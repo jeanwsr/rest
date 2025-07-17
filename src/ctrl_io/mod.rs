@@ -244,7 +244,7 @@ impl InputKeywords {
             auxbas_path: String::from("./def2-SV(P)-JKFIT"),
             auxbas_type: String::from("spheric"),
             use_auxbas: true,
-            auxbasis_response: false,
+            auxbasis_response: true,
             numerical_force: false,
             use_isdf: false,
             ri_k_only: false,
