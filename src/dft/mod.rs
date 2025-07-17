@@ -1104,7 +1104,7 @@ impl DFA4REST {
             // for vsigma
             if self.use_density_gradient() {
                 if let Some(aop) = &grids.aop {
-                    if spin_channel==1 {
+                    if spin_channel == 1 {
                         // vxc_ao_s: the shape of [num_basis, num_grids]
                         let mut loc_vxc_ao_s = &mut loc_vxc_ao_0[0];
                         // vsigma_s: a slice with the length of [num_grids]
@@ -1192,42 +1192,81 @@ impl DFA4REST {
                         // ==================================
                     } // end spin case for GGA 
 
-                    // construc vxc_mat for LDA/GGA 
-                    for i_spin in 0..spin_channel {
-                        let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
-                        let mut loc_vxc_ao_s = loc_vxc_ao_0.get_mut(i_spin).unwrap();
-                        loc_vxc_ao_s.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(vxc_ao_s,w)| {
-                            vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
-                        });
-                        _dgemm(
-                            ao,(0..num_basis, range_grids.clone()),'N',
-                            loc_vxc_ao_s,(0..num_basis,0..range_grids.len()),'T',
-                            loc_vxc_mat_s, (0..num_basis,0..num_basis),
-                            1.0,0.0
-                        );
-                    }
+                    // // construc vxc_mat for LDA/GGA 
+                    // for i_spin in 0..spin_channel {
+                    //     let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                    //     let mut loc_vxc_ao_s = loc_vxc_ao_0.get_mut(i_spin).unwrap();
+                    //     loc_vxc_ao_s.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(vxc_ao_s,w)| {
+                    //         vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
+                    //     });
+                    //     _dgemm(
+                    //         ao,(0..num_basis, range_grids.clone()),'N',
+                    //         loc_vxc_ao_s,(0..num_basis,0..range_grids.len()),'T',
+                    //         loc_vxc_mat_s, (0..num_basis,0..num_basis),
+                    //         1.0,0.0
+                    //     );
+                    // }
 
-                    // MGGA
-                    if self.use_kinetic_density() {
-                        for i_spin in  0..spin_channel {
-                            let loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
-                            let mut loc_vtau_s = loc_vtau.slice_column_mut(i_spin);
-                            let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_0[i_spin];
-                            loc_vtau_s.iter_mut().zip(loc_weights.iter()).for_each(
-                                |(vtau_s, w)| {*vtau_s *= *w}
-                            );
-                            for ic in 0usize..3usize {
-                                let loc_aop_ic = aop.get_reducing_matrix_columns(range_grids.clone(),ic).unwrap();
-                                contract_vxc_0_serial (loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
-                                _dgemm(
-                                &loc_aop_ic,(0..num_basis, 0..range_grids.len()), 'N',
-                                loc_vxc_ao_1_s, (0..num_basis, 0..range_grids.len()), 'T',
-                                loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
-                                );
-                                loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
-                            }                            
-                        }
-                    }
+                    // // MGGA
+                    // if self.use_kinetic_density() {
+                    //     for i_spin in  0..spin_channel {
+                    //         let loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                    //         let mut loc_vtau_s = loc_vtau.slice_column_mut(i_spin);
+                    //         let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_0[i_spin];
+                    //         loc_vtau_s.iter_mut().zip(loc_weights.iter()).for_each(
+                    //             |(vtau_s, w)| {*vtau_s *= *w}
+                    //         );
+                    //         for ic in 0usize..3usize {
+                    //             let loc_aop_ic = aop.get_reducing_matrix_columns(range_grids.clone(),ic).unwrap();
+                    //             contract_vxc_0_serial (loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
+                    //             _dgemm(
+                    //             &loc_aop_ic,(0..num_basis, 0..range_grids.len()), 'N',
+                    //             loc_vxc_ao_1_s, (0..num_basis, 0..range_grids.len()), 'T',
+                    //             loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
+                    //             );
+                    //             loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
+                    //         }                            
+                    //     }
+                    // }
+                }
+            }
+
+            // construc vxc_mat for LDA/GGA 
+            for i_spin in 0..spin_channel {
+                let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                let mut loc_vxc_ao_s = loc_vxc_ao_0.get_mut(i_spin).unwrap();
+                loc_vxc_ao_s.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(vxc_ao_s,w)| {
+                    vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
+                });
+                _dgemm(
+                    ao,(0..num_basis, range_grids.clone()),'N',
+                    loc_vxc_ao_s,(0..num_basis,0..range_grids.len()),'T',
+                    loc_vxc_mat_s, (0..num_basis,0..num_basis),
+                    1.0,0.0
+                );
+            }
+            // MGGA
+            if self.use_kinetic_density() {
+                let Some(aop) = &grids.aop else {
+                    panic!("aop is not available in xc_exc_vxc_slots_dm_only");
+                };
+                for i_spin in  0..spin_channel {
+                    let loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                    let mut loc_vtau_s = loc_vtau.slice_column_mut(i_spin);
+                    let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_1[i_spin];
+                    loc_vtau_s.iter_mut().zip(loc_weights.iter()).for_each(
+                        |(vtau_s, w)| {*vtau_s *= *w}
+                    );
+                    for ic in 0usize..3usize {
+                        let loc_aop_ic = aop.get_reducing_matrix_columns(range_grids.clone(),ic).unwrap();
+                        contract_vxc_0_serial (loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
+                        _dgemm(
+                        &loc_aop_ic,(0..num_basis, 0..range_grids.len()), 'N',
+                        loc_vxc_ao_1_s, (0..num_basis, 0..range_grids.len()), 'T',
+                        loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
+                        );
+                        loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
+                    }                            
                 }
             }
         }
@@ -1527,44 +1566,83 @@ impl DFA4REST {
                         // ==================================
                     } // end spin case for GGA
 
-                    // construct vxc_mat for LDA/GGA 
-                    for i_spin in 0..spin_channel {
-                        let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
-                        let mut loc_vxc_ao_s = loc_vxc_ao.get_mut(i_spin).unwrap();
-                        loc_vxc_ao_s.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(vxc_ao_s,w)| {
-                            vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
-                        });
-                        _dgemm(
-                            ao,(0..num_basis, range_grids.clone()),'N',
-                            loc_vxc_ao_s,(0..num_basis,0..range_grids.len()),'T',
-                            loc_vxc_mat_s, (0..num_basis,0..num_basis),
-                            1.0,0.0
-                        );
-                    }
+                    // // construct vxc_mat for LDA/GGA 
+                    // for i_spin in 0..spin_channel {
+                    //     let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                    //     let mut loc_vxc_ao_s = loc_vxc_ao.get_mut(i_spin).unwrap();
+                    //     loc_vxc_ao_s.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(vxc_ao_s,w)| {
+                    //         vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
+                    //     });
+                    //     _dgemm(
+                    //         ao,(0..num_basis, range_grids.clone()),'N',
+                    //         loc_vxc_ao_s,(0..num_basis,0..range_grids.len()),'T',
+                    //         loc_vxc_mat_s, (0..num_basis,0..num_basis),
+                    //         1.0,0.0
+                    //     );
+                    // }
 
-                    // MGGA
-                    if self.use_kinetic_density() {
-                        for i_spin in  0..spin_channel {
-                            let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
-                            let mut loc_vtau_s = loc_vtau.slice_column_mut(i_spin);
-                            let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_1[i_spin];
-                            loc_vtau_s.iter_mut().zip(loc_weights.iter()).for_each(
-                                |(vtau_s, w)| {*vtau_s *= *w}
-                            );
-                            for ic in 0usize..3usize {
-                                let loc_aop_ic = aop.get_reducing_matrix_columns(range_grids.clone(),ic).unwrap();
-                                loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
-                                contract_vxc_0_serial (loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
-                                _dgemm(
-                                &loc_aop_ic,(0..num_basis, 0..range_grids.len()), 'N',
-                                loc_vxc_ao_1_s, (0..num_basis, 0..range_grids.len()), 'T',
-                                loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
-                                );
-                            }
-                        }
-                    }
+                    // // MGGA
+                    // if self.use_kinetic_density() {
+                    //     for i_spin in  0..spin_channel {
+                    //         let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                    //         let mut loc_vtau_s = loc_vtau.slice_column_mut(i_spin);
+                    //         let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_1[i_spin];
+                    //         loc_vtau_s.iter_mut().zip(loc_weights.iter()).for_each(
+                    //             |(vtau_s, w)| {*vtau_s *= *w}
+                    //         );
+                    //         for ic in 0usize..3usize {
+                    //             let loc_aop_ic = aop.get_reducing_matrix_columns(range_grids.clone(),ic).unwrap();
+                    //             loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
+                    //             contract_vxc_0_serial (loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
+                    //             _dgemm(
+                    //             &loc_aop_ic,(0..num_basis, 0..range_grids.len()), 'N',
+                    //             loc_vxc_ao_1_s, (0..num_basis, 0..range_grids.len()), 'T',
+                    //             loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
+                    //             );
+                    //         }
+                    //     }
+                    // }
                     
                 } // end let aop 
+            }
+
+            // construc vxc_mat for LDA/GGA 
+            for i_spin in 0..spin_channel {
+                let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                let mut loc_vxc_ao_s = loc_vxc_ao.get_mut(i_spin).unwrap();
+                loc_vxc_ao_s.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(vxc_ao_s,w)| {
+                    vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
+                });
+                _dgemm(
+                    ao,(0..num_basis, range_grids.clone()),'N',
+                    loc_vxc_ao_s,(0..num_basis,0..range_grids.len()),'T',
+                    loc_vxc_mat_s, (0..num_basis,0..num_basis),
+                    1.0,0.0
+                );
+            }
+            // MGGA
+            if self.use_kinetic_density() {
+                let Some(aop) = &grids.aop else {
+                    panic!("aop is not available in xc_exc_vxc_slots_dm_only");
+                };
+                for i_spin in  0..spin_channel {
+                    let loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                    let mut loc_vtau_s = loc_vtau.slice_column_mut(i_spin);
+                    let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_1[i_spin];
+                    loc_vtau_s.iter_mut().zip(loc_weights.iter()).for_each(
+                        |(vtau_s, w)| {*vtau_s *= *w}
+                    );
+                    for ic in 0usize..3usize {
+                        let loc_aop_ic = aop.get_reducing_matrix_columns(range_grids.clone(),ic).unwrap();
+                        contract_vxc_0_serial (loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
+                        _dgemm(
+                        &loc_aop_ic,(0..num_basis, 0..range_grids.len()), 'N',
+                        loc_vxc_ao_1_s, (0..num_basis, 0..range_grids.len()), 'T',
+                        loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
+                        );
+                        loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
+                    }                            
+                }
             }
         }
         //println!("debug ");
