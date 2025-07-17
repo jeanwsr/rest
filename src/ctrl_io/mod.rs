@@ -531,7 +531,7 @@ impl InputKeywords {
                 // ==============================================
                 tmp_input.auxbasis_response = match tmp_ctrl.get("auxbasis_response").unwrap_or(&serde_json::Value::Null) {
                     serde_json::Value::Bool(tmp_str) => *tmp_str,
-                    other => false,
+                    other => true,
                 };
                 tmp_input.numerical_force = match tmp_ctrl.get("numerical_force").unwrap_or(&serde_json::Value::Null) {
                     serde_json::Value::Bool(tmp_str) => *tmp_str,
