@@ -552,7 +552,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
 }
 
 fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_operator: &Option<MPIOperator>, position: &MatrixFull<f64>) -> (f64, MatrixFull<f64>) {
-    scf_data.mol.geom.position = position.clone();
+    scf_data.mol.geom.geom_update(&position.data(), GeomUnit::Bohr);
     if scf_data.mol.ctrl.print_level>0 {
         println!("Input geometry in this round is:");
         println!("{}", scf_data.mol.geom.formated_geometry());
