@@ -83,7 +83,7 @@
     1. `analytic`: 四中心积分的解析计算方法，使用libcint库实现
 	1. `ri-v`: 全称为resolution of identity，又名density fitting，是对四中心积分进行张量分解后的近似算法。(缺省)
 	- **注意：REST中的analytic算法并未被充分优化，仅供程序开发测评使用，不建议在实际计算中使用**
-- `basis_type`: 取值为String类型。使用高斯基组的类型，有Spheric及Cartesian两种选择。Spheric对应球坐标系，Cartesian对应笛卡尔坐标系。缺省为spheric
+- `basis_type`: 取值为String类型。使用高斯基组的类型，有Spheric及Cartesian两种选择。Spheric对应球谐型基函数，Cartesian对应笛卡尔型基函数。缺省为spheric
 - `basis_path`: 取值为String类型，无缺省值。计算所使用的基组所在位置。若所用基组为cc-pVTZ, 则应为`{basis_set_pool}/cc-pVTZ`；若所用基组为STO-3G, 则应为`{basis_set_pool}/STO-3G`。其中`{basis_set_pool}`是具体基组文件夹所在的根目录。**注意：基组信息高度依赖于具体的计算体系，因此没有缺省值，必须在输入卡中声明**
 当然，REST程序对于基组的使用是高度自由和自定义的。你可以根据具体的计算任务，从基组网站上下载、修改或者混合使用不同的基组。你所需要做是：
     1. 在`{basis_set_pool}`基组文件夹下创建一个新的基组文件夹。比如你想使用混合基组，并取名这个混合基组名称为mix_bs_01。则需要创建一个基组文件夹为：`mkdir {basis_set_pool}/mix_bs_01`
@@ -103,13 +103,13 @@
 	1. `hcore`: Hcore则对应单电子近似初猜，直接将由libcint生成的hcore矩阵作为初始猜测的fock矩阵进行计算
 - `chkfile`: 取值为String。给定初始猜测所在位置/路径。缺省为none
 - `mixer`：取值为String。辅助自洽场收敛的方法。目前REST支持direct，diis，linear及ddiis。Direct对应不使用辅助收敛方法，linear对应于线性辅助收敛方法，diis对应于direct inversion in the iterative subspace。Diis是有效的加速收敛方法。缺省为diis
-- `mix_parameter`: 取值为f64。Diis方法或linear方法的混合系数。缺省为1.0
+- `mix_param`: 取值为f64。Diis方法或linear方法的混合系数。缺省为0.2
 - `start_diis_cycle`: 取值为i32。开始使用diis加速收敛方法的循环数。缺省为2
-- `num_max_diis`: 取值为i32。最大使用diis加速方法的循环数。缺省为2
+- `num_max_diis`: 取值为i32。diis空间大小。缺省为8
 - `max_scf_cycle`: 取值为i32。自洽场运算的最大迭代循环数。缺省为100
-- `scf_acc_rho`: 取值为f64。自洽场运算密度矩阵的收敛标准。缺省为1.0e-6
+- `scf_acc_rho`: 取值为f64。自洽场运算密度矩阵的收敛标准。缺省为1.0e-8
 - `scf_acc_eev`: 取值为f64。自洽场运算能量差平方和的收敛标准。缺省为1.0e-6
-- `scf_acc_etot`: 取值为f64。自洽场运算总能量的收敛标准。缺省为1.0e-6
+- `scf_acc_etot`: 取值为f64。自洽场运算总能量的收敛标准。缺省为1.0e-8
 - `level_shift`: 取值为f64。对于发生近简并振荡不收敛的情况，可以采用level_shift的方式人为破坏简并，加速收敛。缺省值为0.0
 - `start_check_oscillation`: 取值为i32。开始检查并自洽场计算不收敛发生振荡的循环数。当监控到自洽场发生振荡，SCF能量上升的情况，开启一次线性混合方案（linear)。缺省为20
 - `force_state_occupation`: 取值是Vector。 Constrained DFT (C-DFT) 计算方法。具体设置如下：
