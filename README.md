@@ -25,12 +25,12 @@
 """
 `
   - 输入卡中不采用'''符号
-  - 请将输入卡中的代表基组和辅助基组的存放文件夹`{basis_set_pool}`自动替换成`/opt/rest_workspace/rest/basis-set-pool`
   - 若用户没有申明辅助基组，则使用`{basis_set_pool}/def2-SV(P)-JKFIT`
+  - 将输入卡中的代表基组和辅助基组的存放文件夹`{basis_set_pool}`自动替换成`/opt/rest_workspace/rest/basis-set-pool`
   - 反复迭代比较，直至输入卡一次性全部满足上述要求
   - 输出REST程序的输入卡，使用String的格式，包含换行符号'\n'，并且对'"'符号进行'\"'转译
 
-# Detail descrption of `[ctrl]` block in the control file
+# Detailed descrption of `[ctrl]` block in the control file
 
 ## 系统设置相关关键词（Keyword）
 - `num_threads`: 取值为i32类型。任务最大可调用线程数目，缺省为1
@@ -83,7 +83,7 @@
     1. `analytic`: 四中心积分的解析计算方法，使用libcint库实现
 	1. `ri-v`: 全称为resolution of identity，又名density fitting，是对四中心积分进行张量分解后的近似算法。(缺省)
 	- **注意：REST中的analytic算法并未被充分优化，仅供程序开发测评使用，不建议在实际计算中使用**
-- `basis_type`: 取值为String类型。使用高斯基组的类型，有Spheric及Cartesian两种选择。Spheric对应球坐标系，Cartesian对应笛卡尔坐标系。缺省为spheric
+- `basis_type`: 取值为String类型。使用高斯基组的类型，有Spheric及Cartesian两种选择。Spheric对应球谐型基函数，Cartesian对应笛卡尔型基函数。缺省为spheric
 - `basis_path`: 取值为String类型，无缺省值。计算所使用的基组所在位置。若所用基组为cc-pVTZ, 则应为`{basis_set_pool}/cc-pVTZ`；若所用基组为STO-3G, 则应为`{basis_set_pool}/STO-3G`。其中`{basis_set_pool}`是具体基组文件夹所在的根目录。**注意：基组信息高度依赖于具体的计算体系，因此没有缺省值，必须在输入卡中声明**
 当然，REST程序对于基组的使用是高度自由和自定义的。你可以根据具体的计算任务，从基组网站上下载、修改或者混合使用不同的基组。你所需要做是：
     1. 在`{basis_set_pool}`基组文件夹下创建一个新的基组文件夹。比如你想使用混合基组，并取名这个混合基组名称为mix_bs_01。则需要创建一个基组文件夹为：`mkdir {basis_set_pool}/mix_bs_01`
@@ -103,13 +103,13 @@
 	1. `hcore`: Hcore则对应单电子近似初猜，直接将由libcint生成的hcore矩阵作为初始猜测的fock矩阵进行计算
 - `chkfile`: 取值为String。给定初始猜测所在位置/路径。缺省为none
 - `mixer`：取值为String。辅助自洽场收敛的方法。目前REST支持direct，diis，linear及ddiis。Direct对应不使用辅助收敛方法，linear对应于线性辅助收敛方法，diis对应于direct inversion in the iterative subspace。Diis是有效的加速收敛方法。缺省为diis
-- `mix_parameter`: 取值为f64。Diis方法或linear方法的混合系数。缺省为1.0
+- `mix_param`: 取值为f64。Diis方法或linear方法的混合系数。缺省为0.2
 - `start_diis_cycle`: 取值为i32。开始使用diis加速收敛方法的循环数。缺省为2
-- `num_max_diis`: 取值为i32。最大使用diis加速方法的循环数。缺省为2
+- `num_max_diis`: 取值为i32。diis空间大小。缺省为8
 - `max_scf_cycle`: 取值为i32。自洽场运算的最大迭代循环数。缺省为100
-- `scf_acc_rho`: 取值为f64。自洽场运算密度矩阵的收敛标准。缺省为1.0e-6
+- `scf_acc_rho`: 取值为f64。自洽场运算密度矩阵的收敛标准。缺省为1.0e-8
 - `scf_acc_eev`: 取值为f64。自洽场运算能量差平方和的收敛标准。缺省为1.0e-6
-- `scf_acc_etot`: 取值为f64。自洽场运算总能量的收敛标准。缺省为1.0e-6
+- `scf_acc_etot`: 取值为f64。自洽场运算总能量的收敛标准。缺省为1.0e-8
 - `level_shift`: 取值为f64。对于发生近简并振荡不收敛的情况，可以采用level_shift的方式人为破坏简并，加速收敛。缺省值为0.0
 - `start_check_oscillation`: 取值为i32。开始检查并自洽场计算不收敛发生振荡的循环数。当监控到自洽场发生振荡，SCF能量上升的情况，开启一次线性混合方案（linear)。缺省为20
 - `force_state_occupation`: 取值是Vector。 Constrained DFT (C-DFT) 计算方法。具体设置如下：
@@ -124,11 +124,18 @@
      - `force_occ`：取值为f64。设置上述定位的轨道在约束DFT（C-DFT）计算中的取值
      - `force_check_min`和`force_check_max`：取值为i32。在C-DFT的自洽计算中设置搜索窗口，仅从这个窗口中寻找和prev_state/prev_spin最相似的轨道
 ## 后自洽场计算相关关键词（Keyword）
-- `frozen_core_postscf`: 取值为i32，且小于100的两位数。对于后自洽场方法，包括MP2和第五阶密度泛函近似，需要考虑激发组态的贡献。由于原子的内层电子（core electrons）通常不参与化学成键，我们可以采用冻芯近似（frozen core approximation），缺省值为`0`，代表不使用冻心近似
-	- 当设置为一位数`n`的时候，不区分原子是主族元素还是过渡金属，冻心近似下只考虑涉及`n`个最外价层的电子激发组态
+- `frozen_core_postscf`: 取值为i32，且小于100的两位正整数或者一位正整数。对于后自洽场方法，包括MP2和第五阶密度泛函近似，需要考虑激发组态的贡献。由于原子的内层电子（core electrons）通常不参与化学成键，仅有最外几个价层参与（按主量子数划分）。因此我们可以采用冻芯近似（frozen core approximation）
+    - 缺省值为`0`，代表考虑所有电子，不使用冻心近似
+	- 当设置为一位数`n`的时候，不区分原子是主族元素还是过渡金属，冻心近似下只考虑涉及`n`个最外价层的电子激发组态。
 	- 当设置为两位数`mn`的时候，则区分原子类型，对于主族元素考虑`n`个价层上的电子激发（个位上的数），而对过渡金属则考虑`m`个价层（十位上的数）
-	- 这里我们以主量子数来定义价层，比如`2s2p`是一个价层，而`3s3p3d`为一个价层
-	- **对于传统密度泛函方法，本参数设置不起作用**
+	- 几个示例和几点说明：
+	    - `sp`电子所属电子层由`主量子数`来区分。以第三周期元素Si、P、S为例，`3s3p`属于最高第三价层，而`2s2p`是次高第二价层
+	    - `d`电子所属电子层由`主量子数-1`来区分。以3d过渡金属Fe、Cu、Zn为例，`3d4s`属于最高第四价层，而`3s3p`是次高第二价层
+	    - `f`电子所属电子层由`主量子数-2`来区分。以5d过渡金属Ir、Pt、Au为例，`4f5d6s`属于最高第六价层，而`4d5s5p`是次高第五价层
+	    - `fronzen_core_postscf=1`（即`n=1`），表示第三周期元素仅考虑`3s3p`价层电子的贡献，而不考虑`1s2s2p`轨道的电子激发
+		- 若`n`等于或大于主族元素占据轨道的电子层数，代表对于这个元素不采用冻心近似，等价于`n=0`.
+	    - `fronzen_core_postscf=2`（即`n=2`），表示第二周期元素同时考虑`2s2p`最高价层和`1s`次高价层（即最低核层）的贡献，等价于`n=0`不开冻心近似。
+	    - **对于传统密度泛函方法，本参数设置不起作用**
 - `frequency_points`：取值为i32。对于RPA型的相关能计算方法，比如RPA、SCSRPA和R-xDH7等，需要对频率空间进行数值积分。这里设置频率积分的格点数目。缺省为20
 - `freq_grid_type`：取值为i32。对于RPA型相关能计算方法做格点化准备:
      - `0`: 代表使用modified Gauss-Legendre格点。缺省为0
@@ -136,7 +143,7 @@
 	 - `2`: 代表Logarithmic格点。
 - `lambda_points`：取值为i32。对于SCSRPA和R-xDH7等方法，对于开窍层的强关联体系，需要对绝热涨落途径（lambda)数值积分。这里设置lambda积分的格点数目。缺省为20
 
-# Detail descrption of [geom] block in the control file
+# Detailed descrption of [geom] block in the control file
 - `name`：取值为String类型。分子体系的名称
 - `unit`：取值为String类型。坐标单位。目前支持：angstrom和bohr
 - `position`：取值为String类型。分子体系的坐标，目前支持xyz格式
