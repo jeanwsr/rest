@@ -1,33 +1,35 @@
 extern crate dunce;
 use std::{env, fs};
-//use std::path::PathBuf;
+use std::path::PathBuf;
 
 fn main() -> miette::Result<()> {
 
-    let external_dir = if let Ok(external_dir) = env::var("REST_EXT_DIR") {
-        external_dir
-    } else {"".to_string()};
-
     generate_libxc_names_and_values();
 
-    let library_names = [
-        "restmatr",
-        "xc",
-        "hdf5",
-        "rest2fch",
-        "openblas",
-        "gomp"
-        ];
-    library_names.iter().for_each(|name| {
-        println!("cargo:rustc-link-lib={}",*name);
-    });
 
     // conditionally link to the libraries based on the features
+    #[cfg(feature = "intel-mkl")] {
+        println!("cargo:rustc-link-lib=mkl_rt");
+        let blas_dir = if let Ok(blas_dir) = env::var("MKLROOT") {
+            PathBuf::from(blas_dir)
+        } else {panic!("MKLROOT not set for feature intel-mkl")};
+        println!("cargo:rustc-link-search={}/lib",&blas_dir.display());
+    }
 
     #[cfg(feature = "dftd3")]
     println!("cargo:rustc-link-lib=s-dftd3");
     #[cfg(feature = "dftd4")]
     println!("cargo:rustc-link-lib=dftd4");
+
+    let library_names = ["restmatr","xc","hdf5","rest2fch","openblas","gomp"];
+    library_names.iter().for_each(|name| {
+        println!("cargo:rustc-link-lib={}",*name);
+    });
+
+    let external_dir = if let Ok(external_dir) = env::var("REST_EXT_DIR") {
+        PathBuf::from(external_dir)
+    } else {panic!("REST_EXT_DIR not set, which,however, is necessary for the build script to run.")};
+
 
     let library_path = [
         dunce::canonicalize(&external_dir).unwrap(),
@@ -35,6 +37,7 @@ fn main() -> miette::Result<()> {
     library_path.iter().for_each(|path| {
         println!("cargo:rustc-link-search={}",env::join_paths(&[path]).unwrap().to_str().unwrap())
     });
+
 
     Ok(())
 

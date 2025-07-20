@@ -81,8 +81,8 @@ default = ["dftd3", "dftd4", "geometric-pyo3"]
 dftd3 = ["dep:dftd3"]
 dftd4 = ["dep:dftd4"]
 geometric-pyo3 = ["dep:geometric-pyo3"]
-#openblas = ["dep:rstsr-openblas","rstsr/openblas"]
-#intel-mkl = ["rstsr/intel-mkl"]
+openblas = []
+intel-mkl = []
 
 [[bench]]
 name = "bench_tensors"
