@@ -3061,6 +3061,8 @@ impl Molecule {
 
         (out, out_shape) = cint_data.integral_s2ij::<int3c2e>(Some(&shl_slices));
 
+        cint_data.final_c2r();
+
         let mut tmp_ri3fn = MatrixFull::from_vec([n_baspar, n_auxbas],out).unwrap();
 
         let mut basbas2baspar = MatrixFull::new([n_basis,n_basis],0_usize);

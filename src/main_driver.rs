@@ -552,8 +552,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
 }
 
 fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_operator: &Option<MPIOperator>, position: &MatrixFull<f64>) -> (f64, MatrixFull<f64>) {
-    //scf_data.mol.geom.position = position.clone();
-    scf_data.mol.geom.geom_update(&position.data(), GeomUnit::Angstrom);
+    scf_data.mol.geom.geom_update(&position.data(), GeomUnit::Bohr);
     if scf_data.mol.ctrl.print_level>0 {
         println!("Input geometry in this round is:");
         println!("{}", scf_data.mol.geom.formated_geometry());
@@ -582,7 +581,7 @@ mod geometric_pyo3_impl {
             let coords = MatrixFull::from_vec([3, coords.len()/3], coords).unwrap();
             let mpi_operator = None;
             let (scf_data, time_mark) = (&mut self.scf_data, &mut self.time_mark);
-            let (energy, mut gradient) = eval_force_with_position(scf_data, time_mark, &mpi_operator, &coords);
+            let (energy, gradient) = eval_force_with_position(scf_data, time_mark, &mpi_operator, &coords);
             //gradient.formated_output(3, "full");
             //gradient *= -1.0;
             let gradient = gradient.data();
