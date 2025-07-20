@@ -17,6 +17,7 @@ use dft::gen_grids;
 use crate::utilities::balancing;
 use crate::geom_io::get_mass_charge;
 mod lib;
+use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
 
 /* Given grid points and center of each clusters, classify points to nearest cluster centers.
 Input:
@@ -480,8 +481,7 @@ pub fn index_of_min(nets: &mut Vec<f64>) -> usize{
 }
 
 pub fn tabulated_ao (mol: &Molecule, rand_p: &Vec<[f64; 3]>) -> MatrixFull<f64>{
-    let default_omp_num_threads = unsafe {utilities::openblas_get_num_threads()};
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = mol.ctrl.num_threads.unwrap();
 
     let num_grids = rand_p.len();
     let num_basis = mol.num_basis;
@@ -490,6 +490,7 @@ pub fn tabulated_ao (mol: &Molecule, rand_p: &Vec<[f64; 3]>) -> MatrixFull<f64>{
     let par_tasks = utilities::balancing(num_grids, rayon::current_num_threads());
     let (sender, receiver) = channel();
     par_tasks.par_iter().for_each_with(sender, |s, range_grids| {
+        omp_set_num_threads_wrapper(1);
 
         let loc_num_grids = range_grids.len();
         let mut loc_ao = MatrixFull::new([num_basis, loc_num_grids],0.0);
@@ -511,7 +512,7 @@ pub fn tabulated_ao (mol: &Molecule, rand_p: &Vec<[f64; 3]>) -> MatrixFull<f64>{
         let loc_num_grids = range_grids.len();
         ao.copy_from_matr(0..num_basis, range_grids.clone(), &loc_ao, 0..num_basis, 0..loc_num_grids);
     });
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads as usize);
+    omp_set_num_threads_wrapper(default_omp_num_threads as usize);
     ao // [num_basis,num_grids]
 }
 
@@ -612,8 +613,8 @@ pub fn prepare_for_ri_isdf(k_mu: usize, mol: &Molecule, grids: &dft::Grids) -> R
 
     // c就是C_{\mu\nu}^{L}*\lambda(r_L)， 见公式22,24
     let mut c = prod_states_gw(&lambda_varphi.transpose(), &varphi.transpose());
-    utilities::omp_set_num_threads_wrapper(mol.ctrl.num_threads.unwrap());
-    let omp_num = utilities::omp_get_num_threads_wrapper();
+    omp_set_num_threads_wrapper(mol.ctrl.num_threads.unwrap());
+    //let omp_num = omp_get_num_threads_wrapper();
     let mut tmp1 = MatrixFull::new([nri, n_mu],0.0);
 
     tmp1.lapack_dgemm(&mut ri_v_ao_t, &mut c, 'T', 'T', 1.0, 0.0);

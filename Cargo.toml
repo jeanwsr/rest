@@ -23,8 +23,8 @@ mimalloc = "0.1.43"
 rayon = "1.8"
 crossbeam = "0.8"
 libm = "0.2"
-blas-sys = "0.7"
-blas = "0.22"
+#blas-sys = "0.7"
+#blas = "0.22"
 lazy_static = "1.4"
 toml = "0.7"
 #tuple-conv = "1.0.1"
@@ -51,9 +51,9 @@ rest_libcint = {path="../rest_libcint"}
 liblbfgs = "0.1.0"
 sysinfo = "0.33"
 rstsr = { version = "0.3", default-features = false, features = ["openblas", "linalg", "rayon", "std", "col_major"] }
-rstsr-openblas = { version = "0.3", features = ["linalg", "openmp"] }
 derive_builder = { version = "0.20" }
 
+rstsr-openblas = { version = "0.3", features = ["linalg", "openmp"]}
 dftd3 = { version = "0.1", optional = true }
 dftd4 = { version = "0.1", optional = true }
 geometric-pyo3 = { version = "0.1", optional = true }
@@ -81,6 +81,8 @@ default = ["dftd3", "dftd4", "geometric-pyo3"]
 dftd3 = ["dep:dftd3"]
 dftd4 = ["dep:dftd4"]
 geometric-pyo3 = ["dep:geometric-pyo3"]
+#openblas = ["dep:rstsr-openblas","rstsr/openblas"]
+#intel-mkl = ["rstsr/intel-mkl"]
 
 [[bench]]
 name = "bench_tensors"

@@ -10,12 +10,20 @@ fn main() -> miette::Result<()> {
 
     generate_libxc_names_and_values();
 
-    let library_names = ["restmatr","openblas","xc","hdf5","rest2fch","gomp"];
+    let library_names = [
+        "restmatr",
+        "xc",
+        "hdf5",
+        "rest2fch",
+        "openblas",
+        "gomp"
+        ];
     library_names.iter().for_each(|name| {
         println!("cargo:rustc-link-lib={}",*name);
     });
 
     // conditionally link to the libraries based on the features
+
     #[cfg(feature = "dftd3")]
     println!("cargo:rustc-link-lib=s-dftd3");
     #[cfg(feature = "dftd4")]
