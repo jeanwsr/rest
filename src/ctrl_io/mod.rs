@@ -7,6 +7,7 @@ use std::{fs, sync::Arc};
 use crate::{check_norm::force_state_occupation::ForceStateOccupation, dft::{DFAFamily, DFTType, DFA4REST}, geom_io::{GeomCell, GeomUnit, MOrC}, utilities};
 use rayon::ThreadPoolBuilder;
 use crate::check_norm::OCCType;
+use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper,omp_get_num_threads_wrapper};
 
 use serde_json;
 use toml;
@@ -392,9 +393,9 @@ impl InputKeywords {
                     // Now move the setting of rayon thread numbers to the main.rs
                     //rayon::ThreadPoolBuilder::new().num_threads(num_threads);
                     rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global().unwrap_or_else(|x| {println!("{:?}", &x)});
-                    utilities::omp_set_num_threads_wrapper(num_threads);
+                    omp_set_num_threads_wrapper(num_threads);
                 } else {
-                    utilities::omp_set_num_threads_wrapper(rayon::current_num_threads());
+                    omp_set_num_threads_wrapper(rayon::current_num_threads());
                     //if tmp_input.print_level>0 {println!("The default rayon num_threads value is used:      {}", rayon::current_num_threads())};
                 };
                 //println!("max_num_threads: {}, current_num_threads: {}", rayon::max_num_threads(), rayon::current_num_threads());

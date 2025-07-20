@@ -37,6 +37,8 @@ use libxc::{XcFuncType, LibXCFamily};
 //use std::intrinsics::expf64;
 use crate::dft::libxc::names_and_values::MAP as libxc_names_values;
 
+use rest_tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
+
 
 
 
@@ -2214,8 +2216,8 @@ impl Grids {
         //In this subroutine, we call the lapack dgemm in a rayon parallel environment.
         //In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
         //let default_omp_num_threads = unsafe {utilities::openblas_get_num_threads()};
-        let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-        utilities::omp_set_num_threads_wrapper(1);
+        //let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+        let default_omp_num_threads = mol.ctrl.num_threads.unwrap();
 
         let num_grids = self.coordinates.len();
         let num_basis = mol.num_basis;
@@ -2230,6 +2232,7 @@ impl Grids {
         let par_tasks = utilities::balancing(num_grids, rayon::current_num_threads());
         let (sender, receiver) = channel();
         par_tasks.par_iter().for_each_with(sender, |s, range_grids| {
+            omp_set_num_threads_wrapper(1);
 
             let loc_num_grids = range_grids.len();
 
@@ -2279,16 +2282,13 @@ impl Grids {
         self.ao = Some(ao);
         self.aop = aop;
 
-        utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+        omp_set_num_threads_wrapper(default_omp_num_threads);
     }
 
     pub fn prepare_tabulated_ao_rayon(&mut self, mol: &Molecule) {
         //In this subroutine, we call the lapack dgemm in a rayon parallel environment.
         //In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-        //let default_omp_num_threads = unsafe {utilities::openblas_get_num_threads()};
-        let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-        //println!("debug: default_omp_num_threads: {}", default_omp_num_threads);
-        utilities::omp_set_num_threads_wrapper(1);
+        let default_omp_num_threads = mol.ctrl.num_threads.unwrap();
 
         let num_grids = self.coordinates.len();
 
@@ -2301,6 +2301,7 @@ impl Grids {
 
         let (sender, receiver) = channel();
         mol.basis4elem.par_iter().zip(mol.geom.rg_position.par_iter_columns_full()).for_each_with(sender, |s, (elem,geom)| {
+            omp_set_num_threads_wrapper(1);
             let ind_glb_bas = elem.global_index.0;
             let num_loc_bas = elem.global_index.1;
             //let mut tab_den = MatrixFull::new([num_grids, num_loc_bas],0.0);
@@ -2342,7 +2343,7 @@ impl Grids {
         self.ao = Some(ao.transpose_and_drop());
         self.aop = aop;
 
-        utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+        omp_set_num_threads_wrapper(default_omp_num_threads);
 
     }
 
@@ -2450,8 +2451,8 @@ impl Grids {
         cur_rho
     }
     pub fn prepare_tabulated_density(&self, dm: &Vec<MatrixFull<f64>>, spin_channel: usize) -> MatrixFull<f64> {
-        let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-        utilities::omp_set_num_threads_wrapper(1);
+        //let default_omp_num_threads = omp_get_num_threads_wrapper();
+        //omp_set_num_threads_wrapper(1);
         let num_grids = self.coordinates.len();
         let mut cur_rho = MatrixFull::new([num_grids,spin_channel],0.0);
         for i_spin in 0..spin_channel {
@@ -2474,7 +2475,7 @@ impl Grids {
                 let dt2 = utilities::timing(&dt1, Some("Contracting ao*wao"));
             };
         };
-        utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+        //utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
         cur_rho
     }
 
@@ -3120,10 +3121,7 @@ pub fn numerical_density_rayon(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull
     let mut total_density = [0.0f64;2];
     //let mut count:usize = 0;
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
-    // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    //println!("debug: default omp_num_threads: {}", default_omp_num_threads);
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
 
     let local_basis4elem = mol.basis4elem.clone();
     let local_position = mol.geom.rg_position.clone();
@@ -3131,8 +3129,7 @@ pub fn numerical_density_rayon(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull
     let basis_type = mol.ctrl.basis_type.clone();
     let (sender,receiver) = channel();
     grid.coordinates.par_iter().zip(grid.weights.par_iter()).for_each_with(sender, |s,(r,w)| {
-        //let r = &grid.coordinates[0];
-        //let w = &grid.weights[0];
+        omp_set_num_threads_wrapper(1);
         let mut local_total_density = [0.0f64;2];
         let mut density_r_sum = [0.0;2];
         let mut density_r:Vec<f64> = vec![];
@@ -3142,18 +3139,12 @@ pub fn numerical_density_rayon(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull
             tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
             density_r.extend(gto_value(r, &tmp_geom, elem, &basis_type));
         });
-        //if count<=10 {println!("{:?}", density_r)};
-        //println!{"debug 1"};
         let mut density_rr = MatrixFull::from_vec([num_basis,1],density_r).unwrap();
-        //println!{"debug 2"};
         local_dm.iter_mut().zip(density_r_sum.iter_mut()).for_each(|(dm_s, density_r_sum)| {
             let mut tmp_mat = MatrixFull::new([num_basis,1],0.0);
             tmp_mat.lapack_dgemm(&mut density_rr, dm_s, 'T', 'N', 1.0, 0.0);
             *density_r_sum += tmp_mat.data.iter().zip(density_rr.data.iter()).fold(0.0, |acc,(a,b)| {acc + a*b});
         });
-        //println!{"debug 3"};
-        //if count<=10 {println!("{:?},{},{}", r,w,density_r_sum)};
-        //count += 1;
         local_total_density.iter_mut().zip(density_r_sum.iter()).for_each(|(to,from)| *to += from*w);
         s.send(local_total_density).unwrap();
     });
@@ -3164,7 +3155,7 @@ pub fn numerical_density_rayon(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull
     });
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
     
     total_density
 }

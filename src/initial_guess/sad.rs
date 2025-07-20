@@ -23,7 +23,7 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
             if mol.ctrl.print_level > 0 {
                 println!("\n=======================");
                 println!("Generating SAD for atom: {}", &ielem);
-                println!("=======================\n");
+                println!("=======================");
             }
 
             //elem_name.push(ielem.to_string());
@@ -91,7 +91,7 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
             atom_dms.insert(ielem.clone(),dms);
             
             if mol.ctrl.print_level > 0 {
-                println!("SAD generation for {} complete.\n", &ielem);
+                println!("SAD generation for {} complete.", &ielem);
             }
         }
     });

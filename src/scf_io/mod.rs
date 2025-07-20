@@ -31,6 +31,8 @@ use crate::initial_guess::initial_guess;
 use crate::external_libs::dftd;
 use crate::constants::{INVERSE_THRESHOLD, SPECIES_INFO, SQRT_THRESHOLD};
 
+use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
+
 
 
 
@@ -2600,7 +2602,7 @@ impl SCF {
     pub fn generate_vxc_rayon_dm_only(&self, scaling_factor: f64) -> ([f64;2], f64, Vec<MatrixUpper<f64>>) {
         //In this subroutine, we call the lapack dgemm in a rayon parallel environment.
         //In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-        let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+        let default_omp_num_threads = self.mol.ctrl.num_threads.unwrap();
 
         let num_basis = self.mol.num_basis;
         let num_state = self.mol.num_state;
@@ -2619,7 +2621,7 @@ impl SCF {
         if let Some(grids) = &self.grids {
             let (sender, receiver) = channel();
             grids.parallel_balancing.par_iter().for_each_with(sender,|s,range_grids| {
-                utilities::omp_set_num_threads_wrapper(1);
+                omp_set_num_threads_wrapper(1);
                 // change the return of xc_exc_vxc, directly return vxc_mat [num_basis, num_basis]
                 // let (exc,vxc_ao,total_elec) = self.mol.xc_data.xc_exc_vxc_slots_dm_only(range_grids.clone(), grids, spin_channel,dm, mo, occ);
                 //exc_spin = exc;
@@ -2687,7 +2689,7 @@ impl SCF {
             }
         };
 
-        utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+        omp_set_num_threads_wrapper(default_omp_num_threads);
 
         (total_elec, exc_total, vxc)
 
@@ -2787,7 +2789,7 @@ impl SCF {
 
     pub fn generate_vxc_rayon(&self, scaling_factor: f64) -> ([f64;2], f64, Vec<MatrixUpper<f64>>) {
         //In this subroutine, we call the lapack dgemm in a rayon parallel environment.
-        let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+        let default_omp_num_threads = self.mol.ctrl.num_threads.unwrap();
 
         let num_basis = self.mol.num_basis;
         let num_state = self.mol.num_state;
@@ -2808,7 +2810,7 @@ impl SCF {
             grids.parallel_balancing.par_iter().for_each_with(sender,|s,range_grids| {
 
                 // To ensure the efficiency, we disable the openmp ability of openblas within the parallel region
-                utilities::omp_set_num_threads_wrapper(1);
+                omp_set_num_threads_wrapper(1);
 
                 // change the return value of xc_exc_vxc by vxc_mat [num_basis, num_basis]
                 // let (exc,vxc_ao,total_elec) = self.mol.xc_data.xc_exc_vxc_slots(range_grids.clone(), grids, spin_channel,dm, mo, occ);
@@ -2877,7 +2879,7 @@ impl SCF {
             }
         };
 
-        utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+        omp_set_num_threads_wrapper(default_omp_num_threads);
 
         (total_elec,exc_total, vxc)
 
@@ -3197,7 +3199,7 @@ pub fn vj_upper_with_rimatr_sync_v02(
                 dm: &Vec<MatrixFull<f64>>, 
                 spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
 
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+    //let default_omp_num_threads = omp_get_num_threads_wrapper();
 
     let mut vj: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
     if let Some((ri3fn,basbas2baspar,baspar2basbas)) = ri3fn {
@@ -3309,7 +3311,7 @@ pub fn vk_upper_with_ri_v_use_dm_only_sync(
                 dm: &Vec<MatrixFull<f64>>,
                 spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     //let mut bm = RIFull::new([num_state,num_basis,num_auxbas], 0.0f64);
     let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
 
@@ -3327,7 +3329,7 @@ pub fn vk_upper_with_ri_v_use_dm_only_sync(
             ri3fn.par_iter_auxbas(0..num_auxbas).unwrap().for_each_with(sender,|s, m| {
 
                 // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
-                utilities::omp_set_num_threads_wrapper(1);
+                omp_set_num_threads_wrapper(1);
 
                 let mut tmp_mat = MatrixFull::new([num_basis,num_basis],0.0_f64);
                 let mut reduced_ri3fn = MatrixFullSlice {
@@ -3367,7 +3369,7 @@ pub fn vk_upper_with_ri_v_use_dm_only_sync(
     };
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     vk
 }
@@ -3388,7 +3390,7 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v01(
                 spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     //let mut bm = RIFull::new([num_state,num_basis,num_auxbas], 0.0f64);
     let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
 
@@ -3404,7 +3406,7 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v01(
             ri3fn.par_iter_columns_full().for_each_with(sender,|s, m| {
 
                 // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
-                utilities::omp_set_num_threads_wrapper(1);
+                omp_set_num_threads_wrapper(1);
 
                 let mut tmp_mat = MatrixFull::new([num_basis,num_basis],0.0_f64);
                 let mut reduced_ri3fn = MatrixFull::new([num_basis,num_basis],0.0_f64);
@@ -3434,7 +3436,7 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v01(
     };
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     vk
 }
@@ -3445,7 +3447,7 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v02(
                 spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     //utilities::omp_set_num_threads_wrapper(1);
     //let mut bm = RIFull::new([num_state,num_basis,num_auxbas], 0.0f64);
     let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
@@ -3459,15 +3461,13 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v02(
             let mut vk_s = &mut vk[i_spin];
             *vk_s = MatrixUpper::new(num_baspair,0.0_f64);
             //let dm_s = &dm[i_spin];
-            utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
             let dm_s = _power_rayon_for_symmetric_matrix(&dm[i_spin], 0.5, SQRT_THRESHOLD).unwrap();
-            utilities::omp_set_num_threads_wrapper(1);
             let batch_num_auxbas = utilities::balancing(num_auxbas, rayon::current_num_threads());
             let (sender, receiver) = channel();
             batch_num_auxbas.par_iter().for_each_with(sender, |s,loc_auxbas| {
 
                 // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
-                utilities::omp_set_num_threads_wrapper(1);
+                omp_set_num_threads_wrapper(1);
 
                 let mut tmp_mat = MatrixFull::new([num_basis,num_basis],0.0_f64);
                 let mut reduced_ri3fn = MatrixFull::new([num_basis,num_basis],0.0_f64);
@@ -3498,7 +3498,7 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v02(
     };
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     vk
 }
@@ -3561,7 +3561,7 @@ pub fn vk_upper_with_rimatr_sync_v01(
                 spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     //let mut bm = RIFull::new([num_state,num_basis,num_auxbas], 0.0f64);
     let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
 
@@ -3593,7 +3593,7 @@ pub fn vk_upper_with_rimatr_sync_v01(
                 ri3fn.par_iter_columns_full().for_each_with(sender,|s, m| {
 
                     // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
-                    utilities::omp_set_num_threads_wrapper(1);
+                    omp_set_num_threads_wrapper(1);
 
                     //let mut tmp_mat = MatrixFull::new([num_basis,num_basis],0.0_f64);
                     let mut reduced_ri3fn = MatrixFull::new([num_basis,num_basis],0.0_f64);
@@ -3627,7 +3627,7 @@ pub fn vk_upper_with_rimatr_sync_v01(
     };
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     vk
 }
@@ -3710,7 +3710,7 @@ pub fn vk_upper_with_rimatr_sync_v03(
                 spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     //utilities::omp_set_num_threads_wrapper(1);
     //let mut bm = RIFull::new([num_state,num_basis,num_auxbas], 0.0f64);
     //let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
@@ -3751,7 +3751,7 @@ pub fn vk_upper_with_rimatr_sync_v03(
                 batch_num_auxbas.par_iter().for_each_with(sender, |s, loc_auxbas| {
 
                     // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
-                    utilities::omp_set_num_threads_wrapper(1);
+                    omp_set_num_threads_wrapper(1);
 
                     let mut reduced_ri3fn = MatrixFull::new([num_basis,num_basis],0.0_f64);
                     let mut vk_sm = MatrixFull::new([num_basis,num_basis],0.0_f64);
@@ -3781,7 +3781,7 @@ pub fn vk_upper_with_rimatr_sync_v03(
     };
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     vk
 }
@@ -3794,7 +3794,7 @@ pub fn vk_upper_with_ri_v_sync(
                 spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     //utilities::omp_set_num_threads_wrapper(1);
 
     //let mut bm = RIFull::new([num_state,num_basis,num_auxbas], 0.0f64);
@@ -3821,7 +3821,7 @@ pub fn vk_upper_with_ri_v_sync(
                 ri3fn.par_iter_auxbas(0..num_auxbas).unwrap().for_each_with(sender, |s, m| {
 
                     // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
-                    utilities::omp_set_num_threads_wrapper(1);
+                    omp_set_num_threads_wrapper(1);
 
                     let mut reduced_ri3fn = MatrixFullSlice {
                         size:  &[num_basis,num_basis], 
@@ -3870,7 +3870,7 @@ pub fn vk_upper_with_ri_v_sync(
     };
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
 
     vk
@@ -4283,7 +4283,7 @@ fn ao2mo_rayon_v01<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
 {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     //utilities::omp_set_num_threads_wrapper(1);
 
     let num_basis = eigenvector.size()[0];
@@ -4298,7 +4298,7 @@ fn ao2mo_rayon_v01<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
     rimat_chunk.data_ref().unwrap().par_chunks_exact(num_bpair).enumerate().for_each_with(sender, |s, (i_auxbs, m)| {
 
         // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
-        utilities::omp_set_num_threads_wrapper(1);
+        omp_set_num_threads_wrapper(1);
 
         let mut loc_ri3mo = MatrixFull::new([row_dim.len(), column_dim.len()],0.0_f64);
         let mut reduced_ri = MatrixFull::new([num_basis, num_basis], 0.0_f64);
@@ -4319,7 +4319,7 @@ fn ao2mo_rayon_v01<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
         rimo.copy_from_matr(0..num_loc_row, 0..num_loc_col, i_auxbs, 2, &loc_ri3mo, 0..num_loc_row, 0..num_loc_col)
     });
 
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     Ok((rimo, row_dim, column_dim))
 }
@@ -4331,7 +4331,7 @@ fn ao2mo_rayon_v02<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
 {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     //utilities::omp_set_num_threads_wrapper(1);
 
     let num_basis = eigenvector.size()[0];
@@ -4346,7 +4346,7 @@ fn ao2mo_rayon_v02<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
     rimat_chunk.data_ref().unwrap().par_chunks_exact(num_bpair).enumerate().for_each_with(sender, |s, (i_auxbs, m)| {
 
         // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
-        utilities::omp_set_num_threads_wrapper(1);
+        omp_set_num_threads_wrapper(1);
 
         let mut loc_ri3mo = MatrixFull::new([row_dim.len(), column_dim.len()],0.0_f64);
         let mut reduced_ri = MatrixFull::new([num_basis, num_basis], 0.0_f64);
@@ -4367,7 +4367,7 @@ fn ao2mo_rayon_v02<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
         rimo.copy_from_matr(0..num_loc_row, 0..num_loc_col, i_auxbs, 2, &loc_ri3mo, 0..num_loc_row, 0..num_loc_col)
     });
 
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     Ok((rimo, row_dim, column_dim))
 }

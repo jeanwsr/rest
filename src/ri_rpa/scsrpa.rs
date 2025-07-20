@@ -11,6 +11,8 @@ use crate::constants::{PI, E, INVERSE_THRESHOLD};
 use crate::mpi_io::MPIOperator;
 use tensors::matrix_blas_lapack::{_dgemm,_dsyev};
 
+use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
+
 use super::{trans_gauss_legendre_grids, gauss_legendre_grids, logarithmic_grid};
 
 pub fn evaluate_spin_response_rayon(scf_data: &SCF, freq: f64) -> anyhow::Result<Vec<MatrixFull<f64>>> {
@@ -341,7 +343,7 @@ pub fn evaluate_osrpa_correlation_detailed_rayon(scf_data: &SCF) -> anyhow::Resu
 
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+    let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
     let mut per_omp_num_threads = default_omp_num_threads/num_freq;
     if per_omp_num_threads == 0 {per_omp_num_threads = 1};
     //if default_omp_num_threads%num_freq != 0 {per_omp_num_threads += 1};
@@ -349,7 +351,7 @@ pub fn evaluate_osrpa_correlation_detailed_rayon(scf_data: &SCF) -> anyhow::Resu
     let (sender,receiver) = channel();
     omega.par_iter().zip(weight.par_iter())
         .for_each_with(sender, |s, (omega,weight)| {
-        utilities::omp_set_num_threads_wrapper(per_omp_num_threads);
+        omp_set_num_threads_wrapper(per_omp_num_threads);
         let mut response_freq = evaluate_spin_response_serial(scf_data, *omega).unwrap();
         //if scf_data.mol.spin_channel == 1 {
         //    response_freq *= 2.0;
@@ -378,7 +380,7 @@ pub fn evaluate_osrpa_correlation_detailed_rayon(scf_data: &SCF) -> anyhow::Resu
     rpa_c_energy_os = rpa_c_energy_os*0.5/PI;
     rpa_c_energy_ss = rpa_c_energy_ss*0.5/PI;
 
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     // for scs-rpa, higher oder OS terms are combined with the SS term to be the SS+ term
     // SS+ = RPA_total - RPA_OS
