@@ -230,7 +230,7 @@ impl RIRHFGradient<'_> {
         });
         let aux_batch_size = calc_batch_size::<f64>(8 * nao * nao, mem_avail, None, Some(naux * nocc * nocc));
         let aux_batch_size = aux_batch_size.min(216);
-        let aux_partition = balance_partition(aux_loc, aux_batch_size);
+        let aux_partition = blocksize_partition(aux_loc, aux_batch_size);
 
         time_records.count("de-jk preparation 1");
 
@@ -549,11 +549,11 @@ pub fn calc_batch_size<T>(unit_flop: usize, mem_avail: Option<f64>, mem_factor: 
 ///
 /// ```rust
 /// let indices = [1, 3, 6, 7, 10, 15, 16, 19];
-/// let partitions = balance_partition(&indices, 4);
+/// let partitions = blocksize_partition(&indices, 4);
 /// // A info of `[Warn] Batch size is too small: 15 - 10 > 4` will be printed.
 /// assert_eq!(partitions, [[0, 1], [1, 3], [3, 4], [4, 5], [5, 7]]);
 /// ```
-pub fn balance_partition(indices: &[usize], batch_size: usize) -> Vec<[usize; 2]> {
+pub fn blocksize_partition(indices: &[usize], batch_size: usize) -> Vec<[usize; 2]> {
     if batch_size == 0 {
         panic!("Batch size should not be zero.");
     }
@@ -563,25 +563,18 @@ pub fn balance_partition(indices: &[usize], batch_size: usize) -> Vec<[usize; 2]
     }
 
     let mut partitions = vec![0];
-    for idx in 1..indices.len() {
-        let last = indices[partitions.last().unwrap().clone()];
-        if indices[idx] - last > batch_size {
-            if indices[idx - 1] == last {
-                println!("[Warn] Batch size is too small: {} - {} > {}", indices[idx], last, batch_size);
-                partitions.push(idx);
-            } else {
-                partitions.push(idx - 1);
-                let last = indices[partitions.last().unwrap().clone()];
-                if indices[idx] - last > batch_size {
-                    println!("[Warn] Batch size is too small: {} - {} > {}", indices[idx], indices[idx - 1], batch_size);
-                    partitions.push(idx);
-                }
+    let mut p0 = 0;
+    let n = indices.len() - 1;
+    for idx in 1..n {
+        if indices[idx + 1] - indices[p0] > batch_size {
+            if indices[idx] - indices[p0] > batch_size {
+                println!("[Warn] Batch size is too small: {} - {} > {}", indices[idx], indices[p0], batch_size);
             }
+            partitions.push(idx);
+            p0 = idx;
         }
     }
-    if partitions.last().unwrap().clone() != indices.len() - 1 {
-        partitions.push(indices.len() - 1);
-    }
+    partitions.push(n);
 
     assert!(partitions.len() >= 2);
     let mut result = vec![];
