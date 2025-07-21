@@ -10,6 +10,7 @@ use crate::utilities::{create_pool, TimeRecords};
 mod addons;
 mod fchk;
 mod pyrest_scf_io;
+mod ri_on_the_fly;
 
 use mpi::collective::SystemOperation;
 use pyo3::{pyclass, pymethods, pyfunction};
@@ -1582,7 +1583,7 @@ impl SCF {
         let spin_channel = self.mol.spin_channel;
         let dt1 = time::Local::now();
         let vj = if self.mol.ctrl.isdf_new || self.mol.ctrl.ri_k_only {
-            self.generate_vj_on_the_fly_par()
+            self.generate_vj_ri_direct(None)
         }else{
             self.generate_vj_with_ri_v_sync(1.0, mpi_operator)
         };
@@ -1644,7 +1645,7 @@ impl SCF {
         //let homo = &self.homo;
         let dt1 = time::Local::now();
         let vj = if self.mol.ctrl.isdf_new || self.mol.ctrl.ri_k_only {
-            self.generate_vj_on_the_fly_par()
+            self.generate_vj_ri_direct(None)
         } else {
             self.generate_vj_with_ri_v_sync(1.0, mpi_operator)
         };
@@ -1785,7 +1786,7 @@ impl SCF {
         let vj = if self.mol.ctrl.use_ri_vj {
             self.generate_vj_with_ri_v_sync(1.0, mpi_operator)
         } else {
-            self.generate_vj_on_the_fly_par()
+            self.generate_vj_ri_direct(None)
         };
         //// ==== DEBUG IGOR ====
         //if let Some(mpi_op) = &mpi_operator {
@@ -2933,6 +2934,45 @@ impl SCF {
         self.ri3mo = Some(ri3mo);
 
 
+    }
+
+    /// Generates J-matrix.
+    /// 
+    /// In function name:
+    /// - `ri`: using RI-V method
+    /// - `direct`: on-the-fly direct calculation
+    /// 
+    /// To activate this function, in the meantime when writing this function, in `ctrl.in`
+    /// - specify `use_ri_vj = false` to disable full storage of 3c-2e ERI (required);
+    /// - specify `[ctrl]: max_memory` in MB for calculating `block_size` if not specified;
+    fn generate_vj_ri_direct(&mut self, block_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
+        // compute block_size
+        const MAX_BLOCK_SIZE: usize = 432;
+        const MIN_BLOCK_SIZE: usize = 16;
+        let block_size = block_size.unwrap_or_else(|| {
+            let nao = self.mol.num_basis;
+            let naux = self.mol.num_auxbas;
+            let sys_info = sysinfo::System::new_all();
+            let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
+                let pid = sysinfo::get_current_pid().unwrap();
+                let used_memory = sys_info.process(pid).unwrap().memory() as f64 / 1024.0 / 1024.0;
+                max_memory - used_memory
+            });
+            let aux_batch_size = crate::grad::rhf::calc_batch_size::<f64>(nao * nao, mem_avail, None, Some(naux * naux));
+            aux_batch_size.min(MAX_BLOCK_SIZE).max(MIN_BLOCK_SIZE)
+        });
+
+        // compute vj only for specified spin channels
+        let dms = &self.density_matrix[0..self.mol.spin_channel];
+        let mol_obj = &self.mol;
+        let mut vjs = crate::scf_io::ri_on_the_fly::generate_vj_ri_direct(dms, mol_obj, block_size);
+
+        // complete `vjs` if the spin channel is 1 (restricted, spin-unpolarized)
+        if self.mol.spin_channel == 1 {
+            vjs.push(MatrixUpper::new(1, 0.0f64));
+        }
+
+        vjs
     }
 
 }
