@@ -26,7 +26,7 @@
 `
   - 输入卡中不采用'''符号
   - 若用户没有申明辅助基组，则使用`{basis_set_pool}/def2-SV(P)-JKFIT`
-  - 将输入卡中的代表基组和辅助基组的存放文件夹`{basis_set_pool}`自动替换成`/opt/rest_workspace/rest/basis-set-pool`
+  - 将输入卡中的代表基组和辅助基组的存放文件夹`{basis_set_pool}`自动替换成`/opt/rest_workspace/rest/basis-set-pool`。这是docker和singularity容器中，内置基组存放位置（见`rest_docker`项目）
   - 反复迭代比较，直至输入卡一次性全部满足上述要求
   - 输出REST程序的输入卡，使用String的格式，包含换行符号'\n'，并且对'"'符号进行'\"'转译
 
