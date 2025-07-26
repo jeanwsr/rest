@@ -23,6 +23,8 @@ use crate::dft::num_int::{eval_rho5_batch, eval_rho5_dm_only_batch, eval_ao_batc
 use crate::dft::libxc_itrf::{eval_xc_eff};
 use crate::utilities::{self, balancing};
 
+use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
+
 
 impl<'a> NumInt<'a> for RIRHFGradient<'a> {
     fn gen_xc_data(&'a self, scf_data: &'a SCF, spin: usize) -> XCData<'a> {
@@ -452,7 +454,7 @@ fn get_vxc(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &mut Grids,
 
 fn get_vxc_rayon(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &mut Grids, mol: &Molecule) -> Tsr<f64> {
     //In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
 
     let num_basis = mol.num_basis;
     // determine block settings 
@@ -473,7 +475,7 @@ fn get_vxc_rayon(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &mut 
     .for_each_with(
         sender,|s, range_grids| 
         {
-            utilities::omp_set_num_threads_wrapper(1);
+            omp_set_num_threads_wrapper(1);
             // eval batch ao 
             let num_grids = range_grids.len();
             let loc_coordinates = &grids.coordinates[range_grids.clone()];
@@ -533,7 +535,7 @@ fn get_vxc_rayon(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &mut 
             vmat += loc_vmat;
         }
     );
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
     // nabla R = - nabla r
     vmat *= -1.0;
     vmat
