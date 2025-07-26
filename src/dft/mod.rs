@@ -1,6 +1,9 @@
 mod libxc;
 pub mod gen_grids;
 pub mod deep_learning;
+pub mod libxc_itrf;
+pub mod xc_deriv;
+pub mod num_int;
 
 use mpi::collective::SystemOperation;
 use mpi::ffi::MPI_T_SCOPE_GROUP_EQ;
@@ -1233,7 +1236,7 @@ impl DFA4REST {
                         loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
                     }                            
                 }
-            }
+            } 
         }
         //println!("debug ");
         //(0..100).for_each(|i| {
@@ -2679,7 +2682,7 @@ impl Grids {
 
     pub fn prepare_tabulated_density_2_slots_dm_only(
         &self, 
-        dm:& Vec<MatrixFull<f64>>, 
+        dm:&Vec<MatrixFull<f64>>, 
         spin_channel: usize, 
         order: usize, 
         range_grids: Range<usize>

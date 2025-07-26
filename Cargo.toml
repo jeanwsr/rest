@@ -51,6 +51,7 @@ rest_libcint = {path="../rest_libcint"}
 liblbfgs = "0.1.0"
 sysinfo = "0.33"
 rstsr = { version = "0.4", default-features = false, features = ["openblas", "linalg", "rayon", "std", "col_major", "dynamic_loading"] }
+rstsr-core = { version = "0.4", default-features = false }
 derive_builder = { version = "0.20" }
 
 dftd3 = { version = "0.1", optional = true }
