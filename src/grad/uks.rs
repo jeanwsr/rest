@@ -23,6 +23,8 @@ use crate::dft::libxc_itrf::{eval_xc_eff};
 use super::rks::{gga_grad_sum, tau_grad_dot};
 use crate::utilities::{self, balancing};
 
+use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
+
 
 impl<'a> NumInt<'a> for RIUHFGradient<'a> {
     fn gen_xc_data(&'a self, scf_data: &'a SCF, spin: usize) -> XCData<'a> {
@@ -292,7 +294,7 @@ fn get_vxc(gradient_method: &RIUHFGradient, xc_data: &XCData, grids: &mut Grids,
 
 
 fn get_vxc_rayon(gradient_method: &RIUHFGradient, xc_data: &XCData, grids: &mut Grids, mol: &Molecule) -> Vec<Tsr<f64>> {
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
 
     let num_basis = mol.num_basis;
     // determine block settings 
@@ -317,7 +319,7 @@ fn get_vxc_rayon(gradient_method: &RIUHFGradient, xc_data: &XCData, grids: &mut 
     .for_each_with(
         sender,|s, range_grids| 
         {
-            utilities::omp_set_num_threads_wrapper(1);
+            omp_set_num_threads_wrapper(1);
             // eval batch ao 
             let num_grids = range_grids.len();
             let loc_coordinates = &grids.coordinates[range_grids.clone()];
@@ -386,7 +388,7 @@ fn get_vxc_rayon(gradient_method: &RIUHFGradient, xc_data: &XCData, grids: &mut 
             vmat[1] += loc_vmat[1].view();
         }
     );
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
     // nabla R = - nabla r
     for ispin in 0..nspin {
         vmat[ispin].mul_assign(-1.0);
