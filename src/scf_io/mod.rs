@@ -356,7 +356,6 @@ impl SCF {
         if let Some(grids) = &mut self.grids {
             grids.prepare_tabulated_ao(&self.mol);
         }
-
     }
 
     pub fn prepare_isdf(&mut self, mpi_operator: &Option<MPIOperator>) {
