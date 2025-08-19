@@ -28,13 +28,14 @@ use anyhow;
 //use crate::isdf::error_isdf;
 use crate::dft::DFA4REST;
 use crate::post_scf_analysis::mulliken::mulliken_pop;
+
 //use crate::post_scf_analysis::{post_scf_correlation, print_out_dfa, save_chkfile};
 use crate::scf_io::{initialize_scf, scf};
 use time::{DateTime,Local};
 use crate::molecule_io::Molecule;
 //use crate::isdf::error_isdf;
 //use crate::dft::DFA4REST;
-use crate::post_scf_analysis::{post_scf_correlation, print_out_dfa, save_chkfile, rand_wf_real_space, cube_build, molden_build, post_ai_correction};
+use crate::post_scf_analysis::{post_scf_correlation, print_out_dfa, save_chkfile, rand_wf_real_space, cube_build, molden_build, post_ai_correction,quasiparticle_methods};
 use liblbfgs::{lbfgs,Progress};
 use crate::mpi_io::{MPIOperator,MPIData};
 
@@ -319,7 +320,7 @@ pub fn main_driver() -> anyhow::Result<()> {
             };
         }
     }
-
+    
     post_scf_analysis::post_scf_output(&scf_data, &mpi_operator);
 
     //====================================
@@ -328,7 +329,11 @@ pub fn main_driver() -> anyhow::Result<()> {
     if scf_data.mol.ctrl.post_correlation.len()>=1 {
         post_scf_correlation(&mut scf_data);
     }
-
+    println!("quasiparticle method:{}",scf_data.mol.ctrl.quasipartcle_methods);
+    if scf_data.mol.ctrl.quasipartcle_methods.len()>=1{
+        print!("Now starts quasiparticle method computation!\n");
+        quasiparticle_methods(&mut scf_data,&mpi_operator);
+    }
     time_mark.count("Overall");
 
     if scf_data.mol.ctrl.print_level > 0 {

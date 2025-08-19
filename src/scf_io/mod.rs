@@ -53,6 +53,7 @@ pub struct SCF {
     pub m: Option<MatrixFull<f64>>,
     pub rimatr: Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
     pub ri3mo: Option<Vec<(RIFull<f64>,std::ops::Range<usize> , std::ops::Range<usize>)>>,
+    pub ri3mo_full:Option<Vec<(RIFull<f64>,std::ops::Range<usize> , std::ops::Range<usize>)>>,
     #[pyo3(get,set)]
     pub eigenvalues: [Vec<f64>;2],
     //pub eigenvectors: Vec<Tensors<f64>>,
@@ -81,6 +82,8 @@ pub struct SCF {
     pub empirical_dispersion_energy: f64,
     pub energies: HashMap<String,Vec<f64>>,
     pub ref_eigenvectors: HashMap<String, ([MatrixFull<f64>;2], [usize;4])>,
+    pub renormalized_singles_particles:Vec<f64>,
+    pub gwqp:(Vec<f64>,Vec<f64>),
 }
 
 #[derive(Clone,Copy)]
@@ -104,6 +107,7 @@ impl SCF {
             m: None,
             rimatr: None,
             ri3mo: None,
+            ri3mo_full:None,
             eigenvalues: [vec![],vec![]],
             hamiltonian: [MatrixUpper::empty(),
                           MatrixUpper::empty()],
@@ -127,6 +131,8 @@ impl SCF {
             empirical_dispersion_energy: 0.0,
             grids: None,
             energies: HashMap::new(),
+            renormalized_singles_particles:Vec::new(),
+            gwqp:(Vec::new(),Vec::new()),
         };
 
         // at first check the scf type: RHF, ROHF or UHF
@@ -2931,10 +2937,29 @@ impl SCF {
         // deallocate the rimatr to save the memory
         self.rimatr = None;
         self.ri3mo = Some(ri3mo);
-
+    }
+    pub fn generate_ri3mo_full_rayon(&mut self, row_range: std::ops::Range<usize>, col_range: std::ops::Range<usize>) {
+        let (mut ri3ao, mut basbas2baspair, mut baspar2basbas) =  if let Some((riao,basbas2baspair, baspar2basbas))=&mut self.rimatr {
+            (riao,basbas2baspair, baspar2basbas)
+        } else {
+            panic!("rimatr should be initialized in the preparation of ri3mo");
+        };
+        let mut ri3mo: Vec<(RIFull<f64>,std::ops::Range<usize>, std::ops::Range<usize>)> = vec![];
+        for i_spin in 0..self.mol.spin_channel {
+            let eigenvector = &self.eigenvectors[i_spin];
+            ri3mo.push(
+                ao2mo_rayon(
+                    eigenvector, ri3ao, 
+                    row_range.clone(), 
+                    col_range.clone()
+                ).unwrap()
+            )
+        }
+        self.ri3mo_full = Some(ri3mo);
+        self.rimatr=None;
 
     }
-
+    
     /// Generates J-matrix.
     /// 
     /// In function name:
