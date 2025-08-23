@@ -16,6 +16,8 @@ use crate::mpi_io::MPIOperator;
 use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon, open_shell_sbge2_rayon, close_shell_sbge2_detailed_rayon, open_shell_sbge2_detailed_rayon};
 use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon, evaluate_spin_response_rayon, evaluate_special_radius_only};
 use crate::ri_rpa::{evaluate_rpa_correlation, evaluate_rpa_correlation_rayon};
+use crate::ri_gw;
+use crate::ri_bse;
 use crate::scf_io::{SCF, SCFType};
 use crate::ri_pt2::{close_shell_pt2_rayon, open_shell_pt2_rayon};
 use crate::utilities::TimeRecords;
@@ -433,6 +435,43 @@ pub fn post_scf_correlation(scf_data: &mut SCF) {
         });
         println!("----------------------------------------------------------------------");
         if scf_data.mol.ctrl.print_level>1 {timerecords.report_all()};
+    }
+}
+
+pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>){
+    let output_type=scf_data.mol.ctrl.quasipartcle_methods.clone();
+    if output_type.eq("gw"){
+        let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
+        if scf_data.mol.ctrl.gw_scheme !="no gw" || scf_data.mol.ctrl.homo_lumo_gw_qp==true{
+            let mut rimatr=scf_data.rimatr.clone();
+            ri_bse::prepare_ri3mo(scf_data,'Y');
+            if scf_data.mol.ctrl.bse_all==false || scf_data.mol.ctrl.bse_spin =="none"{
+                scf_data.rimatr=rimatr;
+                rimatr=None;
+            }else{
+                rimatr=None;
+            }
+        }
+        if scf_data.mol.ctrl.homo_lumo_gw_qp==true{
+            ri_gw::get_homo_lumo_qp_only(scf_data,20,&vxc_nn,mpi_operator);
+        }else{
+            ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
+        }
+    }else if output_type.eq("bse"){
+        if scf_data.mol.ctrl.gw_scheme=="parse from file"{
+            let parse_qp_path=scf_data.mol.ctrl.parse_qp_path.clone();
+            scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
+        }else{
+            let mut rimatr=scf_data.rimatr.clone();
+            ri_bse::prepare_ri3mo(scf_data,'Y');
+            scf_data.rimatr=rimatr;
+            rimatr=None;
+            let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
+            ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
+        }
+        ri_bse::bse_main(scf_data);
+    }else{
+        print!("Warning: You entered an invalid quasiparticle method. No quasiparticle methods Were triggered.")
     }
 }
 

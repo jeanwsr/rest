@@ -475,7 +475,7 @@ fn evaluate_rpa_integrand(polar_freq: &mut MatrixFull<f64>) -> f64 {
 }
 
 
-fn logarithmic_grid(score:[f64;2],num_grids:usize) -> (Vec<f64>, Vec<f64>) {
+pub fn logarithmic_grid(score:[f64;2],num_grids:usize) -> (Vec<f64>, Vec<f64>) {
     let e = std::f64::consts::E;
     let w_0 = 0.01_f64;
     let h = 1.0_f64/(num_grids as f64)*((score[1] - score[0])/w_0).log(e);
@@ -493,7 +493,7 @@ fn logarithmic_grid(score:[f64;2],num_grids:usize) -> (Vec<f64>, Vec<f64>) {
 
 }
 
-fn trans_gauss_legendre_grids(omega_max:f64,num_grids:usize) -> (Vec<f64>, Vec<f64>) {
+pub fn trans_gauss_legendre_grids(omega_max:f64,num_grids:usize) -> (Vec<f64>, Vec<f64>) {
     //specific for the frequence generation
     let score = [-omega_max, omega_max];
     let (s_abcsia, s_weight) = gauss_legendre_grids(score, num_grids);
@@ -513,7 +513,7 @@ fn trans_gauss_legendre_grids(omega_max:f64,num_grids:usize) -> (Vec<f64>, Vec<f
     (abcsia,weight)
 }
 
-fn gauss_legendre_grids(score:[f64;2],num_grids:usize) -> (Vec<f64>, Vec<f64>) {
+pub fn gauss_legendre_grids(score:[f64;2],num_grids:usize) -> (Vec<f64>, Vec<f64>) {
     let eps = 3E-14;
     let pi = std::f64::consts::PI;
     let m = (num_grids+1)/2;
