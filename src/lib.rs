@@ -71,6 +71,8 @@ pub mod post_scf_analysis;
 pub mod main_driver;
 pub mod ri_pt2;
 pub mod ri_rpa;
+pub mod ri_gw;
+pub mod ri_bse;
 
 //extern crate rest;
 
