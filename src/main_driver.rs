@@ -329,9 +329,8 @@ pub fn main_driver() -> anyhow::Result<()> {
     if scf_data.mol.ctrl.post_correlation.len()>=1 {
         post_scf_correlation(&mut scf_data);
     }
-    println!("quasiparticle method:{}",scf_data.mol.ctrl.quasipartcle_methods);
     if scf_data.mol.ctrl.quasipartcle_methods.len()>=1{
-        print!("Now starts quasiparticle method computation!\n");
+        println!("Now start quasiparticle computation using {}",scf_data.mol.ctrl.quasipartcle_methods);
         quasiparticle_methods(&mut scf_data,&mpi_operator);
     }
     time_mark.count("Overall");

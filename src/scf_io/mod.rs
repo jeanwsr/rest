@@ -433,6 +433,47 @@ impl SCF {
     pub fn generate_occupation(&mut self) {
         (self.occupation, self.homo, self.lumo) = generate_occupation_outside(&self);
     }
+    
+    pub fn print_homo_lumo_gap(&self) {
+        let is_rohf = match self.scftype {
+            SCFType::ROHF => true,
+            _ => false,
+        };
+        if self.mol.ctrl.print_level>0 {
+            if self.mol.spin_channel==1 {
+                let i_spin = 0; 
+                let i_homo = self.homo[i_spin];
+                let i_lumo = self.lumo[i_spin];
+                let homo = self.eigenvalues[i_spin][i_homo];
+                let lumo = self.eigenvalues[i_spin][i_lumo];
+                println!("HOMO: {:16.8}, LUMO: {:14.6}, H-L Gap: {:16.8}", homo, lumo, lumo-homo);
+            } else {
+                for i_spin in (0..self.mol.spin_channel) {
+                         // 只打印有电子的自旋通道
+                    if (self.mol.num_elec[i_spin+1] > 1.0E-5) {
+                        if ! is_rohf {
+                            let i_homo = self.homo[i_spin];
+                            let i_lumo = self.lumo[i_spin];
+                            let homo = self.eigenvalues[i_spin][i_homo];
+                            let lumo = self.eigenvalues[i_spin][i_lumo];
+                            println!("Spin {:2}: HOMO: {:14.6}, LUMO: {:14.6}, H-L Gap: {:16.8}", i_spin, homo, lumo, lumo-homo);
+                        } else {
+                            // 对于ROHF, 只打印第一个自旋通道(i_spin=0)
+                            let i_homo = self.homo[i_spin];
+                            let i_lumo = self.lumo[i_spin];
+                            //println!("i_homo: {}, i_lumo: {}", i_homo, i_lumo);
+                            //println!("debug eigenvalues: {:?}", self.eigenvalues[0]);
+                            let homo = self.eigenvalues[0][i_homo];
+                            let lumo = self.eigenvalues[0][i_lumo];
+                            println!("Spin {:2}: HOMO: {:14.6}, LUMO: {:14.6}, H-L Gap: {:16.8}", i_spin, homo, lumo, lumo-homo);
+                        }
+                    } else {
+                        println!("No electron with spin {:2}", i_spin);
+                    }
+                }
+            }
+        }
+    }
 
     pub fn generate_density_matrix(&mut self) {
         self.density_matrix = generate_density_matrix_outside(&self);
@@ -2370,6 +2411,7 @@ impl SCF {
         let spin_channel = self.mol.spin_channel;
         match self.scftype {
             SCFType::RHF => {
+                println!("Eigenvalues in Restricted HF (or KS) calculation:");
                 println!("{:>8}{:>14}{:>18}",String::from("State"),
                                         String::from("Occupation"),
                                         String::from("Eigenvalue"));
@@ -2383,6 +2425,7 @@ impl SCF {
                 }
             },
             SCFType::UHF => {
+                println!("Eigenvalues in Unrestricted HF (or KS) calculation:");
                 for i_spin in (0..spin_channel) {
                     if i_spin == 0 {
                         println!("Spin-up eigenvalues");
@@ -2407,6 +2450,7 @@ impl SCF {
                 }
             },
             SCFType::ROHF => {
+                println!("Eigenvalues in Rrestricted Openshell HF (or KS) calculation:");
                 println!("{:>8}{:>14}{:>18}",String::from("State"),
                                         String::from("Occupation"),
                                         String::from("Eigenvalue"));
@@ -4852,6 +4896,9 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         let dt1_2 = time::Local::now();
         scf_data.generate_occupation();
         scf_data.generate_density_matrix();
+        if scf_data.mol.ctrl.print_level>1 {
+            scf_data.print_homo_lumo_gap()
+        };
         let dt1_3 = time::Local::now();
         scf_converge = scf_data.check_scf_convergence(&scf_records);
         let dt1_4 = time::Local::now();
@@ -4894,37 +4941,37 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         if scf_data.mol.ctrl.print_level>0 {println!("SCF is converged after {:4} iterations.", scf_records.num_iter-1)};
         // Level shift is disabled before the final diagonalization to ensure accurate eigenvalues.
         // Formatted printing of eigenvalues and eigenvectors is now performed after re-diagonalizing the HF Hamiltonian.
-
-        match scf_data.mol.ctrl.occupation_type {
-            OCCType::FRAC => {
-                let (occupation, homo, lumo) = check_norm::generate_occupation_integer(&scf_data.mol, &scf_data.scftype);
-                scf_data.occupation = occupation;
-                scf_data.homo = homo;
-                scf_data.lumo = lumo;
-                scf_data.generate_density_matrix();
-                scf_data.generate_hf_hamiltonian(mpi_operator);
-                scf_data.diagonalize_hamiltonian(mpi_operator);
-
-            }
-            _ => {
-                scf_data.generate_hf_hamiltonian(mpi_operator); 
-                scf_data.diagonalize_hamiltonian(mpi_operator); 
-            }
-        }
-
-        if scf_data.mol.ctrl.print_level>1 {
-            scf_data.formated_eigenvalues((scf_data.homo.iter().max().unwrap()+4).min(scf_data.mol.num_state));
-        }
-        if scf_data.mol.ctrl.print_level>3 {
-            scf_data.formated_eigenvectors();
-        }
-        // not yet implemented. Just an empty subroutine
     } else {
         //if scf_data.mol.ctrl.restart {save_chkfile(&scf_data)};
         println!("SCF does not converge within {:03} iterations",scf_records.num_iter);
     }
+    match scf_data.mol.ctrl.occupation_type {
+        OCCType::FRAC => {
+            let (occupation, homo, lumo) = check_norm::generate_occupation_integer(&scf_data.mol, &scf_data.scftype);
+            scf_data.occupation = occupation;
+            scf_data.homo = homo;
+            scf_data.lumo = lumo;
+            scf_data.generate_density_matrix();
+            scf_data.generate_hf_hamiltonian(mpi_operator);
+            scf_data.diagonalize_hamiltonian(mpi_operator);
+
+        }
+        _ => {
+            scf_data.generate_hf_hamiltonian(mpi_operator); 
+            scf_data.diagonalize_hamiltonian(mpi_operator); 
+        }
+    }
+
+    if scf_data.mol.ctrl.print_level>1 {
+        scf_data.print_homo_lumo_gap();
+        scf_data.formated_eigenvalues((scf_data.homo.iter().max().unwrap()+4).min(scf_data.mol.num_state));
+    }
+    if scf_data.mol.ctrl.print_level>3 {
+        scf_data.formated_eigenvectors();
+    }
 
 }
+
 
 pub fn vj_on_the_fly_par(mol: &Molecule, dm: &Vec<MatrixFull<f64>>) -> Vec<MatrixUpper<f64>>{
 
