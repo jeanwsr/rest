@@ -1147,8 +1147,8 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
 
 
     for i_spin in (0..2) {
-        let eigenvalues_spin = scf_data.semi_eigenvalues.get(i_spin).unwrap();
-        let fock_spin = scf_data.semi_fock.get(i_spin).unwrap();
+        let eigenvalues_spin = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin];
+        let fock_spin = &scf_data.semi_fock.as_ref().unwrap()[i_spin];
         for i_occ in (0..scf_data.lumo[i_spin]) {
             for i_virt in (scf_data.lumo[i_spin]..scf_data.mol.num_state) {
                 let single_gap = eigenvalues_spin[i_virt] - eigenvalues_spin[i_occ];
@@ -1175,8 +1175,8 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
             if i_spin_1 == i_spin_2 {
 
                 let i_spin = i_spin_1;
-                let eigenvector = scf_data.semi_eigenvectors.get(i_spin).unwrap();
-                let eigenvalues = scf_data.semi_eigenvalues.get(i_spin).unwrap();
+                let eigenvector = &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin];
+                let eigenvalues = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin];
                 let occupation = scf_data.occupation.get(i_spin).unwrap();
 
                 let homo = scf_data.homo.get(i_spin).unwrap().clone();
@@ -1260,8 +1260,8 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
                 e_mp2_ss -= receiver.into_iter().sum::<f64>();
 
             } else {
-                let eigenvector_1 = scf_data.semi_eigenvectors.get(i_spin_1).unwrap();
-                let eigenvalues_1 = scf_data.semi_eigenvalues.get(i_spin_1).unwrap();
+                let eigenvector_1 = &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin_1];
+                let eigenvalues_1 = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin_1];
                 let occupation_1 = scf_data.occupation.get(i_spin_1).unwrap();
                 let homo_1 = scf_data.homo.get(i_spin_1).unwrap().clone();
                 let lumo_1 = scf_data.lumo.get(i_spin_1).unwrap().clone();
@@ -1270,8 +1270,8 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
                 let num_occu_1 = if scf_data.mol.num_elec[i_spin_1 + 1] <= 1.0e-6 {0} else {homo_1 + 1};
                 let (rimo_1, vir_range, occ_range) = &ri3mo_vec[i_spin_1];
 
-                let eigenvector_2 = scf_data.semi_eigenvectors.get(i_spin_2).unwrap();
-                let eigenvalues_2 = scf_data.semi_eigenvalues.get(i_spin_2).unwrap();
+                let eigenvector_2 = &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin_2];
+                let eigenvalues_2 = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin_2];
                 let occupation_2 = scf_data.occupation.get(i_spin_2).unwrap();
                 let homo_2 = scf_data.homo.get(i_spin_2).unwrap().clone();
                 let lumo_2 = scf_data.lumo.get(i_spin_2).unwrap().clone();
@@ -1414,8 +1414,8 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
                 if i_spin_1 == i_spin_2 {
 
                     let i_spin = i_spin_1;
-                    let eigenvector = scf_data.semi_eigenvectors.get(i_spin).unwrap();
-                    let eigenvalues = scf_data.semi_eigenvalues.get(i_spin).unwrap();
+                    let eigenvector = &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin];
+                    let eigenvalues = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin];
                     let occupation = scf_data.occupation.get(i_spin).unwrap();
 
                     let homo = scf_data.homo.get(i_spin).unwrap().clone();
@@ -1507,8 +1507,8 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
 
 
                 } else {
-                    let eigenvector_1 = scf_data.semi_eigenvectors.get(i_spin_1).unwrap();
-                    let eigenvalues_1 = scf_data.semi_eigenvalues.get(i_spin_1).unwrap();
+                    let eigenvector_1 = &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin_1];
+                    let eigenvalues_1 = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin_1];
                     let occupation_1 = scf_data.occupation.get(i_spin_1).unwrap();
                     let homo_1 = scf_data.homo.get(i_spin_1).unwrap().clone();
                     let lumo_1 = scf_data.lumo.get(i_spin_1).unwrap().clone();
@@ -1517,8 +1517,8 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
                     let num_occu_1 = if scf_data.mol.num_elec[i_spin_1 + 1] <= 1.0e-6 {0} else {homo_1 + 1};
                     let (rimo_1, vir_range, occ_range) = &ri3mo_vec[i_spin_1];
 
-                    let eigenvector_2 = scf_data.semi_eigenvectors.get(i_spin_2).unwrap();
-                    let eigenvalues_2 = scf_data.semi_eigenvalues.get(i_spin_2).unwrap();
+                    let eigenvector_2 = &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin_2];
+                    let eigenvalues_2 = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin_2];
                     let occupation_2 = scf_data.occupation.get(i_spin_2).unwrap();
                     let homo_2 = scf_data.homo.get(i_spin_2).unwrap().clone();
                     let lumo_2 = scf_data.lumo.get(i_spin_2).unwrap().clone();
