@@ -19,6 +19,8 @@ use crate::scf_io::{SCF,scf};
 use crate::constants::{E, PI};
 use crate::utilities::{debug_print_slices, self};
 
+use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
+
 pub fn rpa_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<f64> {
 
     let x_energy = scf_data.evaluate_exact_exchange_ri_v(mpi_operator);
@@ -153,8 +155,7 @@ pub fn evaluate_rpa_correlation(scf_data: &SCF) -> anyhow::Result<f64>  {
 pub fn evaluate_rpa_correlation_rayon(scf_data: &SCF) -> anyhow::Result<f64>  {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
 
     let mut rpa_c_energy = 0.0_f64;
     let spin_channel = scf_data.mol.spin_channel;
@@ -182,6 +183,9 @@ pub fn evaluate_rpa_correlation_rayon(scf_data: &SCF) -> anyhow::Result<f64>  {
     let (sender,receiver) = channel();
     rayon::prelude::IndexedParallelIterator::zip(omega.par_iter(), weight.par_iter())
         .for_each_with(sender, |s, (omega,weight)| {
+
+        omp_set_num_threads_wrapper(1);
+
         let mut response_freq = evaluate_response_serial(scf_data, *omega).unwrap();
         if scf_data.mol.spin_channel == 1 {
             response_freq *= 2.0;
@@ -200,7 +204,7 @@ pub fn evaluate_rpa_correlation_rayon(scf_data: &SCF) -> anyhow::Result<f64>  {
 
     rpa_c_energy = rpa_c_energy*0.5/PI;
 
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     Ok(rpa_c_energy)
 }
@@ -253,8 +257,7 @@ fn evaluate_response(scf_data: &SCF, rimo: &mut Vec<RIFull<f64>>, freq: f64) -> 
 fn evaluate_response_rayon(scf_data: &SCF, freq: f64) -> anyhow::Result<MatrixFull<f64>> {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
 
     let num_auxbas = scf_data.mol.num_auxbas;
     let num_basis = scf_data.mol.num_basis;
@@ -286,6 +289,8 @@ fn evaluate_response_rayon(scf_data: &SCF, freq: f64) -> anyhow::Result<MatrixFu
             };
             let (sender,receiver) = channel();
             elec_pair.par_iter().for_each_with(sender,|s,i_pair| {
+
+                omp_set_num_threads_wrapper(1);
 
                 let mut loc_polar_freq = MatrixFull::new([num_auxbas,num_auxbas],0.0);
                 let j_state = i_pair[0];
@@ -349,7 +354,7 @@ fn evaluate_response_rayon(scf_data: &SCF, freq: f64) -> anyhow::Result<MatrixFu
         panic!("RI3MO should be initialized before the RPA calculations")
     };
 
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     Ok(polar_freq)
 
@@ -470,7 +475,7 @@ fn evaluate_rpa_integrand(polar_freq: &mut MatrixFull<f64>) -> f64 {
 }
 
 
-fn logarithmic_grid(score:[f64;2],num_grids:usize) -> (Vec<f64>, Vec<f64>) {
+pub fn logarithmic_grid(score:[f64;2],num_grids:usize) -> (Vec<f64>, Vec<f64>) {
     let e = std::f64::consts::E;
     let w_0 = 0.01_f64;
     let h = 1.0_f64/(num_grids as f64)*((score[1] - score[0])/w_0).log(e);
@@ -488,7 +493,7 @@ fn logarithmic_grid(score:[f64;2],num_grids:usize) -> (Vec<f64>, Vec<f64>) {
 
 }
 
-fn trans_gauss_legendre_grids(omega_max:f64,num_grids:usize) -> (Vec<f64>, Vec<f64>) {
+pub fn trans_gauss_legendre_grids(omega_max:f64,num_grids:usize) -> (Vec<f64>, Vec<f64>) {
     //specific for the frequence generation
     let score = [-omega_max, omega_max];
     let (s_abcsia, s_weight) = gauss_legendre_grids(score, num_grids);
@@ -508,7 +513,7 @@ fn trans_gauss_legendre_grids(omega_max:f64,num_grids:usize) -> (Vec<f64>, Vec<f
     (abcsia,weight)
 }
 
-fn gauss_legendre_grids(score:[f64;2],num_grids:usize) -> (Vec<f64>, Vec<f64>) {
+pub fn gauss_legendre_grids(score:[f64;2],num_grids:usize) -> (Vec<f64>, Vec<f64>) {
     let eps = 3E-14;
     let pi = std::f64::consts::PI;
     let m = (num_grids+1)/2;

@@ -7,6 +7,7 @@ use std::{fs, sync::Arc};
 use crate::{check_norm::force_state_occupation::ForceStateOccupation, dft::{DFAFamily, DFTType, DFA4REST}, geom_io::{GeomCell, GeomUnit, MOrC}, utilities};
 use rayon::ThreadPoolBuilder;
 use crate::check_norm::OCCType;
+use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper,omp_get_num_threads_wrapper};
 
 use serde_json;
 use toml;
@@ -221,8 +222,39 @@ pub struct InputKeywords {
     /// For multi-node (MPI), this keyword is not fully discussed.
     pub max_memory: Option<f64>,
     pub guess_mix: bool,
-    pub guess_mix_theta_deg: f64,
-    pub spin_correction_scheme: Option<String>
+    pub guess_mix_theta_deg: Vec<f64>,
+    pub spin_correction_scheme: Option<String>,
+    /// External dipole field (x, y, z) intensity in atomic units
+    pub ext_field_dipole: Option<[f64; 3]>,
+    pub opt_engine: Option<String>,
+    pub gw_scheme:String,
+    pub homo_lumo_gw_qp:bool,
+    pub x_alpha:f64,
+    pub save_qp:bool,
+    pub bse_all:bool,
+    pub bse_tda:bool,
+    pub bse_spin:String,
+    pub bse_cutoff_energy:f64,
+    pub save_bse_terms:bool,
+    pub obtain_vx_vc_terms:bool,
+    pub obtain_pure_exchange:bool,
+    pub obtain_ks_homos:bool,
+    pub gw_linearize_shift:f64,
+    pub gw_linearize_derivative_h:f64,
+    pub renormalized_singles:bool,
+    pub w_rs:bool,
+    pub scgw:String,
+    pub gw:bool,
+    pub save_bse_excitations:bool,
+    pub evgw_rounds:usize,
+    pub save_gw_homo_lumo_qp:bool,
+    pub save_single_qp_path:String,
+    pub save_first_excitation:bool,
+    pub save_first_excitation_path:String,
+    pub parse_qp_path:String,
+    pub bse_qp_polarization:bool,
+    pub threshold:f64,
+    pub quasipartcle_methods:String,
 }
 
 impl InputKeywords {
@@ -241,7 +273,7 @@ impl InputKeywords {
             auxbas_path: String::from("./def2-SV(P)-JKFIT"),
             auxbas_type: String::from("spheric"),
             use_auxbas: true,
-            auxbasis_response: false,
+            auxbasis_response: true,
             numerical_force: false,
             use_isdf: false,
             ri_k_only: false,
@@ -336,8 +368,38 @@ impl InputKeywords {
             pt2_mpi_mode: 0,
             max_memory: None,
             guess_mix: false,
-            guess_mix_theta_deg: 15.0,
-            spin_correction_scheme: None
+            guess_mix_theta_deg: [15.0, 15.0].to_vec(),
+            spin_correction_scheme: None,
+            ext_field_dipole: None,
+            opt_engine: None,
+            gw_scheme:String::from("no gw"),
+            homo_lumo_gw_qp:false,
+            x_alpha:0.5,
+            save_qp:false,
+            bse_all:false,
+            bse_tda:false,
+            bse_spin:String::from("none"),
+            bse_cutoff_energy:1000000.0,
+            save_bse_terms:false,
+            obtain_vx_vc_terms:false,
+            obtain_pure_exchange:false,
+            obtain_ks_homos:false,
+            gw_linearize_shift:1e-2,
+            gw_linearize_derivative_h:1e-10,
+            renormalized_singles:false,
+            w_rs:false,
+            scgw:String::from("g0w0"),
+            gw:false,
+            save_bse_excitations:false, 
+            evgw_rounds:0,
+            save_gw_homo_lumo_qp:false,
+            save_single_qp_path:String::from("single_qp_path.txt"),
+            save_first_excitation:false,
+            save_first_excitation_path:String::from("first_excitation_save.txt"),
+            parse_qp_path:String::from("./qp_energies"),
+            bse_qp_polarization:false,
+            threshold:0.1,
+            quasipartcle_methods:String::new(),
         }
     }
 
@@ -387,9 +449,9 @@ impl InputKeywords {
                     // Now move the setting of rayon thread numbers to the main.rs
                     //rayon::ThreadPoolBuilder::new().num_threads(num_threads);
                     rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global().unwrap_or_else(|x| {println!("{:?}", &x)});
-                    utilities::omp_set_num_threads_wrapper(num_threads);
+                    omp_set_num_threads_wrapper(num_threads);
                 } else {
-                    utilities::omp_set_num_threads_wrapper(rayon::current_num_threads());
+                    omp_set_num_threads_wrapper(rayon::current_num_threads());
                     //if tmp_input.print_level>0 {println!("The default rayon num_threads value is used:      {}", rayon::current_num_threads())};
                 };
                 //println!("max_num_threads: {}, current_num_threads: {}", rayon::max_num_threads(), rayon::current_num_threads());
@@ -526,7 +588,7 @@ impl InputKeywords {
                 // ==============================================
                 tmp_input.auxbasis_response = match tmp_ctrl.get("auxbasis_response").unwrap_or(&serde_json::Value::Null) {
                     serde_json::Value::Bool(tmp_str) => *tmp_str,
-                    other => false,
+                    other => true,
                 };
                 tmp_input.numerical_force = match tmp_ctrl.get("numerical_force").unwrap_or(&serde_json::Value::Null) {
                     serde_json::Value::Bool(tmp_str) => *tmp_str,
@@ -636,7 +698,15 @@ impl InputKeywords {
                 };
 
                 tmp_input.empirical_dispersion = match tmp_ctrl.get("empirical_dispersion").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_emp) => {Some(tmp_emp.to_lowercase())},
+                    serde_json::Value::String(tmp_emp) => {
+                        if tmp_emp.to_lowercase() == "none" {
+                           None 
+                        } else if tmp_emp.to_lowercase() == "true" {
+                            Some("d3bj".to_string())
+                        } else {
+                           Some(tmp_emp.to_lowercase())
+                        }
+                    },
                     other => {None},
                 };
                 //let re0 = Regex::new(r"
@@ -1174,16 +1244,152 @@ impl InputKeywords {
                     _ => false,
                 };
                 
+                // for guess_mix_theta_deg: support number, string, or array; default to [15.0, 15.0]
                 tmp_input.guess_mix_theta_deg = match tmp_ctrl.get("guess_mix_theta_deg").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Number(tmp_num) => tmp_num.as_f64().unwrap_or(15.0),
-                    serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(15.0),
-                    _ => 15.0,
+                    serde_json::Value::Number(n) => vec![n.as_f64().unwrap_or(15.0); 2],
+                    serde_json::Value::String(s) => {
+                        let val = s.parse::<f64>().unwrap_or(15.0);
+                        vec![val; 2]
+                    }
+                    serde_json::Value::Array(arr) => {
+                        let mut vals = arr.iter().filter_map(|v| v.as_f64()).collect::<Vec<f64>>();
+                        if vals.len() == 1 { vec![vals[0]; 2] }
+                        else { vals.truncate(2); vals }
+                    }
+                    _ => vec![15.0, 15.0],
                 };
+
                 tmp_input.spin_correction_scheme = match tmp_ctrl.get("spin_correction_scheme").unwrap_or(&serde_json::Value::Null) {
                     serde_json::Value::String(tmp_emp) => {Some(tmp_emp.to_lowercase())},
                     other => {None},
                 };
 
+                // opt_engine: available options: "lbfgs", "geometric-pyo3"; default: "lbfgs"
+                tmp_input.opt_engine = match tmp_ctrl.get("opt_engine").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::String(tmp_str) => { 
+                        let s = tmp_str.to_lowercase();
+                        match s.as_str() {
+                            "lbfgs" | "geometric-pyo3" => Some(s.to_string()),
+                            _ => panic!("Not recognized option for opt_engine: {}", s),
+                        }
+                    },
+                    serde_json::Value::Null => { None },
+                    _ => panic!("Not recognized type for opt_engine"),
+                };
+                tmp_input.gw_scheme = match tmp_ctrl.get("gw_scheme").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => String::from("no gw"),
+                };
+                tmp_input.homo_lumo_gw_qp=match tmp_ctrl.get("homo_lumo_gw_qp").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                    other => {false},
+                };
+                tmp_input.x_alpha=match tmp_ctrl.get("x_alpha").unwrap_or(&serde_json::Value::Null){
+                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(2.0_f64)},
+                    other => {0.5},
+                };
+                tmp_input.save_qp = match tmp_ctrl.get("save_qp").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                    other => {false},
+                };
+                tmp_input.bse_all = match tmp_ctrl.get("bse_all").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                    other => {false},
+                };
+                tmp_input.bse_tda = match tmp_ctrl.get("bse_tda").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                    other => {false},
+                };
+                tmp_input.bse_spin = match tmp_ctrl.get("bse_spin").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => String::from("none"),
+                };
+                tmp_input.bse_cutoff_energy = match tmp_ctrl.get("bse_cutoff_energy").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.5_f64)},
+                    other => {1000000.0},
+                };
+                tmp_input.save_bse_terms = match tmp_ctrl.get("save_bse_terms").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                    other => {false},
+                };
+                tmp_input.obtain_vx_vc_terms = match tmp_ctrl.get("obtain_vx_vc_terms").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                    other => {false},
+                };
+                tmp_input.obtain_pure_exchange = match tmp_ctrl.get("obtain_pure_exchange").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                    other => {false},
+                };
+                tmp_input.obtain_ks_homos = match tmp_ctrl.get("obtain_ks_homos").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                    other => {false},
+                };
+                tmp_input.gw_linearize_shift= match tmp_ctrl.get("gw_linearize_shift").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.01_f64)},
+                    other => {0.01},
+                };
+                tmp_input.gw_linearize_derivative_h= match tmp_ctrl.get("gw_linearize_derivative_h").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-10_f64)},
+                    other => {1e-10},
+                };
+                tmp_input.threshold= match tmp_ctrl.get("threshold").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.1)},
+                    other => {0.1},
+                };
+                tmp_input.renormalized_singles = match tmp_ctrl.get("renormalized_singles").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                    other => {false},
+                };
+                tmp_input.w_rs = match tmp_ctrl.get("w_rs").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                    other => {false},
+                };
+                tmp_input.scgw = match tmp_ctrl.get("scgw").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => String::from("g0w0"),
+                };
+                tmp_input.gw = match tmp_ctrl.get("gw").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                    other => {false},
+                };
+
+                tmp_input.evgw_rounds = match tmp_ctrl.get("evgw_rounds").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(4_usize)},
+                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(4) as usize},
+                    other => {0}
+                };
+                tmp_input.save_gw_homo_lumo_qp = match tmp_ctrl.get("save_gw_homo_lumo_qp").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                    other => {false},
+                };
+                tmp_input.save_bse_excitations = match tmp_ctrl.get("save_bse_excitations").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                    other => {false},
+                };
+                tmp_input.save_single_qp_path = match tmp_ctrl.get("save_single_qp_path").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => String::from("single_qp_save.txt"),
+                };
+                tmp_input.save_first_excitation = match tmp_ctrl.get("save_first_excitation").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                    other => {false},
+                };
+                tmp_input.save_first_excitation_path = match tmp_ctrl.get("save_first_excitation_path").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => String::from("first_excitation_save.txt"),
+                };
+                tmp_input.parse_qp_path = match tmp_ctrl.get("parse_qp_path").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => String::from("./qp_energies"),
+                };
+                tmp_input.quasipartcle_methods = match tmp_ctrl.get("quasiparticle_methods").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => String::new(),
+                };
+                tmp_input.bse_qp_polarization = match tmp_ctrl.get("bse_qp_polarization").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                    other => {false},
+                };
                 //===========================================================
                 // Global check of ctrl keywords and futher modification
                 //============================================================
@@ -1253,6 +1459,9 @@ impl InputKeywords {
                         tmp_geomcell.fix = tmp2;
                         tmp_geomcell.position = tmp3;
                         tmp_geomcell.nfree = tmp4;
+                        // real items in to real + ghost items
+                        tmp_geomcell.rg_elem = tmp_geomcell.elem.clone();
+                        tmp_geomcell.rg_position = tmp_geomcell.position.clone();
                     },
                     serde_json::Value::String(tmp_str) => {
                         let tmp_unit = tmp_geomcell.unit.clone();
@@ -1263,6 +1472,9 @@ impl InputKeywords {
                         tmp_geomcell.fix = tmp2;
                         tmp_geomcell.position = tmp3;
                         tmp_geomcell.nfree = tmp4;
+                        // real items in to real + ghost items
+                        tmp_geomcell.rg_elem = tmp_geomcell.elem.clone();
+                        tmp_geomcell.rg_position = tmp_geomcell.position.clone();
 
                     }
                     other => {
@@ -1290,6 +1502,12 @@ impl InputKeywords {
                         if let Some((bs_elem, bs_pos)) = bs {
                             tmp_geomcell.ghost_bs_elem = bs_elem;
                             tmp_geomcell.ghost_bs_pos = bs_pos;
+                            //println!("{:?}", &tmp_geomcell.ghost_bs_pos);
+                            //println!("{:?}", &tmp_geomcell.rg_position);
+
+                            tmp_geomcell.rg_elem.extend_from_slice(&tmp_geomcell.ghost_bs_elem);
+                            tmp_geomcell.rg_position.append_column(&tmp_geomcell.ghost_bs_pos);
+
                         } else {
                             tmp_geomcell.ghost_bs_elem = vec![];
                             tmp_geomcell.ghost_bs_pos = MatrixFull::empty();
@@ -1493,7 +1711,8 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         }
 
         if ctrl.guess_mix {
-            println!("Initial guess mixing enabled (theta = {:.1}°): HOMO-LUMO rotated to induce symmetry breaking",ctrl.guess_mix_theta_deg);
+            println!("Initial guess mixing enabled: HOMO-LUMO rotated with theta = {:.1}° (alpha), {:.1}° (beta) to induce symmetry breaking",
+                ctrl.guess_mix_theta_deg[0], ctrl.guess_mix_theta_deg[1]);
         }
 
     }

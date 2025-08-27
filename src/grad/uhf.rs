@@ -204,7 +204,7 @@ impl RIUHFGradient<'_> {
         });
         let aux_batch_size = calc_batch_size::<f64>(8 * nao * nao, mem_avail, None, Some(naux * (nocc[0] * nocc[0] + nocc[1] * nocc[1])));
         let aux_batch_size = aux_batch_size.min(216);
-        let aux_partition = balance_partition(aux_loc, aux_batch_size);
+        let aux_partition = blocksize_partition(aux_loc, aux_batch_size);
 
         time_records.count("de-jk preparation 1");
 

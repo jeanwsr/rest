@@ -1,6 +1,6 @@
 [package]
 name = "rest"
-version = "0.1.0"
+version = "1.1.0"
 authors = ["Igor Ying Zhang <igor_zhangying@fudan.edu.cn>"]
 edition = "2021"
 build = "build.rs"
@@ -23,8 +23,8 @@ mimalloc = "0.1.43"
 rayon = "1.8"
 crossbeam = "0.8"
 libm = "0.2"
-blas-sys = "0.7"
-blas = "0.22"
+#blas-sys = "0.7"
+#blas = "0.22"
 lazy_static = "1.4"
 toml = "0.7"
 #tuple-conv = "1.0.1"
@@ -50,19 +50,21 @@ rest_libcint = {path="../rest_libcint"}
 #liblbfgs = {path="../rust-lbfgs"}
 liblbfgs = "0.1.0"
 sysinfo = "0.33"
-rstsr = { version = "0.2.6", default-features = false, features = ["openblas", "linalg", "rayon", "std", "col_major"] }
-rstsr-openblas = { version = "0.2.6", features = ["linalg", "openmp"] }
+rstsr = { version = "0.4", default-features = false, features = ["openblas", "linalg", "rayon", "std", "col_major", "dynamic_loading"] }
+rstsr-core = { version = "0.4", default-features = false }
 derive_builder = { version = "0.20" }
+
+dftd3 = { version = "0.1", optional = true }
+dftd4 = { version = "0.1", optional = true }
+geometric-pyo3 = { version = "0.1", optional = true }
 
 [build-dependencies]
 autocxx-build = "0.26.0"
 miette = { version = "5", features = ["fancy"]}
 dunce = "1.0.0"
 
-
 [dependencies.pyo3]
-version = "0.21.1"
-features = ["extension-module"]
+version = "0.24"
 
 #[package.metadata.docs.rs]
 #rustdoc-args = [
@@ -74,6 +76,13 @@ features = ["extension-module"]
 [dev-dependencies]
 criterion = "0.4"
 
+[features]
+default = ["dftd3", "dftd4", "geometric-pyo3"]
+dftd3 = ["dep:dftd3"]
+dftd4 = ["dep:dftd4"]
+geometric-pyo3 = ["dep:geometric-pyo3"]
+openblas = []
+intel-mkl = []
 
 [[bench]]
 name = "bench_tensors"
