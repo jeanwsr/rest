@@ -50,6 +50,9 @@ pub struct GeomCell {
     #[pyo3(get,set)]
     pub rest : Vec<(usize,String)>,
     pub ext_field: ExtField<f64>,
+    // both real and ghost atom positions
+    pub rg_position: MatrixFull<f64>,
+    pub rg_elem: Vec<String>,
 }
 
 //impl GeomCell {
@@ -154,6 +157,8 @@ impl GeomCell {
             ghost_ep_path   : vec![],
             ghost_ep_pos    : MatrixFull::empty(),
             ext_field       : ExtField::empty(),
+            rg_elem         : vec![], 
+            rg_position     : MatrixFull::empty(),
         }
     }
     pub fn copy(&mut self, name:String) -> GeomCell {
@@ -278,11 +283,39 @@ impl GeomCell {
         Ok(gi-1)
     }
 
+    pub fn get_start_index_of_ghost_atoms(&self) -> usize {
+        self.elem.len()
+    }
+
     pub fn geom_shift(&mut self, atm_idx:usize, vec_xyz:Vec<f64>) {
-        let mut gi = self.get_relax_index(atm_idx).unwrap();
+        // update the atom position in the matrix include only real atoms
         let mut given_atm = &mut self.position[(..,atm_idx)];
         given_atm.iter_mut().zip(vec_xyz.iter()).for_each(|(to, from)| {
             *to += from
+        });
+        // update the atom position in the matrix include both real and ghost atoms
+        let mut given_atm = &mut self.rg_position[(..,atm_idx)];
+        given_atm.iter_mut().zip(vec_xyz.iter()).for_each(|(to, from)| {
+            *to += from
+        });
+    }
+    pub fn geom_update(&mut self, new_position:&[f64], unit: GeomUnit) {
+        let factor = match unit {
+            GeomUnit::Angstrom => ANG,
+            GeomUnit::Bohr => 1.0,
+        };
+        if self.position.data.len() != new_position.len() {
+            panic!("The length of new position is not equal to the length of old position");
+        } 
+        // update the position of real atoms in the matrix include only real atoms
+        self.position.iter_mut().zip(new_position.iter()).for_each(|(to, from)| {
+            *to = *from/factor
+        });
+        // update the position of real atoms in the matrix include both real and ghost atoms
+        self.rg_position.iter_columns_mut(0..self.elem.len()).zip(new_position.chunks_exact(3)).for_each(|(to, from)| {
+            to.iter_mut().zip(from.iter()).for_each(|(to, from)| {
+                *to = *from/factor
+            });
         });
     }
 
@@ -391,7 +424,7 @@ impl GeomCell {
     }
     pub fn to_numgrid_io(&self) -> Vec<(f64,f64,f64)> {
         let mut tmp_vec: Vec<(f64,f64,f64)> = vec![];
-        self.position.data.chunks_exact(3).for_each(|value| {
+        self.rg_position.data.chunks_exact(3).for_each(|value| {
             tmp_vec.push((value[0],value[1],value[2]))
         });
         tmp_vec

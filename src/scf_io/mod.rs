@@ -10,6 +10,7 @@ use crate::utilities::{create_pool, TimeRecords};
 mod addons;
 mod fchk;
 mod pyrest_scf_io;
+mod ri_on_the_fly;
 
 use mpi::collective::SystemOperation;
 use pyo3::{pyclass, pymethods, pyfunction};
@@ -31,6 +32,8 @@ use crate::initial_guess::initial_guess;
 use crate::external_libs::dftd;
 use crate::constants::{INVERSE_THRESHOLD, SPECIES_INFO, SQRT_THRESHOLD};
 
+use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
+
 
 
 
@@ -50,6 +53,7 @@ pub struct SCF {
     pub m: Option<MatrixFull<f64>>,
     pub rimatr: Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
     pub ri3mo: Option<Vec<(RIFull<f64>,std::ops::Range<usize> , std::ops::Range<usize>)>>,
+    pub ri3mo_full:Option<Vec<(RIFull<f64>,std::ops::Range<usize> , std::ops::Range<usize>)>>,
     #[pyo3(get,set)]
     pub eigenvalues: [Vec<f64>;2],
     //pub eigenvectors: Vec<Tensors<f64>>,
@@ -78,6 +82,8 @@ pub struct SCF {
     pub empirical_dispersion_energy: f64,
     pub energies: HashMap<String,Vec<f64>>,
     pub ref_eigenvectors: HashMap<String, ([MatrixFull<f64>;2], [usize;4])>,
+    pub renormalized_singles_particles:Vec<f64>,
+    pub gwqp:(Vec<f64>,Vec<f64>),
 }
 
 #[derive(Clone,Copy)]
@@ -101,6 +107,7 @@ impl SCF {
             m: None,
             rimatr: None,
             ri3mo: None,
+            ri3mo_full:None,
             eigenvalues: [vec![],vec![]],
             hamiltonian: [MatrixUpper::empty(),
                           MatrixUpper::empty()],
@@ -124,6 +131,8 @@ impl SCF {
             empirical_dispersion_energy: 0.0,
             grids: None,
             energies: HashMap::new(),
+            renormalized_singles_particles:Vec::new(),
+            gwqp:(Vec::new(),Vec::new()),
         };
 
         // at first check the scf type: RHF, ROHF or UHF
@@ -353,7 +362,6 @@ impl SCF {
         if let Some(grids) = &mut self.grids {
             grids.prepare_tabulated_ao(&self.mol);
         }
-
     }
 
     pub fn prepare_isdf(&mut self, mpi_operator: &Option<MPIOperator>) {
@@ -424,6 +432,47 @@ impl SCF {
 
     pub fn generate_occupation(&mut self) {
         (self.occupation, self.homo, self.lumo) = generate_occupation_outside(&self);
+    }
+    
+    pub fn print_homo_lumo_gap(&self) {
+        let is_rohf = match self.scftype {
+            SCFType::ROHF => true,
+            _ => false,
+        };
+        if self.mol.ctrl.print_level>0 {
+            if self.mol.spin_channel==1 {
+                let i_spin = 0; 
+                let i_homo = self.homo[i_spin];
+                let i_lumo = self.lumo[i_spin];
+                let homo = self.eigenvalues[i_spin][i_homo];
+                let lumo = self.eigenvalues[i_spin][i_lumo];
+                println!("HOMO: {:16.8}, LUMO: {:14.6}, H-L Gap: {:16.8}", homo, lumo, lumo-homo);
+            } else {
+                for i_spin in (0..self.mol.spin_channel) {
+                         // 只打印有电子的自旋通道
+                    if (self.mol.num_elec[i_spin+1] > 1.0E-5) {
+                        if ! is_rohf {
+                            let i_homo = self.homo[i_spin];
+                            let i_lumo = self.lumo[i_spin];
+                            let homo = self.eigenvalues[i_spin][i_homo];
+                            let lumo = self.eigenvalues[i_spin][i_lumo];
+                            println!("Spin {:2}: HOMO: {:14.6}, LUMO: {:14.6}, H-L Gap: {:16.8}", i_spin, homo, lumo, lumo-homo);
+                        } else {
+                            // 对于ROHF, 只打印第一个自旋通道(i_spin=0)
+                            let i_homo = self.homo[i_spin];
+                            let i_lumo = self.lumo[i_spin];
+                            //println!("i_homo: {}, i_lumo: {}", i_homo, i_lumo);
+                            //println!("debug eigenvalues: {:?}", self.eigenvalues[0]);
+                            let homo = self.eigenvalues[0][i_homo];
+                            let lumo = self.eigenvalues[0][i_lumo];
+                            println!("Spin {:2}: HOMO: {:14.6}, LUMO: {:14.6}, H-L Gap: {:16.8}", i_spin, homo, lumo, lumo-homo);
+                        }
+                    } else {
+                        println!("No electron with spin {:2}", i_spin);
+                    }
+                }
+            }
+        }
     }
 
     pub fn generate_density_matrix(&mut self) {
@@ -1580,7 +1629,7 @@ impl SCF {
         let spin_channel = self.mol.spin_channel;
         let dt1 = time::Local::now();
         let vj = if self.mol.ctrl.isdf_new || self.mol.ctrl.ri_k_only {
-            self.generate_vj_on_the_fly_par()
+            self.generate_vj_ri_direct(None)
         }else{
             self.generate_vj_with_ri_v_sync(1.0, mpi_operator)
         };
@@ -1642,7 +1691,7 @@ impl SCF {
         //let homo = &self.homo;
         let dt1 = time::Local::now();
         let vj = if self.mol.ctrl.isdf_new || self.mol.ctrl.ri_k_only {
-            self.generate_vj_on_the_fly_par()
+            self.generate_vj_ri_direct(None)
         } else {
             self.generate_vj_with_ri_v_sync(1.0, mpi_operator)
         };
@@ -1783,7 +1832,7 @@ impl SCF {
         let vj = if self.mol.ctrl.use_ri_vj {
             self.generate_vj_with_ri_v_sync(1.0, mpi_operator)
         } else {
-            self.generate_vj_on_the_fly_par()
+            self.generate_vj_ri_direct(None)
         };
         //// ==== DEBUG IGOR ====
         //if let Some(mpi_op) = &mpi_operator {
@@ -2362,6 +2411,7 @@ impl SCF {
         let spin_channel = self.mol.spin_channel;
         match self.scftype {
             SCFType::RHF => {
+                println!("Eigenvalues in Restricted HF (or KS) calculation:");
                 println!("{:>8}{:>14}{:>18}",String::from("State"),
                                         String::from("Occupation"),
                                         String::from("Eigenvalue"));
@@ -2375,6 +2425,7 @@ impl SCF {
                 }
             },
             SCFType::UHF => {
+                println!("Eigenvalues in Unrestricted HF (or KS) calculation:");
                 for i_spin in (0..spin_channel) {
                     if i_spin == 0 {
                         println!("Spin-up eigenvalues");
@@ -2399,6 +2450,7 @@ impl SCF {
                 }
             },
             SCFType::ROHF => {
+                println!("Eigenvalues in Rrestricted Openshell HF (or KS) calculation:");
                 println!("{:>8}{:>14}{:>18}",String::from("State"),
                                         String::from("Occupation"),
                                         String::from("Eigenvalue"));
@@ -2600,8 +2652,7 @@ impl SCF {
     pub fn generate_vxc_rayon_dm_only(&self, scaling_factor: f64) -> ([f64;2], f64, Vec<MatrixUpper<f64>>) {
         //In this subroutine, we call the lapack dgemm in a rayon parallel environment.
         //In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-        let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-        utilities::omp_set_num_threads_wrapper(1);
+        let default_omp_num_threads = self.mol.ctrl.num_threads.unwrap();
 
         let num_basis = self.mol.num_basis;
         let num_state = self.mol.num_state;
@@ -2620,6 +2671,7 @@ impl SCF {
         if let Some(grids) = &self.grids {
             let (sender, receiver) = channel();
             grids.parallel_balancing.par_iter().for_each_with(sender,|s,range_grids| {
+                omp_set_num_threads_wrapper(1);
                 // change the return of xc_exc_vxc, directly return vxc_mat [num_basis, num_basis]
                 // let (exc,vxc_ao,total_elec) = self.mol.xc_data.xc_exc_vxc_slots_dm_only(range_grids.clone(), grids, spin_channel,dm, mo, occ);
                 //exc_spin = exc;
@@ -2687,7 +2739,7 @@ impl SCF {
             }
         };
 
-        utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+        omp_set_num_threads_wrapper(default_omp_num_threads);
 
         (total_elec, exc_total, vxc)
 
@@ -2787,9 +2839,7 @@ impl SCF {
 
     pub fn generate_vxc_rayon(&self, scaling_factor: f64) -> ([f64;2], f64, Vec<MatrixUpper<f64>>) {
         //In this subroutine, we call the lapack dgemm in a rayon parallel environment.
-        //In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-        let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-        utilities::omp_set_num_threads_wrapper(1);
+        let default_omp_num_threads = self.mol.ctrl.num_threads.unwrap();
 
         let num_basis = self.mol.num_basis;
         let num_state = self.mol.num_state;
@@ -2808,6 +2858,10 @@ impl SCF {
         if let Some(grids) = &self.grids {
             let (sender, receiver) = channel();
             grids.parallel_balancing.par_iter().for_each_with(sender,|s,range_grids| {
+
+                // To ensure the efficiency, we disable the openmp ability of openblas within the parallel region
+                omp_set_num_threads_wrapper(1);
+
                 // change the return value of xc_exc_vxc by vxc_mat [num_basis, num_basis]
                 // let (exc,vxc_ao,total_elec) = self.mol.xc_data.xc_exc_vxc_slots(range_grids.clone(), grids, spin_channel,dm, mo, occ);
                 //exc_spin = exc;
@@ -2875,7 +2929,7 @@ impl SCF {
             }
         };
 
-        utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+        omp_set_num_threads_wrapper(default_omp_num_threads);
 
         (total_elec,exc_total, vxc)
 
@@ -2927,8 +2981,66 @@ impl SCF {
         // deallocate the rimatr to save the memory
         self.rimatr = None;
         self.ri3mo = Some(ri3mo);
+    }
+    pub fn generate_ri3mo_full_rayon(&mut self, row_range: std::ops::Range<usize>, col_range: std::ops::Range<usize>) {
+        let (mut ri3ao, mut basbas2baspair, mut baspar2basbas) =  if let Some((riao,basbas2baspair, baspar2basbas))=&mut self.rimatr {
+            (riao,basbas2baspair, baspar2basbas)
+        } else {
+            panic!("rimatr should be initialized in the preparation of ri3mo");
+        };
+        let mut ri3mo: Vec<(RIFull<f64>,std::ops::Range<usize>, std::ops::Range<usize>)> = vec![];
+        for i_spin in 0..self.mol.spin_channel {
+            let eigenvector = &self.eigenvectors[i_spin];
+            ri3mo.push(
+                ao2mo_rayon(
+                    eigenvector, ri3ao, 
+                    row_range.clone(), 
+                    col_range.clone()
+                ).unwrap()
+            )
+        }
+        self.ri3mo_full = Some(ri3mo);
+        self.rimatr=None;
 
+    }
+    
+    /// Generates J-matrix.
+    /// 
+    /// In function name:
+    /// - `ri`: using RI-V method
+    /// - `direct`: on-the-fly direct calculation
+    /// 
+    /// To activate this function, in the meantime when writing this function, in `ctrl.in`
+    /// - specify `use_ri_vj = false` to disable full storage of 3c-2e ERI (required);
+    /// - specify `[ctrl]: max_memory` in MB for calculating `block_size` if not specified;
+    fn generate_vj_ri_direct(&mut self, block_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
+        // compute block_size
+        const MAX_BLOCK_SIZE: usize = 432;
+        const MIN_BLOCK_SIZE: usize = 16;
+        let block_size = block_size.unwrap_or_else(|| {
+            let nao = self.mol.num_basis;
+            let naux = self.mol.num_auxbas;
+            let sys_info = sysinfo::System::new_all();
+            let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
+                let pid = sysinfo::get_current_pid().unwrap();
+                let used_memory = sys_info.process(pid).unwrap().memory() as f64 / 1024.0 / 1024.0;
+                max_memory - used_memory
+            });
+            let aux_batch_size = crate::grad::rhf::calc_batch_size::<f64>(nao * nao, mem_avail, None, Some(naux * naux));
+            aux_batch_size.min(MAX_BLOCK_SIZE).max(MIN_BLOCK_SIZE)
+        });
 
+        // compute vj only for specified spin channels
+        let dms = &self.density_matrix[0..self.mol.spin_channel];
+        let mol_obj = &self.mol;
+        let mut vjs = crate::scf_io::ri_on_the_fly::generate_vj_ri_direct(dms, mol_obj, block_size);
+
+        // complete `vjs` if the spin channel is 1 (restricted, spin-unpolarized)
+        if self.mol.spin_channel == 1 {
+            vjs.push(MatrixUpper::new(1, 0.0f64));
+        }
+
+        vjs
     }
 
 }
@@ -3194,6 +3306,9 @@ pub fn vj_upper_with_rimatr_sync_v02(
                 ri3fn: &Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
                 dm: &Vec<MatrixFull<f64>>, 
                 spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
+
+    //let default_omp_num_threads = omp_get_num_threads_wrapper();
+
     let mut vj: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
     if let Some((ri3fn,basbas2baspar,baspar2basbas)) = ri3fn {
         let num_basis = basbas2baspar.size[0];
@@ -3304,9 +3419,7 @@ pub fn vk_upper_with_ri_v_use_dm_only_sync(
                 dm: &Vec<MatrixFull<f64>>,
                 spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
-    // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     //let mut bm = RIFull::new([num_state,num_basis,num_auxbas], 0.0f64);
     let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
 
@@ -3322,6 +3435,10 @@ pub fn vk_upper_with_ri_v_use_dm_only_sync(
             //dm_s.formated_output(5, "upper");
             let (sender, receiver) = channel();
             ri3fn.par_iter_auxbas(0..num_auxbas).unwrap().for_each_with(sender,|s, m| {
+
+                // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
+                omp_set_num_threads_wrapper(1);
+
                 let mut tmp_mat = MatrixFull::new([num_basis,num_basis],0.0_f64);
                 let mut reduced_ri3fn = MatrixFullSlice {
                     size:  &[num_basis,num_basis],
@@ -3360,7 +3477,7 @@ pub fn vk_upper_with_ri_v_use_dm_only_sync(
     };
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     vk
 }
@@ -3381,8 +3498,7 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v01(
                 spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     //let mut bm = RIFull::new([num_state,num_basis,num_auxbas], 0.0f64);
     let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
 
@@ -3396,6 +3512,10 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v01(
             let dm_s = &dm[i_spin];
             let (sender, receiver) = channel();
             ri3fn.par_iter_columns_full().for_each_with(sender,|s, m| {
+
+                // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
+                omp_set_num_threads_wrapper(1);
+
                 let mut tmp_mat = MatrixFull::new([num_basis,num_basis],0.0_f64);
                 let mut reduced_ri3fn = MatrixFull::new([num_basis,num_basis],0.0_f64);
 
@@ -3424,7 +3544,7 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v01(
     };
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     vk
 }
@@ -3435,7 +3555,7 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v02(
                 spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     //utilities::omp_set_num_threads_wrapper(1);
     //let mut bm = RIFull::new([num_state,num_basis,num_auxbas], 0.0f64);
     let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
@@ -3449,12 +3569,14 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v02(
             let mut vk_s = &mut vk[i_spin];
             *vk_s = MatrixUpper::new(num_baspair,0.0_f64);
             //let dm_s = &dm[i_spin];
-            utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
             let dm_s = _power_rayon_for_symmetric_matrix(&dm[i_spin], 0.5, SQRT_THRESHOLD).unwrap();
-            utilities::omp_set_num_threads_wrapper(1);
             let batch_num_auxbas = utilities::balancing(num_auxbas, rayon::current_num_threads());
             let (sender, receiver) = channel();
             batch_num_auxbas.par_iter().for_each_with(sender, |s,loc_auxbas| {
+
+                // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
+                omp_set_num_threads_wrapper(1);
+
                 let mut tmp_mat = MatrixFull::new([num_basis,num_basis],0.0_f64);
                 let mut reduced_ri3fn = MatrixFull::new([num_basis,num_basis],0.0_f64);
                 let mut vk_sm = MatrixFull::new([num_basis,num_basis],0.0_f64);
@@ -3484,7 +3606,7 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v02(
     };
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     vk
 }
@@ -3547,8 +3669,7 @@ pub fn vk_upper_with_rimatr_sync_v01(
                 spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     //let mut bm = RIFull::new([num_state,num_basis,num_auxbas], 0.0f64);
     let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
 
@@ -3578,6 +3699,10 @@ pub fn vk_upper_with_rimatr_sync_v01(
 
                 let (sender, receiver) = channel();
                 ri3fn.par_iter_columns_full().for_each_with(sender,|s, m| {
+
+                    // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
+                    omp_set_num_threads_wrapper(1);
+
                     //let mut tmp_mat = MatrixFull::new([num_basis,num_basis],0.0_f64);
                     let mut reduced_ri3fn = MatrixFull::new([num_basis,num_basis],0.0_f64);
 
@@ -3610,7 +3735,7 @@ pub fn vk_upper_with_rimatr_sync_v01(
     };
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     vk
 }
@@ -3693,8 +3818,8 @@ pub fn vk_upper_with_rimatr_sync_v03(
                 spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
+    //utilities::omp_set_num_threads_wrapper(1);
     //let mut bm = RIFull::new([num_state,num_basis,num_auxbas], 0.0f64);
     //let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
     let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::empty(),MatrixUpper::empty()];
@@ -3732,6 +3857,10 @@ pub fn vk_upper_with_rimatr_sync_v03(
                 let batch_num_auxbas = utilities::balancing(num_auxbas, rayon::current_num_threads());
                 let (sender, receiver) = channel();
                 batch_num_auxbas.par_iter().for_each_with(sender, |s, loc_auxbas| {
+
+                    // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
+                    omp_set_num_threads_wrapper(1);
+
                     let mut reduced_ri3fn = MatrixFull::new([num_basis,num_basis],0.0_f64);
                     let mut vk_sm = MatrixFull::new([num_basis,num_basis],0.0_f64);
                     let mut tmp_mc = MatrixFull::new([num_basis,nw],0.0_f64);
@@ -3760,7 +3889,7 @@ pub fn vk_upper_with_rimatr_sync_v03(
     };
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     vk
 }
@@ -3773,8 +3902,8 @@ pub fn vk_upper_with_ri_v_sync(
                 spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
+    //utilities::omp_set_num_threads_wrapper(1);
 
     //let mut bm = RIFull::new([num_state,num_basis,num_auxbas], 0.0f64);
     let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
@@ -3798,6 +3927,9 @@ pub fn vk_upper_with_ri_v_sync(
                 //let mut tmp_b = MatrixFull::new([num_basis,num_basis],0.0_f64);
                 let (sender, receiver) = channel();
                 ri3fn.par_iter_auxbas(0..num_auxbas).unwrap().for_each_with(sender, |s, m| {
+
+                    // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
+                    omp_set_num_threads_wrapper(1);
 
                     let mut reduced_ri3fn = MatrixFullSlice {
                         size:  &[num_basis,num_basis], 
@@ -3846,7 +3978,7 @@ pub fn vk_upper_with_ri_v_sync(
     };
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
 
     vk
@@ -4259,8 +4391,8 @@ fn ao2mo_rayon_v01<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
 {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
+    //utilities::omp_set_num_threads_wrapper(1);
 
     let num_basis = eigenvector.size()[0];
     let num_state = eigenvector.size()[1];
@@ -4272,6 +4404,10 @@ fn ao2mo_rayon_v01<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
     let (sender, receiver) = channel();
 
     rimat_chunk.data_ref().unwrap().par_chunks_exact(num_bpair).enumerate().for_each_with(sender, |s, (i_auxbs, m)| {
+
+        // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
+        omp_set_num_threads_wrapper(1);
+
         let mut loc_ri3mo = MatrixFull::new([row_dim.len(), column_dim.len()],0.0_f64);
         let mut reduced_ri = MatrixFull::new([num_basis, num_basis], 0.0_f64);
         reduced_ri.iter_matrixupper_mut().unwrap().zip(m.iter()).for_each(|(to, from)| {*to = *from});
@@ -4291,7 +4427,7 @@ fn ao2mo_rayon_v01<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
         rimo.copy_from_matr(0..num_loc_row, 0..num_loc_col, i_auxbs, 2, &loc_ri3mo, 0..num_loc_row, 0..num_loc_col)
     });
 
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     Ok((rimo, row_dim, column_dim))
 }
@@ -4303,8 +4439,8 @@ fn ao2mo_rayon_v02<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
 {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
+    //utilities::omp_set_num_threads_wrapper(1);
 
     let num_basis = eigenvector.size()[0];
     let num_state = eigenvector.size()[1];
@@ -4316,6 +4452,10 @@ fn ao2mo_rayon_v02<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
     let (sender, receiver) = channel();
 
     rimat_chunk.data_ref().unwrap().par_chunks_exact(num_bpair).enumerate().for_each_with(sender, |s, (i_auxbs, m)| {
+
+        // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
+        omp_set_num_threads_wrapper(1);
+
         let mut loc_ri3mo = MatrixFull::new([row_dim.len(), column_dim.len()],0.0_f64);
         let mut reduced_ri = MatrixFull::new([num_basis, num_basis], 0.0_f64);
         reduced_ri.iter_matrixupper_mut().unwrap().zip(m.iter()).for_each(|(to, from)| {*to = *from});
@@ -4335,7 +4475,7 @@ fn ao2mo_rayon_v02<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
         rimo.copy_from_matr(0..num_loc_row, 0..num_loc_col, i_auxbs, 2, &loc_ri3mo, 0..num_loc_row, 0..num_loc_col)
     });
 
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     Ok((rimo, row_dim, column_dim))
 }
@@ -4690,46 +4830,44 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     scf_data.diagonalize_hamiltonian(mpi_operator);
     scf_data.generate_occupation();
 
-    // mix the homo and lumo MO coeff. In most cases, mixing just one spin channel are more likely to converge at a symmetry-broken state.
     if scf_data.mol.ctrl.guess_mix {
-        let theta_deg = scf_data.mol.ctrl.guess_mix_theta_deg;
-        if theta_deg <= 0.0 || theta_deg > 45.0 {
-            println!("WARNING: theta = {:.1}° is outside the recommended range (0°–45°); mixing may be ineffective or unstable.", theta_deg);
-        }
-
-        let theta_rad = theta_deg.to_radians();
-        let cos_theta = theta_rad.cos();
-        let sin_theta = theta_rad.sin();
-
-        for i_spin in (0..2) {
+        for (i_spin, &theta_deg) in scf_data.mol.ctrl.guess_mix_theta_deg.iter().enumerate() {
+            if theta_deg <= 0.0 || theta_deg > 45.0 {
+                println!(
+                    "WARNING: theta for spin {} = {:.1}° is outside the recommended range (0°–45°); mixing may be ineffective or unstable.",
+                    i_spin, theta_deg
+                );
+            }
+    
+            let (cos_theta, sin_theta) = {
+                let rad = theta_deg.to_radians();
+                (rad.cos(), rad.sin())
+            };
+    
             let homo = scf_data.homo[i_spin];
             let lumo = scf_data.lumo[i_spin];
             let eigenvector_mut = scf_data.eigenvectors.get_mut(i_spin).unwrap();
             let homo_vec: Vec<f64> = eigenvector_mut.iter_column(homo).cloned().collect();
             let lumo_vec: Vec<f64> = eigenvector_mut.iter_column(lumo).cloned().collect();
-
-            let (mixed_homo_vec, mixed_lumo_vec) = if i_spin == 0 {
-                (
-                    homo_vec.iter().zip(&lumo_vec).map(|(h, l)| cos_theta * h + sin_theta * l).collect::<Vec<f64>>(),
-                    homo_vec.iter().zip(&lumo_vec).map(|(h, l)| -sin_theta * h + cos_theta * l).collect::<Vec<f64>>(),
-                )
-            } else {
-                (
-                    homo_vec.iter().zip(&lumo_vec).map(|(h, l)| cos_theta * h - sin_theta * l).collect::<Vec<f64>>(),
-                    homo_vec.iter().zip(&lumo_vec).map(|(h, l)|  sin_theta * h + cos_theta * l).collect::<Vec<f64>>(),
-                )
-            };
-
-            let mut homo_col = eigenvector_mut.iter_column_mut(homo);
-            for (val, slot) in mixed_homo_vec.iter().zip(homo_col.by_ref()) {
+    
+            let (mixed_homo_vec, mixed_lumo_vec) = if i_spin == 0 {(
+                homo_vec.iter().zip(&lumo_vec).map(|(h, l)| cos_theta * h + sin_theta * l).collect::<Vec<f64>>(),
+                homo_vec.iter().zip(&lumo_vec).map(|(h, l)| -sin_theta * h + cos_theta * l).collect::<Vec<f64>>(),
+            )} else {(
+                homo_vec.iter().zip(&lumo_vec).map(|(h, l)| cos_theta * h - sin_theta * l).collect::<Vec<f64>>(),
+                homo_vec.iter().zip(&lumo_vec).map(|(h, l)| sin_theta * h + cos_theta * l).collect::<Vec<f64>>(),
+            )};
+    
+            for (val, slot) in mixed_homo_vec.iter().zip(eigenvector_mut.iter_column_mut(homo)) {
                 *slot = *val;
             }
-            let mut lumo_col = eigenvector_mut.iter_column_mut(lumo);
-            for (val, slot) in mixed_lumo_vec.iter().zip(lumo_col.by_ref()) {
+            for (val, slot) in mixed_lumo_vec.iter().zip(eigenvector_mut.iter_column_mut(lumo)) {
                 *slot = *val;
             }
         }
     }
+    
+    
 
     scf_data.generate_density_matrix();
     scf_records.update(&scf_data);
@@ -4758,6 +4896,9 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         let dt1_2 = time::Local::now();
         scf_data.generate_occupation();
         scf_data.generate_density_matrix();
+        if scf_data.mol.ctrl.print_level>1 {
+            scf_data.print_homo_lumo_gap()
+        };
         let dt1_3 = time::Local::now();
         scf_converge = scf_data.check_scf_convergence(&scf_records);
         let dt1_4 = time::Local::now();
@@ -4800,37 +4941,37 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         if scf_data.mol.ctrl.print_level>0 {println!("SCF is converged after {:4} iterations.", scf_records.num_iter-1)};
         // Level shift is disabled before the final diagonalization to ensure accurate eigenvalues.
         // Formatted printing of eigenvalues and eigenvectors is now performed after re-diagonalizing the HF Hamiltonian.
-
-        match scf_data.mol.ctrl.occupation_type {
-            OCCType::FRAC => {
-                let (occupation, homo, lumo) = check_norm::generate_occupation_integer(&scf_data.mol, &scf_data.scftype);
-                scf_data.occupation = occupation;
-                scf_data.homo = homo;
-                scf_data.lumo = lumo;
-                scf_data.generate_density_matrix();
-                scf_data.generate_hf_hamiltonian(mpi_operator);
-                scf_data.diagonalize_hamiltonian(mpi_operator);
-
-            }
-            _ => {
-                scf_data.generate_hf_hamiltonian(mpi_operator); 
-                scf_data.diagonalize_hamiltonian(mpi_operator); 
-            }
-        }
-
-        if scf_data.mol.ctrl.print_level>1 {
-            scf_data.formated_eigenvalues((scf_data.homo.iter().max().unwrap()+4).min(scf_data.mol.num_state));
-        }
-        if scf_data.mol.ctrl.print_level>3 {
-            scf_data.formated_eigenvectors();
-        }
-        // not yet implemented. Just an empty subroutine
     } else {
         //if scf_data.mol.ctrl.restart {save_chkfile(&scf_data)};
         println!("SCF does not converge within {:03} iterations",scf_records.num_iter);
     }
+    match scf_data.mol.ctrl.occupation_type {
+        OCCType::FRAC => {
+            let (occupation, homo, lumo) = check_norm::generate_occupation_integer(&scf_data.mol, &scf_data.scftype);
+            scf_data.occupation = occupation;
+            scf_data.homo = homo;
+            scf_data.lumo = lumo;
+            scf_data.generate_density_matrix();
+            scf_data.generate_hf_hamiltonian(mpi_operator);
+            scf_data.diagonalize_hamiltonian(mpi_operator);
+
+        }
+        _ => {
+            scf_data.generate_hf_hamiltonian(mpi_operator); 
+            scf_data.diagonalize_hamiltonian(mpi_operator); 
+        }
+    }
+
+    if scf_data.mol.ctrl.print_level>1 {
+        scf_data.print_homo_lumo_gap();
+        scf_data.formated_eigenvalues((scf_data.homo.iter().max().unwrap()+4).min(scf_data.mol.num_state));
+    }
+    if scf_data.mol.ctrl.print_level>3 {
+        scf_data.formated_eigenvectors();
+    }
 
 }
+
 
 pub fn vj_on_the_fly_par(mol: &Molecule, dm: &Vec<MatrixFull<f64>>) -> Vec<MatrixUpper<f64>>{
 

@@ -8,6 +8,8 @@ use tensors::{MatrixFull,matrix_blas_lapack::_dgemm, TensorOpt, BasicMatrix};
 
 use crate::{mpi_io::{mpi_broadcast, mpi_broadcast_matrixfull, mpi_broadcast_vector, mpi_reduce, MPIData,MPIOperator}, utilities};
 use crate::scf_io::SCFType;
+
+use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
 pub fn close_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow::Result<([f64;3],[MatrixFull<(f64,f64)>;3])> {
 //pub fn close_shell_sbge2_rayon(scf_data: &crate::scf_io::SCF) -> anyhow::Result<[f64;3]> {
 
@@ -18,8 +20,7 @@ pub fn close_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow
 
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
 
     let num_auxbas = scf_data.mol.num_auxbas;
     let num_basis = scf_data.mol.num_basis;
@@ -60,6 +61,7 @@ pub fn close_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow
         };
         let (sender, receiver) = channel();
         elec_pair.par_iter().for_each_with(sender,|s,i_pair| {
+            omp_set_num_threads_wrapper(1);
             let mut e_mp2_term_ss = 0.0_f64;
             let mut e_mp2_term_os = 0.0_f64;
 
@@ -220,7 +222,7 @@ pub fn close_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow
     };
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     //println!("debug pt2 and sbge2: {:?}, {:?}", e_mp2_os+e_mp2_ss, e_bge2_ss+ e_bge2_os);
 
@@ -355,8 +357,7 @@ pub fn open_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow:
 
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
 
     let mut e_mp2_ss = 0.0_f64;
     let mut e_mp2_os = 0.0_f64;
@@ -411,6 +412,7 @@ pub fn open_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow:
                 };
                 let (sender, receiver) = channel();
                 elec_pair.par_iter().for_each_with(sender,|s,i_pair| {
+                    omp_set_num_threads_wrapper(1);
 
                     let mut e_mp2_term_ss = 0.0_f64;
                     let mut num_eij_iter = 0_usize;
@@ -541,6 +543,7 @@ pub fn open_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow:
                 };
                 let (sender, receiver) = channel();
                 elec_pair.par_iter().for_each_with(sender,|s,i_pair| {
+                    omp_set_num_threads_wrapper(1);
                     let mut e_mp2_term_os = 0.0_f64;
                     let mut num_eij_iter = 0_usize;
                     let mut e_eij_term_ss = 0.0_f64;
@@ -655,7 +658,7 @@ pub fn open_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow:
         panic!("RI3MO should be initialized before the PT2 calculations")
     };
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     Ok(([e_bge2_ss+e_bge2_os,e_bge2_os,e_bge2_ss],[eij_00,eij_01,eij_11]))
 
@@ -823,8 +826,8 @@ pub fn close_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF,mpi_operator:&O
 
         // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
         // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-        let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-        utilities::omp_set_num_threads_wrapper(1);
+        let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
+        omp_set_num_threads_wrapper(default_omp_num_threads);
 
         let my_rank = mpi_ix.rank;
         let size = mpi_ix.size;
@@ -1004,7 +1007,7 @@ pub fn close_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF,mpi_operator:&O
         };
 
         // reuse the default omp_num_threads setting
-        utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+        omp_set_num_threads_wrapper(default_omp_num_threads);
 
         //println!("debug pt2 and sbge2: {:?}, {:?}", e_mp2_os+e_mp2_ss, e_bge2_ss+ e_bge2_os);
 
@@ -1205,10 +1208,8 @@ pub fn open_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF, mpi_operator:&O
         let screening_factor = 1.0;
         let shifted_factor = 0.0;
 
-        // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
-        // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-        let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-        utilities::omp_set_num_threads_wrapper(1);
+        let default_omp_num_threads = omp_get_num_threads_wrapper();
+        omp_set_num_threads_wrapper(default_omp_num_threads);
 
         let mut e_mp2_ss = 0.0_f64;
         let mut e_mp2_os = 0.0_f64;
@@ -1498,7 +1499,7 @@ pub fn open_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF, mpi_operator:&O
             panic!("RI3MO should be initialized before the PT2 calculations")
         };
         // reuse the default omp_num_threads setting
-        utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+        omp_set_num_threads_wrapper(default_omp_num_threads);
 
         Ok(([e_bge2_ss+e_bge2_os,e_bge2_os,e_bge2_ss]))
         //panic!("ERROR: the MPI/Rayon parallelization is not yet available for open-shell SBGE2 calculation")

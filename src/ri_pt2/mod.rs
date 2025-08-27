@@ -20,6 +20,8 @@ use crate::scf_io::{SCF, SCFType};
 use crate::utilities::{TimeRecords, self};
 use crate::mpi_io::{self, mpi_reduce, MPIOperator};
 
+use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
+
 pub mod sbge2;
 
 #[derive(Clone)]
@@ -394,8 +396,7 @@ pub fn close_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
 
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
 
     let mut e_mp2_ss = 0.0_f64;
     let mut e_mp2_os = 0.0_f64;
@@ -426,6 +427,7 @@ pub fn close_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
         };
         let (sender, receiver) = channel();
         elec_pair.par_iter().for_each_with(sender,|s,i_pair| {
+            omp_set_num_threads_wrapper(1);
             let mut e_mp2_term_ss = 0.0_f64;
             let mut e_mp2_term_os = 0.0_f64;
 
@@ -498,7 +500,7 @@ pub fn close_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
     };
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
     //tmp_record.report_all();
     Ok([e_mp2_ss+e_mp2_os,e_mp2_os,e_mp2_ss])
 
@@ -508,8 +510,7 @@ pub fn close_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
 pub fn open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
 
     let mut e_mp2_ss = 0.0_f64;
     let mut e_mp2_os = 0.0_f64;
@@ -548,6 +549,7 @@ pub fn open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
                 };
                 let (sender, receiver) = channel();
                 elec_pair.par_iter().for_each_with(sender,|s,i_pair| {
+                    omp_set_num_threads_wrapper(1);
 
                     let mut e_mp2_term_ss = 0.0_f64;
 
@@ -640,6 +642,7 @@ pub fn open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
                 };
                 let (sender, receiver) = channel();
                 elec_pair.par_iter().for_each_with(sender,|s,i_pair| {
+                    omp_set_num_threads_wrapper(1);
                     let mut e_mp2_term_os = 0.0_f64;
                     let i_state = i_pair[0];
                     let j_state = i_pair[1];
@@ -705,7 +708,7 @@ pub fn open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
         panic!("RI3MO should be initialized before the PT2 calculations")
     };
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     Ok([e_mp2_ss+e_mp2_os,e_mp2_os,e_mp2_ss])
 
@@ -719,7 +722,7 @@ pub fn open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperato
     if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data) {
 
         let num_threads = if let Some(nt) = scf_data.mol.ctrl.num_threads {nt} else {1};
-        utilities::omp_set_num_threads_wrapper(num_threads);
+        omp_set_num_threads_wrapper(num_threads);
 
         let mut e_mp2_ss = 0.0_f64;
         let mut e_mp2_os = 0.0_f64;
@@ -992,7 +995,7 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
         // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
         //let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
         let num_threads = if let Some(num_threads) = scf_data.mol.ctrl.num_threads {num_threads} else {1};
-        utilities::omp_set_num_threads_wrapper(num_threads);
+        omp_set_num_threads_wrapper(num_threads);
         let mut e_mp2_ss = 0.0_f64;
         let mut e_mp2_os = 0.0_f64;
 
@@ -1137,8 +1140,7 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
 }
 
 pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
     
     // Calculate the contribution of singly excited states.
     let mut e_mp2_single_list = [0.0_f64, 0.0_f64];
@@ -1194,6 +1196,8 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
                 };
                 let (sender, receiver) = channel();
                 elec_pair.par_iter().for_each_with(sender,|s,i_pair| {
+
+                    omp_set_num_threads_wrapper(1);
 
                     let mut e_mp2_term_ss = 0.0_f64;
 
@@ -1351,7 +1355,7 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
         panic!("RI3MO should be initialized before the PT2 calculations")
     };
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
     
     // Temporarily output the contribution of singly excited states here, to avoid modifying the pt2_c structure.
     if let Some(coeff) = &scf_data.mol.xc_data.dfa_paramr_adv {
@@ -1382,7 +1386,7 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
     
     if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data) {
         let num_threads = if let Some(nt) = scf_data.mol.ctrl.num_threads {nt} else {1};
-        utilities::omp_set_num_threads_wrapper(num_threads);
+        omp_set_num_threads_wrapper(num_threads);
 
         let mut e_mp2_ss = 0.0_f64;
         let mut e_mp2_os = 0.0_f64;
