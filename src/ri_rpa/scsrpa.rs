@@ -31,10 +31,10 @@ pub fn evaluate_spin_response_rayon(scf_data: &SCF, freq: f64) -> anyhow::Result
             let mut polar_freq = spin_polar_freq.get_mut(i_spin).unwrap();
             *polar_freq = MatrixFull::new([num_auxbas,num_auxbas], 0.0);
             let eigenvector = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvectors.get(i_spin).unwrap(),
-                SCFType::ROHF => scf_data.semi_eigenvectors.get(i_spin).unwrap()
+                SCFType::ROHF => &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin]
             };
             let eigenvalues = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvalues.get(i_spin).unwrap(),
-                SCFType::ROHF => scf_data.semi_eigenvalues.get(i_spin).unwrap()
+                SCFType::ROHF => &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin]
             };
             let occ_numbers = scf_data.occupation.get(i_spin).unwrap();
             let homo = scf_data.homo.get(i_spin).unwrap().clone();
@@ -139,10 +139,10 @@ pub fn evaluate_spin_response_serial(scf_data: &SCF, freq: f64) -> anyhow::Resul
             let mut polar_freq = spin_polar_freq.get_mut(i_spin).unwrap();
             *polar_freq = MatrixFull::new([num_auxbas,num_auxbas], 0.0);
             let eigenvector = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvectors.get(i_spin).unwrap(),
-                SCFType::ROHF => scf_data.semi_eigenvectors.get(i_spin).unwrap()
+                SCFType::ROHF => &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin]
             }; 
             let eigenvalues = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvalues.get(i_spin).unwrap(),
-                SCFType::ROHF => scf_data.semi_eigenvalues.get(i_spin).unwrap()
+                SCFType::ROHF => &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin]
             };
             let occ_numbers = scf_data.occupation.get(i_spin).unwrap();
             let homo = scf_data.homo.get(i_spin).unwrap().clone();
