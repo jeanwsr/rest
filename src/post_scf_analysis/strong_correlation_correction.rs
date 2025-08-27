@@ -49,12 +49,12 @@ pub fn scc15_for_rxdh7(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -
         SCFType::ROHF => {
             let homo_0 = scf_data.homo[0];
             let lumo_0 = scf_data.lumo[0];
-            let e_homo_0 = scf_data.semi_eigenvalues[0][homo_0];
-            let e_lumo_0 = scf_data.semi_eigenvalues[0][lumo_0];
+            let e_homo_0 = scf_data.semi_eigenvalues.as_ref().unwrap()[0][homo_0];
+            let e_lumo_0 = scf_data.semi_eigenvalues.as_ref().unwrap()[0][lumo_0];
             let homo_1 = scf_data.homo[1];
             let lumo_1 = scf_data.lumo[1];
-            let e_homo_1 = scf_data.semi_eigenvalues[1][homo_1];
-            let e_lumo_1 = scf_data.semi_eigenvalues[1][lumo_1];
+            let e_homo_1 = scf_data.semi_eigenvalues.as_ref().unwrap()[1][homo_1];
+            let e_lumo_1 = scf_data.semi_eigenvalues.as_ref().unwrap()[1][lumo_1];
             (e_lumo_0.min(e_lumo_1) - e_homo_0.max(e_homo_1))*EV            
         }
     };
@@ -76,7 +76,6 @@ pub fn scc15_for_rxdh7(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -
         vec![[0.0,0.0]]
     };
     let x_pbe = post_xc_energy[0][0]+post_xc_energy[0][1];
-    println!("debug-lyyu, x_pbe: {}", x_pbe);
 
     let dxpbe = (x_pbe-x_hf)/x_hf*100.0f64;
 
@@ -87,7 +86,6 @@ pub fn scc15_for_rxdh7(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -
     };
 
     scf_data.energies.insert(String::from("sbge2"), vec![c_sbge2,sbge2_os,sbge2_ss]);
-    println!("debug-lyyu, energy: {:?}", scf_data.energies);
 
     let c_scsrpa = if let Some(scsrpa_c) = scf_data.energies.get("scsrpa") {
         let os1 = scsrpa_c[1];
