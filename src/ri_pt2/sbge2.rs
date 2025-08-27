@@ -388,10 +388,10 @@ pub fn open_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow:
 
                 let i_spin = i_spin_1;
                 let eigenvector = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvectors.get(i_spin).unwrap(),
-                    SCFType::ROHF => scf_data.semi_eigenvectors.get(i_spin).unwrap() 
+                    SCFType::ROHF => &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin]
                 };
                 let eigenvalues = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvalues.get(i_spin).unwrap(),
-                    SCFType::ROHF => scf_data.semi_eigenvalues.get(i_spin).unwrap() 
+                    SCFType::ROHF => &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin]
                 };
                 let occupation = scf_data.occupation.get(i_spin).unwrap();
 
@@ -508,10 +508,10 @@ pub fn open_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow:
 
             } else {
                 let eigenvector_1 = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvectors.get(i_spin_1).unwrap(),
-                    SCFType::ROHF => scf_data.semi_eigenvectors.get(i_spin_1).unwrap()
+                    SCFType::ROHF => &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin_1]
                 };
                 let eigenvalues_1 = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvalues.get(i_spin_1).unwrap(),
-                    SCFType::ROHF => scf_data.semi_eigenvalues.get(i_spin_1).unwrap() 
+                    SCFType::ROHF => &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin_1] 
                 };
                 let occupation_1 = scf_data.occupation.get(i_spin_1).unwrap();
                 let homo_1 = scf_data.homo.get(i_spin_1).unwrap().clone();
@@ -522,10 +522,10 @@ pub fn open_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow:
                 let lumo_min = vir_range.start;
 
                 let eigenvector_2 = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvectors.get(i_spin_2).unwrap(),
-                    SCFType::ROHF => scf_data.semi_eigenvectors.get(i_spin_2).unwrap()
+                    SCFType::ROHF => &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin_2]
                 };
                 let eigenvalues_2 = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvalues.get(i_spin_2).unwrap(),
-                    SCFType::ROHF => scf_data.semi_eigenvalues.get(i_spin_2).unwrap()
+                    SCFType::ROHF => &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin_2]
                 };
                 let occupation_2 = scf_data.occupation.get(i_spin_2).unwrap();
                 let homo_2 = scf_data.homo.get(i_spin_2).unwrap().clone();

@@ -22,7 +22,7 @@ pub fn mulliken_pop(scf_data: &SCF) -> Vec<f64>{
     charge.extend(vec![0.0; mol.geom.ghost_bs_elem.len()]);
 
     let mut dm = scf_data.density_matrix[0].clone();
-    if mol.ctrl.spin_polarization {
+    if mol.spin_channel == 2 {
         dm += scf_data.density_matrix[1].clone();
     };
     

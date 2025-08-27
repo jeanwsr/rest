@@ -63,10 +63,10 @@ pub struct SCF {
     pub density_matrix: Vec<MatrixFull<f64>>,
     //pub hamiltonian: Vec<Tensors<f64>>,
     pub hamiltonian: [MatrixUpper<f64>;2],
-    pub roothaan_hamiltonian: MatrixUpper<f64>,
-    pub semi_eigenvalues: [Vec<f64>;2],
-    pub semi_eigenvectors: [MatrixFull<f64>;2],
-    pub semi_fock: [MatrixFull<f64>;2],
+    pub roothaan_hamiltonian: Option<MatrixUpper<f64>>,
+    pub semi_eigenvalues: Option<[Vec<f64>; 2]>,
+    pub semi_eigenvectors: Option<[MatrixFull<f64>; 2]>,
+    pub semi_fock: Option<[MatrixFull<f64>; 2]>,
     pub scftype: SCFType,
     #[pyo3(get,set)]
     pub occupation: [Vec<f64>;2],
@@ -111,10 +111,10 @@ impl SCF {
             eigenvalues: [vec![],vec![]],
             hamiltonian: [MatrixUpper::empty(),
                           MatrixUpper::empty()],
-            roothaan_hamiltonian: MatrixUpper::empty(),
-            semi_eigenvalues: [vec![],vec![]],
-            semi_eigenvectors: [MatrixFull::empty(), MatrixFull::empty()],
-            semi_fock: [MatrixFull::empty(), MatrixFull::empty()],
+            roothaan_hamiltonian: None,
+            semi_eigenvalues: None,
+            semi_eigenvectors: None,
+            semi_fock: None,
             eigenvectors: [MatrixFull::empty(),
                            MatrixFull::empty()],
             ref_eigenvectors: HashMap::new(),
@@ -1620,7 +1620,7 @@ impl SCF {
         };
 
         if let SCFType::ROHF = self.scftype {
-            self.roothaan_hamiltonian = self.generate_roothaan_fock();
+            self.roothaan_hamiltonian = Some(self.generate_roothaan_fock());
         }
     }
     pub fn generate_hf_hamiltonian_ri_v(&mut self, mpi_operator: &Option<MPIOperator>) {
@@ -1681,7 +1681,7 @@ impl SCF {
         };
 
         if let SCFType::ROHF = self.scftype {
-            self.roothaan_hamiltonian = self.generate_roothaan_fock();
+            self.roothaan_hamiltonian = Some(self.generate_roothaan_fock());
         }
     }
     pub fn generate_hf_hamiltonian_ri_v_dm_only(&mut self, mpi_operator: &Option<MPIOperator>) {
@@ -1731,7 +1731,7 @@ impl SCF {
         };
 
         if let SCFType::ROHF = self.scftype {
-            self.roothaan_hamiltonian = self.generate_roothaan_fock();
+            self.roothaan_hamiltonian = Some(self.generate_roothaan_fock());
         }
     }
 
@@ -1810,7 +1810,7 @@ impl SCF {
         };
 
         if let SCFType::ROHF = self.scftype {
-            self.roothaan_hamiltonian = self.generate_roothaan_fock();
+            self.roothaan_hamiltonian = Some(self.generate_roothaan_fock());
         }
         (exc_total, vxc_total)
 
@@ -1904,7 +1904,7 @@ impl SCF {
         let dt4 = time::Local::now();
 
         if let SCFType::ROHF = self.scftype {
-            self.roothaan_hamiltonian = self.generate_roothaan_fock();
+            self.roothaan_hamiltonian = Some(self.generate_roothaan_fock());
             let dt5 = time::Local::now();
             let timecost4 = (dt5.timestamp_millis()-dt4.timestamp_millis()) as f64 /1000.0;
             if self.mol.ctrl.print_level > 2 {
@@ -2163,7 +2163,7 @@ impl SCF {
          
     }
 
-        pub fn generate_roothaan_fock(&self) -> MatrixUpper<f64> {
+    pub fn generate_roothaan_fock(&self) -> MatrixUpper<f64> {
         //generate Roothaan's effective Fock matrix
         // ======== ======== ====== =========
         // space     closed   open   virtual
@@ -2948,7 +2948,7 @@ impl SCF {
         let mut ri3mo: Vec<(RIFull<f64>,std::ops::Range<usize>, std::ops::Range<usize>)> = vec![];
         for i_spin in 0..self.mol.spin_channel {
             let eigenvector = match self.scftype {
-                SCFType::ROHF => &self.semi_eigenvectors[i_spin],
+                SCFType::ROHF => &self.semi_eigenvectors.as_ref().unwrap()[i_spin],
                 _ => &self.eigenvectors[i_spin],
             };
             ri3mo.push(
@@ -4251,7 +4251,7 @@ impl ScfTraceRecord {
                         }
                     },
                     SCFType::ROHF => {
-                        let mut fock = &mut scf.roothaan_hamiltonian;
+                        let fock = scf.roothaan_hamiltonian.as_mut().unwrap();
                         let dm = scf.density_matrix[0].clone() + scf.density_matrix[1].clone();
                         level_shift_fock(fock, ovlp, level_shift, &dm, dm_scaling_factor);
                     }
@@ -4546,7 +4546,7 @@ pub fn diagonalize_hamiltonian_outside_fast(scf_data: &SCF)  -> ([MatrixFull<f64
         SCFType::ROHF => {
             // diagonalize Roothaan Fock matrix
             let (eigenvector, eigenvalue)=
-                _hamiltonian_fast_solver(&scf_data.roothaan_hamiltonian, &scf_data.ovlp, &mut num_state).unwrap();
+                _hamiltonian_fast_solver(scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp, &mut num_state).unwrap();
             eigenvectors[0] = eigenvector;
             eigenvalues[0] = eigenvalue;
         }
@@ -4568,7 +4568,7 @@ pub fn diagonalize_hamiltonian_outside_rayon(scf_data: &SCF) -> ([MatrixFull<f64
         SCFType::ROHF => {
             // diagonalize Roothaan Fock matrix
             let (eigenvector, eigenvalue, tmp_num_state_out)=
-                _dspgvx(&scf_data.roothaan_hamiltonian, &scf_data.ovlp, num_state).unwrap();
+                _dspgvx(scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp, num_state).unwrap();
             eigenvectors[0] = eigenvector;
             eigenvalues[0] = eigenvalue;
             if tmp_num_state_out < num_state_out {
@@ -4593,7 +4593,7 @@ pub fn diagonalize_hamiltonian_outside_rayon(scf_data: &SCF) -> ([MatrixFull<f64
     (eigenvectors,eigenvalues, num_state_out)
 }
 
-pub fn semi_diagonalize_hamiltonian_outside(scf_data: &SCF) -> ([MatrixFull<f64>; 2], [Vec<f64>; 2], [MatrixFull<f64>; 2], usize) {
+pub fn semi_diagonalize_hamiltonian_outside(scf_data: &SCF) -> (Option<[MatrixFull<f64>; 2]>, Option<[Vec<f64>; 2]>, Option<[MatrixFull<f64>; 2]>, usize) {
     // get the semi-canonical orbitals for RO-xDH calculations
     // See Knowles et al., Chem. Phys. Lett. 186(2), 130–136 (1991)
     let num_state = scf_data.mol.num_state;
@@ -4646,7 +4646,7 @@ pub fn semi_diagonalize_hamiltonian_outside(scf_data: &SCF) -> ([MatrixFull<f64>
         semi_eigenvalues[i_spin] = diag_terms;
     }
     
-    (semi_eigenvectors, semi_eigenvalues, semi_fock, num_state)
+    (Some(semi_eigenvectors), Some(semi_eigenvalues), Some(semi_fock), num_state)
 }
 
 pub fn generate_occupation_outside(scf_data: &SCF) -> ([Vec<f64>;2], [usize;2], [usize;2]) {
