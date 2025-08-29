@@ -10,6 +10,8 @@ use tensors::matrix_blas_lapack::_dgemm_nn_serial;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs;
+use std::env;
+use std::path;
 use std::io::{Write,BufRead, BufReader};
 use rest_libcint::{CINTR2CDATA, CintType};
 use std::f64::consts::{PI, E};
@@ -57,7 +59,9 @@ pub struct Basis4ElemRaw {
 
 #[test]
 fn import_ecp()-> anyhow::Result<()> {
-    let tmp_string = fs::read_to_string(String::from("/home/igor/Documents/Package-Pool/rest_workspace/rest/basis-set-pool/def2-SVP/Au.json"))?;
+    let rest_home = env::var("REST_HOME").expect("The environment variable REST_HOME is not set");
+    let mut file_path = path::PathBuf::from(rest_home).join("rest/basis-set-pool/def2-SVP/Au.json");
+    let tmp_string = fs::read_to_string(file_path)?;
     let tmp_basis:Basis4ElemRaw = serde_json::from_str(&tmp_string[..])?;
     if let (Some(ecp_electrons), Some(ecp_potentials))= (&tmp_basis.ecp_electrons, &tmp_basis.ecp_potentials)  {
         println!("debug ecp electrons: {}", &ecp_electrons);
