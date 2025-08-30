@@ -7,7 +7,7 @@ use std::{f64, fs::File, io::Write};
 use std::path::PathBuf;
 use crate::basis_io::ecp::ghost_effective_potential_matrix;
 use crate::external_field::num_dipole::numerical_dipole;
-use crate::geom_io::GeomUnit;
+use crate::geom_io::{GeomUnit,get_charge};
 use num_traits::Pow;
 use pyo3::prelude::*;
 use autocxx::prelude::*;
@@ -35,9 +35,10 @@ use time::{DateTime,Local};
 use crate::molecule_io::Molecule;
 //use crate::isdf::error_isdf;
 //use crate::dft::DFA4REST;
-use crate::post_scf_analysis::{post_scf_correlation, print_out_dfa, save_chkfile, rand_wf_real_space, cube_build, molden_build, post_ai_correction,quasiparticle_methods};
+use crate::post_scf_analysis::{post_scf_correlation, print_out_dfa, save_chkfile, rand_wf_real_space, cube_build, molden_build, post_ai_correction,quasiparticle_methods,rrs_pbc};
 use liblbfgs::{lbfgs,Progress};
 use crate::mpi_io::{MPIOperator,MPIData};
+use std::collections::HashMap;
 
 //use crate::mpi_io::initialization;
 
@@ -329,6 +330,59 @@ pub fn main_driver() -> anyhow::Result<()> {
     if scf_data.mol.ctrl.post_correlation.len()>=1 {
         post_scf_correlation(&mut scf_data);
     }
+
+    //===================================
+    // Now for rrs-pbc calculations
+    //===================================
+    if scf_data.mol.geom.rrs_pbc {
+        //get core_hamil_size
+        let full_hamil_size = scf_data.mol.num_basis;
+        let mut core_hamil_size = 0 as usize;
+        let charge_vec = get_charge(&scf_data.mol.geom.unit_cell_elem);
+        let mut cell_charge = 0.0;
+        charge_vec.iter().for_each(|c| { cell_charge += c});
+        let mut full_index_map = HashMap::new();
+        for (index, item) in scf_data.mol.geom.elem.iter().enumerate() {
+            full_index_map.entry(item.clone()).or_insert(index);
+        }
+        for item in &scf_data.mol.geom.unit_cell_elem {
+            match full_index_map.get(item) {
+                Some(&idx) => { 
+                    core_hamil_size += scf_data.mol.basis4elem[idx].global_index.1;
+                },
+                None => {
+                    panic!("Element {:?} in unit_cell_elem not exists in the molecule",item);
+                },
+            }
+        }
+        //core_hamil_size done
+        let num_cluster = ((scf_data.mol.geom.num_units - 1)/2) as usize;
+        let mut p_vec = vec![vec![0.0;3];scf_data.mol.geom.pbc_dim];
+        for i in 0..scf_data.mol.geom.pbc_dim {
+            p_vec[i] = scf_data.mol.geom.rrs_pbc_vec.data.clone()[i*3..(i+1)*3].to_vec();
+        };
+        let mut pbc_result = vec![vec![0.0;core_hamil_size];scf_data.mol.geom.k_points];
+        pbc_result = rrs_pbc::rrs_pbc_1d(&scf_data,core_hamil_size,num_cluster,p_vec,scf_data.mol.geom.k_points);
+        let k_f64 = scf_data.mol.geom.k_points as f64;
+        let real_k: Vec<_> = (1..(scf_data.mol.geom.k_points+1)).map(|i| {
+            let i_f64 = i as f64;
+            -std::f64::consts::PI + 2.0*(std::f64::consts::PI/k_f64)*i_f64
+        }).collect();
+        println!("RRS-PBC results:");
+        println!("Unit Cell: {:?}",scf_data.mol.geom.unit_cell_elem);
+        println!("Occupied orbitals: {:?}",(cell_charge/2.0) as usize);
+        real_k.iter().zip(pbc_result.iter()).for_each(|(k,res)| {
+            println!("k = {:?}",k);
+            println!("Orbital energy = {:?}",res);
+        });
+        let mut homo_lumo_gap = vec![0.0;scf_data.mol.geom.k_points];
+        homo_lumo_gap.iter_mut().zip(pbc_result.iter()).for_each(|(h,p)| {
+            *h = (p[(cell_charge/2.0) as usize] - p[(cell_charge/2.0) as usize - 1])*27.2113863;
+        });
+        let min_hlg = homo_lumo_gap.iter().filter(|&&x| !x.is_nan()).min_by(|a, b| a.partial_cmp(b).unwrap());
+        println!("HOMO-LUMO gap: {:?} eV",min_hlg.unwrap());
+    }
+
     if scf_data.mol.ctrl.quasipartcle_methods.len()>=1{
         println!("Now start quasiparticle computation using {}",scf_data.mol.ctrl.quasipartcle_methods);
         quasiparticle_methods(&mut scf_data,&mpi_operator);
