@@ -3,6 +3,7 @@ pub mod cube_build;
 pub mod molden_build;
 pub mod mulliken;
 pub mod strong_correlation_correction;
+pub mod rrs_pbc;
 
 use std::path::Path;
 use rest_libcint::prelude::int1e_r;

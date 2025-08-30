@@ -53,6 +53,13 @@ pub struct GeomCell {
     // both real and ghost atom positions
     pub rg_position: MatrixFull<f64>,
     pub rg_elem: Vec<String>,
+    //keywords for rrs-pbc
+    pub rrs_pbc: bool,
+    pub unit_cell_elem: Vec<String>,
+    pub num_units: usize,
+    pub pbc_dim: usize,
+    pub rrs_pbc_vec: MatrixFull<f64>,
+    pub k_points: usize,
 }
 
 //impl GeomCell {
@@ -159,6 +166,12 @@ impl GeomCell {
             ext_field       : ExtField::empty(),
             rg_elem         : vec![], 
             rg_position     : MatrixFull::empty(),
+            rrs_pbc         : false,
+            unit_cell_elem  : vec![],
+            num_units       : 1,
+            pbc_dim         : 1,
+            rrs_pbc_vec     : MatrixFull::empty(),
+            k_points        : 1,
         }
     }
     pub fn copy(&mut self, name:String) -> GeomCell {
@@ -177,6 +190,14 @@ impl GeomCell {
             new_mol.elem.push(elem.to_string());
             new_mol.fix.push(*fix);
         }
+        new_mol.rrs_pbc = self.rrs_pbc;
+        for elem in &mut self.unit_cell_elem {
+            new_mol.unit_cell_elem.push(elem.to_string());
+        }
+        new_mol.num_units = self.num_units;
+        new_mol.pbc_dim = self.pbc_dim;
+        new_mol.rrs_pbc_vec = self.rrs_pbc_vec.to_owned();
+        new_mol.k_points = self.k_points;
         new_mol
     }
     pub fn get_nfree(&self) -> anyhow::Result<usize> {
