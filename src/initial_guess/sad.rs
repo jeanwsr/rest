@@ -52,6 +52,7 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
             atom_ctrl.scf_acc_etot = 1.0e-8;
             let (spin, spin_channel, spin_polarization) = ctrl_setting_atom_sad(ielem);
             atom_ctrl.spin = spin;
+            atom_ctrl.use_int_nelec = false;
             atom_ctrl.spin_channel = spin_channel;
             atom_ctrl.spin_polarization = spin_polarization;
             //atom_ctrl.spin = 1.0;
