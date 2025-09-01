@@ -919,6 +919,10 @@ impl Molecule {
         // determine the electron number in total and in each spin channel.
         num_elec[0]-=ctrl.charge;
 
+        if ctrl.use_int_nelec {
+            sanity_check_nelec(num_elec[0], ctrl.spin);
+        }
+
         let unpair_elec = (ctrl.spin-1.0_f64);
         num_elec[1] = (num_elec[0]-unpair_elec)/2.0 + unpair_elec;
         num_elec[2] = (num_elec[0]-unpair_elec)/2.0;
@@ -3308,8 +3312,49 @@ pub fn count_frozen_core_states(n_frozen_shell: i32, elem: &Vec<String>) -> usiz
 //    //(index[1]+1)*index[1]/2
 //}
 
+pub fn is_int(f: f64) -> bool {
+    (f - f.round()).abs() < 1.0e-8
+}
 
+pub fn sanity_check_nelec(num_elec: f64, spin: f64) -> (i32, i32) {
 
+    let num_elec_int: i32;
+    let spin_int: i32;
+    if !is_int(num_elec) {
+        panic!("Error:: The total electron number cannot be rounded to an integer: {}.", num_elec);
+    } else {
+        num_elec_int = num_elec.round() as i32;
+    };
+    if !is_int(spin) {
+        panic!("Error:: The spin multiplicity cannot be rounded to an integer: {}.", spin);
+    } else {
+        spin_int = spin.round() as i32;
+    };
+    // odd/even check
+    if (num_elec_int - spin_int + 1) % 2 != 0 {
+        panic!("Error:: The total number of electrons ({}) and the spin multiplicity ({}) do not match.", num_elec, spin);
+    };
+    (num_elec_int, spin_int)
+}
+
+#[test]
+fn test_sanity_check_nelec() {
+    let (n, s) = sanity_check_nelec(10.0, 1.0);
+    assert_eq!(n, 10);
+    assert_eq!(s, 1);
+}
+
+#[test]
+#[should_panic]
+fn test_sanity_check_nelec_panic1() {
+    let (n, s) = sanity_check_nelec(10.1, 1.0);
+}
+
+#[test]
+#[should_panic]
+fn test_sanity_check_nelec_panic2() {
+    let (n, s) = sanity_check_nelec(10.0, 0.0);
+}
 
 #[test]
 fn test_get_slices_mut() {

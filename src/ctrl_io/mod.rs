@@ -106,6 +106,7 @@ pub struct InputKeywords {
     #[pyo3(get, set)]
     pub spin: f64,
     #[pyo3(get, set)]
+    pub use_int_nelec: bool,
     pub spin_channel: usize,
     #[pyo3(get, set)]
     pub spin_polarization: bool,
@@ -295,6 +296,7 @@ impl InputKeywords {
             use_ri_symm: true,
             charge: 0.0_f64,
             spin: 1.0_f64,
+            use_int_nelec: true,
             spin_channel: 1_usize,
             spin_polarization: false,
             // Keywords for frozen-core algorithms
@@ -776,6 +778,11 @@ impl InputKeywords {
                     serde_json::Value::String(tmp_spin) => {tmp_spin.to_lowercase().parse().unwrap_or(0.0)},
                     serde_json::Value::Number(tmp_spin) => {tmp_spin.as_f64().unwrap_or(0.0)},
                     other => {0.0},
+                };
+                tmp_input.use_int_nelec = match tmp_ctrl.get("use_int_nelec").unwrap_or(&serde_json::Value::Null) {
+                    // serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(true)},
+                    serde_json::Value::Bool(tmp_bool) => tmp_bool.clone(),
+                    other => {true},
                 };
                 tmp_input.spin_polarization = match tmp_ctrl.get("spin_polarization").unwrap_or(&serde_json::Value::Null) {
                     serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
