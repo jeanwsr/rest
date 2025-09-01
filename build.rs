@@ -37,6 +37,7 @@ fn main() -> miette::Result<()> {
     library_path.iter().for_each(|path| {
         println!("cargo:rustc-link-search={}",env::join_paths(&[path]).unwrap().to_str().unwrap())
     });
+    //println!("cargo:rustc-link-arg=-Wl,--no-as-needed,-lgomp");
 
 
     Ok(())
