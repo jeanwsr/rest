@@ -42,8 +42,9 @@
     1. `opt`: 基于数值力的构型优化。等价设置有：`geometry optimization`, `relax`等
 	1. `force`: 计算当前结构下的受力。等价设置有：`gradient`
 	1. `numerical dipole`: 计算数值偶极。等价设置有：`numdipole`
+- `auxbasis_response`：开启辅助基导数。缺省为true
 - `opt_engine`: 取值为String类型。构型优化引擎。可选项有：`LBFGS`（缺省）、`geometric-pyo3`
-- `numeric_force`: 取值为布尔类型。是否计算数值力。缺省为false
+- `numerical_force`: 取值为布尔类型。是否计算数值力。缺省为false
 - `nforce_displacement`:　取值为f64类型。数值力计算中的结构位移值，缺省是0.0013 Bohr
 
 ## 计算体系相关关键词（Keyword）
@@ -172,3 +173,17 @@
         potential       Mg_ghost.json      0.200000   0.30000    1.1000000
 '''
 `
+- `ext_field_dipole`：取值为 `[f64;3]` 类型。外加偶极电场 (以 `[0., 0., 0.]` 为规范原点) 在 [x, y, z] 三个分量上的强度。单位 a.u.。
+    - 一个例子：
+        ```
+        [geom]
+        name = "NH3"
+        unit = "Angstrom"
+        position = """
+            N  0.0  0.0  0.0
+            H  0.0  1.5  1.0
+            H  1.4  1.1  0.0
+            H  1.2  0.0  1.3
+        """
+        ext_field_dipole = [0.0, 0.1, 0.0]
+        ```
