@@ -128,7 +128,7 @@
   ...
 ]`
      - Vector中的每一项对应于一个轨道的约束。
-     - `reference`: 取值为String。C-DFT的计算需要有一个常规的DFT计算结果，并以hdf5的格式存在`reference`中
+     - `reference`: （可选）取值为String。C-DFT的计算需要有一个常规的DFT计算结果，并以hdf5的格式存在`reference`中。若省略，则默认与chkfile相同。
      - `prev_state`和`prev_spin`：取值为i32。定位需要约束的轨道在reference中的轨道序号和自旋通道
      - `target_spin`：（可选）取值为i32。在C-DFT计算中，约束轨道的目标自旋通道
         - 若省略该值，则默认与`prev_spin`相同
