@@ -50,7 +50,10 @@
 ## 计算体系相关关键词（Keyword）
 - `charge`：取值为f64类型。体系的总电荷数
 - `spin`: 取值为i32类型。体系的自旋多重度。假设体系未成对电子数为S，则取值2S+1
-- `spin_polarization`: 取值为布尔类型。是否开放自旋极化。当spin取值为1时，缺省为false；当spin取值大于1时，缺省为true
+- `spin_polarization`: 取值为布尔类型。是否开放自旋极化。
+    - 当spin取值为1时，缺省为false（RHF计算）
+    - 当spin取值大于1时，缺省为true（UHF计算）
+    - 若要进行ROHF计算，需要在spin取值大于1时将spin_polarization设为false。目前仅支持高自旋（即所有未成对电子自旋平行）的情况。
 - `outputs`: 取值为Vec\<String\>。用于计算结束后输出结果。可输出的信息包括：
     - `dipole`    偶极
     - `fchk`　    Gaussian程序的fchk文件
@@ -102,26 +105,34 @@
 	1. `sad` : 对体系各原子进行自洽场计算得到自洽的密度矩阵后，将多个密度矩阵按顺序置于对角位置后得到初始的密度矩阵进行自洽场运算。缺省为sad
     1. `vsap`: Superposition of Atomic Potentials的初始猜测方法。采用半经验方法对体系势能项进行估计，与libcint生成的动能项进行加和后得到初始的Fock矩阵
 	1. `hcore`: Hcore则对应单电子近似初猜，直接将由libcint生成的hcore矩阵作为初始猜测的fock矩阵进行计算
+- `guess_mix`: 取值为布尔类型，是否采用混合HOMO和LUMO的方法获得对称性破缺初猜。由此可以破坏体系的空间对称性和自旋对称性，有助于得到单重态UHF波函数。缺省为false。
+- `guess_mix_theta_deg`: 取值为`[f64;2]`或f64，分别设置两个自旋通道的混合角度（单位：度）。
+    - 设为0.0，则表示完全不混合
+    - 在0.0-90.0范围内，角度越大，表示破坏原始初猜效果越显著。一般建议取值为0.0-45.0。缺省为[15.0, 15.0]
 - `chkfile`: 取值为String。给定初始猜测所在位置/路径。缺省为none
 - `mixer`：取值为String。辅助自洽场收敛的方法。目前REST支持direct，diis，linear及ddiis。Direct对应不使用辅助收敛方法，linear对应于线性辅助收敛方法，diis对应于direct inversion in the iterative subspace。Diis是有效的加速收敛方法。缺省为diis
 - `mix_param`: 取值为f64。Diis方法或linear方法的混合系数。缺省为0.2
 - `start_diis_cycle`: 取值为i32。开始使用diis加速收敛方法的循环数。缺省为2
 - `num_max_diis`: 取值为i32。diis空间大小。缺省为8
 - `max_scf_cycle`: 取值为i32。自洽场运算的最大迭代循环数。缺省为100
+- `noiter`: 取值为布尔类型。是否跳过自洽场运算。缺省为false
 - `scf_acc_rho`: 取值为f64。自洽场运算密度矩阵的收敛标准。缺省为1.0e-8
 - `scf_acc_eev`: 取值为f64。自洽场运算能量差平方和的收敛标准。缺省为1.0e-6
 - `scf_acc_etot`: 取值为f64。自洽场运算总能量的收敛标准。缺省为1.0e-8
-- `level_shift`: 取值为f64。对于发生近简并振荡不收敛的情况，可以采用level_shift的方式人为破坏简并，加速收敛。缺省值为0.0
-- `start_check_oscillation`: 取值为i32。开始检查并自洽场计算不收敛发生振荡的循环数。当监控到自洽场发生振荡，SCF能量上升的情况，开启一次线性混合方案（linear)。缺省为20
+- `level_shift`: 取值为f64。对于发生近简并振荡不收敛的情况，可以采用level_shift的方式人为破坏简并，加速收敛。单位为hartree，缺省值为0.0
+- `start_check_oscillation`: 取值为i32。开始检查并自洽场计算不收敛发生振荡的循环数。当监控到自洽场发生振荡，SCF能量上升的情况，开启一次线性混合方案（linear）。缺省为20
 - `force_state_occupation`: 取值是Vector。 Constrained DFT (C-DFT) 计算方法。具体设置如下：
      - `[
-  [reference, prev_state, prev_spin, force_occ, force_check_min, force_check_max],
-  [reference, prev_state, prev_spin, force_occ, force_check_min, force_check_max],
+  [reference, prev_state, prev_spin, target_spin, force_occ, force_check_min, force_check_max],
+  [reference, prev_state, prev_spin, target_spin, force_occ, force_check_min, force_check_max],
   ...
 ]`
      - Vector中的每一项对应于一个轨道的约束。
-     - `reference`: 取值为String。C-DFT的计算需要有一个常规的DFT计算结果，并以hdf5的格式存在`reference`中
+     - `reference`: （可选）取值为String。C-DFT的计算需要有一个常规的DFT计算结果，并以hdf5的格式存在`reference`中。若省略，则默认与chkfile相同。
      - `prev_state`和`prev_spin`：取值为i32。定位需要约束的轨道在reference中的轨道序号和自旋通道
+     - `target_spin`：（可选）取值为i32。在C-DFT计算中，约束轨道的目标自旋通道
+        - 若省略该值，则默认与`prev_spin`相同
+        - 若给定，则会在指定自旋通道中寻找与prev_state/prev_spin最相似的轨道。
      - `force_occ`：取值为f64。设置上述定位的轨道在约束DFT（C-DFT）计算中的取值
      - `force_check_min`和`force_check_max`：取值为i32。在C-DFT的自洽计算中设置搜索窗口，仅从这个窗口中寻找和prev_state/prev_spin最相似的轨道
 ## 后自洽场计算相关关键词（Keyword）
@@ -142,7 +153,7 @@
      - `0`: 代表使用modified Gauss-Legendre格点。缺省为0
 	 - `1`: 代表standard Gausss-Legendre格点
 	 - `2`: 代表Logarithmic格点。
-- `lambda_points`：取值为i32。对于SCSRPA和R-xDH7等方法，对于开窍层的强关联体系，需要对绝热涨落途径（lambda)数值积分。这里设置lambda积分的格点数目。缺省为20
+- `lambda_points`：取值为i32。对于SCSRPA和R-xDH7等方法，对于开窍层的强关联体系，需要对绝热涨落途径（lambda）数值积分。这里设置lambda积分的格点数目。缺省为20
 
 # Detailed descrption of [geom] block in the control file
 - `name`：取值为String类型。分子体系的名称
