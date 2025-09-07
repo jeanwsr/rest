@@ -154,6 +154,18 @@
 	 - `1`: 代表standard Gausss-Legendre格点
 	 - `2`: 代表Logarithmic格点。
 - `lambda_points`：取值为i32。对于SCSRPA和R-xDH7等方法，对于开窍层的强关联体系，需要对绝热涨落途径（lambda）数值积分。这里设置lambda积分的格点数目。缺省为20
+## GW-BSE计算相关设置
+- `quasiparticle_methods`: 取值为String，设置为gw即开启GW计算准粒子能量，设置为bse即在计算或读取准粒子能量后进一步开启BSE计算垂直激发能。缺省为空，即不触发任何GW-BSE计算
+- `gw_scheme`: 取值为String，决定使用何种方式计算GW准粒子，无论进行GW还是BSE都需要设置此项。GW计算建议设置为extrapolated，即计算费米面附近一定范围内的准例子能量，其余轨道的准例子能量根据费米面附近的准粒子能量来外推。BSE计算还可以设置为parse from file，通过再设置`parse qp path`（取值为String，读取纯数据文本文件的路径）即可读取预先已计算好的GW准例子能量用于BSE计算
+- `threshold`: 取值为f64，单位为Hatree，在extrapolated方案中决定计算费米面附近计算准粒子能量的SCF轨道范围，费米面加减threshold范围以外的轨道的准粒子能量将由已计算的准粒子能量外推，缺省为0.1
+- `parse qp path`: 取值为String，若设置gw_scheme=“parse from file”则必须设置此项，读取纯数据文本文件的路径,从此路径读取预先已计算好的GW准粒子能量用于BSE计算
+- `scgw`: 取值为String，若设置为evgw即开启循环迭代的GW计算，缺省为g0w0，即只进行一轮GW计算
+- `evgw_rounds`: 取值为usize，若设置scgw=“evgw”则必须设置此项，循环迭代evgw的次数
+- `renormalized_singles`: 取值为bool，设置为true即在进行GW计算之前先使用密度泛函的密度矩阵投影计算HF哈密顿量并将其对角化，得到的本征值是RS粒子能量，使用RS粒子能量初始化GW中的G部分。参考文献：J. Phys. Chem. Let. 2019, 10 (3), 447-452.
+- `w_rs`: 取值为bool，设置`renormalized_singles`=true时进一步设置`w_rs`=true可以进一步使用RS粒子能量初始化GW中的W部分
+- `bse_spin`: 取值为String，需要进行BSE计算时必须设置此项，指定计算何种自旋的激发，可以设置为”singlet”或”triplet”
+- `bse_cutoff_energy`: 取值为f64，单位为Hatree，进行BSE计算时DFT能级高于此能量的轨道的准粒子能量将不参与BSE kernel的构建，用于削减构建的BSE kernel的维数，减少对角化计算时间，缺省为1.5
+- `bse_tda`: 取值为bool，设置为true则使用TDA近似，即BSE kernel只保留左上部分的子矩阵。缺省为false
 
 # Detailed descrption of [geom] block in the control file
 - `name`：取值为String类型。分子体系的名称
