@@ -27,19 +27,22 @@ pub fn bse_main(scf_data:&mut SCF){
         let n=wr_1.len();
         println!("Triplet full diagonalization results:");
         wr_1.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        println!("diag:{:#?}",wr_1.iter().filter(|a|**a>0.0).copied().collect::<Vec<f64>>()[0..10].to_vec());
+        let number=wr_1.len().min(30);
+        println!("diag:{:#?}",wr_1.iter().filter(|a|**a>0.0).copied().collect::<Vec<f64>>()[0..number].to_vec());
         println!("complexities:");
         println!("wi_1:{:?}",wi_1);
         println!("end of full diagonalization results");
         println!("~~~~~results of another method~~~~~~");
         wr_2.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        println!("Triplet TDA-BSE diagonalization results:{:#?}",wr_2[0..10].to_vec());
+        let number=wr_2.len().min(30);
+        println!("Triplet TDA-BSE diagonalization results:{:#?}",wr_2[0..number].to_vec());
         println!("complexities:");
         println!("wi_2:{:?}",wi_2);
         println!("end of TDA-BSE diagonalization results");
         println!("~~~~~results of another method~~~~~~");
         wr_3.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        println!("Triplet TDA-TDHF diagonalization results:{:#?}",wr_3[0..10].to_vec());
+        let number=wr_3.len().min(30);
+        println!("Triplet TDA-TDHF diagonalization results:{:#?}",wr_3[0..number].to_vec());
         println!("complexities:");
         println!("wi_3:{:?}",wi_3);
         println!("end of TDA-TDHF diagonalization results");
@@ -50,19 +53,22 @@ pub fn bse_main(scf_data:&mut SCF){
         let n=wr_1.len();
         println!("Singlet full diagonalization results:");
         wr_1.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        println!("diag:{:#?}",wr_1.iter().filter(|a|**a>0.0).copied().collect::<Vec<f64>>()[0..10].to_vec());
+        let number=wr_1.len().min(30);
+        println!("diag:{:#?}",wr_1.iter().filter(|a|**a>0.0).copied().collect::<Vec<f64>>()[0..number].to_vec());
         println!("complexities:");
         println!("wi_1:{:?}",wi_1);
         println!("end of full diagonalization results");
         println!("~~~~~results of another method~~~~~~");
         wr_2.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        println!("Singlet TDA-BSE diagonalization results:{:#?}",wr_2[0..10].to_vec());
+        let number=wr_2.len().min(30);
+        println!("Singlet TDA-BSE diagonalization results:{:#?}",wr_2[0..number].to_vec());
         println!("complexities:");
         println!("wi_2:{:?}",wi_2);
         println!("end of TDA-BSE diagonalization results");
         println!("~~~~~results of another method~~~~~~");
         wr_3.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        println!("Singlet TDA-TDHF diagonalization results:{:#?}",wr_3[0..30].to_vec());
+        let number=wr_1.len().min(30);
+        println!("Singlet TDA-TDHF diagonalization results:{:#?}",wr_3[0..number].to_vec());
         println!("complexities:");
         println!("wi_3:{:?}",wi_3);
         println!("end of TDA-TDHF diagonalization results");
@@ -77,10 +83,14 @@ pub fn bse_main(scf_data:&mut SCF){
         if scf_data.mol.ctrl.bse_tda==false{
             let mut eigens=non_tda_calculations(&scf_data,&quasiparticle_energies,xlet);
             let mut excitations=zip_and_sort(&eigens.0,&eigens.1);
+            if scf_data.mol.ctrl.print_level>2{
+                show_all_eigenpairs(&excitations);
+            }
             let mid = excitations.len() / 2;
             excitations=excitations[mid..].to_vec();
-            println!("First 30 excitations:");
-            excitations[0..30].iter().for_each(|(e,v)|{println!("excitation energy={}",e);leading_components(v,occ_size,vir_size)});
+            let number=excitations.len().min(30);
+            println!("First {} excitations:",number);
+            excitations[0..number].iter().for_each(|(e,v)|{println!("excitation energy={}",e);leading_components(v,occ_size,vir_size)});
             println!("The first excitation obtained by BSE is {}",excitations[0].0);
             if scf_data.mol.ctrl.save_bse_excitations==true{
                 let line = excitations.iter().map(|(num,vec)| num.to_string()).collect::<Vec<_>>().join(",");
@@ -95,8 +105,12 @@ pub fn bse_main(scf_data:&mut SCF){
         }else{
             let mut eigens=tda_calculations(&scf_data,&quasiparticle_energies,xlet);
             let excitations=zip_and_sort(&eigens.0,&eigens.1);
-            println!("First 30 excitations:");
-            excitations[0..30].iter().for_each(|(e,v)|{println!("excitation energy={}",e);leading_components(v,occ_size,vir_size)});
+            if scf_data.mol.ctrl.print_level>2{
+                show_all_eigenpairs(&excitations);
+            }
+            let number=excitations.len().min(30);
+            println!("First {} excitations:",number);
+            excitations[0..number].iter().for_each(|(e,v)|{println!("excitation energy={}",e);leading_components(v,occ_size,vir_size)});
             println!("The first excitation obtained by BSE is {}",excitations[0].0);
             if scf_data.mol.ctrl.save_bse_excitations==true{
                 let line = excitations.iter().map(|(num,vec)| num.to_string()).collect::<Vec<_>>().join(",");
@@ -241,7 +255,7 @@ pub fn construct_inverse_dielectric(scf_data:&SCF,epsilon:&Vec<f64>)->MatrixFull
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
     let ri_ov=get_submatrix(scf_data,'O','V','Y');
     if scf_data.mol.ctrl.print_level>1{
-        println!("occ_size={},vir_size={}",occ_size,vir_size);
+        println!("occ_size={},vir_size(for response)={}",occ_size,vir_size);
     }
     let response=ri_gw::response_matrix(epsilon,occ_size,vir_size,&ri_ov,0.0,'R');
     let inverse_dielectric=ri_gw::inverse_dielectric_matrix(&response,'R');
@@ -390,17 +404,21 @@ pub fn leading_components(eigenvector: &[f64],occ_size:usize, vir_size: usize){
         .enumerate()
         .map(|(n, x)| {
             let index = n; // 从0开始的索引
-            let i = index / vir_size;  // 整除
-            let j = occ_size+index % vir_size;  // 取余
+            let j = occ_size+index / occ_size;  // 整除
+            let i = index % occ_size;  // 取余
             (i, j, *x)
         })
         .collect();
     
     components.sort_by(|a, b| {
-        b.2.partial_cmp(&a.2)  // 降序排列（绝对值最大的在前）
+        b.2.abs().partial_cmp(&a.2.abs())  // 降序排列（绝对值最大的在前）
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    for i in 0..5{
+    let length=components.len().min(5);
+    for i in 0..length{
         println!("      #{}->#{},amplitude={}",components[i].0,components[i].1,components[i].2);
     }
+}
+pub fn show_all_eigenpairs<'a>(eigenpairs:&Vec<(f64,&'a [f64])>){
+    eigenpairs.iter().for_each(|(val,vec)|println!("eigenvalue:{},eigenverctor:{:#?}",val,vec))
 }
