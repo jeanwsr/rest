@@ -3,7 +3,7 @@ extern crate rest_tensors as tensors;
 //extern crate rest_libxc as libxc;
 extern crate chrono as time;
 extern crate hdf5_metno as hdf5;
-use std::{f64, fs::File, io::Write};
+use std::{f64, fs::File, io::{Write,Read}};
 use std::path::PathBuf;
 use crate::basis_io::ecp::ghost_effective_potential_matrix;
 use crate::external_field::num_dipole::numerical_dipole;
@@ -384,7 +384,7 @@ pub fn main_driver() -> anyhow::Result<()> {
     }
 
     if scf_data.mol.ctrl.quasipartcle_methods.len()>=1{
-        println!("Now start quasiparticle computation using {}",scf_data.mol.ctrl.quasipartcle_methods);
+        print!("Now starts quasiparticle method computation!\n");
         quasiparticle_methods(&mut scf_data,&mpi_operator);
     }
     time_mark.count("Overall");
