@@ -4898,7 +4898,6 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         let dt1_2 = time::Local::now();
         scf_data.generate_occupation();
         scf_data.generate_density_matrix();
-        scf_data.density_matrix[0].formated_output(5, "full");
 
         if scf_data.mol.ctrl.print_level>1 {
             scf_data.print_homo_lumo_gap()
