@@ -216,7 +216,8 @@ pub fn main_driver() -> anyhow::Result<()> {
                 lbfgs().minimize(
                     &mut position, 
                     |x: &[f64], gx: &mut [f64]| {
-                        scf_data.mol.geom.position = MatrixFull::from_vec([3,x.len()/3], x.to_vec()).unwrap();
+                        //scf_data.mol.geom.position = MatrixFull::from_vec([3,x.len()/3], x.to_vec()).unwrap();
+                        scf_data.mol.geom.geom_update(x, GeomUnit::Bohr);
                         if scf_data.mol.ctrl.print_level>0 {
                             println!("Input geometry in this round is:");
                             println!("{}", scf_data.mol.geom.formated_geometry());
