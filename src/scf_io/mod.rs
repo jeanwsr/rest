@@ -4716,7 +4716,7 @@ pub fn generate_density_matrix_outside(scf_data: &SCF) -> Vec<MatrixFull<f64>>{
     let num_state = scf_data.mol.num_state;
     let spin_channel = scf_data.mol.spin_channel;
     let homo = &scf_data.homo;
-    //println!("homo: {:?}", &homo);
+    // println!("homo: {:?}", &homo);
     let mut dm = vec![
         MatrixFull::empty(),
         MatrixFull::empty()
@@ -4742,6 +4742,7 @@ pub fn generate_density_matrix_outside(scf_data: &SCF) -> Vec<MatrixFull<f64>>{
                     *value.0 = *value.1
                 })
             });
+
         // prepare weighted eigenvalue matrix wC
         weight_eigv.par_iter_columns_mut(0..nw).unwrap().zip(occ_s[0..nw].par_iter()).for_each(|(we,occ)| {
         //weight_eigv.data.chunks_exact_mut(weight_eigv.size[0]).zip(occ_s.iter()).for_each(|(we,occ)| {
@@ -4830,6 +4831,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     scf_data.diagonalize_hamiltonian(mpi_operator);
     scf_data.generate_occupation();
 
+    // guess_mix
     if scf_data.mol.ctrl.guess_mix {
         for (i_spin, &theta_deg) in scf_data.mol.ctrl.guess_mix_theta_deg.iter().enumerate() {
             if theta_deg <= 0.0 || theta_deg > 45.0 {
@@ -4896,6 +4898,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         let dt1_2 = time::Local::now();
         scf_data.generate_occupation();
         scf_data.generate_density_matrix();
+
         if scf_data.mol.ctrl.print_level>1 {
             scf_data.print_homo_lumo_gap()
         };
@@ -4954,11 +4957,13 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             scf_data.generate_density_matrix();
             scf_data.generate_hf_hamiltonian(mpi_operator);
             scf_data.diagonalize_hamiltonian(mpi_operator);
+            scf_data.generate_occupation();
 
         }
         _ => {
             scf_data.generate_hf_hamiltonian(mpi_operator); 
-            scf_data.diagonalize_hamiltonian(mpi_operator); 
+            scf_data.diagonalize_hamiltonian(mpi_operator);
+            scf_data.generate_occupation(); 
         }
     }
 
