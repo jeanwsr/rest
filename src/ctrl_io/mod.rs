@@ -225,6 +225,7 @@ pub struct InputKeywords {
     pub guess_mix: bool,
     pub guess_mix_theta_deg: Vec<f64>,
     pub spin_correction_scheme: Option<String>,
+    pub yamaguchi_triplet_type: Option<String>,
     /// External dipole field (x, y, z) intensity in atomic units
     pub ext_field_dipole: Option<[f64; 3]>,
     pub opt_engine: Option<String>,
@@ -372,6 +373,7 @@ impl InputKeywords {
             guess_mix: false,
             guess_mix_theta_deg: [15.0, 15.0].to_vec(),
             spin_correction_scheme: None,
+            yamaguchi_triplet_type: None,
             ext_field_dipole: None,
             opt_engine: None,
             gw_scheme:String::from("no gw"),
@@ -1267,6 +1269,11 @@ impl InputKeywords {
                 };
 
                 tmp_input.spin_correction_scheme = match tmp_ctrl.get("spin_correction_scheme").unwrap_or(&serde_json::Value::Null) {
+                    serde_json::Value::String(tmp_emp) => {Some(tmp_emp.to_lowercase())},
+                    other => {None},
+                };
+
+                tmp_input.yamaguchi_triplet_type = match tmp_ctrl.get("yamaguchi_triplet_type").unwrap_or(&serde_json::Value::Null) {
                     serde_json::Value::String(tmp_emp) => {Some(tmp_emp.to_lowercase())},
                     other => {None},
                 };
