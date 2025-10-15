@@ -26,7 +26,7 @@ libm = "0.2"
 #blas-sys = "0.7"
 #blas = "0.22"
 lazy_static = "1.4"
-toml = "0.7"
+toml = "0.8"
 #tuple-conv = "1.0.1"
 num-traits = "0.2.15"
 statrs = "0.13"
@@ -57,7 +57,8 @@ derive_builder = { version = "0.20" }
 
 dftd3 = { version = "0.1", optional = true }
 dftd4 = { version = "0.1", optional = true }
-geometric-pyo3 = { version = "0.1", optional = true }
+#geometric-pyo3 = { version = "0.1", optional = true }
+geometric-pyo3 = {path="../geomeTRIC-pyo3", version = "0.1", optional = true }
 
 [build-dependencies]
 autocxx-build = "0.26.0"
@@ -65,7 +66,7 @@ miette = { version = "5", features = ["fancy"]}
 dunce = "1.0.0"
 
 [dependencies.pyo3]
-version = "0.24"
+version = "0.24.2"
 
 #[package.metadata.docs.rs]
 #rustdoc-args = [
@@ -85,9 +86,9 @@ geometric-pyo3 = ["dep:geometric-pyo3"]
 openblas = []
 intel-mkl = []
 
-[[bench]]
-name = "bench_tensors"
-harness = false
+#[[bench]]
+#name = "bench_tensors"
+#harness = false
 
 
 [[bin]]

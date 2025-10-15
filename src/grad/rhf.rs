@@ -834,7 +834,7 @@ pub fn get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2: TsrView<f64>, itm_k_ao: TsrV
 #[allow(non_snake_case)]
 mod debug {
     use super::*;
-    use crate::ctrl_io::InputKeywords;
+    //use crate::ctrl_io::{parse_ctl_from_json, InputKeywords};
     use crate::scf_io::scf_without_build;
 
     #[test]
@@ -978,7 +978,7 @@ mod debug {
     """
 "##;
         let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
-        let (mut ctrl, mut geom) = InputKeywords::parse_ctl_from_json(&keys).unwrap();
+        let (mut ctrl, mut geom) = crate::ctrl_io::parse_ctl_from_json(&keys).unwrap();
         let mol = Molecule::build_native(ctrl, geom, None).unwrap();
         let mut scf_data = scf_io::SCF::build(mol, &None);
         scf_without_build(&mut scf_data, &None);
@@ -1016,7 +1016,7 @@ mod debug {
     """
 "##;
         let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
-        let (mut ctrl, mut geom) = InputKeywords::parse_ctl_from_json(&keys).unwrap();
+        let (mut ctrl, mut geom) = crate::ctrl_io::parse_ctl_from_json(&keys).unwrap();
         let mol = Molecule::build_native(ctrl, geom, None).unwrap();
         let mut scf_data = scf_io::SCF::build(mol, &None);
         scf_without_build(&mut scf_data, &None);
@@ -1097,7 +1097,7 @@ mod debug {
     """
 "##;
         let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
-        let (mut ctrl, mut geom) = InputKeywords::parse_ctl_from_json(&keys).unwrap();
+        let (mut ctrl, mut geom) = crate::ctrl_io::parse_ctl_from_json(&keys).unwrap();
         let mol = Molecule::build_native(ctrl, geom, None).unwrap();
         let mut scf_data = scf_io::SCF::build(mol, &None);
         scf_without_build(&mut scf_data, &None);

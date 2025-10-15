@@ -28,7 +28,7 @@ use crate::constants::{ATM_NUC, ATM_NUC_MOD_OF, AUXBAS_THRESHOLD, ELEM1ST, ELEM2
 use crate::dft::{DFTType, DFA4REST};
 use crate::geom_io::{GeomCell,MOrC, GeomUnit, get_mass_charge};
 use crate::basis_io::{ecp, BasInfo, Basis4Elem};
-use crate::ctrl_io::{overall_parse_and_report_on_ctrl_geom, InputKeywords};
+use crate::ctrl_io::{overall_parse_and_report_on_ctrl_geom, InputKeywords, parse_ctl};
 use crate::mpi_io::{mpi_isend_irecv_wrt_distribution, mpi_isend_irecv_wrt_distribution_v02, mpi_isend_irecv_wrt_distribution_v03, MPIData, MPIOperator};
 use crate::utilities;
 use crate::basis_io::bse_downloader::{self, ctrl_element_checker, local_element_checker};
@@ -174,7 +174,7 @@ impl Molecule {
     pub fn build(ctrl_file: String, mpi_data: Option<MPIData>) -> anyhow::Result<Molecule> {
         //let mut mol = Molecule::new();
         //let (mut ctrl, mut geom) = RawCtrl::parse_ctl_from_jsonfile_v02(ctrl_file)?;
-        let (mut ctrl, mut geom) = InputKeywords::parse_ctl(ctrl_file)?;
+        let (mut ctrl, mut geom) = parse_ctl(ctrl_file)?;
         if let Some(local_mpi_data) = &mpi_data {
             if local_mpi_data.rank != 0 {ctrl.print_level = 0};
         };

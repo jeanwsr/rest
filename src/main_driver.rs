@@ -150,42 +150,38 @@ pub fn main_driver() -> anyhow::Result<()> {
             println!("Dipole Moment in DEBYE: {:16.8}, {:16.8}, {:16.8}", dp[0], dp[1], dp[2]);
         },
         JobType::GeomOpt => {
-            let opt_engine = scf_data.mol.ctrl.opt_engine.clone().unwrap_or("lbfgs".to_string());
+            //let opt_engine = scf_data.mol.ctrl.opt_engine.clone().unwrap_or("lbfgs".to_string());
+            let opt_engine = scf_data.mol.ctrl.opt_engine.clone().expect("Optimization engine is not specified");
             if opt_engine == "lbfgs" {
                 println!("LBFGS geometry optimization invoked");
                 time_mark.count_start("geom_opt");
                 if scf_data.mol.ctrl.print_level>0 {
                     println!("Geometry optimization invoked");
                 }
-                let displace = 0.0013/ANG;
-
-                //let (energy,nforce) = numerical_force(&scf_data, displace);
-                //println!("Total atomic forces [a.u.]: ");
-                //nforce.formated_output(5, "full");
-                //let mut nnforce = nforce.clone();
-                //nnforce.iter_mut().for_each(|x| *x *= ANG/EV);
-                //println!("Total atomic forces [EV/Ang]: ");
-                //nnforce.formated_output(5, "full");
+                let displace = scf_data.mol.ctrl.nforce_displacement/ANG;
 
                 let mut position = scf_data.mol.geom.position.iter().map(|x| *x).collect::<Vec<f64>>();
                 lbfgs().minimize(
                     &mut position, 
                     |x: &[f64], gx: &mut [f64]| {
-                        //scf_data.mol.geom.position = MatrixFull::from_vec([3,x.len()/3], x.to_vec()).unwrap();
                         scf_data.mol.geom.geom_update(x, GeomUnit::Bohr);
                         if scf_data.mol.ctrl.print_level>0 {
                             println!("Input geometry in this round is:");
                             println!("{}", scf_data.mol.geom.formated_geometry());
                         }
-                        scf_data.mol.ctrl.initial_guess = String::from("inherit");
-                        initialize_scf(&mut scf_data, &mpi_operator);
-                        performance_essential_calculations(&mut scf_data, &mut time_mark, &mpi_operator);
-                        let (energy, nforce) = numerical_force(&scf_data, displace, &mpi_operator);
-                        gx.iter_mut().zip(nforce.iter()).for_each(|(to, from)| {*to = *from});
+                        //scf_data.mol.ctrl.initial_guess = String::from("inherit");
+                        //initialize_scf(&mut scf_data, &mpi_operator);
+                        //performance_essential_calculations(&mut scf_data, &mut time_mark, &mpi_operator);
+                        //let (energy, nforce) = numerical_force(&scf_data, displace, &mpi_operator);
+                        
+                        let coords = MatrixFull::from_vec([3, x.len()/3], x.to_vec()).unwrap();
+                        let (energy, force) = eval_force_with_position(&mut scf_data, &mut time_mark, &mpi_operator, &coords);
+
+                        gx.iter_mut().zip(force.iter()).for_each(|(to, from)| {*to = *from});
 
                         if scf_data.mol.ctrl.print_level>0 {
                             println!("Output force in this round [a.u.] is:");
-                            println!("{}", formated_force(&nforce, &scf_data.mol.geom.elem));
+                            println!("{}", formated_force(&force, &scf_data.mol.geom.elem));
                         }
 
                         Ok(energy)
@@ -203,13 +199,13 @@ pub fn main_driver() -> anyhow::Result<()> {
                 time_mark.count("geom_opt");
 
                 time_mark.report("geom_opt");
-            } else if opt_engine == "geometric-pyo3" {
+            } else if opt_engine == "geometric_pyo3" {
                 #[cfg(feature = "geometric-pyo3")]
                 {
                     //println!("Geometric geometry optimization invoked");
                     time_mark.count_start("geom_opt");
                     if scf_data.mol.ctrl.print_level>0 {
-                        println!("Geometry optimization invoked using the optimization engine of geometric-pyo3");
+                        println!("Geometry optimization invoked using the optimization engine of geometric_pyo3");
                     }
                     geometric_pyo3_impl::optimize_geometric_pyo3(&mut scf_data, &mut time_mark);
                     println!("Geometry after relaxation [Ang]:");
@@ -502,6 +498,7 @@ fn initialize_time_record(mol: &Molecule) -> utilities::TimeRecords {
 
 /* #region force and geomopt utilities */
 
+
 fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_operator: &Option<MPIOperator>) -> (f64, MatrixFull<f64>) {
     // this is a temporary workaround for the force evaluation
     // currently, this framework could not work for post-scf,
@@ -644,15 +641,24 @@ mod geometric_pyo3_impl {
         let xyzs = vec![xyz];
         let molecule = init_pyo3_molecule(&elem, &xyzs).unwrap();
         
-        let optimizer_params = r#"
-            convergence_energy   = 1.0e-6  # Eh
-            convergence_grms     = 3.0e-4  # Eh/Bohr
-            convergence_gmax     = 4.5e-4  # Eh/Bohr
-            convergence_drms     = 1.2e-3  # Angstrom
-            convergence_dmax     = 1.8e-3  # Angstrom
-        "#;
+        //let optimizer_params = r#"
+        //    convergence_energy   = 1.0e-6  # Eh
+        //    convergence_grms     = 3.0e-4  # Eh/Bohr
+        //    convergence_gmax     = 4.5e-4  # Eh/Bohr
+        //    convergence_drms     = 1.2e-3  # Angstrom
+        //    convergence_dmax     = 1.8e-3  # Angstrom
+        //"#;
+        //let mut params = tomlstr2py(optimizer_params)?;
+
+        let mut params = if let Some(params) = &scf_data.mol.ctrl.geometric_pyo3 {
+            let params = toml2py(&params.to_toml())?;
+            params
+        } else {
+            panic!("For geometric_pyo3, you must specify the parameters in the control file.")
+        };
+
+
         let input = None;
-        let params = tomlstr2py(optimizer_params)?;
 
         let pyo3_engine_cls = get_pyo3_engine_cls()?;
         let geometric_opt_driver = GeometricOptDriver {
@@ -665,6 +671,7 @@ mod geometric_pyo3_impl {
         let (last_energy, last_coords) = Python::with_gil(|py| -> PyResult<(f64, Vec<f64>)> {
             let custom_engine = pyo3_engine_cls.call1(py, (molecule,))?;
             custom_engine.call_method1(py, "set_driver", (driver,))?;
+
             let res = run_optimization(custom_engine, &params, input)?;
 
             let last_energy = res

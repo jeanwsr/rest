@@ -11,7 +11,19 @@ use crate::{constants::{ANG, EV}, scf_io::{initialize_scf, scf_without_build, SC
 use crate::mpi_io::{MPIData, MPIOperator};
 use tensors::MatrixFull;
 
-
+//pub fn numerical_hessian(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> (f64,MatrixFull<f64>) { 
+//    let num_atoms =  scf_data.mol.geom.nfree;
+//    let mut num_hessian = MatrixFull::new([num_atoms*3,num_atoms*3],0.0);
+//    (0..num_atoms).into_iter().for_each(|atm_idx| { 
+//        (0..num_atoms).into_iter().for_each(|atm_idx2| { 
+//            (0..num_atoms).into_iter().for_each(|atm_idx3| { 
+//                (0..num_atoms).into_iter().for_each(|atm_idx4| { 
+//
+//                });
+//            });
+//        });
+//    });
+//}
 pub fn numerical_force(scf_data: &SCF, displace: f64, mpi_operator: &Option<MPIOperator>) -> (f64,MatrixFull<f64>) {
     let num_atoms =  scf_data.mol.geom.nfree;
     let mut num_force = MatrixFull::new([3,num_atoms],0.0);
