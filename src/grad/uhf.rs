@@ -610,7 +610,7 @@ mod debug {
     """
 "##;
         let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
-        let (mut ctrl, mut geom) = InputKeywords::parse_ctl_from_json(&keys).unwrap();
+        let (mut ctrl, mut geom) = crate::ctrl_io::parse_ctl_from_json(&keys).unwrap();
         let mol = Molecule::build_native(ctrl, geom, None).unwrap();
         let mut scf_data = scf_io::SCF::build(mol, &None);
         scf_without_build(&mut scf_data, &None);
@@ -648,7 +648,7 @@ mod debug {
     """
 "##;
         let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
-        let (mut ctrl, mut geom) = InputKeywords::parse_ctl_from_json(&keys).unwrap();
+        let (mut ctrl, mut geom) = crate::ctrl_io::parse_ctl_from_json(&keys).unwrap();
         let mol = Molecule::build_native(ctrl, geom, None).unwrap();
         let mut scf_data = scf_io::SCF::build(mol, &None);
         scf_without_build(&mut scf_data, &None);
@@ -727,7 +727,7 @@ mod debug {
     """
 "##;
         let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
-        let (mut ctrl, mut geom) = InputKeywords::parse_ctl_from_json(&keys).unwrap();
+        let (mut ctrl, mut geom) = crate::ctrl_io::parse_ctl_from_json(&keys).unwrap();
         let mol = Molecule::build_native(ctrl, geom, None).unwrap();
         let mut scf_data = scf_io::SCF::build(mol, &None);
         scf_without_build(&mut scf_data, &None);

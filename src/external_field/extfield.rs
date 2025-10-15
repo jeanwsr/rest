@@ -56,7 +56,7 @@ impl ExtField<f64> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::ctrl_io::InputKeywords;
+    use crate::ctrl_io::{parse_ctl_from_json, InputKeywords};
     use crate::scf_io::scf_without_build;
     use rstsr::prelude::*;
     use tensors::BasicMatrix;
@@ -94,7 +94,7 @@ mod test {
     """
 "##;
         let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
-        let (mut ctrl, mut geom) = InputKeywords::parse_ctl_from_json(&keys).unwrap();
+        let (mut ctrl, mut geom) = parse_ctl_from_json(&keys).unwrap();
         Molecule::build_native(ctrl, geom, None).unwrap()
     }
 }

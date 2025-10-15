@@ -46,6 +46,7 @@
 - `opt_engine`: 取值为String类型。构型优化引擎。可选项有：`LBFGS`（缺省）、`geometric-pyo3`
 - `numerical_force`: 取值为布尔类型。是否计算数值力。缺省为false
 - `nforce_displacement`:　取值为f64类型。数值力计算中的结构位移值，缺省是0.0013 Bohr
+- `ndipole_displacement`:　取值为f64类型。数值Dipole计算中的外电场位移值，缺省是3.0E-4 Bohr
 
 ## 计算体系相关关键词（Keyword）
 - `charge`：取值为f64类型。体系的总电荷数

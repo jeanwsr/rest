@@ -1011,3 +1011,202 @@ pub fn test_parse() {
         println!("{}, {}", cap["rmsd1"].to_string(), cap["rmsd2"].to_string());
     }
 }
+
+pub fn parse_geom_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<GeomCell> {
+    //let tmp_cont = fs::read_to_string(&filename[..])?;
+    //let tmp_keys: serde_json::Value = serde_json::from_str(&tmp_cont[..])?;
+    let mut tmp_geomcell = GeomCell::init_geom();
+
+    //==================================================================
+    //
+    //  parse the keywords from the "geom" block
+    //
+    //==================================================================
+    match tmp_keys.get("geom").unwrap_or(&serde_json::Value::Null) {
+        serde_json::Value::Object(tmp_geom) => {
+            tmp_geomcell.name = match tmp_geom.get("name").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.clone()},
+                other => {String::from("none")},
+            };
+            //for rrs_pbc
+            tmp_geomcell.rrs_pbc = match tmp_geom.get("rrs_pbc").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_geomcell.num_units = match tmp_geom.get("num_units").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
+                other => {1_usize}
+            };
+            tmp_geomcell.pbc_dim = match tmp_geom.get("pbc_dim").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
+                other => {1_usize}
+            };
+            tmp_geomcell.rrs_pbc_vec = match tmp_geom.get("rrs_pbc_vec").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(tmp_op) => {
+                    let tmp_vec: Vec<f64> = tmp_op.iter().map(|x| {
+                        match x {
+                            serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(0.0)},
+                            serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.0)},
+                            other => {0.0},
+                        }
+                    }).collect::<Vec<f64>>();
+                    MatrixFull::from_vec([tmp_geomcell.pbc_dim,3],tmp_vec).unwrap()
+                },
+                other => {MatrixFull::empty()},
+            };
+            tmp_geomcell.k_points = match tmp_geom.get("k_points").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
+                other => {1_usize}
+            };
+            tmp_geomcell.unit_cell_elem = match tmp_geom.get("unit_cell_elem").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_op) => {vec![tmp_op.to_string()]},
+                serde_json::Value::Array(tmp_op) => {
+                    let mut tmp_vec: Vec<String> = vec![];
+                    tmp_op.iter().for_each(|x| {
+                        let op_type = x.to_string();
+                        let string_len = op_type.len();
+                        tmp_vec.push(op_type[1..string_len-1].to_string())
+                    });
+                    tmp_vec
+                },
+                other => {vec![]},
+            };
+            //rrs_pbc check
+            if tmp_geomcell.rrs_pbc {
+                if tmp_geomcell.pbc_dim != 1_usize {
+                    panic!("I am sorry but 2D and 3D RRS-PBC methods are not yet implemented");
+                };
+                if tmp_geomcell.num_units % 2 == 0 {
+                    panic!("1D RRS-PBC method requires num_units to be odd");
+                };
+            };
+            //rrs_pbc end
+            let tmp_unit = match tmp_geom.get("unit").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
+                other => {String::from("angstrom")},
+            };
+            if tmp_unit.to_lowercase()==String::from("angstrom") {
+                tmp_geomcell.unit=GeomUnit::Angstrom;
+            } else if tmp_unit.to_lowercase()==String::from("bohr") {
+                tmp_geomcell.unit=GeomUnit::Bohr
+            } else {
+                println!("Warning:: unknown geometry unit is specified: {}. Angstrom will be used", tmp_unit);
+                tmp_geomcell.unit=GeomUnit::Angstrom;
+            };
+            //(tmp_geomcell.elem, tmp_geomcell.fix, tmp_geomcell.position, tmp_geomcell.nfree, )
+            match tmp_geom.get("position").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(tmp_vec) => {
+                    let tmp_unit = tmp_geomcell.unit.clone();
+                    
+                    let (tmp1,tmp2,tmp3,tmp4) = GeomCell::parse_position(tmp_vec, &tmp_unit)?;
+
+                    tmp_geomcell.elem = tmp1;
+                    tmp_geomcell.fix = tmp2;
+                    tmp_geomcell.position = tmp3;
+                    tmp_geomcell.nfree = tmp4;
+                    // real items in to real + ghost items
+                    tmp_geomcell.rg_elem = tmp_geomcell.elem.clone();
+                    tmp_geomcell.rg_position = tmp_geomcell.position.clone();
+                },
+                serde_json::Value::String(tmp_str) => {
+                    let tmp_unit = tmp_geomcell.unit.clone();
+                    
+                    let (tmp1,tmp2,tmp3,tmp4) = GeomCell::parse_position_from_string(tmp_str, &tmp_unit)?;
+
+                    tmp_geomcell.elem = tmp1;
+                    tmp_geomcell.fix = tmp2;
+                    tmp_geomcell.position = tmp3;
+                    tmp_geomcell.nfree = tmp4;
+                    // real items in to real + ghost items
+                    tmp_geomcell.rg_elem = tmp_geomcell.elem.clone();
+                    tmp_geomcell.rg_position = tmp_geomcell.position.clone();
+
+                }
+                other => {
+                    panic!("Error in reading the geometry position")
+                }
+            };
+            match tmp_geom.get("lattice").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(tmp_vec) => {
+                    let tmp_unit = tmp_geomcell.unit.clone();
+                    tmp_geomcell.lattice = GeomCell::parse_lattice(tmp_vec, &tmp_unit)?;
+                    tmp_geomcell.pbc = MOrC::Crystal;
+                    panic!("Find lattice vectors. PBC calculations should be turn on, which, however, is not yet implemented");
+                },
+                other => {
+                    //if tmp_input.print_level>0 {
+                    //    println!("It is a cluster calculation for finite molecules");
+                    //}
+                    tmp_geomcell.pbc = MOrC::Molecule;
+                }
+            }
+            match tmp_geom.get("ghost").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {
+                    let tmp_unit = tmp_geomcell.unit.clone();
+                    let (bs, pc, ep) = GeomCell::parse_ghost_atoms_from_string(tmp_str, &tmp_unit)?;
+                    if let Some((bs_elem, bs_pos)) = bs {
+                        tmp_geomcell.ghost_bs_elem = bs_elem;
+                        tmp_geomcell.ghost_bs_pos = bs_pos;
+                        //println!("{:?}", &tmp_geomcell.ghost_bs_pos);
+                        //println!("{:?}", &tmp_geomcell.rg_position);
+
+                        tmp_geomcell.rg_elem.extend_from_slice(&tmp_geomcell.ghost_bs_elem);
+                        tmp_geomcell.rg_position.append_column(&tmp_geomcell.ghost_bs_pos);
+
+                    } else {
+                        tmp_geomcell.ghost_bs_elem = vec![];
+                        tmp_geomcell.ghost_bs_pos = MatrixFull::empty();
+                    }
+                    if let Some((pc_chrg, pc_pos)) = pc {
+                        tmp_geomcell.ghost_pc_chrg = pc_chrg;
+                        tmp_geomcell.ghost_pc_pos = pc_pos;
+                    } else {
+                        tmp_geomcell.ghost_pc_chrg = vec![];
+                        tmp_geomcell.ghost_pc_pos = MatrixFull::empty();
+                    }
+                    if let Some((ep_path, ep_pos)) = ep {
+                        tmp_geomcell.ghost_ep_path = ep_path;
+                        tmp_geomcell.ghost_ep_pos = ep_pos;
+                    } else {
+                        tmp_geomcell.ghost_ep_path = vec![];
+                        tmp_geomcell.ghost_ep_pos = MatrixFull::empty();
+                    }
+                },
+                other => {
+                    //println!("debug: cannot recognize ghost");
+                    tmp_geomcell.ghost_bs_elem = vec![];
+                    tmp_geomcell.ghost_bs_pos = MatrixFull::empty();
+                    tmp_geomcell.ghost_pc_chrg = vec![];
+                    tmp_geomcell.ghost_pc_pos = MatrixFull::empty();
+                    tmp_geomcell.ghost_ep_path = vec![];
+                    tmp_geomcell.ghost_ep_pos = MatrixFull::empty();
+                }
+            }
+
+            // ext_field_dipole: [x, y, z]
+            match tmp_geom.get("ext_field_dipole").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(tmp_arr) => {
+                    assert_eq!(tmp_arr.len(), 3, "Dipole is 3-component (x, y, z) vector");
+                    let mut tmp_array = [0.0; 3];
+                    tmp_array.iter_mut().zip(tmp_arr.iter()).for_each(|(to, from)| {
+                        match from {
+                            serde_json::Value::String(tmp_str) => {*to = tmp_str.parse().unwrap_or(0.0)},
+                            serde_json::Value::Number(tmp_num) => {*to = tmp_num.as_f64().unwrap_or(0.0)},
+                            other => panic!("Not recognized type for ext_field_dipole"),
+                        }
+                    });
+                    tmp_geomcell.ext_field.dipole = Some(tmp_array);
+                }
+                _ => {},
+            };
+        },
+        other => {
+            panic!("Error:: no 'geom' keyword or some inproper settings of 'geom' keyword in the input file");
+        },
+    }
+    Ok(tmp_geomcell)
+    
+}

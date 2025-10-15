@@ -4,7 +4,11 @@ use serde::{Deserialize,Serialize};
 use tensors::MatrixFull;
 //use std::{fs, str::pattern::StrSearcher};
 use std::{fs, sync::Arc};
-use crate::{check_norm::force_state_occupation::ForceStateOccupation, dft::{DFAFamily, DFTType, DFA4REST}, geom_io::{GeomCell, GeomUnit, MOrC}, utilities};
+use crate::ctrl_io::geometric_pyo3_io::parse_geometric_keywords;
+use crate::{check_norm::force_state_occupation::ForceStateOccupation};
+use crate::dft::{DFAFamily, DFTType, DFA4REST};
+use crate::geom_io::{GeomCell, GeomUnit, MOrC, parse_geom_keywords};
+use crate::utilities;
 use rayon::ThreadPoolBuilder;
 use crate::check_norm::OCCType;
 use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper,omp_get_num_threads_wrapper};
@@ -12,15 +16,32 @@ use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper,omp_get_num_thread
 use serde_json;
 use toml;
 
-//use crate::geom_io::{GeomCell,GeomCell,CodeSelect,MOrC, GeomUnit, RawGeomCell};
-
-//#[derive(Serialize,Deserialize)]
-//pub struct RawCtrl {
-//    pub ctrl: Option<RawInputKeywords>,
-//    pub geom: Option<RawGeomCell>
-//}
-
 mod pyrest_ctrl_io;
+mod geometric_pyo3_io;
+use geometric_pyo3_io::GeomeTRIC;
+
+pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
+    let tmp_cont = fs::read_to_string(&filename[..])?;
+    let tmp_keys = if let Ok(tmp_json) = serde_json::from_str::<serde_json::Value>(&tmp_cont[..]) {
+        // input file in the json format
+        tmp_json
+    } else {
+        // input file in the toml format
+        toml::from_str::<serde_json::Value>(&tmp_cont[..])?
+    };
+    parse_ctl_from_json(&tmp_keys)
+}
+
+pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(InputKeywords,GeomCell)> {
+    let mut tmp_input = parse_ctrl_keywords(tmp_keys)?;
+    let mut tmp_geomcell = parse_geom_keywords(tmp_keys)?;
+    let mut tmp_geomtric = parse_geometric_keywords(tmp_keys)?;
+    if let Some(tmp_geomtric) = &mut tmp_geomtric {
+        tmp_input.geometric_pyo3 = Some(std::mem::take(tmp_geomtric));
+    }
+    Ok((tmp_input,tmp_geomcell))
+}
+
 
 #[derive(Clone,Copy,Debug, Deserialize, Serialize)]
 pub enum JobType {
@@ -257,6 +278,14 @@ pub struct InputKeywords {
     pub bse_qp_polarization:bool,
     pub threshold:f64,
     pub quasipartcle_methods:String,
+
+    pub geometric_pyo3: Option<GeomeTRIC>,
+}
+
+impl Default for InputKeywords {
+    fn default() -> Self {
+        InputKeywords::init_ctrl()
+    }
 }
 
 impl InputKeywords {
@@ -404,6 +433,7 @@ impl InputKeywords {
             bse_qp_polarization:false,
             threshold:0.1,
             quasipartcle_methods:String::new(),
+            geometric_pyo3: None,
         }
     }
 
@@ -411,1240 +441,6 @@ impl InputKeywords {
         toml::to_string(self).unwrap()
     }
 
-    pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(InputKeywords,GeomCell)> {
-        //let tmp_cont = fs::read_to_string(&filename[..])?;
-        //let tmp_keys: serde_json::Value = serde_json::from_str(&tmp_cont[..])?;
-        let mut tmp_input = InputKeywords::init_ctrl();
-        let mut tmp_geomcell = GeomCell::init_geom();
-
-        //==================================================================
-        //
-        //  parse the keywords from the "ctrl" block
-        //
-        //==================================================================
-        match tmp_keys.get("ctrl").unwrap_or(&serde_json::Value::Null) {
-            serde_json::Value::Object(tmp_ctrl) => {
-                // =====================================
-                //  Keywords for machine info and debug 
-                // =====================================
-                tmp_input.print_level = match tmp_ctrl.get("print_level").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
-                    other => {1_usize},
-                };
-                //let default_rayon_current_num_threads = rayon::current_num_threads();
-                tmp_input.num_threads = match tmp_ctrl.get("num_threads").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {Some(tmp_str.to_lowercase().parse().unwrap_or(1))},
-                    serde_json::Value::Number(tmp_num) => {Some(tmp_num.as_i64().unwrap_or(1) as usize)},
-                    other => {Some(1)},
-                };
-                tmp_input.batch_size = match tmp_ctrl.get("batch_size").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(64)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(64) as usize},
-                    other => {64},
-                };
-                tmp_input.pt2_mpi_mode = match tmp_ctrl.get("pt2_mpi_mode").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(0)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(0) as usize},
-                    other => {0},
-                };
-                if let Some(num_threads) = tmp_input.num_threads {
-                    //if tmp_input.print_level>0 {println!("The number of threads used for parallelism:      {}", num_threads)};
-                    // Now move the setting of rayon thread numbers to the main.rs
-                    //rayon::ThreadPoolBuilder::new().num_threads(num_threads);
-                    rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global().unwrap_or_else(|x| {println!("{:?}", &x)});
-                    omp_set_num_threads_wrapper(num_threads);
-                } else {
-                    omp_set_num_threads_wrapper(rayon::current_num_threads());
-                    //if tmp_input.print_level>0 {println!("The default rayon num_threads value is used:      {}", rayon::current_num_threads())};
-                };
-                //println!("max_num_threads: {}, current_num_threads: {}", rayon::max_num_threads(), rayon::current_num_threads());
-                // ====================================
-                //  Keywords for the (aux) basis sets
-                // ====================================
-                tmp_input.basis_path = match tmp_ctrl.get("basis_path").unwrap_or(&serde_json::Value::Null) {
-                   serde_json::Value::String(tmp_bas) => {
-                        if ! std::path::Path::new(tmp_bas).is_dir() {
-                            println!("The specified folder for the basis sets is missing: ({})", tmp_bas);
-                            println!("REST trys to fetch the basis sets from the basis-set exchange pool (https://www.basissetexchange.org/)");
-                        };
-                        tmp_bas.clone()
-                   },
-                   other => {
-                        if ! std::path::Path::new(&String::from("./")).is_dir() {
-                            panic!("The specified folder for the basis sets is missing. REST trys to find the basis set from the current folder: (./)");
-                        };
-                        String::from("./")
-                   }
-                };
-                tmp_input.basis_type = match tmp_ctrl.get("basis_type").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
-                    other => {String::from("spheric")}
-                };
-                //if tmp_input.print_level> 0 {println!("The {}-GTO basis set is taken from {}", tmp_input.basis_type,tmp_input.basis_path)};
-
-                tmp_input.pruning = match tmp_ctrl.get("pruning").unwrap_or(&serde_json::Value::Null){
-                    serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
-                    other => {String::from("nwchem")} //default prune method: sg1
-                };
-                //if tmp_input.print_level>0 {println!("The pruning method will be {}", tmp_input.pruning)};
-
-                tmp_input.rad_grid_method = match tmp_ctrl.get("radial_grid_method").unwrap_or(&serde_json::Value::Null){
-                    serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
-                    other => {String::from("treutler")} //default prune method: sg1
-                };
-                //if tmp_input.print_level>0 {println!("The radial grid generation method will be {}", tmp_input.rad_grid_method)};
-
-                tmp_input.eri_type = match tmp_ctrl.get("eri_type").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_eri) => {
-                        if tmp_eri.to_lowercase().eq("ri_v") || tmp_eri.to_lowercase().eq("ri-v")
-                        {
-                            String::from("ri_v")
-                        } else {tmp_eri.to_lowercase()}
-                    },
-                    other => {String::from("ri_v")},
-                };
-                let eri_type = tmp_input.eri_type.clone();
-                if eri_type.eq(&String::from("ri_v"))
-                {
-                    tmp_input.use_auxbas = true;
-                    tmp_input.use_isdf = false;
-                    tmp_input.ri_k_only = false;
-                } else if eri_type.eq(&String::from("ri_k")) {
-                    tmp_input.eri_type = String::from("ri_v");
-                    tmp_input.use_auxbas = true;
-                    tmp_input.use_isdf = false;
-                    tmp_input.ri_k_only = true;
-                } else if eri_type.eq(&String::from("isdf_full")) {
-                    // =========== for debug use by IGOR =================
-                    tmp_input.eri_type = String::from("ri_v");
-                    //====================================================
-                    tmp_input.use_auxbas = true;
-                    tmp_input.use_isdf = true;
-                }else if eri_type.eq(&String::from("isdf_k_new")){
-                        tmp_input.use_auxbas = true;
-                        tmp_input.use_isdf = true;
-                        tmp_input.isdf_k_only = true;
-                        tmp_input.eri_type = String::from("ri_v");
-                        tmp_input.isdf_new = true;
-                }else if  eri_type.eq(&String::from("isdf_k")){
-                        tmp_input.use_auxbas = true;
-                        tmp_input.use_isdf = true;
-                        tmp_input.isdf_k_only = true;
-                        tmp_input.eri_type = String::from("ri_v");
-                        tmp_input.isdf_new = false;
-                        //println!("Initial use_isdf: {}", tmp_input.use_isdf);
-                }else {
-                    tmp_input.use_auxbas = false;
-                    tmp_input.use_isdf = false;
-                };
-                //if tmp_input.print_level>0 {println!("ERI Type: {}", tmp_input.eri_type)};
-
-                tmp_input.use_ri_symm = match tmp_ctrl.get("use_ri_symm").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {true},
-                };
-                //if tmp_input.print_level>0 {
-                //    if tmp_input.use_ri_symm {
-                //        println!("Turn on the basis pair symmetry for RI 3D-tensors")
-                //    } else {
-                //        println!("Turn off the basis pair symmetry for RI 3D-tensors")
-                //    };
-                //}
-                tmp_input.isdf_k_mu = match tmp_ctrl.get("isdf_k_mu").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(8_usize)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
-                    other => {8_usize},
-                };            
-
-                tmp_input.auxbas_type = match tmp_ctrl.get("auxbas_type").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
-                    other => {String::from("spheric")}
-                };
-                tmp_input.auxbas_path = match tmp_ctrl.get("auxbas_path").unwrap_or(&serde_json::Value::Null) {
-                   serde_json::Value::String(tmp_bas) => {
-                        if ! std::path::Path::new(tmp_bas).is_dir() {
-                            println!("The specified folder for the auxiliar basis sets is missing: ({})", tmp_bas);
-                            //tmp_input.use_auxbas = false;
-                        }
-                        //tmp_input.use_auxbas = true;
-                        tmp_bas.clone()
-                   },
-                   other => {
-                        //if ! std::path::Path::new(&String::from("./")).is_dir() {
-                        //    println!("The specified folder for the auxiliar basis sets is missing: (./)");
-                        //};
-                        println!("No auxiliary basis set is specified. REST will try to find the auxiliary basis fromt the current folder: (./)");
-                        let default_bas = String::from("./");
-                        if ! std::path::Path::new(&default_bas).is_dir() {
-                            //tmp_input.use_auxbas = false;
-                        } else {
-                            //tmp_input.use_auxbas = true;
-                        }
-                        default_bas
-                   }
-                };
-                //if tmp_input.use_auxbas && tmp_input.print_level>0 {
-                //    println!("The {}-GTO auxiliary basis set is taken from {}", tmp_input.auxbas_type,tmp_input.auxbas_path)
-                //};
-                // ===============================================
-                //  Keywords for Gradient calculation
-                // ==============================================
-                tmp_input.auxbasis_response = match tmp_ctrl.get("auxbasis_response").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => *tmp_str,
-                    other => true,
-                };
-                tmp_input.numerical_force = match tmp_ctrl.get("numerical_force").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => *tmp_str,
-                    other => false,
-                };
-                // ==============================================
-                //  JobType
-                // ==============================================
-                tmp_input.job_type = match tmp_ctrl.get("job_type").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_xc) => {
-                        let tmp_xc_low = tmp_xc.to_lowercase();
-                        if tmp_xc_low.eq("opt") || tmp_xc_low.eq("geometry optimization") || 
-                           tmp_xc_low.eq("geometry relaxation") || tmp_xc_low.eq("geom_opt") ||
-                           tmp_xc_low.eq("geom_relax") || tmp_xc_low.eq("relax") {
-                            JobType::GeomOpt
-                        } else if tmp_xc_low.eq("force") || tmp_xc_low.eq("gradient") {
-                            JobType::Force
-                        } else if tmp_xc_low.eq("numdipole") || tmp_xc_low.eq("numerical dipole") {
-                            JobType::NumDipole
-                        } else if tmp_xc_low.eq("energy") || tmp_xc_low.eq("single point") ||
-                          tmp_xc_low.eq("single_point") {
-                            JobType::SinglePoint 
-                        } else {
-                            JobType::SinglePoint
-                        }
-                    },
-                    other => {JobType::SinglePoint},
-                };
-                tmp_input.nforce_displacement = match tmp_ctrl.get("nforce_displacement").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_nforce) => {tmp_nforce.to_lowercase().parse().unwrap_or(0.0013)},
-                    serde_json::Value::Number(tmp_nforce) => {tmp_nforce.as_f64().unwrap_or(0.0013)},
-                    other => {0.0013},
-                };
-                tmp_input.ndipole_displacement = match tmp_ctrl.get("nforce_displacement").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_nforce) => {tmp_nforce.to_lowercase().parse().unwrap_or(3e-4)},
-                    serde_json::Value::Number(tmp_nforce) => {tmp_nforce.as_f64().unwrap_or(3e-4)},
-                    serde_json::Value::Null => {3e-4},
-                    other => panic!("The ndipole_displacement is not recognized"),
-                };
-                // ==============================================
-                //  Keywords associated with the method employed
-                // ==============================================
-                tmp_input.xc = match tmp_ctrl.get("xc").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_xc) => {tmp_xc.to_lowercase()},
-                    other => {String::from("hf")},
-                };
-                tmp_input.xc_type = match tmp_ctrl.get("xc_type").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_xc) => {
-                        if tmp_xc.to_lowercase().eq("nonstandard") || tmp_xc.to_lowercase().eq("non-standard") {
-                            DFTType::NonStandard
-                        } else if tmp_xc.to_lowercase().eq("deep-learning")  
-                               || tmp_xc.to_lowercase().eq("deep_learning") 
-                               || tmp_xc.to_lowercase().eq("deep learning") 
-                               || tmp_xc.to_lowercase().eq("machine learning") 
-                               || tmp_xc.to_lowercase().eq("machine-learning") 
-                               || tmp_xc.to_lowercase().eq("machine_learning") 
-                        {
-                            DFTType::DeepLearning
-                        } else if tmp_xc.to_lowercase().eq("standard")  {
-                            DFTType::Standard
-                        } else {
-                            println!("Unknown xc_type: ({}). xc_type is set to `standard`", tmp_xc);
-                            DFTType::Standard
-                        }
-                    },
-                    other => {
-                        DFTType::Standard
-                    },
-                };
-                tmp_input.xc_namelist = match tmp_ctrl.get("xc_namelist").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_op) => {Some(vec![tmp_op.to_lowercase()])},
-                    serde_json::Value::Array(tmp_op) => {
-                        let mut tmp_vec:Vec<String> = vec![];
-                        tmp_op.iter().for_each(|x| {
-                            let op_type = x.to_string();
-                            let string_len = op_type.len();
-                            tmp_vec.push(op_type[1..string_len-1].to_lowercase().to_string())
-                        });
-                        Some(tmp_vec)
-                    },
-                    other => {None},
-                };
-                tmp_input.xc_paralist = match tmp_ctrl.get("xc_paralist").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Array(tmp_op) => {
-                        let tmp_vec:Vec<f64> = tmp_op.iter().map(|x| {
-                            match x {
-                                serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(0.0)},
-                                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.0)},
-                                other => {0.0},
-                            }
-                        }).collect::<Vec<f64>>();
-                        Some(tmp_vec)
-                    },
-                    other => {None},
-                };
-                tmp_input.dfa_hybrid_scf = match tmp_ctrl.get("xc_hybrid_para").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {Some(tmp_str.parse().unwrap_or(0.0))},
-                    serde_json::Value::Number(tmp_num) => {Some(tmp_num.as_f64().unwrap_or(0.0))},
-                    other => {None}
-                };
-                tmp_input.xc_model = match tmp_ctrl.get("xc_model").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_xc) => {
-                        tmp_input.xc_type=DFTType::DeepLearning; 
-                        Some(tmp_xc.to_lowercase())
-                    },
-                    other => {None},
-                };
-
-                tmp_input.empirical_dispersion = match tmp_ctrl.get("empirical_dispersion").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_emp) => {
-                        if tmp_emp.to_lowercase() == "none" {
-                           None 
-                        } else if tmp_emp.to_lowercase() == "true" {
-                            Some("d3bj".to_string())
-                        } else {
-                           Some(tmp_emp.to_lowercase())
-                        }
-                    },
-                    other => {None},
-                };
-                //let re0 = Regex::new(r"
-                //                    (?P<elem>\w{1,2})\s*,?    # the element
-                //                    \s+
-                //                    (?P<x>[\+-]?\d+.\d+)\s*,? # the 'x' position
-                //                    \s+
-                //                    (?P<y>[\+-]?\d+.\d+)\s*,? # the 'y' position
-                //                    \s+
-                //                    (?P<z>[\+-]?\d+.\d+)\s*,? # the 'z' position
-                //                    \s*").unwrap();
-                tmp_input.post_xc = match tmp_ctrl.get("post_xc").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_xc) => {vec![tmp_xc.to_lowercase()]},
-                    serde_json::Value::Array(tmp_xc) => {
-                        let mut tmp_vec:Vec<String> = vec![];
-                        tmp_xc.iter().for_each(|x| {
-                            let xc_method = x.to_string();
-                            let string_len = xc_method.len();
-                            tmp_vec.push(xc_method[1..string_len-1].to_string())
-                        });
-                        tmp_vec
-                    },
-                    other => {vec![]},
-                };
-                let post_corr = match tmp_ctrl.get("post_correlation").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_xc) => {vec![tmp_xc.to_lowercase()]},
-                    serde_json::Value::Array(tmp_xc) => {
-                        let mut tmp_vec:Vec<String> = vec![];
-                        tmp_xc.iter().for_each(|x| {
-                            let xc_method = x.to_string();
-                            let string_len = xc_method.len();
-                            tmp_vec.push(xc_method[1..string_len-1].to_string())
-                        });
-                        tmp_vec
-                    },
-                    other => {vec![]},
-                };
-                tmp_input.post_correlation = vec![];
-                post_corr.iter().for_each(|corr| {
-                    if corr.to_lowercase().eq("pt2") {
-                        tmp_input.post_correlation.push(DFAFamily::PT2)
-                    } else if corr.to_lowercase().eq("sbge2") {
-                        tmp_input.post_correlation.push(DFAFamily::SBGE2)
-                    } else if corr.to_lowercase().eq("rpa") {
-                        tmp_input.post_correlation.push(DFAFamily::RPA)
-                    } else if corr.to_lowercase().eq("scsrpa") {
-                        tmp_input.post_correlation.push(DFAFamily::SCSRPA)
-                    } else {
-                        println!("WARNNING: Unknown post-scf correlation method: {}", corr)
-                    }
-                    //if corr.to_lowercase().eq(&pt2) 
-                });
-                tmp_input.post_ai_correction = match tmp_ctrl.get("post_ai_correction").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_xc) => {tmp_xc.to_lowercase()},
-                    other => {String::from("none")},
-                };
-                // ===============================================
-                //  Keywords to determine the spin channel, which 
-                //   is important to turn on RHF(RKS) or UHF(UKS)
-                // ==============================================
-                tmp_input.charge = match tmp_ctrl.get("charge").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_charge) => {tmp_charge.to_lowercase().parse().unwrap_or(0.0)},
-                    serde_json::Value::Number(tmp_charge) => {tmp_charge.as_f64().unwrap_or(0.0)},
-                    other => {0.0},
-                };
-                tmp_input.spin = match tmp_ctrl.get("spin").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_spin) => {tmp_spin.to_lowercase().parse().unwrap_or(0.0)},
-                    serde_json::Value::Number(tmp_spin) => {tmp_spin.as_f64().unwrap_or(0.0)},
-                    other => {0.0},
-                };
-                tmp_input.use_int_nelec = match tmp_ctrl.get("use_int_nelec").unwrap_or(&serde_json::Value::Null) {
-                    // serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(true)},
-                    serde_json::Value::Bool(tmp_bool) => tmp_bool.clone(),
-                    other => {true},
-                };
-                tmp_input.spin_polarization = match tmp_ctrl.get("spin_polarization").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
-                    serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
-                    other => false,
-                };
-                tmp_input.spin_channel = if tmp_input.spin_polarization {
-                    //if tmp_input.print_level>0 {println!("Spin polarization: On")};
-                    2_usize
-                } else {
-                    //if tmp_input.print_level>0 {println!("Spin polarization: Off")};
-                    1_usize
-                };
-                // ==============================================
-                //  Keywords of setting the frozen-core algorithm
-                // ==============================================
-                tmp_input.frozen_core_postscf = match tmp_ctrl.get("frozen_core_postscf").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_fc) => {tmp_fc.to_lowercase().parse().unwrap_or(0)},
-                    serde_json::Value::Number(tmp_fc) => {tmp_fc.as_i64().unwrap_or(0) as i32},
-                    other => {0},
-                };
-                // ==============================================
-                //  Keywords of setting the frequency tabulation
-                // ==============================================
-                tmp_input.frequency_points = match tmp_ctrl.get("frequency_points").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_fp) => {tmp_fp.to_lowercase().parse().unwrap_or(20_usize)},
-                    serde_json::Value::Number(tmp_fp) => {tmp_fp.as_i64().unwrap_or(20) as usize},
-                    other => {20_usize},
-                };
-                tmp_input.freq_grid_type = match tmp_ctrl.get("freq_grid_type").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_fg) => {tmp_fg.to_lowercase().parse().unwrap_or(0)},
-                    serde_json::Value::Number(tmp_fg) => {tmp_fg.as_i64().unwrap_or(0) as usize},
-                    other => {0},
-                };
-                tmp_input.freq_cut_off = match tmp_ctrl.get("freq_cut_off").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_fg) => {tmp_fg.to_lowercase().parse().unwrap_or(10.0)},
-                    serde_json::Value::Number(tmp_fg) => {tmp_fg.as_f64().unwrap_or(10.0)},
-                    other => {10.0},
-                };
-                tmp_input.lambda_points = match tmp_ctrl.get("lambda_points").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_fp) => {tmp_fp.to_lowercase().parse().unwrap_or(20_usize)},
-                    serde_json::Value::Number(tmp_fp) => {tmp_fp.as_i64().unwrap_or(20) as usize},
-                    other => {20_usize},
-                };
-                //===============================================
-                // Keywords for fciqmc dump
-                //===============================================
-                tmp_input.fciqmc_dump = match tmp_ctrl.get("fciqmc_dump").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_bool) => {tmp_bool.clone()},
-                    other => {false},
-                };
-
-
-                // ==============================================
-                //  Keywords associated with DFT grids
-                // ==============================================
-                tmp_input.radial_precision = match tmp_ctrl.get("radial_precision").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-12)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-12)},
-                    other => {1.0e-12}
-                };
-                tmp_input.min_num_angular_points = match tmp_ctrl.get("min_num_angular_points").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(110_usize)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(110) as usize},
-                    other => {110_usize}
-                };
-                tmp_input.max_num_angular_points = match tmp_ctrl.get("max_num_angular_points").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(590_usize)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(590) as usize},
-                    other => {590_usize}
-                };
-                tmp_input.hardness = match tmp_ctrl.get("hardness").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(3_usize)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(3) as usize},
-                    other => {3_usize}
-                };
-
-                tmp_input.external_grids = match tmp_ctrl.get("external_grids").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_type) => {
-                        if tmp_input.print_level>0 {println!("Read grids from the external file: {}", tmp_type)};
-                        tmp_type.to_string()},
-                    other => {String::from("grids")}
-                };
-
-                tmp_input.grid_gen_level = match tmp_ctrl.get("grid_generation_level").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(3_usize)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(3) as usize},
-                    other => {3_usize},
-                };
-
-                tmp_input.even_tempered_basis = match tmp_ctrl.get("even_tempered_basis").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-
-                tmp_input.etb_start_atom_number = match tmp_ctrl.get("etb_start_atom_number").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(37_usize)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(37) as usize},
-                    other => {37_usize},
-                };
-
-                tmp_input.etb_beta = match tmp_ctrl.get("etb_beta").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(2.0_f64)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(2.0_f64)},
-                    other => {2.0_f64},
-                };
-
-                // ==============================================
-                //  Keywords associated with the SCF procedure
-                // ==============================================
-                tmp_input.max_scf_cycle = match tmp_ctrl.get("max_scf_cycle").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(100_usize)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(100) as usize},
-                    other => {100_usize}
-                };
-                tmp_input.level_shift = match tmp_ctrl.get("level_shift").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {
-                        let num = tmp_str.to_lowercase().parse().unwrap_or(0.0);
-                        if num == 0.0 {
-                            None
-                        } else {
-                            Some(num)
-                        }
-                    },
-                    serde_json::Value::Number(tmp_num) => {
-                        let num = tmp_num.as_f64().unwrap_or(0.0);
-                        if num == 0.0 {
-                            None
-                        } else {
-                            Some(num)
-                        }
-                    },
-                    other => {None}
-                };
-                tmp_input.scf_acc_rho = match tmp_ctrl.get("scf_acc_rho").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-6)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-8)},
-                    other => {1.0e-8}
-                };
-                tmp_input.scf_acc_eev = match tmp_ctrl.get("scf_acc_eev").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-6)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-6)},
-                    other => {1.0e-6}
-                };
-                tmp_input.scf_acc_etot = match tmp_ctrl.get("scf_acc_etot").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-8)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-8)},
-                    other => {1.0e-8}
-                };
-
-                tmp_input.mixer = match tmp_ctrl.get("mixer").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
-                    other => {String::from("diis")},
-                };
-                tmp_input.mix_param = match tmp_ctrl.get("mix_param").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(0.2)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.2)},
-                    other => {0.2}
-                };
-                tmp_input.num_max_diis = match tmp_ctrl.get("num_max_diis").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(8_usize)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
-                    other => {8_usize}
-                };
-                tmp_input.start_diis_cycle = match tmp_ctrl.get("start_diis_cycle").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
-                    other => {1_usize}
-                };
-                tmp_input.start_check_oscillation = match tmp_ctrl.get("start_check_oscillation").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(20_usize)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(20) as usize},
-                    other => {20_usize}
-                };
-
-                // Initial guess relevant keywords
-                tmp_input.guessfile = match tmp_ctrl.get("guessfile").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_guess) => tmp_guess.clone(),
-                    other => String::from("none"),
-                };
-                tmp_input.guessfile_type = match tmp_ctrl.get("guessfile_type").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_guess) => tmp_guess.to_lowercase().clone(),
-                    other => String::from("none"),
-                };
-
-                // Fix a bug reported by Linyue Yu, 2024-09-03
-                tmp_input.external_init_guess = (! tmp_input.guessfile.to_lowercase().eq(&"none") ) &&
-                            std::path::Path::new(&tmp_input.guessfile).exists();
-
-                tmp_input.chkfile = match tmp_ctrl.get("chkfile").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_chk) => tmp_chk.clone(),
-                    other => String::from("none"),
-                };
-                tmp_input.chkfile_type = match tmp_ctrl.get("chkfile_type").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_chk) => tmp_chk.to_lowercase().clone(),
-                    other => String::from("hdf5"),
-                };
-
-                tmp_input.restart = ! tmp_input.chkfile.to_lowercase().eq(&"none");
-
-                tmp_input.initial_guess = match tmp_ctrl.get("initial_guess").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
-                    other => {String::from("sad")},
-                };
-
-                tmp_input.noiter = match tmp_ctrl.get("noiter").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
-                    serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
-                    other => false,
-                };
-                tmp_input.check_stab = match tmp_ctrl.get("check_stab").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
-                    serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
-                    other => false,
-                };
-                tmp_input.use_dm_only = match tmp_ctrl.get("use_dm_only").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
-                    serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
-                    other => false,
-                };
-                tmp_input.use_ri_vj = match tmp_ctrl.get("use_ri_vj").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(true),
-                    serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
-                    other => true,
-                };
-                // ================================================
-                //  Keywords associated with the elec occupation 
-                // ================================================
-                tmp_input.occupation_type = 
-                match tmp_ctrl.get("occupation_type").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_type) => {
-                        let tmp_occupation_type = tmp_type.to_lowercase();
-                        if tmp_occupation_type.eq("integer") {
-                            OCCType::INTEGER
-                        } else if tmp_occupation_type.eq("sad") {
-                            OCCType::ATMSAD
-                        } else if tmp_occupation_type.eq("frac") {
-                            OCCType::FRAC
-                        } else {
-                            OCCType::INTEGER
-                        }
-                    },
-                    other => OCCType::INTEGER,
-                };
-                tmp_input.frac_tolerant = match tmp_ctrl.get("frac_tolerant").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-3)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-3)},
-                    other => {1.0e-3}
-                };
-                tmp_input.force_state_occupation = match tmp_ctrl.get("force_state_occupation").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(_) => vec![],
-                    serde_json::Value::Array(tmp_op) => {
-                        let mut tmp_vec: Vec<ForceStateOccupation> = vec![];
-                        tmp_op.iter().for_each(|x| {
-                            let tmp_obj = match x {
-                                serde_json::Value::Array(tmp_value) => {
-                                    match tmp_value.len() {
-                                        5 => {
-                                            // [ref_state, ref_spin, force_occ, min, max]
-                                            let ref_state = tmp_value[0].as_u64().unwrap_or(0) as usize;
-                                            let ref_spin = tmp_value[1].as_u64().unwrap_or(0) as usize;
-                                            let target_spin = ref_spin;
-                                            let force_occ = tmp_value[2].as_f64().unwrap_or(0.0);
-                                            let check_min = tmp_value[3].as_u64().unwrap_or(0) as usize;
-                                            let check_max = tmp_value[4].as_u64().unwrap_or(0) as usize;
-                                            Some(ForceStateOccupation::init(
-                                                tmp_input.chkfile.clone(),
-                                                ref_state,
-                                                ref_spin,
-                                                target_spin,
-                                                force_occ,
-                                                check_min,
-                                                check_max,
-                                            ))
-                                        }
-                                        6 => {
-                                            match &tmp_value[0] {
-                                                serde_json::Value::String(ref reference) => {
-                                                    // ["ref.hdf5", ref_state, ref_spin, force_occ, min, max]
-                                                    let ref_state = tmp_value[1].as_u64().unwrap_or(0) as usize;
-                                                    let ref_spin = tmp_value[2].as_u64().unwrap_or(0) as usize;
-                                                    let target_spin = ref_spin;
-                                                    let force_occ = tmp_value[3].as_f64().unwrap_or(0.0);
-                                                    let check_min = tmp_value[4].as_u64().unwrap_or(0) as usize;
-                                                    let check_max = tmp_value[5].as_u64().unwrap_or(0) as usize;
-                                                    Some(ForceStateOccupation::init(
-                                                        reference.to_string(),
-                                                        ref_state,
-                                                        ref_spin,
-                                                        target_spin,
-                                                        force_occ,
-                                                        check_min,
-                                                        check_max,
-                                                    ))
-                                                }
-                                                _ => {
-                                                    // [ref_state, ref_spin, target_spin, force_occ, min, max]
-                                                    let ref_state = tmp_value[0].as_u64().unwrap_or(0) as usize;
-                                                    let ref_spin = tmp_value[1].as_u64().unwrap_or(0) as usize;
-                                                    let target_spin = tmp_value[2].as_u64().unwrap_or(0) as usize;
-                                                    let force_occ = tmp_value[3].as_f64().unwrap_or(0.0);
-                                                    let check_min = tmp_value[4].as_u64().unwrap_or(0) as usize;
-                                                    let check_max = tmp_value[5].as_u64().unwrap_or(0) as usize;
-                                                    Some(ForceStateOccupation::init(
-                                                        tmp_input.chkfile.clone(),
-                                                        ref_state,
-                                                        ref_spin,
-                                                        target_spin,
-                                                        force_occ,
-                                                        check_min,
-                                                        check_max,
-                                                    ))
-                                                }
-                                            }
-                                        }
-                                        7 => {
-                                            // ["ref.hdf5", ref_state, ref_spin, target_spin, force_occ, min, max]
-                                            let reference = tmp_value[0].as_str().unwrap_or("none").to_string();
-                                            let ref_state = tmp_value[1].as_u64().unwrap_or(0) as usize;
-                                            let ref_spin = tmp_value[2].as_u64().unwrap_or(0) as usize;
-                                            let target_spin = tmp_value[3].as_u64().unwrap_or(0) as usize;
-                                            let force_occ = tmp_value[4].as_f64().unwrap_or(0.0);
-                                            let check_min = tmp_value[5].as_u64().unwrap_or(0) as usize;
-                                            let check_max = tmp_value[6].as_u64().unwrap_or(0) as usize;
-                                            Some(ForceStateOccupation::init(
-                                                reference,
-                                                ref_state,
-                                                ref_spin,
-                                                target_spin,
-                                                force_occ,
-                                                check_min,
-                                                check_max,
-                                            ))
-                                        }
-                                        _ => {
-                                            panic!("ERROR:: incorrect force_state_occupation setting: {:?}", &tmp_value);
-                                        }
-                                    }
-                                }
-                                _ => None,
-                            };
-                            if let Some(tmp_obj) = tmp_obj {
-                                tmp_vec.push(tmp_obj);
-                            }
-                        });
-                        tmp_vec
-                    }
-                    _ => vec![],
-                };
-
-                //
-                tmp_input.auxiliary_reference_states = match tmp_ctrl.get("auxiliary_reference_states").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_chk) => vec![(String::from("none"),0)],
-                    serde_json::Value::Array(tmp_op) => {
-                        let mut tmp_files = vec![];
-                        tmp_op.iter().for_each(|x| {
-                            match x {
-                                serde_json::Value::String(tmp_str) => {tmp_files.push((tmp_str.clone(),0))},
-                                serde_json::Value::Array(tmp_value) => {
-                                    let aux_file_name = tmp_value[0].as_str().unwrap().to_string();
-                                    let global_start = tmp_value[1].as_u64().unwrap() as usize;
-                                    tmp_files.push((aux_file_name,global_start));
-                                },
-                                _ => {}
-                            }
-                        });
-                        tmp_files
-                    },
-                    other => Vec::new(),
-                };
-                tmp_input.rpa_de_excitation_parameters = match tmp_ctrl.get("rpa_de_excitation_parameters").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Array(tmp_op) => {
-                        if tmp_op.len() == 4 {
-                            let mut tmp_array = [0.0;4];
-                            tmp_array.iter_mut().zip(tmp_op.iter()).for_each(|(to, from)| {
-                                *to = from.as_f64().unwrap()
-                            });
-                            Some(tmp_array)
-                        } else {
-                            None
-                        }
-                    },
-                    other => None,
-                };
-                // ================================================
-                //  Keywords associated with the post-SCF analyais
-                // ================================================
-                tmp_input.outputs = match tmp_ctrl.get("outputs").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_op) => {vec![tmp_op.to_lowercase()]},
-                    serde_json::Value::Array(tmp_op) => {
-                        let mut tmp_vec:Vec<String> = vec![];
-                        tmp_op.iter().for_each(|x| {
-                            let op_type = x.to_string();
-                            let string_len = op_type.len();
-                            tmp_vec.push(op_type[1..string_len-1].to_lowercase().to_string())
-                        });
-                        tmp_vec
-                    },
-                    other => {vec![]},
-                };
-                tmp_input.cube_orb_setting = match tmp_ctrl.get("cube_orb_setting").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Array(tmp_op) => {
-                        let mut tmp_array = [0.0;2];
-                        tmp_array.iter_mut().zip(tmp_op[0..2].iter()).for_each(|(to, from)| {
-                            match from {
-                                serde_json::Value::String(tmp_str) => {*to = tmp_str.parse().unwrap_or(0.0)},
-                                serde_json::Value::Number(tmp_num) => {*to = tmp_num.as_f64().unwrap_or(0.0)},
-                                other => {*to = 0.0},
-                            }
-                        });
-                        tmp_array
-                    },
-                    other => {[3.0,80.0]},
-                };
-                tmp_input.cube_orb_indices = match tmp_ctrl.get("cube_orb_indices").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Array(tmp_op) => {
-                        //let mut tmp_array = [0.0;2];
-                        let mut tmp_indices = vec![[0;3];tmp_op.len()];
-                        tmp_indices.iter_mut().zip(tmp_op.iter()).for_each(|(to, from)| {
-                            let tmp_to = match from {
-                                serde_json::Value::Array(tmp_opp) => {
-                                    let mut tmp_array = [0_usize;3];
-                                    tmp_array.iter_mut().zip(tmp_opp[0..3].iter()).for_each(|(to, from)| {
-                                        match from {
-                                            serde_json::Value::String(tmp_str) => {*to = tmp_str.parse().unwrap_or(0)},
-                                            serde_json::Value::Number(tmp_num) => {*to = tmp_num.as_u64().unwrap_or(0) as usize},
-                                            other => {*to = 0},
-                                        }
-                                    });
-                                    Some(tmp_array)
-                                },
-                                other => {None},
-                            };
-                            if let Some(tmp_array) = tmp_to {
-                                *to = tmp_array;
-                            };
-                        });
-                        tmp_indices 
-                    },
-                    other => {vec![]},
-                };
-                tmp_input.deep_pot = match tmp_ctrl.get("deep_potential").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                tmp_input.bench_eps = match tmp_ctrl.get("bench_eps").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-
-                // for atom_sad setting
-                tmp_input.atom_sad = match tmp_ctrl.get("atom_sad").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-
-                tmp_input.max_memory = match tmp_ctrl.get("max_memory").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Number(tmp_num) => Some(tmp_num.as_f64().unwrap()),
-                    other => None,
-                };
-                
-                // for guess_mix setting
-                tmp_input.guess_mix = match tmp_ctrl.get("guess_mix").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_bool) => *tmp_bool,
-                    serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
-                    _ => false,
-                };
-                
-                // for guess_mix_theta_deg: support number, string, or array; default to [15.0, 15.0]
-                tmp_input.guess_mix_theta_deg = match tmp_ctrl.get("guess_mix_theta_deg").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Number(n) => vec![n.as_f64().unwrap_or(15.0); 2],
-                    serde_json::Value::String(s) => {
-                        let val = s.parse::<f64>().unwrap_or(15.0);
-                        vec![val; 2]
-                    }
-                    serde_json::Value::Array(arr) => {
-                        let mut vals = arr.iter().filter_map(|v| v.as_f64()).collect::<Vec<f64>>();
-                        if vals.len() == 1 { vec![vals[0]; 2] }
-                        else { vals.truncate(2); vals }
-                    }
-                    _ => vec![15.0, 15.0],
-                };
-
-                tmp_input.spin_correction_scheme = match tmp_ctrl.get("spin_correction_scheme").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_emp) => {Some(tmp_emp.to_lowercase())},
-                    other => {None},
-                };
-
-                tmp_input.yamaguchi_triplet_type = match tmp_ctrl.get("yamaguchi_triplet_type").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_emp) => {Some(tmp_emp.to_lowercase())},
-                    other => {None},
-                };
-
-                // opt_engine: available options: "lbfgs", "geometric-pyo3"; default: "lbfgs"
-                tmp_input.opt_engine = match tmp_ctrl.get("opt_engine").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => { 
-                        let s = tmp_str.to_lowercase();
-                        match s.as_str() {
-                            "lbfgs" | "geometric-pyo3" => Some(s.to_string()),
-                            _ => panic!("Not recognized option for opt_engine: {}", s),
-                        }
-                    },
-                    serde_json::Value::Null => { None },
-                    _ => panic!("Not recognized type for opt_engine"),
-                };
-                tmp_input.gw_scheme = match tmp_ctrl.get("gw_scheme").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => String::from("no gw"),
-                };
-                tmp_input.homo_lumo_gw_qp=match tmp_ctrl.get("homo_lumo_gw_qp").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                tmp_input.x_alpha=match tmp_ctrl.get("x_alpha").unwrap_or(&serde_json::Value::Null){
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(2.0_f64)},
-                    other => {0.5},
-                };
-                tmp_input.save_qp = match tmp_ctrl.get("save_qp").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                tmp_input.bse_all = match tmp_ctrl.get("bse_all").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                tmp_input.bse_tda = match tmp_ctrl.get("bse_tda").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                tmp_input.bse_spin = match tmp_ctrl.get("bse_spin").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => String::from("none"),
-                };
-                tmp_input.bse_cutoff_energy = match tmp_ctrl.get("bse_cutoff_energy").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.5_f64)},
-                    other => {1000000.0},
-                };
-                tmp_input.save_bse_terms = match tmp_ctrl.get("save_bse_terms").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                tmp_input.obtain_vx_vc_terms = match tmp_ctrl.get("obtain_vx_vc_terms").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                tmp_input.obtain_pure_exchange = match tmp_ctrl.get("obtain_pure_exchange").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                tmp_input.obtain_ks_homos = match tmp_ctrl.get("obtain_ks_homos").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                tmp_input.gw_linearize_shift= match tmp_ctrl.get("gw_linearize_shift").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.01_f64)},
-                    other => {0.01},
-                };
-                tmp_input.gw_linearize_derivative_h= match tmp_ctrl.get("gw_linearize_derivative_h").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-10_f64)},
-                    other => {1e-10},
-                };
-                tmp_input.threshold= match tmp_ctrl.get("threshold").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.1)},
-                    other => {0.1},
-                };
-                tmp_input.renormalized_singles = match tmp_ctrl.get("renormalized_singles").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                tmp_input.w_rs = match tmp_ctrl.get("w_rs").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                tmp_input.scgw = match tmp_ctrl.get("scgw").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => String::from("g0w0"),
-                };
-                tmp_input.gw = match tmp_ctrl.get("gw").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-
-                tmp_input.evgw_rounds = match tmp_ctrl.get("evgw_rounds").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(4_usize)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(4) as usize},
-                    other => {0}
-                };
-                tmp_input.save_gw_homo_lumo_qp = match tmp_ctrl.get("save_gw_homo_lumo_qp").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                tmp_input.save_bse_excitations = match tmp_ctrl.get("save_bse_excitations").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                tmp_input.save_single_qp_path = match tmp_ctrl.get("save_single_qp_path").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => String::from("single_qp_save.txt"),
-                };
-                tmp_input.save_first_excitation = match tmp_ctrl.get("save_first_excitation").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                tmp_input.save_first_excitation_path = match tmp_ctrl.get("save_first_excitation_path").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => String::from("first_excitation_save.txt"),
-                };
-                tmp_input.parse_qp_path = match tmp_ctrl.get("parse_qp_path").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => String::from("./qp_energies"),
-                };
-                tmp_input.quasipartcle_methods = match tmp_ctrl.get("quasiparticle_methods").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => String::new(),
-                };
-                tmp_input.bse_qp_polarization = match tmp_ctrl.get("bse_qp_polarization").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                //===========================================================
-                // Global check of ctrl keywords and futher modification
-                //============================================================
-                if tmp_input.even_tempered_basis == true {
-                    if tmp_input.etb_beta<=1.0f64 {
-                        println!("WARNING: etb_beta cannot be below 1.0. REST will use etb_beta=2.0 instead in this calculation");
-                        tmp_input.etb_beta=2.0f64;
-                    }
-                    //if tmp_input.print_level>0 {
-                    //    println!("Even tempered basis generation starts at: {}", tmp_input.etb_start_atom_number);
-                    //    println!("Even tempered basis beta is: {}", tmp_input.etb_beta);
-                    //}
-                }
-                if tmp_input.external_init_guess  {
-                    if ! std::path::Path::new(&tmp_input.guessfile).exists() {
-                        println!("WARNING: Initial density matrix is required by the keyword of guessfile, which, however, does not exist: \n({}). \n The external initial guess will not be imported.\n",&tmp_input.guessfile);
-                        tmp_input.external_init_guess = false;
-                    } else {
-                        //if tmp_input.print_level>0 {
-                        //    println!("The initial guess will be imported from \n({}).\n ",&tmp_input.guessfile);
-                        //}
-                    }
-                }
-                if tmp_input.force_state_occupation.len()>0 {
-                    if ! tmp_input.restart {
-                        panic!("ERROR: force_state_occupation can not be involved without an existing chkfile \'restart\'");
-                    } else if ! std::path::Path::new(&tmp_input.chkfile).exists() {
-                        panic!("ERROR: force_state_occupation can not be involved without an existing chkfile \'restart\'");
-                    }
-                }
-            },
-            other => {
-                panic!("Error:: no 'ctrl' keyword or some inproper settings of the 'ctrl' keyword in the input file")
-            },
-        }
-        //==================================================================
-        //
-        //  parse the keywords from the "geom" block
-        //
-        //==================================================================
-        match tmp_keys.get("geom").unwrap_or(&serde_json::Value::Null) {
-            serde_json::Value::Object(tmp_geom) => {
-                tmp_geomcell.name = match tmp_geom.get("name").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.clone()},
-                    other => {String::from("none")},
-                };
-                //for rrs_pbc
-                tmp_geomcell.rrs_pbc = match tmp_geom.get("rrs_pbc").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                    other => {false},
-                };
-                tmp_geomcell.num_units = match tmp_geom.get("num_units").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
-                    other => {1_usize}
-                };
-                tmp_geomcell.pbc_dim = match tmp_geom.get("pbc_dim").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
-                    other => {1_usize}
-                };
-                tmp_geomcell.rrs_pbc_vec = match tmp_geom.get("rrs_pbc_vec").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Array(tmp_op) => {
-                        let tmp_vec: Vec<f64> = tmp_op.iter().map(|x| {
-                            match x {
-                                serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(0.0)},
-                                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.0)},
-                                other => {0.0},
-                            }
-                        }).collect::<Vec<f64>>();
-                        MatrixFull::from_vec([tmp_geomcell.pbc_dim,3],tmp_vec).unwrap()
-                    },
-                    other => {MatrixFull::empty()},
-                };
-                tmp_geomcell.k_points = match tmp_geom.get("k_points").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
-                    serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
-                    other => {1_usize}
-                };
-                tmp_geomcell.unit_cell_elem = match tmp_geom.get("unit_cell_elem").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_op) => {vec![tmp_op.to_string()]},
-                    serde_json::Value::Array(tmp_op) => {
-                        let mut tmp_vec: Vec<String> = vec![];
-                        tmp_op.iter().for_each(|x| {
-                            let op_type = x.to_string();
-                            let string_len = op_type.len();
-                            tmp_vec.push(op_type[1..string_len-1].to_string())
-                        });
-                        tmp_vec
-                    },
-                    other => {vec![]},
-                };
-                //rrs_pbc check
-                if tmp_geomcell.rrs_pbc {
-                    if tmp_geomcell.pbc_dim != 1_usize {
-                        panic!("I am sorry but 2D and 3D RRS-PBC methods are not yet implemented");
-                    };
-                    if tmp_geomcell.num_units % 2 == 0 {
-                        panic!("1D RRS-PBC method requires num_units to be odd");
-                    };
-                };
-                //rrs_pbc end
-                let tmp_unit = match tmp_geom.get("unit").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
-                    other => {String::from("angstrom")},
-                };
-                if tmp_unit.to_lowercase()==String::from("angstrom") {
-                    tmp_geomcell.unit=GeomUnit::Angstrom;
-                } else if tmp_unit.to_lowercase()==String::from("bohr") {
-                    tmp_geomcell.unit=GeomUnit::Bohr
-                } else {
-                    println!("Warning:: unknown geometry unit is specified: {}. Angstrom will be used", tmp_unit);
-                    tmp_geomcell.unit=GeomUnit::Angstrom;
-                };
-                //(tmp_geomcell.elem, tmp_geomcell.fix, tmp_geomcell.position, tmp_geomcell.nfree, )
-                match tmp_geom.get("position").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Array(tmp_vec) => {
-                        let tmp_unit = tmp_geomcell.unit.clone();
-                        
-                        let (tmp1,tmp2,tmp3,tmp4) = GeomCell::parse_position(tmp_vec, &tmp_unit)?;
-
-                        tmp_geomcell.elem = tmp1;
-                        tmp_geomcell.fix = tmp2;
-                        tmp_geomcell.position = tmp3;
-                        tmp_geomcell.nfree = tmp4;
-                        // real items in to real + ghost items
-                        tmp_geomcell.rg_elem = tmp_geomcell.elem.clone();
-                        tmp_geomcell.rg_position = tmp_geomcell.position.clone();
-                    },
-                    serde_json::Value::String(tmp_str) => {
-                        let tmp_unit = tmp_geomcell.unit.clone();
-                        
-                        let (tmp1,tmp2,tmp3,tmp4) = GeomCell::parse_position_from_string(tmp_str, &tmp_unit)?;
-
-                        tmp_geomcell.elem = tmp1;
-                        tmp_geomcell.fix = tmp2;
-                        tmp_geomcell.position = tmp3;
-                        tmp_geomcell.nfree = tmp4;
-                        // real items in to real + ghost items
-                        tmp_geomcell.rg_elem = tmp_geomcell.elem.clone();
-                        tmp_geomcell.rg_position = tmp_geomcell.position.clone();
-
-                    }
-                    other => {
-                        panic!("Error in reading the geometry position")
-                    }
-                };
-                match tmp_geom.get("lattice").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Array(tmp_vec) => {
-                        let tmp_unit = tmp_geomcell.unit.clone();
-                        tmp_geomcell.lattice = GeomCell::parse_lattice(tmp_vec, &tmp_unit)?;
-                        tmp_geomcell.pbc = MOrC::Crystal;
-                        panic!("Find lattice vectors. PBC calculations should be turn on, which, however, is not yet implemented");
-                    },
-                    other => {
-                        //if tmp_input.print_level>0 {
-                        //    println!("It is a cluster calculation for finite molecules");
-                        //}
-                        tmp_geomcell.pbc = MOrC::Molecule;
-                    }
-                }
-                match tmp_geom.get("ghost").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::String(tmp_str) => {
-                        let tmp_unit = tmp_geomcell.unit.clone();
-                        let (bs, pc, ep) = GeomCell::parse_ghost_atoms_from_string(tmp_str, &tmp_unit)?;
-                        if let Some((bs_elem, bs_pos)) = bs {
-                            tmp_geomcell.ghost_bs_elem = bs_elem;
-                            tmp_geomcell.ghost_bs_pos = bs_pos;
-                            //println!("{:?}", &tmp_geomcell.ghost_bs_pos);
-                            //println!("{:?}", &tmp_geomcell.rg_position);
-
-                            tmp_geomcell.rg_elem.extend_from_slice(&tmp_geomcell.ghost_bs_elem);
-                            tmp_geomcell.rg_position.append_column(&tmp_geomcell.ghost_bs_pos);
-
-                        } else {
-                            tmp_geomcell.ghost_bs_elem = vec![];
-                            tmp_geomcell.ghost_bs_pos = MatrixFull::empty();
-                        }
-                        if let Some((pc_chrg, pc_pos)) = pc {
-                            tmp_geomcell.ghost_pc_chrg = pc_chrg;
-                            tmp_geomcell.ghost_pc_pos = pc_pos;
-                        } else {
-                            tmp_geomcell.ghost_pc_chrg = vec![];
-                            tmp_geomcell.ghost_pc_pos = MatrixFull::empty();
-                        }
-                        if let Some((ep_path, ep_pos)) = ep {
-                            tmp_geomcell.ghost_ep_path = ep_path;
-                            tmp_geomcell.ghost_ep_pos = ep_pos;
-                        } else {
-                            tmp_geomcell.ghost_ep_path = vec![];
-                            tmp_geomcell.ghost_ep_pos = MatrixFull::empty();
-                        }
-                    },
-                    other => {
-                        //println!("debug: cannot recognize ghost");
-                        tmp_geomcell.ghost_bs_elem = vec![];
-                        tmp_geomcell.ghost_bs_pos = MatrixFull::empty();
-                        tmp_geomcell.ghost_pc_chrg = vec![];
-                        tmp_geomcell.ghost_pc_pos = MatrixFull::empty();
-                        tmp_geomcell.ghost_ep_path = vec![];
-                        tmp_geomcell.ghost_ep_pos = MatrixFull::empty();
-                    }
-                }
-
-                // ext_field_dipole: [x, y, z]
-                match tmp_geom.get("ext_field_dipole").unwrap_or(&serde_json::Value::Null) {
-                    serde_json::Value::Array(tmp_arr) => {
-                        assert_eq!(tmp_arr.len(), 3, "Dipole is 3-component (x, y, z) vector");
-                        let mut tmp_array = [0.0; 3];
-                        tmp_array.iter_mut().zip(tmp_arr.iter()).for_each(|(to, from)| {
-                            match from {
-                                serde_json::Value::String(tmp_str) => {*to = tmp_str.parse().unwrap_or(0.0)},
-                                serde_json::Value::Number(tmp_num) => {*to = tmp_num.as_f64().unwrap_or(0.0)},
-                                other => panic!("Not recognized type for ext_field_dipole"),
-                            }
-                        });
-                        tmp_geomcell.ext_field.dipole = Some(tmp_array);
-                    }
-                    _ => {},
-                };
-            },
-            other => {
-                panic!("Error:: no 'geom' keyword or some inproper settings of 'geom' keyword in the input file");
-            },
-        }
-        Ok((tmp_input,tmp_geomcell))
-        
-    }
-
-    pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
-        let tmp_cont = fs::read_to_string(&filename[..])?;
-        let tmp_keys = if let Ok(tmp_json) = serde_json::from_str::<serde_json::Value>(&tmp_cont[..]) {
-            // input file in the json format
-            tmp_json
-        } else {
-            // input file in the toml format
-            toml::from_str::<serde_json::Value>(&tmp_cont[..])?
-        };
-
-        InputKeywords::parse_ctl_from_json(&tmp_keys)
-    }
 }
 
 
@@ -1657,22 +453,55 @@ fn iter_inputkeywords()  {
 
 pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mut GeomCell) {
     println!("=========================================================");
-    println!("Input parameters for the REST calculation");
+    println!("      Input parameters for the REST calculation");
     println!("=========================================================");
-    //println!("Calculation type: {}", ctrl.calculation_type);
-    //println!("SCF procedure: {}", ctrl.scf_type);
-    //println!("Mixer: {}", ctrl.mixer);
-    //println!("Number of DIIS cycles: {}", ctrl.num_diis_cycles);
-    //println!("Number of DIIS cycles for the initial guess: {}", ctrl.num_diis_cycles_init_guess);
-    //println!("Number of DIIS cycles for the initial guess: {}", ctrl.num_diis_cycles_init_guess);
-    //println!("Number of DIIS cycles for the initial guess: {}", ctrl.num_diis_cycles_init_guess);
 
-    match ctrl.job_type {
+    match ctrl.job_type.clone() {
         JobType::SinglePoint => {println!("Calculation type: Single-point energy")},
         JobType::Force => {println!("Calculation type: Force calculation")},
         JobType::NumDipole => {println!("Calculation type: Numerical dipole calculation")},
-        JobType::GeomOpt => {println!("Calculation type: Geometry optimization")},
+        JobType::GeomOpt => {
+            println!("Calculation type: Geometry optimization");
+            // opt_engine: available options: "lbfgs", "geometric-pyo3"; default: "geometric-pyo3"
+            if let Some(opt_engine) = &mut ctrl.opt_engine {
+                if ctrl.print_level >= 1 {
+                    println!("Optimization engine: {}", opt_engine);
+                }
+            } else {
+                ctrl.opt_engine = Some("geometric_pyo3".to_string());
+                if ctrl.print_level >= 1 {
+                    println!("Optimization engine: Default (geometric_pyo3)");
+                }
+            }
+        },
     }
+
+    // To make sure the geometric_pyo3 structure is initialized properly
+    // The geometric_pyo3 block has higher priority than the corresponding settings in the ctrl block
+    if let JobType::GeomOpt = ctrl.job_type.clone() {
+        if let Some(opt_engine) = ctrl.opt_engine.clone() {
+            if opt_engine.eq("geometric_pyo3") {
+                println!("Geometric_pyo3 is used for geometry optimization");
+                if let Some(geometric_pyo3) = &ctrl.geometric_pyo3 {
+                    if geometric_pyo3.transition {
+                        println!("Transition state optimization is enabled");
+                    } else if geometric_pyo3.irc {
+                        println!("IRC optimization is enabled");
+                    } else {
+                        println!("Standard geometry optimization is enabled");
+                    }
+                } else {
+                    ctrl.geometric_pyo3 = Some(GeomeTRIC::default());
+                    println!("Standard geometry optimization is enabled");
+                }
+            } else if opt_engine.eq("lbfgs") {
+                println!("L-BFGS is used for geometry optimization");
+            } else {
+                panic!("Error:: Unknown optimization engine: {}", opt_engine);
+            }
+        }
+    };
+
     if ctrl.xc.eq("dl_dft") {
         ctrl.xc_type = DFTType::DeepLearning
     };
@@ -1732,7 +561,6 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
             MOrC::Molecule => println!("It is a finite cluster calculation"),
             MOrC::Crystal => println!("It is a periodic calculation")
         }
-        // if guessfile is specified, reading the external initial guess file is prior to reading the restart file
         if ctrl.restart && ! std::path::Path::new(&ctrl.chkfile).exists() {
             println!("The specified checkfile is missing, which will be created after the SCF procedure \n({})",&ctrl.chkfile)
         } else if ctrl.restart && ! ctrl.external_init_guess {
@@ -1740,7 +568,6 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         } else {
             println!("The specified checkfile exists but is not loaded because the keyword 'external_init_guess' is specified");
             println!("It will be updated after the SCF procedure \n({})",&ctrl.chkfile)
-            //println!("No existing checkfile for restart\n")
         };
 
 
@@ -1788,6 +615,1033 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
     }
     println!("=========================================================");
 
+}
+
+pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<InputKeywords> { 
+    let mut tmp_input = InputKeywords::init_ctrl();
+    //==================================================================
+    //
+    //  parse the keywords from the "ctrl" block
+    //
+    //==================================================================
+    match tmp_keys.get("ctrl").unwrap_or(&serde_json::Value::Null) {
+        serde_json::Value::Object(tmp_ctrl) => {
+            // =====================================
+            //  Keywords for machine info and debug 
+            // =====================================
+            tmp_input.print_level = match tmp_ctrl.get("print_level").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
+                other => {1_usize},
+            };
+            //let default_rayon_current_num_threads = rayon::current_num_threads();
+            tmp_input.num_threads = match tmp_ctrl.get("num_threads").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {Some(tmp_str.to_lowercase().parse().unwrap_or(1))},
+                serde_json::Value::Number(tmp_num) => {Some(tmp_num.as_i64().unwrap_or(1) as usize)},
+                other => {Some(1)},
+            };
+            tmp_input.batch_size = match tmp_ctrl.get("batch_size").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(64)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(64) as usize},
+                other => {64},
+            };
+            tmp_input.pt2_mpi_mode = match tmp_ctrl.get("pt2_mpi_mode").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(0)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(0) as usize},
+                other => {0},
+            };
+            if let Some(num_threads) = tmp_input.num_threads {
+                //if tmp_input.print_level>0 {println!("The number of threads used for parallelism:      {}", num_threads)};
+                // Now move the setting of rayon thread numbers to the main.rs
+                //rayon::ThreadPoolBuilder::new().num_threads(num_threads);
+                rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global().unwrap_or_else(|x| {println!("{:?}", &x)});
+                omp_set_num_threads_wrapper(num_threads);
+            } else {
+                omp_set_num_threads_wrapper(rayon::current_num_threads());
+                //if tmp_input.print_level>0 {println!("The default rayon num_threads value is used:      {}", rayon::current_num_threads())};
+            };
+            //println!("max_num_threads: {}, current_num_threads: {}", rayon::max_num_threads(), rayon::current_num_threads());
+            // ====================================
+            //  Keywords for the (aux) basis sets
+            // ====================================
+            tmp_input.basis_path = match tmp_ctrl.get("basis_path").unwrap_or(&serde_json::Value::Null) {
+               serde_json::Value::String(tmp_bas) => {
+                    if ! std::path::Path::new(tmp_bas).is_dir() {
+                        println!("The specified folder for the basis sets is missing: ({})", tmp_bas);
+                        println!("REST trys to fetch the basis sets from the basis-set exchange pool (https://www.basissetexchange.org/)");
+                    };
+                    tmp_bas.clone()
+               },
+               other => {
+                    if ! std::path::Path::new(&String::from("./")).is_dir() {
+                        panic!("The specified folder for the basis sets is missing. REST trys to find the basis set from the current folder: (./)");
+                    };
+                    String::from("./")
+               }
+            };
+            tmp_input.basis_type = match tmp_ctrl.get("basis_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
+                other => {String::from("spheric")}
+            };
+            //if tmp_input.print_level> 0 {println!("The {}-GTO basis set is taken from {}", tmp_input.basis_type,tmp_input.basis_path)};
+
+            tmp_input.pruning = match tmp_ctrl.get("pruning").unwrap_or(&serde_json::Value::Null){
+                serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
+                other => {String::from("nwchem")} //default prune method: sg1
+            };
+            //if tmp_input.print_level>0 {println!("The pruning method will be {}", tmp_input.pruning)};
+
+            tmp_input.rad_grid_method = match tmp_ctrl.get("radial_grid_method").unwrap_or(&serde_json::Value::Null){
+                serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
+                other => {String::from("treutler")} //default prune method: sg1
+            };
+            //if tmp_input.print_level>0 {println!("The radial grid generation method will be {}", tmp_input.rad_grid_method)};
+
+            tmp_input.eri_type = match tmp_ctrl.get("eri_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_eri) => {
+                    if tmp_eri.to_lowercase().eq("ri_v") || tmp_eri.to_lowercase().eq("ri-v")
+                    {
+                        String::from("ri_v")
+                    } else {tmp_eri.to_lowercase()}
+                },
+                other => {String::from("ri_v")},
+            };
+            let eri_type = tmp_input.eri_type.clone();
+            if eri_type.eq(&String::from("ri_v"))
+            {
+                tmp_input.use_auxbas = true;
+                tmp_input.use_isdf = false;
+                tmp_input.ri_k_only = false;
+            } else if eri_type.eq(&String::from("ri_k")) {
+                tmp_input.eri_type = String::from("ri_v");
+                tmp_input.use_auxbas = true;
+                tmp_input.use_isdf = false;
+                tmp_input.ri_k_only = true;
+            } else if eri_type.eq(&String::from("isdf_full")) {
+                // =========== for debug use by IGOR =================
+                tmp_input.eri_type = String::from("ri_v");
+                //====================================================
+                tmp_input.use_auxbas = true;
+                tmp_input.use_isdf = true;
+            }else if eri_type.eq(&String::from("isdf_k_new")){
+                    tmp_input.use_auxbas = true;
+                    tmp_input.use_isdf = true;
+                    tmp_input.isdf_k_only = true;
+                    tmp_input.eri_type = String::from("ri_v");
+                    tmp_input.isdf_new = true;
+            }else if  eri_type.eq(&String::from("isdf_k")){
+                    tmp_input.use_auxbas = true;
+                    tmp_input.use_isdf = true;
+                    tmp_input.isdf_k_only = true;
+                    tmp_input.eri_type = String::from("ri_v");
+                    tmp_input.isdf_new = false;
+                    //println!("Initial use_isdf: {}", tmp_input.use_isdf);
+            }else {
+                tmp_input.use_auxbas = false;
+                tmp_input.use_isdf = false;
+            };
+            //if tmp_input.print_level>0 {println!("ERI Type: {}", tmp_input.eri_type)};
+
+            tmp_input.use_ri_symm = match tmp_ctrl.get("use_ri_symm").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {true},
+            };
+            //if tmp_input.print_level>0 {
+            //    if tmp_input.use_ri_symm {
+            //        println!("Turn on the basis pair symmetry for RI 3D-tensors")
+            //    } else {
+            //        println!("Turn off the basis pair symmetry for RI 3D-tensors")
+            //    };
+            //}
+            tmp_input.isdf_k_mu = match tmp_ctrl.get("isdf_k_mu").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(8_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
+                other => {8_usize},
+            };            
+
+            tmp_input.auxbas_type = match tmp_ctrl.get("auxbas_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
+                other => {String::from("spheric")}
+            };
+            tmp_input.auxbas_path = match tmp_ctrl.get("auxbas_path").unwrap_or(&serde_json::Value::Null) {
+               serde_json::Value::String(tmp_bas) => {
+                    if ! std::path::Path::new(tmp_bas).is_dir() {
+                        println!("The specified folder for the auxiliar basis sets is missing: ({})", tmp_bas);
+                        //tmp_input.use_auxbas = false;
+                    }
+                    //tmp_input.use_auxbas = true;
+                    tmp_bas.clone()
+               },
+               other => {
+                    //if ! std::path::Path::new(&String::from("./")).is_dir() {
+                    //    println!("The specified folder for the auxiliar basis sets is missing: (./)");
+                    //};
+                    println!("No auxiliary basis set is specified. REST will try to find the auxiliary basis fromt the current folder: (./)");
+                    let default_bas = String::from("./");
+                    if ! std::path::Path::new(&default_bas).is_dir() {
+                        //tmp_input.use_auxbas = false;
+                    } else {
+                        //tmp_input.use_auxbas = true;
+                    }
+                    default_bas
+               }
+            };
+            //if tmp_input.use_auxbas && tmp_input.print_level>0 {
+            //    println!("The {}-GTO auxiliary basis set is taken from {}", tmp_input.auxbas_type,tmp_input.auxbas_path)
+            //};
+            // ===============================================
+            //  Keywords for Gradient calculation
+            // ==============================================
+            tmp_input.auxbasis_response = match tmp_ctrl.get("auxbasis_response").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => *tmp_str,
+                other => true,
+            };
+            tmp_input.numerical_force = match tmp_ctrl.get("numerical_force").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => *tmp_str,
+                other => false,
+            };
+            // ==============================================
+            //  JobType
+            // ==============================================
+            tmp_input.job_type = match tmp_ctrl.get("job_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_xc) => {
+                    let tmp_xc_low = tmp_xc.to_lowercase();
+                    if tmp_xc_low.eq("opt") || tmp_xc_low.eq("geometry optimization") || 
+                       tmp_xc_low.eq("geometry relaxation") || tmp_xc_low.eq("geom_opt") ||
+                       tmp_xc_low.eq("geom_relax") || tmp_xc_low.eq("relax") {
+                        JobType::GeomOpt
+                    } else if tmp_xc_low.eq("force") || tmp_xc_low.eq("gradient") {
+                        JobType::Force
+                    } else if tmp_xc_low.eq("numdipole") || tmp_xc_low.eq("numerical dipole") {
+                        JobType::NumDipole
+                    } else if tmp_xc_low.eq("energy") || tmp_xc_low.eq("single point") ||
+                      tmp_xc_low.eq("single_point") {
+                        JobType::SinglePoint 
+                    } else {
+                        JobType::SinglePoint
+                    }
+                },
+                other => {JobType::SinglePoint},
+            };
+            tmp_input.nforce_displacement = match tmp_ctrl.get("nforce_displacement").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_nforce) => {tmp_nforce.to_lowercase().parse().unwrap_or(0.0013)},
+                serde_json::Value::Number(tmp_nforce) => {tmp_nforce.as_f64().unwrap_or(0.0013)},
+                other => {0.0013},
+            };
+            tmp_input.ndipole_displacement = match tmp_ctrl.get("nforce_displacement").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_nforce) => {tmp_nforce.to_lowercase().parse().unwrap_or(3e-4)},
+                serde_json::Value::Number(tmp_nforce) => {tmp_nforce.as_f64().unwrap_or(3e-4)},
+                serde_json::Value::Null => {3e-4},
+                other => panic!("The ndipole_displacement is not recognized"),
+            };
+            // ==============================================
+            //  Keywords associated with the method employed
+            // ==============================================
+            tmp_input.xc = match tmp_ctrl.get("xc").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_xc) => {tmp_xc.to_lowercase()},
+                other => {String::from("hf")},
+            };
+            tmp_input.xc_type = match tmp_ctrl.get("xc_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_xc) => {
+                    if tmp_xc.to_lowercase().eq("nonstandard") || tmp_xc.to_lowercase().eq("non-standard") {
+                        DFTType::NonStandard
+                    } else if tmp_xc.to_lowercase().eq("deep-learning")  
+                           || tmp_xc.to_lowercase().eq("deep_learning") 
+                           || tmp_xc.to_lowercase().eq("deep learning") 
+                           || tmp_xc.to_lowercase().eq("machine learning") 
+                           || tmp_xc.to_lowercase().eq("machine-learning") 
+                           || tmp_xc.to_lowercase().eq("machine_learning") 
+                    {
+                        DFTType::DeepLearning
+                    } else if tmp_xc.to_lowercase().eq("standard")  {
+                        DFTType::Standard
+                    } else {
+                        println!("Unknown xc_type: ({}). xc_type is set to `standard`", tmp_xc);
+                        DFTType::Standard
+                    }
+                },
+                other => {
+                    DFTType::Standard
+                },
+            };
+            tmp_input.xc_namelist = match tmp_ctrl.get("xc_namelist").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_op) => {Some(vec![tmp_op.to_lowercase()])},
+                serde_json::Value::Array(tmp_op) => {
+                    let mut tmp_vec:Vec<String> = vec![];
+                    tmp_op.iter().for_each(|x| {
+                        let op_type = x.to_string();
+                        let string_len = op_type.len();
+                        tmp_vec.push(op_type[1..string_len-1].to_lowercase().to_string())
+                    });
+                    Some(tmp_vec)
+                },
+                other => {None},
+            };
+            tmp_input.xc_paralist = match tmp_ctrl.get("xc_paralist").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(tmp_op) => {
+                    let tmp_vec:Vec<f64> = tmp_op.iter().map(|x| {
+                        match x {
+                            serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(0.0)},
+                            serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.0)},
+                            other => {0.0},
+                        }
+                    }).collect::<Vec<f64>>();
+                    Some(tmp_vec)
+                },
+                other => {None},
+            };
+            tmp_input.dfa_hybrid_scf = match tmp_ctrl.get("xc_hybrid_para").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {Some(tmp_str.parse().unwrap_or(0.0))},
+                serde_json::Value::Number(tmp_num) => {Some(tmp_num.as_f64().unwrap_or(0.0))},
+                other => {None}
+            };
+            tmp_input.xc_model = match tmp_ctrl.get("xc_model").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_xc) => {
+                    tmp_input.xc_type=DFTType::DeepLearning; 
+                    Some(tmp_xc.to_lowercase())
+                },
+                other => {None},
+            };
+
+            tmp_input.empirical_dispersion = match tmp_ctrl.get("empirical_dispersion").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_emp) => {
+                    if tmp_emp.to_lowercase() == "none" {
+                       None 
+                    } else if tmp_emp.to_lowercase() == "true" {
+                        Some("d3bj".to_string())
+                    } else {
+                       Some(tmp_emp.to_lowercase())
+                    }
+                },
+                other => {None},
+            };
+            //let re0 = Regex::new(r"
+            //                    (?P<elem>\w{1,2})\s*,?    # the element
+            //                    \s+
+            //                    (?P<x>[\+-]?\d+.\d+)\s*,? # the 'x' position
+            //                    \s+
+            //                    (?P<y>[\+-]?\d+.\d+)\s*,? # the 'y' position
+            //                    \s+
+            //                    (?P<z>[\+-]?\d+.\d+)\s*,? # the 'z' position
+            //                    \s*").unwrap();
+            tmp_input.post_xc = match tmp_ctrl.get("post_xc").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_xc) => {vec![tmp_xc.to_lowercase()]},
+                serde_json::Value::Array(tmp_xc) => {
+                    let mut tmp_vec:Vec<String> = vec![];
+                    tmp_xc.iter().for_each(|x| {
+                        let xc_method = x.to_string();
+                        let string_len = xc_method.len();
+                        tmp_vec.push(xc_method[1..string_len-1].to_string())
+                    });
+                    tmp_vec
+                },
+                other => {vec![]},
+            };
+            let post_corr = match tmp_ctrl.get("post_correlation").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_xc) => {vec![tmp_xc.to_lowercase()]},
+                serde_json::Value::Array(tmp_xc) => {
+                    let mut tmp_vec:Vec<String> = vec![];
+                    tmp_xc.iter().for_each(|x| {
+                        let xc_method = x.to_string();
+                        let string_len = xc_method.len();
+                        tmp_vec.push(xc_method[1..string_len-1].to_string())
+                    });
+                    tmp_vec
+                },
+                other => {vec![]},
+            };
+            tmp_input.post_correlation = vec![];
+            post_corr.iter().for_each(|corr| {
+                if corr.to_lowercase().eq("pt2") {
+                    tmp_input.post_correlation.push(DFAFamily::PT2)
+                } else if corr.to_lowercase().eq("sbge2") {
+                    tmp_input.post_correlation.push(DFAFamily::SBGE2)
+                } else if corr.to_lowercase().eq("rpa") {
+                    tmp_input.post_correlation.push(DFAFamily::RPA)
+                } else if corr.to_lowercase().eq("scsrpa") {
+                    tmp_input.post_correlation.push(DFAFamily::SCSRPA)
+                } else {
+                    println!("WARNNING: Unknown post-scf correlation method: {}", corr)
+                }
+                //if corr.to_lowercase().eq(&pt2) 
+            });
+            tmp_input.post_ai_correction = match tmp_ctrl.get("post_ai_correction").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_xc) => {tmp_xc.to_lowercase()},
+                other => {String::from("none")},
+            };
+            // ===============================================
+            //  Keywords to determine the spin channel, which 
+            //   is important to turn on RHF(RKS) or UHF(UKS)
+            // ==============================================
+            tmp_input.charge = match tmp_ctrl.get("charge").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_charge) => {tmp_charge.to_lowercase().parse().unwrap_or(0.0)},
+                serde_json::Value::Number(tmp_charge) => {tmp_charge.as_f64().unwrap_or(0.0)},
+                other => {0.0},
+            };
+            tmp_input.spin = match tmp_ctrl.get("spin").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_spin) => {tmp_spin.to_lowercase().parse().unwrap_or(0.0)},
+                serde_json::Value::Number(tmp_spin) => {tmp_spin.as_f64().unwrap_or(0.0)},
+                other => {0.0},
+            };
+            tmp_input.use_int_nelec = match tmp_ctrl.get("use_int_nelec").unwrap_or(&serde_json::Value::Null) {
+                // serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(true)},
+                serde_json::Value::Bool(tmp_bool) => tmp_bool.clone(),
+                other => {true},
+            };
+            tmp_input.spin_polarization = match tmp_ctrl.get("spin_polarization").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
+                other => false,
+            };
+            tmp_input.spin_channel = if tmp_input.spin_polarization {
+                //if tmp_input.print_level>0 {println!("Spin polarization: On")};
+                2_usize
+            } else {
+                //if tmp_input.print_level>0 {println!("Spin polarization: Off")};
+                1_usize
+            };
+            // ==============================================
+            //  Keywords of setting the frozen-core algorithm
+            // ==============================================
+            tmp_input.frozen_core_postscf = match tmp_ctrl.get("frozen_core_postscf").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_fc) => {tmp_fc.to_lowercase().parse().unwrap_or(0)},
+                serde_json::Value::Number(tmp_fc) => {tmp_fc.as_i64().unwrap_or(0) as i32},
+                other => {0},
+            };
+            // ==============================================
+            //  Keywords of setting the frequency tabulation
+            // ==============================================
+            tmp_input.frequency_points = match tmp_ctrl.get("frequency_points").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_fp) => {tmp_fp.to_lowercase().parse().unwrap_or(20_usize)},
+                serde_json::Value::Number(tmp_fp) => {tmp_fp.as_i64().unwrap_or(20) as usize},
+                other => {20_usize},
+            };
+            tmp_input.freq_grid_type = match tmp_ctrl.get("freq_grid_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_fg) => {tmp_fg.to_lowercase().parse().unwrap_or(0)},
+                serde_json::Value::Number(tmp_fg) => {tmp_fg.as_i64().unwrap_or(0) as usize},
+                other => {0},
+            };
+            tmp_input.freq_cut_off = match tmp_ctrl.get("freq_cut_off").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_fg) => {tmp_fg.to_lowercase().parse().unwrap_or(10.0)},
+                serde_json::Value::Number(tmp_fg) => {tmp_fg.as_f64().unwrap_or(10.0)},
+                other => {10.0},
+            };
+            tmp_input.lambda_points = match tmp_ctrl.get("lambda_points").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_fp) => {tmp_fp.to_lowercase().parse().unwrap_or(20_usize)},
+                serde_json::Value::Number(tmp_fp) => {tmp_fp.as_i64().unwrap_or(20) as usize},
+                other => {20_usize},
+            };
+            //===============================================
+            // Keywords for fciqmc dump
+            //===============================================
+            tmp_input.fciqmc_dump = match tmp_ctrl.get("fciqmc_dump").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {tmp_bool.clone()},
+                other => {false},
+            };
 
 
+            // ==============================================
+            //  Keywords associated with DFT grids
+            // ==============================================
+            tmp_input.radial_precision = match tmp_ctrl.get("radial_precision").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-12)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-12)},
+                other => {1.0e-12}
+            };
+            tmp_input.min_num_angular_points = match tmp_ctrl.get("min_num_angular_points").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(110_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(110) as usize},
+                other => {110_usize}
+            };
+            tmp_input.max_num_angular_points = match tmp_ctrl.get("max_num_angular_points").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(590_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(590) as usize},
+                other => {590_usize}
+            };
+            tmp_input.hardness = match tmp_ctrl.get("hardness").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(3_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(3) as usize},
+                other => {3_usize}
+            };
+
+            tmp_input.external_grids = match tmp_ctrl.get("external_grids").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_type) => {
+                    if tmp_input.print_level>0 {println!("Read grids from the external file: {}", tmp_type)};
+                    tmp_type.to_string()},
+                other => {String::from("grids")}
+            };
+
+            tmp_input.grid_gen_level = match tmp_ctrl.get("grid_generation_level").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(3_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(3) as usize},
+                other => {3_usize},
+            };
+
+            tmp_input.even_tempered_basis = match tmp_ctrl.get("even_tempered_basis").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+
+            tmp_input.etb_start_atom_number = match tmp_ctrl.get("etb_start_atom_number").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(37_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(37) as usize},
+                other => {37_usize},
+            };
+
+            tmp_input.etb_beta = match tmp_ctrl.get("etb_beta").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(2.0_f64)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(2.0_f64)},
+                other => {2.0_f64},
+            };
+
+            // ==============================================
+            //  Keywords associated with the SCF procedure
+            // ==============================================
+            tmp_input.max_scf_cycle = match tmp_ctrl.get("max_scf_cycle").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(100_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(100) as usize},
+                other => {100_usize}
+            };
+            tmp_input.level_shift = match tmp_ctrl.get("level_shift").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {
+                    let num = tmp_str.to_lowercase().parse().unwrap_or(0.0);
+                    if num == 0.0 {
+                        None
+                    } else {
+                        Some(num)
+                    }
+                },
+                serde_json::Value::Number(tmp_num) => {
+                    let num = tmp_num.as_f64().unwrap_or(0.0);
+                    if num == 0.0 {
+                        None
+                    } else {
+                        Some(num)
+                    }
+                },
+                other => {None}
+            };
+            tmp_input.scf_acc_rho = match tmp_ctrl.get("scf_acc_rho").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-6)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-8)},
+                other => {1.0e-8}
+            };
+            tmp_input.scf_acc_eev = match tmp_ctrl.get("scf_acc_eev").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-6)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-6)},
+                other => {1.0e-6}
+            };
+            tmp_input.scf_acc_etot = match tmp_ctrl.get("scf_acc_etot").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-8)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-8)},
+                other => {1.0e-8}
+            };
+
+            tmp_input.mixer = match tmp_ctrl.get("mixer").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
+                other => {String::from("diis")},
+            };
+            tmp_input.mix_param = match tmp_ctrl.get("mix_param").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(0.2)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.2)},
+                other => {0.2}
+            };
+            tmp_input.num_max_diis = match tmp_ctrl.get("num_max_diis").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(8_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
+                other => {8_usize}
+            };
+            tmp_input.start_diis_cycle = match tmp_ctrl.get("start_diis_cycle").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
+                other => {1_usize}
+            };
+            tmp_input.start_check_oscillation = match tmp_ctrl.get("start_check_oscillation").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(20_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(20) as usize},
+                other => {20_usize}
+            };
+
+            // Initial guess relevant keywords
+            tmp_input.guessfile = match tmp_ctrl.get("guessfile").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_guess) => tmp_guess.clone(),
+                other => String::from("none"),
+            };
+            tmp_input.guessfile_type = match tmp_ctrl.get("guessfile_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_guess) => tmp_guess.to_lowercase().clone(),
+                other => String::from("none"),
+            };
+
+            // Fix a bug reported by Linyue Yu, 2024-09-03
+            tmp_input.external_init_guess = (! tmp_input.guessfile.to_lowercase().eq(&"none") ) &&
+                        std::path::Path::new(&tmp_input.guessfile).exists();
+
+            tmp_input.chkfile = match tmp_ctrl.get("chkfile").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_chk) => tmp_chk.clone(),
+                other => String::from("none"),
+            };
+            tmp_input.chkfile_type = match tmp_ctrl.get("chkfile_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_chk) => tmp_chk.to_lowercase().clone(),
+                other => String::from("hdf5"),
+            };
+
+            tmp_input.restart = ! tmp_input.chkfile.to_lowercase().eq(&"none");
+
+            tmp_input.initial_guess = match tmp_ctrl.get("initial_guess").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
+                other => {String::from("sad")},
+            };
+
+            tmp_input.noiter = match tmp_ctrl.get("noiter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
+                other => false,
+            };
+            tmp_input.check_stab = match tmp_ctrl.get("check_stab").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
+                other => false,
+            };
+            tmp_input.use_dm_only = match tmp_ctrl.get("use_dm_only").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
+                other => false,
+            };
+            tmp_input.use_ri_vj = match tmp_ctrl.get("use_ri_vj").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(true),
+                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
+                other => true,
+            };
+            // ================================================
+            //  Keywords associated with the elec occupation 
+            // ================================================
+            tmp_input.occupation_type = 
+            match tmp_ctrl.get("occupation_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_type) => {
+                    let tmp_occupation_type = tmp_type.to_lowercase();
+                    if tmp_occupation_type.eq("integer") {
+                        OCCType::INTEGER
+                    } else if tmp_occupation_type.eq("sad") {
+                        OCCType::ATMSAD
+                    } else if tmp_occupation_type.eq("frac") {
+                        OCCType::FRAC
+                    } else {
+                        OCCType::INTEGER
+                    }
+                },
+                other => OCCType::INTEGER,
+            };
+            tmp_input.frac_tolerant = match tmp_ctrl.get("frac_tolerant").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-3)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-3)},
+                other => {1.0e-3}
+            };
+            tmp_input.force_state_occupation = match tmp_ctrl.get("force_state_occupation").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(_) => vec![],
+                serde_json::Value::Array(tmp_op) => {
+                    let mut tmp_vec: Vec<ForceStateOccupation> = vec![];
+                    tmp_op.iter().for_each(|x| {
+                        let tmp_obj = match x {
+                            serde_json::Value::Array(tmp_value) => {
+                                match tmp_value.len() {
+                                    5 => {
+                                        // [ref_state, ref_spin, force_occ, min, max]
+                                        let ref_state = tmp_value[0].as_u64().unwrap_or(0) as usize;
+                                        let ref_spin = tmp_value[1].as_u64().unwrap_or(0) as usize;
+                                        let target_spin = ref_spin;
+                                        let force_occ = tmp_value[2].as_f64().unwrap_or(0.0);
+                                        let check_min = tmp_value[3].as_u64().unwrap_or(0) as usize;
+                                        let check_max = tmp_value[4].as_u64().unwrap_or(0) as usize;
+                                        Some(ForceStateOccupation::init(
+                                            tmp_input.chkfile.clone(),
+                                            ref_state,
+                                            ref_spin,
+                                            target_spin,
+                                            force_occ,
+                                            check_min,
+                                            check_max,
+                                        ))
+                                    }
+                                    6 => {
+                                        match &tmp_value[0] {
+                                            serde_json::Value::String(ref reference) => {
+                                                // ["ref.hdf5", ref_state, ref_spin, force_occ, min, max]
+                                                let ref_state = tmp_value[1].as_u64().unwrap_or(0) as usize;
+                                                let ref_spin = tmp_value[2].as_u64().unwrap_or(0) as usize;
+                                                let target_spin = ref_spin;
+                                                let force_occ = tmp_value[3].as_f64().unwrap_or(0.0);
+                                                let check_min = tmp_value[4].as_u64().unwrap_or(0) as usize;
+                                                let check_max = tmp_value[5].as_u64().unwrap_or(0) as usize;
+                                                Some(ForceStateOccupation::init(
+                                                    reference.to_string(),
+                                                    ref_state,
+                                                    ref_spin,
+                                                    target_spin,
+                                                    force_occ,
+                                                    check_min,
+                                                    check_max,
+                                                ))
+                                            }
+                                            _ => {
+                                                // [ref_state, ref_spin, target_spin, force_occ, min, max]
+                                                let ref_state = tmp_value[0].as_u64().unwrap_or(0) as usize;
+                                                let ref_spin = tmp_value[1].as_u64().unwrap_or(0) as usize;
+                                                let target_spin = tmp_value[2].as_u64().unwrap_or(0) as usize;
+                                                let force_occ = tmp_value[3].as_f64().unwrap_or(0.0);
+                                                let check_min = tmp_value[4].as_u64().unwrap_or(0) as usize;
+                                                let check_max = tmp_value[5].as_u64().unwrap_or(0) as usize;
+                                                Some(ForceStateOccupation::init(
+                                                    tmp_input.chkfile.clone(),
+                                                    ref_state,
+                                                    ref_spin,
+                                                    target_spin,
+                                                    force_occ,
+                                                    check_min,
+                                                    check_max,
+                                                ))
+                                            }
+                                        }
+                                    }
+                                    7 => {
+                                        // ["ref.hdf5", ref_state, ref_spin, target_spin, force_occ, min, max]
+                                        let reference = tmp_value[0].as_str().unwrap_or("none").to_string();
+                                        let ref_state = tmp_value[1].as_u64().unwrap_or(0) as usize;
+                                        let ref_spin = tmp_value[2].as_u64().unwrap_or(0) as usize;
+                                        let target_spin = tmp_value[3].as_u64().unwrap_or(0) as usize;
+                                        let force_occ = tmp_value[4].as_f64().unwrap_or(0.0);
+                                        let check_min = tmp_value[5].as_u64().unwrap_or(0) as usize;
+                                        let check_max = tmp_value[6].as_u64().unwrap_or(0) as usize;
+                                        Some(ForceStateOccupation::init(
+                                            reference,
+                                            ref_state,
+                                            ref_spin,
+                                            target_spin,
+                                            force_occ,
+                                            check_min,
+                                            check_max,
+                                        ))
+                                    }
+                                    _ => {
+                                        panic!("ERROR:: incorrect force_state_occupation setting: {:?}", &tmp_value);
+                                    }
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(tmp_obj) = tmp_obj {
+                            tmp_vec.push(tmp_obj);
+                        }
+                    });
+                    tmp_vec
+                }
+                _ => vec![],
+            };
+
+            //
+            tmp_input.auxiliary_reference_states = match tmp_ctrl.get("auxiliary_reference_states").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_chk) => vec![(String::from("none"),0)],
+                serde_json::Value::Array(tmp_op) => {
+                    let mut tmp_files = vec![];
+                    tmp_op.iter().for_each(|x| {
+                        match x {
+                            serde_json::Value::String(tmp_str) => {tmp_files.push((tmp_str.clone(),0))},
+                            serde_json::Value::Array(tmp_value) => {
+                                let aux_file_name = tmp_value[0].as_str().unwrap().to_string();
+                                let global_start = tmp_value[1].as_u64().unwrap() as usize;
+                                tmp_files.push((aux_file_name,global_start));
+                            },
+                            _ => {}
+                        }
+                    });
+                    tmp_files
+                },
+                other => Vec::new(),
+            };
+            tmp_input.rpa_de_excitation_parameters = match tmp_ctrl.get("rpa_de_excitation_parameters").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(tmp_op) => {
+                    if tmp_op.len() == 4 {
+                        let mut tmp_array = [0.0;4];
+                        tmp_array.iter_mut().zip(tmp_op.iter()).for_each(|(to, from)| {
+                            *to = from.as_f64().unwrap()
+                        });
+                        Some(tmp_array)
+                    } else {
+                        None
+                    }
+                },
+                other => None,
+            };
+            // ================================================
+            //  Keywords associated with the post-SCF analyais
+            // ================================================
+            tmp_input.outputs = match tmp_ctrl.get("outputs").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_op) => {vec![tmp_op.to_lowercase()]},
+                serde_json::Value::Array(tmp_op) => {
+                    let mut tmp_vec:Vec<String> = vec![];
+                    tmp_op.iter().for_each(|x| {
+                        let op_type = x.to_string();
+                        let string_len = op_type.len();
+                        tmp_vec.push(op_type[1..string_len-1].to_lowercase().to_string())
+                    });
+                    tmp_vec
+                },
+                other => {vec![]},
+            };
+            tmp_input.cube_orb_setting = match tmp_ctrl.get("cube_orb_setting").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(tmp_op) => {
+                    let mut tmp_array = [0.0;2];
+                    tmp_array.iter_mut().zip(tmp_op[0..2].iter()).for_each(|(to, from)| {
+                        match from {
+                            serde_json::Value::String(tmp_str) => {*to = tmp_str.parse().unwrap_or(0.0)},
+                            serde_json::Value::Number(tmp_num) => {*to = tmp_num.as_f64().unwrap_or(0.0)},
+                            other => {*to = 0.0},
+                        }
+                    });
+                    tmp_array
+                },
+                other => {[3.0,80.0]},
+            };
+            tmp_input.cube_orb_indices = match tmp_ctrl.get("cube_orb_indices").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(tmp_op) => {
+                    //let mut tmp_array = [0.0;2];
+                    let mut tmp_indices = vec![[0;3];tmp_op.len()];
+                    tmp_indices.iter_mut().zip(tmp_op.iter()).for_each(|(to, from)| {
+                        let tmp_to = match from {
+                            serde_json::Value::Array(tmp_opp) => {
+                                let mut tmp_array = [0_usize;3];
+                                tmp_array.iter_mut().zip(tmp_opp[0..3].iter()).for_each(|(to, from)| {
+                                    match from {
+                                        serde_json::Value::String(tmp_str) => {*to = tmp_str.parse().unwrap_or(0)},
+                                        serde_json::Value::Number(tmp_num) => {*to = tmp_num.as_u64().unwrap_or(0) as usize},
+                                        other => {*to = 0},
+                                    }
+                                });
+                                Some(tmp_array)
+                            },
+                            other => {None},
+                        };
+                        if let Some(tmp_array) = tmp_to {
+                            *to = tmp_array;
+                        };
+                    });
+                    tmp_indices 
+                },
+                other => {vec![]},
+            };
+            tmp_input.deep_pot = match tmp_ctrl.get("deep_potential").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.bench_eps = match tmp_ctrl.get("bench_eps").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+
+            // for atom_sad setting
+            tmp_input.atom_sad = match tmp_ctrl.get("atom_sad").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+
+            tmp_input.max_memory = match tmp_ctrl.get("max_memory").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => Some(tmp_num.as_f64().unwrap()),
+                other => None,
+            };
+            
+            // for guess_mix setting
+            tmp_input.guess_mix = match tmp_ctrl.get("guess_mix").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => *tmp_bool,
+                serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                _ => false,
+            };
+            
+            // for guess_mix_theta_deg: support number, string, or array; default to [15.0, 15.0]
+            tmp_input.guess_mix_theta_deg = match tmp_ctrl.get("guess_mix_theta_deg").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => vec![n.as_f64().unwrap_or(15.0); 2],
+                serde_json::Value::String(s) => {
+                    let val = s.parse::<f64>().unwrap_or(15.0);
+                    vec![val; 2]
+                }
+                serde_json::Value::Array(arr) => {
+                    let mut vals = arr.iter().filter_map(|v| v.as_f64()).collect::<Vec<f64>>();
+                    if vals.len() == 1 { vec![vals[0]; 2] }
+                    else { vals.truncate(2); vals }
+                }
+                _ => vec![15.0, 15.0],
+            };
+
+            tmp_input.spin_correction_scheme = match tmp_ctrl.get("spin_correction_scheme").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_emp) => {Some(tmp_emp.to_lowercase())},
+                other => {None},
+            };
+
+            tmp_input.yamaguchi_triplet_type = match tmp_ctrl.get("yamaguchi_triplet_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_emp) => {Some(tmp_emp.to_lowercase())},
+                other => {None},
+            };
+
+            // opt_engine: available options: "lbfgs", "geometric-pyo3"; default: "geometric-pyo3"
+            tmp_input.opt_engine = match tmp_ctrl.get("opt_engine").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => { 
+                    let s = tmp_str.to_lowercase();
+                    match s.to_lowercase().as_str() {
+                        "lbfgs"  => Some(s.to_string()),
+                        "geometric_pyo3" | "geometric-pyo3" => Some("geometric_pyo3".to_string()),
+                        _ => panic!("Not recognized option for opt_engine: {}", s),
+                    }
+                },
+                serde_json::Value::Null => { None },
+                _ => panic!("Not recognized type for opt_engine"),
+            };
+            tmp_input.gw_scheme = match tmp_ctrl.get("gw_scheme").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("no gw"),
+            };
+            tmp_input.homo_lumo_gw_qp=match tmp_ctrl.get("homo_lumo_gw_qp").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.x_alpha=match tmp_ctrl.get("x_alpha").unwrap_or(&serde_json::Value::Null){
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(2.0_f64)},
+                other => {0.5},
+            };
+            tmp_input.save_qp = match tmp_ctrl.get("save_qp").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.bse_all = match tmp_ctrl.get("bse_all").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.bse_tda = match tmp_ctrl.get("bse_tda").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.bse_spin = match tmp_ctrl.get("bse_spin").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("none"),
+            };
+            tmp_input.bse_cutoff_energy = match tmp_ctrl.get("bse_cutoff_energy").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.5_f64)},
+                other => {1000000.0},
+            };
+            tmp_input.save_bse_terms = match tmp_ctrl.get("save_bse_terms").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.obtain_vx_vc_terms = match tmp_ctrl.get("obtain_vx_vc_terms").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.obtain_pure_exchange = match tmp_ctrl.get("obtain_pure_exchange").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.obtain_ks_homos = match tmp_ctrl.get("obtain_ks_homos").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.gw_linearize_shift= match tmp_ctrl.get("gw_linearize_shift").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.01_f64)},
+                other => {0.01},
+            };
+            tmp_input.gw_linearize_derivative_h= match tmp_ctrl.get("gw_linearize_derivative_h").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-10_f64)},
+                other => {1e-10},
+            };
+            tmp_input.threshold= match tmp_ctrl.get("threshold").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.1)},
+                other => {0.1},
+            };
+            tmp_input.renormalized_singles = match tmp_ctrl.get("renormalized_singles").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.w_rs = match tmp_ctrl.get("w_rs").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.scgw = match tmp_ctrl.get("scgw").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("g0w0"),
+            };
+            tmp_input.gw = match tmp_ctrl.get("gw").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+
+            tmp_input.evgw_rounds = match tmp_ctrl.get("evgw_rounds").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(4_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(4) as usize},
+                other => {0}
+            };
+            tmp_input.save_gw_homo_lumo_qp = match tmp_ctrl.get("save_gw_homo_lumo_qp").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.save_bse_excitations = match tmp_ctrl.get("save_bse_excitations").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.save_single_qp_path = match tmp_ctrl.get("save_single_qp_path").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("single_qp_save.txt"),
+            };
+            tmp_input.save_first_excitation = match tmp_ctrl.get("save_first_excitation").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.save_first_excitation_path = match tmp_ctrl.get("save_first_excitation_path").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("first_excitation_save.txt"),
+            };
+            tmp_input.parse_qp_path = match tmp_ctrl.get("parse_qp_path").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("./qp_energies"),
+            };
+            tmp_input.quasipartcle_methods = match tmp_ctrl.get("quasiparticle_methods").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            tmp_input.bse_qp_polarization = match tmp_ctrl.get("bse_qp_polarization").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            //===========================================================
+            // Global check of ctrl keywords and futher modification
+            //============================================================
+            if tmp_input.even_tempered_basis == true {
+                if tmp_input.etb_beta<=1.0f64 {
+                    println!("WARNING: etb_beta cannot be below 1.0. REST will use etb_beta=2.0 instead in this calculation");
+                    tmp_input.etb_beta=2.0f64;
+                }
+                //if tmp_input.print_level>0 {
+                //    println!("Even tempered basis generation starts at: {}", tmp_input.etb_start_atom_number);
+                //    println!("Even tempered basis beta is: {}", tmp_input.etb_beta);
+                //}
+            }
+            if tmp_input.external_init_guess  {
+                if ! std::path::Path::new(&tmp_input.guessfile).exists() {
+                    println!("WARNING: Initial density matrix is required by the keyword of guessfile, which, however, does not exist: \n({}). \n The external initial guess will not be imported.\n",&tmp_input.guessfile);
+                    tmp_input.external_init_guess = false;
+                } else {
+                    //if tmp_input.print_level>0 {
+                    //    println!("The initial guess will be imported from \n({}).\n ",&tmp_input.guessfile);
+                    //}
+                }
+            }
+            if tmp_input.force_state_occupation.len()>0 {
+                if ! tmp_input.restart {
+                    panic!("ERROR: force_state_occupation can not be involved without an existing chkfile \'restart\'");
+                } else if ! std::path::Path::new(&tmp_input.chkfile).exists() {
+                    panic!("ERROR: force_state_occupation can not be involved without an existing chkfile \'restart\'");
+                }
+            }
+        },
+        other => {
+            panic!("Error:: no 'ctrl' keyword or some inproper settings of the 'ctrl' keyword in the input file")
+        },
+    }
+
+    Ok(tmp_input)
 }
