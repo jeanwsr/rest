@@ -58,7 +58,7 @@ derive_builder = { version = "0.20" }
 dftd3 = { version = "0.1", optional = true }
 dftd4 = { version = "0.1", optional = true }
 #geometric-pyo3 = { version = "0.1", optional = true }
-geometric-pyo3 = {path="../geomeTRIC-pyo3", version = "0.1", optional = true }
+geometric-pyo3 = { version = "0.1.1", optional = true }
 
 [build-dependencies]
 autocxx-build = "0.26.0"
