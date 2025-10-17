@@ -607,6 +607,7 @@ fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeR
 mod geometric_pyo3_impl {
     use super::*;
     use geometric_pyo3::prelude::*;
+    use geometric_pyo3::engine::molecule_build_topology;
     use pyo3::prelude::*;
 
     pub(crate) struct GeometricOptDriver<'a> {
@@ -640,6 +641,7 @@ mod geometric_pyo3_impl {
         //let xyz = scf_data.mol.geom.position.iter().map(|x| *x).collect::<Vec<f64>>();
         let xyzs = vec![xyz];
         let molecule = init_pyo3_molecule(&elem, &xyzs).unwrap();
+        molecule_build_topology(&molecule, None).unwrap();
         
         //let optimizer_params = r#"
         //    convergence_energy   = 1.0e-6  # Eh
