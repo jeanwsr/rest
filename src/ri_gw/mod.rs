@@ -144,6 +144,9 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
             }
             scf_data.eigenvalues[0][n]+exchange-vxc_nn[n]
         }else{quasiparticle_energies_g[n]};
+        //for first round, if non-RS, then of course qp==scf;
+        //if RS, testings showed that solving omega=scf-v_xc+sigma_x+sigma_c_RS would be better for fisrt round
+        //To confirm, the consts DO UPDATE over self-consistent GW
         if scf_data.mol.ctrl.print_level>=2{
             println!("for n={},decenteralized calculations yield:imag={},contour_rayon={}",n,imag_n,contour_rayon);
         }
@@ -154,7 +157,6 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
         real_qp
     }).collect::<Vec<f64>>().clone();
     quasiparticle_energies_g=save_energies.clone();
-    //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,1);
     scf_data.gwqp.0=quasiparticle_energies_g.clone();
     display::full_quasiparticles(&quasiparticle_energies_g,occ_size);
     quasiparticle_energies_g
@@ -175,7 +177,6 @@ pub fn vxc_ao2mo(scf_data:&SCF)->Vec<f64>{
                 element+=(eigenvecs[0][[mu,i]]*eigenvecs[0][[nu,i]]*vxc_ao[[mu,nu]]);
             }
         }
-            //println!("an matrix element has been computed!");
         vxc_nn[i]=element;
     }
     vxc_nn
