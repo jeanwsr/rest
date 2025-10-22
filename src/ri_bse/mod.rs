@@ -14,11 +14,12 @@ use crate::molecule_io::Molecule;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgeev,_dgemm_full};
 use std::fs::OpenOptions;
 use std::{f64, fs::File, io::Write};
-//pub mod desert;
+pub mod dipoles;
 
 pub fn bse_main(scf_data:&mut SCF){
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let quasiparticle_energies=scf_data.gwqp.0.clone();
+    let dipole_matrix=dipoles::compute_dipole_matrix(scf_data);
     if scf_data.mol.ctrl.bse_all==true{
         prepare_ri3mo(scf_data,'N');
         println!("NOW STARTS TRIPLET BSE CALCULATION!!!");
@@ -90,7 +91,11 @@ pub fn bse_main(scf_data:&mut SCF){
             excitations=excitations[mid..].to_vec();
             let number=excitations.len().min(30);
             println!("First {} excitations:",number);
-            excitations[0..number].iter().for_each(|(e,v)|{println!("excitation energy={}",e);leading_components(v,occ_size,vir_size)});
+            excitations[0..number].iter().for_each(|(e,vec)|{println!("excitation energy={}",e);
+            let v=dipoles::normalize(vec,false);
+            let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,false);
+            println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
+            leading_components(&v,occ_size,vir_size)});
             println!("The first excitation obtained by BSE is {}",excitations[0].0);
             if scf_data.mol.ctrl.save_bse_excitations==true{
                 let line = excitations.iter().map(|(num,vec)| num.to_string()).collect::<Vec<_>>().join(",");
@@ -110,7 +115,12 @@ pub fn bse_main(scf_data:&mut SCF){
             }
             let number=excitations.len().min(30);
             println!("First {} excitations:",number);
-            excitations[0..number].iter().for_each(|(e,v)|{println!("excitation energy={}",e);leading_components(v,occ_size,vir_size)});
+            excitations[0..number].iter().for_each(|(e,vec)|{
+                let v=dipoles::normalize(vec,true);
+                println!("excitation energy={}",e);
+                let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
+                println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
+                leading_components(&v,occ_size,vir_size)});
             println!("The first excitation obtained by BSE is {}",excitations[0].0);
             if scf_data.mol.ctrl.save_bse_excitations==true{
                 let line = excitations.iter().map(|(num,vec)| num.to_string()).collect::<Vec<_>>().join(",");
@@ -398,7 +408,7 @@ pub fn zip_and_sort<'a>(eigenvalues:&'a Vec<f64>,eigenvectors:&'a MatrixFull<f64
     eigens.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     eigens
 }
-pub fn leading_components(eigenvector: &[f64],occ_size:usize, vir_size: usize){
+pub fn leading_components(eigenvector: &Vec<f64>,occ_size:usize, vir_size: usize){
     let mut components: Vec<(usize, usize, f64)> = eigenvector
         .iter()
         .enumerate()
@@ -420,5 +430,5 @@ pub fn leading_components(eigenvector: &[f64],occ_size:usize, vir_size: usize){
     }
 }
 pub fn show_all_eigenpairs<'a>(eigenpairs:&Vec<(f64,&'a [f64])>){
-    eigenpairs.iter().for_each(|(val,vec)|println!("eigenvalue:{},eigenverctor:{:#?}",val,vec))
+    eigenpairs.iter().for_each(|(val,vec)|println!("eigenvalue:{},eigenvector:{:#?}",val,vec))
 }
