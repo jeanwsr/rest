@@ -42,12 +42,15 @@ pub fn obtain_mu_ia(eigenvectors:&MatrixFull<f64>,ao_dip:&RIFull<f64>,i:usize,a:
     mu_ia
 }
 pub fn compute_dipole_matrix(scf_data:&SCF)->MatrixFull<f64>{
+    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
+    if scf_data.mol.ctrl.bse_spin=="triplet"{
+        return MatrixFull::new([3,vir_size*occ_size],0.0)
+    }
     let ao_dip=obtain_ao_dips(scf_data,None);
     println!("size of ao_dip:{:?}",ao_dip.size);
     matrixfullslice_to_matrixfull(ao_dip.get_reducing_matrix(0).unwrap()).formated_output(1000,"full");
     matrixfullslice_to_matrixfull(ao_dip.get_reducing_matrix(1).unwrap()).formated_output(1000,"full");
     matrixfullslice_to_matrixfull(ao_dip.get_reducing_matrix(2).unwrap()).formated_output(1000,"full");
-    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     println!("occupation parameters:occ_size={},vir_size={}",occ_size,vir_size);
     let mut dipole_matrix=MatrixFull::new([3,vir_size*occ_size],0.0);
     let eigenvectors=scf_data.eigenvectors[0].clone();
