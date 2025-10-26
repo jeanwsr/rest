@@ -254,7 +254,11 @@ pub struct InputKeywords {
     pub homo_lumo_gw_qp:bool,
     pub x_alpha:f64,
     pub save_qp:bool,
-    pub bse_all:bool,
+    pub bse_davidson_solver:bool,
+    pub davidson_target_excitations:usize,
+    pub davidson_converge_threshold:f64,
+    pub davidson_maximum_subspace_size:usize,
+    pub davidson_restart_dimensions:usize,
     pub bse_tda:bool,
     pub bse_spin:String,
     pub bse_cutoff_energy:f64,
@@ -409,7 +413,11 @@ impl InputKeywords {
             homo_lumo_gw_qp:false,
             x_alpha:0.5,
             save_qp:false,
-            bse_all:false,
+            bse_davidson_solver:false,
+            davidson_target_excitations:6,
+            davidson_converge_threshold:1e-6,
+            davidson_maximum_subspace_size:2,
+            davidson_restart_dimensions:5,
             bse_tda:false,
             bse_spin:String::from("none"),
             bse_cutoff_energy:1000000.0,
@@ -1509,7 +1517,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };
-            tmp_input.bse_all = match tmp_ctrl.get("bse_all").unwrap_or(&serde_json::Value::Null) {
+            tmp_input.bse_davidson_solver = match tmp_ctrl.get("bse_davidson_solver").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };
@@ -1524,6 +1532,29 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.bse_cutoff_energy = match tmp_ctrl.get("bse_cutoff_energy").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.5_f64)},
                 other => {1000000.0},
+            };
+            tmp_input.davidson_converge_threshold = match tmp_ctrl.get("davidson_converge_threshold").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-6_f64)},
+                other => {1e-6},
+            };
+            tmp_input.davidson_target_excitations = match tmp_ctrl.get("davidson_target_excitations").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(6_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(6) as usize},
+                other => {6}
+            };
+            let maximum_subspace_size=(((tmp_input.davidson_target_excitations as f64)*3.0).ceil() as usize);
+            tmp_input.davidson_maximum_subspace_size = match tmp_ctrl.get("davidson_maximum_subspace_size").unwrap_or(&serde_json::Value::Null) {
+        
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(maximum_subspace_size) as usize},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(maximum_subspace_size as i64) as usize},
+                other => {maximum_subspace_size}
+            };
+            let restart_size=(((tmp_input.davidson_target_excitations as f64)*1.5).ceil() as usize);
+            tmp_input.davidson_restart_dimensions = match tmp_ctrl.get("davidson_restart_dimensions").unwrap_or(&serde_json::Value::Null) {
+        
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(restart_size) as usize},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(restart_size as i64) as usize},
+                other => {restart_size}
             };
             tmp_input.save_bse_terms = match tmp_ctrl.get("save_bse_terms").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},

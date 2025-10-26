@@ -445,19 +445,13 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
     if output_type.eq("gw"){
         let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
         if scf_data.mol.ctrl.gw_scheme !="no gw" || scf_data.mol.ctrl.homo_lumo_gw_qp==true{
-            let mut rimatr=scf_data.rimatr.clone();
             ri_bse::prepare_ri3mo(scf_data,'Y');
-            if scf_data.mol.ctrl.bse_all==false || scf_data.mol.ctrl.bse_spin =="none"{
-                scf_data.rimatr=rimatr;
-                rimatr=None;
-            }else{
-                rimatr=None;
-            }
         }
         if scf_data.mol.ctrl.homo_lumo_gw_qp==true{
             ri_gw::get_homo_lumo_qp_only(scf_data,20,&vxc_nn,mpi_operator);
         }else{
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
+            ri_bse::matvec::test_v_w_contribution(scf_data);
         }
     }else if output_type.eq("bse"){
         if scf_data.mol.ctrl.gw_scheme=="parse from file"{
