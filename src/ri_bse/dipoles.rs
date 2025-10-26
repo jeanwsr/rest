@@ -47,22 +47,19 @@ pub fn compute_dipole_matrix(scf_data:&SCF)->MatrixFull<f64>{
         return MatrixFull::new([3,vir_size*occ_size],0.0)
     }
     let ao_dip=obtain_ao_dips(scf_data,None);
-    println!("size of ao_dip:{:?}",ao_dip.size);
-    matrixfullslice_to_matrixfull(ao_dip.get_reducing_matrix(0).unwrap()).formated_output(1000,"full");
-    matrixfullslice_to_matrixfull(ao_dip.get_reducing_matrix(1).unwrap()).formated_output(1000,"full");
-    matrixfullslice_to_matrixfull(ao_dip.get_reducing_matrix(2).unwrap()).formated_output(1000,"full");
-    println!("occupation parameters:occ_size={},vir_size={}",occ_size,vir_size);
+    //matrixfullslice_to_matrixfull(ao_dip.get_reducing_matrix(0).unwrap()).formated_output(1000,"full");
+    //matrixfullslice_to_matrixfull(ao_dip.get_reducing_matrix(1).unwrap()).formated_output(1000,"full");
+    //matrixfullslice_to_matrixfull(ao_dip.get_reducing_matrix(2).unwrap()).formated_output(1000,"full");
     let mut dipole_matrix=MatrixFull::new([3,vir_size*occ_size],0.0);
     let eigenvectors=scf_data.eigenvectors[0].clone();
-    println!("eigenvectors size:{:?}",eigenvectors.size);
-    eigenvectors.formated_output(1000,"full");
+    //eigenvectors.formated_output(1000,"full");
     (0..occ_size).cartesian_product(0..vir_size).for_each(|(i,a)|{
         let mu_ia=obtain_mu_ia(&eigenvectors,&ao_dip,i,a+occ_size);
         dipole_matrix[[0,i+a*occ_size]]=mu_ia[0];
         dipole_matrix[[1,i+a*occ_size]]=mu_ia[1];
         dipole_matrix[[2,i+a*occ_size]]=mu_ia[2];
     });
-    dipole_matrix.formated_output(1000,"full");
+    //dipole_matrix.formated_output(1000,"full");
     dipole_matrix
 }
 pub fn transition_dipole_square(dipole_matrix:&MatrixFull<f64>,vec:&Vec<f64>,tda:bool)->f64{
@@ -78,7 +75,7 @@ pub fn transition_dipole_square(dipole_matrix:&MatrixFull<f64>,vec:&Vec<f64>,tda
     }
     vector=vector.iter().map(|x_i|x_i*2.0).collect();
     _dgemv(dipole_matrix, &vector, &mut mu, 'N', 1.0, 0.0, 1, 1);
-    println!("dipole moment projections:\nx:{}, y:{}, z:{}",mu[0],mu[1],mu[2]);
+    println!("Dipole Moment Components:\nx:{}, y:{}, z:{}",mu[0],mu[1],mu[2]);
     mu[0].powf(2.0)+mu[1].powf(2.0)+mu[2].powf(2.0)
 }
 pub fn matrixfullslice_to_matrixfull(slice:MatrixFullSlice<f64>)->MatrixFull<f64>{
@@ -93,11 +90,9 @@ pub fn normalize(vector:&[f64],tda:bool)->Vec<f64>{
         let x_norm=x_vec.iter().fold(0.0,|acc,x_i|acc+x_i.powf(2.0));
         let y_norm=y_vec.iter().fold(0.0,|acc,y_i|acc+y_i.powf(2.0));
         let x_minus_y_root=(x_norm-y_norm).powf(0.5);
-        println!("x_norm-y_norm={}",x_norm-y_norm);
         vector.iter().map(|x_i|x_i/x_minus_y_root/SQRT_2).collect()
     }else{
         let x_norm=vector.iter().fold(0.0,|acc,x_i|acc+x_i.powf(2.0));
-        println!("x_norm={}",x_norm);
         vector.iter().map(|x_i|x_i/x_norm/SQRT_2).collect()
     }
 }

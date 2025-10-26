@@ -15,65 +15,14 @@ use rest_tensors::matrix::matrix_blas_lapack::{_dgeev,_dgemm_full};
 use std::fs::OpenOptions;
 use std::{f64, fs::File, io::Write};
 pub mod dipoles;
+pub mod davidson_solver;
+pub mod matvec;
 
 pub fn bse_main(scf_data:&mut SCF){
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let quasiparticle_energies=scf_data.gwqp.0.clone();
     let dipole_matrix=dipoles::compute_dipole_matrix(scf_data);
-    if scf_data.mol.ctrl.bse_all==true{
-        prepare_ri3mo(scf_data,'N');
-        println!("NOW STARTS TRIPLET BSE CALCULATION!!!");
-        let (mut wr_1,wi_1,mut wr_2,wi_2,mut wr_3,wi_3)=evaluate_all_excitations(scf_data,&quasiparticle_energies,'T');
-        println!("BSE evaluation finished!!!");
-        let n=wr_1.len();
-        println!("Triplet full diagonalization results:");
-        wr_1.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let number=wr_1.len().min(30);
-        println!("diag:{:#?}",wr_1.iter().filter(|a|**a>0.0).copied().collect::<Vec<f64>>()[0..number].to_vec());
-        println!("complexities:");
-        println!("wi_1:{:?}",wi_1);
-        println!("end of full diagonalization results");
-        println!("~~~~~results of another method~~~~~~");
-        wr_2.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let number=wr_2.len().min(30);
-        println!("Triplet TDA-BSE diagonalization results:{:#?}",wr_2[0..number].to_vec());
-        println!("complexities:");
-        println!("wi_2:{:?}",wi_2);
-        println!("end of TDA-BSE diagonalization results");
-        println!("~~~~~results of another method~~~~~~");
-        wr_3.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let number=wr_3.len().min(30);
-        println!("Triplet TDA-TDHF diagonalization results:{:#?}",wr_3[0..number].to_vec());
-        println!("complexities:");
-        println!("wi_3:{:?}",wi_3);
-        println!("end of TDA-TDHF diagonalization results");
-
-        println!("NOW STARTS  SINGLET BSE CALCULATION!!!");
-        let (mut wr_1,wi_1,mut wr_2,wi_2,mut wr_3,wi_3)=evaluate_all_excitations(scf_data,&quasiparticle_energies,'S');
-        println!("BSE evaluation finished!!!");
-        let n=wr_1.len();
-        println!("Singlet full diagonalization results:");
-        wr_1.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let number=wr_1.len().min(30);
-        println!("diag:{:#?}",wr_1.iter().filter(|a|**a>0.0).copied().collect::<Vec<f64>>()[0..number].to_vec());
-        println!("complexities:");
-        println!("wi_1:{:?}",wi_1);
-        println!("end of full diagonalization results");
-        println!("~~~~~results of another method~~~~~~");
-        wr_2.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let number=wr_2.len().min(30);
-        println!("Singlet TDA-BSE diagonalization results:{:#?}",wr_2[0..number].to_vec());
-        println!("complexities:");
-        println!("wi_2:{:?}",wi_2);
-        println!("end of TDA-BSE diagonalization results");
-        println!("~~~~~results of another method~~~~~~");
-        wr_3.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let number=wr_1.len().min(30);
-        println!("Singlet TDA-TDHF diagonalization results:{:#?}",wr_3[0..number].to_vec());
-        println!("complexities:");
-        println!("wi_3:{:?}",wi_3);
-        println!("end of TDA-TDHF diagonalization results");
-    }else if scf_data.mol.ctrl.bse_spin =="none"{
+    if scf_data.mol.ctrl.bse_spin =="none"{
         println!("No BSE Calculations are triggered");
     }else{
         println!("Specific BSE calculations are triggered");
@@ -108,8 +57,7 @@ pub fn bse_main(scf_data:&mut SCF){
                 writeln!(file.expect("write failure"), "{}", excitations[0].0);
             }
         }else{
-            let mut eigens=tda_calculations(&scf_data,&quasiparticle_energies,xlet);
-            let excitations=zip_and_sort(&eigens.0,&eigens.1);
+            let excitations=tda_calculations(&scf_data,&quasiparticle_energies,xlet);
             if scf_data.mol.ctrl.print_level>2{
                 show_all_eigenpairs(&excitations);
             }
@@ -350,7 +298,6 @@ pub fn evaluate_all_excitations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,x
     if scf_data.mol.ctrl.bse_qp_polarization==true{
         epsilon=quasiparticle_energies.clone();
     }
-    let inverse_dielectric=construct_inverse_dielectric(scf_data,&epsilon);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     println!("homo:{},lumo:{},occ_size:{},vir_size:{},start_mo:{},num_state:{}",homo,lumo,occ_size,vir_size,start_mo,num_state);
     println!("--------------------------------");
@@ -390,7 +337,7 @@ pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:
     let (matr_b_1, wr_1, wi_1,vl_1,vr_1,info_1)=_dgeev(&bse_hamiltonian, 'N', 'V');
     (wr_1,vr_1)
 }
-pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char)->(Vec<f64>,MatrixFull<f64>){
+pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char)->Vec<(f64,Vec<f64>)>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let ks_energies:Vec<f64>=scf_data.eigenvalues[0].clone();
     let mut epsilon=ks_energies.clone();
@@ -398,13 +345,23 @@ pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char
         epsilon=quasiparticle_energies.clone();
     }
     let inverse_dielectric=construct_inverse_dielectric(scf_data,&epsilon);
-    println!("starts contructing TDA BSE hamiltonian!!!");
-    let tda_bse_hamiltonian=construct_submat_a(scf_data,&inverse_dielectric,quasiparticle_energies, xlet);
-    let (matr_b_1, wr_1, wi_1,vl_1,vr_1,info_1)=_dgeev(&tda_bse_hamiltonian, 'N', 'V');
-    (wr_1,vr_1)
+    let mut eigenpairs:Vec<(f64,Vec<f64>)>=Vec::new();
+    if scf_data.mol.ctrl.bse_davidson_solver==true{
+        let mut subspace=davidson_solver::form_initial_space(scf_data);
+        eigenpairs=davidson_solver::iteration(scf_data,&mut subspace,&inverse_dielectric);
+    }else{
+        println!("starts contructing TDA BSE hamiltonian!!!");
+        let tda_bse_hamiltonian=construct_submat_a(scf_data,&inverse_dielectric,quasiparticle_energies, xlet);
+        let (matr_b_1, wr_1, wi_1,vl_1,vr_1,info_1)=_dgeev(&tda_bse_hamiltonian, 'N', 'V');
+        eigenpairs=zip_and_sort(&wr_1,&vr_1);
+    }
+    eigenpairs
 }
-pub fn zip_and_sort<'a>(eigenvalues:&'a Vec<f64>,eigenvectors:&'a MatrixFull<f64>)->Vec<(f64,&'a [f64])>{
-    let mut eigens:Vec<(f64,&[f64])>=eigenvalues.iter().cloned().zip(eigenvectors.iter_columns_full()).collect();
+pub fn zip_and_sort(
+    eigenvalues: &Vec<f64>,
+    eigenvectors: &MatrixFull<f64>
+    ) -> Vec<(f64,Vec<f64>)> {
+    let mut eigens:Vec<(f64,Vec<f64>)>=eigenvalues.iter().zip(eigenvectors.iter_columns_full()).map(|(e,v)|(*e,v.to_vec())).collect();
     eigens.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     eigens
 }
@@ -429,6 +386,6 @@ pub fn leading_components(eigenvector: &Vec<f64>,occ_size:usize, vir_size: usize
         println!("      #{}->#{},amplitude={}",components[i].0,components[i].1,components[i].2);
     }
 }
-pub fn show_all_eigenpairs<'a>(eigenpairs:&Vec<(f64,&'a [f64])>){
+pub fn show_all_eigenpairs(eigenpairs:&Vec<(f64,Vec<f64>)>){
     eigenpairs.iter().for_each(|(val,vec)|println!("eigenvalue:{},eigenvector:{:#?}",val,vec))
 }
