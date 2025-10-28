@@ -2358,9 +2358,16 @@ impl SCF {
             //    .zip(pre_energy[i_spin].iter())
             //    .fold(0.0,|acc,(c,p)| acc + (c-p).powf(2.0));
             // rayon parallel version
-            eev_err += cur_energy[i_spin].par_iter()
-                .zip(pre_energy[i_spin].par_iter())
-                .map(|(c,p)| (c-p).powf(2.0)).sum::<f64>();
+            if self.mol.num_elec[i_spin+1] > 1.0E-5 {
+                eev_err += cur_energy[i_spin].par_iter()
+                    .zip(pre_energy[i_spin].par_iter())
+                    .map(|(c,p)| (c-p).powf(2.0)).sum::<f64>();
+                // println!("DEBUG: eev[{}]\n pre: {:?},\n cur: {:?}", i_spin, pre_energy[i_spin], cur_energy[i_spin]);
+            } else {
+                // See https://gitee.com/restgroup/rest/issues/ICSQ9O
+                eev_err += 0.0;
+                // println!("DEBUG: eev[{}] is not considered due to the negligible electron number in this spin channel.", i_spin);
+            }
         }
         eev_err = eev_err.sqrt();
 
