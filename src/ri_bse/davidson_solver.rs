@@ -137,10 +137,11 @@ pub fn iteration(scf_data:&SCF,subspace:&mut Vec<Vec<f64>>,inverse_dielectric:&M
     let mut residues=compute_residues(scf_data,&ritz_pairs,inverse_dielectric);
     let mut rounds=0;
     //New Control Parameters:1)davidson_converge_threshold;2)davidson_target_excitations;3)maximum dimensions;4)restart dimensions
-    let converge_threshold=scf_data.mol.ctrl.davidson_converge_threshold;
-    let mut compute_pairs=scf_data.mol.ctrl.davidson_target_excitations;
-    let max_subspace=scf_data.mol.ctrl.davidson_maximum_subspace_size;
-    let restart_dimensions=scf_data.mol.ctrl.davidson_restart_dimensions;
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let converge_threshold=qp_ctrl.davidson_converge_threshold;
+    let mut compute_pairs=qp_ctrl.davidson_target_excitations;
+    let max_subspace=qp_ctrl.davidson_maximum_subspace_size;
+    let restart_dimensions=qp_ctrl.davidson_restart_dimensions;
     println!("Paramaters for this Davidson Algorithm:\n  Dimension of matrix={};\n  Converge threshold={};\n  Target excitations={};\n  Maximum Subspace Dimensions={}\n  Restart Dimensions={}",occ_size*vir_size,converge_threshold,compute_pairs,max_subspace,restart_dimensions);
     if compute_pairs>occ_size*vir_size{
         println!("Warning: You asked for {} eigenpairs computed from the Davidson Eigensolver, \nbut there are only {} eigenpairs in this system.\nOnly {} eigenpairs will be computed instead.",compute_pairs,occ_size*vir_size,cmp::max(occ_size*vir_size-2,1));

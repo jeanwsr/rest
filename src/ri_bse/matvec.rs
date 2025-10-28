@@ -120,7 +120,7 @@ pub fn test_v_w_contribution(scf_data:&SCF){
     println!("Wz Implicit Rayon:{}",az[3]);
 }
 pub fn a_block_matvec(scf_data:&SCF,inverse_dielectric:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
-    let xlet=if scf_data.mol.ctrl.bse_spin=="triplet"{'T'}else{'S'};
+    let xlet=if scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().bse_spin=="triplet"{'T'}else{'S'};
     let mut result=diagonal_elements_contribution(scf_data,z_vec);
     result=w_contribution(scf_data,z_vec,inverse_dielectric).iter().zip(result.iter()).map(|(w_i,z_i)|-w_i+z_i).collect();
     if xlet=='S'{

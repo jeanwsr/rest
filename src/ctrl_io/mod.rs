@@ -5,6 +5,7 @@ use tensors::MatrixFull;
 //use std::{fs, str::pattern::StrSearcher};
 use std::{fs, sync::Arc};
 use crate::ctrl_io::geometric_pyo3_io::parse_geometric_keywords;
+use crate::ctrl_io::quasiparticle_methods::parse_quasiparticle_keywords;
 use crate::{check_norm::force_state_occupation::ForceStateOccupation};
 use crate::dft::{DFAFamily, DFTType, DFA4REST};
 use crate::geom_io::{GeomCell, GeomUnit, MOrC, parse_geom_keywords};
@@ -18,7 +19,9 @@ use toml;
 
 mod pyrest_ctrl_io;
 mod geometric_pyo3_io;
+mod quasiparticle_methods;
 use geometric_pyo3_io::GeomeTRIC;
+use quasiparticle_methods::QuasiParticle;
 
 pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
     let tmp_cont = fs::read_to_string(&filename[..])?;
@@ -36,8 +39,12 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     let mut tmp_input = parse_ctrl_keywords(tmp_keys)?;
     let mut tmp_geomcell = parse_geom_keywords(tmp_keys)?;
     let mut tmp_geomtric = parse_geometric_keywords(tmp_keys)?;
+    let mut tmp_quasiparticle=parse_quasiparticle_keywords(tmp_keys)?;
     if let Some(tmp_geomtric) = &mut tmp_geomtric {
         tmp_input.geometric_pyo3 = Some(std::mem::take(tmp_geomtric));
+    }
+    if let Some(tmp_quasiparticle) = &mut tmp_quasiparticle {
+        tmp_input.quasiparticle_methods = Some(std::mem::take(tmp_quasiparticle));
     }
     Ok((tmp_input,tmp_geomcell))
 }
@@ -250,40 +257,8 @@ pub struct InputKeywords {
     /// External dipole field (x, y, z) intensity in atomic units
     pub ext_field_dipole: Option<[f64; 3]>,
     pub opt_engine: Option<String>,
-    pub gw_scheme:String,
-    pub homo_lumo_gw_qp:bool,
-    pub x_alpha:f64,
-    pub save_qp:bool,
-    pub bse_davidson_solver:bool,
-    pub davidson_target_excitations:usize,
-    pub davidson_converge_threshold:f64,
-    pub davidson_maximum_subspace_size:usize,
-    pub davidson_restart_dimensions:usize,
-    pub bse_tda:bool,
-    pub bse_spin:String,
-    pub bse_cutoff_energy:f64,
-    pub save_bse_terms:bool,
-    pub obtain_vx_vc_terms:bool,
-    pub obtain_pure_exchange:bool,
-    pub obtain_ks_homos:bool,
-    pub gw_linearize_shift:f64,
-    pub gw_linearize_derivative_h:f64,
-    pub renormalized_singles:bool,
-    pub w_rs:bool,
-    pub scgw:String,
-    pub gw:bool,
-    pub save_bse_excitations:bool,
-    pub evgw_rounds:usize,
-    pub save_gw_homo_lumo_qp:bool,
-    pub save_single_qp_path:String,
-    pub save_first_excitation:bool,
-    pub save_first_excitation_path:String,
-    pub parse_qp_path:String,
-    pub bse_qp_polarization:bool,
-    pub threshold:f64,
-    pub quasipartcle_methods:String,
-
     pub geometric_pyo3: Option<GeomeTRIC>,
+    pub quasiparticle_methods:Option<QuasiParticle>,
 }
 
 impl Default for InputKeywords {
@@ -409,39 +384,8 @@ impl InputKeywords {
             yamaguchi_triplet_type: None,
             ext_field_dipole: None,
             opt_engine: None,
-            gw_scheme:String::from("no gw"),
-            homo_lumo_gw_qp:false,
-            x_alpha:0.5,
-            save_qp:false,
-            bse_davidson_solver:false,
-            davidson_target_excitations:6,
-            davidson_converge_threshold:1e-6,
-            davidson_maximum_subspace_size:2,
-            davidson_restart_dimensions:5,
-            bse_tda:false,
-            bse_spin:String::from("none"),
-            bse_cutoff_energy:1000000.0,
-            save_bse_terms:false,
-            obtain_vx_vc_terms:false,
-            obtain_pure_exchange:false,
-            obtain_ks_homos:false,
-            gw_linearize_shift:1e-2,
-            gw_linearize_derivative_h:1e-10,
-            renormalized_singles:false,
-            w_rs:false,
-            scgw:String::from("g0w0"),
-            gw:false,
-            save_bse_excitations:false, 
-            evgw_rounds:0,
-            save_gw_homo_lumo_qp:false,
-            save_single_qp_path:String::from("single_qp_path.txt"),
-            save_first_excitation:false,
-            save_first_excitation_path:String::from("first_excitation_save.txt"),
-            parse_qp_path:String::from("./qp_energies"),
-            bse_qp_polarization:false,
-            threshold:0.1,
-            quasipartcle_methods:String::new(),
             geometric_pyo3: None,
+            quasiparticle_methods:None,
         }
     }
 
@@ -1501,143 +1445,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Null => { None },
                 _ => panic!("Not recognized type for opt_engine"),
             };
-            tmp_input.gw_scheme = match tmp_ctrl.get("gw_scheme").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(s) => s.clone(),
-                _ => String::from("no gw"),
-            };
-            tmp_input.homo_lumo_gw_qp=match tmp_ctrl.get("homo_lumo_gw_qp").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                other => {false},
-            };
-            tmp_input.x_alpha=match tmp_ctrl.get("x_alpha").unwrap_or(&serde_json::Value::Null){
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(2.0_f64)},
-                other => {0.5},
-            };
-            tmp_input.save_qp = match tmp_ctrl.get("save_qp").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                other => {false},
-            };
-            tmp_input.bse_davidson_solver = match tmp_ctrl.get("bse_davidson_solver").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                other => {false},
-            };
-            tmp_input.bse_tda = match tmp_ctrl.get("bse_tda").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                other => {false},
-            };
-            tmp_input.bse_spin = match tmp_ctrl.get("bse_spin").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(s) => s.clone(),
-                _ => String::from("none"),
-            };
-            tmp_input.bse_cutoff_energy = match tmp_ctrl.get("bse_cutoff_energy").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.5_f64)},
-                other => {1000000.0},
-            };
-            tmp_input.davidson_converge_threshold = match tmp_ctrl.get("davidson_converge_threshold").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-6_f64)},
-                other => {1e-6},
-            };
-            tmp_input.davidson_target_excitations = match tmp_ctrl.get("davidson_target_excitations").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(6_usize)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(6) as usize},
-                other => {6}
-            };
-            let maximum_subspace_size=(((tmp_input.davidson_target_excitations as f64)*3.0).ceil() as usize);
-            tmp_input.davidson_maximum_subspace_size = match tmp_ctrl.get("davidson_maximum_subspace_size").unwrap_or(&serde_json::Value::Null) {
-        
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(maximum_subspace_size) as usize},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(maximum_subspace_size as i64) as usize},
-                other => {maximum_subspace_size}
-            };
-            let restart_size=(((tmp_input.davidson_target_excitations as f64)*1.5).ceil() as usize);
-            tmp_input.davidson_restart_dimensions = match tmp_ctrl.get("davidson_restart_dimensions").unwrap_or(&serde_json::Value::Null) {
-        
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(restart_size) as usize},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(restart_size as i64) as usize},
-                other => {restart_size}
-            };
-            tmp_input.save_bse_terms = match tmp_ctrl.get("save_bse_terms").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                other => {false},
-            };
-            tmp_input.obtain_vx_vc_terms = match tmp_ctrl.get("obtain_vx_vc_terms").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                other => {false},
-            };
-            tmp_input.obtain_pure_exchange = match tmp_ctrl.get("obtain_pure_exchange").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                other => {false},
-            };
-            tmp_input.obtain_ks_homos = match tmp_ctrl.get("obtain_ks_homos").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                other => {false},
-            };
-            tmp_input.gw_linearize_shift= match tmp_ctrl.get("gw_linearize_shift").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.01_f64)},
-                other => {0.01},
-            };
-            tmp_input.gw_linearize_derivative_h= match tmp_ctrl.get("gw_linearize_derivative_h").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-10_f64)},
-                other => {1e-10},
-            };
-            tmp_input.threshold= match tmp_ctrl.get("threshold").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.1)},
-                other => {0.1},
-            };
-            tmp_input.renormalized_singles = match tmp_ctrl.get("renormalized_singles").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                other => {false},
-            };
-            tmp_input.w_rs = match tmp_ctrl.get("w_rs").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                other => {false},
-            };
-            tmp_input.scgw = match tmp_ctrl.get("scgw").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(s) => s.clone(),
-                _ => String::from("g0w0"),
-            };
-            tmp_input.gw = match tmp_ctrl.get("gw").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                other => {false},
-            };
-
-            tmp_input.evgw_rounds = match tmp_ctrl.get("evgw_rounds").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(4_usize)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(4) as usize},
-                other => {0}
-            };
-            tmp_input.save_gw_homo_lumo_qp = match tmp_ctrl.get("save_gw_homo_lumo_qp").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                other => {false},
-            };
-            tmp_input.save_bse_excitations = match tmp_ctrl.get("save_bse_excitations").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                other => {false},
-            };
-            tmp_input.save_single_qp_path = match tmp_ctrl.get("save_single_qp_path").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(s) => s.clone(),
-                _ => String::from("single_qp_save.txt"),
-            };
-            tmp_input.save_first_excitation = match tmp_ctrl.get("save_first_excitation").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                other => {false},
-            };
-            tmp_input.save_first_excitation_path = match tmp_ctrl.get("save_first_excitation_path").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(s) => s.clone(),
-                _ => String::from("first_excitation_save.txt"),
-            };
-            tmp_input.parse_qp_path = match tmp_ctrl.get("parse_qp_path").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(s) => s.clone(),
-                _ => String::from("./qp_energies"),
-            };
-            tmp_input.quasipartcle_methods = match tmp_ctrl.get("quasiparticle_methods").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(s) => s.clone(),
-                _ => String::new(),
-            };
-            tmp_input.bse_qp_polarization = match tmp_ctrl.get("bse_qp_polarization").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(tmp_str) => {*tmp_str},
-                other => {false},
-            };
+            
             //===========================================================
             // Global check of ctrl keywords and futher modification
             //============================================================

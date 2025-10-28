@@ -43,7 +43,7 @@ pub fn obtain_mu_ia(eigenvectors:&MatrixFull<f64>,ao_dip:&RIFull<f64>,i:usize,a:
 }
 pub fn compute_dipole_matrix(scf_data:&SCF)->MatrixFull<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
-    if scf_data.mol.ctrl.bse_spin=="triplet"{
+    if scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().bse_spin=="triplet"{
         return MatrixFull::new([3,vir_size*occ_size],0.0)
     }
     let ao_dip=obtain_ao_dips(scf_data,None);
