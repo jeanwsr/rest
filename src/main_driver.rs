@@ -334,8 +334,7 @@ pub fn main_driver() -> anyhow::Result<()> {
         let min_hlg = homo_lumo_gap.iter().filter(|&&x| !x.is_nan()).min_by(|a, b| a.partial_cmp(b).unwrap());
         println!("HOMO-LUMO gap: {:?} eV",min_hlg.unwrap());
     }
-
-    if scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().gw_or_bse.len()>=1{
+    if let Some(qp_ctrl)=scf_data.mol.ctrl.quasiparticle_methods.clone(){
         print!("Now starts quasiparticle method computation!\n");
         quasiparticle_methods(&mut scf_data,&mpi_operator);
     }
