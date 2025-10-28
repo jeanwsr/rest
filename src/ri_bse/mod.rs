@@ -22,15 +22,16 @@ pub fn bse_main(scf_data:&mut SCF){
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let quasiparticle_energies=scf_data.gwqp.0.clone();
     let dipole_matrix=dipoles::compute_dipole_matrix(scf_data);
-    if scf_data.mol.ctrl.bse_spin =="none"{
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    if qp_ctrl.bse_spin =="none"{
         println!("No BSE Calculations are triggered");
     }else{
         println!("Specific BSE calculations are triggered");
         prepare_ri3mo(scf_data,'N');
-        let bse_spin=scf_data.mol.ctrl.bse_spin.clone();
+        let bse_spin=qp_ctrl.bse_spin.clone();
         println!("BSE Type:{}",bse_spin);
         let xlet=if bse_spin=="triplet"{'T'}else if bse_spin=="singlet"{'S'}else{panic!("invalid choice for bse_spin!")};
-        if scf_data.mol.ctrl.bse_tda==false{
+        if qp_ctrl.bse_tda==false{
             let mut eigens=non_tda_calculations(&scf_data,&quasiparticle_energies,xlet);
             let mut excitations=zip_and_sort(&eigens.0,&eigens.1);
             if scf_data.mol.ctrl.print_level>2{
@@ -46,13 +47,13 @@ pub fn bse_main(scf_data:&mut SCF){
             println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
             leading_components(&v,occ_size,vir_size)});
             println!("The first excitation obtained by BSE is {}",excitations[0].0);
-            if scf_data.mol.ctrl.save_bse_excitations==true{
+            if qp_ctrl.save_bse_excitations==true{
                 let line = excitations.iter().map(|(num,vec)| num.to_string()).collect::<Vec<_>>().join(",");
                 let mut file = OpenOptions::new().append(true).create(true).open("bse_excitations.txt");
                 writeln!(file.expect("write failure"), "{}", line);
             }
-            if scf_data.mol.ctrl.save_first_excitation==true{
-                let save_path=scf_data.mol.ctrl.save_first_excitation_path.clone();
+            if qp_ctrl.save_first_excitation==true{
+                let save_path=qp_ctrl.save_first_excitation_path.clone();
                 let mut file = OpenOptions::new().append(true).create(true).open(save_path);
                 writeln!(file.expect("write failure"), "{}", excitations[0].0);
             }
@@ -70,13 +71,13 @@ pub fn bse_main(scf_data:&mut SCF){
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
                 leading_components(&v,occ_size,vir_size)});
             println!("The first excitation obtained by BSE is {}",excitations[0].0);
-            if scf_data.mol.ctrl.save_bse_excitations==true{
+            if qp_ctrl.save_bse_excitations==true{
                 let line = excitations.iter().map(|(num,vec)| num.to_string()).collect::<Vec<_>>().join(",");
                 let mut file = OpenOptions::new().append(true).create(true).open("bse_excitations.txt");
                 writeln!(file.expect("write failure"), "{}", line);
             }
-            if scf_data.mol.ctrl.save_first_excitation==true{
-                let save_path=scf_data.mol.ctrl.save_first_excitation_path.clone();
+            if qp_ctrl.save_first_excitation==true{
+                let save_path=qp_ctrl.save_first_excitation_path.clone();
                 let mut file = OpenOptions::new().append(true).create(true).open(save_path);
                 writeln!(file.expect("write failure"), "{}", excitations[0].0);
             }
@@ -295,7 +296,8 @@ extern "C" fn select(ar: *const f64, ai: *const f64) -> i32 {
 pub fn evaluate_all_excitations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let ks_energies:Vec<f64>=scf_data.eigenvalues[0].clone();
     let mut epsilon=ks_energies.clone();
-    if scf_data.mol.ctrl.bse_qp_polarization==true{
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    if qp_ctrl.bse_qp_polarization==true{
         epsilon=quasiparticle_energies.clone();
     }
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
@@ -328,7 +330,8 @@ pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let ks_energies:Vec<f64>=scf_data.eigenvalues[0].clone();
     let mut epsilon=ks_energies.clone();
-    if scf_data.mol.ctrl.bse_qp_polarization==true{
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    if qp_ctrl.bse_qp_polarization==true{
         epsilon=quasiparticle_energies.clone();
     }
     let inverse_dielectric=construct_inverse_dielectric(scf_data,&epsilon);
@@ -341,12 +344,13 @@ pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let ks_energies:Vec<f64>=scf_data.eigenvalues[0].clone();
     let mut epsilon=ks_energies.clone();
-    if scf_data.mol.ctrl.bse_qp_polarization==true{
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    if qp_ctrl.bse_qp_polarization==true{
         epsilon=quasiparticle_energies.clone();
     }
     let inverse_dielectric=construct_inverse_dielectric(scf_data,&epsilon);
     let mut eigenpairs:Vec<(f64,Vec<f64>)>=Vec::new();
-    if scf_data.mol.ctrl.bse_davidson_solver==true{
+    if qp_ctrl.bse_davidson_solver==true{
         let mut subspace=davidson_solver::form_initial_space(scf_data);
         eigenpairs=davidson_solver::iteration(scf_data,&mut subspace,&inverse_dielectric);
     }else{

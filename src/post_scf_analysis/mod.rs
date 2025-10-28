@@ -441,21 +441,22 @@ pub fn post_scf_correlation(scf_data: &mut SCF) {
 }
 
 pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>){
-    let output_type=scf_data.mol.ctrl.quasipartcle_methods.clone();
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let output_type=qp_ctrl.gw_or_bse.clone();
     if output_type.eq("gw"){
         let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
-        if scf_data.mol.ctrl.gw_scheme !="no gw" || scf_data.mol.ctrl.homo_lumo_gw_qp==true{
+        if qp_ctrl.gw_scheme !="no gw" || qp_ctrl.homo_lumo_gw_qp==true{
             ri_bse::prepare_ri3mo(scf_data,'Y');
         }
-        if scf_data.mol.ctrl.homo_lumo_gw_qp==true{
+        if qp_ctrl.homo_lumo_gw_qp==true{
             ri_gw::get_homo_lumo_qp_only(scf_data,20,&vxc_nn,mpi_operator);
         }else{
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
             ri_bse::matvec::test_v_w_contribution(scf_data);
         }
     }else if output_type.eq("bse"){
-        if scf_data.mol.ctrl.gw_scheme=="parse from file"{
-            let parse_qp_path=scf_data.mol.ctrl.parse_qp_path.clone();
+        if qp_ctrl.gw_scheme=="parse from file"{
+            let parse_qp_path=qp_ctrl.parse_qp_path.clone();
             scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
         }else{
             let mut rimatr=scf_data.rimatr.clone();

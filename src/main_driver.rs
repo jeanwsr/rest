@@ -335,7 +335,7 @@ pub fn main_driver() -> anyhow::Result<()> {
         println!("HOMO-LUMO gap: {:?} eV",min_hlg.unwrap());
     }
 
-    if scf_data.mol.ctrl.quasipartcle_methods.len()>=1{
+    if scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().gw_or_bse.len()>=1{
         print!("Now starts quasiparticle method computation!\n");
         quasiparticle_methods(&mut scf_data,&mpi_operator);
     }

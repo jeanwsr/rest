@@ -38,10 +38,11 @@ pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperat
     show_energy_levels(scf_data);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(&scf_data,'Y');
     let mut rs_particles:Vec<f64>=Vec::new();
-    let renormalized_singles=scf_data.mol.ctrl.renormalized_singles;
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let renormalized_singles=qp_ctrl.renormalized_singles;
     if renormalized_singles==true{
         println!("Starts renormalized singles calculations!");
-        let w_rs=scf_data.mol.ctrl.w_rs;
+        let w_rs=qp_ctrl.w_rs;
         //println!("Now starting to compute rs_particles");
         rs_particles=renormalized_singles::renormalized_singles_diagonalization(scf_data,w_rs,mpi_operator);
         if printlevel>0{
@@ -50,15 +51,15 @@ pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperat
         scf_data.renormalized_singles_particles=rs_particles
     }
     initialize_qp_g_w(scf_data);
-    let gw_scheme=scf_data.mol.ctrl.gw_scheme.clone();
-    let scgw=scf_data.mol.ctrl.scgw.clone();
+    let gw_scheme=qp_ctrl.gw_scheme.clone();
+    let scgw=qp_ctrl.scgw.clone();
     let quasiparticle_energies:Vec<f64>=
         if scgw=="g0w0"&&renormalized_singles==false{
             println!("You are doing G0W0 calculations of entire energy spectrum");
             scgw::g0w0(scf_data,20,&vxc_nn,true)
         }else if scgw=="evgw"{
             println!("You are doing evGW calculations of entire energy spectrum");
-            scgw::evgw(scf_data,20,&vxc_nn,scf_data.mol.ctrl.evgw_rounds)
+            scgw::evgw(scf_data,20,&vxc_nn,qp_ctrl.evgw_rounds)
         }else if scgw=="g0w0"&&renormalized_singles==true{
             scgw::g0w0(scf_data,20,&vxc_nn,true)
         }else{panic!("invalid expression for scgw!")};
@@ -67,9 +68,10 @@ pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperat
     }
 }
 pub fn initialize_qp_g_w(scf_data:&mut SCF){
-    if scf_data.mol.ctrl.renormalized_singles==true{
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    if qp_ctrl.renormalized_singles==true{
         let rsp=scf_data.renormalized_singles_particles.clone();
-        if scf_data.mol.ctrl.w_rs==true{
+        if qp_ctrl.w_rs==true{
             scf_data.gwqp=(rsp.clone(),rsp);
         }else{
             let eigenenergies=scf_data.eigenvalues[0].clone();
@@ -272,7 +274,7 @@ pub fn calculate_imag(w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,num_state:usi
     //No need to worry about cutoff
 }
 pub fn get_occupation_parameters(scf_data:&SCF,response_or_not:char)->(usize,usize,usize,usize,usize,usize){
-    let cutoff=scf_data.mol.ctrl.bse_cutoff_energy;
+    let cutoff=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().bse_cutoff_energy;
     let mut num_state = scf_data.mol.num_state;
     let mut homo = 0_usize;
     let mut lumo = num_state;
@@ -454,9 +456,10 @@ pub fn spectrum_test(scf_data:&SCF,num_freq:usize){
 pub fn x_alpha_gw(scf_data:&mut SCF)->Vec<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let ks_energies:Vec<f64>=scf_data.eigenvalues[0].clone();
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let xc_name = scf_data.mol.ctrl.xc.to_lowercase();
     let exchange_under_dfa=get_pure_x_or_c_of_xc(scf_data,&xc_name,'X');
-    let x_alpha=scf_data.mol.ctrl.x_alpha;
+    let x_alpha=qp_ctrl.x_alpha;
     let v_matrix=v_matrix(&scf_data);
     ks_energies.into_iter().enumerate().map(|(n,e_n)|{
         let mut exchange=0.0;
@@ -467,11 +470,12 @@ pub fn x_alpha_gw(scf_data:&mut SCF)->Vec<f64>{
     }).collect()
 }
 pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
-    let delta=scf_data.mol.ctrl.gw_linearize_shift;
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let delta=qp_ctrl.gw_linearize_shift;
     let v_matrix=v_matrix(&scf_data);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let mut num_state_qp_range=num_state;
-    if scf_data.mol.ctrl.scgw=="g0w0"{
+    if qp_ctrl.scgw=="g0w0"{
         let (start_mo_n,num_state_n,occ_size_n,vir_size_n,homo_n,lumo_n)=get_occupation_parameters(scf_data,'N');
         num_state_qp_range=num_state_n;
     }
@@ -483,7 +487,7 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
     //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,0);
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
     let mut save_energies:Vec<f64>=vec![0.0;num_state];
-    let h=scf_data.mol.ctrl.gw_linearize_derivative_h;
+    let h=qp_ctrl.gw_linearize_derivative_h;
     save_energies=(0..num_state_qp_range).map(|n|{
         let side=if n>=occ_size{1.0}else{-1.0};
         let omega_shifted=scf_data.eigenvalues[0][n]-delta*side;
@@ -577,10 +581,11 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     let v_matrix=v_matrix(&scf_data);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let mut rs_particles:Vec<f64>=Vec::new();
-    let renormalized_singles=scf_data.mol.ctrl.renormalized_singles;
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let renormalized_singles=qp_ctrl.renormalized_singles;
     if renormalized_singles==true{
         println!("Starts renormalized singles calculations!");
-        let w_rs=scf_data.mol.ctrl.w_rs;
+        let w_rs=qp_ctrl.w_rs;
         //println!("Now starting to compute rs_particles");
         rs_particles=renormalized_singles::renormalized_singles_diagonalization(scf_data,w_rs,mpi_operator);
         if printlevel>0{
@@ -597,9 +602,9 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
         ri_mat.formated_output(1000,"full");
     }
     
-    if scf_data.mol.ctrl.renormalized_singles==true{
+    if qp_ctrl.renormalized_singles==true{
         quasiparticle_energies_g=scf_data.renormalized_singles_particles.clone();
-        if scf_data.mol.ctrl.w_rs==true{
+        if qp_ctrl.w_rs==true{
             quasiparticle_energies_w=scf_data.renormalized_singles_particles.clone();
         }else{
             for n in 0..num_state{
@@ -627,7 +632,7 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     let printlevel=scf_data.mol.ctrl.print_level;
     let homo_qp=newton_solver(quasiparticle_equation,n,consts,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],0.00001,50,side,printlevel);
     //println!("for n={}, quasiparticle equation yields:qp energy={}",n,homo_qp);
-    let save_path=scf_data.mol.ctrl.save_single_qp_path.clone();
+    let save_path=qp_ctrl.save_single_qp_path.clone();
     println!("The QP energy of HOMO obtained by GWA is {}",homo_qp);
     let n=lumo;
     let mut exchange=0.0;
@@ -641,8 +646,8 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     let side=if n>=occ_size{1.0}else{-1.0};
     let printlevel=scf_data.mol.ctrl.print_level;
     let lumo_qp=newton_solver(quasiparticle_equation,n,consts,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],0.00001,50,side,printlevel);
-    let save_path=scf_data.mol.ctrl.save_single_qp_path.clone();
-    if scf_data.mol.ctrl.save_gw_homo_lumo_qp==true{
+    let save_path=qp_ctrl.save_single_qp_path.clone();
+    if qp_ctrl.save_gw_homo_lumo_qp==true{
         let mut file = OpenOptions::new().append(true).create(true).open(save_path);
         writeln!(file.expect("write failure"), "{},{}",homo_qp,lumo_qp);
     }
