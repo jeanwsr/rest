@@ -27,7 +27,8 @@ use rayon::iter::IntoParallelRefMutIterator;
 use crate::ri_gw;
 
 pub fn g0w0(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
-    let gw_scheme=scf_data.mol.ctrl.gw_scheme.clone();
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let gw_scheme=qp_ctrl.gw_scheme.clone();
     if gw_scheme=="qp equation"{
         ri_gw::gw_calculations(scf_data,20,&vxc_nn,cancel_dfa_xc)
     }else if gw_scheme=="linearize"{
@@ -35,7 +36,7 @@ pub fn g0w0(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool
     }else if gw_scheme=="x alpha"{
         ri_gw::x_alpha_gw(scf_data)
     }else if gw_scheme=="extrapolated"{
-        gw_near_fermi_surface(scf_data,20,&vxc_nn,scf_data.mol.ctrl.threshold)
+        gw_near_fermi_surface(scf_data,20,&vxc_nn,qp_ctrl.threshold)
     }
     else if gw_scheme=="no gw"{
         Vec::new()
@@ -79,7 +80,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,t
     let w_c_at_freqs=ri_gw::generate_w_c(scf_data,&ri_ov,&ri_mat,&scf_data.gwqp.0,&scf_data.gwqp.1,num_state,occ_size,vir_size,num_freq);
     let e_homo=ks_energies[occ_size-1];
     let e_lumo=ks_energies[occ_size];
-    let calc_orbs_indices:Vec<usize>=ks_energies.into_iter().enumerate().filter(|(n,e_n)|*e_n>e_homo-threshold && *e_n<e_lumo+threshold).map(|(n,e_n)|n-1).collect();
+    let calc_orbs_indices:Vec<usize>=ks_energies.into_iter().enumerate().filter(|(n,e_n)|*e_n>e_homo-threshold && *e_n<e_lumo+threshold).map(|(n,e_n)|n).collect();
     println!("calculated orbital indices:{:?}",calc_orbs_indices);
     let calc_orbs:Vec<(usize,f64)>=calc_orbs_indices.iter().map(|&n|(n,single_orbital_gw(scf_data,&v_matrix,&ri_ov,&ri_mat,&w_c_at_freqs,n,num_freq,vxc_nn[n]))).collect();
     let occ_shift=calc_orbs.clone().into_iter().filter(|(n,e_n)|*n<lumo).fold(0.0,|acc,(n,e_gw_n)| acc+(e_gw_n-scf_data.eigenvalues[0][n]))/((lumo-calc_orbs[0].0) as f64);
@@ -109,9 +110,10 @@ pub fn prepare_gwqp(scf_data:&mut SCF){
     let mut quasiparticle_energies_g:Vec<f64> = vec![];
     let mut quasiparticle_energies_w:Vec<f64> = vec![];
     let eigenenergies:Vec<f64>=scf_data.eigenvalues[0].clone();
-    if scf_data.mol.ctrl.renormalized_singles==true{
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    if qp_ctrl.renormalized_singles==true{
         quasiparticle_energies_g=scf_data.renormalized_singles_particles.clone();
-        if scf_data.mol.ctrl.w_rs==true{
+        if qp_ctrl.w_rs==true{
             quasiparticle_energies_w=scf_data.renormalized_singles_particles.clone();
         }else{
             for n in 0..num_state{
