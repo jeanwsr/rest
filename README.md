@@ -67,6 +67,13 @@
     - `molden`　　结果输出为molden程序的格式
     - `geometry`  输出分子结构文件
     - `force`     输出分子受力信息
+- `cube_orb_setting`: 取值[f64;2]。`cube_orb`格点参数设置。前一个值(margin)是边界信息，第二个值(num_grids)是生成格点的数目。缺省值为[3.0, 80.0]
+- `cube_orb_indices`: 取值Vec\<[usize;3]\>。
+	- 指定需要生成cube信息的轨道信息。缺省为空，即`[]`
+    - 每一个矢量元素`[usize;3]`代表一组轨道信息：
+    - 第一个值(start_orb)为起始轨道的index
+    - 第二个值(end_orb)为截止轨道的index
+    - 第三个值(i_spin)是这组轨道所在的自旋通道。0为alpha自旋;1为beta自旋
 
 ## 计算方法相关关键词（Keyword）
 - `xc`：取值String类型。调用的电子结构计算方法。目前REST支持
