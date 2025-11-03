@@ -21,6 +21,7 @@ mod pyrest_ctrl_io;
 mod geometric_pyo3_io;
 mod quasiparticle_methods;
 use geometric_pyo3_io::GeomeTRIC;
+mod path_util;
 use quasiparticle_methods::QuasiParticle;
 
 pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
@@ -616,13 +617,14 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             // ====================================
             //  Keywords for the (aux) basis sets
             // ====================================
+
+            // if env REST_BASIS_DIR is set, use it as rest_basis_dir, 
+            // otherwise use the default path from rest docker's convention or $REST_HOME/rest/basis-set-pool/
+            let rest_basis_dir = path_util::get_rest_basis_dir(tmp_input.print_level);
+
             tmp_input.basis_path = match tmp_ctrl.get("basis_path").unwrap_or(&serde_json::Value::Null) {
                serde_json::Value::String(tmp_bas) => {
-                    if ! std::path::Path::new(tmp_bas).is_dir() {
-                        println!("The specified folder for the basis sets is missing: ({})", tmp_bas);
-                        println!("REST trys to fetch the basis sets from the basis-set exchange pool (https://www.basissetexchange.org/)");
-                    };
-                    tmp_bas.clone()
+                    path_util::get_valid_basis_path(&tmp_bas, &rest_basis_dir, "basis")
                },
                other => {
                     if ! std::path::Path::new(&String::from("./")).is_dir() {
@@ -717,18 +719,13 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
             tmp_input.auxbas_path = match tmp_ctrl.get("auxbas_path").unwrap_or(&serde_json::Value::Null) {
                serde_json::Value::String(tmp_bas) => {
-                    if ! std::path::Path::new(tmp_bas).is_dir() {
-                        println!("The specified folder for the auxiliar basis sets is missing: ({})", tmp_bas);
-                        //tmp_input.use_auxbas = false;
-                    }
-                    //tmp_input.use_auxbas = true;
-                    tmp_bas.clone()
+                    path_util::get_valid_basis_path(&tmp_bas, &rest_basis_dir, "auxiliary basis")
                },
                other => {
                     //if ! std::path::Path::new(&String::from("./")).is_dir() {
                     //    println!("The specified folder for the auxiliar basis sets is missing: (./)");
                     //};
-                    println!("No auxiliary basis set is specified. REST will try to find the auxiliary basis fromt the current folder: (./)");
+                    println!("No auxiliary basis set is specified. REST will try to find the auxiliary basis from the current folder: (./)");
                     let default_bas = String::from("./");
                     if ! std::path::Path::new(&default_bas).is_dir() {
                         //tmp_input.use_auxbas = false;
