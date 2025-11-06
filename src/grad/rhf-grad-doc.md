@@ -175,9 +175,9 @@ $$
 
 | 变量名 | 变量意义 | 指标顺序 | 维度大小 | 其他说明 |
 |--|--|--|--|--|
-| `int1e_ipkin` | $\langle \partial_t \mu | \hat k | \nu \rangle$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | anti-sym |
-| `int1e_ipnuc` | $\langle \partial_t \mu | \hat v | \nu \rangle$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | non-sym |
-| `int1e_iprinv` | $\langle \partial_t \mu | \frac{1}{|\boldsymbol{r}_{\rightarrow A}|} | \nu \rangle$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | non-sym, gauge-dependent |
+| `int1e_ipkin` | $\langle \partial_t \mu \vert \hat k \vert \nu \rangle$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | anti-sym |
+| `int1e_ipnuc` | $\langle \partial_t \mu \vert \hat v \vert \nu \rangle$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | non-sym |
+| `int1e_iprinv` | $\langle \partial_t \mu \vert \frac{1}{\vert \boldsymbol{r}_{\rightarrow A} \vert} \vert \nu \rangle$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | non-sym, gauge-dependent |
 | `h1` | $\texttt{h1}_{\mu \nu}^t$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | non-sym |
 | `vrinv` | $\partial_{A_t} h_{\mu \nu}$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | sym |
 
