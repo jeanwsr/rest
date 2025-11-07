@@ -1,6 +1,6 @@
 use crate::molecule_io::Molecule;
 use crate::utilities::memory_batch::blocksize_partition;
-use crate::utilities::rstsr_interchange::*;
+use crate::utilities::rstsr_util::*;
 use rest_libcint::prelude::*;
 use rstsr::prelude::*;
 use tensors::{MatrixFull, MatrixUpper};
@@ -38,10 +38,8 @@ type TsrMut<'a, T> = TensorMut<'a, T, DeviceBLAS, IxD>;
 ///
 /// - [`Tsr<f64>`]
 ///
-///   - Coulomb (J) matrices in shape (nao_tp, nset), stored in f-contiguous order.
-///   - Here `nao_tp = nao * (nao + 1) / 2` is the number of elements in the upper-triangular part
-///     of the density matrix.
-///   - The output matrices are in packed upper-triangular format.
+///   - Coulomb (J) matrices in shape (nao, nao, nset), stored in f-contiguous order.
+///   - J matrices are symmetric by definition in real arithmetic.
 ///
 /// # Formula and Algorithm
 ///
@@ -143,8 +141,12 @@ pub(crate) fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Mole
         idx_ao += nbatch_ao;
     }
 
-    // returns upper triangular part
-    js_tp
+    // returns symmetrized part
+    let mut js = rt::zeros(([nao, nao, nset].f(), &device));
+    for iset in 0..nset {
+        js.i_mut((.., .., iset)).assign(js_tp.i((.., iset)).unpack_triu(FlagSymm::Sy));
+    }
+    js
 }
 
 pub(crate) fn generate_vj_ri_direct(
@@ -165,7 +167,7 @@ pub(crate) fn generate_vj_ri_direct(
     // Tsr -> Vec<MatrixUpper>
     let mut js = vec![];
     for iset in 0..nset {
-        let j = js_rstsr.i((.., iset)).to_owned().raw().clone();
+        let j = js_rstsr.i((.., iset)).pack_tri(Upper).into_vec();
         js.push(unsafe { MatrixUpper::from_vec_unchecked(nao_tp, j) });
     }
 
@@ -183,23 +185,25 @@ mod debug {
         let device = DeviceBLAS::default();
 
         let dm = [&scf_data.density_matrix[0]].as_ref().to_rstsr(&device);
-        println!("Density matrix:");
-        println!("{:10.6}", dm.i((.., .., 0)));
-
-        let mo_coeff = (&scf_data.eigenvectors[0]).to_rstsr(&device);
-        println!("MO coefficients:");
-        println!("{:10.6}", mo_coeff);
-
         let mol = &scf_data.mol;
-        let j_rstsr = generate_vj_ri_direct_with_rstsr(dm.view(), mol, 50000000);
-        println!("J matrix (upper triangular):");
-        println!("{j_rstsr:10.6}");
+        // full batch
+        let j_rstsr = generate_vj_ri_direct_with_rstsr(dm.view(), mol, 10000);
+        let fp = fingerprint_f64(j_rstsr.i((.., .., 0)));
+        let ref_fp = 37.83424292927407;
+        assert!((fp / ref_fp - 1.0).abs() < 1e-5);
+
+        // small batch
+        let j_rstsr = generate_vj_ri_direct_with_rstsr(dm.view(), mol, 16);
+        let fp = fingerprint_f64(j_rstsr.i((.., .., 0)));
+        let ref_fp = 37.83424292927407;
+        assert!((fp / ref_fp - 1.0).abs() < 1e-5);
     }
 
     fn initialize_nh3() -> SCF {
         let input_token = r##"
 [ctrl]
      print_level =          2
+     method =               "hf"
      basis_path =           "basis-set-pool/def2-TZVP"
      auxbas_path =          "basis-set-pool/def2-SVP-JKFIT"
      eri_type =             "ri-v"

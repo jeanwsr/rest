@@ -1,8 +1,11 @@
 //! rest_tensor to RSTSR interchange.
 
+use rayon::prelude::*;
 use rstsr::prelude::*;
 use rstsr_core::{prelude_dev::OpAssignAPI, storage::DeviceCreationAnyAPI};
 use tensors::{BasicMatrix, MatrixFull};
+
+/* #region interchange between rstsr and rest_tensor */
 
 // In REST, we always use DeviceBLAS as backend in most cases.
 pub type Tsr<T> = Tensor<T, DeviceBLAS, IxD>;
@@ -109,3 +112,21 @@ where
         slice_of_refs.as_slice().to_rstsr(device)
     }
 }
+
+/* #endregion */
+
+/* #region general utilities */
+
+/// Fingerprint for f64 tensor.
+///
+/// This function corresponds to `pyscf.lib.fingerprint`, but will be column-major.
+pub fn fingerprint_f64(tsr: TsrView<f64>) -> f64 {
+    let tsr = tsr.reshape(-1);
+    tsr.iter()
+        .into_par_iter()
+        .enumerate()
+        .fold(|| 0.0_f64, |acc, (i, &x)| acc + x * (i as f64).cos())
+        .reduce(|| 0.0_f64, |a, b| a + b)
+}
+
+/* #endregion */
