@@ -548,6 +548,7 @@ pub fn calc_batch_size<T>(unit_flop: usize, mem_avail: Option<f64>, mem_factor: 
 /// # Example
 ///
 /// ```rust
+/// # use pyrest::grad::rhf::blocksize_partition;
 /// let indices = [1, 3, 6, 7, 10, 15, 16, 19];
 /// let partitions = blocksize_partition(&indices, 4);
 /// // A info of `[Warn] Batch size is too small: 15 - 10 > 4` will be printed.
