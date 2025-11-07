@@ -2,6 +2,7 @@ use rstsr::prelude::*;
 use rest_libcint::prelude::*;
 use tensors::{BasicMatrix, MatrixFull, MatrixUpper};
 use crate::molecule_io::Molecule;
+use crate::utilities::memory_batch::{blocksize_partition};
 
 type Tsr<T> = Tensor<T, DeviceBLAS, IxD>;
 type TsrView<'a, T> = TensorView<'a, T, DeviceBLAS, IxD>;
@@ -24,7 +25,7 @@ pub(crate) fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Mole
 
     // get partition
     let aux_loc = &mol.cgto_loc()[(n_basis_shell as usize)..];
-    let partition = crate::grad::rhf::blocksize_partition(&aux_loc, block_size);
+    let partition = blocksize_partition(&aux_loc, block_size);
 
     // int2c2e (may be stored in SCF iteration, generate on-the-fly costs some but not that much)
     let tsr_int2c2e = {
