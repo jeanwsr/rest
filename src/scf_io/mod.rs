@@ -6,6 +6,8 @@ use crate::dft::{numerical_density, DFTType, Grids};
 use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges};
 use crate::mpi_io::{mpi_broadcast, mpi_broadcast_matrixfull, mpi_broadcast_vector, mpi_reduce, MPIOperator};
 use crate::utilities::{create_pool, TimeRecords};
+use crate::utilities::memory_batch::calc_batch_size;
+
 ////use blas_src::openblas::dgemm;
 mod addons;
 mod fchk;
@@ -3033,7 +3035,7 @@ impl SCF {
                 let used_memory = sys_info.process(pid).unwrap().memory() as f64 / 1024.0 / 1024.0;
                 max_memory - used_memory
             });
-            let aux_batch_size = crate::grad::rhf::calc_batch_size::<f64>(nao * nao, mem_avail, None, Some(naux * naux));
+            let aux_batch_size = calc_batch_size::<f64>(nao * nao, mem_avail, None, Some(naux * naux));
             aux_batch_size.min(MAX_BLOCK_SIZE).max(MIN_BLOCK_SIZE)
         });
 

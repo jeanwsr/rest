@@ -1,8 +1,11 @@
+pub mod memory_batch;
+
 use clap::{Command, Arg, ArgMatches};
 use rayon::ThreadPoolBuildError;
 use time::{DateTime,Local};
 use std::{time::Instant, collections::HashMap, ops::Range};
 use regex::Regex;
+
 enum DebugTiming {
    Yes,
    Not,

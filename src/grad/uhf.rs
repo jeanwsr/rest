@@ -6,7 +6,7 @@ use crate::grad::traits::GradAPI;
 use crate::scf_io;
 use crate::scf_io::SCF;
 use crate::Molecule;
-use num_traits::ToPrimitive;
+use crate::utilities::memory_batch::{calc_batch_size, blocksize_partition};
 use rayon::prelude::*;
 use rest_libcint::prelude::*;
 use rstsr::prelude::*;
@@ -517,7 +517,7 @@ mod debug {
         println!("Time elapsed: {:?}", time.elapsed());
     }
 
-    fn test_with_scf(scf_data: &SCF) -> RIUHFGradient {
+    fn test_with_scf(scf_data: &'_ SCF) -> RIUHFGradient<'_> {
         let mut scf_grad = RIUHFGradient::new(&scf_data);
         scf_grad.calc();
 
