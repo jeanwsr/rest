@@ -69,11 +69,16 @@
     - `force`     输出分子受力信息
 - `cube_orb_setting`: 取值[f64;2]。`cube_orb`格点参数设置。前一个值(margin)是边界信息，第二个值(num_grids)是生成格点的数目。缺省值为[3.0, 80.0]
 - `cube_orb_indices`: 取值Vec\<[usize;3]\>。
-	- 指定需要生成cube信息的轨道信息。缺省为空，即`[]`
+	- 指定需要生成cube文件的一组轨道。缺省为空，即`[]`
     - 每一个矢量元素`[usize;3]`代表一组轨道信息：
     - 第一个值(start_orb)为起始轨道的index
-    - 第二个值(end_orb)为截止轨道的index
+    - 第二个值(end_orb)为截止轨道的index，与start_orb组成闭区间(closed interval)
     - 第三个值(i_spin)是这组轨道所在的自旋通道。0为alpha自旋;1为beta自旋
+    - **注意**：REST的轨道排序从0开始。因此，因此第一个轨道是0。如果HOMO是第X个轨道，在REST的排序是X-1
+	- 举例来说：闭壳层基态苯分子体系的HOMO-1、HOMO和LUMO是第20、21和22个轨道，在REST中的排序是19、20和21。打印alpha自旋通道上这三个轨道的设置是[[19,21,0]]
+- `cube_orb_type`: 取值String类型。指定生成的cube文件类型：
+  - `wavefunction`: 生成轨道波函数的cube文件（缺省）
+  - `density`: 生成轨道概率密度的cube文件（|ψ|²）
 
 ## 计算方法相关关键词（Keyword）
 - `xc`：取值String类型。调用的电子结构计算方法。目前REST支持
