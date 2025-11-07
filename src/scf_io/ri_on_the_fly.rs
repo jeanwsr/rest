@@ -8,6 +8,65 @@ type Tsr<T> = Tensor<T, DeviceBLAS, IxD>;
 type TsrView<'a, T> = TensorView<'a, T, DeviceBLAS, IxD>;
 type TsrMut<'a, T> = TensorMut<'a, T, DeviceBLAS, IxD>;
 
+/// Generate Coulomb (J) matrix on-the-fly using RI direct method.
+///
+/// This function is low-level implementation, using RSTSR tensors as input and output. For
+/// high-level interface (using rest_tensors as input and output), please refer to
+/// [`generate_vj_ri_direct`].
+///
+/// # Parameters
+///
+/// - `dms`: [`TsrView<f64>`]
+///
+///   - Density matrices in shape (nao, nao, nset), stored in f-contiguous order.
+///   - We will check `ndim == 3`. Please expand dimension if necessary, especially for RHF case
+///     where `nset = 1`.
+///   - This matrix is assumed to be in AO basis.
+///   - This matrix is assumed to be symmetric. We will not perform symmetry check or symmetrize
+///     operation.
+///
+/// - `mol_obj`: [`Molecule`]
+///
+///   - Please make sure auxiliary basis is assigned to this molecule object.
+///
+/// - `block_size`: `usize`
+///
+///   - Block size for auxiliary basis partitioning. This value controls memory usage.
+///
+/// # Returns
+///
+/// - [`Tsr<f64>`]
+///
+///   - Coulomb (J) matrices in shape (nao_tp, nset), stored in f-contiguous order.
+///   - Here `nao_tp = nao * (nao + 1) / 2` is the number of elements in the upper-triangular part
+///     of the density matrix.
+///   - The output matrices are in packed upper-triangular format.
+///
+/// # Formula and Algorithm
+///
+/// $$
+/// \begin{align*}
+/// \mathscr{T}_P^\text{1} [\mathbf{D}^\mathbb{A}] &= \sum_{\kappa \lambda} g_{\kappa \lambda, P}
+/// D_{\kappa \lambda}^\mathbb{A} \tag{eq.1} \\
+/// \mathscr{T}_P^\text{2} [\mathbf{D}^\mathbb{A}] &= \sum_{Q} (\mathbf{J}^{-1})_{PQ}
+/// \mathscr{T}_Q^\text{1} [\mathbf{D}^\mathbb{A}] \tag{eq.2} \\
+/// J_{\mu \nu} [\mathbf{D}^\mathbb{A}] &= \sum_{P} g_{\mu \nu, P} \mathscr{T}_P^\text{2}
+/// [\mathbf{D}^\mathbb{A}] \tag{eq.3}
+/// \end{align*}
+/// $$
+/// 
+/// - AO indices ($\mu \nu$, $\kappa, \lambda$) are in packed upper-triangular format.
+/// - Auxiliary basis are batched, sparately in (eq.1) and (eq.3).
+/// - (eq.2) is solved using general linear solver.
+/// 
+/// Fixed memory requirement:
+/// 
+/// - Storage of $\mathscr{T}_P^\text{1} [\mathbf{D}^\mathbb{A}]$ and $\mathscr{T}_P^\text{2} [\mathbf{D}^\mathbb{A}]$, which costs (naux * nset * 2).
+/// - Storage of decomposed or inversed 2c-2e ERI $J_{PQ}$, which costs approximately (naux * naux).
+/// 
+/// Batched memory requirement (controlled by `block_size`):
+/// 
+/// - Storage of 3c-2e ERI $g_{\kappa \lambda, P}$ for a batch of auxiliary basis, which costs (nao_tp * block_size).
 pub(crate) fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, block_size: usize) -> Tsr<f64> {
     // dm shape: (nao, nao, nset) in f-contig
     assert!(dms.ndim() == 3, "DM must have 3 dimensions");
