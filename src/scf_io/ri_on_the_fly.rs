@@ -1,8 +1,8 @@
-use rstsr::prelude::*;
-use rest_libcint::prelude::*;
-use tensors::{BasicMatrix, MatrixFull, MatrixUpper};
 use crate::molecule_io::Molecule;
-use crate::utilities::memory_batch::{blocksize_partition};
+use crate::utilities::memory_batch::blocksize_partition;
+use rest_libcint::prelude::*;
+use rstsr::prelude::*;
+use tensors::{BasicMatrix, MatrixFull, MatrixUpper};
 
 type Tsr<T> = Tensor<T, DeviceBLAS, IxD>;
 type TsrView<'a, T> = TensorView<'a, T, DeviceBLAS, IxD>;
@@ -11,7 +11,7 @@ type TsrMut<'a, T> = TensorMut<'a, T, DeviceBLAS, IxD>;
 pub(crate) fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, block_size: usize) -> Tsr<f64> {
     // dm shape: (nao, nao, nset) in f-contig
     assert!(dms.ndim() == 3, "DM must have 3 dimensions");
-    
+
     let mut mol = mol_obj.initialize_cint(true);
     let mut aux = mol_obj.make_auxmol_fake().initialize_cint(false);
 
@@ -29,7 +29,8 @@ pub(crate) fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Mole
 
     // int2c2e (may be stored in SCF iteration, generate on-the-fly costs some but not that much)
     let tsr_int2c2e = {
-        let shls_slice = [[n_basis_shell, n_basis_shell + n_auxbas_shell], [n_basis_shell, n_basis_shell + n_auxbas_shell]];
+        let shls_slice =
+            [[n_basis_shell, n_basis_shell + n_auxbas_shell], [n_basis_shell, n_basis_shell + n_auxbas_shell]];
         let (out, shape) = mol.integral_s1::<int2c2e>(Some(&shls_slice));
         rt::asarray((out, shape.f(), &device))
     };
@@ -50,7 +51,8 @@ pub(crate) fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Mole
     let mut idx_ao = 0;
     for &[shl0, shl1] in &partition {
         let nbatch_ao = aux_loc[shl1] - aux_loc[shl0];
-        let shls_slice = [[0, n_basis_shell], [0, n_basis_shell], [n_basis_shell + shl0 as i32, n_basis_shell + shl1 as i32]];
+        let shls_slice =
+            [[0, n_basis_shell], [0, n_basis_shell], [n_basis_shell + shl0 as i32, n_basis_shell + shl1 as i32]];
         let int3c2e_batch = {
             let (out, shape) = mol.integral_s2ij::<int3c2e>(Some(&shls_slice));
             rt::asarray((out, shape.f(), &device))
@@ -68,7 +70,8 @@ pub(crate) fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Mole
     let mut idx_ao = 0;
     for &[shl0, shl1] in &partition {
         let nbatch_ao = aux_loc[shl1] - aux_loc[shl0];
-        let shls_slice = [[0, n_basis_shell], [0, n_basis_shell], [n_basis_shell + shl0 as i32, n_basis_shell + shl1 as i32]];
+        let shls_slice =
+            [[0, n_basis_shell], [0, n_basis_shell], [n_basis_shell + shl0 as i32, n_basis_shell + shl1 as i32]];
         let int3c2e_batch = {
             let (out, shape) = mol.integral_s2ij::<int3c2e>(Some(&shls_slice));
             rt::asarray((out, shape.f(), &device))
@@ -77,12 +80,16 @@ pub(crate) fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Mole
         js_tp.matmul_from(&int3c2e_batch, &scr_js.i(slc), 1.0, 1.0);
         idx_ao += nbatch_ao;
     }
-    
+
     // returns upper triangular part
     js_tp
 }
 
-pub(crate) fn generate_vj_ri_direct(dms: &[MatrixFull<f64>], mol_obj: &Molecule, block_size: usize) -> Vec<MatrixUpper<f64>> {
+pub(crate) fn generate_vj_ri_direct(
+    dms: &[MatrixFull<f64>],
+    mol_obj: &Molecule,
+    block_size: usize,
+) -> Vec<MatrixUpper<f64>> {
     // dm shape: (nao, nao, nset) in f-contig
     let device = DeviceBLAS::default();
     let nao = dms[0].size()[0];
