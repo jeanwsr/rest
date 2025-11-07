@@ -1,8 +1,9 @@
 use crate::molecule_io::Molecule;
 use crate::utilities::memory_batch::blocksize_partition;
+use crate::utilities::rstsr_interchange::*;
 use rest_libcint::prelude::*;
 use rstsr::prelude::*;
-use tensors::{BasicMatrix, MatrixFull, MatrixUpper};
+use tensors::{MatrixFull, MatrixUpper};
 
 type Tsr<T> = Tensor<T, DeviceBLAS, IxD>;
 type TsrView<'a, T> = TensorView<'a, T, DeviceBLAS, IxD>;
@@ -54,19 +55,21 @@ type TsrMut<'a, T> = TensorMut<'a, T, DeviceBLAS, IxD>;
 /// [\mathbf{D}^\mathbb{A}] \tag{eq.3}
 /// \end{align*}
 /// $$
-/// 
+///
 /// - AO indices ($\mu \nu$, $\kappa, \lambda$) are in packed upper-triangular format.
 /// - Auxiliary basis are batched, sparately in (eq.1) and (eq.3).
 /// - (eq.2) is solved using general linear solver.
-/// 
+///
 /// Fixed memory requirement:
-/// 
-/// - Storage of $\mathscr{T}_P^\text{1} [\mathbf{D}^\mathbb{A}]$ and $\mathscr{T}_P^\text{2} [\mathbf{D}^\mathbb{A}]$, which costs (naux * nset * 2).
+///
+/// - Storage of $\mathscr{T}_P^\text{1} [\mathbf{D}^\mathbb{A}]$ and $\mathscr{T}_P^\text{2}
+///   [\mathbf{D}^\mathbb{A}]$, which costs (naux * nset * 2).
 /// - Storage of decomposed or inversed 2c-2e ERI $J_{PQ}$, which costs approximately (naux * naux).
-/// 
+///
 /// Batched memory requirement (controlled by `block_size`):
-/// 
-/// - Storage of 3c-2e ERI $g_{\kappa \lambda, P}$ for a batch of auxiliary basis, which costs (nao_tp * block_size).
+///
+/// - Storage of 3c-2e ERI $g_{\kappa \lambda, P}$ for a batch of auxiliary basis, which costs
+///   (nao_tp * block_size).
 pub(crate) fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, block_size: usize) -> Tsr<f64> {
     // dm shape: (nao, nao, nset) in f-contig
     assert!(dms.ndim() == 3, "DM must have 3 dimensions");
@@ -151,20 +154,13 @@ pub(crate) fn generate_vj_ri_direct(
 ) -> Vec<MatrixUpper<f64>> {
     // dm shape: (nao, nao, nset) in f-contig
     let device = DeviceBLAS::default();
-    let nao = dms[0].size()[0];
-    let nao_tp = (nao + 1) * nao / 2;
-    let nset = dms.len();
+    let dms_rstsr = dms.to_rstsr(&device);
 
-    // Vec<MatrixFull> -> Tsr
-    let mut dms_rstsr = rt::zeros(([nao, nao, nset].f(), &device));
-    for (iset, dm) in dms.iter().enumerate() {
-        let dm = rt::asarray((&dm.data, [nao, nao].f(), &device));
-        dms_rstsr.i_mut((.., .., iset)).assign(dm);
-    }
+    let nao = dms_rstsr.shape()[0];
+    let nset = dms_rstsr.shape()[2];
+    let nao_tp = (nao + 1) * nao / 2;
 
     let js_rstsr = generate_vj_ri_direct_with_rstsr(dms_rstsr.view(), mol_obj, block_size);
-
-    // println!("js_rstsr: {:12.6?}", js_rstsr);
 
     // Tsr -> Vec<MatrixUpper>
     let mut js = vec![];
@@ -174,4 +170,61 @@ pub(crate) fn generate_vj_ri_direct(
     }
 
     js
+}
+
+#[cfg(test)]
+mod debug {
+    use super::*;
+    use crate::scf_io::SCF;
+
+    #[test]
+    fn test_nh3() {
+        let scf_data = initialize_nh3();
+        let device = DeviceBLAS::default();
+
+        let dm = [&scf_data.density_matrix[0]].as_ref().to_rstsr(&device);
+        println!("Density matrix:");
+        println!("{:10.6}", dm.i((.., .., 0)));
+
+        let mo_coeff = (&scf_data.eigenvectors[0]).to_rstsr(&device);
+        println!("MO coefficients:");
+        println!("{:10.6}", mo_coeff);
+
+        let mol = &scf_data.mol;
+        let j_rstsr = generate_vj_ri_direct_with_rstsr(dm.view(), mol, 50000000);
+        println!("J matrix (upper triangular):");
+        println!("{j_rstsr:10.6}");
+    }
+
+    fn initialize_nh3() -> SCF {
+        let input_token = r##"
+[ctrl]
+     print_level =          2
+     basis_path =           "basis-set-pool/def2-TZVP"
+     auxbas_path =          "basis-set-pool/def2-SVP-JKFIT"
+     eri_type =             "ri-v"
+     charge =               0.0
+     spin =                 1.0
+     spin_polarization =    false
+     initial_guess=         "sad"
+     mixer =                "diis"
+     num_threads =          16
+
+[geom]
+    name = "NH3"
+    unit = "Angstrom"
+    position = """
+        N  0.0  0.0  0.0
+        H  0.0  1.5  1.0
+        H  1.4  1.1  0.0
+        H  1.2  0.0  1.3
+    """
+"##;
+        let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
+        let (mut ctrl, mut geom) = crate::ctrl_io::parse_ctl_from_json(&keys).unwrap();
+        let mol = Molecule::build_native(ctrl, geom, None).unwrap();
+        let mut scf_data = crate::scf_io::SCF::build(mol, &None);
+        crate::scf_io::scf_without_build(&mut scf_data, &None);
+        return scf_data;
+    }
 }
