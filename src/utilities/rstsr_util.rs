@@ -113,6 +113,28 @@ where
     }
 }
 
+impl<T> RestTensorIntoRstsrTsrAPI<T> for Vec<T>
+where
+    T: Clone,
+{
+    fn into_rstsr(self, device: &DeviceBLAS) -> Tsr<T> {
+        let n = self.len();
+        let layout = Layout::new(vec![n], vec![1], 0).unwrap();
+        rt::asarray((self, layout, device))
+    }
+}
+
+impl<T> RestTensorToRstsrTsrAPI<T> for &Vec<T>
+where
+    T: Clone,
+{
+    fn to_rstsr(&self, device: &DeviceBLAS) -> Tsr<T> {
+        let n = self.len();
+        let layout = Layout::new(vec![n], vec![1], 0).unwrap();
+        rt::asarray((self.to_vec(), layout, device))
+    }
+}
+
 /* #endregion */
 
 /* #region general utilities */

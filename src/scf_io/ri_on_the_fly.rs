@@ -1,6 +1,7 @@
 use crate::molecule_io::Molecule;
 use crate::utilities::memory_batch::*;
 use crate::utilities::rstsr_util::*;
+use rayon::prelude::*;
 use rest_libcint::prelude::*;
 use rstsr::prelude::*;
 use tensors::{MatrixFull, MatrixUpper};
@@ -45,10 +46,10 @@ type TsrMut<'a, T> = TensorMut<'a, T, DeviceBLAS, IxD>;
 /// J_{\mu \nu}[\mathbf{D}^\mathbb{A}] = \sum_{P} \sum_{\kappa \lambda} Y_{\mu \nu, P}
 /// Y_{\kappa \lambda, P} D_{\kappa \lambda}^\mathbb{A}
 /// $$
-/// 
+///
 /// - AO indices ($\mu \nu$, $\kappa, \lambda$) are in packed upper-triangular format.
 /// - This function implements the above formula directly using matrix multiplications.
-/// 
+///
 /// There is virtually no memory requirement other than input and output tensors.
 pub fn generate_vj_ri_incore_with_rstsr(cderi: TsrView<f64>, dms: TsrView<f64>) -> Tsr<f64> {
     assert_eq!(dms.ndim(), 3, "DM must have 3 dimensions");
@@ -109,6 +110,8 @@ pub fn generate_vj_ri_incore_with_rstsr(cderi: TsrView<f64>, dms: TsrView<f64>) 
 /// - `block_size`: `usize`
 ///
 ///   - Block size for auxiliary basis partitioning. This value controls memory usage.
+///   - To give a proper value, please refer to memory estimation function
+///     [`mem_estimate_vj_ri_direct`].
 ///
 /// # Returns
 ///
@@ -224,6 +227,8 @@ pub fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, b
 
 /// Estimate memory requirement for VJ RI direct method.
 ///
+/// This function corresponds to [`generate_vj_ri_direct_with_rstsr`].
+///
 /// # Parameters
 ///
 /// - `nao`: Number of atomic orbitals.
@@ -262,6 +267,152 @@ pub fn generate_vj_ri_direct(dms: &[MatrixFull<f64>], mol_obj: &Molecule, block_
 
 /* #endregion ri-vj direct */
 
+/* #region ri-vk incore */
+
+/// Generate Exchange (K) matrix using RI incore method with MO coefficients and occupations.
+///
+/// This function is low-level implementation, using RSTSR tensors as input and output.
+///
+/// # Parameters
+///
+/// - `cderi`: [`TsrView<f64>`]
+///
+///   - Cholesky decomposed 3c-2e ERI in shape (nao_tp, naux), stored in f-contiguous order.
+///   - `nao_tp = nao * (nao + 1) / 2`, where `nao` is number of atomic orbitals.
+///   - This tensor is assumed to be in AO basis.
+///
+/// - `mo_coeff`: [`TsrView<f64>`]
+///
+///   - Molecular orbital coefficients in shape (nao, nmo, nset), stored in f-contiguous order.
+///   - We will check `ndim == 3`. Please expand dimension if necessary, especially for RHF case
+///     where `nset = 1`.
+///
+/// - `mo_occ`: [`TsrView<f64>`]
+///
+///   - Molecular orbital occupations in shape (nmo, nset), stored in f-contiguous order.
+///   - We will check `ndim == 2`. Please expand dimension if necessary, especially for RHF case
+///     where `nset = 1`.
+///
+/// - `batch_size`: `usize`
+///
+///   - Batch size for auxiliary basis partitioning. This value controls memory usage.
+///
+/// # Returns
+///
+/// - [`Tsr<f64>`]
+///
+///   - Exchange (K) matrices in shape (nao, nao, nset), stored in f-contiguous order.
+///   - K matrices are symmetric by definition in real arithmetic.
+///
+/// # Formula and Algorithm
+///
+/// $$
+/// \begin{align*}
+/// Y_{\mu i, P}^\mathbb{A} &= \sum_{\nu} \sqrt{n_i} C_{\nu i}^\mathbb{A} Y_{\mu \nu, P} \\
+/// K_{\mu \nu} [\mathbf{D}^\mathbb{A}] &= \sum_{P i} Y_{\mu i, P}^\mathbb{A} Y_{\nu i,
+/// P}^\mathbb{A} \end{align*}
+/// $$
+///
+/// Fixed memory requirement:
+///
+/// - Storage of output K matrix, which costs (nao * nao * nset).
+///
+/// Batched memory requirement (controlled by `batch_size`):
+///
+/// - Storage of half-transformed integrals $Y_{\mu i, P}^\mathbb{A}$, which costs (nao * nocc *
+///   batch_size). Note that `nocc` can be different for different sets (spin-channels for example),
+///   and this can be determined by the largest `nocc` among all sets.
+/// 
+/// Thread memory requirement:
+/// 
+/// - Storage of cderi per auxiliary, which costs (nao * nao * nthread).
+pub fn generate_vk_ri_incore_coeff_with_rstsr(
+    cderi: TsrView<f64>,
+    mo_coeff: TsrView<f64>,
+    mo_occ: TsrView<f64>,
+    batch_size: usize,
+) -> Tsr<f64> {
+    assert_eq!(mo_coeff.ndim(), 3, "Molecular coefficients must have 3 dimensions");
+    assert_eq!(mo_occ.ndim(), 2, "Molecular occupations must have 2 dimensions");
+    assert_eq!(cderi.ndim(), 2, "Cholesky ERI must have 2 dimensions");
+
+    // get shapes
+    let nao = mo_coeff.shape()[0];
+    let nmo = mo_coeff.shape()[1];
+    let nset = mo_coeff.shape()[2];
+    let naux = cderi.shape()[1];
+    let nao_tp = (nao + 1) * nao / 2;
+    let device = cderi.device().clone();
+
+    // shape check
+    assert_eq!(cderi.shape(), &[nao_tp, naux], "Cholesky ERI must have shape (nao_tp, naux)");
+
+    // check occupation not less than zero
+    let occ_neg = rt::lt(&mo_occ, 0.0).sum();
+    if occ_neg > 0 {
+        println!("[WARN] in generate_vk_ri_incore_coeff_with_rstsr, negative occupation found: {occ_neg} elements < 0");
+    }
+
+    // compress mo_coeff with occupation
+    let mut occ_coeff_list = vec![];
+    for iset in 0..nset {
+        // generate occ_coeff by sqrt(occupation) * coefficient
+        let occ_mask = rt::gt(mo_occ.i((.., iset)), f64::EPSILON).into_vec();
+        let occ_coeff = mo_coeff.i((.., .., iset)).bool_select(-1, &occ_mask);
+        let occ = mo_occ.i((.., iset)).bool_select(-1, &occ_mask).sqrt();
+        occ_coeff_list.push(occ_coeff * occ.i((None, ..)));
+    }
+
+    // initialize vk as result
+    let mut ks = rt::zeros(([nao, nao, nset].f(), &device));
+
+    // process each auxiliary function
+    (0..naux).step_by(batch_size).for_each(|iaux| {
+        // get and unpack cderi for this auxiliary function
+        // cderi_iaux: (nao, nao, nbatch)
+        let nbatch = if iaux + batch_size <= naux { batch_size } else { naux - iaux };
+
+        for iset in 0..nset {
+            // half-transformed integrals: (nao, nocc, nbatch)
+            let occ_coeff = &occ_coeff_list[iset];
+            let nocc = occ_coeff.shape()[1];
+            let cderi_half = unsafe { rt::empty(([nao, nocc, nbatch].f(), &device)) };
+            (0..nbatch).into_par_iter().for_each(|p| {
+                let cderi_iaux = cderi.i((.., iaux + p)).unpack_tri(Upper, FlagSymm::Sy);
+                let cderi_half_iaux = cderi_half.i((.., .., p));
+                let mut cderi_half_iaux = unsafe { cderi_half_iaux.force_mut() };
+                cderi_half_iaux.matmul_from(&cderi_iaux, &occ_coeff, 1.0, 0.0);
+            });
+            // build vk contribution
+            let cderi_half = cderi_half.into_shape([nao, nocc * nbatch]);
+            ks.i_mut((.., .., iset)).matmul_from(&cderi_half, &cderi_half.t(), 1.0, 1.0);
+        }
+    });
+    ks
+}
+
+/// Estimate memory requirement for VK RI incore method with MO coefficients and occupations.
+/// 
+/// This function corresponds to [`generate_vk_ri_incore_coeff_with_rstsr`].
+/// 
+/// # Parameters
+/// 
+/// - `nao`: Number of atomic orbitals.
+/// - `naux`: Number of auxiliary basis functions.
+/// - `nocc_max`: Maximum number of occupied molecular orbitals among all sets.
+/// - `nset`: Number of density matrix sets.
+pub fn mem_estimate_vk_ri_incore_coeff(nao: usize, naux: usize, nocc_max: usize, nset: usize) -> MemEstimate {
+    // int3c2e batch
+    let batched = nao * nocc_max;
+    // ks
+    let fixed = nao * nao * nset;
+    // cderi per auxiliary
+    let thread = nao * nao;
+    MemEstimate { batched, fixed, thread }
+}
+
+/* #endregion ri-vk incore */
+
 #[cfg(test)]
 mod debug {
     use super::*;
@@ -292,6 +443,28 @@ mod debug {
         let j_rstsr = generate_vj_ri_direct_with_rstsr(dm.view(), mol, 16);
         let fp = fingerprint_f64(j_rstsr.i((.., .., 0)));
         let ref_fp = 37.83424292927407;
+        assert!((fp / ref_fp - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_nh3_k() {
+        let scf_data = initialize_nh3();
+        let device = DeviceBLAS::default();
+
+        let mo_coeff = [&scf_data.eigenvectors[0]].as_ref().to_rstsr(&device);
+        let mo_occ = (&scf_data.occupation[0]).to_rstsr(&device).into_slice((.., None));
+
+        // incore, full batch
+        let rimatr = scf_data.rimatr.as_ref().unwrap().0.to_rstsr_view(&device);
+        let k_rstsr = generate_vk_ri_incore_coeff_with_rstsr(rimatr.view(), mo_coeff.view(), mo_occ.view(), 10000);
+        let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
+        let ref_fp = 12.950224351107128;
+        assert!((fp / ref_fp - 1.0).abs() < 1e-5);
+
+        // incore, small batch
+        let k_rstsr = generate_vk_ri_incore_coeff_with_rstsr(rimatr.view(), mo_coeff.view(), mo_occ.view(), 16);
+        let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
+        let ref_fp = 12.950224351107128;
         assert!((fp / ref_fp - 1.0).abs() < 1e-5);
     }
 
