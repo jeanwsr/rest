@@ -4,6 +4,7 @@ use crate::utilities::rstsr_util::*;
 use rayon::prelude::*;
 use rest_libcint::prelude::*;
 use rstsr::prelude::*;
+use rstsr_core::prelude_dev::uninitialized_vec;
 use tensors::{MatrixFull, MatrixUpper};
 
 type Tsr<T> = Tensor<T, DeviceBLAS, IxD>;
@@ -107,7 +108,7 @@ pub fn generate_vj_ri_incore_with_rstsr(cderi: TsrView<f64>, dms: TsrView<f64>) 
 ///
 ///   - Please make sure auxiliary basis is assigned to this molecule object.
 ///
-/// - `block_size`: `usize`
+/// - `batch_size`: `usize`
 ///
 ///   - Block size for auxiliary basis partitioning. This value controls memory usage.
 ///   - To give a proper value, please refer to memory estimation function
@@ -143,11 +144,11 @@ pub fn generate_vj_ri_incore_with_rstsr(cderi: TsrView<f64>, dms: TsrView<f64>) 
 ///   [\mathbf{D}^\mathbb{A}]$, which costs (naux * nset * 2).
 /// - Storage of decomposed or inversed 2c-2e ERI $J_{PQ}$, which costs approximately (naux * naux).
 ///
-/// Batched memory requirement (controlled by `block_size`):
+/// Batched memory requirement (controlled by `batch_size`):
 ///
 /// - Storage of 3c-2e ERI $g_{\kappa \lambda, P}$ for a batch of auxiliary basis, which costs
-///   (nao_tp * block_size).
-pub fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, block_size: usize) -> Tsr<f64> {
+///   (nao_tp * batch_size).
+pub fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, batch_size: usize) -> Tsr<f64> {
     // dm shape: (nao, nao, nset) in f-contig
     assert_eq!(dms.ndim(), 3, "DM must have 3 dimensions");
 
@@ -160,17 +161,16 @@ pub fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, b
     let nao_tp = (nao + 1) * nao / 2;
     let naux = aux.cgto_loc().last().unwrap().clone();
     let device = dms.device().clone();
-    let n_basis_shell = mol_obj.cint_bas.len() as i32;
-    let n_auxbas_shell = mol_obj.cint_aux_bas.len() as i32;
+    let nbas = mol_obj.cint_bas.len() as i32;
+    let nbas_aux = mol_obj.cint_aux_bas.len() as i32;
 
     // get partition
-    let aux_loc = &mol.cgto_loc()[(n_basis_shell as usize)..];
-    let partition = blocksize_partition(&aux_loc, block_size);
+    let aux_loc = &mol.cgto_loc()[(nbas as usize)..];
+    let partition = blocksize_partition(&aux_loc, batch_size);
 
     // int2c2e (may be stored in SCF iteration, generate on-the-fly costs some but not that much)
     let tsr_int2c2e = {
-        let shls_slice =
-            [[n_basis_shell, n_basis_shell + n_auxbas_shell], [n_basis_shell, n_basis_shell + n_auxbas_shell]];
+        let shls_slice = [[nbas, nbas + nbas_aux], [nbas, nbas + nbas_aux]];
         let (out, shape) = mol.integral_s1::<int2c2e>(Some(&shls_slice));
         rt::asarray((out, shape.f(), &device))
     };
@@ -191,8 +191,7 @@ pub fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, b
     let mut idx_ao = 0;
     for &[shl0, shl1] in &partition {
         let nbatch_ao = aux_loc[shl1] - aux_loc[shl0];
-        let shls_slice =
-            [[0, n_basis_shell], [0, n_basis_shell], [n_basis_shell + shl0 as i32, n_basis_shell + shl1 as i32]];
+        let shls_slice = [[0, nbas], [0, nbas], [nbas + shl0 as i32, nbas + shl1 as i32]];
         let int3c2e_batch = {
             let (out, shape) = mol.integral_s2ij::<int3c2e>(Some(&shls_slice));
             rt::asarray((out, shape.f(), &device))
@@ -210,8 +209,7 @@ pub fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, b
     let mut idx_ao = 0;
     for &[shl0, shl1] in &partition {
         let nbatch_ao = aux_loc[shl1] - aux_loc[shl0];
-        let shls_slice =
-            [[0, n_basis_shell], [0, n_basis_shell], [n_basis_shell + shl0 as i32, n_basis_shell + shl1 as i32]];
+        let shls_slice = [[0, nbas], [0, nbas], [nbas + shl0 as i32, nbas + shl1 as i32]];
         let int3c2e_batch = {
             let (out, shape) = mol.integral_s2ij::<int3c2e>(Some(&shls_slice));
             rt::asarray((out, shape.f(), &device))
@@ -244,7 +242,7 @@ pub const fn mem_estimate_vj_ri_direct(nao: usize, naux: usize, nset: usize) -> 
     MemEstimate { batched, fixed, thread }
 }
 
-pub fn generate_vj_ri_direct(dms: &[MatrixFull<f64>], mol_obj: &Molecule, block_size: usize) -> Vec<MatrixUpper<f64>> {
+pub fn generate_vj_ri_direct(dms: &[MatrixFull<f64>], mol_obj: &Molecule, batch_size: usize) -> Vec<MatrixUpper<f64>> {
     // dm shape: (nao, nao, nset) in f-contig
     let device = DeviceBLAS::default();
     let dms_rstsr = dms.to_rstsr(&device);
@@ -253,7 +251,7 @@ pub fn generate_vj_ri_direct(dms: &[MatrixFull<f64>], mol_obj: &Molecule, block_
     let nset = dms_rstsr.shape()[2];
     let nao_tp = (nao + 1) * nao / 2;
 
-    let js_rstsr = generate_vj_ri_direct_with_rstsr(dms_rstsr.view(), mol_obj, block_size);
+    let js_rstsr = generate_vj_ri_direct_with_rstsr(dms_rstsr.view(), mol_obj, batch_size);
 
     // Tsr -> Vec<MatrixUpper>
     let mut js = vec![];
@@ -322,9 +320,9 @@ pub fn generate_vj_ri_direct(dms: &[MatrixFull<f64>], mol_obj: &Molecule, block_
 /// - Storage of half-transformed integrals $Y_{\mu i, P}^\mathbb{A}$, which costs (nao * nocc *
 ///   batch_size). Note that `nocc` can be different for different sets (spin-channels for example),
 ///   and this can be determined by the largest `nocc` among all sets.
-/// 
+///
 /// Thread memory requirement:
-/// 
+///
 /// - Storage of cderi per auxiliary, which costs (nao * nao * nthread).
 pub fn generate_vk_ri_incore_coeff_with_rstsr(
     cderi: TsrView<f64>,
@@ -346,6 +344,7 @@ pub fn generate_vk_ri_incore_coeff_with_rstsr(
 
     // shape check
     assert_eq!(cderi.shape(), &[nao_tp, naux], "Cholesky ERI must have shape (nao_tp, naux)");
+    assert_eq!(mo_occ.shape(), &[nmo, nset], "Molecular occupations must have shape (nmo, nset)");
 
     // check occupation not less than zero
     let occ_neg = rt::lt(&mo_occ, 0.0).sum();
@@ -392,11 +391,11 @@ pub fn generate_vk_ri_incore_coeff_with_rstsr(
 }
 
 /// Estimate memory requirement for VK RI incore method with MO coefficients and occupations.
-/// 
+///
 /// This function corresponds to [`generate_vk_ri_incore_coeff_with_rstsr`].
-/// 
+///
 /// # Parameters
-/// 
+///
 /// - `nao`: Number of atomic orbitals.
 /// - `naux`: Number of auxiliary basis functions.
 /// - `nocc_max`: Maximum number of occupied molecular orbitals among all sets.
@@ -412,6 +411,106 @@ pub fn mem_estimate_vk_ri_incore_coeff(nao: usize, naux: usize, nocc_max: usize,
 }
 
 /* #endregion ri-vk incore */
+
+/* #region ri-vk semi-incore */
+
+pub fn generate_vk_ri_semi_incore_coeff_with_rstsr(
+    mo_coeff: TsrView<f64>,
+    mo_occ: TsrView<f64>,
+    mol_obj: &Molecule,
+    batch_size: usize,
+) -> Tsr<f64> {
+    assert_eq!(mo_coeff.ndim(), 3, "Molecular coefficients must have 3 dimensions");
+    assert_eq!(mo_occ.ndim(), 2, "Molecular occupations must have 2 dimensions");
+
+    // initialize mol and aux
+    let mut mol = mol_obj.initialize_cint(true);
+    let mut aux = mol_obj.make_auxmol_fake().initialize_cint(false);
+
+    // get shapes
+    let nao = mo_coeff.shape()[0];
+    let nmo = mo_coeff.shape()[1];
+    let nset = mo_coeff.shape()[2];
+    let naux = aux.cgto_loc().last().unwrap().clone();
+    let device = mo_coeff.device().clone();
+    let nbas = mol_obj.cint_bas.len() as i32;
+    let nbas_aux = mol_obj.cint_aux_bas.len() as i32;
+    println!("[DEBUG] nao = {nao}, nmo = {nmo}, nset = {nset}, naux = {naux}");
+
+    // shape check
+    assert_eq!(mo_occ.shape(), &[nmo, nset], "Molecular occupations must have shape (nmo, nset)");
+
+    // check occupation not less than zero
+    let occ_neg = rt::lt(&mo_occ, 0.0).sum();
+    if occ_neg > 0 {
+        println!("[WARN] in generate_vk_ri_incore_coeff_with_rstsr, negative occupation found: {occ_neg} elements < 0");
+    }
+
+    // compress mo_coeff with occupation
+    let mut occ_coeff_list = vec![];
+    for iset in 0..nset {
+        // generate occ_coeff by sqrt(occupation) * coefficient
+        let occ_mask = rt::gt(mo_occ.i((.., iset)), f64::EPSILON).into_vec();
+        let occ_coeff = mo_coeff.i((.., .., iset)).bool_select(-1, &occ_mask);
+        let occ = mo_occ.i((.., iset)).bool_select(-1, &occ_mask).sqrt();
+        occ_coeff_list.push(occ_coeff * occ.i((None, ..)));
+    }
+    let nocc_max = occ_coeff_list.iter().map(|x| x.shape()[1]).max().unwrap();
+
+    // get partition
+    let aux_loc = &mol.cgto_loc()[(nbas as usize)..];
+    let partition = blocksize_partition(&aux_loc, batch_size);
+
+    // initialize vk as result
+    let mut ks: Tsr<f64> = rt::zeros(([nao, nao, nset].f(), &device));
+
+    // initialize half-transformed cderi storage
+    let mut eri_half_vec = unsafe { uninitialized_vec::<f64>(nao * nocc_max * naux).unwrap() };
+
+    // initialize int2c2e and perform cholesky decomposition
+    let tsr_int2c2e = {
+        let shls_slice = [[nbas, nbas + nbas_aux], [nbas, nbas + nbas_aux]];
+        let (out, shape) = mol.integral_s1::<int2c2e>(Some(&shls_slice));
+        rt::asarray((out, shape.f(), &device))
+    };
+    let tsr_int2c2e_l = rt::linalg::cholesky((tsr_int2c2e, Upper));
+
+    for iset in 0..nset {
+        // get half-transformed cderi for this density matrix set
+        let occ_coeff = &occ_coeff_list[iset];
+        let nocc = occ_coeff.shape()[1];
+        let eri_half: TsrMut<f64> = rt::asarray((&mut eri_half_vec, [nao, nocc, naux].f(), &device));
+
+        for &[shl0, shl1] in &partition {
+            let ao0 = aux_loc[shl0] - nao;
+            let ao1 = aux_loc[shl1] - nao;
+            let nbatch_ao = ao1 - ao0;
+            let shls_slice = [[0, nbas], [0, nbas], [nbas + shl0 as i32, nbas + shl1 as i32]];
+            let int3c2e_batch = {
+                let (out, shape) = mol.integral_s2ij::<int3c2e>(Some(&shls_slice));
+                rt::asarray((out, shape.f(), &device))
+            };
+            // half-transform
+            (0..nbatch_ao).into_par_iter().for_each(|p| {
+                let cderi_iaux = int3c2e_batch.i((.., p)).unpack_tri(Upper, FlagSymm::Sy);
+                let cderi_half_iaux = eri_half.i((.., .., ao0 + p));
+                let mut cderi_half_iaux = unsafe { cderi_half_iaux.force_mut() };
+                cderi_half_iaux.matmul_from(&cderi_iaux, &occ_coeff, 1.0, 0.0);
+            });
+        }
+
+        // solve eri_half
+        let eri_half = rt::asarray((&mut eri_half_vec, [nao * nocc, naux].f(), &device)).into_reverse_axes();
+        let cderi_half = rt::linalg::solve_triangular((tsr_int2c2e_l.t(), eri_half, Lower));
+
+        // build vk contribution
+        let cderi_half = rt::asarray((&mut eri_half_vec, [nao, nocc * naux].f(), &device));
+        ks.i_mut((.., .., iset)).matmul_from(&cderi_half, &cderi_half.t(), 1.0, 1.0);
+    }
+    ks
+}
+
+/* #endregion */
 
 #[cfg(test)]
 mod debug {
@@ -453,6 +552,7 @@ mod debug {
 
         let mo_coeff = [&scf_data.eigenvectors[0]].as_ref().to_rstsr(&device);
         let mo_occ = (&scf_data.occupation[0]).to_rstsr(&device).into_slice((.., None));
+        let mol = &scf_data.mol;
 
         // incore, full batch
         let rimatr = scf_data.rimatr.as_ref().unwrap().0.to_rstsr_view(&device);
@@ -463,6 +563,12 @@ mod debug {
 
         // incore, small batch
         let k_rstsr = generate_vk_ri_incore_coeff_with_rstsr(rimatr.view(), mo_coeff.view(), mo_occ.view(), 16);
+        let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
+        let ref_fp = 12.950224351107128;
+        assert!((fp / ref_fp - 1.0).abs() < 1e-5);
+
+        // semi-incore, small batch
+        let k_rstsr = generate_vk_ri_semi_incore_coeff_with_rstsr(mo_coeff.view(), mo_occ.view(), mol, 1024);
         let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
         let ref_fp = 12.950224351107128;
         assert!((fp / ref_fp - 1.0).abs() < 1e-5);
