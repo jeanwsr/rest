@@ -414,6 +414,68 @@ pub fn mem_estimate_vk_ri_incore_coeff(nao: usize, naux: usize, nocc_max: usize,
 
 /* #region ri-vk semi-incore */
 
+/// Generate Exchange (K) matrix using RI semi-incore method with MO coefficients and occupations.
+///
+/// This function is low-level implementation, using RSTSR tensors as input and output.
+///
+/// # Parameters
+///
+/// - `mo_coeff`: [`TsrView<f64>`]
+///
+///   - Molecular orbital coefficients in shape (nao, nmo, nset), stored in f-contiguous order.
+///   - We will check `ndim == 3`. Please expand dimension if necessary, especially for RHF case
+///     where `nset = 1`.
+///
+/// - `mo_occ`: [`TsrView<f64>`]
+///
+///   - Molecular orbital occupations in shape (nmo, nset), stored in f-contiguous order.
+///   - We will check `ndim == 2`. Please expand dimension if necessary, especially for RHF case
+///     where `nset = 1`.
+///
+/// - `mol_obj`: [`Molecule`]
+///
+///   - Please make sure auxiliary basis is assigned to this molecule object.
+///
+/// - `batch_size`: `usize`
+///
+///   - Batch size for auxiliary basis partitioning. This value controls memory usage.
+///
+/// # Returns
+///
+/// - [`Tsr<f64>`]
+///
+///   - Exchange (K) matrices in shape (nao, nao, nset), stored in f-contiguous order.
+///   - K matrices are symmetric by definition in real arithmetic.
+///
+/// # Formula and Algorithm
+///
+/// $$
+/// \begin{align*}
+/// g_{\mu i, P}^\mathbb{A} &= \sum_{\nu} \sqrt{n_i} C_{\nu i}^\mathbb{A} g_{\mu \nu, P} \\
+/// Y_{\mu i, P}^\mathbb{A} &= \sum_{Q} (\mathbf{L}^{-1})_{PQ} g_{\mu i, Q}^\mathbb{A} \\
+/// K_{\mu \nu} [\mathbf{D}^\mathbb{A}] &= \sum_{P i} Y_{\mu i, P}^\mathbb{A} Y_{\nu i,
+/// P}^\mathbb{A}
+/// \end{align*}
+/// $$
+///
+/// Only the first equation is evaluated by batch, while the second and third equations are not
+/// batched.
+///
+/// Fixed memory requirement:
+///
+/// - Storage of output K matrix, which costs (nao * nao * nset).
+/// - Storage of half-transformed integrals $Y_{\mu i, P}^\mathbb{A}$, which costs (nao * nocc_max *
+///   naux).
+/// - Storage of decomposed 2c-2e ERI $L_{PQ}$, which costs approximately (naux * naux).
+///
+/// Batched memory requirement (controlled by `batch_size`):
+///
+/// - Storage of half-transformed integrals $g_{\mu \nu, P}^\mathbb{A}$ for a batch of auxiliary
+///   basis, which costs (nao * nao * batch_size).
+/// 
+/// Thread memory requirement:
+/// 
+/// - Storage of cderi per auxiliary, which costs (nao * nao * nthread).
 pub fn generate_vk_ri_semi_incore_coeff_with_rstsr(
     mo_coeff: TsrView<f64>,
     mo_occ: TsrView<f64>,
@@ -508,6 +570,26 @@ pub fn generate_vk_ri_semi_incore_coeff_with_rstsr(
         ks.i_mut((.., .., iset)).matmul_from(&cderi_half, &cderi_half.t(), 1.0, 1.0);
     }
     ks
+}
+
+/// Estimate memory requirement for VK RI semi-incore method with MO coefficients and occupations.
+///
+/// This function corresponds to [`generate_vk_ri_semi_incore_coeff_with_rstsr`].
+///
+/// # Parameters
+///
+/// - `nao`: Number of atomic orbitals.
+/// - `naux`: Number of auxiliary basis functions.
+/// - `nocc_max`: Maximum number of occupied molecular orbitals among all sets.
+/// - `nset`: Number of density matrix sets.
+pub fn mem_estimate_vk_ri_semi_incore_coeff(nao: usize, naux: usize, nocc_max: usize, nset: usize) -> MemEstimate {
+    // int3c2e batch
+    let batched = nao * nao;
+    // ks, eri_half, int2c2e
+    let fixed = nao * nao * nset + nao * nocc_max * naux + nao * nao;
+    // cderi per auxiliary
+    let thread = nao * nao;
+    MemEstimate { batched, fixed, thread }
 }
 
 /* #endregion */
