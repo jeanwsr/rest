@@ -416,6 +416,11 @@ pub fn mem_estimate_vk_ri_incore_coeff(nao: usize, naux: usize, nocc_max: usize,
 
 /// Generate Exchange (K) matrix using RI semi-incore method with MO coefficients and occupations.
 ///
+/// Semi-incore here means that 3c-2e ERI are computed on-the-fly in batches, while the
+/// half-transformed integrals are stored in memory. In this way, we still need to re-evaluate all
+/// 3c-2e ERI every time we compute each component of K matrix, and still require a large amount of
+/// DRAM consumption, but less computation effort than fully direct method.
+///
 /// This function is low-level implementation, using RSTSR tensors as input and output.
 ///
 /// # Parameters
@@ -472,9 +477,9 @@ pub fn mem_estimate_vk_ri_incore_coeff(nao: usize, naux: usize, nocc_max: usize,
 ///
 /// - Storage of half-transformed integrals $g_{\mu \nu, P}^\mathbb{A}$ for a batch of auxiliary
 ///   basis, which costs (nao * nao * batch_size).
-/// 
+///
 /// Thread memory requirement:
-/// 
+///
 /// - Storage of cderi per auxiliary, which costs (nao * nao * nthread).
 pub fn generate_vk_ri_semi_incore_coeff_with_rstsr(
     mo_coeff: TsrView<f64>,
@@ -497,7 +502,6 @@ pub fn generate_vk_ri_semi_incore_coeff_with_rstsr(
     let device = mo_coeff.device().clone();
     let nbas = mol_obj.cint_bas.len() as i32;
     let nbas_aux = mol_obj.cint_aux_bas.len() as i32;
-    println!("[DEBUG] nao = {nao}, nmo = {nmo}, nset = {nset}, naux = {naux}");
 
     // shape check
     assert_eq!(mo_occ.shape(), &[nmo, nset], "Molecular occupations must have shape (nmo, nset)");
@@ -524,7 +528,7 @@ pub fn generate_vk_ri_semi_incore_coeff_with_rstsr(
     let partition = blocksize_partition(&aux_loc, batch_size);
 
     // initialize vk as result
-    let mut ks: Tsr<f64> = rt::zeros(([nao, nao, nset].f(), &device));
+    let mut ks = rt::zeros(([nao, nao, nset].f(), &device));
 
     // initialize half-transformed cderi storage
     let mut eri_half_vec = unsafe { uninitialized_vec::<f64>(nao * nocc_max * naux).unwrap() };
@@ -541,21 +545,21 @@ pub fn generate_vk_ri_semi_incore_coeff_with_rstsr(
         // get half-transformed cderi for this density matrix set
         let occ_coeff = &occ_coeff_list[iset];
         let nocc = occ_coeff.shape()[1];
-        let eri_half: TsrMut<f64> = rt::asarray((&mut eri_half_vec, [nao, nocc, naux].f(), &device));
+        let eri_half = rt::asarray((&mut eri_half_vec, [nao, nocc, naux].f(), &device));
 
         for &[shl0, shl1] in &partition {
-            let ao0 = aux_loc[shl0] - nao;
-            let ao1 = aux_loc[shl1] - nao;
-            let nbatch_ao = ao1 - ao0;
+            let aux0 = aux_loc[shl0] - nao;
+            let aux1 = aux_loc[shl1] - nao;
+            let nbatch_aux = aux1 - aux0;
             let shls_slice = [[0, nbas], [0, nbas], [nbas + shl0 as i32, nbas + shl1 as i32]];
             let int3c2e_batch = {
                 let (out, shape) = mol.integral_s2ij::<int3c2e>(Some(&shls_slice));
                 rt::asarray((out, shape.f(), &device))
             };
             // half-transform
-            (0..nbatch_ao).into_par_iter().for_each(|p| {
+            (0..nbatch_aux).into_par_iter().for_each(|p| {
                 let cderi_iaux = int3c2e_batch.i((.., p)).unpack_tri(Upper, FlagSymm::Sy);
-                let cderi_half_iaux = eri_half.i((.., .., ao0 + p));
+                let cderi_half_iaux = eri_half.i((.., .., aux0 + p));
                 let mut cderi_half_iaux = unsafe { cderi_half_iaux.force_mut() };
                 cderi_half_iaux.matmul_from(&cderi_iaux, &occ_coeff, 1.0, 0.0);
             });
@@ -592,7 +596,220 @@ pub fn mem_estimate_vk_ri_semi_incore_coeff(nao: usize, naux: usize, nocc_max: u
     MemEstimate { batched, fixed, thread }
 }
 
-/* #endregion */
+/* #endregion ri-vk semi-incore */
+
+/* #region ri-vk direct */
+
+/// Generate Exchange (K) matrix using RI direct method with MO coefficients and occupations.
+///
+/// Direct here means that both 3c-2e ERI and half-transformed ERI are computed on-the-fly in
+/// batches. This will cost less memory, but more computation effort.
+///   
+/// This function is low-level implementation, using RSTSR tensors as input and output.
+///
+/// # Parameters
+///
+/// - `mo_coeff`: [`TsrView<f64>`]
+///
+///   - Molecular orbital coefficients in shape (nao, nmo, nset), stored in f-contiguous order.
+///   - We will check `ndim == 3`. Please expand dimension if necessary, especially for RHF case
+///     where `nset = 1`.
+///
+/// - `mo_occ`: [`TsrView<f64>`]
+///
+///   - Molecular orbital occupations in shape (nmo, nset), stored in f-contiguous order.
+///   - We will check `ndim == 2`. Please expand dimension if necessary, especially for RHF case
+///     where `nset = 1`.
+///
+/// - `mol_obj`: [`Molecule`]
+///
+///   - Please make sure auxiliary basis is assigned to this molecule object.
+///
+/// - `batch_size`: `usize`
+///
+///   - Batch size for auxiliary basis partitioning. This value controls memory usage.
+///
+/// # Returns
+///
+/// - [`Tsr<f64>`]
+///
+///   - Exchange (K) matrices in shape (nao, nao, nset), stored in f-contiguous order.
+///   - K matrices are symmetric by definition in real arithmetic.
+///
+/// # Formula and Algorithm
+///
+/// This is similar to the semi-incore method, but batch occurs on the atomic orbital index $\mu$
+/// and $\nu$, instead of auxiliary index $P$. This function will generate k contribution to fock
+/// batch-by-batch.
+///
+/// Fixed memory requirement:
+///
+/// - Storage of output K matrix, which costs (nao * nao * nset).
+/// - Storage of decomposed 2c-2e ERI $L_{PQ}$, which costs approximately (naux * naux).
+///
+/// Batched memory requirement (controlled by `batch_size`):
+///
+/// - Storage of 3c-2e ERI $g_{\mu \kappa, P}$ for a batch of atomic orbitals, which costs
+///   (nbatch_ao * nao * naux).
+/// - Storage of half-transformed integrals $Y_{\mu i, P}^\mathbb{A}$ for a batch of atomic
+///   orbitals, which costs (nbatch_ao * nocc_max * naux * nset).
+/// - Storage of another half-transformed integrals $Y_{\nu j, P}^\mathbb{A}$ for a batch of atomic
+///   orbitals, but only for one set at a time, which costs (nbatch_ao * nocc_max * naux).
+///
+/// Thread memory requirement:
+///
+/// - Storage of cderi per auxiliary, which costs (nao * nao * nthread).
+pub fn generate_vk_ri_direct_coeff_with_rstsr(
+    mo_coeff: TsrView<f64>,
+    mo_occ: TsrView<f64>,
+    mol_obj: &Molecule,
+    batch_size: usize,
+) -> Tsr<f64> {
+    assert_eq!(mo_coeff.ndim(), 3, "Molecular coefficients must have 3 dimensions");
+    assert_eq!(mo_occ.ndim(), 2, "Molecular occupations must have 2 dimensions");
+
+    // initialize mol and aux
+    let mut mol = mol_obj.initialize_cint(true);
+    let mut aux = mol_obj.make_auxmol_fake().initialize_cint(false);
+
+    // get shapes
+    let nao = mo_coeff.shape()[0];
+    let nmo = mo_coeff.shape()[1];
+    let nset = mo_coeff.shape()[2];
+    let naux = aux.cgto_loc().last().unwrap().clone();
+    let device = mo_coeff.device().clone();
+    let nbas = mol_obj.cint_bas.len() as i32;
+    let nbas_aux = mol_obj.cint_aux_bas.len() as i32;
+
+    // shape check
+    assert_eq!(mo_occ.shape(), &[nmo, nset], "Molecular occupations must have shape (nmo, nset)");
+
+    // check occupation not less than zero
+    let occ_neg = rt::lt(&mo_occ, 0.0).sum();
+    if occ_neg > 0 {
+        println!("[WARN] in generate_vk_ri_incore_coeff_with_rstsr, negative occupation found: {occ_neg} elements < 0");
+    }
+
+    // compress mo_coeff with occupation
+    let mut occ_coeff_list = vec![];
+    for iset in 0..nset {
+        // generate occ_coeff by sqrt(occupation) * coefficient
+        let occ_mask = rt::gt(mo_occ.i((.., iset)), f64::EPSILON).into_vec();
+        let occ_coeff = mo_coeff.i((.., .., iset)).bool_select(-1, &occ_mask);
+        let occ = mo_occ.i((.., iset)).bool_select(-1, &occ_mask).sqrt();
+        occ_coeff_list.push(occ_coeff * occ.i((None, ..)));
+    }
+    let nocc_max = occ_coeff_list.iter().map(|x| x.shape()[1]).max().unwrap();
+
+    // get partition
+    let ao_loc = &mol.cgto_loc()[..=(nbas as usize)];
+    let partition = blocksize_partition(&ao_loc, batch_size);
+
+    // initialize vk as result
+    let mut ks = rt::zeros(([nao, nao, nset].f(), &device));
+
+    // initialize int2c2e and perform cholesky decomposition
+    let tsr_int2c2e = {
+        let shls_slice = [[nbas, nbas + nbas_aux], [nbas, nbas + nbas_aux]];
+        let (out, shape) = mol.integral_s1::<int2c2e>(Some(&shls_slice));
+        rt::asarray((out, shape.f(), &device))
+    };
+    let tsr_int2c2e_l = rt::linalg::cholesky((tsr_int2c2e, Upper));
+
+    for (batch_i, &[shl0_i, shl1_i]) in partition.iter().enumerate() {
+        let ao0_i = ao_loc[shl0_i];
+        let ao1_i = ao_loc[shl1_i];
+        let nbatch_ao_i = ao1_i - ao0_i;
+        let shls_slice_i = [[shl0_i as i32, shl1_i as i32], [0, nbas], [nbas, nbas + nbas_aux]];
+        let int3c2e_batch_i = {
+            let (out, shape) = mol.integral_s1::<int3c2e>(Some(&shls_slice_i));
+            rt::asarray((out, shape.f(), &device))
+        };
+
+        // half-transform for batch i
+        let mut cderi_half_i = vec![];
+        for iset in 0..nset {
+            let nocc = occ_coeff_list[iset].shape()[1];
+            let mut eri_half_iset_vec = unsafe { uninitialized_vec::<f64>(nbatch_ao_i * nocc * naux).unwrap() };
+            let eri_half_iset = rt::asarray((&mut eri_half_iset_vec, [nbatch_ao_i, nocc, naux].f(), &device));
+            (0..naux).into_par_iter().for_each(|p| {
+                let cderi_half_iaux = eri_half_iset.i((.., .., p));
+                let mut cderi_half_iaux = unsafe { cderi_half_iaux.force_mut() };
+                cderi_half_iaux.matmul_from(&int3c2e_batch_i.i((.., .., p)), &occ_coeff_list[iset], 1.0, 0.0);
+            });
+            let eri_half_iset =
+                rt::asarray((&mut eri_half_iset_vec, [nbatch_ao_i * nocc, naux].f(), &device)).into_reverse_axes();
+            rt::linalg::solve_triangular((tsr_int2c2e_l.t(), eri_half_iset, Lower));
+            let cderi_half_iset = rt::asarray((eri_half_iset_vec, [nbatch_ao_i, nocc, naux].f(), &device));
+            cderi_half_i.push(cderi_half_iset);
+        }
+
+        // perform contribution to vk for intra-batch i
+        for iset in 0..nset {
+            let nocc = occ_coeff_list[iset].shape()[1];
+            let cderi_half_iset = cderi_half_i[iset].reshape([nbatch_ao_i, nocc * naux]);
+            ks.i_mut((ao0_i..ao1_i, ao0_i..ao1_i, iset)).matmul_from(&cderi_half_iset, &cderi_half_iset.t(), 1.0, 1.0);
+        }
+
+        for batch_j in 0..batch_i {
+            let &[shl0_j, shl1_j] = &partition[batch_j];
+            let ao0_j = ao_loc[shl0_j];
+            let ao1_j = ao_loc[shl1_j];
+            let nbatch_ao_j = ao1_j - ao0_j;
+            let shls_slice_j = [[shl0_j as i32, shl1_j as i32], [0, nbas], [nbas, nbas + nbas_aux]];
+            let int3c2e_batch_j = {
+                let (out, shape) = mol.integral_s1::<int3c2e>(Some(&shls_slice_j));
+                rt::asarray((out, shape.f(), &device))
+            };
+
+            let mut eri_half_iset_vec = unsafe { uninitialized_vec::<f64>(nbatch_ao_j * nocc_max * naux).unwrap() };
+            for iset in 0..nset {
+                // half-transform for batch j
+                let nocc = occ_coeff_list[iset].shape()[1];
+                let eri_half_iset = rt::asarray((&mut eri_half_iset_vec, [nbatch_ao_j, nocc, naux].f(), &device));
+                (0..naux).into_par_iter().for_each(|p| {
+                    let cderi_half_iaux = eri_half_iset.i((.., .., p));
+                    let mut cderi_half_iaux = unsafe { cderi_half_iaux.force_mut() };
+                    cderi_half_iaux.matmul_from(&int3c2e_batch_j.i((.., .., p)), &occ_coeff_list[iset], 1.0, 0.0);
+                });
+                let eri_half_iset =
+                    rt::asarray((&mut eri_half_iset_vec, [nbatch_ao_j * nocc, naux].f(), &device)).into_reverse_axes();
+                rt::linalg::solve_triangular((tsr_int2c2e_l.t(), eri_half_iset, Lower));
+
+                // contribution to vk between batch i and j
+                let cderi_half_iset_j = rt::asarray((&eri_half_iset_vec, [nbatch_ao_j, nocc * naux].f(), &device));
+                let cderi_half_iset_i = cderi_half_i[iset].reshape([nbatch_ao_i, nocc * naux]);
+                let mut scr_k = unsafe { rt::empty(([nbatch_ao_i, nbatch_ao_j].f(), &device)) };
+                scr_k.matmul_from(&cderi_half_iset_i, &cderi_half_iset_j.t(), 1.0, 0.0);
+                *&mut ks.i_mut((ao0_i..ao1_i, ao0_j..ao1_j, iset)) += &scr_k;
+                *&mut ks.i_mut((ao0_j..ao1_j, ao0_i..ao1_i, iset)) += &scr_k.t();
+            }
+        }
+    }
+    ks
+}
+
+/// Estimate memory requirement for VK RI direct method with MO coefficients and occupations.
+///
+/// This function corresponds to [`generate_vk_ri_direct_coeff_with_rstsr`].
+///
+/// # Parameters
+///
+/// - `nao`: Number of atomic orbitals.
+/// - `naux`: Number of auxiliary basis functions.
+/// - `nocc_max`: Maximum number of occupied molecular orbitals among all sets.
+/// - `nset`: Number of density matrix sets.
+pub fn mem_estimate_vk_ri_direct_coeff(nao: usize, naux: usize, nocc_max: usize, nset: usize) -> MemEstimate {
+    // int3c2e, cderi_half_i, eri_half_iset_vec
+    let batched = nao * naux + nocc_max * naux * (nset + 1);
+    // ks, int2c2e
+    let fixed = nao * nao * nset + naux * naux;
+    // cderi per auxiliary
+    let thread = nao * nao;
+    MemEstimate { batched, fixed, thread }
+}
+
+/* #endregion ri-vk direct */
 
 #[cfg(test)]
 mod debug {
@@ -649,8 +866,26 @@ mod debug {
         let ref_fp = 12.950224351107128;
         assert!((fp / ref_fp - 1.0).abs() < 1e-5);
 
+        // semi-incore, full batch
+        let k_rstsr = generate_vk_ri_semi_incore_coeff_with_rstsr(mo_coeff.view(), mo_occ.view(), mol, 10000);
+        let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
+        let ref_fp = 12.950224351107128;
+        assert!((fp / ref_fp - 1.0).abs() < 1e-5);
+
         // semi-incore, small batch
-        let k_rstsr = generate_vk_ri_semi_incore_coeff_with_rstsr(mo_coeff.view(), mo_occ.view(), mol, 1024);
+        let k_rstsr = generate_vk_ri_semi_incore_coeff_with_rstsr(mo_coeff.view(), mo_occ.view(), mol, 16);
+        let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
+        let ref_fp = 12.950224351107128;
+        assert!((fp / ref_fp - 1.0).abs() < 1e-5);
+
+        // direct, full batch
+        let k_rstsr = generate_vk_ri_direct_coeff_with_rstsr(mo_coeff.view(), mo_occ.view(), mol, 10000);
+        let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
+        let ref_fp = 12.950224351107128;
+        assert!((fp / ref_fp - 1.0).abs() < 1e-5);
+
+        // direct, small batch
+        let k_rstsr = generate_vk_ri_direct_coeff_with_rstsr(mo_coeff.view(), mo_occ.view(), mol, 16);
         let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
         let ref_fp = 12.950224351107128;
         assert!((fp / ref_fp - 1.0).abs() < 1e-5);
