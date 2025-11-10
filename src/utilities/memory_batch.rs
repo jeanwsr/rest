@@ -42,10 +42,10 @@ pub fn calc_batch_size<T>(
     let max_mb = mem_avail_mb - pre_mb;
 
     if unit_mb > max_mb {
-        println!("[Warn] Memory overflow when preparing batch number.");
+        println!("[WARN] Memory overflow when preparing batch number.");
         println!("Current memory available {:10.3} MB, minimum required {:10.3} MB", max_mb, unit_mb);
     }
-    let batch_size = (max_mb / unit_mb).max(1.0).to_usize().unwrap();
+    let batch_size = (max_mb / unit_mb).floor().max(1.0).to_usize().unwrap();
     return batch_size;
 }
 
@@ -66,7 +66,7 @@ pub fn calc_batch_size<T>(
 /// # use pyrest::grad::rhf::blocksize_partition;
 /// let indices = [1, 3, 6, 7, 10, 15, 16, 19];
 /// let partitions = blocksize_partition(&indices, 4);
-/// // A info of `[Warn] Batch size is too small: 15 - 10 > 4` will be printed.
+/// // A info of `[WARN] Batch size is too small: 15 - 10 > 4` will be printed.
 /// assert_eq!(partitions, [[0, 1], [1, 3], [3, 4], [4, 5], [5, 7]]);
 /// ```
 pub fn blocksize_partition(indices: &[usize], batch_size: usize) -> Vec<[usize; 2]> {
@@ -84,7 +84,7 @@ pub fn blocksize_partition(indices: &[usize], batch_size: usize) -> Vec<[usize; 
     for idx in 1..n {
         if indices[idx + 1] - indices[p0] > batch_size {
             if indices[idx] - indices[p0] > batch_size {
-                println!("[Warn] Batch size is too small: {} - {} > {}", indices[idx], indices[p0], batch_size);
+                println!("[WARN] Batch size is too small: {} - {} > {}", indices[idx], indices[p0], batch_size);
             }
             partitions.push(idx);
             p0 = idx;
@@ -98,4 +98,111 @@ pub fn blocksize_partition(indices: &[usize], batch_size: usize) -> Vec<[usize; 
         result.push([partitions[i], partitions[i + 1]]);
     }
     return result;
+}
+
+/// Struct for memory estimation.
+#[derive(Debug, Clone, Default)]
+pub struct MemEstimate {
+    /// Batched memory in DRAM, in number of elements.
+    ///
+    /// API caller must fill this field to get total memory estimation.
+    pub batched: usize,
+
+    /// Fixed memory in DRAM, in number of elements.
+    ///
+    /// This can be zero if no fixed memory consumption.
+    pub fixed: usize,
+
+    /// Fixed memory consumption in a thread, in number of elements.
+    ///
+    /// This can be zero if no fixed memory consumption.
+    pub thread: usize,
+}
+
+impl MemEstimate {
+    /// Print memory estimation info with data type.
+    pub fn print_with_dtype<T>(&self) {
+        let nbytes_dtype = std::mem::size_of::<T>();
+        let type_name = std::any::type_name::<T>();
+        let batched_mb = (self.batched * nbytes_dtype) as f64 / 1024.0 / 1024.0;
+        let fixed_mb = (self.fixed * nbytes_dtype) as f64 / 1024.0 / 1024.0;
+        let thread_mb = (self.thread * nbytes_dtype) as f64 / 1024.0 / 1024.0;
+        println!("[INFO] MemEstimate debug print:");
+        println!("       dtype   = type {type_name} with {nbytes_dtype} bytes");
+        println!("       batched = {batched_mb:10.3} MB");
+        println!("       fixed   = {fixed_mb:10.3} MB");
+        println!("       thread  = {thread_mb:10.3} MB");
+    }
+}
+
+/// Calculate batch size within possible memory, by struct [`MemEstimate`].
+///
+/// For example, if we want to compute tensor (100, 100, 100), but only 50,000 memory available,
+/// then this tensor should be splited into 20 batches.
+///
+/// ``flop`` in parameters is number of data, not refers to FLOPs.
+///
+/// This function requires generic `<T>`, which determines size of data.
+///
+/// # Parameters
+///
+/// - `mem_est`: Memory estimation struct.
+/// - `mem_avail`: Memory available in MB. By default, it will check available memory in os system.
+/// - `mem_factor`: factor for mem_avail, to avoid all memory consumed; should be smaller than 1,
+///   recommended 0.7.
+///
+/// # Example
+///
+/// ```rust
+/// # use pyrest::utilities::memory_batch::{MemEstimate, calc_batch_size_from_mem_estimate};
+/// // make sure to let 6 threads in rayon
+/// use rayon::prelude::*;
+/// let pool = rayon::ThreadPoolBuilder::new().num_threads(6).build().unwrap();
+/// let mem_est = MemEstimate {
+///     batched: 200_000,
+///     fixed: 500_000,
+///     thread: 100_000,
+/// };
+/// let batch_size = pool.install(|| calc_batch_size_from_mem_estimate::<f64>(&mem_est, Some(500.0), Some(0.8)));
+/// println!("Calculated batch size: {}", batch_size);
+/// assert_eq!(batch_size, 256);
+/// ```
+pub fn calc_batch_size_from_mem_estimate<T>(
+    mem_est: &MemEstimate,
+    mem_avail: Option<f64>,
+    mem_factor: Option<f64>,
+) -> usize {
+    use rayon::prelude::*;
+    let num_threads = rayon::current_num_threads();
+
+    let nbytes_dtype = std::mem::size_of::<T>();
+    let batched_flop = mem_est.batched.max(1);
+    let batched_mb = (batched_flop * nbytes_dtype) as f64 / 1024.0 / 1024.0;
+    let fixed_mb = mem_est.fixed as f64 * nbytes_dtype as f64 / 1024.0 / 1024.0;
+    let thread_mb = mem_est.thread as f64 * nbytes_dtype as f64 / 1024.0 / 1024.0;
+    let mem_factor = mem_factor.unwrap_or(0.7);
+    let mem_avail_mb = mem_avail.unwrap_or_else(detect_available_memory_mb) * mem_factor;
+    let max_mb = mem_avail_mb - fixed_mb - thread_mb * num_threads as f64;
+
+    if batched_mb > max_mb {
+        println!("[WARN] Memory overflow when preparing batch number.");
+        println!("Current memory available {:10.3} MB, minimum required {:10.3} MB", max_mb, batched_mb);
+    }
+    let batch_size = (max_mb / batched_mb).floor().max(1.0).to_usize().unwrap();
+    return batch_size;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calc_batch_size_from_mem_estimate() {
+        use rayon::prelude::*;
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(6).build().unwrap();
+        let mem_est = MemEstimate { batched: 200_000, fixed: 500_000, thread: 100_000 };
+        let batch_size = pool.install(|| calc_batch_size_from_mem_estimate::<f64>(&mem_est, Some(500.0), Some(0.8)));
+        println!("Calculated batch size: {batch_size}");
+        assert_eq!(batch_size, 256);
+    }
 }

@@ -6,7 +6,7 @@ use crate::dft::{numerical_density, DFTType, Grids};
 use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges};
 use crate::mpi_io::{mpi_broadcast, mpi_broadcast_matrixfull, mpi_broadcast_vector, mpi_reduce, MPIOperator};
 use crate::utilities::{create_pool, TimeRecords};
-use crate::utilities::memory_batch::calc_batch_size;
+use crate::utilities::memory_batch::{calc_batch_size, calc_batch_size_from_mem_estimate};
 
 ////use blas_src::openblas::dgemm;
 mod addons;
@@ -3024,19 +3024,26 @@ impl SCF {
     /// - specify `[ctrl]: max_memory` in MB for calculating `block_size` if not specified;
     fn generate_vj_ri_direct(&mut self, block_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
         // compute block_size
-        const MAX_BLOCK_SIZE: usize = 432;
         const MIN_BLOCK_SIZE: usize = 16;
         let block_size = block_size.unwrap_or_else(|| {
             let nao = self.mol.num_basis;
             let naux = self.mol.num_auxbas;
+            let nset = self.mol.spin_channel;
             let sys_info = sysinfo::System::new_all();
             let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
                 let pid = sysinfo::get_current_pid().unwrap();
                 let used_memory = sys_info.process(pid).unwrap().memory() as f64 / 1024.0 / 1024.0;
                 max_memory - used_memory
             });
-            let aux_batch_size = calc_batch_size::<f64>(nao * nao, mem_avail, None, Some(naux * naux));
-            aux_batch_size.min(MAX_BLOCK_SIZE).max(MIN_BLOCK_SIZE)
+            let mem_est = ri_on_the_fly::mem_estimate_vj_ri_direct(nao, naux, nset);
+            let aux_batch_size = calc_batch_size_from_mem_estimate::<f64>(&mem_est, mem_avail, None);
+            let aux_batch_size = aux_batch_size.max(MIN_BLOCK_SIZE);
+            // info output
+            println!("[INFO] in generate_vj_ri_direct, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
+            println!("[INFO] in generate_vj_ri_direct, batch size      : {aux_batch_size}");
+            println!("[INFO] in generate_vj_ri_direct, memory estimation");
+            mem_est.print_with_dtype::<f64>();
+            aux_batch_size
         });
 
         // compute vj only for specified spin channels
