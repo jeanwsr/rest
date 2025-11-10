@@ -9,7 +9,83 @@ type Tsr<T> = Tensor<T, DeviceBLAS, IxD>;
 type TsrView<'a, T> = TensorView<'a, T, DeviceBLAS, IxD>;
 type TsrMut<'a, T> = TensorMut<'a, T, DeviceBLAS, IxD>;
 
-/// Generate Coulomb (J) matrix on-the-fly using RI direct method.
+/* #region ri-vj incore */
+
+/// Generate Coulomb (J) matrix using RI incore method (cholesky decomposed ERI in-memory).
+///
+/// This function is low-level implementation, using RSTSR tensors as input and output.
+///
+/// # Parameters
+///
+/// - `cderi`: [`TsrView<f64>`]
+///
+///   - Cholesky decomposed 3c-2e ERI in shape (nao_tp, naux), stored in f-contiguous order.
+///   - `nao_tp = nao * (nao + 1) / 2`, where `nao` is number of atomic orbitals.
+///   - This tensor is assumed to be in AO basis.
+///
+/// - `dms`: [`TsrView<f64>`]
+///
+///   - Density matrices in shape (nao, nao, nset), stored in f-contiguous order.
+///   - We will check `ndim == 3`. Please expand dimension if necessary, especially for RHF case
+///     where `nset = 1`.
+///   - This matrix is assumed to be in AO basis.
+///   - This matrix is assumed to be symmetric. We will not perform symmetry check or symmetrize
+///     operation.
+///
+/// # Returns
+///
+/// - [`Tsr<f64>`]
+///
+///   - Coulomb (J) matrices in shape (nao, nao, nset), stored in f-contiguous order.
+///   - J matrices are symmetric by definition in real arithmetic.
+///
+/// # Formula and Algorithm
+///
+/// $$
+/// J_{\mu \nu}[\mathbf{D}^\mathbb{A}] = \sum_{P} \sum_{\kappa \lambda} Y_{\mu \nu, P}
+/// Y_{\kappa \lambda, P} D_{\kappa \lambda}^\mathbb{A}
+/// $$
+/// 
+/// - AO indices ($\mu \nu$, $\kappa, \lambda$) are in packed upper-triangular format.
+/// - This function implements the above formula directly using matrix multiplications.
+/// 
+/// There is virtually no memory requirement other than input and output tensors.
+pub fn generate_vj_ri_incore_with_rstsr(cderi: TsrView<f64>, dms: TsrView<f64>) -> Tsr<f64> {
+    assert_eq!(dms.ndim(), 3, "DM must have 3 dimensions");
+    assert_eq!(cderi.ndim(), 2, "Cholesky ERI must have 2 dimensions");
+
+    // get shapes
+    let nset = dms.shape()[2];
+    let nao = dms.shape()[0];
+    let nao_tp = (nao + 1) * nao / 2;
+
+    // shape check
+    assert_eq!(cderi.shape()[0], nao_tp, "Cholesky ERI must have shape (nao_tp, naux)");
+
+    // pack density matrix with upper-triangular, diagonal doubled
+    let mut dms_tp = rt::zeros(([nao_tp, nset].f(), dms.device()));
+    for iset in 0..nset {
+        let dm = dms.i((.., .., iset));
+        let dm_diag = dm.diagonal(None);
+        let mut dm = 2.0_f64 * &dm;
+        dm.diagonal_mut(None).assign(&dm_diag);
+        let dm_tp = dm.pack_triu();
+        dms_tp.i_mut((.., iset)).assign(dm_tp);
+    }
+
+    // generate j contribution
+    let scr_j = cderi.t() % &dms_tp;
+    let js_tp = &cderi % &scr_j;
+
+    // returns symmetrized part
+    js_tp.unpack_tri(Upper, FlagSymm::Sy)
+}
+
+/* #endregion ri-vj incore */
+
+/* #region ri-vj direct */
+
+/// Generate Coulomb (J) matrix using RI direct method (on-the-fly).
 ///
 /// This function is low-level implementation, using RSTSR tensors as input and output. For
 /// high-level interface (using rest_tensors as input and output), please refer to
@@ -70,11 +146,12 @@ type TsrMut<'a, T> = TensorMut<'a, T, DeviceBLAS, IxD>;
 ///   (nao_tp * block_size).
 pub fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, block_size: usize) -> Tsr<f64> {
     // dm shape: (nao, nao, nset) in f-contig
-    assert!(dms.ndim() == 3, "DM must have 3 dimensions");
+    assert_eq!(dms.ndim(), 3, "DM must have 3 dimensions");
 
     let mut mol = mol_obj.initialize_cint(true);
     let mut aux = mol_obj.make_auxmol_fake().initialize_cint(false);
 
+    // get shapes
     let nset = dms.shape()[2];
     let nao = dms.shape()[0];
     let nao_tp = (nao + 1) * nao / 2;
@@ -95,7 +172,7 @@ pub fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, b
         rt::asarray((out, shape.f(), &device))
     };
 
-    // pack density matrix
+    // pack density matrix with upper-triangular, diagonal doubled
     let mut dms_tp = rt::zeros(([nao_tp, nset].f(), &device));
     for iset in 0..nset {
         let dm = dms.i((.., .., iset));
@@ -142,11 +219,7 @@ pub fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, b
     }
 
     // returns symmetrized part
-    let mut js = rt::zeros(([nao, nao, nset].f(), &device));
-    for iset in 0..nset {
-        js.i_mut((.., .., iset)).assign(js_tp.i((.., iset)).unpack_triu(FlagSymm::Sy));
-    }
-    js
+    js_tp.unpack_tri(Upper, FlagSymm::Sy)
 }
 
 /// Estimate memory requirement for VJ RI direct method.
@@ -187,25 +260,35 @@ pub fn generate_vj_ri_direct(dms: &[MatrixFull<f64>], mol_obj: &Molecule, block_
     js
 }
 
+/* #endregion ri-vj direct */
+
 #[cfg(test)]
 mod debug {
     use super::*;
     use crate::scf_io::SCF;
 
     #[test]
-    fn test_nh3() {
+    fn test_nh3_j() {
         let scf_data = initialize_nh3();
         let device = DeviceBLAS::default();
 
         let dm = [&scf_data.density_matrix[0]].as_ref().to_rstsr(&device);
         let mol = &scf_data.mol;
-        // full batch
+
+        // incore
+        let rimatr = scf_data.rimatr.as_ref().unwrap().0.to_rstsr_view(&device);
+        let j_rstsr = generate_vj_ri_incore_with_rstsr(rimatr, dm.view());
+        let fp = fingerprint_f64(j_rstsr.i((.., .., 0)));
+        let ref_fp = 37.83424292927407;
+        assert!((fp / ref_fp - 1.0).abs() < 1e-5);
+
+        // direct, full batch
         let j_rstsr = generate_vj_ri_direct_with_rstsr(dm.view(), mol, 10000);
         let fp = fingerprint_f64(j_rstsr.i((.., .., 0)));
         let ref_fp = 37.83424292927407;
         assert!((fp / ref_fp - 1.0).abs() < 1e-5);
 
-        // small batch
+        // direct, small batch
         let j_rstsr = generate_vj_ri_direct_with_rstsr(dm.view(), mol, 16);
         let fp = fingerprint_f64(j_rstsr.i((.., .., 0)));
         let ref_fp = 37.83424292927407;
