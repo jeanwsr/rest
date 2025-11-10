@@ -1,5 +1,5 @@
 use crate::molecule_io::Molecule;
-use crate::utilities::memory_batch::blocksize_partition;
+use crate::utilities::memory_batch::*;
 use crate::utilities::rstsr_util::*;
 use rest_libcint::prelude::*;
 use rstsr::prelude::*;
@@ -68,7 +68,7 @@ type TsrMut<'a, T> = TensorMut<'a, T, DeviceBLAS, IxD>;
 ///
 /// - Storage of 3c-2e ERI $g_{\kappa \lambda, P}$ for a batch of auxiliary basis, which costs
 ///   (nao_tp * block_size).
-pub(crate) fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, block_size: usize) -> Tsr<f64> {
+pub fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, block_size: usize) -> Tsr<f64> {
     // dm shape: (nao, nao, nset) in f-contig
     assert!(dms.ndim() == 3, "DM must have 3 dimensions");
 
@@ -149,11 +149,24 @@ pub(crate) fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Mole
     js
 }
 
-pub(crate) fn generate_vj_ri_direct(
-    dms: &[MatrixFull<f64>],
-    mol_obj: &Molecule,
-    block_size: usize,
-) -> Vec<MatrixUpper<f64>> {
+/// Estimate memory requirement for VJ RI direct method.
+///
+/// # Parameters
+///
+/// - `nao`: Number of atomic orbitals.
+/// - `naux`: Number of auxiliary basis functions.
+/// - `nset`: Number of density matrix sets.
+pub const fn mem_estimate_vj_ri_direct(nao: usize, naux: usize, nset: usize) -> MemEstimate {
+    let nao_tp = (nao + 1) * nao / 2;
+    // int3c2e batch
+    let batched = nao_tp;
+    // scr_j, scr_js, int2c2e, js_tp / dms_tp, js_tp
+    let fixed = naux * nset * 2 + naux * naux + nao * nao * nset + nao_tp * nset;
+    let thread = 0;
+    MemEstimate { batched, fixed, thread }
+}
+
+pub fn generate_vj_ri_direct(dms: &[MatrixFull<f64>], mol_obj: &Molecule, block_size: usize) -> Vec<MatrixUpper<f64>> {
     // dm shape: (nao, nao, nset) in f-contig
     let device = DeviceBLAS::default();
     let dms_rstsr = dms.to_rstsr(&device);
@@ -167,7 +180,7 @@ pub(crate) fn generate_vj_ri_direct(
     // Tsr -> Vec<MatrixUpper>
     let mut js = vec![];
     for iset in 0..nset {
-        let j = js_rstsr.i((.., iset)).pack_tri(Upper).into_vec();
+        let j = js_rstsr.i((.., .., iset)).pack_tri(Upper).into_vec();
         js.push(unsafe { MatrixUpper::from_vec_unchecked(nao_tp, j) });
     }
 
