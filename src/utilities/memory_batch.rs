@@ -64,12 +64,13 @@ pub fn calc_batch_size<T>(
     let unit_mb = (unit_flop * nbytes_dtype) as f64 / 1024.0 / 1024.0;
     let pre_mb = pre_flop.unwrap_or(0) as f64 * nbytes_dtype as f64 / 1024.0 / 1024.0;
     let mem_factor = mem_factor.unwrap_or(0.7);
-    let mem_avail_mb = mem_avail.unwrap_or_else(detect_available_memory_mb) * mem_factor;
-    let max_mb = mem_avail_mb - pre_mb;
+    let mem_avail_mb = mem_avail.unwrap_or_else(detect_available_memory_mb);
+    let mem_avail_factored_mb = mem_avail.unwrap_or_else(detect_available_memory_mb) * mem_factor;
+    let max_mb = mem_avail_factored_mb - pre_mb;
 
     if unit_mb > max_mb {
         println!("[WARN] Memory overflow when preparing batch number.");
-        println!("Current memory available {:10.3} MB, minimum required {:10.3} MB", max_mb, unit_mb);
+        println!("       Current memory available {mem_avail_mb:10.3} MB, after allocation {max_mb:10.3} MB, minimum required per batch {unit_mb:10.3} MB");
     }
     let batch_size = (max_mb / unit_mb).floor().max(1.0).to_usize().unwrap();
     return batch_size;
@@ -147,17 +148,22 @@ pub struct MemEstimate {
 
 impl MemEstimate {
     /// Print memory estimation info with data type.
-    pub fn print_with_dtype<T>(&self) {
+    pub fn print_with_dtype<T>(&self) -> String {
+        use std::fmt::Write;
         let nbytes_dtype = std::mem::size_of::<T>();
         let type_name = std::any::type_name::<T>();
         let batched_mb = (self.batched * nbytes_dtype) as f64 / 1024.0 / 1024.0;
         let fixed_mb = (self.fixed * nbytes_dtype) as f64 / 1024.0 / 1024.0;
         let thread_mb = (self.thread * nbytes_dtype) as f64 / 1024.0 / 1024.0;
-        println!("[INFO] MemEstimate debug print:");
-        println!("       dtype   = type {type_name} with {nbytes_dtype} bytes");
-        println!("       batched = {batched_mb:10.3} MB");
-        println!("       fixed   = {fixed_mb:10.3} MB");
-        println!("       thread  = {thread_mb:10.3} MB");
+        let mut output = String::new();
+        writeln!(output, "[INFO] MemEstimate debug print:").unwrap();
+        writeln!(output, "       dtype   = type {type_name} with {nbytes_dtype} bytes").unwrap();
+        writeln!(output, "       batched = {batched_mb:10.3} MB").unwrap();
+        writeln!(output, "       fixed   = {fixed_mb:10.3} MB").unwrap();
+        writeln!(output, "       thread  = {thread_mb:10.3} MB").unwrap();
+        // currently, we also print this to stdout
+        print!("{output}");
+        output
     }
 }
 
@@ -202,19 +208,22 @@ pub fn calc_batch_size_from_mem_estimate<T>(
     let num_threads = rayon::current_num_threads();
 
     let nbytes_dtype = std::mem::size_of::<T>();
-    let batched_flop = mem_est.batched.max(1);
-    let batched_mb = (batched_flop * nbytes_dtype) as f64 / 1024.0 / 1024.0;
+    let unit_flop = mem_est.batched.max(1);
+    let unit_mb = (unit_flop * nbytes_dtype) as f64 / 1024.0 / 1024.0;
     let fixed_mb = mem_est.fixed as f64 * nbytes_dtype as f64 / 1024.0 / 1024.0;
     let thread_mb = mem_est.thread as f64 * nbytes_dtype as f64 / 1024.0 / 1024.0;
     let mem_factor = mem_factor.unwrap_or(0.7);
-    let mem_avail_mb = mem_avail.unwrap_or_else(detect_available_memory_mb) * mem_factor;
-    let max_mb = mem_avail_mb - fixed_mb - thread_mb * num_threads as f64;
+    let mem_avail_mb = mem_avail.unwrap_or_else(detect_available_memory_mb);
+    let mem_avail_factored_mb = mem_avail.unwrap_or_else(detect_available_memory_mb) * mem_factor;
+    let max_mb = mem_avail_factored_mb - fixed_mb - thread_mb * num_threads as f64;
 
-    if batched_mb > max_mb {
+    if unit_mb > max_mb {
         println!("[WARN] Memory overflow when preparing batch number.");
-        println!("Current memory available {:10.3} MB, minimum required {:10.3} MB", max_mb, batched_mb);
+        println!("       Current memory available {mem_avail_mb:10.3} MB, after allocation {max_mb:10.3} MB, minimum required per batch {unit_mb:10.3} MB");
+        println!("       Following debug info from MemEstimate:");
+        mem_est.print_with_dtype::<T>();
     }
-    let batch_size = (max_mb / batched_mb).floor().max(1.0).to_usize().unwrap();
+    let batch_size = (max_mb / unit_mb).floor().max(1.0).to_usize().unwrap();
     return batch_size;
 }
 
