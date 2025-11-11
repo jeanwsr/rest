@@ -17,12 +17,15 @@ use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper,omp_get_num_thread
 use serde_json;
 use toml;
 
+pub mod flags;
 mod pyrest_ctrl_io;
 mod geometric_pyo3_io;
 mod quasiparticle_methods;
-use geometric_pyo3_io::GeomeTRIC;
 mod path_util;
+
+use geometric_pyo3_io::GeomeTRIC;
 use quasiparticle_methods::QuasiParticle;
+pub use flags::*;
 
 pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
     let tmp_cont = fs::read_to_string(&filename[..])?;
