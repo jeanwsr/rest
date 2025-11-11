@@ -6,7 +6,7 @@ use crate::dft::{numerical_density, DFTType, Grids};
 use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges};
 use crate::mpi_io::{mpi_broadcast, mpi_broadcast_matrixfull, mpi_broadcast_vector, mpi_reduce, MPIOperator};
 use crate::utilities::{create_pool, TimeRecords};
-use crate::utilities::memory_batch::{calc_batch_size, calc_batch_size_from_mem_estimate};
+use crate::utilities::memory_batch::*;
 
 ////use blas_src::openblas::dgemm;
 mod addons;
@@ -3031,9 +3031,7 @@ impl SCF {
             let nset = self.mol.spin_channel;
             let sys_info = sysinfo::System::new_all();
             let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
-                let pid = sysinfo::get_current_pid().unwrap();
-                let used_memory = sys_info.process(pid).unwrap().memory() as f64 / 1024.0 / 1024.0;
-                max_memory - used_memory
+                max_memory - detect_used_memory_mb("proc")
             });
             let mem_est = ri_on_the_fly::mem_estimate_vj_ri_direct(nao, naux, nset);
             let aux_batch_size = calc_batch_size_from_mem_estimate::<f64>(&mem_est, mem_avail, None);
