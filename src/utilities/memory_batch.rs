@@ -8,6 +8,32 @@ pub fn detect_available_memory_mb() -> f64 {
     (sys.total_memory() - sys.used_memory()) as f64 / 1024.0 / 1024.0
 }
 
+/// Detect used memory in system in MB.
+///
+/// # Parameters
+///
+/// - `use_case`: `&str`
+///
+///   - `"sys"`: detect used memory of whole system.
+///   - `"proc"`: detect used memory of current process.
+pub fn detect_used_memory_mb(use_case: &str) -> f64 {
+    match use_case {
+        "sys" => {
+            let sys = sysinfo::System::new_all();
+            sys.used_memory() as f64 / 1024.0 / 1024.0
+        },
+        "proc" => {
+            let sys = sysinfo::System::new_all();
+            let pid = sysinfo::get_current_pid().unwrap();
+            let process = sys.process(pid).unwrap();
+            process.memory() as f64 / 1024.0 / 1024.0
+        },
+        _ => {
+            panic!("Unknown use_case for detect_used_memory_mb: {}", use_case);
+        },
+    }
+}
+
 /// Calculate batch size within possible memory.
 ///
 /// For example, if we want to compute tensor (100, 100, 100), but only 50,000 memory available,
