@@ -259,7 +259,6 @@ pub fn generate_vj_ri_direct(dms: &[MatrixFull<f64>], mol_obj: &Molecule, batch_
         let j = js_rstsr.i((.., .., iset)).pack_tri(Upper).into_vec();
         js.push(unsafe { MatrixUpper::from_vec_unchecked(nao_tp, j) });
     }
-
     js
 }
 
@@ -598,7 +597,7 @@ pub fn mem_estimate_vk_ri_semi_incore_coeff(nao: usize, naux: usize, nocc_max: u
 
 /* #endregion ri-vk semi-incore */
 
-/* #region ri-vk direct */
+/* #region ri-vk direct coeff */
 
 /// Generate Exchange (K) matrix using RI direct method with MO coefficients and occupations.
 ///
@@ -809,7 +808,174 @@ pub fn mem_estimate_vk_ri_direct_coeff(nao: usize, naux: usize, nocc_max: usize,
     MemEstimate { batched, fixed, thread }
 }
 
-/* #endregion ri-vk direct */
+pub fn generate_vk_ri_direct_coeff(
+    scaling_factor: f64,
+    mo_coeff: &[MatrixFull<f64>],
+    mo_occ: &[Vec<f64>],
+    mol_obj: &Molecule,
+    batch_size: usize,
+) -> Vec<MatrixUpper<f64>> {
+    let device = DeviceBLAS::default();
+    let mo_coeff = mo_coeff.to_rstsr(&device);
+    let mo_occ = mo_occ.to_rstsr(&device);
+
+    let nao = mo_coeff.shape()[0];
+    let nocc = mo_coeff.shape()[1];
+    let nset = mo_coeff.shape()[2];
+    let nao_tp = (nao + 1) * nao / 2;
+
+    // shape sanity check
+    assert_eq!(mo_occ.shape(), &[nocc, nset], "Molecular occupations must have shape (nmo, nset)");
+
+    let mut ks_rstsr = generate_vk_ri_direct_coeff_with_rstsr(mo_coeff.view(), mo_occ.view(), mol_obj, batch_size);
+    ks_rstsr *= scaling_factor;
+
+    // Tsr -> Vec<MatrixUpper>
+    let mut ks = vec![];
+    for iset in 0..nset {
+        let k = ks_rstsr.i((.., .., iset)).pack_tri(Upper).into_vec();
+        ks.push(unsafe { MatrixUpper::from_vec_unchecked(nao_tp, k) })
+    }
+    ks
+}
+
+/* #endregion ri-vk direct coeff */
+
+/* #region ri-vk direct dm */
+
+pub fn generate_vk_ri_direct_dm_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, batch_size: usize) -> Tsr<f64> {
+    assert_eq!(dms.ndim(), 3, "Density matrices must have 3 dimensions");
+
+    // initialize mol and aux
+    let mut mol = mol_obj.initialize_cint(true);
+    let mut aux = mol_obj.make_auxmol_fake().initialize_cint(false);
+
+    // get shapes
+    let nao = dms.shape()[0];
+    let nset = dms.shape()[2];
+    let naux = aux.cgto_loc().last().unwrap().clone();
+    let device = dms.device().clone();
+    let nbas = mol_obj.cint_bas.len() as i32;
+    let nbas_aux = mol_obj.cint_aux_bas.len() as i32;
+
+    // shape check
+    assert_eq!(dms.shape(), &[nao, nao, nset], "Density matrices must have shape (nao, nao, nset)");
+
+    // get partition
+    let ao_loc = &mol.cgto_loc()[..=(nbas as usize)];
+    let partition = blocksize_partition(&ao_loc, batch_size);
+
+    // initialize vk as result
+    let mut ks = rt::zeros(([nao, nao, nset].f(), &device));
+
+    // initialize int2c2e and perform cholesky decomposition
+    let tsr_int2c2e = {
+        let shls_slice = [[nbas, nbas + nbas_aux], [nbas, nbas + nbas_aux]];
+        let (out, shape) = mol.integral_s1::<int2c2e>(Some(&shls_slice));
+        rt::asarray((out, shape.f(), &device))
+    };
+    let tsr_int2c2e_l = rt::linalg::cholesky((tsr_int2c2e, Upper));
+
+    for (batch_i, &[shl0_i, shl1_i]) in partition.iter().enumerate() {
+        let ao0_i = ao_loc[shl0_i];
+        let ao1_i = ao_loc[shl1_i];
+        let nbatch_ao_i = ao1_i - ao0_i;
+        let shls_slice_i = [[shl0_i as i32, shl1_i as i32], [0, nbas], [nbas, nbas + nbas_aux]];
+        let int3c2e_batch_i = {
+            let (out, shape) = mol.integral_s1::<int3c2e>(Some(&shls_slice_i));
+            rt::asarray((out, shape.f(), &device))
+        };
+
+        // half-transform for batch i
+        let mut inveri_half_i = vec![];
+        for iset in 0..nset {
+            let mut eri_half_iset_vec = unsafe { uninitialized_vec::<f64>(nbatch_ao_i * nao * naux).unwrap() };
+            let eri_half_iset = rt::asarray((&mut eri_half_iset_vec, [nbatch_ao_i, nao, naux].f(), &device));
+            (0..naux).into_par_iter().for_each(|p| {
+                let cderi_half_iaux = eri_half_iset.i((.., .., p));
+                let mut cderi_half_iaux = unsafe { cderi_half_iaux.force_mut() };
+                cderi_half_iaux.matmul_from(&int3c2e_batch_i.i((.., .., p)), &dms.i((.., .., iset)), 1.0, 0.0);
+            });
+            let eri_half_iset =
+                rt::asarray((&mut eri_half_iset_vec, [nbatch_ao_i * nao, naux].f(), &device)).into_reverse_axes();
+            let eri_half_iset = rt::linalg::solve_triangular((tsr_int2c2e_l.t(), eri_half_iset, Lower));
+            rt::linalg::solve_triangular((tsr_int2c2e_l.view(), eri_half_iset, Upper));
+            let inveri_half_iset = rt::asarray((eri_half_iset_vec, [nbatch_ao_i, nao, naux].f(), &device));
+            inveri_half_i.push(inveri_half_iset);
+        }
+
+        // perform contribution to vk for intra-batch i
+        for iset in 0..nset {
+            let int3c2e_batch_i = int3c2e_batch_i.reshape([nbatch_ao_i, nao * naux]);
+            let inveri_half_iset = inveri_half_i[iset].reshape([nbatch_ao_i, nao * naux]);
+            ks.i_mut((ao0_i..ao1_i, ao0_i..ao1_i, iset)).matmul_from(&inveri_half_iset, &int3c2e_batch_i.t(), 1.0, 1.0);
+        }
+
+        for batch_j in 0..batch_i {
+            let &[shl0_j, shl1_j] = &partition[batch_j];
+            let ao0_j = ao_loc[shl0_j];
+            let ao1_j = ao_loc[shl1_j];
+            let nbatch_ao_j = ao1_j - ao0_j;
+            let shls_slice_j = [[shl0_j as i32, shl1_j as i32], [0, nbas], [nbas, nbas + nbas_aux]];
+            let int3c2e_batch_j = {
+                let (out, shape) = mol.integral_s1::<int3c2e>(Some(&shls_slice_j));
+                rt::asarray((out, shape.f(), &device))
+            };
+
+            for iset in 0..nset {
+                // half-transform for batch j
+                let mut scr_k = unsafe { rt::empty(([nbatch_ao_i, nbatch_ao_j].f(), &device)) };
+                let inveri_half_iset_i = inveri_half_i[iset].reshape([nbatch_ao_i, nao * naux]);
+                let int3c2e_batch_j = int3c2e_batch_j.reshape([nbatch_ao_j, nao * naux]);
+                scr_k.matmul_from(&inveri_half_iset_i, &int3c2e_batch_j.t(), 1.0, 0.0);
+                *&mut ks.i_mut((ao0_i..ao1_i, ao0_j..ao1_j, iset)) += &scr_k;
+                *&mut ks.i_mut((ao0_j..ao1_j, ao0_i..ao1_i, iset)) += &scr_k.t();
+            }
+        }
+    }
+    ks
+}
+
+/// Estimate memory requirement for VK RI direct method with density matrices.
+pub fn mem_estimate_vk_ri_direct_dm(nao: usize, naux: usize, nset: usize) -> MemEstimate {
+    // int3c2e_batch, inveri_half_iset
+    let batched = nao * naux + nao * naux * nset;
+    // ks, int2c2e
+    let fixed = nao * nao * nset + naux * naux;
+    // cderi per auxiliary
+    let thread = nao * nao;
+    MemEstimate { batched, fixed, thread }
+}
+
+pub fn generate_vk_ri_direct_dm(
+    scaling_factor: f64,
+    dms: &[MatrixFull<f64>],
+    mol_obj: &Molecule,
+    batch_size: usize,
+) -> Vec<MatrixUpper<f64>> {
+    let device = DeviceBLAS::default();
+    let dms = dms.to_rstsr(&device);
+
+    let nao = dms.shape()[0];
+    let nset = dms.shape()[2];
+    let nao_tp = (nao + 1) * nao / 2;
+
+    // shape sanity check
+    assert_eq!(dms.shape(), &[nao, nao, nset], "Density matrices must have shape (nao, nao, nset)");
+
+    let mut ks_rstsr = generate_vk_ri_direct_dm_with_rstsr(dms.view(), mol_obj, batch_size);
+    ks_rstsr *= scaling_factor;
+
+    // Tsr -> Vec<MatrixUpper>
+    let mut ks = vec![];
+    for iset in 0..nset {
+        let k = ks_rstsr.i((.., .., iset)).pack_tri(Upper).into_vec();
+        ks.push(unsafe { MatrixUpper::from_vec_unchecked(nao_tp, k) })
+    }
+    ks
+}
+
+/* #endregion ri-vk direct dm */
 
 #[cfg(test)]
 mod debug {
@@ -851,6 +1017,7 @@ mod debug {
 
         let mo_coeff = [&scf_data.eigenvectors[0]].as_ref().to_rstsr(&device);
         let mo_occ = (&scf_data.occupation[0]).to_rstsr(&device).into_slice((.., None));
+        let dms = [&scf_data.density_matrix[0]].as_ref().to_rstsr(&device);
         let mol = &scf_data.mol;
 
         // incore, full batch
@@ -886,6 +1053,18 @@ mod debug {
 
         // direct, small batch
         let k_rstsr = generate_vk_ri_direct_coeff_with_rstsr(mo_coeff.view(), mo_occ.view(), mol, 16);
+        let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
+        let ref_fp = 12.950224351107128;
+        assert!((fp / ref_fp - 1.0).abs() < 1e-5);
+
+        // direct, full batch, dm version
+        let k_rstsr = generate_vk_ri_direct_dm_with_rstsr(dms.view(), mol, 10000);
+        let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
+        let ref_fp = 12.950224351107128;
+        assert!((fp / ref_fp - 1.0).abs() < 1e-5);
+
+        // direct, small batch, dm version
+        let k_rstsr = generate_vk_ri_direct_dm_with_rstsr(dms.view(), mol, 16);
         let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
         let ref_fp = 12.950224351107128;
         assert!((fp / ref_fp - 1.0).abs() < 1e-5);

@@ -221,6 +221,7 @@ impl SCF {
                     alg_jk
                 }
             } else {
+                println!("Memory available for RI integrals ({:.2} MB) is more than required ({:.2} MB).", mem_avail_mb.unwrap_or(f64::INFINITY), mem_cderi_mb);
                 println!("Using standard incore RI-J/K algorithms.");
                 if alg_jk == AlgJK::Ri {
                     AlgJK::RiIncore
@@ -1733,12 +1734,19 @@ impl SCF {
         };
 
         let use_dm_only = self.mol.ctrl.use_dm_only;
-        let vk = if self.mol.ctrl.use_isdf && !self.mol.ctrl.isdf_new{
+        let vk = if self.mol.ctrl.use_isdf && !self.mol.ctrl.isdf_new {
             self.generate_vk_with_isdf(scaling_factor, use_dm_only)
-        }else if self.mol.ctrl.isdf_new{
+        } else if self.mol.ctrl.isdf_new {
             self.generate_vk_with_isdf_new(scaling_factor)
-        }else{
-            self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator)
+        } else {
+            match self.alg_jk {
+                AlgJK::RiIncore | AlgJK::Separated(_, AlgK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
+                AlgJK::RiDirect | AlgJK::Separated(_, AlgK::RiDirect) => {
+                    // use density matrix anyway, that should be generally better when using RI-direct
+                    self.generate_vk_ri_direct_dm(scaling_factor, None)
+                },
+                _ => unreachable!("Other cases of alg_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.alg_jk),
+            }
         };
 
 
@@ -3114,7 +3122,7 @@ impl SCF {
     fn generate_vj_ri_direct(&mut self, block_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
         println!("[DEBUG] in  generate_vj_ri_direct");
         // compute block_size
-        const MIN_BLOCK_SIZE: usize = 16;
+        let min_block_size = 2 * rayon::current_num_threads();
         let block_size = block_size.unwrap_or_else(|| {
             let nao = self.mol.num_basis;
             let naux = self.mol.num_auxbas;
@@ -3125,7 +3133,7 @@ impl SCF {
             });
             let mem_est = ri_on_the_fly::mem_estimate_vj_ri_direct(nao, naux, nset);
             let aux_batch_size = calc_batch_size_from_mem_estimate::<f64>(&mem_est, mem_avail, None);
-            let aux_batch_size = aux_batch_size.max(MIN_BLOCK_SIZE);
+            let aux_batch_size = aux_batch_size.max(min_block_size);
             // info output
             println!("[INFO] in generate_vj_ri_direct, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
             println!("[INFO] in generate_vj_ri_direct, batch size      : {aux_batch_size}");
@@ -3147,6 +3155,79 @@ impl SCF {
         vjs
     }
 
+    fn generate_vk_ri_direct_coeff(&mut self, scaling_factor: f64, block_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
+        println!("[DEBUG] in  generate_vk_ri_direct_coeff");
+        // compute block_size
+        let min_block_size = 2 * rayon::current_num_threads();
+        let block_size = block_size.unwrap_or_else(|| {
+            let nao = self.mol.num_basis;
+            let naux = self.mol.num_auxbas;
+            let nset = self.mol.spin_channel;
+            let nocc_max = self.occupation.iter().map(|occ| occ.iter().filter(|&&x| x > f64::EPSILON).count()).max().unwrap();
+            let sys_info = sysinfo::System::new_all();
+            let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
+                max_memory - detect_used_memory_mb("proc")
+            });
+            let mem_est = ri_on_the_fly::mem_estimate_vk_ri_direct_coeff(nao, naux, nocc_max, nset);
+            let aux_batch_size = calc_batch_size_from_mem_estimate::<f64>(&mem_est, mem_avail, None);
+            let aux_batch_size = aux_batch_size.max(min_block_size);
+            // info output
+            println!("[INFO] in generate_vk_ri_direct_coeff, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
+            println!("[INFO] in generate_vk_ri_direct_coeff, batch size      : {aux_batch_size}");
+            println!("[INFO] in generate_vk_ri_direct_coeff, memory estimation");
+            mem_est.print_with_dtype::<f64>();
+            aux_batch_size
+        });
+
+        // compute vk only for specified spin channels
+        let mo_coeff = &self.eigenvectors[0..self.mol.spin_channel];
+        let mo_occ = &self.occupation[0..self.mol.spin_channel];
+        let mol_obj = &self.mol;
+        let mut vks = crate::scf_io::ri_on_the_fly::generate_vk_ri_direct_coeff(scaling_factor, mo_coeff, mo_occ, mol_obj, block_size);
+
+        // complete `vks` if the spin channel is 1 (restricted, spin-unpolarized)
+        if self.mol.spin_channel == 1 {
+            vks.push(MatrixUpper::new(1, 0.0f64));
+        }
+
+        vks
+    }
+
+    fn generate_vk_ri_direct_dm(&mut self, scaling_factor: f64, block_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
+        println!("[DEBUG] in  generate_vk_ri_direct_dm");
+        // compute block_size
+        let min_block_size = 2 * rayon::current_num_threads();
+        let block_size = block_size.unwrap_or_else(|| {
+            let nao = self.mol.num_basis;
+            let naux = self.mol.num_auxbas;
+            let nset = self.mol.spin_channel;
+            let sys_info = sysinfo::System::new_all();
+            let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
+                max_memory - detect_used_memory_mb("proc")
+            });
+            let mem_est = ri_on_the_fly::mem_estimate_vk_ri_direct_dm(nao, naux, nset);
+            let aux_batch_size = calc_batch_size_from_mem_estimate::<f64>(&mem_est, mem_avail, None);
+            let aux_batch_size = aux_batch_size.max(min_block_size);
+            // info output
+            println!("[INFO] in generate_vk_ri_direct_dm, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
+            println!("[INFO] in generate_vk_ri_direct_dm, batch size      : {aux_batch_size}");
+            println!("[INFO] in generate_vk_ri_direct_dm, memory estimation");
+            mem_est.print_with_dtype::<f64>();
+            aux_batch_size
+        });
+
+        // compute vk only for specified spin channels
+        let dms = &self.density_matrix[0..self.mol.spin_channel];
+        let mol_obj = &self.mol;
+        let mut vks = crate::scf_io::ri_on_the_fly::generate_vk_ri_direct_dm(scaling_factor, dms, mol_obj, block_size);
+
+        // complete `vks` if the spin channel is 1 (restricted, spin-unpolarized)
+        if self.mol.spin_channel == 1 {
+            vks.push(MatrixUpper::new(1, 0.0f64));
+        }
+
+        vks
+    }
 }
 
 /// Applies a projection operator to a given matrix. Specifically, it calculates the
