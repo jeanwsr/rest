@@ -3155,44 +3155,6 @@ impl SCF {
         vjs
     }
 
-    fn generate_vk_ri_direct_coeff(&mut self, scaling_factor: f64, block_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
-        println!("[DEBUG] in  generate_vk_ri_direct_coeff");
-        // compute block_size
-        let min_block_size = 2 * rayon::current_num_threads();
-        let block_size = block_size.unwrap_or_else(|| {
-            let nao = self.mol.num_basis;
-            let naux = self.mol.num_auxbas;
-            let nset = self.mol.spin_channel;
-            let nocc_max = self.occupation.iter().map(|occ| occ.iter().filter(|&&x| x > f64::EPSILON).count()).max().unwrap();
-            let sys_info = sysinfo::System::new_all();
-            let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
-                max_memory - detect_used_memory_mb("proc")
-            });
-            let mem_est = ri_on_the_fly::mem_estimate_vk_ri_direct_coeff(nao, naux, nocc_max, nset);
-            let aux_batch_size = calc_batch_size_from_mem_estimate::<f64>(&mem_est, mem_avail, None);
-            let aux_batch_size = aux_batch_size.max(min_block_size);
-            // info output
-            println!("[INFO] in generate_vk_ri_direct_coeff, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
-            println!("[INFO] in generate_vk_ri_direct_coeff, batch size      : {aux_batch_size}");
-            println!("[INFO] in generate_vk_ri_direct_coeff, memory estimation");
-            mem_est.print_with_dtype::<f64>();
-            aux_batch_size
-        });
-
-        // compute vk only for specified spin channels
-        let mo_coeff = &self.eigenvectors[0..self.mol.spin_channel];
-        let mo_occ = &self.occupation[0..self.mol.spin_channel];
-        let mol_obj = &self.mol;
-        let mut vks = crate::scf_io::ri_on_the_fly::generate_vk_ri_direct_coeff(scaling_factor, mo_coeff, mo_occ, mol_obj, block_size);
-
-        // complete `vks` if the spin channel is 1 (restricted, spin-unpolarized)
-        if self.mol.spin_channel == 1 {
-            vks.push(MatrixUpper::new(1, 0.0f64));
-        }
-
-        vks
-    }
-
     fn generate_vk_ri_direct_dm(&mut self, scaling_factor: f64, block_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
         println!("[DEBUG] in  generate_vk_ri_direct_dm");
         // compute block_size
