@@ -7,6 +7,7 @@ use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_e
 use crate::mpi_io::{mpi_broadcast, mpi_broadcast_matrixfull, mpi_broadcast_vector, mpi_reduce, MPIOperator};
 use crate::utilities::{create_pool, TimeRecords};
 use crate::utilities::memory_batch::*;
+use crate::ctrl_io::flags::*;
 
 ////use blas_src::openblas::dgemm;
 mod addons;
@@ -86,6 +87,7 @@ pub struct SCF {
     pub ref_eigenvectors: HashMap<String, ([MatrixFull<f64>;2], [usize;4])>,
     pub renormalized_singles_particles:Vec<f64>,
     pub gwqp:(Vec<f64>,Vec<f64>),
+    pub alg_jk: AlgJK,
 }
 
 #[derive(Clone,Copy)]
@@ -135,6 +137,7 @@ impl SCF {
             energies: HashMap::new(),
             renormalized_singles_particles:Vec::new(),
             gwqp:(Vec::new(),Vec::new()),
+            alg_jk: AlgJK::Default,
         };
 
         // at first check the scf type: RHF, ROHF or UHF
@@ -163,6 +166,79 @@ impl SCF {
         };
 
         scf_data
+    }
+
+
+    /// Determine the J/K algorithms based on user input and memory requirement.
+    /// 
+    /// Only in effective when
+    /// 
+    /// - Some user input is not given (i.e. field `alg_jk` is not specified).
+    /// - Some user input is not a determined algorithm (i.e. field `alg_jk` is set to `ri`
+    ///   instead of more-determined `ri-incore` or `ri-direct`).
+    /// 
+    /// The memory consumption for RI integrals is estimated as (nao, nao, naux) * 8 bytes.
+    /// This estimation is twice larger than the actual memory consumption, to be conservative.
+    pub fn update_jk_algorithms(&mut self) {
+        let mol = &self.mol;
+
+        // check algorithms of J/K
+        let alg_jk = mol.ctrl.alg_jk;
+        // by default, we will let it be RI
+        let alg_jk = match alg_jk {
+            AlgJK::Default => AlgJK::Ri,
+            AlgJK::Separated(alg_j, alg_k) => {
+                let new_alg_j = if alg_j == AlgJ::Default { AlgJ::Ri } else { alg_j };
+                let new_alg_k = if alg_k == AlgK::Default { AlgK::Ri } else { alg_k };
+                AlgJK::Separated(new_alg_j, new_alg_k)
+            },
+            _ => alg_jk,
+        };
+        // check memory requirement for RI
+        let has_ri_non_specified = match alg_jk {
+            AlgJK::Ri => true,
+            AlgJK::Separated(alg_j, alg_k) => alg_j == AlgJ::Ri || alg_k == AlgK::Ri,
+            _ => false,
+        };
+        let alg_jk = if has_ri_non_specified {
+            println!("Checking memory requirement for RI J/K algorithms...");
+            let nao = mol.num_basis;
+            let naux = mol.num_auxbas;
+            let mem_cderi_mb = 8.0 * (nao * nao * naux) as f64 / 1024.0 / 1024.0;
+            let mem_avail_mb = mol.ctrl.max_memory.map(|max_memory| {
+                max_memory - detect_used_memory_mb("proc")
+            });
+            let alg_jk = if mem_avail_mb.is_some_and(|mem_avail_mb| mem_avail_mb < mem_cderi_mb) {
+                println!("Memory available for RI integrals ({:.2} MB) is less than required ({:.2} MB).", mem_avail_mb.unwrap(), mem_cderi_mb);
+                println!("Switch to direct RI-J/K algorithms.");
+                if alg_jk == AlgJK::Ri {
+                    AlgJK::RiDirect
+                } else if let AlgJK::Separated(alg_j, alg_k) = alg_jk {
+                    let new_alg_j = if alg_j == AlgJ::Ri { AlgJ::RiDirect } else { alg_j };
+                    let new_alg_k = if alg_k == AlgK::Ri { AlgK::RiDirect } else { alg_k };
+                    AlgJK::Separated(new_alg_j, new_alg_k)
+                } else {
+                    alg_jk
+                }
+            } else {
+                println!("Using standard incore RI-J/K algorithms.");
+                if alg_jk == AlgJK::Ri {
+                    AlgJK::RiIncore
+                } else if let AlgJK::Separated(alg_j, alg_k) = alg_jk {
+                    let new_alg_j = if alg_j == AlgJ::Ri { AlgJ::RiIncore } else { alg_j };
+                    let new_alg_k = if alg_k == AlgK::Ri { AlgK::RiIncore } else { alg_k };
+                    AlgJK::Separated(new_alg_j, new_alg_k)
+                } else {
+                    alg_jk
+                }
+            };
+            alg_jk
+        } else {
+            alg_jk
+        };
+
+        // reassign the alg_jk to disable any ambiguity
+        self.alg_jk = alg_jk;
     }
 
 
@@ -296,7 +372,17 @@ impl SCF {
             }
         }
 
-        let use_eri = self.mol.use_eri;
+        // update use_eri if some RI algorithms are specified
+        let use_eri_jk = match self.alg_jk {
+            AlgJK::RiIncore => true,
+            AlgJK::Separated(alg_j, alg_k) => {
+                let use_eri_j = alg_j == AlgJ::RiIncore;
+                let use_eri_k = alg_k == AlgK::RiIncore;
+                use_eri_j || use_eri_k
+            },
+            _ => false,
+        };
+        let use_eri = self.mol.use_eri || use_eri_jk;
         //let use_eri = true;
         let isdf = if use_eri {self.mol.ctrl.eri_type.eq("ri_v") && self.mol.ctrl.use_isdf} else {false};
         let ri3fn_full = if use_eri {self.mol.ctrl.use_auxbas && !self.mol.ctrl.use_ri_symm} else {false};
@@ -1630,12 +1716,15 @@ impl SCF {
         let num_state = self.mol.num_state;
         let spin_channel = self.mol.spin_channel;
         let dt1 = time::Local::now();
-        let vj = if self.mol.ctrl.isdf_new || self.mol.ctrl.ri_k_only {
+        let vj = if self.mol.ctrl.isdf_new {
             self.generate_vj_ri_direct(None)
-        }else{
-            self.generate_vj_with_ri_v_sync(1.0, mpi_operator)
+        } else {
+            match self.alg_jk {
+                AlgJK::RiIncore | AlgJK::Separated(AlgJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
+                AlgJK::RiDirect | AlgJK::Separated(AlgJ::RiDirect, _) => self.generate_vj_ri_direct(None),
+                _ => unreachable!("Other cases of alg_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.alg_jk),
+            }
         };
-
 
         let dt2 = time::Local::now();
         let scaling_factor = match self.scftype {
@@ -1831,10 +1920,10 @@ impl SCF {
         let dt1 = time::Local::now();
         //let use_eri = self.mol.xc_data.use_eri() || self.mol.xc_dat;
         //let use_eri = true;
-        let vj = if self.mol.ctrl.use_ri_vj {
-            self.generate_vj_with_ri_v_sync(1.0, mpi_operator)
-        } else {
-            self.generate_vj_ri_direct(None)
+        let vj = match self.alg_jk {
+            AlgJK::RiIncore | AlgJK::Separated(AlgJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
+            AlgJK::RiDirect | AlgJK::Separated(AlgJ::RiDirect, _) => self.generate_vj_ri_direct(None),
+            _ => unreachable!("Other cases of alg_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.alg_jk),
         };
         //// ==== DEBUG IGOR ====
         //if let Some(mpi_op) = &mpi_operator {
@@ -3020,9 +3109,10 @@ impl SCF {
     /// - `direct`: on-the-fly direct calculation
     /// 
     /// To activate this function, in the meantime when writing this function, in `ctrl.in`
-    /// - specify `use_ri_vj = false` to disable full storage of 3c-2e ERI (required);
+    /// - specify `alg_j = ri-direct` or `alg_jk = ri-direct` to disable full storage of 3c-2e ERI (required);
     /// - specify `[ctrl]: max_memory` in MB for calculating `block_size` if not specified;
     fn generate_vj_ri_direct(&mut self, block_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
+        println!("[DEBUG] in  generate_vj_ri_direct");
         // compute block_size
         const MIN_BLOCK_SIZE: usize = 16;
         let block_size = block_size.unwrap_or_else(|| {
@@ -4781,6 +4871,9 @@ pub fn initialize_scf(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
     // for preparing the following integrals accurately
     let position = &scf_data.mol.geom.position;
     scf_data.mol.cint_env = scf_data.mol.update_geom_poisition_in_cint_env(position);
+
+    // update the RI-JK algorithms if not clearly specified
+    scf_data.update_jk_algorithms();
 
     let mut time_mark = utilities::TimeRecords::new();
     time_mark.new_item("Overall", "SCF Preparation");
