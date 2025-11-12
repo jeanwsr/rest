@@ -252,7 +252,7 @@ pub fn initial_guess_from_hdf5chkfile(
     let file = hdf5::File::open(chkname).unwrap();
     let scf = file.group("scf").unwrap();
     let member = scf.member_names().unwrap();
-    let e_tot = scf.dataset("e_tot").unwrap().read_1d::<f64>().unwrap()[0];
+    let e_tot = scf.dataset("e_tot").unwrap().read_raw::<f64>().unwrap()[0];
     if print_level>1 {
         println!("HDF5 Group: {:?} \nMembers: {:?}", scf, member);
     }
