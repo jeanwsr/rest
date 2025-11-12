@@ -68,7 +68,6 @@ pub enum AlgK {
     Default,
     Ri,
     RiIncore,
-    RiSemiDirect,
     RiDirect,
 }
 
@@ -78,7 +77,6 @@ impl std::fmt::Debug for AlgK {
             AlgK::Default => "default",
             AlgK::Ri => "ri",
             AlgK::RiIncore => "ri-incore",
-            AlgK::RiSemiDirect => "ri-semi-direct",
             AlgK::RiDirect => "ri-direct",
         };
         write!(f, "{s}")
@@ -94,7 +92,6 @@ impl<'de> Deserialize<'de> for AlgK {
         match normalize_input_string(&s).as_str() {
             "ri" => Ok(AlgK::Ri),
             "riincore" => Ok(AlgK::RiIncore),
-            "risemidirect" => Ok(AlgK::RiSemiDirect),
             "ridirect" => Ok(AlgK::RiDirect),
             "default" | "" => Ok(AlgK::Default),
             _ => Err(serde::de::Error::custom(format!(
