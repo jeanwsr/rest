@@ -13,7 +13,7 @@ pub fn serde_from_value<T: serde::de::DeserializeOwned>(v: &serde_json::Value) -
 }
 
 #[non_exhaustive]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum AlgJ {
     #[default]
     Default,
@@ -62,7 +62,7 @@ impl Serialize for AlgJ {
 }
 
 #[non_exhaustive]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum AlgK {
     #[default]
     Default,
@@ -114,11 +114,13 @@ impl Serialize for AlgK {
 }
 
 #[non_exhaustive]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum AlgJK {
     #[default]
     Default,
     Ri,
+    RiIncore,
+    RiDirect,
     Separated(AlgJ, AlgK),
 }
 
@@ -127,6 +129,8 @@ impl std::fmt::Debug for AlgJK {
         let s = match self {
             AlgJK::Default => "default",
             AlgJK::Ri => "ri",
+            AlgJK::RiIncore => "ri-incore",
+            AlgJK::RiDirect => "ri-direct",
             AlgJK::Separated(alg_j, alg_k) => &format!("separated({alg_j:?}, {alg_k:?})"),
         };
         write!(f, "{s}")
@@ -142,6 +146,8 @@ impl<'de> Deserialize<'de> for AlgJK {
         match normalize_input_string(&s).as_str() {
             "ri" => Ok(AlgJK::Ri),
             "default" | "" => Ok(AlgJK::Default),
+            "riincore" => Ok(AlgJK::RiIncore),
+            "ridirect" => Ok(AlgJK::RiDirect),
             _ => Err(serde::de::Error::custom(format!(
                 "unknown AlgJK variant: {s}",
             ))),

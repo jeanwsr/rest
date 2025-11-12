@@ -215,7 +215,9 @@ pub struct InputKeywords {
     pub check_stab: bool,
     #[pyo3(get, set)]
     pub use_dm_only: bool,
-    pub use_ri_vj: bool,
+    pub alg_jk: AlgJK,
+    pub alg_j: AlgJ,
+    pub alg_k: AlgK,
     // Keywords for fciqmc dump
     #[pyo3(get, set)]
     pub fciqmc_dump: bool,
@@ -357,7 +359,9 @@ impl InputKeywords {
             // True:  using only density matrix in the evaluation
             // False: use coefficients as well with higher efficiency
             use_dm_only: false,
-            use_ri_vj: true,
+            alg_jk: AlgJK::Default,
+            alg_j: AlgJ::Default,
+            alg_k: AlgK::Default,
             // Keywords for the fciqmc dump
             fciqmc_dump: false,
             // Kyewords for post scf
@@ -1159,11 +1163,16 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
                 other => false,
             };
-            tmp_input.use_ri_vj = match tmp_ctrl.get("use_ri_vj").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(true),
-                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
-                other => true,
-            };
+            // setup and sanity check of J/K algorithms
+            tmp_input.alg_jk = tmp_ctrl.get("alg_jk").map(serde_from_value).unwrap_or_default();
+            tmp_input.alg_j = tmp_ctrl.get("alg_j").map(serde_from_value).unwrap_or_default();
+            tmp_input.alg_k = tmp_ctrl.get("alg_k").map(serde_from_value).unwrap_or_default();
+            if (tmp_input.alg_j != AlgJ::Default || tmp_input.alg_k != AlgK::Default) {
+                if tmp_input.alg_jk != AlgJK::Default {
+                    println!("Warning: alg_j and alg_k are specified, the setting in alg_jk will be ignored.");
+                }
+                tmp_input.alg_jk = AlgJK::Separated(tmp_input.alg_j, tmp_input.alg_k);
+            }
             // ================================================
             //  Keywords associated with the elec occupation 
             // ================================================

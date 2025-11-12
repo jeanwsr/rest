@@ -229,7 +229,7 @@ impl Molecule {
             DFTType::DeepLearning => {DFA4REST::new_deep_learning(spin_channel, ctrl.print_level, &ctrl.xc_model)}
         };
 
-        let use_eri = xc_data.use_eri() || ctrl.use_ri_vj;
+        let use_eri = xc_data.use_eri();
         
 
         let mut start_mo = count_frozen_core_states(ctrl.frozen_core_postscf, &geom.elem);
