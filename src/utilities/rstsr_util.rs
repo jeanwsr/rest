@@ -113,6 +113,29 @@ where
     }
 }
 
+impl<T> RestTensorToRstsrTsrAPI<T> for &[Vec<T>]
+where
+    T: Clone,
+    DeviceBLAS: DeviceAPI<T, Raw = Vec<T>> + OpAssignAPI<T, IxD> + DeviceCreationAnyAPI<T>,
+{
+    fn to_rstsr(&self, device: &DeviceBLAS) -> Tsr<T> {
+        if self.len() == 0 {
+            panic!("Empty slice cannot be converted to RSTSR Tensor.");
+        }
+        let n = self[0].len();
+        let nset = self.len();
+        let layout = vec![n, nset].f();
+
+        let mut tsr = unsafe { rt::empty((layout, device)) };
+        for (iset, vec) in self.iter().enumerate() {
+            let mut slc = tsr.i_mut((.., iset));
+            let vec_tsr: TsrView<T> = rt::asarray((vec, device));
+            slc.assign(&vec_tsr);
+        }
+        tsr
+    }
+}
+
 impl<T> RestTensorIntoRstsrTsrAPI<T> for Vec<T>
 where
     T: Clone,
