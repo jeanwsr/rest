@@ -203,6 +203,7 @@ pub fn calc_batch_size_from_mem_estimate<T>(
     mem_est: &MemEstimate,
     mem_avail: Option<f64>,
     mem_factor: Option<f64>,
+    print_warn: bool,
 ) -> usize {
     use rayon::prelude::*;
     let num_threads = rayon::current_num_threads();
@@ -217,10 +218,10 @@ pub fn calc_batch_size_from_mem_estimate<T>(
     let mem_avail_factored_mb = mem_avail.unwrap_or_else(detect_available_memory_mb) * mem_factor;
     let max_mb = mem_avail_factored_mb - fixed_mb - thread_mb * num_threads as f64;
 
-    if unit_mb > max_mb {
-        println!("[WARN] Memory overflow when preparing batch number.");
-        println!("       Current memory available {mem_avail_mb:10.3} MB, after allocation {max_mb:10.3} MB, minimum required per batch {unit_mb:10.3} MB");
-        println!("       Following debug info from MemEstimate:");
+    if unit_mb > max_mb && print_warn {
+        eprintln!("[WARN] Memory overflow when preparing batch number.");
+        eprintln!("       Current memory available {mem_avail_mb:10.3} MB, after allocation {max_mb:10.3} MB, minimum required per batch {unit_mb:10.3} MB");
+        eprintln!("       Following debug info from MemEstimate:");
         mem_est.print_with_dtype::<T>();
     }
     let batch_size = (max_mb / unit_mb).floor().max(1.0).to_usize().unwrap();
@@ -236,7 +237,7 @@ mod tests {
         use rayon::prelude::*;
         let pool = rayon::ThreadPoolBuilder::new().num_threads(6).build().unwrap();
         let mem_est = MemEstimate { batched: 200_000, fixed: 500_000, thread: 100_000 };
-        let batch_size = pool.install(|| calc_batch_size_from_mem_estimate::<f64>(&mem_est, Some(500.0), Some(0.8)));
+        let batch_size = pool.install(|| calc_batch_size_from_mem_estimate::<f64>(&mem_est, Some(500.0), Some(0.8), true));
         println!("Calculated batch size: {batch_size}");
         assert_eq!(batch_size, 256);
     }

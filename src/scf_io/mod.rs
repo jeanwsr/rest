@@ -1741,10 +1741,7 @@ impl SCF {
         } else {
             match self.alg_jk {
                 AlgJK::RiIncore | AlgJK::Separated(_, AlgK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
-                AlgJK::RiDirect | AlgJK::Separated(_, AlgK::RiDirect) => {
-                    // use density matrix anyway, that should be generally better when using RI-direct
-                    self.generate_vk_ri_direct_dm(scaling_factor, None)
-                },
+                AlgJK::RiDirect | AlgJK::Separated(_, AlgK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None),
                 _ => unreachable!("Other cases of alg_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.alg_jk),
             }
         };
@@ -1964,7 +1961,12 @@ impl SCF {
         if ! scaling_factor.eq(&0.0) {
             let use_dm_only = self.mol.ctrl.use_dm_only;
             //self.mol.ctrl.use_dm_only
-            let vk = self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator);
+            // let vk = self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator);
+            let vk = match self.alg_jk {
+                AlgJK::RiIncore | AlgJK::Separated(_, AlgK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
+                AlgJK::RiDirect | AlgJK::Separated(_, AlgK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None),
+                _ => unreachable!("Other cases of alg_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.alg_jk),
+            };
             for i_spin in (0..spin_channel) {
                 self.hamiltonian[i_spin].data
                     .par_iter_mut()
@@ -3119,33 +3121,53 @@ impl SCF {
     /// To activate this function, in the meantime when writing this function, in `ctrl.in`
     /// - specify `alg_j = ri-direct` or `alg_jk = ri-direct` to disable full storage of 3c-2e ERI (required);
     /// - specify `[ctrl]: max_memory` in MB for calculating `block_size` if not specified;
-    fn generate_vj_ri_direct(&mut self, block_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
-        println!("[DEBUG] in  generate_vj_ri_direct");
-        // compute block_size
-        let min_block_size = 2 * rayon::current_num_threads();
-        let block_size = block_size.unwrap_or_else(|| {
-            let nao = self.mol.num_basis;
-            let naux = self.mol.num_auxbas;
-            let nset = self.mol.spin_channel;
-            let sys_info = sysinfo::System::new_all();
-            let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
-                max_memory - detect_used_memory_mb("proc")
-            });
-            let mem_est = ri_on_the_fly::mem_estimate_vj_ri_direct(nao, naux, nset);
-            let aux_batch_size = calc_batch_size_from_mem_estimate::<f64>(&mem_est, mem_avail, None);
-            let aux_batch_size = aux_batch_size.max(min_block_size);
-            // info output
+    fn generate_vj_ri_direct(&mut self, batch_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
+        let print_level = self.mol.ctrl.print_level;
+
+        // compute batch_size
+        let min_batch_size = 2 * rayon::current_num_threads();
+
+        // estimate batch size based on available memory
+        let nao = self.mol.num_basis;
+        let naux = self.mol.num_auxbas;
+        let nset = self.mol.spin_channel;
+        let sys_info = sysinfo::System::new_all();
+        let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
+            max_memory - detect_used_memory_mb("proc")
+        });
+        let mem_est = ri_on_the_fly::mem_estimate_vj_ri_direct(nao, naux, nset);
+        let mut batch_size_estimate = calc_batch_size_from_mem_estimate::<f64>(&mem_est, mem_avail, None, true);
+
+        // if estimated batch size is smaller than minimum, warn and set to minimum
+        if batch_size_estimate < min_batch_size {
+            eprintln!("[WARN] in generate_vj_ri_direct, the estimated batch size ({batch_size_estimate}) is smaller than the minimum batch size ({min_batch_size}).");
+            eprintln!("[WARN] Setting batch size to {min_batch_size}. Memory could be insufficient.");
+            batch_size_estimate = min_batch_size;
+        }
+
+        // if user specified batch size is smaller than minimum, warn and set to minimum
+        let batch_size = if let Some(user_batch_size) = batch_size {
+            if user_batch_size < min_batch_size {
+                eprintln!("[WARN] in generate_vj_ri_direct, the specified batch size ({user_batch_size}) is smaller than the minimum batch size ({min_batch_size}).");
+                eprintln!("[WARN] Setting batch size to {min_batch_size}.");
+            }
+            user_batch_size.max(min_batch_size)
+        } else {
+            batch_size_estimate
+        };
+
+        // batch size info output
+        if print_level > 0 {
             println!("[INFO] in generate_vj_ri_direct, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
-            println!("[INFO] in generate_vj_ri_direct, batch size      : {aux_batch_size}");
+            println!("[INFO] in generate_vj_ri_direct, batch size      : {batch_size}");
             println!("[INFO] in generate_vj_ri_direct, memory estimation");
             mem_est.print_with_dtype::<f64>();
-            aux_batch_size
-        });
+        }
 
         // compute vj only for specified spin channels
         let dms = &self.density_matrix[0..self.mol.spin_channel];
         let mol_obj = &self.mol;
-        let mut vjs = crate::scf_io::ri_on_the_fly::generate_vj_ri_direct(dms, mol_obj, block_size);
+        let mut vjs = crate::scf_io::ri_on_the_fly::generate_vj_ri_direct(dms, mol_obj, batch_size);
 
         // complete `vjs` if the spin channel is 1 (restricted, spin-unpolarized)
         if self.mol.spin_channel == 1 {
@@ -3155,33 +3177,80 @@ impl SCF {
         vjs
     }
 
-    fn generate_vk_ri_direct_dm(&mut self, scaling_factor: f64, block_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
-        println!("[DEBUG] in  generate_vk_ri_direct_dm");
-        // compute block_size
-        let min_block_size = 2 * rayon::current_num_threads();
-        let block_size = block_size.unwrap_or_else(|| {
-            let nao = self.mol.num_basis;
-            let naux = self.mol.num_auxbas;
-            let nset = self.mol.spin_channel;
-            let sys_info = sysinfo::System::new_all();
-            let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
-                max_memory - detect_used_memory_mb("proc")
-            });
-            let mem_est = ri_on_the_fly::mem_estimate_vk_ri_direct_dm(nao, naux, nset);
-            let aux_batch_size = calc_batch_size_from_mem_estimate::<f64>(&mem_est, mem_avail, None);
-            let aux_batch_size = aux_batch_size.max(min_block_size);
-            // info output
-            println!("[INFO] in generate_vk_ri_direct_dm, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
-            println!("[INFO] in generate_vk_ri_direct_dm, batch size      : {aux_batch_size}");
-            println!("[INFO] in generate_vk_ri_direct_dm, memory estimation");
-            mem_est.print_with_dtype::<f64>();
-            aux_batch_size
+    fn generate_vk_ri_direct(&mut self, scaling_factor: f64, use_dm_only: bool, batch_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
+        let print_level = self.mol.ctrl.print_level;
+
+        // compute batch_size
+        let min_batch_size = 2 * rayon::current_num_threads();
+        
+        // estimate batch size based on available memory
+        let nao = self.mol.num_basis;
+        let naux = self.mol.num_auxbas;
+        let nset = self.mol.spin_channel;
+        let nocc_max = self.occupation.iter().map(|occ_s| occ_s.iter().filter(|&&x| x > f64::EPSILON).count()).max().unwrap_or(0);
+        let sys_info = sysinfo::System::new_all();
+        let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
+            max_memory - detect_used_memory_mb("proc")
         });
+        let mem_est_direct = ri_on_the_fly::mem_estimate_vk_ri_direct_dm(nao, naux, nset);
+        let mem_est_semi = ri_on_the_fly::mem_estimate_vk_ri_semi_direct_coeff(nao, naux, nocc_max, nset);
+        let batch_size_estimate_direct = calc_batch_size_from_mem_estimate::<f64>(&mem_est_direct, mem_avail, None, true);
+        let batch_size_estimate_semi = calc_batch_size_from_mem_estimate::<f64>(&mem_est_semi, mem_avail, None, true);
+
+        // prefer semi-direct if possible
+        let (alg_semi, mut batch_size_estimate) = if !use_dm_only && batch_size_estimate_semi >= min_batch_size {
+            if print_level > 0 {
+                println!("[INFO] in generate_vk_ri_direct_dm, using semi-direct algorithm for vk computation.");
+            }
+            (true, batch_size_estimate_semi)
+        } else {
+            if print_level > 0 {
+                println!("[INFO] in generate_vk_ri_direct_dm, using direct algorithm for vk computation.");
+            }
+            (false, batch_size_estimate_direct)
+        };
+
+        // if estimated batch size is smaller than minimum, warn and set to minimum
+        if batch_size_estimate < min_batch_size {
+            eprintln!("[WARN] in generate_vk_ri_direct_dm, the estimated batch size ({batch_size_estimate}) is smaller than the minimum batch size ({min_batch_size}).");
+            eprintln!("[WARN] Setting batch size to {min_batch_size}. Memory could be insufficient.");
+            batch_size_estimate = min_batch_size
+        }
+
+        // if user specified batch size is smaller than minimum, warn and set to minimum
+        let batch_size = if let Some(user_batch_size) = batch_size {
+            if user_batch_size < min_batch_size {
+                eprintln!("[WARN] in generate_vk_ri_direct_dm, the specified batch size ({user_batch_size}) is smaller than the minimum batch size ({min_batch_size}).");
+                eprintln!("[WARN] Setting batch size to {min_batch_size}.");
+            }
+            user_batch_size.max(min_batch_size)
+        } else {
+            batch_size_estimate
+        };
+
+        // info output
+        if print_level > 0 {
+            println!("[INFO] in generate_vk_ri_direct_dm, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
+            println!("[INFO] in generate_vk_ri_direct_dm, batch size      : {batch_size}");
+            println!("[INFO] in generate_vk_ri_direct_dm, memory estimation");
+            if alg_semi {
+                mem_est_semi.print_with_dtype::<f64>();
+            } else {
+                mem_est_direct.print_with_dtype::<f64>();
+            }
+        }
 
         // compute vk only for specified spin channels
-        let dms = &self.density_matrix[0..self.mol.spin_channel];
-        let mol_obj = &self.mol;
-        let mut vks = crate::scf_io::ri_on_the_fly::generate_vk_ri_direct_dm(scaling_factor, dms, mol_obj, block_size);
+        let mut vks = if alg_semi {
+            let mo_coeff = &self.eigenvectors[0..self.mol.spin_channel];
+            let mo_occ = &self.occupation[0..self.mol.spin_channel];
+            let mol_obj = &self.mol;
+            crate::scf_io::ri_on_the_fly::generate_vk_ri_semi_direct_coeff(scaling_factor, mo_coeff, mo_occ, mol_obj, batch_size)
+        } else {
+            let dms = &self.density_matrix[0..self.mol.spin_channel];
+            let mol_obj = &self.mol;
+            crate::scf_io::ri_on_the_fly::generate_vk_ri_direct_dm(scaling_factor, dms, mol_obj, batch_size)
+        };
 
         // complete `vks` if the spin channel is 1 (restricted, spin-unpolarized)
         if self.mol.spin_channel == 1 {
