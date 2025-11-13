@@ -19,7 +19,7 @@ use toml;
 
 mod pyrest_ctrl_io;
 mod geometric_pyo3_io;
-mod quasiparticle_methods;
+pub mod quasiparticle_methods;
 use geometric_pyo3_io::GeomeTRIC;
 use quasiparticle_methods::QuasiParticle;
 
