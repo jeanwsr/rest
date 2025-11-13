@@ -6,12 +6,20 @@ pub fn normalize_input_string(input: &str) -> String {
 }
 
 /// Deserialize a serde_json::Value into a specified type T.
-/// 
+///
 /// This will panic if deserialization fails, instead of giving a default value.
 pub fn serde_from_value<T: serde::de::DeserializeOwned>(v: &serde_json::Value) -> T {
     serde_json::from_value(v.clone()).unwrap()
 }
 
+/// Flag for algorithms of Coulomb contribution (J) to Fock operator.
+///
+/// - `default`: use default algorithm (currently same to `ri`).
+/// - `ri`: use RI algorithm with incore fitting integrals; depending to the memory available, it
+///   will decide whether to use `ri-incore` or `ri-direct`.
+/// - `ri-incore`: use RI algorithm with Cholesky decomposed 3c-2e ERI stored in DRAM.
+/// - `ri-direct`: use RI algorithm with on-the-fly computation of 3c-2e ERI, no need to store them
+///   in DRAM.
 #[non_exhaustive]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum AlgJ {
@@ -45,9 +53,7 @@ impl<'de> Deserialize<'de> for AlgJ {
             "riincore" => Ok(AlgJ::RiIncore),
             "ridirect" => Ok(AlgJ::RiDirect),
             "default" | "" => Ok(AlgJ::Default),
-            _ => Err(serde::de::Error::custom(format!(
-                "unknown AlgJ variant: {s}",
-            ))),
+            _ => Err(serde::de::Error::custom(format!("unknown AlgJ variant: {s}",))),
         }
     }
 }
@@ -61,6 +67,14 @@ impl Serialize for AlgJ {
     }
 }
 
+/// Flag for algorithms of Exchange contribution (K) to Fock operator.
+///
+/// - `default`: use default algorithm (currently same to `ri`).
+/// - `ri`: use RI algorithm with incore fitting integrals; depending to the memory available, it
+///   will decide whether to use `ri-incore` or `ri-direct`.
+/// - `ri-incore`: use RI algorithm with Cholesky decomposed 3c-2e ERI stored in DRAM.
+/// - `ri-direct`: use RI algorithm with on-the-fly computation of 3c-2e ERI, no need to store them
+///   in DRAM.
 #[non_exhaustive]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum AlgK {
@@ -94,9 +108,7 @@ impl<'de> Deserialize<'de> for AlgK {
             "riincore" => Ok(AlgK::RiIncore),
             "ridirect" => Ok(AlgK::RiDirect),
             "default" | "" => Ok(AlgK::Default),
-            _ => Err(serde::de::Error::custom(format!(
-                "unknown AlgK variant: {s}",
-            ))),
+            _ => Err(serde::de::Error::custom(format!("unknown AlgK variant: {s}",))),
         }
     }
 }
@@ -110,6 +122,16 @@ impl Serialize for AlgK {
     }
 }
 
+/// Flag for combined algorithms of Coulomb and Exchange contributions (J and K) to Fock operator.
+///
+/// - `default`: use default algorithm (currently same to `ri`).
+/// - `ri`: use RI algorithm with incore fitting integrals; depending to the memory available, it
+///   will decide whether to use `ri-incore` or `ri-direct`.
+/// - `ri-incore`: use RI algorithm with Cholesky decomposed 3c-2e ERI stored in DRAM.
+/// - `ri-direct`: use RI algorithm with on-the-fly computation of 3c-2e ERI, no need to store them
+///   in DRAM.
+/// - `separated(alg_j, alg_k)`: use separate algorithms for J and K, specified by `alg_j` (of type
+///   [`AlgJ`]) and `alg_k` (of type [`AlgK`]).
 #[non_exhaustive]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum AlgJK {
@@ -145,9 +167,7 @@ impl<'de> Deserialize<'de> for AlgJK {
             "default" | "" => Ok(AlgJK::Default),
             "riincore" => Ok(AlgJK::RiIncore),
             "ridirect" => Ok(AlgJK::RiDirect),
-            _ => Err(serde::de::Error::custom(format!(
-                "unknown AlgJK variant: {s}",
-            ))),
+            _ => Err(serde::de::Error::custom(format!("unknown AlgJK variant: {s}",))),
         }
     }
 }
@@ -159,15 +179,4 @@ impl Serialize for AlgJK {
     {
         serializer.serialize_str(&format!("{self:?}"))
     }
-}
-
-#[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
-    #[serde(default)]
-    pub alg_jk: AlgJK,
-    #[serde(default)]
-    pub alg_j: AlgJ,
-    #[serde(default)]
-    pub alg_k: AlgK,
 }
