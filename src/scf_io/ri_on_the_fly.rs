@@ -264,7 +264,7 @@ pub fn generate_vj_ri_direct(dms: &[MatrixFull<f64>], mol_obj: &Molecule, batch_
 
 /* #endregion ri-vj direct */
 
-/* #region ri-vk incore */
+/* #region ri-vk incore coeff */
 
 /// Generate Exchange (K) matrix using RI incore method with MO coefficients and occupations.
 ///
@@ -409,7 +409,70 @@ pub fn mem_estimate_vk_ri_incore_coeff(nao: usize, naux: usize, nocc_max: usize,
     MemEstimate { batched, fixed, thread }
 }
 
-/* #endregion ri-vk incore */
+/* #endregion ri-vk incore coeff */
+
+/* #region ri-vk incore dm */
+
+pub fn generate_vk_ri_incore_dm_with_rstsr(cderi: TsrView<f64>, dms: TsrView<f64>, batch_size: usize) -> Tsr<f64> {
+    assert_eq!(dms.ndim(), 3, "DM must have 3 dimensions");
+    assert_eq!(cderi.ndim(), 2, "Cholesky ERI must have 2 dimensions");
+
+    // get shapes
+    let nao = dms.shape()[0];
+    let nset = dms.shape()[2];
+    let naux = cderi.shape()[1];
+    let nao_tp = (nao + 1) * nao / 2;
+    let device = cderi.device().clone();
+
+    // shape check
+    assert_eq!(cderi.shape(), &[nao_tp, naux], "Cholesky ERI must have shape (nao_tp, naux)");
+
+    // initialize vk as result
+    let mut ks = rt::zeros(([nao, nao, nset].f(), &device));
+
+    // process each auxiliary function
+    (0..naux).step_by(batch_size).for_each(|iaux| {
+        // get and unpack cderi for this auxiliary function
+        // cderi_iaux: (nao, nao, nbatch)
+        let nbatch = if iaux + batch_size <= naux { batch_size } else { naux - iaux };
+
+        // unpack cderi for this batch
+        let cderi_batch = unsafe { rt::empty(([nao, nao, nbatch].f(), &device)) };
+        (0..nbatch).into_par_iter().for_each(|p| {
+            let cderi_iaux = cderi.i((.., iaux + p)).unpack_tri(Upper, FlagSymm::Sy);
+            let cderi_iaux_mut = cderi_batch.i((.., .., p));
+            let mut cderi_iaux_mut = unsafe { cderi_iaux_mut.force_mut() };
+            cderi_iaux_mut.assign(&cderi_iaux);
+        });
+
+        for iset in 0..nset {
+            // half-transformed integrals: (nao, nao, nbatch)
+            let dm = dms.i((.., .., iset));
+            let cderi_half = unsafe { rt::empty(([nao, nao, nbatch].f(), &device)) };
+            (0..nbatch).into_par_iter().for_each(|p| {
+                let cderi_iaux = cderi_batch.i((.., .., p));
+                let cderi_half_iaux = cderi_half.i((.., .., p));
+                let mut cderi_half_iaux = unsafe { cderi_half_iaux.force_mut() };
+                cderi_half_iaux.matmul_from(&cderi_iaux, &dm, 1.0, 0.0);
+            });
+            // build vk contribution
+            let cderi_half = cderi_half.into_shape([nao, nao * nbatch]);
+            let cderi_batch = cderi_batch.reshape([nao, nao * nbatch]);
+            ks.i_mut((.., .., iset)).matmul_from(&cderi_half, &cderi_batch.t(), 1.0, 1.0);
+        }
+    });
+    ks
+}
+
+pub fn mem_estimate_vk_ri_incore_dm(nao: usize, naux: usize, nset: usize) -> MemEstimate {
+    // cderi_half, cderi_batch
+    let batched = nao * nao * 2;
+    // ks
+    let fixed = nao * nao;
+    // cderi per auxiliary
+    let thread = nao * nao;
+    MemEstimate { batched, fixed, thread }
+}
 
 /* #region ri-vk semi-direct */
 
@@ -544,7 +607,7 @@ pub fn generate_vk_ri_semi_direct_coeff_with_rstsr(
         // get half-transformed cderi for this density matrix set
         let occ_coeff = &occ_coeff_list[iset];
         let nocc = occ_coeff.shape()[1];
-        let eri_half = rt::asarray((&mut eri_half_vec, [nao, nocc, naux].f(), &device));
+        let eri_half = rt::asarray((&mut eri_half_vec[..nao * nocc * naux], [nao, nocc, naux].f(), &device));
 
         for &[shl0, shl1] in &partition {
             let aux0 = aux_loc[shl0] - nao;
@@ -565,11 +628,12 @@ pub fn generate_vk_ri_semi_direct_coeff_with_rstsr(
         }
 
         // solve eri_half
-        let eri_half = rt::asarray((&mut eri_half_vec, [nao * nocc, naux].f(), &device)).into_reverse_axes();
+        let eri_half =
+            rt::asarray((&mut eri_half_vec[..nao * nocc * naux], [nao * nocc, naux].f(), &device)).into_reverse_axes();
         let cderi_half = rt::linalg::solve_triangular((tsr_int2c2e_l.t(), eri_half, Lower));
 
         // build vk contribution
-        let cderi_half = rt::asarray((&mut eri_half_vec, [nao, nocc * naux].f(), &device));
+        let cderi_half = rt::asarray((&mut eri_half_vec[..nao * nocc * naux], [nao, nocc * naux].f(), &device));
         ks.i_mut((.., .., iset)).matmul_from(&cderi_half, &cderi_half.t(), 1.0, 1.0);
     }
     ks
@@ -611,7 +675,8 @@ pub fn generate_vk_ri_semi_direct_coeff(
     let nset = mo_coeff_rstsr.shape()[2];
     let nao_tp = (nao + 1) * nao / 2;
 
-    let mut ks_rstsr = generate_vk_ri_semi_direct_coeff_with_rstsr(mo_coeff_rstsr.view(), mo_occ_rstsr.view(), mol_obj, batch_size);
+    let mut ks_rstsr =
+        generate_vk_ri_semi_direct_coeff_with_rstsr(mo_coeff_rstsr.view(), mo_occ_rstsr.view(), mol_obj, batch_size);
     if (scaling_factor - 1.0).abs() > f64::EPSILON {
         ks_rstsr *= scaling_factor;
     }
@@ -808,15 +873,27 @@ mod debug {
         let dms = [&scf_data.density_matrix[0]].as_ref().to_rstsr(&device);
         let mol = &scf_data.mol;
 
-        // incore, full batch
+        // incore, full batch, coeff
         let rimatr = scf_data.rimatr.as_ref().unwrap().0.to_rstsr_view(&device);
         let k_rstsr = generate_vk_ri_incore_coeff_with_rstsr(rimatr.view(), mo_coeff.view(), mo_occ.view(), 10000);
         let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
         let ref_fp = 12.950224351107128;
         assert!((fp / ref_fp - 1.0).abs() < 1e-5);
 
-        // incore, small batch
+        // incore, small batch, coeff
         let k_rstsr = generate_vk_ri_incore_coeff_with_rstsr(rimatr.view(), mo_coeff.view(), mo_occ.view(), 16);
+        let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
+        let ref_fp = 12.950224351107128;
+        assert!((fp / ref_fp - 1.0).abs() < 1e-5);
+
+        // incore, full batch, dm
+        let k_rstsr = generate_vk_ri_incore_dm_with_rstsr(rimatr.view(), dms.view(), 10000);
+        let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
+        let ref_fp = 12.950224351107128;
+        assert!((fp / ref_fp - 1.0).abs() < 1e-5);
+
+        // incore, small batch, dm
+        let k_rstsr = generate_vk_ri_incore_dm_with_rstsr(rimatr.view(), dms.view(), 16);
         let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
         let ref_fp = 12.950224351107128;
         assert!((fp / ref_fp - 1.0).abs() < 1e-5);
