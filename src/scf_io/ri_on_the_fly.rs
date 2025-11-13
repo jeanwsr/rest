@@ -411,11 +411,11 @@ pub fn mem_estimate_vk_ri_incore_coeff(nao: usize, naux: usize, nocc_max: usize,
 
 /* #endregion ri-vk incore */
 
-/* #region ri-vk semi-incore */
+/* #region ri-vk semi-direct */
 
-/// Generate Exchange (K) matrix using RI semi-incore method with MO coefficients and occupations.
+/// Generate Exchange (K) matrix using RI semi-direct method with MO coefficients and occupations.
 ///
-/// Semi-incore here means that 3c-2e ERI are computed on-the-fly in batches, while the
+/// semi-direct here means that 3c-2e ERI are computed on-the-fly in batches, while the
 /// half-transformed integrals are stored in memory. In this way, we still need to re-evaluate all
 /// 3c-2e ERI every time we compute each component of K matrix, and still require a large amount of
 /// DRAM consumption, but less computation effort than fully direct method.
@@ -480,7 +480,7 @@ pub fn mem_estimate_vk_ri_incore_coeff(nao: usize, naux: usize, nocc_max: usize,
 /// Thread memory requirement:
 ///
 /// - Storage of cderi per auxiliary, which costs (nao * nao * nthread).
-pub fn generate_vk_ri_semi_incore_coeff_with_rstsr(
+pub fn generate_vk_ri_semi_direct_coeff_with_rstsr(
     mo_coeff: TsrView<f64>,
     mo_occ: TsrView<f64>,
     mol_obj: &Molecule,
@@ -575,9 +575,9 @@ pub fn generate_vk_ri_semi_incore_coeff_with_rstsr(
     ks
 }
 
-/// Estimate memory requirement for VK RI semi-incore method with MO coefficients and occupations.
+/// Estimate memory requirement for VK RI semi-direct method with MO coefficients and occupations.
 ///
-/// This function corresponds to [`generate_vk_ri_semi_incore_coeff_with_rstsr`].
+/// This function corresponds to [`generate_vk_ri_semi_direct_coeff_with_rstsr`].
 ///
 /// # Parameters
 ///
@@ -585,7 +585,7 @@ pub fn generate_vk_ri_semi_incore_coeff_with_rstsr(
 /// - `naux`: Number of auxiliary basis functions.
 /// - `nocc_max`: Maximum number of occupied molecular orbitals among all sets.
 /// - `nset`: Number of density matrix sets.
-pub fn mem_estimate_vk_ri_semi_incore_coeff(nao: usize, naux: usize, nocc_max: usize, nset: usize) -> MemEstimate {
+pub fn mem_estimate_vk_ri_semi_direct_coeff(nao: usize, naux: usize, nocc_max: usize, nset: usize) -> MemEstimate {
     // int3c2e batch
     let batched = nao * nao;
     // ks, eri_half, int2c2e
@@ -595,7 +595,37 @@ pub fn mem_estimate_vk_ri_semi_incore_coeff(nao: usize, naux: usize, nocc_max: u
     MemEstimate { batched, fixed, thread }
 }
 
-/* #endregion ri-vk semi-incore */
+pub fn generate_vk_ri_semi_direct_coeff(
+    scaling_factor: f64,
+    mo_coeff: &[MatrixFull<f64>],
+    mo_occ: &[Vec<f64>],
+    mol_obj: &Molecule,
+    batch_size: usize,
+) -> Vec<MatrixUpper<f64>> {
+    // mo_coeff shape: (nao, nmo, nset) in f-contig
+    let device = DeviceBLAS::default();
+    let mo_coeff_rstsr = mo_coeff.to_rstsr(&device);
+    let mo_occ_rstsr = mo_occ.to_rstsr(&device);
+
+    let nao = mo_coeff_rstsr.shape()[0];
+    let nset = mo_coeff_rstsr.shape()[2];
+    let nao_tp = (nao + 1) * nao / 2;
+
+    let mut ks_rstsr = generate_vk_ri_semi_direct_coeff_with_rstsr(mo_coeff_rstsr.view(), mo_occ_rstsr.view(), mol_obj, batch_size);
+    if (scaling_factor - 1.0).abs() > f64::EPSILON {
+        ks_rstsr *= scaling_factor;
+    }
+
+    // Tsr -> Vec<MatrixUpper>
+    let mut ks = vec![];
+    for iset in 0..nset {
+        let k = ks_rstsr.i((.., .., iset)).pack_tri(Upper).into_vec();
+        ks.push(unsafe { MatrixUpper::from_vec_unchecked(nao_tp, k) })
+    }
+    ks
+}
+
+/* #endregion ri-vk semi-direct */
 
 /* #region ri-vk direct dm */
 
@@ -720,7 +750,9 @@ pub fn generate_vk_ri_direct_dm(
     assert_eq!(dms.shape(), &[nao, nao, nset], "Density matrices must have shape (nao, nao, nset)");
 
     let mut ks_rstsr = generate_vk_ri_direct_dm_with_rstsr(dms.view(), mol_obj, batch_size);
-    ks_rstsr *= scaling_factor;
+    if (scaling_factor - 1.0).abs() > f64::EPSILON {
+        ks_rstsr *= scaling_factor;
+    }
 
     // Tsr -> Vec<MatrixUpper>
     let mut ks = vec![];
@@ -789,14 +821,14 @@ mod debug {
         let ref_fp = 12.950224351107128;
         assert!((fp / ref_fp - 1.0).abs() < 1e-5);
 
-        // semi-incore, full batch
-        let k_rstsr = generate_vk_ri_semi_incore_coeff_with_rstsr(mo_coeff.view(), mo_occ.view(), mol, 10000);
+        // semi-direct, full batch
+        let k_rstsr = generate_vk_ri_semi_direct_coeff_with_rstsr(mo_coeff.view(), mo_occ.view(), mol, 10000);
         let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
         let ref_fp = 12.950224351107128;
         assert!((fp / ref_fp - 1.0).abs() < 1e-5);
 
-        // semi-incore, small batch
-        let k_rstsr = generate_vk_ri_semi_incore_coeff_with_rstsr(mo_coeff.view(), mo_occ.view(), mol, 16);
+        // semi-direct, small batch
+        let k_rstsr = generate_vk_ri_semi_direct_coeff_with_rstsr(mo_coeff.view(), mo_occ.view(), mol, 16);
         let fp = fingerprint_f64(k_rstsr.i((.., .., 0)));
         let ref_fp = 12.950224351107128;
         assert!((fp / ref_fp - 1.0).abs() < 1e-5);
