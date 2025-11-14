@@ -215,9 +215,9 @@ pub struct InputKeywords {
     pub check_stab: bool,
     #[pyo3(get, set)]
     pub use_dm_only: bool,
-    pub alg_jk: AlgJK,
-    pub alg_j: AlgJ,
-    pub alg_k: AlgK,
+    pub algorithm_jk: AlgorithmJK,
+    pub algorithm_j: AlgorithmJ,
+    pub algorithm_k: AlgorithmK,
     // Keywords for fciqmc dump
     #[pyo3(get, set)]
     pub fciqmc_dump: bool,
@@ -359,9 +359,9 @@ impl InputKeywords {
             // True:  using only density matrix in the evaluation
             // False: use coefficients as well with higher efficiency
             use_dm_only: false,
-            alg_jk: AlgJK::Default,
-            alg_j: AlgJ::Default,
-            alg_k: AlgK::Default,
+            algorithm_jk: AlgorithmJK::Default,
+            algorithm_j: AlgorithmJ::Default,
+            algorithm_k: AlgorithmK::Default,
             // Keywords for the fciqmc dump
             fciqmc_dump: false,
             // Kyewords for post scf
@@ -1164,14 +1164,14 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => false,
             };
             // setup and sanity check of J/K algorithms
-            tmp_input.alg_jk = tmp_ctrl.get("alg_jk").map(serde_from_value).unwrap_or_default();
-            tmp_input.alg_j = tmp_ctrl.get("alg_j").map(serde_from_value).unwrap_or_default();
-            tmp_input.alg_k = tmp_ctrl.get("alg_k").map(serde_from_value).unwrap_or_default();
-            if (tmp_input.alg_j != AlgJ::Default || tmp_input.alg_k != AlgK::Default) {
-                if tmp_input.alg_jk != AlgJK::Default {
-                    println!("Warning: alg_j and alg_k are specified, the setting in alg_jk will be ignored.");
+            tmp_input.algorithm_jk = tmp_ctrl.get("algorithm_jk").map(serde_from_value).unwrap_or_default();
+            tmp_input.algorithm_j = tmp_ctrl.get("algorithm_j").map(serde_from_value).unwrap_or_default();
+            tmp_input.algorithm_k = tmp_ctrl.get("algorithm_k").map(serde_from_value).unwrap_or_default();
+            if (tmp_input.algorithm_j != AlgorithmJ::Default || tmp_input.algorithm_k != AlgorithmK::Default) {
+                if tmp_input.algorithm_jk != AlgorithmJK::Default {
+                    println!("Warning: algorithm_j and algorithm_k are specified, the setting in algorithm_jk will be ignored.");
                 }
-                tmp_input.alg_jk = AlgJK::Separated(tmp_input.alg_j, tmp_input.alg_k);
+                tmp_input.algorithm_jk = AlgorithmJK::Separated(tmp_input.algorithm_j, tmp_input.algorithm_k);
             }
             // ================================================
             //  Keywords associated with the elec occupation 
