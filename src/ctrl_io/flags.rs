@@ -22,7 +22,7 @@ pub fn serde_from_value<T: serde::de::DeserializeOwned>(v: &serde_json::Value) -
 ///   in DRAM.
 #[non_exhaustive]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub enum AlgJ {
+pub enum AlgorithmJ {
     #[default]
     Default,
     Ri,
@@ -30,35 +30,35 @@ pub enum AlgJ {
     RiDirect,
 }
 
-impl std::fmt::Debug for AlgJ {
+impl std::fmt::Debug for AlgorithmJ {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            AlgJ::Default => "default",
-            AlgJ::Ri => "ri",
-            AlgJ::RiIncore => "ri-incore",
-            AlgJ::RiDirect => "ri-direct",
+            AlgorithmJ::Default => "default",
+            AlgorithmJ::Ri => "ri",
+            AlgorithmJ::RiIncore => "ri-incore",
+            AlgorithmJ::RiDirect => "ri-direct",
         };
         write!(f, "{s}")
     }
 }
 
-impl<'de> Deserialize<'de> for AlgJ {
+impl<'de> Deserialize<'de> for AlgorithmJ {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         match normalize_input_string(&s).as_str() {
-            "ri" => Ok(AlgJ::Ri),
-            "riincore" => Ok(AlgJ::RiIncore),
-            "ridirect" => Ok(AlgJ::RiDirect),
-            "default" | "" => Ok(AlgJ::Default),
-            _ => Err(serde::de::Error::custom(format!("unknown AlgJ variant: {s}",))),
+            "ri" => Ok(AlgorithmJ::Ri),
+            "riincore" => Ok(AlgorithmJ::RiIncore),
+            "ridirect" => Ok(AlgorithmJ::RiDirect),
+            "default" | "" => Ok(AlgorithmJ::Default),
+            _ => Err(serde::de::Error::custom(format!("unknown AlgorithmJ variant: {s}",))),
         }
     }
 }
 
-impl Serialize for AlgJ {
+impl Serialize for AlgorithmJ {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -77,7 +77,7 @@ impl Serialize for AlgJ {
 ///   in DRAM.
 #[non_exhaustive]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub enum AlgK {
+pub enum AlgorithmK {
     #[default]
     Default,
     Ri,
@@ -85,35 +85,35 @@ pub enum AlgK {
     RiDirect,
 }
 
-impl std::fmt::Debug for AlgK {
+impl std::fmt::Debug for AlgorithmK {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            AlgK::Default => "default",
-            AlgK::Ri => "ri",
-            AlgK::RiIncore => "ri-incore",
-            AlgK::RiDirect => "ri-direct",
+            AlgorithmK::Default => "default",
+            AlgorithmK::Ri => "ri",
+            AlgorithmK::RiIncore => "ri-incore",
+            AlgorithmK::RiDirect => "ri-direct",
         };
         write!(f, "{s}")
     }
 }
 
-impl<'de> Deserialize<'de> for AlgK {
+impl<'de> Deserialize<'de> for AlgorithmK {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         match normalize_input_string(&s).as_str() {
-            "ri" => Ok(AlgK::Ri),
-            "riincore" => Ok(AlgK::RiIncore),
-            "ridirect" => Ok(AlgK::RiDirect),
-            "default" | "" => Ok(AlgK::Default),
-            _ => Err(serde::de::Error::custom(format!("unknown AlgK variant: {s}",))),
+            "ri" => Ok(AlgorithmK::Ri),
+            "riincore" => Ok(AlgorithmK::RiIncore),
+            "ridirect" => Ok(AlgorithmK::RiDirect),
+            "default" | "" => Ok(AlgorithmK::Default),
+            _ => Err(serde::de::Error::custom(format!("unknown AlgorithmK variant: {s}",))),
         }
     }
 }
 
-impl Serialize for AlgK {
+impl Serialize for AlgorithmK {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -130,49 +130,49 @@ impl Serialize for AlgK {
 /// - `ri-incore`: use RI algorithm with Cholesky decomposed 3c-2e ERI stored in DRAM.
 /// - `ri-direct`: use RI algorithm with on-the-fly computation of 3c-2e ERI, no need to store them
 ///   in DRAM.
-/// - `separated(alg_j, alg_k)`: use separate algorithms for J and K, specified by `alg_j` (of type
-///   [`AlgJ`]) and `alg_k` (of type [`AlgK`]).
+/// - `separated(algorithm_j, algorithm_k)`: use separate algorithms for J and K, specified by
+///   `algorithm_j` (of type [`AlgorithmJ`]) and `algorithm_k` (of type [`AlgorithmK`]).
 #[non_exhaustive]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub enum AlgJK {
+pub enum AlgorithmJK {
     #[default]
     Default,
     Ri,
     RiIncore,
     RiDirect,
-    Separated(AlgJ, AlgK),
+    Separated(AlgorithmJ, AlgorithmK),
 }
 
-impl std::fmt::Debug for AlgJK {
+impl std::fmt::Debug for AlgorithmJK {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            AlgJK::Default => "default",
-            AlgJK::Ri => "ri",
-            AlgJK::RiIncore => "ri-incore",
-            AlgJK::RiDirect => "ri-direct",
-            AlgJK::Separated(alg_j, alg_k) => &format!("separated({alg_j:?}, {alg_k:?})"),
+            AlgorithmJK::Default => "default",
+            AlgorithmJK::Ri => "ri",
+            AlgorithmJK::RiIncore => "ri-incore",
+            AlgorithmJK::RiDirect => "ri-direct",
+            AlgorithmJK::Separated(algorithm_j, algorithm_k) => &format!("separated({algorithm_j:?}, {algorithm_k:?})"),
         };
         write!(f, "{s}")
     }
 }
 
-impl<'de> Deserialize<'de> for AlgJK {
+impl<'de> Deserialize<'de> for AlgorithmJK {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         match normalize_input_string(&s).as_str() {
-            "ri" => Ok(AlgJK::Ri),
-            "default" | "" => Ok(AlgJK::Default),
-            "riincore" => Ok(AlgJK::RiIncore),
-            "ridirect" => Ok(AlgJK::RiDirect),
-            _ => Err(serde::de::Error::custom(format!("unknown AlgJK variant: {s}",))),
+            "ri" => Ok(AlgorithmJK::Ri),
+            "default" | "" => Ok(AlgorithmJK::Default),
+            "riincore" => Ok(AlgorithmJK::RiIncore),
+            "ridirect" => Ok(AlgorithmJK::RiDirect),
+            _ => Err(serde::de::Error::custom(format!("unknown AlgorithmJK variant: {s}",))),
         }
     }
 }
 
-impl Serialize for AlgJK {
+impl Serialize for AlgorithmJK {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,

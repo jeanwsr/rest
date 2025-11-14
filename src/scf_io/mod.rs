@@ -87,7 +87,7 @@ pub struct SCF {
     pub ref_eigenvectors: HashMap<String, ([MatrixFull<f64>;2], [usize;4])>,
     pub renormalized_singles_particles:Vec<f64>,
     pub gwqp:(Vec<f64>,Vec<f64>),
-    pub alg_jk: AlgJK,
+    pub algorithm_jk: AlgorithmJK,
 }
 
 #[derive(Clone,Copy)]
@@ -137,7 +137,7 @@ impl SCF {
             energies: HashMap::new(),
             renormalized_singles_particles:Vec::new(),
             gwqp:(Vec::new(),Vec::new()),
-            alg_jk: AlgJK::Default,
+            algorithm_jk: AlgorithmJK::Default,
         };
 
         // at first check the scf type: RHF, ROHF or UHF
@@ -173,8 +173,8 @@ impl SCF {
     /// 
     /// Only in effective when
     /// 
-    /// - Some user input is not given (i.e. field `alg_jk` is not specified).
-    /// - Some user input is not a determined algorithm (i.e. field `alg_jk` is set to `ri`
+    /// - Some user input is not given (i.e. field `algorithm_jk` is not specified).
+    /// - Some user input is not a determined algorithm (i.e. field `algorithm_jk` is set to `ri`
     ///   instead of more-determined `ri-incore` or `ri-direct`).
     /// 
     /// The memory consumption for RI integrals is estimated as (nao, nao, naux) * 8 bytes.
@@ -183,24 +183,24 @@ impl SCF {
         let mol = &self.mol;
 
         // check algorithms of J/K
-        let alg_jk = mol.ctrl.alg_jk;
+        let algorithm_jk = mol.ctrl.algorithm_jk;
         // by default, we will let it be RI
-        let alg_jk = match alg_jk {
-            AlgJK::Default => AlgJK::Ri,
-            AlgJK::Separated(alg_j, alg_k) => {
-                let new_alg_j = if alg_j == AlgJ::Default { AlgJ::Ri } else { alg_j };
-                let new_alg_k = if alg_k == AlgK::Default { AlgK::Ri } else { alg_k };
-                AlgJK::Separated(new_alg_j, new_alg_k)
+        let algorithm_jk = match algorithm_jk {
+            AlgorithmJK::Default => AlgorithmJK::Ri,
+            AlgorithmJK::Separated(algorithm_j, algorithm_k) => {
+                let new_algorithm_j = if algorithm_j == AlgorithmJ::Default { AlgorithmJ::Ri } else { algorithm_j };
+                let new_algorithm_k = if algorithm_k == AlgorithmK::Default { AlgorithmK::Ri } else { algorithm_k };
+                AlgorithmJK::Separated(new_algorithm_j, new_algorithm_k)
             },
-            _ => alg_jk,
+            _ => algorithm_jk,
         };
         // check memory requirement for RI
-        let has_ri_non_specified = match alg_jk {
-            AlgJK::Ri => true,
-            AlgJK::Separated(alg_j, alg_k) => alg_j == AlgJ::Ri || alg_k == AlgK::Ri,
+        let has_ri_non_specified = match algorithm_jk {
+            AlgorithmJK::Ri => true,
+            AlgorithmJK::Separated(algorithm_j, algorithm_k) => algorithm_j == AlgorithmJ::Ri || algorithm_k == AlgorithmK::Ri,
             _ => false,
         };
-        let alg_jk = if has_ri_non_specified {
+        let algorithm_jk = if has_ri_non_specified {
             println!("Checking memory requirement for RI J/K algorithms...");
             let nao = mol.num_basis;
             let naux = mol.num_auxbas;
@@ -208,38 +208,38 @@ impl SCF {
             let mem_avail_mb = mol.ctrl.max_memory.map(|max_memory| {
                 max_memory - detect_used_memory_mb("proc")
             });
-            let alg_jk = if mem_avail_mb.is_some_and(|mem_avail_mb| mem_avail_mb < mem_cderi_mb) {
+            let algorithm_jk = if mem_avail_mb.is_some_and(|mem_avail_mb| mem_avail_mb < mem_cderi_mb) {
                 println!("Memory available for RI integrals ({:.2} MB) is less than required ({:.2} MB).", mem_avail_mb.unwrap(), mem_cderi_mb);
                 println!("Switch to direct RI-J/K algorithms.");
-                if alg_jk == AlgJK::Ri {
-                    AlgJK::RiDirect
-                } else if let AlgJK::Separated(alg_j, alg_k) = alg_jk {
-                    let new_alg_j = if alg_j == AlgJ::Ri { AlgJ::RiDirect } else { alg_j };
-                    let new_alg_k = if alg_k == AlgK::Ri { AlgK::RiDirect } else { alg_k };
-                    AlgJK::Separated(new_alg_j, new_alg_k)
+                if algorithm_jk == AlgorithmJK::Ri {
+                    AlgorithmJK::RiDirect
+                } else if let AlgorithmJK::Separated(algorithm_j, algorithm_k) = algorithm_jk {
+                    let new_algorithm_j = if algorithm_j == AlgorithmJ::Ri { AlgorithmJ::RiDirect } else { algorithm_j };
+                    let new_algorithm_k = if algorithm_k == AlgorithmK::Ri { AlgorithmK::RiDirect } else { algorithm_k };
+                    AlgorithmJK::Separated(new_algorithm_j, new_algorithm_k)
                 } else {
-                    alg_jk
+                    algorithm_jk
                 }
             } else {
                 println!("Memory available for RI integrals ({:.2} MB) is more than required ({:.2} MB).", mem_avail_mb.unwrap_or(f64::INFINITY), mem_cderi_mb);
                 println!("Using standard incore RI-J/K algorithms.");
-                if alg_jk == AlgJK::Ri {
-                    AlgJK::RiIncore
-                } else if let AlgJK::Separated(alg_j, alg_k) = alg_jk {
-                    let new_alg_j = if alg_j == AlgJ::Ri { AlgJ::RiIncore } else { alg_j };
-                    let new_alg_k = if alg_k == AlgK::Ri { AlgK::RiIncore } else { alg_k };
-                    AlgJK::Separated(new_alg_j, new_alg_k)
+                if algorithm_jk == AlgorithmJK::Ri {
+                    AlgorithmJK::RiIncore
+                } else if let AlgorithmJK::Separated(algorithm_j, algorithm_k) = algorithm_jk {
+                    let new_algorithm_j = if algorithm_j == AlgorithmJ::Ri { AlgorithmJ::RiIncore } else { algorithm_j };
+                    let new_algorithm_k = if algorithm_k == AlgorithmK::Ri { AlgorithmK::RiIncore } else { algorithm_k };
+                    AlgorithmJK::Separated(new_algorithm_j, new_algorithm_k)
                 } else {
-                    alg_jk
+                    algorithm_jk
                 }
             };
-            alg_jk
+            algorithm_jk
         } else {
-            alg_jk
+            algorithm_jk
         };
 
-        // reassign the alg_jk to disable any ambiguity
-        self.alg_jk = alg_jk;
+        // reassign the algorithm_jk to disable any ambiguity
+        self.algorithm_jk = algorithm_jk;
     }
 
 
@@ -374,11 +374,11 @@ impl SCF {
         }
 
         // update use_eri if some RI algorithms are specified
-        let use_eri_jk = match self.alg_jk {
-            AlgJK::RiIncore => true,
-            AlgJK::Separated(alg_j, alg_k) => {
-                let use_eri_j = alg_j == AlgJ::RiIncore;
-                let use_eri_k = alg_k == AlgK::RiIncore;
+        let use_eri_jk = match self.algorithm_jk {
+            AlgorithmJK::RiIncore => true,
+            AlgorithmJK::Separated(algorithm_j, algorithm_k) => {
+                let use_eri_j = algorithm_j == AlgorithmJ::RiIncore;
+                let use_eri_k = algorithm_k == AlgorithmK::RiIncore;
                 use_eri_j || use_eri_k
             },
             _ => false,
@@ -1720,10 +1720,10 @@ impl SCF {
         let vj = if self.mol.ctrl.isdf_new {
             self.generate_vj_ri_direct(None)
         } else {
-            match self.alg_jk {
-                AlgJK::RiIncore | AlgJK::Separated(AlgJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
-                AlgJK::RiDirect | AlgJK::Separated(AlgJ::RiDirect, _) => self.generate_vj_ri_direct(None),
-                _ => unreachable!("Other cases of alg_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.alg_jk),
+            match self.algorithm_jk {
+                AlgorithmJK::RiIncore | AlgorithmJK::Separated(AlgorithmJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
+                AlgorithmJK::RiDirect | AlgorithmJK::Separated(AlgorithmJ::RiDirect, _) => self.generate_vj_ri_direct(None),
+                _ => unreachable!("Other cases of algorithm_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             }
         };
 
@@ -1739,10 +1739,10 @@ impl SCF {
         } else if self.mol.ctrl.isdf_new {
             self.generate_vk_with_isdf_new(scaling_factor)
         } else {
-            match self.alg_jk {
-                AlgJK::RiIncore | AlgJK::Separated(_, AlgK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
-                AlgJK::RiDirect | AlgJK::Separated(_, AlgK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None),
-                _ => unreachable!("Other cases of alg_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.alg_jk),
+            match self.algorithm_jk {
+                AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
+                AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None),
+                _ => unreachable!("Other cases of algorithm_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             }
         };
 
@@ -1925,10 +1925,10 @@ impl SCF {
         let dt1 = time::Local::now();
         //let use_eri = self.mol.xc_data.use_eri() || self.mol.xc_dat;
         //let use_eri = true;
-        let vj = match self.alg_jk {
-            AlgJK::RiIncore | AlgJK::Separated(AlgJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
-            AlgJK::RiDirect | AlgJK::Separated(AlgJ::RiDirect, _) => self.generate_vj_ri_direct(None),
-            _ => unreachable!("Other cases of alg_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.alg_jk),
+        let vj = match self.algorithm_jk {
+            AlgorithmJK::RiIncore | AlgorithmJK::Separated(AlgorithmJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
+            AlgorithmJK::RiDirect | AlgorithmJK::Separated(AlgorithmJ::RiDirect, _) => self.generate_vj_ri_direct(None),
+            _ => unreachable!("Other cases of algorithm_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.algorithm_jk),
         };
         //// ==== DEBUG IGOR ====
         //if let Some(mpi_op) = &mpi_operator {
@@ -1962,10 +1962,10 @@ impl SCF {
             let use_dm_only = self.mol.ctrl.use_dm_only;
             //self.mol.ctrl.use_dm_only
             // let vk = self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator);
-            let vk = match self.alg_jk {
-                AlgJK::RiIncore | AlgJK::Separated(_, AlgK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
-                AlgJK::RiDirect | AlgJK::Separated(_, AlgK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None),
-                _ => unreachable!("Other cases of alg_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.alg_jk),
+            let vk = match self.algorithm_jk {
+                AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
+                AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None),
+                _ => unreachable!("Other cases of algorithm_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             };
             for i_spin in (0..spin_channel) {
                 self.hamiltonian[i_spin].data
@@ -3119,7 +3119,7 @@ impl SCF {
     /// - `direct`: on-the-fly direct calculation
     /// 
     /// To activate this function, in the meantime when writing this function, in `ctrl.in`
-    /// - specify `alg_j = ri-direct` or `alg_jk = ri-direct` to disable full storage of 3c-2e ERI (required);
+    /// - specify `algorithm_j = ri-direct` or `algorithm_jk = ri-direct` to disable full storage of 3c-2e ERI (required);
     /// - specify `[ctrl]: max_memory` in MB for calculating `block_size` if not specified;
     fn generate_vj_ri_direct(&mut self, batch_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
         let print_level = self.mol.ctrl.print_level;
