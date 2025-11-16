@@ -89,6 +89,7 @@ pub fn normalize(vector:&[f64],tda:bool)->Vec<f64>{
         let y_vec=&vector[num_state..];
         let x_norm=x_vec.iter().fold(0.0,|acc,x_i|acc+x_i.powf(2.0));
         let y_norm=y_vec.iter().fold(0.0,|acc,y_i|acc+y_i.powf(2.0));
+        println!("x_norm-y_norm={}",x_norm-y_norm);
         let x_minus_y_root=(x_norm-y_norm).powf(0.5);
         vector.iter().map(|x_i|x_i/x_minus_y_root/SQRT_2).collect()
     }else{
