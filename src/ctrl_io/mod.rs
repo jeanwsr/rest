@@ -221,6 +221,8 @@ pub struct InputKeywords {
     pub cube_orb_setting: [f64;2],
     pub cube_orb_indices: Vec<[usize;3]>,
     pub cube_orb_type: String,
+    // keyword for rrs-pbc output
+    pub pbc_eigenval: Option<String>,
     //pub output_wfn_in_real_space: usize,
     //pub output_cube: bool,
     //pub output_molden: bool,
@@ -358,11 +360,13 @@ impl InputKeywords {
             use_ri_vj: true,
             // Keywords for the fciqmc dump
             fciqmc_dump: false,
-            // Kyewords for post scf
+            // Keywords for post scf
             outputs: vec![],
             cube_orb_setting: [3.0,80.0],
             cube_orb_indices: Vec::new(),
             cube_orb_type: String::from("wavefunction"),
+            // keyword for rrs-pbc output
+            pbc_eigenval: None,
             //output_wfn_in_real_space: 0,
             //output_cube: false,
             //output_molden: false,
@@ -1333,6 +1337,17 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             // ================================================
             //  Keywords associated with the post-SCF analyais
             // ================================================
+            tmp_input.pbc_eigenval = match tmp_ctrl.get("pbc_eigenval").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_op) => {
+                    let tmp = match tmp_op.as_str() {
+                        "none" => None,
+                        "None" => None,
+                        _ => Some(String::from(tmp_op))
+                    };
+                    tmp
+                }
+                _ => None
+            };
             tmp_input.outputs = match tmp_ctrl.get("outputs").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_op) => {vec![tmp_op.to_lowercase()]},
                 serde_json::Value::Array(tmp_op) => {

@@ -55,11 +55,11 @@ pub struct GeomCell {
     pub rg_elem: Vec<String>,
     //keywords for rrs-pbc
     pub rrs_pbc: bool,
-    pub unit_cell_elem: Vec<String>,
-    pub num_units: usize,
+    pub unit_cell_index: Vec<usize>,
     pub pbc_dim: usize,
     pub rrs_pbc_vec: MatrixFull<f64>,
-    pub k_points: usize,
+    pub max_step: Vec<usize>,
+    pub k_points: Vec<usize>,
 }
 
 //impl GeomCell {
@@ -167,11 +167,11 @@ impl GeomCell {
             rg_elem         : vec![], 
             rg_position     : MatrixFull::empty(),
             rrs_pbc         : false,
-            unit_cell_elem  : vec![],
-            num_units       : 1,
+            unit_cell_index : vec![],
             pbc_dim         : 1,
             rrs_pbc_vec     : MatrixFull::empty(),
-            k_points        : 1,
+            max_step        : vec![],
+            k_points        : vec![],
         }
     }
     pub fn copy(&mut self, name:String) -> GeomCell {
@@ -191,13 +191,10 @@ impl GeomCell {
             new_mol.fix.push(*fix);
         }
         new_mol.rrs_pbc = self.rrs_pbc;
-        for elem in &mut self.unit_cell_elem {
-            new_mol.unit_cell_elem.push(elem.to_string());
-        }
-        new_mol.num_units = self.num_units;
+        new_mol.unit_cell_index = self.unit_cell_index.to_owned();
         new_mol.pbc_dim = self.pbc_dim;
         new_mol.rrs_pbc_vec = self.rrs_pbc_vec.to_owned();
-        new_mol.k_points = self.k_points;
+        new_mol.k_points = self.k_points.to_owned();
         new_mol
     }
     pub fn get_nfree(&self) -> anyhow::Result<usize> {
@@ -1033,11 +1030,6 @@ pub fn parse_geom_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<GeomC
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };
-            tmp_geomcell.num_units = match tmp_geom.get("num_units").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
-                other => {1_usize}
-            };
             tmp_geomcell.pbc_dim = match tmp_geom.get("pbc_dim").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
@@ -1056,32 +1048,41 @@ pub fn parse_geom_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<GeomC
                 },
                 other => {MatrixFull::empty()},
             };
-            tmp_geomcell.k_points = match tmp_geom.get("k_points").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
-                other => {1_usize}
-            };
-            tmp_geomcell.unit_cell_elem = match tmp_geom.get("unit_cell_elem").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_op) => {vec![tmp_op.to_string()]},
+            tmp_geomcell.unit_cell_index = match tmp_geom.get("unit_cell_index").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_op) => {vec![tmp_op.as_f64().unwrap_or(0.0) as usize]},
+                serde_json::Value::String(tmp_op) => {
+                    let val = tmp_op.parse::<usize>().unwrap_or(0);
+                    vec![val]
+                },
                 serde_json::Value::Array(tmp_op) => {
-                    let mut tmp_vec: Vec<String> = vec![];
-                    tmp_op.iter().for_each(|x| {
-                        let op_type = x.to_string();
-                        let string_len = op_type.len();
-                        tmp_vec.push(op_type[1..string_len-1].to_string())
-                    });
-                    tmp_vec
+                    let vals = tmp_op.iter().filter_map(|v| Some(v.as_f64().unwrap_or(0.0) as usize)).collect::<Vec<usize>>();
+                    vals
                 },
                 other => {vec![]},
             };
-            //rrs_pbc check
-            if tmp_geomcell.rrs_pbc {
-                if tmp_geomcell.pbc_dim != 1_usize {
-                    panic!("I am sorry but 2D and 3D RRS-PBC methods are not yet implemented");
-                };
-                if tmp_geomcell.num_units % 2 == 0 {
-                    panic!("1D RRS-PBC method requires num_units to be odd");
-                };
+            tmp_geomcell.max_step = match tmp_geom.get("max_step").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_op) => {vec![tmp_op.as_f64().unwrap_or(0.0) as usize]},
+                serde_json::Value::String(tmp_op) => {
+                    let val = tmp_op.parse::<usize>().unwrap_or(0);
+                    vec![val]
+                },
+                serde_json::Value::Array(tmp_op) => {
+                    let vals = tmp_op.iter().filter_map(|v| Some(v.as_f64().unwrap_or(0.0) as usize)).collect::<Vec<usize>>();
+                    vals
+                },
+                other => {vec![]},
+            };
+            tmp_geomcell.k_points = match tmp_geom.get("k_points").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_op) => {vec![tmp_op.as_f64().unwrap_or(0.0) as usize]},
+                serde_json::Value::String(tmp_op) => {
+                    let val = tmp_op.parse::<usize>().unwrap_or(0);
+                    vec![val]
+                },
+                serde_json::Value::Array(tmp_op) => {
+                    let vals = tmp_op.iter().filter_map(|v| Some(v.as_f64().unwrap_or(0.0) as usize)).collect::<Vec<usize>>();
+                    vals
+                },
+                other => {vec![]},
             };
             //rrs_pbc end
             let tmp_unit = match tmp_geom.get("unit").unwrap_or(&serde_json::Value::Null) {
