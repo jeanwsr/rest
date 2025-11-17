@@ -6,6 +6,9 @@ use crate::dft::{numerical_density, DFTType, Grids};
 use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges};
 use crate::mpi_io::{mpi_broadcast, mpi_broadcast_matrixfull, mpi_broadcast_vector, mpi_reduce, MPIOperator};
 use crate::utilities::{create_pool, TimeRecords};
+use crate::utilities::memory_batch::*;
+use crate::ctrl_io::flags::*;
+
 ////use blas_src::openblas::dgemm;
 mod addons;
 mod fchk;
@@ -84,6 +87,7 @@ pub struct SCF {
     pub ref_eigenvectors: HashMap<String, ([MatrixFull<f64>;2], [usize;4])>,
     pub renormalized_singles_particles:Vec<f64>,
     pub gwqp:(Vec<f64>,Vec<f64>),
+    pub algorithm_jk: AlgorithmJK,
 }
 
 #[derive(Clone,Copy)]
@@ -133,6 +137,7 @@ impl SCF {
             energies: HashMap::new(),
             renormalized_singles_particles:Vec::new(),
             gwqp:(Vec::new(),Vec::new()),
+            algorithm_jk: AlgorithmJK::Default,
         };
 
         // at first check the scf type: RHF, ROHF or UHF
@@ -161,6 +166,80 @@ impl SCF {
         };
 
         scf_data
+    }
+
+
+    /// Determine the J/K algorithms based on user input and memory requirement.
+    /// 
+    /// Only in effective when
+    /// 
+    /// - Some user input is not given (i.e. field `algorithm_jk` is not specified).
+    /// - Some user input is not a determined algorithm (i.e. field `algorithm_jk` is set to `ri`
+    ///   instead of more-determined `ri-incore` or `ri-direct`).
+    /// 
+    /// The memory consumption for RI integrals is estimated as (nao, nao, naux) * 8 bytes.
+    /// This estimation is twice larger than the actual memory consumption, to be conservative.
+    pub fn update_jk_algorithms(&mut self) {
+        let mol = &self.mol;
+
+        // check algorithms of J/K
+        let algorithm_jk = mol.ctrl.algorithm_jk;
+        // by default, we will let it be RI
+        let algorithm_jk = match algorithm_jk {
+            AlgorithmJK::Default => AlgorithmJK::Ri,
+            AlgorithmJK::Separated(algorithm_j, algorithm_k) => {
+                let new_algorithm_j = if algorithm_j == AlgorithmJ::Default { AlgorithmJ::Ri } else { algorithm_j };
+                let new_algorithm_k = if algorithm_k == AlgorithmK::Default { AlgorithmK::Ri } else { algorithm_k };
+                AlgorithmJK::Separated(new_algorithm_j, new_algorithm_k)
+            },
+            _ => algorithm_jk,
+        };
+        // check memory requirement for RI
+        let has_ri_non_specified = match algorithm_jk {
+            AlgorithmJK::Ri => true,
+            AlgorithmJK::Separated(algorithm_j, algorithm_k) => algorithm_j == AlgorithmJ::Ri || algorithm_k == AlgorithmK::Ri,
+            _ => false,
+        };
+        let algorithm_jk = if has_ri_non_specified {
+            println!("Checking memory requirement for RI J/K algorithms...");
+            let nao = mol.num_basis;
+            let naux = mol.num_auxbas;
+            let mem_cderi_mb = 8.0 * (nao * nao * naux) as f64 / 1024.0 / 1024.0;
+            let mem_avail_mb = mol.ctrl.max_memory.map(|max_memory| {
+                max_memory - detect_used_memory_mb("proc")
+            });
+            let algorithm_jk = if mem_avail_mb.is_some_and(|mem_avail_mb| mem_avail_mb < mem_cderi_mb) {
+                println!("Memory available for RI integrals ({:.2} MB) is less than required ({:.2} MB).", mem_avail_mb.unwrap(), mem_cderi_mb);
+                println!("Switch to direct RI-J/K algorithms.");
+                if algorithm_jk == AlgorithmJK::Ri {
+                    AlgorithmJK::RiDirect
+                } else if let AlgorithmJK::Separated(algorithm_j, algorithm_k) = algorithm_jk {
+                    let new_algorithm_j = if algorithm_j == AlgorithmJ::Ri { AlgorithmJ::RiDirect } else { algorithm_j };
+                    let new_algorithm_k = if algorithm_k == AlgorithmK::Ri { AlgorithmK::RiDirect } else { algorithm_k };
+                    AlgorithmJK::Separated(new_algorithm_j, new_algorithm_k)
+                } else {
+                    algorithm_jk
+                }
+            } else {
+                println!("Memory available for RI integrals ({:.2} MB) is more than required ({:.2} MB).", mem_avail_mb.unwrap_or(f64::INFINITY), mem_cderi_mb);
+                println!("Using standard incore RI-J/K algorithms.");
+                if algorithm_jk == AlgorithmJK::Ri {
+                    AlgorithmJK::RiIncore
+                } else if let AlgorithmJK::Separated(algorithm_j, algorithm_k) = algorithm_jk {
+                    let new_algorithm_j = if algorithm_j == AlgorithmJ::Ri { AlgorithmJ::RiIncore } else { algorithm_j };
+                    let new_algorithm_k = if algorithm_k == AlgorithmK::Ri { AlgorithmK::RiIncore } else { algorithm_k };
+                    AlgorithmJK::Separated(new_algorithm_j, new_algorithm_k)
+                } else {
+                    algorithm_jk
+                }
+            };
+            algorithm_jk
+        } else {
+            algorithm_jk
+        };
+
+        // reassign the algorithm_jk to disable any ambiguity
+        self.algorithm_jk = algorithm_jk;
     }
 
 
@@ -294,7 +373,17 @@ impl SCF {
             }
         }
 
-        let use_eri = self.mol.use_eri;
+        // update use_eri if some RI algorithms are specified
+        let use_eri_jk = match self.algorithm_jk {
+            AlgorithmJK::RiIncore => true,
+            AlgorithmJK::Separated(algorithm_j, algorithm_k) => {
+                let use_eri_j = algorithm_j == AlgorithmJ::RiIncore;
+                let use_eri_k = algorithm_k == AlgorithmK::RiIncore;
+                use_eri_j || use_eri_k
+            },
+            _ => false,
+        };
+        let use_eri = self.mol.use_eri || use_eri_jk;
         //let use_eri = true;
         let isdf = if use_eri {self.mol.ctrl.eri_type.eq("ri_v") && self.mol.ctrl.use_isdf} else {false};
         let ri3fn_full = if use_eri {self.mol.ctrl.use_auxbas && !self.mol.ctrl.use_ri_symm} else {false};
@@ -1628,12 +1717,15 @@ impl SCF {
         let num_state = self.mol.num_state;
         let spin_channel = self.mol.spin_channel;
         let dt1 = time::Local::now();
-        let vj = if self.mol.ctrl.isdf_new || self.mol.ctrl.ri_k_only {
+        let vj = if self.mol.ctrl.isdf_new {
             self.generate_vj_ri_direct(None)
-        }else{
-            self.generate_vj_with_ri_v_sync(1.0, mpi_operator)
+        } else {
+            match self.algorithm_jk {
+                AlgorithmJK::RiIncore | AlgorithmJK::Separated(AlgorithmJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
+                AlgorithmJK::RiDirect | AlgorithmJK::Separated(AlgorithmJ::RiDirect, _) => self.generate_vj_ri_direct(None),
+                _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
+            }
         };
-
 
         let dt2 = time::Local::now();
         let scaling_factor = match self.scftype {
@@ -1642,12 +1734,16 @@ impl SCF {
         };
 
         let use_dm_only = self.mol.ctrl.use_dm_only;
-        let vk = if self.mol.ctrl.use_isdf && !self.mol.ctrl.isdf_new{
+        let vk = if self.mol.ctrl.use_isdf && !self.mol.ctrl.isdf_new {
             self.generate_vk_with_isdf(scaling_factor, use_dm_only)
-        }else if self.mol.ctrl.isdf_new{
+        } else if self.mol.ctrl.isdf_new {
             self.generate_vk_with_isdf_new(scaling_factor)
-        }else{
-            self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator)
+        } else {
+            match self.algorithm_jk {
+                AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
+                AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None),
+                _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
+            }
         };
 
 
@@ -1829,10 +1925,10 @@ impl SCF {
         let dt1 = time::Local::now();
         //let use_eri = self.mol.xc_data.use_eri() || self.mol.xc_dat;
         //let use_eri = true;
-        let vj = if self.mol.ctrl.use_ri_vj {
-            self.generate_vj_with_ri_v_sync(1.0, mpi_operator)
-        } else {
-            self.generate_vj_ri_direct(None)
+        let vj = match self.algorithm_jk {
+            AlgorithmJK::RiIncore | AlgorithmJK::Separated(AlgorithmJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
+            AlgorithmJK::RiDirect | AlgorithmJK::Separated(AlgorithmJ::RiDirect, _) => self.generate_vj_ri_direct(None),
+            _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
         };
         //// ==== DEBUG IGOR ====
         //if let Some(mpi_op) = &mpi_operator {
@@ -1865,7 +1961,12 @@ impl SCF {
         if ! scaling_factor.eq(&0.0) {
             let use_dm_only = self.mol.ctrl.use_dm_only;
             //self.mol.ctrl.use_dm_only
-            let vk = self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator);
+            // let vk = self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator);
+            let vk = match self.algorithm_jk {
+                AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
+                AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None),
+                _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
+            };
             for i_spin in (0..spin_channel) {
                 self.hamiltonian[i_spin].data
                     .par_iter_mut()
@@ -3018,29 +3119,55 @@ impl SCF {
     /// - `direct`: on-the-fly direct calculation
     /// 
     /// To activate this function, in the meantime when writing this function, in `ctrl.in`
-    /// - specify `use_ri_vj = false` to disable full storage of 3c-2e ERI (required);
+    /// - specify `algorithm_j = ri-direct` or `algorithm_jk = ri-direct` to disable full storage of 3c-2e ERI (required);
     /// - specify `[ctrl]: max_memory` in MB for calculating `block_size` if not specified;
-    fn generate_vj_ri_direct(&mut self, block_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
-        // compute block_size
-        const MAX_BLOCK_SIZE: usize = 432;
-        const MIN_BLOCK_SIZE: usize = 16;
-        let block_size = block_size.unwrap_or_else(|| {
-            let nao = self.mol.num_basis;
-            let naux = self.mol.num_auxbas;
-            let sys_info = sysinfo::System::new_all();
-            let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
-                let pid = sysinfo::get_current_pid().unwrap();
-                let used_memory = sys_info.process(pid).unwrap().memory() as f64 / 1024.0 / 1024.0;
-                max_memory - used_memory
-            });
-            let aux_batch_size = crate::grad::rhf::calc_batch_size::<f64>(nao * nao, mem_avail, None, Some(naux * naux));
-            aux_batch_size.min(MAX_BLOCK_SIZE).max(MIN_BLOCK_SIZE)
+    fn generate_vj_ri_direct(&mut self, batch_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
+        let print_level = self.mol.ctrl.print_level;
+
+        // compute batch_size
+        let min_batch_size = 2 * rayon::current_num_threads();
+
+        // estimate batch size based on available memory
+        let nao = self.mol.num_basis;
+        let naux = self.mol.num_auxbas;
+        let nset = self.mol.spin_channel;
+        let sys_info = sysinfo::System::new_all();
+        let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
+            max_memory - detect_used_memory_mb("proc")
         });
+        let mem_est = ri_on_the_fly::mem_estimate_vj_ri_direct(nao, naux, nset);
+        let mut batch_size_estimate = calc_batch_size_from_mem_estimate::<f64>(&mem_est, mem_avail, None, true);
+
+        // if estimated batch size is smaller than minimum, warn and set to minimum
+        if batch_size_estimate < min_batch_size {
+            eprintln!("[WARN] in generate_vj_ri_direct, the estimated batch size ({batch_size_estimate}) is smaller than the minimum batch size ({min_batch_size}).");
+            eprintln!("[WARN] Setting batch size to {min_batch_size}. Memory could be insufficient.");
+            batch_size_estimate = min_batch_size;
+        }
+
+        // if user specified batch size is smaller than minimum, warn and set to minimum
+        let batch_size = if let Some(user_batch_size) = batch_size {
+            if user_batch_size < min_batch_size {
+                eprintln!("[WARN] in generate_vj_ri_direct, the specified batch size ({user_batch_size}) is smaller than the minimum batch size ({min_batch_size}).");
+                eprintln!("[WARN] Setting batch size to {min_batch_size}.");
+            }
+            user_batch_size.max(min_batch_size)
+        } else {
+            batch_size_estimate
+        };
+
+        // batch size info output
+        if print_level > 0 {
+            println!("[INFO] in generate_vj_ri_direct, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
+            println!("[INFO] in generate_vj_ri_direct, batch size      : {batch_size}");
+            println!("[INFO] in generate_vj_ri_direct, memory estimation");
+            mem_est.print_with_dtype::<f64>();
+        }
 
         // compute vj only for specified spin channels
         let dms = &self.density_matrix[0..self.mol.spin_channel];
         let mol_obj = &self.mol;
-        let mut vjs = crate::scf_io::ri_on_the_fly::generate_vj_ri_direct(dms, mol_obj, block_size);
+        let mut vjs = crate::scf_io::ri_on_the_fly::generate_vj_ri_direct(dms, mol_obj, batch_size);
 
         // complete `vjs` if the spin channel is 1 (restricted, spin-unpolarized)
         if self.mol.spin_channel == 1 {
@@ -3050,6 +3177,88 @@ impl SCF {
         vjs
     }
 
+    fn generate_vk_ri_direct(&mut self, scaling_factor: f64, use_dm_only: bool, batch_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
+        let print_level = self.mol.ctrl.print_level;
+
+        // compute batch_size
+        let min_batch_size = 2 * rayon::current_num_threads();
+        
+        // estimate batch size based on available memory
+        let nao = self.mol.num_basis;
+        let naux = self.mol.num_auxbas;
+        let nset = self.mol.spin_channel;
+        let nocc_max = self.occupation.iter().map(|occ_s| occ_s.iter().filter(|&&x| x > f64::EPSILON).count()).max().unwrap_or(0);
+        let sys_info = sysinfo::System::new_all();
+        let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
+            max_memory - detect_used_memory_mb("proc")
+        });
+        let mem_est_direct = ri_on_the_fly::mem_estimate_vk_ri_direct_dm(nao, naux, nset);
+        let mem_est_semi = ri_on_the_fly::mem_estimate_vk_ri_semi_direct_coeff(nao, naux, nocc_max, nset);
+        let batch_size_estimate_direct = calc_batch_size_from_mem_estimate::<f64>(&mem_est_direct, mem_avail, None, true);
+        let batch_size_estimate_semi = calc_batch_size_from_mem_estimate::<f64>(&mem_est_semi, mem_avail, None, true);
+
+        // prefer semi-direct if possible
+        let (alg_semi, mut batch_size_estimate) = if !use_dm_only && batch_size_estimate_semi >= min_batch_size {
+            if print_level > 0 {
+                println!("[INFO] in generate_vk_ri_direct_dm, using semi-direct algorithm for vk computation.");
+            }
+            (true, batch_size_estimate_semi)
+        } else {
+            if print_level > 0 {
+                println!("[INFO] in generate_vk_ri_direct_dm, using direct algorithm for vk computation.");
+            }
+            (false, batch_size_estimate_direct)
+        };
+
+        // if estimated batch size is smaller than minimum, warn and set to minimum
+        if batch_size_estimate < min_batch_size {
+            eprintln!("[WARN] in generate_vk_ri_direct_dm, the estimated batch size ({batch_size_estimate}) is smaller than the minimum batch size ({min_batch_size}).");
+            eprintln!("[WARN] Setting batch size to {min_batch_size}. Memory could be insufficient.");
+            batch_size_estimate = min_batch_size
+        }
+
+        // if user specified batch size is smaller than minimum, warn and set to minimum
+        let batch_size = if let Some(user_batch_size) = batch_size {
+            if user_batch_size < min_batch_size {
+                eprintln!("[WARN] in generate_vk_ri_direct_dm, the specified batch size ({user_batch_size}) is smaller than the minimum batch size ({min_batch_size}).");
+                eprintln!("[WARN] Setting batch size to {min_batch_size}.");
+            }
+            user_batch_size.max(min_batch_size)
+        } else {
+            batch_size_estimate
+        };
+
+        // info output
+        if print_level > 0 {
+            println!("[INFO] in generate_vk_ri_direct_dm, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
+            println!("[INFO] in generate_vk_ri_direct_dm, batch size      : {batch_size}");
+            println!("[INFO] in generate_vk_ri_direct_dm, memory estimation");
+            if alg_semi {
+                mem_est_semi.print_with_dtype::<f64>();
+            } else {
+                mem_est_direct.print_with_dtype::<f64>();
+            }
+        }
+
+        // compute vk only for specified spin channels
+        let mut vks = if alg_semi {
+            let mo_coeff = &self.eigenvectors[0..self.mol.spin_channel];
+            let mo_occ = &self.occupation[0..self.mol.spin_channel];
+            let mol_obj = &self.mol;
+            crate::scf_io::ri_on_the_fly::generate_vk_ri_semi_direct_coeff(scaling_factor, mo_coeff, mo_occ, mol_obj, batch_size)
+        } else {
+            let dms = &self.density_matrix[0..self.mol.spin_channel];
+            let mol_obj = &self.mol;
+            crate::scf_io::ri_on_the_fly::generate_vk_ri_direct_dm(scaling_factor, dms, mol_obj, batch_size)
+        };
+
+        // complete `vks` if the spin channel is 1 (restricted, spin-unpolarized)
+        if self.mol.spin_channel == 1 {
+            vks.push(MatrixUpper::new(1, 0.0f64));
+        }
+
+        vks
+    }
 }
 
 /// Applies a projection operator to a given matrix. Specifically, it calculates the
@@ -4774,6 +4983,9 @@ pub fn initialize_scf(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
     // for preparing the following integrals accurately
     let position = &scf_data.mol.geom.position;
     scf_data.mol.cint_env = scf_data.mol.update_geom_poisition_in_cint_env(position);
+
+    // update the RI-JK algorithms if not clearly specified
+    scf_data.update_jk_algorithms();
 
     let mut time_mark = utilities::TimeRecords::new();
     time_mark.new_item("Overall", "SCF Preparation");
