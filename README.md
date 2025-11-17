@@ -195,7 +195,7 @@
 - `bse_spin`: 取值String，需要进行BSE计算时必须设置此项，指定计算何种自旋的激发，可以设置为”singlet”或”triplet”
 - `bse_cutoff_energy`: 取值f64，单位为Hatree，进行BSE计算时DFT能级高于此能量的轨道的准粒子能量将不参与BSE kernel的构建，用于削减构建的BSE kernel的维数，减少对角化计算时间，缺省为1.5
 - `bse_tda`: 取值bool，设置为true则使用TDA近似，即BSE kernel只保留左上部分的子矩阵。缺省为false
-##RRS-PBC计算相关设置
+## RRS-PBC计算相关设置
 - `pbc_eigenval`: 取值String，用于指定存储k点和能级信息的文件路径。如果设置为"none"或"None"则直接打印到标准输出。缺省为"none"。相关文章见Zhang, I.Y., Jiang, J., Gao, B. *et al.* RRS-PBC: a molecular approach for periodic systems. *Sci. China Chem.* **57**, 1399–1404 (2014). https://doi.org/10.1007/s11426-014-5183-y
 # Detailed descrption of [geometric_pyo3] block in the control file
 - `maxiter`：取值i32。结构优化的最大步数上限。缺省值：300
