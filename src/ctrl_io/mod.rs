@@ -1169,7 +1169,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.algorithm_k = tmp_ctrl.get("algorithm_k").map(serde_from_value).unwrap_or_default();
             if (tmp_input.algorithm_j != AlgorithmJ::Default || tmp_input.algorithm_k != AlgorithmK::Default) {
                 if tmp_input.algorithm_jk != AlgorithmJK::Default {
-                    println!("Warning: algorithm_j and algorithm_k are specified, the setting in algorithm_jk will be ignored.");
+                    println!("Warning: algorithm_j or algorithm_k are specified, the setting in algorithm_jk will be ignored.");
                 }
                 tmp_input.algorithm_jk = AlgorithmJK::Separated(tmp_input.algorithm_j, tmp_input.algorithm_k);
             }
