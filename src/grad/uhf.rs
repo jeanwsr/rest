@@ -6,7 +6,7 @@ use crate::grad::traits::GradAPI;
 use crate::scf_io;
 use crate::scf_io::SCF;
 use crate::Molecule;
-use num_traits::ToPrimitive;
+use crate::utilities::memory_batch::*;
 use rayon::prelude::*;
 use rest_libcint::prelude::*;
 use rstsr::prelude::*;
@@ -198,9 +198,7 @@ impl RIUHFGradient<'_> {
         // available memory in MB, if not set, will be calculated from system
         let sys_info = sysinfo::System::new_all();
         let mem_avail = self.flags.max_memory.map(|max_memory| {
-            let pid = sysinfo::get_current_pid().unwrap();
-            let used_memory = sys_info.process(pid).unwrap().memory() as f64 / 1024.0 / 1024.0;
-            max_memory - used_memory
+            max_memory - detect_used_memory_mb("proc")
         });
         let aux_batch_size = calc_batch_size::<f64>(8 * nao * nao, mem_avail, None, Some(naux * (nocc[0] * nocc[0] + nocc[1] * nocc[1])));
         let aux_batch_size = aux_batch_size.min(216);
@@ -517,7 +515,7 @@ mod debug {
         println!("Time elapsed: {:?}", time.elapsed());
     }
 
-    fn test_with_scf(scf_data: &SCF) -> RIUHFGradient {
+    fn test_with_scf(scf_data: &'_ SCF) -> RIUHFGradient<'_> {
         let mut scf_grad = RIUHFGradient::new(&scf_data);
         scf_grad.calc();
 

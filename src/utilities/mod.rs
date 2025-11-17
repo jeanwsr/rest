@@ -1,8 +1,12 @@
+pub mod memory_batch;
+pub mod rstsr_util;
+
 use clap::{Command, Arg, ArgMatches};
 use rayon::ThreadPoolBuildError;
 use time::{DateTime,Local};
 use std::{time::Instant, collections::HashMap, ops::Range};
 use regex::Regex;
+
 enum DebugTiming {
    Yes,
    Not,

@@ -17,6 +17,9 @@ use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper,omp_get_num_thread
 use serde_json;
 use toml;
 
+pub mod flags;
+pub use flags::*;
+
 mod pyrest_ctrl_io;
 mod geometric_pyo3_io;
 pub mod quasiparticle_methods;
@@ -212,7 +215,9 @@ pub struct InputKeywords {
     pub check_stab: bool,
     #[pyo3(get, set)]
     pub use_dm_only: bool,
-    pub use_ri_vj: bool,
+    pub algorithm_jk: AlgorithmJK,
+    pub algorithm_j: AlgorithmJ,
+    pub algorithm_k: AlgorithmK,
     // Keywords for fciqmc dump
     #[pyo3(get, set)]
     pub fciqmc_dump: bool,
@@ -355,7 +360,9 @@ impl InputKeywords {
             // True:  using only density matrix in the evaluation
             // False: use coefficients as well with higher efficiency
             use_dm_only: false,
-            use_ri_vj: true,
+            algorithm_jk: AlgorithmJK::Default,
+            algorithm_j: AlgorithmJ::Default,
+            algorithm_k: AlgorithmK::Default,
             // Keywords for the fciqmc dump
             fciqmc_dump: false,
             // Kyewords for post scf
@@ -1166,11 +1173,16 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
                 other => false,
             };
-            tmp_input.use_ri_vj = match tmp_ctrl.get("use_ri_vj").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(true),
-                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
-                other => true,
-            };
+            // setup and sanity check of J/K algorithms
+            tmp_input.algorithm_jk = tmp_ctrl.get("algorithm_jk").map(serde_from_value).unwrap_or_default();
+            tmp_input.algorithm_j = tmp_ctrl.get("algorithm_j").map(serde_from_value).unwrap_or_default();
+            tmp_input.algorithm_k = tmp_ctrl.get("algorithm_k").map(serde_from_value).unwrap_or_default();
+            if (tmp_input.algorithm_j != AlgorithmJ::Default || tmp_input.algorithm_k != AlgorithmK::Default) {
+                if tmp_input.algorithm_jk != AlgorithmJK::Default {
+                    println!("Warning: algorithm_j or algorithm_k are specified, the setting in algorithm_jk will be ignored.");
+                }
+                tmp_input.algorithm_jk = AlgorithmJK::Separated(tmp_input.algorithm_j, tmp_input.algorithm_k);
+            }
             // ================================================
             //  Keywords associated with the elec occupation 
             // ================================================
