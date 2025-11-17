@@ -277,7 +277,7 @@ pub fn generate_vk_ri_incore_coeff_with_rstsr(
     mo_occ: TsrView<f64>,
     batch_size: usize,
 ) -> Tsr<f64> {
-    assert_eq!(mo_coeff.ndim(), 3, "Molecular coefficients must have 3 dimensions");
+    assert_eq!(mo_coeff.ndim(), 3, "Molecular orbital coefficients must have 3 dimensions");
     assert_eq!(mo_occ.ndim(), 2, "Molecular occupations must have 2 dimensions");
     assert_eq!(cderi.ndim(), 2, "Cholesky ERI must have 2 dimensions");
 
@@ -507,7 +507,7 @@ pub fn generate_vk_ri_semi_direct_coeff_with_rstsr(
     mol_obj: &Molecule,
     batch_size: usize,
 ) -> Tsr<f64> {
-    assert_eq!(mo_coeff.ndim(), 3, "Molecular coefficients must have 3 dimensions");
+    assert_eq!(mo_coeff.ndim(), 3, "Molecular orbital coefficients must have 3 dimensions");
     assert_eq!(mo_occ.ndim(), 2, "Molecular occupations must have 2 dimensions");
 
     // initialize mol and aux

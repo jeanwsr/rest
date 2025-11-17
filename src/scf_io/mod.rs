@@ -1723,7 +1723,7 @@ impl SCF {
             match self.algorithm_jk {
                 AlgorithmJK::RiIncore | AlgorithmJK::Separated(AlgorithmJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
                 AlgorithmJK::RiDirect | AlgorithmJK::Separated(AlgorithmJ::RiDirect, _) => self.generate_vj_ri_direct(None),
-                _ => unreachable!("Other cases of algorithm_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.algorithm_jk),
+                _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             }
         };
 
@@ -1742,7 +1742,7 @@ impl SCF {
             match self.algorithm_jk {
                 AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
                 AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None),
-                _ => unreachable!("Other cases of algorithm_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.algorithm_jk),
+                _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             }
         };
 
@@ -1928,7 +1928,7 @@ impl SCF {
         let vj = match self.algorithm_jk {
             AlgorithmJK::RiIncore | AlgorithmJK::Separated(AlgorithmJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
             AlgorithmJK::RiDirect | AlgorithmJK::Separated(AlgorithmJ::RiDirect, _) => self.generate_vj_ri_direct(None),
-            _ => unreachable!("Other cases of algorithm_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.algorithm_jk),
+            _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
         };
         //// ==== DEBUG IGOR ====
         //if let Some(mpi_op) = &mpi_operator {
@@ -1965,7 +1965,7 @@ impl SCF {
             let vk = match self.algorithm_jk {
                 AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
                 AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None),
-                _ => unreachable!("Other cases of algorithm_jk ({:?}) should been ruled out. If this happens, it is a bug.", self.algorithm_jk),
+                _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             };
             for i_spin in (0..spin_channel) {
                 self.hamiltonian[i_spin].data
