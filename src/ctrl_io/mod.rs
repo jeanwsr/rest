@@ -18,14 +18,14 @@ use serde_json;
 use toml;
 
 pub mod flags;
+pub use flags::*;
+
 mod pyrest_ctrl_io;
 mod geometric_pyo3_io;
-mod quasiparticle_methods;
-mod path_util;
-
+pub mod quasiparticle_methods;
 use geometric_pyo3_io::GeomeTRIC;
+mod path_util;
 use quasiparticle_methods::QuasiParticle;
-pub use flags::*;
 
 pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
     let tmp_cont = fs::read_to_string(&filename[..])?;
@@ -225,6 +225,7 @@ pub struct InputKeywords {
     pub outputs: Vec<String>,
     pub cube_orb_setting: [f64;2],
     pub cube_orb_indices: Vec<[usize;3]>,
+    pub cube_orb_type: String,
     //pub output_wfn_in_real_space: usize,
     //pub output_cube: bool,
     //pub output_molden: bool,
@@ -368,6 +369,7 @@ impl InputKeywords {
             outputs: vec![],
             cube_orb_setting: [3.0,80.0],
             cube_orb_indices: Vec::new(),
+            cube_orb_type: String::from("wavefunction"),
             //output_wfn_in_real_space: 0,
             //output_cube: false,
             //output_molden: false,
@@ -461,6 +463,14 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
             }
         }
     };
+
+    if ctrl.cube_orb_type.eq("wavefunction") {
+        println!("Cube output: wavefunction");
+    } else if ctrl.cube_orb_type.eq("density") {
+        println!("Cube output: density");
+    } else {
+        panic!("Error:: Unknown cube output type: {}", ctrl.cube_orb_type);
+    }
 
     if ctrl.xc.eq("dl_dft") {
         ctrl.xc_type = DFTType::DeepLearning
@@ -1347,6 +1357,14 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     tmp_vec
                 },
                 other => {vec![]},
+            };
+            tmp_input.cube_orb_type = match tmp_ctrl.get("cube_orb_type").unwrap_or(&serde_json::Value::Null) {
+               serde_json::Value::String(tmp_type) => {
+                    String::from(tmp_type).to_lowercase()
+               },
+               other => {
+                    String::from("wavefunction")
+               }
             };
             tmp_input.cube_orb_setting = match tmp_ctrl.get("cube_orb_setting").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Array(tmp_op) => {
