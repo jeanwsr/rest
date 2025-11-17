@@ -159,6 +159,12 @@ pub fn get_cube_orb(scf_data:&SCF) -> [MatrixFull<f64>;2]{
         
         prod[i_spin] = MatrixFull::new([ao.size[0],scf_data.eigenvectors[i_spin].size[1]],0.0);
         _dgemm_full(&ao, 'N', &scf_data.eigenvectors[i_spin], 'N', &mut prod[i_spin], 1.0, 0.0);
+
+        // to generate orbital density 
+        if scf_data.mol.ctrl.cube_orb_type == "density"{ 
+            for ele in prod[i_spin].iter_mut() {
+               *ele *= *ele;            }
+        }
     
         // generate cube file  
         prod[i_spin].iter_columns_full().enumerate().for_each(|(index, x)|{
