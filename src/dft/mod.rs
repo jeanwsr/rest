@@ -145,9 +145,13 @@ impl DFA4REST {
             dfa_paramr_adv: None }
     }
 
-    pub fn new_nonstandard(spin_channel: usize, print_level: usize, 
-               xc_namelist:&Option<Vec<String>>, xc_paramlist:&Option<Vec<f64>>, dfa_hybrid_scf: &Option<f64>,
-            ) -> DFA4REST {
+    pub fn new_nonstandard(
+        spin_channel: usize, 
+        print_level:  usize, 
+        xc_namelist:  &Option<Vec<String>>, 
+        xc_paramlist: &Option<Vec<f64>>, 
+        dfa_hybrid_scf: &Option<f64>,
+    ) -> DFA4REST {
         let mut dfa = if let (Some(codelist), Some(paramlist), Some(dfa_hybrid_scf)) = (&xc_namelist, &xc_paramlist, &dfa_hybrid_scf) {
             DFA4REST::parse_scf_nonstd(codelist, paramlist, dfa_hybrid_scf, spin_channel)
         } else {
@@ -155,6 +159,7 @@ impl DFA4REST {
         };
         dfa
     }
+
     pub fn new_deep_learning(spin_channel: usize, print_level: usize, xc_model:&Option<String>) -> DFA4REST {
         let mut dfa = if let Some(xc_model) = xc_model {
             DFA4REST::parse_scf_dldft(xc_model, spin_channel)
@@ -162,6 +167,22 @@ impl DFA4REST {
             panic!("xc_model should be provided for deep-learning DFA model")
         };
         dfa
+    }
+
+    pub fn update_pt2_params(&mut self, os_factor:Option<f64>, ss_factor:Option<f64>) {
+        match self.dfa_family_pos {
+            Some(DFAFamily::PT2) => {
+                let mut params_adv = self.dfa_paramr_adv.take().unwrap_or(vec![1.0, 1.0]);
+                if let Some(osf) = os_factor {
+                    params_adv[0] = osf;
+                }
+                if let Some(ssf) = ss_factor {
+                    params_adv[1] = ssf;
+                }
+                self.dfa_paramr_adv = Some(params_adv);
+            },
+            _ => { }
+        }
     }
 
     pub fn parse_scf_dldft(xc_model:&String, spin_channel: usize) -> DFA4REST {
@@ -367,7 +388,8 @@ impl DFA4REST {
             dfa_hybrid_scf,
         }
     }
-    pub fn parse_scf_nonstd(codelist:&Vec<String>, paramlist:&Vec<f64>, dfa_hybrid_scf: &f64, spin_channel: usize) -> DFA4REST {
+
+    pub fn parse_scf_nonstd(codelist: &Vec<String>, paramlist: &Vec<f64>, dfa_hybrid_scf: &f64, spin_channel: usize) -> DFA4REST {
         if codelist.len()!=paramlist.len() {panic!("codelist (len: {}) does not match paramlist (len: {})", codelist.len(), paramlist.len())}
         // Parse the xc functionals
         let dfa_compnt_scf = codelist.iter().map(|xc| {
@@ -398,9 +420,11 @@ impl DFA4REST {
         }
     }
 
-    pub fn parse_postscf(name: &str,spin_channel: usize) -> Option<DFA4REST> {
+    pub fn parse_postscf(name: &str, spin_channel: usize) -> Option<DFA4REST> {
         let tmp_name = name.to_lowercase();
         if tmp_name.eq("xyg3") {
+            // XYG3 functional
+            // Proc. Natl. Acad. Sci. U.S.A. 106, 13, 4963-4968 (2009); https://pnas.org/doi/full/10.1073/pnas.0901093106
             let dfa_family_pos = Some(DFAFamily::PT2);
             let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
             let dfa_compnt_pos: Option<Vec<usize>> = Some(pos_dfa.iter().map(|xc| {
@@ -416,7 +440,7 @@ impl DFA4REST {
                 DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
                 .flatten().collect();
             let dfa_paramr_scf = vec![1.0;dfa_compnt_scf.len()];
-            let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf,spin_channel);
+            let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf, spin_channel);
             Some(DFA4REST{
                 spin_channel,
                 dfa_compnt_scf,
@@ -429,6 +453,8 @@ impl DFA4REST {
                 dfa_hybrid_pos
             })
         } else if tmp_name.eq("xygjos") {
+            // XYGJ-OS functional
+            // Proc. Natl. Acad. Sci. U.S.A. 108, 50, 19896-19900 (2011); https://pnas.org/doi/full/10.1073/pnas.1115123108
             let dfa_family_pos = Some(DFAFamily::PT2);
             let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
             //let dfa_compnt_pos: Option<Vec<XcFuncType>> = Some(pos_dfa.iter().map(|xc| {
@@ -463,6 +489,8 @@ impl DFA4REST {
                 dfa_hybrid_pos
             })
         } else if tmp_name.eq("xyg7") {
+            // XYG7 functional 
+            // J. Phys. Chem. Lett. 12, 10, 2638-2644 (2021); https://doi.org/10.1021/acs.jpclett.1c00360
             let dfa_family_pos = Some(DFAFamily::PT2);
             let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
             //let dfa_compnt_pos: Option<Vec<XcFuncType>> = Some(pos_dfa.iter().map(|xc| {
@@ -496,7 +524,42 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos
             })
+        } else if tmp_name.eq("xdhpbe0") || tmp_name.eq("xdh-pbe0") {
+            // xDH-PBE0 functional
+            // J. Chem. Phys. 136, 174103 (2012); https://doi.org/10.1063/1.3703893
+            let dfa_family_pos = Some(DFAFamily::PT2);
+            let pos_dfa = ["gga_x_pbe", "gga_c_pbe"];
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(pos_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect());
+            let dfa_paramr_pos = Some(vec![0.1665, 0.5292]);
+            let dfa_hybrid_pos = Some(0.8335);
+            let dfa_paramr_adv = Some(vec![0.5428, 0.0000]);
+
+            let dfa_family_scf = DFAFamily::HybridGGA;
+            let scf_dfa = ["pbe0"];
+            //let dfa_compnt_scf: Vec<XcFuncType> = scf_dfa.iter().map(|xc| {
+            //    DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+            //    .flatten().collect();
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![1.0; dfa_compnt_scf.len()];
+            let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf, spin_channel);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos
+            })
         } else if tmp_name.eq("zrps") {
+            // ZRPS
+            // Phys. Rev. Lett. 117, 133002 (2016); https://doi.org/10.1103/PhysRevLett.117.133002
             let dfa_family_pos = Some(DFAFamily::SBGE2);
             let pos_dfa = ["gga_x_pbe","gga_c_pbe"];
             let scf_dfa = ["pbe0"];
@@ -576,6 +639,8 @@ impl DFA4REST {
                 dfa_hybrid_pos
             })
         } else if tmp_name.eq("scsrpa") {
+            // scsRPA
+            // J. Phys. Chem. Lett. 10, 10, 2617-2623 (2019); https://doi.org/10.1021/acs.jpclett.9b00946
             let dfa_family_pos = Some(DFAFamily::SCSRPA);
             let dfa_compnt_pos: Option<Vec<usize>> = Some(vec![]);
             let dfa_paramr_pos = Some(vec![]);
@@ -601,6 +666,8 @@ impl DFA4REST {
                 dfa_hybrid_pos
             })
         } else if tmp_name.eq("r-xdh7") {
+            // R-xDH7
+            // JACS Au 4, 8, 3205-3216 (2024); https://doi.org/10.1021/jacsau.4c00488
             let dfa_family_pos = Some(DFAFamily::SCSRPA);
             let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
             let dfa_compnt_pos: Option<Vec<usize>> = Some(pos_dfa.iter().map(|xc| {

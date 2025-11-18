@@ -224,7 +224,11 @@ impl Molecule {
         //let basis4elem = bas;
 
         let xc_data = match &ctrl.xc_type {
-            DFTType::Standard => {DFA4REST::new(&ctrl.xc, spin_channel, ctrl.print_level)},
+            DFTType::Standard => {
+                let mut cur_xc_data = DFA4REST::new(&ctrl.xc, spin_channel, ctrl.print_level);
+                cur_xc_data.update_pt2_params(ctrl.pt2_os_factor, ctrl.pt2_ss_factor);
+                cur_xc_data
+            },
             DFTType::NonStandard => {DFA4REST::new_nonstandard(spin_channel, ctrl.print_level, &ctrl.xc_namelist, &ctrl.xc_paralist, &ctrl.dfa_hybrid_scf)},
             DFTType::DeepLearning => {DFA4REST::new_deep_learning(spin_channel, ctrl.print_level, &ctrl.xc_model)}
         };
