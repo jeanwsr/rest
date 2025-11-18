@@ -385,11 +385,19 @@ pub fn post_scf_correlation(scf_data: &mut SCF) {
                 timerecords.new_item("PT2", "the PT2 calculation");
                 timerecords.count_start("PT2");
                 println!("Evaluating the PT2 correlation");
-                let energy_post = if spin_channel == 1 {
+                let mut energy_post = if spin_channel == 1 {
                     close_shell_pt2_rayon(&scf_data).unwrap()
                 } else {
                     open_shell_pt2_rayon(&scf_data).unwrap()
                 };
+                let os_factor = scf_data.mol.ctrl.pt2_os_factor.unwrap_or(1.0);
+                let ss_factor = scf_data.mol.ctrl.pt2_ss_factor.unwrap_or(1.0);
+                if scf_data.mol.ctrl.print_level > 1 && (os_factor != 1.0 || ss_factor != 1.0) {
+                    println!("PT2 scaling factors: OS: {:16.8}, SS: {:16.8}", os_factor, ss_factor);
+                }
+                let sos_energy = os_factor * energy_post[1];
+                let sss_energy = ss_factor * energy_post[2];
+                energy_post[0] = sos_energy + sss_energy;
                 post_corr.push((crate::dft::DFAFamily::PT2, energy_post));
                 timerecords.count("PT2");
             },

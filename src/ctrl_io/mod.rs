@@ -133,6 +133,8 @@ pub struct InputKeywords {
     // =========================================
     pub post_xc: Vec<String>,
     pub post_correlation: Vec<DFAFamily>,
+    pub pt2_ss_factor: Option<f64>,
+    pub pt2_os_factor: Option<f64>,
     pub post_ai_correction: String,
     pub charge: f64,
     #[pyo3(get, set)]
@@ -309,6 +311,8 @@ impl InputKeywords {
             empirical_dispersion: None,
             post_xc: vec![],
             post_correlation: vec![],
+            pt2_os_factor: None,
+            pt2_ss_factor: None,
             post_ai_correction: String::from("none"),
             eri_type: String::from("ri_v"),
             use_ri_symm: true,
@@ -935,6 +939,30 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 }
                 //if corr.to_lowercase().eq(&pt2) 
             });
+            tmp_input.pt2_os_factor = match tmp_ctrl.get("pt2_os_factor").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {
+                    match tmp_str.to_lowercase().parse() {
+                        Ok(num) => Some(num),
+                        Err(_) => None,
+                    }
+                },
+                serde_json::Value::Number(tmp_num) => {
+                    tmp_num.as_f64()
+                },
+                other => {None},
+            };
+            tmp_input.pt2_ss_factor = match tmp_ctrl.get("pt2_ss_factor").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {
+                    match tmp_str.to_lowercase().parse() {
+                        Ok(num) => Some(num),
+                        Err(_) => None,
+                    }
+                },
+                serde_json::Value::Number(tmp_num) => {
+                    tmp_num.as_f64()
+                },
+                other => {None},
+            };
             tmp_input.post_ai_correction = match tmp_ctrl.get("post_ai_correction").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_xc) => {tmp_xc.to_lowercase()},
                 other => {String::from("none")},

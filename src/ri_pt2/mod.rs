@@ -151,7 +151,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
 
     if scf_data.mol.ctrl.print_level>0 {
         println!("----------------------------------------------------------------------");
-        println!("{:16}: {:>16}, {:>16}, {:>16}","Methods","Total Corr", "OS Corr", "SS Corr");
+        println!("{:16}: {:>16}, {:>16}, {:>16}", "Methods", "Total Corr", "OS Corr", "SS Corr");
         println!("----------------------------------------------------------------------");
         println!("{:16}: {:16.8}, {:16.8}, {:16.8}", 
             dfa_family_pos.to_name(), pt2_c[0], pt2_c[1], pt2_c[2]);
@@ -162,7 +162,9 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
             total_energy, 
             x_energy, 
             postscf_method,
-            pt2_c[0]);
+            xdh_pt2_energy
+        );
+        println!("Exc[KS-DFA]: {:16.8} Ha", xc_energy_xdh);
     }
 
     scf_data.energies.insert(String::from("xdh_energy"), vec![total_energy]);
