@@ -10,6 +10,7 @@ use std::io::Write;
 use libc::seccomp_notif;
 use rayon::result;
 use reqwest::blocking::Response;
+use std::sync::{Arc, Mutex};
 use rest_tensors::{RIFull};
 use tensors::{matrix_blas_lapack::{_dinverse,_dsyev}, ri, MathMatrix, MatrixFull};
 //use rest::molecule_io::Molecule;
@@ -137,8 +138,6 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
     let mut save_energies:Vec<f64>=vec![0.0;num_state_cutoff];
     save_energies=(0..num_state_cutoff).map(|n|{
-        let contour_rayon=contour_rayon(quasiparticle_energies_g[n],n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_mat);
-        let imag_n=calculate_imag(&w_c_at_freqs,num_state,n,quasiparticle_energies_g[n],&quasiparticle_energies_g,&quasiparticle_energies_w);
         let consts=if cancel_dfa_xc==true{
             let mut exchange=0.0;
             for i in 0..homo+1{
@@ -149,12 +148,14 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
         //for first round, if non-RS, then of course qp==scf;
         //if RS, testings showed that solving omega=scf-v_xc+sigma_x+sigma_c_RS would be better for fisrt round
         //To confirm, the consts DO UPDATE over self-consistent GW
-        if scf_data.mol.ctrl.print_level>=2{
-            println!("for n={},decenteralized calculations yield:imag={},contour_rayon={}",n,imag_n,contour_rayon);
-        }
         let side=if n>=occ_size{1.0}else{-1.0};
         let printlevel=scf_data.mol.ctrl.print_level.clone();
-        let real_qp=newton_solver(quasiparticle_equation,n,consts,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,scf_data.eigenvalues[0][n],0.00001,50,side,printlevel);
+        let mut real_qp=0.0;
+        let qp_eq_func=|omega: f64|{
+            quasiparticle_equation(omega,n,consts,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs)
+        };
+        real_qp=linear_interpolation_solver(qp_eq_func,scf_data.eigenvalues[0][n],side,21,0.1);
+        //real_qp=newton_solver(quasiparticle_equation,n,consts,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,scf_data.eigenvalues[0][n],0.00001,50,side,printlevel);
         println!("for n={}, quasiparticle equation yields:qp energy={}",n,real_qp);
         real_qp
     }).collect::<Vec<f64>>().clone();
@@ -357,6 +358,7 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
             let mut contour:f64=0.0;
             let mut residue=0.0;
             if quasiparticle_energies_g[occ_size+a]<omega{
+                let mut exist=false;
                 let gap=omega-quasiparticle_energies_g[occ_size+a];
                 let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,gap,'C');
                 let inverse_dielectric=inverse_dielectric_matrix(&response,'C');
@@ -364,6 +366,7 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
                 let mut first_product=vec![0.0;num_auxbas];
                 _dgemv(&inverse_dielectric, &vec, &mut first_product, 'N', 1.0, 0.0, 1, 1);
                 residue=first_product.iter().zip(vec.iter()).map(|(a,b)|a*b).sum::<f64>();
+                
             }
             residue*=(sign as f64);
             residue
@@ -373,6 +376,7 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
             let mut contour:f64=0.0;
             let mut residue=0.0;
             if quasiparticle_energies_g[i]>omega{
+                let mut exist=false;
                 let gap=quasiparticle_energies_g[i]-omega;
                 let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,gap,'C');
                 let inverse_dielectric=inverse_dielectric_matrix(&response,'C');
@@ -387,7 +391,7 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
     }
     contour
 }
-pub fn newton_solver<F>(f:F,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_full:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,num_state:usize,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,starting_point:f64,tol:f64,max_iter:usize,side:f64,printlevel:usize)->f64 where F:Fn(f64,usize,f64,&MatrixFull<f64>,&MatrixFull<f64>,&Vec<f64>,&Vec<f64>,usize,usize,usize,&Vec<(f64,f64,MatrixFull<f64>)>)->f64,{
+pub fn newton_solver<F>(mut f:F,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_full:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,num_state:usize,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,starting_point:f64,tol:f64,max_iter:usize,side:f64,printlevel:usize)->f64 where F:Fn(f64,usize,f64,&MatrixFull<f64>,&MatrixFull<f64>,&Vec<f64>,&Vec<f64>,usize,usize,usize,&Vec<(f64,f64,MatrixFull<f64>)>)->f64,{
     let h =0.000001;
     let delta=0.02;
     let mut x_curr=starting_point+side*delta;
@@ -407,7 +411,7 @@ pub fn newton_solver<F>(f:F,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_full:&M
         if shift.abs()<tol{
             converge+=1;
             if printlevel>1{
-                println!("convergence: shift={}, y_curr={}",shift,y_curr);
+                println!("convergence: x_curr={},shift={}, y_curr={}",x_curr,shift,y_curr);
             }
         }
         y_plus=f(x_curr+h,n,consts,ri_ov,ri_full,quasiparticle_energies_g,quasiparticle_energies_w,occ_size,vir_size,num_state,w_c_at_freqs);
@@ -421,6 +425,53 @@ pub fn newton_solver<F>(f:F,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_full:&M
         println!("warning!!! newton solver did not converge for orbital {}!",n);
     }
     x_curr
+}
+pub fn linear_interpolation_solver<F>(mut f:F,starting_point:f64,side:f64,grid_freqs:usize,span_energy:f64)->f64 where F:Fn(f64)->f64{
+    let h=0.000001;
+    let delta=0.02;
+    let mut x_curr=starting_point+side*delta;
+    let y_curr=f(x_curr);
+    let y_minus=f(x_curr-h);
+    let y_plus=f(x_curr+h);
+    let derivative=(y_plus-y_minus)/(2.0*h);
+    let shift=-y_curr/derivative;
+    x_curr=x_curr+shift;
+    let energy_step=span_energy*2.0/((grid_freqs-1)as f64);
+    let grid_results:Vec<(f64,f64)>=(0..grid_freqs).map(|i|{
+            let x=x_curr-span_energy+((i as f64)*energy_step);
+            let fx=f(x);
+            //println!("omega={}, qp_eq={}",x,fx);
+            (x,fx)
+    }).collect();
+    let mut xing=vec![0.0;0];
+    let mut answer=0.0;
+    for i in (0..grid_freqs-1){
+        if grid_results[i].1*grid_results[i+1].1<0.0{
+            let slope=(grid_results[i+1].1-grid_results[i].1)/(grid_results[i+1].0-grid_results[i].0);
+            xing.push(grid_results[i].0-(grid_results[i].1/slope));
+        }
+    }
+    //println!("---------------\nfound {} crossings",xing.len());
+    if xing.len()>1{
+        let mut spectral_weights:Vec<(f64,f64)>=xing.iter().map(|e|{
+            let y_minus=f(e-h);
+            let y_plus=f(e+h);
+            let derivative=(y_plus-y_minus)/(2.0*h)+1.0;
+            let spectral_weight=(1.0-derivative).powf(-1.0);
+            println!("crossing at {}, spectral value={}",e,spectral_weight);
+            (spectral_weight,*e)
+        }).collect();
+        spectral_weights.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        answer=spectral_weights[0].1;
+    }else{
+        answer=xing[0];
+        let y_minus=f(answer-h);
+        let y_plus=f(answer+h);
+        let derivative=(y_plus-y_minus)/(2.0*h);
+        let spectral_weight=(1.0-derivative).powf(-1.0);
+        println!("crossing at {}, derivative={}, spectral value={}",answer,derivative,spectral_weight);
+    }
+    answer
 }
 pub fn quasiparticle_equation(omega:f64,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_full:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,num_state:usize,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>)->f64{
     let contour=contour_rayon(omega,n,quasiparticle_energies_g,quasiparticle_energies_g,occ_size,vir_size,num_state,ri_ov,ri_full);
