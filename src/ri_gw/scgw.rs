@@ -66,7 +66,24 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
     }
     let side=if n>=occ_size{1.0}else{-1.0};
     let consts=scf_data.eigenvalues[0][n]+exchange-vxc_nn;
-    ri_gw::newton_solver(ri_gw::quasiparticle_equation,n,consts,ri_ov,ri_mat,&gwqp_g,&gwqp_w,occ_size,vir_size,num_state,w_c_at_freqs,e_ks_n,0.00001,50,side,scf_data.mol.ctrl.print_level)
+    let mut real_qp=0.0;
+    let qp_eq_func=|omega: f64|{
+        ri_gw::quasiparticle_equation(omega,n,consts,&ri_ov,&ri_mat,&gwqp_g,&gwqp_w,occ_size,vir_size,num_state,w_c_at_freqs)
+    };
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let rootfinder=qp_ctrl.gw_rootfinder.clone();
+    if rootfinder=="newton".to_string(){
+        ri_gw::newton_solver(ri_gw::quasiparticle_equation,n,consts,ri_ov,ri_mat,&gwqp_g,&gwqp_w,occ_size,vir_size,num_state,w_c_at_freqs,e_ks_n,0.00001,50,side,scf_data.mol.ctrl.print_level)
+    }else if rootfinder=="interpolation".to_string(){
+        println!("Orbital #{}:",n);
+        let qp_energy=ri_gw::linear_interpolation_solver(qp_eq_func,scf_data.eigenvalues[0][n],side,qp_ctrl.gw_search_grid,qp_ctrl.gw_span_energy);
+        println!("QP energy:{}",qp_energy);
+        qp_energy
+    }else{
+        panic!("Invalid choice of GW rootfinder!")
+    }
+    
+    //
 }
 
 

@@ -38,7 +38,9 @@ pub struct QuasiParticle {
     pub bse_qp_polarization:bool,
     pub threshold:f64,
     pub gw_or_bse:String,
-
+    pub gw_span_energy:f64,
+    pub gw_search_grid:usize,
+    pub gw_rootfinder:String
 }
 
 impl Default for QuasiParticle {
@@ -76,6 +78,9 @@ impl Default for QuasiParticle {
             bse_qp_polarization:false,
             threshold:0.1,
             gw_or_bse:String::new(),
+            gw_span_energy:0.2,
+            gw_search_grid:51,
+            gw_rootfinder:"newton".to_string()
         }
     }
 }
@@ -105,6 +110,7 @@ impl QuasiParticle {
         table.insert("renormalized_singles".to_string(), toml::Value::Boolean(self.renormalized_singles));
         table.insert("w_rs".to_string(), toml::Value::Boolean(self.w_rs));
         table.insert("scgw".to_string(), toml::Value::String(self.scgw.clone()));
+        table.insert("gw_rootfinder".to_string(), toml::Value::String(self.gw_rootfinder.clone()));
         table.insert("gw".to_string(), toml::Value::Boolean(self.gw));
         table.insert("save_bse_excitations".to_string(), toml::Value::Boolean(self.save_bse_excitations));
         table.insert("evgw_rounds".to_string(), toml::Value::Integer(self.evgw_rounds as i64));
@@ -115,8 +121,9 @@ impl QuasiParticle {
         table.insert("parse_qp_path".to_string(), toml::Value::String(self.parse_qp_path.clone()));
         table.insert("bse_qp_polarization".to_string(), toml::Value::Boolean(self.bse_qp_polarization));
         table.insert("threshold".to_string(), toml::Value::Float(self.threshold));
+        table.insert("gw_span_energy".to_string(), toml::Value::Float(self.gw_span_energy));
         table.insert("gw_or_bse".to_string(), toml::Value::String(self.gw_or_bse.clone()));
-        
+        table.insert("gw_search_grid".to_string(), toml::Value::Integer(self.gw_search_grid as i64));
         toml::Value::Table(table)
     }
 }
@@ -208,6 +215,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.1)},
                 other => {0.1},
             };
+            tmp_input.gw_span_energy= match tmp_ctrl.get("gw_span_energy").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.1)},
+                other => {0.1},
+            };
             tmp_input.renormalized_singles = match tmp_ctrl.get("renormalized_singles").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
@@ -230,6 +241,11 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(4) as usize},
                 other => {0}
             };
+            tmp_input.gw_search_grid = match tmp_ctrl.get("gw_search_grid").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(4_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(4) as usize},
+                other => {0}
+            };
             tmp_input.save_gw_homo_lumo_qp = match tmp_ctrl.get("save_gw_homo_lumo_qp").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
@@ -241,6 +257,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.save_single_qp_path = match tmp_ctrl.get("save_single_qp_path").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::from("single_qp_save.txt"),
+            };
+            tmp_input.gw_rootfinder = match tmp_ctrl.get("gw_rootfinder").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("newton".to_string()),
             };
             tmp_input.save_first_excitation = match tmp_ctrl.get("save_first_excitation").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
