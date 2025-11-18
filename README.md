@@ -197,7 +197,8 @@
 - `bse_spin`: 取值String，需要进行BSE计算时必须设置此项，指定计算何种自旋的激发，可以设置为”singlet”或”triplet”
 - `bse_cutoff_energy`: 取值f64，单位为Hatree，进行BSE计算时DFT能级高于此能量的轨道的准粒子能量将不参与BSE kernel的构建，用于削减构建的BSE kernel的维数，减少对角化计算时间，缺省为1.5
 - `bse_tda`: 取值bool，设置为true则使用TDA近似，即BSE kernel只保留左上部分的子矩阵。缺省为false
-
+## RRS-PBC计算相关设置
+- `pbc_eigenval`: 取值String，用于指定存储k点和能级信息的文件路径。如果设置为"none"或"None"则直接打印到标准输出。缺省为"none"。相关文章见Zhang, I.Y., Jiang, J., Gao, B. *et al.* RRS-PBC: a molecular approach for periodic systems. *Sci. China Chem.* **57**, 1399–1404 (2014). https://doi.org/10.1007/s11426-014-5183-y
 # Detailed descrption of [geometric_pyo3] block in the control file
 - `maxiter`：取值i32。结构优化的最大步数上限。缺省值：300
 - `converge_energy`：取值f64。构型优化中上下两步能量变化的收敛阈值。缺省值：1.0e-6
@@ -294,3 +295,55 @@
         """
         ext_field_dipole = [0.0, 0.1, 0.0]
         ```
+- `rrs_pbc`: 取值为bool。如果设置为true则启动RRS-PBC计算。缺省为false
+  
+- `unit_cell_index`: 取值为Vec<usize>。核心晶胞包含的原子在`position`中的序号。缺省为空
+  
+  - **注意**：原子的序号从0开始
+    
+  - 一个例子：
+    
+    ```
+    [geom]
+    name = "NH3"
+    unit = "Angstrom"
+    position = """
+        H  0.0  0.0  0.0
+        C  1.1  0.0  0.0
+        C  2.4  0.0  0.0
+        C  3.7  0.0  0.0  # 这个原子属于核心晶胞
+        C  5.0  0.0  0.0  # 这个原子也属于核心晶胞
+        C  6.3  0.0  0.0
+        C  8.0  0.0  0.0
+        H  9.1  0.0  0.0
+    """
+    rrs_pbc = true
+    unit_cell_index = [3,4]
+    ```
+    
+- `pbc_dim`: 取值为usize。周期性的维度。缺省为1
+  
+- `rrs_pbc_vec`：取值为Vec<f64>。周期性体系的晶格矢量。缺省为空
+  
+  - **注意**：每个晶格矢量均为三维，如果周期性的维度不为1，则将所有晶格矢量拼接为一个作为该参数。如果晶格矢量的总长度超过周期性维度对应的长度，将抛出一个警告并忽略多余部分
+    
+  - 一个例子：
+    
+    ```
+    pbc_dim = 2  # 视为二维周期性体系
+    rrs_pbc_vec = [1.0,0.0,0.0,0.0,1.0,0.0,5.14]  # 两个晶格矢量分别为[1.0,0.0,0.0]和[0.0,1.0,0.0]，多余的5.14被忽略
+    ```
+    
+- `max_step`：取值为Vec<String>。从核心晶胞开始作用晶格矢量的最大次数。缺省为空
+  
+  - **注意**：RRS-PBC算法会从核心晶胞开始按照平移矢量向正负方向各平移至多`max_step`次，匹配元素和位置均符合的晶胞，并跳过不符合的。如果长度超过周期性维度，将忽略多余部分。匹配结果会在`print_level`至少为1时输出，例如：
+    
+    ```
+    For step path = (-1, 0, 0), found target index = [0, 1, 2, 3]
+    For step path = (0, 0, 0), found target index = [4，5，6，7]
+    For step path = (1, 0, 0), found target index = [8，9，10，11] 
+    ```
+    
+- `k_points`: 取值为Vec<usize>。每个周期性维度下的k点数量。缺省为空
+  
+  - **注意**：k点的选取方法为在倒格矢和倒格矢的反向之间均匀分布，并包含两侧边界。为了确保均匀分布的k点能够覆盖高对称点，推荐将数量设置的大一些
