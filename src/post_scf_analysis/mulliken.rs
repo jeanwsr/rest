@@ -22,7 +22,7 @@ pub fn mulliken_pop(scf_data: &SCF) -> Vec<f64>{
     charge.extend(vec![0.0; mol.geom.ghost_bs_elem.len()]);
 
     let mut dm = scf_data.density_matrix[0].clone();
-    if mol.ctrl.spin_polarization {
+    if mol.spin_channel == 2 {
         dm += scf_data.density_matrix[1].clone();
     };
     
@@ -67,8 +67,11 @@ pub fn mulliken_pop(scf_data: &SCF) -> Vec<f64>{
     });
 
     // check if ecp is used
-    mulliken.iter_mut().zip(scf_data.mol.basis4elem.iter()).for_each(|(mcharge,b4e)| {
-        if let Some(i_ecp) = b4e.ecp_electrons {*mcharge -= i_ecp as f64;}
+    let ghost_atom_index =scf_data.mol.geom.get_start_index_of_ghost_atoms(); 
+    mulliken.iter_mut().enumerate().zip(scf_data.mol.basis4elem.iter()).for_each(|((atm_indx,mcharge),b4e)| {
+        if atm_indx < ghost_atom_index {
+            if let Some(i_ecp) = b4e.ecp_electrons {*mcharge -= i_ecp as f64;}
+        }
     });
     
     mulliken

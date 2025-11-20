@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use std::fmt::format;
 use std::fs::{File, self, create_dir_all, read_dir};
 use std::io::{Write, copy, Cursor};
+use std::env;
+use std::path;
 use crate::basis_io::Basis4Elem;
 use crate::geom_io::{GeomCell, get_mass_charge};
 use array_tool::vec::{self, Intersect};
@@ -485,8 +487,9 @@ pub fn ctrl_element_checker(cell: &GeomCell) -> Vec<String> {
 
 #[test]
 fn local_test() {
-    let path = String::from("/share/home/tygao/REST2.0/basis-set-pool/cc-pVTZ");
-    local_element_checker(&path);
+    let rest_home = std::env::var("REST_HOME").expect("The environment variable REST_HOME is not set.");
+    let mut file_path = path::PathBuf::from(rest_home).join("rest/basis-set-pool/cc-pVTZ");
+    local_element_checker(&file_path.to_string_lossy().to_string());
 }    
 //passed
 

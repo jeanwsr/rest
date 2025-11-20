@@ -28,11 +28,12 @@ use crate::constants::{ATM_NUC, ATM_NUC_MOD_OF, AUXBAS_THRESHOLD, ELEM1ST, ELEM2
 use crate::dft::{DFTType, DFA4REST};
 use crate::geom_io::{GeomCell,MOrC, GeomUnit, get_mass_charge};
 use crate::basis_io::{ecp, BasInfo, Basis4Elem};
-use crate::ctrl_io::{overall_parse_and_report_on_ctrl_geom, InputKeywords};
+use crate::ctrl_io::{overall_parse_and_report_on_ctrl_geom, InputKeywords, parse_ctl};
 use crate::mpi_io::{mpi_isend_irecv_wrt_distribution, mpi_isend_irecv_wrt_distribution_v02, mpi_isend_irecv_wrt_distribution_v03, MPIData, MPIOperator};
 use crate::utilities;
 use crate::basis_io::bse_downloader::{self, ctrl_element_checker, local_element_checker};
 use crate::basis_io::basis_list::{self, basis_fuzzy_matcher, check_basis_name};
+use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper, omp_get_num_threads_wrapper};
 
 //extern crate nalgebra as na;
 //use na::{DMatrix,DVector};
@@ -173,7 +174,7 @@ impl Molecule {
     pub fn build(ctrl_file: String, mpi_data: Option<MPIData>) -> anyhow::Result<Molecule> {
         //let mut mol = Molecule::new();
         //let (mut ctrl, mut geom) = RawCtrl::parse_ctl_from_jsonfile_v02(ctrl_file)?;
-        let (mut ctrl, mut geom) = InputKeywords::parse_ctl(ctrl_file)?;
+        let (mut ctrl, mut geom) = parse_ctl(ctrl_file)?;
         if let Some(local_mpi_data) = &mpi_data {
             if local_mpi_data.rank != 0 {ctrl.print_level = 0};
         };
@@ -223,12 +224,16 @@ impl Molecule {
         //let basis4elem = bas;
 
         let xc_data = match &ctrl.xc_type {
-            DFTType::Standard => {DFA4REST::new(&ctrl.xc, spin_channel, ctrl.print_level)},
+            DFTType::Standard => {
+                let mut cur_xc_data = DFA4REST::new(&ctrl.xc, spin_channel, ctrl.print_level);
+                cur_xc_data.update_pt2_params(ctrl.pt2_os_factor, ctrl.pt2_ss_factor);
+                cur_xc_data
+            },
             DFTType::NonStandard => {DFA4REST::new_nonstandard(spin_channel, ctrl.print_level, &ctrl.xc_namelist, &ctrl.xc_paralist, &ctrl.dfa_hybrid_scf)},
             DFTType::DeepLearning => {DFA4REST::new_deep_learning(spin_channel, ctrl.print_level, &ctrl.xc_model)}
         };
 
-        let use_eri = xc_data.use_eri() || ctrl.use_ri_vj;
+        let use_eri = xc_data.use_eri();
         
 
         let mut start_mo = count_frozen_core_states(ctrl.frozen_core_postscf, &geom.elem);
@@ -843,97 +848,84 @@ impl Molecule {
         // now import ecp basis infom.
         let mut ecpbas: Vec<Vec<i32>> = vec![];
         let mut ecp_start = env.len() as i32;
+        let ghost_atm_index = geom.get_start_index_of_ghost_atoms(); 
         basis_total.iter().zip(atm.iter_mut().enumerate()).for_each(|(bas, (atm_index,cur_atm))| {
-            if let (Some(ecp), Some(necp))  = (&bas.ecp_potentials, &bas.ecp_electrons) {
-                // IMPORTANCE. to uncount the electrons in ECP
-                cur_atm[ATM_NUC] -= *necp as i32;
-                cur_atm[ATM_NUC_MOD_OF] = NUC_ECP;
-                num_elec[0] -= *necp as f64;
+            // only act for the ecp of real atoms
+            if atm_index < ghost_atm_index { 
+                if let (Some(ecp), Some(necp))  = (&bas.ecp_potentials, &bas.ecp_electrons) {
+                    // IMPORTANCE. to uncount the electrons in ECP
+                    cur_atm[ATM_NUC] -= *necp as i32;
+                    cur_atm[ATM_NUC_MOD_OF] = NUC_ECP;
+                    num_elec[0] -= *necp as f64;
 
-                // import ecpbas and ecp for env
-                let ecp_ang_start = (ecp.len()-1) as i32;
-                for ecpcell in ecp.iter() {
+                    // import ecpbas and ecp for env
+                    let ecp_ang_start = (ecp.len()-1) as i32;
+                    for ecpcell in ecp.iter() {
 
-                    let angl = ecpcell.angular_momentum[0];
-                    let coeffs = &ecpcell.coefficients;
-                    let gaussian_exponents = &ecpcell.gaussian_exponents;
-                    let num_exp = gaussian_exponents.len() as i32;
-                    let num_coeffs = coeffs.len() as i32;
+                        let angl = ecpcell.angular_momentum[0];
+                        let coeffs = &ecpcell.coefficients;
+                        let gaussian_exponents = &ecpcell.gaussian_exponents;
+                        let num_exp = gaussian_exponents.len() as i32;
+                        let num_coeffs = coeffs.len() as i32;
 
-                    let mut r_exponents_group: HashMap<i32, Vec<usize>> = HashMap::new();
-                    //let r_exponents_list: Vec<i32> = vec![];
+                        let mut r_exponents_group: HashMap<i32, Vec<usize>> = HashMap::new();
+                        //let r_exponents_list: Vec<i32> = vec![];
 
-                    ecpcell.r_exponents.iter().enumerate().for_each(|(index, r_exponents)| {
-                        if r_exponents_group.contains_key(r_exponents) {
-                            r_exponents_group.get_mut(r_exponents).unwrap().push(index);
-                        } else {
-                            r_exponents_group.insert(*r_exponents, vec![index]);
-                        }
-                    });
-                    //let r_exponents = *ecpcell.r_exponents.get(0).unwrap();
-                    //if num_coeffs != num_exp {
-                    //    panic!("bad ecp basis for the elem of {}", &geom.elem[atm_index]);
-                    //}
-
-                    r_exponents_group.iter().for_each(|(r_exponent, index_vec)| {
-                        let mut ecp_exp_start = env.len() as i32;
-                        let num_index_vec = index_vec.len() as i32;
-                        env.extend(gaussian_exponents.iter().enumerate()
-                            .filter(|(index, x)| index_vec.contains(index) )
-                            .map(|(_, x)| x)
-                        );
-                        if num_index_vec > num_exp {
-                            panic!("bad ecp basis for the elem of {}", &geom.elem[atm_index]);
-                        }
-                        coeffs.iter().for_each(|each_coeffs| {
-                            let len_coeffs = each_coeffs.len() as i32;
-                            if len_coeffs != num_exp {
-                                panic!("bad ecp basis for the elem of {}", &geom.elem[atm_index]);
+                        ecpcell.r_exponents.iter().enumerate().for_each(|(index, r_exponents)| {
+                            if r_exponents_group.contains_key(r_exponents) {
+                                r_exponents_group.get_mut(r_exponents).unwrap().push(index);
+                            } else {
+                                r_exponents_group.insert(*r_exponents, vec![index]);
                             }
-                            let mut ecp_coeff_start = env.len() as i32;
-                            let mut tmp_ecpbas_vec: Vec<i32> = vec![atm_index as i32, 
-                                        if angl==ecp_ang_start {-1} else {angl},
-                                        num_index_vec,
-                                        *r_exponent,
-                                        0,
-                                        ecp_exp_start,
-                                        ecp_coeff_start,
-                                        0];
-                            ecpbas.push(tmp_ecpbas_vec);
+                        });
+                        //let r_exponents = *ecpcell.r_exponents.get(0).unwrap();
+                        //if num_coeffs != num_exp {
+                        //    panic!("bad ecp basis for the elem of {}", &geom.elem[atm_index]);
+                        //}
 
-                            env.extend(each_coeffs.iter().enumerate()
-                                .filter(|(index, x)| index_vec.contains(index))
+                        r_exponents_group.iter().for_each(|(r_exponent, index_vec)| {
+                            let mut ecp_exp_start = env.len() as i32;
+                            let num_index_vec = index_vec.len() as i32;
+                            env.extend(gaussian_exponents.iter().enumerate()
+                                .filter(|(index, x)| index_vec.contains(index) )
                                 .map(|(_, x)| x)
                             );
+                            if num_index_vec > num_exp {
+                                panic!("bad ecp basis for the elem of {}", &geom.elem[atm_index]);
+                            }
+                            coeffs.iter().for_each(|each_coeffs| {
+                                let len_coeffs = each_coeffs.len() as i32;
+                                if len_coeffs != num_exp {
+                                    panic!("bad ecp basis for the elem of {}", &geom.elem[atm_index]);
+                                }
+                                let mut ecp_coeff_start = env.len() as i32;
+                                let mut tmp_ecpbas_vec: Vec<i32> = vec![atm_index as i32, 
+                                            if angl==ecp_ang_start {-1} else {angl},
+                                            num_index_vec,
+                                            *r_exponent,
+                                            0,
+                                            ecp_exp_start,
+                                            ecp_coeff_start,
+                                            0];
+                                ecpbas.push(tmp_ecpbas_vec);
+
+                                env.extend(each_coeffs.iter().enumerate()
+                                    .filter(|(index, x)| index_vec.contains(index))
+                                    .map(|(_, x)| x)
+                                );
+                            });
                         });
-                    });
-
-                    //let mut ecp_exp_start = env.len() as i32;
-                    //env.extend(gaussian_exponents.iter());
-
-                    //coeffs.iter().for_each(|each_coeffs| {
-                    //    let len_coeffs = each_coeffs.len() as i32;
-                    //    if len_coeffs != num_exp {
-                    //        panic!("bad ecp basis for the elem of {}", &geom.elem[atm_index]);
-                    //    }
-                    //    let mut ecp_coeff_start = env.len() as i32;
-                    //    let mut tmp_ecpbas_vec: Vec<i32> = vec![atm_index as i32, 
-                    //                if angl==ecp_ang_start {-1} else {angl},
-                    //                num_exp,
-                    //                r_exponents,
-                    //                0,
-                    //                ecp_exp_start,
-                    //                ecp_coeff_start,
-                    //                0];
-                    //    env.extend(each_coeffs.iter());
-                    //    ecpbas.push(tmp_ecpbas_vec);
-                    //});
-                }
-            };
+                    }
+                };
+            }
         });
 
         // determine the electron number in total and in each spin channel.
         num_elec[0]-=ctrl.charge;
+
+        if ctrl.use_int_nelec {
+            sanity_check_nelec(num_elec[0], ctrl.spin);
+        }
 
         let unpair_elec = (ctrl.spin-1.0_f64);
         num_elec[1] = (num_elec[0]-unpair_elec)/2.0 + unpair_elec;
@@ -1782,7 +1774,7 @@ impl Molecule {
     }
 
     pub fn int_ij_aux_columb_new(&self) -> MatrixFull<f64> {
-        utilities::omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
+        omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
         let n_auxbas = self.num_auxbas;
         let mut cint_data = self.initialize_cint(true);
         let n_basis_shell = self.cint_bas.len() as i32;
@@ -2004,10 +1996,10 @@ impl Molecule {
                    self.ctrl.basis_type);
         };
 
-        utilities::omp_set_num_threads_wrapper(1);
         let (sender, receiver) = channel();
         //self.cint_aux_fdqc.par_iter().enumerate().for_each_with(sender,|s,(k,bas_info)| {
         self.cint_fdqc.par_iter().enumerate().for_each_with(sender,|s, (j,bas_info_j)| {
+            omp_set_num_threads_wrapper(1);
             let basis_start_j = bas_info_j[0];
             let basis_len_j = bas_info_j[1];
 
@@ -2073,7 +2065,8 @@ impl Molecule {
                 0..n_basis,0..basis_len_j,0..n_auxbas,
             );
         });
-        utilities::omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
+
+        omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
 
         time_records.count("prim ri");
         time_records.count("all ri");
@@ -2129,9 +2122,10 @@ impl Molecule {
             }
         };
 
-        utilities::omp_set_num_threads_wrapper(1);
         let (sender, receiver) = channel();
         par_shellpair.par_iter().for_each_with(sender, |s, shell_index| {
+
+            omp_set_num_threads_wrapper(1);
             // first, initialize rust_cint for each rayon threads
             let mut cint_data = self.initialize_cint(true);
 
@@ -2234,7 +2228,7 @@ impl Molecule {
             });
         });
 
-        utilities::omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
+        omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
 
         time_records.count("prim ri");
 
@@ -2293,10 +2287,10 @@ impl Molecule {
                    self.ctrl.basis_type);
         };
 
-        utilities::omp_set_num_threads_wrapper(1);
         let (sender, receiver) = channel();
         //par_shellpair.par_iter().for_each_with(sender, |s, shell_index| {
         (0..n_basis_shell).rev().collect::<Vec<usize>>().par_iter().for_each_with(sender, |s, gj| {
+            omp_set_num_threads_wrapper(1);
             //// ========== for efficiency debug ==============
             //let mut sub_time_records = utilities::TimeRecords::new();
             //sub_time_records.new_item("ri: cint_3c2e", "debug");
@@ -2441,7 +2435,7 @@ impl Molecule {
             });
         });
 
-        utilities::omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
+        omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
 
         time_records.count("prim ri");
 
@@ -2495,10 +2489,10 @@ impl Molecule {
                    self.ctrl.basis_type);
         };
 
-        utilities::omp_set_num_threads_wrapper(1);
         let (sender, receiver) = channel();
         //par_shellpair.par_iter().for_each_with(sender, |s, shell_index| {
         (0..n_basis_shell).rev().collect::<Vec<usize>>().par_iter().for_each_with(sender, |s, gj| {
+            omp_set_num_threads_wrapper(1);
             //// ========== for efficiency debug ==============
             //let mut sub_time_records = utilities::TimeRecords::new();
             //sub_time_records.new_item("ri: cint_3c2e", "debug");
@@ -2603,7 +2597,8 @@ impl Molecule {
 
         time_records.new_item("ri_v","for RI dot aux_v^{-1/2}");
         time_records.count_start("ri_v");
-        utilities::omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
+
+        omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
         let mut ri3fn = MatrixFull::new([n_baspar,n_auxbas],0.0);
         _dgemm_full(&tmp_ri3fn, 'N', &aux_v, 'N', &mut ri3fn, 1.0, 0.0);
         time_records.count("ri_v");
@@ -2666,9 +2661,10 @@ impl Molecule {
                    self.ctrl.basis_type);
         };
 
-        utilities::omp_set_num_threads_wrapper(1);
         let (sender, receiver) = channel();
         (0..n_basis_shell).rev().collect::<Vec<usize>>().par_iter().for_each_with(sender, |s, gj| {
+
+            omp_set_num_threads_wrapper(1);
 
             let bas_j = *gj;
             // first, initialize rust_cint for each rayon threads
@@ -2780,7 +2776,8 @@ impl Molecule {
 
         time_records.new_item("ri_v","for RI dot aux_v^{-1/2}");
         time_records.count_start("ri_v");
-        utilities::omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
+
+        omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
         let mut ri3fn = MatrixFull::new([n_baspar,n_auxbas],0.0);
         _dgemm_full(&tmp_ri3fn, 'T', &aux_v, 'N', &mut ri3fn, 1.0, 0.0);
         time_records.count("ri_v");
@@ -2918,10 +2915,11 @@ impl Molecule {
         let loc_n_baspar = e_baspar - s_baspar + 1;
 
         let mut tmp_ri3fn = MatrixFull::new([n_auxbas, loc_n_baspar],0.0);
-        utilities::omp_set_num_threads_wrapper(1);
         let (sender, receiver) = channel();
         //(0..n_basis_shell).rev().collect::<Vec<usize>>().par_iter().for_each_with(sender, |s, gj| {
         (sbsh..ebsh+1).collect::<Vec<usize>>().par_iter().for_each_with(sender, |s,gj| {
+
+            omp_set_num_threads_wrapper(1);
 
             let bas_j = *gj;
             // first, initialize rust_cint for each rayon threads
@@ -3008,7 +3006,7 @@ impl Molecule {
 
 
         let mut ri3fn = MatrixFull::new([loc_n_baspar, n_auxbas],0.0);
-        utilities::omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
+        omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
         _dgemm_full(&tmp_ri3fn, 'T', aux_v, 'N', &mut ri3fn, 1.0, 0.0);
 
         ri3fn
@@ -3018,6 +3016,8 @@ impl Molecule {
 
     // generate the 3-center RI integrals and the basis pair symmetry is used to save the memory
     pub fn prepare_rimatr_for_ri_v_rayon_v05(&self) -> (MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>) {
+
+        omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
 
         let mut time_records = utilities::TimeRecords::new();
         time_records.new_item("all ri", "for the total evaluations of ri3fn");
@@ -3069,6 +3069,8 @@ impl Molecule {
 
         (out, out_shape) = cint_data.integral_s2ij::<int3c2e>(Some(&shl_slices));
 
+        cint_data.final_c2r();
+
         let mut tmp_ri3fn = MatrixFull::from_vec([n_baspar, n_auxbas],out).unwrap();
 
         let mut basbas2baspar = MatrixFull::new([n_basis,n_basis],0_usize);
@@ -3084,7 +3086,7 @@ impl Molecule {
 
         time_records.new_item("ri_v","for RI dot aux_v^{-1/2}");
         time_records.count_start("ri_v");
-        utilities::omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
+
         let mut ri3fn = MatrixFull::new([n_baspar,n_auxbas],0.0);
         _dgemm_full(&tmp_ri3fn, 'N', &aux_v, 'N', &mut ri3fn, 1.0, 0.0);
         time_records.count("ri_v");
@@ -3314,8 +3316,49 @@ pub fn count_frozen_core_states(n_frozen_shell: i32, elem: &Vec<String>) -> usiz
 //    //(index[1]+1)*index[1]/2
 //}
 
+pub fn is_int(f: f64) -> bool {
+    (f - f.round()).abs() < 1.0e-8
+}
 
+pub fn sanity_check_nelec(num_elec: f64, spin: f64) -> (i32, i32) {
 
+    let num_elec_int: i32;
+    let spin_int: i32;
+    if !is_int(num_elec) {
+        panic!("Error:: The total electron number cannot be rounded to an integer: {}.", num_elec);
+    } else {
+        num_elec_int = num_elec.round() as i32;
+    };
+    if !is_int(spin) {
+        panic!("Error:: The spin multiplicity cannot be rounded to an integer: {}.", spin);
+    } else {
+        spin_int = spin.round() as i32;
+    };
+    // odd/even check
+    if (num_elec_int - spin_int + 1) % 2 != 0 {
+        panic!("Error:: The total number of electrons ({}) and the spin multiplicity ({}) do not match.", num_elec, spin);
+    };
+    (num_elec_int, spin_int)
+}
+
+#[test]
+fn test_sanity_check_nelec() {
+    let (n, s) = sanity_check_nelec(10.0, 1.0);
+    assert_eq!(n, 10);
+    assert_eq!(s, 1);
+}
+
+#[test]
+#[should_panic]
+fn test_sanity_check_nelec_panic1() {
+    let (n, s) = sanity_check_nelec(10.1, 1.0);
+}
+
+#[test]
+#[should_panic]
+fn test_sanity_check_nelec_panic2() {
+    let (n, s) = sanity_check_nelec(10.0, 0.0);
+}
 
 #[test]
 fn test_get_slices_mut() {
@@ -3325,23 +3368,23 @@ fn test_get_slices_mut() {
         12.0,  37.0, -43.0,
        -16.0, -43.0,  98.0
     ]).unwrap();
-    utilities::omp_set_num_threads_wrapper(1);
+    omp_set_num_threads_wrapper(1);
     //aux_v = aux_v.lapack_power(-0.5, 1.0E-6).unwrap();
     let aux_v = test_matrix.to_matrixfullslicemut().cholesky_decompose_inverse('L').unwrap();
     println!("{:?}", aux_v);
-    utilities::omp_set_num_threads_wrapper(2);
+    omp_set_num_threads_wrapper(2);
     let aux_v = test_matrix.to_matrixfullslicemut().cholesky_decompose_inverse('L').unwrap();
     println!("{:?}", aux_v);
-    utilities::omp_set_num_threads_wrapper(3);
+    omp_set_num_threads_wrapper(3);
     let aux_v = test_matrix.to_matrixfullslicemut().cholesky_decompose_inverse('L').unwrap();
     println!("{:?}", aux_v);
-    utilities::omp_set_num_threads_wrapper(4);
+    omp_set_num_threads_wrapper(4);
     let aux_v = test_matrix.to_matrixfullslicemut().cholesky_decompose_inverse('L').unwrap();
     println!("{:?}", aux_v);
-    utilities::omp_set_num_threads_wrapper(5);
+    omp_set_num_threads_wrapper(5);
     let aux_v = test_matrix.to_matrixfullslicemut().cholesky_decompose_inverse('L').unwrap();
     println!("{:?}", aux_v);
-    utilities::omp_set_num_threads_wrapper(6);
+    omp_set_num_threads_wrapper(6);
     let aux_v = test_matrix.to_matrixfullslicemut().cholesky_decompose_inverse('L').unwrap();
     println!("{:?}", aux_v);
     //let aa = test_matrix.iter_submatrix_mut(0..3, 0..2).map(|a| *a).collect::<Vec<i32>>();

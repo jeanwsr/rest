@@ -43,7 +43,7 @@ pub fn numerical_dipole(scf_data: &SCF, displace: f64) -> [f64; 3] {
 #[allow(non_snake_case)]
 mod debug {
     use super::*;
-    use crate::ctrl_io::InputKeywords;
+    use crate::ctrl_io::parse_ctl_from_json;
     use crate::molecule_io::Molecule;
     use crate::scf_io::{self, scf_without_build};
 
@@ -90,7 +90,7 @@ mod debug {
     """
 "##;
         let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
-        let (mut ctrl, mut geom) = InputKeywords::parse_ctl_from_json(&keys).unwrap();
+        let (mut ctrl, mut geom) = parse_ctl_from_json(&keys).unwrap();
         let mol = Molecule::build_native(ctrl, geom, None).unwrap();
         let mut scf_data = scf_io::SCF::build(mol, &None);
         scf_without_build(&mut scf_data, &None);
@@ -119,7 +119,7 @@ mod debug {
     """
 "##;
         let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
-        let (mut ctrl, mut geom) = InputKeywords::parse_ctl_from_json(&keys).unwrap();
+        let (mut ctrl, mut geom) = parse_ctl_from_json(&keys).unwrap();
         let mol = Molecule::build_native(ctrl, geom, None).unwrap();
         let mut scf_data = scf_io::SCF::build(mol, &None);
         scf_without_build(&mut scf_data, &None);

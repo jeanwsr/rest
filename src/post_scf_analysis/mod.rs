@@ -3,6 +3,8 @@ pub mod cube_build;
 pub mod molden_build;
 pub mod mulliken;
 pub mod strong_correlation_correction;
+pub mod rrs_pbc;
+pub mod spin_correction;
 
 use std::path::Path;
 use rest_libcint::prelude::int1e_r;
@@ -16,6 +18,8 @@ use crate::mpi_io::MPIOperator;
 use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon, open_shell_sbge2_rayon, close_shell_sbge2_detailed_rayon, open_shell_sbge2_detailed_rayon};
 use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon, evaluate_spin_response_rayon, evaluate_special_radius_only};
 use crate::ri_rpa::{evaluate_rpa_correlation, evaluate_rpa_correlation_rayon};
+use crate::ri_gw;
+use crate::ri_bse;
 use crate::scf_io::{SCF, SCFType};
 use crate::ri_pt2::{close_shell_pt2_rayon, open_shell_pt2_rayon};
 use crate::utilities::TimeRecords;
@@ -381,11 +385,19 @@ pub fn post_scf_correlation(scf_data: &mut SCF) {
                 timerecords.new_item("PT2", "the PT2 calculation");
                 timerecords.count_start("PT2");
                 println!("Evaluating the PT2 correlation");
-                let energy_post = if spin_channel == 1 {
+                let mut energy_post = if spin_channel == 1 {
                     close_shell_pt2_rayon(&scf_data).unwrap()
                 } else {
                     open_shell_pt2_rayon(&scf_data).unwrap()
                 };
+                let os_factor = scf_data.mol.ctrl.pt2_os_factor.unwrap_or(1.0);
+                let ss_factor = scf_data.mol.ctrl.pt2_ss_factor.unwrap_or(1.0);
+                if scf_data.mol.ctrl.print_level > 1 && (os_factor != 1.0 || ss_factor != 1.0) {
+                    println!("PT2 scaling factors: OS: {:16.8}, SS: {:16.8}", os_factor, ss_factor);
+                }
+                let sos_energy = os_factor * energy_post[1];
+                let sss_energy = ss_factor * energy_post[2];
+                energy_post[0] = sos_energy + sss_energy;
                 post_corr.push((crate::dft::DFAFamily::PT2, energy_post));
                 timerecords.count("PT2");
             },
@@ -433,6 +445,38 @@ pub fn post_scf_correlation(scf_data: &mut SCF) {
         });
         println!("----------------------------------------------------------------------");
         if scf_data.mol.ctrl.print_level>1 {timerecords.report_all()};
+    }
+}
+
+pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>){
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let output_type=qp_ctrl.gw_or_bse.clone();
+    if output_type.eq("gw"){
+        let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
+        if qp_ctrl.gw_scheme !="no gw" || qp_ctrl.homo_lumo_gw_qp==true{
+            ri_bse::prepare_ri3mo(scf_data,'Y');
+        }
+        if qp_ctrl.homo_lumo_gw_qp==true{
+            ri_gw::get_homo_lumo_qp_only(scf_data,20,&vxc_nn,mpi_operator);
+        }else{
+            ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
+            //ri_bse::matvec::test_v_w_contribution(scf_data);
+        }
+    }else if output_type.eq("bse"){
+        if qp_ctrl.gw_scheme=="parse from file"{
+            let parse_qp_path=qp_ctrl.parse_qp_path.clone();
+            scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
+        }else{
+            let mut rimatr=scf_data.rimatr.clone();
+            ri_bse::prepare_ri3mo(scf_data,'Y');
+            scf_data.rimatr=rimatr;
+            rimatr=None;
+            let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
+            ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
+        }
+        ri_bse::bse_main(scf_data);
+    }else{
+        print!("Warning: You entered an invalid quasiparticle method. No quasiparticle methods Were triggered.")
     }
 }
 

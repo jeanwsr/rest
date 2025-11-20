@@ -1,6 +1,9 @@
 mod libxc;
 pub mod gen_grids;
 pub mod deep_learning;
+pub mod libxc_itrf;
+pub mod xc_deriv;
+pub mod num_int;
 
 use mpi::collective::SystemOperation;
 use mpi::ffi::MPI_T_SCOPE_GROUP_EQ;
@@ -36,6 +39,8 @@ use serde::{Deserialize, Serialize};
 use libxc::{XcFuncType, LibXCFamily};
 //use std::intrinsics::expf64;
 use crate::dft::libxc::names_and_values::MAP as libxc_names_values;
+
+use rest_tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
 
 
 
@@ -140,9 +145,13 @@ impl DFA4REST {
             dfa_paramr_adv: None }
     }
 
-    pub fn new_nonstandard(spin_channel: usize, print_level: usize, 
-               xc_namelist:&Option<Vec<String>>, xc_paramlist:&Option<Vec<f64>>, dfa_hybrid_scf: &Option<f64>,
-            ) -> DFA4REST {
+    pub fn new_nonstandard(
+        spin_channel: usize, 
+        print_level:  usize, 
+        xc_namelist:  &Option<Vec<String>>, 
+        xc_paramlist: &Option<Vec<f64>>, 
+        dfa_hybrid_scf: &Option<f64>,
+    ) -> DFA4REST {
         let mut dfa = if let (Some(codelist), Some(paramlist), Some(dfa_hybrid_scf)) = (&xc_namelist, &xc_paramlist, &dfa_hybrid_scf) {
             DFA4REST::parse_scf_nonstd(codelist, paramlist, dfa_hybrid_scf, spin_channel)
         } else {
@@ -150,6 +159,7 @@ impl DFA4REST {
         };
         dfa
     }
+
     pub fn new_deep_learning(spin_channel: usize, print_level: usize, xc_model:&Option<String>) -> DFA4REST {
         let mut dfa = if let Some(xc_model) = xc_model {
             DFA4REST::parse_scf_dldft(xc_model, spin_channel)
@@ -157,6 +167,22 @@ impl DFA4REST {
             panic!("xc_model should be provided for deep-learning DFA model")
         };
         dfa
+    }
+
+    pub fn update_pt2_params(&mut self, os_factor:Option<f64>, ss_factor:Option<f64>) {
+        match self.dfa_family_pos {
+            Some(DFAFamily::PT2) => {
+                let mut params_adv = self.dfa_paramr_adv.take().unwrap_or(vec![1.0, 1.0]);
+                if let Some(osf) = os_factor {
+                    params_adv[0] = osf;
+                }
+                if let Some(ssf) = ss_factor {
+                    params_adv[1] = ssf;
+                }
+                self.dfa_paramr_adv = Some(params_adv);
+            },
+            _ => { }
+        }
     }
 
     pub fn parse_scf_dldft(xc_model:&String, spin_channel: usize) -> DFA4REST {
@@ -261,6 +287,10 @@ impl DFA4REST {
             [0,263,267]
         } else if lower_name.eq(&"revscan".to_string()) {
             [0,581,582]
+        } else if lower_name.eq(&"mn06-l".to_string()) {
+            [0,203,233]
+        } else if lower_name.eq(&"mn15-l".to_string()) {
+            [0,260,261]
         } else if lower_name.eq(&"r2scan".to_string()) {
             [0,497,498]
         } else if lower_name.eq(&"tpss".to_string()) {
@@ -275,9 +305,17 @@ impl DFA4REST {
             [0,264,267]
         } else if lower_name.eq(&"tpssh".to_string()) {
             [457,0,0]
-        }
-        // for a list of exchange functionals
-        else if lower_name.eq(&"lda_x_slater".to_string()) {
+        } else if lower_name.eq(&"m05-2x".to_string()) || lower_name.eq(&"m052x".to_string()) {
+            [0,439,238]
+        } else if lower_name.eq(&"m05".to_string()) {
+            [0,438,237]
+        } else if lower_name.eq(&"m06".to_string()) {
+            [0,449,235]
+        } else if lower_name.eq(&"m06-2x".to_string()) || lower_name.eq(&"m062x".to_string()) {
+            [0,450,236]
+        } else if lower_name.eq(&"mn15".to_string()) {
+            [0,268,269]
+        } else if lower_name.eq(&"lda_x_slater".to_string()) {
             [0,1,0]
         } else {
             for (name, value) in libxc_names_values.iter() {
@@ -350,7 +388,8 @@ impl DFA4REST {
             dfa_hybrid_scf,
         }
     }
-    pub fn parse_scf_nonstd(codelist:&Vec<String>, paramlist:&Vec<f64>, dfa_hybrid_scf: &f64, spin_channel: usize) -> DFA4REST {
+
+    pub fn parse_scf_nonstd(codelist: &Vec<String>, paramlist: &Vec<f64>, dfa_hybrid_scf: &f64, spin_channel: usize) -> DFA4REST {
         if codelist.len()!=paramlist.len() {panic!("codelist (len: {}) does not match paramlist (len: {})", codelist.len(), paramlist.len())}
         // Parse the xc functionals
         let dfa_compnt_scf = codelist.iter().map(|xc| {
@@ -381,9 +420,11 @@ impl DFA4REST {
         }
     }
 
-    pub fn parse_postscf(name: &str,spin_channel: usize) -> Option<DFA4REST> {
+    pub fn parse_postscf(name: &str, spin_channel: usize) -> Option<DFA4REST> {
         let tmp_name = name.to_lowercase();
         if tmp_name.eq("xyg3") {
+            // XYG3 functional
+            // Proc. Natl. Acad. Sci. U.S.A. 106, 13, 4963-4968 (2009); https://pnas.org/doi/full/10.1073/pnas.0901093106
             let dfa_family_pos = Some(DFAFamily::PT2);
             let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
             let dfa_compnt_pos: Option<Vec<usize>> = Some(pos_dfa.iter().map(|xc| {
@@ -399,7 +440,7 @@ impl DFA4REST {
                 DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
                 .flatten().collect();
             let dfa_paramr_scf = vec![1.0;dfa_compnt_scf.len()];
-            let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf,spin_channel);
+            let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf, spin_channel);
             Some(DFA4REST{
                 spin_channel,
                 dfa_compnt_scf,
@@ -412,6 +453,8 @@ impl DFA4REST {
                 dfa_hybrid_pos
             })
         } else if tmp_name.eq("xygjos") {
+            // XYGJ-OS functional
+            // Proc. Natl. Acad. Sci. U.S.A. 108, 50, 19896-19900 (2011); https://pnas.org/doi/full/10.1073/pnas.1115123108
             let dfa_family_pos = Some(DFAFamily::PT2);
             let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
             //let dfa_compnt_pos: Option<Vec<XcFuncType>> = Some(pos_dfa.iter().map(|xc| {
@@ -446,6 +489,8 @@ impl DFA4REST {
                 dfa_hybrid_pos
             })
         } else if tmp_name.eq("xyg7") {
+            // XYG7 functional 
+            // J. Phys. Chem. Lett. 12, 10, 2638-2644 (2021); https://doi.org/10.1021/acs.jpclett.1c00360
             let dfa_family_pos = Some(DFAFamily::PT2);
             let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
             //let dfa_compnt_pos: Option<Vec<XcFuncType>> = Some(pos_dfa.iter().map(|xc| {
@@ -479,7 +524,42 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos
             })
+        } else if tmp_name.eq("xdhpbe0") || tmp_name.eq("xdh-pbe0") {
+            // xDH-PBE0 functional
+            // J. Chem. Phys. 136, 174103 (2012); https://doi.org/10.1063/1.3703893
+            let dfa_family_pos = Some(DFAFamily::PT2);
+            let pos_dfa = ["gga_x_pbe", "gga_c_pbe"];
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(pos_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect());
+            let dfa_paramr_pos = Some(vec![0.1665, 0.5292]);
+            let dfa_hybrid_pos = Some(0.8335);
+            let dfa_paramr_adv = Some(vec![0.5428, 0.0000]);
+
+            let dfa_family_scf = DFAFamily::HybridGGA;
+            let scf_dfa = ["pbe0"];
+            //let dfa_compnt_scf: Vec<XcFuncType> = scf_dfa.iter().map(|xc| {
+            //    DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+            //    .flatten().collect();
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![1.0; dfa_compnt_scf.len()];
+            let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf, spin_channel);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos
+            })
         } else if tmp_name.eq("zrps") {
+            // ZRPS
+            // Phys. Rev. Lett. 117, 133002 (2016); https://doi.org/10.1103/PhysRevLett.117.133002
             let dfa_family_pos = Some(DFAFamily::SBGE2);
             let pos_dfa = ["gga_x_pbe","gga_c_pbe"];
             let scf_dfa = ["pbe0"];
@@ -559,6 +639,8 @@ impl DFA4REST {
                 dfa_hybrid_pos
             })
         } else if tmp_name.eq("scsrpa") {
+            // scsRPA
+            // J. Phys. Chem. Lett. 10, 10, 2617-2623 (2019); https://doi.org/10.1021/acs.jpclett.9b00946
             let dfa_family_pos = Some(DFAFamily::SCSRPA);
             let dfa_compnt_pos: Option<Vec<usize>> = Some(vec![]);
             let dfa_paramr_pos = Some(vec![]);
@@ -584,6 +666,8 @@ impl DFA4REST {
                 dfa_hybrid_pos
             })
         } else if tmp_name.eq("r-xdh7") {
+            // R-xDH7
+            // JACS Au 4, 8, 3205-3216 (2024); https://doi.org/10.1021/jacsau.4c00488
             let dfa_family_pos = Some(DFAFamily::SCSRPA);
             let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
             let dfa_compnt_pos: Option<Vec<usize>> = Some(pos_dfa.iter().map(|xc| {
@@ -1092,7 +1176,7 @@ impl DFA4REST {
             // for vsigma
             if self.use_density_gradient() {
                 if let Some(aop) = &grids.aop {
-                    if spin_channel==1 {
+                    if spin_channel == 1 {
                         // vxc_ao_s: the shape of [num_basis, num_grids]
                         let mut loc_vxc_ao_s = &mut loc_vxc_ao_0[0];
                         // vsigma_s: a slice with the length of [num_grids]
@@ -1179,45 +1263,47 @@ impl DFA4REST {
                         }
                         // ==================================
                     } // end spin case for GGA 
-
-                    // construc vxc_mat for LDA/GGA 
-                    for i_spin in 0..spin_channel {
-                        let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
-                        let mut loc_vxc_ao_s = loc_vxc_ao_0.get_mut(i_spin).unwrap();
-                        loc_vxc_ao_s.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(vxc_ao_s,w)| {
-                            vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
-                        });
-                        _dgemm(
-                            ao,(0..num_basis, range_grids.clone()),'N',
-                            loc_vxc_ao_s,(0..num_basis,0..range_grids.len()),'T',
-                            loc_vxc_mat_s, (0..num_basis,0..num_basis),
-                            1.0,0.0
-                        );
-                    }
-
-                    // MGGA
-                    if self.use_kinetic_density() {
-                        for i_spin in  0..spin_channel {
-                            let loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
-                            let mut loc_vtau_s = loc_vtau.slice_column_mut(i_spin);
-                            let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_0[i_spin];
-                            loc_vtau_s.iter_mut().zip(loc_weights.iter()).for_each(
-                                |(vtau_s, w)| {*vtau_s *= *w}
-                            );
-                            for ic in 0usize..3usize {
-                                let loc_aop_ic = aop.get_reducing_matrix_columns(range_grids.clone(),ic).unwrap();
-                                contract_vxc_0_serial (loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
-                                _dgemm(
-                                &loc_aop_ic,(0..num_basis, 0..range_grids.len()), 'N',
-                                loc_vxc_ao_1_s, (0..num_basis, 0..range_grids.len()), 'T',
-                                loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
-                                );
-                                loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
-                            }                            
-                        }
-                    }
                 }
             }
+
+            // construc vxc_mat for LDA/GGA 
+            for i_spin in 0..spin_channel {
+                let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                let mut loc_vxc_ao_s = loc_vxc_ao_0.get_mut(i_spin).unwrap();
+                loc_vxc_ao_s.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(vxc_ao_s,w)| {
+                    vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
+                });
+                _dgemm(
+                    ao,(0..num_basis, range_grids.clone()),'N',
+                    loc_vxc_ao_s,(0..num_basis,0..range_grids.len()),'T',
+                    loc_vxc_mat_s, (0..num_basis,0..num_basis),
+                    1.0,0.0
+                );
+            }
+            // MGGA
+            if self.use_kinetic_density() {
+                let Some(aop) = &grids.aop else {
+                    panic!("aop is not available in xc_exc_vxc_slots_dm_only");
+                };
+                for i_spin in  0..spin_channel {
+                    let loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                    let mut loc_vtau_s = loc_vtau.slice_column_mut(i_spin);
+                    let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_1[i_spin];
+                    loc_vtau_s.iter_mut().zip(loc_weights.iter()).for_each(
+                        |(vtau_s, w)| {*vtau_s *= *w}
+                    );
+                    for ic in 0usize..3usize {
+                        let loc_aop_ic = aop.get_reducing_matrix_columns(range_grids.clone(),ic).unwrap();
+                        contract_vxc_0_serial (loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
+                        _dgemm(
+                        &loc_aop_ic,(0..num_basis, 0..range_grids.len()), 'N',
+                        loc_vxc_ao_1_s, (0..num_basis, 0..range_grids.len()), 'T',
+                        loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
+                        );
+                        loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
+                    }                            
+                }
+            } 
         }
         //println!("debug ");
         //(0..100).for_each(|i| {
@@ -1514,45 +1600,46 @@ impl DFA4REST {
                         }
                         // ==================================
                     } // end spin case for GGA
-
-                    // construct vxc_mat for LDA/GGA 
-                    for i_spin in 0..spin_channel {
-                        let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
-                        let mut loc_vxc_ao_s = loc_vxc_ao.get_mut(i_spin).unwrap();
-                        loc_vxc_ao_s.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(vxc_ao_s,w)| {
-                            vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
-                        });
-                        _dgemm(
-                            ao,(0..num_basis, range_grids.clone()),'N',
-                            loc_vxc_ao_s,(0..num_basis,0..range_grids.len()),'T',
-                            loc_vxc_mat_s, (0..num_basis,0..num_basis),
-                            1.0,0.0
-                        );
-                    }
-
-                    // MGGA
-                    if self.use_kinetic_density() {
-                        for i_spin in  0..spin_channel {
-                            let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
-                            let mut loc_vtau_s = loc_vtau.slice_column_mut(i_spin);
-                            let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_1[i_spin];
-                            loc_vtau_s.iter_mut().zip(loc_weights.iter()).for_each(
-                                |(vtau_s, w)| {*vtau_s *= *w}
-                            );
-                            for ic in 0usize..3usize {
-                                let loc_aop_ic = aop.get_reducing_matrix_columns(range_grids.clone(),ic).unwrap();
-                                loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
-                                contract_vxc_0_serial (loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
-                                _dgemm(
-                                &loc_aop_ic,(0..num_basis, 0..range_grids.len()), 'N',
-                                loc_vxc_ao_1_s, (0..num_basis, 0..range_grids.len()), 'T',
-                                loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
-                                );
-                            }
-                        }
-                    }
-                    
                 } // end let aop 
+            }
+
+            // construc vxc_mat for LDA/GGA 
+            for i_spin in 0..spin_channel {
+                let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                let mut loc_vxc_ao_s = loc_vxc_ao.get_mut(i_spin).unwrap();
+                loc_vxc_ao_s.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(vxc_ao_s,w)| {
+                    vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
+                });
+                _dgemm(
+                    ao,(0..num_basis, range_grids.clone()),'N',
+                    loc_vxc_ao_s,(0..num_basis,0..range_grids.len()),'T',
+                    loc_vxc_mat_s, (0..num_basis,0..num_basis),
+                    1.0,0.0
+                );
+            }
+            // MGGA
+            if self.use_kinetic_density() {
+                let Some(aop) = &grids.aop else {
+                    panic!("aop is not available in xc_exc_vxc_slots_dm_only");
+                };
+                for i_spin in  0..spin_channel {
+                    let loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                    let mut loc_vtau_s = loc_vtau.slice_column_mut(i_spin);
+                    let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_1[i_spin];
+                    loc_vtau_s.iter_mut().zip(loc_weights.iter()).for_each(
+                        |(vtau_s, w)| {*vtau_s *= *w}
+                    );
+                    for ic in 0usize..3usize {
+                        let loc_aop_ic = aop.get_reducing_matrix_columns(range_grids.clone(),ic).unwrap();
+                        contract_vxc_0_serial (loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
+                        _dgemm(
+                        &loc_aop_ic,(0..num_basis, 0..range_grids.len()), 'N',
+                        loc_vxc_ao_1_s, (0..num_basis, 0..range_grids.len()), 'T',
+                        loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
+                        );
+                        loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
+                    }                            
+                }
             }
         }
         //println!("debug ");
@@ -2054,6 +2141,7 @@ impl Grids {
                 aop: None, 
                 parallel_balancing,
             };
+            return global_grid;
 
 
         }
@@ -2069,10 +2157,14 @@ impl Grids {
         let rad_grid_method: String = mol.ctrl.rad_grid_method.clone();
 
         // obtain system-dependent parameters
-        let mass_charge = get_mass_charge(&mol.geom.elem);
+        //let mass_charge = get_mass_charge(&mol.geom.elem);
+        //let mut proton_charges: Vec<i32> = mass_charge.iter().map(|value| value.1 as i32).collect();
+        //if mol.geom.ghost_bs_elem.len() > 0 {
+        //    proton_charges.append(&mut vec![1;mol.geom.ghost_bs_elem.len()])
+        //}
+        let mass_charge = get_mass_charge(&mol.geom.rg_elem);
         let proton_charges: Vec<i32> = mass_charge.iter().map(|value| value.1 as i32).collect();
         let center_coordinates_bohr = mol.geom.to_numgrid_io();
-        //mol.fdqc_bas[0].
         let mut alpha_max: Vec<f64> = vec![];
         let mut alpha_min: Vec<HashMap<usize,f64>> = vec![];
         mol.basis4elem.iter().for_each(|value| {
@@ -2194,8 +2286,8 @@ impl Grids {
         //In this subroutine, we call the lapack dgemm in a rayon parallel environment.
         //In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
         //let default_omp_num_threads = unsafe {utilities::openblas_get_num_threads()};
-        let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-        utilities::omp_set_num_threads_wrapper(1);
+        //let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
+        let default_omp_num_threads = mol.ctrl.num_threads.unwrap();
 
         let num_grids = self.coordinates.len();
         let num_basis = mol.num_basis;
@@ -2210,6 +2302,7 @@ impl Grids {
         let par_tasks = utilities::balancing(num_grids, rayon::current_num_threads());
         let (sender, receiver) = channel();
         par_tasks.par_iter().for_each_with(sender, |s, range_grids| {
+            omp_set_num_threads_wrapper(1);
 
             let loc_num_grids = range_grids.len();
 
@@ -2219,13 +2312,15 @@ impl Grids {
             } else {
                 RIFull::empty()
             };
-            mol.basis4elem.iter().zip(mol.geom.position.iter_columns_full()).for_each(|(elem, geom)| {
+            //mol.basis4elem.iter().zip(mol.geom.position.iter_columns_full()).for_each(|(elem, geom)| {
+            mol.basis4elem.iter().zip(mol.geom.rg_position.iter_columns_full()).for_each(|(elem, geom)| {
                 let ind_glb_bas = elem.global_index.0;
                 let loc_num_bas = elem.global_index.1;
                 let start = ind_glb_bas;
                 let end = start + loc_num_bas;
-                let mut tmp_geom = [0.0;3];
-                tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
+                //let mut tmp_geom = [0.0;3];
+                //tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
+                let tmp_geom:[f64;3] = geom.try_into().unwrap();
                 let tab_den = spheric_gto_value_serial(&self.coordinates[range_grids.clone()], &tmp_geom, elem);
 
                 loc_ao.copy_from_matr(start..end, 0..loc_num_grids, &tab_den, 0..loc_num_bas, 0..loc_num_grids);
@@ -2257,16 +2352,13 @@ impl Grids {
         self.ao = Some(ao);
         self.aop = aop;
 
-        utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+        omp_set_num_threads_wrapper(default_omp_num_threads);
     }
 
     pub fn prepare_tabulated_ao_rayon(&mut self, mol: &Molecule) {
         //In this subroutine, we call the lapack dgemm in a rayon parallel environment.
         //In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-        //let default_omp_num_threads = unsafe {utilities::openblas_get_num_threads()};
-        let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-        //println!("debug: default_omp_num_threads: {}", default_omp_num_threads);
-        utilities::omp_set_num_threads_wrapper(1);
+        let default_omp_num_threads = mol.ctrl.num_threads.unwrap();
 
         let num_grids = self.coordinates.len();
 
@@ -2278,7 +2370,8 @@ impl Grids {
         };
 
         let (sender, receiver) = channel();
-        mol.basis4elem.par_iter().zip(mol.geom.position.par_iter_columns_full()).for_each_with(sender, |s, (elem,geom)| {
+        mol.basis4elem.par_iter().zip(mol.geom.rg_position.par_iter_columns_full()).for_each_with(sender, |s, (elem,geom)| {
+            omp_set_num_threads_wrapper(1);
             let ind_glb_bas = elem.global_index.0;
             let num_loc_bas = elem.global_index.1;
             //let mut tab_den = MatrixFull::new([num_grids, num_loc_bas],0.0);
@@ -2320,7 +2413,7 @@ impl Grids {
         self.ao = Some(ao.transpose_and_drop());
         self.aop = aop;
 
-        utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+        omp_set_num_threads_wrapper(default_omp_num_threads);
 
     }
 
@@ -2344,7 +2437,7 @@ impl Grids {
 
         let mut tab_den = MatrixFull::new([num_grids,mol.num_basis], 0.0);
         let mut start:usize = 0;
-        mol.basis4elem.iter().zip(mol.geom.position.iter_columns_full()).for_each(|(elem,geom)| {
+        mol.basis4elem.iter().zip(mol.geom.rg_position.iter_columns_full()).for_each(|(elem,geom)| {
             let mut tmp_geom = [0.0;3];
             tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
             time_records.count_start("1");
@@ -2369,7 +2462,7 @@ impl Grids {
 
             let mut tab_dev = RIFull::new([mol.num_basis,num_grids,3],0.0);
             let mut start: usize = 0;
-            mol.basis4elem.iter().zip(mol.geom.position.iter_columns_full()).for_each(|(elem,geom)| {
+            mol.basis4elem.iter().zip(mol.geom.rg_position.iter_columns_full()).for_each(|(elem,geom)| {
                 let mut tmp_geom = [0.0;3];
                 tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
                 time_records.count_start("2");
@@ -2428,8 +2521,8 @@ impl Grids {
         cur_rho
     }
     pub fn prepare_tabulated_density(&self, dm: &Vec<MatrixFull<f64>>, spin_channel: usize) -> MatrixFull<f64> {
-        let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-        utilities::omp_set_num_threads_wrapper(1);
+        //let default_omp_num_threads = omp_get_num_threads_wrapper();
+        //omp_set_num_threads_wrapper(1);
         let num_grids = self.coordinates.len();
         let mut cur_rho = MatrixFull::new([num_grids,spin_channel],0.0);
         for i_spin in 0..spin_channel {
@@ -2452,7 +2545,7 @@ impl Grids {
                 let dt2 = utilities::timing(&dt1, Some("Contracting ao*wao"));
             };
         };
-        utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+        //utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
         cur_rho
     }
 
@@ -2656,7 +2749,7 @@ impl Grids {
 
     pub fn prepare_tabulated_density_2_slots_dm_only(
         &self, 
-        dm:& Vec<MatrixFull<f64>>, 
+        dm:&Vec<MatrixFull<f64>>, 
         spin_channel: usize, 
         order: usize, 
         range_grids: Range<usize>
@@ -3064,7 +3157,7 @@ pub fn numerical_density_v01(grid: &Grids, mol: &Molecule, dm: &mut [MatrixFull<
     grid.coordinates.iter().zip(grid.weights.iter()).for_each(|(r,w)| {
         let mut density_r_sum = [0.0;2];
         let mut density_r:Vec<f64> = vec![];
-        mol.basis4elem.iter().zip(mol.geom.position.iter_columns_full()).for_each(|(elem,geom)| {
+        mol.basis4elem.iter().zip(mol.geom.rg_position.iter_columns_full()).for_each(|(elem,geom)| {
             let mut tmp_geom = [0.0;3];
             tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
             density_r.extend(gto_value(r, &tmp_geom, elem, &mol.ctrl.basis_type));
@@ -3098,19 +3191,15 @@ pub fn numerical_density_rayon(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull
     let mut total_density = [0.0f64;2];
     //let mut count:usize = 0;
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
-    // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    //println!("debug: default omp_num_threads: {}", default_omp_num_threads);
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
 
     let local_basis4elem = mol.basis4elem.clone();
-    let local_position = mol.geom.position.clone();
+    let local_position = mol.geom.rg_position.clone();
     let num_basis = mol.num_basis;
     let basis_type = mol.ctrl.basis_type.clone();
     let (sender,receiver) = channel();
     grid.coordinates.par_iter().zip(grid.weights.par_iter()).for_each_with(sender, |s,(r,w)| {
-        //let r = &grid.coordinates[0];
-        //let w = &grid.weights[0];
+        omp_set_num_threads_wrapper(1);
         let mut local_total_density = [0.0f64;2];
         let mut density_r_sum = [0.0;2];
         let mut density_r:Vec<f64> = vec![];
@@ -3120,18 +3209,12 @@ pub fn numerical_density_rayon(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull
             tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
             density_r.extend(gto_value(r, &tmp_geom, elem, &basis_type));
         });
-        //if count<=10 {println!("{:?}", density_r)};
-        //println!{"debug 1"};
         let mut density_rr = MatrixFull::from_vec([num_basis,1],density_r).unwrap();
-        //println!{"debug 2"};
         local_dm.iter_mut().zip(density_r_sum.iter_mut()).for_each(|(dm_s, density_r_sum)| {
             let mut tmp_mat = MatrixFull::new([num_basis,1],0.0);
             tmp_mat.lapack_dgemm(&mut density_rr, dm_s, 'T', 'N', 1.0, 0.0);
             *density_r_sum += tmp_mat.data.iter().zip(density_rr.data.iter()).fold(0.0, |acc,(a,b)| {acc + a*b});
         });
-        //println!{"debug 3"};
-        //if count<=10 {println!("{:?},{},{}", r,w,density_r_sum)};
-        //count += 1;
         local_total_density.iter_mut().zip(density_r_sum.iter()).for_each(|(to,from)| *to += from*w);
         s.send(local_total_density).unwrap();
     });
@@ -3142,7 +3225,7 @@ pub fn numerical_density_rayon(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull
     });
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
     
     total_density
 }

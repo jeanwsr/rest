@@ -23,7 +23,7 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
             if mol.ctrl.print_level > 0 {
                 println!("\n=======================");
                 println!("Generating SAD for atom: {}", &ielem);
-                println!("=======================\n");
+                println!("=======================");
             }
 
             //elem_name.push(ielem.to_string());
@@ -52,6 +52,7 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
             atom_ctrl.scf_acc_etot = 1.0e-8;
             let (spin, spin_channel, spin_polarization) = ctrl_setting_atom_sad(ielem);
             atom_ctrl.spin = spin;
+            atom_ctrl.use_int_nelec = false;
             atom_ctrl.spin_channel = spin_channel;
             atom_ctrl.spin_polarization = spin_polarization;
             //atom_ctrl.spin = 1.0;
@@ -61,6 +62,8 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
             atom_geom.name = ielem.to_string();
             atom_geom.position = MatrixFull::from_vec([3,1], vec![0.000,0.000,0.000]).unwrap();
             atom_geom.elem = vec![ielem.to_string()];
+            atom_geom.rg_elem = atom_geom.elem.clone();
+            atom_geom.rg_position = atom_geom.position.clone();
 
             let mut atom_mol = Molecule::build_native(atom_ctrl,atom_geom, None).unwrap();
 
@@ -89,7 +92,7 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
             atom_dms.insert(ielem.clone(),dms);
             
             if mol.ctrl.print_level > 0 {
-                println!("SAD generation for {} complete.\n", &ielem);
+                println!("SAD generation for {} complete.", &ielem);
             }
         }
     });
