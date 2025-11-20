@@ -20,7 +20,7 @@ pub fn scc15_for_rxdh7(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -
         println!("There is no electron correlation effect in the system. No strong-correlation correction is needed");
         return 0.0
     }
-
+    
     let start_mo = scf_data.mol.start_mo;
     let num_occu_0 = scf_data.lumo[0];
     let num_occu_1 = if spin_channel ==1 {scf_data.lumo[0]} else {scf_data.lumo[1]};
@@ -49,19 +49,19 @@ pub fn scc15_for_rxdh7(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -
         SCFType::ROHF => {
             let homo_0 = scf_data.homo[0];
             let lumo_0 = scf_data.lumo[0];
-            let e_homo_0 = scf_data.semi_eigenvalues[0][homo_0];
-            let e_lumo_0 = scf_data.semi_eigenvalues[0][lumo_0];
+            let e_homo_0 = scf_data.semi_eigenvalues.as_ref().unwrap()[0][homo_0];
+            let e_lumo_0 = scf_data.semi_eigenvalues.as_ref().unwrap()[0][lumo_0];
             let homo_1 = scf_data.homo[1];
             let lumo_1 = scf_data.lumo[1];
-            let e_homo_1 = scf_data.semi_eigenvalues[1][homo_1];
-            let e_lumo_1 = scf_data.semi_eigenvalues[1][lumo_1];
+            let e_homo_1 = scf_data.semi_eigenvalues.as_ref().unwrap()[1][homo_1];
+            let e_lumo_1 = scf_data.semi_eigenvalues.as_ref().unwrap()[1][lumo_1];
             (e_lumo_0.min(e_lumo_1) - e_homo_0.max(e_homo_1))*EV            
         }
     };
     let special_radius = evaluate_special_radius_only(scf_data).unwrap();
     let x_max = special_radius[0].max(special_radius[1]);
     let x_min = special_radius[0].min(special_radius[1]);
-
+    
     // collect the hf exchange
     let x_hf = if let Some(x_hf) =scf_data.energies.get("x_hf") {
         x_hf[0]

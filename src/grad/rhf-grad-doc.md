@@ -175,9 +175,9 @@ $$
 
 | 变量名 | 变量意义 | 指标顺序 | 维度大小 | 其他说明 |
 |--|--|--|--|--|
-| `int1e_ipkin` | $\langle \partial_t \mu | \hat k | \nu \rangle$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | anti-sym |
-| `int1e_ipnuc` | $\langle \partial_t \mu | \hat v | \nu \rangle$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | non-sym |
-| `int1e_iprinv` | $\langle \partial_t \mu | \frac{1}{|\boldsymbol{r}_{\rightarrow A}|} | \nu \rangle$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | non-sym, gauge-dependent |
+| `int1e_ipkin` | $\langle \partial_t \mu \vert \hat k \vert \nu \rangle$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | anti-sym |
+| `int1e_ipnuc` | $\langle \partial_t \mu \vert \hat v \vert \nu \rangle$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | non-sym |
+| `int1e_iprinv` | $\langle \partial_t \mu \vert \frac{1}{\vert \boldsymbol{r}_{\rightarrow A} \vert} \vert \nu \rangle$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | non-sym, gauge-dependent |
 | `h1` | $\texttt{h1}_{\mu \nu}^t$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | non-sym |
 | `vrinv` | $\partial_{A_t} h_{\mu \nu}$ | $(\mu, \nu, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, 3)$ | sym |
 
@@ -354,7 +354,7 @@ $$
 
 | 变量名 | 变量意义 | 指标顺序 | 维度大小 | 其他说明 |
 |--|--|--|--|--|
-| `int3c2e_ip1_pubb` | $(\partial_t \mu \nu | P)$ | $(\mu, \nu, P, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, n_\mathrm{aux}, 3)$ | non-sym |
+| `int3c2e_ip1_pubb` | $(\partial_t \mu \nu \vert P)$ | $(\mu, \nu, P, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, n_\mathrm{aux}, 3)$ | non-sym |
 | `dm` | $D_{\mu \nu}$ | $(\mu, \nu)$ | $(n_\mathrm{basis}, n_\mathrm{basis})$ | sym |
 | `itm_j` | $\mathscr{J}_P$ | $(P)$ | $(n_\mathrm{aux})$ |
 | `dao_j_int3c2e_ip1` | $\Delta_{t \mu}$ 贡献项 | $(\mu, t)$ | $(n_\mathrm{basis}, 3)$ |
@@ -371,7 +371,7 @@ $$
 
 | 变量名 | 变量意义 | 指标顺序 | 维度大小 | 其他说明 |
 |--|--|--|--|--|
-| `int3c2e_ip2_putp` | $(\mu \nu | \partial_t P)$ | $(\mathrm{tp} (\mu \nu), P, t)$ | $(\frac{1}{2} n_\mathrm{basis} (n_\mathrm{basis} + 1), n_\mathrm{aux}, 3)$ | $\bowtie$ |
+| `int3c2e_ip2_putp` | $(\mu \nu \vert \partial_t P)$ | $(\mathrm{tp} (\mu \nu), P, t)$ | $(\frac{1}{2} n_\mathrm{basis} (n_\mathrm{basis} + 1), n_\mathrm{aux}, 3)$ | $\bowtie$ |
 | `dm_tp` | $D_{\mathrm{tp} (\mu \nu)}$ | $(\mathrm{tp} (\mu \nu))$ | $(\frac{1}{2} n_\mathrm{basis} (n_\mathrm{basis} + 1))$ | $\mathop{\tilde{\bowtie}}$ |
 | `itm_j` | $\mathscr{J}_P$ | $(P)$ | $(n_\mathrm{aux})$ |
 | `daux_j_int3c2e_ip2` | $\Delta_{t P}$ 贡献项 | $(P, t)$ | $(n_\mathrm{aux}, 3)$ |
@@ -388,7 +388,7 @@ $$
 
 | 变量名 | 变量意义 | 指标顺序 | 维度大小 | 其他说明 |
 |--|--|--|--|--|
-| `int2c2e_ip1` | $(\partial_t P | Q)$ | $(P, Q, t)$ | $(n_\mathrm{aux}, n_\mathrm{aux}, 3)$ | anti-sym |
+| `int2c2e_ip1` | $(\partial_t P \vert Q)$ | $(P, Q, t)$ | $(n_\mathrm{aux}, n_\mathrm{aux}, 3)$ | anti-sym |
 | `itm_j` | $\mathscr{J}_P$ | $(P)$ | $(n_\mathrm{aux})$ |
 | `daux_j_int2c2e_ip1` | $\Delta_{t P}$ 贡献项 | $(P, t)$ | $(n_\mathrm{aux}, 3)$ |
 
@@ -474,7 +474,7 @@ $$
 
 | 变量名 | 变量意义 | 指标顺序 | 维度大小 | 其他说明 |
 |--|--|--|--|--|
-| `int3c2e_ip1_pubb` | $(\partial_t \mu \nu | P)$ | $(\mu, \nu, P, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, n_\mathrm{aux}, 3)$ | non-sym |
+| `int3c2e_ip1_pubb` | $(\partial_t \mu \nu \vert P)$ | $(\mu, \nu, P, t)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, n_\mathrm{aux}, 3)$ | non-sym |
 | `itm_k_ao` | $\mathscr{K}_{P, \mu \nu}$ | $(\mu, \nu, P)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, n_\mathrm{aux})$ | sym |
 | `dao_k_int3c2e_ip1` | $\Delta_{t \mu}$ 贡献项 | $(\mu, t)$ | $(n_\mathrm{basis}, 3)$ |
 
@@ -490,7 +490,7 @@ $$
 
 | 变量名 | 变量意义 | 指标顺序 | 维度大小 | 其他说明 |
 |--|--|--|--|--|
-| `int3c2e_ip2_putp` | $(\mu \nu | \partial_t P)$ | $(\mathrm{tp} (\mu \nu), P, t)$ | $(\frac{1}{2} n_\mathrm{basis} (n_\mathrm{basis} + 1), n_\mathrm{aux}, 3)$ | $\bowtie$ |
+| `int3c2e_ip2_putp` | $(\mu \nu \vert \partial_t P)$ | $(\mathrm{tp} (\mu \nu), P, t)$ | $(\frac{1}{2} n_\mathrm{basis} (n_\mathrm{basis} + 1), n_\mathrm{aux}, 3)$ | $\bowtie$ |
 | `itm_k_ao` | $\mathscr{K}_{P, \mu \nu}$ | $(\mu, \nu, P)$ | $(n_\mathrm{basis}, n_\mathrm{basis}, n_\mathrm{aux})$ | sym |
 | `daux_j_int3c2e_ip2` | $\Delta_{t P}$ 贡献项 | $(P, t)$ | $(n_\mathrm{aux}, 3)$ |
 
@@ -506,7 +506,7 @@ $$
 
 | 变量名 | 变量意义 | 指标顺序 | 维度大小 | 其他说明 |
 |--|--|--|--|--|
-| `int2c2e_ip1` | $(\partial_t P | Q)$ | $(P, Q, t)$ | $(n_\mathrm{aux}, n_\mathrm{aux}, 3)$ | anti-sym |
+| `int2c2e_ip1` | $(\partial_t P \vert Q)$ | $(P, Q, t)$ | $(n_\mathrm{aux}, n_\mathrm{aux}, 3)$ | anti-sym |
 | `itm_k_aux` | $\mathscr{K}_{PQ}$ | $(P, Q)$ | $(n_\mathrm{aux}, n_\mathrm{aux})$ | sym |
 | `daux_k_int2c2e_ip1` | $\Delta_{t P}$ 贡献项 | $(P, t)$ | $(n_\mathrm{aux}, 3)$ |
 

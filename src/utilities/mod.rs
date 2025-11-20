@@ -1,8 +1,12 @@
+pub mod memory_batch;
+pub mod rstsr_util;
+
 use clap::{Command, Arg, ArgMatches};
 use rayon::ThreadPoolBuildError;
 use time::{DateTime,Local};
 use std::{time::Instant, collections::HashMap, ops::Range};
 use regex::Regex;
+
 enum DebugTiming {
    Yes,
    Not,
@@ -139,34 +143,6 @@ pub fn debug_print_slices(s: &[f64]) {
     println!("{}",tmp_s);
 }
 
-//#[link(name="openblas")]
-extern "C" {
-    pub fn openblas_get_num_threads() -> ::std::os::raw::c_int;
-    pub fn openblas_set_num_threads(n: ::std::os::raw::c_int);
-    pub fn goto_get_num_threads() -> ::std::os::raw::c_int;
-    pub fn goto_set_num_threads(n: ::std::os::raw::c_int);
-}
-//extern "C" {
-//    pub fn omp_get_num_threads() -> ::std::os::raw::c_int;
-//    pub fn omp_set_num_threads(n: ::std::os::raw::c_int);
-//}
-
-pub fn omp_get_num_threads_wrapper() -> usize {
-    let num_threads_openblas = unsafe{openblas_get_num_threads()} as usize;
-    //let num_threads_goto = unsafe{goto_get_num_threads()} as usize;
-    //println!("debug {:}, {:}", num_threads_goto, num_threads_openblas);
-    //num_threads_openblas.max(num_threads_goto)
-    //println!("debug {:}", num_threads_openblas);
-    num_threads_openblas
-}
-/// NOTE: the current OpenBLAS only supports at most 32 threads. Otherwise, it panics with an error:  
-/// "BLAS : Program is Terminated. Because you tried to allocate too many memory regions."
-pub fn omp_set_num_threads_wrapper(n:usize)  {
-    unsafe{
-        openblas_set_num_threads(n as std::os::raw::c_int);
-        goto_set_num_threads(n as std::os::raw::c_int);
-    } 
-}
 
 //#[test]
 //fn debug_time() {

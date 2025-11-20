@@ -50,6 +50,16 @@ pub struct GeomCell {
     #[pyo3(get,set)]
     pub rest : Vec<(usize,String)>,
     pub ext_field: ExtField<f64>,
+    // both real and ghost atom positions
+    pub rg_position: MatrixFull<f64>,
+    pub rg_elem: Vec<String>,
+    //keywords for rrs-pbc
+    pub rrs_pbc: bool,
+    pub unit_cell_index: Vec<usize>,
+    pub pbc_dim: usize,
+    pub rrs_pbc_vec: MatrixFull<f64>,
+    pub max_step: Vec<usize>,
+    pub k_points: Vec<usize>,
 }
 
 //impl GeomCell {
@@ -154,6 +164,14 @@ impl GeomCell {
             ghost_ep_path   : vec![],
             ghost_ep_pos    : MatrixFull::empty(),
             ext_field       : ExtField::empty(),
+            rg_elem         : vec![], 
+            rg_position     : MatrixFull::empty(),
+            rrs_pbc         : false,
+            unit_cell_index : vec![],
+            pbc_dim         : 1,
+            rrs_pbc_vec     : MatrixFull::empty(),
+            max_step        : vec![],
+            k_points        : vec![],
         }
     }
     pub fn copy(&mut self, name:String) -> GeomCell {
@@ -172,6 +190,11 @@ impl GeomCell {
             new_mol.elem.push(elem.to_string());
             new_mol.fix.push(*fix);
         }
+        new_mol.rrs_pbc = self.rrs_pbc;
+        new_mol.unit_cell_index = self.unit_cell_index.to_owned();
+        new_mol.pbc_dim = self.pbc_dim;
+        new_mol.rrs_pbc_vec = self.rrs_pbc_vec.to_owned();
+        new_mol.k_points = self.k_points.to_owned();
         new_mol
     }
     pub fn get_nfree(&self) -> anyhow::Result<usize> {
@@ -278,11 +301,39 @@ impl GeomCell {
         Ok(gi-1)
     }
 
+    pub fn get_start_index_of_ghost_atoms(&self) -> usize {
+        self.elem.len()
+    }
+
     pub fn geom_shift(&mut self, atm_idx:usize, vec_xyz:Vec<f64>) {
-        let mut gi = self.get_relax_index(atm_idx).unwrap();
+        // update the atom position in the matrix include only real atoms
         let mut given_atm = &mut self.position[(..,atm_idx)];
         given_atm.iter_mut().zip(vec_xyz.iter()).for_each(|(to, from)| {
             *to += from
+        });
+        // update the atom position in the matrix include both real and ghost atoms
+        let mut given_atm = &mut self.rg_position[(..,atm_idx)];
+        given_atm.iter_mut().zip(vec_xyz.iter()).for_each(|(to, from)| {
+            *to += from
+        });
+    }
+    pub fn geom_update(&mut self, new_position:&[f64], unit: GeomUnit) {
+        let factor = match unit {
+            GeomUnit::Angstrom => ANG,
+            GeomUnit::Bohr => 1.0,
+        };
+        if self.position.data.len() != new_position.len() {
+            panic!("The length of new position is not equal to the length of old position");
+        } 
+        // update the position of real atoms in the matrix include only real atoms
+        self.position.iter_mut().zip(new_position.iter()).for_each(|(to, from)| {
+            *to = *from/factor
+        });
+        // update the position of real atoms in the matrix include both real and ghost atoms
+        self.rg_position.iter_columns_mut(0..self.elem.len()).zip(new_position.chunks_exact(3)).for_each(|(to, from)| {
+            to.iter_mut().zip(from.iter()).for_each(|(to, from)| {
+                *to = *from/factor
+            });
         });
     }
 
@@ -391,7 +442,7 @@ impl GeomCell {
     }
     pub fn to_numgrid_io(&self) -> Vec<(f64,f64,f64)> {
         let mut tmp_vec: Vec<(f64,f64,f64)> = vec![];
-        self.position.data.chunks_exact(3).for_each(|value| {
+        self.rg_position.data.chunks_exact(3).for_each(|value| {
             tmp_vec.push((value[0],value[1],value[2]))
         });
         tmp_vec
@@ -956,4 +1007,207 @@ pub fn test_parse() {
         println!("debug: re3_cap: {:?}", &cap);
         println!("{}, {}", cap["rmsd1"].to_string(), cap["rmsd2"].to_string());
     }
+}
+
+pub fn parse_geom_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<GeomCell> {
+    //let tmp_cont = fs::read_to_string(&filename[..])?;
+    //let tmp_keys: serde_json::Value = serde_json::from_str(&tmp_cont[..])?;
+    let mut tmp_geomcell = GeomCell::init_geom();
+
+    //==================================================================
+    //
+    //  parse the keywords from the "geom" block
+    //
+    //==================================================================
+    match tmp_keys.get("geom").unwrap_or(&serde_json::Value::Null) {
+        serde_json::Value::Object(tmp_geom) => {
+            tmp_geomcell.name = match tmp_geom.get("name").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.clone()},
+                other => {String::from("none")},
+            };
+            //for rrs_pbc
+            tmp_geomcell.rrs_pbc = match tmp_geom.get("rrs_pbc").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_geomcell.pbc_dim = match tmp_geom.get("pbc_dim").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
+                other => {1_usize}
+            };
+            tmp_geomcell.rrs_pbc_vec = match tmp_geom.get("rrs_pbc_vec").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(tmp_op) => {
+                    let tmp_vec: Vec<f64> = tmp_op.iter().map(|x| {
+                        match x {
+                            serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(0.0)},
+                            serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.0)},
+                            other => {0.0},
+                        }
+                    }).collect::<Vec<f64>>();
+                    MatrixFull::from_vec([tmp_geomcell.pbc_dim,3],tmp_vec).unwrap()
+                },
+                other => {MatrixFull::empty()},
+            };
+            tmp_geomcell.unit_cell_index = match tmp_geom.get("unit_cell_index").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_op) => {vec![tmp_op.as_f64().unwrap_or(0.0) as usize]},
+                serde_json::Value::String(tmp_op) => {
+                    let val = tmp_op.parse::<usize>().unwrap_or(0);
+                    vec![val]
+                },
+                serde_json::Value::Array(tmp_op) => {
+                    let vals = tmp_op.iter().filter_map(|v| Some(v.as_f64().unwrap_or(0.0) as usize)).collect::<Vec<usize>>();
+                    vals
+                },
+                other => {vec![]},
+            };
+            tmp_geomcell.max_step = match tmp_geom.get("max_step").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_op) => {vec![tmp_op.as_f64().unwrap_or(0.0) as usize]},
+                serde_json::Value::String(tmp_op) => {
+                    let val = tmp_op.parse::<usize>().unwrap_or(0);
+                    vec![val]
+                },
+                serde_json::Value::Array(tmp_op) => {
+                    let vals = tmp_op.iter().filter_map(|v| Some(v.as_f64().unwrap_or(0.0) as usize)).collect::<Vec<usize>>();
+                    vals
+                },
+                other => {vec![]},
+            };
+            tmp_geomcell.k_points = match tmp_geom.get("k_points").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_op) => {vec![tmp_op.as_f64().unwrap_or(0.0) as usize]},
+                serde_json::Value::String(tmp_op) => {
+                    let val = tmp_op.parse::<usize>().unwrap_or(0);
+                    vec![val]
+                },
+                serde_json::Value::Array(tmp_op) => {
+                    let vals = tmp_op.iter().filter_map(|v| Some(v.as_f64().unwrap_or(0.0) as usize)).collect::<Vec<usize>>();
+                    vals
+                },
+                other => {vec![]},
+            };
+            //rrs_pbc end
+            let tmp_unit = match tmp_geom.get("unit").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
+                other => {String::from("angstrom")},
+            };
+            if tmp_unit.to_lowercase()==String::from("angstrom") {
+                tmp_geomcell.unit=GeomUnit::Angstrom;
+            } else if tmp_unit.to_lowercase()==String::from("bohr") {
+                tmp_geomcell.unit=GeomUnit::Bohr
+            } else {
+                println!("Warning:: unknown geometry unit is specified: {}. Angstrom will be used", tmp_unit);
+                tmp_geomcell.unit=GeomUnit::Angstrom;
+            };
+            //(tmp_geomcell.elem, tmp_geomcell.fix, tmp_geomcell.position, tmp_geomcell.nfree, )
+            match tmp_geom.get("position").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(tmp_vec) => {
+                    let tmp_unit = tmp_geomcell.unit.clone();
+                    
+                    let (tmp1,tmp2,tmp3,tmp4) = GeomCell::parse_position(tmp_vec, &tmp_unit)?;
+
+                    tmp_geomcell.elem = tmp1;
+                    tmp_geomcell.fix = tmp2;
+                    tmp_geomcell.position = tmp3;
+                    tmp_geomcell.nfree = tmp4;
+                    // real items in to real + ghost items
+                    tmp_geomcell.rg_elem = tmp_geomcell.elem.clone();
+                    tmp_geomcell.rg_position = tmp_geomcell.position.clone();
+                },
+                serde_json::Value::String(tmp_str) => {
+                    let tmp_unit = tmp_geomcell.unit.clone();
+                    
+                    let (tmp1,tmp2,tmp3,tmp4) = GeomCell::parse_position_from_string(tmp_str, &tmp_unit)?;
+
+                    tmp_geomcell.elem = tmp1;
+                    tmp_geomcell.fix = tmp2;
+                    tmp_geomcell.position = tmp3;
+                    tmp_geomcell.nfree = tmp4;
+                    // real items in to real + ghost items
+                    tmp_geomcell.rg_elem = tmp_geomcell.elem.clone();
+                    tmp_geomcell.rg_position = tmp_geomcell.position.clone();
+
+                }
+                other => {
+                    panic!("Error in reading the geometry position")
+                }
+            };
+            match tmp_geom.get("lattice").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(tmp_vec) => {
+                    let tmp_unit = tmp_geomcell.unit.clone();
+                    tmp_geomcell.lattice = GeomCell::parse_lattice(tmp_vec, &tmp_unit)?;
+                    tmp_geomcell.pbc = MOrC::Crystal;
+                    panic!("Find lattice vectors. PBC calculations should be turn on, which, however, is not yet implemented");
+                },
+                other => {
+                    //if tmp_input.print_level>0 {
+                    //    println!("It is a cluster calculation for finite molecules");
+                    //}
+                    tmp_geomcell.pbc = MOrC::Molecule;
+                }
+            }
+            match tmp_geom.get("ghost").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {
+                    let tmp_unit = tmp_geomcell.unit.clone();
+                    let (bs, pc, ep) = GeomCell::parse_ghost_atoms_from_string(tmp_str, &tmp_unit)?;
+                    if let Some((bs_elem, bs_pos)) = bs {
+                        tmp_geomcell.ghost_bs_elem = bs_elem;
+                        tmp_geomcell.ghost_bs_pos = bs_pos;
+                        //println!("{:?}", &tmp_geomcell.ghost_bs_pos);
+                        //println!("{:?}", &tmp_geomcell.rg_position);
+
+                        tmp_geomcell.rg_elem.extend_from_slice(&tmp_geomcell.ghost_bs_elem);
+                        tmp_geomcell.rg_position.append_column(&tmp_geomcell.ghost_bs_pos);
+
+                    } else {
+                        tmp_geomcell.ghost_bs_elem = vec![];
+                        tmp_geomcell.ghost_bs_pos = MatrixFull::empty();
+                    }
+                    if let Some((pc_chrg, pc_pos)) = pc {
+                        tmp_geomcell.ghost_pc_chrg = pc_chrg;
+                        tmp_geomcell.ghost_pc_pos = pc_pos;
+                    } else {
+                        tmp_geomcell.ghost_pc_chrg = vec![];
+                        tmp_geomcell.ghost_pc_pos = MatrixFull::empty();
+                    }
+                    if let Some((ep_path, ep_pos)) = ep {
+                        tmp_geomcell.ghost_ep_path = ep_path;
+                        tmp_geomcell.ghost_ep_pos = ep_pos;
+                    } else {
+                        tmp_geomcell.ghost_ep_path = vec![];
+                        tmp_geomcell.ghost_ep_pos = MatrixFull::empty();
+                    }
+                },
+                other => {
+                    //println!("debug: cannot recognize ghost");
+                    tmp_geomcell.ghost_bs_elem = vec![];
+                    tmp_geomcell.ghost_bs_pos = MatrixFull::empty();
+                    tmp_geomcell.ghost_pc_chrg = vec![];
+                    tmp_geomcell.ghost_pc_pos = MatrixFull::empty();
+                    tmp_geomcell.ghost_ep_path = vec![];
+                    tmp_geomcell.ghost_ep_pos = MatrixFull::empty();
+                }
+            }
+
+            // ext_field_dipole: [x, y, z]
+            match tmp_geom.get("ext_field_dipole").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(tmp_arr) => {
+                    assert_eq!(tmp_arr.len(), 3, "Dipole is 3-component (x, y, z) vector");
+                    let mut tmp_array = [0.0; 3];
+                    tmp_array.iter_mut().zip(tmp_arr.iter()).for_each(|(to, from)| {
+                        match from {
+                            serde_json::Value::String(tmp_str) => {*to = tmp_str.parse().unwrap_or(0.0)},
+                            serde_json::Value::Number(tmp_num) => {*to = tmp_num.as_f64().unwrap_or(0.0)},
+                            other => panic!("Not recognized type for ext_field_dipole"),
+                        }
+                    });
+                    tmp_geomcell.ext_field.dipole = Some(tmp_array);
+                }
+                _ => {},
+            };
+        },
+        other => {
+            panic!("Error:: no 'geom' keyword or some inproper settings of 'geom' keyword in the input file");
+        },
+    }
+    Ok(tmp_geomcell)
+    
 }

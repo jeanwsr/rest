@@ -200,7 +200,7 @@ impl SCF {
                     num_primitiv_vec.push(ibascell.exponents.len());
                     shell_to_atom_map.push(i_atom+1);
                     primitive_exp.extend(ibascell.exponents.iter());
-                    coord_each_shell.extend(self.mol.geom.position.iter_column(i_atom));
+                    coord_each_shell.extend(self.mol.geom.rg_position.iter_column(i_atom));
                 });
             });
         });
@@ -217,8 +217,19 @@ impl SCF {
         if i_index % 6 != 0 {write!(input, "\n");}
         write!(input, "Number of contracted shells                I {:16}\n",num_contract);
         write!(input, "Number of primitive shells                 I {:16}\n",num_primitiv);
-        //write!(input, "Pure/Cartesian d shells                    I {:16}\n", num_d_shell);
-        //write!(input, "Pure/Cartesian f shells                    I {:16}\n", num_f_shell);
+        let basis_type = match self.mol.cint_type {
+            CintType::Spheric => {
+                0
+            },
+            CintType::Cartesian => {
+                1
+            },
+            CintType::Spinor => {
+                panic!("Spinor basis is not yet implemented.")
+            }
+        };
+        write!(input, "Pure/Cartesian d shells                    I {:16}\n", basis_type);
+        write!(input, "Pure/Cartesian f shells                    I {:16}\n", basis_type);
         write!(input, "Highest angular momentum                   I {:16}\n", max_ang);
         write!(input, "Largest degree of contraction              I {:16}\n", max_contract);
         // ==============================

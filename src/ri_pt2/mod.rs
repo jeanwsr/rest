@@ -20,6 +20,8 @@ use crate::scf_io::{SCF, SCFType};
 use crate::utilities::{TimeRecords, self};
 use crate::mpi_io::{self, mpi_reduce, MPIOperator};
 
+use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
+
 pub mod sbge2;
 
 #[derive(Clone)]
@@ -149,7 +151,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
 
     if scf_data.mol.ctrl.print_level>0 {
         println!("----------------------------------------------------------------------");
-        println!("{:16}: {:>16}, {:>16}, {:>16}","Methods","Total Corr", "OS Corr", "SS Corr");
+        println!("{:16}: {:>16}, {:>16}, {:>16}", "Methods", "Total Corr", "OS Corr", "SS Corr");
         println!("----------------------------------------------------------------------");
         println!("{:16}: {:16.8}, {:16.8}, {:16.8}", 
             dfa_family_pos.to_name(), pt2_c[0], pt2_c[1], pt2_c[2]);
@@ -160,7 +162,9 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
             total_energy, 
             x_energy, 
             postscf_method,
-            pt2_c[0]);
+            xdh_pt2_energy
+        );
+        println!("Exc[KS-DFA]: {:16.8} Ha", xc_energy_xdh);
     }
 
     scf_data.energies.insert(String::from("xdh_energy"), vec![total_energy]);
@@ -394,8 +398,7 @@ pub fn close_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
 
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
 
     let mut e_mp2_ss = 0.0_f64;
     let mut e_mp2_os = 0.0_f64;
@@ -426,6 +429,7 @@ pub fn close_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
         };
         let (sender, receiver) = channel();
         elec_pair.par_iter().for_each_with(sender,|s,i_pair| {
+            omp_set_num_threads_wrapper(1);
             let mut e_mp2_term_ss = 0.0_f64;
             let mut e_mp2_term_os = 0.0_f64;
 
@@ -498,7 +502,7 @@ pub fn close_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
     };
 
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
     //tmp_record.report_all();
     Ok([e_mp2_ss+e_mp2_os,e_mp2_os,e_mp2_ss])
 
@@ -508,8 +512,7 @@ pub fn close_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
 pub fn open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
 
     let mut e_mp2_ss = 0.0_f64;
     let mut e_mp2_os = 0.0_f64;
@@ -548,6 +551,7 @@ pub fn open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
                 };
                 let (sender, receiver) = channel();
                 elec_pair.par_iter().for_each_with(sender,|s,i_pair| {
+                    omp_set_num_threads_wrapper(1);
 
                     let mut e_mp2_term_ss = 0.0_f64;
 
@@ -640,6 +644,7 @@ pub fn open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
                 };
                 let (sender, receiver) = channel();
                 elec_pair.par_iter().for_each_with(sender,|s,i_pair| {
+                    omp_set_num_threads_wrapper(1);
                     let mut e_mp2_term_os = 0.0_f64;
                     let i_state = i_pair[0];
                     let j_state = i_pair[1];
@@ -705,7 +710,7 @@ pub fn open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
         panic!("RI3MO should be initialized before the PT2 calculations")
     };
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     Ok([e_mp2_ss+e_mp2_os,e_mp2_os,e_mp2_ss])
 
@@ -719,7 +724,7 @@ pub fn open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperato
     if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data) {
 
         let num_threads = if let Some(nt) = scf_data.mol.ctrl.num_threads {nt} else {1};
-        utilities::omp_set_num_threads_wrapper(num_threads);
+        omp_set_num_threads_wrapper(num_threads);
 
         let mut e_mp2_ss = 0.0_f64;
         let mut e_mp2_os = 0.0_f64;
@@ -992,7 +997,7 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
         // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
         //let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
         let num_threads = if let Some(num_threads) = scf_data.mol.ctrl.num_threads {num_threads} else {1};
-        utilities::omp_set_num_threads_wrapper(num_threads);
+        omp_set_num_threads_wrapper(num_threads);
         let mut e_mp2_ss = 0.0_f64;
         let mut e_mp2_os = 0.0_f64;
 
@@ -1137,16 +1142,15 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
 }
 
 pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
-    let default_omp_num_threads = utilities::omp_get_num_threads_wrapper();
-    utilities::omp_set_num_threads_wrapper(1);
+    let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
     
     // Calculate the contribution of singly excited states.
     let mut e_mp2_single_list = [0.0_f64, 0.0_f64];
 
 
     for i_spin in (0..2) {
-        let eigenvalues_spin = scf_data.semi_eigenvalues.get(i_spin).unwrap();
-        let fock_spin = scf_data.semi_fock.get(i_spin).unwrap();
+        let eigenvalues_spin = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin];
+        let fock_spin = &scf_data.semi_fock.as_ref().unwrap()[i_spin];
         for i_occ in (0..scf_data.lumo[i_spin]) {
             for i_virt in (scf_data.lumo[i_spin]..scf_data.mol.num_state) {
                 let single_gap = eigenvalues_spin[i_virt] - eigenvalues_spin[i_occ];
@@ -1173,8 +1177,8 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
             if i_spin_1 == i_spin_2 {
 
                 let i_spin = i_spin_1;
-                let eigenvector = scf_data.semi_eigenvectors.get(i_spin).unwrap();
-                let eigenvalues = scf_data.semi_eigenvalues.get(i_spin).unwrap();
+                let eigenvector = &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin];
+                let eigenvalues = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin];
                 let occupation = scf_data.occupation.get(i_spin).unwrap();
 
                 let homo = scf_data.homo.get(i_spin).unwrap().clone();
@@ -1194,6 +1198,8 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
                 };
                 let (sender, receiver) = channel();
                 elec_pair.par_iter().for_each_with(sender,|s,i_pair| {
+
+                    omp_set_num_threads_wrapper(1);
 
                     let mut e_mp2_term_ss = 0.0_f64;
 
@@ -1256,8 +1262,8 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
                 e_mp2_ss -= receiver.into_iter().sum::<f64>();
 
             } else {
-                let eigenvector_1 = scf_data.semi_eigenvectors.get(i_spin_1).unwrap();
-                let eigenvalues_1 = scf_data.semi_eigenvalues.get(i_spin_1).unwrap();
+                let eigenvector_1 = &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin_1];
+                let eigenvalues_1 = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin_1];
                 let occupation_1 = scf_data.occupation.get(i_spin_1).unwrap();
                 let homo_1 = scf_data.homo.get(i_spin_1).unwrap().clone();
                 let lumo_1 = scf_data.lumo.get(i_spin_1).unwrap().clone();
@@ -1266,8 +1272,8 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
                 let num_occu_1 = if scf_data.mol.num_elec[i_spin_1 + 1] <= 1.0e-6 {0} else {homo_1 + 1};
                 let (rimo_1, vir_range, occ_range) = &ri3mo_vec[i_spin_1];
 
-                let eigenvector_2 = scf_data.semi_eigenvectors.get(i_spin_2).unwrap();
-                let eigenvalues_2 = scf_data.semi_eigenvalues.get(i_spin_2).unwrap();
+                let eigenvector_2 = &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin_2];
+                let eigenvalues_2 = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin_2];
                 let occupation_2 = scf_data.occupation.get(i_spin_2).unwrap();
                 let homo_2 = scf_data.homo.get(i_spin_2).unwrap().clone();
                 let lumo_2 = scf_data.lumo.get(i_spin_2).unwrap().clone();
@@ -1351,7 +1357,7 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
         panic!("RI3MO should be initialized before the PT2 calculations")
     };
     // reuse the default omp_num_threads setting
-    utilities::omp_set_num_threads_wrapper(default_omp_num_threads);
+    omp_set_num_threads_wrapper(default_omp_num_threads);
     
     // Temporarily output the contribution of singly excited states here, to avoid modifying the pt2_c structure.
     if let Some(coeff) = &scf_data.mol.xc_data.dfa_paramr_adv {
@@ -1382,7 +1388,7 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
     
     if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data) {
         let num_threads = if let Some(nt) = scf_data.mol.ctrl.num_threads {nt} else {1};
-        utilities::omp_set_num_threads_wrapper(num_threads);
+        omp_set_num_threads_wrapper(num_threads);
 
         let mut e_mp2_ss = 0.0_f64;
         let mut e_mp2_os = 0.0_f64;
@@ -1410,8 +1416,8 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
                 if i_spin_1 == i_spin_2 {
 
                     let i_spin = i_spin_1;
-                    let eigenvector = scf_data.semi_eigenvectors.get(i_spin).unwrap();
-                    let eigenvalues = scf_data.semi_eigenvalues.get(i_spin).unwrap();
+                    let eigenvector = &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin];
+                    let eigenvalues = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin];
                     let occupation = scf_data.occupation.get(i_spin).unwrap();
 
                     let homo = scf_data.homo.get(i_spin).unwrap().clone();
@@ -1503,8 +1509,8 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
 
 
                 } else {
-                    let eigenvector_1 = scf_data.semi_eigenvectors.get(i_spin_1).unwrap();
-                    let eigenvalues_1 = scf_data.semi_eigenvalues.get(i_spin_1).unwrap();
+                    let eigenvector_1 = &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin_1];
+                    let eigenvalues_1 = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin_1];
                     let occupation_1 = scf_data.occupation.get(i_spin_1).unwrap();
                     let homo_1 = scf_data.homo.get(i_spin_1).unwrap().clone();
                     let lumo_1 = scf_data.lumo.get(i_spin_1).unwrap().clone();
@@ -1513,8 +1519,8 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
                     let num_occu_1 = if scf_data.mol.num_elec[i_spin_1 + 1] <= 1.0e-6 {0} else {homo_1 + 1};
                     let (rimo_1, vir_range, occ_range) = &ri3mo_vec[i_spin_1];
 
-                    let eigenvector_2 = scf_data.semi_eigenvectors.get(i_spin_2).unwrap();
-                    let eigenvalues_2 = scf_data.semi_eigenvalues.get(i_spin_2).unwrap();
+                    let eigenvector_2 = &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin_2];
+                    let eigenvalues_2 = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin_2];
                     let occupation_2 = scf_data.occupation.get(i_spin_2).unwrap();
                     let homo_2 = scf_data.homo.get(i_spin_2).unwrap().clone();
                     let lumo_2 = scf_data.lumo.get(i_spin_2).unwrap().clone();
