@@ -109,7 +109,7 @@
 	1. `ri-v`: 全称为resolution of identity，又名density fitting，是对四中心积分进行张量分解后的近似算法。(缺省)
 	- **注意：REST中的analytic算法并未被充分优化，仅供程序开发测评使用，不建议在实际计算中使用**
 - `basis_type`: 取值String类型。使用高斯基组的类型，有Spheric及Cartesian两种选择。Spheric对应球谐型基函数，Cartesian对应笛卡尔型基函数。缺省为spheric
-- `basis_path`: 取值String类型，无缺省值。计算所使用的基组所在位置。若所用基组为cc-pVTZ, 则应为`{basis_set_pool}/cc-pVTZ`；若所用基组为STO-3G, 则应为`{basis_set_pool}/STO-3G`。其中`{basis_set_pool}`是具体基组文件夹所在的根目录。**注意：基组信息高度依赖于具体的计算体系，因此没有缺省值，必须在输入卡中声明**。
+- `basis_path`: 取值String类型，无缺省值。计算所使用的基组所在位置。若所用基组为cc-pVTZ, 则应为`{basis_set_pool}/cc-pVTZ`；若所用基组为STO-3G, 则应为`{basis_set_pool}/STO-3G`。其中`{basis_set_pool}`是具体基组文件夹所在的根目录。**注意：基组信息高度依赖于具体的计算体系，因此没有缺省值，必须在输入卡中声明**
 - `auxbas_path`: 取值String类型，无缺省值。计算所使用的辅助基组所在位置。辅助基组通常与常规基组放置在相同的文件夹下(`{basis_set_pool}`)。使用最广泛的辅助基组为`def2-SV(P)-JKFIT`，则申明方式应为`auxbas_path={basis_set_pool}/def2-SV(P)-JKFIT`。**注意：辅助基组信息高度依赖于具体的计算体系，因此没有缺省值。如果使用RI-V的近似方法，则必须在输入卡中声明。若`eri_type=anlaytic`，则无需使用辅助基组，也就不用申明auxbas_path**。
 
 `basis_path`和`auxbas_path`中，`{basis_set_pool}`可以省略，例如只写 `cc-pVTZ`。REST 将自动从某些默认路径搜索该文件，优先级为：
