@@ -12,8 +12,8 @@ pub fn apply_yamaguchi_spin_correction(scf_data: &mut SCF, time_mark: &mut TimeR
     println!("==========================================");
             
     let scf_energy_singlet = scf_data.scf_energy;
-    let tot_energy_singlet = scf_data.energies.get("xdh_energy").unwrap()[0]
-        + scf_data.energies.get("ai_correction").map_or(0.0, |v| v[0]);
+    let tot_energy_singlet = scf_data.energies.get("xdh_energy").map_or(0.0, |v| v[0]) 
+                            + scf_data.energies.get("ai_correction").map_or(0.0, |v| v[0]);
     let [square_spin_singlet, _] = scf_io::evaluate_spin_angular_momentum(&scf_data.density_matrix, &scf_data.ovlp, scf_data.mol.spin_channel, &scf_data.mol.num_elec);
 
             if scf_data.mol.ctrl.spin == 1.0 && square_spin_singlet >= 1e-3 {
@@ -22,6 +22,7 @@ pub fn apply_yamaguchi_spin_correction(scf_data: &mut SCF, time_mark: &mut TimeR
                 //scf_data.mol.ctrl.spin = 3.0;
                 //scf_data.mol.ctrl.spin_polarization = false;
                 scf_data.mol.ctrl.guess_mix = false;
+                scf_data.mol.ctrl.force_state_occupation = vec![];
                 scf_data.mol.num_elec[1] += 1.0;
                 scf_data.mol.num_elec[2] -= 1.0;
                 scf_data.mol.ctrl.initial_guess = String::from("inherit");
@@ -46,8 +47,8 @@ pub fn apply_yamaguchi_spin_correction(scf_data: &mut SCF, time_mark: &mut TimeR
                 performance_essential_calculations(scf_data, time_mark, &mpi_operator);
 
                 let scf_energy_triplet = scf_data.scf_energy;
-                let tot_energy_triplet = scf_data.energies.get("xdh_energy").unwrap()[0]
-                + scf_data.energies.get("ai_correction").map_or(0.0, |v| v[0]);
+                let tot_energy_triplet = scf_data.energies.get("xdh_energy").map_or(0.0, |v| v[0])
+                                        + scf_data.energies.get("ai_correction").map_or(0.0, |v| v[0]);
                 let [square_spin_triplet, _] = scf_io::evaluate_spin_angular_momentum(&scf_data.density_matrix, &scf_data.ovlp, scf_data.mol.spin_channel, &scf_data.mol.num_elec);
 
                 let spin_corrction_factor = square_spin_singlet / (square_spin_triplet - square_spin_singlet);
