@@ -358,10 +358,9 @@ impl BasCell {
    pub fn basis_normalization(&mut self, cint_type: &CintType) {
        /// To use libcint properly, we should rescale the coefficients of the contractive GTOs,
        /// A detailed interpreation is necessary, which, however, is missing at present.
-       let mut bas_start: i32 = 0;
-       let mut atm: Vec<Vec<i32>> = vec![vec![1,0,0,0,0,0]];
-       let mut env: Vec<f64> = vec![0.0_f64,0.0,0.0]; 
-       bas_start += 3;
+       let mut atm: Vec<Vec<i32>> = vec![vec![1, 20, 1, 23, 0, 0]];
+       let mut env: Vec<f64> = vec![0.0_f64; 24]; 
+       let bas_start: i32 = 24;
        let bas: Vec<Vec<i32>> = vec![vec![0,
                                 self.angular_momentum[0],
                                 self.exponents.len() as i32, 
