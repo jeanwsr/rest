@@ -15,6 +15,7 @@ pub struct QuasiParticle {
     pub davidson_converge_threshold:f64,
     pub davidson_maximum_subspace_size:usize,
     pub davidson_restart_dimensions:usize,
+    pub davidson_max_iter:usize,
     pub bse_tda:bool,
     pub bse_spin:String,
     pub bse_cutoff_energy:f64,
@@ -40,7 +41,8 @@ pub struct QuasiParticle {
     pub gw_or_bse:String,
     pub gw_span_energy:f64,
     pub gw_search_grid:usize,
-    pub gw_rootfinder:String
+    pub gw_rootfinder:String,
+    pub simplified_bse:bool
 }
 
 impl Default for QuasiParticle {
@@ -55,6 +57,7 @@ impl Default for QuasiParticle {
             davidson_converge_threshold:1e-6,
             davidson_maximum_subspace_size:2,
             davidson_restart_dimensions:5,
+            davidson_max_iter:20,
             bse_tda:false,
             bse_spin:String::from("none"),
             bse_cutoff_energy:1000000.0,
@@ -80,7 +83,8 @@ impl Default for QuasiParticle {
             gw_or_bse:String::new(),
             gw_span_energy:0.2,
             gw_search_grid:51,
-            gw_rootfinder:"newton".to_string()
+            gw_rootfinder:"newton".to_string(),
+            simplified_bse:false
         }
     }
 }
@@ -98,6 +102,7 @@ impl QuasiParticle {
         table.insert("davidson_converge_threshold".to_string(), toml::Value::Float(self.davidson_converge_threshold));
         table.insert("davidson_maximum_subspace_size".to_string(), toml::Value::Integer(self.davidson_maximum_subspace_size as i64));
         table.insert("davidson_restart_dimensions".to_string(), toml::Value::Integer(self.davidson_restart_dimensions as i64));
+        table.insert("davidson_max_iter".to_string(), toml::Value::Integer(self.davidson_max_iter as i64));
         table.insert("bse_tda".to_string(), toml::Value::Boolean(self.bse_tda));
         table.insert("bse_spin".to_string(), toml::Value::String(self.bse_spin.clone()));
         table.insert("bse_cutoff_energy".to_string(), toml::Value::Float(self.bse_cutoff_energy));
@@ -124,6 +129,7 @@ impl QuasiParticle {
         table.insert("gw_span_energy".to_string(), toml::Value::Float(self.gw_span_energy));
         table.insert("gw_or_bse".to_string(), toml::Value::String(self.gw_or_bse.clone()));
         table.insert("gw_search_grid".to_string(), toml::Value::Integer(self.gw_search_grid as i64));
+        table.insert("simplified_bse".to_string(), toml::Value::Boolean(self.simplified_bse));
         toml::Value::Table(table)
     }
 }
@@ -172,6 +178,11 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(6_usize)},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(6) as usize},
                 other => {6}
+            };
+            tmp_input.davidson_max_iter = match tmp_ctrl.get("davidson_max_iter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(6_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(6) as usize},
+                other => {20}
             };
             let maximum_subspace_size=(((tmp_input.davidson_target_excitations as f64)*3.0).ceil() as usize);
             tmp_input.davidson_maximum_subspace_size = match tmp_ctrl.get("davidson_maximum_subspace_size").unwrap_or(&serde_json::Value::Null) {
@@ -251,6 +262,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 other => {false},
             };
             tmp_input.save_bse_excitations = match tmp_ctrl.get("save_bse_excitations").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.simplified_bse = match tmp_ctrl.get("simplified_bse").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };

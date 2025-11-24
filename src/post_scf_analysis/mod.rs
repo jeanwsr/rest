@@ -452,7 +452,9 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             ri_gw::get_homo_lumo_qp_only(scf_data,20,&vxc_nn,mpi_operator);
         }else{
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
-            //ri_bse::matvec::test_v_w_contribution(scf_data);
+            if scf_data.mol.ctrl.print_level>1{
+                ri_bse::matvec::test_v_w_contribution(scf_data);
+            }
         }
     }else if output_type.eq("bse"){
         if qp_ctrl.gw_scheme=="parse from file"{
