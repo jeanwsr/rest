@@ -14,7 +14,7 @@ use serde_json::Value;
 //use tensors::Tensors;
 
 use crate::basis_io::Basis4Elem;
-use crate::constants::{SPECIES_NAME,MASS_CHARGE,ANG,SPECIES_INFO};
+use crate::constants::{ANG, ATOMIC_RADII, MASS_CHARGE, SPECIES_INFO, SPECIES_NAME};
 use crate::external_field::ExtField;
 mod pyrest_geom_io;
 
@@ -771,6 +771,48 @@ impl GeomCell {
         //dipole[2] /= mass_sum;
         (dipole, mass_sum)
     }
+
+    /// evaluate the distance between two atoms in the geometry
+    /// # Arguments
+    /// * `i`: the index of the first atom
+    /// * `j`: the index of the second atom
+    /// # Return
+    /// the distance between two atoms
+    fn calculate_distance(&self, i: usize, j: usize) -> f64 {
+        let ri = self.position.iter_column(i);
+        let rj = self.position.iter_column(j);
+        let mut dd = ri.zip(rj)
+            .fold(0.0,|acc,(ri,rj)| acc + (ri-rj).powf(2.0)).sqrt();
+        dd *= crate::constants::ANG.powf(-1.0);
+        dd
+    }
+
+    /// check if the atoms are overlapping
+    fn check_atom_overlaps(&self, tolerance: f64) -> bool { 
+        let n_atoms = self.elem.len();
+
+        for i in 0..n_atoms {
+            //let radius_i = *ATOMIC_RADII.get(&self.elem[i].as_str()).unwrap_or(&&1.5);
+            for j in (i+1)..n_atoms {
+                //let radius_j = *ATOMIC_RADII.get(&self.elem[j].as_str()).unwrap_or(&&1.5);
+                let dd = self.calculate_distance(i,j);
+                //if dd < radius_i + radius_j - tolerance {
+                //    println!("Atom overlap: {} (Index {}) and {} (Index {}), Distance: {:.3} Å, Min. Dist.: {:.3} Å", 
+                //            &self.elem[i], i, &self.elem[j], j, dd, radius_i + radius_j - tolerance);
+                if dd < tolerance {
+                    println!("Atom overlap: {} (Index {}) and {} (Index {}), Distance: {:.3} Å, Min. Dist.: {:.3} Å", 
+                            &self.elem[i], i, &self.elem[j], j, dd, tolerance);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn has_atom_overlap(&self) -> bool {
+        self.check_atom_overlaps(0.3)
+    }
+    
 
 
 }
