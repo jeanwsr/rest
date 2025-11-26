@@ -342,7 +342,7 @@ pub fn w_c_matrix(inverse_dielectric:&MatrixFull<f64>,num_state:usize,ri_full:&M
     for (a,vec) in iterator{
         let n=a/num_state;
         let m=a%num_state;
-        if check_matrix[[m,n]]!=0.0{
+        if check_matrix[[m,n]]<0.5{
             _dgemv(inverse_dielectric,vec,&mut first_product,'N', 1.0, 0.0, 1, 1);
             w_c[[m,n]]=first_product.iter().zip(vec.iter()).map(|(a,b)|a*b).sum();
             w_c[[n,m]]=w_c[[m,n]];
