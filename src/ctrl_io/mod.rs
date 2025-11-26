@@ -528,6 +528,9 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
     println!("Input molecular structure (in Angstrom): ----------");
     println!("{}", geom.formated_geometry());
     println!("End of molecular structure ------------------------");
+    if geom.has_atom_overlap() {
+        panic!("Error:: Overlapping atoms detected")
+    }
 
     if ctrl.print_level>0 {
         println!("ERI Type: {}", ctrl.eri_type);

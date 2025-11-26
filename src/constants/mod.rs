@@ -297,3 +297,149 @@ pub const AU2DEBYE:f64 = E_CHARGE * BOHR*1e-10 / DEBYE; // 2.541746
 
 
 pub const MPI_CHUNK:usize = 134217728; // around 1 GB
+
+lazy_static!{
+    pub static ref ATOMIC_RADII: HashMap<&'static str, &'static f64> = {
+    /// 获取元素周期表中所有元素的原子半径（单位：Å）
+    /// 数据来源：Clementi-Raimondi半径、共价半径和范德华半径的综合
+        let mut radii = HashMap::new();
+        
+        // 第1周期
+        radii.insert( "H", &0.53);  // 氢
+        radii.insert("He", &0.31);  // 氦
+
+        // 第2周期
+        radii.insert("Li", &1.67);  // 锂
+        radii.insert("Be", &1.12);  // 铍
+        radii.insert( "B", &0.87);  // 硼
+        radii.insert( "C", &0.67);  // 碳
+        radii.insert( "N", &0.56);  // 氮
+        radii.insert( "O", &0.48);  // 氧
+        radii.insert( "F", &0.42);  // 氟
+        radii.insert("Ne", &0.38);  // 氖
+
+        // 第3周期
+        radii.insert("Na", &1.90);  // 钠
+        radii.insert("Mg", &1.45);  // 镁
+        radii.insert("Al", &1.18);  // 铝
+        radii.insert("Si", &1.11);  // 硅
+        radii.insert( "P", &0.98);  // 磷
+        radii.insert( "S", &0.88);  // 硫
+        radii.insert("Cl", &0.79);  // 氯
+        radii.insert("Ar", &0.71);  // 氩
+
+        // 第4周期
+        radii.insert( "K", &2.43);  // 钾
+        radii.insert("Ca", &1.94);  // 钙
+        radii.insert("Sc", &1.84);  // 钪
+        radii.insert("Ti", &1.76);  // 钛
+        radii.insert( "V", &1.71);  // 钒
+        radii.insert("Cr", &1.66);  // 铬
+        radii.insert("Mn", &1.61);  // 锰
+        radii.insert("Fe", &1.56);  // 铁
+        radii.insert("Co", &1.52);  // 钴
+        radii.insert("Ni", &1.49);  // 镍
+        radii.insert("Cu", &1.45);  // 铜
+        radii.insert("Zn", &1.42);  // 锌
+        radii.insert("Ga", &1.36);  // 镓
+        radii.insert("Ge", &1.25);  // 锗
+        radii.insert("As", &1.14);  // 砷
+        radii.insert("Se", &1.03);  // 硒
+        radii.insert("Br", &0.94);  // 溴
+        radii.insert("Kr", &0.88);  // 氪
+
+        // 第5周期
+        radii.insert("Rb", &2.65);  // 铷
+        radii.insert("Sr", &2.19);  // 锶
+        radii.insert( "Y", &2.12);  // 钇
+        radii.insert("Zr", &2.06);  // 锆
+        radii.insert("Nb", &1.98);  // 铌
+        radii.insert("Mo", &1.90);  // 钼
+        radii.insert("Tc", &1.83);  // 锝
+        radii.insert("Ru", &1.78);  // 钌
+        radii.insert("Rh", &1.73);  // 铑
+        radii.insert("Pd", &1.69);  // 钯
+        radii.insert("Ag", &1.65);  // 银
+        radii.insert("Cd", &1.61);  // 镉
+        radii.insert("In", &1.56);  // 铟
+        radii.insert("Sn", &1.45);  // 锡
+        radii.insert("Sb", &1.33);  // 锑
+        radii.insert("Te", &1.23);  // 碲
+        radii.insert( "I", &1.15);  // 碘
+        radii.insert("Xe", &1.08);  // 氙
+
+        // 第6周期
+        radii.insert("Cs", &2.98);  // 铯
+        radii.insert("Ba", &2.53);  // 钡
+        radii.insert("La", &2.50);  // 镧
+        radii.insert("Ce", &2.48);  // 铈
+        radii.insert("Pr", &2.47);  // 镨
+        radii.insert("Nd", &2.45);  // 钕
+        radii.insert("Pm", &2.43);  // 钷
+        radii.insert("Sm", &2.42);  // 钐
+        radii.insert("Eu", &2.40);  // 铕
+        radii.insert("Gd", &2.38);  // 钆
+        radii.insert("Tb", &2.37);  // 铽
+        radii.insert("Dy", &2.35);  // 镝
+        radii.insert("Ho", &2.33);  // 钬
+        radii.insert("Er", &2.32);  // 铒
+        radii.insert("Tm", &2.30);  // 铥
+        radii.insert("Yb", &2.28);  // 镱
+        radii.insert("Lu", &2.27);  // 镥
+        radii.insert("Hf", &2.25);  // 铪
+        radii.insert("Ta", &2.20);  // 钽
+        radii.insert( "W", &2.10);  // 钨
+        radii.insert("Re", &2.05);  // 铼
+        radii.insert("Os", &2.00);  // 锇
+        radii.insert("Ir", &1.97);  // 铱
+        radii.insert("Pt", &1.92);  // 铂
+        radii.insert("Au", &1.87);  // 金
+        radii.insert("Hg", &1.75);  // 汞
+        radii.insert("Tl", &1.70);  // 铊
+        radii.insert("Pb", &1.54);  // 铅
+        radii.insert("Bi", &1.43);  // 铋
+        radii.insert("Po", &1.35);  // 钋
+        radii.insert("At", &1.27);  // 砹
+        radii.insert("Rn", &1.20);  // 氡
+
+        // 第7周期
+        radii.insert("Fr", &3.00);  // 钫
+        radii.insert("Ra", &2.70);  // 镭
+        radii.insert("Ac", &2.60);  // 锕
+        radii.insert("Th", &2.50);  // 钍
+        radii.insert("Pa", &2.40);  // 镤
+        radii.insert( "U",  &2.30); // 铀
+        radii.insert("Np", &2.30);  // 镎
+        radii.insert("Pu", &2.30);  // 钚
+        radii.insert("Am", &2.30);  // 镅
+        radii.insert("Cm", &2.30);  // 锔
+        radii.insert("Bk", &2.30);  // 锫
+        radii.insert("Cf", &2.30);  // 锎
+        radii.insert("Es", &2.30);  // 锿
+        radii.insert("Fm", &2.30);  // 镄
+        radii.insert("Md", &2.30);  // 钔
+        radii.insert("No", &2.30);  // 锘
+        radii.insert("Lr", &2.30);  // 铹
+        radii.insert("Rf", &2.30);  // 卢瑟福
+        radii.insert("Db", &2.30);  // 𨧀
+        radii.insert("Sg", &2.30);  // 𨭎
+        radii.insert("Bh", &2.30);  // 𨨏
+        radii.insert("Hs", &2.30);  // 𨭆
+        radii.insert("Mt", &2.30);  // 䥑
+        radii.insert("Ds", &2.30);  // 鐽
+        radii.insert("Rg", &2.30);  // 錀
+        radii.insert("Cn", &2.30);  // 鎶
+        radii.insert("Nh", &2.30);  // 鉨
+        radii.insert("Fl", &2.30);  // 鈇
+        radii.insert("Mc", &2.30);  // 鏌
+        radii.insert("Lv", &2.30);  // 鉝
+        radii.insert("Ts", &2.30);  // 鿬
+        radii.insert("Og", &2.30);  // 鿫
+
+        // 添加一些常见的同位素和特殊表示
+        radii.insert("D", &0.53);   // 氘
+        radii.insert("T", &0.53);   // 氚
+        
+        radii
+    };
+}

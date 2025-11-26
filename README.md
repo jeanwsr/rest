@@ -217,7 +217,7 @@ REST程序对于基组的使用是高度自由和自定义的，可以根据具�
 	- "first"：只对初始结构计算Hessian矩阵（缺省：过渡态搜索）
 	- "last"：计算优化好的结构的Hessian矩阵计算
 	- "first+last"：计算初始和优化好的两个结构的Hessian矩阵
-	- "stop"：不做游行优化，只计算初始结构的Hessian矩阵
+	- "stop"：不做构型优化，只计算初始结构的Hessian矩阵
 	- "each"：计算构型优化中每一步的Hessian矩阵
 - `frequency`：取值bool，当得到Hessian矩阵后，是否开展频率计算和热化学分析。缺省值：true
 - `thermo`：取值[f64;2]，提供热力学分析的状态：[温度 (K),压强 (bar)]。缺省值：[300.0, 1.0]
