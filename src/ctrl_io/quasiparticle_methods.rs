@@ -16,6 +16,7 @@ pub struct QuasiParticle {
     pub davidson_maximum_subspace_size:usize,
     pub davidson_restart_dimensions:usize,
     pub davidson_max_iter:usize,
+    pub davidson_add_dimensions:usize,
     pub bse_tda:bool,
     pub bse_spin:String,
     pub bse_cutoff_energy:f64,
@@ -57,6 +58,7 @@ impl Default for QuasiParticle {
             davidson_converge_threshold:1e-6,
             davidson_maximum_subspace_size:2,
             davidson_restart_dimensions:5,
+            davidson_add_dimensions:4,
             davidson_max_iter:20,
             bse_tda:false,
             bse_spin:String::from("none"),
@@ -102,6 +104,7 @@ impl QuasiParticle {
         table.insert("davidson_converge_threshold".to_string(), toml::Value::Float(self.davidson_converge_threshold));
         table.insert("davidson_maximum_subspace_size".to_string(), toml::Value::Integer(self.davidson_maximum_subspace_size as i64));
         table.insert("davidson_restart_dimensions".to_string(), toml::Value::Integer(self.davidson_restart_dimensions as i64));
+        table.insert("davidson_add_dimensions".to_string(), toml::Value::Integer(self.davidson_add_dimensions as i64));
         table.insert("davidson_max_iter".to_string(), toml::Value::Integer(self.davidson_max_iter as i64));
         table.insert("bse_tda".to_string(), toml::Value::Boolean(self.bse_tda));
         table.insert("bse_spin".to_string(), toml::Value::String(self.bse_spin.clone()));
@@ -193,7 +196,11 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             };
             let restart_size=(((tmp_input.davidson_target_excitations as f64)*1.5).ceil() as usize);
             tmp_input.davidson_restart_dimensions = match tmp_ctrl.get("davidson_restart_dimensions").unwrap_or(&serde_json::Value::Null) {
-        
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(restart_size) as usize},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(restart_size as i64) as usize},
+                other => {restart_size}
+            };
+            tmp_input.davidson_add_dimensions = match tmp_ctrl.get("davidson_add_dimensions").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(restart_size) as usize},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(restart_size as i64) as usize},
                 other => {restart_size}

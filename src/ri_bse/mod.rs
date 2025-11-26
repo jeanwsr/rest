@@ -25,6 +25,16 @@ pub fn bse_main(scf_data:&mut SCF){
     let quasiparticle_energies=scf_data.gwqp.0.clone();
     let dipole_matrix=dipoles::compute_dipole_matrix(scf_data);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let auxbas_dir=scf_data.mol.ctrl.auxbas_path.clone();
+    let elements=scf_data.mol.geom.elem.clone();
+    println!("Elements:{:?}",elements);
+    elements.iter().for_each(|elem|{
+        let auxbas=format!("{}/{}.json",auxbas_dir,elem);
+        let total_count=sbse::count_all_ao(auxbas.clone()).unwrap();
+        let s_count=sbse::count_angular_momentum_regex(auxbas.clone(),0).unwrap();
+        println!("{} basis funtions are found from {}",total_count,auxbas);
+        println!("{} S basis functions are detected from the auxbas {}",s_count,auxbas);
+    });
     if qp_ctrl.bse_spin =="none"{
         println!("No BSE Calculations are triggered");
     }else{
@@ -389,6 +399,7 @@ pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:
     let mut eigenpairs:Vec<(f64,Vec<f64>)>=Vec::new();
     if qp_ctrl.bse_davidson_solver==true{
         let ri_oo=get_submatrix(scf_data,'O','O','N');
+        println!("num_auxbas={}",ri_oo.size[0]);
         let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
         _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
         drop(ri_oo);

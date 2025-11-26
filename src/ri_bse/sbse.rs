@@ -8,6 +8,9 @@ use crate::ri_bse::davidson_solver;
 use rayon::prelude::*;
 use std::time::Instant;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use regex::Regex;
+use std::fs;
+use std::path::Path;
 
 pub fn w_ao_basis(inverse_dielectric:&MatrixFull<f64>,num_state:usize,ri3ao:MatrixFull<f64>)->MatrixFull<f64>{
     println!("size of ri3ao:{},{}",ri3ao.size[0],ri3ao.size[1]);
@@ -27,15 +30,15 @@ pub fn w_ao_basis(inverse_dielectric:&MatrixFull<f64>,num_state:usize,ri3ao:Matr
             column+=1;
         }
     }
-    println!("W matrix in AO basis:");
-    w_c.formated_output(1000,"full");
+    //println!("W matrix in AO basis:");
+    //w_c.formated_output(1000,"full");
     w_c
 }
 pub fn sbse_matvec_w_contribution(w_ao_basis:&MatrixFull<f64>,mo_coeff:&MatrixFull<f64>,occ_size:usize,vir_size:usize,z:&Vec<f64>)->Vec<f64>{
     let nao=w_ao_basis.size[0];
     let z_matrix=MatrixFull::from_vec([occ_size,vir_size],z.clone()).unwrap();
     //println!("MatVec Debug:z_vector:{:#?},z matrix:",z);
-    z_matrix.formated_output(1000,"full");
+    //z_matrix.formated_output(1000,"full");
     let mut c_nub_z_jb=MatrixFull::new([nao,occ_size],0.0);
     _dgemm(mo_coeff,((0..nao),(occ_size..occ_size+vir_size)),'N',&z_matrix,((0..occ_size),(0..vir_size)),'T',&mut c_nub_z_jb,((0..nao),(0..occ_size)),1.0,0.0);
     let mut k_mu_nu=MatrixFull::new([nao,nao],0.0);
@@ -49,4 +52,40 @@ pub fn sbse_matvec_w_contribution(w_ao_basis:&MatrixFull<f64>,mo_coeff:&MatrixFu
     let result=w_z_matrix.data;
     //println!("MatVec:{:#?} into: {:#?}",z,result);
     result
+}
+pub fn count_angular_momentum_regex<P>(filename: P,angular_momentum:usize) -> Result<usize, Box<dyn std::error::Error>>
+where
+    P: AsRef<Path>,
+{
+    let content = fs::read_to_string(filename)?;
+    
+    // 创建正则表达式模式，注意要匹配确切的缩进
+    let pattern = format!(r#"\[\s*{}\s*\]"#,angular_momentum);
+    let re = Regex::new(&pattern)?;
+    
+    Ok(re.find_iter(&content).count())
+}
+pub fn count_all_ao<P>(filename: P) -> Result<usize, Box<dyn std::error::Error>>
+where
+    P: AsRef<Path>,
+{
+    let content = fs::read_to_string(filename)?;
+    
+    // 创建正则表达式模式，注意要匹配确切的缩进
+    let pattern = r#"angular_momentum"#;
+    let re = Regex::new(&pattern)?;
+    
+    Ok(re.find_iter(&content).count())
+}
+pub fn obtain_relevant_indices(elements:&Vec<String>,auxbas_dir:&String,max_angular_momentum:usize)->Vec<usize>{
+    let mut indices=vec![1;0];
+    let mut starting_index=0;
+    elements.iter().for_each(|elem|{
+        let tot_num=count_all_ao(format!("{}/{}.json",auxbas_dir,elem));
+        let mut basis_funcs_pushed=0;
+        (0..max_angular_momentum).for_each(|angular_momentum|basis_funcs_pushed+=count_angular_momentum_regex(format!("{}/{}.json",auxbas_dir,elem),angular_momentum));
+        (0..basis_funcs_pushed).for_each(|n|indices.push(starting_index+n));
+        starting_index+=tot_num;
+    });
+    indices
 }

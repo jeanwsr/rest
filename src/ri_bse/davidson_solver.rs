@@ -40,8 +40,8 @@ where F1:Fn(&Vec<f64>)->Vec<f64>{
     let mut x_solutions=MatrixFull::new([occ_vir,0],0.0);
     let mut eigenvalues:Vec<f64>=Vec::new();
     let mut iter_num=0;
-    let qp_ctrl=
     loop{
+        let restart=if ss.size[1]>qp_ctrl.davidson_maximum_subspace_size-qp_ctrl.davidson_add_dimensions{true}else{false};
         iter_num+=1;
         let m=ss.size[1];
         let mut a_ss=MatrixFull::new([occ_vir,0],0.0);
@@ -65,15 +65,16 @@ where F1:Fn(&Vec<f64>)->Vec<f64>{
         let mut x_proj_nroots=MatrixFull::new([m,0],0.0);
         let mut omega_nroots:Vec<f64>=Vec::new();
         if print_level>1{println!("omega={:#?}",omega);}
+        let collect_sol_num=if restart{qp_ctrl.davidson_restart_dimensions}else{cmp::min(ss.size[1],qp_ctrl.davidson_add_dimensions)};
         omega.iter().zip(x_proj.iter_columns_full()).enumerate().for_each(|(n,(omega_i,x_i))|
-            if n<nroots{
+            if n<collect_sol_num{
                 omega_nroots.push(*omega_i);
                 x_proj_nroots.push_column(x_i);
             });
         let m=ss_t_a_ss.size[0];
         //m:subspace dimensions
         if print_level>1{println!("omega:{:#?}",omega);}
-        let mut x_full=MatrixFull::new([occ_vir,nroots],0.0);
+        let mut x_full=MatrixFull::new([occ_vir,collect_sol_num],0.0);
         _dgemm_full(&ss,'N',&x_proj_nroots,'N',&mut x_full,1.0,0.0);
         //xmy_full,xpy_full:Real X+Y and X-Y spanned in MO-pair basis
         let mut ax_full=MatrixFull::new([occ_vir,0],0.0);
@@ -83,33 +84,35 @@ where F1:Fn(&Vec<f64>)->Vec<f64>{
             ax_full.push_column(&ax_i);
         });
         let mut residues=ax_full;
-        let mut eigenvalue_matrix=MatrixFull::new([nroots,nroots],0.0);
-        (0..nroots).for_each(|i|eigenvalue_matrix[[i,i]]=omega[i]);
+        let mut eigenvalue_matrix=MatrixFull::new([collect_sol_num,collect_sol_num],0.0);
+        (0..collect_sol_num).for_each(|i|eigenvalue_matrix[[i,i]]=omega[i]);
         //diagonal matrix of eigenvalues, to make it possible to obtain residues with LAPACK
-        let mut omega_x_full=MatrixFull::new([occ_vir,nroots],0.0);
+        let mut omega_x_full=MatrixFull::new([occ_vir,collect_sol_num],0.0);
         _dgemm_full(&x_full,'N',&eigenvalue_matrix,'N',&mut omega_x_full,1.0,0.0);
         //omega_x: Omega(diagonal)X
-        let mut omega_x=MatrixFull::new([occ_vir,nroots],0.0);
+        let mut omega_x=MatrixFull::new([occ_vir,collect_sol_num],0.0);
         _dgemm_full(&x_full,'N',&eigenvalue_matrix,'N',&mut omega_x_full,1.0,0.0);
-        residues=residues.scaled_add(&omega_x_full,-1.0).unwrap();
-        println!("Now is iteration #{},current progress:",iter_num);
+        residues=residues.scaled_add(&omega_x_full,-1.0).unwrap();println!("Now is iteration #{},current progress:",iter_num);
         println!("Residues:");
-        residues.iter_columns_full().for_each(|vec|{
-            println!("{}",vec.iter().map(|x|x.powf(2.0)).sum::<f64>().powf(0.5));
+        residues.iter_columns_full().enumerate().for_each(|(n,vec)|{
+            if n<nroots{
+                println!("{}",vec.iter().map(|x|x.powf(2.0)).sum::<f64>().powf(0.5));
+            }
         });
         let mut converge=true;
-        residues.iter_columns_full().for_each(|residue_i|{
-            let norm=residue_i.iter().fold(0.0,|acc,val|acc+val.powf(2.0));
-            if norm>1e-10{
-                converge=false;
+        residues.iter_columns_full().enumerate().for_each(|(n,residue_i)|{
+            if n<nroots{
+                let norm=residue_i.iter().fold(0.0,|acc,val|acc+val.powf(2.0));
+                if norm>1e-10{
+                    converge=false;
+                }
             }
         });
         if converge{
-            x_solutions.append_column(&x_full);
-            eigenvalues=omega;
+            x_full.iter_columns_full().enumerate().for_each(|(n,vec)|if n<nroots{x_solutions.push_column(vec)});
+            eigenvalues=omega[..nroots].to_vec();
             break;
         }
-        let restart=if ss.size[1]>qp_ctrl.davidson_maximum_subspace_size{true}else{false};
         if !restart{residues.iter_columns_full().enumerate().for_each(|(i,residue_i)|{
             let mut preconditioned=residue_i.iter().enumerate().map(|(j,v_k)|v_k/(omega[i]-diag[j])).collect();
             //preconditioned:preconditioned vector:
@@ -129,8 +132,28 @@ where F1:Fn(&Vec<f64>)->Vec<f64>{
                 println!("A new search vector has been added. Search space now has {} vectors",ss.size[1]);
             }
         });}else{
+            println!("Explicit Restart");
             ss=MatrixFull::new([occ_vir,0],0.0);
             x_full.iter_columns_full().take(qp_ctrl.davidson_restart_dimensions).for_each(|x_i|ss.push_column(x_i));
+            residues.iter_columns_full().enumerate().for_each(|(i,residue_i)|{
+                let mut preconditioned=residue_i.iter().enumerate().map(|(j,v_k)|v_k/(omega[i]-diag[j])).collect();
+                //preconditioned:preconditioned vector:
+                //(X-Y)=(omega-diag)
+                if print_level>2{println!("Un-orthogonalized to add:{:#?}",preconditioned);}
+                ss.iter_columns_full().for_each(|v_k|{
+                    let subspace_vec=v_k.to_vec();
+                    let projection_product=dot_product(&subspace_vec,&preconditioned);
+                    if print_level>2{println!("projection={}",projection_product);}
+                    preconditioned=vector_scaled_add(&preconditioned,1.0,&subspace_vec,-projection_product);
+                });
+                let orthogonalized_norm=dot_product(&preconditioned,&preconditioned).powf(0.5);
+                //if print_level>1{println!("Before normalization:{:#?},norm={}",preconditioned,orthogonalized_norm);}
+                if orthogonalized_norm>1e-8{
+                    preconditioned=num_product(&preconditioned,1.0/orthogonalized_norm);
+                    ss.push_column(&preconditioned);
+                    println!("A new search vector has been added. Search space now has {} vectors",ss.size[1]);
+                }
+            });
         }
         if print_level>2{println!("Search Space:");
         ss.formated_output(1000,"full");}
@@ -329,8 +352,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
             break;
         }
         left_residues.iter_columns_full().enumerate().for_each(|(i,residue)|{
-            let omega_m_diag=omega[i]-diag[i];
-            let mut preconditioned=residue.iter().map(|v_k|v_k/omega_m_diag).collect();
+            let mut preconditioned=residue.iter().enumerate().map(|(j,v_k)|v_k/(omega[i]-diag[j])).collect();
             //preconditioned:preconditioned vector:
             //(X-Y)=(omega-diag)
             if print_level>1{println!("Un-orthogonalized to add:{:#?}",preconditioned);}

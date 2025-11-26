@@ -140,7 +140,7 @@ pub fn w_contribution_rayon_b_block(scf_data:&SCF,ri_ov:&MatrixFull<f64>,z_vec:&
     });
     let t_tensor = MatrixFull::from_vec([num_auxbas, occ_size * occ_size], t_tensor_data).unwrap();
     println!("RAYON T TENSOR:");
-    t_tensor.formated_output(1000,"full");
+    //t_tensor.formated_output(1000,"full");
     // 并行化第二部分：计算最终结果
     let result: Vec<f64> = (0..vir_size).into_par_iter().flat_map(|a| {
         let ri_ov_tilde_ref = &ri_ov_tilde;
