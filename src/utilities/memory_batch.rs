@@ -165,6 +165,15 @@ impl MemEstimate {
         print!("{output}");
         output
     }
+
+    /// Estimate memory consumption in MB for given number of batches.
+    pub fn estimate_mem<T>(&self, nbatch: usize) -> f64 {
+        let nbytes_dtype = std::mem::size_of::<T>();
+        let batched_mb = (self.batched * nbytes_dtype) as f64 / 1024.0 / 1024.0 * nbatch as f64;
+        let fixed_mb = (self.fixed * nbytes_dtype) as f64 / 1024.0 / 1024.0;
+        let thread_mb = (self.thread * nbytes_dtype) as f64 / 1024.0 / 1024.0 * rayon::current_num_threads() as f64;
+        batched_mb + fixed_mb + thread_mb
+    }
 }
 
 /// Calculate batch size within possible memory, by struct [`MemEstimate`].
@@ -228,6 +237,20 @@ pub fn calc_batch_size_from_mem_estimate<T>(
     return batch_size;
 }
 
+/// Handle memory exceed situation (**this func returns `Result`, unwrap to panic**).
+pub fn handle_memory_exceed(mem_to_use: f64, mem_avail: Option<f64>, abort_on_mem_exceed: bool) -> Result<(), String> {
+    let mem_avail_mb = mem_avail.unwrap_or_else(detect_available_memory_mb);
+    let msg = format!(
+        "Memory usage exceeded: trying to use {mem_to_use:10.3} MB, but only {mem_avail_mb:10.3} MB available."
+    );
+    if abort_on_mem_exceed {
+        Err(format!("[ERROR] {msg}"))
+    } else {
+        eprintln!("[WARN] {msg}");
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,7 +260,8 @@ mod tests {
         use rayon::prelude::*;
         let pool = rayon::ThreadPoolBuilder::new().num_threads(6).build().unwrap();
         let mem_est = MemEstimate { batched: 200_000, fixed: 500_000, thread: 100_000 };
-        let batch_size = pool.install(|| calc_batch_size_from_mem_estimate::<f64>(&mem_est, Some(500.0), Some(0.8), true));
+        let batch_size =
+            pool.install(|| calc_batch_size_from_mem_estimate::<f64>(&mem_est, Some(500.0), Some(0.8), true));
         println!("Calculated batch size: {batch_size}");
         assert_eq!(batch_size, 256);
     }
