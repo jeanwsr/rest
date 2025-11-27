@@ -2826,6 +2826,12 @@ impl Molecule {
         let n_auxbas = self.num_auxbas;
         let n_baspar = (self.num_basis+1)*self.num_basis/2;
 
+        // AJZ: this will cost n_baspar * n_auxbas * 8 * 2 bytes memory, where * 2 is for the temporary storage of gemm
+        // for safety, we apply 1.5 factor to limit the memory usage
+        let estimated_mem = 1.5 * n_baspar as f64 * n_auxbas as f64 * 8.0 * 2.0 / (1024.0 * 1024.0); // in MB
+        let avail_mem = self.ctrl.max_memory.map(|m| m - crate::utilities::memory_batch::detect_used_memory_mb("proc"));
+        utilities::memory_batch::handle_memory_exceed(estimated_mem, avail_mem, self.ctrl.abort_on_mem_exceed).unwrap();
+
         if let (Some(mpi_op), Some(loc_mpi_data)) = (&mpi_operator, &self.mpi_data) {
 
             let my_rank = mpi_op.rank;

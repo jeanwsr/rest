@@ -2292,6 +2292,13 @@ impl Grids {
         let num_grids = self.coordinates.len();
         let num_basis = mol.num_basis;
 
+        // handle memory exceed
+        // AJZ: here tabulated grids will cost (num_basis * num_grids * 1 or 4) memory, depending on whether gradients are needed.
+        let ncomp = if mol.xc_data.use_density_gradient() { 4 } else { 1 };
+        let estimated_mem = (num_basis * num_grids * ncomp) as f64 * 8.0 / 1024.0 / 1024.0; // in MB
+        let mem_avail = mol.ctrl.max_memory.map(|m| m - crate::utilities::memory_batch::detect_used_memory_mb("proc"));
+        crate::utilities::memory_batch::handle_memory_exceed(estimated_mem, mem_avail, mol.ctrl.abort_on_mem_exceed).unwrap();
+
         let mut ao = MatrixFull::new([num_basis,num_grids],0.0);
         let mut aop =  if mol.xc_data.use_density_gradient() {
             Some(RIFull::new([num_basis,num_grids,3],0.0))
