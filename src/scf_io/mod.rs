@@ -204,7 +204,8 @@ impl SCF {
             println!("Checking memory requirement for RI J/K algorithms...");
             let nao = mol.num_basis;
             let naux = mol.num_auxbas;
-            let mem_cderi_mb = 8.0 * (nao * nao * naux) as f64 / 1024.0 / 1024.0;
+            // TODO: for safety, we add factor 3.0 to the memory requirement
+            let mem_cderi_mb = 3.0 * 8.0 * (0.5 * (nao * nao * naux) as f64) / 1024.0 / 1024.0;
             let mem_avail_mb = mol.ctrl.max_memory.map(|max_memory| {
                 max_memory - detect_used_memory_mb("proc")
             });
@@ -3155,6 +3156,7 @@ impl SCF {
         } else {
             batch_size_estimate
         };
+        handle_memory_exceed(mem_est.estimate_mem::<f64>(batch_size), mem_avail, self.mol.ctrl.abort_on_mem_exceed).unwrap();
 
         // batch size info output
         if print_level > 0 {
@@ -3227,17 +3229,15 @@ impl SCF {
         } else {
             batch_size_estimate
         };
+        let mem_est = if alg_semi { &mem_est_semi } else { &mem_est_direct };
+        handle_memory_exceed(mem_est.estimate_mem::<f64>(batch_size), mem_avail, self.mol.ctrl.abort_on_mem_exceed).unwrap();
 
         // info output
         if print_level > 0 {
             println!("[INFO] in generate_vk_ri_direct_dm, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
             println!("[INFO] in generate_vk_ri_direct_dm, batch size      : {batch_size}");
             println!("[INFO] in generate_vk_ri_direct_dm, memory estimation");
-            if alg_semi {
-                mem_est_semi.print_with_dtype::<f64>();
-            } else {
-                mem_est_direct.print_with_dtype::<f64>();
-            }
+            mem_est.print_with_dtype::<f64>();
         }
 
         // compute vk only for specified spin channels
