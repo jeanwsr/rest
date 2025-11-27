@@ -338,11 +338,17 @@ pub fn w_c_matrix(inverse_dielectric:&MatrixFull<f64>,num_state:usize,ri_full:&M
     let num_auxbas=inverse_dielectric.size[0];
     let mut w_c=MatrixFull::new([num_state,num_state],0.0);
     let mut first_product=vec![0.0;num_auxbas];
+    let mut check_matrix=MatrixFull::new([num_state,num_state],0.0);
     for (a,vec) in iterator{
         let n=a/num_state;
         let m=a%num_state;
-        _dgemv(inverse_dielectric,vec,&mut first_product,'N', 1.0, 0.0, 1, 1);
-        w_c[[m,n]]=first_product.iter().zip(vec.iter()).map(|(a,b)|a*b).sum();
+        if check_matrix[[m,n]]<0.5{
+            _dgemv(inverse_dielectric,vec,&mut first_product,'N', 1.0, 0.0, 1, 1);
+            w_c[[m,n]]=first_product.iter().zip(vec.iter()).map(|(a,b)|a*b).sum();
+            w_c[[n,m]]=w_c[[m,n]];
+            check_matrix[[m,n]]=1.0;
+            check_matrix[[n,m]]=1.0;
+        }
     }
     w_c
 }
@@ -467,7 +473,7 @@ pub fn linear_interpolation_solver<F>(mut f:F,starting_point:f64,side:f64,grid_f
         answer=xing[0];
         let y_minus=f(answer-h);
         let y_plus=f(answer+h);
-        let derivative=(y_plus-y_minus)/(2.0*h);
+        let derivative=(y_plus-y_minus)/(2.0*h)+1.0;
         let spectral_weight=(1.0-derivative).powf(-1.0);
         println!("crossing at {}, derivative={}, spectral value={}",answer,derivative,spectral_weight);
     }
