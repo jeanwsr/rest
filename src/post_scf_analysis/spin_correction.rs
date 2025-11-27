@@ -3,6 +3,7 @@ use crate::scf_io;
 use crate::utilities::TimeRecords;
 use crate::mpi_io::MPIOperator;
 use crate::main_driver::{collect_total_energy, performance_essential_calculations};
+use crate::post_scf_analysis::save_chkfile;
 
 
 pub fn apply_yamaguchi_spin_correction(scf_data: &mut SCF, time_mark: &mut TimeRecords, mpi_operator: &Option<MPIOperator>) {
@@ -17,12 +18,14 @@ pub fn apply_yamaguchi_spin_correction(scf_data: &mut SCF, time_mark: &mut TimeR
     let [square_spin_singlet, _] = scf_io::evaluate_spin_angular_momentum(&scf_data.density_matrix, &scf_data.ovlp, scf_data.mol.spin_channel, &scf_data.mol.num_elec);
 
             if scf_data.mol.ctrl.spin == 1.0 && square_spin_singlet >= 1e-3 {
+                save_chkfile(&scf_data);
                 time_mark.new_item("spin_correction", "the whole job");
                 time_mark.count_start("spin_correction");
                 //scf_data.mol.ctrl.spin = 3.0;
                 //scf_data.mol.ctrl.spin_polarization = false;
                 scf_data.mol.ctrl.guess_mix = false;
                 scf_data.mol.ctrl.force_state_occupation = vec![];
+                scf_data.mol.ctrl.chkfile.push_str("_triplet");
                 scf_data.mol.num_elec[1] += 1.0;
                 scf_data.mol.num_elec[2] -= 1.0;
                 scf_data.mol.ctrl.initial_guess = String::from("inherit");
