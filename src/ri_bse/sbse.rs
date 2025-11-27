@@ -81,9 +81,9 @@ pub fn obtain_relevant_indices(elements:&Vec<String>,auxbas_dir:&String,max_angu
     let mut indices=vec![1;0];
     let mut starting_index=0;
     elements.iter().for_each(|elem|{
-        let tot_num=count_all_ao(format!("{}/{}.json",auxbas_dir,elem));
+        let tot_num=count_all_ao(format!("{}/{}.json",auxbas_dir,elem)).unwrap();
         let mut basis_funcs_pushed=0;
-        (0..max_angular_momentum).for_each(|angular_momentum|basis_funcs_pushed+=count_angular_momentum_regex(format!("{}/{}.json",auxbas_dir,elem),angular_momentum));
+        (0..max_angular_momentum).for_each(|angular_momentum|basis_funcs_pushed+=count_angular_momentum_regex(format!("{}/{}.json",auxbas_dir,elem),angular_momentum).unwrap());
         (0..basis_funcs_pushed).for_each(|n|indices.push(starting_index+n));
         starting_index+=tot_num;
     });
