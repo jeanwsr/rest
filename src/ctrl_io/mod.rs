@@ -261,6 +261,8 @@ pub struct InputKeywords {
     /// This option is only for single-node computation, and only works in some cases where algorithm awares memory usage and perform batched computation.
     /// For multi-node (MPI), this keyword is not fully discussed.
     pub max_memory: Option<f64>,
+    /// Abort the calculation when memory usage exceeds max_memory.
+    pub abort_on_mem_exceed: bool,
     pub guess_mix: bool,
     pub guess_mix_theta_deg: Vec<f64>,
     pub spin_correction_scheme: Option<String>,
@@ -396,6 +398,7 @@ impl InputKeywords {
             rpa_de_excitation_parameters: None,
             pt2_mpi_mode: 0,
             max_memory: None,
+            abort_on_mem_exceed: true,
             guess_mix: false,
             guess_mix_theta_deg: [15.0, 15.0].to_vec(),
             spin_correction_scheme: None,
@@ -1472,6 +1475,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Number(tmp_num) => Some(tmp_num.as_f64().unwrap()),
                 other => None,
             };
+            tmp_input.abort_on_mem_exceed = tmp_ctrl.get("abort_on_mem_exceed").map(serde_from_value).unwrap_or(true);
             
             // for guess_mix setting
             tmp_input.guess_mix = match tmp_ctrl.get("guess_mix").unwrap_or(&serde_json::Value::Null) {
