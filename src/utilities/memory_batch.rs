@@ -238,19 +238,18 @@ pub fn calc_batch_size_from_mem_estimate<T>(
 }
 
 /// Handle memory exceed situation (**this func returns `Result`, unwrap to panic**).
-pub fn handle_memory_exceed(mem_to_use: f64, mem_avail: Option<f64>, abort_on_mem_exceed: bool) -> Result<(), String> {
+pub fn handle_memory_exceed(mem_to_use: f64, mem_avail: Option<f64>, abort_on_mem_exceed: bool) {
     let mem_avail_mb = mem_avail.unwrap_or_else(detect_available_memory_mb);
     if mem_to_use <= mem_avail_mb {
-        return Ok(());
+        return;
     }
     let msg = format!(
         "Memory usage exceeded: trying to use {mem_to_use:10.3} MB, but only {mem_avail_mb:10.3} MB available.\nIf you want to continue anyway, please set `abort_on_mem_exceed = false` in [ctrl] block of ctrl.in, but use that with caution and risk!"
     );
     if abort_on_mem_exceed {
-        Err(format!("[ERROR] {msg}"))
+        panic!("[ERROR] {msg}")
     } else {
-        eprintln!("[WARN] {msg}");
-        Ok(())
+        eprintln!("[WARN] {msg}")
     }
 }
 

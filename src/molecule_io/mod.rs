@@ -2830,7 +2830,7 @@ impl Molecule {
         // for safety, we apply 1.5 factor to limit the memory usage
         let estimated_mem = 1.5 * n_baspar as f64 * n_auxbas as f64 * 8.0 * 2.0 / (1024.0 * 1024.0); // in MB
         let avail_mem = self.ctrl.max_memory.map(|m| m - crate::utilities::memory_batch::detect_used_memory_mb("proc"));
-        utilities::memory_batch::handle_memory_exceed(estimated_mem, avail_mem, self.ctrl.abort_on_mem_exceed).unwrap();
+        utilities::memory_batch::handle_memory_exceed(estimated_mem, avail_mem, self.ctrl.abort_on_mem_exceed);
 
         if let (Some(mpi_op), Some(loc_mpi_data)) = (&mpi_operator, &self.mpi_data) {
 

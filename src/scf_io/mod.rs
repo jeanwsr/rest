@@ -3156,7 +3156,7 @@ impl SCF {
         } else {
             batch_size_estimate
         };
-        handle_memory_exceed(mem_est.estimate_mem::<f64>(batch_size), mem_avail, self.mol.ctrl.abort_on_mem_exceed).unwrap();
+        handle_memory_exceed(mem_est.estimate_mem::<f64>(batch_size), mem_avail, self.mol.ctrl.abort_on_mem_exceed);
 
         // batch size info output
         if print_level > 0 {
@@ -3230,7 +3230,7 @@ impl SCF {
             batch_size_estimate
         };
         let mem_est = if alg_semi { &mem_est_semi } else { &mem_est_direct };
-        handle_memory_exceed(mem_est.estimate_mem::<f64>(batch_size), mem_avail, self.mol.ctrl.abort_on_mem_exceed).unwrap();
+        handle_memory_exceed(mem_est.estimate_mem::<f64>(batch_size), mem_avail, self.mol.ctrl.abort_on_mem_exceed);
 
         // info output
         if print_level > 0 {
