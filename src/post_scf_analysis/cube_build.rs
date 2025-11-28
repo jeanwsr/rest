@@ -89,7 +89,7 @@ pub fn tabulated_ao_fig (mol: &Molecule, points: &Vec<[f64; 3]>) -> MatrixFull<f
         tmp_pos.append_column(&mol.geom.ghost_bs_pos);
         tmp_pos
     };
-    println!("debug num_basis: {:?},tmp_pos: {:?}", mol.num_basis, &position_full);
+    //println!("debug num_basis: {:?},tmp_pos: {:?}", mol.num_basis, &position_full);
     
     mol.basis4elem.iter().zip(position_full.iter_columns_full()).for_each(|(elem,geom)| {
         let mut tmp_geom = [0.0;3];

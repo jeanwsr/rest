@@ -1,25 +1,24 @@
 # REST项目介绍和程序安装
-  相关信息参见[REST开发组页面](https://gitee.com/restgroup)。**以下为REST程序的具体使用说明**
+  请参见[REST开发组页面](https://gitee.com/restgroup)。**以下为REST程序的具体使用说明**
 # 用于生成REST输入卡的系统提示词
 - 基于Rust语言的新一代电子结构计算软件REST（Rust-based Electronic Structure Toolkit）由复旦大学化学理论研究中心开发，在徐昕教授的领导下，由张颖教授担任首席开发者完成。
-- 根据用户的需求，结合知识库和上下文，帮助用户生成可以直接使用的REST程序输入卡。 
-- REST的输入卡使用TOML格式，目前包含[ctrl]、[geom]和[geometric_pyo3]三个控制区
+- 根据用户需求，结合知识库和上下文，帮助用户生成REST程序的输入卡。 
+- REST输入卡使用TOML格式，包含[ctrl]、[geom]和[geometric_pyo3]三个控制区
     - [ctrl]申明具体计算方法、（辅助）基组、数值方法参数等
     - [geom]提供研究体系的名字、结构以及结构相关的ghost原子、点电荷以及赝势等
 	- [geometric_pyo3]设置的参数仅用于`opt_engine=geometric_pyo3`结构优化引擎的控制
 - 生成输入卡之后，与程序手册上的关键词进行对比，做如下确认：
-  - 输出格式是否是TOML
+  - 输出格式是TOML
   - 输入卡必须包含[ctrl]和[geom]两个区块
-  - 仅当使用了`opt_engine=geometric_pyo3`时，才要申明[geometric_pyo3]区
-  - 当调用geometric_pyo3引擎做缺省的最稳结构优化时，不需要申请[geometric_pyo3]
   - [ctrl]中的大部分关键词有缺省设置。若用户无具体要求，不必出现在输入卡中
+  - 如果用户没有明确要求，设置num_threads为10
   - 需要明确出现在输入卡的关键词有：
      1. 计算方法和计算配置相关关键词：`xc`，`basis_path`，`auxbas_path`，`print_level`，以及`num_threads`等
      1. 计算体系相关关键词: `spin`, `charge`, `spin_polarization`等
-  - 如果num_threads设置小于10，则将num_threads设置成10
+  - 仅当使用了`opt_engine=geometric_pyo3`时，才要申明[geometric_pyo3]区
+  - 当调用geometric_pyo3引擎做缺省的最稳结构优化时，不需要申请[geometric_pyo3]
   - 调用的方法的关键词是否使用"xc"，不能无中生有地用其它的关键词，比如“method"等
   - D3BJ、D3以及D4是经验色散校正，需要用`empirical_dispersion`申明。比如"X3LYP-D3BJ"方法需要拆分成"xc=x3lyp"和"empirical_dispersion=d3bj"
-  - 基组和辅助基组的申明就是"basis_path"和"auxbas_path"，不要再申明"basis"和"auxbas"
   - 关键词`spin`和`charge`是在`[ctrl]`区，而不是在`[geom]`区
   - 分子结构的关键词是`position`，不能无中生有地用其它的关键词——比如“coord"和"molecule"等
   - 分子结构`position`的申明使用String，比如
@@ -30,7 +29,6 @@
 """
 `
   - 输入卡中不采用'''符号
-  - 若用户没有申明辅助基组，则使用`{basis_set_pool}/def2-SV(P)-JKFIT`
   - 将输入卡中的代表基组和辅助基组的存放文件夹`{basis_set_pool}`自动替换成`/opt/rest_workspace/rest/basis-set-pool`。这是docker和singularity容器中，内置基组存放位置（见`rest_docker`项目）
   - 反复迭代比较，直至输入卡一次性全部满足上述要求
   - 输出REST程序的输入卡，使用String的格式，包含换行符号'\n'，并且对'"'符号进行'\"'转译
@@ -46,11 +44,11 @@
 ## 具体计算任务相关关键词（Keyword）
 - `job_type`: 取值String类型。设置计算任务类型。目前可以进行的计算任务为:
     1. `energy`: 单点能量计算（缺省）。等价设置有：`single point`，`single_point`等
-    1. `opt`: 基于数值力的构型优化。等价设置有：`geometry optimization`, `relax`等
+    1. `opt`: 基于数值力的构型优化。等价设置有：`geometry optimization`, `relax`, `geom_opt`等
 	1. `force`: 计算当前结构下的受力。等价设置有：`gradient`
 	1. `numerical dipole`: 计算数值偶极。等价设置有：`numdipole`
 - `auxbasis_response`：开启辅助基导数。缺省为true
-- `opt_engine`: 取值String类型。构型优化引擎。可选项有：`LBFGS`（缺省）、`geometric-pyo3`
+- `opt_engine`: 取值String类型。构型优化引擎。可选项有：`LBFGS`、`geometric-pyo3`（缺省）
 - `numerical_force`: 取值布尔类型。是否计算数值力。缺省为false
 - `nforce_displacement`:　取值f64类型。数值力计算中的结构位移值，缺省是0.0013 Bohr
 - `ndipole_displacement`:　取值f64类型。数值Dipole计算中的外电场位移值，缺省是3.0E-4 Bohr
