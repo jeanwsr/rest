@@ -208,9 +208,9 @@ impl SCF {
             let mem_cderi_mb = 3.0 * 8.0 * (0.5 * (nao * nao * naux) as f64) / 1024.0 / 1024.0;
             let mem_avail_mb = mol.ctrl.max_memory.map(|max_memory| {
                 max_memory - detect_used_memory_mb("proc")
-            });
-            let algorithm_jk = if mem_avail_mb.is_some_and(|mem_avail_mb| mem_avail_mb < mem_cderi_mb) {
-                println!("Memory available for RI integrals ({:.2} MB) is less than required ({:.2} MB).", mem_avail_mb.unwrap(), mem_cderi_mb);
+            }).unwrap_or_else(detect_available_memory_mb);
+            let algorithm_jk = if mem_avail_mb  < mem_cderi_mb {
+                println!("Memory available for RI integrals ({:.2} MB) is less than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
                 println!("Switch to direct RI-J/K algorithms.");
                 if algorithm_jk == AlgorithmJK::Ri {
                     AlgorithmJK::RiDirect
@@ -222,7 +222,7 @@ impl SCF {
                     algorithm_jk
                 }
             } else {
-                println!("Memory available for RI integrals ({:.2} MB) is more than required ({:.2} MB).", mem_avail_mb.unwrap_or(f64::INFINITY), mem_cderi_mb);
+                println!("Memory available for RI integrals ({:.2} MB) is more than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
                 println!("Using standard incore RI-J/K algorithms.");
                 if algorithm_jk == AlgorithmJK::Ri {
                     AlgorithmJK::RiIncore
