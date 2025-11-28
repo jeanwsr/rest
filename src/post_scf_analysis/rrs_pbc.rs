@@ -25,7 +25,7 @@ pub fn rrs_pbc_output(scf_data: &SCF, unit_cell_elem: Vec<String>, index_map: Ha
             println!("RRS-PBC dimension: {:?}",scf_data.mol.geom.pbc_dim);
             println!("Unit Cell: {:?}",unit_cell_elem);
             println!("Occupied orbitals: {:?}",(cell_charge/2.0) as usize);
-            real_k.iter().zip(pbc_result.iter()).for_each(|(k,res)| {
+            real_k.par_iter().zip(pbc_result.par_iter()).for_each(|(k,res)| {
                 println!("k = {:?}",k);
                 println!("Orbital energy = {:?}",res);
             });
@@ -36,10 +36,12 @@ pub fn rrs_pbc_output(scf_data: &SCF, unit_cell_elem: Vec<String>, index_map: Ha
             writeln!(&mut file,"RRS-PBC dimension: {:?}",scf_data.mol.geom.pbc_dim);
             writeln!(&mut file,"Unit Cell: {:?}",unit_cell_elem);
             writeln!(&mut file,"Occupied orbitals: {:?}",(cell_charge/2.0) as usize);
-            real_k.iter().zip(pbc_result.iter()).for_each(|(k,res)| {
-                writeln!(&mut file,"k = {:?}",k);
-                writeln!(&mut file,"Orbital energy = {:?}",res);
-            });
+            let result: Vec<String> = real_k.par_iter()
+                .zip(pbc_result.par_iter())
+                .map(|(a_val, b_val)| format!("k = {:?}\nOrbital energy = {:?}\n",a_val,b_val))
+                .collect();
+            let result_string = result.join("");
+            writeln!(&mut file,"{}",result_string);
         }
     };
     let mut tot_k_points = 0 as usize;
@@ -172,7 +174,7 @@ pub fn rrs_pbc_match(mol: &Molecule) -> (HashMap<(i32,i32,i32),Vec<usize>>, Vec<
                     });
                     //try to match tmp_unit
                     tot_pos.iter().enumerate().for_each(|(pidx,p)| {
-                        let bool_match = abs_diff_eq!(p[0],dst[0],epsilon=1e-6) && abs_diff_eq!(p[1],dst[1],epsilon=1e-6) && abs_diff_eq!(p[0],dst[0],epsilon=1e-6) && (full_elem[pidx] == unit_elem_vec[dst_idx]);
+                        let bool_match = abs_diff_eq!(p[0],dst[0],epsilon=1e-6) && abs_diff_eq!(p[1],dst[1],epsilon=1e-6) && abs_diff_eq!(p[2],dst[2],epsilon=1e-6) && (full_elem[pidx] == unit_elem_vec[dst_idx]);
                         if bool_match {
                             tmp_elem_idx.push(pidx);
                         };
@@ -258,32 +260,37 @@ pub fn rrs_pbc_new(scf: &SCF,index_map: HashMap<(i32,i32,i32),Vec<usize>>) -> (V
         panic!("Find illegal PBC dimension: {:?}",rrs_pbc_dim);
     }
     //real_k save all k values, and it has the same order as real_w, k_fock and k_ovlp
-    let mut real_k: Vec<Vec<f64>> = vec![];
-    let mut k_fock: Vec<Vec<Complex<f64>>> = vec![];
-    let mut k_ovlp: Vec<Vec<Complex<f64>>> = vec![];
+    let mut k_fock = vec![vec![Complex::new(0.0,0.0);unit_hamiltonian_size*unit_hamiltonian_size];tot_k_points];
+    let mut k_ovlp = vec![vec![Complex::new(0.0,0.0);unit_hamiltonian_size*unit_hamiltonian_size];tot_k_points];
+    let mut real_k = vec![vec![0.0;3];tot_k_points];
     if rrs_pbc_dim == 1 {
         let k_points = k_points_vec[0];
-        (0..k_points+1).into_iter().for_each(|k| {
-            let mut tmp_fock = vec![Complex::new(0.0,0.0);unit_hamiltonian_size*unit_hamiltonian_size];
-            let mut tmp_ovlp = vec![Complex::new(0.0,0.0);unit_hamiltonian_size*unit_hamiltonian_size];
-            let fac = (k as f64)/(k_points as f64) - 0.5;
-            let pre_factor = 2.0*PI*fac;
-            fold_fock.iter().for_each(|(p,f)| {
-                let factor = Complex::new(0.0,pre_factor*(p.0 as f64)).exp();
-                tmp_fock.iter_mut().zip(f.iter()).for_each(|(tf,ff)| {
-                    *tf += factor * Complex::new(*ff,0.0);
+        k_fock.par_iter_mut()
+            .zip(k_ovlp.par_iter_mut())
+            .zip(real_k.par_iter_mut())
+            .enumerate()
+            .for_each(|(idx,((fock_item,ovlp_item),k_item))| {
+                let k = idx;
+                let mut tmp_fock = vec![Complex::new(0.0,0.0);unit_hamiltonian_size*unit_hamiltonian_size];
+                let mut tmp_ovlp = vec![Complex::new(0.0,0.0);unit_hamiltonian_size*unit_hamiltonian_size];
+                let fac = (k as f64)/(k_points as f64) - 0.5;
+                let pre_factor = 2.0*PI*fac;
+                fold_fock.iter().for_each(|(p,f)| {
+                    let factor = Complex::new(0.0,pre_factor*(p.0 as f64)).exp();
+                    tmp_fock.iter_mut().zip(f.iter()).for_each(|(tf,ff)| {
+                        *tf += factor * Complex::new(*ff,0.0);
+                    });
                 });
-            });
-            fold_ovlp.iter().for_each(|(p,f)| {
-                let factor = Complex::new(0.0,pre_factor*(p.0 as f64)).exp();
-                tmp_ovlp.iter_mut().zip(f.iter()).for_each(|(tf,ff)| {
-                    *tf += factor * Complex::new(*ff,0.0);
+                fold_ovlp.iter().for_each(|(p,f)| {
+                    let factor = Complex::new(0.0,pre_factor*(p.0 as f64)).exp();
+                    tmp_ovlp.iter_mut().zip(f.iter()).for_each(|(tf,ff)| {
+                        *tf += factor * Complex::new(*ff,0.0);
+                    });
                 });
-            });
-            k_fock.push(tmp_fock);
-            k_ovlp.push(tmp_ovlp);
-            let tmp_k = vec![fac,0.0,0.0];
-            real_k.push(tmp_k);
+                let tmp_k = vec![fac,0.0,0.0];
+                *fock_item = tmp_fock;
+                *ovlp_item = tmp_ovlp;
+                *k_item = tmp_k;
         });
     } else if rrs_pbc_dim == 2 {
         //get p_vec
@@ -312,8 +319,14 @@ pub fn rrs_pbc_new(scf: &SCF,index_map: HashMap<(i32,i32,i32),Vec<usize>>) -> (V
 
         let k_points_1 = k_points_vec[0];
         let k_points_2 = k_points_vec[1];
-        (0..k_points_1+1).into_iter().for_each(|kx| {
-            (0..k_points_2+1).into_iter().for_each(|ky| {
+
+        k_fock.par_iter_mut()
+            .zip(k_ovlp.par_iter_mut())
+            .zip(real_k.par_iter_mut())
+            .enumerate()
+            .for_each(|(idx,((fock_item,ovlp_item),k_item))| {
+                let kx = idx % (k_points_1+1);
+                let ky = idx / (k_points_1+1);
                 let mut tmp_fock = vec![Complex::new(0.0,0.0);unit_hamiltonian_size*unit_hamiltonian_size];
                 let mut tmp_ovlp = vec![Complex::new(0.0,0.0);unit_hamiltonian_size*unit_hamiltonian_size];
                 let mut pre_factor1 = 2.0 * (kx as f64)/(k_points_1 as f64) - 1.0;
@@ -350,12 +363,11 @@ pub fn rrs_pbc_new(scf: &SCF,index_map: HashMap<(i32,i32,i32),Vec<usize>>) -> (V
                         *tf += factor * Complex::new(*ff,0.0);
                     });
                 });
-                k_fock.push(tmp_fock);
-                k_ovlp.push(tmp_ovlp);
                 let tmp_k = vec![pre_factor1,pre_factor2,0.0];
-                real_k.push(tmp_k);
+                *fock_item = tmp_fock;
+                *ovlp_item = tmp_ovlp;
+                *k_item = tmp_k;
             });
-        });
     } else if rrs_pbc_dim == 3 {
         let vec1 = vec_rrs_pbc_vec[0..3].to_vec().clone();
         let vec2 = vec_rrs_pbc_vec[3..6].to_vec().clone();
@@ -391,52 +403,57 @@ pub fn rrs_pbc_new(scf: &SCF,index_map: HashMap<(i32,i32,i32),Vec<usize>>) -> (V
         let k_points_1 = k_points_vec[0];
         let k_points_2 = k_points_vec[1];
         let k_points_3 = k_points_vec[2];
-        (0..k_points_1+1).into_iter().for_each(|kx| {
-            (0..k_points_2+1).into_iter().for_each(|ky| {
-                (0..k_points_3+1).into_iter().for_each(|kz| {
-                    let mut tmp_fock = vec![Complex::new(0.0,0.0);unit_hamiltonian_size*unit_hamiltonian_size];
-                    let mut tmp_ovlp = vec![Complex::new(0.0,0.0);unit_hamiltonian_size*unit_hamiltonian_size];
-                    let pre_factor1 = 2.0 * (kx as f64)/(k_points_1 as f64) - 1.0;
-                    let pre_factor2 = 2.0 * (ky as f64)/(k_points_2 as f64) - 1.0;
-                    let pre_factor3 = 2.0 * (kz as f64)/(k_points_3 as f64) - 1.0;
-                    let mut k_vec = vec![0.0;3];
-                    k_vec1.iter().zip(k_vec2.iter()).zip(k_vec3.iter()).zip(k_vec.iter_mut()).for_each(|(((v1,v2),v3),v)| {
-                        *v = pre_factor1 * *v1 + pre_factor2 * *v2 + pre_factor3 * *v3; 
-                    });
-                    fold_fock.iter().for_each(|(p,f)| {
-                        let mut tmp_p = vec![0.0;3];
-                        tmp_p.iter_mut().zip(vec1.iter()).zip(vec2.iter()).zip(vec3.iter()).for_each(|(((pp,v1),v2),v3)| {
-                            *pp = (p.0 as f64) * *v1 + (p.1 as f64) * *v2 +(p.2 as f64) * *v3;
-                        });
-                        let mut tmp_factor = 0.0;
-                        tmp_p.iter().zip(k_vec.iter()).for_each(|(pp,kk)| {
-                            tmp_factor += *pp * *kk;
-                        });
-                        let factor = Complex::new(0.0,tmp_factor).exp();
-                        tmp_fock.iter_mut().zip(f.iter()).for_each(|(tf,ff)| {
-                            *tf += factor * Complex::new(*ff,0.0);
-                        });
-                    });
-                    fold_ovlp.iter().for_each(|(p,f)| {
-                        let mut tmp_p = vec![0.0;3];
-                        tmp_p.iter_mut().zip(vec1.iter()).zip(vec2.iter()).zip(vec3.iter()).for_each(|(((pp,v1),v2),v3)| {
-                            *pp = (p.0 as f64) * *v1 + (p.1 as f64) * *v2 +(p.2 as f64) * *v3;
-                        });
-                        let mut tmp_factor = 0.0;
-                        tmp_p.iter().zip(k_vec.iter()).for_each(|(pp,kk)| {
-                            tmp_factor += *pp * *kk;
-                        });
-                        let factor = Complex::new(0.0,tmp_factor).exp();
-                        tmp_ovlp.iter_mut().zip(f.iter()).for_each(|(tf,ff)| {
-                            *tf += factor * Complex::new(*ff,0.0);
-                        });
-                    });
-                    k_fock.push(tmp_fock);
-                    k_ovlp.push(tmp_ovlp);
-                    let tmp_k = vec![pre_factor1,pre_factor2,pre_factor3];
-                    real_k.push(tmp_k);
+
+        k_fock.par_iter_mut()
+            .zip(k_ovlp.par_iter_mut())
+            .zip(real_k.par_iter_mut())
+            .enumerate()
+            .for_each(|(idx,((fock_item,ovlp_item),k_item))| {
+                let kx = idx / (k_points_2 * k_points_3);
+                let remainder = idx % (k_points_2 * k_points_3);
+                let ky = remainder / k_points_3;
+                let kz = remainder % k_points_3;
+                let mut tmp_fock = vec![Complex::new(0.0,0.0);unit_hamiltonian_size*unit_hamiltonian_size];
+                let mut tmp_ovlp = vec![Complex::new(0.0,0.0);unit_hamiltonian_size*unit_hamiltonian_size];
+                let pre_factor1 = 2.0 * (kx as f64)/(k_points_1 as f64) - 1.0;
+                let pre_factor2 = 2.0 * (ky as f64)/(k_points_2 as f64) - 1.0;
+                let pre_factor3 = 2.0 * (kz as f64)/(k_points_3 as f64) - 1.0;
+                let mut k_vec = vec![0.0;3];
+                k_vec1.iter().zip(k_vec2.iter()).zip(k_vec3.iter()).zip(k_vec.iter_mut()).for_each(|(((v1,v2),v3),v)| {
+                    *v = pre_factor1 * *v1 + pre_factor2 * *v2 + pre_factor3 * *v3; 
                 });
-            });
+                fold_fock.iter().for_each(|(p,f)| {
+                    let mut tmp_p = vec![0.0;3];
+                    tmp_p.iter_mut().zip(vec1.iter()).zip(vec2.iter()).zip(vec3.iter()).for_each(|(((pp,v1),v2),v3)| {
+                        *pp = (p.0 as f64) * *v1 + (p.1 as f64) * *v2 +(p.2 as f64) * *v3;
+                    });
+                    let mut tmp_factor = 0.0;
+                    tmp_p.iter().zip(k_vec.iter()).for_each(|(pp,kk)| {
+                        tmp_factor += *pp * *kk;
+                    });
+                    let factor = Complex::new(0.0,tmp_factor).exp();
+                    tmp_fock.iter_mut().zip(f.iter()).for_each(|(tf,ff)| {
+                        *tf += factor * Complex::new(*ff,0.0);
+                    });
+                });
+                fold_ovlp.iter().for_each(|(p,f)| {
+                    let mut tmp_p = vec![0.0;3];
+                    tmp_p.iter_mut().zip(vec1.iter()).zip(vec2.iter()).zip(vec3.iter()).for_each(|(((pp,v1),v2),v3)| {
+                        *pp = (p.0 as f64) * *v1 + (p.1 as f64) * *v2 +(p.2 as f64) * *v3;
+                    });
+                    let mut tmp_factor = 0.0;
+                    tmp_p.iter().zip(k_vec.iter()).for_each(|(pp,kk)| {
+                        tmp_factor += *pp * *kk;
+                    });
+                    let factor = Complex::new(0.0,tmp_factor).exp();
+                    tmp_ovlp.iter_mut().zip(f.iter()).for_each(|(tf,ff)| {
+                        *tf += factor * Complex::new(*ff,0.0);
+                    });
+                });
+                let tmp_k = vec![pre_factor1,pre_factor2,pre_factor3];
+                *fock_item = tmp_fock;
+                *ovlp_item = tmp_ovlp;
+                *k_item = tmp_k;
         });
     } else {
         panic!("Illegal PBC dimension");
@@ -461,7 +478,7 @@ pub fn rrs_pbc_new(scf: &SCF,index_map: HashMap<(i32,i32,i32),Vec<usize>>) -> (V
 
     //solve eigvalues
     let mut w = vec![vec![Complex::new(0.0,0.0);unit_hamiltonian_size];tot_k_points];
-    herm_k_fock.iter_mut().zip(herm_k_ovlp.iter_mut()).zip(w.iter_mut()).for_each(|((hf,ho),ww)| {
+    herm_k_fock.par_iter_mut().zip(herm_k_ovlp.par_iter_mut()).zip(w.par_iter_mut()).for_each(|((hf,ho),ww)| {
         let jobvl = b'N' as c_char;
         let jobvr = b'V' as c_char;
         let n = unit_hamiltonian_size.clone() as i32;
@@ -499,6 +516,7 @@ pub fn rrs_pbc_new(scf: &SCF,index_map: HashMap<(i32,i32,i32),Vec<usize>>) -> (V
             *www = *aa / *bb;
         });
     });
+
     let mut real_w = vec![vec![0.0;unit_hamiltonian_size];tot_k_points];
     real_w.iter_mut().zip(w.iter()).for_each(|(rw,cw)| {
         rw.iter_mut().zip(cw.iter()).for_each(|(rwi,cwi)| {
@@ -506,10 +524,9 @@ pub fn rrs_pbc_new(scf: &SCF,index_map: HashMap<(i32,i32,i32),Vec<usize>>) -> (V
         });
     });
 
-    real_w.iter_mut().for_each(|ww| {
+    real_w.par_iter_mut().for_each(|ww| {
         ww.sort_by(|a,b| a.partial_cmp(b).unwrap());
     });
-    
 
     (real_k,real_w)
 }

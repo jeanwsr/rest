@@ -1,5 +1,3 @@
-#![doc = include_str!("rhf-grad-doc.md")]
-
 use crate::constants::AUXBAS_THRESHOLD;
 use crate::grad::traits::GradAPI;
 use crate::scf_io;
