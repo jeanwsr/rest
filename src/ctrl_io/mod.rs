@@ -291,9 +291,9 @@ impl InputKeywords {
             nforce_displacement: 0.0013,
             ndipole_displacement: 3e-4,
             // Keywords for (aux)-basis sets
-            basis_path: String::from("./STO-3G"),
+            basis_path: String::from("def2-SVP"),
             basis_type: String::from("spheric"),
-            auxbas_path: String::from("./def2-SV(P)-JKFIT"),
+            auxbas_path: String::from("def2-SV(P)-JKFIT"),
             auxbas_type: String::from("spheric"),
             use_auxbas: true,
             auxbasis_response: true,
