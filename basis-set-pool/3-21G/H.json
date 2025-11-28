@@ -7,15 +7,13 @@
                 0
             ],
             "exponents": [
-                "0.3842163400E+02",
-                "0.5778030000E+01",
-                "0.1241774000E+01"
+                "0.5447178000E+01",
+                "0.8245472400E+00"
             ],
             "coefficients": [
                 [
-                    "0.4013973935E-01",
-                    "0.2612460970E+00",
-                    "0.7931846246E+00"
+                    "0.1562849787E+00",
+                    "0.9046908767E+00"
                 ]
             ]
         },
@@ -26,7 +24,7 @@
                 0
             ],
             "exponents": [
-                "0.2979640000E+00"
+                "0.1831915800E+00"
             ],
             "coefficients": [
                 [
@@ -37,9 +35,9 @@
     ],
     "references": [
         {
-            "reference_description": "31G Split-valence basis set for H,He",
+            "reference_description": "21G Split-valence basis set for H,He",
             "reference_keys": [
-                "gaussian09e01"
+                "binkley1980a"
             ]
         }
     ]
