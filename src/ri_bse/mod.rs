@@ -25,16 +25,6 @@ pub fn bse_main(scf_data:&mut SCF){
     let quasiparticle_energies=scf_data.gwqp.0.clone();
     let dipole_matrix=dipoles::compute_dipole_matrix(scf_data);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let auxbas_dir=scf_data.mol.ctrl.auxbas_path.clone();
-    let elements=scf_data.mol.geom.elem.clone();
-    println!("Elements:{:?}",elements);
-    elements.iter().for_each(|elem|{
-        let auxbas=format!("{}/{}.json",auxbas_dir,elem);
-        let total_count=sbse::count_all_ao(auxbas.clone()).unwrap();
-        let s_count=sbse::count_angular_momentum_regex(auxbas.clone(),0).unwrap();
-        println!("{} basis funtions are found from {}",total_count,auxbas);
-        println!("{} S basis functions are detected from the auxbas {}",s_count,auxbas);
-    });
     if qp_ctrl.bse_spin =="none"{
         println!("No BSE Calculations are triggered");
     }else{
@@ -45,32 +35,43 @@ pub fn bse_main(scf_data:&mut SCF){
         let xlet=if bse_spin=="triplet"{'T'}else if bse_spin=="singlet"{'S'}else{panic!("invalid choice for bse_spin!")};
         if qp_ctrl.simplified_bse==true{
             println!("Now using: Simplified BSE scheme");
-            let (ri3ao, mut basbas2baspair, mut baspar2basbas) =  if let Some((riao,basbas2baspair, baspar2basbas))=&scf_data.rimatr {
-                (riao,basbas2baspair, baspar2basbas)
-            } else {
-                panic!("rimatr should be initialized in the preparation of riao");
-            };
-            let ri3ao=ri3ao.transpose();
+            let auxbas_dir=scf_data.mol.ctrl.auxbas_path.clone();
+            let elements=scf_data.mol.geom.elem.clone();
+            println!("Elements:{:?}",elements);
+            elements.iter().for_each(|elem|{
+                let auxbas=format!("{}/{}.json",auxbas_dir,elem);
+                let total_count=sbse::count_all_ao(auxbas.clone()).unwrap();
+                let s_count=sbse::count_angular_momentum_regex(auxbas.clone(),0).unwrap();
+                println!("{} basis funtions are found from {}",total_count,auxbas);
+                println!("{} S basis functions are detected from the auxbas {}",s_count,auxbas);
+            });
+            let ang_momentum=qp_ctrl.bse_max_ang_momentum;
+            let relevant_indices=sbse::obtain_relevant_indices(&elements,&auxbas_dir,ang_momentum);
+            let energy_diag=construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
             let mut epsilon:Vec<f64>=scf_data.eigenvalues[0].clone();
             let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
             if qp_ctrl.bse_qp_polarization==true{
-                epsilon=quasiparticle_energies.clone();
+                epsilon=scf_data.gwqp.0.clone();
             }
-            let energy_diag=construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
             let inverse_dielectric=construct_inverse_dielectric(scf_data,&epsilon);
-            let w_ao=sbse::w_ao_basis(&inverse_dielectric,epsilon.len(),ri3ao.clone());
-            let mo_coeff=scf_data.eigenvectors[0].clone();
-            let ovlp=scf_data.ovlp.clone().to_matrixfull().unwrap();
-            let level_shift = vec![0.0];
-            let (ovlp_invsqrt, n_singular, converged_flag) = _newton_schulz_inverse_square_root_v02(&ovlp, 1.0e-8, 1.0, 100, &level_shift);
-            let ovlp_sqrt=_dinverse(&ovlp_invsqrt).expect("unsuccessful _dinverse");
-            let mut ortho_mo_coeff=MatrixFull::new(ovlp.size,0.0);
-            _dgemm_full(&ovlp_sqrt,'N',&mo_coeff,'N',&mut ortho_mo_coeff,1.0,0.0);
-            println!("MO coefficients:");
-            ortho_mo_coeff.formated_output(1000,"full");
             let ri_ov=get_submatrix(scf_data,'O','V','N');
+            ri_ov.formated_output(100000,"full");
+            let ri_oo=get_submatrix(scf_data,'O','O','N');
+            let mut ri_vv=get_submatrix(scf_data,'V','V','N');
+            println!("Full NumAuxBas={}\nRelevant Indices={:?}",ri_ov.size[0],relevant_indices);
+            let mut ri_oo_red=sbse::obtain_ri_with_reduced_ang_momentum(&ri_oo,&relevant_indices);
+            let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo_red.size,0.0);
+            _dgemm_full(&inverse_dielectric,'N',&ri_oo_red,'N',&mut ri_oo_tilde,1.0,0.0);
+            println!("RI-OO-Tilde Size={},{}, where occ_size={}",ri_oo_tilde.size[0],ri_oo_tilde.size[1],occ_size);
+            let reduced_num_auxbas=ri_oo_tilde.size[0];
+            println!("Reduced NumAuxBas={}",reduced_num_auxbas);
+            ri_oo_tilde.reshape([reduced_num_auxbas*occ_size,occ_size]);
+            ri_oo_tilde=ri_oo_tilde.transpose_and_drop();
+            ri_oo_tilde.reshape([occ_size*reduced_num_auxbas,occ_size]);
+            ri_vv=sbse::obtain_ri_with_reduced_ang_momentum(&ri_vv,&relevant_indices);
+            ri_vv.reshape([reduced_num_auxbas*vir_size,vir_size]);
             let initial_guess=davidson_solver::generate_initial_guess(&energy_diag,qp_ctrl.davidson_target_excitations);
-            let excitations=davidson_solver::tda_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::sbse_matvec(scf_data,&ortho_mo_coeff,&w_ao,occ_size,vir_size,&ri_ov,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&qp_ctrl);
+            let excitations=davidson_solver::tda_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&ri_vv,&ri_ov,&ri_oo_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&qp_ctrl);
             if scf_data.mol.ctrl.print_level>2{
                 show_all_eigenpairs(&excitations);
             }
@@ -273,7 +274,16 @@ pub fn construct_energy_diag_for_a(quasiparticle_energies:&Vec<f64>,occ_size:usi
 }
 pub fn construct_inverse_dielectric(scf_data:&SCF,epsilon:&Vec<f64>)->MatrixFull<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
-    let ri_ov=get_submatrix(scf_data,'O','V','Y');
+    let mut ri_ov=get_submatrix(scf_data,'O','V','Y');
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    if qp_ctrl.simplified_bse==true{
+        let ang_momentum=qp_ctrl.bse_max_ang_momentum;
+        let auxbas_dir=scf_data.mol.ctrl.auxbas_path.clone();
+        let elements=scf_data.mol.geom.elem.clone();
+        let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+        let relevant_indices=sbse::obtain_relevant_indices(&elements,&auxbas_dir,ang_momentum);
+        ri_ov=sbse::obtain_ri_with_reduced_ang_momentum(&ri_ov,&relevant_indices);
+    }
     if scf_data.mol.ctrl.print_level>1{
         println!("occ_size={},vir_size(for response)={}",occ_size,vir_size);
     }

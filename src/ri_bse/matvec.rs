@@ -5,6 +5,7 @@ use itertools::Itertools;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgeev, _dgemv,_dgemm_full};
 use crate::ri_bse;
 use crate::ri_bse::{davidson_solver,sbse};
+use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
 use rayon::prelude::*;
 use std::time::Instant;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -85,8 +86,9 @@ pub fn w_contribution_rayon_a_block(scf_data:&SCF,ri_vv:&MatrixFull<f64>,z_vec:&
     println!("W第三个操作耗时: {:?}", duration3-duration2);
     result
 }
-pub fn w_contribution_a_block_dgemm(scf_data:&SCF,ri_vv:&MatrixFull<f64>,z_vec:&Vec<f64>,ri_oo_tilde:&MatrixFull<f64>,num_auxbas:usize)->Vec<f64>{
+pub fn w_contribution_a_block_dgemm(scf_data:&SCF,ri_vv:&MatrixFull<f64>,z_vec:&Vec<f64>,ri_oo_tilde:&MatrixFull<f64>,qp_ctrl:&QuasiParticle)->Vec<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
+    let num_auxbas=ri_vv.size[0]/ri_vv.size[1];
     let mut t_tensor=MatrixFull::new([num_auxbas*vir_size,occ_size],0.0);
     let z_mat=MatrixFull::from_vec([occ_size,vir_size],z_vec.clone()).unwrap();
     _dgemm_full(ri_vv,'N',&z_mat,'T',&mut t_tensor,1.0,0.0);
@@ -94,22 +96,31 @@ pub fn w_contribution_a_block_dgemm(scf_data:&SCF,ri_vv:&MatrixFull<f64>,z_vec:&
     t_tensor.reshape([num_auxbas*occ_size,vir_size]);
     let mut result_tensor=MatrixFull::new([occ_size,vir_size],0.0);
     _dgemm_full(ri_oo_tilde,'T',&t_tensor,'N',&mut result_tensor,1.0,0.0);
-    result_tensor.data
+    result_tensor.data.iter().map(|x|x*qp_ctrl.bse_exchange_rescaling).collect()
 }
 pub fn w_contribution_b_block_dgemm(scf_data:&SCF,ri_ov:&MatrixFull<f64>,z_vec:&Vec<f64>,ri_ov_tilde:&MatrixFull<f64>,num_auxbas:usize)->Vec<f64>{
     
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
-    //println!("RI-OV-TILDE USED IN DGEMM:");
-    //ri_ov_tilde.formated_output(1000,"full");
     let mut t_tensor=MatrixFull::new([num_auxbas*occ_size,occ_size],0.0);
     let z_mat=MatrixFull::from_vec([occ_size,vir_size],z_vec.clone()).unwrap();
     _dgemm_full(ri_ov,'N',&z_mat,'T',&mut t_tensor,1.0,0.0);
-    //println!("DGEMM T TENSOR");
-    //t_tensor.formated_output(1000,"full");
+    let mut result = vec![0.0; t_tensor.data.len()];
+    // 并行处理每个目标块
+    let reshape_t_time=Instant::now();
+    result.par_chunks_exact_mut(num_auxbas).enumerate().for_each(|(new_idx, target_chunk)| {
+        // 计算对应的原块索引
+        let n2 = new_idx / occ_size;  // 新的行索引（原列索引）
+        let n1 = new_idx % occ_size;  // 新的列索引（原行索引）
+        let orig_idx = n1 * occ_size + n2;  // 原块索引
+        
+        // 复制数据
+        let source_start = orig_idx * num_auxbas;
+        let source_end = source_start + num_auxbas;
+        target_chunk.copy_from_slice(&t_tensor.data[source_start..source_end]);
+    });
+    t_tensor=MatrixFull::from_vec([num_auxbas*occ_size,occ_size],result).unwrap();
     let mut result_tensor=MatrixFull::new([occ_size,vir_size],0.0);
     _dgemm_full(&t_tensor,'T',ri_ov_tilde,'N',&mut result_tensor,1.0,0.0);
-    //println!("DGEMM RESULT TENSOR");
-    //result_tensor.formated_output(1000,"full");
     result_tensor.data
 }
 pub fn w_contribution_rayon_b_block(scf_data:&SCF,ri_ov:&MatrixFull<f64>,z_vec:&Vec<f64>,ri_ov_tilde:&MatrixFull<f64>)->Vec<f64>{
@@ -139,8 +150,6 @@ pub fn w_contribution_rayon_b_block(scf_data:&SCF,ri_ov:&MatrixFull<f64>,z_vec:&
         }
     });
     let t_tensor = MatrixFull::from_vec([num_auxbas, occ_size * occ_size], t_tensor_data).unwrap();
-    println!("RAYON T TENSOR:");
-    //t_tensor.formated_output(1000,"full");
     // 并行化第二部分：计算最终结果
     let result: Vec<f64> = (0..vir_size).into_par_iter().flat_map(|a| {
         let ri_ov_tilde_ref = &ri_ov_tilde;
@@ -184,6 +193,7 @@ pub fn test_v_w_contribution_v01(scf_data:&SCF){
     println!("Vz Implicit:{},{}",az[0],az[3]);
     let start1=Instant::now();
     az=w_contribution(scf_data,&z_vec,&ri_oo_tilde);
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let serial_time=start1.elapsed();
     println!("Serial W contribution time={:?}",serial_time);
     println!("Wz Implicit:{},{}",az[0],az[3]);
@@ -196,7 +206,8 @@ pub fn test_v_w_contribution_v01(scf_data:&SCF){
     ri_vv_reshape.reshape([num_auxbas*vir_size,vir_size]);
     let prep_time=dgemm_time.elapsed();
     println!("DGEMM Prep Time={:?}",prep_time);
-    let az=w_contribution_a_block_dgemm(scf_data,&ri_vv_reshape,&z_vec,&ri_oo_tilde_reshape,num_auxbas);
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let az=w_contribution_a_block_dgemm(scf_data,&ri_vv_reshape,&z_vec,&ri_oo_tilde_reshape,&qp_ctrl);
     let calc_time=start1.elapsed();
     println!("DGEMM W contribution time={:?}",calc_time-prep_time);
     println!("Wz DGEMM:{},{}",az[0],az[3]);
@@ -209,8 +220,11 @@ pub fn test_v_w_contribution_v01(scf_data:&SCF){
     let mut w_b=ri_bse::reorganize_w(raw_w_b, 'B', occ_size, vir_size);
     let mut ri_ov_tilde:MatrixFull<f64>=MatrixFull::new(ri_ov.size,0.0);
     _dgemm_full(&inverse_dielectric,'N',&ri_ov,'N',&mut ri_ov_tilde,1.0,0.0);
+    let bblock_timing=Instant::now();
     let bz=w_contribution_rayon_b_block(scf_data,&ri_ov,&z_vec,&ri_ov_tilde);
     println!("Wz_B Implicit:{},{}",bz[0],bz[2]);
+    let rayon_time=bblock_timing.elapsed();
+    println!("B Block Rayon Time={:?}",rayon_time);
     //println!("RI OV TILDE=");
     //ri_ov_tilde.formated_output(1000,"full");
     //println!("RI OV=");
@@ -226,8 +240,34 @@ pub fn test_v_w_contribution_v01(scf_data:&SCF){
     ri_ov_reshape.reshape([num_auxbas*occ_size,vir_size]);
     _dgemv(&w_b,&z_vec , &mut bz, 'N', 1.0, 0.0, 1, 1);
     println!("Wz_B Exact:{:?}",bz);
+    let bblock_dgemm_timing=Instant::now();
     let mut bz=w_contribution_b_block_dgemm(scf_data,&ri_ov_reshape,&z_vec,&ri_ov_tilde,num_auxbas);
+    println!("B Block DGEMM Time={:?}",bblock_dgemm_timing.elapsed());
     println!("Wz_B DGEMM:{:?}",bz);
+    /*let auxbas_dir=scf_data.mol.ctrl.auxbas_path.clone();
+    let elements=scf_data.mol.geom.elem.clone();
+    let relevant_indices=sbse::obtain_relevant_indices(&elements,&auxbas_dir,0);
+    
+    let ri_oo=ri_bse::get_submatrix(scf_data,'O','O','N');
+    let mut ri_vv_new=ri_bse::get_submatrix(scf_data,'V','V','N');
+    println!("Full NumAuxBas={}\nRelevant Indices={:?}",ri_ov.size[0],relevant_indices);
+    let mut ri_oo_tilde_small=sbse::obtain_ri_with_reduced_ang_momentum(&ri_oo,&relevant_indices);
+    println!("RI-OO-Tilde Size={},{}, where occ_size={}",ri_oo_tilde_small.size[0],ri_oo_tilde_small.size[1],occ_size);
+    let reduced_num_auxbas=ri_oo_tilde_small.size[0];
+    println!("Reduced NumAuxBas={}",reduced_num_auxbas);
+    ri_oo_tilde_small.reshape([reduced_num_auxbas*occ_size,occ_size]);
+    ri_oo_tilde_small=ri_oo_tilde_small.transpose_and_drop();
+    ri_oo_tilde_small.reshape([occ_size*reduced_num_auxbas,occ_size]);
+    let mut ri_vv_small=sbse::obtain_ri_with_reduced_ang_momentum(&ri_vv_new,&relevant_indices);
+    ri_vv_small.reshape([reduced_num_auxbas*vir_size,vir_size]);
+    let ratio=sbse::power_iterative_norm(
+        |z|w_contribution_a_block_dgemm(scf_data,&ri_vv_reshape,&z,&ri_oo_tilde_reshape,&qp_ctrl),
+        |z|w_contribution_a_block_dgemm(scf_data,&ri_vv_small,&z,&ri_oo_tilde_small,&qp_ctrl),
+        occ_size*vir_size);
+    */
+
+
+
     /*let paired_vec=davidson_solver::PairedVector{x:vec![0.3;occ_size*vir_size],y:vec![0.3;occ_size*vir_size]};
     let paired_product=paired_vec.pair_matvec({|z|a_block_matvec(scf_data,&ri_oo_tilde,&z)},{|z|b_block_matvec(scf_data,&ri_ov_tilde,&z)});
     let full_product={let mut x_vec=paired_product.x;let y_vec=paired_product.y;x_vec.extend(&y_vec);x_vec};
@@ -245,7 +285,8 @@ pub fn a_block_matvec(scf_data:&SCF,ri_vv:&MatrixFull<f64>,ri_ov:&MatrixFull<f64
     let mut result=diagonal_elements_contribution(scf_data,z_vec);
     let duration1=start.elapsed();
     println!("对角元操作耗时: {:?}", duration1);
-    result=w_contribution_a_block_dgemm(scf_data,ri_vv,z_vec,ri_oo_tilde,ri_ov.size[0]).iter().zip(result.iter()).map(|(w_i,z_i)|-w_i+z_i).collect();
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    result=w_contribution_a_block_dgemm(scf_data,ri_vv,z_vec,ri_oo_tilde,&qp_ctrl).iter().zip(result.iter()).map(|(w_i,z_i)|-w_i+z_i).collect();
     let duration2=start.elapsed();
     println!("W操作耗时: {:?}", duration2-duration1);
     if xlet=='S'{
