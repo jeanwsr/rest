@@ -98,9 +98,9 @@ pub fn w_contribution_a_block_dgemm(scf_data:&SCF,ri_vv:&MatrixFull<f64>,z_vec:&
     _dgemm_full(ri_oo_tilde,'T',&t_tensor,'N',&mut result_tensor,1.0,0.0);
     result_tensor.data.iter().map(|x|x*qp_ctrl.bse_exchange_rescaling).collect()
 }
-pub fn w_contribution_b_block_dgemm(scf_data:&SCF,ri_ov:&MatrixFull<f64>,z_vec:&Vec<f64>,ri_ov_tilde:&MatrixFull<f64>,num_auxbas:usize)->Vec<f64>{
-    
+pub fn w_contribution_b_block_dgemm(scf_data:&SCF,ri_ov:&MatrixFull<f64>,z_vec:&Vec<f64>,ri_ov_tilde:&MatrixFull<f64>)->Vec<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
+    let num_auxbas=ri_ov.size[0]/ri_ov.size[1];
     let mut t_tensor=MatrixFull::new([num_auxbas*occ_size,occ_size],0.0);
     let z_mat=MatrixFull::from_vec([occ_size,vir_size],z_vec.clone()).unwrap();
     _dgemm_full(ri_ov,'N',&z_mat,'T',&mut t_tensor,1.0,0.0);
@@ -241,7 +241,7 @@ pub fn test_v_w_contribution_v01(scf_data:&SCF){
     _dgemv(&w_b,&z_vec , &mut bz, 'N', 1.0, 0.0, 1, 1);
     println!("Wz_B Exact:{:?}",bz);
     let bblock_dgemm_timing=Instant::now();
-    let mut bz=w_contribution_b_block_dgemm(scf_data,&ri_ov_reshape,&z_vec,&ri_ov_tilde,num_auxbas);
+    let mut bz=w_contribution_b_block_dgemm(scf_data,&ri_ov_reshape,&z_vec,&ri_ov_tilde);
     println!("B Block DGEMM Time={:?}",bblock_dgemm_timing.elapsed());
     println!("Wz_B DGEMM:{:?}",bz);
     /*let auxbas_dir=scf_data.mol.ctrl.auxbas_path.clone();
@@ -279,27 +279,33 @@ pub fn test_v_w_contribution_v01(scf_data:&SCF){
     _dgemv(&bse_hamiltonian,&full_vec , &mut result, 'N', 1.0, 0.0, 1, 1);
     println!("Full matvec explicit{},{}",result[0],result[occ_size*vir_size+3])*/
 }
-pub fn a_block_matvec(scf_data:&SCF,ri_vv:&MatrixFull<f64>,ri_ov:&MatrixFull<f64>,ri_oo_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
+pub fn a_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_vv:&MatrixFull<f64>,ri_ov:&MatrixFull<f64>,ri_oo_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
     let start=Instant::now();
-    let xlet=if scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().bse_spin=="triplet"{'T'}else{'S'};
+    let xlet=if qp_ctrl.bse_spin=="triplet"{'T'}else{'S'};
     let mut result=diagonal_elements_contribution(scf_data,z_vec);
     let duration1=start.elapsed();
-    println!("对角元操作耗时: {:?}", duration1);
+    if scf_data.mol.ctrl.print_level>1{
+        println!("对角元操作耗时: {:?}", duration1);   
+    }
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     result=w_contribution_a_block_dgemm(scf_data,ri_vv,z_vec,ri_oo_tilde,&qp_ctrl).iter().zip(result.iter()).map(|(w_i,z_i)|-w_i+z_i).collect();
     let duration2=start.elapsed();
-    println!("W操作耗时: {:?}", duration2-duration1);
+    if scf_data.mol.ctrl.print_level>1{
+        println!("W操作耗时: {:?}", duration2-duration1); 
+    }
     if xlet=='S'{
         result=coulomb_contribution(ri_ov,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|2.0*v_i+z_i).collect();
         let duration3=start.elapsed();
-        println!("库仑操作耗时: {:?}", duration3-duration2);
+        if scf_data.mol.ctrl.print_level>1{
+            println!("库仑操作耗时: {:?}", duration3-duration2);
+        }
     }
     result
 }
-pub fn b_block_matvec(scf_data:&SCF,ri_ov:&MatrixFull<f64>,ri_ov_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
-    let xlet=if scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().bse_spin=="triplet"{'T'}else{'S'};
+pub fn b_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_ov:&MatrixFull<f64>,ri_ov_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
+    let xlet=if qp_ctrl.bse_spin=="triplet"{'T'}else{'S'};
     let mut result=vec![0.0;z_vec.len()];
-    result=w_contribution_rayon_b_block(scf_data,ri_ov,z_vec,ri_ov_tilde).iter().zip(result.iter()).map(|(w_i,z_i)|-w_i+z_i).collect();
+    result=w_contribution_b_block_dgemm(scf_data,ri_ov,z_vec,ri_ov_tilde).iter().zip(result.iter()).map(|(w_i,z_i)|-w_i+z_i).collect();
     if xlet=='S'{
         result=coulomb_contribution(ri_ov,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|2.0*v_i+z_i).collect();
     }
