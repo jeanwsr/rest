@@ -75,7 +75,7 @@ pub fn transition_dipole_square(dipole_matrix:&MatrixFull<f64>,vec:&Vec<f64>,tda
     }
     vector=vector.iter().map(|x_i|x_i*2.0).collect();
     _dgemv(dipole_matrix, &vector, &mut mu, 'N', 1.0, 0.0, 1, 1);
-    println!("Dipole Moment Components:\nx:{}, y:{}, z:{}",mu[0],mu[1],mu[2]);
+    println!("\tDipole Moment Components:\n\tx:{}, y:{}, z:{}",mu[0],mu[1],mu[2]);
     mu[0].powf(2.0)+mu[1].powf(2.0)+mu[2].powf(2.0)
 }
 pub fn matrixfullslice_to_matrixfull(slice:MatrixFullSlice<f64>)->MatrixFull<f64>{
