@@ -25,6 +25,7 @@ use rayon::iter::IndexedParallelIterator;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefMutIterator;
 use crate::ri_gw;
+use std::time::Instant;
 
 pub fn g0w0(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
@@ -56,6 +57,7 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
     scf_data.gwqp.0.clone()
 }
 pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&MatrixFull<f64>,ri_mat:&MatrixFull<f64>,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,n:usize,num_freq:usize,vxc_nn:f64)->f64{
+    let start=Instant::now(); 
     let mut exchange=0.0;
     let gwqp_g=scf_data.gwqp.0.clone();
     let gwqp_w=scf_data.gwqp.1.clone();
@@ -73,11 +75,16 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let rootfinder=qp_ctrl.gw_rootfinder.clone();
     if rootfinder=="newton".to_string(){
-        ri_gw::newton_solver(ri_gw::quasiparticle_equation,n,consts,ri_ov,ri_mat,&gwqp_g,&gwqp_w,occ_size,vir_size,num_state,w_c_at_freqs,e_ks_n,0.00001,50,side,scf_data.mol.ctrl.print_level)
+        println!("Orbital #{}:",n);
+        let qp_energy=ri_gw::newton_solver(ri_gw::quasiparticle_equation,n,consts,ri_ov,ri_mat,&gwqp_g,&gwqp_w,occ_size,vir_size,num_state,w_c_at_freqs,e_ks_n,0.00001,50,side,scf_data.mol.ctrl.print_level);
+        println!("QP energy:{}",qp_energy);
+        println!("GW Evaluation of orbital #{} took {:?}",n,start.elapsed());
+        qp_energy
     }else if rootfinder=="interpolation".to_string(){
         println!("Orbital #{}:",n);
         let qp_energy=ri_gw::linear_interpolation_solver(qp_eq_func,scf_data.eigenvalues[0][n],side,qp_ctrl.gw_search_grid,qp_ctrl.gw_span_energy);
         println!("QP energy:{}",qp_energy);
+        println!("GW Evaluation of orbital #{} took {:?}",n,start.elapsed());
         qp_energy
     }else{
         panic!("Invalid choice of GW rootfinder!")
@@ -100,8 +107,8 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,t
     let calc_orbs_indices:Vec<usize>=ks_energies.into_iter().enumerate().filter(|(n,e_n)|*e_n>e_homo-threshold && *e_n<e_lumo+threshold).map(|(n,e_n)|n).collect();
     println!("calculated orbital indices:{:?}",calc_orbs_indices);
     let calc_orbs:Vec<(usize,f64)>=calc_orbs_indices.iter().map(|&n|(n,single_orbital_gw(scf_data,&v_matrix,&ri_ov,&ri_mat,&w_c_at_freqs,n,num_freq,vxc_nn[n]))).collect();
-    let occ_shift=calc_orbs.clone().into_iter().filter(|(n,e_n)|*n<lumo).fold(0.0,|acc,(n,e_gw_n)| acc+(e_gw_n-scf_data.eigenvalues[0][n]))/((lumo-calc_orbs[0].0) as f64);
-    let vir_shift=calc_orbs.clone().into_iter().filter(|(n,e_n)|*n>homo).fold(0.0,|acc,(n,e_gw_n)| acc+(e_gw_n-scf_data.eigenvalues[0][n]))/((lumo-calc_orbs[0].0) as f64);
+    let occ_shift=calc_orbs[0].1-scf_data.eigenvalues[0][calc_orbs[0].0];
+    let vir_shift=calc_orbs[calc_orbs.len()-1].1-scf_data.eigenvalues[0][calc_orbs[calc_orbs.len()-1].0];
     let mut gwqp:Vec<f64>=Vec::new();
     if scf_data.mol.ctrl.print_level>1{
         println!("low extrapolations:{}",calc_orbs[0].0);
