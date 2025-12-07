@@ -41,6 +41,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>{
     let mut eigenvalues:Vec<f64>=Vec::new();
     let mut iter_num=0;
     loop{
+        let start=Instant::now();
         let restart=if ss.size[1]>qp_ctrl.davidson_maximum_subspace_size-qp_ctrl.davidson_add_dimensions{true}else{false};
         iter_num+=1;
         let m=ss.size[1];
@@ -93,24 +94,28 @@ where F1:Fn(&Vec<f64>)->Vec<f64>{
         let mut omega_x=MatrixFull::new([occ_vir,collect_sol_num],0.0);
         _dgemm_full(&x_full,'N',&eigenvalue_matrix,'N',&mut omega_x_full,1.0,0.0);
         residues=residues.scaled_add(&omega_x_full,-1.0).unwrap();println!("Now is iteration #{},current progress:",iter_num);
-        println!("Residues:");
+        if print_level>1{println!("Residues:");
         residues.iter_columns_full().enumerate().for_each(|(n,vec)|{
             if n<nroots{
                 println!("{}",vec.iter().map(|x|x.powf(2.0)).sum::<f64>().powf(0.5));
             }
-        });
+        });}
         let mut converge=true;
+        let mut converge_pairs=0;
         residues.iter_columns_full().enumerate().for_each(|(n,residue_i)|{
             if n<nroots{
                 let norm=residue_i.iter().fold(0.0,|acc,val|acc+val.powf(2.0));
                 if norm>1e-10{
                     converge=false;
+                }else{
+                    converge_pairs+=1;
                 }
             }
         });
         if converge{
             x_full.iter_columns_full().enumerate().for_each(|(n,vec)|if n<nroots{x_solutions.push_column(vec)});
             eigenvalues=omega[..nroots].to_vec();
+            println!("Davidson Solver has converged. This final round took {:?}",start.elapsed());
             break;
         }
         if !restart{residues.iter_columns_full().enumerate().for_each(|(i,residue_i)|{
@@ -160,6 +165,8 @@ where F1:Fn(&Vec<f64>)->Vec<f64>{
         if iter_num>qp_ctrl.davidson_max_iter{
             break;
         }
+        println!("Converged Pairs:{} out of the {} desired solutions",converge_pairs,nroots);
+        println!("This iteration took {:?}",start.elapsed());
     };
     let eigenvectors:Vec<_>=x_solutions.iter_columns_full().map(|v1|{
         let mut vec=v1.to_vec();
@@ -183,6 +190,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
     let mut eigenvalues:Vec<f64>=Vec::new();
     let mut iter_num=0;
     loop{
+        let start=Instant::now();
         iter_num+=1;
         let m=ss.size[1];
         let mut a_ss=MatrixFull::new([occ_vir,0],0.0);
@@ -316,21 +324,25 @@ where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
         left_residues=left_residues.scaled_add(&omega_xpy,-1.0).unwrap();
         right_residues=right_residues.scaled_add(&omega_xmy,-1.0).unwrap();
         println!("Now is iteration #{},current progress:",iter_num);
-        println!("Right residues:");
+        if print_level>1{println!("Right residues:");
         right_residues.iter_columns_full().for_each(|vec|{
             println!("{}",vec.iter().map(|x|x.powf(2.0)).sum::<f64>().powf(0.5));
         });
         println!("Left residues:");
         left_residues.iter_columns_full().for_each(|vec|{
             println!("{}",vec.iter().map(|x|x.powf(2.0)).sum::<f64>().powf(0.5));
-        });
+        });}
         //R_left=(A-B)(X-Y)-Omega(X+Y)
         //R_right=(A+B)(X+Y)-Omega(X-Y)
         let mut converge=true;
+        let mut left_converge_pair=0;
+        let mut right_converge_pair=0;
         left_residues.iter_columns_full().for_each(|residue|{
             let norm=residue.iter().fold(0.0,|acc,val|acc+val.powf(2.0));
             if norm>1e-10{
                 converge=false;
+            }else{
+                left_converge_pair+=1;
             }
         });
         if converge{
@@ -338,6 +350,8 @@ where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
                 let norm=residue.iter().fold(0.0,|acc,val|acc+val.powf(2.0));
                 if norm>1e-10{
                     converge=false;
+                }else{
+                    right_converge_pair+=1;
                 }
             });
         }
@@ -349,6 +363,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
             x_solutions.append_column(&x);
             y_solutions.append_column(&y);
             eigenvalues=omega;
+            println!("Davidson Solver has converged. This final iteration took {:?}",start.elapsed());
             break;
         }
         left_residues.iter_columns_full().enumerate().for_each(|(i,residue)|{
@@ -392,9 +407,13 @@ where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
         });
         if print_level>1{println!("Search Space:");
         ss.formated_output(1000,"full");}
-        if iter_num>20{
+        if iter_num>40{
+            println!("Warning: Davidson Solver did not converge after 40 iterations");
             break;
         }
+        println!("For Left Residues, {} out of the {} desired solutions have converged",left_converge_pair,nroots);
+        println!("For Right Residues, {} out of the {} desired solutions have converged",right_converge_pair,nroots);
+        println!("This iteration took {:?}",start.elapsed());
     }
     let eigenvectors:Vec<_>=x_solutions.iter_columns_full().zip(y_solutions.iter_columns_full()).map(|(v1,v2)|{
         let mut vec=v1.to_vec();

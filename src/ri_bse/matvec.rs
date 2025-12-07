@@ -100,7 +100,7 @@ pub fn w_contribution_a_block_dgemm(scf_data:&SCF,ri_vv:&MatrixFull<f64>,z_vec:&
 }
 pub fn w_contribution_b_block_dgemm(scf_data:&SCF,ri_ov:&MatrixFull<f64>,z_vec:&Vec<f64>,ri_ov_tilde:&MatrixFull<f64>)->Vec<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
-    let num_auxbas=ri_ov.size[0]/ri_ov.size[1];
+    let num_auxbas=ri_ov.size[0]/occ_size;
     let mut t_tensor=MatrixFull::new([num_auxbas*occ_size,occ_size],0.0);
     let z_mat=MatrixFull::from_vec([occ_size,vir_size],z_vec.clone()).unwrap();
     _dgemm_full(ri_ov,'N',&z_mat,'T',&mut t_tensor,1.0,0.0);
@@ -302,12 +302,12 @@ pub fn a_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_vv:&MatrixFull<f64
     }
     result
 }
-pub fn b_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_ov:&MatrixFull<f64>,ri_ov_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
+pub fn b_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_ov_a:&MatrixFull<f64>,ri_ov_b:&MatrixFull<f64>,ri_ov_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
     let xlet=if qp_ctrl.bse_spin=="triplet"{'T'}else{'S'};
     let mut result=vec![0.0;z_vec.len()];
-    result=w_contribution_b_block_dgemm(scf_data,ri_ov,z_vec,ri_ov_tilde).iter().zip(result.iter()).map(|(w_i,z_i)|-w_i+z_i).collect();
+    result=w_contribution_b_block_dgemm(scf_data,ri_ov_b,z_vec,ri_ov_tilde).iter().zip(result.iter()).map(|(w_i,z_i)|-w_i+z_i).collect();
     if xlet=='S'{
-        result=coulomb_contribution(ri_ov,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|2.0*v_i+z_i).collect();
+        result=coulomb_contribution(ri_ov_a,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|2.0*v_i+z_i).collect();
     }
     result
 }
