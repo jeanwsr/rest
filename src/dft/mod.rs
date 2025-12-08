@@ -524,7 +524,7 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos
             })
-        } else if tmp_name.eq("xdhpbe0") || tmp_name.eq("xdh-pbe0") {
+        } else if tmp_name.eq("xdh-pbe0") {
             // xDH-PBE0 functional
             // J. Chem. Phys. 136, 174103 (2012); https://doi.org/10.1063/1.3703893
             let dfa_family_pos = Some(DFAFamily::PT2);
@@ -745,6 +745,225 @@ impl DFA4REST {
                 dfa_compnt_pos,
                 dfa_paramr_pos,
                 dfa_hybrid_pos
+            })
+        } else if tmp_name.eq("b2plyp") {
+            // below are some popular B2PLYP-type DH functionals
+            // B2PLYP
+            // J. Chem. Phys. 2006, 124, 034108.
+            // KS part
+            let dfa_family_scf = DFAFamily::HybridGGA;
+            let scf_dfa = ["gga_x_b88", "gga_c_lyp"];
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![0.47, 0.73];
+            let dfa_hybrid_scf = 0.53;
+            // PT2 part
+            let dfa_family_pos = Some(DFAFamily::PT2);
+            let dfa_paramr_adv = Some(vec![0.27, 0.27]);
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(dfa_compnt_scf.clone());
+            let dfa_paramr_pos = Some(dfa_paramr_scf.clone());
+            let dfa_hybrid_pos = Some(dfa_hybrid_scf);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos,
+            })
+        } else if tmp_name.eq("b2gpplyp") {
+            // B2GP-PLYP
+            // J. Phys. Chem. A 2008, 112, 12868–12886.
+            // KS part
+            let dfa_family_scf = DFAFamily::HybridGGA;
+            let scf_dfa = ["gga_x_b88", "gga_c_lyp"];
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![0.35, 0.64];
+            let dfa_hybrid_scf = 0.65;
+            // PT2 part
+            let dfa_family_pos = Some(DFAFamily::PT2);
+            let dfa_paramr_adv = Some(vec![0.36, 0.36]);
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(dfa_compnt_scf.clone());
+            let dfa_paramr_pos = Some(dfa_paramr_scf.clone());
+            let dfa_hybrid_pos = Some(dfa_hybrid_scf);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos,
+            })
+        } else if tmp_name.eq("pbe-qidh") {
+            // PBE-QIDH
+            // J. Chem. Phys. 2014, 141, 031101.
+            let dfa_family_scf = DFAFamily::HybridGGA;
+            let scf_dfa = ["gga_x_pbe", "gga_c_pbe"];
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![0.306639, 0.666667];
+            let dfa_hybrid_scf = 0.693361;
+            // PT2 part
+            let dfa_family_pos = Some(DFAFamily::PT2);
+            let dfa_paramr_adv = Some(vec![0.333333, 0.333333]);
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(dfa_compnt_scf.clone());
+            let dfa_paramr_pos = Some(dfa_paramr_scf.clone());
+            let dfa_hybrid_pos = Some(dfa_hybrid_scf);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos,
+            })
+        } else if tmp_name.eq("pbe0dh") {
+            // PBE0-DH
+            // J. Chem. Phys. 2011, 135, 024106.
+            let dfa_family_scf = DFAFamily::HybridGGA;
+            let scf_dfa = ["gga_x_pbe", "gga_c_pbe"];
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![0.50, 0.875];
+            let dfa_hybrid_scf = 0.50;
+            // PT2 part
+            let dfa_family_pos = Some(DFAFamily::PT2);
+            let dfa_paramr_adv = Some(vec![0.125, 0.125]);
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(dfa_compnt_scf.clone());
+            let dfa_paramr_pos = Some(dfa_paramr_scf.clone());
+            let dfa_hybrid_pos = Some(dfa_hybrid_scf);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos,
+            })
+        } else if tmp_name.eq("dsdpbep86-nodisp") {
+            // DSD-PBEP86
+            // Phys. Chem. Chem. Phys. 2011,13, 20104-20107.
+            let dfa_family_scf = DFAFamily::HybridGGA;
+            let scf_dfa = ["gga_x_pbe", "gga_c_p86"];
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![0.28, 0.44];
+            let dfa_hybrid_scf = 0.72;
+            // PT2 part
+            let dfa_family_pos = Some(DFAFamily::PT2);
+            let dfa_paramr_adv = Some(vec![0.51, 0.36]);
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(dfa_compnt_scf.clone());
+            let dfa_paramr_pos = Some(dfa_paramr_scf.clone());
+            let dfa_hybrid_pos = Some(dfa_hybrid_scf);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos,
+            })
+        } else if tmp_name.eq("dsdpbep86") {
+            // DSD-PBEP86-D3BJ
+            // J. Comput. Chem. 2013, 34, 2327-2344.
+            let dfa_family_scf = DFAFamily::HybridGGA;
+            let scf_dfa = ["gga_x_pbe", "gga_c_p86"];
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![0.31, 0.44];
+            let dfa_hybrid_scf = 0.69;
+            // PT2 part
+            let dfa_family_pos = Some(DFAFamily::PT2);
+            let dfa_paramr_adv = Some(vec![0.52, 0.22]);
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(dfa_compnt_scf.clone());
+            let dfa_paramr_pos = Some(dfa_paramr_scf.clone());
+            let dfa_hybrid_pos = Some(dfa_hybrid_scf);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos,
+            })
+        } else if tmp_name.eq("dsdblyp") {
+            // DSD-BLYP-D3BJ
+            // J. Comput. Chem. 2013, 34, 2327-2344.
+            let dfa_family_scf = DFAFamily::HybridGGA;
+            let scf_dfa = ["gga_x_b88", "gga_c_lyp"];
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![0.29, 0.54];
+            let dfa_hybrid_scf = 0.71;
+            // PT2 part
+            let dfa_family_pos = Some(DFAFamily::PT2);
+            let dfa_paramr_adv = Some(vec![0.47, 0.40]);
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(dfa_compnt_scf.clone());
+            let dfa_paramr_pos = Some(dfa_paramr_scf.clone());
+            let dfa_hybrid_pos = Some(dfa_hybrid_scf);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos,
+            })
+        } else if tmp_name.eq("dsdpbep95") {
+            // DSD-PBEP95-D3BJ
+            // J. Comput. Chem. 2013, 34, 2327-2344.
+            let dfa_family_scf = DFAFamily::HybridGGA;
+            let scf_dfa = ["gga_x_pbe", "gga_c_p95"];
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![0.24, 0.55];
+            let dfa_hybrid_scf = 0.66;
+            // PT2 part
+            let dfa_family_pos = Some(DFAFamily::PT2);
+            let dfa_paramr_adv = Some(vec![0.46, 0.09]);
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(dfa_compnt_scf.clone());
+            let dfa_paramr_pos = Some(dfa_paramr_scf.clone());
+            let dfa_hybrid_pos = Some(dfa_hybrid_scf);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos,
             })
         } else {
             None

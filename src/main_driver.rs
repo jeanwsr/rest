@@ -335,7 +335,23 @@ pub fn output_result(scf_data: &scf_io::SCF) {
         scf_data.scf_energy);
     
     let xc_name = scf_data.mol.ctrl.xc.to_lowercase();
-    if xc_name.eq("mp2") || xc_name.eq("xyg3") || xc_name.eq("xygjos") || xc_name.eq("r-xdh7") || xc_name.eq("xyg7") || xc_name.eq("zrps") || xc_name.eq("scsrpa") {
+
+    if xc_name.eq("mp2") || xc_name.eq("scs-mp2") {
+        let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
+        println!("The MP2 total energy  : {:18.10} Ha", total_energy);
+    }
+
+    if xc_name.eq("b2plyp") || xc_name.eq("b2gpplyp") || xc_name.eq("pbe-qidh") || xc_name.eq("pbe0dh") {
+        let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
+        println!("The DH energy         : {:18.10} Ha", total_energy);
+    }
+    
+    if xc_name.eq("dsdpbep86-nodisp") || xc_name.eq("dsdpbep86") || xc_name.eq("dsdpbep95") || xc_name.eq("dsdblyp") {
+        let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
+        println!("The DSD-DH energy     : {:18.10} Ha", total_energy);
+    }
+
+    if xc_name.eq("xyg3") || xc_name.eq("xygjos") || xc_name.eq("xdh-pbe0") || xc_name.eq("r-xdh7") || xc_name.eq("xyg7") || xc_name.eq("zrps") || xc_name.eq("scsrpa") {
         let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
         //let post_ai_correction = scf_data.mol.ctrl.post_ai_correction.to_lowercase();
         //let ai_correction = if xc_name.eq("r-xdh7") && post_ai_correction.eq("scc15") {
@@ -352,6 +368,7 @@ pub fn output_result(scf_data: &scf_io::SCF) {
         };
         println!("The (R)-xDH energy    : {:18.10} Ha", total_energy+ ai_correction);
     }
+
     if xc_name.eq("rpa@pbe") {
         let total_energy = scf_data.energies.get("rpa_energy").unwrap()[0];
         println!("The RPA energy        : {:18.10} Ha", total_energy);
@@ -419,11 +436,34 @@ pub fn collect_total_energy(scf_data: &SCF) -> f64 {
     let mut total_energy = scf_data.scf_energy;
     
     let xc_name = scf_data.mol.ctrl.xc.to_lowercase();
-    if xc_name.eq("mp2") || xc_name.eq("xyg3") || xc_name.eq("xygjos") || xc_name.eq("r-xdh7") || xc_name.eq("xyg7") || xc_name.eq("zrps") || xc_name.eq("scsrpa") {
-        total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
-    } else if xc_name.eq("rpa@pbe") {
-        total_energy = scf_data.energies.get("rpa_energy").unwrap()[0];
-    }
+    // if xc_name.eq("mp2") || xc_name.eq("xyg3") || xc_name.eq("xygjos") || xc_name.eq("r-xdh7") || xc_name.eq("xyg7") || xc_name.eq("zrps") || xc_name.eq("scsrpa") {
+    //     total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
+    // } else if xc_name.eq("rpa@pbe") {
+    //     total_energy = scf_data.energies.get("rpa_energy").unwrap()[0];
+    // }
+
+    total_energy = match xc_name.as_str() {
+        "mp2" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "scs-mp2" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "b2plyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "b2gpplyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "pbe-qidh" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "pbe0dh" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "dsdpbep86-nodisp" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "dsdpbep86" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "dsdpbep95" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "dsdblyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "xyg7" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "xdh-pbe0" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "r-xdh7" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "zrps" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "scsrpa" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "rpa@pbe" => scf_data.energies.get("rpa_energy").unwrap()[0],
+        _ => scf_data.scf_energy,
+    };
+
     if let Some(post_ai_correction) = scf_data.energies.get("ai_correction") {
         total_energy += post_ai_correction[0]
     };
