@@ -129,7 +129,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>{
             if orthogonalized_norm>1e-8{
                 preconditioned=num_product(&preconditioned,1.0/orthogonalized_norm);
                 ss.push_column(&preconditioned);
-                println!("A new search vector has been added. Search space now has {} vectors",ss.size[1]);
+                if print_level>1{println!("A new search vector has been added. Search space now has {} vectors",ss.size[1]);}
             }
         });}else{
             println!("Explicit Restart");
@@ -151,7 +151,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>{
                 if orthogonalized_norm>1e-8{
                     preconditioned=num_product(&preconditioned,1.0/orthogonalized_norm);
                     ss.push_column(&preconditioned);
-                    println!("A new search vector has been added. Search space now has {} vectors",ss.size[1]);
+                    if print_level>1{println!("A new search vector has been added. Search space now has {} vectors",ss.size[1]);}
                 }
             });
         }
@@ -367,7 +367,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
             if orthogonalized_norm>1e-8{
                 preconditioned=num_product(&preconditioned,1.0/orthogonalized_norm);
                 ss.push_column(&preconditioned);
-                println!("A new search vector has been added. Search space now has {} vectors",ss.size[1]);
+                if print_level>1{println!("A new search vector has been added. Search space now has {} vectors",ss.size[1]);}
             }
         });
         right_residues.iter_columns_full().enumerate().for_each(|(i,residue)|{
@@ -387,7 +387,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
             if orthogonalized_norm>1e-8{
                 preconditioned=num_product(&preconditioned,1.0/orthogonalized_norm);
                 ss.push_column(&preconditioned);
-                println!("A new search vector has been added. Search space now has {} vectors",ss.size[1]);
+                if print_level>1{println!("A new search vector has been added. Search space now has {} vectors",ss.size[1]);}
             }
         });
         if print_level>1{println!("Search Space:");
