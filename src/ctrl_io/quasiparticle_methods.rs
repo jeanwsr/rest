@@ -30,6 +30,7 @@ pub struct QuasiParticle {
     pub w_rs:bool,
     pub scgw:String,
     pub gw:bool,
+    pub bse_exchange_rescaling:f64,
     pub save_bse_excitations:bool,
     pub evgw_rounds:usize,
     pub save_gw_homo_lumo_qp:bool,
@@ -42,8 +43,10 @@ pub struct QuasiParticle {
     pub gw_or_bse:String,
     pub gw_span_energy:f64,
     pub gw_search_grid:usize,
+    pub bse_max_ang_momentum:usize,
     pub gw_rootfinder:String,
-    pub simplified_bse:bool
+    pub simplified_bse:bool,
+    pub pysoc:bool
 }
 
 impl Default for QuasiParticle {
@@ -84,9 +87,12 @@ impl Default for QuasiParticle {
             threshold:0.1,
             gw_or_bse:String::new(),
             gw_span_energy:0.2,
+            bse_exchange_rescaling:1.0,
             gw_search_grid:51,
             gw_rootfinder:"newton".to_string(),
-            simplified_bse:false
+            simplified_bse:false,
+            bse_max_ang_momentum:10,
+            pysoc:false
         }
     }
 }
@@ -133,6 +139,9 @@ impl QuasiParticle {
         table.insert("gw_or_bse".to_string(), toml::Value::String(self.gw_or_bse.clone()));
         table.insert("gw_search_grid".to_string(), toml::Value::Integer(self.gw_search_grid as i64));
         table.insert("simplified_bse".to_string(), toml::Value::Boolean(self.simplified_bse));
+        table.insert("pysoc".to_string(), toml::Value::Boolean(self.pysoc));
+        table.insert("bse_exchange_rescaling".to_string(), toml::Value::Float(self.bse_exchange_rescaling));
+        table.insert("bse_max_ang_momentum".to_string(), toml::Value::Integer(self.bse_max_ang_momentum as i64));
         toml::Value::Table(table)
     }
 }
@@ -173,6 +182,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.5_f64)},
                 other => {1000000.0},
             };
+            tmp_input.bse_exchange_rescaling = match tmp_ctrl.get("bse_exchange_rescaling").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0_f64)},
+                other => {1.0},
+            };
             tmp_input.davidson_converge_threshold = match tmp_ctrl.get("davidson_converge_threshold").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-6_f64)},
                 other => {1e-6},
@@ -210,6 +223,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 other => {false},
             };
             tmp_input.obtain_vx_vc_terms = match tmp_ctrl.get("obtain_vx_vc_terms").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.pysoc = match tmp_ctrl.get("pysoc").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };
@@ -259,10 +276,15 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(4) as usize},
                 other => {0}
             };
+            tmp_input.bse_max_ang_momentum = match tmp_ctrl.get("bse_max_ang_momentum").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(10_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(10) as usize},
+                other => {10}
+            };
             tmp_input.gw_search_grid = match tmp_ctrl.get("gw_search_grid").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(4_usize)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(4) as usize},
-                other => {0}
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(21_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(21) as usize},
+                other => {21}
             };
             tmp_input.save_gw_homo_lumo_qp = match tmp_ctrl.get("save_gw_homo_lumo_qp").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
