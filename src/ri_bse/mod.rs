@@ -38,7 +38,7 @@ pub fn bse_main(scf_data:&mut SCF){
             println!("First {} Singlet Excitations:",number);
             excitations_singlets[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
                 let v=dipoles::normalize(vec,true);
-                println!("{}th Excitation energy={}",n,e);
+                println!("#{} Excitation energy={}",n,e);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
                 leading_components(&v,occ_size,vir_size)});
@@ -46,7 +46,7 @@ pub fn bse_main(scf_data:&mut SCF){
             println!("First {} Triplet Excitations:",number);
             excitations_triplets[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
                 let v=dipoles::normalize(vec,true);
-                println!("{}th Excitation energy={}",n,e);
+                println!("#{} Excitation energy={}",n,e);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
                 leading_components(&v,occ_size,vir_size)});
@@ -56,13 +56,10 @@ pub fn bse_main(scf_data:&mut SCF){
             }
         }else{
             println!("BSE Calculation Results of Both Singlets and Triplets without TDA:");
-            let mid = excitations_singlets.len() / 2;
-            excitations_singlets=excitations_singlets[mid..].to_vec();
-            excitations_triplets=excitations_triplets[mid..].to_vec();
             let number=excitations_singlets.len();
             println!("First {} Singlet Excitations:",number);
             excitations_singlets[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
-                println!("{}th Excitation energy={}",n,e);
+                println!("#{} Excitation energy={}",n,e);
                 let v=dipoles::normalize(vec,false);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,false);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
@@ -71,7 +68,7 @@ pub fn bse_main(scf_data:&mut SCF){
             println!("The first singlet excitation obtained by BSE is {}",excitations_singlets[0].0);
             println!("First {} Triplet Excitations:",number);
             excitations_triplets[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
-                println!("{}th Excitation energy={}",n,e);
+                println!("#{} Excitation energy={}",n,e);
                 let v=dipoles::normalize(vec,false);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,false);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
@@ -134,7 +131,7 @@ pub fn bse_main(scf_data:&mut SCF){
             println!("First {} excitations:",number);
             excitations[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
             let v=dipoles::normalize(vec,true);
-            println!("{}th Excitation energy={}",n,e);
+            println!("#{} Excitation energy={}",n,e);
             let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
             println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
             leading_components(&v,occ_size,vir_size)});
@@ -154,16 +151,18 @@ pub fn bse_main(scf_data:&mut SCF){
             if scf_data.mol.ctrl.print_level>2{
                 show_all_eigenpairs(&excitations);
             }
-            let mid = excitations.len() / 2;
-            excitations=excitations[mid..].to_vec();
+            if qp_ctrl.bse_davidson_solver==false{
+                let mid = excitations.len() / 2;
+                excitations=excitations[mid..].to_vec();
+            }
             let number=excitations.len().min(30);
             println!("First {} excitations:",number);
-            excitations[0..number].iter().enumerate().for_each(|(n,(e,vec))|{println!("{}th Excitation energy={}",n,e);
+            excitations[0..number].iter().enumerate().for_each(|(n,(e,vec))|{println!("#{} Excitation energy={}",n,e);
             let v=dipoles::normalize(vec,false);
             let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,false);
             println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
             leading_components(&v,occ_size,vir_size)});
-            println!("The first excitation obtained by BSE is {}",excitations[0].0);
+            println!("\n\nThe first excitation obtained by BSE is {}",excitations[0].0);
             if qp_ctrl.save_bse_excitations==true{
                 let line = excitations.iter().map(|(num,vec)| num.to_string()).collect::<Vec<_>>().join(",");
                 let mut file = OpenOptions::new().append(true).create(true).open("bse_excitations.txt");
@@ -183,7 +182,7 @@ pub fn bse_main(scf_data:&mut SCF){
             println!("First {} excitations:",number);
             excitations[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
                 let v=dipoles::normalize(vec,true);
-                println!("{}th Excitation energy={}",n,e);
+                println!("#{} Excitation energy={}",n,e);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
                 println!("\tTransition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
                 leading_components(&v,occ_size,vir_size)});
