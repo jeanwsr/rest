@@ -433,8 +433,8 @@ impl Molecule {
             (Vec<Basis4Elem>, Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>, Vec<BasInfo>, Vec<Vec<usize>>, usize) {
 
         let mut aux_atm: Vec<Vec<i32>> = vec![];
-        let mut aux_env: Vec<f64> = vec![];
-        let mut geom_start: i32 = 0;
+        let mut aux_env: Vec<f64> = vec![0.0; ENV_PRT_START as usize];
+        let mut geom_start: i32 = ENV_PRT_START as i32;
         let cint_type = if ctrl.basis_type.to_lowercase()==String::from("spheric") {
             CintType::Spheric
         } else if ctrl.basis_type.to_lowercase()==String::from("cartesian") {
@@ -3137,14 +3137,12 @@ impl Molecule {
     /// - `p0`: start AO (number of basis functions)
     /// - `p1`: end AO (number of basis functions)
     pub fn aoslice_by_atom(&self) -> Vec<[usize; 4]> {
-        use rest_libcint::cint;
-
-        let atom_of = cint::ATOM_OF as usize;
+        const ATOM_OF: usize = rest_libcint::ffi::cint_ffi::ATOM_OF as usize;
 
         let cint_data = self.initialize_cint(false);
         let cint_bas = self.cint_bas.clone();
 
-        let ao_loc = cint_data.cgto_loc();
+        let ao_loc = cint_data.ao_loc();
         let natm = self.geom.elem.len();
         let nbas = cint_bas.len();
         let mut aoslice = vec![[0; 4]; natm];
@@ -3152,7 +3150,7 @@ impl Molecule {
         // the following code should assume that atoms in `cint_bas` has been sorted by atom index
         let delimiter = (0..(nbas - 1))
             .into_iter()
-            .filter(|&idx| cint_bas[idx + 1][atom_of] != cint_bas[idx][atom_of])
+            .filter(|&idx| cint_bas[idx + 1][ATOM_OF] != cint_bas[idx][ATOM_OF])
             .collect::<Vec<usize>>();
         if delimiter.len() != natm - 1 {
             unimplemented!("Missing basis in atoms. Currently it should be internal problem in program.");
