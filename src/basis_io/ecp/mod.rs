@@ -2,7 +2,8 @@ use std::{fs, path::PathBuf};
 
 use hdf5::file;
 use pyo3::{pyclass, pymethods};
-use rest_libcint::{prelude::ECPscalar, CintType, CINTR2CDATA};
+use rest_libcint::{CintType, CINTR2CDATA};
+use rest_libcint::prelude::rest_libcint_wrapper::ECPscalar;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tensors::{MatrixFull, MatrixUpper};

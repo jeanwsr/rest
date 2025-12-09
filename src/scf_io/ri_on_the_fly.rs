@@ -3,6 +3,7 @@ use crate::utilities::memory_batch::*;
 use crate::utilities::rstsr_util::*;
 use rayon::prelude::*;
 use rest_libcint::prelude::*;
+use rest_libcint_wrapper::*;
 use rstsr::prelude::*;
 use rstsr_core::prelude_dev::uninitialized_vec;
 use tensors::{MatrixFull, MatrixUpper};
