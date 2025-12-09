@@ -1172,6 +1172,7 @@ impl Molecule {
     }
 
     pub fn int_ij_matrixupper_v02(&self, op_name: String) -> MatrixUpper<f64> {
+        use rest_libcint_wrapper::*;
         let mut cint_data = self.initialize_cint(false);
         //let mut cur_op = op_name.to_string();
         let mut out = vec![]; 
@@ -1774,6 +1775,7 @@ impl Molecule {
     }
 
     pub fn int_ij_aux_columb_new(&self) -> MatrixFull<f64> {
+        use rest_libcint_wrapper::*;
         omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
         let n_auxbas = self.num_auxbas;
         let mut cint_data = self.initialize_cint(true);
@@ -3022,6 +3024,7 @@ impl Molecule {
 
     // generate the 3-center RI integrals and the basis pair symmetry is used to save the memory
     pub fn prepare_rimatr_for_ri_v_rayon_v05(&self) -> (MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>) {
+        use rest_libcint_wrapper::*;
 
         omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
 

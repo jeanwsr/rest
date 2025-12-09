@@ -7,7 +7,7 @@ pub mod rrs_pbc;
 pub mod spin_correction;
 
 use std::path::Path;
-use rest_libcint::prelude::int1e_r;
+use rest_libcint::prelude::rest_libcint_wrapper::int1e_r;
 use tensors::{MathMatrix, MatrixFull, RIFull};
 
 use crate::constants::{ANG, AU2DEBYE, SPECIES_INFO};

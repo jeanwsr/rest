@@ -1,7 +1,7 @@
 use crate::scf_io::{SCF, SCFType};
 use crate::mpi_io::MPIOperator;
 use std::path::Path;
-use rest_libcint::prelude::int1e_r;
+use rest_libcint::prelude::rest_libcint_wrapper::int1e_r;
 use tensors::{MathMatrix, MatrixFull, RIFull,MatrixFullSlice};
 use crate::constants::{ANG, AU2DEBYE, SPECIES_INFO};
 use itertools::Itertools;

@@ -25,6 +25,7 @@ impl ExtField<f64> {
 
     /// Contribution to 2c integral
     pub fn contribution_2c(self, mol: &Molecule) -> MatrixFull<f64> {
+        use rest_libcint_wrapper::*;
         // handle dipole
         let nao = mol.num_basis;
         let mut cint = mol.initialize_cint(false);

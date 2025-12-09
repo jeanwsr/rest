@@ -7,6 +7,7 @@ use crate::Molecule;
 use crate::utilities::memory_batch::*;
 use rayon::prelude::*;
 use rest_libcint::prelude::*;
+use rest_libcint_wrapper::*;
 use rstsr::prelude::*;
 use std::collections::HashMap;
 use tensors::{matrix_blas_lapack::_power_rayon_for_symmetric_matrix, MatrixFull};

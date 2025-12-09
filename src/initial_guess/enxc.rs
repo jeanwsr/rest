@@ -10,7 +10,7 @@ use pyo3::pyclass;
 
 use crate::{molecule_io::Molecule, scf_io::SCF};
 use crate::constants::{ATM_NUC_MOD_OF, NUC_ECP, SPECIES_INFO};
-use rest_libcint::prelude::ECPscalar;
+use rest_libcint::prelude::rest_libcint_wrapper::ECPscalar;
 use crate::basis_io::ecp::{PotCell, PotCellRaw};
 
 
