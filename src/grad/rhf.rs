@@ -217,7 +217,7 @@ impl RIRHFGradient<'_> {
         };
 
         // shell partition of int3c2e
-        let ao_loc = cint_data.cgto_loc();
+        let ao_loc = cint_data.ao_loc();
         let aux_loc = &ao_loc[(n_basis_shell as usize)..];
 
         // available memory in MB, if not set, will be calculated from system
