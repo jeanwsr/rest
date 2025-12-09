@@ -223,17 +223,11 @@ pub fn get_submatrix(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:c
     }else if choice_a=='F'&&choice_b=='F'{
         vector=scf_data.ri3mo_full.clone().unwrap();
     }else if choice_a=='O'&&choice_b=='O'{
-        let mut scf_clone=scf_data.clone();
-        scf_clone.generate_ri3mo_rayon(range_oo.0,range_oo.1);
-        vector=scf_clone.ri3mo.clone().unwrap();
+        vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_oo.0,range_oo.1);
     }else if choice_a=='V'&&choice_b=='V'{
-        let mut scf_clone=scf_data.clone();
-        scf_clone.generate_ri3mo_rayon(range_vv.0,range_vv.1);
-        vector=scf_clone.ri3mo.clone().unwrap();
+        vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_vv.0,range_vv.1);
     }else if choice_a=='O'&&choice_b=='V'&&response_or_not=='N'{
-        let mut scf_clone=scf_data.clone();
-        scf_clone.generate_ri3mo_rayon(range_ov.0,range_ov.1);
-        vector=scf_clone.ri3mo.clone().unwrap();
+        vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_ov.0,range_ov.1);
     }else {
         panic!("invalid choice of ri subspace!")
     };

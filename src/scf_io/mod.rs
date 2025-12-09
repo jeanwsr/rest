@@ -3091,6 +3091,29 @@ impl SCF {
         self.rimatr = None;
         self.ri3mo = Some(ri3mo);
     }
+    pub fn generate_ri3mo_rayon_for_multiple_times(&self, row_range: std::ops::Range<usize>, col_range: std::ops::Range<usize>)->Vec<(RIFull<f64>,std::ops::Range<usize>,std::ops::Range<usize>)> {
+
+        let (mut ri3ao, mut basbas2baspair, mut baspar2basbas) =  if let Some((riao,basbas2baspair, baspar2basbas))=&self.rimatr {
+            (riao,basbas2baspair, baspar2basbas)
+        } else {
+            panic!("rimatr should be initialized in the preparation of ri3mo");
+        };
+        let mut ri3mo: Vec<(RIFull<f64>,std::ops::Range<usize>, std::ops::Range<usize>)> = vec![];
+        for i_spin in 0..self.mol.spin_channel {
+            let eigenvector = match self.scftype {
+                SCFType::ROHF => &self.semi_eigenvectors.as_ref().unwrap()[i_spin],
+                _ => &self.eigenvectors[i_spin],
+            };
+            ri3mo.push(
+                ao2mo_rayon(
+                    eigenvector, ri3ao, 
+                    row_range.clone(), 
+                    col_range.clone()
+                ).unwrap()
+            )
+        }
+        ri3mo
+    }
     pub fn generate_ri3mo_full_rayon(&mut self, row_range: std::ops::Range<usize>, col_range: std::ops::Range<usize>) {
         let (mut ri3ao, mut basbas2baspair, mut baspar2basbas) =  if let Some((riao,basbas2baspair, baspar2basbas))=&mut self.rimatr {
             (riao,basbas2baspair, baspar2basbas)
