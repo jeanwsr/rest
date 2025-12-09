@@ -26,7 +26,7 @@ pub fn obtain_ao_dips(scf_data:&SCF,orig:Option<[f64;3]>)->RIFull<f64>{
     } else {
         p_orig.clone()
     };
-    cint_data.set_common_origin(&r_orig);
+    cint_data.set_common_origin(r_orig);
     let (out, out_shape)= cint_data.integral_s1::<int1e_r>(None);
     RIFull::from_vec(out_shape.try_into().unwrap(), out).unwrap()
 }

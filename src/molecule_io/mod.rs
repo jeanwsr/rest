@@ -391,7 +391,7 @@ impl Molecule {
             let natm = final_cint_atm.len() as i32;
             let nbas = final_cint_bas.len() as i32;
             let mut cint_data = CINTR2CDATA::new();
-            cint_data.set_cint_type(&self.cint_type);
+            cint_data.set_cint_type(self.cint_type);
             if let Some(final_cint_ecp) = &self.cint_ecpbas {
                 let necp = final_cint_ecp.len() as i32;
                 cint_data.initial_r2c_with_ecp(&final_cint_atm, natm, &final_cint_bas, nbas, &final_cint_ecp, necp, &final_cint_env);
@@ -406,7 +406,7 @@ impl Molecule {
             let natm = final_cint_atm.len() as i32;
             let nbas = final_cint_bas.len() as i32;
             let mut cint_data = CINTR2CDATA::new();
-            cint_data.set_cint_type(&self.cint_type);
+            cint_data.set_cint_type(self.cint_type);
             if let Some(final_cint_ecp) = &self.cint_ecpbas {
                 let necp = final_cint_ecp.len() as i32;
                 cint_data.initial_r2c_with_ecp(final_cint_atm, natm, final_cint_bas, nbas, final_cint_ecp, necp, final_cint_env);
@@ -1200,7 +1200,7 @@ impl Molecule {
             self.geom.ghost_pc_chrg.iter().zip(self.geom.ghost_pc_pos.iter_columns_full()).for_each(|(charge, pos)| {
                 let mut tmp_out = vec![];
                 let mut tmp_out_shape = vec![];
-                cint_data.set_rinv_origin(pos);
+                cint_data.set_rinv_origin([pos[0], pos[1], pos[2]]);
                 (tmp_out, tmp_out_shape) = cint_data.integral_s2ij::<int1e_rinv>(None);
                 //println!("debug pos: {:?}, charge: {}", pos, charge);
                 if out.len() == 0 {
@@ -1211,7 +1211,7 @@ impl Molecule {
                 });
             });
 
-            cint_data.set_rinv_origin(&orig_orig);
+            cint_data.set_rinv_origin(orig_orig);
         } else if op_name.eq("hcore") {
             // for the kinetic term
             (out, out_shape) = cint_data.integral_s2ij::<int1e_kin>(None);
