@@ -540,7 +540,7 @@ pub fn evaluate_dipole_moment(scf_data: &SCF, orig: Option<[f64;3]>) -> [f64;3] 
     } else {
         p_orig.clone()
     };
-    cint_data.set_common_origin(&r_orig);
+    cint_data.set_common_origin(r_orig);
 
     let (out, out_shape)= cint_data.integral_s1::<int1e_r>(None);
     //let mut out_shape_1 = [0;3];
@@ -557,7 +557,7 @@ pub fn evaluate_dipole_moment(scf_data: &SCF, orig: Option<[f64;3]>) -> [f64;3] 
         });
     }
 
-    cint_data.set_common_origin(&p_orig);
+    cint_data.set_common_origin(p_orig);
 
     //nucl_dip.iter().zip(el_dip.iter()).map(|(nucl, el)| (*nucl - *el)*AU2DEBYE).collect::<Vec<f64>>()
 

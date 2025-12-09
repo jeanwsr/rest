@@ -427,7 +427,7 @@ impl BasCell {
             let mut cint_data = CINTR2CDATA::new();
             let natm = atm.len() as i32;
             let nbas = bas.len() as i32;
-            let (ang,n_len) = match &cint_type {
+            let (ang,n_len) = match cint_type {
                 CintType::Cartesian => {let ang = tmp_ang as usize; (ang,(ang+1)*(ang+2)/2)},
                 CintType::Spheric => {let ang = tmp_ang as usize; (ang, ang*2+1)},
                 _ => panic!("The angular momentum is missing for the basis set : {:?}", &self)
@@ -435,7 +435,7 @@ impl BasCell {
             //let n_len = (tmp_ang*2+1) as usize;
             cint_data.initial_r2c(&atm, natm, &bas, nbas, &env);
             //cint_data.set_cint_type(CintType::Spheric);
-            cint_data.set_cint_type(&cint_type);
+            cint_data.set_cint_type(*cint_type);
             cint_data.cint1e_ovlp_optimizer_rust();
             let num_bas = self.coefficients.len();
             let num_pri = self.exponents.len();
