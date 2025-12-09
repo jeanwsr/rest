@@ -6,6 +6,8 @@ use crate::scf_io::{SCF, SCFType};
 use crate::ri_bse::get_occupation_parameters;
 use std::cmp;
 use crate::ri_bse;
+use rayon::prelude::*;
+use rayon::iter::ParallelBridge;
 use itertools::Itertools;
 use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
 
@@ -32,7 +34,7 @@ pub fn generate_initial_guess(diag:&Vec<f64>,nroots_ctrl:usize)->MatrixFull<f64>
     initial_guess
 }
 pub fn tda_davidson_solver<F1>(print_level:usize,a_matvec:F1,nroots:usize,diag:&Vec<f64>,initial_guess:MatrixFull<f64>,qp_ctrl:&QuasiParticle)->Vec<(f64,Vec<f64>)>
-where F1:Fn(&Vec<f64>)->Vec<f64>{
+where F1:Fn(&Vec<f64>)->Vec<f64>+Send+Sync{
     let mut ss=initial_guess;
     //ss:search space S, where each column in S is a search vector
     let occ_vir=diag.len();
@@ -47,11 +49,18 @@ where F1:Fn(&Vec<f64>)->Vec<f64>{
         let m=ss.size[1];
         let mut a_ss=MatrixFull::new([occ_vir,0],0.0);
         //a_ss:AS
-        ss.iter_columns_full().for_each(|ss_i|{
-            let z=ss_i.to_vec();
-            let a_z=a_matvec(&z);
-            a_ss.push_column(&a_z);
-        });
+        let mut results: Vec<(usize,Vec<f64>)> = ss.iter_columns_full()
+            .enumerate().par_bridge()  // 将普通迭代器转换为并行迭代器
+            .map(|(i,ss_i)| {
+                let z = ss_i.to_vec();
+                (i,a_matvec(&z))  // 直接返回结果向量
+            })
+            .collect();
+        // 按顺序推入结果
+        results.sort_by_key(|(i, _)| *i);
+        for result in results {
+            a_ss.push_column(&result.1);
+        }
         if print_level>1{
             println!("m={}",m);
         }
@@ -79,11 +88,18 @@ where F1:Fn(&Vec<f64>)->Vec<f64>{
         _dgemm_full(&ss,'N',&x_proj_nroots,'N',&mut x_full,1.0,0.0);
         //xmy_full,xpy_full:Real X+Y and X-Y spanned in MO-pair basis
         let mut ax_full=MatrixFull::new([occ_vir,0],0.0);
-        x_full.iter_columns_full().for_each(|x_i|{
-            let z=x_i.to_vec();
-            let ax_i=a_matvec(&z);
-            ax_full.push_column(&ax_i);
-        });
+        let mut results: Vec<(usize,Vec<f64>)> = x_full.iter_columns_full()
+            .enumerate().par_bridge()  // 将普通迭代器转换为并行迭代器
+            .map(|(i,x_i)| {
+                let z = x_i.to_vec();
+                (i,a_matvec(&z))  // 直接返回结果向量
+            })
+            .collect();
+        // 按顺序推入结果
+        results.sort_by_key(|(i, _)| *i);
+        for result in results {
+            ax_full.push_column(&result.1);
+        }
         let mut residues=ax_full;
         let mut eigenvalue_matrix=MatrixFull::new([collect_sol_num,collect_sol_num],0.0);
         (0..collect_sol_num).for_each(|i|eigenvalue_matrix[[i,i]]=omega[i]);
@@ -180,7 +196,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>{
 
 
 pub fn lr_davidson_solver<F1,F2>(print_level:usize,a_matvec:F1,b_matvec:F2,nroots:usize,diag:&Vec<f64>,initial_guess:MatrixFull<f64>)->Vec<(f64,Vec<f64>)>
-where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
+where F1:Fn(&Vec<f64>)->Vec<f64>+ Send + Sync,F2:Fn(&Vec<f64>)->Vec<f64>+ Send + Sync{
     let mut ss=initial_guess;
     //ss:search space S, where each column in S is a search vector
     let occ_vir=diag.len();
@@ -195,11 +211,18 @@ where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
         let m=ss.size[1];
         let mut a_ss=MatrixFull::new([occ_vir,0],0.0);
         //a_ss:AS
-        ss.iter_columns_full().for_each(|ss_i|{
-            let z=ss_i.to_vec();
-            let a_z=a_matvec(&z);
-            a_ss.push_column(&a_z);
-        });
+        let mut results: Vec<(usize,Vec<f64>)> = ss.iter_columns_full()
+            .enumerate().par_bridge()  // 将普通迭代器转换为并行迭代器
+            .map(|(i,ss_i)| {
+                let z = ss_i.to_vec();
+                (i,a_matvec(&z))  // 直接返回结果向量
+            })
+            .collect();
+        // 按顺序推入结果
+        results.sort_by_key(|(i, _)| *i);
+        for result in results {
+            a_ss.push_column(&result.1);
+        }
         if print_level>1{
             println!("m={}",m);
         }
@@ -211,11 +234,18 @@ where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
         drop(a_ss);
         let mut b_ss=MatrixFull::new([occ_vir,0],0.0);
         //b_ss:BS
-        ss.iter_columns_full().for_each(|ss_i|{
-            let z=ss_i.to_vec();
-            let b_z=b_matvec(&z);
-            b_ss.push_column(&b_z);
-        });
+        let mut results: Vec<(usize,Vec<f64>)> = ss.iter_columns_full()
+            .enumerate().par_bridge()  // 将普通迭代器转换为并行迭代器
+            .map(|(i,ss_i)| {
+                let z = ss_i.to_vec();
+                (i,b_matvec(&z))  // 直接返回结果向量
+            })
+            .collect();
+        // 按顺序推入结果
+        results.sort_by_key(|(i, _)| *i);
+        for result in results {
+            b_ss.push_column(&result.1);
+        }
         let mut ss_t_b_ss=MatrixFull::new([m,m],0.0);
         //ss_t_b_ss:projection matrix of b
         _dgemm_full(&ss,'T',&b_ss,'N',&mut ss_t_b_ss,1.0,0.0);
@@ -246,11 +276,13 @@ where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
         //ginv_xpy:G^{-1}(X+Y),eigenvectors of G^T(A-B)G,denoted as u in some literature,omega2:square of desired excitation energies
         let mut ginv_xpy_positives=MatrixFull::new([m,0],0.0);
         let mut omega2_positives:Vec<f64>=Vec::new();
+        let mut push_count=0;
         if print_level>1{println!("omega square={:#?}",omega2);}
         omega2.iter().zip(ginv_xpy.iter_columns_full()).enumerate().for_each(|(n,(omega2_i,ginv_xpy))|if *omega2_i>0.0{
-            if n<nroots && *omega2_i>0.0{
+            if push_count<nroots && *omega2_i>0.0{
                 omega2_positives.push(*omega2_i);
                 ginv_xpy_positives.push_column(ginv_xpy);
+                push_count+=1;
             }
         });
         omega2_positives.iter().take(nroots).collect::<Vec<_>>();
@@ -290,23 +322,35 @@ where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
         //xmy_full,xpy_full:Real X+Y and X-Y spanned in MO-pair basis
         let mut axmy=MatrixFull::new([occ_vir,0],0.0);
         let mut bxmy=MatrixFull::new([occ_vir,0],0.0);
-        xmy_full.iter_columns_full().for_each(|xmy_i|{
-            let z=xmy_i.to_vec();
-            let axmy_i=a_matvec(&z);
-            axmy.push_column(&axmy_i);
-            let bxmy_i=b_matvec(&z);
-            bxmy.push_column(&bxmy_i);
-        });
+        let mut results: Vec<(usize,Vec<f64>,Vec<f64>)> = xmy_full.iter_columns_full()
+            .enumerate().par_bridge()  // 将普通迭代器转换为并行迭代器
+            .map(|(i,xmy_i)| {
+                let z=xmy_i.to_vec();
+                (i,a_matvec(&z),b_matvec(&z))  // 直接返回结果向量
+            })
+            .collect();
+        // 按顺序推入结果
+        results.sort_by_key(|(i, _,_)| *i);
+        for result in results {
+            axmy.push_column(&result.1);
+            bxmy.push_column(&result.2);
+        }
         let ambxmy=axmy.scaled_add(&bxmy,-1.0).unwrap();
         let mut axpy=MatrixFull::new([occ_vir,0],0.0);
         let mut bxpy=MatrixFull::new([occ_vir,0],0.0);
-        xpy_full.iter_columns_full().for_each(|xpy_i|{
-            let z=xpy_i.to_vec();
-            let axpy_i=a_matvec(&z);
-            axpy.push_column(&axpy_i);
-            let bxpy_i=b_matvec(&z);
-            bxpy.push_column(&bxpy_i);
-        });
+        let mut results: Vec<(usize,Vec<f64>,Vec<f64>)> = xpy_full.iter_columns_full()
+            .enumerate().par_bridge()  // 将普通迭代器转换为并行迭代器
+            .map(|(i,xpy_i)| {
+                let z=xpy_i.to_vec();
+                (i,a_matvec(&z),b_matvec(&z))  // 直接返回结果向量
+            })
+            .collect();
+        // 按顺序推入结果
+        results.sort_by_key(|(i, _,_)| *i);
+        for result in results {
+            axpy.push_column(&result.1);
+            bxpy.push_column(&result.2);
+        }
         let apbxpy=axpy.scaled_add(&bxpy,1.0).unwrap();
         //ambxmy,apbxpy:(A+B)(X+Y) and (A-B)(X-Y)
         //They are used to evaluate residues:(A+B)(X+Y)-omega(X-Y) and (A-B)(X-Y)-omega(X+Y)
@@ -367,7 +411,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
             break;
         }
         left_residues.iter_columns_full().enumerate().for_each(|(i,residue)|{
-            let mut preconditioned=residue.iter().enumerate().map(|(j,v_k)|v_k/(omega[i]-diag[j])).collect();
+            let mut preconditioned=residue.iter().enumerate().map(|(k,v_k)|v_k/(omega[i]-diag[k])).collect();
             //preconditioned:preconditioned vector:
             //(X-Y)=(omega-diag)
             if print_level>1{println!("Un-orthogonalized to add:{:#?}",preconditioned);}
@@ -377,17 +421,16 @@ where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
                 if print_level>1{println!("projection={}",projection_product);}
                 preconditioned=vector_scaled_add(&preconditioned,1.0,&subspace_vec,-projection_product);
             });
-            let orthogonalized_norm=dot_product(&preconditioned,&preconditioned).powf(0.5);
-            //if print_level>1{println!("Before normalization:{:#?},norm={}",preconditioned,orthogonalized_norm);}
-            if orthogonalized_norm>1e-8{
-                preconditioned=num_product(&preconditioned,1.0/orthogonalized_norm);
+            let orthogonalizrd_norm=dot_product(&preconditioned,&preconditioned).powf(0.5);
+            if print_level>1{println!("Before normalization:{:#?},norm={}",preconditioned,orthogonalizrd_norm);}
+            if orthogonalizrd_norm>1e-8{
+                preconditioned=num_product(&preconditioned,1.0/orthogonalizrd_norm);
                 ss.push_column(&preconditioned);
                 if print_level>1{println!("A new search vector has been added. Search space now has {} vectors",ss.size[1]);}
             }
         });
         right_residues.iter_columns_full().enumerate().for_each(|(i,residue)|{
-            let omega_m_diag=omega[i]-diag[i];
-            let mut preconditioned=residue.iter().map(|v_k|v_k/omega_m_diag).collect();
+            let mut preconditioned=residue.iter().enumerate().map(|(k,v_k)|v_k/(omega[i]-diag[k])).collect();
             //preconditioned:preconditioned vector:
             //(X-Y)=(omega-diag)
             if print_level>1{println!("Un-orthogonalized to add:{:#?}",preconditioned);}
@@ -397,18 +440,17 @@ where F1:Fn(&Vec<f64>)->Vec<f64>,F2:Fn(&Vec<f64>)->Vec<f64>{
                 if print_level>1{println!("projection={}",projection_product);}
                 preconditioned=vector_scaled_add(&preconditioned,1.0,&subspace_vec,-projection_product);
             });
-            let orthogonalized_norm=dot_product(&preconditioned,&preconditioned).powf(0.5);
-            //if print_level>1{println!("Before normalization:{:#?},norm={}",preconditioned,orthogonalized_norm);}
-            if orthogonalized_norm>1e-8{
-                preconditioned=num_product(&preconditioned,1.0/orthogonalized_norm);
+            let orthogonalizrd_norm=dot_product(&preconditioned,&preconditioned).powf(0.5);
+            if print_level>1{println!("Before normalization:{:#?},norm={}",preconditioned,orthogonalizrd_norm);}
+            if orthogonalizrd_norm>1e-8{
+                preconditioned=num_product(&preconditioned,1.0/orthogonalizrd_norm);
                 ss.push_column(&preconditioned);
                 if print_level>1{println!("A new search vector has been added. Search space now has {} vectors",ss.size[1]);}
             }
         });
         if print_level>1{println!("Search Space:");
         ss.formated_output(1000,"full");}
-        if iter_num>40{
-            println!("Warning: Davidson Solver did not converge after 40 iterations");
+        if iter_num>20{
             break;
         }
         println!("For Left Residues, {} out of the {} desired solutions have converged",left_converge_pair,nroots);

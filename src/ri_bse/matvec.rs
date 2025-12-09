@@ -22,7 +22,6 @@ pub fn coulomb_contribution(ri_matrix:&MatrixFull<f64>,vec:&Vec<f64>)->Vec<f64>{
     _dgemv(ri_matrix,vec , &mut inter_result, 'N', 1.0, 0.0, 1, 1);
     let mut result=vec![0.0;ri_matrix.size[1]];
     _dgemv(ri_matrix,&inter_result , &mut result, 'T', 1.0, 0.0, 1, 1);
-    println!("Coulomb contribution={:?}",result);
     result
 }
 pub fn w_contribution(scf_data:&SCF,z_vec:&Vec<f64>,ri_oo_tilde:&MatrixFull<f64>)->Vec<f64>{
@@ -294,7 +293,6 @@ pub fn a_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_vv:&MatrixFull<f64
         println!("W操作耗时: {:?}", duration2-duration1); 
     }
     if xlet=='S'{
-        println!("Now is in Block A:");
         result=coulomb_contribution(ri_ov,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|2.0*v_i+z_i).collect();
         let duration3=start.elapsed();
         if scf_data.mol.ctrl.print_level>1{
@@ -306,17 +304,12 @@ pub fn a_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_vv:&MatrixFull<f64
 pub fn b_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_ov_a:&MatrixFull<f64>,ri_ov_b:&MatrixFull<f64>,ri_ov_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
     let xlet=if qp_ctrl.bse_spin=="triplet"{'T'}else{'S'};
     let mut result=vec![0.0;z_vec.len()];
-    println!("z_vec:{:?}",z_vec);
     let mut ri_ov_tilde_old=ri_ov_tilde.clone();
     ri_ov_tilde_old.reshape(ri_ov_a.size);
     result=w_contribution_b_block_dgemm(scf_data,ri_ov_b,z_vec,ri_ov_tilde).iter().zip(result.iter()).map(|(w_i,z_i)|-w_i+z_i).collect();
-    println!("Old W Matvec{:?}",w_contribution_rayon_b_block(scf_data,ri_ov_a,z_vec,&ri_ov_tilde_old));
-    println!("W_z={:?}",result);
-    println!("Now is in block B:");
     if xlet=='S'{
         result=coulomb_contribution(ri_ov_a,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|2.0*v_i+z_i).collect();
     }
-    println!("B_z={:?}",result);
     result
 }
 pub fn sbse_matvec(scf_data:&SCF,mo_coeff:&MatrixFull<f64>,w_ao_basis:&MatrixFull<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
