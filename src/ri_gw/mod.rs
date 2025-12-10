@@ -7,6 +7,7 @@ use crate::scf_io::SCF;
 //use std::slice::Iter::<'_, f64>;
 use std::fs::OpenOptions;
 use std::io::Write;
+use rayon::iter::ParallelBridge;
 use libc::seccomp_notif;
 use rayon::result;
 use reqwest::blocking::Response;
@@ -306,16 +307,21 @@ pub fn display_and_save_quasiparticles(scf_data:&mut SCF,quasiparticle_energies_
     }
 }
 pub fn response_matrix(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,omega:f64,part:char)->MatrixFull<f64>{
-    let mut ri_to_be_processed=ri_ov.clone();
     let num_auxbas=ri_ov.size[0];
-    for (i,a) in (0..occ_size).cartesian_product(0..vir_size){
-        let energy_gap=quasiparticle_energies_w[occ_size+a]-quasiparticle_energies_w[i];
-        let eta=0.03;
+    let mut ri_to_be_processed=MatrixFull::new([num_auxbas,0],0.0);
+    let mut ri_as_vecs:Vec<(usize,Vec<f64>)>=ri_ov.iter_columns_full().enumerate().par_bridge().map(|(n,ri_n)|{
+        let i=n%occ_size;
+        let a=occ_size+n/occ_size;
+        let energy_gap=quasiparticle_energies_w[a]-quasiparticle_energies_w[i];
         let mut multiply_number=if part=='I'{-2.0*energy_gap/(energy_gap.powf(2.0)+omega.powf(2.0))}
-        else{-2.0*energy_gap/(energy_gap.powf(2.0)-omega.powf(2.0))};
-        for p in (0..num_auxbas){
-            ri_to_be_processed[[p,i+a*occ_size]]*=multiply_number;
-        }
+            else{-2.0*energy_gap/(energy_gap.powf(2.0)-omega.powf(2.0))};
+        let mut ri_n_vec=ri_n.to_vec();
+        ri_n_vec.par_iter_mut().for_each(|x| *x *= multiply_number);
+        (n,ri_n_vec)
+    }).collect();
+    ri_as_vecs.sort_by_key(|(i, _)| *i);
+    for ri_vec in ri_as_vecs {
+        ri_to_be_processed.push_column(&ri_vec.1);
     }
     let mut response:MatrixFull<f64>=MatrixFull::new([num_auxbas,num_auxbas],0.0);
     _dgemm_full(ri_ov,'N',&ri_to_be_processed,'T',&mut response,1.0,0.0); 
