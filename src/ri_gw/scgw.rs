@@ -79,12 +79,22 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
         let qp_energy=ri_gw::newton_solver(ri_gw::quasiparticle_equation,n,consts,ri_ov,ri_mat,&gwqp_g,&gwqp_w,occ_size,vir_size,num_state,w_c_at_freqs,e_ks_n,0.00001,50,side,scf_data.mol.ctrl.print_level);
         println!("QP energy:{}",qp_energy);
         println!("GW Evaluation of orbital #{} took {:?}",n,start.elapsed());
+        if scf_data.mol.ctrl.print_level>1{
+            println!("Shift={}",qp_energy-scf_data.eigenvalues[0][n]);
+        }
         qp_energy
     }else if rootfinder=="interpolation".to_string(){
         println!("Orbital #{}:",n);
-        let qp_energy=ri_gw::linear_interpolation_solver(qp_eq_func,scf_data.eigenvalues[0][n],side,qp_ctrl.gw_search_grid,qp_ctrl.gw_span_energy);
+        let (have_crossing,mut qp_energy)=ri_gw::linear_interpolation_solver(qp_eq_func,scf_data.eigenvalues[0][n],side,qp_ctrl.gw_search_grid,qp_ctrl.gw_span_energy);
+        if have_crossing==false{
+            println!("No Graphical crossings were found for n={}, so the Newton Solver is used instead.",n);
+            qp_energy=ri_gw::newton_solver(ri_gw::quasiparticle_equation,n,consts,ri_ov,ri_mat,&gwqp_g,&gwqp_w,occ_size,vir_size,num_state,w_c_at_freqs,e_ks_n,0.00001,50,side,scf_data.mol.ctrl.print_level);
+        }
         println!("QP energy:{}",qp_energy);
         println!("GW Evaluation of orbital #{} took {:?}",n,start.elapsed());
+        if scf_data.mol.ctrl.print_level>1{
+            println!("Shift={}",qp_energy-scf_data.eigenvalues[0][n]);
+        }
         qp_energy
     }else{
         panic!("Invalid choice of GW rootfinder!")
@@ -114,6 +124,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,t
         println!("low extrapolations:{}",calc_orbs[0].0);
         println!("calculated orbitals:{}",calc_orbs.len());
         println!("high extrapolations:{}",num_state-1-calc_orbs[calc_orbs.len()-1].0);
+        println!("Occ Shift={}, Vir Shift={}",occ_shift,vir_shift);
     }
     for i in 0 .. calc_orbs[0].0{
         gwqp.push(scf_data.eigenvalues[0][i]+occ_shift)
@@ -121,7 +132,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,t
     for i in 0..calc_orbs.len(){
         gwqp.push(calc_orbs[i].1)
     }
-    for i in calc_orbs[calc_orbs.len()-1].0 .. num_state-1{
+    for i in calc_orbs[calc_orbs.len()-1].0+1 .. num_state{
         gwqp.push(scf_data.eigenvalues[0][i]+vir_shift)
     }
     //println!("extrapolated GW Results:{:#?}",gwqp);

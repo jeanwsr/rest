@@ -151,10 +151,11 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
         let side=if n>=occ_size{1.0}else{-1.0};
         let printlevel=scf_data.mol.ctrl.print_level.clone();
         let mut real_qp=0.0;
+        let mut have_crossing=true;
         let qp_eq_func=|omega: f64|{
             quasiparticle_equation(omega,n,consts,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs)
         };
-        real_qp=linear_interpolation_solver(qp_eq_func,scf_data.eigenvalues[0][n],side,21,0.1);
+        (have_crossing,real_qp)=linear_interpolation_solver(qp_eq_func,scf_data.eigenvalues[0][n],side,21,0.1);
         //real_qp=newton_solver(quasiparticle_equation,n,consts,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,scf_data.eigenvalues[0][n],0.00001,50,side,printlevel);
         println!("for n={}, quasiparticle equation yields:qp energy={}",n,real_qp);
         real_qp
@@ -432,7 +433,7 @@ pub fn newton_solver<F>(mut f:F,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_ful
     }
     x_curr
 }
-pub fn linear_interpolation_solver<F>(mut f:F,starting_point:f64,side:f64,grid_freqs:usize,span_energy:f64)->f64 where F:Fn(f64)->f64{
+pub fn linear_interpolation_solver<F>(mut f:F,starting_point:f64,side:f64,grid_freqs:usize,span_energy:f64)->(bool,f64) where F:Fn(f64)->f64{
     let h=0.000001;
     let delta=0.02;
     let mut x_curr=starting_point+side*delta;
@@ -457,6 +458,7 @@ pub fn linear_interpolation_solver<F>(mut f:F,starting_point:f64,side:f64,grid_f
             xing.push(grid_results[i].0-(grid_results[i].1/slope));
         }
     }
+    let mut have_crossing=true;
     //println!("---------------\nfound {} crossings",xing.len());
     if xing.len()>1{
         let mut spectral_weights:Vec<(f64,f64)>=xing.iter().map(|e|{
@@ -469,15 +471,17 @@ pub fn linear_interpolation_solver<F>(mut f:F,starting_point:f64,side:f64,grid_f
         }).collect();
         spectral_weights.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         answer=spectral_weights[0].1;
-    }else{
+    }else if xing.len()==1{
         answer=xing[0];
         let y_minus=f(answer-h);
         let y_plus=f(answer+h);
         let derivative=(y_plus-y_minus)/(2.0*h)+1.0;
         let spectral_weight=(1.0-derivative).powf(-1.0);
         println!("crossing at {}, derivative={}, spectral value={}",answer,derivative,spectral_weight);
+    }else{
+        have_crossing=false;
     }
-    answer
+    (have_crossing,answer)
 }
 pub fn quasiparticle_equation(omega:f64,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_full:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,num_state:usize,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>)->f64{
     let contour=contour_rayon(omega,n,quasiparticle_energies_g,quasiparticle_energies_g,occ_size,vir_size,num_state,ri_ov,ri_full);
