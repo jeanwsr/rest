@@ -75,6 +75,9 @@ pub fn bse_main(scf_data:&mut SCF){
                 leading_components(&v,occ_size,vir_size)
             });
             println!("The first triplet excitation obtained by BSE is {}",excitations_triplets[0].0);
+            if qp_ctrl.pysoc{
+                let generate=pysoc_file::write_pysoc_file(scf_data,excitations_singlets,excitations_triplets);
+            }
         }
     }else{
         println!("Specific BSE calculations are triggered");
@@ -637,10 +640,17 @@ pub fn leading_components(eigenvector: &Vec<f64>,occ_size:usize, vir_size: usize
         .iter()
         .enumerate()
         .map(|(n, x)| {
-            let index = n; // 从0开始的索引
-            let j = occ_size+index / occ_size;  // 整除
-            let i = index % occ_size;  // 取余
-            (i, j, *x)
+            let mut index = n; // 从0开始的索引
+            if index>occ_size*vir_size-1{
+                let j = occ_size+index / occ_size;  // 整除
+                let i = index % occ_size;  // 取余
+                (i, j, *x)
+            }else{
+                index-=occ_size*vir_size;
+                let j = occ_size+index / occ_size;  // 整除
+                let i = index % occ_size;  // 取余
+                (j, i, *x)
+            }
         })
         .collect();
     
