@@ -265,6 +265,7 @@ pub struct InputKeywords {
     pub abort_on_mem_exceed: bool,
     pub guess_mix: bool,
     pub guess_mix_theta_deg: Vec<f64>,
+    pub start_mix_cycle: usize,
     pub spin_correction_scheme: Option<String>,
     pub yamaguchi_triplet_type: Option<String>,
     /// External dipole field (x, y, z) intensity in atomic units
@@ -401,6 +402,7 @@ impl InputKeywords {
             abort_on_mem_exceed: true,
             guess_mix: false,
             guess_mix_theta_deg: [15.0, 15.0].to_vec(),
+            start_mix_cycle: 0,
             spin_correction_scheme: None,
             yamaguchi_triplet_type: None,
             ext_field_dipole: None,
@@ -1477,7 +1479,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
             tmp_input.abort_on_mem_exceed = tmp_ctrl.get("abort_on_mem_exceed").map(serde_from_value).unwrap_or(true);
             
-            // for guess_mix setting
+            // for guess_mix setting; default = False
             tmp_input.guess_mix = match tmp_ctrl.get("guess_mix").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_bool) => *tmp_bool,
                 serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
@@ -1497,6 +1499,13 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     else { vals.truncate(2); vals }
                 }
                 _ => vec![15.0, 15.0],
+            };
+
+            // for start_mix_cycle: support number or string; default = 0
+            tmp_input.start_mix_cycle = match tmp_ctrl.get("start_mix_cycle").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_i64().unwrap_or(0) as usize,
+                serde_json::Value::String(s) => {s.parse::<usize>().unwrap_or(0_usize)}
+                _ => 0_usize,
             };
 
             tmp_input.spin_correction_scheme = match tmp_ctrl.get("spin_correction_scheme").unwrap_or(&serde_json::Value::Null) {

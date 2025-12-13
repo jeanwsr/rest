@@ -54,46 +54,38 @@ pub fn sbse_matvec_w_contribution(w_ao_basis:&MatrixFull<f64>,mo_coeff:&MatrixFu
     //println!("MatVec:{:#?} into: {:#?}",z,result);
     result
 }
-pub fn count_angular_momentum_regex<P>(filename: P,angular_momentum:usize) -> Result<usize, Box<dyn std::error::Error>>
-where
-    P: AsRef<Path>,
-{
-    let content = fs::read_to_string(filename)?;
-    
-    // 创建正则表达式模式，注意要匹配确切的缩进
-    let pattern = format!(r#"\[\s*{}\s*\]"#,angular_momentum);
-    let re = Regex::new(&pattern)?;
-    
-    Ok(re.find_iter(&content).count())
-}
-pub fn count_all_ang_momentum_under_value<P>(filename: P,angular_momentum:usize)-> usize
-where
-    P: AsRef<Path>+Clone,
-{
+pub fn count_specific_angular_momentum(scf_data:&SCF,angular_momentum:usize,elem_index:usize) -> usize{
+    let basis_info=scf_data.mol.fdqc_aux_bas.clone();
+    let ang_momentum_dict:Vec<char>=vec!['S','P','D','F','G','H','I'];
     let mut count=0;
-    (0..angular_momentum+1).for_each(|j|count+=count_angular_momentum_regex(filename.clone(),j).unwrap());
+    basis_info.iter().for_each(|basis|if basis.bas_name.contains(ang_momentum_dict[angular_momentum])&&basis.elem_index0==elem_index{
+        count+=1;
+    });
     count
 }
-pub fn count_all_ao<P>(filename: P) -> Result<usize, Box<dyn std::error::Error>>
-where
-    P: AsRef<Path>,
+pub fn count_all_ang_momentum_under_value(scf_data:&SCF,angular_momentum:usize,elem_index:usize)-> usize
 {
-    let content = fs::read_to_string(filename)?;
-    
-    // 创建正则表达式模式，注意要匹配确切的缩进
-    let pattern = r#"angular_momentum"#;
-    let re = Regex::new(&pattern)?;
-    
-    Ok(re.find_iter(&content).count())
+    let mut count=0;
+    (0..angular_momentum+1).for_each(|j|count+=count_specific_angular_momentum(scf_data,j,elem_index));
+    count
 }
-pub fn obtain_relevant_indices(elements:&Vec<String>,auxbas_dir:&String,max_angular_momentum:usize)->Vec<usize>{
+pub fn count_all_ao(scf_data:&SCF,elem_index:usize) -> usize{
+    let basis_info=scf_data.mol.fdqc_aux_bas.clone();
+    let ang_momentum_dict:Vec<char>=vec!['S','P','D','F','G','H','I'];
+    let mut count=0;
+    basis_info.iter().for_each(|basis|if basis.elem_index0==elem_index{
+        count+=1;
+    });
+    count
+}
+pub fn obtain_relevant_indices(scf_data:&SCF,elements:&Vec<String>,max_angular_momentum:usize)->Vec<usize>{
     let mut indices=vec![1;0];
     let mut starting_index=0;
-    elements.iter().for_each(|elem|{
-        let tot_num=count_all_ao(format!("{}/{}.json",auxbas_dir,elem)).unwrap();
-        println!("Now Atom={}",elem);
-        let basis_funcs_pushed=count_all_ang_momentum_under_value(format!("{}/{}.json",auxbas_dir,elem),max_angular_momentum);
-        (0..basis_funcs_pushed).for_each(|n|{indices.push(starting_index+n);println!("Pushed index={}",starting_index+n)});
+    elements.iter().enumerate().for_each(|(n,elem)|{
+        let tot_num=count_all_ao(scf_data,n);
+        //println!("Now Atom={}",elem);
+        let basis_funcs_pushed=count_all_ang_momentum_under_value(scf_data,max_angular_momentum,n);
+        (0..basis_funcs_pushed).for_each(|n|{indices.push(starting_index+n);/*println!("Pushed index={}",starting_index+n)*/});
         starting_index+=tot_num;
     });
     indices

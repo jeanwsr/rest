@@ -34,7 +34,7 @@ pub struct QuasiParticle {
     pub save_bse_excitations:bool,
     pub evgw_rounds:usize,
     pub save_gw_homo_lumo_qp:bool,
-    pub save_single_qp_path:String,
+    pub save_qp_path:String,
     pub save_first_excitation:bool,
     pub save_first_excitation_path:String,
     pub parse_qp_path:String,
@@ -79,7 +79,7 @@ impl Default for QuasiParticle {
             save_bse_excitations:false, 
             evgw_rounds:0,
             save_gw_homo_lumo_qp:false,
-            save_single_qp_path:String::from("single_qp_path.txt"),
+            save_qp_path:String::from("single_qp_path.txt"),
             save_first_excitation:false,
             save_first_excitation_path:String::from("first_excitation_save.txt"),
             parse_qp_path:String::from("./qp_energies"),
@@ -129,7 +129,7 @@ impl QuasiParticle {
         table.insert("save_bse_excitations".to_string(), toml::Value::Boolean(self.save_bse_excitations));
         table.insert("evgw_rounds".to_string(), toml::Value::Integer(self.evgw_rounds as i64));
         table.insert("save_gw_homo_lumo_qp".to_string(), toml::Value::Boolean(self.save_gw_homo_lumo_qp));
-        table.insert("save_single_qp_path".to_string(), toml::Value::String(self.save_single_qp_path.clone()));
+        table.insert("save_qp_path".to_string(), toml::Value::String(self.save_qp_path.clone()));
         table.insert("save_first_excitation".to_string(), toml::Value::Boolean(self.save_first_excitation));
         table.insert("save_first_excitation_path".to_string(), toml::Value::String(self.save_first_excitation_path.clone()));
         table.insert("parse_qp_path".to_string(), toml::Value::String(self.parse_qp_path.clone()));
@@ -298,7 +298,7 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };
-            tmp_input.save_single_qp_path = match tmp_ctrl.get("save_single_qp_path").unwrap_or(&serde_json::Value::Null) {
+            tmp_input.save_qp_path = match tmp_ctrl.get("save_qp_path").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::from("single_qp_save.txt"),
             };
