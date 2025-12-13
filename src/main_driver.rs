@@ -338,17 +338,21 @@ pub fn output_result(scf_data: &scf_io::SCF) {
 
     if xc_name.eq("mp2") || xc_name.eq("scs-mp2") {
         let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
-        println!("The MP2 total energy  : {:18.10} Ha", total_energy);
+        // println!("The MP2 total energy  : {:18.10} Ha", total_energy);
+        println!("The (R)-xDH energy    : {:18.10} Ha", total_energy);
+        
     }
 
     if xc_name.eq("b2plyp") || xc_name.eq("b2gpplyp") || xc_name.eq("pbe-qidh") || xc_name.eq("pbe0dh") {
         let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
-        println!("The DH energy         : {:18.10} Ha", total_energy);
+        // println!("The DH energy         : {:18.10} Ha", total_energy);
+        println!("The (R)-xDH energy    : {:18.10} Ha", total_energy);
     }
     
-    if xc_name.eq("dsdpbep86-nodisp") || xc_name.eq("dsdpbep86") || xc_name.eq("dsdpbep95") || xc_name.eq("dsdblyp") {
+    if xc_name.eq("dsdpbep86-nodisp") || xc_name.eq("dsdpbep86") || xc_name.eq("dsdpbeb95") || xc_name.eq("dsdblyp") {
         let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
-        println!("The DSD-DH energy     : {:18.10} Ha", total_energy);
+        // println!("The DSD-DH energy     : {:18.10} Ha", total_energy);
+        println!("The (R)-xDH energy    : {:18.10} Ha", total_energy);
     }
 
     if xc_name.eq("xyg3") || xc_name.eq("xygjos") || xc_name.eq("xdh-pbe0") || xc_name.eq("r-xdh7") || xc_name.eq("xyg7") || xc_name.eq("zrps") || xc_name.eq("scsrpa") {
@@ -451,7 +455,7 @@ pub fn collect_total_energy(scf_data: &SCF) -> f64 {
         "pbe0dh" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "dsdpbep86-nodisp" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "dsdpbep86" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "dsdpbep95" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "dsdpbeb95" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "dsdblyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],

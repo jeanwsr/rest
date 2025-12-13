@@ -938,11 +938,11 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
             })
-        } else if tmp_name.eq("dsdpbep95") {
+        } else if tmp_name.eq("dsdpbeb95") {
             // DSD-PBEP95-D3BJ
             // J. Comput. Chem. 2013, 34, 2327-2344.
-            let dfa_family_scf = DFAFamily::HybridGGA;
-            let scf_dfa = ["gga_x_pbe", "gga_c_p95"];
+            let dfa_family_scf = DFAFamily::HybridMGGA;
+            let scf_dfa = ["gga_x_pbe", "mgga_c_bc95"];
             let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
                 DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
                 .flatten().collect();
