@@ -356,14 +356,14 @@ pub fn output_result(scf_data: &scf_io::SCF) {
     //--------------------------
     if xc_name.eq("mp2") || xc_name.eq("scs-mp2") {
         if let Some(e) = yamaguchi_tot {
-            println!("The MP2 total energy  : {:18.10} Ha", e);
+            // println!("The MP2 energy  : {:18.10} Ha", e);
+            println!("The (R)-xDH energy    : {:18.10} Ha", e);
         } else {
-            let total = scf_data.energies.get("xdh_energy").unwrap()[0];
-            println!("The MP2 total energy  : {:18.10} Ha", total);
+            let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
+            // println!("The MP2 energy  : {:18.10} Ha", total_energy);
+            println!("The (R)-xDH energy    : {:18.10} Ha", total_energy);
         }
-        return;
     }
-
     //--------------------------
     // DH functionals
     //--------------------------
@@ -373,10 +373,11 @@ pub fn output_result(scf_data: &scf_io::SCF) {
         || xc_name.eq("pbe0dh")
     {
         if let Some(e) = yamaguchi_tot {
-            println!("The DH energy         : {:18.10} Ha", e);
+            // println!("The DH energy         : {:18.10} Ha", e);
+            println!("The (R)-xDH energy    : {:18.10} Ha", e);
         } else {
-            let total = scf_data.energies.get("xdh_energy").unwrap()[0];
-            println!("The DH energy         : {:18.10} Ha", total);
+            let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
+            println!("The (R)-xDH energy    : {:18.10} Ha", total_energy);
         }
         return;
     }
@@ -390,10 +391,12 @@ pub fn output_result(scf_data: &scf_io::SCF) {
         || xc_name.eq("dsdblyp")
     {
         if let Some(e) = yamaguchi_tot {
-            println!("The DSD-DH energy     : {:18.10} Ha", e);
+            // println!("The DSD-DH energy     : {:18.10} Ha", e);
+            println!("The (R)-xDH energy    : {:18.10} Ha", e);
         } else {
-            let total = scf_data.energies.get("xdh_energy").unwrap()[0];
-            println!("The DSD-DH energy     : {:18.10} Ha", total);
+            let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
+            // println!("The DSD-DH energy     : {:18.10} Ha", total);
+            println!("The (R)-xDH energy    : {:18.10} Ha", total_energy);
         }
         return;
     }
@@ -516,7 +519,7 @@ pub fn collect_total_energy(scf_data: &SCF) -> f64 {
         "pbe0dh" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "dsdpbep86-nodisp" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "dsdpbep86" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "dsdpbep95" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "dsdpbeb95" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "dsdblyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],

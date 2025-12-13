@@ -5,6 +5,7 @@ use libc::seccomp_notif;
 use rayon::result;
 use rest_tensors::{RIFull};
 use std::ops::Index;
+use std::cmp;
 use tensors::{matrix_blas_lapack::_dinverse, MathMatrix, MatrixFull};
 use crate::ri_gw::get_occupation_parameters;
 //use libc::select;
@@ -22,11 +23,11 @@ pub mod sbse;
 pub mod pysoc_file;
 
 pub fn bse_main(scf_data:&mut SCF){
+    let start=Instant::now();
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let quasiparticle_energies=scf_data.gwqp.0.clone();
     let dipole_matrix=dipoles::compute_dipole_matrix(scf_data);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    scf_data.mol.geom.position.formated_output(1000,"full");
     if qp_ctrl.bse_spin =="none"{
         println!("No BSE Calculations are triggered");
     }else if qp_ctrl.bse_spin=="both"{
@@ -37,7 +38,7 @@ pub fn bse_main(scf_data:&mut SCF){
             println!("First {} Singlet Excitations:",number);
             excitations_singlets[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
                 let v=dipoles::normalize(vec,true);
-                println!("{}th Excitation energy={}",n,e);
+                println!("#{} Excitation energy={}",n,e);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
                 leading_components(&v,occ_size,vir_size)});
@@ -45,7 +46,7 @@ pub fn bse_main(scf_data:&mut SCF){
             println!("First {} Triplet Excitations:",number);
             excitations_triplets[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
                 let v=dipoles::normalize(vec,true);
-                println!("{}th Excitation energy={}",n,e);
+                println!("#{} Excitation energy={}",n,e);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
                 leading_components(&v,occ_size,vir_size)});
@@ -55,13 +56,10 @@ pub fn bse_main(scf_data:&mut SCF){
             }
         }else{
             println!("BSE Calculation Results of Both Singlets and Triplets without TDA:");
-            let mid = excitations_singlets.len() / 2;
-            excitations_singlets=excitations_singlets[mid..].to_vec();
-            excitations_triplets=excitations_triplets[mid..].to_vec();
             let number=excitations_singlets.len();
             println!("First {} Singlet Excitations:",number);
             excitations_singlets[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
-                println!("{}th Excitation energy={}",n,e);
+                println!("#{} Excitation energy={}",n,e);
                 let v=dipoles::normalize(vec,false);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,false);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
@@ -70,13 +68,16 @@ pub fn bse_main(scf_data:&mut SCF){
             println!("The first singlet excitation obtained by BSE is {}",excitations_singlets[0].0);
             println!("First {} Triplet Excitations:",number);
             excitations_triplets[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
-                println!("{}th Excitation energy={}",n,e);
+                println!("#{} Excitation energy={}",n,e);
                 let v=dipoles::normalize(vec,false);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,false);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
                 leading_components(&v,occ_size,vir_size)
             });
             println!("The first triplet excitation obtained by BSE is {}",excitations_triplets[0].0);
+            if qp_ctrl.pysoc{
+                let generate=pysoc_file::write_pysoc_file(scf_data,excitations_singlets,excitations_triplets);
+            }
         }
     }else{
         println!("Specific BSE calculations are triggered");
@@ -88,16 +89,15 @@ pub fn bse_main(scf_data:&mut SCF){
             println!("Now using: Simplified BSE scheme");
             let auxbas_dir=scf_data.mol.ctrl.auxbas_path.clone();
             let elements=scf_data.mol.geom.elem.clone();
-            println!("Elements:{:?}",elements);
-            elements.iter().for_each(|elem|{
-                let auxbas=format!("{}/{}.json",auxbas_dir,elem);
-                let total_count=sbse::count_all_ao(auxbas.clone()).unwrap();
-                let s_count=sbse::count_angular_momentum_regex(auxbas.clone(),0).unwrap();
-                println!("{} basis funtions are found from {}",total_count,auxbas);
-                println!("{} S basis functions are detected from the auxbas {}",s_count,auxbas);
-            });
-            let ang_momentum=qp_ctrl.bse_max_ang_momentum;
-            let relevant_indices=sbse::obtain_relevant_indices(&elements,&auxbas_dir,ang_momentum);
+            if scf_data.mol.ctrl.print_level>1{println!("Elements:{:?}",elements);
+            elements.iter().enumerate().for_each(|(n,elem)|{
+                let total_count=sbse::count_all_ao(scf_data,n);
+                let s_count=sbse::count_specific_angular_momentum(scf_data,0,n);
+                println!("{} basis funtions are found from the auxbas of {}",total_count,elem);
+                println!("{} S basis functions are detected from the auxbas of {}",s_count,elem);
+            });}
+            let ang_momentum=cmp::min(6,qp_ctrl.bse_max_ang_momentum);
+            let relevant_indices=sbse::obtain_relevant_indices(scf_data,&elements,ang_momentum);
             let energy_diag=construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
             let mut epsilon:Vec<f64>=scf_data.eigenvalues[0].clone();
             let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
@@ -106,14 +106,15 @@ pub fn bse_main(scf_data:&mut SCF){
             }
             let inverse_dielectric=construct_inverse_dielectric(scf_data,&epsilon);
             let ri_ov=get_submatrix(scf_data,'O','V','N');
-            ri_ov.formated_output(100000,"full");
-            let ri_oo=get_submatrix(scf_data,'O','O','N');
+            //ri_ov.formated_output(100000,"full");
+            let mut ri_oo=get_submatrix(scf_data,'O','O','N');
             let mut ri_vv=get_submatrix(scf_data,'V','V','N');
-            println!("Full NumAuxBas={}\nRelevant Indices={:?}",ri_ov.size[0],relevant_indices);
-            let mut ri_oo_red=sbse::obtain_ri_with_reduced_ang_momentum(&ri_oo,&relevant_indices);
-            let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo_red.size,0.0);
-            _dgemm_full(&inverse_dielectric,'N',&ri_oo_red,'N',&mut ri_oo_tilde,1.0,0.0);
-            println!("RI-OO-Tilde Size={},{}, where occ_size={}",ri_oo_tilde.size[0],ri_oo_tilde.size[1],occ_size);
+            println!("Full NumAuxBas={}",ri_oo.size[0]);
+            if scf_data.mol.ctrl.print_level>1{println!("Relevant Indices={:?}",relevant_indices);}
+            ri_oo=sbse::obtain_ri_with_reduced_ang_momentum(&ri_oo,&relevant_indices);
+            let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
+            _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
+            //println!("RI-OO-Tilde Size={},{}, where occ_size={}",ri_oo_tilde.size[0],ri_oo_tilde.size[1],occ_size);
             let reduced_num_auxbas=ri_oo_tilde.size[0];
             println!("Reduced NumAuxBas={}",reduced_num_auxbas);
             ri_oo_tilde.reshape([reduced_num_auxbas*occ_size,occ_size]);
@@ -122,7 +123,10 @@ pub fn bse_main(scf_data:&mut SCF){
             ri_vv=sbse::obtain_ri_with_reduced_ang_momentum(&ri_vv,&relevant_indices);
             ri_vv.reshape([reduced_num_auxbas*vir_size,vir_size]);
             let initial_guess=davidson_solver::generate_initial_guess(&energy_diag,qp_ctrl.davidson_target_excitations);
+            let preptime=start.elapsed();
+            println!("BSE Preparation Time:{:?}",preptime);
             let excitations=davidson_solver::tda_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&qp_ctrl);
+            println!("Davidson Solver took {:?}",start.elapsed()-preptime);
             if scf_data.mol.ctrl.print_level>2{
                 show_all_eigenpairs(&excitations);
             }
@@ -130,11 +134,11 @@ pub fn bse_main(scf_data:&mut SCF){
             println!("First {} excitations:",number);
             excitations[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
             let v=dipoles::normalize(vec,true);
-            println!("{} Excitation energy={}",n,e);
+            println!("#{} Excitation energy={}",n,e);
             let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
             println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
             leading_components(&v,occ_size,vir_size)});
-            println!("The first excitation obtained by BSE is {}",excitations[0].0);
+            println!("\n\nThe first excitation obtained by BSE is {}",excitations[0].0);
             if qp_ctrl.save_bse_excitations==true{
                 let line = excitations.iter().map(|(num,vec)| num.to_string()).collect::<Vec<_>>().join(",");
                 let mut file = OpenOptions::new().append(true).create(true).open("bse_excitations.txt");
@@ -150,16 +154,18 @@ pub fn bse_main(scf_data:&mut SCF){
             if scf_data.mol.ctrl.print_level>2{
                 show_all_eigenpairs(&excitations);
             }
-            let mid = excitations.len() / 2;
-            excitations=excitations[mid..].to_vec();
+            if qp_ctrl.bse_davidson_solver==false{
+                let mid = excitations.len() / 2;
+                excitations=excitations[mid..].to_vec();
+            }
             let number=excitations.len().min(30);
             println!("First {} excitations:",number);
-            excitations[0..number].iter().enumerate().for_each(|(n,(e,vec))|{println!("{}th Excitation energy={}",n,e);
+            excitations[0..number].iter().enumerate().for_each(|(n,(e,vec))|{println!("#{} Excitation energy={}",n,e);
             let v=dipoles::normalize(vec,false);
             let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,false);
             println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
             leading_components(&v,occ_size,vir_size)});
-            println!("The first excitation obtained by BSE is {}",excitations[0].0);
+            println!("\n\nThe first excitation obtained by BSE is {}",excitations[0].0);
             if qp_ctrl.save_bse_excitations==true{
                 let line = excitations.iter().map(|(num,vec)| num.to_string()).collect::<Vec<_>>().join(",");
                 let mut file = OpenOptions::new().append(true).create(true).open("bse_excitations.txt");
@@ -179,7 +185,7 @@ pub fn bse_main(scf_data:&mut SCF){
             println!("First {} excitations:",number);
             excitations[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
                 let v=dipoles::normalize(vec,true);
-                println!("{}th Excitation energy={}",n,e);
+                println!("#{} Excitation energy={}",n,e);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
                 println!("\tTransition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
                 leading_components(&v,occ_size,vir_size)});
@@ -220,17 +226,11 @@ pub fn get_submatrix(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:c
     }else if choice_a=='F'&&choice_b=='F'{
         vector=scf_data.ri3mo_full.clone().unwrap();
     }else if choice_a=='O'&&choice_b=='O'{
-        let mut scf_clone=scf_data.clone();
-        scf_clone.generate_ri3mo_rayon(range_oo.0,range_oo.1);
-        vector=scf_clone.ri3mo.clone().unwrap();
+        vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_oo.0,range_oo.1);
     }else if choice_a=='V'&&choice_b=='V'{
-        let mut scf_clone=scf_data.clone();
-        scf_clone.generate_ri3mo_rayon(range_vv.0,range_vv.1);
-        vector=scf_clone.ri3mo.clone().unwrap();
+        vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_vv.0,range_vv.1);
     }else if choice_a=='O'&&choice_b=='V'&&response_or_not=='N'{
-        let mut scf_clone=scf_data.clone();
-        scf_clone.generate_ri3mo_rayon(range_ov.0,range_ov.1);
-        vector=scf_clone.ri3mo.clone().unwrap();
+        vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_ov.0,range_ov.1);
     }else {
         panic!("invalid choice of ri subspace!")
     };
@@ -328,11 +328,9 @@ pub fn construct_inverse_dielectric(scf_data:&SCF,epsilon:&Vec<f64>)->MatrixFull
     let mut ri_ov=get_submatrix(scf_data,'O','V','Y');
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     if qp_ctrl.simplified_bse==true{
-        let ang_momentum=qp_ctrl.bse_max_ang_momentum;
-        let auxbas_dir=scf_data.mol.ctrl.auxbas_path.clone();
+        let ang_momentum=if qp_ctrl.simplified_bse==true{cmp::min(qp_ctrl.bse_max_ang_momentum,6)}else{6};
         let elements=scf_data.mol.geom.elem.clone();
-        let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-        let relevant_indices=sbse::obtain_relevant_indices(&elements,&auxbas_dir,ang_momentum);
+        let relevant_indices=sbse::obtain_relevant_indices(scf_data,&elements,ang_momentum);
         ri_ov=sbse::obtain_ri_with_reduced_ang_momentum(&ri_ov,&relevant_indices);
     }
     if scf_data.mol.ctrl.print_level>1{
@@ -449,6 +447,7 @@ pub fn evaluate_all_excitations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,x
     (wr_1,wi_1,wr_2,wi_2,wr_3,wi_3)
 }
 pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char)->Vec<(f64,Vec<f64>)>{
+    let start=Instant::now();
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let ks_energies:Vec<f64>=scf_data.eigenvalues[0].clone();
     let mut epsilon=ks_energies.clone();
@@ -461,26 +460,41 @@ pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:
     if qp_ctrl.bse_davidson_solver==true{
         let ri_oo=get_submatrix(scf_data,'O','O','N');
         println!("num_auxbas={}",ri_oo.size[0]);
+        let num_auxbas=ri_oo.size[0];
         let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
         _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
         drop(ri_oo);
-        let ri_ov=get_submatrix(scf_data,'V','V','N');
-        let ri_vv=get_submatrix(scf_data,'V','V','N');
+        ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
+        ri_oo_tilde=ri_oo_tilde.transpose_and_drop();
+        ri_oo_tilde.reshape([occ_size*num_auxbas,occ_size]);
+        let ri_ov=get_submatrix(scf_data,'O','V','N');
+        let mut ri_ov_b=ri_ov.clone();
+        ri_ov_b.reshape([num_auxbas*occ_size,vir_size]);
+        let mut ri_vv=get_submatrix(scf_data,'V','V','N');
+        ri_vv.reshape([num_auxbas*vir_size,vir_size]);
         let mut ri_ov_tilde:MatrixFull<f64>=MatrixFull::new(ri_ov.size,0.0);
         _dgemm_full(&inverse_dielectric,'N',&ri_ov,'N',&mut ri_ov_tilde,1.0,0.0);
         drop(inverse_dielectric);
+        ri_ov_tilde.reshape([num_auxbas*occ_size,vir_size]);
         let energy_diag=construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
         let initial_guess=davidson_solver::generate_initial_guess(&energy_diag,qp_ctrl.davidson_target_excitations);
-        eigenpairs=davidson_solver::lr_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),|z|matvec::b_block_matvec(scf_data,&qp_ctrl,&ri_ov,&ri_ov_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess);
+        let preptime=start.elapsed();
+        println!("BSE Preparation Time:{:?}",preptime);
+        eigenpairs=davidson_solver::lr_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),|z|matvec::b_block_matvec(scf_data,&qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess);
+        println!("Davidson Solver took {:?}",start.elapsed()-preptime);
     }else{
         println!("starts contructing Full BSE hamiltonian!!!");
         let bse_hamiltonian=construct_full_bse_hamitonian(scf_data, xlet,&inverse_dielectric,quasiparticle_energies);
+        let preptime=start.elapsed();
+        println!("BSE Preparation Time:{:?}",preptime);
         let (matr_b_1, wr_1, wi_1,vl_1,vr_1,info_1)=_dgeev(&bse_hamiltonian, 'N', 'V');
+        println!("BSE DGEES Time:{:?}",start.elapsed()-preptime);
         eigenpairs=zip_and_sort(&wr_1,&vr_1);
     }
     eigenpairs
 }
 pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char)->Vec<(f64,Vec<f64>)>{
+    let start=Instant::now();
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let ks_energies:Vec<f64>=scf_data.eigenvalues[0].clone();
     let mut epsilon=ks_energies.clone();
@@ -494,15 +508,15 @@ pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char
         let start=Instant::now();
         let ri_ov=get_submatrix(scf_data,'O','V','N');
         let duration1=start.elapsed();
-        println!("RI-OV耗时: {:?}", duration1);
+        //println!("RI-OV耗时: {:?}", duration1);
         let mut ri_vv=get_submatrix(scf_data,'V','V','N');
         let num_auxbas=inverse_dielectric.size[0];
         //ri_vv.reshape([num_auxbas*vir_size,vir_size]);
         let duration2=start.elapsed();
-        println!("RI-VV作耗时: {:?}", duration2-duration1);
+        //println!("RI-VV作耗时: {:?}", duration2-duration1);
         let ri_oo=get_submatrix(scf_data,'O','O','N');
         let duration3=start.elapsed();
-        println!("RI-OO耗时: {:?}", duration3-duration2);
+        //println!("RI-OO耗时: {:?}", duration3-duration2);
         let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
         _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
         drop(inverse_dielectric);
@@ -513,16 +527,23 @@ pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char
         //ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
         let energy_diag=construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
         let initial_guess=davidson_solver::generate_initial_guess(&energy_diag,qp_ctrl.davidson_target_excitations);
+        let preptime=start.elapsed();
+        println!("BSE Preparation Time:{:?}",preptime);
         eigenpairs=davidson_solver::tda_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&qp_ctrl);
+        println!("Davidson Solver took {:?}",start.elapsed());
     }else{
         println!("starts contructing TDA BSE hamiltonian!!!");
         let tda_bse_hamiltonian=construct_submat_a(scf_data,&inverse_dielectric,quasiparticle_energies, xlet);
+        let preptime=start.elapsed();
+        println!("BSE Preparation Time:{:?}",preptime);
         let (matr_b_1, wr_1, wi_1,vl_1,vr_1,info_1)=_dgeev(&tda_bse_hamiltonian, 'N', 'V');
-        eigenpairs=zip_and_sort(&wr_1,&vr_1);
+        println!("BSE DGEES Time:{:?}",start.elapsed()-preptime);
+        eigenpairs=zip_and_sort(&wr_1,&vr_1);eigenpairs=zip_and_sort(&wr_1,&vr_1);
     }
     eigenpairs
 }
 pub fn pysoc_prep_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>)->(Vec<(f64,Vec<f64>)>,Vec<(f64,Vec<f64>)>){
+    let start=Instant::now();
     let mut qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let mut eigenpairs_singlet:Vec<(f64,Vec<f64>)>=Vec::new();
     let mut eigenpairs_triplet:Vec<(f64,Vec<f64>)>=Vec::new();
@@ -537,15 +558,15 @@ pub fn pysoc_prep_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>)->
         let start=Instant::now();
         let ri_ov=get_submatrix(scf_data,'O','V','N');
         let duration1=start.elapsed();
-        println!("RI-OV耗时: {:?}", duration1);
+        //println!("RI-OV耗时: {:?}", duration1);
         let mut ri_vv=get_submatrix(scf_data,'V','V','N');
         let num_auxbas=inverse_dielectric.size[0];
         //ri_vv.reshape([num_auxbas*vir_size,vir_size]);
         let duration2=start.elapsed();
-        println!("RI-VV作耗时: {:?}", duration2-duration1);
+        //println!("RI-VV作耗时: {:?}", duration2-duration1);
         let ri_oo=get_submatrix(scf_data,'O','O','N');
         let duration3=start.elapsed();
-        println!("RI-OO耗时: {:?}", duration3-duration2);
+        //println!("RI-OO耗时: {:?}", duration3-duration2);
         let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
         _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
         drop(inverse_dielectric);
@@ -555,12 +576,17 @@ pub fn pysoc_prep_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>)->
         ri_vv.reshape([num_auxbas*vir_size,vir_size]);
         //ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
         let energy_diag=construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
+        let preptime=start.elapsed();
+        println!("BSE Preparation Time:{:?}",preptime);
         qp_ctrl.bse_spin=String::from("singlet");
         let initial_guess=davidson_solver::generate_initial_guess(&energy_diag,qp_ctrl.davidson_target_excitations);
         eigenpairs_singlet=davidson_solver::tda_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&qp_ctrl);
+        let one_dav_time=start.elapsed();
+        println!("Singlets calculation took {:?}",one_dav_time-preptime);
         qp_ctrl.bse_spin=String::from("triplet");
         let initial_guess=davidson_solver::generate_initial_guess(&energy_diag,qp_ctrl.davidson_target_excitations);
         eigenpairs_triplet=davidson_solver::tda_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&qp_ctrl);
+        println!("Triplets calculation took {:?}",start.elapsed()-one_dav_time);
     }else{
         let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
         let ks_energies:Vec<f64>=scf_data.eigenvalues[0].clone();
@@ -571,20 +597,33 @@ pub fn pysoc_prep_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>)->
         let inverse_dielectric=construct_inverse_dielectric(scf_data,&epsilon);
         let ri_oo=get_submatrix(scf_data,'O','O','N');
         println!("num_auxbas={}",ri_oo.size[0]);
+        let num_auxbas=ri_oo.size[0];
         let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
         _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
         drop(ri_oo);
-        let ri_ov=get_submatrix(scf_data,'V','V','N');
-        let ri_vv=get_submatrix(scf_data,'V','V','N');
+        ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
+        ri_oo_tilde=ri_oo_tilde.transpose_and_drop();
+        ri_oo_tilde.reshape([occ_size*num_auxbas,occ_size]);
+        let ri_ov=get_submatrix(scf_data,'O','V','N');
+        let mut ri_vv=get_submatrix(scf_data,'V','V','N');
+        ri_vv.reshape([num_auxbas*vir_size,vir_size]);
         let mut ri_ov_tilde:MatrixFull<f64>=MatrixFull::new(ri_ov.size,0.0);
         _dgemm_full(&inverse_dielectric,'N',&ri_ov,'N',&mut ri_ov_tilde,1.0,0.0);
+        ri_ov_tilde.reshape([num_auxbas*occ_size,vir_size]);
+        let mut ri_ov_b=ri_ov.clone();
+        ri_ov_b.reshape([num_auxbas*occ_size,vir_size]);
         drop(inverse_dielectric);
         let energy_diag=construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
         let initial_guess=davidson_solver::generate_initial_guess(&energy_diag,qp_ctrl.davidson_target_excitations);
+        let preptime=start.elapsed();
+        println!("BSE Preparation Time:{:?}",preptime);
         qp_ctrl.bse_spin=String::from("singlet");
-        eigenpairs_singlet=davidson_solver::lr_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),|z|matvec::b_block_matvec(scf_data,&qp_ctrl,&ri_ov,&ri_ov_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess.clone());
+        eigenpairs_singlet=davidson_solver::lr_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),|z|matvec::b_block_matvec(scf_data,&qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess.clone());
+        let one_dav_time=start.elapsed();
+        println!("Singlets calculation took {:?}",one_dav_time-preptime);
         qp_ctrl.bse_spin=String::from("triplet");
-        eigenpairs_triplet=davidson_solver::lr_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),|z|matvec::b_block_matvec(scf_data,&qp_ctrl,&ri_ov,&ri_ov_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess);
+        eigenpairs_triplet=davidson_solver::lr_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),|z|matvec::b_block_matvec(scf_data,&qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess);
+        println!("Triplets calculation took {:?}",start.elapsed()-one_dav_time);
     }
     (eigenpairs_singlet,eigenpairs_triplet)
 }
@@ -601,10 +640,17 @@ pub fn leading_components(eigenvector: &Vec<f64>,occ_size:usize, vir_size: usize
         .iter()
         .enumerate()
         .map(|(n, x)| {
-            let index = n; // 从0开始的索引
-            let j = occ_size+index / occ_size;  // 整除
-            let i = index % occ_size;  // 取余
-            (i, j, *x)
+            let mut index = n; // 从0开始的索引
+            if index>occ_size*vir_size-1{
+                let j = occ_size+index / occ_size;  // 整除
+                let i = index % occ_size;  // 取余
+                (i, j, *x)
+            }else{
+                index-=occ_size*vir_size;
+                let j = occ_size+index / occ_size;  // 整除
+                let i = index % occ_size;  // 取余
+                (j, i, *x)
+            }
         })
         .collect();
     

@@ -1,5 +1,7 @@
 # REST项目介绍和程序安装
   请参见[REST开发组页面](https://gitee.com/restgroup)。**以下为REST程序的具体使用说明**
+# For English Users:
+  - This manual can be used as a prompt file for state-of-the-art Large Language Models (LLMs), such as DeepSeek and Tongyi. By providing this content to an LLM, you can effectively utilize it as an online support assistant. (Note: ChatGPT has not been tested due to restrictions by the US government.)
 # 用于生成REST输入卡的系统提示词
 - 基于Rust语言的新一代电子结构计算软件REST（Rust-based Electronic Structure Toolkit）由复旦大学化学理论研究中心开发，在徐昕教授的领导下，由张颖教授担任首席开发者完成。
 - 根据用户需求，结合知识库和上下文，帮助用户生成REST程序的输入卡。 
