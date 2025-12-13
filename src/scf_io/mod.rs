@@ -3294,6 +3294,43 @@ pub fn apply_projection_operator(a: &MatrixFull<f64>, b: &MatrixFull<f64>, c: &M
     final_result
 }
 
+pub fn apply_guess_mix(scf_data: &mut SCF) {
+    for (i_spin, &theta_deg) in scf_data.mol.ctrl.guess_mix_theta_deg.iter().enumerate() {
+        if theta_deg < 0.0 || theta_deg > 45.0 {
+            println!(
+                "WARNING: theta for spin {} = {:.1}° is outside the recommended range (0°–45°); mixing may be ineffective or unstable.",
+                i_spin, theta_deg
+            );
+        }
+
+        let (cos_theta, sin_theta) = {
+            let rad = theta_deg.to_radians();
+            (rad.cos(), rad.sin())
+        };
+
+        let homo = scf_data.homo[i_spin];
+        let lumo = scf_data.lumo[i_spin];
+        let eigenvector_mut = scf_data.eigenvectors.get_mut(i_spin).unwrap();
+        let homo_vec: Vec<f64> = eigenvector_mut.iter_column(homo).cloned().collect();
+        let lumo_vec: Vec<f64> = eigenvector_mut.iter_column(lumo).cloned().collect();
+
+        let (mixed_homo_vec, mixed_lumo_vec) = if i_spin == 0 {(
+            homo_vec.iter().zip(&lumo_vec).map(|(h, l)| cos_theta * h + sin_theta * l).collect::<Vec<f64>>(),
+            homo_vec.iter().zip(&lumo_vec).map(|(h, l)| -sin_theta * h + cos_theta * l).collect::<Vec<f64>>(),
+        )} else {(
+            homo_vec.iter().zip(&lumo_vec).map(|(h, l)| cos_theta * h - sin_theta * l).collect::<Vec<f64>>(),
+            homo_vec.iter().zip(&lumo_vec).map(|(h, l)| sin_theta * h + cos_theta * l).collect::<Vec<f64>>(),
+        )};
+
+        for (val, slot) in mixed_homo_vec.iter().zip(eigenvector_mut.iter_column_mut(homo)) {
+            *slot = *val;
+        }
+        for (val, slot) in mixed_lumo_vec.iter().zip(eigenvector_mut.iter_column_mut(lumo)) {
+            *slot = *val;
+        }
+    }
+}
+
 
 /// return the occupation range and virtual range for the preparation of ri3mo;
 pub fn determine_ri3mo_size_for_pt2_and_rpa(scf_data: &SCF) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
@@ -5050,45 +5087,13 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     scf_data.diagonalize_hamiltonian(mpi_operator);
     scf_data.generate_occupation();
 
-    // guess_mix
-    if scf_data.mol.ctrl.guess_mix {
-        for (i_spin, &theta_deg) in scf_data.mol.ctrl.guess_mix_theta_deg.iter().enumerate() {
-            if theta_deg <= 0.0 || theta_deg > 45.0 {
-                println!(
-                    "WARNING: theta for spin {} = {:.1}° is outside the recommended range (0°–45°); mixing may be ineffective or unstable.",
-                    i_spin, theta_deg
-                );
-            }
-    
-            let (cos_theta, sin_theta) = {
-                let rad = theta_deg.to_radians();
-                (rad.cos(), rad.sin())
-            };
-    
-            let homo = scf_data.homo[i_spin];
-            let lumo = scf_data.lumo[i_spin];
-            let eigenvector_mut = scf_data.eigenvectors.get_mut(i_spin).unwrap();
-            let homo_vec: Vec<f64> = eigenvector_mut.iter_column(homo).cloned().collect();
-            let lumo_vec: Vec<f64> = eigenvector_mut.iter_column(lumo).cloned().collect();
-    
-            let (mixed_homo_vec, mixed_lumo_vec) = if i_spin == 0 {(
-                homo_vec.iter().zip(&lumo_vec).map(|(h, l)| cos_theta * h + sin_theta * l).collect::<Vec<f64>>(),
-                homo_vec.iter().zip(&lumo_vec).map(|(h, l)| -sin_theta * h + cos_theta * l).collect::<Vec<f64>>(),
-            )} else {(
-                homo_vec.iter().zip(&lumo_vec).map(|(h, l)| cos_theta * h - sin_theta * l).collect::<Vec<f64>>(),
-                homo_vec.iter().zip(&lumo_vec).map(|(h, l)| sin_theta * h + cos_theta * l).collect::<Vec<f64>>(),
-            )};
-    
-            for (val, slot) in mixed_homo_vec.iter().zip(eigenvector_mut.iter_column_mut(homo)) {
-                *slot = *val;
-            }
-            for (val, slot) in mixed_lumo_vec.iter().zip(eigenvector_mut.iter_column_mut(lumo)) {
-                *slot = *val;
-            }
-        }
-    }
-    
-    
+    // --- Apply guess_mix during the initial-guess stage ---
+    // start_mix_cycle == 0 means: perform HOMO–LUMO mixing immediately
+    // after the initial diagonalization (i.e. before the first SCF iteration).
+    if scf_data.mol.ctrl.guess_mix && scf_data.mol.ctrl.start_mix_cycle == 0_usize {
+        println!(">>> guess_mix activated: applying HOMO–LUMO mixing immediately after initial guess (start_mix_cycle = 0).");
+        apply_guess_mix(scf_data);
+    }    
 
     scf_data.generate_density_matrix();
     scf_records.update(&scf_data);
@@ -5106,6 +5111,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     //println!("======= IGOR debug for xc components ========");
 
     let mut scf_converge = [false;2];
+    let mut guess_mix_applied = (scf_data.mol.ctrl.start_mix_cycle == 0_usize); 
     while ! (scf_converge[0] || scf_converge[1]) {
         let dt1 = time::Local::now();
 
@@ -5116,6 +5122,16 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         scf_data.diagonalize_hamiltonian(mpi_operator);
         let dt1_2 = time::Local::now();
         scf_data.generate_occupation();
+
+        // --- Apply guess_mix during SCF iterations ---
+        // When start_mix_cycle > 0, perform HOMO–LUMO mixing exactly at the
+        // specified SCF cycle number (num_iter == start_mix_cycle).
+        if scf_data.mol.ctrl.guess_mix && !guess_mix_applied && (scf_records.num_iter as usize) == scf_data.mol.ctrl.start_mix_cycle {
+            println!(">>> guess_mix activated at SCF iteration {}.", scf_records.num_iter);
+            apply_guess_mix(scf_data);
+            guess_mix_applied = true;
+        }
+
         scf_data.generate_density_matrix();
 
         if scf_data.mol.ctrl.print_level>1 {
@@ -5124,6 +5140,30 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         let dt1_3 = time::Local::now();
         scf_converge = scf_data.check_scf_convergence(&scf_records);
         let dt1_4 = time::Local::now();
+        
+        // -------------------------
+        // If SCF converged earlier than requested mix point,
+        // but user requested guess_mix and it hasn't been applied yet,
+        // apply mixing now and continue SCF (do NOT exit loop).
+        // -------------------------
+        if (scf_converge[0] || scf_converge[1]) && scf_data.mol.ctrl.guess_mix && !guess_mix_applied {
+            println!(">>> guess_mix requested at start_mix_cycle = {}, but SCF converged after {} iterations. \
+            Applying HOMO-LUMO mixing now and continuing SCF.", scf_data.mol.ctrl.start_mix_cycle, scf_records.num_iter - 1);
+
+            // apply mixing and mark as applied
+            apply_guess_mix(scf_data);
+            guess_mix_applied = true;
+
+            // rebuild dependent quantities so subsequent SCF iterations are consistent
+            scf_data.generate_density_matrix();
+            scf_data.generate_hf_hamiltonian(mpi_operator);
+            scf_data.diagonalize_hamiltonian(mpi_operator);
+            scf_data.generate_occupation();
+
+            // IMPORTANT: clear convergence so the while-loop continues
+            scf_converge = [false, false];
+        }
+
         scf_records.update(&scf_data);
         let dt1_5 = time::Local::now();
 
