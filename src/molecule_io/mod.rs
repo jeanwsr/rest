@@ -391,7 +391,7 @@ impl Molecule {
             let natm = final_cint_atm.len() as i32;
             let nbas = final_cint_bas.len() as i32;
             let mut cint_data = CINTR2CDATA::new();
-            cint_data.set_cint_type(&self.cint_type);
+            cint_data.set_cint_type(self.cint_type);
             if let Some(final_cint_ecp) = &self.cint_ecpbas {
                 let necp = final_cint_ecp.len() as i32;
                 cint_data.initial_r2c_with_ecp(&final_cint_atm, natm, &final_cint_bas, nbas, &final_cint_ecp, necp, &final_cint_env);
@@ -406,7 +406,7 @@ impl Molecule {
             let natm = final_cint_atm.len() as i32;
             let nbas = final_cint_bas.len() as i32;
             let mut cint_data = CINTR2CDATA::new();
-            cint_data.set_cint_type(&self.cint_type);
+            cint_data.set_cint_type(self.cint_type);
             if let Some(final_cint_ecp) = &self.cint_ecpbas {
                 let necp = final_cint_ecp.len() as i32;
                 cint_data.initial_r2c_with_ecp(final_cint_atm, natm, final_cint_bas, nbas, final_cint_ecp, necp, final_cint_env);
@@ -433,8 +433,8 @@ impl Molecule {
             (Vec<Basis4Elem>, Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>, Vec<BasInfo>, Vec<Vec<usize>>, usize) {
 
         let mut aux_atm: Vec<Vec<i32>> = vec![];
-        let mut aux_env: Vec<f64> = vec![];
-        let mut geom_start: i32 = 0;
+        let mut aux_env: Vec<f64> = vec![0.0; ENV_PRT_START as usize];
+        let mut geom_start: i32 = ENV_PRT_START as i32;
         let cint_type = if ctrl.basis_type.to_lowercase()==String::from("spheric") {
             CintType::Spheric
         } else if ctrl.basis_type.to_lowercase()==String::from("cartesian") {
@@ -1172,6 +1172,7 @@ impl Molecule {
     }
 
     pub fn int_ij_matrixupper_v02(&self, op_name: String) -> MatrixUpper<f64> {
+        use rest_libcint_wrapper::*;
         let mut cint_data = self.initialize_cint(false);
         //let mut cur_op = op_name.to_string();
         let mut out = vec![]; 
@@ -1200,7 +1201,7 @@ impl Molecule {
             self.geom.ghost_pc_chrg.iter().zip(self.geom.ghost_pc_pos.iter_columns_full()).for_each(|(charge, pos)| {
                 let mut tmp_out = vec![];
                 let mut tmp_out_shape = vec![];
-                cint_data.set_rinv_origin(pos);
+                cint_data.set_rinv_origin([pos[0], pos[1], pos[2]]);
                 (tmp_out, tmp_out_shape) = cint_data.integral_s2ij::<int1e_rinv>(None);
                 //println!("debug pos: {:?}, charge: {}", pos, charge);
                 if out.len() == 0 {
@@ -1211,7 +1212,7 @@ impl Molecule {
                 });
             });
 
-            cint_data.set_rinv_origin(&orig_orig);
+            cint_data.set_rinv_origin(orig_orig);
         } else if op_name.eq("hcore") {
             // for the kinetic term
             (out, out_shape) = cint_data.integral_s2ij::<int1e_kin>(None);
@@ -1774,6 +1775,7 @@ impl Molecule {
     }
 
     pub fn int_ij_aux_columb_new(&self) -> MatrixFull<f64> {
+        use rest_libcint_wrapper::*;
         omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
         let n_auxbas = self.num_auxbas;
         let mut cint_data = self.initialize_cint(true);
@@ -3022,6 +3024,7 @@ impl Molecule {
 
     // generate the 3-center RI integrals and the basis pair symmetry is used to save the memory
     pub fn prepare_rimatr_for_ri_v_rayon_v05(&self) -> (MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>) {
+        use rest_libcint_wrapper::*;
 
         omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
 
@@ -3137,14 +3140,12 @@ impl Molecule {
     /// - `p0`: start AO (number of basis functions)
     /// - `p1`: end AO (number of basis functions)
     pub fn aoslice_by_atom(&self) -> Vec<[usize; 4]> {
-        use rest_libcint::cint;
-
-        let atom_of = cint::ATOM_OF as usize;
+        const ATOM_OF: usize = rest_libcint::ffi::cint_ffi::ATOM_OF as usize;
 
         let cint_data = self.initialize_cint(false);
         let cint_bas = self.cint_bas.clone();
 
-        let ao_loc = cint_data.cgto_loc();
+        let ao_loc = cint_data.ao_loc();
         let natm = self.geom.elem.len();
         let nbas = cint_bas.len();
         let mut aoslice = vec![[0; 4]; natm];
@@ -3152,7 +3153,7 @@ impl Molecule {
         // the following code should assume that atoms in `cint_bas` has been sorted by atom index
         let delimiter = (0..(nbas - 1))
             .into_iter()
-            .filter(|&idx| cint_bas[idx + 1][atom_of] != cint_bas[idx][atom_of])
+            .filter(|&idx| cint_bas[idx + 1][ATOM_OF] != cint_bas[idx][ATOM_OF])
             .collect::<Vec<usize>>();
         if delimiter.len() != natm - 1 {
             unimplemented!("Missing basis in atoms. Currently it should be internal problem in program.");

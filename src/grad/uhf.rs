@@ -7,6 +7,7 @@ use crate::Molecule;
 use crate::utilities::memory_batch::*;
 use rayon::prelude::*;
 use rest_libcint::prelude::*;
+use rest_libcint_wrapper::*;
 use rstsr::prelude::*;
 use std::collections::HashMap;
 use tensors::{matrix_blas_lapack::_power_rayon_for_symmetric_matrix, MatrixFull};
@@ -190,7 +191,7 @@ impl RIUHFGradient<'_> {
         };
 
         // shell partition of int3c2e
-        let ao_loc = cint_data.cgto_loc();
+        let ao_loc = cint_data.ao_loc();
         let aux_loc = &ao_loc[(n_basis_shell as usize)..];
         
         // available memory in MB, if not set, will be calculated from system
