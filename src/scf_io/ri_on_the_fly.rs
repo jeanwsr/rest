@@ -3,6 +3,7 @@ use crate::utilities::memory_batch::*;
 use crate::utilities::rstsr_util::*;
 use rayon::prelude::*;
 use rest_libcint::prelude::*;
+use rest_libcint_wrapper::*;
 use rstsr::prelude::*;
 use rstsr_core::prelude_dev::uninitialized_vec;
 use tensors::{MatrixFull, MatrixUpper};
@@ -123,13 +124,13 @@ pub fn generate_vj_ri_direct_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule, b
     let nset = dms.shape()[2];
     let nao = dms.shape()[0];
     let nao_tp = (nao + 1) * nao / 2;
-    let naux = aux.cgto_loc().last().unwrap().clone();
+    let naux = aux.ao_loc().last().unwrap().clone();
     let device = dms.device().clone();
     let nbas = mol_obj.cint_bas.len() as i32;
     let nbas_aux = mol_obj.cint_aux_bas.len() as i32;
 
     // get partition
-    let aux_loc = &mol.cgto_loc()[(nbas as usize)..];
+    let aux_loc = &mol.ao_loc()[(nbas as usize)..];
     let partition = blocksize_partition(&aux_loc, batch_size);
 
     // int2c2e (may be stored in SCF iteration, generate on-the-fly costs some but not that much)
@@ -518,7 +519,7 @@ pub fn generate_vk_ri_semi_direct_coeff_with_rstsr(
     let nao = mo_coeff.shape()[0];
     let nmo = mo_coeff.shape()[1];
     let nset = mo_coeff.shape()[2];
-    let naux = aux.cgto_loc().last().unwrap().clone();
+    let naux = aux.ao_loc().last().unwrap().clone();
     let device = mo_coeff.device().clone();
     let nbas = mol_obj.cint_bas.len() as i32;
     let nbas_aux = mol_obj.cint_aux_bas.len() as i32;
@@ -545,7 +546,7 @@ pub fn generate_vk_ri_semi_direct_coeff_with_rstsr(
     let nocc_max = occ_coeff_list.iter().map(|x| x.shape()[1]).max().unwrap();
 
     // get partition
-    let aux_loc = &mol.cgto_loc()[(nbas as usize)..];
+    let aux_loc = &mol.ao_loc()[(nbas as usize)..];
     let partition = blocksize_partition(&aux_loc, batch_size);
 
     // initialize vk as result
@@ -700,7 +701,7 @@ pub fn generate_vk_ri_direct_dm_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule
     // get shapes
     let nao = dms.shape()[0];
     let nset = dms.shape()[2];
-    let naux = aux.cgto_loc().last().unwrap().clone();
+    let naux = aux.ao_loc().last().unwrap().clone();
     let device = dms.device().clone();
     let nbas = mol_obj.cint_bas.len() as i32;
     let nbas_aux = mol_obj.cint_aux_bas.len() as i32;
@@ -709,7 +710,7 @@ pub fn generate_vk_ri_direct_dm_with_rstsr(dms: TsrView<f64>, mol_obj: &Molecule
     assert_eq!(dms.shape(), &[nao, nao, nset], "Density matrices must have shape (nao, nao, nset)");
 
     // get partition
-    let ao_loc = &mol.cgto_loc()[..=(nbas as usize)];
+    let ao_loc = &mol.ao_loc()[..=(nbas as usize)];
     let partition = blocksize_partition(&ao_loc, batch_size);
 
     // initialize vk as result
