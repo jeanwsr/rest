@@ -81,7 +81,6 @@ pub fn bse_main(scf_data:&mut SCF){
         }
     }else{
         println!("Specific BSE calculations are triggered");
-        prepare_ri3mo(scf_data,'N');
         let bse_spin=qp_ctrl.bse_spin.clone();
         println!("BSE Type:{}",bse_spin);
         let xlet=if bse_spin=="triplet"{'T'}else if bse_spin=="singlet"{'S'}else{panic!("invalid choice for bse_spin!")};
@@ -203,37 +202,25 @@ pub fn bse_main(scf_data:&mut SCF){
         }
     }
 }
-pub fn prepare_ri3mo(scf_data:&mut SCF,response_or_not:char){
-    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,response_or_not);
-    let (start_mo,num_state_response,occ_size,vir_size_response,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
-    let mut range:(Range<usize>, Range<usize>);
-    let range_ov=(start_mo..homo+1, lumo..num_state_response);
-    let range_ff=(start_mo..num_state,start_mo..num_state);
-    let mut rimatr=scf_data.rimatr.clone();
-    scf_data.generate_ri3mo_rayon(range_ov.0,range_ov.1);
-    scf_data.rimatr=rimatr.clone();
-    scf_data.generate_ri3mo_full_rayon(range_ff.0,range_ff.1);
-    scf_data.rimatr=rimatr;
-}
 pub fn get_submatrix(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:char)->MatrixFull<f64>{
     let mut vector:Vec<(RIFull<f64>,Range<usize>,Range<usize>)>=Vec::new();
-    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'N');
+    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,response_or_not);
     let range_oo=(start_mo..homo+1, start_mo..homo+1);
     let range_vv=(lumo..num_state, lumo..num_state);
     let range_ov=(start_mo..homo+1, lumo..num_state);
-    if choice_a=='O'&&choice_b=='V'&&response_or_not=='Y'{
-        vector=scf_data.ri3mo.clone().unwrap();
-    }else if choice_a=='F'&&choice_b=='F'{
-        vector=scf_data.ri3mo_full.clone().unwrap();
+    let range_ff=(start_mo..num_state,start_mo..num_state);
+    if choice_a=='F'&&choice_b=='F'{
+        vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_ff.0,range_ff.1);
     }else if choice_a=='O'&&choice_b=='O'{
         vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_oo.0,range_oo.1);
     }else if choice_a=='V'&&choice_b=='V'{
         vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_vv.0,range_vv.1);
-    }else if choice_a=='O'&&choice_b=='V'&&response_or_not=='N'{
+    }else if choice_a=='O'&&choice_b=='V'{
         vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_ov.0,range_ov.1);
     }else {
         panic!("invalid choice of ri subspace!")
     };
+    println!("Allocated RI Tensor: {}-{}, Size={:?}, For Response={}",choice_a,choice_b,vector[0].0.size,response_or_not);
     let matrix:MatrixFull<f64>=vector[0].0.rifull_to_matfull_i_jk();
     matrix
 }
@@ -336,7 +323,7 @@ pub fn construct_inverse_dielectric(scf_data:&SCF,epsilon:&Vec<f64>)->MatrixFull
     if scf_data.mol.ctrl.print_level>1{
         println!("occ_size={},vir_size(for response)={}",occ_size,vir_size);
     }
-    let response=ri_gw::response_matrix(epsilon,occ_size,vir_size,&ri_ov,0.0,'R');
+    let response=ri_gw::response_matrix_old(epsilon,occ_size,vir_size,&ri_ov,0.0,'R');
     let inverse_dielectric=ri_gw::inverse_dielectric_matrix(&response,'R');
     inverse_dielectric
 }
@@ -568,6 +555,7 @@ pub fn pysoc_prep_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>)->
         let duration3=start.elapsed();
         //println!("RI-OO耗时: {:?}", duration3-duration2);
         let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
+        println!("Created RI-OO-Tilde. Size=[{},{},{}]",occ_size,occ_size,num_auxbas);
         _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
         drop(inverse_dielectric);
         ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
@@ -599,8 +587,10 @@ pub fn pysoc_prep_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>)->
         println!("num_auxbas={}",ri_oo.size[0]);
         let num_auxbas=ri_oo.size[0];
         let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
+        println!("Created RI-OO-Tilde. Size=[{},{},{}]",occ_size,occ_size,num_auxbas);
         _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
         drop(ri_oo);
+        println!("Deallocated RI-OO. Size=[{},{},{}]",occ_size,occ_size,num_auxbas);
         ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
         ri_oo_tilde=ri_oo_tilde.transpose_and_drop();
         ri_oo_tilde.reshape([occ_size*num_auxbas,occ_size]);
@@ -608,9 +598,11 @@ pub fn pysoc_prep_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>)->
         let mut ri_vv=get_submatrix(scf_data,'V','V','N');
         ri_vv.reshape([num_auxbas*vir_size,vir_size]);
         let mut ri_ov_tilde:MatrixFull<f64>=MatrixFull::new(ri_ov.size,0.0);
+        println!("Created RI-OV-Tilde. Size=[{},{},{}]",occ_size,vir_size,num_auxbas);
         _dgemm_full(&inverse_dielectric,'N',&ri_ov,'N',&mut ri_ov_tilde,1.0,0.0);
         ri_ov_tilde.reshape([num_auxbas*occ_size,vir_size]);
         let mut ri_ov_b=ri_ov.clone();
+        println!("Created RI-OV for B block. Size=[{},{},{}]",occ_size,vir_size,num_auxbas);
         ri_ov_b.reshape([num_auxbas*occ_size,vir_size]);
         drop(inverse_dielectric);
         let energy_diag=construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
@@ -641,7 +633,7 @@ pub fn leading_components(eigenvector: &Vec<f64>,occ_size:usize, vir_size: usize
         .enumerate()
         .map(|(n, x)| {
             let mut index = n; // 从0开始的索引
-            if index>occ_size*vir_size-1{
+            if index<occ_size*vir_size{
                 let j = occ_size+index / occ_size;  // 整除
                 let i = index % occ_size;  // 取余
                 (i, j, *x)

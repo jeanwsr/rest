@@ -8,7 +8,7 @@ use rayon::result;
 use reqwest::blocking::Response;
 use rest_tensors::{RIFull};
 use tensors::{matrix_blas_lapack::{_dinverse,_dsyev}, ri, MathMatrix, MatrixFull};
-use rest_tensors::matrix::matrix_blas_lapack::{_dgees,_dgemm_full,_dgemv};
+use rest_tensors::matrix::matrix_blas_lapack::{_dgees,_dgemm,_dgemv};
 use rest_tensors::MatrixUpper;
 use crate::ri_bse;
 use crate::ri_rpa;
@@ -97,23 +97,25 @@ pub fn hamiltonian_ao2mo(scf_data:&SCF,choice:char)->MatrixFull<f64>{
         println!("ao dimensions={}",ao_dimensions);
         println!("mo dimensions={}",dimensions);
     }
-    hamiltonian.data.par_iter_mut().enumerate().for_each(|(index, element)| {
-        let mut i = index / dimensions;
-        let mut j = index % dimensions;
-        if choice=='V'{
-            i+=occ_size;
-            j+=occ_size;
-        }
-        //println!("now computing:{}-{}",i,j);
-        // 计算element的值并赋值
-        for mu in 0..ao_dimensions{
-            for nu in 0..ao_dimensions{
-                *element+=(eigenvecs[[mu,i]]*eigenvecs[[nu,j]]*ao_hamiltonian[[mu,nu]]);
-            }
-        }
-    });
-
-    hamiltonian
+    let mut c_t_h_ao=MatrixFull::new([dimensions,ao_dimensions],0.0);
+    let mut h_mo=MatrixFull::new([dimensions,dimensions],0.0);
+    if choice=='O'{
+        _dgemm(&eigenvecs,((0..ao_dimensions),(0..occ_size)),'T',
+               &ao_hamiltonian,((0..ao_dimensions),(0..ao_dimensions)),'N',
+               &mut c_t_h_ao,((0..occ_size),(0..ao_dimensions)),1.0,0.0);
+        _dgemm(&c_t_h_ao,((0..occ_size),(0..ao_dimensions)),'N',
+               &eigenvecs,((0..ao_dimensions),(0..occ_size)),'N',
+               &mut h_mo,((0..occ_size),(0..occ_size)),1.0,0.0);
+    }else{
+        _dgemm(&eigenvecs,((0..ao_dimensions),(occ_size..ao_dimensions)),'T',
+               &ao_hamiltonian,((0..ao_dimensions),(0..ao_dimensions)),'N',
+               &mut c_t_h_ao,((0..dimensions),(0..ao_dimensions)),1.0,0.0);
+        _dgemm(&c_t_h_ao,((0..dimensions),(0..ao_dimensions)),'N',
+               &eigenvecs,((0..ao_dimensions),(occ_size..ao_dimensions)),'N',
+               &mut h_mo,((0..dimensions),(0..dimensions)),1.0,0.0);
+    }
+    
+    h_mo
 }
 pub fn diagonalize_and_renormalize(scf_data:&SCF,subspace_hamiltonian:&MatrixFull<f64>,choice:char)->(Vec<f64>,MatrixFull<f64>){
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');

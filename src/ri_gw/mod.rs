@@ -125,14 +125,14 @@ pub fn show_energy_levels(scf_data:&SCF){
 }
 
 pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
-    let v_matrix=v_matrix(&scf_data);
+    let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
+    let v_matrix=v_matrix(&scf_data,&ri_mat);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let (start_mo,num_state_cutoff,occ_size,vir_size_cutoff,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let hatree=27.2113863;
     let spin_channel=scf_data.mol.ctrl.spin_channel;
     let mut quasiparticle_energies_g:Vec<f64>=Vec::new();
     let mut quasiparticle_energies_w:Vec<f64>=Vec::new();
-    let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
     let start:usize=0;
     let end:usize=6*occ_size;
     if scf_data.mol.ctrl.print_level>2{
@@ -141,7 +141,8 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     }
     let mut quasiparticle_energies_g=scf_data.gwqp.0.clone();
     let quasiparticle_energies_w=scf_data.gwqp.1.clone();
-    let ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    ri_ov=ri_ov.transpose();
     //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,0);
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
     let mut save_energies:Vec<f64>=vec![0.0;num_state_cutoff];
@@ -173,8 +174,6 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     display::full_quasiparticles(&quasiparticle_energies_g,occ_size);
     quasiparticle_energies_g
 } 
-
-
 pub fn vxc_ao2mo(scf_data:&SCF)->Vec<f64>{
     let eigenvecs=scf_data.eigenvectors.clone();
     let vxc_ao=scf_data.generate_vxc_rayon(1.0).2[0].to_matrixfull().unwrap().clone();
@@ -221,9 +220,8 @@ pub fn v_mn_matrix_element(scf_data:&SCF,m:usize,n:usize,ri_mat:&MatrixFull<f64>
     }
     v_mn_matrix_element
 }
-pub fn v_matrix(scf_data:&SCF)->MatrixFull<f64>{
+pub fn v_matrix(scf_data:&SCF,ri_mat:&MatrixFull<f64>)->MatrixFull<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
-    let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
     let mut v_matrix:MatrixFull<f64>=MatrixFull::new([num_state,num_state],0.0);
     for i in 0..num_state{
         for j in 0..num_state{
@@ -314,6 +312,32 @@ pub fn display_and_save_quasiparticles(scf_data:&mut SCF,quasiparticle_energies_
     }
 }
 pub fn response_matrix(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,omega:f64,part:char)->MatrixFull<f64>{
+    let mut diag=vec![0.0;occ_size*vir_size];
+    let num_auxbas=ri_ov.size[1];
+    let mut response=MatrixFull::new([num_auxbas,0],0.0);
+    (0..occ_size*vir_size).for_each(|n|{
+        let i=n%occ_size;
+        let a=occ_size+n/occ_size;
+        let energy_gap=quasiparticle_energies_w[a]-quasiparticle_energies_w[i];
+        diag[n]=if part=='I'{-2.0*energy_gap/(energy_gap.powf(2.0)+omega.powf(2.0))}
+            else{-2.0*energy_gap/(energy_gap.powf(2.0)-omega.powf(2.0))};
+    });
+    let mut chi_as_vecs:Vec<(usize,Vec<f64>)>=ri_ov.iter_columns_full().enumerate().par_bridge().map(|(p,ri_p)|{
+        let mut work_vec=vec![0.0;occ_size*vir_size];
+        (0..occ_size*vir_size).for_each(|ia|work_vec[ia]=ri_p[ia]*diag[ia]);
+        let mut chi_p=vec![0.0;num_auxbas];
+        _dgemv(ri_ov,&work_vec,&mut chi_p,'T', 1.0, 0.0, 1, 1);
+        (p,chi_p.clone())
+    }).collect();
+    chi_as_vecs.sort_by_key(|(i, _)| *i);
+    for chi_p in chi_as_vecs {
+        response.push_column(&chi_p.1);
+    }
+    response.self_multiple(2.0);
+    //println!("a response has been collected, its size is:{},{}",response.size[0],response.size[1]);
+    response
+}
+pub fn response_matrix_old(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,omega:f64,part:char)->MatrixFull<f64>{
     let num_auxbas=ri_ov.size[0];
     let mut ri_to_be_processed=MatrixFull::new([num_auxbas,0],0.0);
     let mut ri_as_vecs:Vec<(usize,Vec<f64>)>=ri_ov.iter_columns_full().enumerate().par_bridge().map(|(n,ri_n)|{
@@ -370,7 +394,7 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
     let fermi_energy=(quasiparticle_energies_g[occ_size-1]+quasiparticle_energies_g[occ_size])/2.0;
     let sign=if omega>fermi_energy{1}else{-1};
     let mut contour:f64=0.0;
-    let num_auxbas=ri_ov.size[0];
+    let num_auxbas=ri_ov.size[1];
     let mut residue_count=0;
     let mut contour=0.0;
     if sign==1{
@@ -511,7 +535,8 @@ pub fn spectrum_test(scf_data:&SCF,num_freq:usize){
         quasiparticle_energies.push(eigenenergies[n]);
     }
     let ri_full:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
-    let ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+
     let start_freq:f64=-0.8;
     let end_freq:f64=0.8;
     let step:f64=0.8/1000.0;
@@ -534,7 +559,8 @@ pub fn x_alpha_gw(scf_data:&mut SCF)->Vec<f64>{
     let xc_name = scf_data.mol.ctrl.xc.to_lowercase();
     let exchange_under_dfa=get_pure_x_or_c_of_xc(scf_data,&xc_name,'X');
     let x_alpha=qp_ctrl.x_alpha;
-    let v_matrix=v_matrix(&scf_data);
+    let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
+    let v_matrix=v_matrix(&scf_data,&ri_mat);
     ks_energies.into_iter().enumerate().map(|(n,e_n)|{
         let mut exchange=0.0;
         for i in 0..homo+1{
@@ -546,7 +572,8 @@ pub fn x_alpha_gw(scf_data:&mut SCF)->Vec<f64>{
 pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let delta=qp_ctrl.gw_linearize_shift;
-    let v_matrix=v_matrix(&scf_data);
+    let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
+    let v_matrix=v_matrix(&scf_data,&ri_mat);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let mut num_state_qp_range=num_state;
     if qp_ctrl.scgw=="g0w0"{
@@ -557,7 +584,8 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
     let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
     let mut quasiparticle_energies_g:Vec<f64>=scf_data.gwqp.0.clone();
     let mut quasiparticle_energies_w:Vec<f64>=scf_data.gwqp.1.clone();
-    let ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    ri_ov=ri_ov.transpose();
     //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,0);
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
     let mut save_energies:Vec<f64>=vec![0.0;num_state];
@@ -652,7 +680,8 @@ pub fn get_homo_vx_or_vc(scf_data:&mut SCF,name:&str,choice:char)->f64{
 }
 pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperator>){
     let printlevel=scf_data.mol.ctrl.print_level.clone();
-    let v_matrix=v_matrix(&scf_data);
+    let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
+    let v_matrix=v_matrix(&scf_data,&ri_mat);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let mut rs_particles:Vec<f64>=Vec::new();
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
@@ -670,7 +699,6 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     let eigenenergies:Vec<f64>=scf_data.eigenvalues[0].clone();
     let mut quasiparticle_energies_g:Vec<f64>=Vec::new();
     let mut quasiparticle_energies_w:Vec<f64>=Vec::new();
-    let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
     if scf_data.mol.ctrl.print_level>2{
         println!("ri_mat full:");
         ri_mat.formated_output(1000,"full");
@@ -691,7 +719,8 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
             quasiparticle_energies_w.push(eigenenergies[n]);
         }
     }
-    let ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    ri_ov=ri_ov.transpose();
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
     let n=homo;
     let mut exchange=0.0;
@@ -726,16 +755,6 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
         writeln!(file.expect("write failure"), "{},{}",homo_qp,lumo_qp);
     }
     println!("The QP energy of LUMO obtained by GWA is {}",lumo_qp);
-}
-pub fn get_homo_gw_exchange(scf_data:&SCF)->f64{
-    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
-    let v_matrix=v_matrix(&scf_data);
-    let mut exchange=0.0;
-    let n=homo;
-    for i in 0..homo+1{
-        exchange-=v_matrix[[n,i]];
-    }
-    exchange
 }
 pub fn obtain_vx_vc_terms(scf_data:&mut SCF){
     println!("starts obtaining HOMO vx and vc terms from various DFAs");

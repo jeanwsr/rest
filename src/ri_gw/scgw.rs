@@ -106,9 +106,11 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
 
 pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,threshold:f64)->Vec<f64>{
     //println!("Check that gwqp is RS or not: GWQP_G-E_KS[4]={},GWQP_W-E_KS[4]={},GWQP_G-E_KS[4]={}",scf_data.gwqp.0[4]-scf_data.eigenvalues[0][4],scf_data.gwqp.1[4]-scf_data.eigenvalues[0][4],scf_data.gwqp.0[4]-scf_data.renormalized_singles_particles[4]);
-    let ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    ri_ov=ri_ov.transpose();
+    println!("RI-OV Shape={:?}",ri_ov.size);
     let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
-    let v_matrix=ri_gw::v_matrix(&scf_data);
+    let v_matrix=ri_gw::v_matrix(&scf_data,&ri_mat);
     let ks_energies=scf_data.eigenvalues[0].clone();
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(&scf_data,'Y');
     let w_c_at_freqs=ri_gw::generate_w_c(scf_data,&ri_ov,&ri_mat,&scf_data.gwqp.0,&scf_data.gwqp.1,num_state,occ_size,vir_size,num_freq);
