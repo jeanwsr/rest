@@ -115,9 +115,11 @@
 - `auxbas_path`: 取值String类型，缺省值为def2-SV(P)-JKFIT。计算所使用的辅助基组所在位置。辅助基组通常与常规基组放置在相同的文件夹下(`{basis_set_pool}`)。使用最广泛的辅助基组为`def2-SV(P)-JKFIT`，则申明方式应为`auxbas_path={basis_set_pool}/def2-SV(P)-JKFIT`。**注意：辅助基组信息高度依赖于具体的计算体系，缺省值基组较大，不一定合适大体系计算。可以考虑使用具体基组匹配的辅助基组。若`eri_type=analytic`，则无需使用辅助基组，不用申明auxbas_path**。
 
 `basis_path`和`auxbas_path`中，`{basis_set_pool}`可以省略，例如只写 `cc-pVTZ`。REST 将自动从某些默认路径搜索该文件，优先级为：
-    1. 环境变量 `REST_BASIS_DIR`；
-    2. 内置路径 `/opt/rest_workspace/rest/basis-set-pool/` （REST docker 的默认基组路径）；
-    3. `$REST_HOME/rest/basis-set-pool/`
+
+1. 环境变量 `REST_BASIS_DIR`；
+2. `$CONDA_PREFIX/share/rest/basis-set-pool/` (仅在使用 conda 安装的 rest 时有效)；
+3. 内置路径 `/opt/rest_workspace/rest/basis-set-pool/` （REST docker 的默认基组路径）；
+4. `$REST_HOME/rest/basis-set-pool/`
 
 若以上搜索都不成功则尝试使用 bse 下载。
 
