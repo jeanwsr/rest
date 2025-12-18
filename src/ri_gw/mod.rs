@@ -11,6 +11,7 @@ use rayon::iter::ParallelBridge;
 use libc::seccomp_notif;
 use rayon::result;
 use reqwest::blocking::Response;
+use std::time::Instant;
 use std::sync::{Arc, Mutex};
 use rest_tensors::{RIFull};
 use tensors::{matrix_blas_lapack::{_dinverse,_dsyev}, ri, MathMatrix, MatrixFull};
@@ -142,7 +143,6 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     let mut quasiparticle_energies_g=scf_data.gwqp.0.clone();
     let quasiparticle_energies_w=scf_data.gwqp.1.clone();
     let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
-    ri_ov=ri_ov.transpose();
     //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,0);
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
     let mut save_energies:Vec<f64>=vec![0.0;num_state_cutoff];
@@ -175,22 +175,17 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     quasiparticle_energies_g
 } 
 pub fn vxc_ao2mo(scf_data:&SCF)->Vec<f64>{
-    let eigenvecs=scf_data.eigenvectors.clone();
+    let eigenvecs=scf_data.eigenvectors[0].clone();
     let vxc_ao=scf_data.generate_vxc_rayon(1.0).2[0].to_matrixfull().unwrap().clone();
     let dimensions=vxc_ao.size[0];
     let mut vxc_nn=vec![0.0;dimensions];
     let mut element=0.0;
-    for i in (0..dimensions){
-        //println!("now computing:{}-{}",i,i);
-        element=0.0;
-        for mu in 0..dimensions{
-            for nu in 0..dimensions{
-                element+=(eigenvecs[0][[mu,i]]*eigenvecs[0][[nu,i]]*vxc_ao[[mu,nu]]);
-            }
-        }
-        vxc_nn[i]=element;
-    }
-    vxc_nn
+    eigenvecs.iter_columns_full().map(|vec|{
+        let ev=vec.to_vec();
+        let mut fv=vec![0.0;dimensions];
+        _dgemv(&vxc_ao,&ev,&mut fv,'N', 1.0, 0.0, 1, 1);
+        ev.iter().zip(fv.iter()).fold(0.0,|acc,(ev_i,fv_i)|acc+(ev_i*fv_i))
+    }).collect()
     //No need to worry about cutoff
 }
 pub fn vxc_ao2mo_rayon(scf_data:&SCF)->MatrixFull<f64>{
@@ -254,14 +249,46 @@ pub fn generate_w_c(scf_data:&SCF,ri_ov:&MatrixFull<f64>,ri_full:&MatrixFull<f64
     }
     let (sender,receiver) = channel();
     rayon::prelude::IndexedParallelIterator::zip(omega_1.par_iter(), weight.par_iter()).for_each_with(sender, |s, (omega_1, weight)| {
+        let start=Instant::now();
         let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,*omega_1,'I');
         let inverse_dielectric=inverse_dielectric_matrix(&response,'I');
         let w_c=w_c_matrix(&inverse_dielectric,num_state,ri_full);
+        println!("Evaluation of W_c for omega={} has finished. This step took {:?}",omega_1,start.elapsed());
         s.send((*omega_1,*weight,w_c)).expect("unsuccessful collection of w_c")
     });
     let w_c_at_freqs:Vec<(f64,f64,MatrixFull<f64>)>=receiver.into_iter().collect();
     omp_get_num_threads_wrapper();
     w_c_at_freqs
+}
+pub fn generate_w_c_serial(scf_data:&SCF,ri_ov:&MatrixFull<f64>,ri_full:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,num_state:usize,occ_size:usize,vir_size:usize,num_freq:usize)->Vec<(f64,f64,MatrixFull<f64>)>{
+    omp_get_num_threads_wrapper();
+    let freq_grid_type = scf_data.mol.ctrl.freq_grid_type;
+    let max_freq = scf_data.mol.ctrl.freq_cut_off;
+    let mut sp = format!("The frequency integration is tabulated by {:3} grids using", num_freq);
+    let (mut omega_1,weight) = if freq_grid_type==0 {
+        sp = format!("{} the modified Gauss-Legendre grids",sp);
+        ri_rpa::trans_gauss_legendre_grids(1.0, num_freq)
+    } else if freq_grid_type==1 {
+        sp = format!("{} the standard Gauss-Legendre grids",sp);
+        ri_rpa::gauss_legendre_grids([0.0,max_freq], num_freq)
+    } else if freq_grid_type== 2 {
+        sp = format!("{} the logarithmic grids",sp);
+        ri_rpa::logarithmic_grid([0.0,max_freq], num_freq)
+    } else {
+        sp = format!("{} the modified Gauss-Legendre grids",sp);
+        ri_rpa::trans_gauss_legendre_grids(1.0, num_freq)
+    };
+    if scf_data.mol.ctrl.print_level>1 {
+        println!("{}", sp);
+    }
+    omega_1.iter().zip(weight.iter()).map(|(omega_1, weight)| {
+        let start=Instant::now();
+        let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,*omega_1,'I');
+        let inverse_dielectric=inverse_dielectric_matrix(&response,'I');
+        let w_c=w_c_matrix(&inverse_dielectric,num_state,ri_full);
+        println!("Evaluation of W_c for omega={} has finished. This step took {:?}",omega_1,start.elapsed());
+        (*omega_1,*weight,w_c)
+    }).collect()
 }
 pub fn calculate_imag(w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,num_state:usize,n:usize,omega:f64,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>)->f64{
     omp_get_num_threads_wrapper();
@@ -311,7 +338,7 @@ pub fn display_and_save_quasiparticles(scf_data:&mut SCF,quasiparticle_energies_
         //scf_data.eigenvalues[0][i]=quasiparticle_energies[i];
     }
 }
-pub fn response_matrix(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,omega:f64,part:char)->MatrixFull<f64>{
+pub fn response_matrix_legacy(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,omega:f64,part:char)->MatrixFull<f64>{
     let mut diag=vec![0.0;occ_size*vir_size];
     let num_auxbas=ri_ov.size[1];
     let mut response=MatrixFull::new([num_auxbas,0],0.0);
@@ -337,7 +364,7 @@ pub fn response_matrix(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_siz
     //println!("a response has been collected, its size is:{},{}",response.size[0],response.size[1]);
     response
 }
-pub fn response_matrix_old(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,omega:f64,part:char)->MatrixFull<f64>{
+pub fn response_matrix(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,omega:f64,part:char)->MatrixFull<f64>{
     let num_auxbas=ri_ov.size[0];
     let mut ri_to_be_processed=MatrixFull::new([num_auxbas,0],0.0);
     let mut ri_as_vecs:Vec<(usize,Vec<f64>)>=ri_ov.iter_columns_full().enumerate().par_bridge().map(|(n,ri_n)|{
@@ -394,7 +421,7 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
     let fermi_energy=(quasiparticle_energies_g[occ_size-1]+quasiparticle_energies_g[occ_size])/2.0;
     let sign=if omega>fermi_energy{1}else{-1};
     let mut contour:f64=0.0;
-    let num_auxbas=ri_ov.size[1];
+    let num_auxbas=ri_ov.size[0];
     let mut residue_count=0;
     let mut contour=0.0;
     if sign==1{
@@ -585,7 +612,6 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
     let mut quasiparticle_energies_g:Vec<f64>=scf_data.gwqp.0.clone();
     let mut quasiparticle_energies_w:Vec<f64>=scf_data.gwqp.1.clone();
     let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
-    ri_ov=ri_ov.transpose();
     //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,0);
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
     let mut save_energies:Vec<f64>=vec![0.0;num_state];
@@ -720,7 +746,6 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
         }
     }
     let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
-    ri_ov=ri_ov.transpose();
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
     let n=homo;
     let mut exchange=0.0;

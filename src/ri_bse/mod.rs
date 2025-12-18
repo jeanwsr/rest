@@ -323,7 +323,7 @@ pub fn construct_inverse_dielectric(scf_data:&SCF,epsilon:&Vec<f64>)->MatrixFull
     if scf_data.mol.ctrl.print_level>1{
         println!("occ_size={},vir_size(for response)={}",occ_size,vir_size);
     }
-    let response=ri_gw::response_matrix_old(epsilon,occ_size,vir_size,&ri_ov,0.0,'R');
+    let response=ri_gw::response_matrix(epsilon,occ_size,vir_size,&ri_ov,0.0,'R');
     let inverse_dielectric=ri_gw::inverse_dielectric_matrix(&response,'R');
     inverse_dielectric
 }
