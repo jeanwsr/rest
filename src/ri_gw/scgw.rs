@@ -110,7 +110,12 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,t
     println!("RI-OV Shape={:?}",ri_ov.size);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
+    let start=Instant::now();
     let v_matrix=ri_gw::v_matrix(&scf_data,&ri_mat);
+    let time1=start.elapsed();
+    println!("V Matrix Constructed. This step took {:?}",time1);
+    let v_matrix=ri_gw::v_matrix_old(&scf_data,&ri_mat);
+    println!("As comparison, previous version of this step took {:?}",start.elapsed()-time1);
     let ks_energies=scf_data.eigenvalues[0].clone();
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(&scf_data,'Y');
     let w_c_at_freqs=if qp_ctrl.gw_imag_rayon{

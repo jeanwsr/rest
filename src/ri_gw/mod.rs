@@ -14,6 +14,7 @@ use reqwest::blocking::Response;
 use std::time::Instant;
 use std::sync::{Arc, Mutex};
 use rest_tensors::{RIFull};
+use rayon::prelude::ParallelSliceMut;
 use tensors::{matrix_blas_lapack::{_dinverse,_dsyev}, ri, MathMatrix, MatrixFull};
 //use rest::molecule_io::Molecule;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgees,_dgemm_full,_dgemv};
@@ -215,7 +216,96 @@ pub fn v_mn_matrix_element(scf_data:&SCF,m:usize,n:usize,ri_mat:&MatrixFull<f64>
     }
     v_mn_matrix_element
 }
-pub fn v_matrix(scf_data:&SCF,ri_mat:&MatrixFull<f64>)->MatrixFull<f64>{
+pub fn v_matrix(
+    scf_data: &SCF,
+    ri_mat: &MatrixFull<f64>
+) -> MatrixFull<f64> {
+    let (start_mo, num_state, occ_size, vir_size, homo, lumo) = 
+        get_occupation_parameters(scf_data, 'Y');
+    
+    let mut v_matrix = MatrixFull::new([num_state, num_state], 0.0);
+    let n_rows = ri_mat.size[0];
+    
+    // 预计算列索引，减少重复计算
+    let mut col_indices = Vec::with_capacity(num_state * num_state);
+    for i in 0..num_state {
+        for j in 0..num_state {
+            col_indices.push(i * num_state + j);
+        }
+    }
+    // 并行化外层循环
+    v_matrix.data.par_chunks_mut(num_state)
+        .enumerate()
+        .for_each(|(i, row)| {
+            for j in 0..num_state {
+                let col_index = col_indices[i * num_state + j];
+                if col_index < ri_mat.size[1] {
+                    let mut sum = 0.0;
+                    let start = col_index * n_rows;
+                    
+                    // 使用迭代器和fold
+                    sum = ri_mat.data[start..start + n_rows]
+                        .iter()
+                        .fold(0.0, |acc, &x| acc + x * x);
+                    
+                    row[j] = sum;
+                }
+            }
+        });
+    
+    v_matrix
+}
+pub fn v_matrix_symmetric_optimized(
+    scf_data: &SCF,
+    ri_mat: &MatrixFull<f64>
+) -> MatrixFull<f64> {
+    let (_, num_state, _, _, _, _) = get_occupation_parameters(scf_data, 'Y');
+    let n_rows = ri_mat.size[0];
+    
+    // 创建结果矩阵
+    let mut v_matrix = MatrixFull::new([num_state, num_state], 0.0);
+    
+    // 预先计算所有列的点积
+    let column_sums: Vec<f64> = (0..num_state * num_state)
+        .into_par_iter()
+        .map(|col_idx| {
+            let start = col_idx * n_rows;
+            let end = start + n_rows;
+            ri_mat.data[start..end]
+                .iter()
+                .fold(0.0, |acc, &x| acc + x * x)
+        })
+        .collect();
+    
+    // 将列和重塑为矩阵形式以便并行访问
+    let column_sums_matrix: Vec<Vec<f64>> = column_sums
+        .chunks(num_state)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    
+    // 使用行并行填充上三角
+    v_matrix.data.par_chunks_mut(num_state)
+        .enumerate()
+        .for_each(|(i, row)| {
+            // 获取当前行的列和
+            let row_sums = &column_sums_matrix[i];
+            
+            // 填充当前行的上三角部分
+            for j in i..num_state {
+                row[j] = row_sums[j];
+            }
+        });
+    
+    // 串行填充下三角（对称性）
+    for i in 0..num_state {
+        for j in 0..i {
+            v_matrix[[i, j]] = v_matrix[[j, i]];
+        }
+    }
+    
+    v_matrix
+}
+pub fn v_matrix_old(scf_data:&SCF,ri_mat:&MatrixFull<f64>)->MatrixFull<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let mut v_matrix:MatrixFull<f64>=MatrixFull::new([num_state,num_state],0.0);
     for i in 0..num_state{
