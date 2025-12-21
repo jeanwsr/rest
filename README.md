@@ -129,8 +129,9 @@
 	  4. REST conda 默认路径： `$CONDA_PREFIX/share/rest/basis-set-pool/cc-pVTZ`
       5. `$REST_HOME/rest/basis-set-pool/cc-pVTZ`
       6. 自动从BSE库在线获取（若本地未找到），并保存在当前工作目录
+    - 以上 2-5 情形不区分基组名称的大小写。 
 - `auxbas_path`: 取值String类型，指定辅助基组路径，仅当`eri_type=ri-v`时需要设置  
-    缺省值：def2-SV(P)-JKFIT。（该基组较大，建议根据体系换用匹配的辅助基组）
+    缺省值：def2-universal-jkfit。（该基组较大，建议根据体系换用匹配的辅助基组）
 	设置方式与`basis_path`相同，程序搜索路径一致。
 
 ### 自定义基组使用方法
@@ -166,13 +167,13 @@ REST 支持用户自定义或混合基组：
 # 示例1：使用标准基组和缺省辅助基组（简写格式）
 eri_type = ri-v
 basis_type = Spheric
-basis_path = cc-pVTZ                    # 程序自动搜索 cc-pVTZ 文件夹
+basis_path = cc-pvtz                    # 程序自动搜索 cc-pvtz 文件夹
 
 # 示例2：使用标准基组，同时申明辅助基组（简写格式）
 eri_type = ri-v
 basis_type = Spheric
-basis_path = cc-pVTZ                    # 程序自动搜索 cc-pVTZ 文件夹
-auxbas_path = def2-SV(P)-JKFIT          # 程序自动搜索同名辅助基组文件夹
+basis_path = cc-pvtz                    # 程序自动搜索 cc-pvtz 文件夹
+auxbas_path = def2-universal-jkfit      # 程序自动搜索同名辅助基组文件夹
 
 # 示例3：使用自定义基组（相对路径）
 eri_type = ri-v
@@ -184,7 +185,7 @@ auxbas_path = ./my_aux_basis            # 使用自定义辅助基组
 eri_type = ri-v
 basis_type = Spheric
 basis_path = /shared/basis/def2-TZVP    # 明确指定完整路径
-auxbas_path = def2-TZVP-JKFIT           # 简写格式，自动搜索
+auxbas_path = def2-universal-jkfit      # 简写格式，自动搜索
 ```
 
 ## 自洽场计算相关关键词（Keyword）
@@ -292,7 +293,7 @@ auxbas_path = def2-TZVP-JKFIT           # 简写格式，自动搜索
          xc =                        "x3lyp"
          empirical_dispersion =      "d3bj"
          basis_path =                "cc-pVDZ"
-         auxbas_path =               "def2-SV(P)-JKFIT"
+         auxbas_path =               "def2-universal-jkfit"
          charge =                    0.0
          spin =                      1.0
          spin_polarization =         false

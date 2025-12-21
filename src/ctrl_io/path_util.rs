@@ -1,4 +1,6 @@
 use std::{env, path};
+use std::collections::HashMap;
+use lazy_static::lazy_static;
 
 const DEFAULT_BASIS_PATH: &str = "/opt/rest_workspace/rest/basis-set-pool/";
 
@@ -71,6 +73,22 @@ pub fn get_rest_basis_dir(print_level:usize) -> Vec<String> {
     rest_basis_dir
 }
 
+lazy_static!{
+    static ref BASIS_ALIAS: HashMap<&'static str, &'static str> = HashMap::from([
+        ("def2-sv(p)-jkfit", "def2-universal-jkfit")
+    ]);
+} 
+
+pub fn filter_by_alias(basis_name: &String) -> String {
+    if BASIS_ALIAS.contains_key(basis_name.as_str()) {
+        let alias_name = BASIS_ALIAS.get(basis_name.as_str()).unwrap();
+        println!("The basis set name {} is an alias to {}", basis_name, alias_name);
+        alias_name.to_string()
+    } else {
+        basis_name.clone()
+    }
+}
+
 pub fn get_valid_basis_path(tmp_bas: &String, rest_basis_dir: &Vec<String>, bastype: &str) -> String {
     if path::Path::new(tmp_bas).is_dir() {
         println!("The specified path for the basis sets: {}", tmp_bas);
@@ -93,10 +111,11 @@ pub fn get_valid_basis_path(tmp_bas: &String, rest_basis_dir: &Vec<String>, bast
 
 pub fn get_valid_basis_path_from_dirlist(tmp_bas: &String, rest_basis_dir: &Vec<String>, bastype: &str) -> Option<String> {
     let mut found = false;
+    let tmp_bas_lower = filter_by_alias(&tmp_bas.to_lowercase());
     for dir in rest_basis_dir.iter() {
-        let try_path = dir.clone() + tmp_bas;
+        let try_path = dir.clone() + &tmp_bas_lower;
         if path::Path::new(&try_path).is_dir() {
-            println!("The specified path for the {} sets is: {}, try to find it from the rest_basis_dir", bastype, tmp_bas);
+            println!("The specified path for the {} sets is: {} (lowercase), try to find it from the rest_basis_dir", bastype, tmp_bas_lower);
             println!("Found: {}", try_path);
             return Some(try_path);
         }
