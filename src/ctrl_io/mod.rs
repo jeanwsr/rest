@@ -755,17 +755,9 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     path_util::get_valid_basis_path(&tmp_bas, &rest_basis_dir, "auxiliary basis")
                },
                other => {
-                    //if ! std::path::Path::new(&String::from("./")).is_dir() {
-                    //    println!("The specified folder for the auxiliar basis sets is missing: (./)");
-                    //};
-                    println!("No auxiliary basis set is specified. Default auxiliary basis set in REST is def2-SV(P)-JKFIT");
-                    let default_bas = String::from("def2-SV(P)-JKFIT");
-                    if ! std::path::Path::new(&default_bas).is_dir() {
-                        //tmp_input.use_auxbas = false;
-                    } else {
-                        //tmp_input.use_auxbas = true;
-                    }
-                    default_bas
+                    println!("No auxiliary basis set is specified. Default auxiliary basis set in REST is def2-universal-jkfit");
+                    let default_bas = String::from("def2-universal-jkfit");
+                    path_util::get_valid_basis_path(&default_bas, &rest_basis_dir, "auxiliary basis")
                }
             };
             //if tmp_input.use_auxbas && tmp_input.print_level>0 {
