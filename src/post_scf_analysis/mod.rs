@@ -137,6 +137,24 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
     });
 }
 
+pub fn write_scf_attribute<T>(group: &hdf5::Group, dataset_name: &str, value: &[T]) 
+where 
+    T: Clone + hdf5::H5Type
+{
+    if let Ok(dataset) = group.dataset(dataset_name) {
+        match dataset.write_raw(value) {
+            Ok(_) => (),
+            Err(e) => println!("Error writing dataset {}: {:?}", dataset_name, e),
+        }
+    } else {
+        let builder = group.new_dataset_builder();
+        match builder.with_data(value).create(dataset_name) {
+            Ok(_) => (),
+            Err(e) => println!("Error creating dataset {}: {:?}", dataset_name, e),
+        }
+    }
+}
+
 pub fn save_chkfile(scf_data: &SCF) {
     let chkfile= &scf_data.mol.ctrl.chkfile;
     let path = Path::new(chkfile);
@@ -148,6 +166,7 @@ pub fn save_chkfile(scf_data: &SCF) {
     } else {
         hdf5::File::create(chkfile).unwrap()
     };
+    println!("write chkfile: {}", chkfile);
     let is_exist = file.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("scf")});
     let scf = if is_exist {
         file.group("scf").unwrap()
@@ -155,46 +174,12 @@ pub fn save_chkfile(scf_data: &SCF) {
         file.create_group("scf").unwrap()
     };
 
-    let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("e_tot")});
-    if is_exist {
-        let dataset = scf.dataset("e_tot").unwrap();
-        dataset.write(&[scf_data.scf_energy]);
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&[scf_data.scf_energy]
-        ).create("e_tot").unwrap();
-    }
+    write_scf_attribute(&scf, "e_tot", &[scf_data.scf_energy]);
+    write_scf_attribute(&scf, "num_basis", &[scf_data.mol.num_basis]);
+    write_scf_attribute(&scf, "spin_channel", &[scf_data.mol.spin_channel]);
+    write_scf_attribute(&scf, "num_states", &[scf_data.mol.num_state]);
 
-    let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("num_basis")});
-    if is_exist {
-        let dataset = scf.dataset("num_basis").unwrap();
-        dataset.write(&[scf_data.mol.num_basis]).unwrap();
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&[scf_data.mol.num_basis]
-        ).create("num_basis").unwrap();
-    }
-    let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("spin_channel")});
-    if is_exist {
-        let dataset = scf.dataset("spin_channel").unwrap();
-        dataset.write(&[scf_data.mol.spin_channel]);
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&[scf_data.mol.spin_channel]
-        ).create("spin_channel").unwrap();
-    }
-
-    let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("num_state")});
-    if is_exist {
-        let dataset = scf.dataset("num_state").unwrap();
-        dataset.write(&[scf_data.mol.num_state]);
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&[scf_data.mol.num_state]
-        ).create("num_state").unwrap();
-    }
-
-    let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("mo_coeff")});
+    // let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("mo_coeff")});
     let mut eigenvectors: Vec<f64> = vec![];
     for i_spin in 0..scf_data.mol.spin_channel {
         let tmp_eigenvectors = scf_data.eigenvectors[i_spin].transpose();
@@ -203,13 +188,7 @@ pub fn save_chkfile(scf_data: &SCF) {
             break
         }
     }
-    if is_exist {
-        let dataset = scf.dataset("mo_coeff").unwrap();
-        dataset.write(&eigenvectors);
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&eigenvectors).create("mo_coeff");
-    }
+    write_scf_attribute(&scf, "mo_coeff", &eigenvectors);
 
     let mut eigenvalues: Vec<f64> = vec![];
     for i_spin in 0..scf_data.mol.spin_channel {
@@ -218,26 +197,16 @@ pub fn save_chkfile(scf_data: &SCF) {
             break 
         }
     }
-    if is_exist {
-        let dataset = scf.dataset("mo_energy").unwrap();
-        dataset.write(&eigenvalues);
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&eigenvalues).create("mo_energy");
-    }
+    write_scf_attribute(&scf, "mo_energy", &eigenvalues);
 
-    let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("mo_occupation")});
     let mut occ: Vec<f64> = vec![];
     for i_spin in 0..scf_data.mol.spin_channel {
         occ.extend(scf_data.occupation[i_spin].iter());
     }
-    if is_exist {
-        let dataset = scf.dataset("mo_occupation").unwrap();
-        dataset.write(&occ);
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&occ).create("mo_occupation");
-    }
+    // for compatibility with old rest, may be removed in the future
+    write_scf_attribute(&scf, "mo_occupation", &occ);
+    // for compatibility with pyscf
+    write_scf_attribute(&scf, "mo_occ", &occ);
 
     file.close();
 }
