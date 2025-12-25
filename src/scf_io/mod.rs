@@ -535,8 +535,14 @@ impl SCF {
                 let i_homo = self.homo[i_spin];
                 let i_lumo = self.lumo[i_spin];
                 let homo = self.eigenvalues[i_spin][i_homo];
-                let lumo = self.eigenvalues[i_spin][i_lumo];
-                println!("HOMO: {:16.8}, LUMO: {:14.6}, H-L Gap: {:16.8}", homo, lumo, lumo-homo);
+                if i_lumo < self.eigenvalues[i_spin].len()  {
+                    let lumo = self.eigenvalues[i_spin][i_lumo];
+                    println!("HOMO: {:16.8}, LUMO: {:14.6}, H-L Gap: {:16.8}", homo, lumo, lumo-homo);
+                } else {
+                    println!("{:?}", &self.eigenvalues[i_spin]);
+                    println!("HOMO: {:16.8} (No virtual orbtials available)", homo);
+                }
+
             } else {
                 for i_spin in (0..self.mol.spin_channel) {
                          // 只打印有电子的自旋通道
