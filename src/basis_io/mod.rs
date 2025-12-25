@@ -1635,6 +1635,14 @@ pub fn spheric_gto_value_matrixfull(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basi
     outmat_s
 }
 
+pub fn gto_value_matrixfull_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4Elem, basis_type: &String) -> MatrixFull<f64> { 
+    if basis_type.eq(&"spheric".to_string()) {
+        return spheric_gto_value_matrixfull_serial(r, gto_center, bas);
+    } else {
+        return cartesian_gto_value_matrixfull_serial(r, gto_center, bas);
+    } 
+}
+
 pub fn spheric_gto_value_matrixfull_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4Elem) -> MatrixFull<f64> {
 
     //let mut time_records = utilities::TimeRecords::new();
@@ -1686,6 +1694,65 @@ pub fn spheric_gto_value_matrixfull_serial(r: &[[f64;3]],gto_center:&[f64;3], ba
     outmat_s
 }
 
+pub fn cartesian_gto_value_matrixfull_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4Elem) -> MatrixFull<f64> {
+
+    //let mut time_records = utilities::TimeRecords::new();
+    //time_records.new_item("1-1", "cartesian_gto_cint_batch");
+    //time_records.new_item("1-2", "_dgemm_nn");
+
+    let num_grids:usize = r.len();
+    let mut num_bas_c = 0;
+    let mut num_bas_s = 0;
+    bas.electron_shells.iter().for_each(|ibas| {
+        let iang = ibas.angular_momentum[0] as usize;
+        num_bas_c += (iang+1)*(iang+2)/2*ibas.coefficients.len();
+        num_bas_s += (iang*2+1)*ibas.coefficients.len();
+    });
+    //println!("debug num_bas_c and num_bas_s: {},{}", num_bas_c, num_bas_s);
+    let mut outmat_c = MatrixFull::new([num_grids,num_bas_c],0.0);
+    //let mut outmat_s = MatrixFull::new([num_grids,num_bas_s],0.0);
+    let mut ibas_start = 0;
+    for ibas in &bas.electron_shells {
+        let iang = ibas.angular_momentum[0] as usize;
+        //let mut c2s_mat = &mut c2s_matrix(iang);
+        let c2s_mat = &c2s_matrix_const(iang);
+        let s_len = 2*iang + 1;
+        let c_len = (iang+1)*(iang+2)/2;
+        for coeff in ibas.coefficients.iter() {
+            let mut tmp_cart = MatrixFull::new([num_grids,c_len],0.0);
+            coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
+
+                //time_records.count_start("1-1");
+                let mut tmp_cart_0 = cartesian_gto_cint_batch(*iexp, iang, gto_center, r);
+                //time_records.count("1-1");
+
+                tmp_cart.self_scaled_add(&tmp_cart_0, *icoeff);
+            });
+
+            //time_records.count_start("1-2");
+            //let tmp_spheric = _dgemm_nn_serial(&tmp_cart.to_matrixfullslice(), &c2s_mat.to_matrixfullslice());
+            //time_records.count("1-2");
+
+            outmat_c.iter_columns_mut(ibas_start..ibas_start+c_len)
+            .zip(tmp_cart.iter_columns_full()).for_each(|(to,from)| {
+                to.iter_mut().zip(from.iter()).for_each(|(to,from)| {*to = *from});
+            });
+            ibas_start += c_len;
+        }
+    }
+    //time_records.report_all();
+
+    outmat_c
+}
+
+pub fn gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4Elem, basis_type: &String) -> MatrixFull<f64> { 
+    if basis_type.eq(&"spheric".to_string()) {
+        return spheric_gto_value_serial(r, gto_center, bas);
+    } else {
+        return cartesian_gto_value_serial(r, gto_center, bas);
+    } 
+}
+
 pub fn spheric_gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4Elem) -> MatrixFull<f64> {
 
     //let mut time_records = utilities::TimeRecords::new();
@@ -1717,8 +1784,8 @@ pub fn spheric_gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4El
                 ////time_records.count_start("1-1");
                 //let mut tmp_cart_0 = cartesian_gto_cint_batch_v04(*iexp, iang, gto_center, r);
                 ////time_records.count("1-1");
-
                 //tmp_cart.self_scaled_add(&tmp_cart_0, *icoeff);
+
                 tmp_cart += cartesian_gto_cint_batch_v04(*iexp, iang, gto_center, r)* (*icoeff);
             });
 
@@ -1743,6 +1810,44 @@ pub fn spheric_gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4El
     //time_records.report_all();
 
     outmat_s
+}
+
+pub fn cartesian_gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4Elem) -> MatrixFull<f64> {
+
+    let num_grids:usize = r.len();
+    let mut num_bas_c = 0;
+    let mut num_bas_s = 0;
+    bas.electron_shells.iter().for_each(|ibas| {
+        let iang = ibas.angular_momentum[0] as usize;
+        num_bas_c += (iang+1)*(iang+2)/2*ibas.coefficients.len();
+        num_bas_s += (iang*2+1)*ibas.coefficients.len();
+    });
+    let mut outmat_c = MatrixFull::new([num_bas_c, num_grids],0.0);
+    let mut ibas_start = 0;
+    for ibas in &bas.electron_shells {
+        let iang = ibas.angular_momentum[0] as usize;
+        let c_len = (iang+1)*(iang+2)/2;
+        for coeff in ibas.coefficients.iter() {
+            if let Some(thread_id) = rayon::current_thread_index() {
+                if thread_id == 0 {
+                    println!("debug info: rayon_{} cartesian_gto_value_serial: ibas_start = {}, iang: {}, c_len: {}, num_basis: {}, num_grids: {}", thread_id, ibas_start, iang, c_len, num_bas_c, num_grids)
+                };
+            } else {
+                println!("debug info serial: cartesian_gto_value_serial: ibas_start = {}, iang: {}, c_len: {}, num_basis: {}, num_grids: {}", ibas_start, iang, c_len, num_bas_c, num_grids)
+            }
+            let mut tmp_cart = MatrixFull::new([c_len,num_grids],0.0);
+            coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
+
+                tmp_cart += cartesian_gto_cint_batch_v04(*iexp, iang, gto_center, r)* (*icoeff);
+            });
+
+            outmat_c.copy_from_matr(ibas_start..ibas_start+c_len, 0..num_grids, 
+                &tmp_cart, 0..c_len, 0..num_grids);
+            ibas_start += c_len;
+        }
+    }
+
+    outmat_c
 }
 
 pub fn gto_value(r:&[f64;3], gto_center:&[f64;3], bas:&Basis4Elem, basis_type: &String) -> Vec<f64> {
@@ -1821,6 +1926,13 @@ pub fn spheric_gto_1st_value_batch(r:&[[f64;3]], gto_center:&[f64;3], bas:&Basis
     }
     paox
 }
+pub fn gto_1st_value_batch_serial(r:&[[f64;3]], gto_center:&[f64;3], bas:&Basis4Elem, basis_type:&String) -> Vec<MatrixFull<f64>> {
+    if basis_type.eq(&"spheric".to_string()) {
+        return spheric_gto_1st_value_batch_serial(r, gto_center, bas)
+    } else {
+        return cartesian_gto_1st_value_batch_serial(r, gto_center, bas)
+    } 
+}
 pub fn spheric_gto_1st_value_batch_serial(r:&[[f64;3]], gto_center:&[f64;3], bas:&Basis4Elem) -> Vec<MatrixFull<f64>> {
     let num_grids:usize = r.len();
     let mut num_bas_c = 0;
@@ -1863,6 +1975,94 @@ pub fn spheric_gto_1st_value_batch_serial(r:&[[f64;3]], gto_center:&[f64;3], bas
 
             });
             ibas_start += s_len;
+        }
+    }
+    paox
+}
+
+pub fn cartesian_gto_1st_value_batch_serial(r:&[[f64;3]], gto_center:&[f64;3], bas:&Basis4Elem) -> Vec<MatrixFull<f64>> {
+    let num_grids:usize = r.len();
+    let mut num_bas_c = 0;
+    let mut num_bas_s = 0;
+    bas.electron_shells.iter().for_each(|ibas| {
+        let iang = ibas.angular_momentum[0] as usize;
+        num_bas_c += (iang+1)*(iang+2)/2*ibas.coefficients.len();
+        num_bas_s += (iang*2+1)*ibas.coefficients.len();
+    });
+    //let mut paox = RIFull::new([num_grids,num_bas_s,3],0.0);
+    //let mut paox = vec![MatrixFull::new([num_grids,num_bas_s],0.0);3];
+    let mut paox = vec![MatrixFull::new([num_grids,num_bas_c],0.0);3];
+    //let mut paox = MatrixFull::new([num_grids,num_bas_s],0.0);
+    //let mut aopy = MatrixFull::new([num_grids,num_bas_s],0.0);
+    //let mut aopz = MatrixFull::new([num_grids,num_bas_s],0.0);
+    let mut ibas_start = 0;
+    for ibas in &bas.electron_shells {
+        let iang = ibas.angular_momentum[0] as usize;
+        //let mut c2s_mat = &mut c2s_matrix(iang);
+        let mut c2s_mat = &c2s_matrix_const(iang);
+        let s_len = 2*iang + 1;
+        let c_len = (iang+1)*(iang+2)/2;
+        for coeff in ibas.coefficients.iter() {
+            let mut tmp_cart = vec![MatrixFull::new([num_grids,c_len],0.0);3];
+            coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
+                let mut tmp_cart_0 = cartesian_gto_1st_cint_batch_serial(*iexp, iang, gto_center, r);
+
+                //tmp_cart.self_scaled_add(&tmp_cart_0, *icoeff);
+                tmp_cart.iter_mut().zip(tmp_cart_0.iter()).for_each(|(to,from)| {
+                    to.self_scaled_add(from, *icoeff);
+                });
+            });
+            //let mut tmp_spheric = MatrixFull::new([num_grids,s_len],0.0);
+            paox.iter_mut().zip(tmp_cart.iter_mut()).for_each(|(paox_x,tmp_cart_x)| {
+                //tmp_spheric.lapack_dgemm(tmp_cart_x, &mut c2s_mat, 'N','N',1.0,0.0);
+                //let tmp_spheric = _dgemm_nn_serial(&tmp_cart_x.to_matrixfullslice(),&c2s_mat.to_matrixfullslice());
+                paox_x.iter_columns_mut(ibas_start..ibas_start+c_len)
+                .zip(tmp_cart_x.iter_columns_full()).for_each(|(to,from)| {
+                    to.iter_mut().zip(from.iter()).for_each(|(to,from)| {*to = *from});
+                });
+
+            });
+            ibas_start += c_len;
+        }
+    }
+    paox
+}
+
+pub fn gto_1st_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4Elem, basis_type: &String) -> Vec<MatrixFull<f64>> { 
+    if basis_type.eq(&"spheric".to_string()) {
+        return spheric_gto_1st_value_serial(r, gto_center, bas);
+    } else {
+        return cartesian_gto_1st_value_serial(r, gto_center, bas);
+    } 
+}
+
+pub fn cartesian_gto_1st_value_serial(r:&[[f64;3]], gto_center:&[f64;3], bas:&Basis4Elem) -> Vec<MatrixFull<f64>> {
+    let num_grids:usize = r.len();
+    let mut num_bas_c = 0;
+    let mut num_bas_s = 0;
+    bas.electron_shells.iter().for_each(|ibas| {
+        let iang = ibas.angular_momentum[0] as usize;
+        num_bas_c += (iang+1)*(iang+2)/2*ibas.coefficients.len();
+        num_bas_s += (iang*2+1)*ibas.coefficients.len();
+    });
+    let mut paox = vec![MatrixFull::new([num_bas_c,num_grids],0.0);3];
+    let mut ibas_start = 0;
+    for ibas in &bas.electron_shells {
+        let iang = ibas.angular_momentum[0] as usize;
+        let c_len = (iang+1)*(iang+2)/2;
+        for coeff in ibas.coefficients.iter() {
+            let mut tmp_cart = vec![MatrixFull::new([c_len, num_grids],0.0);3];
+            coeff.iter().zip(ibas.exponents.iter()).for_each(|(icoeff,iexp)| {
+                let mut tmp_cart_0 = cartesian_gto_1st_cint_batch_serial_v03(*iexp, iang, gto_center, r);
+                tmp_cart.iter_mut().zip(tmp_cart_0.iter()).for_each(|(to,from)| {
+                    to.self_scaled_add(from, *icoeff);
+                });
+            });
+            paox.iter_mut().zip(tmp_cart.iter_mut()).for_each(|(paox_x,tmp_cart_x)| {
+                paox_x.copy_from_matr(ibas_start..ibas_start+c_len,0..num_grids,  tmp_cart_x, 0..c_len,0..num_grids);
+
+            });
+            ibas_start += c_len;
         }
     }
     paox

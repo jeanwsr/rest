@@ -18,7 +18,7 @@ use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, contract_vxc_0_serial};
 use self::gen_grids::radial_grid_lmg_bse;
 use rayon::iter::{IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator, IntoParallelRefMutIterator};
 use regex::Regex;
-use crate::basis_io::{Basis4Elem, cartesian_gto_cint, cartesian_gto_std, gto_value, BasCell, gto_value_debug, cint_norm_factor, gto_1st_value, spheric_gto_value_matrixfull, spheric_gto_1st_value_batch, spheric_gto_value_matrixfull_serial, spheric_gto_1st_value_batch_serial, spheric_gto_value_serial, spheric_gto_1st_value_serial};
+use crate::basis_io::{BasCell, Basis4Elem, cartesian_gto_cint, cartesian_gto_std, cint_norm_factor, gto_1st_value, gto_1st_value_batch_serial, gto_1st_value_serial, gto_value, gto_value_debug, gto_value_matrixfull_serial, gto_value_serial, spheric_gto_1st_value_batch, spheric_gto_1st_value_batch_serial, spheric_gto_1st_value_serial, spheric_gto_value_matrixfull, spheric_gto_value_matrixfull_serial, spheric_gto_value_serial};
 use crate::molecule_io::Molecule;
 use crate::geom_io::get_mass_charge;
 use crate::mpi_io::{mpi_broadcast, mpi_broadcast_vector, mpi_reduce, MPIData, MPIOperator};
@@ -2510,6 +2510,14 @@ impl Grids {
 
         let num_grids = self.coordinates.len();
         let num_basis = mol.num_basis;
+        println!("debug info: prepare_tabulated_ao_rayon_v02: num_basis: {}, num_grids: {}", num_basis, num_grids);
+        if let Some(thread_id) = rayon::current_thread_index() {
+            if thread_id == 0 {
+                println!("debug info: rayon_{} prepare_tabulated_ao_rayon_v02: num_basis: {}, num_grids: {}", thread_id, num_basis, num_grids)
+            };
+        } else {
+            println!("debug info serial: prepare_tabulated_ao_rayon_v02: num_basis: {}, num_grids: {}", num_basis, num_grids);
+        }
 
         // handle memory exceed
         // AJZ: here tabulated grids will cost (num_basis * num_grids * 1 or 4) memory, depending on whether gradients are needed.
@@ -2547,13 +2555,13 @@ impl Grids {
                 //let mut tmp_geom = [0.0;3];
                 //tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
                 let tmp_geom:[f64;3] = geom.try_into().unwrap();
-                let tab_den = spheric_gto_value_serial(&self.coordinates[range_grids.clone()], &tmp_geom, elem);
+                let tab_den = gto_value_serial(&self.coordinates[range_grids.clone()], &tmp_geom, elem, &mol.ctrl.basis_type);
 
                 loc_ao.copy_from_matr(start..end, 0..loc_num_grids, &tab_den, 0..loc_num_bas, 0..loc_num_grids);
 
                 if mol.xc_data.use_density_gradient() {
                     //println!("debug 01");
-                    let tab_dev = spheric_gto_1st_value_serial(&self.coordinates[range_grids.clone()], &tmp_geom, elem);
+                    let tab_dev = gto_1st_value_serial(&self.coordinates[range_grids.clone()], &tmp_geom, elem, &mol.ctrl.basis_type);
                     //println!("debug 02");
                     for x in 0..3 {
                         let gto_1st_x = &tab_dev[x];
@@ -2604,10 +2612,10 @@ impl Grids {
 
             let mut tmp_geom = [0.0;3];
             tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
-            let tab_den = spheric_gto_value_matrixfull_serial(&self.coordinates, &tmp_geom, elem);
+            let tab_den = gto_value_matrixfull_serial(&self.coordinates, &tmp_geom, elem, &mol.ctrl.basis_type);
 
             let tab_dev = if mol.xc_data.use_density_gradient() {
-                Some(spheric_gto_1st_value_batch_serial(&self.coordinates, &tmp_geom, elem))
+                Some(gto_1st_value_batch_serial(&self.coordinates, &tmp_geom, elem, &mol.ctrl.basis_type))
                 //Some(RIFull::new([num_loc_bas,num_grids,3],0.0))
             } else {
                 None
