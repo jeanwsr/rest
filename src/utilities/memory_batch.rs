@@ -40,6 +40,58 @@ pub fn detect_used_memory_mb(use_case: &str) -> f64 {
         },
     }
 }
+/// Lower bound of the XC gradient block budget (MiB): a process that already exceeds its
+/// declared budget still walks the grid in usable blocks.
+pub const MIN_XC_GRAD_BLOCK_MB: f64 = 8.0;
+/// Upper bound of the XC gradient block budget (MiB): one block never dominates the resident
+/// set even when the declared budget is generous.
+pub const MAX_XC_GRAD_BLOCK_MB: f64 = 256.0;
+
+/// Working-set budget (MiB) of one XC gradient grid block, **per worker**.
+///
+/// `max_memory` is the declared process budget in MiB, the unit of `[ctrl] max_memory`.
+/// The budget of one block of one worker is the head room left after the resident set, capped
+/// at 10% of the declared budget (a single block must never claim the whole process budget) and
+/// divided by the number of rayon workers of the grid loop. It is clamped to
+/// [`MIN_XC_GRAD_BLOCK_MB`, `MAX_XC_GRAD_BLOCK_MB`].
+///
+/// `fallback_mb` is used when no budget is declared, which keeps the historical block size of
+/// the gradient path.
+///
+/// `REST_XC_GRAD_BLK_MB` overrides the result, for experiments and for machines where the
+/// declared budget does not describe the process.
+pub fn xc_grad_block_mb(max_memory: Option<f64>, fallback_mb: f64) -> f64 {
+    if let Ok(v) = std::env::var("REST_XC_GRAD_BLK_MB") {
+        if let Ok(mb) = v.parse::<f64>() {
+            return mb.max(1.0);
+        }
+    }
+    match max_memory {
+        Some(total) => {
+            let avail = (total - detect_used_memory_mb("proc")).max(0.0);
+            let workers = rayon::current_num_threads().max(1) as f64;
+            (avail.min(0.1 * total) / workers).clamp(MIN_XC_GRAD_BLOCK_MB, MAX_XC_GRAD_BLOCK_MB)
+        }
+        None => fallback_mb,
+    }
+}
+
+/// Peak-attribution probe: print the resident set of this process together with a label.
+///
+/// Enabled by the environment variable `REST_MEM_PROBE=1` or by `print_level >= 3`, and a no-op
+/// otherwise, so the calls can stay in the hot paths of the force driver. Used to attribute the
+/// peak memory of an analytic gradient.
+pub fn mem_probe(label: &str, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    println!("[mem-probe] {:9.1} MB | {}", detect_used_memory_mb("proc"), label);
+}
+
+/// Whether the memory probe is switched on for this run.
+pub fn mem_probe_enabled(print_level: usize) -> bool {
+    print_level >= 3 || std::env::var("REST_MEM_PROBE").map(|v| v == "1").unwrap_or(false)
+}
 
 /// Calculate batch size within possible memory.
 ///
@@ -97,7 +149,7 @@ pub fn calc_batch_size<T>(
 /// # Example
 ///
 /// ```rust
-/// # use pyrest::grad::rhf::blocksize_partition;
+/// # use pyrest::utilities::memory_batch::blocksize_partition;
 /// let indices = [1, 3, 6, 7, 10, 15, 16, 19];
 /// let partitions = blocksize_partition(&indices, 4);
 /// // A info of `[WARN] Batch size is too small: 15 - 10 > 4` will be printed.
@@ -211,7 +263,7 @@ impl MemEstimate {
 ///     fixed: 500_000,
 ///     thread: 100_000,
 /// };
-/// let batch_size = pool.install(|| calc_batch_size_from_mem_estimate::<f64>(&mem_est, Some(500.0), Some(0.8)));
+/// let batch_size = pool.install(|| calc_batch_size_from_mem_estimate::<f64>(&mem_est, Some(500.0), Some(0.8), false));
 /// println!("Calculated batch size: {}", batch_size);
 /// assert_eq!(batch_size, 256);
 /// ```

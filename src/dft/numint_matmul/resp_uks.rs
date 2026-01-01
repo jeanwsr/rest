@@ -1,0 +1,392 @@
+//! Response (Fock and response matrix) implementation for the UKS numint-matmul XC component.
+//!
+//! The response object [`URespKSNIMatmul`] is a standalone object for the fock/response
+//! functionality of the UKS numerical-integration XC contribution, independent of the hessian
+//! machinery of `UHessKSNIMatmul` (which owns its own grid, built from the same grid data).
+//!
+//! The two grids are separated by purpose: the fock path (`get_fock_rdm`/`get_fock_coeff`) always
+//! evaluates on the common (large) grid `ni`, while the response path
+//! (`make_response_preparation`/`get_response_bra`) uses the small response grid `ni_resp` when
+//! one is attached. The returned fock is the DFT numerical-integration XC contribution only, never
+//! the full SCF fock.
+//!
+//! Main-thread only (not `Send`/`Sync`).
+
+use super::prelude::*;
+use crate::analdrv::prelude::*;
+
+#[allow(non_upper_case_globals)]
+const α: usize = 0;
+#[allow(non_upper_case_globals)]
+const β: usize = 1;
+
+/// Evaluate the spin-polarized XC potential `vxc` and kernel `fxc` from a given ground-state
+/// `rho`, by summing each sub-functional's spin-polarized `libxc_eval_eff` (deriv = 2) contribution.
+///
+/// `rho` : shape `[ngrids, nvar, 2]`. Extracted from the rho formation so that callers which
+/// already have `rho` (e.g. obtained directly from occupied spin-orbitals via a bra-ket
+/// contraction) can skip the `ao_dm0`-based density formation.
+pub fn eval_vxc_fxc_uks_from_rho(xc_func_list: &[(f64, LibXCFunctional)], rho: TsrView) -> (Tsr, Tsr) {
+    assert!(!xc_func_list.is_empty(), "xc_func_list must not be empty");
+    let xc_type = xc_func_list
+        .iter()
+        .map(|(_, f)| determine_den_type(f))
+        .max_by_key(|t| t.num_nvar())
+        .expect("xc_func_list must not be empty");
+    let nvar = xc_type.num_nvar();
+    let ngrids = rho.shape()[0];
+    let device = rho.device().clone();
+
+    let mut vxc = rt::zeros(([ngrids, nvar, 2], &device));
+    let mut fxc = rt::zeros(([ngrids, nvar, 2, nvar, 2], &device));
+    for (scale, xc_func) in xc_func_list {
+        let xc_type_i = determine_den_type(xc_func);
+        let nvar_i = xc_type_i.num_nvar();
+        let rho_i = rho.i((.., ..nvar_i, ..));
+        let xc_eff = libxc_eval_eff(xc_func, rho_i, 2, false);
+        let [_, vxc_i, fxc_i] = xc_eff.into_iter().collect_array().unwrap();
+        *&mut vxc.i_mut((.., ..nvar_i, ..)) += *scale * vxc_i;
+        *&mut fxc.i_mut((.., ..nvar_i, .., ..nvar_i, ..)) += *scale * fxc_i;
+    }
+    (vxc, fxc)
+}
+
+/// Lean evaluation of only `vxc` and `fxc` on a given grid, for use as the response object's
+/// cached `vxc_*` / `fxc_*` when a dedicated (coarser) low-precision grid is attached (UKS
+/// counterpart of [`make_cpks_vxc_fxc`](super::resp_rks::make_cpks_vxc_fxc)).
+///
+/// Skips all skeleton-Hessian intermediates, evaluates AO at the minimum derivative order needed
+/// to form the spin densities (`xc_type.num_ao_deriv()`), and forms each spin density `rhoσ`
+/// directly from the occupied spin-orbital coefficients via a bra-ket contraction
+/// ([`NIMatmul::make_rho_from_homogeneous_braket`]) instead of building the full `[nao, nao]` spin
+/// density matrices (consistent with the CP-KS response path in [`get_uks_response_bra`]).
+pub fn make_cpks_vxc_fxc_uks(
+    xc_func_list: &[(f64, LibXCFunctional)],
+    ni: &mut NIMatmul,
+    mo_coeff: &[TsrView; 2],
+    mo_occ: &[TsrView; 2],
+) -> (Tsr, Tsr) {
+    let xc_type = determine_den_type_from_list(&xc_func_list.iter().map(|(_, f)| f).collect_vec());
+
+    // For each spin, bake the occupation into the occupied spin coefficients (sqrt so the bra-ket
+    // square reproduces the occ-weighted spin density for every component) and form rhoσ directly
+    // via a bra-ket contraction. For UKS the spin occupation is 1, so this is a no-op in the common
+    // case but stays correct for fractional occupation.
+    let occidx_α = mo_occ[α].view().greater(0).into_vec();
+    let mocc_α = mo_coeff[α].bool_select(-1, &occidx_α);
+    let occ_α = mo_occ[α].bool_select(-1, &occidx_α);
+    let occ_sqrt_α = occ_α.mapv(f64::sqrt);
+    let mocc_2_α = &mocc_α * occ_sqrt_α.i((None, ..));
+
+    let occidx_β = mo_occ[β].view().greater(0).into_vec();
+    let mocc_β = mo_coeff[β].bool_select(-1, &occidx_β);
+    let occ_β = mo_occ[β].bool_select(-1, &occidx_β);
+    let occ_sqrt_β = occ_β.mapv(f64::sqrt);
+    let mocc_2_β = &mocc_β * occ_sqrt_β.i((None, ..));
+
+    // rho : [ngrids, nvar, 2]
+    let rho = ni.make_rho_from_homogeneous_braket(&[mocc_2_α.view(), mocc_2_β.view()], xc_type);
+    eval_vxc_fxc_uks_from_rho(xc_func_list, rho.view())
+}
+
+/* #region response */
+
+pub fn get_uks_response_bra(
+    ni: &mut NIMatmul,
+    den_type: XCDenType,
+    fxc_eff: TsrView,
+    bra: &[TsrView; 2],
+    mocc: &[TsrView; 2],
+) -> ([Tsr; 2], IndexMap<&'static str, f64>) {
+    let nao = bra[α].shape()[0];
+    let nocc_α = bra[α].shape()[1];
+    let nocc_β = bra[β].shape()[1];
+    let bra_α_shape = bra[α].shape().to_vec();
+    let bra_β_shape = bra[β].shape().to_vec();
+    let bra_α = bra[α].reshape((nao, nocc_α, -1));
+    let bra_β = bra[β].reshape((nao, nocc_β, -1));
+    let nset = bra_α.shape()[2];
+
+    let mut timing = IndexMap::new();
+    let mut tic = |label: &'static str, t0: std::time::Instant| {
+        let elapsed = t0.elapsed().as_secs_f64();
+        timing.insert(label, elapsed);
+    };
+
+    let t0 = std::time::Instant::now();
+    ni.get_cached_ao(den_type.num_ao_deriv());
+    tic("ao", t0);
+
+    // Compute per-spin rho1
+    let t0 = std::time::Instant::now();
+    let bra_α_list = bra_α.axes_iter(-1).collect_vec();
+    let bra_β_list = bra_β.axes_iter(-1).collect_vec();
+    let rho1α = ni.make_rho_from_one_bra_mult_ket(mocc[α].view(), &bra_α_list, den_type);
+    let rho1β = ni.make_rho_from_one_bra_mult_ket(mocc[β].view(), &bra_β_list, den_type);
+    // Stack into [ngrids, nvar, 2, nset]
+    let ngrids = rho1α.shape()[0];
+    let nvar = den_type.num_nvar();
+    let device = rho1α.device().clone();
+    let mut rho1 = rt::zeros(([ngrids, nvar, 2, nset], &device));
+    rho1.i_mut((.., .., α, ..)).assign(&rho1α);
+    rho1.i_mut((.., .., β, ..)).assign(&rho1β);
+    tic("rho1", t0);
+
+    // Compute UKS fxc bra-trans response
+    let t0 = std::time::Instant::now();
+    let resp = ni.make_uks_fxc_pot_with_eff_bra_trans(fxc_eff, rho1.view(), mocc, den_type);
+    tic("resp", t0);
+
+    // UKS CPHF factor: 2.0 (hermitian symmetry only, no spin degeneracy)
+    let [resp_α, resp_β] = resp;
+    let resp_α = 2.0 * resp_α.into_shape(bra_α_shape);
+    let resp_β = 2.0 * resp_β.into_shape(bra_β_shape);
+    ([resp_α, resp_β], timing)
+}
+
+pub fn get_uks_response_bra_batched(
+    ni: &mut NIMatmul,
+    den_type: XCDenType,
+    fxc_eff: TsrView,
+    bra: &[TsrView; 2],
+    mocc: &[TsrView; 2],
+    verbose: bool,
+) -> ([Tsr; 2], IndexMap<&'static str, f64>) {
+    let ngrids = ni.weights.len();
+    let nbatch = ni.nbatch;
+    let bra_α_shape = bra[α].shape().to_vec();
+    let bra_β_shape = bra[β].shape().to_vec();
+    let device = bra[α].device().clone();
+    let mut resp_α = rt::zeros((bra_α_shape, &device));
+    let mut resp_β = rt::zeros((bra_β_shape, &device));
+    let mut timing = IndexMap::from([("ao", 0.0), ("rho1", 0.0), ("resp", 0.0), ("total", 0.0)]);
+
+    let t0 = std::time::Instant::now();
+    for start in (0..ngrids).step_by(nbatch) {
+        let end = (start + nbatch).min(ngrids);
+        let mut ni_batch = ni.split_batch(start, end);
+        let ([resp_batch_α, resp_batch_β], timing_batch) =
+            get_uks_response_bra(&mut ni_batch, den_type, fxc_eff.i(start..end), bra, mocc);
+        resp_α += resp_batch_α;
+        resp_β += resp_batch_β;
+        for (key, value) in timing_batch {
+            *timing.get_mut(key).unwrap() += value;
+        }
+        let duration = t0.elapsed().as_secs_f64();
+        timing.insert("total", duration);
+        if verbose {
+            println!("In get_uks_response_bra_batched, Batch {start}..{end}");
+            println!("  Elapsed time from start (Wall time): {:.4} sec", duration);
+        }
+    }
+
+    if verbose {
+        println!("Finished get_uks_response_bra_batched");
+        println!("  Total elapsed time (Wall time): {:.4} sec", timing["total"]);
+        println!("  Timing breakdown:");
+        for (key, value) in timing.iter() {
+            if *key != "total" {
+                println!("  {key:>20}: {value:.4} sec");
+            }
+        }
+    }
+
+    ([resp_α, resp_β], timing)
+}
+
+/* #endregion */
+
+/// Response (fock/response matrix) object for the UKS numint-matmul XC contribution.
+pub struct URespKSNIMatmul<'a> {
+    /// List of `(scale, functional)` pairs of the XC functional (spin-polarized).
+    pub xc_func_list: Vec<(f64, LibXCFunctional)>,
+    /// High-precision (large, SCF/common) numerical-integration grid, selected by `prec = true`.
+    pub ni: NIMatmul<'a>,
+    /// Optional separate small grid for the low-precision (`prec = false`) response path; `None`
+    /// reuses `ni`.
+    pub ni_resp: Option<NIMatmul<'a>>,
+    /// Print progress of the response evaluation.
+    pub verbose: bool,
+    /// Response intermediates: `mo_coeff_0/1 [nao, nmo_s]` and `mo_occ_0/1 [nmo_s]` from
+    /// [`URespAPI::make_response_preparation`], and `vxc_{high,low} [ngrids, nvar, 2]` /
+    /// `fxc_{high,low} [ngrids, nvar, 2, nvar, 2]` cached per precision on the selected grid
+    /// (the fxc entry is shared between the preparation and the rdm-form contraction).
+    pub intmd: HashMap<String, Tsr>,
+}
+
+impl<'a> URespKSNIMatmul<'a> {
+    /// Create a new UKS response object.
+    ///
+    /// # Parameters
+    ///
+    /// - `xc_func_list` : list of `(scale, functional)` pairs (spin-polarized functionals).
+    /// - `ni` : numerical-integration driver over the high-precision (large) grid.
+    /// - `verbose` : print progress.
+    pub fn new(xc_func_list: Vec<(f64, LibXCFunctional)>, ni: NIMatmul<'a>, verbose: bool) -> Self {
+        Self { xc_func_list, ni, ni_resp: None, verbose, intmd: HashMap::new() }
+    }
+
+    /// Attach a dedicated small numerical-integration grid (`ni_resp`) for the low-precision
+    /// (`prec = false`) response path.
+    ///
+    /// When set, the contractions called with `prec = false` (the CP-SCF machinery) are evaluated
+    /// on this grid instead of the high-precision (large) grid, and `vxc_low` / `fxc_low` are
+    /// computed on it during
+    /// [`make_response_preparation`](URespAPI::make_response_preparation).
+    pub fn set_ni_resp(mut self, ni_resp: NIMatmul<'a>) -> Self {
+        self.ni_resp = Some(ni_resp);
+        self
+    }
+}
+
+impl<'a> AnalDrvBaseAPI for URespKSNIMatmul<'a> {}
+
+impl<'a> URespAPI for URespKSNIMatmul<'a> {
+    /// Fock (the XC numint contribution only) per spin from spin density matrices, on the grid
+    /// selected by `prec` (the high-precision `ni` for `prec = true`).
+    fn get_fock_rdm(&mut self, rdm: &[TsrView; 2], prec: bool) -> [Tsr; 2] {
+        for rdm_s in rdm {
+            assert_eq!(rdm_s.ndim(), 2, "rdm must have 2 dimensions");
+        }
+        let den_type = determine_den_type_from_list(&self.xc_func_list.iter().map(|(_, f)| f).collect_vec());
+        let ni = if prec { &mut self.ni } else { self.ni_resp.as_mut().unwrap_or(&mut self.ni) };
+        // rho : [ngrids, nvar, 2] (the spin is the set axis)
+        let rho = ni.make_rho_from_dm(&[rdm[α].view(), rdm[β].view()], den_type);
+        let (vxc, _fxc) = eval_vxc_fxc_uks_from_rho(&self.xc_func_list, rho.view());
+        let pot = ni.make_vxc_pot_with_eff(vxc.view(), den_type, XCSpin::Polarized);
+        [pot.i((.., .., α)).to_owned(), pot.i((.., .., β)).to_owned()]
+    }
+
+    // note: `get_fock_coeff` keeps the trait default (dm route via `get_dm0_restricted` per spin).
+
+    /// Response matrix per spin from (symmetrizable) full spin density matrices: `2 * fxc`
+    /// response on the grid selected by `prec` — the UHF factor `2.0` (hermitian symmetry
+    /// only, no spin degeneracy) against the restricted `4.0` of
+    /// [`RRespKSNIMatmul`](super::resp_rks::RRespKSNIMatmul). The per-spin `rdm` carries a
+    /// leading `[nao, nao]` square followed by an arbitrary (possibly empty) set of trailing
+    /// dimensions, shared by both spins; the output has the same per-spin shape.
+    ///
+    /// This is the rdm-form entry of the unrestricted response kernel, the form required by the
+    /// future unrestricted generalized-Fock Lagrangian term `A_{ai, pq} D_{pq}`; accordingly,
+    /// the production callers contract it with `prec = true`, so the fxc kernel is built from
+    /// the ground-state spin densities on the high-precision (large) grid `ni`, mirroring
+    /// [`RRespKSNIMatmul::get_response_rdm`](super::resp_rks::RRespKSNIMatmul::get_response_rdm).
+    /// Call [`make_response_preparation`](URespAPI::make_response_preparation) before this
+    /// function to make sure the data is ready.
+    fn get_response_rdm(&mut self, rdm: &[TsrView; 2], prec: bool) -> [Tsr; 2] {
+        for rdm_s in rdm {
+            assert!(rdm_s.ndim() >= 2, "rdm must have at least 2 dimensions");
+        }
+        let rdm_shape = [rdm[α].shape().to_vec(), rdm[β].shape().to_vec()];
+        let nao = rdm_shape[α][0];
+        for s in [α, β] {
+            assert_eq!(nao, rdm_shape[s][1], "the first two dimensions of rdm must be equal");
+        }
+        assert_eq!(rdm_shape[α], rdm_shape[β], "the rdm shape must agree across spins");
+        let nset: usize = rdm_shape[α][2..].iter().product();
+        let den_type = determine_den_type_from_list(&self.xc_func_list.iter().map(|(_, f)| f).collect_vec());
+        let key_fxc = if prec { "fxc_high" } else { "fxc_low" };
+
+        if !self.intmd.contains_key(key_fxc) {
+            // panic with "no entry" if preparation is skipped
+            let mo_coeff = [self.intmd["mo_coeff_0"].view(), self.intmd["mo_coeff_1"].view()];
+            let mo_occ = [self.intmd["mo_occ_0"].view(), self.intmd["mo_occ_1"].view()];
+            let ni = if prec { &mut self.ni } else { self.ni_resp.as_mut().unwrap_or(&mut self.ni) };
+            let (_, fxc) = make_cpks_vxc_fxc_uks(&self.xc_func_list, ni, &mo_coeff, &mo_occ);
+            self.intmd.insert(key_fxc.to_string(), fxc);
+        }
+        // NOTE: the cached `fxc_*` is written here only when missing;
+        // [`make_response_preparation`](URespAPI::make_response_preparation) re-validates it
+        // against the orbitals and refreshes it on orbital change, so the entry cannot go stale
+        // under the analdrv driver contract.
+        let fxc = self.intmd[key_fxc].view();
+
+        // flatten the trailing dimensions into one set dimension; symmetrize each spin's
+        // leading [nao, nao] block — the fxc kernel only sees the symmetric part anyway
+        let rdm_sym = [
+            ((&rdm[α] + &rdm[α].swapaxes(0, 1)) * 0.5).into_shape((nao, nao, nset)),
+            ((&rdm[β] + &rdm[β].swapaxes(0, 1)) * 0.5).into_shape((nao, nao, nset)),
+        ];
+
+        // rho1 : [ngrids, nvar, 2, nset], formed in one batched `make_rho_from_dm` call over the
+        // spin-interleaved dm list: the column-major output splits its last (set) axis as
+        // `k = spin + 2 * set`, so the list must alternate the spins within each set
+        let dm_list: Vec<TsrView> = (0..nset)
+            .flat_map(|k| [rdm_sym[α].i((.., .., k)), rdm_sym[β].i((.., .., k))])
+            .collect();
+        let ni = if prec { &mut self.ni } else { self.ni_resp.as_mut().unwrap_or(&mut self.ni) };
+        let ngrids = ni.weights.len();
+        let nvar = den_type.num_nvar();
+        let rho1 = ni.make_rho_from_dm(&dm_list, den_type).into_shape((ngrids, nvar, 2, nset));
+
+        let pot = ni.make_fxc_pot_with_eff(fxc, rho1.view(), den_type, XCSpin::Polarized);
+        // restore the input's per-spin trailing shape
+        [
+            (pot.i((.., .., α, ..)) * 2.0_f64).into_shape(rdm_shape[α].to_vec()),
+            (pot.i((.., .., β, ..)) * 2.0_f64).into_shape(rdm_shape[β].to_vec()),
+        ]
+    }
+
+    /// Cached on first call for fixed inputs: the CP-KS `vxc`/`fxc` evaluation is skipped when
+    /// this object was already prepared with the same orbitals (e.g. repeated calls from
+    /// multi-order property evaluations directly reuse the stored results).
+    fn make_response_preparation(&mut self, mo_coeff: &[TsrView; 2], mo_occ: &[TsrView; 2], prec: bool) {
+        let (key_vxc, key_fxc) = if prec { ("vxc_high", "fxc_high") } else { ("vxc_low", "fxc_low") };
+        // cache check (before the orbital refresh): whether the expensive evaluation below was
+        // already performed with the same orbitals (the `fxc_*` entry is also written by the
+        // rdm-form contraction on the same grid and orbitals, so it is a valid proxy)
+        let already_prepared = self.intmd.contains_key(key_fxc)
+            && is_same_tensor(self.intmd["mo_coeff_0"].view(), mo_coeff[α].view())
+            && is_same_tensor(self.intmd["mo_coeff_1"].view(), mo_coeff[β].view())
+            && is_same_tensor(self.intmd["mo_occ_0"].view(), mo_occ[α].view())
+            && is_same_tensor(self.intmd["mo_occ_1"].view(), mo_occ[β].view());
+        self.intmd.insert("mo_coeff_0".to_string(), mo_coeff[α].view().into_contig(ColMajor));
+        self.intmd.insert("mo_coeff_1".to_string(), mo_coeff[β].view().into_contig(ColMajor));
+        self.intmd.insert("mo_occ_0".to_string(), mo_occ[α].view().into_contig(ColMajor));
+        self.intmd.insert("mo_occ_1".to_string(), mo_occ[β].view().into_contig(ColMajor));
+        if already_prepared {
+            return;
+        }
+
+        // Compute the cached `vxc_*` / `fxc_*` on the selected grid (the small `ni_resp` of the
+        // low-precision path when attached, else the high-precision grid) from the ground-state
+        // spin densities, using the lean [`make_cpks_vxc_fxc_uks`] (no skeleton intermediates,
+        // minimal AO derivative order, spin densities formed from occupied spin-orbitals via a
+        // bra-ket contraction rather than full spin dm0 matrices).
+        let ni = if prec { &mut self.ni } else { self.ni_resp.as_mut().unwrap_or(&mut self.ni) };
+        let mo_coeff_α = self.intmd["mo_coeff_0"].view();
+        let mo_coeff_β = self.intmd["mo_coeff_1"].view();
+        let mo_occ_α = self.intmd["mo_occ_0"].view();
+        let mo_occ_β = self.intmd["mo_occ_1"].view();
+        let (vxc, fxc) =
+            make_cpks_vxc_fxc_uks(&self.xc_func_list, ni, &[mo_coeff_α, mo_coeff_β], &[mo_occ_α, mo_occ_β]);
+        self.intmd.insert(key_vxc.to_string(), vxc);
+        self.intmd.insert(key_fxc.to_string(), fxc);
+    }
+
+    fn get_response_bra(&mut self, bra: &[TsrView; 2], prec: bool) -> [Tsr; 2] {
+        let ni = if prec { &mut self.ni } else { self.ni_resp.as_mut().unwrap_or(&mut self.ni) };
+        let mo_coeff_α = self.intmd["mo_coeff_0"].view();
+        let mo_coeff_β = self.intmd["mo_coeff_1"].view();
+        let mo_occ_α = self.intmd["mo_occ_0"].view();
+        let mo_occ_β = self.intmd["mo_occ_1"].view();
+        let fxc_eff = self.intmd[if prec { "fxc_high" } else { "fxc_low" }].view();
+
+        let occidx_α = mo_occ_α.view().greater(0).into_vec();
+        let occidx_β = mo_occ_β.view().greater(0).into_vec();
+        let mocc_α = mo_coeff_α.bool_select(-1, &occidx_α);
+        let mocc_β = mo_coeff_β.bool_select(-1, &occidx_β);
+
+        let den_type = determine_den_type_from_list(&self.xc_func_list.iter().map(|(_, f)| f).collect_vec());
+
+        let ([resp_α, resp_β], _timing) = get_uks_response_bra_batched(
+            ni,
+            den_type,
+            fxc_eff.view(),
+            bra,
+            &[mocc_α.view(), mocc_β.view()],
+            self.verbose,
+        );
+        [resp_α, resp_β]
+    }
+}

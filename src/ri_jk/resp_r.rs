@@ -170,8 +170,12 @@ pub struct RRespRIJK<'a> {
     pub factor_j: f64,
     /// Exchange factor, absorbed into the returned fock/response tensors.
     pub factor_k: f64,
-    /// Cholesky decomposed 3c-2e ERI, shape `[nao_tp, naux]`.
+    /// Cholesky decomposed 3c-2e ERI of the SCF auxiliary basis (the high-precision resource),
+    /// shape `[nao_tp, naux]`.
     pub cderi: TsrCow<'a>,
+    /// Optional decomposed ERI of the response auxiliary basis (`resp_auxbas_path`, the
+    /// low-precision resource); `None` reuses `cderi`.
+    pub cderi_resp: Option<TsrCow<'a>>,
     /// Response intermediates: `mo_coeff [nao, nmo]` (RowMajor) and `mo_occ [nmo]`, stored by
     /// [`RRespAPI::make_response_preparation`].
     pub intmd: HashMap<String, Tsr>,
@@ -180,7 +184,27 @@ pub struct RRespRIJK<'a> {
 impl<'a> RRespRIJK<'a> {
     /// Create from a Cholesky-decomposed ERI (`cderi`).
     pub fn new_with_cderi(factor_j: f64, factor_k: f64, cderi: TsrCow<'a>) -> Self {
-        Self { factor_j, factor_k, cderi, intmd: HashMap::new() }
+        Self { factor_j, factor_k, cderi, cderi_resp: None, intmd: HashMap::new() }
+    }
+
+    /// Attach a dedicated decomposed ERI (`cderi_resp`) of the response auxiliary basis for the
+    /// low-precision (`prec = false`) path.
+    ///
+    /// When set, the response contractions called with `prec = false` (the CP-SCF machinery)
+    /// evaluate on this tensor instead of the SCF-basis `cderi`.
+    pub fn set_cderi_resp(mut self, cderi_resp: TsrCow<'a>) -> Self {
+        self.cderi_resp = Some(cderi_resp);
+        self
+    }
+
+    /// The decomposed ERI selected by the precision flag: the SCF-basis `cderi` for `prec = true`,
+    /// the response-basis [`Self::cderi_resp`] for `prec = false` (falling back to `cderi`).
+    fn cderi_in_use(&self, prec: bool) -> &TsrCow<'a> {
+        if prec {
+            &self.cderi
+        } else {
+            self.cderi_resp.as_ref().unwrap_or(&self.cderi)
+        }
     }
 }
 
@@ -190,17 +214,18 @@ impl<'a> RRespAPI for RRespRIJK<'a> {
     /// Fock from density matrix: `factor_j * J(rdm) - 0.5 * factor_k * K(rdm)`.
     ///
     /// The `rdm` is assumed to be symmetric, as required by the pure in-core functions.
-    fn get_fock_rdm(&mut self, rdm: TsrView) -> Tsr {
+    fn get_fock_rdm(&mut self, rdm: TsrView, prec: bool) -> Tsr {
         assert_eq!(rdm.ndim(), 2, "rdm must have 2 dimensions");
         let nao = rdm.shape()[0];
-        let device = self.cderi.device();
+        let cderi = self.cderi_in_use(prec);
+        let device = cderi.device();
 
         // pure functions require (nao, nao, nset) f-contiguous inputs
         let dms = rdm.into_contig(ColMajor).into_shape((nao, nao, 1));
 
         // TODO: batch size `72` should be tunable by max-memory.
-        let vj = get_vj_ri_incore(self.cderi.view(), dms.view()).i((.., .., 0)).into_contig(ColMajor);
-        let vk = get_vk_ri_incore_dm(self.cderi.view(), dms.view(), 72).i((.., .., 0)).into_contig(ColMajor);
+        let vj = get_vj_ri_incore(cderi.view(), dms.view()).i((.., .., 0)).into_contig(ColMajor);
+        let vk = get_vk_ri_incore_dm(cderi.view(), dms.view(), 72).i((.., .., 0)).into_contig(ColMajor);
 
         let mut fock = rt::zeros(([nao, nao], device));
         if self.factor_j != 0.0 {
@@ -214,20 +239,21 @@ impl<'a> RRespAPI for RRespRIJK<'a> {
 
     /// Fock from molecular coefficients: J by the dm route (no coeff-native vj exists), K by the
     /// coeff-native pure function.
-    fn get_fock_coeff(&mut self, mo_coeff: TsrView, mo_occ: TsrView) -> Tsr {
+    fn get_fock_coeff(&mut self, mo_coeff: TsrView, mo_occ: TsrView, prec: bool) -> Tsr {
         let [nao, nmo] = mo_coeff.shape().to_vec().try_into().unwrap();
-        let device = self.cderi.device();
+        let cderi = self.cderi_in_use(prec);
+        let device = cderi.device();
 
         let dm = get_dm0_restricted(mo_coeff.view(), mo_occ.view());
         let dms = dm.into_contig(ColMajor).into_shape((nao, nao, 1));
-        let vj = get_vj_ri_incore(self.cderi.view(), dms.view()).i((.., .., 0)).into_contig(ColMajor);
+        let vj = get_vj_ri_incore(cderi.view(), dms.view()).i((.., .., 0)).into_contig(ColMajor);
 
         let coeff = mo_coeff.into_contig(ColMajor).into_shape((nao, nmo, 1));
         let occ = mo_occ.into_contig(ColMajor).into_shape((nmo, 1));
 
         // TODO: batch size `72` should be tunable by max-memory.
         let vk =
-            get_vk_ri_incore_coeff(self.cderi.view(), coeff.view(), occ.view(), 72).i((.., .., 0)).into_contig(ColMajor);
+            get_vk_ri_incore_coeff(cderi.view(), coeff.view(), occ.view(), 72).i((.., .., 0)).into_contig(ColMajor);
 
         let mut fock = rt::zeros(([nao, nao], device));
         if self.factor_j != 0.0 {
@@ -239,37 +265,39 @@ impl<'a> RRespAPI for RRespRIJK<'a> {
         fock
     }
 
-    fn get_response_rdm(&mut self, rdm: TsrView) -> Tsr {
+    fn get_response_rdm(&mut self, rdm: TsrView, prec: bool) -> Tsr {
         // assume rdm can be symmetrized, 4 * J - 2 * K
         assert_eq!(rdm.ndim(), 2, "rdm must have 2 dimensions");
         let [nao, nao2] = rdm.shape().to_vec().try_into().unwrap();
         assert_eq!(nao, nao2, "rdm must be square");
-        let device = self.cderi.device();
+        let cderi = self.cderi_in_use(prec);
+        let device = cderi.device();
 
         let rdm_sym = ((&rdm + &rdm.t()) * 0.5).into_contig(ColMajor).into_shape((nao, nao, 1));
 
         let mut resp = rt::zeros(([nao, nao], device));
         if self.factor_j != 0.0 {
-            let vj = get_vj_ri_incore(self.cderi.view(), rdm_sym.view()).i((.., .., 0)).into_contig(ColMajor);
+            let vj = get_vj_ri_incore(cderi.view(), rdm_sym.view()).i((.., .., 0)).into_contig(ColMajor);
             resp += 4.0 * self.factor_j * &vj;
         }
         // TODO: batch size `72` should be tunable by max-memory.
         if self.factor_k != 0.0 {
-            let vk = get_vk_ri_incore_dm(self.cderi.view(), rdm_sym.view(), 72).i((.., .., 0)).into_contig(ColMajor);
+            let vk = get_vk_ri_incore_dm(cderi.view(), rdm_sym.view(), 72).i((.., .., 0)).into_contig(ColMajor);
             resp -= 2.0 * self.factor_k * &vk;
         }
         resp
     }
 
-    fn make_response_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView) {
+    fn make_response_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView, _prec: bool) {
+        // the intermediates are precision-independent (the decomposed ERI is selected per call)
         self.intmd.insert("mo_coeff".to_string(), mo_coeff.into_contig(RowMajor));
         self.intmd.insert("mo_occ".to_string(), mo_occ.to_owned());
     }
 
-    fn get_response_bra(&mut self, bra: TsrView) -> Tsr {
+    fn get_response_bra(&mut self, bra: TsrView, prec: bool) -> Tsr {
         let mo_coeff = self.intmd["mo_coeff"].view();
         let mo_occ = self.intmd["mo_occ"].view();
-        let cderi = self.cderi.view();
+        let cderi = self.cderi_in_use(prec).view();
 
         // RHF (single spin) assembly of the separated J/K response core.
         // - J (AO form, from total density) contracted with `mocc` and scaled by `factor_j`.

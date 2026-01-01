@@ -1,6 +1,5 @@
 //! CO2 (HF, RI-JK, def2-TZVP): the neutral linear molecule has vanishing dipole, so its raw
-//! quadrupole is origin-invariant. Quadrupole reference from pyscf
-//! (`local-runs/260911-multipole/gen_refs.py`, pyscf 2.14.0).
+//! quadrupole is origin-invariant. Quadrupole reference from pyscf 2.14.0.
 
 use pyrest::analdrv::multipole::rmultipole::RMultipoleDH;
 use pyrest::ctrl_io;

@@ -7,7 +7,7 @@ use std::{fs};
 use crate::ctrl_io::geometric_pyo3_io::parse_geometric_keywords;
 use crate::ctrl_io::quasiparticle_methods::parse_quasiparticle_keywords;
 use crate::ri_jk::decompose::J2CDecompOption;
-use crate::analdrv::config::{AnalDrvConfig, AnalDrvTask};
+use crate::analdrv::config::{AnalDrvConfig, AnalDrvTask, parse_analdrv_keywords};
 use crate::ctrl_io::tddft_parameters::parse_tddft_keywords;
 use crate::ctrl_io::hessian_parameters::parse_hessian_keywords;
 use crate::ctrl_io::thermo_parameters::parse_thermo_keywords;
@@ -38,7 +38,7 @@ pub mod tddft_parameters;
 pub mod hessian_parameters;
 pub mod thermo_parameters;
 use geometric_pyo3_io::GeomeTRIC;
-mod path_util;
+pub mod path_util;
 use quasiparticle_methods::QuasiParticle;
 use tddft_parameters::TDDFTParameters;
 use hessian_parameters::HessianParameters;
@@ -87,7 +87,7 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     if let Some(tmp_thermo) = &mut tmp_thermo {
         tmp_input.thermo = Some(std::mem::take(tmp_thermo));
     }
-    tmp_input.analdrv = tmp_keys.get("analdrv").map(serde_from_value);
+    tmp_input.analdrv = parse_analdrv_keywords(tmp_keys);
     Ok((tmp_input,tmp_geomcell))
 }
 
@@ -577,7 +577,7 @@ impl InputKeywords {
             // False: use coefficients as well with higher efficiency
             use_dm_only: false,
             vxc_screen_threshold: 1.0e-15,
-            ao_cutoff: 0.0,
+            ao_cutoff: 1.0e-9,
             non0tab_blksize: 0,     // 0 = auto-select based on nao
             drop_dense_ao: false,
             algorithm_jk: AlgorithmJK::Default,
@@ -962,7 +962,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
 
             // if env REST_BASIS_DIR is set, use it as rest_basis_dir, 
             // otherwise use the default path from rest docker's convention or $REST_HOME/rest/basis-set-pool/
-            let rest_basis_dir = path_util::get_rest_basis_dir(tmp_input.print_level);
+            let rest_basis_dir = path_util::get_rest_basis_dir();
 
             tmp_input.basis_path = match tmp_ctrl.get("basis_path").unwrap_or(&serde_json::Value::Null) {
                serde_json::Value::String(tmp_bas) => {
@@ -1672,9 +1672,9 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 _ => 1.0e-15,
             };
             tmp_input.ao_cutoff = match tmp_ctrl.get("ao_cutoff").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-12),
-                serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-12),
-                _ => 1.0e-12,
+                serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-9),
+                serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-9),
+                _ => 1.0e-9,
             };
             tmp_input.non0tab_blksize = match tmp_ctrl.get("non0tab_blksize").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(num) => num.as_u64().map(|v| v as usize).unwrap_or(0),

@@ -68,6 +68,7 @@
 - `outputs`: 取值Vec\<String\>。用于计算结束后输出结果。可输出的信息包括：
     - `dipole`    偶极
     - `fchk`　    Gaussian程序的fchk文件
+        - 双杂化 (PT2 族) 的解析力计算 (`job_type = "force"`) 额外在 fchk 中写入弛豫总密度 `Total MP2 Density` 段；开壳层 (UHF 参考) 另行写入 `Spin MP2 Density` 段 (alpha − beta)。
     - `cube_orb`  格点化的轨道文件信息 
     - `molden`　　结果输出为molden程序的格式
     - `geometry`  输出分子结构文件
@@ -117,7 +118,7 @@
 
 ### VXC 格点积分优化相关关键词（Keyword）
 - `vxc_screen_threshold`: 取值f64。密度筛选阈值，在 VXC 计算中跳过密度低于此值的格点。对于大分子（真空区域多），可节省 30-70% 的 XC 计算量。设为 0.0 可关闭筛选。缺省为 1.0e-15。
-- `ao_cutoff`: 取值f64。AO 格点值截断阈值，启用 non0tab 稀疏存储。AO 值低于此阈值的基函数-格点对被当作零处理。设为 0.0（缺省）则关闭 non0tab 压缩。推荐值 1.0e-10。
+- `ao_cutoff`: 取值f64。AO 格点值截断阈值，启用 non0tab 稀疏存储。AO 值低于此阈值的基函数-格点对被当作零处理。缺省为 1.0e-9：格点制表按批次只存超过阈值的 AO/AOP 元素，稠密 AO/AOP 不分配。若某体系在该阈值下 AO 存留率高于 90%，程序自动放弃压缩、回退稠密存储。设为 0.0 可强制关闭压缩。(H2O)30 / B3LYP / def2-SVP 实测：1.0e-9 相对 1.0e-12 峰值内存少约 10%、墙钟少约 12%，能量差约 1 nHa。
 - `non0tab_blksize`: 取值usize。non0tab 压缩存储中每个格点批次的大小。设为 0（缺省）时程序根据基组大小自动选择 [32, 256]。设为具体值则固定该批次大小。
 - `drop_dense_ao`: 取值布尔类型。non0tab 压缩存储生成后是否释放稠密 AO/AOP 矩阵以节省内存。缺省为 false。当 `ao_cutoff > 0` 且该体系 AO 稀疏率 < 90% 时，设为 true 可显著降低内存。
 
@@ -231,6 +232,18 @@ guessfile = "my_checkpoint.rchk"
     - 缺省为 0.0，即不剪枝也不筛选，数值与未筛选内核一致。构建期剪枝改变了存储的 `rimatr` 的行空间，因此每个消费者都要按 `PairMap` 取行，未接线的路径一律显式报错退出，不会静默算错。
     - 已接线：SCF 的 J/K 缩并（含 RSH 短程张量与 `use_dm_only` 的密度版 K），以及后自洽场相关能的 AO→MO 变换（`ri3mo` 与 streaming PT2 驱动，覆盖 PT2/SBGE2/SCS-RPA/RPA 以及 `xc = "mp2"` 这类 PT2 family 单点）。
     - 仍被拒绝：解析导数与 Hessian、SCF/单点之外的 job_type、TDDFT 与响应、GW/BSE、数值力（`outputs = ["num_force"]`），以及 `ri_pt2` 的 `new_driver = true` 与 `engine = "torch"` 两个引擎。
+
+    - **推荐用法（杂化泛函的能量与几何优化）**：显式设 `pair_screen_threshold = 1.0e-12`。构建期会丢掉大多数可忽略的 AO 对行，K 的缩并随之变短，内存与时间都明显下降，而能量变化只有 1e-8 Ha 量级。
+
+      ````toml`
+      [ctrl]
+           ao_cutoff =                 1.0e-9      # 缺省值，可省略
+           ...
+      [ctrl.ri_jk]
+           pair_screen_threshold =     1.0e-12     # 杂化泛函能量与几何优化推荐
+      `````
+
+      (H2O)30 / B3LYP / def2-SVP 实测（ao_cutoff = 1.0e-9，4 线程）：不筛选 12.75 GB / 897 s，1.0e-12 为 **8.78 GB / 624 s**（能量差 0.017 μHa），1.0e-10 为 8.38 GB / 606 s（差 2.1 μHa），1.0e-9 为 8.16 GB / 593 s（差 12.8 μHa）。收益在 1.0e-12 已基本拿满，故推荐 1.0e-12。
 - `use_dm_only`: 取值布尔类型。控制 VK (Exchange) 和 VXC (XC Potential) 矩阵的构建方式。缺省为 false。
     - `false`（缺省）：使用分子轨道系数构造（occ-RI-K 算法），效率更高，推荐用于大多数体系。
     - `true`：直接使用密度矩阵构造。当轨道占据数非整数（如 dSCF 激发态）时可能需要设为 true。
@@ -1024,6 +1037,7 @@ analdrv_tasks = ["multipole", "hessian"]
 - `cpscf_lindep`：CP-SCF 中一些数值过程的数值精度阈值。默认 1e-15，无量纲。
 - `cpscf_tol_inflation`：容忍系数。若 Krylov 真残差 `||r|| < factor * tol`，接受该解而不触发 per-root 求解。缺省为1000.0。
 - `grid_level_cpscf`：CP-SCF 中响应路径 (响应/A 张量收缩的 DFT 计算；fock 路径仍用 SCF 格点) 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None，是 `[ctrl]` 中 grid_generation_level 关键词设定值减 2 (SCF 默认格点级别是 3，对应 Hessian 的级别是 1)；显式取值不设下限。
+- `resp_auxbas_path`：响应计算辅助基路径。默认为 None，即使用 `[ctrl]` 中 auxbas_path 设定的辅助基组。若显式指定，则在 CP-SCF/Z-Vector/response 计算中使用对应辅助基。该选项通常用于指定更小的辅助基以加速 CP-SCF 计算，但作为代价会降低 CP-SCF 的精度且增加内存占用。
 
 这些关键词的旧名称 `cphf_*` 前缀 (`cphf_tol`、`cphf_lindep`、`cphf_tol_inflation` 等) 目前仍然作为别名被接受；响应格点则同时接受其旧名称 `grid_level_cphf`。
 

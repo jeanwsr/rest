@@ -8,8 +8,7 @@
 //!
 //! References: Gaussian 16 Legacy RevB.01, `#p MP2(Full)/def2TZVP Density=MP2 NoSymm` (relaxed
 //! MP2 density; note G16's default MP2 freezes the I 4s/4p subshells, so `Full` is required to
-//! match REST's `start_mo = 0`), geometry H(0,0,0), I(0,0,1.609 Angstrom), run recorded at
-//! `local-runs/260912-hi-ecp/g16`:
+//! match REST's `start_mo = 0`), geometry H(0,0,0), I(0,0,1.609 Angstrom):
 //!
 //! - E(SCF) = -297.242009239, E2 = -0.5911611131, EUMP2 = -297.83317035213
 //! - dipole Z = -0.5630 D (G16 prints 4 decimals; 1e-5 a.u. rounding)

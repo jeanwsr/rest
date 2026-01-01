@@ -106,19 +106,29 @@ pub fn main_driver() -> anyhow::Result<()> {
 
     // Storage-level AO-pair pruning ([ctrl.ri_jk] pair_screen_threshold > 0) rewrites the row
     // space of the in-core RI tensor `rimatr`, and every consumer of that tensor has to address
-    // it through `SCF::rimatr_pair_map`. That is wired for the SCF J/K contractions (S1) and for
+    // it through `SCF::rimatr_pair_map`. That is wired for the SCF J/K contractions (S1), for
     // the AO-to-MO transform that feeds the post-SCF correlation energy: the `ri3mo` route and the
-    // streaming PT2 driver both go through the map-aware `scf_io::ao2mo_rayon*` kernels (S2).
-    // The derivative, response, Hessian, TDDFT and quasiparticle paths still index the tensor with
-    // the full-space pair tables, and would silently read the wrong rows instead of failing, so
-    // they stay refused here. (S3 of the pruning plan lifts the remaining ones.)
+    // streaming PT2 driver both go through the map-aware `scf_io::ao2mo_rayon*` kernels (S2), and
+    // for the analytic gradient of a hybrid functional (`grad/rhf.rs`, `grad/uhf.rs`, S3c). The
+    // response, Hessian, TDDFT and quasiparticle paths still index the tensor with the full-space
+    // pair tables, and would silently read the wrong rows instead of failing, so they stay
+    // refused here, and the entry points that were reachable from two of them now fail closed on
+    // their own (`ri_jk::require_unpruned_rimatr`).
     if mol.ctrl.ri_jk.pair_screen_threshold > 0.0 {
         let mut unsupported: Vec<&str> = Vec::new();
         if !mol.ctrl.analdrv_tasks.is_empty() {
             unsupported.push("analytical derivative tasks (analdrv_tasks)");
         }
-        if !matches!(mol.ctrl.job_type, JobType::SinglePoint) {
-            unsupported.push("a job_type other than a single-point energy (gradient / optimization / MD / numerical dipole)");
+        match mol.ctrl.job_type {
+            // The analytic gradient contracts `rimatr` through its pair map, and it shares the
+            // row set of the energy of the very same geometry, so a single point, a force
+            // calculation and a geometry optimization driven by that force are all consistent.
+            JobType::SinglePoint | JobType::Force | JobType::GeomOpt => {},
+            _ => unsupported.push(
+                "a job_type other than a single-point energy, a force calculation or a geometry \
+                 optimization (MD, normal modes and the numerical dipole change the geometry or \
+                 the field without freezing the pair mask)",
+            ),
         }
         if mol.ctrl.tddft.is_some() {
             unsupported.push("TDDFT and response TDDFT (tddft)");
@@ -128,6 +138,13 @@ pub fn main_driver() -> anyhow::Result<()> {
         }
         if mol.ctrl.quasiparticle_methods.is_some() {
             unsupported.push("quasiparticle methods such as GW and BSE (quasiparticle_methods)");
+        }
+        // A numerical force differentiates the pruned energy across geometries, and the pair
+        // mask is rebuilt at every displaced geometry: the finite difference then crosses a
+        // change of the row set, and its error does not converge with the displacement. Freezing
+        // the mask of the reference geometry for the whole stencil is still to be implemented.
+        if mol.ctrl.numerical_force {
+            unsupported.push("a numerical force ([ctrl] numerical_force = true)");
         }
         if mol.ctrl.outputs.iter().any(|output| output.eq("num_force")) {
             unsupported.push("numerical force output (outputs = \"num_force\")");
@@ -824,6 +841,23 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         println!("Force calculation invoked");
     }
 
+    // 力阶段的内存监控：后台线程每 20 ms 采样 RSS 并跟踪峰值；只有用户要求时
+    // （`abort_on_mem_exceed`，缺省 true）才按 `[ctrl] max_memory` 中止。SCF 阶段不在覆盖范围内。
+    let mem_monitor = crate::utilities::memory_monitor::MemMonitor::start_from_ctrl(
+        scf_data.mol.ctrl.max_memory,
+        scf_data.mol.ctrl.abort_on_mem_exceed,
+        std::time::Duration::from_millis(20),
+    );
+    if scf_data.mol.ctrl.print_level > 1 {
+        println!(
+            "  Memory monitor (force phase): limit = {}",
+            mem_monitor
+                .limit_mb()
+                .map(|m| format!("{:.1} MiB ({:.3} GiB, abort on exceed)", m, m / 1024.0))
+                .unwrap_or_else(|| "NONE (peak tracking only)".to_string())
+        );
+    }
+
     let (energy, gradient) = if scf_data.mol.ctrl.numerical_force {
         if scf_data.mol.ctrl.print_level > 1 {
             println!("Gradient evaluation using numerical differentiation");
@@ -838,10 +872,13 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         // current available analytical gradients methods:
         // 1) analytical RHF, UHF force
         // 2) dftd force
-        // 
-        // disallow post-scf calculations for force
-        if scf_data.mol.xc_data.is_fifth_dfa() {
+        // 3) doubly-hybrid (PT2-family) correlation gradient, as a separate entry
+        let is_dh = matches!(scf_data.mol.xc_data.dfa_family_pos, Some(crate::dft::DFAFamily::PT2));
+        if scf_data.mol.xc_data.is_fifth_dfa() && !is_dh {
             panic!("Analytic Gradient calculation is currently not available for post-SCF methods.");
+        }
+        if is_dh && mpi_operator.is_some() {
+            panic!("Analytic Gradient calculation of post-SCF methods is not MPI-parallelized yet.");
         }
 
         if scf_data.mol.ctrl.print_level > 1 {
@@ -882,6 +919,25 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         // list of (gradient name, gradient data)
         let mut grad_data_list: Vec<(String, Box<dyn GradAPI>)> = vec![];
 
+        // the DH (PT2-family) entry hands the total relaxed density back for the fchk density
+        // dump (`SCF::dh_rdm1_resp`, written out by the `outputs` pass)
+        let mut dh_rdm1_resp: Option<Vec<MatrixFull<f64>>> = None;
+
+        // post-SCF (doubly-hybrid) gradients need the DFT grids again whenever the DH entry runs
+        // on a grid (final-functional XC part / hybrid difference, or the SCF functional's own XC
+        // response); `xdh_calculations` frees them, so regenerate (pure MP2 needs none)
+        let is_dh = matches!(scf_data.mol.xc_data.dfa_family_pos, Some(crate::dft::DFAFamily::PT2));
+        let dh_needs_grids = {
+            let xc_data = &scf_data.mol.xc_data;
+            let final_xc = xc_data.dfa_compnt_pos.as_ref().map_or(false, |v| !v.is_empty());
+            let delta_hyb =
+                xc_data.dfa_hybrid_pos.unwrap_or(xc_data.dfa_hybrid_scf) - xc_data.dfa_hybrid_scf;
+            final_xc || delta_hyb.abs() > 1.0e-10 || !xc_data.dfa_compnt_scf.is_empty()
+        };
+        if is_dh && dh_needs_grids && scf_data.grids.is_none() {
+            scf_data.grids = Some(crate::dft::Grids::build(&mut scf_data.mol));
+        }
+
         // 1. self-consistent gradient data
         let grad_data_scf: Box<dyn crate::grad::traits::GradAPI> = {
             if !scf_data.mol.ctrl.spin_polarization {
@@ -908,6 +964,21 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         };
         grad_data_list.push(("SCF".into(), grad_data_scf));
 
+        // 1.5 doubly-hybrid (RI-PT2) correlation gradient; requires the decomposed rimatr
+        if is_dh {
+            if !scf_data.mol.ctrl.spin_polarization {
+                let mut grad_data_dh = crate::grad::rdh::RDHGradient::new(&scf_data, mpi_operator);
+                grad_data_dh.calc();
+                dh_rdm1_resp = grad_data_dh.rdm1_dump.take();
+                grad_data_list.push(("DH".into(), Box::new(grad_data_dh)));
+            } else {
+                let mut grad_data_dh = crate::grad::udh::UDHGradient::new(&scf_data, mpi_operator);
+                grad_data_dh.calc();
+                dh_rdm1_resp = grad_data_dh.rdm1_dump.take();
+                grad_data_list.push(("DH".into(), Box::new(grad_data_dh)));
+            }
+        }
+
         // 2. dftd gradient data
         //    we will force to evaluate dftd gradient, since dftd3 is not bottleneck for small to medium molecules
         use crate::dftd::grad::DFTDGrad;
@@ -928,6 +999,13 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
                 println!("Gradient contribution from {:} [a.u.]:", grad_name);
                 println!("{}", formated_force(&grad_contrib, &scf_data.mol.geom.elem));
             }
+        }
+
+        // the gradient objects borrow `scf_data`; release them before handing the DH relaxed
+        // density to the fchk output pass — force jobs only
+        drop(grad_data_list);
+        if is_dh && matches!(scf_data.mol.ctrl.job_type, JobType::Force) {
+            scf_data.dh_rdm1_resp = dh_rdm1_resp;
         }
 
         // TDDFT analytic-gradient response for the requested excited state.
@@ -978,8 +1056,20 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         println!("{}", formated_force(&gradient, &scf_data.mol.geom.elem));
         println!("------------------------------------");
 
-        (scf_data.scf_energy, gradient)
+        // the total energy (fifth-DFA/rpa/ai correction included), consistent with the gradient
+        (collect_total_energy(scf_data), gradient)
     };
+
+    // 力阶段峰值（监控线程 20 ms 一次采样），随后关掉监控线程
+    let force_peak_mb = mem_monitor.stage_peak_mb();
+    if scf_data.mol.ctrl.print_level > 0 {
+        println!(
+            "  [mem] force phase peak RSS = {:.1} MiB ({:.3} GiB)",
+            force_peak_mb,
+            force_peak_mb / 1024.0
+        );
+    }
+    mem_monitor.stop();
 
     time_mark.count("force");
     time_mark.report("force");
@@ -1376,15 +1466,21 @@ mod geometric_pyo3_impl {
                 } else {
                     use crate::analdrv::hessian::hess_interface;
                     use crate::analdrv::response::rresp_interface::rscf_resp_interface;
+                    use crate::analdrv::response::uresp_interface::uscf_resp_interface;
+                    use crate::analdrv::response::RespSCF;
                     use rstsr::prelude::*;
 
                     let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
-                    // shared RHF response object for the hessian.
-                    // UHF builds its own internally, and will implement the UHF response interface in the future.
-                    let mut resp_objs = if matches!(scf_data.scftype, crate::scf_io::SCFType::RHF) {
-                        Some(rscf_resp_interface(&scf_data, &config))
-                    } else {
-                        None
+                    // post-SCF (fifth-DFA) methods have no analytic hessian; reject before any
+                    // response object is built (the DFT grids it would need are already freed)
+                    if scf_data.mol.xc_data.is_fifth_dfa() {
+                        panic!("Normal modes calculation is currently not available for post-SCF methods.");
+                    }
+                    // shared response object for the hessian, per the SCF type
+                    let mut resp_objs = match scf_data.scftype {
+                        crate::scf_io::SCFType::RHF => Some(RespSCF::R(rscf_resp_interface(&scf_data, &config))),
+                        crate::scf_io::SCFType::UHF => Some(RespSCF::U(uscf_resp_interface(&scf_data, &config))),
+                        _ => None,
                     };
                     let hess_out = hess_interface(&scf_data, &config, resp_objs.as_mut());
                     let hess_raw = hess_out.hessian;

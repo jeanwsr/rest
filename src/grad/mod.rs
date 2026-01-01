@@ -1,8 +1,13 @@
+pub mod rdh;
+pub mod udh;
 pub mod uhf;
 pub mod rks;
 pub mod uks;
 pub mod rhf;
 pub mod traits;
+
+#[cfg(test)]
+mod grad_pair_row_space_tests;
 
 use std::io::{self, Write};
 

@@ -4,7 +4,9 @@
 //! Port of the validated PySCF implementation
 //! `pyscf/gw/bse_grad_optimized.py` to REST.  The reference definition is
 //!
+//! ```text
 //!     d Omega_S / dR = sum_p c_p^(S) dE_p/dR + d Omega_kernel^(S)/dR
+//! ```
 //!
 //! where `c_p` are the BSE amplitude weights (X^2 + Y^2 over the occupied and
 //! virtual blocks) times the quasiparticle renormalisation factors Z_p, and

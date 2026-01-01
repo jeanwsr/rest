@@ -969,7 +969,7 @@ pub fn get_vmat_becke_parts(
 /// across chunks by a plain sum; grid-atom keys carry only the chunk atom's
 /// contribution and are scattered by [`make_hessian_setup_becke`]:
 ///
-/// - Sum: `fxc [ngrids, nvar, nvar]` (disjoint grid ranges); `de_vxc_diag`, `de_vxc_off`, `de_fxc`,
+/// - Sum: `de_vxc_diag`, `de_vxc_off`, `de_fxc`,
 ///   `de_becke_full_1/2` `[3, 3, natm, natm]`; `vmat_ip [nao, nao, 3]`; `vmat_fxc`, `vmat_vxc`,
 ///   `vmat_deriv1`, `vmat_becke_dw` `[nao, nao, 3, natm]`.
 /// - Scatter into column `B = atm_idx` (direction axes interchanged): `de_becke_atom_1/2`,
@@ -1115,7 +1115,6 @@ pub fn make_hessian_setup_chunk_becke(
     }
 
     let mut result = HashMap::from([
-        ("fxc", fxc),
         ("de_vxc_diag", de_vxc_diag),
         ("de_vxc_off", de_vxc_off),
         ("de_fxc", de_fxc),
@@ -1200,8 +1199,6 @@ pub fn make_hessian_setup_becke(
     let nao = mol.nao();
     let ngrids = ni.weights.len();
     let nchunk = ni.nchunk;
-    let xc_type = determine_den_type_from_list(&xc_func_list.iter().map(|(_, f)| f).collect_vec());
-    let nvar = xc_type.num_nvar();
     let device = dm0.device().clone();
 
     // per-atom grid boundaries, deduced from the (atom-grouped) attribution
@@ -1230,7 +1227,6 @@ pub fn make_hessian_setup_becke(
     let chunks = quad_split_by_atom(&atm_quad_split, ngrids, nchunk);
     let nchunks = chunks.len();
 
-    let fxc_full: Tsr = rt::zeros(([ngrids, nvar, nvar], &device));
     let de_fxc: Tsr = rt::zeros(([3, 3, natm, natm], &device));
     let de_vxc_diag: Tsr = rt::zeros(([3, 3, natm, natm], &device));
     let de_vxc_off: Tsr = rt::zeros(([3, 3, natm, natm], &device));
@@ -1272,12 +1268,6 @@ pub fn make_hessian_setup_becke(
             hardness,
             grid_shift,
         );
-        // fxc: disjoint grid ranges
-        unsafe {
-            let fxc_slc = fxc_full.i(start..end);
-            let mut fxc_slc = fxc_slc.force_mut();
-            fxc_slc.assign(&result_chunk["fxc"]);
-        }
         // sum the full-grid keys, scatter the grid-atom keys into the chunk
         // atom's column of the last (B) axis
         unsafe {
@@ -1353,7 +1343,6 @@ pub fn make_hessian_setup_becke(
     };
 
     let mut result = HashMap::from([
-        ("fxc", fxc_full),
         ("de_vxc_diag", de_vxc_diag),
         ("de_vxc_off", de_vxc_off),
         ("de_fxc", de_fxc),
