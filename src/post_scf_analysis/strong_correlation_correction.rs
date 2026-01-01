@@ -9,9 +9,6 @@ use crate::ri_pt2::sbge2::{close_shell_sbge2_detailed_rayon, open_shell_sbge2_de
 use libm::{erf,erfc};
 
 pub fn scc15_for_rxdh7(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> f64 {
-    if let (Some(mpi_op), Some(mpi_ix)) = (mpi_operator, &scf_data.mol.mpi_data) {
-        panic!("The MPI implementation for SCC15 is not yet available");
-    };
     let spin_channel = scf_data.mol.spin_channel;
     let xc_method = &scf_data.mol.ctrl.xc;
     let num_elec = &scf_data.mol.num_elec;
@@ -58,7 +55,34 @@ pub fn scc15_for_rxdh7(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -
             (e_lumo_0.min(e_lumo_1) - e_homo_0.max(e_homo_1))*EV            
         }
     };
-    let special_radius = evaluate_special_radius_only(scf_data).unwrap();
+    // MPI 分支：SBGE2-detailed（逐对 eij）与谱半径经 2.5D 路径计算；
+    // 其余量（x_hf / x_pbe / scsrpa 能量）由 xdh_calculations 预存，直接复用。
+    let is_mpi = mpi_operator.is_some() && scf_data.mol.mpi_data.is_some();
+
+    let (sbge2_detailed, special_radius) = if is_mpi {
+        #[cfg(feature = "mpi")]
+        {
+            let radius = crate::ri_rpa::scsrpa_25d::evaluate_special_radius_only_25d(scf_data, mpi_operator);
+            let detailed = if scf_data.mol.spin_channel == 1 {
+                crate::ri_pt2::sbge2_25d::close_shell_sbge2_detailed_rayon_mpi_25d(scf_data, mpi_operator).unwrap()
+            } else {
+                crate::ri_pt2::sbge2_25d::open_shell_sbge2_detailed_rayon_mpi_25d(scf_data, mpi_operator).unwrap()
+            };
+            (detailed, radius)
+        }
+        #[cfg(not(feature = "mpi"))]
+        {
+            panic!("SCC15 under MPI requires the mpi feature");
+        }
+    } else {
+        let radius = evaluate_special_radius_only(scf_data).unwrap();
+        let detailed = if scf_data.mol.spin_channel == 1 {
+            close_shell_sbge2_detailed_rayon(scf_data).unwrap()
+        } else {
+            open_shell_sbge2_detailed_rayon(scf_data).unwrap()
+        };
+        (detailed, radius)
+    };
     let x_max = special_radius[0].max(special_radius[1]);
     let x_min = special_radius[0].min(special_radius[1]);
     
@@ -83,11 +107,8 @@ pub fn scc15_for_rxdh7(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -
 
     let dxpbe = (x_pbe-x_hf)/x_hf*100.0f64;
 
-    let ([c_sbge2,sbge2_os,sbge2_ss],[eij_00,eij_01,eij_11]) = if spin_channel == 1 {
-        close_shell_sbge2_detailed_rayon(scf_data).unwrap()
-    } else {
-        open_shell_sbge2_detailed_rayon(scf_data).unwrap()
-    };
+    // sbge2_detailed 已在上方按 MPI/串行分支取得
+    let ([c_sbge2,sbge2_os,sbge2_ss],[eij_00,eij_01,eij_11]) = sbge2_detailed;
 
     scf_data.energies.insert(String::from("sbge2"), vec![c_sbge2,sbge2_os,sbge2_ss]);
 
