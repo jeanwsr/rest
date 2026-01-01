@@ -2482,6 +2482,7 @@ pub fn close_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>
         let mut ri3mo_i = {
             let (r, _, _) = crate::scf_io::ao2mo_rayon_m1(
                 eigenvector, ri3ao, vir_range.clone(), blocks[0].clone(),
+                scf_data.rimatr_pair_map.as_ref(),
             )?;
             r
         };
@@ -2496,6 +2497,7 @@ pub fn close_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>
                     None => {
                         let (r, _, _) = crate::scf_io::ao2mo_rayon_m1(
                             eigenvector, ri3ao, vir_range.clone(), blocks[bi_idx].clone(),
+                            scf_data.rimatr_pair_map.as_ref(),
                         )?;
                         r
                     }
@@ -2514,6 +2516,7 @@ pub fn close_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>
                         None => {
                             let (r, _, _) = crate::scf_io::ao2mo_rayon_m1(
                                 eigenvector, ri3ao, vir_range.clone(), blocks[bj_idx].clone(),
+                                scf_data.rimatr_pair_map.as_ref(),
                             )?;
                             Some(r)
                         }
@@ -2537,8 +2540,9 @@ pub fn close_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>
                     let eigvec = eigenvector;
                     let ri3ao_ref = ri3ao;
                     let vir = vir_range.clone();
+                    let pair_map = scf_data.rimatr_pair_map.as_ref();
                     scope.spawn(move || {
-                        let (r, _, _) = crate::scf_io::ao2mo_rayon_m1(eigvec, ri3ao_ref, vir, occ_range).unwrap();
+                        let (r, _, _) = crate::scf_io::ao2mo_rayon_m1(eigvec, ri3ao_ref, vir, occ_range, pair_map).unwrap();
                         r
                     })
                 });
@@ -2863,6 +2867,7 @@ pub fn open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>)
             let (ri3mo_i, _, _) = crate::scf_io::ao2mo_rayon_m1(
                 eigenvector_1, ri3ao,
                 vir_range_1.clone(), occ_range_i.clone(),
+                scf_data.rimatr_pair_map.as_ref(),
             )?;
 
             for (bj_idx, occ_range_j) in blocks_2.iter().enumerate() {
@@ -2877,6 +2882,7 @@ pub fn open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>)
                     let (rj, _, _) = crate::scf_io::ao2mo_rayon_m1(
                         eigenvector_2, ri3ao,
                         vir_range_2.clone(), occ_range_j.clone(),
+                        scf_data.rimatr_pair_map.as_ref(),
                     )?;
                     Some(rj)
                 };
@@ -3000,6 +3006,7 @@ pub fn restricted_open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Opt
             let (ri3mo_i, _, _) = crate::scf_io::ao2mo_rayon_m1(
                 eigenvector_1, ri3ao,
                 vir_range_1.clone(), occ_range_i.clone(),
+                scf_data.rimatr_pair_map.as_ref(),
             )?;
 
             for (bj_idx, occ_range_j) in blocks_2.iter().enumerate() {
@@ -3012,6 +3019,7 @@ pub fn restricted_open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Opt
                     let (rj, _, _) = crate::scf_io::ao2mo_rayon_m1(
                         eigenvector_2, ri3ao,
                         vir_range_2.clone(), occ_range_j.clone(),
+                        scf_data.rimatr_pair_map.as_ref(),
                     )?;
                     Some(rj)
                 };
