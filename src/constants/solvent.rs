@@ -257,8 +257,8 @@ pub static UFF_RADII: [f64; 104] = [
 /// SMD default fallback radii for non-eq.16 elements, in **bohr** (1-indexed: `BONDI_UFF_RADII[Z]`
 /// = radius of element Z; index 0 unused). Consumed by `SmdCavityRadii::BondiUff`.
 ///
-/// This table is a **complete snapshot** of the reference SMD implementation's per-element radii
-/// (see read_md/smd_cds_parameters.md §6.3-§6.4). Role in the SMD model (scheme `uff_mixed`):
+/// This table is a **complete snapshot** of the reference SMD implementation's per-element radii.
+/// Role in the SMD model (scheme `uff_mixed`):
 /// ```text
 /// R_sasa[Z] = BONDI_UFF_RADII[Z] × BOHR + 0.4 Å     (CDS accessible-sphere radius)
 /// R_cav[Z]  = BONDI_UFF_RADII[Z]                     (electrostatic cavity radius, bohr)
@@ -511,3 +511,44 @@ pub const SUPPORTED_SOLVENT_NAMES: &str = "\
   dmf, dma, ethyl acetate, nitrobenzene, mek (butanone), ipa (isopropanol), \
   etoh (ethanol), meoh (methanol), sulfolane, m-xylene, m-cresol, \
   and ~180 more (see source code for full list)";
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 描述符格式 [n, n25, α, β, γ, ε, φ, ψ]，数值直接对照 mnsddb 表。
+    #[test]
+    fn test_solvent_data_known_values() {
+        assert_eq!(
+            solvent_data("water").unwrap(),
+            [1.3328, 1.3323, 0.82, 0.35, -1.0, 78.355, -1.0, -1.0]
+        );
+        assert_eq!(
+            solvent_data("1-octanol").unwrap(),
+            [1.4295, 1.4279, 0.37, 0.48, 39.01, 9.8629, 0.0, 0.0]
+        );
+        assert_eq!(
+            solvent_data("acetonitrile").unwrap(),
+            [1.3442, 1.3416, 0.07, 0.32, 41.25, 35.688, 0.0, 0.0]
+        );
+        assert_eq!(
+            solvent_data("acetone").unwrap(),
+            [1.3588, 1.3559, 0.04, 0.49, 33.77, 20.493, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn test_solvent_data_aliases_and_case() {
+        // 大小写不敏感 + trim
+        assert_eq!(solvent_data("H2O").unwrap(), solvent_data("water").unwrap());
+        assert_eq!(solvent_data("  water  ").unwrap(), solvent_data("water").unwrap());
+        // 别名
+        assert_eq!(solvent_data("Octanol").unwrap(), solvent_data("n-octanol").unwrap());
+        assert_eq!(solvent_data("CH3CN").unwrap(), solvent_data("acetonitrile").unwrap());
+        assert!(solvent_data("not-a-solvent").is_none());
+    }
+}

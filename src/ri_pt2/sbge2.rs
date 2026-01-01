@@ -992,7 +992,8 @@ pub fn close_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF,mpi_operator:&O
                         (eij_bge2_ss, eij_bge2_os,num_eij_iter) = iterator_close_shell_eij_rayon_mpi(&eri_virt, &denominator, 
                             eij_mp2_ss, eij_mp2_os, 
                             enhanced_factor, screening_factor, shifted_factor, 
-                            lumo, lumo_min, num_state, &scf_data.mol.mpi_data, mpi_operator);
+                            lumo, lumo_min, num_state, 
+                            scf_data.mol.ctrl.ri_pt2.mpi_mode, &scf_data.mol.mpi_data, mpi_operator);
 
                         if i_state != j_state {
                             eij_mp2_ss *= 2.0;
@@ -1041,7 +1042,8 @@ pub fn iterator_close_shell_eij_rayon_mpi(
     screening_factor: f64,
     shifted_factor: f64,
     lumo: usize,
-    lumo_min: usize, num_state: usize, 
+    lumo_min: usize, num_state: usize,
+    mpi_mode: usize,
     mpi_data: &Option<MPIData>, mpi_operator:&Option<MPIOperator>) -> (f64,f64,usize)
 {
     let threshold_eij = 1.0E-8;
@@ -1070,6 +1072,7 @@ pub fn iterator_close_shell_eij_rayon_mpi(
                 lumo, 
                 lumo_min, 
                 num_state,
+                mpi_mode,
                 mpi_data,
                 mpi_operator);
         } else
@@ -1125,6 +1128,7 @@ pub fn close_shell_eij_rayon_mpi(
     shifted_factor: f64,
     lumo: usize,
     lumo_min: usize, num_state: usize,
+    mpi_mode: usize,
     mpi_data: &Option<MPIData>,
     mpi_operator:&Option<MPIOperator>) -> (f64,f64)
 {
@@ -1143,7 +1147,7 @@ pub fn close_shell_eij_rayon_mpi(
         let mut eij_ss = 0.0f64;
         let mut eij_os = 0.0f64;
 
-        let loc_virt_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo, lumo, num_state, 0);
+        let loc_virt_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo, lumo, num_state, mpi_mode);
         if screening_factor.abs().lt(&1.0E-6) {
             let (sender, receiver) = channel();
             loc_virt_pair.par_iter().for_each_with(sender,|s,i_pair| {
@@ -1365,7 +1369,8 @@ pub fn open_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF, mpi_operator:&O
                                     enhanced_factor, screening_factor, shifted_factor, 
                                     lumo,lumo,true,
                                     lumo_min, num_state, 
-                                    &scf_data.mol.mpi_data, mpi_operator);
+                                    scf_data.mol.ctrl.ri_pt2.mpi_mode,
+                            &scf_data.mol.mpi_data, mpi_operator);
 
                                 //println!("debug: i,j=({},{}), mp2_ss={:16.8}, eij_ss={:16.8}", i_state, j_state, e_mp2_term_ss, e_eij_term_ss);
                                 e_mp2_ss -= eij_mp2_ss;
@@ -1485,7 +1490,8 @@ pub fn open_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF, mpi_operator:&O
                                     0.0, eij_mp2_os, 
                                     enhanced_factor, screening_factor, shifted_factor, 
                                     lumo_1,lumo_2,false,lumo_min, num_state,
-                                    &scf_data.mol.mpi_data, mpi_operator);
+                                    scf_data.mol.ctrl.ri_pt2.mpi_mode,
+                            &scf_data.mol.mpi_data, mpi_operator);
 
                                 e_mp2_os -= eij_mp2_os;
                                 e_bge2_os -= eij_bge2_os;
@@ -1567,6 +1573,7 @@ pub fn iterator_open_shell_eij_rayon_mpi(
     lumo_j: usize,
     is_same_spin: bool,
     lumo_min: usize, num_state: usize,
+    mpi_mode: usize,
     mpi_data: &Option<MPIData>, mpi_operator: &Option<MPIOperator>) -> (f64,f64,usize)
 {
     let threshold_eij = 1.0E-8;
@@ -1597,6 +1604,7 @@ pub fn iterator_open_shell_eij_rayon_mpi(
                 lumo_j,
                 is_same_spin,
                 lumo_min, num_state,
+                mpi_mode,
                 mpi_data, mpi_operator);
         } else
         {
@@ -1655,6 +1663,7 @@ pub fn open_shell_eij_rayon_mpi(
     lumo_j: usize,
     is_same_spin: bool,
     lumo_min: usize, num_state: usize,
+    mpi_mode: usize,
     mpi_data: &Option<MPIData>, mpi_operator: &Option<MPIOperator>
 ) -> (f64,f64)
 {
@@ -1700,7 +1709,7 @@ pub fn open_shell_eij_rayon_mpi(
                     eij_ss += tmp_energy_term_ss;
                 });
             } else {
-                let loc_virt_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo_i, lumo_j, num_state, 0);
+                let loc_virt_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo_i, lumo_j, num_state, mpi_mode);
                 let (sender, receiver) = channel();
                 loc_virt_pair.par_iter().for_each_with(sender,|s,i_pair| {
                 //for i_virt in lumo_i..num_state {
@@ -1756,7 +1765,7 @@ pub fn open_shell_eij_rayon_mpi(
                 });
                 //println!("debug: mp2_ss={:16.8}, eij_ss={:16.8}", previous_eij_ss, eij_ss);
             } else {
-                let loc_virt_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo_i, lumo_j, num_state, 0);
+                let loc_virt_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo_i, lumo_j, num_state, mpi_mode);
                 let (sender, receiver) = channel();
                 loc_virt_pair.par_iter().for_each_with(sender,|s,i_pair| {
                     let i_virt = i_pair[0];

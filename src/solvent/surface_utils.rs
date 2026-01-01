@@ -555,3 +555,67 @@ pub fn solve_lu_transpose(
 
     Some(x)
 }
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_radius_scheme_scales_and_parsing() {
+        assert_eq!(RadiusScheme::Bondi.default_vdw_scale(), 1.2);
+        assert_eq!(RadiusScheme::UFF.default_vdw_scale(), 1.1);
+        assert_eq!(serde_json::from_str::<RadiusScheme>("\"bondi\"").unwrap(), RadiusScheme::Bondi);
+        assert_eq!(serde_json::from_str::<RadiusScheme>("\"uff\"").unwrap(), RadiusScheme::UFF);
+        assert!(serde_json::from_str::<RadiusScheme>("\"smd\"").is_err());
+    }
+
+    #[test]
+    fn test_smd_cavity_radii_parsing() {
+        assert_eq!(
+            serde_json::from_str::<SmdCavityRadii>("\"bondi\"").unwrap(),
+            SmdCavityRadii::Bondi
+        );
+        assert_eq!(
+            serde_json::from_str::<SmdCavityRadii>("\"uff_mixed\"").unwrap(),
+            SmdCavityRadii::BondiUff
+        );
+        assert!(serde_json::from_str::<SmdCavityRadii>("\"bogus\"").is_err());
+    }
+
+    /// R_O(α) 分段：α ≥ 0.43 → 1.52 Å；否则 1.52 + 1.8×(0.43−α)。返回值为 Bohr。
+    #[test]
+    fn test_smd_radii_oxygen_alpha_dependence() {
+        let r = smd_radii(0.43, &[8], SmdCavityRadii::Bondi);
+        assert!((r[0] - 1.52 / BOHR).abs() < 1e-12);
+        let r = smd_radii(0.35, &[8], SmdCavityRadii::Bondi);
+        assert!((r[0] - (1.52 + 1.8 * 0.08) / BOHR).abs() < 1e-12);
+        let r = smd_radii(0.0, &[8], SmdCavityRadii::Bondi);
+        assert!((r[0] - (1.52 + 1.8 * 0.43) / BOHR).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_smd_radii_special_elements() {
+        let r = smd_radii(0.82, &[1, 6, 7, 9, 15, 16, 17], SmdCavityRadii::Bondi);
+        assert!((r[0] - 1.20 / BOHR).abs() < 1e-12); // H
+        assert!((r[1] - 1.85 / BOHR).abs() < 1e-12); // C
+        assert!((r[2] - 1.89 / BOHR).abs() < 1e-12); // N
+        assert!((r[3] - 1.73 / BOHR).abs() < 1e-12); // F
+        assert!((r[4] - 2.12 / BOHR).abs() < 1e-12); // P
+        assert!((r[5] - 2.49 / BOHR).abs() < 1e-12); // S
+        assert!((r[6] - 2.38 / BOHR).abs() < 1e-12); // Cl
+    }
+
+    /// 非 eq.16 元素按 scheme 走不同 fallback 表（Be 两表取值不同）。
+    #[test]
+    fn test_smd_radii_fallback_scheme() {
+        let r_bondi = smd_radii(0.5, &[4], SmdCavityRadii::Bondi);
+        let r_uff = smd_radii(0.5, &[4], SmdCavityRadii::BondiUff);
+        assert!((r_bondi[0] - data::VDW_RADII[4]).abs() < 1e-12);
+        assert!((r_uff[0] - data::BONDI_UFF_RADII[4]).abs() < 1e-12);
+        assert!((r_bondi[0] - r_uff[0]).abs() > 0.1, "两套 fallback 表应显著不同");
+    }
+}

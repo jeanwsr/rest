@@ -15,7 +15,6 @@ mod lebedev;
 mod parameters;
 mod python;
 mod radial;
-mod tables;
 pub mod becke_partitioning_deriv;
 pub mod prune;
 
