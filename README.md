@@ -49,12 +49,14 @@
     2. `opt`: 基于数值力的构型优化。等价设置有：`geometry optimization`, `relax`, `geom_opt`等
 	3. `force`: 计算当前结构下的受力。等价设置有：`gradient`
 	4. `numerical dipole`: 计算数值偶极。等价设置有：`numdipole`
+	5. `md`: 内置分子动力学（详见 [REST 文档 · MD](https://rest-doc.readthedocs.io/zh_CN/user/md.html)）。纯 MM 使用 `pure_mm = true`
 - `auxbasis_response`：开启辅助基导数。缺省为true
 - `opt_engine`: 取值String类型。构型优化引擎。可选项有：`LBFGS`、`geometric-pyo3`（缺省）
     - **注意**：固定原子功能（在 `position` 中用 `0`/`1` 标记）当前仅支持 `geometric-pyo3` 引擎，`LBFGS` 引擎暂不支持约束优化。
 - `numerical_force`: 取值布尔类型。是否计算数值力。缺省为false
 - `nforce_displacement`:　取值f64类型。数值力计算中的结构位移值，缺省是0.0013 Bohr
 - `ndipole_displacement`:　取值f64类型。数值Dipole计算中的外电场位移值，缺省是3.0E-4 Bohr
+- `check_stab`: 取值String类型。SCF收敛后进行波函数稳定性分析，与 `[tddft] stability` 等价。详见 TD-DFT计算相关设置的稳定性分析一节。
 
 ## 计算体系相关关键词（Keyword）
 - `charge`：取值f64类型。体系的总电荷数
@@ -99,6 +101,9 @@
     - MP2、XYG3、XYGJOS、XYG7、xDH-PBE0、sBGE2、ZRPS、scsRPA、R-xDH7、RPA@PBE、RPA@B3LYP为后自洽场计算方法。若用户未申明具体基组，则使用def2-QZVPP基组 (`basis_path = {basis_set_pool}/def2-QZVPP`)
     - RPA@PBE、RPA@B3LYP表示后自洽场RPA计算使用PBE、B3LYP方法的轨道
     - 当 `xc_parser` 设置为`xc_parser=parse_xc`时，可通过 `xc` 关键词自定义密度泛函近似方法，具体书写规则请参见[REST程序用户手册](https://rest-doc.readthedocs.io/zh_CN/contributor/dft/parse_xc.html)
+- `pure_mm`：取值布尔类型。设为 `true` 时 REST 完全不做电子结构计算，整个体系交给内嵌 OpenMM 处理（纯 MM），
+  配合 `job_type = "md"/"sp"/"force"/"singlepoint"` 与 `[md]` 中的 `mm_file`/`mm_system_xml`/`mm_cutoff`。
+  此时无需 `xc`、`basis_path` 与 `[geom]`。
 - `empirical_dispersion`:　取值为String。针对低级别密度泛函方法（包括LDA、BLYP、PBE、B3LYP、PBE0等）的经验色散校正方法。目前支持D3, D3BJ和D4。对于XYG3型双杂化泛函比如XYG3、XYG7、XYGJOS、scsRPA、R-xDH7、RPA等不需要经验色散校正
 - `post_ai_correction`：取值String。AI辅助的校正方法。目前仅支持SCC15，并只能和R-xDH7重整化双杂化泛函方法相匹配。相关文章见：Wang, Y.; Lin, Z.; Ouyang, R.; Jiang, B.; Zhang, I. Y.; Xu, X. Toward Efficient and Unified Treatment of Static and Dynamic Correlations in Generalized Kohn–Sham Density Functional Theory. [JACS Au 2024, 4 (8), 3205–3216](https://doi.org/10.1021/jacsau.4c00488). 
 - `post_xc`：取值Vec\<String\>。采用自洽收敛的轨道和密度，进行不同的交换－关联泛函(xc)的计算。允许的方法包括REST支持的"xc"方法
@@ -108,6 +113,7 @@
 - `grid_generation_level`: 取值usize。格点精度等级，数值越大越精确。缺省为3
 - `pruning`: 取值String。DFT方法或sap初猜所选用格点筛选。目前，REST支持nwchem，sg1以及none。其中none为不筛选。缺省为nwchem
 - `radial_grid_method`: 取值String。径向格点的生成方法。目前REST支持treutler，gc2nd， delley, becke, mura_knowles及lmg。缺省为treutler
+- `radii_adjust`: 取值String。Becke划分中原子的半径调整方案。`becke` 用Bragg半径本身（Becke 1988原文形式），`treutler` 用Bragg半径的平方根（Treutler-Ahlrichs 1995形式）。两者都满足权重和为1，差别随格点加密衰减。缺省为becke
 
 ### VXC 格点积分优化相关关键词（Keyword）
 - `vxc_screen_threshold`: 取值f64。密度筛选阈值，在 VXC 计算中跳过密度低于此值的格点。对于大分子（真空区域多），可节省 30-70% 的 XC 计算量。设为 0.0 可关闭筛选。缺省为 1.0e-15。
@@ -213,8 +219,12 @@ guessfile = "my_checkpoint.rchk"
     - `default`: 目前同 `ri`。
 - `algorithm_j`: 设置 Fock 矩阵计算中 J (Coulomb) 部分的算法；该关键词是高级选项，一般用户建议使用`algorithm_jk`关键词进行整体设置。
     - 下述选项同 `algorithm_jk`：`ri-direct`, `ri-incore`, `ri`, `default`。
+    - `ri-schwartz`: 使用 Schwartz screening 的 direct RI-J 算法。3c-2e ERI 即算即用（同 `ri-direct`），但利用了稀疏性并降低内存开销与提升内存局域性。该选项仅对 J 部分有效，即只能通过 `algorithm_j` 指定；其行为由 `[ctrl.ri_jk]` 表控制（见下）。该路径暂不支持 MPI 并行。
 - `algorithm_k`: 设置 Fock 矩阵计算中 K (Exchange) 部分的算法；该关键词是高级选项，一般用户建议使用`algorithm_jk`关键词进行整体设置。
     - 下述选项同 `algorithm_jk`：`ri-direct`, `ri-incore`, `ri`, `default`。
+- `ri_jk`: RI-J/RI-K 算法的参数，以 `[ctrl.ri_jk]` 表形式给出。目前的字段控制 `ri-schwartz` RI-J 算法的筛选行为，对其它算法无影响。
+    - `schwartz_threshold`: 取值f64类型。Schwartz 筛选的积分忽略阈值（单位 Hartree）：仅当 (壳对, 辅助壳) 块的 Coulomb 贡献上界达到该阈值时才纳入计算。缺省为 1.0e-12。
+    - `schwartz_overlap_tol2`: 取值f64类型。Schwarz 上界构建前静态重叠预筛选的阈值：最弥散基元的重叠小于该值的壳对不参与上界构建。缺省为 1.0e-24。
 - `use_dm_only`: 取值布尔类型。控制 VK (Exchange) 和 VXC (XC Potential) 矩阵的构建方式。缺省为 false。
     - `false`（缺省）：使用分子轨道系数构造（occ-RI-K 算法），效率更高，推荐用于大多数体系。
     - `true`：直接使用密度矩阵构造。当轨道占据数非整数（如 dSCF 激发态）时可能需要设为 true。
@@ -338,7 +348,7 @@ fp_mode = "FP64"
 输入卡关键词包括：
 - `ss_factor`: 取值f64。采用 Spin-Component-Scaled 方式计算 MP2 型相关能（SCS-MP2）时, 用于控制自旋平行（same spin）分量贡献的缩放系数，适用于 `xc` 关键词为 MP2、SCS-MP2或双杂化泛函，以及 `post_correlation` 设置为 PT2 的情况。缺省为 None，即依 `xc` 设置的泛函进行设定。
 - `os_factor`: 取值f64。适用场景与 `ss_factor` 一致，采用 SCS-MP2 方法计算相关能贡献时，用于缩放自旋反平行（opposite spin）分量贡献的系数。缺省为 None，即依 `xc` 设置的泛函进行设定。
-- `fp_mode`: 取值 String (`"FP32"`, `"FP64"`)。设置 RI-PT2 计算中使用的浮点精度。仅当 `new_driver = true` 时生效。缺省为 `"FP32"`。对于数值梯度计算，建议设置为 `"FP64"` 以获得更高的数值稳定性。
+- `fp_mode`: 取值 String (`"FP32"`, `"FP64"`, `"TF32"`)。设置 RI-PT2 计算中使用的浮点精度。缺省为 `"FP32"`。在 `new_driver = true` 的 CPU 驱动、`engine = "torch"` 以及 PT2 解析响应核（rgfock）中生效；`"TF32"` 仅在 `engine = "torch"` 时有效（f32 存储 + TF32 张量核 matmul），CPU 驱动下自动回退为 `"FP32"`。对于数值梯度计算，建议设置为 `"FP64"` 以获得更高的数值稳定性。
 - `mpi_mode`: 取值 usize。设置 RI-PT2 计算中使用的 MPI 模式。缺省为 0，即不使用 MPI。
 
 #### PT2 算法选择
@@ -372,6 +382,8 @@ REST 提供三种 PT2 实现算法，通过以下关键词选择：
 | 2 | `streaming = true`（缺省）且非 MPI 且 `use_ri_symm = true` 且 PT2 | **流式算法** |
 | 3 | 其它情况 | 原始 legacy 算法 |
 
+**注意**：若设置 `engine = "torch"` 且满足其适用条件（CUDA、非 MPI、PT2 家族、RHF/UHF），则优先使用 torch 引擎（见下节）。
+
 **输入卡示例**：
 
 ```toml
@@ -393,6 +405,33 @@ stream_block_size = 32
 [ctrl.ri_pt2]
 new_driver = true
 fp_mode = "FP32"
+```
+
+#### Torch 引擎（GPU 加速）
+
+设置 `engine = "torch"` 后，PT2 成对电子相关能张量乘法由 PyTorch 内核（`dfmp2_addons`）实现；AO→MO 变换等仍在 CPU 上完成。适用条件：单节点计算（不支持 MPI）、`xc` 属于 PT2 家族、参考态为 RHF 或 UHF（ROHF 请使用缺省的 `engine = "cpu"`）、整数占据（不支持 smearing/分数占据，此时请使用 `engine = "cpu"`）；不满足条件时程序直接报错，不会静默回退到 CPU 驱动。相关关键词包括：
+- `engine`: 取值 String（`"cpu"`、`"torch"`）。缺省为 `"cpu"`，即不采用 Torch 引擎的 GPU 加速。
+- `torch_devices`: 取值 `Vec<usize>`。torch 引擎使用的 CUDA 设备列表（逻辑设备号，受 `CUDA_VISIBLE_DEVICES` 过滤），缺省为 `[0]`。多设备驱动（设备列表含 2+ 设备，或 `torch_force_batch_inter = true`）要求至少 8 倍于 GPU 数的相关占据轨道，过小的体系请使用单 GPU。
+- `torch_force_batch_inter`: 取值 bool。缺省为 false。当 `torch_devices` 只含一个设备时，强制启用分批的 intra+inter 方案（占据空间切成若干簇，逐簇上传 cderi 切片和轨道块），从而降低单卡显存峰值。这是单卡 GPU 显存溢出（OOM）时的补救选项。
+- `torch_nbatch`: 取值 usize。分批 intra+inter 方案的占据簇数目，缺省根据各设备空闲显存自动选择。仅多设备驱动路径（`torch_devices` 含 2+ 设备或 `torch_force_batch_inter = true`）使用。
+- `torch_fold`: 取值 String（`"F32Acc"`、`"F64"`、`"F32"`）。f32 matmul 结果逐元素能量折叠的精度。缺省为 `"F32Acc"`（f32 折叠、对能以 f64 累加）；`"F64"` 最慢但最准；`"F32"` 最快但精度最低。仅对 `fp_mode = "FP32"/"TF32"` 生效。
+- `torch_batch`: 取值 usize。torch 引擎 j≤i 收缩循环中占据对的批大小，缺省 16；设为 0 表示一次完成全部对。值越大单次 GEMM 越大，FLOPS 利用率更高但显存开销稍高。
+
+输入卡示例：
+```toml
+# 单 GPU（缺省设备 0，等价于 torch_devices = [0]）
+[ctrl.ri_pt2]
+engine = "torch"
+
+# 双 GPU 分摊占据轨道
+[ctrl.ri_pt2]
+engine = "torch"
+torch_devices = [0, 1]
+
+# 单卡显存不足时分批计算
+[ctrl.ri_pt2]
+engine = "torch"
+torch_force_batch_inter = true
 ```
 
 ## RRS-PBC计算相关设置
@@ -747,7 +786,7 @@ davidson_converge_threshold = 1e-8
 
 ## TD-DFT计算相关设置
 
-TD-DFT方法相关的设置在 `[tddft]` 区块中进行。REST支持基于RI积分的TD-DFT激发能计算，包括TDA近似和完整线性响应两种方案，可计算单重态和三重态的垂直激发能。
+TD-DFT方法相关的设置在 `[tddft]` 区块中进行。REST支持基于RI积分的TD-DFT激发能计算，包括TDA近似和完整线性响应两种方案，支持限制性（单重态/三重态）与非限制（UHF/UKS）参考态，并支持范围分离杂化（RSH）泛函。
 
 ### 基础设置
 
@@ -755,17 +794,11 @@ TD-DFT方法相关的设置在 `[tddft]` 区块中进行。REST支持基于RI积
     - `"tda"`：Tamm-Dancoff近似，仅求解A子矩阵的本征值问题。计算量较小，对低能激发态通常与完整线性响应精度相当。
     - `"lr"`（缺省）：完整线性响应，同时使用A和B子矩阵，对激发能的描述更完备。
 - `tddft_spin`: 取值String，指定**限制性**（自旋适配）参考态的自旋通道：
-    - `"singlet"`（缺省）：单重态激发，库仑耦合因子为2。
+    - `"singlet"`：单重态激发，库仑耦合因子为2。限制性参考态不设置该关键词时缺省取 `"singlet"`。
     - `"triplet"`：三重态激发，库仑耦合因子为0；仅 AO 模式（需同时设 `tddft_mode = "ao"`）支持。
     - `"both"`：先算单重态、再算三重态；同样仅 AO 模式支持，`pysoc = true` 的 PySOC 导出需要此项。
     - 其它取值将报错。
-    - **该关键词不适用于非限制参考态**（`spin_polarization = true`，即非限制 TD-DFT，UTDDFT）。
-      非限制 TD-DFT 只有一个合法的响应通道：库仑（Hartree）核与自旋无关，它把 α、β 两个块耦合在一起；
-      而"库仑因子 2 / 0"这一对只对**可以旋转到单/三重态子空间**的限制性参考态成立。
-      因此 UTDDFT 不存在"去库仑"的第二个通道，`"triplet"` / `"both"` 会被直接拒绝；
-      若在非限制计算中写了缺省值 `"singlet"`，程序会忽略它并给出提示（建议直接从输入中删除该关键词）。
-      注意：对自旋对称的参考态，非限制通道的本征谱**本身就同时包含单重态型与三重态型根**
-      （三重态型根的振子强度≈0），这是该算符的固有性质，而不是需要额外选择的通道。
+    - **该关键词不适用于UTDDFT**：显式设置任何取值（包括 `"singlet"`）都会报错。
 - `nroots`: 取值usize，需要计算的激发态数目（根的数目）。缺省为6。
 - `tddft_cutoff_energy`: 取值f64，单位Hartree。KS轨道能量高于此值的虚轨道将被排除在TD-DFT激发空间之外。设置合理值（如20.0-100.0）可显著缩减激发空间维度，加速计算。缺省为1e6（几乎不截断）。
 - `tddft_mode`: 取值String，选择TD-DFT计算模式：`"mo"`（缺省，MO-basis RI）/ `"ao"`（AO-basis）。
@@ -784,6 +817,23 @@ REST默认使用Davidson迭代对角化算法求解TD-DFT本征值问题。
 ### XC Kernel设置
 
 - `tddft_use_optimized_fxc`: 取值bool，设置为 `true`（缺省）使用rayon并行的优化fxc kernel加速矩阵-矢量积运算。一般用户无需修改。
+
+### SCF稳定性分析
+
+在SCF收敛后，可以对参考态波函数做稳定性分析。该分析基于TDDFT Hessian（轨道Hessian的最低本征值，由Davidson求解器计算），仅做检查（不改变波函数）：
+
+- `stability`: 取值String，选择要进行的稳定性检查：
+    - `"off"`（缺省）：不做稳定性分析
+    - `"internal"`：内部稳定性检查（RHF/RKS：轨道Hessian `4(A^S+B^S)`；UHF/UKS：轨道Hessian `2(A+B)`）
+    - `"external"`：外部稳定性检查（RHF/RKS参考态：RHF→UHF通道 `(A^T+B^T)`；UHF/UKS参考态暂不支持）
+    - `"full"`：同时进行内部与外部检查
+    - `"auto"`（**推荐**）：自动选择参考态适用的所有检查：RHF/RKS 为内部 + 外部检查；UHF/UKS 为内部检查（UHF→GHF 外部检查尚未实现）。目前与 `"full"` 行为一致；`"full"` 的含义保持固定（内部 + 外部），未来 `"auto"` 可能随方法/参考态扩展新的检查
+- `stability_nroots`: 取值usize，Hessian Davidson求解的最低本征值数目。缺省为3。
+- `stability_tol`: 取值f64，Hessian Davidson收敛阈值。缺省为1e-8。
+
+注意：
+- 仅支持RHF/RKS与UHF/UKS参考态（ROHF暂不支持）。
+- 设置 `stability ≠ "off"` 后，程序只做稳定性分析，不再进行TD-DFT激发能计算。
 
 ### 输入卡示例
 
@@ -844,7 +894,7 @@ auxbas_path = "/path/to/cc-pvdz-rifit"
 [tddft]
 tddft_method = "tda"
 nroots = 6
-# 不要设置 tddft_spin：非限制参考态只有一个自旋耦合通道
+# 不要设置 tddft_spin：非限制参考态不适用该关键词，任何显式取值（包括 "singlet"）都会报错
 ```
 
 ## 解析Hessian计算相关设置
@@ -1321,3 +1371,20 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 	```
     - `fac = 0.9` 全局收紧成键判据；`radii = {"Sr" = 1.0}` 进一步把 Sr 的共价半径从 1.95 降到 1.0，精确去除 Sr–O 离子接触（两者可单独或组合使用）
     - `check = 10` 每 10 步重建内坐标体系，防止 DLC 离域基随几何变化而陈旧化
+
+# 内置分子动力学（MD / AIMD）
+
+`job_type = "md"` 时 REST 将启动一套内置的分子动力学引擎（MD 循环、积分器、伞形采样都在 REST 内，每一步的 QM 能量/梯度走与几何优化相同的进程内接口）：
+
+- **AIMD（纯 QM）**：体系只有 `[geom]` 的 QM 分子，每步先收敛 SCF 再移动原子核并取解析梯度；上一步的收敛波函数自动作为下一步初猜（内部设为 `initial_guess = "inherit"`，用户无需配置，显著减少迭代），SCF 用多线程（`num_threads`）并行。
+- **QM/MM**：`[geom]` 为 QM 区，MM 体系可用内嵌 OpenMM 提供（TIP3P 自动类型，或直接给完整的 OpenMM System XML），也可由 REST 从经典力场参数**内部生成** System XML（支持共价切断的 link-H）；QM–MM 之间为点电荷嵌入 + QM–MM LJ。
+- **纯 MM**：`pure_mm = true` 时整个体系交给 OpenMM（`mm_file` / `mm_system_xml`）。
+- **任务类型**：`ensemble = "nvt"`(Langevin) / `"nve"`(VelocityVerlet) / `"opt"`(几何优化) / `"sp"`(单点能量/受力)。
+- **伞形采样（US）**：`umbrella_atoms` 存在即启用；CV 支持 `dihedral` / `distance` / `angle` / `distance_diff`（后者可叠加 `umbrella_sum_kappa` 的 ½ks(s−s0)² 约束），输出 `umbrella_timeseries.csv` 供 (2D) WHAM 后处理。
+- **续跑**：`restart_input` 从上次的 `md_restart` 同时读位置与速度，无需改写 `[geom]`。
+- **输出**：`md.log`、`dump_{nvt|nve}.xyz`、`dipole.dat`、`energy_force.log`、`umbrella_timeseries.csv`、`md_restart`。
+- **Python 依赖**：MD/AIMD 的积分与优化由内嵌 Python 的 [ASE](https://wiki.fysik.dtu.dk/ase/) 完成，QM/MM 与纯 MM 的 MM 侧由 [OpenMM](https://openmm.org/) 完成；运行时需要有可用的 Python 及 `numpy`、`ase`、`openmm`（含 `openmm.app`）。参考环境：Python 3.10、numpy 2.2、ASE 3.29、OpenMM 8.6。
+
+纯 QM 的 AIMD 支持多进程 MPI（SCF 与积分沿 MPI 并行，所有 rank 同步积分、仅 root 落盘）。QM/MM 与纯 MM 目前只支持单进程：进程内用 OpenMP/Rayon 多线程（`num_threads`），多进程 MPI 会在启动时被拒绝。
+
+详情请见 [REST 文档 · 内置分子动力学](https://rest-doc.readthedocs.io/zh_CN/user/md.html)。

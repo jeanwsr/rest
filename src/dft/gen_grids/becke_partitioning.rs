@@ -4,6 +4,56 @@
 use super::bragg;
 use super::parameters;
 
+/// Which radii enter Becke's atomic-size adjustment.
+///
+/// * `Becke`: Becke's original expression, J. Chem. Phys. 88, 2547 (1988), using the Bragg
+///   radii themselves. This has been REST's behaviour so far.
+/// * `Treutler`: the Treutler-Ahlrichs variant, J. Chem. Phys. 102, 346 (1995), which
+///   replaces the radii by their square roots. PySCF's `Grids` defaults to this variant
+///   (`radi.treutler_atomic_radii_adjust`) and PyFock's `size_adjustment_table` with
+///   `scheme='treutler'` implements the same one, so selecting it makes REST reproduce
+///   their partition weights and thus their grid weights.
+///
+/// Both variants satisfy `sum_A pbecke_A = 1` at every grid point. They differ by a
+/// quadrature error that decays as the grid is refined, so they agree in the dense-grid limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RadiiAdjust {
+    Becke,
+    Treutler,
+}
+
+impl RadiiAdjust {
+    /// Parse the `radii_adjust` ctrl keyword. Anything but `treutler` means `Becke`.
+    pub fn from_str(name: &str) -> Self {
+        match name.trim().to_lowercase().as_str() {
+            "treutler" => RadiiAdjust::Treutler,
+            _ => RadiiAdjust::Becke,
+        }
+    }
+
+    /// Radius that enters the adjustment factor.
+    #[inline]
+    pub fn radius(self, r: f64) -> f64 {
+        match self {
+            RadiiAdjust::Becke => r,
+            RadiiAdjust::Treutler => r.sqrt(),
+        }
+    }
+
+    /// Becke's `a_AB = u_AB / (u_AB^2 - 1)`, clamped to `[-0.5, 0.5]`.
+    ///
+    /// Only the ratio of the two radii enters, so their unit is irrelevant.
+    #[inline]
+    pub fn factor(self, r_a: f64, r_b: f64) -> f64 {
+        let ra = self.radius(r_a);
+        let rb = self.radius(r_b);
+        if (ra - rb).abs() <= parameters::SMALL {
+            return 0.0;
+        }
+        let u_ab = (ra + rb) / (rb - ra);
+        (u_ab / (u_ab * u_ab - 1.0)).min(0.5).max(-0.5)
+    }
+}
 
 // JCP 88, 2547 (1988), eq. 20
 #[inline]
@@ -32,6 +82,7 @@ pub fn partitioning_weight(
     proton_charges: &[i32],
     grid_coordinates_bohr: (f64, f64, f64),
     hardness: usize,
+    radii_adjust: RadiiAdjust,
 ) -> f64 {
     let num_centers = proton_charges.len();
 
@@ -54,10 +105,11 @@ pub fn partitioning_weight(
 
             let mut nu_ab = mu_ab;
             if (r_a - r_b).abs() > parameters::SMALL {
-                let u_ab = (r_a + r_b) / (r_b - r_a);
-                let a_ab = u_ab / (u_ab * u_ab - 1.0);
+                // the two variants differ only here: raw radii (Becke) or their square
+                // roots (Treutler-Ahlrichs, the PySCF/PyFock default)
+                let a_ab = radii_adjust.factor(r_a, r_b);
 
-                nu_ab += a_ab.min(0.5).max(-0.5) * (1.0 - mu_ab * mu_ab);
+                nu_ab += a_ab * (1.0 - mu_ab * mu_ab);
             }
 
             let f = f3(nu_ab, hardness);

@@ -42,6 +42,7 @@ pub mod sbge2;
 pub mod sbge2_25d;
 pub mod pure_pt2_pair_eng;
 pub mod pt2_pair_eng;
+pub mod torch_pt2_pair_eng;
 
 pub mod pure_pt2_r_elecderiv;
 pub mod rgfock_pt2;
@@ -70,6 +71,41 @@ pub enum PT2FPMode {
     #[default]
     #[serde(alias = "FP32", alias = "fp32", alias = "f32")]
     FP32,
+    /// TensorFloat-32 matmul precision; only executable by the torch engine
+    /// (`engine = "torch"` on a CUDA device, f32 storage + TF32 tensor-core
+    /// matmuls). On the CPU drivers it falls back to FP32 with a warning, since
+    /// TF32 accuracy may sit at the edge of chemical accuracy.
+    #[serde(alias = "TF32", alias = "tf32")]
+    TF32,
+}
+
+/// Pair-energy contraction engine selection (`[ctrl.ri_pt2].engine`).
+#[derive(Default, Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum PT2Engine {
+    /// Built-in CPU drivers (`new_driver` / `streaming` / legacy).
+    #[default]
+    #[serde(alias = "cpu", alias = "CPU", alias = "rust")]
+    Cpu,
+    /// PyTorch kernel on a CUDA device, called through an embedded CPython
+    /// interpreter (pyo3); see [`torch_pt2_pair_eng`].
+    #[serde(alias = "torch", alias = "TORCH", alias = "pytorch", alias = "PyTorch")]
+    Torch,
+}
+
+/// Element-wise energy-fold precision of the torch engine's f32 matmul path
+/// (`[ctrl.ri_pt2].torch_fold`; kernel env `MP2_FOLD`). Currently torch engine only.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum PT2TorchFoldMode {
+    /// fold in f32 with f64 accumulation of the pair energies (kernel default).
+    #[default]
+    #[serde(alias = "f32acc", alias = "F32ACC", alias = "F32Acc")]
+    F32Acc,
+    /// upcast the f32 matmul result to f64 and fold in f64.
+    #[serde(alias = "f64", alias = "F64")]
+    F64,
+    /// fold entirely in f32.
+    #[serde(alias = "f32", alias = "F32")]
+    F32,
 }
 
 pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<f64> {
@@ -141,25 +177,114 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
 
     let dfa_family_pos = scf_data.mol.xc_data.dfa_family_pos.clone().unwrap();
 
-    let use_new_driver = scf_data.mol.ctrl.ri_pt2.new_driver
+    // engine = "torch" delegates the pair-energy contraction to the embedded-CPython
+    // torch kernel on a CUDA device (see torch_pt2_pair_eng). Guards are hard errors
+    // (never a silent CPU fallback): MPI, non-PT2 families and non-RHF/UHF references
+    // are all out of scope for the torch engine.
+    if scf_data.mol.ctrl.ri_pt2.engine == PT2Engine::Torch {
+        if mpi_operator.is_some() {
+            panic!("ri_pt2 engine = \"torch\" is not supported under MPI; run without MPI (mpirun -np 1 / serial build).");
+        }
+        if dfa_family_pos != crate::dft::DFAFamily::PT2 {
+            panic!("ri_pt2 engine = \"torch\" only applies to the PT2 family; got {dfa_family_pos:?} (xc = `{}`).", scf_data.mol.ctrl.xc);
+        }
+        if !matches!(scf_data.scftype, SCFType::RHF | SCFType::UHF) {
+            panic!(
+                "ri_pt2 engine = \"torch\" currently supports RHF (restricted closed-shell) and \
+                 UHF (unrestricted, single device) references. Use engine = \"cpu\" (default) \
+                 for ROHF."
+            );
+        }
+    }
+
+    // TF32 is only executable by the torch engine (f32 storage + TF32 tensor-core matmuls
+    // on CUDA); on the CPU drivers it falls back to FP32 with a warning (TF32 accuracy may
+    // sit at the edge of chemical accuracy).
+    if scf_data.mol.ctrl.ri_pt2.engine == PT2Engine::Cpu
+        && scf_data.mol.ctrl.ri_pt2.fp_mode == PT2FPMode::TF32
+    {
+        println!("WARNING [ctrl.ri_pt2]: fp_mode = \"TF32\" is only effective with engine = \"torch\"; falling back to FP32 for the CPU drivers.");
+    }
+
+    let use_torch_engine = scf_data.mol.ctrl.ri_pt2.engine == PT2Engine::Torch;
+
+    let use_new_driver = !use_torch_engine
+        && scf_data.mol.ctrl.ri_pt2.new_driver
         && mpi_operator.is_none()
         && dfa_family_pos == crate::dft::DFAFamily::PT2
         && matches!(scf_data.scftype, SCFType::RHF | SCFType::UHF);
-    
+
     // Streaming PT2 is enabled when all of:
     //   - ri_pt2.streaming = true
     //   - rimatr is materialized (use_ri_symm = true, not isdf)
     //   - PT2 family (not SBGE2/SCSRPA, which use their own drivers)
     //   - new_driver is not also requested (precedence: new_driver > streaming)
+    //   - engine = "torch" is not requested (precedence: torch > new_driver > streaming)
     //   - MPI not active (single-node only for now)
     let use_streaming = !use_new_driver
+        && !use_torch_engine
         && scf_data.mol.ctrl.ri_pt2.streaming
         && mpi_operator.is_none()
         && scf_data.mol.ctrl.use_ri_symm
         && scf_data.rimatr.is_some()
         && dfa_family_pos == crate::dft::DFAFamily::PT2;
 
-    if use_new_driver {
+    if use_torch_engine {
+        // torch engine: pair-energy contraction on CUDA through the embedded-CPython
+        // torch kernel; cderi_xvo generation stays on CPU (same as new_driver).
+        // Frozen-core filtering is identical to the new-driver path below.
+        let spin_orb_indices = split_indices_by_spin_occ(&scf_data.occupation, 0.5);
+        let spin_channel = scf_data.mol.spin_channel;
+        // frozen-core approximation: the occupied space starts at mol.start_mo,
+        // so orbitals below idx_core must be excluded from the PT2 pair sums
+        let idx_core = scf_data.mol.start_mo;
+        let occ_filtered: Vec<Vec<usize>> = (0..spin_channel)
+            .map(|i_spin| {
+                spin_orb_indices[i_spin]
+                    .0
+                    .iter()
+                    .copied()
+                    .filter(|&i| i >= idx_core)
+                    .collect()
+            })
+            .collect();
+        let vir_filtered: Vec<Vec<usize>> = (0..spin_channel)
+            .map(|i_spin| spin_orb_indices[i_spin].1.clone())
+            .collect();
+        let mut occidx: [Option<&[usize]>; 2] = [None, None];
+        let mut viridx: [Option<&[usize]>; 2] = [None, None];
+        for i_spin in 0..spin_channel {
+            occidx[i_spin] = Some(occ_filtered[i_spin].as_slice());
+            viridx[i_spin] = Some(vir_filtered[i_spin].as_slice());
+        }
+
+        // RHF | UHF (guarded above); fp_mode selects the torch matmul dtype:
+        // FP64 -> f64, FP32 -> f32, TF32 -> f32 + TF32 tensor-core matmuls
+        // (the use_tf32 flag is read inside the torch engine). UHF routes
+        // through dfump2_kernel_one_gpu, or the multi-device intra+inter
+        // driver dfump2_kernel_multi_gpu_cderi_cpu when several devices are
+        // listed / force-batch is set.
+        let pt2_fp_mode = scf_data.mol.ctrl.ri_pt2.fp_mode;
+        pt2_c = match scf_data.scftype {
+            SCFType::RHF => match pt2_fp_mode {
+                PT2FPMode::FP64 => {
+                    torch_pt2_pair_eng::evaluate_ript2_eng_torch::<f64>(scf_data, &mut timerecords, occidx, viridx)
+                },
+                PT2FPMode::FP32 | PT2FPMode::TF32 => {
+                    torch_pt2_pair_eng::evaluate_ript2_eng_torch::<f32>(scf_data, &mut timerecords, occidx, viridx)
+                },
+            },
+            SCFType::UHF => match pt2_fp_mode {
+                PT2FPMode::FP64 => {
+                    torch_pt2_pair_eng::evaluate_riupt2_eng_torch::<f64>(scf_data, &mut timerecords, occidx, viridx)
+                },
+                PT2FPMode::FP32 | PT2FPMode::TF32 => {
+                    torch_pt2_pair_eng::evaluate_riupt2_eng_torch::<f32>(scf_data, &mut timerecords, occidx, viridx)
+                },
+            },
+            SCFType::ROHF => unreachable!("ROHF is rejected by the torch-engine guard above"),
+        };
+    } else if use_new_driver {
         // we have already checked dfa_family_pos = PT2
         let spin_orb_indices = split_indices_by_spin_occ(&scf_data.occupation, 0.5);
         let spin_channel = scf_data.mol.spin_channel;
@@ -190,11 +315,17 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         pt2_c = match scf_data.scftype {
             SCFType::RHF => match pt2_fp_mode {
                 PT2FPMode::FP64 => pt2_pair_eng::evaluate_ript2_eng::<f64>(scf_data, &mut timerecords, occidx, viridx),
-                PT2FPMode::FP32 => pt2_pair_eng::evaluate_ript2_eng::<f32>(scf_data, &mut timerecords, occidx, viridx),
+                // TF32 is not executable on the CPU drivers; falls back to FP32
+                PT2FPMode::FP32 | PT2FPMode::TF32 => {
+                    pt2_pair_eng::evaluate_ript2_eng::<f32>(scf_data, &mut timerecords, occidx, viridx)
+                },
             },
             SCFType::UHF => match pt2_fp_mode {
                 PT2FPMode::FP64 => pt2_pair_eng::evaluate_riupt2_eng::<f64>(scf_data, &mut timerecords, occidx, viridx),
-                PT2FPMode::FP32 => pt2_pair_eng::evaluate_riupt2_eng::<f32>(scf_data, &mut timerecords, occidx, viridx),
+                // TF32 is not executable on the CPU drivers; falls back to FP32
+                PT2FPMode::FP32 | PT2FPMode::TF32 => {
+                    pt2_pair_eng::evaluate_riupt2_eng::<f32>(scf_data, &mut timerecords, occidx, viridx)
+                },
             },
             SCFType::ROHF => unreachable!("currently not implemented, and should not go here due to `use_new_driver` condition"),
         };
@@ -1790,6 +1921,7 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
                 };
                 let (sender, receiver) = channel();
                 elec_pair.par_iter().for_each_with(sender,|s,i_pair| {
+                    omp_set_num_threads_wrapper(1);
                     let mut e_mp2_term_os = 0.0_f64;
                     let i_state = i_pair[0];
                     let j_state = i_pair[1];

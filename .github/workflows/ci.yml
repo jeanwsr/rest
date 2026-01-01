@@ -16,6 +16,26 @@ jobs:
   linux-build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Three build variants: default (MPI), serial (no MPI), and ScaLAPACK-enabled.
+    # The scalapack entry mirrors the rest-feedstock variant (openmpi 4.* + scalapack 2.2.*).
+    name: linux-build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: mpi
+            cargo_flags: ""
+            conda_extra: ""
+            scalapack_run: false
+          - name: no-mpi
+            # default features minus mpi (serial fallbacks in the code)
+            cargo_flags: "--no-default-features --features dftd3,dftd4,geometric-pyo3"
+            conda_extra: ""
+            scalapack_run: false
+          - name: scalapack
+            cargo_flags: "--features scalapack"
+            conda_extra: "scalapack 2.2.*"
+            scalapack_run: true
 
     env:
       # $REST_HOME is the cargo workspace root (the checkout lives at $REST_HOME/rest)
@@ -42,11 +62,18 @@ jobs:
           # simple-dftd3/dftd4/geometric are runtime Python deps required by the
           # regression suite (dispersion / TRIC-optimizer cases import them via
           # REST's Python bridge); the build itself does not link them
+          # openmpi 4.* and openblas <0.3.34 pinned to match the feedstock.
+          # NOTE: space-separated specs ("openmpi 4.*") must stay QUOTED - unquoted,
+          # the shell would pass the version as a separate package spec.
+          CONDA_EXTRA="${{ matrix.conda_extra }}"
+          EXTRA_ARGS=()
+          if [ -n "$CONDA_EXTRA" ]; then EXTRA_ARGS=("$CONDA_EXTRA"); fi
           $CONDA create -y -p "$CONDA_DIR/envs/rest-dev" \
             python=3.11 numpy scipy h5py \
-            "libopenblas=*=*openmp*" \
-            libxc libcint hdf5 openmpi gfortran libclang \
+            "libopenblas <0.3.34 *openmp*" \
+            libxc libcint hdf5 "openmpi 4.*" gfortran libclang \
             simple-dftd3 dftd4 geometric mokit \
+            "${EXTRA_ARGS[@]}" \
             -c conda-forge -c mokit
           echo "CONDA_PREFIX=$CONDA_DIR/envs/rest-dev" >> "$GITHUB_ENV"
           echo "$CONDA_DIR/envs/rest-dev/bin" >> "$GITHUB_PATH"
@@ -116,13 +143,14 @@ jobs:
         with:
           workspaces: /home/runner/work/rest
           cache-on-failure: true
+          key: ${{ matrix.name }}
 
       # 7. Build (release; rest_tensors' build.rs compiles restmatr.f90 -> librestmatr.so)
       - name: Build (release)
         run: |
           set -euo pipefail
           cd "$REST_HOME"
-          cargo build -p rest --release
+          cargo build -p rest --release ${{ matrix.cargo_flags }}
           # Link integrity check: no unresolved shared libraries allowed
           if ldd target/release/rest | grep -q "not found"; then
             echo "::error::unresolved shared libraries:"
@@ -130,12 +158,20 @@ jobs:
             exit 1
           fi
 
-      # 8. Test: run regression
+      # 8. Test: regression suite (mirrors rest-feedstock recipe_rattler/run_tests.sh)
       - name: Test
         run: |
           set -euo pipefail
           cd "$REST_HOME/rest_regression"
-          cargo run -- -t 4
+          if [ "${{ matrix.scalapack_run }}" = "true" ]; then
+            # ScaLAPACK variant: real MPI + forced distributed paths only;
+            # scope kept in sync with the feedstock (scf, gradient + mpi-tagged tests)
+            export REST_BASIS_DIR="$REST_HOME/rest/basis-set-pool"
+            cargo run --quiet -- -r ./bench_pool -n 2 -t 2 --scalapack -f "scf,gradient,mpi" --timeout 600
+          else
+            # standard run: full suite, 4 threads, per-test timeout 200s
+            cargo run --quiet -- -r ./bench_pool -t 4 --timeout 200
+          fi
 
       # 9. Upload regression logs as artifacts when any step failed
       #    (same pattern as rest-feedstock/.github/workflows/conda_rattler.yml)
@@ -143,6 +179,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: regression-logs-${{ runner.os }}-${{ runner.arch }}
+          name: regression-logs-${{ matrix.name }}-${{ runner.os }}-${{ runner.arch }}
           path: ${{ env.REST_HOME }}/rest_regression/work_pool/**
           if-no-files-found: ignore

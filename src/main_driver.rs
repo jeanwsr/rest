@@ -64,7 +64,7 @@ pub fn main_driver() -> anyhow::Result<()> {
 
 
     // VERY IMPORTANCE: introduce mpi_operator:
-    let (mpi_operator , mut mpi_data)= MPIData::initialization();
+    let (mut mpi_operator , mut mpi_data)= MPIData::initialization();
 
     // Under MPI, every rank executes the same code, so an ungated print would appear once
     // per process in the merged output. The `print_level` gating in `Molecule::build`
@@ -95,6 +95,10 @@ pub fn main_driver() -> anyhow::Result<()> {
     let ctrl_file = utilities::parse_input().value_of("input_file").unwrap_or("ctrl.in").to_string();
     if ! PathBuf::from(ctrl_file.clone()).is_file() {
         panic!("Input file ({:}) does not exist", ctrl_file);
+    }
+    if crate::md::is_pure_mm_run(&ctrl_file) {
+        crate::md::run_pure_mm(&ctrl_file, &mpi_operator)?;
+        return Ok(());
     }
     let mut mol = Molecule::build(ctrl_file.clone(), mpi_data)?;
     mol.ctrl.ctrl_file = ctrl_file;
@@ -325,15 +329,50 @@ pub fn main_driver() -> anyhow::Result<()> {
         JobType::NormalModes => {
             eval_normal_modes(&mut scf_data, &mut time_mark, &mpi_operator);
         },
+        JobType::MD => {
+            let ctrl_file = utilities::parse_input().value_of("input_file").unwrap_or("ctrl.in").to_string();
+            let (sd, tm, mo) = crate::md::run_md(scf_data, time_mark, mpi_operator, &ctrl_file);
+            scf_data = sd;
+            time_mark = tm;
+            mpi_operator = mo;
+        },
         // ------------
         _ => {}
     }
 
-    if scf_data.mol.ctrl.check_stab {
-        time_mark.new_item("Stability", "the scf stability check");
+    // Stability mode resolution: `[tddft] stability` wins; the top-level
+    // `check_stab` (same string values) is the fallback. "auto" is the
+    // recommended value: it currently resolves to "full" (internal + external)
+    // inside `stability::stability` and may become method-aware in the future,
+    // whereas the meaning of "full" stays frozen.
+    let mut stab_mode = scf_data
+        .mol
+        .ctrl
+        .tddft
+        .as_ref()
+        .map_or(String::from("off"), |t| t.stability.clone());
+    if stab_mode == "off" {
+        stab_mode = scf_data.mol.ctrl.check_stab.clone();
+    }
+    if stab_mode != "off" {
+        time_mark.new_item("Stability", "the SCF stability analysis (TDDFT Hessian)");
         time_mark.count_start("Stability");
 
-        scf_data.stability();
+        match crate::ri_tddft::stability::stability(&scf_data, &stab_mode) {
+            Ok(report) => {
+                // Expose the Hessian roots in rest_results.json, grouped under
+                // "stability" like the "tddft" block (machine-readable
+                // regression input; the lowest internal root is the stability
+                // verdict quantity).
+                if !report.roots_internal.is_empty() || !report.roots_external.is_empty() {
+                    json_extra.insert("stability".to_string(), json!({
+                        "roots_internal": report.roots_internal,
+                        "roots_external": report.roots_external,
+                    }));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!("stability analysis failed: {e}")),
+        }
 
         time_mark.count("Stability");
     }
@@ -428,7 +467,13 @@ pub fn main_driver() -> anyhow::Result<()> {
     // Now for TDDFT calculations
     //===================================
             if let Some(tddft_ctrl) = &scf_data.mol.ctrl.tddft {
-        if !tddft_ctrl.response_tddft {
+        // A stability analysis (`[tddft] stability != "off"` or the top-level
+        // `check_stab != "off"`, run above) is mutually exclusive with the
+        // excitation-energy run: a stability-only deck carries the [tddft]
+        // section for the stability keywords alone.
+        let stability_requested =
+            tddft_ctrl.stability != "off" || scf_data.mol.ctrl.check_stab != "off";
+        if !tddft_ctrl.response_tddft && !stability_requested {
             time_mark.new_item("TDDFT", "the TDDFT eigenvalue calculation");
             time_mark.count_start("TDDFT");
             match crate::ri_tddft::tddft_main(&mut scf_data) {
@@ -902,7 +947,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
     (energy, gradient)
 }
 
-fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_operator: &Option<MPIOperator>, position: &MatrixFull<f64>) -> (f64, MatrixFull<f64>) {
+pub(crate) fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_operator: &Option<MPIOperator>, position: &MatrixFull<f64>) -> (f64, MatrixFull<f64>) {
     scf_data.mol.geom.geom_update(&position.data(), GeomUnit::Bohr);
     if scf_data.mol.ctrl.print_level>0 {
         println!("Input geometry in this round is:");

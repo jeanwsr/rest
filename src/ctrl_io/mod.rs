@@ -64,6 +64,7 @@ pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
 }
 
 pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(InputKeywords,GeomCell)> {
+    check_top_level_blocks(tmp_keys)?;
     let mut tmp_input = parse_ctrl_keywords(tmp_keys)?;
     let mut tmp_geomcell = parse_geom_keywords(tmp_keys)?;
     let mut tmp_geomtric = parse_geometric_keywords(tmp_keys)?;
@@ -88,6 +89,36 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     }
     tmp_input.analdrv = tmp_keys.get("analdrv").map(serde_from_value);
     Ok((tmp_input,tmp_geomcell))
+}
+
+const VALID_TOP_LEVEL_BLOCKS: &[&str] = &[
+    "ctrl",
+    "geom",
+    "md",
+    "tddft",
+    "hessian",
+    "thermo",
+    "analdrv",
+    "geometric_pyo3",
+    "quasiparticle_methods",
+];
+
+fn check_top_level_blocks(tmp_keys: &serde_json::Value) -> anyhow::Result<()> {
+    if let serde_json::Value::Object(top_level) = tmp_keys {
+        let unknown: Vec<&str> = top_level
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| !VALID_TOP_LEVEL_BLOCKS.contains(k))
+            .collect();
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "Unknown input block(s): [{}]. Valid top-level blocks are: {}.",
+                unknown.join("], ["),
+                VALID_TOP_LEVEL_BLOCKS.join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 fn parse_usize_list_keyword(value: &serde_json::Value) -> Vec<usize> {
@@ -122,6 +153,7 @@ pub enum JobType {
     NumDipole,
     GeomOpt,
     NormalModes,
+    MD,
 }
 
 /// Whether to use the distributed (ScaLAPACK) solver for diagonalizing the
@@ -258,6 +290,11 @@ pub struct InputKeywords {
     pub rad_grid_method: String,
     #[pyo3(get, set)]
     pub external_grids: String,
+    /// Becke radii adjustment used by the grid partitioning: `"becke"` keeps the raw Bragg radii
+    /// (Becke 1988, REST historical behaviour), `"treutler"` uses their square roots
+    /// (Treutler-Ahlrichs 1995, the PySCF/PyFock convention).
+    #[pyo3(get, set)]
+    pub radii_adjust: String,
     // Keywords for the scf procedures
     #[pyo3(get, set)]
     pub mixer: String,
@@ -323,7 +360,7 @@ pub struct InputKeywords {
     #[pyo3(get, set)]
     pub noiter: bool,
     #[pyo3(get, set)]
-    pub check_stab: bool,
+    pub check_stab: String,
     #[pyo3(get, set)]
     pub use_dm_only: bool,
     #[pyo3(get, set)]
@@ -416,6 +453,7 @@ pub struct InputKeywords {
     pub xc_parser: String,
     pub tddft: Option<TDDFTParameters>,
     pub j2c_decomp: J2CDecompOption,
+    pub ri_jk: RIJKOption,
     /// Whether to use the distributed (ScaLAPACK) Hamiltonian diagonalization
     /// in MPI runs. `Auto` (default) decides by problem size; `On` forces the
     /// distributed solver; `Off` forces the serial one.
@@ -506,6 +544,7 @@ impl InputKeywords {
             pruning: String::from("nwchem"),
             rad_grid_method: String::from("treutler"),
             external_grids: "none".to_string(),
+            radii_adjust: String::from("becke"),
             // ETB for autogen the auxbasis
             even_tempered_basis: false,
             etb_start_atom_number: 37,
@@ -532,7 +571,7 @@ impl InputKeywords {
             initial_guess: String::from("sad"),
             basis_projection: String::from("occupied"),
             noiter: false,
-            check_stab: false,
+            check_stab: String::from("off"),
             // Kyewords for the manner to evaluate the Vk (and also Vxc) potentials
             // True:  using only density matrix in the evaluation
             // False: use coefficients as well with higher efficiency
@@ -602,6 +641,7 @@ impl InputKeywords {
             stop_at: None,
             xc_parser: String::from("legacy"),
             j2c_decomp: J2CDecompOption::default(),
+            ri_jk: RIJKOption::default(),
             hamiltonian_distributed: HamiltonianDistributedMode::default(),
             rpa_distributed: HamiltonianDistributedMode::default(),
             ri_pt2: RiPt2Option::default(),
@@ -654,6 +694,9 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         },
         JobType::NormalModes => {
             println!("Calculation type: Vibrational normal modes (frequency) calculation");
+        },
+        JobType::MD => {
+            println!("Calculation type: Molecular dynamics (MD) simulation");
         },
     }
 
@@ -815,6 +858,7 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
     };
     debug!("The pruning method is {}", ctrl.pruning);
     debug!("The radial grid generation method is {}", ctrl.rad_grid_method);
+    debug!("The Becke radii adjustment scheme is {}", ctrl.radii_adjust);
     debug!("min_num_angular_points: {}", ctrl.min_num_angular_points);
     debug!("max_num_angular_points: {}", ctrl.max_num_angular_points);
     debug!("hardness: {}", ctrl.hardness);
@@ -949,6 +993,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
             //if tmp_input.print_level>0 {println!("The radial grid generation method will be {}", tmp_input.rad_grid_method)};
 
+            tmp_input.radii_adjust = match tmp_ctrl.get("radii_adjust").unwrap_or(&serde_json::Value::Null){
+                serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
+                other => {String::from("becke")} // default: raw Bragg radii (REST historical behaviour)
+            };
+            //if tmp_input.print_level>0 {println!("The Becke radii adjustment will be {}", tmp_input.radii_adjust)};
+
             tmp_input.eri_type = match tmp_ctrl.get("eri_type").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_eri) => {
                     if tmp_eri.to_lowercase().eq("ri_v") || tmp_eri.to_lowercase().eq("ri-v")
@@ -1080,13 +1130,24 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     } else if tmp_xc_low.eq("numdipole") || tmp_xc_low.eq("numerical dipole") {
                         JobType::NumDipole
                     } else if tmp_xc_low.eq("energy") || tmp_xc_low.eq("single point") ||
-                      tmp_xc_low.eq("single_point") {
+                      tmp_xc_low.eq("single_point") || tmp_xc_low.eq("sp") ||
+                      tmp_xc_low.eq("singlepoint") {
                         JobType::SinglePoint
                     } else if tmp_xc_low.eq("normal_modes") || tmp_xc_low.eq("freq") ||
                       tmp_xc_low.eq("frequency") || tmp_xc_low.eq("vibration") {
                         JobType::NormalModes
+                    } else if tmp_xc_low.eq("md") || tmp_xc_low.eq("molecular dynamics") ||
+                      tmp_xc_low.eq("molecular_dynamics") {
+                        JobType::MD
                     } else {
-                        JobType::SinglePoint
+                        anyhow::bail!(
+                            "Unknown job_type '{}' in the [ctrl] block. Valid values: \
+                             energy/single point/single_point/sp/singlepoint, force/gradient, \
+                             numdipole/numerical dipole, \
+                             opt/geometry optimization/geometry relaxation/geom_opt/geom_relax/relax, \
+                             normal_modes/freq/frequency/vibration, md/molecular dynamics/molecular_dynamics.",
+                            tmp_xc
+                        );
                     }
                 },
                 other => {JobType::SinglePoint},
@@ -1424,10 +1485,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
             // Experimental function
             tmp_input.solv_chunk = match tmp_ctrl.get("solv_chunk").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(8)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
-                other => {8},
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(16)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(16) as usize},
+                _ => {16},
             };
+            // 0 would panic the RI veff path (`par_chunks(0)`); clamp to at least one point.
+            tmp_input.solv_chunk = tmp_input.solv_chunk.max(1);
             // ==============================================
             //  Keywords associated with relativistic methods 
             // ==============================================
@@ -1593,9 +1656,10 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => false,
             };
             tmp_input.check_stab = match tmp_ctrl.get("check_stab").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
-                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
-                other => false,
+                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase(),
+                serde_json::Value:: Bool(true) => String::from("auto"),
+                serde_json::Value:: Bool(false) => String::from("off"),
+                other => String::from("off"),
             };
             tmp_input.use_dm_only = match tmp_ctrl.get("use_dm_only").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
@@ -1627,6 +1691,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.algorithm_j = tmp_ctrl.get("algorithm_j").map(serde_from_value).unwrap_or_default();
             tmp_input.algorithm_k = tmp_ctrl.get("algorithm_k").map(serde_from_value).unwrap_or_default();
             tmp_input.j2c_decomp = tmp_ctrl.get("j2c_decomp").map(serde_from_value).unwrap_or_default();
+            tmp_input.ri_jk = tmp_ctrl.get("ri_jk").map(serde_from_value).unwrap_or_default();
             tmp_input.hamiltonian_distributed = tmp_ctrl.get("hamiltonian_distributed").map(serde_from_value).unwrap_or_default();
             tmp_input.rpa_distributed = tmp_ctrl.get("rpa_distributed").map(serde_from_value).unwrap_or_default();
             if (tmp_input.algorithm_j != AlgorithmJ::Default || tmp_input.algorithm_k != AlgorithmK::Default) {

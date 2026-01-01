@@ -27,6 +27,7 @@ pub mod prelude {
     pub(super) use super::nimatmul::*;
     pub(super) use super::pure_eval_rho::*;
     pub(super) use super::pure_xcpot::*;
+    pub(super) use crate::dft::gen_grids::RadiiAdjust;
     pub(super) use crate::dft::xceff::prelude::*;
     pub(super) use crate::ni_check_shape;
     pub(super) use crate::ri_jk::util::get_dm0_restricted;
