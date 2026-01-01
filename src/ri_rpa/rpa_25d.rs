@@ -122,7 +122,7 @@ pub fn rpa_correlation_rayon_mpi_25d(
 ) -> anyhow::Result<f64> {
     use mpi::collective::SystemOperation;
     use mpi::traits::*;
-    use crate::ri_pt2::pt2_25d::{initialize_metadata, swap_ownership};
+    use crate::ri_pt2::pt2_25d::{initialize_metadata_linear, redistribute_to_diag};
 
     let (mpi_op, mpi_ix) = match (mpi_operator, &scf_data.mol.mpi_data) {
         (Some(op), Some(ix)) => (op, ix),
@@ -163,16 +163,16 @@ pub fn rpa_correlation_rayon_mpi_25d(
     let n1_global = alpha_rimo.size[1];
     let n2_global = alpha_rimo.size[2];
 
-    let ctx = initialize_metadata(&grid, n2_global);
+    let ctx = initialize_metadata_linear(&grid, n2_global);
     let mut n0_global_tmp: u64 = 0;
     grid.cart_comm
         .all_reduce_into(&(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
     let n0_global = n0_global_tmp as usize;
 
     let redistributed_alpha =
-        swap_ownership(&grid, &ctx, alpha_rimo, n0_global, n1_global, n2_global, &local_n0_range);
+        redistribute_to_diag(&grid, &ctx, alpha_rimo, n0_global, &local_n0_range);
     let redistributed_beta = match beta_rimo {
-        Some(b) => Some(swap_ownership(&grid, &ctx, b, n0_global, n1_global, n2_global, &local_n0_range)),
+        Some(b) => Some(redistribute_to_diag(&grid, &ctx, b, n0_global, &local_n0_range)),
         None => None,
     };
 

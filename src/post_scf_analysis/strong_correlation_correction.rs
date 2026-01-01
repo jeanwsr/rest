@@ -62,7 +62,13 @@ pub fn scc15_for_rxdh7(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -
     let (sbge2_detailed, special_radius) = if is_mpi {
         #[cfg(feature = "mpi")]
         {
-            let radius = crate::ri_rpa::scsrpa_25d::evaluate_special_radius_only_25d(scf_data, mpi_operator);
+            // xdh_calculations 的 2.5D 相关能驱动已在归约后的 χ₀(0) 上算过谱半径并
+            // 持久化到 energies["special_radius"] —— 直接复用，免去第二次完整重分布 +
+            // ω=0 响应重算（原 SCC15 MPI 每次运行重复一次）。防御性兜底保留原路径。
+            let radius = match scf_data.energies.get("special_radius") {
+                Some(r) if r.len() >= 2 => [r[0], r[1]],
+                _ => crate::ri_rpa::scsrpa_25d::evaluate_special_radius_only_25d(scf_data, mpi_operator),
+            };
             let detailed = if scf_data.mol.spin_channel == 1 {
                 crate::ri_pt2::sbge2_25d::close_shell_sbge2_detailed_rayon_mpi_25d(scf_data, mpi_operator).unwrap()
             } else {

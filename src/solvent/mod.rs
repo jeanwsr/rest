@@ -21,7 +21,7 @@ use rest_libcint::{CINTR2CDATA, CintType};
 use serde::{Deserialize, Serialize};
 use tensors::{map_full_to_upper, map_upper_to_full, MatrixFull, MatrixUpper, ri, BasicMatUp, BasicMatrix, MathMatrix, MatrixFullSlice, MatrixUpperSlice};
 //use rstsr as rt;
-use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemm_scaled};
+use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemm_scaled, omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
 use crate::molecule_io::Molecule;
 //use crate::geom_io::{GeomCell, get_mass_charge};
 //use crate::constants::solvent as data;
@@ -430,6 +430,7 @@ impl PcmScf{
         max_memory: &Option<f64>,
         chunk_size: &usize,
         solv_ri: bool,
+        mpi_operator: &Option<crate::mpi_io::MPIOperator>,
     ) -> PcmScf {
         let dt_solv0 = time::Local::now();
         // RI-based PCM: use auxiliary basis for (μν|g_i) integrals
@@ -504,6 +505,15 @@ impl PcmScf{
     
             (v_grids_e, v_grids_matrix, veff, q_sym, dt_4)
         } else {
+            #[cfg(feature = "mpi")]
+            let v_grids_e = {
+                if mpi_operator.is_some() {
+                    get_v_grids_e_old_mpi(surface, &cint_data, dm, spin_channel, max_memory, chunk_size, mpi_operator)
+                } else {
+                    get_v_grids_e_old(surface, &cint_data, dm, spin_channel, max_memory, chunk_size)
+                }
+            };
+            #[cfg(not(feature = "mpi"))]
             let v_grids_e = get_v_grids_e_old(surface, &cint_data, dm, spin_channel, max_memory, chunk_size);
 
             let dt_1 = time::Local::now();
@@ -542,6 +552,15 @@ impl PcmScf{
             let timecost_qsym = (dt_4.timestamp_millis()-dt_3.timestamp_millis()) as f64 /1000.0;
             println!("Symmetrization of q costs {:10.2} seconds.", timecost_qsym);
 
+            #[cfg(feature = "mpi")]
+            let veff = {
+                if mpi_operator.is_some() {
+                    get_veff_pcm_by_q_old_mpi(surface, &cint_data, &q_sym.data, max_memory, chunk_size, mpi_operator)
+                } else {
+                    get_veff_pcm_by_q_old(surface, &cint_data, &q_sym.data, max_memory, chunk_size)
+                }
+            };
+            #[cfg(not(feature = "mpi"))]
             let veff = get_veff_pcm_by_q_old(surface, &cint_data, &q_sym.data, max_memory, chunk_size);
             (v_grids_e, v_grids_matrix, veff, q_sym, dt_4)
         };
@@ -563,6 +582,33 @@ impl PcmScf{
     }
 
 }   
+
+/// Unified solvent chunk size (number of surface points per work batch).
+///
+/// A single ctrl knob (`solv_chunk`) controls the thread-level batch size for
+/// both the PCM energy and gradient paths. The value is clamped by:
+/// - **user knob**: `solv_chunk` (upper bound; default 8, benchmark inputs 64);
+/// - **memory**: the ~500 MB in-flight tensor budget per process divided by the
+///   thread count (`bytes_per_point · nao²` bytes per point; gradient tensors are
+///   3× the energy ones);
+/// - **load balance**: `range / (nthreads · K)` so every thread gets ≥K tasks;
+/// - **floor**: 16 points (per-batch overhead: fake molecule + integral call).
+pub(crate) fn solvent_chunk(
+    range: usize,          // surface points owned by this rank
+    nao: usize,            // number of AO basis functions
+    bytes_per_point: f64,  // tensor bytes per point (8·nao² energy, 24·nao² gradient)
+    solv_chunk: usize,     // ctrl `solv_chunk`
+    nthreads: usize,       // rayon pool size
+) -> usize {
+    const C_MIN: usize = 16;
+    const K: usize = 2;
+    let t = nthreads.max(1);
+    let mem_cap = ((500_000_000.0 / (bytes_per_point * (nao * nao) as f64)) as usize / t).max(1);
+    let hi = solv_chunk.min(mem_cap).max(1);
+    let by_load = (range / (t * K)).max(1);
+    let lo = C_MIN.min(range).max(1);
+    by_load.max(lo).min(hi).max(1)
+}
 
 pub fn get_v_grids_e_old(
     surface: &SurfaceVdwGaussian,
@@ -622,7 +668,9 @@ pub fn get_v_grids_e_old(
     
     let mut v_grids_e = vec![0.0; ngrids];
     //let (sender, receiver) = channel();
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     v_grids_e.par_chunks_mut(CHUNK).enumerate().for_each(|(v_chunk, idx)| {
+        omp_set_num_threads_wrapper(1);
         let t0 = Instant::now();
         let p0 = v_chunk * CHUNK;
         let p1 = (p0 + CHUNK).min(ngrids);
@@ -649,6 +697,7 @@ pub fn get_v_grids_e_old(
         idx.iter_mut().zip(v_e_chunk.iter()).for_each(|(i, &v)| *i = v);
 
     });
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     let dt1 = time::Local::now();
     let timecost = (dt1.timestamp_millis()-dt0.timestamp_millis()) as f64 /1000.0;
@@ -656,6 +705,193 @@ pub fn get_v_grids_e_old(
     
     
     v_grids_e
+}
+
+// ============================================================================
+// MPI 并行化：表面格点 chunk 按 rank 分段 → 各 rank 本地计算 → allreduce
+// 串行路径完全零改动（仅新增 _mpi 函数）
+// ============================================================================
+
+/// MPI 版 `get_v_grids_e_old`：表面点按 rank 分区（`average_distribution`），
+/// rank 内按统一 chunk（`solvent_chunk`）用 Rayon 并行批处理（闭包内 BLAS 已 gate）。
+/// 通信：allreduce(ngrids × 8B) —— 极小。
+#[cfg(feature = "mpi")]
+pub fn get_v_grids_e_old_mpi(
+    surface: &SurfaceVdwGaussian,
+    cint_data: &CINTR2CDATA,
+    dm: &Vec<MatrixFull<f64>>,
+    spin_channel: &usize,
+    max_memory: &Option<f64>,
+    chunk_size: &usize,
+    mpi_operator: &Option<crate::mpi_io::MPIOperator>,
+) -> Vec<f64> {
+    use mpi::collective::SystemOperation;
+    use mpi::traits::*;
+
+    let mpi_op = match mpi_operator {
+        Some(op) => op,
+        None => return get_v_grids_e_old(surface, cint_data, dm, spin_channel, max_memory, chunk_size),
+    };
+    let my_rank = mpi_op.rank;
+    let nproc = mpi_op.size;
+
+    let charge_exp = &surface.surface_calc.charge_exp;
+    let grid_coords = &surface.surface_calc.grid_coords;
+    let ngrids = charge_exp.len();
+    let nao = cint_data.nao();
+
+    // Flatten DM
+    let mut dm_vec = vec![0.0; nao * nao];
+    for i_spin in 0..*spin_channel {
+        for j in 0..nao {
+            for i in 0..nao {
+                dm_vec[j*nao + i] += dm[i_spin][(i,j)];
+            }
+        }
+    }
+    let dm_mat = MatrixFull::from_vec([1, nao*nao], dm_vec).unwrap();
+
+    // MPI ownership: contiguous surface-point range per rank; within the range,
+    // chunks follow the unified solvent chunk (thread batch size).
+    let (g0, g1) = {
+        let dist = crate::mpi_io::average_distribution(ngrids, nproc);
+        (dist[my_rank].start, dist[my_rank].end)
+    };
+    let range = g1 - g0;
+    let chunk = solvent_chunk(range, nao, 8.0, *chunk_size, rayon::current_num_threads());
+    let chunks: Vec<(usize, usize)> = (g0..g1).step_by(chunk)
+        .map(|p0| (p0, (p0 + chunk).min(g1)))
+        .collect();
+
+    let dt0 = time::Local::now();
+
+    // Thread-parallel chunks; the BLAS call inside the closure is gated to one
+    // thread (Rayon × OpenBLAS double pool). Partials are collected in ascending
+    // chunk order → deterministic fold.
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
+    let partials: Vec<(usize, Vec<f64>)> = chunks
+        .par_iter()
+        .map(|&(p0, p1)| {
+            omp_set_num_threads_wrapper(1);
+            let grid_coords_chunk = &grid_coords[p0..p1];
+            let charge_exp_chunk: Vec<f64> = charge_exp[p0..p1].iter().map(|x| x * x).collect();
+            let fake_chg_data = CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk.as_slice());
+
+            let (tmpout, shape) = CINTR2CDATA::integrate_cross("int3c2e", [cint_data, cint_data, &fake_chg_data], None, None).into();
+            let max_val = tmpout.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            if max_val < 1.0e-12 {
+                return (p0, vec![0.0; p1 - p0]);
+            }
+            let tmpshape = [shape[0] * shape[1], shape[2]];
+            let v_nj = MatrixFull::from_vec(tmpshape, tmpout).unwrap();
+            let v_e_chunk = _dgemm_scaled(&dm_mat, 'N', &v_nj, 'N', 1.0);
+            (p0, v_e_chunk.data)
+        })
+        .collect();
+    omp_set_num_threads_wrapper(default_omp_num_threads);
+
+    let mut v_grids_e_local = vec![0.0_f64; ngrids];
+    for (p0, vals) in &partials {
+        for (off, &v) in vals.iter().enumerate() {
+            v_grids_e_local[*p0 + off] = v;
+        }
+    }
+
+    // Allreduce
+    let mut v_grids_e = vec![0.0_f64; ngrids];
+    mpi_op.world.any_process().all_reduce_into(&v_grids_e_local[..], &mut v_grids_e[..], &SystemOperation::sum());
+
+    let dt1 = time::Local::now();
+    let timecost = (dt1.timestamp_millis()-dt0.timestamp_millis()) as f64 /1000.0;
+    if my_rank == 0 {
+        println!("MPI v_grids_e ({} chunks / {} ranks) costs {:8.3} s", chunks.len(), nproc, timecost);
+    }
+    v_grids_e
+}
+
+/// MPI 版 `get_veff_pcm_by_q_old`：表面点按 rank 分区（`average_distribution`），
+/// rank 内按统一 chunk（`solvent_chunk`）用 Rayon 并行批处理（闭包内 BLAS 已 gate）。
+/// 通信：allreduce(nao² × 8B)。
+#[cfg(feature = "mpi")]
+pub fn get_veff_pcm_by_q_old_mpi(
+    surface: &SurfaceVdwGaussian,
+    cint_data: &CINTR2CDATA,
+    q: &Vec<f64>,
+    max_memory: &Option<f64>,
+    chunk_size: &usize,
+    mpi_operator: &Option<crate::mpi_io::MPIOperator>,
+) -> MatrixUpper<f64> {
+    use mpi::collective::SystemOperation;
+    use mpi::traits::*;
+
+    let mpi_op = match mpi_operator {
+        Some(op) => op,
+        None => return get_veff_pcm_by_q_old(surface, cint_data, q, max_memory, chunk_size),
+    };
+    let my_rank = mpi_op.rank;
+    let nproc = mpi_op.size;
+
+    let nao = cint_data.nao();
+    let charge_exp = &surface.surface_calc.charge_exp;
+    let grid_coords = &surface.surface_calc.grid_coords;
+    let ngrids = charge_exp.len();
+    // MPI ownership: contiguous surface-point range per rank; within the range,
+    // chunks follow the unified solvent chunk (thread batch size).
+    let (g0, g1) = {
+        let dist = crate::mpi_io::average_distribution(ngrids, nproc);
+        (dist[my_rank].start, dist[my_rank].end)
+    };
+    let range = g1 - g0;
+    let chunk = solvent_chunk(range, nao, 8.0, *chunk_size, rayon::current_num_threads());
+    let chunks: Vec<(usize, usize)> = (g0..g1).step_by(chunk)
+        .map(|p0| (p0, (p0 + chunk).min(g1)))
+        .collect();
+
+    let dt0 = time::Local::now();
+
+    // Thread-parallel chunks; the BLAS call inside the closure is gated to one
+    // thread (Rayon × OpenBLAS double pool). Partials are collected in ascending
+    // chunk order → deterministic fold.
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
+    let partials: Vec<Vec<f64>> = chunks
+        .par_iter()
+        .map(|&(p0, p1)| {
+            omp_set_num_threads_wrapper(1);
+            let chunk_len = p1 - p0;
+            let grid_coords_chunk = &grid_coords[p0..p1];
+            let charge_exp_chunk_sq: Vec<f64> = charge_exp[p0..p1].iter().map(|x| x * x).collect();
+            let fake_chg_data = CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk_sq.as_slice());
+
+            let (tmpout, shape) = CINTR2CDATA::integrate_cross("int3c2e", [cint_data, cint_data, &fake_chg_data], None, None).into();
+            let tmpshape = [shape[0] * shape[1], shape[2]];
+            let tmp_v_nj = MatrixFull::from_vec(tmpshape, tmpout).unwrap();
+            let q_p = MatrixFull::from_vec([chunk_len, 1], q[p0..p1].to_vec()).unwrap();
+            let v_nj = _dgemm_scaled(&tmp_v_nj, 'N', &q_p, 'N', 1.0);
+            v_nj.data
+        })
+        .collect();
+    omp_set_num_threads_wrapper(default_omp_num_threads);
+
+    let mut veff_local = MatrixFull::<f64>::new([nao, nao], 0.0);
+    for vnj in &partials {
+        for (ve, &v) in veff_local.data.iter_mut().zip(vnj.iter()) {
+            *ve -= v;
+        }
+    }
+
+    // Allreduce
+    let mut veff_full = vec![0.0_f64; nao * nao];
+    mpi_op.world.any_process().all_reduce_into(&veff_local.data[..], &mut veff_full[..], &SystemOperation::sum());
+
+    let dt1 = time::Local::now();
+    let timecost = (dt1.timestamp_millis()-dt0.timestamp_millis()) as f64 /1000.0;
+    if my_rank == 0 {
+        println!("MPI veff ({} chunks / {} ranks) costs {:8.3} s", chunks.len(), nproc, timecost);
+    }
+
+    let veff_mf = MatrixFull::from_vec([nao, nao], veff_full).unwrap();
+    let veff_upper = veff_mf.iter_matrixupper().unwrap().map(|&x| x).collect::<Vec<f64>>();
+    MatrixUpper::from_vec(nao*(nao+1)/2 as usize, veff_upper).unwrap()
 }
 
 pub fn get_veff_pcm_by_q_old(
@@ -753,11 +989,13 @@ pub fn get_veff_pcm_by_q_old(
             }
         );
     */
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     let veff = grid_coords
     .par_chunks(CHUNK)
     .zip(charge_exp.par_chunks(CHUNK))
     .zip(q.par_chunks(CHUNK))
     .map(|((grid_coords_chunk, charge_exp_chunk), q_chunk)| {
+        omp_set_num_threads_wrapper(1);
         let t0 = Instant::now();
 
         let chunk_len = grid_coords_chunk.len();
@@ -798,6 +1036,8 @@ pub fn get_veff_pcm_by_q_old(
             acc
         }
     );
+
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     let dt1 = time::Local::now();
     let timecost = (dt1.timestamp_millis() - dt0.timestamp_millis()) as f64 / 1000.0;
@@ -883,7 +1123,9 @@ pub fn get_v_grids_e(
 
     // Step 3: Parallel grid chunks — v_grids_e[j] = Σ_P Y_P · (P|g_j)
     let mut v_grids_e = vec![0.0; ngrids];
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     v_grids_e.par_chunks_mut(CHUNK).enumerate().for_each(|(v_chunk, idx)| {
+        omp_set_num_threads_wrapper(1);
         let p0 = v_chunk * CHUNK;
         let p1 = (p0 + CHUNK).min(ngrids);
         let grid_coords_chunk = &grid_coords[p0..p1];
@@ -913,6 +1155,7 @@ pub fn get_v_grids_e(
         let v_e_chunk = _dgemm_scaled(&pg_mat, 'N', &y_mat, 'N', 1.0);
         idx.iter_mut().zip(v_e_chunk.iter()).for_each(|(i, &v)| *i = v);
     });
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     // Debug: check v_grids_e results
     let ve_minmax = v_grids_e.iter().fold((f64::MAX, f64::MIN), |(mn, mx), &v| (mn.min(v), mx.max(v)));
@@ -1149,4 +1392,61 @@ pub fn debug_print_pcm(sta: &PcmStatic, scf: &PcmScf){
     print_vec_stats(&scf.veff.data);
     println!("eng:");
     println!("{}", scf.eng);
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 模糊 water 判定只比较 n, α, ε（容差 0.01 / 0.01 / 1.0）。
+    #[test]
+    fn test_is_water_descriptor() {
+        assert!(is_water_descriptor(&SMD_WATER_DESCRIPTORS));
+        // 容差内（严格 < 0.01 / < 0.01 / < 1.0）：Δn=+0.0072, Δα=+0.005, Δε=+0.645
+        let near = [1.34, 1.33, 0.825, 0.35, -1.0, 79.0, -1.0, -1.0];
+        assert!(is_water_descriptor(&near));
+        // 边界：|Δα| = 0.01 不满足严格小于 → false
+        let mut d = SMD_WATER_DESCRIPTORS;
+        d[2] = 0.83;
+        assert!(!is_water_descriptor(&d), "|Δα|=0.01 应为 false（严格小于）");
+        // 非水溶剂（octanol）
+        let octanol = [1.4295, 1.4279, 0.37, 0.48, 39.01, 9.8629, 0.0, 0.0];
+        assert!(!is_water_descriptor(&octanol));
+        // n 超容差
+        let mut d = SMD_WATER_DESCRIPTORS;
+        d[0] = 1.36;
+        assert!(!is_water_descriptor(&d));
+        // ε 超容差
+        let mut d = SMD_WATER_DESCRIPTORS;
+        d[5] = 76.0;
+        assert!(!is_water_descriptor(&d));
+        // 哨兵值
+        assert!(!is_water_descriptor(&SMD_ERROR_DESCRIPTORS));
+    }
+
+    #[test]
+    fn test_pcm_object_cfg_default() {
+        let cfg = PcmObjectCfg::default();
+        assert_eq!(cfg.method, PcmMethod::CPCM);
+        assert_eq!(cfg.epsilon, 78.3553);
+        assert_eq!(cfg.icds, 0);
+        assert_eq!(cfg.smd_cavity_radii, SmdCavityRadii::Bondi);
+        assert_eq!(cfg.solvent_descriptors, SMD_ERROR_DESCRIPTORS);
+    }
+
+    #[test]
+    fn test_pcm_method_deserialize() {
+        assert_eq!(serde_json::from_str::<PcmMethod>("\"cpcm\"").unwrap(), PcmMethod::CPCM);
+        assert_eq!(serde_json::from_str::<PcmMethod>("\"COSMO\"").unwrap(), PcmMethod::COSMO);
+        assert_eq!(serde_json::from_str::<PcmMethod>("\"iefpcm\"").unwrap(), PcmMethod::IEFPCM);
+        // Fortran/文献别名 SS(V)PE
+        assert_eq!(serde_json::from_str::<PcmMethod>("\"ss(v)pe\"").unwrap(), PcmMethod::SSVPE);
+        assert_eq!(serde_json::from_str::<PcmMethod>("\"ssvpe\"").unwrap(), PcmMethod::SSVPE);
+        assert_eq!(serde_json::from_str::<PcmMethod>("\"smd\"").unwrap(), PcmMethod::SMD);
+        assert!(serde_json::from_str::<PcmMethod>("\"unknown\"").is_err());
+    }
 }
