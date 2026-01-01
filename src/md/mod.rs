@@ -84,8 +84,8 @@ fn update_links(
             let r_eq = qp.link_r_eq / crate::constants::BOHR;
             let unit = if n > 1.0e-12 { [d[0] / n, d[1] / n, d[2] / n] } else { [1.0, 0.0, 0.0] };
             pos[3 * lrow] = pos[qrow] + r_eq * unit[0];
-            pos[3 * lrow + 1] = pos[qrow] + r_eq * unit[1];
-            pos[3 * lrow + 2] = pos[qrow] + r_eq * unit[2];
+            pos[3 * lrow + 1] = pos[qrow + 1] + r_eq * unit[1];
+            pos[3 * lrow + 2] = pos[qrow + 2] + r_eq * unit[2];
             if zero_v {
                 for c in 0..3 {
                     vel[3 * lrow + c] = 0.0;
@@ -143,7 +143,12 @@ impl EvalCtx {
     }
 
     fn eval_bohr(&self, pos_bohr: &[f64]) -> anyhow::Result<(f64, Vec<f64>)> {
-        let fe = self.force(pos_bohr);
+        let mut pos = pos_bohr.to_vec();
+        if self.rt.is_some() {
+            let mut vel = vec![0.0f64; pos.len()];
+            update_links(&mut pos, &mut vel, false, self.rt.as_deref(), self.params.qmmm.as_ref());
+        }
+        let fe = self.force(&pos);
         let out = (
             fe.epot * HARTREE2EV,
             fe.force.iter().map(|x| x * AU_FORCE2_EV_PER_ANG).collect::<Vec<f64>>(),
@@ -872,6 +877,7 @@ pub fn run_md(
                 qp.box_margin,
                 qp.box_spacing,
                 0,
+                params.seed,
             );
             let box_path = base.join("auto_box.gro");
             std::fs::write(&box_path, &gro_text)
@@ -1157,8 +1163,8 @@ pub fn run_md(
                         [1.0, 0.0, 0.0]
                     };
                     pos_bohr[3 * lrow] = pos_bohr[qrow] + r_eq * unit[0];
-                    pos_bohr[3 * lrow + 1] = pos_bohr[qrow] + r_eq * unit[1];
-                    pos_bohr[3 * lrow + 2] = pos_bohr[qrow] + r_eq * unit[2];
+                    pos_bohr[3 * lrow + 1] = pos_bohr[qrow + 1] + r_eq * unit[1];
+                    pos_bohr[3 * lrow + 2] = pos_bohr[qrow + 2] + r_eq * unit[2];
                 }
             }
             let fe = evaluate_forces(
@@ -1212,6 +1218,7 @@ pub fn run_md(
             for i in 0..3 * n_total {
                 pos[i] = p_ang[i] / crate::constants::BOHR;
             }
+            update_links(&mut pos, &mut vel, false, rt, params.qmmm.as_ref());
             nsteps += 1;
         }
         let vel_zero = vec![0.0f64; 3 * n_total];

@@ -64,6 +64,7 @@ pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
 }
 
 pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(InputKeywords,GeomCell)> {
+    check_top_level_blocks(tmp_keys)?;
     let mut tmp_input = parse_ctrl_keywords(tmp_keys)?;
     let mut tmp_geomcell = parse_geom_keywords(tmp_keys)?;
     let mut tmp_geomtric = parse_geometric_keywords(tmp_keys)?;
@@ -88,6 +89,36 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     }
     tmp_input.analdrv = tmp_keys.get("analdrv").map(serde_from_value);
     Ok((tmp_input,tmp_geomcell))
+}
+
+const VALID_TOP_LEVEL_BLOCKS: &[&str] = &[
+    "ctrl",
+    "geom",
+    "md",
+    "tddft",
+    "hessian",
+    "thermo",
+    "analdrv",
+    "geometric_pyo3",
+    "quasiparticle_methods",
+];
+
+fn check_top_level_blocks(tmp_keys: &serde_json::Value) -> anyhow::Result<()> {
+    if let serde_json::Value::Object(top_level) = tmp_keys {
+        let unknown: Vec<&str> = top_level
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| !VALID_TOP_LEVEL_BLOCKS.contains(k))
+            .collect();
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "Unknown input block(s): [{}]. Valid top-level blocks are: {}.",
+                unknown.join("], ["),
+                VALID_TOP_LEVEL_BLOCKS.join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 fn parse_usize_list_keyword(value: &serde_json::Value) -> Vec<usize> {
@@ -329,7 +360,7 @@ pub struct InputKeywords {
     #[pyo3(get, set)]
     pub noiter: bool,
     #[pyo3(get, set)]
-    pub check_stab: bool,
+    pub check_stab: String,
     #[pyo3(get, set)]
     pub use_dm_only: bool,
     #[pyo3(get, set)]
@@ -540,7 +571,7 @@ impl InputKeywords {
             initial_guess: String::from("sad"),
             basis_projection: String::from("occupied"),
             noiter: false,
-            check_stab: false,
+            check_stab: String::from("off"),
             // Kyewords for the manner to evaluate the Vk (and also Vxc) potentials
             // True:  using only density matrix in the evaluation
             // False: use coefficients as well with higher efficiency
@@ -1090,7 +1121,8 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     } else if tmp_xc_low.eq("numdipole") || tmp_xc_low.eq("numerical dipole") {
                         JobType::NumDipole
                     } else if tmp_xc_low.eq("energy") || tmp_xc_low.eq("single point") ||
-                      tmp_xc_low.eq("single_point") {
+                      tmp_xc_low.eq("single_point") || tmp_xc_low.eq("sp") ||
+                      tmp_xc_low.eq("singlepoint") {
                         JobType::SinglePoint
                     } else if tmp_xc_low.eq("normal_modes") || tmp_xc_low.eq("freq") ||
                       tmp_xc_low.eq("frequency") || tmp_xc_low.eq("vibration") {
@@ -1099,7 +1131,14 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                       tmp_xc_low.eq("molecular_dynamics") {
                         JobType::MD
                     } else {
-                        JobType::SinglePoint
+                        anyhow::bail!(
+                            "Unknown job_type '{}' in the [ctrl] block. Valid values: \
+                             energy/single point/single_point/sp/singlepoint, force/gradient, \
+                             numdipole/numerical dipole, \
+                             opt/geometry optimization/geometry relaxation/geom_opt/geom_relax/relax, \
+                             normal_modes/freq/frequency/vibration, md/molecular dynamics/molecular_dynamics.",
+                            tmp_xc
+                        );
                     }
                 },
                 other => {JobType::SinglePoint},
@@ -1437,10 +1476,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
             // Experimental function
             tmp_input.solv_chunk = match tmp_ctrl.get("solv_chunk").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(8)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
-                other => {8},
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(16)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(16) as usize},
+                _ => {16},
             };
+            // 0 would panic the RI veff path (`par_chunks(0)`); clamp to at least one point.
+            tmp_input.solv_chunk = tmp_input.solv_chunk.max(1);
             // ==============================================
             //  Keywords associated with relativistic methods 
             // ==============================================
@@ -1606,9 +1647,10 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => false,
             };
             tmp_input.check_stab = match tmp_ctrl.get("check_stab").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
-                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
-                other => false,
+                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase(),
+                serde_json::Value:: Bool(true) => String::from("auto"),
+                serde_json::Value:: Bool(false) => String::from("off"),
+                other => String::from("off"),
             };
             tmp_input.use_dm_only = match tmp_ctrl.get("use_dm_only").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),

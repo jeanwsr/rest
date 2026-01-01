@@ -286,11 +286,39 @@ pub fn main_driver() -> anyhow::Result<()> {
         _ => {}
     }
 
-    if scf_data.mol.ctrl.check_stab {
-        time_mark.new_item("Stability", "the scf stability check");
+    // Stability mode resolution: `[tddft] stability` wins; the top-level
+    // `check_stab` (same string values) is the fallback. "auto" is the
+    // recommended value: it currently resolves to "full" (internal + external)
+    // inside `stability::stability` and may become method-aware in the future,
+    // whereas the meaning of "full" stays frozen.
+    let mut stab_mode = scf_data
+        .mol
+        .ctrl
+        .tddft
+        .as_ref()
+        .map_or(String::from("off"), |t| t.stability.clone());
+    if stab_mode == "off" {
+        stab_mode = scf_data.mol.ctrl.check_stab.clone();
+    }
+    if stab_mode != "off" {
+        time_mark.new_item("Stability", "the SCF stability analysis (TDDFT Hessian)");
         time_mark.count_start("Stability");
 
-        scf_data.stability();
+        match crate::ri_tddft::stability::stability(&scf_data, &stab_mode) {
+            Ok(report) => {
+                // Expose the Hessian roots in rest_results.json, grouped under
+                // "stability" like the "tddft" block (machine-readable
+                // regression input; the lowest internal root is the stability
+                // verdict quantity).
+                if !report.roots_internal.is_empty() || !report.roots_external.is_empty() {
+                    json_extra.insert("stability".to_string(), json!({
+                        "roots_internal": report.roots_internal,
+                        "roots_external": report.roots_external,
+                    }));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!("stability analysis failed: {e}")),
+        }
 
         time_mark.count("Stability");
     }
@@ -385,7 +413,13 @@ pub fn main_driver() -> anyhow::Result<()> {
     // Now for TDDFT calculations
     //===================================
             if let Some(tddft_ctrl) = &scf_data.mol.ctrl.tddft {
-        if !tddft_ctrl.response_tddft {
+        // A stability analysis (`[tddft] stability != "off"` or the top-level
+        // `check_stab != "off"`, run above) is mutually exclusive with the
+        // excitation-energy run: a stability-only deck carries the [tddft]
+        // section for the stability keywords alone.
+        let stability_requested =
+            tddft_ctrl.stability != "off" || scf_data.mol.ctrl.check_stab != "off";
+        if !tddft_ctrl.response_tddft && !stability_requested {
             time_mark.new_item("TDDFT", "the TDDFT eigenvalue calculation");
             time_mark.count_start("TDDFT");
             match crate::ri_tddft::tddft_main(&mut scf_data) {

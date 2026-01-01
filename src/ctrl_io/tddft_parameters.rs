@@ -17,7 +17,10 @@ pub struct TDDFTParameters {
     /// value other than the default `"singlet"` is therefore rejected in an
     /// unrestricted run.
     ///
-    /// `None` means the keyword was not given (restricted default: `"singlet"`).
+    /// `None` means the keyword was not given: for a restricted reference it
+    /// resolves to `"singlet"` (see [`TDDFTParameters::restricted_spin`]); for
+    /// an unrestricted reference the keyword is not applicable at all and ANY
+    /// explicit value is rejected by `tddft_main`.
     pub tddft_spin: Option<String>,
     pub tddft_mode: String,         // "mo" (default; MO-basis RI tensors) or "ao" (AO transition-density kernel)
     pub grid_batch: bool,           // AO mode only: batch the fxc AO evaluation over grid batches (memory-bounded)
@@ -65,6 +68,16 @@ pub struct TDDFTParameters {
     // above this are excluded from the TDDFT excitation space. Default 1e6
     // (effectively no cutoff).
     pub tddft_cutoff_energy: f64,
+    // SCF stability analysis: "off" (default) | "internal" | "external" |
+    // "full" | "auto" (recommended: RHF/RKS internal + external; UHF/UKS
+    // internal, see `ri_tddft::stability`).
+    // internal: RHF/RKS singlet or UHF/UKS orbital Hessian; external:
+    // RHF→UHF (triplet) check. Real→complex and UHF→GHF not implemented.
+    // The top-level `[ctrl] check_stab` keyword takes the same string values
+    // and is used when `stability` is "off".
+    pub stability: String,
+    pub stability_nroots: usize, // Davidson roots for the Hessian (lowest eigenvalues)
+    pub stability_tol: f64,      // Davidson convergence tolerance for the Hessian
     /// If true, export TDDFT results to rest_pysoc_export.json for PySOC.
     /// Requires a restricted reference with `tddft_spin = "both"` (spin-orbit
     /// coupling needs both the singlet and the triplet amplitudes); it is
@@ -134,6 +147,12 @@ impl Default for TDDFTParameters {
             tddft_feast_gaussian_width_factor: 0.5,
             tddft_use_optimized_fxc: true,
             tddft_cutoff_energy: 1.0e6,
+            stability: String::from("off"),
+            stability_nroots: 3,
+            // REST's Davidson converges on ||r|| < sqrt(tol); 1e-8 therefore
+            // matches PySCF's stability check (lib.davidson STAB_TOL = 1e-4 on
+            // the residual norm).
+            stability_tol: 1.0e-8,
             pysoc: false,
             tddft_grad_state: 0,
         }
@@ -352,6 +371,20 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
             p.tddft_cutoff_energy = match tmp_ctrl.get("tddft_cutoff_energy").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e6),
                 _ => 1.0e6,
+            };
+            // SCF stability analysis
+            p.stability = match tmp_ctrl.get("stability").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase(),
+                serde_json::Value::Bool(true) => String::from("internal"),
+                _ => String::from("off"),
+            };
+            p.stability_nroots = match tmp_ctrl.get("stability_nroots").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(3) as usize,
+                _ => 3,
+            };
+            p.stability_tol = match tmp_ctrl.get("stability_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-8),
+                _ => 1.0e-8,
             };
             p.pysoc = match tmp_ctrl.get("pysoc").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(b) => *b,
