@@ -112,7 +112,10 @@ impl ScfTraceRecord {
         // update later. Restricted to the plain "diis" mixer and to the default
         // start cycle so that the EDIIS/ADIIS paths and explicit
         // start_diis_cycle settings keep their existing history semantics.
-        if tmp_records.mixer.eq(&"diis") && scf.mol.ctrl.start_diis_cycle <= 1 {
+        if tmp_records.mixer.eq(&"diis")
+            && scf.mol.ctrl.start_diis_cycle <= 1
+            && scf.mol.ctrl.force_state_occupation.is_empty()
+        {
             let mut dm_for_err = [tmp_records.density_matrix[0].clone(),
                                   tmp_records.density_matrix[1].clone()];
             let (guess_err, guess_target) = generate_diis_error_vector(
