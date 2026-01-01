@@ -632,7 +632,9 @@ impl EvgwDiis {
 /// (and, as in MolGW's `GnWn`, the screened interaction) is rebuilt from the
 /// current quasiparticle energies.  The plain fixed-point iteration
 ///
+/// ```text
 ///     E^(k+1) = F(E^(k)),
+/// ```
 ///
 /// where `F` is the map defined by one GW pass, is **not** a contraction for
 /// typical molecules: the Jacobian of `F` has eigenvalues that approach (and
@@ -844,8 +846,10 @@ const Z_UPDATE_DERIVATIVE_H: f64 = 1.0e-5;
 /// step per GW pass (`find_qp_energy_linearization` in
 /// `m_selfenergy_tools.f90`):
 ///
-///     E_out = E_in + Z * (E_KS - V_xc + Sigma_c(E_in) - E_in),
-///     Z     = 1 / (1 - dSigma_c/domega),   clamped to [0, 1].
+/// ```text
+/// E_out = E_in + Z * (E_KS - V_xc + Sigma_c(E_in) - E_in),
+/// Z     = 1 / (1 - dSigma_c/domega),   clamped to [0, 1].
+/// ```
 ///
 /// `qp_eq(omega)` here is `consts + Sigma_c(omega) - omega`, so
 /// `E_out = E_in + Z * qp_eq(E_in)` and `d(qp_eq)/domega = Sigma_c' - 1`,

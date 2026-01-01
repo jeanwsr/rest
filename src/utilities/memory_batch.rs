@@ -97,7 +97,7 @@ pub fn calc_batch_size<T>(
 /// # Example
 ///
 /// ```rust
-/// # use pyrest::grad::rhf::blocksize_partition;
+/// # use pyrest::utilities::memory_batch::blocksize_partition;
 /// let indices = [1, 3, 6, 7, 10, 15, 16, 19];
 /// let partitions = blocksize_partition(&indices, 4);
 /// // A info of `[WARN] Batch size is too small: 15 - 10 > 4` will be printed.
@@ -211,7 +211,7 @@ impl MemEstimate {
 ///     fixed: 500_000,
 ///     thread: 100_000,
 /// };
-/// let batch_size = pool.install(|| calc_batch_size_from_mem_estimate::<f64>(&mem_est, Some(500.0), Some(0.8)));
+/// let batch_size = pool.install(|| calc_batch_size_from_mem_estimate::<f64>(&mem_est, Some(500.0), Some(0.8), false));
 /// println!("Calculated batch size: {}", batch_size);
 /// assert_eq!(batch_size, 256);
 /// ```

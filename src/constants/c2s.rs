@@ -252,6 +252,7 @@ pub const C2S_L5: C2S = C2S::L5(DMatrix21x11 {
 // H. BERNHARD SCHLEGEL, MLCHAEL J. FRISCH, Transformation Between Cartesian and Pure Spherical Hamonic Gaussians
 // International Journal of Quantum Chemistry, Volume 54, 83-87 (1995)
 /**
+```python
 import sympy as sp
 from sympy import factorial, sqrt, binomial, re, im
 
@@ -331,6 +332,7 @@ def test_all(l):
 
 test_all(6)
  
+```
  **/
 pub const C2S_L6: C2S = C2S::L6(DMatrix28x13 {
     size: [28,13],

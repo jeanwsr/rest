@@ -92,6 +92,7 @@ pub(crate) fn compute_j_upper(
     scf: &SCF,
     dm_vec: &Vec<MatrixFull<f64>>,
 ) -> MatrixUpper<f64> {
+    crate::ri_jk::require_unpruned_rimatr(&scf.rimatr_pair_map, "the response J kernel (compute_j_upper)");
     if let Some(ref _rimatr) = scf.rimatr {
         let vj = crate::scf_io::vj_upper_with_rimatr_sync(&scf.rimatr, dm_vec, 1, 1.0);
         if vj[0].size > 1 { return vj[0].clone(); }
@@ -108,6 +109,7 @@ pub(crate) fn compute_k_upper(
     scf: &SCF,
     dm_vec: &Vec<MatrixFull<f64>>,
 ) -> MatrixUpper<f64> {
+    crate::ri_jk::require_unpruned_rimatr(&scf.rimatr_pair_map, "the response K kernel (compute_k_upper)");
     if let Some(ref _rimatr) = scf.rimatr {
         let vk = crate::scf_io::vk_upper_with_rimatr_use_dm_only_sync(&scf.rimatr, dm_vec, 1, 1.0);
         if vk[0].size > 1 { return vk[0].clone(); }
@@ -701,6 +703,12 @@ impl KLowRankPrecompute {
         }
         let src: Src<'_>;
         let naux;
+        if scf.rimatr.is_some() {
+            crate::ri_jk::require_unpruned_rimatr(
+                &scf.rimatr_pair_map,
+                "the low-rank K precompute (KLowRankPrecompute::new)",
+            );
+        }
         if let Some((ri, _, _)) = &scf.rimatr {
             naux = ri.size[1];
             src = Src::Rim(ri, ri.size[0]);
@@ -1053,6 +1061,10 @@ pub fn vj_upper_rimatr_batched(
     scf: &SCF,
     dms: &[MatrixFull<f64>],
 ) -> Vec<MatrixFull<f64>> {
+    crate::ri_jk::require_unpruned_rimatr(
+        &scf.rimatr_pair_map,
+        "the batched response J kernel (vj_upper_rimatr_batched)",
+    );
     let n_rhs = dms.len();
     let nao = dms[0].size[0];
     let (ri3fn, _, baspar2basbas) = scf.rimatr.as_ref().unwrap();
