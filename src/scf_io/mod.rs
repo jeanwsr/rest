@@ -2341,6 +2341,11 @@ impl SCF {
             };
         }
         let dt3 = time::Local::now();
+        if std::env::var("REST_XC_TIME").is_ok() {
+            let j_s = (dt2.timestamp_millis() - dt1.timestamp_millis()) as f64 / 1000.0;
+            let k_s = (dt3.timestamp_millis() - dt2.timestamp_millis()) as f64 / 1000.0;
+            println!("[jk-time] J {:.3}s | K {:.3}s (wall per iteration)", j_s, k_s);
+        }
         if self.mol.dfadef.is_dfa_scf() {
             let (exc,vxc) = self.generate_vxc(1.0);
             //println!("{:?}",vxc[0].data);
@@ -2384,13 +2389,31 @@ impl SCF {
         let mut vxc_total = 0.0;
         let mut vk_total = 0.0;
 
+        let t_entry = time::Local::now();
+
         for i_spin in (0..spin_channel) {
             self.hamiltonian[i_spin] = self.h_core.clone();
         }
 
         // Coulomb J
         let dt1 = time::Local::now();
-        let vj = if self.mol.ctrl.isdf_new {
+        // UKS in-core RI: J is linear in the density, so one contraction of the summed
+        // density replaces two (the callers add every vj[..] to every spin channel).
+        let j_from_summed_density = spin_channel == 2
+            && !self.mol.ctrl.isdf_new
+            && !self.mol.ctrl.incremental_fock
+            && matches!(self.algorithm_jk,
+                AlgorithmJK::RIIncore | AlgorithmJK::Separated(AlgorithmJ::RIIncore, _));
+        let vj = if j_from_summed_density {
+            let mut dm_sum = self.density_matrix[0].clone();
+            dm_sum.data.par_iter_mut()
+                .zip(self.density_matrix[1].data.par_iter())
+                .for_each(|(a, b)| *a += *b);
+            let vj_one = self.generate_vj_with_ri_v_sync_dm(1.0, mpi_operator, &vec![dm_sum]);
+            let mut out = vec![MatrixUpper::new(1, 0.0_f64), MatrixUpper::new(1, 0.0_f64)];
+            out[0] = vj_one[0].clone();
+            out
+        } else if self.mol.ctrl.isdf_new {
             self.generate_vj_ri_direct(None)
         } else {
             match self.algorithm_jk {
@@ -2504,6 +2527,11 @@ impl SCF {
             }
         }
         let dt3 = time::Local::now();
+        if std::env::var("REST_XC_TIME").is_ok() {
+            let j_s = (dt2.timestamp_millis() - dt1.timestamp_millis()) as f64 / 1000.0;
+            let k_s = (dt3.timestamp_millis() - dt2.timestamp_millis()) as f64 / 1000.0;
+            println!("[jk-time] J {:.3}s | K {:.3}s (wall per iteration)", j_s, k_s);
+        }
         if self.mol.dfadef.is_dfa_scf() {
             //let (exc,vxc) = self.generate_vxc_rayon_dm_only(1.0);
             let (_, exc,vxc) = if self.mol.ctrl.use_dm_only {
@@ -2513,13 +2541,20 @@ impl SCF {
             };
             //let (exc,vxc) = self.generate_vxc(1.0);
             let _ = utilities::timing(&dt3, Some("evaluate vxc total"));
-            if let Some((t_den, t_elem, t_gemm, t_scat, t_call)) = crate::dft::xc_timing::report_and_reset() {
+            if std::env::var("REST_XC_TIME").is_ok() {
+                let dt4 = time::Local::now();
+                let vxc_wall = (dt4.timestamp_millis() - dt3.timestamp_millis()) as f64 / 1000.0;
+                println!("[vxc-wall] {:.3}s (wall per iteration)", vxc_wall);
+                let ms = |x: &chrono::DateTime<chrono::Local>, y: &chrono::DateTime<chrono::Local>| (y.timestamp_millis() - x.timestamp_millis()) as f64 / 1000.0;
+                println!("[hf-span] pre {:.3}s | j {:.3}s | k {:.3}s | vxc {:.3}s", ms(&t_entry, &dt1), ms(&dt1, &dt2), ms(&dt2, &dt3), ms(&dt3, &dt4));
+            }
+            if let Some((t_den, t_elem, t_gemm, t_scat, t_call, t_wmo, t_tmo, t_rhod, t_rhopg, t_rhopd, t_sig, t_libxc)) = crate::dft::xc_timing::report_and_reset() {
                 let skip_info = match crate::dft::batch_rho_cache::take_stats() {
                     Some((s, t)) => format!(" | batch-skip {}/{} ({:.1}%)", s, t, 100.0 * s as f64 / t as f64),
                     None => String::new(),
                 };
-                println!("[xc-time] density {:.3}s | elem {:.3}s | gemm {:.3}s | scatter {:.3}s | contract_total {:.3}s{} (thread-seconds, divide by chunk count for wall)",
-                    t_den, t_elem, t_gemm, t_scat, t_call, skip_info);
+                println!("[xc-time] density {:.3}s | elem {:.3}s | gemm {:.3}s | scatter {:.3}s | contract_total {:.3}s | den_wmo {:.3}s | den_tmo {:.3}s | den_rho {:.3}s | den_rhopg {:.3}s | den_rhopd {:.3}s | sigma {:.3}s | libxc {:.3}s{} (thread-seconds, divide by chunk count for wall)",
+                    t_den, t_elem, t_gemm, t_scat, t_call, t_wmo, t_tmo, t_rhod, t_rhopg, t_rhopd, t_sig, t_libxc, skip_info);
             }
             for i_spin in (0..spin_channel) {
                 self.hamiltonian[i_spin].data
@@ -3126,18 +3161,21 @@ impl SCF {
     /// E0 = 1/2*\sum_{i}\sum_{j}a_{ij}*b_{ij}
     /// einsum('ij,ij')
     pub fn par_energy_contraction(a:&MatrixUpper<f64>, b:&MatrixUpper<f64>) -> f64 {
-        let (sender, receiver) = channel();
-        a.data.par_iter().zip(b.data.par_iter()).for_each_with(sender, |s,(dm,hc)| {
-            let mut tmp_scf_energy = 0.0_f64;
-            tmp_scf_energy += dm*(hc);
-            s.send(tmp_scf_energy).unwrap();
-        });
-        let mut tmp_energy = 2.0_f64 * receiver.into_iter().sum::<f64>();
+        // A per-element channel send here cost ~170 ns per entry (1.55M entries
+        // per call, five calls per SCF iteration): ~1.3 s of pure messaging per
+        // iteration. A plain parallel reduction is a few hundred microseconds.
+        let tmp_energy = 2.0_f64
+            * a.data.par_iter()
+                .zip(b.data.par_iter())
+                .map(|(dm, hc)| dm * hc)
+                .sum::<f64>();
         let a_diag = a.get_diagonal_terms().unwrap();
         let b_diag = b.get_diagonal_terms().unwrap();
-        let double_count = a_diag.par_iter().zip(b_diag.par_iter()).fold(|| 0.0_f64,|acc,(a,b)| {
-            acc + *a*(*b)
-        }).sum::<f64>();
+        let double_count = a_diag
+            .par_iter()
+            .zip(b_diag.par_iter())
+            .map(|(a, b)| *a * *b)
+            .sum::<f64>();
 
         (tmp_energy - double_count) * 0.5
     }
@@ -3208,7 +3246,11 @@ impl SCF {
         }
 
         let num_state_before = self.mol.num_state;
+        let t_eigh = std::time::Instant::now();
         (self.eigenvectors, self.eigenvalues, self.mol.num_state) = diagonalize_hamiltonian_outside(&self, mpi_operator);
+        if std::env::var("REST_XC_TIME").is_ok() {
+            eprintln!("[diag-split] eigh {:.3}s", t_eigh.elapsed().as_secs_f64());
+        }
 
         if self.mol.num_state < num_state_before {
             info!("The overlap matrix has {} linearly dependent direction(s): {} of {} basis functions carry an orbital.",
@@ -3380,6 +3422,24 @@ impl SCF {
             //}else{
                 vj_upper_with_ri_v_sync(&self.ri3fn, dm, spin_channel, scaling_factor)
             //}
+        }
+    }
+
+    /// Coulomb J built from an explicit density list (see `generate_vj_with_ri_v_sync`).
+    /// Passing one summed density halves the rimatr streaming traffic of the UKS J build.
+    pub fn generate_vj_with_ri_v_sync_dm(&mut self, scaling_factor: f64, mpi_operator: &Option<MPIOperator>, dm: &Vec<MatrixFull<f64>>) -> Vec<MatrixUpper<f64>> {
+        let spin_channel = dm.len();
+        let pair_screen_threshold = self.kernel_pair_screen_threshold();
+        if self.mol.ctrl.use_ri_symm {
+            if self.rimatr_pair_map.is_some() {
+                vj_upper_with_rimatr_screened_mpi(
+                    &self.rimatr, &self.rimatr_pair_map, dm,
+                    spin_channel, scaling_factor, pair_screen_threshold, mpi_operator)
+            } else {
+                vj_upper_with_rimatr_sync_mpi(&self.rimatr, dm, spin_channel, scaling_factor, mpi_operator)
+            }
+        } else {
+            vj_upper_with_ri_v_sync(&self.ri3fn, dm, spin_channel, scaling_factor)
         }
     }
 
@@ -3559,7 +3619,41 @@ impl SCF {
         let occ = &self.occupation;
         if let Some(grids) = &self.grids {
             let (sender, receiver) = channel();
-            grids.parallel_balancing.par_iter().for_each_with(sender,|s,range_grids| {
+            // Dynamic scheduling prototype: split the grid into ~multiples of the thread
+            // count at batch granularity, ordered by descending estimated cost, and let
+            // rayon's work stealing balance them. Static `parallel_balancing` gives each
+            // thread one contiguous range whose cost varies with the batch AO-union size.
+            let xc_work: Vec<std::ops::Range<usize>> = if std::env::var("REST_XC_DYNSCHED").is_ok() {
+                let n_total = grids.parallel_balancing.last().map(|r| r.end).unwrap_or(0);
+                let blk = grids.ao_compressed.as_ref().map(|a| a.blksize).unwrap_or(256);
+                let nb = (n_total + blk - 1) / blk.max(1);
+                let nt = default_omp_num_threads;
+                let mult: usize = std::env::var("REST_XC_DYNSCHED_MULT").ok()
+                    .and_then(|v| v.parse().ok()).filter(|&m| m > 0).unwrap_or(2);
+                let nchunk = (nt * mult).min(nb).max(1);
+                let per = (nb + nchunk - 1) / nchunk;
+                let mut chunks: Vec<(f64, usize, usize)> = Vec::new();
+                let mut c = 0usize;
+                while c < nb {
+                    let e = (c + per).min(nb);
+                    let mut w = 0.0f64;
+                    for ib in c..e {
+                        let nact = grids.ao_compressed.as_ref()
+                            .and_then(|a| a.batch_ao_map.get(ib))
+                            .map(|m| m.len()).unwrap_or(blk) as f64;
+                        w += nact + nact * nact / 1000.0;
+                    }
+                    chunks.push((w, c, e));
+                    c = e;
+                }
+                chunks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                chunks.iter().map(|&(_w, c0, e0)| {
+                    (c0 * blk)..((e0 * blk).min(n_total))
+                }).collect()
+            } else {
+                grids.parallel_balancing.clone()
+            };
+            xc_work.par_iter().for_each_with(sender,|s,range_grids| {
                 omp_set_num_threads_wrapper(1);
                 // change the return of xc_exc_vxc, directly return vxc_mat [num_basis, num_basis]
                 //exc_spin = exc;
@@ -3764,6 +3858,7 @@ impl SCF {
         let mo = &self.eigenvectors;
         let occ = &self.occupation;
         if let Some(grids) = &self.grids {
+            let _t_par = std::time::Instant::now();
             let (sender, receiver) = channel();
             grids.parallel_balancing.par_iter().for_each_with(sender,|s,range_grids| {
 
@@ -3794,10 +3889,13 @@ impl SCF {
                 // }
                 s.send((vxc_mf,exc,total_elec)).unwrap()
             });
+            let _t_red = std::time::Instant::now();
+            let _par_elapsed = _t_par.elapsed().as_secs_f64();
             receiver.into_iter().for_each(|(vxc_mf_local,exc_local,loc_total_elec)| {
                 vxc_mf.iter_mut().zip(vxc_mf_local.iter()).for_each(|(to_matr,from_matr)| {
                     to_matr.self_add(from_matr);
                 });
+                crate::dft::VXC_BUF_POOL.lock().unwrap().push(vxc_mf_local);
                 exc_spin.iter_mut().zip(exc_local.iter()).for_each(|(to_exc,from_exc)| {
                     *to_exc += from_exc
                 });
@@ -3805,7 +3903,10 @@ impl SCF {
                     *to_elec += from_elec
 
                 })
-            })
+            });
+            if std::env::var("REST_XC_TIME").is_ok() {
+                eprintln!("[vxc-split] par {:.3}s | reduce {:.3}s", _par_elapsed, _t_red.elapsed().as_secs_f64());
+            }
         }
 
         //if self.mol.ctrl.print_level>1 {
@@ -6471,6 +6572,7 @@ pub fn generate_occupation_outside(scf_data: &mut SCF) -> ([Vec<f64>;2], [usize;
 }
 
 pub fn generate_density_matrix_outside(scf_data: &SCF) -> Vec<MatrixFull<f64>>{
+    let t_dm = std::time::Instant::now();
 
     // let num_basis = scf_data.mol.num_basis;
     // let num_state = scf_data.mol.num_state;
@@ -6518,6 +6620,9 @@ pub fn generate_density_matrix_outside(scf_data: &SCF) -> Vec<MatrixFull<f64>>{
     });
     //if let SCFType::ROHF = scf_data.scftype {dm[1]=dm[0].clone()};
     //scf_data.density_matrix = dm;
+    if std::env::var("REST_XC_TIME").is_ok() {
+        eprintln!("[diag-split] dm {:.3}s", t_dm.elapsed().as_secs_f64());
+    }
 
     dm
 
@@ -6573,6 +6678,21 @@ pub fn initialize_scf(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
     time_mark.new_item("InitGuess", "Prepare initial guess");
     time_mark.count_start("InitGuess");
     initial_guess(scf_data, mpi_operator);
+
+    // Density-weighted row pruning (`ctrl.xc_dm_mask`): drop stored AO rows whose
+    // density-weighted magnitude is negligible.  Runs once per initialization,
+    // right after D exists.
+    let dm_mask_tau = scf_data.mol.ctrl.xc_dm_mask;
+    if dm_mask_tau > 0.0 {
+        let tau = dm_mask_tau;
+        if let Some(grids) = &mut scf_data.grids {
+            let dropped = grids.apply_density_row_mask(&scf_data.density_matrix, tau);
+            if scf_data.mol.ctrl.print_level > 0 {
+                println!(" [dm-mask] tau={:.0e}: dropped {} stored AO rows", tau, dropped);
+            }
+        }
+    }
+
     if ! scf_data.mol.ctrl.atom_sad && scf_data.mol.ctrl.print_level>2 {
         println!("Initial density matrix by Atom SAD:");
         scf_data.density_matrix[0].formated_output(5, "full");

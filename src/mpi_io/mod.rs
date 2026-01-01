@@ -666,7 +666,6 @@ where
             if rank == j || rank == i {
                 let tmp_range = distribution[i].start*scale_vec[j] .. distribution[i].end*scale_vec[j];
                 let by_batch = communicate_by_batch(tmp_range.len());
-                println!("debug ij: {} {}, by_batch_len: {}", i, j, &by_batch.len());
                 by_batch.iter().enumerate().for_each(|(k,loc_batch)| {
                     mpi::request::scope(|scope| {
                         let sreq = if rank == j {

@@ -543,6 +543,17 @@ pub struct InputKeywords {
     pub grid_prune_compact: bool,
     #[pyo3(get, set)]
     pub ao_cutoff: f64,
+    /// Order in which the grid points are laid out before the AO tables are built.
+    /// `"kd"` (default) sorts them by recursive spatial bisection so that each
+    /// compressed batch covers a compact region and its AO union stays small;
+    /// `"round_robin"` keeps the legacy thread-interleaved order.
+    #[pyo3(get, set)]
+    pub grid_order: String,
+    /// Drop stored AO/AOP rows whose density-weighted magnitude
+    /// `max|phi| * sqrt(D_mu_mu)` is below this value, once after the initial guess
+    /// (`dm_mask`, default 3e-6; 0 disables the pruning). See README.
+    #[pyo3(get, set)]
+    pub xc_dm_mask: f64,
     #[pyo3(get, set)]
     pub non0tab_blksize: usize,
     #[pyo3(get, set)]
@@ -907,7 +918,9 @@ impl InputKeywords {
             vxc_screen_threshold: 0.0, // 0.0 = 关闭格点密度筛选（见 README）
             grid_prune_threshold: 0.0,  // 0.0 = 不剪枝（见 README）
             grid_prune_compact: true,   // true = 就地压缩（省时间、多一份表的峰值内存）
-            ao_cutoff: 1.0e-9,
+            ao_cutoff: 1.0e-8,
+            grid_order: String::from("kd"),
+            xc_dm_mask: 5.0e-7,
             non0tab_blksize: 0,     // 0 = auto-select based on nao
             drop_dense_ao: false,
             algorithm_jk: AlgorithmJK::Default,
@@ -2081,9 +2094,18 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 _ => true,
             };
             tmp_input.ao_cutoff = match tmp_ctrl.get("ao_cutoff").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-9),
-                serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-9),
-                _ => 1.0e-9,
+                serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-8),
+                serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-8),
+                _ => 1.0e-8,
+            };
+            tmp_input.grid_order = match tmp_ctrl.get("grid_order").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase(),
+                _ => String::from("kd"),
+            };
+            tmp_input.xc_dm_mask = match tmp_ctrl.get("xc_dm_mask").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(num) => num.as_f64().unwrap_or(tmp_input.xc_dm_mask),
+                serde_json::Value::String(s) => s.parse().unwrap_or(tmp_input.xc_dm_mask),
+                _ => tmp_input.xc_dm_mask,
             };
             tmp_input.non0tab_blksize = match tmp_ctrl.get("non0tab_blksize").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(num) => num.as_u64().map(|v| v as usize).unwrap_or(0),
