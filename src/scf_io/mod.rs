@@ -5974,6 +5974,21 @@ pub fn diagonalize_hamiltonian_outside_rayon(scf_data: &SCF) -> ([MatrixFull<f64
 }
 
 pub fn semi_diagonalize_hamiltonian_outside(scf_data: &SCF) -> (Option<[MatrixFull<f64>; 2]>, Option<[Vec<f64>; 2]>, Option<[MatrixFull<f64>; 2]>, usize) {
+    // The Knowles d/s/v blocks below are `lumo`-based ranges, i.e. they assume
+    // that the occupied orbitals of each spin channel are exactly
+    // `0..lumo[spin]`. That holds for an Aufbau occupation but not for a
+    // non-Aufbau one (e.g. a MOM hole below the HOMO, where an occupied
+    // orbital sits *above* `lumo`): one of the diagonalization blocks would
+    // then contain both occupied and virtual orbitals, and rotating inside it
+    // would change the reference determinant rather than just the basis.
+    // Fall back to the occupation-based scheme in that case.
+    if !occupation_is_index_contiguous(scf_data) {
+        if scf_data.mol.ctrl.print_level > 0 {
+            println!("ROHF semi-canonicalization: non-Aufbau occupation detected; using the occupation-based per-spin scheme (the Knowles d/s/v ranges are not valid here)");
+        }
+        return semi_diagonalize_from_occupation(scf_data);
+    }
+
     // get the semi-canonical orbitals for RO-xDH calculations
     // See Knowles et al., Chem. Phys. Lett. 186(2), 130–136 (1991)
     let num_state = scf_data.mol.num_state;
@@ -6027,6 +6042,126 @@ pub fn semi_diagonalize_hamiltonian_outside(scf_data: &SCF) -> (Option<[MatrixFu
     }
     
     (Some(semi_eigenvectors), Some(semi_eigenvalues), Some(semi_fock), num_state)
+}
+
+/// Occupation-based semi-canonicalization (generalization of the Knowles
+/// d/s/v scheme to an arbitrary occupation pattern).
+///
+/// Each spin channel is semi-canonicalized independently with its own
+/// determinantal Fock:
+///
+/// ```text
+/// F^alpha: alpha-occ = {p : occ[alpha][p] > 0}, alpha-vir = the rest
+/// F^beta : beta-occ  = {p : occ[beta ][p] > 0}, beta-vir  = the rest
+/// ```
+///
+/// The occupied/virtual masks are taken from the per-spin occupation
+/// vectors (NOT from homo/lumo ranges). That is required whenever the
+/// occupation is non-Aufbau, e.g.
+///   * the OSS beta channel (hole at `a` below the beta HOMO `b`), and
+///   * a high-spin ROHF run with `force_state_occupation` (hole below the HOMO).
+/// A range-based block would mix occupied and virtual orbitals inside one
+/// diagonalization, which changes the reference determinant instead of just
+/// the one-electron basis.
+///
+/// The two spin channels therefore generally do NOT share the same
+/// semi-canonical orbital set: `semi_eigenvectors[0] !=
+/// semi_eigenvectors[1]`. The returned semi-eigenvalues are taken as the
+/// diagonal of the full `C_semi^T F^sigma C_semi` in global MO index
+/// order; they are not assembled by concatenating occ/vir block energies.
+/// The columns are scattered back into the original global MO order, so the
+/// per-spin occupation vectors stay valid index by index.
+fn semi_diagonalize_from_occupation(scf_data: &SCF) -> (Option<[MatrixFull<f64>; 2]>, Option<[Vec<f64>; 2]>, Option<[MatrixFull<f64>; 2]>, usize) {
+    let nrow = scf_data.eigenvectors[0].size[0];
+    let ncol = scf_data.eigenvectors[0].size[1];
+
+    let fock = [
+        scf_data.hamiltonian[0].to_matrixfull().unwrap(),
+        scf_data.hamiltonian[1].to_matrixfull().unwrap(),
+    ];
+
+    const OCC_THRESHOLD: f64 = 1.0e-6;
+
+    // Per-spin occupied / virtual indices.  Never use `0..homo` or
+    // `lumo..num_state` here: for the OSS mixed determinant the beta
+    // channel has a hole below its HOMO, so those ranges do not match the
+    // actual beta occupied / virtual subspaces.
+    let mut occ_idx: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+    let mut vir_idx: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+    for i in 0..ncol {
+        for i_spin in 0..2 {
+            if scf_data.occupation[i_spin][i] > OCC_THRESHOLD {
+                occ_idx[i_spin].push(i);
+            } else {
+                vir_idx[i_spin].push(i);
+            }
+        }
+    }
+
+    // Start from the shared restricted MOs and rotate each spin subspace
+    // independently.  The output matrices remain in the original global
+    // MO column order.
+    let mut semi_eigenvectors = [
+        scf_data.eigenvectors[0].clone(),
+        scf_data.eigenvectors[0].clone(),
+    ];
+
+    for i_spin in 0..2 {
+        for idx_set in [&occ_idx[i_spin], &vir_idx[i_spin]] {
+            let n_sub = idx_set.len();
+            if n_sub == 0 {
+                continue;
+            }
+
+            // Gather the subspace columns of the current restricted MOs.
+            let mut c = MatrixFull::new([nrow, n_sub], 0.0);
+            for (k, &col) in idx_set.iter().enumerate() {
+                for i in 0..nrow {
+                    c.data[i + k * nrow] = scf_data.eigenvectors[0].data[i + col * nrow];
+                }
+            }
+
+            // F_sub = C_sub^T F^sigma C_sub
+            let fock_block = apply_projection_operator(&c, &fock[i_spin], &c);
+            let (eigvecs, _eigvals, _) = _dsyevd(&fock_block, 'V');
+            let eigvecs = eigvecs.unwrap();
+
+            // Scatter C_sub * U back into the same global MO columns.
+            for (j, &col) in idx_set.iter().enumerate() {
+                for i in 0..nrow {
+                    let mut v = 0.0;
+                    for k in 0..n_sub {
+                        v += c.data[i + k * nrow] * eigvecs.data[k + j * n_sub];
+                    }
+                    semi_eigenvectors[i_spin].data[i + col * nrow] = v;
+                }
+            }
+        }
+    }
+
+    // Full semi-canonical Fock and eigenvalues in global index order.
+    let mut semi_fock = [
+        MatrixFull::new([ncol, ncol], 0.0),
+        MatrixFull::new([ncol, ncol], 0.0),
+    ];
+    let mut semi_eigenvalues = [Vec::new(), Vec::new()];
+
+    for i_spin in 0..2 {
+        let fock_tmp = apply_projection_operator(&semi_eigenvectors[i_spin], &fock[i_spin], &semi_eigenvectors[i_spin]);
+        let diag_terms: Vec<f64> = fock_tmp.get_diagonal_terms().unwrap().into_iter().map(|&x| x).collect();
+        semi_fock[i_spin] = fock_tmp;
+        semi_eigenvalues[i_spin] = diag_terms;
+    }
+
+    (Some(semi_eigenvectors), Some(semi_eigenvalues), Some(semi_fock), ncol)
+}
+
+fn occupation_is_index_contiguous(scf_data: &SCF) -> bool {
+    (0..scf_data.mol.spin_channel.min(2)).all(|i_spin| {
+        let occ = &scf_data.occupation[i_spin];
+        let nocc = occ.iter().filter(|&&o| o > 0.5).count();
+        occ[..nocc].iter().all(|&o| o > 0.5) && occ[nocc..].iter().all(|&o| o <= 0.5)
+    })
 }
 
 pub fn generate_occupation_outside(scf_data: &SCF) -> ([Vec<f64>;2], [usize;2], [usize;2]) {
