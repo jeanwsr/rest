@@ -1,0 +1,192 @@
+name: Sync from Gitee PR to GitHub
+
+on:
+  # Scheduled trigger: check every 30 minutes
+  schedule:
+    - cron: '11,41 * * * *'
+    #- cron: '11,41 3-14 * * *'
+    #- cron: '11 0-2,15-23 * * *'
+  # Manual trigger for debugging
+  workflow_dispatch:
+
+# Prevent scheduled runs from overlapping with manual dispatches
+concurrency:
+  group: gitee-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # Job-level timeout so a stuck run cannot hang forever
+    timeout-minutes: 10
+
+    steps:
+      # 1. Check out the GitHub repository
+      - name: Checkout GitHub repository
+        uses: actions/checkout@v4
+        with:
+          # Use a PAT so pushes trigger other workflows (GITHUB_TOKEN pushes do not)
+          # checkout persists the PAT in the local git config; later `git push origin` just works
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+
+      # 2. Gitee SSH key: Gitee's HTTP rate limiting (429) for GitHub runner IPs
+      #    does not affect the SSH transport
+      - name: Set up Gitee SSH
+        env:
+          GITEE_SSH_PRIVATE_KEY: ${{ secrets.GITEE_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "$GITEE_SSH_PRIVATE_KEY" > ~/.ssh/gitee_key
+          chmod 600 ~/.ssh/gitee_key
+          ssh-keyscan -t ed25519,rsa gitee.com >> ~/.ssh/known_hosts 2>/dev/null
+          printf 'Host gitee.com\n  IdentityFile ~/.ssh/gitee_key\n  IdentitiesOnly yes\n' >> ~/.ssh/config
+
+      # 3. Sync: mirror master + two branches per open PR
+      #    sync/pr-<n>        = pure mirror of the PR head (CI tests the PR itself)
+      #    sync/pr-<n>-merged = merge preview against base (CI tests the merged result)
+      - name: Sync
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}  # format: "owner/repo"
+        run: |
+          set -euo pipefail
+
+          # git fetch goes over the SSH channel (bypasses HTTP 429 throttling);
+          # GITEE_TOKEN is only used for the REST API query
+          GITEE_URL="git@gitee.com:${GITEE_REPO}.git"
+          PRS_FILE="${RUNNER_TEMP}/open_prs.jsonl"
+          : > "$PRS_FILE"
+
+          # fetch_retry: retries only transient errors (network flakiness / throttling);
+          # permanent errors (branch or repo missing, unauthorized SSH key) return immediately.
+          fetch_retry() {
+            local url="$1"; shift
+            local attempt err
+            for attempt in 1 2 3; do
+              if err=$(git fetch "$url" "$@" 2>&1); then
+                [ -n "$err" ] && printf '%s\n' "$err"
+                return 0
+              fi
+              printf '%s\n' "$err" >&2
+              if ! grep -Eq 'RPC failed|HTTP 429|HTTP 5[0-9][0-9]|curl (18|22|28|35|56)|timed out|Connection reset|Connection closed by|kex_exchange_identification|Could not resolve|expected flush' <<<"$err"; then
+                return 1
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "::warning::git fetch hit a transient error, retry ${attempt}/2 in $((attempt * ${RETRY_SLEEP_SEC:-15}))s"
+                sleep $((attempt * ${RETRY_SLEEP_SEC:-15}))
+              fi
+            done
+            return 1
+          }
+
+          # ---------- 1. Query all open Gitee PRs (paginated, response validated) ----------
+          page=1
+          while :; do
+            resp=$(curl -fsS --retry 3 --retry-delay 10 -H "Authorization: token ${GITEE_TOKEN}" \
+              "https://gitee.com/api/v5/repos/${GITEE_REPO}/pulls?state=open&per_page=100&page=${page}") \
+              || { echo "::error::Gitee API request failed (page ${page})"; exit 1; }
+            jq -e 'type == "array"' <<<"$resp" >/dev/null \
+              || { echo "::error::Unexpected Gitee API response (page ${page})"; exit 1; }
+            count=$(jq 'length' <<<"$resp")
+            [ "$count" -eq 0 ] && break
+            # Skip draft PRs; one TSV row per PR: number / head.ref / head.repo.full_name (may be empty) / base.ref
+            jq -r '.[] | select((.draft // false) | not) | [.number, .head.ref, (.head.repo.full_name // ""), .base.ref] | @tsv' <<<"$resp" >> "$PRS_FILE"
+            [ "$count" -lt 100 ] && break
+            page=$((page + 1))
+          done
+          total=$(wc -l < "$PRS_FILE")
+          echo "Found ${total} open PR(s)"
+
+          # ---------- 2. Mirror master (force-consistent; self-heals accidental GitHub-side commits) ----------
+          fetch_retry "$GITEE_URL" +refs/heads/master:refs/remotes/gitee/master \
+            || { echo "::error::cannot fetch master from Gitee (retries exhausted)"; exit 1; }
+          git fetch origin +refs/heads/master:refs/remotes/origin/master || true
+          gitee_master=$(git rev-parse refs/remotes/gitee/master)
+          github_master=$(git rev-parse --verify -q refs/remotes/origin/master || true)
+          if [ "$gitee_master" != "$github_master" ]; then
+            echo "Mirroring master to GitHub (${github_master:-absent} -> ${gitee_master})"
+            git push origin +refs/remotes/gitee/master:refs/heads/master
+          fi
+
+          # Fetch all existing sync branches from GitHub once, for the "skip push when unchanged" comparison
+          git fetch origin '+refs/heads/sync/pr-*:refs/remotes/origin/sync/pr-*' || true
+
+          # ---------- 3. Sync PR by PR ----------
+          conflicted=()
+          declare -A fetched_base=()
+
+          while IFS=$'\t' read -r pr_number head_ref head_repo base_ref; do
+            echo "=== PR #${pr_number}: ${head_ref} -> ${base_ref} ==="
+
+            # 3.1 Fetch the PR head (fork PRs are fetched from the fork repository)
+            if [ -n "$head_repo" ] && [ "$head_repo" != "$GITEE_REPO" ]; then
+              head_url="git@gitee.com:${head_repo}.git"
+            else
+              head_url="$GITEE_URL"
+            fi
+            head_ref_name="refs/remotes/pr-${pr_number}-head"
+            if ! fetch_retry "$head_url" "+refs/heads/${head_ref}:${head_ref_name}"; then
+              echo "::warning::PR #${pr_number}: cannot fetch head '${head_ref}' (fork deleted? PR just closed? SSH key unauthorized?) - skipped"
+              continue
+            fi
+            head_sha=$(git rev-parse "$head_ref_name")
+
+            # 3.2 Head mirror: sync/pr-<n>
+            head_branch="sync/pr-${pr_number}"
+            origin_head=$(git rev-parse --verify -q "refs/remotes/origin/${head_branch}" || true)
+            if [ "$origin_head" != "$head_sha" ]; then
+              git push origin "+${head_sha}:refs/heads/${head_branch}"
+            fi
+
+            # 3.3 Fetch the base branch (cached per branch name, fetched only once)
+            if [ -z "${fetched_base[${base_ref}]:-}" ]; then
+              if ! fetch_retry "$GITEE_URL" "+refs/heads/${base_ref}:refs/remotes/gitee/${base_ref}"; then
+                echo "::warning::PR #${pr_number}: cannot fetch base '${base_ref}' - skipped"
+                continue
+              fi
+              fetched_base[$base_ref]=1
+            fi
+            base_sha=$(git rev-parse "refs/remotes/gitee/${base_ref}")
+
+            # 3.4 Worktree-free merge test (git >= 2.38; exit code 1 means conflicts)
+            set +e
+            merge_out=$(git merge-tree --write-tree --name-only "$head_sha" "$base_sha" 2>/dev/null)
+            merge_rc=$?
+            set -e
+            if [ "$merge_rc" -eq 1 ]; then
+              echo "::warning::PR #${pr_number} conflicts with ${base_ref}:"
+              sed -n '2,$p' <<<"$merge_out" | sed 's/^/    /'
+              conflicted+=("${pr_number}")
+              continue
+            elif [ "$merge_rc" -ne 0 ]; then
+              echo "::error::PR #${pr_number}: git merge-tree failed (rc=${merge_rc})"
+              exit 1
+            fi
+            tree=$(sed -n '1p' <<<"$merge_out")
+
+            # 3.5 Deterministic merge commit: identical inputs => identical SHA
+            #     => no redundant pushes, no redundant CI triggers
+            merged_sha=$(GIT_AUTHOR_NAME="gitee-sync-bot" \
+              GIT_AUTHOR_EMAIL="github-actions[bot]@users.noreply.github.com" \
+              GIT_AUTHOR_DATE="2026-01-01T00:00:00Z" \
+              GIT_COMMITTER_NAME="gitee-sync-bot" \
+              GIT_COMMITTER_EMAIL="github-actions[bot]@users.noreply.github.com" \
+              GIT_COMMITTER_DATE="2026-01-01T00:00:00Z" \
+              git commit-tree "$tree" -p "$head_sha" -p "$base_sha" \
+              -m "Merge ${base_ref} into PR #${pr_number} (Gitee sync preview)")
+
+            merged_branch="sync/pr-${pr_number}-merged"
+            origin_merged=$(git rev-parse --verify -q "refs/remotes/origin/${merged_branch}" || true)
+            if [ "$origin_merged" != "$merged_sha" ]; then
+              git push origin "+${merged_sha}:refs/heads/${merged_branch}"
+            fi
+          done < "$PRS_FILE"
+
+          # ---------- 4. Conflict summary: fail explicitly ----------
+          if [ "${#conflicted[@]}" -gt 0 ]; then
+            echo "::error::${#conflicted[@]} PR(s) conflict with their base branch: ${conflicted[*]}"
+            exit 1
+          fi
+          echo "All PR(s) synced."

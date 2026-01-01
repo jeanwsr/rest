@@ -18,7 +18,7 @@ use tensors::BasicMatrix;
 use tensors::matrix_blas_lapack::{_dsymm, _dgemm};
 
 #[cfg(feature = "mpi")]
-use crate::ri_pt2::pt2_25d::{initialize_metadata, check_memory_25d, swap_ownership, local_computation_close_shell_batch, local_computation_ss_batch, local_computation_os_batch};
+use crate::ri_pt2::pt2_25d::{initialize_metadata, initialize_metadata_linear, check_memory_25d, swap_ownership, local_computation_close_shell_batch, local_computation_ss_batch, local_computation_os_batch};
 
 use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon,open_shell_sbge2_rayon};
 use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon, evaluate_osrpa_correlation_rayon_mpi};
@@ -32,6 +32,8 @@ use crate::mpi_io::{self, mpi_reduce};
 use crate::post_scf_analysis::{split_indices_by_spin_occ, format_indices};
 
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
+
+use crate::utilities::memory_batch::{detect_available_memory_mb};
 
 #[cfg(feature = "mpi")]
 pub mod pt2_25d;
@@ -233,19 +235,19 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
                 SCFType::RHF => match  dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi_25d(&scf_data,mpi_operator).unwrap(),
                     crate::dft::DFAFamily::SBGE2 => crate::ri_pt2::sbge2_25d::close_shell_sbge2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
-                    crate::dft::DFAFamily::SCSRPA => crate::ri_rpa::scsrpa_25d::close_shell_osrpa_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SCSRPA => crate::ri_rpa::scsrpa_25d::close_shell_osrpa_rayon_mpi_25d(scf_data, mpi_operator).unwrap(),
                     _ => [0.0,0.0,0.0]
                 },
                 SCFType::UHF => match  dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => open_shell_pt2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
                     crate::dft::DFAFamily::SBGE2 => crate::ri_pt2::sbge2_25d::open_shell_sbge2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
-                    crate::dft::DFAFamily::SCSRPA => crate::ri_rpa::scsrpa_25d::open_shell_osrpa_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SCSRPA => crate::ri_rpa::scsrpa_25d::open_shell_osrpa_rayon_mpi_25d(scf_data, mpi_operator).unwrap(),
                     _ => [0.0,0.0,0.0]
                 },
                 SCFType::ROHF => match dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => restricted_open_shell_pt2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
                     crate::dft::DFAFamily::SBGE2 => crate::ri_pt2::sbge2_25d::open_shell_sbge2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
-                    crate::dft::DFAFamily::SCSRPA => crate::ri_rpa::scsrpa_25d::open_shell_osrpa_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SCSRPA => crate::ri_rpa::scsrpa_25d::open_shell_osrpa_rayon_mpi_25d(scf_data, mpi_operator).unwrap(),
                     _ => [0.0,0.0,0.0]
                 }
             };
@@ -1381,31 +1383,60 @@ fn check_conditions_25d(
     }
 
     if !has_1d_fallback {
-        // Block-partition feasibility: num_block = k * grid_mult with k >= 2
-        // (initialize_metadata) must satisfy num_block <= n_occ. If violated,
-        // error clearly instead of tripping the assert deep inside.
-        let (r, c) = grid.dims;
-        let grid_mult = if r == c { r } else { r * c } as usize;
-        if n2_global < 2 * grid_mult {
+        // Block-partition feasibility for the linear ownership path
+        // (initialize_metadata_linear, k floor 1): num_block = k·P <= n_occ requires
+        // n_occ >= P (P = cart rank count). If violated, error clearly instead of
+        // tripping the assert deep inside.
+        let P = grid.cart_comm.size() as usize;
+        if n2_global < P {
             panic!(
                 "The 2.5D MPI path is the only MPI path for this post-SCF family \
                  (DFAFamily::{:?}), but the system is too small for the current rank \
-                 count: n_occ = {} cannot be split into {} blocks. Reduce the MPI \
-                 ranks or run without MPI.",
-                dfa_family_pos, n2_global, 2 * grid_mult
+                 count: n_occ = {} < {} ranks. Reduce the MPI ranks or run without MPI.",
+                dfa_family_pos, n2_global, P
             );
         }
     }
 
     if use_25d {
-        let ctx = initialize_metadata(&grid, n2_global);
         let mut n0_global_tmp: u64 = 0;
         grid.cart_comm.all_reduce_into( &(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
         let n0_global = n0_global_tmp as usize;
 
-        let memory_flag = check_memory_25d(&grid, &ctx, n0_global * n1_global, n2_global);
-        if !memory_flag {
+        // Memory gate must mirror the redistribution the driver will actually use:
+        // pair kernels (PT2/SBGE2) run initialize_metadata + swap_ownership
+        // (row∪col, ≈ 2·M/√p); single-index kernels (SCSRPA/RPA) run
+        // initialize_metadata_linear + redistribute_to_diag (≈ M/p).
+        let ctx = if has_1d_fallback {
+            initialize_metadata(&grid, n2_global)
+        } else {
+            initialize_metadata_linear(&grid, n2_global)
+        };
+        // Tensor part: estimated inside check_memory_25d from the ctx slice counts.
+        let tensor_ok = check_memory_25d(&grid, &ctx, n0_global * n1_global, n2_global);
+        // Response scratch part (replicated on every rank, independent of p):
+        // partial + reduced + polar + integrand temporaries. dRPA ≈ 3-4×naux²;
+        // SCSRPA open-shell λ-integration/series branch ≈ 6-8×naux² (conservative).
+        let scratch_ok = if has_1d_fallback {
+            true
+        } else {
+            let n_chi_sq = match dfa_family_pos {
+                crate::dft::DFAFamily::RPA => 4,
+                _ => 8, // SCSRPA 保守估计（含 OS 分支临时矩阵）
+            };
+            let required_bytes = n_chi_sq * n0_global * n0_global * std::mem::size_of::<f64>();
+            let avail_bytes = detect_available_memory_mb() * 1024.0 * 1024.0;
+            let local_ok = 4.0 * (required_bytes as f64) < (avail_bytes as f64);
+            let mut global_ok = true;
+            grid.cart_comm.all_reduce_into(&local_ok, &mut global_ok, &SystemOperation::logical_and());
+            global_ok
+        };
+        if !tensor_ok {
             eprintln!("Not enough memory for 2.5D, fallback to primitive PT2");
+            use_25d = false;
+        }
+        if !scratch_ok {
+            eprintln!("Not enough memory for the replicated response matrices of the 2.5D path");
             use_25d = false;
         }
     }

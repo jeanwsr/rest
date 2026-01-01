@@ -408,6 +408,11 @@ pub struct InputKeywords {
     /// in MPI runs. `Auto` (default) decides by problem size; `On` forces the
     /// distributed solver; `Off` forces the serial one.
     pub hamiltonian_distributed: HamiltonianDistributedMode,
+    /// Whether the dRPA/SCSRPA response matrices are built and factorized in
+    /// distributed (ScaLAPACK block-cyclic) form under MPI. `Auto` (default):
+    /// naux >= 8192 and nproc >= 32; `On` forces the distributed path (testing);
+    /// `Off` keeps the replicated path.
+    pub rpa_distributed: HamiltonianDistributedMode,
     pub ri_pt2: RiPt2Option,
     pub hessian: Option<HessianParameters>,
     pub thermo: Option<ThermoParameters>,
@@ -582,6 +587,7 @@ impl InputKeywords {
             xc_parser: String::from("legacy"),
             j2c_decomp: J2CDecompOption::default(),
             hamiltonian_distributed: HamiltonianDistributedMode::default(),
+            rpa_distributed: HamiltonianDistributedMode::default(),
             ri_pt2: RiPt2Option::default(),
             tddft: None,
             hessian: None,
@@ -1571,6 +1577,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.algorithm_k = tmp_ctrl.get("algorithm_k").map(serde_from_value).unwrap_or_default();
             tmp_input.j2c_decomp = tmp_ctrl.get("j2c_decomp").map(serde_from_value).unwrap_or_default();
             tmp_input.hamiltonian_distributed = tmp_ctrl.get("hamiltonian_distributed").map(serde_from_value).unwrap_or_default();
+            tmp_input.rpa_distributed = tmp_ctrl.get("rpa_distributed").map(serde_from_value).unwrap_or_default();
             if (tmp_input.algorithm_j != AlgorithmJ::Default || tmp_input.algorithm_k != AlgorithmK::Default) {
                 if tmp_input.algorithm_jk != AlgorithmJK::Default {
                     warn!("algorithm_j or algorithm_k are specified, the setting in algorithm_jk will be ignored.");
