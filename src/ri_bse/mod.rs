@@ -29,10 +29,6 @@ pub mod dynamicbse;
 pub mod pysoc_export;
 pub mod bse_grad;
 
-
-#[cfg(target_os = "linux")]
-use libc::seccomp_notif;
-
 pub struct BseOutput {
     pub first_excitation: Option<f64>,
     pub excitation_energies: Vec<f64>,
