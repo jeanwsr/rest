@@ -557,6 +557,34 @@ pub fn sorted_runs(indices: &[usize]) -> Vec<Range<usize>> {
 /// vector is the packed upper triangle of J over the **full** pair space of `map` (length
 /// `map.num_baspar_full()`): dropped rows contribute zeros, so the caller keeps the unmodified
 /// `basbas2baspar` to assemble the Fock matrix. A threshold of `0.0` keeps every stored row.
+#[cfg(target_os = "linux")]
+fn advise_huge_pages_scratch(buf: &mut [f64]) {
+    // MADV_HUGEPAGE on the 2 MiB-aligned interior of the buffer; the kernel ignores
+    // unaligned head/tail. Best-effort: the call only helps when THP is in madvise mode.
+    extern "C" { fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32; }
+    const MADV_HUGEPAGE: i32 = 14;
+    unsafe {
+        let a = buf.as_mut_ptr() as usize;
+        let len = buf.len() * std::mem::size_of::<f64>();
+        let start = (a + (1 << 21) - 1) & !((1 << 21) - 1);
+        let end = (a + len) & !((1 << 21) - 1);
+        if end > start {
+            madvise(start as *mut u8, end - start, MADV_HUGEPAGE);
+        }
+    }
+}
+
+pub mod k_stat {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static DENSIFY_NS: AtomicU64 = AtomicU64::new(0);
+    pub static BLAS_NS: AtomicU64 = AtomicU64::new(0);
+    pub fn take() -> (f64, f64) {
+        let d = DENSIFY_NS.swap(0, Ordering::Relaxed) as f64 / 1e9;
+        let b = BLAS_NS.swap(0, Ordering::Relaxed) as f64 / 1e9;
+        (d, b)
+    }
+}
+
 pub fn get_vj_pair_screened(
     ri3fn: &MatrixFull<f64>,
     map: &PairMap,
@@ -733,31 +761,82 @@ pub fn get_vk_pair_screened(
         retained.iter().map(|&(p, mu, nu)| (p, active_of[mu], active_of[nu])).collect();
 
     let chunks = crate::utilities::balancing(num_auxbas, rayon::current_num_threads());
+
+    // ---- sequential densification plan -------------------------------------------
+    // `retained_active` ascends in the packed upper-triangle index, which is also the
+    // ascending order of the column-major dense offsets `lo + hi * num_active`. Instead of
+    // scattering only the retained entries and zeroing them again after each dsymm (two
+    // un-prefetchable store streams into a matrix that exceeds LLC from nao ~ 2000 on;
+    // measured 8x slower than the unpruned streaming kernel on a 2392-bfs system), every
+    // auxiliary column is now written in ONE ascending pass: `fill(0.0)` over the gaps
+    // between retained offsets plus a direct store at each retained offset. The resulting
+    // matrix is bit-identical to the old one (same values, same positions, zeros elsewhere).
+    let write_offsets: Vec<usize> = retained_active
+        .iter()
+        .map(|&(_, ia, ja)| {
+            let (lo, hi) = if ia <= ja { (ia, ja) } else { (ja, ia) };
+            lo + hi * num_active
+        })
+        .collect();
+    let read_rows: Vec<usize> = retained_active.iter().map(|&(p, _, _)| p).collect();
+    let sub_len = num_active * num_active;
+
+    // ---- BLAS thread pairing around the rayon region --------------------------------
+    // The SIF ships a pthread-built OpenBLAS: `omp_set_num_threads` inside a rayon worker is a
+    // no-op there, so each worker's `_dsymm/_dsyrk` fans out to the auto-detected (= all cores)
+    // thread count and multiplies with the worker pool (measured 224 OS threads on 2x56 cores).
+    // Pin BLAS to 1 thread on the MAIN thread before entering the region — the global wrapper
+    // also emits `openblas_set_num_threads`, which the pthread build honours — and restore the
+    // saved count after `collect()` returns to the main thread. Never call the global wrapper
+    // from inside a worker: on an OpenMP build it is process-global and would serialize every
+    // later BLAS call (see the 15s -> 321s regression note on the per-thread wrapper).
+    let blas_threads_saved = tensors::matrix_blas_lapack::omp_get_num_threads_wrapper();
+    tensors::matrix_blas_lapack::omp_set_num_threads_global_wrapper(1);
     let partial: Vec<MatrixFull<f64>> = chunks
         .par_iter()
         .map(|columns| {
             let mut sub = MatrixFull::new([num_active, num_active], 0.0_f64);
             let mut tmp = MatrixFull::new([num_active, nw], 0.0_f64);
             let mut accum = MatrixFull::new([num_active, num_active], 0.0_f64);
+            // these scratch buffers are fully rewritten every auxiliary column; on a
+            // madvise-THP system without this hint each column re-faults on 4 KB pages.
+            // Measured without it: the per-column fill slowed 4.3x between adjacent builds.
+            advise_huge_pages_scratch(&mut sub.data);
+            advise_huge_pages_scratch(&mut accum.data);
             for p_aux in columns.clone() {
                 let column = &data[p_aux * num_stored..(p_aux + 1) * num_stored];
-                // upper triangle of the retained rows only, dsymm reads the upper triangle
-                for &(p, ia, ja) in &retained_active {
-                    let (lo, hi) = if ia <= ja { (ia, ja) } else { (ja, ia) };
-                    sub[[lo, hi]] = column[p];
+                // one ascending pass: zeros at the dropped pairs, values at the retained ones
+                {
+                    let t_f = std::time::Instant::now();
+                    let sub_data = &mut sub.data[..];
+                    let mut prev = 0usize;
+                    for k in 0..write_offsets.len() {
+                        let off = write_offsets[k];
+                        if off > prev {
+                            sub_data[prev..off].fill(0.0);
+                        }
+                        sub_data[off] = column[read_rows[k]];
+                        prev = off + 1;
+                    }
+                    if prev < sub_len {
+                        sub_data[prev..sub_len].fill(0.0);
+                    }
+                    k_stat::DENSIFY_NS.fetch_add(t_f.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 // T = R_P C on the active subset, then K += T T^t
+                let t_b = std::time::Instant::now();
                 _dsymm(&sub, &coeff_active, &mut tmp, 'L', 'U', 1.0, 0.0);
                 _dsyrk(&tmp, &mut accum, 'U', 'N', 1.0, 1.0);
-                for &(_, ia, ja) in &retained_active {
-                    let (lo, hi) = if ia <= ja { (ia, ja) } else { (ja, ia) };
-                    sub[[lo, hi]] = 0.0;
-                }
+                k_stat::BLAS_NS.fetch_add(t_b.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             accum
         })
         .collect();
+    tensors::matrix_blas_lapack::omp_set_num_threads_global_wrapper(blas_threads_saved);
 
+    let (d_s, b_s) = k_stat::take();
+    println!("[k-stat] screened K: nw={} n_active={} retained={} of {} wall_total(next line) densify={:.2}s blas={:.2}s (thread-s)",
+        nw, num_active, retained.len(), num_stored, d_s, b_s);
     // scatter the active block into the full symmetric matrix and pack it
     let mut k_full = MatrixFull::new([nao, nao], 0.0_f64);
     for accum in &partial {
