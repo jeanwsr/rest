@@ -13,6 +13,8 @@ use crate::utilities::memory_batch::*;
 use crate::ctrl_io::ri_jk_io::*;
 
 mod addons;
+#[cfg(test)]
+mod ao2mo_kernel_tests;
 mod fchk;
 pub mod print;
 mod pyrest_scf_io;
@@ -4726,14 +4728,41 @@ pub fn scf(mol:Molecule, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<S
     Ok(scf_data)
 }
 
+/// AO -> MO transformation of the symmetric-format RI 3-center tensor.
+///
+/// Dispatch rule, in order:
+///   1. if the eigenvector is not backed by a contiguous buffer, use `v02`, which
+///      works through the generic `BasicMatrix` interface;
+///   2. otherwise contract the *narrower* of the two requested blocks first.
+///      `m1` preslices the column (ket) block, `m2` preslices the row (bra) block.
+///      The two kernels are algebraically identical and differ only in which
+///      side carries the `dsymm`, so the cheap order costs
+///      `n^2 * min(|row|, |col|) + n * |row| * |col|` per auxiliary function
+///      instead of `n^2 * nmo + n * |row| * |col|`.
+///
+/// The per-orbital and per-block callers of RI-GW request (1, nmo) and
+/// (block, nmo) shapes, where the column block is the whole MO space. Those go
+/// through `m2` and no longer pay `n^2 * nmo` per auxiliary function.
 fn ao2mo_rayon<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops::Range<usize>, column_dim: std::ops::Range<usize>)
 -> anyhow::Result<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)>
     where T: BasicMatrix<'a, f64>+std::marker::Sync,
           P: BasicMatrix<'a, f64>
 {
-    ao2mo_rayon_v02(eigenvector, rimat_chunk, row_dim, column_dim)
-    //let mut 
-    //ri_ao2mo_f
+    // `m1` and `m2` walk the eigenvector through raw offsets, which assumes a
+    // contiguous, column-major `[nao, nmo]` buffer. Anything else goes to `v02`,
+    // which only uses the generic `BasicMatrix` interface.
+    let nao = eigenvector.size()[0];
+    let slicable = eigenvector.data_ref().is_some()
+        && eigenvector.is_contiguous()
+        && eigenvector.indicing() == [1, nao];
+    if !slicable {
+        return ao2mo_rayon_v02(eigenvector, rimat_chunk, row_dim, column_dim);
+    }
+    if row_dim.len() < column_dim.len() {
+        ao2mo_rayon_m2(eigenvector, rimat_chunk, row_dim, column_dim)
+    } else {
+        ao2mo_rayon_m1(eigenvector, rimat_chunk, row_dim, column_dim)
+    }
 }
 
 fn ao2mo_rayon_v01<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops::Range<usize>, column_dim: std::ops::Range<usize>)
@@ -4895,6 +4924,83 @@ where T: BasicMatrix<'a, f64> + std::marker::Sync,
         _dgemm(
             eigenvector, ((0..num_basis), row_dim.clone()), 'T',
             &tmp_mat, ((0..num_basis), (0..num_loc_col)), 'N',
+            &mut loc_ri3mo, ((0..num_loc_row), (0..num_loc_col)),
+            1.0, 0.0
+        );
+        s.send((loc_ri3mo, i_auxbs)).unwrap()
+    });
+    receiver.into_iter().for_each(|(loc_ri3mo, i_auxbs)| {
+        rimo.copy_from_matr(0..num_loc_row, 0..num_loc_col, i_auxbs, 2, &loc_ri3mo, 0..num_loc_row, 0..num_loc_col)
+    });
+
+    omp_set_num_threads_wrapper(default_omp_num_threads);
+
+    Ok((rimo, row_dim, column_dim))
+}
+
+/// M2-optimized AO->MO transformation: contracts the *row* (bra) block first.
+///
+/// Mirror image of `ao2mo_rayon_m1`. Where `m1` preslices the eigenvector to the
+/// requested *column* block and computes `tmp = A x C[:, col]`, this routine
+/// preslices the *row* block and computes `w = A x C[:, row]` followed by
+/// `out[a, i] = sum_u w[u, a] C[u, i]`. Both give the same `[naux, |row|, |col|]`
+/// tensor, and both cost `n^2 * (sliced block) + n * |row| * |col|` per auxiliary
+/// function, so together they cover the cheap contraction order for any block
+/// shape.
+///
+/// Use this whenever `|row_dim| < |column_dim|`. The case that motivates it is
+/// RI-GW, which asks for one MO row at a time against the full MO space
+/// (`|row| = 1`, `|col| = nmo`): contracting the column side first costs
+/// `n^2 * nmo` per auxiliary function for a single row, while contracting the
+/// row side costs `n^2 + n * nmo`.
+pub(crate) fn ao2mo_rayon_m2<'a, T, P>(
+    eigenvector: &T,
+    rimatr_chunk: &P,
+    row_dim: std::ops::Range<usize>,
+    column_dim: std::ops::Range<usize>,
+) -> anyhow::Result<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)>
+where T: BasicMatrix<'a, f64> + std::marker::Sync,
+      P: BasicMatrix<'a, f64>
+{
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
+
+    let num_basis = eigenvector.size()[0];
+    let num_bpair = rimatr_chunk.size()[0];
+    let num_auxbs = rimatr_chunk.size()[1];
+    let num_loc_row = row_dim.len();
+    let num_loc_col = column_dim.len();
+
+    // M2: pre-slice eigenvector to the bra (row) block.
+    // Cost: one-time copy of [nao, |row|] doubles.
+    let mut eigvec_row_data = vec![0.0_f64; num_basis * num_loc_row];
+    let eigvec_src = eigenvector.data_ref().expect("ao2mo_rayon_m2 requires a contiguous eigenvector");
+    for a in 0..num_loc_row {
+        let src_off = (row_dim.start + a) * num_basis;
+        let dst_off = a * num_basis;
+        eigvec_row_data[dst_off..dst_off + num_basis]
+            .copy_from_slice(&eigvec_src[src_off..src_off + num_basis]);
+    }
+    let eigvec_row = MatrixFull::from_vec([num_basis, num_loc_row], eigvec_row_data).unwrap();
+
+    let mut rimo = RIFull::new([num_auxbs, num_loc_row, num_loc_col], 0.0);
+    let (sender, receiver) = channel();
+
+    rimatr_chunk.data_ref().unwrap().par_chunks_exact(num_bpair).enumerate().for_each_with(sender, |s, (i_auxbs, m)| {
+
+        omp_set_num_threads_wrapper(1);
+
+        let mut reduced_ri = MatrixFull::new([num_basis, num_basis], 0.0_f64);
+        reduced_ri.iter_matrixupper_mut().unwrap().zip(m.iter()).for_each(|(to, from)| {*to = *from});
+
+        // M2: dsymm with the sliced bra block, [nao, |row|]
+        let mut tmp_mat = MatrixFull::new([num_basis, num_loc_row], 0.0_f64);
+        _dsymm(&reduced_ri, &eigvec_row, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
+
+        // out[a, i] = sum_u tmp_mat[u, a] * eigenvector[u, i]
+        let mut loc_ri3mo = MatrixFull::new([num_loc_row, num_loc_col], 0.0_f64);
+        _dgemm(
+            &tmp_mat, ((0..num_basis), (0..num_loc_row)), 'T',
+            eigenvector, ((0..num_basis), column_dim.clone()), 'N',
             &mut loc_ri3mo, ((0..num_loc_row), (0..num_loc_col)),
             1.0, 0.0
         );
