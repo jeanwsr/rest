@@ -50,7 +50,7 @@ use smear::apply_smearing;
 use smear::annealed_sigma;
 
 #[cfg(feature = "scalapack")]
-use tensors::distributedmatrixfull::_hamiltonian_distributed_solver;
+use tensors::distributedmatrixfull::{_hamiltonian_distributed_solver, _hamiltonian_distributed_solver_inv};
 #[allow(unused_imports)]
 use tensors::BasicMatUp;
 
@@ -2192,6 +2192,10 @@ impl SCF {
     /// Called both before the first Fock build (solvent-consistent initial guess /
     /// chkfile restart) and once per SCF iteration.
     pub fn refresh_solvent(&mut self) {
+        self.refresh_solvent_with_mpi(&None)
+    }
+
+    pub fn refresh_solvent_with_mpi(&mut self, mpi_operator: &Option<MPIOperator>) {
         if let Some(solvent_static) = self.solvent_static_obj.as_ref() {
             let s_static = PcmScf::get_pcm_refresh(
                 &solvent_static.surface,
@@ -2204,7 +2208,8 @@ impl SCF {
                 &self.mol.spin_channel,
                 &self.mol.ctrl.max_memory,
                 &self.mol.ctrl.solv_chunk,
-                self.mol.ctrl.solvent_ri
+                self.mol.ctrl.solvent_ri,
+                mpi_operator
             );
             // SMD: CDS energy from PcmStatic (computed once in solvent_prepare)
             let e_cds = solvent_static.pstatic.e_cds.unwrap_or(0.0);
@@ -4896,6 +4901,47 @@ pub fn diagonalize_hamiltonian_distributed_check(scf_data: &SCF, mpi_operator: &
 }
 
 #[cfg(feature = "scalapack")]
+
+/// 广义本征问题 A·X = B·X·Λ 的相对残差 ‖A·X − B·X·Λ‖_F / (‖A‖_F·‖X‖_F 尺度)。
+/// 仅用上三角输入（按对称填充下三角后运算）；X 为列本征矢、w 为对角本征值。
+/// 用于分布式求解器的静默质量门：pdsygvx 对小/病态体系（ECP）可能 info=0 却给出
+/// 漂移的解（同输入多次运行能量/轨道不同），此检查在 rank 间数据一致时给出全局一致的
+/// 回退判据。
+#[cfg(feature = "scalapack")]
+fn generalized_residual_upper(
+    matr_a: &rest_tensors::MatrixUpper<f64>,
+    matr_b: &rest_tensors::MatrixUpper<f64>,
+    z: &rest_tensors::MatrixFull<f64>,
+    w: &Vec<f64>,
+) -> f64 {
+    use tensors::{MathMatrix, ParMathMatrix};
+    let n = z.size()[0];
+    let ncol = z.size()[1].min(w.len());
+    let mut a = rest_tensors::MatrixFull::new([n, n], 0.0);
+    a.iter_matrixupper_mut().unwrap().zip(matr_a.data_ref().unwrap()).for_each(|(to, from)| { *to = *from; });
+    a.fill_lower_part_from_upper_unsafe();
+    let mut b = rest_tensors::MatrixFull::new([n, n], 0.0);
+    b.iter_matrixupper_mut().unwrap().zip(matr_b.data_ref().unwrap()).for_each(|(to, from)| { *to = *from; });
+    b.fill_lower_part_from_upper_unsafe();
+    // az = A·Z ; bz = B·Z ; then subtract column k scaled by w[k]
+    let mut az = rest_tensors::MatrixFull::new([n, ncol], 0.0);
+    let mut bz = rest_tensors::MatrixFull::new([n, ncol], 0.0);
+    tensors::matrix_blas_lapack::_dgemm(&a, (0..n, 0..n), 'N', z, (0..n, 0..ncol), 'N', &mut az, (0..n, 0..ncol), 1.0, 0.0);
+    tensors::matrix_blas_lapack::_dgemm(&b, (0..n, 0..n), 'N', z, (0..n, 0..ncol), 'N', &mut bz, (0..n, 0..ncol), 1.0, 0.0);
+    let mut denom = 0.0_f64;
+    let mut num = 0.0_f64;
+    for k in 0..ncol {
+        let wk = w[k];
+        for i in 0..n {
+            let res = az.data[k * n + i] - wk * bz.data[k * n + i];
+            num += res * res;
+            denom += az.data[k * n + i] * az.data[k * n + i];
+        }
+    }
+    (num / denom.max(1e-300)).sqrt()
+}
+
+#[cfg(feature = "scalapack")]
 pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> ([MatrixFull<f64>;2], [Vec<f64>;2], usize) {
 
     #[cfg(not(feature = "mpi"))]
@@ -4903,6 +4949,7 @@ pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option
 
     #[cfg(feature = "mpi")]
     if let Some(mpi_io) = mpi_operator {
+        use mpi::traits::*;
         let spin_channel = scf_data.mol.spin_channel;
         let mut num_state = scf_data.mol.num_state;
         let mut eigenvectors = [MatrixFull::empty(),MatrixFull::empty()];
@@ -4914,34 +4961,62 @@ pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option
         match scf_data.scftype {
             SCFType::RHF | SCFType::UHF => {
                 for i_spin in (0..spin_channel) {
-                    match _hamiltonian_distributed_solver(&scf_data.hamiltonian[i_spin], &scf_data.ovlp, &mut num_state, grid, world) {
-                        Some((eigenvector_spin, eigenvalue_spin)) => {
-                            eigenvectors[i_spin] = eigenvector_spin;
-                            eigenvalues[i_spin] = eigenvalue_spin;
-                        }
-                        None => {
-                            // distributed solve failed (e.g. non-convergence for small
-                            // / ill-conditioned systems); fall back to the serial solver.
-                            println!("WARNING: distributed (ScaLAPACK) Hamiltonian solver failed; falling back to the serial solver.");
-                            (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
-                            return (eigenvectors, eigenvalues, num_state);
-                        }
-                    }
-                }
-            },
-            SCFType::ROHF => {
-                // diagonalize Roothaan Fock matrix
-                match _hamiltonian_distributed_solver(scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp, &mut num_state, grid, world) {
-                    Some((eigenvector, eigenvalue)) => {
-                        eigenvectors[0] = eigenvector;
-                        eigenvalues[0] = eigenvalue;
-                    }
-                    None => {
-                        println!("WARNING: distributed (ScaLAPACK) Hamiltonian solver failed; falling back to the serial solver.");
+                    // ---- 首选：pdsyevd 反变换求解器 ----
+                    // 通过 S^{-1/2} A S^{-1/2} 变换后用 pdsyevd（分治法）求标准本征
+                    // 问题，数值质量（残差 ~1e-14~1e-15）远优于 pdsygvx（~5e-10）。
+                    // ScaLAPACK 的 info 失败时只在属主进程非零，故"求解器失败"判定
+                    // 必须做**全局逻辑 AND**——否则部分 rank 回退、其余继续 → 下一次
+                    // 集体操作死锁（opt 任务多次 force 求值下间歇挂起的根因）。
+                    let mut num_state_inv = scf_data.mol.num_state;
+                    let solver_result = _hamiltonian_distributed_solver_inv(
+                        &scf_data.hamiltonian[i_spin], &scf_data.ovlp, &mut num_state_inv, grid, world);
+                    let ok_local = solver_result.is_some();
+                    let mut ok_global = false;
+                    world.any_process().all_reduce_into(&ok_local, &mut ok_global, &SystemOperation::logical_and());
+                    if !ok_global {
+                        println!("WARNING: pdsyevd inverse solver failed on some rank (spin {}); all ranks fall back to serial.", i_spin);
                         (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
                         return (eigenvectors, eigenvalues, num_state);
                     }
+                    let (eigenvector_spin, eigenvalue_spin) = solver_result.unwrap();
+                    let n_dim = eigenvector_spin.size()[0];
+                    let res_inv = if n_dim <= 4096 { generalized_residual_upper(
+                            &scf_data.hamiltonian[i_spin], &scf_data.ovlp,
+                            &eigenvector_spin, &eigenvalue_spin) } else { 0.0 };
+                    if n_dim <= 4096 && res_inv > 1.0e-10 {
+                        println!("WARNING: pdsyevd inverse solver quality gate failed (spin {}, residual {:.3e}); falling back to serial.", i_spin, res_inv);
+                        (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
+                        return (eigenvectors, eigenvalues, num_state);
+                    }
+                    eigenvectors[i_spin] = eigenvector_spin;
+                    eigenvalues[i_spin] = eigenvalue_spin;
                 }
+            },
+            SCFType::ROHF => {
+                // ---- 首选：pdsyevd 反变换（同 RHF/UHF；失败判定全局 AND 防分歧死锁）----
+                let mut num_state_inv = scf_data.mol.num_state;
+                let solver_result = _hamiltonian_distributed_solver_inv(
+                    scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp, &mut num_state_inv, grid, world);
+                let ok_local = solver_result.is_some();
+                let mut ok_global = false;
+                world.any_process().all_reduce_into(&ok_local, &mut ok_global, &SystemOperation::logical_and());
+                if !ok_global {
+                    println!("WARNING: pdsyevd inverse solver failed on some rank (ROHF); all ranks fall back to serial.");
+                    (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
+                    return (eigenvectors, eigenvalues, num_state);
+                }
+                let (eigenvector, eigenvalue) = solver_result.unwrap();
+                let n_dim = eigenvector.size()[0];
+                let res_inv = if n_dim <= 4096 { generalized_residual_upper(
+                        scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp,
+                        &eigenvector, &eigenvalue) } else { 0.0 };
+                if n_dim <= 4096 && res_inv > 1.0e-10 {
+                    println!("WARNING: pdsyevd inverse solver quality gate failed (ROHF, residual {:.3e}); falling back to serial.", res_inv);
+                    (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
+                    return (eigenvectors, eigenvalues, num_state);
+                }
+                eigenvectors[0] = eigenvector;
+                eigenvalues[0] = eigenvalue;
             }
         };
         (eigenvectors, eigenvalues, num_state)
@@ -5261,7 +5336,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     // build below is already solvent-consistent (chkfile restart converges in
     // few iterations; also fixes the noiter path where solvent_scf stayed None)
     if scf_data.mol.ctrl.solvent_enabled {
-        scf_data.refresh_solvent();
+        scf_data.refresh_solvent_with_mpi(mpi_operator);
     }
     scf_data.generate_hf_hamiltonian(mpi_operator);
     scf_data.grad_dm = scf_data.get_grad_dm();
@@ -5357,7 +5432,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
 
         let dt_solv0 = time::Local::now();
         if scf_data.mol.ctrl.solvent_enabled {
-            scf_data.refresh_solvent();
+            scf_data.refresh_solvent_with_mpi(mpi_operator);
         }
         let dt_solv1 = time::Local::now();
 

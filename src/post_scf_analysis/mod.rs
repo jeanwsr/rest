@@ -203,6 +203,18 @@ pub fn post_ai_correction(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>
 /// NOTE: only support symmetric RI-V tensors
 pub fn post_scf_correlation(scf_data: &mut SCF) {
 
+    // Phase-0 guard (P0-4): every post-correlation branch below (PT2/SBGE2/RPA/SCSRPA)
+    // evaluates its correlation with serial kernels that assume a full (non-distributed)
+    // RI3MO tensor. Under MPI the RI3MO tensor is aux-distributed and these kernels would
+    // read out of bounds. Error out at the entrance instead of deep inside the kernels.
+    if scf_data.mol.mpi_data.is_some() {
+        panic!(
+            "post_correlation is not yet supported under MPI: the PT2/SBGE2/RPA/SCSRPA \
+             post-correlation kernels assume a full RI3MO tensor, which is aux-distributed \
+             under MPI. Please run post-correlation tasks without MPI for now."
+        );
+    }
+
     let mut timerecords = TimeRecords::new();
     let spin_channel = scf_data.mol.spin_channel;
     let dfa_family_pos = if let Some(tmp_dfa) = &scf_data.mol.xc_data.dfa_family_pos {
