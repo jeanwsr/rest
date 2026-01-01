@@ -191,6 +191,55 @@ pub enum HamiltonianDistributedMode {
 ///  - `even_tempered-basis`: `Bool`. True: turn on ETB to generate the auxiliary basis set
 ///  - `etb_start_atom_number`: `Usize`. Use ETB, for the element with atomic index larger than this value  
 ///  - `etb_beta`: `f64`. Relevant to the ETB basis set size. Smaller value indicates larger ETB basis set. NOTE: etb_beta should be larger than 1.0
+/// Strategy for importing a two-channel (UHF/UKS) wavefunction into a
+/// restricted (RHF/ROHF/ROKS) calculation, where only one common spatial
+/// orbital set can be carried over.
+///
+/// The alpha and beta channels of a UHF/UKS solution are optimized
+/// independently and do not share a common basis, so the import has to
+/// *choose* one orthonormal set:
+///
+/// * `keepalpha` (default): keep the alpha channel.  The beta channel is still
+///   read in, but only as the MOM / force-state reference.
+/// * `keepbeta`: keep the beta channel instead.
+/// * `natural`: natural orbitals (Lowdin) of the total one-particle density
+///   `D = D_alpha + D_beta`, i.e. the unrestricted natural orbitals (UNO),
+///   ordered by decreasing occupation.  This is the only mixing style: an
+///   average of the two *coefficient* matrices is not well defined (the two
+///   channels are complete orthonormal bases of the same AO space, so their
+///   overlap matrix is orthogonal), and any proper corresponding-orbital
+///   average of the occupied spaces reproduces exactly this eigenbasis.
+///
+/// For weakly spin-polarized sources all styles give the same guess up to
+/// `1 - sigma_min`; they differ when the UHF/UKS solution is strongly
+/// spin-polarized or symmetry broken.  Only the two `keep*` styles retain the
+/// per-spin structure that the restricted open-shell singlet needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum U2RStyle {
+    KeepAlpha,
+    KeepBeta,
+    Natural,
+}
+
+impl U2RStyle {
+    pub const KEYWORDS: [&'static str; 3] = ["keepalpha", "keepbeta", "natural"];
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            U2RStyle::KeepAlpha => "keepalpha",
+            U2RStyle::KeepBeta => "keepbeta",
+            U2RStyle::Natural => "natural",
+        }
+    }
+    pub fn from_keyword(keyword: &str) -> Option<U2RStyle> {
+        match keyword.to_lowercase().as_str() {
+            "keepalpha" | "keep_alpha" | "alpha" => Some(U2RStyle::KeepAlpha),
+            "keepbeta" | "keep_beta" | "beta" => Some(U2RStyle::KeepBeta),
+            "natural" | "uno" => Some(U2RStyle::Natural),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug,Clone,Serialize, Deserialize)]
 #[pyclass]
 pub struct InputKeywords {
@@ -482,6 +531,10 @@ pub struct InputKeywords {
     pub guess_mix: bool,
     pub guess_mix_theta_deg: Vec<f64>,
     pub start_mix_cycle: usize,
+    /// How a two-channel (UHF/UKS) guess file is converted into the single
+    /// common orbital set of a restricted (RHF/ROHF/ROKS) calculation
+    /// (keyword `u2r_style`, default "keepalpha").  See [`U2RStyle`].
+    pub u2r_style: U2RStyle,
     pub spin_correction_scheme: Option<String>,
     pub yamaguchi_triplet_type: Option<String>,
     /// External dipole field (x, y, z) intensity in atomic units
@@ -665,6 +718,7 @@ impl InputKeywords {
             guess_mix: false,
             guess_mix_theta_deg: [15.0, 15.0].to_vec(),
             start_mix_cycle: 0,
+            u2r_style: U2RStyle::KeepAlpha,
             spin_correction_scheme: None,
             yamaguchi_triplet_type: None,
             ext_field_dipole: None,
@@ -2117,6 +2171,22 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 _ => 0_usize,
             };
 
+            // for u2r_style: how a two-channel (UHF/UKS) guess file is converted
+            // into the single common orbital set of a restricted calculation.
+            tmp_input.u2r_style = match tmp_ctrl.get("u2r_style").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => match U2RStyle::from_keyword(tmp_str) {
+                    Some(style) => style,
+                    None => panic!(
+                        "ERROR: not recognized option for u2r_style: \"{}\" (available: {})",
+                        tmp_str, U2RStyle::KEYWORDS.join("\", \"")
+                    ),
+                },
+                serde_json::Value::Null => U2RStyle::KeepAlpha,
+                _ => panic!(
+                    "ERROR: u2r_style expects a string (available: {})",
+                    U2RStyle::KEYWORDS.join("\", \"")
+                ),
+            };
             tmp_input.spin_correction_scheme = match tmp_ctrl.get("spin_correction_scheme").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_emp) => {Some(tmp_emp.to_lowercase())},
                 other => {None},

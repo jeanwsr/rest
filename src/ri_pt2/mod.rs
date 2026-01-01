@@ -2988,16 +2988,22 @@ pub fn restricted_open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Opt
         let eigenvector_1 = &semi_eigenvectors[i_spin_1];
         let eigenvalues_1 = &semi_eigenvalues[i_spin_1];
         let occupation_1 = &occupation[i_spin_1];
+        let homo_1 = scf_data.homo[i_spin_1];
         let lumo_1 = scf_data.lumo[i_spin_1];
-        let num_occu_1 = if scf_data.mol.num_elec[i_spin_1 + 1] <= 1.0e-6 { 0 } else { lumo_1 };
+        // Take the larger of `lumo` and `homo + 1`: for an Aufbau occupation the
+        // two coincide, but for a non-Aufbau one (e.g. a MOM beta hole below the
+        // HOMO) `lumo` is smaller than the number of occupied orbitals and
+        // `0..lumo` would silently drop the occupied orbitals above the hole.
+        let num_occu_1 = if scf_data.mol.num_elec[i_spin_1 + 1] <= 1.0e-6 { 0 } else { lumo_1.max(homo_1 + 1) };
         let occ_range_1 = start_mo..num_occu_1;
         let vir_range_1 = lumo_1..num_state;
 
         let eigenvector_2 = &semi_eigenvectors[i_spin_2];
         let eigenvalues_2 = &semi_eigenvalues[i_spin_2];
         let occupation_2 = &occupation[i_spin_2];
+        let homo_2 = scf_data.homo[i_spin_2];
         let lumo_2 = scf_data.lumo[i_spin_2];
-        let num_occu_2 = if scf_data.mol.num_elec[i_spin_2 + 1] <= 1.0e-6 { 0 } else { lumo_2 };
+        let num_occu_2 = if scf_data.mol.num_elec[i_spin_2 + 1] <= 1.0e-6 { 0 } else { lumo_2.max(homo_2 + 1) };
         let occ_range_2 = start_mo..num_occu_2;
         let vir_range_2 = lumo_2..num_state;
 
