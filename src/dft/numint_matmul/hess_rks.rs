@@ -1223,7 +1223,7 @@ pub fn make_hessian_setup_becke(
     let hardness = BECKE_HARDNESS;
     let tables = grid_shift.then(|| {
         let proton_charges: Vec<i32> = mol.atom_charges().iter().map(|&c| c as i32).collect_vec();
-        let adjustment_factor = gen_adjustment_factor(&proton_charges);
+        let adjustment_factor = gen_adjustment_factor(&proton_charges, ni.radii_adjust);
         BeckeMolTables::new(&mol.atom_coords(), &adjustment_factor, 2)
     });
 

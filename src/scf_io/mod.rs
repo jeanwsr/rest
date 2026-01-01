@@ -12,7 +12,8 @@ use crate::utilities::{self, TimeRecords};
 use crate::utilities::memory_batch::*;
 use crate::ctrl_io::ri_jk_io::*;
 
-mod addons;
+#[cfg(test)]
+mod ao2mo_kernel_tests;
 mod fchk;
 pub mod print;
 mod pyrest_scf_io;
@@ -112,8 +113,12 @@ pub struct SCF {
     /// Spin-resolved quasiparticle energies: (G energies, W energies), indexed [spin].
     pub gwqp_spin:([Vec<f64>;2],[Vec<f64>;2]),
     pub algorithm_jk: AlgorithmJK,
+    /// Per-geometry engine of the `ri-schwartz` RI-J algorithm, built in
+    /// `prepare_necessary_integrals` when `algorithm_j = ri-schwartz` is set.
+    pub schwartz_rij_engine: Option<std::sync::Arc<ri_jk::RIJSchwartzEngine>>,
     pub solvent_static_obj: Option<PcmObject>,
     pub solvent_scf: Option<PcmScf>,
+    pub scf_converged: bool,
     /// Raw TDDFT eigenvectors from the last `tddft_main` call:
     /// `(excitation energy, eigenvector)` in the solver's ordering.  Used by
     /// the TDDFT analytic-gradient driver.
@@ -131,7 +136,7 @@ pub struct SCF {
     pub gw_checkpoint_state: Option<crate::fileop::gw_checkpoint::GwCheckpointState>,
 }
 
-#[derive(Clone,Copy)]
+#[derive(Clone,Copy,PartialEq)]
 pub enum SCFType {
     RHF,
     ROHF,
@@ -188,8 +193,10 @@ impl SCF {
             gwqp:(Vec::new(),Vec::new()),
             gwqp_spin:([Vec::new(),Vec::new()],[Vec::new(),Vec::new()]),
             algorithm_jk: AlgorithmJK::Default,
+            schwartz_rij_engine: None,
             solvent_static_obj: None,
             solvent_scf: None,
+            scf_converged: false,
             tddft_excitations: None,
             gw_checkpoint_state: None,
         };
@@ -243,18 +250,18 @@ impl SCF {
         let algorithm_jk = mol.ctrl.algorithm_jk;
         // by default, we will let it be RI
         let algorithm_jk = match algorithm_jk {
-            AlgorithmJK::Default => AlgorithmJK::Ri,
+            AlgorithmJK::Default => AlgorithmJK::RI,
             AlgorithmJK::Separated(algorithm_j, algorithm_k) => {
-                let new_algorithm_j = if algorithm_j == AlgorithmJ::Default { AlgorithmJ::Ri } else { algorithm_j };
-                let new_algorithm_k = if algorithm_k == AlgorithmK::Default { AlgorithmK::Ri } else { algorithm_k };
+                let new_algorithm_j = if algorithm_j == AlgorithmJ::Default { AlgorithmJ::RI } else { algorithm_j };
+                let new_algorithm_k = if algorithm_k == AlgorithmK::Default { AlgorithmK::RI } else { algorithm_k };
                 AlgorithmJK::Separated(new_algorithm_j, new_algorithm_k)
             },
             _ => algorithm_jk,
         };
         // check memory requirement for RI
         let has_ri_non_specified = match algorithm_jk {
-            AlgorithmJK::Ri => true,
-            AlgorithmJK::Separated(algorithm_j, algorithm_k) => algorithm_j == AlgorithmJ::Ri || algorithm_k == AlgorithmK::Ri,
+            AlgorithmJK::RI => true,
+            AlgorithmJK::Separated(algorithm_j, algorithm_k) => algorithm_j == AlgorithmJ::RI || algorithm_k == AlgorithmK::RI,
             _ => false,
         };
         let algorithm_jk = if has_ri_non_specified {
@@ -271,11 +278,11 @@ impl SCF {
             let algorithm_jk = if mem_avail_mb  < mem_cderi_mb {
                 info!("Memory available for 1.5 times of RI integrals ({:.2} MB) is less than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
                 info!("Switch to direct RI-J/K algorithms.");
-                if algorithm_jk == AlgorithmJK::Ri {
-                    AlgorithmJK::RiDirect
+                if algorithm_jk == AlgorithmJK::RI {
+                    AlgorithmJK::RIDirect
                 } else if let AlgorithmJK::Separated(algorithm_j, algorithm_k) = algorithm_jk {
-                    let new_algorithm_j = if algorithm_j == AlgorithmJ::Ri { AlgorithmJ::RiDirect } else { algorithm_j };
-                    let new_algorithm_k = if algorithm_k == AlgorithmK::Ri { AlgorithmK::RiDirect } else { algorithm_k };
+                    let new_algorithm_j = if algorithm_j == AlgorithmJ::RI { AlgorithmJ::RIDirect } else { algorithm_j };
+                    let new_algorithm_k = if algorithm_k == AlgorithmK::RI { AlgorithmK::RIDirect } else { algorithm_k };
                     AlgorithmJK::Separated(new_algorithm_j, new_algorithm_k)
                 } else {
                     algorithm_jk
@@ -283,11 +290,11 @@ impl SCF {
             } else {
                 info!("Memory available for 1.5 times of RI integrals ({:.2} MB) is more than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
                 info!("Using standard incore RI-J/K algorithms.");
-                if algorithm_jk == AlgorithmJK::Ri {
-                    AlgorithmJK::RiIncore
+                if algorithm_jk == AlgorithmJK::RI {
+                    AlgorithmJK::RIIncore
                 } else if let AlgorithmJK::Separated(algorithm_j, algorithm_k) = algorithm_jk {
-                    let new_algorithm_j = if algorithm_j == AlgorithmJ::Ri { AlgorithmJ::RiIncore } else { algorithm_j };
-                    let new_algorithm_k = if algorithm_k == AlgorithmK::Ri { AlgorithmK::RiIncore } else { algorithm_k };
+                    let new_algorithm_j = if algorithm_j == AlgorithmJ::RI { AlgorithmJ::RIIncore } else { algorithm_j };
+                    let new_algorithm_k = if algorithm_k == AlgorithmK::RI { AlgorithmK::RIIncore } else { algorithm_k };
                     AlgorithmJK::Separated(new_algorithm_j, new_algorithm_k)
                 } else {
                     algorithm_jk
@@ -444,10 +451,10 @@ impl SCF {
 
         // update use_eri if some RI algorithms are specified
         let use_eri_jk = match self.algorithm_jk {
-            AlgorithmJK::RiIncore => true,
+            AlgorithmJK::RIIncore => true,
             AlgorithmJK::Separated(algorithm_j, algorithm_k) => {
-                let use_eri_j = algorithm_j == AlgorithmJ::RiIncore;
-                let use_eri_k = algorithm_k == AlgorithmK::RiIncore;
+                let use_eri_j = algorithm_j == AlgorithmJ::RIIncore;
+                let use_eri_k = algorithm_k == AlgorithmK::RIIncore;
                 use_eri_j || use_eri_k
             },
             _ => false,
@@ -503,6 +510,18 @@ impl SCF {
                 self.ri3fn_sr = Some(self.mol.prepare_ri3fn_sr_rayon(omega));
             }
             info!("  SR 3c integrals built.");
+        }
+
+        // build the per-geometry engine of the Schwartz-screened RI-J algorithm
+        // (all static data: shell-pair Schwarz bounds, aux-shell bounds, decomposed 2c-2e metric)
+        if let AlgorithmJK::Separated(AlgorithmJ::RISchwartz, _) = self.algorithm_jk {
+            let mol = ri_jk::util::get_cint_mol(&self.mol);
+            let aux = ri_jk::util::get_cint_aux(&self.mol);
+            let ri_jk_opt = self.mol.ctrl.ri_jk;
+            let engine =
+                ri_jk::RIJSchwartzEngine::build(mol, aux, ri_jk_opt.schwartz_threshold, ri_jk_opt.schwartz_overlap_tol2, self.mol.ctrl.j2c_decomp);
+            info!("Schwartz-screened RI-J engine built ({} shell pairs).", engine.pairs.pairs.len());
+            self.schwartz_rij_engine = Some(std::sync::Arc::new(engine));
         }
 
         // initial eigenvectors and eigenvalues
@@ -1847,8 +1866,9 @@ impl SCF {
             self.generate_vj_ri_direct(None)
         } else {
             match self.algorithm_jk {
-                AlgorithmJK::RiIncore | AlgorithmJK::Separated(AlgorithmJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
-                AlgorithmJK::RiDirect | AlgorithmJK::Separated(AlgorithmJ::RiDirect, _) => self.generate_vj_ri_direct(None),
+                AlgorithmJK::RIIncore | AlgorithmJK::Separated(AlgorithmJ::RIIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
+                AlgorithmJK::RIDirect | AlgorithmJK::Separated(AlgorithmJ::RIDirect, _) => self.generate_vj_ri_direct(None),
+                AlgorithmJK::Separated(AlgorithmJ::RISchwartz, _) => self.generate_vj_ri_schwartz(),
                 _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             }
         };
@@ -1866,8 +1886,8 @@ impl SCF {
             self.generate_vk_with_isdf_new(scaling_factor)
         } else {
             match self.algorithm_jk {
-                AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
-                AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None, None),
+                AlgorithmJK::RIIncore | AlgorithmJK::Separated(_, AlgorithmK::RIIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
+                AlgorithmJK::RIDirect | AlgorithmJK::Separated(_, AlgorithmK::RIDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None, None),
                 _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             }
         };
@@ -2055,8 +2075,9 @@ impl SCF {
             self.generate_vj_ri_direct(None)
         } else {
             match self.algorithm_jk {
-            AlgorithmJK::RiIncore | AlgorithmJK::Separated(AlgorithmJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
-            AlgorithmJK::RiDirect | AlgorithmJK::Separated(AlgorithmJ::RiDirect, _) => self.generate_vj_ri_direct(None),
+            AlgorithmJK::RIIncore | AlgorithmJK::Separated(AlgorithmJ::RIIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
+            AlgorithmJK::RIDirect | AlgorithmJK::Separated(AlgorithmJ::RIDirect, _) => self.generate_vj_ri_direct(None),
+            AlgorithmJK::Separated(AlgorithmJ::RISchwartz, _) => self.generate_vj_ri_schwartz(),
             _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             }
         };
@@ -2085,8 +2106,8 @@ impl SCF {
             if scaling_kfull.abs() > 1e-10 {
                 let use_dm_only = self.mol.ctrl.use_dm_only;
                 let vk_full = match self.algorithm_jk {
-                    AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(scaling_kfull, use_dm_only, mpi_operator),
-                    AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_kfull, use_dm_only, None, None),
+                    AlgorithmJK::RIIncore | AlgorithmJK::Separated(_, AlgorithmK::RIIncore) => self.generate_vk_with_ri_v(scaling_kfull, use_dm_only, mpi_operator),
+                    AlgorithmJK::RIDirect | AlgorithmJK::Separated(_, AlgorithmK::RIDirect) => self.generate_vk_ri_direct(scaling_kfull, use_dm_only, None, None),
                     _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
                 };
                 for i_spin in 0..spin_channel {
@@ -2100,7 +2121,7 @@ impl SCF {
             // For ri-incore, use the pre-built rimatr_sr / ri3fn_sr.
             if scaling_ksr.abs() > 1e-10 {
                 let vk_sr = match self.algorithm_jk {
-                    AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => {
+                    AlgorithmJK::RIDirect | AlgorithmJK::Separated(_, AlgorithmK::RIDirect) => {
                         self.generate_vk_ri_direct(scaling_ksr, self.mol.ctrl.use_dm_only, None, Some(-omega))
                     }
                     _ => {
@@ -2140,8 +2161,8 @@ impl SCF {
                     self.generate_vk_with_isdf_new(scaling_factor)
                 } else {
                     match self.algorithm_jk {
-                    AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
-                    AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None, None),
+                    AlgorithmJK::RIIncore | AlgorithmJK::Separated(_, AlgorithmK::RIIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
+                    AlgorithmJK::RIDirect | AlgorithmJK::Separated(_, AlgorithmK::RIDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None, None),
                     _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
                     }
                 };
@@ -2717,8 +2738,8 @@ impl SCF {
             self.generate_vk_with_isdf_new(1.0)
         }else{
             match self.algorithm_jk {
-                AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(1.0, use_dm_only, None, None),
-                AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(1.0, use_dm_only, mpi_operator),
+                AlgorithmJK::RIDirect | AlgorithmJK::Separated(_, AlgorithmK::RIDirect) => self.generate_vk_ri_direct(1.0, use_dm_only, None, None),
+                AlgorithmJK::RIIncore | AlgorithmJK::Separated(_, AlgorithmK::RIIncore) => self.generate_vk_with_ri_v(1.0, use_dm_only, mpi_operator),
                 _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             }
         };
@@ -3563,6 +3584,28 @@ impl SCF {
         let dms = &self.density_matrix[0..self.mol.spin_channel];
         let mol_obj = &self.mol;
         let mut vjs = ri_jk::generate_vj_ri_direct(dms, mol_obj, batch_size);
+
+        // complete `vjs` if the spin channel is 1 (restricted, spin-unpolarized)
+        if self.mol.spin_channel == 1 {
+            vjs.push(MatrixUpper::new(1, 0.0f64));
+        }
+
+        vjs
+    }
+
+    /// Generate Coulomb (J) matrices using the Schwartz-screened RI-J algorithm
+    /// (`algorithm_j = ri-schwartz`). The per-geometry engine is built in
+    /// `prepare_necessary_integrals`. This path is not MPI-parallel (single-node).
+    fn generate_vj_ri_schwartz(&self) -> Vec<MatrixUpper<f64>> {
+        let engine = self.schwartz_rij_engine.as_ref().expect(
+            "Schwartz-screened RI-J engine is not built; the SCF object was not prepared with algorithm_j = ri-schwartz.",
+        );
+
+        debug!("Entering Schwartz-screened RI-J algorithm ({} shell pairs).", engine.pairs.pairs.len());
+
+        // compute vj only for specified spin channels
+        let dms = &self.density_matrix[0..self.mol.spin_channel];
+        let mut vjs = ri_jk::generate_vj_ri_schwartz(engine, dms);
 
         // complete `vjs` if the spin channel is 1 (restricted, spin-unpolarized)
         if self.mol.spin_channel == 1 {
@@ -4698,14 +4741,41 @@ pub fn scf(mol:Molecule, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<S
     Ok(scf_data)
 }
 
+/// AO -> MO transformation of the symmetric-format RI 3-center tensor.
+///
+/// Dispatch rule, in order:
+///   1. if the eigenvector is not backed by a contiguous buffer, use `v02`, which
+///      works through the generic `BasicMatrix` interface;
+///   2. otherwise contract the *narrower* of the two requested blocks first.
+///      `m1` preslices the column (ket) block, `m2` preslices the row (bra) block.
+///      The two kernels are algebraically identical and differ only in which
+///      side carries the `dsymm`, so the cheap order costs
+///      `n^2 * min(|row|, |col|) + n * |row| * |col|` per auxiliary function
+///      instead of `n^2 * nmo + n * |row| * |col|`.
+///
+/// The per-orbital and per-block callers of RI-GW request (1, nmo) and
+/// (block, nmo) shapes, where the column block is the whole MO space. Those go
+/// through `m2` and no longer pay `n^2 * nmo` per auxiliary function.
 fn ao2mo_rayon<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops::Range<usize>, column_dim: std::ops::Range<usize>)
 -> anyhow::Result<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)>
     where T: BasicMatrix<'a, f64>+std::marker::Sync,
           P: BasicMatrix<'a, f64>
 {
-    ao2mo_rayon_v02(eigenvector, rimat_chunk, row_dim, column_dim)
-    //let mut 
-    //ri_ao2mo_f
+    // `m1` and `m2` walk the eigenvector through raw offsets, which assumes a
+    // contiguous, column-major `[nao, nmo]` buffer. Anything else goes to `v02`,
+    // which only uses the generic `BasicMatrix` interface.
+    let nao = eigenvector.size()[0];
+    let slicable = eigenvector.data_ref().is_some()
+        && eigenvector.is_contiguous()
+        && eigenvector.indicing() == [1, nao];
+    if !slicable {
+        return ao2mo_rayon_v02(eigenvector, rimat_chunk, row_dim, column_dim);
+    }
+    if row_dim.len() < column_dim.len() {
+        ao2mo_rayon_m2(eigenvector, rimat_chunk, row_dim, column_dim)
+    } else {
+        ao2mo_rayon_m1(eigenvector, rimat_chunk, row_dim, column_dim)
+    }
 }
 
 fn ao2mo_rayon_v01<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops::Range<usize>, column_dim: std::ops::Range<usize>)
@@ -4867,6 +4937,83 @@ where T: BasicMatrix<'a, f64> + std::marker::Sync,
         _dgemm(
             eigenvector, ((0..num_basis), row_dim.clone()), 'T',
             &tmp_mat, ((0..num_basis), (0..num_loc_col)), 'N',
+            &mut loc_ri3mo, ((0..num_loc_row), (0..num_loc_col)),
+            1.0, 0.0
+        );
+        s.send((loc_ri3mo, i_auxbs)).unwrap()
+    });
+    receiver.into_iter().for_each(|(loc_ri3mo, i_auxbs)| {
+        rimo.copy_from_matr(0..num_loc_row, 0..num_loc_col, i_auxbs, 2, &loc_ri3mo, 0..num_loc_row, 0..num_loc_col)
+    });
+
+    omp_set_num_threads_wrapper(default_omp_num_threads);
+
+    Ok((rimo, row_dim, column_dim))
+}
+
+/// M2-optimized AO->MO transformation: contracts the *row* (bra) block first.
+///
+/// Mirror image of `ao2mo_rayon_m1`. Where `m1` preslices the eigenvector to the
+/// requested *column* block and computes `tmp = A x C[:, col]`, this routine
+/// preslices the *row* block and computes `w = A x C[:, row]` followed by
+/// `out[a, i] = sum_u w[u, a] C[u, i]`. Both give the same `[naux, |row|, |col|]`
+/// tensor, and both cost `n^2 * (sliced block) + n * |row| * |col|` per auxiliary
+/// function, so together they cover the cheap contraction order for any block
+/// shape.
+///
+/// Use this whenever `|row_dim| < |column_dim|`. The case that motivates it is
+/// RI-GW, which asks for one MO row at a time against the full MO space
+/// (`|row| = 1`, `|col| = nmo`): contracting the column side first costs
+/// `n^2 * nmo` per auxiliary function for a single row, while contracting the
+/// row side costs `n^2 + n * nmo`.
+pub(crate) fn ao2mo_rayon_m2<'a, T, P>(
+    eigenvector: &T,
+    rimatr_chunk: &P,
+    row_dim: std::ops::Range<usize>,
+    column_dim: std::ops::Range<usize>,
+) -> anyhow::Result<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)>
+where T: BasicMatrix<'a, f64> + std::marker::Sync,
+      P: BasicMatrix<'a, f64>
+{
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
+
+    let num_basis = eigenvector.size()[0];
+    let num_bpair = rimatr_chunk.size()[0];
+    let num_auxbs = rimatr_chunk.size()[1];
+    let num_loc_row = row_dim.len();
+    let num_loc_col = column_dim.len();
+
+    // M2: pre-slice eigenvector to the bra (row) block.
+    // Cost: one-time copy of [nao, |row|] doubles.
+    let mut eigvec_row_data = vec![0.0_f64; num_basis * num_loc_row];
+    let eigvec_src = eigenvector.data_ref().expect("ao2mo_rayon_m2 requires a contiguous eigenvector");
+    for a in 0..num_loc_row {
+        let src_off = (row_dim.start + a) * num_basis;
+        let dst_off = a * num_basis;
+        eigvec_row_data[dst_off..dst_off + num_basis]
+            .copy_from_slice(&eigvec_src[src_off..src_off + num_basis]);
+    }
+    let eigvec_row = MatrixFull::from_vec([num_basis, num_loc_row], eigvec_row_data).unwrap();
+
+    let mut rimo = RIFull::new([num_auxbs, num_loc_row, num_loc_col], 0.0);
+    let (sender, receiver) = channel();
+
+    rimatr_chunk.data_ref().unwrap().par_chunks_exact(num_bpair).enumerate().for_each_with(sender, |s, (i_auxbs, m)| {
+
+        omp_set_num_threads_wrapper(1);
+
+        let mut reduced_ri = MatrixFull::new([num_basis, num_basis], 0.0_f64);
+        reduced_ri.iter_matrixupper_mut().unwrap().zip(m.iter()).for_each(|(to, from)| {*to = *from});
+
+        // M2: dsymm with the sliced bra block, [nao, |row|]
+        let mut tmp_mat = MatrixFull::new([num_basis, num_loc_row], 0.0_f64);
+        _dsymm(&reduced_ri, &eigvec_row, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
+
+        // out[a, i] = sum_u tmp_mat[u, a] * eigenvector[u, i]
+        let mut loc_ri3mo = MatrixFull::new([num_loc_row, num_loc_col], 0.0_f64);
+        _dgemm(
+            &tmp_mat, ((0..num_basis), (0..num_loc_row)), 'T',
+            eigenvector, ((0..num_basis), column_dim.clone()), 'N',
             &mut loc_ri3mo, ((0..num_loc_row), (0..num_loc_col)),
             1.0, 0.0
         );
@@ -5568,6 +5715,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             println!("solvent_model.refresh:   {:10.2}s", timecost);
         }
     }
+    scf_data.scf_converged = scf_converge[0];
     if scf_converge[0] {
         info!("SCF is converged after {:4} iterations.", scf_records.num_iter-1);
         // Level shift is disabled before the final diagonalization to ensure accurate eigenvalues.

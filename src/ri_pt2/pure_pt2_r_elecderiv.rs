@@ -67,9 +67,9 @@ where
 
     // --- dimension check --- //
 
-    let &[nao_tp, naux] = cderi.shape().as_array().unwrap();
-    let &[nao, nocc] = occ_coeff.shape().as_array().unwrap();
-    let &[_, nvir] = vir_coeff.shape().as_array().unwrap();
+    let &[nao_tp, naux] = <&[usize; 2]>::try_from(cderi.shape().as_slice()).unwrap();
+    let &[nao, nocc] = <&[usize; 2]>::try_from(occ_coeff.shape().as_slice()).unwrap();
+    let &[_, nvir] = <&[usize; 2]>::try_from(vir_coeff.shape().as_slice()).unwrap();
 
     assert_eq!(nao_tp, nao * (nao + 1) / 2, "cderi shape mismatch (nao)");
     assert_eq!(nocc, occ_energy.shape()[0], "occ_energy shape mismatch (nocc)");
