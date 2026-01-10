@@ -31,6 +31,7 @@ pub fn prepare_basinfo(l:i32) -> MatrixFull<f64> {
             tmp_ibas[2] = lz as f64;
             tmp_ibas[3] = norm;
             i_bas += 1;
+            println!("debug for (lx,ly,lz) = ({},{},{})", lx, ly, lz);
         }
     }
     basinfo
@@ -38,20 +39,21 @@ pub fn prepare_basinfo(l:i32) -> MatrixFull<f64> {
 
 #[test]
 fn test_prepare_basinfo() {
-    let tmp_matr=prepare_basinfo(0);
-    println!("l=0: {:?},{:?}", tmp_matr.size,tmp_matr.data);
-    let tmp_matr=prepare_basinfo(1);
-    println!("l=1: {:?},{:?}", tmp_matr.size,tmp_matr.data);
+    //let tmp_matr=prepare_basinfo(0);
+    //println!("l=0: {:?},{:?}", tmp_matr.size,tmp_matr.data);
+    //let tmp_matr=prepare_basinfo(1);
+    //println!("l=1: {:?},{:?}", tmp_matr.size,tmp_matr.data);
     let tmp_matr=prepare_basinfo(2);
-    println!("l=2: {:?},{:?}", tmp_matr.size,tmp_matr.data);
-    let tmp_matr=prepare_basinfo(3);
-    println!("l=3: {:?},{:?}", tmp_matr.size,tmp_matr.data);
-    let tmp_matr=prepare_basinfo(4);
-    println!("l=4: {:?},{:?}", tmp_matr.size,tmp_matr.data);
-    let tmp_matr=prepare_basinfo(5);
-    println!("l=5: {:?},{:?}", tmp_matr.size,tmp_matr.data);
-    let tmp_matr=prepare_basinfo(6);
-    println!("l=6: {:?},{:?}", tmp_matr.size,tmp_matr.data);
+    println!("l=2: {:?}", tmp_matr.size);
+    tmp_matr.formated_output(6, "full");
+    //let tmp_matr=prepare_basinfo(3);
+    //println!("l=3: {:?},{:?}", tmp_matr.size,tmp_matr.data);
+    //let tmp_matr=prepare_basinfo(4);
+    //println!("l=4: {:?},{:?}", tmp_matr.size,tmp_matr.data);
+    //let tmp_matr=prepare_basinfo(5);
+    //println!("l=5: {:?},{:?}", tmp_matr.size,tmp_matr.data);
+    //let tmp_matr=prepare_basinfo(6);
+    //println!("l=6: {:?},{:?}", tmp_matr.size,tmp_matr.data);
 }
 
 
@@ -81,6 +83,8 @@ pub enum CarBasInfo {
 
 /// normalization factor for gaussian-type orbital
 ///    ((2*lx-1)!!(2*ly-1)!!(2*lz-1)!!)^{-1/2}
+/// (lx, ly, lz) are ranged using the same order of libcint
+/// taking l=2 as example, the order is xx, xy, xz, yy, yz, zz
 pub const CAR_BAS_INFO_L0: CarBasInfo = CarBasInfo::L0(DMatrix4x1 {
     size: [4,1], 
     indicing: [1,4], 
@@ -105,6 +109,7 @@ pub const CAR_BAS_INFO_L2: CarBasInfo = CarBasInfo::L2(DMatrix4x6 {
             0.0, 1.0, 1.0, 1.0, 
             0.0, 0.0, 2.0, 0.5773502691896258]
 });
+
 pub const CAR_BAS_INFO_L3: CarBasInfo = CarBasInfo::L3(DMatrix4x10 {
     size: [4,10], 
     indicing: [1,4], 
@@ -267,6 +272,129 @@ pub fn cartesian_gto_const(l:usize) -> crate::constants::cartesian_gto::CarBasIn
         CAR_BAS_INFO_L5
     } else if l == 6 {
         CAR_BAS_INFO_L6
+    } else {
+        panic!("No C2S transformation implementation for l > 6")
+    }
+}
+
+/// libcint does not normalize the gaussian-type orbital with l>=2
+pub const CINT_CAR_BAS_INFO_L2: CarBasInfo = CarBasInfo::L2(DMatrix4x6 {
+    size: [4,6], 
+    indicing: [1,4], 
+    data:  [2.0, 0.0, 0.0, 0.5773502691896258, 
+            1.0, 1.0, 0.0, 0.5773502691896258, 
+            1.0, 0.0, 1.0, 0.5773502691896258, 
+            0.0, 2.0, 0.0, 0.5773502691896258, 
+            0.0, 1.0, 1.0, 0.5773502691896258, 
+            0.0, 0.0, 2.0, 0.5773502691896258]
+});
+
+pub const CINT_CAR_BAS_INFO_L3: CarBasInfo = CarBasInfo::L3(DMatrix4x10 {
+    size: [4,10], 
+    indicing: [1,4], 
+    data: [3.0, 0.0, 0.0, 0.2581988897471611, 
+           2.0, 1.0, 0.0, 0.2581988897471611, 
+           2.0, 0.0, 1.0, 0.2581988897471611, 
+           1.0, 2.0, 0.0, 0.2581988897471611, 
+           1.0, 1.0, 1.0, 0.2581988897471611,
+           1.0, 0.0, 2.0, 0.2581988897471611, 
+           0.0, 3.0, 0.0, 0.2581988897471611, 
+           0.0, 2.0, 1.0, 0.2581988897471611, 
+           0.0, 1.0, 2.0, 0.2581988897471611, 
+           0.0, 0.0, 3.0, 0.2581988897471611]
+});
+pub const CINT_CAR_BAS_INFO_L4: CarBasInfo = CarBasInfo::L4(DMatrix4x15 {
+    size: [4,15], 
+    indicing: [1,4], 
+    data: [4.0, 0.0, 0.0, 0.09759000729485333, 
+           3.0, 1.0, 0.0, 0.09759000729485333, 
+           3.0, 0.0, 1.0, 0.09759000729485333, 
+           2.0, 2.0, 0.0, 0.09759000729485333, 
+           2.0, 1.0, 1.0, 0.09759000729485333, 
+           2.0, 0.0, 2.0, 0.09759000729485333, 
+           1.0, 3.0, 0.0, 0.09759000729485333, 
+           1.0, 2.0, 1.0, 0.09759000729485333, 
+           1.0, 1.0, 2.0, 0.09759000729485333, 
+           1.0, 0.0, 3.0, 0.09759000729485333, 
+           0.0, 4.0, 0.0, 0.09759000729485333,
+           0.0, 3.0, 1.0, 0.09759000729485333, 
+           0.0, 2.0, 2.0, 0.09759000729485333, 
+           0.0, 1.0, 3.0, 0.09759000729485333, 
+           0.0, 0.0, 4.0, 0.09759000729485333]
+});
+pub const CINT_CAR_BAS_INFO_L5: CarBasInfo = CarBasInfo::L5(DMatrix4x21 {
+    size: [4,21], 
+    indicing: [1,4], 
+    data: [5.0, 0.0, 0.0, 0.03253000243161777, 
+           4.0, 1.0, 0.0, 0.03253000243161777, 
+           4.0, 0.0, 1.0, 0.03253000243161777, 
+           3.0, 2.0, 0.0, 0.03253000243161777, 
+           3.0, 1.0, 1.0, 0.03253000243161777, 
+           3.0, 0.0, 2.0, 0.03253000243161777, 
+           2.0, 3.0, 0.0, 0.03253000243161777, 
+           2.0, 2.0, 1.0, 0.03253000243161777, 
+           2.0, 1.0, 2.0, 0.03253000243161777, 
+           2.0, 0.0, 3.0, 0.03253000243161777, 
+           1.0, 4.0, 0.0, 0.03253000243161777, 
+           1.0, 3.0, 1.0, 0.03253000243161777, 
+           1.0, 2.0, 2.0, 0.03253000243161777, 
+           1.0, 1.0, 3.0, 0.03253000243161777, 
+           1.0, 0.0, 4.0, 0.03253000243161777, 
+           0.0, 5.0, 0.0, 0.03253000243161777, 
+           0.0, 4.0, 1.0, 0.03253000243161777, 
+           0.0, 3.0, 2.0, 0.03253000243161777, 
+           0.0, 2.0, 3.0, 0.03253000243161777, 
+           0.0, 1.0, 4.0, 0.03253000243161777, 
+           0.0, 0.0, 5.0, 0.03253000243161777]
+});
+pub const CINT_CAR_BAS_INFO_L6: CarBasInfo = CarBasInfo::L6(DMatrix4x28 {
+    size: [4,28], 
+    indicing: [1,4], 
+    data: [6.0, 0.0, 0.0, 0.009808164772274995, 
+           5.0, 1.0, 0.0, 0.009808164772274995, 
+           5.0, 0.0, 1.0, 0.009808164772274995, 
+           4.0, 2.0, 0.0, 0.009808164772274995, 
+           4.0, 1.0, 1.0, 0.009808164772274995, 
+           4.0, 0.0, 2.0, 0.009808164772274995, 
+           3.0, 3.0, 0.0, 0.009808164772274995, 
+           3.0, 2.0, 1.0, 0.009808164772274995, 
+           3.0, 1.0, 2.0, 0.009808164772274995, 
+           3.0, 0.0, 3.0, 0.009808164772274995, 
+           2.0, 4.0, 0.0, 0.009808164772274995, 
+           2.0, 3.0, 1.0, 0.009808164772274995, 
+           2.0, 2.0, 2.0, 0.009808164772274995, 
+           2.0, 1.0, 3.0, 0.009808164772274995, 
+           2.0, 0.0, 4.0, 0.009808164772274995, 
+           1.0, 5.0, 0.0, 0.009808164772274995, 
+           1.0, 4.0, 1.0, 0.009808164772274995, 
+           1.0, 3.0, 2.0, 0.009808164772274995, 
+           1.0, 2.0, 3.0, 0.009808164772274995, 
+           1.0, 1.0, 4.0, 0.009808164772274995, 
+           1.0, 0.0, 5.0, 0.009808164772274995, 
+           0.0, 6.0, 0.0, 0.009808164772274995, 
+           0.0, 5.0, 1.0, 0.009808164772274995, 
+           0.0, 4.0, 2.0, 0.009808164772274995, 
+           0.0, 3.0, 3.0, 0.009808164772274995, 
+           0.0, 2.0, 4.0, 0.009808164772274995, 
+           0.0, 1.0, 5.0, 0.009808164772274995, 
+           0.0, 0.0, 6.0, 0.009808164772274995]
+});
+
+pub fn cint_cartesian_gto_const(l:usize) -> crate::constants::cartesian_gto::CarBasInfo {
+    if l == 0 {
+        CAR_BAS_INFO_L0
+    } else if l == 1 {
+        CAR_BAS_INFO_L1
+    } else if l == 2 {
+        CINT_CAR_BAS_INFO_L2
+    } else if l == 3 {
+        CINT_CAR_BAS_INFO_L3
+    } else if l == 4 {
+        CINT_CAR_BAS_INFO_L4
+    } else if l == 5 {
+        CINT_CAR_BAS_INFO_L5
+    } else if l == 6 {
+        CINT_CAR_BAS_INFO_L6
     } else {
         panic!("No C2S transformation implementation for l > 6")
     }

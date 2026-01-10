@@ -5,6 +5,7 @@ pub mod libxc_itrf;
 pub mod xc_deriv;
 pub mod num_int;
 
+use libm::powf;
 use mpi::collective::SystemOperation;
 use mpi::ffi::MPI_T_SCOPE_GROUP_EQ;
 use rest_tensors::{MatrixFull, MatrixFullSliceMut, TensorSliceMut, RIFull, MatrixFullSlice};
@@ -2510,14 +2511,6 @@ impl Grids {
 
         let num_grids = self.coordinates.len();
         let num_basis = mol.num_basis;
-        println!("debug info: prepare_tabulated_ao_rayon_v02: num_basis: {}, num_grids: {}", num_basis, num_grids);
-        if let Some(thread_id) = rayon::current_thread_index() {
-            if thread_id == 0 {
-                println!("debug info: rayon_{} prepare_tabulated_ao_rayon_v02: num_basis: {}, num_grids: {}", thread_id, num_basis, num_grids)
-            };
-        } else {
-            println!("debug info serial: prepare_tabulated_ao_rayon_v02: num_basis: {}, num_grids: {}", num_basis, num_grids);
-        }
 
         // handle memory exceed
         // AJZ: here tabulated grids will cost (num_basis * num_grids * 1 or 4) memory, depending on whether gradients are needed.
@@ -2556,6 +2549,7 @@ impl Grids {
                 //tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
                 let tmp_geom:[f64;3] = geom.try_into().unwrap();
                 let tab_den = gto_value_serial(&self.coordinates[range_grids.clone()], &tmp_geom, elem, &mol.ctrl.basis_type);
+                //println!("debug info: start: {}, end: {}, loc_num_grids: {}, loc_num_bas: {}", start, end, loc_num_grids, loc_num_bas);
 
                 loc_ao.copy_from_matr(start..end, 0..loc_num_grids, &tab_den, 0..loc_num_bas, 0..loc_num_grids);
 
@@ -3421,8 +3415,47 @@ pub fn numerical_density(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull<f64>>
     }
 }
 
+pub fn numerical_orbital_population(grid: &Grids, mol: &Molecule) -> Vec<f64> {
+    let mut orbital_densities = vec![0.0;mol.num_basis];
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
+    let local_basis4elem = mol.basis4elem.clone();
+    let local_position = mol.geom.rg_position.clone();
+    let num_basis = mol.num_basis;
+    let basis_type = mol.ctrl.basis_type.clone();
+    let num_grids = grid.coordinates.len();
+    //let (sender,receiver) = channel();
+
+    // reuse the default omp_num_threads setting
+    omp_set_num_threads_wrapper(default_omp_num_threads);
+
+    if let Some(tabulated_ao) = &grid.ao { 
+        orbital_densities.iter_mut().enumerate().for_each(|(i,to)| {
+            grid.weights.iter().zip(tabulated_ao.iter_row(i)).for_each(|(w,ao_r_r)| {
+                *to += ao_r_r*ao_r_r * w
+            })
+        })
+    } else {
+        panic!("tabulated ao is not available")
+    }
+
+    //orbital_densities.iter_mut().enumerate().for_each(|(i,to));
+
+    
+    orbital_densities
+
+}
+
 pub fn numerical_density_rayon(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull<f64>>) -> [f64;2] {
     let mut total_density = [0.0f64;2];
+    let mut given_orbital_densities = 0.0;
+    let orb_index = 13_usize;
+
+    //let mut fack_dm = MatrixFull::new([mol.num_basis,mol.num_basis],0.0);
+    ////fack_dm.iter_diagonal_mut().unwrap().for_each(|x| {
+    ////    *x = 1.0;
+    ////});
+    //fack_dm[(12,12)] = 1.0;
+
     //let mut count:usize = 0;
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     let default_omp_num_threads = omp_get_num_threads_wrapper();
@@ -3434,32 +3467,49 @@ pub fn numerical_density_rayon(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull
     let (sender,receiver) = channel();
     grid.coordinates.par_iter().zip(grid.weights.par_iter()).for_each_with(sender, |s,(r,w)| {
         omp_set_num_threads_wrapper(1);
+
+        //let mut fack_dm = MatrixFull::new([mol.num_basis,mol.num_basis],0.0);
+        ////fack_dm.iter_diagonal_mut().unwrap().for_each(|x| {
+        ////    *x = 1.0;
+        ////});
+        //fack_dm[(orb_index,orb_index)] = 1.0;
+
         let mut local_total_density = [0.0f64;2];
+        let mut local_orbital_densities = 0.0;
         let mut density_r_sum = [0.0;2];
         let mut density_r:Vec<f64> = vec![];
         let mut local_dm = dm.clone();
         local_basis4elem.iter().zip(local_position.iter_columns_full()).for_each(|(elem,geom)| {
             let mut tmp_geom = [0.0;3];
             tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
-            density_r.extend(gto_value(r, &tmp_geom, elem, &basis_type));
+            //density_r.extend(gto_value(r, &tmp_geom, elem, &basis_type));
+            let tmp_coordinate = [r.clone()];
+            let tab_den = gto_value_serial(&tmp_coordinate, &tmp_geom, elem, &basis_type);
+            density_r.extend(tab_den.data.clone());
         });
+
+        let mut local_orbital_densities = density_r[orb_index];
+        local_orbital_densities *= local_orbital_densities*w;
+
         let mut density_rr = MatrixFull::from_vec([num_basis,1],density_r).unwrap();
         local_dm.iter_mut().zip(density_r_sum.iter_mut()).for_each(|(dm_s, density_r_sum)| {
             let mut tmp_mat = MatrixFull::new([num_basis,1],0.0);
             tmp_mat.lapack_dgemm(&mut density_rr, dm_s, 'T', 'N', 1.0, 0.0);
+            //tmp_mat.lapack_dgemm(&mut density_rr, &mut fack_dm, 'T', 'N', 1.0, 0.0);
             *density_r_sum += tmp_mat.data.iter().zip(density_rr.data.iter()).fold(0.0, |acc,(a,b)| {acc + a*b});
         });
         local_total_density.iter_mut().zip(density_r_sum.iter()).for_each(|(to,from)| *to += from*w);
-        s.send(local_total_density).unwrap();
+        s.send((local_total_density,local_orbital_densities)).unwrap();
     });
 
-    receiver.iter().for_each(|value| {
+    receiver.iter().for_each(|(value,orb_value)| {
         total_density.iter_mut().zip(value.iter()).for_each(|(to,from)| *to += from);
-
+        given_orbital_densities += orb_value;
     });
 
     // reuse the default omp_num_threads setting
     omp_set_num_threads_wrapper(default_omp_num_threads);
+    println!("debug: given orbital density: {:?}", given_orbital_densities);
     
     total_density
 }
