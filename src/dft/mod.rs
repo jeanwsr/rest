@@ -940,14 +940,14 @@ impl DFA4REST {
                 dfa_hybrid_pos,
             })
         } else if tmp_name.eq("dsdpbeb95") {
-            // DSD-PBEP95-D3BJ
+            // DSD-PBEB95-D3BJ
             // J. Comput. Chem. 2013, 34, 2327-2344.
             let dfa_family_scf = DFAFamily::HybridMGGA;
             let scf_dfa = ["gga_x_pbe", "mgga_c_bc95"];
             let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
                 DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
                 .flatten().collect();
-            let dfa_paramr_scf = vec![0.24, 0.55];
+            let dfa_paramr_scf = vec![0.34, 0.55];
             let dfa_hybrid_scf = 0.66;
             // PT2 part
             let dfa_family_pos = Some(DFAFamily::PT2);
@@ -965,6 +965,37 @@ impl DFA4REST {
                 dfa_compnt_pos,
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
+            })
+        } else if tmp_name.eq("r-xyg3") {
+            // Renormalized XYG3 functional (experimental)
+            // Replaces PT2 correlation with sBGE2 in the post-SCF part
+            // No publication yet - experimental test of sBGE2 in XYG3 framework
+            let dfa_family_pos = Some(DFAFamily::SBGE2);
+            let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(pos_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten()
+                .collect());
+            let dfa_paramr_pos = Some(vec![-0.0140,0.2107,0.00,0.6789]);
+            let dfa_hybrid_pos = Some(0.8033);
+            let dfa_paramr_adv = Some(vec![0.3211,0.3211]);
+
+            let scf_dfa = ["b3lyp"];
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![1.0;dfa_compnt_scf.len()];
+            let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf, spin_channel);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos
             })
         } else {
             None
