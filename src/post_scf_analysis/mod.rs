@@ -20,7 +20,7 @@ use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon, evaluate_spin_resp
 use crate::ri_rpa::{evaluate_rpa_correlation, evaluate_rpa_correlation_rayon};
 use crate::ri_gw;
 use crate::ri_bse;
-use crate::scf_io::{SCF, SCFType};
+use crate::scf_io::{SCF, SCFType, print_force_for_ghost_point_charges};
 use crate::ri_pt2::{close_shell_pt2_rayon, open_shell_pt2_rayon};
 use crate::utilities::TimeRecords;
 
@@ -114,7 +114,7 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
                 let dp = evaluate_dipole_moment(scf_data, None);
                 println!("Dipole Moment in DEBYE: {:16.8}, {:16.8}, {:16.8}", dp[0], dp[1], dp[2]);
             }
-        } else if output_type.eq("force") {
+        } else if output_type.eq("num_force") {
             let displace = match scf_data.mol.geom.unit {
                 crate::geom_io::GeomUnit::Angstrom => scf_data.mol.ctrl.nforce_displacement/ANG,
                 crate::geom_io::GeomUnit::Bohr => scf_data.mol.ctrl.nforce_displacement,
@@ -133,6 +133,8 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
                 println!("Total atomic forces [ev/ang]: ");
                 println!("{}", formated_force_ev(&num_force, &scf_data.mol.geom.elem));
             }
+        } else if output_type.eq("force_for_ghost_point_charges") {
+            print_force_for_ghost_point_charges(&scf_data)
         }
     });
 }
