@@ -174,7 +174,7 @@ pub fn close_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow
         for i_state in start_mo..num_occ {
             for j_state in i_state+1..num_occ {
                 let (e_mp2_term_os,e_mp2_term_ss, e_eij_term_os, e_eij_term_ss,num_eij_iter) = e_ij[(i_state, j_state)];
-                if scf_data.mol.ctrl.print_level>1 {
+                if scf_data.mol.ctrl.print_level>2 {
                     println!("the ({:3},{:3}) elec-pair: (PT2, sBGE2)=({:16.8},{:16.8})", i_state,j_state, e_mp2_term_ss/2.0, e_eij_term_ss/2.0);
                 }
                 eij_00[(i_state,j_state)] = (e_mp2_term_ss/2.0,e_eij_term_ss/2.0);
@@ -186,7 +186,7 @@ pub fn close_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow
                 //let (e_mp2_term, e_eij_term) = eij_11[(i_state, j_state)];
                 //println!("the ({:3},{:3}) elec-pair: (PT2, sBGE2)=({:16.8},{:16.8})", i_state,j_state, e_mp2_term, e_eij_term);
                 let (e_mp2_term_os,e_mp2_term_ss, e_eij_term_os, e_eij_term_ss,num_eij_iter) = e_ij[(i_state, j_state)];
-                if scf_data.mol.ctrl.print_level>1 {
+                if scf_data.mol.ctrl.print_level>2 {
                     println!("the ({:3},{:3}) elec-pair: (PT2, sBGE2)=({:16.8},{:16.8})", i_state,j_state, e_mp2_term_ss/2.0, e_eij_term_ss/2.0);
                 }
                 eij_11[(i_state,j_state)] = (e_mp2_term_ss/2.0,e_eij_term_ss/2.0);
@@ -198,19 +198,19 @@ pub fn close_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow
                 //let (e_mp2_term, e_eij_term) = eij_01[(i_state, j_state)];
                 if i_state<j_state {
                     let (e_mp2_term_os,e_mp2_term_ss, e_eij_term_os, e_eij_term_ss,num_eij_iter) = e_ij[(i_state, j_state)];
-                    if scf_data.mol.ctrl.print_level>1 {
+                    if scf_data.mol.ctrl.print_level>2 {
                         println!("the ({:3},{:3}) elec-pair: (PT2, sBGE2)=({:16.8},{:16.8})", i_state,j_state, e_mp2_term_os/2.0, e_eij_term_os/2.0);
                     } 
                     eij_01[(i_state,j_state)] = (e_mp2_term_os/2.0,e_eij_term_os/2.0);
                 } else if i_state==j_state {
                     let (e_mp2_term_os,e_mp2_term_ss, e_eij_term_os, e_eij_term_ss,num_eij_iter) = e_ij[(i_state, j_state)];
-                    if scf_data.mol.ctrl.print_level>1 {
+                    if scf_data.mol.ctrl.print_level>2 {
                         println!("the ({:3},{:3}) elec-pair: (PT2, sBGE2)=({:16.8},{:16.8})", i_state,j_state, e_mp2_term_os, e_eij_term_os);
                     }
                     eij_01[(i_state,j_state)] = (e_mp2_term_os,e_eij_term_os);
                 } else if i_state>j_state {
                     let (e_mp2_term_os,e_mp2_term_ss, e_eij_term_os, e_eij_term_ss,num_eij_iter) = e_ij[(j_state, i_state)];
-                    if scf_data.mol.ctrl.print_level>1 {
+                    if scf_data.mol.ctrl.print_level>2 {
                         println!("the ({:3},{:3}) elec-pair: (PT2, sBGE2)=({:16.8},{:16.8})", i_state,j_state, e_mp2_term_os/2.0, e_eij_term_os/2.0);
                     }
                     eij_01[(i_state,j_state)] = (e_mp2_term_os/2.0,e_eij_term_os/2.0);
@@ -628,7 +628,7 @@ pub fn open_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow:
                 });
             }
         }
-        if scf_data.mol.ctrl.print_level>1 {
+        if scf_data.mol.ctrl.print_level>2 {
             let num_occ_alpha = if scf_data.mol.num_elec[1] <= 1.0e-6 {0} else {scf_data.homo[0] + 1};
             let num_occ_beta = if scf_data.mol.num_elec[2] <= 1.0e-6 {0} else {scf_data.homo[1] + 1};
             println!("Print the correlation energies for each electron-pair:");
@@ -1239,8 +1239,12 @@ pub fn open_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF, mpi_operator:&O
                 if i_spin_1 == i_spin_2 {
 
                     let i_spin = i_spin_1;
-                    let eigenvector = scf_data.eigenvectors.get(i_spin).unwrap();
-                    let eigenvalues = scf_data.eigenvalues.get(i_spin).unwrap();
+                    let eigenvector = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvectors.get(i_spin).unwrap(),
+                        SCFType::ROHF => &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin]
+                    };
+                    let eigenvalues = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvalues.get(i_spin).unwrap(),
+                        SCFType::ROHF => &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin]
+                    };
                     let occupation = scf_data.occupation.get(i_spin).unwrap();
 
                     let homo = scf_data.homo[i_spin].clone();
@@ -1343,8 +1347,12 @@ pub fn open_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF, mpi_operator:&O
 
 
                 } else {
-                    let eigenvector_1 = scf_data.eigenvectors.get(i_spin_1).unwrap();
-                    let eigenvalues_1 = scf_data.eigenvalues.get(i_spin_1).unwrap();
+                    let eigenvector_1 = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvectors.get(i_spin_1).unwrap(),
+                        SCFType::ROHF => &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin_1]
+                    };
+                    let eigenvalues_1 = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvalues.get(i_spin_1).unwrap(),
+                        SCFType::ROHF => &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin_1] 
+                    };
                     let occupation_1 = scf_data.occupation.get(i_spin_1).unwrap();
                     let homo_1 = scf_data.homo.get(i_spin_1).unwrap().clone();
                     let lumo_1 = scf_data.lumo.get(i_spin_1).unwrap().clone();
@@ -1353,8 +1361,12 @@ pub fn open_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF, mpi_operator:&O
                     let (rimo_1, vir_range, occ_range) = &ri3mo_vec[i_spin_1];
                     let lumo_min = vir_range.start;
 
-                    let eigenvector_2 = scf_data.eigenvectors.get(i_spin_2).unwrap();
-                    let eigenvalues_2 = scf_data.eigenvalues.get(i_spin_2).unwrap();
+                    let eigenvector_2 = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvectors.get(i_spin_2).unwrap(),
+                        SCFType::ROHF => &scf_data.semi_eigenvectors.as_ref().unwrap()[i_spin_2]
+                    };
+                    let eigenvalues_2 = match scf_data.scftype { SCFType::RHF | SCFType::UHF => scf_data.eigenvalues.get(i_spin_2).unwrap(),
+                        SCFType::ROHF => &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin_2]
+                    };
                     let occupation_2 = scf_data.occupation.get(i_spin_2).unwrap();
                     let homo_2 = scf_data.homo.get(i_spin_2).unwrap().clone();
                     let lumo_2 = scf_data.lumo.get(i_spin_2).unwrap().clone();
