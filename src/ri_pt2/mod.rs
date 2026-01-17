@@ -110,6 +110,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
             },
             SCFType::ROHF => match dfa_family_pos {
                 crate::dft::DFAFamily::PT2 => restricted_open_shell_pt2_rayon_mpi(&scf_data, mpi_operator).unwrap(),
+                crate::dft::DFAFamily::SBGE2 => open_shell_sbge2_rayon_mpi(scf_data, mpi_operator).unwrap(),
                 crate::dft::DFAFamily::SCSRPA => evaluate_osrpa_correlation_rayon_mpi(scf_data, mpi_operator).unwrap(),
                 _ => [0.0,0.0,0.0]
             }

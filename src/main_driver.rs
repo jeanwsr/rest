@@ -387,7 +387,7 @@ pub fn output_result(scf_data: &scf_io::SCF) {
     //--------------------------
     if xc_name.eq("dsdpbep86-nodisp") 
         || xc_name.eq("dsdpbep86") 
-        || xc_name.eq("dsdpbep95") 
+        || xc_name.eq("dsdpbeb95") 
         || xc_name.eq("dsdblyp")
     {
         if let Some(e) = yamaguchi_tot {
@@ -405,6 +405,7 @@ pub fn output_result(scf_data: &scf_io::SCF) {
     // xDH / XYG / ZRPS / SCSRPA
     //--------------------------
     if xc_name.eq("xyg3") 
+        || xc_name.eq("r-xyg3") 
         || xc_name.eq("xygjos") 
         || xc_name.eq("xdh-pbe0") 
         || xc_name.eq("r-xdh7") 
@@ -522,6 +523,7 @@ pub fn collect_total_energy(scf_data: &SCF) -> f64 {
         "dsdpbeb95" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "dsdblyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "r-xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "xyg7" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "xdh-pbe0" => scf_data.energies.get("xdh_energy").unwrap()[0],
