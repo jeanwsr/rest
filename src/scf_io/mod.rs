@@ -3,7 +3,7 @@ use crate::check_norm::force_state_occupation::adapt_occupation_with_force_proje
 use crate::check_norm::{self, generate_occupation_frac_occ, generate_occupation_integer, generate_occupation_sad, OCCType};
 use crate::dft::gen_grids::prune::prune_by_rho;
 use crate::dft::{numerical_density, DFTType, Grids};
-use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges};
+use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges, get_charge};
 use crate::mpi_io::{mpi_broadcast, mpi_broadcast_matrixfull, mpi_broadcast_vector, mpi_reduce, MPIOperator};
 use crate::utilities::{create_pool, TimeRecords};
 use crate::utilities::memory_batch::*;
@@ -2031,6 +2031,118 @@ impl SCF {
 
     }
 
+    pub fn compute_ghost_charge_forces(&self) -> Option<MatrixFull<f64>> {
+        if let Some(grids) = &self.grids {
+            let num_grids = grids.coordinates.len();
+
+            let geom = &self.mol.geom;
+            
+            if geom.ghost_pc_chrg.is_empty() {
+                return None;
+            }
+            
+            let spin_channel = match self.scftype {
+                SCFType::RHF => 1,
+                SCFType::UHF | SCFType::ROHF => 2,
+            };
+            
+            let rho_grid = grids.prepare_tabulated_density(&self.density_matrix, spin_channel);
+
+            let total_electrons: f64 = (0..grids.coordinates.len())
+                .map(|i| grids.weights[i] * if spin_channel == 1 {
+                    rho_grid[[i, 0]]
+                } else {
+                    rho_grid[[i, 0]] + rho_grid[[i, 1]]
+                })
+                .sum();
+            let expected_electrons = self.mol.num_elec[0] as f64;
+            if (total_electrons - expected_electrons).abs() > 1e-6 {
+                println!("Density integration warning");
+                println!("Integrated electrons: {:.6}", total_electrons);
+                println!("Expected electrons: {:.6}", expected_electrons);
+                println!("Difference: {:.6e}", total_electrons - expected_electrons);
+            }
+            //let mut forces = Vec::new();
+            let num_ghosts = geom.ghost_pc_chrg.len();
+            let mut matr_force = MatrixFull::new([3,num_ghosts],0.0);
+            for i in 0..geom.ghost_pc_chrg.len() {
+                let charge = geom.ghost_pc_chrg[i];
+                let position = [
+                    geom.ghost_pc_pos[[0, i]],
+                    geom.ghost_pc_pos[[1, i]],
+                    geom.ghost_pc_pos[[2, i]],
+                ];
+                let mut electron_force = [0.0; 3];
+                for grid_idx in 0..grids.coordinates.len() {
+                    let electron_density = if spin_channel == 1 {
+                        rho_grid[[grid_idx, 0]]
+                    } else {
+                        rho_grid[[grid_idx, 0]] + rho_grid[[grid_idx, 1]]
+                    };
+                    
+                    let electron_charge_density = -electron_density;
+                    
+                    let r_vec = [
+                        position[0] - grids.coordinates[grid_idx][0],
+                        position[1] - grids.coordinates[grid_idx][1],
+                        position[2] - grids.coordinates[grid_idx][2],
+                    ];
+                    let r_sq = r_vec[0]*r_vec[0] + r_vec[1]*r_vec[1] + r_vec[2]*r_vec[2];
+                    
+                    if r_sq > 1e-24 {
+                        let r = r_sq.sqrt();
+                        let denominator = r_sq * r;
+                        let prefactor = grids.weights[grid_idx] * charge * electron_charge_density / denominator;
+                        
+                        electron_force[0] += prefactor * r_vec[0];
+                        electron_force[1] += prefactor * r_vec[1];
+                        electron_force[2] += prefactor * r_vec[2];
+                    }
+                }
+                let mut nuclear_force = [0.0; 3];
+                let nuclear_charges = get_charge(&self.mol.geom.elem);
+                for atom_idx in 0..nuclear_charges.len() {
+                    let nuclear_charge = nuclear_charges[atom_idx];
+                    let atom_position = [
+                        self.mol.geom.position[[0, atom_idx]],
+                        self.mol.geom.position[[1, atom_idx]],
+                        self.mol.geom.position[[2, atom_idx]],
+                    ];
+                    let r_vec = [
+                        position[0] - atom_position[0],
+                        position[1] - atom_position[1],
+                        position[2] - atom_position[2],
+                    ];
+                    let r_sq = r_vec[0]*r_vec[0] + r_vec[1]*r_vec[1] + r_vec[2]*r_vec[2];
+                    
+                    if r_sq > 1e-24 {
+                        let r = r_sq.sqrt();
+                        let denominator = r_sq * r;
+                        let prefactor = charge * nuclear_charge / denominator;
+                        
+                        nuclear_force[0] += prefactor * r_vec[0];
+                        nuclear_force[1] += prefactor * r_vec[1];
+                        nuclear_force[2] += prefactor * r_vec[2];
+                    }
+                }
+                //forces.push([
+                //    electron_force[0] + nuclear_force[0],
+                //    electron_force[1] + nuclear_force[1],
+                //    electron_force[2] + nuclear_force[2],
+                //]);
+                for j in 0..3 {
+                    matr_force[(j,i)] = electron_force[j] + nuclear_force[j]
+                }
+
+            }
+            
+            
+            
+            Some(matr_force)
+        } else {
+            None
+        }
+    }
 //    pub fn generate_ks_hamiltonian_ri_v_dm_only(&mut self, mpi_operator: &Option<MPIOperator>) -> (f64,f64) {
 //        let num_basis = self.mol.num_basis;
 //        let num_state = self.mol.num_state;
@@ -5596,7 +5708,36 @@ pub fn evaluate_spin_angular_momentum(dm: &Vec<MatrixFull<f64>>, ovlp: &MatrixUp
 
 }
 
+pub fn print_force_for_ghost_point_charges(scf_data: &SCF) {
+    if let Some(ghost_forces) = scf_data.compute_ghost_charge_forces() {
+        if scf_data.mol.ctrl.print_level > 0 {
+            println!("Calculating forces on ghost point charges");
+        }
+    
+        
+        println!("------ Forces on point charges [a.u.] ------");
+        let geom = &scf_data.mol.geom;
 
+        ghost_forces.iter_columns_full().enumerate()
+            .zip(geom.ghost_pc_pos.iter_columns_full())
+            .zip(geom.ghost_pc_chrg.iter())
+            .for_each(|(((i,force),position),charge)| {
+            let elem_str = format!("Q{:04}", i+1);  
+            let force_str = format!("{:15.8}{:15.8}{:15.8}", 
+                                force[0], force[1], force[2]);
+            println!("    {:<8} {}", elem_str, force_str);
+            if scf_data.mol.ctrl.print_level > 1 {
+                println!("      Charge: {:.6}, Position: [{:.6}, {:.6}, {:.6}]", 
+                        charge, position[0], position[1], position[2]);
+            }
+        });
+        println!("--------------------------------------------");
+    } else {
+        if scf_data.mol.ctrl.print_level > 0 {
+            println!("No ghost point charges found or grids not available");
+        }
+    }
+}
 
 #[test]
 fn test_max() {

@@ -68,6 +68,7 @@
     - `molden`　　结果输出为molden程序的格式
     - `geometry`  输出分子结构文件
     - `force`     输出分子受力信息
+    - `force_for_ghost_point_charges`  在[geom]部分输入ghost point charges时输出原子区域对这些ghost点电荷的作用力
 - `cube_orb_setting`: 取值[f64;2]。`cube_orb`格点参数设置。前一个值(margin)是边界信息，第二个值(num_grids)是生成格点的数目。缺省值为[3.0, 80.0]
 - `cube_orb_indices`: 取值Vec\<[usize;3]\>。
 	- 指定需要生成cube文件的一组轨道。缺省为空，即`[]`
