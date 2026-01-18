@@ -19,6 +19,7 @@ use crate::molecule_io::Molecule;
 use crate::scf_io::{SCF, SCFType};
 use crate::utilities::{TimeRecords, self};
 use crate::mpi_io::{self, mpi_reduce, MPIOperator};
+use crate::post_scf_analysis::{split_indices_by_spin_occ, format_indices};
 
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
 
@@ -83,7 +84,16 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         timerecords.count_start("ao2mo");
         let (occ_range, vir_range) = determine_ri3mo_size_for_pt2_and_rpa(&scf_data);
         if scf_data.mol.ctrl.print_level>1 {
-            println!("generate RI3MO only for occ_range:{:?}, vir_range:{:?}", &occ_range, &vir_range)
+            //println!("generate RI3MO only for occ_range:{:?}, vir_range:{:?}", &occ_range, &vir_range);
+            let spin_orb_indices = split_indices_by_spin_occ(&scf_data.occupation, 0.5);
+            let (alpha_occ, alpha_vir) = &spin_orb_indices[0];
+            println!("Occupied orbitals (alpha): {}", format_indices(alpha_occ));
+            println!("Virtual orbitals (alpha): {}", format_indices(alpha_vir));
+            if matches!(scf_data.scftype, SCFType::UHF | SCFType::ROHF) {
+                let (beta_occ,  beta_vir)  = &spin_orb_indices[1];
+                println!("Occupied orbitals (beta): {}", format_indices(beta_occ));
+                println!("Virtual orbitals (beta): {}", format_indices(beta_vir));
+            }
         };
         scf_data.generate_ri3mo_rayon(vir_range, occ_range);
         if scf_data.mol.ctrl.print_level>1 {

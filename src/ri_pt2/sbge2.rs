@@ -174,7 +174,7 @@ pub fn close_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow
         for i_state in start_mo..num_occ {
             for j_state in i_state+1..num_occ {
                 let (e_mp2_term_os,e_mp2_term_ss, e_eij_term_os, e_eij_term_ss,num_eij_iter) = e_ij[(i_state, j_state)];
-                if scf_data.mol.ctrl.print_level>1 {
+                if scf_data.mol.ctrl.print_level>2 {
                     println!("the ({:3},{:3}) elec-pair: (PT2, sBGE2)=({:16.8},{:16.8})", i_state,j_state, e_mp2_term_ss/2.0, e_eij_term_ss/2.0);
                 }
                 eij_00[(i_state,j_state)] = (e_mp2_term_ss/2.0,e_eij_term_ss/2.0);
@@ -186,7 +186,7 @@ pub fn close_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow
                 //let (e_mp2_term, e_eij_term) = eij_11[(i_state, j_state)];
                 //println!("the ({:3},{:3}) elec-pair: (PT2, sBGE2)=({:16.8},{:16.8})", i_state,j_state, e_mp2_term, e_eij_term);
                 let (e_mp2_term_os,e_mp2_term_ss, e_eij_term_os, e_eij_term_ss,num_eij_iter) = e_ij[(i_state, j_state)];
-                if scf_data.mol.ctrl.print_level>1 {
+                if scf_data.mol.ctrl.print_level>2 {
                     println!("the ({:3},{:3}) elec-pair: (PT2, sBGE2)=({:16.8},{:16.8})", i_state,j_state, e_mp2_term_ss/2.0, e_eij_term_ss/2.0);
                 }
                 eij_11[(i_state,j_state)] = (e_mp2_term_ss/2.0,e_eij_term_ss/2.0);
@@ -198,19 +198,19 @@ pub fn close_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow
                 //let (e_mp2_term, e_eij_term) = eij_01[(i_state, j_state)];
                 if i_state<j_state {
                     let (e_mp2_term_os,e_mp2_term_ss, e_eij_term_os, e_eij_term_ss,num_eij_iter) = e_ij[(i_state, j_state)];
-                    if scf_data.mol.ctrl.print_level>1 {
+                    if scf_data.mol.ctrl.print_level>2 {
                         println!("the ({:3},{:3}) elec-pair: (PT2, sBGE2)=({:16.8},{:16.8})", i_state,j_state, e_mp2_term_os/2.0, e_eij_term_os/2.0);
                     } 
                     eij_01[(i_state,j_state)] = (e_mp2_term_os/2.0,e_eij_term_os/2.0);
                 } else if i_state==j_state {
                     let (e_mp2_term_os,e_mp2_term_ss, e_eij_term_os, e_eij_term_ss,num_eij_iter) = e_ij[(i_state, j_state)];
-                    if scf_data.mol.ctrl.print_level>1 {
+                    if scf_data.mol.ctrl.print_level>2 {
                         println!("the ({:3},{:3}) elec-pair: (PT2, sBGE2)=({:16.8},{:16.8})", i_state,j_state, e_mp2_term_os, e_eij_term_os);
                     }
                     eij_01[(i_state,j_state)] = (e_mp2_term_os,e_eij_term_os);
                 } else if i_state>j_state {
                     let (e_mp2_term_os,e_mp2_term_ss, e_eij_term_os, e_eij_term_ss,num_eij_iter) = e_ij[(j_state, i_state)];
-                    if scf_data.mol.ctrl.print_level>1 {
+                    if scf_data.mol.ctrl.print_level>2 {
                         println!("the ({:3},{:3}) elec-pair: (PT2, sBGE2)=({:16.8},{:16.8})", i_state,j_state, e_mp2_term_os/2.0, e_eij_term_os/2.0);
                     }
                     eij_01[(i_state,j_state)] = (e_mp2_term_os/2.0,e_eij_term_os/2.0);
@@ -628,7 +628,7 @@ pub fn open_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow:
                 });
             }
         }
-        if scf_data.mol.ctrl.print_level>1 {
+        if scf_data.mol.ctrl.print_level>2 {
             let num_occ_alpha = if scf_data.mol.num_elec[1] <= 1.0e-6 {0} else {scf_data.homo[0] + 1};
             let num_occ_beta = if scf_data.mol.num_elec[2] <= 1.0e-6 {0} else {scf_data.homo[1] + 1};
             println!("Print the correlation energies for each electron-pair:");
