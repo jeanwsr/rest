@@ -288,7 +288,7 @@ impl DFA4REST {
             [0,263,267]
         } else if lower_name.eq(&"revscan".to_string()) {
             [0,581,582]
-        } else if lower_name.eq(&"mn06-l".to_string()) {
+        } else if lower_name.eq(&"m06-l".to_string()) {
             [0,203,233]
         } else if lower_name.eq(&"mn15-l".to_string()) {
             [0,260,261]
@@ -330,8 +330,7 @@ impl DFA4REST {
                     }
                 }
             }
-            println!("Unknown XC method is specified: {}. The standard Hartree-Fock approximation is involked", &name);
-            [0,0,0]
+            panic!("Unknown XC method is specified: {}.", &name);
         }
     }
 
