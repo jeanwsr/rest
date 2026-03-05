@@ -453,8 +453,15 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
     let output_type=qp_ctrl.gw_or_bse.clone();
     if output_type.eq("gw"){
         let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
+        let xc_data=scf_data.mol.xc_data.clone();
+        println!("Current XC data:");
+        println!("dfa_compnt_scf={:?}",xc_data.dfa_compnt_scf);
+        println!("dfa_paramr_scf={:?}",xc_data.dfa_paramr_scf);
+        println!("dfa_hybrid_scf={}",xc_data.dfa_hybrid_scf);
         if qp_ctrl.homo_lumo_gw_qp==true{
             ri_gw::get_homo_lumo_qp_only(scf_data,20,&vxc_nn,mpi_operator);
+        }else if qp_ctrl.self_energy_spectrum_test==true{
+            ri_gw::spectrum_test(scf_data,20);
         }else{
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
             if scf_data.mol.ctrl.print_level>1{

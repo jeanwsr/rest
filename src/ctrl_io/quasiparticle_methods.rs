@@ -46,6 +46,7 @@ pub struct QuasiParticle {
     pub bse_max_ang_momentum:usize,
     pub gw_rootfinder:String,
     pub simplified_bse:bool,
+    pub self_energy_spectrum_test:bool,
     pub pysoc:bool,
     pub gw_imag_rayon:bool
 }
@@ -93,6 +94,7 @@ impl Default for QuasiParticle {
             gw_rootfinder:"newton".to_string(),
             simplified_bse:false,
             bse_max_ang_momentum:10,
+            self_energy_spectrum_test:false,
             pysoc:false,
             gw_imag_rayon:true
         }
@@ -144,6 +146,7 @@ impl QuasiParticle {
         table.insert("pysoc".to_string(), toml::Value::Boolean(self.pysoc));
         table.insert("gw_imag_rayon".to_string(), toml::Value::Boolean(self.gw_imag_rayon));
         table.insert("bse_exchange_rescaling".to_string(), toml::Value::Float(self.bse_exchange_rescaling));
+        table.insert("self_energy_spectrum_test".to_string(), toml::Value::Boolean(self.self_energy_spectrum_test));
         table.insert("bse_max_ang_momentum".to_string(), toml::Value::Integer(self.bse_max_ang_momentum as i64));
         toml::Value::Table(table)
     }
@@ -174,6 +177,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 other => {false},
             };
             tmp_input.bse_tda = match tmp_ctrl.get("bse_tda").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.self_energy_spectrum_test= match tmp_ctrl.get("self_energy_spectrum_test").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };

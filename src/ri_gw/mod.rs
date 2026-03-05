@@ -5,6 +5,7 @@ use std::ops::Range;
 use crate::utilities;
 use crate::scf_io::SCF;
 //use std::slice::Iter::<'_, f64>;
+use std::cmp;
 use std::fs::OpenOptions;
 use std::io::Write;
 use rayon::iter::ParallelBridge;
@@ -127,7 +128,16 @@ pub fn show_energy_levels(scf_data:&SCF){
 }
 
 pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
-    let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
+    let mut ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
+    let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    if qp_ctrl.simplified_bse==true{
+        let ang_momentum=if qp_ctrl.simplified_bse==true{cmp::min(qp_ctrl.bse_max_ang_momentum,6)}else{6};
+        let elements=scf_data.mol.geom.elem.clone();
+        let relevant_indices=ri_bse::sbse::obtain_relevant_indices(scf_data,&elements,ang_momentum);
+        ri_ov=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_ov,&relevant_indices);
+        ri_mat=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_mat,&relevant_indices);
+    }
     let v_matrix=v_matrix(&scf_data,&ri_mat);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let (start_mo,num_state_cutoff,occ_size,vir_size_cutoff,homo,lumo)=get_occupation_parameters(scf_data,'N');
@@ -143,7 +153,6 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     }
     let mut quasiparticle_energies_g=scf_data.gwqp.0.clone();
     let quasiparticle_energies_w=scf_data.gwqp.1.clone();
-    let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
     //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,0);
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
     let mut save_energies:Vec<f64>=vec![0.0;num_state_cutoff];
@@ -638,7 +647,7 @@ pub fn linear_interpolation_solver<F>(mut f:F,starting_point:f64,side:f64,grid_f
     (have_crossing,answer)
 }
 pub fn quasiparticle_equation(omega:f64,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_full:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,num_state:usize,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>)->f64{
-    let contour=contour_rayon(omega,n,quasiparticle_energies_g,quasiparticle_energies_g,occ_size,vir_size,num_state,ri_ov,ri_full);
+    let contour=contour_rayon(omega,n,quasiparticle_energies_g,quasiparticle_energies_w,occ_size,vir_size,num_state,ri_ov,ri_full);
     let imag=calculate_imag(&w_c_at_freqs,num_state,n,omega,quasiparticle_energies_g,quasiparticle_energies_w);
     //println!("quasiparticle equation residue now:={}",consts+contour-imag-omega);
     consts+contour-imag-omega
@@ -651,16 +660,22 @@ pub fn spectrum_test(scf_data:&SCF,num_freq:usize){
     for n in 0..num_state{
         quasiparticle_energies.push(eigenenergies[n]);
     }
-    let ri_full:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
+    let mut ri_full:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
     let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
-
-    let start_freq:f64=-0.8;
-    let end_freq:f64=0.8;
-    let step:f64=0.8/1000.0;
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    if qp_ctrl.simplified_bse==true{
+        let ang_momentum=if qp_ctrl.simplified_bse==true{cmp::min(qp_ctrl.bse_max_ang_momentum,6)}else{6};
+        let elements=scf_data.mol.geom.elem.clone();
+        let relevant_indices=ri_bse::sbse::obtain_relevant_indices(scf_data,&elements,ang_momentum);
+        ri_ov=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_ov,&relevant_indices);
+        ri_full=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_full,&relevant_indices);
+    }
+    let start_freq:f64=-0.5;
+    let step:f64=0.5/600.0;
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_full,&quasiparticle_energies,&quasiparticle_energies,num_state,occ_size,vir_size,num_freq);
-    for n in (6..15){
+    for n in (homo..homo+2){
         println!("Now is the spectrum of orbital #{}",n);
-        (0..2000).into_par_iter().for_each(|w|{
+        (0..1200).into_par_iter().for_each(|w|{
             let freq=start_freq+(w as f64)*step;
             let contour=contour_rayon(freq,n,&quasiparticle_energies,&quasiparticle_energies,occ_size,vir_size,num_state,&ri_ov,&ri_full);
             let imag=calculate_imag(&w_c_at_freqs,num_state,n,freq,&quasiparticle_energies,&quasiparticle_energies);

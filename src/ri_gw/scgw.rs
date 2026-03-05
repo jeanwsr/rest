@@ -26,6 +26,7 @@ use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefMutIterator;
 use crate::ri_gw;
 use std::time::Instant;
+use std::cmp;
 
 pub fn g0w0(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
@@ -66,14 +67,20 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
     for i in 0..homo+1{
         exchange-=v_matrix[[n,i]];
     }
+    let hybrid_param=scf_data.mol.xc_data.dfa_hybrid_scf;
+    println!("Exchange={},V_xc={}",exchange,vxc_nn+hybrid_param*exchange);
     let side=if n>=occ_size{1.0}else{-1.0};
-    let consts=scf_data.eigenvalues[0][n]+exchange-vxc_nn;
+    let consts=scf_data.eigenvalues[0][n]+exchange*(1.0-hybrid_param)-vxc_nn;
+    let imag=ri_gw::calculate_imag(&w_c_at_freqs,num_state,n,0.0,&gwqp_g,&gwqp_w);
+    let contour=ri_gw::contour_rayon(0.0,n,&gwqp_g,&gwqp_w,occ_size,vir_size,num_state,ri_ov,ri_mat);
+    println!("Static Self Energy(Correlation part) Sigma_c(omega=0)={}(imag={},contour={})",contour-imag,imag,contour);
     let mut real_qp=0.0;
     let qp_eq_func=|omega: f64|{
         ri_gw::quasiparticle_equation(omega,n,consts,&ri_ov,&ri_mat,&gwqp_g,&gwqp_w,occ_size,vir_size,num_state,w_c_at_freqs)
     };
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let rootfinder=qp_ctrl.gw_rootfinder.clone();
+
     if rootfinder=="newton".to_string(){
         println!("Orbital #{}:",n);
         let qp_energy=ri_gw::newton_solver(ri_gw::quasiparticle_equation,n,consts,ri_ov,ri_mat,&gwqp_g,&gwqp_w,occ_size,vir_size,num_state,w_c_at_freqs,e_ks_n,0.00001,50,side,scf_data.mol.ctrl.print_level);
@@ -109,7 +116,14 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,t
     let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
     println!("RI-OV Shape={:?}",ri_ov.size);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
+    let mut ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
+    if qp_ctrl.simplified_bse==true{
+        let ang_momentum=if qp_ctrl.simplified_bse==true{cmp::min(qp_ctrl.bse_max_ang_momentum,6)}else{6};
+        let elements=scf_data.mol.geom.elem.clone();
+        let relevant_indices=ri_bse::sbse::obtain_relevant_indices(scf_data,&elements,ang_momentum);
+        ri_ov=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_ov,&relevant_indices);
+        ri_mat=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_mat,&relevant_indices);
+    }
     let start=Instant::now();
     let v_matrix=ri_gw::v_matrix(&scf_data,&ri_mat);
     let time1=start.elapsed();
