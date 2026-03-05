@@ -38,6 +38,7 @@ pub mod scgw;
 pub mod display;
 pub mod fourier_self_energy;
 use crate::mpi_io::MPIOperator;
+pub mod fourier_self_energy;
 
 pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperator>){
     let printlevel=scf_data.mol.ctrl.print_level.clone();
