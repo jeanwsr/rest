@@ -36,6 +36,7 @@ use rayon::iter::IntoParallelRefMutIterator;
 pub mod renormalized_singles;
 pub mod scgw;
 pub mod display;
+pub mod fourier_self_energy;
 use crate::mpi_io::MPIOperator;
 
 pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperator>){
@@ -595,6 +596,17 @@ pub fn newton_solver<F>(mut f:F,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_ful
         println!("warning!!! newton solver did not converge for orbital {}!",n);
     }
     x_curr
+}
+pub fn single_newton_step<F>(mut f:F,starting_point:f64,side:f64,span_energy:f64)->f64 where F:Fn(f64)->f64{
+    let h=0.000001;
+    let delta=0.02;
+    let mut x_curr=starting_point+side*delta;
+    let y_curr=f(x_curr);
+    let y_minus=f(x_curr-h);
+    let y_plus=f(x_curr+h);
+    let derivative=(y_plus-y_minus)/(2.0*h);
+    let shift=-y_curr/derivative;
+    x_curr+shift
 }
 pub fn linear_interpolation_solver<F>(mut f:F,starting_point:f64,side:f64,grid_freqs:usize,span_energy:f64)->(bool,f64) where F:Fn(f64)->f64{
     let h=0.000001;

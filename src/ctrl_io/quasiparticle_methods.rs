@@ -37,6 +37,9 @@ pub struct QuasiParticle {
     pub save_qp_path:String,
     pub save_first_excitation:bool,
     pub save_first_excitation_path:String,
+    pub fourier_self_energy:bool,
+    pub fse_sin_coeff_path:String,
+    pub fse_cos_coeff_path:String,
     pub parse_qp_path:String,
     pub bse_qp_polarization:bool,
     pub threshold:f64,
@@ -85,6 +88,9 @@ impl Default for QuasiParticle {
             save_first_excitation:false,
             save_first_excitation_path:String::from("first_excitation_save.txt"),
             parse_qp_path:String::from("./qp_energies"),
+            fourier_self_energy:false,
+            fse_sin_coeff_path:String::from("./fse_sin_coeff.txt"),
+            fse_cos_coeff_path:String::from("./fse_cos_coeff.txt"),
             bse_qp_polarization:false,
             threshold:0.1,
             gw_or_bse:String::new(),
@@ -136,6 +142,8 @@ impl QuasiParticle {
         table.insert("save_qp_path".to_string(), toml::Value::String(self.save_qp_path.clone()));
         table.insert("save_first_excitation".to_string(), toml::Value::Boolean(self.save_first_excitation));
         table.insert("save_first_excitation_path".to_string(), toml::Value::String(self.save_first_excitation_path.clone()));
+        table.insert("fse_sin_coeff_path".to_string(), toml::Value::String(self.fse_sin_coeff_path.clone()));
+        table.insert("fse_cos_coeff_path".to_string(), toml::Value::String(self.fse_cos_coeff_path.clone()));
         table.insert("parse_qp_path".to_string(), toml::Value::String(self.parse_qp_path.clone()));
         table.insert("bse_qp_polarization".to_string(), toml::Value::Boolean(self.bse_qp_polarization));
         table.insert("threshold".to_string(), toml::Value::Float(self.threshold));
@@ -145,6 +153,7 @@ impl QuasiParticle {
         table.insert("simplified_bse".to_string(), toml::Value::Boolean(self.simplified_bse));
         table.insert("pysoc".to_string(), toml::Value::Boolean(self.pysoc));
         table.insert("gw_imag_rayon".to_string(), toml::Value::Boolean(self.gw_imag_rayon));
+        table.insert("fourier_self_energy".to_string(), toml::Value::Boolean(self.fourier_self_energy));
         table.insert("bse_exchange_rescaling".to_string(), toml::Value::Float(self.bse_exchange_rescaling));
         table.insert("self_energy_spectrum_test".to_string(), toml::Value::Boolean(self.self_energy_spectrum_test));
         table.insert("bse_max_ang_momentum".to_string(), toml::Value::Integer(self.bse_max_ang_momentum as i64));
@@ -232,6 +241,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };
+            tmp_input.fourier_self_energy = match tmp_ctrl.get("fourier_self_energy").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
             tmp_input.obtain_vx_vc_terms = match tmp_ctrl.get("obtain_vx_vc_terms").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
@@ -315,6 +328,14 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.save_qp_path = match tmp_ctrl.get("save_qp_path").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::from("single_qp_save.txt"),
+            };
+            tmp_input.fse_sin_coeff_path = match tmp_ctrl.get("fse_sin_coeff_path").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("fse_sin_coeff.txt"),
+            };
+            tmp_input.fse_cos_coeff_path = match tmp_ctrl.get("fse_cos_coeff_path").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("fse_cos_coeff.txt"),
             };
             tmp_input.gw_rootfinder = match tmp_ctrl.get("gw_rootfinder").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),

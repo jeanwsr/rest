@@ -75,10 +75,25 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
     let contour=ri_gw::contour_rayon(0.0,n,&gwqp_g,&gwqp_w,occ_size,vir_size,num_state,ri_ov,ri_mat);
     println!("Static Self Energy(Correlation part) Sigma_c(omega=0)={}(imag={},contour={})",contour-imag,imag,contour);
     let mut real_qp=0.0;
-    let qp_eq_func=|omega: f64|{
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let qp_eq_func_0=|omega: f64|{
         ri_gw::quasiparticle_equation(omega,n,consts,&ri_ov,&ri_mat,&gwqp_g,&gwqp_w,occ_size,vir_size,num_state,w_c_at_freqs)
     };
-    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let mut origin:f64=0.0;
+    let mut powers:usize=1;
+    let mut t=1.0;
+    let mut sin_coeff:Vec<f64>=vec![0.0];
+    let mut cos_coeff:Vec<f64>=vec![0.0];
+    if qp_ctrl.fourier_self_energy==true{
+        origin=ri_gw::single_newton_step(qp_eq_func_0,scf_data.eigenvalues[0][n],side,qp_ctrl.gw_span_energy);
+        (powers,t,sin_coeff,cos_coeff)=ri_gw::fourier_self_energy::define_fourier_series(&qp_ctrl);
+        println!("Fourier Self Energy Defined:\nOrigin={},Powers={},t={},\nsin_coeff={:#?}\ncos_coeff={:#?}",origin,powers,t,sin_coeff,cos_coeff);
+    }
+    let qp_eq_func=|omega: f64|{
+            println!("Calling QP_Eq_Func");
+            ri_gw::quasiparticle_equation(omega,n,consts,&ri_ov,&ri_mat,&gwqp_g,&gwqp_w,occ_size,vir_size,num_state,w_c_at_freqs)+ri_gw::fourier_self_energy::fourier_series(&sin_coeff,&cos_coeff,powers,t,omega-origin)
+        };
+    
     let rootfinder=qp_ctrl.gw_rootfinder.clone();
 
     if rootfinder=="newton".to_string(){
