@@ -40,6 +40,8 @@ pub struct QuasiParticle {
     pub fourier_self_energy:bool,
     pub fse_sin_coeff_path:String,
     pub fse_cos_coeff_path:String,
+    pub hermite_self_energy:bool,
+    pub hermite_coeff_path:String,
     pub parse_qp_path:String,
     pub bse_qp_polarization:bool,
     pub threshold:f64,
@@ -91,6 +93,8 @@ impl Default for QuasiParticle {
             fourier_self_energy:false,
             fse_sin_coeff_path:String::from("./fse_sin_coeff.txt"),
             fse_cos_coeff_path:String::from("./fse_cos_coeff.txt"),
+            hermite_self_energy:false,
+            hermite_coeff_path:String::from("./hermite_coeff.txt"),
             bse_qp_polarization:false,
             threshold:0.1,
             gw_or_bse:String::new(),
@@ -144,6 +148,8 @@ impl QuasiParticle {
         table.insert("save_first_excitation_path".to_string(), toml::Value::String(self.save_first_excitation_path.clone()));
         table.insert("fse_sin_coeff_path".to_string(), toml::Value::String(self.fse_sin_coeff_path.clone()));
         table.insert("fse_cos_coeff_path".to_string(), toml::Value::String(self.fse_cos_coeff_path.clone()));
+        table.insert("hermite_self_energy".to_string(), toml::Value::Boolean(self.hermite_self_energy));
+        table.insert("hermite_coeff_path".to_string(), toml::Value::String(self.hermite_coeff_path.clone()));
         table.insert("parse_qp_path".to_string(), toml::Value::String(self.parse_qp_path.clone()));
         table.insert("bse_qp_polarization".to_string(), toml::Value::Boolean(self.bse_qp_polarization));
         table.insert("threshold".to_string(), toml::Value::Float(self.threshold));
@@ -245,6 +251,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };
+            tmp_input.hermite_self_energy = match tmp_ctrl.get("hermite_self_energy").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
             tmp_input.obtain_vx_vc_terms = match tmp_ctrl.get("obtain_vx_vc_terms").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
@@ -336,6 +346,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.fse_cos_coeff_path = match tmp_ctrl.get("fse_cos_coeff_path").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::from("fse_cos_coeff.txt"),
+            };
+            tmp_input.hermite_coeff_path = match tmp_ctrl.get("hermite_coeff_path").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("hermite_coeff.txt"),
             };
             tmp_input.gw_rootfinder = match tmp_ctrl.get("gw_rootfinder").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
