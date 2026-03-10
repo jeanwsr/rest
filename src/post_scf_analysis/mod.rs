@@ -469,6 +469,9 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             }
         }
     }else if output_type.eq("bse"){
+        // Prepare BSE-specific RI integrals before BSE calculation
+        scf_data.prepare_bse_integrals(mpi_operator);
+
         if qp_ctrl.gw_scheme=="parse from file"{
             let parse_qp_path=qp_ctrl.parse_qp_path.clone();
             scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");

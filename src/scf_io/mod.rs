@@ -57,6 +57,9 @@ pub struct SCF {
     pub rimatr: Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
     pub ri3mo: Option<Vec<(RIFull<f64>,std::ops::Range<usize> , std::ops::Range<usize>)>>,
     pub ri3mo_full:Option<Vec<(RIFull<f64>,std::ops::Range<usize> , std::ops::Range<usize>)>>,
+    pub ri3fn_bse: Option<RIFull<f64>>,
+    pub rimatr_bse: Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
+    pub num_auxbas_bse: Option<usize>,
     #[pyo3(get,set)]
     pub eigenvalues: [Vec<f64>;2],
     //pub eigenvectors: Vec<Tensors<f64>>,
@@ -112,6 +115,9 @@ impl SCF {
             rimatr: None,
             ri3mo: None,
             ri3mo_full:None,
+            ri3fn_bse: None,
+            rimatr_bse: None,
+            num_auxbas_bse: None,
             eigenvalues: [vec![],vec![]],
             hamiltonian: [MatrixUpper::empty(),
                           MatrixUpper::empty()],
@@ -437,6 +443,57 @@ impl SCF {
             }
         };
 
+    }
+
+    pub fn prepare_bse_integrals(&mut self, mpi_operator: &Option<MPIOperator>) {
+        // Check if BSE-specific auxiliary basis is set
+        let bse_auxbas_path = if let Some(qp) = &self.mol.ctrl.quasiparticle_methods {
+            if let Some(path) = &qp.bse_auxbas_path {
+                path.clone()
+            } else {
+                return; // No BSE-specific auxiliary basis set
+            }
+        } else {
+            return;
+        };
+
+        if self.mol.ctrl.print_level > 0 {
+            println!("Preparing BSE-specific RI integrals with auxiliary basis: {}", bse_auxbas_path);
+        }
+
+        // Save original auxiliary basis information
+        let original_auxbas_path = self.mol.ctrl.auxbas_path.clone();
+        let original_num_auxbas = self.mol.num_auxbas;
+
+        // Switch to BSE auxiliary basis
+        self.mol.reload_auxbas(bse_auxbas_path);
+        self.num_auxbas_bse = Some(self.mol.num_auxbas);
+
+        // Generate BSE-specific RI integrals
+        if self.mol.ctrl.use_ri_symm {
+            // Initialize MPI distribution for BSE integrals if needed
+            if let Some(local_mpi) = &mut self.mol.mpi_data {
+                let num_auxbas = self.mol.num_auxbas;
+                let num_basis = self.mol.num_basis;
+                let cint_bas = self.mol.cint_fdqc.clone();
+                local_mpi.distribute_rimatr_tasks(num_auxbas, num_basis, cint_bas);
+            }
+
+            let (rimatr, basbas2baspar, baspar2basbas) =
+                self.mol.prepare_rimatr_for_ri_v_mpi_rayon(mpi_operator);
+            self.rimatr_bse = Some((rimatr, basbas2baspar, baspar2basbas));
+        } else {
+            self.ri3fn_bse = Some(self.mol.prepare_ri3fn_for_ri_v_full_rayon());
+        }
+
+        // Restore original auxiliary basis
+        self.mol.reload_auxbas(original_auxbas_path);
+
+        if self.mol.ctrl.print_level > 0 {
+            println!("BSE-specific RI integrals prepared successfully");
+            println!("BSE auxiliary basis size: {}, Regular auxiliary basis size: {}",
+                     self.num_auxbas_bse.unwrap(), original_num_auxbas);
+        }
     }
 
     pub fn prepare_density_grids(&mut self) {
@@ -3114,6 +3171,35 @@ impl SCF {
         }
         ri3mo
     }
+
+    pub fn generate_ri3mo_bse(&self, row_range: std::ops::Range<usize>, col_range: std::ops::Range<usize>)
+        -> Vec<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)> {
+
+        // Use BSE-specific RI integrals for AO→MO transformation
+        if let Some((ri3ao, basbas2baspar, baspar2basbas)) = &self.rimatr_bse {
+            // Using symmetric format BSE RI integrals
+            let mut ri3mo = vec![];
+            for i_spin in 0..self.mol.spin_channel {
+                let eigenvector = match self.scftype {
+                    SCFType::ROHF => &self.semi_eigenvectors.as_ref().unwrap()[i_spin],
+                    _ => &self.eigenvectors[i_spin],
+                };
+
+                let tmp_ri3mo = ao2mo_rayon(
+                    eigenvector, ri3ao,
+                    row_range.clone(),
+                    col_range.clone()
+                ).unwrap();
+                ri3mo.push(tmp_ri3mo);
+            }
+            ri3mo
+        } else {
+            // If rimatr_bse is not available, fall back to regular integrals
+            // This maintains backward compatibility
+            panic!("BSE RI integrals (rimatr_bse) not initialized. Only symmetric RI format is supported for BSE.");
+        }
+    }
+
     pub fn generate_ri3mo_full_rayon(&mut self, row_range: std::ops::Range<usize>, col_range: std::ops::Range<usize>) {
         let (mut ri3ao, mut basbas2baspair, mut baspar2basbas) =  if let Some((riao,basbas2baspair, baspar2basbas))=&mut self.rimatr {
             (riao,basbas2baspair, baspar2basbas)

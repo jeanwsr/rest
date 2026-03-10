@@ -379,6 +379,52 @@ impl Molecule {
 
     }
 
+    pub fn reload_auxbas(&mut self, auxbas_path: String) {
+        // Save the new auxiliary basis path
+        let original_auxbas_path = self.ctrl.auxbas_path.clone();
+        self.ctrl.auxbas_path = auxbas_path;
+
+        // Reload auxiliary basis information
+        let etb = if self.ctrl.even_tempered_basis {
+            let etb_elem = get_etb_elem(&self.geom, &self.ctrl.etb_start_atom_number);
+            let etb_basis = etb_gen_for_atom_list(&self, &self.ctrl.etb_beta, &etb_elem);
+            Some(etb_basis)
+        } else {
+            None
+        };
+
+        let (auxbas, cint_aux_atm, cint_aux_bas, cint_aux_env, fdqc_aux_bas, cint_aux_fdqc, num_auxbas) =
+            Molecule::collect_auxbas(&mut self.ctrl, &mut self.geom, etb);
+
+        // Update auxiliary basis fields
+        self.cint_aux_atm = cint_aux_atm;
+        self.cint_aux_bas = cint_aux_bas;
+        self.cint_aux_env = cint_aux_env;
+        self.fdqc_aux_bas = fdqc_aux_bas;
+        self.cint_aux_fdqc = cint_aux_fdqc;
+        self.num_auxbas = num_auxbas;
+        self.auxbas4elem = auxbas;
+
+        // Apply offsets as in initialize_auxbas
+        let off = self.cint_env.len() as i32;
+        let nbas_off = self.cint_bas.len() as i32;
+
+        self.cint_aux_atm.iter_mut().for_each(|i| {
+            if let Some(j) = i.get_mut(1) {*j += off};
+            if let Some(j) = i.get_mut(3) {*j += off};
+        });
+        self.cint_aux_bas.iter_mut().for_each(|i| {
+            if let Some(j) = i.get_mut(5) {*j += off};
+            if let Some(j) = i.get_mut(6) {*j += off};
+        });
+        self.fdqc_aux_bas.iter_mut().for_each(|i| {i.cint_index0 += nbas_off as usize});
+
+        if self.ctrl.print_level > 0 {
+            println!("Reloaded auxiliary basis: {}", self.ctrl.auxbas_path);
+            println!("New auxiliary basis size: {}", self.num_auxbas);
+        }
+    }
+
     pub fn initialize_cint(&self, for_ri: bool) -> CINTR2CDATA {
 
         if for_ri {

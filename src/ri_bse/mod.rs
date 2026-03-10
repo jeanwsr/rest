@@ -209,18 +209,39 @@ pub fn get_submatrix(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:c
     let range_vv=(lumo..num_state, lumo..num_state);
     let range_ov=(start_mo..homo+1, lumo..num_state);
     let range_ff=(start_mo..num_state,start_mo..num_state);
+
+    // Check if BSE-specific RI integrals are available and not for response calculation
+    let use_bse_integrals = (scf_data.ri3fn_bse.is_some() || scf_data.rimatr_bse.is_some())
+                            && response_or_not == 'N';
+
     if choice_a=='F'&&choice_b=='F'{
         vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_ff.0,range_ff.1);
     }else if choice_a=='O'&&choice_b=='O'{
-        vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_oo.0,range_oo.1);
+        vector = if use_bse_integrals {
+            scf_data.generate_ri3mo_bse(range_oo.0, range_oo.1)
+        } else {
+            scf_data.generate_ri3mo_rayon_for_multiple_times(range_oo.0, range_oo.1)
+        };
     }else if choice_a=='V'&&choice_b=='V'{
-        vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_vv.0,range_vv.1);
+        vector = if use_bse_integrals {
+            scf_data.generate_ri3mo_bse(range_vv.0, range_vv.1)
+        } else {
+            scf_data.generate_ri3mo_rayon_for_multiple_times(range_vv.0, range_vv.1)
+        };
     }else if choice_a=='O'&&choice_b=='V'{
-        vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_ov.0,range_ov.1);
+        vector = if use_bse_integrals {
+            scf_data.generate_ri3mo_bse(range_ov.0, range_ov.1)
+        } else {
+            scf_data.generate_ri3mo_rayon_for_multiple_times(range_ov.0, range_ov.1)
+        };
     }else {
         panic!("invalid choice of ri subspace!")
     };
-    println!("Allocated RI Tensor: {}-{}, Size={:?}, For Response={}",choice_a,choice_b,vector[0].0.size,response_or_not);
+
+    let auxbas_type = if use_bse_integrals { "BSE-specific" } else { "Regular" };
+    println!("Allocated RI Tensor: {}-{}, Size={:?}, For Response={}, AuxBas Type={}",
+             choice_a, choice_b, vector[0].0.size, response_or_not, auxbas_type);
+
     let matrix:MatrixFull<f64>=vector[0].0.rifull_to_matfull_i_jk();
     matrix
 }
@@ -312,7 +333,18 @@ pub fn construct_energy_diag_for_a(quasiparticle_energies:&Vec<f64>,occ_size:usi
 }
 pub fn construct_inverse_dielectric(scf_data:&SCF,epsilon:&Vec<f64>)->MatrixFull<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
-    let mut ri_ov=get_submatrix(scf_data,'O','V','Y');
+
+    // Check if BSE-specific auxiliary basis is being used
+    let use_bse_integrals = scf_data.ri3fn_bse.is_some() || scf_data.rimatr_bse.is_some();
+
+    // For response function, use BSE-specific integrals if available
+    // This ensures dimensional consistency with BSE Hamiltonian construction
+    let mut ri_ov = if use_bse_integrals {
+        get_submatrix(scf_data,'O','V','N')  // Use BSE-specific integrals
+    } else {
+        get_submatrix(scf_data,'O','V','Y')  // Use regular integrals
+    };
+
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     if qp_ctrl.simplified_bse==true{
         let ang_momentum=if qp_ctrl.simplified_bse==true{cmp::min(qp_ctrl.bse_max_ang_momentum,6)}else{6};
