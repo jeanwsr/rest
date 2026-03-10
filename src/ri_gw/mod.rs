@@ -156,8 +156,18 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     let quasiparticle_energies_w=scf_data.gwqp.1.clone();
     //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,0);
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
-    let mut save_energies:Vec<f64>=vec![0.0;num_state_cutoff];
-    save_energies=(0..num_state_cutoff).map(|n|{
+
+    // 检查是否启用自能校正
+    let use_fourier = qp_ctrl.fourier_self_energy;
+    let use_hermite = qp_ctrl.hermite_self_energy;
+
+    if use_fourier && use_hermite {
+        panic!("Cannot enable both Fourier self-energy and Hermite self-energy simultaneously!");
+    }
+
+    // 第一轮：正常GW计算（不添加自能校正）
+    let mut save_energies_no_se:Vec<f64>=vec![0.0;num_state_cutoff];
+    save_energies_no_se=(0..num_state_cutoff).map(|n|{
         let consts=if cancel_dfa_xc==true{
             let mut exchange=0.0;
             for i in 0..homo+1{
@@ -165,9 +175,6 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
             }
             scf_data.eigenvalues[0][n]+exchange-vxc_nn[n]
         }else{quasiparticle_energies_g[n]};
-        //for first round, if non-RS, then of course qp==scf;
-        //if RS, testings showed that solving omega=scf-v_xc+sigma_x+sigma_c_RS would be better for fisrt round
-        //To confirm, the consts DO UPDATE over self-consistent GW
         let side=if n>=occ_size{1.0}else{-1.0};
         let printlevel=scf_data.mol.ctrl.print_level.clone();
         let mut real_qp=0.0;
@@ -176,10 +183,73 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
             quasiparticle_equation(omega,n,consts,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs)
         };
         (have_crossing,real_qp)=linear_interpolation_solver(qp_eq_func,scf_data.eigenvalues[0][n],side,21,0.1);
-        //real_qp=newton_solver(quasiparticle_equation,n,consts,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,scf_data.eigenvalues[0][n],0.00001,50,side,printlevel);
-        println!("for n={}, quasiparticle equation yields:qp energy={}",n,real_qp);
+        println!("for n={}, first round (no self-energy correction): qp energy={}",n,real_qp);
         real_qp
     }).collect::<Vec<f64>>().clone();
+
+    // 如果不需要自能校正，直接返回第一轮结果
+    if !use_fourier && !use_hermite {
+        quasiparticle_energies_g=save_energies_no_se.clone();
+        scf_data.gwqp.0=quasiparticle_energies_g.clone();
+        display::full_quasiparticles(&quasiparticle_energies_g,occ_size);
+        return quasiparticle_energies_g;
+    }
+
+    // 第二轮：添加自能校正
+    let mut save_energies:Vec<f64>=vec![0.0;num_state_cutoff];
+
+    if use_fourier {
+        let (powers, t, sin_coeff, cos_coeff) = fourier_self_energy::define_fourier_series(&qp_ctrl);
+        println!("Fourier Self Energy enabled for second round");
+
+        save_energies=(0..num_state_cutoff).map(|n|{
+            let origin = save_energies_no_se[n];
+            let consts=if cancel_dfa_xc==true{
+                let mut exchange=0.0;
+                for i in 0..homo+1{
+                    exchange-=v_matrix[[n,i]];
+                }
+                scf_data.eigenvalues[0][n]+exchange-vxc_nn[n]
+            }else{quasiparticle_energies_g[n]};
+            let side=if n>=occ_size{1.0}else{-1.0};
+            let printlevel=scf_data.mol.ctrl.print_level.clone();
+
+            let qp_eq_func_with_fse=|omega: f64|{
+                quasiparticle_equation(omega,n,consts,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs)
+                    + fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin)
+            };
+
+            let (have_crossing,mut real_qp)=linear_interpolation_solver(qp_eq_func_with_fse,save_energies_no_se[n],side,qp_ctrl.gw_search_grid,qp_ctrl.gw_span_energy);
+            println!("for n={}, second round (with FSE): qp energy={}",n,real_qp);
+            real_qp
+        }).collect::<Vec<f64>>().clone();
+    } else if use_hermite {
+        let hermite_coeff = fourier_self_energy::define_hermite_series(&qp_ctrl);
+        println!("Hermite Self Energy enabled for second round");
+
+        save_energies=(0..num_state_cutoff).map(|n|{
+            let origin = save_energies_no_se[n];
+            let consts=if cancel_dfa_xc==true{
+                let mut exchange=0.0;
+                for i in 0..homo+1{
+                    exchange-=v_matrix[[n,i]];
+                }
+                scf_data.eigenvalues[0][n]+exchange-vxc_nn[n]
+            }else{quasiparticle_energies_g[n]};
+            let side=if n>=occ_size{1.0}else{-1.0};
+            let printlevel=scf_data.mol.ctrl.print_level.clone();
+
+            let qp_eq_func_with_hse=|omega: f64|{
+                quasiparticle_equation(omega,n,consts,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs)
+                    + fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff)
+            };
+
+            let (have_crossing,mut real_qp)=linear_interpolation_solver(qp_eq_func_with_hse,save_energies_no_se[n],side,qp_ctrl.gw_search_grid,qp_ctrl.gw_span_energy);
+            println!("for n={}, second round (with HSE): qp energy={}",n,real_qp);
+            real_qp
+        }).collect::<Vec<f64>>().clone();
+    }
+
     quasiparticle_energies_g=save_energies.clone();
     scf_data.gwqp.0=quasiparticle_energies_g.clone();
     display::full_quasiparticles(&quasiparticle_energies_g,occ_size);
@@ -731,15 +801,24 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
     let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
     //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,0);
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
-    let mut save_energies:Vec<f64>=vec![0.0;num_state];
     let h=qp_ctrl.gw_linearize_derivative_h;
-    save_energies=(0..num_state_qp_range).map(|n|{
+
+    // 检查是否启用自能校正
+    let use_fourier = qp_ctrl.fourier_self_energy;
+    let use_hermite = qp_ctrl.hermite_self_energy;
+
+    if use_fourier && use_hermite {
+        panic!("Cannot enable both Fourier self-energy and Hermite self-energy simultaneously!");
+    }
+
+    // 第一轮：正常线性化GW计算（不添加自能校正）
+    let mut save_energies_no_se:Vec<f64>=vec![0.0;num_state];
+    save_energies_no_se=(0..num_state_qp_range).map(|n|{
         let side=if n>=occ_size{1.0}else{-1.0};
         let omega_shifted=scf_data.eigenvalues[0][n]-delta*side;
         let contour=contour_rayon(omega_shifted,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_mat);
         let imag_n=calculate_imag(&w_c_at_freqs,num_state,n,omega_shifted,&quasiparticle_energies_g,&quasiparticle_energies_w);
-        let mut exchange=0.0;
-        
+
         let contour_plus_h=contour_rayon(omega_shifted+h,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_mat);
         let contour_minus_h=contour_rayon(omega_shifted-h,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_mat);
         let imag_plus_h=calculate_imag(&w_c_at_freqs,num_state,n,omega_shifted+h,&quasiparticle_energies_g,&quasiparticle_energies_w);
@@ -757,15 +836,102 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
             for i in 0..homo+1{
                 exchange-=v_matrix[[n,i]];
             }
-            //println!("for n={},exchange={}",n,exchange);
             omega_shifted+(spectral_weight*(contour-imag_n+exchange-vxc_nn[n]))
         }else{omega_shifted+(spectral_weight*(contour-imag_n))};
-        println!("for n={}, linearized gw yields:qp energy={}",n,real_qp);
+        println!("for n={}, first round (no self-energy correction): linearized gw yields qp energy={}",n,real_qp);
         real_qp
     }).collect::<Vec<f64>>().clone();
+
+    // 如果不需要自能校正，直接返回第一轮结果
+    if !use_fourier && !use_hermite {
+        quasiparticle_energies_g=save_energies_no_se.clone();
+        display::full_quasiparticles(&quasiparticle_energies_g,occ_size);
+        return quasiparticle_energies_g;
+    }
+
+    // 第二轮：添加自能校正
+    let mut save_energies:Vec<f64>=vec![0.0;num_state];
+
+    if use_fourier {
+        let (powers, t, sin_coeff, cos_coeff) = fourier_self_energy::define_fourier_series(&qp_ctrl);
+        println!("Fourier Self Energy enabled for second round (linearized GW)");
+
+        save_energies=(0..num_state_qp_range).map(|n|{
+            let origin = save_energies_no_se[n];
+            let side=if n>=occ_size{1.0}else{-1.0};
+            let omega_shifted=scf_data.eigenvalues[0][n]-delta*side;
+
+            // 计算带FSE的自能及其导数
+            let sigma_with_fse = |omega: f64| -> f64 {
+                let contour=contour_rayon(omega,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_mat);
+                let imag=calculate_imag(&w_c_at_freqs,num_state,n,omega,&quasiparticle_energies_g,&quasiparticle_energies_w);
+                let fse=fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin);
+                contour - imag + fse
+            };
+
+            let self_energy_at_omega=sigma_with_fse(omega_shifted);
+            let self_energy_plus_h=sigma_with_fse(omega_shifted+h);
+            let self_energy_minus_h=sigma_with_fse(omega_shifted-h);
+            let derivative=(self_energy_plus_h-self_energy_minus_h)/(2.0*h);
+
+            if scf_data.mol.ctrl.print_level>1{
+                println!("derivative at n={} (with FSE): {}",n,derivative);
+            }
+            let spectral_weight=(1.0-derivative).powf(-1.0);
+            println!("spectral weight at n={} (with FSE): {}",n,spectral_weight);
+
+            let real_qp=if cancel_dfa_xc==true{
+                let mut exchange=0.0;
+                for i in 0..homo+1{
+                    exchange-=v_matrix[[n,i]];
+                }
+                omega_shifted+(spectral_weight*(self_energy_at_omega+exchange-vxc_nn[n]))
+            }else{omega_shifted+(spectral_weight*self_energy_at_omega)};
+            println!("for n={}, second round (with FSE): linearized gw yields qp energy={}",n,real_qp);
+            real_qp
+        }).collect::<Vec<f64>>().clone();
+    } else if use_hermite {
+        let hermite_coeff = fourier_self_energy::define_hermite_series(&qp_ctrl);
+        println!("Hermite Self Energy enabled for second round (linearized GW)");
+
+        save_energies=(0..num_state_qp_range).map(|n|{
+            let origin = save_energies_no_se[n];
+            let side=if n>=occ_size{1.0}else{-1.0};
+            let omega_shifted=scf_data.eigenvalues[0][n]-delta*side;
+
+            // 计算带HSE的自能及其导数
+            let sigma_with_hse = |omega: f64| -> f64 {
+                let contour=contour_rayon(omega,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_mat);
+                let imag=calculate_imag(&w_c_at_freqs,num_state,n,omega,&quasiparticle_energies_g,&quasiparticle_energies_w);
+                let hse=fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff);
+                contour - imag + hse
+            };
+
+            let self_energy_at_omega=sigma_with_hse(omega_shifted);
+            let self_energy_plus_h=sigma_with_hse(omega_shifted+h);
+            let self_energy_minus_h=sigma_with_hse(omega_shifted-h);
+            let derivative=(self_energy_plus_h-self_energy_minus_h)/(2.0*h);
+
+            if scf_data.mol.ctrl.print_level>1{
+                println!("derivative at n={} (with HSE): {}",n,derivative);
+            }
+            let spectral_weight=(1.0-derivative).powf(-1.0);
+            println!("spectral weight at n={} (with HSE): {}",n,spectral_weight);
+
+            let real_qp=if cancel_dfa_xc==true{
+                let mut exchange=0.0;
+                for i in 0..homo+1{
+                    exchange-=v_matrix[[n,i]];
+                }
+                omega_shifted+(spectral_weight*(self_energy_at_omega+exchange-vxc_nn[n]))
+            }else{omega_shifted+(spectral_weight*self_energy_at_omega)};
+            println!("for n={}, second round (with HSE): linearized gw yields qp energy={}",n,real_qp);
+            real_qp
+        }).collect::<Vec<f64>>().clone();
+    }
+
     quasiparticle_energies_g=save_energies.clone();
     display::full_quasiparticles(&quasiparticle_energies_g,occ_size);
-    //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,1);
     quasiparticle_energies_g
 }
 pub fn get_pure_x_or_c_of_xc(scf_data:&mut SCF,name:&str,choice:char)->Vec<f64>{
