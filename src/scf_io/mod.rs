@@ -5708,7 +5708,7 @@ pub fn print_force_for_ghost_point_charges(scf_data: &SCF) {
         println!("--------------------------------------------");
     } else {
         if scf_data.mol.ctrl.print_level > 0 {
-            println!("No ghost point charges found or grids not available");
+            println!("No ghost point charges found");
         }
     }
 }
