@@ -2032,116 +2032,90 @@ impl SCF {
     }
 
     pub fn compute_ghost_charge_forces(&self) -> Option<MatrixFull<f64>> {
-        if let Some(grids) = &self.grids {
-            let num_grids = grids.coordinates.len();
-
-            let geom = &self.mol.geom;
-            
-            if geom.ghost_pc_chrg.is_empty() {
-                return None;
-            }
-            
-            let spin_channel = match self.scftype {
-                SCFType::RHF => 1,
-                SCFType::UHF | SCFType::ROHF => 2,
-            };
-            
-            let rho_grid = grids.prepare_tabulated_density(&self.density_matrix, spin_channel);
-
-            let total_electrons: f64 = (0..grids.coordinates.len())
-                .map(|i| grids.weights[i] * if spin_channel == 1 {
-                    rho_grid[[i, 0]]
-                } else {
-                    rho_grid[[i, 0]] + rho_grid[[i, 1]]
-                })
-                .sum();
-            let expected_electrons = self.mol.num_elec[0] as f64;
-            if (total_electrons - expected_electrons).abs() > 1e-6 {
-                println!("Density integration warning");
-                println!("Integrated electrons: {:.6}", total_electrons);
-                println!("Expected electrons: {:.6}", expected_electrons);
-                println!("Difference: {:.6e}", total_electrons - expected_electrons);
-            }
-            //let mut forces = Vec::new();
-            let num_ghosts = geom.ghost_pc_chrg.len();
-            let mut matr_force = MatrixFull::new([3,num_ghosts],0.0);
-            for i in 0..geom.ghost_pc_chrg.len() {
-                let charge = geom.ghost_pc_chrg[i];
-                let position = [
-                    geom.ghost_pc_pos[[0, i]],
-                    geom.ghost_pc_pos[[1, i]],
-                    geom.ghost_pc_pos[[2, i]],
-                ];
-                let mut electron_force = [0.0; 3];
-                for grid_idx in 0..grids.coordinates.len() {
-                    let electron_density = if spin_channel == 1 {
-                        rho_grid[[grid_idx, 0]]
-                    } else {
-                        rho_grid[[grid_idx, 0]] + rho_grid[[grid_idx, 1]]
-                    };
-                    
-                    let electron_charge_density = -electron_density;
-                    
-                    let r_vec = [
-                        position[0] - grids.coordinates[grid_idx][0],
-                        position[1] - grids.coordinates[grid_idx][1],
-                        position[2] - grids.coordinates[grid_idx][2],
-                    ];
-                    let r_sq = r_vec[0]*r_vec[0] + r_vec[1]*r_vec[1] + r_vec[2]*r_vec[2];
-                    
-                    if r_sq > 1e-24 {
-                        let r = r_sq.sqrt();
-                        let denominator = r_sq * r;
-                        let prefactor = grids.weights[grid_idx] * charge * electron_charge_density / denominator;
-                        
-                        electron_force[0] += prefactor * r_vec[0];
-                        electron_force[1] += prefactor * r_vec[1];
-                        electron_force[2] += prefactor * r_vec[2];
-                    }
-                }
-                let mut nuclear_force = [0.0; 3];
-                let nuclear_charges = get_charge(&self.mol.geom.elem);
-                for atom_idx in 0..nuclear_charges.len() {
-                    let nuclear_charge = nuclear_charges[atom_idx];
-                    let atom_position = [
-                        self.mol.geom.position[[0, atom_idx]],
-                        self.mol.geom.position[[1, atom_idx]],
-                        self.mol.geom.position[[2, atom_idx]],
-                    ];
-                    let r_vec = [
-                        position[0] - atom_position[0],
-                        position[1] - atom_position[1],
-                        position[2] - atom_position[2],
-                    ];
-                    let r_sq = r_vec[0]*r_vec[0] + r_vec[1]*r_vec[1] + r_vec[2]*r_vec[2];
-                    
-                    if r_sq > 1e-24 {
-                        let r = r_sq.sqrt();
-                        let denominator = r_sq * r;
-                        let prefactor = charge * nuclear_charge / denominator;
-                        
-                        nuclear_force[0] += prefactor * r_vec[0];
-                        nuclear_force[1] += prefactor * r_vec[1];
-                        nuclear_force[2] += prefactor * r_vec[2];
-                    }
-                }
-                //forces.push([
-                //    electron_force[0] + nuclear_force[0],
-                //    electron_force[1] + nuclear_force[1],
-                //    electron_force[2] + nuclear_force[2],
-                //]);
-                for j in 0..3 {
-                    matr_force[(j,i)] = electron_force[j] + nuclear_force[j]
-                }
-
-            }
-            
-            
-            
-            Some(matr_force)
-        } else {
-            None
+        let geom = &self.mol.geom;
+        if geom.ghost_pc_chrg.is_empty() {
+            return None;
         }
+
+        let num_ghosts = geom.ghost_pc_chrg.len();
+        let ghost_pc_chrg = &geom.ghost_pc_chrg;
+        let ghost_pc_pos = &geom.ghost_pc_pos;
+        let mut matr_force = MatrixFull::new([3, num_ghosts], 0.0);
+        let nao = self.mol.num_basis;
+
+        let is_sp = self.mol.ctrl.spin_polarization;
+        let dm = &self.density_matrix;
+        let use_double_dm = is_sp && dm.len() > 1 && dm[1].size == [nao, nao];
+
+        let nuclear_charges = crate::geom_io::get_charge(&geom.elem);
+        let qm_position = &geom.position;
+        let mut temp_mol = self.mol.clone();
+
+        for i in 0..num_ghosts {
+            let q_i = ghost_pc_chrg[i];
+            let pos_i = [
+                ghost_pc_pos[[0, i]],
+                ghost_pc_pos[[1, i]],
+                ghost_pc_pos[[2, i]],
+            ];
+
+            let mut deriv_hcore = vec![0.0; 3 * nao * nao];
+
+            temp_mol.with_rinv_origin(pos_i, |mol_mut| {
+                let cint = mol_mut.initialize_cint(false);
+                let iprinv_out = cint.integrate("int1e_iprinv", "s1", None);
+                
+                if let Some(out_vec) = iprinv_out.out {
+                    for t in 0..3 {
+                        for nu in 0..nao {
+                            for mu in 0..nao {
+                                let idx = mu + nu * nao + t * (nao * nao);
+                                if let Some(&val) = out_vec.get(idx) {
+                                    deriv_hcore[t * nao * nao + mu * nao + nu] += q_i * val;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            let mut electron_force = [0.0; 3];
+            for t in 0..3 {
+                let mut sum_val = 0.0;
+                for mu in 0..nao {
+                    for nu in 0..nao {
+                        let h_val = deriv_hcore[t * nao * nao + mu * nao + nu];
+                        let dm_val = if !use_double_dm { 
+                            dm[0][[mu, nu]] 
+                        } else { 
+                            dm[0][[mu, nu]] + dm[1][[mu, nu]] 
+                        };
+                        sum_val += h_val * dm_val;
+                    }
+                }
+                electron_force[t] = 2.0 * sum_val;
+            }
+
+            let mut nuclear_force = [0.0; 3];
+            for a in 0..nuclear_charges.len() {
+                let pos_a = [qm_position[[0, a]], qm_position[[1, a]], qm_position[[2, a]]];
+                let r_vec = [pos_i[0] - pos_a[0], pos_i[1] - pos_a[1], pos_i[2] - pos_a[2]];
+                let r_sq = r_vec.iter().map(|&x| x * x).sum::<f64>();
+                
+                if r_sq > 1e-12 {
+                    let prefactor = (nuclear_charges[a] * q_i) / (r_sq * r_sq.sqrt());
+                    for t in 0..3 {
+                        nuclear_force[t] += prefactor * r_vec[t];
+                    }
+                }
+            }
+
+            for t in 0..3 {
+                matr_force[[t, i]] = electron_force[t] + nuclear_force[t];
+            }
+        }
+
+        Some(matr_force)
     }
 //    pub fn generate_ks_hamiltonian_ri_v_dm_only(&mut self, mpi_operator: &Option<MPIOperator>) -> (f64,f64) {
 //        let num_basis = self.mol.num_basis;
