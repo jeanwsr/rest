@@ -121,6 +121,90 @@ impl RIUHFGradient<'_> {
         return self;
     }
 
+    pub fn calc_de_qmmm(&mut self) -> &mut Self {
+        let scf_data = &self.scf_data;
+        let mol = &scf_data.mol;
+        let num_qm_atoms = mol.geom.elem.len();
+        
+        let mut de_qmmm = MatrixFull::new([3, num_qm_atoms], 0.0);
+
+        if mol.geom.ghost_pc_chrg.is_empty() {
+            self.result.insert("de_qmmm".into(), de_qmmm);
+            return self;
+        }
+
+        let num_ghosts = mol.geom.ghost_pc_chrg.len();
+        let ghost_pc_chrg = &mol.geom.ghost_pc_chrg;
+        let ghost_pc_pos = &mol.geom.ghost_pc_pos;
+        let qm_position = &mol.geom.position;
+        let qm_elem = &mol.geom.elem;
+        let aoslices = mol.aoslice_by_atom();
+        let nao = if let Some(last) = aoslices.last() { last[3] } else { 0 };
+
+        let nuclear_charges = crate::geom_io::get_charge(qm_elem);
+        for a in 0..num_qm_atoms {
+            let pos_a = [qm_position[[0, a]], qm_position[[1, a]], qm_position[[2, a]]];
+            for i in 0..num_ghosts {
+                let pos_x = [ghost_pc_pos[[0, i]], ghost_pc_pos[[1, i]], ghost_pc_pos[[2, i]]];
+                let r_vec = [pos_a[0] - pos_x[0], pos_a[1] - pos_x[1], pos_a[2] - pos_x[2]];
+                let r_sq = r_vec.iter().map(|&x| x*x).sum::<f64>();
+                if r_sq > 1e-12 {
+                    let prefactor = -1.0 * (nuclear_charges[a] * ghost_pc_chrg[i]) / (r_sq * r_sq.sqrt());
+                    for t in 0..3 { de_qmmm[[t, a]] += prefactor * r_vec[t]; }
+                }
+            }
+        }
+
+        let mut deriv_hcore = vec![0.0; 3 * nao * nao];
+        
+        let mut temp_mol = mol.clone(); 
+        
+        for i in 0..num_ghosts {
+            let q_i = ghost_pc_chrg[i];
+            let pos_i = [ghost_pc_pos[[0, i]], ghost_pc_pos[[1, i]], ghost_pc_pos[[2, i]]];
+            
+            temp_mol.with_rinv_origin(pos_i, |mol_mut| {
+                let cint = mol_mut.initialize_cint(false);
+                let iprinv_out = cint.integrate("int1e_iprinv", "s1", None);
+                
+                if let Some(out_vec) = iprinv_out.out {
+                    for t in 0..3 {
+                        for nu in 0..nao {
+                            for mu in 0..nao {
+                                let idx = mu + nu * nao + t * (nao * nao);
+                                if let Some(&val) = out_vec.get(idx) {
+                                    deriv_hcore[t * nao * nao + mu * nao + nu] += q_i * val;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        let is_sp = mol.ctrl.spin_polarization;
+        let dm = &scf_data.density_matrix;
+        let use_double_dm = is_sp && dm.len() > 1 && dm[1].size == [nao, nao];
+
+        for a in 0..num_qm_atoms {
+            let [_, _, p0, p1] = aoslices[a];
+            for t in 0..3 {
+                let mut sum_val = 0.0;
+                for mu in p0..p1 {
+                    for nu in 0..nao {
+                        let h_val = deriv_hcore[t * nao * nao + mu * nao + nu];
+                        let dm_val = if !use_double_dm { dm[0][[mu, nu]] } 
+                                     else { dm[0][[mu, nu]] + dm[1][[mu, nu]] };
+                        sum_val += h_val * dm_val;
+                    }
+                }
+                de_qmmm[[t, a]] += 2.0 * sum_val;
+            }
+        }
+        self.result.insert("de_qmmm".into(), de_qmmm);
+        return self;
+    }
+
     pub fn calc_de_jk(&mut self) -> &mut Self {
         let mut time_records = crate::utilities::TimeRecords::new();
         time_records.new_item("de-jk preparation 1", "de-jk preparation 1");
@@ -391,6 +475,10 @@ impl RIUHFGradient<'_> {
         self.calc_de_hcore();
         time_records.count("uhf grad calc_de_hcore");
 
+        time_records.count_start("uhf grad calc_de_qmmm");
+        self.calc_de_qmmm();
+        time_records.count("uhf grad calc_de_qmmm");
+
         if self.flags.factor_j.is_some() || self.flags.factor_k.is_some() {
             time_records.count_start("uhf grad calc_de_jk");
             self.calc_de_jk();
@@ -406,6 +494,7 @@ impl RIUHFGradient<'_> {
         self.result.get("de_k").map(|x| de += x.clone());
         self.result.get("de_jaux").map(|x| de += x.clone());
         self.result.get("de_kaux").map(|x| de += x.clone());
+        self.result.get("de_qmmm").map(|x| de += x.clone());
         self.result.insert("de".into(), de);
 
         if self.scf_data.mol.ctrl.print_level >= 2 {
