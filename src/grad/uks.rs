@@ -147,6 +147,10 @@ impl RIUHFGradient<'_> {
         self.calc_de_hcore();
         time_records.count("uks grad calc_de_hcore");
 
+        time_records.count_start("uhf grad calc_de_qmmm");
+        self.calc_de_qmmm();
+        time_records.count("uhf grad calc_de_qmmm");
+
         if self.flags.factor_j.is_some() || self.flags.factor_k.is_some() {
             time_records.count_start("uks grad calc_de_jk");
             self.calc_de_jk();
@@ -167,6 +171,7 @@ impl RIUHFGradient<'_> {
         self.result.get("de_jaux").map(|x| de += x.clone());
         self.result.get("de_kaux").map(|x| de += x.clone());
         self.result.get("de_xc").map(|x| de += x.clone());
+        self.result.get("de_qmmm").map(|x| de += x.clone());
         self.result.insert("de".into(), de);
 
         if self.flags.print_level >= 2 {
