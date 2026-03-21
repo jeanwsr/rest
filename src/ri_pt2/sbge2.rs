@@ -398,7 +398,7 @@ pub fn open_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow:
                 let homo = scf_data.homo[i_spin].clone();
                 let lumo = scf_data.lumo[i_spin].clone();
                 //let num_occu = homo + 1;
-                let num_occu = lumo;
+                let num_occu = lumo.max(homo + 1);
 
                 let (rimo, vir_range, occ_range) = &ri3mo_vec[i_spin];
                 let lumo_min = vir_range.start;
@@ -517,7 +517,7 @@ pub fn open_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow:
                 let homo_1 = scf_data.homo.get(i_spin_1).unwrap().clone();
                 let lumo_1 = scf_data.lumo.get(i_spin_1).unwrap().clone();
                 //let num_occu_1 = homo_1 + 1;
-                let num_occu_1 = lumo_1;
+                let num_occu_1 = lumo_1.max(homo_1 + 1);
                 let (rimo_1, vir_range, occ_range) = &ri3mo_vec[i_spin_1];
                 let lumo_min = vir_range.start;
 
@@ -531,7 +531,7 @@ pub fn open_shell_sbge2_detailed_rayon(scf_data: &crate::scf_io::SCF) -> anyhow:
                 let homo_2 = scf_data.homo.get(i_spin_2).unwrap().clone();
                 let lumo_2 = scf_data.lumo.get(i_spin_2).unwrap().clone();
                 //let num_occu_2 = homo_2 + 1;
-                let num_occu_2 = lumo_2;
+                let num_occu_2 = lumo_2.max(homo_2 + 1);
                 let (rimo_2, _, _) = &ri3mo_vec[i_spin_2];
 
                 // prepare the elec_pair for the rayon parallelization
