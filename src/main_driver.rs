@@ -329,6 +329,13 @@ pub fn main_driver() -> anyhow::Result<()> {
 }
 
 pub fn output_result(scf_data: &scf_io::SCF) {
+    
+    //--------------------------
+    // 0. Solvent energy
+    //--------------------------
+    if scf_data.mol.use_solvent{
+        println!("The solvent energy    : {:18.10} Ha", scf_data.energies.get("solvent_energy").unwrap()[0]);
+    }
     let xc_name = scf_data.mol.ctrl.xc.to_lowercase();
 
     //===========================================================
@@ -443,6 +450,7 @@ pub fn output_result(scf_data: &scf_io::SCF) {
         }
         return;
     }
+
 }
 
 /// Perform key SCF and post-SCF calculations
