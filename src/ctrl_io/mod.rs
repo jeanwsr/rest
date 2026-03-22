@@ -2,6 +2,7 @@
 use pyo3::pyclass;
 use serde::{Deserialize,Serialize};
 use tensors::MatrixFull;
+use core::panic;
 //use std::{fs, str::pattern::StrSearcher};
 use std::{fs, sync::Arc};
 use crate::ctrl_io::geometric_pyo3_io::parse_geometric_keywords;
@@ -13,6 +14,7 @@ use crate::utilities;
 use rayon::ThreadPoolBuilder;
 use crate::check_norm::OCCType;
 use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper,omp_get_num_threads_wrapper};
+use crate::solvent::PcmMethod;
 
 use serde_json;
 use toml;
@@ -194,6 +196,11 @@ pub struct InputKeywords {
     pub scf_acc_etot:f64,
     #[pyo3(get, set)]
     pub restart: bool,
+    #[pyo3(get, set)]
+    // Keywords for solvent models
+    pub solvent_enabled: bool,
+    pub epsilon: f64,
+    pub solvent_model: PcmMethod,
     #[pyo3(get, set)]
     // The initial MO coefficients and eigenvalues can be imported by setting chkfile
     pub chkfile: String,
@@ -409,6 +416,9 @@ impl InputKeywords {
             opt_engine: None,
             geometric_pyo3: None,
             quasiparticle_methods:None,
+            solvent_enabled: false,
+            epsilon:1.0,
+            solvent_model: PcmMethod::CPCM,
         }
     }
 
@@ -596,6 +606,9 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         if ctrl.guess_mix {
             println!("Initial guess mixing enabled: HOMO-LUMO rotated with theta = {:.1}° (alpha), {:.1}° (beta) to induce symmetry breaking",
                 ctrl.guess_mix_theta_deg[0], ctrl.guess_mix_theta_deg[1]);
+        }
+        if ctrl.solvent_enabled {
+                println!("Current solvent model is {}.",ctrl.solvent_model)
         }
 
     }
@@ -1091,7 +1104,47 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(2.0_f64)},
                 other => {2.0_f64},
             };
-
+            // ==============================================
+            //  Keywords associated with solvent model
+            // ==============================================
+            tmp_input.solvent_enabled = match tmp_ctrl.get("solvent_enabled").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
+                serde_json::Value::Null =>{
+                    match tmp_ctrl.get("solvent_model").unwrap_or(&serde_json::Value::Null) {
+                        serde_json::Value::String(model_str) => !model_str.trim().is_empty(),
+                        _ => false,
+                    }
+                },
+                other => false,
+            };
+            tmp_input.solvent_model = match tmp_ctrl.get("solvent_model") {
+                Some(value) => {
+                    serde_json::from_value(value.clone())?
+                },
+                None => PcmMethod::CPCM,
+            };
+            tmp_input.epsilon = match tmp_ctrl.get("epsilon").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_fc) => {tmp_fc.to_lowercase().parse().unwrap_or(1.0_f64)},
+                serde_json::Value::Number(tmp_fc) => {tmp_fc.as_f64().unwrap_or(1.0_f64) as f64},
+                other => {1.0_f64},
+            };
+           // tmp_input.solvent_model = 
+           // match tmp_ctrl.get("solvent_model").unwrap_or(&serde_json::Value::Null) {
+           //     serde_json::Value::String(tmp_type) => {
+           //         let tmp_solvent_model = tmp_type.to_lowercase();
+           //         if tmp_solvent_model.eq("cpcm") {
+           //             PcmMethod::CPCM
+           //         } else if tmp_solvent_model.eq("cosmo") {
+           //             PcmMethod::COSMO
+           //         } else if tmp_solvent_model.eq("iefpcm") {
+           //             PcmMethod::IEFPCM
+           //         } else {
+           //             PcmMethod::disabled
+           //         }
+           //     },
+           //     other => PcmMethod::CPCM,
+           // };
             // ==============================================
             //  Keywords associated with the SCF procedure
             // ==============================================
