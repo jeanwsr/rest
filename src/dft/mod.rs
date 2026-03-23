@@ -996,6 +996,80 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos
             })
+        } else if tmp_name.eq("r-xygjos") {
+            // Renormalized XYGJOS functional (experimental)
+            // Replaces PT2 correlation with sBGE2 in the post-SCF part
+            // No publication yet - experimental test of sBGE2 in XYGJOS framework
+            let dfa_family_pos = Some(DFAFamily::SBGE2);
+            let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
+            //let dfa_compnt_pos: Option<Vec<XcFuncType>> = Some(pos_dfa.iter().map(|xc| {
+            //    DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+            //    .flatten().collect());
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(pos_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect());
+            let dfa_paramr_pos = Some(vec![0.2269,0.000,0.2309,0.2754]);
+            let dfa_hybrid_pos = Some(0.7731);
+            let dfa_paramr_adv = Some(vec![0.4364,0.0000]);
+
+            let dfa_family_scf = DFAFamily::HybridGGA;
+            let scf_dfa = ["b3lyp"];
+            //let dfa_compnt_scf: Vec<XcFuncType> = scf_dfa.iter().map(|xc| {
+            //    DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+            //    .flatten().collect();
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![1.0;dfa_compnt_scf.len()];
+            let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf,spin_channel);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos
+            })
+        } else if tmp_name.eq("r-xyg7") {
+            // Renormalized XYG7 functional (experimental)
+            // Replaces PT2 correlation with sBGE2 in the post-SCF part
+            // No publication yet - experimental test of sBGE2 in XYG7 framework
+            let dfa_family_pos = Some(DFAFamily::SBGE2);
+            let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
+            //let dfa_compnt_pos: Option<Vec<XcFuncType>> = Some(pos_dfa.iter().map(|xc| {
+            //    DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+            //    .flatten().collect());
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(pos_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect());
+            let dfa_paramr_pos = Some(vec![0.2055,-0.1408,0.4056,0.1159]);
+            let dfa_hybrid_pos = Some(0.8971);
+            let dfa_paramr_adv = Some(vec![0.4052,0.2589]);
+
+            let dfa_family_scf = DFAFamily::HybridGGA;
+            let scf_dfa = ["b3lyp"];
+            //let dfa_compnt_scf: Vec<XcFuncType> = scf_dfa.iter().map(|xc| {
+            //    DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+            //    .flatten().collect();
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![1.0;dfa_compnt_scf.len()];
+            let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf,spin_channel);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos
+            })
         } else {
             None
         }
