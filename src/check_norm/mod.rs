@@ -9,6 +9,7 @@ pub enum OCCType {
     INTEGER,
     FRAC,
     ATMSAD,
+    FERMI
 }
 
 pub mod force_state_occupation;

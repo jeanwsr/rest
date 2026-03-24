@@ -167,6 +167,16 @@ impl XcFuncType {
         }
     }
 
+    pub fn code_to_name(code: usize) -> String {
+        for (name, value) in names_and_values::MAP.iter() {
+            if *value == code {
+                return name.to_string();
+            }
+        }
+        "Unknown_XC".to_string()
+    }
+
+
     pub fn xc_func_end(&mut self) {
         unsafe{ffi_xc::xc_func_end(self.xc_func_type)}
     }

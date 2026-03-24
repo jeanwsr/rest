@@ -11,7 +11,7 @@ use rest_libcint::prelude::rest_libcint_wrapper::int1e_r;
 use tensors::{MathMatrix, MatrixFull, RIFull};
 
 use crate::constants::{ANG, AU2DEBYE, SPECIES_INFO};
-use crate::dft::DFAFamily;
+use crate::dft::{DFAFamily};
 use crate::geom_io::get_mass_charge;
 use crate::grad::{formated_force, formated_force_ev, numerical_force};
 use crate::mpi_io::MPIOperator;
@@ -57,6 +57,20 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
                 panic!("The MPI version is not yet implemented for generating orbital cube files");
             } else {
                 cube_build::get_cube_orb(&scf_data);
+            }
+        } else if output_type.eq("tabulated_exc") {
+            println!("Now tabulating e_[xc] to each grid points");
+            if let Some(mpi_op) = &mpi_operator {
+                panic!("The MPI version is not yet implemented for tabulating e_[xc] to each grid points");
+            } else {
+                if let Some(grids) = &scf_data.grids {
+                    let dm = &scf_data.density_matrix;
+                    let mo = &scf_data.eigenvectors;
+                    let occ = &scf_data.occupation;
+                    scf_data.mol.xc_data.post_tabulated_exc(grids, dm, mo, occ);
+                } else {
+                    panic!("The grids are not yet initialized");
+                }
             }
         } else if output_type.eq("molden") {
             if let Some(mpi_op) = &mpi_operator {
@@ -303,6 +317,18 @@ pub fn save_geometry(scf_data: &SCF) {
 }
 
 pub fn print_out_dfa(scf_data: &SCF) {
+    let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);
+    let post_xc_energy = if let Some(grids) = &scf_data.grids {
+        dfa.post_xc_exc(&scf_data.mol.ctrl.post_xc, grids, &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation)
+    } else {
+        vec![[0.0,0.0]]
+    };
+    post_xc_energy.iter().zip(scf_data.mol.ctrl.post_xc.iter()).for_each(|(energy, name)| {
+        println!("{:<16}: {:16.8} Ha", name, energy[0]+energy[1]);
+    });
+}
+
+pub fn print_out_xc_potentials(scf_data: &SCF) {
     let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);
     let post_xc_energy = if let Some(grids) = &scf_data.grids {
         dfa.post_xc_exc(&scf_data.mol.ctrl.post_xc, grids, &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation)
