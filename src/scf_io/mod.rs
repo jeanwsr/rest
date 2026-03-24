@@ -3,7 +3,7 @@ use crate::check_norm::force_state_occupation::adapt_occupation_with_force_proje
 use crate::check_norm::{self, generate_occupation_frac_occ, generate_occupation_integer, generate_occupation_sad, OCCType};
 use crate::dft::gen_grids::prune::prune_by_rho;
 use crate::dft::{numerical_density, DFTType, Grids};
-use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges};
+use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges, get_charge};
 use crate::mpi_io::{mpi_broadcast, mpi_broadcast_matrixfull, mpi_broadcast_vector, mpi_reduce, MPIOperator};
 use crate::utilities::{create_pool, TimeRecords};
 use crate::utilities::memory_batch::*;
@@ -2031,6 +2031,92 @@ impl SCF {
 
     }
 
+    pub fn compute_ghost_charge_forces(&self) -> Option<MatrixFull<f64>> {
+        let geom = &self.mol.geom;
+        if geom.ghost_pc_chrg.is_empty() {
+            return None;
+        }
+
+        let num_ghosts = geom.ghost_pc_chrg.len();
+        let ghost_pc_chrg = &geom.ghost_pc_chrg;
+        let ghost_pc_pos = &geom.ghost_pc_pos;
+        let mut matr_force = MatrixFull::new([3, num_ghosts], 0.0);
+        let nao = self.mol.num_basis;
+
+        let is_sp = self.mol.ctrl.spin_polarization;
+        let dm = &self.density_matrix;
+        let use_double_dm = is_sp && dm.len() > 1 && dm[1].size == [nao, nao];
+
+        let nuclear_charges = crate::geom_io::get_charge(&geom.elem);
+        let qm_position = &geom.position;
+        let mut temp_mol = self.mol.clone();
+
+        for i in 0..num_ghosts {
+            let q_i = ghost_pc_chrg[i];
+            let pos_i = [
+                ghost_pc_pos[[0, i]],
+                ghost_pc_pos[[1, i]],
+                ghost_pc_pos[[2, i]],
+            ];
+
+            let mut deriv_hcore = vec![0.0; 3 * nao * nao];
+
+            temp_mol.with_rinv_origin(pos_i, |mol_mut| {
+                let cint = mol_mut.initialize_cint(false);
+                let iprinv_out = cint.integrate("int1e_iprinv", "s1", None);
+                
+                if let Some(out_vec) = iprinv_out.out {
+                    for t in 0..3 {
+                        for nu in 0..nao {
+                            for mu in 0..nao {
+                                let idx = mu + nu * nao + t * (nao * nao);
+                                if let Some(&val) = out_vec.get(idx) {
+                                    deriv_hcore[t * nao * nao + mu * nao + nu] += q_i * val;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            let mut electron_force = [0.0; 3];
+            for t in 0..3 {
+                let mut sum_val = 0.0;
+                for mu in 0..nao {
+                    for nu in 0..nao {
+                        let h_val = deriv_hcore[t * nao * nao + mu * nao + nu];
+                        let dm_val = if !use_double_dm { 
+                            dm[0][[mu, nu]] 
+                        } else { 
+                            dm[0][[mu, nu]] + dm[1][[mu, nu]] 
+                        };
+                        sum_val += h_val * dm_val;
+                    }
+                }
+                electron_force[t] = 2.0 * sum_val;
+            }
+
+            let mut nuclear_force = [0.0; 3];
+            for a in 0..nuclear_charges.len() {
+                let pos_a = [qm_position[[0, a]], qm_position[[1, a]], qm_position[[2, a]]];
+                let r_vec = [pos_i[0] - pos_a[0], pos_i[1] - pos_a[1], pos_i[2] - pos_a[2]];
+                let r_sq = r_vec.iter().map(|&x| x * x).sum::<f64>();
+                
+                if r_sq > 1e-12 {
+                    let prefactor = (nuclear_charges[a] * q_i) / (r_sq * r_sq.sqrt());
+                    for t in 0..3 {
+                        nuclear_force[t] += prefactor * r_vec[t];
+                    }
+                }
+            }
+
+            for t in 0..3 {
+                matr_force[[t, i]] = electron_force[t] + nuclear_force[t];
+            }
+        }
+
+        Some(matr_force)
+    }
 //    pub fn generate_ks_hamiltonian_ri_v_dm_only(&mut self, mpi_operator: &Option<MPIOperator>) -> (f64,f64) {
 //        let num_basis = self.mol.num_basis;
 //        let num_state = self.mol.num_state;
@@ -5596,7 +5682,36 @@ pub fn evaluate_spin_angular_momentum(dm: &Vec<MatrixFull<f64>>, ovlp: &MatrixUp
 
 }
 
+pub fn print_force_for_ghost_point_charges(scf_data: &SCF) {
+    if let Some(ghost_forces) = scf_data.compute_ghost_charge_forces() {
+        if scf_data.mol.ctrl.print_level > 0 {
+            println!("Calculating forces on ghost point charges");
+        }
+    
+        
+        println!("------ Forces on point charges [a.u.] ------");
+        let geom = &scf_data.mol.geom;
 
+        ghost_forces.iter_columns_full().enumerate()
+            .zip(geom.ghost_pc_pos.iter_columns_full())
+            .zip(geom.ghost_pc_chrg.iter())
+            .for_each(|(((i,force),position),charge)| {
+            let elem_str = format!("Q{:04}", i+1);  
+            let force_str = format!("{:15.8}{:15.8}{:15.8}", 
+                                force[0], force[1], force[2]);
+            println!("    {:<8} {}", elem_str, force_str);
+            if scf_data.mol.ctrl.print_level > 1 {
+                println!("      Charge: {:.6}, Position: [{:.6}, {:.6}, {:.6}]", 
+                        charge, position[0], position[1], position[2]);
+            }
+        });
+        println!("--------------------------------------------");
+    } else {
+        if scf_data.mol.ctrl.print_level > 0 {
+            println!("No ghost point charges found");
+        }
+    }
+}
 
 #[test]
 fn test_max() {
