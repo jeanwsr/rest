@@ -342,207 +342,208 @@ pub struct PcmStatic {
 }
 
 impl PcmStatic{
-    pub fn get_A_D_S(surface: &SurfaceVdwGaussian) -> (Vec<f64>, MatrixFull<f64>, MatrixFull<f64>) {
-        const PI: f64 = std::f64::consts::PI;
-
-        let R_vdw = &surface.surface_calc.R_vdw;
-        let switch_fun = &surface.surface_calc.switch_fun;
-        let weights = &surface.surface_calc.weights;
-
-        //The matrix A is diagonal and consists of the surface element areas, ai.
-        let A: Vec<f64> = weights
-        .iter().zip(R_vdw.iter()).zip(switch_fun.iter())
-        .map(|((&w,&r),&s)| w * r.powi(2) * s).collect();
-
-        let charge_exp = &surface.surface_calc.charge_exp;
-        let grid_coords = &surface.surface_calc.grid_coords;
-        let n_grids = grid_coords.len();
-        let grid_capacity = n_grids * (n_grids + 1) /2;
-        let norm_vec = &surface.surface_calc.norm_vec;
-
-        //println!("DEBUG get_A_D_S: n_grids = {}", n_grids);
-        //println!("DEBUG get_A_D_S: R_vdw len = {}", R_vdw.len());
-        //println!("DEBUG get_A_D_S: switch_fun len = {}", switch_fun.len());
-        //println!("DEBUG get_A_D_S: weights len = {}", weights.len());
-
-        //println!("DEBUG get_A_D_S: grid_capacity = {}", grid_capacity);
-        //assert!(n_grids == R_vdw.len() && n_grids == switch_fun.len() && n_grids == weights.len() && n_grids == charge_exp.len() 
-        //&& n_grids == norm_vec.len(), "Length of grid-related vectors must match the number of grid points.");
-        
-        if n_grids == 0 {
-            panic!("ERROR: No surface grid points generated!");
-        }
-
-        let mut zeta_ij = Vec::with_capacity(grid_capacity);
-        for j in 0..n_grids{
-            for i in 0..j+1{
-                zeta_ij.push(charge_exp[i]*charge_exp[j]/(charge_exp[i].powi(2)+charge_exp[j].powi(2)).sqrt() );
-            }
-        }
-
-        let mut r_ij = Vec::with_capacity(grid_capacity);
-        for j in 0..n_grids{
-            for i in 0..j+1{
-                if i == j {
-                    r_ij.push(1.0);
-                }
-                else{
-                    let dx = grid_coords[i][0] - grid_coords[j][0];
-                    let dy = grid_coords[i][1] - grid_coords[j][1];
-                    let dz = grid_coords[i][2] - grid_coords[j][2];
-                    let r = (dx*dx + dy*dy + dz*dz).sqrt();
-                    r_ij.push(r);
-                }
-            }
-        }
-        //let r_ij = MatrixUpper::from_vec(grid_capacity, tmp_r_ij).unwrap();
-        //let r_ij = r_ij.to_matrixfull();
-        let zeta_r_ij: Vec<f64> = r_ij.iter()
-            .zip(zeta_ij.iter()).map(|(&r, &z)| z*r).collect();
-        
-        // S_ij = erf(zeta_ij * r_ij) / r_ij, with S_ii = charge_exp[i] * (2/pi)^0.5 / switch_fun[i]
-        let mut tmp_S_ij = zeta_r_ij.iter().zip(r_ij.iter())
-            .map(|(&z, &r)| libm::erf(z) / r).collect();
-        let mut S_ij: MatrixFull<f64> = MatrixUpper::from_vec(grid_capacity, tmp_S_ij).unwrap().to_matrixfull().unwrap();
-        for i in 0..n_grids{
-            let s_ii = charge_exp[i] * (2.0 / PI).sqrt() / switch_fun[i];
-            S_ij[(i,i)] = s_ii;
-        }
-
-        let r_ij_matrix: MatrixFull<f64> = MatrixUpper::from_vec(grid_capacity, r_ij).unwrap().to_matrixfull().unwrap();
-        let zeta_r_ij_matrix: MatrixFull<f64> = MatrixUpper::from_vec(grid_capacity, zeta_r_ij).unwrap().to_matrixfull().unwrap();
-        // n_r_ij = \vec{n_j} * \vec{r_ij}, where \vec{n_j} is the normal vector at grid point j, and \vec{r_ij} is the vector from grid point j to grid point i.
-        let mut n_r_ij: Vec<f64> = Vec::with_capacity(n_grids * n_grids);
-        for j in 0..n_grids{
-            for i in 0..n_grids{
-                let dx = grid_coords[i][0] - grid_coords[j][0];
-                let dy = grid_coords[i][1] - grid_coords[j][1];
-                let dz = grid_coords[i][2] - grid_coords[j][2];
-                n_r_ij.push( dx*norm_vec[j].0 + dy*norm_vec[j].1 + dz*norm_vec[j].2 );
-            }
-        }
-    
-        //r_scale = \vec{n_j} * \vec{r_ij}/ r_ij^3, 
-        let r_scale: Vec<f64> = n_r_ij.iter().zip(r_ij_matrix.iter())
-            .map(|(&n, &r)| n / r.powi(3)).collect();
-        let f_zeta_r_ij: Vec<f64> = zeta_r_ij_matrix.iter()
-            .map(|&x| libm::erf(x) - 2.0 / PI.sqrt() * x * f64::exp(-x.powi(2)))
-            .collect();
-        let tmp_D_ij: Vec<f64> = f_zeta_r_ij.iter().zip(r_scale.iter())
-            .map(|(&f, &scale)| f * scale).collect();
-        let mut D_ij = MatrixFull::from_vec([n_grids, n_grids], tmp_D_ij).unwrap();
-        for i in 0..n_grids{
-            let d_ii = -charge_exp[i]* (2.0 / PI).sqrt() / (2.0 * R_vdw[i]);
-            D_ij[(i,i)] = d_ii;
-        }
-
-        (A, D_ij, S_ij)
-
-    }
-
-    pub fn get_K_R_f(surface: &SurfaceVdwGaussian, method: PcmMethod, epsilon: f64) -> (MatrixFull<f64>, MatrixFull<f64>, f64) {
-        const PI: f64 = std::f64::consts::PI;
-
-        //let device = A.device();
-        let (A, D, S) = Self::get_A_D_S(&surface);
-        let ngrids = A.len();
-        let mut R = MatrixFull::<f64>::new([ngrids, ngrids], 0.0);
-        for i in 0..ngrids {
-            R[(i, i)] = 1.0 ;
-        }
-        //let A_matr = MatrixFull::from_vec([ngrids, 1], A.clone()).unwrap();
-
-        match method {
-            PcmMethod::CPCM => {
-                let f_epsilon = (epsilon - 1.0) / epsilon;
-                let K = S.clone();
-                R.self_multiple(-f_epsilon);
-                (K, R, f_epsilon)
-            },
-            PcmMethod::COSMO => {
-                let f_epsilon = (epsilon - 1.0) / (epsilon + 0.5);
-                let K = S.clone();
-                R.self_multiple(-f_epsilon);
-                (K, R, f_epsilon)
-            },
-            PcmMethod::IEFPCM => {
-                let f_epsilon = (epsilon - 1.0) / (epsilon + 1.0);
-                let mut DA = D.clone();
-                for j in 0..ngrids{
-                    for i in 0..ngrids{
-                        DA[(i,j)] = DA[(i,j)] * A[j];
-                    }
-                }
-                //let DA = _dgemm_scaled(&D, 'N', &A_matr, 'N', 1.0);
-                let DAS = _dgemm_scaled(&DA, 'N', &S, 'N', 1.0);
-                let K = S.scaled_add(&DAS, -f_epsilon / (2.0 * PI)).unwrap();
-                //let K = S - f_epsilon / (2.0 * PI) * DAS;
-                //let R = -f_epsilon * (rt::eye((ngrids, device)) - 1.0 / (2.0 * PI) * DA);
-                R.self_scaled_add(&DA, - 1.0 / (2.0 * PI));
-                R.self_multiple(-f_epsilon);
-                (K, R, f_epsilon)
-            },
-            PcmMethod::SSVPE => {
-                let f_epsilon = (epsilon - 1.0) / (epsilon + 1.0);
-                let mut DA = D.clone();
-                for j in 0..ngrids{
-                    for i in 0..ngrids{
-                        DA[(i,j)] = DA[(i,j)] * A[j];
-                    }
-                }
-                //let DA =  _dgemm_scaled(&D, 'N', &A_matr, 'N', 1.0);;
-                let mut DAS = _dgemm_scaled(&DA, 'N', &S, 'N', 1.0);
-                DAS.self_add(&DAS.transpose());
-                let K = S.scaled_add(&DAS,  - f_epsilon / (4.0 * PI)).unwrap();
-                //let K = S - f_epsilon / (4.0 * PI) * (&DAS + DAS.t());
-                R.self_scaled_add(&DA, - 1.0 / (2.0 * PI));
-                R.self_multiple(-f_epsilon);
-                //let R = -f_epsilon * (rt::eye((ngrids, device)) - 1.0 / (2.0 * PI) * DA);
-                (K, R, f_epsilon)
-            },
-        }
-    }
-
-    pub fn get_v_grids_n(surface: &SurfaceVdwGaussian, cint_data: &CINTR2CDATA) -> Vec<f64> {
-    //compute the nuclear contribution to the potential on the surface grid points
-        let grid_coords = &surface.surface_calc.grid_coords;
-        let charge_exp = &surface.surface_calc.charge_exp;
-        let exponents = charge_exp.iter().map(|&x| x * x).collect::<Vec<f64>>();
-        let atom_coords = &cint_data.atom_coords();
-        let atom_charges = &cint_data.atom_charges();
-
-        let fake_chg_data = CINTR2CDATA::fakemol_for_charges(grid_coords, exponents.as_slice());
-        let fake_nuc_data = CINTR2CDATA::fakemol_for_charges(atom_coords, None);
-        // Electron distribution satisfy the Gaussian distribution
-        //g_i(\vec{r})=q_i(\xi_i^2/\pi)^{3/2}exp(-\xi_i^2|\vec{r}-\vec{s}_i|^2).
-        // compute \iint g_i(r1) * 1/|r1 - r2| * dr1 dr2
-        let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&fake_nuc_data, &fake_chg_data], None, None).into();
-        let tmpshape = [shape[0],shape[1]];
-        let tmp_v_ng = MatrixFull::from_vec(tmpshape, tmpout).unwrap();
-        let mut v_ng = vec![];
-        for j in 0..tmpshape[1]{
-            let mut v_ng_j = 0.0;
-            for i in 0..tmpshape[0]{
-                v_ng_j  += tmp_v_ng[(i,j)] * atom_charges[i];
-            }
-            v_ng.push(v_ng_j);
-        }
-        //assert!(v_ng.len() == atom_charges.len(), "Length of v_ng{} must match number of grid points{}.", v_ng.len(), atom_charges.len());
-        //let v_n = v_ng.iter()
-        //    .zip(atom_charges.iter())
-        //    .map(|(&v, &q)| v * q)
-        //    .collect::<Vec<f64>>();
-        v_ng
-    }
-
     pub fn build_pcm_static(surface: &SurfaceVdwGaussian, cfg: &PcmObjectCfg, mol: &Molecule) -> PcmStatic {
         let mut cint_data = mol.initialize_cint(false);
-        let (A, D, S) = Self::get_A_D_S(&surface);
-        let (K, R, f_epsilon) = Self::get_K_R_f(&surface, cfg.method, cfg.epsilon);
-        let v_grids_n = Self::get_v_grids_n(&surface, &cint_data);
+        let (A, D, S) = get_A_D_S(&surface);
+        let (K, R, f_epsilon) = get_K_R_f(&surface, cfg.method, cfg.epsilon);
+        let v_grids_n = get_v_grids_n(&surface, &cint_data);
         PcmStatic { A, D, S, K, R, f_epsilon, v_grids_n }
     }
 }
+
+pub fn get_A_D_S(surface: &SurfaceVdwGaussian) -> (Vec<f64>, MatrixFull<f64>, MatrixFull<f64>) {
+    const PI: f64 = std::f64::consts::PI;
+
+    let R_vdw = &surface.surface_calc.R_vdw;
+    let switch_fun = &surface.surface_calc.switch_fun;
+    let weights = &surface.surface_calc.weights;
+
+    //The matrix A is diagonal and consists of the surface element areas, ai.
+    let A: Vec<f64> = weights
+    .iter().zip(R_vdw.iter()).zip(switch_fun.iter())
+    .map(|((&w,&r),&s)| w * r.powi(2) * s).collect();
+
+    let charge_exp = &surface.surface_calc.charge_exp;
+    let grid_coords = &surface.surface_calc.grid_coords;
+    let n_grids = grid_coords.len();
+    let grid_capacity = n_grids * (n_grids + 1) /2;
+    let norm_vec = &surface.surface_calc.norm_vec;
+
+    //println!("DEBUG get_A_D_S: n_grids = {}", n_grids);
+    //println!("DEBUG get_A_D_S: R_vdw len = {}", R_vdw.len());
+    //println!("DEBUG get_A_D_S: switch_fun len = {}", switch_fun.len());
+    //println!("DEBUG get_A_D_S: weights len = {}", weights.len());
+
+    //println!("DEBUG get_A_D_S: grid_capacity = {}", grid_capacity);
+    //assert!(n_grids == R_vdw.len() && n_grids == switch_fun.len() && n_grids == weights.len() && n_grids == charge_exp.len() 
+    //&& n_grids == norm_vec.len(), "Length of grid-related vectors must match the number of grid points.");
+    
+    if n_grids == 0 {
+        panic!("ERROR: No surface grid points generated!");
+    }
+
+    let mut zeta_ij = Vec::with_capacity(grid_capacity);
+    for j in 0..n_grids{
+        for i in 0..j+1{
+            zeta_ij.push(charge_exp[i]*charge_exp[j]/(charge_exp[i].powi(2)+charge_exp[j].powi(2)).sqrt() );
+        }
+    }
+
+    let mut r_ij = Vec::with_capacity(grid_capacity);
+    for j in 0..n_grids{
+        for i in 0..j+1{
+            if i == j {
+                r_ij.push(1.0);
+            }
+            else{
+                let dx = grid_coords[i][0] - grid_coords[j][0];
+                let dy = grid_coords[i][1] - grid_coords[j][1];
+                let dz = grid_coords[i][2] - grid_coords[j][2];
+                let r = (dx*dx + dy*dy + dz*dz).sqrt();
+                r_ij.push(r);
+            }
+        }
+    }
+    //let r_ij = MatrixUpper::from_vec(grid_capacity, tmp_r_ij).unwrap();
+    //let r_ij = r_ij.to_matrixfull();
+    let zeta_r_ij: Vec<f64> = r_ij.iter()
+        .zip(zeta_ij.iter()).map(|(&r, &z)| z*r).collect();
+    
+    // S_ij = erf(zeta_ij * r_ij) / r_ij, with S_ii = charge_exp[i] * (2/pi)^0.5 / switch_fun[i]
+    let mut tmp_S_ij = zeta_r_ij.iter().zip(r_ij.iter())
+        .map(|(&z, &r)| libm::erf(z) / r).collect();
+    let mut S_ij: MatrixFull<f64> = MatrixUpper::from_vec(grid_capacity, tmp_S_ij).unwrap().to_matrixfull().unwrap();
+    for i in 0..n_grids{
+        let s_ii = charge_exp[i] * (2.0 / PI).sqrt() / switch_fun[i];
+        S_ij[(i,i)] = s_ii;
+    }
+
+    let r_ij_matrix: MatrixFull<f64> = MatrixUpper::from_vec(grid_capacity, r_ij).unwrap().to_matrixfull().unwrap();
+    let zeta_r_ij_matrix: MatrixFull<f64> = MatrixUpper::from_vec(grid_capacity, zeta_r_ij).unwrap().to_matrixfull().unwrap();
+    // n_r_ij = \vec{n_j} * \vec{r_ij}, where \vec{n_j} is the normal vector at grid point j, and \vec{r_ij} is the vector from grid point j to grid point i.
+    let mut n_r_ij: Vec<f64> = Vec::with_capacity(n_grids * n_grids);
+    for j in 0..n_grids{
+        for i in 0..n_grids{
+            let dx = grid_coords[i][0] - grid_coords[j][0];
+            let dy = grid_coords[i][1] - grid_coords[j][1];
+            let dz = grid_coords[i][2] - grid_coords[j][2];
+            n_r_ij.push( dx*norm_vec[j].0 + dy*norm_vec[j].1 + dz*norm_vec[j].2 );
+        }
+    }
+
+    //r_scale = \vec{n_j} * \vec{r_ij}/ r_ij^3, 
+    let r_scale: Vec<f64> = n_r_ij.iter().zip(r_ij_matrix.iter())
+        .map(|(&n, &r)| n / r.powi(3)).collect();
+    let f_zeta_r_ij: Vec<f64> = zeta_r_ij_matrix.iter()
+        .map(|&x| libm::erf(x) - 2.0 / PI.sqrt() * x * f64::exp(-x.powi(2)))
+        .collect();
+    let tmp_D_ij: Vec<f64> = f_zeta_r_ij.iter().zip(r_scale.iter())
+        .map(|(&f, &scale)| f * scale).collect();
+    let mut D_ij = MatrixFull::from_vec([n_grids, n_grids], tmp_D_ij).unwrap();
+    for i in 0..n_grids{
+        let d_ii = -charge_exp[i]* (2.0 / PI).sqrt() / (2.0 * R_vdw[i]);
+        D_ij[(i,i)] = d_ii;
+    }
+
+    (A, D_ij, S_ij)
+
+}
+
+pub fn get_K_R_f(surface: &SurfaceVdwGaussian, method: PcmMethod, epsilon: f64) -> (MatrixFull<f64>, MatrixFull<f64>, f64) {
+    const PI: f64 = std::f64::consts::PI;
+
+    //let device = A.device();
+    let (A, D, S) = get_A_D_S(&surface);
+    let ngrids = A.len();
+    let mut R = MatrixFull::<f64>::new([ngrids, ngrids], 0.0);
+    for i in 0..ngrids {
+        R[(i, i)] = 1.0 ;
+    }
+    //let A_matr = MatrixFull::from_vec([ngrids, 1], A.clone()).unwrap();
+
+    match method {
+        PcmMethod::CPCM => {
+            let f_epsilon = (epsilon - 1.0) / epsilon;
+            let K = S.clone();
+            R.self_multiple(-f_epsilon);
+            (K, R, f_epsilon)
+        },
+        PcmMethod::COSMO => {
+            let f_epsilon = (epsilon - 1.0) / (epsilon + 0.5);
+            let K = S.clone();
+            R.self_multiple(-f_epsilon);
+            (K, R, f_epsilon)
+        },
+        PcmMethod::IEFPCM => {
+            let f_epsilon = (epsilon - 1.0) / (epsilon + 1.0);
+            let mut DA = D.clone();
+            for j in 0..ngrids{
+                for i in 0..ngrids{
+                    DA[(i,j)] = DA[(i,j)] * A[j];
+                }
+            }
+            //let DA = _dgemm_scaled(&D, 'N', &A_matr, 'N', 1.0);
+            let DAS = _dgemm_scaled(&DA, 'N', &S, 'N', 1.0);
+            let K = S.scaled_add(&DAS, -f_epsilon / (2.0 * PI)).unwrap();
+            //let K = S - f_epsilon / (2.0 * PI) * DAS;
+            //let R = -f_epsilon * (rt::eye((ngrids, device)) - 1.0 / (2.0 * PI) * DA);
+            R.self_scaled_add(&DA, - 1.0 / (2.0 * PI));
+            R.self_multiple(-f_epsilon);
+            (K, R, f_epsilon)
+        },
+        PcmMethod::SSVPE => {
+            let f_epsilon = (epsilon - 1.0) / (epsilon + 1.0);
+            let mut DA = D.clone();
+            for j in 0..ngrids{
+                for i in 0..ngrids{
+                    DA[(i,j)] = DA[(i,j)] * A[j];
+                }
+            }
+            //let DA =  _dgemm_scaled(&D, 'N', &A_matr, 'N', 1.0);;
+            let mut DAS = _dgemm_scaled(&DA, 'N', &S, 'N', 1.0);
+            DAS.self_add(&DAS.transpose());
+            let K = S.scaled_add(&DAS,  - f_epsilon / (4.0 * PI)).unwrap();
+            //let K = S - f_epsilon / (4.0 * PI) * (&DAS + DAS.t());
+            R.self_scaled_add(&DA, - 1.0 / (2.0 * PI));
+            R.self_multiple(-f_epsilon);
+            //let R = -f_epsilon * (rt::eye((ngrids, device)) - 1.0 / (2.0 * PI) * DA);
+            (K, R, f_epsilon)
+        },
+    }
+}
+
+pub fn get_v_grids_n(surface: &SurfaceVdwGaussian, cint_data: &CINTR2CDATA) -> Vec<f64> {
+//compute the nuclear contribution to the potential on the surface grid points
+    let grid_coords = &surface.surface_calc.grid_coords;
+    let charge_exp = &surface.surface_calc.charge_exp;
+    let exponents = charge_exp.iter().map(|&x| x * x).collect::<Vec<f64>>();
+    let atom_coords = &cint_data.atom_coords();
+    let atom_charges = &cint_data.atom_charges();
+
+    let fake_chg_data = CINTR2CDATA::fakemol_for_charges(grid_coords, exponents.as_slice());
+    let fake_nuc_data = CINTR2CDATA::fakemol_for_charges(atom_coords, None);
+    // Electron distribution satisfy the Gaussian distribution
+    //g_i(\vec{r})=q_i(\xi_i^2/\pi)^{3/2}exp(-\xi_i^2|\vec{r}-\vec{s}_i|^2).
+    // compute \iint g_i(r1) * 1/|r1 - r2| * dr1 dr2
+    let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&fake_nuc_data, &fake_chg_data], None, None).into();
+    let tmpshape = [shape[0],shape[1]];
+    let tmp_v_ng = MatrixFull::from_vec(tmpshape, tmpout).unwrap();
+    let mut v_ng = vec![];
+    for j in 0..tmpshape[1]{
+        let mut v_ng_j = 0.0;
+        for i in 0..tmpshape[0]{
+            v_ng_j  += tmp_v_ng[(i,j)] * atom_charges[i];
+        }
+        v_ng.push(v_ng_j);
+    }
+    //assert!(v_ng.len() == atom_charges.len(), "Length of v_ng{} must match number of grid points{}.", v_ng.len(), atom_charges.len());
+    //let v_n = v_ng.iter()
+    //    .zip(atom_charges.iter())
+    //    .map(|(&v, &q)| v * q)
+    //    .collect::<Vec<f64>>();
+    v_ng
+}
+
 
 /// Full PCM object containing configuration, surface data, and static PCM data
 #[non_exhaustive]
@@ -579,78 +580,6 @@ pub struct PcmScf {
 }
 
 impl PcmScf{
-    pub fn get_v_grids_e(surface: &SurfaceVdwGaussian, cint_data: &CINTR2CDATA, dm: &Vec<MatrixFull<f64>>, spin_channel: &usize) -> Vec<f64> {
-        
-        let charge_exp = &surface.surface_calc.charge_exp;
-        let grid_coords = &surface.surface_calc.grid_coords;
-        
-        let ngrids = charge_exp.len();
-        //let mut v_grids_e: Tsr = rt::zeros(([ngrids], &device));
-        let mut v_grids_e: Vec<f64> = vec![];
-
-        const CHUNK: usize = 256;
-        for p0 in (0..ngrids).step_by(CHUNK) {
-            let p1 = (p0 + CHUNK).min(ngrids);
-            let grid_coords_chunk = &grid_coords[p0..p1];
-            let charge_exp_chunk = charge_exp[p0..p1].to_vec().iter().map(|x| x * x).collect::<Vec<f64>>();
-            let fake_chg_data = CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk.as_slice());
-            
-            let (tmpout, shape) = CINTR2CDATA::integrate_cross("int3c2e", [cint_data, cint_data, &fake_chg_data], None, None).into();
-            let tmpshape = [shape[0] * shape[1], shape[2]];
-            let v_nj = MatrixFull::from_vec(tmpshape, tmpout).unwrap();
-            let mut tmp_v_e = vec![];
-            for t in 0..shape[2]{
-                let mut f_t = 0.0;
-                for i_spin in 0..*spin_channel{
-                    for j in 0..shape[1]{
-                        for i in 0..shape[0]{
-                            f_t  += v_nj[(j*shape[0]+i,t)] * dm[i_spin][(i,j)];
-                        }
-                    }
-                }
-                tmp_v_e.push(f_t);
-            }
-
-            v_grids_e.extend(tmp_v_e);
-        }
-
-        v_grids_e
-    }
-
-    pub fn get_veff_pcm_by_q(surface: &SurfaceVdwGaussian, cint_data: &CINTR2CDATA, q: &Vec<f64>) -> MatrixUpper<f64> {
-        //let device = DeviceBLAS::default();
-        let nao = cint_data.nao();
-        let charge_exp = &surface.surface_calc.charge_exp;
-        let grid_coords = &surface.surface_calc.grid_coords;
-        //let grid_coords = grid_coords.chunks_exact(3).map(|chunk| [chunk[0], chunk[1], chunk[2]]).collect::<Vec<[f64; 3]>>();
-
-        let ngrids = charge_exp.len();
-        //let mut veff: Tsr = rt::zeros(([nao, nao].c(), &device));
-        let mut veff = MatrixFull::<f64>::new([nao, nao], 0.0);
-
-        const CHUNK: usize = 256;
-        for p0 in (0..ngrids).step_by(CHUNK) {
-            let p1 = (p0 + CHUNK).min(ngrids);
-            let grid_coords_chunk = &grid_coords[p0..p1];
-            let charge_exp_chunk = charge_exp[p0..p1].iter().map(|x| x * x).collect::<Vec<f64>>();
-            //let charge_exp_chunk = charge_exp[p0..p1].to_vec();
-            let fake_chg_data = CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk.as_slice());
-
-            let (tmpout, shape) = CINTR2CDATA::integrate_cross("int3c2e", [cint_data, cint_data, &fake_chg_data], None, None).into();
-            //println!("Block shape={:?}, expected=[{},{},{}]", shape, nao, nao, p1-p0);
-            let tmpshape = [shape[0] * shape[1], shape[2]];
-            let tmp_v_nj = MatrixFull::from_vec(tmpshape, tmpout).unwrap();
-            let q_p =MatrixFull::from_vec([p1 - p0, 1], q[p0..p1].to_vec()).unwrap();
-            let v_nj = _dgemm_scaled(&tmp_v_nj, 'N', &q_p, 'N', 1.0);  
-            veff.iter_mut().zip(v_nj.iter()).for_each(|(ve, &vnj)| *ve -= vnj);
-
-        }
-
-        let veff_upper = veff.iter_matrixupper().unwrap().map(|&x| x).collect::<Vec<f64>>();
-        let veff = MatrixUpper::from_vec(nao*(nao+1)/2 as usize, veff_upper).unwrap();
-        veff
-    }
-
     pub fn get_pcm_refresh(
         surface: &SurfaceVdwGaussian,
         mol: &Molecule,
@@ -661,7 +590,7 @@ impl PcmScf{
         spin_channel: &usize
     ) -> PcmScf {
         let mut cint_data = mol.initialize_cint(false);
-        let v_grids_e = Self::get_v_grids_e(surface, &cint_data, dm, spin_channel);
+        let v_grids_e = get_v_grids_e(surface, &cint_data, dm, spin_channel);
         assert!(v_grids_e.len() == v_grids_n.len(), "Length mismatch: v_grids_e has {} elements but v_grids_n has {} elements", v_grids_e.len(), v_grids_n.len());
         let v_grids: Vec<f64> = v_grids_n.iter().zip(v_grids_e.iter()).map(|(&vn, &ve)| vn - ve).collect();
         let v_grids_matrix = MatrixFull::from_vec([v_grids.len(), 1], v_grids).unwrap();
@@ -680,7 +609,7 @@ impl PcmScf{
         }
         let q_sym = (q.clone() + qt.clone()) * 0.5;
 
-        let veff = Self::get_veff_pcm_by_q(surface, &cint_data, &q_sym.data);
+        let veff = get_veff_pcm_by_q(surface, &cint_data, &q_sym.data);
         let eng: f64 = 0.5 * q_sym.iter().zip(v_grids_matrix.iter())
             .map(|(&q, &v)| q * v)
             .sum::<f64>();
@@ -694,6 +623,79 @@ impl PcmScf{
     }
 
 }   
+
+pub fn get_v_grids_e(surface: &SurfaceVdwGaussian, cint_data: &CINTR2CDATA, dm: &Vec<MatrixFull<f64>>, spin_channel: &usize) -> Vec<f64> {
+        
+    let charge_exp = &surface.surface_calc.charge_exp;
+    let grid_coords = &surface.surface_calc.grid_coords;
+    
+    let ngrids = charge_exp.len();
+    //let mut v_grids_e: Tsr = rt::zeros(([ngrids], &device));
+    let mut v_grids_e: Vec<f64> = vec![];
+
+    const CHUNK: usize = 256;
+    for p0 in (0..ngrids).step_by(CHUNK) {
+        let p1 = (p0 + CHUNK).min(ngrids);
+        let grid_coords_chunk = &grid_coords[p0..p1];
+        let charge_exp_chunk = charge_exp[p0..p1].to_vec().iter().map(|x| x * x).collect::<Vec<f64>>();
+        let fake_chg_data = CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk.as_slice());
+        
+        let (tmpout, shape) = CINTR2CDATA::integrate_cross("int3c2e", [cint_data, cint_data, &fake_chg_data], None, None).into();
+        let tmpshape = [shape[0] * shape[1], shape[2]];
+        let v_nj = MatrixFull::from_vec(tmpshape, tmpout).unwrap();
+        let mut tmp_v_e = vec![];
+        for t in 0..shape[2]{
+            let mut f_t = 0.0;
+            for i_spin in 0..*spin_channel{
+                for j in 0..shape[1]{
+                    for i in 0..shape[0]{
+                        f_t  += v_nj[(j*shape[0]+i,t)] * dm[i_spin][(i,j)];
+                    }
+                }
+            }
+            tmp_v_e.push(f_t);
+        }
+
+        v_grids_e.extend(tmp_v_e);
+    }
+
+    v_grids_e
+}
+
+pub fn get_veff_pcm_by_q(surface: &SurfaceVdwGaussian, cint_data: &CINTR2CDATA, q: &Vec<f64>) -> MatrixUpper<f64> {
+    //let device = DeviceBLAS::default();
+    let nao = cint_data.nao();
+    let charge_exp = &surface.surface_calc.charge_exp;
+    let grid_coords = &surface.surface_calc.grid_coords;
+    //let grid_coords = grid_coords.chunks_exact(3).map(|chunk| [chunk[0], chunk[1], chunk[2]]).collect::<Vec<[f64; 3]>>();
+
+    let ngrids = charge_exp.len();
+    //let mut veff: Tsr = rt::zeros(([nao, nao].c(), &device));
+    let mut veff = MatrixFull::<f64>::new([nao, nao], 0.0);
+
+    const CHUNK: usize = 256;
+    for p0 in (0..ngrids).step_by(CHUNK) {
+        let p1 = (p0 + CHUNK).min(ngrids);
+        let grid_coords_chunk = &grid_coords[p0..p1];
+        let charge_exp_chunk = charge_exp[p0..p1].iter().map(|x| x * x).collect::<Vec<f64>>();
+        //let charge_exp_chunk = charge_exp[p0..p1].to_vec();
+        let fake_chg_data = CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk.as_slice());
+
+        let (tmpout, shape) = CINTR2CDATA::integrate_cross("int3c2e", [cint_data, cint_data, &fake_chg_data], None, None).into();
+        //println!("Block shape={:?}, expected=[{},{},{}]", shape, nao, nao, p1-p0);
+        let tmpshape = [shape[0] * shape[1], shape[2]];
+        let tmp_v_nj = MatrixFull::from_vec(tmpshape, tmpout).unwrap();
+        let q_p =MatrixFull::from_vec([p1 - p0, 1], q[p0..p1].to_vec()).unwrap();
+        let v_nj = _dgemm_scaled(&tmp_v_nj, 'N', &q_p, 'N', 1.0);  
+        veff.iter_mut().zip(v_nj.iter()).for_each(|(ve, &vnj)| *ve -= vnj);
+
+    }
+
+    let veff_upper = veff.iter_matrixupper().unwrap().map(|&x| x).collect::<Vec<f64>>();
+    let veff = MatrixUpper::from_vec(nao*(nao+1)/2 as usize, veff_upper).unwrap();
+    veff
+}
+
 
 /// Solve linear system Ax = b using LU decomposition without explicitly computing the inverse of A
 pub fn solve_lu_no_inverse(a: &MatrixFull<f64>, b: &[f64]) -> Option<Vec<f64>>
@@ -742,7 +744,7 @@ pub fn solve_lu_no_inverse(a: &MatrixFull<f64>, b: &[f64]) -> Option<Vec<f64>>
 /// Main function to prepare PCM object for a given molecule
 pub fn solvent_prepare(mol: &Molecule) -> PcmObject {
     let method = mol.solvent_model.clone();
-    let epsilon = mol.epsilon.clone();
+    let epsilon = mol.solv_epsilon.clone();
     let pcmcfg = PcmObjectCfg::build(method, epsilon);
     let surfacecfg = SurfaceVdwGaussianCfg::default();
     let mut surface = SurfaceVdwGaussian::new(surfacecfg, &mol.geom);
