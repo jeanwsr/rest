@@ -20,7 +20,7 @@ use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon, evaluate_spin_resp
 use crate::ri_rpa::{evaluate_rpa_correlation, evaluate_rpa_correlation_rayon};
 use crate::ri_gw;
 use crate::ri_bse;
-use crate::scf_io::{SCF, SCFType};
+use crate::scf_io::{SCF, SCFType, print_force_for_ghost_point_charges};
 use crate::ri_pt2::{close_shell_pt2_rayon, open_shell_pt2_rayon};
 use crate::utilities::TimeRecords;
 
@@ -128,7 +128,7 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
                 let dp = evaluate_dipole_moment(scf_data, None);
                 println!("Dipole Moment in DEBYE: {:16.8}, {:16.8}, {:16.8}", dp[0], dp[1], dp[2]);
             }
-        } else if output_type.eq("force") {
+        } else if output_type.eq("num_force") {
             let displace = match scf_data.mol.geom.unit {
                 crate::geom_io::GeomUnit::Angstrom => scf_data.mol.ctrl.nforce_displacement/ANG,
                 crate::geom_io::GeomUnit::Bohr => scf_data.mol.ctrl.nforce_displacement,
@@ -147,6 +147,8 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
                 println!("Total atomic forces [ev/ang]: ");
                 println!("{}", formated_force_ev(&num_force, &scf_data.mol.geom.elem));
             }
+        } else if output_type.eq("force_for_ghost_point_charges") {
+            print_force_for_ghost_point_charges(&scf_data)
         }
     });
 }
@@ -368,7 +370,16 @@ pub fn post_scf_correlation(scf_data: &mut SCF) {
     if let None = scf_data.ri3mo {
         let (occ_range, vir_range) = crate::scf_io::determine_ri3mo_size_for_pt2_and_rpa(&scf_data);
         if scf_data.mol.ctrl.print_level>1 {
-            println!("generate RI3MO only for occ_range:{:?}, vir_range:{:?}", &occ_range, &vir_range)
+            //println!("generate RI3MO only for occ_range:{:?}, vir_range:{:?}", &occ_range, &vir_range);
+            let spin_orb_indices = split_indices_by_spin_occ(&scf_data.occupation, 0.5);
+            let (alpha_occ, alpha_vir) = &spin_orb_indices[0];
+            println!("Occupied orbitals (alpha): {}", format_indices(alpha_occ));
+            println!("Virtual orbitals (alpha): {}", format_indices(alpha_vir));
+            if matches!(scf_data.scftype, SCFType::UHF | SCFType::ROHF) {
+                let (beta_occ,  beta_vir)  = &spin_orb_indices[1];
+                println!("Occupied orbitals (beta): {}", format_indices(beta_occ));
+                println!("Virtual orbitals (beta): {}", format_indices(beta_vir));
+            }
         };
         scf_data.generate_ri3mo_rayon(vir_range, occ_range);
     }
@@ -562,3 +573,77 @@ pub fn evaluate_dipole_moment(scf_data: &SCF, orig: Option<[f64;3]>) -> [f64;3] 
 
 }
 
+fn split_indices_by_occ(
+    spin_occ: &[f64],
+    occ_threshold: f64,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut occ_idx = Vec::new();
+    let mut vir_idx = Vec::new();
+
+    for (i, &n_occ) in spin_occ.iter().enumerate() {
+        if n_occ > occ_threshold {
+            occ_idx.push(i);
+        } else {
+            vir_idx.push(i);
+        }
+    }
+
+    (occ_idx, vir_idx)
+}
+
+pub fn split_indices_by_spin_occ(
+    occupations: &[Vec<f64>], // occupations[0]=alpha, occupations[1]=beta
+    occ_threshold: f64,
+) -> Vec<(Vec<usize>, Vec<usize>)> {
+    occupations
+        .iter()
+        .map(|spin_occ| split_indices_by_occ(spin_occ, occ_threshold))
+        .collect()
+}
+
+fn compress_indices_to_ranges(indices: &[usize]) -> Vec<(usize, usize)> {
+    if indices.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+
+    let mut start = indices[0];
+    let mut prev  = indices[0];
+
+    for &idx in indices.iter().skip(1) {
+        if idx == prev + 1 {
+            // still contiguous
+            prev = idx;
+        } else {
+            // end current range
+            ranges.push((start, prev));
+            start = idx;
+            prev  = idx;
+        }
+    }
+
+    // push last range
+    ranges.push((start, prev));
+
+    ranges
+}
+
+fn format_ranges(ranges: &[(usize, usize)]) -> String {
+    ranges
+        .iter()
+        .map(|(start, end)| {
+            if start == end {
+                format!("{}", start)
+            } else {
+                format!("{}-{}", start, end)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub fn format_indices(indices: &[usize]) -> String {
+    let ranges = compress_indices_to_ranges(indices);
+    format_ranges(&ranges)
+}
