@@ -12,7 +12,7 @@ use rest_tensors::{MatrixFull, MatrixFullSliceMut, TensorSliceMut, RIFull, Matri
 use rest_tensors::matrix_blas_lapack::{_dgemm_nn,_dgemm_tn, _einsum_01_serial, _einsum_02_serial, _einsum_01_rayon, _einsum_02_rayon};
 use itertools::{Itertools, izip};
 use libc::access;
-use tensors::{BasicMatrix, MathMatrix, ParMathMatrix};
+use tensors::{BasicMatrix, BasicMatrixOpt, MathMatrix, ParMathMatrix};
 use tensors::external_libs::{general_dgemm_f, matr_copy};
 use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, contract_vxc_0_serial};
 //use numgrid::{self, radial_grid_lmg_bse};
@@ -23,10 +23,12 @@ use crate::basis_io::{BasCell, Basis4Elem, cartesian_gto_cint, cartesian_gto_std
 use crate::molecule_io::Molecule;
 use crate::geom_io::get_mass_charge;
 use crate::mpi_io::{mpi_broadcast, mpi_broadcast_vector, mpi_reduce, MPIData, MPIOperator};
+use crate::post_scf_analysis::spin_correction;
 use crate::scf_io::SCF;
 use crate::utilities::{self, balancing};
 use core::num;
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::Read;
 use std::iter::Zip;
 use std::ops::Range;
@@ -1889,7 +1891,7 @@ impl DFA4REST {
                         loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
                         );
                         loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
-                    }                            
+                    }
                 }
             }
         }
@@ -1978,6 +1980,169 @@ impl DFA4REST {
 
         post_xc_energy
 
+    }
+
+    pub fn post_tabulated_exc(&self, 
+        grids: &crate::dft::Grids, 
+        dm: &Vec<MatrixFull<f64>>, 
+        mo: &[MatrixFull<f64>;2], 
+        occ: &[Vec<f64>;2]) 
+    {
+        use std::io::Write;
+        let dt0 = utilities::init_timing();
+        let spin_channel = self.spin_channel;
+        let num_grids = grids.coordinates.len();
+        let num_basis = dm[0].size[0];
+        let use_density_gradient = self.use_density_gradient();
+
+        //// 获取rayon的当前线程的ID
+        //let id = rayon::current_thread_index().unwrap_or_default();
+        //// 创建一个文件，包含当前线程的ID的信息
+        //let mut file = File::create(format!("debug_tabulated_exc_{}.txt", id)).unwrap();
+
+
+        let mut str_lines: Vec<String> = vec![String::new();num_grids+1];
+        //let mut str_lines_beta: Vec<String> = if spin_channel == 2 {
+        //    vec![String::new();num_grids]
+        //} else {
+        //    vec![]
+        //};
+
+        let mut post_xc_energy:Vec<[f64;2]>=vec![];
+
+        if spin_channel == 1 { 
+            str_lines[0].push_str(&format!("{:>20} " , "rho"));
+        } else {
+            str_lines[0].push_str(&format!("{:>20}" , "rho_alpha"));
+            str_lines[0].push_str(&format!("{:>20} ", "rho_beta"));
+        };
+
+        if use_density_gradient {
+            if spin_channel == 1 {
+                str_lines[0].push_str(&format!("{:>20}", "rhop_x"));
+                str_lines[0].push_str(&format!("{:>20}", "rhop_y"));
+                str_lines[0].push_str(&format!("{:>20}", "rhop_z"));
+                str_lines[0].push_str(&format!("{:>20}", "sigma"));
+            } else {
+                str_lines[0].push_str(&format!("{:>20}","rhop_alpha_x"));
+                str_lines[0].push_str(&format!("{:>20}","rhop_alpha_y"));
+                str_lines[0].push_str(&format!("{:>20}","rhop_alpha_z"));
+                str_lines[0].push_str(&format!("{:>20}","rhop_beta_x"));
+                str_lines[0].push_str(&format!("{:>20}","rhop_beta_y"));
+                str_lines[0].push_str(&format!("{:>20}","rhop_beta_z"));
+                str_lines[0].push_str(&format!("{:>20}","sigma_aa"));
+                str_lines[0].push_str(&format!("{:>20}","sigma_ab"));
+                str_lines[0].push_str(&format!("{:>20}","sigma_bb"));
+            }
+        }
+
+        self.dfa_compnt_scf.iter().enumerate().for_each(|(i_xc, xc)| { 
+            //if spin_channel == 1 {
+                str_lines[0].push_str(&format!("{:>20} ", &XcFuncType::code_to_name(*xc)));
+            //} else {
+            //    str_lines[0].push_str(&format!("{:>20}_alpha ", &XcFuncType::code_to_name(*xc)));
+            //    str_lines[0].push_str(&format!("{:>20}_beta ", &XcFuncType::code_to_name(*xc)));
+            //}
+        });
+
+        let (rho,rhop) = if ! mo[1].data.is_empty() || spin_channel == 1 { // RHF or UHF case
+            grids.prepare_tabulated_density_2(mo, occ, spin_channel)
+        } else { // ROHF case
+            let mut mo_temp = mo.clone();
+            mo_temp[1] = mo_temp[0].clone();
+            grids.prepare_tabulated_density_2(&mo_temp, occ, spin_channel)
+        };
+
+        str_lines[1..].par_iter_mut().zip(rho.par_iter_column(0)).for_each(|(line,rho)| {
+            line.push_str(&format!("{:20.10} ", rho));
+        });
+        if spin_channel == 2 {
+            str_lines[1..].par_iter_mut().zip(rho.par_iter_column(1)).for_each(|(line,rho)| {
+                line.push_str(&format!("{:20.10} ", rho));
+            });
+        }
+
+        let sigma = if use_density_gradient {
+            prepare_tabulated_sigma_rayon(&rhop, spin_channel)
+        } else {
+            MatrixFull::empty()
+        };
+        if use_density_gradient { 
+            str_lines[1..].par_iter_mut().zip(rhop.par_iter_slices_x(0, 0)).for_each(|(line,rhop_i)| {
+                line.push_str(&format!("{:20.10} ", rhop_i));
+            });
+            str_lines[1..].par_iter_mut().zip(rhop.par_iter_slices_x(1, 0)).for_each(|(line,rhop_i)| {
+                line.push_str(&format!("{:20.10} ", rhop_i));
+            });
+            str_lines[1..].par_iter_mut().zip(rhop.par_iter_slices_x(2, 0)).for_each(|(line,rhop_i)| {
+                line.push_str(&format!("{:20.10} ", rhop_i));
+            });
+            if spin_channel == 2 {
+                str_lines[1..].par_iter_mut().zip(rhop.par_iter_slices_x(0, 1)).for_each(|(line,rhop_i)| {
+                    line.push_str(&format!("{:20.10} ", rhop_i));
+                });
+                str_lines[1..].par_iter_mut().zip(rhop.par_iter_slices_x(1, 1)).for_each(|(line,rhop_i)| {
+                    line.push_str(&format!("{:20.10} ", rhop_i));
+                });
+                str_lines[1..].par_iter_mut().zip(rhop.par_iter_slices_x(2, 1)).for_each(|(line,rhop_i)| {
+                    line.push_str(&format!("{:20.10} ", rhop_i));
+                });
+            }
+            if spin_channel == 1 {
+                str_lines[1..].par_iter_mut().zip(sigma.par_iter_column(0)).for_each(|(line,sigma_i)| {
+                    line.push_str(&format!("{:20.10} ", sigma_i));
+                });
+            } else if spin_channel == 2 {
+                str_lines[1..].par_iter_mut().zip(sigma.par_iter_column(0)).for_each(|(line,sigma_i)| {
+                    line.push_str(&format!("{:20.10} ", sigma_i));
+                });
+                str_lines[1..].par_iter_mut().zip(sigma.par_iter_column(1)).for_each(|(line,sigma_i)| {
+                    line.push_str(&format!("{:20.10} ", sigma_i));
+                });
+                str_lines[1..].par_iter_mut().zip(sigma.par_iter_column(2)).for_each(|(line,sigma_i)| {
+                    line.push_str(&format!("{:20.10} ", sigma_i));
+                });
+            }
+        }
+        self.dfa_compnt_scf.iter().enumerate().for_each(|(i_xc, xc)| { 
+            //let mut exc = MatrixFull::new([num_grids,1],0.0);
+            let exc = self.xc_exc_code(xc, &rho, &sigma, spin_channel);
+            str_lines[1..].par_iter_mut().zip(exc.par_iter_column(0)).for_each(|(line,exc_i)| {
+                line.push_str(&format!("{:20.10} ", exc_i));
+            });
+            if spin_channel == 2 {
+                str_lines[1..].par_iter_mut().zip(exc.par_iter_column(1)).for_each(|(line,exc_i)| {
+                    line.push_str(&format!("{:20.10} ", exc_i));
+                });
+
+            }
+        });
+        //将str_lines：Vec<String>，按照每一个element是一行的方式写入文件
+        let mut file = File::create(format!("debug_tabulated_exc.txt")).unwrap();
+        for line in str_lines.iter() {
+            writeln!(file, "{}", line).expect("Unable to write file");
+        }
+        //file.close();
+
+        //post_xc.iter().for_each(|x| {
+        //    let mut exc = MatrixFull::new([num_grids,1],0.0);
+        //    let mut exc_total =[0.0,0.0];
+        //    let code = DFA4REST::xc_func_init_fdqc(x,spin_channel);
+        //    //println!("debug xc_code: {:?}", &code);
+        //    code.iter().for_each(|xc_code| {
+        //        exc.par_self_scaled_add(&self.xc_exc_code(xc_code, &rho, &sigma, spin_channel),1.0);
+        //    });
+
+        //    for i_spin in 0..spin_channel {
+        //        exc_total[i_spin] = izip!(exc.data.iter(),rho.iter_column(i_spin),grids.weights.iter())
+        //            .fold(0.0,|acc,(exc,rho,weight)| {
+        //                acc + exc * rho * weight
+        //            });
+        //    };
+        //    //println!("exc_total: {:?}", &exc_total);
+
+        //    post_xc_energy.push(exc_total);
+        //});
     }
 
     pub fn xc_exc_list(&self, xc_code_list: &Vec<usize>, grids: &crate::dft::Grids, dm: &Vec<MatrixFull<f64>>, mo: &[MatrixFull<f64>;2], occ: &[Vec<f64>;2]) 
@@ -2232,6 +2397,7 @@ pub fn contract_vxc_0(mat_a: &mut MatrixFull<f64>, mat_b: &MatrixFullSlice<f64>,
 /// Prepare `sigma[0] = rhop_u dot rhop_u => sigma_uu`
 ///         `sigma[1] = rhop_u dot rhop_d => sigma_ud`
 ///         `sigma[2] = rhop_d dot rhop_d => sigma_dd`
+/// IGOR MARK HERE for unefficient use of  powf
 fn prepare_tabulated_sigma(rhop: &RIFull<f64>, spin_channel: usize) -> MatrixFull<f64> {
     let grids_len = rhop.size[0];
     if spin_channel==1 {
@@ -2275,6 +2441,7 @@ fn prepare_tabulated_sigma(rhop: &RIFull<f64>, spin_channel: usize) -> MatrixFul
 ///         `sigma[0] = rhop_u dot rhop_u => sigma_uu`
 ///         `sigma[1] = rhop_u dot rhop_d => sigma_ud`
 ///         `sigma[2] = rhop_d dot rhop_d => sigma_dd`
+/// IGOR MARK HERE for unefficient use of  powf
 fn prepare_tabulated_sigma_rayon(rhop: &RIFull<f64>, spin_channel: usize) -> MatrixFull<f64> {
     let grids_len = rhop.size[0];
     if spin_channel==1 {
