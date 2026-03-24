@@ -34,6 +34,7 @@ use crate::{utilities, initial_guess};
 use crate::initial_guess::initial_guess;
 use crate::external_libs::dftd;
 use crate::constants::{INVERSE_THRESHOLD, SPECIES_INFO, SQRT_THRESHOLD};
+use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
 
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
 
@@ -88,6 +89,8 @@ pub struct SCF {
     pub renormalized_singles_particles:Vec<f64>,
     pub gwqp:(Vec<f64>,Vec<f64>),
     pub algorithm_jk: AlgorithmJK,
+    pub solvent_static_obj: Option<PcmObject>,
+    pub solvent_scf: Option<PcmScf>,
 }
 
 #[derive(Clone,Copy)]
@@ -138,6 +141,8 @@ impl SCF {
             renormalized_singles_particles:Vec::new(),
             gwqp:(Vec::new(),Vec::new()),
             algorithm_jk: AlgorithmJK::Default,
+            solvent_static_obj: None,
+            solvent_scf: None,
         };
 
         // at first check the scf type: RHF, ROHF or UHF
@@ -437,6 +442,8 @@ impl SCF {
             }
         };
 
+
+
     }
 
     pub fn prepare_density_grids(&mut self) {
@@ -506,7 +513,12 @@ impl SCF {
 
     }
 
+    pub fn prepare_solvent_calculation(&mut self) {
+        if self.mol.use_solvent {
+            self.solvent_static_obj = Some(solvent_prepare(&self.mol));
 
+        }
+    }
 
     pub fn build(mol: Molecule, mpi_operator: &Option<MPIOperator>) -> SCF {
 
@@ -2007,6 +2019,7 @@ impl SCF {
                 let dm_upper = dm_s.to_matrixupper();
                 vxc_total += SCF::par_energy_contraction(&dm_upper, &vxc[i_spin]);
             }
+
         };
 
         let dt4 = time::Local::now();
@@ -2020,6 +2033,36 @@ impl SCF {
             }
         }
         
+        let dt_solv0 = time::Local::now();
+        //let mut esolv_total = 0.0;
+        if self.mol.use_solvent{
+            if self.solvent_scf.is_some() {
+                if let Some(solvent_scf) = self.solvent_scf.as_ref() {
+                    for i_spin in 0..spin_channel {
+                        self.hamiltonian[i_spin].data
+                            .par_iter_mut()
+                            .zip(solvent_scf.veff.data.par_iter())
+                            .for_each(|(h_ij, veff_ij)| {
+                                *h_ij += veff_ij;
+                            });
+
+                        let dm_s = &self.density_matrix[i_spin];
+                        let dm_upper = dm_s.to_matrixupper();
+                        //esolv_total -=  SCF::par_energy_contraction(&dm_upper, &solvent_scf.veff)
+                    }
+                    
+                }
+            }
+        }
+        //exc_total += esolv_total;
+        
+        let dt_solv1 = time::Local::now();
+        let timecost_solv = (dt_solv1.timestamp_millis()-dt_solv0.timestamp_millis()) as f64 /1000.0;
+        if self.mol.use_solvent && self.mol.ctrl.print_level > 2 {
+            println!("The evaluation of Solvent potential costs {:10.2} seconds.", timecost_solv);
+        }
+
+
         let timecost1 = (dt2.timestamp_millis()-dt1.timestamp_millis()) as f64 /1000.0;
         let timecost2 = (dt3.timestamp_millis()-dt2.timestamp_millis()) as f64 /1000.0;
         let timecost3 = (dt4.timestamp_millis()-dt3.timestamp_millis()) as f64 /1000.0;
@@ -2305,7 +2348,11 @@ impl SCF {
         //let exc_hf = self.evaluate_exact_exchange_ri_v(mpi_operator);
         //println!("Exc[HF] = {:16.8}", exc_hf);
         //println!("==== IGOR debug for Exc[HF]====");
-
+        if self.mol.use_solvent {
+            if let Some(solvent_scf) = self.solvent_scf.as_ref() {
+                self.scf_energy += solvent_scf.eng_nuc;
+            }
+        }
         if self.mol.ctrl.print_level>1 {
             println!("Exc: {:16.8}, Vxc: {:16.8}", exc_total, vxc_total)
         };
@@ -5154,6 +5201,10 @@ pub fn initialize_scf(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
     scf_data.prepare_density_grids();
     time_mark.count("DFT Grids");
 
+    time_mark.new_item("Solvent Calculation", "Initialization of the solvent calculation");
+    time_mark.count_start("Solvent Calculation");
+    scf_data.prepare_solvent_calculation();
+
     time_mark.new_item("ISDF", "ISDF initialization");
     time_mark.count_start("ISDF");
     scf_data.prepare_isdf(mpi_operator);
@@ -5249,6 +5300,23 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
 
         scf_data.generate_density_matrix();
 
+        if scf_data.mol.use_solvent {
+            if let Some(solvent_static) = scf_data.solvent_static_obj.as_ref() {
+                let s_static = PcmScf::get_pcm_refresh(
+                    &solvent_static.surface, 
+                    &scf_data.mol, 
+                    &scf_data.density_matrix, 
+                    solvent_static.pstatic.K.clone(),
+                    solvent_static.pstatic.R.clone(),
+                    solvent_static.pstatic.v_grids_n.clone(),
+                    &scf_data.mol.spin_channel
+                );
+                scf_data.energies.insert(String::from("solvent_energy"), vec![s_static.eng]);
+                scf_data.solvent_scf = Some(s_static);
+            }
+        }
+        
+
         if scf_data.mol.ctrl.print_level>1 {
             scf_data.print_homo_lumo_gap()
         };
@@ -5341,6 +5409,22 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         }
     }
 
+    //solvent debug
+    if scf_data.mol.use_solvent{
+
+        //println!("solvent_static_obj: {:?}", scf_data.solvent_static_obj.is_some());
+        //println!("solvent_scf: {:?}", scf_data.solvent_scf.is_some());
+
+        if scf_data.solvent_static_obj.is_none() {
+            println!("ERROR: solvent_static_obj is None");
+        }
+        if scf_data.solvent_scf.is_none() {
+            println!("ERROR: solvent_scf is None");
+        }
+
+        //debug_print_pcm(&scf_data.solvent_static_obj.as_ref().unwrap().pstatic, &scf_data.solvent_scf.as_ref().unwrap());
+    }
+    
     if scf_data.mol.ctrl.print_level>1 {
         scf_data.print_homo_lumo_gap();
         scf_data.formated_eigenvalues((scf_data.homo.iter().max().unwrap()+4).min(scf_data.mol.num_state));
