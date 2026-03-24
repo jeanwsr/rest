@@ -199,7 +199,7 @@ pub struct InputKeywords {
     #[pyo3(get, set)]
     // Keywords for solvent models
     pub solvent_enabled: bool,
-    pub epsilon: f64,
+    pub solv_epsilon: f64,
     pub solvent_model: PcmMethod,
     #[pyo3(get, set)]
     // The initial MO coefficients and eigenvalues can be imported by setting chkfile
@@ -417,7 +417,7 @@ impl InputKeywords {
             geometric_pyo3: None,
             quasiparticle_methods:None,
             solvent_enabled: false,
-            epsilon:1.0,
+            solv_epsilon:1.0,
             solvent_model: PcmMethod::CPCM,
         }
     }
@@ -1124,10 +1124,13 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 },
                 None => PcmMethod::CPCM,
             };
-            tmp_input.epsilon = match tmp_ctrl.get("epsilon").unwrap_or(&serde_json::Value::Null) {
+            tmp_input.solv_epsilon = match tmp_ctrl.get("solv_epsilon").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_fc) => {tmp_fc.to_lowercase().parse().unwrap_or(1.0_f64)},
                 serde_json::Value::Number(tmp_fc) => {tmp_fc.as_f64().unwrap_or(1.0_f64) as f64},
-                other => {1.0_f64},
+                other => {
+                    println!("WARNING: No solvent epsilon provided, use epsilon of vacuum.");
+                    1.0_f64
+                },
             };
            // tmp_input.solvent_model = 
            // match tmp_ctrl.get("solvent_model").unwrap_or(&serde_json::Value::Null) {

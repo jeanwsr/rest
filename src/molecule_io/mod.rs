@@ -128,7 +128,7 @@ pub struct Molecule {
     // solvation model data
     pub use_solvent: bool,
     pub solvent_model: PcmMethod,
-    pub epsilon: f64,
+    pub solv_epsilon: f64,
 }
 
 impl Molecule {
@@ -163,7 +163,7 @@ impl Molecule {
             //cint_data: CINTR2CDATA::new()
             use_solvent: false,
             solvent_model: PcmMethod::CPCM,
-            epsilon: 1.0,
+            solv_epsilon: 1.0,
         }
     }
 
@@ -271,7 +271,7 @@ impl Molecule {
         };
         let use_solvent = ctrl.solvent_enabled;
         let solvent_model=ctrl.solvent_model;
-        let epsilon = ctrl.epsilon;
+        let solv_epsilon = ctrl.solv_epsilon;
         let mut mol = Molecule {
             ctrl,
             mpi_data,
@@ -301,7 +301,7 @@ impl Molecule {
             cint_type,
             use_solvent,
             solvent_model,
-            epsilon,
+            solv_epsilon,
         };
         // check and prepare the auxiliary basis sets
         if mol.ctrl.use_auxbas {mol.initialize_auxbas()};
