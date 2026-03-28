@@ -526,6 +526,37 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos
             })
+        } else if tmp_name.eq("xyg2") {
+            // XYG2 functional
+            // Yan, W., PhD thesis, Fudan University, Shanghai, China (2022).
+            // Precision Chemistry (2026); https://doi.org/10.1021/prechem.5c00432
+            let dfa_family_pos = Some(DFAFamily::PT2);
+            let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(pos_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten()
+                .collect());
+            let dfa_paramr_pos = Some(vec![0.00,0.1984,0.00,0.6613]);
+            let dfa_hybrid_pos = Some(0.8016);
+            let dfa_paramr_adv = Some(vec![0.3387,0.3387]);
+
+            let scf_dfa = ["b3lyp"];
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![1.0;dfa_compnt_scf.len()];
+            let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf, spin_channel);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos
+            })
         } else if tmp_name.eq("xdh-pbe0") {
             // xDH-PBE0 functional
             // J. Chem. Phys. 136, 174103 (2012); https://doi.org/10.1063/1.3703893
