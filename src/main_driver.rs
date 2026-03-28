@@ -416,6 +416,7 @@ pub fn output_result(scf_data: &scf_io::SCF) {
         || xc_name.eq("xdh-pbe0") 
         || xc_name.eq("r-xdh7") 
         || xc_name.eq("xyg7")
+        || xc_name.eq("xyg2")
         || xc_name.eq("zrps")
         || xc_name.eq("scsrpa")
         || xc_name.eq("r-xyg3")
@@ -535,6 +536,7 @@ pub fn collect_total_energy(scf_data: &SCF) -> f64 {
         "xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "xyg7" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "xyg2" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "r-xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "r-xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "r-xyg7" => scf_data.energies.get("xdh_energy").unwrap()[0],
