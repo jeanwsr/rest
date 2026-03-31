@@ -421,7 +421,8 @@ pub fn output_result(scf_data: &scf_io::SCF) {
         || xc_name.eq("scsrpa")
         || xc_name.eq("r-xyg3")
         || xc_name.eq("r-xygjos")
-        || xc_name.eq("r-xyg7")   
+        || xc_name.eq("r-xyg7")
+        || xc_name.eq("r-xyg2")
     {
         if let Some(e) = yamaguchi_tot {
             println!("The (R)-xDH energy    : {:18.10} Ha", e);
@@ -540,6 +541,7 @@ pub fn collect_total_energy(scf_data: &SCF) -> f64 {
         "r-xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "r-xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "r-xyg7" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "r-xyg2" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "xdh-pbe0" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "r-xdh7" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "zrps" => scf_data.energies.get("xdh_energy").unwrap()[0],
