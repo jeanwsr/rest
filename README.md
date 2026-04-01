@@ -267,6 +267,10 @@ auxbas_path = def2-universal-jkfit      # 简写格式，自动搜索
 - `bse_tda`: 取值bool，设置为true则使用TDA近似，即BSE kernel只保留左上部分的子矩阵。缺省为false
 ## RRS-PBC计算相关设置
 - `pbc_eigenval`: 取值String，用于指定存储k点和能级信息的文件路径。如果设置为"none"或"None"则直接打印到标准输出。缺省为"none"。相关文章见Zhang, I.Y., Jiang, J., Gao, B. *et al.* RRS-PBC: a molecular approach for periodic systems. *Sci. China Chem.* **57**, 1399–1404 (2014). https://doi.org/10.1007/s11426-014-5183-y
+## 溶剂化计算相关设置
+- `solvent_model`: 取值String, 用于指定用于计算的溶剂模型。目前支持CPCM, COSMO, IEFPCM, SS(V)PE。缺省为CPCM。
+- `solvent_enabled`: 取值bool，设置为true则启用溶剂化计算。如果没有`solvent_enabled`字段但有`solvent_model`的设置且内容非空的时候，同样启用溶剂化计算。其他情况缺省为false。
+- `solv_epsilon`: 取值f64, 为溶质的介电常数。缺省为1.0 (真空)。介电常数表可以参考 http://sobereva.com/g09/k_scrf.htm 的最后。
 # Detailed descrption of [geometric_pyo3] block in the control file
 - `maxiter`：取值i32。结构优化的最大步数上限。缺省值：300
 - `converge_energy`：取值f64。构型优化中上下两步能量变化的收敛阈值。缺省值：1.0e-6
