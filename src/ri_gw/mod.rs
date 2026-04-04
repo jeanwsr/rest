@@ -757,12 +757,14 @@ pub fn spectrum_test(scf_data:&SCF,num_freq:usize){
         ri_ov=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_ov,&relevant_indices);
         ri_full=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_full,&relevant_indices);
     }
-    let start_freq:f64=-0.5;
-    let step:f64=0.5/600.0;
+    let start_freq:f64=qp_ctrl.spectrum_test_start;
+    let end_freq:f64=qp_ctrl.spectrum_test_end;
+    let step:f64=qp_ctrl.spectrum_test_step;
+    let steps:usize=((start_freq-end_freq)/step).ceil() as usize;
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_full,&quasiparticle_energies,&quasiparticle_energies,num_state,occ_size,vir_size,num_freq);
     for n in (homo..homo+2){
         println!("Now is the spectrum of orbital #{}",n);
-        (0..1200).into_par_iter().for_each(|w|{
+        (0..steps+1).into_par_iter().for_each(|w|{
             let freq=start_freq+(w as f64)*step;
             let contour=contour_rayon(freq,n,&quasiparticle_energies,&quasiparticle_energies,occ_size,vir_size,num_state,&ri_ov,&ri_full);
             let imag=calculate_imag(&w_c_at_freqs,num_state,n,freq,&quasiparticle_energies,&quasiparticle_energies);

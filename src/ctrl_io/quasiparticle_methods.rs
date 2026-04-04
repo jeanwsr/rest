@@ -52,6 +52,9 @@ pub struct QuasiParticle {
     pub gw_rootfinder:String,
     pub simplified_bse:bool,
     pub self_energy_spectrum_test:bool,
+    pub spectrum_test_start:f64,
+    pub spectrum_test_end:f64,
+    pub spectrum_test_step:f64,
     pub pysoc:bool,
     pub gw_imag_rayon:bool,
     pub bse_auxbas_path: Option<String>,
@@ -111,6 +114,9 @@ impl Default for QuasiParticle {
             simplified_bse:false,
             bse_max_ang_momentum:10,
             self_energy_spectrum_test:false,
+            spectrum_test_start:-1.0,
+            spectrum_test_end:0.0,
+            spectrum_test_step:0.01,
             pysoc:false,
             gw_imag_rayon:true,
             bse_auxbas_path: None,
@@ -173,6 +179,9 @@ impl QuasiParticle {
         table.insert("fourier_self_energy".to_string(), toml::Value::Boolean(self.fourier_self_energy));
         table.insert("bse_exchange_rescaling".to_string(), toml::Value::Float(self.bse_exchange_rescaling));
         table.insert("self_energy_spectrum_test".to_string(), toml::Value::Boolean(self.self_energy_spectrum_test));
+        table.insert("spectrum_test_start".to_string(), toml::Value::Float(self.spectrum_test_start));
+        table.insert("spectrum_test_end".to_string(), toml::Value::Float(self.spectrum_test_end));
+        table.insert("spectrum_test_step".to_string(), toml::Value::Float(self.spectrum_test_step));
         table.insert("bse_max_ang_momentum".to_string(), toml::Value::Integer(self.bse_max_ang_momentum as i64));
         if let Some(path) = &self.bse_auxbas_path {
             table.insert("bse_auxbas_path".to_string(), toml::Value::String(path.clone()));
@@ -216,6 +225,18 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.self_energy_spectrum_test= match tmp_ctrl.get("self_energy_spectrum_test").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
+            };
+            tmp_input.spectrum_test_start = match tmp_ctrl.get("spectrum_test_start").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.5_f64)},
+                other => {-1.0},
+            };
+            tmp_input.spectrum_test_end = match tmp_ctrl.get("spectrum_test_end").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.5_f64)},
+                other => {0.0},
+            };
+            tmp_input.spectrum_test_step = match tmp_ctrl.get("spectrum_test_step").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.5_f64)},
+                other => {0.01},
             };
             tmp_input.bse_spin = match tmp_ctrl.get("bse_spin").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
