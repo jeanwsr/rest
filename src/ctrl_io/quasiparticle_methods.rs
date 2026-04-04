@@ -54,7 +54,12 @@ pub struct QuasiParticle {
     pub self_energy_spectrum_test:bool,
     pub pysoc:bool,
     pub gw_imag_rayon:bool,
-    pub bse_auxbas_path: Option<String>
+    pub bse_auxbas_path: Option<String>,
+    // QSGW-specific controls
+    pub qsgw_max_iter: usize,
+    pub qsgw_energy_tol: f64,
+    pub qsgw_mix_param: f64,
+    pub qsgw_eta: f64
 }
 
 impl Default for QuasiParticle {
@@ -108,7 +113,11 @@ impl Default for QuasiParticle {
             self_energy_spectrum_test:false,
             pysoc:false,
             gw_imag_rayon:true,
-            bse_auxbas_path: None
+            bse_auxbas_path: None,
+            qsgw_max_iter: 50,
+            qsgw_energy_tol: 1e-5,
+            qsgw_mix_param: 0.5,
+            qsgw_eta: 0.001
         }
     }
 }
@@ -168,6 +177,10 @@ impl QuasiParticle {
         if let Some(path) = &self.bse_auxbas_path {
             table.insert("bse_auxbas_path".to_string(), toml::Value::String(path.clone()));
         }
+        table.insert("qsgw_max_iter".to_string(), toml::Value::Integer(self.qsgw_max_iter as i64));
+        table.insert("qsgw_energy_tol".to_string(), toml::Value::Float(self.qsgw_energy_tol));
+        table.insert("qsgw_mix_param".to_string(), toml::Value::Float(self.qsgw_mix_param));
+        table.insert("qsgw_eta".to_string(), toml::Value::Float(self.qsgw_eta));
         toml::Value::Table(table)
     }
 }
@@ -383,6 +396,22 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.bse_auxbas_path = match tmp_ctrl.get("bse_auxbas_path").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => Some(s.clone()),
                 _ => None,
+            };
+            tmp_input.qsgw_max_iter = match tmp_ctrl.get("qsgw_max_iter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(50) as usize,
+                _ => 50,
+            };
+            tmp_input.qsgw_energy_tol = match tmp_ctrl.get("qsgw_energy_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e-5),
+                _ => 1e-5,
+            };
+            tmp_input.qsgw_mix_param = match tmp_ctrl.get("qsgw_mix_param").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.5),
+                _ => 0.5,
+            };
+            tmp_input.qsgw_eta = match tmp_ctrl.get("qsgw_eta").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),
+                _ => 0.001,
             };
             return Ok(Some(tmp_input));
         },

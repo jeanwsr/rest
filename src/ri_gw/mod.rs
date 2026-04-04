@@ -37,6 +37,8 @@ pub mod renormalized_singles;
 pub mod scgw;
 pub mod display;
 pub mod fourier_self_energy;
+pub mod drpa;
+pub mod qsgw;
 use crate::mpi_io::MPIOperator;
 
 pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperator>){
@@ -60,7 +62,10 @@ pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperat
     let gw_scheme=qp_ctrl.gw_scheme.clone();
     let scgw=qp_ctrl.scgw.clone();
     let quasiparticle_energies:Vec<f64>=
-        if scgw=="g0w0"&&renormalized_singles==false{
+        if scgw=="qsgw" {
+            println!("You are doing QSGW (quasiparticle self-consistent GW) calculations");
+            qsgw::qsgw_loop(scf_data, vxc_nn, mpi_operator)
+        } else if scgw=="g0w0"&&renormalized_singles==false{
             println!("You are doing G0W0 calculations of entire energy spectrum");
             scgw::g0w0(scf_data,20,&vxc_nn,true)
         }else if scgw=="evgw"{
