@@ -462,6 +462,8 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             ri_gw::get_homo_lumo_qp_only(scf_data,20,&vxc_nn,mpi_operator);
         }else if qp_ctrl.self_energy_spectrum_test==true{
             ri_gw::spectrum_test(scf_data,20);
+        }else if qp_ctrl.obtain_vx_vc_terms==true{
+            ri_gw::obtain_vx_vc_terms(scf_data);
         }else{
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
             if scf_data.mol.ctrl.print_level>1{

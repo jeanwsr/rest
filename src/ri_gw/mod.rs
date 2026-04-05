@@ -1073,9 +1073,11 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
 }
 pub fn obtain_vx_vc_terms(scf_data:&mut SCF){
     println!("starts obtaining HOMO vx and vc terms from various DFAs");
+    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
+    let mut file = OpenOptions::new().append(true).create(true).open("ks_homo.txt");
+    writeln!(file.expect("write failure"), "{}", scf_data.eigenvalues[0][occ_size-1]);
     let mut file = OpenOptions::new().append(true).create(true).open("lda_x_slater.txt");
-    let value=get_homo_vx_or_vc(scf_data,"lda_x_slater",'X');
-    writeln!(file.expect("write failure"), "{}", value);
+    writeln!(file.expect("write failure"), "{}", get_homo_vx_or_vc(scf_data,"lda_x_slater",'X'));
     let mut file = OpenOptions::new().append(true).create(true).open("gga_x_b88.txt");
     writeln!(file.expect("write failure"), "{}", get_homo_vx_or_vc(scf_data,"gga_x_b88",'X'));
     let mut file = OpenOptions::new().append(true).create(true).open("gga_x_pbe.txt");
