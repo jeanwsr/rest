@@ -760,7 +760,7 @@ pub fn spectrum_test(scf_data:&SCF,num_freq:usize){
     let start_freq:f64=qp_ctrl.spectrum_test_start;
     let end_freq:f64=qp_ctrl.spectrum_test_end;
     let step:f64=qp_ctrl.spectrum_test_step;
-    let steps:usize=((start_freq-end_freq)/step).ceil() as usize;
+    let steps:usize=((end_freq-start_freq)/step).ceil() as usize;
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_full,&quasiparticle_energies,&quasiparticle_energies,num_state,occ_size,vir_size,num_freq);
     for n in (homo..homo+2){
         println!("Now is the spectrum of orbital #{}",n);
