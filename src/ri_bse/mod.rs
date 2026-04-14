@@ -21,6 +21,8 @@ pub mod davidson_solver;
 pub mod matvec;
 pub mod sbse;
 pub mod pysoc_file;
+pub mod damped;
+
 
 pub fn bse_main(scf_data:&mut SCF){
     let start=Instant::now();

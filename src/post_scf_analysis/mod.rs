@@ -482,6 +482,20 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
         }
         ri_bse::bse_main(scf_data);
+    }else if output_type.eq("damped_bse"){
+        if qp_ctrl.gw_scheme=="parse from file"{
+            let parse_qp_path=qp_ctrl.parse_qp_path.clone();
+            scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
+        }else{
+            let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
+            ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
+        }
+        let p_induced=ri_bse::damped::damped_bse(scf_data);
+        println!("Induced Density Matrix:");
+        println!("P Real (Plus Half):\n{:#?}",p_induced.0);
+        println!("P Real (Minus Half):\n{:#?}",p_induced.1);
+        println!("P Imaginary (Plus Half):\n{:#?}",p_induced.2);
+        println!("P Imaginary (Minus Half):\n{:#?}",p_induced.3);
     }else{
         print!("Warning: You entered an invalid quasiparticle method. No quasiparticle methods Were triggered.")
     }

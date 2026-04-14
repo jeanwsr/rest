@@ -45,6 +45,8 @@ pub struct QuasiParticle {
     pub parse_qp_path:String,
     pub bse_qp_polarization:bool,
     pub threshold:f64,
+    pub external_field_freq:f64,
+    pub lifetime_gamma:f64,
     pub gw_or_bse:String,
     pub gw_span_energy:f64,
     pub gw_search_grid:usize,
@@ -118,6 +120,8 @@ impl Default for QuasiParticle {
             spectrum_test_end:0.0,
             spectrum_test_step:0.01,
             pysoc:false,
+            external_field_freq:0.5,
+            lifetime_gamma:0.001,
             gw_imag_rayon:true,
             bse_auxbas_path: None,
             qsgw_max_iter: 50,
@@ -171,6 +175,8 @@ impl QuasiParticle {
         table.insert("bse_qp_polarization".to_string(), toml::Value::Boolean(self.bse_qp_polarization));
         table.insert("threshold".to_string(), toml::Value::Float(self.threshold));
         table.insert("gw_span_energy".to_string(), toml::Value::Float(self.gw_span_energy));
+        table.insert("external_field_freq".to_string(), toml::Value::Float(self.external_field_freq));
+        table.insert("lifetime_gamma".to_string(), toml::Value::Float(self.lifetime_gamma));
         table.insert("gw_or_bse".to_string(), toml::Value::String(self.gw_or_bse.clone()));
         table.insert("gw_search_grid".to_string(), toml::Value::Integer(self.gw_search_grid as i64));
         table.insert("simplified_bse".to_string(), toml::Value::Boolean(self.simplified_bse));
@@ -249,6 +255,13 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.bse_exchange_rescaling = match tmp_ctrl.get("bse_exchange_rescaling").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0_f64)},
                 other => {1.0},
+            };
+            tmp_input.external_field_freq = match tmp_ctrl.get("external_field_freq").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.5_f64)},
+                other => {0.5},
+            };tmp_input.lifetime_gamma = match tmp_ctrl.get("lifetime_gamma").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.001_f64)},
+                other => {0.001},
             };
             tmp_input.davidson_converge_threshold = match tmp_ctrl.get("davidson_converge_threshold").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-6_f64)},
