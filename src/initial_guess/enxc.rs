@@ -1,6 +1,5 @@
 use core::panic;
 use std::fs;
-use libc::TCA_DUMP_INVISIBLE;
 use rest_libcint::{CintType, CINTR2CDATA};
 use serde::{Deserialize, Serialize};
 use serde_json::{Result,Value};
@@ -13,6 +12,8 @@ use crate::constants::{ATM_NUC_MOD_OF, NUC_ECP, SPECIES_INFO};
 use rest_libcint::prelude::rest_libcint_wrapper::ECPscalar;
 use crate::basis_io::ecp::{PotCell, PotCellRaw};
 
+#[cfg(target_os = "linux")]
+use libc::TCA_DUMP_INVISIBLE;
 
 
 //#[derive(Clone, Debug,Serialize,Deserialize)]

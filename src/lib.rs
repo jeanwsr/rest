@@ -47,6 +47,7 @@
 //! ![image](/home/igor/Documents/Package-Pool/rest_workspace/rest/figures/REST电子结构程序6-2.png) 
 //! 
 #![allow(unused)]
+#![allow(non_snake_case)]
 extern crate rest_tensors as tensors;
 extern crate hdf5_metno as hdf5;
 extern crate chrono as time;
