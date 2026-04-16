@@ -3,7 +3,6 @@ use itertools::Itertools;
 use std::ops::Range;
 use crate::utilities;
 use crate::scf_io::SCF;
-use libc::seccomp_notif;
 use rayon::result;
 use reqwest::blocking::Response;
 use rest_tensors::{RIFull};
@@ -23,6 +22,9 @@ use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefMutIterator;
 use crate::mpi_io::{MPIOperator,MPIData};
 use crate::ri_gw;
+
+#[cfg(target_os = "linux")]
+use libc::seccomp_notif;
 
 pub fn generate_rs_hamiltonian(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>)->(MatrixFull<f64>,MatrixFull<f64>){
     println!("Starts generating rs hamiltonian!");
