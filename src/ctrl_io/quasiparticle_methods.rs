@@ -64,7 +64,18 @@ pub struct QuasiParticle {
     pub qsgw_max_iter: usize,
     pub qsgw_energy_tol: f64,
     pub qsgw_mix_param: f64,
-    pub qsgw_eta: f64
+    pub qsgw_eta: f64,
+    // damped BSE grid sampling parameters
+    pub damped_bse_x_start: f64,
+    pub damped_bse_x_end: f64,
+    pub damped_bse_x_points: usize,
+    pub damped_bse_y_start: f64,
+    pub damped_bse_y_end: f64,
+    pub damped_bse_y_points: usize,
+    pub damped_bse_z_start: f64,
+    pub damped_bse_z_end: f64,
+    pub damped_bse_z_points: usize,
+    pub damped_bse_grids: Vec<[f64; 3]>
 }
 
 impl Default for QuasiParticle {
@@ -127,7 +138,18 @@ impl Default for QuasiParticle {
             qsgw_max_iter: 50,
             qsgw_energy_tol: 1e-5,
             qsgw_mix_param: 0.5,
-            qsgw_eta: 0.001
+            qsgw_eta: 0.001,
+            // damped BSE grid sampling parameters (default: 2 points per dimension)
+            damped_bse_x_start: 0.0,
+            damped_bse_x_end: 1.0,
+            damped_bse_x_points: 2,
+            damped_bse_y_start: 0.0,
+            damped_bse_y_end: 1.0,
+            damped_bse_y_points: 2,
+            damped_bse_z_start: 0.0,
+            damped_bse_z_end: 1.0,
+            damped_bse_z_points: 2,
+            damped_bse_grids: Vec::new()
         }
     }
 }
@@ -196,6 +218,15 @@ impl QuasiParticle {
         table.insert("qsgw_energy_tol".to_string(), toml::Value::Float(self.qsgw_energy_tol));
         table.insert("qsgw_mix_param".to_string(), toml::Value::Float(self.qsgw_mix_param));
         table.insert("qsgw_eta".to_string(), toml::Value::Float(self.qsgw_eta));
+        table.insert("damped_bse_x_start".to_string(), toml::Value::Float(self.damped_bse_x_start));
+        table.insert("damped_bse_x_end".to_string(), toml::Value::Float(self.damped_bse_x_end));
+        table.insert("damped_bse_x_points".to_string(), toml::Value::Integer(self.damped_bse_x_points as i64));
+        table.insert("damped_bse_y_start".to_string(), toml::Value::Float(self.damped_bse_y_start));
+        table.insert("damped_bse_y_end".to_string(), toml::Value::Float(self.damped_bse_y_end));
+        table.insert("damped_bse_y_points".to_string(), toml::Value::Integer(self.damped_bse_y_points as i64));
+        table.insert("damped_bse_z_start".to_string(), toml::Value::Float(self.damped_bse_z_start));
+        table.insert("damped_bse_z_end".to_string(), toml::Value::Float(self.damped_bse_z_end));
+        table.insert("damped_bse_z_points".to_string(), toml::Value::Integer(self.damped_bse_z_points as i64));
         toml::Value::Table(table)
     }
 }
@@ -447,6 +478,71 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),
                 _ => 0.001,
             };
+            // Parse damped BSE grid sampling parameters
+            tmp_input.damped_bse_x_start = match tmp_ctrl.get("damped_bse_x_start").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.damped_bse_x_end = match tmp_ctrl.get("damped_bse_x_end").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0),
+                _ => 1.0,
+            };
+            tmp_input.damped_bse_x_points = match tmp_ctrl.get("damped_bse_x_points").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(2) as usize,
+                _ => 2,
+            };
+            tmp_input.damped_bse_y_start = match tmp_ctrl.get("damped_bse_y_start").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.damped_bse_y_end = match tmp_ctrl.get("damped_bse_y_end").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0),
+                _ => 1.0,
+            };
+            tmp_input.damped_bse_y_points = match tmp_ctrl.get("damped_bse_y_points").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(2) as usize,
+                _ => 2,
+            };
+            tmp_input.damped_bse_z_start = match tmp_ctrl.get("damped_bse_z_start").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.damped_bse_z_end = match tmp_ctrl.get("damped_bse_z_end").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0),
+                _ => 1.0,
+            };
+            tmp_input.damped_bse_z_points = match tmp_ctrl.get("damped_bse_z_points").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(2) as usize,
+                _ => 2,
+            };
+            // Generate grids: OUTER LOOP X, MIDDLE LOOP Y, INNER LOOP Z
+            let x_step = if tmp_input.damped_bse_x_points > 1 {
+                (tmp_input.damped_bse_x_end - tmp_input.damped_bse_x_start) / (tmp_input.damped_bse_x_points - 1) as f64
+            } else {
+                0.0
+            };
+            let y_step = if tmp_input.damped_bse_y_points > 1 {
+                (tmp_input.damped_bse_y_end - tmp_input.damped_bse_y_start) / (tmp_input.damped_bse_y_points - 1) as f64
+            } else {
+                0.0
+            };
+            let z_step = if tmp_input.damped_bse_z_points > 1 {
+                (tmp_input.damped_bse_z_end - tmp_input.damped_bse_z_start) / (tmp_input.damped_bse_z_points - 1) as f64
+            } else {
+                0.0
+            };
+            let mut grids = Vec::with_capacity(tmp_input.damped_bse_x_points * tmp_input.damped_bse_y_points * tmp_input.damped_bse_z_points);
+            for ix in 0..tmp_input.damped_bse_x_points {
+                let x = tmp_input.damped_bse_x_start + ix as f64 * x_step;
+                for iy in 0..tmp_input.damped_bse_y_points {
+                    let y = tmp_input.damped_bse_y_start + iy as f64 * y_step;
+                    for iz in 0..tmp_input.damped_bse_z_points {
+                        let z = tmp_input.damped_bse_z_start + iz as f64 * z_step;
+                        grids.push([x, y, z]);
+                    }
+                }
+            }
+            tmp_input.damped_bse_grids = grids;
             return Ok(Some(tmp_input));
         },
         other => {
