@@ -70,6 +70,7 @@ pub mod mpi_io;
 pub mod grad;
 pub mod post_scf_analysis;
 pub mod main_driver;
+pub mod ri_jk;
 pub mod ri_pt2;
 pub mod ri_rpa;
 pub mod ri_gw;

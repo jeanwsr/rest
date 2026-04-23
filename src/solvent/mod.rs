@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::f64::consts;
 use rest_libcint::gto::prelude_dev::X;
 use rest_libcint::{CINTR2CDATA, CintType};
-use rstsr_core::prelude_dev::shape;
 use serde::{Deserialize, Serialize};
 use tensors::{map_full_to_upper, map_upper_to_full, ri, BasicMatUp, BasicMatrix, MathMatrix, MatrixFull, MatrixFullSlice, MatrixFullSliceMut, MatrixUpper, MatrixUpperSlice};
 //use rstsr as rt;

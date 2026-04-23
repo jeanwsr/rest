@@ -7,6 +7,7 @@ use core::panic;
 use std::{fs, sync::Arc};
 use crate::ctrl_io::geometric_pyo3_io::parse_geometric_keywords;
 use crate::ctrl_io::quasiparticle_methods::parse_quasiparticle_keywords;
+use crate::ri_jk::decompose::J2CDecompOption;
 use crate::{check_norm::force_state_occupation::ForceStateOccupation};
 use crate::dft::{DFAFamily, DFTType, DFA4REST};
 use crate::geom_io::{GeomCell, GeomUnit, MOrC, parse_geom_keywords};
@@ -280,6 +281,7 @@ pub struct InputKeywords {
     pub opt_engine: Option<String>,
     pub geometric_pyo3: Option<GeomeTRIC>,
     pub quasiparticle_methods:Option<QuasiParticle>,
+    pub j2c_decomp: J2CDecompOption,
 }
 
 impl Default for InputKeywords {
@@ -419,6 +421,7 @@ impl InputKeywords {
             solvent_enabled: false,
             solv_epsilon:1.0,
             solvent_model: PcmMethod::CPCM,
+            j2c_decomp: J2CDecompOption::default(),
         }
     }
 
@@ -1265,6 +1268,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.algorithm_jk = tmp_ctrl.get("algorithm_jk").map(serde_from_value).unwrap_or_default();
             tmp_input.algorithm_j = tmp_ctrl.get("algorithm_j").map(serde_from_value).unwrap_or_default();
             tmp_input.algorithm_k = tmp_ctrl.get("algorithm_k").map(serde_from_value).unwrap_or_default();
+            tmp_input.j2c_decomp = tmp_ctrl.get("j2c_decomp").map(serde_from_value).unwrap_or_default();
             if (tmp_input.algorithm_j != AlgorithmJ::Default || tmp_input.algorithm_k != AlgorithmK::Default) {
                 if tmp_input.algorithm_jk != AlgorithmJK::Default {
                     println!("Warning: algorithm_j or algorithm_k are specified, the setting in algorithm_jk will be ignored.");
