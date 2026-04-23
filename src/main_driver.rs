@@ -339,50 +339,131 @@ pub fn main_driver() -> anyhow::Result<()> {
     Ok(())
 }
 
-
 pub fn output_result(scf_data: &scf_io::SCF) {
-    println!("The SCF energy        : {:18.10} Ha", 
-        //scf_data.mol.ctrl.xc.to_uppercase(),
-        scf_data.scf_energy);
     
+    //--------------------------
+    // 0. Solvent energy
+    //--------------------------
+    if scf_data.mol.use_solvent{
+        println!("The solvent energy    : {:18.10} Ha", scf_data.energies.get("solvent_energy").unwrap()[0]);
+    }
     let xc_name = scf_data.mol.ctrl.xc.to_lowercase();
 
+    //===========================================================
+    // 1. Print SCF energy (Yamaguchi-corrected overrides SCF)
+    //===========================================================
+    if let Some(v) = scf_data.energies.get("yamaguchi_scf_corrected") {
+        println!("The SCF energy        : {:18.10} Ha", v[0]);
+    } else {
+        println!("The SCF energy        : {:18.10} Ha", scf_data.scf_energy);
+    }
+
+
+    //===========================================================
+    // 2. Helper: fetch corrected or normal total energy
+    //===========================================================
+    let yamaguchi_tot = scf_data.energies.get("yamaguchi_tot_corrected").map(|v| v[0]);
+
+
+    //===========================================================
+    // 3. Print energies corresponding to the functional family
+    //===========================================================
+
+    //--------------------------
+    // MP2 / SCS-MP2
+    //--------------------------
     if xc_name.eq("mp2") || xc_name.eq("scs-mp2") {
-        let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
-        println!("The MP2 total energy  : {:18.10} Ha", total_energy);
-    }
-
-    if xc_name.eq("b2plyp") || xc_name.eq("b2gpplyp") || xc_name.eq("pbe-qidh") || xc_name.eq("pbe0dh") {
-        let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
-        println!("The DH energy         : {:18.10} Ha", total_energy);
-    }
-    
-    if xc_name.eq("dsdpbep86-nodisp") || xc_name.eq("dsdpbep86") || xc_name.eq("dsdpbep95") || xc_name.eq("dsdblyp") {
-        let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
-        println!("The DSD-DH energy     : {:18.10} Ha", total_energy);
-    }
-
-    if xc_name.eq("xyg3") || xc_name.eq("xygjos") || xc_name.eq("xdh-pbe0") || xc_name.eq("r-xdh7") || xc_name.eq("xyg7") || xc_name.eq("zrps") || xc_name.eq("scsrpa") {
-        let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
-        //let post_ai_correction = scf_data.mol.ctrl.post_ai_correction.to_lowercase();
-        //let ai_correction = if xc_name.eq("r-xdh7") && post_ai_correction.eq("scc15") {
-        //    let ai_correction = scf_data.energies.get("ai_correction").unwrap()[0];
-        //    println!("AI Correction         : {:18.10} Ha", ai_correction);
-        //    ai_correction
-        //} else {
-        //    0.0
-        //};
-        let ai_correction = if let Some(ai_correction) = scf_data.energies.get("ai_correction") {
-            ai_correction[0]
+        if let Some(e) = yamaguchi_tot {
+            // println!("The MP2 energy  : {:18.10} Ha", e);
+            println!("The (R)-xDH energy    : {:18.10} Ha", e);
         } else {
-            0.0
-        };
-        println!("The (R)-xDH energy    : {:18.10} Ha", total_energy+ ai_correction);
+            let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
+            // println!("The MP2 energy  : {:18.10} Ha", total_energy);
+            println!("The (R)-xDH energy    : {:18.10} Ha", total_energy);
+        }
+    }
+    //--------------------------
+    // DH functionals
+    //--------------------------
+    if xc_name.eq("b2plyp") 
+        || xc_name.eq("b2gpplyp") 
+        || xc_name.eq("pbe-qidh") 
+        || xc_name.eq("pbe0dh")
+    {
+        if let Some(e) = yamaguchi_tot {
+            // println!("The DH energy         : {:18.10} Ha", e);
+            println!("The (R)-xDH energy    : {:18.10} Ha", e);
+        } else {
+            let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
+            println!("The (R)-xDH energy    : {:18.10} Ha", total_energy);
+        }
+        return;
     }
 
+    //--------------------------
+    // DSD double hybrids
+    //--------------------------
+    if xc_name.eq("dsdpbep86-nodisp") 
+        || xc_name.eq("dsdpbep86") 
+        || xc_name.eq("dsdpbeb95") 
+        || xc_name.eq("dsdblyp")
+    {
+        if let Some(e) = yamaguchi_tot {
+            // println!("The DSD-DH energy     : {:18.10} Ha", e);
+            println!("The (R)-xDH energy    : {:18.10} Ha", e);
+        } else {
+            let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
+            // println!("The DSD-DH energy     : {:18.10} Ha", total);
+            println!("The (R)-xDH energy    : {:18.10} Ha", total_energy);
+        }
+        return;
+    }
+
+    //--------------------------
+    // xDH / XYG / ZRPS / SCSRPA
+    //--------------------------
+    if xc_name.eq("xyg3") 
+        || xc_name.eq("xygjos") 
+        || xc_name.eq("xdh-pbe0") 
+        || xc_name.eq("r-xdh7") 
+        || xc_name.eq("xyg7")
+        || xc_name.eq("xyg2")
+        || xc_name.eq("zrps")
+        || xc_name.eq("scsrpa")
+        || xc_name.eq("r-xyg3")
+        || xc_name.eq("r-xygjos")
+        || xc_name.eq("r-xyg7")
+        || xc_name.eq("r-xyg2")
+    {
+        if let Some(e) = yamaguchi_tot {
+            println!("The (R)-xDH energy    : {:18.10} Ha", e);
+        } else {
+            let total = scf_data.energies.get("xdh_energy").unwrap()[0];
+            //let post_ai_correction = scf_data.mol.ctrl.post_ai_correction.to_lowercase();
+            //let ai_correction = if xc_name.eq("r-xdh7") && post_ai_correction.eq("scc15") {
+            //    let ai_correction = scf_data.energies.get("ai_correction").unwrap()[0];
+            //    println!("AI Correction         : {:18.10} Ha", ai_correction);
+            //    ai_correction
+            //} else {
+            //    0.0
+            //};
+            let ai_corr = scf_data.energies.get("ai_correction").map(|v| v[0]).unwrap_or(0.0);
+            println!("The (R)-xDH energy    : {:18.10} Ha", total + ai_corr);
+        }
+        return;
+    }
+
+    //--------------------------
+    // RPA
+    //--------------------------
     if xc_name.eq("rpa@pbe") {
-        let total_energy = scf_data.energies.get("rpa_energy").unwrap()[0];
-        println!("The RPA energy        : {:18.10} Ha", total_energy);
+        if let Some(e) = yamaguchi_tot {
+            println!("The RPA energy        : {:18.10} Ha", e);
+        } else {
+            let total = scf_data.energies.get("rpa_energy").unwrap()[0];
+            println!("The RPA energy        : {:18.10} Ha", total);
+        }
+        return;
     }
 
 }
@@ -462,11 +543,16 @@ pub fn collect_total_energy(scf_data: &SCF) -> f64 {
         "pbe0dh" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "dsdpbep86-nodisp" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "dsdpbep86" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "dsdpbep95" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "dsdpbeb95" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "dsdblyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "xyg7" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "xyg2" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "r-xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "r-xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "r-xyg7" => scf_data.energies.get("xdh_energy").unwrap()[0],
+        "r-xyg2" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "xdh-pbe0" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "r-xdh7" => scf_data.energies.get("xdh_energy").unwrap()[0],
         "zrps" => scf_data.energies.get("xdh_energy").unwrap()[0],

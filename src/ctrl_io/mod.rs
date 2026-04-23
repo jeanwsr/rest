@@ -2,10 +2,12 @@
 use pyo3::pyclass;
 use serde::{Deserialize,Serialize};
 use tensors::MatrixFull;
+use core::panic;
 //use std::{fs, str::pattern::StrSearcher};
 use std::{fs, sync::Arc};
 use crate::ctrl_io::geometric_pyo3_io::parse_geometric_keywords;
 use crate::ctrl_io::quasiparticle_methods::parse_quasiparticle_keywords;
+use crate::ri_jk::decompose::J2CDecompOption;
 use crate::ctrl_io::tddft_parameters::parse_tddft_keywords;
 use crate::{check_norm::force_state_occupation::ForceStateOccupation};
 use crate::dft::{DFAFamily, DFTType, DFA4REST};
@@ -14,6 +16,7 @@ use crate::utilities;
 use rayon::ThreadPoolBuilder;
 use crate::check_norm::OCCType;
 use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper,omp_get_num_threads_wrapper};
+use crate::solvent::PcmMethod;
 
 use serde_json;
 use toml;
@@ -202,6 +205,11 @@ pub struct InputKeywords {
     #[pyo3(get, set)]
     pub restart: bool,
     #[pyo3(get, set)]
+    // Keywords for solvent models
+    pub solvent_enabled: bool,
+    pub solv_epsilon: f64,
+    pub solvent_model: PcmMethod,
+    #[pyo3(get, set)]
     // The initial MO coefficients and eigenvalues can be imported by setting chkfile
     pub chkfile: String,
     #[pyo3(get, set)]
@@ -272,6 +280,7 @@ pub struct InputKeywords {
     pub abort_on_mem_exceed: bool,
     pub guess_mix: bool,
     pub guess_mix_theta_deg: Vec<f64>,
+    pub start_mix_cycle: usize,
     pub spin_correction_scheme: Option<String>,
     pub yamaguchi_triplet_type: Option<String>,
     /// External dipole field (x, y, z) intensity in atomic units
@@ -280,6 +289,7 @@ pub struct InputKeywords {
     pub geometric_pyo3: Option<GeomeTRIC>,
     pub quasiparticle_methods:Option<QuasiParticle>,
     pub tddft: Option<TDDFTParameters>,
+    pub j2c_decomp: J2CDecompOption,
 }
 
 impl Default for InputKeywords {
@@ -409,12 +419,17 @@ impl InputKeywords {
             abort_on_mem_exceed: true,
             guess_mix: false,
             guess_mix_theta_deg: [15.0, 15.0].to_vec(),
+            start_mix_cycle: 0,
             spin_correction_scheme: None,
             yamaguchi_triplet_type: None,
             ext_field_dipole: None,
             opt_engine: None,
             geometric_pyo3: None,
             quasiparticle_methods:None,
+            solvent_enabled: false,
+            solv_epsilon:1.0,
+            solvent_model: PcmMethod::CPCM,
+            j2c_decomp: J2CDecompOption::default(),
             tddft: None,
         }
     }
@@ -604,6 +619,9 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
             println!("Initial guess mixing enabled: HOMO-LUMO rotated with theta = {:.1}° (alpha), {:.1}° (beta) to induce symmetry breaking",
                 ctrl.guess_mix_theta_deg[0], ctrl.guess_mix_theta_deg[1]);
         }
+        if ctrl.solvent_enabled {
+                println!("Current solvent model is {}.",ctrl.solvent_model)
+        }
 
     }
     println!("=========================================================");
@@ -762,17 +780,9 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     path_util::get_valid_basis_path(&tmp_bas, &rest_basis_dir, "auxiliary basis")
                },
                other => {
-                    //if ! std::path::Path::new(&String::from("./")).is_dir() {
-                    //    println!("The specified folder for the auxiliar basis sets is missing: (./)");
-                    //};
-                    println!("No auxiliary basis set is specified. Default auxiliary basis set in REST is def2-SV(P)-JKFIT");
-                    let default_bas = String::from("def2-SV(P)-JKFIT");
-                    if ! std::path::Path::new(&default_bas).is_dir() {
-                        //tmp_input.use_auxbas = false;
-                    } else {
-                        //tmp_input.use_auxbas = true;
-                    }
-                    default_bas
+                    println!("No auxiliary basis set is specified. Default auxiliary basis set in REST is def2-universal-jkfit");
+                    let default_bas = String::from("def2-universal-jkfit");
+                    path_util::get_valid_basis_path(&default_bas, &rest_basis_dir, "auxiliary basis")
                }
             };
             //if tmp_input.use_auxbas && tmp_input.print_level>0 {
@@ -1106,7 +1116,50 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(2.0_f64)},
                 other => {2.0_f64},
             };
-
+            // ==============================================
+            //  Keywords associated with solvent model
+            // ==============================================
+            tmp_input.solvent_enabled = match tmp_ctrl.get("solvent_enabled").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
+                serde_json::Value::Null =>{
+                    match tmp_ctrl.get("solvent_model").unwrap_or(&serde_json::Value::Null) {
+                        serde_json::Value::String(model_str) => !model_str.trim().is_empty(),
+                        _ => false,
+                    }
+                },
+                other => false,
+            };
+            tmp_input.solvent_model = match tmp_ctrl.get("solvent_model") {
+                Some(value) => {
+                    serde_json::from_value(value.clone())?
+                },
+                None => PcmMethod::CPCM,
+            };
+            tmp_input.solv_epsilon = match tmp_ctrl.get("solv_epsilon").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_fc) => {tmp_fc.to_lowercase().parse().unwrap_or(1.0_f64)},
+                serde_json::Value::Number(tmp_fc) => {tmp_fc.as_f64().unwrap_or(1.0_f64) as f64},
+                other => {
+                    println!("WARNING: No solvent epsilon provided, use epsilon of vacuum.");
+                    1.0_f64
+                },
+            };
+           // tmp_input.solvent_model = 
+           // match tmp_ctrl.get("solvent_model").unwrap_or(&serde_json::Value::Null) {
+           //     serde_json::Value::String(tmp_type) => {
+           //         let tmp_solvent_model = tmp_type.to_lowercase();
+           //         if tmp_solvent_model.eq("cpcm") {
+           //             PcmMethod::CPCM
+           //         } else if tmp_solvent_model.eq("cosmo") {
+           //             PcmMethod::COSMO
+           //         } else if tmp_solvent_model.eq("iefpcm") {
+           //             PcmMethod::IEFPCM
+           //         } else {
+           //             PcmMethod::disabled
+           //         }
+           //     },
+           //     other => PcmMethod::CPCM,
+           // };
             // ==============================================
             //  Keywords associated with the SCF procedure
             // ==============================================
@@ -1224,6 +1277,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.algorithm_jk = tmp_ctrl.get("algorithm_jk").map(serde_from_value).unwrap_or_default();
             tmp_input.algorithm_j = tmp_ctrl.get("algorithm_j").map(serde_from_value).unwrap_or_default();
             tmp_input.algorithm_k = tmp_ctrl.get("algorithm_k").map(serde_from_value).unwrap_or_default();
+            tmp_input.j2c_decomp = tmp_ctrl.get("j2c_decomp").map(serde_from_value).unwrap_or_default();
             if (tmp_input.algorithm_j != AlgorithmJ::Default || tmp_input.algorithm_k != AlgorithmK::Default) {
                 if tmp_input.algorithm_jk != AlgorithmJK::Default {
                     println!("Warning: algorithm_j or algorithm_k are specified, the setting in algorithm_jk will be ignored.");
@@ -1486,7 +1540,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
             tmp_input.abort_on_mem_exceed = tmp_ctrl.get("abort_on_mem_exceed").map(serde_from_value).unwrap_or(true);
             
-            // for guess_mix setting
+            // for guess_mix setting; default = False
             tmp_input.guess_mix = match tmp_ctrl.get("guess_mix").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_bool) => *tmp_bool,
                 serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
@@ -1506,6 +1560,13 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     else { vals.truncate(2); vals }
                 }
                 _ => vec![15.0, 15.0],
+            };
+
+            // for start_mix_cycle: support number or string; default = 0
+            tmp_input.start_mix_cycle = match tmp_ctrl.get("start_mix_cycle").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_i64().unwrap_or(0) as usize,
+                serde_json::Value::String(s) => {s.parse::<usize>().unwrap_or(0_usize)}
+                _ => 0_usize,
             };
 
             tmp_input.spin_correction_scheme = match tmp_ctrl.get("spin_correction_scheme").unwrap_or(&serde_json::Value::Null) {

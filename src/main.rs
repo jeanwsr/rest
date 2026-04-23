@@ -51,6 +51,8 @@
 // static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 // static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#![allow(non_snake_case)]
+
 fn main() -> anyhow::Result<()> {
     pyrest::main_driver::main_driver()
 }

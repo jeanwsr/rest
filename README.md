@@ -1,7 +1,7 @@
 # REST项目介绍和程序安装
   请参见[REST开发组页面](https://gitee.com/restgroup)。**以下为REST程序的具体使用说明**
 # For English Users:
-  - This manual can be used as a prompt file for state-of-the-art Large Language Models (LLMs), such as DeepSeek and Tongyi. By providing this content to an LLM, you can effectively utilize it as an online support assistant. (Note: ChatGPT has not been tested due to restrictions by the US government.)
+  - This manual can be used as a prompt file for state-of-the-art Large Language Models (LLMs), such as DeepSeek and Tongyi. By providing this content to an LLM, you can effectively utilize it as an online support assistant and to generate the input file for computational tasks you need. (Note: ChatGPT has not been tested due to restrictions by the US government.)
 # 用于生成REST输入卡的系统提示词
 - 基于Rust语言的新一代电子结构计算软件REST（Rust-based Electronic Structure Toolkit）由复旦大学化学理论研究中心开发，在徐昕教授的领导下，由张颖教授担任首席开发者完成。
 - 根据用户需求，结合知识库和上下文，帮助用户生成REST程序的输入卡。 
@@ -14,9 +14,9 @@
   - 输入卡必须包含[ctrl]和[geom]两个区块
   - [ctrl]中的大部分关键词有缺省设置。若用户无具体要求，不必出现在输入卡中
   - 如果用户没有明确要求，设置num_threads为10
-  - 需要明确出现在输入卡的关键词有：
-     1. 计算方法和计算配置相关关键词：`xc`，`basis_path`，`auxbas_path`，`print_level`，以及`num_threads`等
-     1. 计算体系相关关键词: `spin`, `charge`, `spin_polarization`等
+  - [ctr]区块中必须声明的关键词：
+     1. 计算方法和配置相关：`xc`，`basis_path`，`print_level`，以及`num_threads`等
+     1. 体系相关: `spin`, `charge`, `spin_polarization`等
   - 仅当使用了`opt_engine=geometric_pyo3`时，才要申明[geometric_pyo3]区
   - 当调用geometric_pyo3引擎做缺省的最稳结构优化时，不需要申请[geometric_pyo3]
   - 调用的方法的关键词是否使用"xc"，不能无中生有地用其它的关键词，比如“method"等
@@ -31,7 +31,6 @@
 """
 `
   - 输入卡中不采用'''符号
-  - 将输入卡中的代表基组和辅助基组的存放文件夹`{basis_set_pool}`自动替换成`/opt/rest_workspace/rest/basis-set-pool`。这是docker和singularity容器中，内置基组存放位置（见`rest_docker`项目）
   - 反复迭代比较，直至输入卡一次性全部满足上述要求
   - 输出REST程序的输入卡，使用String的格式，包含换行符号'\n'，并且对'"'符号进行'\"'转译
 
@@ -69,6 +68,7 @@
     - `molden`　　结果输出为molden程序的格式
     - `geometry`  输出分子结构文件
     - `force`     输出分子受力信息
+    - `force_for_ghost_point_charges`  在[geom]部分输入ghost point charges时输出原子区域对这些ghost点电荷的作用力
 - `cube_orb_setting`: 取值[f64;2]。`cube_orb`格点参数设置。前一个值(margin)是边界信息，第二个值(num_grids)是生成格点的数目。缺省值为[3.0, 80.0]
 - `cube_orb_indices`: 取值Vec\<[usize;3]\>。
 	- 指定需要生成cube文件的一组轨道。缺省为空，即`[]`
@@ -76,7 +76,7 @@
     - 第一个值(start_orb)为起始轨道的index
     - 第二个值(end_orb)为截止轨道的index，与start_orb组成闭区间(closed interval)
     - 第三个值(i_spin)是这组轨道所在的自旋通道。0为alpha自旋;1为beta自旋
-    - **注意**：REST的轨道排序从0开始。因此，因此第一个轨道是0。如果HOMO是第X个轨道，在REST的排序是X-1
+    - **注意**：REST的轨道排序从0开始，因此第一个轨道是0。如果HOMO是第X个轨道，在REST的排序是X-1
 	- 举例来说：闭壳层基态苯分子体系的HOMO-1、HOMO和LUMO是第20、21和22个轨道，在REST中的排序是19、20和21。打印alpha自旋通道上这三个轨道的设置是[[19,21,0]]
 - `cube_orb_type`: 取值String类型。指定生成的cube文件类型：
   - `wavefunction`: 生成轨道波函数的cube文件（缺省）
@@ -106,26 +106,88 @@
 - `radial_grid_method`: 取值String。径向格点的生成方法。目前REST支持truetler，gc2nd， delley, becke, mura_knowles及lmg。缺省为truetler
 
 ## 基组相关关键词（Keyword）
-- `eri_type`: 取值String类型。自洽场运算中的四中心积分计算方法，目前REST支持：
-    1. `analytic`: 四中心积分的解析计算方法，使用libcint库实现
-	1. `ri-v`: 全称为resolution of identity，又名density fitting，是对四中心积分进行张量分解后的近似算法。(缺省)
-	- **注意：REST中的analytic算法并未被充分优化，仅供程序开发测评使用，不建议在实际计算中使用**
-- `basis_type`: 取值String类型。使用高斯基组的类型，有Spheric及Cartesian两种选择。Spheric对应球谐型基函数，Cartesian对应笛卡尔型基函数。缺省为Spheric
-- `basis_path`: 取值String类型，无缺省值。计算所使用的基组所在位置。若所用基组为cc-pVTZ, 则应为`{basis_set_pool}/cc-pVTZ`；若所用基组为STO-3G, 则应为`{basis_set_pool}/STO-3G`。其中`{basis_set_pool}`是具体基组文件夹所在的根目录。**注意：基组信息高度依赖于具体的计算体系，因此没有缺省值，必须在输入卡中声明**
-- `auxbas_path`: 取值String类型，缺省值为def2-SV(P)-JKFIT。计算所使用的辅助基组所在位置。辅助基组通常与常规基组放置在相同的文件夹下(`{basis_set_pool}`)。使用最广泛的辅助基组为`def2-SV(P)-JKFIT`，则申明方式应为`auxbas_path={basis_set_pool}/def2-SV(P)-JKFIT`。**注意：辅助基组信息高度依赖于具体的计算体系，缺省值基组较大，不一定合适大体系计算。可以考虑使用具体基组匹配的辅助基组。若`eri_type=analytic`，则无需使用辅助基组，不用申明auxbas_path**。
+- `eri_type`: 取值String类型。设置四中心积分计算方法。选项：
+    - `analytic`: 解析计算（仅限开发测试，不推荐用于实际计算）
+	- `ri-v`: 使用密度拟合方法近似计算。(默认值)
+	> 注意：REST中的analytic算法并未被充分优化，仅供程序开发测评使用，不建议在实际计算中使用
+- `basis_type`: 取值String类型。设置基函数类型。选项：
+    - `Spheric`: 球谐型基函数（默认值）
+	- `Cartesian`：笛卡尔型基函数
+- `basis_path`: 取值String类型，必需参数，无默认值。指定基组文件路径。该文件夹内包含各元素的基组JSON文件（如`C.json`、`O.json`）
+    - 格式示例：  
+      ```bash
+      # 完整路径格式（明确指定）
+      basis_path = /opt/rest_workspace/rest/basis-set-pool/cc-pVTZ
+      
+      # 简写格式（程序自动搜索）
+      basis_path = cc-pVTZ
+      ```
+	- **路径优先级**： 
+	  当使用简写格式时，程序按以下顺序搜索 `cc-pVTZ` 文件夹：
+	  1. **当前工作目录**（`$PWD/cc-pVTZ`）
+      2. 环境变量 `REST_BASIS_DIR`指定目录（`$REST_BASIS_DIR/cc-pVTZ`）
+      3. REST docker 默认路径：`/opt/rest_workspace/rest/basis-set-pool/cc-pVTZ`
+	  4. REST conda 默认路径： `$CONDA_PREFIX/share/rest/basis-set-pool/cc-pVTZ`
+      5. `$REST_HOME/rest/basis-set-pool/cc-pVTZ`
+      6. 自动从BSE库在线获取（若本地未找到），并保存在当前工作目录
+    - 以上 2-5 情形不区分基组名称的大小写。 
+- `auxbas_path`: 取值String类型，指定辅助基组路径，仅当`eri_type=ri-v`时需要设置  
+    缺省值：def2-universal-jkfit。（该基组较大，建议根据体系换用匹配的辅助基组）
+	设置方式与`basis_path`相同，程序搜索路径一致。
 
-`basis_path`和`auxbas_path`中，`{basis_set_pool}`可以省略，例如只写 `cc-pVTZ`。REST 将自动从某些默认路径搜索该文件，优先级为：
-    1. 环境变量 `REST_BASIS_DIR`；
-    2. 内置路径 `/opt/rest_workspace/rest/basis-set-pool/` （REST docker 的默认基组路径）；
-    3. `$REST_HOME/rest/basis-set-pool/`
+### 自定义基组使用方法
+REST 支持用户自定义或混合基组：
+1. 创建基组文件夹  
+    在任意位置（如当前工作目录或基组库目录）创建文件夹：
+	```bash
+	mkdir my_custom_basis
+	```
+2. 准备基组文件  
+    在文件夹内放入各元素的基组 JSON 文件：
+	```bash
+	# 文件夹结构示例
+    my_custom_basis/
+    ├── C.json
+    ├── O.json
+    ├── H.json
+    └── N.json
+	```
+3. 在输入文件中引用  
+    ```bash
+	# 方式1：使用相对路径（从当前目录查找）
+    basis_path = ./my_custom_basis
+    
+    # 方式2：使用文件夹名（按搜索优先级查找）
+    basis_path = my_custom_basis
+    
+    # 方式3：使用绝对路径（直接定位）
+    basis_path = /home/user/my_custom_basis
+	```
+### 配置示例
+```plaintext
+# 示例1：使用标准基组和缺省辅助基组（简写格式）
+eri_type = ri-v
+basis_type = Spheric
+basis_path = cc-pvtz                    # 程序自动搜索 cc-pvtz 文件夹
 
-若以上搜索都不成功则尝试使用 bse 下载。
+# 示例2：使用标准基组，同时申明辅助基组（简写格式）
+eri_type = ri-v
+basis_type = Spheric
+basis_path = cc-pvtz                    # 程序自动搜索 cc-pvtz 文件夹
+auxbas_path = def2-universal-jkfit      # 程序自动搜索同名辅助基组文件夹
 
-`basis_path` 申明的路径本身已经存在时，其优先级高于以上所有的搜索路径。可以是完整路径，也可以是相对路径，例如`./my_basis`、`my_basis`。
-REST程序对于基组的使用是高度自由和自定义的，可以根据具体的计算任务，从基组网站上下载、修改或者混合使用不同的基组。你所需要做的是：
-    1. 在`{basis_set_pool}`基组文件夹下创建一个新的基组文件夹。比如你想使用混合基组，并取名这个混合基组名称为mix_bs_01。则需要创建一个基组文件夹为：`mkdir {basis_set_pool}/mix_bs_01`
-    2. 然后将这些基组以”元素名称.json”放置在`{basis_set_pool}/mix_bs_01`的文件夹内
-    3. 在输入卡内申明`basis_path = {basis_set_pool}/mix_bs_01`（自定义辅助基组则申明`auxbas_path`）
+# 示例3：使用自定义基组（相对路径）
+eri_type = ri-v
+basis_type = Cartesian
+basis_path = ./my_project_basis         # 使用当前目录下的自定义基组
+auxbas_path = ./my_aux_basis            # 使用自定义辅助基组
+
+# 示例4：使用完整路径
+eri_type = ri-v
+basis_type = Spheric
+basis_path = /shared/basis/def2-TZVP    # 明确指定完整路径
+auxbas_path = def2-universal-jkfit      # 简写格式，自动搜索
+```
 
 ## 自洽场计算相关关键词（Keyword）
 - `initial_guess`: 取值String。分子体系进行自洽场运算所用的初始猜测方法。目前REST支持:
@@ -184,7 +246,7 @@ REST程序对于基组的使用是高度自由和自定义的，可以根据具�
 	    - `fronzen_core_postscf=1`（即`n=1`），表示第三周期元素仅考虑`3s3p`价层电子的贡献，而不考虑`1s2s2p`轨道的电子激发
 		- 若`n`等于或大于主族元素占据轨道的电子层数，代表对于这个元素不采用冻心近似，等价于`n=0`.
 	    - `fronzen_core_postscf=2`（即`n=2`），表示第二周期元素同时考虑`2s2p`最高价层和`1s`次高价层（即最低核层）的贡献，等价于`n=0`不开冻心近似。
-	    - **对于传统密度泛函方法，本参数设置不起作用**
+	    - **注意**：对于传统密度泛函方法，本参数设置不起作用
 - `frequency_points`：取值i32。对于RPA型的相关能计算方法，比如RPA、SCSRPA和R-xDH7等，需要对频率空间进行数值积分。这里设置频率积分的格点数目。缺省为20
 - `freq_grid_type`：取值i32。对于RPA型相关能计算方法做格点化准备:
      - `0`: 代表使用modified Gauss-Legendre格点。缺省为0
@@ -205,6 +267,10 @@ REST程序对于基组的使用是高度自由和自定义的，可以根据具�
 - `bse_tda`: 取值bool，设置为true则使用TDA近似，即BSE kernel只保留左上部分的子矩阵。缺省为false
 ## RRS-PBC计算相关设置
 - `pbc_eigenval`: 取值String，用于指定存储k点和能级信息的文件路径。如果设置为"none"或"None"则直接打印到标准输出。缺省为"none"。相关文章见Zhang, I.Y., Jiang, J., Gao, B. *et al.* RRS-PBC: a molecular approach for periodic systems. *Sci. China Chem.* **57**, 1399–1404 (2014). https://doi.org/10.1007/s11426-014-5183-y
+## 溶剂化计算相关设置
+- `solvent_model`: 取值String, 用于指定用于计算的溶剂模型。目前支持CPCM, COSMO, IEFPCM, SS(V)PE。缺省为CPCM。
+- `solvent_enabled`: 取值bool，设置为true则启用溶剂化计算。如果没有`solvent_enabled`字段但有`solvent_model`的设置且内容非空的时候，同样启用溶剂化计算。其他情况缺省为false。
+- `solv_epsilon`: 取值f64, 为溶质的介电常数。缺省为1.0 (真空)。介电常数表可以参考 http://sobereva.com/g09/k_scrf.htm 的最后。
 # Detailed descrption of [geometric_pyo3] block in the control file
 - `maxiter`：取值i32。结构优化的最大步数上限。缺省值：300
 - `converge_energy`：取值f64。构型优化中上下两步能量变化的收敛阈值。缺省值：1.0e-6
@@ -232,7 +298,7 @@ REST程序对于基组的使用是高度自由和自定义的，可以根据具�
          xc =                        "x3lyp"
          empirical_dispersion =      "d3bj"
          basis_path =                "cc-pVDZ"
-         auxbas_path =               "def2-SV(P)-JKFIT"
+         auxbas_path =               "def2-universal-jkfit"
          charge =                    0.0
          spin =                      1.0
          spin_polarization =         false

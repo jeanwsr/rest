@@ -9,7 +9,6 @@ use std::cmp;
 use std::fs::OpenOptions;
 use std::io::Write;
 use rayon::iter::ParallelBridge;
-use libc::seccomp_notif;
 use rayon::result;
 use reqwest::blocking::Response;
 use std::time::Instant;
@@ -40,6 +39,9 @@ pub mod fourier_self_energy;
 pub mod drpa;
 pub mod qsgw;
 use crate::mpi_io::MPIOperator;
+
+#[cfg(target_os = "linux")]
+use libc::seccomp_notif;
 
 pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperator>){
     let printlevel=scf_data.mol.ctrl.print_level.clone();

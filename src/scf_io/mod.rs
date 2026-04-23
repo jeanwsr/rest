@@ -3,7 +3,7 @@ use crate::check_norm::force_state_occupation::adapt_occupation_with_force_proje
 use crate::check_norm::{self, generate_occupation_frac_occ, generate_occupation_integer, generate_occupation_sad, OCCType};
 use crate::dft::gen_grids::prune::prune_by_rho;
 use crate::dft::{numerical_density, DFTType, Grids};
-use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges};
+use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges, get_charge};
 use crate::mpi_io::{mpi_broadcast, mpi_broadcast_matrixfull, mpi_broadcast_vector, mpi_reduce, MPIOperator};
 use crate::utilities::{create_pool, TimeRecords};
 use crate::utilities::memory_batch::*;
@@ -13,7 +13,6 @@ use crate::ctrl_io::flags::*;
 mod addons;
 mod fchk;
 mod pyrest_scf_io;
-mod ri_on_the_fly;
 
 use mpi::collective::SystemOperation;
 use pyo3::{pyclass, pymethods, pyfunction};
@@ -34,6 +33,8 @@ use crate::{utilities, initial_guess};
 use crate::initial_guess::initial_guess;
 use crate::external_libs::dftd;
 use crate::constants::{INVERSE_THRESHOLD, SPECIES_INFO, SQRT_THRESHOLD};
+use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
+use crate::ri_jk;
 
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
 
@@ -91,6 +92,8 @@ pub struct SCF {
     pub renormalized_singles_particles:Vec<f64>,
     pub gwqp:(Vec<f64>,Vec<f64>),
     pub algorithm_jk: AlgorithmJK,
+    pub solvent_static_obj: Option<PcmObject>,
+    pub solvent_scf: Option<PcmScf>,
 }
 
 #[derive(Clone,Copy)]
@@ -144,6 +147,8 @@ impl SCF {
             renormalized_singles_particles:Vec::new(),
             gwqp:(Vec::new(),Vec::new()),
             algorithm_jk: AlgorithmJK::Default,
+            solvent_static_obj: None,
+            solvent_scf: None,
         };
 
         // at first check the scf type: RHF, ROHF or UHF
@@ -443,6 +448,8 @@ impl SCF {
             }
         };
 
+
+
     }
 
     pub fn prepare_bse_integrals(&mut self, mpi_operator: &Option<MPIOperator>) {
@@ -563,7 +570,12 @@ impl SCF {
 
     }
 
+    pub fn prepare_solvent_calculation(&mut self) {
+        if self.mol.use_solvent {
+            self.solvent_static_obj = Some(solvent_prepare(&self.mol));
 
+        }
+    }
 
     pub fn build(mol: Molecule, mpi_operator: &Option<MPIOperator>) -> SCF {
 
@@ -592,8 +604,14 @@ impl SCF {
                 let i_homo = self.homo[i_spin];
                 let i_lumo = self.lumo[i_spin];
                 let homo = self.eigenvalues[i_spin][i_homo];
-                let lumo = self.eigenvalues[i_spin][i_lumo];
-                println!("HOMO: {:16.8}, LUMO: {:14.6}, H-L Gap: {:16.8}", homo, lumo, lumo-homo);
+                if i_lumo < self.eigenvalues[i_spin].len()  {
+                    let lumo = self.eigenvalues[i_spin][i_lumo];
+                    println!("HOMO: {:16.8}, LUMO: {:14.6}, H-L Gap: {:16.8}", homo, lumo, lumo-homo);
+                } else {
+                    println!("{:?}", &self.eigenvalues[i_spin]);
+                    println!("HOMO: {:16.8} (No virtual orbtials available)", homo);
+                }
+
             } else {
                 for i_spin in (0..self.mol.spin_channel) {
                          // 只打印有电子的自旋通道
@@ -2058,6 +2076,7 @@ impl SCF {
                 let dm_upper = dm_s.to_matrixupper();
                 vxc_total += SCF::par_energy_contraction(&dm_upper, &vxc[i_spin]);
             }
+
         };
 
         let dt4 = time::Local::now();
@@ -2071,6 +2090,36 @@ impl SCF {
             }
         }
         
+        let dt_solv0 = time::Local::now();
+        //let mut esolv_total = 0.0;
+        if self.mol.use_solvent{
+            if self.solvent_scf.is_some() {
+                if let Some(solvent_scf) = self.solvent_scf.as_ref() {
+                    for i_spin in 0..spin_channel {
+                        self.hamiltonian[i_spin].data
+                            .par_iter_mut()
+                            .zip(solvent_scf.veff.data.par_iter())
+                            .for_each(|(h_ij, veff_ij)| {
+                                *h_ij += veff_ij;
+                            });
+
+                        let dm_s = &self.density_matrix[i_spin];
+                        let dm_upper = dm_s.to_matrixupper();
+                        //esolv_total -=  SCF::par_energy_contraction(&dm_upper, &solvent_scf.veff)
+                    }
+                    
+                }
+            }
+        }
+        //exc_total += esolv_total;
+        
+        let dt_solv1 = time::Local::now();
+        let timecost_solv = (dt_solv1.timestamp_millis()-dt_solv0.timestamp_millis()) as f64 /1000.0;
+        if self.mol.use_solvent && self.mol.ctrl.print_level > 2 {
+            println!("The evaluation of Solvent potential costs {:10.2} seconds.", timecost_solv);
+        }
+
+
         let timecost1 = (dt2.timestamp_millis()-dt1.timestamp_millis()) as f64 /1000.0;
         let timecost2 = (dt3.timestamp_millis()-dt2.timestamp_millis()) as f64 /1000.0;
         let timecost3 = (dt4.timestamp_millis()-dt3.timestamp_millis()) as f64 /1000.0;
@@ -2082,6 +2131,92 @@ impl SCF {
 
     }
 
+    pub fn compute_ghost_charge_forces(&self) -> Option<MatrixFull<f64>> {
+        let geom = &self.mol.geom;
+        if geom.ghost_pc_chrg.is_empty() {
+            return None;
+        }
+
+        let num_ghosts = geom.ghost_pc_chrg.len();
+        let ghost_pc_chrg = &geom.ghost_pc_chrg;
+        let ghost_pc_pos = &geom.ghost_pc_pos;
+        let mut matr_force = MatrixFull::new([3, num_ghosts], 0.0);
+        let nao = self.mol.num_basis;
+
+        let is_sp = self.mol.ctrl.spin_polarization;
+        let dm = &self.density_matrix;
+        let use_double_dm = is_sp && dm.len() > 1 && dm[1].size == [nao, nao];
+
+        let nuclear_charges = crate::geom_io::get_charge(&geom.elem);
+        let qm_position = &geom.position;
+        let mut temp_mol = self.mol.clone();
+
+        for i in 0..num_ghosts {
+            let q_i = ghost_pc_chrg[i];
+            let pos_i = [
+                ghost_pc_pos[[0, i]],
+                ghost_pc_pos[[1, i]],
+                ghost_pc_pos[[2, i]],
+            ];
+
+            let mut deriv_hcore = vec![0.0; 3 * nao * nao];
+
+            temp_mol.with_rinv_origin(pos_i, |mol_mut| {
+                let cint = mol_mut.initialize_cint(false);
+                let iprinv_out = cint.integrate("int1e_iprinv", "s1", None);
+                
+                if let Some(out_vec) = iprinv_out.out {
+                    for t in 0..3 {
+                        for nu in 0..nao {
+                            for mu in 0..nao {
+                                let idx = mu + nu * nao + t * (nao * nao);
+                                if let Some(&val) = out_vec.get(idx) {
+                                    deriv_hcore[t * nao * nao + mu * nao + nu] += q_i * val;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            let mut electron_force = [0.0; 3];
+            for t in 0..3 {
+                let mut sum_val = 0.0;
+                for mu in 0..nao {
+                    for nu in 0..nao {
+                        let h_val = deriv_hcore[t * nao * nao + mu * nao + nu];
+                        let dm_val = if !use_double_dm { 
+                            dm[0][[mu, nu]] 
+                        } else { 
+                            dm[0][[mu, nu]] + dm[1][[mu, nu]] 
+                        };
+                        sum_val += h_val * dm_val;
+                    }
+                }
+                electron_force[t] = 2.0 * sum_val;
+            }
+
+            let mut nuclear_force = [0.0; 3];
+            for a in 0..nuclear_charges.len() {
+                let pos_a = [qm_position[[0, a]], qm_position[[1, a]], qm_position[[2, a]]];
+                let r_vec = [pos_i[0] - pos_a[0], pos_i[1] - pos_a[1], pos_i[2] - pos_a[2]];
+                let r_sq = r_vec.iter().map(|&x| x * x).sum::<f64>();
+                
+                if r_sq > 1e-12 {
+                    let prefactor = (nuclear_charges[a] * q_i) / (r_sq * r_sq.sqrt());
+                    for t in 0..3 {
+                        nuclear_force[t] += prefactor * r_vec[t];
+                    }
+                }
+            }
+
+            for t in 0..3 {
+                matr_force[[t, i]] = electron_force[t] + nuclear_force[t];
+            }
+        }
+
+        Some(matr_force)
+    }
 //    pub fn generate_ks_hamiltonian_ri_v_dm_only(&mut self, mpi_operator: &Option<MPIOperator>) -> (f64,f64) {
 //        let num_basis = self.mol.num_basis;
 //        let num_state = self.mol.num_state;
@@ -2270,7 +2405,11 @@ impl SCF {
         //let exc_hf = self.evaluate_exact_exchange_ri_v(mpi_operator);
         //println!("Exc[HF] = {:16.8}", exc_hf);
         //println!("==== IGOR debug for Exc[HF]====");
-
+        if self.mol.use_solvent {
+            if let Some(solvent_scf) = self.solvent_scf.as_ref() {
+                self.scf_energy += solvent_scf.eng_nuc;
+            }
+        }
         if self.mol.ctrl.print_level>1 {
             println!("Exc: {:16.8}, Vxc: {:16.8}", exc_total, vxc_total)
         };
@@ -3245,7 +3384,7 @@ impl SCF {
         let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
             max_memory - detect_used_memory_mb("proc")
         });
-        let mem_est = ri_on_the_fly::mem_estimate_vj_ri_direct(nao, naux, nset);
+        let mem_est = ri_jk::mem_estimate_vj_ri_direct(nao, naux, nset);
         let mut batch_size_estimate = calc_batch_size_from_mem_estimate::<f64>(&mem_est, mem_avail, None, true);
 
         // if estimated batch size is smaller than minimum, warn and set to minimum
@@ -3278,7 +3417,7 @@ impl SCF {
         // compute vj only for specified spin channels
         let dms = &self.density_matrix[0..self.mol.spin_channel];
         let mol_obj = &self.mol;
-        let mut vjs = crate::scf_io::ri_on_the_fly::generate_vj_ri_direct(dms, mol_obj, batch_size);
+        let mut vjs = ri_jk::generate_vj_ri_direct(dms, mol_obj, batch_size);
 
         // complete `vjs` if the spin channel is 1 (restricted, spin-unpolarized)
         if self.mol.spin_channel == 1 {
@@ -3303,8 +3442,8 @@ impl SCF {
         let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
             max_memory - detect_used_memory_mb("proc")
         });
-        let mem_est_direct = ri_on_the_fly::mem_estimate_vk_ri_direct_dm(nao, naux, nset);
-        let mem_est_semi = ri_on_the_fly::mem_estimate_vk_ri_semi_direct_coeff(nao, naux, nocc_max, nset);
+        let mem_est_direct = ri_jk::mem_estimate_vk_ri_direct_dm(nao, naux, nset);
+        let mem_est_semi = ri_jk::mem_estimate_vk_ri_semi_direct_coeff(nao, naux, nocc_max, nset);
         let batch_size_estimate_direct = calc_batch_size_from_mem_estimate::<f64>(&mem_est_direct, mem_avail, None, true);
         let batch_size_estimate_semi = calc_batch_size_from_mem_estimate::<f64>(&mem_est_semi, mem_avail, None, true);
 
@@ -3354,11 +3493,11 @@ impl SCF {
             let mo_coeff = &self.eigenvectors[0..self.mol.spin_channel];
             let mo_occ = &self.occupation[0..self.mol.spin_channel];
             let mol_obj = &self.mol;
-            crate::scf_io::ri_on_the_fly::generate_vk_ri_semi_direct_coeff(scaling_factor, mo_coeff, mo_occ, mol_obj, batch_size)
+            ri_jk::generate_vk_ri_semi_direct_coeff(scaling_factor, mo_coeff, mo_occ, mol_obj, batch_size)
         } else {
             let dms = &self.density_matrix[0..self.mol.spin_channel];
             let mol_obj = &self.mol;
-            crate::scf_io::ri_on_the_fly::generate_vk_ri_direct_dm(scaling_factor, dms, mol_obj, batch_size)
+            ri_jk::generate_vk_ri_direct_dm(scaling_factor, dms, mol_obj, batch_size)
         };
 
         // complete `vks` if the spin channel is 1 (restricted, spin-unpolarized)
@@ -3401,6 +3540,43 @@ pub fn apply_projection_operator(a: &MatrixFull<f64>, b: &MatrixFull<f64>, c: &M
     _dgemm_full(&temp, 'N', c, 'N', &mut final_result, 1.0, 0.0);
     
     final_result
+}
+
+pub fn apply_guess_mix(scf_data: &mut SCF) {
+    for (i_spin, &theta_deg) in scf_data.mol.ctrl.guess_mix_theta_deg.iter().enumerate() {
+        if theta_deg < 0.0 || theta_deg > 45.0 {
+            println!(
+                "WARNING: theta for spin {} = {:.1}° is outside the recommended range (0°–45°); mixing may be ineffective or unstable.",
+                i_spin, theta_deg
+            );
+        }
+
+        let (cos_theta, sin_theta) = {
+            let rad = theta_deg.to_radians();
+            (rad.cos(), rad.sin())
+        };
+
+        let homo = scf_data.homo[i_spin];
+        let lumo = scf_data.lumo[i_spin];
+        let eigenvector_mut = scf_data.eigenvectors.get_mut(i_spin).unwrap();
+        let homo_vec: Vec<f64> = eigenvector_mut.iter_column(homo).cloned().collect();
+        let lumo_vec: Vec<f64> = eigenvector_mut.iter_column(lumo).cloned().collect();
+
+        let (mixed_homo_vec, mixed_lumo_vec) = if i_spin == 0 {(
+            homo_vec.iter().zip(&lumo_vec).map(|(h, l)| cos_theta * h + sin_theta * l).collect::<Vec<f64>>(),
+            homo_vec.iter().zip(&lumo_vec).map(|(h, l)| -sin_theta * h + cos_theta * l).collect::<Vec<f64>>(),
+        )} else {(
+            homo_vec.iter().zip(&lumo_vec).map(|(h, l)| cos_theta * h - sin_theta * l).collect::<Vec<f64>>(),
+            homo_vec.iter().zip(&lumo_vec).map(|(h, l)| sin_theta * h + cos_theta * l).collect::<Vec<f64>>(),
+        )};
+
+        for (val, slot) in mixed_homo_vec.iter().zip(eigenvector_mut.iter_column_mut(homo)) {
+            *slot = *val;
+        }
+        for (val, slot) in mixed_lumo_vec.iter().zip(eigenvector_mut.iter_column_mut(lumo)) {
+            *slot = *val;
+        }
+    }
 }
 
 
@@ -5111,6 +5287,10 @@ pub fn initialize_scf(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
     scf_data.prepare_density_grids();
     time_mark.count("DFT Grids");
 
+    time_mark.new_item("Solvent Calculation", "Initialization of the solvent calculation");
+    time_mark.count_start("Solvent Calculation");
+    scf_data.prepare_solvent_calculation();
+
     time_mark.new_item("ISDF", "ISDF initialization");
     time_mark.count_start("ISDF");
     scf_data.prepare_isdf(mpi_operator);
@@ -5159,45 +5339,13 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     scf_data.diagonalize_hamiltonian(mpi_operator);
     scf_data.generate_occupation();
 
-    // guess_mix
-    if scf_data.mol.ctrl.guess_mix {
-        for (i_spin, &theta_deg) in scf_data.mol.ctrl.guess_mix_theta_deg.iter().enumerate() {
-            if theta_deg <= 0.0 || theta_deg > 45.0 {
-                println!(
-                    "WARNING: theta for spin {} = {:.1}° is outside the recommended range (0°–45°); mixing may be ineffective or unstable.",
-                    i_spin, theta_deg
-                );
-            }
-    
-            let (cos_theta, sin_theta) = {
-                let rad = theta_deg.to_radians();
-                (rad.cos(), rad.sin())
-            };
-    
-            let homo = scf_data.homo[i_spin];
-            let lumo = scf_data.lumo[i_spin];
-            let eigenvector_mut = scf_data.eigenvectors.get_mut(i_spin).unwrap();
-            let homo_vec: Vec<f64> = eigenvector_mut.iter_column(homo).cloned().collect();
-            let lumo_vec: Vec<f64> = eigenvector_mut.iter_column(lumo).cloned().collect();
-    
-            let (mixed_homo_vec, mixed_lumo_vec) = if i_spin == 0 {(
-                homo_vec.iter().zip(&lumo_vec).map(|(h, l)| cos_theta * h + sin_theta * l).collect::<Vec<f64>>(),
-                homo_vec.iter().zip(&lumo_vec).map(|(h, l)| -sin_theta * h + cos_theta * l).collect::<Vec<f64>>(),
-            )} else {(
-                homo_vec.iter().zip(&lumo_vec).map(|(h, l)| cos_theta * h - sin_theta * l).collect::<Vec<f64>>(),
-                homo_vec.iter().zip(&lumo_vec).map(|(h, l)| sin_theta * h + cos_theta * l).collect::<Vec<f64>>(),
-            )};
-    
-            for (val, slot) in mixed_homo_vec.iter().zip(eigenvector_mut.iter_column_mut(homo)) {
-                *slot = *val;
-            }
-            for (val, slot) in mixed_lumo_vec.iter().zip(eigenvector_mut.iter_column_mut(lumo)) {
-                *slot = *val;
-            }
-        }
-    }
-    
-    
+    // --- Apply guess_mix during the initial-guess stage ---
+    // start_mix_cycle == 0 means: perform HOMO–LUMO mixing immediately
+    // after the initial diagonalization (i.e. before the first SCF iteration).
+    if scf_data.mol.ctrl.guess_mix && scf_data.mol.ctrl.start_mix_cycle == 0_usize {
+        println!(">>> guess_mix activated: applying HOMO–LUMO mixing immediately after initial guess (start_mix_cycle = 0).");
+        apply_guess_mix(scf_data);
+    }    
 
     scf_data.generate_density_matrix();
     scf_records.update(&scf_data);
@@ -5215,6 +5363,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     //println!("======= IGOR debug for xc components ========");
 
     let mut scf_converge = [false;2];
+    let mut guess_mix_applied = (scf_data.mol.ctrl.start_mix_cycle == 0_usize); 
     while ! (scf_converge[0] || scf_converge[1]) {
         let dt1 = time::Local::now();
 
@@ -5225,7 +5374,34 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         scf_data.diagonalize_hamiltonian(mpi_operator);
         let dt1_2 = time::Local::now();
         scf_data.generate_occupation();
+
+        // --- Apply guess_mix during SCF iterations ---
+        // When start_mix_cycle > 0, perform HOMO–LUMO mixing exactly at the
+        // specified SCF cycle number (num_iter == start_mix_cycle).
+        if scf_data.mol.ctrl.guess_mix && !guess_mix_applied && (scf_records.num_iter as usize) == scf_data.mol.ctrl.start_mix_cycle {
+            println!(">>> guess_mix activated at SCF iteration {}.", scf_records.num_iter);
+            apply_guess_mix(scf_data);
+            guess_mix_applied = true;
+        }
+
         scf_data.generate_density_matrix();
+
+        if scf_data.mol.use_solvent {
+            if let Some(solvent_static) = scf_data.solvent_static_obj.as_ref() {
+                let s_static = PcmScf::get_pcm_refresh(
+                    &solvent_static.surface, 
+                    &scf_data.mol, 
+                    &scf_data.density_matrix, 
+                    solvent_static.pstatic.K.clone(),
+                    solvent_static.pstatic.R.clone(),
+                    solvent_static.pstatic.v_grids_n.clone(),
+                    &scf_data.mol.spin_channel
+                );
+                scf_data.energies.insert(String::from("solvent_energy"), vec![s_static.eng]);
+                scf_data.solvent_scf = Some(s_static);
+            }
+        }
+        
 
         if scf_data.mol.ctrl.print_level>1 {
             scf_data.print_homo_lumo_gap()
@@ -5233,6 +5409,30 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         let dt1_3 = time::Local::now();
         scf_converge = scf_data.check_scf_convergence(&scf_records);
         let dt1_4 = time::Local::now();
+        
+        // -------------------------
+        // If SCF converged earlier than requested mix point,
+        // but user requested guess_mix and it hasn't been applied yet,
+        // apply mixing now and continue SCF (do NOT exit loop).
+        // -------------------------
+        if (scf_converge[0] || scf_converge[1]) && scf_data.mol.ctrl.guess_mix && !guess_mix_applied {
+            println!(">>> guess_mix requested at start_mix_cycle = {}, but SCF converged after {} iterations. \
+            Applying HOMO-LUMO mixing now and continuing SCF.", scf_data.mol.ctrl.start_mix_cycle, scf_records.num_iter - 1);
+
+            // apply mixing and mark as applied
+            apply_guess_mix(scf_data);
+            guess_mix_applied = true;
+
+            // rebuild dependent quantities so subsequent SCF iterations are consistent
+            scf_data.generate_density_matrix();
+            scf_data.generate_hf_hamiltonian(mpi_operator);
+            scf_data.diagonalize_hamiltonian(mpi_operator);
+            scf_data.generate_occupation();
+
+            // IMPORTANT: clear convergence so the while-loop continues
+            scf_converge = [false, false];
+        }
+
         scf_records.update(&scf_data);
         let dt1_5 = time::Local::now();
 
@@ -5295,6 +5495,22 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         }
     }
 
+    //solvent debug
+    if scf_data.mol.use_solvent{
+
+        //println!("solvent_static_obj: {:?}", scf_data.solvent_static_obj.is_some());
+        //println!("solvent_scf: {:?}", scf_data.solvent_scf.is_some());
+
+        if scf_data.solvent_static_obj.is_none() {
+            println!("ERROR: solvent_static_obj is None");
+        }
+        if scf_data.solvent_scf.is_none() {
+            println!("ERROR: solvent_scf is None");
+        }
+
+        //debug_print_pcm(&scf_data.solvent_static_obj.as_ref().unwrap().pstatic, &scf_data.solvent_scf.as_ref().unwrap());
+    }
+    
     if scf_data.mol.ctrl.print_level>1 {
         scf_data.print_homo_lumo_gap();
         scf_data.formated_eigenvalues((scf_data.homo.iter().max().unwrap()+4).min(scf_data.mol.num_state));
@@ -5636,7 +5852,36 @@ pub fn evaluate_spin_angular_momentum(dm: &Vec<MatrixFull<f64>>, ovlp: &MatrixUp
 
 }
 
+pub fn print_force_for_ghost_point_charges(scf_data: &SCF) {
+    if let Some(ghost_forces) = scf_data.compute_ghost_charge_forces() {
+        if scf_data.mol.ctrl.print_level > 0 {
+            println!("Calculating forces on ghost point charges");
+        }
+    
+        
+        println!("------ Forces on point charges [a.u.] ------");
+        let geom = &scf_data.mol.geom;
 
+        ghost_forces.iter_columns_full().enumerate()
+            .zip(geom.ghost_pc_pos.iter_columns_full())
+            .zip(geom.ghost_pc_chrg.iter())
+            .for_each(|(((i,force),position),charge)| {
+            let elem_str = format!("Q{:04}", i+1);  
+            let force_str = format!("{:15.8}{:15.8}{:15.8}", 
+                                force[0], force[1], force[2]);
+            println!("    {:<8} {}", elem_str, force_str);
+            if scf_data.mol.ctrl.print_level > 1 {
+                println!("      Charge: {:.6}, Position: [{:.6}, {:.6}, {:.6}]", 
+                        charge, position[0], position[1], position[2]);
+            }
+        });
+        println!("--------------------------------------------");
+    } else {
+        if scf_data.mol.ctrl.print_level > 0 {
+            println!("No ghost point charges found");
+        }
+    }
+}
 
 #[test]
 fn test_max() {

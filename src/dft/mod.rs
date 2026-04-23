@@ -5,27 +5,30 @@ pub mod libxc_itrf;
 pub mod xc_deriv;
 pub mod num_int;
 
+use libm::powf;
 use mpi::collective::SystemOperation;
 use mpi::ffi::MPI_T_SCOPE_GROUP_EQ;
 use rest_tensors::{MatrixFull, MatrixFullSliceMut, TensorSliceMut, RIFull, MatrixFullSlice};
 use rest_tensors::matrix_blas_lapack::{_dgemm_nn,_dgemm_tn, _einsum_01_serial, _einsum_02_serial, _einsum_01_rayon, _einsum_02_rayon};
 use itertools::{Itertools, izip};
 use libc::access;
-use tensors::{BasicMatrix, MathMatrix, ParMathMatrix};
+use tensors::{BasicMatrix, BasicMatrixOpt, MathMatrix, ParMathMatrix};
 use tensors::external_libs::{general_dgemm_f, matr_copy};
 use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, contract_vxc_0_serial};
 //use numgrid::{self, radial_grid_lmg_bse};
 use self::gen_grids::radial_grid_lmg_bse;
 use rayon::iter::{IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator, IntoParallelRefMutIterator};
 use regex::Regex;
-use crate::basis_io::{Basis4Elem, cartesian_gto_cint, cartesian_gto_std, gto_value, BasCell, gto_value_debug, cint_norm_factor, gto_1st_value, spheric_gto_value_matrixfull, spheric_gto_1st_value_batch, spheric_gto_value_matrixfull_serial, spheric_gto_1st_value_batch_serial, spheric_gto_value_serial, spheric_gto_1st_value_serial};
+use crate::basis_io::{BasCell, Basis4Elem, cartesian_gto_cint, cartesian_gto_std, cint_norm_factor, gto_1st_value, gto_1st_value_batch_serial, gto_1st_value_serial, gto_value, gto_value_debug, gto_value_matrixfull_serial, gto_value_serial, spheric_gto_1st_value_batch, spheric_gto_1st_value_batch_serial, spheric_gto_1st_value_serial, spheric_gto_value_matrixfull, spheric_gto_value_matrixfull_serial, spheric_gto_value_serial};
 use crate::molecule_io::Molecule;
 use crate::geom_io::get_mass_charge;
 use crate::mpi_io::{mpi_broadcast, mpi_broadcast_vector, mpi_reduce, MPIData, MPIOperator};
+use crate::post_scf_analysis::spin_correction;
 use crate::scf_io::SCF;
 use crate::utilities::{self, balancing};
 use core::num;
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::Read;
 use std::iter::Zip;
 use std::ops::Range;
@@ -287,7 +290,7 @@ impl DFA4REST {
             [0,263,267]
         } else if lower_name.eq(&"revscan".to_string()) {
             [0,581,582]
-        } else if lower_name.eq(&"mn06-l".to_string()) {
+        } else if lower_name.eq(&"m06-l".to_string()) {
             [0,203,233]
         } else if lower_name.eq(&"mn15-l".to_string()) {
             [0,260,261]
@@ -329,8 +332,7 @@ impl DFA4REST {
                     }
                 }
             }
-            println!("Unknown XC method is specified: {}. The standard Hartree-Fock approximation is involked", &name);
-            [0,0,0]
+            panic!("Unknown XC method is specified: {}.", &name);
         }
     }
 
@@ -513,6 +515,37 @@ impl DFA4REST {
                 .flatten().collect();
             let dfa_paramr_scf = vec![1.0;dfa_compnt_scf.len()];
             let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf,spin_channel);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos
+            })
+        } else if tmp_name.eq("xyg2") {
+            // XYG2 functional
+            // Yan, W., PhD thesis, Fudan University, Shanghai, China (2022).
+            // Precision Chemistry (2026); https://doi.org/10.1021/prechem.5c00432
+            let dfa_family_pos = Some(DFAFamily::PT2);
+            let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(pos_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten()
+                .collect());
+            let dfa_paramr_pos = Some(vec![0.00,0.1984,0.00,0.6613]);
+            let dfa_hybrid_pos = Some(0.8016);
+            let dfa_paramr_adv = Some(vec![0.3387,0.3387]);
+
+            let scf_dfa = ["b3lyp"];
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![1.0;dfa_compnt_scf.len()];
+            let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf, spin_channel);
             Some(DFA4REST{
                 spin_channel,
                 dfa_compnt_scf,
@@ -938,15 +971,15 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
             })
-        } else if tmp_name.eq("dsdpbep95") {
-            // DSD-PBEP95-D3BJ
+        } else if tmp_name.eq("dsdpbeb95") {
+            // DSD-PBEB95-D3BJ
             // J. Comput. Chem. 2013, 34, 2327-2344.
-            let dfa_family_scf = DFAFamily::HybridGGA;
-            let scf_dfa = ["gga_x_pbe", "gga_c_p95"];
+            let dfa_family_scf = DFAFamily::HybridMGGA;
+            let scf_dfa = ["gga_x_pbe", "mgga_c_bc95"];
             let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
                 DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
                 .flatten().collect();
-            let dfa_paramr_scf = vec![0.24, 0.55];
+            let dfa_paramr_scf = vec![0.34, 0.55];
             let dfa_hybrid_scf = 0.66;
             // PT2 part
             let dfa_family_pos = Some(DFAFamily::PT2);
@@ -964,6 +997,140 @@ impl DFA4REST {
                 dfa_compnt_pos,
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
+            })
+        } else if tmp_name.eq("r-xyg3") {
+            // Renormalized XYG3 functional (experimental)
+            // Replaces PT2 correlation with sBGE2 in the post-SCF part
+            // No publication yet - experimental test of sBGE2 in XYG3 framework
+            let dfa_family_pos = Some(DFAFamily::SBGE2);
+            let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(pos_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten()
+                .collect());
+            let dfa_paramr_pos = Some(vec![-0.0140,0.2107,0.00,0.6789]);
+            let dfa_hybrid_pos = Some(0.8033);
+            let dfa_paramr_adv = Some(vec![0.3211,0.3211]);
+
+            let scf_dfa = ["b3lyp"];
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![1.0;dfa_compnt_scf.len()];
+            let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf, spin_channel);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos
+            })
+        } else if tmp_name.eq("r-xygjos") {
+            // Renormalized XYGJOS functional (experimental)
+            // Replaces PT2 correlation with sBGE2 in the post-SCF part
+            // No publication yet - experimental test of sBGE2 in XYGJOS framework
+            let dfa_family_pos = Some(DFAFamily::SBGE2);
+            let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
+            //let dfa_compnt_pos: Option<Vec<XcFuncType>> = Some(pos_dfa.iter().map(|xc| {
+            //    DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+            //    .flatten().collect());
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(pos_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect());
+            let dfa_paramr_pos = Some(vec![0.2269,0.000,0.2309,0.2754]);
+            let dfa_hybrid_pos = Some(0.7731);
+            let dfa_paramr_adv = Some(vec![0.4364,0.0000]);
+
+            let dfa_family_scf = DFAFamily::HybridGGA;
+            let scf_dfa = ["b3lyp"];
+            //let dfa_compnt_scf: Vec<XcFuncType> = scf_dfa.iter().map(|xc| {
+            //    DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+            //    .flatten().collect();
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![1.0;dfa_compnt_scf.len()];
+            let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf,spin_channel);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos
+            })
+        } else if tmp_name.eq("r-xyg7") {
+            // Renormalized XYG7 functional (experimental)
+            // Replaces PT2 correlation with sBGE2 in the post-SCF part
+            // No publication yet - experimental test of sBGE2 in XYG7 framework
+            let dfa_family_pos = Some(DFAFamily::SBGE2);
+            let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
+            //let dfa_compnt_pos: Option<Vec<XcFuncType>> = Some(pos_dfa.iter().map(|xc| {
+            //    DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+            //    .flatten().collect());
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(pos_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect());
+            let dfa_paramr_pos = Some(vec![0.2055,-0.1408,0.4056,0.1159]);
+            let dfa_hybrid_pos = Some(0.8971);
+            let dfa_paramr_adv = Some(vec![0.4052,0.2589]);
+
+            let dfa_family_scf = DFAFamily::HybridGGA;
+            let scf_dfa = ["b3lyp"];
+            //let dfa_compnt_scf: Vec<XcFuncType> = scf_dfa.iter().map(|xc| {
+            //    DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+            //    .flatten().collect();
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![1.0;dfa_compnt_scf.len()];
+            let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf,spin_channel);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos
+            })
+        } else if tmp_name.eq("r-xyg2") {
+            // Renormalized XYG2 functional (experimental)
+            let dfa_family_pos = Some(DFAFamily::SBGE2);
+            let pos_dfa = ["lda_x_slater", "gga_x_b88","lda_c_vwn_rpa","gga_c_lyp"];
+            let dfa_compnt_pos: Option<Vec<usize>> = Some(pos_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten()
+                .collect());
+            let dfa_paramr_pos = Some(vec![0.00,0.1984,0.00,0.6613]);
+            let dfa_hybrid_pos = Some(0.8016);
+            let dfa_paramr_adv = Some(vec![0.3387,0.3387]);
+
+            let scf_dfa = ["b3lyp"];
+            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
+                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
+                .flatten().collect();
+            let dfa_paramr_scf = vec![1.0;dfa_compnt_scf.len()];
+            let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf, spin_channel);
+            Some(DFA4REST{
+                spin_channel,
+                dfa_compnt_scf,
+                dfa_paramr_scf,
+                dfa_hybrid_scf,
+                dfa_paramr_adv,
+                dfa_family_pos,
+                dfa_compnt_pos,
+                dfa_paramr_pos,
+                dfa_hybrid_pos
             })
         } else {
             None
@@ -1857,7 +2024,7 @@ impl DFA4REST {
                         loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
                         );
                         loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
-                    }                            
+                    }
                 }
             }
         }
@@ -1946,6 +2113,169 @@ impl DFA4REST {
 
         post_xc_energy
 
+    }
+
+    pub fn post_tabulated_exc(&self, 
+        grids: &crate::dft::Grids, 
+        dm: &Vec<MatrixFull<f64>>, 
+        mo: &[MatrixFull<f64>;2], 
+        occ: &[Vec<f64>;2]) 
+    {
+        use std::io::Write;
+        let dt0 = utilities::init_timing();
+        let spin_channel = self.spin_channel;
+        let num_grids = grids.coordinates.len();
+        let num_basis = dm[0].size[0];
+        let use_density_gradient = self.use_density_gradient();
+
+        //// 获取rayon的当前线程的ID
+        //let id = rayon::current_thread_index().unwrap_or_default();
+        //// 创建一个文件，包含当前线程的ID的信息
+        //let mut file = File::create(format!("debug_tabulated_exc_{}.txt", id)).unwrap();
+
+
+        let mut str_lines: Vec<String> = vec![String::new();num_grids+1];
+        //let mut str_lines_beta: Vec<String> = if spin_channel == 2 {
+        //    vec![String::new();num_grids]
+        //} else {
+        //    vec![]
+        //};
+
+        let mut post_xc_energy:Vec<[f64;2]>=vec![];
+
+        if spin_channel == 1 { 
+            str_lines[0].push_str(&format!("{:>20} " , "rho"));
+        } else {
+            str_lines[0].push_str(&format!("{:>20}" , "rho_alpha"));
+            str_lines[0].push_str(&format!("{:>20} ", "rho_beta"));
+        };
+
+        if use_density_gradient {
+            if spin_channel == 1 {
+                str_lines[0].push_str(&format!("{:>20}", "rhop_x"));
+                str_lines[0].push_str(&format!("{:>20}", "rhop_y"));
+                str_lines[0].push_str(&format!("{:>20}", "rhop_z"));
+                str_lines[0].push_str(&format!("{:>20}", "sigma"));
+            } else {
+                str_lines[0].push_str(&format!("{:>20}","rhop_alpha_x"));
+                str_lines[0].push_str(&format!("{:>20}","rhop_alpha_y"));
+                str_lines[0].push_str(&format!("{:>20}","rhop_alpha_z"));
+                str_lines[0].push_str(&format!("{:>20}","rhop_beta_x"));
+                str_lines[0].push_str(&format!("{:>20}","rhop_beta_y"));
+                str_lines[0].push_str(&format!("{:>20}","rhop_beta_z"));
+                str_lines[0].push_str(&format!("{:>20}","sigma_aa"));
+                str_lines[0].push_str(&format!("{:>20}","sigma_ab"));
+                str_lines[0].push_str(&format!("{:>20}","sigma_bb"));
+            }
+        }
+
+        self.dfa_compnt_scf.iter().enumerate().for_each(|(i_xc, xc)| { 
+            //if spin_channel == 1 {
+                str_lines[0].push_str(&format!("{:>20} ", &XcFuncType::code_to_name(*xc)));
+            //} else {
+            //    str_lines[0].push_str(&format!("{:>20}_alpha ", &XcFuncType::code_to_name(*xc)));
+            //    str_lines[0].push_str(&format!("{:>20}_beta ", &XcFuncType::code_to_name(*xc)));
+            //}
+        });
+
+        let (rho,rhop) = if ! mo[1].data.is_empty() || spin_channel == 1 { // RHF or UHF case
+            grids.prepare_tabulated_density_2(mo, occ, spin_channel)
+        } else { // ROHF case
+            let mut mo_temp = mo.clone();
+            mo_temp[1] = mo_temp[0].clone();
+            grids.prepare_tabulated_density_2(&mo_temp, occ, spin_channel)
+        };
+
+        str_lines[1..].par_iter_mut().zip(rho.par_iter_column(0)).for_each(|(line,rho)| {
+            line.push_str(&format!("{:20.10} ", rho));
+        });
+        if spin_channel == 2 {
+            str_lines[1..].par_iter_mut().zip(rho.par_iter_column(1)).for_each(|(line,rho)| {
+                line.push_str(&format!("{:20.10} ", rho));
+            });
+        }
+
+        let sigma = if use_density_gradient {
+            prepare_tabulated_sigma_rayon(&rhop, spin_channel)
+        } else {
+            MatrixFull::empty()
+        };
+        if use_density_gradient { 
+            str_lines[1..].par_iter_mut().zip(rhop.par_iter_slices_x(0, 0)).for_each(|(line,rhop_i)| {
+                line.push_str(&format!("{:20.10} ", rhop_i));
+            });
+            str_lines[1..].par_iter_mut().zip(rhop.par_iter_slices_x(1, 0)).for_each(|(line,rhop_i)| {
+                line.push_str(&format!("{:20.10} ", rhop_i));
+            });
+            str_lines[1..].par_iter_mut().zip(rhop.par_iter_slices_x(2, 0)).for_each(|(line,rhop_i)| {
+                line.push_str(&format!("{:20.10} ", rhop_i));
+            });
+            if spin_channel == 2 {
+                str_lines[1..].par_iter_mut().zip(rhop.par_iter_slices_x(0, 1)).for_each(|(line,rhop_i)| {
+                    line.push_str(&format!("{:20.10} ", rhop_i));
+                });
+                str_lines[1..].par_iter_mut().zip(rhop.par_iter_slices_x(1, 1)).for_each(|(line,rhop_i)| {
+                    line.push_str(&format!("{:20.10} ", rhop_i));
+                });
+                str_lines[1..].par_iter_mut().zip(rhop.par_iter_slices_x(2, 1)).for_each(|(line,rhop_i)| {
+                    line.push_str(&format!("{:20.10} ", rhop_i));
+                });
+            }
+            if spin_channel == 1 {
+                str_lines[1..].par_iter_mut().zip(sigma.par_iter_column(0)).for_each(|(line,sigma_i)| {
+                    line.push_str(&format!("{:20.10} ", sigma_i));
+                });
+            } else if spin_channel == 2 {
+                str_lines[1..].par_iter_mut().zip(sigma.par_iter_column(0)).for_each(|(line,sigma_i)| {
+                    line.push_str(&format!("{:20.10} ", sigma_i));
+                });
+                str_lines[1..].par_iter_mut().zip(sigma.par_iter_column(1)).for_each(|(line,sigma_i)| {
+                    line.push_str(&format!("{:20.10} ", sigma_i));
+                });
+                str_lines[1..].par_iter_mut().zip(sigma.par_iter_column(2)).for_each(|(line,sigma_i)| {
+                    line.push_str(&format!("{:20.10} ", sigma_i));
+                });
+            }
+        }
+        self.dfa_compnt_scf.iter().enumerate().for_each(|(i_xc, xc)| { 
+            //let mut exc = MatrixFull::new([num_grids,1],0.0);
+            let exc = self.xc_exc_code(xc, &rho, &sigma, spin_channel);
+            str_lines[1..].par_iter_mut().zip(exc.par_iter_column(0)).for_each(|(line,exc_i)| {
+                line.push_str(&format!("{:20.10} ", exc_i));
+            });
+            if spin_channel == 2 {
+                str_lines[1..].par_iter_mut().zip(exc.par_iter_column(1)).for_each(|(line,exc_i)| {
+                    line.push_str(&format!("{:20.10} ", exc_i));
+                });
+
+            }
+        });
+        //将str_lines：Vec<String>，按照每一个element是一行的方式写入文件
+        let mut file = File::create(format!("debug_tabulated_exc.txt")).unwrap();
+        for line in str_lines.iter() {
+            writeln!(file, "{}", line).expect("Unable to write file");
+        }
+        //file.close();
+
+        //post_xc.iter().for_each(|x| {
+        //    let mut exc = MatrixFull::new([num_grids,1],0.0);
+        //    let mut exc_total =[0.0,0.0];
+        //    let code = DFA4REST::xc_func_init_fdqc(x,spin_channel);
+        //    //println!("debug xc_code: {:?}", &code);
+        //    code.iter().for_each(|xc_code| {
+        //        exc.par_self_scaled_add(&self.xc_exc_code(xc_code, &rho, &sigma, spin_channel),1.0);
+        //    });
+
+        //    for i_spin in 0..spin_channel {
+        //        exc_total[i_spin] = izip!(exc.data.iter(),rho.iter_column(i_spin),grids.weights.iter())
+        //            .fold(0.0,|acc,(exc,rho,weight)| {
+        //                acc + exc * rho * weight
+        //            });
+        //    };
+        //    //println!("exc_total: {:?}", &exc_total);
+
+        //    post_xc_energy.push(exc_total);
+        //});
     }
 
     pub fn xc_exc_list(&self, xc_code_list: &Vec<usize>, grids: &crate::dft::Grids, dm: &Vec<MatrixFull<f64>>, mo: &[MatrixFull<f64>;2], occ: &[Vec<f64>;2]) 
@@ -2200,6 +2530,7 @@ pub fn contract_vxc_0(mat_a: &mut MatrixFull<f64>, mat_b: &MatrixFullSlice<f64>,
 /// Prepare `sigma[0] = rhop_u dot rhop_u => sigma_uu`
 ///         `sigma[1] = rhop_u dot rhop_d => sigma_ud`
 ///         `sigma[2] = rhop_d dot rhop_d => sigma_dd`
+/// IGOR MARK HERE for unefficient use of  powf
 fn prepare_tabulated_sigma(rhop: &RIFull<f64>, spin_channel: usize) -> MatrixFull<f64> {
     let grids_len = rhop.size[0];
     if spin_channel==1 {
@@ -2243,6 +2574,7 @@ fn prepare_tabulated_sigma(rhop: &RIFull<f64>, spin_channel: usize) -> MatrixFul
 ///         `sigma[0] = rhop_u dot rhop_u => sigma_uu`
 ///         `sigma[1] = rhop_u dot rhop_d => sigma_ud`
 ///         `sigma[2] = rhop_d dot rhop_d => sigma_dd`
+/// IGOR MARK HERE for unefficient use of  powf
 fn prepare_tabulated_sigma_rayon(rhop: &RIFull<f64>, spin_channel: usize) -> MatrixFull<f64> {
     let grids_len = rhop.size[0];
     if spin_channel==1 {
@@ -2547,13 +2879,14 @@ impl Grids {
                 //let mut tmp_geom = [0.0;3];
                 //tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
                 let tmp_geom:[f64;3] = geom.try_into().unwrap();
-                let tab_den = spheric_gto_value_serial(&self.coordinates[range_grids.clone()], &tmp_geom, elem);
+                let tab_den = gto_value_serial(&self.coordinates[range_grids.clone()], &tmp_geom, elem, &mol.ctrl.basis_type);
+                //println!("debug info: start: {}, end: {}, loc_num_grids: {}, loc_num_bas: {}", start, end, loc_num_grids, loc_num_bas);
 
                 loc_ao.copy_from_matr(start..end, 0..loc_num_grids, &tab_den, 0..loc_num_bas, 0..loc_num_grids);
 
                 if mol.xc_data.use_density_gradient() {
                     //println!("debug 01");
-                    let tab_dev = spheric_gto_1st_value_serial(&self.coordinates[range_grids.clone()], &tmp_geom, elem);
+                    let tab_dev = gto_1st_value_serial(&self.coordinates[range_grids.clone()], &tmp_geom, elem, &mol.ctrl.basis_type);
                     //println!("debug 02");
                     for x in 0..3 {
                         let gto_1st_x = &tab_dev[x];
@@ -2604,10 +2937,10 @@ impl Grids {
 
             let mut tmp_geom = [0.0;3];
             tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
-            let tab_den = spheric_gto_value_matrixfull_serial(&self.coordinates, &tmp_geom, elem);
+            let tab_den = gto_value_matrixfull_serial(&self.coordinates, &tmp_geom, elem, &mol.ctrl.basis_type);
 
             let tab_dev = if mol.xc_data.use_density_gradient() {
-                Some(spheric_gto_1st_value_batch_serial(&self.coordinates, &tmp_geom, elem))
+                Some(gto_1st_value_batch_serial(&self.coordinates, &tmp_geom, elem, &mol.ctrl.basis_type))
                 //Some(RIFull::new([num_loc_bas,num_grids,3],0.0))
             } else {
                 None
@@ -3413,8 +3746,47 @@ pub fn numerical_density(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull<f64>>
     }
 }
 
+pub fn numerical_orbital_population(grid: &Grids, mol: &Molecule) -> Vec<f64> {
+    let mut orbital_densities = vec![0.0;mol.num_basis];
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
+    let local_basis4elem = mol.basis4elem.clone();
+    let local_position = mol.geom.rg_position.clone();
+    let num_basis = mol.num_basis;
+    let basis_type = mol.ctrl.basis_type.clone();
+    let num_grids = grid.coordinates.len();
+    //let (sender,receiver) = channel();
+
+    // reuse the default omp_num_threads setting
+    omp_set_num_threads_wrapper(default_omp_num_threads);
+
+    if let Some(tabulated_ao) = &grid.ao { 
+        orbital_densities.iter_mut().enumerate().for_each(|(i,to)| {
+            grid.weights.iter().zip(tabulated_ao.iter_row(i)).for_each(|(w,ao_r_r)| {
+                *to += ao_r_r*ao_r_r * w
+            })
+        })
+    } else {
+        panic!("tabulated ao is not available")
+    }
+
+    //orbital_densities.iter_mut().enumerate().for_each(|(i,to));
+
+    
+    orbital_densities
+
+}
+
 pub fn numerical_density_rayon(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull<f64>>) -> [f64;2] {
     let mut total_density = [0.0f64;2];
+    let mut given_orbital_densities = 0.0;
+    let orb_index = 13_usize;
+
+    //let mut fack_dm = MatrixFull::new([mol.num_basis,mol.num_basis],0.0);
+    ////fack_dm.iter_diagonal_mut().unwrap().for_each(|x| {
+    ////    *x = 1.0;
+    ////});
+    //fack_dm[(12,12)] = 1.0;
+
     //let mut count:usize = 0;
     // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
     let default_omp_num_threads = omp_get_num_threads_wrapper();
@@ -3426,32 +3798,49 @@ pub fn numerical_density_rayon(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull
     let (sender,receiver) = channel();
     grid.coordinates.par_iter().zip(grid.weights.par_iter()).for_each_with(sender, |s,(r,w)| {
         omp_set_num_threads_wrapper(1);
+
+        //let mut fack_dm = MatrixFull::new([mol.num_basis,mol.num_basis],0.0);
+        ////fack_dm.iter_diagonal_mut().unwrap().for_each(|x| {
+        ////    *x = 1.0;
+        ////});
+        //fack_dm[(orb_index,orb_index)] = 1.0;
+
         let mut local_total_density = [0.0f64;2];
+        let mut local_orbital_densities = 0.0;
         let mut density_r_sum = [0.0;2];
         let mut density_r:Vec<f64> = vec![];
         let mut local_dm = dm.clone();
         local_basis4elem.iter().zip(local_position.iter_columns_full()).for_each(|(elem,geom)| {
             let mut tmp_geom = [0.0;3];
             tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
-            density_r.extend(gto_value(r, &tmp_geom, elem, &basis_type));
+            //density_r.extend(gto_value(r, &tmp_geom, elem, &basis_type));
+            let tmp_coordinate = [r.clone()];
+            let tab_den = gto_value_serial(&tmp_coordinate, &tmp_geom, elem, &basis_type);
+            density_r.extend(tab_den.data.clone());
         });
+
+        let mut local_orbital_densities = density_r[orb_index];
+        local_orbital_densities *= local_orbital_densities*w;
+
         let mut density_rr = MatrixFull::from_vec([num_basis,1],density_r).unwrap();
         local_dm.iter_mut().zip(density_r_sum.iter_mut()).for_each(|(dm_s, density_r_sum)| {
             let mut tmp_mat = MatrixFull::new([num_basis,1],0.0);
             tmp_mat.lapack_dgemm(&mut density_rr, dm_s, 'T', 'N', 1.0, 0.0);
+            //tmp_mat.lapack_dgemm(&mut density_rr, &mut fack_dm, 'T', 'N', 1.0, 0.0);
             *density_r_sum += tmp_mat.data.iter().zip(density_rr.data.iter()).fold(0.0, |acc,(a,b)| {acc + a*b});
         });
         local_total_density.iter_mut().zip(density_r_sum.iter()).for_each(|(to,from)| *to += from*w);
-        s.send(local_total_density).unwrap();
+        s.send((local_total_density,local_orbital_densities)).unwrap();
     });
 
-    receiver.iter().for_each(|value| {
+    receiver.iter().for_each(|(value,orb_value)| {
         total_density.iter_mut().zip(value.iter()).for_each(|(to,from)| *to += from);
-
+        given_orbital_densities += orb_value;
     });
 
     // reuse the default omp_num_threads setting
     omp_set_num_threads_wrapper(default_omp_num_threads);
+    println!("debug: given orbital density: {:?}", given_orbital_densities);
     
     total_density
 }
