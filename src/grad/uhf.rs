@@ -3,8 +3,8 @@ use crate::constants::AUXBAS_THRESHOLD;
 use crate::grad::traits::GradAPI;
 use crate::scf_io;
 use crate::scf_io::SCF;
-use crate::Molecule;
 use crate::utilities::memory_batch::*;
+use crate::Molecule;
 use rayon::prelude::*;
 use rest_libcint::prelude::*;
 use rest_libcint_wrapper::*;
@@ -37,8 +37,15 @@ impl RIUHFGradient<'_> {
     pub fn new(scf_data: &SCF) -> RIUHFGradient<'_> {
         // check SCF type
         match scf_data.scftype {
-            scf_io::SCFType::UHF => {}
+            scf_io::SCFType::UHF => {},
             _ => panic!("SCFtype is not sutiable for UHF gradient."),
+        };
+
+        // check j2c_decomp flag
+        use crate::ri_jk::decompose::*;
+        match scf_data.mol.ctrl.j2c_decomp.policy {
+            J2CDecompPolicy::Cd => unimplemented!("Cholesky decompose is not implemented for gradient currently."),
+            _ => {},
         };
 
         // flags
@@ -49,11 +56,7 @@ impl RIUHFGradient<'_> {
         flags.print_level(scf_data.mol.ctrl.print_level);
         let flags = flags.build().unwrap();
 
-        RIUHFGradient {
-            scf_data,
-            flags,
-            result: HashMap::new(),
-        }
+        RIUHFGradient { scf_data, flags, result: HashMap::new() }
     }
 
     /// Derivatives of nuclear repulsion energy with reference to nuclear coordinates
@@ -125,7 +128,7 @@ impl RIUHFGradient<'_> {
         let scf_data = &self.scf_data;
         let mol = &scf_data.mol;
         let num_qm_atoms = mol.geom.elem.len();
-        
+
         let mut de_qmmm = MatrixFull::new([3, num_qm_atoms], 0.0);
 
         if mol.geom.ghost_pc_chrg.is_empty() {
@@ -147,26 +150,28 @@ impl RIUHFGradient<'_> {
             for i in 0..num_ghosts {
                 let pos_x = [ghost_pc_pos[[0, i]], ghost_pc_pos[[1, i]], ghost_pc_pos[[2, i]]];
                 let r_vec = [pos_a[0] - pos_x[0], pos_a[1] - pos_x[1], pos_a[2] - pos_x[2]];
-                let r_sq = r_vec.iter().map(|&x| x*x).sum::<f64>();
+                let r_sq = r_vec.iter().map(|&x| x * x).sum::<f64>();
                 if r_sq > 1e-12 {
                     let prefactor = -1.0 * (nuclear_charges[a] * ghost_pc_chrg[i]) / (r_sq * r_sq.sqrt());
-                    for t in 0..3 { de_qmmm[[t, a]] += prefactor * r_vec[t]; }
+                    for t in 0..3 {
+                        de_qmmm[[t, a]] += prefactor * r_vec[t];
+                    }
                 }
             }
         }
 
         let mut deriv_hcore = vec![0.0; 3 * nao * nao];
-        
-        let mut temp_mol = mol.clone(); 
-        
+
+        let mut temp_mol = mol.clone();
+
         for i in 0..num_ghosts {
             let q_i = ghost_pc_chrg[i];
             let pos_i = [ghost_pc_pos[[0, i]], ghost_pc_pos[[1, i]], ghost_pc_pos[[2, i]]];
-            
+
             temp_mol.with_rinv_origin(pos_i, |mol_mut| {
                 let cint = mol_mut.initialize_cint(false);
                 let iprinv_out = cint.integrate("int1e_iprinv", "s1", None);
-                
+
                 if let Some(out_vec) = iprinv_out.out {
                     for t in 0..3 {
                         for nu in 0..nao {
@@ -193,8 +198,7 @@ impl RIUHFGradient<'_> {
                 for mu in p0..p1 {
                     for nu in 0..nao {
                         let h_val = deriv_hcore[t * nao * nao + mu * nao + nu];
-                        let dm_val = if !use_double_dm { dm[0][[mu, nu]] } 
-                                     else { dm[0][[mu, nu]] + dm[1][[mu, nu]] };
+                        let dm_val = if !use_double_dm { dm[0][[mu, nu]] } else { dm[0][[mu, nu]] + dm[1][[mu, nu]] };
                         sum_val += h_val * dm_val;
                     }
                 }
@@ -253,10 +257,8 @@ impl RIUHFGradient<'_> {
         time_records.count_start("de-jk preparation power");
         // tsr_int2c2e_l: J^-1/2
         let tsr_int2c2e_l_inv = {
-            let shl_slices = vec![
-                [n_basis_shell, n_basis_shell + n_auxbas_shell],
-                [n_basis_shell, n_basis_shell + n_auxbas_shell],
-            ];
+            let shl_slices =
+                vec![[n_basis_shell, n_basis_shell + n_auxbas_shell], [n_basis_shell, n_basis_shell + n_auxbas_shell]];
             let (out, shape) = cint_data.integral_s1::<int2c2e>(Some(&shl_slices));
             let out = MatrixFull::from_vec(shape.try_into().unwrap(), out).unwrap();
             let out = _power_rayon_for_symmetric_matrix(&out, -0.5, AUXBAS_THRESHOLD).unwrap();
@@ -266,10 +268,8 @@ impl RIUHFGradient<'_> {
 
         // tsr_int2c2e_ip1
         let tsr_int2c2e_ip1 = {
-            let shl_slices = vec![
-                [n_basis_shell, n_basis_shell + n_auxbas_shell],
-                [n_basis_shell, n_basis_shell + n_auxbas_shell],
-            ];
+            let shl_slices =
+                vec![[n_basis_shell, n_basis_shell + n_auxbas_shell], [n_basis_shell, n_basis_shell + n_auxbas_shell]];
             let (out, shape) = cint_data.integral_s1::<int2c2e_ip1>(Some(&shl_slices));
             rt::asarray((out, shape, &device))
         };
@@ -277,13 +277,16 @@ impl RIUHFGradient<'_> {
         // shell partition of int3c2e
         let ao_loc = cint_data.ao_loc();
         let aux_loc = &ao_loc[(n_basis_shell as usize)..];
-        
+
         // available memory in MB, if not set, will be calculated from system
         let sys_info = sysinfo::System::new_all();
-        let mem_avail = self.flags.max_memory.map(|max_memory| {
-            max_memory - detect_used_memory_mb("proc")
-        });
-        let aux_batch_size = calc_batch_size::<f64>(8 * nao * nao, mem_avail, None, Some(naux * (nocc[0] * nocc[0] + nocc[1] * nocc[1])));
+        let mem_avail = self.flags.max_memory.map(|max_memory| max_memory - detect_used_memory_mb("proc"));
+        let aux_batch_size = calc_batch_size::<f64>(
+            8 * nao * nao,
+            mem_avail,
+            None,
+            Some(naux * (nocc[0] * nocc[0] + nocc[1] * nocc[1])),
+        );
         let aux_batch_size = aux_batch_size.min(216);
         let aux_partition = blocksize_partition(aux_loc, aux_batch_size);
 
@@ -325,11 +328,10 @@ impl RIUHFGradient<'_> {
         let mut idx_aux_start = 0;
         for [shl0, shl1] in aux_partition {
             let shl_naux = aux_loc[shl1] - aux_loc[shl0];
-            let shl_slices = vec![
-                [0, n_basis_shell],
-                [0, n_basis_shell],
-                [n_basis_shell + shl0 as i32, n_basis_shell + shl1 as i32],
-            ];
+            let shl_slices = vec![[0, n_basis_shell], [0, n_basis_shell], [
+                n_basis_shell + shl0 as i32,
+                n_basis_shell + shl1 as i32,
+            ]];
             let (p0, p1) = (idx_aux_start, idx_aux_start + shl_naux);
 
             time_records.count_start("de-jk batch int");
@@ -356,7 +358,8 @@ impl RIUHFGradient<'_> {
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 2");
-                    *&mut daux_j.i_mut((p0..p1)) += get_grad_daux_j_int3c2e_ip2(tsr_int3c2e_ip2.view(), dm_tp.view(), itm_j.i(p0..p1));
+                    *&mut daux_j.i_mut((p0..p1)) +=
+                        get_grad_daux_j_int3c2e_ip2(tsr_int3c2e_ip2.view(), dm_tp.view(), itm_j.i(p0..p1));
                     time_records.count("de-jk batch 2");
                 }
             }
@@ -373,7 +376,8 @@ impl RIUHFGradient<'_> {
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 5");
-                    *&mut daux_k.i_mut((p0..p1)) += get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_k_ao.view());
+                    *&mut daux_k.i_mut((p0..p1)) +=
+                        get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_k_ao.view());
                     time_records.count("de-jk batch 5");
                 }
             }

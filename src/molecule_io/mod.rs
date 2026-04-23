@@ -35,6 +35,7 @@ use crate::basis_io::bse_downloader::{self, ctrl_element_checker, local_element_
 use crate::basis_io::basis_list::{self, basis_fuzzy_matcher, check_basis_name};
 use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper, omp_get_num_threads_wrapper};
 use crate::solvent::PcmMethod;
+use crate::ri_jk;
 
 //extern crate nalgebra as na;
 //use na::{DMatrix,DVector};
@@ -443,7 +444,7 @@ impl Molecule {
         cint_env
     }
 
-    pub fn collect_auxbas(ctrl: &InputKeywords,geom: &mut GeomCell, etb: Option<InfoV2>) -> 
+    pub fn collect_auxbas(ctrl: &InputKeywords,geom: &GeomCell, etb: Option<InfoV2>) -> 
             (Vec<Basis4Elem>, Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>, Vec<BasInfo>, Vec<Vec<usize>>, usize) {
 
         let mut aux_atm: Vec<Vec<i32>> = vec![];
@@ -623,7 +624,7 @@ impl Molecule {
         (auxbas_total, aux_atm, aux_bas, aux_env,auxbas_info,aux_cint_fdqc,num_auxbas)
     }
 
-    pub fn collect_basis(ctrl: &InputKeywords,geom: &mut GeomCell) -> 
+    pub fn collect_basis(ctrl: &InputKeywords,geom: &GeomCell) -> 
             (Vec<Basis4Elem>, Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>, Vec<BasInfo>, Vec<Vec<usize>>, [f64;3],usize, usize, Option<Vec<Vec<i32>>>) {
         //let (elem_name, elem_charge, elem_mass) = elements();
         let mut atm: Vec<Vec<i32>> = vec![];
@@ -2842,9 +2843,9 @@ impl Molecule {
         let n_auxbas = self.num_auxbas;
         let n_baspar = (self.num_basis+1)*self.num_basis/2;
 
-        // AJZ: this will cost n_baspar * n_auxbas * 8 * 2 bytes memory, where * 2 is for the temporary storage of gemm
+        // AJZ: this will cost n_baspar * n_auxbas * 8 bytes memory
         // for safety, we apply 1.5 factor to limit the memory usage
-        let estimated_mem = 1.5 * n_baspar as f64 * n_auxbas as f64 * 8.0 * 2.0 / (1024.0 * 1024.0); // in MB
+        let estimated_mem = 1.5 * n_baspar as f64 * n_auxbas as f64 * 8.0 / (1024.0 * 1024.0); // in MB
         let avail_mem = self.ctrl.max_memory.map(|m| m - crate::utilities::memory_batch::detect_used_memory_mb("proc"));
         utilities::memory_batch::handle_memory_exceed(estimated_mem, avail_mem, self.ctrl.abort_on_mem_exceed);
 
@@ -3127,7 +3128,9 @@ impl Molecule {
     }
 
     pub fn prepare_rimatr_for_ri_v_rayon(&self) -> (MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>) {
-        self.prepare_rimatr_for_ri_v_rayon_v05()
+        let cderi = ri_jk::generate_rimatr_bare(self);
+        let (basbas2baspar, baspar2basbas) = ri_jk::generate_baspar(self.num_basis);
+        (cderi, basbas2baspar, baspar2basbas)
     }
 
     /// Make an auxiliary molecule from a molecule for calculation.

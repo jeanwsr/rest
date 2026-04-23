@@ -1,5 +1,6 @@
 pub mod memory_batch;
 pub mod rstsr_util;
+pub mod buffer_pool;
 
 use clap::{Command, Arg, ArgMatches};
 use rayon::ThreadPoolBuildError;

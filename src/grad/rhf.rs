@@ -2,8 +2,8 @@ use crate::constants::AUXBAS_THRESHOLD;
 use crate::grad::traits::GradAPI;
 use crate::scf_io;
 use crate::scf_io::SCF;
-use crate::Molecule;
 use crate::utilities::memory_batch::*;
+use crate::Molecule;
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use rest_libcint::prelude::*;
@@ -47,8 +47,8 @@ pub struct RIHFGradientFlags {
 ///
 /// Field `result` contains
 /// - `de`: total derivative of energy with respect to nuclear coordinates, in unit a.u.
-/// - components contributed to total derivative, including
-///   `de_nuc`, `de_hcore`, `de_ovlp`, `de_j`, `de_k`, `de_jaux`, `de_kaux`.
+/// - components contributed to total derivative, including `de_nuc`, `de_hcore`, `de_ovlp`, `de_j`,
+///   `de_k`, `de_jaux`, `de_kaux`.
 pub struct RIRHFGradient<'a> {
     pub scf_data: &'a SCF,
     pub flags: RIHFGradientFlags,
@@ -69,8 +69,15 @@ impl RIRHFGradient<'_> {
     pub fn new(scf_data: &SCF) -> RIRHFGradient<'_> {
         // check SCF type
         match scf_data.scftype {
-            scf_io::SCFType::RHF => {}
+            scf_io::SCFType::RHF => {},
             _ => panic!("SCFtype is not sutiable for RHF gradient."),
+        };
+
+        // check j2c_decomp flag
+        use crate::ri_jk::decompose::*;
+        match scf_data.mol.ctrl.j2c_decomp.policy {
+            J2CDecompPolicy::Cd => unimplemented!("Cholesky decompose is not implemented for gradient currently."),
+            _ => {},
         };
 
         // flags
@@ -82,11 +89,7 @@ impl RIRHFGradient<'_> {
         flags.max_memory(scf_data.mol.ctrl.max_memory);
         let flags = flags.build().unwrap();
 
-        RIRHFGradient {
-            scf_data,
-            flags,
-            result: HashMap::new(),
-        }
+        RIRHFGradient { scf_data, flags, result: HashMap::new() }
     }
 
     /// Derivatives of nuclear repulsion energy with reference to nuclear coordinates
@@ -196,10 +199,8 @@ impl RIRHFGradient<'_> {
         time_records.count_start("de-jk preparation power");
         // tsr_int2c2e_l: J^-1/2
         let tsr_int2c2e_l_inv = {
-            let shl_slices = vec![
-                [n_basis_shell, n_basis_shell + n_auxbas_shell],
-                [n_basis_shell, n_basis_shell + n_auxbas_shell],
-            ];
+            let shl_slices =
+                vec![[n_basis_shell, n_basis_shell + n_auxbas_shell], [n_basis_shell, n_basis_shell + n_auxbas_shell]];
             let (out, shape) = cint_data.integral_s1::<int2c2e>(Some(&shl_slices));
             let out = MatrixFull::from_vec(shape.try_into().unwrap(), out).unwrap();
             let out = _power_rayon_for_symmetric_matrix(&out, -0.5, AUXBAS_THRESHOLD).unwrap();
@@ -209,10 +210,8 @@ impl RIRHFGradient<'_> {
 
         // tsr_int2c2e_ip1
         let tsr_int2c2e_ip1 = {
-            let shl_slices = vec![
-                [n_basis_shell, n_basis_shell + n_auxbas_shell],
-                [n_basis_shell, n_basis_shell + n_auxbas_shell],
-            ];
+            let shl_slices =
+                vec![[n_basis_shell, n_basis_shell + n_auxbas_shell], [n_basis_shell, n_basis_shell + n_auxbas_shell]];
             let (out, shape) = cint_data.integral_s1::<int2c2e_ip1>(Some(&shl_slices));
             rt::asarray((out, shape, &device))
         };
@@ -223,9 +222,7 @@ impl RIRHFGradient<'_> {
 
         // available memory in MB, if not set, will be calculated from system
         let sys_info = sysinfo::System::new_all();
-        let mem_avail = self.flags.max_memory.map(|max_memory| {
-            max_memory - detect_used_memory_mb("proc")
-        });
+        let mem_avail = self.flags.max_memory.map(|max_memory| max_memory - detect_used_memory_mb("proc"));
         let aux_batch_size = calc_batch_size::<f64>(8 * nao * nao, mem_avail, None, Some(naux * nocc * nocc));
         let aux_batch_size = aux_batch_size.min(216);
         let aux_partition = blocksize_partition(aux_loc, aux_batch_size);
@@ -265,11 +262,10 @@ impl RIRHFGradient<'_> {
         let mut idx_aux_start = 0;
         for [shl0, shl1] in aux_partition {
             let shl_naux = aux_loc[shl1] - aux_loc[shl0];
-            let shl_slices = vec![
-                [0, n_basis_shell],
-                [0, n_basis_shell],
-                [n_basis_shell + shl0 as i32, n_basis_shell + shl1 as i32],
-            ];
+            let shl_slices = vec![[0, n_basis_shell], [0, n_basis_shell], [
+                n_basis_shell + shl0 as i32,
+                n_basis_shell + shl1 as i32,
+            ]];
             let (p0, p1) = (idx_aux_start, idx_aux_start + shl_naux);
 
             time_records.count_start("de-jk batch int");
@@ -296,7 +292,8 @@ impl RIRHFGradient<'_> {
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 2");
-                    *&mut daux_j.i_mut((p0..p1)) += get_grad_daux_j_int3c2e_ip2(tsr_int3c2e_ip2.view(), dm_tp.view(), itm_j.i(p0..p1));
+                    *&mut daux_j.i_mut((p0..p1)) +=
+                        get_grad_daux_j_int3c2e_ip2(tsr_int3c2e_ip2.view(), dm_tp.view(), itm_j.i(p0..p1));
                     time_records.count("de-jk batch 2");
                 }
             }
@@ -312,7 +309,8 @@ impl RIRHFGradient<'_> {
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 5");
-                    *&mut daux_k.i_mut((p0..p1)) += get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_k_ao.view());
+                    *&mut daux_k.i_mut((p0..p1)) +=
+                        get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_k_ao.view());
                     time_records.count("de-jk batch 5");
                 }
             }
@@ -396,7 +394,7 @@ impl RIRHFGradient<'_> {
         let scf_data = &self.scf_data;
         let mol = &scf_data.mol;
         let num_qm_atoms = mol.geom.elem.len();
-        
+
         let mut de_qmmm = MatrixFull::new([3, num_qm_atoms], 0.0);
 
         if mol.geom.ghost_pc_chrg.is_empty() {
@@ -418,26 +416,28 @@ impl RIRHFGradient<'_> {
             for i in 0..num_ghosts {
                 let pos_x = [ghost_pc_pos[[0, i]], ghost_pc_pos[[1, i]], ghost_pc_pos[[2, i]]];
                 let r_vec = [pos_a[0] - pos_x[0], pos_a[1] - pos_x[1], pos_a[2] - pos_x[2]];
-                let r_sq = r_vec.iter().map(|&x| x*x).sum::<f64>();
+                let r_sq = r_vec.iter().map(|&x| x * x).sum::<f64>();
                 if r_sq > 1e-12 {
                     let prefactor = -1.0 * (nuclear_charges[a] * ghost_pc_chrg[i]) / (r_sq * r_sq.sqrt());
-                    for t in 0..3 { de_qmmm[[t, a]] += prefactor * r_vec[t]; }
+                    for t in 0..3 {
+                        de_qmmm[[t, a]] += prefactor * r_vec[t];
+                    }
                 }
             }
         }
 
         let mut deriv_hcore = vec![0.0; 3 * nao * nao];
-        
-        let mut temp_mol = mol.clone(); 
-        
+
+        let mut temp_mol = mol.clone();
+
         for i in 0..num_ghosts {
             let q_i = ghost_pc_chrg[i];
             let pos_i = [ghost_pc_pos[[0, i]], ghost_pc_pos[[1, i]], ghost_pc_pos[[2, i]]];
-            
+
             temp_mol.with_rinv_origin(pos_i, |mol_mut| {
                 let cint = mol_mut.initialize_cint(false);
                 let iprinv_out = cint.integrate("int1e_iprinv", "s1", None);
-                
+
                 if let Some(out_vec) = iprinv_out.out {
                     for t in 0..3 {
                         for nu in 0..nao {
@@ -464,8 +464,7 @@ impl RIRHFGradient<'_> {
                 for mu in p0..p1 {
                     for nu in 0..nao {
                         let h_val = deriv_hcore[t * nao * nao + mu * nao + nu];
-                        let dm_val = if !use_double_dm { dm[0][[mu, nu]] } 
-                                     else { dm[0][[mu, nu]] + dm[1][[mu, nu]] };
+                        let dm_val = if !use_double_dm { dm[0][[mu, nu]] } else { dm[0][[mu, nu]] + dm[1][[mu, nu]] };
                         sum_val += h_val * dm_val;
                     }
                 }
@@ -535,10 +534,7 @@ pub fn generator_deriv_hcore<'a>(scf_data: &'a SCF) -> impl FnMut(usize) -> Tsr<
 
     let necp_by_atom = {
         let basis4elem = Molecule::collect_basis(&scf_data.mol.ctrl, &mut scf_data.mol.geom.clone()).0;
-        basis4elem
-            .iter()
-            .map(|i| if let Some(num_ecp) = i.ecp_electrons { num_ecp } else { 0 })
-            .collect::<Vec<usize>>()
+        basis4elem.iter().map(|i| if let Some(num_ecp) = i.ecp_electrons { num_ecp } else { 0 }).collect::<Vec<usize>>()
     };
     let has_ecp = necp_by_atom.iter().any(|&x| x > 0);
 
@@ -632,7 +628,8 @@ pub fn calc_de_nuc(mol: &Molecule) -> MatrixFull<f64> {
     let nuc_inf = rt::full(([natm], f64::INFINITY, &device));
     let nuc_rinv: Tsr<f64> = 1.0 / (nuc_v.l2_norm_axes(0) + rt::diag(&nuc_inf));
 
-    let tmp = -nuc_z.i((None, .., None)) * nuc_z.i((None, None, ..)) * nuc_rinv.mapv(|x| x.powi(3)).i((None, .., ..)) * nuc_v;
+    let tmp =
+        -nuc_z.i((None, .., None)) * nuc_z.i((None, None, ..)) * nuc_rinv.mapv(|x| x.powi(3)).i((None, .., ..)) * nuc_v;
     let de_nuc = tmp.sum_axes(1);
 
     let de_nuc = {
@@ -701,7 +698,11 @@ pub fn get_grad_dao_j_int3c2e_ip1(tsr_int3c2e_ip1: TsrView<f64>, dm: TsrView<f64
     return dao_j_int3c2e_ip1;
 }
 
-pub fn get_grad_daux_j_int3c2e_ip2(tsr_int3c2e_ip2: TsrView<f64>, dm_tp: TsrView<f64>, itm_j: TsrView<f64>) -> Tsr<f64> {
+pub fn get_grad_daux_j_int3c2e_ip2(
+    tsr_int3c2e_ip2: TsrView<f64>,
+    dm_tp: TsrView<f64>,
+    itm_j: TsrView<f64>,
+) -> Tsr<f64> {
     // see module level documentation for details
     assert!(tsr_int3c2e_ip2.f_prefer());
 
@@ -710,7 +711,11 @@ pub fn get_grad_daux_j_int3c2e_ip2(tsr_int3c2e_ip2: TsrView<f64>, dm_tp: TsrView
     return -1.0 * (&tmp1.reshape((naux, 3)) * itm_j.i((.., None)));
 }
 
-pub fn get_itm_k_occtp(tsr_int2c2e_l_inv: TsrView<f64>, ederi_utp: TsrView<f64>, weighted_occ_coeff: TsrView<f64>) -> Tsr<f64> {
+pub fn get_itm_k_occtp(
+    tsr_int2c2e_l_inv: TsrView<f64>,
+    ederi_utp: TsrView<f64>,
+    weighted_occ_coeff: TsrView<f64>,
+) -> Tsr<f64> {
     // see module level documentation for details
     assert!(tsr_int2c2e_l_inv.f_prefer());
     assert!(ederi_utp.f_prefer());
@@ -772,9 +777,7 @@ pub fn get_itm_k_ao(itm_k_occtp: TsrView<f64>, weighted_occ_coeff: TsrView<f64>)
     (0..naux).into_par_iter().for_each(|p| {
         let mut itm_k_ao = unsafe { itm_k_ao.force_mut() };
         let itm_k_occ_p = itm_k_occtp.i((.., p)).unpack_triu(FlagSymm::Sy);
-        itm_k_ao
-            .i_mut((.., .., p))
-            .assign(&weighted_occ_coeff % itm_k_occ_p % weighted_occ_coeff.t());
+        itm_k_ao.i_mut((.., .., p)).assign(&weighted_occ_coeff % itm_k_occ_p % weighted_occ_coeff.t());
     });
     return itm_k_ao;
 }

@@ -13,7 +13,6 @@ use crate::ctrl_io::flags::*;
 mod addons;
 mod fchk;
 mod pyrest_scf_io;
-mod ri_on_the_fly;
 
 use mpi::collective::SystemOperation;
 use pyo3::{pyclass, pymethods, pyfunction};
@@ -35,6 +34,7 @@ use crate::initial_guess::initial_guess;
 use crate::external_libs::dftd;
 use crate::constants::{INVERSE_THRESHOLD, SPECIES_INFO, SQRT_THRESHOLD};
 use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
+use crate::ri_jk;
 
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
 
@@ -3298,7 +3298,7 @@ impl SCF {
         let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
             max_memory - detect_used_memory_mb("proc")
         });
-        let mem_est = ri_on_the_fly::mem_estimate_vj_ri_direct(nao, naux, nset);
+        let mem_est = ri_jk::mem_estimate_vj_ri_direct(nao, naux, nset);
         let mut batch_size_estimate = calc_batch_size_from_mem_estimate::<f64>(&mem_est, mem_avail, None, true);
 
         // if estimated batch size is smaller than minimum, warn and set to minimum
@@ -3331,7 +3331,7 @@ impl SCF {
         // compute vj only for specified spin channels
         let dms = &self.density_matrix[0..self.mol.spin_channel];
         let mol_obj = &self.mol;
-        let mut vjs = crate::scf_io::ri_on_the_fly::generate_vj_ri_direct(dms, mol_obj, batch_size);
+        let mut vjs = ri_jk::generate_vj_ri_direct(dms, mol_obj, batch_size);
 
         // complete `vjs` if the spin channel is 1 (restricted, spin-unpolarized)
         if self.mol.spin_channel == 1 {
@@ -3356,8 +3356,8 @@ impl SCF {
         let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
             max_memory - detect_used_memory_mb("proc")
         });
-        let mem_est_direct = ri_on_the_fly::mem_estimate_vk_ri_direct_dm(nao, naux, nset);
-        let mem_est_semi = ri_on_the_fly::mem_estimate_vk_ri_semi_direct_coeff(nao, naux, nocc_max, nset);
+        let mem_est_direct = ri_jk::mem_estimate_vk_ri_direct_dm(nao, naux, nset);
+        let mem_est_semi = ri_jk::mem_estimate_vk_ri_semi_direct_coeff(nao, naux, nocc_max, nset);
         let batch_size_estimate_direct = calc_batch_size_from_mem_estimate::<f64>(&mem_est_direct, mem_avail, None, true);
         let batch_size_estimate_semi = calc_batch_size_from_mem_estimate::<f64>(&mem_est_semi, mem_avail, None, true);
 
@@ -3407,11 +3407,11 @@ impl SCF {
             let mo_coeff = &self.eigenvectors[0..self.mol.spin_channel];
             let mo_occ = &self.occupation[0..self.mol.spin_channel];
             let mol_obj = &self.mol;
-            crate::scf_io::ri_on_the_fly::generate_vk_ri_semi_direct_coeff(scaling_factor, mo_coeff, mo_occ, mol_obj, batch_size)
+            ri_jk::generate_vk_ri_semi_direct_coeff(scaling_factor, mo_coeff, mo_occ, mol_obj, batch_size)
         } else {
             let dms = &self.density_matrix[0..self.mol.spin_channel];
             let mol_obj = &self.mol;
-            crate::scf_io::ri_on_the_fly::generate_vk_ri_direct_dm(scaling_factor, dms, mol_obj, batch_size)
+            ri_jk::generate_vk_ri_direct_dm(scaling_factor, dms, mol_obj, batch_size)
         };
 
         // complete `vks` if the spin channel is 1 (restricted, spin-unpolarized)
