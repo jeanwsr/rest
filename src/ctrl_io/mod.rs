@@ -6,6 +6,7 @@ use tensors::MatrixFull;
 use std::{fs, sync::Arc};
 use crate::ctrl_io::geometric_pyo3_io::parse_geometric_keywords;
 use crate::ctrl_io::quasiparticle_methods::parse_quasiparticle_keywords;
+use crate::ctrl_io::tddft_parameters::parse_tddft_keywords;
 use crate::{check_norm::force_state_occupation::ForceStateOccupation};
 use crate::dft::{DFAFamily, DFTType, DFA4REST};
 use crate::geom_io::{GeomCell, GeomUnit, MOrC, parse_geom_keywords};
@@ -23,9 +24,11 @@ pub use flags::*;
 mod pyrest_ctrl_io;
 mod geometric_pyo3_io;
 pub mod quasiparticle_methods;
+pub mod tddft_parameters;
 use geometric_pyo3_io::GeomeTRIC;
 mod path_util;
 use quasiparticle_methods::QuasiParticle;
+use tddft_parameters::TDDFTParameters;
 
 pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
     let tmp_cont = fs::read_to_string(&filename[..])?;
@@ -44,11 +47,15 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     let mut tmp_geomcell = parse_geom_keywords(tmp_keys)?;
     let mut tmp_geomtric = parse_geometric_keywords(tmp_keys)?;
     let mut tmp_quasiparticle=parse_quasiparticle_keywords(tmp_keys)?;
+    let mut tmp_tddft = parse_tddft_keywords(tmp_keys)?;
     if let Some(tmp_geomtric) = &mut tmp_geomtric {
         tmp_input.geometric_pyo3 = Some(std::mem::take(tmp_geomtric));
     }
     if let Some(tmp_quasiparticle) = &mut tmp_quasiparticle {
         tmp_input.quasiparticle_methods = Some(std::mem::take(tmp_quasiparticle));
+    }
+    if let Some(tmp_tddft) = &mut tmp_tddft {
+        tmp_input.tddft = Some(std::mem::take(tmp_tddft));
     }
     Ok((tmp_input,tmp_geomcell))
 }
@@ -272,6 +279,7 @@ pub struct InputKeywords {
     pub opt_engine: Option<String>,
     pub geometric_pyo3: Option<GeomeTRIC>,
     pub quasiparticle_methods:Option<QuasiParticle>,
+    pub tddft: Option<TDDFTParameters>,
 }
 
 impl Default for InputKeywords {
@@ -407,6 +415,7 @@ impl InputKeywords {
             opt_engine: None,
             geometric_pyo3: None,
             quasiparticle_methods:None,
+            tddft: None,
         }
     }
 

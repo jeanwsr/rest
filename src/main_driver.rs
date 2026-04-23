@@ -309,6 +309,17 @@ pub fn main_driver() -> anyhow::Result<()> {
         print!("Now starts quasiparticle method computation!\n");
         quasiparticle_methods(&mut scf_data,&mpi_operator);
     }
+
+    //===================================
+    // Now for TDDFT calculations
+    //===================================
+    if scf_data.mol.ctrl.tddft.is_some() {
+        time_mark.new_item("TDDFT", "the TDDFT calculation");
+        time_mark.count_start("TDDFT");
+        crate::ri_tddft::tddft_main(&mut scf_data);
+        time_mark.count("TDDFT");
+    }
+
     time_mark.count("Overall");
 
     if scf_data.mol.ctrl.print_level > 0 {
