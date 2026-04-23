@@ -97,8 +97,6 @@
 - `post_ai_correction`：取值String。AI辅助的校正方法。目前仅支持SCC15，并只能和R-xDH7重整化双杂化泛涵方法相匹配。相关文章见：Wang, Y.; Lin, Z.; Ouyang, R.; Jiang, B.; Zhang, I. Y.; Xu, X. Toward Efficient and Unified Treatment of Static and Dynamic Correlations in Generalized Kohn–Sham Density Functional Theory. JACS Au 2024, 4 (8), 3205–3216. https://doi.org/10.1021/jacsau.4c00488
 - `post_xc`：取值Vec\<String\>。采用自洽收敛的轨道和密度，进行不同的交换－关联泛函(xc)的计算。允许的方法包括REST支持的"xc"方法
 - `post_correlation`：取值Vec\<String\>。采用自洽收敛的轨道和密度，进行后自洽场高等级相关能方法计算。允许的方法包括PT2、sBGE2、RPA、scsRPA等
-- `pt2_ss_factor`: 取值f64。采用 Spin-Component-Scaled 方式计算 MP2 型相关能（SCS-MP2）时, 用于控制自旋平行（same spin）分量贡献的缩放系数，适用于 `xc` 关键词为 MP2、SCS-MP2或双杂化泛函，以及 `post_correlation` 设置为 PT2 的情况
-- `pt2_os_factor`: 取值f64。适用场景与 `pt2_ss_factor` 一致，采用 SCS-MP2 方法计算相关能贡献时，用于缩放自旋反平行（opposite spin）分量贡献的系数
 
 ## DFT积分格点相关关键词（Keyword）
 - `grid_gen_level`: 取值usize。格点精度等级，数值越大越精确。缺省为3
@@ -253,6 +251,21 @@ auxbas_path = def2-universal-jkfit      # 简写格式，自动搜索
 	 - `1`: 代表standard Gausss-Legendre格点
 	 - `2`: 代表Logarithmic格点。
 - `lambda_points`：取值i32。对于SCSRPA和R-xDH7等方法，对于开窍层的强关联体系，需要对绝热涨落途径（lambda）数值积分。这里设置lambda积分的格点数目。缺省为20
+
+## RI-PT2计算相关设置
+
+首先，RI-PT2 相关设置在 `[ctrl.ri_pt2]` 区块中进行，输入样例如下：
+```toml
+[ctrl.ri_pt2]
+fp_mode = "FP64"
+```
+
+输入卡关键词包括：
+- `ss_factor`: 取值f64。采用 Spin-Component-Scaled 方式计算 MP2 型相关能（SCS-MP2）时, 用于控制自旋平行（same spin）分量贡献的缩放系数，适用于 `xc` 关键词为 MP2、SCS-MP2或双杂化泛函，以及 `post_correlation` 设置为 PT2 的情况。缺省为 None，即依 `xc` 设置的泛函进行设定。
+- `os_factor`: 取值f64。适用场景与 `ss_factor` 一致，采用 SCS-MP2 方法计算相关能贡献时，用于缩放自旋反平行（opposite spin）分量贡献的系数。缺省为 None，即依 `xc` 设置的泛函进行设定。
+- `fp_mode`: 取值 String (`"FP32"`, `"FP64"`)。设置 RI-PT2 计算中使用的浮点精度。缺省为 `"FP32"`。对于数值梯度计算，建议设置为 `"FP64"` 以获得更高的数值稳定性。
+- `mpi_mode`: 取值 usize。设置 RI-PT2 计算中使用的 MPI 模式。缺省为 0，即不使用 MPI。
+
 ## GW-BSE计算相关设置
 - `quasiparticle_methods`: 取值String，设置为gw即开启GW计算准粒子能量，设置为bse即在计算或读取准粒子能量后进一步开启BSE计算垂直激发能。缺省为空，即不触发任何GW-BSE计算
 - `gw_scheme`: 取值String，决定使用何种方式计算GW准粒子，无论进行GW还是BSE都需要设置此项。GW计算建议设置为extrapolated，即计算费米面附近一定范围内的准例子能量，其余轨道的准例子能量根据费米面附近的准粒子能量来外推。BSE计算还可以设置为parse from file，通过再设置`parse qp path`（取值String，读取纯数据文本文件的路径）即可读取预先已计算好的GW准例子能量用于BSE计算

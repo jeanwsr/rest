@@ -30,13 +30,13 @@ where
     // apply occ and vir orbital indices
     let idx_core = scf_data.mol.start_mo;
     let idx_lumo = scf_data.lumo[0];
-    let occ_coeff = match row_range {
+    let occ_coeff = match col_range {
         None => mo_coeff.i((.., idx_core..idx_lumo)),
-        Some(row_range) => mo_coeff.i((.., row_range)),
-    };
-    let vir_coeff = match col_range {
-        None => mo_coeff.i((.., idx_lumo..)),
         Some(col_range) => mo_coeff.i((.., col_range)),
+    };
+    let vir_coeff = match row_range {
+        None => mo_coeff.i((.., idx_lumo..)),
+        Some(row_range) => mo_coeff.i((.., row_range)),
     };
 
     let nocc = occ_coeff.shape()[1];
@@ -149,13 +149,13 @@ where
     };
     let idx_core = scf_data.mol.start_mo;
     let idx_lumo = scf_data.lumo;
-    let occ_coeff = match row_ranges {
+    let occ_coeff = match col_ranges {
         None => [mo_coeff.i((.., idx_core..idx_lumo[A], A)), mo_coeff.i((.., idx_core..idx_lumo[B], B))],
-        Some(row_range) => [mo_coeff.i((.., row_range[A].clone(), A)), mo_coeff.i((.., row_range[B].clone(), B))],
-    };
-    let vir_coeff = match col_ranges {
-        None => [mo_coeff.i((.., idx_lumo[A].., A)), mo_coeff.i((.., idx_lumo[B].., B))],
         Some(col_range) => [mo_coeff.i((.., col_range[A].clone(), A)), mo_coeff.i((.., col_range[B].clone(), B))],
+    };
+    let vir_coeff = match row_ranges {
+        None => [mo_coeff.i((.., idx_lumo[A].., A)), mo_coeff.i((.., idx_lumo[B].., B))],
+        Some(row_range) => [mo_coeff.i((.., row_range[A].clone(), A)), mo_coeff.i((.., row_range[B].clone(), B))],
     };
 
     let nocc = [occ_coeff[A].shape()[1], occ_coeff[B].shape()[1]];
