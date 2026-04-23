@@ -76,6 +76,7 @@ pub mod ri_rpa;
 pub mod ri_gw;
 pub mod ri_bse;
 pub mod solvent;
+pub mod ri_tddft;
 
 //extern crate rest;
 

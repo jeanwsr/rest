@@ -5,13 +5,16 @@ use std::ops::Range;
 use crate::utilities;
 use crate::scf_io::SCF;
 //use std::slice::Iter::<'_, f64>;
+use std::cmp;
 use std::fs::OpenOptions;
 use std::io::Write;
 use rayon::iter::ParallelBridge;
 use rayon::result;
 use reqwest::blocking::Response;
+use std::time::Instant;
 use std::sync::{Arc, Mutex};
 use rest_tensors::{RIFull};
+use rayon::prelude::ParallelSliceMut;
 use tensors::{matrix_blas_lapack::{_dinverse,_dsyev}, ri, MathMatrix, MatrixFull};
 //use rest::molecule_io::Molecule;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgees,_dgemm_full,_dgemv};
@@ -32,6 +35,9 @@ use rayon::iter::IntoParallelRefMutIterator;
 pub mod renormalized_singles;
 pub mod scgw;
 pub mod display;
+pub mod fourier_self_energy;
+pub mod drpa;
+pub mod qsgw;
 use crate::mpi_io::MPIOperator;
 
 #[cfg(target_os = "linux")]
@@ -58,7 +64,10 @@ pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperat
     let gw_scheme=qp_ctrl.gw_scheme.clone();
     let scgw=qp_ctrl.scgw.clone();
     let quasiparticle_energies:Vec<f64>=
-        if scgw=="g0w0"&&renormalized_singles==false{
+        if scgw=="qsgw" {
+            println!("You are doing QSGW (quasiparticle self-consistent GW) calculations");
+            qsgw::qsgw_loop(scf_data, vxc_nn, mpi_operator)
+        } else if scgw=="g0w0"&&renormalized_singles==false{
             println!("You are doing G0W0 calculations of entire energy spectrum");
             scgw::g0w0(scf_data,20,&vxc_nn,true)
         }else if scgw=="evgw"{
@@ -127,14 +136,23 @@ pub fn show_energy_levels(scf_data:&SCF){
 }
 
 pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
-    let v_matrix=v_matrix(&scf_data);
+    let mut ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
+    let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    if qp_ctrl.simplified_bse==true{
+        let ang_momentum=if qp_ctrl.simplified_bse==true{cmp::min(qp_ctrl.bse_max_ang_momentum,6)}else{6};
+        let elements=scf_data.mol.geom.elem.clone();
+        let relevant_indices=ri_bse::sbse::obtain_relevant_indices(scf_data,&elements,ang_momentum);
+        ri_ov=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_ov,&relevant_indices);
+        ri_mat=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_mat,&relevant_indices);
+    }
+    let v_matrix=v_matrix(&scf_data,&ri_mat);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let (start_mo,num_state_cutoff,occ_size,vir_size_cutoff,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let hatree=27.2113863;
     let spin_channel=scf_data.mol.ctrl.spin_channel;
     let mut quasiparticle_energies_g:Vec<f64>=Vec::new();
     let mut quasiparticle_energies_w:Vec<f64>=Vec::new();
-    let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
     let start:usize=0;
     let end:usize=6*occ_size;
     if scf_data.mol.ctrl.print_level>2{
@@ -143,11 +161,20 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     }
     let mut quasiparticle_energies_g=scf_data.gwqp.0.clone();
     let quasiparticle_energies_w=scf_data.gwqp.1.clone();
-    let ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
     //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,0);
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
-    let mut save_energies:Vec<f64>=vec![0.0;num_state_cutoff];
-    save_energies=(0..num_state_cutoff).map(|n|{
+
+    // 检查是否启用自能校正
+    let use_fourier = qp_ctrl.fourier_self_energy;
+    let use_hermite = qp_ctrl.hermite_self_energy;
+
+    if use_fourier && use_hermite {
+        panic!("Cannot enable both Fourier self-energy and Hermite self-energy simultaneously!");
+    }
+
+    // 第一轮：正常GW计算（不添加自能校正）
+    let mut save_energies_no_se:Vec<f64>=vec![0.0;num_state_cutoff];
+    save_energies_no_se=(0..num_state_cutoff).map(|n|{
         let consts=if cancel_dfa_xc==true{
             let mut exchange=0.0;
             for i in 0..homo+1{
@@ -155,9 +182,6 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
             }
             scf_data.eigenvalues[0][n]+exchange-vxc_nn[n]
         }else{quasiparticle_energies_g[n]};
-        //for first round, if non-RS, then of course qp==scf;
-        //if RS, testings showed that solving omega=scf-v_xc+sigma_x+sigma_c_RS would be better for fisrt round
-        //To confirm, the consts DO UPDATE over self-consistent GW
         let side=if n>=occ_size{1.0}else{-1.0};
         let printlevel=scf_data.mol.ctrl.print_level.clone();
         let mut real_qp=0.0;
@@ -166,34 +190,90 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
             quasiparticle_equation(omega,n,consts,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs)
         };
         (have_crossing,real_qp)=linear_interpolation_solver(qp_eq_func,scf_data.eigenvalues[0][n],side,21,0.1);
-        //real_qp=newton_solver(quasiparticle_equation,n,consts,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,scf_data.eigenvalues[0][n],0.00001,50,side,printlevel);
-        println!("for n={}, quasiparticle equation yields:qp energy={}",n,real_qp);
+        println!("for n={}, first round (no self-energy correction): qp energy={}",n,real_qp);
         real_qp
     }).collect::<Vec<f64>>().clone();
+
+    // 如果不需要自能校正，直接返回第一轮结果
+    if !use_fourier && !use_hermite {
+        quasiparticle_energies_g=save_energies_no_se.clone();
+        scf_data.gwqp.0=quasiparticle_energies_g.clone();
+        display::full_quasiparticles(&quasiparticle_energies_g,occ_size);
+        return quasiparticle_energies_g;
+    }
+
+    // 第二轮：添加自能校正
+    let mut save_energies:Vec<f64>=vec![0.0;num_state_cutoff];
+
+    if use_fourier {
+        let (powers, t, sin_coeff, cos_coeff) = fourier_self_energy::define_fourier_series(&qp_ctrl);
+        println!("Fourier Self Energy enabled for second round");
+
+        save_energies=(0..num_state_cutoff).map(|n|{
+            let origin = save_energies_no_se[n];
+            let consts=if cancel_dfa_xc==true{
+                let mut exchange=0.0;
+                for i in 0..homo+1{
+                    exchange-=v_matrix[[n,i]];
+                }
+                scf_data.eigenvalues[0][n]+exchange-vxc_nn[n]
+            }else{quasiparticle_energies_g[n]};
+            let side=if n>=occ_size{1.0}else{-1.0};
+            let printlevel=scf_data.mol.ctrl.print_level.clone();
+
+            let qp_eq_func_with_fse=|omega: f64|{
+                quasiparticle_equation(omega,n,consts,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs)
+                    + fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin)
+            };
+
+            let (have_crossing,mut real_qp)=linear_interpolation_solver(qp_eq_func_with_fse,save_energies_no_se[n],side,qp_ctrl.gw_search_grid,qp_ctrl.gw_span_energy);
+            println!("for n={}, second round (with FSE): qp energy={}",n,real_qp);
+            real_qp
+        }).collect::<Vec<f64>>().clone();
+    } else if use_hermite {
+        let hermite_coeff = fourier_self_energy::define_hermite_series(&qp_ctrl);
+        println!("Hermite Self Energy enabled for second round");
+
+        save_energies=(0..num_state_cutoff).map(|n|{
+            let origin = save_energies_no_se[n];
+            let consts=if cancel_dfa_xc==true{
+                let mut exchange=0.0;
+                for i in 0..homo+1{
+                    exchange-=v_matrix[[n,i]];
+                }
+                scf_data.eigenvalues[0][n]+exchange-vxc_nn[n]
+            }else{quasiparticle_energies_g[n]};
+            let side=if n>=occ_size{1.0}else{-1.0};
+            let printlevel=scf_data.mol.ctrl.print_level.clone();
+
+            let qp_eq_func_with_hse=|omega: f64|{
+                quasiparticle_equation(omega,n,consts,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs)
+                    + fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff)
+            };
+
+            let (have_crossing,mut real_qp)=linear_interpolation_solver(qp_eq_func_with_hse,save_energies_no_se[n],side,qp_ctrl.gw_search_grid,qp_ctrl.gw_span_energy);
+            println!("for n={}, second round (with HSE): qp energy={}",n,real_qp);
+            real_qp
+        }).collect::<Vec<f64>>().clone();
+    }
+
     quasiparticle_energies_g=save_energies.clone();
     scf_data.gwqp.0=quasiparticle_energies_g.clone();
     display::full_quasiparticles(&quasiparticle_energies_g,occ_size);
     quasiparticle_energies_g
 } 
-
-
 pub fn vxc_ao2mo(scf_data:&SCF)->Vec<f64>{
-    let eigenvecs=scf_data.eigenvectors.clone();
+    let eigenvecs=scf_data.eigenvectors[0].clone();
     let vxc_ao=scf_data.generate_vxc_rayon(1.0).2[0].to_matrixfull().unwrap().clone();
     let dimensions=vxc_ao.size[0];
     let mut vxc_nn=vec![0.0;dimensions];
     let mut element=0.0;
-    for i in (0..dimensions){
-        //println!("now computing:{}-{}",i,i);
-        element=0.0;
-        for mu in 0..dimensions{
-            for nu in 0..dimensions{
-                element+=(eigenvecs[0][[mu,i]]*eigenvecs[0][[nu,i]]*vxc_ao[[mu,nu]]);
-            }
-        }
-        vxc_nn[i]=element;
-    }
-    vxc_nn
+    eigenvecs.iter_columns_full().map(|vec|{
+        let ev=vec.to_vec();
+        let mut fv=vec![0.0;dimensions];
+        _dgemv(&vxc_ao,&ev,&mut fv,'N', 1.0, 0.0, 1, 1);
+        ev.iter().zip(fv.iter()).fold(0.0,|acc,(ev_i,fv_i)|acc+(ev_i*fv_i))
+    }).collect()
     //No need to worry about cutoff
 }
 pub fn vxc_ao2mo_rayon(scf_data:&SCF)->MatrixFull<f64>{
@@ -223,9 +303,97 @@ pub fn v_mn_matrix_element(scf_data:&SCF,m:usize,n:usize,ri_mat:&MatrixFull<f64>
     }
     v_mn_matrix_element
 }
-pub fn v_matrix(scf_data:&SCF)->MatrixFull<f64>{
+pub fn v_matrix(
+    scf_data: &SCF,
+    ri_mat: &MatrixFull<f64>
+) -> MatrixFull<f64> {
+    let (start_mo, num_state, occ_size, vir_size, homo, lumo) = 
+        get_occupation_parameters(scf_data, 'Y');
+    
+    let mut v_matrix = MatrixFull::new([num_state, num_state], 0.0);
+    let n_rows = ri_mat.size[0];
+    
+    // 预计算列索引，减少重复计算
+    let mut col_indices = Vec::with_capacity(num_state * num_state);
+    for i in 0..num_state {
+        for j in 0..num_state {
+            col_indices.push(i * num_state + j);
+        }
+    }
+    // 并行化外层循环
+    v_matrix.data.par_chunks_mut(num_state)
+        .enumerate()
+        .for_each(|(i, row)| {
+            for j in 0..num_state {
+                let col_index = col_indices[i * num_state + j];
+                if col_index < ri_mat.size[1] {
+                    let mut sum = 0.0;
+                    let start = col_index * n_rows;
+                    
+                    // 使用迭代器和fold
+                    sum = ri_mat.data[start..start + n_rows]
+                        .iter()
+                        .fold(0.0, |acc, &x| acc + x * x);
+                    
+                    row[j] = sum;
+                }
+            }
+        });
+    
+    v_matrix
+}
+pub fn v_matrix_symmetric_optimized(
+    scf_data: &SCF,
+    ri_mat: &MatrixFull<f64>
+) -> MatrixFull<f64> {
+    let (_, num_state, _, _, _, _) = get_occupation_parameters(scf_data, 'Y');
+    let n_rows = ri_mat.size[0];
+    
+    // 创建结果矩阵
+    let mut v_matrix = MatrixFull::new([num_state, num_state], 0.0);
+    
+    // 预先计算所有列的点积
+    let column_sums: Vec<f64> = (0..num_state * num_state)
+        .into_par_iter()
+        .map(|col_idx| {
+            let start = col_idx * n_rows;
+            let end = start + n_rows;
+            ri_mat.data[start..end]
+                .iter()
+                .fold(0.0, |acc, &x| acc + x * x)
+        })
+        .collect();
+    
+    // 将列和重塑为矩阵形式以便并行访问
+    let column_sums_matrix: Vec<Vec<f64>> = column_sums
+        .chunks(num_state)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    
+    // 使用行并行填充上三角
+    v_matrix.data.par_chunks_mut(num_state)
+        .enumerate()
+        .for_each(|(i, row)| {
+            // 获取当前行的列和
+            let row_sums = &column_sums_matrix[i];
+            
+            // 填充当前行的上三角部分
+            for j in i..num_state {
+                row[j] = row_sums[j];
+            }
+        });
+    
+    // 串行填充下三角（对称性）
+    for i in 0..num_state {
+        for j in 0..i {
+            v_matrix[[i, j]] = v_matrix[[j, i]];
+        }
+    }
+    
+    v_matrix
+}
+pub fn v_matrix_old(scf_data:&SCF,ri_mat:&MatrixFull<f64>)->MatrixFull<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
-    let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
     let mut v_matrix:MatrixFull<f64>=MatrixFull::new([num_state,num_state],0.0);
     for i in 0..num_state{
         for j in 0..num_state{
@@ -258,14 +426,46 @@ pub fn generate_w_c(scf_data:&SCF,ri_ov:&MatrixFull<f64>,ri_full:&MatrixFull<f64
     }
     let (sender,receiver) = channel();
     rayon::prelude::IndexedParallelIterator::zip(omega_1.par_iter(), weight.par_iter()).for_each_with(sender, |s, (omega_1, weight)| {
+        let start=Instant::now();
         let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,*omega_1,'I');
         let inverse_dielectric=inverse_dielectric_matrix(&response,'I');
         let w_c=w_c_matrix(&inverse_dielectric,num_state,ri_full);
+        println!("Evaluation of W_c for omega={} has finished. This step took {:?}",omega_1,start.elapsed());
         s.send((*omega_1,*weight,w_c)).expect("unsuccessful collection of w_c")
     });
     let w_c_at_freqs:Vec<(f64,f64,MatrixFull<f64>)>=receiver.into_iter().collect();
     omp_get_num_threads_wrapper();
     w_c_at_freqs
+}
+pub fn generate_w_c_serial(scf_data:&SCF,ri_ov:&MatrixFull<f64>,ri_full:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,num_state:usize,occ_size:usize,vir_size:usize,num_freq:usize)->Vec<(f64,f64,MatrixFull<f64>)>{
+    omp_get_num_threads_wrapper();
+    let freq_grid_type = scf_data.mol.ctrl.freq_grid_type;
+    let max_freq = scf_data.mol.ctrl.freq_cut_off;
+    let mut sp = format!("The frequency integration is tabulated by {:3} grids using", num_freq);
+    let (mut omega_1,weight) = if freq_grid_type==0 {
+        sp = format!("{} the modified Gauss-Legendre grids",sp);
+        ri_rpa::trans_gauss_legendre_grids(1.0, num_freq)
+    } else if freq_grid_type==1 {
+        sp = format!("{} the standard Gauss-Legendre grids",sp);
+        ri_rpa::gauss_legendre_grids([0.0,max_freq], num_freq)
+    } else if freq_grid_type== 2 {
+        sp = format!("{} the logarithmic grids",sp);
+        ri_rpa::logarithmic_grid([0.0,max_freq], num_freq)
+    } else {
+        sp = format!("{} the modified Gauss-Legendre grids",sp);
+        ri_rpa::trans_gauss_legendre_grids(1.0, num_freq)
+    };
+    if scf_data.mol.ctrl.print_level>1 {
+        println!("{}", sp);
+    }
+    omega_1.iter().zip(weight.iter()).map(|(omega_1, weight)| {
+        let start=Instant::now();
+        let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,*omega_1,'I');
+        let inverse_dielectric=inverse_dielectric_matrix(&response,'I');
+        let w_c=w_c_matrix(&inverse_dielectric,num_state,ri_full);
+        println!("Evaluation of W_c for omega={} has finished. This step took {:?}",omega_1,start.elapsed());
+        (*omega_1,*weight,w_c)
+    }).collect()
 }
 pub fn calculate_imag(w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,num_state:usize,n:usize,omega:f64,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>)->f64{
     omp_get_num_threads_wrapper();
@@ -314,6 +514,32 @@ pub fn display_and_save_quasiparticles(scf_data:&mut SCF,quasiparticle_energies_
         println!("quasiparticles:{:#?}",quasiparticle_energies_g[i]);
         //scf_data.eigenvalues[0][i]=quasiparticle_energies[i];
     }
+}
+pub fn response_matrix_legacy(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,omega:f64,part:char)->MatrixFull<f64>{
+    let mut diag=vec![0.0;occ_size*vir_size];
+    let num_auxbas=ri_ov.size[1];
+    let mut response=MatrixFull::new([num_auxbas,0],0.0);
+    (0..occ_size*vir_size).for_each(|n|{
+        let i=n%occ_size;
+        let a=occ_size+n/occ_size;
+        let energy_gap=quasiparticle_energies_w[a]-quasiparticle_energies_w[i];
+        diag[n]=if part=='I'{-2.0*energy_gap/(energy_gap.powf(2.0)+omega.powf(2.0))}
+            else{-2.0*energy_gap/(energy_gap.powf(2.0)-omega.powf(2.0))};
+    });
+    let mut chi_as_vecs:Vec<(usize,Vec<f64>)>=ri_ov.iter_columns_full().enumerate().par_bridge().map(|(p,ri_p)|{
+        let mut work_vec=vec![0.0;occ_size*vir_size];
+        (0..occ_size*vir_size).for_each(|ia|work_vec[ia]=ri_p[ia]*diag[ia]);
+        let mut chi_p=vec![0.0;num_auxbas];
+        _dgemv(ri_ov,&work_vec,&mut chi_p,'T', 1.0, 0.0, 1, 1);
+        (p,chi_p.clone())
+    }).collect();
+    chi_as_vecs.sort_by_key(|(i, _)| *i);
+    for chi_p in chi_as_vecs {
+        response.push_column(&chi_p.1);
+    }
+    response.self_multiple(2.0);
+    //println!("a response has been collected, its size is:{},{}",response.size[0],response.size[1]);
+    response
 }
 pub fn response_matrix(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,omega:f64,part:char)->MatrixFull<f64>{
     let num_auxbas=ri_ov.size[0];
@@ -448,6 +674,17 @@ pub fn newton_solver<F>(mut f:F,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_ful
     }
     x_curr
 }
+pub fn single_newton_step<F>(mut f:F,starting_point:f64,side:f64,span_energy:f64)->f64 where F:Fn(f64)->f64{
+    let h=0.000001;
+    let delta=0.02;
+    let mut x_curr=starting_point+side*delta;
+    let y_curr=f(x_curr);
+    let y_minus=f(x_curr-h);
+    let y_plus=f(x_curr+h);
+    let derivative=(y_plus-y_minus)/(2.0*h);
+    let shift=-y_curr/derivative;
+    x_curr+shift
+}
 pub fn linear_interpolation_solver<F>(mut f:F,starting_point:f64,side:f64,grid_freqs:usize,span_energy:f64)->(bool,f64) where F:Fn(f64)->f64{
     let h=0.000001;
     let delta=0.02;
@@ -499,7 +736,7 @@ pub fn linear_interpolation_solver<F>(mut f:F,starting_point:f64,side:f64,grid_f
     (have_crossing,answer)
 }
 pub fn quasiparticle_equation(omega:f64,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_full:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,num_state:usize,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>)->f64{
-    let contour=contour_rayon(omega,n,quasiparticle_energies_g,quasiparticle_energies_g,occ_size,vir_size,num_state,ri_ov,ri_full);
+    let contour=contour_rayon(omega,n,quasiparticle_energies_g,quasiparticle_energies_w,occ_size,vir_size,num_state,ri_ov,ri_full);
     let imag=calculate_imag(&w_c_at_freqs,num_state,n,omega,quasiparticle_energies_g,quasiparticle_energies_w);
     //println!("quasiparticle equation residue now:={}",consts+contour-imag-omega);
     consts+contour-imag-omega
@@ -512,15 +749,24 @@ pub fn spectrum_test(scf_data:&SCF,num_freq:usize){
     for n in 0..num_state{
         quasiparticle_energies.push(eigenenergies[n]);
     }
-    let ri_full:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
-    let ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
-    let start_freq:f64=-0.8;
-    let end_freq:f64=0.8;
-    let step:f64=0.8/1000.0;
+    let mut ri_full:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
+    let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    if qp_ctrl.simplified_bse==true{
+        let ang_momentum=if qp_ctrl.simplified_bse==true{cmp::min(qp_ctrl.bse_max_ang_momentum,6)}else{6};
+        let elements=scf_data.mol.geom.elem.clone();
+        let relevant_indices=ri_bse::sbse::obtain_relevant_indices(scf_data,&elements,ang_momentum);
+        ri_ov=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_ov,&relevant_indices);
+        ri_full=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_full,&relevant_indices);
+    }
+    let start_freq:f64=qp_ctrl.spectrum_test_start;
+    let end_freq:f64=qp_ctrl.spectrum_test_end;
+    let step:f64=qp_ctrl.spectrum_test_step;
+    let steps:usize=((end_freq-start_freq)/step).ceil() as usize;
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_full,&quasiparticle_energies,&quasiparticle_energies,num_state,occ_size,vir_size,num_freq);
-    for n in (6..15){
+    for n in (homo..homo+2){
         println!("Now is the spectrum of orbital #{}",n);
-        (0..2000).into_par_iter().for_each(|w|{
+        (0..steps+1).into_par_iter().for_each(|w|{
             let freq=start_freq+(w as f64)*step;
             let contour=contour_rayon(freq,n,&quasiparticle_energies,&quasiparticle_energies,occ_size,vir_size,num_state,&ri_ov,&ri_full);
             let imag=calculate_imag(&w_c_at_freqs,num_state,n,freq,&quasiparticle_energies,&quasiparticle_energies);
@@ -536,7 +782,8 @@ pub fn x_alpha_gw(scf_data:&mut SCF)->Vec<f64>{
     let xc_name = scf_data.mol.ctrl.xc.to_lowercase();
     let exchange_under_dfa=get_pure_x_or_c_of_xc(scf_data,&xc_name,'X');
     let x_alpha=qp_ctrl.x_alpha;
-    let v_matrix=v_matrix(&scf_data);
+    let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
+    let v_matrix=v_matrix(&scf_data,&ri_mat);
     ks_energies.into_iter().enumerate().map(|(n,e_n)|{
         let mut exchange=0.0;
         for i in 0..homo+1{
@@ -548,7 +795,8 @@ pub fn x_alpha_gw(scf_data:&mut SCF)->Vec<f64>{
 pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let delta=qp_ctrl.gw_linearize_shift;
-    let v_matrix=v_matrix(&scf_data);
+    let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
+    let v_matrix=v_matrix(&scf_data,&ri_mat);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let mut num_state_qp_range=num_state;
     if qp_ctrl.scgw=="g0w0"{
@@ -559,18 +807,27 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
     let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
     let mut quasiparticle_energies_g:Vec<f64>=scf_data.gwqp.0.clone();
     let mut quasiparticle_energies_w:Vec<f64>=scf_data.gwqp.1.clone();
-    let ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
     //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,0);
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
-    let mut save_energies:Vec<f64>=vec![0.0;num_state];
     let h=qp_ctrl.gw_linearize_derivative_h;
-    save_energies=(0..num_state_qp_range).map(|n|{
+
+    // 检查是否启用自能校正
+    let use_fourier = qp_ctrl.fourier_self_energy;
+    let use_hermite = qp_ctrl.hermite_self_energy;
+
+    if use_fourier && use_hermite {
+        panic!("Cannot enable both Fourier self-energy and Hermite self-energy simultaneously!");
+    }
+
+    // 第一轮：正常线性化GW计算（不添加自能校正）
+    let mut save_energies_no_se:Vec<f64>=vec![0.0;num_state];
+    save_energies_no_se=(0..num_state_qp_range).map(|n|{
         let side=if n>=occ_size{1.0}else{-1.0};
         let omega_shifted=scf_data.eigenvalues[0][n]-delta*side;
         let contour=contour_rayon(omega_shifted,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_mat);
         let imag_n=calculate_imag(&w_c_at_freqs,num_state,n,omega_shifted,&quasiparticle_energies_g,&quasiparticle_energies_w);
-        let mut exchange=0.0;
-        
+
         let contour_plus_h=contour_rayon(omega_shifted+h,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_mat);
         let contour_minus_h=contour_rayon(omega_shifted-h,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_mat);
         let imag_plus_h=calculate_imag(&w_c_at_freqs,num_state,n,omega_shifted+h,&quasiparticle_energies_g,&quasiparticle_energies_w);
@@ -588,15 +845,102 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
             for i in 0..homo+1{
                 exchange-=v_matrix[[n,i]];
             }
-            //println!("for n={},exchange={}",n,exchange);
             omega_shifted+(spectral_weight*(contour-imag_n+exchange-vxc_nn[n]))
         }else{omega_shifted+(spectral_weight*(contour-imag_n))};
-        println!("for n={}, linearized gw yields:qp energy={}",n,real_qp);
+        println!("for n={}, first round (no self-energy correction): linearized gw yields qp energy={}",n,real_qp);
         real_qp
     }).collect::<Vec<f64>>().clone();
+
+    // 如果不需要自能校正，直接返回第一轮结果
+    if !use_fourier && !use_hermite {
+        quasiparticle_energies_g=save_energies_no_se.clone();
+        display::full_quasiparticles(&quasiparticle_energies_g,occ_size);
+        return quasiparticle_energies_g;
+    }
+
+    // 第二轮：添加自能校正
+    let mut save_energies:Vec<f64>=vec![0.0;num_state];
+
+    if use_fourier {
+        let (powers, t, sin_coeff, cos_coeff) = fourier_self_energy::define_fourier_series(&qp_ctrl);
+        println!("Fourier Self Energy enabled for second round (linearized GW)");
+
+        save_energies=(0..num_state_qp_range).map(|n|{
+            let origin = save_energies_no_se[n];
+            let side=if n>=occ_size{1.0}else{-1.0};
+            let omega_shifted=scf_data.eigenvalues[0][n]-delta*side;
+
+            // 计算带FSE的自能及其导数
+            let sigma_with_fse = |omega: f64| -> f64 {
+                let contour=contour_rayon(omega,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_mat);
+                let imag=calculate_imag(&w_c_at_freqs,num_state,n,omega,&quasiparticle_energies_g,&quasiparticle_energies_w);
+                let fse=fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin);
+                contour - imag + fse
+            };
+
+            let self_energy_at_omega=sigma_with_fse(omega_shifted);
+            let self_energy_plus_h=sigma_with_fse(omega_shifted+h);
+            let self_energy_minus_h=sigma_with_fse(omega_shifted-h);
+            let derivative=(self_energy_plus_h-self_energy_minus_h)/(2.0*h);
+
+            if scf_data.mol.ctrl.print_level>1{
+                println!("derivative at n={} (with FSE): {}",n,derivative);
+            }
+            let spectral_weight=(1.0-derivative).powf(-1.0);
+            println!("spectral weight at n={} (with FSE): {}",n,spectral_weight);
+
+            let real_qp=if cancel_dfa_xc==true{
+                let mut exchange=0.0;
+                for i in 0..homo+1{
+                    exchange-=v_matrix[[n,i]];
+                }
+                omega_shifted+(spectral_weight*(self_energy_at_omega+exchange-vxc_nn[n]))
+            }else{omega_shifted+(spectral_weight*self_energy_at_omega)};
+            println!("for n={}, second round (with FSE): linearized gw yields qp energy={}",n,real_qp);
+            real_qp
+        }).collect::<Vec<f64>>().clone();
+    } else if use_hermite {
+        let hermite_coeff = fourier_self_energy::define_hermite_series(&qp_ctrl);
+        println!("Hermite Self Energy enabled for second round (linearized GW)");
+
+        save_energies=(0..num_state_qp_range).map(|n|{
+            let origin = save_energies_no_se[n];
+            let side=if n>=occ_size{1.0}else{-1.0};
+            let omega_shifted=scf_data.eigenvalues[0][n]-delta*side;
+
+            // 计算带HSE的自能及其导数
+            let sigma_with_hse = |omega: f64| -> f64 {
+                let contour=contour_rayon(omega,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_mat);
+                let imag=calculate_imag(&w_c_at_freqs,num_state,n,omega,&quasiparticle_energies_g,&quasiparticle_energies_w);
+                let hse=fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff);
+                contour - imag + hse
+            };
+
+            let self_energy_at_omega=sigma_with_hse(omega_shifted);
+            let self_energy_plus_h=sigma_with_hse(omega_shifted+h);
+            let self_energy_minus_h=sigma_with_hse(omega_shifted-h);
+            let derivative=(self_energy_plus_h-self_energy_minus_h)/(2.0*h);
+
+            if scf_data.mol.ctrl.print_level>1{
+                println!("derivative at n={} (with HSE): {}",n,derivative);
+            }
+            let spectral_weight=(1.0-derivative).powf(-1.0);
+            println!("spectral weight at n={} (with HSE): {}",n,spectral_weight);
+
+            let real_qp=if cancel_dfa_xc==true{
+                let mut exchange=0.0;
+                for i in 0..homo+1{
+                    exchange-=v_matrix[[n,i]];
+                }
+                omega_shifted+(spectral_weight*(self_energy_at_omega+exchange-vxc_nn[n]))
+            }else{omega_shifted+(spectral_weight*self_energy_at_omega)};
+            println!("for n={}, second round (with HSE): linearized gw yields qp energy={}",n,real_qp);
+            real_qp
+        }).collect::<Vec<f64>>().clone();
+    }
+
     quasiparticle_energies_g=save_energies.clone();
     display::full_quasiparticles(&quasiparticle_energies_g,occ_size);
-    //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,1);
     quasiparticle_energies_g
 }
 pub fn get_pure_x_or_c_of_xc(scf_data:&mut SCF,name:&str,choice:char)->Vec<f64>{
@@ -654,7 +998,8 @@ pub fn get_homo_vx_or_vc(scf_data:&mut SCF,name:&str,choice:char)->f64{
 }
 pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperator>){
     let printlevel=scf_data.mol.ctrl.print_level.clone();
-    let v_matrix=v_matrix(&scf_data);
+    let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
+    let v_matrix=v_matrix(&scf_data,&ri_mat);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let mut rs_particles:Vec<f64>=Vec::new();
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
@@ -672,7 +1017,6 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     let eigenenergies:Vec<f64>=scf_data.eigenvalues[0].clone();
     let mut quasiparticle_energies_g:Vec<f64>=Vec::new();
     let mut quasiparticle_energies_w:Vec<f64>=Vec::new();
-    let ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
     if scf_data.mol.ctrl.print_level>2{
         println!("ri_mat full:");
         ri_mat.formated_output(1000,"full");
@@ -693,7 +1037,7 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
             quasiparticle_energies_w.push(eigenenergies[n]);
         }
     }
-    let ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&ri_mat,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
     let n=homo;
     let mut exchange=0.0;
@@ -729,21 +1073,13 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     }
     println!("The QP energy of LUMO obtained by GWA is {}",lumo_qp);
 }
-pub fn get_homo_gw_exchange(scf_data:&SCF)->f64{
-    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
-    let v_matrix=v_matrix(&scf_data);
-    let mut exchange=0.0;
-    let n=homo;
-    for i in 0..homo+1{
-        exchange-=v_matrix[[n,i]];
-    }
-    exchange
-}
 pub fn obtain_vx_vc_terms(scf_data:&mut SCF){
     println!("starts obtaining HOMO vx and vc terms from various DFAs");
+    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
+    let mut file = OpenOptions::new().append(true).create(true).open("ks_homo.txt");
+    writeln!(file.expect("write failure"), "{}", scf_data.eigenvalues[0][occ_size-1]);
     let mut file = OpenOptions::new().append(true).create(true).open("lda_x_slater.txt");
-    let value=get_homo_vx_or_vc(scf_data,"lda_x_slater",'X');
-    writeln!(file.expect("write failure"), "{}", value);
+    writeln!(file.expect("write failure"), "{}", get_homo_vx_or_vc(scf_data,"lda_x_slater",'X'));
     let mut file = OpenOptions::new().append(true).create(true).open("gga_x_b88.txt");
     writeln!(file.expect("write failure"), "{}", get_homo_vx_or_vc(scf_data,"gga_x_b88",'X'));
     let mut file = OpenOptions::new().append(true).create(true).open("gga_x_pbe.txt");

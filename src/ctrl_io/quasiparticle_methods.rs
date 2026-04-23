@@ -37,16 +37,45 @@ pub struct QuasiParticle {
     pub save_qp_path:String,
     pub save_first_excitation:bool,
     pub save_first_excitation_path:String,
+    pub fourier_self_energy:bool,
+    pub fse_sin_coeff_path:String,
+    pub fse_cos_coeff_path:String,
+    pub hermite_self_energy:bool,
+    pub hermite_coeff_path:String,
     pub parse_qp_path:String,
     pub bse_qp_polarization:bool,
     pub threshold:f64,
+    pub external_field_freq:f64,
+    pub lifetime_gamma:f64,
     pub gw_or_bse:String,
     pub gw_span_energy:f64,
     pub gw_search_grid:usize,
     pub bse_max_ang_momentum:usize,
     pub gw_rootfinder:String,
     pub simplified_bse:bool,
-    pub pysoc:bool
+    pub self_energy_spectrum_test:bool,
+    pub spectrum_test_start:f64,
+    pub spectrum_test_end:f64,
+    pub spectrum_test_step:f64,
+    pub pysoc:bool,
+    pub gw_imag_rayon:bool,
+    pub bse_auxbas_path: Option<String>,
+    // QSGW-specific controls
+    pub qsgw_max_iter: usize,
+    pub qsgw_energy_tol: f64,
+    pub qsgw_mix_param: f64,
+    pub qsgw_eta: f64,
+    // damped BSE grid sampling parameters
+    pub damped_bse_x_start: f64,
+    pub damped_bse_x_end: f64,
+    pub damped_bse_x_points: usize,
+    pub damped_bse_y_start: f64,
+    pub damped_bse_y_end: f64,
+    pub damped_bse_y_points: usize,
+    pub damped_bse_z_start: f64,
+    pub damped_bse_z_end: f64,
+    pub damped_bse_z_points: usize,
+    pub damped_bse_grids: Vec<[f64; 3]>
 }
 
 impl Default for QuasiParticle {
@@ -83,6 +112,11 @@ impl Default for QuasiParticle {
             save_first_excitation:false,
             save_first_excitation_path:String::from("first_excitation_save.txt"),
             parse_qp_path:String::from("./qp_energies"),
+            fourier_self_energy:false,
+            fse_sin_coeff_path:String::from("./fse_sin_coeff.txt"),
+            fse_cos_coeff_path:String::from("./fse_cos_coeff.txt"),
+            hermite_self_energy:false,
+            hermite_coeff_path:String::from("./hermite_coeff.txt"),
             bse_qp_polarization:false,
             threshold:0.1,
             gw_or_bse:String::new(),
@@ -92,7 +126,30 @@ impl Default for QuasiParticle {
             gw_rootfinder:"newton".to_string(),
             simplified_bse:false,
             bse_max_ang_momentum:10,
-            pysoc:false
+            self_energy_spectrum_test:false,
+            spectrum_test_start:-1.0,
+            spectrum_test_end:0.0,
+            spectrum_test_step:0.01,
+            pysoc:false,
+            external_field_freq:0.5,
+            lifetime_gamma:0.001,
+            gw_imag_rayon:true,
+            bse_auxbas_path: None,
+            qsgw_max_iter: 50,
+            qsgw_energy_tol: 1e-5,
+            qsgw_mix_param: 0.5,
+            qsgw_eta: 0.001,
+            // damped BSE grid sampling parameters (default: 2 points per dimension)
+            damped_bse_x_start: 0.0,
+            damped_bse_x_end: 1.0,
+            damped_bse_x_points: 2,
+            damped_bse_y_start: 0.0,
+            damped_bse_y_end: 1.0,
+            damped_bse_y_points: 2,
+            damped_bse_z_start: 0.0,
+            damped_bse_z_end: 1.0,
+            damped_bse_z_points: 2,
+            damped_bse_grids: Vec::new()
         }
     }
 }
@@ -132,16 +189,44 @@ impl QuasiParticle {
         table.insert("save_qp_path".to_string(), toml::Value::String(self.save_qp_path.clone()));
         table.insert("save_first_excitation".to_string(), toml::Value::Boolean(self.save_first_excitation));
         table.insert("save_first_excitation_path".to_string(), toml::Value::String(self.save_first_excitation_path.clone()));
+        table.insert("fse_sin_coeff_path".to_string(), toml::Value::String(self.fse_sin_coeff_path.clone()));
+        table.insert("fse_cos_coeff_path".to_string(), toml::Value::String(self.fse_cos_coeff_path.clone()));
+        table.insert("hermite_self_energy".to_string(), toml::Value::Boolean(self.hermite_self_energy));
+        table.insert("hermite_coeff_path".to_string(), toml::Value::String(self.hermite_coeff_path.clone()));
         table.insert("parse_qp_path".to_string(), toml::Value::String(self.parse_qp_path.clone()));
         table.insert("bse_qp_polarization".to_string(), toml::Value::Boolean(self.bse_qp_polarization));
         table.insert("threshold".to_string(), toml::Value::Float(self.threshold));
         table.insert("gw_span_energy".to_string(), toml::Value::Float(self.gw_span_energy));
+        table.insert("external_field_freq".to_string(), toml::Value::Float(self.external_field_freq));
+        table.insert("lifetime_gamma".to_string(), toml::Value::Float(self.lifetime_gamma));
         table.insert("gw_or_bse".to_string(), toml::Value::String(self.gw_or_bse.clone()));
         table.insert("gw_search_grid".to_string(), toml::Value::Integer(self.gw_search_grid as i64));
         table.insert("simplified_bse".to_string(), toml::Value::Boolean(self.simplified_bse));
         table.insert("pysoc".to_string(), toml::Value::Boolean(self.pysoc));
+        table.insert("gw_imag_rayon".to_string(), toml::Value::Boolean(self.gw_imag_rayon));
+        table.insert("fourier_self_energy".to_string(), toml::Value::Boolean(self.fourier_self_energy));
         table.insert("bse_exchange_rescaling".to_string(), toml::Value::Float(self.bse_exchange_rescaling));
+        table.insert("self_energy_spectrum_test".to_string(), toml::Value::Boolean(self.self_energy_spectrum_test));
+        table.insert("spectrum_test_start".to_string(), toml::Value::Float(self.spectrum_test_start));
+        table.insert("spectrum_test_end".to_string(), toml::Value::Float(self.spectrum_test_end));
+        table.insert("spectrum_test_step".to_string(), toml::Value::Float(self.spectrum_test_step));
         table.insert("bse_max_ang_momentum".to_string(), toml::Value::Integer(self.bse_max_ang_momentum as i64));
+        if let Some(path) = &self.bse_auxbas_path {
+            table.insert("bse_auxbas_path".to_string(), toml::Value::String(path.clone()));
+        }
+        table.insert("qsgw_max_iter".to_string(), toml::Value::Integer(self.qsgw_max_iter as i64));
+        table.insert("qsgw_energy_tol".to_string(), toml::Value::Float(self.qsgw_energy_tol));
+        table.insert("qsgw_mix_param".to_string(), toml::Value::Float(self.qsgw_mix_param));
+        table.insert("qsgw_eta".to_string(), toml::Value::Float(self.qsgw_eta));
+        table.insert("damped_bse_x_start".to_string(), toml::Value::Float(self.damped_bse_x_start));
+        table.insert("damped_bse_x_end".to_string(), toml::Value::Float(self.damped_bse_x_end));
+        table.insert("damped_bse_x_points".to_string(), toml::Value::Integer(self.damped_bse_x_points as i64));
+        table.insert("damped_bse_y_start".to_string(), toml::Value::Float(self.damped_bse_y_start));
+        table.insert("damped_bse_y_end".to_string(), toml::Value::Float(self.damped_bse_y_end));
+        table.insert("damped_bse_y_points".to_string(), toml::Value::Integer(self.damped_bse_y_points as i64));
+        table.insert("damped_bse_z_start".to_string(), toml::Value::Float(self.damped_bse_z_start));
+        table.insert("damped_bse_z_end".to_string(), toml::Value::Float(self.damped_bse_z_end));
+        table.insert("damped_bse_z_points".to_string(), toml::Value::Integer(self.damped_bse_z_points as i64));
         toml::Value::Table(table)
     }
 }
@@ -174,17 +259,40 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };
+            tmp_input.self_energy_spectrum_test= match tmp_ctrl.get("self_energy_spectrum_test").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.spectrum_test_start = match tmp_ctrl.get("spectrum_test_start").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.5_f64)},
+                other => {-1.0},
+            };
+            tmp_input.spectrum_test_end = match tmp_ctrl.get("spectrum_test_end").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.5_f64)},
+                other => {0.0},
+            };
+            tmp_input.spectrum_test_step = match tmp_ctrl.get("spectrum_test_step").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.5_f64)},
+                other => {0.01},
+            };
             tmp_input.bse_spin = match tmp_ctrl.get("bse_spin").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::from("none"),
             };
             tmp_input.bse_cutoff_energy = match tmp_ctrl.get("bse_cutoff_energy").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.5_f64)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1000000.0_f64)},
                 other => {1000000.0},
             };
             tmp_input.bse_exchange_rescaling = match tmp_ctrl.get("bse_exchange_rescaling").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0_f64)},
                 other => {1.0},
+            };
+            tmp_input.external_field_freq = match tmp_ctrl.get("external_field_freq").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.5_f64)},
+                other => {0.5},
+            };tmp_input.lifetime_gamma = match tmp_ctrl.get("lifetime_gamma").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.001_f64)},
+                other => {0.001},
             };
             tmp_input.davidson_converge_threshold = match tmp_ctrl.get("davidson_converge_threshold").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-6_f64)},
@@ -222,6 +330,14 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };
+            tmp_input.fourier_self_energy = match tmp_ctrl.get("fourier_self_energy").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.hermite_self_energy = match tmp_ctrl.get("hermite_self_energy").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
             tmp_input.obtain_vx_vc_terms = match tmp_ctrl.get("obtain_vx_vc_terms").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
@@ -229,6 +345,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.pysoc = match tmp_ctrl.get("pysoc").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
+            };
+            tmp_input.gw_imag_rayon = match tmp_ctrl.get("gw_imag_rayon").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {true},
             };
             tmp_input.obtain_pure_exchange = match tmp_ctrl.get("obtain_pure_exchange").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
@@ -302,6 +422,18 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::from("single_qp_save.txt"),
             };
+            tmp_input.fse_sin_coeff_path = match tmp_ctrl.get("fse_sin_coeff_path").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("fse_sin_coeff.txt"),
+            };
+            tmp_input.fse_cos_coeff_path = match tmp_ctrl.get("fse_cos_coeff_path").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("fse_cos_coeff.txt"),
+            };
+            tmp_input.hermite_coeff_path = match tmp_ctrl.get("hermite_coeff_path").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("hermite_coeff.txt"),
+            };
             tmp_input.gw_rootfinder = match tmp_ctrl.get("gw_rootfinder").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::from("newton".to_string()),
@@ -326,6 +458,91 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };
+            tmp_input.bse_auxbas_path = match tmp_ctrl.get("bse_auxbas_path").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => Some(s.clone()),
+                _ => None,
+            };
+            tmp_input.qsgw_max_iter = match tmp_ctrl.get("qsgw_max_iter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(50) as usize,
+                _ => 50,
+            };
+            tmp_input.qsgw_energy_tol = match tmp_ctrl.get("qsgw_energy_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e-5),
+                _ => 1e-5,
+            };
+            tmp_input.qsgw_mix_param = match tmp_ctrl.get("qsgw_mix_param").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.5),
+                _ => 0.5,
+            };
+            tmp_input.qsgw_eta = match tmp_ctrl.get("qsgw_eta").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),
+                _ => 0.001,
+            };
+            // Parse damped BSE grid sampling parameters
+            tmp_input.damped_bse_x_start = match tmp_ctrl.get("damped_bse_x_start").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.damped_bse_x_end = match tmp_ctrl.get("damped_bse_x_end").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0),
+                _ => 1.0,
+            };
+            tmp_input.damped_bse_x_points = match tmp_ctrl.get("damped_bse_x_points").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(2) as usize,
+                _ => 2,
+            };
+            tmp_input.damped_bse_y_start = match tmp_ctrl.get("damped_bse_y_start").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.damped_bse_y_end = match tmp_ctrl.get("damped_bse_y_end").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0),
+                _ => 1.0,
+            };
+            tmp_input.damped_bse_y_points = match tmp_ctrl.get("damped_bse_y_points").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(2) as usize,
+                _ => 2,
+            };
+            tmp_input.damped_bse_z_start = match tmp_ctrl.get("damped_bse_z_start").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.damped_bse_z_end = match tmp_ctrl.get("damped_bse_z_end").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0),
+                _ => 1.0,
+            };
+            tmp_input.damped_bse_z_points = match tmp_ctrl.get("damped_bse_z_points").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(2) as usize,
+                _ => 2,
+            };
+            // Generate grids: OUTER LOOP X, MIDDLE LOOP Y, INNER LOOP Z
+            let x_step = if tmp_input.damped_bse_x_points > 1 {
+                (tmp_input.damped_bse_x_end - tmp_input.damped_bse_x_start) / (tmp_input.damped_bse_x_points - 1) as f64
+            } else {
+                0.0
+            };
+            let y_step = if tmp_input.damped_bse_y_points > 1 {
+                (tmp_input.damped_bse_y_end - tmp_input.damped_bse_y_start) / (tmp_input.damped_bse_y_points - 1) as f64
+            } else {
+                0.0
+            };
+            let z_step = if tmp_input.damped_bse_z_points > 1 {
+                (tmp_input.damped_bse_z_end - tmp_input.damped_bse_z_start) / (tmp_input.damped_bse_z_points - 1) as f64
+            } else {
+                0.0
+            };
+            let mut grids = Vec::with_capacity(tmp_input.damped_bse_x_points * tmp_input.damped_bse_y_points * tmp_input.damped_bse_z_points);
+            for ix in 0..tmp_input.damped_bse_x_points {
+                let x = tmp_input.damped_bse_x_start + ix as f64 * x_step;
+                for iy in 0..tmp_input.damped_bse_y_points {
+                    let y = tmp_input.damped_bse_y_start + iy as f64 * y_step;
+                    for iz in 0..tmp_input.damped_bse_z_points {
+                        let z = tmp_input.damped_bse_z_start + iz as f64 * z_step;
+                        grids.push([x, y, z]);
+                    }
+                }
+            }
+            tmp_input.damped_bse_grids = grids;
             return Ok(Some(tmp_input));
         },
         other => {
