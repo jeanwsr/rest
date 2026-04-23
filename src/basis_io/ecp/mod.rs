@@ -2,7 +2,8 @@ use std::{fs, path::PathBuf};
 
 use hdf5::file;
 use pyo3::{pyclass, pymethods};
-use rest_libcint::{prelude::ECPscalar, CintType, CINTR2CDATA};
+use rest_libcint::{CintType, CINTR2CDATA};
+use rest_libcint::prelude::rest_libcint_wrapper::ECPscalar;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tensors::{MatrixFull, MatrixUpper};
@@ -205,7 +206,7 @@ fn evaluate_gp_matrix(gp_matr: &mut MatrixUpper<f64>,
     let ngp = gpbas.len() as i32;
 
     let mut cint_data = CINTR2CDATA::new();
-    cint_data.set_cint_type(cint_type);
+    cint_data.set_cint_type(*cint_type);
     cint_data.initial_r2c_with_ecp(&final_cint_atm, natm, &final_cint_bas, nbas_shell, gpbas, ngp, &final_cint_env);
     cint_data.cint1e_ecp_optimizer_rust();
 

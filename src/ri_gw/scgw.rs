@@ -5,7 +5,6 @@ use std::ops::Range;
 use crate::utilities;
 use crate::scf_io::SCF;
 //use std::slice::Iter::<'_, f64>;
-use libc::seccomp_notif;
 use rayon::result;
 use reqwest::blocking::Response;
 use rest_tensors::{RIFull};
@@ -27,6 +26,9 @@ use rayon::iter::IntoParallelRefMutIterator;
 use crate::ri_gw;
 use std::time::Instant;
 use std::cmp;
+
+#[cfg(target_os = "linux")]
+use libc::seccomp_notif;
 
 pub fn g0w0(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();

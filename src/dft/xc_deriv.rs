@@ -8,9 +8,7 @@ author: ajz34 (Zhenyu Zhu)
 
 use itertools::Itertools;
 use rstsr::prelude::*;
-use rstsr_core::prelude_dev::{
-    DeviceAddAssignAPI, DeviceCreationAnyAPI, DeviceMulAPI, DeviceMulAssignAPI, OpAssignAPI, OpAssignArbitaryAPI,
-};
+use rstsr_core::prelude_dev::*;
 use std::iter::repeat_n;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,8 +28,7 @@ pub fn count_combinations(n: usize, r: usize) -> usize {
 pub fn indexed_map_last_dim<T, B>(data: TensorView<T, B>, indices: &[usize]) -> Tensor<T, B>
 where
     T: Copy,
-    B: DeviceAPI<T> + DeviceCreationAnyAPI<T> + OpAssignAPI<T, IxD>,
-    B::Raw: Clone,
+    B: DeviceAPI<T, Raw: Clone> + DeviceCreationAnyAPI<T> + OpAssignAPI<T, IxD>,
 {
     let shape = data.shape().clone();
     let mut shape_new = shape.clone();
@@ -197,8 +194,7 @@ pub fn diagonal_indices(idx: &[usize], order: usize) -> Vec<Vec<usize>> {
 pub fn xc_indices_transform<T, B>(xc0: TensorView<T, B>, xctype: XCType, spin: usize, deriv: usize) -> Tensor<T, B>
 where
     T: Copy,
-    B: DeviceAPI<T> + DeviceCreationAnyAPI<T> + OpAssignAPI<T, IxD>,
-    B::Raw: Clone,
+    B: DeviceAPI<T, Raw: Clone> + DeviceCreationAnyAPI<T> + OpAssignAPI<T, IxD>,
 {
     // sanity check
     assert!(xc0.ndim() == 2, "xc0 must be a 2D tensor");
@@ -381,9 +377,9 @@ where
         + DeviceCreationAnyAPI<f64>
         + OpAssignAPI<f64, IxD>
         + OpAssignArbitaryAPI<f64, IxD, IxD>
-        + DeviceMulAPI<f64, f64, f64, IxD>
-        + DeviceAddAssignAPI<f64, f64, IxD>
-        + DeviceMulAssignAPI<f64, f64, IxD>,
+        + OpMulAPI<f64, f64, f64, IxD>
+        + OpAddAssignAPI<f64, f64, IxD>
+        + OpMulAssignAPI<f64, f64, IxD>,
 {
     assert!(order < 4, "currently only support order < 4 (exc, vxc, kxc, fxc)");
 

@@ -1,7 +1,6 @@
 //use std::simd::num;
 use std::ops::Range;
 use crate::scf_io::SCF;
-use libc::seccomp_notif;
 use rayon::result;
 use rest_tensors::{RIFull};
 use std::ops::Index;
@@ -23,6 +22,9 @@ pub mod sbse;
 pub mod pysoc_file;
 pub mod damped;
 
+
+#[cfg(target_os = "linux")]
+use libc::seccomp_notif;
 
 pub fn bse_main(scf_data:&mut SCF){
     let start=Instant::now();

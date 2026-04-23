@@ -1,6 +1,5 @@
 use core::panic;
 use std::fs;
-use libc::TCA_DUMP_INVISIBLE;
 use rest_libcint::{CintType, CINTR2CDATA};
 use serde::{Deserialize, Serialize};
 use serde_json::{Result,Value};
@@ -10,9 +9,11 @@ use pyo3::pyclass;
 
 use crate::{molecule_io::Molecule, scf_io::SCF};
 use crate::constants::{ATM_NUC_MOD_OF, NUC_ECP, SPECIES_INFO};
-use rest_libcint::prelude::ECPscalar;
+use rest_libcint::prelude::rest_libcint_wrapper::ECPscalar;
 use crate::basis_io::ecp::{PotCell, PotCellRaw};
 
+#[cfg(target_os = "linux")]
+use libc::TCA_DUMP_INVISIBLE;
 
 
 //#[derive(Clone, Debug,Serialize,Deserialize)]
@@ -446,7 +447,7 @@ pub fn evaluate_primitive_enxc_operator(enxc: &mut MatrixUpper<f64>,
     let nbas_shell = final_cint_bas.len() as i32;
 
     let mut cint_data = CINTR2CDATA::new();
-    cint_data.set_cint_type(cint_type);
+    cint_data.set_cint_type(*cint_type);
     let nenxc = enxcbas.len() as i32;
     cint_data.initial_r2c_with_ecp(&final_cint_atm, natm, &final_cint_bas, nbas_shell, enxcbas, nenxc, &final_cint_env);
     cint_data.cint1e_ecp_optimizer_rust();

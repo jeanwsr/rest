@@ -1,5 +1,6 @@
 pub mod vsap;
 pub mod c2s;
+pub mod solvent;
 mod cartesian_gto;
 
 use std::collections::HashMap;

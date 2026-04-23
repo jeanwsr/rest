@@ -7,11 +7,11 @@ pub mod rrs_pbc;
 pub mod spin_correction;
 
 use std::path::Path;
-use rest_libcint::prelude::int1e_r;
+use rest_libcint::prelude::rest_libcint_wrapper::int1e_r;
 use tensors::{MathMatrix, MatrixFull, RIFull};
 
 use crate::constants::{ANG, AU2DEBYE, SPECIES_INFO};
-use crate::dft::DFAFamily;
+use crate::dft::{DFAFamily};
 use crate::geom_io::get_mass_charge;
 use crate::grad::{formated_force, formated_force_ev, numerical_force};
 use crate::mpi_io::MPIOperator;
@@ -20,7 +20,7 @@ use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon, evaluate_spin_resp
 use crate::ri_rpa::{evaluate_rpa_correlation, evaluate_rpa_correlation_rayon};
 use crate::ri_gw;
 use crate::ri_bse;
-use crate::scf_io::{SCF, SCFType};
+use crate::scf_io::{SCF, SCFType, print_force_for_ghost_point_charges};
 use crate::ri_pt2::{close_shell_pt2_rayon, open_shell_pt2_rayon};
 use crate::utilities::TimeRecords;
 
@@ -57,6 +57,20 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
                 panic!("The MPI version is not yet implemented for generating orbital cube files");
             } else {
                 cube_build::get_cube_orb(&scf_data);
+            }
+        } else if output_type.eq("tabulated_exc") {
+            println!("Now tabulating e_[xc] to each grid points");
+            if let Some(mpi_op) = &mpi_operator {
+                panic!("The MPI version is not yet implemented for tabulating e_[xc] to each grid points");
+            } else {
+                if let Some(grids) = &scf_data.grids {
+                    let dm = &scf_data.density_matrix;
+                    let mo = &scf_data.eigenvectors;
+                    let occ = &scf_data.occupation;
+                    scf_data.mol.xc_data.post_tabulated_exc(grids, dm, mo, occ);
+                } else {
+                    panic!("The grids are not yet initialized");
+                }
             }
         } else if output_type.eq("molden") {
             if let Some(mpi_op) = &mpi_operator {
@@ -114,7 +128,7 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
                 let dp = evaluate_dipole_moment(scf_data, None);
                 println!("Dipole Moment in DEBYE: {:16.8}, {:16.8}, {:16.8}", dp[0], dp[1], dp[2]);
             }
-        } else if output_type.eq("force") {
+        } else if output_type.eq("num_force") {
             let displace = match scf_data.mol.geom.unit {
                 crate::geom_io::GeomUnit::Angstrom => scf_data.mol.ctrl.nforce_displacement/ANG,
                 crate::geom_io::GeomUnit::Bohr => scf_data.mol.ctrl.nforce_displacement,
@@ -133,8 +147,28 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
                 println!("Total atomic forces [ev/ang]: ");
                 println!("{}", formated_force_ev(&num_force, &scf_data.mol.geom.elem));
             }
+        } else if output_type.eq("force_for_ghost_point_charges") {
+            print_force_for_ghost_point_charges(&scf_data)
         }
     });
+}
+
+pub fn write_scf_attribute<T>(group: &hdf5::Group, dataset_name: &str, value: &[T]) 
+where 
+    T: Clone + hdf5::H5Type
+{
+    if let Ok(dataset) = group.dataset(dataset_name) {
+        match dataset.write_raw(value) {
+            Ok(_) => (),
+            Err(e) => println!("Error writing dataset {}: {:?}", dataset_name, e),
+        }
+    } else {
+        let builder = group.new_dataset_builder();
+        match builder.with_data(value).create(dataset_name) {
+            Ok(_) => (),
+            Err(e) => println!("Error creating dataset {}: {:?}", dataset_name, e),
+        }
+    }
 }
 
 pub fn save_chkfile(scf_data: &SCF) {
@@ -148,6 +182,7 @@ pub fn save_chkfile(scf_data: &SCF) {
     } else {
         hdf5::File::create(chkfile).unwrap()
     };
+    println!("write chkfile: {}", chkfile);
     let is_exist = file.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("scf")});
     let scf = if is_exist {
         file.group("scf").unwrap()
@@ -155,46 +190,12 @@ pub fn save_chkfile(scf_data: &SCF) {
         file.create_group("scf").unwrap()
     };
 
-    let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("e_tot")});
-    if is_exist {
-        let dataset = scf.dataset("e_tot").unwrap();
-        dataset.write(&[scf_data.scf_energy]);
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&[scf_data.scf_energy]
-        ).create("e_tot").unwrap();
-    }
+    write_scf_attribute(&scf, "e_tot", &[scf_data.scf_energy]);
+    write_scf_attribute(&scf, "num_basis", &[scf_data.mol.num_basis]);
+    write_scf_attribute(&scf, "spin_channel", &[scf_data.mol.spin_channel]);
+    write_scf_attribute(&scf, "num_states", &[scf_data.mol.num_state]);
 
-    let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("num_basis")});
-    if is_exist {
-        let dataset = scf.dataset("num_basis").unwrap();
-        dataset.write(&[scf_data.mol.num_basis]).unwrap();
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&[scf_data.mol.num_basis]
-        ).create("num_basis").unwrap();
-    }
-    let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("spin_channel")});
-    if is_exist {
-        let dataset = scf.dataset("spin_channel").unwrap();
-        dataset.write(&[scf_data.mol.spin_channel]);
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&[scf_data.mol.spin_channel]
-        ).create("spin_channel").unwrap();
-    }
-
-    let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("num_state")});
-    if is_exist {
-        let dataset = scf.dataset("num_state").unwrap();
-        dataset.write(&[scf_data.mol.num_state]);
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&[scf_data.mol.num_state]
-        ).create("num_state").unwrap();
-    }
-
-    let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("mo_coeff")});
+    // let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("mo_coeff")});
     let mut eigenvectors: Vec<f64> = vec![];
     for i_spin in 0..scf_data.mol.spin_channel {
         let tmp_eigenvectors = scf_data.eigenvectors[i_spin].transpose();
@@ -203,13 +204,7 @@ pub fn save_chkfile(scf_data: &SCF) {
             break
         }
     }
-    if is_exist {
-        let dataset = scf.dataset("mo_coeff").unwrap();
-        dataset.write(&eigenvectors);
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&eigenvectors).create("mo_coeff");
-    }
+    write_scf_attribute(&scf, "mo_coeff", &eigenvectors);
 
     let mut eigenvalues: Vec<f64> = vec![];
     for i_spin in 0..scf_data.mol.spin_channel {
@@ -218,26 +213,16 @@ pub fn save_chkfile(scf_data: &SCF) {
             break 
         }
     }
-    if is_exist {
-        let dataset = scf.dataset("mo_energy").unwrap();
-        dataset.write(&eigenvalues);
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&eigenvalues).create("mo_energy");
-    }
+    write_scf_attribute(&scf, "mo_energy", &eigenvalues);
 
-    let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("mo_occupation")});
     let mut occ: Vec<f64> = vec![];
     for i_spin in 0..scf_data.mol.spin_channel {
         occ.extend(scf_data.occupation[i_spin].iter());
     }
-    if is_exist {
-        let dataset = scf.dataset("mo_occupation").unwrap();
-        dataset.write(&occ);
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&occ).create("mo_occupation");
-    }
+    // for compatibility with old rest, may be removed in the future
+    write_scf_attribute(&scf, "mo_occupation", &occ);
+    // for compatibility with pyscf
+    write_scf_attribute(&scf, "mo_occ", &occ);
 
     file.close();
 }
@@ -345,6 +330,18 @@ pub fn print_out_dfa(scf_data: &SCF) {
     });
 }
 
+pub fn print_out_xc_potentials(scf_data: &SCF) {
+    let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);
+    let post_xc_energy = if let Some(grids) = &scf_data.grids {
+        dfa.post_xc_exc(&scf_data.mol.ctrl.post_xc, grids, &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation)
+    } else {
+        vec![[0.0,0.0]]
+    };
+    post_xc_energy.iter().zip(scf_data.mol.ctrl.post_xc.iter()).for_each(|(energy, name)| {
+        println!("{:<16}: {:16.8} Ha", name, energy[0]+energy[1]);
+    });
+}
+
 pub fn post_ai_correction(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> Option<Vec<f64>> {
     let xc_method = &scf_data.mol.ctrl.xc.to_lowercase();
     let post_ai_corr = &scf_data.mol.ctrl.post_ai_correction.to_lowercase();
@@ -373,7 +370,16 @@ pub fn post_scf_correlation(scf_data: &mut SCF) {
     if let None = scf_data.ri3mo {
         let (occ_range, vir_range) = crate::scf_io::determine_ri3mo_size_for_pt2_and_rpa(&scf_data);
         if scf_data.mol.ctrl.print_level>1 {
-            println!("generate RI3MO only for occ_range:{:?}, vir_range:{:?}", &occ_range, &vir_range)
+            //println!("generate RI3MO only for occ_range:{:?}, vir_range:{:?}", &occ_range, &vir_range);
+            let spin_orb_indices = split_indices_by_spin_occ(&scf_data.occupation, 0.5);
+            let (alpha_occ, alpha_vir) = &spin_orb_indices[0];
+            println!("Occupied orbitals (alpha): {}", format_indices(alpha_occ));
+            println!("Virtual orbitals (alpha): {}", format_indices(alpha_vir));
+            if matches!(scf_data.scftype, SCFType::UHF | SCFType::ROHF) {
+                let (beta_occ,  beta_vir)  = &spin_orb_indices[1];
+                println!("Occupied orbitals (beta): {}", format_indices(beta_occ));
+                println!("Virtual orbitals (beta): {}", format_indices(beta_vir));
+            }
         };
         scf_data.generate_ri3mo_rayon(vir_range, occ_range);
     }
@@ -559,7 +565,7 @@ pub fn evaluate_dipole_moment(scf_data: &SCF, orig: Option<[f64;3]>) -> [f64;3] 
     } else {
         p_orig.clone()
     };
-    cint_data.set_common_origin(&r_orig);
+    cint_data.set_common_origin(r_orig);
 
     let (out, out_shape)= cint_data.integral_s1::<int1e_r>(None);
     //let mut out_shape_1 = [0;3];
@@ -576,7 +582,7 @@ pub fn evaluate_dipole_moment(scf_data: &SCF, orig: Option<[f64;3]>) -> [f64;3] 
         });
     }
 
-    cint_data.set_common_origin(&p_orig);
+    cint_data.set_common_origin(p_orig);
 
     //nucl_dip.iter().zip(el_dip.iter()).map(|(nucl, el)| (*nucl - *el)*AU2DEBYE).collect::<Vec<f64>>()
 
@@ -586,3 +592,77 @@ pub fn evaluate_dipole_moment(scf_data: &SCF, orig: Option<[f64;3]>) -> [f64;3] 
 
 }
 
+fn split_indices_by_occ(
+    spin_occ: &[f64],
+    occ_threshold: f64,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut occ_idx = Vec::new();
+    let mut vir_idx = Vec::new();
+
+    for (i, &n_occ) in spin_occ.iter().enumerate() {
+        if n_occ > occ_threshold {
+            occ_idx.push(i);
+        } else {
+            vir_idx.push(i);
+        }
+    }
+
+    (occ_idx, vir_idx)
+}
+
+pub fn split_indices_by_spin_occ(
+    occupations: &[Vec<f64>], // occupations[0]=alpha, occupations[1]=beta
+    occ_threshold: f64,
+) -> Vec<(Vec<usize>, Vec<usize>)> {
+    occupations
+        .iter()
+        .map(|spin_occ| split_indices_by_occ(spin_occ, occ_threshold))
+        .collect()
+}
+
+fn compress_indices_to_ranges(indices: &[usize]) -> Vec<(usize, usize)> {
+    if indices.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+
+    let mut start = indices[0];
+    let mut prev  = indices[0];
+
+    for &idx in indices.iter().skip(1) {
+        if idx == prev + 1 {
+            // still contiguous
+            prev = idx;
+        } else {
+            // end current range
+            ranges.push((start, prev));
+            start = idx;
+            prev  = idx;
+        }
+    }
+
+    // push last range
+    ranges.push((start, prev));
+
+    ranges
+}
+
+fn format_ranges(ranges: &[(usize, usize)]) -> String {
+    ranges
+        .iter()
+        .map(|(start, end)| {
+            if start == end {
+                format!("{}", start)
+            } else {
+                format!("{}-{}", start, end)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub fn format_indices(indices: &[usize]) -> String {
+    let ranges = compress_indices_to_ranges(indices);
+    format_ranges(&ranges)
+}

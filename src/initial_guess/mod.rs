@@ -1,6 +1,7 @@
 use tensors::{MatrixFull, MatrixUpper, BasicMatrix};
 
 use crate::constants::E;
+use crate::dft::{numerical_density_rayon, numerical_orbital_population};
 use crate::initial_guess::enxc::effective_nxc_matrix;
 use crate::mpi_io::{mpi_broadcast_matrixfull, MPIOperator};
 use crate::scf_io::{scf, SCFType};
@@ -167,7 +168,15 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
         scf_data.diagonalize_hamiltonian(mpi_operator);
         scf_data.generate_occupation();
         scf_data.generate_density_matrix();
-        //scf_data.generate_hf_hamiltonian();
+        //println!("======== IGOR debug for tabulated orbital densities =======");
+        //if let Some(grids) = &scf_data.grids {
+        //    let dd = numerical_orbital_population(grids, &scf_data.mol);
+        //    println!("debug orbital densities: {:?}", &dd);
+        //    let dd = numerical_density_rayon(grids, &scf_data.mol, &scf_data.density_matrix);
+        //    println!("debug density: {:?}", &dd);
+        //}
+        //println!("======== IGOR debug for dfa components using SAD density matrix =======");
+        //scf_data.generate_hf_hamiltonian(mpi_operator);
         //if scf_data.mol.ctrl.print_level>0 {println!("Initial guess HF energy: {:16.8}", scf_data.scf_energy)};
         //===============================see====================================
     // generate the initial guess from hcore
