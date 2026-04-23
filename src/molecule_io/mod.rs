@@ -235,7 +235,7 @@ impl Molecule {
         let xc_data = match &ctrl.xc_type {
             DFTType::Standard => {
                 let mut cur_xc_data = DFA4REST::new(&ctrl.xc, spin_channel, ctrl.print_level);
-                cur_xc_data.update_pt2_params(ctrl.pt2_os_factor, ctrl.pt2_ss_factor);
+                cur_xc_data.update_pt2_params(ctrl.ri_pt2.os_factor, ctrl.ri_pt2.ss_factor);
                 cur_xc_data
             },
             DFTType::NonStandard => {DFA4REST::new_nonstandard(spin_channel, ctrl.print_level, &ctrl.xc_namelist, &ctrl.xc_paralist, &ctrl.dfa_hybrid_scf)},

@@ -923,7 +923,7 @@ pub fn close_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF,mpi_operator:&O
                         };
 
                         let mut denominator = MatrixFull::new([vir_range.len(),vir_range.len()],[0.0_f64;2]);
-                        let loc_virt_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo, lumo, num_state, scf_data.mol.ctrl.pt2_mpi_mode);
+                        let loc_virt_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo, lumo, num_state, scf_data.mol.ctrl.ri_pt2.mpi_mode);
                         let (sender, receiver) = channel();
                         loc_virt_pair.par_iter().for_each_with(sender,|s,i_pair| {
                             let mut e_mp2_term_ss = 0.0_f64;
@@ -1407,7 +1407,7 @@ pub fn open_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF, mpi_operator:&O
                                     MatrixFull::from_vec([vir_range.len(), vir_range.len()], eri_virt).unwrap()
                                 };
                                 let mut denominator = MatrixFull::new([vir_range.len(),vir_range.len()],[0.0_f64;2]);
-                                let loc_virt_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo_1, lumo_2, num_state, scf_data.mol.ctrl.pt2_mpi_mode);
+                                let loc_virt_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo_1, lumo_2, num_state, scf_data.mol.ctrl.ri_pt2.mpi_mode);
                                 let (sender, receiver) = channel();
                                 loc_virt_pair.par_iter().for_each_with(sender,|s,i_pair| {
                                     let i_virt = i_pair[0];

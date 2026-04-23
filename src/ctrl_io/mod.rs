@@ -21,8 +21,10 @@ use crate::solvent::PcmMethod;
 use serde_json;
 use toml;
 
-pub mod flags;
-pub use flags::*;
+pub mod ri_jk_io;
+pub mod ri_pt2_io;
+pub use ri_jk_io::*;
+pub use ri_pt2_io::*;
 
 mod pyrest_ctrl_io;
 mod geometric_pyo3_io;
@@ -143,8 +145,6 @@ pub struct InputKeywords {
     // =========================================
     pub post_xc: Vec<String>,
     pub post_correlation: Vec<DFAFamily>,
-    pub pt2_ss_factor: Option<f64>,
-    pub pt2_os_factor: Option<f64>,
     pub post_ai_correction: String,
     pub charge: f64,
     #[pyo3(get, set)]
@@ -271,7 +271,6 @@ pub struct InputKeywords {
     pub force_state_occupation: Vec<ForceStateOccupation>,
     pub auxiliary_reference_states: Vec<(String,usize)>,
     pub rpa_de_excitation_parameters: Option<[f64;4]>,
-    pub pt2_mpi_mode: usize,
     /// Maximum memory available in MB, `None` if no limit.
     /// This option is only for single-node computation, and only works in some cases where algorithm awares memory usage and perform batched computation.
     /// For multi-node (MPI), this keyword is not fully discussed.
@@ -290,6 +289,7 @@ pub struct InputKeywords {
     pub quasiparticle_methods:Option<QuasiParticle>,
     pub tddft: Option<TDDFTParameters>,
     pub j2c_decomp: J2CDecompOption,
+    pub ri_pt2: RiPt2Option,
 }
 
 impl Default for InputKeywords {
@@ -331,8 +331,6 @@ impl InputKeywords {
             empirical_dispersion: None,
             post_xc: vec![],
             post_correlation: vec![],
-            pt2_os_factor: None,
-            pt2_ss_factor: None,
             post_ai_correction: String::from("none"),
             eri_type: String::from("ri_v"),
             use_ri_symm: true,
@@ -414,7 +412,6 @@ impl InputKeywords {
             auxiliary_reference_states: Vec::new(),
             force_state_occupation: Vec::new(),
             rpa_de_excitation_parameters: None,
-            pt2_mpi_mode: 0,
             max_memory: None,
             abort_on_mem_exceed: true,
             guess_mix: false,
@@ -430,6 +427,7 @@ impl InputKeywords {
             solv_epsilon:1.0,
             solvent_model: PcmMethod::CPCM,
             j2c_decomp: J2CDecompOption::default(),
+            ri_pt2: RiPt2Option::default(),
             tddft: None,
         }
     }
@@ -655,11 +653,6 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(64)},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(64) as usize},
                 other => {64},
-            };
-            tmp_input.pt2_mpi_mode = match tmp_ctrl.get("pt2_mpi_mode").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(0)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(0) as usize},
-                other => {0},
             };
             if let Some(num_threads) = tmp_input.num_threads {
                 //if tmp_input.print_level>0 {println!("The number of threads used for parallelism:      {}", num_threads)};
@@ -964,30 +957,6 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 }
                 //if corr.to_lowercase().eq(&pt2) 
             });
-            tmp_input.pt2_os_factor = match tmp_ctrl.get("pt2_os_factor").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {
-                    match tmp_str.to_lowercase().parse() {
-                        Ok(num) => Some(num),
-                        Err(_) => None,
-                    }
-                },
-                serde_json::Value::Number(tmp_num) => {
-                    tmp_num.as_f64()
-                },
-                other => {None},
-            };
-            tmp_input.pt2_ss_factor = match tmp_ctrl.get("pt2_ss_factor").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {
-                    match tmp_str.to_lowercase().parse() {
-                        Ok(num) => Some(num),
-                        Err(_) => None,
-                    }
-                },
-                serde_json::Value::Number(tmp_num) => {
-                    tmp_num.as_f64()
-                },
-                other => {None},
-            };
             tmp_input.post_ai_correction = match tmp_ctrl.get("post_ai_correction").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_xc) => {tmp_xc.to_lowercase()},
                 other => {String::from("none")},
@@ -1284,6 +1253,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 }
                 tmp_input.algorithm_jk = AlgorithmJK::Separated(tmp_input.algorithm_j, tmp_input.algorithm_k);
             }
+            tmp_input.ri_pt2 = tmp_ctrl.get("ri_pt2").map(serde_from_value).unwrap_or_default();
             // ================================================
             //  Keywords associated with the elec occupation 
             // ================================================
