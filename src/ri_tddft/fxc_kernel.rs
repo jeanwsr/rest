@@ -1,10 +1,7 @@
 use tensors::{MatrixFull, MathMatrix};
 use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
-use rest_tensors::RIFull;
-use rstsr::prelude::*;
 
 use crate::scf_io::SCF;
-use crate::dft::Grids;
 use crate::dft::xc_deriv::XCType;
 use crate::dft::libxc_itrf::eval_xc_eff;
 use crate::dft::num_int::{eval_rho5_batch, eval_ao_batch};
@@ -105,26 +102,22 @@ pub fn prepare_tddft_data(scf_data: &SCF) -> TDDFTData {
     let mo_coeffs = vec![scf_data.eigenvectors[0].clone()];
     let occ = vec![scf_data.occupation[0].clone()];
     let rho_tensor = eval_rho5_batch(&ao_rifull, xc_type, &mo_coeffs, &occ, 1, num_grids);
-    let rho_array: Vec<f64> = rho_tensor.to_vec();
+    let rho_array: Vec<f64> = rho_tensor.reshape(-1).to_vec();
 
-    // Singlet fxc: spin=0, deriv=2
-    let xc_singlet = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_array, num_grids, 2);
-    let fxc_s = xc_singlet[2].as_ref().expect("fxc must be available");
-    let wfxc_singlet = compute_weighted_fxc(fxc_s, weights, num_grids, nvar, false);
+    // Compute fxc via numerical differentiation of vxc (deriv=1),
+    // because eval_xc_eff with deriv=2 triggers a buffer overflow bug in merge_xc.
+    let delta = 1.0e-5;
+    let inv_2delta = 0.5 / delta;
 
-    // Triplet fxc: need spin=1 to separate αα and αβ
-    // Duplicate RKS density for both spin channels (each gets half)
-    let mut rho_spin = vec![0.0; num_grids * nvar * 2];
-    for g in 0..num_grids {
-        for v in 0..nvar {
-            let val = rho_array[g * nvar + v] * 0.5;
-            rho_spin[(g * nvar + v) * 2 + 0] = val;
-            rho_spin[(g * nvar + v) * 2 + 1] = val;
-        }
-    }
-    let xc_spin = eval_xc_eff(func_ids, func_factors, xc_type, 1, &rho_spin, num_grids, 2);
-    let fxc_t = xc_spin[2].as_ref().expect("spin-resolved fxc must be available");
-    let wfxc_triplet = compute_weighted_fxc(fxc_t, weights, num_grids, nvar, true);
+    // Singlet fxc: d²Exc/drho² (total density second derivative)
+    let wfxc_singlet = numerical_fxc_singlet(
+        func_ids, func_factors, xc_type, &rho_array, weights, num_grids, nvar, delta, inv_2delta,
+    );
+
+    // Triplet fxc: fxc_αα - fxc_αβ (via spin magnetization perturbation)
+    let wfxc_triplet = numerical_fxc_triplet(
+        func_ids, func_factors, xc_type, &rho_array, weights, num_grids, nvar, delta, inv_2delta,
+    );
 
     println!("TDDFT data prepared: occ={}, vir={}, grids={}, xc_type={:?}, alpha_hybrid={}",
              occ_size, vir_size, num_grids, xc_type, alpha_hybrid);
@@ -136,43 +129,103 @@ pub fn prepare_tddft_data(scf_data: &SCF) -> TDDFTData {
     }
 }
 
-fn compute_weighted_fxc(
-    fxc_tensor: &Tensor<f64, DeviceBLAS>,
+fn numerical_fxc_singlet(
+    func_ids: &Vec<usize>,
+    func_factors: &Vec<f64>,
+    xc_type: XCType,
+    rho_array: &[f64],
     weights: &[f64],
     num_grids: usize,
     nvar: usize,
-    is_triplet: bool,
+    delta: f64,
+    inv_2delta: f64,
 ) -> Vec<f64> {
+    // fxc_singlet[g, a, b] = (vxc[g,a](rho + δ*e_b) - vxc[g,a](rho - δ*e_b)) / (2δ) * w[g]
+    // wfxc layout: row-major [num_grids, nvar, nvar]
+    // rho_array layout: column-major [num_grids, nvar], i.e. rho[g, v] = rho_array[g + v * num_grids]
+    // vxc layout: column-major [num_grids, nvar], i.e. vxc[g, a] = vxc_data[g + a * num_grids]
     let mut wfxc = vec![0.0; num_grids * nvar * nvar];
-    let fxc_data = fxc_tensor.to_vec();
+    let np = num_grids;
 
-    if !is_triplet {
-        // fxc shape: [num_grids, nvar, nvar]
-        // Factor 2: eval_xc_eff(spin=0) returns ∂²(ρε)/∂ρ² w.r.t. total density,
-        // but the RKS singlet kernel is f_xc^{αα} + f_xc^{αβ} = 2 * ∂²(ρε)/∂ρ².
-        for g in 0..num_grids {
+    for b in 0..nvar {
+        let mut rho_plus = rho_array.to_vec();
+        let mut rho_minus = rho_array.to_vec();
+        for g in 0..np {
+            rho_plus[g + b * np] += delta;
+            rho_minus[g + b * np] -= delta;
+        }
+
+        let xc_plus = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_plus, np, 1);
+        let xc_minus = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_minus, np, 1);
+
+        let vxc_plus = xc_plus[1].as_ref().unwrap().reshape(-1).to_vec();
+        let vxc_minus = xc_minus[1].as_ref().unwrap().reshape(-1).to_vec();
+
+        for g in 0..np {
             for a in 0..nvar {
-                for b in 0..nvar {
-                    let idx = (g * nvar + a) * nvar + b;
-                    wfxc[idx] = 2.0 * fxc_data[idx] * weights[g];
-                }
+                let out_idx = (g * nvar + a) * nvar + b;
+                let vp = vxc_plus[g + a * np];
+                let vm = vxc_minus[g + a * np];
+                wfxc[out_idx] = (vp - vm) * inv_2delta * weights[g];
             }
         }
-    } else {
-        // fxc shape: [num_grids, nvar, 2, nvar, 2]
-        // triplet = fxc[g,a,α,b,α] - fxc[g,a,α,b,β]
-        let s_g = nvar * 2 * nvar * 2;
-        let s_a = 2 * nvar * 2;
-        let s_s1 = nvar * 2;
-        let s_b = 2;
-        for g in 0..num_grids {
+    }
+    wfxc
+}
+
+fn numerical_fxc_triplet(
+    func_ids: &Vec<usize>,
+    func_factors: &Vec<f64>,
+    xc_type: XCType,
+    rho_array: &[f64],
+    weights: &[f64],
+    num_grids: usize,
+    nvar: usize,
+    delta: f64,
+    inv_2delta: f64,
+) -> Vec<f64> {
+    // Triplet fxc = fxc_αα - fxc_αβ
+    // Perturb spin magnetization: rho_α = rho/2 + δ*e_b, rho_β = rho/2 - δ*e_b
+    // fxc_triplet[g,a,b] = (vxc_α(+δ) - vxc_α(-δ))[g,a] / (2δ) * w[g]
+    //
+    // rho_spin layout: column-major [np, nvar, 2]
+    //   rho_spin[g + v * np] = alpha, rho_spin[g + v * np + np * nvar] = beta
+    // vxc_spin layout: column-major [np, nvar, 2]
+    //   vxc[g + a * np] = alpha, vxc[g + a * np + np * nvar] = beta
+    let mut wfxc = vec![0.0; num_grids * nvar * nvar];
+    let np = num_grids;
+
+    for b in 0..nvar {
+        let mut rho_plus = vec![0.0; np * nvar * 2];
+        let mut rho_minus = vec![0.0; np * nvar * 2];
+        for v in 0..nvar {
+            let pert = if v == b { delta } else { 0.0 };
+            for g in 0..np {
+                let val = rho_array[g + v * np] * 0.5;
+                // alpha block: offset 0
+                rho_plus[g + v * np] = val + pert;
+                // beta block: offset np * nvar
+                rho_plus[g + v * np + np * nvar] = val - pert;
+                // reversed perturbation
+                rho_minus[g + v * np] = val - pert;
+                rho_minus[g + v * np + np * nvar] = val + pert;
+            }
+        }
+
+        let xc_plus = eval_xc_eff(func_ids, func_factors, xc_type, 1, &rho_plus, np, 1);
+        let xc_minus = eval_xc_eff(func_ids, func_factors, xc_type, 1, &rho_minus, np, 1);
+
+        // vxc shape for spin=1: column-major [np, nvar, 2]
+        let vxc_plus = xc_plus[1].as_ref().unwrap().reshape(-1).to_vec();
+        let vxc_minus = xc_minus[1].as_ref().unwrap().reshape(-1).to_vec();
+
+        for g in 0..np {
             for a in 0..nvar {
-                for b in 0..nvar {
-                    let idx_aa = g * s_g + a * s_a + 0 * s_s1 + b * s_b + 0;
-                    let idx_ab = g * s_g + a * s_a + 0 * s_s1 + b * s_b + 1;
-                    let out_idx = (g * nvar + a) * nvar + b;
-                    wfxc[out_idx] = (fxc_data[idx_aa] - fxc_data[idx_ab]) * weights[g];
-                }
+                let out_idx = (g * nvar + a) * nvar + b;
+                // alpha component: offset 0
+                let vp_alpha = vxc_plus[g + a * np];
+                let vm_alpha = vxc_minus[g + a * np];
+                wfxc[out_idx] = (vp_alpha - vm_alpha) * inv_2delta * weights[g];
             }
         }
     }

@@ -21,6 +21,7 @@ pub mod matvec;
 pub mod sbse;
 pub mod pysoc_file;
 pub mod damped;
+pub mod feast_solver;
 
 
 #[cfg(target_os = "linux")]
@@ -35,7 +36,7 @@ pub fn bse_main(scf_data:&mut SCF){
     if qp_ctrl.bse_spin =="none"{
         println!("No BSE Calculations are triggered");
     }else if qp_ctrl.bse_spin=="both"{
-        let (mut excitations_singlets,mut excitations_triplets)=pysoc_prep_calculations(&scf_data,&quasiparticle_energies);
+        let (mut excitations_singlets,mut excitations_triplets)=bse_both_spins(&scf_data,&quasiparticle_energies);
         if qp_ctrl.bse_tda==true{
             println!("BSE Calculation Results of Both Singlets and Triplets with TDA:");
             let number=excitations_singlets.len();
@@ -88,71 +89,42 @@ pub fn bse_main(scf_data:&mut SCF){
         let bse_spin=qp_ctrl.bse_spin.clone();
         println!("BSE Type:{}",bse_spin);
         let xlet=if bse_spin=="triplet"{'T'}else if bse_spin=="singlet"{'S'}else{panic!("invalid choice for bse_spin!")};
-        if qp_ctrl.simplified_bse==true{
-            println!("Now using: Simplified BSE scheme");
-            let auxbas_dir=scf_data.mol.ctrl.auxbas_path.clone();
-            let elements=scf_data.mol.geom.elem.clone();
-            if scf_data.mol.ctrl.print_level>1{println!("Elements:{:?}",elements);
-            elements.iter().enumerate().for_each(|(n,elem)|{
-                let total_count=sbse::count_all_ao(scf_data,n);
-                let s_count=sbse::count_specific_angular_momentum(scf_data,0,n);
-                println!("{} basis funtions are found from the auxbas of {}",total_count,elem);
-                println!("{} S basis functions are detected from the auxbas of {}",s_count,elem);
-            });}
-            let ang_momentum=cmp::min(6,qp_ctrl.bse_max_ang_momentum);
-            let relevant_indices=sbse::obtain_relevant_indices(scf_data,&elements,ang_momentum);
-            let energy_diag=construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
-            let mut epsilon:Vec<f64>=scf_data.eigenvalues[0].clone();
-            let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-            if qp_ctrl.bse_qp_polarization==true{
-                epsilon=scf_data.gwqp.0.clone();
+
+        // ── FEAST solver path for individual spins ──
+        if !qp_ctrl.bse_davidson_solver && qp_ctrl.bse_feast_solver {
+            eprintln!("Warning: Using FEAST solver for BSE (experimental). \
+                       To use the Davidson solver instead, set bse_davidson_solver=true.");
+            let excitations = match bse_spin.as_str() {
+                "singlet" => feast_solver::feast_solve_bse_singlet(scf_data),
+                "triplet" => feast_solver::feast_solve_bse_triplet(scf_data),
+                _ => panic!("invalid choice for bse_spin!"),
+            };
+            // Print results (same format as below)
+            let number = excitations.len().min(30);
+            println!("First {} excitations:", number);
+            for (n, (e, vec)) in excitations[0..number].iter().enumerate() {
+                println!("#{} Excitation energy={}", n, e);
+                let v = dipoles::normalize(vec, true);
+                let dipole_square = dipoles::transition_dipole_square(&dipole_matrix, &v, true);
+                println!("\tTransition Dipole Square:{}; Oscillator Strength:{}",
+                    dipole_square, dipole_square * e * 2.0 / 3.0);
+                leading_components(&v, occ_size, vir_size);
             }
-            let inverse_dielectric=construct_inverse_dielectric(scf_data,&epsilon);
-            let ri_ov=get_submatrix(scf_data,'O','V','N');
-            //ri_ov.formated_output(100000,"full");
-            let mut ri_oo=get_submatrix(scf_data,'O','O','N');
-            let mut ri_vv=get_submatrix(scf_data,'V','V','N');
-            println!("Full NumAuxBas={}",ri_oo.size[0]);
-            if scf_data.mol.ctrl.print_level>1{println!("Relevant Indices={:?}",relevant_indices);}
-            ri_oo=sbse::obtain_ri_with_reduced_ang_momentum(&ri_oo,&relevant_indices);
-            let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
-            _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
-            //println!("RI-OO-Tilde Size={},{}, where occ_size={}",ri_oo_tilde.size[0],ri_oo_tilde.size[1],occ_size);
-            let reduced_num_auxbas=ri_oo_tilde.size[0];
-            println!("Reduced NumAuxBas={}",reduced_num_auxbas);
-            ri_oo_tilde.reshape([reduced_num_auxbas*occ_size,occ_size]);
-            ri_oo_tilde=ri_oo_tilde.transpose_and_drop();
-            ri_oo_tilde.reshape([occ_size*reduced_num_auxbas,occ_size]);
-            ri_vv=sbse::obtain_ri_with_reduced_ang_momentum(&ri_vv,&relevant_indices);
-            ri_vv.reshape([reduced_num_auxbas*vir_size,vir_size]);
-            let initial_guess=davidson_solver::generate_initial_guess(&energy_diag,qp_ctrl.davidson_target_excitations);
-            let preptime=start.elapsed();
-            println!("BSE Preparation Time:{:?}",preptime);
-            let excitations=davidson_solver::tda_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&qp_ctrl);
-            println!("Davidson Solver took {:?}",start.elapsed()-preptime);
-            if scf_data.mol.ctrl.print_level>2{
-                show_all_eigenpairs(&excitations);
-            }
-            let number=excitations.len().min(30);
-            println!("First {} excitations:",number);
-            excitations[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
-            let v=dipoles::normalize(vec,true);
-            println!("#{} Excitation energy={}",n,e);
-            let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
-            println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
-            leading_components(&v,occ_size,vir_size)});
-            println!("\n\nThe first excitation obtained by BSE is {}",excitations[0].0);
-            if qp_ctrl.save_bse_excitations==true{
-                let line = excitations.iter().map(|(num,vec)| num.to_string()).collect::<Vec<_>>().join(",");
+            println!("The first excitation obtained by BSE is {}", excitations[0].0);
+            if qp_ctrl.save_bse_excitations {
+                let line = excitations.iter().map(|(num,_)| num.to_string()).collect::<Vec<_>>().join(",");
                 let mut file = OpenOptions::new().append(true).create(true).open("bse_excitations.txt");
                 writeln!(file.expect("write failure"), "{}", line);
             }
-            if qp_ctrl.save_first_excitation==true{
-                let save_path=qp_ctrl.save_first_excitation_path.clone();
+            if qp_ctrl.save_first_excitation {
+                let save_path = qp_ctrl.save_first_excitation_path.clone();
                 let mut file = OpenOptions::new().append(true).create(true).open(save_path);
                 writeln!(file.expect("write failure"), "{}", excitations[0].0);
             }
-        }else if qp_ctrl.bse_tda==false{
+            return;
+        }
+
+        if qp_ctrl.bse_tda==false{
             let mut excitations=non_tda_calculations(&scf_data,&quasiparticle_energies,xlet);
             if scf_data.mol.ctrl.print_level>2{
                 show_all_eigenpairs(&excitations);
@@ -565,9 +537,20 @@ pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char
     }
     eigenpairs
 }
-pub fn pysoc_prep_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>)->(Vec<(f64,Vec<f64>)>,Vec<(f64,Vec<f64>)>){
+pub fn bse_both_spins(scf_data:&SCF,quasiparticle_energies:&Vec<f64>)->(Vec<(f64,Vec<f64>)>,Vec<(f64,Vec<f64>)>){
+    let qp_ctrl_ref=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+
+    // ── FEAST solver path ──
+    // Triggered when bse_davidson_solver=false and bse_feast_solver=true.
+    if !qp_ctrl_ref.bse_davidson_solver && qp_ctrl_ref.bse_feast_solver {
+        eprintln!("Warning: Using FEAST solver for BSE (experimental). \
+                   To use the Davidson solver instead, set bse_davidson_solver=true.");
+        return feast_solver::feast_solve_bse(scf_data);
+    }
+
+    // ── Davidson solver path (also fallback) ──
     let start=Instant::now();
-    let mut qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let mut qp_ctrl=qp_ctrl_ref;
     let mut eigenpairs_singlet:Vec<(f64,Vec<f64>)>=Vec::new();
     let mut eigenpairs_triplet:Vec<(f64,Vec<f64>)>=Vec::new();
     if qp_ctrl.bse_tda==true{

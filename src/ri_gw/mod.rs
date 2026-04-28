@@ -36,7 +36,6 @@ pub mod renormalized_singles;
 pub mod scgw;
 pub mod display;
 pub mod fourier_self_energy;
-pub mod drpa;
 pub mod qsgw;
 use crate::mpi_io::MPIOperator;
 
