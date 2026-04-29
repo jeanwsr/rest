@@ -132,7 +132,7 @@ pub fn fourvec_dot_product(fourvec_1:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),four
 pub fn fourvec_scaled_add(fourvec_1:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),scale1:f64,fourvec_2:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),scale2:f64)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     (vector_scaled_add(&fourvec_1.0,scale1,&fourvec_2.0,scale2),vector_scaled_add(&fourvec_1.1,scale1,&fourvec_2.1,scale2),vector_scaled_add(&fourvec_1.2,scale1,&fourvec_2.2,scale2),vector_scaled_add(&fourvec_1.3,scale1,&fourvec_2.3,scale2))
 }
-pub fn poples_numerical_trick<F1>(p0:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),update_w:F1)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)
+pub fn poples_numerical_trick<F1>(p0:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),update_w:F1,tol:f64,max_iterations:usize)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)
     where F1:Fn(&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>))->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let p0p0sqrt=fourvec_dot_product(p0,p0).sqrt();
     // Fix 1: Normalize u0 by dividing by ||p0||, not multiplying
@@ -142,7 +142,6 @@ pub fn poples_numerical_trick<F1>(p0:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),upda
     let mut u_vecs:Vec<(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)>=vec![u0.clone()];
     let mut w_vecs:Vec<(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)>=Vec::new();
     let mut iter_count=0;
-    let max_iterations=1000;
     loop{
         let un=u_vecs[u_vecs.len()-1].clone();
         let wn=update_w(&un);
@@ -165,14 +164,14 @@ pub fn poples_numerical_trick<F1>(p0:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),upda
         let coeff=solve_for_coeff(&u_vecs,&w_vecs,&p0);
         let residue=calculate_residue(&u_vecs,&w_vecs,&p0,&coeff);
         u_vecs.push(unp1);
-        if residue<0.000001{
+        if residue<tol{
             (0..coeff.len()).for_each(|k|{
                p_result=fourvec_scaled_add(&p_result,1.0,&u_vecs[k],coeff[k]);
             });
             break
         }
         iter_count+=1;
-        println!("Now is iteration {}, residue={},converge threshold is 0.000001",iter_count,residue);
+        println!("Now is iteration {}, residue={},converge threshold is {}",iter_count,residue,tol);
         // Fix 3: Add maximum iteration limit
         if iter_count >= max_iterations {
             eprintln!("Warning: Maximum iterations ({}) reached without convergence. Final residue: {}", max_iterations, residue);
@@ -208,10 +207,20 @@ pub fn calculate_residue(u_vecs:&Vec<(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)>,w_ve
     fourvec_dot_product(&residue,&residue).sqrt()
 }
 pub fn damped_bse(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    match qp_ctrl.damped_bse_solver.as_str() {
+        "pople" => damped_bse_pople(scf_data),
+        "gmres" => damped_bse_gmres(scf_data),
+        "klopper" => damped_bse_klopper(scf_data),
+        other => panic!("Invalid damped_bse_solver: \"{}\". Expected \"pople\", \"gmres\", or \"klopper\".", other),
+    }
+}
+
+pub fn damped_bse_pople(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let inverse_dielectric=ri_bse::construct_inverse_dielectric(scf_data,&scf_data.eigenvalues[0]);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    println!("Now begins damped BSE calculation. Parameters:\nOcc Size={},Vir Size={},External Field Freq={},Lifetime Gamma={}",occ_size,vir_size,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma);
+    println!("Now begins damped BSE calculation (Pople). Parameters:\nOcc Size={},Vir Size={},External Field Freq={},Lifetime Gamma={}",occ_size,vir_size,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma);
     let mu_z_vec=compute_mu_z_vec(scf_data);
     let ri_oo=ri_bse::get_submatrix(scf_data,'O','O','N');
     println!("num_auxbas={}",ri_oo.size[0]);
@@ -241,7 +250,7 @@ pub fn damped_bse(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
         update_w_vecs(&u.0,&u.1,&u.2,&u.3,|x|wrapped_pair_matvec(&x),
             &scf_data.gwqp.0,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma,occ_size,vir_size)
     };
-    let result=poples_numerical_trick(&p0,|z|wrapped_update_w(&z));
+    let result=poples_numerical_trick(&p0,|z|wrapped_update_w(&z),qp_ctrl.damped_bse_tol,qp_ctrl.damped_bse_max_iter);
     let density_real:Vec<f64>=(0..occ_size*vir_size).map(|ia|result.0[ia]-result.1[ia]).collect();
     let polarized_density_matrix=MatrixFull::from_vec([occ_size,vir_size],density_real).unwrap();
     export_density(scf_data,&polarized_density_matrix,&qp_ctrl);
@@ -257,7 +266,7 @@ fn export_density(scf_data:&SCF,polarized_density_matrix:&MatrixFull<f64>,qp_ctr
     _dgemm_full(&first_prod,'N',&vir_eigenvecs,'T',&mut ao_polarized_density_matrix,1.0,0.0);
     let grids = &qp_ctrl.damped_bse_grids;
     let grid_val=eval_ao_on_grids(&scf_data.mol,&grids);
-    grid_val.formated_output(1000,"full");
+    //grid_val.formated_output(1000,"full");
     let mut first_prod=MatrixFull::new([num_state,grids.len()],0.0);
     _dgemm_full(&ao_polarized_density_matrix,'N',&grid_val,'N',&mut first_prod,1.0,0.0);
     let grid_data:Vec<f64>=first_prod.iter_columns_full().zip(grid_val.iter_columns_full()).par_bridge().map(|(fp,gval)|{
@@ -321,4 +330,466 @@ fn export_density(scf_data:&SCF,polarized_density_matrix:&MatrixFull<f64>,qp_ctr
     writeln!(file, "END OF FILE").expect("write failure");
     writeln!(file, "{}", "=".repeat(70)).expect("write failure");
 }
-// 请增加ctrl_io的quasiparticle模块中输入参数:damped_bse采样空间点的x,y,z范围,即规定x起点终点,y起点终点,z起点终点,以及xyz各自的采样点数(起点终点都是采样点,采样步长为(x_t-x_0)/(N-1),N是采样点总数),ri_bse/damped.rs中的export_density即按照这些采样点生成grids向量来采样(目前grids向量是一个长度为4的向量,它仅仅是测试跑通用的,你可以把它替换掉)。注意生成的grids向量需要以OUTER LOOP: X, MIDDLE LOOP: Y, INNER LOOP: Z的顺序来排序
+pub fn damped_bse_gmres(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
+    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
+    let inverse_dielectric=ri_bse::construct_inverse_dielectric(scf_data,&scf_data.eigenvalues[0]);
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    println!("Now begins damped BSE calculation. Parameters:\nOcc Size={},Vir Size={},External Field Freq={},Lifetime Gamma={}",occ_size,vir_size,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma);
+    let mu_z_vec=compute_mu_z_vec(scf_data);
+    let ri_oo=ri_bse::get_submatrix(scf_data,'O','O','N');
+    println!("num_auxbas={}",ri_oo.size[0]);
+    let num_auxbas=ri_oo.size[0];
+    let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
+    _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
+    drop(ri_oo);
+    ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
+    ri_oo_tilde=ri_oo_tilde.transpose_and_drop();
+    ri_oo_tilde.reshape([occ_size*num_auxbas,occ_size]);
+    let ri_ov=ri_bse::get_submatrix(scf_data,'O','V','N');
+    let mut ri_ov_w=ri_ov.clone();
+    ri_ov_w.reshape([num_auxbas*occ_size,vir_size]);
+    let mut ri_vv=ri_bse::get_submatrix(scf_data,'V','V','N');
+    ri_vv.reshape([num_auxbas*vir_size,vir_size]);
+    let mut ri_ov_tilde:MatrixFull<f64>=MatrixFull::new(ri_ov.size,0.0);
+    _dgemm_full(&inverse_dielectric,'N',&ri_ov,'N',&mut ri_ov_tilde,1.0,0.0);
+    drop(inverse_dielectric);
+    ri_ov_tilde.reshape([num_auxbas*occ_size,vir_size]);
+    let external_field_freq=qp_ctrl.external_field_freq;
+    let lifetime_gamma=qp_ctrl.lifetime_gamma;
+    let casida_a_matvec=|z:&Vec<f64>|{
+        ri_bse::matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,z)
+    };
+    let casida_b_matvec=|z:&Vec<f64>|{
+        ri_bse::matvec::b_block_matvec(scf_data,&qp_ctrl,&ri_ov,&ri_ov_w,&ri_ov_tilde,z)
+    };
+    let gmres_matvec=|z:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)|{
+        let mut vec1=casida_a_matvec(&z.0);
+        vec1=vector_scaled_add(&vec1,1.0,&z.0,-external_field_freq);
+        vec1=vector_scaled_add(&vec1,1.0,&casida_b_matvec(&z.1),1.0);
+        vec1=vector_scaled_add(&vec1,1.0,&z.2,-lifetime_gamma);
+        let mut vec2=casida_b_matvec(&z.0);
+        vec2=vector_scaled_add(&vec2,1.0,&casida_a_matvec(&z.1),1.0);
+        vec2=vector_scaled_add(&vec2,1.0,&z.1,external_field_freq);
+        vec2=vector_scaled_add(&vec2,1.0,&z.3,lifetime_gamma);
+        let mut vec3=casida_a_matvec(&z.2);
+        vec3=vector_scaled_add(&vec3,1.0,&z.0,lifetime_gamma);
+        vec3=vector_scaled_add(&vec3,1.0,&z.2,-external_field_freq);
+        vec3=vector_scaled_add(&vec3,1.0,&casida_b_matvec(&z.3),1.0);
+        let mut vec4=casida_b_matvec(&z.2);
+        vec4=vector_scaled_add(&vec4,1.0,&z.1,-lifetime_gamma);
+        vec4=vector_scaled_add(&vec4,1.0,&casida_a_matvec(&z.3),1.0);
+        vec4=vector_scaled_add(&vec4,1.0,&z.3,external_field_freq);
+        (vec1,vec2,vec3,vec4)
+    };
+    let energy_diag=ri_bse::construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
+    let diag_13:Vec<f64>=energy_diag.iter().map(|d|d-external_field_freq).collect();
+    let diag_24:Vec<f64>=energy_diag.iter().map(|d|d+external_field_freq).collect();
+    let precond=|z:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)|->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
+        let apply_inv = |v:&Vec<f64>,d:&Vec<f64>|->Vec<f64>{
+            v.iter().zip(d.iter()).map(|(vi,di)|{
+                if di.abs()>1e-8 {vi/di} else {0.0}
+            }).collect()
+        };
+        (apply_inv(&z.0,&diag_13),apply_inv(&z.1,&diag_24),
+         apply_inv(&z.2,&diag_13),apply_inv(&z.3,&diag_24))
+    };
+    let precond_trivial=|z:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)|->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
+        z.clone()
+    };
+    let mu_z_vec=compute_mu_z_vec(scf_data);
+    let rhs_p=(mu_z_vec.clone(),mu_z_vec.clone(),vec![0.0;occ_size*vir_size],vec![0.0;occ_size*vir_size]);
+    let solution=fourvec_gmres(&gmres_matvec,&precond,&rhs_p,qp_ctrl.damped_bse_tol,qp_ctrl.damped_bse_max_iter);
+    let density_real:Vec<f64>=(0..occ_size*vir_size).map(|ia|solution.0[ia]-solution.1[ia]).collect();
+    let polarized_density_matrix=MatrixFull::from_vec([occ_size,vir_size],density_real).unwrap();
+    export_density(scf_data,&polarized_density_matrix,&qp_ctrl);
+    solution
+}
+
+/// Klopper subspace solver: implements the iterative subspace method from
+/// Section 2.2 of Kehry et al., Mol. Phys. 118, e1755064 (2020).
+///
+/// Solves the 4-component non-Hermitian linear system:
+///   A_4c * z = b_4c     where A_4c = gmres_matvec, b_4c = rhs
+///
+/// Algorithm:
+/// 1. Start with initial guess z_0 = p0 (non-interacting response, Eqns 14-15)
+/// 2. Normalize to get v_0, compute w_0 = A * v_0
+/// 3. At each iteration, project the system onto the subspace:
+///    Q[i][k] = v_i^T * w_k = v_i^T * A * v_k,   q[i] = v_i^T * b
+/// 4. Solve Q * t = q, form full-space solution: z = \Sigma t_k * v_k
+/// 5. Compute residual: r = A*z - b = \Sigma t_k * w_k - b
+/// 6. Generate new direction via Jacobi-Davidson correction (Eqns 21-23):
+///    u = e * M^{-1}*z - M^{-1}*r,  e = (z^T M^{-1} r) / (z^T M^{-1} z)
+/// 7. Orthogonalize and normalize to get v_{k+1}, compute w_{k+1}
+/// 8. Repeat until convergence
+fn klopper_subspace_solver(
+    matvec: impl Fn(&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)) -> (Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),
+    precond: impl Fn(&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)) -> (Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),
+    rhs: &(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),
+    p0: &(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),
+    tol: f64,
+    max_subspace: usize,
+) -> (Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>) {
+    const EPS: f64 = 1e-14;
+
+    let n = rhs.0.len();
+
+    // Normalize initial guess to get v[0]
+    let p0_norm = fourvec_dot_product(p0, p0).sqrt();
+    if p0_norm < EPS {
+        eprintln!("Warning: initial guess norm is too small ({})", p0_norm);
+        return (vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+    }
+    let inv_norm = 1.0 / p0_norm;
+    let mut v_vecs: Vec<(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)> = vec![(
+        num_product(&p0.0, inv_norm),
+        num_product(&p0.1, inv_norm),
+        num_product(&p0.2, inv_norm),
+        num_product(&p0.3, inv_norm),
+    )];
+
+    // Compute w[0] = A * v[0]
+    let w0 = matvec(&v_vecs[0]);
+    let mut w_vecs: Vec<(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)> = vec![w0];
+
+    for iter in 0..max_subspace {
+        let m = iter + 1; // current subspace size
+
+        // Build subspace matrix: Q[i][k] = v[i]^T * w[k] = v[i]^T * A * v[k]
+        // Build projected RHS: q[i] = v[i]^T * rhs
+        let mut q_mat = MatrixFull::new([m, m], 0.0);
+        let mut q_vec = vec![0.0; m];
+        for i in 0..m {
+            q_vec[i] = fourvec_dot_product(&v_vecs[i], rhs);
+            for k in 0..m {
+                q_mat[[i, k]] = fourvec_dot_product(&v_vecs[i], &w_vecs[k]);
+            }
+        }
+
+        // Solve Q * t = q (dense subspace solve)
+        let t = match _dsolve(&q_mat, &q_vec) {
+            Some(t) => t,
+            None => {
+                eprintln!("Klopper solver: subspace solve failed at iteration {}", iter);
+                break;
+            }
+        };
+
+        // Form full-space solution: z = \Sigma t_k * v[k]
+        let mut z = (vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+        for k in 0..m {
+            z = fourvec_scaled_add(&z, 1.0, &v_vecs[k], t[k]);
+        }
+
+        // Compute residual: r = A*z - rhs = \Sigma t_k * w[k] - rhs
+        let mut r = (vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+        for k in 0..m {
+            r = fourvec_scaled_add(&r, 1.0, &w_vecs[k], t[k]);
+        }
+        r = fourvec_scaled_add(&r, 1.0, rhs, -1.0);
+
+        let res_norm = fourvec_dot_product(&r, &r).sqrt();
+        println!("Klopper Solver: Iteration {}, Subspace Size {}, Residual = {:.2e}, Threshold = {:.2e}",
+                 iter, m, res_norm, tol);
+
+        if res_norm < tol {
+            println!("Klopper Solver converged at iteration {} with residual {:.2e}", iter, res_norm);
+            return z;
+        }
+
+        // Generate new trial vector using Jacobi-Davidson correction (paper Eqns 21-23)
+        // u = e * M^{-1}*z - M^{-1}*r
+        // e = (z^T * M^{-1} * r) / (z^T * M^{-1} * z)
+        let m_inv_z = precond(&z);
+        let m_inv_r = precond(&r);
+
+        let zt_m_inv_r = fourvec_dot_product(&z, &m_inv_r);
+        let zt_m_inv_z = fourvec_dot_product(&z, &m_inv_z);
+
+        let epsilon = if zt_m_inv_z.abs() > EPS {
+            zt_m_inv_r / zt_m_inv_z
+        } else {
+            0.0
+        };
+
+        // u = e * M^{-1}*z - M^{-1}*r
+        let mut u = fourvec_scaled_add(&m_inv_z, epsilon, &m_inv_r, -1.0);
+
+        // Modified Gram-Schmidt (MGS) with iterated reorthogonalization
+        // for numerical stability. Each projection uses the progressively
+        // updated u, and reorthogonalization removes residual components.
+        for _reortho in 0..2 {
+            for existing_v in &v_vecs {
+                let v_norm2 = fourvec_dot_product(existing_v, existing_v);
+                if v_norm2 < EPS { continue; }
+                let dot_val = fourvec_dot_product(&u, existing_v);
+                u = fourvec_scaled_add(&u, 1.0, existing_v, -dot_val / v_norm2);
+            }
+        }
+
+        // Normalize u to get v[m] = u_{new}
+        let u_norm = fourvec_dot_product(&u, &u).sqrt();
+        if u_norm < EPS {
+            println!("Klopper Solver: new direction norm too small ({}), stopping", u_norm);
+            return z;
+        }
+        let inv_u = 1.0 / u_norm;
+        let v_new = (
+            num_product(&u.0, inv_u),
+            num_product(&u.1, inv_u),
+            num_product(&u.2, inv_u),
+            num_product(&u.3, inv_u),
+        );
+
+        // Compute w_new = A * v_new
+        let w_new = matvec(&v_new);
+
+        // Expand subspace
+        v_vecs.push(v_new);
+        w_vecs.push(w_new);
+    }
+
+    eprintln!("Warning: Klopper Solver reached maximum subspace size ({}) without convergence", max_subspace);
+
+    // Return best approximation from final subspace
+    let m = v_vecs.len();
+    let mut q_mat = MatrixFull::new([m, m], 0.0);
+    let mut q_vec = vec![0.0; m];
+    for i in 0..m {
+        q_vec[i] = fourvec_dot_product(&v_vecs[i], rhs);
+        for k in 0..m {
+            q_mat[[i, k]] = fourvec_dot_product(&v_vecs[i], &w_vecs[k]);
+        }
+    }
+    if let Some(t) = _dsolve(&q_mat, &q_vec) {
+        let mut z = (vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+        for k in 0..m {
+            z = fourvec_scaled_add(&z, 1.0, &v_vecs[k], t[k]);
+        }
+        return z;
+    }
+    (vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n])
+}
+
+pub fn damped_bse_klopper(scf_data: &SCF) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+    let (start_mo, num_state, occ_size, vir_size, homo, lumo) = get_occupation_parameters(scf_data, 'N');
+    let inverse_dielectric = ri_bse::construct_inverse_dielectric(scf_data, &scf_data.eigenvalues[0]);
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    println!("Now begins damped BSE calculation (Klopper Subspace Solver). Parameters:\nOcc Size={}, Vir Size={}, External Field Freq={}, Lifetime Gamma={}",
+             occ_size, vir_size, qp_ctrl.external_field_freq, qp_ctrl.lifetime_gamma);
+    let mu_z_vec = compute_mu_z_vec(scf_data);
+    let ri_oo = ri_bse::get_submatrix(scf_data, 'O', 'O', 'N');
+    println!("num_auxbas={}", ri_oo.size[0]);
+    let num_auxbas = ri_oo.size[0];
+    let mut ri_oo_tilde: MatrixFull<f64> = MatrixFull::new(ri_oo.size, 0.0);
+    _dgemm_full(&inverse_dielectric, 'N', &ri_oo, 'N', &mut ri_oo_tilde, 1.0, 0.0);
+    drop(ri_oo);
+    ri_oo_tilde.reshape([num_auxbas * occ_size, occ_size]);
+    ri_oo_tilde = ri_oo_tilde.transpose_and_drop();
+    ri_oo_tilde.reshape([occ_size * num_auxbas, occ_size]);
+    let ri_ov = ri_bse::get_submatrix(scf_data, 'O', 'V', 'N');
+    let mut ri_ov_w = ri_ov.clone();
+    ri_ov_w.reshape([num_auxbas * occ_size, vir_size]);
+    let mut ri_vv = ri_bse::get_submatrix(scf_data, 'V', 'V', 'N');
+    ri_vv.reshape([num_auxbas * vir_size, vir_size]);
+    let mut ri_ov_tilde: MatrixFull<f64> = MatrixFull::new(ri_ov.size, 0.0);
+    _dgemm_full(&inverse_dielectric, 'N', &ri_ov, 'N', &mut ri_ov_tilde, 1.0, 0.0);
+    drop(inverse_dielectric);
+    ri_ov_tilde.reshape([num_auxbas * occ_size, vir_size]);
+
+    let external_field_freq = qp_ctrl.external_field_freq;
+    let lifetime_gamma = qp_ctrl.lifetime_gamma;
+
+    // Matrix-vector product: same 4-component operator as GMRES
+    let casida_a_matvec = |z: &Vec<f64>| {
+        ri_bse::matvec::a_block_matvec(scf_data, &qp_ctrl, &ri_vv, &ri_ov, &ri_oo_tilde, z)
+    };
+    let casida_b_matvec = |z: &Vec<f64>| {
+        ri_bse::matvec::b_block_matvec(scf_data, &qp_ctrl, &ri_ov, &ri_ov_w, &ri_ov_tilde, z)
+    };
+    let gmres_matvec = |z: &(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)| {
+        let mut vec1 = casida_a_matvec(&z.0);
+        vec1 = vector_scaled_add(&vec1, 1.0, &z.0, -external_field_freq);
+        vec1 = vector_scaled_add(&vec1, 1.0, &casida_b_matvec(&z.1), 1.0);
+        vec1 = vector_scaled_add(&vec1, 1.0, &z.2, -lifetime_gamma);
+        let mut vec2 = casida_b_matvec(&z.0);
+        vec2 = vector_scaled_add(&vec2, 1.0, &casida_a_matvec(&z.1), 1.0);
+        vec2 = vector_scaled_add(&vec2, 1.0, &z.1, external_field_freq);
+        vec2 = vector_scaled_add(&vec2, 1.0, &z.3, lifetime_gamma);
+        let mut vec3 = casida_a_matvec(&z.2);
+        vec3 = vector_scaled_add(&vec3, 1.0, &z.0, lifetime_gamma);
+        vec3 = vector_scaled_add(&vec3, 1.0, &z.2, -external_field_freq);
+        vec3 = vector_scaled_add(&vec3, 1.0, &casida_b_matvec(&z.3), 1.0);
+        let mut vec4 = casida_b_matvec(&z.2);
+        vec4 = vector_scaled_add(&vec4, 1.0, &z.1, -lifetime_gamma);
+        vec4 = vector_scaled_add(&vec4, 1.0, &casida_a_matvec(&z.3), 1.0);
+        vec4 = vector_scaled_add(&vec4, 1.0, &z.3, external_field_freq);
+        (vec1, vec2, vec3, vec4)
+    };
+
+    // Diagonal preconditioner: M = diag(A_4c)
+    let energy_diag = ri_bse::construct_energy_diag_for_a(&scf_data.gwqp.0, occ_size, vir_size);
+    let diag_13: Vec<f64> = energy_diag.iter().map(|d| d - external_field_freq).collect();
+    let diag_24: Vec<f64> = energy_diag.iter().map(|d| d + external_field_freq).collect();
+    let precond = |z: &(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)| -> (Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>) {
+        let apply_inv = |v: &Vec<f64>, d: &Vec<f64>| -> Vec<f64> {
+            v.iter().zip(d.iter()).map(|(vi, di)| {
+                if di.abs() > 1e-8 { vi / di } else { 0.0 }
+            }).collect()
+        };
+        (apply_inv(&z.0, &diag_13), apply_inv(&z.1, &diag_24),
+         apply_inv(&z.2, &diag_13), apply_inv(&z.3, &diag_24))
+    };
+
+    // RHS: dipole integrals in 4-component form
+    let rhs = (mu_z_vec.clone(), mu_z_vec.clone(),
+               vec![0.0; occ_size * vir_size], vec![0.0; occ_size * vir_size]);
+
+    // Initial guess: non-interacting response (paper Eqns 14-15)
+    let p0 = prepare_p0_r_i(&mu_z_vec, &scf_data.gwqp.0,
+                             external_field_freq, lifetime_gamma,
+                             occ_size, vir_size);
+
+    // Run the subspace solver
+    let solution = klopper_subspace_solver(&gmres_matvec, &precond, &rhs, &p0,
+                                           qp_ctrl.damped_bse_tol, qp_ctrl.damped_bse_max_iter);
+
+    let density_real: Vec<f64> = (0..occ_size * vir_size).map(|ia| solution.0[ia] - solution.1[ia]).collect();
+    let polarized_density_matrix = MatrixFull::from_vec([occ_size, vir_size], density_real).unwrap();
+    export_density(scf_data, &polarized_density_matrix, &qp_ctrl);
+    solution
+}
+
+fn fourvec_gmres(
+    matvec:impl Fn(&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>))->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),
+    precond:impl Fn(&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>))->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),
+    rhs:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),
+    tol: f64,
+    max_total_iter: usize)
+    ->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
+    const KRYLOV_DIM: usize = 30;
+    let max_restarts = if max_total_iter > KRYLOV_DIM { max_total_iter / KRYLOV_DIM } else { 1 };
+    const EPS: f64 = 1e-14;
+
+    let n = rhs.0.len();
+    // initial guess: x = 0
+    let mut x = (vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+    let mut iter_count=0;
+    for _restart in 0..max_restarts {
+        // r = b - A*x
+        let ax = matvec(&x);
+        let r = fourvec_scaled_add(rhs, 1.0, &ax, -1.0);
+        let beta = fourvec_dot_product(&r, &r).sqrt();
+
+        if beta < tol {
+            break;
+        }
+
+        // v[0] = r / beta
+        let inv_beta = 1.0 / beta;
+        let mut v: Vec<(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)> = vec![(
+            num_product(&r.0, inv_beta),
+            num_product(&r.1, inv_beta),
+            num_product(&r.2, inv_beta),
+            num_product(&r.3, inv_beta),
+        )];
+        // z[i] = M^{-1} * v[i] for solution reconstruction
+        let mut z: Vec<(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)> = Vec::new();
+
+        // Hessenberg matrix: (KRYLOV_DIM+1) rows x KRYLOV_DIM cols, stored as h[row][col]
+        let mut h = vec![vec![0.0; KRYLOV_DIM]; KRYLOV_DIM + 1];
+        let mut c = vec![0.0; KRYLOV_DIM];
+        let mut s = vec![0.0; KRYLOV_DIM];
+        let mut g = vec![0.0; KRYLOV_DIM + 1];
+        g[0] = beta;
+
+        let mut actual_dim = KRYLOV_DIM;
+        let mut converged = false;
+
+        for j in 0..KRYLOV_DIM {
+            // Right-preconditioned GMRES:
+            //   z_j = M^{-1} * v_j   (apply preconditioner)
+            //   w_j = A * z_j         (matrix-vector product on preconditioned vector)
+            let zj = precond(&v[j]);
+            let w = matvec(&zj);
+            z.push(zj);
+
+            // Arnoldi: orthogonalize w against v[0..j]
+            let mut w_orth = w.clone();
+            for i in 0..=j {
+                h[i][j] = fourvec_dot_product(&w_orth, &v[i]);
+                w_orth = fourvec_scaled_add(&w_orth, 1.0, &v[i], -h[i][j]);
+            }
+
+            h[j+1][j] = fourvec_dot_product(&w_orth, &w_orth).sqrt();
+
+            if h[j+1][j] < EPS {
+                // happy breakdown
+                actual_dim = j + 1;
+                converged = true;
+                break;
+            }
+
+            // v_{j+1} = w_orth / h_{j+1,j}
+            let inv_h = 1.0 / h[j+1][j];
+            v.push((
+                num_product(&w_orth.0, inv_h),
+                num_product(&w_orth.1, inv_h),
+                num_product(&w_orth.2, inv_h),
+                num_product(&w_orth.3, inv_h),
+            ));
+
+            // Apply previous Givens rotations to column j of H
+            for i in 0..j {
+                let h_ij = h[i][j];
+                let h_i1j = h[i+1][j];
+                h[i][j]   =  c[i] * h_ij + s[i] * h_i1j;
+                h[i+1][j] = -s[i] * h_ij + c[i] * h_i1j;
+            }
+
+            // Compute new Givens rotation to eliminate h[j+1][j]
+            let r = (h[j][j].powi(2) + h[j+1][j].powi(2)).sqrt();
+            c[j] = h[j][j] / r;
+            s[j] = h[j+1][j] / r;
+            h[j][j] = r;
+            h[j+1][j] = 0.0;
+
+            // Apply rotation to g
+            let g_j = g[j];
+            g[j]   =  c[j] * g_j + s[j] * g[j+1];  // g[j+1] is 0 here
+            g[j+1] = -s[j] * g_j + c[j] * g[j+1];  // = -s[j] * g_j
+
+            let residual = g[j+1].abs();
+            iter_count+=1;
+            println!("GMRES Iteration {}, Residue={}, Converging Threshold is {}",iter_count,residual,tol);
+            if residual < tol {
+                converged = true;
+                actual_dim = j + 1;
+                break;
+            }
+        }
+
+        // Back-substitution: solve R * y = g[0..m]
+        let m = actual_dim;
+        let mut y = vec![0.0; m];
+        for i in (0..m).rev() {
+            y[i] = g[i];
+            for k in i+1..m {
+                y[i] -= h[i][k] * y[k];
+            }
+            y[i] /= h[i][i];
+        }
+
+        // Update solution: x = x + sum_{i=0}^{m-1} y[i] * z[i]
+        // (z[i] = M^{-1} * v[i] for right-preconditioned GMRES)
+        for i in 0..m {
+            x = fourvec_scaled_add(&x, 1.0, &z[i], y[i]);
+        }
+
+        if converged {
+            break;
+        }
+    }
+
+    x
+}

@@ -76,6 +76,10 @@ pub struct QuasiParticle {
     pub damped_bse_z_end: f64,
     pub damped_bse_z_points: usize,
     pub damped_bse_grids: Vec<[f64; 3]>,
+    // damped BSE solver selection
+    pub damped_bse_solver: String,
+    pub damped_bse_tol: f64,
+    pub damped_bse_max_iter: usize,
     // FEAST solver control and parameters for BSE
     pub bse_feast_solver: bool,
     pub bse_eigenrange_min: f64,
@@ -161,6 +165,9 @@ impl Default for QuasiParticle {
             damped_bse_z_end: 1.0,
             damped_bse_z_points: 2,
             damped_bse_grids: Vec::new(),
+            damped_bse_solver: String::from("klopper"),
+            damped_bse_tol: 1e-6,
+            damped_bse_max_iter: 200,
             bse_feast_solver: false,
             bse_eigenrange_min: 0.0,
             bse_eigenrange_max: 0.5,
@@ -258,6 +265,9 @@ impl QuasiParticle {
         table.insert("bse_feast_cg_tol".to_string(), toml::Value::Float(self.bse_feast_cg_tol));
         table.insert("bse_feast_gmres_restart".to_string(), toml::Value::Integer(self.bse_feast_gmres_restart as i64));
         table.insert("bse_feast_gmres_max_iter".to_string(), toml::Value::Integer(self.bse_feast_gmres_max_iter as i64));
+        table.insert("damped_bse_solver".to_string(), toml::Value::String(self.damped_bse_solver.clone()));
+        table.insert("damped_bse_tol".to_string(), toml::Value::Float(self.damped_bse_tol));
+        table.insert("damped_bse_max_iter".to_string(), toml::Value::Integer(self.damped_bse_max_iter as i64));
         toml::Value::Table(table)
     }
 }
@@ -615,6 +625,18 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 }
             }
             tmp_input.damped_bse_grids = grids;
+            tmp_input.damped_bse_solver = match tmp_ctrl.get("damped_bse_solver").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone().to_lowercase(),
+                _ => String::from("klopper"),
+            };
+            tmp_input.damped_bse_tol = match tmp_ctrl.get("damped_bse_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e-6),
+                _ => 1e-6,
+            };
+            tmp_input.damped_bse_max_iter = match tmp_ctrl.get("damped_bse_max_iter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(200) as usize,
+                _ => 200,
+            };
             return Ok(Some(tmp_input));
         },
         other => {
