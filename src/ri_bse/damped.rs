@@ -78,10 +78,16 @@ pub fn prepare_p0_r_i(mu_z_vec:&Vec<f64>,gwqp:&Vec<f64>,omega:f64,gamma:f64,occ_
     (0..occ_size).cartesian_product(0..vir_size).for_each(|(i,a)|{
         let mu_ia_z=mu_z_vec[i+a*occ_size];
         let energy_gap=gwqp[a+occ_size]-gwqp[i];
-        p0rp[i+a*occ_size]=(omega-energy_gap)/((omega-energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
+        // Non-interacting response for GMRES convention (omega -> omega - i*gamma):
+        //   A_4c_nonint * z_nonint = b_4c
+        //   z0_nonint = P*(D-omega)/Delta   (rp component)
+        //   z2_nonint = -gamma*P/Delta      (ip component)
+        //   z1_nonint = P*(D+omega)/Delta_plus  (rm component)
+        //   z3_nonint = gamma*P/Delta_plus      (im component)
+        p0rp[i+a*occ_size]=(energy_gap-omega)/((omega-energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
         p0rm[i+a*occ_size]=(omega+energy_gap)/((omega+energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
         p0ip[i+a*occ_size]=-gamma/((omega-energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
-        p0im[i+a*occ_size]=gamma/((omega+energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
+        p0im[i+a*occ_size]= gamma/((omega+energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
     });
     (p0rp,p0rm,p0ip,p0im)
 }
@@ -119,10 +125,19 @@ pub fn update_w_vecs<F1>(rp:&Vec<f64>,rm:&Vec<f64>,ip:&Vec<f64>,im:&Vec<f64>,pai
         let energy_gap=gwqp[a+occ_size]-gwqp[i];
         let prefactor_p:f64=1.0/((omega-energy_gap).powf(2.0)+gamma.powf(2.0));
         let prefactor_m:f64=1.0/((omega+energy_gap).powf(2.0)+gamma.powf(2.0));
-        wrp[i+a*occ_size]=prefactor_p*((omega-energy_gap)*krp[i+a*occ_size]-gamma*kip[i+a*occ_size]);
-        wrm[i+a*occ_size]=prefactor_m*((omega+energy_gap)*krm[i+a*occ_size]-gamma*kim[i+a*occ_size]);
-        wip[i+a*occ_size]=prefactor_p*((omega-energy_gap)*kip[i+a*occ_size]+gamma*krp[i+a*occ_size]);
-        wim[i+a*occ_size]=prefactor_m*(-(omega+energy_gap)*kim[i+a*occ_size]+gamma*krm[i+a*occ_size]);
+        // T(z) = A_4c_diag^{-1} * Interaction  (exact equivalence with GMRES)
+        // wrp/ip: sign flip needed (rp/ip block)
+        wrp[i+a*occ_size]=-prefactor_p*((omega-energy_gap)*krp[i+a*occ_size]-gamma*kip[i+a*occ_size]);
+        wip[i+a*occ_size]=-prefactor_p*((omega-energy_gap)*kip[i+a*occ_size]+gamma*krp[i+a*occ_size]);
+        // wrm: no sign flip (rm block)
+        wrm[i+a*occ_size]= prefactor_m*((omega+energy_gap)*krm[i+a*occ_size]-gamma*kim[i+a*occ_size]);
+        // wim: sign of (omega+energy_gap)*kim term flipped relative to original
+        wim[i+a*occ_size]= prefactor_m*((omega+energy_gap)*kim[i+a*occ_size]+gamma*krm[i+a*occ_size]);
+        // Diagonal correction (cancels D contribution, forces T(z_ni)=0)
+        wrp[i+a*occ_size] += energy_gap * prefactor_p * ((omega-energy_gap)*rp[i+a*occ_size] - gamma*ip[i+a*occ_size]);
+        wrm[i+a*occ_size] -= energy_gap * prefactor_m * ((omega+energy_gap)*rm[i+a*occ_size] - gamma*im[i+a*occ_size]);
+        wip[i+a*occ_size] += energy_gap * prefactor_p * ((omega-energy_gap)*ip[i+a*occ_size] + gamma*rp[i+a*occ_size]);
+        wim[i+a*occ_size] -= energy_gap * prefactor_m * ((omega+energy_gap)*im[i+a*occ_size] + gamma*rm[i+a*occ_size]);
     });
     (wrp,wrm,wip,wim)
 } 
