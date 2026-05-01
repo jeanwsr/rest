@@ -280,10 +280,23 @@ impl SCF {
         }
         //========================================
         // For emperial dispersion correction
-        if let Some(empirical_dispersion_name) = &self.mol.ctrl.empirical_dispersion {
+        let mut disp_from_parse_xc = false;
+        if let Some(dfadef) = &self.mol.dfadef {
+        if dfadef.has_dispersion() {
+            disp_from_parse_xc = true;
+        }
+        }
+        let disp_from_ctrl = self.mol.ctrl.empirical_dispersion.is_some();
+        if disp_from_ctrl || disp_from_parse_xc {
             let (engy_disp, grad_disp, sigma_disp) = dftd(self);
+
+            let disp_name = if disp_from_parse_xc {
+                self.mol.dfadef.as_ref().unwrap().get_dispersion().unwrap().func.clone()
+            } else {
+                self.mol.ctrl.empirical_dispersion.clone().unwrap()
+            };
             if self.mol.ctrl.print_level>1 { 
-                println!("The empirical dispersion energy of {} is {}.", self.mol.ctrl.empirical_dispersion.clone().unwrap().to_uppercase(), engy_disp)
+                println!("The empirical dispersion energy of {} is {}.", disp_name.to_uppercase(), engy_disp)
             };
             if self.mol.ctrl.print_level>3 { 
                 println!("{:?}, {:?}", &grad_disp, &sigma_disp);
@@ -292,7 +305,8 @@ impl SCF {
             
             // empirical dispersion energy added to the nuc_energy
             self.nuc_energy += engy_disp;
-        } else {
+        }
+        if !disp_from_ctrl && !disp_from_parse_xc {
             if self.mol.ctrl.print_level>1 { 
                 println!("no empirical dispersion correction is employed");
             }

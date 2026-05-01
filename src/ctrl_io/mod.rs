@@ -287,6 +287,8 @@ pub struct InputKeywords {
     pub opt_engine: Option<String>,
     pub geometric_pyo3: Option<GeomeTRIC>,
     pub quasiparticle_methods:Option<QuasiParticle>,
+    pub stop_at: Option<String>,
+    pub xc_parser: String,
     pub tddft: Option<TDDFTParameters>,
     pub j2c_decomp: J2CDecompOption,
     pub ri_pt2: RiPt2Option,
@@ -426,6 +428,8 @@ impl InputKeywords {
             solvent_enabled: false,
             solv_epsilon:1.0,
             solvent_model: PcmMethod::CPCM,
+            stop_at: None,
+            xc_parser: String::from("legacy"),
             j2c_decomp: J2CDecompOption::default(),
             ri_pt2: RiPt2Option::default(),
             tddft: None,
@@ -856,6 +860,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     DFTType::Standard
                 },
             };
+            // to be deprecated
             tmp_input.xc_namelist = match tmp_ctrl.get("xc_namelist").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_op) => {Some(vec![tmp_op.to_lowercase()])},
                 serde_json::Value::Array(tmp_op) => {
@@ -882,6 +887,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 },
                 other => {None},
             };
+            //
             tmp_input.dfa_hybrid_scf = match tmp_ctrl.get("xc_hybrid_para").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {Some(tmp_str.parse().unwrap_or(0.0))},
                 serde_json::Value::Number(tmp_num) => {Some(tmp_num.as_f64().unwrap_or(0.0))},
@@ -1561,6 +1567,16 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 },
                 serde_json::Value::Null => { None },
                 _ => panic!("Not recognized type for opt_engine"),
+            };
+
+            tmp_input.stop_at = match tmp_ctrl.get("stop_at").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => { Some(tmp_str.to_lowercase()) },
+                other => None,
+            };
+
+            tmp_input.xc_parser = match tmp_ctrl.get("xc_parser").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => { tmp_str.to_lowercase() },
+                other => String::from("legacy"),
             };
             
             //===========================================================

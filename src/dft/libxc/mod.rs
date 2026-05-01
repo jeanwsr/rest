@@ -258,8 +258,29 @@ impl XcFuncType {
         }
     }
 
+    pub fn is_rsh(&self) -> bool {
+        unsafe{(*self.xc_func_info_type).flags & (ffi_xc::XC_FLAGS_HYB_CAM as i32) != 0
+        }
+    }
+
+    pub fn xc_hyb_cam_coef(&self) -> (f64, f64, f64) {
+        let mut omega: f64 = 0.0;
+        let mut alpha: f64 = 0.0;
+        let mut beta: f64 = 0.0;
+        unsafe{ffi_xc::xc_hyb_cam_coef(self.xc_func_type, &mut omega, &mut alpha, &mut beta)};
+        (omega, alpha, beta)
+    }
+
     pub fn xc_hyb_exx_coeff(&self) -> f64 {
         unsafe{ffi_xc::xc_hyb_exx_coef(self.xc_func_type)}
+    }
+
+    pub fn is_nlc(&self) -> bool {
+        unsafe{(*self.xc_func_info_type).flags & (ffi_xc::XC_FLAGS_VV10 as i32) != 0}
+    }
+
+    pub fn use_laplacian(&self) -> bool {
+        unsafe{(*self.xc_func_info_type).flags & (ffi_xc::XC_FLAGS_NEEDS_LAPLACIAN as i32) != 0}
     }
 
     pub fn lda_exc(&self, rho: &[f64]) -> Vec<f64> {
@@ -417,6 +438,28 @@ impl XcFuncType {
 
     pub fn get_libxc_family(&self) -> LibXCFamily {
         self.xc_func_family.clone()
+    }
+
+    pub fn get_libxc_references(&self) -> Vec<String> {
+        let mut references = Vec::new();
+        for i in 0..5 {
+            unsafe {
+                let c_ref = ffi_xc::xc_func_info_get_references(self.xc_func_info_type, i);
+                if c_ref != std::ptr::null() {
+                    let x_ref = {
+                        let c_buf = ffi_xc::xc_func_reference_get_ref(c_ref);
+                        let c_str = CStr::from_ptr(c_buf);
+                        let str_slice = c_str.to_str().unwrap_or_default();
+                        str_slice.to_owned()
+                    };
+                    // println!("Reference {}: {}", i, x_ref);
+                    references.push(x_ref);
+                } else {
+                    break;
+                }
+            }
+        }
+        references
     }
 
     pub fn printout_family_name_ref(xc_info: *const xc_func_info_type, x_or_c: &str) {
