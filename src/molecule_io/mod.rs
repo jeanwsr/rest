@@ -8,24 +8,18 @@ use pyo3::{pyclass, pymethods};
 use rayon::prelude::{IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator};
 use rest_libcint::prelude::*;
 use rest_tensors::{ERIFull,RIFull,ERIFold4,TensorSlice,TensorSliceMut,TensorOptMut,TensorOpt, MatrixUpper, MatrixFull};
-use libc::regerror;
-use statrs::distribution::Continuous;
 use tensors::{map_upper_to_full, BasicMatrix, SubMatrixUpper};
 use tensors::external_libs::{ri_copy_from_ri, matr_copy_from_ri};
 use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _power, _power_rayon_for_symmetric_matrix, _newton_schulz_inverse_square_root_v02};
 use std::collections::HashMap;
-use std::fmt::format;
-use std::fs;
 use std::ops::Range;
 use std::sync::mpsc::channel;
-use std::thread::panicking;
-use std::path::PathBuf;
+use std::path::{PathBuf,Path};
 use rest_libcint::{CINTR2CDATA, CintType};
-use std::path::Path;
 use regex::Regex;
 use crate::basis_io::etb::{get_etb_elem, etb_gen_for_atom_list, InfoV2};
 use crate::constants::{ATM_NUC, ATM_NUC_MOD_OF, AUXBAS_THRESHOLD, ELEM1ST, ELEM2ND, ELEM3RD, ELEM4TH, ELEM5TH, ELEM6TH, ELEMTMS, ENV_PRT_START, NUC_ECP, NUC_FRAC_CHARGE, NUC_STAD_CHARGE};
-use crate::dft::{DFTType, DFA4REST};
+use crate::dft::{DFTType, DFA4REST, parse_xc};
 use crate::geom_io::{GeomCell,MOrC, GeomUnit, get_mass_charge};
 use crate::basis_io::{ecp, BasInfo, Basis4Elem};
 use crate::ctrl_io::{overall_parse_and_report_on_ctrl_geom, InputKeywords, parse_ctl};
@@ -37,9 +31,6 @@ use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper, omp_get_num_threa
 use crate::solvent::PcmMethod;
 use crate::ri_jk;
 
-//extern crate nalgebra as na;
-//use na::{DMatrix,DVector};
-//use crate::geom_io::{GeomCell,GeomCell,CodeSelect,MOrC, GeomUnit, RawGeomCell};
 
 pub fn get_basis_name(ang: usize, ctype: &CintType, index: usize) -> String {
     let mut ang_name = if ang==0 {String::from("S")
@@ -86,6 +77,7 @@ pub struct Molecule {
     #[pyo3(get, set)]
     pub spin_channel: usize,
     // exchange-correlation functionals
+    pub dfadef: Option<parse_xc::DFAdef>,
     pub xc_data: DFA4REST,
     pub use_eri: bool,
     #[pyo3(get, set)]
@@ -137,6 +129,7 @@ impl Molecule {
         Molecule {
             ctrl:InputKeywords::init_ctrl(),
             mpi_data: None,
+            dfadef: None, 
             xc_data: DFA4REST::new("hf",1, 0),
             use_eri: false,
             geom: GeomCell::init_geom(),
@@ -231,16 +224,42 @@ impl Molecule {
         //});
 
         //let basis4elem = bas;
-
-        let xc_data = match &ctrl.xc_type {
+        let (dfadef, xc_data) = match &ctrl.xc_type {
             DFTType::Standard => {
-                let mut cur_xc_data = DFA4REST::new(&ctrl.xc, spin_channel, ctrl.print_level);
-                cur_xc_data.update_pt2_params(ctrl.ri_pt2.os_factor, ctrl.ri_pt2.ss_factor);
-                cur_xc_data
+                println!("Using xc_parser {}", ctrl.xc_parser);
+                match ctrl.xc_parser.as_str() {
+                    "legacy" => {
+                    let mut cur_xc_data = DFA4REST::new(&ctrl.xc, spin_channel, ctrl.print_level);
+                    cur_xc_data.update_pt2_params(ctrl.ri_pt2.os_factor, ctrl.ri_pt2.ss_factor);
+                    (None, cur_xc_data)
+                    },
+                    "parse_xc" => {
+                        let mut dfadef = parse_xc::parse_and_derive(&ctrl.xc, spin_channel, ctrl.print_level);
+                        let (san, err_strings) = dfadef.check_sanity();
+                        if !san {
+                            panic!("{}", err_strings.join("\n"));
+                        }
+                        (Some(dfadef.clone()), dfadef.to_dfa4rest())
+                    },
+                    _ => {
+                        panic!("Error:: Unknown xc_parser '{}'. Please use either 'legacy' or 'parse_xc'", 
+                               ctrl.xc_parser);
+                    }
+                }
             },
-            DFTType::NonStandard => {DFA4REST::new_nonstandard(spin_channel, ctrl.print_level, &ctrl.xc_namelist, &ctrl.xc_paralist, &ctrl.dfa_hybrid_scf)},
-            DFTType::DeepLearning => {DFA4REST::new_deep_learning(spin_channel, ctrl.print_level, &ctrl.xc_model)}
+            DFTType::NonStandard => {
+                println!("Warning: DFTType::NonStandard is about to be deprecated. Please use xc_parser = 'parse_xc' instead.");
+                (None, DFA4REST::new_nonstandard(spin_channel, ctrl.print_level, &ctrl.xc_namelist, &ctrl.xc_paralist, &ctrl.dfa_hybrid_scf))
+            },
+            DFTType::DeepLearning => {(None, DFA4REST::new_deep_learning(spin_channel, ctrl.print_level, &ctrl.xc_model))}
         };
+
+        xc_data.summary();
+        if let Some(stop_at) = &ctrl.stop_at {
+            if stop_at == "parse_xc" {
+                std::process::exit(0);
+            }
+        }
 
         let use_eri = xc_data.use_eri();
         
@@ -277,6 +296,7 @@ impl Molecule {
             ctrl,
             mpi_data,
             geom,
+            dfadef,
             xc_data,
             use_eri,
             num_elec,
@@ -569,7 +589,7 @@ impl Molecule {
             //bse_auxbas_getter insert here
             let re = Regex::new(r"/?(?P<basis>[^/]*)/?$").unwrap();
             let cap = re.captures(&ctrl.auxbas_path).unwrap();
-            let auxbas_name = cap.name("basis").unwrap().to_string();
+            let auxbas_name = cap.name("basis").unwrap().as_str().to_string();
             if ctrl.print_level > 0 {
                 println!("auxbas_name = {} from {}", &auxbas_name, &ctrl.auxbas_path)
             };
@@ -742,7 +762,7 @@ impl Molecule {
         if required_elem.len() != 0 {
             let re = Regex::new(r"/?(?P<basis>[^/]*)/?$").unwrap();
             let cap = re.captures(&ctrl.basis_path).unwrap();
-            let basis_name = cap.name("basis").unwrap().to_string();
+            let basis_name = cap.name("basis").unwrap().as_str().to_string();
             if check_basis_name(&basis_name) {
                 bse_downloader::bse_basis_getter_v2(&basis_name,&geom, &ctrl.basis_path, &required_elem);
             }  else {

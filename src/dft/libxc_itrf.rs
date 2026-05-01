@@ -4,10 +4,7 @@ xc functional interface to Libxc for REST
 
 use core::panic;
 use rayon::prelude::*;
-
 use rstsr::prelude::*;
-
-use crate::dft::DFA4REST;
 use crate::dft::libxc::{XcFuncType, LibXCFamily, eval_libxc_func_new};
 use crate::dft::xc_deriv::{XCType, xc_indices_transform, transform_xc_inner, count_combinations};
 

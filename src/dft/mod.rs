@@ -1,51 +1,46 @@
+#![warn(unused_imports)]
 mod libxc;
 pub mod gen_grids;
 pub mod deep_learning;
 pub mod libxc_itrf;
 pub mod xc_deriv;
 pub mod num_int;
+pub mod parse_xc;
 
-use libm::powf;
 use mpi::collective::SystemOperation;
-use mpi::ffi::MPI_T_SCOPE_GROUP_EQ;
-use rest_tensors::{MatrixFull, MatrixFullSliceMut, TensorSliceMut, RIFull, MatrixFullSlice};
-use rest_tensors::matrix_blas_lapack::{_dgemm_nn,_dgemm_tn, _einsum_01_serial, _einsum_02_serial, _einsum_01_rayon, _einsum_02_rayon};
+// use mpi::ffi::MPI_T_SCOPE_GROUP_EQ;
+use rest_tensors::{MatrixFull, RIFull, MatrixFullSlice};
+use rest_tensors::matrix_blas_lapack::{_einsum_01_serial, _einsum_02_serial, _einsum_01_rayon, _einsum_02_rayon};
 use itertools::{Itertools, izip};
-use libc::access;
-use tensors::{BasicMatrix, BasicMatrixOpt, MathMatrix, ParMathMatrix};
-use tensors::external_libs::{general_dgemm_f, matr_copy};
+use tensors::{BasicMatrix, MathMatrix, ParMathMatrix};
+// use tensors::external_libs::{general_dgemm_f, matr_copy};
 use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, contract_vxc_0_serial};
 //use numgrid::{self, radial_grid_lmg_bse};
-use self::gen_grids::radial_grid_lmg_bse;
+// use self::gen_grids::radial_grid_lmg_bse;
 use rayon::iter::{IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator, IntoParallelRefMutIterator};
 use regex::Regex;
-use crate::basis_io::{BasCell, Basis4Elem, cartesian_gto_cint, cartesian_gto_std, cint_norm_factor, gto_1st_value, gto_1st_value_batch_serial, gto_1st_value_serial, gto_value, gto_value_debug, gto_value_matrixfull_serial, gto_value_serial, spheric_gto_1st_value_batch, spheric_gto_1st_value_batch_serial, spheric_gto_1st_value_serial, spheric_gto_value_matrixfull, spheric_gto_value_matrixfull_serial, spheric_gto_value_serial};
+#[cfg(test)]
+use crate::basis_io::{BasCell, Basis4Elem, cint_norm_factor,};
+use crate::basis_io::{gto_1st_value_batch_serial, gto_1st_value_serial, gto_value, gto_value_matrixfull_serial, gto_value_serial, spheric_gto_1st_value_batch, 
+    spheric_gto_value_matrixfull};
 use crate::molecule_io::Molecule;
 use crate::geom_io::get_mass_charge;
-use crate::mpi_io::{mpi_broadcast, mpi_broadcast_vector, mpi_reduce, MPIData, MPIOperator};
-use crate::post_scf_analysis::spin_correction;
-use crate::scf_io::SCF;
+use crate::mpi_io::{mpi_broadcast, mpi_reduce, MPIData, MPIOperator};
 use crate::utilities::{self, balancing};
-use core::num;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
-use std::iter::Zip;
 use std::ops::Range;
-use std::option::IntoIter;
 use std::os::raw::c_int;
-use std::path::Iter;
 use std::sync::mpsc::channel;
 use serde::{Deserialize, Serialize};
 
 //extern crate rest_libxc  as libxc;
-use libxc::{XcFuncType, LibXCFamily};
+use libxc::{XcFuncType};
 //use std::intrinsics::expf64;
 use crate::dft::libxc::names_and_values::MAP as libxc_names_values;
 
 use rest_tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
-
-
 
 
 #[derive(Clone,Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +141,32 @@ impl DFA4REST {
             dfa_paramr_pos: None, 
             dfa_hybrid_pos: None, 
             dfa_paramr_adv: None }
+    }
+    
+    pub fn summary(&self) {
+        println!("==== DFA Summary (legacy) ====");
+        println!("Spin channel: {}", self.spin_channel);
+        println!("SCF DFA components: {:?}", self.dfa_compnt_scf);
+        println!("SCF DFA parameters: {:?}", self.dfa_paramr_scf);
+        println!("SCF DFA hybrid coeff: {:16.8}", self.dfa_hybrid_scf);
+        if let Some(dfatype) = &self.dfa_family_pos {
+            println!("Post-SCF DFA family: {}", dfatype.to_name());
+            if let Some(dfacomp) = &self.dfa_compnt_pos {
+                println!("Post-SCF DFA components: {:?}", dfacomp);
+            }
+            if let Some(dfaparam) = &self.dfa_paramr_pos {
+                println!("Post-SCF DFA parameters: {:?}", dfaparam);
+            }
+            if let Some(dfahybrid) = &self.dfa_hybrid_pos {
+                println!("Post-SCF DFA hybrid coeff: {:16.8}", dfahybrid);
+            }
+        } else {
+            println!("Post-SCF DFA: None");
+        }
+        if let Some(dfaparam_adv) = &self.dfa_paramr_adv {
+            println!("Advanced DFA parameters: {:?}", dfaparam_adv);
+        }
+        // println!("==== End of Summary ====");
     }
 
     pub fn new_nonstandard(
@@ -1149,6 +1170,13 @@ impl DFA4REST {
         match self.dfa_family_pos {
             None => false,
             _ => true
+        }
+    }
+
+    pub fn is_rpa(&self) -> bool {
+        match self.dfa_family_pos {
+            Some(DFAFamily::RPA) => true,
+            _ => false
         }
     }
 
@@ -3707,7 +3735,6 @@ impl Grids {
     //}
 }
 
-//pub fn numerical_density_
 
 
 pub fn numerical_density_v01(grid: &Grids, mol: &Molecule, dm: &mut [MatrixFull<f64>;2]) -> [f64;2] {
@@ -3846,20 +3873,6 @@ pub fn numerical_density_rayon(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull
 }
 
 
-
-
-//#[test]
-//fn test_numgrid_angular() {
-//    let (coordinates, weights) = gen_grids::angular_grid(50);
-//    println!("{:?}",coordinates);
-//    println!("{:?}",weights);
-//}
-//#[test]
-//fn test_numgrid_radii() {
-//    let (coordinates, weights) = gen_grids::radial_grid_lmg_bse("sto-3g",1.0e-12,8);
-//    println!("{:?}",coordinates);
-//    println!("{:?}",weights);
-//}
 #[test]
 fn debug_num_density_for_atom() {
     let angular = 2;
@@ -3993,16 +4006,9 @@ fn test_libxc() {
     println!("{:?}", exc.data);
     println!("{:?}", vrho.data);
 }
+
 #[test]
-fn test_zip() {
-    let dd = vec![1,2,3,4,5,6];
-    let ff = vec![1,3,5];
-    let gg = vec![2,4,6];
-    izip!(dd.chunks_exact(2),ff.iter(),gg.iter()).for_each(|(dd,ff,gg)| {
-        println!("dd {:?}, ff {}, gg {}",dd,ff,gg)
-    });
-}
-#[test]
+#[ignore]
 fn read_grid() {
     let mut grids_file = std::fs::File::open("/home/igor/Documents/Package-Pool/Rust/rest/grids").unwrap();
     let mut content = String::new();

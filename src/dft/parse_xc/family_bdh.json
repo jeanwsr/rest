@@ -1,0 +1,83 @@
+{
+    "MP2": {
+        "code": "HF, MP2",
+        "ref": "10.1103/PhysRev.46.618"
+    },
+    "SCS_MP2": {
+        "code": "HF, MP2(1.2, 0.333333333)",
+        "ref": "10.1063/1.1569242"
+    },
+    "B2PLYP": {
+        "code": "0.53*HF + 0.47*B88, 0.73*LYP + 0.27*MP2",
+        "ref": "10.1063/1.2148954",
+        "tested": "MRCC 2022-03-18"
+    },
+    "B2PLYP_D3BJ": {
+        "code": "0.53*HF + 0.47*B88, 0.73*LYP + 0.27*MP2 + DFTD3(version=bj, xc=B2PLYP)",
+        "ref": ["10.1063/1.2148954", "10.1021/acs.jpclett.6b00780"],
+        "tested": "Gaussian 16, Rev B.01"
+    },
+    "B2PLYP_D4": {
+        "code": "0.53*HF + 0.47*B88, 0.73*LYP + 0.27*MP2 + DFTD4(xc=B2PLYP)",
+        "ref": ["10.1063/1.2148954", "10.1063/1.5090222"]
+    },
+    "DSD_PBEP86": {
+        "code": "0.72*HF + 0.28*PBE, 0.44*P86 + 0.51*MP2_OS + 0.36*MP2_SS",
+        "ref": "10.1039/C1CP22592H"
+    },
+    "DSD_PBEP86_D3BJ": {
+        "code": "0.69*HF + 0.31*PBE, 0.44*P86 + 0.52*MP2_OS + 0.22*MP2_SS + DFTD3(version=bj, xc=dsdpbep86)",
+        "ref": "10.1002/jcc.23391"
+    },
+    "QCHEM_DSD_PBEP86_D3BJ": {
+        "code": "0.69*HF + 0.31*PBE, 0.44*P86_FT + 0.52*MP2_OS + 0.22*MP2_SS + DFTD3(version=bj, xc=dsdpbep86)",
+        "ref": "10.1002/jcc.23391",
+        "tested": "QChem 5.1.1",
+        "notes": "P86_FT used in Gaussian, QChem, etc instead of P86. Also see https://github.com/pyscf/pyscf/issues/1004."
+    },
+    "revDSD_PBEP86_D3BJ": {
+        "code": "0.69*HF + 0.31*PBE, 0.4296*P86 + 0.5785*MP2_OS + 0.0799*MP2_SS + DFTD3(version=bj, xc=revdsdpbep86)",
+        "ref": "10.1021/acs.jpca.9b03157"
+    },
+    "revDSD_PBEP86_D4": {
+        "code": "0.69*HF + 0.31*PBE, 0.4210*P86 + 0.5922*MP2_OS + 0.0636*MP2_SS + DFTD4(xc=revdsdpbep86)",
+        "ref": "10.1021/acs.jpca.9b03157"
+    },
+    "DSD_PBEPBE_D3BJ": {
+        "code": "0.68*HF + 0.32*PBE, 0.49*PBE + 0.55*MP2_OS + 0.13*MP2_SS + DFTD3(version=bj, xc=dsdpbepbe)",
+        "ref": "10.1002/jcc.23391",
+        "tested": "QChem 5.1.1"
+    },
+    "DSD_PBEB95_D3BJ": {
+        "code": "0.66*HF + 0.34*PBE, 0.55*BC95 + 0.46*MP2_OS + 0.09*MP2_SS + DFTD3(version=bj, xc=dsdpbeb95)",
+        "ref": "10.1002/jcc.23391",
+        "tested": "QChem 5.1.1"
+    },
+    "DSD_BLYP_D3BJ": {
+        "code": "0.71*HF + 0.29*B88, 0.54*LYP + 0.47*MP2_OS + 0.40*MP2_SS + DFTD3(version=bj, xc=dsdblyp)",
+        "ref": "10.1002/jcc.23391",
+        "tested": "ORCA 5.0.4"
+    },
+    "B2GP_PLYP": {
+        "code": "0.65*HF + 0.35*B88, 0.64*LYP + 0.36*MP2",
+        "ref": "10.1021/jp801805p"
+    },
+    "B2GP_PLYP_D3BJ": {
+        "code": "0.65*HF + 0.35*B88, 0.64*LYP + 0.36*MP2 + DFTD3(version=bj, xc=B2GPPLYP)",
+        "ref": ["10.1021/jp801805p", "10.1021/acs.jpclett.6b00780"],
+        "tested": "MRCC 2022-03-18",
+        "alias": ["B2GPPLYP_D3BJ"]
+    },
+    "PBE0_DH": {
+        "code": "0.5*HF + 0.5*PBE, 0.875*PBE + 0.125*MP2",
+        "ref": "10.1063/1.3604569"
+    },
+    "PBE_QIDH": {
+        "code": "0.6933612744*HF + 0.3066387256*PBE, 0.6666666667*PBE + 0.3333333333*MP2",
+        "ref": "10.1063/1.4890314",
+        "tested": "QChem 5.1.1",
+        "notes": "This implementation should be the same to rhetoric of original paper (rounded at 1e-10).",
+        "alias": ["PBE_QIDH_QCHEM"]
+    }
+
+}
