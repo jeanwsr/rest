@@ -4,8 +4,9 @@ use num_traits::ToPrimitive;
 
 /// Detect available memory in system in MB.
 pub fn detect_available_memory_mb() -> f64 {
-    let sys = sysinfo::System::new_all();
-    (sys.total_memory() - sys.used_memory()) as f64 / 1024.0 / 1024.0
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    sys.available_memory() as f64 / 1024.0 / 1024.0
 }
 
 /// Detect used memory in system in MB.
@@ -19,12 +20,18 @@ pub fn detect_available_memory_mb() -> f64 {
 pub fn detect_used_memory_mb(use_case: &str) -> f64 {
     match use_case {
         "sys" => {
-            let sys = sysinfo::System::new_all();
+            let mut sys = sysinfo::System::new();
+            sys.refresh_memory();
             sys.used_memory() as f64 / 1024.0 / 1024.0
         },
         "proc" => {
-            let sys = sysinfo::System::new_all();
+            let mut sys = sysinfo::System::new();
             let pid = sysinfo::get_current_pid().unwrap();
+            sys.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[pid]),
+                true,
+                sysinfo::ProcessRefreshKind::nothing().with_memory(),
+            );
             let process = sys.process(pid).unwrap();
             process.memory() as f64 / 1024.0 / 1024.0
         },
