@@ -189,14 +189,26 @@ auxbas_path = def2-universal-jkfit      # 简写格式，自动搜索
 
 ## 自洽场计算相关关键词（Keyword）
 - `initial_guess`: 取值String。分子体系进行自洽场运算所用的初始猜测方法。目前REST支持:
-	1. `sad` : 对体系各原子进行自洽场计算得到自洽的密度矩阵后，将多个密度矩阵按顺序置于对角位置后得到初始的密度矩阵进行自洽场运算。缺省为sad
-    1. `vsap`: Superposition of Atomic Potentials的初始猜测方法。采用半经验方法对体系势能项进行估计，与libcint生成的动能项进行加和后得到初始的Fock矩阵
-	1. `hcore`: Hcore则对应单电子近似初猜，直接将由libcint生成的hcore矩阵作为初始猜测的fock矩阵进行计算
-- `guess_mix`: 取值布尔类型，是否采用混合HOMO和LUMO的方法获得对称性破缺初猜。由此可以破坏体系的空间对称性和自旋对称性，有助于得到单重态UHF波函数。缺省为false。
+    1. 从 checkpoint 文件读取初猜。不需要设定 `initial_guess`，存在 `guessfile` 或 `chkfile` 时会自动读取初猜。
+	2. `sad` : 对体系各原子进行自洽场计算得到自洽的密度矩阵后，将多个密度矩阵按顺序置于对角位置后得到初始的密度矩阵进行自洽场运算。缺省为sad
+    3. `vsap`: Superposition of Atomic Potentials的初始猜测方法。采用半经验方法对体系势能项进行估计，与libcint生成的动能项进行加和后得到初始的Fock矩阵
+	4. `hcore`: Hcore则对应单电子近似初猜，直接将由libcint生成的hcore矩阵作为初始猜测的fock矩阵进行计算
+- `guess_mix`: 取值布尔类型，是否采用混合HOMO和LUMO的方法获得对称性破缺初猜。由此可以破坏体系的空间对称性和自旋对称性，有助于得到对称破缺单重态UHF波函数。缺省为false。
 - `guess_mix_theta_deg`: 取值`[f64;2]`或f64，分别设置两个自旋通道的混合角度（单位：度）。
     - 设为0.0，则表示完全不混合
     - 在0.0-90.0范围内，角度越大，表示破坏原始初猜效果越显著。一般建议取值0.0-45.0。缺省为[15.0, 15.0]
-- `chkfile`: 取值String。给定初始猜测所在位置/路径。缺省为none
+- `guessfile`: 取值String。给定初猜的 checkpoint 文件。缺省为none。不会在计算结束后被覆盖。
+- `chkfile`: 取值String。保存计算结果的 checkpoint 文件。缺省为none。如该文件在计算开始前已存在，则会尝试从中读取初猜，但在计算结束后会覆盖该文件。所以不推荐采用 `chkfile` 提供初猜，而是建议采用 `guessfile`。
+对于 `guessfile` 和 `chkfile`，推荐以下两种使用方式（文件后缀没有要求，可以是任意的或没有）：
+（1） 不读取初猜，只保存计算结果
+```
+chkfile = "mychk.rchk"
+```
+（2） 读取初猜，并保存计算结果
+```
+guessfile = "myoldchk.rchk"
+chkfile = "mychk.rchk"
+```
 - `mixer`：取值String。辅助自洽场收敛的方法。目前REST支持direct，diis，linear及ddiis。Direct对应不使用辅助收敛方法，linear对应于线性辅助收敛方法，diis对应于direct inversion in the iterative subspace。Diis是有效的加速收敛方法。缺省为diis
 - `mix_param`: 取值f64。Diis方法或linear方法的混合系数。缺省为0.2
 - `start_diis_cycle`: 取值i32。开始使用diis加速收敛方法的循环数。缺省为2

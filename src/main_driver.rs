@@ -243,7 +243,7 @@ pub fn main_driver() -> anyhow::Result<()> {
 
     //time_mark.count("SCF");
 
-    if scf_data.mol.ctrl.restart {
+    if scf_data.mol.ctrl.has_chkfile {
         if let Some(mp_op) = &mpi_operator {
             if mp_op.rank == 0 {
                 println!("Rank 0: now save the converged SCF results");
