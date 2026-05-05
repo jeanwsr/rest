@@ -20,7 +20,7 @@ use regex::Regex;
 use crate::basis_io::etb::{get_etb_elem, etb_gen_for_atom_list, InfoV2};
 use crate::constants::{ATM_NUC, ATM_NUC_MOD_OF, AUXBAS_THRESHOLD, ELEM1ST, ELEM2ND, ELEM3RD, ELEM4TH, ELEM5TH, ELEM6TH, ELEMTMS, ENV_PRT_START, NUC_ECP, NUC_FRAC_CHARGE, NUC_STAD_CHARGE};
 use crate::dft::{DFTType, DFA4REST, parse_xc};
-use crate::geom_io::{GeomCell,MOrC, GeomUnit, get_mass_charge};
+use crate::geom_io::{GeomCell,MOrC, GeomUnit, get_mass_charge, formated_element_name};
 use crate::basis_io::{ecp, BasInfo, Basis4Elem};
 use crate::ctrl_io::{overall_parse_and_report_on_ctrl_geom, InputKeywords, parse_ctl};
 use crate::mpi_io::{mpi_isend_irecv_wrt_distribution, mpi_isend_irecv_wrt_distribution_v02, mpi_isend_irecv_wrt_distribution_v03, MPIData, MPIOperator};
@@ -780,7 +780,7 @@ impl Molecule {
 
         // for standard atoms
         for (atm_index, atm_elem) in geom.elem.iter().enumerate() {
-            let tmp_path = format!("{}/{}.json",&ctrl.basis_path, &atm_elem);
+            let tmp_path = format!("{}/{}.json",&ctrl.basis_path, &formated_element_name(atm_elem));
             let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path,&cint_type).unwrap();
             let mut num_basis_per_atm = 0_usize;
             for tmp_bascell in &tmp_basis.electron_shells {
@@ -852,7 +852,7 @@ impl Molecule {
             let atm_index_start = geom.elem.len();
             for (local_atm_index, atm_elem) in geom.ghost_bs_elem.iter().enumerate() {
                 let atm_index = local_atm_index+atm_index_start;
-                let tmp_path = format!("{}/{}.json",&ctrl.basis_path, &atm_elem);
+                let tmp_path = format!("{}/{}.json",&ctrl.basis_path, &formated_element_name(atm_elem));
                 let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path,&cint_type).unwrap();
                 let mut num_basis_per_atm = 0_usize;
                 for tmp_bascell in &tmp_basis.electron_shells {
