@@ -339,7 +339,6 @@ pub fn construct_submat_a(scf_data:&SCF,inverse_dielectric:&MatrixFull<f64>,quas
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let ri_ov=get_submatrix(scf_data,'O','V','N');
     let mut v=construct_coulomb(&ri_ov,&ri_ov);
-    v.self_multiple(2.0);
     let ri_oo=get_submatrix(scf_data,'O','O','N');
     let ri_vv=get_submatrix(scf_data,'V','V','N');
     let raw_w=construct_raw_w(&ri_oo,&ri_vv,&inverse_dielectric);
@@ -349,6 +348,10 @@ pub fn construct_submat_a(scf_data:&SCF,inverse_dielectric:&MatrixFull<f64>,quas
     let mut a=w;
     a.iter_diagonal_mut().unwrap().zip(energy_diag.iter_mut()).for_each(|(x,e)|{(*x,*e)=(*x+*e,*e)});
     if xlet=='S'{
+        v.self_multiple(2.0);
+        a=MatrixFull::add(&v,&a).unwrap();
+    }
+    if xlet=='R'{
         a=MatrixFull::add(&v,&a).unwrap();
     }
     a
@@ -357,12 +360,15 @@ pub fn construct_submat_b(scf_data:&SCF,xlet:char,inverse_dielectric:&MatrixFull
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let ri_ov=get_submatrix(scf_data,'O','V','N');
     let mut v=construct_coulomb(&ri_ov,&ri_ov);
-    v.self_multiple(2.0);
     let raw_w=construct_raw_w(&ri_ov,&ri_ov,&inverse_dielectric);
     let mut w=reorganize_w(raw_w, 'B', occ_size, vir_size);
     w.self_multiple(-1.0);
     let mut b=w;
     if xlet=='S'{
+        v.self_multiple(2.0);
+        b=MatrixFull::add(&b,&v).unwrap();
+    }
+    if xlet=='R'{
         b=MatrixFull::add(&b,&v).unwrap();
     }
     b
@@ -383,6 +389,21 @@ pub fn construct_full_bse_hamitonian(scf_data:&SCF,xlet:char,inverse_dielectric:
             hamiltonian[[occ_size*vir_size+i,j]]=minus_b[[i,j]];
             hamiltonian[[i,occ_size*vir_size+j]]=transpose_b[[i,j]];
             hamiltonian[[occ_size*vir_size+i,occ_size*vir_size+j]]=minus_a[[i,j]];
+        }
+    }
+    hamiltonian
+}
+pub fn construct_damped_full_bse_hamitonian(scf_data:&SCF,xlet:char,inverse_dielectric:&MatrixFull<f64>,quasiparticle_energies:&Vec<f64>)->MatrixFull<f64>{
+    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
+    let mut hamiltonian:MatrixFull<f64>=MatrixFull::new([2*occ_size*vir_size,2*occ_size*vir_size],0.0);
+    let a:MatrixFull<f64>=construct_submat_a(scf_data,inverse_dielectric,quasiparticle_energies, xlet);
+    let b=construct_submat_b(scf_data,xlet,inverse_dielectric);
+    for i in 0..occ_size*vir_size {
+        for j in 0..vir_size*occ_size{
+            hamiltonian[[i,j]]=a[[i,j]];
+            hamiltonian[[occ_size*vir_size+i,j]]=b[[i,j]];
+            hamiltonian[[i,occ_size*vir_size+j]]=b[[i,j]];
+            hamiltonian[[occ_size*vir_size+i,occ_size*vir_size+j]]=a[[i,j]];
         }
     }
     hamiltonian

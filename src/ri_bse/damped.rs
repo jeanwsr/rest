@@ -79,9 +79,9 @@ pub fn prepare_p0_r_i(mu_z_vec:&Vec<f64>,gwqp:&Vec<f64>,omega:f64,gamma:f64,occ_
         let mu_ia_z=mu_z_vec[i+a*occ_size];
         let energy_gap=gwqp[a+occ_size]-gwqp[i];
         p0rp[i+a*occ_size]=(omega-energy_gap)/((omega-energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
-        p0rm[i+a*occ_size]=(omega+energy_gap)/((omega+energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
-        p0ip[i+a*occ_size]=-gamma/((omega-energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
-        p0im[i+a*occ_size]=gamma/((omega+energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
+        p0rm[i+a*occ_size]=-(omega+energy_gap)/((omega+energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
+        p0ip[i+a*occ_size]=gamma/((omega-energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
+        p0im[i+a*occ_size]=-gamma/((omega+energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
     });
     (p0rp,p0rm,p0ip,p0im)
 }
@@ -120,9 +120,9 @@ pub fn update_w_vecs<F1>(rp:&Vec<f64>,rm:&Vec<f64>,ip:&Vec<f64>,im:&Vec<f64>,pai
         let prefactor_p:f64=1.0/((omega-energy_gap).powf(2.0)+gamma.powf(2.0));
         let prefactor_m:f64=1.0/((omega+energy_gap).powf(2.0)+gamma.powf(2.0));
         wrp[i+a*occ_size]=prefactor_p*((omega-energy_gap)*krp[i+a*occ_size]-gamma*kip[i+a*occ_size]);
-        wrm[i+a*occ_size]=prefactor_m*((omega+energy_gap)*krm[i+a*occ_size]-gamma*kim[i+a*occ_size]);
+        wrm[i+a*occ_size]=-prefactor_m*((omega+energy_gap)*krm[i+a*occ_size]-gamma*kim[i+a*occ_size]);
         wip[i+a*occ_size]=prefactor_p*((omega-energy_gap)*kip[i+a*occ_size]+gamma*krp[i+a*occ_size]);
-        wim[i+a*occ_size]=prefactor_m*(-(omega+energy_gap)*kim[i+a*occ_size]+gamma*krm[i+a*occ_size]);
+        wim[i+a*occ_size]=-prefactor_m*((omega+energy_gap)*kim[i+a*occ_size]+gamma*krm[i+a*occ_size]);
     });
     (wrp,wrm,wip,wim)
 } 
@@ -212,7 +212,8 @@ pub fn damped_bse(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
         "pople" => damped_bse_pople(scf_data),
         "gmres" => damped_bse_gmres(scf_data),
         "klopper" => damped_bse_klopper(scf_data),
-        other => panic!("Invalid damped_bse_solver: \"{}\". Expected \"pople\", \"gmres\", or \"klopper\".", other),
+        "dense" => damped_bse_dense(scf_data),
+        other => panic!("Invalid damped_bse_solver: \"{}\". Expected \"pople\", \"gmres\", \"dense\", or \"klopper\".", other),
     }
 }
 
@@ -251,7 +252,7 @@ pub fn damped_bse_pople(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
             &scf_data.gwqp.0,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma,occ_size,vir_size)
     };
     let result=poples_numerical_trick(&p0,|z|wrapped_update_w(&z),qp_ctrl.damped_bse_tol,qp_ctrl.damped_bse_max_iter);
-    let density_real:Vec<f64>=(0..occ_size*vir_size).map(|ia|result.0[ia]-result.1[ia]).collect();
+    let density_real:Vec<f64>=(0..occ_size*vir_size).map(|ia|result.0[ia]+result.1[ia]).collect();
     let polarized_density_matrix=MatrixFull::from_vec([occ_size,vir_size],density_real).unwrap();
     export_density(scf_data,&polarized_density_matrix,&qp_ctrl);
     result
@@ -264,12 +265,14 @@ fn export_density(scf_data:&SCF,polarized_density_matrix:&MatrixFull<f64>,qp_ctr
     let mut ao_polarized_density_matrix=MatrixFull::new([num_state,num_state],0.0);
     _dgemm_full(&occ_eigenvecs,'N',polarized_density_matrix,'N',&mut first_prod,1.0,0.0);
     _dgemm_full(&first_prod,'N',&vir_eigenvecs,'T',&mut ao_polarized_density_matrix,1.0,0.0);
+    let mut file = OpenOptions::new().write(true).create(true).truncate(true).open("AO_Polarized_Density_Matrix.txt").expect("open failure");
+    writeln!(file, "AO Basis Polarized Density Matrix:\nSize:{:?}\nData(Column Major){:#?}",ao_polarized_density_matrix.size,ao_polarized_density_matrix.data).expect("write failure");
     let grids = &qp_ctrl.damped_bse_grids;
     let grid_val=eval_ao_on_grids(&scf_data.mol,&grids);
     //grid_val.formated_output(1000,"full");
     let mut first_prod=MatrixFull::new([num_state,grids.len()],0.0);
     _dgemm_full(&ao_polarized_density_matrix,'N',&grid_val,'N',&mut first_prod,1.0,0.0);
-    let grid_data:Vec<f64>=first_prod.iter_columns_full().zip(grid_val.iter_columns_full()).par_bridge().map(|(fp,gval)|{
+    let grid_data:Vec<f64>=first_prod.iter_columns_full().zip(grid_val.iter_columns_full()).map(|(fp,gval)|{
         let fp_vec=fp.to_vec();
         let gval_vec=gval.to_vec();
         fp_vec.iter().zip(gval_vec.iter()).fold(0.0,|acc,(x,y)|acc+x*y)
@@ -329,6 +332,60 @@ fn export_density(scf_data:&SCF,polarized_density_matrix:&MatrixFull<f64>,qp_ctr
     writeln!(file, "\n{}", "=".repeat(70)).expect("write failure");
     writeln!(file, "END OF FILE").expect("write failure");
     writeln!(file, "{}", "=".repeat(70)).expect("write failure");
+}
+pub fn damped_bse_dense(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
+    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
+    let inverse_dielectric=ri_bse::construct_inverse_dielectric(scf_data,&scf_data.eigenvalues[0]);
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    println!("Now begins damped BSE calculation. Parameters:\nOcc Size={},Vir Size={},External Field Freq={},Lifetime Gamma={}",occ_size,vir_size,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma);
+    let mu_z_vec=compute_mu_z_vec(scf_data);
+    let a=ri_bse::construct_submat_a(scf_data,&inverse_dielectric,&scf_data.gwqp.0, 'R');
+    let b=ri_bse::construct_submat_b(scf_data,'R',&inverse_dielectric);
+    let mut linear_equation_lhs=MatrixFull::new([occ_size*vir_size*4,occ_size*vir_size*4],0.0);
+    let mut linear_equation_rhs=vec![0.0;4*occ_size*vir_size];
+    let start=Instant::now();
+    for i in 0..occ_size*vir_size {
+        for j in 0..vir_size*occ_size{
+            linear_equation_lhs[[i,j]]=a[[i,j]];
+            linear_equation_lhs[[occ_size*vir_size+i,j]]=b[[i,j]];
+            linear_equation_lhs[[i,occ_size*vir_size+j]]=b[[i,j]];
+            linear_equation_lhs[[occ_size*vir_size+i,occ_size*vir_size+j]]=a[[i,j]];
+
+            linear_equation_lhs[[i+occ_size*vir_size*2,j+occ_size*vir_size*2]]=a[[i,j]];
+            linear_equation_lhs[[occ_size*vir_size*3+i,j+occ_size*vir_size*2]]=b[[i,j]];
+            linear_equation_lhs[[i+occ_size*vir_size*2,occ_size*vir_size*3+j]]=b[[i,j]];
+            linear_equation_lhs[[occ_size*vir_size*3+i,occ_size*vir_size*3+j]]=a[[i,j]];
+        }
+    }
+    let external_field_freq=qp_ctrl.external_field_freq;
+    let lifetime_gamma=qp_ctrl.lifetime_gamma;
+    for i in 0..occ_size{
+        for a in 0..vir_size{
+            linear_equation_lhs[[i+a*occ_size,i+a*occ_size]]-=external_field_freq;
+            linear_equation_lhs[[i+a*occ_size+occ_size*vir_size,i+a*occ_size+occ_size*vir_size]]+=external_field_freq;
+            linear_equation_lhs[[i+a*occ_size+2*occ_size*vir_size,i+a*occ_size+2*occ_size*vir_size]]-=external_field_freq;
+            linear_equation_lhs[[i+a*occ_size+3*occ_size*vir_size,i+a*occ_size+3*occ_size*vir_size]]+=external_field_freq;
+
+            linear_equation_lhs[[i+a*occ_size+2*occ_size*vir_size,i+a*occ_size]]+=lifetime_gamma;
+            linear_equation_lhs[[i+a*occ_size+3*occ_size*vir_size,i+a*occ_size+occ_size*vir_size]]-=lifetime_gamma;
+            linear_equation_lhs[[i+a*occ_size,i+a*occ_size+2*occ_size*vir_size]]-=lifetime_gamma;
+            linear_equation_lhs[[i+a*occ_size+occ_size*vir_size,i+a*occ_size+3*occ_size*vir_size]]+=lifetime_gamma;
+
+            linear_equation_rhs[i+a*occ_size]=mu_z_vec[i+a*occ_size];
+            linear_equation_rhs[i+a*occ_size+occ_size*vir_size]=mu_z_vec[i+a*occ_size];
+        }
+    }
+    let preptime=start.elapsed();
+    println!("Preparation of dense linear problem took {:?}",preptime);
+    let result=_dsolve(&linear_equation_lhs,&linear_equation_rhs).unwrap();
+    println!("Solving dense linear problem took {:?}",start.elapsed()-preptime);
+    let solution=(result[0..occ_size*vir_size].to_vec(),result[occ_size*vir_size..2*occ_size*vir_size].to_vec(),result[2*occ_size*vir_size..3*occ_size*vir_size].to_vec(),result[3*occ_size*vir_size..4*occ_size*vir_size].to_vec());
+    let density_real:Vec<f64>=(0..occ_size*vir_size).map(|ia|solution.0[ia]+solution.1[ia]).collect();
+    let polarized_density_matrix=MatrixFull::from_vec([occ_size,vir_size],density_real).unwrap();
+    export_density(scf_data,&polarized_density_matrix,&qp_ctrl);
+    let mut file = OpenOptions::new().write(true).create(true).truncate(true).open("Polarized_Density_Matrix.txt").expect("open failure");
+    writeln!(file, "Polarized Density Matrix(X):\n{:#?}\n(Y):{:#?}", solution.0,solution.1).expect("write failure");
+    solution
 }
 pub fn damped_bse_gmres(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
@@ -399,9 +456,11 @@ pub fn damped_bse_gmres(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let mu_z_vec=compute_mu_z_vec(scf_data);
     let rhs_p=(mu_z_vec.clone(),mu_z_vec.clone(),vec![0.0;occ_size*vir_size],vec![0.0;occ_size*vir_size]);
     let solution=fourvec_gmres(&gmres_matvec,&precond,&rhs_p,qp_ctrl.damped_bse_tol,qp_ctrl.damped_bse_max_iter);
-    let density_real:Vec<f64>=(0..occ_size*vir_size).map(|ia|solution.0[ia]-solution.1[ia]).collect();
+    let density_real:Vec<f64>=(0..occ_size*vir_size).map(|ia|solution.0[ia]+solution.1[ia]).collect();
     let polarized_density_matrix=MatrixFull::from_vec([occ_size,vir_size],density_real).unwrap();
     export_density(scf_data,&polarized_density_matrix,&qp_ctrl);
+    let mut file = OpenOptions::new().write(true).create(true).truncate(true).open("Polarized_Density_Matrix.txt").expect("open failure");
+    writeln!(file, "Polarized Density Matrix(X):\n{:#?}\n(Y):{:#?}", solution.0,solution.1).expect("write failure");
     solution
 }
 
@@ -654,7 +713,7 @@ pub fn damped_bse_klopper(scf_data: &SCF) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<
     let solution = klopper_subspace_solver(&gmres_matvec, &precond, &rhs, &p0,
                                            qp_ctrl.damped_bse_tol, qp_ctrl.damped_bse_max_iter);
 
-    let density_real: Vec<f64> = (0..occ_size * vir_size).map(|ia| solution.0[ia] - solution.1[ia]).collect();
+    let density_real: Vec<f64> = (0..occ_size * vir_size).map(|ia| solution.0[ia] + solution.1[ia]).collect();
     let polarized_density_matrix = MatrixFull::from_vec([occ_size, vir_size], density_real).unwrap();
     export_density(scf_data, &polarized_density_matrix, &qp_ctrl);
     solution
