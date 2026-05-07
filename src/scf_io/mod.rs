@@ -1,45 +1,37 @@
+#![warn(unused_imports)]
 use crate::basis_io::ecp::ghost_effective_potential_matrix;
 use crate::check_norm::force_state_occupation::adapt_occupation_with_force_projection;
 use crate::check_norm::{self, generate_occupation_frac_occ, generate_occupation_integer, generate_occupation_sad, OCCType};
 use crate::dft::gen_grids::prune::prune_by_rho;
-use crate::dft::{numerical_density, DFTType, Grids};
-use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges, get_charge};
+use crate::dft::{DFTType, Grids};
+use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges};
 use crate::mpi_io::{mpi_broadcast, mpi_broadcast_matrixfull, mpi_broadcast_vector, mpi_reduce, MPIOperator};
-use crate::utilities::{create_pool, TimeRecords};
+use crate::utilities::{self, TimeRecords};
 use crate::utilities::memory_batch::*;
 use crate::ctrl_io::ri_jk_io::*;
 
-////use blas_src::openblas::dgemm;
 mod addons;
 mod fchk;
 mod pyrest_scf_io;
 
 use mpi::collective::SystemOperation;
-use pyo3::{pyclass, pymethods, pyfunction};
-use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemm_nn, _dgemv, _dinverse, _dspgvx, _dsymm, _dsyrk, _hamiltonian_fast_solver, _power, _power_rayon_for_symmetric_matrix, _dsyevd};
-use tensors::{map_full_to_upper, map_upper_to_full, ri, BasicMatUp, BasicMatrix, ERIFold4, ERIFull, MathMatrix, MatrixFull, MatrixFullSlice, MatrixFullSliceMut, MatrixUpper, MatrixUpperSlice, ParMathMatrix, RIFull, TensorSliceMut};
-use itertools::{Itertools, iproduct, izip};
+use pyo3::{pyclass};
+use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemv, _dinverse, _dspgvx, _dsymm, _dsyrk, _hamiltonian_fast_solver, _power_rayon_for_symmetric_matrix, _dsyevd};
+use tensors::{map_upper_to_full, BasicMatUp, BasicMatrix, ERIFold4, MathMatrix, MatrixFull, MatrixFullSlice, MatrixUpper, MatrixUpperSlice, RIFull, TensorSliceMut};
+use itertools::{Itertools};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::mem::size_of;
-use std::sync::{Mutex, Arc,mpsc};
-use std::thread;
-use crossbeam::{channel::{unbounded,bounded},thread::{Scope,scope}};
-use std::sync::mpsc::{channel, Receiver};
-use crate::isdf::{prepare_for_ri_isdf, init_by_rho, prepare_m_isdf};
-use crate::molecule_io::{Molecule, generate_ri3fn_from_rimatr};
+use crossbeam::{channel::{unbounded},thread::{scope}};
+use std::sync::mpsc::{channel};
+use crate::isdf::{prepare_for_ri_isdf, prepare_m_isdf};
+use crate::molecule_io::{Molecule};
 use crate::tensors::{TensorOpt,TensorOptMut,TensorSlice};
-use crate::{utilities, initial_guess};
 use crate::initial_guess::initial_guess;
 use crate::external_libs::dftd;
-use crate::constants::{INVERSE_THRESHOLD, SPECIES_INFO, SQRT_THRESHOLD};
-use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
+use crate::constants::{SQRT_THRESHOLD};
+use crate::solvent::{PcmObject, PcmScf, solvent_prepare};
 use crate::ri_jk;
-
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
-
-
-
 
 #[pyclass]
 #[derive(Clone)]
@@ -3299,7 +3291,7 @@ impl SCF {
             self.rimatr = None;
             self.ri3mo = Some(ri3mo);
         } else {
-            use rstsr::prelude::*;
+            // use rstsr::prelude::*;
             let mut ri3mo: Vec<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)> = vec![];
             let mut timerecords = TimeRecords::new();
             timerecords.new_item("ao2mo", "for the generation of RI3MO");

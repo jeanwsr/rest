@@ -3,10 +3,8 @@ use std::io::Write;
 use crate::utilities::convert_scientific_notation_to_fortran_format as r2f;
 use rest_libcint::{CINTR2CDATA, CintType};
 use regex::Regex;
-use crate::constants::{SPECIES_INFO, INVERSE_THRESHOLD};
-
+use crate::constants::{SPECIES_INFO};
 use crate::external_libs::py2fch;
-
 use crate::scf_io::SCF;
 
 
