@@ -118,8 +118,9 @@ where F1:Fn(&Vec<f64>)->Vec<f64>+Send+Sync{
         });}
         let mut converge=true;
         let mut converge_pairs=0;
+        let n_residues = residues.size[1];
         residues.iter_columns_full().enumerate().for_each(|(n,residue_i)|{
-            if n<nroots{
+            if n < nroots.min(n_residues) {
                 let norm=residue_i.iter().fold(0.0,|acc,val|acc+val.powf(2.0));
                 if norm>1e-10{
                     converge=false;
@@ -128,6 +129,12 @@ where F1:Fn(&Vec<f64>)->Vec<f64>+Send+Sync{
                 }
             }
         });
+        if n_residues < nroots {
+            converge = false;
+            if print_level > 0 {
+                println!("  Warning: only {} trial vectors for {} roots", n_residues, nroots);
+            }
+        }
         if converge{
             x_full.iter_columns_full().enumerate().for_each(|(n,vec)|if n<nroots{x_solutions.push_column(vec)});
             eigenvalues=omega[..nroots].to_vec();

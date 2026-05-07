@@ -321,7 +321,9 @@ pub fn main_driver() -> anyhow::Result<()> {
     if scf_data.mol.ctrl.tddft.is_some() {
         time_mark.new_item("TDDFT", "the TDDFT calculation");
         time_mark.count_start("TDDFT");
-        crate::ri_tddft::tddft_main(&mut scf_data);
+        if let Err(e) = crate::ri_tddft::tddft_main(&mut scf_data) {
+            eprintln!("Error in TDDFT calculation: {}", e);
+        }
         time_mark.count("TDDFT");
     }
 

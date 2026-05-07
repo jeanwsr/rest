@@ -1,296 +1,401 @@
-use tensors::{MatrixFull, MathMatrix};
+/// TDDFT A and B matrix-vector product implementations
+///
+/// Implements the full TDDFT linear response A and B matrix-vector products:
+///
+/// (A·z)_{ia} = (ε_a - ε_i) * z_{ia}
+///              + 2 * Σ_{jb} (ia|jb) * z_{jb}           [Coulomb, singlet]
+///              - c_x * Σ_{jb} (ij|ab) * z_{jb}         [Exchange, hybrid only]
+///              + fxc_{ia,jb} * z_{jb}                  [XC kernel]
+///
+/// (B·z)_{ia} = 2 * Σ_{jb} (ia|jb) * z_{jb}             [Coulomb, singlet]
+///              - c_x * Σ_{jb} (ja|ib) * z_{jb}         [Exchange, hybrid only]
+///              + fxc_{ia,jb} * z_{jb}                  [XC kernel]
+///
+/// The Coulomb term is computed via RI: (ia|jb) = Σ_Q (ia|Q) * (Q|jb)
+/// The Exchange term is computed via RI: (ij|ab) = Σ_Q (ij|Q) * (Q|ab)
+
+use rest_tensors::MatrixFull;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, _dgemv};
+use crate::scf_io::SCF;
+use crate::ri_bse;
+use crate::ri_tddft::fxc_matvec::{FXCMatvecData, fxc_matvec};
+use crate::ri_tddft::utils::tddft_occupation_parameters;
 
-use crate::ri_tddft::fxc_kernel::TDDFTData;
-use crate::ri_bse::matvec::coulomb_contribution;
-use crate::dft::xc_deriv::XCType;
-
-/// fxc matvec: computes fxc * z in the (ia) space
-pub fn fxc_matvec(data: &TDDFTData, is_singlet: bool, z: &Vec<f64>) -> Vec<f64> {
-    let occ = data.occ_size;
-    let vir = data.vir_size;
-    let ng = data.num_grids;
-    let nvar = data.nvar;
-    let wfxc = if is_singlet { &data.wfxc_singlet } else { &data.wfxc_triplet };
-
-    // Z_mat: [occ, vir] (column-major)
-    let z_mat = MatrixFull::from_vec([occ, vir], z.clone()).unwrap();
-
-    // T = Z^T * mo_occ -> [vir, ng]
-    let mut t_mat = MatrixFull::new([vir, ng], 0.0);
-    _dgemm_full(&z_mat, 'T', &data.mo_occ, 'N', &mut t_mat, 1.0, 0.0);
-
-    // Build transition density components rho_z: [nvar, ng]
-    let mut rho_z = vec![0.0; nvar * ng];
-
-    // Component 0: rho_z[0,r] = sum_a T[a,r] * mo_vir[a,r]
-    for r in 0..ng {
-        let mut val = 0.0;
-        for a in 0..vir {
-            val += t_mat[[a, r]] * data.mo_vir[[a, r]];
-        }
-        rho_z[r] = val;
-    }
-
-    if nvar > 1 {
-        // GGA: gradient components
-        let mo_og = data.mo_occ_grad.as_ref().unwrap();
-        let mo_vg = data.mo_vir_grad.as_ref().unwrap();
-        for d in 0..3 {
-            // T_gd = Z^T * mo_occ_grad_d -> [vir, ng]
-            let mut t_gd = MatrixFull::new([vir, ng], 0.0);
-            _dgemm_full(&z_mat, 'T', &mo_og[d], 'N', &mut t_gd, 1.0, 0.0);
-            for r in 0..ng {
-                let mut val = 0.0;
-                for a in 0..vir {
-                    val += t_gd[[a, r]] * data.mo_vir[[a, r]]
-                         + t_mat[[a, r]] * mo_vg[d][[a, r]];
-                }
-                rho_z[(d + 1) * ng + r] = val;
-            }
+/// Build the diagonal preconditioner from KS orbital energy differences
+///
+/// hdiag[i + a*nocc] = ε_{lumo+a} - ε_{start_mo+i}
+///
+/// Uses KS eigenvalues from scf.eigenvalues[0], NOT GW quasiparticle energies.
+pub fn build_hdiag(scf: &SCF) -> Vec<f64> {
+    let (start_mo, _num_state, occ_size, vir_size, _homo, lumo) =
+        tddft_occupation_parameters(scf);
+    let ks = &scf.eigenvalues[0];
+    let mut hdiag = Vec::with_capacity(occ_size * vir_size);
+    for a in 0..vir_size {
+        for i in 0..occ_size {
+            hdiag.push(ks[lumo + a] - ks[start_mo + i]);
         }
     }
-
-    // Apply fxc kernel: sigma_z[alpha, r] = sum_beta wfxc[r, alpha, beta] * rho_z[beta, r]
-    let mut sigma_z = vec![0.0; nvar * ng];
-    for r in 0..ng {
-        for alpha in 0..nvar {
-            let mut val = 0.0;
-            for beta in 0..nvar {
-                val += wfxc[(r * nvar + alpha) * nvar + beta] * rho_z[beta * ng + r];
-            }
-            sigma_z[alpha * ng + r] = val;
-        }
-    }
-
-    // Contract back to (ia) space
-    if nvar == 1 {
-        // LDA: weighted_vir[a,r] = mo_vir[a,r] * sigma_z[r]
-        let mut weighted_vir = MatrixFull::new([vir, ng], 0.0);
-        for r in 0..ng {
-            for a in 0..vir {
-                weighted_vir[[a, r]] = data.mo_vir[[a, r]] * sigma_z[r];
-            }
-        }
-        // result = mo_occ * weighted_vir^T -> [occ, vir]
-        let mut result_mat = MatrixFull::new([occ, vir], 0.0);
-        _dgemm_full(&data.mo_occ, 'N', &weighted_vir, 'T', &mut result_mat, 1.0, 0.0);
-        result_mat.data
-    } else {
-        // GGA
-        let mo_og = data.mo_occ_grad.as_ref().unwrap();
-        let mo_vg = data.mo_vir_grad.as_ref().unwrap();
-        let mut result_mat = MatrixFull::new([occ, vir], 0.0);
-
-        // Component 0
-        let mut wv0 = MatrixFull::new([vir, ng], 0.0);
-        for r in 0..ng {
-            for a in 0..vir {
-                wv0[[a, r]] = data.mo_vir[[a, r]] * sigma_z[r];
-            }
-        }
-        _dgemm_full(&data.mo_occ, 'N', &wv0, 'T', &mut result_mat, 1.0, 0.0);
-
-        // Gradient components: for each direction d,
-        // result += mo_occ_grad_d * (mo_vir ⊙ σ_z[d+1])^T
-        //         + mo_occ * (mo_vir_grad_d ⊙ σ_z[d+1])^T
-        for d in 0..3 {
-            let mut wv_d = MatrixFull::new([vir, ng], 0.0);
-            for r in 0..ng {
-                let sd = sigma_z[(d + 1) * ng + r];
-                for a in 0..vir {
-                    wv_d[[a, r]] = data.mo_vir[[a, r]] * sd;
-                }
-            }
-            _dgemm_full(&mo_og[d], 'N', &wv_d, 'T', &mut result_mat, 1.0, 1.0);
-
-            let mut wv_gd = MatrixFull::new([vir, ng], 0.0);
-            for r in 0..ng {
-                let sd = sigma_z[(d + 1) * ng + r];
-                for a in 0..vir {
-                    wv_gd[[a, r]] = mo_vg[d][[a, r]] * sd;
-                }
-            }
-            _dgemm_full(&data.mo_occ, 'N', &wv_gd, 'T', &mut result_mat, 1.0, 1.0);
-        }
-        result_mat.data
-    }
+    hdiag
 }
 
-/// Exchange K^A matvec: Σ_{jb} (ij|ab) z_{jb}
-/// ri_oo: [occ*num_auxbas, occ] (pre-reshaped)
-/// ri_vv: [num_auxbas*vir, vir] (pre-reshaped)
+/// A-block exchange kernel: K_A = -alpha * RI_OO^T · (RI_VV · z^T)^T
+///
+/// Follows the same DGEMM pattern as ri_bse::matvec::w_contribution_a_block_dgemm
+/// but uses raw RI_OO/RI_VV instead of screened integrals.
+///
+/// ri_oo_reshaped: [occ*naux, occ] (pre-transposed via transpose_and_drop + reshape)
+/// ri_vv_reshaped: [naux*vir, vir]
+/// z: [occ*vir]
+/// Returns: [occ*vir] vector, K_A · z with sign -alpha applied
 pub fn exchange_a_matvec(
-    ri_oo: &MatrixFull<f64>,
-    ri_vv: &MatrixFull<f64>,
+    ri_oo_reshaped: &MatrixFull<f64>,
+    ri_vv_reshaped: &MatrixFull<f64>,
+    z: &[f64],
     occ_size: usize,
     vir_size: usize,
-    z: &Vec<f64>,
+    alpha_hybrid: f64,
 ) -> Vec<f64> {
-    let num_auxbas = ri_vv.size[0] / vir_size;
-    let z_mat = MatrixFull::from_vec([occ_size, vir_size], z.clone()).unwrap();
+    if alpha_hybrid.abs() < 1e-15 {
+        return vec![0.0; occ_size * vir_size];
+    }
+    let num_auxbas = ri_vv_reshaped.size[0] / vir_size;
 
-    // T = ri_vv * Z^T -> [num_auxbas*vir, occ]
+    // Step 1: t_tensor[P*vir + a, j] = Σ_b ri_vv[P*vir + a, b] * z_mat^T[b, j]
+    // ri_vv_reshaped: [naux*vir, vir]
+    // z_mat: [occ, vir], z_mat^T: [vir, occ]
+    // t_tensor: [naux*vir, occ]
+    let z_mat = MatrixFull::from_vec([occ_size, vir_size], z.to_vec()).unwrap();
     let mut t_tensor = MatrixFull::new([num_auxbas * vir_size, occ_size], 0.0);
-    _dgemm_full(ri_vv, 'N', &z_mat, 'T', &mut t_tensor, 1.0, 0.0);
+    _dgemm_full(ri_vv_reshaped, 'N', &z_mat, 'T', &mut t_tensor, 1.0, 0.0);
 
-    // Transpose and reshape: [occ, num_auxbas*vir] -> [occ*num_auxbas, vir]
+    // Step 2: Transpose and reshape
+    // t_tensor: [naux*vir, occ] → transpose → [occ, naux*vir]
+    // → reshape → [occ*naux, vir]
     t_tensor = t_tensor.transpose_and_drop();
-    t_tensor.reshape([occ_size * num_auxbas, vir_size]);
+    t_tensor.reshape([num_auxbas * occ_size, vir_size]);
 
-    // result = ri_oo^T * T -> [occ, vir]
+    // Step 3: result[i, a] = -alpha * Σ_j,Σ_P ri_oo[P*nocc + i, j] * t_tensor[j*naux + P, a]
+    // ri_oo_reshaped: [occ*naux, occ]
+    // t_tensor: [naux*occ, vir]
+    // result: [occ, vir]
     let mut result = MatrixFull::new([occ_size, vir_size], 0.0);
-    _dgemm_full(ri_oo, 'T', &t_tensor, 'N', &mut result, 1.0, 0.0);
+    _dgemm_full(ri_oo_reshaped, 'T', &t_tensor, 'N', &mut result, -alpha_hybrid, 0.0);
+
     result.data
 }
 
-/// Exchange K^B matvec: Σ_{jb} (ib|aj) z_{jb}
-/// ri_ov_a: [num_auxbas, occ*vir] (standard layout)
-/// ri_ov_b: [num_auxbas*occ, vir] (reshaped)
+/// B-block exchange kernel: K_B = -alpha * (RI_OV · z^T)^T · RI_OV
+///
+/// Follows the same pattern as ri_bse::matvec::w_contribution_b_block_dgemm
+/// but uses raw RI_OV on both sides (no screening).
+///
+/// ri_ov_reshaped: [naux*occ, vir]
+/// z: [occ*vir]
+/// Returns: [occ*vir] vector, K_B · z with sign -alpha applied
 pub fn exchange_b_matvec(
-    ri_ov_a: &MatrixFull<f64>,
-    ri_ov_b: &MatrixFull<f64>,
+    ri_ov_reshaped: &MatrixFull<f64>,
+    z: &[f64],
     occ_size: usize,
     vir_size: usize,
-    z: &Vec<f64>,
+    alpha_hybrid: f64,
 ) -> Vec<f64> {
-    let num_auxbas = ri_ov_a.size[0];
-    let z_mat = MatrixFull::from_vec([occ_size, vir_size], z.clone()).unwrap();
+    if alpha_hybrid.abs() < 1e-15 {
+        return vec![0.0; occ_size * vir_size];
+    }
+    let num_auxbas = ri_ov_reshaped.size[0] / occ_size;
 
-    // T = ri_ov_b * Z^T -> [num_auxbas*occ, occ]
-    // ri_ov_b[Q*i, b] * Z[j, b]^T = Σ_b ri_ov[Q, i*vir+b] * z[j+b*occ]
+    // Step 1: t_tensor[P*nocc + j, i] = Σ_b ri_ov[P*nocc + j, b] * z_mat^T[b, i]
+    // ri_ov_reshaped: [naux*occ, vir]
+    // z_mat^T: [vir, occ]
+    // t_tensor: [naux*occ, occ]
+    let z_mat = MatrixFull::from_vec([occ_size, vir_size], z.to_vec()).unwrap();
     let mut t_tensor = MatrixFull::new([num_auxbas * occ_size, occ_size], 0.0);
-    _dgemm_full(ri_ov_b, 'N', &z_mat, 'T', &mut t_tensor, 1.0, 0.0);
+    _dgemm_full(ri_ov_reshaped, 'N', &z_mat, 'T', &mut t_tensor, 1.0, 0.0);
 
-    // Transpose block structure: [num_auxbas*occ, occ] -> [num_auxbas*occ, occ]
-    // We need to swap the two occ indices
-    let mut t_swapped = vec![0.0; num_auxbas * occ_size * occ_size];
-    for j in 0..occ_size {
-        for q in 0..num_auxbas {
-            for i in 0..occ_size {
-                // source: t_tensor[q + i*num_auxbas, j]
-                // target: t_swapped[q + j*num_auxbas, i]
-                t_swapped[(q + j * num_auxbas) + i * num_auxbas * occ_size] =
-                    t_tensor[[q + i * num_auxbas, j]];
-            }
-        }
-    }
-    let t_swapped = MatrixFull::from_vec(
-        [num_auxbas * occ_size, occ_size], t_swapped
-    ).unwrap();
+    // Step 2: Transpose and reshape (converting RI index ordering)
+    // t_tensor: [naux*occ, occ] → we need to swap the occ and aux dimensions
+    // Result should be [occ, naux*occ] in a DGEMM-compatible form
+    t_tensor = t_tensor.transpose_and_drop();
+    // Now [occ, naux*occ]
+    t_tensor.reshape([num_auxbas * occ_size, occ_size]);
+    // Now [naux*occ, occ] with transposed data
 
-    // result = ri_ov_b^T * t_swapped -> [vir, occ] ... no, we need [occ, vir]
-    // Actually: result[i, a] = Σ_{Q,j} ri_ov[Q, a*occ+j] * T_swapped[Q*j, i]
-    // = Σ_{Q,j} ri_ov_b[Q*j, a]^T * T_swapped[Q*j, i]
-    // = (ri_ov_b^T * T_swapped)[a, i] -> need transpose
-    let mut result_at = MatrixFull::new([vir_size, occ_size], 0.0);
-    _dgemm_full(ri_ov_b, 'T', &t_swapped, 'N', &mut result_at, 1.0, 0.0);
+    // Step 3: result[i, a] = -alpha * Σ_j Σ_P t_tensor^T[i, j*naux+P] * ri_ov[P*nocc + j, a]
+    // t_tensor after reshape-transpose: [naux*occ, occ]
+    // t_tensor^T: [occ, naux*occ]
+    // ri_ov_reshaped: [naux*occ, vir]
+    // result: [occ, vir]
+    let mut result = MatrixFull::new([occ_size, vir_size], 0.0);
+    _dgemm_full(&t_tensor, 'T', ri_ov_reshaped, 'N', &mut result, -alpha_hybrid, 0.0);
 
-    // Transpose to [occ, vir] layout and flatten
-    let mut result = vec![0.0; occ_size * vir_size];
-    for i in 0..occ_size {
-        for a in 0..vir_size {
-            result[i + a * occ_size] = result_at[[a, i]];
-        }
-    }
-    result
+    result.data
 }
 
-/// Diagonal energy contribution: (ε_a - ε_i) * z_{ia}
-fn energy_diag_matvec(
-    eigenvalues: &[f64],
-    occ_size: usize,
-    vir_size: usize,
+/// Full A-block matrix-vector product for TDDFT
+///
+/// A·z = (ε_a - ε_i)*z + 2*Σ_jb(ia|jb)*z_jb - c_x*Σ_jb(ij|ab)*z_jb + fxc[z]
+///
+/// For TDA: this is the complete matvec (A matrix only).
+/// For full LR: this is the A-block of [A B; -B -A].
+///
+/// singlet (xlet='S'): Coulomb factor = 2
+/// triplet (xlet='T'): Coulomb factor = 0
+pub fn a_matvec(
+    scf: &SCF,
+    fxc_data: &FXCMatvecData,
+    ri_ov: &MatrixFull<f64>,          // [naux, occ*vir], for Coulomb
+    ri_oo_exch: &MatrixFull<f64>,     // [occ*naux, occ], for A exchange
+    ri_vv_exch: &MatrixFull<f64>,     // [naux*vir, vir], for A exchange
     z: &Vec<f64>,
+    xlet: char,
+    alpha_hybrid: f64,
 ) -> Vec<f64> {
-    let mut result = vec![0.0; occ_size * vir_size];
+    let occ_size = fxc_data.nocc;
+    let vir_size = fxc_data.nvir;
+    let dim = occ_size * vir_size;
+
+    // Build diagonal using KS eigenvalues
+    let (start_mo, _num_state, _, _, _homo, lumo) = tddft_occupation_parameters(scf);
+    let ks = &scf.eigenvalues[0];
+
+    // Step 1: Diagonal contribution: (ε_a - ε_i) * z
+    let mut result = vec![0.0; dim];
     for a in 0..vir_size {
         for i in 0..occ_size {
             let idx = i + a * occ_size;
-            result[idx] = (eigenvalues[occ_size + a] - eigenvalues[i]) * z[idx];
-        }
-    }
-    result
-}
-
-/// Full TDA A-block matvec
-/// Singlet: A z = (ε_a - ε_i) z + 2*v*z + fxc*z - α*K^A*z
-/// Triplet: A z = (ε_a - ε_i) z + fxc_triplet*z - α*K^A*z
-pub fn tddft_a_matvec(
-    data: &TDDFTData,
-    ri_ov: &MatrixFull<f64>,
-    ri_oo: &MatrixFull<f64>,
-    ri_vv: &MatrixFull<f64>,
-    eigenvalues: &[f64],
-    is_singlet: bool,
-    z: &Vec<f64>,
-) -> Vec<f64> {
-    let n = data.occ_size * data.vir_size;
-    let mut result = energy_diag_matvec(eigenvalues, data.occ_size, data.vir_size, z);
-
-    // fxc contribution
-    let fxc_z = fxc_matvec(data, is_singlet, z);
-    for i in 0..n {
-        result[i] += fxc_z[i];
-    }
-
-    // Coulomb (only singlet, factor 2)
-    if is_singlet {
-        let v_z = coulomb_contribution(ri_ov, z);
-        for i in 0..n {
-            result[i] += 2.0 * v_z[i];
+            result[idx] = (ks[lumo + a] - ks[start_mo + i]) * z[idx];
         }
     }
 
-    // HF exchange (if hybrid)
-    if data.alpha_hybrid.abs() > 1.0e-10 {
-        let k_z = exchange_a_matvec(ri_oo, ri_vv, data.occ_size, data.vir_size, z);
-        for i in 0..n {
-            result[i] -= data.alpha_hybrid * k_z[i];
+    // Step 2: Coulomb contribution: 2 * J[z] (singlet only)
+    let coulomb_factor = if xlet == 'S' { 2.0 } else if xlet == 'R' { 1.0 } else { 0.0 };
+    if coulomb_factor != 0.0 {
+        let jz = ri_bse::matvec::coulomb_contribution(ri_ov, z);
+        for idx in 0..dim {
+            result[idx] += coulomb_factor * jz[idx];
         }
+    }
+
+    // Step 3: Exchange contribution: -c_x * K_A[z] (hybrid only)
+    if alpha_hybrid.abs() > 1e-15 {
+        let kz = exchange_a_matvec(ri_oo_exch, ri_vv_exch, z, occ_size, vir_size, alpha_hybrid);
+        for idx in 0..dim {
+            result[idx] += kz[idx];
+        }
+    }
+
+    // Step 4: XC kernel contribution: fxc[z]
+    let fxc = fxc_matvec(fxc_data, z);
+    for idx in 0..dim {
+        result[idx] += fxc[idx];
     }
 
     result
 }
 
-/// Full LR (A+B)-block matvec
-/// Singlet: (A+B) z = (ε_a - ε_i) z + 4*v*z + 2*fxc*z - α*(K^A + K^B)*z
-/// Triplet: (A+B) z = (ε_a - ε_i) z + 2*fxc_triplet*z - α*(K^A + K^B)*z
-pub fn tddft_apb_matvec(
-    data: &TDDFTData,
-    ri_ov: &MatrixFull<f64>,
-    ri_oo: &MatrixFull<f64>,
-    ri_vv: &MatrixFull<f64>,
-    ri_ov_b: &MatrixFull<f64>,
-    eigenvalues: &[f64],
-    is_singlet: bool,
+/// Full B-block matrix-vector product for TDDFT (used in full LR, not TDA)
+///
+/// B·z = 2*Σ_jb(ia|jb)*z_jb - c_x*Σ_jb(ja|ib)*z_jb + fxc[z]
+///
+/// Note: B has no diagonal term (no orbital energy differences).
+///
+/// singlet (xlet='S'): Coulomb factor = 2
+/// triplet (xlet='T'): Coulomb factor = 0
+pub fn b_matvec(
+    scf: &SCF,
+    fxc_data: &FXCMatvecData,
+    ri_ov: &MatrixFull<f64>,          // [naux, occ*vir], for Coulomb
+    ri_ov_exch: &MatrixFull<f64>,     // [naux*occ, vir], for B exchange
     z: &Vec<f64>,
+    xlet: char,
+    alpha_hybrid: f64,
 ) -> Vec<f64> {
-    let n = data.occ_size * data.vir_size;
-    let mut result = energy_diag_matvec(eigenvalues, data.occ_size, data.vir_size, z);
+    let occ_size = fxc_data.nocc;
+    let vir_size = fxc_data.nvir;
+    let dim = occ_size * vir_size;
 
-    // fxc contribution (factor 2)
-    let fxc_z = fxc_matvec(data, is_singlet, z);
-    for i in 0..n {
-        result[i] += 2.0 * fxc_z[i];
-    }
+    let mut result = vec![0.0; dim];
 
-    // Coulomb (only singlet, factor 4)
-    if is_singlet {
-        let v_z = coulomb_contribution(ri_ov, z);
-        for i in 0..n {
-            result[i] += 4.0 * v_z[i];
+    // Step 1: Coulomb contribution: 2 * J[z] (singlet only)
+    let coulomb_factor = if xlet == 'S' { 2.0 } else if xlet == 'R' { 1.0 } else { 0.0 };
+    if coulomb_factor != 0.0 {
+        let jz = ri_bse::matvec::coulomb_contribution(ri_ov, z);
+        for idx in 0..dim {
+            result[idx] += coulomb_factor * jz[idx];
         }
     }
 
-    // HF exchange (if hybrid): K^A + K^B
-    if data.alpha_hybrid.abs() > 1.0e-10 {
-        let ka_z = exchange_a_matvec(ri_oo, ri_vv, data.occ_size, data.vir_size, z);
-        let kb_z = exchange_b_matvec(ri_ov, ri_ov_b, data.occ_size, data.vir_size, z);
-        for i in 0..n {
-            result[i] -= data.alpha_hybrid * (ka_z[i] + kb_z[i]);
+    // Step 2: Exchange contribution: -c_x * K_B[z]
+    if alpha_hybrid.abs() > 1e-15 {
+        let kz = exchange_b_matvec(ri_ov_exch, z, occ_size, vir_size, alpha_hybrid);
+        for idx in 0..dim {
+            result[idx] += kz[idx];
         }
+    }
+
+    // Step 3: XC kernel contribution: fxc[z]
+    let fxc = fxc_matvec(fxc_data, z);
+    for idx in 0..dim {
+        result[idx] += fxc[idx];
     }
 
     result
+}
+
+// ====== Tests with synthetic data ======
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_ri_matrices(occ_size: usize, vir_size: usize, naux: usize) -> (MatrixFull<f64>, MatrixFull<f64>, MatrixFull<f64>) {
+        // RI_OV: [naux, occ*vir]
+        let mut ri_ov_data = Vec::with_capacity(naux * occ_size * vir_size);
+        for P in 0..naux {
+            for i in 0..occ_size {
+                for a in 0..vir_size {
+                    ri_ov_data.push(((P + 1) as f64 * (i + 1) as f64 * (a + 1) as f64).sin() * 0.1);
+                }
+            }
+        }
+        let ri_ov = MatrixFull::from_vec([naux, occ_size * vir_size], ri_ov_data).unwrap();
+
+        // RI_OO: [naux, occ*occ]
+        let mut ri_oo_data = Vec::with_capacity(naux * occ_size * occ_size);
+        for P in 0..naux {
+            for i in 0..occ_size {
+                for j in 0..occ_size {
+                    ri_oo_data.push(((P + 1) as f64 * (i + 1) as f64 * (j + 1) as f64).cos() * 0.05);
+                }
+            }
+        }
+        let ri_oo = MatrixFull::from_vec([naux, occ_size * occ_size], ri_oo_data).unwrap();
+
+        // RI_VV: [naux, vir*vir]
+        let mut ri_vv_data = Vec::with_capacity(naux * vir_size * vir_size);
+        for P in 0..naux {
+            for a in 0..vir_size {
+                for b in 0..vir_size {
+                    ri_vv_data.push(((P + 1) as f64 * (a + 1) as f64 * (b + 1) as f64).sin() * 0.05);
+                }
+            }
+        }
+        let ri_vv = MatrixFull::from_vec([naux, vir_size * vir_size], ri_vv_data).unwrap();
+
+        (ri_ov, ri_oo, ri_vv)
+    }
+
+    fn build_exch_matrices(ri_oo: &MatrixFull<f64>, ri_vv: &MatrixFull<f64>, ri_ov: &MatrixFull<f64>,
+                           occ_size: usize, vir_size: usize, naux: usize)
+        -> (MatrixFull<f64>, MatrixFull<f64>, MatrixFull<f64>)
+    {
+        // ri_oo → [occ*naux, occ]
+        let mut ri_oo_exch = ri_oo.clone();
+        ri_oo_exch.reshape([naux * occ_size, occ_size]);
+        ri_oo_exch = ri_oo_exch.transpose_and_drop();
+        ri_oo_exch.reshape([occ_size * naux, occ_size]);
+
+        // ri_vv → [naux*vir, vir]
+        let mut ri_vv_exch = ri_vv.clone();
+        ri_vv_exch.reshape([naux * vir_size, vir_size]);
+
+        // ri_ov → [naux*occ, vir]
+        let mut ri_ov_exch = ri_ov.clone();
+        ri_ov_exch.reshape([naux * occ_size, vir_size]);
+
+        (ri_oo_exch, ri_vv_exch, ri_ov_exch)
+    }
+
+    #[test]
+    fn test_hdiag() {
+        // hdiag is simplest - just check it returns the right length
+        // We can't test values without SCF, so just verify the function compiles
+    }
+
+    #[test]
+    fn test_exchange_a_matvec_shape() {
+        let occ = 3; let vir = 5; let naux = 4;
+        let (ri_ov, ri_oo, ri_vv) = build_ri_matrices(occ, vir, naux);
+        let (ri_oo_exch, ri_vv_exch, _) = build_exch_matrices(&ri_oo, &ri_vv, &ri_ov, occ, vir, naux);
+        let n = occ * vir;
+        let z: Vec<f64> = (0..n).map(|i| (i as f64) * 0.01).collect();
+        let result = exchange_a_matvec(&ri_oo_exch, &ri_vv_exch, &z, occ, vir, 0.25);
+        assert_eq!(result.len(), n);
+        assert!(result.iter().all(|x| x.is_finite()));
+        println!("exchange_a_matvec shape OK, first 3: {:?}", &result[..3]);
+    }
+
+    #[test]
+    fn test_exchange_a_matvec_zero_hybrid() {
+        let occ = 3; let vir = 5; let naux = 4;
+        let (ri_ov, ri_oo, ri_vv) = build_ri_matrices(occ, vir, naux);
+        let (ri_oo_exch, ri_vv_exch, _) = build_exch_matrices(&ri_oo, &ri_vv, &ri_ov, occ, vir, naux);
+        let n = occ * vir;
+        let z: Vec<f64> = (0..n).map(|i| (i as f64) * 0.01).collect();
+        let result = exchange_a_matvec(&ri_oo_exch, &ri_vv_exch, &z, occ, vir, 0.0);
+        assert!(result.iter().all(|x| x.abs() < 1e-15));
+    }
+
+    #[test]
+    fn test_exchange_a_matvec_zero_z() {
+        let occ = 3; let vir = 5; let naux = 4;
+        let (ri_ov, ri_oo, ri_vv) = build_ri_matrices(occ, vir, naux);
+        let (ri_oo_exch, ri_vv_exch, _) = build_exch_matrices(&ri_oo, &ri_vv, &ri_ov, occ, vir, naux);
+        let n = occ * vir;
+        let z = vec![0.0; n];
+        let result = exchange_a_matvec(&ri_oo_exch, &ri_vv_exch, &z, occ, vir, 0.25);
+        assert!(result.iter().all(|x| x.abs() < 1e-15));
+    }
+
+    #[test]
+    fn test_exchange_b_matvec_shape() {
+        let occ = 3; let vir = 5; let naux = 4;
+        let (ri_ov, ri_oo, ri_vv) = build_ri_matrices(occ, vir, naux);
+        let (_, _, ri_ov_exch) = build_exch_matrices(&ri_oo, &ri_vv, &ri_ov, occ, vir, naux);
+        let n = occ * vir;
+        let z: Vec<f64> = (0..n).map(|i| (i as f64) * 0.01).collect();
+        let result = exchange_b_matvec(&ri_ov_exch, &z, occ, vir, 0.25);
+        assert_eq!(result.len(), n);
+        assert!(result.iter().all(|x| x.is_finite()));
+        println!("exchange_b_matvec shape OK, first 3: {:?}", &result[..3]);
+    }
+
+    #[test]
+    fn test_exchange_b_matvec_zero_z() {
+        let occ = 3; let vir = 5; let naux = 4;
+        let (ri_ov, ri_oo, ri_vv) = build_ri_matrices(occ, vir, naux);
+        let (_, _, ri_ov_exch) = build_exch_matrices(&ri_oo, &ri_vv, &ri_ov, occ, vir, naux);
+        let z = vec![0.0; occ * vir];
+        let result = exchange_b_matvec(&ri_ov_exch, &z, occ, vir, 0.25);
+        assert!(result.iter().all(|x| x.abs() < 1e-15));
+    }
+
+    #[test]
+    fn test_coulomb_contribution_symmetry() {
+        // Test that J^T = J (Coulomb is symmetric)
+        let occ = 3; let vir = 5; let naux = 4;
+        let (ri_ov, _, _) = build_ri_matrices(occ, vir, naux);
+        let n = occ * vir;
+        let z1: Vec<f64> = (0..n).map(|i| (i as f64 * 0.1).sin()).collect();
+        let z2: Vec<f64> = (0..n).map(|i| (i as f64 * 0.1).cos()).collect();
+        let r1 = ri_bse::matvec::coulomb_contribution(&ri_ov, &z1);
+        let r2 = ri_bse::matvec::coulomb_contribution(&ri_ov, &z2);
+        let v12: f64 = z1.iter().zip(r2.iter()).map(|(a, b)| a * b).sum();
+        let v21: f64 = z2.iter().zip(r1.iter()).map(|(a, b)| a * b).sum();
+        assert!((v12 - v21).abs() < 1e-14, "Coulomb matvec not symmetric: {} vs {}", v12, v21);
+        println!("Coulomb symmetry: ⟨z1,J·z2⟩ = {:.10}, ⟨z2,J·z1⟩ = {:.10}", v12, v21);
+    }
+
+    #[test]
+    fn test_exchange_a_matvec_random() {
+        let occ = 3; let vir = 5; let naux = 4;
+        let (ri_ov, ri_oo, ri_vv) = build_ri_matrices(occ, vir, naux);
+        let (ri_oo_exch, ri_vv_exch, _) = build_exch_matrices(&ri_oo, &ri_vv, &ri_ov, occ, vir, naux);
+        let n = occ * vir;
+        let z: Vec<f64> = (0..n).map(|i| (i as f64) * 0.01).collect();
+        let result_a = exchange_a_matvec(&ri_oo_exch, &ri_vv_exch, &z, occ, vir, 0.25);
+        assert!(result_a.len() == n);
+        assert!(result_a.iter().all(|x| x.is_finite()));
+    }
 }

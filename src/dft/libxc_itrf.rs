@@ -177,13 +177,18 @@ fn eval_xc1(
 ) -> Vec<f64> {
 
     let (nvar, n_components) = get_nvar(xc_type, spin, deriv);
-    // println!("[eval_xc1] nvar: {}, n_components: {}", nvar, n_components);
+    // Compute output nvar (for merge_xc layout) from xc_type
+    let out_nvar: usize = match xc_type {
+        XCType::LDA | XCType::HF => 1,
+        XCType::GGA => 4,
+        XCType::MGGA => 5,
+    };
     let mut output = vec![0.0; np * n_components];
 
     func_ids.iter()
     .zip(func_factors.iter())
     .for_each(
-        |(func_id, xc_param)| 
+        |(func_id, xc_param)|
         {
             let mut xc_func = XcFuncType::xc_func_init(*func_id, spin+1);
             let cur_xc_type = match xc_func.get_libxc_family() {
@@ -196,7 +201,7 @@ fn eval_xc1(
             };
             let mut outbuf = vec![0.0; np * n_components];
             eval_libxc_func_new(&xc_func, spin, deriv, np, rho, sigma, lapl, tau,  &mut outbuf);
-            merge_xc(&mut output, &outbuf, *xc_param, cur_xc_type, spin, deriv, nvar, np);
+            merge_xc(&mut output, &outbuf, *xc_param, cur_xc_type, spin, deriv, out_nvar, np);
             xc_func.xc_func_end();
         }
     );
