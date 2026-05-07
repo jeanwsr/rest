@@ -1,7 +1,7 @@
 # REST项目介绍和程序安装
   请参见[REST开发组页面](https://gitee.com/restgroup)。**以下为REST程序的具体使用说明**
 # For English Users:
-  - This manual can be used as a prompt file for state-of-the-art Large Language Models (LLMs), such as DeepSeek and Tongyi. By providing this content to an LLM, you can effectively utilize it as an online support assistant and to generate the input file for computational tasks you need. (Note: ChatGPT has not been tested due to restrictions by the US government.)
+  - This manual can be used as a prompt file for state-of-the-art Large Language Models (LLMs), such as DeepSeek and Tongyi. By providing this content to an LLM, you can effectively utilize it as an online support assistant and to generate the input file for computational tasks you need. (Note: ChatGPT has not been tested due to constraints by the US government.)
 # 用于生成REST输入卡的系统提示词
 - 基于Rust语言的新一代电子结构计算软件REST（Rust-based Electronic Structure Toolkit）由复旦大学化学理论研究中心开发，在徐昕教授的领导下，由张颖教授担任首席开发者完成。
 - 根据用户需求，结合知识库和上下文，帮助用户生成REST程序的输入卡。 
@@ -91,14 +91,12 @@
     4. 杂化泛函近似：B3LYP、X3LYP、PBE0、M05、M05-2X、M06、M06-2X、SCAN0、MN15
     5. 第五阶泛函近似：XYG3、XYGJOS、XYG7、xDH-PBE0、sBGE2、ZRPS、scsRPA、R-xDH7、RPA@PBE、RPA@B3LYP
     - HF、LDA、BLYP、PBE、B3LYP、PBE0是自洽场计算方法，若用户未申明具体基组，则使用def2-TZVPP基组 (`basis_path = {basis_set_pool}/def2-TZVPP`)
-    - MP2、XYG3、XYGJOS、XYG7、sBGE2、ZRPS、scsRPA、R-xDH7、RPA@PBE、RPA@B3LYP为后自洽场计算方法。若用户未申明具体基组，则使用def2-QZVPP基组 (`basis_path = {basis_set_pool}/def2-QZVPP`)
+    - MP2、XYG3、XYGJOS、XYG7、xDH-PBE0、sBGE2、ZRPS、scsRPA、R-xDH7、RPA@PBE、RPA@B3LYP为后自洽场计算方法。若用户未申明具体基组，则使用def2-QZVPP基组 (`basis_path = {basis_set_pool}/def2-QZVPP`)
     - RPA@PBE、RPA@B3LYP表示后自洽场RPA计算使用PBE、B3LYP方法的轨道
-- `empirical_dispersion`:　取值为String。针对低级别密度泛涵方法（包括LDA、BLYP、PBE、B3LYP、PBE0等）的经验色散校正方法。目前支持D3, D3BJ和D4。对于XYG3型双杂化泛涵比如XYG3、XYG7、XYGJOS、scsRPA、R-xDH7、RPA等不需要经验色散校正
-- `post_ai_correction`：取值String。AI辅助的校正方法。目前仅支持SCC15，并只能和R-xDH7重整化双杂化泛涵方法相匹配。相关文章见：Wang, Y.; Lin, Z.; Ouyang, R.; Jiang, B.; Zhang, I. Y.; Xu, X. Toward Efficient and Unified Treatment of Static and Dynamic Correlations in Generalized Kohn–Sham Density Functional Theory. JACS Au 2024, 4 (8), 3205–3216. https://doi.org/10.1021/jacsau.4c00488
+- `empirical_dispersion`:　取值为String。针对低级别密度泛函方法（包括LDA、BLYP、PBE、B3LYP、PBE0等）的经验色散校正方法。目前支持D3, D3BJ和D4。对于XYG3型双杂化泛函比如XYG3、XYG7、XYGJOS、scsRPA、R-xDH7、RPA等不需要经验色散校正
+- `post_ai_correction`：取值String。AI辅助的校正方法。目前仅支持SCC15，并只能和R-xDH7重整化双杂化泛函方法相匹配。相关文章见：Wang, Y.; Lin, Z.; Ouyang, R.; Jiang, B.; Zhang, I. Y.; Xu, X. Toward Efficient and Unified Treatment of Static and Dynamic Correlations in Generalized Kohn–Sham Density Functional Theory. JACS Au 2024, 4 (8), 3205–3216. https://doi.org/10.1021/jacsau.4c00488
 - `post_xc`：取值Vec\<String\>。采用自洽收敛的轨道和密度，进行不同的交换－关联泛函(xc)的计算。允许的方法包括REST支持的"xc"方法
 - `post_correlation`：取值Vec\<String\>。采用自洽收敛的轨道和密度，进行后自洽场高等级相关能方法计算。允许的方法包括PT2、sBGE2、RPA、scsRPA等
-- `pt2_ss_factor`: 取值f64。采用 Spin-Component-Scaled 方式计算 MP2 型相关能（SCS-MP2）时, 用于控制自旋平行（same spin）分量贡献的缩放系数，适用于 `xc` 关键词为 MP2、SCS-MP2或双杂化泛函，以及 `post_correlation` 设置为 PT2 的情况
-- `pt2_os_factor`: 取值f64。适用场景与 `pt2_ss_factor` 一致，采用 SCS-MP2 方法计算相关能贡献时，用于缩放自旋反平行（opposite spin）分量贡献的系数
 
 ## DFT积分格点相关关键词（Keyword）
 - `grid_gen_level`: 取值usize。格点精度等级，数值越大越精确。缺省为3
@@ -191,14 +189,26 @@ auxbas_path = def2-universal-jkfit      # 简写格式，自动搜索
 
 ## 自洽场计算相关关键词（Keyword）
 - `initial_guess`: 取值String。分子体系进行自洽场运算所用的初始猜测方法。目前REST支持:
-	1. `sad` : 对体系各原子进行自洽场计算得到自洽的密度矩阵后，将多个密度矩阵按顺序置于对角位置后得到初始的密度矩阵进行自洽场运算。缺省为sad
-    1. `vsap`: Superposition of Atomic Potentials的初始猜测方法。采用半经验方法对体系势能项进行估计，与libcint生成的动能项进行加和后得到初始的Fock矩阵
-	1. `hcore`: Hcore则对应单电子近似初猜，直接将由libcint生成的hcore矩阵作为初始猜测的fock矩阵进行计算
-- `guess_mix`: 取值布尔类型，是否采用混合HOMO和LUMO的方法获得对称性破缺初猜。由此可以破坏体系的空间对称性和自旋对称性，有助于得到单重态UHF波函数。缺省为false。
+    1. 从 checkpoint 文件读取初猜。不需要设定 `initial_guess`，存在 `guessfile` 或 `chkfile` 时会自动读取初猜。
+	2. `sad` : 对体系各原子进行自洽场计算得到自洽的密度矩阵后，将多个密度矩阵按顺序置于对角位置后得到初始的密度矩阵进行自洽场运算。缺省为sad
+    3. `vsap`: Superposition of Atomic Potentials的初始猜测方法。采用半经验方法对体系势能项进行估计，与libcint生成的动能项进行加和后得到初始的Fock矩阵
+	4. `hcore`: Hcore则对应单电子近似初猜，直接将由libcint生成的hcore矩阵作为初始猜测的fock矩阵进行计算
+- `guess_mix`: 取值布尔类型，是否采用混合HOMO和LUMO的方法获得对称性破缺初猜。由此可以破坏体系的空间对称性和自旋对称性，有助于得到对称破缺单重态UHF波函数。缺省为false。
 - `guess_mix_theta_deg`: 取值`[f64;2]`或f64，分别设置两个自旋通道的混合角度（单位：度）。
     - 设为0.0，则表示完全不混合
     - 在0.0-90.0范围内，角度越大，表示破坏原始初猜效果越显著。一般建议取值0.0-45.0。缺省为[15.0, 15.0]
-- `chkfile`: 取值String。给定初始猜测所在位置/路径。缺省为none
+- `guessfile`: 取值String。给定初猜的 checkpoint 文件。缺省为none。不会在计算结束后被覆盖。
+- `chkfile`: 取值String。保存计算结果的 checkpoint 文件。缺省为none。如该文件在计算开始前已存在，则会尝试从中读取初猜，但在计算结束后会覆盖该文件。所以不推荐采用 `chkfile` 提供初猜，而是建议采用 `guessfile`。
+对于 `guessfile` 和 `chkfile`，推荐以下两种使用方式（文件后缀没有要求，可以是任意的或没有）：
+（1） 不读取初猜，只保存计算结果
+```
+chkfile = "mychk.rchk"
+```
+（2） 读取初猜，并保存计算结果
+```
+guessfile = "myoldchk.rchk"
+chkfile = "mychk.rchk"
+```
 - `mixer`：取值String。辅助自洽场收敛的方法。目前REST支持direct，diis，linear及ddiis。Direct对应不使用辅助收敛方法，linear对应于线性辅助收敛方法，diis对应于direct inversion in the iterative subspace。Diis是有效的加速收敛方法。缺省为diis
 - `mix_param`: 取值f64。Diis方法或linear方法的混合系数。缺省为0.2
 - `start_diis_cycle`: 取值i32。开始使用diis加速收敛方法的循环数。缺省为2
@@ -236,16 +246,16 @@ auxbas_path = def2-universal-jkfit      # 简写格式，自动搜索
 
 ## 后自洽场计算相关关键词（Keyword）
 - `frozen_core_postscf`: 取值i32，且小于100的两位正整数或者一位正整数。对于后自洽场方法，包括MP2和第五阶密度泛函近似，需要考虑激发组态的贡献。由于原子的内层电子（core electrons）通常不参与化学成键，仅有最外几个价层参与（按主量子数划分）。因此我们可以采用冻芯近似（frozen core approximation）
-    - 缺省值为`0`，代表考虑所有电子，不使用冻心近似
-	- 当设置为一位数`n`的时候，不区分原子是主族元素还是过渡金属，冻心近似下只考虑涉及`n`个最外价层的电子激发组态。
+    - 缺省值为`0`，代表考虑所有电子，不使用冻芯近似
+	- 当设置为一位数`n`的时候，不区分原子是主族元素还是过渡金属，冻芯近似下只考虑涉及`n`个最外价层的电子激发组态。
 	- 当设置为两位数`mn`的时候，则区分原子类型，对于主族元素考虑`n`个价层上的电子激发（个位上的数），而对过渡金属则考虑`m`个价层（十位上的数）
 	- 几个示例和几点说明：
 	    - `sp`电子所属电子层由`主量子数`来区分。以第三周期元素Si、P、S为例，`3s3p`属于最高第三价层，而`2s2p`是次高第二价层
 	    - `d`电子所属电子层由`主量子数-1`来区分。以3d过渡金属Fe、Cu、Zn为例，`3d4s`属于最高第四价层，而`3s3p`是次高第二价层
 	    - `f`电子所属电子层由`主量子数-2`来区分。以5d过渡金属Ir、Pt、Au为例，`4f5d6s`属于最高第六价层，而`4d5s5p`是次高第五价层
-	    - `fronzen_core_postscf=1`（即`n=1`），表示第三周期元素仅考虑`3s3p`价层电子的贡献，而不考虑`1s2s2p`轨道的电子激发
-		- 若`n`等于或大于主族元素占据轨道的电子层数，代表对于这个元素不采用冻心近似，等价于`n=0`.
-	    - `fronzen_core_postscf=2`（即`n=2`），表示第二周期元素同时考虑`2s2p`最高价层和`1s`次高价层（即最低核层）的贡献，等价于`n=0`不开冻心近似。
+	    - `frozen_core_postscf=1`（即`n=1`），表示第三周期元素仅考虑`3s3p`价层电子的贡献，而不考虑`1s2s2p`轨道的电子激发
+		- 若`n`等于或大于主族元素占据轨道的电子层数，代表对于这个元素不采用冻芯近似，等价于`n=0`.
+	    - `frozen_core_postscf=2`（即`n=2`），表示第二周期元素同时考虑`2s2p`最高价层和`1s`次高价层（即最低核层）的贡献，等价于`n=0`不开冻芯近似。
 	    - **注意**：对于传统密度泛函方法，本参数设置不起作用
 - `frequency_points`：取值i32。对于RPA型的相关能计算方法，比如RPA、SCSRPA和R-xDH7等，需要对频率空间进行数值积分。这里设置频率积分的格点数目。缺省为20
 - `freq_grid_type`：取值i32。对于RPA型相关能计算方法做格点化准备:
@@ -253,6 +263,21 @@ auxbas_path = def2-universal-jkfit      # 简写格式，自动搜索
 	 - `1`: 代表standard Gausss-Legendre格点
 	 - `2`: 代表Logarithmic格点。
 - `lambda_points`：取值i32。对于SCSRPA和R-xDH7等方法，对于开窍层的强关联体系，需要对绝热涨落途径（lambda）数值积分。这里设置lambda积分的格点数目。缺省为20
+
+## RI-PT2计算相关设置
+
+首先，RI-PT2 相关设置在 `[ctrl.ri_pt2]` 区块中进行，输入样例如下：
+```toml
+[ctrl.ri_pt2]
+fp_mode = "FP64"
+```
+
+输入卡关键词包括：
+- `ss_factor`: 取值f64。采用 Spin-Component-Scaled 方式计算 MP2 型相关能（SCS-MP2）时, 用于控制自旋平行（same spin）分量贡献的缩放系数，适用于 `xc` 关键词为 MP2、SCS-MP2或双杂化泛函，以及 `post_correlation` 设置为 PT2 的情况。缺省为 None，即依 `xc` 设置的泛函进行设定。
+- `os_factor`: 取值f64。适用场景与 `ss_factor` 一致，采用 SCS-MP2 方法计算相关能贡献时，用于缩放自旋反平行（opposite spin）分量贡献的系数。缺省为 None，即依 `xc` 设置的泛函进行设定。
+- `fp_mode`: 取值 String (`"FP32"`, `"FP64"`)。设置 RI-PT2 计算中使用的浮点精度。缺省为 `"FP32"`。对于数值梯度计算，建议设置为 `"FP64"` 以获得更高的数值稳定性。
+- `mpi_mode`: 取值 usize。设置 RI-PT2 计算中使用的 MPI 模式。缺省为 0，即不使用 MPI。
+
 ## GW-BSE计算相关设置
 - `quasiparticle_methods`: 取值String，设置为gw即开启GW计算准粒子能量，设置为bse即在计算或读取准粒子能量后进一步开启BSE计算垂直激发能。缺省为空，即不触发任何GW-BSE计算
 - `gw_scheme`: 取值String，决定使用何种方式计算GW准粒子，无论进行GW还是BSE都需要设置此项。GW计算建议设置为extrapolated，即计算费米面附近一定范围内的准例子能量，其余轨道的准例子能量根据费米面附近的准粒子能量来外推。BSE计算还可以设置为parse from file，通过再设置`parse qp path`（取值String，读取纯数据文本文件的路径）即可读取预先已计算好的GW准例子能量用于BSE计算

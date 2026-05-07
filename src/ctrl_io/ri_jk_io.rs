@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 /// Normalize input string by removing spaces, hyphens, underscores, and converting to lowercase.
 pub fn normalize_input_string(input: &str) -> String {
     // note that e-[num], E-[num] should not be normalized to e[num], E[num]
-    // in these cases, we first substitute to a temporary token, then remove the unwanted characters, and finally restore the original format.
+    // in these cases, we first substitute to a temporary token, then remove the unwanted characters,
+    // and finally restore the original format.
     const TEMP_TOKEN: &str = "**temp*token**";
     // may use regex for finding number after hyphen
     let reg = regex::Regex::new(r"(?P<letter>[eE])-(?P<number>\d+)").unwrap();

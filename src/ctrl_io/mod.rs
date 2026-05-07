@@ -21,8 +21,10 @@ use crate::solvent::PcmMethod;
 use serde_json;
 use toml;
 
-pub mod flags;
-pub use flags::*;
+pub mod ri_jk_io;
+pub mod ri_pt2_io;
+pub use ri_jk_io::*;
+pub use ri_pt2_io::*;
 
 mod pyrest_ctrl_io;
 mod geometric_pyo3_io;
@@ -144,8 +146,6 @@ pub struct InputKeywords {
     // =========================================
     pub post_xc: Vec<String>,
     pub post_correlation: Vec<DFAFamily>,
-    pub pt2_ss_factor: Option<f64>,
-    pub pt2_os_factor: Option<f64>,
     pub post_ai_correction: String,
     pub charge: f64,
     #[pyo3(get, set)]
@@ -204,7 +204,7 @@ pub struct InputKeywords {
     #[pyo3(get, set)]
     pub scf_acc_etot:f64,
     #[pyo3(get, set)]
-    pub restart: bool,
+    pub has_chkfile: bool,
     #[pyo3(get, set)]
     // Keywords for solvent models
     pub solvent_enabled: bool,
@@ -273,7 +273,6 @@ pub struct InputKeywords {
     pub force_state_occupation: Vec<ForceStateOccupation>,
     pub auxiliary_reference_states: Vec<(String,usize)>,
     pub rpa_de_excitation_parameters: Option<[f64;4]>,
-    pub pt2_mpi_mode: usize,
     /// Maximum memory available in MB, `None` if no limit.
     /// This option is only for single-node computation, and only works in some cases where algorithm awares memory usage and perform batched computation.
     /// For multi-node (MPI), this keyword is not fully discussed.
@@ -290,8 +289,11 @@ pub struct InputKeywords {
     pub opt_engine: Option<String>,
     pub geometric_pyo3: Option<GeomeTRIC>,
     pub quasiparticle_methods:Option<QuasiParticle>,
+    pub stop_at: Option<String>,
+    pub xc_parser: String,
     pub tddft: Option<TDDFTParameters>,
     pub j2c_decomp: J2CDecompOption,
+    pub ri_pt2: RiPt2Option,
 }
 
 impl Default for InputKeywords {
@@ -334,8 +336,6 @@ impl InputKeywords {
             empirical_dispersion: None,
             post_xc: vec![],
             post_correlation: vec![],
-            pt2_os_factor: None,
-            pt2_ss_factor: None,
             post_ai_correction: String::from("none"),
             eri_type: String::from("ri_v"),
             use_ri_symm: true,
@@ -380,8 +380,8 @@ impl InputKeywords {
             scf_acc_rho: 1.0e-6,
             scf_acc_eev: 1.0e-5,
             scf_acc_etot:1.0e-8,
-            restart: false,
-            external_init_guess: false,
+            has_chkfile: false, // not directly set by input
+            external_init_guess: false, // not directly set by input
             initial_guess: String::from("sad"),
             noiter: false,
             check_stab: false,
@@ -417,7 +417,6 @@ impl InputKeywords {
             auxiliary_reference_states: Vec::new(),
             force_state_occupation: Vec::new(),
             rpa_de_excitation_parameters: None,
-            pt2_mpi_mode: 0,
             max_memory: None,
             abort_on_mem_exceed: true,
             guess_mix: false,
@@ -432,7 +431,10 @@ impl InputKeywords {
             solvent_enabled: false,
             solv_epsilon:1.0,
             solvent_model: PcmMethod::CPCM,
+            stop_at: None,
+            xc_parser: String::from("legacy"),
             j2c_decomp: J2CDecompOption::default(),
+            ri_pt2: RiPt2Option::default(),
             tddft: None,
         }
     }
@@ -575,14 +577,27 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
             MOrC::Molecule => println!("It is a finite cluster calculation"),
             MOrC::Crystal => println!("It is a periodic calculation")
         }
-        if ctrl.restart && ! std::path::Path::new(&ctrl.chkfile).exists() {
-            println!("The specified checkfile is missing, which will be created after the SCF procedure \n({})",&ctrl.chkfile)
-        } else if ctrl.restart && ! ctrl.external_init_guess {
-            println!("The initial guess will be obtained from the existing checkfile \n({})",&ctrl.chkfile)
+
+        let chkfile_exist = std::path::Path::new(&ctrl.chkfile).exists();
+        if ctrl.external_init_guess {
+            println!("The initial guess is prepared by reading guessfile ({})", &ctrl.guessfile);
+            if ctrl.has_chkfile && chkfile_exist {
+                println!("The specified chkfile exists but is not loaded because the guessfile is specified");
+                println!("It will be overwritten after the SCF procedure \n({})",&ctrl.chkfile)
+            }
         } else {
-            println!("The specified checkfile exists but is not loaded because the keyword 'external_init_guess' is specified");
-            println!("It will be updated after the SCF procedure \n({})",&ctrl.chkfile)
-        };
+            if ctrl.has_chkfile {
+                if ! chkfile_exist {
+                    println!("The specified chkfile is missing, which will be created after the SCF procedure \n({})",&ctrl.chkfile)
+                } else {
+                    println!("The initial guess is prepared by reading chkfile ({})",&ctrl.chkfile);
+                    ctrl.external_init_guess = true;
+                }
+            }
+        }
+        if ! ctrl.external_init_guess {
+            println!("Initial guess is prepared by ({}).", &ctrl.initial_guess);
+        }
 
 
     }
@@ -615,11 +630,6 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
             //ctrl.mixer = String::from("direct");
             panic!("Unknown charge density mixer ({})! No charge density mixing will be invoked.", ctrl.mixer);
         };
-        println!("Initial guess is prepared by ({}).", &ctrl.initial_guess);
-
-        if ctrl.external_init_guess {
-            println!("The initial guess is obtained from the specified file \n({})", &ctrl.guessfile);
-        }
 
         if ctrl.guess_mix {
             println!("Initial guess mixing enabled: HOMO-LUMO rotated with theta = {:.1}° (alpha), {:.1}° (beta) to induce symmetry breaking",
@@ -661,11 +671,6 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(64)},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(64) as usize},
                 other => {64},
-            };
-            tmp_input.pt2_mpi_mode = match tmp_ctrl.get("pt2_mpi_mode").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(0)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(0) as usize},
-                other => {0},
             };
             if let Some(num_threads) = tmp_input.num_threads {
                 //if tmp_input.print_level>0 {println!("The number of threads used for parallelism:      {}", num_threads)};
@@ -877,6 +882,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     DFTType::Standard
                 },
             };
+            // to be deprecated
             tmp_input.xc_namelist = match tmp_ctrl.get("xc_namelist").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_op) => {Some(vec![tmp_op.to_lowercase()])},
                 serde_json::Value::Array(tmp_op) => {
@@ -903,6 +909,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 },
                 other => {None},
             };
+            //
             tmp_input.dfa_hybrid_scf = match tmp_ctrl.get("xc_hybrid_para").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {Some(tmp_str.parse().unwrap_or(0.0))},
                 serde_json::Value::Number(tmp_num) => {Some(tmp_num.as_f64().unwrap_or(0.0))},
@@ -978,30 +985,6 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 }
                 //if corr.to_lowercase().eq(&pt2) 
             });
-            tmp_input.pt2_os_factor = match tmp_ctrl.get("pt2_os_factor").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {
-                    match tmp_str.to_lowercase().parse() {
-                        Ok(num) => Some(num),
-                        Err(_) => None,
-                    }
-                },
-                serde_json::Value::Number(tmp_num) => {
-                    tmp_num.as_f64()
-                },
-                other => {None},
-            };
-            tmp_input.pt2_ss_factor = match tmp_ctrl.get("pt2_ss_factor").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {
-                    match tmp_str.to_lowercase().parse() {
-                        Ok(num) => Some(num),
-                        Err(_) => None,
-                    }
-                },
-                serde_json::Value::Number(tmp_num) => {
-                    tmp_num.as_f64()
-                },
-                other => {None},
-            };
             tmp_input.post_ai_correction = match tmp_ctrl.get("post_ai_correction").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_xc) => {tmp_xc.to_lowercase()},
                 other => {String::from("none")},
@@ -1249,7 +1232,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
             tmp_input.guessfile_type = match tmp_ctrl.get("guessfile_type").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_guess) => tmp_guess.to_lowercase().clone(),
-                other => String::from("none"),
+                other => String::from("hdf5"),
             };
 
             // Fix a bug reported by Linyue Yu, 2024-09-03
@@ -1265,7 +1248,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => String::from("hdf5"),
             };
 
-            tmp_input.restart = ! tmp_input.chkfile.to_lowercase().eq(&"none");
+            tmp_input.has_chkfile = ! tmp_input.chkfile.to_lowercase().eq(&"none");
 
             tmp_input.initial_guess = match tmp_ctrl.get("initial_guess").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
@@ -1298,6 +1281,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 }
                 tmp_input.algorithm_jk = AlgorithmJK::Separated(tmp_input.algorithm_j, tmp_input.algorithm_k);
             }
+            tmp_input.ri_pt2 = tmp_ctrl.get("ri_pt2").map(serde_from_value).unwrap_or_default();
             // ================================================
             //  Keywords associated with the elec occupation 
             // ================================================
@@ -1606,6 +1590,16 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Null => { None },
                 _ => panic!("Not recognized type for opt_engine"),
             };
+
+            tmp_input.stop_at = match tmp_ctrl.get("stop_at").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => { Some(tmp_str.to_lowercase()) },
+                other => None,
+            };
+
+            tmp_input.xc_parser = match tmp_ctrl.get("xc_parser").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => { tmp_str.to_lowercase() },
+                other => String::from("legacy"),
+            };
             
             //===========================================================
             // Global check of ctrl keywords and futher modification
@@ -1620,21 +1614,9 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 //    println!("Even tempered basis beta is: {}", tmp_input.etb_beta);
                 //}
             }
-            if tmp_input.external_init_guess  {
-                if ! std::path::Path::new(&tmp_input.guessfile).exists() {
-                    println!("WARNING: Initial density matrix is required by the keyword of guessfile, which, however, does not exist: \n({}). \n The external initial guess will not be imported.\n",&tmp_input.guessfile);
-                    tmp_input.external_init_guess = false;
-                } else {
-                    //if tmp_input.print_level>0 {
-                    //    println!("The initial guess will be imported from \n({}).\n ",&tmp_input.guessfile);
-                    //}
-                }
-            }
             if tmp_input.force_state_occupation.len()>0 {
-                if ! tmp_input.restart {
-                    panic!("ERROR: force_state_occupation can not be involved without an existing chkfile \'restart\'");
-                } else if ! std::path::Path::new(&tmp_input.chkfile).exists() {
-                    panic!("ERROR: force_state_occupation can not be involved without an existing chkfile \'restart\'");
+                if ! (tmp_input.has_chkfile && std::path::Path::new(&tmp_input.chkfile).exists()) && ! tmp_input.external_init_guess {
+                    panic!("ERROR: force_state_occupation can not be involved without an existing guessfile/chkfile");
                 }
             }
         },

@@ -9,6 +9,7 @@ use rayon::slice::ParallelSlice;
 use rest_tensors::{TensorOpt,RIFull, MatrixFull};
 use rest_tensors::matrix_blas_lapack::{_dgemm_nn,_dgemm_tn};
 use sbge2::{close_shell_sbge2_rayon_mpi, open_shell_sbge2_rayon_mpi};
+use serde::{Deserialize, Serialize};
 use tensors::BasicMatrix;
 use tensors::matrix_blas_lapack::{_dsymm, _dgemm};
 
@@ -24,6 +25,8 @@ use crate::post_scf_analysis::{split_indices_by_spin_occ, format_indices};
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
 
 pub mod sbge2;
+pub mod pure_pt2_pair_eng;
+pub mod pt2_pair_eng;
 
 #[derive(Clone)]
 pub struct PT2 {
@@ -40,6 +43,15 @@ impl PT2 {
             pt2_energy:[0.0,0.0]
         }
     }
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum PT2FPMode {
+    #[serde(alias = "FP64", alias = "fp64", alias = "f64")]
+    FP64,
+    #[default]
+    #[serde(alias = "FP32", alias = "fp32", alias = "f32")]
+    FP32,
 }
 
 pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<f64> {
@@ -80,25 +92,27 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     timerecords.count("xc_energy");
     let dfa_family_pos = scf_data.mol.xc_data.dfa_family_pos.clone().unwrap();
 
-    if scf_data.mol.ctrl.use_ri_symm {
+    let use_new_driver = mpi_operator.is_none()
+        && dfa_family_pos == crate::dft::DFAFamily::PT2
+        && matches!(scf_data.scftype, SCFType::RHF | SCFType::UHF);
+    
+    if use_new_driver {
+        // we have already checked dfa_family_pos = PT2
+        let pt2_fp_mode = scf_data.mol.ctrl.ri_pt2.fp_mode;
+        pt2_c = match scf_data.scftype {
+            SCFType::RHF => match pt2_fp_mode {
+                PT2FPMode::FP64 => pt2_pair_eng::evaluate_ript2_eng::<f64>(scf_data, &mut timerecords),
+                PT2FPMode::FP32 => pt2_pair_eng::evaluate_ript2_eng::<f32>(scf_data, &mut timerecords),
+            },
+            SCFType::UHF => match pt2_fp_mode {
+                PT2FPMode::FP64 => pt2_pair_eng::evaluate_riupt2_eng::<f64>(scf_data, &mut timerecords),
+                PT2FPMode::FP32 => pt2_pair_eng::evaluate_riupt2_eng::<f32>(scf_data, &mut timerecords),
+            },
+            SCFType::ROHF => unreachable!("currently not implemented, and should not go here due to `use_new_driver` condition"),
+        };
+    } else if scf_data.mol.ctrl.use_ri_symm {
         timerecords.count_start("ao2mo");
-        let (occ_range, vir_range) = determine_ri3mo_size_for_pt2_and_rpa(&scf_data);
-        if scf_data.mol.ctrl.print_level>1 {
-            //println!("generate RI3MO only for occ_range:{:?}, vir_range:{:?}", &occ_range, &vir_range);
-            let spin_orb_indices = split_indices_by_spin_occ(&scf_data.occupation, 0.5);
-            let (alpha_occ, alpha_vir) = &spin_orb_indices[0];
-            println!("Occupied orbitals (alpha): {}", format_indices(alpha_occ));
-            println!("Virtual orbitals (alpha): {}", format_indices(alpha_vir));
-            if matches!(scf_data.scftype, SCFType::UHF | SCFType::ROHF) {
-                let (beta_occ,  beta_vir)  = &spin_orb_indices[1];
-                println!("Occupied orbitals (beta): {}", format_indices(beta_occ));
-                println!("Virtual orbitals (beta): {}", format_indices(beta_vir));
-            }
-        };
-        scf_data.generate_ri3mo_rayon(vir_range, occ_range);
-        if scf_data.mol.ctrl.print_level>1 {
-            println!("Finish the RI3MO generation")
-        };
+        crate::scf_io::generate_ri3mo_rayon_for_pt2_and_rpa(scf_data);
         timerecords.count("ao2mo");
         timerecords.count_start("c_r5dft");
         pt2_c = match scf_data.scftype {
@@ -111,11 +125,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
             SCFType::UHF => match  dfa_family_pos {
                 crate::dft::DFAFamily::PT2 => open_shell_pt2_rayon_mpi(&scf_data, mpi_operator).unwrap(),
                 crate::dft::DFAFamily::SBGE2 => open_shell_sbge2_rayon_mpi(scf_data, mpi_operator).unwrap(),
-                crate::dft::DFAFamily::SCSRPA => {
-                    let c_rpa = evaluate_osrpa_correlation_rayon_mpi(scf_data, mpi_operator).unwrap();
-                    //[c_rpa[0], c_rpa[1], c_rpa[0]-c_rpa[1]]
-                    c_rpa
-                },
+                crate::dft::DFAFamily::SCSRPA => evaluate_osrpa_correlation_rayon_mpi(scf_data, mpi_operator).unwrap(),
                 _ => [0.0,0.0,0.0]
             },
             SCFType::ROHF => match dfa_family_pos {
@@ -878,7 +888,7 @@ pub fn open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperato
 
                     let mut eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
                     let mut loc_eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
-                    let virt_os_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo_1, lumo_2, num_state, scf_data.mol.ctrl.pt2_mpi_mode);
+                    let virt_os_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo_1, lumo_2, num_state, scf_data.mol.ctrl.ri_pt2.mpi_mode);
 
 
                     // prepare the elec_pair for the rayon parallelization
@@ -1045,7 +1055,7 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
             //let (sender, receiver) = channel();
             //elec_pair.par_iter().for_each_with(sender,|s,i_pair| {
 
-            let virt_os_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo, lumo, num_state, scf_data.mol.ctrl.pt2_mpi_mode);
+            let virt_os_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo, lumo, num_state, scf_data.mol.ctrl.ri_pt2.mpi_mode);
 
             for i_state in start_mo..num_occu {
                 for j_state in i_state..num_occu {
@@ -1542,7 +1552,7 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
 
                     let mut eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
                     let mut loc_eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
-                    let virt_os_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo_1, lumo_2, num_state, scf_data.mol.ctrl.pt2_mpi_mode);
+                    let virt_os_pair = mpi_ix.distribution_opposite_spin_virtual_orbital_pair(lumo_1, lumo_2, num_state, scf_data.mol.ctrl.ri_pt2.mpi_mode);
 
 
                     // prepare the elec_pair for the rayon parallelization

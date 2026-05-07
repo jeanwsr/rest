@@ -16,10 +16,14 @@ fn main() -> miette::Result<()> {
         println!("cargo:rustc-link-search={}/lib",&blas_dir.display());
     }
 
-    #[cfg(feature = "dftd3")]
-    println!("cargo:rustc-link-lib=s-dftd3");
-    #[cfg(feature = "dftd4")]
-    println!("cargo:rustc-link-lib=dftd4");
+    // AJZ34: After dftd3/4 v0.2, by default we support dynamic loading.
+    // libs-dftd3.so, libdftd4.so are not necessarily linked at compile time.
+    // User should specify those libraries if dftd3/4 computation requested (by conda or LD_LIBRARY_PATH).
+    //
+    // #[cfg(feature = "dftd3")]
+    // println!("cargo:rustc-link-lib=s-dftd3");
+    // #[cfg(feature = "dftd4")]
+    // println!("cargo:rustc-link-lib=dftd4");
 
     let library_names = ["cint","restmatr","xc","hdf5","rest2fch","openblas","gomp"];
     library_names.iter().for_each(|name| {

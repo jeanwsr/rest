@@ -247,7 +247,7 @@ pub const C2S_L5: C2S = C2S::L5(DMatrix21x11 {
 });
 
 impl C2S {
-    pub fn to_matrixfullslice(&self) -> MatrixFullSlice<f64> {
+    pub fn to_matrixfullslice(&self) -> MatrixFullSlice<'_, f64> {
         match &self {
             C2S::L0(matr) => {
                 MatrixFullSlice {

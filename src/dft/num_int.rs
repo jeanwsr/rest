@@ -1,25 +1,14 @@
-
-
-use rayon::prelude::*;
-use itertools::{Itertools, izip};
-use tensors::{BasicMatrixOpt, TensorSlice};
-// use toml::de;
-use std::borrow::Borrow;
-use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
-
 use rstsr::prelude::*;
-use rest_tensors::{MatrixFull, MatrixFullSliceMut, TensorSliceMut, RIFull, MatrixFullSlice};
-use rest_tensors::matrix_blas_lapack::{_dgemm_nn, _dgemm_tn, _einsum_01_serial, _einsum_02_serial, _einsum_01_rayon, _einsum_02_rayon};
-use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, contract_vxc_0_serial};
-
+use rest_tensors::{MatrixFull, RIFull};
+use rest_tensors::matrix_blas_lapack::{ _einsum_01_serial, _einsum_02_serial};
+use tensors::matrix_blas_lapack::{_dgemm};
 use crate::scf_io::SCF;
 use crate::molecule_io::Molecule;
-use crate::basis_io::{Basis4Elem, BasCell, spheric_gto_deriv_batch_serial};
+use crate::basis_io::{spheric_gto_deriv_batch_serial};
 use crate::dft::{Grids, DFA4REST};
 use crate::dft::xc_deriv::XCType;
 use crate::dft::libxc_itrf::eval_xc_eff;
-use crate::utilities::{self, balancing};
 
 
 pub fn eval_ao_batch(mol:&Molecule, coords:&[[f64; 3]], ao_deriv:usize, num_grids:usize) -> RIFull<f64> {
