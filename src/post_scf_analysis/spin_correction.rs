@@ -27,6 +27,7 @@ pub fn apply_yamaguchi_spin_correction(scf_data: &mut SCF, time_mark: &mut TimeR
         scf_data.mol.ctrl.force_state_occupation = vec![];
         //scf_data.mol.ctrl.chkfile.push_str("_triplet");
         scf_data.mol.ctrl.has_chkfile = false;
+        scf_data.mol.ctrl.external_init_guess = None;
         scf_data.mol.num_elec[1] += 1.0;
         scf_data.mol.num_elec[2] -= 1.0;
         scf_data.mol.ctrl.initial_guess = String::from("inherit");

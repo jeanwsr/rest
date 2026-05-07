@@ -30,33 +30,40 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
         scf_data.generate_occupation();
         scf_data.generate_density_matrix();
     // import the initial guess from guessfile
-    } else if scf_data.mol.ctrl.external_init_guess && scf_data.mol.ctrl.guessfile_type.eq(&"hdf5") {
-        let file = hdf5::File::open(&scf_data.mol.ctrl.guessfile).unwrap();
-        if has_dm(&file) {
-            scf_data.density_matrix = initial_guess_from_hdf5guess(&scf_data.mol);
-            // for DFT methods, it needs the eigenvectors to generate the hamiltonian. In consequence, we use the hf method to prepare the eigenvectors from the guess dm
-            scf_data.generate_hf_hamiltonian_for_guess();
-            //scf_data.generate_hf_hamiltonian();
-            if scf_data.mol.ctrl.print_level>0 {println!("Initial guess energy: {:16.8}", scf_data.evaluate_hf_total_energy())};
-            scf_data.diagonalize_hamiltonian(mpi_operator);
-            scf_data.generate_occupation();
-            scf_data.generate_density_matrix();
-        } else if has_mo_coeff(&file) {
-            println!("Read MO coefficients from guessfile: {}", &scf_data.mol.ctrl.guessfile);
-            // let (eigenvectors, eigenvalues, is_occupation) = initial_guess_from_hdf5chk(
-            //     &scf_data.mol, &scf_data.scftype, &scf_data.mol.ctrl.guessfile);
-            update_scf_from_hdf5chk(scf_data, scf_data.mol.ctrl.guessfile.clone());
-        }
-    // import the eigenvalues and eigen vectors from chkfile
-    } else if scf_data.mol.ctrl.has_chkfile && std::path::Path::new(&scf_data.mol.ctrl.chkfile).exists()  {
-        if scf_data.mol.ctrl.chkfile_type.eq(&"hdf5") {
+    } else if scf_data.mol.ctrl.external_init_guess.is_some() { match scf_data.mol.ctrl.external_init_guess.as_ref().unwrap().as_str() {
+        "guessfile" => {
+            assert!(std::path::Path::new(&scf_data.mol.ctrl.guessfile).exists(), "The specified guessfile is missing \n({})", &scf_data.mol.ctrl.guessfile);
+            assert!(scf_data.mol.ctrl.guessfile_type.eq(&"hdf5"), "at present only hdf5 type guess file is supported");
+            let file = hdf5::File::open(&scf_data.mol.ctrl.guessfile).unwrap();
+            if has_dm(&file) {
+                scf_data.density_matrix = initial_guess_from_hdf5guess(&scf_data.mol);
+                // for DFT methods, it needs the eigenvectors to generate the hamiltonian. In consequence, we use the hf method to prepare the eigenvectors from the guess dm
+                scf_data.generate_hf_hamiltonian_for_guess();
+                //scf_data.generate_hf_hamiltonian();
+                if scf_data.mol.ctrl.print_level>0 {println!("Initial guess energy: {:16.8}", scf_data.evaluate_hf_total_energy())};
+                scf_data.diagonalize_hamiltonian(mpi_operator);
+                scf_data.generate_occupation();
+                scf_data.generate_density_matrix();
+            } else if has_mo_coeff(&file) {
+                println!("Read MO coefficients from guessfile: {}", &scf_data.mol.ctrl.guessfile);
+                // let (eigenvectors, eigenvalues, is_occupation) = initial_guess_from_hdf5chk(
+                //     &scf_data.mol, &scf_data.scftype, &scf_data.mol.ctrl.guessfile);
+                update_scf_from_hdf5chk(scf_data, scf_data.mol.ctrl.guessfile.clone());
+            }
+        },
+        "chkfile" => {
+            // import the eigenvalues and eigen vectors from chkfile
+            assert!(std::path::Path::new(&scf_data.mol.ctrl.chkfile).exists(), "The specified chkfile is missing \n({})", &scf_data.mol.ctrl.chkfile);
+            assert!(scf_data.mol.ctrl.chkfile_type.eq(&"hdf5"), "at present only hdf5 type check file is supported");
             println!("Read MO coefficients from chkfile: {}", &scf_data.mol.ctrl.chkfile);
             println!("However, the chkfile will be overwritten in the SCF procedure.");
             println!("To prevent that, use `guessfile = your_chkfile` instead");
             update_scf_from_hdf5chk(scf_data, scf_data.mol.ctrl.chkfile.clone());
-        } else {
-            panic!("WARNNING: at present only hdf5 type check file is supported");
         }
+        _ => {
+            panic!("Error: unknown external initial guess file type ({})", &scf_data.mol.ctrl.external_init_guess.as_ref().unwrap());
+        }
+    }
     // generate the machine-learning enxc potential initial guess
     } else if scf_data.mol.ctrl.initial_guess.eq(&"deep_enxc") {
         let mut init_fock = scf_data.h_core.clone();
