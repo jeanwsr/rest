@@ -35,11 +35,11 @@ statrs = "0.13"
 rand = "0.3"
 array_tool = "1.0.3"
 fuzzy-matcher = "0.3.7"
-ndarray = "0.15.6"
+#ndarray = "0.15.6"
 # for libecpint
-cxx = "1.0"
+#cxx = "1.0"
 autocxx = "0.26.0"
-miette = "5.0"
+#miette = "5.0"
 #katex-doc = "0.1.0"
 #rust_libecpint = {path="../rust_libecpint"}
 # seems to pull in libssl and libcrypto which is rejected by manylinux

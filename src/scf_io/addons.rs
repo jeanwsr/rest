@@ -14,7 +14,7 @@ use itertools::{//Itertools,
                 //izip
                 };
 use tensors::MathMatrix;
-use anyhow::{anyhow,Error};
+use anyhow::{Error};
 
 impl SCF {
 

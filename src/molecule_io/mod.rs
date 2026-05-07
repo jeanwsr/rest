@@ -1,33 +1,33 @@
+#![warn(unused_imports)]
 extern crate rest_tensors as tensors;
 
 mod pyrest_molecule_io;
 pub mod with_clause;
 
 use array_tool::vec::Intersect;
-use pyo3::{pyclass, pymethods};
+use pyo3::{pyclass};
 use rayon::prelude::{IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator};
 use rest_libcint::prelude::*;
-use rest_tensors::{ERIFull,RIFull,ERIFold4,TensorSlice,TensorSliceMut,TensorOptMut,TensorOpt, MatrixUpper, MatrixFull};
-use tensors::{map_upper_to_full, BasicMatrix, SubMatrixUpper};
-use tensors::external_libs::{ri_copy_from_ri, matr_copy_from_ri};
-use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _power, _power_rayon_for_symmetric_matrix, _newton_schulz_inverse_square_root_v02};
+use rest_tensors::{ERIFull,RIFull,ERIFold4,TensorSlice,TensorSliceMut,TensorOpt, MatrixUpper, MatrixFull};
+use tensors::{BasicMatrix, SubMatrixUpper};
+use tensors::external_libs::{matr_copy_from_ri};
+use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _power_rayon_for_symmetric_matrix};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::mpsc::channel;
-use std::path::{PathBuf,Path};
 use rest_libcint::{CINTR2CDATA, CintType};
 use regex::Regex;
 use crate::basis_io::etb::{get_etb_elem, etb_gen_for_atom_list, InfoV2};
-use crate::constants::{ATM_NUC, ATM_NUC_MOD_OF, AUXBAS_THRESHOLD, ELEM1ST, ELEM2ND, ELEM3RD, ELEM4TH, ELEM5TH, ELEM6TH, ELEMTMS, ENV_PRT_START, NUC_ECP, NUC_FRAC_CHARGE, NUC_STAD_CHARGE};
+use crate::constants::{ATM_NUC, ATM_NUC_MOD_OF, AUXBAS_THRESHOLD, ELEM1ST, ELEM2ND, ELEM3RD, ELEM4TH, ELEM5TH, ELEM6TH, ELEMTMS, ENV_PRT_START, NUC_ECP, NUC_STAD_CHARGE};
 use crate::dft::{DFTType, DFA4REST, parse_xc};
-use crate::geom_io::{GeomCell,MOrC, GeomUnit, get_mass_charge, formated_element_name};
-use crate::basis_io::{ecp, BasInfo, Basis4Elem};
+use crate::geom_io::{GeomCell, get_mass_charge, formated_element_name};
+use crate::basis_io::{BasInfo, Basis4Elem};
 use crate::ctrl_io::{overall_parse_and_report_on_ctrl_geom, InputKeywords, parse_ctl};
-use crate::mpi_io::{mpi_isend_irecv_wrt_distribution, mpi_isend_irecv_wrt_distribution_v02, mpi_isend_irecv_wrt_distribution_v03, MPIData, MPIOperator};
+use crate::mpi_io::{mpi_isend_irecv_wrt_distribution_v03, MPIData, MPIOperator};
 use crate::utilities;
 use crate::basis_io::bse_downloader::{self, ctrl_element_checker, local_element_checker};
-use crate::basis_io::basis_list::{self, basis_fuzzy_matcher, check_basis_name};
-use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper, omp_get_num_threads_wrapper};
+use crate::basis_io::basis_list::{basis_fuzzy_matcher, check_basis_name};
+use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper};
 use crate::solvent::PcmMethod;
 use crate::ri_jk;
 
