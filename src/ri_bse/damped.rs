@@ -78,10 +78,16 @@ pub fn prepare_p0_r_i(mu_z_vec:&Vec<f64>,gwqp:&Vec<f64>,omega:f64,gamma:f64,occ_
     (0..occ_size).cartesian_product(0..vir_size).for_each(|(i,a)|{
         let mu_ia_z=mu_z_vec[i+a*occ_size];
         let energy_gap=gwqp[a+occ_size]-gwqp[i];
-        p0rp[i+a*occ_size]=(omega-energy_gap)/((omega-energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
-        p0rm[i+a*occ_size]=-(omega+energy_gap)/((omega+energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
-        p0ip[i+a*occ_size]=gamma/((omega-energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
-        p0im[i+a*occ_size]=-gamma/((omega+energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
+        // Non-interacting response for GMRES convention (omega -> omega - i*gamma):
+        //   A_4c_nonint * z_nonint = b_4c
+        //   z0_nonint = P*(D-omega)/Delta   (rp component)
+        //   z2_nonint = -gamma*P/Delta      (ip component)
+        //   z1_nonint = P*(D+omega)/Delta_plus  (rm component)
+        //   z3_nonint = gamma*P/Delta_plus      (im component)
+        p0rp[i+a*occ_size]=(energy_gap-omega)/((omega-energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
+        p0rm[i+a*occ_size]=(omega+energy_gap)/((omega+energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
+        p0ip[i+a*occ_size]=-gamma/((omega-energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
+        p0im[i+a*occ_size]= gamma/((omega+energy_gap).powf(2.0)+gamma.powf(2.0))*mu_ia_z;
     });
     (p0rp,p0rm,p0ip,p0im)
 }
@@ -119,10 +125,19 @@ pub fn update_w_vecs<F1>(rp:&Vec<f64>,rm:&Vec<f64>,ip:&Vec<f64>,im:&Vec<f64>,pai
         let energy_gap=gwqp[a+occ_size]-gwqp[i];
         let prefactor_p:f64=1.0/((omega-energy_gap).powf(2.0)+gamma.powf(2.0));
         let prefactor_m:f64=1.0/((omega+energy_gap).powf(2.0)+gamma.powf(2.0));
-        wrp[i+a*occ_size]=prefactor_p*((omega-energy_gap)*krp[i+a*occ_size]-gamma*kip[i+a*occ_size]);
-        wrm[i+a*occ_size]=-prefactor_m*((omega+energy_gap)*krm[i+a*occ_size]-gamma*kim[i+a*occ_size]);
-        wip[i+a*occ_size]=prefactor_p*((omega-energy_gap)*kip[i+a*occ_size]+gamma*krp[i+a*occ_size]);
-        wim[i+a*occ_size]=-prefactor_m*((omega+energy_gap)*kim[i+a*occ_size]+gamma*krm[i+a*occ_size]);
+        // T(z) = A_4c_diag^{-1} * Interaction  (exact equivalence with GMRES)
+        // wrp/ip: sign flip needed (rp/ip block)
+        wrp[i+a*occ_size]=-prefactor_p*((omega-energy_gap)*krp[i+a*occ_size]-gamma*kip[i+a*occ_size]);
+        wip[i+a*occ_size]=-prefactor_p*((omega-energy_gap)*kip[i+a*occ_size]+gamma*krp[i+a*occ_size]);
+        // wrm: no sign flip (rm block)
+        wrm[i+a*occ_size]= prefactor_m*((omega+energy_gap)*krm[i+a*occ_size]-gamma*kim[i+a*occ_size]);
+        // wim: sign of (omega+energy_gap)*kim term flipped relative to original
+        wim[i+a*occ_size]= prefactor_m*((omega+energy_gap)*kim[i+a*occ_size]+gamma*krm[i+a*occ_size]);
+        // Diagonal correction (cancels D contribution, forces T(z_ni)=0)
+        wrp[i+a*occ_size] += energy_gap * prefactor_p * ((omega-energy_gap)*rp[i+a*occ_size] - gamma*ip[i+a*occ_size]);
+        wrm[i+a*occ_size] -= energy_gap * prefactor_m * ((omega+energy_gap)*rm[i+a*occ_size] - gamma*im[i+a*occ_size]);
+        wip[i+a*occ_size] += energy_gap * prefactor_p * ((omega-energy_gap)*ip[i+a*occ_size] + gamma*rp[i+a*occ_size]);
+        wim[i+a*occ_size] -= energy_gap * prefactor_m * ((omega+energy_gap)*im[i+a*occ_size] + gamma*rm[i+a*occ_size]);
     });
     (wrp,wrm,wip,wim)
 } 
@@ -132,53 +147,107 @@ pub fn fourvec_dot_product(fourvec_1:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),four
 pub fn fourvec_scaled_add(fourvec_1:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),scale1:f64,fourvec_2:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),scale2:f64)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     (vector_scaled_add(&fourvec_1.0,scale1,&fourvec_2.0,scale2),vector_scaled_add(&fourvec_1.1,scale1,&fourvec_2.1,scale2),vector_scaled_add(&fourvec_1.2,scale1,&fourvec_2.2,scale2),vector_scaled_add(&fourvec_1.3,scale1,&fourvec_2.3,scale2))
 }
-pub fn poples_numerical_trick<F1>(p0:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),update_w:F1,tol:f64,max_iterations:usize)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)
-    where F1:Fn(&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>))->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
+pub fn poples_numerical_trick<F1,F2>(p0:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),update_w:F1,precond:F2,tol:f64,max_iterations:usize)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)
+    where F1:Fn(&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>))->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),
+          F2:Fn(&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>))->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
+    const EPS: f64 = 1e-14;
     let p0p0sqrt=fourvec_dot_product(p0,p0).sqrt();
-    // Fix 1: Normalize u0 by dividing by ||p0||, not multiplying
     let u0=(num_product(&p0.0,1.0/p0p0sqrt),num_product(&p0.1,1.0/p0p0sqrt),num_product(&p0.2,1.0/p0p0sqrt),num_product(&p0.3,1.0/p0p0sqrt));
     let occvir=p0.0.len();
-    let mut p_result=(vec![0.0;occvir],vec![0.0;occvir],vec![0.0;occvir],vec![0.0;occvir]);
+    // Initialize subspace with u0 and w0 = T(u0)
+    let w0 = update_w(&u0);
     let mut u_vecs:Vec<(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)>=vec![u0.clone()];
-    let mut w_vecs:Vec<(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)>=Vec::new();
+    let mut w_vecs:Vec<(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)>=vec![w0];
     let mut iter_count=0;
     loop{
-        let un=u_vecs[u_vecs.len()-1].clone();
-        let wn=update_w(&un);
-        w_vecs.push(wn.clone());
-        let mut unp1=wn.clone();
-        u_vecs.iter().for_each(|uk|{
-            let ukuk=fourvec_dot_product(uk,uk);
-            let ukwn=fourvec_dot_product(uk,&wn);
-            unp1=fourvec_scaled_add(&unp1,1.0,uk,-ukwn/ukuk);
-        });
-        // Fix 2: Normalize u_{n+1} after orthogonalization
-        let unp1_norm=fourvec_dot_product(&unp1,&unp1).sqrt();
-        if unp1_norm > 1e-14 {
-            unp1=(num_product(&unp1.0,1.0/unp1_norm),num_product(&unp1.1,1.0/unp1_norm),
-                  num_product(&unp1.2,1.0/unp1_norm),num_product(&unp1.3,1.0/unp1_norm));
-        } else {
-            println!("Warning: u_{} norm is too small ({}), stopping iteration", iter_count+1, unp1_norm);
+        let m = u_vecs.len(); // current subspace size
+        // Build Q[i][k] = u_i^T * w_k + δ_ik, q[i] = u_i^T * p0
+        let mut q_mat = MatrixFull::new([m, m], 0.0);
+        let mut q_vec = vec![0.0; m];
+        for i in 0..m {
+            q_vec[i] = fourvec_dot_product(&u_vecs[i], p0);
+            for k in 0..m {
+                let mut val = fourvec_dot_product(&u_vecs[i], &w_vecs[k]);
+                if i == k { val += 1.0; }
+                q_mat[[i, k]] = val;
+            }
+        }
+        // Solve Q * t = q
+        let coeff = match _dsolve(&q_mat, &q_vec) {
+            Some(c) => c,
+            None => {
+                eprintln!("Pople solver: subspace solve failed at iteration {}", iter_count);
+                break;
+            }
+        };
+        // Form full-space solution: z = Σ t_k * u_k
+        let mut z_p_result = (vec![0.0;occvir],vec![0.0;occvir],vec![0.0;occvir],vec![0.0;occvir]);
+        for k in 0..m {
+            z_p_result = fourvec_scaled_add(&z_p_result, 1.0, &u_vecs[k], coeff[k]);
+        }
+        // Residual: r = p0 - z - T(z)  (fresh T(z), avoids numerical drift in stored w_vecs)
+        let t_of_z = update_w(&z_p_result);
+        let mut r = p0.clone();
+        r = fourvec_scaled_add(&r, 1.0, &z_p_result, -1.0);
+        r = fourvec_scaled_add(&r, 1.0, &t_of_z, -1.0);
+        let res_norm = fourvec_dot_product(&r, &r).sqrt();
+        if res_norm < tol {
+            println!("Pople Solver converged at iteration {} with residual {:.2e}", iter_count, res_norm);
             break;
         }
-        let coeff=solve_for_coeff(&u_vecs,&w_vecs,&p0);
-        let residue=calculate_residue(&u_vecs,&w_vecs,&p0,&coeff);
-        u_vecs.push(unp1);
-        if residue<tol{
-            (0..coeff.len()).for_each(|k|{
-               p_result=fourvec_scaled_add(&p_result,1.0,&u_vecs[k],coeff[k]);
-            });
-            break
-        }
-        iter_count+=1;
-        println!("Now is iteration {}, residue={},converge threshold is {}",iter_count,residue,tol);
-        // Fix 3: Add maximum iteration limit
+        iter_count += 1;
+        println!("Pople iteration {}, subspace size {}, residual = {:.2e}, threshold = {}",
+                 iter_count, m, res_norm, tol);
         if iter_count >= max_iterations {
-            eprintln!("Warning: Maximum iterations ({}) reached without convergence. Final residue: {}", max_iterations, residue);
-            (0..coeff.len()).for_each(|k|{
-               p_result=fourvec_scaled_add(&p_result,1.0,&u_vecs[k],coeff[k]);
-            });
+            eprintln!("Warning: Pople solver max iterations ({}) reached, res={:.2e}", max_iterations, res_norm);
             break;
+        }
+        // JD correction: u_new = ε * M^{-1}*z - M^{-1}*r
+        // ε = (z^T * M^{-1} * r) / (z^T * M^{-1} * z)
+        let m_inv_z = precond(&z_p_result);
+        let m_inv_r = precond(&r);
+        let zt_m_inv_r = fourvec_dot_product(&z_p_result, &m_inv_r);
+        let zt_m_inv_z = fourvec_dot_product(&z_p_result, &m_inv_z);
+        let epsilon = if zt_m_inv_z.abs() > EPS { zt_m_inv_r / zt_m_inv_z } else { 0.0 };
+        let mut u_new = fourvec_scaled_add(&m_inv_z, epsilon, &m_inv_r, -1.0);
+        // MGS reorthogonalization × 2
+        for _reortho in 0..2 {
+            for existing_u in &u_vecs {
+                let u_norm2 = fourvec_dot_product(existing_u, existing_u);
+                if u_norm2 > EPS {
+                    let dot_val = fourvec_dot_product(&u_new, existing_u);
+                    u_new = fourvec_scaled_add(&u_new, 1.0, existing_u, -dot_val / u_norm2);
+                }
+            }
+        }
+        let u_new_norm = fourvec_dot_product(&u_new, &u_new).sqrt();
+        if u_new_norm < EPS {
+            println!("Pople solver: new direction norm too small ({:.2e}), stopping", u_new_norm);
+            break;
+        }
+        let inv_unorm = 1.0 / u_new_norm;
+        let v_new = (num_product(&u_new.0, inv_unorm),num_product(&u_new.1, inv_unorm),
+                     num_product(&u_new.2, inv_unorm),num_product(&u_new.3, inv_unorm));
+        let w_new = update_w(&v_new);
+        u_vecs.push(v_new);
+        w_vecs.push(w_new);
+    }
+    // Reconstruct final solution from best subspace coefficients
+    let m = u_vecs.len();
+    let mut q_mat = MatrixFull::new([m, m], 0.0);
+    let mut q_vec = vec![0.0; m];
+    for i in 0..m {
+        q_vec[i] = fourvec_dot_product(&u_vecs[i], p0);
+        for k in 0..m {
+            let mut val = fourvec_dot_product(&u_vecs[i], &w_vecs[k]);
+            if i == k { val += 1.0; }
+            q_mat[[i, k]] = val;
+        }
+    }
+    let mut p_result = (vec![0.0;occvir],vec![0.0;occvir],vec![0.0;occvir],vec![0.0;occvir]);
+    if let Some(coeff) = _dsolve(&q_mat, &q_vec) {
+        for k in 0..m {
+            p_result = fourvec_scaled_add(&p_result, 1.0, &u_vecs[k], coeff[k]);
         }
     }
     p_result
@@ -241,7 +310,9 @@ pub fn damped_bse_pople(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     _dgemm_full(&inverse_dielectric,'N',&ri_ov,'N',&mut ri_ov_tilde,1.0,0.0);
     drop(inverse_dielectric);
     ri_ov_tilde.reshape([num_auxbas*occ_size,vir_size]);
-    let p0=prepare_p0_r_i(&mu_z_vec,&scf_data.gwqp.0,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma,occ_size,vir_size);
+    let external_field_freq=qp_ctrl.external_field_freq;
+    let lifetime_gamma=qp_ctrl.lifetime_gamma;
+    let p0=prepare_p0_r_i(&mu_z_vec,&scf_data.gwqp.0,external_field_freq,lifetime_gamma,occ_size,vir_size);
     let wrapped_pair_matvec = |pairvec:&(Vec<f64>,Vec<f64>)| -> (Vec<f64>,Vec<f64>) {
         pairvec_matvec(scf_data,&ri_vv,&ri_ov,&ri_oo_tilde,
             &ri_ov_w,&ri_ov_tilde,&pairvec.0,&pairvec.1,
@@ -249,10 +320,23 @@ pub fn damped_bse_pople(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     };
     let wrapped_update_w=|u:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)|->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
         update_w_vecs(&u.0,&u.1,&u.2,&u.3,|x|wrapped_pair_matvec(&x),
-            &scf_data.gwqp.0,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma,occ_size,vir_size)
+            &scf_data.gwqp.0,external_field_freq,lifetime_gamma,occ_size,vir_size)
     };
-    let result=poples_numerical_trick(&p0,|z|wrapped_update_w(&z),qp_ctrl.damped_bse_tol,qp_ctrl.damped_bse_max_iter);
-    let density_real:Vec<f64>=(0..occ_size*vir_size).map(|ia|result.0[ia]+result.1[ia]).collect();
+    // Diagonal preconditioner: M = diag(A_4c)
+    let energy_diag=ri_bse::construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
+    let diag_13:Vec<f64>=energy_diag.iter().map(|d|d-external_field_freq).collect();
+    let diag_24:Vec<f64>=energy_diag.iter().map(|d|d+external_field_freq).collect();
+    let precond=|z:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)|->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
+        let apply_inv = |v:&Vec<f64>,d:&Vec<f64>|->Vec<f64>{
+            v.iter().zip(d.iter()).map(|(vi,di)|{
+                if di.abs()>1e-8 {vi/di} else {0.0}
+            }).collect()
+        };
+        (apply_inv(&z.0,&diag_13),apply_inv(&z.1,&diag_24),
+         apply_inv(&z.2,&diag_13),apply_inv(&z.3,&diag_24))
+    };
+    let result=poples_numerical_trick(&p0,|z|wrapped_update_w(&z),|z|precond(&z),qp_ctrl.damped_bse_tol,qp_ctrl.damped_bse_max_iter);
+    let density_real:Vec<f64>=(0..occ_size*vir_size).map(|ia|result.0[ia]-result.1[ia]).collect();
     let polarized_density_matrix=MatrixFull::from_vec([occ_size,vir_size],density_real).unwrap();
     export_density(scf_data,&polarized_density_matrix,&qp_ctrl);
     result
