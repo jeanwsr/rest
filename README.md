@@ -128,7 +128,7 @@
 	  4. REST conda 默认路径： `$CONDA_PREFIX/share/rest/basis-set-pool/cc-pVTZ`
       5. `$REST_HOME/rest/basis-set-pool/cc-pVTZ`
       6. 自动从BSE库在线获取（若本地未找到），并保存在当前工作目录
-    - 以上 2-5 情形不区分基组名称的大小写。 
+    - 以上 2-5 情形不区分基组名称的大小写，对于以前使用的 `def2-sv(p)-jkfit`，现在会视为 `def2-universal-jkfit` 的 alias，仍然可以使用。若使用完整路径格式，则区分大小写，且不支持 alias。 
 - `auxbas_path`: 取值String类型，指定辅助基组路径，仅当`eri_type=ri-v`时需要设置  
     缺省值：def2-universal-jkfit。（该基组较大，建议根据体系换用匹配的辅助基组）
 	设置方式与`basis_path`相同，程序搜索路径一致。
