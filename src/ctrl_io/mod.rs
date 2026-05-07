@@ -222,7 +222,7 @@ pub struct InputKeywords {
     // At present, only the hdf5 format is available
     pub guessfile_type: String,
     #[pyo3(get, set)]
-    pub external_init_guess: bool,
+    pub external_init_guess: Option<String>,
     #[pyo3(get, set)]
     // There are three kinds of available initital guesses: 1) sad (default), 2) hcore, 3) vsap
     pub initial_guess: String,
@@ -378,7 +378,7 @@ impl InputKeywords {
             scf_acc_eev: 1.0e-5,
             scf_acc_etot:1.0e-8,
             has_chkfile: false, // not directly set by input
-            external_init_guess: false, // not directly set by input
+            external_init_guess: None, // not directly set by input
             initial_guess: String::from("sad"),
             noiter: false,
             check_stab: false,
@@ -571,30 +571,39 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
             MOrC::Molecule => println!("It is a finite cluster calculation"),
             MOrC::Crystal => println!("It is a periodic calculation")
         }
-
-        let chkfile_exist = std::path::Path::new(&ctrl.chkfile).exists();
-        if ctrl.external_init_guess {
-            println!("The initial guess is prepared by reading guessfile ({})", &ctrl.guessfile);
-            if ctrl.has_chkfile && chkfile_exist {
-                println!("The specified chkfile exists but is not loaded because the guessfile is specified");
-                println!("It will be overwritten after the SCF procedure \n({})",&ctrl.chkfile)
-            }
-        } else {
-            if ctrl.has_chkfile {
-                if ! chkfile_exist {
-                    println!("The specified chkfile is missing, which will be created after the SCF procedure \n({})",&ctrl.chkfile)
-                } else {
-                    println!("The initial guess is prepared by reading chkfile ({})",&ctrl.chkfile);
-                    ctrl.external_init_guess = true;
-                }
+    }
+    let guessfile_exist = std::path::Path::new(&ctrl.guessfile).exists();
+    let chkfile_exist = std::path::Path::new(&ctrl.chkfile).exists();
+    if ctrl.guessfile.to_lowercase() != "none" {
+        if ! guessfile_exist {
+            panic!("The specified guessfile is missing \n({})",&ctrl.guessfile)
+        }
+        ctrl.external_init_guess = Some(String::from("guessfile"));
+        println!("The initial guess is prepared by reading guessfile ({})", &ctrl.guessfile);
+        if ctrl.has_chkfile && chkfile_exist {
+            println!("The specified chkfile exists but is not loaded because the guessfile is specified");
+            println!("It will be overwritten after the SCF procedure \n({})",&ctrl.chkfile)
+        }
+    } else {
+        if ctrl.has_chkfile {
+            if ! chkfile_exist {
+                println!("The specified chkfile is missing, which will be created after the SCF procedure \n({})",&ctrl.chkfile)
+            } else {
+                println!("The initial guess is prepared by reading chkfile ({})",&ctrl.chkfile);
+                ctrl.external_init_guess = Some(String::from("chkfile"));
             }
         }
-        if ! ctrl.external_init_guess {
-            println!("Initial guess is prepared by ({}).", &ctrl.initial_guess);
-        }
-
+    }
+    if ctrl.external_init_guess.is_none() {
+        println!("Initial guess is prepared by ({}).", &ctrl.initial_guess);
 
     }
+    if ctrl.force_state_occupation.len()>0 {
+        if ! ctrl.external_init_guess.is_some() {
+            panic!("ERROR: force_state_occupation can not be involved without an existing guessfile/chkfile");
+        }
+    }
+
     if ctrl.print_level>1 {
         if ctrl.use_ri_symm {
             println!("Turn on the basis pair symmetry for RI 3D-tensors")
@@ -608,22 +617,27 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         println!("hardness: {}", ctrl.hardness);
         println!("Grid generation level: {}", ctrl.grid_gen_level);
         println!("Even tempered basis generation: {}", ctrl.even_tempered_basis);
-        let tmp_mixer = ctrl.mixer.clone();
-        if tmp_mixer.eq(&"direct") {
-            println!("No charge density mixing is employed for the SCF procedure");
-        } else if tmp_mixer.eq(&"linear") {
-            println!("The {} mixing is employed with the mixing parameter of {} for the SCF procedure", 
-                      &tmp_mixer, &ctrl.mix_param);
-        } else if tmp_mixer.eq(&"ddiis") 
-               || tmp_mixer.eq(&"diis") {
-            println!("The {} mixing with (param, max_vec_len) = ({}, {}) is employed for the SCF procedure", 
-                      &tmp_mixer, &ctrl.mix_param, &ctrl.num_max_diis);
-            println!("Turn on the {} mixing after {} step(s) of SCF iteractions with the linear mixing", 
-                      &tmp_mixer, &ctrl.start_diis_cycle);
-        } else {
-            //ctrl.mixer = String::from("direct");
-            panic!("Unknown charge density mixer ({})! No charge density mixing will be invoked.", ctrl.mixer);
-        };
+    }
+
+    let tmp_mixer = ctrl.mixer.clone();
+    let mut mixer_log = "".to_string();
+    if tmp_mixer.eq(&"direct") {
+        mixer_log = "No charge density mixing is employed for the SCF procedure".to_string();
+    } else if tmp_mixer.eq(&"linear") {
+        mixer_log = format!("The {} mixing is employed with the mixing parameter of {} for the SCF procedure", 
+                    &tmp_mixer, &ctrl.mix_param);
+    } else if tmp_mixer.eq(&"ddiis") 
+            || tmp_mixer.eq(&"diis") {
+        mixer_log = format!("The {} mixing with (param, max_vec_len) = ({}, {}) is employed for the SCF procedure", 
+                    &tmp_mixer, &ctrl.mix_param, &ctrl.num_max_diis);
+        mixer_log.push_str(&format!("\nTurn on the {} mixing after {} step(s) of SCF iteractions with the linear mixing", 
+                    &tmp_mixer, &ctrl.start_diis_cycle));
+    } else {
+        //ctrl.mixer = String::from("direct");
+        panic!("Unknown charge density mixer ({})! No charge density mixing will be invoked.", ctrl.mixer);
+    };
+    if ctrl.print_level>1 {
+        println!("{}", mixer_log);
 
         if ctrl.guess_mix {
             println!("Initial guess mixing enabled: HOMO-LUMO rotated with theta = {:.1}° (alpha), {:.1}° (beta) to induce symmetry breaking",
@@ -1221,10 +1235,6 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => String::from("hdf5"),
             };
 
-            // Fix a bug reported by Linyue Yu, 2024-09-03
-            tmp_input.external_init_guess = (! tmp_input.guessfile.to_lowercase().eq(&"none") ) &&
-                        std::path::Path::new(&tmp_input.guessfile).exists();
-
             tmp_input.chkfile = match tmp_ctrl.get("chkfile").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_chk) => tmp_chk.clone(),
                 other => String::from("none"),
@@ -1599,11 +1609,6 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 //    println!("Even tempered basis generation starts at: {}", tmp_input.etb_start_atom_number);
                 //    println!("Even tempered basis beta is: {}", tmp_input.etb_beta);
                 //}
-            }
-            if tmp_input.force_state_occupation.len()>0 {
-                if ! (tmp_input.has_chkfile && std::path::Path::new(&tmp_input.chkfile).exists()) && ! tmp_input.external_init_guess {
-                    panic!("ERROR: force_state_occupation can not be involved without an existing guessfile/chkfile");
-                }
             }
         },
         other => {
