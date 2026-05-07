@@ -1,7 +1,5 @@
 use pyo3::{pymethods,PyResult};
 use crate::molecule_io::Molecule;
-use crate::initial_guess::initial_guess;
-
 use super::SCF;
 
 #[pymethods]

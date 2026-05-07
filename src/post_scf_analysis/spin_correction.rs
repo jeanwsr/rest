@@ -18,7 +18,7 @@ pub fn apply_yamaguchi_spin_correction(scf_data: &mut SCF, time_mark: &mut TimeR
     let [square_spin_singlet, _] = scf_io::evaluate_spin_angular_momentum(&scf_data.density_matrix, &scf_data.ovlp, scf_data.mol.spin_channel, &scf_data.mol.num_elec);
 
     if scf_data.mol.ctrl.spin == 1.0 && square_spin_singlet >= 1e-3 {
-        if scf_data.mol.ctrl.restart {
+        if scf_data.mol.ctrl.has_chkfile {
             save_chkfile(&scf_data);  // save singlet wavefunction
         }
         time_mark.new_item("spin_correction", "the whole job");
@@ -26,7 +26,7 @@ pub fn apply_yamaguchi_spin_correction(scf_data: &mut SCF, time_mark: &mut TimeR
         scf_data.mol.ctrl.guess_mix = false;
         scf_data.mol.ctrl.force_state_occupation = vec![];
         //scf_data.mol.ctrl.chkfile.push_str("_triplet");
-        scf_data.mol.ctrl.restart = false;
+        scf_data.mol.ctrl.has_chkfile = false;
         scf_data.mol.num_elec[1] += 1.0;
         scf_data.mol.num_elec[2] -= 1.0;
         scf_data.mol.ctrl.initial_guess = String::from("inherit");

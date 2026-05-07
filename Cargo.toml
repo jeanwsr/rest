@@ -9,7 +9,7 @@ build = "build.rs"
 anyhow = "1"
 time = "0.1.12"
 clap = "3.0.0-beta.2"
-regex = "0.1.41"
+regex = "1.*"
 itertools = "0.8"
 serde_json = "1.0"
 serde = {version="1.0",features=["derive"]}
@@ -18,7 +18,7 @@ num = "0.4"
 num-complex = "0.4"
 libc = "0.2"
 #hdf5 = "0.8.0"
-hdf5-metno = "0.10.1"
+hdf5-metno = "0.12"
 chrono = "0.4"
 #jemallocator = "0.3.2"
 #mimalloc = "0.1.43"
@@ -35,11 +35,11 @@ statrs = "0.13"
 rand = "0.3"
 array_tool = "1.0.3"
 fuzzy-matcher = "0.3.7"
-ndarray = "0.15.6"
+#ndarray = "0.15.6"
 # for libecpint
-cxx = "1.0"
+#cxx = "1.0"
 autocxx = "0.26.0"
-miette = "5.0"
+#miette = "5.0"
 #katex-doc = "0.1.0"
 #rust_libecpint = {path="../rust_libecpint"}
 # seems to pull in libssl and libcrypto which is rejected by manylinux
@@ -57,11 +57,12 @@ rstsr-core = { version = "0.7", default-features = false }
 rstsr-openblas = { version = "0.7", features = ["openmp"] }
 derive_builder = { version = "0.20" }
 
-dftd3 = { version = "0.1", optional = true }
-dftd4 = { version = "0.1", optional = true }
+dftd3 = { version = "0.2", optional = true }
+dftd4 = { version = "0.2", optional = true }
 geometric-pyo3 = { version = "0.1.1", optional = true }
 
 approx = "0.5"
+assert_float_eq = "1"
 
 [build-dependencies]
 autocxx-build = "0.26.0"

@@ -16,6 +16,8 @@ pub mod sap;
 pub mod sad;
 pub mod enxc;
 mod pyrest_enxc;
+mod chkfile;
+use chkfile::{has_dm, has_mo_coeff};
 
 enum RESTART {
     HDF5,
@@ -27,78 +29,31 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
     if scf_data.mol.ctrl.initial_guess.eq(&"inherit") {
         scf_data.generate_occupation();
         scf_data.generate_density_matrix();
-    // import the initial guess density from a hdf5 file
+    // import the initial guess from guessfile
     } else if scf_data.mol.ctrl.external_init_guess && scf_data.mol.ctrl.guessfile_type.eq(&"hdf5") {
-        scf_data.density_matrix = initial_guess_from_hdf5guess(&scf_data.mol);
-        // for DFT methods, it needs the eigenvectors to generate the hamiltonian. In consequence, we use the hf method to prepare the eigenvectors from the guess dm
-        scf_data.generate_hf_hamiltonian_for_guess();
-        //scf_data.generate_hf_hamiltonian();
-        if scf_data.mol.ctrl.print_level>0 {println!("Initial guess energy: {:16.8}", scf_data.evaluate_hf_total_energy())};
-        scf_data.diagonalize_hamiltonian(mpi_operator);
-        scf_data.generate_occupation();
-        scf_data.generate_density_matrix();
-    // import the eigenvalues and eigen vectors from a hdf5 file directly
-    } else if scf_data.mol.ctrl.restart && std::path::Path::new(&scf_data.mol.ctrl.chkfile).exists()  {
-        if scf_data.mol.ctrl.chkfile_type.eq(&"hdf5") {
-            let (eigenvectors, eigenvalues, is_occupation) = initial_guess_from_hdf5chk(&scf_data.mol, &scf_data.scftype);
-
-            //=============================
-            // for MOM projection
-            //=============================
-            if scf_data.mol.ctrl.force_state_occupation.len()>0 {
-                let restart = scf_data.mol.ctrl.chkfile.clone();
-                //let is_exist = scf_data.ref_eigenvectors.contains_key(&restart);
-                //if ! is_exist {
-                scf_data.ref_eigenvectors.insert(
-                    restart, 
-                    (eigenvectors.clone(),[0,scf_data.mol.num_basis,scf_data.mol.num_state,scf_data.mol.spin_channel])
-                );
-                //};
-                match scf_data.scftype {
-                    SCFType::RHF => {
-                        scf_data.mol.ctrl.force_state_occupation.iter().enumerate().for_each(|(i,x)| {
-                            if x.get_force_occ() > 2.0 {
-                                println!("ERROR: the orbital occupation number for RHF cannot be larger than 2.0");
-                                panic!("{}", x.formated_output_check());
-                            }
-                            if x.get_occ_spin() > 0 {
-                                println!("ERROR: the spin is unpolarized for RHF, and thus cannot manipulate the orbitals in BETA spin-channel");
-                                panic!("{}", x.formated_output_check());
-                            }
-                        })
-                    },
-                    _ => {
-                        scf_data.mol.ctrl.force_state_occupation.iter().enumerate().for_each(|(i,x)| {
-                            if x.get_force_occ() > 1.0 {
-                                println!("ERROR: the orbital occupation number for UHF and ROHF cannot be larger than 1.0");
-                                panic!("{}", x.formated_output_check());
-                            }
-                        })
-
-                    }
-                }
-            }
-            //println!("{:?}", &scf_data.mol.ctrl.auxiliary_reference_states);
-            if scf_data.mol.ctrl.auxiliary_reference_states.len() > 0 {
-                scf_data.mol.ctrl.auxiliary_reference_states.iter().for_each(|(chkname,global_index)| {
-                    println!("{}", chkname);
-                    let is_exist = scf_data.ref_eigenvectors.contains_key(chkname);
-                    if ! is_exist {
-                        let (reference,[num_basis, num_state, spin_channel]) = import_mo_coeff_from_hdf5chkfile(chkname);
-                        println!("{},{},{},{},{}", chkname,global_index, num_basis, num_state, spin_channel);
-                        scf_data.ref_eigenvectors.insert(chkname.clone(), (reference,[global_index.clone(),num_basis, num_state, spin_channel]));
-                    }
-                });
- ;           }
-            //=============================
-            scf_data.eigenvalues = eigenvalues;
-            scf_data.eigenvectors = eigenvectors;
-            if let Some(occupation) = is_occupation {
-                scf_data.occupation = occupation;
-            } else {
-                scf_data.generate_occupation();
-            }
+        let file = hdf5::File::open(&scf_data.mol.ctrl.guessfile).unwrap();
+        if has_dm(&file) {
+            scf_data.density_matrix = initial_guess_from_hdf5guess(&scf_data.mol);
+            // for DFT methods, it needs the eigenvectors to generate the hamiltonian. In consequence, we use the hf method to prepare the eigenvectors from the guess dm
+            scf_data.generate_hf_hamiltonian_for_guess();
+            //scf_data.generate_hf_hamiltonian();
+            if scf_data.mol.ctrl.print_level>0 {println!("Initial guess energy: {:16.8}", scf_data.evaluate_hf_total_energy())};
+            scf_data.diagonalize_hamiltonian(mpi_operator);
+            scf_data.generate_occupation();
             scf_data.generate_density_matrix();
+        } else if has_mo_coeff(&file) {
+            println!("Read MO coefficients from guessfile: {}", &scf_data.mol.ctrl.guessfile);
+            // let (eigenvectors, eigenvalues, is_occupation) = initial_guess_from_hdf5chk(
+            //     &scf_data.mol, &scf_data.scftype, &scf_data.mol.ctrl.guessfile);
+            update_scf_from_hdf5chk(scf_data, scf_data.mol.ctrl.guessfile.clone());
+        }
+    // import the eigenvalues and eigen vectors from chkfile
+    } else if scf_data.mol.ctrl.has_chkfile && std::path::Path::new(&scf_data.mol.ctrl.chkfile).exists()  {
+        if scf_data.mol.ctrl.chkfile_type.eq(&"hdf5") {
+            println!("Read MO coefficients from chkfile: {}", &scf_data.mol.ctrl.chkfile);
+            println!("However, the chkfile will be overwritten in the SCF procedure.");
+            println!("To prevent that, use `guessfile = your_chkfile` instead");
+            update_scf_from_hdf5chk(scf_data, scf_data.mol.ctrl.chkfile.clone());
         } else {
             panic!("WARNNING: at present only hdf5 type check file is supported");
         }
@@ -216,6 +171,68 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
     };
 }
 
+pub fn update_scf_from_hdf5chk(scf_data: &mut SCF, chkfile: String) {
+            let (eigenvectors, eigenvalues, is_occupation) = initial_guess_from_hdf5chk(
+                &scf_data.mol, &scf_data.scftype, &chkfile);
+
+            //=============================
+            // for MOM projection
+            //=============================
+            if scf_data.mol.ctrl.force_state_occupation.len()>0 {
+                let restart = chkfile.clone();
+                //let is_exist = scf_data.ref_eigenvectors.contains_key(&restart);
+                //if ! is_exist {
+                scf_data.ref_eigenvectors.insert(
+                    restart, 
+                    (eigenvectors.clone(),[0,scf_data.mol.num_basis,scf_data.mol.num_state,scf_data.mol.spin_channel])
+                );
+                //};
+                match scf_data.scftype {
+                    SCFType::RHF => {
+                        scf_data.mol.ctrl.force_state_occupation.iter().enumerate().for_each(|(i,x)| {
+                            if x.get_force_occ() > 2.0 {
+                                println!("ERROR: the orbital occupation number for RHF cannot be larger than 2.0");
+                                panic!("{}", x.formated_output_check());
+                            }
+                            if x.get_occ_spin() > 0 {
+                                println!("ERROR: the spin is unpolarized for RHF, and thus cannot manipulate the orbitals in BETA spin-channel");
+                                panic!("{}", x.formated_output_check());
+                            }
+                        })
+                    },
+                    _ => {
+                        scf_data.mol.ctrl.force_state_occupation.iter().enumerate().for_each(|(i,x)| {
+                            if x.get_force_occ() > 1.0 {
+                                println!("ERROR: the orbital occupation number for UHF and ROHF cannot be larger than 1.0");
+                                panic!("{}", x.formated_output_check());
+                            }
+                        })
+
+                    }
+                }
+            }
+            //println!("{:?}", &scf_data.mol.ctrl.auxiliary_reference_states);
+            if scf_data.mol.ctrl.auxiliary_reference_states.len() > 0 {
+                scf_data.mol.ctrl.auxiliary_reference_states.iter().for_each(|(chkname,global_index)| {
+                    println!("{}", chkname);
+                    let is_exist = scf_data.ref_eigenvectors.contains_key(chkname);
+                    if ! is_exist {
+                        let (reference,[num_basis, num_state, spin_channel]) = import_mo_coeff_from_hdf5chkfile(chkname);
+                        println!("{},{},{},{},{}", chkname,global_index, num_basis, num_state, spin_channel);
+                        scf_data.ref_eigenvectors.insert(chkname.clone(), (reference,[global_index.clone(),num_basis, num_state, spin_channel]));
+                    }
+                });
+            }
+            //=============================
+            scf_data.eigenvalues = eigenvalues;
+            scf_data.eigenvectors = eigenvectors;
+            if let Some(occupation) = is_occupation {
+                scf_data.occupation = occupation;
+            } else {
+                scf_data.generate_occupation();
+            }
+            scf_data.generate_density_matrix();
+        }
 
 pub fn initial_guess_from_hdf5guess(mol: &Molecule) -> Vec<MatrixFull<f64>> {
     if mol.ctrl.print_level>0 {println!("Importing density matrix from external initial guess file")};
@@ -230,21 +247,19 @@ pub fn initial_guess_from_hdf5guess(mol: &Molecule) -> Vec<MatrixFull<f64>> {
     dm
 }
 
-pub fn initial_guess_from_hdf5chk(mol: &Molecule, scftype: &SCFType) -> ([MatrixFull<f64>;2],[Vec<f64>;2],Option<[Vec<f64>;2]>) {
-
+pub fn initial_guess_from_hdf5chk(mol: &Molecule, scftype: &SCFType, chkfile: &String) -> ([MatrixFull<f64>;2],[Vec<f64>;2],Option<[Vec<f64>;2]>) {
+    let mut spin_channel: usize;
     if let &SCFType::ROHF = scftype {
-        initial_guess_from_hdf5chkfile(&mol.ctrl.chkfile, 
-            1, // only one set of MO_coeff and MO_energy
-            mol.num_state,
-            mol.num_basis,
-            mol.ctrl.print_level)
+        spin_channel = 1;
+
     } else {
-        initial_guess_from_hdf5chkfile(&mol.ctrl.chkfile, 
-            mol.spin_channel,
+        spin_channel = mol.spin_channel;
+    }
+    initial_guess_from_hdf5chkfile(chkfile, 
+            spin_channel,
             mol.num_state,
             mol.num_basis,
             mol.ctrl.print_level)
-    }
 }
 
 pub fn initial_guess_from_hdf5chkfile(

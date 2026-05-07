@@ -1,45 +1,37 @@
+#![warn(unused_imports)]
 use crate::basis_io::ecp::ghost_effective_potential_matrix;
 use crate::check_norm::force_state_occupation::adapt_occupation_with_force_projection;
 use crate::check_norm::{self, generate_occupation_frac_occ, generate_occupation_integer, generate_occupation_sad, OCCType};
 use crate::dft::gen_grids::prune::prune_by_rho;
-use crate::dft::{numerical_density, DFTType, Grids};
-use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges, get_charge};
+use crate::dft::{DFTType, Grids};
+use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges};
 use crate::mpi_io::{mpi_broadcast, mpi_broadcast_matrixfull, mpi_broadcast_vector, mpi_reduce, MPIOperator};
-use crate::utilities::{create_pool, TimeRecords};
+use crate::utilities::{self, TimeRecords};
 use crate::utilities::memory_batch::*;
-use crate::ctrl_io::flags::*;
+use crate::ctrl_io::ri_jk_io::*;
 
-////use blas_src::openblas::dgemm;
 mod addons;
 mod fchk;
 mod pyrest_scf_io;
 
 use mpi::collective::SystemOperation;
-use pyo3::{pyclass, pymethods, pyfunction};
-use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemm_nn, _dgemv, _dinverse, _dspgvx, _dsymm, _dsyrk, _hamiltonian_fast_solver, _power, _power_rayon_for_symmetric_matrix, _dsyevd};
-use tensors::{map_full_to_upper, map_upper_to_full, ri, BasicMatUp, BasicMatrix, ERIFold4, ERIFull, MathMatrix, MatrixFull, MatrixFullSlice, MatrixFullSliceMut, MatrixUpper, MatrixUpperSlice, ParMathMatrix, RIFull, TensorSliceMut};
-use itertools::{Itertools, iproduct, izip};
+use pyo3::{pyclass};
+use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemv, _dinverse, _dspgvx, _dsymm, _dsyrk, _hamiltonian_fast_solver, _power_rayon_for_symmetric_matrix, _dsyevd};
+use tensors::{map_upper_to_full, BasicMatUp, BasicMatrix, ERIFold4, MathMatrix, MatrixFull, MatrixFullSlice, MatrixUpper, MatrixUpperSlice, RIFull, TensorSliceMut};
+use itertools::{Itertools};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::mem::size_of;
-use std::sync::{Mutex, Arc,mpsc};
-use std::thread;
-use crossbeam::{channel::{unbounded,bounded},thread::{Scope,scope}};
-use std::sync::mpsc::{channel, Receiver};
-use crate::isdf::{prepare_for_ri_isdf, init_by_rho, prepare_m_isdf};
-use crate::molecule_io::{Molecule, generate_ri3fn_from_rimatr};
+use crossbeam::{channel::{unbounded},thread::{scope}};
+use std::sync::mpsc::{channel};
+use crate::isdf::{prepare_for_ri_isdf, prepare_m_isdf};
+use crate::molecule_io::{Molecule};
 use crate::tensors::{TensorOpt,TensorOptMut,TensorSlice};
-use crate::{utilities, initial_guess};
 use crate::initial_guess::initial_guess;
 use crate::external_libs::dftd;
-use crate::constants::{INVERSE_THRESHOLD, SPECIES_INFO, SQRT_THRESHOLD};
-use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
+use crate::constants::{SQRT_THRESHOLD};
+use crate::solvent::{PcmObject, PcmScf, solvent_prepare};
 use crate::ri_jk;
-
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
-
-
-
 
 #[pyclass]
 #[derive(Clone)]
@@ -179,7 +171,6 @@ impl SCF {
         scf_data
     }
 
-
     /// Determine the J/K algorithms based on user input and memory requirement.
     /// 
     /// Only in effective when
@@ -215,13 +206,13 @@ impl SCF {
             println!("Checking memory requirement for RI J/K algorithms...");
             let nao = mol.num_basis;
             let naux = mol.num_auxbas;
-            // TODO: for safety, we add factor 3.0 to the memory requirement
-            let mem_cderi_mb = 3.0 * 8.0 * (0.5 * (nao * nao * naux) as f64) / 1024.0 / 1024.0;
+            // TODO: for safety, we add factor 1.5 to the memory requirement
+            let mem_cderi_mb = 1.5 * 8.0 * (0.5 * (nao * nao * naux) as f64) / 1024.0 / 1024.0;
             let mem_avail_mb = mol.ctrl.max_memory.map(|max_memory| {
                 max_memory - detect_used_memory_mb("proc")
             }).unwrap_or_else(detect_available_memory_mb);
             let algorithm_jk = if mem_avail_mb  < mem_cderi_mb {
-                println!("Memory available for RI integrals ({:.2} MB) is less than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
+                println!("Memory available for 1.5 times of RI integrals ({:.2} MB) is less than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
                 println!("Switch to direct RI-J/K algorithms.");
                 if algorithm_jk == AlgorithmJK::Ri {
                     AlgorithmJK::RiDirect
@@ -233,7 +224,7 @@ impl SCF {
                     algorithm_jk
                 }
             } else {
-                println!("Memory available for RI integrals ({:.2} MB) is more than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
+                println!("Memory available for 1.5 times of RI integrals ({:.2} MB) is more than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
                 println!("Using standard incore RI-J/K algorithms.");
                 if algorithm_jk == AlgorithmJK::Ri {
                     AlgorithmJK::RiIncore
@@ -281,10 +272,23 @@ impl SCF {
         }
         //========================================
         // For emperial dispersion correction
-        if let Some(empirical_dispersion_name) = &self.mol.ctrl.empirical_dispersion {
+        let mut disp_from_parse_xc = false;
+        if let Some(dfadef) = &self.mol.dfadef {
+        if dfadef.has_dispersion() {
+            disp_from_parse_xc = true;
+        }
+        }
+        let disp_from_ctrl = self.mol.ctrl.empirical_dispersion.is_some();
+        if disp_from_ctrl || disp_from_parse_xc {
             let (engy_disp, grad_disp, sigma_disp) = dftd(self);
+
+            let disp_name = if disp_from_parse_xc {
+                self.mol.dfadef.as_ref().unwrap().get_dispersion().unwrap().func.clone()
+            } else {
+                self.mol.ctrl.empirical_dispersion.clone().unwrap()
+            };
             if self.mol.ctrl.print_level>1 { 
-                println!("The empirical dispersion energy of {} is {}.", self.mol.ctrl.empirical_dispersion.clone().unwrap().to_uppercase(), engy_disp)
+                println!("The empirical dispersion energy of {} is {}.", disp_name.to_uppercase(), engy_disp)
             };
             if self.mol.ctrl.print_level>3 { 
                 println!("{:?}, {:?}", &grad_disp, &sigma_disp);
@@ -293,7 +297,8 @@ impl SCF {
             
             // empirical dispersion energy added to the nuc_energy
             self.nuc_energy += engy_disp;
-        } else {
+        }
+        if !disp_from_ctrl && !disp_from_parse_xc {
             if self.mol.ctrl.print_level>1 { 
                 println!("no empirical dispersion correction is employed");
             }
@@ -395,11 +400,10 @@ impl SCF {
             },
             _ => false,
         };
-        let use_eri = self.mol.use_eri || use_eri_jk;
         //let use_eri = true;
-        let isdf = if use_eri {self.mol.ctrl.eri_type.eq("ri_v") && self.mol.ctrl.use_isdf} else {false};
-        let ri3fn_full = if use_eri {self.mol.ctrl.use_auxbas && !self.mol.ctrl.use_ri_symm} else {false};
-        let ri3fn_symm = if use_eri {self.mol.ctrl.use_auxbas && self.mol.ctrl.use_ri_symm} else{false};
+        let isdf = if use_eri_jk {self.mol.ctrl.eri_type.eq("ri_v") && self.mol.ctrl.use_isdf} else {false};
+        let ri3fn_full = if use_eri_jk {self.mol.ctrl.use_auxbas && !self.mol.ctrl.use_ri_symm} else {false};
+        let ri3fn_symm = if use_eri_jk {self.mol.ctrl.use_auxbas && self.mol.ctrl.use_ri_symm} else{false};
 
         // preparing the three-center integrals in the full format
         self.ri3fn = if ri3fn_full && !isdf {
@@ -2582,7 +2586,11 @@ impl SCF {
         let mut vk = if self.mol.ctrl.use_isdf{
             self.generate_vk_with_isdf(1.0, use_dm_only)
         }else{
-            self.generate_vk_with_ri_v(1.0, use_dm_only, mpi_operator)
+            match self.algorithm_jk {
+                AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(1.0, use_dm_only, None),
+                AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(1.0, use_dm_only, mpi_operator),
+                _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
+            }
         };
         let spin_channel = self.mol.spin_channel;
         for i_spin in 0..spin_channel {
@@ -3245,47 +3253,85 @@ impl SCF {
             self.semi_diagonalize_hamiltonian(); 
         }
 
-        let (mut ri3ao, mut basbas2baspair, mut baspar2basbas) =  if let Some((riao,basbas2baspair, baspar2basbas))=&mut self.rimatr {
-            (riao,basbas2baspair, baspar2basbas)
+        if let Some((ref ri3ao, ref basbas2baspair, ref baspar2basbas))= &mut self.rimatr {
+            let mut ri3mo: Vec<(RIFull<f64>,std::ops::Range<usize>, std::ops::Range<usize>)> = vec![];
+            for i_spin in 0..self.mol.spin_channel {
+                let eigenvector = match self.scftype {
+                    SCFType::ROHF => &self.semi_eigenvectors.as_ref().unwrap()[i_spin],
+                    _ => &self.eigenvectors[i_spin],
+                };
+                ri3mo.push(
+                    ao2mo_rayon(
+                        eigenvector, ri3ao, 
+                        row_range.clone(), 
+                        col_range.clone()
+                    ).unwrap()
+                )
+            }
+
+            //if let Some(my_data)=&self.mol.mpi_data {
+            //    //if my_data.rank == 0 {self.eigenvectors[0].formated_output(5, "full")};
+            //    let (dd, col, row) = &ri3mo[0];
+            //    let ff = dd.get_reducing_matrix(0).unwrap();
+            //    ff.iter_columns_full().enumerate().for_each(|(i,x)| {
+            //        println!("i: {}", i);
+            //        println!("x: {:?}", &x);
+            //    })
+            //} else {
+            //    //self.eigenvectors[0].formated_output(5, "full");
+            //    let (dd, col, row) = &ri3mo[0];
+            //    let ff = dd.get_reducing_matrix(0).unwrap();
+            //    ff.iter_columns_full().enumerate().for_each(|(i,x)| {
+            //        println!("i: {}", i);
+            //        println!("x: {:?}", &x);
+            //    })
+            //};
+
+            // deallocate the rimatr to save the memory
+            self.rimatr = None;
+            self.ri3mo = Some(ri3mo);
         } else {
-            panic!("rimatr should be initialized in the preparation of ri3mo");
-        };
-        let mut ri3mo: Vec<(RIFull<f64>,std::ops::Range<usize>, std::ops::Range<usize>)> = vec![];
-        for i_spin in 0..self.mol.spin_channel {
-            let eigenvector = match self.scftype {
-                SCFType::ROHF => &self.semi_eigenvectors.as_ref().unwrap()[i_spin],
-                _ => &self.eigenvectors[i_spin],
+            // use rstsr::prelude::*;
+            let mut ri3mo: Vec<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)> = vec![];
+            let mut timerecords = TimeRecords::new();
+            timerecords.new_item("ao2mo", "for the generation of RI3MO");
+            match self.mol.spin_channel {
+                1 => {
+                    let eigenvectors = match self.scftype {
+                        SCFType::ROHF => &self.semi_eigenvectors.as_ref().unwrap()[0],
+                        _ => &self.eigenvectors[0],
+                    };
+                    let cderi = ri_jk::obtain_cderi_xvo_restricted(&self, &mut timerecords, Some(eigenvectors), Some(row_range.clone()), Some(col_range.clone()));
+                    let shape = cderi.shape().to_vec().try_into().unwrap();
+                    let data = cderi.into_shape(-1).into_raw();
+                    let ri3ao = RIFull::from_vec(shape, data).unwrap();
+                    ri3mo.push((ri3ao, row_range.clone(), col_range.clone()));
+                },
+                2 => {
+                    let eigenvectors = match self.scftype {
+                        SCFType::ROHF => [&self.semi_eigenvectors.as_ref().unwrap()[0], &self.semi_eigenvectors.as_ref().unwrap()[1]],
+                        _ => [&self.eigenvectors[0], &self.eigenvectors[1]],
+                    };
+                    let row_ranges = [row_range.clone(), row_range.clone()];
+                    let col_ranges = [col_range.clone(), col_range.clone()];
+                    let cderi = ri_jk::obtain_cderi_xvo_unrestricted(&self, &mut timerecords, Some(eigenvectors), Some(row_ranges), Some(col_ranges));
+
+                    let [cderi_a, cderi_b] = cderi;
+                    // handle alpha
+                    let shape = cderi_a.shape().to_vec().try_into().unwrap();
+                    let data = cderi_a.into_shape(-1).into_raw();
+                    let ri3ao = RIFull::from_vec(shape, data).unwrap();
+                    ri3mo.push((ri3ao, row_range.clone(), col_range.clone()));
+                    // handle beta
+                    let shape = cderi_b.shape().to_vec().try_into().unwrap();
+                    let data = cderi_b.into_shape(-1).into_raw();
+                    let ri3ao = RIFull::from_vec(shape, data).unwrap();
+                    ri3mo.push((ri3ao, row_range.clone(), col_range.clone()));
+                },
+                _ => unreachable!()
             };
-            ri3mo.push(
-                ao2mo_rayon(
-                    eigenvector, ri3ao, 
-                    row_range.clone(), 
-                    col_range.clone()
-                ).unwrap()
-            )
-        }
-
-        //if let Some(my_data)=&self.mol.mpi_data {
-        //    //if my_data.rank == 0 {self.eigenvectors[0].formated_output(5, "full")};
-        //    let (dd, col, row) = &ri3mo[0];
-        //    let ff = dd.get_reducing_matrix(0).unwrap();
-        //    ff.iter_columns_full().enumerate().for_each(|(i,x)| {
-        //        println!("i: {}", i);
-        //        println!("x: {:?}", &x);
-        //    })
-        //} else {
-        //    //self.eigenvectors[0].formated_output(5, "full");
-        //    let (dd, col, row) = &ri3mo[0];
-        //    let ff = dd.get_reducing_matrix(0).unwrap();
-        //    ff.iter_columns_full().enumerate().for_each(|(i,x)| {
-        //        println!("i: {}", i);
-        //        println!("x: {:?}", &x);
-        //    })
-        //};
-
-        // deallocate the rimatr to save the memory
-        self.rimatr = None;
-        self.ri3mo = Some(ri3mo);
+            self.ri3mo = Some(ri3mo);
+        };
     }
     pub fn generate_ri3mo_rayon_for_multiple_times(&self, row_range: std::ops::Range<usize>, col_range: std::ops::Range<usize>)->Vec<(RIFull<f64>,std::ops::Range<usize>,std::ops::Range<usize>)> {
 
@@ -3370,7 +3416,7 @@ impl SCF {
     /// To activate this function, in the meantime when writing this function, in `ctrl.in`
     /// - specify `algorithm_j = ri-direct` or `algorithm_jk = ri-direct` to disable full storage of 3c-2e ERI (required);
     /// - specify `[ctrl]: max_memory` in MB for calculating `block_size` if not specified;
-    fn generate_vj_ri_direct(&mut self, batch_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
+    fn generate_vj_ri_direct(&self, batch_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
         let print_level = self.mol.ctrl.print_level;
 
         // compute batch_size
@@ -3427,7 +3473,7 @@ impl SCF {
         vjs
     }
 
-    fn generate_vk_ri_direct(&mut self, scaling_factor: f64, use_dm_only: bool, batch_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
+    fn generate_vk_ri_direct(&self, scaling_factor: f64, use_dm_only: bool, batch_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
         let print_level = self.mol.ctrl.print_level;
 
         // compute batch_size
@@ -3449,12 +3495,12 @@ impl SCF {
 
         // prefer semi-direct if possible
         let (alg_semi, mut batch_size_estimate) = if !use_dm_only && batch_size_estimate_semi >= min_batch_size {
-            if print_level > 0 {
+            if print_level > 1 {
                 println!("[INFO] in generate_vk_ri_direct_dm, using semi-direct algorithm for vk computation.");
             }
             (true, batch_size_estimate_semi)
         } else {
-            if print_level > 0 {
+            if print_level > 1 {
                 println!("[INFO] in generate_vk_ri_direct_dm, using direct algorithm for vk computation.");
             }
             (false, batch_size_estimate_direct)
@@ -3481,7 +3527,7 @@ impl SCF {
         handle_memory_exceed(mem_est.estimate_mem::<f64>(batch_size), mem_avail, self.mol.ctrl.abort_on_mem_exceed);
 
         // info output
-        if print_level > 0 {
+        if print_level > 1 {
             println!("[INFO] in generate_vk_ri_direct_dm, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
             println!("[INFO] in generate_vk_ri_direct_dm, batch size      : {batch_size}");
             println!("[INFO] in generate_vk_ri_direct_dm, memory estimation");
@@ -3597,6 +3643,29 @@ pub fn determine_ri3mo_size_for_pt2_and_rpa(scf_data: &SCF) -> (std::ops::Range<
     }
 
     (start_mo..homo+1, lumo..num_state)
+}
+
+
+pub fn generate_ri3mo_rayon_for_pt2_and_rpa(scf_data: &mut SCF) {
+    use crate::post_scf_analysis::{split_indices_by_spin_occ, format_indices};
+
+    let (occ_range, vir_range) = determine_ri3mo_size_for_pt2_and_rpa(&scf_data);
+    if scf_data.mol.ctrl.print_level>1 {
+        //println!("generate RI3MO only for occ_range:{:?}, vir_range:{:?}", &occ_range, &vir_range);
+        let spin_orb_indices = split_indices_by_spin_occ(&scf_data.occupation, 0.5);
+        let (alpha_occ, alpha_vir) = &spin_orb_indices[0];
+        println!("Occupied orbitals (alpha): {}", format_indices(alpha_occ));
+        println!("Virtual orbitals (alpha): {}", format_indices(alpha_vir));
+        if matches!(scf_data.scftype, SCFType::UHF | SCFType::ROHF) {
+            let (beta_occ,  beta_vir)  = &spin_orb_indices[1];
+            println!("Occupied orbitals (beta): {}", format_indices(beta_occ));
+            println!("Virtual orbitals (beta): {}", format_indices(beta_vir));
+        }
+    };
+    scf_data.generate_ri3mo_rayon(vir_range, occ_range);
+    if scf_data.mol.ctrl.print_level>1 {
+        println!("Finish the RI3MO generation")
+    };
 }
 
 
