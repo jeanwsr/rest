@@ -3495,7 +3495,7 @@ fn test_matrixupper() {
     let dd = MatrixUpper::from_vec(10, (0..10).collect::<Vec<usize>>()).unwrap();
     dd.iter_diagonal().for_each(|x| {println!("{}",x)});
 
-    let matrixupper_index = map_upper_to_full(10).unwrap();
+    let matrixupper_index = tensors::map_upper_to_full(10).unwrap();
     dd.iter_submatrix(1..3, 0..2, &matrixupper_index).for_each(|x| {println!("{}",x)});
 }
 
