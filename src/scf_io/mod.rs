@@ -4059,7 +4059,7 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync(
                 dm: &Vec<MatrixFull<f64>>,
                 spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
 
-    vk_upper_with_rimatr_use_dm_only_sync_v02(ri3fn, dm, spin_channel, scaling_factor)
+    vk_upper_with_rimatr_use_dm_only_sync_v01(ri3fn, dm, spin_channel, scaling_factor)
 }
 
 pub fn vk_upper_with_rimatr_use_dm_only_sync_v01(
