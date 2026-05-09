@@ -329,6 +329,20 @@ pub fn main_driver() -> anyhow::Result<()> {
         time_mark.count("TDDFT");
     }
 
+    //===================================
+    // Now for CP-HF calculations
+    //===================================
+    if let Some(cphf_ctrl) = &scf_data.mol.ctrl.cphf {
+        let label = if cphf_ctrl.solver == "dense" { "dense" } else { "krylov" };
+        println!("\n=== CP-HF Calculation (solver={}) ===", label);
+        time_mark.new_item("CPHF", &format!("the CP-HF {} solver test", label));
+        time_mark.count_start("CPHF");
+        if let Err(e) = crate::ri_cphf::test_cphf_dense(&scf_data) {
+            eprintln!("Error in CP-HF calculation: {}", e);
+        }
+        time_mark.count("CPHF");
+    }
+
     time_mark.count("Overall");
 
     if scf_data.mol.ctrl.print_level > 0 {
