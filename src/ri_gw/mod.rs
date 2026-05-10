@@ -36,7 +36,6 @@ pub mod renormalized_singles;
 pub mod scgw;
 pub mod display;
 pub mod fourier_self_energy;
-pub mod drpa;
 pub mod qsgw;
 use crate::mpi_io::MPIOperator;
 
@@ -597,16 +596,11 @@ pub fn w_c_matrix(inverse_dielectric:&MatrixFull<f64>,num_state:usize,ri_full:&M
 pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,num_state:usize,ri_ov:&MatrixFull<f64>,ri_full:&MatrixFull<f64>)->f64{
     let fermi_energy=(quasiparticle_energies_g[occ_size-1]+quasiparticle_energies_g[occ_size])/2.0;
     let sign=if omega>fermi_energy{1}else{-1};
-    let mut contour:f64=0.0;
     let num_auxbas=ri_ov.size[0];
-    let mut residue_count=0;
-    let mut contour=0.0;
     if sign==1{
-        contour=(0..vir_size).into_par_iter().map(|a|{
-            let mut contour:f64=0.0;
+        (0..vir_size).into_par_iter().map(|a|{
             let mut residue=0.0;
             if quasiparticle_energies_g[occ_size+a]<omega{
-                let mut exist=false;
                 let gap=omega-quasiparticle_energies_g[occ_size+a];
                 let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,gap,'C');
                 let inverse_dielectric=inverse_dielectric_matrix(&response,'C');
@@ -614,17 +608,14 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
                 let mut first_product=vec![0.0;num_auxbas];
                 _dgemv(&inverse_dielectric, &vec, &mut first_product, 'N', 1.0, 0.0, 1, 1);
                 residue=first_product.iter().zip(vec.iter()).map(|(a,b)|a*b).sum::<f64>();
-                
             }
             residue*=(sign as f64);
             residue
         }).sum()
     }else{
-        contour=(0..occ_size).into_par_iter().map(|i|{
-            let mut contour:f64=0.0;
+        (0..occ_size).into_par_iter().map(|i|{
             let mut residue=0.0;
             if quasiparticle_energies_g[i]>omega{
-                let mut exist=false;
                 let gap=quasiparticle_energies_g[i]-omega;
                 let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,gap,'C');
                 let inverse_dielectric=inverse_dielectric_matrix(&response,'C');
@@ -637,7 +628,6 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
             residue
         }).sum()
     }
-    contour
 }
 pub fn newton_solver<F>(mut f:F,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_full:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,num_state:usize,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,starting_point:f64,tol:f64,max_iter:usize,side:f64,printlevel:usize)->f64 where F:Fn(f64,usize,f64,&MatrixFull<f64>,&MatrixFull<f64>,&Vec<f64>,&Vec<f64>,usize,usize,usize,&Vec<(f64,f64,MatrixFull<f64>)>)->f64,{
     let h =0.000001;
@@ -686,7 +676,7 @@ pub fn single_newton_step<F>(mut f:F,starting_point:f64,side:f64,span_energy:f64
     x_curr+shift
 }
 pub fn linear_interpolation_solver<F>(mut f:F,starting_point:f64,side:f64,grid_freqs:usize,span_energy:f64)->(bool,f64) where F:Fn(f64)->f64{
-    let h=0.000001;
+    let h=0.00000001;
     let delta=0.02;
     let mut x_curr=starting_point+side*delta;
     let y_curr=f(x_curr);

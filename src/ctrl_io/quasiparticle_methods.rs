@@ -75,7 +75,22 @@ pub struct QuasiParticle {
     pub damped_bse_z_start: f64,
     pub damped_bse_z_end: f64,
     pub damped_bse_z_points: usize,
-    pub damped_bse_grids: Vec<[f64; 3]>
+    pub damped_bse_grids: Vec<[f64; 3]>,
+    // damped BSE solver selection
+    pub damped_bse_solver: String,
+    pub damped_bse_tol: f64,
+    pub damped_bse_max_iter: usize,
+    // FEAST solver control and parameters for BSE
+    pub bse_feast_solver: bool,
+    pub bse_eigenrange_min: f64,
+    pub bse_eigenrange_max: f64,
+    pub bse_m_expected: usize,
+    pub bse_max_feast_iter: usize,
+    pub bse_tol_feast: f64,
+    pub bse_feast_cg_max_iter: usize,
+    pub bse_feast_cg_tol: f64,
+    pub bse_feast_gmres_restart: usize,
+    pub bse_feast_gmres_max_iter: usize,
 }
 
 impl Default for QuasiParticle {
@@ -149,7 +164,20 @@ impl Default for QuasiParticle {
             damped_bse_z_start: 0.0,
             damped_bse_z_end: 1.0,
             damped_bse_z_points: 2,
-            damped_bse_grids: Vec::new()
+            damped_bse_grids: Vec::new(),
+            damped_bse_solver: String::from("klopper"),
+            damped_bse_tol: 1e-6,
+            damped_bse_max_iter: 200,
+            bse_feast_solver: false,
+            bse_eigenrange_min: 0.0,
+            bse_eigenrange_max: 0.5,
+            bse_m_expected: 20,
+            bse_max_feast_iter: 30,
+            bse_tol_feast: 1e-8,
+            bse_feast_cg_max_iter: 100,
+            bse_feast_cg_tol: 1e-8,
+            bse_feast_gmres_restart: 200,
+            bse_feast_gmres_max_iter: 500,
         }
     }
 }
@@ -227,6 +255,19 @@ impl QuasiParticle {
         table.insert("damped_bse_z_start".to_string(), toml::Value::Float(self.damped_bse_z_start));
         table.insert("damped_bse_z_end".to_string(), toml::Value::Float(self.damped_bse_z_end));
         table.insert("damped_bse_z_points".to_string(), toml::Value::Integer(self.damped_bse_z_points as i64));
+        table.insert("bse_eigenrange_min".to_string(), toml::Value::Float(self.bse_eigenrange_min));
+        table.insert("bse_feast_solver".to_string(), toml::Value::Boolean(self.bse_feast_solver));
+        table.insert("bse_eigenrange_max".to_string(), toml::Value::Float(self.bse_eigenrange_max));
+        table.insert("bse_m_expected".to_string(), toml::Value::Integer(self.bse_m_expected as i64));
+        table.insert("bse_max_feast_iter".to_string(), toml::Value::Integer(self.bse_max_feast_iter as i64));
+        table.insert("bse_tol_feast".to_string(), toml::Value::Float(self.bse_tol_feast));
+        table.insert("bse_feast_cg_max_iter".to_string(), toml::Value::Integer(self.bse_feast_cg_max_iter as i64));
+        table.insert("bse_feast_cg_tol".to_string(), toml::Value::Float(self.bse_feast_cg_tol));
+        table.insert("bse_feast_gmres_restart".to_string(), toml::Value::Integer(self.bse_feast_gmres_restart as i64));
+        table.insert("bse_feast_gmres_max_iter".to_string(), toml::Value::Integer(self.bse_feast_gmres_max_iter as i64));
+        table.insert("damped_bse_solver".to_string(), toml::Value::String(self.damped_bse_solver.clone()));
+        table.insert("damped_bse_tol".to_string(), toml::Value::Float(self.damped_bse_tol));
+        table.insert("damped_bse_max_iter".to_string(), toml::Value::Integer(self.damped_bse_max_iter as i64));
         toml::Value::Table(table)
     }
 }
@@ -515,6 +556,47 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(2) as usize,
                 _ => 2,
             };
+            // Parse FEAST solver control and parameters
+            tmp_input.bse_feast_solver = match tmp_ctrl.get("bse_feast_solver").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
+            };
+            tmp_input.bse_eigenrange_min = match tmp_ctrl.get("bse_eigenrange_min").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.bse_eigenrange_max = match tmp_ctrl.get("bse_eigenrange_max").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.5),
+                _ => 0.5,
+            };
+            tmp_input.bse_m_expected = match tmp_ctrl.get("bse_m_expected").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(20) as usize,
+                _ => 20,
+            };
+            tmp_input.bse_max_feast_iter = match tmp_ctrl.get("bse_max_feast_iter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(30) as usize,
+                _ => 30,
+            };
+            tmp_input.bse_tol_feast = match tmp_ctrl.get("bse_tol_feast").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e-8),
+                _ => 1e-8,
+            };
+            tmp_input.bse_feast_cg_max_iter = match tmp_ctrl.get("bse_feast_cg_max_iter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(100) as usize,
+                _ => 100,
+            };
+            tmp_input.bse_feast_cg_tol = match tmp_ctrl.get("bse_feast_cg_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e-8),
+                _ => 1e-8,
+            };
+            tmp_input.bse_feast_gmres_restart = match tmp_ctrl.get("bse_feast_gmres_restart").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(200) as usize,
+                _ => 200,
+            };
+            tmp_input.bse_feast_gmres_max_iter = match tmp_ctrl.get("bse_feast_gmres_max_iter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(500) as usize,
+                _ => 500,
+            };
             // Generate grids: OUTER LOOP X, MIDDLE LOOP Y, INNER LOOP Z
             let x_step = if tmp_input.damped_bse_x_points > 1 {
                 (tmp_input.damped_bse_x_end - tmp_input.damped_bse_x_start) / (tmp_input.damped_bse_x_points - 1) as f64
@@ -543,6 +625,18 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 }
             }
             tmp_input.damped_bse_grids = grids;
+            tmp_input.damped_bse_solver = match tmp_ctrl.get("damped_bse_solver").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone().to_lowercase(),
+                _ => String::from("klopper"),
+            };
+            tmp_input.damped_bse_tol = match tmp_ctrl.get("damped_bse_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e-6),
+                _ => 1e-6,
+            };
+            tmp_input.damped_bse_max_iter = match tmp_ctrl.get("damped_bse_max_iter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(200) as usize,
+                _ => 200,
+            };
             return Ok(Some(tmp_input));
         },
         other => {

@@ -6,6 +6,7 @@ pub mod libxc_itrf;
 pub mod xc_deriv;
 pub mod num_int;
 pub mod parse_xc;
+pub mod response;
 
 use mpi::collective::SystemOperation;
 // use mpi::ffi::MPI_T_SCOPE_GROUP_EQ;

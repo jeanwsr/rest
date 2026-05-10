@@ -118,8 +118,9 @@ where F1:Fn(&Vec<f64>)->Vec<f64>+Send+Sync{
         });}
         let mut converge=true;
         let mut converge_pairs=0;
+        let n_residues = residues.size[1];
         residues.iter_columns_full().enumerate().for_each(|(n,residue_i)|{
-            if n<nroots{
+            if n < nroots.min(n_residues) {
                 let norm=residue_i.iter().fold(0.0,|acc,val|acc+val.powf(2.0));
                 if norm>1e-10{
                     converge=false;
@@ -128,6 +129,12 @@ where F1:Fn(&Vec<f64>)->Vec<f64>+Send+Sync{
                 }
             }
         });
+        if n_residues < nroots {
+            converge = false;
+            if print_level > 0 {
+                println!("  Warning: only {} trial vectors for {} roots", n_residues, nroots);
+            }
+        }
         if converge{
             x_full.iter_columns_full().enumerate().for_each(|(n,vec)|if n<nroots{x_solutions.push_column(vec)});
             eigenvalues=omega[..nroots].to_vec();
@@ -255,81 +262,148 @@ where F1:Fn(&Vec<f64>)->Vec<f64>+ Send + Sync,F2:Fn(&Vec<f64>)->Vec<f64>+ Send +
         let ss_t_apb_ss=ss_t_a_ss.scaled_add(&ss_t_b_ss,1.0).unwrap();
         if print_level>1{println!("AmB projection:");
         ss_t_amb_ss.formated_output(1000,"full");}
-        let mut g=ss_t_amb_ss;
-        _dpotrf(&mut g,'L');
-        (0..m).cartesian_product(0..m).for_each(|(i,j)|{
-            if i<j{
-                g[[i,j]]=0.0;
+        let mut g=ss_t_amb_ss.clone();
+        // Try Cholesky decomposition; catch panic if not positive definite
+        let cholesky_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut g_chol = ss_t_amb_ss.clone();
+            _dpotrf(&mut g_chol, 'L');
+            (0..m).cartesian_product(0..m).for_each(|(i,j)|{
+                if i<j{ g_chol[[i,j]] = 0.0; }
+            });
+            g = g_chol;
+        }));
+        if cholesky_ok.is_err() {
+            if print_level > 0 {
+                println!("  Cholesky failed (A-B not positive-definite): this can happen with hybrid functionals.");
+                println!("  Falling back to TDA approximation for this iteration.");
             }
-        });
-        //g: A-B=GG^T,Cholesky Lower matrix from A-B
-        if print_level>1{println!("ApB projection:");
-        ss_t_apb_ss.formated_output(1000,"full");}
-        let mut apb_g=MatrixFull::new([m,m],0.0);
-        //apb_g:(A-B)G,where A-B is the subspace projection
-        _dgemm_full(&ss_t_apb_ss,'N',&g,'N',&mut apb_g,1.0,0.0);
-        let mut gt_apb_g=MatrixFull::new([m,m],0.0);
-        //gt_apb_g:G^T(A-B)G,where A-B is the subspace projection.This is the matrix to dsyev!
-        _dgemm_full(&g,'T',&apb_g,'N',&mut gt_apb_g,1.0,0.0);
-        drop(apb_g);
-        let (Some(ginv_xpy),omega2,_)=_dsyev(&gt_apb_g,'V')else{panic!("dsyev failure!")};
-        //ginv_xpy:G^{-1}(X+Y),eigenvectors of G^T(A-B)G,denoted as u in some literature,omega2:square of desired excitation energies
-        let mut ginv_xpy_positives=MatrixFull::new([m,0],0.0);
-        let mut omega2_positives:Vec<f64>=Vec::new();
-        let mut push_count=0;
-        if print_level>1{println!("omega square={:#?}",omega2);}
-        omega2.iter().zip(ginv_xpy.iter_columns_full()).enumerate().for_each(|(n,(omega2_i,ginv_xpy))|if *omega2_i>0.0{
-            if push_count<nroots && *omega2_i>0.0{
-                omega2_positives.push(*omega2_i);
-                ginv_xpy_positives.push_column(ginv_xpy);
-                push_count+=1;
+        }
+        let cholesky_result: Option<(MatrixFull<f64>, MatrixFull<f64>, Vec<f64>)> = if cholesky_ok.is_ok() {
+            // Cholesky succeeded: use standard approach
+            // (A-B) = GG^T, solve G^T(A+B)G Z = ω²Z
+            if print_level>1{println!("ApB projection:");
+            ss_t_apb_ss.formated_output(1000,"full");}
+            let mut apb_g=MatrixFull::new([m,m],0.0);
+            _dgemm_full(&ss_t_apb_ss,'N',&g,'N',&mut apb_g,1.0,0.0);
+            let mut gt_apb_g=MatrixFull::new([m,m],0.0);
+            _dgemm_full(&g,'T',&apb_g,'N',&mut gt_apb_g,1.0,0.0);
+            drop(apb_g);
+            let (Some(ginv_xpy), omega2, _) = _dsyev(&gt_apb_g, 'V') else { panic!("dsyev failure!") };
+
+            let mut ginv_xpy_pos = MatrixFull::new([m,0], 0.0);
+            let mut omega2_pos: Vec<f64> = Vec::new();
+            for (n, (w2, col)) in omega2.iter().zip(ginv_xpy.iter_columns_full()).enumerate() {
+                if *w2 > 0.0 && omega2_pos.len() < nroots {
+                    omega2_pos.push(*w2);
+                    ginv_xpy_pos.push_column(col);
+                }
             }
-        });
-        omega2_positives.iter().take(nroots).collect::<Vec<_>>();
-    
-        //Deleted solutions with negative omega^2 to increase robustness
-        let m=g.size[0];
-        //m:subspace dimensions
-        let mut xpy=MatrixFull::new([m,nroots],0.0);
-        _dgemm_full(&g,'N',&ginv_xpy_positives,'N',&mut xpy,1.0,0.0);
-        if print_level>1{println!("Subspace xpy:");
-        xpy.formated_output(1000,"full");}
-        //xpy:X+Y, spanned in subspace
-        let ginv=_dinverse(&g).expect("unsuccessful _dinverse");
-        //ginv:G^{-1}
-        let mut xmy=MatrixFull::new([m,nroots],0.0);
-        //xmy:X-Y, spanned in subspace
-        _dgemm_full(&ginv,'T',&ginv_xpy_positives,'N',&mut xmy,1.0,0.0);
+            if omega2_pos.is_empty() {
+                // No positive eigenvalues; fall through to dgeev approach
+                None
+            } else {
+                let m_sub = g.size[0];
+                let mut xpy_sub = MatrixFull::new([m_sub, nroots], 0.0);
+                _dgemm_full(&g, 'N', &ginv_xpy_pos, 'N', &mut xpy_sub, 1.0, 0.0);
+                let ginv = _dinverse(&g).expect("_dinverse");
+                let mut xmy_sub = MatrixFull::new([m_sub, nroots], 0.0);
+                _dgemm_full(&ginv, 'T', &ginv_xpy_pos, 'N', &mut xmy_sub, 1.0, 0.0);
+                let omega_vec: Vec<f64> = omega2_pos.iter().map(|w| w.sqrt()).collect();
+                Some((xpy_sub, xmy_sub, omega_vec))
+            }
+        } else {
+            if print_level > 0 {
+                println!("  Cholesky failed (A-B not positive-definite), switching to direct subspace solver");
+            }
+            None
+        };
+
+        let (mut xpy, mut xmy, mut omega) = match cholesky_result {
+            Some((xp, xm, ow)) => (xp, xm, ow),
+            None => {
+                // Fallback: solve [A B; -B -A] on the projected subspace directly
+                // Build 2m × 2m matrix H = [A_proj, B_proj; -B_proj, -A_proj]
+                let mut h_full = MatrixFull::new([2*m, 2*m], 0.0);
+                // Upper-left: A_proj = ss_t_a_ss
+                for i in 0..m { for j in 0..m { h_full[[i, j]] = ss_t_a_ss[[i, j]]; }}
+                // Upper-right: B_proj = ss_t_b_ss
+                for i in 0..m { for j in 0..m { h_full[[i, m + j]] = ss_t_b_ss[[i, j]]; }}
+                // Lower-left: -B_proj
+                for i in 0..m { for j in 0..m { h_full[[m + i, j]] = -ss_t_b_ss[[i, j]]; }}
+                // Lower-right: -A_proj
+                for i in 0..m { for j in 0..m { h_full[[m + i, m + j]] = -ss_t_a_ss[[i, j]]; }}
+
+                let (_, wr, wi, _vl, vr, _info) = _dgeev(&h_full, 'N', 'V');
+
+                // Collect positive-real eigenvalues and corresponding right eigenvectors
+                let mut pairs: Vec<(f64, Vec<f64>)> = wr.iter().zip(wi.iter().zip(vr.iter_columns_full()))
+                    .filter(|(wr_i, (wi_i, _))| **wr_i > 1e-4 && wi_i.abs() < 1e-6)
+                    .map(|(wr_i, (_, v))| (*wr_i, v.to_vec()))
+                    .collect();
+                pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                pairs.truncate(nroots);
+
+                if pairs.is_empty() {
+                    println!("  WARNING: No positive eigenvalues found in subspace.");
+                    // Return empty results
+                    return vec![];
+                }
+
+                let n_found = pairs.len();
+                let mut xp = MatrixFull::new([m, n_found], 0.0);
+                let mut xm = MatrixFull::new([m, n_found], 0.0);
+                let mut ow: Vec<f64> = Vec::new();
+
+                for (k, (val, vec)) in pairs.iter().enumerate() {
+                    ow.push(*val);
+                    // vec[0..m] = X, vec[m..2m] = Y from the dgeev eigenvector [X; Y]
+                    for i in 0..m {
+                        let vx = vec[i];           // X component
+                        let vy = vec[m + i];        // Y component
+                        xp[[i, k]] = vx + vy;       // X+Y
+                        xm[[i, k]] = vx - vy;       // X-Y
+                    }
+                    // Standard rescaling: xmy *= sqrt(ω), xpy /= sqrt(ω)
+                    let omega_sqrt = val.sqrt();
+                    for i in 0..m {
+                        xp[[i, k]] /= omega_sqrt;
+                        xm[[i, k]] *= omega_sqrt;
+                    }
+                }
+                (xp, xm, ow)
+            }
+        };
         if print_level>1{println!("Subspace xmy:");
         xmy.formated_output(1000,"full");}
-        //G^{-T}G{-1}(X+Y)=(A-B)^{-1}(X+Y)=omega(A-B)^{-1}(A-B)(X-Y)=omega(X-Y)
-        let mut omega:Vec<f64>=Vec::new();
-        (0..nroots).for_each(|j|{
-            let omega_j=omega2_positives[j].powf(0.5);
-            omega.push(omega_j);
-            //constructing omega
-            (0..m).for_each(|k|{
-                xmy[[k,j]]=xmy[[k,j]]*omega_j.powf(0.5);
-                xpy[[k,j]]=xpy[[k,j]]/omega_j.powf(0.5);
-            });
-            //Rescaling:to satisfy xmy*xpy=1
-        });
+        // Rescale to satisfy xmy·xpy = 1 (half-weight normalization)
+        let n_omega = omega.len();
+        for j in 0..n_omega {
+            let eig = omega[j];
+            for i in 0..m {
+                xmy[[i,j]] *= eig.sqrt();
+                xpy[[i,j]] /= eig.sqrt();
+            }
+        }
+        let n_omega = omega.len();
+        if n_omega == 0 {
+            if print_level > 0 { println!("  No TDDFT roots found in subspace."); }
+            break;
+        }
         if print_level>1{println!("omega:{:#?}",omega);}
-        let mut xmy_full=MatrixFull::new([occ_vir,nroots],0.0);
-        let mut xpy_full=MatrixFull::new([occ_vir,nroots],0.0);
+        let mut xmy_full=MatrixFull::new([occ_vir,n_omega],0.0);
+        let mut xpy_full=MatrixFull::new([occ_vir,n_omega],0.0);
         _dgemm_full(&ss,'N',&xmy,'N',&mut xmy_full,1.0,0.0);
         _dgemm_full(&ss,'N',&xpy,'N',&mut xpy_full,1.0,0.0);
         //xmy_full,xpy_full:Real X+Y and X-Y spanned in MO-pair basis
         let mut axmy=MatrixFull::new([occ_vir,0],0.0);
         let mut bxmy=MatrixFull::new([occ_vir,0],0.0);
         let mut results: Vec<(usize,Vec<f64>,Vec<f64>)> = xmy_full.iter_columns_full()
-            .enumerate().par_bridge()  // 将普通迭代器转换为并行迭代器
+            .enumerate().par_bridge()
             .map(|(i,xmy_i)| {
                 let z=xmy_i.to_vec();
-                (i,a_matvec(&z),b_matvec(&z))  // 直接返回结果向量
+                (i,a_matvec(&z),b_matvec(&z))
             })
             .collect();
-        // 按顺序推入结果
         results.sort_by_key(|(i, _,_)| *i);
         for result in results {
             axmy.push_column(&result.1);
@@ -339,30 +413,25 @@ where F1:Fn(&Vec<f64>)->Vec<f64>+ Send + Sync,F2:Fn(&Vec<f64>)->Vec<f64>+ Send +
         let mut axpy=MatrixFull::new([occ_vir,0],0.0);
         let mut bxpy=MatrixFull::new([occ_vir,0],0.0);
         let mut results: Vec<(usize,Vec<f64>,Vec<f64>)> = xpy_full.iter_columns_full()
-            .enumerate().par_bridge()  // 将普通迭代器转换为并行迭代器
+            .enumerate().par_bridge()
             .map(|(i,xpy_i)| {
                 let z=xpy_i.to_vec();
-                (i,a_matvec(&z),b_matvec(&z))  // 直接返回结果向量
+                (i,a_matvec(&z),b_matvec(&z))
             })
             .collect();
-        // 按顺序推入结果
         results.sort_by_key(|(i, _,_)| *i);
         for result in results {
             axpy.push_column(&result.1);
             bxpy.push_column(&result.2);
         }
         let apbxpy=axpy.scaled_add(&bxpy,1.0).unwrap();
-        //ambxmy,apbxpy:(A+B)(X+Y) and (A-B)(X-Y)
-        //They are used to evaluate residues:(A+B)(X+Y)-omega(X-Y) and (A-B)(X-Y)-omega(X+Y)
         let mut left_residues=ambxmy;
         let mut right_residues=apbxpy;
-        let mut eigenvalue_matrix=MatrixFull::new([nroots,nroots],0.0);
-        (0..nroots).for_each(|i|eigenvalue_matrix[[i,i]]=omega[i]);
-        //diagonal matrix of eigenvalues, to make it possible to obtain residues with LAPACK
-        let mut omega_xpy=MatrixFull::new([occ_vir,nroots],0.0);
+        let mut eigenvalue_matrix=MatrixFull::new([n_omega,n_omega],0.0);
+        (0..n_omega).for_each(|i|eigenvalue_matrix[[i,i]]=omega[i]);
+        let mut omega_xpy=MatrixFull::new([occ_vir,n_omega],0.0);
         _dgemm_full(&xpy_full,'N',&eigenvalue_matrix,'N',&mut omega_xpy,1.0,0.0);
-        //omega_xpy: Omega(diagonal)(X+Y)
-        let mut omega_xmy=MatrixFull::new([occ_vir,nroots],0.0);
+        let mut omega_xmy=MatrixFull::new([occ_vir,n_omega],0.0);
         _dgemm_full(&xmy_full,'N',&eigenvalue_matrix,'N',&mut omega_xmy,1.0,0.0);
         //omega_xmy: Omega(diagonal)(X-Y)
         left_residues=left_residues.scaled_add(&omega_xpy,-1.0).unwrap();
