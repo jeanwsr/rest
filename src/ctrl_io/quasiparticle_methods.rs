@@ -37,6 +37,12 @@ pub struct QuasiParticle {
     pub save_qp_path:String,
     pub save_first_excitation:bool,
     pub save_first_excitation_path:String,
+    pub use_low_rank_contour:bool,
+    pub low_rank_grid_type:String,   // "linear" or "quadratic" (power-law, denser near zero)
+    pub nomega_chi_real:usize,
+    pub low_rank_tolerance:f64,
+    pub nomega_sigma:usize,         // number of sigma sampling points on each side (de_max scan)
+    pub step_sigma:f64,             // spacing of sigma grid in Ha (de_max scan)
     pub fourier_self_energy:bool,
     pub fse_sin_coeff_path:String,
     pub fse_cos_coeff_path:String,
@@ -126,6 +132,12 @@ impl Default for QuasiParticle {
             save_qp_path:String::from("single_qp_path.txt"),
             save_first_excitation:false,
             save_first_excitation_path:String::from("first_excitation_save.txt"),
+            use_low_rank_contour:false,
+            low_rank_grid_type:String::from("linear"),
+            nomega_chi_real:6,
+            low_rank_tolerance:1e-3,
+            nomega_sigma:10,
+            step_sigma:0.05,
             parse_qp_path:String::from("./qp_energies"),
             fourier_self_energy:false,
             fse_sin_coeff_path:String::from("./fse_sin_coeff.txt"),
@@ -217,6 +229,12 @@ impl QuasiParticle {
         table.insert("save_qp_path".to_string(), toml::Value::String(self.save_qp_path.clone()));
         table.insert("save_first_excitation".to_string(), toml::Value::Boolean(self.save_first_excitation));
         table.insert("save_first_excitation_path".to_string(), toml::Value::String(self.save_first_excitation_path.clone()));
+        table.insert("use_low_rank_contour".to_string(), toml::Value::Boolean(self.use_low_rank_contour));
+        table.insert("low_rank_grid_type".to_string(), toml::Value::String(self.low_rank_grid_type.clone()));
+        table.insert("nomega_chi_real".to_string(), toml::Value::Integer(self.nomega_chi_real as i64));
+        table.insert("low_rank_tolerance".to_string(), toml::Value::Float(self.low_rank_tolerance));
+        table.insert("nomega_sigma".to_string(), toml::Value::Integer(self.nomega_sigma as i64));
+        table.insert("step_sigma".to_string(), toml::Value::Float(self.step_sigma));
         table.insert("fse_sin_coeff_path".to_string(), toml::Value::String(self.fse_sin_coeff_path.clone()));
         table.insert("fse_cos_coeff_path".to_string(), toml::Value::String(self.fse_cos_coeff_path.clone()));
         table.insert("hermite_self_energy".to_string(), toml::Value::Boolean(self.hermite_self_energy));
@@ -486,6 +504,37 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.save_first_excitation_path = match tmp_ctrl.get("save_first_excitation_path").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::from("first_excitation_save.txt"),
+            };
+            tmp_input.use_low_rank_contour = match tmp_ctrl.get("use_low_rank_contour").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                _ => {false},
+            };
+            tmp_input.low_rank_grid_type = match tmp_ctrl.get("low_rank_grid_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => {
+                    let lower = s.to_lowercase();
+                    match lower.as_str() {
+                        "quadratic" => String::from("quadratic"),
+                        _ => String::from("linear"),
+                    }
+                },
+                _ => String::from("linear"),
+            };
+            tmp_input.nomega_chi_real = match tmp_ctrl.get("nomega_chi_real").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(6_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(6) as usize},
+                _ => {6}
+            };
+            tmp_input.low_rank_tolerance = match tmp_ctrl.get("low_rank_tolerance").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-3)},
+                _ => {1e-3},
+            };
+            tmp_input.nomega_sigma = match tmp_ctrl.get("nomega_sigma").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(10) as usize},
+                _ => {10},
+            };
+            tmp_input.step_sigma = match tmp_ctrl.get("step_sigma").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.05)},
+                _ => {0.05},
             };
             tmp_input.parse_qp_path = match tmp_ctrl.get("parse_qp_path").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
