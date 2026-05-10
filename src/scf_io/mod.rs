@@ -280,7 +280,9 @@ impl SCF {
         }
         let disp_from_ctrl = self.mol.ctrl.empirical_dispersion.is_some();
         if disp_from_ctrl || disp_from_parse_xc {
-            let (engy_disp, grad_disp, sigma_disp) = dftd(self);
+            // (energy, grad, sigma); fallback to this default value if dftd evaluation fails
+            let default_disp = (0.0, None, None);
+            let (engy_disp, grad_disp, sigma_disp) = dftd(self).unwrap_or(default_disp);
 
             let disp_name = if disp_from_parse_xc {
                 self.mol.dfadef.as_ref().unwrap().get_dispersion().unwrap().func.clone()

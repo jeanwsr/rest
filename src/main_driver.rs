@@ -236,13 +236,6 @@ pub fn main_driver() -> anyhow::Result<()> {
         _ => {}
     }
 
-    //let mut grad_data = Gradient::build(&scf_data.mol, &scf_data);
-
-    //grad_data.calc_j(&scf_data.density_matrix);
-    //print!("occ, {:?}", scf_data.occupation);
-
-    //time_mark.count("SCF");
-
     if scf_data.mol.ctrl.has_chkfile {
         if let Some(mp_op) = &mpi_operator {
             if mp_op.rank == 0 {
@@ -572,8 +565,8 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         (energy, nforce)
     } else {
         // current available analytical gradients methods:
-        // 1) numerical force
-        // 2) analytical RHF, UHF force
+        // 1) analytical RHF, UHF force
+        // 2) dftd force
         // 
         // disallow post-scf calculations for force
         if scf_data.mol.xc_data.is_fifth_dfa() {
@@ -590,43 +583,72 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
 
         let is_hf = scf_data.mol.ctrl.xc.to_lowercase() == "hf";
 
-        // Please note that this is only a temporary workaround for RHF/UHF gradients.
+        // Please note that this is only a temporary workaround implemented gradients.
         // Totally refactor the following code if necessary if other types of gradients to be implemented.
-        let grad_data: Box<dyn crate::grad::traits::GradAPI> = {
+        use crate::grad::traits::GradAPI;
+
+        // we will collect the gradient data from different components into a list,
+        // and then summarize the total gradient at the end
+        // list of (gradient name, gradient data)
+        let mut grad_data_list: Vec<(String, Box<dyn GradAPI>)> = vec![];
+
+        // 1. self-consistent gradient data
+        let grad_data_scf: Box<dyn crate::grad::traits::GradAPI> = {
             if !scf_data.mol.ctrl.spin_polarization {
-                let mut grad_data = crate::grad::rhf::RIRHFGradient::new(&scf_data);
+                let mut grad_data_scf = crate::grad::rhf::RIRHFGradient::new(&scf_data);
 
                 if is_hf {
-                    grad_data.calc();
+                    grad_data_scf.calc();
                 } else {
-                    grad_data.flags.factor_k = if scf_data.mol.xc_data.dfa_hybrid_scf != 0.0 {
+                    grad_data_scf.flags.factor_k = if scf_data.mol.xc_data.dfa_hybrid_scf != 0.0 {
                         Some(scf_data.mol.xc_data.dfa_hybrid_scf)
                     } else {
                         None
                     };
-                    grad_data.calc_rks();
+                    grad_data_scf.calc_rks();
                 }
 
-                Box::new(grad_data)
+                Box::new(grad_data_scf)
             } else {
-                let mut grad_data = crate::grad::uhf::RIUHFGradient::new(&scf_data);
+                let mut grad_data_scf = crate::grad::uhf::RIUHFGradient::new(&scf_data);
 
                 if is_hf {
-                    grad_data.calc();
+                    grad_data_scf.calc();
                 } else {
-                    grad_data.flags.factor_k = if scf_data.mol.xc_data.dfa_hybrid_scf != 0.0 {
+                    grad_data_scf.flags.factor_k = if scf_data.mol.xc_data.dfa_hybrid_scf != 0.0 {
                         Some(scf_data.mol.xc_data.dfa_hybrid_scf)
                     } else {
                         None
                     };
-                    grad_data.calc_uks();
+                    grad_data_scf.calc_uks();
                 }
                 
-                Box::new(grad_data)
+                Box::new(grad_data_scf)
             }
         };
+        grad_data_list.push(("SCF".into(), grad_data_scf));
 
-        let gradient = grad_data.get_gradient();
+        // 2. dftd gradient data
+        //    we will force to evaluate dftd gradient, since dftd3 is not bottleneck for small to medium molecules
+        use crate::grad::dftd::DFTDGrad;
+        let mut grad_data_dftd = DFTDGrad::new(&scf_data);
+        grad_data_dftd.make_grad();
+        // only append the dftd gradient if dftd really exists
+        if grad_data_dftd.result.is_some() {
+            grad_data_list.push(("DFTD".into(), Box::new(grad_data_dftd)));
+        }
+
+        // summarize the gradient contributions by different components
+        let natm = scf_data.mol.geom.elem.len();
+        let mut gradient = MatrixFull::new([3, natm], 0.0);
+        for (grad_name, grad_data) in grad_data_list.iter() {
+            let grad_contrib = grad_data.get_gradient();
+            gradient.data.iter_mut().zip(grad_contrib.data.iter()).for_each(|(to, from)| {*to += from});
+            if scf_data.mol.ctrl.print_level > 1 {
+                println!("Gradient contribution from {:} [a.u.]:", grad_name);
+                println!("{}", formated_force(&grad_contrib, &scf_data.mol.geom.elem));
+            }
+        }
 
         println!("------ Output gradient [a.u.] ------");
         println!("{}", formated_force(&gradient, &scf_data.mol.geom.elem));
