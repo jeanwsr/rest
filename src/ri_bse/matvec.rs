@@ -280,7 +280,7 @@ pub fn test_v_w_contribution_v01(scf_data:&SCF){
 }
 pub fn a_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_vv:&MatrixFull<f64>,ri_ov:&MatrixFull<f64>,ri_oo_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
     let start=Instant::now();
-    let xlet=if qp_ctrl.bse_spin=="triplet"{'T'}else{'S'};
+    let xlet=if qp_ctrl.bse_spin=="triplet"{'T'}else if qp_ctrl.bse_spin=="singlet"{'S'}else{'R'};
     let mut result=diagonal_elements_contribution(scf_data,z_vec);
     let duration1=start.elapsed();
     if scf_data.mol.ctrl.print_level>1{
@@ -299,16 +299,26 @@ pub fn a_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_vv:&MatrixFull<f64
             println!("库仑操作耗时: {:?}", duration3-duration2);
         }
     }
+    if xlet=='R'{
+        result=coulomb_contribution(ri_ov,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|v_i+z_i).collect();
+        let duration3=start.elapsed();
+        if scf_data.mol.ctrl.print_level>1{
+            println!("库仑操作耗时: {:?}", duration3-duration2);
+        }
+    }
     result
 }
 pub fn b_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_ov_a:&MatrixFull<f64>,ri_ov_b:&MatrixFull<f64>,ri_ov_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
-    let xlet=if qp_ctrl.bse_spin=="triplet"{'T'}else{'S'};
+    let xlet=if qp_ctrl.bse_spin=="triplet"{'T'}else if qp_ctrl.bse_spin=="singlet"{'S'}else{'R'};
     let mut result=vec![0.0;z_vec.len()];
     let mut ri_ov_tilde_old=ri_ov_tilde.clone();
     ri_ov_tilde_old.reshape(ri_ov_a.size);
     result=w_contribution_b_block_dgemm(scf_data,ri_ov_b,z_vec,ri_ov_tilde).iter().zip(result.iter()).map(|(w_i,z_i)|-w_i+z_i).collect();
     if xlet=='S'{
         result=coulomb_contribution(ri_ov_a,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|2.0*v_i+z_i).collect();
+    }
+    if xlet=='R'{
+        result=coulomb_contribution(ri_ov_a,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|v_i+z_i).collect();
     }
     result
 }
