@@ -100,9 +100,9 @@ pub fn bse_main(scf_data:&mut SCF){
                 _ => panic!("invalid choice for bse_spin!"),
             };
             // Print results (same format as below)
-            let number = excitations.len().min(30);
-            println!("First {} excitations:", number);
-            for (n, (e, vec)) in excitations[0..number].iter().enumerate() {
+            let number = excitations.len();
+            println!("{} excitations within the window:", number);
+            for (n, (e, vec)) in excitations[..].iter().enumerate() {
                 println!("#{} Excitation energy={}", n, e);
                 let v = dipoles::normalize(vec, true);
                 let dipole_square = dipoles::transition_dipole_square(&dipole_matrix, &v, true);
@@ -129,13 +129,9 @@ pub fn bse_main(scf_data:&mut SCF){
             if scf_data.mol.ctrl.print_level>2{
                 show_all_eigenpairs(&excitations);
             }
-            if qp_ctrl.bse_davidson_solver==false{
-                let mid = excitations.len() / 2;
-                excitations=excitations[mid..].to_vec();
-            }
-            let number=excitations.len().min(30);
-            println!("First {} excitations:",number);
-            excitations[0..number].iter().enumerate().for_each(|(n,(e,vec))|{println!("#{} Excitation energy={}",n,e);
+            let number=excitations.len();
+            println!("{} excitations within the window:",number);
+            excitations[..].iter().enumerate().for_each(|(n,(e,vec))|{println!("#{} Excitation energy={}",n,e);
             let v=dipoles::normalize(vec,false);
             let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,false);
             println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
@@ -156,9 +152,9 @@ pub fn bse_main(scf_data:&mut SCF){
             if scf_data.mol.ctrl.print_level>2{
                 show_all_eigenpairs(&excitations);
             }
-            let number=excitations.len().min(30);
-            println!("First {} excitations:",number);
-            excitations[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
+            let number=excitations.len();
+            println!("{} excitations within the window:",number);
+            excitations[..].iter().enumerate().for_each(|(n,(e,vec))|{
                 let v=dipoles::normalize(vec,true);
                 println!("#{} Excitation energy={}",n,e);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
@@ -505,7 +501,42 @@ pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:
         println!("BSE Preparation Time:{:?}",preptime);
         let (matr_b_1, wr_1, wi_1,vl_1,vr_1,info_1)=_dgeev(&bse_hamiltonian, 'N', 'V');
         println!("BSE DGEES Time:{:?}",start.elapsed()-preptime);
+        if scf_data.mol.ctrl.print_level > 1 {
+            let n = occ_size * vir_size;
+            let a_mat = construct_submat_a(scf_data, &inverse_dielectric, quasiparticle_energies, xlet);
+            let b_mat = construct_submat_b(scf_data, xlet, &inverse_dielectric);
+            // (A+B) matrix
+            let apb = MatrixFull::add(&a_mat, &b_mat).unwrap();
+            let (_, wr_apb, _, _, _, _) = _dgeev(&apb, 'N', 'N');
+            let min_apb = wr_apb.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+            println!("Minimum eigenvalue of (A+B) matrix: {}", min_apb);
+            if min_apb < 0.0 {
+                println!("WARNING:NEGATIVE EIGENVALUE OF DIAGNOSTIC MATRIX!!!");
+            }
+            // (A-B) matrix
+            let mut neg_b = b_mat.clone();
+            neg_b.self_multiple(-1.0);
+            let amb = MatrixFull::add(&a_mat, &neg_b).unwrap();
+            let (_, wr_amb, _, _, _, _) = _dgeev(&amb, 'N', 'N');
+            let min_amb = wr_amb.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+            println!("Minimum eigenvalue of (A-B) matrix: {}", min_amb);
+            if min_amb < 0.0 {
+                println!("WARNING:NEGATIVE EIGENVALUE OF DIAGNOSTIC MATRIX!!!");
+            }
+            // (A+B)(A-B) matrix
+            let mut apb_amb = MatrixFull::new([n, n], 0.0);
+            _dgemm_full(&apb, 'N', &amb, 'N', &mut apb_amb, 1.0, 0.0);
+            let (_, wr_apb_amb, _, _, _, _) = _dgeev(&apb_amb, 'N', 'N');
+            let min_apb_amb = wr_apb_amb.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+            println!("Minimum eigenvalue of (A+B)(A-B) matrix: {}", min_apb_amb);
+            if min_apb_amb < 0.0 {
+                println!("WARNING:NEGATIVE EIGENVALUE OF DIAGNOSTIC MATRIX!!!");
+            }
+        }
         eigenpairs=zip_and_sort(&wr_1,&vr_1);
+        eigenpairs = eigenpairs.into_iter()
+            .filter(|(val, _)| *val >= qp_ctrl.bse_eigenrange_min && *val <= qp_ctrl.bse_eigenrange_max)
+            .collect();
     }
     eigenpairs
 }
@@ -554,7 +585,10 @@ pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char
         println!("BSE Preparation Time:{:?}",preptime);
         let (matr_b_1, wr_1, wi_1,vl_1,vr_1,info_1)=_dgeev(&tda_bse_hamiltonian, 'N', 'V');
         println!("BSE DGEES Time:{:?}",start.elapsed()-preptime);
-        eigenpairs=zip_and_sort(&wr_1,&vr_1);eigenpairs=zip_and_sort(&wr_1,&vr_1);
+        eigenpairs=zip_and_sort(&wr_1,&vr_1);
+        eigenpairs = eigenpairs.into_iter()
+            .filter(|(val, _)| *val >= qp_ctrl.bse_eigenrange_min && *val <= qp_ctrl.bse_eigenrange_max)
+            .collect();
     }
     eigenpairs
 }
