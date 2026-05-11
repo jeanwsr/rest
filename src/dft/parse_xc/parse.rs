@@ -188,7 +188,14 @@ impl DFAComponent {
             return self.factor;
         } else if self.component_type == ComponentType::Libxc {
             let mut xcfunc = XcFuncType::xc_func_init(self.id, spin_channel);
-            let hyb =  self.factor * xcfunc.get_hybrid();
+            let hybrid_coef = match xcfunc.is_rsh() {
+                false => xcfunc.get_hybrid(),
+                true => {
+                    let (omega, alpha, beta) = xcfunc.xc_hyb_cam_coef();
+                    alpha + beta // for RSH, return alpha + beta (matches pyscf)
+                },
+            };
+            let hyb =  self.factor * hybrid_coef;
             xcfunc.xc_func_end();
             return hyb;
         } else {
@@ -435,6 +442,8 @@ pub struct DFAdef {
     pub reference: Vec<String>,
     pub spin_channel: usize,
     pub dfa_hybrid_scf: f64,
+    // (omega, alpha, beta) in libxc convention; note beta is usually not used in computation.
+    pub dfa_rsh_scf: Option<(f64, f64, f64)>,
     pub dfa_hybrid_nscf: Option<f64>,
 }
 
@@ -447,6 +456,7 @@ impl DFAdef {
             reference: Vec::new(),
             spin_channel: 1,
             dfa_hybrid_scf: 0.0,
+            dfa_rsh_scf: None,
             dfa_hybrid_nscf: None,
         }
     }
@@ -462,9 +472,10 @@ impl DFAdef {
                     },
                     _ => {},
                 }
-            xc_data.dfa_hybrid_scf = self.dfa_hybrid_scf;
             }
         }
+        xc_data.dfa_hybrid_scf = self.dfa_hybrid_scf;
+        xc_data.dfa_rsh_scf = self.dfa_rsh_scf;
         if let Some(nscf_components) = &self.xc_nscf {
             let mut dfa_compnt_pos = Vec::new();
             let mut dfa_paramr_pos = Vec::new();
@@ -532,6 +543,29 @@ impl DFAdef {
         } else {
             0.0
         }
+    }
+
+    pub fn get_rsh_scf(&self, spin_channel: usize) -> Option<(f64, f64, f64)> {
+        // check if any component in self.xc is RSH, if so, return (omega, alpha, beta)
+        let mut result = None;
+        if let Some(components) = &self.xc_scf {
+            for comp in components.iter() {
+                if comp.is_rsh() {
+                    let mut xcfunc = XcFuncType::xc_func_init(comp.id, spin_channel);
+                    let (omega, alpha, beta) = xcfunc.xc_hyb_cam_coef();
+                    // only if alpha and beta are both close to zero, we consider it as not range-separated (pure zero).
+                    if alpha.abs() < 1e-10 && beta.abs() < 1e-10 {
+                        continue;
+                    }
+                    if result.is_some() {
+                        panic!("Multiple RSH functionals are specified in the DFA components for SCF. Currently this is not supported.");
+                    }
+                    xcfunc.xc_func_end();
+                    result = Some((omega, alpha, beta));
+                }
+            }
+        }
+        result
     }
 
     pub fn get_hybrid_nscf(&self, spin_channel: usize) -> f64 {
@@ -612,9 +646,6 @@ impl DFAdef {
 
     pub fn check_sanity(&self) -> (bool, Vec<String>) {
         let mut err_strings = Vec::new();
-        if self.is_rsh() {
-            err_strings.push("Error: range-separated hybrid functionals are not supported in current implementation".to_string());
-        }
         if self.is_nlc() {
             err_strings.push("Error: non-local correlation functionals are not supported in current implementation".to_string());
         }
@@ -759,6 +790,7 @@ pub fn parse_and_derive(xc: &str, spin_channel: usize, print_level: usize) -> DF
     // restore intermediate variables
     // dfa.init_libxc();
     dfa.dfa_hybrid_scf = dfa.get_hybrid_scf(spin_channel);
+    dfa.dfa_rsh_scf = dfa.get_rsh_scf(spin_channel);
     if dfa.has_nscf() {
         dfa.dfa_hybrid_nscf = Some(dfa.get_hybrid_nscf(spin_channel));
     }

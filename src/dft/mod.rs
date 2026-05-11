@@ -71,6 +71,8 @@ pub struct DFA4REST {
     pub dfa_compnt_scf: Vec<usize>,
     pub dfa_paramr_scf: Vec<f64>,
     pub dfa_hybrid_scf: f64,
+    // (omega, alpha, beta) in libxc convention; note beta is usually not used in computation.
+    pub dfa_rsh_scf: Option<(f64, f64, f64)>,
     pub dfa_family_pos: Option<DFAFamily>,
     pub dfa_compnt_pos: Option<Vec<usize>>,
     pub dfa_paramr_pos: Option<Vec<f64>>,
@@ -136,7 +138,8 @@ impl DFA4REST {
             spin_channel, 
             dfa_compnt_scf: vec![], 
             dfa_paramr_scf: vec![], 
-            dfa_hybrid_scf: 0.0, 
+            dfa_hybrid_scf: 0.0,
+            dfa_rsh_scf: None,
             dfa_family_pos: None, 
             dfa_compnt_pos: None, 
             dfa_paramr_pos: None, 
@@ -150,6 +153,11 @@ impl DFA4REST {
         println!("SCF DFA components: {:?}", self.dfa_compnt_scf);
         println!("SCF DFA parameters: {:?}", self.dfa_paramr_scf);
         println!("SCF DFA hybrid coeff: {:16.8}", self.dfa_hybrid_scf);
+        if self.is_rsh() {
+            println!("Range-Separated Hybrid parameters:");
+            println!("  omega: {:16.8}", self.omega().unwrap());
+            println!("  alpha (LR-HF coeff): {:16.8}", self.rsh_alpha().unwrap());
+        }
         if let Some(dfatype) = &self.dfa_family_pos {
             println!("Post-SCF DFA family: {}", dfatype.to_name());
             if let Some(dfacomp) = &self.dfa_compnt_pos {
@@ -243,6 +251,7 @@ impl DFA4REST {
             dfa_compnt_scf,
             dfa_paramr_scf,
             dfa_hybrid_scf,
+            dfa_rsh_scf: None,
         }
     }
 
@@ -340,6 +349,18 @@ impl DFA4REST {
             [0,450,236]
         } else if lower_name.eq(&"mn15".to_string()) {
             [0,268,269]
+        } else if lower_name.eq(&"wb97x".to_string()) {
+            [464,0,0]
+        } else if lower_name.eq(&"cam-b3lyp".to_string()) || lower_name.eq(&"camb3lyp".to_string()) {
+            [433,0,0]
+        } else if lower_name.eq(&"lc-blyp".to_string()) || lower_name.eq(&"lcblyp".to_string()) {
+            [400,0,0]
+        } else if lower_name.eq(&"lc-wpbe".to_string()) || lower_name.eq(&"lcwpbe".to_string()) {
+            [478,0,0]
+        } else if lower_name.eq(&"hse06".to_string()) || lower_name.eq(&"hse".to_string()) {
+            [428,0,0]
+        } else if lower_name.eq(&"hse03".to_string()) {
+            [427,0,0]
         } else if lower_name.eq(&"lda_x_slater".to_string()) {
             [0,1,0]
         } else {
@@ -354,7 +375,7 @@ impl DFA4REST {
                     }
                 }
             }
-            panic!("Unknown XC method is specified: {}.", &name);
+            panic!("Unknown XC method is specified: {}. You can try using `xc_parser = \"parse_xc\"` and see if works in the ctrl.in input configuration.", &name);
         }
     }
 
@@ -380,25 +401,70 @@ impl DFA4REST {
     }
 
     pub fn get_hybrid_libxc(dfa_compnt_scf: &Vec<usize>,spin_channel:usize) -> f64 {
-        let hybrid_list = dfa_compnt_scf
-            .iter()
-            .filter(|xc_func| {XcFuncType::xc_func_init(**xc_func,spin_channel).use_exact_exchange()})
-            .map(|xc_func| {XcFuncType::xc_func_init(*xc_func,spin_channel).xc_hyb_exx_coeff()}).collect_vec();
-        //let count = hybrid_list.iter().fold(0,|acc, x| {if ! x.eq(&0.0) acc + 1});
-        let hybrid_coeff = if hybrid_list.len() == 1 {
-            hybrid_list[0]
-        } else {
-            0.0
-        };
-        hybrid_coeff
+        let mut hybrid_coeff = None;
+        for xc_func in dfa_compnt_scf {
+            let func = XcFuncType::xc_func_init(*xc_func, spin_channel);
+            if func.use_exact_exchange() {
+                let hyb_exx_coeff = match func.is_rsh() {
+                    false => func.xc_hyb_exx_coeff(),
+                    true => {
+                        let (omega, alpha, beta) = func.xc_hyb_cam_coef();
+                        // for RSH, we consider the hybrid coeff as alpha + beta (matches pyscf)
+                        alpha + beta
+                    }
+                };
+                if hyb_exx_coeff.abs() > 1e-10 {
+                    if hybrid_coeff.is_some() {
+                        panic!("Multiple hybrid functionals are specified in the DFA components for SCF. Currently this is not supported.");
+                    }
+                    hybrid_coeff = Some(hyb_exx_coeff);
+                }
+            }
+        }
+        hybrid_coeff.unwrap_or(0.0)
+    }
+
+    pub fn get_rsh_libxc(dfa_compnt_scf: &Vec<usize>, spin_channel: usize) -> Option<(f64, f64, f64)> {
+        let mut result = None;
+        for xc_func in dfa_compnt_scf {
+            let func = XcFuncType::xc_func_init(*xc_func, spin_channel);
+            if func.is_rsh() {
+                let (omega, alpha, beta) = func.xc_hyb_cam_coef();
+                // only if alpha and beta are both close to zero, we consider it as not range-separated (pure zero).
+                if alpha.abs() < 1e-10 && beta.abs() < 1e-10 {
+                    continue;
+                }
+                if result.is_some() {
+                    panic!("Multiple RSH functionals are specified in the DFA components for SCF. Currently this is not supported.");
+                }
+                result = Some((omega, alpha, alpha + beta));
+            }
+        }
+        result
+    }
+
+    pub fn is_rsh(&self) -> bool {
+        self.omega().is_some()
+    }
+
+    pub fn omega(&self) -> Option<f64> {
+        self.rsh_params().map(|(omega, _, _)| omega)
+    }
+
+    pub fn rsh_alpha(&self) -> Option<f64> {
+        self.rsh_params().map(|(_, alpha, _)| alpha)
+    }
+
+    pub fn rsh_params(&self) -> Option<(f64, f64, f64)> {
+        self.dfa_rsh_scf
     }
 
     pub fn parse_scf(name: &str, spin_channel: usize) -> DFA4REST {
         let tmp_name = name.to_lowercase();
-        //let dfa_compnt_scf = vec![libxc::XcFuncType::xc_func_init_fdqc(&tmp_name, spin_channel)];
         let dfa_compnt_scf = DFA4REST::xc_func_init_fdqc(&tmp_name, spin_channel);
         let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf,spin_channel);
         let dfa_paramr_scf =  vec![1.0;dfa_compnt_scf.len()];
+        let dfa_rsh_scf = DFA4REST::get_rsh_libxc(&dfa_compnt_scf, spin_channel);
 
         DFA4REST {
             spin_channel,
@@ -410,6 +476,7 @@ impl DFA4REST {
             dfa_compnt_scf,
             dfa_paramr_scf,
             dfa_hybrid_scf,
+            dfa_rsh_scf,
         }
     }
 
@@ -441,6 +508,7 @@ impl DFA4REST {
             dfa_compnt_scf,
             dfa_paramr_scf,
             dfa_hybrid_scf: *dfa_hybrid_scf,
+            dfa_rsh_scf: None,
         }
     }
 
@@ -474,7 +542,8 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("xygjos") {
             // XYGJ-OS functional
@@ -510,7 +579,8 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("xyg7") {
             // XYG7 functional 
@@ -546,7 +616,9 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
+
             })
         } else if tmp_name.eq("xyg2") {
             // XYG2 functional
@@ -577,7 +649,8 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("xdh-pbe0") {
             // xDH-PBE0 functional
@@ -610,7 +683,8 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("zrps") {
             // ZRPS
@@ -641,7 +715,8 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("rpa@b3lyp") {
             let dfa_family_pos = Some(DFAFamily::RPA);
@@ -666,7 +741,8 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("rpa@pbe") {
             let dfa_family_pos = Some(DFAFamily::RPA);
@@ -691,7 +767,8 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("scsrpa") {
             // scsRPA
@@ -718,7 +795,8 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("r-xdh7") {
             // R-xDH7
@@ -748,7 +826,8 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("mp2") {
             let dfa_family_pos = Some(DFAFamily::PT2);
@@ -772,7 +851,8 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("scs-mp2") {
             let dfa_family_pos = Some(DFAFamily::PT2);
@@ -799,7 +879,8 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("b2plyp") {
             // below are some popular B2PLYP-type DH functionals
@@ -829,6 +910,7 @@ impl DFA4REST {
                 dfa_compnt_pos,
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("b2gpplyp") {
             // B2GP-PLYP
@@ -857,6 +939,7 @@ impl DFA4REST {
                 dfa_compnt_pos,
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("pbe-qidh") {
             // PBE-QIDH
@@ -884,6 +967,7 @@ impl DFA4REST {
                 dfa_compnt_pos,
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("pbe0dh") {
             // PBE0-DH
@@ -911,6 +995,7 @@ impl DFA4REST {
                 dfa_compnt_pos,
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("dsdpbep86-nodisp") {
             // DSD-PBEP86
@@ -938,6 +1023,7 @@ impl DFA4REST {
                 dfa_compnt_pos,
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("dsdpbep86") {
             // DSD-PBEP86-D3BJ
@@ -965,6 +1051,7 @@ impl DFA4REST {
                 dfa_compnt_pos,
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("dsdblyp") {
             // DSD-BLYP-D3BJ
@@ -992,6 +1079,7 @@ impl DFA4REST {
                 dfa_compnt_pos,
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("dsdpbeb95") {
             // DSD-PBEB95-D3BJ
@@ -1019,6 +1107,7 @@ impl DFA4REST {
                 dfa_compnt_pos,
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("r-xyg3") {
             // Renormalized XYG3 functional (experimental)
@@ -1049,7 +1138,8 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("r-xygjos") {
             // Renormalized XYGJOS functional (experimental)
@@ -1086,7 +1176,8 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("r-xyg7") {
             // Renormalized XYG7 functional (experimental)
@@ -1123,7 +1214,8 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else if tmp_name.eq("r-xyg2") {
             // Renormalized XYG2 functional (experimental)
@@ -1152,7 +1244,8 @@ impl DFA4REST {
                 dfa_family_pos,
                 dfa_compnt_pos,
                 dfa_paramr_pos,
-                dfa_hybrid_pos
+                dfa_hybrid_pos,
+                dfa_rsh_scf: None,
             })
         } else {
             None
@@ -1164,7 +1257,7 @@ impl DFA4REST {
     }
 
     pub fn is_hybrid(&self) -> bool {
-        self.dfa_hybrid_scf.abs() >= 1.0e-6
+        self.dfa_hybrid_scf.abs() >= 1.0e-6 || self.is_rsh()
     }
 
     pub fn is_fifth_dfa(&self) -> bool {
@@ -4062,4 +4155,216 @@ fn debug_transpose() {
 fn test_balancing() {
     let dd = balancing(550, 23);
     println!("{:?}",dd);
+}
+
+#[test]
+fn test_rsh_cam_coeff_raw() {
+    // Test raw libxc CAM coefficients match pyscf expectations
+    // Each entry: (libxc_id, expected_omega, expected_alpha, expected_beta, expected_hyb)
+    // hyb = alpha + beta (pyscf convention for RSH)
+    let ref_data = vec![
+        (464, 0.300, 1.0, -0.842294, 0.157706),    // WB97X
+        (466, 0.300, 1.0, -0.833,    0.167),        // WB97X-V
+        (471, 0.200, 1.0, -0.777964, 0.222036),     // WB97X-D
+        (433, 0.330, 0.65, -0.46,   0.19),          // CAM-B3LYP
+        (400, 0.330, 1.0, -1.0,     0.0),           // LC-BLYP
+        (478, 0.400, 1.0, -1.0,     0.0),           // LC-wPBE
+        (428, 0.110, 0.0,  0.25,    0.25),          // HSE06
+        (427, 0.1061, 0.0, 0.25,    0.25),          // HSE03
+    ];
+
+    for (libxc_id, exp_omega, exp_alpha, exp_beta, exp_hyb) in &ref_data {
+        let func = XcFuncType::xc_func_init(*libxc_id, 1);
+        assert!(func.is_rsh(), "ID {} should be RSH/CAM", libxc_id);
+        let (omega, alpha, beta) = func.xc_hyb_cam_coef();
+        let hyb = alpha + beta;
+        assert!((omega - exp_omega).abs() < 1e-3, "ID {}: omega mismatch: got {} expected {}", libxc_id, omega, exp_omega);
+        assert!((alpha - exp_alpha).abs() < 1e-3, "ID {}: alpha mismatch: got {} expected {}", libxc_id, alpha, exp_alpha);
+        assert!((beta - exp_beta).abs() < 1e-3, "ID {}: beta mismatch: got {} expected {}", libxc_id, beta, exp_beta);
+        assert!((hyb - exp_hyb).abs() < 1e-4, "ID {}: hyb mismatch: got {} expected {}", libxc_id, hyb, exp_hyb);
+        println!("ID {}: omega={:.4} alpha={:.4} beta={:+.4} hyb={:.6}  OK", libxc_id, omega, alpha, beta, hyb);
+    }
+    println!("All {} RSH libxc raw CAM coefficient tests passed.", ref_data.len());
+}
+
+#[test]
+fn test_rsh_parameters_wb97x_v() {
+    let dfa = DFA4REST::new("wb97x-v", 1, 0);
+    assert!(dfa.is_hybrid(), "wB97X-V should be hybrid");
+    assert!(dfa.is_rsh(), "wB97X-V should be range-separated");
+    assert!((dfa.omega().unwrap() - 0.3).abs() < 1e-9, "omega should be 0.3, got {}", dfa.omega().unwrap());
+    assert!((dfa.rsh_alpha().unwrap() - 1.0).abs() < 1e-9, "alpha should be 1.0, got {}", dfa.rsh_alpha().unwrap());
+    assert!((dfa.dfa_hybrid_scf - 0.167).abs() < 1e-5, "hyb should be ~0.167, got {}", dfa.dfa_hybrid_scf);
+    assert_eq!(dfa.dfa_compnt_scf, vec![466], "component should be [466]");
+}
+
+#[test]
+fn test_rsh_parameters_wb97x() {
+    let dfa = DFA4REST::new("wb97x", 1, 0);
+    assert!(dfa.is_hybrid());
+    assert!(dfa.is_rsh());
+    assert!((dfa.omega().unwrap() - 0.3).abs() < 1e-9);
+    assert!((dfa.rsh_alpha().unwrap() - 1.0).abs() < 1e-9);
+    assert!((dfa.dfa_hybrid_scf - 0.157706).abs() < 1e-5);
+    assert_eq!(dfa.dfa_compnt_scf, vec![464]);
+}
+
+#[test]
+fn test_rsh_parameters_wb97x_d() {
+    let dfa = DFA4REST::new("wb97x-d", 1, 0);
+    assert!(dfa.is_hybrid());
+    assert!(dfa.is_rsh());
+    assert!((dfa.omega().unwrap() - 0.2).abs() < 1e-9);
+    assert!((dfa.rsh_alpha().unwrap() - 1.0).abs() < 1e-9);
+    assert!((dfa.dfa_hybrid_scf - 0.222036).abs() < 1e-5);
+    assert_eq!(dfa.dfa_compnt_scf, vec![471]);
+}
+
+#[test]
+fn test_rsh_parameters_cam_b3lyp() {
+    let dfa = DFA4REST::new("cam-b3lyp", 1, 0);
+    assert!(dfa.is_hybrid());
+    assert!(dfa.is_rsh());
+    assert!((dfa.omega().unwrap() - 0.33).abs() < 1e-9);
+    assert!((dfa.rsh_alpha().unwrap() - 0.65).abs() < 1e-5);
+    assert!((dfa.dfa_hybrid_scf - 0.19).abs() < 1e-5);
+    assert_eq!(dfa.dfa_compnt_scf, vec![433]);
+    // also test case variation
+    let dfa2 = DFA4REST::new("CAM-B3LYP", 1, 0);
+    assert!((dfa.omega().unwrap() - dfa2.omega().unwrap()).abs() < 1e-9);
+    assert!((dfa.dfa_hybrid_scf - dfa2.dfa_hybrid_scf).abs() < 1e-9);
+}
+
+#[test]
+fn test_rsh_parameters_lc_blyp() {
+    let dfa = DFA4REST::new("lc-blyp", 1, 0);
+    assert!(dfa.is_hybrid());
+    assert!(dfa.is_rsh());
+    assert!((dfa.omega().unwrap() - 0.33).abs() < 1e-9);
+    assert!((dfa.rsh_alpha().unwrap() - 1.0).abs() < 1e-9);
+    // LC-BLYP has hyb=0 (alpha=1, beta=-1 → hyb=0, LR-only HF)
+    assert!((dfa.dfa_hybrid_scf - 0.0).abs() < 1e-8);
+    assert_eq!(dfa.dfa_compnt_scf, vec![400]);
+}
+
+#[test]
+fn test_rsh_parameters_hse06() {
+    let dfa = DFA4REST::new("hse06", 1, 0);
+    assert!(dfa.is_hybrid());
+    assert!(dfa.is_rsh());
+    assert!((dfa.omega().unwrap() - 0.11).abs() < 1e-9);
+    // HSE06 has alpha=0 (no additional LR-HF), beta=0.25 (SR-HF only)
+    assert!((dfa.rsh_alpha().unwrap() - 0.0).abs() < 1e-5);
+    assert!((dfa.dfa_hybrid_scf - 0.25).abs() < 1e-5);
+    assert_eq!(dfa.dfa_compnt_scf, vec![428]);
+}
+
+#[test]
+fn test_non_rsh_b3lyp() {
+    let dfa = DFA4REST::new("b3lyp", 1, 0);
+    assert!(dfa.is_hybrid(), "B3LYP should be hybrid");
+    assert!(!dfa.is_rsh(), "B3LYP should NOT be range-separated");
+    assert_eq!(dfa.omega().unwrap(), 0.0);
+    assert_eq!(dfa.rsh_alpha().unwrap(), 0.0);
+}
+
+#[test]
+fn test_non_rsh_pbe() {
+    let dfa = DFA4REST::new("pbe", 1, 0);
+    assert!(!dfa.is_hybrid());
+    assert!(!dfa.is_rsh());
+    assert_eq!(dfa.omega().unwrap(), 0.0);
+    assert_eq!(dfa.rsh_alpha().unwrap(), 0.0);
+    assert_eq!(dfa.dfa_hybrid_scf, 0.0);
+}
+
+#[test]
+fn test_wb97x_case_insensitive() {
+    let names = ["wb97x-v", "WB97X-V", "Wb97x-V", "wb97X-v"];
+    let mut dfas = vec![];
+    for name in &names {
+        dfas.push(DFA4REST::new(name, 1, 0));
+    }
+    for i in 1..dfas.len() {
+        assert!((dfas[0].omega().unwrap() - dfas[i].omega().unwrap()).abs() < 1e-9);
+        assert!((dfas[0].rsh_alpha().unwrap() - dfas[i].rsh_alpha().unwrap()).abs() < 1e-9);
+        assert!((dfas[0].dfa_hybrid_scf - dfas[i].dfa_hybrid_scf).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn test_rsh_spin_polarized() {
+    // Test RSH initialization with spin=2 (open-shell)
+    let dfa_closed = DFA4REST::new("wb97x-v", 1, 0);
+    let dfa_open = DFA4REST::new("wb97x-v", 2, 0);
+    // RSH parameters should be spin-independent
+    assert!((dfa_closed.omega().unwrap() - dfa_open.omega().unwrap()).abs() < 1e-9);
+    assert!((dfa_closed.rsh_alpha().unwrap() - dfa_open.rsh_alpha().unwrap()).abs() < 1e-9);
+    assert!((dfa_closed.dfa_hybrid_scf - dfa_open.dfa_hybrid_scf).abs() < 1e-9);
+}
+
+#[test]
+fn test_rsh_hyb_override() {
+    // Verify that for RSH functionals, dfa_hybrid_scf is overridden to alpha+beta
+    // NOT the raw xc_hyb_exx_coeff (which may return 1.0)
+    let dfa = DFA4REST::new("lc-blyp", 1, 0);
+    // LC-BLYP: raw xc_hyb_exx_coef = 1.0 (because it's a hybrid),
+    // but alpha+beta = 0.0 (pure LR-HF, no SR-HF)
+    // The override should set hyb to 0.0
+    assert!((dfa.dfa_hybrid_scf - 0.0).abs() < 1e-8,
+        "LC-BLYP hyb should be 0 (alpha+beta=0), got {}", dfa.dfa_hybrid_scf);
+
+    let dfa2 = DFA4REST::new("cam-b3lyp", 1, 0);
+    // CAM-B3LYP: raw xc_hyb_exx_coef = ?, alpha+beta = 0.19
+    assert!((dfa2.dfa_hybrid_scf - 0.19).abs() < 1e-3,
+        "CAM-B3LYP hyb should be ~0.19 (alpha+beta), got {}", dfa2.dfa_hybrid_scf);
+}
+
+#[test]
+fn test_rsh_nonstd_parse() {
+    // Test parse_scf_nonstd with RSH components (e.g. custom mixing)
+    let dfa = DFA4REST::parse_scf_nonstd(
+        &vec!["HYB_GGA_XC_WB97X_V".to_string()],
+        &vec![0.5],  // 50% scaling
+        &0.167,       // hyb = alpha+beta
+        1,
+    );
+    assert!(dfa.is_rsh(), "Nonstd WB97X-V should be RSH");
+    assert!((dfa.omega().unwrap() - 0.3).abs() < 1e-9);
+    assert!((dfa.rsh_alpha().unwrap() - 1.0).abs() < 1e-9);
+    assert!((dfa.dfa_hybrid_scf - 0.167).abs() < 1e-5);
+
+    // Test with HSE06 nonstd
+    let dfa2 = DFA4REST::parse_scf_nonstd(
+        &vec!["HYB_GGA_XC_HSE06".to_string()],
+        &vec![1.0],
+        &0.25,
+        1,
+    );
+    assert!(dfa2.is_rsh());
+    assert!((dfa2.omega().unwrap() - 0.11).abs() < 1e-9);
+    assert!((dfa2.rsh_alpha().unwrap() - 0.0).abs() < 1e-5);
+}
+
+#[test]
+fn test_rsh_summary_does_not_panic() {
+    // Ensure summary() works without panicking for RSH and non-RSH
+    for name in &["wb97x-v", "cam-b3lyp", "lc-blyp", "hse06", "b3lyp", "pbe"] {
+        let dfa = DFA4REST::new(name, 1, 0);
+        dfa.summary();
+    }
+}
+
+#[test]
+fn test_all_rsh_via_auto_resolver() {
+    // Test that the auto-resolver (generic libxc name lookup) works for RSH
+    let dfa = DFA4REST::new("HYB_GGA_XC_WB97X_V", 1, 0);
+    assert!(dfa.is_rsh());
+    assert!((dfa.omega().unwrap() - 0.3).abs() < 1e-9);
+    assert_eq!(dfa.dfa_compnt_scf, vec![466]);
+
+    let dfa2 = DFA4REST::new("HYB_GGA_XC_HSE06", 1, 0);
+    assert!(dfa2.is_rsh());
+    assert!((dfa2.omega().unwrap() - 0.11).abs() < 1e-9);
+    assert_eq!(dfa2.dfa_compnt_scf, vec![428]);
 }

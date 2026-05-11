@@ -44,10 +44,12 @@ pub struct SCF {
     //pub ijkl: Option<ERIFull<f64>>,
     pub ijkl: Option<ERIFold4<f64>>,
     pub ri3fn: Option<RIFull<f64>>,
+    pub ri3fn_lr: Option<RIFull<f64>>,
     pub ri3fn_isdf: Option<RIFull<f64>>,
     pub tab_ao: Option<MatrixFull<f64>>,
     pub m: Option<MatrixFull<f64>>,
     pub rimatr: Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
+    pub rimatr_lr: Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
     pub ri3mo: Option<Vec<(RIFull<f64>,std::ops::Range<usize> , std::ops::Range<usize>)>>,
     pub ri3mo_full:Option<Vec<(RIFull<f64>,std::ops::Range<usize> , std::ops::Range<usize>)>>,
     pub ri3fn_bse: Option<RIFull<f64>>,
@@ -104,10 +106,12 @@ impl SCF {
             h_core: MatrixUpper::new(1,0.0),
             ijkl: None,
             ri3fn: None,
+            ri3fn_lr: None,
             ri3fn_isdf: None,
             tab_ao: None,
             m: None,
             rimatr: None,
+            rimatr_lr: None,
             ri3mo: None,
             ri3mo_full:None,
             ri3fn_bse: None,
@@ -206,8 +210,10 @@ impl SCF {
             println!("Checking memory requirement for RI J/K algorithms...");
             let nao = mol.num_basis;
             let naux = mol.num_auxbas;
+            // range-separate hybrid functionals requires double memory for RI integrals due to the need of both standard RI and long-range RI integrals.
+            let scale_rsh = if mol.xc_data.is_rsh() { 2.0 } else { 1.0 };
             // TODO: for safety, we add factor 1.5 to the memory requirement
-            let mem_cderi_mb = 1.5 * 8.0 * (0.5 * (nao * nao * naux) as f64) / 1024.0 / 1024.0;
+            let mem_cderi_mb = 1.5 * scale_rsh * 8.0 * (0.5 * (nao * nao * naux) as f64) / 1024.0 / 1024.0;
             let mem_avail_mb = mol.ctrl.max_memory.map(|max_memory| {
                 max_memory - detect_used_memory_mb("proc")
             }).unwrap_or_else(detect_available_memory_mb);
@@ -407,35 +413,57 @@ impl SCF {
         let ri3fn_full = if use_eri_jk {self.mol.ctrl.use_auxbas && !self.mol.ctrl.use_ri_symm} else {false};
         let ri3fn_symm = if use_eri_jk {self.mol.ctrl.use_auxbas && self.mol.ctrl.use_ri_symm} else{false};
 
-        // preparing the three-center integrals in the full format
-        self.ri3fn = if ri3fn_full && !isdf {
-            Some(self.mol.prepare_ri3fn_for_ri_v_full_rayon())
-        }else if self.mol.ctrl.isdf_k_only{ 
-            Some(self.mol.prepare_ri3fn_for_ri_v_full_rayon())
-        }else {
-            None
-        };
+        let is_rsh = self.mol.xc_data.is_rsh();
 
-        // preparing the three-center integrals using the symmetry
-        self.rimatr = if ri3fn_symm  && ! isdf {
+        // For RSH: J uses on-the-fly shell-based ERI (generate_vj_on_the_fly_par).
+        // K_full still needs standard rimatr (generate_vk_ri_direct has unresolved RSTSR bug).
+        // K_erfc uses rimatr_lr.
+        // TODO: when generate_vk_ri_direct is fixed, add `if !is_rsh` to skip standard rimatr for RSH.
+        {
+            // preparing the three-center integrals in the full format
+            self.ri3fn = if ri3fn_full && !isdf {
+                Some(self.mol.prepare_ri3fn_for_ri_v_full_rayon())
+            } else if self.mol.ctrl.isdf_k_only {
+                Some(self.mol.prepare_ri3fn_for_ri_v_full_rayon())
+            } else {
+                None
+            };
 
-            // initialize the mpi distribution information for num_auxbas and num_baspar
-            if let Some(local_mpi) = &mut self.mol.mpi_data {
-                let num_auxbas = self.mol.num_auxbas;
-                let num_basis = self.mol.num_basis;
-                let cint_bas = self.mol.cint_fdqc.clone();
-                local_mpi.distribute_rimatr_tasks(num_auxbas, num_basis, cint_bas);
+            // preparing the three-center integrals using the symmetry
+            self.rimatr = if ri3fn_symm && !isdf {
+                // initialize the mpi distribution information for num_auxbas and num_baspar
+                if let Some(local_mpi) = &mut self.mol.mpi_data {
+                    let num_auxbas = self.mol.num_auxbas;
+                    let num_basis = self.mol.num_basis;
+                    let cint_bas = self.mol.cint_fdqc.clone();
+                    local_mpi.distribute_rimatr_tasks(num_auxbas, num_basis, cint_bas);
+                }
+                let (rimatr, basbas2baspar, baspar2basbas) =
+                    self.mol.prepare_rimatr_for_ri_v_mpi_rayon(None, mpi_operator);
+                Some((rimatr, basbas2baspar, baspar2basbas))
+            } else if ri3fn_symm && isdf {
+                None
+            } else {
+                None
+            };
+        }
+
+        // build long-range 3c RI integrals for range-separated hybrid (RSH) functionals
+        if is_rsh && use_eri_jk {
+            let omega = self.mol.xc_data.omega().unwrap();
+            if self.mol.ctrl.print_level > 0 {
+                println!("Building long-range 3c RI integrals for RSH (omega = {:.4})", omega);
             }
-
-            let (rimatr, basbas2baspar, baspar2basbas) = 
-                self.mol.prepare_rimatr_for_ri_v_mpi_rayon(mpi_operator);
-            Some((rimatr, basbas2baspar, baspar2basbas))
-        } else if ri3fn_symm  && isdf {
-            None
-        } else {
-            None
-        };
-
+            if ri3fn_symm {
+                // Note: LR RI omega is negative in libcint's convention.
+                self.rimatr_lr = Some(self.mol.prepare_rimatr_for_ri_v_mpi_rayon(Some(-omega), mpi_operator));
+            } else {
+                self.ri3fn_lr = Some(self.mol.prepare_ri3fn_lr_rayon(omega));
+            }
+            if self.mol.ctrl.print_level > 0 {
+                println!("  LR 3c integrals built.");
+            }
+        }
 
         // initial eigenvectors and eigenvalues
         let (eigenvectors, eigenvalues,n_found)=self.ovlp.to_matrixupperslicemut().lapack_dspevx().unwrap();
@@ -493,7 +521,7 @@ impl SCF {
             }
 
             let (rimatr, basbas2baspar, baspar2basbas) =
-                self.mol.prepare_rimatr_for_ri_v_mpi_rayon(mpi_operator);
+                self.mol.prepare_rimatr_for_ri_v_mpi_rayon(None, mpi_operator);
             self.rimatr_bse = Some((rimatr, basbas2baspar, baspar2basbas));
         } else {
             self.ri3fn_bse = Some(self.mol.prepare_ri3fn_for_ri_v_full_rayon());
@@ -1823,7 +1851,7 @@ impl SCF {
         } else {
             match self.algorithm_jk {
                 AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
-                AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None),
+                AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None, None),
                 _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             }
         };
@@ -2000,63 +2028,94 @@ impl SCF {
         let mut exc_total = 0.0;
         let mut vxc_total = 0.0;
         let mut vk_total = 0.0;
-        //let homo = &self.homo;
+
         for i_spin in (0..spin_channel) {
             self.hamiltonian[i_spin] = self.h_core.clone();
         }
+
+        // Coulomb J
         let dt1 = time::Local::now();
-        //let use_eri = self.mol.xc_data.use_eri() || self.mol.xc_dat;
-        //let use_eri = true;
         let vj = match self.algorithm_jk {
             AlgorithmJK::RiIncore | AlgorithmJK::Separated(AlgorithmJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
             AlgorithmJK::RiDirect | AlgorithmJK::Separated(AlgorithmJ::RiDirect, _) => self.generate_vj_ri_direct(None),
             _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
         };
-        //// ==== DEBUG IGOR ====
-        //if let Some(mpi_op) = &mpi_operator {
-        //    if mpi_op.rank == 0 {
-        //        vj[0].formated_output(5, "full");
-        //    }
-        //} else {
-        //    vj[0].formated_output(5, "full");
-        //}
-        //// ==== DEBUG IGOR ====
+
         for i_spin in (0..spin_channel) {
-            self.hamiltonian[i_spin].data
-                .par_iter_mut()
-                .zip(vj[0].data.par_iter())
-                .for_each(|(h_ij,vj_ij)| {
-                    *h_ij += vj_ij
-                });
-            self.hamiltonian[i_spin].data
-                .par_iter_mut()
-                .zip(vj[1].data.par_iter())
-                .for_each(|(h_ij,vj_ij)| {
-                    *h_ij += vj_ij
-                });
+            self.hamiltonian[i_spin].data.par_iter_mut()
+                .zip(vj[0].data.par_iter()).for_each(|(h,v)| *h += v);
+            self.hamiltonian[i_spin].data.par_iter_mut()
+                .zip(vj[1].data.par_iter()).for_each(|(h,v)| *h += v);
         }
+
         let dt2 = time::Local::now();
-        let scaling_factor = match self.scftype {
-            SCFType::RHF => -0.5,
-            _ => -1.0,
-        }*self.mol.xc_data.dfa_hybrid_scf ;
-        if ! scaling_factor.eq(&0.0) {
-            let use_dm_only = self.mol.ctrl.use_dm_only;
-            //self.mol.ctrl.use_dm_only
-            // let vk = self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator);
-            let vk = match self.algorithm_jk {
-                AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
-                AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None),
-                _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
-            };
-            for i_spin in (0..spin_channel) {
-                self.hamiltonian[i_spin].data
-                    .par_iter_mut()
-                    .zip(vk[i_spin].data.par_iter())
-                    .for_each(|(h_ij,vk_ij)| {
-                        *h_ij += vk_ij
-                    });
-            };
+
+        // Standard hybrid exchange: K_total = hyb * K_full + (alpha-hyb) * K_erf
+        // Since we have K_erfc (from LR rimatr), K_erf = K_full - K_erfc
+        // So: K_total = alpha * K_full - (alpha-hyb) * K_erfc
+        // F_ex = base_scaling * alpha * K_full + (-base_scaling) * (alpha-hyb) * K_erfc
+        let base_scaling = match self.scftype { SCFType::RHF => -0.5, _ => -1.0 };
+
+        if let Some((omega, alpha, _)) = self.mol.xc_data.rsh_params() {
+            let hyb = self.mol.xc_data.dfa_hybrid_scf;
+            let scaling_kfull = base_scaling * alpha;            // alpha * K_full
+            let scaling_klr = -base_scaling * (alpha - hyb);    // - (alpha-hyb) * K_erfc  (note: sign flipped)
+
+            // Full K: alpha * K_full
+            if scaling_kfull.abs() > 1e-10 {
+                let use_dm_only = self.mol.ctrl.use_dm_only;
+                let vk_full = match self.algorithm_jk {
+                    AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(scaling_kfull, use_dm_only, mpi_operator),
+                    AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_kfull, use_dm_only, None, None),
+                    _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
+                };
+                for i_spin in 0..spin_channel {
+                    self.hamiltonian[i_spin].data.par_iter_mut()
+                        .zip(vk_full[i_spin].data.par_iter()).for_each(|(h,v)| *h += v);
+                }
+            }
+
+            // LR correction: -(alpha-hyb) * K_erfc → scaling_klr * K_erfc where scaling_klr = -base_scaling*(alpha-hyb)
+            // For ri-direct, pass omega so libcint computes erfc(ωr)/r integrals on the fly.
+            // For ri-incore, use the pre-built rimatr_lr / ri3fn_lr.
+            if scaling_klr.abs() > 1e-10 {
+                let vk_lr = match self.algorithm_jk {
+                    AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => {
+                        self.generate_vk_ri_direct(scaling_klr, self.mol.ctrl.use_dm_only, None, Some(-omega))
+                    }
+                    _ => {
+                        if self.rimatr_lr.is_some() {
+                            let dm = &self.density_matrix;
+                            vk_upper_with_rimatr_use_dm_only_sync(&self.rimatr_lr, dm, spin_channel, scaling_klr)
+                        } else if self.ri3fn_lr.is_some() {
+                            let dm = &self.density_matrix;
+                            vk_upper_with_ri_v_use_dm_only_sync(&self.ri3fn_lr, dm, spin_channel, scaling_klr)
+                        } else {
+                            vec![MatrixUpper::empty(); spin_channel]
+                        }
+                    }
+                };
+                for i_spin in 0..spin_channel {
+                    if !vk_lr[i_spin].data.is_empty() {
+                        self.hamiltonian[i_spin].data.par_iter_mut()
+                            .zip(vk_lr[i_spin].data.par_iter()).for_each(|(h,v)| *h += v);
+                    }
+                }
+            }
+        } else {
+            let scaling_factor = base_scaling * self.mol.xc_data.dfa_hybrid_scf;
+            if ! scaling_factor.eq(&0.0) {
+                let use_dm_only = self.mol.ctrl.use_dm_only;
+                let vk = match self.algorithm_jk {
+                    AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
+                    AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None, None),
+                    _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
+                };
+                for i_spin in (0..spin_channel) {
+                    self.hamiltonian[i_spin].data.par_iter_mut()
+                        .zip(vk[i_spin].data.par_iter()).for_each(|(h,v)| *h += v);
+                };
+            }
         }
         let dt3 = time::Local::now();
         if self.mol.xc_data.dfa_compnt_scf.len()!=0 {
@@ -2589,7 +2648,7 @@ impl SCF {
             self.generate_vk_with_isdf(1.0, use_dm_only)
         }else{
             match self.algorithm_jk {
-                AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(1.0, use_dm_only, None),
+                AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(1.0, use_dm_only, None, None),
                 AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(1.0, use_dm_only, mpi_operator),
                 _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             }
@@ -3475,7 +3534,7 @@ impl SCF {
         vjs
     }
 
-    fn generate_vk_ri_direct(&self, scaling_factor: f64, use_dm_only: bool, batch_size: Option<usize>) -> Vec<MatrixUpper<f64>> {
+    fn generate_vk_ri_direct(&self, scaling_factor: f64, use_dm_only: bool, batch_size: Option<usize>, omega: Option<f64>) -> Vec<MatrixUpper<f64>> {
         let print_level = self.mol.ctrl.print_level;
 
         // compute batch_size
@@ -3541,11 +3600,11 @@ impl SCF {
             let mo_coeff = &self.eigenvectors[0..self.mol.spin_channel];
             let mo_occ = &self.occupation[0..self.mol.spin_channel];
             let mol_obj = &self.mol;
-            ri_jk::generate_vk_ri_semi_direct_coeff(scaling_factor, mo_coeff, mo_occ, mol_obj, batch_size)
+            ri_jk::generate_vk_ri_semi_direct_coeff(scaling_factor, mo_coeff, mo_occ, mol_obj, omega, batch_size)
         } else {
             let dms = &self.density_matrix[0..self.mol.spin_channel];
             let mol_obj = &self.mol;
-            ri_jk::generate_vk_ri_direct_dm(scaling_factor, dms, mol_obj, batch_size)
+            ri_jk::generate_vk_ri_direct_dm(scaling_factor, dms, mol_obj, omega, batch_size)
         };
 
         // complete `vks` if the spin channel is 1 (restricted, spin-unpolarized)
