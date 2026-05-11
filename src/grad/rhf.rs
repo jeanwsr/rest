@@ -79,6 +79,10 @@ impl RIRHFGradient<'_> {
             J2CDecompPolicy::Cd => unimplemented!("Cholesky decompose is not implemented for gradient currently."),
             _ => {},
         };
+        // check omega flag
+        if scf_data.mol.xc_data.is_rsh() {
+            unimplemented!("RI gradient for range-separated hybrid functionals is not implemented currently.")
+        }
 
         // flags
         let mut flags = RIHFGradientFlagsBuilder::default();

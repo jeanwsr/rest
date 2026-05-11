@@ -87,9 +87,15 @@ pub enum J2CDecompose {
 ///   eigh is called.
 /// - by Cholesky way, solve j3c to cderi does not require extra memory
 /// - by eigen way, the matmul will cost at most `2 * naux^2` or 4% of the final cderi matrix.
-pub fn generate_rimatr_bare(mol_obj: &Molecule) -> MatrixFull<f64> {
-    let mol = util::get_cint_mol(mol_obj);
-    let aux = util::get_cint_aux(mol_obj);
+pub fn generate_rimatr_bare(mol_obj: &Molecule, omega: Option<f64>) -> MatrixFull<f64> {
+    let mut mol = util::get_cint_mol(mol_obj);
+    let mut aux = util::get_cint_aux(mol_obj);
+
+    if let Some(omega) = omega {
+        mol.set_omega(omega);
+        aux.set_omega(omega);
+    }
+    
     let j2c_decomp_option = mol_obj.ctrl.j2c_decomp;
 
     let device = DeviceBLAS::default();
