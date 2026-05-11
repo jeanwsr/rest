@@ -97,6 +97,10 @@ pub struct QuasiParticle {
     pub bse_feast_cg_tol: f64,
     pub bse_feast_gmres_restart: usize,
     pub bse_feast_gmres_max_iter: usize,
+    // FEAST initial guess type: "random" (default) or "gaussian"
+    pub bse_feast_init_guess_type: String,
+    // Gaussian width = (step * width_factor)²  (default 0.5 → half-spacing)
+    pub bse_feast_gaussian_width_factor: f64,
 }
 
 impl Default for QuasiParticle {
@@ -190,6 +194,8 @@ impl Default for QuasiParticle {
             bse_feast_cg_tol: 1e-8,
             bse_feast_gmres_restart: 200,
             bse_feast_gmres_max_iter: 500,
+            bse_feast_init_guess_type: String::from("random"),
+            bse_feast_gaussian_width_factor: 0.5,
         }
     }
 }
@@ -283,6 +289,8 @@ impl QuasiParticle {
         table.insert("bse_feast_cg_tol".to_string(), toml::Value::Float(self.bse_feast_cg_tol));
         table.insert("bse_feast_gmres_restart".to_string(), toml::Value::Integer(self.bse_feast_gmres_restart as i64));
         table.insert("bse_feast_gmres_max_iter".to_string(), toml::Value::Integer(self.bse_feast_gmres_max_iter as i64));
+        table.insert("bse_feast_init_guess_type".to_string(), toml::Value::String(self.bse_feast_init_guess_type.clone()));
+        table.insert("bse_feast_gaussian_width_factor".to_string(), toml::Value::Float(self.bse_feast_gaussian_width_factor));
         table.insert("damped_bse_solver".to_string(), toml::Value::String(self.damped_bse_solver.clone()));
         table.insert("damped_bse_tol".to_string(), toml::Value::Float(self.damped_bse_tol));
         table.insert("damped_bse_max_iter".to_string(), toml::Value::Integer(self.damped_bse_max_iter as i64));
@@ -645,6 +653,20 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.bse_feast_gmres_max_iter = match tmp_ctrl.get("bse_feast_gmres_max_iter").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(500) as usize,
                 _ => 500,
+            };
+            tmp_input.bse_feast_init_guess_type = match tmp_ctrl.get("bse_feast_init_guess_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => {
+                    let lower = s.to_lowercase();
+                    match lower.as_str() {
+                        "gaussian" => String::from("gaussian"),
+                        _ => String::from("random"),
+                    }
+                },
+                _ => String::from("random"),
+            };
+            tmp_input.bse_feast_gaussian_width_factor = match tmp_ctrl.get("bse_feast_gaussian_width_factor").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.5),
+                _ => 0.5,
             };
             // Generate grids: OUTER LOOP X, MIDDLE LOOP Y, INNER LOOP Z
             let x_step = if tmp_input.damped_bse_x_points > 1 {
