@@ -565,7 +565,7 @@ pub fn damped_bse_gmres(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
 ///    u = e * M^{-1}*z - M^{-1}*r,  e = (z^T M^{-1} r) / (z^T M^{-1} z)
 /// 7. Orthogonalize and normalize to get v_{k+1}, compute w_{k+1}
 /// 8. Repeat until convergence
-fn klopper_subspace_solver(
+pub fn klopper_subspace_solver(
     matvec: impl Fn(&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)) -> (Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),
     precond: impl Fn(&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)) -> (Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),
     rhs: &(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),
@@ -803,7 +803,7 @@ pub fn damped_bse_klopper(scf_data: &SCF) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<
     solution
 }
 
-fn fourvec_gmres(
+pub fn fourvec_gmres(
     matvec:impl Fn(&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>))->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),
     precond:impl Fn(&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>))->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),
     rhs:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>),

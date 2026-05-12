@@ -18,10 +18,11 @@ use std::{f64, fs::File, io::Write};
 pub mod dipoles;
 pub mod davidson_solver;
 pub mod matvec;
-pub mod sbse;
-pub mod pysoc_file;
 pub mod damped;
 pub mod feast_solver;
+pub mod nonlinbse_matvec;
+pub mod nonlinbse;
+pub mod matvec_trace;
 
 
 #[cfg(target_os = "linux")]
@@ -56,9 +57,6 @@ pub fn bse_main(scf_data:&mut SCF){
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
                 leading_components(&v,occ_size,vir_size)});
             println!("The first triplet excitation obtained by BSE is {}",excitations_triplets[0].0);
-            if qp_ctrl.pysoc{
-                let generate=pysoc_file::write_pysoc_file(scf_data,excitations_singlets,excitations_triplets);
-            }
         }else{
             println!("BSE Calculation Results of Both Singlets and Triplets without TDA:");
             let number=excitations_singlets.len();
@@ -80,9 +78,6 @@ pub fn bse_main(scf_data:&mut SCF){
                 leading_components(&v,occ_size,vir_size)
             });
             println!("The first triplet excitation obtained by BSE is {}",excitations_triplets[0].0);
-            if qp_ctrl.pysoc{
-                let generate=pysoc_file::write_pysoc_file(scf_data,excitations_singlets,excitations_triplets);
-            }
         }
     }else{
         println!("Specific BSE calculations are triggered");
@@ -318,12 +313,6 @@ pub fn construct_inverse_dielectric(scf_data:&SCF,epsilon:&Vec<f64>)->MatrixFull
     };
 
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    if qp_ctrl.simplified_bse==true{
-        let ang_momentum=if qp_ctrl.simplified_bse==true{cmp::min(qp_ctrl.bse_max_ang_momentum,6)}else{6};
-        let elements=scf_data.mol.geom.elem.clone();
-        let relevant_indices=sbse::obtain_relevant_indices(scf_data,&elements,ang_momentum);
-        ri_ov=sbse::obtain_ri_with_reduced_ang_momentum(&ri_ov,&relevant_indices);
-    }
     if scf_data.mol.ctrl.print_level>1{
         println!("occ_size={},vir_size(for response)={}",occ_size,vir_size);
     }

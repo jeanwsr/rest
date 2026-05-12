@@ -502,6 +502,16 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
         // println!("P Real (Minus Half):\n{:#?}",p_induced.1);
         // println!("P Imaginary (Plus Half):\n{:#?}",p_induced.2);
         // println!("P Imaginary (Minus Half):\n{:#?}",p_induced.3);
+    }else if output_type.eq("nonlinear_bse"){
+        // NLFEAST requires GW quasiparticle energies for diagonal elements
+        if qp_ctrl.gw_scheme=="parse from file"{
+            let parse_qp_path=qp_ctrl.parse_qp_path.clone();
+            scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
+        }else{
+            let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
+            ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
+        }
+        ri_bse::nonlinbse::nlfeast_bse_main(scf_data, &qp_ctrl);
     }else{
         print!("Warning: You entered an invalid quasiparticle method. No quasiparticle methods Were triggered.")
     }
