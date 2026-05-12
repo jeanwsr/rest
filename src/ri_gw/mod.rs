@@ -138,13 +138,6 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     let mut ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
     let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    if qp_ctrl.simplified_bse==true{
-        let ang_momentum=if qp_ctrl.simplified_bse==true{cmp::min(qp_ctrl.bse_max_ang_momentum,6)}else{6};
-        let elements=scf_data.mol.geom.elem.clone();
-        let relevant_indices=ri_bse::sbse::obtain_relevant_indices(scf_data,&elements,ang_momentum);
-        ri_ov=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_ov,&relevant_indices);
-        ri_mat=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_mat,&relevant_indices);
-    }
     let v_matrix=v_matrix(&scf_data,&ri_mat);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let (start_mo,num_state_cutoff,occ_size,vir_size_cutoff,homo,lumo)=get_occupation_parameters(scf_data,'N');
@@ -764,13 +757,6 @@ pub fn spectrum_test(scf_data:&SCF,num_freq:usize){
     let mut ri_full:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
     let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    if qp_ctrl.simplified_bse==true{
-        let ang_momentum=if qp_ctrl.simplified_bse==true{cmp::min(qp_ctrl.bse_max_ang_momentum,6)}else{6};
-        let elements=scf_data.mol.geom.elem.clone();
-        let relevant_indices=ri_bse::sbse::obtain_relevant_indices(scf_data,&elements,ang_momentum);
-        ri_ov=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_ov,&relevant_indices);
-        ri_full=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_full,&relevant_indices);
-    }
     let start_freq:f64=qp_ctrl.spectrum_test_start;
     let end_freq:f64=qp_ctrl.spectrum_test_end;
     let step:f64=qp_ctrl.spectrum_test_step;
@@ -1879,17 +1865,6 @@ pub fn gw_calculations_lowrank(
     let mut ri_mat: MatrixFull<f64> = ri_bse::get_submatrix(scf_data, 'F', 'F', 'Y');
     let mut ri_ov: MatrixFull<f64> = ri_bse::get_submatrix(scf_data, 'O', 'V', 'Y');
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    if qp_ctrl.simplified_bse == true {
-        let ang_momentum = if qp_ctrl.simplified_bse == true {
-            cmp::min(qp_ctrl.bse_max_ang_momentum, 6)
-        } else {
-            6
-        };
-        let elements = scf_data.mol.geom.elem.clone();
-        let relevant_indices = ri_bse::sbse::obtain_relevant_indices(scf_data, &elements, ang_momentum);
-        ri_ov = ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_ov, &relevant_indices);
-        ri_mat = ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_mat, &relevant_indices);
-    }
     let v_matrix = v_matrix(&scf_data, &ri_mat);
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
         get_occupation_parameters(scf_data, 'Y');

@@ -147,22 +147,21 @@ fn gmres(
     max_iter: usize,
     tol: f64,
     verbose: bool,
-    precondition: Option<&Vec<f64>>,
+    precondition: Option<&BlockDiagPrecond>,
 ) -> Vec<f64> {
     let n = b.len();
 
     // Preconditioned RHS norm for tolerance
-    let b_prec: Vec<f64> = if let Some(prec) = precondition {
-        (0..n).map(|i| b[i] / f64::max(prec[i].abs(), 1e-16)).collect()
+    let b_norm: f64 = if let Some(prec) = precondition {
+        prec.norm(b)
     } else {
-        b.clone()
+        b.iter().map(|bi| bi * bi).sum::<f64>().sqrt()
     };
-    let b_norm: f64 = b_prec.iter().map(|bi| bi * bi).sum::<f64>().sqrt();
     let tol_abs = tol * b_norm.max(1e-30);
 
-    // Helper: apply diagonal preconditioner to a vector
-    let apply_prec = |w: &Vec<f64>, prec: &Vec<f64>| -> Vec<f64> {
-        (0..n).map(|i| w[i] / f64::max(prec[i].abs(), 1e-16)).collect()
+    // Helper: apply block-diagonal preconditioner to a vector
+    let apply_prec = |w: &Vec<f64>, prec: &BlockDiagPrecond| -> Vec<f64> {
+        prec.apply_inverse(w)
     };
 
     let mut x = vec![0.0; n];
@@ -330,6 +329,68 @@ fn gmres(
     x
 }
 
+/// 2×2 block-diagonal preconditioner for the 2N real-embedded system.
+///
+/// For each original complex index i (mapping to real components at indices
+/// i and N+i in the 2N vector), the block is stored as [a, b, c, d] in
+/// row-major order representing:
+///
+///   block_i = [a  b]
+///             [c  d]
+///
+/// Application: v_out = block_i⁻¹ · v_in  (solved for each i).
+pub struct BlockDiagPrecond {
+    pub blocks: Vec<[f64; 4]>,
+}
+
+impl BlockDiagPrecond {
+    /// Create from two arrays: re_part[i] = Re(λ_i), im_part[i] = Im(λ_i).
+    /// The correct 2×2 block for complex value λ = re + i·im in the
+    /// real embedding is [[re, -im], [im, re]].
+    pub fn from_re_im(re_part: &[f64], im_part: &[f64]) -> Self {
+        let n = re_part.len();
+        let mut blocks = Vec::with_capacity(n);
+        for i in 0..n {
+            blocks.push([re_part[i], -im_part[i], im_part[i], re_part[i]]);
+        }
+        BlockDiagPrecond { blocks }
+    }
+
+    /// Apply the inverse of this block-diagonal matrix to a vector v
+    /// of length 2*n (first n = real parts, next n = imag parts).
+    pub fn apply_inverse(&self, v: &[f64]) -> Vec<f64> {
+        let n = self.blocks.len();
+        let mut out = v.to_vec();
+        for i in 0..n {
+            let [a, b, c, d] = self.blocks[i];
+            let det = a * d - b * c;
+            let inv_det = 1.0 / f64::max(det.abs(), 1e-30);
+            let r = v[i];
+            let s = v[n + i];
+            out[i]     = ( d * r - b * s) * inv_det;
+            out[n + i] = (-c * r + a * s) * inv_det;
+        }
+        out
+    }
+
+    /// Compute the 2-norm of the preconditioned vector (for residual checks).
+    pub fn norm(&self, v: &[f64]) -> f64 {
+        let n = self.blocks.len();
+        let mut sum = 0.0;
+        for i in 0..n {
+            let [a, b, c, d] = self.blocks[i];
+            let det = a * d - b * c;
+            let inv_det = 1.0 / f64::max(det.abs(), 1e-30);
+            let r = v[i];
+            let s = v[n + i];
+            let pr = ( d * r - b * s) * inv_det;
+            let ps = (-c * r + a * s) * inv_det;
+            sum += pr * pr + ps * ps;
+        }
+        sum.sqrt()
+    }
+}
+
 /// Solve (z·B − A) · X = RHS  for all columns of RHS using GMRES.
 ///
 /// The complex system (α+iβ)·B − A is embedded as a 2N×2N real system
@@ -358,17 +419,19 @@ fn solve_complex_iterative(
 ) -> (MatrixFull<f64>, MatrixFull<f64>) {
     let m0 = rhs_matrix.size()[1];
 
-    // Build M₂ diagonal preconditioner: M₂_diag[k] = alpha − Ã_diag[k % n]
+    // Build M₂ block-diagonal preconditioner
+    // The 2×2 block for each complex index i is:
+    //   [α − Ã[i]    −β]
+    //   [  β       α − Ã[i]]
+    // We store this as [re, -im, im, re] = [α-d[i], -β, β, α-d[i]]
     let precond = diag_a.map(|d| {
-        let mut p = vec![0.0; 2 * n];
+        let mut re_part = vec![0.0; n];
+        let mut im_part = vec![0.0; n];
         for i in 0..n {
-            // M₂ = [ α·I − Ã   −β·I  ]
-            //      [  β·I     α·I − Ã ]
-            // Diagonal: α − Ã_diag[i] for both blocks
-            p[i] = alpha - d[i];
-            p[n + i] = alpha - d[i];
+            re_part[i] = alpha - d[i];
+            im_part[i] = -beta;  // −β from the upper-right block
         }
-        p
+        BlockDiagPrecond::from_re_im(&re_part, &im_part)
     });
 
     let mut x_re = MatrixFull::new([n, m0], 0.0);

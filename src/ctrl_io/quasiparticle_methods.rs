@@ -101,6 +101,18 @@ pub struct QuasiParticle {
     pub bse_feast_init_guess_type: String,
     // Gaussian width = (step * width_factor)²  (default 0.5 → half-spacing)
     pub bse_feast_gaussian_width_factor: f64,
+    // NLFEAST (nonlinear BSE) control parameters
+    pub nonlinear_bse: bool,
+    pub nlfeast_centre: f64,
+    pub nlfeast_radius: f64,
+    pub nlfeast_m0: usize,
+    pub nlfeast_n_quad: usize,
+    pub nlfeast_max_iter: usize,
+    pub nlfeast_tol: f64,
+    pub nlfeast_gmres_restart: usize,
+    pub nlfeast_gmres_max_it: usize,
+    pub nlfeast_gmres_tol: f64,
+    pub export_matvec_count: bool,
 }
 
 impl Default for QuasiParticle {
@@ -196,6 +208,17 @@ impl Default for QuasiParticle {
             bse_feast_gmres_max_iter: 500,
             bse_feast_init_guess_type: String::from("random"),
             bse_feast_gaussian_width_factor: 0.5,
+            nonlinear_bse: false,
+            nlfeast_centre: 0.0,
+            nlfeast_radius: 0.5,
+            nlfeast_m0: 20,
+            nlfeast_n_quad: 12,
+            nlfeast_max_iter: 20,
+            nlfeast_tol: 1e-8,
+            nlfeast_gmres_restart: 200,
+            nlfeast_gmres_max_it: 500,
+            nlfeast_gmres_tol: 1e-6,
+            export_matvec_count: false,
         }
     }
 }
@@ -294,6 +317,17 @@ impl QuasiParticle {
         table.insert("damped_bse_solver".to_string(), toml::Value::String(self.damped_bse_solver.clone()));
         table.insert("damped_bse_tol".to_string(), toml::Value::Float(self.damped_bse_tol));
         table.insert("damped_bse_max_iter".to_string(), toml::Value::Integer(self.damped_bse_max_iter as i64));
+        table.insert("nonlinear_bse".to_string(), toml::Value::Boolean(self.nonlinear_bse));
+        table.insert("nlfeast_centre".to_string(), toml::Value::Float(self.nlfeast_centre));
+        table.insert("nlfeast_radius".to_string(), toml::Value::Float(self.nlfeast_radius));
+        table.insert("nlfeast_m0".to_string(), toml::Value::Integer(self.nlfeast_m0 as i64));
+        table.insert("nlfeast_n_quad".to_string(), toml::Value::Integer(self.nlfeast_n_quad as i64));
+        table.insert("nlfeast_max_iter".to_string(), toml::Value::Integer(self.nlfeast_max_iter as i64));
+        table.insert("nlfeast_tol".to_string(), toml::Value::Float(self.nlfeast_tol));
+        table.insert("nlfeast_gmres_restart".to_string(), toml::Value::Integer(self.nlfeast_gmres_restart as i64));
+        table.insert("nlfeast_gmres_max_it".to_string(), toml::Value::Integer(self.nlfeast_gmres_max_it as i64));
+        table.insert("nlfeast_gmres_tol".to_string(), toml::Value::Float(self.nlfeast_gmres_tol));
+        table.insert("export_matvec_count".to_string(), toml::Value::Boolean(self.export_matvec_count));
         toml::Value::Table(table)
     }
 }
@@ -707,6 +741,51 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.damped_bse_max_iter = match tmp_ctrl.get("damped_bse_max_iter").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(200) as usize,
                 _ => 200,
+            };
+            // NLFEAST (nonlinear BSE) control parameters
+            tmp_input.nonlinear_bse = match tmp_ctrl.get("nonlinear_bse").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
+            };
+            tmp_input.nlfeast_centre = match tmp_ctrl.get("nlfeast_centre").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.nlfeast_radius = match tmp_ctrl.get("nlfeast_radius").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.5),
+                _ => 0.5,
+            };
+            tmp_input.nlfeast_m0 = match tmp_ctrl.get("nlfeast_m0").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(20) as usize,
+                _ => 20,
+            };
+            tmp_input.nlfeast_n_quad = match tmp_ctrl.get("nlfeast_n_quad").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(12) as usize,
+                _ => 12,
+            };
+            tmp_input.nlfeast_max_iter = match tmp_ctrl.get("nlfeast_max_iter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(20) as usize,
+                _ => 20,
+            };
+            tmp_input.nlfeast_tol = match tmp_ctrl.get("nlfeast_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e-8),
+                _ => 1e-8,
+            };
+            tmp_input.nlfeast_gmres_restart = match tmp_ctrl.get("nlfeast_gmres_restart").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(200) as usize,
+                _ => 200,
+            };
+            tmp_input.nlfeast_gmres_max_it = match tmp_ctrl.get("nlfeast_gmres_max_it").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(500) as usize,
+                _ => 500,
+            };
+            tmp_input.export_matvec_count = match tmp_ctrl.get("export_matvec_count").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
+            };
+            tmp_input.nlfeast_gmres_tol = match tmp_ctrl.get("nlfeast_gmres_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e-6),
+                _ => 1e-6,
             };
             return Ok(Some(tmp_input));
         },

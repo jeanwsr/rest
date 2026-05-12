@@ -259,13 +259,6 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,t
     println!("RI-OV Shape={:?}",ri_ov.size);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let mut ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
-    // if qp_ctrl.simplified_bse==true{
-    //     let ang_momentum=if qp_ctrl.simplified_bse==true{cmp::min(qp_ctrl.bse_max_ang_momentum,6)}else{6};
-    //     let elements=scf_data.mol.geom.elem.clone();
-    //     let relevant_indices=ri_bse::sbse::obtain_relevant_indices(scf_data,&elements,ang_momentum);
-    //     ri_ov=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_ov,&relevant_indices);
-    //     ri_mat=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_mat,&relevant_indices);
-    // }
     let start=Instant::now();
     let v_matrix=ri_gw::v_matrix(&scf_data,&ri_mat);
     let time1=start.elapsed();
