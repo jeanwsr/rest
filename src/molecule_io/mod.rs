@@ -230,6 +230,7 @@ impl Molecule {
                 match ctrl.xc_parser.as_str() {
                     "legacy" => {
                     let mut cur_xc_data = DFA4REST::new(&ctrl.xc, spin_channel, ctrl.print_level);
+                    cur_xc_data.update_pt2_params(ctrl.ri_pt2.os_factor, ctrl.ri_pt2.ss_factor);
                     (None, cur_xc_data)
                     },
                     "parse_xc" => {

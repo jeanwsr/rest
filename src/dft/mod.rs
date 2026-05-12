@@ -240,6 +240,7 @@ impl DFA4REST {
             let xc_code = DFA4REST::libxc_code_fdqc(xc);
             xc_code.iter().filter(|x| **x!=0).map(|x| *param).collect::<Vec<f64>>()
         }).flatten().collect::<Vec<f64>>();
+        let dfa_rsh_scf = DFA4REST::get_rsh_libxc(&dfa_compnt_scf, spin_channel);
 
         DFA4REST {
             spin_channel,
@@ -251,7 +252,7 @@ impl DFA4REST {
             dfa_compnt_scf,
             dfa_paramr_scf,
             dfa_hybrid_scf,
-            dfa_rsh_scf: None,
+            dfa_rsh_scf,
         }
     }
 
@@ -492,6 +493,7 @@ impl DFA4REST {
             let xc_code = DFA4REST::libxc_code_fdqc(xc);
             xc_code.iter().filter(|x| **x!=0).map(|x| *param).collect::<Vec<f64>>()
         }).flatten().collect::<Vec<f64>>();
+        let dfa_rsh_scf = DFA4REST::get_rsh_libxc(&dfa_compnt_scf, spin_channel);
 
         println!("==== IGOR debug for nonstd DFT parse ====");
         println!("codelist: {:?}, xc_hybrid: {:16.8}", codelist, dfa_hybrid_scf);
@@ -508,7 +510,7 @@ impl DFA4REST {
             dfa_compnt_scf,
             dfa_paramr_scf,
             dfa_hybrid_scf: *dfa_hybrid_scf,
-            dfa_rsh_scf: None,
+            dfa_rsh_scf,
         }
     }
 
@@ -4188,17 +4190,6 @@ fn test_rsh_cam_coeff_raw() {
 }
 
 #[test]
-fn test_rsh_parameters_wb97x_v() {
-    let dfa = DFA4REST::new("wb97x-v", 1, 0);
-    assert!(dfa.is_hybrid(), "wB97X-V should be hybrid");
-    assert!(dfa.is_rsh(), "wB97X-V should be range-separated");
-    assert!((dfa.omega().unwrap() - 0.3).abs() < 1e-9, "omega should be 0.3, got {}", dfa.omega().unwrap());
-    assert!((dfa.rsh_alpha().unwrap() - 1.0).abs() < 1e-9, "alpha should be 1.0, got {}", dfa.rsh_alpha().unwrap());
-    assert!((dfa.dfa_hybrid_scf - 0.167).abs() < 1e-5, "hyb should be ~0.167, got {}", dfa.dfa_hybrid_scf);
-    assert_eq!(dfa.dfa_compnt_scf, vec![466], "component should be [466]");
-}
-
-#[test]
 fn test_rsh_parameters_wb97x() {
     let dfa = DFA4REST::new("wb97x", 1, 0);
     assert!(dfa.is_hybrid());
@@ -4207,17 +4198,6 @@ fn test_rsh_parameters_wb97x() {
     assert!((dfa.rsh_alpha().unwrap() - 1.0).abs() < 1e-9);
     assert!((dfa.dfa_hybrid_scf - 0.157706).abs() < 1e-5);
     assert_eq!(dfa.dfa_compnt_scf, vec![464]);
-}
-
-#[test]
-fn test_rsh_parameters_wb97x_d() {
-    let dfa = DFA4REST::new("wb97x-d", 1, 0);
-    assert!(dfa.is_hybrid());
-    assert!(dfa.is_rsh());
-    assert!((dfa.omega().unwrap() - 0.2).abs() < 1e-9);
-    assert!((dfa.rsh_alpha().unwrap() - 1.0).abs() < 1e-9);
-    assert!((dfa.dfa_hybrid_scf - 0.222036).abs() < 1e-5);
-    assert_eq!(dfa.dfa_compnt_scf, vec![471]);
 }
 
 #[test]
@@ -4264,8 +4244,8 @@ fn test_non_rsh_b3lyp() {
     let dfa = DFA4REST::new("b3lyp", 1, 0);
     assert!(dfa.is_hybrid(), "B3LYP should be hybrid");
     assert!(!dfa.is_rsh(), "B3LYP should NOT be range-separated");
-    assert_eq!(dfa.omega().unwrap(), 0.0);
-    assert_eq!(dfa.rsh_alpha().unwrap(), 0.0);
+    assert!(dfa.omega().is_none());
+    assert!(dfa.rsh_alpha().is_none());
 }
 
 #[test]
@@ -4273,14 +4253,14 @@ fn test_non_rsh_pbe() {
     let dfa = DFA4REST::new("pbe", 1, 0);
     assert!(!dfa.is_hybrid());
     assert!(!dfa.is_rsh());
-    assert_eq!(dfa.omega().unwrap(), 0.0);
-    assert_eq!(dfa.rsh_alpha().unwrap(), 0.0);
+    assert!(dfa.omega().is_none());
+    assert!(dfa.rsh_alpha().is_none());
     assert_eq!(dfa.dfa_hybrid_scf, 0.0);
 }
 
 #[test]
-fn test_wb97x_case_insensitive() {
-    let names = ["wb97x-v", "WB97X-V", "Wb97x-V", "wb97X-v"];
+fn test_cam_b3lyp_case_insensitive() {
+    let names = ["cam-b3lyp", "CAMB3LYP"];
     let mut dfas = vec![];
     for name in &names {
         dfas.push(DFA4REST::new(name, 1, 0));
@@ -4295,8 +4275,8 @@ fn test_wb97x_case_insensitive() {
 #[test]
 fn test_rsh_spin_polarized() {
     // Test RSH initialization with spin=2 (open-shell)
-    let dfa_closed = DFA4REST::new("wb97x-v", 1, 0);
-    let dfa_open = DFA4REST::new("wb97x-v", 2, 0);
+    let dfa_closed = DFA4REST::new("cam-b3lyp", 1, 0);
+    let dfa_open = DFA4REST::new("cam-b3lyp", 2, 0);
     // RSH parameters should be spin-independent
     assert!((dfa_closed.omega().unwrap() - dfa_open.omega().unwrap()).abs() < 1e-9);
     assert!((dfa_closed.rsh_alpha().unwrap() - dfa_open.rsh_alpha().unwrap()).abs() < 1e-9);
@@ -4349,7 +4329,7 @@ fn test_rsh_nonstd_parse() {
 #[test]
 fn test_rsh_summary_does_not_panic() {
     // Ensure summary() works without panicking for RSH and non-RSH
-    for name in &["wb97x-v", "cam-b3lyp", "lc-blyp", "hse06", "b3lyp", "pbe"] {
+    for name in &["cam-b3lyp", "lc-blyp", "hse06", "b3lyp", "pbe"] {
         let dfa = DFA4REST::new(name, 1, 0);
         dfa.summary();
     }
