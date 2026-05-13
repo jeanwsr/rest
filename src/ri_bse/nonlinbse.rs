@@ -124,7 +124,7 @@ impl BlockDiagPrecond {
 // GMRES Solver (real-embedded, for complex linear systems)
 // ============================================================================
 
-fn givens_rotation(a: f64, b: f64) -> (f64, f64) {
+pub fn givens_rotation(a: f64, b: f64) -> (f64, f64) {
     if b.abs() < 1e-30 {
         (1.0, 0.0)
     } else if a.abs() > b.abs() {
@@ -138,7 +138,7 @@ fn givens_rotation(a: f64, b: f64) -> (f64, f64) {
     }
 }
 
-fn gmres(
+pub fn gmres(
     a_mul: impl Fn(&[f64]) -> Vec<f64>,
     b: &[f64],
     restart: usize,
@@ -303,7 +303,7 @@ fn make_shifted_matvec<'a>(
 // QR orthogonalisation (modified Gram–Schmidt)
 // ============================================================================
 
-fn qr_orthonormalise(a: &MatrixFull<f64>) -> MatrixFull<f64> {
+pub fn qr_orthonormalise(a: &MatrixFull<f64>) -> MatrixFull<f64> {
     let n = a.size[0];
     let k = a.size[1];
     let mut q = a.clone();
