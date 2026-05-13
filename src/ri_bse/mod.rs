@@ -23,6 +23,8 @@ pub mod feast_solver;
 pub mod nonlinbse_matvec;
 pub mod nonlinbse;
 pub mod matvec_trace;
+pub mod dynamicbse_matvec;
+pub mod dynamicbse;
 
 
 #[cfg(target_os = "linux")]
@@ -206,8 +208,8 @@ pub fn get_submatrix(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:c
     };
 
     let auxbas_type = if use_bse_integrals { "BSE-specific" } else { "Regular" };
-    println!("Allocated RI Tensor: {}-{}, Size={:?}, For Response={}, AuxBas Type={}",
-             choice_a, choice_b, vector[0].0.size, response_or_not, auxbas_type);
+    if scf_data.mol.ctrl.print_level>1{println!("Allocated RI Tensor: {}-{}, Size={:?}, For Response={}, AuxBas Type={}",
+             choice_a, choice_b, vector[0].0.size, response_or_not, auxbas_type)};
 
     let matrix:MatrixFull<f64>=vector[0].0.rifull_to_matfull_i_jk();
     matrix
