@@ -29,7 +29,7 @@ use crate::ri_bse::damped::{
 };
 use crate::ri_bse::davidson_solver::vector_scaled_add;
 use crate::ri_bse::dipoles;
-use crate::ri_tddft::fxc_matvec::{FXCMatvecData, prepare_fxc_data};
+use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data};
 use crate::ri_tddft::matvec::{self, a_matvec, b_matvec};
 use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_get_submatrix};
 use crate::scf_io::SCF;

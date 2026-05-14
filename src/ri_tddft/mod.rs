@@ -1,4 +1,3 @@
-pub mod fxc_matvec;
 pub mod matvec;
 pub mod tddft_solver;
 pub mod utils;
