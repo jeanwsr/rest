@@ -10,7 +10,7 @@
 use rest_tensors::{MatrixFull, MatrixUpper};
 use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
 use crate::scf_io::SCF;
-use crate::ri_tddft::fxc_matvec::{FXCMatvecData, prepare_fxc_data, fxc_matvec};
+use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data, fxc_matvec};
 
 /// Precomputed workspace for gen_vind: caches C_occ, C_vir slices.
 pub struct VindWorkspace {

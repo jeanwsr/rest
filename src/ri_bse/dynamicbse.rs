@@ -734,12 +734,23 @@ pub fn dynamic_bse_main(scf_data: &SCF, qp_ctrl: &QuasiParticle) {
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
         get_occupation_parameters(scf_data, 'N');
     let n = occ_size * vir_size;
+
+    // ── Orbital energies ──
     let quasiparticle_energies = scf_data.gwqp.0.clone();
 
-    // ── Orbital energies: always use GW quasiparticle energies ──
-    let epsilon = quasiparticle_energies.clone();
-    let eps_occ: Vec<f64> = epsilon[0..occ_size].to_vec();
-    let eps_vir: Vec<f64> = epsilon[occ_size..occ_size + vir_size].to_vec();
+    // eps_occ/eps_vir for diagonal and denominator ε_i/ε_a → always GW QP
+    let eps_occ: Vec<f64> = quasiparticle_energies[0..occ_size].to_vec();
+    let eps_vir: Vec<f64> = quasiparticle_energies[occ_size..occ_size + vir_size].to_vec();
+
+    // IA-pair energy gaps Δ_p = ε_I − ε_A — controlled by bse_qp_polarization
+    // (analogous to whether the polarization uses KS or QP energies)
+    let epsilon_ia = if qp_ctrl.bse_qp_polarization {
+        quasiparticle_energies.clone()
+    } else {
+        scf_data.eigenvalues[0].clone()
+    };
+    let eps_occ_ia: Vec<f64> = epsilon_ia[0..occ_size].to_vec();
+    let eps_vir_ia: Vec<f64> = epsilon_ia[occ_size..occ_size + vir_size].to_vec();
 
     let num_auxbas = crate::ri_bse::get_submatrix(scf_data, 'O', 'V', 'N').size[0];
     println!("=============================================");
@@ -765,7 +776,12 @@ pub fn dynamic_bse_main(scf_data: &SCF, qp_ctrl: &QuasiParticle) {
     let nIA = occ_size * vir_size;
 
     // ── Pre-compute Delta_IA ──
-    let delta_IA = dynamicbse_matvec::compute_delta_ia(&eps_occ, &eps_vir, occ_size, vir_size);
+    let delta_IA = dynamicbse_matvec::compute_delta_ia(&eps_occ_ia, &eps_vir_ia, occ_size, vir_size);
+    if qp_ctrl.bse_qp_polarization {
+        println!("  IA-pair gaps: GW quasiparticle energies");
+    } else {
+        println!("  IA-pair gaps: KS eigenvalues");
+    }
 
     // ── Auto-select block size ──
     let block_size = dynamicbse_matvec::auto_block_size(occ_size, vir_size, nIA);

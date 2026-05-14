@@ -13,7 +13,7 @@ use rest_tensors::MatrixFull;
 use crate::scf_io::SCF;
 use crate::ri_bse::{davidson_solver, dipoles};
 use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
-use crate::ri_tddft::fxc_matvec::{FXCMatvecData, prepare_fxc_data};
+use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data};
 use crate::ri_tddft::matvec::{self, a_matvec, b_matvec};
 use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_get_submatrix, compute_tddft_dipole_matrix};
 

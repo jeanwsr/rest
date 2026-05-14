@@ -7,7 +7,7 @@ use rest_tensors::MatrixFull;
 use rest_tensors::matrix::matrix_blas_lapack::_dsolve;
 use crate::scf_io::SCF;
 use crate::ri_tddft::utils::tddft_occupation_parameters;
-use crate::ri_tddft::fxc_matvec::{FXCMatvecData, prepare_fxc_data};
+use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data};
 use crate::dft::response::{gen_vind_opt, VindWorkspace};
 
 pub struct CPHFSolver {

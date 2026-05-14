@@ -673,7 +673,7 @@ pub fn feast(
         let qtq = _dgemm_scaled(&q, 'T', &q, 'N', 1.0);
         let (v_opt, eigval_qtq, _) = _dsyevd(&qtq, 'V');
         let v = v_opt.unwrap();
-        let threshold = 1e-4;
+        let threshold = 1e-6;
         let m_eff = std::cmp::max(1, eigval_qtq.iter().filter(|&&val| val > threshold).count());
         if m_eff < m0 {
             let offset = m0 - m_eff;
