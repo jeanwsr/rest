@@ -187,7 +187,7 @@ impl DFAComponent {
         if self.component_type == ComponentType::HF {
             return self.factor;
         } else if self.component_type == ComponentType::Libxc {
-            let mut xcfunc = XcFuncType::xc_func_init(self.id, spin_channel);
+            let xcfunc = XcFuncType::xc_func_init(self.id, spin_channel);
             let hybrid_coef = match xcfunc.is_rsh() {
                 false => xcfunc.get_hybrid(),
                 true => {
@@ -196,7 +196,6 @@ impl DFAComponent {
                 },
             };
             let hyb =  self.factor * hybrid_coef;
-            xcfunc.xc_func_end();
             return hyb;
         } else {
             return 0.0;
@@ -206,10 +205,8 @@ impl DFAComponent {
     pub fn is_rsh(&self) -> bool {
         match self.component_type {
             ComponentType::Libxc => {
-                let mut xcfunc = XcFuncType::xc_func_init(self.id, 1);
-                let is_rsh = xcfunc.is_rsh();
-                xcfunc.xc_func_end();
-                is_rsh
+                let xcfunc = XcFuncType::xc_func_init(self.id, 1);
+                xcfunc.is_rsh()
             },
             _ => false,
         }
@@ -218,10 +215,8 @@ impl DFAComponent {
     pub fn use_laplacian(&self) -> bool {
         match self.component_type {
             ComponentType::Libxc => {
-                let mut xcfunc = XcFuncType::xc_func_init(self.id, 1);
-                let use_laplacian = xcfunc.use_laplacian();
-                xcfunc.xc_func_end();
-                use_laplacian
+                let xcfunc = XcFuncType::xc_func_init(self.id, 1);
+                xcfunc.use_laplacian()
             },
             _ => false,
         }
@@ -229,10 +224,8 @@ impl DFAComponent {
 
     pub fn get_reference(&self) -> Vec<String> {
         if self.component_type == ComponentType::Libxc && self.id != 0 {
-            let mut xcfunc = XcFuncType::xc_func_init(self.id, 1);
-            let reference = xcfunc.get_libxc_references();
-            xcfunc.xc_func_end();
-            return reference;
+            let xcfunc = XcFuncType::xc_func_init(self.id, 1);
+            return xcfunc.get_libxc_references();
         } else {
             return Vec::new();
         }
@@ -551,7 +544,7 @@ impl DFAdef {
         if let Some(components) = &self.xc_scf {
             for comp in components.iter() {
                 if comp.is_rsh() {
-                    let mut xcfunc = XcFuncType::xc_func_init(comp.id, spin_channel);
+                    let xcfunc = XcFuncType::xc_func_init(comp.id, spin_channel);
                     let (omega, alpha, beta) = xcfunc.xc_hyb_cam_coef();
                     // only if alpha and beta are both close to zero, we consider it as not range-separated (pure zero).
                     if alpha.abs() < 1e-10 && beta.abs() < 1e-10 {
@@ -560,7 +553,6 @@ impl DFAdef {
                     if result.is_some() {
                         panic!("Multiple RSH functionals are specified in the DFA components for SCF. Currently this is not supported.");
                     }
-                    xcfunc.xc_func_end();
                     result = Some((omega, alpha, beta));
                 }
             }
