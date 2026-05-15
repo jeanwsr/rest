@@ -1,10 +1,12 @@
 extern crate dunce;
-use std::{env, fs};
+use std::env;
 use std::path::PathBuf;
 
 fn main() -> miette::Result<()> {
 
-    generate_libxc_names_and_values();
+    // AJZ34: This function should not be called in normal build.
+    //        Also, we are trying to use the external crate `libxc` for better maintainability.
+    // generate_libxc_names_and_values();
 
 
     // conditionally link to the libraries based on the features
@@ -48,7 +50,9 @@ fn main() -> miette::Result<()> {
 
 }
 
+#[allow(dead_code)]
 fn generate_libxc_names_and_values() {
+    use std::fs;
     // Retrieve the REST_HOME environment variable or use an empty string if not set
     let rest_dir = if let Ok(rest_dir) = env::var("REST_HOME") {
         rest_dir
