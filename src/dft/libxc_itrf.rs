@@ -187,7 +187,7 @@ fn eval_xc1(
     .for_each(
         |(func_id, xc_param)|
         {
-            let mut xc_func = XcFuncType::xc_func_init(*func_id, spin+1);
+            let xc_func = XcFuncType::xc_func_init(*func_id, spin+1);
             let cur_xc_type = match xc_func.get_libxc_family() {
                 LibXCFamily::LDA => XCType::LDA,
                 LibXCFamily::GGA => XCType::GGA,
@@ -199,7 +199,6 @@ fn eval_xc1(
             let mut outbuf = vec![0.0; np * n_components];
             eval_libxc_func_new(&xc_func, spin, deriv, np, rho, sigma, lapl, tau,  &mut outbuf);
             merge_xc(&mut output, &outbuf, *xc_param, cur_xc_type, spin, deriv, out_nvar, np);
-            xc_func.xc_func_end();
         }
     );
 

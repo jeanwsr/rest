@@ -65,10 +65,8 @@ impl DFAComponent {
     pub fn is_nlc(&self) -> bool {
         match self.component_type {
             ComponentType::Libxc => {
-                let mut xcfunc = XcFuncType::xc_func_init(self.id, 1);
-                let is_nlc = xcfunc.is_nlc();
-                xcfunc.xc_func_end();
-                is_nlc
+                let xcfunc = XcFuncType::xc_func_init(self.id, 1);
+                xcfunc.is_nlc()
             },
             _ => false,
         }
