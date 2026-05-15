@@ -37,6 +37,12 @@ pub struct QuasiParticle {
     pub save_qp_path:String,
     pub save_first_excitation:bool,
     pub save_first_excitation_path:String,
+    pub use_low_rank_contour:bool,
+    pub low_rank_grid_type:String,   // "linear" or "quadratic" (power-law, denser near zero)
+    pub nomega_chi_real:usize,
+    pub low_rank_tolerance:f64,
+    pub nomega_sigma:usize,         // number of sigma sampling points on each side (de_max scan)
+    pub step_sigma:f64,             // spacing of sigma grid in Ha (de_max scan)
     pub fourier_self_energy:bool,
     pub fse_sin_coeff_path:String,
     pub fse_cos_coeff_path:String,
@@ -91,6 +97,22 @@ pub struct QuasiParticle {
     pub bse_feast_cg_tol: f64,
     pub bse_feast_gmres_restart: usize,
     pub bse_feast_gmres_max_iter: usize,
+    // FEAST initial guess type: "random" (default) or "gaussian"
+    pub bse_feast_init_guess_type: String,
+    // Gaussian width = (step * width_factor)²  (default 0.5 → half-spacing)
+    pub bse_feast_gaussian_width_factor: f64,
+    // NLFEAST (nonlinear BSE) control parameters
+    pub nonlinear_bse: bool,
+    pub nlfeast_centre: f64,
+    pub nlfeast_radius: f64,
+    pub nlfeast_m0: usize,
+    pub nlfeast_n_quad: usize,
+    pub nlfeast_max_iter: usize,
+    pub nlfeast_tol: f64,
+    pub nlfeast_gmres_restart: usize,
+    pub nlfeast_gmres_max_it: usize,
+    pub nlfeast_gmres_tol: f64,
+    pub export_matvec_count: bool,
 }
 
 impl Default for QuasiParticle {
@@ -126,6 +148,12 @@ impl Default for QuasiParticle {
             save_qp_path:String::from("single_qp_path.txt"),
             save_first_excitation:false,
             save_first_excitation_path:String::from("first_excitation_save.txt"),
+            use_low_rank_contour:false,
+            low_rank_grid_type:String::from("linear"),
+            nomega_chi_real:6,
+            low_rank_tolerance:1e-3,
+            nomega_sigma:10,
+            step_sigma:0.05,
             parse_qp_path:String::from("./qp_energies"),
             fourier_self_energy:false,
             fse_sin_coeff_path:String::from("./fse_sin_coeff.txt"),
@@ -178,6 +206,19 @@ impl Default for QuasiParticle {
             bse_feast_cg_tol: 1e-8,
             bse_feast_gmres_restart: 200,
             bse_feast_gmres_max_iter: 500,
+            bse_feast_init_guess_type: String::from("random"),
+            bse_feast_gaussian_width_factor: 0.5,
+            nonlinear_bse: false,
+            nlfeast_centre: 0.0,
+            nlfeast_radius: 0.5,
+            nlfeast_m0: 20,
+            nlfeast_n_quad: 12,
+            nlfeast_max_iter: 20,
+            nlfeast_tol: 1e-8,
+            nlfeast_gmres_restart: 200,
+            nlfeast_gmres_max_it: 500,
+            nlfeast_gmres_tol: 1e-6,
+            export_matvec_count: false,
         }
     }
 }
@@ -217,6 +258,12 @@ impl QuasiParticle {
         table.insert("save_qp_path".to_string(), toml::Value::String(self.save_qp_path.clone()));
         table.insert("save_first_excitation".to_string(), toml::Value::Boolean(self.save_first_excitation));
         table.insert("save_first_excitation_path".to_string(), toml::Value::String(self.save_first_excitation_path.clone()));
+        table.insert("use_low_rank_contour".to_string(), toml::Value::Boolean(self.use_low_rank_contour));
+        table.insert("low_rank_grid_type".to_string(), toml::Value::String(self.low_rank_grid_type.clone()));
+        table.insert("nomega_chi_real".to_string(), toml::Value::Integer(self.nomega_chi_real as i64));
+        table.insert("low_rank_tolerance".to_string(), toml::Value::Float(self.low_rank_tolerance));
+        table.insert("nomega_sigma".to_string(), toml::Value::Integer(self.nomega_sigma as i64));
+        table.insert("step_sigma".to_string(), toml::Value::Float(self.step_sigma));
         table.insert("fse_sin_coeff_path".to_string(), toml::Value::String(self.fse_sin_coeff_path.clone()));
         table.insert("fse_cos_coeff_path".to_string(), toml::Value::String(self.fse_cos_coeff_path.clone()));
         table.insert("hermite_self_energy".to_string(), toml::Value::Boolean(self.hermite_self_energy));
@@ -265,9 +312,22 @@ impl QuasiParticle {
         table.insert("bse_feast_cg_tol".to_string(), toml::Value::Float(self.bse_feast_cg_tol));
         table.insert("bse_feast_gmres_restart".to_string(), toml::Value::Integer(self.bse_feast_gmres_restart as i64));
         table.insert("bse_feast_gmres_max_iter".to_string(), toml::Value::Integer(self.bse_feast_gmres_max_iter as i64));
+        table.insert("bse_feast_init_guess_type".to_string(), toml::Value::String(self.bse_feast_init_guess_type.clone()));
+        table.insert("bse_feast_gaussian_width_factor".to_string(), toml::Value::Float(self.bse_feast_gaussian_width_factor));
         table.insert("damped_bse_solver".to_string(), toml::Value::String(self.damped_bse_solver.clone()));
         table.insert("damped_bse_tol".to_string(), toml::Value::Float(self.damped_bse_tol));
         table.insert("damped_bse_max_iter".to_string(), toml::Value::Integer(self.damped_bse_max_iter as i64));
+        table.insert("nonlinear_bse".to_string(), toml::Value::Boolean(self.nonlinear_bse));
+        table.insert("nlfeast_centre".to_string(), toml::Value::Float(self.nlfeast_centre));
+        table.insert("nlfeast_radius".to_string(), toml::Value::Float(self.nlfeast_radius));
+        table.insert("nlfeast_m0".to_string(), toml::Value::Integer(self.nlfeast_m0 as i64));
+        table.insert("nlfeast_n_quad".to_string(), toml::Value::Integer(self.nlfeast_n_quad as i64));
+        table.insert("nlfeast_max_iter".to_string(), toml::Value::Integer(self.nlfeast_max_iter as i64));
+        table.insert("nlfeast_tol".to_string(), toml::Value::Float(self.nlfeast_tol));
+        table.insert("nlfeast_gmres_restart".to_string(), toml::Value::Integer(self.nlfeast_gmres_restart as i64));
+        table.insert("nlfeast_gmres_max_it".to_string(), toml::Value::Integer(self.nlfeast_gmres_max_it as i64));
+        table.insert("nlfeast_gmres_tol".to_string(), toml::Value::Float(self.nlfeast_gmres_tol));
+        table.insert("export_matvec_count".to_string(), toml::Value::Boolean(self.export_matvec_count));
         toml::Value::Table(table)
     }
 }
@@ -487,6 +547,37 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::from("first_excitation_save.txt"),
             };
+            tmp_input.use_low_rank_contour = match tmp_ctrl.get("use_low_rank_contour").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                _ => {false},
+            };
+            tmp_input.low_rank_grid_type = match tmp_ctrl.get("low_rank_grid_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => {
+                    let lower = s.to_lowercase();
+                    match lower.as_str() {
+                        "quadratic" => String::from("quadratic"),
+                        _ => String::from("linear"),
+                    }
+                },
+                _ => String::from("linear"),
+            };
+            tmp_input.nomega_chi_real = match tmp_ctrl.get("nomega_chi_real").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(6_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(6) as usize},
+                _ => {6}
+            };
+            tmp_input.low_rank_tolerance = match tmp_ctrl.get("low_rank_tolerance").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-3)},
+                _ => {1e-3},
+            };
+            tmp_input.nomega_sigma = match tmp_ctrl.get("nomega_sigma").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(10) as usize},
+                _ => {10},
+            };
+            tmp_input.step_sigma = match tmp_ctrl.get("step_sigma").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.05)},
+                _ => {0.05},
+            };
             tmp_input.parse_qp_path = match tmp_ctrl.get("parse_qp_path").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::from("./qp_energies"),
@@ -597,6 +688,20 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(500) as usize,
                 _ => 500,
             };
+            tmp_input.bse_feast_init_guess_type = match tmp_ctrl.get("bse_feast_init_guess_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => {
+                    let lower = s.to_lowercase();
+                    match lower.as_str() {
+                        "gaussian" => String::from("gaussian"),
+                        _ => String::from("random"),
+                    }
+                },
+                _ => String::from("random"),
+            };
+            tmp_input.bse_feast_gaussian_width_factor = match tmp_ctrl.get("bse_feast_gaussian_width_factor").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.5),
+                _ => 0.5,
+            };
             // Generate grids: OUTER LOOP X, MIDDLE LOOP Y, INNER LOOP Z
             let x_step = if tmp_input.damped_bse_x_points > 1 {
                 (tmp_input.damped_bse_x_end - tmp_input.damped_bse_x_start) / (tmp_input.damped_bse_x_points - 1) as f64
@@ -636,6 +741,51 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.damped_bse_max_iter = match tmp_ctrl.get("damped_bse_max_iter").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(200) as usize,
                 _ => 200,
+            };
+            // NLFEAST (nonlinear BSE) control parameters
+            tmp_input.nonlinear_bse = match tmp_ctrl.get("nonlinear_bse").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
+            };
+            tmp_input.nlfeast_centre = match tmp_ctrl.get("nlfeast_centre").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.nlfeast_radius = match tmp_ctrl.get("nlfeast_radius").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.5),
+                _ => 0.5,
+            };
+            tmp_input.nlfeast_m0 = match tmp_ctrl.get("nlfeast_m0").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(20) as usize,
+                _ => 20,
+            };
+            tmp_input.nlfeast_n_quad = match tmp_ctrl.get("nlfeast_n_quad").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(12) as usize,
+                _ => 12,
+            };
+            tmp_input.nlfeast_max_iter = match tmp_ctrl.get("nlfeast_max_iter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(20) as usize,
+                _ => 20,
+            };
+            tmp_input.nlfeast_tol = match tmp_ctrl.get("nlfeast_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e-8),
+                _ => 1e-8,
+            };
+            tmp_input.nlfeast_gmres_restart = match tmp_ctrl.get("nlfeast_gmres_restart").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(200) as usize,
+                _ => 200,
+            };
+            tmp_input.nlfeast_gmres_max_it = match tmp_ctrl.get("nlfeast_gmres_max_it").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(500) as usize,
+                _ => 500,
+            };
+            tmp_input.export_matvec_count = match tmp_ctrl.get("export_matvec_count").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
+            };
+            tmp_input.nlfeast_gmres_tol = match tmp_ctrl.get("nlfeast_gmres_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e-6),
+                _ => 1e-6,
             };
             return Ok(Some(tmp_input));
         },

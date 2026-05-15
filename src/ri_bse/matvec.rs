@@ -1,10 +1,11 @@
+use super::matvec_trace;
 use crate::scf_io::{SCF, SCFType};
 use tensors::{MathMatrix, MatrixFull, RIFull,MatrixFullSlice};
 use crate::ri_gw::get_occupation_parameters;
 use itertools::Itertools;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgeev, _dgemv,_dgemm_full};
 use crate::ri_bse;
-use crate::ri_bse::{davidson_solver,sbse};
+use crate::ri_bse::davidson_solver;
 use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
 use rayon::prelude::*;
 use std::time::Instant;
@@ -243,30 +244,6 @@ pub fn test_v_w_contribution_v01(scf_data:&SCF){
     let mut bz=w_contribution_b_block_dgemm(scf_data,&ri_ov_reshape,&z_vec,&ri_ov_tilde);
     println!("B Block DGEMM Time={:?}",bblock_dgemm_timing.elapsed());
     println!("Wz_B DGEMM:{:?}",bz);
-    /*let auxbas_dir=scf_data.mol.ctrl.auxbas_path.clone();
-    let elements=scf_data.mol.geom.elem.clone();
-    let relevant_indices=sbse::obtain_relevant_indices(&elements,&auxbas_dir,0);
-    
-    let ri_oo=ri_bse::get_submatrix(scf_data,'O','O','N');
-    let mut ri_vv_new=ri_bse::get_submatrix(scf_data,'V','V','N');
-    println!("Full NumAuxBas={}\nRelevant Indices={:?}",ri_ov.size[0],relevant_indices);
-    let mut ri_oo_tilde_small=sbse::obtain_ri_with_reduced_ang_momentum(&ri_oo,&relevant_indices);
-    println!("RI-OO-Tilde Size={},{}, where occ_size={}",ri_oo_tilde_small.size[0],ri_oo_tilde_small.size[1],occ_size);
-    let reduced_num_auxbas=ri_oo_tilde_small.size[0];
-    println!("Reduced NumAuxBas={}",reduced_num_auxbas);
-    ri_oo_tilde_small.reshape([reduced_num_auxbas*occ_size,occ_size]);
-    ri_oo_tilde_small=ri_oo_tilde_small.transpose_and_drop();
-    ri_oo_tilde_small.reshape([occ_size*reduced_num_auxbas,occ_size]);
-    let mut ri_vv_small=sbse::obtain_ri_with_reduced_ang_momentum(&ri_vv_new,&relevant_indices);
-    ri_vv_small.reshape([reduced_num_auxbas*vir_size,vir_size]);
-    let ratio=sbse::power_iterative_norm(
-        |z|w_contribution_a_block_dgemm(scf_data,&ri_vv_reshape,&z,&ri_oo_tilde_reshape,&qp_ctrl),
-        |z|w_contribution_a_block_dgemm(scf_data,&ri_vv_small,&z,&ri_oo_tilde_small,&qp_ctrl),
-        occ_size*vir_size);
-    */
-
-
-
     /*let paired_vec=davidson_solver::PairedVector{x:vec![0.3;occ_size*vir_size],y:vec![0.3;occ_size*vir_size]};
     let paired_product=paired_vec.pair_matvec({|z|a_block_matvec(scf_data,&ri_oo_tilde,&z)},{|z|b_block_matvec(scf_data,&ri_ov_tilde,&z)});
     let full_product={let mut x_vec=paired_product.x;let y_vec=paired_product.y;x_vec.extend(&y_vec);x_vec};
@@ -279,6 +256,7 @@ pub fn test_v_w_contribution_v01(scf_data:&SCF){
     println!("Full matvec explicit{},{}",result[0],result[occ_size*vir_size+3])*/
 }
 pub fn a_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_vv:&MatrixFull<f64>,ri_ov:&MatrixFull<f64>,ri_oo_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
+    matvec_trace::trace("a_block_matvec");
     let start=Instant::now();
     let xlet=if qp_ctrl.bse_spin=="triplet"{'T'}else if qp_ctrl.bse_spin=="singlet"{'S'}else{'R'};
     let mut result=diagonal_elements_contribution(scf_data,z_vec);
@@ -309,6 +287,7 @@ pub fn a_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_vv:&MatrixFull<f64
     result
 }
 pub fn b_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_ov_a:&MatrixFull<f64>,ri_ov_b:&MatrixFull<f64>,ri_ov_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
+    matvec_trace::trace("b_block_matvec");
     let xlet=if qp_ctrl.bse_spin=="triplet"{'T'}else if qp_ctrl.bse_spin=="singlet"{'S'}else{'R'};
     let mut result=vec![0.0;z_vec.len()];
     let mut ri_ov_tilde_old=ri_ov_tilde.clone();
@@ -321,42 +300,4 @@ pub fn b_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_ov_a:&MatrixFull<f
         result=coulomb_contribution(ri_ov_a,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|v_i+z_i).collect();
     }
     result
-}
-pub fn sbse_matvec(scf_data:&SCF,mo_coeff:&MatrixFull<f64>,w_ao_basis:&MatrixFull<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
-    let xlet=if scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().bse_spin=="triplet"{'T'}else{'S'};
-    let mut result=diagonal_elements_contribution(scf_data,z_vec);
-    result=sbse::sbse_matvec_w_contribution(w_ao_basis,mo_coeff,occ_size,vir_size,z_vec).iter().zip(result.iter()).map(|(w_i,z_i)|-w_i+z_i).collect();
-    if xlet=='S'{
-        result=coulomb_contribution(ri_ov,z_vec).iter().zip(result.iter()).map(|(v_i,z_i)|2.0*v_i+z_i).collect();
-    }
-    result
-}
-pub fn test_v_w_contribution_v02(scf_data:&SCF){
-    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
-    //ri_bse::prepare_ri3mo(scf_data,'N');
-    let (ri3ao, mut basbas2baspair, mut baspar2basbas) =  if let Some((riao,basbas2baspair, baspar2basbas))=&scf_data.rimatr {
-        (riao,basbas2baspair, baspar2basbas)
-    } else {
-        panic!("rimatr should be initialized in the preparation of riao");
-    };
-    let ri3ao=ri3ao.transpose();
-    let mut epsilon:Vec<f64>=scf_data.eigenvalues[0].clone();
-    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let energy_diag=ri_bse::construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
-    let inverse_dielectric=ri_bse::construct_inverse_dielectric(scf_data,&epsilon);
-    let w_ao=sbse::w_ao_basis(&inverse_dielectric,epsilon.len(),ri3ao.clone());
-    let mo_coeff=scf_data.eigenvectors[0].clone();
-    let ri_ov=ri_bse::get_submatrix(scf_data,'O','V','N');
-    let vector1=vec![1.0;occ_size*vir_size];
-    let mut vector2=vector1.clone();
-    vector2[3]=3.0;
-    vector2[5]=10.0;
-    let vec1_p_vec2=vector1.iter().zip(vector2.iter()).map(|(v1,v2)|v1+v2).collect();
-    let sbse_matvec=|z|sbse_matvec(scf_data,&mo_coeff,&w_ao,occ_size,vir_size,&ri_ov,&z);
-    let av1=sbse_matvec(vector1);
-    let av2=sbse_matvec(vector2);
-    let av1pv2=sbse_matvec(vec1_p_vec2);
-    let av1pav2:Vec<f64>=av1.iter().zip(av2.iter()).map(|(v1,v2)|v1+v2).collect();
-    println!("A(v1+v2)={:#?}",av1pv2);
-    println!("Av1+Av2={:#?}",av1pav2);
 }
