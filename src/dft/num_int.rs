@@ -8,6 +8,7 @@ use crate::molecule_io::Molecule;
 use crate::basis_io::{spheric_gto_deriv_batch_serial};
 use crate::dft::{Grids, DFA4REST};
 use crate::dft::xc_deriv::XCType;
+use crate::scf_io::util::occupied_orbital_count_with_threshold;
 use crate::dft::libxc_itrf::eval_xc_eff;
 
 
@@ -271,15 +272,8 @@ pub fn eval_rho5_spin_batch(ao:&RIFull<f64>, xc_type:XCType, mo:&MatrixFull<f64>
 
     
     
-    let homo = occ.iter().enumerate()
-        .filter(|(i,occ)| **occ >=1.0e-6)
-        .map(|(i,occ)| i).max();
-    let mut occ_tmp = if let Some(homo) = homo {
-            occ[0..homo+1].iter().map(|occ| occ.sqrt()).collect::<Vec<f64>>()
-    } else {
-        // In this case, no electrons in the i_spin channel, for which homo_s = None
-        vec![]
-    };
+    let num_occ = occupied_orbital_count_with_threshold(occ, 1.0e-6);
+    let mut occ_tmp = occ[0..num_occ].iter().map(|occ| occ.sqrt()).collect::<Vec<f64>>();
 
     let num_occ = occ_tmp.len();
     let mut wmo = _einsum_01_serial(&mo.to_matrixfullslice(), &occ_tmp);
@@ -866,7 +860,6 @@ impl<'a> NumInt<'a> for DFA4REST {
 
 
 }
-
 
 
 
