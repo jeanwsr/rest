@@ -14,7 +14,7 @@
 // LAPACK's dgesv (LU factorization).  The 2N × 2N matrix is assembled
 // via O(N) calls to the a_mul / b_mul closures on unit vectors.
 // ============================================================================
-
+use crate::tensors::MathMatrix;
 use crate::scf_io::SCF;
 use rest_tensors::matrix::matrix_blas_lapack::{
     _dgemm_scaled,_dgemm_full, _dpotrf, _dsyevd, _dinverse, _dgeev,
@@ -147,22 +147,21 @@ fn gmres(
     max_iter: usize,
     tol: f64,
     verbose: bool,
-    precondition: Option<&Vec<f64>>,
+    precondition: Option<&BlockDiagPrecond>,
 ) -> Vec<f64> {
     let n = b.len();
 
     // Preconditioned RHS norm for tolerance
-    let b_prec: Vec<f64> = if let Some(prec) = precondition {
-        (0..n).map(|i| b[i] / f64::max(prec[i].abs(), 1e-16)).collect()
+    let b_norm: f64 = if let Some(prec) = precondition {
+        prec.norm(b)
     } else {
-        b.clone()
+        b.iter().map(|bi| bi * bi).sum::<f64>().sqrt()
     };
-    let b_norm: f64 = b_prec.iter().map(|bi| bi * bi).sum::<f64>().sqrt();
     let tol_abs = tol * b_norm.max(1e-30);
 
-    // Helper: apply diagonal preconditioner to a vector
-    let apply_prec = |w: &Vec<f64>, prec: &Vec<f64>| -> Vec<f64> {
-        (0..n).map(|i| w[i] / f64::max(prec[i].abs(), 1e-16)).collect()
+    // Helper: apply block-diagonal preconditioner to a vector
+    let apply_prec = |w: &Vec<f64>, prec: &BlockDiagPrecond| -> Vec<f64> {
+        prec.apply_inverse(w)
     };
 
     let mut x = vec![0.0; n];
@@ -330,6 +329,68 @@ fn gmres(
     x
 }
 
+/// 2×2 block-diagonal preconditioner for the 2N real-embedded system.
+///
+/// For each original complex index i (mapping to real components at indices
+/// i and N+i in the 2N vector), the block is stored as [a, b, c, d] in
+/// row-major order representing:
+///
+///   block_i = [a  b]
+///             [c  d]
+///
+/// Application: v_out = block_i⁻¹ · v_in  (solved for each i).
+pub struct BlockDiagPrecond {
+    pub blocks: Vec<[f64; 4]>,
+}
+
+impl BlockDiagPrecond {
+    /// Create from two arrays: re_part[i] = Re(λ_i), im_part[i] = Im(λ_i).
+    /// The correct 2×2 block for complex value λ = re + i·im in the
+    /// real embedding is [[re, -im], [im, re]].
+    pub fn from_re_im(re_part: &[f64], im_part: &[f64]) -> Self {
+        let n = re_part.len();
+        let mut blocks = Vec::with_capacity(n);
+        for i in 0..n {
+            blocks.push([re_part[i], -im_part[i], im_part[i], re_part[i]]);
+        }
+        BlockDiagPrecond { blocks }
+    }
+
+    /// Apply the inverse of this block-diagonal matrix to a vector v
+    /// of length 2*n (first n = real parts, next n = imag parts).
+    pub fn apply_inverse(&self, v: &[f64]) -> Vec<f64> {
+        let n = self.blocks.len();
+        let mut out = v.to_vec();
+        for i in 0..n {
+            let [a, b, c, d] = self.blocks[i];
+            let det = a * d - b * c;
+            let inv_det = 1.0 / f64::max(det.abs(), 1e-30);
+            let r = v[i];
+            let s = v[n + i];
+            out[i]     = ( d * r - b * s) * inv_det;
+            out[n + i] = (-c * r + a * s) * inv_det;
+        }
+        out
+    }
+
+    /// Compute the 2-norm of the preconditioned vector (for residual checks).
+    pub fn norm(&self, v: &[f64]) -> f64 {
+        let n = self.blocks.len();
+        let mut sum = 0.0;
+        for i in 0..n {
+            let [a, b, c, d] = self.blocks[i];
+            let det = a * d - b * c;
+            let inv_det = 1.0 / f64::max(det.abs(), 1e-30);
+            let r = v[i];
+            let s = v[n + i];
+            let pr = ( d * r - b * s) * inv_det;
+            let ps = (-c * r + a * s) * inv_det;
+            sum += pr * pr + ps * ps;
+        }
+        sum.sqrt()
+    }
+}
+
 /// Solve (z·B − A) · X = RHS  for all columns of RHS using GMRES.
 ///
 /// The complex system (α+iβ)·B − A is embedded as a 2N×2N real system
@@ -358,17 +419,19 @@ fn solve_complex_iterative(
 ) -> (MatrixFull<f64>, MatrixFull<f64>) {
     let m0 = rhs_matrix.size()[1];
 
-    // Build M₂ diagonal preconditioner: M₂_diag[k] = alpha − Ã_diag[k % n]
+    // Build M₂ block-diagonal preconditioner
+    // The 2×2 block for each complex index i is:
+    //   [α − Ã[i]    −β]
+    //   [  β       α − Ã[i]]
+    // We store this as [re, -im, im, re] = [α-d[i], -β, β, α-d[i]]
     let precond = diag_a.map(|d| {
-        let mut p = vec![0.0; 2 * n];
+        let mut re_part = vec![0.0; n];
+        let mut im_part = vec![0.0; n];
         for i in 0..n {
-            // M₂ = [ α·I − Ã   −β·I  ]
-            //      [  β·I     α·I − Ã ]
-            // Diagonal: α − Ã_diag[i] for both blocks
-            p[i] = alpha - d[i];
-            p[n + i] = alpha - d[i];
+            re_part[i] = alpha - d[i];
+            im_part[i] = -beta;  // −β from the upper-right block
         }
-        p
+        BlockDiagPrecond::from_re_im(&re_part, &im_part)
     });
 
     let mut x_re = MatrixFull::new([n, m0], 0.0);
@@ -452,6 +515,9 @@ pub fn feast(
     gmres_max_iter: usize,
     gmres_tol: f64,
     diag_a: Option<&Vec<f64>>,
+    init_guess_type: &str,
+    init_diag: Option<&Vec<f64>>,
+    gaussian_width_factor: f64,
 ) -> Vec<(f64, Vec<f64>)> {
     // ---- Step 0: parameters ------------------------------------------------
     let c = (λ_max + λ_min) / 2.0; // centre of the contour
@@ -494,12 +560,70 @@ pub fn feast(
         })
         .collect();
 
-    // ---- Step 1: random initial subspace -----------------------------------
+    // ---- Step 1: initial subspace ---------------------------------------------
     let mut rng = rand::thread_rng();
     let mut y = MatrixFull::new([n, m0], 0.0);
-    for j in 0..m0 {
-        for i in 0..n {
-            y[[i, j]] = rng.gen::<f64>() * 2.0 - 1.0; // uniform in [-1, 1]
+    if init_guess_type == "gaussian" {
+        // Gaussian-weighted initial guess strategy:
+        //   1. Extend the search window by 50% on each side → sampling window
+        //   2. Divide sampling window into m0-1 equal segments → m0 equally spaced E_k
+        //   3. For each E_k, build weight vector w_j = exp(-(D_j - E_k)² / a)
+        //      where a = (half spacing)², then normalize and apply random signs.
+        let l = λ_max - λ_min;
+        let samp_min = λ_min - 0.5 * l;
+        let samp_max = λ_max + 0.5 * l;
+        let step = if m0 > 1 { (samp_max - samp_min) / (m0 - 1) as f64 } else { 0.0 };
+        let half_step = step * gaussian_width_factor;
+        let a = half_step * half_step; // Gaussian width parameter
+
+        if let Some(diag) = init_diag {
+            for j in 0..m0 {
+                let e_k = samp_min + j as f64 * step;
+                // Compute unnormalized Gaussian weights
+                let raw_w: Vec<f64> = if a > 1e-30 {
+                    diag.iter()
+                        .map(|&d| {
+                            let de = d - e_k;
+                            (-de * de / a).exp()
+                        })
+                        .collect()
+                } else {
+                    // a is effectively zero: all weight at the sampling energy
+                    diag.iter()
+                        .map(|&d| {
+                            let de = (d - e_k).abs();
+                            if de < 1e-12 { 1.0 } else { 0.0 }
+                        })
+                        .collect()
+                };
+                // Normalize
+                let norm: f64 = raw_w.iter().map(|&wi| wi * wi).sum::<f64>().sqrt();
+                if norm > 1e-30 {
+                    for i in 0..n {
+                        let sign = if rng.gen::<f64>() > 0.5 { 1.0 } else { -1.0 };
+                        y[[i, j]] = sign * raw_w[i] / norm;
+                    }
+                } else {
+                    // Fallback to random if all weights vanish
+                    for i in 0..n {
+                        y[[i, j]] = rng.gen::<f64>() * 2.0 - 1.0;
+                    }
+                }
+            }
+        } else {
+            // Fallback to random if no diag available
+            for j in 0..m0 {
+                for i in 0..n {
+                    y[[i, j]] = rng.gen::<f64>() * 2.0 - 1.0;
+                }
+            }
+        }
+    } else {
+        // Default random strategy
+        for j in 0..m0 {
+            for i in 0..n {
+                y[[i, j]] = rng.gen::<f64>() * 2.0 - 1.0; // uniform in [-1, 1]
+            }
         }
     }
 
@@ -540,14 +664,42 @@ pub fn feast(
             }
         }
 
+        // ── Step 2a': Subspace orthogonalization and compression ──
+        // Purify Q by removing near-linear-dependent directions:
+        //   1. Compute Gram matrix S = Q^T·Q
+        //   2. Eigendecompose S = V·Λ·V^T
+        //   3. Keep eigenvectors with eigenvalue > 1e-4
+        //   4. Form orthonormal Q_tilde = Q·V_selected·diag(1/√λ)
+        let qtq = _dgemm_scaled(&q, 'T', &q, 'N', 1.0);
+        let (v_opt, eigval_qtq, _) = _dsyevd(&qtq, 'V');
+        let v = v_opt.unwrap();
+        let threshold = 1e-6;
+        let m_eff = std::cmp::max(1, eigval_qtq.iter().filter(|&&val| val > threshold).count());
+        if m_eff < m0 {
+            let offset = m0 - m_eff;
+            let mut q_tilde = MatrixFull::new([n, m_eff], 0.0);
+            for j in 0..m_eff {
+                let inv_sqrt = 1.0 / eigval_qtq[offset + j].sqrt();
+                for i in 0..n {
+                    let mut s = 0.0;
+                    for k in 0..m0 {
+                        s += q[[i, k]] * v[[k, offset + j]];
+                    }
+                    q_tilde[[i, j]] = s* inv_sqrt;
+                }
+            }
+            q = q_tilde;
+            println!("FEAST iter {}: subspace compressed from {} to {}", iter, m0, m_eff);
+        }
+
         // ── Step 2b: Rayleigh–Ritz — form reduced matrices ──
-        //   A_Q = Q^T · A · Q      (M0 × M0)
-        //   B_Q = Q^T · B · Q      (M0 × M0)
+        //   A_Q = Q^T · A · Q      (m_eff × m_eff)
+        //   B_Q = Q^T · B · Q      (m_eff × m_eff)
         //
         // Compute A·Q and B·Q one column at a time using closures.
-        let mut aq = MatrixFull::new([n, m0], 0.0);
-        let mut bq = MatrixFull::new([n, m0], 0.0);
-        for j in 0..m0 {
+        let mut aq = MatrixFull::new([n, m_eff], 0.0);
+        let mut bq = MatrixFull::new([n, m_eff], 0.0);
+        for j in 0..m_eff {
             let qj: Vec<f64> = (0..n).map(|i| q[[i, j]]).collect();
             let aqj = a_mul(&qj);
             let bqj = b_mul(&qj);
@@ -556,12 +708,30 @@ pub fn feast(
                 bq[[i, j]] = bqj[i];
             }
         }
-        let a_q = _dgemm_scaled(&q, 'T', &aq, 'N', 1.0); // Q^T · A·Q
+        let mut a_q = _dgemm_scaled(&q, 'T', &aq, 'N', 1.0); // Q^T · A·Q
         let mut b_q = _dgemm_scaled(&q, 'T', &bq, 'N', 1.0); // Q^T · B·Q
-        b_q.formated_output(1000,"full");
+        // let (_, wr_aq, _, _, _, _) = _dgeev(&a_q, 'N', 'N');
+        // let min_aq = wr_aq.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        // println!("Minimum eigenvalue of A_Q (subspace) matrix: {}", min_aq);
+        // let (_, wr_bq, _, _, _, _) = _dgeev(&b_q, 'N', 'N');
+        // let min_bq = wr_bq.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        // println!("Minimum eigenvalue of B_Q (subspace) matrix: {}", min_bq);
+
+
         // ── Step 2c: Rayleigh-Ritz — solve reduced eigenvalue problem ──
         // B_Q should be SPD for the standard Cholesky-based reduction path.
         // If not SPD, fall back to solving B_Q^{-1}·A_Q via dgeev.
+
+        // let aq_p_bq=MatrixFull::add(&a_q,&b_q).unwrap();
+        // let mut bq_clone=b_q.clone();
+        // bq_clone.self_multiple(-1.0);
+        // let aq_m_bq=MatrixFull::add(&a_q,&bq_clone).unwrap();
+        // let (_, wr_apb, _, _, _, _) = _dgeev(&aq_p_bq, 'N', 'N');
+        // let min_apb = wr_apb.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        // println!("Minimum eigenvalue of A_Q + B_Q (subspace) matrix: {}", min_apb);
+        // let (_, wr_amb, _, _, _, _) = _dgeev(&aq_m_bq, 'N', 'N');
+        // let min_amb = wr_amb.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        // println!("Minimum eigenvalue of A_Q - B_Q (subspace) matrix: {}", min_amb);
         let cholesky_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             _dpotrf(&mut b_q, 'L');
         }));
@@ -570,9 +740,9 @@ pub fn feast(
             // ── Cholesky path: H = L⁻¹ · A_Q · L⁻ᵀ, then dsyevd ──
 
             // Extract lower-triangular L from B_Q (after dpotrf, L is in lower triangle)
-            let mut l_mat = MatrixFull::new([m0, m0], 0.0);
-            for j in 0..m0 {
-                for i in j..m0 {
+            let mut l_mat = MatrixFull::new([m_eff, m_eff], 0.0);
+            for j in 0..m_eff {
+                for i in j..m_eff {
                     l_mat[[i, j]] = b_q[[i, j]];
                 }
             }
@@ -581,8 +751,8 @@ pub fn feast(
                 Some(m) => m,
                 None => {
                     eprintln!("Warning: could not invert L.  Using identity fallback.");
-                    let mut eye = MatrixFull::new([m0, m0], 0.0);
-                    for i in 0..m0 {
+                    let mut eye = MatrixFull::new([m_eff, m_eff], 0.0);
+                    for i in 0..m_eff {
                         eye[[i, i]] = 1.0;
                     }
                     eye
@@ -625,7 +795,7 @@ pub fn feast(
                 }
 
                 // Select real eigenvalues (BSE should give real excitation energies)
-                let mut eigen_pairs: Vec<(usize, f64)> = (0..m0)
+                let mut eigen_pairs: Vec<(usize, f64)> = (0..m_eff)
                     .filter(|&j| wi[j].abs() < 1.0e-10)
                     .map(|j| (j, wr[j]))
                     .collect();
@@ -635,9 +805,9 @@ pub fn feast(
                 let m_selected = eigen_pairs.len();
 
                 // Build phi from selected right eigenvectors
-                let mut phi = MatrixFull::new([m0, m_selected], 0.0);
+                let mut phi = MatrixFull::new([m_eff, m_selected], 0.0);
                 for (col, &(j, _)) in eigen_pairs.iter().enumerate() {
-                    for i in 0..m0 {
+                    for i in 0..m_eff {
                         phi[[i, col]] = vr[[i, j]];
                     }
                 }
@@ -645,10 +815,10 @@ pub fn feast(
                 // Ritz vectors: X_new = Q · Φ
                 let mut x_new = _dgemm_scaled(&q, 'N', &phi, 'N', 1.0);
 
-                // Pad lambda and x_new back to m0 columns (for subspace consistency)
-                if m_selected < m0 {
-                    lambda.resize(m0, 0.0);
-                    let mut x_new_padded = MatrixFull::new([n, m0], 0.0);
+                // Pad lambda and x_new back to m_eff columns (for subspace consistency)
+                if m_selected < m_eff {
+                    lambda.resize(m_eff, 0.0);
+                    let mut x_new_padded = MatrixFull::new([n, m_eff], 0.0);
                     for j in 0..m_selected {
                         for i in 0..n {
                             x_new_padded[[i, j]] = x_new[[i, j]];
@@ -665,6 +835,21 @@ pub fn feast(
                 let x_new = _dgemm_scaled(&q, 'N', &psi, 'N', 1.0);
                 (lambda, x_new)
             };
+            (lambda, x_new)
+        };
+
+        // ── Pad subspace results back to m0 columns for next iteration ──
+        let (lambda, x_new) = if m_eff < m0 {
+            let mut lambda_padded = lambda;
+            lambda_padded.resize(m0, 0.0);
+            let mut x_new_padded = MatrixFull::new([n, m0], 0.0);
+            for j in 0..m_eff {
+                for i in 0..n {
+                    x_new_padded[[i, j]] = x_new[[i, j]];
+                }
+            }
+            (lambda_padded, x_new_padded)
+        } else {
             (lambda, x_new)
         };
 
@@ -738,8 +923,8 @@ fn extract_eigenpairs(
 /// FEAST solver for singlet BSE excitations (handles both TDA and non-TDA).
 pub fn feast_solve_bse_singlet(scf_data:&SCF)->Vec<(f64,Vec<f64>)>{
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let eigenrange_min=qp_ctrl.bse_eigenrange_min;
-    let eigenrange_max=qp_ctrl.bse_eigenrange_max;
+    let eigenrange_min=qp_ctrl.bse_eigenrange_min*qp_ctrl.bse_eigenrange_min;
+    let eigenrange_max=qp_ctrl.bse_eigenrange_max*qp_ctrl.bse_eigenrange_max;
     let m_expected=qp_ctrl.bse_m_expected;
     let max_feast_iter=qp_ctrl.bse_max_feast_iter;
     let tol_feast=qp_ctrl.bse_tol_feast;
@@ -753,8 +938,8 @@ pub fn feast_solve_bse_singlet(scf_data:&SCF)->Vec<(f64,Vec<f64>)>{
 /// FEAST solver for triplet BSE excitations (handles both TDA and non-TDA).
 pub fn feast_solve_bse_triplet(scf_data:&SCF)->Vec<(f64,Vec<f64>)>{
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let eigenrange_min=qp_ctrl.bse_eigenrange_min;
-    let eigenrange_max=qp_ctrl.bse_eigenrange_max;
+    let eigenrange_min=qp_ctrl.bse_eigenrange_min*qp_ctrl.bse_eigenrange_min;
+    let eigenrange_max=qp_ctrl.bse_eigenrange_max*qp_ctrl.bse_eigenrange_max;
     let m_expected=qp_ctrl.bse_m_expected;
     let max_feast_iter=qp_ctrl.bse_max_feast_iter;
     let tol_feast=qp_ctrl.bse_tol_feast;
@@ -843,7 +1028,9 @@ fn feast_solve_bse_tda(
     feast(occ_size*vir_size,&feast_a_matvec,&feast_b_matvec,None,None,
           eigenrange_min,eigenrange_max,m_expected,max_feast_iter,tol_feast,
           gmres_restart,gmres_max_iter,gmres_tol,
-          Some(&diag_a))
+          Some(&diag_a),
+          &qp_ctrl.bse_feast_init_guess_type, Some(&diag_a),
+          qp_ctrl.bse_feast_gaussian_width_factor)
 }
 
 /// Non-TDA branch for a single spin.
@@ -910,20 +1097,20 @@ fn feast_solve_bse_nontda(
     // The transformed GMRES matrix is (z·I − (A−B)(A+B)).
     // Approximating A_diag ≈ D_j (QP energy gaps) and B_diag ≈ 0 gives
     // (A−B)(A+B)_diag ≈ D_j².  So M₂_diag ≈ z − D_j².
-    let diag_sq: Vec<f64> = {
-        let energies: Vec<f64> = if qp_ctrl.bse_qp_polarization {
-            scf_data.gwqp.0.clone()
-        } else {
-            scf_data.eigenvalues[0].clone()
-        };
-        let diag = construct_energy_diag_for_a(&energies, occ_size, vir_size);
-        diag.iter().map(|&d| d * d).collect()
+    let energies: Vec<f64> = if qp_ctrl.bse_qp_polarization {
+        scf_data.gwqp.0.clone()
+    } else {
+        scf_data.eigenvalues[0].clone()
     };
+    let diag = construct_energy_diag_for_a(&energies, occ_size, vir_size);
+    let diag_sq: Vec<f64> = diag.iter().map(|&d| d * d).collect();
 
     let eigenpairs_xpy=feast(occ_size*vir_size,&feast_a_matvec,&feast_b_matvec,Some(&gmres_a_mul),Some(&gmres_b_mul),
                              eigenrange_min,eigenrange_max,m_expected,max_feast_iter,tol_feast,
                              gmres_restart,gmres_max_iter,gmres_tol,
-                             Some(&diag_sq));
+                             Some(&diag_sq),
+                             &qp_ctrl.bse_feast_init_guess_type, Some(&diag),
+                             qp_ctrl.bse_feast_gaussian_width_factor);
     eigenpairs_xpy.iter().map(|(omega2,xpy)|{
         let xmy=feast_a_matvec(xpy);
         (omega2.sqrt(),xmy.iter().zip(xpy.iter()).map(|(xmy_k,xpy_k)|(xmy_k/omega2.sqrt())+xpy_k).collect::<Vec<_>>())
@@ -934,8 +1121,8 @@ fn feast_solve_bse_nontda(
 pub fn feast_solve_bse(scf_data:&SCF)->(Vec<(f64,Vec<f64>)>,Vec<(f64,Vec<f64>)>){
     let start=Instant::now();
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let eigenrange_min=qp_ctrl.bse_eigenrange_min;
-    let eigenrange_max=qp_ctrl.bse_eigenrange_max;
+    let eigenrange_min=qp_ctrl.bse_eigenrange_min*qp_ctrl.bse_eigenrange_min;
+    let eigenrange_max=qp_ctrl.bse_eigenrange_max*qp_ctrl.bse_eigenrange_max;
     let m_expected=qp_ctrl.bse_m_expected;
     let max_feast_iter=qp_ctrl.bse_max_feast_iter;
     let tol_feast=qp_ctrl.bse_tol_feast;

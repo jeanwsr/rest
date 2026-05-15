@@ -18,7 +18,7 @@ use rest_tensors::MatrixFull;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, _dgemv};
 use crate::scf_io::SCF;
 use crate::ri_bse;
-use crate::ri_tddft::fxc_matvec::{FXCMatvecData, fxc_matvec};
+use crate::dft::num_int::{FXCMatvecData, fxc_matvec};
 use crate::ri_tddft::utils::tddft_occupation_parameters;
 
 /// Build the diagonal preconditioner from KS orbital energy differences

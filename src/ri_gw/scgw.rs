@@ -77,12 +77,12 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
     //let contour=ri_gw::contour_rayon(0.0,n,&gwqp_g,&gwqp_w,occ_size,vir_size,num_state,ri_ov,ri_mat);
     //println!("Static Self Energy(Correlation part) Sigma_c(omega=0)={}(imag={},contour={})",contour-imag,imag,contour);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let self_energy_static=ri_gw::contour_rayon(scf_data.eigenvalues[0][n],n,&gwqp_g, &gwqp_w, occ_size, vir_size, num_state,ri_ov,ri_mat)-ri_gw::calculate_imag(w_c_at_freqs,num_state,n,scf_data.eigenvalues[0][n],&gwqp_g, &gwqp_w);
+    //let self_energy_static=ri_gw::contour_rayon(scf_data.eigenvalues[0][n],n,&gwqp_g, &gwqp_w, occ_size, vir_size, num_state,ri_ov,ri_mat)-ri_gw::calculate_imag(w_c_at_freqs,num_state,n,scf_data.eigenvalues[0][n],&gwqp_g, &gwqp_w);
     // 第一轮：正常GW计算（不添加Fourier自能）
     let qp_eq_func_no_fse = |omega: f64| {
         ri_gw::quasiparticle_equation(omega, n, consts, ri_ov, ri_mat, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs)
     };
-    println!("Static Approximation Yields:{},Sigma_c[E_KS]={},consts={},E_ks={}",qp_eq_func_no_fse(scf_data.eigenvalues[0][n])+scf_data.eigenvalues[0][n],self_energy_static,consts,scf_data.eigenvalues[0][n]);
+    //println!("Static Approximation Yields:{},Sigma_c[E_KS]={},consts={},E_ks={}",qp_eq_func_no_fse(scf_data.eigenvalues[0][n])+scf_data.eigenvalues[0][n],self_energy_static,consts,scf_data.eigenvalues[0][n]);
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
@@ -259,13 +259,6 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,t
     println!("RI-OV Shape={:?}",ri_ov.size);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let mut ri_mat:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'F','F','Y');
-    // if qp_ctrl.simplified_bse==true{
-    //     let ang_momentum=if qp_ctrl.simplified_bse==true{cmp::min(qp_ctrl.bse_max_ang_momentum,6)}else{6};
-    //     let elements=scf_data.mol.geom.elem.clone();
-    //     let relevant_indices=ri_bse::sbse::obtain_relevant_indices(scf_data,&elements,ang_momentum);
-    //     ri_ov=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_ov,&relevant_indices);
-    //     ri_mat=ri_bse::sbse::obtain_ri_with_reduced_ang_momentum(&ri_mat,&relevant_indices);
-    // }
     let start=Instant::now();
     let v_matrix=ri_gw::v_matrix(&scf_data,&ri_mat);
     let time1=start.elapsed();
@@ -279,11 +272,43 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,t
     }else{
         ri_gw::generate_w_c_serial(scf_data,&ri_ov,&ri_mat,&scf_data.gwqp.0,&scf_data.gwqp.1,num_state,occ_size,vir_size,num_freq)
     };
+
+    // Precompute low-rank real-axis v*chi*v if enabled
+    let real_axis_vchiv: Option<ri_gw::RealAxisVChiV> = if qp_ctrl.use_low_rank_contour {
+        println!("Low-rank contour: Precomputing real-axis sqrt(v)*chi*sqrt(v)...");
+        let gwqp_g = scf_data.gwqp.0.clone();
+        let gwqp_w = scf_data.gwqp.1.clone();
+        let (start_mo_2,num_state_2,occ_size_2,vir_size_2,homo_2,lumo_2)=ri_gw::get_occupation_parameters(&scf_data,'Y');
+        let nsemin = 0;
+        let nsemax = num_state_2 - 1;
+        let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
+        let pl = scf_data.mol.ctrl.print_level;
+        Some(ri_gw::generate_real_axis_vchiv(
+            &gwqp_g, &gwqp_w, occ_size_2, vir_size_2, num_state_2,
+            &ri_ov, &ri_mat,
+            qp_ctrl.nomega_chi_real,
+            nsemin, nsemax,
+            qp_ctrl.nomega_sigma,
+            qp_ctrl.step_sigma,
+            qp_ctrl.low_rank_tolerance,
+            grid_type,
+            pl,
+        ))
+    } else {
+        None
+    };
+
     let e_homo=ks_energies[occ_size-1];
     let e_lumo=ks_energies[occ_size];
     let calc_orbs_indices:Vec<usize>=ks_energies.into_iter().enumerate().filter(|(n,e_n)|*e_n>e_homo-threshold && *e_n<e_lumo+threshold).map(|(n,e_n)|n).collect();
     println!("calculated orbital indices:{:?}",calc_orbs_indices);
-    let calc_orbs:Vec<(usize,f64)>=calc_orbs_indices.iter().map(|&n|(n,single_orbital_gw(scf_data,&v_matrix,&ri_ov,&ri_mat,&w_c_at_freqs,n,num_freq,vxc_nn[n]))).collect();
+    let calc_orbs:Vec<(usize,f64)>=calc_orbs_indices.iter().map(|&n|{
+        if let Some(ref ra) = real_axis_vchiv {
+            (n, single_orbital_gw_lowrank(scf_data, &v_matrix, &ri_ov, &ri_mat, &w_c_at_freqs, ra, n, num_freq, vxc_nn[n]))
+        } else {
+            (n, single_orbital_gw(scf_data, &v_matrix, &ri_ov, &ri_mat, &w_c_at_freqs, n, num_freq, vxc_nn[n]))
+        }
+    }).collect();
     let occ_shift=calc_orbs[0].1-scf_data.eigenvalues[0][calc_orbs[0].0];
     let vir_shift=calc_orbs[calc_orbs.len()-1].1-scf_data.eigenvalues[0][calc_orbs[calc_orbs.len()-1].0];
     let mut gwqp:Vec<f64>=Vec::new();
@@ -329,4 +354,142 @@ pub fn prepare_gwqp(scf_data:&mut SCF){
         }
     }
     scf_data.gwqp=(quasiparticle_energies_g,quasiparticle_energies_w)
+}
+
+/// Low-rank version of single_orbital_gw for core/valence GW calculations.
+/// Uses pre-computed real-axis low-rank v*chi*v for contour (residue) contributions.
+fn single_orbital_gw_lowrank(
+    scf_data: &mut SCF,
+    v_matrix: &MatrixFull<f64>,
+    ri_ov: &MatrixFull<f64>,
+    ri_mat: &MatrixFull<f64>,
+    w_c_at_freqs: &Vec<(f64, f64, MatrixFull<f64>)>,
+    real_axis_vchiv: &ri_gw::RealAxisVChiV,
+    n: usize,
+    num_freq: usize,
+    vxc_nn: f64,
+) -> f64 {
+    let start = Instant::now();
+    let gwqp_g = scf_data.gwqp.0.clone();
+    let gwqp_w = scf_data.gwqp.1.clone();
+    let e_ks_n = scf_data.eigenvalues[0][n];
+    let (start_mo, num_state, occ_size, vir_size, homo, lumo) = ri_gw::get_occupation_parameters(&scf_data, 'Y');
+    let mut exchange = 0.0;
+    for i in 0..homo + 1 {
+        exchange -= v_matrix[[n, i]];
+    }
+    let hybrid_param = scf_data.mol.xc_data.dfa_hybrid_scf;
+    let side = if n >= occ_size { 1.0 } else { -1.0 };
+    let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
+
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let rootfinder = qp_ctrl.gw_rootfinder.clone();
+    let qp_energy_no_fse;
+
+    if rootfinder == "newton".to_string() {
+        println!("Orbital #{} (low-rank, no FSE):", n);
+        let qp_start = gwqp_g[n];
+        qp_energy_no_fse = ri_gw::newton_solver_lowrank(
+            n, consts, ri_mat, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
+            w_c_at_freqs, real_axis_vchiv,
+            qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level,
+        );
+        println!("QP energy (low-rank, no FSE): {}", qp_energy_no_fse);
+    } else if rootfinder == "interpolation".to_string() {
+        // Debug print at starting point (once per state)
+        // Use gwqp_g[n] as omega to ensure self-pole (de = qp_g[n] - omega = 0) is captured
+        // The solver's scan uses e_ks_n as starting_point, but the self-pole FIXED POINT
+        // is at omega = qp_energy (gwqp_g[n]), not the KS energy.
+        let debug_omega = gwqp_g[n];
+        let pl = scf_data.mol.ctrl.print_level;
+        ri_gw::quasiparticle_equation_lowrank(
+            debug_omega, n, consts, ri_mat, &gwqp_g, &gwqp_w,
+            occ_size, vir_size, num_state,
+            w_c_at_freqs, real_axis_vchiv, pl,
+        );
+        let qp_eq_func = |omega: f64| {
+            ri_gw::quasiparticle_equation_lowrank(
+                omega, n, consts, ri_mat, &gwqp_g, &gwqp_w,
+                occ_size, vir_size, num_state,
+                w_c_at_freqs, real_axis_vchiv, 0,
+            )
+        };
+        // Use gwqp_g[n] as starting_point so the self-pole (de=0) at omega = qp_energy
+        // is captured by fallback and solver scan. Without this, the half-pole is missed
+        // when renormalized_singles or evGW shifts gwqp_g[n] away from e_ks_n.
+        let qp_start = gwqp_g[n];
+        let (have_crossing, mut qp_energy) = ri_gw::linear_interpolation_solver(
+            qp_eq_func, qp_start, side, qp_ctrl.gw_search_grid, qp_ctrl.gw_span_energy,
+        );
+        // let static_result=qp_eq_func(scf_data.eigenvalues[0][n])+scf_data.eigenvalues[0][n];
+        // println!("Static Approximation yields: {}",static_result);
+        if !have_crossing {
+            println!("No graphical crossings for n={}, using Newton solver.", n);
+            qp_energy = ri_gw::newton_solver_lowrank(
+                n, consts, ri_mat, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
+                w_c_at_freqs, real_axis_vchiv,
+                qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level,
+            );
+        }
+        qp_energy_no_fse = qp_energy;
+        println!("QP energy (low-rank, no FSE): {}", qp_energy_no_fse);
+    } else {
+        panic!("Invalid choice of GW rootfinder!");
+    }
+
+    if !qp_ctrl.fourier_self_energy && !qp_ctrl.hermite_self_energy {
+        println!("GW of orbital #{} (low-rank) took {:?}", n, start.elapsed());
+        return qp_energy_no_fse;
+    }
+
+    // Second round with self-energy correction
+    let origin = qp_energy_no_fse;
+    let final_qp;
+
+    if qp_ctrl.fourier_self_energy {
+        let (powers, t, sin_coeff, cos_coeff) = ri_gw::fourier_self_energy::define_fourier_series(&qp_ctrl);
+        let qp_eq_func = |omega: f64| {
+            ri_gw::quasiparticle_equation_lowrank(
+                omega, n, consts, ri_mat, &gwqp_g, &gwqp_w,
+                occ_size, vir_size, num_state, w_c_at_freqs, real_axis_vchiv, 0,
+            ) + ri_gw::fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin)
+        };
+        let (have_crossing, qp) = ri_gw::linear_interpolation_solver(
+            qp_eq_func, qp_energy_no_fse, side, qp_ctrl.gw_search_grid, qp_ctrl.gw_span_energy,
+        );
+        final_qp = if !have_crossing {
+            ri_gw::newton_solver_lowrank(
+                n, consts, ri_mat, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
+                w_c_at_freqs, real_axis_vchiv,
+                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level,
+            )
+        } else {
+            qp
+        };
+    } else if qp_ctrl.hermite_self_energy {
+        let hermite_coeff = ri_gw::fourier_self_energy::define_hermite_series(&qp_ctrl);
+        let qp_eq_func = |omega: f64| {
+            ri_gw::quasiparticle_equation_lowrank(
+                omega, n, consts, ri_mat, &gwqp_g, &gwqp_w,
+                occ_size, vir_size, num_state, w_c_at_freqs, real_axis_vchiv, 0,
+            ) + ri_gw::fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff)
+        };
+        let (have_crossing, qp) = ri_gw::linear_interpolation_solver(
+            qp_eq_func, qp_energy_no_fse, side, qp_ctrl.gw_search_grid, qp_ctrl.gw_span_energy,
+        );
+        final_qp = if !have_crossing {
+            ri_gw::newton_solver_lowrank(
+                n, consts, ri_mat, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
+                w_c_at_freqs, real_axis_vchiv,
+                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level,
+            )
+        } else {
+            qp
+        };
+    } else {
+        panic!("No self-energy correction enabled but reached second round!");
+    }
+
+    println!("GW of orbital #{} (low-rank) took {:?}, QP={}", n, start.elapsed(), final_qp);
+    final_qp
 }
