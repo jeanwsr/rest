@@ -14,6 +14,7 @@ use itertools::{//Itertools,
                 //izip
                 };
 use tensors::MathMatrix;
+use crate::scf_io::util;
 use anyhow::{Error};
 
 impl SCF {
@@ -110,6 +111,7 @@ impl SCF {
         let num_auxbas = self.mol.num_auxbas;
         //let npair = num_basis*(num_basis+1)/2;
         let spin_channel = self.mol.spin_channel;
+        assert!(util::is_aufbau(&self.occupation[0]));
         let mut occ = self.homo[0] + 1;
         let mut vir = num_state - occ;
         let mut ov = occ*vir;
@@ -244,6 +246,7 @@ impl SCF {
             factor = 2.0;
         }
         for ispin in 0..spin_channel {
+            assert!(util::is_aufbau(&self.occupation[ispin]));
             _occ[ispin] = self.homo[ispin] + 1;
             //println!("{:?}", _occ);
             _vir[ispin] = num_state - _occ[ispin];
@@ -414,5 +417,3 @@ impl SCF {
     }
 
 }
-
-

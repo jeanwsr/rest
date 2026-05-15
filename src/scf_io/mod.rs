@@ -13,6 +13,7 @@ use crate::ctrl_io::ri_jk_io::*;
 mod addons;
 mod fchk;
 mod pyrest_scf_io;
+pub mod util;
 
 use mpi::collective::SystemOperation;
 use pyo3::{pyclass};
@@ -32,6 +33,7 @@ use crate::constants::{SQRT_THRESHOLD};
 use crate::solvent::{PcmObject, PcmScf, solvent_prepare};
 use crate::ri_jk;
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
+use self::util::occupied_orbital_count;
 
 #[pyclass]
 #[derive(Clone)]
@@ -1685,7 +1687,7 @@ impl SCF {
 
         for i_spin in 0..spin_channel{
             let mut dm_s = &self.density_matrix[i_spin];
-            let nw =  self.homo[i_spin]+1;
+            let nw = occupied_orbital_count(&self.occupation[i_spin]);
             let mut kernel_mid = MatrixFull::new([n_ip,num_basis], 0.0);
             _dgemm(&tab_ao,(0..num_basis, 0..n_ip),'T',
                 dm_s,(0..num_basis,0..num_basis),'N',
@@ -1731,7 +1733,7 @@ impl SCF {
 
         for i_spin in 0..spin_channel{
             let occ_s =  &self.occupation[i_spin];
-            let nw =  self.homo[i_spin]+1;
+            let nw = occupied_orbital_count(occ_s);
 
             let mut tab_mo = MatrixFull::new([nw,n_ip], 0.0);
             _dgemm(&eigv[i_spin],(0..num_basis, 0..nw),'T',
@@ -4312,9 +4314,7 @@ pub fn vk_upper_with_rimatr_sync_v01(
             let mut vk_s = &mut vk[i_spin];
             *vk_s = MatrixUpper::new(num_baspair,0.0_f64);
             let eigv_s = &eigv[i_spin];
-            let homo_s = occupation[i_spin].iter().enumerate()
-                .fold(0_usize,|x, (ob, occ)| {if *occ>1.0e-4 {ob} else {x}});
-            let nw = homo_s + 1;
+            let nw = occupied_orbital_count(&occupation[i_spin]);
             //let nw = num_elec[i_spin+1].ceil() as usize;
             if nw>0 {
                 let mut tmp_mat = MatrixFull::new([num_basis,nw],0.0_f64);
@@ -4391,9 +4391,7 @@ pub fn vk_upper_with_rimatr_sync_v02(
             //*vk_s = MatrixUpper::new(num_baspair,0.0_f64);
             let eigv_s = &eigv[i_spin];
             // now locate the highest obital that has electron with occupation largger than 1.0e-4
-            let homo_s = occupation[i_spin].iter().enumerate()
-                .fold(0_usize,|x, (ob, occ)| {if *occ>1.0e-4 {ob} else {x}});
-            let nw = homo_s + 1;
+            let nw = occupied_orbital_count(&occupation[i_spin]);
             if nw>0 {
                 let mut tmp_mat = MatrixFull::new([num_basis,nw],0.0_f64);
                 tmp_mat.data.iter_mut().zip(eigv_s.iter_submatrix(0..num_basis,0..nw))
@@ -4469,10 +4467,8 @@ pub fn vk_upper_with_rimatr_sync_v03(
                 &eigv[0]
             };
             // now locate the highest obital that has electron with occupation largger than 1.0e-4
-            let homo_s = occupation[i_spin].iter().enumerate()
-                .fold(0_usize,|x, (ob, occ)| {if *occ>1.0e-4 {ob} else {x}});
             let elec_spin = num_elec[i_spin+1].ceil() as usize;
-            let nw = if elec_spin == 0 {0} else {homo_s + 1} ;
+            let nw = if elec_spin == 0 {0} else {occupied_orbital_count(&occupation[i_spin])};
             if nw>0 {
                 let mut tmp_mat = MatrixFull::new([num_basis,nw],0.0_f64);
                 tmp_mat.data.iter_mut().zip(eigv_s.iter_submatrix(0..num_basis,0..nw))
@@ -4548,7 +4544,7 @@ pub fn vk_upper_with_ri_v_sync(
             let mut vk_s = &mut vk[i_spin];
             *vk_s = MatrixUpper::new(npair,0.0_f64);
             let eigv_s = &eigv[i_spin];
-            let nw = num_elec[i_spin+1].ceil() as usize;
+            let nw = occupied_orbital_count(&occupation[i_spin]);
             if nw>0 {
                 let mut tmp_mat = MatrixFull::new([num_basis,nw],0.0_f64);
                 tmp_mat.data.iter_mut().zip(eigv_s.iter_submatrix(0..num_basis,0..nw))
@@ -5362,7 +5358,7 @@ pub fn generate_density_matrix_outside(scf_data: &SCF) -> Vec<MatrixFull<f64>>{
         };
         let occ_s =  &scf_data.occupation[i_spin];
 
-        let nw =  scf_data.homo[i_spin]+1;
+        let nw = occupied_orbital_count(&scf_data.occupation[i_spin]);
         //println!("number of occupied orbitals from dm generation: {}", nw);
 
         let mut weight_eigv = MatrixFull::new([num_basis, num_state],0.0_f64);
@@ -5391,6 +5387,7 @@ pub fn generate_density_matrix_outside(scf_data: &SCF) -> Vec<MatrixFull<f64>>{
     dm
 
 }
+
 
 pub fn initialize_scf(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
 

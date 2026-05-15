@@ -3,6 +3,7 @@ Cargo.lock
 /debug_logs/
 *.log
 /examples/
+/tmp/
 *.py
 *.so
 bse_pool
