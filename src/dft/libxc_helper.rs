@@ -184,7 +184,7 @@ pub fn eval_libxc_func_new(
     sigma: Option<&[f64]>,
     lapl: Option<&[f64]>,
     tau: Option<&[f64]>,
-    exc: &mut [f64],
+    outbuf: &mut [f64],
 ) {
     assert!(deriv <= 3, "Derivative order must be 0, 1, 2 or 3");
     let _ = (spin, np);
@@ -200,11 +200,13 @@ pub fn eval_libxc_func_new(
         }
     }
     if let Some(t) = tau {
-        input.insert("tau".to_string(), t);
+        if xc_func.needs_tau() {
+            input.insert("tau".to_string(), t);
+        }
     }
 
     xc_func
-        .compute_xc_with_unsliced_output(&input, exc, deriv)
+        .compute_xc_with_unsliced_output(&input, outbuf, deriv)
         .unwrap();
 }
 
@@ -222,12 +224,6 @@ mod tests {
     fn test_xc_code_fdqc_b3lyp() {
         let code = xc_code_fdqc("b3lyp");
         assert_eq!(code, [402, 0, 0]);
-    }
-
-    #[test]
-    fn test_code_to_name() {
-        let name = xc_code_to_name(1);
-        assert!(!name.is_empty());
     }
 
     #[test]

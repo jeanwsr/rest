@@ -36,7 +36,7 @@ use std::sync::mpsc::channel;
 use serde::{Deserialize, Serialize};
 
 use libxc::prelude::*;
-use crate::dft::libxc_helper::{xc_code_fdqc, xc_code_to_name, xc_func_init, lda_exc_vxc, gga_exc_vxc, mgga_exc_vxc, lda_exc, gga_exc, mgga_exc};
+use crate::dft::libxc_helper::{xc_code_fdqc, xc_func_init, lda_exc_vxc, gga_exc_vxc, mgga_exc_vxc, lda_exc, gga_exc, mgga_exc};
 
 use rest_tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
 
@@ -2189,7 +2189,7 @@ impl DFA4REST {
 
         self.dfa_compnt_scf.iter().enumerate().for_each(|(i_xc, xc)| { 
             //if spin_channel == 1 {
-                str_lines[0].push_str(&format!("{:>20} ", &xc_code_to_name(*xc)));
+                str_lines[0].push_str(&format!("{:>20} ", libxc::util::libxc_functional_get_name(*xc as i32).unwrap_or_else(|| "Unknown_XC".to_string())));
             //} else {
             //    str_lines[0].push_str(&format!("{:>20}_alpha ", &code_to_name(*xc)));
             //    str_lines[0].push_str(&format!("{:>20}_beta ", &code_to_name(*xc)));
