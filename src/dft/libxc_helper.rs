@@ -87,10 +87,13 @@ pub fn xc_code_fdqc(name: &str) -> [usize; 3] {
     }
 }
 
-pub fn xc_code_to_name(code: usize) -> String {
-    libxc::util::libxc_functional_get_name(code as i32).unwrap_or_else(|| "Unknown_XC".to_string())
-}
-
+/// Initialize a LibXC functional based on the given function ID and spin channel.
+/// 
+/// - 1 for unpolarized (spin-unpolarized) calculations
+/// - 2 for polarized (spin-polarized) calculations
+/// 
+/// This number may different to PySCF convention, but should be consistent with REST and Libxc conventions.
+/// Number of spin channels means for rho/tau/lapl, how many spin components are there.
 pub fn xc_func_init(func_id: usize, spin_channel: usize) -> LibXCFunctional {
     let spin = if spin_channel == 1 { LibXCSpin::Unpolarized } else { LibXCSpin::Polarized };
     LibXCFunctional::from_number(func_id as i32, spin)
