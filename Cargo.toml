@@ -67,9 +67,7 @@ approx = "0.5"
 assert_float_eq = "1"
 
 [build-dependencies]
-autocxx-build = "0.26.0"
-miette = { version = "5", features = ["fancy"]}
-dunce = "1.0.0"
+dunce = "1.0"
 
 [dependencies.pyo3]
 version = "0.24.2"
