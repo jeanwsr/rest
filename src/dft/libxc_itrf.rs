@@ -5,7 +5,7 @@ xc functional interface to Libxc for REST
 use core::panic;
 use rayon::prelude::*;
 use rstsr::prelude::*;
-use crate::dft::libxc::{XcFuncType, LibXCFamily, eval_libxc_func_new};
+use crate::dft::libxc_helper::{LibXCFamily, get_libxc_family, xc_func_init, eval_libxc_func_new};
 use crate::dft::xc_deriv::{XCType, xc_indices_transform, transform_xc_inner, count_combinations};
 
 
@@ -187,14 +187,14 @@ fn eval_xc1(
     .for_each(
         |(func_id, xc_param)|
         {
-            let xc_func = XcFuncType::xc_func_init(*func_id, spin+1);
-            let cur_xc_type = match xc_func.get_libxc_family() {
+            let xc_func = xc_func_init(*func_id, spin+1);
+            let cur_xc_type = match get_libxc_family(&xc_func) {
                 LibXCFamily::LDA => XCType::LDA,
                 LibXCFamily::GGA => XCType::GGA,
                 LibXCFamily::MGGA => XCType::MGGA,
                 LibXCFamily::HybridGGA => XCType::GGA, // Hybrid GGA is treated as GGA
                 LibXCFamily::HybridMGGA => XCType::MGGA, // Hybrid MGGA is treated as MGGA
-                _ => panic!("Unresolved xc family: {:?}", xc_func.get_libxc_family()),
+                _ => panic!("Unresolved xc family: {:?}", get_libxc_family(&xc_func)),
             };
             let mut outbuf = vec![0.0; np * n_components];
             eval_libxc_func_new(&xc_func, spin, deriv, np, rho, sigma, lapl, tau,  &mut outbuf);
