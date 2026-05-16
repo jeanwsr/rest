@@ -245,16 +245,16 @@ pub fn get_name_with_dash() -> HashMap<String, &'static str> {
 }
 
 pub fn get_name(id: usize) -> String {
-    let name = ::libxc::util::libxc_functional_get_name(id as i32)
+    let name = libxc::util::libxc_functional_get_name(id as i32)
         .unwrap_or_default();
     name.to_uppercase()
 }
 
 pub fn get_available_functionals() -> HashMap<String, usize> {
-    let ids = ::libxc::util::libxc_available_functional_numbers();
+    let ids = libxc::util::libxc_available_functional_numbers();
     let mut available_functionals = HashMap::new();
     for id in ids {
-        let name = ::libxc::util::libxc_functional_get_name(id)
+        let name = libxc::util::libxc_functional_get_name(id)
             .unwrap_or_default();
         available_functionals.insert(name.to_uppercase(), id as usize);
     }

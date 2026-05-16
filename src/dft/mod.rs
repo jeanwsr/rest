@@ -35,7 +35,7 @@ use std::ops::Range;
 use std::sync::mpsc::channel;
 use serde::{Deserialize, Serialize};
 
-use ::libxc::functional::LibXCFunctional;
+use libxc::functional::LibXCFunctional;
 use crate::dft::libxc_helper::{LibXCFamily, get_libxc_family, use_density_gradient, use_kinetic_density, xc_code_fdqc, xc_code_to_name, xc_func_init, lda_exc_vxc, gga_exc_vxc, mgga_exc_vxc, lda_exc, gga_exc, mgga_exc};
 
 use rest_tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
@@ -122,7 +122,7 @@ impl DFAFamily {
 impl DFA4REST {
 
     pub fn xc_version(&self) {
-        let (major, minor, micro) = ::libxc::util::libxc_version();
+        let (major, minor, micro) = libxc::util::libxc_version();
         println!("Libxc version used in REST: {}.{}.{}", major, minor, micro);
     }
 
