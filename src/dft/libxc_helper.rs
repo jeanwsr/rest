@@ -1,4 +1,4 @@
-use ::libxc::prelude::*;
+use libxc::prelude::*;
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,13 +12,13 @@ pub enum LibXCFamily {
 }
 
 impl LibXCFamily {
-    pub fn from_libxc(family: ::libxc::enums::LibXCFamily) -> Self {
+    pub fn from_libxc(family: libxc::enums::LibXCFamily) -> Self {
         match family {
-            ::libxc::enums::LibXCFamily::LDA | ::libxc::enums::LibXCFamily::HybLDA => LibXCFamily::LDA,
-            ::libxc::enums::LibXCFamily::GGA => LibXCFamily::GGA,
-            ::libxc::enums::LibXCFamily::MGGA => LibXCFamily::MGGA,
-            ::libxc::enums::LibXCFamily::HybGGA => LibXCFamily::HybridGGA,
-            ::libxc::enums::LibXCFamily::HybMGGA => LibXCFamily::HybridMGGA,
+            libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA => LibXCFamily::LDA,
+            libxc::enums::LibXCFamily::GGA => LibXCFamily::GGA,
+            libxc::enums::LibXCFamily::MGGA => LibXCFamily::MGGA,
+            libxc::enums::LibXCFamily::HybGGA => LibXCFamily::HybridGGA,
+            libxc::enums::LibXCFamily::HybMGGA => LibXCFamily::HybridMGGA,
             _ => LibXCFamily::Unknown,
         }
     }
@@ -139,7 +139,7 @@ pub fn xc_code_fdqc(name: &str) -> [usize; 3] {
 }
 
 pub fn xc_code_to_name(code: usize) -> String {
-    ::libxc::util::libxc_functional_get_name(code as i32).unwrap_or_else(|| "Unknown_XC".to_string())
+    libxc::util::libxc_functional_get_name(code as i32).unwrap_or_else(|| "Unknown_XC".to_string())
 }
 
 pub fn xc_func_init(func_id: usize, spin_channel: usize) -> LibXCFunctional {
