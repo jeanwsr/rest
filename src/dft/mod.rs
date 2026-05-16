@@ -35,8 +35,8 @@ use std::ops::Range;
 use std::sync::mpsc::channel;
 use serde::{Deserialize, Serialize};
 
-use libxc::functional::LibXCFunctional;
-use crate::dft::libxc_helper::{LibXCFamily, get_libxc_family, use_density_gradient, use_kinetic_density, xc_code_fdqc, xc_code_to_name, xc_func_init, lda_exc_vxc, gga_exc_vxc, mgga_exc_vxc, lda_exc, gga_exc, mgga_exc};
+use libxc::prelude::*;
+use crate::dft::libxc_helper::{xc_code_fdqc, xc_code_to_name, xc_func_init, lda_exc_vxc, gga_exc_vxc, mgga_exc_vxc, lda_exc, gga_exc, mgga_exc};
 
 use rest_tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
 
@@ -83,13 +83,13 @@ impl DFAFamily {
             DFAFamily::LDA => LibXCFamily::LDA,
             DFAFamily::GGA => LibXCFamily::GGA,
             DFAFamily::MGGA => LibXCFamily::MGGA,
-            DFAFamily::HybridGGA => LibXCFamily::HybridGGA,
-            DFAFamily::HybridMGGA => LibXCFamily::HybridMGGA,
-            DFAFamily::PT2 => LibXCFamily::HybridGGA,
-            DFAFamily::SBGE2 => LibXCFamily::HybridGGA,
-            DFAFamily::SCSRPA => LibXCFamily::HybridGGA,
+            DFAFamily::HybridGGA => LibXCFamily::HybGGA,
+            DFAFamily::HybridMGGA => LibXCFamily::HybMGGA,
+            DFAFamily::PT2 => LibXCFamily::HybGGA,
+            DFAFamily::SBGE2 => LibXCFamily::HybGGA,
+            DFAFamily::SCSRPA => LibXCFamily::HybGGA,
             DFAFamily::RPA => LibXCFamily::GGA,
-            _ => LibXCFamily::Unknown,
+            DFAFamily::Unknown => panic!("Unknown DFA family cannot be converted to a specific libxc family"),
         }
     }
     pub fn from_libxc_family(family: &LibXCFamily) -> DFAFamily {
@@ -97,8 +97,8 @@ impl DFAFamily {
             LibXCFamily::LDA => DFAFamily::LDA,
             LibXCFamily::GGA => DFAFamily::GGA,
             LibXCFamily::MGGA => DFAFamily::MGGA,
-            LibXCFamily::HybridGGA => DFAFamily::HybridGGA,
-            LibXCFamily::HybridMGGA => DFAFamily::HybridMGGA,
+            LibXCFamily::HybGGA => DFAFamily::HybridGGA,
+            LibXCFamily::HybMGGA => DFAFamily::HybridMGGA,
             _ => DFAFamily::Unknown,
         }
     }
@@ -1179,27 +1179,24 @@ impl DFA4REST {
 
 
     pub fn use_density_gradient(&self) -> bool {
-        let mut is_flag = self.dfa_compnt_scf.iter().fold(false, |acc, xc_func| {
-            acc || use_density_gradient(&self.init_libxc(xc_func))
-        });
-        if let Some(dfa_compnt_pos) = &self.dfa_compnt_pos {
-            is_flag = is_flag || dfa_compnt_pos.iter().fold(false, |acc, xc_func| {
-                acc || use_density_gradient(&self.init_libxc(xc_func))
-            });
-        }
-        is_flag
+        self
+            .dfa_compnt_pos
+            .iter()
+            .flatten()
+            .chain(self.dfa_compnt_scf.iter())
+            .any(|xc_func_id| {
+                // Only LDA and HybLDA do not need density gradient
+                !matches!(self.init_libxc(xc_func_id).family(), libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA)
+            })
     }
 
     pub fn use_kinetic_density(&self) -> bool {
-        let mut is_flag = self.dfa_compnt_scf.iter().fold(false, |acc, xc_func| {
-            acc || use_kinetic_density(&self.init_libxc(xc_func))
-        });
-        if let Some(dfa_compnt_pos) = &self.dfa_compnt_pos {
-            is_flag = is_flag || dfa_compnt_pos.iter().fold(false, |acc, xc_func| {
-                acc || use_kinetic_density(&self.init_libxc(xc_func))
-            });
-        }
-        is_flag
+        self
+            .dfa_compnt_pos
+            .iter()
+            .flatten()
+            .chain(self.dfa_compnt_scf.iter())
+            .any(|xc_func_id| self.init_libxc(xc_func_id).needs_tau())
     }
 
     pub fn xc_exc_vxc(&self, grids: &Grids, spin_channel: usize, dm: &Vec<MatrixFull<f64>>, mo: &[MatrixFull<f64>;2], occ: &[Vec<f64>;2], print_level:usize) -> (Vec<f64>, Vec<MatrixFull<f64>>) {
@@ -1237,7 +1234,7 @@ impl DFA4REST {
 
         self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
             let xc_func = self.init_libxc(xc_func);
-            match get_libxc_family(&xc_func) {
+            match xc_func.family() {
                 LibXCFamily::LDA => {
                     if spin_channel==1 {
                         let (tmp_exc,tmp_vrho) = lda_exc_vxc(&xc_func,rho.data_ref().unwrap());
@@ -1255,7 +1252,7 @@ impl DFA4REST {
                         vrho.par_self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
                     }
                 },
-                LibXCFamily::GGA | LibXCFamily::HybridGGA => {
+                LibXCFamily::GGA | LibXCFamily::HybGGA => {
                     if spin_channel==1 {
                         let (tmp_exc,tmp_vrho, tmp_vsigma) = gga_exc_vxc(&xc_func,rho.data_ref().unwrap(),sigma.data_ref().unwrap());
                         let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
@@ -1274,7 +1271,7 @@ impl DFA4REST {
                         vsigma.par_self_scaled_add(&tmp_vsigma.transpose_and_drop(), *xc_para);
                     }
                 },
-                _ => {println!("{} is not yet implemented", get_libxc_family(&xc_func).get_name())}
+                xc_family => panic!("{xc_family:?} is not yet implemented")
             }
         });
 
@@ -1493,7 +1490,7 @@ impl DFA4REST {
 
         self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
             let xc_func = self.init_libxc(xc_func);
-            match get_libxc_family(&xc_func) {
+            match xc_func.family() {
                 LibXCFamily::LDA => {
                     if spin_channel==1 {
                         let (tmp_exc,tmp_vrho) = lda_exc_vxc(&xc_func,loc_rho.data_ref().unwrap());
@@ -1511,7 +1508,7 @@ impl DFA4REST {
                         loc_vrho.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
                     }
                 },
-                LibXCFamily::GGA | LibXCFamily::HybridGGA => {
+                LibXCFamily::GGA | LibXCFamily::HybGGA => {
                     if spin_channel==1 {
                         let (tmp_exc,tmp_vrho, tmp_vsigma) = gga_exc_vxc(&xc_func,loc_rho.data_ref().unwrap(),loc_sigma.data_ref().unwrap());
                         let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
@@ -1530,7 +1527,7 @@ impl DFA4REST {
                         loc_vsigma.self_scaled_add(&tmp_vsigma.transpose_and_drop(), *xc_para);
                     }
                 },
-                LibXCFamily::MGGA | LibXCFamily::HybridMGGA => {
+                LibXCFamily::MGGA | LibXCFamily::HybMGGA => {
                     if spin_channel==1 {
                         let (tmp_exc,tmp_vrho,tmp_vsigma,tmp_valpl,tmp_vtau)
                             = mgga_exc_vxc(&xc_func,
@@ -1567,7 +1564,7 @@ impl DFA4REST {
                         loc_vtau.self_scaled_add(&tmp_vtau.transpose_and_drop(), *xc_para);
                     }
                 },
-                _ => {println!("{} is not yet implemented", get_libxc_family(&xc_func).get_name())}
+                xc_family => panic!("{xc_family:?} is not yet implemented"),
             }
         });
 
@@ -1828,7 +1825,7 @@ impl DFA4REST {
 
         self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
             let xc_func = self.init_libxc(xc_func);
-            match get_libxc_family(&xc_func) {
+            match xc_func.family() {
                 LibXCFamily::LDA => {
                     if spin_channel==1 {
                         let (tmp_exc,tmp_vrho) = lda_exc_vxc(&xc_func,loc_rho.data_ref().unwrap());
@@ -1846,7 +1843,7 @@ impl DFA4REST {
                         loc_vrho.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
                     }
                 },
-                LibXCFamily::GGA | LibXCFamily::HybridGGA => {
+                LibXCFamily::GGA | LibXCFamily::HybGGA => {
                     if spin_channel==1 {
                         let (tmp_exc,tmp_vrho, tmp_vsigma) = gga_exc_vxc(&xc_func,loc_rho.data_ref().unwrap(),loc_sigma.data_ref().unwrap());
                         let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
@@ -1865,7 +1862,7 @@ impl DFA4REST {
                         loc_vsigma.self_scaled_add(&tmp_vsigma.transpose_and_drop(), *xc_para);
                     }
                 },
-                LibXCFamily::MGGA | LibXCFamily::HybridMGGA => {
+                LibXCFamily::MGGA | LibXCFamily::HybMGGA => {
                     if spin_channel==1 {
                         let (tmp_exc,tmp_vrho,tmp_vsigma,tmp_valpl,tmp_vtau)
                             = mgga_exc_vxc(&xc_func,
@@ -1902,7 +1899,7 @@ impl DFA4REST {
                         loc_vtau.self_scaled_add(&tmp_vtau.transpose_and_drop(), *xc_para);
                     }
                 },
-                _ => {println!("{} is not yet implemented", get_libxc_family(&xc_func).get_name())}
+                xc_family => panic!("{xc_family:?} is not yet implemented"),
             }
         });
 
@@ -2103,7 +2100,7 @@ impl DFA4REST {
             let code = DFA4REST::xc_func_init_fdqc(x,spin_channel);
             let x_flag = code.iter().fold(false, |flag, xc_code| {
                 let xc_func = self.init_libxc(xc_code);
-                flag || use_density_gradient(&xc_func)
+                flag || !matches!(xc_func.family(), LibXCFamily::LDA | LibXCFamily::HybLDA)
             });
             flag || x_flag
         });
@@ -2316,7 +2313,7 @@ impl DFA4REST {
         //let (rho,rhop) = grids.prepare_tabulated_density(dm, spin_channel);
         let use_density_gradient = xc_code_list.iter().fold(false,|flag, xc_code| {
             let xc_func = self.init_libxc(xc_code);
-            flag || use_density_gradient(&xc_func)
+            flag || !matches!(xc_func.family(), LibXCFamily::LDA | LibXCFamily::HybLDA)
         });
         let sigma = if use_density_gradient {
             prepare_tabulated_sigma_rayon(&rhop, spin_channel)
@@ -2385,7 +2382,7 @@ impl DFA4REST {
             //};
             self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
                 let xc_func = self.init_libxc(xc_func);
-                match get_libxc_family(&xc_func) {
+                match xc_func.family() {
                     LibXCFamily::LDA => {
                         let tmp_exc = MatrixFull::from_vec([num_grids,1],
                             if spin_channel==1 {
@@ -2396,7 +2393,7 @@ impl DFA4REST {
                         ).unwrap();
                         exc.par_self_scaled_add(&tmp_exc,*xc_para);
                     },
-                    LibXCFamily::GGA | LibXCFamily::HybridGGA => {
+                    LibXCFamily::GGA | LibXCFamily::HybGGA => {
                         let tmp_exc = MatrixFull::from_vec([num_grids,1],
                             if spin_channel==1 {
                                 gga_exc(&xc_func,rho.data_ref().unwrap(),sigma.data_ref().unwrap())
@@ -2406,7 +2403,7 @@ impl DFA4REST {
                         ).unwrap();
                         exc.par_self_scaled_add(&tmp_exc,*xc_para);
                     },
-                    LibXCFamily::MGGA | LibXCFamily::HybridMGGA => {
+                    LibXCFamily::MGGA | LibXCFamily::HybMGGA => {
                         let tmp_exc = MatrixFull::from_vec(
                             [num_grids, 1],
                             if spin_channel==1 {
@@ -2417,14 +2414,14 @@ impl DFA4REST {
                         ).unwrap();
                         exc.par_self_scaled_add(&tmp_exc,*xc_para);
                     },
-                    _ => {println!("{} is not yet implemented", get_libxc_family(&xc_func).get_name())}
+                    xc_family => panic!("{xc_family:?} is not yet implemented"),
                 }
             });
         } else if iop==1 { // for the post-SCF energy calculation
             if let (Some(dfa_paramr),Some(dfa_compnt)) = (&self.dfa_paramr_pos, &self.dfa_compnt_pos) {
                 dfa_compnt.iter().zip(dfa_paramr.iter()).for_each(|(xc_func,xc_para)| {
                     let xc_func = self.init_libxc(xc_func);
-                    match get_libxc_family(&xc_func) {
+                    match xc_func.family() {
                         LibXCFamily::LDA => {
                             let tmp_exc = MatrixFull::from_vec([num_grids,1],
                                 if spin_channel==1 {
@@ -2435,7 +2432,7 @@ impl DFA4REST {
                             ).unwrap();
                             exc.par_self_scaled_add(&tmp_exc,*xc_para);
                         },
-                        LibXCFamily::GGA | LibXCFamily::HybridGGA => {
+                        LibXCFamily::GGA | LibXCFamily::HybGGA => {
                             let tmp_exc = MatrixFull::from_vec([num_grids,1],
                                 if spin_channel==1 {
                                     gga_exc(&xc_func,rho.data_ref().unwrap(),sigma.data_ref().unwrap())
@@ -2445,7 +2442,7 @@ impl DFA4REST {
                             ).unwrap();
                             exc.par_self_scaled_add(&tmp_exc,*xc_para);
                         },
-                        _ => {println!("{} is not yet implemented", get_libxc_family(&xc_func).get_name())}
+                        xc_family => panic!("{xc_family:?} is not yet implemented")
                     }
                 });
             }
@@ -2483,7 +2480,7 @@ impl DFA4REST {
     pub fn xc_exc_code(&self, xc_code: &usize, rho: &MatrixFull<f64>, sigma:&MatrixFull<f64>, spin_channel: usize) -> MatrixFull<f64> {
         let xc_func = self.init_libxc(xc_code);
         let num_grids = rho.size()[0];
-        let tmp_exc = match get_libxc_family(&xc_func) {
+        let tmp_exc = match xc_func.family() {
             LibXCFamily::LDA => {
                 MatrixFull::from_vec([num_grids,1],
                     if spin_channel==1 {
@@ -2494,7 +2491,7 @@ impl DFA4REST {
                 ).unwrap()
                 //exc.par_self_scaled_add(&tmp_exc,*xc_para);
             },
-            LibXCFamily::GGA | LibXCFamily::HybridGGA => {
+            LibXCFamily::GGA | LibXCFamily::HybGGA => {
                 //println!("debug, {:?}, {:?}, {:?}", xc_code, xc_func, sigma.data.len());
                 MatrixFull::from_vec([num_grids,1],
                     if spin_channel==1 {
@@ -2505,7 +2502,7 @@ impl DFA4REST {
                 ).unwrap()
                 //exc.par_self_scaled_add(&tmp_exc,*xc_para);
             },
-            _ => {panic!("{} is not yet implemented", get_libxc_family(&xc_func).get_name())}
+            xc_family => panic!("{xc_family:?} is not yet implemented"),
         };
         tmp_exc
     }
