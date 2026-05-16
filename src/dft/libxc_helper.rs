@@ -1,55 +1,6 @@
 use libxc::prelude::*;
 use std::collections::HashMap;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LibXCFamily {
-    LDA,
-    GGA,
-    MGGA,
-    HybridGGA,
-    HybridMGGA,
-    Unknown,
-}
-
-impl LibXCFamily {
-    pub fn from_libxc(family: libxc::enums::LibXCFamily) -> Self {
-        match family {
-            libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA => LibXCFamily::LDA,
-            libxc::enums::LibXCFamily::GGA => LibXCFamily::GGA,
-            libxc::enums::LibXCFamily::MGGA => LibXCFamily::MGGA,
-            libxc::enums::LibXCFamily::HybGGA => LibXCFamily::HybridGGA,
-            libxc::enums::LibXCFamily::HybMGGA => LibXCFamily::HybridMGGA,
-            _ => LibXCFamily::Unknown,
-        }
-    }
-
-    pub fn get_name(&self) -> &'static str {
-        match self {
-            LibXCFamily::LDA => "LDA",
-            LibXCFamily::GGA => "GGA",
-            LibXCFamily::MGGA => "MGGA",
-            LibXCFamily::HybridGGA => "HybridGGA",
-            LibXCFamily::HybridMGGA => "HybridMGGA",
-            LibXCFamily::Unknown => "Unknown DFA",
-        }
-    }
-}
-
-pub fn get_libxc_family(func: &LibXCFunctional) -> LibXCFamily {
-    LibXCFamily::from_libxc(func.family())
-}
-
-pub fn use_density_gradient(func: &LibXCFunctional) -> bool {
-    !matches!(get_libxc_family(func), LibXCFamily::LDA)
-}
-
-pub fn use_kinetic_density(func: &LibXCFunctional) -> bool {
-    matches!(
-        get_libxc_family(func),
-        LibXCFamily::MGGA | LibXCFamily::HybridMGGA
-    )
-}
-
 pub fn xc_code_fdqc(name: &str) -> [usize; 3] {
     let lower_name = name.to_lowercase();
     if lower_name == "hf" {
@@ -262,36 +213,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_compat_family_lda() {
-        let func = xc_func_init(1, 1);
-        assert_eq!(get_libxc_family(&func), LibXCFamily::LDA);
-    }
-
-    #[test]
-    fn test_compat_family_gga() {
-        let func = xc_func_init(101, 1);
-        assert_eq!(get_libxc_family(&func), LibXCFamily::GGA);
-    }
-
-    #[test]
-    fn test_compat_family_mgga() {
-        let func = xc_func_init(263, 1);
-        assert_eq!(get_libxc_family(&func), LibXCFamily::MGGA);
-    }
-
-    #[test]
-    fn test_compat_family_hyb_gga() {
-        let func = xc_func_init(402, 1);
-        assert_eq!(get_libxc_family(&func), LibXCFamily::HybridGGA);
-    }
-
-    #[test]
-    fn test_compat_family_hyb_mgga() {
-        let func = xc_func_init(457, 1);
-        assert_eq!(get_libxc_family(&func), LibXCFamily::HybridMGGA);
-    }
-
-    #[test]
     fn test_xc_code_fdqc_pbe() {
         let code = xc_code_fdqc("pbe");
         assert_eq!(code, [0, 101, 130]);
@@ -307,14 +228,6 @@ mod tests {
     fn test_code_to_name() {
         let name = xc_code_to_name(1);
         assert!(!name.is_empty());
-    }
-
-    #[test]
-    fn test_use_density_gradient() {
-        let lda = xc_func_init(1, 1);
-        assert!(!use_density_gradient(&lda));
-        let gga = xc_func_init(101, 1);
-        assert!(use_density_gradient(&gga));
     }
 
     #[test]
