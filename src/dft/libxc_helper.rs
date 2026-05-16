@@ -70,9 +70,7 @@ pub fn xc_code_fdqc(name: &str) -> [usize; 3] {
     } else {
         for (name, value) in LIBXC_FUNC_MAP.iter() {
             let prefixed = format!("XC_{}", name);
-            if prefixed.starts_with("XC_")
-                && format!("xc_{}", lower_name) == prefixed.to_lowercase()
-            {
+            if prefixed.starts_with("XC_") && format!("xc_{}", lower_name) == prefixed.to_lowercase() {
                 if name.contains("_XC_") {
                     return [*value as usize, 0, 0];
                 } else if name.contains("_C_") {
@@ -94,11 +92,7 @@ pub fn xc_code_to_name(code: usize) -> String {
 }
 
 pub fn xc_func_init(func_id: usize, spin_channel: usize) -> LibXCFunctional {
-    let spin = if spin_channel == 1 {
-        LibXCSpin::Unpolarized
-    } else {
-        LibXCSpin::Polarized
-    };
+    let spin = if spin_channel == 1 { LibXCSpin::Unpolarized } else { LibXCSpin::Polarized };
     LibXCFunctional::from_number(func_id as i32, spin)
 }
 
@@ -140,10 +134,7 @@ pub fn mgga_exc_vxc(
     let exc = buf[layout.get("zk").unwrap()].to_vec();
     let vrho = buf[layout.get("vrho").unwrap()].to_vec();
     let vsigma = buf[layout.get("vsigma").unwrap()].to_vec();
-    let vlapl = layout
-        .get("vlapl")
-        .map(|r| buf[r].to_vec())
-        .unwrap_or_default();
+    let vlapl = layout.get("vlapl").map(|r| buf[r].to_vec()).unwrap_or_default();
     let vtau = buf[layout.get("vtau").unwrap()].to_vec();
     (exc, vrho, vsigma, vlapl, vtau)
 }
@@ -205,9 +196,7 @@ pub fn eval_libxc_func_new(
         }
     }
 
-    xc_func
-        .compute_xc_with_unsliced_output(&input, outbuf, deriv)
-        .unwrap();
+    xc_func.compute_xc_with_unsliced_output(&input, outbuf, deriv).unwrap();
 }
 
 #[cfg(test)]
