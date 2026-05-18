@@ -59,15 +59,14 @@ derive_builder = { version = "0.20" }
 
 dftd3 = { version = "0.2", optional = true }
 dftd4 = { version = "0.2", optional = true }
+libxc = { version = "0.1", features = ["api-v7_0", "dynamic_loading"] }
 geometric-pyo3 = { version = "0.1.1", optional = true }
 
 approx = "0.5"
 assert_float_eq = "1"
 
 [build-dependencies]
-autocxx-build = "0.26.0"
-miette = { version = "5", features = ["fancy"]}
-dunce = "1.0.0"
+dunce = "1.0"
 
 [dependencies.pyo3]
 version = "0.24.2"

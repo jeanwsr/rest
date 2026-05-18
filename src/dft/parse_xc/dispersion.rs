@@ -3,7 +3,6 @@ use serde_json::Value;
 // use crate::dft::parse_xc::xc_helper::ALIAS_WITH_DISP;
 use std::collections::HashMap;
 use lazy_static::lazy_static;
-use crate::dft::libxc::XcFuncType;
 
 lazy_static! {
     pub static ref ALIAS_WITH_DISP: HashMap<&'static str, &'static str> = HashMap::from([
@@ -65,10 +64,9 @@ impl DFAComponent {
     pub fn is_nlc(&self) -> bool {
         match self.component_type {
             ComponentType::Libxc => {
-                let mut xcfunc = XcFuncType::xc_func_init(self.id, 1);
-                let is_nlc = xcfunc.is_nlc();
-                xcfunc.xc_func_end();
-                is_nlc
+                use libxc::prelude::*;
+                let xcfunc = LibXCFunctional::from_number(self.id as i32, LibXCSpin::Unpolarized);
+                xcfunc.flags().contains(LibXCFlags::VV10)
             },
             _ => false,
         }
