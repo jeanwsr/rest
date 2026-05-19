@@ -204,6 +204,8 @@ impl RIRHFGradient<'_> {
             J2CDecompose::Cd { j2c_l, .. } => rt::linalg::inv(j2c_l),
             J2CDecompose::Eig { j2c_l_inv, .. } => j2c_l_inv,
         };
+        // TODO: transpose should inside pure functions, try consider uplo
+        let tsr_int2c2e_l_inv = tsr_int2c2e_l_inv.into_reverse_axes().into_contig(FlagOrder::F);
         time_records.count("de-jk preparation power");
 
         // tsr_int2c2e_ip1
