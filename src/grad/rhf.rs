@@ -134,7 +134,7 @@ impl RIRHFGradient<'_> {
         }
 
         // note f-contiguous transpose
-        let de_ovlp_raw = de_ovlp.into_raw_parts().0.into_cpu_vec().unwrap();
+        let de_ovlp_raw = de_ovlp.into_shape(-1).into_raw();
         let de_ovlp = MatrixFull::from_vec([3, natm], de_ovlp_raw).unwrap();
         self.result.insert("de_ovlp".into(), de_ovlp);
         return self;
@@ -152,7 +152,7 @@ impl RIRHFGradient<'_> {
             *&mut de_hcore.i_mut((.., atm)) += (gen_deriv_hcore(atm) * &dm).sum_axes([0, 1]);
         }
 
-        let de_hcore_raw = de_hcore.into_raw_parts().0.into_cpu_vec().unwrap();
+        let de_hcore_raw = de_hcore.into_shape(-1).into_raw();
         let de_hcore = MatrixFull::from_vec([3, natm], de_hcore_raw).unwrap();
         self.result.insert("de_hcore".into(), de_hcore);
         return self;
@@ -349,19 +349,19 @@ impl RIRHFGradient<'_> {
         }
 
         let de_j = {
-            let de_j_raw = de_j.into_raw_parts().0.into_cpu_vec().unwrap();
+            let de_j_raw = de_j.into_shape(-1).into_raw();
             MatrixFull::from_vec([3, natm], de_j_raw).unwrap()
         };
         let de_jaux = {
-            let de_jaux_raw = de_jaux.into_raw_parts().0.into_cpu_vec().unwrap();
+            let de_jaux_raw = de_jaux.into_shape(-1).into_raw();
             MatrixFull::from_vec([3, natm], de_jaux_raw).unwrap()
         };
         let de_k = {
-            let de_k_raw = de_k.into_raw_parts().0.into_cpu_vec().unwrap();
+            let de_k_raw = de_k.into_shape(-1).into_raw();
             MatrixFull::from_vec([3, natm], de_k_raw).unwrap()
         };
         let de_kaux = {
-            let de_kaux_raw = de_kaux.into_raw_parts().0.into_cpu_vec().unwrap();
+            let de_kaux_raw = de_kaux.into_shape(-1).into_raw();
             MatrixFull::from_vec([3, natm], de_kaux_raw).unwrap()
         };
 
@@ -624,7 +624,7 @@ pub fn calc_de_nuc(mol: &Molecule) -> MatrixFull<f64> {
     let de_nuc = tmp.sum_axes(1);
 
     let de_nuc = {
-        let de_nuc_raw = de_nuc.into_raw_parts().0.into_cpu_vec().unwrap();
+        let de_nuc_raw = de_nuc.into_shape(-1).into_raw();
         MatrixFull::from_vec([3, natm], de_nuc_raw).unwrap()
     };
 
