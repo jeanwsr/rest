@@ -1,6 +1,6 @@
 #![warn(unused)]
 use crate::grad::traits::GradAPI;
-use crate::ri_jk::{self, J2CDecompose};
+use crate::ri_jk::{self, J2CDecompose, get_j2c_decomp, get_solved_j3c};
 use crate::scf_io::{self, SCF};
 use crate::utilities::memory_batch::*;
 use crate::Molecule;
@@ -200,6 +200,7 @@ impl RIRHFGradient<'_> {
         };
         // TODO: transpose should inside pure functions, try consider uplo
         let tsr_int2c2e_l_inv = tsr_int2c2e_l_inv.into_reverse_axes().into_contig(FlagOrder::F);
+        let j2c_decomp = get_j2c_decomp(&aux, &device, j2c_decomp_option);
         time_records.count("de-jk preparation power");
 
         // tsr_int2c2e_ip1
@@ -228,7 +229,7 @@ impl RIRHFGradient<'_> {
         let mut dao_j = rt::full(([], f64::NAN, &device));
         let mut daux_j = rt::full(([], f64::NAN, &device));
         if self.flags.factor_j.is_some() {
-            itm_j = get_itm_j(tsr_int2c2e_l_inv.view(), ederi_utp.view(), dm_tp.view());
+            itm_j = get_itm_j(&j2c_decomp, ederi_utp.view(), dm_tp.view());
             dao_j = rt::zeros(([nao, 3], &device));
         }
         if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
@@ -652,9 +653,10 @@ pub fn get_grad_dao_ovlp(tsr_int1e_ipovlp: TsrView<f64>, dme0: TsrView<f64>) -> 
     return 2.0 * (tsr_int1e_ipovlp * dme0.i((.., .., None))).sum_axes(1);
 }
 
-pub fn get_itm_j(tsr_int2c2e_l_inv: TsrView<f64>, ederi_utp: TsrView<f64>, dm_tp: TsrView<f64>) -> Tsr<f64> {
+pub fn get_itm_j(j2c_decomp: &J2CDecompose, ederi_utp: TsrView<f64>, dm_tp: TsrView<f64>) -> Tsr<f64> {
     // see module level documentation for details
-    return dm_tp % ederi_utp % tsr_int2c2e_l_inv;
+    println!("DEBUG: ederi_utp: {:?}", ederi_utp.shape());
+    return get_solved_j3c(dm_tp % ederi_utp, j2c_decomp);
 }
 
 pub fn get_grad_daux_j_int2c2e_ip1(tsr_int2c2e_ip1: TsrView<f64>, itm_j: TsrView<f64>) -> Tsr<f64> {
