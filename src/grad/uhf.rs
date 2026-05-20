@@ -1,16 +1,13 @@
 use super::rhf::*;
-use crate::{constants::AUXBAS_THRESHOLD, ri_jk::get_j2c_decomp};
 use crate::grad::traits::GradAPI;
-use crate::scf_io;
-use crate::scf_io::SCF;
+use crate::ri_jk;
+use crate::scf_io::{self, SCF};
 use crate::utilities::memory_batch::*;
-use crate::Molecule;
 use rayon::prelude::*;
 use rest_libcint::prelude::*;
-use rest_libcint_wrapper::*;
 use rstsr::prelude::*;
 use std::collections::HashMap;
-use tensors::{matrix_blas_lapack::_power_rayon_for_symmetric_matrix, MatrixFull};
+use tensors::MatrixFull;
 
 type Tsr<T> = Tensor<T, DeviceBLAS, IxD>;
 type TsrView<'a, T> = TensorView<'a, T, DeviceBLAS, IxD>;
@@ -41,12 +38,6 @@ impl RIUHFGradient<'_> {
             _ => panic!("SCFtype is not sutiable for UHF gradient."),
         };
 
-        // check j2c_decomp flag
-        use crate::ri_jk::decompose::*;
-        match scf_data.mol.ctrl.j2c_decomp.policy {
-            J2CDecompPolicy::Cd => unimplemented!("Cholesky decompose is not implemented for gradient currently."),
-            _ => {},
-        };
         // check omega flag
         if scf_data.mol.xc_data.is_rsh() {
             unimplemented!("RI gradient for range-separated hybrid functionals is not implemented currently.")
@@ -58,6 +49,7 @@ impl RIUHFGradient<'_> {
         flags.factor_k(Some(1.0));
         flags.auxbasis_response(scf_data.mol.ctrl.auxbasis_response);
         flags.print_level(scf_data.mol.ctrl.print_level);
+        flags.max_memory(scf_data.mol.ctrl.max_memory);
         let flags = flags.build().unwrap();
 
         RIUHFGradient { scf_data, flags, result: HashMap::new() }
@@ -73,9 +65,9 @@ impl RIUHFGradient<'_> {
 
     pub fn calc_de_ovlp(&mut self) -> &mut Self {
         // preparation
-        let mol = &self.scf_data.mol;
-        let mut cint_data = mol.initialize_cint(false);
-        let device = rt::DeviceBLAS::default();
+        let mol_obj = &self.scf_data.mol;
+        let mol = ri_jk::util::get_cint_mol(mol_obj);
+        let device = DeviceBLAS::default();
 
         // orbital informations
         let mo_coeff = get_mo_coeff(self.scf_data, &device);
@@ -84,7 +76,7 @@ impl RIUHFGradient<'_> {
 
         // tsr_int1e_ipovlp
         let tsr_int1e_ipovlp = {
-            let (out, mut shape) = cint_data.integral_s1::<int1e_ipovlp>(None);
+            let (out, shape) = mol.integrate("int1e_ipovlp", "s1", None).into();
             rt::asarray((out, shape, &device))
         };
 
@@ -93,17 +85,17 @@ impl RIUHFGradient<'_> {
         let dao_ovlp = get_grad_dao_ovlp(tsr_int1e_ipovlp.view(), dme0.view());
 
         // de_ovlp
-        let natm = mol.geom.elem.len();
+        let natm = mol_obj.geom.elem.len();
         let mut de_ovlp = rt::zeros(([3, natm], &device));
-        let ao_slice = mol.aoslice_by_atom();
+        let ao_slice = mol_obj.aoslice_by_atom();
 
         for atm in 0..natm {
             let [_, _, p0, p1] = ao_slice[atm];
-            *&mut de_ovlp.i_mut((.., atm)) += dao_ovlp.i((p0..p1)).sum_axes(0);
+            *&mut de_ovlp.i_mut((.., atm)) += dao_ovlp.i(p0..p1).sum_axes(0);
         }
 
         // note f-contiguous transpose
-        let de_ovlp_raw = de_ovlp.into_raw_parts().0.into_cpu_vec().unwrap();
+        let de_ovlp_raw = de_ovlp.into_shape(-1).into_raw();
         let de_ovlp = MatrixFull::from_vec([3, natm], de_ovlp_raw).unwrap();
         self.result.insert("de_ovlp".into(), de_ovlp);
         return self;
@@ -112,7 +104,7 @@ impl RIUHFGradient<'_> {
     pub fn calc_de_hcore(&mut self) -> &mut Self {
         let mol = &self.scf_data.mol;
         let natm = mol.geom.elem.len();
-        let device = rt::DeviceBLAS::default();
+        let device = DeviceBLAS::default();
 
         let dm = get_dm(self.scf_data, &device);
         let dm = &dm[0] + &dm[1];
@@ -122,7 +114,7 @@ impl RIUHFGradient<'_> {
             *&mut de_hcore.i_mut((.., atm)) += (gen_deriv_hcore(atm) * &dm).sum_axes([0, 1]);
         }
 
-        let de_hcore_raw = de_hcore.into_raw_parts().0.into_cpu_vec().unwrap();
+        let de_hcore_raw = de_hcore.into_shape(-1).into_raw();
         let de_hcore = MatrixFull::from_vec([3, natm], de_hcore_raw).unwrap();
         self.result.insert("de_hcore".into(), de_hcore);
         return self;
@@ -227,14 +219,11 @@ impl RIUHFGradient<'_> {
 
         time_records.count_start("de-jk preparation 1");
 
-        let mol = &self.scf_data.mol;
-        let auxmol = mol.make_auxmol_fake();
-        let natm = mol.geom.elem.len();
-        let mut cint_data = mol.initialize_cint(true);
-        let mut cint_data_aux = auxmol.initialize_cint(false);
-        let n_basis_shell = mol.cint_bas.len() as i32;
-        let n_auxbas_shell = mol.cint_aux_bas.len() as i32;
-        let device = rt::DeviceBLAS::default();
+        let mol_obj = &self.scf_data.mol;
+        let natm = mol_obj.geom.elem.len();
+        let mol = ri_jk::util::get_cint_mol(mol_obj);
+        let aux = ri_jk::util::get_cint_aux(mol_obj);
+        let device = DeviceBLAS::default();
 
         // density matrix and triu-packed density matrix
         let dm = get_dm(self.scf_data, &device);
@@ -261,23 +250,19 @@ impl RIUHFGradient<'_> {
         time_records.count_start("de-jk preparation power");
         // tsr_int2c2e_l: J^-1/2
         let j2c_decomp_option = self.scf_data.mol.ctrl.j2c_decomp;
-        let j2c_decomp = get_j2c_decomp(&cint_data_aux, &device, j2c_decomp_option);
+        let j2c_decomp = ri_jk::get_j2c_decomp(&aux, &device, j2c_decomp_option);
         time_records.count("de-jk preparation power");
 
         // tsr_int2c2e_ip1
         let tsr_int2c2e_ip1 = {
-            let shl_slices =
-                vec![[n_basis_shell, n_basis_shell + n_auxbas_shell], [n_basis_shell, n_basis_shell + n_auxbas_shell]];
-            let (out, shape) = cint_data.integral_s1::<int2c2e_ip1>(Some(&shl_slices));
+            let (out, shape) = aux.integrate("int2c2e_ip1", "s1", None).into();
             rt::asarray((out, shape, &device))
         };
 
         // shell partition of int3c2e
-        let ao_loc = cint_data.ao_loc();
-        let aux_loc = &ao_loc[(n_basis_shell as usize)..];
+        let aux_loc = aux.ao_loc();
 
         // available memory in MB, if not set, will be calculated from system
-        let sys_info = sysinfo::System::new_all();
         let mem_avail = self.flags.max_memory.map(|max_memory| max_memory - detect_used_memory_mb("proc"));
         let aux_batch_size = calc_batch_size::<f64>(
             8 * nao * nao,
@@ -286,7 +271,7 @@ impl RIUHFGradient<'_> {
             Some(naux * (nocc[0] * nocc[0] + nocc[1] * nocc[1])),
         );
         let aux_batch_size = aux_batch_size.min(216);
-        let aux_partition = blocksize_partition(aux_loc, aux_batch_size);
+        let aux_partition = blocksize_partition(&aux_loc, aux_batch_size);
 
         time_records.count("de-jk preparation 1");
 
@@ -326,17 +311,13 @@ impl RIUHFGradient<'_> {
         let mut idx_aux_start = 0;
         for [shl0, shl1] in aux_partition {
             let shl_naux = aux_loc[shl1] - aux_loc[shl0];
-            let shl_slices = vec![
-                [0, n_basis_shell],
-                [0, n_basis_shell],
-                [n_basis_shell + shl0 as i32, n_basis_shell + shl1 as i32],
-            ];
+            let shl_slices = [[0, mol.nbas()], [0, mol.nbas()], [shl0, shl1]];
             let (p0, p1) = (idx_aux_start, idx_aux_start + shl_naux);
 
             time_records.count_start("de-jk batch int");
             // int3c2e_ip1
             let tsr_int3c2e_ip1 = {
-                let (out, shape) = cint_data.integral_s1::<int3c2e_ip1>(Some(&shl_slices));
+                let (out, shape) = CInt::integrate_cross("int3c2e_ip1", [&mol, &mol, &aux], "s1", shl_slices).into();
                 rt::asarray((out, shape, &device))
             };
 
@@ -344,7 +325,8 @@ impl RIUHFGradient<'_> {
             let mut tsr_int3c2e_ip2 = rt::full(([], f64::NAN, &device));
             if self.flags.auxbasis_response {
                 tsr_int3c2e_ip2 = {
-                    let (out, shape) = cint_data.integral_s2ij::<int3c2e_ip2>(Some(&shl_slices));
+                    let (out, shape) =
+                        CInt::integrate_cross("int3c2e_ip2", [&mol, &mol, &aux], "s2ij", shl_slices).into();
                     rt::asarray((out, shape, &device))
                 };
             }
@@ -357,7 +339,7 @@ impl RIUHFGradient<'_> {
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 2");
-                    *&mut daux_j.i_mut((p0..p1)) +=
+                    *&mut daux_j.i_mut(p0..p1) +=
                         get_grad_daux_j_int3c2e_ip2(tsr_int3c2e_ip2.view(), dm_tp.view(), itm_j.i(p0..p1));
                     time_records.count("de-jk batch 2");
                 }
@@ -365,7 +347,7 @@ impl RIUHFGradient<'_> {
 
             if self.flags.factor_k.is_some() {
                 time_records.count_start("de-jk batch 3");
-                let mut itm_k_ao = get_itm_k_ao(itm_k_occtp[0].i((.., p0..p1)), occ_coeff[0].view())
+                let itm_k_ao = get_itm_k_ao(itm_k_occtp[0].i((.., p0..p1)), occ_coeff[0].view())
                     + get_itm_k_ao(itm_k_occtp[1].i((.., p0..p1)), occ_coeff[1].view());
                 time_records.count("de-jk batch 3");
 
@@ -375,7 +357,7 @@ impl RIUHFGradient<'_> {
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 5");
-                    *&mut daux_k.i_mut((p0..p1)) +=
+                    *&mut daux_k.i_mut(p0..p1) +=
                         get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_k_ao.view());
                     time_records.count("de-jk batch 5");
                 }
@@ -384,7 +366,7 @@ impl RIUHFGradient<'_> {
             idx_aux_start += shl_naux;
         }
 
-        if self.scf_data.mol.ctrl.print_level >= 2 {
+        if self.flags.print_level >= 2 {
             time_records.report_all();
         }
 
@@ -393,24 +375,24 @@ impl RIUHFGradient<'_> {
         let mut de_k = rt::full(([3, natm], f64::NAN, &device));
         let mut de_jaux = rt::full(([3, natm], f64::NAN, &device));
         let mut de_kaux = rt::full(([3, natm], f64::NAN, &device));
-        let ao_slice = mol.aoslice_by_atom();
-        let aux_slice = mol.make_auxmol_fake().aoslice_by_atom();
+        let ao_slice = mol_obj.aoslice_by_atom();
+        let aux_slice = mol_obj.make_auxmol_fake().aoslice_by_atom();
 
         for atm in 0..natm {
             let [_, _, p0, p1] = ao_slice[atm].clone().try_into().unwrap();
             if self.flags.factor_j.is_some() {
-                *&mut de_j.i_mut((.., atm)).assign(dao_j.i((p0..p1)).sum_axes(0));
+                *&mut de_j.i_mut((.., atm)).assign(dao_j.i(p0..p1).sum_axes(0));
             }
             if self.flags.factor_k.is_some() {
-                *&mut de_k.i_mut((.., atm)).assign(dao_k.i((p0..p1)).sum_axes(0));
+                *&mut de_k.i_mut((.., atm)).assign(dao_k.i(p0..p1).sum_axes(0));
             }
 
             let [_, _, p0, p1] = aux_slice[atm].clone().try_into().unwrap();
             if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
-                *&mut de_jaux.i_mut((.., atm)).assign(daux_j.i((p0..p1)).sum_axes(0));
+                *&mut de_jaux.i_mut((.., atm)).assign(daux_j.i(p0..p1).sum_axes(0));
             }
             if self.flags.factor_k.is_some() && self.flags.auxbasis_response {
-                *&mut de_kaux.i_mut((.., atm)).assign(daux_k.i((p0..p1)).sum_axes(0));
+                *&mut de_kaux.i_mut((.., atm)).assign(daux_k.i(p0..p1).sum_axes(0));
             }
         }
 
@@ -424,19 +406,19 @@ impl RIUHFGradient<'_> {
         }
 
         let de_j = {
-            let de_j_raw = de_j.into_raw_parts().0.into_cpu_vec().unwrap();
+            let de_j_raw = de_j.into_shape(-1).into_raw();
             MatrixFull::from_vec([3, natm], de_j_raw).unwrap()
         };
         let de_jaux = {
-            let de_jaux_raw = de_jaux.into_raw_parts().0.into_cpu_vec().unwrap();
+            let de_jaux_raw = de_jaux.into_shape(-1).into_raw();
             MatrixFull::from_vec([3, natm], de_jaux_raw).unwrap()
         };
         let de_k = {
-            let de_k_raw = de_k.into_raw_parts().0.into_cpu_vec().unwrap();
+            let de_k_raw = de_k.into_shape(-1).into_raw();
             MatrixFull::from_vec([3, natm], de_k_raw).unwrap()
         };
         let de_kaux = {
-            let de_kaux_raw = de_kaux.into_raw_parts().0.into_cpu_vec().unwrap();
+            let de_kaux_raw = de_kaux.into_shape(-1).into_raw();
             MatrixFull::from_vec([3, natm], de_kaux_raw).unwrap()
         };
 
