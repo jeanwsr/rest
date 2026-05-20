@@ -1,5 +1,5 @@
 use super::rhf::*;
-use crate::constants::AUXBAS_THRESHOLD;
+use crate::{constants::AUXBAS_THRESHOLD, ri_jk::get_j2c_decomp};
 use crate::grad::traits::GradAPI;
 use crate::scf_io;
 use crate::scf_io::SCF;
@@ -260,14 +260,8 @@ impl RIUHFGradient<'_> {
 
         time_records.count_start("de-jk preparation power");
         // tsr_int2c2e_l: J^-1/2
-        let tsr_int2c2e_l_inv = {
-            let shl_slices =
-                vec![[n_basis_shell, n_basis_shell + n_auxbas_shell], [n_basis_shell, n_basis_shell + n_auxbas_shell]];
-            let (out, shape) = cint_data.integral_s1::<int2c2e>(Some(&shl_slices));
-            let out = MatrixFull::from_vec(shape.try_into().unwrap(), out).unwrap();
-            let out = _power_rayon_for_symmetric_matrix(&out, -0.5, AUXBAS_THRESHOLD).unwrap();
-            rt::asarray((out.data, out.size, &device))
-        };
+        let j2c_decomp_option = self.scf_data.mol.ctrl.j2c_decomp;
+        let j2c_decomp = get_j2c_decomp(&cint_data_aux, &device, j2c_decomp_option);
         time_records.count("de-jk preparation power");
 
         // tsr_int2c2e_ip1
@@ -305,8 +299,8 @@ impl RIUHFGradient<'_> {
         let mut dao_j = rt::full(([], f64::NAN, &device));
         let mut daux_j = rt::full(([], f64::NAN, &device));
         if self.flags.factor_j.is_some() {
-            // itm_j = get_itm_j(tsr_int2c2e_l_inv.view(), ederi_utp.view(), dm_tp.view());
-            // dao_j = rt::zeros(([nao, 3], &device));
+            itm_j = get_itm_j(&j2c_decomp, ederi_utp.view(), dm_tp.view());
+            dao_j = rt::zeros(([nao, 3], &device));
         }
         if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
             daux_j = get_grad_daux_j_int2c2e_ip1(tsr_int2c2e_ip1.view(), itm_j.view());
@@ -317,8 +311,8 @@ impl RIUHFGradient<'_> {
         let mut daux_k = rt::full(([], f64::NAN, &device));
         if self.flags.factor_k.is_some() {
             itm_k_occtp = [
-                get_itm_k_occtp(tsr_int2c2e_l_inv.view(), ederi_utp.view(), occ_coeff[0].view()),
-                get_itm_k_occtp(tsr_int2c2e_l_inv.view(), ederi_utp.view(), occ_coeff[1].view()),
+                get_itm_k_occtp(&j2c_decomp, ederi_utp.view(), occ_coeff[0].view()),
+                get_itm_k_occtp(&j2c_decomp, ederi_utp.view(), occ_coeff[1].view()),
             ];
             dao_k = rt::zeros(([nao, 3], &device));
         }

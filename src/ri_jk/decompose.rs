@@ -110,7 +110,7 @@ pub fn generate_rimatr_bare(mol_obj: &Molecule, omega: Option<f64>) -> MatrixFul
         let (out, shape) = CInt::integrate_cross("int3c2e", [&mol, &mol, &aux], "s2ij", None).into();
         rt::asarray((out, shape.f(), &device))
     };
-    let cderi = get_solved_j3c(j3c, &j2c_decomp);
+    let cderi = get_solved_j3c(j3c, &j2c_decomp, false);
 
     let shape = cderi.shape().to_vec().try_into().unwrap();
     MatrixFull::from_vec(shape, cderi.into_shape(-1).into_vec()).unwrap()

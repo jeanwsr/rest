@@ -1,6 +1,6 @@
 #![warn(unused)]
 use crate::grad::traits::GradAPI;
-use crate::ri_jk::{self, J2CDecompose, get_j2c_decomp, get_solved_j3c};
+use crate::ri_jk::{self, get_solved_j3c, J2CDecompose};
 use crate::scf_io::{self, SCF};
 use crate::utilities::memory_batch::*;
 use crate::Molecule;
@@ -194,13 +194,6 @@ impl RIRHFGradient<'_> {
         // tsr_int2c2e_l: J^-1/2
         let j2c_decomp_option = self.scf_data.mol.ctrl.j2c_decomp;
         let j2c_decomp = ri_jk::get_j2c_decomp(&aux, &device, j2c_decomp_option);
-        let tsr_int2c2e_l_inv = match j2c_decomp {
-            J2CDecompose::Cd { j2c_l, .. } => rt::linalg::inv(j2c_l),
-            J2CDecompose::Eig { j2c_l_inv, .. } => j2c_l_inv,
-        };
-        // TODO: transpose should inside pure functions, try consider uplo
-        let tsr_int2c2e_l_inv = tsr_int2c2e_l_inv.into_reverse_axes().into_contig(FlagOrder::F);
-        let j2c_decomp = get_j2c_decomp(&aux, &device, j2c_decomp_option);
         time_records.count("de-jk preparation power");
 
         // tsr_int2c2e_ip1
@@ -240,7 +233,7 @@ impl RIRHFGradient<'_> {
         let mut dao_k = rt::full(([], f64::NAN, &device));
         let mut daux_k = rt::full(([], f64::NAN, &device));
         if self.flags.factor_k.is_some() {
-            itm_k_occtp = get_itm_k_occtp(tsr_int2c2e_l_inv.view(), ederi_utp.view(), weighted_occ_coeff.view());
+            itm_k_occtp = get_itm_k_occtp(&j2c_decomp, ederi_utp.view(), weighted_occ_coeff.view());
             dao_k = rt::zeros(([nao, 3], &device));
         }
         if self.flags.factor_k.is_some() && self.flags.auxbasis_response {
@@ -655,8 +648,7 @@ pub fn get_grad_dao_ovlp(tsr_int1e_ipovlp: TsrView<f64>, dme0: TsrView<f64>) -> 
 
 pub fn get_itm_j(j2c_decomp: &J2CDecompose, ederi_utp: TsrView<f64>, dm_tp: TsrView<f64>) -> Tsr<f64> {
     // see module level documentation for details
-    println!("DEBUG: ederi_utp: {:?}", ederi_utp.shape());
-    return get_solved_j3c(dm_tp % ederi_utp, j2c_decomp);
+    return get_solved_j3c(dm_tp % ederi_utp, j2c_decomp, true);
 }
 
 pub fn get_grad_daux_j_int2c2e_ip1(tsr_int2c2e_ip1: TsrView<f64>, itm_j: TsrView<f64>) -> Tsr<f64> {
@@ -701,19 +693,18 @@ pub fn get_grad_daux_j_int3c2e_ip2(
 }
 
 pub fn get_itm_k_occtp(
-    tsr_int2c2e_l_inv: TsrView<f64>,
+    j2c_decomp: &J2CDecompose,
     ederi_utp: TsrView<f64>,
     weighted_occ_coeff: TsrView<f64>,
 ) -> Tsr<f64> {
     // see module level documentation for details
-    assert!(tsr_int2c2e_l_inv.f_prefer());
     assert!(ederi_utp.f_prefer());
     assert!(weighted_occ_coeff.f_prefer());
 
     let nocc = weighted_occ_coeff.shape()[1];
     let naux = ederi_utp.shape()[1];
     let nocc_tp = nocc * (nocc + 1) / 2;
-    let device = tsr_int2c2e_l_inv.device().clone();
+    let device = ederi_utp.device().clone();
     let tmp: Tsr<f64> = unsafe { rt::empty(([nocc_tp, naux], &device)) };
     (0..naux).into_par_iter().for_each(|p| {
         let ederi_bb = ederi_utp.i((.., p)).unpack_triu(FlagSymm::Sy);
@@ -722,8 +713,7 @@ pub fn get_itm_k_occtp(
         let mut tmp = unsafe { tmp.force_mut() };
         tmp.i_mut((.., p)).assign(ederi_oo.pack_triu());
     });
-    let itm_k_occ = tmp % tsr_int2c2e_l_inv;
-    return itm_k_occ;
+    get_solved_j3c(tmp, j2c_decomp, true)
 }
 
 pub fn get_itm_k_aux(mut itm_k_occtp: TsrMut<f64>) -> Tsr<f64> {
