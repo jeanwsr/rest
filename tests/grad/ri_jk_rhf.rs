@@ -27,6 +27,7 @@ static INPUT_NH3: &str = r##"
 
 [ctrl.j2c_decomp]
 policy = "POLICY"
+uplo = "UPLO"
 
 [geom]
     name = "NH3"
@@ -39,8 +40,8 @@ policy = "POLICY"
     """
 "##;
 
-fn test_nh3_with_arg(policy: &str) {
-    let input_token = INPUT_NH3.replace("POLICY", policy);
+fn test_nh3_with_arg(policy: &str, uplo: &str) {
+    let input_token = INPUT_NH3.replace("POLICY", policy).replace("UPLO", uplo);
     let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
     let (ctrl, geom) = ctrl_io::parse_ctl_from_json(&keys).unwrap();
     let mol = Molecule::build_native(ctrl, geom, None).unwrap();
@@ -67,12 +68,17 @@ fn test_nh3_with_arg(policy: &str) {
 
 #[test]
 fn test_nh3_eig() {
-    test_nh3_with_arg("eig");
+    test_nh3_with_arg("eig", "Upper");
 }
 
 #[test]
-fn test_nh3_cd() {
-    test_nh3_with_arg("cd");
+fn test_nh3_cd_upper() {
+    test_nh3_with_arg("cd", "Upper");
+}
+
+#[test]
+fn test_nh3_cd_lower() {
+    test_nh3_with_arg("cd", "Lower");
 }
 
 #[test]
