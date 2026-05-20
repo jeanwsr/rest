@@ -256,8 +256,10 @@ impl RIRHFGradient<'_> {
         de += self.result.get("de_hcore").unwrap().clone();
         self.result.get("de_j").map(|x| de += x.clone());
         self.result.get("de_k").map(|x| de += x.clone());
+        self.result.get("de_r").map(|x| de += x.clone());
         self.result.get("de_jaux").map(|x| de += x.clone());
         self.result.get("de_kaux").map(|x| de += x.clone());
+        self.result.get("de_raux").map(|x| de += x.clone());
         self.result.get("de_xc").map(|x| de += x.clone());
         self.result.get("de_qmmm").map(|x| de += x.clone());
         self.result.insert("de".into(), de);

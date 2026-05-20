@@ -85,52 +85,15 @@ fn test_with_scf(scf_data: &'_ SCF) -> RIRHFGradient<'_> {
     let mut scf_grad = RIRHFGradient::new(scf_data);
     scf_grad.calc_rks();
 
-    println!("=== de ===");
-    let de = scf_grad.result.get("de").unwrap().clone();
-    let de = rt::asarray((de.data, de.size));
-    println!("{:12.6}", de.t());
-
-    println!("=== de_nuc ===");
-    scf_grad.result.get("de_nuc").map(|de| {
-        let de = rt::asarray((&de.data, de.size));
-        println!("{:12.6}", de.t());
-    });
-
-    println!("=== de_ovlp ===");
-    scf_grad.result.get("de_ovlp").map(|de| {
-        let de = rt::asarray((&de.data, de.size));
-        println!("{:12.6}", de.t());
-    });
-
-    println!("=== de_hcore ===");
-    scf_grad.result.get("de_hcore").map(|de| {
-        let de = rt::asarray((&de.data, de.size));
-        println!("{:12.6}", de.t());
-    });
-
-    println!("=== de_j ===");
-    scf_grad.result.get("de_j").map(|de| {
-        let de = rt::asarray((&de.data, de.size));
-        println!("{:12.6}", de.t());
-    });
-
-    println!("=== de_k ===");
-    scf_grad.result.get("de_k").map(|de| {
-        let de = rt::asarray((&de.data, de.size));
-        println!("{:12.6}", de.t());
-    });
-
-    println!("=== de_jaux ===");
-    scf_grad.result.get("de_jaux").map(|de| {
-        let de = rt::asarray((&de.data, de.size));
-        println!("{:12.6}", de.t());
-    });
-
-    println!("=== de_kaux ===");
-    scf_grad.result.get("de_kaux").map(|de| {
-        let de = rt::asarray((&de.data, de.size));
-        println!("{:12.6}", de.t());
-    });
+    for grad_key in
+        ["de", "de_nuc", "de_ovlp", "de_hcore", "de_j", "de_k", "de_jaux", "de_kaux", "de_xc", "de_r", "de_raux"]
+    {
+        if let Some(de) = scf_grad.result.get(grad_key) {
+            let de = rt::asarray((&de.data, de.size));
+            println!("=== {} ===", grad_key);
+            println!("{:12.6}", de.t());
+        }
+    }
 
     return scf_grad;
 }
