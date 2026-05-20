@@ -6,6 +6,7 @@ use crate::dft::DFAFamily;
 #[derive(Clone,PartialEq,Debug)]
 pub enum ComponentType {
     HF,
+    RSHF,
     PT2,
     RPA,
     SCSRPA,
@@ -27,6 +28,7 @@ impl ComponentType {
     pub fn as_str(&self) -> &'static str {
         match self {
             ComponentType::HF => "HF",
+            ComponentType::RSHF => "RSHF",
             ComponentType::PT2 => "PT2",
             ComponentType::RPA => "RPA",
             ComponentType::SCSRPA => "SCSRPA",
@@ -40,6 +42,7 @@ impl ComponentType {
     pub fn to_dfa_family(&self) -> Option<DFAFamily> {
         match self {
             ComponentType::HF => None,
+            ComponentType::RSHF => None,
             ComponentType::PT2 => Some(DFAFamily::PT2),
             ComponentType::RPA => Some(DFAFamily::RPA),
             ComponentType::SCSRPA => Some(DFAFamily::SCSRPA),
@@ -197,7 +200,9 @@ lazy_static! {
 
     pub static ref WHITELIST_NONLIBXC:HashMap<&'static str, ComponentType> = HashMap::from([
         ("HF", ComponentType::HF),
-        // todo SR_HF
+        ("SR_HF", ComponentType::RSHF),
+        ("LR_HF", ComponentType::RSHF),
+        ("RSH", ComponentType::RSHF),
         ("MP2", ComponentType::PT2),
         ("MP2_OS", ComponentType::PT2),
         ("MP2_SS", ComponentType::PT2),
@@ -276,6 +281,8 @@ pub fn load_json_functionals() -> HashMap<String, XC2step> {
     map1.extend(load_json(jsonfile2));
     let jsonfile3 = include_str!("./family_bdh.json");
     map1.extend(load_json(jsonfile3));
+    let jsonfile4 = include_str!("./family_bdh_omega.json");
+    map1.extend(load_json(jsonfile4));
     map1
 }
 

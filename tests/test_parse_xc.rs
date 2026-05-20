@@ -1,18 +1,18 @@
 use pyrest::dft::parse_xc::parse::{parse, parse_1step, parse_and_derive, merge_components, parse_pass3};
 use pyrest::dft::parse_xc::ComponentType;
-use assert_float_eq::{assert_f64_near};
+
 
 #[test]
 fn test_parse_xc_param() {
     let input1 = "0.5*PBE + 0.5*B88, PBE(_beta=0.1)";
     let final_components = parse_1step(input1);
     assert_eq!(final_components.len(), 3);
-    assert_f64_near!(final_components[0].factor, 0.5, 9);
+    assert!((final_components[0].factor - 0.5).abs() <= 1e-9);
     assert_eq!(final_components[0].id, 101);
     assert_eq!(final_components[1].id, 106);
     assert_eq!(final_components[2].factor, 1.0);
     assert_eq!(final_components[2].id, 130);
-    assert_f64_near!(final_components[2].param_keyword.get("_beta").unwrap().as_f64().unwrap(), 0.1, 9);
+    assert!((final_components[2].param_keyword.get("_beta").unwrap().as_f64().unwrap() - 0.1).abs() <= 1e-9);
 }
 
 #[test]
@@ -28,10 +28,10 @@ fn test_parse_xc_hybrid() {
     assert_eq!(final_components[4].id, 8);
     let input2 = "B3LYP";
     let final_dfa = parse(input2);
-    assert_f64_near!(final_dfa.get_hybrid_scf(1), 0.2, 9);
+    assert!((final_dfa.get_hybrid_scf(1) - 0.2).abs() <= 1e-9);
     let input3 = "0.2*HF + 0.5*B3LYP";
     let final_dfa3 = parse(input3);
-    assert_f64_near!(final_dfa3.get_hybrid_scf(1), 0.3, 9);
+    assert!((final_dfa3.get_hybrid_scf(1) - 0.3).abs() <= 1e-9);
 }
 
 #[test]
@@ -72,13 +72,13 @@ fn test_parse_xc_merge() {
     let final_components = parse_1step(input1);
     let merged = merge_components(final_components);
     assert_eq!(merged.len(), 2);
-    assert_f64_near!(merged[0].factor, 1.1, 9);
+    assert!((merged[0].factor - 1.1).abs() <= 1e-9);
     assert_eq!(merged[0].id, 106);
     let input2 = "BLYP + 0.1*LYP";
     let final_components2 = parse_1step(input2);
     let merged2 = merge_components(final_components2);
     assert_eq!(merged2.len(), 2);
-    assert_f64_near!(merged2[1].factor, 1.1, 9);
+    assert!((merged2[1].factor - 1.1).abs() <= 1e-9);
 }
 
 #[test]
@@ -128,4 +128,46 @@ fn test_parse_xc_vv10() {
     let dfa2 = parse_and_derive(input2, 1, 0);
     let (san2,_) = dfa2.check_sanity();
     assert!(!san2);
+}
+
+#[test]
+fn test_parse_xc_cam_b3lyp() {
+    let input1 = "CAM-B3LYP";
+    let dfa = parse_and_derive(input1, 1, 0);
+    let (san,_) = dfa.check_sanity();
+    assert!(san);
+    let (omega, alpha, _beta) = dfa.get_rsh_scf(1);
+    assert!((omega.unwrap() - 0.33).abs() <= 1e-7);
+    assert!((alpha - 0.65).abs() <= 1e-7);
+    assert!((dfa.dfa_hybrid_scf - 0.19).abs() <= 1e-7);
+}
+
+#[test]
+fn test_parse_xc_rsh() {
+    let input1 = "0.2*SR_HF(0.2) + 0.3*LR_HF(0.2) + 0.5*B3LYP";
+    let dfa = parse_and_derive(input1, 1, 0);
+    let (san,_) = dfa.check_sanity();
+    assert!(san);
+    let (omega, alpha, beta) = dfa.get_rsh_scf(1);
+    assert!((omega.unwrap() - 0.2).abs() <= 1e-7);
+    assert!((alpha - 0.4).abs() <= 1e-7);
+    assert!(((alpha + beta) - 0.3).abs() <= 1e-7);
+    assert!((dfa.dfa_hybrid_scf - 0.3).abs() <= 1e-7);
+}
+
+#[test]
+fn test_parse_xc_equivalent_rsh() {
+    let input1 = "RSH(0.33,0.65,-0.46) + 0.46*ITYH + 0.35*B88, 0.19*VWN5 + 0.81*LYP";
+    let input2 = "CAM-B3LYP";
+    let dfa1 = parse_and_derive(input1, 1, 0);
+    let dfa2 = parse_and_derive(input2, 1, 0);
+    assert!(dfa1.get_rsh_scf(1) == dfa2.get_rsh_scf(1));
+    assert!((dfa1.dfa_hybrid_scf - dfa2.dfa_hybrid_scf).abs() <= 1e-7);
+}
+
+#[test]
+#[should_panic]
+fn test_parse_xc_rsh_fail() {
+    let input1 = "0.2*RSH(0.1, 0.5, -0.1) + 0.5*CAM-B3LYP";
+    let _dfa = parse_and_derive(input1, 1, 0);
 }
