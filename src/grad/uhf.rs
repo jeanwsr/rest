@@ -41,15 +41,7 @@ impl RIUHFGradient<'_> {
             unimplemented!("RI gradient for range-separated hybrid functionals is not implemented currently.")
         }
 
-        // flags
-        let mut flags = RIHFGradientFlagsBuilder::default();
-        flags.factor_j(Some(1.0));
-        flags.factor_k(Some(1.0));
-        flags.auxbasis_response(scf_data.mol.ctrl.auxbasis_response);
-        flags.print_level(scf_data.mol.ctrl.print_level);
-        flags.max_memory(scf_data.mol.ctrl.max_memory);
-        let flags = flags.build().unwrap();
-
+        let flags = build_ri_jk_grad_flags(scf_data);
         RIUHFGradient { scf_data, flags, result: HashMap::new() }
     }
 
