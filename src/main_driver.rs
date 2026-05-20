@@ -17,7 +17,7 @@ use crate::constants::{ANG, AU2DEBYE};
 use crate::scf_io::{scf_without_build, SCFType, SCF};
 use tensors::{MathMatrix, MatrixFull};
 use tensors::matrix_blas_lapack::_dsyevd;
-use crate::{utilities, ri_pt2, ri_rpa, dft, scf_io, post_scf_analysis};
+use crate::{utilities, ri_pt2, ri_rpa, dft, scf_io, post_scf_analysis, lib_rint};
 
 //use rayon;
 use crate::constants::EV;
@@ -44,6 +44,12 @@ use crate::mpi_io::{MPIOperator,MPIData};
 use std::collections::HashMap;
 
 //use crate::mpi_io::initialization;
+
+fn print_r12inv2_export(observables: &lib_rint::RhfVeeObservables) {
+    println!("E_J(r2)            : {:.16e}", observables.ej);
+    println!("E_K(r2)            : {:.16e}", observables.ek);
+    println!("E(r2)              : {:.16e}", observables.total);
+}
 
 
 pub fn main_driver() -> anyhow::Result<()> {
@@ -262,6 +268,65 @@ pub fn main_driver() -> anyhow::Result<()> {
         scf_data.stability();
 
         time_mark.count("Stability");
+    }
+
+    // check lib_rint
+    if scf_data.mol.ctrl.run_lib_rint {
+        time_mark.count_start("RI-r2");
+        match scf_data.scftype {
+            SCFType::RHF => {
+                let p_rhf = &scf_data.density_matrix[0];
+                let r2 = lib_rint::lib_vee_rhf_r2_observables_advanced(
+                    &scf_data.mol.geom,
+                    &scf_data.mol.basis4elem,
+                    p_rhf,
+                    Some(&scf_data.eigenvectors),
+                    Some(&scf_data.occupation),
+                );
+                print_r12inv2_export(&r2);
+            }
+            SCFType::ROHF | SCFType::UHF => {
+                if scf_data.density_matrix.len() < 2 {
+                    println!("lib_rint skipped: open-shell run needs alpha/beta density matrices");
+                } else {
+                    let dm_spin = &scf_data.density_matrix[0..2];
+                    let r2 = lib_rint::lib_vee_uhf_r2_observables_advanced(
+                        &scf_data.mol.geom,
+                        &scf_data.mol.basis4elem,
+                        dm_spin,
+                        Some(&scf_data.eigenvectors),
+                        Some(&scf_data.occupation),
+                    );
+                    print_r12inv2_export(&r2);
+                }
+            }
+        }
+        let x_ab_atoms_a = scf_data.mol.ctrl.x_ab_atoms_a.clone();
+        let x_ab_atoms_b = scf_data.mol.ctrl.x_ab_atoms_b.clone();
+        if !x_ab_atoms_a.is_empty() || !x_ab_atoms_b.is_empty() {
+            if x_ab_atoms_a.is_empty() || x_ab_atoms_b.is_empty() {
+                println!(
+                    "X_AB_OCC_CLOSURE skipped: both x_ab_atoms_a and x_ab_atoms_b must be non-empty"
+                );
+            } else {
+                match scf_data.scftype {
+                    SCFType::RHF => {
+                        let x_ab = lib_rint::lib_vee_rhf_occ_closure_connected_ri_coulomb_x(
+                            &scf_data,
+                            &x_ab_atoms_a,
+                            &x_ab_atoms_b,
+                        );
+                        println!("X_AB_OCC_CLOSURE       : {:.16e}", x_ab);
+                        println!("X_AB_OCC_CLOSURE_ATOMS_A: {:?}", x_ab_atoms_a);
+                        println!("X_AB_OCC_CLOSURE_ATOMS_B: {:?}", x_ab_atoms_b);
+                    }
+                    SCFType::ROHF | SCFType::UHF => {
+                        println!("X_AB_OCC_CLOSURE skipped: only RHF is supported for now");
+                    }
+                }
+            }
+        }
+        time_mark.count("RI-r2");
     }
 
     //====================================
