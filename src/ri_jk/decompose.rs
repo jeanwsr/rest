@@ -36,6 +36,10 @@ pub struct J2CDecompOption {
     #[serde_inline_default(Some(J2C_THRESH))]
     pub threshold: Option<f64>,
     /// The flag indicating whether the Cholesky factor is upper or lower triangular. Default to `Upper`.
+    ///
+    /// This is developer option. In most cases, col-major uses upper triangular.
+    /// Lower triangular is only for debug and testing purposes.
+    ///
     /// This field is only used for Cholesky decomposition, and will be ignored for eigen decomposition.
     #[serde_inline_default(Upper)]
     pub uplo: FlagUpLo,
