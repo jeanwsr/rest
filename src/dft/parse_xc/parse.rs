@@ -184,6 +184,10 @@ impl DFAComponent {
 
     // #[cached]
     pub fn get_hybrid(&self, spin_channel: usize) -> f64 {
+        if self.is_rsh() {
+            let (omega, alpha, beta) = self.get_rsh(spin_channel);
+            return self.factor * (alpha + beta);
+        }
         if self.component_type == ComponentType::HF {
             return self.factor;
         } else if self.component_type == ComponentType::Libxc {
@@ -201,8 +205,48 @@ impl DFAComponent {
         }
     }
 
+    pub fn get_rsh(&self, spin_channel: usize) -> (Option<f64>, f64, f64) {
+        if !self.is_rsh() {
+            return (None, self.get_hybrid(spin_channel), 0.0);
+        }
+        if self.component_type == ComponentType::Libxc {
+            let xcfunc = xc_func_init(self.id, spin_channel);
+            if let Some((omega, alpha, beta)) = xcfunc.cam_coef() {
+                return (Some(omega), alpha, beta);
+            } else {
+                panic!("Error: component {} is detected as RSH but cam_coef is not available in libxc", self.func);
+            }
+        } else if self.component_type == ComponentType::RSHF {
+            let param = &self.param_positional;
+            match self.func.as_str() {
+                "LR_HF" | "SR_HF" => {
+                    if param.len() != 1 {
+                        panic!("Error: SR/LR HF component with func {} should have exactly 1 positional parameter, but got {}", self.func, param.len());
+                    }
+                },
+                "RSH" => {
+                    if param.len() != 3 {
+                        panic!("Error: RSH component should have exactly 3 positional parameters (omega, alpha, beta), but got {}", param.len());
+                    }
+                },
+                _ => {},
+            }
+            match self.func.as_str() {
+                "LR_HF" => return (Some(param[0]), self.factor, -1.0*self.factor), 
+                "SR_HF" => return (Some(param[0]), 0.0, self.factor),
+                "RSH" => return (Some(param[0]), param[1], param[2]), 
+                _ => return (None, 0.0, 0.0),
+            }
+        } else {
+            return (None, 0.0, 0.0);
+        }
+    }
+
     pub fn is_rsh(&self) -> bool {
         match self.component_type {
+            ComponentType::RSHF => {
+                true
+            },
             ComponentType::Libxc => {
                 let xcfunc = xc_func_init(self.id, 1);
                 xcfunc.is_hyb_cam()
@@ -241,6 +285,9 @@ impl DFAComponent {
 
     pub fn canonicalize(&self) -> Self {
         match self.component_type {
+            ComponentType::RSHF => {
+                return self.normalize_rsh();
+            }
             ComponentType::Disp => {
                 // todo: check default
                 let mut comp = self.clone();
@@ -266,6 +313,15 @@ impl DFAComponent {
         self.clone()
     }
 
+    pub fn normalize_rsh(&self) -> Self {
+        assert!(self.component_type == ComponentType::RSHF);
+        let mut new_component = self.clone();
+        let (omega, alpha, beta) = self.get_rsh(1);
+        new_component.func = "RSH".to_string();
+        new_component.param_positional = vec![omega.unwrap(), alpha, beta];
+        new_component.factor = 1.0;
+        new_component
+    }
 
     pub fn normalize_pt2_param(&self) -> Self {
         let mut new_component = DFAComponent::new(1.0, self.func.clone());
@@ -328,10 +384,13 @@ impl DFAComponent {
 
     pub fn is_normalized(&self) -> bool {
         match self.component_type {
-            ComponentType::PT2 | ComponentType::SCSRPA => {
+            ComponentType::PT2 | ComponentType::SCSRPA | ComponentType::SBGE2 => {
                 self.factor == 1.0
             },
-            _ => panic!("Error: only PT2 and SCSRPA components can be checked for normalization, but got {}", self.component_type.as_str()),
+            ComponentType::RSHF => {
+                self.factor == 1.0 && self.func == "RSH" && self.param_positional.len() == 3
+            },
+            _ => panic!("Error: only PT2, SCSRPA, SBGE2, and RSHF components can be checked for normalization, but got {}", self.component_type.as_str()),
         }
     }
 
@@ -366,6 +425,13 @@ impl Addable for DFAComponent {
                         return false;
                     }
                 },
+                ComponentType::RSHF => {
+                    if self.is_normalized() && other.is_normalized() && self.param_positional[0] == other.param_positional[0] {
+                        return true;
+                    } else {
+                        return false;
+                    }
+                }
                 _ => {
                     return false;
                 },
@@ -397,6 +463,25 @@ impl std::ops::Add for DFAComponent {
             reference: self.reference.clone(), // todo: check if reference is the same
                 }
             },
+            ComponentType::RSHF => {
+                DFAComponent {
+                    factor: 1.0, // should be normalized before add
+                    func: self.func.clone(),
+                    func_full_name: self.func_full_name.clone(),
+                    id: self.id,
+                    // direct add positional parameters
+                    param_positional: {
+                        let mut p = self.param_positional.clone();
+                        p[1] += other.param_positional[1];
+                        p[2] += other.param_positional[2];
+                        p
+                    },
+                    param_keyword: self.param_keyword.clone(), // should be empty
+                    component_type: self.component_type.clone(),
+                    // xcfunc: None,
+                    reference: self.reference.clone(), // todo: check if reference is the same
+                }
+            },
             _ => {
         DFAComponent {
             factor: self.factor + other.factor,
@@ -423,7 +508,7 @@ pub struct DFAdef {
     pub spin_channel: usize,
     pub dfa_hybrid_scf: f64,
     // (omega, alpha, beta) in libxc convention; note beta is usually not used in computation.
-    pub dfa_rsh_scf: Option<(f64, f64, f64)>,
+    pub dfa_rsh_scf: (Option<f64>, f64, f64),
     pub dfa_hybrid_nscf: Option<f64>,
 }
 
@@ -436,7 +521,7 @@ impl DFAdef {
             reference: Vec::new(),
             spin_channel: 1,
             dfa_hybrid_scf: 0.0,
-            dfa_rsh_scf: None,
+            dfa_rsh_scf: (None, 0.0, 0.0),
             dfa_hybrid_nscf: None,
         }
     }
@@ -455,7 +540,13 @@ impl DFAdef {
             }
         }
         xc_data.dfa_hybrid_scf = self.dfa_hybrid_scf;
-        xc_data.dfa_rsh_scf = self.dfa_rsh_scf;
+        let alpha = self.dfa_rsh_scf.1;
+        let beta = self.dfa_rsh_scf.2;
+        if let Some(omega) = self.dfa_rsh_scf.0 {
+            xc_data.dfa_rsh_scf = Some((omega, alpha, beta));
+        } else {
+            xc_data.dfa_rsh_scf = None;
+        }
         if let Some(nscf_components) = &self.xc_nscf {
             let mut dfa_compnt_pos = Vec::new();
             let mut dfa_paramr_pos = Vec::new();
@@ -497,6 +588,9 @@ impl DFAdef {
         // println!("Info for SCF functional:");
         // let hyb_0 = self.get_hybrid_scf(1);
         result.push_str(&format!("  Total hybrid: {}\n", self.dfa_hybrid_scf));
+        if self.is_rsh() {
+            result.push_str(&format!("  RSH parameters (omega, alpha, beta): {} {} {}\n", self.dfa_rsh_scf.0.unwrap(), self.dfa_rsh_scf.1, self.dfa_rsh_scf.2));
+        }
         if let Some(nscf_components) = &self.xc_nscf {
             result.push_str("Final energy components:\n");
             for comp in nscf_components {
@@ -525,22 +619,33 @@ impl DFAdef {
         }
     }
 
-    pub fn get_rsh_scf(&self, spin_channel: usize) -> Option<(f64, f64, f64)> {
+    pub fn get_rsh_scf(&self, spin_channel: usize) -> (Option<f64>, f64, f64) {
         // check if any component in self.xc is RSH, if so, return (omega, alpha, beta)
-        let mut result = None;
+        let mut result = (None, 0.0, 0.0);
         if let Some(components) = &self.xc_scf {
             for comp in components.iter() {
                 if comp.is_rsh() {
-                    let xcfunc = xc_func_init(comp.id, spin_channel);
-                    let (omega, alpha, beta) = xcfunc.cam_coef().unwrap_or((0.0, 0.0, 0.0));
+                    let (omega, alpha, beta) = comp.get_rsh(spin_channel);
+                    // println!("Component {}: omega = {:?}, alpha = {}, beta = {}", comp.func, omega, alpha, beta);
                     // only if alpha and beta are both close to zero, we consider it as not range-separated (pure zero).
                     if alpha.abs() < 1e-10 && beta.abs() < 1e-10 {
                         continue;
                     }
-                    if result.is_some() {
-                        panic!("Multiple RSH functionals are specified in the DFA components for SCF. Currently this is not supported.");
+                    if result.0.is_some() {
+                        if result.0.unwrap() != omega.unwrap() {
+                            panic!("Multiple omega detected in the DFA components for SCF. Currently this is not supported.");
+                        }
+                    } else {
+                        result.0 = omega;
                     }
-                    result = Some((omega, alpha, beta));
+                        // result = Some((omega, result.unwrap().1 + alpha, result.unwrap().2 + beta));
+                    result.1 += alpha;
+                    result.2 += beta;
+                    
+                } else {
+                    // if it's not RSH but has hybrid, we consider it as alpha with beta = 0.
+                    let hyb = comp.get_hybrid(spin_channel);
+                    result.1 += hyb;                    
                 }
             }
         }

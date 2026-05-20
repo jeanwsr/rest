@@ -8,6 +8,7 @@ static CTRL_TEMPLATE: &str = r##"
 [ctrl]
     print_level =          1
     xc =                   "XC_PLACEHOLDER"
+    xc_parser =            "parse_xc"
     basis_path =           "basis-set-pool/sto-3g"
     auxbas_path =          "basis-set-pool/def2-universal-jkfit"
     eri_type =             "ri-v"
@@ -43,6 +44,16 @@ fn run_scf(xc: &str) -> SCF {
 #[test]
 fn test_cam_b3lyp_energy() {
     let scf = run_scf("cam-b3lyp");
+    let pyscf_ref = -55.315789868819;
+    println!("REST CAM-B3LYP: {:.12}", scf.scf_energy);
+    println!("pyscf:          {:.12}", pyscf_ref);
+    assert!((scf.scf_energy - pyscf_ref).abs() < 1e-5,
+        "CAM-B3LYP energy mismatch: REST={} pyscf={}", scf.scf_energy, pyscf_ref);
+}
+
+#[test]
+fn test_cam_b3lyp_another_energy() {
+    let scf = run_scf("RSH(0.33,0.65,-0.46) + 0.46*ITYH + 0.35*B88, 0.19*VWN5 + 0.81*LYP");
     let pyscf_ref = -55.315789868819;
     println!("REST CAM-B3LYP: {:.12}", scf.scf_energy);
     println!("pyscf:          {:.12}", pyscf_ref);
