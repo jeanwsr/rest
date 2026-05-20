@@ -7,9 +7,47 @@ use pyrest::molecule_io::Molecule;
 use pyrest::scf_io::{self, scf_without_build, SCF};
 use rstsr::prelude::*;
 
-#[test]
-fn test_nh3() {
-    let scf_data = initialize_nh3();
+static INPUT_NH3: &str = r##"
+[ctrl]
+    print_level =          2
+    num_threads =          16
+    xc =                   "hf"
+    basis_path =           "def2-tzvp"
+    auxbas_path =          "def2-universal-jkfit"
+    eri_type =             "ri-v"
+    charge =               2.0
+    spin =                 3.0
+    spin_polarization =    true
+    auxbasis_response =    true
+    mixer =                "diis"
+    num_max_diis =         8
+    start_diis_cycle =     3
+    mix_param =            0.8
+    max_scf_cycle =        100
+
+[ctrl.j2c_decomp]
+policy = "POLICY"
+uplo = "UPLO"
+
+[geom]
+    name = "NH3"
+    unit = "Angstrom"
+    position = """
+        N  0.0  0.0  0.0
+        H  0.0  1.5  1.0
+        H  1.4  1.1  0.0
+        H  1.2  0.0  1.3
+    """
+"##;
+
+fn test_nh3_with_arg(policy: &str, uplo: &str) {
+    let input_token = INPUT_NH3.replace("POLICY", policy).replace("UPLO", uplo);
+    let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
+    let (ctrl, geom) = ctrl_io::parse_ctl_from_json(&keys).unwrap();
+    let mol = Molecule::build_native(ctrl, geom, None).unwrap();
+    let mut scf_data = scf_io::SCF::build(mol, &None);
+    scf_without_build(&mut scf_data, &None);
+
     let time = std::time::Instant::now();
     let scf_grad = test_with_scf(&scf_data);
     println!("Time elapsed: {:?}", time.elapsed());
@@ -24,7 +62,23 @@ fn test_nh3() {
          0.0026470960, -0.0146023219,  0.0199992057,
     ];
     let de_ref = rt::asarray((&de_ref, [3, 4]));
+    println!("Maximum Error {:?}", (&de_ref - &de).abs().max_all());
     assert!((de_ref - de).abs().max_all() < 1.0e-5);
+}
+
+#[test]
+fn test_nh3_eig() {
+    test_nh3_with_arg("eig", "Upper");
+}
+
+#[test]
+fn test_nh3_cd_upper() {
+    test_nh3_with_arg("cd", "Upper");
+}
+
+#[test]
+fn test_nh3_cd_lower() {
+    test_nh3_with_arg("cd", "Lower");
 }
 
 #[test]
@@ -108,49 +162,12 @@ fn test_with_scf(scf_data: &'_ SCF) -> RIUHFGradient<'_> {
     return scf_grad;
 }
 
-fn initialize_nh3() -> SCF {
-    let input_token = r##"
-[ctrl]
-    print_level =          2
-    num_threads =          16
-    xc =                   "hf"
-    basis_path =           "def2-tzvp"
-    auxbas_path =          "def2-universal-jkfit"
-    eri_type =             "ri-v"
-    charge =               2.0
-    spin =                 3.0
-    spin_polarization =    true
-    auxbasis_response =    true
-    mixer =                "diis"
-    num_max_diis =         8
-    start_diis_cycle =     3
-    mix_param =            0.8
-    max_scf_cycle =        100
-
-[geom]
-    name = "NH3"
-    unit = "Angstrom"
-    position = """
-        N  0.0  0.0  0.0
-        H  0.0  1.5  1.0
-        H  1.4  1.1  0.0
-        H  1.2  0.0  1.3
-    """
-"##;
-    let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
-    let (ctrl, geom) = ctrl_io::parse_ctl_from_json(&keys).unwrap();
-    let mol = Molecule::build_native(ctrl, geom, None).unwrap();
-    let mut scf_data = scf_io::SCF::build(mol, &None);
-    scf_without_build(&mut scf_data, &None);
-    return scf_data;
-}
-
 fn initialize_hi() -> SCF {
     let input_token = r##"
 [ctrl]
     print_level =               2
     num_threads =               16
-    xc =                        "mp2" 
+    xc =                        "mp2"
     basis_path =                "def2-tzvp"
     auxbas_path =               "def2-universal-jkfit"
     charge =                    -1.0
