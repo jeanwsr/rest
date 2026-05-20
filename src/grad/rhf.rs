@@ -72,12 +72,6 @@ impl RIRHFGradient<'_> {
             _ => panic!("SCFtype is not sutiable for RHF gradient."),
         };
 
-        // // check j2c_decomp flag
-        // use crate::ri_jk::decompose::*;
-        // match scf_data.mol.ctrl.j2c_decomp.policy {
-        //     J2CDecompPolicy::Cd => unimplemented!("Cholesky decompose is not implemented for gradient currently."),
-        //     _ => {},
-        // };
         // check omega flag
         if scf_data.mol.xc_data.is_rsh() {
             unimplemented!("RI gradient for range-separated hybrid functionals is not implemented currently.")

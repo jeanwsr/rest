@@ -61,7 +61,7 @@ pub fn get_j2c_decomp(mol: &CInt, device: &DeviceBLAS, j2c_decomp_option: J2CDec
 
     // first try cholesky decomposition, fall back by policy
     match j2c_decomp_option.policy {
-        J2CDecompPolicy::Cd => decomp_j2c_cd(j2c.view(), j2c_decomp_option.threshold, Upper),
+        J2CDecompPolicy::Cd => decomp_j2c_cd(j2c.view(), j2c_decomp_option.threshold, j2c_decomp_option.uplo),
         J2CDecompPolicy::Eig => decomp_j2c_eig(j2c.view(), j2c_decomp_option.threshold.unwrap_or(J2C_THRESH)),
     }
 }
