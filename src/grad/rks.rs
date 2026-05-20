@@ -235,9 +235,9 @@ impl RIRHFGradient<'_> {
         self.calc_de_hcore();
         time_records.count("rks grad calc_de_hcore");
 
-        time_records.count_start("rhf grad calc_de_qmmm");
+        time_records.count_start("rks grad calc_de_qmmm");
         self.calc_de_qmmm();
-        time_records.count("rhf grad calc_de_qmmm");
+        time_records.count("rks grad calc_de_qmmm");
 
         if self.flags.factor_j.is_some() || self.flags.factor_k.is_some() {
             time_records.count_start("rks grad calc_de_jk");
@@ -256,10 +256,10 @@ impl RIRHFGradient<'_> {
         de += self.result.get("de_hcore").unwrap().clone();
         self.result.get("de_j").map(|x| de += x.clone());
         self.result.get("de_k").map(|x| de += x.clone());
-        self.result.get("de_r").map(|x| de += x.clone());
+        self.result.get("de_sr").map(|x| de += x.clone());
         self.result.get("de_jaux").map(|x| de += x.clone());
         self.result.get("de_kaux").map(|x| de += x.clone());
-        self.result.get("de_raux").map(|x| de += x.clone());
+        self.result.get("de_sraux").map(|x| de += x.clone());
         self.result.get("de_xc").map(|x| de += x.clone());
         self.result.get("de_qmmm").map(|x| de += x.clone());
         self.result.insert("de".into(), de);

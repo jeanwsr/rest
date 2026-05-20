@@ -46,12 +46,12 @@ pub struct SCF {
     //pub ijkl: Option<ERIFull<f64>>,
     pub ijkl: Option<ERIFold4<f64>>,
     pub ri3fn: Option<RIFull<f64>>,
-    pub ri3fn_lr: Option<RIFull<f64>>,
+    pub ri3fn_sr: Option<RIFull<f64>>,
     pub ri3fn_isdf: Option<RIFull<f64>>,
     pub tab_ao: Option<MatrixFull<f64>>,
     pub m: Option<MatrixFull<f64>>,
     pub rimatr: Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
-    pub rimatr_lr: Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
+    pub rimatr_sr: Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
     pub ri3mo: Option<Vec<(RIFull<f64>,std::ops::Range<usize> , std::ops::Range<usize>)>>,
     pub ri3mo_full:Option<Vec<(RIFull<f64>,std::ops::Range<usize> , std::ops::Range<usize>)>>,
     pub ri3fn_bse: Option<RIFull<f64>>,
@@ -108,12 +108,12 @@ impl SCF {
             h_core: MatrixUpper::new(1,0.0),
             ijkl: None,
             ri3fn: None,
-            ri3fn_lr: None,
+            ri3fn_sr: None,
             ri3fn_isdf: None,
             tab_ao: None,
             m: None,
             rimatr: None,
-            rimatr_lr: None,
+            rimatr_sr: None,
             ri3mo: None,
             ri3mo_full:None,
             ri3fn_bse: None,
@@ -212,7 +212,7 @@ impl SCF {
             println!("Checking memory requirement for RI J/K algorithms...");
             let nao = mol.num_basis;
             let naux = mol.num_auxbas;
-            // range-separate hybrid functionals requires double memory for RI integrals due to the need of both standard RI and long-range RI integrals.
+            // range-separate hybrid functionals requires double memory for RI integrals due to the need of both standard RI and short-range RI integrals.
             let scale_rsh = if mol.xc_data.is_rsh() { 2.0 } else { 1.0 };
             // TODO: for safety, we add factor 1.5 to the memory requirement
             let mem_cderi_mb = 1.5 * scale_rsh * 8.0 * (0.5 * (nao * nao * naux) as f64) / 1024.0 / 1024.0;
@@ -419,7 +419,7 @@ impl SCF {
 
         // For RSH: J uses on-the-fly shell-based ERI (generate_vj_on_the_fly_par).
         // K_full still needs standard rimatr (generate_vk_ri_direct has unresolved RSTSR bug).
-        // K_erfc uses rimatr_lr.
+        // K_erfc uses rimatr_sr.
         // TODO: when generate_vk_ri_direct is fixed, add `if !is_rsh` to skip standard rimatr for RSH.
         {
             // preparing the three-center integrals in the full format
@@ -450,20 +450,20 @@ impl SCF {
             };
         }
 
-        // build long-range 3c RI integrals for range-separated hybrid (RSH) functionals
+        // build short-range 3c RI integrals for range-separated hybrid (RSH) functionals
         if is_rsh && use_eri_jk {
             let omega = self.mol.xc_data.omega().unwrap();
             if self.mol.ctrl.print_level > 0 {
-                println!("Building long-range 3c RI integrals for RSH (omega = {:.4})", omega);
+                println!("Building short-range 3c RI integrals for RSH (omega = {:.4})", omega);
             }
             if ri3fn_symm {
-                // Note: LR RI omega is negative in libcint's convention.
-                self.rimatr_lr = Some(self.mol.prepare_rimatr_for_ri_v_mpi_rayon(Some(-omega), mpi_operator));
+                // Note: SR RI omega is negative in libcint's convention.
+                self.rimatr_sr = Some(self.mol.prepare_rimatr_for_ri_v_mpi_rayon(Some(-omega), mpi_operator));
             } else {
-                self.ri3fn_lr = Some(self.mol.prepare_ri3fn_lr_rayon(omega));
+                self.ri3fn_sr = Some(self.mol.prepare_ri3fn_sr_rayon(omega));
             }
             if self.mol.ctrl.print_level > 0 {
-                println!("  LR 3c integrals built.");
+                println!("  SR 3c integrals built.");
             }
         }
 
@@ -2053,15 +2053,15 @@ impl SCF {
         let dt2 = time::Local::now();
 
         // Standard hybrid exchange: K_total = hyb * K_full + (alpha-hyb) * K_erf
-        // Since we have K_erfc (from LR rimatr), K_erf = K_full - K_erfc
+        // Since we have K_erfc (from SR rimatr), K_erf = K_full - K_erfc
         // So: K_total = alpha * K_full - (alpha-hyb) * K_erfc
         // F_ex = base_scaling * alpha * K_full + (-base_scaling) * (alpha-hyb) * K_erfc
         let base_scaling = match self.scftype { SCFType::RHF => -0.5, _ => -1.0 };
 
         if let Some((omega, alpha, _)) = self.mol.xc_data.rsh_params() {
             let hyb = self.mol.xc_data.dfa_hybrid_scf;
-            let scaling_kfull = base_scaling * alpha;            // alpha * K_full
-            let scaling_klr = -base_scaling * (alpha - hyb);    // - (alpha-hyb) * K_erfc  (note: sign flipped)
+            let scaling_kfull = base_scaling * alpha;           // alpha * K_full
+            let scaling_ksr = -base_scaling * (alpha - hyb);    // - (alpha-hyb) * K_erfc  (note: sign flipped)
 
             // Full K: alpha * K_full
             if scaling_kfull.abs() > 1e-10 {
@@ -2077,30 +2077,30 @@ impl SCF {
                 }
             }
 
-            // LR correction: -(alpha-hyb) * K_erfc → scaling_klr * K_erfc where scaling_klr = -base_scaling*(alpha-hyb)
+            // SR correction: -(alpha-hyb) * K_erfc → scaling_ksr * K_erfc where scaling_ksr = -base_scaling*(alpha-hyb)
             // For ri-direct, pass omega so libcint computes erfc(ωr)/r integrals on the fly.
-            // For ri-incore, use the pre-built rimatr_lr / ri3fn_lr.
-            if scaling_klr.abs() > 1e-10 {
-                let vk_lr = match self.algorithm_jk {
+            // For ri-incore, use the pre-built rimatr_sr / ri3fn_sr.
+            if scaling_ksr.abs() > 1e-10 {
+                let vk_sr = match self.algorithm_jk {
                     AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => {
-                        self.generate_vk_ri_direct(scaling_klr, self.mol.ctrl.use_dm_only, None, Some(-omega))
+                        self.generate_vk_ri_direct(scaling_ksr, self.mol.ctrl.use_dm_only, None, Some(-omega))
                     }
                     _ => {
-                        if self.rimatr_lr.is_some() {
+                        if self.rimatr_sr.is_some() {
                             let dm = &self.density_matrix;
-                            vk_upper_with_rimatr_use_dm_only_sync(&self.rimatr_lr, dm, spin_channel, scaling_klr)
-                        } else if self.ri3fn_lr.is_some() {
+                            vk_upper_with_rimatr_use_dm_only_sync(&self.rimatr_sr, dm, spin_channel, scaling_ksr)
+                        } else if self.ri3fn_sr.is_some() {
                             let dm = &self.density_matrix;
-                            vk_upper_with_ri_v_use_dm_only_sync(&self.ri3fn_lr, dm, spin_channel, scaling_klr)
+                            vk_upper_with_ri_v_use_dm_only_sync(&self.ri3fn_sr, dm, spin_channel, scaling_ksr)
                         } else {
                             vec![MatrixUpper::empty(); spin_channel]
                         }
                     }
                 };
                 for i_spin in 0..spin_channel {
-                    if !vk_lr[i_spin].data.is_empty() {
+                    if !vk_sr[i_spin].data.is_empty() {
                         self.hamiltonian[i_spin].data.par_iter_mut()
-                            .zip(vk_lr[i_spin].data.par_iter()).for_each(|(h,v)| *h += v);
+                            .zip(vk_sr[i_spin].data.par_iter()).for_each(|(h,v)| *h += v);
                     }
                 }
             }
