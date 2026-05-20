@@ -1,17 +1,15 @@
+#![warn(unused)]
 use super::rhf::*;
 use crate::grad::traits::GradAPI;
 use crate::ri_jk;
 use crate::scf_io::{self, SCF};
 use crate::utilities::memory_batch::*;
-use rayon::prelude::*;
 use rest_libcint::prelude::*;
 use rstsr::prelude::*;
 use std::collections::HashMap;
 use tensors::MatrixFull;
 
 type Tsr<T> = Tensor<T, DeviceBLAS, IxD>;
-type TsrView<'a, T> = TensorView<'a, T, DeviceBLAS, IxD>;
-type TsrMut<'a, T> = TensorMut<'a, T, DeviceBLAS, IxD>;
 
 /// Gradient structure and values for UHF method.
 pub struct RIUHFGradient<'a> {
@@ -357,8 +355,7 @@ impl RIUHFGradient<'_> {
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 5");
-                    *&mut daux_k.i_mut(p0..p1) +=
-                        get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_k_ao.view());
+                    *&mut daux_k.i_mut(p0..p1) += get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_k_ao.view());
                     time_records.count("de-jk batch 5");
                 }
             }
