@@ -64,6 +64,25 @@ impl GradAPI for RIRHFGradient<'_> {
     }
 }
 
+pub fn build_ri_jk_grad_flags(scf_data: &SCF) -> RIHFGradientFlags {
+    let mut flags = RIHFGradientFlagsBuilder::default();
+    flags.factor_j(Some(1.0));
+    flags.auxbasis_response(scf_data.mol.ctrl.auxbasis_response);
+    flags.print_level(scf_data.mol.ctrl.print_level);
+    flags.max_memory(scf_data.mol.ctrl.max_memory);
+
+    let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+    let factor_k = if is_hf {
+        Some(1.0)
+    } else {
+        let fac = scf_data.mol.xc_data.dfa_hybrid_scf;
+        if fac == 0.0 { None } else { Some(fac) }
+    };
+    flags.factor_k(factor_k);
+
+    flags.build().unwrap()
+}
+
 impl RIRHFGradient<'_> {
     pub fn new(scf_data: &SCF) -> RIRHFGradient<'_> {
         // check SCF type
@@ -78,14 +97,7 @@ impl RIRHFGradient<'_> {
         }
 
         // flags
-        let mut flags = RIHFGradientFlagsBuilder::default();
-        flags.factor_j(Some(1.0));
-        flags.factor_k(Some(1.0));
-        flags.auxbasis_response(scf_data.mol.ctrl.auxbasis_response);
-        flags.print_level(scf_data.mol.ctrl.print_level);
-        flags.max_memory(scf_data.mol.ctrl.max_memory);
-        let flags = flags.build().unwrap();
-
+        let flags = build_ri_jk_grad_flags(scf_data);
         RIRHFGradient { scf_data, flags, result: HashMap::new() }
     }
 
