@@ -67,7 +67,7 @@ pub fn get_j2c_decomp(mol: &CInt, device: &DeviceBLAS, j2c_decomp_option: J2CDec
 }
 
 /// Transform 3c-2e ERI (j3c), use solve/inv-matmul to decomposed 3c-2e ERI (cderi).
-pub fn get_solved_j3c<T>(j3c: Tsr<T>, j2c_decomp: &J2CDecompose) -> Tsr<T>
+pub fn get_solved_j3c<T>(j3c: Tsr<T>, j2c_decomp: &J2CDecompose, flip_uplo: bool) -> Tsr<T>
 where
     T: BlasFloat + FromPrimitive + 'static,
     DeviceBLAS: LapackDriverAPI<T>,
@@ -86,9 +86,11 @@ where
             );
             let naux = j2c_l.shape()[0];
             let j3c_2d = j3c.into_shape((-1, naux)).into_reverse_axes(); // transposed to (naux, -1)]
-            let j3c_2d = match uplo {
-                Upper => rt::linalg::solve_triangular((j2c_l.t(), j3c_2d, Lower)),
-                Lower => rt::linalg::solve_triangular((j2c_l, j3c_2d, Lower)),
+            let j3c_2d = match (uplo, flip_uplo) {
+                (Upper, false) => rt::linalg::solve_triangular((j2c_l.t(), j3c_2d, Lower)),
+                (Lower, false) => rt::linalg::solve_triangular((j2c_l, j3c_2d, Lower)),
+                (Upper, true) => rt::linalg::solve_triangular((j2c_l, j3c_2d, Upper)),
+                (Lower, true) => rt::linalg::solve_triangular((j2c_l.t(), j3c_2d, Upper)),
             };
             j3c_2d.into_reverse_axes().into_shape(j3c_shape) // reverse back and reshape back
         },
