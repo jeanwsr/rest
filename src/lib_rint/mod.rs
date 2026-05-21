@@ -10,7 +10,7 @@ use crate::scf_io::{
 use crate::utilities::memory_batch::detect_available_memory_mb;
 use rayon::prelude::*;
 use rest_tensors::matrix_blas_lapack::{
-    _dsolve, _dsyrk, omp_get_num_threads_wrapper, omp_set_num_threads_wrapper,
+    _dsolve, _dsyev, _dsyrk, omp_get_num_threads_wrapper, omp_set_num_threads_wrapper,
 };
 use rest_tensors::{MatrixFull, MatrixFullSlice, MatrixUpper, RIFull, TensorOpt, TensorOptMut};
 use statrs::function::erf::erf;
@@ -169,7 +169,7 @@ pub fn boys_vec(mmax: usize, t: f64) -> Vec<f64> {
         return f;
     }
     // Small T: power series F_m(T) = sum_k (-T)^k / (k! (2m + 2k + 1)).
-    if t <= 1.0 {
+    if t <= 5.0 {
         for m in 0..=mmax {
             let mut sum = 0.0_f64;
             let mut term = 1.0 / (2.0 * (m as f64) + 1.0);
@@ -188,6 +188,15 @@ pub fn boys_vec(mmax: usize, t: f64) -> Vec<f64> {
                 }
             }
             f[m] = if sum.is_finite() { sum } else { 0.0 };
+        }
+        if t > 1.0e-6 {
+            let sqrt_pi = std::f64::consts::PI.sqrt();
+            let sqrt_t = t.sqrt();
+            f[0] = 0.5 * sqrt_pi * erf(sqrt_t) / sqrt_t;
+            if mmax >= 1 {
+                let f1 = (f[0] - (-t).exp()) / (2.0 * t);
+                f[1] = if f1.is_finite() { f1 } else { 0.0 };
+            }
         }
         return f;
     }
@@ -263,7 +272,7 @@ fn boys_slice(mmax: usize, t: f64, f: &mut [f64]) {
         }
         return;
     }
-    if t <= 1.0 {
+    if t <= 5.0 {
         for m in 0..=mmax {
             let mut sum = 0.0_f64;
             let mut term = 1.0 / (2.0 * (m as f64) + 1.0);
@@ -281,6 +290,15 @@ fn boys_slice(mmax: usize, t: f64, f: &mut [f64]) {
                 }
             }
             f[m] = if sum.is_finite() { sum } else { 0.0 };
+        }
+        if t > 1.0e-6 {
+            let sqrt_pi = std::f64::consts::PI.sqrt();
+            let sqrt_t = t.sqrt();
+            f[0] = 0.5 * sqrt_pi * erf(sqrt_t) / sqrt_t;
+            if mmax >= 1 {
+                let f1 = (f[0] - (-t).exp()) / (2.0 * t);
+                f[1] = if f1.is_finite() { f1 } else { 0.0 };
+            }
         }
         return;
     }
@@ -359,7 +377,7 @@ fn boys_f0(t: f64) -> f64 {
     if t <= 1.0e-12 {
         return 1.0;
     }
-    if t <= 1.0 {
+    if t <= 1.0e-6 {
         let mut sum = 1.0_f64;
         let mut term = 1.0_f64;
         let mut k = 0_u32;
@@ -852,10 +870,323 @@ fn polynomial_roots_unit_interval(coeffs: &[f64]) -> Vec<f64> {
     roots
 }
 
-fn rys_roots_weights_r_from_moments(nroots: usize, ff: &[f64]) -> Option<(Vec<f64>, Vec<f64>)> {
-    if nroots < 3 || ff.len() < 2 * nroots {
+fn rys_roots_weights_from_moments_golub_welsch(
+    nroots: usize,
+    moments: &[f64],
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    if nroots == 0 || moments.len() < 2 * nroots || moments[0] <= 0.0 || !moments[0].is_finite() {
         return None;
     }
+
+    let mut s = zeros_2d(nroots, nroots);
+    for row in 0..nroots {
+        for col in 0..nroots {
+            s[(row, col)] = moments[row + col];
+        }
+    }
+    let cs = R_dsmit(&s, nroots).ok()?;
+
+    let mut jacobi = vec![0.0_f64; nroots * nroots];
+    let idx = |row: usize, col: usize| -> usize { row + nroots * col };
+    for j in 0..nroots {
+        let mut alpha = 0.0_f64;
+        for a in 0..=j {
+            for b in 0..=j {
+                alpha += cs[(j, a)] * cs[(j, b)] * moments[a + b + 1];
+            }
+        }
+        if !alpha.is_finite() {
+            return None;
+        }
+        jacobi[idx(j, j)] = alpha;
+
+        if j > 0 {
+            let mut beta = 0.0_f64;
+            for a in 0..=j {
+                for b in 0..j {
+                    beta += cs[(j, a)] * cs[(j - 1, b)] * moments[a + b + 1];
+                }
+            }
+            if !beta.is_finite() {
+                return None;
+            }
+            let beta_abs = beta.abs();
+            jacobi[idx(j - 1, j)] = beta_abs;
+            jacobi[idx(j, j - 1)] = beta_abs;
+        }
+    }
+
+    let jacobi_matrix = MatrixFull::from_vec([nroots, nroots], jacobi)?;
+    let (vectors_opt, roots, info) = _dsyev(&jacobi_matrix, 'V');
+    if info != nroots as i32 || roots.len() != nroots {
+        return None;
+    }
+    let vectors = vectors_opt?;
+    if roots
+        .iter()
+        .any(|root| !root.is_finite() || *root < -1.0e-10 || *root > 1.0 + 1.0e-10)
+    {
+        return None;
+    }
+
+    let mut weights = Vec::with_capacity(nroots);
+    for col in 0..nroots {
+        let v0 = vectors[(0, col)];
+        let weight = moments[0] * v0 * v0;
+        if !weight.is_finite() || weight < -1.0e-12 {
+            return None;
+        }
+        weights.push(weight.max(0.0));
+    }
+    validate_quadrature_moments(nroots, &roots, &weights, moments, 5.0e-10)?;
+    Some((roots, weights))
+}
+
+fn validate_quadrature_moments(
+    nroots: usize,
+    roots: &[f64],
+    weights: &[f64],
+    moments: &[f64],
+    rel_tol: f64,
+) -> Option<()> {
+    if roots.len() != nroots || weights.len() != nroots || moments.len() < 2 * nroots {
+        return None;
+    }
+    for moment_idx in 0..=(2 * nroots - 1) {
+        let got = roots
+            .iter()
+            .zip(weights.iter())
+            .map(|(root, weight)| weight * root.powi(moment_idx as i32))
+            .sum::<f64>();
+        let expect = moments[moment_idx];
+        if (got - expect).abs() > rel_tol * expect.abs().max(1.0) {
+            return None;
+        }
+    }
+    Some(())
+}
+
+const STIELTJES_BASE_N: usize = 192;
+
+#[derive(Clone, Copy)]
+enum RysMomentMeasure {
+    RInv,
+    RInv2Code,
+}
+
+fn gauss_legendre_unit_nodes_weights() -> &'static [(f64, f64)] {
+    static CACHE: OnceLock<Vec<(f64, f64)>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let n = STIELTJES_BASE_N;
+        let half = (n + 1) / 2;
+        let mut nodes_weights = vec![(0.0_f64, 0.0_f64); n];
+        for i in 0..half {
+            let i_f = i as f64;
+            let n_f = n as f64;
+            let mut z = (std::f64::consts::PI * (i_f + 0.75) / (n_f + 0.5)).cos();
+            let mut pp = 0.0_f64;
+            for _ in 0..64 {
+                let mut p1 = 1.0_f64;
+                let mut p2 = 0.0_f64;
+                for j in 1..=n {
+                    let j_f = j as f64;
+                    let p3 = p2;
+                    p2 = p1;
+                    p1 = ((2.0 * j_f - 1.0) * z * p2 - (j_f - 1.0) * p3) / j_f;
+                }
+                pp = n_f * (z * p1 - p2) / (z * z - 1.0);
+                let z_next = z - p1 / pp;
+                if (z_next - z).abs() <= 1.0e-15 {
+                    z = z_next;
+                    break;
+                }
+                z = z_next;
+            }
+            let x_left = 0.5 * (1.0 - z);
+            let x_right = 0.5 * (1.0 + z);
+            let weight = 1.0 / ((1.0 - z * z) * pp * pp);
+            nodes_weights[i] = (x_left, weight);
+            nodes_weights[n - 1 - i] = (x_right, weight);
+        }
+        nodes_weights
+    })
+}
+
+fn rys_roots_weights_stieltjes(
+    nroots: usize,
+    t: f64,
+    measure: RysMomentMeasure,
+    moments: &[f64],
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    if nroots == 0 || moments.len() < 2 * nroots || !t.is_finite() || t < 0.0 {
+        return None;
+    }
+    let base = gauss_legendre_unit_nodes_weights();
+    let mut nodes = Vec::with_capacity(base.len());
+    let mut weights = Vec::with_capacity(base.len());
+    let t_measure = match measure {
+        RysMomentMeasure::RInv2Code if t <= 1.0e-8 => 0.0,
+        _ => t,
+    };
+    for &(s, legendre_weight) in base {
+        let (node, weight) = match measure {
+            RysMomentMeasure::RInv => {
+                let node = s * s;
+                (node, legendre_weight * (-t_measure * node).exp())
+            }
+            RysMomentMeasure::RInv2Code => {
+                let node = 1.0 - s * s;
+                (node, legendre_weight * (-t_measure * node).exp())
+            }
+        };
+        if !node.is_finite() || !weight.is_finite() || weight < 0.0 {
+            return None;
+        }
+        nodes.push(node.clamp(0.0, 1.0));
+        weights.push(weight);
+    }
+
+    let mu0 = weights.iter().sum::<f64>();
+    if mu0 <= 0.0 || !mu0.is_finite() {
+        return None;
+    }
+    let mut p_prev = vec![0.0_f64; nodes.len()];
+    let mut p_curr = vec![1.0 / mu0.sqrt(); nodes.len()];
+    let mut beta_prev = 0.0_f64;
+    let mut jacobi = vec![0.0_f64; nroots * nroots];
+    let idx = |row: usize, col: usize| -> usize { row + nroots * col };
+
+    for k in 0..nroots {
+        let alpha = nodes
+            .iter()
+            .zip(weights.iter())
+            .zip(p_curr.iter())
+            .map(|((node, weight), p)| weight * node * p * p)
+            .sum::<f64>();
+        if !alpha.is_finite() {
+            return None;
+        }
+        jacobi[idx(k, k)] = alpha;
+        if k + 1 < nroots {
+            let mut next = vec![0.0_f64; nodes.len()];
+            for i in 0..nodes.len() {
+                next[i] = (nodes[i] - alpha) * p_curr[i] - beta_prev * p_prev[i];
+            }
+            let norm_sq = next
+                .iter()
+                .zip(weights.iter())
+                .map(|(value, weight)| weight * value * value)
+                .sum::<f64>();
+            if norm_sq <= 0.0 || !norm_sq.is_finite() {
+                return None;
+            }
+            let beta = norm_sq.sqrt();
+            jacobi[idx(k, k + 1)] = beta;
+            jacobi[idx(k + 1, k)] = beta;
+            for value in &mut next {
+                *value /= beta;
+            }
+            p_prev = p_curr;
+            p_curr = next;
+            beta_prev = beta;
+        }
+    }
+
+    let jacobi_matrix = MatrixFull::from_vec([nroots, nroots], jacobi)?;
+    let (vectors_opt, roots, info) = _dsyev(&jacobi_matrix, 'V');
+    if info != nroots as i32 || roots.len() != nroots {
+        return None;
+    }
+    let vectors = vectors_opt?;
+    if roots
+        .iter()
+        .any(|root| !root.is_finite() || *root < -1.0e-10 || *root > 1.0 + 1.0e-10)
+    {
+        return None;
+    }
+    let mut quad_weights = (0..nroots)
+        .map(|col| {
+            let v0 = vectors[(0, col)];
+            mu0 * v0 * v0
+        })
+        .collect::<Vec<_>>();
+    let sumw = quad_weights.iter().sum::<f64>();
+    if sumw == 0.0 || !sumw.is_finite() {
+        return None;
+    }
+    let scale = moments[0] / sumw;
+    for weight in &mut quad_weights {
+        *weight *= scale;
+    }
+    if quad_weights
+        .iter()
+        .any(|weight| !weight.is_finite() || *weight < -1.0e-12)
+    {
+        return None;
+    }
+    validate_quadrature_moments(nroots, &roots, &quad_weights, moments, 5.0e-8)?;
+    Some((roots, quad_weights))
+}
+
+fn r2_stable_moments_from_measure(mmax: usize, t: f64) -> Option<Vec<f64>> {
+    if !t.is_finite() || t < 0.0 {
+        return None;
+    }
+    if t <= 1.0e-8 {
+        return Some((0..=mmax).map(|m| 0.5 * beta(m)).collect());
+    }
+    let mut moments = vec![0.0_f64; mmax + 1];
+    for &(s, legendre_weight) in gauss_legendre_unit_nodes_weights() {
+        let node = (1.0 - s * s).clamp(0.0, 1.0);
+        let scale = legendre_weight * (-t * node).exp();
+        if !scale.is_finite() || scale < 0.0 {
+            return None;
+        }
+        let mut power = 1.0_f64;
+        for moment in &mut moments {
+            *moment += scale * power;
+            power *= node;
+        }
+    }
+    Some(moments)
+}
+
+fn rys_roots_weights_r_from_moments(nroots: usize, ff: &[f64]) -> Option<(Vec<f64>, Vec<f64>)> {
+    if nroots < 3 {
+        return None;
+    }
+    if let Some((roots, weights)) = rys_roots_weights_from_moments_golub_welsch(nroots, ff) {
+        return Some((roots, weights));
+    }
+    if ff.len() >= 2 * nroots + 1 {
+        let nroots1 = nroots + 1;
+        let mut s = zeros_2d(nroots1, nroots1);
+        for j in 0..nroots1 {
+            for i in 0..nroots1 {
+                s[(i, j)] = ff[i + j];
+            }
+        }
+        let cs = R_dsmit(&s, nroots1).ok()?;
+        let poly_coeffs = (0..=nroots)
+            .map(|col| cs[(nroots, col)])
+            .collect::<Vec<_>>();
+        let mut roots = polynomial_roots_unit_interval(&poly_coeffs);
+        if roots.len() != nroots || roots.iter().any(|root| !root.is_finite()) {
+            roots = find_polyroots(&cs, nroots);
+        }
+        if roots.len() != nroots || roots.iter().any(|root| !root.is_finite()) {
+            return None;
+        }
+        roots.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+        let weights = rys_weights_from_orthogonal_polys(nroots, &roots, &cs, ff)
+            .or_else(|| rys_weights_from_roots_moments(nroots, &roots, ff))?;
+        return Some((roots, weights));
+    }
+
+    if ff.len() < 2 * nroots {
+        return None;
+    }
+
     let mut hankel = vec![0.0_f64; nroots * nroots];
     let mut rhs = vec![0.0_f64; nroots];
     for row in 0..nroots {
@@ -898,6 +1229,93 @@ fn rys_roots_weights_r_from_moments(nroots: usize, ff: &[f64]) -> Option<(Vec<f6
         }
     }
     Some((roots, weights))
+}
+
+fn rys_weights_from_orthogonal_polys(
+    nroots: usize,
+    roots: &[f64],
+    cs: &MatrixFull<f64>,
+    ff: &[f64],
+) -> Option<Vec<f64>> {
+    if roots.len() != nroots || cs.size[0] < nroots || cs.size[1] < nroots || ff.len() < 2 * nroots
+    {
+        return None;
+    }
+    let mut weights = zeros_1d(nroots);
+    for i in 0..nroots {
+        let root = roots[i];
+        let mut denom = if ff[0] == 0.0 { 0.0 } else { 1.0 / ff[0] };
+        for j in 1..nroots {
+            let row: Vec<f64> = (0..=j).map(|col| cs[(j, col)]).collect();
+            let poly = poly_value1(&row, j, root);
+            denom += poly * poly;
+        }
+        weights[i] = if denom == 0.0 || !denom.is_finite() {
+            return None;
+        } else {
+            1.0 / denom
+        };
+    }
+    let sumw = weights.iter().sum::<f64>();
+    if sumw == 0.0 || !sumw.is_finite() {
+        return None;
+    }
+    let scale = ff[0] / sumw;
+    for weight in &mut weights {
+        *weight *= scale;
+    }
+    if weights.iter().any(|weight| !weight.is_finite()) {
+        return None;
+    }
+    for moment_idx in 0..=(2 * nroots - 1) {
+        let got = roots
+            .iter()
+            .zip(weights.iter())
+            .map(|(root, weight)| weight * root.powi(moment_idx as i32))
+            .sum::<f64>();
+        let expect = ff[moment_idx];
+        if (got - expect).abs() > 1.0e-5 * expect.abs().max(1.0) {
+            return None;
+        }
+    }
+    Some(weights)
+}
+
+fn rys_weights_from_roots_moments(nroots: usize, roots: &[f64], ff: &[f64]) -> Option<Vec<f64>> {
+    if roots.len() != nroots || ff.len() < 2 * nroots {
+        return None;
+    }
+    if roots
+        .iter()
+        .any(|root| !root.is_finite() || *root < -1.0e-10 || *root > 1.0 + 1.0e-10)
+    {
+        return None;
+    }
+
+    let mut vandermonde = vec![0.0_f64; nroots * nroots];
+    let mut rhs = vec![0.0_f64; nroots];
+    for row in 0..nroots {
+        rhs[row] = ff[row];
+        for (col, root) in roots.iter().enumerate() {
+            vandermonde[row * nroots + col] = root.powi(row as i32);
+        }
+    }
+    let weights = solve_linear_system(vandermonde, rhs, nroots)?;
+    if weights.iter().any(|weight| !weight.is_finite()) {
+        return None;
+    }
+    for moment_idx in 0..=(2 * nroots - 1) {
+        let got = roots
+            .iter()
+            .zip(weights.iter())
+            .map(|(root, weight)| weight * root.powi(moment_idx as i32))
+            .sum::<f64>();
+        let expect = ff[moment_idx];
+        if (got - expect).abs() > 1.0e-7 * expect.abs().max(1.0) {
+            return None;
+        }
+    }
+    Some(weights)
 }
 
 fn rys_roots_weights_r_into(
@@ -963,7 +1381,7 @@ fn rys_roots_weights_r_into(
 
     if (4..=6).contains(&nroots) {
         let mut ff = [0.0_f64; 16];
-        let mmax = 2 * nroots - 1;
+        let mmax = 2 * nroots;
         boys_slice(mmax, t, &mut ff);
         if let Some((roots_vec, weights_vec)) =
             rys_roots_weights_r_from_moments(nroots, &ff[..=mmax])
@@ -1027,13 +1445,18 @@ pub fn rys_roots_weights_r(nroots: usize, t: f64) -> (Vec<f64>, Vec<f64>) {
         }
     }
     if (4..=6).contains(&nroots) {
-        let ff = boys_vec(2 * nroots - 1, t);
+        let ff = boys_vec(2 * nroots, t);
         if let Some((roots, weights)) = rys_roots_weights_r_from_moments(nroots, &ff) {
             return (roots, weights);
         }
     }
     let m = nroots * 2;
     let ff = boys_vec(m, t); // F_m(T)
+    if let Some((roots, weights)) =
+        rys_roots_weights_stieltjes(nroots, t, RysMomentMeasure::RInv, &ff)
+    {
+        return (roots, weights);
+    }
     let nroots1 = nroots + 1;
     let mut s = zeros_2d(nroots1, nroots1);
     for j in 0..nroots1 {
@@ -1045,7 +1468,14 @@ pub fn rys_roots_weights_r(nroots: usize, t: f64) -> (Vec<f64>, Vec<f64>) {
         Ok(val) => val,
         Err(_) => return (zeros_1d(nroots), zeros_1d(nroots)),
     };
-    let rt = find_polyroots(&cs, nroots);
+    let mut rt = find_polyroots(&cs, nroots);
+    if rt.len() != nroots || rt.iter().any(|root| !root.is_finite()) {
+        return (zeros_1d(nroots), zeros_1d(nroots));
+    }
+    rt.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    if let Some(weights) = rys_weights_from_roots_moments(nroots, &rt, &ff) {
+        return (rt, weights);
+    }
     let mut weights = zeros_1d(nroots);
     for i in 0..nroots {
         let root = rt[i];
@@ -1073,6 +1503,32 @@ pub fn rys_roots_weights_r(nroots: usize, t: f64) -> (Vec<f64>, Vec<f64>) {
 pub fn rys_roots_weights_r2(nroots: usize, t: f64) -> (Vec<f64>, Vec<f64>) {
     let m = nroots * 2;
     let gg = boys_vec_r2(m, t); // G_m(T)
+    if let Some((roots, weights)) = rys_roots_weights_r2_from_moments(nroots, &gg, true) {
+        return (roots, weights);
+    }
+    if let Some(stable_moments) = r2_stable_moments_from_measure(m, t) {
+        if let Some((roots, weights)) =
+            rys_roots_weights_stieltjes(nroots, t, RysMomentMeasure::RInv2Code, &gg)
+        {
+            return (roots, weights);
+        }
+        if let Some((roots, weights)) =
+            rys_roots_weights_stieltjes(nroots, t, RysMomentMeasure::RInv2Code, &stable_moments)
+        {
+            return (roots, weights);
+        }
+    }
+    (zeros_1d(nroots), zeros_1d(nroots))
+}
+
+fn rys_roots_weights_r2_from_moments(
+    nroots: usize,
+    gg: &[f64],
+    validate: bool,
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    if nroots == 0 || gg.len() < 2 * nroots + 1 {
+        return None;
+    }
     let nroots1 = nroots + 1;
     let mut s = zeros_2d(nroots1, nroots1);
     for j in 0..nroots1 {
@@ -1080,11 +1536,11 @@ pub fn rys_roots_weights_r2(nroots: usize, t: f64) -> (Vec<f64>, Vec<f64>) {
             s[(i, j)] = gg[i + j]; // S_ij = G_{i+j}(T)
         }
     }
-    let cs = match R_dsmit(&s, nroots1) {
-        Ok(val) => val,
-        Err(_) => return (zeros_1d(nroots), zeros_1d(nroots)),
-    };
+    let cs = R_dsmit(&s, nroots1).ok()?;
     let rt = find_polyroots(&cs, nroots);
+    if rt.len() != nroots {
+        return None;
+    }
     let mut weights = zeros_1d(nroots);
     for i in 0..nroots {
         let root = rt[i];
@@ -1107,7 +1563,20 @@ pub fn rys_roots_weights_r2(nroots: usize, t: f64) -> (Vec<f64>, Vec<f64>) {
     for w in &mut weights {
         *w *= scale;
     }
-    (rt[..nroots].to_vec(), weights)
+    let roots = rt[..nroots].to_vec();
+    if validate {
+        if roots
+            .iter()
+            .any(|root| !root.is_finite() || *root < -1.0e-10 || *root > 1.0 + 1.0e-10)
+            || weights
+                .iter()
+                .any(|weight| !weight.is_finite() || *weight < -1.0e-12)
+        {
+            return None;
+        }
+        validate_quadrature_moments(nroots, &roots, &weights, gg, 5.0e-8)?;
+    }
+    Some((roots, weights))
 }
 // ============================================================
 // Geometry helpers (f64)
@@ -4093,17 +4562,33 @@ fn add_primitive_4c_r_shell_block(
         return;
     }
 
-    let nroots = (total_ang / 2 + 1) as usize;
-    let mut roots = [0.0_f64; 8];
-    let mut weights = [0.0_f64; 8];
-    let nroots = rys_roots_weights_r_into(nroots, t, &mut roots, &mut weights);
+    let nroots_required = (total_ang / 2 + 1) as usize;
+    let mut roots_stack = [0.0_f64; 16];
+    let mut weights_stack = [0.0_f64; 16];
+    let mut roots_heap = Vec::new();
+    let mut weights_heap = Vec::new();
+    let nroots = if nroots_required <= roots_stack.len() {
+        rys_roots_weights_r_into(nroots_required, t, &mut roots_stack, &mut weights_stack)
+    } else {
+        let (roots, weights) = rys_roots_weights_r(nroots_required, t);
+        if roots.len() == nroots_required && weights.len() == nroots_required {
+            roots_heap = roots;
+            weights_heap = weights;
+            nroots_required
+        } else {
+            0
+        }
+    };
     if nroots == 0 {
         return;
     }
 
     for root_idx in 0..nroots {
-        let root = roots[root_idx];
-        let weight = weights[root_idx];
+        let (root, weight) = if nroots_required <= roots_stack.len() {
+            (roots_stack[root_idx], weights_stack[root_idx])
+        } else {
+            (roots_heap[root_idx], weights_heap[root_idx])
+        };
         let scalars = rys_root_scalars_4c(root, p_sum, q_sum, p_sum_q);
         build_rys_transfer_table_4c_direct(
             &mut workspace.table_x,
@@ -7841,6 +8326,7 @@ pub fn lib_vee_rhf_occ_closure_connected_ri_coulomb_x(
 mod kernel_worst_quartet_tests {
     use super::*;
     use crate::basis_io::{BasCell, Basis4Elem};
+    use crate::lib_rint::basis::Shell;
     use crate::scf_io::{
         scf_without_build, vj_upper_with_rimatr_sync, vk_upper_with_rimatr_use_dm_only_sync_v02,
         SCF,
@@ -7892,6 +8378,140 @@ mod kernel_worst_quartet_tests {
         fs::write(&path, text).unwrap();
         path
     }
+    fn write_temp_high_l_he_basis(l: u32) -> (String, String) {
+        let pid = std::process::id();
+        let basis_dir = format!("/tmp/lib_rint_high_l_basis_l{l}_{pid}");
+        fs::create_dir_all(&basis_dir).unwrap();
+        let basis_path = format!("{basis_dir}/He.json");
+        let basis_json = format!(
+            r#"{{
+    "electron_shells": [
+        {{
+            "function_type": "gto",
+            "region": "",
+            "angular_momentum": [{l}],
+            "exponents": ["0.75"],
+            "coefficients": [["1.0"]]
+        }}
+    ],
+    "references": null,
+    "ecp_potentials": null,
+    "ecp_electrons": null
+}}"#
+        );
+        fs::write(&basis_path, basis_json).unwrap();
+
+        let ctrl_path = format!("/tmp/lib_rint_high_l_ctrl_l{l}_{pid}.toml");
+        let ctrl_text = format!(
+            "[ctrl]\nprint_level = 0\nxc = \"hf\"\nbasis_path = \"{basis_dir}\"\nbasis_type = \"Cartesian\"\nuse_auxbas = false\neven_tempered_basis = false\ncharge = 0.0\nspin = 1.0\nspin_polarization = false\nnum_threads = 1\nrun_lib_rint = false\n\n[geom]\nname = \"He_high_l\"\nunit = \"angstrom\"\nposition = [\n    \"He   0.0000000000   0.0000000000   0.0000000000\",\n]\n"
+        );
+        fs::write(&ctrl_path, ctrl_text).unwrap();
+        (ctrl_path, basis_dir)
+    }
+
+    fn assert_high_l_4c_shell_block_matches_scalar_and_libcint(l: u32) {
+        let (ctrl_path, basis_dir) = write_temp_high_l_he_basis(l);
+        let mol = Molecule::build(ctrl_path.clone(), None).unwrap();
+
+        let ao_shells =
+            crate::lib_rint::basis::load_molecule_rint_shells_from_raw(&mol.geom, &mol.basis4elem)
+                .expect("failed to build AO rint shells");
+        let ao_bfs = crate::lib_rint::basis::expand_rint_shells_to_basis_functions(&ao_shells)
+            .expect("failed to expand AO rint shells");
+        assert_eq!(ao_shells.len(), 1);
+        let shell = &ao_shells[0];
+        assert_eq!(shell.shell.ang_type, l);
+
+        let t0 = Instant::now();
+        let block = int4c_r_shell_block(shell, shell, shell, shell);
+        let librint_s = t0.elapsed().as_secs_f64();
+        let t0 = Instant::now();
+        let libcint_full = mol.int_ijkl_erifull();
+        let libcint_s = t0.elapsed().as_secs_f64();
+        let mut max_abs_scalar = 0.0_f64;
+        let mut max_abs_libcint = 0.0_f64;
+        let mut max_value = 0.0_f64;
+        let sample_locs = [
+            0_usize,
+            shell.ao_len / 3,
+            shell.ao_len / 2,
+            shell.ao_len.saturating_sub(1),
+        ];
+        for l_loc in 0..shell.ao_len {
+            for k_loc in 0..shell.ao_len {
+                let col = l_loc * shell.ao_len + k_loc;
+                for j_loc in 0..shell.ao_len {
+                    for i_loc in 0..shell.ao_len {
+                        let row = j_loc * shell.ao_len + i_loc;
+                        let got = block[(row, col)];
+                        let i_ao = shell.ao_start + i_loc;
+                        let j_ao = shell.ao_start + j_loc;
+                        let k_ao = shell.ao_start + k_loc;
+                        let l_ao = shell.ao_start + l_loc;
+                        let libcint = *libcint_full.get(&[i_ao, j_ao, k_ao, l_ao]).unwrap();
+                        max_abs_libcint = max_abs_libcint.max((got - libcint).abs());
+                        max_value = max_value.max(got.abs()).max(libcint.abs());
+                        if sample_locs.contains(&i_loc)
+                            && sample_locs.contains(&j_loc)
+                            && sample_locs.contains(&k_loc)
+                            && sample_locs.contains(&l_loc)
+                        {
+                            let scalar = eri_ao_4c_r(&ao_bfs, i_ao, j_ao, k_ao, l_ao);
+                            max_abs_scalar = max_abs_scalar.max((got - scalar).abs());
+                        }
+                    }
+                }
+            }
+        }
+        let tol = 5.0e-8 * max_value.max(1.0);
+        let nroots = ((4 * l) / 2 + 1) as usize;
+        println!(
+            "TMP_EXACT4C_HIGH_L_ERROR l={l} nroots={nroots} ao_len={} libcint_s={libcint_s:.6} lib_rint_s={librint_s:.6} lib_rint_over_libcint={:.3} max_abs_libcint={max_abs_libcint:.3e} max_abs_scalar={max_abs_scalar:.3e} max_value={max_value:.3e} tol={tol:.3e}",
+            shell.ao_len,
+            librint_s / libcint_s.max(1.0e-12)
+        );
+        assert!(
+            max_abs_scalar <= tol,
+            "high-l shell block vs scalar mismatch l={l}: max_abs={max_abs_scalar:.3e}, tol={tol:.3e}"
+        );
+        assert!(
+            max_abs_libcint <= tol,
+            "high-l shell block vs libcint mismatch l={l}: max_abs={max_abs_libcint:.3e}, tol={tol:.3e}"
+        );
+
+        let _ = fs::remove_file(ctrl_path);
+        let _ = fs::remove_dir_all(basis_dir);
+    }
+
+    fn single_component_shell(l: u32, component: [u32; 3]) -> RintShell {
+        RintShell {
+            atom_idx: 0,
+            center: [0.0, 0.0, 0.0],
+            shell: Shell {
+                ang_type: l,
+                exponents: vec![0.75],
+                coefficients: vec![vec![1.0]],
+            },
+            column_idx: 0,
+            cart_components: vec![component],
+            ao_start: 0,
+            ao_len: 1,
+            is_aux: false,
+        }
+    }
+
+    fn single_component_basis_function(component: [u32; 3]) -> BasisFunction {
+        BasisFunction {
+            atom_idx: 0,
+            lx: component[0],
+            ly: component[1],
+            lz: component[2],
+            exponents: vec![0.75],
+            coefficients: vec![1.0],
+            center: [0.0, 0.0, 0.0],
+        }
+    }
+
     fn write_temp_ctrl_water_cluster(basis_dir: &str, nwater: usize) -> String {
         let pid = std::process::id();
         let path = format!("/tmp/lib_rint_kernel_h2o_cluster_{nwater}_{basis_dir}_{pid}.toml")
@@ -9347,8 +9967,8 @@ position = [
     }
 
     #[test]
-    fn rys_roots_weights_r_reproduce_boys_moments_through_six_roots() {
-        for nroots in 1..=6 {
+    fn rys_roots_weights_r_reproduce_boys_moments_through_nine_roots() {
+        for nroots in 1..=9 {
             for t in [0.0_f64, 1.0e-8, 0.2, 1.0384010260937269, 2.0, 20.0, 80.0] {
                 let (roots, weights) = rys_roots_weights_r(nroots, t);
                 let moments = boys_vec(2 * nroots - 1, t);
@@ -9361,10 +9981,172 @@ position = [
                         .map(|(root, weight)| weight * root.powi(moment_idx as i32))
                         .sum::<f64>();
                     let expect = moments[moment_idx];
-                    let tol = 1.0e-9 * expect.abs().max(1.0);
+                    let tol = if nroots <= 6 { 1.0e-9 } else { 5.0e-8 } * expect.abs().max(1.0);
                     assert!(
                         (got - expect).abs() <= tol,
                         "Rys moment mismatch nroots={nroots}, t={t}, moment={moment_idx}: {got} vs {expect}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rys_roots_weights_r_reproduce_boys_moments_through_twenty_five_roots() {
+        for nroots in 4..=25 {
+            for t in [0.0_f64, 1.0e-8, 0.2, 1.0384010260937269, 2.0, 20.0, 80.0] {
+                let moments = boys_vec(2 * nroots, t);
+                let (roots, weights) = rys_roots_weights_r(nroots, t);
+                for idx in 0..nroots {
+                    assert!(
+                        roots[idx].is_finite()
+                            && roots[idx] >= -1.0e-12
+                            && roots[idx] <= 1.0 + 1.0e-12,
+                        "invalid root nroots={nroots}, t={t}, idx={idx}: got={:.16e}",
+                        roots[idx]
+                    );
+                    assert!(
+                        weights[idx].is_finite() && weights[idx] >= -1.0e-10,
+                        "invalid weight nroots={nroots}, t={t}, idx={idx}: got={:.16e}",
+                        weights[idx]
+                    );
+                }
+                for moment_idx in 0..=(2 * nroots - 1) {
+                    let got = roots
+                        .iter()
+                        .zip(weights.iter())
+                        .map(|(root, weight)| weight * root.powi(moment_idx as i32))
+                        .sum::<f64>();
+                    let expect = moments[moment_idx];
+                    assert!(
+                        (got - expect).abs() <= 5.0e-8 * expect.abs().max(1.0),
+                        "generic moment mismatch nroots={nroots}, t={t}, moment={moment_idx}: got={got:.16e}, expect={expect:.16e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rys_roots_weights_r2_reproduce_moments_through_six_roots() {
+        for nroots in 1..=6 {
+            for t in [0.0_f64, 1.0e-8, 0.2, 1.0384010260937269, 2.0, 20.0, 80.0] {
+                let moments = boys_vec_r2(2 * nroots, t);
+                let (roots, weights) = rys_roots_weights_r2(nroots, t);
+                assert_eq!(roots.len(), nroots);
+                assert_eq!(weights.len(), nroots);
+                for idx in 0..nroots {
+                    assert!(
+                        roots[idx].is_finite()
+                            && roots[idx] >= -1.0e-12
+                            && roots[idx] <= 1.0 + 1.0e-12,
+                        "invalid R2 root nroots={nroots}, t={t}, idx={idx}: got={:.16e}",
+                        roots[idx]
+                    );
+                    assert!(
+                        weights[idx].is_finite() && weights[idx] >= -1.0e-10,
+                        "invalid R2 weight nroots={nroots}, t={t}, idx={idx}: got={:.16e}",
+                        weights[idx]
+                    );
+                }
+                for moment_idx in 0..=(2 * nroots - 1) {
+                    let got = roots
+                        .iter()
+                        .zip(weights.iter())
+                        .map(|(root, weight)| weight * root.powi(moment_idx as i32))
+                        .sum::<f64>();
+                    let expect = moments[moment_idx];
+                    assert!(
+                        (got - expect).abs() <= 5.0e-8 * expect.abs().max(1.0),
+                        "R2 moment mismatch nroots={nroots}, t={t}, moment={moment_idx}: got={got:.16e}, expect={expect:.16e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rys_roots_weights_r2_keeps_legacy_low_root_path() {
+        for nroots in 1..=6 {
+            for t in [0.0_f64, 1.0e-8, 0.2, 1.0384010260937269, 2.0, 20.0, 80.0] {
+                let moments = boys_vec_r2(2 * nroots, t);
+                let (roots_ref, weights_ref) =
+                    rys_roots_weights_r2_from_moments(nroots, &moments, false)
+                        .expect("legacy R2 roots/weights should be available");
+                let (roots, weights) = rys_roots_weights_r2(nroots, t);
+                assert_eq!(roots.len(), roots_ref.len());
+                assert_eq!(weights.len(), weights_ref.len());
+                for idx in 0..nroots {
+                    assert!(
+                        (roots[idx] - roots_ref[idx]).abs() <= 1.0e-13,
+                        "R2 low-root baseline root changed nroots={nroots}, t={t}, idx={idx}: got={:.16e}, legacy={:.16e}",
+                        roots[idx],
+                        roots_ref[idx]
+                    );
+                    assert!(
+                        (weights[idx] - weights_ref[idx]).abs() <= 1.0e-13,
+                        "R2 low-root baseline weight changed nroots={nroots}, t={t}, idx={idx}: got={:.16e}, legacy={:.16e}",
+                        weights[idx],
+                        weights_ref[idx]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rys_roots_weights_r2_handles_high_roots_with_stable_moments() {
+        for nroots in [7_usize, 9, 15, 25, 33, 49, 65] {
+            for t in [0.0_f64, 1.0e-8, 0.2, 2.0, 20.0, 80.0] {
+                let moments = r2_stable_moments_from_measure(2 * nroots, t)
+                    .expect("failed to build stable R2 moments");
+                let (roots, weights) = rys_roots_weights_r2(nroots, t);
+                assert_eq!(roots.len(), nroots);
+                assert_eq!(weights.len(), nroots);
+                for idx in 0..nroots {
+                    assert!(
+                        roots[idx].is_finite()
+                            && roots[idx] >= -1.0e-12
+                            && roots[idx] <= 1.0 + 1.0e-12,
+                        "invalid stable R2 root nroots={nroots}, t={t}, idx={idx}: got={:.16e}",
+                        roots[idx]
+                    );
+                    assert!(
+                        weights[idx].is_finite() && weights[idx] >= -1.0e-10,
+                        "invalid stable R2 weight nroots={nroots}, t={t}, idx={idx}: got={:.16e}",
+                        weights[idx]
+                    );
+                }
+                for moment_idx in 0..=(2 * nroots - 1) {
+                    let got = roots
+                        .iter()
+                        .zip(weights.iter())
+                        .map(|(root, weight)| weight * root.powi(moment_idx as i32))
+                        .sum::<f64>();
+                    let expect = moments[moment_idx];
+                    assert!(
+                        (got - expect).abs() <= 5.0e-8 * expect.abs().max(1.0),
+                        "stable R2 moment mismatch nroots={nroots}, t={t}, moment={moment_idx}: got={got:.16e}, expect={expect:.16e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r2_stable_moments_match_legacy_gm_convention() {
+        for mmax in [12_usize, 24, 50, 98, 130] {
+            for t in [0.0_f64, 1.0e-8, 0.2, 2.0, 8.0] {
+                let legacy = boys_vec_r2(mmax, t);
+                let stable = r2_stable_moments_from_measure(mmax, t)
+                    .expect("failed to build stable R2 moments");
+                for m in 0..=mmax {
+                    let expect = legacy[m];
+                    let got = stable[m];
+                    let tol = 5.0e-10 * expect.abs().max(1.0);
+                    assert!(
+                        (got - expect).abs() <= tol,
+                        "stable R2 moment changed legacy convention mmax={mmax}, m={m}, t={t}: got={got:.16e}, legacy={expect:.16e}, tol={tol:.3e}"
                     );
                 }
             }
@@ -9409,12 +10191,126 @@ position = [
     }
 
     #[test]
+    fn exact4c_scalar_def2_tzvpp_pfff_matches_libcint() {
+        let ctrl_path = write_temp_ctrl_h2o("def2-tzvpp");
+        let mol = Molecule::build(ctrl_path.clone(), None).unwrap();
+
+        let ao_shells =
+            crate::lib_rint::basis::load_molecule_rint_shells_from_raw(&mol.geom, &mol.basis4elem)
+                .expect("failed to build AO rint shells");
+        let ao_bfs = crate::lib_rint::basis::expand_rint_shells_to_basis_functions(&ao_shells)
+            .expect("failed to expand AO rint shells");
+
+        let indices = [41_usize, 26_usize, 26_usize, 26_usize];
+        let got = eri_ao_4c_r(&ao_bfs, indices[0], indices[1], indices[2], indices[3]);
+        let eri4_libcint = mol.int_ijkl_erifull();
+        let expect = *eri4_libcint
+            .get(&[indices[0], indices[1], indices[2], indices[3]])
+            .unwrap();
+        assert!(
+            (got - expect).abs() <= 1.0e-10 * expect.abs().max(1.0),
+            "def2-tzvpp p-f-f-f exact 4c mismatch at {:?}: got={got:.16e}, libcint={expect:.16e}",
+            indices
+        );
+
+        let _ = fs::remove_file(ctrl_path);
+    }
+
+    #[test]
+    fn exact4c_shell_block_def2_qzvp_gggg_matches_scalar() {
+        let ctrl_path = write_temp_ctrl_h2o("def2-qzvp");
+        let mol = Molecule::build(ctrl_path.clone(), None).unwrap();
+
+        let ao_shells =
+            crate::lib_rint::basis::load_molecule_rint_shells_from_raw(&mol.geom, &mol.basis4elem)
+                .expect("failed to build AO rint shells");
+        let ao_bfs = crate::lib_rint::basis::expand_rint_shells_to_basis_functions(&ao_shells)
+            .expect("failed to expand AO rint shells");
+
+        let shell = ao_shells
+            .iter()
+            .find(|shell| shell.shell.ang_type == 4)
+            .expect("def2-qzvp H2O should contain g shells");
+        let block = int4c_r_shell_block(shell, shell, shell, shell);
+        let got = block[(0, 0)];
+        let ao = shell.ao_start;
+        let expect = eri_ao_4c_r(&ao_bfs, ao, ao, ao, ao);
+        assert!(
+            got.abs() > 1.0e-8,
+            "def2-qzvp g-g-g-g shell block unexpectedly vanished for ao={ao}: got={got:.16e}"
+        );
+        assert!(
+            (got - expect).abs() <= 1.0e-10 * expect.abs().max(1.0),
+            "def2-qzvp g-g-g-g shell block mismatch ao={ao}: got={got:.16e}, scalar={expect:.16e}"
+        );
+
+        let _ = fs::remove_file(ctrl_path);
+    }
+
+    #[test]
+    fn exact4c_shell_block_single_component_l5_to_l8_matches_scalar() {
+        for l in 5_u32..=8 {
+            let component = [l, 0, 0];
+            let shell = single_component_shell(l, component);
+            let ao_bfs = vec![single_component_basis_function(component)];
+            let block = int4c_r_shell_block(&shell, &shell, &shell, &shell);
+            let got = block[(0, 0)];
+            let expect = eri_ao_4c_r(&ao_bfs, 0, 0, 0, 0);
+            assert!(
+                (got - expect).abs() <= 1.0e-10 * expect.abs().max(1.0),
+                "single-component exact 4c mismatch l={l}: got={got:.16e}, scalar={expect:.16e}"
+            );
+        }
+    }
+
+    #[test]
+    fn r2_4c_shell_block_single_component_l5_to_l12_matches_scalar() {
+        for l in 5_u32..=12 {
+            let component = [l, 0, 0];
+            let shell = single_component_shell(l, component);
+            let ao_bfs = vec![single_component_basis_function(component)];
+            let block = int4c_r2_shell_block(&shell, &shell, &shell, &shell);
+            let got = block[(0, 0)];
+            let expect = eri_ao_4c_r2(&ao_bfs, 0, 0, 0, 0);
+            assert!(
+                (got - expect).abs() <= 1.0e-10 * expect.abs().max(1.0),
+                "single-component R2 exact 4c mismatch l={l}: got={got:.16e}, scalar={expect:.16e}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "artificial R2 l=13..20 shell-block comparison is too slow for default debug tests"]
+    fn r2_4c_shell_block_single_component_l13_to_l20_matches_scalar() {
+        for l in 13_u32..=20 {
+            let component = [l, 0, 0];
+            let shell = single_component_shell(l, component);
+            let ao_bfs = vec![single_component_basis_function(component)];
+            let block = int4c_r2_shell_block(&shell, &shell, &shell, &shell);
+            let got = block[(0, 0)];
+            let expect = eri_ao_4c_r2(&ao_bfs, 0, 0, 0, 0);
+            assert!(
+                (got - expect).abs() <= 1.0e-10 * expect.abs().max(1.0),
+                "single-component R2 exact 4c mismatch l={l}: got={got:.16e}, scalar={expect:.16e}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "full h/i Cartesian shell-block comparison is too slow for debug default tests"]
+    fn exact4c_shell_block_artificial_h_and_i_match_scalar_and_libcint() {
+        for l in [5_u32, 6_u32] {
+            assert_high_l_4c_shell_block_matches_scalar_and_libcint(l);
+        }
+    }
+
+    #[test]
     fn rys_roots_weights_r_into_matches_allocating_api() {
-        for nroots in 1..=6 {
+        for nroots in 1..=9 {
             for t in [0.0_f64, 1.0e-8, 0.2, 2.0, 20.0, 80.0] {
                 let (roots_ref, weights_ref) = rys_roots_weights_r(nroots, t);
-                let mut roots = [0.0_f64; 8];
-                let mut weights = [0.0_f64; 8];
+                let mut roots = [0.0_f64; 16];
+                let mut weights = [0.0_f64; 16];
                 let got_nroots = rys_roots_weights_r_into(nroots, t, &mut roots, &mut weights);
                 assert_eq!(got_nroots, nroots);
                 for i in 0..nroots {
@@ -9489,14 +10385,13 @@ position = [
         let _ = fs::remove_file(ctrl_path);
     }
 
-
     #[test]
     #[ignore = "temporary exact 4c libcint vs lib_rint release benchmark"]
     fn tmp_bench_exact4c_libcint_vs_librint() {
         use std::hint::black_box;
 
-        let cases_env = std::env::var("TMP_EXACT4C_CASES")
-            .unwrap_or_else(|_| String::from("sto-3g"));
+        let cases_env =
+            std::env::var("TMP_EXACT4C_CASES").unwrap_or_else(|_| String::from("sto-3g"));
         let cases = cases_env
             .split(',')
             .map(str::trim)
@@ -9520,12 +10415,11 @@ position = [
 
         for (basis_name, ctrl_path) in cases {
             let mol = Molecule::build(ctrl_path.clone(), None).unwrap();
-            let ao_shells =
-                crate::lib_rint::basis::load_molecule_rint_shells_from_raw(
-                    &mol.geom,
-                    &mol.basis4elem,
-                )
-                .expect("failed to build AO rint shells");
+            let ao_shells = crate::lib_rint::basis::load_molecule_rint_shells_from_raw(
+                &mol.geom,
+                &mol.basis4elem,
+            )
+            .expect("failed to build AO rint shells");
             let nao = ao_shells.iter().map(|shell| shell.ao_len).sum::<usize>();
             let full_nint = nao * nao * nao * nao;
 
@@ -9596,10 +10490,10 @@ position = [
                 }
                 let mut rows = shell_profile.into_iter().collect::<Vec<_>>();
                 rows.sort_by(|left, right| {
-                    right
-                        .1
-                        .3
-                        .partial_cmp(&left.1.3)
+                    let left_seconds = left.1 .3;
+                    let right_seconds = right.1 .3;
+                    right_seconds
+                        .partial_cmp(&left_seconds)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
                 for (rank, (key, (count, prim_quartets, block_values, seconds))) in
@@ -9637,7 +10531,9 @@ position = [
                     .data
                     .iter()
                     .enumerate()
-                    .fold(0.0_f64, |acc, (idx, value)| acc + *value * ((idx % 17 + 1) as f64));
+                    .fold(0.0_f64, |acc, (idx, value)| {
+                        acc + *value * ((idx % 17 + 1) as f64)
+                    });
                 black_box(libcint_checksum);
                 libcint_ref = Some(eri4_libcint);
 
@@ -9652,14 +10548,26 @@ position = [
                 librint_checksum = librint_full
                     .iter()
                     .enumerate()
-                    .fold(0.0_f64, |acc, (idx, value)| acc + *value * ((idx % 17 + 1) as f64));
+                    .fold(0.0_f64, |acc, (idx, value)| {
+                        acc + *value * ((idx % 17 + 1) as f64)
+                    });
                 black_box(librint_checksum);
             }
 
             let eri4_libcint = libcint_ref.expect("missing libcint reference");
             let mut max_abs = 0.0_f64;
             let mut max_rel = 0.0_f64;
-            let mut max_case = (0_usize, 0_usize, 0_usize, 0_usize, 0_usize, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+            let mut ao_to_shell = vec![0_usize; nao];
+            for (shell_idx, shell) in ao_shells.iter().enumerate() {
+                for local in 0..shell.ao_len {
+                    ao_to_shell[shell.ao_start + local] = shell_idx;
+                }
+            }
+            let mut error_by_nroots =
+                std::collections::BTreeMap::<usize, (usize, f64, f64, f64)>::new();
+            let mut max_case = (
+                0_usize, 0_usize, 0_usize, 0_usize, 0_usize, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64,
+            );
             for sig in 0..nao {
                 for lam in 0..nao {
                     for nu in 0..nao {
@@ -9669,6 +10577,21 @@ position = [
                             let ref_value = *eri4_libcint.get(&[mu, nu, lam, sig]).unwrap();
                             let abs = (lib_value - ref_value).abs();
                             let rel = abs / ref_value.abs().max(1.0e-12);
+                            let a_shell = &ao_shells[ao_to_shell[mu]];
+                            let b_shell = &ao_shells[ao_to_shell[nu]];
+                            let c_shell = &ao_shells[ao_to_shell[lam]];
+                            let d_shell = &ao_shells[ao_to_shell[sig]];
+                            let nroots = ((a_shell.shell.ang_type
+                                + b_shell.shell.ang_type
+                                + c_shell.shell.ang_type
+                                + d_shell.shell.ang_type)
+                                / 2
+                                + 1) as usize;
+                            let item = error_by_nroots.entry(nroots).or_insert((0, 0.0, 0.0, 0.0));
+                            item.0 += 1;
+                            item.1 = item.1.max(abs);
+                            item.2 = item.2.max(rel);
+                            item.3 += abs * abs;
                             if abs > max_abs {
                                 max_abs = abs;
                                 max_case = (mu, nu, lam, sig, idx, lib_value, ref_value, abs, rel);
@@ -9678,9 +10601,16 @@ position = [
                     }
                 }
             }
+            for (nroots, (count, bucket_max_abs, bucket_max_rel, sum_abs_sq)) in &error_by_nroots {
+                let rms_abs = (sum_abs_sq / (*count as f64)).sqrt();
+                println!(
+                    "TMP_EXACT4C_ERROR_BY_NROOTS basis={basis_name} nroots={nroots} count={count} max_abs={bucket_max_abs:.3e} max_rel_floor_1e-12={bucket_max_rel:.3e} rms_abs={rms_abs:.3e}"
+                );
+            }
             if diagnose_mismatch && max_abs > 1.0e-8 {
-                let ao_bfs = crate::lib_rint::basis::expand_rint_shells_to_basis_functions(&ao_shells)
-                    .expect("failed to expand AO rint shells");
+                let ao_bfs =
+                    crate::lib_rint::basis::expand_rint_shells_to_basis_functions(&ao_shells)
+                        .expect("failed to expand AO rint shells");
                 let mut ao_to_shell_local = vec![(0_usize, 0_usize); nao];
                 for (shell_idx, shell) in ao_shells.iter().enumerate() {
                     for local in 0..shell.ao_len {
