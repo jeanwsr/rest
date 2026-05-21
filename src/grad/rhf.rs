@@ -40,6 +40,17 @@ pub struct RIHFGradientFlags {
     /// For RHF, it should be set to 1.0; for KS, it depends on exchange coefficient.
     #[builder(default = "Some(1.0)")]
     pub factor_k: Option<f64>,
+
+    /// Factor for alpha in range-separated hybrid functionals.
+    /// In the form of (omega, alpha, beta), corresponds to `dfa_rsh_scf`.
+    /// This value will not be applied when `omega` is None.
+    #[builder(default = "None")]
+    pub factor_alpha: Option<f64>,
+
+    /// Factor for omega in range-separated hybrid functionals.
+    /// In the form of (omega, alpha, beta), corresponds to `dfa_rsh_scf`.
+    #[builder(default = "None")]
+    pub omega: Option<f64>,
 }
 
 /// Gradient structure and values for RHF method.
@@ -64,6 +75,36 @@ impl GradAPI for RIRHFGradient<'_> {
     }
 }
 
+pub fn build_ri_jk_grad_flags(scf_data: &SCF) -> RIHFGradientFlags {
+    let mut flags = RIHFGradientFlagsBuilder::default();
+    flags.factor_j(Some(1.0));
+    flags.auxbasis_response(scf_data.mol.ctrl.auxbasis_response);
+    flags.print_level(scf_data.mol.ctrl.print_level);
+    flags.max_memory(scf_data.mol.ctrl.max_memory);
+
+    // set hybrid factor
+    let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+    let factor_k = if is_hf {
+        Some(1.0)
+    } else {
+        let fac = scf_data.mol.xc_data.dfa_hybrid_scf;
+        if fac == 0.0 {
+            None
+        } else {
+            Some(fac)
+        }
+    };
+    flags.factor_k(factor_k);
+
+    // set rsh factor
+    if let Some((omega, alpha, _beta)) = scf_data.mol.xc_data.dfa_rsh_scf {
+        flags.omega(Some(omega));
+        flags.factor_alpha(Some(alpha));
+    }
+
+    flags.build().unwrap()
+}
+
 impl RIRHFGradient<'_> {
     pub fn new(scf_data: &SCF) -> RIRHFGradient<'_> {
         // check SCF type
@@ -72,20 +113,8 @@ impl RIRHFGradient<'_> {
             _ => panic!("SCFtype is not sutiable for RHF gradient."),
         };
 
-        // check omega flag
-        if scf_data.mol.xc_data.is_rsh() {
-            unimplemented!("RI gradient for range-separated hybrid functionals is not implemented currently.")
-        }
-
         // flags
-        let mut flags = RIHFGradientFlagsBuilder::default();
-        flags.factor_j(Some(1.0));
-        flags.factor_k(Some(1.0));
-        flags.auxbasis_response(scf_data.mol.ctrl.auxbasis_response);
-        flags.print_level(scf_data.mol.ctrl.print_level);
-        flags.max_memory(scf_data.mol.ctrl.max_memory);
-        let flags = flags.build().unwrap();
-
+        let flags = build_ri_jk_grad_flags(scf_data);
         RIRHFGradient { scf_data, flags, result: HashMap::new() }
     }
 
@@ -154,17 +183,21 @@ impl RIRHFGradient<'_> {
 
     pub fn calc_de_jk(&mut self) -> &mut Self {
         let mut time_records = crate::utilities::TimeRecords::new();
-        time_records.new_item("de-jk preparation 1", "de-jk preparation 1");
-        time_records.new_item("de-jk preparation power", "de-jk preparation power");
-        time_records.new_item("de-jk preparation 2", "de-jk preparation 2");
-        time_records.new_item("de-jk batch int", "de-jk batch int");
-        time_records.new_item("de-jk batch 1", "de-jk batch 1");
-        time_records.new_item("de-jk batch 2", "de-jk batch 2");
-        time_records.new_item("de-jk batch 3", "de-jk batch 3");
-        time_records.new_item("de-jk batch 4", "de-jk batch 4");
-        time_records.new_item("de-jk batch 5", "de-jk batch 5");
+        time_records.new_item("de-jk prepr 1", "de-jk prepr 1 (basic setup)");
+        time_records.new_item("de-jk prepr 2", "de-jk prepr 2 (itm setup, hyb)");
+        time_records.new_item("de-jk batch int 1", "de-jk batch int (int3c2e_ip1, int3c2e_ip2, hyb)");
+        time_records.new_item("de-jk batch 1", "de-jk 1 batch (get_grad_dao_j_int3c2e_ip1)");
+        time_records.new_item("de-jk batch 2", "de-jk 2 batch (get_grad_daux_j_int3c2e_ip2)");
+        time_records.new_item("de-jk batch 3", "de-jk 3 batch (get_itm_k_ao, hyb)");
+        time_records.new_item("de-jk batch 4", "de-jk 4 batch (get_grad_dao_k_int3c2e_ip1, hyb)");
+        time_records.new_item("de-jk batch 5", "de-jk 5 batch (get_grad_daux_k_int3c2e_ip2, hyb)");
+        time_records.new_item("de-jk prepr 3", "de-jk prepr 3 (itm setup, rsh)");
+        time_records.new_item("de-jk batch int 2", "de-jk batch int (int3c2e_ip1, int3c2e_ip2, rsh)");
+        time_records.new_item("de-jk batch 6", "de-jk 6 batch (get_itm_k_ao, rsh)");
+        time_records.new_item("de-jk batch 7", "de-jk 7 batch (get_grad_dao_k_int3c2e_ip1, rsh)");
+        time_records.new_item("de-jk batch 8", "de-jk 8 batch (get_grad_daux_k_int3c2e_ip2, rsh)");
 
-        time_records.count_start("de-jk preparation 1");
+        time_records.count_start("de-jk prepr 1");
 
         let mol_obj = &self.scf_data.mol;
         let natm = mol_obj.geom.elem.len();
@@ -190,11 +223,9 @@ impl RIRHFGradient<'_> {
         };
         let naux = ederi_utp.shape()[0];
 
-        time_records.count_start("de-jk preparation power");
         // tsr_int2c2e_l: J^-1/2
         let j2c_decomp_option = self.scf_data.mol.ctrl.j2c_decomp;
         let j2c_decomp = ri_jk::get_j2c_decomp(&aux, &device, j2c_decomp_option);
-        time_records.count("de-jk preparation power");
 
         // tsr_int2c2e_ip1
         let tsr_int2c2e_ip1 = {
@@ -211,11 +242,12 @@ impl RIRHFGradient<'_> {
         let aux_batch_size = aux_batch_size.min(216);
         let aux_partition = blocksize_partition(&aux_loc, aux_batch_size);
 
-        time_records.count("de-jk preparation 1");
+        time_records.count("de-jk prepr 1");
 
-        // preparation finished
+        // basic setup finished
+        // begin hybrid computation
 
-        time_records.count_start("de-jk preparation 2");
+        time_records.count_start("de-jk prepr 2");
 
         // temporaries for de_jaux, de_kaux
         let mut itm_j = rt::full(([], f64::NAN, &device));
@@ -241,10 +273,10 @@ impl RIRHFGradient<'_> {
             daux_k = get_grad_daux_k_int2c2e_ip1(tsr_int2c2e_ip1.view(), itm_k_aux.view());
         }
 
-        time_records.count("de-jk preparation 2");
+        time_records.count("de-jk prepr 2");
 
         let mut idx_aux_start = 0;
-        for [shl0, shl1] in aux_partition {
+        for [shl0, shl1] in aux_partition.clone() {
             let shl_naux = aux_loc[shl1] - aux_loc[shl0];
             let shl_slices = [[0, mol.nbas()], [0, mol.nbas()], [shl0, shl1]];
             let (p0, p1) = (idx_aux_start, idx_aux_start + shl_naux);
@@ -299,15 +331,97 @@ impl RIRHFGradient<'_> {
             idx_aux_start += shl_naux;
         }
 
+        // begin rsh computation (evaluate short-range part of K, so negative omega for libcint)
+
+        let mut dao_sr = rt::full(([], f64::NAN, &device));
+        let mut daux_sr = rt::full(([], f64::NAN, &device));
+
+        if let Some(omega) = self.flags.omega {
+            // setup molecules for short-range integrals
+            let (mut mol, mut aux) = (mol.clone(), aux.clone());
+            mol.set_omega(-omega);
+            aux.set_omega(-omega);
+
+            // the already existed decomposed ERI
+            let ederi_utp_rimatr_sr = self.scf_data.rimatr_sr.as_ref().unwrap();
+            let ederi_utp_sr = {
+                let tsr = ederi_utp_rimatr_sr;
+                rt::asarray((&tsr.0.data, tsr.0.size, &device))
+            };
+
+            // regenerate essential cheap integrals
+            let j2c_decomp_option = self.scf_data.mol.ctrl.j2c_decomp;
+            let j2c_decomp_sr = ri_jk::get_j2c_decomp(&aux, &device, j2c_decomp_option);
+
+            let tsr_int2c2e_ip1 = {
+                let (out, shape) = aux.integrate("int2c2e_ip1", "s1", None).into();
+                rt::asarray((out, shape, &device))
+            };
+
+            time_records.count_start("de-jk prepr 3");
+
+            // temporaries for de_sraux
+            let mut itm_r_occtp = get_itm_k_occtp(&j2c_decomp_sr, ederi_utp_sr.view(), weighted_occ_coeff.view());
+            dao_sr = rt::zeros(([nao, 3], &device));
+            let itm_sr_aux = get_itm_k_aux(itm_r_occtp.view_mut());
+            daux_sr = get_grad_daux_k_int2c2e_ip1(tsr_int2c2e_ip1.view(), itm_sr_aux.view());
+
+            time_records.count("de-jk prepr 3");
+
+            let mut idx_aux_start = 0;
+            for [shl0, shl1] in aux_partition.clone() {
+                let shl_naux = aux_loc[shl1] - aux_loc[shl0];
+                let shl_slices = [[0, mol.nbas()], [0, mol.nbas()], [shl0, shl1]];
+                let (p0, p1) = (idx_aux_start, idx_aux_start + shl_naux);
+
+                time_records.count_start("de-jk batch int 2");
+                // int3c2e_ip1
+                let tsr_int3c2e_ip1 = {
+                    let (out, shape) =
+                        CInt::integrate_cross("int3c2e_ip1", [&mol, &mol, &aux], "s1", shl_slices).into();
+                    rt::asarray((out, shape, &device))
+                };
+
+                // int3c2e_ip2
+                let mut tsr_int3c2e_ip2 = rt::full(([], f64::NAN, &device));
+                if self.flags.auxbasis_response {
+                    tsr_int3c2e_ip2 = {
+                        let (out, shape) =
+                            CInt::integrate_cross("int3c2e_ip2", [&mol, &mol, &aux], "s2ij", shl_slices).into();
+                        rt::asarray((out, shape, &device))
+                    };
+                }
+                time_records.count("de-jk batch int 2");
+
+                time_records.count_start("de-jk batch 6");
+                let itm_r_ao = get_itm_k_ao(itm_r_occtp.i((.., p0..p1)), weighted_occ_coeff.view());
+                time_records.count("de-jk batch 6");
+
+                time_records.count_start("de-jk batch 7");
+                *&mut dao_sr += get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1.view(), itm_r_ao.view());
+                time_records.count("de-jk batch 7");
+
+                if self.flags.auxbasis_response {
+                    time_records.count_start("de-jk batch 8");
+                    *&mut daux_sr.i_mut(p0..p1) += get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_r_ao.view());
+                    time_records.count("de-jk batch 8");
+                }
+
+                idx_aux_start += shl_naux;
+            }
+        }
+
         if self.flags.print_level >= 2 {
             time_records.report_all();
         }
 
-        // de_j, de_k, de_jaux, de_kaux
+        // de_j, de_k, de_sr, de_jaux, de_kaux
         let mut de_j = rt::full(([3, natm], f64::NAN, &device));
         let mut de_k = rt::full(([3, natm], f64::NAN, &device));
+        let mut de_sr = rt::full(([3, natm], f64::NAN, &device));
         let mut de_jaux = rt::full(([3, natm], f64::NAN, &device));
         let mut de_kaux = rt::full(([3, natm], f64::NAN, &device));
+        let mut de_sraux = rt::full(([3, natm], f64::NAN, &device));
         let ao_slice = mol_obj.aoslice_by_atom();
         let aux_slice = mol_obj.make_auxmol_fake().aoslice_by_atom();
 
@@ -319,6 +433,9 @@ impl RIRHFGradient<'_> {
             if self.flags.factor_k.is_some() {
                 *&mut de_k.i_mut((.., atm)).assign(dao_k.i(p0..p1).sum_axes(0));
             }
+            if self.flags.omega.is_some() {
+                *&mut de_sr.i_mut((.., atm)).assign(dao_sr.i(p0..p1).sum_axes(0));
+            }
 
             let [_, _, p0, p1] = aux_slice[atm].clone().try_into().unwrap();
             if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
@@ -327,6 +444,9 @@ impl RIRHFGradient<'_> {
             if self.flags.factor_k.is_some() && self.flags.auxbasis_response {
                 *&mut de_kaux.i_mut((.., atm)).assign(daux_k.i(p0..p1).sum_axes(0));
             }
+            if self.flags.omega.is_some() && self.flags.auxbasis_response {
+                *&mut de_sraux.i_mut((.., atm)).assign(daux_sr.i(p0..p1).sum_axes(0));
+            }
         }
 
         if let Some(factor_j) = self.flags.factor_j {
@@ -334,38 +454,35 @@ impl RIRHFGradient<'_> {
             de_jaux *= factor_j;
         }
         if let Some(factor_k) = self.flags.factor_k {
-            de_k *= -0.5 * factor_k;
-            de_kaux *= -0.5 * factor_k;
+            if self.flags.omega.is_some() {
+                // rsh case: full exchange = alpha
+                let alpha = self.flags.factor_alpha.unwrap_or(0.0);
+                de_k *= -0.5 * alpha;
+                de_kaux *= -0.5 * alpha;
+            } else {
+                de_k *= -0.5 * factor_k;
+                de_kaux *= -0.5 * factor_k;
+            }
+        }
+        if self.flags.omega.is_some() {
+            // rsh case: short range = - (alpha - hyb)
+            let alpha = self.flags.factor_alpha.unwrap_or(0.0);
+            let hyb = self.flags.factor_k.unwrap_or(0.0);
+            de_sr *= 0.5 * (alpha - hyb);
+            de_sraux *= 0.5 * (alpha - hyb);
         }
 
-        let de_j = {
-            let de_j_raw = de_j.into_shape(-1).into_raw();
-            MatrixFull::from_vec([3, natm], de_j_raw).unwrap()
-        };
-        let de_jaux = {
-            let de_jaux_raw = de_jaux.into_shape(-1).into_raw();
-            MatrixFull::from_vec([3, natm], de_jaux_raw).unwrap()
-        };
-        let de_k = {
-            let de_k_raw = de_k.into_shape(-1).into_raw();
-            MatrixFull::from_vec([3, natm], de_k_raw).unwrap()
-        };
-        let de_kaux = {
-            let de_kaux_raw = de_kaux.into_shape(-1).into_raw();
-            MatrixFull::from_vec([3, natm], de_kaux_raw).unwrap()
-        };
-
-        if self.flags.factor_j.is_some() {
-            self.result.insert("de_j".into(), de_j);
-        }
-        if self.flags.factor_k.is_some() {
-            self.result.insert("de_k".into(), de_k);
-        }
-        if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
-            self.result.insert("de_jaux".into(), de_jaux);
-        }
-        if self.flags.factor_k.is_some() && self.flags.auxbasis_response {
-            self.result.insert("de_kaux".into(), de_kaux);
+        for (key, de_part, flag) in [
+            ("de_j", de_j, self.flags.factor_j.is_some()),
+            ("de_k", de_k, self.flags.factor_k.is_some()),
+            ("de_sr", de_sr, self.flags.omega.is_some()),
+            ("de_jaux", de_jaux, self.flags.factor_j.is_some() && self.flags.auxbasis_response),
+            ("de_kaux", de_kaux, self.flags.factor_k.is_some() && self.flags.auxbasis_response),
+            ("de_sraux", de_sraux, self.flags.omega.is_some() && self.flags.auxbasis_response),
+        ] {
+            let de_sraw = de_part.into_shape(-1).into_raw();
+            let de_part = MatrixFull::from_vec([3, natm], de_sraw).unwrap();
+            flag.then(|| self.result.insert(key.into(), de_part));
         }
 
         return self;
@@ -495,8 +612,10 @@ impl RIRHFGradient<'_> {
         de += self.result.get("de_hcore").unwrap().clone();
         self.result.get("de_j").map(|x| de += x.clone());
         self.result.get("de_k").map(|x| de += x.clone());
+        self.result.get("de_sr").map(|x| de += x.clone());
         self.result.get("de_jaux").map(|x| de += x.clone());
         self.result.get("de_kaux").map(|x| de += x.clone());
+        self.result.get("de_sraux").map(|x| de += x.clone());
         self.result.get("de_qmmm").map(|x| de += x.clone());
         self.result.insert("de".into(), de);
 
