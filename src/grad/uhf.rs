@@ -234,7 +234,7 @@ impl RIUHFGradient<'_> {
             let tsr = self.scf_data.rimatr.as_ref().unwrap();
             rt::asarray((&tsr.0.data, tsr.0.size, &device))
         };
-        let naux = ederi_utp.shape()[0];
+        let naux = ederi_utp.shape()[1];
 
         // tsr_int2c2e_l: J^-1/2
         let j2c_decomp_option = self.scf_data.mol.ctrl.j2c_decomp;
