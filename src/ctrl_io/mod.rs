@@ -1295,7 +1295,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.vxc_screen_threshold = match tmp_ctrl.get("vxc_screen_threshold").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-15),
                 serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-15),
-                _ => 1.0e-12,
+                _ => 1.0e-15,
             };
             // setup and sanity check of J/K algorithms
             tmp_input.algorithm_jk = tmp_ctrl.get("algorithm_jk").map(serde_from_value).unwrap_or_default();
