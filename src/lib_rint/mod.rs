@@ -3193,6 +3193,50 @@ struct RysRootScalars4c {
     p_over_pq: f64,
 }
 
+#[derive(Clone, Copy)]
+struct PTripletTarget4c {
+    data_idx: usize,
+    axes: [usize; 3],
+    ids: [usize; 3],
+}
+
+#[derive(Clone, Copy)]
+struct PQuartetTarget4c {
+    data_idx: usize,
+    axes: [usize; 4],
+}
+
+#[derive(Clone, Copy)]
+struct TotalAng2Target4c {
+    data_idx: usize,
+    kind: u8,
+    ang: [u32; 3],
+    left_axis: usize,
+    right_axis: usize,
+}
+
+enum Rint4cCachedBlockPlan {
+    Ssss,
+    TotalAng1 {
+        p_shell_id: usize,
+        targets: [(usize, usize); 3],
+        target_len: usize,
+    },
+    TotalAng2 {
+        targets: [TotalAng2Target4c; 16],
+        target_len: usize,
+    },
+    ThreePOneS {
+        targets: [PTripletTarget4c; 81],
+        target_len: usize,
+    },
+    FourP {
+        targets: [PQuartetTarget4c; 81],
+        target_len: usize,
+    },
+    Generic(Vec<Rint4cBlockEntry>),
+}
+
 #[inline(always)]
 fn rys_root_scalars_4c(root: f64, p_sum: f64, q_sum: f64, p_sum_q: f64) -> RysRootScalars4c {
     let inv_p_sum_q = p_sum_q.recip();
@@ -3258,6 +3302,317 @@ fn single_p_axis(ang: [u32; 3]) -> usize {
     }
 }
 
+fn build_three_p_one_s_targets_4c(
+    a: &RintShell,
+    b: &RintShell,
+    c: &RintShell,
+    d: &RintShell,
+) -> Option<([PTripletTarget4c; 81], usize)> {
+    let mut targets = [PTripletTarget4c {
+        data_idx: 0,
+        axes: [0; 3],
+        ids: [0; 3],
+    }; 81];
+    let mut target_len = 0_usize;
+    let left_rows = a.ao_len * b.ao_len;
+    for l in 0..d.ao_len {
+        let d_ang = d.cart_components[l];
+        let col_base = l * c.ao_len * left_rows;
+        for k in 0..c.ao_len {
+            let c_ang = c.cart_components[k];
+            let col_offset = col_base + k * left_rows;
+            for j in 0..b.ao_len {
+                let b_ang = b.cart_components[j];
+                let row_offset = col_offset + j * a.ao_len;
+                for i in 0..a.ao_len {
+                    if target_len >= targets.len() {
+                        return None;
+                    }
+                    let a_ang = a.cart_components[i];
+                    let mut axes = [0_usize; 3];
+                    let mut ids = [0_usize; 3];
+                    let mut n = 0_usize;
+                    if a.shell.ang_type == 1 {
+                        axes[n] = single_p_axis(a_ang);
+                        ids[n] = 0;
+                        n += 1;
+                    }
+                    if b.shell.ang_type == 1 {
+                        axes[n] = single_p_axis(b_ang);
+                        ids[n] = 1;
+                        n += 1;
+                    }
+                    if c.shell.ang_type == 1 {
+                        axes[n] = single_p_axis(c_ang);
+                        ids[n] = 2;
+                        n += 1;
+                    }
+                    if d.shell.ang_type == 1 {
+                        axes[n] = single_p_axis(d_ang);
+                        ids[n] = 3;
+                        n += 1;
+                    }
+                    debug_assert_eq!(n, 3);
+                    targets[target_len] = PTripletTarget4c {
+                        data_idx: row_offset + i,
+                        axes,
+                        ids,
+                    };
+                    target_len += 1;
+                }
+            }
+        }
+    }
+    Some((targets, target_len))
+}
+
+fn build_four_p_targets_4c(
+    a: &RintShell,
+    b: &RintShell,
+    c: &RintShell,
+    d: &RintShell,
+) -> Option<([PQuartetTarget4c; 81], usize)> {
+    let mut targets = [PQuartetTarget4c {
+        data_idx: 0,
+        axes: [0; 4],
+    }; 81];
+    let mut target_len = 0_usize;
+    let left_rows = a.ao_len * b.ao_len;
+    for l in 0..d.ao_len {
+        let d_axis = single_p_axis(d.cart_components[l]);
+        let col_base = l * c.ao_len * left_rows;
+        for k in 0..c.ao_len {
+            let c_axis = single_p_axis(c.cart_components[k]);
+            let col_offset = col_base + k * left_rows;
+            for j in 0..b.ao_len {
+                let b_axis = single_p_axis(b.cart_components[j]);
+                let row_offset = col_offset + j * a.ao_len;
+                for i in 0..a.ao_len {
+                    if target_len >= targets.len() {
+                        return None;
+                    }
+                    targets[target_len] = PQuartetTarget4c {
+                        data_idx: row_offset + i,
+                        axes: [single_p_axis(a.cart_components[i]), b_axis, c_axis, d_axis],
+                    };
+                    target_len += 1;
+                }
+            }
+        }
+    }
+    Some((targets, target_len))
+}
+
+fn build_total_ang2_targets_4c(
+    a: &RintShell,
+    b: &RintShell,
+    c: &RintShell,
+    d: &RintShell,
+) -> Option<([TotalAng2Target4c; 16], usize)> {
+    let mut targets = [TotalAng2Target4c {
+        data_idx: 0,
+        kind: 0,
+        ang: [0; 3],
+        left_axis: 0,
+        right_axis: 0,
+    }; 16];
+    let mut target_len = 0_usize;
+    let left_rows = a.ao_len * b.ao_len;
+    let mut push_target = |target: TotalAng2Target4c| -> Option<()> {
+        if target_len >= targets.len() {
+            return None;
+        }
+        targets[target_len] = target;
+        target_len += 1;
+        Some(())
+    };
+
+    if a.shell.ang_type == 2 {
+        for i in 0..a.ao_len {
+            push_target(TotalAng2Target4c {
+                data_idx: i,
+                kind: 0,
+                ang: a.cart_components[i],
+                left_axis: 0,
+                right_axis: 0,
+            })?;
+        }
+    } else if b.shell.ang_type == 2 {
+        for j in 0..b.ao_len {
+            push_target(TotalAng2Target4c {
+                data_idx: j * a.ao_len,
+                kind: 1,
+                ang: b.cart_components[j],
+                left_axis: 0,
+                right_axis: 0,
+            })?;
+        }
+    } else if c.shell.ang_type == 2 {
+        for k in 0..c.ao_len {
+            push_target(TotalAng2Target4c {
+                data_idx: k * left_rows,
+                kind: 2,
+                ang: c.cart_components[k],
+                left_axis: 0,
+                right_axis: 0,
+            })?;
+        }
+    } else if d.shell.ang_type == 2 {
+        for l in 0..d.ao_len {
+            push_target(TotalAng2Target4c {
+                data_idx: l * c.ao_len * left_rows,
+                kind: 3,
+                ang: d.cart_components[l],
+                left_axis: 0,
+                right_axis: 0,
+            })?;
+        }
+    } else if a.shell.ang_type == 1 && b.shell.ang_type == 1 {
+        for j in 0..b.ao_len {
+            let b_axis = single_p_axis(b.cart_components[j]);
+            let row_offset = j * a.ao_len;
+            for i in 0..a.ao_len {
+                push_target(TotalAng2Target4c {
+                    data_idx: row_offset + i,
+                    kind: 4,
+                    ang: [0; 3],
+                    left_axis: single_p_axis(a.cart_components[i]),
+                    right_axis: b_axis,
+                })?;
+            }
+        }
+    } else if a.shell.ang_type == 1 && c.shell.ang_type == 1 {
+        for k in 0..c.ao_len {
+            let c_axis = single_p_axis(c.cart_components[k]);
+            let col_offset = k * left_rows;
+            for i in 0..a.ao_len {
+                push_target(TotalAng2Target4c {
+                    data_idx: col_offset + i,
+                    kind: 5,
+                    ang: [0; 3],
+                    left_axis: single_p_axis(a.cart_components[i]),
+                    right_axis: c_axis,
+                })?;
+            }
+        }
+    } else if a.shell.ang_type == 1 && d.shell.ang_type == 1 {
+        for l in 0..d.ao_len {
+            let d_axis = single_p_axis(d.cart_components[l]);
+            let col_offset = l * c.ao_len * left_rows;
+            for i in 0..a.ao_len {
+                push_target(TotalAng2Target4c {
+                    data_idx: col_offset + i,
+                    kind: 6,
+                    ang: [0; 3],
+                    left_axis: single_p_axis(a.cart_components[i]),
+                    right_axis: d_axis,
+                })?;
+            }
+        }
+    } else if b.shell.ang_type == 1 && c.shell.ang_type == 1 {
+        for k in 0..c.ao_len {
+            let c_axis = single_p_axis(c.cart_components[k]);
+            let col_offset = k * left_rows;
+            for j in 0..b.ao_len {
+                push_target(TotalAng2Target4c {
+                    data_idx: col_offset + j * a.ao_len,
+                    kind: 7,
+                    ang: [0; 3],
+                    left_axis: single_p_axis(b.cart_components[j]),
+                    right_axis: c_axis,
+                })?;
+            }
+        }
+    } else if b.shell.ang_type == 1 && d.shell.ang_type == 1 {
+        for l in 0..d.ao_len {
+            let d_axis = single_p_axis(d.cart_components[l]);
+            let col_offset = l * c.ao_len * left_rows;
+            for j in 0..b.ao_len {
+                push_target(TotalAng2Target4c {
+                    data_idx: col_offset + j * a.ao_len,
+                    kind: 8,
+                    ang: [0; 3],
+                    left_axis: single_p_axis(b.cart_components[j]),
+                    right_axis: d_axis,
+                })?;
+            }
+        }
+    } else {
+        for l in 0..d.ao_len {
+            let d_axis = single_p_axis(d.cart_components[l]);
+            let col_base = l * c.ao_len * left_rows;
+            for k in 0..c.ao_len {
+                push_target(TotalAng2Target4c {
+                    data_idx: col_base + k * left_rows,
+                    kind: 9,
+                    ang: [0; 3],
+                    left_axis: single_p_axis(c.cart_components[k]),
+                    right_axis: d_axis,
+                })?;
+            }
+        }
+    }
+    Some((targets, target_len))
+}
+
+fn build_total_ang1_targets_4c(
+    a: &RintShell,
+    b: &RintShell,
+    c: &RintShell,
+    d: &RintShell,
+) -> (usize, [(usize, usize); 3], usize) {
+    let left_rows = a.ao_len * b.ao_len;
+    let p_shell_id = if a.shell.ang_type == 1 {
+        0
+    } else if b.shell.ang_type == 1 {
+        1
+    } else if c.shell.ang_type == 1 {
+        2
+    } else {
+        3
+    };
+    let mut p_targets = [(0_usize, 0_usize); 3];
+    let p_target_len = match p_shell_id {
+        0 => {
+            for (target, (i, &ang)) in p_targets
+                .iter_mut()
+                .zip(a.cart_components.iter().enumerate())
+            {
+                *target = (i, single_p_axis(ang));
+            }
+            a.ao_len
+        }
+        1 => {
+            for (target, (j, &ang)) in p_targets
+                .iter_mut()
+                .zip(b.cart_components.iter().enumerate())
+            {
+                *target = (j * a.ao_len, single_p_axis(ang));
+            }
+            b.ao_len
+        }
+        2 => {
+            for (target, (k, &ang)) in p_targets
+                .iter_mut()
+                .zip(c.cart_components.iter().enumerate())
+            {
+                *target = (k * left_rows, single_p_axis(ang));
+            }
+            c.ao_len
+        }
+        _ => {
+            for (target, (l, &ang)) in p_targets
+                .iter_mut()
+                .zip(d.cart_components.iter().enumerate())
+            {
+                *target = (l * c.ao_len * left_rows, single_p_axis(ang));
+            }
+            d.ao_len
+        }
+    };
+    (p_shell_id, p_targets, p_target_len)
+}
+
 #[derive(Clone, Copy)]
 struct RysTotalAng2Values {
     a1: [f64; 3],
@@ -3309,6 +3664,58 @@ fn p_pair_component_value(
 }
 
 #[inline(always)]
+fn total_ang2_target_value(target: TotalAng2Target4c, values: &RysTotalAng2Values) -> f64 {
+    match target.kind {
+        0 => d_component_value(target.ang, &values.a1, &values.a2),
+        1 => d_component_value(target.ang, &values.b1, &values.b2),
+        2 => d_component_value(target.ang, &values.c1, &values.c2),
+        3 => d_component_value(target.ang, &values.d1, &values.d2),
+        4 => p_pair_component_value(
+            target.left_axis,
+            target.right_axis,
+            &values.a1,
+            &values.b1,
+            &values.ab_same,
+        ),
+        5 => p_pair_component_value(
+            target.left_axis,
+            target.right_axis,
+            &values.a1,
+            &values.c1,
+            &values.ac_same,
+        ),
+        6 => p_pair_component_value(
+            target.left_axis,
+            target.right_axis,
+            &values.a1,
+            &values.d1,
+            &values.ad_same,
+        ),
+        7 => p_pair_component_value(
+            target.left_axis,
+            target.right_axis,
+            &values.b1,
+            &values.c1,
+            &values.bc_same,
+        ),
+        8 => p_pair_component_value(
+            target.left_axis,
+            target.right_axis,
+            &values.b1,
+            &values.d1,
+            &values.bd_same,
+        ),
+        _ => p_pair_component_value(
+            target.left_axis,
+            target.right_axis,
+            &values.c1,
+            &values.d1,
+            &values.cd_same,
+        ),
+    }
+}
+
+#[inline(always)]
 fn p_pair_covariance(id_a: usize, id_b: usize, scalars: RysRootScalars4c) -> f64 {
     match (id_a <= 1, id_b <= 1) {
         (true, true) => scalars.b10,
@@ -3352,6 +3759,51 @@ fn p_triplet_component_value(
     } else {
         m0 * m1 * m2
     }
+}
+
+#[inline(always)]
+fn p_axis_covariance(
+    left_axis: usize,
+    right_axis: usize,
+    left_id: usize,
+    right_id: usize,
+    scalars: RysRootScalars4c,
+) -> f64 {
+    if left_axis == right_axis {
+        p_pair_covariance(left_id, right_id, scalars)
+    } else {
+        0.0
+    }
+}
+
+#[inline(always)]
+fn p_quartet_component_value(
+    axes: [usize; 4],
+    ids: [usize; 4],
+    first: &[[f64; 3]; 4],
+    scalars: RysRootScalars4c,
+) -> f64 {
+    let m0 = first[ids[0]][axes[0]];
+    let m1 = first[ids[1]][axes[1]];
+    let m2 = first[ids[2]][axes[2]];
+    let m3 = first[ids[3]][axes[3]];
+    let c01 = p_axis_covariance(axes[0], axes[1], ids[0], ids[1], scalars);
+    let c02 = p_axis_covariance(axes[0], axes[2], ids[0], ids[2], scalars);
+    let c03 = p_axis_covariance(axes[0], axes[3], ids[0], ids[3], scalars);
+    let c12 = p_axis_covariance(axes[1], axes[2], ids[1], ids[2], scalars);
+    let c13 = p_axis_covariance(axes[1], axes[3], ids[1], ids[3], scalars);
+    let c23 = p_axis_covariance(axes[2], axes[3], ids[2], ids[3], scalars);
+
+    m0 * m1 * m2 * m3
+        + c01 * m2 * m3
+        + c02 * m1 * m3
+        + c03 * m1 * m2
+        + c12 * m0 * m3
+        + c13 * m0 * m2
+        + c23 * m0 * m1
+        + c01 * c23
+        + c02 * c13
+        + c03 * c12
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3415,7 +3867,6 @@ fn rys_total_ang2_values(
 
     values
 }
-
 #[allow(clippy::too_many_arguments)]
 fn add_primitive_4c_total_ang2_fast(
     block_data: &mut [f64],
@@ -3438,7 +3889,6 @@ fn add_primitive_4c_total_ang2_fast(
     if nroots != 2 {
         return false;
     }
-
     let left_rows = a.ao_len * b.ao_len;
     for root_idx in 0..2 {
         let values = rys_total_ang2_values(
@@ -3579,6 +4029,101 @@ fn add_primitive_4c_total_ang2_fast(
     true
 }
 
+fn int4c_r_four_p_block_into_data_with_pairs(
+    a: &RintShell,
+    b: &RintShell,
+    c: &RintShell,
+    d: &RintShell,
+    ab_pairs: &[RintPrimitivePair4c],
+    cd_pairs: &[RintPrimitivePair4c],
+    block_data: &mut [f64],
+) -> bool {
+    if a.shell.ang_type != 1
+        || b.shell.ang_type != 1
+        || c.shell.ang_type != 1
+        || d.shell.ang_type != 1
+    {
+        return false;
+    }
+
+    let Some((targets, target_len)) = build_four_p_targets_4c(a, b, c, d) else {
+        return false;
+    };
+    int4c_r_four_p_block_into_data_with_pairs_targets(
+        a, b, c, d, ab_pairs, cd_pairs, block_data, &targets, target_len,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn int4c_r_four_p_block_into_data_with_pairs_targets(
+    a: &RintShell,
+    b: &RintShell,
+    c: &RintShell,
+    d: &RintShell,
+    ab_pairs: &[RintPrimitivePair4c],
+    cd_pairs: &[RintPrimitivePair4c],
+    block_data: &mut [f64],
+    targets: &[PQuartetTarget4c; 81],
+    target_len: usize,
+) -> bool {
+    let ids = [0_usize, 1_usize, 2_usize, 3_usize];
+    for ab_pair in ab_pairs {
+        let p_sum = ab_pair.exp_sum;
+        let p_center = ab_pair.center;
+        for cd_pair in cd_pairs {
+            let q_sum = cd_pair.exp_sum;
+            let p_sum_q = p_sum + q_sum;
+            let pq_mul = p_sum * q_sum;
+            debug_assert!(p_sum > 0.0 && q_sum > 0.0 && p_sum_q > 0.0 && pq_mul > 0.0);
+
+            let rho = pq_mul / p_sum_q;
+            let t = rho * distance_squared(&p_center, &cd_pair.center);
+            let mut roots = [0.0_f64; 3];
+            let mut weights = [0.0_f64; 3];
+            let nroots = rys_roots_weights_r_into(3, t, &mut roots, &mut weights);
+            if nroots != 3 {
+                return false;
+            }
+
+            let pref = TWO_PI_POW_2P5 / p_sum_q.sqrt();
+            let primitive_coeff =
+                ab_pair.scaled_coeff_over_exp_sum * cd_pair.scaled_coeff_over_exp_sum;
+            for root_idx in 0..3 {
+                let root = roots[root_idx];
+                let scalars = rys_root_scalars_4c(root, p_sum, q_sum, p_sum_q);
+                let mut first = [[0.0_f64; 3]; 4];
+                for axis in 0..3 {
+                    let rc = rys_axis_coeffs_4c_from_scalars(
+                        scalars,
+                        root,
+                        p_center[axis],
+                        cd_pair.center[axis],
+                        a.center[axis],
+                        c.center[axis],
+                    );
+                    first[0][axis] = rc.c00;
+                    first[1][axis] = rc.c00 + a.center[axis] - b.center[axis];
+                    first[2][axis] = rc.c00p;
+                    first[3][axis] = rc.c00p + c.center[axis] - d.center[axis];
+                }
+
+                let primitive_scale = primitive_coeff * pref * weights[root_idx];
+                if !primitive_scale.is_finite() {
+                    continue;
+                }
+                for target in targets[..target_len].iter() {
+                    let value = p_quartet_component_value(target.axes, ids, &first, scalars);
+                    let term = primitive_scale * value;
+                    if term.is_finite() {
+                        block_data[target.data_idx] += term;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 fn int4c_r_ssss_block_into_data_with_pairs(
     ab_pairs: &[RintPrimitivePair4c],
     cd_pairs: &[RintPrimitivePair4c],
@@ -3617,55 +4162,34 @@ fn int4c_r_total_ang1_block_into_data_with_pairs(
     cd_pairs: &[RintPrimitivePair4c],
     block_data: &mut [f64],
 ) {
-    let left_rows = a.ao_len * b.ao_len;
-    let p_shell_id = if a.shell.ang_type == 1 {
-        0
-    } else if b.shell.ang_type == 1 {
-        1
-    } else if c.shell.ang_type == 1 {
-        2
-    } else {
-        3
-    };
-    let mut p_targets = [(0_usize, 0_usize); 3];
-    let p_target_len = match p_shell_id {
-        0 => {
-            for (target, (i, &ang)) in p_targets
-                .iter_mut()
-                .zip(a.cart_components.iter().enumerate())
-            {
-                *target = (i, single_p_axis(ang));
-            }
-            a.ao_len
-        }
-        1 => {
-            for (target, (j, &ang)) in p_targets
-                .iter_mut()
-                .zip(b.cart_components.iter().enumerate())
-            {
-                *target = (j * a.ao_len, single_p_axis(ang));
-            }
-            b.ao_len
-        }
-        2 => {
-            for (target, (k, &ang)) in p_targets
-                .iter_mut()
-                .zip(c.cart_components.iter().enumerate())
-            {
-                *target = (k * left_rows, single_p_axis(ang));
-            }
-            c.ao_len
-        }
-        _ => {
-            for (target, (l, &ang)) in p_targets
-                .iter_mut()
-                .zip(d.cart_components.iter().enumerate())
-            {
-                *target = (l * c.ao_len * left_rows, single_p_axis(ang));
-            }
-            d.ao_len
-        }
-    };
+    let (p_shell_id, p_targets, p_target_len) = build_total_ang1_targets_4c(a, b, c, d);
+    int4c_r_total_ang1_block_into_data_with_pairs_targets(
+        a,
+        b,
+        c,
+        d,
+        ab_pairs,
+        cd_pairs,
+        block_data,
+        p_shell_id,
+        &p_targets,
+        p_target_len,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn int4c_r_total_ang1_block_into_data_with_pairs_targets(
+    a: &RintShell,
+    b: &RintShell,
+    c: &RintShell,
+    d: &RintShell,
+    ab_pairs: &[RintPrimitivePair4c],
+    cd_pairs: &[RintPrimitivePair4c],
+    block_data: &mut [f64],
+    p_shell_id: usize,
+    p_targets: &[(usize, usize); 3],
+    p_target_len: usize,
+) {
     for ab_pair in ab_pairs {
         let p_sum = ab_pair.exp_sum;
         let p_center = ab_pair.center;
@@ -3725,6 +4249,84 @@ fn int4c_r_total_ang1_block_into_data_with_pairs(
     }
 }
 
+fn int4c_r_total_ang2_block_into_data_with_pairs(
+    a: &RintShell,
+    b: &RintShell,
+    c: &RintShell,
+    d: &RintShell,
+    ab_pairs: &[RintPrimitivePair4c],
+    cd_pairs: &[RintPrimitivePair4c],
+    block_data: &mut [f64],
+) -> bool {
+    let Some((targets, target_len)) = build_total_ang2_targets_4c(a, b, c, d) else {
+        return false;
+    };
+    int4c_r_total_ang2_block_into_data_with_pairs_targets(
+        a, b, c, d, ab_pairs, cd_pairs, block_data, &targets, target_len,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn int4c_r_total_ang2_block_into_data_with_pairs_targets(
+    a: &RintShell,
+    b: &RintShell,
+    c: &RintShell,
+    d: &RintShell,
+    ab_pairs: &[RintPrimitivePair4c],
+    cd_pairs: &[RintPrimitivePair4c],
+    block_data: &mut [f64],
+    targets: &[TotalAng2Target4c; 16],
+    target_len: usize,
+) -> bool {
+    for ab_pair in ab_pairs {
+        let p_sum = ab_pair.exp_sum;
+        let p_center = ab_pair.center;
+        for cd_pair in cd_pairs {
+            let q_sum = cd_pair.exp_sum;
+            let p_sum_q = p_sum + q_sum;
+            let pq_mul = p_sum * q_sum;
+            debug_assert!(p_sum > 0.0 && q_sum > 0.0 && p_sum_q > 0.0 && pq_mul > 0.0);
+
+            let rho = pq_mul / p_sum_q;
+            let t = rho * distance_squared(&p_center, &cd_pair.center);
+            let pref = TWO_PI_POW_2P5 / p_sum_q.sqrt();
+            let primitive_coeff =
+                ab_pair.scaled_coeff_over_exp_sum * cd_pair.scaled_coeff_over_exp_sum;
+            let mut roots = [0.0_f64; 2];
+            let mut weights = [0.0_f64; 2];
+            let nroots = rys_roots_weights_r_into(2, t, &mut roots, &mut weights);
+            if nroots != 2 {
+                return false;
+            }
+            for root_idx in 0..2 {
+                let values = rys_total_ang2_values(
+                    roots[root_idx],
+                    p_sum,
+                    q_sum,
+                    p_sum_q,
+                    &p_center,
+                    &cd_pair.center,
+                    &a.center,
+                    &b.center,
+                    &c.center,
+                    &d.center,
+                );
+                let primitive_scale = primitive_coeff * pref * weights[root_idx];
+                if !primitive_scale.is_finite() {
+                    continue;
+                }
+                for target in targets[..target_len].iter() {
+                    let term = primitive_scale * total_ang2_target_value(*target, &values);
+                    if term.is_finite() {
+                        block_data[target.data_idx] += term;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 fn int4c_r_three_p_one_s_block_into_data_with_pairs(
     a: &RintShell,
     b: &RintShell,
@@ -3746,7 +4348,26 @@ fn int4c_r_three_p_one_s_block_into_data_with_pairs(
         return false;
     }
 
-    let left_rows = a.ao_len * b.ao_len;
+    let Some((targets, target_len)) = build_three_p_one_s_targets_4c(a, b, c, d) else {
+        return false;
+    };
+    int4c_r_three_p_one_s_block_into_data_with_pairs_targets(
+        a, b, c, d, ab_pairs, cd_pairs, block_data, &targets, target_len,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn int4c_r_three_p_one_s_block_into_data_with_pairs_targets(
+    a: &RintShell,
+    b: &RintShell,
+    c: &RintShell,
+    d: &RintShell,
+    ab_pairs: &[RintPrimitivePair4c],
+    cd_pairs: &[RintPrimitivePair4c],
+    block_data: &mut [f64],
+    targets: &[PTripletTarget4c; 81],
+    target_len: usize,
+) -> bool {
     for ab_pair in ab_pairs {
         let p_sum = ab_pair.exp_sum;
         let p_center = ab_pair.center;
@@ -3791,47 +4412,11 @@ fn int4c_r_three_p_one_s_block_into_data_with_pairs(
                 if !primitive_scale.is_finite() {
                     continue;
                 }
-                for l in 0..d.ao_len {
-                    let d_ang = d.cart_components[l];
-                    let col_base = l * c.ao_len * left_rows;
-                    for k in 0..c.ao_len {
-                        let c_ang = c.cart_components[k];
-                        let col_offset = col_base + k * left_rows;
-                        for j in 0..b.ao_len {
-                            let b_ang = b.cart_components[j];
-                            let row_offset = col_offset + j * a.ao_len;
-                            for i in 0..a.ao_len {
-                                let a_ang = a.cart_components[i];
-                                let mut axes = [0_usize; 3];
-                                let mut ids = [0_usize; 3];
-                                let mut n = 0_usize;
-                                if a.shell.ang_type == 1 {
-                                    axes[n] = single_p_axis(a_ang);
-                                    ids[n] = 0;
-                                    n += 1;
-                                }
-                                if b.shell.ang_type == 1 {
-                                    axes[n] = single_p_axis(b_ang);
-                                    ids[n] = 1;
-                                    n += 1;
-                                }
-                                if c.shell.ang_type == 1 {
-                                    axes[n] = single_p_axis(c_ang);
-                                    ids[n] = 2;
-                                    n += 1;
-                                }
-                                if d.shell.ang_type == 1 {
-                                    axes[n] = single_p_axis(d_ang);
-                                    ids[n] = 3;
-                                }
-                                debug_assert_eq!(n + usize::from(d.shell.ang_type == 1), 3);
-                                let value = p_triplet_component_value(axes, ids, &first, scalars);
-                                let term = primitive_scale * value;
-                                if term.is_finite() {
-                                    block_data[row_offset + i] += term;
-                                }
-                            }
-                        }
+                for target in targets[..target_len].iter() {
+                    let value = p_triplet_component_value(target.axes, target.ids, &first, scalars);
+                    let term = primitive_scale * value;
+                    if term.is_finite() {
+                        block_data[target.data_idx] += term;
                     }
                 }
             }
@@ -4727,8 +5312,13 @@ fn int4c_r_shell_block_batched_into_data_with_pairs_and_workspace(
     block_data: &mut Vec<f64>,
     workspace: &mut RysTransferWorkspace4c,
 ) -> [usize; 2] {
+    if let Some(shape) = try_int4c_r_shell_block_fast_path_into_data_with_pairs(
+        a, b, c, d, ab_pairs, cd_pairs, block_data,
+    ) {
+        return shape;
+    }
     build_4c_block_entries_into(a, b, c, d, entries);
-    int4c_r_shell_block_batched_into_data_with_pairs_workspace_entries(
+    int4c_r_shell_block_batched_into_data_with_pairs_workspace_entries_generic(
         a, b, c, d, ab_pairs, cd_pairs, entries, block_data, workspace,
     )
 }
@@ -4744,30 +5334,296 @@ fn int4c_r_shell_block_batched_into_data_with_pairs_workspace_entries(
     block_data: &mut Vec<f64>,
     workspace: &mut RysTransferWorkspace4c,
 ) -> [usize; 2] {
+    if let Some(shape) = try_int4c_r_shell_block_fast_path_into_data_with_pairs(
+        a, b, c, d, ab_pairs, cd_pairs, block_data,
+    ) {
+        return shape;
+    }
+    int4c_r_shell_block_batched_into_data_with_pairs_workspace_entries_generic(
+        a, b, c, d, ab_pairs, cd_pairs, entries, block_data, workspace,
+    )
+}
+
+fn build_cached_4c_block_plan(
+    a: &RintShell,
+    b: &RintShell,
+    c: &RintShell,
+    d: &RintShell,
+) -> Rint4cCachedBlockPlan {
+    let total_ang = a.shell.ang_type + b.shell.ang_type + c.shell.ang_type + d.shell.ang_type;
+    if total_ang == 0 {
+        return Rint4cCachedBlockPlan::Ssss;
+    }
+    if total_ang == 1 {
+        let (p_shell_id, targets, target_len) = build_total_ang1_targets_4c(a, b, c, d);
+        return Rint4cCachedBlockPlan::TotalAng1 {
+            p_shell_id,
+            targets,
+            target_len,
+        };
+    }
+    if total_ang == 2 {
+        if let Some((targets, target_len)) = build_total_ang2_targets_4c(a, b, c, d) {
+            return Rint4cCachedBlockPlan::TotalAng2 {
+                targets,
+                target_len,
+            };
+        }
+    }
+    if total_ang == 3 {
+        let p_shell_count = [a, b, c, d]
+            .iter()
+            .filter(|shell| shell.shell.ang_type == 1)
+            .count();
+        let s_shell_count = [a, b, c, d]
+            .iter()
+            .filter(|shell| shell.shell.ang_type == 0)
+            .count();
+        if p_shell_count == 3 && s_shell_count == 1 {
+            if let Some((targets, target_len)) = build_three_p_one_s_targets_4c(a, b, c, d) {
+                return Rint4cCachedBlockPlan::ThreePOneS {
+                    targets,
+                    target_len,
+                };
+            }
+        }
+    }
+    if total_ang == 4
+        && a.shell.ang_type == 1
+        && b.shell.ang_type == 1
+        && c.shell.ang_type == 1
+        && d.shell.ang_type == 1
+    {
+        if let Some((targets, target_len)) = build_four_p_targets_4c(a, b, c, d) {
+            return Rint4cCachedBlockPlan::FourP {
+                targets,
+                target_len,
+            };
+        }
+    }
+
+    let mut entries = Vec::new();
+    build_4c_block_entries_into(a, b, c, d, &mut entries);
+    Rint4cCachedBlockPlan::Generic(entries)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn int4c_r_shell_block_batched_into_data_with_pairs_cached_plan(
+    a: &RintShell,
+    b: &RintShell,
+    c: &RintShell,
+    d: &RintShell,
+    ab_pairs: &[RintPrimitivePair4c],
+    cd_pairs: &[RintPrimitivePair4c],
+    plan: &Rint4cCachedBlockPlan,
+    block_data: &mut Vec<f64>,
+    workspace: &mut RysTransferWorkspace4c,
+) -> [usize; 2] {
+    let left_rows = a.ao_len * b.ao_len;
+    let right_cols = c.ao_len * d.ao_len;
+    let shape = [left_rows, right_cols];
+    match plan {
+        Rint4cCachedBlockPlan::Ssss => {
+            block_data.resize(left_rows * right_cols, 0.0_f64);
+            block_data.fill(0.0);
+            int4c_r_ssss_block_into_data_with_pairs(ab_pairs, cd_pairs, block_data);
+            shape
+        }
+        Rint4cCachedBlockPlan::TotalAng1 {
+            p_shell_id,
+            targets,
+            target_len,
+        } => {
+            block_data.resize(left_rows * right_cols, 0.0_f64);
+            block_data.fill(0.0);
+            int4c_r_total_ang1_block_into_data_with_pairs_targets(
+                a,
+                b,
+                c,
+                d,
+                ab_pairs,
+                cd_pairs,
+                block_data,
+                *p_shell_id,
+                targets,
+                *target_len,
+            );
+            shape
+        }
+        Rint4cCachedBlockPlan::TotalAng2 {
+            targets,
+            target_len,
+        } => {
+            block_data.resize(left_rows * right_cols, 0.0_f64);
+            block_data.fill(0.0);
+            if int4c_r_total_ang2_block_into_data_with_pairs_targets(
+                a,
+                b,
+                c,
+                d,
+                ab_pairs,
+                cd_pairs,
+                block_data,
+                targets,
+                *target_len,
+            ) {
+                shape
+            } else {
+                let mut entries = Vec::new();
+                build_4c_block_entries_into(a, b, c, d, &mut entries);
+                int4c_r_shell_block_batched_into_data_with_pairs_workspace_entries_generic(
+                    a, b, c, d, ab_pairs, cd_pairs, &entries, block_data, workspace,
+                )
+            }
+        }
+        Rint4cCachedBlockPlan::ThreePOneS {
+            targets,
+            target_len,
+        } => {
+            block_data.resize(left_rows * right_cols, 0.0_f64);
+            block_data.fill(0.0);
+            if int4c_r_three_p_one_s_block_into_data_with_pairs_targets(
+                a,
+                b,
+                c,
+                d,
+                ab_pairs,
+                cd_pairs,
+                block_data,
+                targets,
+                *target_len,
+            ) {
+                shape
+            } else {
+                let mut entries = Vec::new();
+                build_4c_block_entries_into(a, b, c, d, &mut entries);
+                int4c_r_shell_block_batched_into_data_with_pairs_workspace_entries_generic(
+                    a, b, c, d, ab_pairs, cd_pairs, &entries, block_data, workspace,
+                )
+            }
+        }
+        Rint4cCachedBlockPlan::FourP {
+            targets,
+            target_len,
+        } => {
+            block_data.resize(left_rows * right_cols, 0.0_f64);
+            block_data.fill(0.0);
+            if int4c_r_four_p_block_into_data_with_pairs_targets(
+                a,
+                b,
+                c,
+                d,
+                ab_pairs,
+                cd_pairs,
+                block_data,
+                targets,
+                *target_len,
+            ) {
+                shape
+            } else {
+                let mut entries = Vec::new();
+                build_4c_block_entries_into(a, b, c, d, &mut entries);
+                int4c_r_shell_block_batched_into_data_with_pairs_workspace_entries_generic(
+                    a, b, c, d, ab_pairs, cd_pairs, &entries, block_data, workspace,
+                )
+            }
+        }
+        Rint4cCachedBlockPlan::Generic(entries) => {
+            int4c_r_shell_block_batched_into_data_with_pairs_workspace_entries_generic(
+                a, b, c, d, ab_pairs, cd_pairs, entries, block_data, workspace,
+            )
+        }
+    }
+}
+
+fn int4c_r_shell_block_batched_into_data_with_pairs_entry_cache(
+    a: &RintShell,
+    b: &RintShell,
+    c: &RintShell,
+    d: &RintShell,
+    ab_pairs: &[RintPrimitivePair4c],
+    cd_pairs: &[RintPrimitivePair4c],
+    plan_cache: &mut HashMap<[u32; 4], Rint4cCachedBlockPlan>,
+    block_data: &mut Vec<f64>,
+    workspace: &mut RysTransferWorkspace4c,
+) -> [usize; 2] {
+    let entry_key = [
+        a.shell.ang_type,
+        b.shell.ang_type,
+        c.shell.ang_type,
+        d.shell.ang_type,
+    ];
+    let plan = plan_cache
+        .entry(entry_key)
+        .or_insert_with(|| build_cached_4c_block_plan(a, b, c, d));
+    int4c_r_shell_block_batched_into_data_with_pairs_cached_plan(
+        a, b, c, d, ab_pairs, cd_pairs, plan, block_data, workspace,
+    )
+}
+
+fn try_int4c_r_shell_block_fast_path_into_data_with_pairs(
+    a: &RintShell,
+    b: &RintShell,
+    c: &RintShell,
+    d: &RintShell,
+    ab_pairs: &[RintPrimitivePair4c],
+    cd_pairs: &[RintPrimitivePair4c],
+    block_data: &mut Vec<f64>,
+) -> Option<[usize; 2]> {
     let left_rows = a.ao_len * b.ao_len;
     let right_cols = c.ao_len * d.ao_len;
     let shape = [left_rows, right_cols];
     block_data.resize(left_rows * right_cols, 0.0_f64);
     block_data.fill(0.0);
+    let total_ang = a.shell.ang_type + b.shell.ang_type + c.shell.ang_type + d.shell.ang_type;
     if a.shell.ang_type == 0
         && b.shell.ang_type == 0
         && c.shell.ang_type == 0
         && d.shell.ang_type == 0
     {
         int4c_r_ssss_block_into_data_with_pairs(ab_pairs, cd_pairs, block_data);
-        return shape;
+        return Some(shape);
     }
-    if a.shell.ang_type + b.shell.ang_type + c.shell.ang_type + d.shell.ang_type == 1 {
+    if total_ang == 1 {
         int4c_r_total_ang1_block_into_data_with_pairs(a, b, c, d, ab_pairs, cd_pairs, block_data);
-        return shape;
+        return Some(shape);
     }
-    if a.shell.ang_type + b.shell.ang_type + c.shell.ang_type + d.shell.ang_type == 3
+    if total_ang == 2
+        && int4c_r_total_ang2_block_into_data_with_pairs(a, b, c, d, ab_pairs, cd_pairs, block_data)
+    {
+        return Some(shape);
+    }
+    if total_ang == 3
         && int4c_r_three_p_one_s_block_into_data_with_pairs(
             a, b, c, d, ab_pairs, cd_pairs, block_data,
         )
     {
-        return shape;
+        return Some(shape);
     }
+    if total_ang == 4
+        && int4c_r_four_p_block_into_data_with_pairs(a, b, c, d, ab_pairs, cd_pairs, block_data)
+    {
+        return Some(shape);
+    }
+    None
+}
+
+fn int4c_r_shell_block_batched_into_data_with_pairs_workspace_entries_generic(
+    a: &RintShell,
+    b: &RintShell,
+    c: &RintShell,
+    d: &RintShell,
+    ab_pairs: &[RintPrimitivePair4c],
+    cd_pairs: &[RintPrimitivePair4c],
+    entries: &[Rint4cBlockEntry],
+    block_data: &mut Vec<f64>,
+    workspace: &mut RysTransferWorkspace4c,
+) -> [usize; 2] {
+    let left_rows = a.ao_len * b.ao_len;
+    let right_cols = c.ao_len * d.ao_len;
+    let shape = [left_rows, right_cols];
+    block_data.resize(left_rows * right_cols, 0.0_f64);
+    block_data.fill(0.0);
 
     for ab_pair in ab_pairs {
         for cd_pair in cd_pairs {
@@ -4940,6 +5796,166 @@ fn build_unique_4c_shell_quartet_tasks(
         }
     }
     tasks
+}
+
+struct RintMergedShellGroup {
+    shell_indices: Vec<usize>,
+    atom_idx: usize,
+    center: [f64; 3],
+    ang_type: u32,
+    cart_len: usize,
+    ao_start: usize,
+    ao_len: usize,
+    is_aux: bool,
+}
+
+fn rint_shells_can_merge_for_direct(left: &RintShell, right: &RintShell) -> bool {
+    left.atom_idx == right.atom_idx
+        && left.center == right.center
+        && left.shell.ang_type == right.shell.ang_type
+        && left.shell.exponents == right.shell.exponents
+        && left.cart_components == right.cart_components
+        && left.is_aux == right.is_aux
+        && left.ao_start + left.ao_len == right.ao_start
+}
+
+fn build_merged_shell_groups_for_direct(shells: &[RintShell]) -> Vec<RintMergedShellGroup> {
+    let mut groups = Vec::new();
+    let mut idx = 0_usize;
+    while idx < shells.len() {
+        let first = &shells[idx];
+        let mut shell_indices = vec![idx];
+        let mut next = idx + 1;
+        while next < shells.len()
+            && rint_shells_can_merge_for_direct(&shells[next - 1], &shells[next])
+        {
+            shell_indices.push(next);
+            next += 1;
+        }
+        groups.push(RintMergedShellGroup {
+            shell_indices,
+            atom_idx: first.atom_idx,
+            center: first.center,
+            ang_type: first.shell.ang_type,
+            cart_len: first.ao_len,
+            ao_start: first.ao_start,
+            ao_len: first.ao_len * (next - idx),
+            is_aux: first.is_aux,
+        });
+        idx = next;
+    }
+    groups
+}
+
+fn build_unique_4c_merged_shell_quartet_tasks(
+    groups: &[RintMergedShellGroup],
+) -> Vec<(usize, usize, usize, usize)> {
+    let mut tasks = Vec::new();
+    for a_idx in 0..groups.len() {
+        for b_idx in 0..=a_idx {
+            let ab_rank = shell_pair_rank(a_idx, b_idx);
+            for c_idx in 0..groups.len() {
+                for d_idx in 0..=c_idx {
+                    if shell_pair_rank(c_idx, d_idx) <= ab_rank {
+                        tasks.push((a_idx, b_idx, c_idx, d_idx));
+                    }
+                }
+            }
+        }
+    }
+    tasks
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scatter_split_4c_block_into_merged_block(
+    split_data: &[f64],
+    block_data: &mut [f64],
+    a_group: &RintMergedShellGroup,
+    b_group: &RintMergedShellGroup,
+    c_group: &RintMergedShellGroup,
+    d_group: &RintMergedShellGroup,
+    a_ctr: usize,
+    b_ctr: usize,
+    c_ctr: usize,
+    d_ctr: usize,
+) {
+    let split_left_rows = a_group.cart_len * b_group.cart_len;
+    let merged_left_rows = a_group.ao_len * b_group.ao_len;
+    for d_cart in 0..d_group.cart_len {
+        let d_local = d_ctr * d_group.cart_len + d_cart;
+        for c_cart in 0..c_group.cart_len {
+            let c_local = c_ctr * c_group.cart_len + c_cart;
+            let split_col = d_cart * c_group.cart_len + c_cart;
+            let merged_col = d_local * c_group.ao_len + c_local;
+            for b_cart in 0..b_group.cart_len {
+                let b_local = b_ctr * b_group.cart_len + b_cart;
+                for a_cart in 0..a_group.cart_len {
+                    let a_local = a_ctr * a_group.cart_len + a_cart;
+                    let split_row = b_cart * a_group.cart_len + a_cart;
+                    let merged_row = b_local * a_group.ao_len + a_local;
+                    block_data[merged_col * merged_left_rows + merged_row] =
+                        split_data[split_col * split_left_rows + split_row];
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn int4c_r_merged_shell_block_batched_into_data_with_split_kernel(
+    shells: &[RintShell],
+    a_group: &RintMergedShellGroup,
+    b_group: &RintMergedShellGroup,
+    c_group: &RintMergedShellGroup,
+    d_group: &RintMergedShellGroup,
+    primitive_pair_cache: &[Vec<RintPrimitivePair4c>],
+    plan_cache: &mut HashMap<[u32; 4], Rint4cCachedBlockPlan>,
+    workspace_cache: &mut HashMap<[u32; 4], RysTransferWorkspace4c>,
+    block_data: &mut Vec<f64>,
+    split_data: &mut Vec<f64>,
+) -> [usize; 2] {
+    let left_rows = a_group.ao_len * b_group.ao_len;
+    let right_cols = c_group.ao_len * d_group.ao_len;
+    block_data.resize(left_rows * right_cols, 0.0_f64);
+    block_data.fill(0.0);
+
+    for (a_ctr, &a_idx) in a_group.shell_indices.iter().enumerate() {
+        for (b_ctr, &b_idx) in b_group.shell_indices.iter().enumerate() {
+            for (c_ctr, &c_idx) in c_group.shell_indices.iter().enumerate() {
+                for (d_ctr, &d_idx) in d_group.shell_indices.iter().enumerate() {
+                    let a_shell = &shells[a_idx];
+                    let b_shell = &shells[b_idx];
+                    let c_shell = &shells[c_idx];
+                    let d_shell = &shells[d_idx];
+                    let ab_pairs = &primitive_pair_cache[shell_pair_rank(a_idx, b_idx)];
+                    let cd_pairs = &primitive_pair_cache[shell_pair_rank(c_idx, d_idx)];
+                    let workspace_key = [
+                        a_shell.shell.ang_type + b_shell.shell.ang_type,
+                        b_shell.shell.ang_type,
+                        c_shell.shell.ang_type + d_shell.shell.ang_type,
+                        d_shell.shell.ang_type,
+                    ];
+                    let workspace = workspace_cache.entry(workspace_key).or_insert_with(|| {
+                        RysTransferWorkspace4c::new(
+                            workspace_key[0],
+                            workspace_key[1],
+                            workspace_key[2],
+                            workspace_key[3],
+                        )
+                    });
+                    int4c_r_shell_block_batched_into_data_with_pairs_entry_cache(
+                        a_shell, b_shell, c_shell, d_shell, ab_pairs, cd_pairs, plan_cache,
+                        split_data, workspace,
+                    );
+                    scatter_split_4c_block_into_merged_block(
+                        split_data, block_data, a_group, b_group, c_group, d_group, a_ctr, b_ctr,
+                        c_ctr, d_ctr,
+                    );
+                }
+            }
+        }
+    }
+    [left_rows, right_cols]
 }
 
 /// Full exact Coulomb four-center tensor generated from shell-block quartets.
@@ -8359,8 +9375,13 @@ mod kernel_worst_quartet_tests {
             .replace(')', "")
             .replace('/', "_")
             .replace(' ', "_");
+        let num_threads = std::env::var("TMP_EXACT4C_NUM_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
         let text = format!(
-            "[ctrl]\nprint_level = 0\nxc = \"hf\"\nbasis_path = \"/home/cfh/rest_workspace/rest/basis-set-pool/{basis_dir}\"\nbasis_type = \"Cartesian\"\nuse_auxbas = false\neven_tempered_basis = false\ncharge = 0.0\nspin = 1.0\nspin_polarization = false\nnum_threads = 1\nrun_lib_rint = false\n\n[geom]\nname = \"H2\"\nunit = \"angstrom\"\nposition = [\n    \"H   0.0000000000   0.0000000000   0.0000000000\",\n    \"H   0.0000000000   0.0000000000   1.4000000000\",\n]\n"
+            "[ctrl]\nprint_level = 0\nxc = \"hf\"\nbasis_path = \"/home/cfh/rest_workspace/rest/basis-set-pool/{basis_dir}\"\nbasis_type = \"Cartesian\"\nuse_auxbas = false\neven_tempered_basis = false\ncharge = 0.0\nspin = 1.0\nspin_polarization = false\nnum_threads = {num_threads}\nrun_lib_rint = false\n\n[geom]\nname = \"H2\"\nunit = \"angstrom\"\nposition = [\n    \"H   0.0000000000   0.0000000000   0.0000000000\",\n    \"H   0.0000000000   0.0000000000   1.4000000000\",\n]\n"
         );
         fs::write(&path, text).unwrap();
         path
@@ -8372,8 +9393,13 @@ mod kernel_worst_quartet_tests {
             .replace(')', "")
             .replace('/', "_")
             .replace(' ', "_");
+        let num_threads = std::env::var("TMP_EXACT4C_NUM_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
         let text = format!(
-            "[ctrl]\nprint_level = 0\nxc = \"hf\"\nbasis_path = \"/home/cfh/rest_workspace/rest/basis-set-pool/{basis_dir}\"\nbasis_type = \"Cartesian\"\nuse_auxbas = false\neven_tempered_basis = false\ncharge = 0.0\nspin = 1.0\nspin_polarization = false\nnum_threads = 1\nrun_lib_rint = false\n\n[geom]\nname = \"H2O\"\nunit = \"angstrom\"\nposition = [\n    \"O   0.0000000000   0.0000000000   0.0000000000\",\n    \"H   0.7586020000   0.0000000000   0.5042840000\",\n    \"H  -0.7586020000   0.0000000000   0.5042840000\",\n]\n"
+            "[ctrl]\nprint_level = 0\nxc = \"hf\"\nbasis_path = \"/home/cfh/rest_workspace/rest/basis-set-pool/{basis_dir}\"\nbasis_type = \"Cartesian\"\nuse_auxbas = false\neven_tempered_basis = false\ncharge = 0.0\nspin = 1.0\nspin_polarization = false\nnum_threads = {num_threads}\nrun_lib_rint = false\n\n[geom]\nname = \"H2O\"\nunit = \"angstrom\"\nposition = [\n    \"O   0.0000000000   0.0000000000   0.0000000000\",\n    \"H   0.7586020000   0.0000000000   0.5042840000\",\n    \"H  -0.7586020000   0.0000000000   0.5042840000\",\n]\n"
         );
         fs::write(&path, text).unwrap();
         path
@@ -10412,16 +11438,68 @@ position = [
         let diagnose_mismatch = std::env::var("TMP_EXACT4C_DIAGNOSE_MISMATCH")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let max_nao = std::env::var("TMP_EXACT4C_MAX_NAO")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
+        let summary_path = std::env::var("TMP_EXACT4C_SUMMARY_FILE").ok();
+        if let Some(path) = &summary_path {
+            let _ = fs::remove_file(path);
+        }
+        let emit_summary_line = |line: String| {
+            println!("{line}");
+            if let Some(path) = &summary_path {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .expect("failed to open exact 4c benchmark summary file");
+                writeln!(file, "{line}").expect("failed to write exact 4c benchmark summary file");
+            }
+        };
 
         for (basis_name, ctrl_path) in cases {
-            let mol = Molecule::build(ctrl_path.clone(), None).unwrap();
-            let ao_shells = crate::lib_rint::basis::load_molecule_rint_shells_from_raw(
+            let mol = match std::panic::catch_unwind(|| Molecule::build(ctrl_path.clone(), None)) {
+                Ok(Ok(mol)) => mol,
+                Ok(Err(err)) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_SKIP basis={basis_name} reason=build_failed detail={err:?}"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+                Err(_) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_SKIP basis={basis_name} reason=build_panicked"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+            };
+            let ao_shells = match crate::lib_rint::basis::load_molecule_rint_shells_from_raw(
                 &mol.geom,
                 &mol.basis4elem,
-            )
-            .expect("failed to build AO rint shells");
+            ) {
+                Ok(shells) => shells,
+                Err(err) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_SKIP basis={basis_name} reason=rint_shell_load_failed detail={err:?}"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+            };
             let nao = ao_shells.iter().map(|shell| shell.ao_len).sum::<usize>();
             let full_nint = nao * nao * nao * nao;
+            if max_nao.is_some_and(|limit| nao > limit) {
+                emit_summary_line(format!(
+                    "TMP_EXACT4C_SKIP basis={basis_name} reason=max_nao_exceeded nao={nao} nshell={} full_nint={full_nint} max_nao={}",
+                    ao_shells.len(),
+                    max_nao.unwrap()
+                ));
+                let _ = fs::remove_file(ctrl_path);
+                continue;
+            }
 
             if profile_shells {
                 let shell_coeffs = build_rint_shell_coefficient_cache(&ao_shells);
@@ -10686,7 +11764,7 @@ position = [
                     );
                 }
             }
-            println!(
+            emit_summary_line(format!(
                 "TMP_EXACT4C_LIBCINT_BENCH basis={basis_name} mode={mode} nao={nao} nshell={} full_nint={full_nint} repeat={repeat} libcint_direct_s={:.6} lib_rint_shell_s={:.6} lib_rint_over_libcint={:.3} libcint_over_lib_rint={:.3} max_abs={:.3e} max_rel_floor_1e-12={:.3e} checksum_libcint={:.12e} checksum_librint={:.12e}",
                 ao_shells.len(),
                 best_libcint,
@@ -10697,11 +11775,860 @@ position = [
                 max_rel,
                 libcint_checksum,
                 librint_checksum,
-            );
+            ));
             assert!(
                 max_abs <= 1.0e-8,
                 "exact 4c mismatch for {basis_name}: max_abs={max_abs:.3e}, max_rel={max_rel:.3e}"
             );
+
+            let _ = fs::remove_file(ctrl_path);
+        }
+    }
+
+    #[test]
+    #[ignore = "temporary exact 4c shell-block libcint vs lib_rint release benchmark"]
+    fn tmp_bench_exact4c_shell_blocks_libcint_vs_librint() {
+        use std::hint::black_box;
+
+        #[derive(Clone)]
+        struct Candidate {
+            a_idx: usize,
+            b_idx: usize,
+            c_idx: usize,
+            d_idx: usize,
+            key: [u32; 5],
+            primitive_quartets: usize,
+            block_values: usize,
+            cost: usize,
+        }
+
+        let cases_env =
+            std::env::var("TMP_EXACT4C_CASES").unwrap_or_else(|_| String::from("sto-3g"));
+        let cases = cases_env
+            .split(',')
+            .map(str::trim)
+            .filter(|case| !case.is_empty())
+            .map(|case| (case.to_string(), write_temp_ctrl_h2o(case)))
+            .collect::<Vec<_>>();
+        let repeat = std::env::var("TMP_EXACT4C_REPEAT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(10);
+        let max_groups = std::env::var("TMP_EXACT4C_SHELL_BENCH_GROUPS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(16);
+        let summary_path = std::env::var("TMP_EXACT4C_SUMMARY_FILE").ok();
+        if let Some(path) = &summary_path {
+            let _ = fs::remove_file(path);
+        }
+        let emit_summary_line = |line: String| {
+            println!("{line}");
+            if let Some(path) = &summary_path {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .expect("failed to open exact 4c shell benchmark summary file");
+                writeln!(file, "{line}")
+                    .expect("failed to write exact 4c shell benchmark summary file");
+            }
+        };
+
+        for (basis_name, ctrl_path) in cases {
+            let mol = match std::panic::catch_unwind(|| Molecule::build(ctrl_path.clone(), None)) {
+                Ok(Ok(mol)) => mol,
+                Ok(Err(err)) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_SHELL_SKIP basis={basis_name} reason=build_failed detail={err:?}"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+                Err(_) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_SHELL_SKIP basis={basis_name} reason=build_panicked"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+            };
+            let ao_shells = match crate::lib_rint::basis::load_molecule_rint_shells_from_raw(
+                &mol.geom,
+                &mol.basis4elem,
+            ) {
+                Ok(shells) => shells,
+                Err(err) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_SHELL_SKIP basis={basis_name} reason=rint_shell_load_failed detail={err:?}"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+            };
+
+            let shell_coeffs = build_rint_shell_coefficient_cache(&ao_shells);
+            let primitive_pair_cache =
+                build_shell_pair_primitive_pair_cache(&ao_shells, &shell_coeffs);
+            let mut by_key = std::collections::HashMap::<[u32; 5], Candidate>::new();
+            for (a_idx, b_idx, c_idx, d_idx) in build_unique_4c_shell_quartet_tasks(&ao_shells) {
+                let a_shell = &ao_shells[a_idx];
+                let b_shell = &ao_shells[b_idx];
+                let c_shell = &ao_shells[c_idx];
+                let d_shell = &ao_shells[d_idx];
+                let key = [
+                    a_shell.shell.ang_type,
+                    b_shell.shell.ang_type,
+                    c_shell.shell.ang_type,
+                    d_shell.shell.ang_type,
+                    (a_shell.shell.ang_type
+                        + b_shell.shell.ang_type
+                        + c_shell.shell.ang_type
+                        + d_shell.shell.ang_type)
+                        / 2
+                        + 1,
+                ];
+                let primitive_quartets = primitive_pair_cache[shell_pair_rank(a_idx, b_idx)].len()
+                    * primitive_pair_cache[shell_pair_rank(c_idx, d_idx)].len();
+                let block_values =
+                    a_shell.ao_len * b_shell.ao_len * c_shell.ao_len * d_shell.ao_len;
+                let cost = primitive_quartets * block_values;
+                let candidate = Candidate {
+                    a_idx,
+                    b_idx,
+                    c_idx,
+                    d_idx,
+                    key,
+                    primitive_quartets,
+                    block_values,
+                    cost,
+                };
+                by_key
+                    .entry(key)
+                    .and_modify(|current| {
+                        if candidate.cost > current.cost {
+                            *current = candidate.clone();
+                        }
+                    })
+                    .or_insert(candidate);
+            }
+
+            let mut candidates = by_key.into_values().collect::<Vec<_>>();
+            candidates.sort_by(|left, right| right.cost.cmp(&left.cost));
+            let mut selected = Vec::<Candidate>::new();
+            for candidate in candidates.iter().take(max_groups / 2 + max_groups % 2) {
+                selected.push(candidate.clone());
+            }
+            candidates.sort_by(|left, right| {
+                let left_l = left.key[0] + left.key[1] + left.key[2] + left.key[3];
+                let right_l = right.key[0] + right.key[1] + right.key[2] + right.key[3];
+                right_l
+                    .cmp(&left_l)
+                    .then_with(|| right.cost.cmp(&left.cost))
+            });
+            for candidate in candidates.iter().take(max_groups / 2) {
+                if !selected.iter().any(|item| item.key == candidate.key) {
+                    selected.push(candidate.clone());
+                }
+            }
+            selected.sort_by(|left, right| {
+                let left_l = left.key[0] + left.key[1] + left.key[2] + left.key[3];
+                let right_l = right.key[0] + right.key[1] + right.key[2] + right.key[3];
+                right_l
+                    .cmp(&left_l)
+                    .then_with(|| right.cost.cmp(&left.cost))
+            });
+            selected.truncate(max_groups);
+
+            let mut cint_data = mol.initialize_cint(false);
+            cint_data.cint2e_optimizer_rust();
+            let mut entries = Vec::new();
+            let mut block_data = Vec::new();
+            let mut workspace_cache =
+                std::collections::HashMap::<[u32; 4], RysTransferWorkspace4c>::new();
+            let mut rint_to_cint_shell = vec![None; ao_shells.len()];
+            for (rint_idx, shell) in ao_shells.iter().enumerate() {
+                rint_to_cint_shell[rint_idx] =
+                    mol.cint_fdqc
+                        .iter()
+                        .enumerate()
+                        .find_map(|(cint_idx, shell_range)| {
+                            (shell_range[0] == shell.ao_start && shell_range[1] == shell.ao_len)
+                                .then_some(cint_idx)
+                        });
+            }
+            let mut total_libcint = 0.0_f64;
+            let mut total_librint = 0.0_f64;
+            let mut total_values = 0_usize;
+            let mut total_primitive_quartets = 0_usize;
+            let mut usable_blocks = 0_usize;
+            let mut max_abs = 0.0_f64;
+            let mut max_rel = 0.0_f64;
+            let mut lmax = 0_u32;
+            let mut max_nroots = 0_u32;
+
+            for (rank, candidate) in selected.iter().enumerate() {
+                let a_shell = &ao_shells[candidate.a_idx];
+                let b_shell = &ao_shells[candidate.b_idx];
+                let c_shell = &ao_shells[candidate.c_idx];
+                let d_shell = &ao_shells[candidate.d_idx];
+                let Some(cint_a_idx) = rint_to_cint_shell[candidate.a_idx] else {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_SHELL_BLOCK_SKIP basis={basis_name} rank={} shls=({},{},{},{}) l=({},{},{},{}) nroots={} reason=missing_cint_shell_map",
+                        rank + 1,
+                        candidate.a_idx,
+                        candidate.b_idx,
+                        candidate.c_idx,
+                        candidate.d_idx,
+                        candidate.key[0],
+                        candidate.key[1],
+                        candidate.key[2],
+                        candidate.key[3],
+                        candidate.key[4],
+                    ));
+                    continue;
+                };
+                let Some(cint_b_idx) = rint_to_cint_shell[candidate.b_idx] else {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_SHELL_BLOCK_SKIP basis={basis_name} rank={} shls=({},{},{},{}) l=({},{},{},{}) nroots={} reason=missing_cint_shell_map",
+                        rank + 1,
+                        candidate.a_idx,
+                        candidate.b_idx,
+                        candidate.c_idx,
+                        candidate.d_idx,
+                        candidate.key[0],
+                        candidate.key[1],
+                        candidate.key[2],
+                        candidate.key[3],
+                        candidate.key[4],
+                    ));
+                    continue;
+                };
+                let Some(cint_c_idx) = rint_to_cint_shell[candidate.c_idx] else {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_SHELL_BLOCK_SKIP basis={basis_name} rank={} shls=({},{},{},{}) l=({},{},{},{}) nroots={} reason=missing_cint_shell_map",
+                        rank + 1,
+                        candidate.a_idx,
+                        candidate.b_idx,
+                        candidate.c_idx,
+                        candidate.d_idx,
+                        candidate.key[0],
+                        candidate.key[1],
+                        candidate.key[2],
+                        candidate.key[3],
+                        candidate.key[4],
+                    ));
+                    continue;
+                };
+                let Some(cint_d_idx) = rint_to_cint_shell[candidate.d_idx] else {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_SHELL_BLOCK_SKIP basis={basis_name} rank={} shls=({},{},{},{}) l=({},{},{},{}) nroots={} reason=missing_cint_shell_map",
+                        rank + 1,
+                        candidate.a_idx,
+                        candidate.b_idx,
+                        candidate.c_idx,
+                        candidate.d_idx,
+                        candidate.key[0],
+                        candidate.key[1],
+                        candidate.key[2],
+                        candidate.key[3],
+                        candidate.key[4],
+                    ));
+                    continue;
+                };
+                let ab_pairs =
+                    &primitive_pair_cache[shell_pair_rank(candidate.a_idx, candidate.b_idx)];
+                let cd_pairs =
+                    &primitive_pair_cache[shell_pair_rank(candidate.c_idx, candidate.d_idx)];
+                let workspace_key = [
+                    a_shell.shell.ang_type + b_shell.shell.ang_type,
+                    b_shell.shell.ang_type,
+                    c_shell.shell.ang_type + d_shell.shell.ang_type,
+                    d_shell.shell.ang_type,
+                ];
+                let workspace = workspace_cache.entry(workspace_key).or_insert_with(|| {
+                    RysTransferWorkspace4c::new(
+                        workspace_key[0],
+                        workspace_key[1],
+                        workspace_key[2],
+                        workspace_key[3],
+                    )
+                });
+
+                let mut best_librint = f64::INFINITY;
+                let mut best_libcint = f64::INFINITY;
+                for _ in 0..repeat {
+                    let t0 = Instant::now();
+                    let shape = int4c_r_shell_block_batched_into_data_with_pairs_workspace_entries(
+                        a_shell,
+                        b_shell,
+                        c_shell,
+                        d_shell,
+                        ab_pairs,
+                        cd_pairs,
+                        &mut entries,
+                        &mut block_data,
+                        workspace,
+                    );
+                    best_librint = best_librint.min(t0.elapsed().as_secs_f64());
+                    black_box(shape);
+                    black_box(&block_data);
+
+                    let t0 = Instant::now();
+                    let libcint_buf = cint_data.cint_ijkl_by_shell(
+                        cint_a_idx as i32,
+                        cint_b_idx as i32,
+                        cint_c_idx as i32,
+                        cint_d_idx as i32,
+                    );
+                    best_libcint = best_libcint.min(t0.elapsed().as_secs_f64());
+                    black_box(&libcint_buf);
+                }
+
+                let shape = int4c_r_shell_block_batched_into_data_with_pairs_workspace_entries(
+                    a_shell,
+                    b_shell,
+                    c_shell,
+                    d_shell,
+                    ab_pairs,
+                    cd_pairs,
+                    &mut entries,
+                    &mut block_data,
+                    workspace,
+                );
+                let libcint_buf = cint_data.cint_ijkl_by_shell(
+                    cint_a_idx as i32,
+                    cint_b_idx as i32,
+                    cint_c_idx as i32,
+                    cint_d_idx as i32,
+                );
+                if block_data.len() != libcint_buf.len() {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_SHELL_BLOCK_SKIP basis={basis_name} rank={} shls=({},{},{},{}) l=({},{},{},{}) nroots={} reason=libcint_shape_mismatch librint_len={} libcint_len={} shape={shape:?}",
+                        rank + 1,
+                        candidate.a_idx,
+                        candidate.b_idx,
+                        candidate.c_idx,
+                        candidate.d_idx,
+                        candidate.key[0],
+                        candidate.key[1],
+                        candidate.key[2],
+                        candidate.key[3],
+                        candidate.key[4],
+                        block_data.len(),
+                        libcint_buf.len(),
+                    ));
+                    continue;
+                }
+                let mut block_max_abs = 0.0_f64;
+                let mut block_max_rel = 0.0_f64;
+                for (got, expect) in block_data.iter().zip(libcint_buf.iter()) {
+                    let abs = (*got - *expect).abs();
+                    let rel = abs / expect.abs().max(1.0e-12);
+                    block_max_abs = block_max_abs.max(abs);
+                    block_max_rel = block_max_rel.max(rel);
+                }
+                max_abs = max_abs.max(block_max_abs);
+                max_rel = max_rel.max(block_max_rel);
+                total_libcint += best_libcint;
+                total_librint += best_librint;
+                total_values += candidate.block_values;
+                total_primitive_quartets += candidate.primitive_quartets;
+                usable_blocks += 1;
+                lmax = lmax.max(
+                    candidate.key[0]
+                        .max(candidate.key[1])
+                        .max(candidate.key[2])
+                        .max(candidate.key[3]),
+                );
+                max_nroots = max_nroots.max(candidate.key[4]);
+
+                emit_summary_line(format!(
+                    "TMP_EXACT4C_SHELL_BENCH_DETAIL basis={basis_name} rank={} shls=({},{},{},{}) l=({},{},{},{}) nroots={} primitive_quartets={} block_values={} repeat={repeat} libcint_shell_s={:.9} lib_rint_shell_s={:.9} lib_rint_over_libcint={:.3} flat_max_abs={:.3e} flat_max_rel_floor_1e-12={:.3e}",
+                    rank + 1,
+                    candidate.a_idx,
+                    candidate.b_idx,
+                    candidate.c_idx,
+                    candidate.d_idx,
+                    candidate.key[0],
+                    candidate.key[1],
+                    candidate.key[2],
+                    candidate.key[3],
+                    candidate.key[4],
+                    candidate.primitive_quartets,
+                    candidate.block_values,
+                    best_libcint,
+                    best_librint,
+                    best_librint / best_libcint.max(1.0e-12),
+                    block_max_abs,
+                    block_max_rel,
+                ));
+            }
+
+            cint_data.final_c2r();
+            emit_summary_line(format!(
+                "TMP_EXACT4C_SHELL_BENCH_SUMMARY basis={basis_name} selected={} usable={} nao={} nshell={} lmax={} max_nroots={} total_primitive_quartets={} total_block_values={} repeat={repeat} libcint_shell_s={:.9} lib_rint_shell_s={:.9} lib_rint_over_libcint={:.3} libcint_over_lib_rint={:.3} flat_max_abs={:.3e} flat_max_rel_floor_1e-12={:.3e}",
+                selected.len(),
+                usable_blocks,
+                ao_shells.iter().map(|shell| shell.ao_len).sum::<usize>(),
+                ao_shells.len(),
+                lmax,
+                max_nroots,
+                total_primitive_quartets,
+                total_values,
+                total_libcint,
+                total_librint,
+                total_librint / total_libcint.max(1.0e-12),
+                total_libcint / total_librint.max(1.0e-12),
+                max_abs,
+                max_rel,
+            ));
+
+            let _ = fs::remove_file(ctrl_path);
+        }
+    }
+
+    #[test]
+    #[ignore = "temporary exact 4c all-shell streaming libcint vs lib_rint release benchmark"]
+    fn tmp_bench_exact4c_stream_all_shell_blocks_libcint_vs_librint() {
+        use std::hint::black_box;
+
+        let cases_env =
+            std::env::var("TMP_EXACT4C_CASES").unwrap_or_else(|_| String::from("sto-3g"));
+        let cases = cases_env
+            .split(',')
+            .map(str::trim)
+            .filter(|case| !case.is_empty())
+            .map(|case| (case.to_string(), write_temp_ctrl_h2o(case)))
+            .collect::<Vec<_>>();
+        let repeat = std::env::var("TMP_EXACT4C_REPEAT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        let summary_path = std::env::var("TMP_EXACT4C_SUMMARY_FILE").ok();
+        if let Some(path) = &summary_path {
+            let _ = fs::remove_file(path);
+        }
+        let emit_summary_line = |line: String| {
+            println!("{line}");
+            if let Some(path) = &summary_path {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .expect("failed to open exact 4c streaming benchmark summary file");
+                writeln!(file, "{line}")
+                    .expect("failed to write exact 4c streaming benchmark summary file");
+            }
+        };
+
+        for (basis_name, ctrl_path) in cases {
+            let mol = match std::panic::catch_unwind(|| Molecule::build(ctrl_path.clone(), None)) {
+                Ok(Ok(mol)) => mol,
+                Ok(Err(err)) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_STREAM_SKIP basis={basis_name} reason=build_failed detail={err:?}"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+                Err(_) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_STREAM_SKIP basis={basis_name} reason=build_panicked"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+            };
+            let ao_shells = match crate::lib_rint::basis::load_molecule_rint_shells_from_raw(
+                &mol.geom,
+                &mol.basis4elem,
+            ) {
+                Ok(shells) => shells,
+                Err(err) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_STREAM_SKIP basis={basis_name} reason=rint_shell_load_failed detail={err:?}"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+            };
+
+            let rint_tasks = build_unique_4c_shell_quartet_tasks(&ao_shells);
+            let shell_coeffs = build_rint_shell_coefficient_cache(&ao_shells);
+            let primitive_pair_cache =
+                build_shell_pair_primitive_pair_cache(&ao_shells, &shell_coeffs);
+            let mut block_data = Vec::new();
+            let mut workspace_cache =
+                std::collections::HashMap::<[u32; 4], RysTransferWorkspace4c>::new();
+            let mut plan_cache =
+                std::collections::HashMap::<[u32; 4], Rint4cCachedBlockPlan>::new();
+
+            let mut best_librint = f64::INFINITY;
+            let mut librint_checksum = 0.0_f64;
+            let mut librint_block_values = 0_usize;
+            let mut librint_primitive_quartets = 0_usize;
+            let mut librint_lmax = 0_u32;
+            let mut librint_max_nroots = 0_u32;
+            for _ in 0..repeat {
+                let t0 = Instant::now();
+                let mut checksum = 0.0_f64;
+                let mut block_values = 0_usize;
+                let mut primitive_quartets = 0_usize;
+                let mut lmax = 0_u32;
+                let mut max_nroots = 0_u32;
+                for &(a_idx, b_idx, c_idx, d_idx) in &rint_tasks {
+                    let a_shell = &ao_shells[a_idx];
+                    let b_shell = &ao_shells[b_idx];
+                    let c_shell = &ao_shells[c_idx];
+                    let d_shell = &ao_shells[d_idx];
+                    let ab_pairs = &primitive_pair_cache[shell_pair_rank(a_idx, b_idx)];
+                    let cd_pairs = &primitive_pair_cache[shell_pair_rank(c_idx, d_idx)];
+                    let workspace_key = [
+                        a_shell.shell.ang_type + b_shell.shell.ang_type,
+                        b_shell.shell.ang_type,
+                        c_shell.shell.ang_type + d_shell.shell.ang_type,
+                        d_shell.shell.ang_type,
+                    ];
+                    let workspace = workspace_cache.entry(workspace_key).or_insert_with(|| {
+                        RysTransferWorkspace4c::new(
+                            workspace_key[0],
+                            workspace_key[1],
+                            workspace_key[2],
+                            workspace_key[3],
+                        )
+                    });
+                    let shape = int4c_r_shell_block_batched_into_data_with_pairs_entry_cache(
+                        a_shell,
+                        b_shell,
+                        c_shell,
+                        d_shell,
+                        ab_pairs,
+                        cd_pairs,
+                        &mut plan_cache,
+                        &mut block_data,
+                        workspace,
+                    );
+                    checksum += block_data
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, value)| *value * ((idx % 17 + 1) as f64))
+                        .sum::<f64>();
+                    block_values += shape[0] * shape[1];
+                    primitive_quartets += ab_pairs.len() * cd_pairs.len();
+                    lmax = lmax.max(
+                        a_shell
+                            .shell
+                            .ang_type
+                            .max(b_shell.shell.ang_type)
+                            .max(c_shell.shell.ang_type)
+                            .max(d_shell.shell.ang_type),
+                    );
+                    max_nroots = max_nroots.max(
+                        (a_shell.shell.ang_type
+                            + b_shell.shell.ang_type
+                            + c_shell.shell.ang_type
+                            + d_shell.shell.ang_type)
+                            / 2
+                            + 1,
+                    );
+                }
+                let seconds = t0.elapsed().as_secs_f64();
+                if seconds < best_librint {
+                    best_librint = seconds;
+                    librint_checksum = checksum;
+                    librint_block_values = block_values;
+                    librint_primitive_quartets = primitive_quartets;
+                    librint_lmax = lmax;
+                    librint_max_nroots = max_nroots;
+                }
+                black_box(librint_checksum);
+            }
+
+            let cint_shell_count = mol.cint_fdqc.len();
+            let mut best_libcint = f64::INFINITY;
+            let mut libcint_checksum = 0.0_f64;
+            let mut libcint_block_values = 0_usize;
+            let mut libcint_tasks = 0_usize;
+            let mut cint_data = mol.initialize_cint(false);
+            cint_data.cint2e_optimizer_rust();
+            for _ in 0..repeat {
+                let t0 = Instant::now();
+                let mut checksum = 0.0_f64;
+                let mut block_values = 0_usize;
+                let mut tasks = 0_usize;
+                for a_idx in 0..cint_shell_count {
+                    for b_idx in 0..=a_idx {
+                        let ab_rank = shell_pair_rank(a_idx, b_idx);
+                        for c_idx in 0..cint_shell_count {
+                            for d_idx in 0..=c_idx {
+                                if shell_pair_rank(c_idx, d_idx) <= ab_rank {
+                                    let block = cint_data.cint_ijkl_by_shell(
+                                        a_idx as i32,
+                                        b_idx as i32,
+                                        c_idx as i32,
+                                        d_idx as i32,
+                                    );
+                                    checksum += block
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(idx, value)| *value * ((idx % 17 + 1) as f64))
+                                        .sum::<f64>();
+                                    block_values += block.len();
+                                    tasks += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                let seconds = t0.elapsed().as_secs_f64();
+                if seconds < best_libcint {
+                    best_libcint = seconds;
+                    libcint_checksum = checksum;
+                    libcint_block_values = block_values;
+                    libcint_tasks = tasks;
+                }
+                black_box(libcint_checksum);
+            }
+            cint_data.final_c2r();
+
+            emit_summary_line(format!(
+                "TMP_EXACT4C_STREAM_BENCH basis={basis_name} repeat={repeat} nao={} rint_nshell={} cint_nshell={} rint_tasks={} libcint_tasks={} lmax={} max_nroots={} rint_primitive_quartets={} rint_block_values={} libcint_block_values={} libcint_stream_s={:.6} lib_rint_stream_s={:.6} lib_rint_over_libcint={:.3} libcint_over_lib_rint={:.3} checksum_libcint={:.12e} checksum_librint={:.12e}",
+                ao_shells.iter().map(|shell| shell.ao_len).sum::<usize>(),
+                ao_shells.len(),
+                cint_shell_count,
+                rint_tasks.len(),
+                libcint_tasks,
+                librint_lmax,
+                librint_max_nroots,
+                librint_primitive_quartets,
+                librint_block_values,
+                libcint_block_values,
+                best_libcint,
+                best_librint,
+                best_librint / best_libcint.max(1.0e-12),
+                best_libcint / best_librint.max(1.0e-12),
+                libcint_checksum,
+                librint_checksum,
+            ));
+
+            let _ = fs::remove_file(ctrl_path);
+        }
+    }
+
+    #[test]
+    #[ignore = "temporary exact 4c merged-shell all-shell streaming libcint vs lib_rint benchmark"]
+    fn tmp_bench_exact4c_stream_merged_shell_blocks_libcint_vs_librint() {
+        use std::hint::black_box;
+
+        let cases_env =
+            std::env::var("TMP_EXACT4C_CASES").unwrap_or_else(|_| String::from("sto-3g"));
+        let cases = cases_env
+            .split(',')
+            .map(str::trim)
+            .filter(|case| !case.is_empty())
+            .map(|case| (case.to_string(), write_temp_ctrl_h2o(case)))
+            .collect::<Vec<_>>();
+        let repeat = std::env::var("TMP_EXACT4C_REPEAT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        let summary_path = std::env::var("TMP_EXACT4C_SUMMARY_FILE").ok();
+        if let Some(path) = &summary_path {
+            let _ = fs::remove_file(path);
+        }
+        let emit_summary_line = |line: String| {
+            println!("{line}");
+            if let Some(path) = &summary_path {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .expect("failed to open exact 4c merged streaming benchmark summary file");
+                writeln!(file, "{line}")
+                    .expect("failed to write exact 4c merged streaming benchmark summary file");
+            }
+        };
+
+        for (basis_name, ctrl_path) in cases {
+            let mol = match std::panic::catch_unwind(|| Molecule::build(ctrl_path.clone(), None)) {
+                Ok(Ok(mol)) => mol,
+                Ok(Err(err)) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_MERGED_STREAM_SKIP basis={basis_name} reason=build_failed detail={err:?}"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+                Err(_) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_MERGED_STREAM_SKIP basis={basis_name} reason=build_panicked"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+            };
+            let ao_shells = match crate::lib_rint::basis::load_molecule_rint_shells_from_raw(
+                &mol.geom,
+                &mol.basis4elem,
+            ) {
+                Ok(shells) => shells,
+                Err(err) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_MERGED_STREAM_SKIP basis={basis_name} reason=rint_shell_load_failed detail={err:?}"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+            };
+            let merged_groups = build_merged_shell_groups_for_direct(&ao_shells);
+            let merged_tasks = build_unique_4c_merged_shell_quartet_tasks(&merged_groups);
+            let shell_coeffs = build_rint_shell_coefficient_cache(&ao_shells);
+            let primitive_pair_cache =
+                build_shell_pair_primitive_pair_cache(&ao_shells, &shell_coeffs);
+            let mut block_data = Vec::new();
+            let mut split_data = Vec::new();
+            let mut workspace_cache =
+                std::collections::HashMap::<[u32; 4], RysTransferWorkspace4c>::new();
+            let mut plan_cache =
+                std::collections::HashMap::<[u32; 4], Rint4cCachedBlockPlan>::new();
+
+            let mut best_librint = f64::INFINITY;
+            let mut librint_checksum = 0.0_f64;
+            let mut librint_block_values = 0_usize;
+            let mut librint_split_subblocks = 0_usize;
+            let mut librint_lmax = 0_u32;
+            let mut librint_max_nroots = 0_u32;
+            for _ in 0..repeat {
+                let t0 = Instant::now();
+                let mut checksum = 0.0_f64;
+                let mut block_values = 0_usize;
+                let mut split_subblocks = 0_usize;
+                let mut lmax = 0_u32;
+                let mut max_nroots = 0_u32;
+                for &(a_idx, b_idx, c_idx, d_idx) in &merged_tasks {
+                    let a_group = &merged_groups[a_idx];
+                    let b_group = &merged_groups[b_idx];
+                    let c_group = &merged_groups[c_idx];
+                    let d_group = &merged_groups[d_idx];
+                    let shape = int4c_r_merged_shell_block_batched_into_data_with_split_kernel(
+                        &ao_shells,
+                        a_group,
+                        b_group,
+                        c_group,
+                        d_group,
+                        &primitive_pair_cache,
+                        &mut plan_cache,
+                        &mut workspace_cache,
+                        &mut block_data,
+                        &mut split_data,
+                    );
+                    checksum += block_data
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, value)| *value * ((idx % 17 + 1) as f64))
+                        .sum::<f64>();
+                    block_values += shape[0] * shape[1];
+                    split_subblocks += a_group.shell_indices.len()
+                        * b_group.shell_indices.len()
+                        * c_group.shell_indices.len()
+                        * d_group.shell_indices.len();
+                    lmax = lmax.max(
+                        a_group
+                            .ang_type
+                            .max(b_group.ang_type)
+                            .max(c_group.ang_type)
+                            .max(d_group.ang_type),
+                    );
+                    max_nroots = max_nroots.max(
+                        (a_group.ang_type + b_group.ang_type + c_group.ang_type + d_group.ang_type)
+                            / 2
+                            + 1,
+                    );
+                }
+                let seconds = t0.elapsed().as_secs_f64();
+                if seconds < best_librint {
+                    best_librint = seconds;
+                    librint_checksum = checksum;
+                    librint_block_values = block_values;
+                    librint_split_subblocks = split_subblocks;
+                    librint_lmax = lmax;
+                    librint_max_nroots = max_nroots;
+                }
+                black_box(librint_checksum);
+            }
+
+            let cint_shell_count = mol.cint_fdqc.len();
+            let mut best_libcint = f64::INFINITY;
+            let mut libcint_checksum = 0.0_f64;
+            let mut libcint_block_values = 0_usize;
+            let mut libcint_tasks = 0_usize;
+            let mut cint_data = mol.initialize_cint(false);
+            cint_data.cint2e_optimizer_rust();
+            for _ in 0..repeat {
+                let t0 = Instant::now();
+                let mut checksum = 0.0_f64;
+                let mut block_values = 0_usize;
+                let mut tasks = 0_usize;
+                for a_idx in 0..cint_shell_count {
+                    for b_idx in 0..=a_idx {
+                        let ab_rank = shell_pair_rank(a_idx, b_idx);
+                        for c_idx in 0..cint_shell_count {
+                            for d_idx in 0..=c_idx {
+                                if shell_pair_rank(c_idx, d_idx) <= ab_rank {
+                                    let block = cint_data.cint_ijkl_by_shell(
+                                        a_idx as i32,
+                                        b_idx as i32,
+                                        c_idx as i32,
+                                        d_idx as i32,
+                                    );
+                                    checksum += block
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(idx, value)| *value * ((idx % 17 + 1) as f64))
+                                        .sum::<f64>();
+                                    block_values += block.len();
+                                    tasks += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                let seconds = t0.elapsed().as_secs_f64();
+                if seconds < best_libcint {
+                    best_libcint = seconds;
+                    libcint_checksum = checksum;
+                    libcint_block_values = block_values;
+                    libcint_tasks = tasks;
+                }
+                black_box(libcint_checksum);
+            }
+            cint_data.final_c2r();
+
+            emit_summary_line(format!(
+                "TMP_EXACT4C_MERGED_STREAM_BENCH basis={basis_name} repeat={repeat} nao={} rint_nshell={} merged_nshell={} cint_nshell={} merged_tasks={} libcint_tasks={} split_subblocks={} lmax={} max_nroots={} merged_block_values={} libcint_block_values={} libcint_stream_s={:.6} lib_rint_merged_stream_s={:.6} lib_rint_over_libcint={:.3} libcint_over_lib_rint={:.3} checksum_libcint={:.12e} checksum_librint={:.12e}",
+                ao_shells.iter().map(|shell| shell.ao_len).sum::<usize>(),
+                ao_shells.len(),
+                merged_groups.len(),
+                cint_shell_count,
+                merged_tasks.len(),
+                libcint_tasks,
+                librint_split_subblocks,
+                librint_lmax,
+                librint_max_nroots,
+                librint_block_values,
+                libcint_block_values,
+                best_libcint,
+                best_librint,
+                best_librint / best_libcint.max(1.0e-12),
+                best_libcint / best_librint.max(1.0e-12),
+                libcint_checksum,
+                librint_checksum,
+            ));
 
             let _ = fs::remove_file(ctrl_path);
         }
