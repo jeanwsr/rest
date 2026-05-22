@@ -110,10 +110,11 @@ pub fn gen_vind_opt(
     let k_full = compute_k_upper(scf, &dm_vec).to_matrixfull()
         .unwrap_or_else(|| panic!("K to_matrixfull failed"));
 
-    // ── Step 3: v_ao = J - 0.5*K ──
+    // ── Step 3: v_ao = J - hyb*K ──
+    let hyb = scf.mol.xc_data.dfa_hybrid_scf;
     let mut v_ao = MatrixFull::new([nao, nao], 0.0);
     for i in 0..nao { for j in 0..nao {
-        v_ao[[i, j]] = j_full[[i, j]] - 0.5 * k_full[[i, j]];
+        v_ao[[i, j]] = j_full[[i, j]] - hyb * k_full[[i, j]];
     }}
 
     // ── Step 4: fxc contribution ──

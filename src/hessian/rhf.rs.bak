@@ -1,0 +1,189 @@
+use crate::scf_io;
+use crate::scf_io::SCF;
+use crate::Molecule;
+use num_traits::ToPrimitive;
+use rest_libcint::prelude::*;
+use rest_libcint_wrapper::*;
+use rstsr::prelude::*;
+use std::collections::HashMap;
+use tensors::MatrixFull;
+
+type Tsr<T> = Tensor<T, DeviceBLAS, IxD>;
+type TsrView<'a, T> = TensorView<'a, T, DeviceBLAS, IxD>;
+
+#[non_exhaustive]
+#[derive(derive_builder::Builder)]
+pub struct RIRHFHessianFlags {
+    #[builder(default = 0)]
+    pub print_level: usize,
+
+    #[builder(default = "None")]
+    pub max_memory: Option<f64>,
+
+    #[builder(default = true)]
+    pub auxbasis_response: bool,
+
+    #[builder(default = "Some(1.0)")]
+    pub factor_j: Option<f64>,
+
+    #[builder(default = "Some(1.0)")]
+    pub factor_k: Option<f64>,
+
+    /// Include CP-HF contribution
+    #[builder(default = false)]
+    pub with_cphf: bool,
+}
+
+pub struct RIRHFHessian<'a> {
+    pub scf_data: &'a SCF,
+    pub flags: RIRHFHessianFlags,
+    pub result: HashMap<String, MatrixFull<f64>>,
+}
+
+impl RIRHFHessian<'_> {
+    pub fn new(scf_data: &SCF) -> RIRHFHessian<'_> {
+        match scf_data.scftype {
+            scf_io::SCFType::RHF => {}
+            _ => panic!("SCF type is not suitable for RHF Hessian."),
+        }
+        RIRHFHessian {
+            scf_data,
+            flags: RIRHFHessianFlagsBuilder::default().build().unwrap(),
+            result: HashMap::new(),
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    //  e1 = -2·s1aa·dme0 - 2·s1ab·dme0 + hcore·dm0
+    // ─────────────────────────────────────────────
+    pub fn calc_e1(&mut self) -> &mut Self {
+        let scf = self.scf_data;
+        let mol = &scf.mol;
+        let natm = mol.geom.nfree;
+        let nao = mol.num_basis;
+
+        // Build CInt objects for the molecule
+        let cint_mol = mol.initialize_cint(false);
+
+        // ── Get dm0 and dme0 from SCF ──
+        let dm0_mat = &scf.density_matrix[0];
+        let dm0: Vec<f64> = dm0_mat.iter().copied().collect();
+
+        // MO data
+        let c = &scf.eigenvectors[0];
+        let eps = &scf.eigenvalues[0];
+        let occ = &scf.occupation[0];
+        let nocc = (scf.homo[0] + 1) as usize;
+
+        let mut dme0 = vec![0.0; nao * nao];
+        for p in 0..nao {
+            for q in 0..nao {
+                let mut s = 0.0;
+                for i in 0..nocc {
+                    s += c[[p, i]] * occ[i] as f64 * eps[i] * c[[q, i]];
+                }
+                dme0[p * nao + q] = s * 2.0;
+            }
+        }
+
+        let aoslices = mol.aoslice_by_atom();
+        let mut e1 = vec![0.0; natm * 3 * natm * 3];
+
+        // ── TODO: implement proper e1 computation via rest_libcint ──
+        // This requires:
+        // 1. int1e_ipipovlp for s1aa (diag overlap blocks)
+        // 2. int1e_ipovlpip for s1ab (full overlap)
+        // 3. hcore_deriv generator using int1e_ipiprinv + rinv_at_nucleus
+        // These integrals and the complex hcore_deriv logic from PySCF
+        // will be implemented in P2 full implementation
+
+        self.result
+            .insert("e1".to_string(), MatrixFull::from_vec([natm * 3, natm * 3], e1.clone()).unwrap());
+        let e1_mat = MatrixFull::from_vec([natm * 3, natm * 3], e1).unwrap();
+        self.result.insert("e1_mat".to_string(), e1_mat);
+
+        self
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod debug {
+    use super::*;
+
+    #[test]
+    fn test_e1_h2_sto3g() {
+        let input_token = r##"
+[ctrl]
+xc = "hf"
+basis_path = "basis-set-pool/sto-3g"
+basis_type = "spheric"
+charge = 0.0
+spin = 1.0
+num_threads = 1
+print_level = 0
+[geom]
+name = "H2"
+unit = "Angstrom"
+position = """
+    H   0.0  0.0  0.0
+    H   0.0  0.0  0.76
+"""
+"##;
+        let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
+        let (ctrl, geom) = crate::ctrl_io::parse_ctl_from_json(&keys).unwrap();
+        let mol = Molecule::build_native(ctrl, geom, None).unwrap();
+        let nao = mol.num_basis; let natm = mol.geom.nfree;
+        let cint_mol = mol.initialize_cint(false);
+        let aoslices = mol.aoslice_by_atom();
+
+        // dm0, dme0 from PySCF RHF/STO-3G
+        let d = 0.60723691_f64; let e = -0.34634532_f64;
+        let dm0 = vec![d,d,d,d]; let dme0 = vec![e,e,e,e];
+
+        // 1-e integrals via rest_libcint (row-major: [9, nao, nao])
+        let (ovlp_aa,_)=cint_mol.integrate_row_major("int1e_ipipovlp","s1",None).into();
+        let (ovlp_ab,_)=cint_mol.integrate_row_major("int1e_ipovlpip","s1",None).into();
+        let (k_aa,_)=cint_mol.integrate_row_major("int1e_ipipkin","s1",None).into();
+        let (n_aa,_)=cint_mol.integrate_row_major("int1e_ipipnucip","s1",None).into();
+        let (k_ab,_)=cint_mol.integrate_row_major("int1e_ipkinip","s1",None).into();
+        let (n_ab,_)=cint_mol.integrate_row_major("int1e_ipnucip","s1",None).into();
+
+        // Compute e1 = -2*s1aa - 2*s1ab_blocks + hcore_blocks
+        let mut e1 = vec![0.0; natm*3*natm*3];
+        for ia in 0..natm {
+            let p0 = aoslices[ia][2]; let ni = aoslices[ia][3]-p0;
+            // s1aa: int1e_ipipovlp, full col range, both derivs on bra atom
+            for x in 0..3 { for y in 0..3 {
+                let mut s=0.0; for p in 0..ni { for q in 0..nao {
+                    s += ovlp_aa[(x*3+y)*nao*nao+(p0+p)*nao+q] * dme0[(p0+p)*nao+q]; }}
+                e1[(ia*3+y)*natm*3+ia*3+x] -= s*2.0;
+            }}
+            for ja in 0..=ia {
+                let q0 = aoslices[ja][2]; let qj = aoslices[ja][3]-q0;
+                // s1ab: int1e_ipovlpip, block (p0:ni, q0:qj)
+                for x in 0..3 { for y in 0..3 {
+                    let mut s1=0.0; for p in 0..ni { for q in 0..qj {
+                        let idx=(x*3+y)*nao*nao+(p0+p)*nao+(q0+q);
+                        s1 += ovlp_ab[idx]*dme0[(p0+p)*nao+(q0+q)]; }}
+                    e1[(ja*3+y)*natm*3+ia*3+x] -= s1*2.0;
+                }}
+            }
+        }
+        // Symmetrize
+        for ia in 0..natm { for ja in 0..ia { for x in 0..3 { for y in 0..3 {
+            e1[(ja*3+x)*natm*3+ia*3+y] = e1[(ia*3+y)*natm*3+ja*3+x];
+        }}}}
+        let em = MatrixFull::from_vec([natm*3,natm*3],e1).unwrap();
+        println!("e1 overlap-only [6x6]:");
+        for i in 0..6 { for j in 0..6 { print!("{:10.6}",em[[i,j]]); } println!(); }
+
+        // Reference overlap contribution from PySCF:
+        // s1aa+s1ab[0,0] = (-0.166534, -0.166534, 0.021073)
+        let tol=1e-5;
+        assert!((em[[0,0]]--0.166534).abs()<tol,"s1aa 00xx");
+        assert!((em[[1,1]]--0.166534).abs()<tol,"s1aa 00yy");
+        assert!((em[[2,2]]-0.021073).abs()<tol,"s1aa 00zz");
+        println!("PASS: overlap contribution matches PySCF");
+    }
+}

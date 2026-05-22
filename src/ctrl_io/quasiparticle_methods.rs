@@ -101,6 +101,8 @@ pub struct QuasiParticle {
     pub bse_feast_init_guess_type: String,
     // Gaussian width = (step * width_factor)²  (default 0.5 → half-spacing)
     pub bse_feast_gaussian_width_factor: f64,
+    // Number of Gauss-Legendre quadrature points for contour integration (default 8)
+    pub bse_feast_n_quad: usize,
     // NLFEAST (nonlinear BSE) control parameters
     pub nonlinear_bse: bool,
     pub nlfeast_centre: f64,
@@ -208,6 +210,7 @@ impl Default for QuasiParticle {
             bse_feast_gmres_max_iter: 500,
             bse_feast_init_guess_type: String::from("random"),
             bse_feast_gaussian_width_factor: 0.5,
+            bse_feast_n_quad: 8,
             nonlinear_bse: false,
             nlfeast_centre: 0.0,
             nlfeast_radius: 0.5,
@@ -314,6 +317,7 @@ impl QuasiParticle {
         table.insert("bse_feast_gmres_max_iter".to_string(), toml::Value::Integer(self.bse_feast_gmres_max_iter as i64));
         table.insert("bse_feast_init_guess_type".to_string(), toml::Value::String(self.bse_feast_init_guess_type.clone()));
         table.insert("bse_feast_gaussian_width_factor".to_string(), toml::Value::Float(self.bse_feast_gaussian_width_factor));
+        table.insert("bse_feast_n_quad".to_string(), toml::Value::Integer(self.bse_feast_n_quad as i64));
         table.insert("damped_bse_solver".to_string(), toml::Value::String(self.damped_bse_solver.clone()));
         table.insert("damped_bse_tol".to_string(), toml::Value::Float(self.damped_bse_tol));
         table.insert("damped_bse_max_iter".to_string(), toml::Value::Integer(self.damped_bse_max_iter as i64));
@@ -701,6 +705,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.bse_feast_gaussian_width_factor = match tmp_ctrl.get("bse_feast_gaussian_width_factor").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.5),
                 _ => 0.5,
+            };
+            tmp_input.bse_feast_n_quad = match tmp_ctrl.get("bse_feast_n_quad").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(8) as usize,
+                _ => 8,
             };
             // Generate grids: OUTER LOOP X, MIDDLE LOOP Y, INNER LOOP Z
             let x_step = if tmp_input.damped_bse_x_points > 1 {
