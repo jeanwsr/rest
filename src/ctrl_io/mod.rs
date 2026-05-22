@@ -240,6 +240,8 @@ pub struct InputKeywords {
     pub check_stab: bool,
     #[pyo3(get, set)]
     pub use_dm_only: bool,
+    #[pyo3(get, set)]
+    pub vxc_screen_threshold: f64,
     pub algorithm_jk: AlgorithmJK,
     pub algorithm_j: AlgorithmJ,
     pub algorithm_k: AlgorithmK,
@@ -397,6 +399,7 @@ impl InputKeywords {
             // True:  using only density matrix in the evaluation
             // False: use coefficients as well with higher efficiency
             use_dm_only: false,
+            vxc_screen_threshold: 1.0e-15,
             algorithm_jk: AlgorithmJK::Default,
             algorithm_j: AlgorithmJ::Default,
             algorithm_k: AlgorithmK::Default,
@@ -1288,6 +1291,11 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
                 serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
                 other => false,
+            };
+            tmp_input.vxc_screen_threshold = match tmp_ctrl.get("vxc_screen_threshold").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-15),
+                serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-15),
+                _ => 1.0e-12,
             };
             // setup and sanity check of J/K algorithms
             tmp_input.algorithm_jk = tmp_ctrl.get("algorithm_jk").map(serde_from_value).unwrap_or_default();
