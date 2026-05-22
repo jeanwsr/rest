@@ -441,6 +441,9 @@ pub struct FXCMatvecData {
     /// LDA: vec[ngrids] = fxc[g] × w[g]
     /// GGA: vec[ngrids × 4 × 4] f-contiguous [g, α, β] = fxc[g,α,β] × w[g]
     pub wfxc: Vec<f64>,
+    /// If true, `fxc_matvec` will use the optimized implementation
+    /// (`fxc_matvec_opt`) instead of the original.
+    pub use_opt: bool,
 }
 
 /// Prepare FXCMatvecData from converged SCF object
@@ -604,18 +607,40 @@ pub fn prepare_fxc_data(scf: &SCF) -> FXCMatvecData {
         mo_occ_grad,
         mo_vir_grad,
         wfxc,
+        use_opt: scf.mol.ctrl.use_fxc_opt,
     }
 }
 
-/// Dispatch fxc matrix-vector product based on functional type
+/// Dispatch fxc matrix-vector product based on functional type.
+///
+/// When `data.use_opt` is `true`, the optimized implementation
+/// (`fxc_matvec_opt`) is used; otherwise the original (`fxc_matvec_old`)
+/// is used.
 pub fn fxc_matvec(data: &FXCMatvecData, z: &[f64]) -> Vec<f64> {
+    assert_eq!(z.len(), data.nocc * data.nvir,
+               "z vector length {} must equal nocc×nvir = {}×{}",
+               z.len(), data.nocc, data.nvir);
+    if data.use_opt {
+        let mut ws = prepare_fxc_workspace(data);
+        fxc_matvec_opt(data, z, &mut ws)
+    } else {
+        match data.nvar {
+            1 => fxc_matvec_lda(data, z),
+            4 => fxc_matvec_gga(data, z),
+            _ => panic!("fxc_matvec only supports LDA (nvar=1) and GGA (nvar=4)"),
+        }
+    }
+}
+
+/// Original fxc matrix-vector product (kept for reference).
+pub fn fxc_matvec_old(data: &FXCMatvecData, z: &[f64]) -> Vec<f64> {
     assert_eq!(z.len(), data.nocc * data.nvir,
                "z vector length {} must equal nocc×nvir = {}×{}",
                z.len(), data.nocc, data.nvir);
     match data.nvar {
         1 => fxc_matvec_lda(data, z),
         4 => fxc_matvec_gga(data, z),
-        _ => panic!("fxc_matvec only supports LDA (nvar=1) and GGA (nvar=4)"),
+        _ => panic!("fxc_matvec_old only supports LDA (nvar=1) and GGA (nvar=4)"),
     }
 }
 
@@ -768,6 +793,402 @@ fn fxc_matvec_gga(data: &FXCMatvecData, z: &[f64]) -> Vec<f64> {
     }
 
     result
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Optimized fxc_matvec with pre-allocated workspace and parallelism
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Key optimizations over the original:
+//   1. Pre-allocated workspace eliminates per-call heap allocations.
+//   2. z is copied (not cloned via to_vec()) into pre-allocated z_mat.
+//   3. GGA wfxc is packed [g][16] so the 4×4 kernel per grid point is
+//      contiguous in memory (eliminating MB-stride access).
+//   4. Rayon parallelism on independent loops (rho_z, 4×4 kernel,
+//      column-wise scaling).  The GEMMs remain handled by OpenBLAS.
+
+/// Pre-allocated workspace for `fxc_matvec_opt`.
+///
+/// All buffers are sized once at construction and reused across calls.
+#[derive(Debug)]
+pub struct FXCMatvecWorkspace {
+    /// z matrix [nocc, nvir] — avoids `z.to_vec()` allocation per call
+    pub z_mat: MatrixFull<f64>,
+    /// t = z_mat @ mo_vir [nocc, ngrids]
+    pub t: MatrixFull<f64>,
+    /// Density response: [ngrids] for LDA, [ngrids*4] for GGA
+    pub rho_z: Vec<f64>,
+    /// Scaled virtuals for LDA contraction [nvir, ngrids]
+    pub mo_vir_scaled: MatrixFull<f64>,
+    /// Result buffer [nocc * nvir]
+    pub result: Vec<f64>,
+
+    // GGA-specific:
+    /// t_grad[d] = z_mat @ mo_vir_grad[d]  [nocc, ngrids] each
+    pub t_grad: [MatrixFull<f64>; 3],
+    /// fxc kernel result on grids [ngrids * 4] — stored [g][α] (grid-major)
+    pub fxc_eff_grid: Vec<f64>,
+    /// right-scaled virtuals [nvir, ngrids]
+    pub right_scaled: MatrixFull<f64>,
+    /// right-scaled virtual gradients [nvir, ngrids]
+    pub right_grad_scaled: MatrixFull<f64>,
+    /// Packed wfxc [ngrids * 16]: each grid point's 4×4 kernel contiguous.
+    /// Derived from data.wfxc (strided [g,α,β] → packed [g][α][β]).
+    pub wfxc_packed: Option<Vec<f64>>,
+}
+
+/// Allocate workspace buffers sized for `data`.
+///
+/// For GGA this also pre-computes the packed wfxc layout.
+pub fn prepare_fxc_workspace(data: &FXCMatvecData) -> FXCMatvecWorkspace {
+    let nocc = data.nocc;
+    let nvir = data.nvir;
+    let ngrids = data.ngrids;
+    let is_gga = data.nvar == 4;
+
+    let wfxc_packed = if is_gga {
+        // Original layout: idx = g + α * ngrids + β * 4 * ngrids
+        // Packed  layout:  idx = g * 16 + α * 4 + β
+        let src = &data.wfxc;
+        let mut packed = vec![0.0; ngrids * 16];
+        for g in 0..ngrids {
+            for a in 0..4 {
+                for b in 0..4 {
+                    packed[g * 16 + a * 4 + b] =
+                        src[g + a * ngrids + b * 4 * ngrids];
+                }
+            }
+        }
+        Some(packed)
+    } else {
+        None
+    };
+
+    FXCMatvecWorkspace {
+        z_mat: MatrixFull::new([nocc, nvir], 0.0),
+        t: MatrixFull::new([nocc, ngrids], 0.0),
+        rho_z: vec![0.0; if is_gga { ngrids * 4 } else { ngrids }],
+        mo_vir_scaled: MatrixFull::new([nvir, ngrids], 0.0),
+        result: vec![0.0; nocc * nvir],
+        t_grad: [
+            MatrixFull::new([nocc, ngrids], 0.0),
+            MatrixFull::new([nocc, ngrids], 0.0),
+            MatrixFull::new([nocc, ngrids], 0.0),
+        ],
+        fxc_eff_grid: vec![0.0; ngrids * 4],
+        right_scaled: MatrixFull::new([nvir, ngrids], 0.0),
+        right_grad_scaled: MatrixFull::new([nvir, ngrids], 0.0),
+        wfxc_packed,
+    }
+}
+
+/// Optimized fxc matrix-vector product using pre-allocated workspace.
+///
+/// The result vector is taken from the workspace's internal buffer.
+/// Call `prepare_fxc_workspace` once before calling this function in a loop.
+pub fn fxc_matvec_opt(
+    data: &FXCMatvecData,
+    z: &[f64],
+    ws: &mut FXCMatvecWorkspace,
+) -> Vec<f64> {
+    let nocc = data.nocc;
+    let nvir = data.nvir;
+    assert_eq!(z.len(), nocc * nvir, "z length mismatch");
+
+    // Copy z into pre-allocated z_mat, avoiding the `z.to_vec()` allocation.
+    ws.z_mat.data.copy_from_slice(z);
+
+    match data.nvar {
+        1 => fxc_matvec_lda_opt(data, ws),
+        4 => fxc_matvec_gga_opt(data, ws),
+        _ => panic!("fxc_matvec_opt only supports LDA (nvar=1) and GGA (nvar=4)"),
+    }
+    std::mem::take(&mut ws.result)
+}
+
+// ── LDA optimized ────────────────────────────────────────────────────
+
+fn fxc_matvec_lda_opt(data: &FXCMatvecData, ws: &mut FXCMatvecWorkspace) {
+    use rayon::prelude::*;
+    let nocc = data.nocc;
+    let nvir = data.nvir;
+    let ngrids = data.ngrids;
+
+    // Step 1a: t = z_mat @ mo_vir  (BLAS GEMM — thread-safe)
+    ws.t.data.fill(0.0);
+    _dgemm_full(&ws.z_mat, 'N', &data.mo_vir, 'N', &mut ws.t, 1.0, 0.0);
+
+    // Step 1b: rho_z[g] = Σ_i mo_occ[i,g] × t[i,g]   (parallel over g)
+    //
+    // MatrixFull is column-major [nocc, ngrids]: column g has its nocc
+    // elements contiguously at data[g*nocc .. (g+1)*nocc].
+    let mo_occ = &data.mo_occ;
+    let t = &ws.t;
+    ws.rho_z
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(g, rho)| {
+            let base = g * nocc;
+            let mo_col = &mo_occ.data[base..base + nocc];
+            let t_col = &t.data[base..base + nocc];
+            let mut sum = 0.0;
+            for i in 0..nocc {
+                sum += mo_col[i] * t_col[i];
+            }
+            *rho = sum;
+        });
+
+    // Step 2: v[g] = wfxc[g] × rho_z[g]   (element-wise, reuse rho_z buf)
+    for g in 0..ngrids {
+        ws.rho_z[g] = data.wfxc[g] * ws.rho_z[g];
+    }
+
+    // Step 3a: mo_vir_scaled[a,g] = mo_vir[a,g] × v[g]  (parallel over columns)
+    //
+    // mo_vir is [nvir, ngrids] column-major: column g is at data[g*nvir..].
+    // par_chunks_mut(nvir) splits the data into ngrids chunks, one per column.
+    let mo_vir = &data.mo_vir;
+    let v = &ws.rho_z;
+    ws.mo_vir_scaled
+        .data
+        .par_chunks_mut(nvir)
+        .enumerate()
+        .for_each(|(g, col)| {
+            let vg = v[g];
+            for a in 0..nvir {
+                col[a] = mo_vir.data[a + g * nvir] * vg;
+            }
+        });
+
+    // Step 3b: result = mo_occ × mo_vir_scaled^T  (BLAS GEMM)
+    //
+    // NOTE: allocate a fresh Vec rather than taking from ws.result,
+    // because ws.result may be empty after a previous fxc_matvec_opt call
+    // drained it for return.  We assign the GEMM result into ws.result
+    // so it is valid for subsequent calls.
+    let mut result_mat = MatrixFull {
+        size: [nocc, nvir],
+        indicing: [nocc, nvir],
+        data: vec![0.0; nocc * nvir],
+    };
+    _dgemm_full(
+        mo_occ,
+        'N',
+        &ws.mo_vir_scaled,
+        'T',
+        &mut result_mat,
+        1.0,
+        0.0,
+    );
+    ws.result = result_mat.data;
+}
+
+// ── GGA optimized ────────────────────────────────────────────────────
+
+fn fxc_matvec_gga_opt(data: &FXCMatvecData, ws: &mut FXCMatvecWorkspace) {
+    use rayon::prelude::*;
+    let nocc = data.nocc;
+    let nvir = data.nvir;
+    let ngrids = data.ngrids;
+
+    let mo_occ_grad = data
+        .mo_occ_grad
+        .as_ref()
+        .expect("GGA requires mo_occ_grad");
+    let mo_vir_grad = data
+        .mo_vir_grad
+        .as_ref()
+        .expect("GGA requires mo_vir_grad");
+    let wfxc_packed = ws
+        .wfxc_packed
+        .as_ref()
+        .expect("GGA requires packed wfxc");
+
+    // Step 1a: t0 = z_mat @ mo_vir  (BLAS)
+    ws.t.data.fill(0.0);
+    _dgemm_full(&ws.z_mat, 'N', &data.mo_vir, 'N', &mut ws.t, 1.0, 0.0);
+
+    // Step 1b: t_grad[d] = z_mat @ mo_vir_grad[d]  (BLAS × 3)
+    for d in 0..3 {
+        ws.t_grad[d].data.fill(0.0);
+        _dgemm_full(
+            &ws.z_mat,
+            'N',
+            &mo_vir_grad[d],
+            'N',
+            &mut ws.t_grad[d],
+            1.0,
+            0.0,
+        );
+    }
+
+    // Step 1c: rho_z[β, g] — parallel over the 4 β components.
+    //
+    // rho_z is stored as 4 contiguous slabs of length ngrids.
+    // par_chunks_mut(ngrids) → 4 chunks, one per β.
+    let mo_occ = &data.mo_occ;
+    let t0 = &ws.t;
+    ws.rho_z
+        .par_chunks_mut(ngrids)
+        .enumerate()
+        .for_each(|(beta, rho_beta)| {
+            if beta == 0 {
+                // β=0:  ρ_z[0,g] = Σ_i mo_occ[i,g] × t0[i,g]
+                for g in 0..ngrids {
+                    let base = g * nocc;
+                    let mut s = 0.0;
+                    for i in 0..nocc {
+                        s += mo_occ.data[base + i] * t0.data[base + i];
+                    }
+                    rho_beta[g] = s;
+                }
+            } else {
+                let d = beta - 1;
+                let tg = &ws.t_grad[d];
+                let mog = &mo_occ_grad[d];
+                // β=1..3:  ρ_z[β,g] =
+                //   Σ_i ∇mo[d,i,g] × t0[i,g]  +  mo_occ[i,g] × ∇t[d,i,g]
+                for g in 0..ngrids {
+                    let base = g * nocc;
+                    let mut s = 0.0;
+                    for i in 0..nocc {
+                        s += mog.data[base + i] * t0.data[base + i]
+                            + mo_occ.data[base + i] * tg.data[base + i];
+                    }
+                    rho_beta[g] = s;
+                }
+            }
+        });
+
+    // Step 2: 4×4 matvec per grid point  (parallel over g)
+    //
+    // wfxc_packed[g*16 + α*4 + β] — all 16 values per g are contiguous.
+    //
+    // fxc_eff_grid is written in [g][α] (grid-major) layout:
+    //   fxc_eff_grid[g*4 + α] = Σ_β wfxc_packed[g*16 + α*4 + β] * rho_z[g + β*ngrids]
+    let fxc_eff = &mut ws.fxc_eff_grid;
+    fxc_eff
+        .par_chunks_mut(4)
+        .enumerate()
+        .for_each(|(g, blk)| {
+            let wb = g * 16;
+            let r0 = ws.rho_z[g];
+            let r1 = ws.rho_z[g + 1 * ngrids];
+            let r2 = ws.rho_z[g + 2 * ngrids];
+            let r3 = ws.rho_z[g + 3 * ngrids];
+
+            blk[0] = wfxc_packed[wb] * r0
+                + wfxc_packed[wb + 1] * r1
+                + wfxc_packed[wb + 2] * r2
+                + wfxc_packed[wb + 3] * r3;
+            blk[1] = wfxc_packed[wb + 4] * r0
+                + wfxc_packed[wb + 5] * r1
+                + wfxc_packed[wb + 6] * r2
+                + wfxc_packed[wb + 7] * r3;
+            blk[2] = wfxc_packed[wb + 8] * r0
+                + wfxc_packed[wb + 9] * r1
+                + wfxc_packed[wb + 10] * r2
+                + wfxc_packed[wb + 11] * r3;
+            blk[3] = wfxc_packed[wb + 12] * r0
+                + wfxc_packed[wb + 13] * r1
+                + wfxc_packed[wb + 14] * r2
+                + wfxc_packed[wb + 15] * r3;
+        });
+
+    // Step 3: Contract back to MO basis (sequential α loop, parallel scaling)
+    //
+    // Reallocate result Vec: ws.result may be empty after a previous
+    // fxc_matvec_opt call drained it for return.
+    ws.result = vec![0.0; nocc * nvir];
+    let mo_occ = &data.mo_occ;
+    let mo_vir = &data.mo_vir;
+
+    // fxc_eff is [g][α], so α-component at grid point g is fxc_eff[g*4 + α].
+    for alpha in 0..4 {
+        if alpha == 0 {
+            // right_scaled[a,g] = mo_vir[a,g] × fxc_eff[g*4]  (column-wise)
+            ws.right_scaled
+                .data
+                .par_chunks_mut(nvir)
+                .enumerate()
+                .for_each(|(g, col)| {
+                    let fv = fxc_eff[g * 4];
+                    for a in 0..nvir {
+                        col[a] = mo_vir.data[a + g * nvir] * fv;
+                    }
+                });
+            // contrib = mo_occ × right_scaled^T
+            let mut contrib = MatrixFull {
+                size: [nocc, nvir],
+                indicing: [nocc, nvir],
+                data: vec![0.0; nocc * nvir],
+            };
+            _dgemm_full(mo_occ, 'N', &ws.right_scaled, 'T', &mut contrib, 1.0, 0.0);
+            for i in 0..ws.result.len() {
+                ws.result[i] += contrib.data[i];
+            }
+        } else {
+            let d = alpha - 1;
+
+            // right_scaled = mo_vir × fxc_eff[g*4 + α]
+            ws.right_scaled
+                .data
+                .par_chunks_mut(nvir)
+                .enumerate()
+                .for_each(|(g, col)| {
+                    let fv = fxc_eff[g * 4 + alpha];
+                    for a in 0..nvir {
+                        col[a] = mo_vir.data[a + g * nvir] * fv;
+                    }
+                });
+            let mut contrib_a = MatrixFull {
+                size: [nocc, nvir],
+                indicing: [nocc, nvir],
+                data: vec![0.0; nocc * nvir],
+            };
+            _dgemm_full(
+                &mo_occ_grad[d],
+                'N',
+                &ws.right_scaled,
+                'T',
+                &mut contrib_a,
+                1.0,
+                0.0,
+            );
+            for i in 0..ws.result.len() {
+                ws.result[i] += contrib_a.data[i];
+            }
+
+            // right_grad_scaled = mo_vir_grad[d] × fxc_eff[g*4 + α]
+            ws.right_grad_scaled
+                .data
+                .par_chunks_mut(nvir)
+                .enumerate()
+                .for_each(|(g, col)| {
+                    let fv = fxc_eff[g * 4 + alpha];
+                    for a in 0..nvir {
+                        col[a] = mo_vir_grad[d].data[a + g * nvir] * fv;
+                    }
+                });
+            let mut contrib_b = MatrixFull {
+                size: [nocc, nvir],
+                indicing: [nocc, nvir],
+                data: vec![0.0; nocc * nvir],
+            };
+            _dgemm_full(
+                mo_occ,
+                'N',
+                &ws.right_grad_scaled,
+                'T',
+                &mut contrib_b,
+                1.0,
+                0.0,
+            );
+            for i in 0..ws.result.len() {
+                ws.result[i] += contrib_b.data[i];
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1263,6 +1684,7 @@ mod tests {
             mo_occ_grad: None,
             mo_vir_grad: None,
             wfxc,
+            use_opt: false,
         }
     }
 
@@ -1327,6 +1749,7 @@ mod tests {
             mo_occ_grad: Some(og),
             mo_vir_grad: Some(vg),
             wfxc,
+            use_opt: false,
         }
     }
 
@@ -1426,8 +1849,176 @@ mod tests {
         }
         println!("GGA linearity test passed");
     }
+
+    // ═════════════════════════════════════════════════════════════════
+    // Tests for fxc_matvec_opt
+    // ═════════════════════════════════════════════════════════════════
+
+    fn setup_rayon_threads(n: usize) -> Option<rayon::ThreadPool> {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build()
+            .ok()
+    }
+
+    fn compare_results(name: &str, expected: &[f64], got: &[f64]) {
+        assert_eq!(expected.len(), got.len(), "{}: length mismatch", name);
+        for (i, (e, g)) in expected.iter().zip(got.iter()).enumerate() {
+            let diff = (e - g).abs();
+            assert!(
+                diff < 1e-14,
+                "{}: mismatch at [{}]: expected {} got {} (diff {:.2e})",
+                name,
+                i,
+                e,
+                g,
+                diff
+            );
+        }
+    }
+
+    fn test_opt_lda_small(nocc: usize, nvir: usize, ngrids: usize) {
+        let data = make_lda_data(nocc, nvir, ngrids);
+        let n = nocc * nvir;
+        let z: Vec<f64> = (0..n).map(|i| ((i % 7) as f64) * 0.01).collect();
+        let expected = fxc_matvec(&data, &z);
+        let mut ws = prepare_fxc_workspace(&data);
+        let got = fxc_matvec_opt(&data, &z, &mut ws);
+        compare_results("LDA opt small", &expected, &got);
+        println!("LDA opt small nocc={} nvir={} ngrids={}: ✓", nocc, nvir, ngrids);
+    }
+
+    fn test_opt_gga_small(nocc: usize, nvir: usize, ngrids: usize) {
+        let data = make_gga_data(nocc, nvir, ngrids);
+        let n = nocc * nvir;
+        let z: Vec<f64> = (0..n).map(|i| ((i % 7) as f64) * 0.01).collect();
+        let expected = fxc_matvec(&data, &z);
+        let mut ws = prepare_fxc_workspace(&data);
+        let got = fxc_matvec_opt(&data, &z, &mut ws);
+        compare_results("GGA opt small", &expected, &got);
+        println!("GGA opt small nocc={} nvir={} ngrids={}: ✓", nocc, nvir, ngrids);
+    }
+
+    fn test_opt_lda_multiple_calls(nocc: usize, nvir: usize, ngrids: usize) {
+        let data = make_lda_data(nocc, nvir, ngrids);
+        let n = nocc * nvir;
+        let mut ws = prepare_fxc_workspace(&data);
+        for trial in 0..5 {
+            let z: Vec<f64> = (0..n)
+                .map(|i| ((i + trial * 17) % 11) as f64 * 0.01)
+                .collect();
+            let expected = fxc_matvec(&data, &z);
+            let got = fxc_matvec_opt(&data, &z, &mut ws);
+            compare_results(&format!("LDA reuse trial {}", trial), &expected, &got);
+        }
+        println!("LDA opt multiple-call reuse nocc={} nvir={} ngrids={}: ✓", nocc, nvir, ngrids);
+    }
+
+    fn test_opt_gga_multiple_calls(nocc: usize, nvir: usize, ngrids: usize) {
+        let data = make_gga_data(nocc, nvir, ngrids);
+        let n = nocc * nvir;
+        let mut ws = prepare_fxc_workspace(&data);
+        for trial in 0..5 {
+            let z: Vec<f64> = (0..n)
+                .map(|i| ((i + trial * 17) % 11) as f64 * 0.01)
+                .collect();
+            let expected = fxc_matvec(&data, &z);
+            let got = fxc_matvec_opt(&data, &z, &mut ws);
+            compare_results(&format!("GGA reuse trial {}", trial), &expected, &got);
+        }
+        println!("GGA opt multiple-call reuse nocc={} nvir={} ngrids={}: ✓", nocc, nvir, ngrids);
+    }
+
+    fn bench_opt(
+        label: &str,
+        nocc: usize,
+        nvir: usize,
+        ngrids: usize,
+        ntrials: usize,
+        nthreads: Option<usize>,
+    ) {
+        let pool = nthreads.and_then(|n| setup_rayon_threads(n));
+
+        let data = if label.contains("GGA") {
+            make_gga_data(nocc, nvir, ngrids)
+        } else {
+            make_lda_data(nocc, nvir, ngrids)
+        };
+        let n = nocc * nvir;
+        let z: Vec<f64> = (0..n).map(|i| (i as f64 % 13.0) * 0.01).collect();
+        let mut ws = prepare_fxc_workspace(&data);
+
+        // Warm-up
+        for _ in 0..3 {
+            fxc_matvec(&data, &z);
+            fxc_matvec_opt(&data, &z, &mut ws);
+        }
+
+        // Benchmark original (sequential)
+        let start = std::time::Instant::now();
+        for _ in 0..ntrials {
+            std::hint::black_box(fxc_matvec(&data, &z));
+        }
+        let orig_time = start.elapsed().as_secs_f64() / ntrials as f64;
+
+        // Benchmark optimized (may use rayon threads inside pool)
+        let start = std::time::Instant::now();
+        if let Some(ref pool) = pool {
+            pool.install(|| {
+                for _ in 0..ntrials {
+                    std::hint::black_box(fxc_matvec_opt(&data, &z, &mut ws));
+                }
+            });
+        } else {
+            for _ in 0..ntrials {
+                std::hint::black_box(fxc_matvec_opt(&data, &z, &mut ws));
+            }
+        }
+        let opt_time = start.elapsed().as_secs_f64() / ntrials as f64;
+
+        let speedup = orig_time / opt_time;
+        let threads_str = nthreads.map_or("default".to_string(), |n| n.to_string());
+        println!(
+            "{} (nocc={} nvir={} ngrids={}, nthreads={}): \
+             orig={:.4}s opt={:.4}s speedup={:.2}×",
+            label, nocc, nvir, ngrids, threads_str, orig_time, opt_time, speedup
+        );
+    }
+
+    // ── Correctness tests ──
+
+    #[test]
+    fn test_fxc_opt_lda_correctness() {
+        test_opt_lda_small(3, 5, 10);
+        test_opt_lda_small(10, 20, 100);
+        test_opt_lda_small(50, 100, 500);
+    }
+
+    #[test]
+    fn test_fxc_opt_gga_correctness() {
+        test_opt_gga_small(3, 5, 10);
+        test_opt_gga_small(10, 20, 100);
+        test_opt_gga_small(20, 30, 200);
+    }
+
+    #[test]
+    fn test_fxc_opt_lda_workspace_reuse() {
+        test_opt_lda_multiple_calls(10, 20, 100);
+    }
+
+    #[test]
+    fn test_fxc_opt_gga_workspace_reuse() {
+        test_opt_gga_multiple_calls(10, 20, 100);
+    }
+
+    #[test]
+    fn test_fxc_opt_lda_performance() {
+        bench_opt("LDA", 50, 200, 10_000, 30, Some(8));
+    }
+
+    #[test]
+    fn test_fxc_opt_gga_performance() {
+        bench_opt("GGA", 30, 80, 5_000, 15, Some(8));
+    }
 }
-
-
-
 

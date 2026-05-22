@@ -1,0 +1,634 @@
+% !TEX program = xelatex
+\documentclass[12pt,a4paper]{article}
+
+% ---- Packages ----
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{cleveref}
+
+\geometry{margin=1in}
+
+% ---- Theorem environments ----
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{remark}[theorem]{Remark}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+
+% ---- Math operators ----
+\DeclareMathOperator{\Tr}{Tr}
+\DeclareMathOperator{\sgn}{sgn}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator{\rank}{rank}
+\DeclareMathOperator{\Res}{Res}
+\DeclareMathOperator{\Span}{span}
+\DeclareMathOperator{\ReOp}{Re}
+\DeclareMathOperator{\ImOp}{Im}
+
+% ---- Colors ----
+\definecolor{keypoint}{RGB}{180,0,0}
+\newcommand{\key}[1]{\textcolor{keypoint}{\textbf{#1}}}
+
+% ---- Title ----
+\title{\bfseries Nonlinear Eigenvalue Algorithm for $GW$ Quasiparticle Equations\\
+\large A Detailed Derivation of the FEAST Contour Integral Method}
+\author{Based on the work of Dongming Li and Eric Polizzi\\
+\textit{Phys. Rev. B} \textbf{111}, 045137 (2025)}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document provides a comprehensive mathematical derivation and theoretical justification of the FEAST contour integral algorithm applied to nonlinear eigenvalue problems, with specific focus on the $G_0W_0$ quasiparticle equation in many-body quantum theory. We present step-by-step derivations of: (1) the formulation of the GW equation as a nonlinear eigenvalue problem, (2) the Cauchy-integral-based spectral projection that extracts eigenpairs within a user-specified energy window, (3) the iterative residual-driven mechanism that resolves the nonlinearity within that window, (4) the hypercomplex number technique for separating contour-integral and Green's-function imaginary components, and (5) convergence properties. The document is self-contained and accessible to readers with background in numerical linear algebra and quantum many-body theory.
+\end{abstract}
+
+\tableofcontents
+
+%=====================================================================
+\section{Introduction: The GW Quasiparticle Equation}
+%=====================================================================
+
+\subsection{Physical Origin}
+
+The $G_0W_0$ (one-shot $GW$) approximation quasiparticle equation in atomic units is given by
+\begin{equation}\label{eq:gw_qp}
+\hat{h}\,\psi(r) + \int_{-\infty}^{+\infty} \Sigma(r, r', \varepsilon)\,\psi(r')\,dr' = \varepsilon\,\psi(r),
+\end{equation}
+where
+\begin{equation}\label{eq:h_hat}
+\hat{h} = -\frac{1}{2}\nabla^{2} + v_{\rm ext}(r) + v_{H}(r),
+\end{equation}
+$v_{\rm ext}$ and $v_{H}$ are the external and Hartree potentials, and $\Sigma(r,r',\varepsilon)$ is the exchange-correlation self-energy operator.
+
+The self-energy in the one-shot $GW$ approximation is given by the convolution of the Green's function $G_0$ and the screened Coulomb interaction $W_0$:
+\begin{equation}\label{eq:sigma_def}
+\Sigma(r, r', \varepsilon) = \frac{\mathbf{i}}{2\pi} \int_{-\infty}^{+\infty} e^{\mathbf{i}\omega\eta}\, G_0(r, r', \varepsilon+\omega)\, W_0(r, r', \omega)\, d\omega.
+\end{equation}
+Here $\eta \to 0^{+}$ is a positive infinitesimal ensuring convergence, and $G_0$ is the mean-field one-body Green's function:
+\begin{equation}\label{eq:G0_def}
+G_0(r, r', \varepsilon) = \sum_n \frac{\psi_n(r)\psi_n^{*}(r')}{\varepsilon - \varepsilon_n - \mathbf{i}\eta\,\sgn(E_F - \varepsilon_n)}.
+\end{equation}
+
+\subsection{Nonlinear Eigenvalue Formulation}
+
+The self-energy is conventionally split into exchange and correlation parts:
+\begin{equation}\label{eq:sigma_split}
+\Sigma(\varepsilon) = \Sigma^{X} + \Sigma^{C}(\varepsilon),
+\end{equation}
+where the exchange part $\Sigma^{X}$ has an analytic solution and is energy-independent, while the \key{correlation part $\Sigma^{C}(\varepsilon)$ depends on the energy $\varepsilon$}. Substituting into Eq.~\eqref{eq:gw_qp}:
+\begin{equation}\label{eq:gw_split}
+\hat{h}\,\psi_i(r) + \int \left[\Sigma^{X}(r, r') + \Sigma^{C}(r, r', \varepsilon_i)\right]\psi_i(r')\,dr' = \varepsilon_i\,\psi_i(r).
+\end{equation}
+
+After spatial discretization (e.g., finite element method, real-space grid, or Gaussian basis), we obtain the matrix form:
+\begin{equation}\label{eq:gw_matrix}
+\boxed{\bigl[\mathbf{h} + \mathbf{\Sigma}^{X} + \mathbf{\Sigma}^{C}(\varepsilon)\bigr]\mathbf{\Psi} = \varepsilon\,\mathbf{S}\,\mathbf{\Psi}},
+\end{equation}
+where $\mathbf{S}$ is the positive-definite overlap (mass) matrix arising from the non-orthogonal basis or FEM discretization. Defining
+\begin{equation}\label{eq:T_def}
+\boxed{\mathbf{T}(z) \equiv z\mathbf{S} - \bigl[\mathbf{h} + \mathbf{\Sigma}^{X} + \mathbf{\Sigma}^{C}(z)\bigr]},
+\end{equation}
+the $G_0W_0$ quasiparticle equation becomes:
+\begin{equation}\label{eq:nonlinear_T}
+\boxed{\mathbf{T}(\varepsilon)\,\mathbf{\Psi} = \mathbf{0}}.
+\end{equation}
+
+\key{This is a nonlinear eigenvalue problem} because the matrix-valued function $\mathbf{T}(z)$ depends nonlinearly on the eigenvalue $z = \varepsilon$ through the correlation self-energy $\mathbf{\Sigma}^{C}(z)$.
+
+%=====================================================================
+\section{Mathematical Framework of Nonlinear Eigenvalue Problems}
+%=====================================================================
+
+\subsection{General Formulation}
+
+A nonlinear eigenvalue problem (NEP) for a matrix-valued function $\mathbf{T}: \Omega \subset \mathbb{C} \to \mathbb{C}^{n \times n}$ consists of finding pairs $(\lambda, \mathbf{x})$ with $\mathbf{x} \neq \mathbf{0}$ such that
+\begin{equation}\label{eq:NEP_general}
+\boxed{\mathbf{T}(\lambda)\,\mathbf{x} = \mathbf{0}}.
+\end{equation}
+
+$\lambda$ is called an eigenvalue and $\mathbf{x} \neq \mathbf{0}$ is the associated eigenvector. The function $\mathbf{T}(z)$ is assumed to be holomorphic in a neighborhood of the eigenvalues of interest.
+
+\begin{definition}[Resolvent and Spectrum]
+The \textbf{resolvent} of $\mathbf{T}$ is $\mathbf{T}^{-1}(z)$. The \textbf{spectrum} $\sigma(\mathbf{T})$ is the set of $z \in \Omega$ where $\mathbf{T}(z)$ is singular, i.e., where the resolvent does not exist:
+\begin{equation}
+\sigma(\mathbf{T}) = \{ z \in \Omega \mid \det\mathbf{T}(z) = 0 \}.
+\end{equation}
+\end{definition}
+
+\begin{remark}
+For the linear case $\mathbf{T}(z) = z\mathbf{I} - \mathbf{A}$, the spectrum $\sigma(\mathbf{T})$ coincides with the standard set of eigenvalues of $\mathbf{A}$. For the polynomial case $\mathbf{T}(z) = \sum_{m=0}^{M} z^{m}\mathbf{A}_m$, Eq.~\eqref{eq:NEP_general} reduces to the polynomial eigenvalue problem. The GW problem \eqref{eq:T_def} falls into the general nonlinear category.
+\end{remark}
+
+\subsection{Special Cases Important for GW}
+
+\begin{enumerate}[label=(\roman*)]
+    \item \textbf{Linear:} $\mathbf{T}(z) = z\mathbf{S} - \mathbf{H}_0$ where $\mathbf{H}_0 = \mathbf{h} + \mathbf{\Sigma}^{X}$. If we approximate $\mathbf{\Sigma}^{C}(z) \approx \mathbf{0}$ (or treat it as constant), the problem becomes a standard generalized eigenvalue problem.
+    \item \textbf{Polynomial:} If $\mathbf{\Sigma}^{C}(z)$ can be approximated by a rational or polynomial expansion, we obtain a polynomial NEP.
+    \item \textbf{General nonlinear (GW):} $\mathbf{\Sigma}^{C}(z)$ has a complex analytic structure involving poles, branch cuts, and convolution integrals --- the full nonlinear case.
+\end{enumerate}
+
+%=====================================================================
+\section{Contour Integration and Spectral Projection}
+%=====================================================================
+
+\subsection{Cauchy's Integral Theorem and Residue Calculus}
+
+The mathematical foundation of the FEAST algorithm rests on \textbf{Cauchy's integral formula} from complex analysis. Let $\Gamma$ be a simple closed positively-oriented curve in $\mathbb{C}$ and let $f(z)$ be holomorphic inside and on $\Gamma$, except possibly at finitely many isolated singularities.
+
+\begin{theorem}[Cauchy's Residue Theorem]\label{thm:cauchy}
+Let $f(z)$ be meromorphic inside and on a simple closed curve $\Gamma$, with poles $\{z_k\}_{k=1}^{m}$ inside $\Gamma$. Then
+\begin{equation}
+\frac{1}{2\pi\mathbf{i}} \oint_{\Gamma} f(z)\,dz = \sum_{k=1}^{m} \Res(f, z_k).
+\end{equation}
+\end{theorem}
+
+\begin{theorem}[Cauchy's Integral Formula]\label{thm:CIF}
+If $f(z)$ is holomorphic inside and on $\Gamma$, then for any $a$ inside $\Gamma$:
+\begin{equation}
+f(a) = \frac{1}{2\pi\mathbf{i}} \oint_{\Gamma} \frac{f(z)}{z - a}\,dz.
+\end{equation}
+In particular, with $f(z)=1$:
+\begin{equation}
+\frac{1}{2\pi\mathbf{i}} \oint_{\Gamma} \frac{1}{z - a}\,dz = \begin{cases}
+1, & \text{if } a \text{ is inside } \Gamma,\\
+0, & \text{if } a \text{ is outside } \Gamma.
+\end{cases}
+\end{equation}
+\end{theorem}
+
+\subsection{Spectral Projector for Linear Eigenvalue Problems}
+
+For a linear eigenvalue problem $\mathbf{A}\mathbf{x} = \lambda\mathbf{x}$, the resolvent is $(\lambda\mathbf{I} - \mathbf{A})^{-1}$. Consider the contour integral:
+\begin{equation}\label{eq:linear_projector}
+\mathbf{P}_{\Gamma} = \frac{1}{2\pi\mathbf{i}} \oint_{\Gamma} (z\mathbf{I} - \mathbf{A})^{-1}\,dz.
+\end{equation}
+
+Let $\mathbf{A}$ be diagonalizable with eigenvalues $\{\lambda_j\}$ and eigenvectors $\{\mathbf{x}_j\}$ forming $\mathbf{A} = \mathbf{X}\mathbf{\Lambda}\mathbf{X}^{-1}$. Then:
+\begin{equation}
+(z\mathbf{I} - \mathbf{A})^{-1} = \mathbf{X}(z\mathbf{I} - \mathbf{\Lambda})^{-1}\mathbf{X}^{-1} = \sum_{j=1}^{n} \frac{\mathbf{x}_j\mathbf{y}_j^{H}}{\lambda - \lambda_j},
+\end{equation}
+where $\mathbf{y}_j^{H}$ is the $j$-th left eigenvector (row of $\mathbf{X}^{-1}$). Applying Theorem~\ref{thm:CIF}:
+\begin{equation}\label{eq:spectral_projector_derivation}
+\boxed{\mathbf{P}_{\Gamma} = \frac{1}{2\pi\mathbf{i}} \oint_{\Gamma} (z\mathbf{I} - \mathbf{A})^{-1}\,dz = \sum_{\lambda_j \in \Gamma} \mathbf{x}_j\mathbf{y}_j^{H}}.
+\end{equation}
+
+This is the \key{spectral projector} onto the invariant subspace spanned by eigenvectors whose eigenvalues lie inside $\Gamma$.
+
+\subsection{Extension to Nonlinear Eigenvalue Problems: Keldysh's Theorem}
+
+For the nonlinear case $\mathbf{T}(\lambda)\mathbf{x} = \mathbf{0}$, we need a generalization. The key result is \textbf{Keldysh's theorem}, which states that under appropriate holomorphicity conditions, the resolvent $\mathbf{T}^{-1}(z)$ admits a representation similar to the linear case near eigenvalues.
+
+\begin{theorem}[Keldysh's Theorem --- Informal Statement]\label{thm:keldysh}
+Let $\mathbf{T}(z)$ be a holomorphic matrix-valued function on a domain $\Omega \subset \mathbb{C}$. Under suitable conditions (the determinant $\det\mathbf{T}(z)$ does not vanish identically), the resolvent admits the representation
+\begin{equation}\label{eq:keldysh}
+\mathbf{T}^{-1}(z) = \sum_{j=1}^{m} \frac{\mathbf{x}_j\mathbf{y}_j^{H}}{z - \lambda_j} + \mathbf{H}(z),
+\end{equation}
+where $\mathbf{H}(z)$ is holomorphic inside $\Gamma$, and $\{\lambda_j\}$ are the eigenvalues inside $\Gamma$, with $\mathbf{x}_j$, $\mathbf{y}_j$ the right and left eigenvectors.
+\end{theorem}
+
+\begin{proof}[Sketch of Proof]
+Since $\det\mathbf{T}(z)$ is a scalar holomorphic function, its zeros $\{\lambda_j\}$ are isolated. Near each eigenvalue $\lambda_j$, we can use the Smith canonical form or local Smith-MacMillan factorization, yielding first-order pole contributions with residues of rank equal to the algebraic multiplicity. Summing over all poles inside $\Gamma$ and absorbing the remaining holomorphic part into $\mathbf{H}(z)$ gives \eqref{eq:keldysh}. See \cite{Beyn2012} for a rigorous treatment.
+\end{proof}
+
+Applying the contour integral to $\mathbf{T}^{-1}(z)$ and using Theorem~\ref{thm:cauchy}:
+\begin{equation}\label{eq:nonlinear_projector}
+\boxed{\mathbf{P}_{\Gamma} = \frac{1}{2\pi\mathbf{i}} \oint_{\Gamma} \mathbf{T}^{-1}(z)\,dz = \sum_{j=1}^{m} \mathbf{x}_j\mathbf{y}_j^{H}}.
+\end{equation}
+
+\key{The crucial insight: The contour integral of the resolvent $\mathbf{T}^{-1}(z)$ around $\Gamma$ yields the spectral projector onto the eigenspace associated with eigenvalues inside $\Gamma$, regardless of whether $\mathbf{T}(z)$ depends linearly or nonlinearly on $z$.} The nonlinearity is ``absorbed'' by the contour integration --- at each point $z$ on the contour, $\mathbf{T}(z)$ is simply a constant matrix.
+
+%=====================================================================
+\section{The FEAST Algorithm for Nonlinear Eigenvalue Problems}
+%=====================================================================
+
+\subsection{Core Contour Integral Formulation}
+
+The FEAST algorithm for nonlinear eigenvalue problems \cite{Polizzi2009,Gavin2018,Brenneck2020} is based on the following contour integral (Eq.~(19) in \cite{Li2025}):
+\begin{equation}\label{eq:feast_Qk}
+\boxed{\mathbf{Q}_k = \frac{1}{2\pi\mathbf{i}} \oint_{\Gamma} z^{k}\,\bigl[\mathbf{X} - \mathbf{T}^{-1}(z)\mathbf{R}\bigr]\,(z\mathbf{I} - \mathbf{\Lambda})^{-1}\,dz, \qquad k = 0, 1},
+\end{equation}
+where:
+\begin{itemize}[itemsep=2pt]
+    \item $\mathbf{X} = [\mathbf{x}_1, \ldots, \mathbf{x}_{m_0}] \in \mathbb{C}^{n \times m_0}$ is the current \textbf{approximate eigenvector subspace} (initialized randomly, $m_0 \geq m$).
+    \item $\mathbf{\Lambda} = \diag(\lambda_1, \ldots, \lambda_{m_0})$ contains the \textbf{current approximate eigenvalues} for the eigenpairs within $\Gamma$.
+    \item $\mathbf{R} = [\mathbf{r}_1, \ldots, \mathbf{r}_{m_0}]$ with $\mathbf{r}_i = \mathbf{T}(\lambda_i)\mathbf{x}_i$ is the \textbf{residual matrix}.
+    \item $\Gamma$ is a closed contour in $\mathbb{C}$ enclosing the eigenvalues of interest.
+\end{itemize}
+
+\subsection{Interpretation and Derivation of Formula \eqref{eq:feast_Qk}}
+
+We now provide a step-by-step derivation and interpretation.
+
+\subsubsection*{Part A: The Ideal Case ($\mathbf{R} = \mathbf{0}$)}
+
+When the eigenpairs are exact ($\mathbf{T}(\lambda_i)\mathbf{x}_i = \mathbf{0}$ for all $i$), we have $\mathbf{R} = \mathbf{0}$. Then:
+\begin{equation}\label{eq:Qk_ideal}
+\mathbf{Q}_k = \frac{1}{2\pi\mathbf{i}} \oint_{\Gamma} z^{k}\,\mathbf{X}\,(z\mathbf{I} - \mathbf{\Lambda})^{-1}\,dz
+= \mathbf{X}\left[\frac{1}{2\pi\mathbf{i}} \oint_{\Gamma} z^{k}\,(z\mathbf{I} - \mathbf{\Lambda})^{-1}\,dz\right].
+\end{equation}
+
+Since $(z\mathbf{I} - \mathbf{\Lambda})^{-1} = \diag\bigl(\frac{1}{z-\lambda_1}, \ldots, \frac{1}{z-\lambda_{m_0}}\bigr)$, the contour integral acts element-wise. By Cauchy's formula (Theorem~\ref{thm:CIF}):
+
+\begin{equation}\label{eq:Qk_result_ideal}
+\boxed{\mathbf{Q}_0 = \hat{\mathbf{X}}, \qquad \mathbf{Q}_1 = \hat{\mathbf{X}}\hat{\mathbf{\Lambda}}},
+\end{equation}
+where $\hat{\mathbf{X}}$ and $\hat{\mathbf{\Lambda}}$ contain only the eigenpairs with eigenvalues inside $\Gamma$ (filtering out those outside). The matrix $\mathbf{Q}_0$ thus \key{spans the exact invariant subspace} associated with eigenvalues in $\Gamma$.
+
+\subsubsection*{Part B: The Non-Ideal Case ($\mathbf{R} \neq \mathbf{0}$)}
+
+When the eigenpairs are approximate, $\mathbf{R} \neq \mathbf{0}$, and the term $\mathbf{T}^{-1}(z)\mathbf{R}$ provides a \textbf{correction}. Expanding:
+\begin{equation}\label{eq:Qk_correction}
+\mathbf{Q}_k = \underbrace{\frac{1}{2\pi\mathbf{i}} \oint_{\Gamma} z^{k}\,\mathbf{X}\,(z\mathbf{I} - \mathbf{\Lambda})^{-1}\,dz}_{\text{projection of current subspace}}
+- \underbrace{\frac{1}{2\pi\mathbf{i}} \oint_{\Gamma} z^{k}\,\mathbf{T}^{-1}(z)\mathbf{R}\,(z\mathbf{I} - \mathbf{\Lambda})^{-1}\,dz}_{\text{residual-driven correction}}.
+\end{equation}
+
+The second term injects information about the residual into the spectral projection. This can be understood as follows: the residual $\mathbf{R}$ measures how far the current approximation is from satisfying $\mathbf{T}(\lambda)\mathbf{x} = \mathbf{0}$. The resolvent $\mathbf{T}^{-1}(z)$ then ``propagates'' this error information, and the contour integral projects it onto the relevant eigenspace.
+
+\subsection{Numerical Quadrature Approximation}
+
+In practice, the contour integral is discretized using numerical quadrature with $N_q$ nodes $\{z_j\}_{j=1}^{N_q}$ and weights $\{w_j\}_{j=1}^{N_q}$:
+\begin{equation}\label{eq:Qk_quad}
+\boxed{\mathbf{Q}_k \approx \frac{1}{2\pi\mathbf{i}} \sum_{j=1}^{N_q} w_j\,z_j^{k}\,\bigl[\mathbf{X} - \mathbf{T}^{-1}(z_j)\mathbf{R}\bigr]\,(z_j\mathbf{I} - \mathbf{\Lambda})^{-1}}.
+\end{equation}
+
+Typically an elliptical contour is used, and Gauss-Legendre quadrature (or the trapezoidal rule for circular contours) with $N_q \approx 8{-}16$ nodes provides sufficient accuracy for the projection.
+
+\subsection{Complete Algorithm Derivation}
+
+Let us now trace through each step of the FEAST algorithm (Algorithm~1 in~\cite{Li2025}), proving why each operation is performed.
+
+\subsubsection*{Step 1: Solve Linear Systems at Quadrature Nodes}
+
+For each quadrature node $z_j$, compute:
+\begin{equation}\label{eq:linear_systems}
+\mathbf{T}(z_j)\mathbf{X}_j = \mathbf{Y}, \quad \text{or equivalently} \quad \mathbf{X}_j = \mathbf{T}^{-1}(z_j)\mathbf{Y}.
+\end{equation}
+
+In practice, $\mathbf{Y} = \mathbf{R}$ (except possibly the first iteration where $\mathbf{Y} = \mathbf{X}$ if $\mathbf{R}$ is not yet known). Each of these $N_q$ linear systems is \textbf{independent} and can be solved in parallel.
+
+The linear system for the GW problem is:
+\begin{equation}\label{eq:gw_linear_system}
+\bigl[z_j\mathbf{S} - \mathbf{h} - \mathbf{\Sigma}^{X} - \mathbf{\Sigma}^{C}(z_j)\bigr]\,\mathbf{X}_j = \mathbf{R}.
+\end{equation}
+
+\subsubsection*{Step 2: Form the $\mathbf{Y}_j$ Matrices}
+
+For each quadrature node, compute:
+\begin{equation}\label{eq:Yj}
+\mathbf{Y}_j = (\mathbf{X} - \mathbf{X}_j)(z_j\mathbf{I} - \mathbf{\Lambda})^{-1}.
+\end{equation}
+
+The term $(z_j\mathbf{I} - \mathbf{\Lambda})^{-1}$ is a diagonal matrix with entries $1/(z_j - \lambda_i)$. This step ``weights'' the correction $\mathbf{X} - \mathbf{X}_j$ by the distance between the quadrature node and each current approximate eigenvalue.
+
+\subsubsection*{Step 3: Assemble $\mathbf{Q}_0$ and $\mathbf{Q}_1$}
+
+\begin{equation}\label{eq:Q0Q1}
+\mathbf{Q}_0 = \sum_{j=1}^{N_q} w_j\,\mathbf{Y}_j, \qquad
+\mathbf{Q}_1 = \sum_{j=1}^{N_q} w_j\,z_j\,\mathbf{Y}_j.
+\end{equation}
+
+\subsubsection*{Step 4: QR Factorization and Subspace Extraction}
+
+Compute the (thin) QR decomposition of $\mathbf{Q}_0$:
+\begin{equation}\label{eq:QR}
+\mathbf{Q}_0 = \mathbf{q}_{n \times m_0}\,\mathbf{r}_{m_0 \times m_0},
+\end{equation}
+where $\mathbf{q}$ has orthonormal columns ($\mathbf{q}^{H}\mathbf{q} = \mathbf{I}_{m_0}$) and $\mathbf{r}$ is upper triangular. The columns of $\mathbf{q}$ form an orthonormal basis for the range of $\mathbf{Q}_0$, which approximates the invariant subspace.
+
+\subsubsection*{Step 5: Form and Solve the Reduced Eigenvalue Problem}
+
+Construct the $m_0 \times m_0$ matrix:
+\begin{equation}\label{eq:C_matrix}
+\mathbf{C} = \mathbf{q}^{H}\,\mathbf{Q}_1\,\mathbf{r}^{-1}.
+\end{equation}
+
+\textbf{Why this form?} Suppose $\mathbf{X}$ spans an invariant subspace with exact eigenpairs. Then $\mathbf{Q}_0 = \mathbf{X}\mathbf{U}$ for some $\mathbf{U}$ (since $\mathbf{Q}_0$ projects onto the same subspace). If $\mathbf{Q}_1 = \mathbf{X}\mathbf{\Lambda}\mathbf{U}$, then:
+\begin{equation}
+\mathbf{C} = \mathbf{q}^{H}(\mathbf{X}\mathbf{\Lambda}\mathbf{U})(\mathbf{q}^{H}\mathbf{X}\mathbf{U})^{-1}
+= (\mathbf{q}^{H}\mathbf{X})\mathbf{\Lambda}(\mathbf{q}^{H}\mathbf{X})^{-1},
+\end{equation}
+so $\mathbf{C}$ is similar to $\mathbf{\Lambda}$. Thus we solve the small linear eigenvalue problem:
+\begin{equation}\label{eq:reduced_evp}
+\boxed{\mathbf{C}\,\mathbf{W} = \mathbf{W}\,\tilde{\mathbf{\Lambda}}},
+\end{equation}
+where $\mathbf{W} \in \mathbb{C}^{m_0 \times m_0}$ and $\tilde{\mathbf{\Lambda}} = \diag(\tilde{\lambda}_1, \ldots, \tilde{\lambda}_{m_0})$.
+
+\subsubsection*{Step 6: Update the Subspace}
+
+\begin{equation}\label{eq:update}
+\mathbf{X} \leftarrow \mathbf{q}\,\mathbf{W}, \qquad \mathbf{\Lambda} \leftarrow \tilde{\mathbf{\Lambda}}.
+\end{equation}
+
+The eigenvectors in the original space are recovered as $\mathbf{X} = \mathbf{q}\mathbf{W}$ via the Rayleigh-Ritz procedure.
+
+\subsubsection*{Step 7: Compute Residuals and Check Convergence}
+
+\begin{equation}\label{eq:residual}
+\mathbf{r}_i = \mathbf{T}(\tilde{\lambda}_i)\,\mathbf{x}_i, \qquad i = 1, \ldots, m_0.
+\end{equation}
+
+If $\|\mathbf{r}_i\| < \tau$ (a convergence threshold, typically close to machine epsilon) for all eigenpairs inside $\Gamma$, the algorithm terminates. Otherwise, $\mathbf{R}$ is set to the current residuals and the process repeats from Step~1.
+
+\subsection{Pseudocode}
+
+\begin{algorithm}[htbp]
+\caption{FEAST Algorithm for Nonlinear Eigenvalue Problems $\mathbf{T}(\lambda)\mathbf{x} = \mathbf{0}$}
+\label{alg:feast}
+\begin{algorithmic}[1]
+\Require Contour $\Gamma$ enclosing $m$ wanted eigenvalues
+\Require Quadrature nodes $\{z_j, w_j\}_{j=1}^{N_q}$
+\Require Initial subspace $\mathbf{X}_{n \times m_0}$ (random), $m_0 \geq m$
+\Ensure All $m$ eigenpairs $\{(\lambda_i, \mathbf{x}_i)\}$ inside $\Gamma$
+\State $\mathbf{\Lambda} \leftarrow \mathbf{0}$, $\mathbf{R} \leftarrow \mathbf{X}$ \Comment{Initialize (R=X for first iteration)}
+\While{not all $\mathbf{r}_i$ converged for $\lambda_i$ inside $\Gamma$}
+    \For{$j = 1$ to $N_q$} \Comment{Parallelizable loop}
+        \State Solve $\mathbf{T}(z_j)\mathbf{X}_j = \mathbf{R}$
+        \State $\mathbf{Y}_j \leftarrow (\mathbf{X} - \mathbf{X}_j)(z_j\mathbf{I} - \mathbf{\Lambda})^{-1}$
+    \EndFor
+    \State $\mathbf{Q}_0 \leftarrow \sum_{j} w_j \mathbf{Y}_j$, \quad $\mathbf{Q}_1 \leftarrow \sum_{j} w_j z_j \mathbf{Y}_j$
+    \State $[\mathbf{q}, \mathbf{r}] \leftarrow \text{QR}(\mathbf{Q}_0)$ \Comment{Thin QR}
+    \State $\mathbf{C} \leftarrow \mathbf{q}^{H}\mathbf{Q}_1\mathbf{r}^{-1}$
+    \State Solve $\mathbf{C}\mathbf{W} = \mathbf{W}\mathbf{\Lambda}$ \Comment{Size $m_0 \times m_0$, direct diagonalization}
+    \State $\mathbf{X} \leftarrow \mathbf{q}\mathbf{W}$
+    \For{$i = 1$ to $m_0$}
+        \State $\mathbf{r}_i \leftarrow \mathbf{T}(\lambda_i)\mathbf{x}_i$
+    \EndFor
+    \State $\mathbf{R} \leftarrow [\mathbf{r}_1, \ldots, \mathbf{r}_{m_0}]$
+\EndWhile
+\State \Return $\{(\lambda_i, \mathbf{x}_i)\}$ for eigenpairs inside $\Gamma$
+\end{algorithmic}
+\end{algorithm}
+
+%=====================================================================
+\section{How the Nonlinearity is Resolved within the Energy Window}
+%=====================================================================
+
+This is the central question: the contour integral provides a spectral projector that isolates a small energy window, but the matrix $\mathbf{T}(z)$ within that window is still nonlinear in $z$. \textbf{How does FEAST overcome this?}
+
+We identify \key{four key mechanisms}, which we discuss in order of increasing depth.
+
+\subsection{Mechanism 1: ``Freezing'' the Nonlinearity at Quadrature Nodes}
+
+The contour integral is evaluated at discrete quadrature nodes $\{z_j\}$ in the complex plane. At each node $z_j$, the argument of $\mathbf{T}$ is a \textbf{fixed complex number}, not a variable. Therefore:
+\begin{equation}
+\mathbf{T}(z_j) = z_j\mathbf{S} - \bigl[\mathbf{h} + \mathbf{\Sigma}^{X} + \mathbf{\Sigma}^{C}(z_j)\bigr]
+\end{equation}
+is simply a \textbf{constant matrix} at each $z_j$. Solving $\mathbf{T}(z_j)\mathbf{X}_j = \mathbf{R}$ is a standard linear system solve. \textbf{The nonlinearity does not manifest during the linear solve} --- it only manifests in the evaluation of $\mathbf{\Sigma}^{C}(z_j)$ at the specific point $z_j$, which is a function evaluation, not an equation-solving step.
+
+\begin{remark}
+This is the fundamental reason contour integral methods work for nonlinear eigenvalue problems: they convert the difficult task of ``solving a nonlinear equation for $\lambda$'' into the much easier tasks of ``evaluating $\mathbf{\Sigma}^{C}(z_j)$ at fixed $z_j$'' and ``solving a linear system with the resulting constant matrix.''
+\end{remark}
+
+\subsection{Mechanism 2: Spectral Projection via the Resolvent Poles}
+
+The contour integral $\frac{1}{2\pi\mathbf{i}} \oint_{\Gamma} \mathbf{T}^{-1}(z)\,dz$ acts as a spectral projector \textbf{regardless of the nature of the $z$-dependence in $\mathbf{T}(z)$}, as established by Keldysh's theorem (Theorem~\ref{thm:keldysh}). The only requirement is that $\mathbf{T}(z)$ is holomorphic inside $\Gamma$ except at the eigenvalues.
+
+The key mathematical fact:
+\begin{quote}
+\key{The eigenvalues of the nonlinear problem $\mathbf{T}(\lambda)\mathbf{x} = \mathbf{0}$ are exactly the poles of the resolvent $\mathbf{T}^{-1}(z)$ inside $\Gamma$.}
+\end{quote}
+
+\textbf{Proof:} If $\det\mathbf{T}(\lambda) = 0$, then $\mathbf{T}(\lambda)$ is singular and $\mathbf{T}^{-1}(\lambda)$ does not exist (it has a pole). Conversely, if $z$ is not an eigenvalue, $\det\mathbf{T}(z) \neq 0$, and $\mathbf{T}^{-1}(z)$ is a well-defined holomorphic matrix function (by Cramer's rule and the holomorphicity of $\mathbf{T}(z)$).
+
+The contour integral therefore ``counts'' and ``extracts'' these poles through the residue theorem, projecting onto the associated eigenspace. Whether the $z$-dependence is linear ($z\mathbf{I} - \mathbf{A}$), polynomial ($\sum z^{m}\mathbf{A}_m$), or general nonlinear (involving $\mathbf{\Sigma}^{C}(z)$) does not change this fundamental mechanism --- it only changes the specific form of the residues.
+
+\subsection{Mechanism 3: Residual-Driven Iterative Refinement as a Newton-Type Method}
+
+The contour integral with $\mathbf{R} \neq \mathbf{0}$ incorporates a correction term. We now show that this amounts to a \textbf{Newton-type iteration} in the reduced subspace.
+
+Consider a single eigenpair $(\lambda, \mathbf{x})$. The residual is $\mathbf{r} = \mathbf{T}(\lambda)\mathbf{x}$. For a small perturbation $(\delta\lambda, \delta\mathbf{x})$, the first-order Taylor expansion of $\mathbf{T}(\lambda + \delta\lambda)(\mathbf{x} + \delta\mathbf{x})$ around $(\lambda, \mathbf{x})$ gives:
+\begin{equation}\label{eq:taylor}
+\mathbf{T}(\lambda + \delta\lambda)(\mathbf{x} + \delta\mathbf{x}) \approx \mathbf{T}(\lambda)\mathbf{x} + \mathbf{T}(\lambda)\delta\mathbf{x} + \frac{\partial\mathbf{T}}{\partial z}(\lambda)\,\mathbf{x}\,\delta\lambda.
+\end{equation}
+
+Setting this to zero (Newton's method for NEP) yields a linear system coupling $\delta\mathbf{x}$ and $\delta\lambda$. The FEAST contour integral \eqref{eq:feast_Qk} with $\mathbf{R} = \mathbf{T}(\lambda)\mathbf{x}$ can be interpreted as performing this Newton correction implicitly through the resolvent $\mathbf{T}^{-1}(z)$, but \textbf{projected onto the subspace of interest} via the contour integration.
+
+Specifically, the correction term $\mathbf{T}^{-1}(z)\mathbf{R}$ expands (using the Keldysh representation near $\lambda$) as:
+\begin{equation}\label{eq:correction_expansion}
+\mathbf{T}^{-1}(z)\,\mathbf{r} \approx \frac{\mathbf{x}\,\mathbf{y}^{H}\mathbf{r}}{z - \lambda} + \text{holomorphic terms},
+\end{equation}
+and the contour integral extracts the pole contribution $\mathbf{x}(\mathbf{y}^{H}\mathbf{r})$, directing the residual information back to the eigenvector correction.
+
+\subsection{Mechanism 4: The Preconditioner Simplification (Crucial Practical Insight)}
+
+The paper reports a remarkable numerical observation \cite{Li2025}:
+
+\begin{quote}
+\key{Even if the correlation term $\mathbf{\Sigma}^{C}(z_j)$ is completely omitted from the linear systems~\eqref{eq:gw_linear_system}, the FEAST algorithm still converges to the correct nonlinear eigenvalues.}
+\end{quote}
+
+This means the linear systems can be simplified to:
+\begin{equation}\label{eq:simplified_system}
+\boxed{\bigl[z_j\mathbf{S} - \mathbf{h} - \mathbf{\Sigma}^{X}\bigr]\,\mathbf{X}_j = \mathbf{R}}.
+\end{equation}
+
+\textbf{Why this works:} The simplified matrix $\tilde{\mathbf{T}}(z) = z\mathbf{S} - \mathbf{h} - \mathbf{\Sigma}^{X}$ acts as a \textbf{preconditioner} for the full $\mathbf{T}(z)$. The spectral projector obtained from $\tilde{\mathbf{T}}^{-1}(z)$ approximates the true projector from $\mathbf{T}^{-1}(z)$ closely enough (since $\mathbf{\Sigma}^{X}$ dominates the self-energy for many systems) to guide the subspace iteration. The true nonlinearity is still accounted for in the \textbf{residual computation} $\mathbf{r}_i = \mathbf{T}(\lambda_i)\mathbf{x}_i$ (Step~7), which uses the full $\mathbf{T}(z)$ including $\mathbf{\Sigma}^{C}(\lambda_i)$.
+
+This simplification dramatically reduces computational cost:
+\begin{itemize}
+    \item The expensive $\mathbf{\Sigma}^{C}(z_j)$ evaluation and assembly is needed only for the $m_0$ residual computations per iteration, not for the $N_q$ linear system solves.
+    \item Since $N_q \sim 8{-}16$ (quadrature nodes) typically exceeds $m_0$ (number of eigenvalues in the window), this is a significant saving.
+    \item The linear systems become ``standard'' complex-shifted systems $[z_j\mathbf{S} - \mathbf{H}_0]$, solvable with standard sparse direct or iterative methods.
+\end{itemize}
+
+%=====================================================================
+\section{Convergence Analysis}
+%=====================================================================
+
+\subsection{Quadrature Accuracy Does Not Determine Final Accuracy}
+
+A crucial property of the FEAST algorithm is:
+
+\begin{theorem}[Quadrature Independence of Final Accuracy]\label{thm:quad_independent}
+The accuracy of the converged eigenpairs from Algorithm~\ref{alg:feast} is independent of the number of quadrature nodes $N_q$ and the precision of the quadrature weights. The quadrature quality affects only the \textbf{convergence rate}, not the final result.
+\end{theorem}
+
+\begin{proof}[Sketch of Proof]
+The residual check $\|\mathbf{T}(\lambda_i)\mathbf{x}_i\| < \tau$ is evaluated directly in the original space using the exact $\mathbf{T}(\lambda_i)$. The contour quadrature provides only the \textbf{search direction} for the subspace iteration. As long as the quadrature is sufficiently accurate to capture the correct invariant subspace (which requires $N_q$ large enough to resolve the poles inside $\Gamma$), the Rayleigh-Ritz procedure and residual computation guarantee that convergence proceeds to the true eigenpairs of the original problem. The quadrature error manifests as a perturbation to the subspace iteration, which is corrected in subsequent iterations.
+\end{proof}
+
+\subsection{Convergence Rate}
+
+The convergence of FEAST for nonlinear problems can be analyzed through the subspace iteration framework. At each iteration, the spectral projector $\mathbf{P}_{\Gamma}$ (exact or approximate) is applied to the current subspace. The convergence factor for eigenpair $i$ is approximately:
+\begin{equation}\label{eq:convergence_factor}
+\rho_i \approx \max_{\lambda_k \notin \Gamma} \left|\frac{\oint_{\Gamma} (z - \lambda_i)^{-1}\,dz}{\oint_{\Gamma} (z - \lambda_k)^{-1}\,dz}\right| \cdot \frac{\|\mathbf{r}_i\|}{\text{gap}(\lambda_i)},
+\end{equation}
+where $\text{gap}(\lambda_i) = \min_{\lambda_j \neq \lambda_i} |\lambda_i - \lambda_j|$ is the eigenvalue gap. Better quadrature (more nodes, better contour shape) reduces the first factor, while smaller residuals reduce the second.
+
+In practice, $N_q \approx 8{-}10$ and $3{-}5$ iterations typically suffice for convergence to machine precision \cite{Li2025}.
+
+\subsection{Mixed-Precision Opportunities}
+
+The linear systems at quadrature nodes can be solved with \textbf{reduced accuracy} (e.g., relative residual $\sim 10^{-2}$) without affecting final convergence \cite{Brenneck2020}. This enables mixed-precision strategies:
+\begin{itemize}
+    \item Low-precision (single/half) for the $N_q$ linear solves at each FEAST iteration.
+    \item High-precision (double) for the reduced eigenvalue problem $\mathbf{C}\mathbf{W} = \mathbf{W}\mathbf{\Lambda}$ and residual computation.
+\end{itemize}
+
+%=====================================================================
+\section{Hypercomplex Numbers in FEAST-GW}
+%=====================================================================
+
+\subsection{The Problem: Two Types of Imaginary Components}
+
+The contour deformation (CD) method for computing $\Sigma^{C}$ involves integrals over both real and imaginary frequency axes. When combined with FEAST:
+\begin{itemize}
+    \item The FEAST quadrature nodes $z_j$ are \textbf{complex numbers} with an imaginary part $\ImOp(z_j)$ related to the contour shape.
+    \item The Green's function $G_0$ involves an integration over \textbf{imaginary frequencies} $\mathbf{i}\omega$.
+\end{itemize}
+
+Naively mixing these two imaginary components leads to confusion: which ``$\mathbf{i}$'' belongs to which integration? The CD self-energy expression (Eq.~(10) in~\cite{Li2025}):
+\begin{equation}\label{eq:CD_sigma}
+\Sigma^{C}(z_j) = \mp\sum_{m}^{\text{poles}} \psi_m\psi_m^{*} W_0^{C}(\varepsilon_m - z_j)
+- \frac{1}{2\pi} \int G_0(z_j + \mathbf{i}\omega)\,W_0^{C}(\mathbf{i}\omega)\,d\omega
+\end{equation}
+mixes the FEAST complex energy $z_j$ with the imaginary integration variable $\mathbf{i}\omega$.
+
+\subsection{Solution: Quaternion Algebra}
+
+To cleanly separate the two types of imaginary components, the energy domain is extended to the quaternion (hypercomplex) space $\mathbb{H}$:
+\begin{equation}\label{eq:quaternion}
+\boxed{q = \varepsilon + \mathbf{i}\omega + \mathbf{j}\gamma + \mathbf{k}\zeta \in \mathbb{H}},
+\end{equation}
+with the quaternion multiplication rules:
+\begin{equation}
+\mathbf{i}^2 = \mathbf{j}^2 = \mathbf{k}^2 = \mathbf{i}\mathbf{j}\mathbf{k} = -1.
+\end{equation}
+
+In this representation:
+\begin{itemize}
+    \item $\varepsilon$: real energy (real axis)
+    \item $\mathbf{i}$: Green's function imaginary frequency direction
+    \item $\mathbf{j}$: FEAST contour imaginary part ($\gamma = \ImOp(z_j)$)
+    \item $\mathbf{k}$: dummy component ($\zeta = 0$), introduced to complete the quaternion basis
+\end{itemize}
+
+\subsection{Reduction to the Complex Plane}
+
+For the real part of $\Sigma^{C}$ (which is what enters the quasiparticle energy), symmetry arguments show that after completing the $\mathbf{i}\omega$ integration in the second term of~\eqref{eq:CD_sigma}, the $\mathbf{i}$ and $\mathbf{k}$ imaginary components cancel (they appear in conjugate pairs from positive and negative $\omega$). Only the $\mathbf{j}$ component survives.
+
+Therefore, the practical calculation reduces to:
+\begin{equation}\label{eq:reduced_sigma}
+\Sigma^{C}(z_j) = \mp\sum_{m}^{\text{poles}} \psi_m\psi_m^{*} W_0^{C}(\varepsilon_m - z_j)
+- \frac{1}{2\pi} \int \Bigl[\ReOp(G_0(q)) + \ImOp^{\{\mathbf{j}\}}(G_0(q))\Bigr]\,\ReOp(W_0^{C}(\mathbf{i}\omega))\,d\omega.
+\end{equation}
+
+The Green's function $G_0$ is temporarily computed in quaternion space (to track the $\mathbf{j}$ component), and then only the real and $\mathbf{j}$-imaginary parts are extracted and combined with the real part of $W_0^{C}$.
+
+\subsection{The Fully Analytic Alternative}
+
+When using the Casida-equation (fully analytic) approach to compute $\Sigma^{C}$, the correlation self-energy has the explicit form:
+\begin{equation}\label{eq:analytic_sigma}
+\Sigma^{C}(\varepsilon) = \sum_{n}\sum_{s} \frac{\psi_n V_s V_s \psi_n^{*}}{\varepsilon - \varepsilon_n \pm \Omega_s \mp \mathbf{i}\eta},
+\end{equation}
+which is a real-valued rational function of $\varepsilon$ (after smearing out the $\mathbf{i}\eta$). Substituting the complex FEAST node $z_j$ for $\varepsilon$ is then straightforward using standard complex arithmetic --- \textbf{no quaternion algebra is needed}.
+
+%=====================================================================
+\section{Complete Workflow Summary}
+%=====================================================================
+
+\subsection{Algorithmic Flow for $G_0W_0$ with FEAST}
+
+\begin{enumerate}[leftmargin=*,itemsep=3pt]
+    \item \textbf{Preprocessing:} Solve the mean-field (KS or HF) problem to obtain $\{\varepsilon_n^{\text{MF}}, \psi_n^{\text{MF}}\}$, construct $\mathbf{h}$, $\mathbf{S}$, $\mathbf{\Sigma}^{X}$, and the machinery to evaluate $\mathbf{\Sigma}^{C}(z)$ at any $z \in \mathbb{C}$.
+
+    \item \textbf{Contour selection:} Choose a contour $\Gamma$ in the complex plane enclosing the target energy window (e.g., HOMO and LUMO energies). An elliptical contour centered on the real axis is typical.
+
+    \item \textbf{Quadrature setup:} Select $N_q \approx 8{-}16$ Gauss-Legendre nodes $\{z_j, w_j\}$ along $\Gamma$.
+
+    \item \textbf{Initialization:} Generate random $\mathbf{X} \in \mathbb{R}^{n \times m_0}$ ($m_0$ slightly larger than the expected number of eigenvalues inside $\Gamma$). Set $\mathbf{R} = \mathbf{X}$.
+
+    \item \textbf{FEAST iteration} (repeat until convergence):
+    \begin{enumerate}
+        \item For each $z_j$: evaluate $\mathbf{\Sigma}^{C}(z_j)$ (possibly using quaternion arithmetic for the CD method, or direct complex evaluation for the fully analytic method).
+        \item Solve $\mathbf{T}(z_j)\mathbf{X}_j = \mathbf{R}$ (or the simplified preconditioned version).
+        \item Compute $\mathbf{Y}_j$, assemble $\mathbf{Q}_0$, $\mathbf{Q}_1$.
+        \item QR-factor $\mathbf{Q}_0$, form $\mathbf{C}$, solve the reduced $m_0 \times m_0$ eigenproblem.
+        \item Update $\mathbf{X}$, $\mathbf{\Lambda}$.
+        \item Compute residuals $\mathbf{r}_i = \mathbf{T}(\lambda_i)\mathbf{x}_i$ (using the full $\mathbf{T}$ with $\mathbf{\Sigma}^{C}$).
+    \end{enumerate}
+
+    \item \textbf{Output:} All converged quasiparticle energies and wave functions within $\Gamma$.
+\end{enumerate}
+
+\subsection{Key Properties}
+
+\begin{center}
+\begin{tabular}{p{0.45\textwidth} p{0.45\textwidth}}
+\toprule
+\multicolumn{1}{c}{\textbf{Property}} & \multicolumn{1}{c}{\textbf{Implication}} \\
+\midrule
+Contour selects energy window & Compute only eigenpairs of interest, not the full spectrum \\
+\addlinespace
+Quadrature nodes are independent & $N_q$ linear systems solvable in parallel \\
+\addlinespace
+Final accuracy independent of $N_q$ & Few quadrature nodes ($\sim$10) suffice \\
+\addlinespace
+Mixed-precision possible & Low-precision linear solves + high-precision residual \\
+\addlinespace
+Preconditioner simplification & $\mathbf{\Sigma}^{C}$ needed only for residual, not linear solves \\
+\addlinespace
+Nonlinearity ``frozen'' at $z_j$ & Each $\mathbf{T}(z_j)$ is a constant matrix at fixed $z_j$ \\
+\addlinespace
+Residual-driven iteration & Newton-type convergence to machine precision \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%=====================================================================
+\section*{Acknowledgments}
+This document is a pedagogical exposition of the FEAST-GW method presented by Li and Polizzi in \textit{Physical Review B} \textbf{111}, 045137 (2025). All core ideas and algorithms are due to the original authors.
+
+%=====================================================================
+\begin{thebibliography}{99}
+
+\bibitem{Li2025}
+D.~Li and E.~Polizzi,
+\emph{Nonlinear eigenvalue algorithm for GW quasiparticle equations},
+Phys. Rev. B \textbf{111}, 045137 (2025).
+
+\bibitem{Polizzi2009}
+E.~Polizzi,
+\emph{Density-matrix-based algorithm for solving eigenvalue problems},
+Phys. Rev. B \textbf{79}, 115112 (2009).
+
+\bibitem{Gavin2018}
+B.~Gavin, A.~Międlar, and E.~Polizzi,
+\emph{FEAST eigensolver for nonlinear eigenvalue problems},
+J. Comput. Sci. \textbf{27}, 107 (2018).
+
+\bibitem{Brenneck2020}
+J.~Brenneck and E.~Polizzi,
+\emph{An iterative method for contour-based nonlinear eigensolvers},
+arXiv:2007.03000 (2020).
+
+\bibitem{Beyn2012}
+W.-J.~Beyn,
+\emph{An integral method for solving nonlinear eigenvalue problems},
+BIT Numer. Math. \textbf{52}, 109 (2012).
+
+\bibitem{Hedin1965}
+L.~Hedin,
+\emph{New method for calculating the one-particle Green's function with application to the electron-gas problem},
+Phys. Rev. \textbf{139}, A796 (1965).
+
+\bibitem{Guttel2017}
+S.~G\"{u}ttel and F.~Tisseur,
+\emph{The nonlinear eigenvalue problem},
+Acta Numerica \textbf{26}, 1 (2017).
+
+\end{thebibliography}
+
+\end{document}

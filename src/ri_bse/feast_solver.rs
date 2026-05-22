@@ -28,18 +28,69 @@ use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
-// 8-point Gauss-Legendre quadrature nodes and weights (from Appendix A)
+// Gauss-Legendre quadrature node/weight generation for arbitrary n
 // ---------------------------------------------------------------------------
-const GL_POINTS: [(f64, f64); 8] = [
-    (-0.960289856497536, 0.101228536290376),
-    (-0.796666477413626, 0.222381034453374),
-    (-0.525532409916328, 0.313706645877887),
-    (-0.183434642495649, 0.362683783378361),
-    ( 0.183434642495649, 0.362683783378361),
-    ( 0.525532409916328, 0.313706645877887),
-    ( 0.796666477413626, 0.222381034453374),
-    ( 0.960289856497536, 0.101228536290376),
-];
+
+/// Compute n-point Gauss-Legendre quadrature nodes and weights on [-1, 1].
+///
+/// Uses the Newton-Raphson method on Legendre polynomials to find roots.
+/// Returns Vec<(node, weight)>.
+fn gauss_legendre_nodes(n: usize) -> Vec<(f64, f64)> {
+    if n == 0 {
+        return vec![];
+    }
+    if n == 1 {
+        return vec![(0.0, 2.0)];
+    }
+
+    let eps = 1e-15;
+    let np1 = n as f64;
+    let mut points = Vec::with_capacity(n);
+
+    for i in 0..n {
+        // Initial guess: symmetric cosine approximation
+        let z = (std::f64::consts::PI * (i as f64 + 0.75) / (n as f64 + 0.5)).cos();
+
+        // Newton-Raphson to find the root
+        let mut z_curr = z;
+        loop {
+            // Compute P_n(z_curr) via recurrence
+            let mut p_prev = 1.0; // P_0
+            let mut p_curr = z_curr; // P_1
+            for k in 1..n {
+                let kf = k as f64;
+                let p_next = ((2.0 * kf + 1.0) * z_curr * p_curr - kf * p_prev) / (kf + 1.0);
+                p_prev = p_curr;
+                p_curr = p_next;
+            }
+            // P'_n = n * (x * P_n - P_{n-1}) / (x² - 1)
+            let pp = np1 * (z_curr * p_curr - p_prev) / (z_curr * z_curr - 1.0);
+            let delta = p_curr / pp;
+            z_curr -= delta;
+            if delta.abs() <= eps {
+                break;
+            }
+        }
+
+        // Final node
+        let node = z_curr;
+
+        // Recompute P_n and P_{n-1} for the converged node
+        let mut p_prev = 1.0;
+        let mut p_curr = node;
+        for k in 1..n {
+            let kf = k as f64;
+            let p_next = ((2.0 * kf + 1.0) * node * p_curr - kf * p_prev) / (kf + 1.0);
+            p_prev = p_curr;
+            p_curr = p_next;
+        }
+        let pp = np1 * (node * p_curr - p_prev) / (node * node - 1.0);
+        // weight = 2 / ((1 - x²) · [P'_n(x)]²)
+        let weight = 2.0 / ((1.0 - node * node) * pp * pp);
+        points.push((node, weight));
+    }
+    points
+}
 
 // ============================================================================
 // Section 1: CG Solver — standard Conjugate Gradient
@@ -518,6 +569,7 @@ pub fn feast(
     init_guess_type: &str,
     init_diag: Option<&Vec<f64>>,
     gaussian_width_factor: f64,
+    n_quad: usize,
 ) -> Vec<(f64, Vec<f64>)> {
     // ---- Step 0: parameters ------------------------------------------------
     let c = (λ_max + λ_min) / 2.0; // centre of the contour
@@ -541,7 +593,8 @@ pub fn feast(
         cosθ: f64,
         sinθ: f64,
     }
-    let quad: Vec<QuadData> = GL_POINTS
+    let gl_points = gauss_legendre_nodes(n_quad);
+    let quad: Vec<QuadData> = gl_points
         .iter()
         .map(|&(x_e, w_e)| {
             let θ = -std::f64::consts::PI * (x_e - 1.0) / 2.0; // θ ∈ [0, π]
@@ -923,8 +976,12 @@ fn extract_eigenpairs(
 /// FEAST solver for singlet BSE excitations (handles both TDA and non-TDA).
 pub fn feast_solve_bse_singlet(scf_data:&SCF)->Vec<(f64,Vec<f64>)>{
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let eigenrange_min=qp_ctrl.bse_eigenrange_min*qp_ctrl.bse_eigenrange_min;
-    let eigenrange_max=qp_ctrl.bse_eigenrange_max*qp_ctrl.bse_eigenrange_max;
+    let mut eigenrange_min=qp_ctrl.bse_eigenrange_min;
+    let mut eigenrange_max=qp_ctrl.bse_eigenrange_max;
+    if qp_ctrl.bse_tda==false{
+        eigenrange_min=qp_ctrl.bse_eigenrange_min*qp_ctrl.bse_eigenrange_min;
+        eigenrange_max=qp_ctrl.bse_eigenrange_max*qp_ctrl.bse_eigenrange_max;
+    }
     let m_expected=qp_ctrl.bse_m_expected;
     let max_feast_iter=qp_ctrl.bse_max_feast_iter;
     let tol_feast=qp_ctrl.bse_tol_feast;
@@ -938,8 +995,12 @@ pub fn feast_solve_bse_singlet(scf_data:&SCF)->Vec<(f64,Vec<f64>)>{
 /// FEAST solver for triplet BSE excitations (handles both TDA and non-TDA).
 pub fn feast_solve_bse_triplet(scf_data:&SCF)->Vec<(f64,Vec<f64>)>{
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let eigenrange_min=qp_ctrl.bse_eigenrange_min*qp_ctrl.bse_eigenrange_min;
-    let eigenrange_max=qp_ctrl.bse_eigenrange_max*qp_ctrl.bse_eigenrange_max;
+    let mut eigenrange_min=qp_ctrl.bse_eigenrange_min;
+    let mut eigenrange_max=qp_ctrl.bse_eigenrange_max;
+    if qp_ctrl.bse_tda==false{
+        eigenrange_min=qp_ctrl.bse_eigenrange_min*qp_ctrl.bse_eigenrange_min;
+        eigenrange_max=qp_ctrl.bse_eigenrange_max*qp_ctrl.bse_eigenrange_max;
+    }
     let m_expected=qp_ctrl.bse_m_expected;
     let max_feast_iter=qp_ctrl.bse_max_feast_iter;
     let tol_feast=qp_ctrl.bse_tol_feast;
@@ -1025,12 +1086,14 @@ fn feast_solve_bse_tda(
     let gmres_restart = qp_ctrl.bse_feast_gmres_restart;
     let gmres_max_iter = qp_ctrl.bse_feast_gmres_max_iter;
     let gmres_tol = qp_ctrl.bse_feast_cg_tol;
+    let n_quad = qp_ctrl.bse_feast_n_quad;
     feast(occ_size*vir_size,&feast_a_matvec,&feast_b_matvec,None,None,
           eigenrange_min,eigenrange_max,m_expected,max_feast_iter,tol_feast,
           gmres_restart,gmres_max_iter,gmres_tol,
           Some(&diag_a),
           &qp_ctrl.bse_feast_init_guess_type, Some(&diag_a),
-          qp_ctrl.bse_feast_gaussian_width_factor)
+          qp_ctrl.bse_feast_gaussian_width_factor,
+          n_quad)
 }
 
 /// Non-TDA branch for a single spin.
@@ -1110,7 +1173,8 @@ fn feast_solve_bse_nontda(
                              gmres_restart,gmres_max_iter,gmres_tol,
                              Some(&diag_sq),
                              &qp_ctrl.bse_feast_init_guess_type, Some(&diag),
-                             qp_ctrl.bse_feast_gaussian_width_factor);
+                             qp_ctrl.bse_feast_gaussian_width_factor,
+                             qp_ctrl.bse_feast_n_quad);
     eigenpairs_xpy.iter().map(|(omega2,xpy)|{
         let xmy=feast_a_matvec(xpy);
         (omega2.sqrt(),xmy.iter().zip(xpy.iter()).map(|(xmy_k,xpy_k)|(xmy_k/omega2.sqrt())+xpy_k).collect::<Vec<_>>())
@@ -1121,8 +1185,12 @@ fn feast_solve_bse_nontda(
 pub fn feast_solve_bse(scf_data:&SCF)->(Vec<(f64,Vec<f64>)>,Vec<(f64,Vec<f64>)>){
     let start=Instant::now();
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let eigenrange_min=qp_ctrl.bse_eigenrange_min*qp_ctrl.bse_eigenrange_min;
-    let eigenrange_max=qp_ctrl.bse_eigenrange_max*qp_ctrl.bse_eigenrange_max;
+    let mut eigenrange_min=qp_ctrl.bse_eigenrange_min;
+    let mut eigenrange_max=qp_ctrl.bse_eigenrange_max;
+    if qp_ctrl.bse_tda==false{
+        eigenrange_min=qp_ctrl.bse_eigenrange_min*qp_ctrl.bse_eigenrange_min;
+        eigenrange_max=qp_ctrl.bse_eigenrange_max*qp_ctrl.bse_eigenrange_max;
+    }
     let m_expected=qp_ctrl.bse_m_expected;
     let max_feast_iter=qp_ctrl.bse_max_feast_iter;
     let tol_feast=qp_ctrl.bse_tol_feast;
