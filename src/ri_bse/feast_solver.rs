@@ -866,6 +866,7 @@ pub fn feast(
         let trace_new: f64 = inside.iter().map(|&j| lambda[j]).sum();
         if iter > 0 {
             let δ_trace = (trace_new - trace_old).abs() / scale;
+            println!("  FEAST iter {}: trace change δ = {:.2e} (tol = {:.2e})", iter, δ_trace, tol_feast);
             if δ_trace <= tol_feast {
                 // Build final result
                 return extract_eigenpairs(
@@ -1121,8 +1122,10 @@ fn feast_solve_bse_nontda(
 pub fn feast_solve_bse(scf_data:&SCF)->(Vec<(f64,Vec<f64>)>,Vec<(f64,Vec<f64>)>){
     let start=Instant::now();
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let eigenrange_min=qp_ctrl.bse_eigenrange_min*qp_ctrl.bse_eigenrange_min;
-    let eigenrange_max=qp_ctrl.bse_eigenrange_max*qp_ctrl.bse_eigenrange_max;
+    let eigenrange_min_orig = qp_ctrl.bse_eigenrange_min;
+    let eigenrange_max_orig = qp_ctrl.bse_eigenrange_max;
+    let eigenrange_min = eigenrange_min_orig * eigenrange_min_orig;
+    let eigenrange_max = eigenrange_max_orig * eigenrange_max_orig;
     let m_expected=qp_ctrl.bse_m_expected;
     let max_feast_iter=qp_ctrl.bse_max_feast_iter;
     let tol_feast=qp_ctrl.bse_tol_feast;
@@ -1145,7 +1148,7 @@ pub fn feast_solve_bse(scf_data:&SCF)->(Vec<(f64,Vec<f64>)>,Vec<(f64,Vec<f64>)>)
         qp_ctrl_s.bse_spin=String::from("singlet");
         eigenpairs_singlet=feast_solve_bse_tda(
             scf_data,&qp_ctrl_s,&inverse_dielectric,occ_size,vir_size,
-            eigenrange_min,eigenrange_max,m_expected,max_feast_iter,tol_feast);
+            eigenrange_min_orig,eigenrange_max_orig,m_expected,max_feast_iter,tol_feast);
         let one_feast_time=start.elapsed();
         println!("Singlets (FEAST) calculation took {:?}",one_feast_time);
 
@@ -1154,7 +1157,7 @@ pub fn feast_solve_bse(scf_data:&SCF)->(Vec<(f64,Vec<f64>)>,Vec<(f64,Vec<f64>)>)
         qp_ctrl_t.bse_spin=String::from("triplet");
         eigenpairs_triplet=feast_solve_bse_tda(
             scf_data,&qp_ctrl_t,&inverse_dielectric,occ_size,vir_size,
-            eigenrange_min,eigenrange_max,m_expected,max_feast_iter,tol_feast);
+            eigenrange_min_orig,eigenrange_max_orig,m_expected,max_feast_iter,tol_feast);
         println!("Triplets (FEAST) calculation took {:?}",start.elapsed()-one_feast_time);
     }else{
         // ---- non-TDA branch: singlet ----
