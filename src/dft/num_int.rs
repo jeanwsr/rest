@@ -1,9 +1,11 @@
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use rayon::prelude::*;
 use rstsr::prelude::*;
-use rest_tensors::{MatrixFull, RIFull};
+use rest_tensors::{MatrixFull, MatrixFullSlice, RIFull};
 use rest_tensors::matrix_blas_lapack::{ _einsum_01_serial, _einsum_02_serial};
 use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
-use tensors::matrix_blas_lapack::{_dgemm};
+use tensors::matrix_blas_lapack::{_dgemm, omp_set_num_threads_wrapper, omp_get_num_threads_wrapper};
 use crate::scf_io::SCF;
 use crate::molecule_io::Molecule;
 use crate::basis_io::{spheric_gto_deriv_batch_serial};
@@ -607,8 +609,32 @@ pub fn prepare_fxc_data(scf: &SCF) -> FXCMatvecData {
     }
 }
 
-/// Dispatch fxc matrix-vector product based on functional type
+// ── Global flag to enable the optimised (rayon-parallel) kernel ──
+static USE_OPTIMIZED_FXC: AtomicBool = AtomicBool::new(true);
+
+/// Set whether the production `fxc_matvec` should use the optimised kernel.
+///
+/// Call once during initialisation, before any TDDFT solve loop.
+/// The flag is read on every invocation so it can be toggled between
+/// calculations, but it is not synchronised with in-flight calls.
+pub fn set_fxc_use_optimized(flag: bool) {
+    USE_OPTIMIZED_FXC.store(flag, Ordering::Relaxed);
+}
+
+/// Production router: delegates to optimised or original kernel based on
+/// the global `tddft_use_optimized_fxc` control flag.
 pub fn fxc_matvec(data: &FXCMatvecData, z: &[f64]) -> Vec<f64> {
+    if USE_OPTIMIZED_FXC.load(Ordering::Relaxed) {
+        fxc_matvec_opt(data, z)
+    } else {
+        fxc_matvec_old(data, z)
+    }
+}
+
+/// Original (non-optimised) dispatch — preserved for benchmarking and
+/// backward-compatible verification.
+#[allow(dead_code)]
+pub fn fxc_matvec_old(data: &FXCMatvecData, z: &[f64]) -> Vec<f64> {
     assert_eq!(z.len(), data.nocc * data.nvir,
                "z vector length {} must equal nocc×nvir = {}×{}",
                z.len(), data.nocc, data.nvir);
@@ -768,6 +794,694 @@ fn fxc_matvec_gga(data: &FXCMatvecData, z: &[f64]) -> Vec<f64> {
     }
 
     result
+}
+
+// ====================================================================
+// Optimized fxc_matvec implementations
+// ====================================================================
+
+/// Optimized dispatch: same interface as fxc_matvec, but with rayon
+/// parallelism over grid points, fused dot products (GGA), and reduced
+/// temporary allocation overhead.
+#[allow(dead_code)]
+pub fn fxc_matvec_opt(data: &FXCMatvecData, z: &[f64]) -> Vec<f64> {
+    assert_eq!(z.len(), data.nocc * data.nvir,
+               "z vector length {} must equal nocc×nvir = {}×{}",
+               z.len(), data.nocc, data.nvir);
+    match data.nvar {
+        1 => fxc_matvec_lda_opt(data, z),
+        4 => fxc_matvec_gga_opt(data, z),
+        _ => panic!("fxc_matvec_opt only supports LDA (nvar=1) and GGA (nvar=4)"),
+    }
+}
+
+/// Optimised LDA fxc matrix-vector product with cache-blocked step 3.
+///
+/// Key improvements over the original:
+/// - Direct raw-slice column access (no per-element bounds checks)
+/// - Rayon parallelisation over grid points
+/// - **Blocked contraction**: mo_vir columns are scaled and contracted in
+///   blocks of `BLOCK` grid columns so that the working set fits in L2/L3
+///   cache, reducing main-memory traffic by ~10× for the contraction step.
+/// - Temporary block-scaled matrices created without zeroing.
+const LDA_BLOCK: usize = 8192;
+#[allow(dead_code)]
+fn fxc_matvec_lda_opt(data: &FXCMatvecData, z: &[f64]) -> Vec<f64> {
+    let nocc = data.nocc;
+    let nvir = data.nvir;
+    let ngrids = data.ngrids;
+
+    // ── Step 1: z_mat * mo_vir  →  t (single BLAS call, unchanged) ──
+    let z_mat = MatrixFull::from_vec([nocc, nvir], z.to_vec()).unwrap();
+    let mut t = MatrixFull::new([nocc, ngrids], 0.0);
+    _dgemm_full(&z_mat, 'N', &data.mo_vir, 'N', &mut t, 1.0, 0.0);
+
+    let mo_occ_data = data.mo_occ.data.as_slice();
+    let mo_vir_data = data.mo_vir.data.as_slice();
+    let t_data = t.data.as_slice();
+    let wfxc = &data.wfxc;
+
+    // Pre-allocate result matrix (accumulated across blocks)
+    let mut result = MatrixFull::new([nocc, nvir], 0.0);
+
+    // ── Block loop: fuse Steps 1b, 2 & 3 for cache efficiency ──
+    //
+    // Each block processes `LDA_BLOCK` grid columns.  Steps 1b and 2
+    // (rho_z, fxc application) are cheap and done per-block.  Step 3
+    // scales mo_vir columns within the block and contracts via dgemm
+    // with beta=1.0 (in-place accumulation).
+    for g_start in (0..ngrids).step_by(LDA_BLOCK) {
+        let g_end = (g_start + LDA_BLOCK).min(ngrids);
+        let n_block = g_end - g_start;
+
+        // ── Step 1b: ρ_z for this block ──
+        let rho_block: Vec<f64> = (0..n_block).into_par_iter().map(|gb| {
+            let g = g_start + gb;
+            let off = g * nocc;
+            let mo = &mo_occ_data[off..off + nocc];
+            let tc = &t_data[off..off + nocc];
+            let mut sum = 0.0_f64;
+            for i in 0..nocc { sum += mo[i] * tc[i]; }
+            sum
+        }).collect();
+
+        // ── Step 2: v = wfxc × ρ_z for this block ──
+        let v_block: Vec<f64> = (0..n_block).into_par_iter()
+            .map(|gb| wfxc[g_start + gb] * rho_block[gb])
+            .collect();
+
+        // ── Step 3: scale mo_vir columns and contract via dgemm ──
+        let mut scaled = Vec::with_capacity(nvir * n_block);
+        unsafe { scaled.set_len(nvir * n_block); }
+        scaled.par_chunks_mut(nvir).enumerate().for_each(|(gb, chunk)| {
+            let g = g_start + gb;
+            let vg = v_block[gb];
+            let src_off = g * nvir;
+            for a in 0..nvir { chunk[a] = mo_vir_data[src_off + a] * vg; }
+        });
+        let scaled_mat = MatrixFull { size: [nvir, n_block], indicing: [1, nvir], data: scaled };
+
+        // View into mo_occ for this block
+        let mo_occ_slice = MatrixFullSlice {
+            size: &[nocc, n_block],
+            indicing: &[1, nocc],
+            data: &mo_occ_data[g_start * nocc..][..nocc * n_block],
+        };
+
+        _dgemm_full(&mo_occ_slice, 'N', &scaled_mat, 'T', &mut result, 1.0, 1.0);
+    }
+
+    result.data
+}
+
+/// Optimized GGA fxc matrix-vector product.
+///
+/// Key optimizations:
+/// - Direct raw-slice column access in all inner loops
+/// - Fused multi-dot-product loop (reads mo_occ[i,g] and t0[i,g] once
+///   instead of four times)
+/// - Rayon parallelisation over grid points for the rho computation and
+///   MO-vir/grad scaling
+/// - Temporary scaling matrices created without zero-initialisation
+/// - Block-fused grid processing: all steps (small dgemms, rho_z, fxc,
+///   contraction) performed per grid block, keeping MO data in cache.
+#[allow(dead_code)]
+/// Design (inspired by PySCF's grid-blocking approach):
+/// Process grid points in blocks.  For each block, ALL steps (small dgemms,
+/// rho_z, fxc, contraction) are performed, keeping MO data in L2/L3 cache
+/// across all 11 internal dgemms.
+const GGA_BLOCK: usize = 512;
+#[allow(dead_code)]
+fn fxc_matvec_gga_opt(data: &FXCMatvecData, z: &[f64]) -> Vec<f64> {
+    let nocc = data.nocc;
+    let nvir = data.nvir;
+    let ngrids = data.ngrids;
+
+    let mo_occ_grad = data.mo_occ_grad.as_ref().expect("GGA requires mo_occ_grad");
+    let mo_vir_grad = data.mo_vir_grad.as_ref().expect("GGA requires mo_vir_grad");
+
+    let z_mat = MatrixFull::from_vec([nocc, nvir], z.to_vec()).unwrap();
+
+    // Pre-fetch raw data slices for block slicing
+    let mo_occ_data  = data.mo_occ.data.as_slice();
+    let mo_vir_data  = data.mo_vir.data.as_slice();
+    let og_data: [&[f64]; 3] = [
+        mo_occ_grad[0].data.as_slice(),
+        mo_occ_grad[1].data.as_slice(),
+        mo_occ_grad[2].data.as_slice(),
+    ];
+    let vg_data: [&[f64]; 3] = [
+        mo_vir_grad[0].data.as_slice(),
+        mo_vir_grad[1].data.as_slice(),
+        mo_vir_grad[2].data.as_slice(),
+    ];
+    let wfxc_data = &data.wfxc;
+
+    let mut result = MatrixFull::new([nocc, nvir], 0.0);
+
+    // ── Block loop ──
+    for g_start in (0..ngrids).step_by(GGA_BLOCK) {
+        let g_end = (g_start + GGA_BLOCK).min(ngrids);
+        let n_block = g_end - g_start;
+
+        // ── Step 1: 4 small dgemms for this block ──
+        let mv_block = MatrixFullSlice {
+            size: &[nvir, n_block], indicing: &[1, nvir],
+            data: &mo_vir_data[g_start * nvir ..][.. nvir * n_block],
+        };
+        let mg_block: [MatrixFullSlice<'_, f64>; 3] = [
+            MatrixFullSlice { size: &[nvir, n_block], indicing: &[1, nvir],
+                data: &vg_data[0][g_start * nvir ..][.. nvir * n_block] },
+            MatrixFullSlice { size: &[nvir, n_block], indicing: &[1, nvir],
+                data: &vg_data[1][g_start * nvir ..][.. nvir * n_block] },
+            MatrixFullSlice { size: &[nvir, n_block], indicing: &[1, nvir],
+                data: &vg_data[2][g_start * nvir ..][.. nvir * n_block] },
+        ];
+
+        let mut t0   = MatrixFull::new([nocc, n_block], 0.0);
+        let mut tg0  = MatrixFull::new([nocc, n_block], 0.0);
+        let mut tg1  = MatrixFull::new([nocc, n_block], 0.0);
+        let mut tg2  = MatrixFull::new([nocc, n_block], 0.0);
+
+        _dgemm_full(&z_mat, 'N', &mv_block, 'N', &mut t0, 1.0, 0.0);
+        _dgemm_full(&z_mat, 'N', &mg_block[0], 'N', &mut tg0, 1.0, 0.0);
+        _dgemm_full(&z_mat, 'N', &mg_block[1], 'N', &mut tg1, 1.0, 0.0);
+        _dgemm_full(&z_mat, 'N', &mg_block[2], 'N', &mut tg2, 1.0, 0.0);
+
+        // ── Step 1b: fused dot products for ρ_z (parallel within block) ──
+        let rho_block: Vec<[f64; 4]> = (0..n_block).into_par_iter().map(|gb| {
+            let g = g_start + gb;
+            let off = g * nocc;
+            let mo   = &mo_occ_data[off .. off + nocc];
+            let tt0  = &t0.data[gb * nocc ..][..nocc];   // t0
+            let ttg0 = &tg0.data[gb * nocc ..][..nocc];  // t_grad[0]
+            let ttg1 = &tg1.data[gb * nocc ..][..nocc];  // t_grad[1]
+            let ttg2 = &tg2.data[gb * nocc ..][..nocc];  // t_grad[2]
+            let mut s = [0.0_f64; 7];
+            for i in 0..nocc {
+                let m = mo[i];
+                let t = tt0[i];
+                s[0] += m * t;
+                s[1] += og_data[0][off + i] * t;  // ∇_x occ × t0
+                s[2] += m * ttg0[i];              // occ × t_grad[0]
+                s[3] += og_data[1][off + i] * t;  // ∇_y occ × t0
+                s[4] += m * ttg1[i];              // occ × t_grad[1]
+                s[5] += og_data[2][off + i] * t;  // ∇_z occ × t0
+                s[6] += m * ttg2[i];              // occ × t_grad[2]
+            }
+            [s[0], s[1] + s[2], s[3] + s[4], s[5] + s[6]]
+        }).collect();
+
+        // ── Step 2: apply 4×4 fxc kernel on block ──
+        let mut fxc_eff = [0.0_f64; 4 * GGA_BLOCK];
+        for (gb, rc) in rho_block.iter().enumerate() {
+            let g = g_start + gb;
+            for alpha in 0..4 {
+                let mut sum = 0.0_f64;
+                for beta in 0..4 {
+                    sum += wfxc_data[g + alpha * ngrids + beta * 4 * ngrids] * rc[beta];
+                }
+                fxc_eff[gb + alpha * n_block] = sum;
+            }
+        }
+
+        // ── Step 3: contract back (7 small dgemms, in-place accumulation) ──
+        let mo_block = MatrixFullSlice {
+            size: &[nocc, n_block], indicing: &[1, nocc],
+            data: &mo_occ_data[g_start * nocc ..][.. nocc * n_block],
+        };
+        let mo_grad_block: [MatrixFullSlice<'_, f64>; 3] = [
+            MatrixFullSlice { size: &[nocc, n_block], indicing: &[1, nocc],
+                data: &og_data[0][g_start * nocc ..][.. nocc * n_block] },
+            MatrixFullSlice { size: &[nocc, n_block], indicing: &[1, nocc],
+                data: &og_data[1][g_start * nocc ..][.. nocc * n_block] },
+            MatrixFullSlice { size: &[nocc, n_block], indicing: &[1, nocc],
+                data: &og_data[2][g_start * nocc ..][.. nocc * n_block] },
+        ];
+
+        // beta=0 for first block * first alpha, otherwise beta=1
+        let first = g_start == 0;
+
+        for alpha in 0..4 {
+            let fxc_a = &fxc_eff[alpha * n_block .. (alpha + 1) * n_block];
+
+            // Scale mo_vir columns for this block (parallel)
+            let mut scaled = Vec::with_capacity(nvir * n_block);
+            unsafe { scaled.set_len(nvir * n_block); }
+            scaled.par_chunks_mut(nvir).enumerate().for_each(|(gb, chunk)| {
+                let g = g_start + gb;
+                let src = g * nvir;
+                for a in 0..nvir { chunk[a] = mo_vir_data[src + a] * fxc_a[gb]; }
+            });
+            let right = MatrixFull { size: [nvir, n_block], indicing: [1, nvir], data: scaled };
+            let beta = if first && alpha == 0 { 0.0 } else { 1.0 };
+
+            if alpha == 0 {
+                _dgemm_full(&mo_block, 'N', &right, 'T', &mut result, 1.0, beta);
+            } else {
+                let d = alpha - 1;
+                _dgemm_full(&mo_grad_block[d], 'N', &right, 'T', &mut result, 1.0, beta);
+
+                let mut gscaled = Vec::with_capacity(nvir * n_block);
+                unsafe { gscaled.set_len(nvir * n_block); }
+                gscaled.par_chunks_mut(nvir).enumerate().for_each(|(gb, chunk)| {
+                    let g = g_start + gb;
+                    let src = g * nvir;
+                    for a in 0..nvir { chunk[a] = vg_data[d][src + a] * fxc_a[gb]; }
+                });
+                let right_g = MatrixFull { size: [nvir, n_block], indicing: [1, nvir], data: gscaled };
+                _dgemm_full(&mo_block, 'N', &right_g, 'T', &mut result, 1.0, 1.0);
+            }
+        }
+    }
+
+    result.data
+}
+
+// ====================================================================
+// NWChem-style optimised fxc_matvec
+//
+// Key improvements over fxc_matvec_opt:
+// 1. wfxc stored in [α, β, g] layout for cache-friendly access
+// 2. Pre-allocated buffers for Step 3 scaling → no per-block allocations
+// 3. Adaptive LDA block size (avoids oversized working sets)
+// 4. Merged DGEMM for GGA α=1,2,3 (2 → 1 dgemm per α)
+// 5. Parallelised fxc kernel application (Step 2)
+// ====================================================================
+
+const NWCHEM_LDA_BLOCK: usize = 8192;
+const NWCHEM_GGA_BLOCK: usize = 1024;
+
+pub struct FXCMatvecDataNwchemOpt {
+    pub nvar: usize,
+    pub ngrids: usize,
+    pub nocc: usize,
+    pub nvir: usize,
+    pub mo_occ: MatrixFull<f64>,
+    pub mo_vir: MatrixFull<f64>,
+    pub mo_occ_grad: Option<[MatrixFull<f64>; 3]>,
+    pub mo_vir_grad: Option<[MatrixFull<f64>; 3]>,
+    /// fxc kernel × grid weights
+    /// LDA: vec[ngrids]
+    /// GGA: vec[4 × 4 × ngrids], layout wfxc[α*4*ngrids + β*ngrids + g]
+    pub wfxc: Vec<f64>,
+    // Pre-allocated buffers for Step 3 (GGA)
+    /// Combined left buffer [nocc × 2 × NWCHEM_GGA_BLOCK]
+    pub combined_left_buf: Vec<f64>,
+    /// Combined right buffer [nvir × 2 × NWCHEM_GGA_BLOCK]
+    pub combined_right_buf: Vec<f64>,
+}
+
+pub fn prepare_fxc_data_nwchem_opt(scf: &SCF) -> FXCMatvecDataNwchemOpt {
+    let (start_mo, _num_state, occ_size, vir_size, _homo, _lumo) =
+        tddft_occupation_parameters(scf);
+
+    let xc_data = &scf.mol.xc_data;
+    let xc_type = if xc_data.use_density_gradient() {
+        XCType::GGA
+    } else {
+        XCType::LDA
+    };
+    let nvar = match xc_type {
+        XCType::LDA => 1,
+        XCType::GGA => 4,
+        _ => panic!("fxc only supports LDA and GGA"),
+    };
+    let grids = scf.grids.as_ref().expect("DFT grids must be initialized for fxc");
+    let ngrids = grids.weights.len();
+    let num_basis = scf.mol.num_basis;
+    let weights = &grids.weights;
+    let ao = grids.ao.as_ref().expect("AO on grids must be tabulated");
+    let eigvec = &scf.eigenvectors[0];
+
+    // Extract MO coefficients
+    let mut c_occ = MatrixFull::new([num_basis, occ_size], 0.0);
+    for j in 0..occ_size {
+        for i in 0..num_basis {
+            c_occ[[i, j]] = eigvec[[i, start_mo + j]];
+        }
+    }
+    let mut c_vir = MatrixFull::new([num_basis, vir_size], 0.0);
+    for j in 0..vir_size {
+        for i in 0..num_basis {
+            c_vir[[i, j]] = eigvec[[i, _lumo + j]];
+        }
+    }
+
+    // Project MO values onto grids
+    let mut mo_occ = MatrixFull::new([occ_size, ngrids], 0.0);
+    _dgemm_full(&c_occ, 'T', ao, 'N', &mut mo_occ, 1.0, 0.0);
+    let mut mo_vir = MatrixFull::new([vir_size, ngrids], 0.0);
+    _dgemm_full(&c_vir, 'T', ao, 'N', &mut mo_vir, 1.0, 0.0);
+
+    // GGA: MO gradients
+    let (mo_occ_grad, mo_vir_grad) = if xc_type == XCType::GGA {
+        let aop = grids.aop.as_ref().expect("AO gradients needed for GGA fxc");
+        let mut og = [
+            MatrixFull::new([occ_size, ngrids], 0.0),
+            MatrixFull::new([occ_size, ngrids], 0.0),
+            MatrixFull::new([occ_size, ngrids], 0.0),
+        ];
+        let mut vg = [
+            MatrixFull::new([vir_size, ngrids], 0.0),
+            MatrixFull::new([vir_size, ngrids], 0.0),
+            MatrixFull::new([vir_size, ngrids], 0.0),
+        ];
+        for d in 0..3 {
+            let aop_d_slice = aop.get_reducing_matrix(d).unwrap();
+            let aop_d = MatrixFull::from_vec(
+                [num_basis, ngrids],
+                aop_d_slice.iter().cloned().collect(),
+            ).unwrap();
+            _dgemm_full(&c_occ, 'T', &aop_d, 'N', &mut og[d], 1.0, 0.0);
+            _dgemm_full(&c_vir, 'T', &aop_d, 'N', &mut vg[d], 1.0, 0.0);
+        }
+        (Some(og), Some(vg))
+    } else {
+        (None, None)
+    };
+
+    // Ground-state density on grids
+    let ao_deriv = if xc_type == XCType::GGA { 1 } else { 0 };
+    let ao_rifull = eval_ao_batch(&scf.mol, &grids.coordinates, ao_deriv, ngrids);
+    let mo_coeffs = vec![scf.eigenvectors[0].clone()];
+    let occ = vec![scf.occupation[0].clone()];
+    let rho_tensor = eval_rho5_batch(&ao_rifull, xc_type, &mo_coeffs, &occ, 1, ngrids);
+
+    let rho_array: Vec<f64> = {
+        let raw = rho_tensor.raw();
+        let offset = rho_tensor.offset();
+        raw[offset..offset + ngrids * nvar].to_vec()
+    };
+
+    let func_ids = &xc_data.dfa_compnt_scf;
+    let func_factors = &xc_data.dfa_paramr_scf;
+    let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_array, ngrids, 2);
+    let fxc_tensor = xc_tensors[2].as_ref()
+        .expect("fxc (deriv=2) should be available");
+    let fxc_raw: Vec<f64> = {
+        let raw = fxc_tensor.raw();
+        let offset = fxc_tensor.offset();
+        raw[offset..offset + ngrids * nvar * nvar].to_vec()
+    };
+
+    // fxc × weights stored in [α, β, g] layout
+    const SINGLET_FXC_FACTOR: f64 = 2.0;
+    let wfxc: Vec<f64> = if nvar == 1 {
+        (0..ngrids).map(|g| fxc_raw[g] * weights[g] * SINGLET_FXC_FACTOR).collect()
+    } else {
+        let mut wfxc = vec![0.0; ngrids * 16];
+        for alpha in 0..4 {
+            let off_out_a = alpha * 4 * ngrids;
+            let off_in_a  = alpha * ngrids;
+            for beta in 0..4 {
+                let off_out = off_out_a + beta * ngrids;
+                let off_in  = off_in_a + beta * 4 * ngrids;
+                let w = weights;
+                for g in 0..ngrids {
+                    wfxc[off_out + g] = fxc_raw[g + off_in] * w[g] * SINGLET_FXC_FACTOR;
+                }
+            }
+        }
+        wfxc
+    };
+
+    let combined_left_buf = vec![0.0; occ_size * NWCHEM_GGA_BLOCK * 2];
+    let combined_right_buf = vec![0.0; vir_size * NWCHEM_GGA_BLOCK * 2];
+
+    println!(
+        "FXCMatvecDataNwchemOpt: nocc={}, nvir={}, ngrids={}, nvar={}",
+        occ_size, vir_size, ngrids, nvar
+    );
+
+    FXCMatvecDataNwchemOpt {
+        nvar,
+        ngrids,
+        nocc: occ_size,
+        nvir: vir_size,
+        mo_occ,
+        mo_vir,
+        mo_occ_grad,
+        mo_vir_grad,
+        wfxc,
+        combined_left_buf,
+        combined_right_buf,
+    }
+}
+
+pub fn fxc_matvec_nwchem_opt(data: &mut FXCMatvecDataNwchemOpt, z: &[f64]) -> Vec<f64> {
+    assert_eq!(z.len(), data.nocc * data.nvir,
+               "z length {} must be nocc×nvir = {}×{}",
+               z.len(), data.nocc, data.nvir);
+    match data.nvar {
+        1 => fxc_matvec_lda_nwchem_opt(data, z),
+        4 => fxc_matvec_gga_nwchem_opt(data, z),
+        _ => panic!("fxc_matvec_nwchem_opt only supports LDA (nvar=1) and GGA (nvar=4)"),
+    }
+}
+
+fn fxc_matvec_lda_nwchem_opt(data: &FXCMatvecDataNwchemOpt, z: &[f64]) -> Vec<f64> {
+    let nocc = data.nocc;
+    let nvir = data.nvir;
+    let ngrids = data.ngrids;
+
+    // Step 1: z_mat × mo_vir → t
+    let z_mat = MatrixFull::from_vec([nocc, nvir], z.to_vec()).unwrap();
+    let mut t = MatrixFull::new([nocc, ngrids], 0.0);
+    _dgemm_full(&z_mat, 'N', &data.mo_vir, 'N', &mut t, 1.0, 0.0);
+
+    let mo_occ_data = data.mo_occ.data.as_slice();
+    let mo_vir_data = data.mo_vir.data.as_slice();
+    let t_data = t.data.as_slice();
+    let wfxc = &data.wfxc;
+
+    let mut result = MatrixFull::new([nocc, nvir], 0.0);
+
+    // Adaptive block size to keep scaled[nvir, block] in ~14 MB
+    let block_size = (NWCHEM_LDA_BLOCK)
+        .min(14_000_000 / (nvir * 8).max(1))
+        .max(256);
+
+    for g_start in (0..ngrids).step_by(block_size) {
+        let g_end = (g_start + block_size).min(ngrids);
+        let n_block = g_end - g_start;
+
+        // Step 1b + 2: ρ_z = Σ_i mo_occ[i,g] × t[i,g]; v = wfxc × ρ_z
+        let v_block: Vec<f64> = (0..n_block).into_par_iter().map(|gb| {
+            let g = g_start + gb;
+            let off = g * nocc;
+            let mo = &mo_occ_data[off..off + nocc];
+            let tc = &t_data[off..off + nocc];
+            let mut sum = 0.0;
+            for i in 0..nocc { sum += mo[i] * tc[i]; }
+            wfxc[g] * sum
+        }).collect();
+
+        // Step 3: scale mo_vir and contract
+        let mut scaled = Vec::with_capacity(nvir * n_block);
+        unsafe { scaled.set_len(nvir * n_block); }
+        scaled.par_chunks_mut(nvir).enumerate().for_each(|(gb, chunk)| {
+            let g = g_start + gb;
+            let src_off = g * nvir;
+            let vg = v_block[gb];
+            for a in 0..nvir { chunk[a] = mo_vir_data[src_off + a] * vg; }
+        });
+        let scaled_mat = MatrixFull { size: [nvir, n_block], indicing: [1, nvir], data: scaled };
+
+        let mo_occ_slice = MatrixFullSlice {
+            size: &[nocc, n_block],
+            indicing: &[1, nocc],
+            data: &mo_occ_data[g_start * nocc..][..nocc * n_block],
+        };
+
+        let beta = if g_start == 0 { 0.0 } else { 1.0 };
+        _dgemm_full(&mo_occ_slice, 'N', &scaled_mat, 'T', &mut result, 1.0, beta);
+    }
+
+    result.data
+}
+
+fn fxc_matvec_gga_nwchem_opt(data: &mut FXCMatvecDataNwchemOpt, z: &[f64]) -> Vec<f64> {
+    let nocc = data.nocc;
+    let nvir = data.nvir;
+    let ngrids = data.ngrids;
+
+    // Borrow buffers from data
+    let combined_left_buf  = &mut data.combined_left_buf;
+    let combined_right_buf = &mut data.combined_right_buf;
+
+    let mo_occ_grad = data.mo_occ_grad.as_ref().expect("GGA requires mo_occ_grad");
+    let mo_vir_grad = data.mo_vir_grad.as_ref().expect("GGA requires mo_vir_grad");
+
+    let z_mat = MatrixFull::from_vec([nocc, nvir], z.to_vec()).unwrap();
+
+    let mo_occ_data = data.mo_occ.data.as_slice();
+    let mo_vir_data = data.mo_vir.data.as_slice();
+    let og_data: [&[f64]; 3] = [
+        mo_occ_grad[0].data.as_slice(),
+        mo_occ_grad[1].data.as_slice(),
+        mo_occ_grad[2].data.as_slice(),
+    ];
+    let vg_data: [&[f64]; 3] = [
+        mo_vir_grad[0].data.as_slice(),
+        mo_vir_grad[1].data.as_slice(),
+        mo_vir_grad[2].data.as_slice(),
+    ];
+    let wfxc_data = &data.wfxc;
+    let block_size = NWCHEM_GGA_BLOCK;
+
+    let mut result = MatrixFull::new([nocc, nvir], 0.0);
+
+    for g_start in (0..ngrids).step_by(block_size) {
+        let g_end = (g_start + block_size).min(ngrids);
+        let n_block = g_end - g_start;
+
+        // ── Step 1: 4 small dgemms ──
+        let mv_block = MatrixFullSlice {
+            size: &[nvir, n_block], indicing: &[1, nvir],
+            data: &mo_vir_data[g_start * nvir ..][.. nvir * n_block],
+        };
+        let mg_block: [MatrixFullSlice<'_, f64>; 3] = [
+            MatrixFullSlice { size: &[nvir, n_block], indicing: &[1, nvir],
+                data: &vg_data[0][g_start * nvir ..][.. nvir * n_block] },
+            MatrixFullSlice { size: &[nvir, n_block], indicing: &[1, nvir],
+                data: &vg_data[1][g_start * nvir ..][.. nvir * n_block] },
+            MatrixFullSlice { size: &[nvir, n_block], indicing: &[1, nvir],
+                data: &vg_data[2][g_start * nvir ..][.. nvir * n_block] },
+        ];
+
+        let mut t0  = MatrixFull::new([nocc, n_block], 0.0);
+        let mut tg0 = MatrixFull::new([nocc, n_block], 0.0);
+        let mut tg1 = MatrixFull::new([nocc, n_block], 0.0);
+        let mut tg2 = MatrixFull::new([nocc, n_block], 0.0);
+
+        _dgemm_full(&z_mat, 'N', &mv_block,  'N', &mut t0,  1.0, 0.0);
+        _dgemm_full(&z_mat, 'N', &mg_block[0], 'N', &mut tg0, 1.0, 0.0);
+        _dgemm_full(&z_mat, 'N', &mg_block[1], 'N', &mut tg1, 1.0, 0.0);
+        _dgemm_full(&z_mat, 'N', &mg_block[2], 'N', &mut tg2, 1.0, 0.0);
+
+        // ── Step 1b: fused dot products (rayon) ──
+        let rho_block: Vec<[f64; 4]> = (0..n_block).into_par_iter().map(|gb| {
+            let g = g_start + gb;
+            let off = g * nocc;
+            let mo   = &mo_occ_data[off .. off + nocc];
+            let tt0  = &t0.data[gb * nocc ..][..nocc];
+            let ttg0 = &tg0.data[gb * nocc ..][..nocc];
+            let ttg1 = &tg1.data[gb * nocc ..][..nocc];
+            let ttg2 = &tg2.data[gb * nocc ..][..nocc];
+            let mut s = [0.0_f64; 7];
+            for i in 0..nocc {
+                s[0] += mo[i] * tt0[i];
+                s[1] += og_data[0][off + i] * tt0[i];
+                s[2] += mo[i] * ttg0[i];
+                s[3] += og_data[1][off + i] * tt0[i];
+                s[4] += mo[i] * ttg1[i];
+                s[5] += og_data[2][off + i] * tt0[i];
+                s[6] += mo[i] * ttg2[i];
+            }
+            [s[0], s[1] + s[2], s[3] + s[4], s[5] + s[6]]
+        }).collect();
+
+        // ── Step 2: apply 4×4 fxc kernel (rayon, compact layout) ──
+        // wfxc stored wfxc[α*4*ngrids + β*ngrids + g]
+        // Build fxc_eff in [alpha][gb] flat layout for easy Step 3 slicing
+        let mut fxc_eff = vec![0.0_f64; 4 * n_block];
+        fxc_eff.par_chunks_mut(n_block).enumerate().for_each(|(alpha, chunk)| {
+            let base = alpha * 4 * ngrids;
+            let w0 = &wfxc_data[(base + 0 * ngrids + g_start)..];
+            let w1 = &wfxc_data[(base + 1 * ngrids + g_start)..];
+            let w2 = &wfxc_data[(base + 2 * ngrids + g_start)..];
+            let w3 = &wfxc_data[(base + 3 * ngrids + g_start)..];
+            for gb in 0..n_block {
+                let rc = &rho_block[gb];
+                chunk[gb] = w0[gb] * rc[0]
+                          + w1[gb] * rc[1]
+                          + w2[gb] * rc[2]
+                          + w3[gb] * rc[3];
+            }
+        });
+
+        // ── Step 3: contract back ──
+        let mo_block = MatrixFullSlice {
+            size: &[nocc, n_block], indicing: &[1, nocc],
+            data: &mo_occ_data[g_start * nocc ..][.. nocc * n_block],
+        };
+        let mo_grad_block: [MatrixFullSlice<'_, f64>; 3] = [
+            MatrixFullSlice { size: &[nocc, n_block], indicing: &[1, nocc],
+                data: &og_data[0][g_start * nocc ..][.. nocc * n_block] },
+            MatrixFullSlice { size: &[nocc, n_block], indicing: &[1, nocc],
+                data: &og_data[1][g_start * nocc ..][.. nocc * n_block] },
+            MatrixFullSlice { size: &[nocc, n_block], indicing: &[1, nocc],
+                data: &og_data[2][g_start * nocc ..][.. nocc * n_block] },
+        ];
+
+        let first = g_start == 0;
+
+        // α = 0: single DGEMM (unmerged)
+        {
+            let fxc_a = &fxc_eff[0 * n_block .. 1 * n_block];
+            let mut scaled = Vec::with_capacity(nvir * n_block);
+            unsafe { scaled.set_len(nvir * n_block); }
+            scaled.par_chunks_mut(nvir).enumerate().for_each(|(gb, chunk)| {
+                let g = g_start + gb;
+                let src = g * nvir;
+                let fv = fxc_a[gb];
+                for a in 0..nvir { chunk[a] = mo_vir_data[src + a] * fv; }
+            });
+            let right = MatrixFull { size: [nvir, n_block], indicing: [1, nvir], data: scaled };
+            let beta = if first { 0.0 } else { 1.0 };
+            _dgemm_full(&mo_block, 'N', &right, 'T', &mut result, 1.0, beta);
+        }
+
+        // α = 1,2,3: merged DGEMM (pre-allocated buffers)
+        for d in 0..3 {
+            let alpha = d + 1;
+            let fxc_a = &fxc_eff[alpha * n_block .. (alpha + 1) * n_block];
+
+            // Fill combined_right_buf with [right | right_grad] side-by-side
+            //   right[nvir, n_block]:  [nvir × n_block] contiguous
+            //   right_grad[nvir, n_block]: [nvir × n_block] contiguous
+            //   combined[nvir, 2×n_block]: 2 × [nvir × n_block] end-to-end (col-major)
+            let cb = &mut combined_right_buf[..nvir * n_block * 2];
+            let nvir_block = nvir * n_block;
+            let (r_part, rg_part) = cb.split_at_mut(nvir_block);
+            r_part.par_chunks_mut(nvir).enumerate().for_each(|(gb, chunk)| {
+                let g = g_start + gb;
+                let src = g * nvir;
+                let fv = fxc_a[gb];
+                for a in 0..nvir { chunk[a] = mo_vir_data[src + a] * fv; }
+            });
+            rg_part.par_chunks_mut(nvir).enumerate().for_each(|(gb, chunk)| {
+                let g = g_start + gb;
+                let src = g * nvir;
+                let fv = fxc_a[gb];
+                for a in 0..nvir { chunk[a] = vg_data[d][src + a] * fv; }
+            });
+
+            // Fill combined_left_buf with [mo_grad_block | mo_block]
+            let lb = &mut combined_left_buf[..nocc * n_block * 2];
+            let nocc_block = nocc * n_block;
+            let (lg_part, lm_part) = lb.split_at_mut(nocc_block);
+            lg_part.copy_from_slice(&og_data[d][g_start * nocc ..][..nocc_block]);
+            lm_part.copy_from_slice(&mo_occ_data[g_start * nocc ..][..nocc_block]);
+
+            // One DGEMM instead of two
+            let nm2 = n_block * 2;
+            let left_mat = MatrixFullSlice {
+                size: &[nocc, nm2],
+                indicing: &[1, nocc],
+                data: &combined_left_buf[..nocc * nm2],
+            };
+            let right_mat = MatrixFullSlice {
+                size: &[nvir, nm2],
+                indicing: &[1, nvir],
+                data: &combined_right_buf[..nvir * nm2],
+            };
+            _dgemm_full(&left_mat, 'N', &right_mat, 'T', &mut result, 1.0, 1.0);
+        }
+    }
+
+    result.data
 }
 
 #[derive(Debug, Clone)]
@@ -1334,7 +2048,7 @@ mod tests {
         let data = make_lda_data(nocc, nvir, ngrids);
         let n = nocc * nvir;
         let z: Vec<f64> = (0..n).map(|i| ((i % 7) as f64) * 0.01).collect();
-        let result = fxc_matvec(&data, &z);
+        let result = fxc_matvec_old(&data, &z);
         assert_eq!(result.len(), n);
         let norm: f64 = result.iter().map(|x| x * x).sum::<f64>().sqrt();
         println!("LDA test nocc={} nvir={} ngrids={}: norm={:.6}", nocc, nvir, ngrids, norm);
@@ -1346,7 +2060,7 @@ mod tests {
         let data = make_gga_data(nocc, nvir, ngrids);
         let n = nocc * nvir;
         let z: Vec<f64> = (0..n).map(|i| ((i % 7) as f64) * 0.01).collect();
-        let result = fxc_matvec(&data, &z);
+        let result = fxc_matvec_old(&data, &z);
         assert_eq!(result.len(), n);
         let norm: f64 = result.iter().map(|x| x * x).sum::<f64>().sqrt();
         println!("GGA test nocc={} nvir={} ngrids={}: norm={:.6}", nocc, nvir, ngrids, norm);
@@ -1362,7 +2076,7 @@ mod tests {
     fn test_fxc_lda_zero_z() {
         let data = make_lda_data(3, 5, 10);
         let z = vec![0.0; 15];
-        let result = fxc_matvec(&data, &z);
+        let result = fxc_matvec_old(&data, &z);
         for &v in &result { assert!((v).abs() < 1e-15); }
     }
     #[test]
@@ -1373,7 +2087,7 @@ mod tests {
     fn test_fxc_gga_zero_z() {
         let data = make_gga_data(3, 5, 10);
         let z = vec![0.0; 15];
-        let result = fxc_matvec(&data, &z);
+        let result = fxc_matvec_old(&data, &z);
         for &v in &result { assert!((v).abs() < 1e-15); }
     }
     #[test]
@@ -1381,7 +2095,7 @@ mod tests {
         let data = make_gga_data(4, 6, 20);
         let n = 24;
         let z: Vec<f64> = (0..n).map(|i| (i as f64) * 0.01).collect();
-        let result = fxc_matvec(&data, &z);
+        let result = fxc_matvec_old(&data, &z);
         assert!(result.iter().all(|x| x.is_finite()));
     }
     #[test]
@@ -1390,10 +2104,10 @@ mod tests {
         let n = 15;
         let z1: Vec<f64> = (0..n).map(|i| (i as f64) * 0.01).collect();
         let z2: Vec<f64> = (0..n).map(|i| ((i + 3) as f64) * 0.01).collect();
-        let r1 = fxc_matvec(&data, &z1);
-        let r2 = fxc_matvec(&data, &z2);
+        let r1 = fxc_matvec_old(&data, &z1);
+        let r2 = fxc_matvec_old(&data, &z2);
         let z_sum: Vec<f64> = z1.iter().zip(z2.iter()).map(|(a, b)| a + b).collect();
-        let r_sum = fxc_matvec(&data, &z_sum);
+        let r_sum = fxc_matvec_old(&data, &z_sum);
         for i in 0..n {
             assert!((r_sum[i] - (r1[i] + r2[i])).abs() < 1e-14,
                     "Linearity violated at index {}", i);
@@ -1405,7 +2119,7 @@ mod tests {
         let data = make_lda_data(5, 8, 30);
         let n = 40;
         let z: Vec<f64> = (0..n).map(|i| if i < 10 { 1.0 } else { 0.0 }).collect();
-        let result = fxc_matvec(&data, &z);
+        let result = fxc_matvec_old(&data, &z);
         assert!(result.iter().all(|x| x.is_finite()));
         let dot: f64 = z.iter().zip(result.iter()).map(|(a, b)| a * b).sum();
         println!("LDA energy test: z·result = {:.6}", dot);
@@ -1416,15 +2130,741 @@ mod tests {
         let n = 15;
         let z1: Vec<f64> = (0..n).map(|i| (i as f64) * 0.01).collect();
         let z2: Vec<f64> = (0..n).map(|i| ((i + 3) as f64) * 0.01).collect();
-        let r1 = fxc_matvec(&data, &z1);
-        let r2 = fxc_matvec(&data, &z2);
+        let r1 = fxc_matvec_old(&data, &z1);
+        let r2 = fxc_matvec_old(&data, &z2);
         let z_sum: Vec<f64> = z1.iter().zip(z2.iter()).map(|(a, b)| a + b).collect();
-        let r_sum = fxc_matvec(&data, &z_sum);
+        let r_sum = fxc_matvec_old(&data, &z_sum);
         for i in 0..n {
             let diff = (r_sum[i] - (r1[i] + r2[i])).abs();
             assert!(diff < 1e-14, "GGA linearity violated at index {}: {}", i, diff);
         }
         println!("GGA linearity test passed");
+    }
+
+    // ================================================================
+    // Tests for fxc_matvec_opt — correctness and performance
+    // ================================================================
+
+    /// Verify LDA optimised result matches original exactly.
+    #[test]
+    fn test_opt_lda_correctness() {
+        let sizes = [(3, 5, 10), (10, 20, 100), (20, 50, 500)];
+        for &(nocc, nvir, ngrids) in &sizes {
+            let data = make_lda_data(nocc, nvir, ngrids);
+            let n = nocc * nvir;
+            let z: Vec<f64> = (0..n).map(|i| ((i % 7) as f64) * 0.01).collect();
+            let expected = fxc_matvec_old(&data, &z);
+            let actual   = fxc_matvec_opt(&data, &z);
+            assert_eq!(expected.len(), actual.len());
+            for idx in 0..n {
+                let diff = (expected[idx] - actual[idx]).abs();
+                assert!(diff < 1e-14,
+                    "LDA mismatch at idx={}: expected={:.15e} actual={:.15e} diff={:.2e}",
+                    idx, expected[idx], actual[idx], diff);
+            }
+            println!("  opt LDA correct: nocc={} nvir={} ngrids={}", nocc, nvir, ngrids);
+        }
+    }
+
+    /// Verify GGA optimised result matches original exactly.
+    #[test]
+    fn test_opt_gga_correctness() {
+        let sizes = [(3, 5, 10), (10, 20, 100), (20, 50, 500)];
+        for &(nocc, nvir, ngrids) in &sizes {
+            let data = make_gga_data(nocc, nvir, ngrids);
+            let n = nocc * nvir;
+            let z: Vec<f64> = (0..n).map(|i| ((i % 7) as f64) * 0.01).collect();
+            let expected = fxc_matvec_old(&data, &z);
+            let actual   = fxc_matvec_opt(&data, &z);
+            assert_eq!(expected.len(), actual.len());
+            for idx in 0..n {
+                let diff = (expected[idx] - actual[idx]).abs();
+                assert!(diff < 1e-14,
+                    "GGA mismatch at idx={}: expected={:.15e} actual={:.15e} diff={:.2e}",
+                    idx, expected[idx], actual[idx], diff);
+            }
+            println!("  opt GGA correct: nocc={} nvir={} ngrids={}", nocc, nvir, ngrids);
+        }
+    }
+
+    /// Verify LDA linearity holds for optimised version too.
+    #[test]
+    fn test_opt_lda_linearity() {
+        let data = make_lda_data(5, 8, 30);
+        let n = 40;
+        let z1: Vec<f64> = (0..n).map(|i| (i as f64) * 0.01).collect();
+        let z2: Vec<f64> = (0..n).map(|i| ((i + 5) as f64) * 0.01).collect();
+        let r1 = fxc_matvec_opt(&data, &z1);
+        let r2 = fxc_matvec_opt(&data, &z2);
+        let z_sum: Vec<f64> = z1.iter().zip(z2.iter()).map(|(a, b)| a + b).collect();
+        let r_sum = fxc_matvec_opt(&data, &z_sum);
+        for i in 0..n {
+            let diff = (r_sum[i] - (r1[i] + r2[i])).abs();
+            assert!(diff < 1e-14, "LDA opt linearity violated at index {}", i);
+        }
+        println!("opt LDA linearity test passed");
+    }
+
+    /// Verify GGA linearity holds for optimised version too.
+    #[test]
+    fn test_opt_gga_linearity() {
+        let data = make_gga_data(5, 8, 30);
+        let n = 40;
+        let z1: Vec<f64> = (0..n).map(|i| (i as f64) * 0.01).collect();
+        let z2: Vec<f64> = (0..n).map(|i| ((i + 5) as f64) * 0.01).collect();
+        let r1 = fxc_matvec_opt(&data, &z1);
+        let r2 = fxc_matvec_opt(&data, &z2);
+        let z_sum: Vec<f64> = z1.iter().zip(z2.iter()).map(|(a, b)| a + b).collect();
+        let r_sum = fxc_matvec_opt(&data, &z_sum);
+        for i in 0..n {
+            let diff = (r_sum[i] - (r1[i] + r2[i])).abs();
+            assert!(diff < 1e-14, "GGA opt linearity violated at index {}", i);
+        }
+        println!("opt GGA linearity test passed");
+    }
+
+    /// LDA performance benchmark: compare original (serial) vs optimised with
+    /// 8 rayon threads.  Reports wall-clock times and speedup.
+    #[test]
+    fn test_opt_lda_performance() {
+        let nocc = 60;
+        let nvir = 200;
+        let ngrids = 50000;
+        let data = make_lda_data(nocc, nvir, ngrids);
+        let n = nocc * nvir;
+        let z: Vec<f64> = (0..n).map(|i| ((i % 7) as f64) * 0.01).collect();
+
+        // Warm-up: call both once to stabilise BLAS / caches
+        let _ = fxc_matvec_old(&data, &z);
+        let _ = fxc_matvec_opt(&data, &z);
+
+        use std::time::Instant;
+        let n_repeat = 5;
+
+        // Time original (no thread pool needed — purely sequential)
+        let t0 = Instant::now();
+        for _ in 0..n_repeat {
+            let _ = fxc_matvec_old(&data, &z);
+        }
+        let dt_orig = t0.elapsed().as_secs_f64() / n_repeat as f64;
+
+        // Time optimised with 8-thread rayon pool
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        let dt_opt = pool.install(|| {
+            let t0 = Instant::now();
+            for _ in 0..n_repeat {
+                let _ = fxc_matvec_opt(&data, &z);
+            }
+            t0.elapsed().as_secs_f64() / n_repeat as f64
+        });
+
+        let speedup = dt_orig / dt_opt;
+        println!("\n  === LDA Performance ({} occ × {} vir × {} grids) ===", nocc, nvir, ngrids);
+        println!("  original  (serial):   {:.4} s",  dt_orig);
+        println!("  optimised (8 threads): {:.4} s",  dt_opt);
+        println!("  speedup:              {:.2}×",       speedup);
+        println!("  z·fxc[z] (original):  {:.6e}", z.iter().zip(fxc_matvec_old(&data, &z).iter()).map(|(a,b)| a*b).sum::<f64>());
+
+        assert!(speedup > 1.8,
+            "Expected > 1.8× speedup with 8 threads for LDA, got {:.2}×", speedup);
+    }
+
+    /// GGA performance benchmark: compare original (serial) vs optimised with
+    /// 8 rayon threads.  Reports wall-clock times and speedup.
+    #[test]
+    fn test_opt_gga_performance() {
+        let nocc = 50;
+        let nvir = 200;
+        let ngrids = 30000;
+        let data = make_gga_data(nocc, nvir, ngrids);
+        let n = nocc * nvir;
+        let z: Vec<f64> = (0..n).map(|i| ((i % 7) as f64) * 0.01).collect();
+
+        // Warm-up
+        let _ = fxc_matvec_old(&data, &z);
+        let _ = fxc_matvec_opt(&data, &z);
+
+        use std::time::Instant;
+        let n_repeat = 5;
+
+        // Time original
+        let t0 = Instant::now();
+        for _ in 0..n_repeat {
+            let _ = fxc_matvec_old(&data, &z);
+        }
+        let dt_orig = t0.elapsed().as_secs_f64() / n_repeat as f64;
+
+        // Time optimised with 8-thread rayon pool
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        let dt_opt = pool.install(|| {
+            let t0 = Instant::now();
+            for _ in 0..n_repeat {
+                let _ = fxc_matvec_opt(&data, &z);
+            }
+            t0.elapsed().as_secs_f64() / n_repeat as f64
+        });
+
+        let speedup = dt_orig / dt_opt;
+        println!("\n  === GGA Performance ({} occ × {} vir × {} grids) ===", nocc, nvir, ngrids);
+        println!("  original  (serial):   {:.4} s",  dt_orig);
+        println!("  optimised (8 threads): {:.4} s",  dt_opt);
+        println!("  speedup:              {:.2}×",       speedup);
+        println!("  z·fxc[z] (original):  {:.6e}", z.iter().zip(fxc_matvec_old(&data, &z).iter()).map(|(a,b)| a*b).sum::<f64>());
+
+        assert!(speedup > 2.0,
+            "Expected > 2.0× speedup with 8 threads for GGA, got {:.2}×", speedup);
+    }
+
+    /// Verify the router delegates correctly: when the flag is off, fxc_matvec
+    /// matches fxc_matvec_old; when on, it matches fxc_matvec_opt.
+    #[test]
+    fn test_opt_router() {
+        // Restore default after test
+        let saved = USE_OPTIMIZED_FXC.load(Ordering::Relaxed);
+
+        let check = |nocc, nvir, ngrids, is_gga: bool| {
+            let data = if is_gga {
+                make_gga_data(nocc, nvir, ngrids)
+            } else {
+                make_lda_data(nocc, nvir, ngrids)
+            };
+            let n = nocc * nvir;
+            let z: Vec<f64> = (0..n).map(|i| ((i % 7) as f64) * 0.01).collect();
+
+            // flag off → should match old
+            set_fxc_use_optimized(false);
+            let router_off = fxc_matvec(&data, &z);
+            let old = fxc_matvec_old(&data, &z);
+            for idx in 0..n {
+                assert!((router_off[idx] - old[idx]).abs() < 1e-14,
+                    "Router-off mismatch at {} nocc={}", idx, nocc);
+            }
+
+            // flag on → should match opt
+            set_fxc_use_optimized(true);
+            let router_on = fxc_matvec(&data, &z);
+            let opt = fxc_matvec_opt(&data, &z);
+            for idx in 0..n {
+                assert!((router_on[idx] - opt[idx]).abs() < 1e-14,
+                    "Router-on mismatch at {} nocc={}", idx, nocc);
+            }
+        };
+
+        check(5, 8, 20, false);   // LDA small
+        check(5, 8, 20, true);    // GGA small
+        check(20, 50, 200, false); // LDA medium
+        check(20, 50, 200, true);  // GGA medium
+
+        // restore
+        set_fxc_use_optimized(saved);
+        println!("opt router test passed (LDA + GGA, small + medium)");
+    }
+
+    // ================================================================
+    // DGEMM scheduling benchmark for GGA Step 1
+    //
+    // Tests multiple strategies for the 4 independent dgemm calls:
+    //   z_mat [nocc,nvir] × mo_vir_grad[d] [nvir,ngrids] → t[d]
+    // ================================================================
+
+    /// Run the GGA Step‑1 dgemm scheduling benchmark.
+    /// Reports wall-clock times for multiple strategies in release mode.
+    fn bench_gga_step1_all(nocc: usize, nvir: usize, ngrids: usize,
+                           n_warm: usize, n_iter: usize) {
+        use std::time::Instant;
+        let old_omp = omp_get_num_threads_wrapper();
+
+        // -------- test data ----------
+        let data = make_gga_data(nocc, nvir, ngrids);
+        let mv  = &data.mo_vir;
+        let mg  = data.mo_vir_grad.as_ref().unwrap();
+        let z: Vec<f64> = (0..nocc * nvir).map(|i| ((i % 7) as f64) * 0.01).collect();
+        let z_mat = MatrixFull::from_vec([nocc, nvir], z.to_vec()).unwrap();
+
+        // reference result
+        let ref_t = {
+            omp_set_num_threads_wrapper(8);
+            let mut t = [MatrixFull::new([nocc, ngrids], 0.0),
+                         MatrixFull::new([nocc, ngrids], 0.0),
+                         MatrixFull::new([nocc, ngrids], 0.0),
+                         MatrixFull::new([nocc, ngrids], 0.0)];
+            _dgemm_full(&z_mat, 'N', mv, 'N', &mut t[0], 1.0, 0.0);
+            for d in 0..3 { _dgemm_full(&z_mat, 'N', &mg[d], 'N', &mut t[1+d], 1.0, 0.0); }
+            t
+        };
+
+        // verify helper
+        let check = |t: &[MatrixFull<f64>; 4]| -> bool {
+            (0..4).all(|i| t[i].data.iter().zip(ref_t[i].data.iter())
+                .map(|(a,b)| (a-b).abs()).sum::<f64>() < 1e-12)
+        };
+
+        println!("\n  === GGA Step‑1 dgemm benchmark ({}×{}×{}) ===", nocc, nvir, ngrids);
+        println!("  {:<22} {:>10} {:>8}  {}", "Strategy", "Time (s)", "Speedup", "Correct");
+        println!("  {}", "-".repeat(50));
+
+        // macro: warmup + time, run a strategy
+        macro_rules! time_strat {
+            ($label:expr, $omp_thr:expr, $body:expr) => {{
+                let label = $label;
+                let thr = $omp_thr;
+                for _ in 0..n_warm { let _ = { $body }; }
+                omp_set_num_threads_wrapper(thr);
+                let t0 = Instant::now();
+                let mut last = None;
+                for _ in 0..n_iter { last = Some({ $body }); }
+                let dt = t0.elapsed().as_secs_f64() / n_iter as f64;
+                (label, dt, last.as_ref().map_or(false, |t| check(t)))
+            }};
+        }
+
+        // -------- strategies ----------
+        // 1. sequential 4 calls × 8 threads (baseline)
+        let mut results: Vec<(&str, f64, bool)> = Vec::new();
+        results.push(time_strat!("seq 4×8thr", 8, {
+            let mut t = [MatrixFull::new([nocc, ngrids], 0.0),
+                         MatrixFull::new([nocc, ngrids], 0.0),
+                         MatrixFull::new([nocc, ngrids], 0.0),
+                         MatrixFull::new([nocc, ngrids], 0.0)];
+            _dgemm_full(&z_mat, 'N', mv, 'N', &mut t[0], 1.0, 0.0);
+            for d in 0..3 { _dgemm_full(&z_mat, 'N', &mg[d], 'N', &mut t[1+d], 1.0, 0.0); }
+            t
+        }));
+
+        // 2. concurrent 4 calls × 2 threads (Phase 7)
+        results.push(time_strat!("conc4 2thr/call", 2, {
+            let mut t0  = MatrixFull::new([nocc, ngrids], 0.0);
+            let mut tg0 = MatrixFull::new([nocc, ngrids], 0.0);
+            let mut tg1 = MatrixFull::new([nocc, ngrids], 0.0);
+            let mut tg2 = MatrixFull::new([nocc, ngrids], 0.0);
+            rayon::scope(|s| {
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', mv, 'N', &mut t0, 1.0, 0.0));
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', &mg[0], 'N', &mut tg0, 1.0, 0.0));
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', &mg[1], 'N', &mut tg1, 1.0, 0.0));
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', &mg[2], 'N', &mut tg2, 1.0, 0.0));
+            });
+            [t0, tg0, tg1, tg2]
+        }));
+
+        // 3. concurrent 4 calls × 1 thread (extreme)
+        results.push(time_strat!("conc4 1thr/call", 1, {
+            let mut t0  = MatrixFull::new([nocc, ngrids], 0.0);
+            let mut tg0 = MatrixFull::new([nocc, ngrids], 0.0);
+            let mut tg1 = MatrixFull::new([nocc, ngrids], 0.0);
+            let mut tg2 = MatrixFull::new([nocc, ngrids], 0.0);
+            rayon::scope(|s| {
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', mv, 'N', &mut t0, 1.0, 0.0));
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', &mg[0], 'N', &mut tg0, 1.0, 0.0));
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', &mg[1], 'N', &mut tg1, 1.0, 0.0));
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', &mg[2], 'N', &mut tg2, 1.0, 0.0));
+            });
+            [t0, tg0, tg1, tg2]
+        }));
+
+        // 4. two rounds of 2 concurrent × 4 threads
+        results.push(time_strat!("conc2×2 4thr", 4, {
+            let mut t0  = MatrixFull::new([nocc, ngrids], 0.0);
+            let mut tg0 = MatrixFull::new([nocc, ngrids], 0.0);
+            let mut tg1 = MatrixFull::new([nocc, ngrids], 0.0);
+            let mut tg2 = MatrixFull::new([nocc, ngrids], 0.0);
+            rayon::scope(|s| {
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', mv, 'N', &mut t0, 1.0, 0.0));
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', &mg[0], 'N', &mut tg0, 1.0, 0.0));
+            });
+            rayon::scope(|s| {
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', &mg[1], 'N', &mut tg1, 1.0, 0.0));
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', &mg[2], 'N', &mut tg2, 1.0, 0.0));
+            });
+            [t0, tg0, tg1, tg2]
+        }));
+
+        // 5. two rounds of 2 concurrent × 2 threads
+        results.push(time_strat!("conc2×2 2thr", 2, {
+            let mut t0  = MatrixFull::new([nocc, ngrids], 0.0);
+            let mut tg0 = MatrixFull::new([nocc, ngrids], 0.0);
+            let mut tg1 = MatrixFull::new([nocc, ngrids], 0.0);
+            let mut tg2 = MatrixFull::new([nocc, ngrids], 0.0);
+            rayon::scope(|s| {
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', mv, 'N', &mut t0, 1.0, 0.0));
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', &mg[0], 'N', &mut tg0, 1.0, 0.0));
+            });
+            rayon::scope(|s| {
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', &mg[1], 'N', &mut tg1, 1.0, 0.0));
+                s.spawn(|_| _dgemm_full(&z_mat, 'N', &mg[2], 'N', &mut tg2, 1.0, 0.0));
+            });
+            [t0, tg0, tg1, tg2]
+        }));
+
+        // 6. stacked single dgemm: copy rhs → 1 big dgemm → split
+        results.push(time_strat!("stacked 8thr", 8, {
+            let mut rhs_all = vec![0.0; nvir * ngrids * 4];
+            let stride = nvir * ngrids;
+            rhs_all[0..stride].copy_from_slice(mv.data.as_slice());
+            rhs_all[stride..2*stride].copy_from_slice(mg[0].data.as_slice());
+            rhs_all[2*stride..3*stride].copy_from_slice(mg[1].data.as_slice());
+            rhs_all[3*stride..4*stride].copy_from_slice(mg[2].data.as_slice());
+            let rhs_full = MatrixFull { size: [nvir, ngrids * 4], indicing: [1, nvir], data: rhs_all };
+            let mut t_stk = MatrixFull::new([nocc, ngrids * 4], 0.0);
+            _dgemm_full(&z_mat, 'N', &rhs_full, 'N', &mut t_stk, 1.0, 0.0);
+            let n = nocc * ngrids;
+            [MatrixFull::from_vec([nocc, ngrids], t_stk.data[0..n].to_vec()).unwrap(),
+             MatrixFull::from_vec([nocc, ngrids], t_stk.data[n..2*n].to_vec()).unwrap(),
+             MatrixFull::from_vec([nocc, ngrids], t_stk.data[2*n..3*n].to_vec()).unwrap(),
+             MatrixFull::from_vec([nocc, ngrids], t_stk.data[3*n..4*n].to_vec()).unwrap()]
+        }));
+
+        // 7. stacked with 4 OMP threads
+        results.push(time_strat!("stacked 4thr", 4, {
+            let mut rhs_all = vec![0.0; nvir * ngrids * 4];
+            let stride = nvir * ngrids;
+            rhs_all[0..stride].copy_from_slice(mv.data.as_slice());
+            rhs_all[stride..2*stride].copy_from_slice(mg[0].data.as_slice());
+            rhs_all[2*stride..3*stride].copy_from_slice(mg[1].data.as_slice());
+            rhs_all[3*stride..4*stride].copy_from_slice(mg[2].data.as_slice());
+            let rhs_full = MatrixFull { size: [nvir, ngrids * 4], indicing: [1, nvir], data: rhs_all };
+            let mut t_stk = MatrixFull::new([nocc, ngrids * 4], 0.0);
+            _dgemm_full(&z_mat, 'N', &rhs_full, 'N', &mut t_stk, 1.0, 0.0);
+            let n = nocc * ngrids;
+            [MatrixFull::from_vec([nocc, ngrids], t_stk.data[0..n].to_vec()).unwrap(),
+             MatrixFull::from_vec([nocc, ngrids], t_stk.data[n..2*n].to_vec()).unwrap(),
+             MatrixFull::from_vec([nocc, ngrids], t_stk.data[2*n..3*n].to_vec()).unwrap(),
+             MatrixFull::from_vec([nocc, ngrids], t_stk.data[3*n..4*n].to_vec()).unwrap()]
+        }));
+
+        // -------- print results --------
+        let baseline = results[0].1;
+        for &(label, dt, ok) in &results {
+            let speedup = baseline / dt;
+            let status = if ok { "✓" } else { "✗ WRONG" };
+            println!("  {:<22} {:>8.4}s  {:>6.2}×  {}", label, dt, speedup, status);
+        }
+        let best = results.iter().filter(|r| r.2).map(|r| baseline / r.1).fold(0.0_f64, f64::max);
+        println!("  Best speedup (correct): {:.2}×", best);
+
+        omp_set_num_threads_wrapper(old_omp);
+    }
+
+    /// Run the dgemm scheduling benchmark (completes in < 30 s in release).
+    #[test]
+    fn test_bench_gga_step1_dgemm() {
+        bench_gga_step1_all(50, 200, 30000, 2, 3);
+    }
+
+    // ================================================================
+    // Tests for fxc_matvec_nwchem_opt — NWChem-style optimised kernel
+    // ================================================================
+
+    fn make_lda_data_nwchem(nocc: usize, nvir: usize, ngrids: usize) -> FXCMatvecDataNwchemOpt {
+        let mut mo_occ = MatrixFull::new([nocc, ngrids], 0.0);
+        for i in 0..nocc {
+            for g in 0..ngrids {
+                mo_occ[[i, g]] = ((i as f64 + 1.0) * (g as f64 + 1.0)).sin() * 0.5;
+            }
+        }
+        let mut mo_vir = MatrixFull::new([nvir, ngrids], 0.0);
+        for a in 0..nvir {
+            for g in 0..ngrids {
+                mo_vir[[a, g]] = ((a as f64 + 1.0) * (g as f64 + 1.0)).cos() * 0.3;
+            }
+        }
+        let wfxc: Vec<f64> = (0..ngrids).map(|g| (g as f64 + 1.0).sqrt() * 0.01).collect();
+
+        FXCMatvecDataNwchemOpt {
+            nvar: 1,
+            ngrids,
+            nocc,
+            nvir,
+            mo_occ,
+            mo_vir,
+            mo_occ_grad: None,
+            mo_vir_grad: None,
+            wfxc,
+            combined_left_buf: vec![],
+            combined_right_buf: vec![],
+        }
+    }
+
+    fn make_gga_data_nwchem(nocc: usize, nvir: usize, ngrids: usize) -> FXCMatvecDataNwchemOpt {
+        let mut mo_occ = MatrixFull::new([nocc, ngrids], 0.0);
+        for i in 0..nocc {
+            for g in 0..ngrids {
+                mo_occ[[i, g]] = ((i as f64 + 1.0) * (g as f64 + 1.0)).sin() * 0.5;
+            }
+        }
+        let mut mo_vir = MatrixFull::new([nvir, ngrids], 0.0);
+        for a in 0..nvir {
+            for g in 0..ngrids {
+                mo_vir[[a, g]] = ((a as f64 + 1.0) * (g as f64 + 1.0)).cos() * 0.3;
+            }
+        }
+
+        let mut og = [
+            MatrixFull::new([nocc, ngrids], 0.0),
+            MatrixFull::new([nocc, ngrids], 0.0),
+            MatrixFull::new([nocc, ngrids], 0.0),
+        ];
+        let mut vg = [
+            MatrixFull::new([nvir, ngrids], 0.0),
+            MatrixFull::new([nvir, ngrids], 0.0),
+            MatrixFull::new([nvir, ngrids], 0.0),
+        ];
+        for d in 0..3 {
+            for i in 0..nocc {
+                for g in 0..ngrids {
+                    og[d][[i, g]] = ((i as f64 + 1.0) * (g as f64 + 1.0)).cos() * 0.2 * (d as f64 + 1.0);
+                }
+            }
+            for a in 0..nvir {
+                for g in 0..ngrids {
+                    vg[d][[a, g]] = -((a as f64 + 1.0) * (g as f64 + 1.0)).sin() * 0.2 * (d as f64 + 1.0);
+                }
+            }
+        }
+
+        // wfxc in [α, β, g] layout
+        let mut wfxc = vec![0.0; ngrids * 16];
+        for alpha in 0..4 {
+            let off_a = alpha * 4 * ngrids;
+            for beta in 0..4 {
+                let off = off_a + beta * ngrids;
+                for g in 0..ngrids {
+                    let weight = (g as f64 + 1.0).sqrt() * 0.01;
+                    wfxc[off + g] = weight * (alpha as f64 * 0.1 + beta as f64 * 0.1 + 1.0).sin().max(0.01);
+                }
+            }
+        }
+
+        let combined_left_buf = vec![0.0; nocc * NWCHEM_GGA_BLOCK * 2];
+        let combined_right_buf = vec![0.0; nvir * NWCHEM_GGA_BLOCK * 2];
+
+        FXCMatvecDataNwchemOpt {
+            nvar: 4,
+            ngrids,
+            nocc,
+            nvir,
+            mo_occ,
+            mo_vir,
+            mo_occ_grad: Some(og),
+            mo_vir_grad: Some(vg),
+            wfxc,
+            combined_left_buf,
+            combined_right_buf,
+        }
+    }
+
+    /// Verify NWChem-opt LDA matches the original LDA exactly.
+    #[test]
+    fn test_nwchem_opt_lda_correctness() {
+        let sizes = [(3, 5, 10), (10, 20, 100), (20, 50, 500)];
+        for &(nocc, nvir, ngrids) in &sizes {
+            let old_data = make_lda_data(nocc, nvir, ngrids);
+            let mut new_data = make_lda_data_nwchem(nocc, nvir, ngrids);
+            let n = nocc * nvir;
+            let z: Vec<f64> = (0..n).map(|i| ((i % 7) as f64) * 0.01).collect();
+            let expected = fxc_matvec_lda(&old_data, &z);
+            let actual   = fxc_matvec_lda_nwchem_opt(&new_data, &z);
+            assert_eq!(expected.len(), actual.len());
+            for idx in 0..n {
+                let diff = (expected[idx] - actual[idx]).abs();
+                assert!(diff < 1e-14,
+                    "LDA nwchem mismatch at idx={}: expected={:.15e} actual={:.15e} diff={:.2e}",
+                    idx, expected[idx], actual[idx], diff);
+            }
+            println!("  nwchem LDA correct: nocc={} nvir={} ngrids={}", nocc, nvir, ngrids);
+        }
+    }
+
+    /// Verify NWChem-opt GGA matches the original GGA exactly.
+    #[test]
+    fn test_nwchem_opt_gga_correctness() {
+        let sizes = [(3, 5, 10), (10, 20, 100), (20, 50, 500)];
+        for &(nocc, nvir, ngrids) in &sizes {
+            let old_data = make_gga_data(nocc, nvir, ngrids);
+            let mut new_data = make_gga_data_nwchem(nocc, nvir, ngrids);
+            let n = nocc * nvir;
+            let z: Vec<f64> = (0..n).map(|i| ((i % 7) as f64) * 0.01).collect();
+            let expected = fxc_matvec_gga(&old_data, &z);
+            let actual   = fxc_matvec_gga_nwchem_opt(&mut new_data, &z);
+            assert_eq!(expected.len(), actual.len());
+            for idx in 0..n {
+                let diff = (expected[idx] - actual[idx]).abs();
+                assert!(diff < 1e-14,
+                    "GGA nwchem mismatch at idx={}: expected={:.15e} actual={:.15e} diff={:.2e}",
+                    idx, expected[idx], actual[idx], diff);
+            }
+            println!("  nwchem GGA correct: nocc={} nvir={} ngrids={}", nocc, nvir, ngrids);
+        }
+    }
+
+    /// NWChem-opt LDA performance benchmark.
+    #[test]
+    fn test_nwchem_opt_lda_performance() {
+        let nocc = 60;
+        let nvir = 200;
+        let ngrids = 50000;
+        let old_data = make_lda_data(nocc, nvir, ngrids);
+        let mut new_data = make_lda_data_nwchem(nocc, nvir, ngrids);
+        let n = nocc * nvir;
+        let z: Vec<f64> = (0..n).map(|i| ((i % 7) as f64) * 0.01).collect();
+
+        // Warm-up
+        let _ = fxc_matvec_lda(&old_data, &z);
+        let _ = fxc_matvec_lda_nwchem_opt(&new_data, &z);
+
+        use std::time::Instant;
+        let n_repeat = 5;
+
+        // Time original
+        let t0 = Instant::now();
+        for _ in 0..n_repeat {
+            let _ = fxc_matvec_lda(&old_data, &z);
+        }
+        let dt_orig = t0.elapsed().as_secs_f64() / n_repeat as f64;
+
+        // Time nwchem-opt with 8-thread rayon pool
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        let dt_opt = pool.install(|| {
+            let t0 = Instant::now();
+            for _ in 0..n_repeat {
+                let _ = fxc_matvec_lda_nwchem_opt(&new_data, &z);
+            }
+            t0.elapsed().as_secs_f64() / n_repeat as f64
+        });
+
+        let speedup = dt_orig / dt_opt;
+        println!("\n  === LDA NWChem-Opt Performance ({} occ × {} vir × {} grids) ===", nocc, nvir, ngrids);
+        println!("  original  (serial):     {:.4} s",  dt_orig);
+        println!("  nwchem-opt (8 threads): {:.4} s",  dt_opt);
+        println!("  speedup:                {:.2}×",       speedup);
+
+        // Soft threshold — just informative
+        println!("  (expected > 1.0 for any parallel speedup)");
+    }
+
+    /// NWChem-opt GGA performance benchmark.
+    #[test]
+    fn test_nwchem_opt_gga_performance() {
+        let nocc = 50;
+        let nvir = 200;
+        let ngrids = 30000;
+        let old_data = make_gga_data(nocc, nvir, ngrids);
+        let mut new_data = make_gga_data_nwchem(nocc, nvir, ngrids);
+        let n = nocc * nvir;
+        let z: Vec<f64> = (0..n).map(|i| ((i % 7) as f64) * 0.01).collect();
+
+        // Warm-up
+        let _ = fxc_matvec_gga(&old_data, &z);
+        let _ = fxc_matvec_gga_nwchem_opt(&mut new_data, &z);
+
+        use std::time::Instant;
+        let n_repeat = 5;
+
+        // Time original
+        let t0 = Instant::now();
+        for _ in 0..n_repeat {
+            let _ = fxc_matvec_gga(&old_data, &z);
+        }
+        let dt_orig = t0.elapsed().as_secs_f64() / n_repeat as f64;
+
+        // Time nwchem-opt with 8-thread rayon pool
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        let dt_opt = pool.install(|| {
+            let t0 = Instant::now();
+            for _ in 0..n_repeat {
+                let _ = fxc_matvec_gga_nwchem_opt(&mut new_data, &z);
+            }
+            t0.elapsed().as_secs_f64() / n_repeat as f64
+        });
+
+        let speedup = dt_orig / dt_opt;
+        println!("\n  === GGA NWChem-Opt Performance ({} occ × {} vir × {} grids) ===", nocc, nvir, ngrids);
+        println!("  original  (serial):     {:.4} s",  dt_orig);
+        println!("  nwchem-opt (8 threads): {:.4} s",  dt_opt);
+        println!("  speedup:                {:.2}×",       speedup);
+
+        println!("  (expected > 1.0 for any parallel speedup)");
+    }
+
+    // ================================================================
+    // Cross-code comparison benchmark: REST vs NWChem
+    //
+    // Uses H2O BLYP/6-31G* parameters extracted from instrumented
+    // NWChem RI-TDDFT run:
+    //   nocc =  5  (doubly occupied MOs)
+    //   nvir = 14  (19 AO - 5 occ - frozen core adjustments)
+    //   nvar =  4  (GGA)
+    //   NWChem fxc kernel: avg ~0.090 s/call (7 dgemms, 2 MPI ranks)
+    // ================================================================
+
+    /// REST GGA fxc_matvec benchmark with H2O-level parameters.
+    /// Reports timing for original (serial) and NWChem-opt (8-thread rayon),
+    /// scaling over a range of grid sizes.
+    #[test]
+    fn test_bench_vs_nwchem_h2o() {
+        let nocc = 5;
+        let nvir = 14;
+        let ngrids_values = [2_500usize, 5_000, 10_000, 20_000, 50_000];
+
+        use std::time::Instant;
+        let n_repeat = 50;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+
+        println!("\n  === REST fxc_matvec GGA benchmark (H2O: {} occ × {} vir) ===", nocc, nvir);
+        println!("  {:<8} {:>12} {:>12} {:>10}",
+                 "ngrids", "old(s)", "nwchem-opt(s)", "speedup");
+        println!("  {}", "-".repeat(45));
+
+        for &ngrids in &ngrids_values {
+            let old_data = make_gga_data(nocc, nvir, ngrids);
+            let mut new_data = make_gga_data_nwchem(nocc, nvir, ngrids);
+            let n = nocc * nvir;
+            let z: Vec<f64> = (0..n).map(|i| ((i % 7) as f64) * 0.01).collect();
+
+            // Warm-up
+            let _ = fxc_matvec_gga(&old_data, &z);
+            let _ = fxc_matvec_gga_nwchem_opt(&mut new_data, &z);
+
+            // Time original (serial BLAS)
+            let t0 = Instant::now();
+            for _ in 0..n_repeat {
+                let _ = fxc_matvec_gga(&old_data, &z);
+            }
+            let dt_old = t0.elapsed().as_secs_f64() / n_repeat as f64;
+
+            // Time nwchem-opt (8-thread rayon pool)
+            let dt_new = pool.install(|| {
+                let t0 = Instant::now();
+                for _ in 0..n_repeat {
+                    let _ = fxc_matvec_gga_nwchem_opt(&mut new_data, &z);
+                }
+                t0.elapsed().as_secs_f64() / n_repeat as f64
+            });
+
+            let speedup = dt_old / dt_new;
+            println!("  {:<8} {:>8.6}s  {:>8.6}s  {:>7.2}×",
+                     ngrids, dt_old, dt_new, speedup);
+        }
+        println!();
+        println!("  NWChem ref (BI H2O, BLYP/6-31G*, RI-TDDFT, 2xMPI):");
+        println!("    FXC_TIME call=1: 0.0766 cpu-s  (first Davidson matvec)");
+        println!("    FXC_TIME avg:    0.095 cpu-s   (over 7 matvecs)");
+        println!("    Grid: medium quality, 94 quadrature shells (~9k points)");
+        println!("  => Compare REST times above at ngrids≈10000");
     }
 }
 
