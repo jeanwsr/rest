@@ -5,7 +5,9 @@ use crate::check_norm::{self, generate_occupation_frac_occ, generate_occupation_
 use crate::dft::gen_grids::prune::prune_by_rho;
 use crate::dft::{DFTType, Grids};
 use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges};
-use crate::mpi_io::{mpi_broadcast, mpi_broadcast_matrixfull, mpi_broadcast_vector, mpi_reduce, MPIOperator};
+#[cfg(feature = "mpi")]
+use crate::mpi_io::{mpi_broadcast, mpi_broadcast_matrixfull, mpi_broadcast_vector, mpi_reduce};
+use crate::mpi_io::MPIOperator;
 use crate::utilities::{self, TimeRecords};
 use crate::utilities::memory_batch::*;
 use crate::ctrl_io::ri_jk_io::*;
@@ -15,6 +17,7 @@ mod fchk;
 mod pyrest_scf_io;
 pub mod util;
 
+#[cfg(feature = "mpi")]
 use mpi::collective::SystemOperation;
 use pyo3::{pyclass};
 use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemv, _dinverse, _dspgvx, _dsymm, _dsyrk, _hamiltonian_fast_solver, _power_rayon_for_symmetric_matrix, _dsyevd};
@@ -2602,6 +2605,7 @@ impl SCF {
 
         let mut xc_energy_list: Vec<f64> = xc_energy_list.iter().map(|energy| energy[0]+energy[1]).collect();
 
+        #[cfg(feature = "mpi")]
         if let Some(mpi_world) = mpi_operator {
             let mut tot_xc_list = mpi_reduce(&mpi_world.world, &xc_energy_list, 0, &SystemOperation::sum());
             mpi_broadcast(&mpi_world.world, &mut tot_xc_list, 0);
@@ -3122,6 +3126,7 @@ impl SCF {
     }
 
     pub fn generate_vxc_mpi_rayon_dm_only(&self, scaling_factor: f64, mpi_operator: &Option<MPIOperator>) -> ([f64;2], f64, Vec<MatrixUpper<f64>>) {
+        #[cfg(feature = "mpi")]
         let (total_elec, tot_exc, tot_xc) = if let Some(mpi_world) = mpi_operator {
 
             let world = &mpi_world.world;
@@ -3151,6 +3156,8 @@ impl SCF {
         } else {
             self.generate_vxc_rayon_dm_only(scaling_factor)
         };
+        #[cfg(not(feature = "mpi"))]
+        let (total_elec, tot_exc, tot_xc) = self.generate_vxc_rayon_dm_only(scaling_factor);
 
         if self.mol.ctrl.print_level>1 {
             if self.mol.spin_channel==1 {
@@ -3168,6 +3175,7 @@ impl SCF {
 
     pub fn generate_vxc_mpi_rayon(&self, scaling_factor: f64, mpi_operator: &Option<MPIOperator>) -> ([f64;2], f64, Vec<MatrixUpper<f64>>) {
 
+        #[cfg(feature = "mpi")]
         let (total_elec, tot_exc, tot_xc) = if let Some(mpi_world) = mpi_operator {
 
             let world = &mpi_world.world;
@@ -3198,6 +3206,8 @@ impl SCF {
         } else {
             self.generate_vxc_rayon(scaling_factor)
         };
+        #[cfg(not(feature = "mpi"))]
+        let (total_elec, tot_exc, tot_xc) = self.generate_vxc_rayon(scaling_factor);
 
         if self.mol.ctrl.print_level>1 {
             if self.mol.spin_channel==1 {
@@ -3841,6 +3851,7 @@ pub fn vj_upper_with_rimatr_sync_mpi(
                 dm: &Vec<MatrixFull<f64>>, 
                 spin_channel: usize, scaling_factor: f64,
                 mpi_operator: &Option<MPIOperator>)  -> Vec<MatrixUpper<f64>> {
+    #[cfg(feature = "mpi")]
     if let Some(mpi_op) = &mpi_operator {
         let mut vj_vec = vj_upper_with_rimatr_sync(ri3fn, dm, spin_channel, scaling_factor);
         for i_spin in 0..spin_channel {
@@ -3852,9 +3863,12 @@ pub fn vj_upper_with_rimatr_sync_mpi(
             //}
         }
         vj_vec
-    } else {
+    } else
+    {
         vj_upper_with_rimatr_sync(ri3fn, dm, spin_channel, scaling_factor)
     }
+    #[cfg(not(feature = "mpi"))]
+    { vj_upper_with_rimatr_sync(ri3fn, dm, spin_channel, scaling_factor) }
 }
 
 pub fn vj_upper_with_rimatr_sync(
@@ -4248,6 +4262,7 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_mpi(
                 ri3fn: &Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
                 dm: &Vec<MatrixFull<f64>>,
                 spin_channel: usize, scaling_factor: f64, mpi_operator: &Option<MPIOperator>)  -> Vec<MatrixUpper<f64>> {
+    #[cfg(feature = "mpi")]
     if let Some(mpi_op) = &mpi_operator {
         let mut vk_vec = vk_upper_with_rimatr_use_dm_only_sync_v02(ri3fn, dm, spin_channel, scaling_factor);
         for i_spin in 0..spin_channel {
@@ -4259,9 +4274,12 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_mpi(
             //}
         };
         vk_vec
-    } else {
+    } else
+    {
         vk_upper_with_rimatr_use_dm_only_sync_v02(ri3fn, dm, spin_channel, scaling_factor)
     }
+    #[cfg(not(feature = "mpi"))]
+    { vk_upper_with_rimatr_use_dm_only_sync_v02(ri3fn, dm, spin_channel, scaling_factor) }
 }
 
 pub fn vk_upper_with_rimatr_sync_mpi(
@@ -4270,6 +4288,7 @@ pub fn vk_upper_with_rimatr_sync_mpi(
                 num_elec: &[f64;3], occupation: &[Vec<f64>;2],
                 spin_channel: usize, scaling_factor: f64,
                 mpi_operator: &Option<MPIOperator>)  -> Vec<MatrixUpper<f64>> {
+    #[cfg(feature = "mpi")]
     if let Some(mpi_op) = &mpi_operator {
         let mut vk_vec = vk_upper_with_rimatr_sync_v03(ri3fn,eigv,num_elec,occupation,spin_channel,scaling_factor);
         for i_spin in 0..spin_channel {
@@ -4281,9 +4300,12 @@ pub fn vk_upper_with_rimatr_sync_mpi(
             //}
         };
         vk_vec
-    } else {
+    } else
+    {
         vk_upper_with_rimatr_sync_v03(ri3fn,eigv,num_elec,occupation,spin_channel,scaling_factor)
     }
+    #[cfg(not(feature = "mpi"))]
+    { vk_upper_with_rimatr_sync_v03(ri3fn,eigv,num_elec,occupation,spin_channel,scaling_factor) }
 }
 pub fn vk_upper_with_rimatr_sync(
                 ri3fn: &Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
@@ -5128,8 +5150,7 @@ pub fn diagonalize_hamiltonian_outside(scf_data: &SCF, mpi_operator: &Option<MPI
     let mut eigenvalues = [Vec::new(),Vec::new()];
     let mut num_state = 0;
 
-    // perform diagonalization within the first mpi task at present.
-    // NOTE:: to fully utilize all CPU resources, a scalapack memory distribution is necessary.
+    #[cfg(feature = "mpi")]
     if let Some(mpi_io) = mpi_operator {
         if mpi_io.rank == 0 {
             (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside_fast(scf_data);
@@ -5141,9 +5162,12 @@ pub fn diagonalize_hamiltonian_outside(scf_data: &SCF, mpi_operator: &Option<MPI
         mpi_broadcast(&mpi_io.world, &mut num_state, 0);
 
 
-    } else {
+    } else
+    {
         (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside_fast(scf_data);
     }
+    #[cfg(not(feature = "mpi"))]
+    { (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside_fast(scf_data); }
 
     //println!("diagonalize_hamiltonian_outside: num_state {}", num_state);
 

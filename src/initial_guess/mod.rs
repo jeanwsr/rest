@@ -3,7 +3,9 @@ use tensors::{MatrixFull, MatrixUpper, BasicMatrix};
 use crate::constants::E;
 use crate::dft::{numerical_density_rayon, numerical_orbital_population};
 use crate::initial_guess::enxc::effective_nxc_matrix;
-use crate::mpi_io::{mpi_broadcast_matrixfull, MPIOperator};
+#[cfg(feature = "mpi")]
+use crate::mpi_io::mpi_broadcast_matrixfull;
+use crate::mpi_io::MPIOperator;
 use crate::scf_io::{scf, SCFType};
 use crate::{molecule_io::Molecule, scf_io::SCF, dft::Grids};
 
@@ -103,6 +105,7 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
         //for DFT methods, it needs the eigenvectors to generate the hamiltoniam. In consequence, we use the hf method to prepare the eigenvectors from the guess dm
         //scf_data.generate_hf_hamiltonian_for_guess();
         //if scf_data.mol.ctrl.print_level>0 {println!("Initial guess HF energy: {:16.8}", scf_data.evaluate_hf_total_energy())};
+        #[cfg(feature = "mpi")]
         if let Some(mpi_op) = mpi_operator {
             mpi_broadcast_matrixfull(&mpi_op.world, &mut scf_data.density_matrix[0], 0);
             mpi_broadcast_matrixfull(&mpi_op.world, &mut scf_data.density_matrix[1], 0);
