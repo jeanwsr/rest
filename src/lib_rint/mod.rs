@@ -11625,6 +11625,205 @@ position = [
         }
     }
 
+    fn tmp_exact4c_deterministic_density(nao: usize) -> MatrixFull<f64> {
+        let mut p = MatrixFull::new([nao, nao], 0.0);
+        for mu in 0..nao {
+            for nu in 0..=mu {
+                let value = if mu == nu {
+                    1.0 / (1.0 + mu as f64)
+                } else {
+                    ((mu + 3 * nu + 1) % 11 + 1) as f64 * 1.0e-2
+                };
+                p.set2d([mu, nu], value);
+                p.set2d([nu, mu], value);
+            }
+        }
+        p
+    }
+
+    fn tmp_exact4c_contract_jk_from_libcint_full(
+        eri4_libcint: &rest_tensors::ERIFull<f64>,
+        p: &MatrixFull<f64>,
+        nao: usize,
+    ) -> (MatrixFull<f64>, MatrixFull<f64>) {
+        let mut j = MatrixFull::new([nao, nao], 0.0);
+        let mut k = MatrixFull::new([nao, nao], 0.0);
+        for mu in 0..nao {
+            for nu in 0..nao {
+                let mut j_munu = 0.0_f64;
+                let mut k_munu = 0.0_f64;
+                for lam in 0..nao {
+                    for sig in 0..nao {
+                        let p_lamsig = *p.get(&[lam, sig]).unwrap();
+                        j_munu += p_lamsig * eri4_libcint.get(&[mu, nu, lam, sig]).unwrap();
+                        k_munu += p_lamsig * eri4_libcint.get(&[mu, lam, nu, sig]).unwrap();
+                    }
+                }
+                j.set2d([mu, nu], j_munu);
+                k.set2d([mu, nu], k_munu);
+            }
+        }
+        (j, k)
+    }
+
+    fn tmp_exact4c_contract_jk_from_librint_full(
+        eri4_librint: &[f64],
+        p: &MatrixFull<f64>,
+        nao: usize,
+    ) -> (MatrixFull<f64>, MatrixFull<f64>) {
+        let mut j = MatrixFull::new([nao, nao], 0.0);
+        let mut k = MatrixFull::new([nao, nao], 0.0);
+        for mu in 0..nao {
+            for nu in 0..nao {
+                let mut j_munu = 0.0_f64;
+                let mut k_munu = 0.0_f64;
+                for lam in 0..nao {
+                    for sig in 0..nao {
+                        let p_lamsig = *p.get(&[lam, sig]).unwrap();
+                        j_munu +=
+                            p_lamsig * eri4_librint[int4c_r_full_index(mu, nu, lam, sig, nao)];
+                        k_munu +=
+                            p_lamsig * eri4_librint[int4c_r_full_index(mu, lam, nu, sig, nao)];
+                    }
+                }
+                j.set2d([mu, nu], j_munu);
+                k.set2d([mu, nu], k_munu);
+            }
+        }
+        (j, k)
+    }
+
+    #[test]
+    #[ignore = "temporary exact 4c full-tensor J/K consumer benchmark"]
+    fn tmp_bench_exact4c_jk_consumer_libcint_vs_librint() {
+        use std::hint::black_box;
+
+        let cases_env =
+            std::env::var("TMP_EXACT4C_CASES").unwrap_or_else(|_| String::from("sto-3g"));
+        let cases = cases_env
+            .split(',')
+            .map(str::trim)
+            .filter(|case| !case.is_empty())
+            .map(|case| (case.to_string(), write_temp_ctrl_h2o(case)))
+            .collect::<Vec<_>>();
+        let repeat = std::env::var("TMP_EXACT4C_REPEAT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        let max_nao = std::env::var("TMP_EXACT4C_MAX_NAO")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
+        let summary_path = std::env::var("TMP_EXACT4C_SUMMARY_FILE").ok();
+        if let Some(path) = &summary_path {
+            let _ = fs::remove_file(path);
+        }
+        let emit_summary_line = |line: String| {
+            println!("{line}");
+            if let Some(path) = &summary_path {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .expect("failed to open exact 4c J/K benchmark summary file");
+                writeln!(file, "{line}")
+                    .expect("failed to write exact 4c J/K benchmark summary file");
+            }
+        };
+
+        for (basis_name, ctrl_path) in cases {
+            let mol = match std::panic::catch_unwind(|| Molecule::build(ctrl_path.clone(), None)) {
+                Ok(Ok(mol)) => mol,
+                Ok(Err(err)) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_JK_SKIP basis={basis_name} reason=build_failed detail={err:?}"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+                Err(_) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_JK_SKIP basis={basis_name} reason=build_panicked"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+            };
+            let ao_shells = match crate::lib_rint::basis::load_molecule_rint_shells_from_raw(
+                &mol.geom,
+                &mol.basis4elem,
+            ) {
+                Ok(shells) => shells,
+                Err(err) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_JK_SKIP basis={basis_name} reason=rint_shell_load_failed detail={err:?}"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+            };
+            let nao = rint_shell_basis_count(&ao_shells);
+            if max_nao.is_some_and(|limit| nao > limit) {
+                emit_summary_line(format!(
+                    "TMP_EXACT4C_JK_SKIP basis={basis_name} reason=max_nao_exceeded nao={nao} nshell={} max_nao={}",
+                    ao_shells.len(),
+                    max_nao.unwrap()
+                ));
+                let _ = fs::remove_file(ctrl_path);
+                continue;
+            }
+
+            let p = tmp_exact4c_deterministic_density(nao);
+            let mut best_libcint_full_contract = f64::INFINITY;
+            let mut best_librint_full_contract = f64::INFINITY;
+            let mut j_ref = MatrixFull::new([nao, nao], 0.0);
+            let mut k_ref = MatrixFull::new([nao, nao], 0.0);
+            let mut j_librint = MatrixFull::new([nao, nao], 0.0);
+            let mut k_librint = MatrixFull::new([nao, nao], 0.0);
+
+            for _ in 0..repeat {
+                let t0 = Instant::now();
+                let eri4_libcint = mol.int_ijkl_erifull();
+                let (j_tmp, k_tmp) =
+                    tmp_exact4c_contract_jk_from_libcint_full(&eri4_libcint, &p, nao);
+                let libcint_s = t0.elapsed().as_secs_f64();
+                best_libcint_full_contract = best_libcint_full_contract.min(libcint_s);
+                j_ref = j_tmp;
+                k_ref = k_tmp;
+                black_box((&j_ref, &k_ref));
+
+                let t0 = Instant::now();
+                let eri4_librint = int4c_r_full_from_shell_blocks(&ao_shells);
+                let (j_tmp, k_tmp) =
+                    tmp_exact4c_contract_jk_from_librint_full(&eri4_librint, &p, nao);
+                let librint_s = t0.elapsed().as_secs_f64();
+                best_librint_full_contract = best_librint_full_contract.min(librint_s);
+                j_librint = j_tmp;
+                k_librint = k_tmp;
+                black_box((&j_librint, &k_librint));
+            }
+
+            let max_abs_j = max_abs_diff_matrix(&j_ref, &j_librint);
+            let max_abs_k = max_abs_diff_matrix(&k_ref, &k_librint);
+            emit_summary_line(format!(
+                "TMP_EXACT4C_JK_BENCH basis={basis_name} path=full_tensor_plus_contract nao={nao} nshell={} repeat={repeat} libcint_full_contract_s={:.6} lib_rint_full_contract_s={:.6} lib_rint_over_libcint={:.3} libcint_over_lib_rint={:.3} max_abs_j={:.3e} max_abs_k={:.3e}",
+                ao_shells.len(),
+                best_libcint_full_contract,
+                best_librint_full_contract,
+                best_librint_full_contract / best_libcint_full_contract.max(1.0e-12),
+                best_libcint_full_contract / best_librint_full_contract.max(1.0e-12),
+                max_abs_j,
+                max_abs_k,
+            ));
+            assert!(
+                max_abs_j <= 1.0e-8 && max_abs_k <= 1.0e-8,
+                "exact 4c direct J/K mismatch for {basis_name}: dJ={max_abs_j:.3e}, dK={max_abs_k:.3e}"
+            );
+
+            let _ = fs::remove_file(ctrl_path);
+        }
+    }
+
     #[test]
     #[ignore = "temporary exact 4c shell-block libcint vs lib_rint release benchmark"]
     fn tmp_bench_exact4c_shell_blocks_libcint_vs_librint() {
@@ -12024,6 +12223,148 @@ position = [
                 total_libcint / total_librint.max(1.0e-12),
                 max_abs,
                 max_rel,
+            ));
+
+            let _ = fs::remove_file(ctrl_path);
+        }
+    }
+
+    #[test]
+    #[ignore = "temporary exact 4c shell splitting diagnostics"]
+    fn tmp_diagnose_exact4c_shell_splitting_libcint_vs_librint() {
+        let cases_env =
+            std::env::var("TMP_EXACT4C_CASES").unwrap_or_else(|_| String::from("sto-3g"));
+        let cases = cases_env
+            .split(',')
+            .map(str::trim)
+            .filter(|case| !case.is_empty())
+            .map(|case| (case.to_string(), write_temp_ctrl_h2o(case)))
+            .collect::<Vec<_>>();
+        let summary_path = std::env::var("TMP_EXACT4C_SUMMARY_FILE").ok();
+        if let Some(path) = &summary_path {
+            let _ = fs::remove_file(path);
+        }
+        let emit_summary_line = |line: String| {
+            println!("{line}");
+            if let Some(path) = &summary_path {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .expect("failed to open exact 4c shell splitting summary file");
+                writeln!(file, "{line}")
+                    .expect("failed to write exact 4c shell splitting summary file");
+            }
+        };
+
+        let pair_count = |n: usize| n * (n + 1) / 2;
+        let quartet_count = |n: usize| {
+            let npair = pair_count(n);
+            npair * (npair + 1) / 2
+        };
+
+        for (basis_name, ctrl_path) in cases {
+            let mol = match std::panic::catch_unwind(|| Molecule::build(ctrl_path.clone(), None)) {
+                Ok(Ok(mol)) => mol,
+                Ok(Err(err)) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_SHELL_SPLIT_SKIP basis={basis_name} reason=build_failed detail={err:?}"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+                Err(_) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_SHELL_SPLIT_SKIP basis={basis_name} reason=build_panicked"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+            };
+            let ao_shells = match crate::lib_rint::basis::load_molecule_rint_shells_from_raw(
+                &mol.geom,
+                &mol.basis4elem,
+            ) {
+                Ok(shells) => shells,
+                Err(err) => {
+                    emit_summary_line(format!(
+                        "TMP_EXACT4C_SHELL_SPLIT_SKIP basis={basis_name} reason=rint_shell_load_failed detail={err:?}"
+                    ));
+                    let _ = fs::remove_file(ctrl_path);
+                    continue;
+                }
+            };
+
+            let libcint_nshell = mol.cint_fdqc.len();
+            let librint_nshell = ao_shells.len();
+            let nao = rint_shell_basis_count(&ao_shells);
+            let libcint_pairs = pair_count(libcint_nshell);
+            let librint_pairs = pair_count(librint_nshell);
+            let libcint_quartets = quartet_count(libcint_nshell);
+            let librint_quartets = build_unique_4c_shell_quartet_tasks(&ao_shells).len();
+
+            let shell_coeffs = build_rint_shell_coefficient_cache(&ao_shells);
+            let primitive_pair_cache =
+                build_shell_pair_primitive_pair_cache(&ao_shells, &shell_coeffs);
+            let mut librint_primitive_pair_sum = 0_usize;
+            for left_idx in 0..librint_nshell {
+                for right_idx in 0..=left_idx {
+                    librint_primitive_pair_sum +=
+                        primitive_pair_cache[shell_pair_rank(left_idx, right_idx)].len();
+                }
+            }
+            let mut librint_primitive_quartet_sum = 0_usize;
+            let mut librint_block_value_sum = 0_usize;
+            for (a_idx, b_idx, c_idx, d_idx) in build_unique_4c_shell_quartet_tasks(&ao_shells) {
+                let ab = primitive_pair_cache[shell_pair_rank(a_idx, b_idx)].len();
+                let cd = primitive_pair_cache[shell_pair_rank(c_idx, d_idx)].len();
+                librint_primitive_quartet_sum += ab * cd;
+                librint_block_value_sum += ao_shells[a_idx].ao_len
+                    * ao_shells[b_idx].ao_len
+                    * ao_shells[c_idx].ao_len
+                    * ao_shells[d_idx].ao_len;
+            }
+
+            let mut cint_primitive_pair_sum = 0_usize;
+            let mut cint_block_value_sum = 0_usize;
+            let mut cint_primitive_quartet_est = 0_usize;
+            for a_idx in 0..libcint_nshell {
+                for b_idx in 0..=a_idx {
+                    let ab_nprim =
+                        mol.cint_bas[a_idx][2] as usize * mol.cint_bas[b_idx][2] as usize;
+                    cint_primitive_pair_sum += ab_nprim;
+                }
+            }
+            for a_idx in 0..libcint_nshell {
+                for b_idx in 0..=a_idx {
+                    let ab_rank = shell_pair_rank(a_idx, b_idx);
+                    let ab_nprim =
+                        mol.cint_bas[a_idx][2] as usize * mol.cint_bas[b_idx][2] as usize;
+                    for c_idx in 0..=a_idx {
+                        for d_idx in 0..=c_idx {
+                            if shell_pair_rank(c_idx, d_idx) <= ab_rank {
+                                let cd_nprim = mol.cint_bas[c_idx][2] as usize
+                                    * mol.cint_bas[d_idx][2] as usize;
+                                cint_primitive_quartet_est += ab_nprim * cd_nprim;
+                                cint_block_value_sum += mol.cint_fdqc[a_idx][1]
+                                    * mol.cint_fdqc[b_idx][1]
+                                    * mol.cint_fdqc[c_idx][1]
+                                    * mol.cint_fdqc[d_idx][1];
+                            }
+                        }
+                    }
+                }
+            }
+
+            emit_summary_line(format!(
+                "TMP_EXACT4C_SHELL_SPLIT basis={basis_name} nao={nao} libcint_nshell={libcint_nshell} librint_nshell={librint_nshell} shell_ratio={:.3} libcint_pairs={libcint_pairs} librint_pairs={librint_pairs} pair_ratio={:.3} libcint_quartets={libcint_quartets} librint_quartets={librint_quartets} quartet_ratio={:.3} libcint_primitive_pair_sum={cint_primitive_pair_sum} librint_primitive_pair_sum={librint_primitive_pair_sum} primitive_pair_ratio={:.3} libcint_primitive_quartet_est={cint_primitive_quartet_est} librint_primitive_quartet_sum={librint_primitive_quartet_sum} primitive_quartet_ratio={:.3} libcint_block_value_sum={cint_block_value_sum} librint_block_value_sum={librint_block_value_sum} block_value_ratio={:.3}",
+                librint_nshell as f64 / libcint_nshell.max(1) as f64,
+                librint_pairs as f64 / libcint_pairs.max(1) as f64,
+                librint_quartets as f64 / libcint_quartets.max(1) as f64,
+                librint_primitive_pair_sum as f64 / cint_primitive_pair_sum.max(1) as f64,
+                librint_primitive_quartet_sum as f64 / cint_primitive_quartet_est.max(1) as f64,
+                librint_block_value_sum as f64 / cint_block_value_sum.max(1) as f64,
             ));
 
             let _ = fs::remove_file(ctrl_path);
