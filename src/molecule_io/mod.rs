@@ -23,7 +23,9 @@ use crate::dft::{DFTType, DFA4REST, parse_xc};
 use crate::geom_io::{GeomCell, get_mass_charge, formated_element_name};
 use crate::basis_io::{BasInfo, Basis4Elem};
 use crate::ctrl_io::{overall_parse_and_report_on_ctrl_geom, InputKeywords, parse_ctl};
-use crate::mpi_io::{mpi_isend_irecv_wrt_distribution_v03, MPIData, MPIOperator};
+#[cfg(feature = "mpi")]
+use crate::mpi_io::mpi_isend_irecv_wrt_distribution_v03;
+use crate::mpi_io::{MPIData, MPIOperator};
 use crate::utilities;
 use crate::basis_io::bse_downloader::{self, ctrl_element_checker, local_element_checker};
 use crate::basis_io::basis_list::{basis_fuzzy_matcher, check_basis_name};
@@ -3039,6 +3041,7 @@ impl Molecule {
         let avail_mem = self.ctrl.max_memory.map(|m| m - crate::utilities::memory_batch::detect_used_memory_mb("proc"));
         utilities::memory_batch::handle_memory_exceed(estimated_mem, avail_mem, self.ctrl.abort_on_mem_exceed);
 
+        #[cfg(feature = "mpi")]
         if let (Some(mpi_op), Some(loc_mpi_data)) = (&mpi_operator, &self.mpi_data) {
 
             if omega.is_some() {
@@ -3088,6 +3091,8 @@ impl Molecule {
         } else {
             self.prepare_rimatr_for_ri_v_rayon(omega)
         }
+        #[cfg(not(feature = "mpi"))]
+        { self.prepare_rimatr_for_ri_v_rayon(omega) }
 
 
     }
