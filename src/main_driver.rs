@@ -301,31 +301,6 @@ pub fn main_driver() -> anyhow::Result<()> {
                 }
             }
         }
-        let x_ab_atoms_a = scf_data.mol.ctrl.x_ab_atoms_a.clone();
-        let x_ab_atoms_b = scf_data.mol.ctrl.x_ab_atoms_b.clone();
-        if !x_ab_atoms_a.is_empty() || !x_ab_atoms_b.is_empty() {
-            if x_ab_atoms_a.is_empty() || x_ab_atoms_b.is_empty() {
-                println!(
-                    "X_AB_OCC_CLOSURE skipped: both x_ab_atoms_a and x_ab_atoms_b must be non-empty"
-                );
-            } else {
-                match scf_data.scftype {
-                    SCFType::RHF => {
-                        let x_ab = lib_rint::lib_vee_rhf_occ_closure_connected_ri_coulomb_x(
-                            &scf_data,
-                            &x_ab_atoms_a,
-                            &x_ab_atoms_b,
-                        );
-                        println!("X_AB_OCC_CLOSURE       : {:.16e}", x_ab);
-                        println!("X_AB_OCC_CLOSURE_ATOMS_A: {:?}", x_ab_atoms_a);
-                        println!("X_AB_OCC_CLOSURE_ATOMS_B: {:?}", x_ab_atoms_b);
-                    }
-                    SCFType::ROHF | SCFType::UHF => {
-                        println!("X_AB_OCC_CLOSURE skipped: only RHF is supported for now");
-                    }
-                }
-            }
-        }
         time_mark.count("RI-r2");
     }
 

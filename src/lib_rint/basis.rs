@@ -52,6 +52,26 @@ pub struct RintShell {
     pub is_aux: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct RintContractedShell {
+    pub atom_idx: usize,
+    pub center: [f64; 3],
+    pub l: u32,
+    pub exponents: Vec<f64>,
+    pub coeff_columns: Vec<Vec<f64>>,
+    pub cart_components: Vec<[u32; 3]>,
+    pub ao_start: usize,
+    pub cart_len: usize,
+    pub ao_len: usize,
+    pub is_aux: bool,
+}
+
+impl RintContractedShell {
+    pub fn nctr(&self) -> usize {
+        self.coeff_columns.len()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ShellInventoryBucket {
     pub shells: usize,
@@ -849,6 +869,46 @@ pub fn expand_shell_shared_to_rint_shells(
     Ok(all_shells)
 }
 
+pub fn expand_shell_shared_to_contracted_rint_shells(
+    shells: &[RawShellShared],
+) -> Result<Vec<RintContractedShell>, Box<dyn Error>> {
+    let mut all_shells = Vec::new();
+    let mut ao_start = 0usize;
+    for shell in shells.iter() {
+        let components: Vec<[u32; 3]> = cartesian_components(shell.l)
+            .into_iter()
+            .map(|(lx, ly, lz)| [lx, ly, lz])
+            .collect();
+        let cart_len = components.len();
+        for coeff_col in shell.coeff_columns.iter() {
+            if coeff_col.len() != shell.exponents.len() {
+                return Err(format!(
+                    "shell l={} coeff len {} != exps len {}",
+                    shell.l,
+                    coeff_col.len(),
+                    shell.exponents.len()
+                )
+                .into());
+            }
+        }
+        let ao_len = cart_len * shell.coeff_columns.len();
+        all_shells.push(RintContractedShell {
+            atom_idx: shell.atom_idx,
+            center: shell.center,
+            l: shell.l,
+            exponents: shell.exponents.clone(),
+            coeff_columns: shell.coeff_columns.clone(),
+            cart_components: components,
+            ao_start,
+            cart_len,
+            ao_len,
+            is_aux: shell.is_aux,
+        });
+        ao_start += ao_len;
+    }
+    Ok(all_shells)
+}
+
 pub fn expand_rint_shells_to_basis_functions(
     shells: &[RintShell],
 ) -> Result<Vec<BasisFunction>, Box<dyn Error>> {
@@ -984,6 +1044,21 @@ pub fn load_molecule_rint_shells_from_raw(
     }
     let normalized = normalize_raw_shells_to_shell_shared(&raw_shells)?;
     expand_shell_shared_to_rint_shells(&normalized)
+}
+
+pub fn load_molecule_contracted_rint_shells_from_raw(
+    geom: &GeomCell,
+    basis4elem: &[Basis4Elem],
+) -> Result<Vec<RintContractedShell>, Box<dyn Error>> {
+    let natm = geom.elem.len();
+    let mut raw_shells = Vec::new();
+    for atom_idx in 0..natm {
+        raw_shells.extend(read_raw_shells_from_basis4elem(
+            geom, basis4elem, atom_idx, false,
+        )?);
+    }
+    let normalized = normalize_raw_shells_to_shell_shared(&raw_shells)?;
+    expand_shell_shared_to_contracted_rint_shells(&normalized)
 }
 
 pub fn load_aux_molecule_shell_shared_from_raw(
