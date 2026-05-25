@@ -652,15 +652,11 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
             panic!("Analytic Gradient calculation is currently not available for post-SCF methods.");
         }
 
-        // if scf_data.mol.ctrl.xc.to_lowercase() != "hf" {
-        //     panic!("Gradient calculation is only available for RHF and UHF");
-        // }
-
         if scf_data.mol.ctrl.print_level > 1 {
             println!("Gradient evaluation using Analytical differentiation");
         }
 
-        let is_hf = scf_data.mol.ctrl.xc.to_lowercase() == "hf";
+        let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
 
         // Please note that this is only a temporary workaround implemented gradients.
         // Totally refactor the following code if necessary if other types of gradients to be implemented.
@@ -679,11 +675,6 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
                 if is_hf {
                     grad_data_scf.calc();
                 } else {
-                    grad_data_scf.flags.factor_k = if scf_data.mol.xc_data.dfa_hybrid_scf != 0.0 {
-                        Some(scf_data.mol.xc_data.dfa_hybrid_scf)
-                    } else {
-                        None
-                    };
                     grad_data_scf.calc_rks();
                 }
 
@@ -694,11 +685,6 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
                 if is_hf {
                     grad_data_scf.calc();
                 } else {
-                    grad_data_scf.flags.factor_k = if scf_data.mol.xc_data.dfa_hybrid_scf != 0.0 {
-                        Some(scf_data.mol.xc_data.dfa_hybrid_scf)
-                    } else {
-                        None
-                    };
                     grad_data_scf.calc_uks();
                 }
                 

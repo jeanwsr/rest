@@ -16,12 +16,11 @@ use itertools::{Itertools, izip};
 use tensors::{BasicMatrix, MathMatrix, ParMathMatrix};
 // use tensors::external_libs::{general_dgemm_f, matr_copy};
 use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, contract_vxc_0_serial};
+use rest_tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
 //use numgrid::{self, radial_grid_lmg_bse};
 // use self::gen_grids::radial_grid_lmg_bse;
 use rayon::iter::{IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator, IntoParallelRefMutIterator};
 use regex::Regex;
-#[cfg(test)]
-use crate::basis_io::{BasCell, Basis4Elem, cint_norm_factor,};
 use crate::basis_io::{gto_1st_value_batch_serial, gto_1st_value_serial, gto_value, gto_value_matrixfull_serial, gto_value_serial, spheric_gto_1st_value_batch, 
     spheric_gto_value_matrixfull};
 use crate::molecule_io::Molecule;
@@ -37,8 +36,6 @@ use serde::{Deserialize, Serialize};
 
 use libxc::prelude::*;
 use crate::dft::libxc_helper::{xc_code_fdqc, xc_func_init, lda_exc_vxc, gga_exc_vxc, mgga_exc_vxc, lda_exc, gga_exc, mgga_exc};
-
-use rest_tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
 
 
 #[derive(Clone,Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,6 +298,16 @@ impl DFA4REST {
 
     pub fn init_libxc(&self, xc_code: &usize) -> LibXCFunctional {
         xc_func_init(*xc_code, self.spin_channel)
+    }
+
+    pub fn init_libxc_and_set_param(&self, xc_code: &usize) -> LibXCFunctional {
+        let mut func = self.init_libxc(xc_code);
+        if let Some(omega) = self.omega() {
+            if func.ext_param_names().contains(&"_omega".to_string()) {
+                func.set_ext_param_by_name("_omega", omega);
+            }
+        }
+        func
     }
 
     pub fn get_hybrid_libxc(dfa_compnt_scf: &Vec<usize>,spin_channel:usize) -> f64 {
@@ -1190,6 +1197,78 @@ impl DFA4REST {
             })
     }
 
+    fn prepare_dft_quantities(
+        &self,
+        grids: &Grids,
+        spin_channel: usize,
+        mo: &[MatrixFull<f64>; 2],
+        occ: &[Vec<f64>; 2],
+        use_density_gradient: bool,
+    ) -> (MatrixFull<f64>, RIFull<f64>, MatrixFull<f64>, MatrixFull<f64>, MatrixFull<f64>) {
+        let num_grids = grids.coordinates.len();
+        let mut rho: MatrixFull<f64> = MatrixFull::empty();
+        let mut rhop: RIFull<f64> = RIFull::empty();
+        let mut lapl: MatrixFull<f64> = MatrixFull::empty();
+        let mut tau: MatrixFull<f64> = MatrixFull::empty();
+
+        if self.use_kinetic_density() {
+            (rho, rhop, tau) = grids.prepare_tabulated_density_3(mo, occ, spin_channel);
+            lapl = MatrixFull::new([num_grids, spin_channel], 0.0);
+        } else {
+            (rho, rhop) = if !mo[1].data.is_empty() || spin_channel == 1 {
+                grids.prepare_tabulated_density_2(mo, occ, spin_channel)
+            } else {
+                let mut mo_temp = mo.clone();
+                mo_temp[1] = mo_temp[0].clone();
+                grids.prepare_tabulated_density_2(&mo_temp, occ, spin_channel)
+            };
+        }
+
+        let sigma = if use_density_gradient {
+            prepare_tabulated_sigma_rayon(&rhop, spin_channel)
+        } else {
+            MatrixFull::empty()
+        };
+
+        (rho, rhop, sigma, lapl, tau)
+    }
+
+    fn compute_exc_by_family(&self, xc_func: &LibXCFunctional, spin_channel: usize, rho: &MatrixFull<f64>, sigma: &MatrixFull<f64>, lapl: &MatrixFull<f64>, tau: &MatrixFull<f64>) -> MatrixFull<f64> {
+        let num_grids = rho.size()[0];
+        match xc_func.family() {
+            LibXCFamily::LDA => MatrixFull::from_vec([num_grids, 1], if spin_channel == 1 {
+                lda_exc(xc_func, rho.data_ref().unwrap())
+            } else {
+                lda_exc(xc_func, rho.transpose().data_ref().unwrap())
+            }).unwrap(),
+            LibXCFamily::GGA | LibXCFamily::HybGGA => MatrixFull::from_vec([num_grids, 1], if spin_channel == 1 {
+                gga_exc(xc_func, rho.data_ref().unwrap(), sigma.data_ref().unwrap())
+            } else {
+                gga_exc(xc_func, rho.transpose().data_ref().unwrap(), sigma.transpose().data_ref().unwrap())
+            }).unwrap(),
+            LibXCFamily::MGGA | LibXCFamily::HybMGGA => MatrixFull::from_vec([num_grids, 1], if spin_channel == 1 {
+                mgga_exc(xc_func, rho.data_ref().unwrap(), sigma.data_ref().unwrap(), lapl.data_ref().unwrap(), tau.data_ref().unwrap())
+            } else {
+                mgga_exc(xc_func, rho.transpose().data_ref().unwrap(), sigma.transpose().data_ref().unwrap(), lapl.transpose().data_ref().unwrap(), tau.transpose().data_ref().unwrap())
+            }).unwrap(),
+            xc_family => panic!("{xc_family:?} is not yet implemented"),
+        }
+    }
+
+    fn integrate_exc(&self, exc: &MatrixFull<f64>, rho: &MatrixFull<f64>, weights: &[f64], spin_channel: usize) -> (Vec<f64>, [f64; 2]) {
+        let mut exc_total = vec![0.0; spin_channel];
+        let mut total_elec = [0.0; 2];
+        for i_spin in 0..spin_channel {
+            let total_elec_s = total_elec.get_mut(i_spin).unwrap();
+            exc_total[i_spin] = izip!(exc.data.iter(), rho.iter_column(i_spin), weights.iter())
+                .fold(0.0, |acc, (exc, rho, weight)| {
+                    *total_elec_s += rho * weight;
+                    acc + exc * rho * weight
+                });
+        }
+        (exc_total, total_elec)
+    }
+
     pub fn use_kinetic_density(&self) -> bool {
         self
             .dfa_compnt_pos
@@ -1207,21 +1286,15 @@ impl DFA4REST {
         let mut vxc_ao = vec![MatrixFull::new([num_basis,num_grids],0.0);spin_channel];
         let dt0 = utilities::init_timing();
 
-        let (rho,rhop) = if ! mo[1].data.is_empty() || spin_channel == 1 { // RHF or UHF case
-            grids.prepare_tabulated_density_2(mo, occ, spin_channel)
-        } else { // ROHF case
-            let mut mo_temp = mo.clone();
-            mo_temp[1] = mo_temp[0].clone();
-            grids.prepare_tabulated_density_2(&mo_temp, occ, spin_channel)
-        };
+        let (rho, rhop, sigma, _lapl, _tau) = self.prepare_dft_quantities(
+            grids,
+            spin_channel,
+            mo,
+            occ,
+            self.use_density_gradient(),
+        );
         
-        let dt2 = utilities::timing(&dt0, Some("evaluate rho and rhop"));
-        let sigma = if self.use_density_gradient() {
-            prepare_tabulated_sigma_rayon(&rhop, spin_channel)
-        } else {
-            MatrixFull::empty()
-        };
-
+        let dt2 = utilities::timing(&dt0, Some("evaluate rho/rhop/sigma"));
         let mut vrho = MatrixFull::new([num_grids,spin_channel],0.0);
         let mut vsigma=if self.use_density_gradient() && spin_channel==1 {
             MatrixFull::new([num_grids,1],0.0)
@@ -1230,10 +1303,10 @@ impl DFA4REST {
         } else {
             MatrixFull::empty()
         };
-        let dt3 = utilities::timing(&dt2, Some("evaluate sigma"));
+        let dt3 = utilities::timing(&dt2, Some("init vrho/vsigma"));
 
         self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
-            let xc_func = self.init_libxc(xc_func);
+            let xc_func = self.init_libxc_and_set_param(xc_func);
             match xc_func.family() {
                 LibXCFamily::LDA => {
                     if spin_channel==1 {
@@ -1390,17 +1463,7 @@ impl DFA4REST {
 
         let dt5 = utilities::timing(&dt4, Some("from vrho -> vxc_ao"));
 
-        let mut total_elec = [0.0;2];
-        for i_spin in 0..spin_channel {
-            let mut total_elec_s = total_elec.get_mut(i_spin).unwrap();
-            exc_total[i_spin] = izip!(exc.data.iter(),rho.iter_column(i_spin),grids.weights.iter())
-                .fold(0.0,|acc,(exc,rho,weight)| {
-                    *total_elec_s += rho*weight;
-                    acc + exc * rho * weight
-                });
-            //exc.data.iter_mut().zip(rho.iter_j(i_spin)).for_each(|(exc,rho)| {
-            //    *exc  = *exc* rho
-        }
+        let (exc_total, total_elec) = self.integrate_exc(&exc, &rho, &grids.weights, spin_channel);
         if print_level > 0 {
             if spin_channel==1 {
                 println!("total electron number: {:16.8}", total_elec[0])
@@ -1423,6 +1486,157 @@ impl DFA4REST {
         (exc_total,vxc_ao)
     }
 
+    fn build_active_grid_mask(rho: &MatrixFull<f64>, num_grids: usize, spin_channel: usize, threshold: f64) -> Vec<bool> {
+        (0..num_grids)
+            .map(|p| {
+                let rho_sum: f64 = (0..spin_channel).map(|s| rho[[p, s]].abs()).sum();
+                rho_sum > threshold
+            })
+            .collect()
+    }
+
+    fn compact_rho(rho: &MatrixFull<f64>, mask: &[bool], num_active: usize, spin_channel: usize) -> MatrixFull<f64> {
+        let mut compact = MatrixFull::new([num_active, spin_channel], 0.0);
+        let mut idx = 0usize;
+        for p in 0..rho.size[0] {
+            if mask[p] {
+                for s in 0..spin_channel {
+                    compact[[idx, s]] = rho[[p, s]];
+                }
+                idx += 1;
+            }
+        }
+        compact
+    }
+
+    fn compact_exc(exc: &MatrixFull<f64>, mask: &[bool], num_active: usize) -> MatrixFull<f64> {
+        let mut compact = MatrixFull::new([num_active, 1], 0.0);
+        let mut idx = 0usize;
+        for p in 0..exc.size[0] {
+            if mask[p] {
+                compact[[idx, 0]] = exc[[p, 0]];
+                idx += 1;
+            }
+        }
+        compact
+    }
+
+    fn compact_vrho(vrho: &MatrixFull<f64>, mask: &[bool], num_active: usize, spin_channel: usize) -> MatrixFull<f64> {
+        let mut compact = MatrixFull::new([num_active, spin_channel], 0.0);
+        let mut idx = 0usize;
+        for p in 0..vrho.size[0] {
+            if mask[p] {
+                for s in 0..spin_channel {
+                    compact[[idx, s]] = vrho[[p, s]];
+                }
+                idx += 1;
+            }
+        }
+        compact
+    }
+
+    fn compact_vsigma(vsigma: &MatrixFull<f64>, mask: &[bool], num_active: usize, ncol: usize) -> MatrixFull<f64> {
+        let mut compact = MatrixFull::new([num_active, ncol], 0.0);
+        let mut idx = 0usize;
+        for p in 0..vsigma.size[0] {
+            if mask[p] {
+                for c in 0..ncol {
+                    compact[[idx, c]] = vsigma[[p, c]];
+                }
+                idx += 1;
+            }
+        }
+        compact
+    }
+
+    fn compact_sigma(sigma: &MatrixFull<f64>, mask: &[bool], num_active: usize, ncol: usize) -> MatrixFull<f64> {
+        Self::compact_vsigma(sigma, mask, num_active, ncol)
+    }
+
+    fn compact_vtau(vtau: &MatrixFull<f64>, mask: &[bool], num_active: usize, spin_channel: usize) -> MatrixFull<f64> {
+        Self::compact_vrho(vtau, mask, num_active, spin_channel)
+    }
+
+    fn compact_tau(tau: &MatrixFull<f64>, mask: &[bool], num_active: usize, spin_channel: usize) -> MatrixFull<f64> {
+        Self::compact_vrho(tau, mask, num_active, spin_channel)
+    }
+
+    fn compact_rhop(rhop: &RIFull<f64>, mask: &[bool], num_active: usize, spin_channel: usize) -> RIFull<f64> {
+        let num_total = rhop.size[0];
+        let mut data = vec![0.0f64; num_active * 3 * spin_channel];
+        let mut idx = 0usize;
+        for p in 0..num_total {
+            if mask[p] {
+                for s in 0..spin_channel {
+                    let rhop_s = rhop.get_reducing_matrix(s).unwrap();
+                    for x in 0usize..3usize {
+                        let rhop_s_x = rhop_s.get_slice_x(x);
+                        data[idx * (3 * spin_channel) + x * spin_channel + s] = rhop_s_x[p];
+                    }
+                }
+                idx += 1;
+            }
+        }
+        RIFull::from_vec([num_active, 3, spin_channel], data).unwrap()
+    }
+
+    fn compact_weights(weights: &[f64], mask: &[bool], num_active: usize) -> Vec<f64> {
+        weights.iter().enumerate()
+            .filter(|(p, _)| mask[*p])
+            .map(|(_, w)| *w)
+            .collect()
+    }
+
+    fn extract_active_ao_columns(
+        ao: &MatrixFull<f64>,
+        range_grids: &std::ops::Range<usize>,
+        mask: &[bool],
+        num_active: usize,
+        num_basis: usize,
+    ) -> MatrixFull<f64> {
+        let mut ao_active = MatrixFull::new([num_basis, num_active], 0.0);
+        let mut idx = 0usize;
+        let offset = range_grids.start;
+        for p_local in 0..mask.len() {
+            if mask[p_local] {
+                let p_global = offset + p_local;
+                for mu in 0..num_basis {
+                    ao_active[[mu, idx]] = ao[[mu, p_global]];
+                }
+                idx += 1;
+            }
+        }
+        ao_active
+    }
+
+    fn extract_active_aop_columns(
+        aop: &RIFull<f64>,
+        range_grids: &std::ops::Range<usize>,
+        mask: &[bool],
+        num_active: usize,
+        num_basis: usize,
+    ) -> RIFull<f64> {
+        let ngrids_full = aop.size[1];
+        let mut data = vec![0.0f64; num_basis * num_active * 3];
+        let mut idx = 0usize;
+        let offset = range_grids.start;
+        for p_local in 0..mask.len() {
+            if mask[p_local] {
+                let p_global = offset + p_local;
+                for x in 0usize..3usize {
+                    let aop_x = aop.get_reducing_matrix(x).unwrap();
+                    for mu in 0..num_basis {
+                        let flat_src = p_global * num_basis + mu;
+                        let flat_dst = mu + idx * num_basis + x * num_basis * num_active;
+                        data[flat_dst] = aop_x.data[flat_src];
+                    }
+                }
+                idx += 1;
+            }
+        }
+        RIFull::from_vec([num_basis, num_active, 3], data).unwrap()
+    }
+
     pub fn xc_exc_vxc_slots_dm_only(
         &self, 
         range_grids: Range<usize>, 
@@ -1430,39 +1644,21 @@ impl DFA4REST {
         spin_channel: usize, 
         dm: &Vec<MatrixFull<f64>>, 
         mo: &[MatrixFull<f64>;2], 
-        occ: &[Vec<f64>;2]
+        occ: &[Vec<f64>;2],
+        print_level: usize,
+        vxc_screen_threshold: f64,
     ) -> (Vec<f64>, Vec<MatrixFull<f64>>, [f64;2]) 
     {
-        //let num_grids = grids.coordinates.len();
         let num_grids = range_grids.len();
         let num_basis = dm[0].size[0];
 
-        let loc_coordinates = &grids.coordinates[range_grids.clone()];
-        let loc_weights = &grids.weights[range_grids.clone()];
-
-        //println!("thread_id: {:?}, rayon_threads_number: {:?}, omp_threads_number: {:?}",
-        //    rayon::current_thread_index().unwrap(), rayon::current_num_threads(), utilities::omp_get_num_threads_wrapper());
-
-        let mut loc_exc = MatrixFull::new([num_grids,1],0.0);
-        let mut loc_exc_total = vec![0.0;spin_channel];
-        let mut loc_vxc_ao_0 = vec![MatrixFull::new([num_basis, num_grids], 0.0); spin_channel];
-        let mut loc_vxc_ao_1 = vec![MatrixFull::new([num_basis, num_grids], 0.0); spin_channel];
-        let mut loc_vxc_mat = vec![MatrixFull::new([num_basis, num_basis], 0.0); spin_channel];
-        //println!("debug loc_vxc_ao size: {:?}", loc_vxc_ao[0].size());
-        let dt0 = utilities::init_timing();
-
-        /// rho and rhop have been localized.
-        //let (loc_rho,loc_rhop) = grids.prepare_tabulated_density_slots(mo, occ, spin_channel,range_grids.clone());
-        //let (loc_rho,loc_rhop) = grids.prepare_tabulated_density_slots_dm_only(dm, spin_channel,range_grids.clone());
         let mut loc_rho = MatrixFull::empty();
         let mut loc_rhop = RIFull::empty();
         let mut loc_lapl = MatrixFull::empty();
         let mut loc_tau = MatrixFull::empty();
-        // for mgga test 
         if self.use_kinetic_density() {
             let order = 2; 
             (loc_rho, loc_rhop, loc_tau) = grids.prepare_tabulated_density_2_slots_dm_only(dm, spin_channel, order, range_grids.clone()); 
-            // currently, laplacian is set to zero
             loc_lapl = MatrixFull::new([num_grids, spin_channel], 0.0);
         }
         else {
@@ -1474,263 +1670,435 @@ impl DFA4REST {
             MatrixFull::empty()
         };
 
-        let mut loc_vrho = MatrixFull::new([num_grids,spin_channel],0.0);
-        let mut loc_vsigma=if self.use_density_gradient() && spin_channel==1 {
-            MatrixFull::new([num_grids,1],0.0)
-        } else if self.use_density_gradient() && spin_channel==2 {
-            MatrixFull::new([num_grids,3],0.0)
-        } else {
-            MatrixFull::empty()
-        };
-        let mut loc_vtau = if self.use_kinetic_density() {
-            MatrixFull::new([num_grids, spin_channel],0.0)
-        } else {
-            MatrixFull::empty()
-        };
+        // Density screening
+        let active_mask = Self::build_active_grid_mask(&loc_rho, num_grids, spin_channel, vxc_screen_threshold);
+        let num_active = active_mask.iter().filter(|&&x| x).count();
+        let use_screening = num_active > 0 && num_active < num_grids * 3 / 4;
 
-        self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
-            let xc_func = self.init_libxc(xc_func);
-            match xc_func.family() {
-                LibXCFamily::LDA => {
-                    if spin_channel==1 {
-                        let (tmp_exc,tmp_vrho) = lda_exc_vxc(&xc_func,loc_rho.data_ref().unwrap());
-                        let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
-                        let tmp_vrho = MatrixFull::from_vec([num_grids,1],tmp_vrho).unwrap();
-                        loc_exc.self_scaled_add(&tmp_exc,*xc_para);
-                        loc_vrho.self_scaled_add(&tmp_vrho,*xc_para);
-
-                    } else {
-                        let (tmp_exc,tmp_vrho) = lda_exc_vxc(&xc_func,loc_rho.transpose().data_ref().unwrap());
-                        let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
-                        //let tmp_vrho = MatrixFull::from_vec([num_grids,spin_channel],tmp_vrho).unwrap();
-                        let tmp_vrho = MatrixFull::from_vec([2,num_grids],tmp_vrho).unwrap();
-                        loc_exc.self_scaled_add(&tmp_exc,*xc_para);
-                        loc_vrho.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
-                    }
-                },
-                LibXCFamily::GGA | LibXCFamily::HybGGA => {
-                    if spin_channel==1 {
-                        let (tmp_exc,tmp_vrho, tmp_vsigma) = gga_exc_vxc(&xc_func,loc_rho.data_ref().unwrap(),loc_sigma.data_ref().unwrap());
-                        let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
-                        let tmp_vrho = MatrixFull::from_vec([num_grids,1],tmp_vrho).unwrap();
-                        let tmp_vsigma= MatrixFull::from_vec([num_grids,1],tmp_vsigma).unwrap();
-                        loc_exc.self_scaled_add(&tmp_exc,*xc_para);
-                        loc_vrho.self_scaled_add(&tmp_vrho,*xc_para);
-                        loc_vsigma.self_scaled_add(&tmp_vsigma, *xc_para);
-                    } else {
-                        let (tmp_exc,tmp_vrho, tmp_vsigma) = gga_exc_vxc(&xc_func,loc_rho.transpose().data_ref().unwrap(),loc_sigma.transpose().data_ref().unwrap());
-                        let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
-                        let tmp_vrho = MatrixFull::from_vec([2,num_grids],tmp_vrho).unwrap();
-                        let tmp_vsigma= MatrixFull::from_vec([3,num_grids],tmp_vsigma).unwrap();
-                        loc_exc.self_scaled_add(&tmp_exc,*xc_para);
-                        loc_vrho.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
-                        loc_vsigma.self_scaled_add(&tmp_vsigma.transpose_and_drop(), *xc_para);
-                    }
-                },
-                LibXCFamily::MGGA | LibXCFamily::HybMGGA => {
-                    if spin_channel==1 {
-                        let (tmp_exc,tmp_vrho,tmp_vsigma,tmp_valpl,tmp_vtau)
-                            = mgga_exc_vxc(&xc_func,
-                                loc_rho.data_ref().unwrap(), 
-                                loc_sigma.data_ref().unwrap(), 
-                                loc_lapl.data_ref().unwrap(),
-                                loc_tau.data_ref().unwrap()
-                            );
-                        // currently no laplacian 
-                        let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
-                        let tmp_vrho = MatrixFull::from_vec([num_grids,1],tmp_vrho).unwrap();
-                        let tmp_vsigma= MatrixFull::from_vec([num_grids,1],tmp_vsigma).unwrap();
-                        let tmp_vtau = MatrixFull::from_vec([num_grids,1],tmp_vtau).unwrap();
-                        loc_exc.self_scaled_add(&tmp_exc,*xc_para);
-                        loc_vrho.self_scaled_add(&tmp_vrho,*xc_para);
-                        loc_vsigma.self_scaled_add(&tmp_vsigma, *xc_para);
-                        loc_vtau.self_scaled_add(&tmp_vtau, *xc_para);
-                    } else {
-                        let (tmp_exc,tmp_vrho,tmp_vsigma,tmp_valpl,tmp_vtau)
-                            = mgga_exc_vxc(&xc_func,
-                                loc_rho.transpose().data_ref().unwrap(), 
-                                loc_sigma.transpose().data_ref().unwrap(), 
-                                loc_lapl.transpose().data_ref().unwrap(),
-                                loc_tau.transpose().data_ref().unwrap()
-                            );
-                        // currently no laplacian 
-                        let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
-                        let tmp_vrho = MatrixFull::from_vec([2,num_grids],tmp_vrho).unwrap();
-                        let tmp_vsigma= MatrixFull::from_vec([3,num_grids],tmp_vsigma).unwrap();
-                        let tmp_vtau = MatrixFull::from_vec([2,num_grids],tmp_vtau).unwrap();
-                        loc_exc.self_scaled_add(&tmp_exc,*xc_para);
-                        loc_vrho.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
-                        loc_vsigma.self_scaled_add(&tmp_vsigma.transpose_and_drop(), *xc_para);
-                        loc_vtau.self_scaled_add(&tmp_vtau.transpose_and_drop(), *xc_para);
-                    }
-                },
-                xc_family => panic!("{xc_family:?} is not yet implemented"),
+        if print_level >= 1 && use_screening {
+            if let Some(tid) = rayon::current_thread_index() {
+                if tid == 0 {
+                    let ratio = num_active as f64 / num_grids as f64 * 100.0;
+                    println!(" [VXC-screen(dm_only)] active grids: {}/{} ({:.1}%), saved ~{:.0}%",
+                        num_active, num_grids, ratio, 100.0 - ratio);
+                }
             }
-        });
+        } 
 
-        if let Some(ao) = &grids.ao {
-            // for vrho
-            for i_spin in  0..spin_channel {
+        if use_screening {
+            // === Screened path: compact arrays, smaller vxc_ao ===
+            let n_g = num_active;
+            let loc_rho_c = Self::compact_rho(&loc_rho, &active_mask, num_active, spin_channel);
+            let loc_rhop_c = Self::compact_rhop(&loc_rhop, &active_mask, num_active, spin_channel);
+            let loc_sigma_c = if self.use_density_gradient() {
+                Self::compact_sigma(&loc_sigma, &active_mask, num_active,
+                    if spin_channel==1 {1} else {3})
+            } else { MatrixFull::empty() };
+            let loc_lapl_c = if self.use_kinetic_density() {
+                Self::compact_vrho(&loc_lapl, &active_mask, num_active, spin_channel)
+            } else { MatrixFull::empty() };
+            let loc_tau_c = if self.use_kinetic_density() {
+                Self::compact_tau(&loc_tau, &active_mask, num_active, spin_channel)
+            } else { MatrixFull::empty() };
+            let mut loc_exc_c = MatrixFull::new([num_active, 1], 0.0);
+
+            let mut loc_vrho_c = MatrixFull::new([n_g, spin_channel], 0.0);
+            let mut loc_vsigma_c = if self.use_density_gradient() && spin_channel==1 {
+                MatrixFull::new([n_g, 1], 0.0)
+            } else if self.use_density_gradient() && spin_channel==2 {
+                MatrixFull::new([n_g, 3], 0.0)
+            } else { MatrixFull::empty() };
+            let mut loc_vtau_c = if self.use_kinetic_density() {
+                MatrixFull::new([n_g, spin_channel], 0.0)
+            } else { MatrixFull::empty() };
+
+            // libxc on compact arrays
+            self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
+                let xc_func = self.init_libxc_and_set_param(xc_func);
+                match xc_func.family() {
+                    LibXCFamily::LDA => {
+                        if spin_channel==1 {
+                            let (tmp_exc,tmp_vrho) = lda_exc_vxc(&xc_func,loc_rho_c.data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([n_g,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([n_g,1],tmp_vrho).unwrap();
+                            loc_exc_c.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho_c.self_scaled_add(&tmp_vrho,*xc_para);
+                        } else {
+                            let (tmp_exc,tmp_vrho) = lda_exc_vxc(&xc_func,loc_rho_c.transpose().data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([n_g,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([2,n_g],tmp_vrho).unwrap();
+                            loc_exc_c.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho_c.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
+                        }
+                    },
+                    LibXCFamily::GGA | LibXCFamily::HybGGA => {
+                        if spin_channel==1 {
+                            let (tmp_exc,tmp_vrho, tmp_vsigma) = gga_exc_vxc(&xc_func,loc_rho_c.data_ref().unwrap(),loc_sigma_c.data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([n_g,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([n_g,1],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([n_g,1],tmp_vsigma).unwrap();
+                            loc_exc_c.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho_c.self_scaled_add(&tmp_vrho,*xc_para);
+                            loc_vsigma_c.self_scaled_add(&tmp_vsigma, *xc_para);
+                        } else {
+                            let (tmp_exc,tmp_vrho, tmp_vsigma) = gga_exc_vxc(&xc_func,loc_rho_c.transpose().data_ref().unwrap(),loc_sigma_c.transpose().data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([n_g,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([2,n_g],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([3,n_g],tmp_vsigma).unwrap();
+                            loc_exc_c.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho_c.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
+                            loc_vsigma_c.self_scaled_add(&tmp_vsigma.transpose_and_drop(), *xc_para);
+                        }
+                    },
+                    LibXCFamily::MGGA | LibXCFamily::HybMGGA => {
+                        if spin_channel==1 {
+                            let (tmp_exc,tmp_vrho,tmp_vsigma,tmp_valpl,tmp_vtau)
+                                = mgga_exc_vxc(&xc_func, loc_rho_c.data_ref().unwrap(), loc_sigma_c.data_ref().unwrap(),
+                                    loc_lapl_c.data_ref().unwrap(), loc_tau_c.data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([n_g,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([n_g,1],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([n_g,1],tmp_vsigma).unwrap();
+                            let tmp_vtau = MatrixFull::from_vec([n_g,1],tmp_vtau).unwrap();
+                            loc_exc_c.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho_c.self_scaled_add(&tmp_vrho,*xc_para);
+                            loc_vsigma_c.self_scaled_add(&tmp_vsigma, *xc_para);
+                            loc_vtau_c.self_scaled_add(&tmp_vtau, *xc_para);
+                        } else {
+                            let (tmp_exc,tmp_vrho,tmp_vsigma,tmp_valpl,tmp_vtau)
+                                = mgga_exc_vxc(&xc_func, loc_rho_c.transpose().data_ref().unwrap(), loc_sigma_c.transpose().data_ref().unwrap(),
+                                    loc_lapl_c.transpose().data_ref().unwrap(), loc_tau_c.transpose().data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([n_g,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([2,n_g],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([3,n_g],tmp_vsigma).unwrap();
+                            let tmp_vtau = MatrixFull::from_vec([2,n_g],tmp_vtau).unwrap();
+                            loc_exc_c.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho_c.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
+                            loc_vsigma_c.self_scaled_add(&tmp_vsigma.transpose_and_drop(), *xc_para);
+                            loc_vtau_c.self_scaled_add(&tmp_vtau.transpose_and_drop(), *xc_para);
+                        }
+                    },
+                    xc_family => panic!("{xc_family:?} is not yet implemented"),
+                }
+            });
+
+            // Build compact ao/aop with only active grid columns
+            let ao_active = Self::extract_active_ao_columns(
+                grids.ao.as_ref().unwrap(), &range_grids, &active_mask, num_active, num_basis);
+            let aop_active: Option<RIFull<f64>> = grids.aop.as_ref().map(|aop| {
+                Self::extract_active_aop_columns(aop, &range_grids, &active_mask, num_active, num_basis)
+            });
+            let weights_active = Self::compact_weights(&grids.weights[range_grids.clone()], &active_mask, num_active);
+
+            // vxc_ao arrays
+            let mut loc_vxc_ao_0 = vec![MatrixFull::new([num_basis, n_g], 0.0); spin_channel];
+            let mut loc_vxc_ao_1 = if self.use_kinetic_density() {
+                vec![MatrixFull::new([num_basis, n_g], 0.0); spin_channel]
+            } else { vec![] };
+            let mut loc_vxc_mat = vec![MatrixFull::new([num_basis, num_basis], 0.0); spin_channel];
+
+            // Build vxc_ao from vrho (compact)
+            for i_spin in 0..spin_channel {
                 let mut loc_vxc_ao_s = &mut loc_vxc_ao_0[i_spin];
-                let loc_vrho_s = loc_vrho.slice_column(i_spin);
-                let loc_ao_ref = ao.to_matrixfullslice_columns(range_grids.clone());
-                // generate vxc grid by grid
+                let loc_vrho_s = loc_vrho_c.slice_column(i_spin);
+                let loc_ao_ref = ao_active.to_matrixfullslice_columns(0..n_g);
                 contract_vxc_0_serial(loc_vxc_ao_s, &loc_ao_ref, loc_vrho_s, None);
             }
-            // for vsigma
+            // GGA sigma
             if self.use_density_gradient() {
-                if let Some(aop) = &grids.aop {
+                if let Some(ref aop_active) = aop_active {
                     if spin_channel == 1 {
-                        // vxc_ao_s: the shape of [num_basis, num_grids]
                         let mut loc_vxc_ao_s = &mut loc_vxc_ao_0[0];
-                        // vsigma_s: a slice with the length of [num_grids]
-                        let loc_vsigma_s = loc_vsigma.slice_column(0);
-                        // rhop_s:  the shape of [num_grids, 3]
-                        let loc_rhop_s = loc_rhop.get_reducing_matrix(0).unwrap();
-                        
-                        // (nabla rho)[num_grids, 3] dot (nabla ao)[num_basis, num_grids, 3] -> [num_basis, num_grids]
-                        //               p,       n                    i,        p,       n  ->     i,       p
-                        //   einsum(pn, ipn -> ip)
-                        let mut loc_wao = MatrixFull::new([num_basis, num_grids],0.0);
+                        let loc_vsigma_s = loc_vsigma_c.slice_column(0);
+                        let loc_rhop_s = loc_rhop_c.get_reducing_matrix(0).unwrap();
+                        let mut loc_wao = MatrixFull::new([num_basis, n_g], 0.0);
                         for x in 0usize..3usize {
-                            // aop_x: the shape of [num_basis, num_grids]
-                            let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(),x).unwrap();
-                            // rhop_s_x: a slice with the length of [num_grids]
+                            let loc_aop_x = aop_active.get_reducing_matrix_columns(0..n_g, x).unwrap();
                             let loc_rhop_s_x = loc_rhop_s.get_slice_x(x);
                             contract_vxc_0_serial(&mut loc_wao, &loc_aop_x, loc_rhop_s_x, None);
                         }
-
-                        contract_vxc_0_serial(loc_vxc_ao_s, &loc_wao.to_matrixfullslice(), loc_vsigma_s,Some(4.0));
-                        //println!("debug awo:");
-                        //(0..100).for_each(|i| {
-                        //    println!("{:16.8},{:16.8}",vxc_ao_s[[0,i]],vxc_ao_s[[1,i]]);
-                        //});
-
+                        contract_vxc_0_serial(loc_vxc_ao_s, &loc_wao.to_matrixfullslice(), loc_vsigma_s, Some(4.0));
                     } else {
-                        // ==================================
-                        // at first i_spin == 0
-                        // ==================================
                         {
                             let mut loc_vxc_ao_a = &mut loc_vxc_ao_0[0];
-                            let loc_rhop_a = loc_rhop.get_reducing_matrix(0).unwrap();
-                            let loc_vsigma_uu = loc_vsigma.slice_column(0);
-                            let mut loc_dao = MatrixFull::new([num_basis, num_grids],0.0);
+                            let loc_rhop_a = loc_rhop_c.get_reducing_matrix(0).unwrap();
+                            let loc_vsigma_uu = loc_vsigma_c.slice_column(0);
+                            let mut loc_dao = MatrixFull::new([num_basis, n_g], 0.0);
                             for x in 0usize..3usize {
-                                // aop_x: the shape of [num_basis, num_grids]
-                                let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(),x).unwrap();
-                                // rhop_s_x: a slice with the length of [num_grids]
+                                let loc_aop_x = aop_active.get_reducing_matrix_columns(0..n_g, x).unwrap();
                                 let loc_rhop_s_x = loc_rhop_a.get_slice_x(x);
-                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x,None);
+                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
                             }
-                            contract_vxc_0_serial(loc_vxc_ao_a, &loc_dao.to_matrixfullslice(), &loc_vsigma_uu,Some(4.0));
-
-                            let loc_rhop_b = loc_rhop.get_reducing_matrix(1).unwrap();
-                            let loc_vsigma_ud = loc_vsigma.slice_column(1);
+                            contract_vxc_0_serial(loc_vxc_ao_a, &loc_dao.to_matrixfullslice(), &loc_vsigma_uu, Some(4.0));
+                            let loc_rhop_b = loc_rhop_c.get_reducing_matrix(1).unwrap();
+                            let loc_vsigma_ud = loc_vsigma_c.slice_column(1);
                             loc_dao.data.iter_mut().for_each(|d| {*d=0.0});
                             for x in 0usize..3usize {
-                                // aop_x: the shape of [num_basis, num_grids]
-                                let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(),x).unwrap();
-                                // rhop_s_x: a slice with the length of [num_grids]
+                                let loc_aop_x = aop_active.get_reducing_matrix_columns(0..n_g, x).unwrap();
                                 let loc_rhop_s_x = loc_rhop_b.get_slice_x(x);
-                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x,None);
+                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
                             }
-                            contract_vxc_0_serial(loc_vxc_ao_a, &loc_dao.to_matrixfullslice(), &loc_vsigma_ud,Some(2.0));
+                            contract_vxc_0_serial(loc_vxc_ao_a, &loc_dao.to_matrixfullslice(), &loc_vsigma_ud, Some(2.0));
                         }
-                        // ==================================
-                        // them i_spin == 1
-                        // ==================================
                         {
                             let mut loc_vxc_ao_b = &mut loc_vxc_ao_0[1];
-                            let loc_rhop_b = loc_rhop.get_reducing_matrix(1).unwrap();
-                            let loc_vsigma_dd = loc_vsigma.slice_column(2);
-                            let mut loc_dao = MatrixFull::new([num_basis, num_grids],0.0);
+                            let loc_rhop_b = loc_rhop_c.get_reducing_matrix(1).unwrap();
+                            let loc_vsigma_dd = loc_vsigma_c.slice_column(2);
+                            let mut loc_dao = MatrixFull::new([num_basis, n_g], 0.0);
                             for x in 0usize..3usize {
-                                // aop_x: the shape of [num_basis, num_grids]
-                                let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(),x).unwrap();
-                                // rhop_s_x: a slice with the length of [num_grids]
+                                let loc_aop_x = aop_active.get_reducing_matrix_columns(0..n_g, x).unwrap();
                                 let loc_rhop_s_x = loc_rhop_b.get_slice_x(x);
-                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x,None);
+                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
                             }
-                            contract_vxc_0_serial(loc_vxc_ao_b, &loc_dao.to_matrixfullslice(), &loc_vsigma_dd,Some(4.0));
-
-                            let loc_rhop_a = loc_rhop.get_reducing_matrix(0).unwrap();
-                            let loc_vsigma_ud = loc_vsigma.slice_column(1);
+                            contract_vxc_0_serial(loc_vxc_ao_b, &loc_dao.to_matrixfullslice(), &loc_vsigma_dd, Some(4.0));
+                            let loc_rhop_a = loc_rhop_c.get_reducing_matrix(0).unwrap();
+                            let loc_vsigma_ud = loc_vsigma_c.slice_column(1);
                             loc_dao.data.iter_mut().for_each(|d| {*d=0.0});
                             for x in 0usize..3usize {
-                                // aop_x: the shape of [num_basis, num_grids]
-                                let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(),x).unwrap();
-                                // rhop_s_x: a slice with the length of [num_grids]
+                                let loc_aop_x = aop_active.get_reducing_matrix_columns(0..n_g, x).unwrap();
                                 let loc_rhop_s_x = loc_rhop_a.get_slice_x(x);
-                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x,None);
+                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
                             }
-                            contract_vxc_0_serial(loc_vxc_ao_b, &loc_dao.to_matrixfullslice(), &loc_vsigma_ud,Some(2.0));
+                            contract_vxc_0_serial(loc_vxc_ao_b, &loc_dao.to_matrixfullslice(), &loc_vsigma_ud, Some(2.0));
                         }
-                        // ==================================
-                    } // end spin case for GGA 
+                    }
                 }
             }
 
-            // construc vxc_mat for LDA/GGA 
+            // GEMM contraction (compact)
             for i_spin in 0..spin_channel {
                 let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
                 let mut loc_vxc_ao_s = loc_vxc_ao_0.get_mut(i_spin).unwrap();
-                loc_vxc_ao_s.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(vxc_ao_s,w)| {
+                loc_vxc_ao_s.iter_columns_full_mut().zip(weights_active.iter()).for_each(|(vxc_ao_s,w)| {
                     vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
                 });
                 _dgemm(
-                    ao,(0..num_basis, range_grids.clone()),'N',
-                    loc_vxc_ao_s,(0..num_basis,0..range_grids.len()),'T',
-                    loc_vxc_mat_s, (0..num_basis,0..num_basis),
-                    1.0,0.0
+                    &ao_active, (0..num_basis, 0..n_g), 'N',
+                    loc_vxc_ao_s, (0..num_basis, 0..n_g), 'T',
+                    loc_vxc_mat_s, (0..num_basis, 0..num_basis),
+                    1.0, 0.0
                 );
             }
-            // MGGA
+            // MGGA tau
             if self.use_kinetic_density() {
-                let Some(aop) = &grids.aop else {
-                    panic!("aop is not available in xc_exc_vxc_slots_dm_only");
-                };
-                for i_spin in  0..spin_channel {
-                    let loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
-                    let mut loc_vtau_s = loc_vtau.slice_column_mut(i_spin);
-                    let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_1[i_spin];
-                    loc_vtau_s.iter_mut().zip(loc_weights.iter()).for_each(
-                        |(vtau_s, w)| {*vtau_s *= *w}
-                    );
-                    for ic in 0usize..3usize {
-                        let loc_aop_ic = aop.get_reducing_matrix_columns(range_grids.clone(),ic).unwrap();
-                        contract_vxc_0_serial (loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
-                        _dgemm(
-                        &loc_aop_ic,(0..num_basis, 0..range_grids.len()), 'N',
-                        loc_vxc_ao_1_s, (0..num_basis, 0..range_grids.len()), 'T',
-                        loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
+                if let Some(ref aop_active) = aop_active {
+                    for i_spin in 0..spin_channel {
+                        let loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                        let mut loc_vtau_s = loc_vtau_c.slice_column_mut(i_spin);
+                        let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_1[i_spin];
+                        loc_vtau_s.iter_mut().zip(weights_active.iter()).for_each(
+                            |(vtau_s, w)| {*vtau_s *= *w}
                         );
-                        loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
-                    }                            
+                        for ic in 0usize..3usize {
+                            let loc_aop_ic = aop_active.get_reducing_matrix_columns(0..n_g, ic).unwrap();
+                            contract_vxc_0_serial(loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
+                            _dgemm(
+                                &loc_aop_ic, (0..num_basis, 0..n_g), 'N',
+                                loc_vxc_ao_1_s, (0..num_basis, 0..n_g), 'T',
+                                loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
+                            );
+                            loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
+                        }
+                    }
                 }
-            } 
+            }
+
+            let (loc_exc_total, loc_total_elec) = self.integrate_exc(&loc_exc_c, &loc_rho_c, &weights_active, spin_channel);
+            (loc_exc_total, loc_vxc_mat, loc_total_elec)
+        } else {
+            // === Original path: no screening, use full grids ===
+            let loc_weights = &grids.weights[range_grids.clone()];
+            let mut loc_exc = MatrixFull::new([num_grids, 1], 0.0);
+            let mut loc_exc_total = vec![0.0; spin_channel];
+            let mut loc_vxc_ao_0 = vec![MatrixFull::new([num_basis, num_grids], 0.0); spin_channel];
+            let mut loc_vxc_ao_1 = if self.use_kinetic_density() {
+                vec![MatrixFull::new([num_basis, num_grids], 0.0); spin_channel]
+            } else { vec![] };
+            let mut loc_vxc_mat = vec![MatrixFull::new([num_basis, num_basis], 0.0); spin_channel];
+
+            let mut loc_vrho = MatrixFull::new([num_grids, spin_channel], 0.0);
+            let mut loc_vsigma = if self.use_density_gradient() && spin_channel==1 {
+                MatrixFull::new([num_grids, 1], 0.0)
+            } else if self.use_density_gradient() && spin_channel==2 {
+                MatrixFull::new([num_grids, 3], 0.0)
+            } else { MatrixFull::empty() };
+            let mut loc_vtau = if self.use_kinetic_density() {
+                MatrixFull::new([num_grids, spin_channel], 0.0)
+            } else { MatrixFull::empty() };
+
+            self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
+                let xc_func = self.init_libxc_and_set_param(xc_func);
+                match xc_func.family() {
+                    LibXCFamily::LDA => {
+                        if spin_channel==1 {
+                            let (tmp_exc,tmp_vrho) = lda_exc_vxc(&xc_func,loc_rho.data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([num_grids,1],tmp_vrho).unwrap();
+                            loc_exc.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho.self_scaled_add(&tmp_vrho,*xc_para);
+                        } else {
+                            let (tmp_exc,tmp_vrho) = lda_exc_vxc(&xc_func,loc_rho.transpose().data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([2,num_grids],tmp_vrho).unwrap();
+                            loc_exc.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
+                        }
+                    },
+                    LibXCFamily::GGA | LibXCFamily::HybGGA => {
+                        if spin_channel==1 {
+                            let (tmp_exc,tmp_vrho, tmp_vsigma) = gga_exc_vxc(&xc_func,loc_rho.data_ref().unwrap(),loc_sigma.data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([num_grids,1],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([num_grids,1],tmp_vsigma).unwrap();
+                            loc_exc.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho.self_scaled_add(&tmp_vrho,*xc_para);
+                            loc_vsigma.self_scaled_add(&tmp_vsigma, *xc_para);
+                        } else {
+                            let (tmp_exc,tmp_vrho, tmp_vsigma) = gga_exc_vxc(&xc_func,loc_rho.transpose().data_ref().unwrap(),loc_sigma.transpose().data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([2,num_grids],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([3,num_grids],tmp_vsigma).unwrap();
+                            loc_exc.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
+                            loc_vsigma.self_scaled_add(&tmp_vsigma.transpose_and_drop(), *xc_para);
+                        }
+                    },
+                    LibXCFamily::MGGA | LibXCFamily::HybMGGA => {
+                        if spin_channel==1 {
+                            let (tmp_exc,tmp_vrho,tmp_vsigma,tmp_valpl,tmp_vtau)
+                                = mgga_exc_vxc(&xc_func, loc_rho.data_ref().unwrap(), loc_sigma.data_ref().unwrap(),
+                                    loc_lapl.data_ref().unwrap(), loc_tau.data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([num_grids,1],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([num_grids,1],tmp_vsigma).unwrap();
+                            let tmp_vtau = MatrixFull::from_vec([num_grids,1],tmp_vtau).unwrap();
+                            loc_exc.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho.self_scaled_add(&tmp_vrho,*xc_para);
+                            loc_vsigma.self_scaled_add(&tmp_vsigma, *xc_para);
+                            loc_vtau.self_scaled_add(&tmp_vtau, *xc_para);
+                        } else {
+                            let (tmp_exc,tmp_vrho,tmp_vsigma,tmp_valpl,tmp_vtau)
+                                = mgga_exc_vxc(&xc_func, loc_rho.transpose().data_ref().unwrap(), loc_sigma.transpose().data_ref().unwrap(),
+                                    loc_lapl.transpose().data_ref().unwrap(), loc_tau.transpose().data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([2,num_grids],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([3,num_grids],tmp_vsigma).unwrap();
+                            let tmp_vtau = MatrixFull::from_vec([2,num_grids],tmp_vtau).unwrap();
+                            loc_exc.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
+                            loc_vsigma.self_scaled_add(&tmp_vsigma.transpose_and_drop(), *xc_para);
+                            loc_vtau.self_scaled_add(&tmp_vtau.transpose_and_drop(), *xc_para);
+                        }
+                    },
+                    xc_family => panic!("{xc_family:?} is not yet implemented"),
+                }
+            });
+
+            if let Some(ao) = &grids.ao {
+                for i_spin in 0..spin_channel {
+                    let mut loc_vxc_ao_s = &mut loc_vxc_ao_0[i_spin];
+                    let loc_vrho_s = loc_vrho.slice_column(i_spin);
+                    let loc_ao_ref = ao.to_matrixfullslice_columns(range_grids.clone());
+                    contract_vxc_0_serial(loc_vxc_ao_s, &loc_ao_ref, loc_vrho_s, None);
+                }
+                if self.use_density_gradient() {
+                    if let Some(aop) = &grids.aop {
+                        if spin_channel == 1 {
+                            let mut loc_vxc_ao_s = &mut loc_vxc_ao_0[0];
+                            let loc_vsigma_s = loc_vsigma.slice_column(0);
+                            let loc_rhop_s = loc_rhop.get_reducing_matrix(0).unwrap();
+                            let mut loc_wao = MatrixFull::new([num_basis, num_grids], 0.0);
+                            for x in 0usize..3usize {
+                                let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(), x).unwrap();
+                                let loc_rhop_s_x = loc_rhop_s.get_slice_x(x);
+                                contract_vxc_0_serial(&mut loc_wao, &loc_aop_x, loc_rhop_s_x, None);
+                            }
+                            contract_vxc_0_serial(loc_vxc_ao_s, &loc_wao.to_matrixfullslice(), loc_vsigma_s, Some(4.0));
+                        } else {
+                            {
+                                let mut loc_vxc_ao_a = &mut loc_vxc_ao_0[0];
+                                let loc_rhop_a = loc_rhop.get_reducing_matrix(0).unwrap();
+                                let loc_vsigma_uu = loc_vsigma.slice_column(0);
+                                let mut loc_dao = MatrixFull::new([num_basis, num_grids], 0.0);
+                                for x in 0usize..3usize {
+                                    let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(), x).unwrap();
+                                    let loc_rhop_s_x = loc_rhop_a.get_slice_x(x);
+                                    contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
+                                }
+                                contract_vxc_0_serial(loc_vxc_ao_a, &loc_dao.to_matrixfullslice(), &loc_vsigma_uu, Some(4.0));
+                                let loc_rhop_b = loc_rhop.get_reducing_matrix(1).unwrap();
+                                let loc_vsigma_ud = loc_vsigma.slice_column(1);
+                                loc_dao.data.iter_mut().for_each(|d| {*d=0.0});
+                                for x in 0usize..3usize {
+                                    let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(), x).unwrap();
+                                    let loc_rhop_s_x = loc_rhop_b.get_slice_x(x);
+                                    contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
+                                }
+                                contract_vxc_0_serial(loc_vxc_ao_a, &loc_dao.to_matrixfullslice(), &loc_vsigma_ud, Some(2.0));
+                            }
+                            {
+                                let mut loc_vxc_ao_b = &mut loc_vxc_ao_0[1];
+                                let loc_rhop_b = loc_rhop.get_reducing_matrix(1).unwrap();
+                                let loc_vsigma_dd = loc_vsigma.slice_column(2);
+                                let mut loc_dao = MatrixFull::new([num_basis, num_grids], 0.0);
+                                for x in 0usize..3usize {
+                                    let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(), x).unwrap();
+                                    let loc_rhop_s_x = loc_rhop_b.get_slice_x(x);
+                                    contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
+                                }
+                                contract_vxc_0_serial(loc_vxc_ao_b, &loc_dao.to_matrixfullslice(), &loc_vsigma_dd, Some(4.0));
+                                let loc_rhop_a = loc_rhop.get_reducing_matrix(0).unwrap();
+                                let loc_vsigma_ud = loc_vsigma.slice_column(1);
+                                loc_dao.data.iter_mut().for_each(|d| {*d=0.0});
+                                for x in 0usize..3usize {
+                                    let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(), x).unwrap();
+                                    let loc_rhop_s_x = loc_rhop_a.get_slice_x(x);
+                                    contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
+                                }
+                                contract_vxc_0_serial(loc_vxc_ao_b, &loc_dao.to_matrixfullslice(), &loc_vsigma_ud, Some(2.0));
+                            }
+                        }
+                    }
+                }
+                for i_spin in 0..spin_channel {
+                    let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                    let mut loc_vxc_ao_s = loc_vxc_ao_0.get_mut(i_spin).unwrap();
+                    loc_vxc_ao_s.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(vxc_ao_s,w)| {
+                        vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
+                    });
+                    _dgemm(
+                        ao, (0..num_basis, range_grids.clone()), 'N',
+                        loc_vxc_ao_s, (0..num_basis, 0..range_grids.len()), 'T',
+                        loc_vxc_mat_s, (0..num_basis, 0..num_basis),
+                        1.0, 0.0
+                    );
+                }
+                if self.use_kinetic_density() {
+                    let Some(aop) = &grids.aop else {
+                        panic!("aop is not available in xc_exc_vxc_slots_dm_only");
+                    };
+                    for i_spin in 0..spin_channel {
+                        let loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                        let mut loc_vtau_s = loc_vtau.slice_column_mut(i_spin);
+                        let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_1[i_spin];
+                        loc_vtau_s.iter_mut().zip(loc_weights.iter()).for_each(
+                            |(vtau_s, w)| {*vtau_s *= *w}
+                        );
+                        for ic in 0usize..3usize {
+                            let loc_aop_ic = aop.get_reducing_matrix_columns(range_grids.clone(), ic).unwrap();
+                            contract_vxc_0_serial(loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
+                            _dgemm(
+                                &loc_aop_ic, (0..num_basis, 0..range_grids.len()), 'N',
+                                loc_vxc_ao_1_s, (0..num_basis, 0..range_grids.len()), 'T',
+                                loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
+                            );
+                            loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
+                        }
+                    }
+                }
+            }
+            let (loc_exc_total, loc_total_elec) = self.integrate_exc(&loc_exc, &loc_rho, loc_weights, spin_channel);
+            (loc_exc_total, loc_vxc_mat, loc_total_elec)
         }
-        //println!("debug ");
-        //(0..100).for_each(|i| {
-        //    println!("{:16.8},{:16.8},{:16.8}", vsigma[[i,0]],vsigma[[i,1]],vsigma[[i,2]]);
-        //});
-
-        let mut loc_total_elec = [0.0;2];
-        for i_spin in 0..spin_channel {
-            let mut loc_total_elec_s = loc_total_elec.get_mut(i_spin).unwrap();
-            loc_exc_total[i_spin] = izip!(loc_exc.data.iter(),loc_rho.iter_column(i_spin),loc_weights.iter())
-                .fold(0.0,|acc,(exc,rho,weight)| {
-                    *loc_total_elec_s += rho*weight;
-                    acc + exc * rho * weight
-                });
-            //exc.data.iter_mut().zip(rho.iter_j(i_spin)).for_each(|(exc,rho)| {
-            //    *exc  = *exc* rho
-        }
-        //if let Some(id) = rayon::current_thread_index() {
-
-        //}
-
-        // (loc_exc_total,loc_vxc_ao,loc_total_elec)
-        (loc_exc_total, loc_vxc_mat, loc_total_elec)
     }
 
     pub fn xc_exc_vxc_slots(
@@ -1740,57 +2108,33 @@ impl DFA4REST {
         spin_channel: usize, 
         dm: &Vec<MatrixFull<f64>>, 
         mo: &[MatrixFull<f64>;2], 
-        occ: &[Vec<f64>;2]
+        occ: &[Vec<f64>;2],
+        print_level: usize,
+        vxc_screen_threshold: f64,
     ) -> (Vec<f64>, Vec<MatrixFull<f64>>, [f64;2]) 
     {
-        //let num_grids = grids.coordinates.len();
         let num_grids = range_grids.len();
         let num_basis = dm[0].size[0];
 
-        let loc_coordinates = &grids.coordinates[range_grids.clone()];
-        let loc_weights = &grids.weights[range_grids.clone()];
-
-        //println!("thread_id: {:?}, rayon_threads_number: {:?}, omp_threads_number: {:?}",
-        //    rayon::current_thread_index().unwrap(), rayon::current_num_threads(), utilities::omp_get_num_threads_wrapper());
-
-        let mut loc_exc = MatrixFull::new([num_grids,1],0.0);
-        let mut loc_exc_total = vec![0.0;spin_channel];
-        let mut loc_vxc_mat = vec![MatrixFull::new([num_basis, num_basis], 0.0); spin_channel];
-        let mut loc_vxc_ao = vec![MatrixFull::new([num_basis, num_grids], 0.0); spin_channel];
-        let mut loc_vxc_ao_1 = if self.use_kinetic_density() {
-            vec![MatrixFull::new([num_basis,num_grids], 0.0); spin_channel]
-        } else {
-            vec![]
-        };
-        let dt0 = utilities::init_timing();
-
-        /// rho and rhop have been localized.
-        //let (loc_rho,loc_rhop) = grids.prepare_tabulated_density_slots(mo, occ, spin_channel,range_grids.clone());
-        // rho on grids 
         let mut loc_rho: MatrixFull<f64> = MatrixFull::empty();
         let mut loc_rhop: RIFull<f64> = RIFull::empty();
         let mut loc_lapl: MatrixFull<f64> = MatrixFull::empty();
         let mut loc_tau: MatrixFull<f64> = MatrixFull::empty();
-        // for mgga test 
         if self.use_kinetic_density() {
-            // loc_rho_ensemble: the shape of [num_grids, num_spin, num_components]
             let loc_rho_emsemble = grids.prepare_tabulated_density_emsemble_slots(&self, mo, occ, spin_channel, range_grids.clone());
             let loc_rho_vec = loc_rho_emsemble.get_reducing_matrix(0).unwrap().iter().copied().collect_vec();
             loc_rho = MatrixFull::from_vec([num_grids, spin_channel], loc_rho_vec).unwrap();
-            // todo!("check order of column or row, should add new traits to RIFull for supporting slices");
             let loc_rhop_vec:Vec<f64> = loc_rho_emsemble.get_slices(0..num_grids, 0..spin_channel, 1..4).copied().collect();
             loc_rhop = RIFull::from_vec([num_grids, spin_channel, 3],loc_rhop_vec).unwrap();
-            loc_rhop = loc_rhop.transpose_ikj(); // [num_grids, 3, spin_channel]
-            // loc_lapl: MatrixFull<f64> = loc_rho_emsemble.get_reducing_matrix(4).unwrap().to_matrixfull().unwrap();
-            // loc_tau: MatrixFull<f64> = loc_rho_emsemble.get_reducing_matrix(5).unwrap().to_matrixfull().unwrap();
+            loc_rhop = loc_rhop.transpose_ikj();
             let loc_lapl_vec = loc_rho_emsemble.get_reducing_matrix(4).unwrap().iter().copied().collect_vec();
             loc_lapl = MatrixFull::from_vec([num_grids, spin_channel], loc_lapl_vec).unwrap();
             let loc_tau_vec = loc_rho_emsemble.get_reducing_matrix(5).unwrap().iter().copied().collect_vec();
             loc_tau = MatrixFull::from_vec([num_grids, spin_channel], loc_tau_vec).unwrap();
         } else {
-            (loc_rho,loc_rhop) = if ! mo[1].data.is_empty() || spin_channel == 1 { // RHF or UHF case
+            (loc_rho,loc_rhop) = if ! mo[1].data.is_empty() || spin_channel == 1 {
                 grids.prepare_tabulated_density_slots(mo, occ, spin_channel,range_grids.clone())
-            } else { // ROHF case
+            } else {
                 let mut mo_temp = mo.clone();
                 mo_temp[1] = mo_temp[0].clone();
                 grids.prepare_tabulated_density_slots(&mo_temp, occ, spin_channel,range_grids.clone())
@@ -1802,283 +2146,428 @@ impl DFA4REST {
             MatrixFull::empty()
         };
 
-        let mut loc_vrho = MatrixFull::new([num_grids,spin_channel],0.0);
-        let mut loc_vsigma=if self.use_density_gradient() && spin_channel==1 {
-            MatrixFull::new([num_grids,1],0.0)
-        } else if self.use_density_gradient() && spin_channel==2 {
-            MatrixFull::new([num_grids,3],0.0)
-        } else {
-            MatrixFull::empty()
-        };
-        let mut loc_vtau = if self.use_kinetic_density() {
-            MatrixFull::new([num_grids, spin_channel],0.0)
-        } else {
-            MatrixFull::empty()
-        };
-        // currently no vlapl 
+        // Density screening
+        let active_mask = Self::build_active_grid_mask(&loc_rho, num_grids, spin_channel, vxc_screen_threshold);
+        let num_active = active_mask.iter().filter(|&&x| x).count();
+        let use_screening = num_active > 0 && num_active < num_grids * 3 / 4;
 
-        //let paramr = if is_dldft {
-        //    self.update_parameter()
-        //} else {
-        //    self.dfa_paramr_scf
-        //}
-
-        self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
-            let xc_func = self.init_libxc(xc_func);
-            match xc_func.family() {
-                LibXCFamily::LDA => {
-                    if spin_channel==1 {
-                        let (tmp_exc,tmp_vrho) = lda_exc_vxc(&xc_func,loc_rho.data_ref().unwrap());
-                        let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
-                        let tmp_vrho = MatrixFull::from_vec([num_grids,1],tmp_vrho).unwrap();
-                        loc_exc.self_scaled_add(&tmp_exc,*xc_para);
-                        loc_vrho.self_scaled_add(&tmp_vrho,*xc_para);
-
-                    } else {
-                        let (tmp_exc,tmp_vrho) = lda_exc_vxc(&xc_func,loc_rho.transpose().data_ref().unwrap());
-                        let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
-                        //let tmp_vrho = MatrixFull::from_vec([num_grids,spin_channel],tmp_vrho).unwrap();
-                        let tmp_vrho = MatrixFull::from_vec([2,num_grids],tmp_vrho).unwrap();
-                        loc_exc.self_scaled_add(&tmp_exc,*xc_para);
-                        loc_vrho.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
-                    }
-                },
-                LibXCFamily::GGA | LibXCFamily::HybGGA => {
-                    if spin_channel==1 {
-                        let (tmp_exc,tmp_vrho, tmp_vsigma) = gga_exc_vxc(&xc_func,loc_rho.data_ref().unwrap(),loc_sigma.data_ref().unwrap());
-                        let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
-                        let tmp_vrho = MatrixFull::from_vec([num_grids,1],tmp_vrho).unwrap();
-                        let tmp_vsigma= MatrixFull::from_vec([num_grids,1],tmp_vsigma).unwrap();
-                        loc_exc.self_scaled_add(&tmp_exc,*xc_para);
-                        loc_vrho.self_scaled_add(&tmp_vrho,*xc_para);
-                        loc_vsigma.self_scaled_add(&tmp_vsigma, *xc_para);
-                    } else {
-                        let (tmp_exc,tmp_vrho, tmp_vsigma) = gga_exc_vxc(&xc_func,loc_rho.transpose().data_ref().unwrap(),loc_sigma.transpose().data_ref().unwrap());
-                        let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
-                        let tmp_vrho = MatrixFull::from_vec([2,num_grids],tmp_vrho).unwrap();
-                        let tmp_vsigma= MatrixFull::from_vec([3,num_grids],tmp_vsigma).unwrap();
-                        loc_exc.self_scaled_add(&tmp_exc,*xc_para);
-                        loc_vrho.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
-                        loc_vsigma.self_scaled_add(&tmp_vsigma.transpose_and_drop(), *xc_para);
-                    }
-                },
-                LibXCFamily::MGGA | LibXCFamily::HybMGGA => {
-                    if spin_channel==1 {
-                        let (tmp_exc,tmp_vrho,tmp_vsigma,tmp_valpl,tmp_vtau)
-                            = mgga_exc_vxc(&xc_func,
-                                loc_rho.data_ref().unwrap(), 
-                                loc_sigma.data_ref().unwrap(), 
-                                loc_lapl.data_ref().unwrap(),
-                                loc_tau.data_ref().unwrap()
-                            );
-                        // currently no laplacian 
-                        let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
-                        let tmp_vrho = MatrixFull::from_vec([num_grids,1],tmp_vrho).unwrap();
-                        let tmp_vsigma= MatrixFull::from_vec([num_grids,1],tmp_vsigma).unwrap();
-                        let tmp_vtau = MatrixFull::from_vec([num_grids,1],tmp_vtau).unwrap();
-                        loc_exc.self_scaled_add(&tmp_exc,*xc_para);
-                        loc_vrho.self_scaled_add(&tmp_vrho,*xc_para);
-                        loc_vsigma.self_scaled_add(&tmp_vsigma, *xc_para);
-                        loc_vtau.self_scaled_add(&tmp_vtau, *xc_para);
-                    } else {
-                        let (tmp_exc,tmp_vrho,tmp_vsigma,tmp_valpl,tmp_vtau)
-                            = mgga_exc_vxc(&xc_func,
-                                loc_rho.transpose().data_ref().unwrap(), 
-                                loc_sigma.transpose().data_ref().unwrap(), 
-                                loc_lapl.transpose().data_ref().unwrap(),
-                                loc_tau.transpose().data_ref().unwrap()
-                            );
-                        // currently no laplacian 
-                        let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
-                        let tmp_vrho = MatrixFull::from_vec([2,num_grids],tmp_vrho).unwrap();
-                        let tmp_vsigma= MatrixFull::from_vec([3,num_grids],tmp_vsigma).unwrap();
-                        let tmp_vtau = MatrixFull::from_vec([2,num_grids],tmp_vtau).unwrap();
-                        loc_exc.self_scaled_add(&tmp_exc,*xc_para);
-                        loc_vrho.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
-                        loc_vsigma.self_scaled_add(&tmp_vsigma.transpose_and_drop(), *xc_para);
-                        loc_vtau.self_scaled_add(&tmp_vtau.transpose_and_drop(), *xc_para);
-                    }
-                },
-                xc_family => panic!("{xc_family:?} is not yet implemented"),
-            }
-        });
-
-        if let Some(ao) = &grids.ao {
-            // for vrho
-            for i_spin in  0..spin_channel {
-                let mut loc_vxc_ao_s = &mut loc_vxc_ao[i_spin];
-                let loc_vrho_s = loc_vrho.slice_column(i_spin);
-                let loc_ao_ref = ao.to_matrixfullslice_columns(range_grids.clone());
-                // generate vxc grid by grid
-                contract_vxc_0_serial(loc_vxc_ao_s, &loc_ao_ref, loc_vrho_s, None);
-            }
-            // for vsigma
-            if self.use_density_gradient() {
-                if let Some(aop) = &grids.aop {
-                    // GGA
-                    if spin_channel==1 {
-                        // vxc_ao_s: the shape of [num_basis, num_grids]
-                        let mut loc_vxc_ao_s = &mut loc_vxc_ao[0];
-                        // vsigma_s: a slice with the length of [num_grids]
-                        let loc_vsigma_s = loc_vsigma.slice_column(0);
-                        // rhop_s:  the shape of [num_grids, 3]
-                        let loc_rhop_s = loc_rhop.get_reducing_matrix(0).unwrap();
-                        
-                        // (nabla rho)[num_grids, 3] dot (nabla ao)[num_basis, num_grids, 3] -> [num_basis, num_grids]
-                        //               p,       n                    i,        p,       n  ->     i,       p
-                        //   einsum(pn, ipn -> ip)
-                        let mut loc_wao = MatrixFull::new([num_basis, num_grids],0.0);
-                        for x in 0usize..3usize {
-                            // aop_x: the shape of [num_basis, num_grids]
-                            let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(),x).unwrap();
-                            // rhop_s_x: a slice with the length of [num_grids]
-                            let loc_rhop_s_x = loc_rhop_s.get_slice_x(x);
-                            contract_vxc_0_serial(&mut loc_wao, &loc_aop_x, loc_rhop_s_x, None);
-                        }
-
-                        contract_vxc_0_serial(loc_vxc_ao_s, &loc_wao.to_matrixfullslice(), loc_vsigma_s,Some(4.0));
-
-                        //println!("debug awo:");
-                        //(0..100).for_each(|i| {
-                        //    println!("{:16.8},{:16.8}",vxc_ao_s[[0,i]],vxc_ao_s[[1,i]]);
-                        //});
-
-                    } else {
-                        // ==================================
-                        // at first i_spin == 0
-                        // ==================================
-                        {
-                            let mut loc_vxc_ao_a = &mut loc_vxc_ao[0];
-                            let loc_rhop_a = loc_rhop.get_reducing_matrix(0).unwrap();
-                            let loc_vsigma_uu = loc_vsigma.slice_column(0);
-                            let mut loc_dao = MatrixFull::new([num_basis, num_grids],0.0);
-                            for x in 0usize..3usize {
-                                // aop_x: the shape of [num_basis, num_grids]
-                                let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(),x).unwrap();
-                                // rhop_s_x: a slice with the length of [num_grids]
-                                let loc_rhop_s_x = loc_rhop_a.get_slice_x(x);
-                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x,None);
-                            }
-                            contract_vxc_0_serial(loc_vxc_ao_a, &loc_dao.to_matrixfullslice(), &loc_vsigma_uu,Some(4.0));
-
-                            let loc_rhop_b = loc_rhop.get_reducing_matrix(1).unwrap();
-                            let loc_vsigma_ud = loc_vsigma.slice_column(1);
-                            loc_dao.data.iter_mut().for_each(|d| {*d=0.0});
-                            for x in 0usize..3usize {
-                                // aop_x: the shape of [num_basis, num_grids]
-                                let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(),x).unwrap();
-                                // rhop_s_x: a slice with the length of [num_grids]
-                                let loc_rhop_s_x = loc_rhop_b.get_slice_x(x);
-                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x,None);
-                            }
-                            contract_vxc_0_serial(loc_vxc_ao_a, &loc_dao.to_matrixfullslice(), &loc_vsigma_ud,Some(2.0));
-                        }
-                        // ==================================
-                        // them i_spin == 1
-                        // ==================================
-                        {
-                            let mut loc_vxc_ao_b = &mut loc_vxc_ao[1];
-                            let loc_rhop_b = loc_rhop.get_reducing_matrix(1).unwrap();
-                            let loc_vsigma_dd = loc_vsigma.slice_column(2);
-                            let mut loc_dao = MatrixFull::new([num_basis, num_grids],0.0);
-                            for x in 0usize..3usize {
-                                // aop_x: the shape of [num_basis, num_grids]
-                                let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(),x).unwrap();
-                                // rhop_s_x: a slice with the length of [num_grids]
-                                let loc_rhop_s_x = loc_rhop_b.get_slice_x(x);
-                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x,None);
-                            }
-                            contract_vxc_0_serial(loc_vxc_ao_b, &loc_dao.to_matrixfullslice(), &loc_vsigma_dd,Some(4.0));
-
-                            let loc_rhop_a = loc_rhop.get_reducing_matrix(0).unwrap();
-                            let loc_vsigma_ud = loc_vsigma.slice_column(1);
-                            loc_dao.data.iter_mut().for_each(|d| {*d=0.0});
-                            for x in 0usize..3usize {
-                                // aop_x: the shape of [num_basis, num_grids]
-                                let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(),x).unwrap();
-                                // rhop_s_x: a slice with the length of [num_grids]
-                                let loc_rhop_s_x = loc_rhop_a.get_slice_x(x);
-                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x,None);
-                            }
-                            contract_vxc_0_serial(loc_vxc_ao_b, &loc_dao.to_matrixfullslice(), &loc_vsigma_ud,Some(2.0));
-                        }
-                        // ==================================
-                    } // end spin case for GGA
-                } // end let aop 
-            }
-
-            // construc vxc_mat for LDA/GGA 
-            for i_spin in 0..spin_channel {
-                let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
-                let mut loc_vxc_ao_s = loc_vxc_ao.get_mut(i_spin).unwrap();
-                loc_vxc_ao_s.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(vxc_ao_s,w)| {
-                    vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
-                });
-                _dgemm(
-                    ao,(0..num_basis, range_grids.clone()),'N',
-                    loc_vxc_ao_s,(0..num_basis,0..range_grids.len()),'T',
-                    loc_vxc_mat_s, (0..num_basis,0..num_basis),
-                    1.0,0.0
-                );
-            }
-            // MGGA
-            if self.use_kinetic_density() {
-                let Some(aop) = &grids.aop else {
-                    panic!("aop is not available in xc_exc_vxc_slots_dm_only");
-                };
-                for i_spin in  0..spin_channel {
-                    let loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
-                    let mut loc_vtau_s = loc_vtau.slice_column_mut(i_spin);
-                    let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_1[i_spin];
-                    loc_vtau_s.iter_mut().zip(loc_weights.iter()).for_each(
-                        |(vtau_s, w)| {*vtau_s *= *w}
-                    );
-                    for ic in 0usize..3usize {
-                        let loc_aop_ic = aop.get_reducing_matrix_columns(range_grids.clone(),ic).unwrap();
-                        contract_vxc_0_serial (loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
-                        _dgemm(
-                        &loc_aop_ic,(0..num_basis, 0..range_grids.len()), 'N',
-                        loc_vxc_ao_1_s, (0..num_basis, 0..range_grids.len()), 'T',
-                        loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
-                        );
-                        loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
-                    }
+        if print_level >= 1 && use_screening {
+            if let Some(tid) = rayon::current_thread_index() {
+                if tid == 0 {
+                    let ratio = num_active as f64 / num_grids as f64 * 100.0;
+                    println!(" [VXC-screen(coeff)]  active grids: {}/{} ({:.1}%), saved ~{:.0}%",
+                        num_active, num_grids, ratio, 100.0 - ratio);
                 }
             }
         }
-        //println!("debug ");
-        //(0..100).for_each(|i| {
-        //    println!("{:16.8},{:16.8},{:16.8}", vsigma[[i,0]],vsigma[[i,1]],vsigma[[i,2]]);
-        //});
 
-        let mut loc_total_elec = [0.0;2];
-        for i_spin in 0..spin_channel {
-            let mut loc_total_elec_s = loc_total_elec.get_mut(i_spin).unwrap();
-            loc_exc_total[i_spin] = izip!(loc_exc.data.iter(),loc_rho.iter_column(i_spin),loc_weights.iter())
-                .fold(0.0,|acc,(exc,rho,weight)| {
-                    *loc_total_elec_s += rho*weight;
-                    acc + exc * rho * weight
+        if use_screening {
+            // === Screened path ===
+            let n_g = num_active;
+            let loc_rho_c = Self::compact_rho(&loc_rho, &active_mask, num_active, spin_channel);
+            let loc_rhop_c = Self::compact_rhop(&loc_rhop, &active_mask, num_active, spin_channel);
+            let loc_sigma_c = if self.use_density_gradient() {
+                Self::compact_sigma(&loc_sigma, &active_mask, num_active,
+                    if spin_channel==1 {1} else {3})
+            } else { MatrixFull::empty() };
+            let loc_lapl_c = if self.use_kinetic_density() {
+                Self::compact_vrho(&loc_lapl, &active_mask, num_active, spin_channel)
+            } else { MatrixFull::empty() };
+            let loc_tau_c = if self.use_kinetic_density() {
+                Self::compact_tau(&loc_tau, &active_mask, num_active, spin_channel)
+            } else { MatrixFull::empty() };
+            let mut loc_exc_c = MatrixFull::new([num_active, 1], 0.0);
+
+            let mut loc_vrho_c = MatrixFull::new([n_g, spin_channel], 0.0);
+            let mut loc_vsigma_c = if self.use_density_gradient() && spin_channel==1 {
+                MatrixFull::new([n_g, 1], 0.0)
+            } else if self.use_density_gradient() && spin_channel==2 {
+                MatrixFull::new([n_g, 3], 0.0)
+            } else { MatrixFull::empty() };
+            let mut loc_vtau_c = if self.use_kinetic_density() {
+                MatrixFull::new([n_g, spin_channel], 0.0)
+            } else { MatrixFull::empty() };
+
+            // libxc on compact arrays
+            self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
+                let xc_func = self.init_libxc_and_set_param(xc_func);
+                match xc_func.family() {
+                    LibXCFamily::LDA => {
+                        if spin_channel==1 {
+                            let (tmp_exc,tmp_vrho) = lda_exc_vxc(&xc_func,loc_rho_c.data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([n_g,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([n_g,1],tmp_vrho).unwrap();
+                            loc_exc_c.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho_c.self_scaled_add(&tmp_vrho,*xc_para);
+                        } else {
+                            let (tmp_exc,tmp_vrho) = lda_exc_vxc(&xc_func,loc_rho_c.transpose().data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([n_g,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([2,n_g],tmp_vrho).unwrap();
+                            loc_exc_c.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho_c.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
+                        }
+                    },
+                    LibXCFamily::GGA | LibXCFamily::HybGGA => {
+                        if spin_channel==1 {
+                            let (tmp_exc,tmp_vrho, tmp_vsigma) = gga_exc_vxc(&xc_func,loc_rho_c.data_ref().unwrap(),loc_sigma_c.data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([n_g,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([n_g,1],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([n_g,1],tmp_vsigma).unwrap();
+                            loc_exc_c.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho_c.self_scaled_add(&tmp_vrho,*xc_para);
+                            loc_vsigma_c.self_scaled_add(&tmp_vsigma, *xc_para);
+                        } else {
+                            let (tmp_exc,tmp_vrho, tmp_vsigma) = gga_exc_vxc(&xc_func,loc_rho_c.transpose().data_ref().unwrap(),loc_sigma_c.transpose().data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([n_g,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([2,n_g],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([3,n_g],tmp_vsigma).unwrap();
+                            loc_exc_c.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho_c.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
+                            loc_vsigma_c.self_scaled_add(&tmp_vsigma.transpose_and_drop(), *xc_para);
+                        }
+                    },
+                    LibXCFamily::MGGA | LibXCFamily::HybMGGA => {
+                        if spin_channel==1 {
+                            let (tmp_exc,tmp_vrho,tmp_vsigma,tmp_valpl,tmp_vtau)
+                                = mgga_exc_vxc(&xc_func, loc_rho_c.data_ref().unwrap(), loc_sigma_c.data_ref().unwrap(),
+                                    loc_lapl_c.data_ref().unwrap(), loc_tau_c.data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([n_g,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([n_g,1],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([n_g,1],tmp_vsigma).unwrap();
+                            let tmp_vtau = MatrixFull::from_vec([n_g,1],tmp_vtau).unwrap();
+                            loc_exc_c.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho_c.self_scaled_add(&tmp_vrho,*xc_para);
+                            loc_vsigma_c.self_scaled_add(&tmp_vsigma, *xc_para);
+                            loc_vtau_c.self_scaled_add(&tmp_vtau, *xc_para);
+                        } else {
+                            let (tmp_exc,tmp_vrho,tmp_vsigma,tmp_valpl,tmp_vtau)
+                                = mgga_exc_vxc(&xc_func, loc_rho_c.transpose().data_ref().unwrap(), loc_sigma_c.transpose().data_ref().unwrap(),
+                                    loc_lapl_c.transpose().data_ref().unwrap(), loc_tau_c.transpose().data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([n_g,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([2,n_g],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([3,n_g],tmp_vsigma).unwrap();
+                            let tmp_vtau = MatrixFull::from_vec([2,n_g],tmp_vtau).unwrap();
+                            loc_exc_c.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho_c.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
+                            loc_vsigma_c.self_scaled_add(&tmp_vsigma.transpose_and_drop(), *xc_para);
+                            loc_vtau_c.self_scaled_add(&tmp_vtau.transpose_and_drop(), *xc_para);
+                        }
+                    },
+                    xc_family => panic!("{xc_family:?} is not yet implemented"),
+                }
+            });
+
+            let ao_active = Self::extract_active_ao_columns(
+                grids.ao.as_ref().unwrap(), &range_grids, &active_mask, num_active, num_basis);
+            let aop_active: Option<RIFull<f64>> = grids.aop.as_ref().map(|aop| {
+                Self::extract_active_aop_columns(aop, &range_grids, &active_mask, num_active, num_basis)
+            });
+            let weights_active = Self::compact_weights(&grids.weights[range_grids.clone()], &active_mask, num_active);
+
+            let mut loc_vxc_ao = vec![MatrixFull::new([num_basis, n_g], 0.0); spin_channel];
+            let mut loc_vxc_ao_1 = if self.use_kinetic_density() {
+                vec![MatrixFull::new([num_basis, n_g], 0.0); spin_channel]
+            } else { vec![] };
+            let mut loc_vxc_mat = vec![MatrixFull::new([num_basis, num_basis], 0.0); spin_channel];
+
+            for i_spin in 0..spin_channel {
+                let mut loc_vxc_ao_s = &mut loc_vxc_ao[i_spin];
+                let loc_vrho_s = loc_vrho_c.slice_column(i_spin);
+                let loc_ao_ref = ao_active.to_matrixfullslice_columns(0..n_g);
+                contract_vxc_0_serial(loc_vxc_ao_s, &loc_ao_ref, loc_vrho_s, None);
+            }
+            if self.use_density_gradient() {
+                if let Some(ref aop_active) = aop_active {
+                    if spin_channel == 1 {
+                        let mut loc_vxc_ao_s = &mut loc_vxc_ao[0];
+                        let loc_vsigma_s = loc_vsigma_c.slice_column(0);
+                        let loc_rhop_s = loc_rhop_c.get_reducing_matrix(0).unwrap();
+                        let mut loc_wao = MatrixFull::new([num_basis, n_g], 0.0);
+                        for x in 0usize..3usize {
+                            let loc_aop_x = aop_active.get_reducing_matrix_columns(0..n_g, x).unwrap();
+                            let loc_rhop_s_x = loc_rhop_s.get_slice_x(x);
+                            contract_vxc_0_serial(&mut loc_wao, &loc_aop_x, loc_rhop_s_x, None);
+                        }
+                        contract_vxc_0_serial(loc_vxc_ao_s, &loc_wao.to_matrixfullslice(), loc_vsigma_s, Some(4.0));
+                    } else {
+                        {
+                            let mut loc_vxc_ao_a = &mut loc_vxc_ao[0];
+                            let loc_rhop_a = loc_rhop_c.get_reducing_matrix(0).unwrap();
+                            let loc_vsigma_uu = loc_vsigma_c.slice_column(0);
+                            let mut loc_dao = MatrixFull::new([num_basis, n_g], 0.0);
+                            for x in 0usize..3usize {
+                                let loc_aop_x = aop_active.get_reducing_matrix_columns(0..n_g, x).unwrap();
+                                let loc_rhop_s_x = loc_rhop_a.get_slice_x(x);
+                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
+                            }
+                            contract_vxc_0_serial(loc_vxc_ao_a, &loc_dao.to_matrixfullslice(), &loc_vsigma_uu, Some(4.0));
+                            let loc_rhop_b = loc_rhop_c.get_reducing_matrix(1).unwrap();
+                            let loc_vsigma_ud = loc_vsigma_c.slice_column(1);
+                            loc_dao.data.iter_mut().for_each(|d| {*d=0.0});
+                            for x in 0usize..3usize {
+                                let loc_aop_x = aop_active.get_reducing_matrix_columns(0..n_g, x).unwrap();
+                                let loc_rhop_s_x = loc_rhop_b.get_slice_x(x);
+                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
+                            }
+                            contract_vxc_0_serial(loc_vxc_ao_a, &loc_dao.to_matrixfullslice(), &loc_vsigma_ud, Some(2.0));
+                        }
+                        {
+                            let mut loc_vxc_ao_b = &mut loc_vxc_ao[1];
+                            let loc_rhop_b = loc_rhop_c.get_reducing_matrix(1).unwrap();
+                            let loc_vsigma_dd = loc_vsigma_c.slice_column(2);
+                            let mut loc_dao = MatrixFull::new([num_basis, n_g], 0.0);
+                            for x in 0usize..3usize {
+                                let loc_aop_x = aop_active.get_reducing_matrix_columns(0..n_g, x).unwrap();
+                                let loc_rhop_s_x = loc_rhop_b.get_slice_x(x);
+                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
+                            }
+                            contract_vxc_0_serial(loc_vxc_ao_b, &loc_dao.to_matrixfullslice(), &loc_vsigma_dd, Some(4.0));
+                            let loc_rhop_a = loc_rhop_c.get_reducing_matrix(0).unwrap();
+                            let loc_vsigma_ud = loc_vsigma_c.slice_column(1);
+                            loc_dao.data.iter_mut().for_each(|d| {*d=0.0});
+                            for x in 0usize..3usize {
+                                let loc_aop_x = aop_active.get_reducing_matrix_columns(0..n_g, x).unwrap();
+                                let loc_rhop_s_x = loc_rhop_a.get_slice_x(x);
+                                contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
+                            }
+                            contract_vxc_0_serial(loc_vxc_ao_b, &loc_dao.to_matrixfullslice(), &loc_vsigma_ud, Some(2.0));
+                        }
+                    }
+                }
+            }
+            for i_spin in 0..spin_channel {
+                let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                let mut loc_vxc_ao_s = loc_vxc_ao.get_mut(i_spin).unwrap();
+                loc_vxc_ao_s.iter_columns_full_mut().zip(weights_active.iter()).for_each(|(vxc_ao_s,w)| {
+                    vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
                 });
-            //exc.data.iter_mut().zip(rho.iter_j(i_spin)).for_each(|(exc,rho)| {
-            //    *exc  = *exc* rho
+                _dgemm(
+                    &ao_active, (0..num_basis, 0..n_g), 'N',
+                    loc_vxc_ao_s, (0..num_basis, 0..n_g), 'T',
+                    loc_vxc_mat_s, (0..num_basis, 0..num_basis),
+                    1.0, 0.0
+                );
+            }
+            if self.use_kinetic_density() {
+                if let Some(ref aop_active) = aop_active {
+                    for i_spin in 0..spin_channel {
+                        let loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                        let mut loc_vtau_s = loc_vtau_c.slice_column_mut(i_spin);
+                        let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_1[i_spin];
+                        loc_vtau_s.iter_mut().zip(weights_active.iter()).for_each(
+                            |(vtau_s, w)| {*vtau_s *= *w}
+                        );
+                        for ic in 0usize..3usize {
+                            let loc_aop_ic = aop_active.get_reducing_matrix_columns(0..n_g, ic).unwrap();
+                            contract_vxc_0_serial(loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
+                            _dgemm(
+                                &loc_aop_ic, (0..num_basis, 0..n_g), 'N',
+                                loc_vxc_ao_1_s, (0..num_basis, 0..n_g), 'T',
+                                loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
+                            );
+                            loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
+                        }
+                    }
+                }
+            }
+            let (loc_exc_total, loc_total_elec) = self.integrate_exc(&loc_exc_c, &loc_rho_c, &weights_active, spin_channel);
+            (loc_exc_total, loc_vxc_mat, loc_total_elec)
+        } else {
+            // === Original path (no screening) ===
+            let loc_weights = &grids.weights[range_grids.clone()];
+
+            let mut loc_exc = MatrixFull::new([num_grids, 1], 0.0);
+            let mut loc_exc_total = vec![0.0; spin_channel];
+            let mut loc_vxc_mat = vec![MatrixFull::new([num_basis, num_basis], 0.0); spin_channel];
+            let mut loc_vxc_ao = vec![MatrixFull::new([num_basis, num_grids], 0.0); spin_channel];
+            let mut loc_vxc_ao_1 = if self.use_kinetic_density() {
+                vec![MatrixFull::new([num_basis, num_grids], 0.0); spin_channel]
+            } else { vec![] };
+
+            let mut loc_vrho = MatrixFull::new([num_grids, spin_channel], 0.0);
+            let mut loc_vsigma = if self.use_density_gradient() && spin_channel==1 {
+                MatrixFull::new([num_grids, 1], 0.0)
+            } else if self.use_density_gradient() && spin_channel==2 {
+                MatrixFull::new([num_grids, 3], 0.0)
+            } else { MatrixFull::empty() };
+            let mut loc_vtau = if self.use_kinetic_density() {
+                MatrixFull::new([num_grids, spin_channel], 0.0)
+            } else { MatrixFull::empty() };
+
+            self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
+                let xc_func = self.init_libxc_and_set_param(xc_func);
+                match xc_func.family() {
+                    LibXCFamily::LDA => {
+                        if spin_channel==1 {
+                            let (tmp_exc,tmp_vrho) = lda_exc_vxc(&xc_func,loc_rho.data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([num_grids,1],tmp_vrho).unwrap();
+                            loc_exc.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho.self_scaled_add(&tmp_vrho,*xc_para);
+                        } else {
+                            let (tmp_exc,tmp_vrho) = lda_exc_vxc(&xc_func,loc_rho.transpose().data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([2,num_grids],tmp_vrho).unwrap();
+                            loc_exc.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
+                        }
+                    },
+                    LibXCFamily::GGA | LibXCFamily::HybGGA => {
+                        if spin_channel==1 {
+                            let (tmp_exc,tmp_vrho, tmp_vsigma) = gga_exc_vxc(&xc_func,loc_rho.data_ref().unwrap(),loc_sigma.data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([num_grids,1],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([num_grids,1],tmp_vsigma).unwrap();
+                            loc_exc.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho.self_scaled_add(&tmp_vrho,*xc_para);
+                            loc_vsigma.self_scaled_add(&tmp_vsigma, *xc_para);
+                        } else {
+                            let (tmp_exc,tmp_vrho, tmp_vsigma) = gga_exc_vxc(&xc_func,loc_rho.transpose().data_ref().unwrap(),loc_sigma.transpose().data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([2,num_grids],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([3,num_grids],tmp_vsigma).unwrap();
+                            loc_exc.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
+                            loc_vsigma.self_scaled_add(&tmp_vsigma.transpose_and_drop(), *xc_para);
+                        }
+                    },
+                    LibXCFamily::MGGA | LibXCFamily::HybMGGA => {
+                        if spin_channel==1 {
+                            let (tmp_exc,tmp_vrho,tmp_vsigma,tmp_valpl,tmp_vtau)
+                                = mgga_exc_vxc(&xc_func, loc_rho.data_ref().unwrap(), loc_sigma.data_ref().unwrap(),
+                                    loc_lapl.data_ref().unwrap(), loc_tau.data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([num_grids,1],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([num_grids,1],tmp_vsigma).unwrap();
+                            let tmp_vtau = MatrixFull::from_vec([num_grids,1],tmp_vtau).unwrap();
+                            loc_exc.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho.self_scaled_add(&tmp_vrho,*xc_para);
+                            loc_vsigma.self_scaled_add(&tmp_vsigma, *xc_para);
+                            loc_vtau.self_scaled_add(&tmp_vtau, *xc_para);
+                        } else {
+                            let (tmp_exc,tmp_vrho,tmp_vsigma,tmp_valpl,tmp_vtau)
+                                = mgga_exc_vxc(&xc_func, loc_rho.transpose().data_ref().unwrap(), loc_sigma.transpose().data_ref().unwrap(),
+                                    loc_lapl.transpose().data_ref().unwrap(), loc_tau.transpose().data_ref().unwrap());
+                            let tmp_exc = MatrixFull::from_vec([num_grids,1],tmp_exc).unwrap();
+                            let tmp_vrho = MatrixFull::from_vec([2,num_grids],tmp_vrho).unwrap();
+                            let tmp_vsigma= MatrixFull::from_vec([3,num_grids],tmp_vsigma).unwrap();
+                            let tmp_vtau = MatrixFull::from_vec([2,num_grids],tmp_vtau).unwrap();
+                            loc_exc.self_scaled_add(&tmp_exc,*xc_para);
+                            loc_vrho.self_scaled_add(&tmp_vrho.transpose_and_drop(),*xc_para);
+                            loc_vsigma.self_scaled_add(&tmp_vsigma.transpose_and_drop(), *xc_para);
+                            loc_vtau.self_scaled_add(&tmp_vtau.transpose_and_drop(), *xc_para);
+                        }
+                    },
+                    xc_family => panic!("{xc_family:?} is not yet implemented"),
+                }
+            });
+
+            if let Some(ao) = &grids.ao {
+                for i_spin in 0..spin_channel {
+                    let mut loc_vxc_ao_s = &mut loc_vxc_ao[i_spin];
+                    let loc_vrho_s = loc_vrho.slice_column(i_spin);
+                    let loc_ao_ref = ao.to_matrixfullslice_columns(range_grids.clone());
+                    contract_vxc_0_serial(loc_vxc_ao_s, &loc_ao_ref, loc_vrho_s, None);
+                }
+                if self.use_density_gradient() {
+                    if let Some(aop) = &grids.aop {
+                        if spin_channel == 1 {
+                            let mut loc_vxc_ao_s = &mut loc_vxc_ao[0];
+                            let loc_vsigma_s = loc_vsigma.slice_column(0);
+                            let loc_rhop_s = loc_rhop.get_reducing_matrix(0).unwrap();
+                            let mut loc_wao = MatrixFull::new([num_basis, num_grids], 0.0);
+                            for x in 0usize..3usize {
+                                let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(), x).unwrap();
+                                let loc_rhop_s_x = loc_rhop_s.get_slice_x(x);
+                                contract_vxc_0_serial(&mut loc_wao, &loc_aop_x, loc_rhop_s_x, None);
+                            }
+                            contract_vxc_0_serial(loc_vxc_ao_s, &loc_wao.to_matrixfullslice(), loc_vsigma_s, Some(4.0));
+                        } else {
+                            {
+                                let mut loc_vxc_ao_a = &mut loc_vxc_ao[0];
+                                let loc_rhop_a = loc_rhop.get_reducing_matrix(0).unwrap();
+                                let loc_vsigma_uu = loc_vsigma.slice_column(0);
+                                let mut loc_dao = MatrixFull::new([num_basis, num_grids], 0.0);
+                                for x in 0usize..3usize {
+                                    let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(), x).unwrap();
+                                    let loc_rhop_s_x = loc_rhop_a.get_slice_x(x);
+                                    contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
+                                }
+                                contract_vxc_0_serial(loc_vxc_ao_a, &loc_dao.to_matrixfullslice(), &loc_vsigma_uu, Some(4.0));
+                                let loc_rhop_b = loc_rhop.get_reducing_matrix(1).unwrap();
+                                let loc_vsigma_ud = loc_vsigma.slice_column(1);
+                                loc_dao.data.iter_mut().for_each(|d| {*d=0.0});
+                                for x in 0usize..3usize {
+                                    let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(), x).unwrap();
+                                    let loc_rhop_s_x = loc_rhop_b.get_slice_x(x);
+                                    contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
+                                }
+                                contract_vxc_0_serial(loc_vxc_ao_a, &loc_dao.to_matrixfullslice(), &loc_vsigma_ud, Some(2.0));
+                            }
+                            {
+                                let mut loc_vxc_ao_b = &mut loc_vxc_ao[1];
+                                let loc_rhop_b = loc_rhop.get_reducing_matrix(1).unwrap();
+                                let loc_vsigma_dd = loc_vsigma.slice_column(2);
+                                let mut loc_dao = MatrixFull::new([num_basis, num_grids], 0.0);
+                                for x in 0usize..3usize {
+                                    let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(), x).unwrap();
+                                    let loc_rhop_s_x = loc_rhop_b.get_slice_x(x);
+                                    contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
+                                }
+                                contract_vxc_0_serial(loc_vxc_ao_b, &loc_dao.to_matrixfullslice(), &loc_vsigma_dd, Some(4.0));
+                                let loc_rhop_a = loc_rhop.get_reducing_matrix(0).unwrap();
+                                let loc_vsigma_ud = loc_vsigma.slice_column(1);
+                                loc_dao.data.iter_mut().for_each(|d| {*d=0.0});
+                                for x in 0usize..3usize {
+                                    let loc_aop_x = aop.get_reducing_matrix_columns(range_grids.clone(), x).unwrap();
+                                    let loc_rhop_s_x = loc_rhop_a.get_slice_x(x);
+                                    contract_vxc_0_serial(&mut loc_dao, &loc_aop_x, loc_rhop_s_x, None);
+                                }
+                                contract_vxc_0_serial(loc_vxc_ao_b, &loc_dao.to_matrixfullslice(), &loc_vsigma_ud, Some(2.0));
+                            }
+                        }
+                    }
+                }
+                for i_spin in 0..spin_channel {
+                    let mut loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                    let mut loc_vxc_ao_s = loc_vxc_ao.get_mut(i_spin).unwrap();
+                    loc_vxc_ao_s.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(vxc_ao_s,w)| {
+                        vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
+                    });
+                    _dgemm(
+                        ao, (0..num_basis, range_grids.clone()), 'N',
+                        loc_vxc_ao_s, (0..num_basis, 0..range_grids.len()), 'T',
+                        loc_vxc_mat_s, (0..num_basis, 0..num_basis),
+                        1.0, 0.0
+                    );
+                }
+                if self.use_kinetic_density() {
+                    let Some(aop) = &grids.aop else {
+                        panic!("aop is not available");
+                    };
+                    for i_spin in 0..spin_channel {
+                        let loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
+                        let mut loc_vtau_s = loc_vtau.slice_column_mut(i_spin);
+                        let mut loc_vxc_ao_1_s = &mut loc_vxc_ao_1[i_spin];
+                        loc_vtau_s.iter_mut().zip(loc_weights.iter()).for_each(
+                            |(vtau_s, w)| {*vtau_s *= *w}
+                        );
+                        for ic in 0usize..3usize {
+                            let loc_aop_ic = aop.get_reducing_matrix_columns(range_grids.clone(), ic).unwrap();
+                            contract_vxc_0_serial(loc_vxc_ao_1_s, &loc_aop_ic, loc_vtau_s, Some(0.5));
+                            _dgemm(
+                                &loc_aop_ic, (0..num_basis, 0..range_grids.len()), 'N',
+                                loc_vxc_ao_1_s, (0..num_basis, 0..range_grids.len()), 'T',
+                                loc_vxc_mat_s, (0..num_basis, 0..num_basis), 1.0, 1.0
+                            );
+                            loc_vxc_ao_1_s.data.iter_mut().for_each(|t| {*t=0.0});
+                        }
+                    }
+                }
+            }
+            let (loc_exc_total, loc_total_elec) = self.integrate_exc(&loc_exc, &loc_rho, loc_weights, spin_channel);
+            (loc_exc_total, loc_vxc_mat, loc_total_elec)
         }
-        //if let Some(id) = rayon::current_thread_index() {
-
-        //}
-
-        // for i_spin in 0..spin_channel {
-        //     let loc_vxc_ao_s = loc_vxc_ao.get_mut(i_spin).unwrap();
-        //     loc_vxc_ao_s.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(vxc_ao_s,w)| {
-        //         vxc_ao_s.iter_mut().for_each(|f| {*f *= *w})
-        //     });
-        // }
-
-        // println!("debug vxc:");
-        // (0..num_basis).for_each(|i| {
-        //     println!("{:16.8}", loc_vxc_mat[0][[0, i]]);
-        //     });
-        // (loc_exc_total,loc_vxc_ao,loc_total_elec)
-        (loc_exc_total, loc_vxc_mat, loc_total_elec)
     }
 
     pub fn post_xc_exc(&self, post_xc: &Vec<String>, grids: &crate::dft::Grids, dm: &Vec<MatrixFull<f64>>, mo: &[MatrixFull<f64>;2], occ: &[Vec<f64>;2]) 
@@ -2088,14 +2577,6 @@ impl DFA4REST {
         let num_grids = grids.coordinates.len();
         let num_basis = dm[0].size[0];
         let dt0 = utilities::init_timing();
-        let (rho,rhop) = if ! mo[1].data.is_empty() || spin_channel == 1 { // RHF or UHF case
-            grids.prepare_tabulated_density_2(mo, occ, spin_channel)
-        } else { // ROHF case
-            let mut mo_temp = mo.clone();
-            mo_temp[1] = mo_temp[0].clone();
-            grids.prepare_tabulated_density_2(&mo_temp, occ, spin_channel)
-        };
-        //let (rho,rhop) = grids.prepare_tabulated_density(dm, spin_channel);
         let use_density_gradient = post_xc.iter().fold(false,|flag, x| {
             let code = DFA4REST::xc_func_init_fdqc(x,spin_channel);
             let x_flag = code.iter().fold(false, |flag, xc_code| {
@@ -2104,26 +2585,29 @@ impl DFA4REST {
             });
             flag || x_flag
         });
-        let sigma = if use_density_gradient {
-            prepare_tabulated_sigma_rayon(&rhop, spin_channel)
-        } else {
-            MatrixFull::empty()
-        };
+        let (rho, rhop, sigma, _lapl, _tau) = self.prepare_dft_quantities(
+            grids,
+            spin_channel,
+            mo,
+            occ,
+            use_density_gradient,
+        );
+        let _dt2 = utilities::timing(&dt0, Some("evaluate rho/rhop/sigma"));
+        //let (rho,rhop) = grids.prepare_tabulated_density(dm, spin_channel);
         post_xc.iter().for_each(|x| {
             let mut exc = MatrixFull::new([num_grids,1],0.0);
-            let mut exc_total =[0.0,0.0];
+            let mut exc_total = [0.0, 0.0];
             let code = DFA4REST::xc_func_init_fdqc(x,spin_channel);
             //println!("debug xc_code: {:?}", &code);
             code.iter().for_each(|xc_code| {
                 exc.par_self_scaled_add(&self.xc_exc_code(xc_code, &rho, &sigma, spin_channel),1.0);
             });
 
-            for i_spin in 0..spin_channel {
-                exc_total[i_spin] = izip!(exc.data.iter(),rho.iter_column(i_spin),grids.weights.iter())
-                    .fold(0.0,|acc,(exc,rho,weight)| {
-                        acc + exc * rho * weight
-                    });
-            };
+            let (exc_total_vec, _) = self.integrate_exc(&exc, &rho, &grids.weights, spin_channel);
+            exc_total[0] = exc_total_vec[0];
+            if spin_channel == 2 {
+                exc_total[1] = exc_total_vec[1];
+            }
             //println!("exc_total: {:?}", &exc_total);
 
             post_xc_energy.push(exc_total);
@@ -2196,13 +2680,13 @@ impl DFA4REST {
             //}
         });
 
-        let (rho,rhop) = if ! mo[1].data.is_empty() || spin_channel == 1 { // RHF or UHF case
-            grids.prepare_tabulated_density_2(mo, occ, spin_channel)
-        } else { // ROHF case
-            let mut mo_temp = mo.clone();
-            mo_temp[1] = mo_temp[0].clone();
-            grids.prepare_tabulated_density_2(&mo_temp, occ, spin_channel)
-        };
+        let (rho, rhop, sigma, _lapl, _tau) = self.prepare_dft_quantities(
+            grids,
+            spin_channel,
+            mo,
+            occ,
+            use_density_gradient,
+        );
 
         str_lines[1..].par_iter_mut().zip(rho.par_iter_column(0)).for_each(|(line,rho)| {
             line.push_str(&format!("{:20.10} ", rho));
@@ -2213,11 +2697,6 @@ impl DFA4REST {
             });
         }
 
-        let sigma = if use_density_gradient {
-            prepare_tabulated_sigma_rayon(&rhop, spin_channel)
-        } else {
-            MatrixFull::empty()
-        };
         if use_density_gradient { 
             str_lines[1..].par_iter_mut().zip(rhop.par_iter_slices_x(0, 0)).for_each(|(line,rhop_i)| {
                 line.push_str(&format!("{:20.10} ", rhop_i));
@@ -2303,38 +2782,30 @@ impl DFA4REST {
         let num_grids = grids.coordinates.len();
         let num_basis = dm[0].size[0];
         let dt0 = utilities::init_timing();
-        let (rho,rhop) = if ! mo[1].data.is_empty() || spin_channel == 1 { // RHF or UHF case
-            grids.prepare_tabulated_density_2(mo, occ, spin_channel)
-        } else { // ROHF case
-            let mut mo_temp = mo.clone();
-            mo_temp[1] = mo_temp[0].clone();
-            grids.prepare_tabulated_density_2(&mo_temp, occ, spin_channel)
-        };
-        //let (rho,rhop) = grids.prepare_tabulated_density(dm, spin_channel);
         let use_density_gradient = xc_code_list.iter().fold(false,|flag, xc_code| {
             let xc_func = self.init_libxc(xc_code);
             flag || !matches!(xc_func.family(), LibXCFamily::LDA | LibXCFamily::HybLDA)
         });
-        let sigma = if use_density_gradient {
-            prepare_tabulated_sigma_rayon(&rhop, spin_channel)
-        } else {
-            MatrixFull::empty()
-        };
+        let (rho, rhop, sigma, _lapl, _tau) = self.prepare_dft_quantities(
+            grids,
+            spin_channel,
+            mo,
+            occ,
+            use_density_gradient,
+        );
+        let _dt2 = utilities::timing(&dt0, Some("evaluate rho/rhop/sigma"));
+        //let (rho,rhop) = grids.prepare_tabulated_density(dm, spin_channel);
         xc_code_list.iter().for_each(|xc_code| {
             //let mut exc = MatrixFull::new([num_grids,1],0.0);
-            let mut exc_total =[0.0,0.0];
-            //let code = DFA4REST::xc_func_init_fdqc(x,spin_channel);
-            //println!("debug xc_code: {:?}", &code);
-            //code.iter().for_each(|xc_code| {
+            let mut exc_total = [0.0, 0.0];
             let exc = self.xc_exc_code(xc_code, &rho, &sigma, spin_channel);
             //});
 
-            for i_spin in 0..spin_channel {
-                exc_total[i_spin] = izip!(exc.data.iter(),rho.iter_column(i_spin),grids.weights.iter())
-                    .fold(0.0,|acc,(exc,rho,weight)| {
-                        acc + exc * rho * weight
-                    });
-            };
+            let (exc_total_vec, _) = self.integrate_exc(&exc, &rho, &grids.weights, spin_channel);
+            exc_total[0] = exc_total_vec[0];
+            if spin_channel == 2 {
+                exc_total[1] = exc_total_vec[1];
+            }
             //println!("exc_total: {:?}", &exc_total);
 
             xc_energy.push(exc_total);
@@ -2350,29 +2821,14 @@ impl DFA4REST {
         let mut exc = MatrixFull::new([num_grids,1],0.0);
         let mut exc_total = vec![0.0;spin_channel];
         let dt0 = utilities::init_timing();
-        let mut rho: MatrixFull<f64> = MatrixFull::empty();
-        let mut rhop: RIFull<f64> = RIFull::empty();
-        let mut tau: MatrixFull<f64> = MatrixFull::empty();
-        let mut lapl: MatrixFull<f64> = MatrixFull::empty();
-        if self.use_kinetic_density() {
-            (rho, rhop, tau) = grids.prepare_tabulated_density_3(mo, occ, spin_channel);
-            lapl = MatrixFull::new([num_grids, spin_channel], 0.0);
-        } else {
-            (rho,rhop) = if ! mo[1].data.is_empty() || spin_channel == 1 { // RHF or UHF case
-                grids.prepare_tabulated_density_2(mo, occ, spin_channel)
-            } else { // ROHF case
-                let mut mo_temp = mo.clone();
-                mo_temp[1] = mo_temp[0].clone();
-                grids.prepare_tabulated_density_2(&mo_temp, occ, spin_channel)
-            }
-        };
-        // let (rho,rhop) = grids.prepare_tabulated_density_2(mo, occ, spin_channel);
-        let dt2 = utilities::timing(&dt0, Some("evaluate rho and rhop"));
-        let sigma = if self.use_density_gradient() {
-            prepare_tabulated_sigma_rayon(&rhop, spin_channel)
-        } else {
-            MatrixFull::empty()
-        };
+        let (rho, rhop, sigma, lapl, tau) = self.prepare_dft_quantities(
+            grids,
+            spin_channel,
+            mo,
+            occ,
+            self.use_density_gradient(),
+        );
+        let dt2 = utilities::timing(&dt0, Some("evaluate rho/rhop/sigma"));
 
         if iop==0 {  // for the SCF energy
             //let rho_trans = if spin_channel== 1 {
@@ -2381,89 +2837,20 @@ impl DFA4REST {
             //    Some(rho.transpose())
             //};
             self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
-                let xc_func = self.init_libxc(xc_func);
-                match xc_func.family() {
-                    LibXCFamily::LDA => {
-                        let tmp_exc = MatrixFull::from_vec([num_grids,1],
-                            if spin_channel==1 {
-                                lda_exc(&xc_func,rho.data_ref().unwrap())
-                            } else {
-                                lda_exc(&xc_func,rho.transpose().data_ref().unwrap())
-                            }
-                        ).unwrap();
-                        exc.par_self_scaled_add(&tmp_exc,*xc_para);
-                    },
-                    LibXCFamily::GGA | LibXCFamily::HybGGA => {
-                        let tmp_exc = MatrixFull::from_vec([num_grids,1],
-                            if spin_channel==1 {
-                                gga_exc(&xc_func,rho.data_ref().unwrap(),sigma.data_ref().unwrap())
-                            } else {
-                                gga_exc(&xc_func,rho.transpose().data_ref().unwrap(),sigma.transpose().data_ref().unwrap())
-                            }
-                        ).unwrap();
-                        exc.par_self_scaled_add(&tmp_exc,*xc_para);
-                    },
-                    LibXCFamily::MGGA | LibXCFamily::HybMGGA => {
-                        let tmp_exc = MatrixFull::from_vec(
-                            [num_grids, 1],
-                            if spin_channel==1 {
-                                mgga_exc(&xc_func,rho.data_ref().unwrap(),sigma.data_ref().unwrap(), lapl.data_ref().unwrap(), tau.data_ref().unwrap())
-                            } else {
-                                mgga_exc(&xc_func,rho.transpose().data_ref().unwrap(),sigma.transpose().data_ref().unwrap(), lapl.transpose().data_ref().unwrap(), tau.transpose().data_ref().unwrap())
-                            }
-                        ).unwrap();
-                        exc.par_self_scaled_add(&tmp_exc,*xc_para);
-                    },
-                    xc_family => panic!("{xc_family:?} is not yet implemented"),
-                }
+                let xc_func = self.init_libxc_and_set_param(xc_func);
+                let tmp_exc = self.compute_exc_by_family(&xc_func, spin_channel, &rho, &sigma, &lapl, &tau);
+                exc.par_self_scaled_add(&tmp_exc, *xc_para);
             });
         } else if iop==1 { // for the post-SCF energy calculation
             if let (Some(dfa_paramr),Some(dfa_compnt)) = (&self.dfa_paramr_pos, &self.dfa_compnt_pos) {
                 dfa_compnt.iter().zip(dfa_paramr.iter()).for_each(|(xc_func,xc_para)| {
-                    let xc_func = self.init_libxc(xc_func);
-                    match xc_func.family() {
-                        LibXCFamily::LDA => {
-                            let tmp_exc = MatrixFull::from_vec([num_grids,1],
-                                if spin_channel==1 {
-                                    lda_exc(&xc_func,rho.data_ref().unwrap())
-                                } else {
-                                    lda_exc(&xc_func,rho.transpose().data_ref().unwrap())
-                                }
-                            ).unwrap();
-                            exc.par_self_scaled_add(&tmp_exc,*xc_para);
-                        },
-                        LibXCFamily::GGA | LibXCFamily::HybGGA => {
-                            let tmp_exc = MatrixFull::from_vec([num_grids,1],
-                                if spin_channel==1 {
-                                    gga_exc(&xc_func,rho.data_ref().unwrap(),sigma.data_ref().unwrap())
-                                } else {
-                                    gga_exc(&xc_func,rho.transpose().data_ref().unwrap(),sigma.transpose().data_ref().unwrap())
-                                }
-                            ).unwrap();
-                            exc.par_self_scaled_add(&tmp_exc,*xc_para);
-                        },
-                        xc_family => panic!("{xc_family:?} is not yet implemented")
-                    }
+                    let xc_func = self.init_libxc_and_set_param(xc_func);
+                    let tmp_exc = self.compute_exc_by_family(&xc_func, spin_channel, &rho, &sigma, &lapl, &tau);
+                    exc.par_self_scaled_add(&tmp_exc, *xc_para);
                 });
             }
         }
-        let mut total_elec = [0.0;2];
-        for i_spin in 0..spin_channel {
-            let mut total_elec_s = total_elec.get_mut(i_spin).unwrap();
-            exc_total[i_spin] = izip!(exc.data.iter(),rho.iter_column(i_spin),grids.weights.iter())
-                .fold(0.0,|acc,(exc,rho,weight)| {
-                    *total_elec_s += rho*weight;
-                    acc + exc * rho * weight
-                });
-            //exc.data.iter_mut().zip(rho.iter_j(i_spin)).for_each(|(exc,rho)| {
-            //    *exc  = *exc* rho
-        }
-        //if spin_channel==1 {
-        //    println!("total electron number: {:16.8}", total_elec[0])
-        //} else {
-        //    println!("electron number in alpha-channel: {:12.8}", total_elec[0]);
-        //    println!("electron number in beta-channel:  {:12.8}", total_elec[1]);
-        //}
+        let (exc_total, _total_elec) = self.integrate_exc(&exc, &rho, &grids.weights, spin_channel);
         let global_exc_total = if let Some(mpi_op) = &mpi_operator {
             let my_rank = mpi_op.rank;
             let mut global_exc_total = mpi_reduce(&mpi_op.world, &exc_total , 0, &SystemOperation::sum());
@@ -2478,33 +2865,9 @@ impl DFA4REST {
 
     }
     pub fn xc_exc_code(&self, xc_code: &usize, rho: &MatrixFull<f64>, sigma:&MatrixFull<f64>, spin_channel: usize) -> MatrixFull<f64> {
-        let xc_func = self.init_libxc(xc_code);
+        let xc_func = self.init_libxc_and_set_param(xc_code);
         let num_grids = rho.size()[0];
-        let tmp_exc = match xc_func.family() {
-            LibXCFamily::LDA => {
-                MatrixFull::from_vec([num_grids,1],
-                    if spin_channel==1 {
-                        lda_exc(&xc_func,rho.data_ref().unwrap())
-                    } else {
-                        lda_exc(&xc_func,rho.transpose().data_ref().unwrap())
-                    }
-                ).unwrap()
-                //exc.par_self_scaled_add(&tmp_exc,*xc_para);
-            },
-            LibXCFamily::GGA | LibXCFamily::HybGGA => {
-                //println!("debug, {:?}, {:?}, {:?}", xc_code, xc_func, sigma.data.len());
-                MatrixFull::from_vec([num_grids,1],
-                    if spin_channel==1 {
-                        gga_exc(&xc_func,rho.data_ref().unwrap(),sigma.data_ref().unwrap())
-                    } else {
-                        gga_exc(&xc_func,rho.transpose().data_ref().unwrap(),sigma.transpose().data_ref().unwrap())
-                    }
-                ).unwrap()
-                //exc.par_self_scaled_add(&tmp_exc,*xc_para);
-            },
-            xc_family => panic!("{xc_family:?} is not yet implemented"),
-        };
-        tmp_exc
+        self.compute_exc_by_family(&xc_func, spin_channel, rho, sigma, &MatrixFull::empty(), &MatrixFull::empty())
     }
 }
 
@@ -3864,381 +4227,7 @@ pub fn numerical_density_rayon(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull
 
 
 #[test]
-fn debug_num_density_for_atom() {
-    let angular = 2;
-    let num_basis = 2*angular+1;
-    let mut dm = [
-        //MatrixFull::from_vec([1,1], vec![2.0]).unwrap(),
-        //MatrixFull::from_vec([num_basis,num_basis], vec![
-        //    1.0,0.0,0.0,
-        //    0.0,1.0,0.0,
-        //    0.0,0.0,0.0]).unwrap(), 
-        MatrixFull::from_vec([5,5], vec![
-            2.0,0.0,0.0,0.0,0.0,
-            0.0,0.0,0.0,0.0,0.0,
-            0.0,0.0,0.0,0.0,0.0,
-            0.0,0.0,0.0,0.0,0.0,
-            0.0,0.0,0.0,0.0,0.0]).unwrap(), 
-        MatrixFull::empty()];
-    let mut alpha_min_h: HashMap<usize, f64> = HashMap::new();
-    alpha_min_h.insert(angular,0.122);
-    let mut alpha_max_h: f64 = 0.122;
-    let mut basis4elem = vec![Basis4Elem {
-        electron_shells: vec![
-            BasCell {
-                function_type: None,
-                region: None,
-                angular_momentum: vec![angular as i32],
-                exponents: vec![0.122],
-                coefficients: vec![vec![1.0/cint_norm_factor(angular as i32, 0.122)]],
-                native_coefficients: vec![vec![1.0/cint_norm_factor(angular as i32, 0.122)]]
-            }
-        ],
-        references: None,
-        ecp_electrons: None,
-        ecp_potentials: None,
-        global_index: (0,0)
-    }];
-    let mut center_coordinates_bohr = vec![(0.0,0.0,0.0)];
-    let mut proton_charges = vec![1];
-    let grids = Grids::build_nonstd(
-        center_coordinates_bohr.clone(), 
-        proton_charges.clone(), 
-        vec![alpha_min_h], 
-        vec![alpha_max_h], &mut None);
-    let mut total_density = 0.0;
-    let mut count:usize =0;
-    grids.coordinates.iter().zip(grids.weights.iter()).for_each(|(r,w)| {
-        let mut density_r_sum = 0.0;
-        let mut density_r:Vec<f64> = vec![];
-        basis4elem.iter().zip(center_coordinates_bohr.iter()).for_each(|(elem,geom_nonstd)| {
-            let geom = [geom_nonstd.0,geom_nonstd.1,geom_nonstd.2];
-            let mut tmp_geom = [0.0;3];
-            tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
-            //density_r.extend(gto_value(r, &tmp_geom, elem, &mol.ctrl.basis_type));
-            //let tmp_vec = gto_value(r, &tmp_geom, elem, &"spheric".to_string());
-            let tmp_vec = gto_value(r, &tmp_geom, elem, &"spheric".to_string());
-            //println!("debug 0: len {}", &tmp_vec.len());
-            density_r.extend(tmp_vec);
-            //if count<=10 {println!("{:?},{:?},{:?}", density_r,elem.electron_shells[0].exponents, elem.electron_shells[0].coefficients[0])};
-        });
-        //println!{"debug 1"};
-        let mut density_rr = MatrixFull::from_vec([num_basis,1],density_r).unwrap();
-        //println!{"debug 2"};
-        dm.iter_mut().for_each(|dm_s| {
-            let mut tmp_mat = MatrixFull::new([num_basis,1],0.0);
-            tmp_mat.lapack_dgemm(&mut density_rr, dm_s, 'T', 'N', 1.0, 0.0);
-            if count<=10 {println!("count: {},{:?}",count, &tmp_mat.data)};
-            density_r_sum += tmp_mat.data.iter().zip(density_rr.data.iter()).fold(0.0, |acc,(a,b)| {acc + a*b});
-        });
-        if count<=10 {println!("{:?},{},{}", r,w,density_r_sum)};
-        count += 1;
-        //println!{"debug 3"};
-        total_density += density_r_sum * w;
-    });
-
-    println!("Total density: {}", total_density);
-    
-}
-
-#[test]
-fn test_libxc() {
-    let mut rho:Vec<f64> = vec![0.1,0.2,0.3,0.4,0.5,0.6,0.8];
-    let sigma:Vec<f64> = vec![0.2,0.3,0.4,0.5,0.6,0.7];
-    //&rho.par_iter().for_each(|c| {println!("{:16.8}",c)});
-    //let mut exc:Vec<c_double> = vec![0.0,0.0,0.0,0.0,0.0];
-    //let mut vrho:Vec<c_double> = vec![0.0,0.0,0.0,0.0,0.0];
-    //let func_id: usize = ffi_xc::XC_GGA_X_XPBE as usize;
-    let spin_channel: usize = 1;
-
-    let mut my_xc = DFA4REST::parse_scf("lda_x_slater", spin_channel); 
-    //let mut my_xc = XcFuncType::xc_func_init_fdqc(&"pw-lda",spin_channel); 
-
-
-
-    let mut exc = MatrixFull::new([rho.len()/spin_channel,1],0.0);
-    let mut vrho = MatrixFull::new([rho.len()/spin_channel,spin_channel],0.0);
-    my_xc.dfa_compnt_scf.iter().zip(my_xc.dfa_paramr_scf.iter()).for_each(|(xc_func, xc_para)| {
-        //let mut new_vec = vec![-0.34280861230056237, -0.43191178672272906, -0.494415573788165, -0.5441747517896713, -0.586194481347579, -0.622924588811561, -0.6856172246011247];
-        //let tmp_c = (new_vec.as_mut_ptr(), new_vec.len(),new_vec.capacity());
-        //let new_vec = unsafe{Vec::from_raw_parts(tmp_c.0, tmp_c.1, tmp_c.2)};
-        //new_vec.par_iter().for_each(|c| {println!("{:16.8e}",c)});
-        let xc_func = my_xc.init_libxc(xc_func);
-
-        let (tmp_exc, tmp_vrho) = lda_exc_vxc(&xc_func,&rho);
-        //let tmp_exc_2 = tmp_exc.clone();
-        //println!("WARNNING:: unsolved rayon par_iter problem. It should be relevant to be the fact that tmp_exc is prepared by libxc via ffi");
-        //println!("tmp_vec_2 copied from tmp_exc: {:?},{},{}", &tmp_exc_2, tmp_exc_2.len(),tmp_exc_2.capacity());
-        //println!("tmp_vec");
-        //&tmp_exc.iter().for_each(|c| {
-        //    println!("{:16.8e}",c);
-        //});
-        //println!("tmp_vec_2");
-        //&tmp_exc_2.par_iter().for_each(|c| {
-        //    println!("{:16.8e}",c);
-        //});
-        //println!("tmp_vec_2");
-        //&tmp_exc.iter().for_each(|c| {
-        //    println!("{:16.8e}",c);
-        //});
-        let mut tmp_exc = MatrixFull::from_vec([rho.len()/spin_channel,1],tmp_exc).unwrap();
-        let mut tmp_vrho = MatrixFull::from_vec([rho.len()/spin_channel,spin_channel],tmp_vrho).unwrap();
-        //println!("{:?}", &tmp_exc.data);
-        //println!("{:?}", &tmp_vrho.data);
-        exc.par_self_scaled_add(&tmp_exc,*xc_para);
-        vrho.par_self_scaled_add(&tmp_vrho,*xc_para);
-        //exc.data.par_iter_mut().zip(tmp_exc.data.par_iter()).for_each(|(c,p)| {
-        //    println!("{:16.8e},{:16.8e}",c,p);
-        //});
-        //println!("{:?}", &exc.data);
-        //println!("{:?}", &vrho.data);
-    });
-    println!("{:?}", exc.data);
-    println!("{:?}", vrho.data);
-}
-
-#[test]
-#[ignore]
-fn read_grid() {
-    let mut grids_file = std::fs::File::open("/home/igor/Documents/Package-Pool/Rust/rest/grids").unwrap();
-    let mut content = String::new();
-    grids_file.read_to_string(&mut content);
-    //println!("{}",&content);
-    let re1 = Regex::new(r"(?x)\s*
-        (?P<x>[\+-]?\d+.\d+[eE][\+-]?\d+)\s*,# the 'x' position
-        \s+
-        (?P<y>[\+-]?\d+.\d+[eE][\+-]?\d+)\s*,# the 'y' position
-        \s+
-        (?P<z>[\+-]?\d+.\d+[eE][\+-]?\d+)\s*,# the 'z' position
-        \s+
-        (?P<w>[\+-]?\d+.\d+[eE][\+-]?\d+)\s*# the 'w' weight
-        \s*\n").unwrap();
-    //if let Some(cap)  = re1.captures(&content) {
-    //    println!("{:?}", &cap)
-    //}
-    for cap in re1.captures_iter(&content) {
-        let x:f64 = cap[1].parse().unwrap();
-        let y:f64 = cap[2].parse().unwrap();
-        let z:f64 = cap[3].parse().unwrap();
-        let w:f64 = cap[4].parse().unwrap();
-        println!("{:16.8} {:16.8} {:16.8} {:16.8}", x,y,z,w);
-    }
-}
-#[test]
-fn debug_transpose() {
-    let len_a = 111_usize;
-    let len_b = 40000_usize;
-    let orig_a:Vec<f64> = (0..len_a*len_b).map(|i| {i as f64}).collect();
-    let a_mat = MatrixFull::from_vec([len_a,len_b],orig_a).unwrap();
-    let dt0 = utilities::init_timing();
-    let b_mat = a_mat.transpose_and_drop();
-    //b_mat.formated_output(10, "full");
-    let dt1 = utilities::timing(&dt0, Some("old transpose"));
-    let orig_a:Vec<f64> = (0..len_a*len_b).map(|i| {i as f64}).collect();
-    let a_mat = MatrixFull::from_vec([len_a,len_b],orig_a).unwrap();
-    let dt0 = utilities::init_timing();
-    let c_mat = a_mat.transpose_and_drop();
-    //b_mat.formated_output(10, "full");
-    let dt1 = utilities::timing(&dt0, Some("new transpose"));
-    b_mat.data.iter().zip(c_mat.data.iter()).for_each(|(b,c)| {
-        assert!(*b==*c);
-    });
-}
-
-
-
-#[test]
 fn test_balancing() {
     let dd = balancing(550, 23);
     println!("{:?}",dd);
-}
-
-#[test]
-fn test_rsh_cam_coeff_raw() {
-    // Test raw libxc CAM coefficients match pyscf expectations
-    // Each entry: (libxc_id, expected_omega, expected_alpha, expected_beta, expected_hyb)
-    // hyb = alpha + beta (pyscf convention for RSH)
-    let ref_data = vec![
-        (464, 0.300, 1.0, -0.842294, 0.157706),    // WB97X
-        (466, 0.300, 1.0, -0.833,    0.167),        // WB97X-V
-        (471, 0.200, 1.0, -0.777964, 0.222036),     // WB97X-D
-        (433, 0.330, 0.65, -0.46,   0.19),          // CAM-B3LYP
-        (400, 0.330, 1.0, -1.0,     0.0),           // LC-BLYP
-        (478, 0.400, 1.0, -1.0,     0.0),           // LC-wPBE
-        (428, 0.110, 0.0,  0.25,    0.25),          // HSE06
-        (427, 0.1061, 0.0, 0.25,    0.25),          // HSE03
-    ];
-
-    for (libxc_id, exp_omega, exp_alpha, exp_beta, exp_hyb) in &ref_data {
-        let func = xc_func_init(*libxc_id, 1);
-        assert!(func.is_hyb_cam(), "ID {} should be RSH/CAM", libxc_id);
-        let (omega, alpha, beta) = func.cam_coef().unwrap_or((0.0, 0.0, 0.0));
-        let hyb = alpha + beta;
-        assert!((omega - exp_omega).abs() < 1e-3, "ID {}: omega mismatch: got {} expected {}", libxc_id, omega, exp_omega);
-        assert!((alpha - exp_alpha).abs() < 1e-3, "ID {}: alpha mismatch: got {} expected {}", libxc_id, alpha, exp_alpha);
-        assert!((beta - exp_beta).abs() < 1e-3, "ID {}: beta mismatch: got {} expected {}", libxc_id, beta, exp_beta);
-        assert!((hyb - exp_hyb).abs() < 1e-4, "ID {}: hyb mismatch: got {} expected {}", libxc_id, hyb, exp_hyb);
-        println!("ID {}: omega={:.4} alpha={:.4} beta={:+.4} hyb={:.6}  OK", libxc_id, omega, alpha, beta, hyb);
-    }
-    println!("All {} RSH libxc raw CAM coefficient tests passed.", ref_data.len());
-}
-
-#[test]
-fn test_rsh_parameters_wb97x() {
-    let dfa = DFA4REST::new("wb97x", 1, 0);
-    assert!(dfa.is_hybrid());
-    assert!(dfa.is_rsh());
-    assert!((dfa.omega().unwrap() - 0.3).abs() < 1e-9);
-    assert!((dfa.rsh_alpha().unwrap() - 1.0).abs() < 1e-9);
-    assert!((dfa.dfa_hybrid_scf - 0.157706).abs() < 1e-5);
-    assert_eq!(dfa.dfa_compnt_scf, vec![464]);
-}
-
-#[test]
-fn test_rsh_parameters_cam_b3lyp() {
-    let dfa = DFA4REST::new("cam-b3lyp", 1, 0);
-    assert!(dfa.is_hybrid());
-    assert!(dfa.is_rsh());
-    assert!((dfa.omega().unwrap() - 0.33).abs() < 1e-9);
-    assert!((dfa.rsh_alpha().unwrap() - 0.65).abs() < 1e-5);
-    assert!((dfa.dfa_hybrid_scf - 0.19).abs() < 1e-5);
-    assert_eq!(dfa.dfa_compnt_scf, vec![433]);
-    // also test case variation
-    let dfa2 = DFA4REST::new("CAM-B3LYP", 1, 0);
-    assert!((dfa.omega().unwrap() - dfa2.omega().unwrap()).abs() < 1e-9);
-    assert!((dfa.dfa_hybrid_scf - dfa2.dfa_hybrid_scf).abs() < 1e-9);
-}
-
-#[test]
-fn test_rsh_parameters_lc_blyp() {
-    let dfa = DFA4REST::new("lc-blyp", 1, 0);
-    assert!(dfa.is_hybrid());
-    assert!(dfa.is_rsh());
-    assert!((dfa.omega().unwrap() - 0.33).abs() < 1e-9);
-    assert!((dfa.rsh_alpha().unwrap() - 1.0).abs() < 1e-9);
-    // LC-BLYP has hyb=0 (alpha=1, beta=-1 → hyb=0, LR-only HF)
-    assert!((dfa.dfa_hybrid_scf - 0.0).abs() < 1e-8);
-    assert_eq!(dfa.dfa_compnt_scf, vec![400]);
-}
-
-#[test]
-fn test_rsh_parameters_hse06() {
-    let dfa = DFA4REST::new("hse06", 1, 0);
-    assert!(dfa.is_hybrid());
-    assert!(dfa.is_rsh());
-    assert!((dfa.omega().unwrap() - 0.11).abs() < 1e-9);
-    // HSE06 has alpha=0 (no additional LR-HF), beta=0.25 (SR-HF only)
-    assert!((dfa.rsh_alpha().unwrap() - 0.0).abs() < 1e-5);
-    assert!((dfa.dfa_hybrid_scf - 0.25).abs() < 1e-5);
-    assert_eq!(dfa.dfa_compnt_scf, vec![428]);
-}
-
-#[test]
-fn test_non_rsh_b3lyp() {
-    let dfa = DFA4REST::new("b3lyp", 1, 0);
-    assert!(dfa.is_hybrid(), "B3LYP should be hybrid");
-    assert!(!dfa.is_rsh(), "B3LYP should NOT be range-separated");
-    assert!(dfa.omega().is_none());
-    assert!(dfa.rsh_alpha().is_none());
-}
-
-#[test]
-fn test_non_rsh_pbe() {
-    let dfa = DFA4REST::new("pbe", 1, 0);
-    assert!(!dfa.is_hybrid());
-    assert!(!dfa.is_rsh());
-    assert!(dfa.omega().is_none());
-    assert!(dfa.rsh_alpha().is_none());
-    assert_eq!(dfa.dfa_hybrid_scf, 0.0);
-}
-
-#[test]
-fn test_cam_b3lyp_case_insensitive() {
-    let names = ["cam-b3lyp", "CAMB3LYP"];
-    let mut dfas = vec![];
-    for name in &names {
-        dfas.push(DFA4REST::new(name, 1, 0));
-    }
-    for i in 1..dfas.len() {
-        assert!((dfas[0].omega().unwrap() - dfas[i].omega().unwrap()).abs() < 1e-9);
-        assert!((dfas[0].rsh_alpha().unwrap() - dfas[i].rsh_alpha().unwrap()).abs() < 1e-9);
-        assert!((dfas[0].dfa_hybrid_scf - dfas[i].dfa_hybrid_scf).abs() < 1e-9);
-    }
-}
-
-#[test]
-fn test_rsh_spin_polarized() {
-    // Test RSH initialization with spin=2 (open-shell)
-    let dfa_closed = DFA4REST::new("cam-b3lyp", 1, 0);
-    let dfa_open = DFA4REST::new("cam-b3lyp", 2, 0);
-    // RSH parameters should be spin-independent
-    assert!((dfa_closed.omega().unwrap() - dfa_open.omega().unwrap()).abs() < 1e-9);
-    assert!((dfa_closed.rsh_alpha().unwrap() - dfa_open.rsh_alpha().unwrap()).abs() < 1e-9);
-    assert!((dfa_closed.dfa_hybrid_scf - dfa_open.dfa_hybrid_scf).abs() < 1e-9);
-}
-
-#[test]
-fn test_rsh_hyb_override() {
-    // Verify that for RSH functionals, dfa_hybrid_scf is overridden to alpha+beta
-    // NOT the raw xc_hyb_exx_coeff (which may return 1.0)
-    let dfa = DFA4REST::new("lc-blyp", 1, 0);
-    // LC-BLYP: raw xc_hyb_exx_coef = 1.0 (because it's a hybrid),
-    // but alpha+beta = 0.0 (pure LR-HF, no SR-HF)
-    // The override should set hyb to 0.0
-    assert!((dfa.dfa_hybrid_scf - 0.0).abs() < 1e-8,
-        "LC-BLYP hyb should be 0 (alpha+beta=0), got {}", dfa.dfa_hybrid_scf);
-
-    let dfa2 = DFA4REST::new("cam-b3lyp", 1, 0);
-    // CAM-B3LYP: raw xc_hyb_exx_coef = ?, alpha+beta = 0.19
-    assert!((dfa2.dfa_hybrid_scf - 0.19).abs() < 1e-3,
-        "CAM-B3LYP hyb should be ~0.19 (alpha+beta), got {}", dfa2.dfa_hybrid_scf);
-}
-
-#[test]
-fn test_rsh_nonstd_parse() {
-    // Test parse_scf_nonstd with RSH components (e.g. custom mixing)
-    let dfa = DFA4REST::parse_scf_nonstd(
-        &vec!["HYB_GGA_XC_WB97X_V".to_string()],
-        &vec![0.5],  // 50% scaling
-        &0.167,       // hyb = alpha+beta
-        1,
-    );
-    assert!(dfa.is_rsh(), "Nonstd WB97X-V should be RSH");
-    assert!((dfa.omega().unwrap() - 0.3).abs() < 1e-9);
-    assert!((dfa.rsh_alpha().unwrap() - 1.0).abs() < 1e-9);
-    assert!((dfa.dfa_hybrid_scf - 0.167).abs() < 1e-5);
-
-    // Test with HSE06 nonstd
-    let dfa2 = DFA4REST::parse_scf_nonstd(
-        &vec!["HYB_GGA_XC_HSE06".to_string()],
-        &vec![1.0],
-        &0.25,
-        1,
-    );
-    assert!(dfa2.is_rsh());
-    assert!((dfa2.omega().unwrap() - 0.11).abs() < 1e-9);
-    assert!((dfa2.rsh_alpha().unwrap() - 0.0).abs() < 1e-5);
-}
-
-#[test]
-fn test_rsh_summary_does_not_panic() {
-    // Ensure summary() works without panicking for RSH and non-RSH
-    for name in &["cam-b3lyp", "lc-blyp", "hse06", "b3lyp", "pbe"] {
-        let dfa = DFA4REST::new(name, 1, 0);
-        dfa.summary();
-    }
-}
-
-#[test]
-fn test_all_rsh_via_auto_resolver() {
-    // Test that the auto-resolver (generic libxc name lookup) works for RSH
-    let dfa = DFA4REST::new("HYB_GGA_XC_WB97X_V", 1, 0);
-    assert!(dfa.is_rsh());
-    assert!((dfa.omega().unwrap() - 0.3).abs() < 1e-9);
-    assert_eq!(dfa.dfa_compnt_scf, vec![466]);
-
-    let dfa2 = DFA4REST::new("HYB_GGA_XC_HSE06", 1, 0);
-    assert!(dfa2.is_rsh());
-    assert!((dfa2.omega().unwrap() - 0.11).abs() < 1e-9);
-    assert_eq!(dfa2.dfa_compnt_scf, vec![428]);
 }
