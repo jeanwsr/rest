@@ -61,13 +61,22 @@ pub fn get_j2c_decomp(mol: &CInt, device: &DeviceBLAS, j2c_decomp_option: J2CDec
 
     // first try cholesky decomposition, fall back by policy
     match j2c_decomp_option.policy {
-        J2CDecompPolicy::Cd => decomp_j2c_cd(j2c.view(), j2c_decomp_option.threshold, Upper),
+        J2CDecompPolicy::Cd => decomp_j2c_cd(j2c.view(), j2c_decomp_option.threshold, j2c_decomp_option.uplo),
         J2CDecompPolicy::Eig => decomp_j2c_eig(j2c.view(), j2c_decomp_option.threshold.unwrap_or(J2C_THRESH)),
     }
 }
 
 /// Transform 3c-2e ERI (j3c), use solve/inv-matmul to decomposed 3c-2e ERI (cderi).
-pub fn get_solved_j3c<T>(j3c: Tsr<T>, j2c_decomp: &J2CDecompose) -> Tsr<T>
+///
+/// - `j3c`: The 3c-2e ERI, of shape (..., naux) in column major order.
+///   - The remaining dimensions should be contiguous if memory and efficiency is of concern.
+/// - `j2c_decomp`: The decomposed 2c-2e ERI, either from Cholesky or eigen decomposition.
+/// - `flip_uplo`: Whether to flip the uplo in computation. Only affects Cholesky decomposition.
+///   - Usual j3c solve `J^-1/2 * j3c` should be `flip_uplo = false`.
+///   - In some cases where gradient response evaluation is involved, we may need to solve
+///     the `(J^-1/2)^T * cderi`, which requires `flip_uplo = true` (the `cderi` is already solved).
+///     This option should not affect eigen decomposition since it's already symmetric.
+pub fn get_solved_j3c<T>(j3c: Tsr<T>, j2c_decomp: &J2CDecompose, flip_uplo: bool) -> Tsr<T>
 where
     T: BlasFloat + FromPrimitive + 'static,
     DeviceBLAS: LapackDriverAPI<T>,
@@ -86,9 +95,11 @@ where
             );
             let naux = j2c_l.shape()[0];
             let j3c_2d = j3c.into_shape((-1, naux)).into_reverse_axes(); // transposed to (naux, -1)]
-            let j3c_2d = match uplo {
-                Upper => rt::linalg::solve_triangular((j2c_l.t(), j3c_2d, Lower)),
-                Lower => rt::linalg::solve_triangular((j2c_l, j3c_2d, Lower)),
+            let j3c_2d = match (uplo, flip_uplo) {
+                (Upper, false) => rt::linalg::solve_triangular((j2c_l.t(), j3c_2d, Lower)),
+                (Lower, false) => rt::linalg::solve_triangular((j2c_l, j3c_2d, Lower)),
+                (Upper, true) => rt::linalg::solve_triangular((j2c_l, j3c_2d, Upper)),
+                (Lower, true) => rt::linalg::solve_triangular((j2c_l.t(), j3c_2d, Upper)),
             };
             j3c_2d.into_reverse_axes().into_shape(j3c_shape) // reverse back and reshape back
         },

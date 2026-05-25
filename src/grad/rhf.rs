@@ -1,16 +1,15 @@
-use crate::constants::AUXBAS_THRESHOLD;
+#![warn(unused)]
 use crate::grad::traits::GradAPI;
-use crate::scf_io;
-use crate::scf_io::SCF;
+use crate::ri_jk::{self, get_solved_j3c, J2CDecompose};
+use crate::scf_io::{self, SCF};
 use crate::utilities::memory_batch::*;
 use crate::Molecule;
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use rest_libcint::prelude::*;
-use rest_libcint_wrapper::*;
 use rstsr::prelude::*;
 use std::collections::HashMap;
-use tensors::{matrix_blas_lapack::_power_rayon_for_symmetric_matrix, MatrixFull};
+use tensors::MatrixFull;
 
 type Tsr<T> = Tensor<T, DeviceBLAS, IxD>;
 type TsrView<'a, T> = TensorView<'a, T, DeviceBLAS, IxD>;
@@ -41,6 +40,17 @@ pub struct RIHFGradientFlags {
     /// For RHF, it should be set to 1.0; for KS, it depends on exchange coefficient.
     #[builder(default = "Some(1.0)")]
     pub factor_k: Option<f64>,
+
+    /// Factor for alpha in range-separated hybrid functionals.
+    /// In the form of (omega, alpha, beta), corresponds to `dfa_rsh_scf`.
+    /// This value will not be applied when `omega` is None.
+    #[builder(default = "None")]
+    pub factor_alpha: Option<f64>,
+
+    /// Factor for omega in range-separated hybrid functionals.
+    /// In the form of (omega, alpha, beta), corresponds to `dfa_rsh_scf`.
+    #[builder(default = "None")]
+    pub omega: Option<f64>,
 }
 
 /// Gradient structure and values for RHF method.
@@ -65,6 +75,36 @@ impl GradAPI for RIRHFGradient<'_> {
     }
 }
 
+pub fn build_ri_jk_grad_flags(scf_data: &SCF) -> RIHFGradientFlags {
+    let mut flags = RIHFGradientFlagsBuilder::default();
+    flags.factor_j(Some(1.0));
+    flags.auxbasis_response(scf_data.mol.ctrl.auxbasis_response);
+    flags.print_level(scf_data.mol.ctrl.print_level);
+    flags.max_memory(scf_data.mol.ctrl.max_memory);
+
+    // set hybrid factor
+    let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+    let factor_k = if is_hf {
+        Some(1.0)
+    } else {
+        let fac = scf_data.mol.xc_data.dfa_hybrid_scf;
+        if fac == 0.0 {
+            None
+        } else {
+            Some(fac)
+        }
+    };
+    flags.factor_k(factor_k);
+
+    // set rsh factor
+    if let Some((omega, alpha, _beta)) = scf_data.mol.xc_data.dfa_rsh_scf {
+        flags.omega(Some(omega));
+        flags.factor_alpha(Some(alpha));
+    }
+
+    flags.build().unwrap()
+}
+
 impl RIRHFGradient<'_> {
     pub fn new(scf_data: &SCF) -> RIRHFGradient<'_> {
         // check SCF type
@@ -73,26 +113,8 @@ impl RIRHFGradient<'_> {
             _ => panic!("SCFtype is not sutiable for RHF gradient."),
         };
 
-        // check j2c_decomp flag
-        use crate::ri_jk::decompose::*;
-        match scf_data.mol.ctrl.j2c_decomp.policy {
-            J2CDecompPolicy::Cd => unimplemented!("Cholesky decompose is not implemented for gradient currently."),
-            _ => {},
-        };
-        // check omega flag
-        if scf_data.mol.xc_data.is_rsh() {
-            unimplemented!("RI gradient for range-separated hybrid functionals is not implemented currently.")
-        }
-
         // flags
-        let mut flags = RIHFGradientFlagsBuilder::default();
-        flags.factor_j(Some(1.0));
-        flags.factor_k(Some(1.0));
-        flags.auxbasis_response(scf_data.mol.ctrl.auxbasis_response);
-        flags.print_level(scf_data.mol.ctrl.print_level);
-        flags.max_memory(scf_data.mol.ctrl.max_memory);
-        let flags = flags.build().unwrap();
-
+        let flags = build_ri_jk_grad_flags(scf_data);
         RIRHFGradient { scf_data, flags, result: HashMap::new() }
     }
 
@@ -106,8 +128,8 @@ impl RIRHFGradient<'_> {
 
     pub fn calc_de_ovlp(&mut self) -> &mut Self {
         // preparation
-        let mol = &self.scf_data.mol;
-        let mut cint_data = mol.initialize_cint(false);
+        let mol_obj = &self.scf_data.mol;
+        let mol = ri_jk::util::get_cint_mol(mol_obj);
         let device = DeviceBLAS::default();
 
         // orbital informations
@@ -117,7 +139,7 @@ impl RIRHFGradient<'_> {
 
         // tsr_int1e_ipovlp
         let tsr_int1e_ipovlp = {
-            let (out, mut shape) = cint_data.integral_s1::<int1e_ipovlp>(None);
+            let (out, shape) = mol.integrate("int1e_ipovlp", "s1", None).into();
             rt::asarray((out, shape, &device))
         };
 
@@ -125,17 +147,17 @@ impl RIRHFGradient<'_> {
         let dao_ovlp = get_grad_dao_ovlp(tsr_int1e_ipovlp.view(), dme0.view());
 
         // de_ovlp
-        let natm = mol.geom.elem.len();
+        let natm = mol_obj.geom.elem.len();
         let mut de_ovlp = rt::zeros(([3, natm], &device));
-        let ao_slice = mol.aoslice_by_atom();
+        let ao_slice = mol_obj.aoslice_by_atom();
 
         for atm in 0..natm {
             let [_, _, p0, p1] = ao_slice[atm];
-            *&mut de_ovlp.i_mut((.., atm)) += dao_ovlp.i((p0..p1)).sum_axes(0);
+            *&mut de_ovlp.i_mut((.., atm)) += dao_ovlp.i(p0..p1).sum_axes(0);
         }
 
         // note f-contiguous transpose
-        let de_ovlp_raw = de_ovlp.into_raw_parts().0.into_cpu_vec().unwrap();
+        let de_ovlp_raw = de_ovlp.into_shape(-1).into_raw();
         let de_ovlp = MatrixFull::from_vec([3, natm], de_ovlp_raw).unwrap();
         self.result.insert("de_ovlp".into(), de_ovlp);
         return self;
@@ -153,7 +175,7 @@ impl RIRHFGradient<'_> {
             *&mut de_hcore.i_mut((.., atm)) += (gen_deriv_hcore(atm) * &dm).sum_axes([0, 1]);
         }
 
-        let de_hcore_raw = de_hcore.into_raw_parts().0.into_cpu_vec().unwrap();
+        let de_hcore_raw = de_hcore.into_shape(-1).into_raw();
         let de_hcore = MatrixFull::from_vec([3, natm], de_hcore_raw).unwrap();
         self.result.insert("de_hcore".into(), de_hcore);
         return self;
@@ -161,25 +183,26 @@ impl RIRHFGradient<'_> {
 
     pub fn calc_de_jk(&mut self) -> &mut Self {
         let mut time_records = crate::utilities::TimeRecords::new();
-        time_records.new_item("de-jk preparation 1", "de-jk preparation 1");
-        time_records.new_item("de-jk preparation power", "de-jk preparation power");
-        time_records.new_item("de-jk preparation 2", "de-jk preparation 2");
-        time_records.new_item("de-jk batch int", "de-jk batch int");
-        time_records.new_item("de-jk batch 1", "de-jk batch 1");
-        time_records.new_item("de-jk batch 2", "de-jk batch 2");
-        time_records.new_item("de-jk batch 3", "de-jk batch 3");
-        time_records.new_item("de-jk batch 4", "de-jk batch 4");
-        time_records.new_item("de-jk batch 5", "de-jk batch 5");
+        time_records.new_item("de-jk prepr 1", "de-jk prepr 1 (basic setup)");
+        time_records.new_item("de-jk prepr 2", "de-jk prepr 2 (itm setup, hyb)");
+        time_records.new_item("de-jk batch int 1", "de-jk batch int (int3c2e_ip1, int3c2e_ip2, hyb)");
+        time_records.new_item("de-jk batch 1", "de-jk 1 batch (get_grad_dao_j_int3c2e_ip1)");
+        time_records.new_item("de-jk batch 2", "de-jk 2 batch (get_grad_daux_j_int3c2e_ip2)");
+        time_records.new_item("de-jk batch 3", "de-jk 3 batch (get_itm_k_ao, hyb)");
+        time_records.new_item("de-jk batch 4", "de-jk 4 batch (get_grad_dao_k_int3c2e_ip1, hyb)");
+        time_records.new_item("de-jk batch 5", "de-jk 5 batch (get_grad_daux_k_int3c2e_ip2, hyb)");
+        time_records.new_item("de-jk prepr 3", "de-jk prepr 3 (itm setup, rsh)");
+        time_records.new_item("de-jk batch int 2", "de-jk batch int (int3c2e_ip1, int3c2e_ip2, rsh)");
+        time_records.new_item("de-jk batch 6", "de-jk 6 batch (get_itm_k_ao, rsh)");
+        time_records.new_item("de-jk batch 7", "de-jk 7 batch (get_grad_dao_k_int3c2e_ip1, rsh)");
+        time_records.new_item("de-jk batch 8", "de-jk 8 batch (get_grad_daux_k_int3c2e_ip2, rsh)");
 
-        time_records.count_start("de-jk preparation 1");
+        time_records.count_start("de-jk prepr 1");
 
-        let mol = &self.scf_data.mol;
-        let auxmol = mol.make_auxmol_fake();
-        let natm = mol.geom.elem.len();
-        let mut cint_data = mol.initialize_cint(true);
-        let mut cint_data_aux = auxmol.initialize_cint(false);
-        let n_basis_shell = mol.cint_bas.len() as i32;
-        let n_auxbas_shell = mol.cint_aux_bas.len() as i32;
+        let mol_obj = &self.scf_data.mol;
+        let natm = mol_obj.geom.elem.len();
+        let mol = ri_jk::util::get_cint_mol(mol_obj);
+        let aux = ri_jk::util::get_cint_aux(mol_obj);
         let device = DeviceBLAS::default();
 
         // density matrix and triu-packed density matrix
@@ -198,51 +221,40 @@ impl RIRHFGradient<'_> {
             let tsr = self.scf_data.rimatr.as_ref().unwrap();
             rt::asarray((&tsr.0.data, tsr.0.size, &device))
         };
-        let naux = ederi_utp.shape()[0];
+        let naux = ederi_utp.shape()[1];
 
-        time_records.count_start("de-jk preparation power");
         // tsr_int2c2e_l: J^-1/2
-        let tsr_int2c2e_l_inv = {
-            let shl_slices =
-                vec![[n_basis_shell, n_basis_shell + n_auxbas_shell], [n_basis_shell, n_basis_shell + n_auxbas_shell]];
-            let (out, shape) = cint_data.integral_s1::<int2c2e>(Some(&shl_slices));
-            let out = MatrixFull::from_vec(shape.try_into().unwrap(), out).unwrap();
-            let out = _power_rayon_for_symmetric_matrix(&out, -0.5, AUXBAS_THRESHOLD).unwrap();
-            rt::asarray((out.data, out.size, &device))
-        };
-        time_records.count("de-jk preparation power");
+        let j2c_decomp_option = self.scf_data.mol.ctrl.j2c_decomp;
+        let j2c_decomp = ri_jk::get_j2c_decomp(&aux, &device, j2c_decomp_option);
 
         // tsr_int2c2e_ip1
         let tsr_int2c2e_ip1 = {
-            let shl_slices =
-                vec![[n_basis_shell, n_basis_shell + n_auxbas_shell], [n_basis_shell, n_basis_shell + n_auxbas_shell]];
-            let (out, shape) = cint_data.integral_s1::<int2c2e_ip1>(Some(&shl_slices));
+            let (out, shape) = aux.integrate("int2c2e_ip1", "s1", None).into();
             rt::asarray((out, shape, &device))
         };
 
         // shell partition of int3c2e
-        let ao_loc = cint_data.ao_loc();
-        let aux_loc = &ao_loc[(n_basis_shell as usize)..];
+        let aux_loc = aux.ao_loc();
 
         // available memory in MB, if not set, will be calculated from system
-        let sys_info = sysinfo::System::new_all();
         let mem_avail = self.flags.max_memory.map(|max_memory| max_memory - detect_used_memory_mb("proc"));
         let aux_batch_size = calc_batch_size::<f64>(8 * nao * nao, mem_avail, None, Some(naux * nocc * nocc));
         let aux_batch_size = aux_batch_size.min(216);
-        let aux_partition = blocksize_partition(aux_loc, aux_batch_size);
+        let aux_partition = blocksize_partition(&aux_loc, aux_batch_size);
 
-        time_records.count("de-jk preparation 1");
+        time_records.count("de-jk prepr 1");
 
-        // preparation finished
+        // basic setup finished
+        // begin hybrid computation
 
-        time_records.count_start("de-jk preparation 2");
+        time_records.count_start("de-jk prepr 2");
 
         // temporaries for de_jaux, de_kaux
         let mut itm_j = rt::full(([], f64::NAN, &device));
         let mut dao_j = rt::full(([], f64::NAN, &device));
         let mut daux_j = rt::full(([], f64::NAN, &device));
         if self.flags.factor_j.is_some() {
-            itm_j = get_itm_j(tsr_int2c2e_l_inv.view(), ederi_utp.view(), dm_tp.view());
+            itm_j = get_itm_j(&j2c_decomp, ederi_utp.view(), dm_tp.view());
             dao_j = rt::zeros(([nao, 3], &device));
         }
         if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
@@ -253,7 +265,7 @@ impl RIRHFGradient<'_> {
         let mut dao_k = rt::full(([], f64::NAN, &device));
         let mut daux_k = rt::full(([], f64::NAN, &device));
         if self.flags.factor_k.is_some() {
-            itm_k_occtp = get_itm_k_occtp(tsr_int2c2e_l_inv.view(), ederi_utp.view(), weighted_occ_coeff.view());
+            itm_k_occtp = get_itm_k_occtp(&j2c_decomp, ederi_utp.view(), weighted_occ_coeff.view());
             dao_k = rt::zeros(([nao, 3], &device));
         }
         if self.flags.factor_k.is_some() && self.flags.auxbasis_response {
@@ -261,21 +273,18 @@ impl RIRHFGradient<'_> {
             daux_k = get_grad_daux_k_int2c2e_ip1(tsr_int2c2e_ip1.view(), itm_k_aux.view());
         }
 
-        time_records.count("de-jk preparation 2");
+        time_records.count("de-jk prepr 2");
 
         let mut idx_aux_start = 0;
-        for [shl0, shl1] in aux_partition {
+        for [shl0, shl1] in aux_partition.clone() {
             let shl_naux = aux_loc[shl1] - aux_loc[shl0];
-            let shl_slices = vec![[0, n_basis_shell], [0, n_basis_shell], [
-                n_basis_shell + shl0 as i32,
-                n_basis_shell + shl1 as i32,
-            ]];
+            let shl_slices = [[0, mol.nbas()], [0, mol.nbas()], [shl0, shl1]];
             let (p0, p1) = (idx_aux_start, idx_aux_start + shl_naux);
 
             time_records.count_start("de-jk batch int");
             // int3c2e_ip1
             let tsr_int3c2e_ip1 = {
-                let (out, shape) = cint_data.integral_s1::<int3c2e_ip1>(Some(&shl_slices));
+                let (out, shape) = CInt::integrate_cross("int3c2e_ip1", [&mol, &mol, &aux], "s1", shl_slices).into();
                 rt::asarray((out, shape, &device))
             };
 
@@ -283,7 +292,8 @@ impl RIRHFGradient<'_> {
             let mut tsr_int3c2e_ip2 = rt::full(([], f64::NAN, &device));
             if self.flags.auxbasis_response {
                 tsr_int3c2e_ip2 = {
-                    let (out, shape) = cint_data.integral_s2ij::<int3c2e_ip2>(Some(&shl_slices));
+                    let (out, shape) =
+                        CInt::integrate_cross("int3c2e_ip2", [&mol, &mol, &aux], "s2ij", shl_slices).into();
                     rt::asarray((out, shape, &device))
                 };
             }
@@ -296,7 +306,7 @@ impl RIRHFGradient<'_> {
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 2");
-                    *&mut daux_j.i_mut((p0..p1)) +=
+                    *&mut daux_j.i_mut(p0..p1) +=
                         get_grad_daux_j_int3c2e_ip2(tsr_int3c2e_ip2.view(), dm_tp.view(), itm_j.i(p0..p1));
                     time_records.count("de-jk batch 2");
                 }
@@ -313,8 +323,7 @@ impl RIRHFGradient<'_> {
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 5");
-                    *&mut daux_k.i_mut((p0..p1)) +=
-                        get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_k_ao.view());
+                    *&mut daux_k.i_mut(p0..p1) += get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_k_ao.view());
                     time_records.count("de-jk batch 5");
                 }
             }
@@ -322,33 +331,121 @@ impl RIRHFGradient<'_> {
             idx_aux_start += shl_naux;
         }
 
+        // begin rsh computation (evaluate short-range part of K, so negative omega for libcint)
+
+        let mut dao_sr = rt::full(([], f64::NAN, &device));
+        let mut daux_sr = rt::full(([], f64::NAN, &device));
+
+        if let Some(omega) = self.flags.omega {
+            // setup molecules for short-range integrals
+            let (mut mol, mut aux) = (mol.clone(), aux.clone());
+            mol.set_omega(-omega);
+            aux.set_omega(-omega);
+
+            // the already existed decomposed ERI
+            let ederi_utp_rimatr_sr = self.scf_data.rimatr_sr.as_ref().unwrap();
+            let ederi_utp_sr = {
+                let tsr = ederi_utp_rimatr_sr;
+                rt::asarray((&tsr.0.data, tsr.0.size, &device))
+            };
+
+            // regenerate essential cheap integrals
+            let j2c_decomp_option = self.scf_data.mol.ctrl.j2c_decomp;
+            let j2c_decomp_sr = ri_jk::get_j2c_decomp(&aux, &device, j2c_decomp_option);
+
+            let tsr_int2c2e_ip1 = {
+                let (out, shape) = aux.integrate("int2c2e_ip1", "s1", None).into();
+                rt::asarray((out, shape, &device))
+            };
+
+            time_records.count_start("de-jk prepr 3");
+
+            // temporaries for de_sraux
+            let mut itm_r_occtp = get_itm_k_occtp(&j2c_decomp_sr, ederi_utp_sr.view(), weighted_occ_coeff.view());
+            dao_sr = rt::zeros(([nao, 3], &device));
+            let itm_sr_aux = get_itm_k_aux(itm_r_occtp.view_mut());
+            daux_sr = get_grad_daux_k_int2c2e_ip1(tsr_int2c2e_ip1.view(), itm_sr_aux.view());
+
+            time_records.count("de-jk prepr 3");
+
+            let mut idx_aux_start = 0;
+            for [shl0, shl1] in aux_partition.clone() {
+                let shl_naux = aux_loc[shl1] - aux_loc[shl0];
+                let shl_slices = [[0, mol.nbas()], [0, mol.nbas()], [shl0, shl1]];
+                let (p0, p1) = (idx_aux_start, idx_aux_start + shl_naux);
+
+                time_records.count_start("de-jk batch int 2");
+                // int3c2e_ip1
+                let tsr_int3c2e_ip1 = {
+                    let (out, shape) =
+                        CInt::integrate_cross("int3c2e_ip1", [&mol, &mol, &aux], "s1", shl_slices).into();
+                    rt::asarray((out, shape, &device))
+                };
+
+                // int3c2e_ip2
+                let mut tsr_int3c2e_ip2 = rt::full(([], f64::NAN, &device));
+                if self.flags.auxbasis_response {
+                    tsr_int3c2e_ip2 = {
+                        let (out, shape) =
+                            CInt::integrate_cross("int3c2e_ip2", [&mol, &mol, &aux], "s2ij", shl_slices).into();
+                        rt::asarray((out, shape, &device))
+                    };
+                }
+                time_records.count("de-jk batch int 2");
+
+                time_records.count_start("de-jk batch 6");
+                let itm_r_ao = get_itm_k_ao(itm_r_occtp.i((.., p0..p1)), weighted_occ_coeff.view());
+                time_records.count("de-jk batch 6");
+
+                time_records.count_start("de-jk batch 7");
+                *&mut dao_sr += get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1.view(), itm_r_ao.view());
+                time_records.count("de-jk batch 7");
+
+                if self.flags.auxbasis_response {
+                    time_records.count_start("de-jk batch 8");
+                    *&mut daux_sr.i_mut(p0..p1) += get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_r_ao.view());
+                    time_records.count("de-jk batch 8");
+                }
+
+                idx_aux_start += shl_naux;
+            }
+        }
+
         if self.flags.print_level >= 2 {
             time_records.report_all();
         }
 
-        // de_j, de_k, de_jaux, de_kaux
+        // de_j, de_k, de_sr, de_jaux, de_kaux
         let mut de_j = rt::full(([3, natm], f64::NAN, &device));
         let mut de_k = rt::full(([3, natm], f64::NAN, &device));
+        let mut de_sr = rt::full(([3, natm], f64::NAN, &device));
         let mut de_jaux = rt::full(([3, natm], f64::NAN, &device));
         let mut de_kaux = rt::full(([3, natm], f64::NAN, &device));
-        let ao_slice = mol.aoslice_by_atom();
-        let aux_slice = mol.make_auxmol_fake().aoslice_by_atom();
+        let mut de_sraux = rt::full(([3, natm], f64::NAN, &device));
+        let ao_slice = mol_obj.aoslice_by_atom();
+        let aux_slice = mol_obj.make_auxmol_fake().aoslice_by_atom();
 
         for atm in 0..natm {
             let [_, _, p0, p1] = ao_slice[atm].clone().try_into().unwrap();
             if self.flags.factor_j.is_some() {
-                *&mut de_j.i_mut((.., atm)).assign(dao_j.i((p0..p1)).sum_axes(0));
+                *&mut de_j.i_mut((.., atm)).assign(dao_j.i(p0..p1).sum_axes(0));
             }
             if self.flags.factor_k.is_some() {
-                *&mut de_k.i_mut((.., atm)).assign(dao_k.i((p0..p1)).sum_axes(0));
+                *&mut de_k.i_mut((.., atm)).assign(dao_k.i(p0..p1).sum_axes(0));
+            }
+            if self.flags.omega.is_some() {
+                *&mut de_sr.i_mut((.., atm)).assign(dao_sr.i(p0..p1).sum_axes(0));
             }
 
             let [_, _, p0, p1] = aux_slice[atm].clone().try_into().unwrap();
             if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
-                *&mut de_jaux.i_mut((.., atm)).assign(daux_j.i((p0..p1)).sum_axes(0));
+                *&mut de_jaux.i_mut((.., atm)).assign(daux_j.i(p0..p1).sum_axes(0));
             }
             if self.flags.factor_k.is_some() && self.flags.auxbasis_response {
-                *&mut de_kaux.i_mut((.., atm)).assign(daux_k.i((p0..p1)).sum_axes(0));
+                *&mut de_kaux.i_mut((.., atm)).assign(daux_k.i(p0..p1).sum_axes(0));
+            }
+            if self.flags.omega.is_some() && self.flags.auxbasis_response {
+                *&mut de_sraux.i_mut((.., atm)).assign(daux_sr.i(p0..p1).sum_axes(0));
             }
         }
 
@@ -357,38 +454,35 @@ impl RIRHFGradient<'_> {
             de_jaux *= factor_j;
         }
         if let Some(factor_k) = self.flags.factor_k {
-            de_k *= -0.5 * factor_k;
-            de_kaux *= -0.5 * factor_k;
+            if self.flags.omega.is_some() {
+                // rsh case: full exchange = alpha
+                let alpha = self.flags.factor_alpha.unwrap_or(0.0);
+                de_k *= -0.5 * alpha;
+                de_kaux *= -0.5 * alpha;
+            } else {
+                de_k *= -0.5 * factor_k;
+                de_kaux *= -0.5 * factor_k;
+            }
+        }
+        if self.flags.omega.is_some() {
+            // rsh case: short range = - (alpha - hyb)
+            let alpha = self.flags.factor_alpha.unwrap_or(0.0);
+            let hyb = self.flags.factor_k.unwrap_or(0.0);
+            de_sr *= 0.5 * (alpha - hyb);
+            de_sraux *= 0.5 * (alpha - hyb);
         }
 
-        let de_j = {
-            let de_j_raw = de_j.into_raw_parts().0.into_cpu_vec().unwrap();
-            MatrixFull::from_vec([3, natm], de_j_raw).unwrap()
-        };
-        let de_jaux = {
-            let de_jaux_raw = de_jaux.into_raw_parts().0.into_cpu_vec().unwrap();
-            MatrixFull::from_vec([3, natm], de_jaux_raw).unwrap()
-        };
-        let de_k = {
-            let de_k_raw = de_k.into_raw_parts().0.into_cpu_vec().unwrap();
-            MatrixFull::from_vec([3, natm], de_k_raw).unwrap()
-        };
-        let de_kaux = {
-            let de_kaux_raw = de_kaux.into_raw_parts().0.into_cpu_vec().unwrap();
-            MatrixFull::from_vec([3, natm], de_kaux_raw).unwrap()
-        };
-
-        if self.flags.factor_j.is_some() {
-            self.result.insert("de_j".into(), de_j);
-        }
-        if self.flags.factor_k.is_some() {
-            self.result.insert("de_k".into(), de_k);
-        }
-        if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
-            self.result.insert("de_jaux".into(), de_jaux);
-        }
-        if self.flags.factor_k.is_some() && self.flags.auxbasis_response {
-            self.result.insert("de_kaux".into(), de_kaux);
+        for (key, de_part, flag) in [
+            ("de_j", de_j, self.flags.factor_j.is_some()),
+            ("de_k", de_k, self.flags.factor_k.is_some()),
+            ("de_sr", de_sr, self.flags.omega.is_some()),
+            ("de_jaux", de_jaux, self.flags.factor_j.is_some() && self.flags.auxbasis_response),
+            ("de_kaux", de_kaux, self.flags.factor_k.is_some() && self.flags.auxbasis_response),
+            ("de_sraux", de_sraux, self.flags.omega.is_some() && self.flags.auxbasis_response),
+        ] {
+            let de_sraw = de_part.into_shape(-1).into_raw();
+            let de_part = MatrixFull::from_vec([3, natm], de_sraw).unwrap();
+            flag.then(|| self.result.insert(key.into(), de_part));
         }
 
         return self;
@@ -518,8 +612,10 @@ impl RIRHFGradient<'_> {
         de += self.result.get("de_hcore").unwrap().clone();
         self.result.get("de_j").map(|x| de += x.clone());
         self.result.get("de_k").map(|x| de += x.clone());
+        self.result.get("de_sr").map(|x| de += x.clone());
         self.result.get("de_jaux").map(|x| de += x.clone());
         self.result.get("de_kaux").map(|x| de += x.clone());
+        self.result.get("de_sraux").map(|x| de += x.clone());
         self.result.get("de_qmmm").map(|x| de += x.clone());
         self.result.insert("de".into(), de);
 
@@ -532,8 +628,8 @@ impl RIRHFGradient<'_> {
 }
 
 pub fn generator_deriv_hcore<'a>(scf_data: &'a SCF) -> impl FnMut(usize) -> Tsr<f64> + 'a {
-    let mut mol = scf_data.mol.clone();
-    let mut cint_data = mol.initialize_cint(false);
+    let mut mol_obj = scf_data.mol.clone();
+    let mol = ri_jk::util::get_cint_mol(&mol_obj);
     let device = DeviceBLAS::default();
 
     let necp_by_atom = {
@@ -543,44 +639,44 @@ pub fn generator_deriv_hcore<'a>(scf_data: &'a SCF) -> impl FnMut(usize) -> Tsr<
     let has_ecp = necp_by_atom.iter().any(|&x| x > 0);
 
     let tsr_int1e_ipkin = {
-        let (out, shape) = cint_data.integral_s1::<int1e_ipkin>(None);
+        let (out, shape) = mol.integrate("int1e_ipkin", "s1", None).into();
         rt::asarray((out, shape, &device))
     };
 
     let tsr_int1e_ipnuc = {
-        let (out, shape) = cint_data.integral_s1::<int1e_ipnuc>(None);
+        let (out, shape) = mol.integrate("int1e_ipnuc", "s1", None).into();
         rt::asarray((out, shape, &device))
     };
 
     let mut h1 = -(tsr_int1e_ipkin + tsr_int1e_ipnuc);
 
     if has_ecp {
-        let (out, shape) = cint_data.integral_ecp_s1::<ECPscalar_ipnuc>(None);
+        let (out, shape) = mol.integrate("ECPscalar_ipnuc", "s1", None).into();
         let tsr_int1e_ecp_ipnuc = rt::asarray((out, shape, &device));
         h1 -= tsr_int1e_ecp_ipnuc;
     }
-    let aoslice_by_atom = mol.aoslice_by_atom();
-    let charge_by_atom = crate::geom_io::get_charge(&mol.geom.elem);
+    let aoslice_by_atom = mol_obj.aoslice_by_atom();
+    let charge_by_atom = crate::geom_io::get_charge(&mol_obj.geom.elem);
 
     move |atm_id| {
         let [_, _, p0, p1] = aoslice_by_atom[atm_id];
-        mol.with_rinv_at_nucleus(atm_id, |mol| {
-            let mut cint_data = mol.initialize_cint(false);
+        mol_obj.with_rinv_at_nucleus(atm_id, |mol_obj| {
+            let mol = ri_jk::util::get_cint_mol(&mol_obj);
 
             let tsr_int1e_iprinv = {
-                let (out, shape) = cint_data.integral_s1::<int1e_iprinv>(None);
+                let (out, shape) = mol.integrate("int1e_iprinv", "s1", None).into();
                 rt::asarray((out, shape, &device))
             };
 
             let mut vrinv = -((&charge_by_atom)[atm_id] - (&necp_by_atom)[atm_id] as f64) * tsr_int1e_iprinv;
 
             if has_ecp && necp_by_atom[atm_id] > 0 {
-                let (out, shape) = cint_data.integral_ecp_s1::<ECPscalar_iprinv>(None);
+                let (out, shape) = mol.integrate("ECPscalar_iprinv", "s1", None).into();
                 let tsr_int1e_ecp_iprinv = rt::asarray((out, shape, &device));
                 vrinv += tsr_int1e_ecp_iprinv;
             }
 
-            *&mut vrinv.i_mut((p0..p1)) += &h1.i((p0..p1));
+            *&mut vrinv.i_mut(p0..p1) += &h1.i(p0..p1);
             (&vrinv + vrinv.swapaxes(0, 1)).into_contig(FlagOrder::F)
         })
     }
@@ -637,7 +733,7 @@ pub fn calc_de_nuc(mol: &Molecule) -> MatrixFull<f64> {
     let de_nuc = tmp.sum_axes(1);
 
     let de_nuc = {
-        let de_nuc_raw = de_nuc.into_raw_parts().0.into_cpu_vec().unwrap();
+        let de_nuc_raw = de_nuc.into_shape(-1).into_raw();
         MatrixFull::from_vec([3, natm], de_nuc_raw).unwrap()
     };
 
@@ -669,9 +765,9 @@ pub fn get_grad_dao_ovlp(tsr_int1e_ipovlp: TsrView<f64>, dme0: TsrView<f64>) -> 
     return 2.0 * (tsr_int1e_ipovlp * dme0.i((.., .., None))).sum_axes(1);
 }
 
-pub fn get_itm_j(tsr_int2c2e_l_inv: TsrView<f64>, ederi_utp: TsrView<f64>, dm_tp: TsrView<f64>) -> Tsr<f64> {
+pub fn get_itm_j(j2c_decomp: &J2CDecompose, ederi_utp: TsrView<f64>, dm_tp: TsrView<f64>) -> Tsr<f64> {
     // see module level documentation for details
-    return dm_tp % ederi_utp % tsr_int2c2e_l_inv;
+    return get_solved_j3c(dm_tp % ederi_utp, j2c_decomp, true);
 }
 
 pub fn get_grad_daux_j_int2c2e_ip1(tsr_int2c2e_ip1: TsrView<f64>, itm_j: TsrView<f64>) -> Tsr<f64> {
@@ -716,20 +812,19 @@ pub fn get_grad_daux_j_int3c2e_ip2(
 }
 
 pub fn get_itm_k_occtp(
-    tsr_int2c2e_l_inv: TsrView<f64>,
+    j2c_decomp: &J2CDecompose,
     ederi_utp: TsrView<f64>,
     weighted_occ_coeff: TsrView<f64>,
 ) -> Tsr<f64> {
     // see module level documentation for details
-    assert!(tsr_int2c2e_l_inv.f_prefer());
     assert!(ederi_utp.f_prefer());
     assert!(weighted_occ_coeff.f_prefer());
 
     let nocc = weighted_occ_coeff.shape()[1];
     let naux = ederi_utp.shape()[1];
     let nocc_tp = nocc * (nocc + 1) / 2;
-    let device = tsr_int2c2e_l_inv.device().clone();
-    let mut tmp: Tsr<f64> = unsafe { rt::empty(([nocc_tp, naux], &device)) };
+    let device = ederi_utp.device().clone();
+    let tmp: Tsr<f64> = unsafe { rt::empty(([nocc_tp, naux], &device)) };
     (0..naux).into_par_iter().for_each(|p| {
         let ederi_bb = ederi_utp.i((.., p)).unpack_triu(FlagSymm::Sy);
         let ederi_oo = weighted_occ_coeff.t() % ederi_bb % &weighted_occ_coeff;
@@ -737,19 +832,16 @@ pub fn get_itm_k_occtp(
         let mut tmp = unsafe { tmp.force_mut() };
         tmp.i_mut((.., p)).assign(ederi_oo.pack_triu());
     });
-    let itm_k_occ = tmp % tsr_int2c2e_l_inv;
-    return itm_k_occ;
+    get_solved_j3c(tmp, j2c_decomp, true)
 }
 
 pub fn get_itm_k_aux(mut itm_k_occtp: TsrMut<f64>) -> Tsr<f64> {
     // see module level documentation for details
     assert!(itm_k_occtp.f_prefer());
 
-    let naux = itm_k_occtp.shape()[1];
     let nocc_tp = itm_k_occtp.shape()[0];
     let nocc = ((2 * nocc_tp) as f64).sqrt().floor().to_usize().unwrap();
     assert_eq!(nocc * (nocc + 1) / 2, nocc_tp);
-    let device = itm_k_occtp.device().clone();
 
     // modify diag elements in-place
     for i in 0..nocc {
@@ -803,7 +895,7 @@ pub fn get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1: TsrView<f64>, itm_k_ao: TsrVi
     let nao = tsr_int3c2e_ip1.shape()[0];
     let device = tsr_int3c2e_ip1.device().clone();
 
-    let mut tmp = unsafe { rt::empty(([nao, 3, naux], &device)) };
+    let tmp = unsafe { rt::empty(([nao, 3, naux], &device)) };
     (0..naux).into_par_iter().for_each(|p| {
         let mut tmp = unsafe { tmp.force_mut() };
         for t in 0..3 {
@@ -827,291 +919,16 @@ pub fn get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2: TsrView<f64>, itm_k_ao: TsrV
     let daux_k_int3c2e_ip2 = rt::zeros(([naux, 3], &device));
     (0..naux).into_par_iter().for_each(|p| {
         let mut itm_k_ao_p = itm_k_ao.i((.., .., p)).pack_triu();
-        for u in (0..nao) {
+        for u in 0..nao {
             let idx = (u + 2) * (u + 1) / 2 - 1;
             itm_k_ao_p[[idx]] *= 0.5;
         }
         let tmp = -2.0 * (itm_k_ao_p % tsr_int3c2e_ip2.i((.., p)));
 
         let mut daux_k_int3c2e_ip2 = unsafe { daux_k_int3c2e_ip2.force_mut() };
-        *&mut daux_k_int3c2e_ip2.i_mut((p)) += tmp;
+        *&mut daux_k_int3c2e_ip2.i_mut(p) += tmp;
     });
     return daux_k_int3c2e_ip2;
 }
 
 /* #endregion */
-
-#[cfg(test)]
-#[allow(non_snake_case)]
-mod debug {
-    use super::*;
-    //use crate::ctrl_io::{parse_ctl_from_json, InputKeywords};
-    use crate::scf_io::scf_without_build;
-
-    #[test]
-    fn test_nh3() {
-        let scf_data = initialize_nh3();
-        let time = std::time::Instant::now();
-        let scf_grad = test_with_scf(&scf_data);
-        println!("Time elapsed: {:?}", time.elapsed());
-
-        let de = scf_grad.result.get("de").unwrap().clone();
-        let de = rt::asarray((de.data, de.size));
-        #[rustfmt::skip]
-        let de_ref = vec![
-            -0.1137786866, -0.1161365056, -0.1125150713,
-             0.0004215289,  0.0659156136,  0.0553809300,
-             0.0630962392,  0.0488708661, -0.0140011525,
-             0.0502609185,  0.0013500258,  0.0711352938,
-        ];
-        let de_ref = rt::asarray((&de_ref, [3, 4]));
-        println!("Maximum Error {:?}", (&de_ref - &de).abs().max_all());
-        assert!((de_ref - de).abs().max_all() < 1.0e-5);
-    }
-
-    #[test]
-    fn test_hi() {
-        let scf_data = initialize_hi();
-        let time = std::time::Instant::now();
-        let scf_grad = test_with_scf(&scf_data);
-        println!("Time elapsed: {:?}", time.elapsed());
-
-        let de = scf_grad.result.get("de").unwrap().clone();
-        let de = rt::asarray((de.data, de.size));
-        #[rustfmt::skip]
-        let de_ref = vec![
-            -0.0000000000, -0.0000000000, -0.0515725566,
-             0.0000000000, -0.0000000000,  0.0515725566,
-        ];
-        let de_ref = rt::asarray((&de_ref, [3, 2]));
-        assert!((de_ref - de).abs().max_all() < 1.0e-5);
-    }
-
-    #[test]
-    #[ignore = "stress test"]
-    fn test_c12h26() {
-        let scf_data = initialize_c12h26();
-        let time = std::time::Instant::now();
-        test_with_scf(&scf_data);
-        println!("Time elapsed: {:?}", time.elapsed());
-    }
-
-    fn test_with_scf(scf_data: &'_ SCF) -> RIRHFGradient<'_> {
-        let mut scf_grad = RIRHFGradient::new(scf_data);
-        scf_grad.calc();
-
-        println!("=== de ===");
-        let de = scf_grad.result.get("de").unwrap().clone();
-        let de = rt::asarray((de.data, de.size));
-        println!("{:12.6}", de.t());
-
-        println!("=== de_nuc ===");
-        scf_grad.result.get("de_nuc").map(|de| {
-            let de = rt::asarray((&de.data, de.size));
-            println!("{:12.6}", de.t());
-        });
-
-        println!("=== de_ovlp ===");
-        scf_grad.result.get("de_ovlp").map(|de| {
-            let de = rt::asarray((&de.data, de.size));
-            println!("{:12.6}", de.t());
-        });
-
-        println!("=== de_hcore ===");
-        scf_grad.result.get("de_hcore").map(|de| {
-            let de = rt::asarray((&de.data, de.size));
-            println!("{:12.6}", de.t());
-        });
-
-        println!("=== de_j ===");
-        scf_grad.result.get("de_j").map(|de| {
-            let de = rt::asarray((&de.data, de.size));
-            println!("{:12.6}", de.t());
-        });
-
-        println!("=== de_k ===");
-        scf_grad.result.get("de_k").map(|de| {
-            let de = rt::asarray((&de.data, de.size));
-            println!("{:12.6}", de.t());
-        });
-
-        println!("=== de_jaux ===");
-        scf_grad.result.get("de_jaux").map(|de| {
-            let de = rt::asarray((&de.data, de.size));
-            println!("{:12.6}", de.t());
-        });
-
-        println!("=== de_kaux ===");
-        scf_grad.result.get("de_kaux").map(|de| {
-            let de = rt::asarray((&de.data, de.size));
-            println!("{:12.6}", de.t());
-        });
-
-        return scf_grad;
-    }
-
-    fn initialize_nh3() -> SCF {
-        let input_token = r##"
-[ctrl]
-     print_level =          2
-     xc =                   "mp2"
-     basis_path =           "basis-set-pool/def2-TZVP"
-     auxbas_path =          "basis-set-pool/def2-SVP-JKFIT"
-     basis_type =           "spheric"
-     eri_type =             "ri-v"
-     auxbas_type =          "spheric"
-     guessfile =            "none"
-     chkfile =              "none"
-     charge =               0.0
-     spin =                 1.0
-     spin_polarization =    false
-     auxbasis_response =    true
-     external_grids =       "none"
-     initial_guess=         "sad"
-     mixer =                "diis"
-     num_max_diis =         8
-     start_diis_cycle =     3
-     mix_param =            0.8
-     max_scf_cycle =        100
-     scf_acc_rho =          1.0e-10
-     scf_acc_eev =          1.0e-10
-     scf_acc_etot =         1.0e-11
-     num_threads =          16
-
-[geom]
-    name = "NH3"
-    unit = "Angstrom"
-    position = """
-        N  0.0  0.0  0.0
-        H  0.0  1.5  1.0
-        H  1.4  1.1  0.0
-        H  1.2  0.0  1.3
-    """
-"##;
-        let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
-        let (mut ctrl, mut geom) = crate::ctrl_io::parse_ctl_from_json(&keys).unwrap();
-        let mol = Molecule::build_native(ctrl, geom, None).unwrap();
-        let mut scf_data = scf_io::SCF::build(mol, &None);
-        scf_without_build(&mut scf_data, &None);
-        return scf_data;
-    }
-
-    fn initialize_hi() -> SCF {
-        let input_token = r##"
-[ctrl]
-     # 设置程序输出的程度，缺省为1
-     print_level =               2
-     # 设置Rayon和OpenMP的并行数，缺省为1
-     num_threads =               16
-     # 设置使用的电子结构方法，缺省为HF
-     xc =                        "mp2" 
-     basis_path =                "basis-set-pool/def2-TZVP"
-     auxbas_path =               "basis-set-pool/def2-SV(P)-JKFIT"
-     charge =                    0.0
-     spin =                      1.0
-     spin_polarization =         false
-     mixer =                     "diis"
-     num_max_diis =              8
-     start_diis_cycle =          1
-     mix_param =                 0.6
-     max_scf_cycle =             100
-     initial_guess =             "hcore"
-     auxbasis_response =         true
-
-[geom]
-    name = "HI"
-    unit = "Angstrom"
-    position = """
-        H   0.0  0.0  0.0
-        I   0.0  0.0  3.0
-    """
-"##;
-        let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
-        let (mut ctrl, mut geom) = crate::ctrl_io::parse_ctl_from_json(&keys).unwrap();
-        let mol = Molecule::build_native(ctrl, geom, None).unwrap();
-        let mut scf_data = scf_io::SCF::build(mol, &None);
-        scf_without_build(&mut scf_data, &None);
-        return scf_data;
-    }
-
-    fn initialize_c12h26() -> SCF {
-        let input_token = r##"
-[ctrl]
-     print_level =          2
-     xc =                   "mp2"
-     basis_path =           "basis-set-pool/def2-TZVP"
-     auxbas_path =          "basis-set-pool/def2-SVP-JKFIT"
-     basis_type =           "spheric"
-     eri_type =             "ri-v"
-     auxbas_type =          "spheric"
-     guessfile =            "none"
-     chkfile =              "none"
-     charge =               0.0
-     spin =                 1.0
-     spin_polarization =    false
-     external_grids =       "none"
-     initial_guess=         "sad"
-     mixer =                "diis"
-     num_max_diis =         8
-     start_diis_cycle =     3
-     mix_param =            0.8
-     max_scf_cycle =        100
-     scf_acc_rho =          1.0e-6
-     scf_acc_eev =          1.0e-9
-     scf_acc_etot =         1.0e-11
-     num_threads =          16
-     auxbasis_response =    true
-     max_memory =           10240
-
-[geom]
-    name = "C12H26"
-    unit = "Angstrom"
-    position = """
-        C          0.99590        0.00874        0.02912
-        C          2.51497        0.01491        0.04092
-        C          3.05233        0.96529        1.10755
-        C          4.57887        0.97424        1.12090
-        C          5.10652        1.92605        2.19141
-        C          6.63201        1.93944        2.20819
-        C          7.15566        2.89075        3.28062
-        C          8.68124        2.90423        3.29701
-        C          9.20897        3.85356        4.36970
-        C         10.73527        3.86292        4.38316
-        C         11.27347        4.81020        5.45174
-        C         12.79282        4.81703        5.46246
-        H          0.62420       -0.67624       -0.73886
-        H          0.60223        1.00743       -0.18569
-        H          0.59837       -0.31563        0.99622
-        H          2.88337        0.31565       -0.94674
-        H          2.87961       -1.00160        0.22902
-        H          2.67826        0.66303        2.09347
-        H          2.68091        1.98005        0.91889
-        H          4.95608        1.27969        0.13728
-        H          4.95349       -0.03891        1.31112
-        H          4.72996        1.62033        3.17524
-        H          4.73142        2.93925        2.00202
-        H          7.00963        2.24697        1.22537
-        H          7.00844        0.92672        2.39728
-        H          6.77826        2.58280        4.26344
-        H          6.77905        3.90354        3.09209
-        H          9.05732        3.21220        2.31361
-        H          9.05648        1.89051        3.48373
-        H          8.83233        3.54509        5.35255
-        H          8.83406        4.86718        4.18229
-        H         11.10909        4.16750        3.39797
-        H         11.10701        2.84786        4.56911
-        H         10.90576        4.50686        6.43902
-        H         10.90834        5.82716        5.26681
-        H         13.18649        3.81699        5.67312
-        H         13.16432        5.49863        6.23161
-        H         13.18931        5.14445        4.49536
-    """
-"##;
-        let keys = toml::from_str::<serde_json::Value>(&input_token[..]).unwrap();
-        let (mut ctrl, mut geom) = crate::ctrl_io::parse_ctl_from_json(&keys).unwrap();
-        let mol = Molecule::build_native(ctrl, geom, None).unwrap();
-        let mut scf_data = scf_io::SCF::build(mol, &None);
-        scf_without_build(&mut scf_data, &None);
-        return scf_data;
-    }
-}
