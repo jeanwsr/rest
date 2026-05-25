@@ -29,7 +29,7 @@ use crate::lib_rint::basis::{
     load_molecule_rint_shells_from_raw, load_molecule_shell_shared_from_raw,
     transform_density_to_cartesian_shell_shared, transform_mo_coeff_to_cartesian_shell_shared,
 };
-pub use basis::{make_contracted_coeffs_for_shell, BasisFunction, RintShell};
+pub use basis::{make_contracted_coeffs_for_shell, BasisFunction, RintContractedShell, RintShell};
 mod find_polyroots;
 use find_polyroots::find_polyroots;
 mod rys_coeffs_provider;
@@ -3028,6 +3028,248 @@ fn build_4c_block_entries_into(
     }
 }
 
+#[derive(Clone, Copy)]
+struct Rint4cContractedBlockEntry {
+    a_cart: usize,
+    b_cart: usize,
+    c_cart: usize,
+    d_cart: usize,
+    x_idx: usize,
+    y_idx: usize,
+    z_idx: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TotalAng2ContractedTarget4c {
+    a_cart: usize,
+    b_cart: usize,
+    c_cart: usize,
+    d_cart: usize,
+    kind: u8,
+    ang: [u32; 3],
+    left_axis: usize,
+    right_axis: usize,
+}
+
+fn build_4c_contracted_block_entries_into(
+    a: &RintContractedShell,
+    b: &RintContractedShell,
+    c: &RintContractedShell,
+    d: &RintContractedShell,
+    entries: &mut Vec<Rint4cContractedBlockEntry>,
+) {
+    entries.clear();
+    entries.reserve(a.cart_len * b.cart_len * c.cart_len * d.cart_len);
+    let nj_dim = (b.l + 1) as usize;
+    let nk_dim = (c.l + d.l + 1) as usize;
+    let nl_dim = (d.l + 1) as usize;
+    for l in 0..d.cart_len {
+        let d_ang = d.cart_components[l];
+        for k in 0..c.cart_len {
+            let c_ang = c.cart_components[k];
+            for j in 0..b.cart_len {
+                let b_ang = b.cart_components[j];
+                for i in 0..a.cart_len {
+                    let a_ang = a.cart_components[i];
+                    entries.push(Rint4cContractedBlockEntry {
+                        a_cart: i,
+                        b_cart: j,
+                        c_cart: k,
+                        d_cart: l,
+                        x_idx: rys_transfer_table_4c_idx(
+                            a_ang[0], b_ang[0], c_ang[0], d_ang[0], nj_dim, nk_dim, nl_dim,
+                        ),
+                        y_idx: rys_transfer_table_4c_idx(
+                            a_ang[1], b_ang[1], c_ang[1], d_ang[1], nj_dim, nk_dim, nl_dim,
+                        ),
+                        z_idx: rys_transfer_table_4c_idx(
+                            a_ang[2], b_ang[2], c_ang[2], d_ang[2], nj_dim, nk_dim, nl_dim,
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn build_total_ang2_contracted_targets_4c(
+    a: &RintContractedShell,
+    b: &RintContractedShell,
+    c: &RintContractedShell,
+    d: &RintContractedShell,
+) -> Option<([TotalAng2ContractedTarget4c; 16], usize)> {
+    let mut targets = [TotalAng2ContractedTarget4c {
+        a_cart: 0,
+        b_cart: 0,
+        c_cart: 0,
+        d_cart: 0,
+        kind: 0,
+        ang: [0; 3],
+        left_axis: 0,
+        right_axis: 0,
+    }; 16];
+    let mut target_len = 0_usize;
+    let mut push_target = |target: TotalAng2ContractedTarget4c| -> Option<()> {
+        if target_len >= targets.len() {
+            return None;
+        }
+        targets[target_len] = target;
+        target_len += 1;
+        Some(())
+    };
+
+    if a.l == 2 {
+        for i in 0..a.cart_len {
+            push_target(TotalAng2ContractedTarget4c {
+                a_cart: i,
+                b_cart: 0,
+                c_cart: 0,
+                d_cart: 0,
+                kind: 0,
+                ang: a.cart_components[i],
+                left_axis: 0,
+                right_axis: 0,
+            })?;
+        }
+    } else if b.l == 2 {
+        for j in 0..b.cart_len {
+            push_target(TotalAng2ContractedTarget4c {
+                a_cart: 0,
+                b_cart: j,
+                c_cart: 0,
+                d_cart: 0,
+                kind: 1,
+                ang: b.cart_components[j],
+                left_axis: 0,
+                right_axis: 0,
+            })?;
+        }
+    } else if c.l == 2 {
+        for k in 0..c.cart_len {
+            push_target(TotalAng2ContractedTarget4c {
+                a_cart: 0,
+                b_cart: 0,
+                c_cart: k,
+                d_cart: 0,
+                kind: 2,
+                ang: c.cart_components[k],
+                left_axis: 0,
+                right_axis: 0,
+            })?;
+        }
+    } else if d.l == 2 {
+        for l in 0..d.cart_len {
+            push_target(TotalAng2ContractedTarget4c {
+                a_cart: 0,
+                b_cart: 0,
+                c_cart: 0,
+                d_cart: l,
+                kind: 3,
+                ang: d.cart_components[l],
+                left_axis: 0,
+                right_axis: 0,
+            })?;
+        }
+    } else if a.l == 1 && b.l == 1 {
+        for j in 0..b.cart_len {
+            let b_axis = single_p_axis(b.cart_components[j]);
+            for i in 0..a.cart_len {
+                push_target(TotalAng2ContractedTarget4c {
+                    a_cart: i,
+                    b_cart: j,
+                    c_cart: 0,
+                    d_cart: 0,
+                    kind: 4,
+                    ang: [0; 3],
+                    left_axis: single_p_axis(a.cart_components[i]),
+                    right_axis: b_axis,
+                })?;
+            }
+        }
+    } else if a.l == 1 && c.l == 1 {
+        for k in 0..c.cart_len {
+            let c_axis = single_p_axis(c.cart_components[k]);
+            for i in 0..a.cart_len {
+                push_target(TotalAng2ContractedTarget4c {
+                    a_cart: i,
+                    b_cart: 0,
+                    c_cart: k,
+                    d_cart: 0,
+                    kind: 5,
+                    ang: [0; 3],
+                    left_axis: single_p_axis(a.cart_components[i]),
+                    right_axis: c_axis,
+                })?;
+            }
+        }
+    } else if a.l == 1 && d.l == 1 {
+        for l in 0..d.cart_len {
+            let d_axis = single_p_axis(d.cart_components[l]);
+            for i in 0..a.cart_len {
+                push_target(TotalAng2ContractedTarget4c {
+                    a_cart: i,
+                    b_cart: 0,
+                    c_cart: 0,
+                    d_cart: l,
+                    kind: 6,
+                    ang: [0; 3],
+                    left_axis: single_p_axis(a.cart_components[i]),
+                    right_axis: d_axis,
+                })?;
+            }
+        }
+    } else if b.l == 1 && c.l == 1 {
+        for k in 0..c.cart_len {
+            let c_axis = single_p_axis(c.cart_components[k]);
+            for j in 0..b.cart_len {
+                push_target(TotalAng2ContractedTarget4c {
+                    a_cart: 0,
+                    b_cart: j,
+                    c_cart: k,
+                    d_cart: 0,
+                    kind: 7,
+                    ang: [0; 3],
+                    left_axis: single_p_axis(b.cart_components[j]),
+                    right_axis: c_axis,
+                })?;
+            }
+        }
+    } else if b.l == 1 && d.l == 1 {
+        for l in 0..d.cart_len {
+            let d_axis = single_p_axis(d.cart_components[l]);
+            for j in 0..b.cart_len {
+                push_target(TotalAng2ContractedTarget4c {
+                    a_cart: 0,
+                    b_cart: j,
+                    c_cart: 0,
+                    d_cart: l,
+                    kind: 8,
+                    ang: [0; 3],
+                    left_axis: single_p_axis(b.cart_components[j]),
+                    right_axis: d_axis,
+                })?;
+            }
+        }
+    } else {
+        for l in 0..d.cart_len {
+            let d_axis = single_p_axis(d.cart_components[l]);
+            for k in 0..c.cart_len {
+                push_target(TotalAng2ContractedTarget4c {
+                    a_cart: 0,
+                    b_cart: 0,
+                    c_cart: k,
+                    d_cart: l,
+                    kind: 9,
+                    ang: [0; 3],
+                    left_axis: single_p_axis(c.cart_components[k]),
+                    right_axis: d_axis,
+                })?;
+            }
+        }
+    }
+    Some((targets, target_len))
+}
+
 struct RysTransferTable4c {
     data: Vec<f64>,
     nj_dim: usize,
@@ -3169,6 +3411,56 @@ fn build_primitive_pairs_4c(
                 exp_sum: p_sum,
                 scaled_coeff_over_exp_sum: scaled_coeff / p_sum,
                 center: gaussian_product_center(alpha, beta, &left.center, &right.center),
+            });
+        }
+    }
+    pairs
+}
+
+#[derive(Clone)]
+struct RintContractedPrimitivePair4c {
+    exp_sum: f64,
+    scaled_exp_over_exp_sum: f64,
+    center: [f64; 3],
+    coeff_products: Vec<f64>,
+}
+
+fn build_contracted_primitive_pairs_4c(
+    left: &RintContractedShell,
+    right: &RintContractedShell,
+    rab2: f64,
+) -> Vec<RintContractedPrimitivePair4c> {
+    let left_nctr = left.nctr();
+    let right_nctr = right.nctr();
+    let mut pairs = Vec::with_capacity(left.exponents.len() * right.exponents.len());
+    for (alpha_idx, &alpha) in left.exponents.iter().enumerate() {
+        for (beta_idx, &beta) in right.exponents.iter().enumerate() {
+            let p_sum = alpha + beta;
+            if p_sum <= 0.0 {
+                continue;
+            }
+            let p_fac = alpha * beta / p_sum;
+            let exp_factor = (-p_fac * rab2).exp();
+            if !exp_factor.is_finite() {
+                continue;
+            }
+            let mut coeff_products = Vec::with_capacity(left_nctr * right_nctr);
+            let mut any_nonzero = false;
+            for right_col in right.coeff_columns.iter() {
+                for left_col in left.coeff_columns.iter() {
+                    let coeff = left_col[alpha_idx] * right_col[beta_idx];
+                    any_nonzero |= coeff != 0.0;
+                    coeff_products.push(coeff);
+                }
+            }
+            if !any_nonzero {
+                continue;
+            }
+            pairs.push(RintContractedPrimitivePair4c {
+                exp_sum: p_sum,
+                scaled_exp_over_exp_sum: exp_factor / p_sum,
+                center: gaussian_product_center(alpha, beta, &left.center, &right.center),
+                coeff_products,
             });
         }
     }
@@ -4450,6 +4742,48 @@ fn build_shell_pair_primitive_pair_cache(
     cache
 }
 
+fn build_single_contraction_shell_views(shells: &[RintContractedShell]) -> Vec<RintShell> {
+    shells
+        .iter()
+        .map(|shell| RintShell {
+            atom_idx: shell.atom_idx,
+            center: shell.center,
+            shell: basis::Shell {
+                ang_type: shell.l,
+                exponents: shell.exponents.clone(),
+                coefficients: vec![shell
+                    .coeff_columns
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(Vec::new)],
+            },
+            column_idx: 0,
+            cart_components: shell.cart_components.clone(),
+            ao_start: shell.ao_start,
+            ao_len: shell.cart_len,
+            is_aux: shell.is_aux,
+        })
+        .collect()
+}
+
+fn build_contracted_shell_pair_primitive_pair_cache(
+    shells: &[RintContractedShell],
+) -> Vec<Vec<RintContractedPrimitivePair4c>> {
+    let pair_count = shells.len() * (shells.len() + 1) / 2;
+    let mut cache = vec![Vec::new(); pair_count];
+    for left_idx in 0..shells.len() {
+        for right_idx in 0..=left_idx {
+            let rank = shell_pair_rank(left_idx, right_idx);
+            cache[rank] = build_contracted_primitive_pairs_4c(
+                &shells[left_idx],
+                &shells[right_idx],
+                distance_squared(&shells[left_idx].center, &shells[right_idx].center),
+            );
+        }
+    }
+    cache
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_dense_1d_panel_for_t_into<C: CoeffProvider>(
     z: &mut RysSeedPanel2d,
@@ -5635,6 +5969,494 @@ fn int4c_r_shell_block_batched_into_data_with_pairs_workspace_entries_generic(
     shape
 }
 
+#[inline(always)]
+fn add_contracted_4c_cart_term_by_carts(
+    block_data: &mut [f64],
+    a: &RintContractedShell,
+    b: &RintContractedShell,
+    c: &RintContractedShell,
+    d: &RintContractedShell,
+    a_cart: usize,
+    b_cart: usize,
+    c_cart: usize,
+    d_cart: usize,
+    ab_pair: &RintContractedPrimitivePair4c,
+    cd_pair: &RintContractedPrimitivePair4c,
+    cart_term: f64,
+) {
+    if cart_term == 0.0 || !cart_term.is_finite() {
+        return;
+    }
+    let a_nctr = a.nctr();
+    let b_nctr = b.nctr();
+    let c_nctr = c.nctr();
+    let d_nctr = d.nctr();
+    let left_rows = a.ao_len * b.ao_len;
+    for d_ctr in 0..d_nctr {
+        let d_local = d_ctr * d.cart_len + d_cart;
+        for c_ctr in 0..c_nctr {
+            let cd_coeff = cd_pair.coeff_products[d_ctr * c_nctr + c_ctr];
+            if cd_coeff == 0.0 {
+                continue;
+            }
+            let c_local = c_ctr * c.cart_len + c_cart;
+            let col_offset = (d_local * c.ao_len + c_local) * left_rows;
+            let cd_term = cart_term * cd_coeff;
+            for b_ctr in 0..b_nctr {
+                let b_local = b_ctr * b.cart_len + b_cart;
+                let row_offset = col_offset + b_local * a.ao_len;
+                for a_ctr in 0..a_nctr {
+                    let ab_coeff = ab_pair.coeff_products[b_ctr * a_nctr + a_ctr];
+                    if ab_coeff == 0.0 {
+                        continue;
+                    }
+                    let term = cd_term * ab_coeff;
+                    if term.is_finite() {
+                        let a_local = a_ctr * a.cart_len + a_cart;
+                        block_data[row_offset + a_local] += term;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn add_contracted_4c_cart_term(
+    block_data: &mut [f64],
+    a: &RintContractedShell,
+    b: &RintContractedShell,
+    c: &RintContractedShell,
+    d: &RintContractedShell,
+    entry: &Rint4cContractedBlockEntry,
+    ab_pair: &RintContractedPrimitivePair4c,
+    cd_pair: &RintContractedPrimitivePair4c,
+    cart_term: f64,
+) {
+    add_contracted_4c_cart_term_by_carts(
+        block_data,
+        a,
+        b,
+        c,
+        d,
+        entry.a_cart,
+        entry.b_cart,
+        entry.c_cart,
+        entry.d_cart,
+        ab_pair,
+        cd_pair,
+        cart_term,
+    );
+}
+
+fn int4c_r_contracted_total_ang1_block_into_data_with_pairs(
+    a: &RintContractedShell,
+    b: &RintContractedShell,
+    c: &RintContractedShell,
+    d: &RintContractedShell,
+    ab_pairs: &[RintContractedPrimitivePair4c],
+    cd_pairs: &[RintContractedPrimitivePair4c],
+    block_data: &mut [f64],
+) {
+    let p_shell_id = if a.l == 1 {
+        0
+    } else if b.l == 1 {
+        1
+    } else if c.l == 1 {
+        2
+    } else {
+        3
+    };
+    for ab_pair in ab_pairs {
+        let p_sum = ab_pair.exp_sum;
+        let p_center = ab_pair.center;
+        for cd_pair in cd_pairs {
+            let q_sum = cd_pair.exp_sum;
+            let p_sum_q = p_sum + q_sum;
+            let pq_mul = p_sum * q_sum;
+            debug_assert!(p_sum > 0.0 && q_sum > 0.0 && p_sum_q > 0.0 && pq_mul > 0.0);
+
+            let rho = pq_mul / p_sum_q;
+            let t = rho * distance_squared(&p_center, &cd_pair.center);
+            let (f0, f1) = boys_f0_f1(t);
+            if f0 == 0.0 {
+                continue;
+            }
+            let root = f1 / f0;
+            if !root.is_finite() {
+                continue;
+            }
+            let pref = TWO_PI_POW_2P5 / p_sum_q.sqrt();
+            let primitive_scale =
+                ab_pair.scaled_exp_over_exp_sum * cd_pair.scaled_exp_over_exp_sum * pref * f0;
+            if !primitive_scale.is_finite() {
+                continue;
+            }
+
+            let scalars = rys_root_scalars_4c(root, p_sum, q_sum, p_sum_q);
+            let mut first = [[0.0_f64; 3]; 4];
+            for axis in 0..3 {
+                let rc = rys_axis_coeffs_4c_from_scalars(
+                    scalars,
+                    root,
+                    p_center[axis],
+                    cd_pair.center[axis],
+                    a.center[axis],
+                    c.center[axis],
+                );
+                first[0][axis] = rc.c00;
+                first[1][axis] = rc.c00 + a.center[axis] - b.center[axis];
+                first[2][axis] = rc.c00p;
+                first[3][axis] = rc.c00p + c.center[axis] - d.center[axis];
+            }
+
+            match p_shell_id {
+                0 => {
+                    for i in 0..a.cart_len {
+                        let axis = single_p_axis(a.cart_components[i]);
+                        add_contracted_4c_cart_term_by_carts(
+                            block_data,
+                            a,
+                            b,
+                            c,
+                            d,
+                            i,
+                            0,
+                            0,
+                            0,
+                            ab_pair,
+                            cd_pair,
+                            primitive_scale * first[0][axis],
+                        );
+                    }
+                }
+                1 => {
+                    for j in 0..b.cart_len {
+                        let axis = single_p_axis(b.cart_components[j]);
+                        add_contracted_4c_cart_term_by_carts(
+                            block_data,
+                            a,
+                            b,
+                            c,
+                            d,
+                            0,
+                            j,
+                            0,
+                            0,
+                            ab_pair,
+                            cd_pair,
+                            primitive_scale * first[1][axis],
+                        );
+                    }
+                }
+                2 => {
+                    for k in 0..c.cart_len {
+                        let axis = single_p_axis(c.cart_components[k]);
+                        add_contracted_4c_cart_term_by_carts(
+                            block_data,
+                            a,
+                            b,
+                            c,
+                            d,
+                            0,
+                            0,
+                            k,
+                            0,
+                            ab_pair,
+                            cd_pair,
+                            primitive_scale * first[2][axis],
+                        );
+                    }
+                }
+                _ => {
+                    for l in 0..d.cart_len {
+                        let axis = single_p_axis(d.cart_components[l]);
+                        add_contracted_4c_cart_term_by_carts(
+                            block_data,
+                            a,
+                            b,
+                            c,
+                            d,
+                            0,
+                            0,
+                            0,
+                            l,
+                            ab_pair,
+                            cd_pair,
+                            primitive_scale * first[3][axis],
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn int4c_r_contracted_total_ang2_block_into_data_with_pairs_targets(
+    a: &RintContractedShell,
+    b: &RintContractedShell,
+    c: &RintContractedShell,
+    d: &RintContractedShell,
+    ab_pairs: &[RintContractedPrimitivePair4c],
+    cd_pairs: &[RintContractedPrimitivePair4c],
+    block_data: &mut [f64],
+    targets: &[TotalAng2ContractedTarget4c; 16],
+    target_len: usize,
+) -> bool {
+    for ab_pair in ab_pairs {
+        let p_sum = ab_pair.exp_sum;
+        let p_center = ab_pair.center;
+        for cd_pair in cd_pairs {
+            let q_sum = cd_pair.exp_sum;
+            let p_sum_q = p_sum + q_sum;
+            let pq_mul = p_sum * q_sum;
+            debug_assert!(p_sum > 0.0 && q_sum > 0.0 && p_sum_q > 0.0 && pq_mul > 0.0);
+
+            let rho = pq_mul / p_sum_q;
+            let t = rho * distance_squared(&p_center, &cd_pair.center);
+            let pref = TWO_PI_POW_2P5 / p_sum_q.sqrt();
+            let primitive_coeff = ab_pair.scaled_exp_over_exp_sum * cd_pair.scaled_exp_over_exp_sum;
+            let mut roots = [0.0_f64; 2];
+            let mut weights = [0.0_f64; 2];
+            let nroots = rys_roots_weights_r_into(2, t, &mut roots, &mut weights);
+            if nroots != 2 {
+                return false;
+            }
+            for root_idx in 0..2 {
+                let values = rys_total_ang2_values(
+                    roots[root_idx],
+                    p_sum,
+                    q_sum,
+                    p_sum_q,
+                    &p_center,
+                    &cd_pair.center,
+                    &a.center,
+                    &b.center,
+                    &c.center,
+                    &d.center,
+                );
+                let primitive_scale = primitive_coeff * pref * weights[root_idx];
+                if !primitive_scale.is_finite() {
+                    continue;
+                }
+                for target in targets[..target_len].iter() {
+                    let value = total_ang2_target_value(
+                        TotalAng2Target4c {
+                            data_idx: 0,
+                            kind: target.kind,
+                            ang: target.ang,
+                            left_axis: target.left_axis,
+                            right_axis: target.right_axis,
+                        },
+                        &values,
+                    );
+                    add_contracted_4c_cart_term_by_carts(
+                        block_data,
+                        a,
+                        b,
+                        c,
+                        d,
+                        target.a_cart,
+                        target.b_cart,
+                        target.c_cart,
+                        target.d_cart,
+                        ab_pair,
+                        cd_pair,
+                        primitive_scale * value,
+                    );
+                }
+            }
+        }
+    }
+    true
+}
+
+fn add_primitive_4c_r_contracted_shell_block(
+    block_data: &mut [f64],
+    workspace: &mut RysTransferWorkspace4c,
+    a: &RintContractedShell,
+    b: &RintContractedShell,
+    c: &RintContractedShell,
+    d: &RintContractedShell,
+    entries: &[Rint4cContractedBlockEntry],
+    ab_pair: &RintContractedPrimitivePair4c,
+    cd_pair: &RintContractedPrimitivePair4c,
+) {
+    let p_sum = ab_pair.exp_sum;
+    let q_sum = cd_pair.exp_sum;
+    let p_sum_q = p_sum + q_sum;
+    let pq_mul = p_sum * q_sum;
+    debug_assert!(p_sum > 0.0 && q_sum > 0.0 && p_sum_q > 0.0 && pq_mul > 0.0);
+
+    let p_center = ab_pair.center;
+    let q_center = cd_pair.center;
+    let rpq2 = distance_squared(&p_center, &q_center);
+    let pref = TWO_PI_POW_2P5 / p_sum_q.sqrt();
+    let primitive_coeff = ab_pair.scaled_exp_over_exp_sum * cd_pair.scaled_exp_over_exp_sum;
+    let rho = pq_mul / p_sum_q;
+    let t = rho * rpq2;
+    let ni_max = a.l + b.l;
+    let nj_max = b.l;
+    let nk_max = c.l + d.l;
+    let nl_max = d.l;
+    if ni_max == 0 && nj_max == 0 && nk_max == 0 && nl_max == 0 {
+        let cart_term = primitive_coeff * pref * boys_f0(t);
+        if let Some(entry) = entries.first() {
+            add_contracted_4c_cart_term(block_data, a, b, c, d, entry, ab_pair, cd_pair, cart_term);
+        }
+        return;
+    }
+
+    let total_ang = a.l + b.l + c.l + d.l;
+    let nroots_required = (total_ang / 2 + 1) as usize;
+    let mut roots_stack = [0.0_f64; 16];
+    let mut weights_stack = [0.0_f64; 16];
+    let mut roots_heap = Vec::new();
+    let mut weights_heap = Vec::new();
+    let nroots = if nroots_required <= roots_stack.len() {
+        rys_roots_weights_r_into(nroots_required, t, &mut roots_stack, &mut weights_stack)
+    } else {
+        let (roots, weights) = rys_roots_weights_r(nroots_required, t);
+        if roots.len() == nroots_required && weights.len() == nroots_required {
+            roots_heap = roots;
+            weights_heap = weights;
+            nroots_required
+        } else {
+            0
+        }
+    };
+    if nroots == 0 {
+        return;
+    }
+
+    for root_idx in 0..nroots {
+        let (root, weight) = if nroots_required <= roots_stack.len() {
+            (roots_stack[root_idx], weights_stack[root_idx])
+        } else {
+            (roots_heap[root_idx], weights_heap[root_idx])
+        };
+        let scalars = rys_root_scalars_4c(root, p_sum, q_sum, p_sum_q);
+        build_rys_transfer_table_4c_direct(
+            &mut workspace.table_x,
+            &mut workspace.seed_panel,
+            rys_axis_coeffs_4c_from_scalars(
+                scalars,
+                root,
+                p_center[0],
+                q_center[0],
+                a.center[0],
+                c.center[0],
+            ),
+            ni_max,
+            nj_max,
+            nk_max,
+            nl_max,
+            a.center[0],
+            b.center[0],
+            c.center[0],
+            d.center[0],
+        );
+        build_rys_transfer_table_4c_direct(
+            &mut workspace.table_y,
+            &mut workspace.seed_panel,
+            rys_axis_coeffs_4c_from_scalars(
+                scalars,
+                root,
+                p_center[1],
+                q_center[1],
+                a.center[1],
+                c.center[1],
+            ),
+            ni_max,
+            nj_max,
+            nk_max,
+            nl_max,
+            a.center[1],
+            b.center[1],
+            c.center[1],
+            d.center[1],
+        );
+        build_rys_transfer_table_4c_direct(
+            &mut workspace.table_z,
+            &mut workspace.seed_panel,
+            rys_axis_coeffs_4c_from_scalars(
+                scalars,
+                root,
+                p_center[2],
+                q_center[2],
+                a.center[2],
+                c.center[2],
+            ),
+            ni_max,
+            nj_max,
+            nk_max,
+            nl_max,
+            a.center[2],
+            b.center[2],
+            c.center[2],
+            d.center[2],
+        );
+
+        let primitive_scale = primitive_coeff * pref * weight;
+        if primitive_scale == 0.0 || !primitive_scale.is_finite() {
+            continue;
+        }
+        for entry in entries {
+            debug_assert!(entry.x_idx < workspace.table_x.data.len());
+            debug_assert!(entry.y_idx < workspace.table_y.data.len());
+            debug_assert!(entry.z_idx < workspace.table_z.data.len());
+            let ix = unsafe { *workspace.table_x.data.get_unchecked(entry.x_idx) };
+            let iy = unsafe { *workspace.table_y.data.get_unchecked(entry.y_idx) };
+            let iz = unsafe { *workspace.table_z.data.get_unchecked(entry.z_idx) };
+            let cart_term = primitive_scale * ix * iy * iz;
+            add_contracted_4c_cart_term(block_data, a, b, c, d, entry, ab_pair, cd_pair, cart_term);
+        }
+    }
+}
+
+fn int4c_r_contracted_shell_block_batched_into_data_with_pairs_workspace_entries(
+    a: &RintContractedShell,
+    b: &RintContractedShell,
+    c: &RintContractedShell,
+    d: &RintContractedShell,
+    ab_pairs: &[RintContractedPrimitivePair4c],
+    cd_pairs: &[RintContractedPrimitivePair4c],
+    entries: &[Rint4cContractedBlockEntry],
+    block_data: &mut Vec<f64>,
+    workspace: &mut RysTransferWorkspace4c,
+) -> [usize; 2] {
+    let left_rows = a.ao_len * b.ao_len;
+    let right_cols = c.ao_len * d.ao_len;
+    let shape = [left_rows, right_cols];
+    block_data.resize(left_rows * right_cols, 0.0_f64);
+    block_data.fill(0.0);
+    let total_ang = a.l + b.l + c.l + d.l;
+    if total_ang == 1 {
+        int4c_r_contracted_total_ang1_block_into_data_with_pairs(
+            a, b, c, d, ab_pairs, cd_pairs, block_data,
+        );
+        return shape;
+    }
+    if total_ang == 2 {
+        if let Some((targets, target_len)) = build_total_ang2_contracted_targets_4c(a, b, c, d) {
+            if int4c_r_contracted_total_ang2_block_into_data_with_pairs_targets(
+                a, b, c, d, ab_pairs, cd_pairs, block_data, &targets, target_len,
+            ) {
+                return shape;
+            }
+        }
+    }
+    for ab_pair in ab_pairs {
+        for cd_pair in cd_pairs {
+            add_primitive_4c_r_contracted_shell_block(
+                block_data, workspace, a, b, c, d, entries, ab_pair, cd_pair,
+            );
+        }
+    }
+    shape
+}
+
 fn int4c_r_shell_block_batched(
     a: &RintShell,
     b: &RintShell,
@@ -5798,6 +6620,25 @@ fn build_unique_4c_shell_quartet_tasks(
     tasks
 }
 
+fn build_unique_4c_shell_quartet_tasks_for_count(
+    nshell: usize,
+) -> Vec<(usize, usize, usize, usize)> {
+    let mut tasks = Vec::new();
+    for a_idx in 0..nshell {
+        for b_idx in 0..=a_idx {
+            let ab_rank = shell_pair_rank(a_idx, b_idx);
+            for c_idx in 0..nshell {
+                for d_idx in 0..=c_idx {
+                    if shell_pair_rank(c_idx, d_idx) <= ab_rank {
+                        tasks.push((a_idx, b_idx, c_idx, d_idx));
+                    }
+                }
+            }
+        }
+    }
+    tasks
+}
+
 /// Full exact Coulomb four-center tensor generated from shell-block quartets.
 ///
 /// The returned vector stores `(mu nu | lam sig)` at
@@ -5857,6 +6698,115 @@ pub fn int4c_r_full_from_shell_blocks(ao_shells: &[RintShell]) -> Vec<f64> {
                 &mut block_data,
                 workspace,
             );
+        for l in 0..d_shell.ao_len {
+            let sig = d_shell.ao_start + l;
+            for k in 0..c_shell.ao_len {
+                let lam = c_shell.ao_start + k;
+                let col = l * c_shell.ao_len + k;
+                for j in 0..b_shell.ao_len {
+                    let nu = b_shell.ao_start + j;
+                    for i in 0..a_shell.ao_len {
+                        let mu = a_shell.ao_start + i;
+                        let row = j * a_shell.ao_len + i;
+                        set_eri4_symmetry(
+                            &mut eri,
+                            nao,
+                            mu,
+                            nu,
+                            lam,
+                            sig,
+                            block_data[col * left_rows + row],
+                        );
+                    }
+                }
+            }
+        }
+    }
+    eri
+}
+
+/// Full exact Coulomb four-center tensor generated from multi-contraction shell blocks.
+///
+/// This preserves the AO ordering of `expand_shell_shared_to_rint_shells`
+/// (contraction column first, Cartesian component second) while avoiding the
+/// front-end split of multi-contraction shells.
+pub fn int4c_r_full_from_contracted_shell_blocks(ao_shells: &[RintContractedShell]) -> Vec<f64> {
+    let nao = rint_contracted_shell_basis_count(ao_shells);
+    let mut eri = vec![0.0_f64; nao * nao * nao * nao];
+    let mut block_data = Vec::new();
+    let primitive_pair_cache = build_contracted_shell_pair_primitive_pair_cache(ao_shells);
+    let single_shells = build_single_contraction_shell_views(ao_shells);
+    let single_shell_coeffs = build_rint_shell_coefficient_cache(&single_shells);
+    let single_primitive_pair_cache =
+        build_shell_pair_primitive_pair_cache(&single_shells, &single_shell_coeffs);
+    let mut workspace_cache: HashMap<[u32; 4], RysTransferWorkspace4c> = HashMap::new();
+    let mut entry_cache: HashMap<[u32; 4], Vec<Rint4cContractedBlockEntry>> = HashMap::new();
+    let mut plan_cache: HashMap<[u32; 4], Rint4cCachedBlockPlan> = HashMap::new();
+
+    for (a_idx, b_idx, c_idx, d_idx) in
+        build_unique_4c_shell_quartet_tasks_for_count(ao_shells.len())
+    {
+        let a_shell = &ao_shells[a_idx];
+        let b_shell = &ao_shells[b_idx];
+        let c_shell = &ao_shells[c_idx];
+        let d_shell = &ao_shells[d_idx];
+        let workspace_key = [
+            a_shell.l + b_shell.l,
+            b_shell.l,
+            c_shell.l + d_shell.l,
+            d_shell.l,
+        ];
+        let workspace = workspace_cache.entry(workspace_key).or_insert_with(|| {
+            RysTransferWorkspace4c::new(
+                workspace_key[0],
+                workspace_key[1],
+                workspace_key[2],
+                workspace_key[3],
+            )
+        });
+        let [left_rows, _right_cols] = if a_shell.nctr() == 1
+            && b_shell.nctr() == 1
+            && c_shell.nctr() == 1
+            && d_shell.nctr() == 1
+        {
+            int4c_r_shell_block_batched_into_data_with_pairs_entry_cache(
+                &single_shells[a_idx],
+                &single_shells[b_idx],
+                &single_shells[c_idx],
+                &single_shells[d_idx],
+                &single_primitive_pair_cache[shell_pair_rank(a_idx, b_idx)],
+                &single_primitive_pair_cache[shell_pair_rank(c_idx, d_idx)],
+                &mut plan_cache,
+                &mut block_data,
+                workspace,
+            )
+        } else {
+            let ab_pairs = &primitive_pair_cache[shell_pair_rank(a_idx, b_idx)];
+            let cd_pairs = &primitive_pair_cache[shell_pair_rank(c_idx, d_idx)];
+            let entry_key = [a_shell.l, b_shell.l, c_shell.l, d_shell.l];
+            let entries = entry_cache.entry(entry_key).or_insert_with(|| {
+                let mut entries = Vec::new();
+                build_4c_contracted_block_entries_into(
+                    a_shell,
+                    b_shell,
+                    c_shell,
+                    d_shell,
+                    &mut entries,
+                );
+                entries
+            });
+            int4c_r_contracted_shell_block_batched_into_data_with_pairs_workspace_entries(
+                a_shell,
+                b_shell,
+                c_shell,
+                d_shell,
+                ab_pairs,
+                cd_pairs,
+                entries,
+                &mut block_data,
+                workspace,
+            )
+        };
         for l in 0..d_shell.ao_len {
             let sig = d_shell.ao_start + l;
             for k in 0..c_shell.ao_len {
@@ -6365,6 +7315,14 @@ struct RiShellBlockKernel {
 }
 
 fn rint_shell_basis_count(shells: &[RintShell]) -> usize {
+    shells
+        .iter()
+        .map(|shell| shell.ao_start + shell.ao_len)
+        .max()
+        .unwrap_or(0)
+}
+
+fn rint_contracted_shell_basis_count(shells: &[RintContractedShell]) -> usize {
     shells
         .iter()
         .map(|shell| shell.ao_start + shell.ao_len)
@@ -9005,179 +9963,6 @@ pub fn lib_vee_rhf_occpair_r(
     s1_occ_raw
 }
 
-fn occ_closure_occupied_coeff_matrix(
-    coeff: &MatrixFull<f64>,
-    occupation: &[f64],
-) -> MatrixFull<f64> {
-    let nao = coeff.size[0];
-    let occ_idx = occupation
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, value)| if *value > 1.0e-8 { Some(idx) } else { None })
-        .collect::<Vec<_>>();
-    let mut c_occ = MatrixFull::new([nao, occ_idx.len()], 0.0_f64);
-    for (i_occ, &i_mo) in occ_idx.iter().enumerate() {
-        for mu in 0..nao {
-            c_occ[(mu, i_occ)] = coeff[(mu, i_mo)];
-        }
-    }
-    c_occ
-}
-
-fn occ_closure_fragment_rimatr_operator_covariance(
-    rimatr: &MatrixFull<f64>,
-    nao: usize,
-    aoslice: &[[usize; 4]],
-    atoms: &[usize],
-    c_occ: &MatrixFull<f64>,
-    s_inv: &MatrixFull<f64>,
-) -> MatrixFull<f64> {
-    let nmode = rimatr.size[1];
-    let nocc = c_occ.size[1];
-    let mut frag_aos = Vec::new();
-    for &atom in atoms {
-        assert!(
-            atom < aoslice.len(),
-            "X_AB atom index {atom} is out of range for {} atoms",
-            aoslice.len()
-        );
-        let [_shl0, _shl1, p0, p1] = aoslice[atom];
-        frag_aos.extend(p0..p1);
-    }
-
-    let mut y_flat = MatrixFull::new([nao * nocc, nmode], 0.0_f64);
-    for &mu in &frag_aos {
-        for &nu in &frag_aos {
-            let pair = baspair_index(mu.max(nu), mu.min(nu));
-            for q in 0..nmode {
-                let value = rimatr[(pair, q)];
-                if value.abs() < 1.0e-18 {
-                    continue;
-                }
-                for i in 0..nocc {
-                    y_flat[(mu + nao * i, q)] += value * c_occ[(nu, i)];
-                }
-            }
-        }
-    }
-
-    let mut z_flat = MatrixFull::new([nao * nocc, nmode], 0.0_f64);
-    for q in 0..nmode {
-        for i in 0..nocc {
-            for mu in 0..nao {
-                let mut value = 0.0_f64;
-                for nu in 0..nao {
-                    value += s_inv[(mu, nu)] * y_flat[(nu + nao * i, q)];
-                }
-                z_flat[(mu + nao * i, q)] = value;
-            }
-        }
-    }
-
-    let mut occ_flat = MatrixFull::new([nocc * nocc, nmode], 0.0_f64);
-    for q in 0..nmode {
-        for j in 0..nocc {
-            for i in 0..nocc {
-                let mut value = 0.0_f64;
-                for mu in 0..nao {
-                    value += c_occ[(mu, i)] * y_flat[(mu + nao * j, q)];
-                }
-                occ_flat[(i + nocc * j, q)] = value;
-            }
-        }
-    }
-
-    let mut closure = MatrixFull::new([nmode, nmode], 0.0_f64);
-    closure.to_matrixfullslicemut().lapack_dgemm(
-        &y_flat.to_matrixfullslice(),
-        &z_flat.to_matrixfullslice(),
-        'T',
-        'N',
-        1.0,
-        0.0,
-    );
-    let mut occupied = MatrixFull::new([nmode, nmode], 0.0_f64);
-    occupied.to_matrixfullslicemut().lapack_dgemm(
-        &occ_flat.to_matrixfullslice(),
-        &occ_flat.to_matrixfullslice(),
-        'T',
-        'N',
-        1.0,
-        0.0,
-    );
-
-    let mut cov = MatrixFull::new([nmode, nmode], 0.0_f64);
-    for r in 0..nmode {
-        for q in 0..nmode {
-            cov[(q, r)] = 2.0 * (closure[(q, r)] - occupied[(q, r)]);
-        }
-    }
-    cov
-}
-
-pub fn lib_vee_rhf_occ_closure_connected_ri_coulomb_x(
-    scf_data: &crate::scf_io::SCF,
-    atoms_a: &[usize],
-    atoms_b: &[usize],
-) -> f64 {
-    assert!(
-        !atoms_a.is_empty() && !atoms_b.is_empty(),
-        "X_AB needs non-empty atom lists for fragments A and B"
-    );
-    let (ao_bfs, _p_cart) = load_cartesian_rhf_basis_and_density_shell_shared(
-        &scf_data.mol.geom,
-        &scf_data.mol.basis4elem,
-        &scf_data.density_matrix[0],
-        "lib_vee_rhf_occ_closure_connected_ri_coulomb_x",
-    );
-    let auxbasis4elem = build_default_r2_etb_auxbasis(&scf_data.mol.geom, &scf_data.mol.basis4elem)
-        .expect("default ETB auxiliary basis should be available for X_AB");
-    let aux_bfs = load_aux_molecule_shell_shared_from_raw(&scf_data.mol.geom, &auxbasis4elem)
-        .expect("failed to build auxiliary basis for X_AB");
-    let (rimatr, _basbas2baspar, _baspar2basbas) =
-        prepare_rimatr_for_r_sync(&ao_bfs, &aux_bfs).expect("failed to build RI-r matrix for X_AB");
-
-    let coeff_cart = transform_mo_coeff_to_cartesian_shell_shared(
-        &scf_data.mol.geom,
-        &scf_data.mol.basis4elem,
-        &scf_data.eigenvectors[0],
-        ao_bfs.len(),
-        "lib_vee_rhf_occ_closure_connected_ri_coulomb_x[coeff]",
-        false,
-    );
-    let c_occ = occ_closure_occupied_coeff_matrix(&coeff_cart, &scf_data.occupation[0]);
-    let mut ovlp = scf_data
-        .ovlp
-        .to_matrixfull()
-        .expect("overlap MatrixUpper -> full");
-    let s_inv = ovlp
-        .lapack_inverse()
-        .expect("overlap inverse should exist for X_AB");
-    let aoslice = scf_data.mol.aoslice_by_atom();
-    let cov_a = occ_closure_fragment_rimatr_operator_covariance(
-        &rimatr,
-        ao_bfs.len(),
-        &aoslice,
-        atoms_a,
-        &c_occ,
-        &s_inv,
-    );
-    let cov_b = occ_closure_fragment_rimatr_operator_covariance(
-        &rimatr,
-        ao_bfs.len(),
-        &aoslice,
-        atoms_b,
-        &c_occ,
-        &s_inv,
-    );
-
-    cov_a
-        .data
-        .iter()
-        .zip(cov_b.data.iter())
-        .fold(0.0_f64, |acc, (a, b)| acc + a * b)
-}
-
 #[cfg(test)]
 mod kernel_worst_quartet_tests {
     use super::*;
@@ -9673,341 +10458,6 @@ mod kernel_worst_quartet_tests {
         x
     }
 
-    fn fragment_mode_operators_from_rimatr(
-        rimatr: &MatrixFull<f64>,
-        nao: usize,
-        aoslice: &[[usize; 4]],
-        atoms: &[usize],
-    ) -> Vec<MatrixFull<f64>> {
-        let mut mask = vec![false; nao];
-        for &atom in atoms {
-            let [_shl0, _shl1, p0, p1] = aoslice[atom];
-            for ao in p0..p1 {
-                mask[ao] = true;
-            }
-        }
-
-        let nmode = rimatr.size[1];
-        let mut ops = (0..nmode)
-            .map(|_| MatrixFull::new([nao, nao], 0.0_f64))
-            .collect::<Vec<_>>();
-        for mu in 0..nao {
-            if !mask[mu] {
-                continue;
-            }
-            for nu in 0..=mu {
-                if !mask[nu] {
-                    continue;
-                }
-                let pair = baspair_index(mu, nu);
-                for q in 0..nmode {
-                    let value = rimatr[(pair, q)];
-                    ops[q][(mu, nu)] = value;
-                    ops[q][(nu, mu)] = value;
-                }
-            }
-        }
-        ops
-    }
-
-    fn one_body_operator_closure_covariance(
-        ops: &[MatrixFull<f64>],
-        c_occ: &MatrixFull<f64>,
-        s_inv: &MatrixFull<f64>,
-    ) -> MatrixFull<f64> {
-        let nmode = ops.len();
-        let nao = c_occ.size[0];
-        let nocc = c_occ.size[1];
-        let mut y_flat = MatrixFull::new([nao * nocc, nmode], 0.0_f64);
-        let mut z_flat = MatrixFull::new([nao * nocc, nmode], 0.0_f64);
-        let mut occ_flat = MatrixFull::new([nocc * nocc, nmode], 0.0_f64);
-
-        for (q, op) in ops.iter().enumerate() {
-            let y = matmul_nn(op, c_occ);
-            let z = matmul_nn(s_inv, &y);
-            let occ = matmul_tn(c_occ, &y);
-            for i in 0..nocc {
-                for mu in 0..nao {
-                    let row = mu + nao * i;
-                    y_flat[(row, q)] = y[(mu, i)];
-                    z_flat[(row, q)] = z[(mu, i)];
-                }
-            }
-            for j in 0..nocc {
-                for i in 0..nocc {
-                    occ_flat[(i + nocc * j, q)] = occ[(i, j)];
-                }
-            }
-        }
-
-        let mut closure = MatrixFull::new([nmode, nmode], 0.0_f64);
-        closure.to_matrixfullslicemut().lapack_dgemm(
-            &y_flat.to_matrixfullslice(),
-            &z_flat.to_matrixfullslice(),
-            'T',
-            'N',
-            1.0,
-            0.0,
-        );
-        let mut occupied = MatrixFull::new([nmode, nmode], 0.0_f64);
-        occupied.to_matrixfullslicemut().lapack_dgemm(
-            &occ_flat.to_matrixfullslice(),
-            &occ_flat.to_matrixfullslice(),
-            'T',
-            'N',
-            1.0,
-            0.0,
-        );
-
-        let mut cov = MatrixFull::new([nmode, nmode], 0.0_f64);
-        for r in 0..nmode {
-            for q in 0..nmode {
-                cov[(q, r)] = 2.0 * (closure[(q, r)] - occupied[(q, r)]);
-            }
-        }
-        cov
-    }
-
-    fn fragment_rimatr_operator_closure_covariance(
-        rimatr: &MatrixFull<f64>,
-        nao: usize,
-        aoslice: &[[usize; 4]],
-        atoms: &[usize],
-        c_occ: &MatrixFull<f64>,
-        s_inv: &MatrixFull<f64>,
-    ) -> MatrixFull<f64> {
-        let nmode = rimatr.size[1];
-        let nocc = c_occ.size[1];
-        let mut frag_aos = Vec::new();
-        for &atom in atoms {
-            let [_shl0, _shl1, p0, p1] = aoslice[atom];
-            frag_aos.extend(p0..p1);
-        }
-
-        let mut y_flat = MatrixFull::new([nao * nocc, nmode], 0.0_f64);
-        for &mu in &frag_aos {
-            for &nu in &frag_aos {
-                let pair = baspair_index(mu.max(nu), mu.min(nu));
-                for q in 0..nmode {
-                    let value = rimatr[(pair, q)];
-                    if value.abs() < 1.0e-18 {
-                        continue;
-                    }
-                    for i in 0..nocc {
-                        y_flat[(mu + nao * i, q)] += value * c_occ[(nu, i)];
-                    }
-                }
-            }
-        }
-
-        let mut z_flat = MatrixFull::new([nao * nocc, nmode], 0.0_f64);
-        for q in 0..nmode {
-            for i in 0..nocc {
-                for mu in 0..nao {
-                    let mut value = 0.0_f64;
-                    for nu in 0..nao {
-                        value += s_inv[(mu, nu)] * y_flat[(nu + nao * i, q)];
-                    }
-                    z_flat[(mu + nao * i, q)] = value;
-                }
-            }
-        }
-
-        let mut occ_flat = MatrixFull::new([nocc * nocc, nmode], 0.0_f64);
-        for q in 0..nmode {
-            for j in 0..nocc {
-                for i in 0..nocc {
-                    let mut value = 0.0_f64;
-                    for mu in 0..nao {
-                        value += c_occ[(mu, i)] * y_flat[(mu + nao * j, q)];
-                    }
-                    occ_flat[(i + nocc * j, q)] = value;
-                }
-            }
-        }
-
-        let mut closure = MatrixFull::new([nmode, nmode], 0.0_f64);
-        closure.to_matrixfullslicemut().lapack_dgemm(
-            &y_flat.to_matrixfullslice(),
-            &z_flat.to_matrixfullslice(),
-            'T',
-            'N',
-            1.0,
-            0.0,
-        );
-        let mut occupied = MatrixFull::new([nmode, nmode], 0.0_f64);
-        occupied.to_matrixfullslicemut().lapack_dgemm(
-            &occ_flat.to_matrixfullslice(),
-            &occ_flat.to_matrixfullslice(),
-            'T',
-            'N',
-            1.0,
-            0.0,
-        );
-
-        let mut cov = MatrixFull::new([nmode, nmode], 0.0_f64);
-        for r in 0..nmode {
-            for q in 0..nmode {
-                cov[(q, r)] = 2.0 * (closure[(q, r)] - occupied[(q, r)]);
-            }
-        }
-        cov
-    }
-
-    fn fragment_connected_ri_coulomb_x(
-        scf_data: &SCF,
-        atoms_a: &[usize],
-        atoms_b: &[usize],
-    ) -> f64 {
-        let (ao_bfs, _p_cart) =
-            crate::lib_rint::basis::load_cartesian_rhf_basis_and_density_shell_shared(
-                &scf_data.mol.geom,
-                &scf_data.mol.basis4elem,
-                &scf_data.density_matrix[0],
-                "fragment_connected_ri_coulomb_x",
-            );
-        let auxbasis4elem =
-            build_default_r2_etb_auxbasis(&scf_data.mol.geom, &scf_data.mol.basis4elem)
-                .expect("default ETB auxiliary basis should be available");
-        let aux_bfs = crate::lib_rint::basis::load_aux_molecule_shell_shared_from_raw(
-            &scf_data.mol.geom,
-            &auxbasis4elem,
-        )
-        .expect("failed to build shell-shared auxiliary basis");
-        let (rimatr, _basbas2baspar, _baspar2basbas) =
-            prepare_rimatr_for_r_sync(&ao_bfs, &aux_bfs).expect("failed to build RI-r matrix");
-
-        let coeff_cart = transform_mo_coeff_to_cartesian_shell_shared(
-            &scf_data.mol.geom,
-            &scf_data.mol.basis4elem,
-            &scf_data.eigenvectors[0],
-            ao_bfs.len(),
-            "fragment_connected_ri_coulomb_x[coeff]",
-            false,
-        );
-        let c_occ = occupied_coeff_matrix(&coeff_cart, &scf_data.occupation[0]);
-        let mut ovlp = scf_data
-            .ovlp
-            .to_matrixfull()
-            .expect("overlap MatrixUpper -> full");
-        let s_inv = ovlp
-            .lapack_inverse()
-            .expect("overlap inverse should exist for RI Coulomb closure test");
-        let aoslice = scf_data.mol.aoslice_by_atom();
-        let cov_a = fragment_rimatr_operator_closure_covariance(
-            &rimatr,
-            ao_bfs.len(),
-            &aoslice,
-            atoms_a,
-            &c_occ,
-            &s_inv,
-        );
-        let cov_b = fragment_rimatr_operator_closure_covariance(
-            &rimatr,
-            ao_bfs.len(),
-            &aoslice,
-            atoms_b,
-            &c_occ,
-            &s_inv,
-        );
-
-        cov_a
-            .data
-            .iter()
-            .zip(cov_b.data.iter())
-            .fold(0.0_f64, |acc, (a, b)| acc + a * b)
-    }
-
-    fn fragment_mask_from_rint_shells(
-        ao_shells: &[crate::lib_rint::basis::RintShell],
-        nao: usize,
-        atoms: &[usize],
-    ) -> Vec<bool> {
-        let mut mask = vec![false; nao];
-        for shell in ao_shells {
-            if atoms.contains(&shell.atom_idx) {
-                for ao in shell.ao_start..(shell.ao_start + shell.ao_len) {
-                    mask[ao] = true;
-                }
-            }
-        }
-        mask
-    }
-
-    fn project_density_to_fragment(p: &MatrixFull<f64>, mask: &[bool]) -> MatrixFull<f64> {
-        let nao = p.size[0];
-        assert_eq!(p.size, [nao, nao]);
-        assert_eq!(mask.len(), nao);
-        let mut p_frag = MatrixFull::new([nao, nao], 0.0_f64);
-        for nu in 0..nao {
-            if !mask[nu] {
-                continue;
-            }
-            for mu in 0..nao {
-                if mask[mu] {
-                    p_frag[(mu, nu)] = p[(mu, nu)];
-                }
-            }
-        }
-        p_frag
-    }
-
-    fn fragment_cross_r2_jk_features(
-        scf_data: &SCF,
-        atoms_a: &[usize],
-        atoms_b: &[usize],
-    ) -> (f64, f64) {
-        let (ao_shells, _ao_bfs, p_cart) =
-            crate::lib_rint::basis::load_cartesian_rhf_rint_shells_basis_and_density_shell_shared(
-                &scf_data.mol.geom,
-                &scf_data.mol.basis4elem,
-                &scf_data.density_matrix[0],
-                "fragment_cross_r2_jk_features",
-            );
-        let auxbasis4elem =
-            build_default_r2_etb_auxbasis(&scf_data.mol.geom, &scf_data.mol.basis4elem)
-                .expect("default r2 ETB auxiliary basis should be available");
-        let aux_shells = crate::lib_rint::basis::load_aux_rint_shells_from_raw(
-            &scf_data.mol.geom,
-            &auxbasis4elem,
-        )
-        .expect("failed to build r2 auxiliary shells");
-        let ri_r2 = prepare_rimatr_for_r2_shell_blocks_sync(&ao_shells, &aux_shells);
-        assert!(
-            ri_r2.is_some(),
-            "failed to build RI-r2 matrix for ablation features"
-        );
-
-        let nao = p_cart.size[0];
-        let mask_a = fragment_mask_from_rint_shells(&ao_shells, nao, atoms_a);
-        let mask_b = fragment_mask_from_rint_shells(&ao_shells, nao, atoms_b);
-        let p_a = project_density_to_fragment(&p_cart, &mask_a);
-        let p_b = project_density_to_fragment(&p_cart, &mask_b);
-        let dm_a = vec![p_a.clone()];
-        let dm_b = vec![p_b.clone()];
-
-        let j_a = vj_upper_with_rimatr_r2_sync(&ri_r2, &dm_a, 1, 1.0)
-            .remove(0)
-            .to_matrixfull()
-            .expect("RI-r2 J_A upper -> full");
-        let j_b = vj_upper_with_rimatr_r2_sync(&ri_r2, &dm_b, 1, 1.0)
-            .remove(0)
-            .to_matrixfull()
-            .expect("RI-r2 J_B upper -> full");
-        let k_a = vk_upper_with_rimatr_r2_sync(&ri_r2, &dm_a, 1, 1.0)
-            .remove(0)
-            .to_matrixfull()
-            .expect("RI-r2 K_A upper -> full");
-        let k_b = vk_upper_with_rimatr_r2_sync(&ri_r2, &dm_b, 1, 1.0)
-            .remove(0)
-            .to_matrixfull()
-            .expect("RI-r2 K_B upper -> full");
-
-        let ej_ab = 0.5_f64 * (dot2(&p_a, &j_b) + dot2(&p_b, &j_a));
-        let ek_ab = -0.25_f64 * (dot2(&p_a, &k_b) + dot2(&p_b, &k_a));
-        (ej_ab, ek_ab)
-    }
-
     fn log_log_slope(points: &[(f64, f64)]) -> f64 {
         let n = points.len() as f64;
         let sum_x = points.iter().map(|(x, _)| x.ln()).sum::<f64>();
@@ -10018,70 +10468,6 @@ mod kernel_worst_quartet_tests {
             .map(|(x, y)| x.ln() * y.abs().ln())
             .sum::<f64>();
         (n * sum_xy - sum_x * sum_y) / (n * sum_xx - sum_x * sum_x)
-    }
-
-    fn log_log_slope_finite(points: &[(f64, f64)]) -> Option<f64> {
-        let finite = points
-            .iter()
-            .copied()
-            .filter(|(x, y)| x.is_finite() && *x > 0.0 && y.is_finite() && y.abs() > 1.0e-300)
-            .collect::<Vec<_>>();
-        if finite.len() < 3 {
-            None
-        } else {
-            Some(log_log_slope(&finite))
-        }
-    }
-
-    fn run_ablation_feature_scaling_case<F>(
-        label: &str,
-        distances_ang: &[f64],
-        make_ctrl: F,
-        atoms_a: &[usize],
-        atoms_b: &[usize],
-    ) where
-        F: Fn(f64) -> String,
-    {
-        let mut x_points = Vec::new();
-        let mut ej_points = Vec::new();
-        let mut ek_points = Vec::new();
-        for &distance_ang in distances_ang {
-            let ctrl_path = make_ctrl(distance_ang);
-            let mol = Molecule::build(ctrl_path.clone(), None).unwrap();
-            let mut scf_data = SCF::build(mol, &None);
-            scf_without_build(&mut scf_data, &None);
-            let distance_bohr = distance_ang / crate::constants::ANG;
-            let x = fragment_connected_ri_coulomb_x(&scf_data, atoms_a, atoms_b);
-            let (ej_r2, ek_r2) = fragment_cross_r2_jk_features(&scf_data, atoms_a, atoms_b);
-            println!(
-                "ablation features {label}: R={distance_ang:.3} Ang ({distance_bohr:.6} bohr) X_AB^RI={x:.16e} E_J^r2_cross={ej_r2:.16e} E_K^r2_cross={ek_r2:.16e} logR={:.8} log|X|={:.8} log|EJ_r2|={:.8} log|EK_r2|={:.8}",
-                distance_bohr.ln(),
-                x.abs().ln(),
-                ej_r2.abs().ln(),
-                ek_r2.abs().ln(),
-            );
-            x_points.push((distance_bohr, x));
-            ej_points.push((distance_bohr, ej_r2));
-            ek_points.push((distance_bohr, ek_r2));
-            let _ = fs::remove_file(ctrl_path);
-        }
-
-        let x_slope = log_log_slope(&x_points);
-        let ej_slope = log_log_slope_finite(&ej_points);
-        let ek_slope = log_log_slope_finite(&ek_points);
-        println!(
-            "ablation feature slopes {label}: X_AB^RI={x_slope:.6} E_J^r2_cross={} E_K^r2_cross={}",
-            ej_slope
-                .map(|value| format!("{value:.6}"))
-                .unwrap_or_else(|| "n/a".to_string()),
-            ek_slope
-                .map(|value| format!("{value:.6}"))
-                .unwrap_or_else(|| "n/a".to_string()),
-        );
-        assert!(
-            (x_slope + 6.0).abs() < 1.0,
-            "expected X_AB^RI slope near -6 for {label}, got {x_slope}"
-        );
     }
 
     fn write_temp_ctrl_h2_with_aux(basis_dir: &str, aux_basis_dir: &str) -> String {
@@ -10354,148 +10740,6 @@ position = [
         assert!(
             (slope + 6.0).abs() < 0.5,
             "expected long-range dipole connected descriptor slope near -6, got {slope}"
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn occ_closure_ri_coulomb_connected_he2_loglog_slope() {
-        let distances_ang = [4.0_f64, 5.0, 6.0, 7.0, 8.0, 10.0];
-        let mut points = Vec::new();
-        for distance_ang in distances_ang {
-            let ctrl_path = write_temp_ctrl_he2("cc-pVDZ", distance_ang, "ri_coulomb_connected");
-            let mol = Molecule::build(ctrl_path.clone(), None).unwrap();
-            let mut scf_data = SCF::build(mol, &None);
-            scf_without_build(&mut scf_data, &None);
-            let distance_bohr = distance_ang / crate::constants::ANG;
-            let x = fragment_connected_ri_coulomb_x(&scf_data, &[0], &[1]);
-            println!(
-                "occ-closure RI Coulomb X_disp(He2): R={distance_ang:.3} Ang ({distance_bohr:.6} bohr) X={x:.16e} logR={:.8} log|X|={:.8}",
-                distance_bohr.ln(),
-                x.abs().ln(),
-            );
-            points.push((distance_bohr, x));
-            let _ = fs::remove_file(ctrl_path);
-        }
-        let slope = log_log_slope(&points);
-        println!("occ-closure RI Coulomb connected He2 log|X| vs log R slope = {slope:.6}");
-        assert!(
-            (slope + 6.0).abs() < 1.0,
-            "expected long-range RI Coulomb connected descriptor slope near -6, got {slope}"
-        );
-    }
-
-    #[test]
-    fn public_occ_closure_ri_coulomb_x_ab_he2_is_positive() {
-        let ctrl_path = write_temp_ctrl_he2("cc-pVDZ", 4.0, "public_x_ab");
-        let mol = Molecule::build(ctrl_path.clone(), None).unwrap();
-        let mut scf_data = SCF::build(mol, &None);
-        scf_without_build(&mut scf_data, &None);
-
-        let x_ab =
-            crate::lib_rint::lib_vee_rhf_occ_closure_connected_ri_coulomb_x(&scf_data, &[0], &[1]);
-
-        assert!(
-            x_ab > 0.0,
-            "expected a positive occupied-closure connected RI Coulomb X_AB, got {x_ab}"
-        );
-        let _ = fs::remove_file(ctrl_path);
-    }
-
-    #[test]
-    #[ignore]
-    fn occ_closure_ri_coulomb_connected_noble_dimers_loglog_slope() {
-        for (elem, basis_dir, distances_ang) in [("Ne", "cc-pVDZ", [4.0_f64, 5.0, 7.0, 10.0])] {
-            let mut points = Vec::new();
-            for distance_ang in distances_ang {
-                let ctrl_path = write_temp_ctrl_diatomic_dimer(
-                    elem,
-                    basis_dir,
-                    distance_ang,
-                    "ri_coulomb_connected",
-                );
-                let mol = Molecule::build(ctrl_path.clone(), None).unwrap();
-                let mut scf_data = SCF::build(mol, &None);
-                scf_without_build(&mut scf_data, &None);
-                let distance_bohr = distance_ang / crate::constants::ANG;
-                let x = fragment_connected_ri_coulomb_x(&scf_data, &[0], &[1]);
-                println!(
-                    "occ-closure RI Coulomb X_disp({elem}2/{basis_dir}): R={distance_ang:.3} Ang ({distance_bohr:.6} bohr) X={x:.16e} logR={:.8} log|X|={:.8}",
-                    distance_bohr.ln(),
-                    x.abs().ln(),
-                );
-                points.push((distance_bohr, x));
-                let _ = fs::remove_file(ctrl_path);
-            }
-            let slope = log_log_slope(&points);
-            println!(
-                "occ-closure RI Coulomb connected {elem}2/{basis_dir} log|X| vs log R slope = {slope:.6}"
-            );
-            assert!(
-                (slope + 6.0).abs() < 1.0,
-                "expected long-range RI Coulomb connected descriptor slope near -6 for {elem}2/{basis_dir}, got {slope}"
-            );
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn occ_closure_ri_coulomb_connected_methane_dimer_loglog_slope() {
-        let distances_ang = [5.0_f64, 6.0, 7.0, 8.0, 10.0, 12.0];
-        let mut points = Vec::new();
-        for distance_ang in distances_ang {
-            let ctrl_path =
-                write_temp_ctrl_methane_dimer("sto-3g", distance_ang, "ri_coulomb_connected");
-            let mol = Molecule::build(ctrl_path.clone(), None).unwrap();
-            let mut scf_data = SCF::build(mol, &None);
-            scf_without_build(&mut scf_data, &None);
-            let distance_bohr = distance_ang / crate::constants::ANG;
-            let x = fragment_connected_ri_coulomb_x(&scf_data, &[0, 1, 2, 3, 4], &[5, 6, 7, 8, 9]);
-            println!(
-                "occ-closure RI Coulomb X_disp(CH4--CH4/STO-3G): R={distance_ang:.3} Ang ({distance_bohr:.6} bohr) X={x:.16e} logR={:.8} log|X|={:.8}",
-                distance_bohr.ln(),
-                x.abs().ln(),
-            );
-            points.push((distance_bohr, x));
-            let _ = fs::remove_file(ctrl_path);
-        }
-        let slope = log_log_slope(&points);
-        println!(
-            "occ-closure RI Coulomb connected CH4--CH4/STO-3G log|X| vs log R slope = {slope:.6}"
-        );
-        assert!(
-            (slope + 6.0).abs() < 1.0,
-            "expected long-range RI Coulomb connected descriptor slope near -6 for CH4 dimer, got {slope}"
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn occ_closure_ablation_feature_scaling_loglog() {
-        run_ablation_feature_scaling_case(
-            "He2/cc-pVDZ",
-            &[4.0_f64, 5.0, 6.0, 7.0, 8.0, 10.0],
-            |distance_ang| write_temp_ctrl_he2("cc-pVDZ", distance_ang, "ablation_features"),
-            &[0],
-            &[1],
-        );
-        run_ablation_feature_scaling_case(
-            "Ne2/cc-pVDZ",
-            &[4.0_f64, 5.0, 7.0, 10.0],
-            |distance_ang| {
-                write_temp_ctrl_diatomic_dimer("Ne", "cc-pVDZ", distance_ang, "ablation_features")
-            },
-            &[0],
-            &[1],
-        );
-        run_ablation_feature_scaling_case(
-            "CH4--CH4/STO-3G",
-            &[5.0_f64, 6.0, 7.0, 8.0, 10.0, 12.0],
-            |distance_ang| {
-                write_temp_ctrl_methane_dimer("sto-3g", distance_ang, "ablation_features")
-            },
-            &[0, 1, 2, 3, 4],
-            &[5, 6, 7, 8, 9],
         );
     }
 
@@ -11252,6 +11496,74 @@ position = [
     }
 
     #[test]
+    fn contracted_rint_shells_keep_multicontraction_shells() {
+        use crate::lib_rint::basis::{
+            expand_shell_shared_to_contracted_rint_shells, expand_shell_shared_to_rint_shells,
+            normalize_raw_shells_to_shell_shared, RawShellShared,
+        };
+
+        let raw = RawShellShared {
+            atom_idx: 0,
+            center: [0.0, 0.0, 0.0],
+            l: 1,
+            exponents: vec![3.0, 0.8],
+            coeff_columns: vec![vec![0.6, 0.4], vec![0.2, 0.9]],
+            is_aux: false,
+        };
+        let normalized = normalize_raw_shells_to_shell_shared(&[raw]).unwrap();
+        let split_shells = expand_shell_shared_to_rint_shells(&normalized).unwrap();
+        let contracted_shells = expand_shell_shared_to_contracted_rint_shells(&normalized).unwrap();
+
+        assert_eq!(split_shells.len(), 2);
+        assert_eq!(contracted_shells.len(), 1);
+        assert_eq!(contracted_shells[0].cart_len, 3);
+        assert_eq!(contracted_shells[0].nctr(), 2);
+        assert_eq!(contracted_shells[0].ao_start, 0);
+        assert_eq!(contracted_shells[0].ao_len, 6);
+    }
+
+    #[test]
+    fn contracted_r_full_matches_split_r_full_for_multicontraction_shells() {
+        use crate::lib_rint::basis::{
+            expand_shell_shared_to_contracted_rint_shells, expand_shell_shared_to_rint_shells,
+            normalize_raw_shells_to_shell_shared, RawShellShared,
+        };
+
+        let raw_shells = vec![
+            RawShellShared {
+                atom_idx: 0,
+                center: [0.0, 0.0, 0.0],
+                l: 0,
+                exponents: vec![2.1, 0.7],
+                coeff_columns: vec![vec![0.8, 0.3], vec![0.1, 0.9]],
+                is_aux: false,
+            },
+            RawShellShared {
+                atom_idx: 1,
+                center: [0.0, 0.0, 1.4],
+                l: 1,
+                exponents: vec![1.8, 0.5],
+                coeff_columns: vec![vec![0.7, 0.4], vec![0.3, 0.8]],
+                is_aux: false,
+            },
+        ];
+        let normalized = normalize_raw_shells_to_shell_shared(&raw_shells).unwrap();
+        let split_shells = expand_shell_shared_to_rint_shells(&normalized).unwrap();
+        let contracted_shells = expand_shell_shared_to_contracted_rint_shells(&normalized).unwrap();
+
+        let split_full = int4c_r_full_from_shell_blocks(&split_shells);
+        let contracted_full = int4c_r_full_from_contracted_shell_blocks(&contracted_shells);
+
+        assert_eq!(contracted_full.len(), split_full.len());
+        for (idx, (got, expect)) in contracted_full.iter().zip(split_full.iter()).enumerate() {
+            assert!(
+                (*got - *expect).abs() < 1.0e-12,
+                "contracted full 1/r mismatch at data[{idx}]: {got} vs {expect}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "temporary exact 4c libcint vs lib_rint release benchmark"]
     fn tmp_bench_exact4c_libcint_vs_librint() {
         use std::hint::black_box;
@@ -11271,7 +11583,14 @@ position = [
         let parallel = std::env::var("TMP_EXACT4C_PARALLEL")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let mode = if parallel { "parallel" } else { "serial" };
+        let contracted = std::env::var("TMP_EXACT4C_CONTRACTED")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let mode = match (contracted, parallel) {
+            (true, _) => "contracted",
+            (false, true) => "parallel",
+            (false, false) => "serial",
+        };
         let profile_shells = std::env::var("TMP_EXACT4C_PROFILE_SHELLS")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -11329,7 +11648,34 @@ position = [
                     continue;
                 }
             };
+            let contracted_shells = if contracted {
+                match crate::lib_rint::basis::load_molecule_contracted_rint_shells_from_raw(
+                    &mol.geom,
+                    &mol.basis4elem,
+                ) {
+                    Ok(shells) => shells,
+                    Err(err) => {
+                        emit_summary_line(format!(
+                            "TMP_EXACT4C_SKIP basis={basis_name} reason=contracted_shell_load_failed detail={err:?}"
+                        ));
+                        let _ = fs::remove_file(ctrl_path);
+                        continue;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
             let nao = ao_shells.iter().map(|shell| shell.ao_len).sum::<usize>();
+            if contracted {
+                let contracted_nao = contracted_shells
+                    .iter()
+                    .map(|shell| shell.ao_len)
+                    .sum::<usize>();
+                assert_eq!(
+                    contracted_nao, nao,
+                    "contracted shell AO count must match split shell AO count"
+                );
+            }
             let full_nint = nao * nao * nao * nao;
             if max_nao.is_some_and(|limit| nao > limit) {
                 emit_summary_line(format!(
@@ -11456,7 +11802,9 @@ position = [
                 libcint_ref = Some(eri4_libcint);
 
                 let t0 = Instant::now();
-                librint_full = if parallel {
+                librint_full = if contracted {
+                    int4c_r_full_from_contracted_shell_blocks(&contracted_shells)
+                } else if parallel {
                     int4c_r_full_from_shell_blocks_parallel(&ao_shells)
                 } else {
                     int4c_r_full_from_shell_blocks(&ao_shells)
@@ -11605,8 +11953,13 @@ position = [
                 }
             }
             emit_summary_line(format!(
-                "TMP_EXACT4C_LIBCINT_BENCH basis={basis_name} mode={mode} nao={nao} nshell={} full_nint={full_nint} repeat={repeat} libcint_direct_s={:.6} lib_rint_shell_s={:.6} lib_rint_over_libcint={:.3} libcint_over_lib_rint={:.3} max_abs={:.3e} max_rel_floor_1e-12={:.3e} checksum_libcint={:.12e} checksum_librint={:.12e}",
+                "TMP_EXACT4C_LIBCINT_BENCH basis={basis_name} mode={mode} nao={nao} nshell={} contracted_nshell={} full_nint={full_nint} repeat={repeat} libcint_direct_s={:.6} lib_rint_shell_s={:.6} lib_rint_over_libcint={:.3} libcint_over_lib_rint={:.3} max_abs={:.3e} max_rel_floor_1e-12={:.3e} checksum_libcint={:.12e} checksum_librint={:.12e}",
                 ao_shells.len(),
+                if contracted {
+                    contracted_shells.len()
+                } else {
+                    ao_shells.len()
+                },
                 best_libcint,
                 best_librint,
                 best_librint / best_libcint.max(1.0e-12),

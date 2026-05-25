@@ -293,8 +293,6 @@ pub struct InputKeywords {
     // Keywords for lib_rint
     #[pyo3(get, set)]
     pub run_lib_rint: bool,
-    pub x_ab_atoms_a: Vec<usize>,
-    pub x_ab_atoms_b: Vec<usize>,
     // Keywords for benchmarking various effective potentials, including ECP, ENXC, and Ghost EP
     #[pyo3(get, set)]
     pub bench_eps: bool,
@@ -449,8 +447,6 @@ impl InputKeywords {
             //dft_type: None,
             deep_pot: false,
             run_lib_rint: false,
-            x_ab_atoms_a: Vec::new(),
-            x_ab_atoms_b: Vec::new(),
             bench_eps: false,
             occupation_type: OCCType::INTEGER,
             frac_tolerant: 1.0e-3,
@@ -1577,16 +1573,6 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
                 _ => false,
             };
-            tmp_input.x_ab_atoms_a = parse_usize_list_keyword(
-                tmp_ctrl
-                    .get("x_ab_atoms_a")
-                    .unwrap_or(&serde_json::Value::Null),
-            );
-            tmp_input.x_ab_atoms_b = parse_usize_list_keyword(
-                tmp_ctrl
-                    .get("x_ab_atoms_b")
-                    .unwrap_or(&serde_json::Value::Null),
-            );
             tmp_input.bench_eps = match tmp_ctrl.get("bench_eps").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
