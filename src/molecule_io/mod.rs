@@ -256,7 +256,7 @@ impl Molecule {
             DFTType::DeepLearning => {(None, DFA4REST::new_deep_learning(spin_channel, ctrl.print_level, &ctrl.xc_model))}
         };
 
-        xc_data.summary();
+        xc_data.summary(ctrl.print_level);
         if let Some(stop_at) = &ctrl.stop_at {
             if stop_at == "parse_xc" {
                 std::process::exit(0);
