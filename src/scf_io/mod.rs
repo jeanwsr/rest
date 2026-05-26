@@ -5204,6 +5204,7 @@ pub fn initialize_scf(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
     time_mark.new_item("Solvent Calculation", "Initialization of the solvent calculation");
     time_mark.count_start("Solvent Calculation");
     scf_data.prepare_solvent_calculation();
+    time_mark.count("Solvent Calculation");
 
     time_mark.new_item("ISDF", "ISDF initialization");
     time_mark.count_start("ISDF");
@@ -5300,22 +5301,27 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
 
         scf_data.generate_density_matrix();
 
+        let dt_solv0 = time::Local::now();
         if scf_data.mol.use_solvent {
             if let Some(solvent_static) = scf_data.solvent_static_obj.as_ref() {
                 let s_static = PcmScf::get_pcm_refresh(
                     &solvent_static.surface, 
                     &scf_data.mol, 
                     &scf_data.density_matrix, 
-                    solvent_static.pstatic.K.clone(),
-                    solvent_static.pstatic.R.clone(),
-                    solvent_static.pstatic.v_grids_n.clone(),
-                    &scf_data.mol.spin_channel
+                    &solvent_static.pstatic.K,
+                    &solvent_static.pstatic.K_ipiv,
+                    &solvent_static.pstatic.R,
+                    &solvent_static.pstatic.v_grids_n,
+                    &scf_data.mol.spin_channel,
+                    &scf_data.mol.ctrl.max_memory,
+                    &scf_data.mol.ctrl.solv_chunk,
+                    scf_data.mol.ctrl.solvent_ri
                 );
                 scf_data.energies.insert(String::from("solvent_energy"), vec![s_static.eng]);
                 scf_data.solvent_scf = Some(s_static);
             }
         }
-        
+        let dt_solv1 = time::Local::now();
 
         if scf_data.mol.ctrl.print_level>1 {
             scf_data.print_homo_lumo_gap()
@@ -5380,6 +5386,8 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             println!("check_scf_convergence:   {:10.2}s", timecost);
             let timecost = (dt1_5.timestamp_millis()-dt1_4.timestamp_millis()) as f64 /1000.0;
             println!("scf_records.update:      {:10.2}s", timecost);
+            let timecost = (dt_solv1.timestamp_millis()-dt_solv0.timestamp_millis()) as f64 /1000.0;
+            println!("solvent_model.refresh:   {:10.2}s", timecost);
         }
     }
     if scf_converge[0] {
@@ -5422,7 +5430,9 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             println!("ERROR: solvent_scf is None");
         }
 
-        //debug_print_pcm(&scf_data.solvent_static_obj.as_ref().unwrap().pstatic, &scf_data.solvent_scf.as_ref().unwrap());
+        if scf_data.mol.ctrl.print_level >= 2{
+            debug_print_pcm(&scf_data.solvent_static_obj.as_ref().unwrap().pstatic, &scf_data.solvent_scf.as_ref().unwrap());
+        }
     }
     
     if scf_data.mol.ctrl.print_level>1 {
