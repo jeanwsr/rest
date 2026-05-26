@@ -48,7 +48,7 @@ pub struct RIHFGradientFlags {
 /// Field `result` contains
 /// - `de`: total derivative of energy with respect to nuclear coordinates, in unit a.u.
 /// - components contributed to total derivative, including
-///   `de_nuc`, `de_hcore`, `de_ovlp`, `de_j`, `de_k`, `de_jaux`, `de_kaux`.
+///   `de_nuc`, `de_hcore`, `de_ovlp`, `de_j`, `de_k`, `de_jaux`, `de_kaux`, `de_solvent`.
 pub struct RIRHFGradient<'a> {
     pub scf_data: &'a SCF,
     pub flags: RIHFGradientFlags,
@@ -476,6 +476,17 @@ impl RIRHFGradient<'_> {
         return self;
     }
 
+    pub fn calc_de_solvent(&mut self) -> &mut Self {
+        if !self.scf_data.mol.use_solvent {
+            let natm = self.scf_data.mol.geom.elem.len();
+            self.result.insert("de_solvent".into(), MatrixFull::new([3, natm], 0.0));
+            return self;
+        }
+        let de_solvent = crate::solvent::grad::compute_solvent_gradient(self.scf_data);
+        self.result.insert("de_solvent".into(), de_solvent);
+        return self;
+    }
+
     pub fn calc(&mut self) -> &MatrixFull<f64> {
         let mut time_records = crate::utilities::TimeRecords::new();
         time_records.new_item("rhf grad", "rhf grad");
@@ -483,6 +494,7 @@ impl RIRHFGradient<'_> {
         time_records.new_item("rhf grad calc_de_ovlp", "rhf grad calc_de_ovlp");
         time_records.new_item("rhf grad calc_de_hcore", "rhf grad calc_de_hcore");
         time_records.new_item("rhf grad calc_de_jk", "rhf grad calc_de_jk");
+        time_records.new_item("rhf grad calc_de_solvent", "rhf grad calc_de_solvent");
 
         time_records.count_start("rhf grad");
 
@@ -508,6 +520,10 @@ impl RIRHFGradient<'_> {
             time_records.count("rhf grad calc_de_jk");
         }
 
+        time_records.count_start("rhf grad calc_de_solvent");
+        self.calc_de_solvent();
+        time_records.count("rhf grad calc_de_solvent");
+
         time_records.count("rhf grad");
 
         let mut de = self.result.get("de_nuc").unwrap().clone();
@@ -518,6 +534,7 @@ impl RIRHFGradient<'_> {
         self.result.get("de_jaux").map(|x| de += x.clone());
         self.result.get("de_kaux").map(|x| de += x.clone());
         self.result.get("de_qmmm").map(|x| de += x.clone());
+        self.result.get("de_solvent").map(|x| de += x.clone());
         self.result.insert("de".into(), de);
 
         if self.flags.print_level >= 2 {

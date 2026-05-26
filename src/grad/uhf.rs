@@ -453,6 +453,17 @@ impl RIUHFGradient<'_> {
         return self;
     }
 
+    pub fn calc_de_solvent(&mut self) -> &mut Self {
+        if !self.scf_data.mol.use_solvent {
+            let natm = self.scf_data.mol.geom.elem.len();
+            self.result.insert("de_solvent".into(), MatrixFull::new([3, natm], 0.0));
+            return self;
+        }
+        let de_solvent = crate::solvent::grad::compute_solvent_gradient(self.scf_data);
+        self.result.insert("de_solvent".into(), de_solvent);
+        return self;
+    }
+
     pub fn calc(&mut self) -> &MatrixFull<f64> {
         let mut time_records = crate::utilities::TimeRecords::new();
         time_records.new_item("uhf grad", "uhf grad");
@@ -460,6 +471,7 @@ impl RIUHFGradient<'_> {
         time_records.new_item("uhf grad calc_de_ovlp", "uhf grad calc_de_ovlp");
         time_records.new_item("uhf grad calc_de_hcore", "uhf grad calc_de_hcore");
         time_records.new_item("uhf grad calc_de_jk", "uhf grad calc_de_jk");
+        time_records.new_item("uhf grad calc_de_solvent", "uhf grad calc_de_solvent");
 
         time_records.count_start("uhf grad");
 
@@ -485,6 +497,10 @@ impl RIUHFGradient<'_> {
             time_records.count("uhf grad calc_de_jk");
         }
 
+        time_records.count_start("uhf grad calc_de_solvent");
+        self.calc_de_solvent();
+        time_records.count("uhf grad calc_de_solvent");
+
         time_records.count("uhf grad");
 
         let mut de = self.result.get("de_nuc").unwrap().clone();
@@ -495,6 +511,7 @@ impl RIUHFGradient<'_> {
         self.result.get("de_jaux").map(|x| de += x.clone());
         self.result.get("de_kaux").map(|x| de += x.clone());
         self.result.get("de_qmmm").map(|x| de += x.clone());
+        self.result.get("de_solvent").map(|x| de += x.clone());
         self.result.insert("de".into(), de);
 
         if self.scf_data.mol.ctrl.print_level >= 2 {

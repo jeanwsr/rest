@@ -132,6 +132,7 @@ impl RIUHFGradient<'_> {
         time_records.new_item("uks grad calc_de_hcore", "uks grad calc_de_hcore");
         time_records.new_item("uks grad calc_de_jk", "uks grad calc_de_jk");
         time_records.new_item("uks grad calc_de_xc", "uks grad calc_de_xc");
+        time_records.new_item("uks grad calc_de_solvent", "uks grad calc_de_solvent");
 
         time_records.count_start("uks grad");
 
@@ -161,6 +162,10 @@ impl RIUHFGradient<'_> {
         self.calc_de_xc();
         time_records.count("uks grad calc_de_xc");
 
+        time_records.count_start("uks grad calc_de_solvent");
+        self.calc_de_solvent();
+        time_records.count("uks grad calc_de_solvent");
+
         time_records.count("uks grad");
 
         let mut de = self.result.get("de_nuc").unwrap().clone();
@@ -172,6 +177,7 @@ impl RIUHFGradient<'_> {
         self.result.get("de_kaux").map(|x| de += x.clone());
         self.result.get("de_xc").map(|x| de += x.clone());
         self.result.get("de_qmmm").map(|x| de += x.clone());
+        self.result.get("de_solvent").map(|x| de += x.clone());
         self.result.insert("de".into(), de);
 
         if self.flags.print_level >= 2 {
