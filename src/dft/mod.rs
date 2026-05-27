@@ -138,35 +138,59 @@ impl DFA4REST {
             dfa_paramr_adv: None }
     }
     
-    pub fn summary(&self) {
-        println!("==== DFA Summary (legacy) ====");
-        println!("Spin channel: {}", self.spin_channel);
-        println!("SCF DFA components: {:?}", self.dfa_compnt_scf);
-        println!("SCF DFA parameters: {:?}", self.dfa_paramr_scf);
-        println!("SCF DFA hybrid coeff: {:16.8}", self.dfa_hybrid_scf);
-        if self.is_rsh() {
-            println!("Range-Separated Hybrid parameters:");
-            println!("  omega: {:16.8}", self.omega().unwrap());
-            println!("  alpha (LR-HF coeff): {:16.8}", self.rsh_alpha().unwrap());
-        }
-        if let Some(dfatype) = &self.dfa_family_pos {
-            println!("Post-SCF DFA family: {}", dfatype.to_name());
-            if let Some(dfacomp) = &self.dfa_compnt_pos {
-                println!("Post-SCF DFA components: {:?}", dfacomp);
+    pub fn summary(&self, print_level: usize) {
+        if print_level > 0 {
+            println!("==== DFA Summary (legacy) ====");
+            println!("Spin channel: {}", self.spin_channel);
+            println!("SCF DFA components: {:?}", self.dfa_compnt_scf);
+            println!("SCF DFA parameters: {:?}", self.dfa_paramr_scf);
+            println!("SCF DFA hybrid coeff: {:16.8}", self.dfa_hybrid_scf);
+            if self.is_rsh() {
+                println!("Range-Separated Hybrid parameters:");
+                println!("  omega: {:16.8}", self.omega().unwrap());
+                println!("  alpha (LR-HF coeff): {:16.8}", self.rsh_alpha().unwrap());
             }
-            if let Some(dfaparam) = &self.dfa_paramr_pos {
-                println!("Post-SCF DFA parameters: {:?}", dfaparam);
+            if let Some(dfatype) = &self.dfa_family_pos {
+                println!("Post-SCF DFA family: {}", dfatype.to_name());
+                if let Some(dfacomp) = &self.dfa_compnt_pos {
+                    println!("Post-SCF DFA components: {:?}", dfacomp);
+                }
+                if let Some(dfaparam) = &self.dfa_paramr_pos {
+                    println!("Post-SCF DFA parameters: {:?}", dfaparam);
+                }
+                if let Some(dfahybrid) = &self.dfa_hybrid_pos {
+                    println!("Post-SCF DFA hybrid coeff: {:16.8}", dfahybrid);
+                }
+            } else {
+                println!("Post-SCF DFA: None");
             }
-            if let Some(dfahybrid) = &self.dfa_hybrid_pos {
-                println!("Post-SCF DFA hybrid coeff: {:16.8}", dfahybrid);
+            if let Some(dfaparam_adv) = &self.dfa_paramr_adv {
+                println!("Advanced DFA parameters: {:?}", dfaparam_adv);
             }
-        } else {
-            println!("Post-SCF DFA: None");
         }
-        if let Some(dfaparam_adv) = &self.dfa_paramr_adv {
-            println!("Advanced DFA parameters: {:?}", dfaparam_adv);
+        if print_level > 1 {
+            self.describe();
         }
-        // println!("==== End of Summary ====");
+        println!("==== End of Summary ====");
+    }
+
+    pub fn describe(&self) {
+        println!("==== detailed info of the scf functional ====");
+        &self.dfa_compnt_scf.iter().for_each(|xc_func| {
+            println!("{}", self.init_libxc(xc_func).describe())
+        });
+        if let (Some(dfatype),Some(dfacomp)) = 
+            (&self.dfa_family_pos, &self.dfa_compnt_pos) {
+            //match dfatype {
+            //    DFAFamily::PT2 => println!("XYG3-type functional '{}' is employed", &name),
+            //    DFAFamily::RPA => println!("RPA-type functional '{}' is employed", &name),
+            //    _ => println!("Standard DFA '{}' is employed", &name),
+            //}
+            println!("==== detailed info of the post-scf functional ====");
+            dfacomp.into_iter().for_each(|xc_func| {
+                println!("{}", self.init_libxc(xc_func).describe())
+            })
+        };
     }
 
     pub fn new_nonstandard(
@@ -253,35 +277,10 @@ impl DFA4REST {
         let post_dfa = DFA4REST::parse_postscf(&tmp_name, spin_channel);
         match post_dfa {
             Some(dfa) => {
-                if print_level> 0 {
-                    println!("the scf functional for '{}' contains", &name);
-                    &dfa.dfa_compnt_scf.iter().for_each(|xc_func| {
-                        println!("{}", dfa.init_libxc(xc_func).describe())
-                    });
-                    if let (Some(dfatype),Some(dfacomp)) = 
-                        (&dfa.dfa_family_pos, &dfa.dfa_compnt_pos) {
-                        //match dfatype {
-                        //    DFAFamily::PT2 => println!("XYG3-type functional '{}' is employed", &name),
-                        //    DFAFamily::RPA => println!("RPA-type functional '{}' is employed", &name),
-                        //    _ => println!("Standard DFA '{}' is employed", &name),
-                        //}
-                        println!("the post-scf functional '{}' is employed, which contains", &name);
-                        dfacomp.into_iter().for_each(|xc_func| {
-                            println!("{}", dfa.init_libxc(xc_func).describe())
-                        })
-                    };
-                }
                 dfa
             },
             None => {
                 let dfa = DFA4REST::parse_scf(&tmp_name, spin_channel);
-                if print_level> 0 {
-                    println!("the functional of '{}' contains", &name);
-                    dfa.dfa_compnt_scf.iter().for_each(|xc_func| {
-                        let tmp_dfa = dfa.init_libxc(xc_func);
-                        println!("{}", tmp_dfa.describe());
-                    });
-                };
                 dfa
             },
         }
