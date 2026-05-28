@@ -1663,40 +1663,44 @@ impl DFA4REST {
         }
         else {
             (loc_rho,loc_rhop) = if grids.ao_compressed.is_some() {
-                // DEBUG: compare dense vs compressed density
-                let (r_dense, rp_dense) = grids.prepare_tabulated_density_slots_dm_only(dm, spin_channel, range_grids.clone());
-                let (r_comp, rp_comp): (MatrixFull<f64>, RIFull<f64>) = grids.prepare_tabulated_density_slots_dm_only_compressed(dm, spin_channel, range_grids.clone());
-                
-                // Compare rho
-                let mut max_d = 0f64; let mut first_g = None;
-                for g in 0..range_grids.len() {
-                    let d = (r_dense[[g, 0]] - r_comp[[g, 0]]).abs();
-                    if d > max_d { max_d = d; }
-                    if d > 1e-8 && first_g.is_none() { first_g = Some((g, r_dense[[g,0]], r_comp[[g,0]])); }
-                }
-                println!(" [DEBUG-non0tab] rho: max|Δ|={:.2e} ngrids={}", max_d, range_grids.len());
-                if let Some((g, dval, cval)) = first_g {
-                    println!(" [DEBUG-non0tab] rho first diff: g={} dense={:.6e} comp={:.6e}", g, dval, cval);
-                }
-                
-                // Compare rhop
-                if !rp_dense.size.is_empty() && !rp_comp.size.is_empty() {
-                    let mut max_rp = 0f64; let mut first_rp = None;
-                    let rd0 = rp_dense.get_reducing_matrix(0).unwrap();
-                    let rc0 = rp_comp.get_reducing_matrix(0).unwrap();
-                    for x in 0usize..3usize {
-                        for g in 0..range_grids.len() {
-                            let d = (rd0.get_slice_x(x)[g] - rc0.get_slice_x(x)[g]).abs();
-                            if d > max_rp { max_rp = d; }
-                            if d > 1e-4 && first_rp.is_none() { first_rp = Some((g, x)); }
+                if print_level >= 2 && grids.ao.is_some() {
+                    // DEBUG: compare dense vs compressed density
+                    let (r_dense, rp_dense) = grids.prepare_tabulated_density_slots_dm_only(dm, spin_channel, range_grids.clone());
+                    let (r_comp, rp_comp): (MatrixFull<f64>, RIFull<f64>) = grids.prepare_tabulated_density_slots_dm_only_compressed(dm, spin_channel, range_grids.clone());
+                    
+                    // Compare rho
+                    let mut max_d = 0f64; let mut first_g = None;
+                    for g in 0..range_grids.len() {
+                        let d = (r_dense[[g, 0]] - r_comp[[g, 0]]).abs();
+                        if d > max_d { max_d = d; }
+                        if d > 1e-8 && first_g.is_none() { first_g = Some((g, r_dense[[g,0]], r_comp[[g,0]])); }
+                    }
+                    println!(" [DEBUG-non0tab] rho: max|Δ|={:.2e} ngrids={}", max_d, range_grids.len());
+                    if let Some((g, dval, cval)) = first_g {
+                        println!(" [DEBUG-non0tab] rho first diff: g={} dense={:.6e} comp={:.6e}", g, dval, cval);
+                    }
+                    
+                    // Compare rhop
+                    if !rp_dense.size.is_empty() && !rp_comp.size.is_empty() {
+                        let mut max_rp = 0f64; let mut first_rp = None;
+                        let rd0 = rp_dense.get_reducing_matrix(0).unwrap();
+                        let rc0 = rp_comp.get_reducing_matrix(0).unwrap();
+                        for x in 0usize..3usize {
+                            for g in 0..range_grids.len() {
+                                let d = (rd0.get_slice_x(x)[g] - rc0.get_slice_x(x)[g]).abs();
+                                if d > max_rp { max_rp = d; }
+                                if d > 1e-4 && first_rp.is_none() { first_rp = Some((g, x)); }
+                            }
+                        }
+                        println!(" [DEBUG-non0tab] rhop: max|Δ|={:.2e}", max_rp);
+                        if let Some((g, x)) = first_rp {
+                            println!(" [DEBUG-non0tab] rhop first diff: g={} x={}", g, x);
                         }
                     }
-                    println!(" [DEBUG-non0tab] rhop: max|Δ|={:.2e}", max_rp);
-                    if let Some((g, x)) = first_rp {
-                        println!(" [DEBUG-non0tab] rhop first diff: g={} x={}", g, x);
-                    }
+                    (r_comp, rp_comp)
+                } else {
+                    grids.prepare_tabulated_density_slots_dm_only_compressed(dm, spin_channel, range_grids.clone())
                 }
-                (r_comp, rp_comp)
             } else {
                 grids.prepare_tabulated_density_slots_dm_only(dm, spin_channel,range_grids.clone())
             };
@@ -2031,53 +2035,49 @@ impl DFA4REST {
             });
 
             if let Some(_ao_c) = &grids.ao_compressed {
-                // DEBUG: compute both dense and compressed response matrices, compare
-                let mut vxc_mat_dense: Vec<MatrixFull<f64>> = vec![MatrixFull::new([num_basis, num_basis], 0.0); spin_channel];
+                // Compressed production path (always active)
                 let mut vxc_mat_comp: Vec<MatrixFull<f64>> = vec![MatrixFull::new([num_basis, num_basis], 0.0); spin_channel];
-                
-                // Dense path (use existing dense ao)
-                if let Some(ao) = &grids.ao {
-                    // Build vxc_ao from vrho (dense)
-                    for i_spin in 0..spin_channel {
-                        let loc_vrho_s = loc_vrho.slice_column(i_spin);
-                        let loc_ao_ref = ao.to_matrixfullslice_columns(range_grids.clone());
-                        let mut vxc_ao_d = MatrixFull::new([num_basis, range_grids.len()], 0.0);
-                        contract_vxc_0_serial(&mut vxc_ao_d, &loc_ao_ref, loc_vrho_s, None);
-                        // Weight
-                        vxc_ao_d.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(col, w)| {
-                            col.iter_mut().for_each(|v| *v *= *w);
-                        });
-                        _dgemm(ao, (0..num_basis, range_grids.clone()), 'N',
-                               &vxc_ao_d, (0..num_basis, 0..range_grids.len()), 'T',
-                               &mut vxc_mat_dense[i_spin], (0..num_basis, 0..num_basis), 1.0, 0.0);
-                    }
-                }
-                
-                // Compressed path
                 grids.contract_response_compressed(
                     &range_grids, &loc_vrho, &loc_vsigma, &loc_vtau,
                     loc_weights, &mut vxc_mat_comp, spin_channel,
                     self.use_density_gradient(), self.use_kinetic_density(),
                     &loc_rhop, num_basis,
                 );
-                
-                // Compare
-                let mut max_vxc = 0f64;
-                let mut first_diff = None;
-                for s in 0..spin_channel {
-                    for mu in 0..num_basis {
-                        for nu in 0..num_basis {
-                            let d = (vxc_mat_dense[s][[mu, nu]] - vxc_mat_comp[s][[mu, nu]]).abs();
-                            if d > max_vxc { max_vxc = d; }
-                            if d > 1e-8 && first_diff.is_none() { first_diff = Some((s, mu, nu, vxc_mat_dense[s][[mu, nu]], vxc_mat_comp[s][[mu, nu]])); }
+
+                // DEBUG compare: only at print_level >= 2 (and dense AO must exist)
+                if print_level >= 2 {
+                    if let Some(ao) = &grids.ao {
+                        let mut vxc_mat_dense: Vec<MatrixFull<f64>> = vec![MatrixFull::new([num_basis, num_basis], 0.0); spin_channel];
+                        for i_spin in 0..spin_channel {
+                            let loc_vrho_s = loc_vrho.slice_column(i_spin);
+                            let loc_ao_ref = ao.to_matrixfullslice_columns(range_grids.clone());
+                            let mut vxc_ao_d = MatrixFull::new([num_basis, range_grids.len()], 0.0);
+                            contract_vxc_0_serial(&mut vxc_ao_d, &loc_ao_ref, loc_vrho_s, None);
+                            vxc_ao_d.iter_columns_full_mut().zip(loc_weights.iter()).for_each(|(col, w)| {
+                                col.iter_mut().for_each(|v| *v *= *w);
+                            });
+                            _dgemm(ao, (0..num_basis, range_grids.clone()), 'N',
+                                   &vxc_ao_d, (0..num_basis, 0..range_grids.len()), 'T',
+                                   &mut vxc_mat_dense[i_spin], (0..num_basis, 0..num_basis), 1.0, 0.0);
+                        }
+                        let mut max_vxc = 0f64;
+                        let mut first_diff = None;
+                        for s in 0..spin_channel {
+                            for mu in 0..num_basis {
+                                for nu in 0..num_basis {
+                                    let d = (vxc_mat_dense[s][[mu, nu]] - vxc_mat_comp[s][[mu, nu]]).abs();
+                                    if d > max_vxc { max_vxc = d; }
+                                    if d > 1e-8 && first_diff.is_none() { first_diff = Some((s, mu, nu, vxc_mat_dense[s][[mu, nu]], vxc_mat_comp[s][[mu, nu]])); }
+                                }
+                            }
+                        }
+                        println!(" [DEBUG-non0tab] vxc_mat: max|Δ|={:.2e} nao={}", max_vxc, num_basis);
+                        if let Some((s, mu, nu, dval, cval)) = first_diff {
+                            println!(" [DEBUG-non0tab] vxc_mat first diff: spin={} mu={} nu={} dense={:.6e} comp={:.6e}", s, mu, nu, dval, cval);
                         }
                     }
                 }
-                println!(" [DEBUG-non0tab] vxc_mat: max|Δ|={:.2e} nao={}", max_vxc, num_basis);
-                if let Some((s, mu, nu, dval, cval)) = first_diff {
-                    println!(" [DEBUG-non0tab] vxc_mat first diff: spin={} mu={} nu={} dense={:.6e} comp={:.6e}", s, mu, nu, dval, cval);
-                }
-                
+
                 // Use compressed result
                 for s in 0..spin_channel {
                     loc_vxc_mat[s] = vxc_mat_comp[s].clone();
@@ -3576,9 +3576,10 @@ impl Grids {
             });
         }
 
-        // -- Compress AOP --
-        if let (Some(ref aop), true) = (&self.aop, !non0tab.batch_aop_indices.is_empty()) {
-            let nbatches = non0tab.batch_aop_indices.len();
+        // -- Compress AOP (use same AO-based index set so that
+        //    aop_batch rows match batch_ao rows in contract_response_compressed) --
+        if let (Some(ref aop), true) = (&self.aop, !non0tab.batch_ao_indices.is_empty()) {
+            let nbatches = non0tab.batch_ao_indices.len();
             let mut batches = Vec::with_capacity(nbatches);
             let mut batch_grid_ranges = Vec::with_capacity(nbatches);
 
@@ -3586,7 +3587,7 @@ impl Grids {
                 let g_start = ibatch * non0tab.blksize;
                 let g_end = (g_start + non0tab.blksize).min(non0tab.ngrids);
                 let nbatch = g_end - g_start;
-                let indices = &non0tab.batch_aop_indices[ibatch];
+                let indices = &non0tab.batch_ao_indices[ibatch];
                 let n_active = indices.len();
 
                 let mut batch_aop: [MatrixFull<f64>; 3] = [
@@ -3609,7 +3610,7 @@ impl Grids {
 
             self.aop_compressed = Some(CompressedGridAOP {
                 batches,
-                batch_aop_map: non0tab.batch_aop_indices.clone(),
+                batch_aop_map: non0tab.batch_ao_indices.clone(),
                 batch_grid_ranges,
                 blksize: non0tab.blksize,
                 nao_total: non0tab.nao,
