@@ -47,6 +47,7 @@
 //! ![image](/home/igor/Documents/Package-Pool/rest_workspace/rest/figures/REST电子结构程序6-2.png) 
 //! 
 #![allow(unused)]
+#![allow(non_snake_case)]
 extern crate rest_tensors as tensors;
 extern crate hdf5_metno as hdf5;
 extern crate chrono as time;
@@ -69,11 +70,14 @@ pub mod mpi_io;
 pub mod grad;
 pub mod post_scf_analysis;
 pub mod main_driver;
+pub mod ri_jk;
 pub mod ri_pt2;
 pub mod ri_rpa;
 pub mod ri_gw;
 pub mod ri_bse;
 pub mod solvent;
+pub mod ri_tddft;
+pub mod ri_cphf;
 
 //extern crate rest;
 

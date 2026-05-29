@@ -1,0 +1,298 @@
+/// TDDFT solver orchestrator
+///
+/// Coordinates the full TDDFT calculation:
+/// 1. Read control parameters
+/// 2. Prepare fxc kernel data
+/// 3. Obtain and reshape RI integrals
+/// 4. Build diagonal preconditioner
+/// 5. Generate initial guess
+/// 6. Call Davidson solver (TDA or full LR)
+/// 7. Print excitation energies and properties
+
+use rest_tensors::MatrixFull;
+use crate::scf_io::SCF;
+use crate::ri_bse::{davidson_solver, dipoles};
+use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
+use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data};
+use crate::ri_tddft::matvec::{self, a_matvec, b_matvec};
+use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_get_submatrix, compute_tddft_dipole_matrix};
+
+/// Main TDDFT entry point
+///
+/// Called from main_driver after SCF convergence.
+/// Expects scf.mol.ctrl.tddft to be Some(...) with valid TDDFT parameters.
+pub fn tddft_main(scf: &mut SCF) -> Result<(), String> {
+    // ═══ Step 1: Extract control parameters ═══
+    let tddft_ctrl = scf.mol.ctrl.tddft.clone()
+        .ok_or_else(|| "TDDFT control parameters not set".to_string())?;
+    let nroots = tddft_ctrl.nroots.max(1);
+    let tddft_method = tddft_ctrl.tddft_method.clone();
+    let tddft_spin = tddft_ctrl.tddft_spin.clone();
+    let xlet = if tddft_spin == "singlet" { 'S' } else if tddft_spin == "triplet" { 'T' } else { 'R' };
+    let is_tda = tddft_method == "tda" || tddft_method == "TDA";
+
+    println!("\n=== TDDFT Calculation ===");
+    println!("Method: {}", if is_tda { "TDA" } else { "Full LR" });
+    println!("Spin: {}", if xlet == 'S' { "Singlet" } else { "Triplet" });
+    println!("Number of roots: {}", nroots);
+
+    // ═══ Step 2: Get orbital dimensions ═══
+    let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
+        tddft_occupation_parameters(scf);
+    let dim = occ_size * vir_size;
+    if dim == 0 {
+        return Err("No occupied-virtual excitation space (all orbitals frozen)".to_string());
+    }
+    println!("occ_size={}, vir_size={}, dim={}", occ_size, vir_size, dim);
+
+    // ═══ Step 3: Prepare fxc data ═══
+    let fxc_data = prepare_fxc_data(scf);
+    let alpha_hybrid = fxc_data.alpha_hybrid;
+
+    // ═══ Step 4: Obtain and reshape RI integrals ═══
+    println!("Obtaining RI integrals...");
+    let ri_ov = tddft_get_submatrix(scf, 'O', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
+    let ri_oo = tddft_get_submatrix(scf, 'O', 'O', start_mo, occ_size, vir_size, homo, lumo, num_state);
+    let ri_vv = tddft_get_submatrix(scf, 'V', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
+    let num_auxbas = ri_ov.size[0];
+    println!("num_auxbas = {}", num_auxbas);
+
+    // Reshape RI_OO for A-block exchange: [naux, occ*occ] → [occ*naux, occ]
+    let mut ri_oo_exch = ri_oo.clone();
+    ri_oo_exch.reshape([num_auxbas * occ_size, occ_size]);
+    ri_oo_exch = ri_oo_exch.transpose_and_drop();
+    ri_oo_exch.reshape([occ_size * num_auxbas, occ_size]);
+
+    // Reshape RI_VV for A-block exchange: [naux, vir*vir] → [naux*vir, vir]
+    let mut ri_vv_exch = ri_vv.clone();
+    ri_vv_exch.reshape([num_auxbas * vir_size, vir_size]);
+
+    // Reshape RI_OV for B-block exchange: [naux, occ*vir] → [naux*occ, vir]
+    let mut ri_ov_exch = ri_ov.clone();
+    ri_ov_exch.reshape([num_auxbas * occ_size, vir_size]);
+
+    // ═══ Step 5: Build diagonal preconditioner ═══
+    let hdiag = matvec::build_hdiag(scf);
+    println!("Diagonal preconditioner built, min gap = {:.6}",
+        hdiag.iter().fold(f64::INFINITY, |a, &b| a.min(b)));
+
+    // ═══ Step 6: Generate initial guess ═══
+    let init_nroots = nroots.min(dim);
+    let initial_guess = davidson_solver::generate_initial_guess(&hdiag, init_nroots);
+    println!("Initial guess generated: {} vectors", initial_guess.size[1]);
+
+    // ═══ Step 7: Prepare control parameters for Davidson solver ═══
+    let converged_tol = tddft_ctrl.davidson_tol.max(1e-12);
+    let max_iter = tddft_ctrl.davidson_max_iter.max(10);
+    let max_subspace = (nroots * 4).max(tddft_ctrl.davidson_max_subspace).min(dim);
+    let add_dim = nroots.min(tddft_ctrl.davidson_max_subspace).max(2)
+        .min((dim / 2).max(nroots));
+    // Ensure max_subspace > add_dim to prevent subtraction underflow
+    let max_subspace = max_subspace.max(add_dim + 1).min(dim);
+
+    // The tda_davidson_solver needs QuasiParticle for control params.
+    // Construct a minimal one with TDDFT-specific settings.
+    let qp_ctrl = QuasiParticle {
+        davidson_maximum_subspace_size: max_subspace,
+        davidson_restart_dimensions: nroots.max(2),
+        davidson_add_dimensions: add_dim,
+        davidson_max_iter: max_iter,
+        bse_spin: tddft_spin.clone(),
+        bse_cutoff_energy: 1e6,
+        bse_exchange_rescaling: 1.0,
+        davidson_converge_threshold: converged_tol,
+        ..QuasiParticle::default()
+    };
+
+    // ═══ Step 8: Diagnostic: check A matrix symmetry for first few columns ═══
+    {
+        let ndiag = dim.min(6);
+        // Test A[i,j] vs A[j,i] for first ndiag columns
+        let mut a_probe = vec![0.0; ndiag * ndiag * 2]; // *2 for two sets
+        let mut e_col = vec![0.0; dim];
+        for col in 0..ndiag {
+            e_col[col] = 1.0;
+            let a_col = a_matvec(scf, &fxc_data, &ri_ov, &ri_oo_exch, &ri_vv_exch, &e_col, xlet, alpha_hybrid);
+            e_col[col] = 0.0;
+            for row in 0..ndiag {
+                a_probe[row + col * ndiag] = a_col[row];
+            }
+        }
+        let mut max_asym = 0.0;
+        let mut max_offdiag = 0.0;
+        for j in 0..ndiag {
+            for i in 0..ndiag {
+                let diff = (a_probe[i + j * ndiag] - a_probe[j + i * ndiag]).abs();
+                if diff > max_asym { max_asym = diff; }
+                if i != j {
+                    let off = a_probe[i + j * ndiag].abs();
+                    if off > max_offdiag { max_offdiag = off; }
+                }
+            }
+        }
+        // Also check fxc tensor symmetry for GGA
+        if fxc_data.nvar == 4 {
+            let nv2 = 16;
+            let mut max_fxc_asym = 0.0;
+            for g in (0..fxc_data.ngrids).step_by(fxc_data.ngrids.max(1) / 10) {
+                for alpha in 0..4 {
+                    for beta in 0..4 {
+                        let idx_ab = g + alpha * fxc_data.ngrids + beta * 4 * fxc_data.ngrids;
+                        let idx_ba = g + beta * fxc_data.ngrids + alpha * 4 * fxc_data.ngrids;
+                        let diff = (fxc_data.wfxc[idx_ab] - fxc_data.wfxc[idx_ba]).abs();
+                        if diff > max_fxc_asym { max_fxc_asym = diff; }
+                    }
+                }
+            }
+            println!("    GGA fxc tensor max asymmetry = {:.2e}", max_fxc_asym);
+        }
+        println!("  A matrix diagnostic: first {}×{} submatrix", ndiag, ndiag);
+        println!("    Max asymmetry |A[i,j]-A[j,i]| = {:.2e}", max_asym);
+        println!("    Max off-diagonal element = {:.6}", max_offdiag);
+        for i in 0..ndiag.min(3) {
+            println!("    A[{},{}] = {:.10} (gap={:.10}, kernel={:.10})",
+                i, i, a_probe[i + i * ndiag], hdiag[i], a_probe[i + i * ndiag] - hdiag[i]);
+        }
+    }
+
+    // ═══ Step 8: Call Davidson solver (or full diag for small systems) ═══
+    let eigenpairs = if dim <= 15 {
+        println!("Small system (dim={}), building full A matrix for diagnosis...", dim);
+        let mut a_mat = vec![0.0; dim * dim];
+        for col in 0..dim {
+            let mut e_col = vec![0.0; dim];
+            e_col[col] = 1.0;
+            let a_col = a_matvec(scf, &fxc_data, &ri_ov, &ri_oo_exch, &ri_vv_exch, &e_col, xlet, alpha_hybrid);
+            for row in 0..dim {
+                a_mat[row + col * dim] = a_col[row];
+            }
+            if col == 0 {
+                println!("  A·e0 [0] = {:.10} (gap={:.10}, kernel={:.10})",
+                    a_col[0], hdiag[0], a_col[0] - hdiag[0]);
+            }
+        }
+        // Diagonalize
+        let mut a = MatrixFull::from_vec([dim, dim], a_mat).unwrap();
+        let (eigvecs_opt, eigvals, _info) = rest_tensors::matrix::matrix_blas_lapack::_dsyev(&a, 'V');
+        let eigvecs = eigvecs_opt.expect("dsyev failed");
+        let mut pairs: Vec<(f64, Vec<f64>)> = eigvals.iter()
+            .zip(eigvecs.iter_columns_full())
+            .map(|(e, v)| (*e, v.to_vec()))
+            .collect();
+        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        pairs.truncate(nroots.min(dim));
+        pairs
+    } else if is_tda {
+        println!("Solving TDA eigenvalue problem...");
+        davidson_solver::tda_davidson_solver(
+            scf.mol.ctrl.print_level,
+            |z: &Vec<f64>| a_matvec(scf, &fxc_data, &ri_ov, &ri_oo_exch, &ri_vv_exch, z, xlet, alpha_hybrid),
+            nroots,
+            &hdiag,
+            initial_guess,
+            &qp_ctrl,
+        )
+    } else {
+        println!("Solving full linear response eigenvalue problem...");
+        davidson_solver::lr_davidson_solver(
+            scf.mol.ctrl.print_level,
+            |z: &Vec<f64>| a_matvec(scf, &fxc_data, &ri_ov, &ri_oo_exch, &ri_vv_exch, z, xlet, alpha_hybrid),
+            |z: &Vec<f64>| b_matvec(scf, &fxc_data, &ri_ov, &ri_ov_exch, z, xlet, alpha_hybrid),
+            nroots,
+            &hdiag,
+            initial_guess,
+        )
+    };
+
+    // ═══ Step 9: Compute and print results ═══
+    let n_found = eigenpairs.len();
+    println!("\n{} {} excitations found (requested {})", n_found, tddft_spin, nroots);
+
+    // Compute dipole matrix for transition properties
+    let dipole_matrix = compute_tddft_dipole_matrix(scf, start_mo, occ_size, vir_size, homo, lumo);
+
+    let tda_flag = is_tda;
+    let n_print = n_found.min(30);
+
+    println!("\n{}", "-".repeat(80));
+    println!("{:>4}  {:>16}  {:>12}  {:>12}  {:>20}",
+        "State", "Energy (Ha)", "Energy (eV)", "Wavelength (nm)", "Osc. Strength");
+    println!("{}", "-".repeat(80));
+
+    for (n, (energy, vector)) in eigenpairs[..n_print].iter().enumerate() {
+        let energy_ev = energy * 27.2114;
+        let wavelength = 1239.84 / energy_ev;
+
+        // Normalize and compute transition dipole
+        let norm_vec = dipoles::normalize(vector, tda_flag);
+        let dipole_sq = dipoles::transition_dipole_square(&dipole_matrix, &norm_vec, tda_flag);
+        let osc_strength = dipole_sq * energy * 2.0 / 3.0;
+
+        println!("{:>4}  {:>16.8}  {:>12.4}  {:>12.2}  {:>20.8}",
+            n + 1, energy, energy_ev, wavelength, osc_strength);
+
+        // Print leading components
+        if scf.mol.ctrl.print_level > 1 {
+            let mut components: Vec<(usize, usize, f64)> = norm_vec.iter()
+                .enumerate()
+                .map(|(idx, &val)| {
+                    let i = idx % occ_size;
+                    let a = idx / occ_size;
+                    (i, a, val)
+                })
+                .collect();
+            components.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap());
+            println!("  Leading components:");
+            for (k, (i, a, val)) in components.iter().enumerate() {
+                if val.abs() > 0.05 && k < 5 {
+                    println!("    occ {} -> vir {}, amplitude = {:.6}",
+                        start_mo + i, lumo + a, val);
+                }
+            }
+        }
+    }
+
+    println!("{}", "-".repeat(80));
+    println!("TDDFT calculation completed successfully.");
+    Ok(())
+}
+
+/// Full TDA diagonalization for small systems (dim <= 3)
+/// Avoids Davidson solver issues with tiny problem sizes.
+fn full_diag_tda(
+    scf: &SCF,
+    fxc_data: &FXCMatvecData,
+    ri_ov: &MatrixFull<f64>,
+    ri_oo_exch: &MatrixFull<f64>,
+    ri_vv_exch: &MatrixFull<f64>,
+    dim: usize,
+    xlet: char,
+    alpha_hybrid: f64,
+    nroots: usize,
+) -> Vec<(f64, Vec<f64>)> {
+    // Build the full A matrix column by column
+    let mut a_mat = vec![0.0; dim * dim];
+    for col in 0..dim {
+        let mut e_col = vec![0.0; dim];
+        e_col[col] = 1.0;
+        let a_col = a_matvec(scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, &e_col, xlet, alpha_hybrid);
+        for row in 0..dim {
+            a_mat[row + col * dim] = a_col[row];
+        }
+    }
+
+    // Diagonalize
+    let n = dim;
+    let mut a = MatrixFull::from_vec([n, n], a_mat).unwrap();
+    let (eigvecs_opt, eigvals, _info) = rest_tensors::matrix::matrix_blas_lapack::_dsyev(&a, 'V');
+    let eigvecs = eigvecs_opt.expect("dsyev failed for TDA full diagonalization");
+
+    // Sort and return
+    let mut pairs: Vec<(f64, Vec<f64>)> = eigvals.iter()
+        .zip(eigvecs.iter_columns_full())
+        .map(|(e, v)| (*e, v.to_vec()))
+        .collect();
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    pairs.truncate(nroots);
+    pairs
+}

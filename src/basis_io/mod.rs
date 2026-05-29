@@ -61,7 +61,7 @@ pub struct Basis4ElemRaw {
 #[test]
 fn import_ecp()-> anyhow::Result<()> {
     let rest_home = env::var("REST_HOME").expect("The environment variable REST_HOME is not set");
-    let mut file_path = path::PathBuf::from(rest_home).join("rest/basis-set-pool/def2-SVP/Au.json");
+    let mut file_path = path::PathBuf::from(rest_home).join("rest/basis-set-pool/def2-svp/Au.json");
     let tmp_string = fs::read_to_string(file_path)?;
     let tmp_basis:Basis4ElemRaw = serde_json::from_str(&tmp_string[..])?;
     if let (Some(ecp_electrons), Some(ecp_potentials))= (&tmp_basis.ecp_electrons, &tmp_basis.ecp_potentials)  {

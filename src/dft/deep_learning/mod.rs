@@ -1,6 +1,3 @@
-use crate::scf_io::SCF;
-use crate::dft::DFA4REST;
-
 //trait DeepLearningXC {
 //    fn evaluate_model_energy(&self, scf_data: &SCF) -> f64;
 //    fn update_xc_potential(&self, scf_data: &SCF ) -> DFA4REST;
