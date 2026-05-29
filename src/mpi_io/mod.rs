@@ -103,6 +103,10 @@ impl MPIData {
             ao: None,
             aop: None,
             parallel_balancing,
+            non0tab: None,
+            ao_cutoff: grids.ao_cutoff,
+            ao_compressed: None,
+            aop_compressed: None,
         }
         
     }

@@ -132,6 +132,7 @@ impl RIUHFGradient<'_> {
         time_records.new_item("uks grad calc_de_hcore", "uks grad calc_de_hcore");
         time_records.new_item("uks grad calc_de_jk", "uks grad calc_de_jk");
         time_records.new_item("uks grad calc_de_xc", "uks grad calc_de_xc");
+        time_records.new_item("uks grad calc_de_solvent", "uks grad calc_de_solvent");
 
         time_records.count_start("uks grad");
 
@@ -147,11 +148,11 @@ impl RIUHFGradient<'_> {
         self.calc_de_hcore();
         time_records.count("uks grad calc_de_hcore");
 
-        time_records.count_start("uhf grad calc_de_qmmm");
+        time_records.count_start("uks grad calc_de_qmmm");
         self.calc_de_qmmm();
-        time_records.count("uhf grad calc_de_qmmm");
+        time_records.count("uks grad calc_de_qmmm");
 
-        if self.flags.factor_j.is_some() || self.flags.factor_k.is_some() {
+        if self.flags.factor_j.is_some() || self.flags.factor_k.is_some() || self.flags.omega.is_some() {
             time_records.count_start("uks grad calc_de_jk");
             self.calc_de_jk();
             time_records.count("uks grad calc_de_jk");
@@ -161,6 +162,10 @@ impl RIUHFGradient<'_> {
         self.calc_de_xc();
         time_records.count("uks grad calc_de_xc");
 
+        time_records.count_start("uks grad calc_de_solvent");
+        self.calc_de_solvent();
+        time_records.count("uks grad calc_de_solvent");
+
         time_records.count("uks grad");
 
         let mut de = self.result.get("de_nuc").unwrap().clone();
@@ -168,10 +173,13 @@ impl RIUHFGradient<'_> {
         de += self.result.get("de_hcore").unwrap().clone();
         self.result.get("de_j").map(|x| de += x.clone());
         self.result.get("de_k").map(|x| de += x.clone());
+        self.result.get("de_sr").map(|x| de += x.clone());
         self.result.get("de_jaux").map(|x| de += x.clone());
         self.result.get("de_kaux").map(|x| de += x.clone());
+        self.result.get("de_sraux").map(|x| de += x.clone());
         self.result.get("de_xc").map(|x| de += x.clone());
         self.result.get("de_qmmm").map(|x| de += x.clone());
+        self.result.get("de_solvent").map(|x| de += x.clone());
         self.result.insert("de".into(), de);
 
         if self.flags.print_level >= 2 {

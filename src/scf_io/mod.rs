@@ -30,7 +30,7 @@ use crate::tensors::{TensorOpt,TensorOptMut,TensorSlice};
 use crate::initial_guess::initial_guess;
 use crate::external_libs::dftd;
 use crate::constants::{SQRT_THRESHOLD};
-use crate::solvent::{PcmObject, PcmScf, solvent_prepare};
+use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
 use crate::ri_jk;
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
 use self::util::occupied_orbital_count;
@@ -46,12 +46,12 @@ pub struct SCF {
     //pub ijkl: Option<ERIFull<f64>>,
     pub ijkl: Option<ERIFold4<f64>>,
     pub ri3fn: Option<RIFull<f64>>,
-    pub ri3fn_lr: Option<RIFull<f64>>,
+    pub ri3fn_sr: Option<RIFull<f64>>,
     pub ri3fn_isdf: Option<RIFull<f64>>,
     pub tab_ao: Option<MatrixFull<f64>>,
     pub m: Option<MatrixFull<f64>>,
     pub rimatr: Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
-    pub rimatr_lr: Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
+    pub rimatr_sr: Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
     pub ri3mo: Option<Vec<(RIFull<f64>,std::ops::Range<usize> , std::ops::Range<usize>)>>,
     pub ri3mo_full:Option<Vec<(RIFull<f64>,std::ops::Range<usize> , std::ops::Range<usize>)>>,
     pub ri3fn_bse: Option<RIFull<f64>>,
@@ -108,12 +108,12 @@ impl SCF {
             h_core: MatrixUpper::new(1,0.0),
             ijkl: None,
             ri3fn: None,
-            ri3fn_lr: None,
+            ri3fn_sr: None,
             ri3fn_isdf: None,
             tab_ao: None,
             m: None,
             rimatr: None,
-            rimatr_lr: None,
+            rimatr_sr: None,
             ri3mo: None,
             ri3mo_full:None,
             ri3fn_bse: None,
@@ -212,7 +212,7 @@ impl SCF {
             println!("Checking memory requirement for RI J/K algorithms...");
             let nao = mol.num_basis;
             let naux = mol.num_auxbas;
-            // range-separate hybrid functionals requires double memory for RI integrals due to the need of both standard RI and long-range RI integrals.
+            // range-separate hybrid functionals requires double memory for RI integrals due to the need of both standard RI and short-range RI integrals.
             let scale_rsh = if mol.xc_data.is_rsh() { 2.0 } else { 1.0 };
             // TODO: for safety, we add factor 1.5 to the memory requirement
             let mem_cderi_mb = 1.5 * scale_rsh * 8.0 * (0.5 * (nao * nao * naux) as f64) / 1024.0 / 1024.0;
@@ -419,7 +419,7 @@ impl SCF {
 
         // For RSH: J uses on-the-fly shell-based ERI (generate_vj_on_the_fly_par).
         // K_full still needs standard rimatr (generate_vk_ri_direct has unresolved RSTSR bug).
-        // K_erfc uses rimatr_lr.
+        // K_erfc uses rimatr_sr.
         // TODO: when generate_vk_ri_direct is fixed, add `if !is_rsh` to skip standard rimatr for RSH.
         {
             // preparing the three-center integrals in the full format
@@ -450,20 +450,20 @@ impl SCF {
             };
         }
 
-        // build long-range 3c RI integrals for range-separated hybrid (RSH) functionals
+        // build short-range 3c RI integrals for range-separated hybrid (RSH) functionals
         if is_rsh && use_eri_jk {
             let omega = self.mol.xc_data.omega().unwrap();
             if self.mol.ctrl.print_level > 0 {
-                println!("Building long-range 3c RI integrals for RSH (omega = {:.4})", omega);
+                println!("Building short-range 3c RI integrals for RSH (omega = {:.4})", omega);
             }
             if ri3fn_symm {
-                // Note: LR RI omega is negative in libcint's convention.
-                self.rimatr_lr = Some(self.mol.prepare_rimatr_for_ri_v_mpi_rayon(Some(-omega), mpi_operator));
+                // Note: SR RI omega is negative in libcint's convention.
+                self.rimatr_sr = Some(self.mol.prepare_rimatr_for_ri_v_mpi_rayon(Some(-omega), mpi_operator));
             } else {
-                self.ri3fn_lr = Some(self.mol.prepare_ri3fn_lr_rayon(omega));
+                self.ri3fn_sr = Some(self.mol.prepare_ri3fn_sr_rayon(omega));
             }
             if self.mol.ctrl.print_level > 0 {
-                println!("  LR 3c integrals built.");
+                println!("  SR 3c integrals built.");
             }
         }
 
@@ -550,7 +550,26 @@ impl SCF {
         } else {None};
 
         if let Some(grids) = &mut self.grids {
-            grids.prepare_tabulated_ao(&self.mol);
+            grids.ao_cutoff = self.mol.ctrl.ao_cutoff;
+            if grids.ao_cutoff > 0.0 {
+                // sparse path: two-pass batch scan → compressed directly, no dense allocation
+                grids.prepare_tabulated_ao_sparse(&self.mol);
+            } else {
+                // dense path: allocate full AO/AOP, then optionally build non0tab + compressed
+                grids.prepare_tabulated_ao(&self.mol);
+                grids.build_non0tab(&self.mol);
+                grids.build_compressed_storage();
+            }
+            if self.mol.ctrl.drop_dense_ao && grids.ao_compressed.is_some() {
+                if self.mol.ctrl.print_level >= 1 {
+                    let (dense_bytes, comp_bytes, _) = grids.memory_footprint();
+                    let ratio = if dense_bytes > 0 { comp_bytes as f64 / dense_bytes as f64 * 100.0 } else { 0.0 };
+                    println!(" [non0tab] dropping dense ao/aop, dense={:.1}GB, compressed={:.1}GB ({:.1}%)",
+                        dense_bytes as f64 / 1e9, comp_bytes as f64 / 1e9, ratio);
+                }
+                grids.ao = None;
+                grids.aop = None;
+            }
         }
     }
 
@@ -2053,15 +2072,15 @@ impl SCF {
         let dt2 = time::Local::now();
 
         // Standard hybrid exchange: K_total = hyb * K_full + (alpha-hyb) * K_erf
-        // Since we have K_erfc (from LR rimatr), K_erf = K_full - K_erfc
+        // Since we have K_erfc (from SR rimatr), K_erf = K_full - K_erfc
         // So: K_total = alpha * K_full - (alpha-hyb) * K_erfc
         // F_ex = base_scaling * alpha * K_full + (-base_scaling) * (alpha-hyb) * K_erfc
         let base_scaling = match self.scftype { SCFType::RHF => -0.5, _ => -1.0 };
 
         if let Some((omega, alpha, _)) = self.mol.xc_data.rsh_params() {
             let hyb = self.mol.xc_data.dfa_hybrid_scf;
-            let scaling_kfull = base_scaling * alpha;            // alpha * K_full
-            let scaling_klr = -base_scaling * (alpha - hyb);    // - (alpha-hyb) * K_erfc  (note: sign flipped)
+            let scaling_kfull = base_scaling * alpha;           // alpha * K_full
+            let scaling_ksr = -base_scaling * (alpha - hyb);    // - (alpha-hyb) * K_erfc  (note: sign flipped)
 
             // Full K: alpha * K_full
             if scaling_kfull.abs() > 1e-10 {
@@ -2077,30 +2096,30 @@ impl SCF {
                 }
             }
 
-            // LR correction: -(alpha-hyb) * K_erfc → scaling_klr * K_erfc where scaling_klr = -base_scaling*(alpha-hyb)
+            // SR correction: -(alpha-hyb) * K_erfc → scaling_ksr * K_erfc where scaling_ksr = -base_scaling*(alpha-hyb)
             // For ri-direct, pass omega so libcint computes erfc(ωr)/r integrals on the fly.
-            // For ri-incore, use the pre-built rimatr_lr / ri3fn_lr.
-            if scaling_klr.abs() > 1e-10 {
-                let vk_lr = match self.algorithm_jk {
+            // For ri-incore, use the pre-built rimatr_sr / ri3fn_sr.
+            if scaling_ksr.abs() > 1e-10 {
+                let vk_sr = match self.algorithm_jk {
                     AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => {
-                        self.generate_vk_ri_direct(scaling_klr, self.mol.ctrl.use_dm_only, None, Some(-omega))
+                        self.generate_vk_ri_direct(scaling_ksr, self.mol.ctrl.use_dm_only, None, Some(-omega))
                     }
                     _ => {
-                        if self.rimatr_lr.is_some() {
+                        if self.rimatr_sr.is_some() {
                             let dm = &self.density_matrix;
-                            vk_upper_with_rimatr_use_dm_only_sync(&self.rimatr_lr, dm, spin_channel, scaling_klr)
-                        } else if self.ri3fn_lr.is_some() {
+                            vk_upper_with_rimatr_use_dm_only_sync(&self.rimatr_sr, dm, spin_channel, scaling_ksr)
+                        } else if self.ri3fn_sr.is_some() {
                             let dm = &self.density_matrix;
-                            vk_upper_with_ri_v_use_dm_only_sync(&self.ri3fn_lr, dm, spin_channel, scaling_klr)
+                            vk_upper_with_ri_v_use_dm_only_sync(&self.ri3fn_sr, dm, spin_channel, scaling_ksr)
                         } else {
                             vec![MatrixUpper::empty(); spin_channel]
                         }
                     }
                 };
                 for i_spin in 0..spin_channel {
-                    if !vk_lr[i_spin].data.is_empty() {
+                    if !vk_sr[i_spin].data.is_empty() {
                         self.hamiltonian[i_spin].data.par_iter_mut()
-                            .zip(vk_lr[i_spin].data.par_iter()).for_each(|(h,v)| *h += v);
+                            .zip(vk_sr[i_spin].data.par_iter()).for_each(|(h,v)| *h += v);
                     }
                 }
             }
@@ -3051,7 +3070,7 @@ impl SCF {
                 // change the return of xc_exc_vxc, directly return vxc_mat [num_basis, num_basis]
                 // let (exc,vxc_ao,total_elec) = self.mol.xc_data.xc_exc_vxc_slots_dm_only(range_grids.clone(), grids, spin_channel,dm, mo, occ);
                 //exc_spin = exc;
-                let (exc, vxc_mf, total_elec) = self.mol.xc_data.xc_exc_vxc_slots_dm_only(range_grids.clone(), grids, spin_channel,dm, mo, occ);
+                let (exc, vxc_mf, total_elec) = self.mol.xc_data.xc_exc_vxc_slots_dm_only(range_grids.clone(), grids, spin_channel,dm, mo, occ, self.mol.ctrl.print_level, self.mol.ctrl.vxc_screen_threshold);
                 // let mut vxc_mf: Vec<MatrixFull<f64>> = vec![MatrixFull::new([num_basis,num_basis],0.0f64);spin_channel];;
                 // if let Some(ao) = &grids.ao {
                 //     for i_spin in 0..spin_channel {
@@ -3241,7 +3260,7 @@ impl SCF {
                 // change the return value of xc_exc_vxc by vxc_mat [num_basis, num_basis]
                 // let (exc,vxc_ao,total_elec) = self.mol.xc_data.xc_exc_vxc_slots(range_grids.clone(), grids, spin_channel,dm, mo, occ);
                 //exc_spin = exc;
-                let (exc, vxc_mf, total_elec) = self.mol.xc_data.xc_exc_vxc_slots(range_grids.clone(), grids, spin_channel, dm, mo, occ);
+                let (exc, vxc_mf, total_elec) = self.mol.xc_data.xc_exc_vxc_slots(range_grids.clone(), grids, spin_channel, dm, mo, occ, self.mol.ctrl.print_level, self.mol.ctrl.vxc_screen_threshold);
                 // let mut vxc_mf: Vec<MatrixFull<f64>> = vec![MatrixFull::new([num_basis,num_basis],0.0f64);spin_channel];;
                 // if let Some(ao) = &grids.ao {
                 //     for i_spin in 0..spin_channel {
@@ -5417,6 +5436,7 @@ pub fn initialize_scf(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
     time_mark.new_item("Solvent Calculation", "Initialization of the solvent calculation");
     time_mark.count_start("Solvent Calculation");
     scf_data.prepare_solvent_calculation();
+    time_mark.count("Solvent Calculation");
 
     time_mark.new_item("ISDF", "ISDF initialization");
     time_mark.count_start("ISDF");
@@ -5513,22 +5533,27 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
 
         scf_data.generate_density_matrix();
 
+        let dt_solv0 = time::Local::now();
         if scf_data.mol.use_solvent {
             if let Some(solvent_static) = scf_data.solvent_static_obj.as_ref() {
                 let s_static = PcmScf::get_pcm_refresh(
                     &solvent_static.surface, 
                     &scf_data.mol, 
                     &scf_data.density_matrix, 
-                    solvent_static.pstatic.K.clone(),
-                    solvent_static.pstatic.R.clone(),
-                    solvent_static.pstatic.v_grids_n.clone(),
-                    &scf_data.mol.spin_channel
+                    &solvent_static.pstatic.K,
+                    &solvent_static.pstatic.K_ipiv,
+                    &solvent_static.pstatic.R,
+                    &solvent_static.pstatic.v_grids_n,
+                    &scf_data.mol.spin_channel,
+                    &scf_data.mol.ctrl.max_memory,
+                    &scf_data.mol.ctrl.solv_chunk,
+                    scf_data.mol.ctrl.solvent_ri
                 );
                 scf_data.energies.insert(String::from("solvent_energy"), vec![s_static.eng]);
                 scf_data.solvent_scf = Some(s_static);
             }
         }
-        
+        let dt_solv1 = time::Local::now();
 
         if scf_data.mol.ctrl.print_level>1 {
             scf_data.print_homo_lumo_gap()
@@ -5593,6 +5618,8 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             println!("check_scf_convergence:   {:10.2}s", timecost);
             let timecost = (dt1_5.timestamp_millis()-dt1_4.timestamp_millis()) as f64 /1000.0;
             println!("scf_records.update:      {:10.2}s", timecost);
+            let timecost = (dt_solv1.timestamp_millis()-dt_solv0.timestamp_millis()) as f64 /1000.0;
+            println!("solvent_model.refresh:   {:10.2}s", timecost);
         }
     }
     if scf_converge[0] {
@@ -5635,7 +5662,9 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             println!("ERROR: solvent_scf is None");
         }
 
-        //debug_print_pcm(&scf_data.solvent_static_obj.as_ref().unwrap().pstatic, &scf_data.solvent_scf.as_ref().unwrap());
+        if scf_data.mol.ctrl.print_level >= 2{
+            debug_print_pcm(&scf_data.solvent_static_obj.as_ref().unwrap().pstatic, &scf_data.solvent_scf.as_ref().unwrap());
+        }
     }
     
     if scf_data.mol.ctrl.print_level>1 {
