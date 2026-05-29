@@ -11,7 +11,7 @@ use rest_libcint::prelude::rest_libcint_wrapper::int1e_r;
 use tensors::{MathMatrix, MatrixFull, RIFull};
 
 use crate::constants::{ANG, AU2DEBYE, SPECIES_INFO};
-use crate::dft::DFAFamily;
+use crate::dft::{DFAFamily};
 use crate::geom_io::get_mass_charge;
 use crate::grad::{formated_force, formated_force_ev, numerical_force};
 use crate::mpi_io::MPIOperator;
@@ -57,6 +57,20 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
                 panic!("The MPI version is not yet implemented for generating orbital cube files");
             } else {
                 cube_build::get_cube_orb(&scf_data);
+            }
+        } else if output_type.eq("tabulated_exc") {
+            println!("Now tabulating e_[xc] to each grid points");
+            if let Some(mpi_op) = &mpi_operator {
+                panic!("The MPI version is not yet implemented for tabulating e_[xc] to each grid points");
+            } else {
+                if let Some(grids) = &scf_data.grids {
+                    let dm = &scf_data.density_matrix;
+                    let mo = &scf_data.eigenvectors;
+                    let occ = &scf_data.occupation;
+                    scf_data.mol.xc_data.post_tabulated_exc(grids, dm, mo, occ);
+                } else {
+                    panic!("The grids are not yet initialized");
+                }
             }
         } else if output_type.eq("molden") {
             if let Some(mpi_op) = &mpi_operator {
@@ -316,6 +330,18 @@ pub fn print_out_dfa(scf_data: &SCF) {
     });
 }
 
+pub fn print_out_xc_potentials(scf_data: &SCF) {
+    let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);
+    let post_xc_energy = if let Some(grids) = &scf_data.grids {
+        dfa.post_xc_exc(&scf_data.mol.ctrl.post_xc, grids, &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation)
+    } else {
+        vec![[0.0,0.0]]
+    };
+    post_xc_energy.iter().zip(scf_data.mol.ctrl.post_xc.iter()).for_each(|(energy, name)| {
+        println!("{:<16}: {:16.8} Ha", name, energy[0]+energy[1]);
+    });
+}
+
 pub fn post_ai_correction(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> Option<Vec<f64>> {
     let xc_method = &scf_data.mol.ctrl.xc.to_lowercase();
     let post_ai_corr = &scf_data.mol.ctrl.post_ai_correction.to_lowercase();
@@ -370,8 +396,8 @@ pub fn post_scf_correlation(scf_data: &mut SCF) {
                 } else {
                     open_shell_pt2_rayon(&scf_data).unwrap()
                 };
-                let os_factor = scf_data.mol.ctrl.pt2_os_factor.unwrap_or(1.0);
-                let ss_factor = scf_data.mol.ctrl.pt2_ss_factor.unwrap_or(1.0);
+                let os_factor = scf_data.mol.ctrl.ri_pt2.os_factor.unwrap_or(1.0);
+                let ss_factor = scf_data.mol.ctrl.ri_pt2.ss_factor.unwrap_or(1.0);
                 if scf_data.mol.ctrl.print_level > 1 && (os_factor != 1.0 || ss_factor != 1.0) {
                     println!("PT2 scaling factors: OS: {:16.8}, SS: {:16.8}", os_factor, ss_factor);
                 }
@@ -433,11 +459,17 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
     let output_type=qp_ctrl.gw_or_bse.clone();
     if output_type.eq("gw"){
         let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
-        if qp_ctrl.gw_scheme !="no gw" || qp_ctrl.homo_lumo_gw_qp==true{
-            ri_bse::prepare_ri3mo(scf_data,'Y');
-        }
+        let xc_data=scf_data.mol.xc_data.clone();
+        println!("Current XC data:");
+        println!("dfa_compnt_scf={:?}",xc_data.dfa_compnt_scf);
+        println!("dfa_paramr_scf={:?}",xc_data.dfa_paramr_scf);
+        println!("dfa_hybrid_scf={}",xc_data.dfa_hybrid_scf);
         if qp_ctrl.homo_lumo_gw_qp==true{
             ri_gw::get_homo_lumo_qp_only(scf_data,20,&vxc_nn,mpi_operator);
+        }else if qp_ctrl.self_energy_spectrum_test==true{
+            ri_gw::spectrum_test(scf_data,20);
+        }else if qp_ctrl.obtain_vx_vc_terms==true{
+            ri_gw::obtain_vx_vc_terms(scf_data);
         }else{
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
             if scf_data.mol.ctrl.print_level>1{
@@ -445,18 +477,52 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             }
         }
     }else if output_type.eq("bse"){
+        // Prepare BSE-specific RI integrals before BSE calculation
+        scf_data.prepare_bse_integrals(mpi_operator);
+
         if qp_ctrl.gw_scheme=="parse from file"{
             let parse_qp_path=qp_ctrl.parse_qp_path.clone();
             scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
         }else{
-            let mut rimatr=scf_data.rimatr.clone();
-            ri_bse::prepare_ri3mo(scf_data,'Y');
-            scf_data.rimatr=rimatr;
-            rimatr=None;
             let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
         }
         ri_bse::bse_main(scf_data);
+    }else if output_type.eq("damped_bse"){
+        if qp_ctrl.gw_scheme=="parse from file"{
+            let parse_qp_path=qp_ctrl.parse_qp_path.clone();
+            scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
+        }else{
+            let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
+            ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
+        }
+        let p_induced=ri_bse::damped::damped_bse(scf_data);
+        // println!("Induced Density Matrix:");
+        // println!("P Real (Plus Half):\n{:#?}",p_induced.0);
+        // println!("P Real (Minus Half):\n{:#?}",p_induced.1);
+        // println!("P Imaginary (Plus Half):\n{:#?}",p_induced.2);
+        // println!("P Imaginary (Minus Half):\n{:#?}",p_induced.3);
+    }else if output_type.eq("nonlinear_bse"){
+        // NLFEAST requires GW quasiparticle energies for diagonal elements
+        if qp_ctrl.gw_scheme=="parse from file"{
+            let parse_qp_path=qp_ctrl.parse_qp_path.clone();
+            scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
+        }else{
+            let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
+            ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
+        }
+        ri_bse::nonlinbse::nlfeast_bse_main(scf_data, &qp_ctrl);
+    }else if output_type.eq("dynamic_bse"){
+        // Dynamic BSE (new IA-pair projection scheme)
+        // Requires GW quasiparticle energies
+        if qp_ctrl.gw_scheme=="parse from file"{
+            let parse_qp_path=qp_ctrl.parse_qp_path.clone();
+            scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
+        }else{
+            let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
+            ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
+        }
+        ri_bse::dynamicbse::dynamic_bse_main(scf_data, &qp_ctrl);
     }else{
         print!("Warning: You entered an invalid quasiparticle method. No quasiparticle methods Were triggered.")
     }

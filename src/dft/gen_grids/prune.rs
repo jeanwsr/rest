@@ -5,11 +5,10 @@
 //! 
 //! [^1]: [P. M. W. Gill, B. G. Johnson, J. A. Pople. Chemical Physics Letters 209, 506-512 (1993)](https://doi.org/10.1016/0009-2614(93)80125-9).
 
-use num_traits::{ToPrimitive, Float};
+use num_traits::{ToPrimitive};
 use tensors::MatrixFull;
-
 //use super::parameters::{SG1RADII, BOHR, BRAGG0, LEBEDEV_NGRID};
-use crate::{molecule_io::Molecule, scf_io::SCF, dft::Grids, utilities::balancing};
+use crate::{dft::Grids, utilities::balancing};
 use super::{parameters::{SG1RADII, BOHR, BRAGG0, LEBEDEV_NGRID}, atom::default_angular_num};
 
 /// Standard Grid 1 according to _P. M. W. Gill, B. G. Johnson, J. A. Pople. Chemical Physics Letters 209, 506-512 (1993)_.<br>

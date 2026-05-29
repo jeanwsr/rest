@@ -75,7 +75,13 @@ pub fn get_rest_basis_dir(print_level:usize) -> Vec<String> {
 
 lazy_static!{
     static ref BASIS_ALIAS: HashMap<&'static str, &'static str> = HashMap::from([
-        ("def2-sv(p)-jkfit", "def2-universal-jkfit")
+        ("def2-sv(p)-jkfit", "def2-universal-jkfit"),
+        ("6-31g**-rifit", "6-31gss-rifit"),
+        ("6-311g**-rifit", "6-311gss-rifit")
+    ]);
+
+    static ref BASIS_MISSING_WARN: HashMap<&'static str, &'static str> = HashMap::from([
+        ("def2-svp-jkfit", "not supported, please use def2-universal-jkfit instead")
     ]);
 } 
 
@@ -84,6 +90,9 @@ pub fn filter_by_alias(basis_name: &String) -> String {
         let alias_name = BASIS_ALIAS.get(basis_name.as_str()).unwrap();
         println!("The basis set name {} is an alias to {}", basis_name, alias_name);
         alias_name.to_string()
+    } else if BASIS_MISSING_WARN.contains_key(basis_name.as_str()) {
+        let warn_msg = BASIS_MISSING_WARN.get(basis_name.as_str()).unwrap();
+        panic!("The basis set {} is {}", basis_name, warn_msg);
     } else {
         basis_name.clone()
     }

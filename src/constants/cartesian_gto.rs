@@ -202,7 +202,7 @@ pub const CAR_BAS_INFO_L6: CarBasInfo = CarBasInfo::L6(DMatrix4x28 {
 });
 
 impl CarBasInfo {
-    pub fn to_matrixfullslice(&self) -> MatrixFullSlice<f64> {
+    pub fn to_matrixfullslice(&self) -> MatrixFullSlice<'_, f64> {
         match &self {
             CarBasInfo::L0(matr) => {
                 MatrixFullSlice {

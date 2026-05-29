@@ -2,7 +2,7 @@
 
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
-use std::{collections::HashMap, f64::MAX};
+use std::{collections::HashMap};
 
 #[derive(Deserialize, Debug)]
 struct Basis {

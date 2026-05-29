@@ -4,10 +4,11 @@ extern crate rest_tensors as tensors;
 extern crate chrono as time;
 extern crate hdf5_metno as hdf5;
 use std::{f64, fs::File, io::{Write,Read}};
+use std::io;
 use std::path::PathBuf;
 use crate::basis_io::ecp::ghost_effective_potential_matrix;
 use crate::external_field::num_dipole::numerical_dipole;
-use crate::geom_io::{GeomUnit};
+use crate::geom_io::{GeomUnit, get_mass_charge};
 use num_traits::Pow;
 use pyo3::prelude::*;
 use autocxx::prelude::*;
@@ -15,6 +16,7 @@ use crate::ctrl_io::JobType;
 use crate::constants::{ANG, AU2DEBYE};
 use crate::scf_io::{scf_without_build, SCFType, SCF};
 use tensors::{MathMatrix, MatrixFull};
+use tensors::matrix_blas_lapack::_dsyevd;
 use crate::{utilities, ri_pt2, ri_rpa, dft, scf_io, post_scf_analysis};
 
 //use rayon;
@@ -233,17 +235,15 @@ pub fn main_driver() -> anyhow::Result<()> {
                 panic!("Invalid optimization engine: {}", opt_engine);
             }
         },
+        // UNVERIFIED NORMAL MODES CALCULATION
+        // JobType::NormalModes => {
+        //     eval_normal_modes(&mut scf_data, &mut time_mark, &mpi_operator);
+        // },
+        // ------------
         _ => {}
     }
 
-    //let mut grad_data = Gradient::build(&scf_data.mol, &scf_data);
-
-    //grad_data.calc_j(&scf_data.density_matrix);
-    //print!("occ, {:?}", scf_data.occupation);
-
-    //time_mark.count("SCF");
-
-    if scf_data.mol.ctrl.restart {
+    if scf_data.mol.ctrl.has_chkfile {
         if let Some(mp_op) = &mpi_operator {
             if mp_op.rank == 0 {
                 println!("Rank 0: now save the converged SCF results");
@@ -309,6 +309,49 @@ pub fn main_driver() -> anyhow::Result<()> {
         print!("Now starts quasiparticle method computation!\n");
         quasiparticle_methods(&mut scf_data,&mpi_operator);
     }
+
+    //===================================
+    // Now for TDDFT calculations
+    //===================================
+    if let Some(tddft_ctrl) = &scf_data.mol.ctrl.tddft {
+        if !tddft_ctrl.damped_tddft {
+            time_mark.new_item("TDDFT", "the TDDFT eigenvalue calculation");
+            time_mark.count_start("TDDFT");
+            if let Err(e) = crate::ri_tddft::tddft_main(&mut scf_data) {
+                eprintln!("Error in TDDFT calculation: {}", e);
+            }
+            time_mark.count("TDDFT");
+        }
+    }
+
+    //===================================
+    // Now for damped TDDFT calculations
+    //===================================
+    if let Some(tddft_ctrl) = &scf_data.mol.ctrl.tddft {
+        if tddft_ctrl.damped_tddft {
+            time_mark.new_item("DampedTDDFT", "the damped TDDFT calculation");
+            time_mark.count_start("DampedTDDFT");
+            if let Err(e) = crate::ri_tddft::damped_tddft(&mut scf_data) {
+                eprintln!("Error in damped TDDFT calculation: {}", e);
+            }
+            time_mark.count("DampedTDDFT");
+        }
+    }
+
+    //===================================
+    // Now for CP-HF calculations
+    //===================================
+    if let Some(cphf_ctrl) = &scf_data.mol.ctrl.cphf {
+        let label = if cphf_ctrl.solver == "dense" { "dense" } else { "krylov" };
+        println!("\n=== CP-HF Calculation (solver={}) ===", label);
+        time_mark.new_item("CPHF", &format!("the CP-HF {} solver test", label));
+        time_mark.count_start("CPHF");
+        if let Err(e) = crate::ri_cphf::test_cphf_dense(&scf_data) {
+            eprintln!("Error in CP-HF calculation: {}", e);
+        }
+        time_mark.count("CPHF");
+    }
+
     time_mark.count("Overall");
 
     if scf_data.mol.ctrl.print_level > 0 {
@@ -357,69 +400,22 @@ pub fn output_result(scf_data: &scf_io::SCF) {
     //===========================================================
     // 3. Print energies corresponding to the functional family
     //===========================================================
-
     //--------------------------
-    // MP2 / SCS-MP2
+    // RPA
     //--------------------------
-    if xc_name.eq("mp2") || xc_name.eq("scs-mp2") {
+    if scf_data.mol.xc_data.is_rpa() {
         if let Some(e) = yamaguchi_tot {
-            // println!("The MP2 energy  : {:18.10} Ha", e);
-            println!("The (R)-xDH energy    : {:18.10} Ha", e);
+            println!("The RPA energy        : {:18.10} Ha", e);
         } else {
-            let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
-            // println!("The MP2 energy  : {:18.10} Ha", total_energy);
-            println!("The (R)-xDH energy    : {:18.10} Ha", total_energy);
-        }
-    }
-    //--------------------------
-    // DH functionals
-    //--------------------------
-    if xc_name.eq("b2plyp") 
-        || xc_name.eq("b2gpplyp") 
-        || xc_name.eq("pbe-qidh") 
-        || xc_name.eq("pbe0dh")
-    {
-        if let Some(e) = yamaguchi_tot {
-            // println!("The DH energy         : {:18.10} Ha", e);
-            println!("The (R)-xDH energy    : {:18.10} Ha", e);
-        } else {
-            let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
-            println!("The (R)-xDH energy    : {:18.10} Ha", total_energy);
+            let total = scf_data.energies.get("rpa_energy").unwrap()[0];
+            println!("The RPA energy        : {:18.10} Ha", total);
         }
         return;
     }
-
     //--------------------------
-    // DSD double hybrids
+    // DH / ZRPS / SCSRPA
     //--------------------------
-    if xc_name.eq("dsdpbep86-nodisp") 
-        || xc_name.eq("dsdpbep86") 
-        || xc_name.eq("dsdpbeb95") 
-        || xc_name.eq("dsdblyp")
-    {
-        if let Some(e) = yamaguchi_tot {
-            // println!("The DSD-DH energy     : {:18.10} Ha", e);
-            println!("The (R)-xDH energy    : {:18.10} Ha", e);
-        } else {
-            let total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
-            // println!("The DSD-DH energy     : {:18.10} Ha", total);
-            println!("The (R)-xDH energy    : {:18.10} Ha", total_energy);
-        }
-        return;
-    }
-
-    //--------------------------
-    // xDH / XYG / ZRPS / SCSRPA
-    //--------------------------
-    if xc_name.eq("xyg3") 
-        || xc_name.eq("r-xyg3") 
-        || xc_name.eq("xygjos") 
-        || xc_name.eq("xdh-pbe0") 
-        || xc_name.eq("r-xdh7") 
-        || xc_name.eq("xyg7")
-        || xc_name.eq("zrps")
-        || xc_name.eq("scsrpa")
-    {
+    if scf_data.mol.xc_data.is_fifth_dfa() {
         if let Some(e) = yamaguchi_tot {
             println!("The (R)-xDH energy    : {:18.10} Ha", e);
         } else {
@@ -438,18 +434,7 @@ pub fn output_result(scf_data: &scf_io::SCF) {
         return;
     }
 
-    //--------------------------
-    // RPA
-    //--------------------------
-    if xc_name.eq("rpa@pbe") {
-        if let Some(e) = yamaguchi_tot {
-            println!("The RPA energy        : {:18.10} Ha", e);
-        } else {
-            let total = scf_data.energies.get("rpa_energy").unwrap()[0];
-            println!("The RPA energy        : {:18.10} Ha", total);
-        }
-        return;
-    }
+
 
 }
 
@@ -512,35 +497,42 @@ pub fn collect_total_energy(scf_data: &SCF) -> f64 {
     //====================================
     let mut total_energy = scf_data.scf_energy;
     
-    let xc_name = scf_data.mol.ctrl.xc.to_lowercase();
-    // if xc_name.eq("mp2") || xc_name.eq("xyg3") || xc_name.eq("xygjos") || xc_name.eq("r-xdh7") || xc_name.eq("xyg7") || xc_name.eq("zrps") || xc_name.eq("scsrpa") {
-    //     total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
-    // } else if xc_name.eq("rpa@pbe") {
-    //     total_energy = scf_data.energies.get("rpa_energy").unwrap()[0];
-    // }
+    // let xc_name = scf_data.mol.ctrl.xc.to_lowercase();
 
-    total_energy = match xc_name.as_str() {
-        "mp2" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "scs-mp2" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "b2plyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "b2gpplyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "pbe-qidh" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "pbe0dh" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "dsdpbep86-nodisp" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "dsdpbep86" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "dsdpbeb95" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "dsdblyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "r-xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "xyg7" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "xdh-pbe0" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "r-xdh7" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "zrps" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "scsrpa" => scf_data.energies.get("xdh_energy").unwrap()[0],
-        "rpa@pbe" => scf_data.energies.get("rpa_energy").unwrap()[0],
-        _ => scf_data.scf_energy,
-    };
+
+    // total_energy = match xc_name.as_str() {
+    //     "mp2" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "scs-mp2" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "b2plyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "b2gpplyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "pbe-qidh" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "pbe0dh" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "dsdpbep86-nodisp" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "dsdpbep86" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "dsdpbeb95" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "dsdblyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "xyg7" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "xyg2" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "r-xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "r-xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "r-xyg7" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "r-xyg2" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "xdh-pbe0" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "r-xdh7" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "zrps" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "scsrpa" => scf_data.energies.get("xdh_energy").unwrap()[0],
+    //     "rpa@pbe" => scf_data.energies.get("rpa_energy").unwrap()[0],
+    //     _ => scf_data.scf_energy,
+    // };
+    if scf_data.mol.xc_data.is_rpa() {
+        total_energy = scf_data.energies.get("rpa_energy").unwrap()[0];
+    } else if scf_data.mol.xc_data.is_fifth_dfa() {
+        total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
+    } else {
+        total_energy = scf_data.scf_energy;
+    }
 
     if let Some(post_ai_correction) = scf_data.energies.get("ai_correction") {
         total_energy += post_ai_correction[0]
@@ -612,61 +604,76 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         (energy, nforce)
     } else {
         // current available analytical gradients methods:
-        // 1) numerical force
-        // 2) analytical RHF, UHF force
+        // 1) analytical RHF, UHF force
+        // 2) dftd force
         // 
         // disallow post-scf calculations for force
         if scf_data.mol.xc_data.is_fifth_dfa() {
             panic!("Analytic Gradient calculation is currently not available for post-SCF methods.");
         }
 
-        // if scf_data.mol.ctrl.xc.to_lowercase() != "hf" {
-        //     panic!("Gradient calculation is only available for RHF and UHF");
-        // }
-
         if scf_data.mol.ctrl.print_level > 1 {
             println!("Gradient evaluation using Analytical differentiation");
         }
 
-        let is_hf = scf_data.mol.ctrl.xc.to_lowercase() == "hf";
+        let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
 
-        // Please note that this is only a temporary workaround for RHF/UHF gradients.
+        // Please note that this is only a temporary workaround implemented gradients.
         // Totally refactor the following code if necessary if other types of gradients to be implemented.
-        let grad_data: Box<dyn crate::grad::traits::GradAPI> = {
+        use crate::grad::traits::GradAPI;
+
+        // we will collect the gradient data from different components into a list,
+        // and then summarize the total gradient at the end
+        // list of (gradient name, gradient data)
+        let mut grad_data_list: Vec<(String, Box<dyn GradAPI>)> = vec![];
+
+        // 1. self-consistent gradient data
+        let grad_data_scf: Box<dyn crate::grad::traits::GradAPI> = {
             if !scf_data.mol.ctrl.spin_polarization {
-                let mut grad_data = crate::grad::rhf::RIRHFGradient::new(&scf_data);
+                let mut grad_data_scf = crate::grad::rhf::RIRHFGradient::new(&scf_data);
 
                 if is_hf {
-                    grad_data.calc();
+                    grad_data_scf.calc();
                 } else {
-                    grad_data.flags.factor_k = if scf_data.mol.xc_data.dfa_hybrid_scf != 0.0 {
-                        Some(scf_data.mol.xc_data.dfa_hybrid_scf)
-                    } else {
-                        None
-                    };
-                    grad_data.calc_rks();
+                    grad_data_scf.calc_rks();
                 }
 
-                Box::new(grad_data)
+                Box::new(grad_data_scf)
             } else {
-                let mut grad_data = crate::grad::uhf::RIUHFGradient::new(&scf_data);
+                let mut grad_data_scf = crate::grad::uhf::RIUHFGradient::new(&scf_data);
 
                 if is_hf {
-                    grad_data.calc();
+                    grad_data_scf.calc();
                 } else {
-                    grad_data.flags.factor_k = if scf_data.mol.xc_data.dfa_hybrid_scf != 0.0 {
-                        Some(scf_data.mol.xc_data.dfa_hybrid_scf)
-                    } else {
-                        None
-                    };
-                    grad_data.calc_uks();
+                    grad_data_scf.calc_uks();
                 }
                 
-                Box::new(grad_data)
+                Box::new(grad_data_scf)
             }
         };
+        grad_data_list.push(("SCF".into(), grad_data_scf));
 
-        let gradient = grad_data.get_gradient();
+        // 2. dftd gradient data
+        //    we will force to evaluate dftd gradient, since dftd3 is not bottleneck for small to medium molecules
+        use crate::grad::dftd::DFTDGrad;
+        let mut grad_data_dftd = DFTDGrad::new(&scf_data);
+        grad_data_dftd.make_grad();
+        // only append the dftd gradient if dftd really exists
+        if grad_data_dftd.result.is_some() {
+            grad_data_list.push(("DFTD".into(), Box::new(grad_data_dftd)));
+        }
+
+        // summarize the gradient contributions by different components
+        let natm = scf_data.mol.geom.elem.len();
+        let mut gradient = MatrixFull::new([3, natm], 0.0);
+        for (grad_name, grad_data) in grad_data_list.iter() {
+            let grad_contrib = grad_data.get_gradient();
+            gradient.data.iter_mut().zip(grad_contrib.data.iter()).for_each(|(to, from)| {*to += from});
+            if scf_data.mol.ctrl.print_level > 1 {
+                println!("Gradient contribution from {:} [a.u.]:", grad_name);
+                println!("{}", formated_force(&grad_contrib, &scf_data.mol.geom.elem));
+            }
+        }
 
         println!("------ Output gradient [a.u.] ------");
         println!("{}", formated_force(&gradient, &scf_data.mol.geom.elem));
@@ -693,6 +700,185 @@ fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeR
     let (energy, gradient) = eval_force(scf_data, time_mark, mpi_operator);
     return (energy, gradient);
 }
+
+// UNVERIFIED NORMAL MODES CALCULATION
+// fn eval_normal_modes(
+//     scf_data: &mut SCF,
+//     time_mark: &mut utilities::TimeRecords,
+//     mpi_operator: &Option<MPIOperator>,
+// ) {
+//     if scf_data.mol.xc_data.is_fifth_dfa() {
+//         panic!("Normal modes calculation is currently not available for post-SCF methods.");
+//     }
+
+//     let num_atoms = scf_data.mol.geom.nfree;
+//     let dim = num_atoms * 3;
+//     let displace_ang = scf_data.mol.ctrl.nhessian_displacement;
+//     let displace = displace_ang / ANG; // convert Angstrom to Bohr
+
+//     if scf_data.mol.ctrl.print_level > 0 {
+//         println!("");
+//         println!("=========================================================");
+//         println!("      Vibrational Normal Modes (Frequency) Calculation");
+//         println!("=========================================================");
+//         println!("Number of atoms:               {}", num_atoms);
+//         println!("Hessian dimension:             {}", dim);
+//         println!("Finite-difference displacement: {:.6} Bohr ({:.6} Ang)", displace, displace_ang);
+//         println!("Number of displaced SCF jobs:  {}", dim * 2);
+//         println!("---------------------------------------------------------");
+//     }
+
+//     // Build Hessian via central finite difference of analytical gradients
+//     let mut hessian = MatrixFull::new([dim, dim], 0.0);
+
+//     if scf_data.mol.ctrl.print_level > 0 {
+//         print!("  Hessian finite difference progress: ");
+//         io::stdout().flush().unwrap();
+//     }
+
+//     for atm_idx in 0..num_atoms {
+//         for xyz in 0..3 {
+//             let col_idx = atm_idx * 3 + xyz;
+
+//             // +δ displacement
+//             let mut vec_plus = vec![0.0; 3];
+//             vec_plus[xyz] = displace;
+//             let mut scf_plus = scf_data.clone();
+//             scf_plus.mol.geom.geom_shift(atm_idx, vec_plus);
+//             scf_plus.mol.ctrl.print_level = 0;
+//             scf_plus.mol.ctrl.initial_guess = String::from("inherit");
+//             initialize_scf(&mut scf_plus, mpi_operator);
+//             let _ = performance_essential_calculations(&mut scf_plus, time_mark, mpi_operator);
+//             let (_, force_plus) = eval_force(&mut scf_plus, time_mark, mpi_operator);
+
+//             // -δ displacement
+//             let mut vec_minus = vec![0.0; 3];
+//             vec_minus[xyz] = -displace;
+//             let mut scf_minus = scf_data.clone();
+//             scf_minus.mol.geom.geom_shift(atm_idx, vec_minus);
+//             scf_minus.mol.ctrl.print_level = 0;
+//             scf_minus.mol.ctrl.initial_guess = String::from("inherit");
+//             initialize_scf(&mut scf_minus, mpi_operator);
+//             let _ = performance_essential_calculations(&mut scf_minus, time_mark, mpi_operator);
+//             let (_, force_minus) = eval_force(&mut scf_minus, time_mark, mpi_operator);
+
+//             // Hessian column = (F(+) - F(-)) / (2δ)
+//             // force_plus/minus are [3, num_atoms], we flatten to 3*num_atoms vector
+//             for a in 0..num_atoms {
+//                 for d in 0..3 {
+//                     let row_idx = a * 3 + d;
+//                     hessian[(row_idx, col_idx)] = (force_plus[(d, a)] - force_minus[(d, a)]) / (2.0 * displace);
+//                 }
+//             }
+
+//             if scf_data.mol.ctrl.print_level > 0 {
+//                 print!(".");
+//                 io::stdout().flush().unwrap();
+//             }
+//         }
+//     }
+
+//     if scf_data.mol.ctrl.print_level > 0 {
+//         println!(" done");
+//     }
+
+//     // Symmetrize Hessian: H = (H + H^T) / 2
+//     for i in 0..dim {
+//         for j in 0..i {
+//             let avg = 0.5 * (hessian[(i, j)] + hessian[(j, i)]);
+//             hessian[(i, j)] = avg;
+//             hessian[(j, i)] = avg;
+//         }
+//     }
+
+//     // Get atomic masses in amu
+//     let mass_charge = get_mass_charge(&scf_data.mol.geom.elem);
+
+//     // Mass-weight Hessian: H̃_ij = H_ij / sqrt(m_i * m_j)
+//     let mut mw_hessian = MatrixFull::new([dim, dim], 0.0);
+//     for i in 0..dim {
+//         let atom_i = i / 3;
+//         let mass_i = mass_charge[atom_i].0; // mass in amu
+//         for j in 0..=i {
+//             let atom_j = j / 3;
+//             let mass_j = mass_charge[atom_j].0;
+//             let mw_val = hessian[(i, j)] / (mass_i * mass_j).sqrt();
+//             mw_hessian[(i, j)] = mw_val;
+//             mw_hessian[(j, i)] = mw_val;
+//         }
+//     }
+
+//     // Diagonalize mass-weighted Hessian
+//     let (eigenvectors, eigenvalues, info) = _dsyevd(&mw_hessian, 'V');
+//     if info != 0 {
+//         panic!("DSYEVD (diagonalization of mass-weighted Hessian) failed with info = {}", info);
+//     }
+
+//     let eigvec = eigenvectors.unwrap();
+
+//     // Conversion factor: sqrt(λ / (amu)) to cm⁻¹
+//     // λ is eigenvalue of mass-weighted Hessian in Hartree/(Bohr²·amu)
+//     // ν̃ (cm⁻¹) = sign(λ) × sqrt(|λ|) × 5140.487
+//     const FREQ_CONV: f64 = 5140.487;
+
+//     // Print frequencies sorted by mode number (already sorted by DSYEVD)
+//     if scf_data.mol.ctrl.print_level > 0 {
+//         println!("");
+//         println!("=========================================================");
+//         println!("      Vibrational Frequencies");
+//         println!("=========================================================");
+//         println!("{:>7} {:>22} {:>22}", "Mode", "Eigenvalue", "Freq (cm⁻¹)");
+//         println!("---------------------------------------------------------");
+
+//         for i in 0..dim {
+//             let lambda = eigenvalues[i];
+//             let freq_sign = if lambda < 0.0 { -1.0 } else { 1.0 };
+//             let freq = freq_sign * lambda.abs().sqrt() * FREQ_CONV;
+//             let lambda_str = if lambda >= 0.0 {
+//                 format!("{:22.8}", lambda)
+//             } else {
+//                 format!("{:22.8}", lambda)
+//             };
+//             println!("{:7} {:>22} {:>22.4}", i + 1, lambda_str, freq);
+//         }
+//         println!("=========================================================");
+
+//         // Identify near-zero modes (translations + rotations)
+//         println!("");
+//         println!("Near-zero modes (translations/rotations):");
+//         let threshold = 100.0; // cm⁻¹
+//         for i in 0..dim {
+//             let lambda = eigenvalues[i];
+//             let freq_sign = if lambda < 0.0 { -1.0 } else { 1.0 };
+//             let freq = freq_sign * lambda.abs().sqrt() * FREQ_CONV;
+//             if freq.abs() < threshold {
+//                 println!("  Mode {:4}: {:12.4} cm⁻¹", i + 1, freq);
+//             }
+//         }
+//     }
+
+//     // Print Cartesian normal mode displacements at higher print levels
+//     if scf_data.mol.ctrl.print_level > 1 {
+//         println!("");
+//         println!("Cartesian normal mode displacements:");
+//         for i in 0..dim {
+//             let lambda = eigenvalues[i];
+//             let freq_sign = if lambda < 0.0 { -1.0 } else { 1.0 };
+//             let freq = freq_sign * lambda.abs().sqrt() * FREQ_CONV;
+//             println!("");
+//             println!("Mode {:4} (ω = {:12.4} cm⁻¹):", i + 1, freq);
+//             println!("{:>6} {:>14} {:>14} {:>14}", "Atom", "dX", "dY", "dZ");
+//             for a in 0..num_atoms {
+//                 let dx = eigvec[(a * 3,     i)];
+//                 let dy = eigvec[(a * 3 + 1, i)];
+//                 let dz = eigvec[(a * 3 + 2, i)];
+//                 println!("{:>6} {:14.8} {:14.8} {:14.8}",
+//                     scf_data.mol.geom.elem[a], dx, dy, dz);
+//             }
+//         }
+//     }
+// }
+//------------------
 
 #[cfg(feature = "geometric-pyo3")]
 mod geometric_pyo3_impl {

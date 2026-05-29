@@ -2,7 +2,7 @@
 
 use rayon::prelude::*;
 use rstsr::prelude::*;
-use rstsr_core::{prelude_dev::OpAssignAPI, storage::DeviceCreationAnyAPI};
+use rstsr_core::{prelude_dev::OpAssignAPI, storage::creation::DeviceCreationAnyAPI};
 use tensors::{BasicMatrix, MatrixFull};
 
 /* #region interchange between rstsr and rest_tensor */
