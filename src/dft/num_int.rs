@@ -467,7 +467,15 @@ pub fn prepare_fxc_data(scf: &SCF) -> FXCMatvecData {
     let ngrids = grids.weights.len();
     let num_basis = scf.mol.num_basis;
     let weights = &grids.weights;
-    let ao = grids.ao.as_ref().expect("AO on grids must be tabulated");
+    // ── Obtain dense AO: decompress from compressed storage if needed ──
+    let ao_owned: Option<MatrixFull<f64>>;
+    let ao: &MatrixFull<f64> = match &grids.ao {
+        Some(a) => { ao_owned = None; a }
+        None => match &grids.ao_compressed {
+            Some(c) => { ao_owned = Some(Grids::decompress_ao(c)); ao_owned.as_ref().unwrap() }
+            None => panic!("AO on grids must be tabulated (dense or compressed)"),
+        }
+    };
     let eigvec = &scf.eigenvectors[0];
 
     // ── Extract MO coefficients for occupied and virtual spaces ──
@@ -495,8 +503,15 @@ pub fn prepare_fxc_data(scf: &SCF) -> FXCMatvecData {
     _dgemm_full(&c_vir, 'T', ao, 'N', &mut mo_vir, 1.0, 0.0);
 
     // ── GGA: MO gradients on grids ──
+    let aop_owned: Option<RIFull<f64>>;
     let (mo_occ_grad, mo_vir_grad) = if xc_type == XCType::GGA {
-        let aop = grids.aop.as_ref().expect("AO gradients needed for GGA fxc");
+        let aop: &RIFull<f64> = match &grids.aop {
+            Some(a) => { aop_owned = None; a }
+            None => match &grids.aop_compressed {
+                Some(c) => { aop_owned = Some(Grids::decompress_aop(c)); aop_owned.as_ref().unwrap() }
+                None => panic!("AO gradients needed for GGA fxc (dense or compressed)"),
+            }
+        };
         let mut og = [
             MatrixFull::new([occ_size, ngrids], 0.0),
             MatrixFull::new([occ_size, ngrids], 0.0),
