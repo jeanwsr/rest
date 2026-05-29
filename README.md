@@ -220,6 +220,11 @@ chkfile = "mychk.rchk"
 - `scf_acc_etot`: 取值f64。自洽场运算总能量的收敛标准。缺省为1.0e-8
 - `level_shift`: 取值f64。对于发生近简并振荡不收敛的情况，可以采用level_shift的方式人为破坏简并，加速收敛。单位为hartree，缺省值为0.0
 - `start_check_oscillation`: 取值i32。开始检查并自洽场计算不收敛发生振荡的循环数。当监控到自洽场发生振荡，SCF能量上升的情况，开启一次线性混合方案（linear）。缺省为20
+- `smear`：取值String。开启分数轨道占据（smearing）加速自洽场收敛。适用于能隙较小或金属性体系。目前支持：
+    - `"fermi"`：Fermi-Dirac 展宽
+    - `"gaussian"`：Gaussian 展宽  
+    缺省为 None（不开启展宽）
+- `smear_sigma`：取值f64。展宽参数 σ，单位为 Hartree。σ 越大，占据数分数化程度越高，收敛越快但引入的熵误差越大。对于小分子体系典型取值范围 0.01-0.05 Ha。缺省为 None（不开启展宽）
 
 ## VXC 格点积分优化相关关键词（Keyword）
 - `vxc_screen_threshold`: 取值f64。密度筛选阈值，在 VXC 计算中跳过密度低于此值的格点。对于大分子（真空区域多），可节省 30-70% 的 XC 计算量。设为 0.0 可关闭筛选。缺省为 1.0e-15。
