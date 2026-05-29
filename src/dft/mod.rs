@@ -2221,15 +2221,41 @@ impl DFA4REST {
         let mut loc_lapl: MatrixFull<f64> = MatrixFull::empty();
         let mut loc_tau: MatrixFull<f64> = MatrixFull::empty();
         if self.use_kinetic_density() {
-            let loc_rho_emsemble = grids.prepare_tabulated_density_emsemble_slots(&self, mo, occ, spin_channel, range_grids.clone());
-            let loc_rho_vec = loc_rho_emsemble.get_reducing_matrix(0).unwrap().iter().copied().collect_vec();
+            // loc_rho_ensemble: the shape of [num_grids, num_spin, num_components]
+            let loc_rho_ensemble = 
+                if !mo[1].data.is_empty() || spin_channel == 1 {
+                    // RHF or UHF case
+                    grids.prepare_tabulated_density_ensemble_slots(
+                        &self,
+                        mo,
+                        occ,
+                        spin_channel,
+                        range_grids.clone(),
+                    )
+                } else {
+                    // ROHF case
+                    let mut mo_temp = mo.clone();
+                    mo_temp[1] = mo_temp[0].clone();
+
+                    grids.prepare_tabulated_density_ensemble_slots(
+                        &self,
+                        &mo_temp,
+                        occ,
+                        spin_channel,
+                        range_grids.clone(),
+                    )
+                };
+            let loc_rho_vec = loc_rho_ensemble.get_reducing_matrix(0).unwrap().iter().copied().collect_vec();
             loc_rho = MatrixFull::from_vec([num_grids, spin_channel], loc_rho_vec).unwrap();
-            let loc_rhop_vec:Vec<f64> = loc_rho_emsemble.get_slices(0..num_grids, 0..spin_channel, 1..4).copied().collect();
+            // todo!("check order of column or row, should add new traits to RIFull for supporting slices");
+            let loc_rhop_vec:Vec<f64> = loc_rho_ensemble.get_slices(0..num_grids, 0..spin_channel, 1..4).copied().collect();
             loc_rhop = RIFull::from_vec([num_grids, spin_channel, 3],loc_rhop_vec).unwrap();
-            loc_rhop = loc_rhop.transpose_ikj();
-            let loc_lapl_vec = loc_rho_emsemble.get_reducing_matrix(4).unwrap().iter().copied().collect_vec();
+            loc_rhop = loc_rhop.transpose_ikj(); // [num_grids, 3, spin_channel]
+            // loc_lapl: MatrixFull<f64> = loc_rho_ensemble.get_reducing_matrix(4).unwrap().to_matrixfull().unwrap();
+            // loc_tau: MatrixFull<f64> = loc_rho_ensemble.get_reducing_matrix(5).unwrap().to_matrixfull().unwrap();
+            let loc_lapl_vec = loc_rho_ensemble.get_reducing_matrix(4).unwrap().iter().copied().collect_vec();
             loc_lapl = MatrixFull::from_vec([num_grids, spin_channel], loc_lapl_vec).unwrap();
-            let loc_tau_vec = loc_rho_emsemble.get_reducing_matrix(5).unwrap().iter().copied().collect_vec();
+            let loc_tau_vec = loc_rho_ensemble.get_reducing_matrix(5).unwrap().iter().copied().collect_vec();
             loc_tau = MatrixFull::from_vec([num_grids, spin_channel], loc_tau_vec).unwrap();
         } else {
             (loc_rho,loc_rhop) = if grids.ao_compressed.is_some() {
@@ -4916,7 +4942,7 @@ impl Grids {
         (cur_rho, cur_rhop, cur_tau)
     }
 
-    pub fn prepare_tabulated_density_emsemble_slots(
+    pub fn prepare_tabulated_density_ensemble_slots(
         &self, 
         xc_method: &DFA4REST, 
         mo: &[MatrixFull<f64>; 2], 
