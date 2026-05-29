@@ -8,8 +8,10 @@ pub const J2C_THRESH: f64 = 1e-13;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum J2CDecompPolicy {
+    /// Cholesky decomposition (give upper/lower triangular decomposition of matrix).
     #[serde(alias = "cholesky", alias = "cd")]
     Cd,
+    /// Eigen decomposition (give symmetric decomposition of matrix).
     #[serde(alias = "eigen", alias = "eig", alias = "eigenvalue")]
     Eig,
 }
@@ -23,22 +25,29 @@ pub enum J2CDecompPolicy {
 ///     Cholesky decomposition again.
 /// - `Eig`: Eigen decomposition, make matrix power -1/2 by strict way with eigenvalues that larger
 ///   than given threshold, a more orthogonal but costly way than Cholesky decomposition.
-///
-/// TODO: currently the gradient code only allows eigen way, and should be updated to allow both
-/// ways.
 #[serde_inline_default]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct J2CDecompOption {
+    /// The policy for 2c-2e ERI decomposition. Default to `Eig`.
     #[serde_inline_default(J2CDecompPolicy::Eig)]
     pub policy: J2CDecompPolicy,
+    /// The threshold for 2c-2e ERI decomposition. Default to `1e-13`.
     #[serde_inline_default(Some(J2C_THRESH))]
     pub threshold: Option<f64>,
+    /// The flag indicating whether the Cholesky factor is upper or lower triangular. Default to `Upper`.
+    ///
+    /// This is developer option. In most cases, col-major uses upper triangular.
+    /// Lower triangular is only for debug and testing purposes.
+    ///
+    /// This field is only used for Cholesky decomposition, and will be ignored for eigen decomposition.
+    #[serde_inline_default(Upper)]
+    pub uplo: FlagUpLo,
 }
 
 impl Default for J2CDecompOption {
     fn default() -> Self {
-        J2CDecompOption { policy: J2CDecompPolicy::Eig, threshold: Some(J2C_THRESH) }
+        J2CDecompOption { policy: J2CDecompPolicy::Eig, threshold: Some(J2C_THRESH), uplo: Upper }
     }
 }
 
@@ -95,7 +104,7 @@ pub fn generate_rimatr_bare(mol_obj: &Molecule, omega: Option<f64>) -> MatrixFul
         mol.set_omega(omega);
         aux.set_omega(omega);
     }
-    
+
     let j2c_decomp_option = mol_obj.ctrl.j2c_decomp;
 
     let device = DeviceBLAS::default();
@@ -105,7 +114,7 @@ pub fn generate_rimatr_bare(mol_obj: &Molecule, omega: Option<f64>) -> MatrixFul
         let (out, shape) = CInt::integrate_cross("int3c2e", [&mol, &mol, &aux], "s2ij", None).into();
         rt::asarray((out, shape.f(), &device))
     };
-    let cderi = get_solved_j3c(j3c, &j2c_decomp);
+    let cderi = get_solved_j3c(j3c, &j2c_decomp, false);
 
     let shape = cderi.shape().to_vec().try_into().unwrap();
     MatrixFull::from_vec(shape, cderi.into_shape(-1).into_vec()).unwrap()

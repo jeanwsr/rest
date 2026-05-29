@@ -256,7 +256,7 @@ impl Molecule {
             DFTType::DeepLearning => {(None, DFA4REST::new_deep_learning(spin_channel, ctrl.print_level, &ctrl.xc_model))}
         };
 
-        xc_data.summary();
+        xc_data.summary(ctrl.print_level);
         if let Some(stop_at) = &ctrl.stop_at {
             if stop_at == "parse_xc" {
                 std::process::exit(0);
@@ -2171,7 +2171,7 @@ impl Molecule {
         let n_auxbas_shell = self.cint_aux_bas.len();
         let mut aux_v = MatrixFull::new([n_auxbas,n_auxbas],0.0);
         let (sender, receiver) = channel();
-        // For LR integrals: set omega < 0 (PTR_RANGE_OMEGA=8, negative → erfc(ωr)/r)
+        // For SR integrals: set omega < 0 (PTR_RANGE_OMEGA=8, negative → erfc(ωr)/r)
         let range_omega = -omega;
         self.cint_aux_fdqc.par_iter().enumerate().for_each_with(sender,|s,(l,fdqc)| {
             let mut cint_data = self.initialize_cint(true);
@@ -2200,19 +2200,19 @@ impl Molecule {
         aux_v
     }
 
-    // generate the long-range 3-center RI integrals: (mu nu | erfc(omega*r12)/r12 | P)
-    pub fn prepare_ri3fn_lr_rayon(&self, omega: f64) -> RIFull<f64> {
+    // generate the short-range 3-center RI integrals: (mu nu | erfc(omega*r12)/r12 | P)
+    pub fn prepare_ri3fn_sr_rayon(&self, omega: f64) -> RIFull<f64> {
         let n_basis = self.num_basis;
         let n_auxbas = self.num_auxbas;
 
-        // For LR integrals: set omega < 0 (PTR_RANGE_OMEGA=8, negative → erfc(ωr)/r)
+        // For SR integrals: set omega < 0 (PTR_RANGE_OMEGA=8, negative → erfc(ωr)/r)
         let range_omega = -omega;
 
-        // First, the Cholesky decomposition of the LR 2-center Coulomb matrix
+        // First, the Cholesky decomposition of the SR 2-center Coulomb matrix
         let mut aux_v = self.int_ij_aux_columb_with_omega(omega);
         aux_v = aux_v.lapack_power(-0.5, AUXBAS_THRESHOLD).unwrap();
 
-        // Then, prepare the 3-center LR integrals
+        // Then, prepare the 3-center SR integrals
         let mut ri3fn = RIFull::new([n_basis,n_basis,n_auxbas],0.0);
         let n_basis_shell = self.cint_bas.len();
         let n_auxbas_shell = self.cint_aux_bas.len();
