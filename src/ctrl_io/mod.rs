@@ -11,6 +11,7 @@ use crate::ri_jk::decompose::J2CDecompOption;
 use crate::ctrl_io::tddft_parameters::parse_tddft_keywords;
 use crate::ctrl_io::cphf_parameters::parse_cphf_keywords;
 use crate::{check_norm::force_state_occupation::ForceStateOccupation};
+use crate::scf_io::smear::SmearingType;
 use crate::dft::{DFAFamily, DFTType, DFA4REST};
 use crate::geom_io::{GeomCell, GeomUnit, MOrC, parse_geom_keywords};
 use crate::utilities;
@@ -296,6 +297,8 @@ pub struct InputKeywords {
     pub max_memory: Option<f64>,
     /// Abort the calculation when memory usage exceeds max_memory.
     pub abort_on_mem_exceed: bool,
+    pub smear: Option<SmearingType>,
+    pub smear_sigma: Option<f64>,
     pub guess_mix: bool,
     pub guess_mix_theta_deg: Vec<f64>,
     pub start_mix_cycle: usize,
@@ -441,6 +444,8 @@ impl InputKeywords {
             rpa_de_excitation_parameters: None,
             max_memory: None,
             abort_on_mem_exceed: true,
+            smear: None,
+            smear_sigma: None,
             guess_mix: false,
             guess_mix_theta_deg: [15.0, 15.0].to_vec(),
             start_mix_cycle: 0,
@@ -1588,7 +1593,35 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => None,
             };
             tmp_input.abort_on_mem_exceed = tmp_ctrl.get("abort_on_mem_exceed").map(serde_from_value).unwrap_or(true);
-            
+
+            // for smearing
+            tmp_input.smear = match tmp_ctrl.get("smear").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_type) => {
+                    let tmp_smear = tmp_type.to_lowercase();
+                    if tmp_smear.eq("fermi") {
+                        Some(SmearingType::FERMI)
+                    } else if tmp_smear.eq("gaussian") || tmp_smear.eq("gauss") {
+                        Some(SmearingType::GAUSSIAN)
+                    } else {
+                        println!("Warning: unknown smear type '{}', smearing not turned on.", tmp_type);
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            tmp_input.smear_sigma = match tmp_ctrl.get("smear_sigma").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {
+                    let num = tmp_str.to_lowercase().parse().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                serde_json::Value::Number(tmp_num) => {
+                    let num = tmp_num.as_f64().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                _ => None,
+            };
+
             // for guess_mix setting; default = False
             tmp_input.guess_mix = match tmp_ctrl.get("guess_mix").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_bool) => *tmp_bool,

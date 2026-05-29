@@ -13,6 +13,7 @@ use crate::ctrl_io::ri_jk_io::*;
 mod addons;
 mod fchk;
 mod pyrest_scf_io;
+pub mod smear;
 pub mod util;
 
 use mpi::collective::SystemOperation;
@@ -34,6 +35,7 @@ use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
 use crate::ri_jk;
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
 use self::util::occupied_orbital_count;
+use smear::apply_smearing;
 
 #[pyclass]
 #[derive(Clone)]
@@ -81,6 +83,7 @@ pub struct SCF {
     pub nuc_energy: f64,
     #[pyo3(get,set)]
     pub scf_energy: f64,
+    pub smearing_entropy: f64,
     pub grids: Option<Grids>,
     pub empirical_dispersion_energy: f64,
     pub energies: HashMap<String,Vec<f64>>,
@@ -139,6 +142,7 @@ impl SCF {
             lumo: [0,0],
             nuc_energy: 0.0,
             scf_energy: 0.0,
+            smearing_entropy: 0.0,
             empirical_dispersion_energy: 0.0,
             grids: None,
             energies: HashMap::new(),
@@ -2731,8 +2735,13 @@ impl SCF {
 
         let cur_index = 1;
         let pre_index = 0;
-        let cur_energy = self.scf_energy;
-        let pre_energy = scftracerecode.scf_energy;
+        let (cur_energy, pre_energy) = if self.mol.ctrl.smear.is_some() {
+            let sigma = self.mol.ctrl.smear_sigma.unwrap_or(0.0);
+            (self.scf_energy - sigma * self.smearing_entropy,
+             scftracerecode.scf_energy - sigma * scftracerecode.smearing_entropy)
+        } else {
+            (self.scf_energy, scftracerecode.scf_energy)
+        };
         let diff_energy = cur_energy-pre_energy;
         let etot_converge = diff_energy.abs()<=scf_acc_etot;
         //scftracerecode.energy_change.push(diff_energy);
@@ -4644,6 +4653,7 @@ pub struct ScfTraceRecord {
     //pub eigenvectors: Vec<[MatrixFull<f64>;2]>,
     //pub eigenvalues: Vec<[Vec<f64>;2]>,
     pub scf_energy : f64,
+    pub smearing_entropy: f64,
     pub energy_records: Vec<f64>,
     pub prev_hamiltonian: Vec<[MatrixUpper<f64>;2]>,
     pub eigenvectors: [MatrixFull<f64>;2],
@@ -4665,6 +4675,7 @@ impl ScfTraceRecord {
             num_max_records,
             start_diis_cycle,
             scf_energy : 0.0,
+            smearing_entropy: 0.0,
             energy_records: vec![],
             prev_hamiltonian: vec![[MatrixUpper::empty(),MatrixUpper::empty()]],
             eigenvectors: [MatrixFull::new([1,1],0.0),
@@ -4711,6 +4722,7 @@ impl ScfTraceRecord {
         // now store the scf energy, eigenvectors and eigenvalues of the last two steps
         //let tmp_data =  self.scf_energy[1].clone();
         self.scf_energy=scf.scf_energy;
+        self.smearing_entropy=scf.smearing_entropy;
         //let tmp_data =  self.eigenvectors[1].clone();
         self.eigenvectors=scf.eigenvectors.clone();
         //let tmp_data =  self.eigenvalues[1].clone();
@@ -4781,7 +4793,13 @@ impl ScfTraceRecord {
 
 
             // update the energy records and check the oscillation
-            self.energy_records.push(scf.scf_energy);
+            let e_free = if scf.mol.ctrl.smear.is_some() {
+                let sigma = scf.mol.ctrl.smear_sigma.unwrap_or(0.0);
+                scf.scf_energy - sigma * scf.smearing_entropy
+            } else {
+                scf.scf_energy
+            };
+            self.energy_records.push(e_free);
             let num_step = self.energy_records.len();
             let oscillation_flag = if num_step >=2 {
                 let change_1 = self.energy_records[num_step-1] - self.energy_records[num_step-2];
@@ -5485,6 +5503,9 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     // now prepare the input density matrix for the first iteration and initialize the records
     scf_data.diagonalize_hamiltonian(mpi_operator);
     scf_data.generate_occupation();
+    if let Some(st) = &scf_data.mol.ctrl.smear {
+        apply_smearing(scf_data, *st, scf_data.mol.ctrl.smear_sigma.unwrap());
+    }
 
     // --- Apply guess_mix during the initial-guess stage ---
     // start_mix_cycle == 0 means: perform HOMO–LUMO mixing immediately
@@ -5521,6 +5542,9 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         scf_data.diagonalize_hamiltonian(mpi_operator);
         let dt1_2 = time::Local::now();
         scf_data.generate_occupation();
+        if let Some(st) = &scf_data.mol.ctrl.smear {
+            apply_smearing(scf_data, *st, scf_data.mol.ctrl.smear_sigma.unwrap());
+        }
 
         // --- Apply guess_mix during SCF iterations ---
         // When start_mix_cycle > 0, perform HOMO–LUMO mixing exactly at the
@@ -5592,18 +5616,33 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         let dt2 = time::Local::now();
         let timecost = (dt2.timestamp_millis()-dt1.timestamp_millis()) as f64 /1000.0;
         if scf_data.mol.ctrl.print_level>0 {
+            let have_smear = scf_data.mol.ctrl.smear.is_some();
+            let e_tot = scf_records.scf_energy;
             if scf_data.mol.spin_channel == 2 {
                 let [square_spin, spin_z] = evaluate_spin_angular_momentum(&scf_data.density_matrix, &scf_data.ovlp, scf_data.mol.spin_channel, &scf_data.mol.num_elec);
-                println!("Energy: {:18.10} Ha with <S^2> = {:6.3} and <2S+1> = {:6.3} after {:4} iterations (in {:10.2} seconds).",
-                     scf_records.scf_energy,
-                     square_spin, spin_z,
-                     scf_records.num_iter-1,
-                     timecost)
+                if have_smear {
+                    let sigma = scf_data.mol.ctrl.smear_sigma.unwrap_or(0.0);
+                    let s = scf_data.smearing_entropy;
+                    println!("E(T) {:18.10}  E_free {:18.10}  E0 {:18.10}  S^2 {:5.3}  2S+1 {:5.3}  iter {:4}  {:8.2}s",
+                         e_tot, e_tot - sigma * s, e_tot - 0.5 * sigma * s,
+                         square_spin, spin_z,
+                         scf_records.num_iter-1, timecost)
+                } else {
+                    println!("Energy: {:18.10} Ha with <S^2> = {:6.3} and <2S+1> = {:6.3} after {:4} iterations (in {:10.2} seconds).",
+                         e_tot, square_spin, spin_z,
+                         scf_records.num_iter-1, timecost)
+                }
             } else {
-                println!("Energy: {:18.10} Ha after {:4} iterations (in {:10.2} seconds).",
-                     scf_records.scf_energy,
-                     scf_records.num_iter-1,
-                     timecost)
+                if have_smear {
+                    let sigma = scf_data.mol.ctrl.smear_sigma.unwrap_or(0.0);
+                    let s = scf_data.smearing_entropy;
+                    println!("E(T) {:18.10}  E_free {:18.10}  E0 {:18.10}  iter {:4}  {:8.2}s",
+                         e_tot, e_tot - sigma * s, e_tot - 0.5 * sigma * s,
+                         scf_records.num_iter-1, timecost)
+                } else {
+                    println!("Energy: {:18.10} Ha after {:4} iterations (in {:10.2} seconds).",
+                         e_tot, scf_records.num_iter-1, timecost)
+                }
             }
         };
         if scf_data.mol.ctrl.print_level>1 {

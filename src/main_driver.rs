@@ -387,7 +387,15 @@ pub fn output_result(scf_data: &scf_io::SCF) {
     if let Some(v) = scf_data.energies.get("yamaguchi_scf_corrected") {
         println!("The SCF energy        : {:18.10} Ha", v[0]);
     } else {
-        println!("The SCF energy        : {:18.10} Ha", scf_data.scf_energy);
+        if scf_data.mol.ctrl.smear.is_some() {
+            println!("The SCF energy (E)    : {:18.10} Ha", scf_data.scf_energy);
+            let sigma = scf_data.mol.ctrl.smear_sigma.unwrap_or(0.0);
+            let s = scf_data.smearing_entropy;
+            println!("Free energy  (E-TS)  : {:18.10} Ha", scf_data.scf_energy - sigma * s);
+            println!("Zero-temp energy (E0): {:18.10} Ha", scf_data.scf_energy - 0.5 * sigma * s);
+        } else {
+            println!("The SCF energy        : {:18.10} Ha", scf_data.scf_energy);
+        }
     }
 
 
