@@ -550,10 +550,16 @@ impl SCF {
         } else {None};
 
         if let Some(grids) = &mut self.grids {
-            grids.prepare_tabulated_ao(&self.mol);
             grids.ao_cutoff = self.mol.ctrl.ao_cutoff;
-            grids.build_non0tab(&self.mol);
-            grids.build_compressed_storage();
+            if grids.ao_cutoff > 0.0 {
+                // sparse path: two-pass batch scan → compressed directly, no dense allocation
+                grids.prepare_tabulated_ao_sparse(&self.mol);
+            } else {
+                // dense path: allocate full AO/AOP, then optionally build non0tab + compressed
+                grids.prepare_tabulated_ao(&self.mol);
+                grids.build_non0tab(&self.mol);
+                grids.build_compressed_storage();
+            }
             if self.mol.ctrl.drop_dense_ao && grids.ao_compressed.is_some() {
                 if self.mol.ctrl.print_level >= 1 {
                     let (dense_bytes, comp_bytes, _) = grids.memory_footprint();

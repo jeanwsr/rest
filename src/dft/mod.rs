@@ -1206,14 +1206,26 @@ impl DFA4REST {
         use_density_gradient: bool,
     ) -> (MatrixFull<f64>, RIFull<f64>, MatrixFull<f64>, MatrixFull<f64>, MatrixFull<f64>) {
         let num_grids = grids.coordinates.len();
+        let all_grids = 0..num_grids;
         let mut rho: MatrixFull<f64> = MatrixFull::empty();
         let mut rhop: RIFull<f64> = RIFull::empty();
         let mut lapl: MatrixFull<f64> = MatrixFull::empty();
         let mut tau: MatrixFull<f64> = MatrixFull::empty();
 
         if self.use_kinetic_density() {
+            // mGGA: tau needed — use dense path (compressed mGGA not yet implemented for this path)
             (rho, rhop, tau) = grids.prepare_tabulated_density_3(mo, occ, spin_channel);
             lapl = MatrixFull::new([num_grids, spin_channel], 0.0);
+        } else if grids.ao_compressed.is_some() {
+            // Use compressed density computation (avoids decompressing dense AO/AOP)
+            let mo_use: [MatrixFull<f64>; 2] = if !mo[1].data.is_empty() || spin_channel == 1 {
+                [mo[0].clone(), mo[1].clone()]
+            } else {
+                [mo[0].clone(), mo[0].clone()]
+            };
+            (rho, rhop) = grids.prepare_tabulated_density_slots_compressed(
+                &mo_use, occ, spin_channel, all_grids,
+            );
         } else {
             (rho, rhop) = if !mo[1].data.is_empty() || spin_channel == 1 {
                 grids.prepare_tabulated_density_2(mo, occ, spin_channel)
@@ -3619,6 +3631,368 @@ impl Grids {
         }
     }
 
+    /// Sparse two-pass AO generation: scan batch-by-batch, then compress.
+    ///
+    /// Avoids allocating the full dense AO/AOP matrices.  Instead:
+    ///   Pass 1 — Compute AO per batch, scan for non-zero entries, build masks.
+    ///   Pass 2 — Recompute AO per batch, extract active rows into compressed storage.
+    ///
+    /// Peak memory: ~nao × blksize × 4 × 8 bytes (a few MB) instead of
+    ///              ~nao × ngrids × 4 × 8 bytes (potentially GB).
+    ///
+    /// If the overall AO sparsity exceeds 90 %, falls back to the standard
+    /// dense path (`prepare_tabulated_ao_rayon_v02`).
+    pub fn prepare_tabulated_ao_sparse(&mut self, mol: &Molecule) {
+        let nao = mol.num_basis;
+        let ngrids = self.coordinates.len();
+        let cutoff = self.ao_cutoff;
+        let do_gradient = mol.xc_data.use_density_gradient();
+
+        let default_omp_num_threads = mol.ctrl.num_threads.unwrap();
+
+        let blksize = if mol.ctrl.non0tab_blksize == 0 {
+            Self::auto_non0tab_blksize(nao)
+        } else {
+            mol.ctrl.non0tab_blksize
+        };
+        let nbatches = (ngrids + blksize - 1) / blksize;
+
+        let auto_note = if mol.ctrl.non0tab_blksize == 0 { " (auto)" } else { "" };
+
+        // pre-compute grid ranges per batch
+        let batch_ranges: Vec<std::ops::Range<usize>> = (0..nbatches)
+            .map(|ib| {
+                let s = ib * blksize;
+                let e = (s + blksize).min(ngrids);
+                s..e
+            })
+            .collect();
+
+        // ── Pass 1: scan every batch, build ao/aop masks ──
+        let batch_indices: Vec<usize> = (0..nbatches).collect();
+        let masks: Vec<(Vec<usize>, Vec<usize>)> = batch_indices
+            .par_iter()
+            .map(|&ibatch| {
+                omp_set_num_threads_wrapper(1);
+                let g_range = &batch_ranges[ibatch];
+                let nbatch = g_range.len();
+
+                let mut temp_ao = MatrixFull::<f64>::new([nao, nbatch], 0.0);
+                mol.basis4elem
+                    .iter()
+                    .zip(mol.geom.rg_position.iter_columns_full())
+                    .for_each(|(elem, geom)| {
+                        let start = elem.global_index.0;
+                        let nbas = elem.global_index.1;
+                        let end = start + nbas;
+                        let tmp_geom: [f64; 3] = geom.try_into().unwrap();
+                        let tab = gto_value_serial(
+                            &self.coordinates[g_range.clone()],
+                            &tmp_geom,
+                            elem,
+                            &mol.ctrl.basis_type,
+                        );
+                        temp_ao.copy_from_matr(
+                            start..end, 0..nbatch, &tab, 0..nbas, 0..nbatch,
+                        );
+                    });
+
+                // AO mask
+                let mut ao_mask = vec![false; nao];
+                for mu in 0..nao {
+                    for g in 0..nbatch {
+                        if temp_ao[[mu, g]].abs() > cutoff {
+                            ao_mask[mu] = true;
+                            break;
+                        }
+                    }
+                }
+                let ao_active: Vec<usize> =
+                    (0..nao).filter(|&mu| ao_mask[mu]).collect();
+
+                // AOP mask
+                let aop_active: Vec<usize> = if do_gradient {
+                    let mut temp_aop = [
+                        MatrixFull::<f64>::new([nao, nbatch], 0.0),
+                        MatrixFull::<f64>::new([nao, nbatch], 0.0),
+                        MatrixFull::<f64>::new([nao, nbatch], 0.0),
+                    ];
+                    mol.basis4elem
+                        .iter()
+                        .zip(mol.geom.rg_position.iter_columns_full())
+                        .for_each(|(elem, geom)| {
+                            let start = elem.global_index.0;
+                            let nbas = elem.global_index.1;
+                            let end = start + nbas;
+                            let tmp_geom: [f64; 3] = geom.try_into().unwrap();
+                            let tab_dev = gto_1st_value_serial(
+                                &self.coordinates[g_range.clone()],
+                                &tmp_geom,
+                                elem,
+                                &mol.ctrl.basis_type,
+                            );
+                            for x in 0usize..3usize {
+                                temp_aop[x].copy_from_matr(
+                                    start..end, 0..nbatch,
+                                    &tab_dev[x], 0..nbas, 0..nbatch,
+                                );
+                            }
+                        });
+                    let mut aop_mask = vec![false; nao];
+                    for mu in 0..nao {
+                        for g in 0..nbatch {
+                            for x in 0usize..3usize {
+                                if temp_aop[x][[mu, g]].abs() > cutoff {
+                                    aop_mask[mu] = true;
+                                    break;
+                                }
+                            }
+                            if aop_mask[mu] {
+                                break;
+                            }
+                        }
+                    }
+                    (0..nao).filter(|&mu| aop_mask[mu]).collect()
+                } else {
+                    vec![]
+                };
+
+                (ao_active, aop_active)
+            })
+            .collect();
+
+        // aggregate masks
+        let batch_ao_indices: Vec<Vec<usize>> = masks.iter().map(|m| m.0.clone()).collect();
+        let batch_aop_indices: Vec<Vec<usize>> = masks.iter().map(|m| m.1.clone()).collect();
+        let total_nonzero_ao: usize =
+            batch_ao_indices.iter().map(|v| v.len()).sum::<usize>() * blksize; // upper bound (last batch may be shorter)
+        let total_nonzero_aop: usize = if do_gradient {
+            batch_aop_indices.iter().map(|v| v.len()).sum::<usize>() * blksize
+        } else {
+            0
+        };
+        let total_elements = ngrids * nao;
+        let sparsity_ratio = if total_nonzero_ao > 0 {
+            total_nonzero_ao as f64 / total_elements as f64
+        } else {
+            1.0
+        };
+
+        // skip if too dense
+        let skip = sparsity_ratio > 0.90 || total_nonzero_ao >= total_elements;
+        if mol.ctrl.print_level >= 1 {
+            let aop_sparsity = if total_nonzero_aop > 0 {
+                total_nonzero_aop as f64 / (total_elements * 3) as f64 * 100.0
+            } else {
+                0.0
+            };
+            if skip {
+                println!(
+                    " [non0tab] cutoff={:.1e}, blksize={}{}, ao-sparsity={:.1}% → skipping (AO too dense), falling back to dense",
+                    cutoff, blksize, auto_note, sparsity_ratio * 100.0
+                );
+            } else {
+                println!(
+                    " [non0tab] cutoff={:.1e}, blksize={}{}, ao-sparsity={:.1}% ({}/{}), aop-sparsity={:.1}%",
+                    cutoff, blksize, auto_note,
+                    sparsity_ratio * 100.0, total_nonzero_ao, total_elements,
+                    aop_sparsity,
+                );
+            }
+        }
+
+        if skip {
+            omp_set_num_threads_wrapper(default_omp_num_threads);
+            // fall back to dense path
+            self.prepare_tabulated_ao_rayon_v02(mol);
+            return;
+        }
+
+        // ── Pass 2: recompute per batch, extract active rows → compressed ──
+        type BatchPair = (MatrixFull<f64>, Option<[MatrixFull<f64>; 3]>);
+        let batch_results: Vec<BatchPair> = batch_indices
+            .par_iter()
+            .map(|&ibatch| -> BatchPair {
+                omp_set_num_threads_wrapper(1);
+                let g_range = &batch_ranges[ibatch];
+                let nbatch = g_range.len();
+                let indices = &batch_ao_indices[ibatch];
+                let n_active = indices.len();
+
+                if n_active == 0 {
+                    return (MatrixFull::<f64>::empty(), None);
+                }
+
+                // --- compress AO ---
+                let mut temp_ao = MatrixFull::<f64>::new([nao, nbatch], 0.0);
+                mol.basis4elem
+                    .iter()
+                    .zip(mol.geom.rg_position.iter_columns_full())
+                    .for_each(|(elem, geom)| {
+                        let start = elem.global_index.0;
+                        let nbas = elem.global_index.1;
+                        let end = start + nbas;
+                        let tmp_geom: [f64; 3] = geom.try_into().unwrap();
+                        let tab = gto_value_serial(
+                            &self.coordinates[g_range.clone()],
+                            &tmp_geom,
+                            elem,
+                            &mol.ctrl.basis_type,
+                        );
+                        temp_ao.copy_from_matr(
+                            start..end, 0..nbatch, &tab, 0..nbas, 0..nbatch,
+                        );
+                    });
+
+                let mut batch_ao = MatrixFull::<f64>::new([n_active, nbatch], 0.0);
+                for (i_local, &mu_global) in indices.iter().enumerate() {
+                    for g in 0..nbatch {
+                        batch_ao[[i_local, g]] = temp_ao[[mu_global, g]];
+                    }
+                }
+
+                // --- compress AOP ---
+                let aop_opt: Option<[MatrixFull<f64>; 3]> = if do_gradient && n_active > 0 {
+                    let mut temp_aop = [
+                        MatrixFull::<f64>::new([nao, nbatch], 0.0),
+                        MatrixFull::<f64>::new([nao, nbatch], 0.0),
+                        MatrixFull::<f64>::new([nao, nbatch], 0.0),
+                    ];
+                    mol.basis4elem
+                        .iter()
+                        .zip(mol.geom.rg_position.iter_columns_full())
+                        .for_each(|(elem, geom)| {
+                            let start = elem.global_index.0;
+                            let nbas = elem.global_index.1;
+                            let end = start + nbas;
+                            let tmp_geom: [f64; 3] = geom.try_into().unwrap();
+                            let tab_dev = gto_1st_value_serial(
+                                &self.coordinates[g_range.clone()],
+                                &tmp_geom,
+                                elem,
+                                &mol.ctrl.basis_type,
+                            );
+                            for x in 0usize..3usize {
+                                temp_aop[x].copy_from_matr(
+                                    start..end, 0..nbatch,
+                                    &tab_dev[x], 0..nbas, 0..nbatch,
+                                );
+                            }
+                        });
+                    let mut comp_aop: [MatrixFull<f64>; 3] = [
+                        MatrixFull::<f64>::new([n_active, nbatch], 0.0),
+                        MatrixFull::<f64>::new([n_active, nbatch], 0.0),
+                        MatrixFull::<f64>::new([n_active, nbatch], 0.0),
+                    ];
+                    for (i_local, &mu_global) in indices.iter().enumerate() {
+                        for g in 0..nbatch {
+                            for x in 0usize..3usize {
+                                comp_aop[x][[i_local, g]] = temp_aop[x][[mu_global, g]];
+                            }
+                        }
+                    }
+                    Some(comp_aop)
+                } else {
+                    None
+                };
+
+                (batch_ao, aop_opt)
+            })
+            .collect();
+
+        // unzip batch results
+        let ao_comp_batches: Vec<MatrixFull<f64>> =
+            batch_results.iter().map(|r| r.0.clone()).collect();
+        let mut aop_comp_batches: Vec<[MatrixFull<f64>; 3]> = if do_gradient {
+            batch_results.iter().map(|r| r.1.clone().unwrap_or([
+                MatrixFull::<f64>::empty(),
+                MatrixFull::<f64>::empty(),
+                MatrixFull::<f64>::empty(),
+            ])).collect()
+        } else {
+            vec![]
+        };
+
+        // ── Store results ──
+        self.non0tab = Some(Non0Tab {
+            batch_ao_indices: batch_ao_indices.clone(),
+            batch_aop_indices,
+            blksize,
+            ngrids,
+            nao,
+            ao_cutoff: cutoff,
+            sparsity_ratio,
+            total_nonzero_ao,
+            total_nonzero_aop,
+            total_elements,
+        });
+
+        let batch_grid_ranges = batch_ranges.clone();
+        self.ao_compressed = Some(CompressedGridAO {
+            batches: ao_comp_batches,
+            batch_ao_map: batch_ao_indices.clone(),
+            batch_grid_ranges: batch_grid_ranges.clone(),
+            blksize,
+            nao_total: nao,
+            ngrids,
+        });
+
+        if do_gradient && !batch_ao_indices.is_empty() {
+            self.aop_compressed = Some(CompressedGridAOP {
+                batches: aop_comp_batches,
+                batch_aop_map: batch_ao_indices.clone(),
+                batch_grid_ranges,
+                blksize,
+                nao_total: nao,
+                ngrids,
+            });
+        }
+
+        omp_set_num_threads_wrapper(default_omp_num_threads);
+    }
+
+    /// Returns a reference to the dense AO matrix, decompressing from
+    /// compressed storage if necessary (for post-SCF modules that need dense).
+    pub fn ensure_dense_ao(&mut self) -> &MatrixFull<f64> {
+        if self.ao.is_none() {
+            if let Some(ref c) = self.ao_compressed {
+                let ao_dense = Self::decompress_ao(c);
+                self.ao = Some(ao_dense);
+            } else {
+                panic!("dense AO is not available and no compressed storage to decompress");
+            }
+        }
+        self.ao.as_ref().unwrap()
+    }
+
+    /// Returns a reference to the dense AOP matrix, decompressing from
+    /// compressed storage if necessary.
+    pub fn ensure_dense_aop(&mut self) -> &RIFull<f64> {
+        if self.aop.is_none() {
+            if let Some(ref c) = self.aop_compressed {
+                let mut aop_dense = RIFull::new([c.nao_total, c.ngrids, 3], 0.0);
+                for ibatch in 0..c.batches.len() {
+                    let indices = &c.batch_aop_map[ibatch];
+                    let g_range = &c.batch_grid_ranges[ibatch];
+                    let batch_aop = &c.batches[ibatch];
+                    for x in 0usize..3usize {
+                        let aop_x = aop_dense.get_reducing_matrix_mut(x).unwrap();
+                        for (i_local, &mu_global) in indices.iter().enumerate() {
+                            for g in g_range.clone() {
+                                let flat_dst = g * c.nao_total + mu_global;
+                                aop_x.data[flat_dst] = batch_aop[x][[i_local, g - g_range.start]];
+                            }
+                        }
+                    }
+                }
+                self.aop = Some(aop_dense);
+            } else {
+                panic!("dense AOP is not available and no compressed storage to decompress");
+            }
+        }
+        self.aop.as_ref().unwrap()
+    }
+
     /// Decompress AO from compressed storage back to dense format, for verification.
     pub fn decompress_ao(compressed: &CompressedGridAO) -> MatrixFull<f64> {
         let nao = compressed.nao_total;
@@ -3635,6 +4009,26 @@ impl Grids {
             }
         }
         ao_dense
+    }
+
+    /// Decompress AOP from compressed storage back to dense format.
+    pub fn decompress_aop(compressed: &CompressedGridAOP) -> RIFull<f64> {
+        let mut aop_dense = RIFull::new([compressed.nao_total, compressed.ngrids, 3], 0.0);
+        for ibatch in 0..compressed.batches.len() {
+            let indices = &compressed.batch_aop_map[ibatch];
+            let g_range = &compressed.batch_grid_ranges[ibatch];
+            let batch_aop = &compressed.batches[ibatch];
+            for x in 0usize..3usize {
+                let aop_x = aop_dense.get_reducing_matrix_mut(x).unwrap();
+                for (i_local, &mu_global) in indices.iter().enumerate() {
+                    for g in g_range.clone() {
+                        let flat_dst = g * compressed.nao_total + mu_global;
+                        aop_x.data[flat_dst] = batch_aop[x][[i_local, g - g_range.start]];
+                    }
+                }
+            }
+        }
+        aop_dense
     }
 
     /// Memory footprint estimate for dense + compressed storage (bytes).
