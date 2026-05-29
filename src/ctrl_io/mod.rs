@@ -215,8 +215,10 @@ pub struct InputKeywords {
     #[pyo3(get, set)]
     // Keywords for solvent models
     pub solvent_enabled: bool,
+    pub solvent_ri: bool,
     pub solv_epsilon: f64,
     pub solvent_model: PcmMethod,
+    pub solv_chunk: usize,
     #[pyo3(get, set)]
     // The initial MO coefficients and eigenvalues can be imported by setting chkfile
     pub chkfile: String,
@@ -449,8 +451,10 @@ impl InputKeywords {
             geometric_pyo3: None,
             quasiparticle_methods:None,
             solvent_enabled: false,
+            solvent_ri: true,
             solv_epsilon:1.0,
             solvent_model: PcmMethod::CPCM,
+            solv_chunk: 8,
             stop_at: None,
             xc_parser: String::from("legacy"),
             j2c_decomp: J2CDecompOption::default(),
@@ -1162,6 +1166,11 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 },
                 other => false,
             };
+            tmp_input.solvent_ri = match tmp_ctrl.get("solvent_ri").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(true),
+                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
+                other => true,
+            };
             tmp_input.solvent_model = match tmp_ctrl.get("solvent_model") {
                 Some(value) => {
                     serde_json::from_value(value.clone())?
@@ -1176,22 +1185,13 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     1.0_f64
                 },
             };
-           // tmp_input.solvent_model = 
-           // match tmp_ctrl.get("solvent_model").unwrap_or(&serde_json::Value::Null) {
-           //     serde_json::Value::String(tmp_type) => {
-           //         let tmp_solvent_model = tmp_type.to_lowercase();
-           //         if tmp_solvent_model.eq("cpcm") {
-           //             PcmMethod::CPCM
-           //         } else if tmp_solvent_model.eq("cosmo") {
-           //             PcmMethod::COSMO
-           //         } else if tmp_solvent_model.eq("iefpcm") {
-           //             PcmMethod::IEFPCM
-           //         } else {
-           //             PcmMethod::disabled
-           //         }
-           //     },
-           //     other => PcmMethod::CPCM,
-           // };
+            // Experimental function
+            tmp_input.solv_chunk = match tmp_ctrl.get("solv_chunk").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(8)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
+                other => {8},
+            };
+
             // ==============================================
             //  Keywords associated with the SCF procedure
             // ==============================================
