@@ -4759,6 +4759,7 @@ impl ScfTraceRecord {
         //if self.residual_density.len()>=2 {
         let alpha = self.mix_param;
         let beta = 1.0-self.mix_param;
+        let mut level_shift_applied = false;
         if self.mixer.eq(&"direct") {
             scf.generate_hf_hamiltonian(mpi_operator);
         }
@@ -4790,6 +4791,37 @@ impl ScfTraceRecord {
             let dt1 = time::Local::now();
 
             scf.generate_hf_hamiltonian(mpi_operator);
+
+            // Apply level_shift to the output fock matrix BEFORE DIIS target storage.
+            // This ensures DIIS operates in the level-shifted subspace, so the DIIS
+            // extrapolated Fock matrix is already level-shifted (no post-hoc correction).
+            if let Some(level_shift_val) = scf.mol.ctrl.level_shift {
+                let ovlp = &scf.ovlp;
+                let dm_scaling_factor = match scf.scftype {
+                    SCFType::RHF | SCFType::ROHF => 0.5,
+                    SCFType::UHF => 1.0,
+                };
+                match scf.scftype {
+                    SCFType::RHF => {
+                        let mut fock = scf.hamiltonian.get_mut(0).unwrap();
+                        let dm = scf.density_matrix.get(0).unwrap();
+                        level_shift_fock(fock, ovlp, level_shift_val, dm, dm_scaling_factor);
+                    },
+                    SCFType::UHF => {
+                        for i_spin in 0..scf.mol.spin_channel {
+                            let mut fock = scf.hamiltonian.get_mut(i_spin).unwrap();
+                            let dm = scf.density_matrix.get(i_spin).unwrap();
+                            level_shift_fock(fock, ovlp, level_shift_val, dm, dm_scaling_factor);
+                        }
+                    },
+                    SCFType::ROHF => {
+                        let fock = scf.roothaan_hamiltonian.as_mut().unwrap();
+                        let dm = scf.density_matrix[0].clone() + scf.density_matrix[1].clone();
+                        level_shift_fock(fock, ovlp, level_shift_val, &dm, dm_scaling_factor);
+                    }
+                }
+                level_shift_applied = true;
+            }
 
 
             // update the energy records and check the oscillation
@@ -4877,9 +4909,7 @@ impl ScfTraceRecord {
                         .unwrap();
                 }
                 scf.generate_hf_hamiltonian(mpi_operator);
-                //let index = self.target_vector.len()-1;
-                //self.target_vector.remove(index);
-                //self.error_vector.remove(index);
+                level_shift_applied = false;
                 self.start_diis_cycle = self.num_iter + 8;
                 self.target_vector =  Vec::<[MatrixFull<f64>;2]>::new();
                 self.error_vector =  Vec::<Vec::<f64>>::new();
@@ -4895,7 +4925,10 @@ impl ScfTraceRecord {
 
         // now consider if level_shift is applied
         // at present only a constant level shift is implemented for both spin channels and for the whole SCF procedure
-        if let Some(level_shift) = scf.mol.ctrl.level_shift {
+        // For the DIIS path, level_shift is applied inside the DIIS block (before target storage)
+        // to ensure the DIIS subspace contains level-shifted Fock matrices.
+        if scf.mol.ctrl.level_shift.is_some() && !level_shift_applied {
+            let level_shift = scf.mol.ctrl.level_shift.unwrap();
             let ovlp = &scf.ovlp;
             let dm_scaling_factor = match scf.scftype {
                 SCFType::RHF | SCFType::ROHF=> 0.5,
