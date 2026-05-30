@@ -22,7 +22,7 @@ fn main() {
     // #[cfg(feature = "dftd4")]
     // println!("cargo:rustc-link-lib=dftd4");
 
-    let library_names = ["cint","restmatr","hdf5","hdf5_shim","rest2fch","openblas","gomp"];
+    let library_names = ["cint","restmatr","hdf5","rest2fch","openblas","gomp"];
     library_names.iter().for_each(|name| {
         println!("cargo:rustc-link-lib={}",*name);
     });
