@@ -1582,7 +1582,7 @@ impl DFA4REST {
                     let rhop_s = rhop.get_reducing_matrix(s).unwrap();
                     for x in 0usize..3usize {
                         let rhop_s_x = rhop_s.get_slice_x(x);
-                        data[idx * (3 * spin_channel) + x * spin_channel + s] = rhop_s_x[p];
+                        data[idx + x * num_active + s * num_active * 3] = rhop_s_x[p];
                     }
                 }
                 idx += 1;
@@ -1723,19 +1723,19 @@ impl DFA4REST {
         };
 
         // Density screening
+        // The screening decision is per-batch but entirely local: compact only
+        // when at least one grid point in this batch falls below the density
+        // threshold. This avoids the thread-count dependency of a percentage-based
+        // heuristic when grids are spatially (contiguously) partitioned.
         let active_mask = Self::build_active_grid_mask(&loc_rho, num_grids, spin_channel, vxc_screen_threshold);
         let num_active = active_mask.iter().filter(|&&x| x).count();
         let use_screening = num_active > 0 && num_active < num_grids * 3 / 4;
 
         if print_level >= 1 && use_screening {
-            if let Some(tid) = rayon::current_thread_index() {
-                if tid == 0 {
-                    let ratio = num_active as f64 / num_grids as f64 * 100.0;
-                    println!(" [VXC-screen(dm_only)] active grids: {}/{} ({:.1}%), saved ~{:.0}%",
-                        num_active, num_grids, ratio, 100.0 - ratio);
-                }
-            }
-        } 
+            let ratio = num_active as f64 / num_grids as f64 * 100.0;
+            println!(" [VXC-screen(dm_only)] active grids: {}/{} ({:.1}%), saved ~{:.0}%",
+                num_active, num_grids, ratio, 100.0 - ratio);
+        }
 
         if use_screening {
             // === Screened path: compact arrays, smaller vxc_ao ===
@@ -1834,9 +1834,30 @@ impl DFA4REST {
             });
 
             // Build compact ao/aop with only active grid columns
+            let ao_dense_owned: Option<MatrixFull<f64>>;
+            let ao_ref: &MatrixFull<f64> = match &grids.ao {
+                Some(a) => { ao_dense_owned = None; a }
+                None => {
+                    let c = grids.ao_compressed.as_ref().unwrap();
+                    ao_dense_owned = Some(Grids::decompress_ao(c));
+                    ao_dense_owned.as_ref().unwrap()
+                }
+            };
             let ao_active = Self::extract_active_ao_columns(
-                grids.ao.as_ref().unwrap(), &range_grids, &active_mask, num_active, num_basis);
-            let aop_active: Option<RIFull<f64>> = grids.aop.as_ref().map(|aop| {
+                ao_ref, &range_grids, &active_mask, num_active, num_basis);
+
+            let aop_dense_owned: Option<RIFull<f64>>;
+            let aop_ref: Option<&RIFull<f64>> = match &grids.aop {
+                Some(a) => { aop_dense_owned = None; Some(a) }
+                None => match &grids.aop_compressed {
+                    Some(c) => {
+                        aop_dense_owned = Some(Grids::decompress_aop(c));
+                        Some(aop_dense_owned.as_ref().unwrap())
+                    }
+                    None => { aop_dense_owned = None; None }
+                }
+            };
+            let aop_active: Option<RIFull<f64>> = aop_ref.map(|aop| {
                 Self::extract_active_aop_columns(aop, &range_grids, &active_mask, num_active, num_basis)
             });
             let weights_active = Self::compact_weights(&grids.weights[range_grids.clone()], &active_mask, num_active);
@@ -2280,18 +2301,18 @@ impl DFA4REST {
         };
 
         // Density screening
+        // The screening decision is per-batch but entirely local: compact only
+        // when at least one grid point in this batch falls below the density
+        // threshold. This avoids the thread-count dependency of a percentage-based
+        // heuristic when grids are spatially (contiguously) partitioned.
         let active_mask = Self::build_active_grid_mask(&loc_rho, num_grids, spin_channel, vxc_screen_threshold);
         let num_active = active_mask.iter().filter(|&&x| x).count();
         let use_screening = num_active > 0 && num_active < num_grids * 3 / 4;
 
         if print_level >= 1 && use_screening {
-            if let Some(tid) = rayon::current_thread_index() {
-                if tid == 0 {
-                    let ratio = num_active as f64 / num_grids as f64 * 100.0;
-                    println!(" [VXC-screen(coeff)]  active grids: {}/{} ({:.1}%), saved ~{:.0}%",
-                        num_active, num_grids, ratio, 100.0 - ratio);
-                }
-            }
+            let ratio = num_active as f64 / num_grids as f64 * 100.0;
+            println!(" [VXC-screen(coeff)]  active grids: {}/{} ({:.1}%), saved ~{:.0}%",
+                num_active, num_grids, ratio, 100.0 - ratio);
         }
 
         if use_screening {
@@ -2390,9 +2411,30 @@ impl DFA4REST {
                 }
             });
 
+            let ao_dense_owned2: Option<MatrixFull<f64>>;
+            let ao_ref2: &MatrixFull<f64> = match &grids.ao {
+                Some(a) => { ao_dense_owned2 = None; a }
+                None => {
+                    let c = grids.ao_compressed.as_ref().unwrap();
+                    ao_dense_owned2 = Some(Grids::decompress_ao(c));
+                    ao_dense_owned2.as_ref().unwrap()
+                }
+            };
             let ao_active = Self::extract_active_ao_columns(
-                grids.ao.as_ref().unwrap(), &range_grids, &active_mask, num_active, num_basis);
-            let aop_active: Option<RIFull<f64>> = grids.aop.as_ref().map(|aop| {
+                ao_ref2, &range_grids, &active_mask, num_active, num_basis);
+
+            let aop_dense_owned2: Option<RIFull<f64>>;
+            let aop_ref2: Option<&RIFull<f64>> = match &grids.aop {
+                Some(a) => { aop_dense_owned2 = None; Some(a) }
+                None => match &grids.aop_compressed {
+                    Some(c) => {
+                        aop_dense_owned2 = Some(Grids::decompress_aop(c));
+                        Some(aop_dense_owned2.as_ref().unwrap())
+                    }
+                    None => { aop_dense_owned2 = None; None }
+                }
+            };
+            let aop_active: Option<RIFull<f64>> = aop_ref2.map(|aop| {
                 Self::extract_active_aop_columns(aop, &range_grids, &active_mask, num_active, num_basis)
             });
             let weights_active = Self::compact_weights(&grids.weights[range_grids.clone()], &active_mask, num_active);
@@ -3271,7 +3313,9 @@ impl Grids {
 
             utilities::timing(&dt0, Some("Importing the grids"));
 
-            let parallel_balancing = balancing(coordinates.len(), rayon::current_num_threads());
+            let num_threads = rayon::current_num_threads();
+            utilities::apply_round_robin_permutation(&mut coordinates, &mut weights);
+            let parallel_balancing = balancing(coordinates.len(), num_threads);
 
             global_grid = Grids {
                 weights,
@@ -3344,7 +3388,9 @@ impl Grids {
         });
 
         utilities::timing(&dt0, Some("Generating the grids"));
-        let parallel_balancing = balancing(coordinates.len(), rayon::current_num_threads());
+        let num_threads = rayon::current_num_threads();
+        utilities::apply_round_robin_permutation(&mut coordinates, &mut weights);
+        let parallel_balancing = balancing(coordinates.len(), num_threads);
         global_grid = Grids {
             weights,
             coordinates,
