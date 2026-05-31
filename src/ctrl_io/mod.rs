@@ -299,6 +299,17 @@ pub struct InputKeywords {
     pub abort_on_mem_exceed: bool,
     pub smear: Option<SmearingType>,
     pub smear_sigma: Option<f64>,
+    /// Enable dynamic smearing annealing: sigma decays exponentially from smear_sigma
+    /// toward smear_sigma_min (or smear_sigma*0.01 by default) over the course of SCF.
+    /// A non-zero floor avoids degeneracy-driven orbital-occupation oscillations.
+    pub smear_anneal: bool,
+    /// Minimum sigma for annealing; defaults to max(smear_sigma * 0.01, 0.001).
+    pub smear_sigma_min: Option<f64>,
+    /// EDIIS penalty parameter η (default 0.5). Larger η = more conservative extrapolation.
+    pub ediis_penalty: Option<f64>,
+    /// HOMO-LUMO gap threshold (Ha) for EDIIS→DIIS auto-switch in "ediis+diis" mode.
+    /// Below this gap, EDIIS is preferred. Default 0.1 Ha.
+    pub ediis_switch_gap: Option<f64>,
     pub guess_mix: bool,
     pub guess_mix_theta_deg: Vec<f64>,
     pub start_mix_cycle: usize,
@@ -446,6 +457,10 @@ impl InputKeywords {
             abort_on_mem_exceed: true,
             smear: None,
             smear_sigma: None,
+            smear_anneal: false,
+            smear_sigma_min: None,
+            ediis_penalty: None,
+            ediis_switch_gap: None,
             guess_mix: false,
             guess_mix_theta_deg: [15.0, 15.0].to_vec(),
             start_mix_cycle: 0,
@@ -662,8 +677,9 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
     } else if tmp_mixer.eq(&"linear") {
         mixer_log = format!("The {} mixing is employed with the mixing parameter of {} for the SCF procedure", 
                     &tmp_mixer, &ctrl.mix_param);
-    } else if tmp_mixer.eq(&"ddiis") 
-            || tmp_mixer.eq(&"diis") {
+    } else if tmp_mixer.eq(&"diis")
+            || tmp_mixer.eq(&"ediis")
+            || tmp_mixer.eq(&"ediis+diis") {
         mixer_log = format!("The {} mixing with (param, max_vec_len) = ({}, {}) is employed for the SCF procedure", 
                     &tmp_mixer, &ctrl.mix_param, &ctrl.num_max_diis);
         mixer_log.push_str(&format!("\nTurn on the {} mixing after {} step(s) of SCF iteractions with the linear mixing", 
@@ -1241,7 +1257,10 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
 
             tmp_input.mixer = match tmp_ctrl.get("mixer").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
+                serde_json::Value::String(tmp_str) => {
+                    let m = tmp_str.to_lowercase();
+                    if m.eq(&"ddiis") { String::from("diis") } else { m }
+                },
                 other => {String::from("diis")},
             };
             tmp_input.mix_param = match tmp_ctrl.get("mix_param").unwrap_or(&serde_json::Value::Null) {
@@ -1611,6 +1630,52 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
 
             tmp_input.smear_sigma = match tmp_ctrl.get("smear_sigma").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {
+                    let num = tmp_str.to_lowercase().parse().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                serde_json::Value::Number(tmp_num) => {
+                    let num = tmp_num.as_f64().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                _ => None,
+            };
+
+            // for smear annealing; default = false
+            tmp_input.smear_anneal = match tmp_ctrl.get("smear_anneal").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => *tmp_bool,
+                serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                _ => false,
+            };
+
+            // for smear annealing minimum sigma
+            tmp_input.smear_sigma_min = match tmp_ctrl.get("smear_sigma_min").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {
+                    let num = tmp_str.to_lowercase().parse().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                serde_json::Value::Number(tmp_num) => {
+                    let num = tmp_num.as_f64().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                _ => None,
+            };
+
+            // for EDIIS penalty parameter
+            tmp_input.ediis_penalty = match tmp_ctrl.get("ediis_penalty").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {
+                    let num = tmp_str.to_lowercase().parse().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                serde_json::Value::Number(tmp_num) => {
+                    let num = tmp_num.as_f64().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                _ => None,
+            };
+
+            // for EDIIS switch gap
+            tmp_input.ediis_switch_gap = match tmp_ctrl.get("ediis_switch_gap").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {
                     let num = tmp_str.to_lowercase().parse().unwrap_or(0.0);
                     if num == 0.0 { None } else { Some(num) }

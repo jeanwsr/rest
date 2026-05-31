@@ -18,7 +18,7 @@ pub mod util;
 
 use mpi::collective::SystemOperation;
 use pyo3::{pyclass};
-use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemv, _dinverse, _dspgvx, _dsymm, _dsyrk, _hamiltonian_fast_solver, _power_rayon_for_symmetric_matrix, _dsyevd};
+use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemv, _dinverse, _dspgvx, _dsymm, _dsyrk, _hamiltonian_fast_solver, _power_rayon_for_symmetric_matrix, _dsyevd, _pinv, _get_sqrt_and_inv_sqrt};
 use tensors::{map_upper_to_full, BasicMatUp, BasicMatrix, ERIFold4, MathMatrix, MatrixFull, MatrixFullSlice, MatrixUpper, MatrixUpperSlice, RIFull, TensorSliceMut};
 use itertools::{Itertools};
 use rayon::prelude::*;
@@ -34,8 +34,9 @@ use crate::constants::{SQRT_THRESHOLD};
 use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
 use crate::ri_jk;
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
-use self::util::occupied_orbital_count;
+use self::util::{occupied_orbital_count, integer_homo_lumo};
 use smear::apply_smearing;
+use smear::annealed_sigma;
 
 #[pyclass]
 #[derive(Clone)]
@@ -653,43 +654,50 @@ impl SCF {
     }
     
     pub fn print_homo_lumo_gap(&self) {
+        let has_smear = self.mol.ctrl.smear.is_some();
+        let (homo_idx, lumo_idx) = if has_smear {
+            integer_homo_lumo(&self.mol.num_elec, self.mol.spin_channel)
+        } else {
+            (self.homo, self.lumo)
+        };
         let is_rohf = match self.scftype {
             SCFType::ROHF => true,
             _ => false,
         };
         if self.mol.ctrl.print_level>0 {
             if self.mol.spin_channel==1 {
-                let i_spin = 0; 
-                let i_homo = self.homo[i_spin];
-                let i_lumo = self.lumo[i_spin];
-                let homo = self.eigenvalues[i_spin][i_homo];
-                if i_lumo < self.eigenvalues[i_spin].len()  {
-                    let lumo = self.eigenvalues[i_spin][i_lumo];
-                    println!("HOMO: {:16.8}, LUMO: {:14.6}, H-L Gap: {:16.8}", homo, lumo, lumo-homo);
+                let i_homo = homo_idx[0];
+                let i_lumo = lumo_idx[0];
+                let homo = self.eigenvalues[0][i_homo];
+                if i_lumo < self.eigenvalues[0].len()  {
+                    let lumo = self.eigenvalues[0][i_lumo];
+                    if has_smear {
+                        print!("(integer-occupation pure-state gap) ");
+                    }
+                    println!("HOMO ({:3}): {:16.8}, LUMO ({:3}): {:14.6}, H-L Gap: {:16.8}", i_homo, homo, i_lumo, lumo, lumo-homo);
                 } else {
-                    println!("{:?}", &self.eigenvalues[i_spin]);
+                    println!("{:?}", &self.eigenvalues[0]);
                     println!("HOMO: {:16.8} (No virtual orbtials available)", homo);
                 }
-
             } else {
                 for i_spin in (0..self.mol.spin_channel) {
-                         // 只打印有电子的自旋通道
                     if (self.mol.num_elec[i_spin+1] > 1.0E-5) {
+                        let i_homo = homo_idx[i_spin];
+                        let i_lumo = lumo_idx[i_spin];
                         if ! is_rohf {
-                            let i_homo = self.homo[i_spin];
-                            let i_lumo = self.lumo[i_spin];
                             let homo = self.eigenvalues[i_spin][i_homo];
                             let lumo = self.eigenvalues[i_spin][i_lumo];
-                            println!("Spin {:2}: HOMO: {:14.6}, LUMO: {:14.6}, H-L Gap: {:16.8}", i_spin, homo, lumo, lumo-homo);
+                            if has_smear {
+                                print!("(integer-occupation pure-state gap) ");
+                            }
+                            println!("Spin {:2}: HOMO ({:3}): {:14.6}, LUMO ({:3}): {:14.6}, H-L Gap: {:16.8}", i_spin, i_homo, homo, i_lumo, lumo, lumo-homo);
                         } else {
-                            // 对于ROHF, 只打印第一个自旋通道(i_spin=0)
-                            let i_homo = self.homo[i_spin];
-                            let i_lumo = self.lumo[i_spin];
-                            //println!("i_homo: {}, i_lumo: {}", i_homo, i_lumo);
-                            //println!("debug eigenvalues: {:?}", self.eigenvalues[0]);
                             let homo = self.eigenvalues[0][i_homo];
                             let lumo = self.eigenvalues[0][i_lumo];
-                            println!("Spin {:2}: HOMO: {:14.6}, LUMO: {:14.6}, H-L Gap: {:16.8}", i_spin, homo, lumo, lumo-homo);
+                            if has_smear {
+                                print!("(integer-occupation pure-state gap) ");
+                            }
+                            println!("Spin {:2}: HOMO ({:3}): {:14.6}, LUMO ({:3}): {:14.6}, H-L Gap: {:16.8}", i_spin, i_homo, homo, i_lumo, lumo, lumo-homo);
                         }
                     } else {
                         println!("No electron with spin {:2}", i_spin);
@@ -4661,6 +4669,9 @@ pub struct ScfTraceRecord {
     pub density_matrix: [Vec<MatrixFull<f64>>;2],
     pub target_vector: Vec<[MatrixFull<f64>;2]>,
     pub error_vector: Vec<Vec<f64>>,
+    pub sqrt_inv_ovlp: Option<MatrixFull<f64>>,
+    pub ediis_density: Vec<[MatrixFull<f64>;2]>,
+    pub ediis_energy: Vec<f64>,
 }
 
 impl ScfTraceRecord {
@@ -4687,6 +4698,9 @@ impl ScfTraceRecord {
                               MatrixFull::new([1,1],0.0)]],
             target_vector: Vec::<[MatrixFull<f64>;2]>::new(),
             error_vector: Vec::<Vec::<f64>>::new(),
+            sqrt_inv_ovlp: None,
+            ediis_density: Vec::<[MatrixFull<f64>;2]>::new(),
+            ediis_energy: Vec::<f64>::new(),
         }
     }
     pub fn initialize(scf: &SCF) -> ScfTraceRecord {
@@ -4703,8 +4717,18 @@ impl ScfTraceRecord {
         tmp_records.eigenvectors=scf.eigenvectors.clone();
         tmp_records.eigenvalues=scf.eigenvalues.clone();
         tmp_records.density_matrix=[scf.density_matrix.clone(),scf.density_matrix.clone()];
-        if tmp_records.mixer.eq(&"ddiis") {
-            tmp_records.target_vector.push([scf.density_matrix[0].clone(),scf.density_matrix[1].clone()]);
+        let ovlp_full = scf.ovlp.to_matrixfull().unwrap();
+        if let Some((_sqrt_a, sqrt_inv_a, _rank)) = _get_sqrt_and_inv_sqrt(&ovlp_full, SQRT_THRESHOLD) {
+            tmp_records.sqrt_inv_ovlp = Some(sqrt_inv_a);
+        }
+        if tmp_records.mixer.eq(&"ediis") {
+            tmp_records.ediis_density.push([scf.density_matrix[0].clone(),
+                if scf.mol.spin_channel>1 { scf.density_matrix[1].clone() }
+                else { MatrixFull::empty() }]);
+            tmp_records.ediis_energy.push(scf.scf_energy);
+            tmp_records.target_vector.push([scf.hamiltonian[0].to_matrixfull().unwrap(),
+                if scf.mol.spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() }
+                else { MatrixFull::empty() }]);
         }
         tmp_records
     }
@@ -4764,7 +4788,6 @@ impl ScfTraceRecord {
             scf.generate_hf_hamiltonian(mpi_operator);
         }
         else if self.mixer.eq(&"linear") 
-            || (self.mixer.eq(&"ddiis") && self.num_iter<start_pulay) 
             || (self.mixer.eq(&"diis") && self.num_iter<start_pulay) 
         {
             let mut alpha = self.mix_param;
@@ -4857,7 +4880,7 @@ impl ScfTraceRecord {
             //    //self.target_vector.push([scf.hamiltonian[i_spin].clone(), scf.hamiltonian[i_spin].clone()]);
             //    scf.hamiltonian[i_spin].formated_output(5, "upper");
             //}
-            let (cur_error_vec, cur_target) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel);
+            let (cur_error_vec, cur_target) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel, &self.sqrt_inv_ovlp);
             self.error_vector.push(cur_error_vec);
             self.target_vector.push(cur_target);
 
@@ -4921,6 +4944,88 @@ impl ScfTraceRecord {
                 println!("Hamiltonian: generation by {:10.2}s and DIIS extrapolation by {:10.2}s", timecost1,timecost2);
             }
             
+        } else if self.mixer.eq(&"ediis") && self.num_iter>=start_pulay {
+            scf.generate_hf_hamiltonian(mpi_operator);
+            let cur_density = [scf.density_matrix[0].clone(),
+                if spin_channel>1 { scf.density_matrix[1].clone() } else { MatrixFull::empty() }];
+            let cur_fock = [scf.hamiltonian[0].to_matrixfull().unwrap(),
+                if spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() } else { MatrixFull::empty() }];
+            if self.ediis_density.len() == self.num_max_records {
+                self.ediis_density.remove(0); self.ediis_energy.remove(0); self.target_vector.remove(0);
+            }
+            self.ediis_density.push(cur_density); self.ediis_energy.push(self.scf_energy);
+            self.target_vector.push(cur_fock);
+            let nhist = self.ediis_density.len();
+            if nhist >= 2 {
+                let bmat = generate_ediis_penalty(&self.target_vector, &self.ediis_density, spin_channel);
+                let eta = scf.mol.ctrl.ediis_penalty.unwrap_or(0.5);
+                let n = bmat.size()[0];
+                let mut qmat = MatrixFull::new([n, n], 0.0);
+                for i in 0..n { for j in 0..n { let bij = bmat.get2d([i, j]).unwrap_or(&0.0); qmat.set2d([i, j], -2.0*eta*bij); } }
+                let coeff = ediis_qp_solver(&qmat, &self.ediis_energy, eta);
+                for i_spin in 0..spin_channel {
+                    let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
+                    for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
+                    scf.hamiltonian[i_spin] = next_h.to_matrixupper();
+                }
+                if scf.mol.ctrl.print_level > 1 {
+                    print!("EDIIS coeff: ["); for ck in &coeff { print!(" {:.4}", ck); } println!(" ]");
+                }
+            }
+            level_shift_applied = false;
+        } else if self.mixer.eq(&"ediis+diis") && self.num_iter>=start_pulay {
+            scf.generate_hf_hamiltonian(mpi_operator);
+            if let Some(ls_val) = scf.mol.ctrl.level_shift {
+                let dsf = match scf.scftype { SCFType::RHF|SCFType::ROHF => 0.5, SCFType::UHF => 1.0 };
+                match scf.scftype {
+                    SCFType::RHF => level_shift_fock(scf.hamiltonian.get_mut(0).unwrap(), &scf.ovlp, ls_val, scf.density_matrix.get(0).unwrap(), dsf),
+                    SCFType::UHF => for s in 0..spin_channel { level_shift_fock(scf.hamiltonian.get_mut(s).unwrap(), &scf.ovlp, ls_val, scf.density_matrix.get(s).unwrap(), dsf) },
+                    SCFType::ROHF => { let dm = scf.density_matrix[0].clone()+scf.density_matrix[1].clone(); level_shift_fock(scf.roothaan_hamiltonian.as_mut().unwrap(), &scf.ovlp, ls_val, &dm, dsf) }
+                }
+                level_shift_applied = true;
+            }
+            let cur_dens = [scf.density_matrix[0].clone(), if spin_channel>1 { scf.density_matrix[1].clone() } else { MatrixFull::empty() }];
+            let cur_fock = [scf.hamiltonian[0].to_matrixfull().unwrap(), if spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() } else { MatrixFull::empty() }];
+            let max_rec = self.num_max_records;
+            if self.target_vector.len() == max_rec { self.target_vector.remove(0); self.error_vector.remove(0); }
+            if self.ediis_density.len() == max_rec { self.ediis_density.remove(0); self.ediis_energy.remove(0); }
+            let (cur_err, cur_tgt) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel, &self.sqrt_inv_ovlp);
+            self.error_vector.push(cur_err); self.target_vector.push(cur_tgt);
+            self.ediis_density.push(cur_dens); self.ediis_energy.push(self.scf_energy);
+            let num_diis = self.error_vector.len(); let num_ediis = self.ediis_density.len();
+            let diis_norm = self.error_vector.last().map(|v| v.iter().map(|x| x*x).sum::<f64>().sqrt()).unwrap_or(1.0);
+            let use_ediis = num_ediis >= 2 && (num_diis < 2 || diis_norm > 1e-3);
+            if use_ediis && num_ediis >= 2 {
+                let bmat = generate_ediis_penalty(&self.target_vector, &self.ediis_density, spin_channel);
+                let eta = scf.mol.ctrl.ediis_penalty.unwrap_or(0.5);
+                let n = bmat.size()[0]; let mut qmat = MatrixFull::new([n, n], 0.0);
+                for i in 0..n { for j in 0..n { let bij = bmat.get2d([i, j]).unwrap_or(&0.0); qmat.set2d([i, j], -2.0*eta*bij); } }
+                let coeff = ediis_qp_solver(&qmat, &self.ediis_energy, eta);
+                for i_spin in 0..spin_channel {
+                    let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
+                    for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
+                    scf.hamiltonian[i_spin] = next_h.to_matrixupper();
+                }
+                if scf.mol.ctrl.print_level > 1 { print!("[EDIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
+            } else if num_diis >= 2 {
+                if let Some(coeff) = diis_solver(&self.error_vector, &num_diis) {
+                    for i_spin in 0..spin_channel {
+                        let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
+                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
+                        scf.hamiltonian[i_spin] = next_h.to_matrixupper();
+                    }
+                    if scf.mol.ctrl.print_level > 1 { print!("[DIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
+                } else {
+                    for i_spin in 0..spin_channel {
+                        let rd = self.density_matrix[1][i_spin].sub(&self.density_matrix[0][i_spin]).unwrap();
+                        scf.density_matrix[i_spin] = self.density_matrix[0][i_spin].scaled_add(&rd, alpha).unwrap();
+                    }
+                    scf.generate_hf_hamiltonian(mpi_operator);
+                    level_shift_applied = false;
+                    self.target_vector.clear(); self.error_vector.clear();
+                    self.ediis_density.clear(); self.ediis_energy.clear();
+                }
+            }
         };
 
         // now consider if level_shift is applied
@@ -4960,7 +5065,8 @@ impl ScfTraceRecord {
 pub fn generate_diis_error_vector(hamiltonian: &[MatrixUpper<f64>;2], 
                                 ovlp: &MatrixUpper<f64>, 
                                 density_matrix: &mut [Vec<MatrixFull<f64>>;2],
-                                spin_channel: usize) -> (Vec<f64>, [MatrixFull<f64>;2]) {
+                                spin_channel: usize,
+                                sqrt_inv_ovlp: &Option<MatrixFull<f64>>) -> (Vec<f64>, [MatrixFull<f64>;2]) {
             let mut cur_error = [
                 MatrixFull::new([1,1],0.0),
                 MatrixFull::new([1,1],0.0)
@@ -4979,12 +5085,15 @@ pub fn generate_diis_error_vector(hamiltonian: &[MatrixUpper<f64>;2],
                 dsf = dsf.ddot(&mut cur_target[i_spin]).unwrap();
                 cur_error[i_spin].self_sub(&dsf);
 
-                // //transfer to an orthorgonal basis
-                // let mut tmp_mat = cur_error[i_spin].ddot(&mut sqrt_inv_ovlp).unwrap();
-                // cur_error[i_spin].lapack_dgemm(
-                //   &mut sqrt_inv_ovlp, &mut tmp_mat,
-                //   'T', 'N',
-                //   1.0,0.0);
+                // transfer to an orthogonal basis to improve numerical conditioning
+                if let Some(sinv) = sqrt_inv_ovlp {
+                    let n = cur_error[i_spin].size()[0];
+                    let mut tmp = MatrixFull::new([n, n], 0.0);
+                    _dgemm_full(&cur_error[i_spin], 'N', sinv, 'N', &mut tmp, 1.0, 0.0);
+                    let mut e_orth = MatrixFull::new([n, n], 0.0);
+                    _dgemm_full(sinv, 'N', &tmp, 'N', &mut e_orth, 1.0, 0.0);
+                    cur_error[i_spin] = e_orth;
+                }
             });
 
             let mut norm = 0.0;
@@ -4999,6 +5108,63 @@ pub fn generate_diis_error_vector(hamiltonian: &[MatrixUpper<f64>;2],
             ([cur_error[0].data.clone(),cur_error[1].data.clone()].concat(),
             cur_target)
 
+}
+
+/// Build the EDIIS penalty matrix B_{ij} = Tr[(D_i−D_j)(F_i−F_j)].
+fn generate_ediis_penalty(
+    target_vector: &[[MatrixFull<f64>; 2]],
+    ediis_density: &[[MatrixFull<f64>; 2]],
+    spin_channel: usize,
+) -> MatrixFull<f64> {
+    let n = target_vector.len();
+    let mut bmat = MatrixFull::new([n, n], 0.0);
+    for i in 0..n {
+        for j in i..n {
+            let mut tr = 0.0f64;
+            for i_spin in 0..spin_channel {
+                let dd = ediis_density[i][i_spin].sub(&ediis_density[j][i_spin]).unwrap();
+                let df = target_vector[i][i_spin].sub(&target_vector[j][i_spin]).unwrap();
+                tr += dd.data.iter().zip(df.data.iter()).map(|(a, b)| a * b).sum::<f64>();
+            }
+            bmat.set2d([i, j], tr);
+            bmat.set2d([j, i], tr);
+        }
+    }
+    bmat
+}
+
+/// Solve the EDIIS QP:  min ½cᵀQc + pᵀc  s.t. Σc=1, c≥0.
+fn ediis_qp_solver(q: &MatrixFull<f64>, p: &[f64], _eta: f64) -> Vec<f64> {
+    let n = p.len();
+    if n <= 1 { return vec![1.0f64; n]; }
+    let mut c = vec![1.0 / n as f64; n];
+    for _iter in 0..200 {
+        let mut g = p.to_vec();
+        for i in 0..n {
+            let row = q.get2d_slice([i, 0], n).unwrap();
+            for j in 0..n { g[i] += row[j] * c[j]; }
+        }
+        let g_mean = g.iter().sum::<f64>() / n as f64;
+        let g_proj: Vec<f64> = g.iter().map(|gi| gi - g_mean).collect();
+        if g_proj.iter().map(|x| x*x).sum::<f64>().sqrt() < 1e-14 { break; }
+        let d: Vec<f64> = g_proj.iter().map(|gi| -gi).collect();
+        let mut amax = f64::INFINITY;
+        for i in 0..n { if d[i] < -1e-14 { let am = -c[i]/d[i]; if am < amax { amax = am; } } }
+        let mut dqd = 0.0f64; let mut gd = 0.0f64;
+        for i in 0..n {
+            let row = q.get2d_slice([i, 0], n).unwrap();
+            let mut qd_i = 0.0f64;
+            for j in 0..n { qd_i += row[j] * d[j]; }
+            dqd += d[i] * qd_i; gd += d[i] * g[i];
+        }
+        let alpha = if dqd <= 0.0 { amax } else { (-gd/dqd).min(amax) };
+        if alpha < 1e-14 { break; }
+        for i in 0..n { c[i] += alpha * d[i]; }
+    }
+    for ci in c.iter_mut() { *ci = ci.max(0.0); }
+    let sum: f64 = c.iter().sum();
+    if sum > 0.0 { for ci in c.iter_mut() { *ci /= sum; } } else { c.fill(1.0/n as f64); }
+    c
 }
 
 pub fn diis_solver(em: &Vec<Vec<f64>>,
@@ -5025,16 +5191,12 @@ pub fn diis_solver(em: &Vec<Vec<f64>>,
             //sum_inv_norm_rdm += inv_norm_rdm;
         })
     });
-    let inv_opta = if let Some(inv_opta) = _dinverse(&mut opta) {
-        //println!("diis_solver: _dinverse");
-        inv_opta
-    //} else if let Some(inv_opta) = opta.lapack_power(-1.0, INVERSE_THRESHOLD) {
-    //    println!("diis_solver: lapack_power");
-    //    inv_opta
-    } else {
-        //println!("diis_solver: none");
-        return None
-    };
+    let inv_opta = _pinv(&opta, Some(1.0e-12f64)).unwrap();
+    let sum_inv = inv_opta.data.iter().sum::<f64>();
+    if sum_inv.abs() < 1.0e-12 {
+        return None;
+    }
+    sum_inv_norm_rdm = sum_inv.powf(-1.0f64);
     sum_inv_norm_rdm = inv_opta.data.iter().sum::<f64>().powf(-1.0f64);
 
     // now prepare the coefficients for the pulay mixing
@@ -5576,7 +5738,15 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         let dt1_2 = time::Local::now();
         scf_data.generate_occupation();
         if let Some(st) = &scf_data.mol.ctrl.smear {
-            apply_smearing(scf_data, *st, scf_data.mol.ctrl.smear_sigma.unwrap());
+            let mut sigma = scf_data.mol.ctrl.smear_sigma.unwrap();
+            if scf_data.mol.ctrl.smear_anneal {
+                let anneal_start = scf_data.mol.ctrl.start_diis_cycle;
+                let anneal_length = (scf_data.mol.ctrl.max_scf_cycle as f64 * 0.5) as usize;
+                let sigma_min = scf_data.mol.ctrl.smear_sigma_min
+                    .unwrap_or_else(|| f64::max(sigma * 0.01, 0.001));
+                sigma = annealed_sigma(sigma, sigma_min, scf_records.num_iter, anneal_start, anneal_length);
+            }
+            apply_smearing(scf_data, *st, sigma);
         }
 
         // --- Apply guess_mix during SCF iterations ---
