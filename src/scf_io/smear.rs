@@ -177,3 +177,33 @@ pub fn find_mu(energy: &[f64], nocc: f64, sigma: f64, smearing_type: SmearingTyp
 
     (lo + hi) / 2.0
 }
+
+/// Exponential smearing annealing schedule.
+///
+/// `sigma_start`  – initial sigma (from `smear_sigma`)
+/// `sigma_min`    – floor value; sigma never drops below this to avoid
+///                  degeneracy-driven oscillations in near-degenerate manifolds.
+/// `iter`         – current SCF iteration (1-indexed)
+/// `anneal_start` – iteration at which annealing begins
+/// `anneal_length` – number of iterations over which to anneal
+///
+/// Returns the effective sigma for the current iteration, clamped to
+/// [sigma_min, sigma_start].
+pub fn annealed_sigma(
+    sigma_start: f64,
+    sigma_min: f64,
+    iter: usize,
+    anneal_start: usize,
+    anneal_length: usize,
+) -> f64 {
+    if anneal_length == 0 {
+        return sigma_min.max(sigma_start);
+    }
+    if iter <= anneal_start {
+        return sigma_start;
+    }
+    let progress = ((iter - anneal_start) as f64) / (anneal_length as f64);
+    let progress = progress.min(1.0);
+    let sigma = sigma_start * (sigma_min / sigma_start).powf(progress);
+    sigma.max(sigma_min)
+}

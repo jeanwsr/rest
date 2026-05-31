@@ -19,6 +19,29 @@ pub fn is_aufbau(occupation: &[f64]) -> bool {
         .all(|pair| pair[0] + ORB_OCCUPATION_THRESHOLD > pair[1])
 }
 
+/// Return the HOMO and LUMO indices that would result from pure (integer)
+/// occupation — i.e. ignoring any smearing.  For UHF/ROHF the return is
+/// `([homo_α, homo_β], [lumo_α, lumo_β])`; for RHF only the first element
+/// of each triplet is meaningful.
+pub fn integer_homo_lumo(num_elec: &[f64; 3], spin_channel: usize) -> ([usize; 2], [usize; 2]) {
+    let mut homo = [0usize; 2];
+    let mut lumo = [0usize; 2];
+    if spin_channel == 1 {
+        // RHF: all electrons doubly occupied
+        let nocc = (num_elec[0] / 2.0).round() as usize;
+        homo[0] = nocc.saturating_sub(1);
+        lumo[0] = nocc;
+    } else {
+        // UHF / ROHF: alpha and beta separately
+        for s in 0..spin_channel {
+            let nocc = num_elec[s + 1].round() as usize; // num_elec[1] = alpha, [2] = beta
+            homo[s] = nocc.saturating_sub(1);
+            lumo[s] = nocc;
+        }
+    }
+    (homo, lumo)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_aufbau, occupied_orbital_count, occupied_orbital_count_with_threshold};
