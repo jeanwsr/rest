@@ -4723,7 +4723,7 @@ impl ScfTraceRecord {
         if let Some((_sqrt_a, sqrt_inv_a, _rank)) = _get_sqrt_and_inv_sqrt(&ovlp_full, SQRT_THRESHOLD) {
             tmp_records.sqrt_inv_ovlp = Some(sqrt_inv_a);
         }
-        if tmp_records.mixer.eq(&"ediis") {
+        if tmp_records.mixer.eq(&"ediis") || tmp_records.mixer.eq(&"ediis+diis") || tmp_records.mixer.eq(&"adiis+diis") {
             tmp_records.ediis_density.push([scf.density_matrix[0].clone(),
                 if scf.mol.spin_channel>1 { scf.density_matrix[1].clone() }
                 else { MatrixFull::empty() }]);
@@ -4963,8 +4963,7 @@ impl ScfTraceRecord {
             if nhist >= 2 {
                 let bmat = generate_ediis_penalty(&self.target_vector, &self.ediis_density, spin_channel);
                 let eta = scf.mol.ctrl.ediis_penalty.unwrap_or(0.5);
-                let n = bmat.size()[0];
-                let mut qmat = MatrixFull::new([n, n], 0.0);
+                let n = bmat.size()[0]; let mut qmat = MatrixFull::new([n, n], 0.0);
                 for i in 0..n { for j in 0..n { let bij = bmat.get2d([i, j]).unwrap_or(&0.0); qmat.set2d([i, j], -2.0*eta*bij); } }
                 let coeff = ediis_qp_solver(&qmat, &self.ediis_energy, eta);
                 for i_spin in 0..spin_channel {
@@ -5000,23 +4999,22 @@ impl ScfTraceRecord {
             let num_diis = self.error_vector.len(); let num_ediis = self.ediis_density.len();
             let diis_norm = self.error_vector.last().map(|v| v.iter().map(|x| x*x).sum::<f64>().sqrt()).unwrap_or(1.0);
             let use_ediis = num_ediis >= 2 && (num_diis < 2 || diis_norm > 1e-3);
-            let mut ediis_ok = false;
+            let mut ediis_used = false;
             if use_ediis && num_ediis >= 2 {
                 let bmat = generate_ediis_penalty(&self.target_vector, &self.ediis_density, spin_channel);
                 let eta = scf.mol.ctrl.ediis_penalty.unwrap_or(0.5);
                 let n = bmat.size()[0]; let mut qmat = MatrixFull::new([n, n], 0.0);
                 for i in 0..n { for j in 0..n { let bij = bmat.get2d([i, j]).unwrap_or(&0.0); qmat.set2d([i, j], -2.0*eta*bij); } }
                 let coeff = ediis_qp_solver(&qmat, &self.ediis_energy, eta);
-                // Energy watchdog: reject EDIIS if predicted energy exceeds current
                 let mut e_pred = 0.0f64;
                 for i in 0..n { e_pred += coeff[i] * self.ediis_energy[i]; }
                 for i in 0..n { for j in 0..n {
                     let bij = bmat.get2d([i, j]).unwrap_or(&0.0);
                     e_pred -= eta * coeff[i] * coeff[j] * bij;
                 }}
-                ediis_ok = e_pred <= ediis_e0(self.scf_energy, self.smearing_entropy, Some(scf.current_smear_sigma)) + 1e-10;
+                let e0_cur = ediis_e0(self.scf_energy, self.smearing_entropy, Some(scf.current_smear_sigma));
+                let ediis_ok = e_pred <= e0_cur + 1e-10;
                 if !ediis_ok && scf.mol.ctrl.print_level > 1 {
-                    let e0_cur = ediis_e0(self.scf_energy, self.smearing_entropy, Some(scf.current_smear_sigma));
                     println!("[EDIIS] rejected: E_pred={:14.8} > E0_cur={:14.8}", e_pred, e0_cur);
                 }
                 if ediis_ok {
@@ -5026,9 +5024,82 @@ impl ScfTraceRecord {
                         scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                     }
                     if scf.mol.ctrl.print_level > 1 { print!("[EDIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
+                    ediis_used = true;
                 }
             }
-            if (!use_ediis || num_ediis < 2 || !ediis_ok) && num_diis >= 2 {
+            if !ediis_used && num_diis >= 2 {
+                if let Some(coeff) = diis_solver(&self.error_vector, &num_diis) {
+                    for i_spin in 0..spin_channel {
+                        let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
+                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
+                        scf.hamiltonian[i_spin] = next_h.to_matrixupper();
+                    }
+                    if scf.mol.ctrl.print_level > 1 { print!("[DIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
+                } else {
+                    for i_spin in 0..spin_channel {
+                        let rd = self.density_matrix[1][i_spin].sub(&self.density_matrix[0][i_spin]).unwrap();
+                        scf.density_matrix[i_spin] = self.density_matrix[0][i_spin].scaled_add(&rd, alpha).unwrap();
+                    }
+                    scf.generate_hf_hamiltonian(mpi_operator);
+                    level_shift_applied = false;
+                    self.target_vector.clear(); self.error_vector.clear();
+                    self.ediis_density.clear(); self.ediis_energy.clear();
+                }
+            }
+        } else if self.mixer.eq(&"adiis+diis") && self.num_iter>=start_pulay {
+            scf.generate_hf_hamiltonian(mpi_operator);
+            if let Some(ls_val) = scf.mol.ctrl.level_shift {
+                let dsf = match scf.scftype { SCFType::RHF|SCFType::ROHF => 0.5, SCFType::UHF => 1.0 };
+                match scf.scftype {
+                    SCFType::RHF => level_shift_fock(scf.hamiltonian.get_mut(0).unwrap(), &scf.ovlp, ls_val, scf.density_matrix.get(0).unwrap(), dsf),
+                    SCFType::UHF => for s in 0..spin_channel { level_shift_fock(scf.hamiltonian.get_mut(s).unwrap(), &scf.ovlp, ls_val, scf.density_matrix.get(s).unwrap(), dsf) },
+                    SCFType::ROHF => { let dm = scf.density_matrix[0].clone()+scf.density_matrix[1].clone(); level_shift_fock(scf.roothaan_hamiltonian.as_mut().unwrap(), &scf.ovlp, ls_val, &dm, dsf) }
+                }
+                level_shift_applied = true;
+            }
+            let cur_dens = [scf.density_matrix[0].clone(), if spin_channel>1 { scf.density_matrix[1].clone() } else { MatrixFull::empty() }];
+            let cur_fock = [scf.hamiltonian[0].to_matrixfull().unwrap(), if spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() } else { MatrixFull::empty() }];
+            let max_rec = self.num_max_records;
+            if self.target_vector.len() == max_rec { self.target_vector.remove(0); self.error_vector.remove(0); }
+            if self.ediis_density.len() == max_rec { self.ediis_density.remove(0); self.ediis_energy.remove(0); }
+            let (cur_err, cur_tgt) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel, &self.sqrt_inv_ovlp);
+            self.error_vector.push(cur_err); self.target_vector.push(cur_tgt);
+            self.ediis_density.push(cur_dens.clone()); self.ediis_energy.push(ediis_e0(self.scf_energy,
+                self.smearing_entropy, Some(scf.current_smear_sigma)));
+            let num_diis = self.error_vector.len(); let num_ediis = self.ediis_density.len();
+            let diis_norm = self.error_vector.last().map(|v| v.iter().map(|x| x*x).sum::<f64>().sqrt()).unwrap_or(1.0);
+            let use_adiis = num_ediis >= 2 && (num_diis < 2 || diis_norm > 1e-3);
+            let mut adiis_used = false;
+            if use_adiis && num_ediis >= 2 {
+                let bmat = generate_adiis_penalty(&self.ediis_density, &self.target_vector, spin_channel);
+                let mu = scf.mol.ctrl.adiis_penalty.unwrap_or(0.5);
+                let bmax = bmat.data.iter().fold(0.0f64, |m, &x| m.max(x.abs()));
+                let mu_eff = if bmax > 1e-10 { mu / bmax } else { mu };
+                let n = bmat.size()[0]; let mut qmat = MatrixFull::new([n, n], 0.0);
+                for i in 0..n { for j in 0..n { let bij = bmat.get2d([i, j]).unwrap_or(&0.0); qmat.set2d([i, j], mu_eff*bij); } }
+                let coeff = ediis_qp_solver(&qmat, &self.ediis_energy, mu_eff);
+                let mut e_pred = 0.0f64;
+                for i in 0..n { e_pred += coeff[i] * self.ediis_energy[i]; }
+                for i in 0..n { for j in 0..n {
+                    let bij = bmat.get2d([i, j]).unwrap_or(&0.0);
+                    e_pred += 0.5 * mu_eff * coeff[i] * coeff[j] * bij;
+                }}
+                let e0_cur = ediis_e0(self.scf_energy, self.smearing_entropy, Some(scf.current_smear_sigma));
+                let adiis_ok = e_pred <= e0_cur + 1e-8;
+                if !adiis_ok && scf.mol.ctrl.print_level > 1 {
+                    println!("[ADIIS] rejected: E_pred={:14.8} > E0_cur={:14.8}", e_pred, e0_cur);
+                }
+                if adiis_ok {
+                    for i_spin in 0..spin_channel {
+                        let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
+                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
+                        scf.hamiltonian[i_spin] = next_h.to_matrixupper();
+                    }
+                    if scf.mol.ctrl.print_level > 1 { print!("[ADIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
+                    adiis_used = true;
+                }
+            }
+            if !adiis_used && num_diis >= 2 {
                 if let Some(coeff) = diis_solver(&self.error_vector, &num_diis) {
                     for i_spin in 0..spin_channel {
                         let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
@@ -5197,6 +5268,32 @@ fn ediis_qp_solver(q: &MatrixFull<f64>, p: &[f64], _eta: f64) -> Vec<f64> {
     c
 }
 
+/// Build ADIIS penalty: B_{ij} = Tr[(D_i−D_ref)(F_j−F_ref)] using newest point as ref.
+/// Positive-semidefinite → convex QP → smooth coefficients. Ref: Hu & Yang JCP 132, 054109 (2010).
+fn generate_adiis_penalty(
+    densities: &[[MatrixFull<f64>; 2]],
+    focks: &[[MatrixFull<f64>; 2]],
+    spin_channel: usize,
+) -> MatrixFull<f64> {
+    let n = densities.len();
+    if n == 0 { return MatrixFull::new([0, 0], 0.0); }
+    let iref = n - 1;  // newest point
+    let mut bmat = MatrixFull::new([n, n], 0.0);
+    for i in 0..n {
+        for j in i..n {
+            let mut tr = 0.0f64;
+            for i_spin in 0..spin_channel {
+                let dd_i = densities[i][i_spin].sub(&densities[iref][i_spin]).unwrap();
+                let df_j = focks[j][i_spin].sub(&focks[iref][i_spin]).unwrap();
+                tr += dd_i.data.iter().zip(df_j.data.iter()).map(|(a, b)| a * b).sum::<f64>();
+            }
+            bmat.set2d([i, j], tr);
+            bmat.set2d([j, i], tr);
+        }
+    }
+    bmat
+}
+
 pub fn diis_solver(em: &Vec<Vec<f64>>,
                    num_vec:&usize) -> Option<Vec<f64>> {
 
@@ -5223,7 +5320,7 @@ pub fn diis_solver(em: &Vec<Vec<f64>>,
     });
     let inv_opta = _pinv(&opta, Some(1.0e-12f64)).unwrap();
     let sum_inv = inv_opta.data.iter().sum::<f64>();
-    if sum_inv.abs() < 1.0e-12 {
+    if sum_inv.abs() < 1.0e-6 {
         return None;
     }
     sum_inv_norm_rdm = sum_inv.powf(-1.0f64);

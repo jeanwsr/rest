@@ -307,6 +307,8 @@ pub struct InputKeywords {
     pub smear_sigma_min: Option<f64>,
     /// EDIIS penalty parameter η (default 0.5). Larger η = more conservative extrapolation.
     pub ediis_penalty: Option<f64>,
+    /// ADIIS penalty parameter μ (default 0.5). Convex QP, penalizes deviation from D₀.
+    pub adiis_penalty: Option<f64>,
     /// HOMO-LUMO gap threshold (Ha) for EDIIS→DIIS auto-switch in "ediis+diis" mode.
     /// Below this gap, EDIIS is preferred. Default 0.1 Ha.
     pub ediis_switch_gap: Option<f64>,
@@ -460,6 +462,7 @@ impl InputKeywords {
             smear_anneal: false,
             smear_sigma_min: None,
             ediis_penalty: None,
+            adiis_penalty: None,
             ediis_switch_gap: None,
             guess_mix: false,
             guess_mix_theta_deg: [15.0, 15.0].to_vec(),
@@ -679,7 +682,8 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
                     &tmp_mixer, &ctrl.mix_param);
     } else if tmp_mixer.eq(&"diis")
             || tmp_mixer.eq(&"ediis")
-            || tmp_mixer.eq(&"ediis+diis") {
+            || tmp_mixer.eq(&"ediis+diis")
+            || tmp_mixer.eq(&"adiis+diis") {
         mixer_log = format!("The {} mixing with (param, max_vec_len) = ({}, {}) is employed for the SCF procedure", 
                     &tmp_mixer, &ctrl.mix_param, &ctrl.num_max_diis);
         mixer_log.push_str(&format!("\nTurn on the {} mixing after {} step(s) of SCF iteractions with the linear mixing", 
@@ -1676,6 +1680,19 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
 
             // for EDIIS switch gap
             tmp_input.ediis_switch_gap = match tmp_ctrl.get("ediis_switch_gap").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {
+                    let num = tmp_str.to_lowercase().parse().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                serde_json::Value::Number(tmp_num) => {
+                    let num = tmp_num.as_f64().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                _ => None,
+            };
+
+            // for ADIIS penalty parameter
+            tmp_input.adiis_penalty = match tmp_ctrl.get("adiis_penalty").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {
                     let num = tmp_str.to_lowercase().parse().unwrap_or(0.0);
                     if num == 0.0 { None } else { Some(num) }
