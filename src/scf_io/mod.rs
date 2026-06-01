@@ -18,7 +18,7 @@ pub mod util;
 
 use mpi::collective::SystemOperation;
 use pyo3::{pyclass};
-use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemv, _dinverse, _dspgvx, _dsymm, _dsyrk, _hamiltonian_fast_solver, _power_rayon_for_symmetric_matrix, _dsyevd, _pinv, _get_sqrt_and_inv_sqrt};
+use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemv, _dspgvx, _dsymm, _dsyrk, _hamiltonian_fast_solver, _power_rayon_for_symmetric_matrix, _dsyevd, _pinv, _get_sqrt_and_inv_sqrt};
 use tensors::{map_upper_to_full, BasicMatUp, BasicMatrix, ERIFold4, MathMatrix, MatrixFull, MatrixFullSlice, MatrixUpper, MatrixUpperSlice, RIFull, TensorSliceMut};
 use itertools::{Itertools};
 use rayon::prelude::*;
