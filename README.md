@@ -209,17 +209,57 @@ chkfile = "mychk.rchk"
 guessfile = "myoldchk.rchk"
 chkfile = "mychk.rchk"
 ```
-- `mixer`：取值String。辅助自洽场收敛的方法。目前REST支持direct，diis，linear及ddiis。Direct对应不使用辅助收敛方法，linear对应于线性辅助收敛方法，diis对应于direct inversion in the iterative subspace。Diis是有效的加速收敛方法。缺省为diis
-- `mix_param`: 取值f64。Diis方法或linear方法的混合系数。缺省为0.2
-- `start_diis_cycle`: 取值i32。开始使用diis加速收敛方法的循环数。缺省为2
-- `num_max_diis`: 取值i32。diis空间大小。缺省为8
+- `mixer`：取值String。辅助自洽场收敛的方法。目前REST支持direct，diis，linear，ediis及ediis+diis。Direct对应不使用辅助收敛方法，linear对应于线性辅助收敛方法，diis对应于direct inversion in the iterative subspace，是有效的加速收敛方法。缺省为diis。
+    - 当前DIIS实现已内置**正交基误差矢量**（通过 S⁻¹ᐟ² 变换改善条件数）和 **SVD 伪逆求解器**（替代直接矩阵求逆），对过渡金属等近简并体系有更好的数值稳定性。
+    - `"ediis"`: Energy-DIIS（Kudin-Scuseria-Cancès, JCP 2002）。基于历史密度矩阵和能量的二次规划外推，保证每一步能量单调下降。适合能隙极小的体系。
+    - `"ediis+diis"`（**推荐用于过渡金属体系**）：混合模式。早期使用 EDIIS（保证能量单调下降，避免 DIIS 在小能隙下失效），当 DIIS 误差范数降至可收敛区间时自动切换至 DIIS（利用超线性收敛加速）：
+      ```
+      DIIS误差范数 > 1e-3  →  EDIIS  # 保守的稳速下降
+      DIIS误差范数 ≤ 1e-3  →  DIIS   # 快速的末段冲刺
+      ```
+    - 各 mixer 策略对比：
+      | 策略 | 场景 | 收敛速度 | 稳定性 |
+      |------|------|---------|--------|
+      | direct/linear | 非常简单的闭壳层小分子 | 慢 | 高 |
+      | diis | 常规体系（缺省） | 快 | 一般 |
+      | ediis | 小能隙、过渡金属 | 较慢 | **很高** |
+      | **ediis+diis** | 过渡金属、难以收敛的体系 | **快** | **很高** |
+- `mix_param`: 取值f64。Diis方法或linear方法的混合系数。缺省为0.6
+- `start_diis_cycle`: 取值i32。开始使用diis（或ediis）加速收敛方法的循环数。缺省为2
+- `num_max_diis`: 取值i32。DIIS/EDIIS子空间大小（存储的历史Fock/密度矩阵数量）。缺省为8
 - `max_scf_cycle`: 取值i32。自洽场运算的最大迭代循环数。缺省为100
 - `noiter`: 取值布尔类型。是否跳过自洽场运算。缺省为false
 - `scf_acc_rho`: 取值f64。自洽场运算密度矩阵的收敛标准。缺省为1.0e-8
 - `scf_acc_eev`: 取值f64。自洽场运算能量差平方和的收敛标准。缺省为1.0e-6
 - `scf_acc_etot`: 取值f64。自洽场运算总能量的收敛标准。缺省为1.0e-8
-- `level_shift`: 取值f64。对于发生近简并振荡不收敛的情况，可以采用level_shift的方式人为破坏简并，加速收敛。单位为hartree，缺省值为0.0
+- `level_shift`: 取值f64。对于发生近简并振荡不收敛的情况，可以采用level_shift的方式人为破坏简并，加速收敛。单位为hartree，缺省值为None（不开启）。
+    - 注意：当体系本身可以用纯 DIIS 正常收敛时，开启 level_shift 反而会减速收敛（DIIS 子空间已充分条件良好）。仅当 DIIS 失效（近简并振荡）时才需要开启此选项。
 - `start_check_oscillation`: 取值i32。开始检查并自洽场计算不收敛发生振荡的循环数。当监控到自洽场发生振荡，SCF能量上升的情况，开启一次线性混合方案（linear）。缺省为20
+- `smear`：取值String。开启分数轨道占据（smearing）加速自洽场收敛。适用于能隙较小或金属性体系。目前支持：
+    - `"fermi"`：Fermi-Dirac 展宽
+    - `"gaussian"`：Gaussian 展宽  
+    缺省为 None（不开启展宽）
+- `smear_sigma`：取值f64。展宽参数 σ，单位为 Hartree。σ 越大，占据数分数化程度越高，收敛越快但引入的熵误差越大。对于小分子体系典型取值范围 0.01-0.05 Ha。缺省为 None（不开启展宽）
+- `smear_anneal`：取值bool。是否启用在 SCF 迭代中对 σ 做**指数退火**。缺省为 false。
+    - 设置为 `true` 后，σ 从 `smear_sigma` 指数衰减至下限值。退火窗口为 `max_scf_cycle` 的前半段，后半段保持恒定的下限 σ 供 DIIS 稳定收敛。
+    - **最终能量使用 E₀（零温外推）**，即 `E₀ = E(T) − ½·T·S`，在退火完成后 E₀ 与无展宽计算结果一致。
+    - 使用示例：
+      ```toml
+      smear = "fermi"
+      smear_sigma = 0.05
+      smear_anneal = true
+      ```
+- `smear_sigma_min`：取值f64。退火过程中 σ 的下限值，单位为 Hartree。缺省为 `max(smear_sigma × 0.01, 0.001)`。
+    - **σ 不应退火至零**：对于高对称性过渡金属等具有严格简并轨道的体系，σ→0 会导致占据数在简并轨道间 ping-pong 振荡而无法收敛。保留非零下限（~0.001 Ha ≈ 300 K）可确保简并流形的平滑平均占据。
+    - 若体系简并程度高、退火后仍不收敛，可手动加大该值，如 `smear_sigma_min = 0.005`。
+- `ediis_penalty`：取值f64。EDIIS 惩罚参数 η（Kudin-Scuseria, JCP 2002, 116, 8255）。η 越大，外推越保守（偏离历史数据点的惩罚越大）。缺省为 0.5。仅当 `mixer = "ediis"` 或 `"ediis+diis"` 时生效。
+- `ediis_switch_gap`：取值f64。EDIIS→DIIS 自动切换的 HOMO-LUMO 能隙阈值（单位为 Hartree）。仅当 `mixer = "ediis+diis"` 时生效。当前实现中 DIIS 误差范数的切换阈值已自动确定（1e-3），本关键词预留用于未来基于能隙的切换策略。缺省为 0.1。
+
+## VXC 格点积分优化相关关键词（Keyword）
+- `vxc_screen_threshold`: 取值f64。密度筛选阈值，在 VXC 计算中跳过密度低于此值的格点。对于大分子（真空区域多），可节省 30-70% 的 XC 计算量。设为 0.0 可关闭筛选。缺省为 1.0e-15。
+- `ao_cutoff`: 取值f64。AO 格点值截断阈值，启用 non0tab 稀疏存储。AO 值低于此阈值的基函数-格点对被当作零处理。设为 0.0（缺省）则关闭 non0tab 压缩。推荐值 1.0e-10。
+- `non0tab_blksize`: 取值usize。non0tab 压缩存储中每个格点批次的大小。设为 0（缺省）时程序根据基组大小自动选择 [32, 256]。设为具体值则固定该批次大小。
+- `drop_dense_ao`: 取值布尔类型。non0tab 压缩存储生成后是否释放稠密 AO/AOP 矩阵以节省内存。缺省为 false。当 `ao_cutoff > 0` 且该体系 AO 稀疏率 < 90% 时，设为 true 可显著降低内存。
 - `force_state_occupation`: 取值是Vector。 Constrained DFT (C-DFT) 计算方法。具体设置如下：
      - `[
   [reference, prev_state, prev_spin, target_spin, force_occ, force_check_min, force_check_max],
@@ -243,6 +283,9 @@ chkfile = "mychk.rchk"
     - 下述选项同 `algorithm_jk`：`ri-direct`, `ri-incore`, `ri`, `default`。
 - `algorithm_k`: 设置 Fock 矩阵计算中 K (Exchange) 部分的算法；该关键词是高级选项，一般用户建议使用`algorithm_jk`关键词进行整体设置。
     - 下述选项同 `algorithm_jk`：`ri-direct`, `ri-incore`, `ri`, `default`。
+- `use_dm_only`: 取值布尔类型。控制 VK (Exchange) 和 VXC (XC Potential) 矩阵的构建方式。缺省为 false。
+    - `false`（缺省）：使用分子轨道系数构造（occ-RI-K 算法），效率更高，推荐用于大多数体系。
+    - `true`：直接使用密度矩阵构造。当轨道占据数非整数（如 dSCF 激发态）时可能需要设为 true。
 
 ## 后自洽场计算相关关键词（Keyword）
 - `frozen_core_postscf`: 取值i32，且小于100的两位正整数或者一位正整数。对于后自洽场方法，包括MP2和第五阶密度泛函近似，需要考虑激发组态的贡献。由于原子的内层电子（core electrons）通常不参与化学成键，仅有最外几个价层参与（按主量子数划分）。因此我们可以采用冻芯近似（frozen core approximation）
@@ -293,9 +336,10 @@ fp_mode = "FP64"
 ## RRS-PBC计算相关设置
 - `pbc_eigenval`: 取值String，用于指定存储k点和能级信息的文件路径。如果设置为"none"或"None"则直接打印到标准输出。缺省为"none"。相关文章见Zhang, I.Y., Jiang, J., Gao, B. *et al.* RRS-PBC: a molecular approach for periodic systems. *Sci. China Chem.* **57**, 1399–1404 (2014). https://doi.org/10.1007/s11426-014-5183-y
 ## 溶剂化计算相关设置
-- `solvent_model`: 取值String, 用于指定用于计算的溶剂模型。目前支持CPCM, COSMO, IEFPCM, SS(V)PE。缺省为CPCM。
+- `solvent_model`: 取值String, 用于指定用于计算的溶剂模型。目前支持CPCM, COSMO, IEFPCM, SS(V)PE。缺省为CPCM。溶剂化梯度计算目前只支持CPCM, COSMO。
 - `solvent_enabled`: 取值bool，设置为true则启用溶剂化计算。如果没有`solvent_enabled`字段但有`solvent_model`的设置且内容非空的时候，同样启用溶剂化计算。其他情况缺省为false。
 - `solv_epsilon`: 取值f64, 为溶质的介电常数。缺省为1.0 (真空)。介电常数表可以参考 http://sobereva.com/g09/k_scrf.htm 的最后。
+- `solvent_ri`: 取值bool, 设置为true为溶剂化能计算开启辅助基，设置为false溶剂化计算不开启辅助基。缺省为true。目前溶剂化梯度(job_type = "opt"/"force")计算没有用辅助基。
 # Detailed descrption of [geometric_pyo3] block in the control file
 - `maxiter`：取值i32。结构优化的最大步数上限。缺省值：300
 - `converge_energy`：取值f64。构型优化中上下两步能量变化的收敛阈值。缺省值：1.0e-6

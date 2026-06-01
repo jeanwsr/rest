@@ -48,6 +48,7 @@ pub fn generate_vk_ri_semi_direct_coeff(
     mo_coeff: &[MatrixFull<f64>],
     mo_occ: &[Vec<f64>],
     mol_obj: &Molecule,
+    omega: Option<f64>,
     batch_size: usize,
 ) -> Vec<MatrixUpper<f64>> {
     // mo_coeff shape: (nao, nmo, nset) in f-contig
@@ -59,8 +60,13 @@ pub fn generate_vk_ri_semi_direct_coeff(
     let nset = mo_coeff_rstsr.shape()[2];
     let nao_tp = (nao + 1) * nao / 2;
 
-    let mol = util::get_cint_mol(mol_obj);
-    let aux = util::get_cint_aux(mol_obj);
+    let mut mol = util::get_cint_mol(mol_obj);
+    let mut aux = util::get_cint_aux(mol_obj);
+
+    if let Some(omega) = omega {
+        mol.set_omega(omega);
+        aux.set_omega(omega);
+    }
 
     let mut ks_rstsr = get_vk_ri_semi_direct_coeff(mo_coeff_rstsr.view(), mo_occ_rstsr.view(), &mol, &aux, batch_size);
     if (scaling_factor - 1.0).abs() > f64::EPSILON {
@@ -80,6 +86,7 @@ pub fn generate_vk_ri_direct_dm(
     scaling_factor: f64,
     dms: &[MatrixFull<f64>],
     mol_obj: &Molecule,
+    omega: Option<f64>,
     batch_size: usize,
 ) -> Vec<MatrixUpper<f64>> {
     let device = DeviceBLAS::default();
@@ -89,8 +96,13 @@ pub fn generate_vk_ri_direct_dm(
     let nset = dms.shape()[2];
     let nao_tp = (nao + 1) * nao / 2;
 
-    let mol = util::get_cint_mol(mol_obj);
-    let aux = util::get_cint_aux(mol_obj);
+    let mut mol = util::get_cint_mol(mol_obj);
+    let mut aux = util::get_cint_aux(mol_obj);
+
+    if let Some(omega) = omega {
+        mol.set_omega(omega);
+        aux.set_omega(omega);
+    }
 
     // shape sanity check
     assert_eq!(dms.shape(), &[nao, nao, nset], "Density matrices must have shape (nao, nao, nset)");

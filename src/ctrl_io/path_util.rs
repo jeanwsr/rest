@@ -75,7 +75,9 @@ pub fn get_rest_basis_dir(print_level:usize) -> Vec<String> {
 
 lazy_static!{
     static ref BASIS_ALIAS: HashMap<&'static str, &'static str> = HashMap::from([
-        ("def2-sv(p)-jkfit", "def2-universal-jkfit")
+        ("def2-sv(p)-jkfit", "def2-universal-jkfit"),
+        ("6-31g**-rifit", "6-31gss-rifit"),
+        ("6-311g**-rifit", "6-311gss-rifit")
     ]);
 
     static ref BASIS_MISSING_WARN: HashMap<&'static str, &'static str> = HashMap::from([

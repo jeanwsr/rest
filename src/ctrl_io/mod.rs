@@ -11,6 +11,7 @@ use crate::ri_jk::decompose::J2CDecompOption;
 use crate::ctrl_io::tddft_parameters::parse_tddft_keywords;
 use crate::ctrl_io::cphf_parameters::parse_cphf_keywords;
 use crate::{check_norm::force_state_occupation::ForceStateOccupation};
+use crate::scf_io::smear::SmearingType;
 use crate::dft::{DFAFamily, DFTType, DFA4REST};
 use crate::geom_io::{GeomCell, GeomUnit, MOrC, parse_geom_keywords};
 use crate::utilities;
@@ -215,8 +216,10 @@ pub struct InputKeywords {
     #[pyo3(get, set)]
     // Keywords for solvent models
     pub solvent_enabled: bool,
+    pub solvent_ri: bool,
     pub solv_epsilon: f64,
     pub solvent_model: PcmMethod,
+    pub solv_chunk: usize,
     #[pyo3(get, set)]
     // The initial MO coefficients and eigenvalues can be imported by setting chkfile
     pub chkfile: String,
@@ -240,6 +243,14 @@ pub struct InputKeywords {
     pub check_stab: bool,
     #[pyo3(get, set)]
     pub use_dm_only: bool,
+    #[pyo3(get, set)]
+    pub vxc_screen_threshold: f64,
+    #[pyo3(get, set)]
+    pub ao_cutoff: f64,
+    #[pyo3(get, set)]
+    pub non0tab_blksize: usize,
+    #[pyo3(get, set)]
+    pub drop_dense_ao: bool,
     pub algorithm_jk: AlgorithmJK,
     pub algorithm_j: AlgorithmJ,
     pub algorithm_k: AlgorithmK,
@@ -286,6 +297,19 @@ pub struct InputKeywords {
     pub max_memory: Option<f64>,
     /// Abort the calculation when memory usage exceeds max_memory.
     pub abort_on_mem_exceed: bool,
+    pub smear: Option<SmearingType>,
+    pub smear_sigma: Option<f64>,
+    /// Enable dynamic smearing annealing: sigma decays exponentially from smear_sigma
+    /// toward smear_sigma_min (or smear_sigma*0.01 by default) over the course of SCF.
+    /// A non-zero floor avoids degeneracy-driven orbital-occupation oscillations.
+    pub smear_anneal: bool,
+    /// Minimum sigma for annealing; defaults to max(smear_sigma * 0.01, 0.001).
+    pub smear_sigma_min: Option<f64>,
+    /// EDIIS penalty parameter η (default 0.5). Larger η = more conservative extrapolation.
+    pub ediis_penalty: Option<f64>,
+    /// HOMO-LUMO gap threshold (Ha) for EDIIS→DIIS auto-switch in "ediis+diis" mode.
+    /// Below this gap, EDIIS is preferred. Default 0.1 Ha.
+    pub ediis_switch_gap: Option<f64>,
     pub guess_mix: bool,
     pub guess_mix_theta_deg: Vec<f64>,
     pub start_mix_cycle: usize,
@@ -397,6 +421,10 @@ impl InputKeywords {
             // True:  using only density matrix in the evaluation
             // False: use coefficients as well with higher efficiency
             use_dm_only: false,
+            vxc_screen_threshold: 1.0e-15,
+            ao_cutoff: 0.0,
+            non0tab_blksize: 0,     // 0 = auto-select based on nao
+            drop_dense_ao: false,
             algorithm_jk: AlgorithmJK::Default,
             algorithm_j: AlgorithmJ::Default,
             algorithm_k: AlgorithmK::Default,
@@ -427,6 +455,12 @@ impl InputKeywords {
             rpa_de_excitation_parameters: None,
             max_memory: None,
             abort_on_mem_exceed: true,
+            smear: None,
+            smear_sigma: None,
+            smear_anneal: false,
+            smear_sigma_min: None,
+            ediis_penalty: None,
+            ediis_switch_gap: None,
             guess_mix: false,
             guess_mix_theta_deg: [15.0, 15.0].to_vec(),
             start_mix_cycle: 0,
@@ -437,8 +471,10 @@ impl InputKeywords {
             geometric_pyo3: None,
             quasiparticle_methods:None,
             solvent_enabled: false,
+            solvent_ri: true,
             solv_epsilon:1.0,
             solvent_model: PcmMethod::CPCM,
+            solv_chunk: 8,
             stop_at: None,
             xc_parser: String::from("legacy"),
             j2c_decomp: J2CDecompOption::default(),
@@ -641,8 +677,9 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
     } else if tmp_mixer.eq(&"linear") {
         mixer_log = format!("The {} mixing is employed with the mixing parameter of {} for the SCF procedure", 
                     &tmp_mixer, &ctrl.mix_param);
-    } else if tmp_mixer.eq(&"ddiis") 
-            || tmp_mixer.eq(&"diis") {
+    } else if tmp_mixer.eq(&"diis")
+            || tmp_mixer.eq(&"ediis")
+            || tmp_mixer.eq(&"ediis+diis") {
         mixer_log = format!("The {} mixing with (param, max_vec_len) = ({}, {}) is employed for the SCF procedure", 
                     &tmp_mixer, &ctrl.mix_param, &ctrl.num_max_diis);
         mixer_log.push_str(&format!("\nTurn on the {} mixing after {} step(s) of SCF iteractions with the linear mixing", 
@@ -1150,6 +1187,11 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 },
                 other => false,
             };
+            tmp_input.solvent_ri = match tmp_ctrl.get("solvent_ri").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(true),
+                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
+                other => true,
+            };
             tmp_input.solvent_model = match tmp_ctrl.get("solvent_model") {
                 Some(value) => {
                     serde_json::from_value(value.clone())?
@@ -1164,22 +1206,13 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     1.0_f64
                 },
             };
-           // tmp_input.solvent_model = 
-           // match tmp_ctrl.get("solvent_model").unwrap_or(&serde_json::Value::Null) {
-           //     serde_json::Value::String(tmp_type) => {
-           //         let tmp_solvent_model = tmp_type.to_lowercase();
-           //         if tmp_solvent_model.eq("cpcm") {
-           //             PcmMethod::CPCM
-           //         } else if tmp_solvent_model.eq("cosmo") {
-           //             PcmMethod::COSMO
-           //         } else if tmp_solvent_model.eq("iefpcm") {
-           //             PcmMethod::IEFPCM
-           //         } else {
-           //             PcmMethod::disabled
-           //         }
-           //     },
-           //     other => PcmMethod::CPCM,
-           // };
+            // Experimental function
+            tmp_input.solv_chunk = match tmp_ctrl.get("solv_chunk").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(8)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
+                other => {8},
+            };
+
             // ==============================================
             //  Keywords associated with the SCF procedure
             // ==============================================
@@ -1224,7 +1257,10 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
 
             tmp_input.mixer = match tmp_ctrl.get("mixer").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
+                serde_json::Value::String(tmp_str) => {
+                    let m = tmp_str.to_lowercase();
+                    if m.eq(&"ddiis") { String::from("diis") } else { m }
+                },
                 other => {String::from("diis")},
             };
             tmp_input.mix_param = match tmp_ctrl.get("mix_param").unwrap_or(&serde_json::Value::Null) {
@@ -1288,6 +1324,26 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
                 serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
                 other => false,
+            };
+            tmp_input.vxc_screen_threshold = match tmp_ctrl.get("vxc_screen_threshold").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-15),
+                serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-15),
+                _ => 1.0e-15,
+            };
+            tmp_input.ao_cutoff = match tmp_ctrl.get("ao_cutoff").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-12),
+                serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-12),
+                _ => 1.0e-12,
+            };
+            tmp_input.non0tab_blksize = match tmp_ctrl.get("non0tab_blksize").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(num) => num.as_u64().map(|v| v as usize).unwrap_or(0),
+                serde_json::Value::String(s) => s.parse().unwrap_or(0),
+                _ => 0,
+            };
+            tmp_input.drop_dense_ao = match tmp_ctrl.get("drop_dense_ao").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase().parse().unwrap_or(false),
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
             };
             // setup and sanity check of J/K algorithms
             tmp_input.algorithm_jk = tmp_ctrl.get("algorithm_jk").map(serde_from_value).unwrap_or_default();
@@ -1556,7 +1612,81 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => None,
             };
             tmp_input.abort_on_mem_exceed = tmp_ctrl.get("abort_on_mem_exceed").map(serde_from_value).unwrap_or(true);
-            
+
+            // for smearing
+            tmp_input.smear = match tmp_ctrl.get("smear").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_type) => {
+                    let tmp_smear = tmp_type.to_lowercase();
+                    if tmp_smear.eq("fermi") {
+                        Some(SmearingType::FERMI)
+                    } else if tmp_smear.eq("gaussian") || tmp_smear.eq("gauss") {
+                        Some(SmearingType::GAUSSIAN)
+                    } else {
+                        println!("Warning: unknown smear type '{}', smearing not turned on.", tmp_type);
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            tmp_input.smear_sigma = match tmp_ctrl.get("smear_sigma").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {
+                    let num = tmp_str.to_lowercase().parse().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                serde_json::Value::Number(tmp_num) => {
+                    let num = tmp_num.as_f64().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                _ => None,
+            };
+
+            // for smear annealing; default = false
+            tmp_input.smear_anneal = match tmp_ctrl.get("smear_anneal").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => *tmp_bool,
+                serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                _ => false,
+            };
+
+            // for smear annealing minimum sigma
+            tmp_input.smear_sigma_min = match tmp_ctrl.get("smear_sigma_min").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {
+                    let num = tmp_str.to_lowercase().parse().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                serde_json::Value::Number(tmp_num) => {
+                    let num = tmp_num.as_f64().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                _ => None,
+            };
+
+            // for EDIIS penalty parameter
+            tmp_input.ediis_penalty = match tmp_ctrl.get("ediis_penalty").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {
+                    let num = tmp_str.to_lowercase().parse().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                serde_json::Value::Number(tmp_num) => {
+                    let num = tmp_num.as_f64().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                _ => None,
+            };
+
+            // for EDIIS switch gap
+            tmp_input.ediis_switch_gap = match tmp_ctrl.get("ediis_switch_gap").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {
+                    let num = tmp_str.to_lowercase().parse().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                serde_json::Value::Number(tmp_num) => {
+                    let num = tmp_num.as_f64().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                _ => None,
+            };
+
             // for guess_mix setting; default = False
             tmp_input.guess_mix = match tmp_ctrl.get("guess_mix").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_bool) => *tmp_bool,

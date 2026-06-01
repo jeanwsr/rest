@@ -235,6 +235,10 @@ pub fn prune_by_rho(grids: &Grids, dm: &Vec<MatrixFull<f64>>, spin_channel: usiz
         weights:lambda_r,
         coordinates: rgrids,
         parallel_balancing,
+        non0tab: None,
+        ao_cutoff: 0.0,
+        ao_compressed: None,
+        aop_compressed: None,
     }
     
 }

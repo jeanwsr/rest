@@ -737,7 +737,11 @@ pub fn gen_atom_grids_for_isdf(mol:&Molecule) -> Vec<dftgrids>{
             coordinates: rgrids,
             ao: None,
             aop: None, 
-            parallel_balancing
+            parallel_balancing,
+            non0tab: None,
+            ao_cutoff: 0.0,
+            ao_compressed: None,
+            aop_compressed: None,
         };
         atom_grids.push(ao_grid)
             
