@@ -66,6 +66,12 @@ pub struct QuasiParticle {
     pub pysoc:bool,
     pub gw_imag_rayon:bool,
     pub bse_auxbas_path: Option<String>,
+    pub bse_feast_renormalized_doubles: bool,
+    pub bse_renormalized_doubles_extra_width: f64,
+    pub bse_feast_precondition_type: String,
+    pub bse_feast_inner_gmres_tol: f64,
+    pub bse_feast_inner_gmres_restart: usize,
+    pub bse_feast_inner_gmres_max_iter: usize,
     // QSGW-specific controls
     pub qsgw_max_iter: usize,
     pub qsgw_energy_tol: f64,
@@ -101,6 +107,9 @@ pub struct QuasiParticle {
     pub bse_feast_init_guess_type: String,
     // Gaussian width = (step * width_factor)²  (default 0.5 → half-spacing)
     pub bse_feast_gaussian_width_factor: f64,
+    // Parallelise over quadrature points via rayon (default true).
+    // If false, quadrature points are solved one by one in serial.
+    pub bse_feast_contour_rayon: bool,
     // NLFEAST (nonlinear BSE) control parameters
     pub nonlinear_bse: bool,
     pub nlfeast_centre: f64,
@@ -113,6 +122,7 @@ pub struct QuasiParticle {
     pub nlfeast_gmres_max_it: usize,
     pub nlfeast_gmres_tol: f64,
     pub export_matvec_count: bool,
+    pub gw_switch_fallback_threshold: f64,
 }
 
 impl Default for QuasiParticle {
@@ -178,6 +188,12 @@ impl Default for QuasiParticle {
             lifetime_gamma:0.001,
             gw_imag_rayon:true,
             bse_auxbas_path: None,
+            bse_feast_renormalized_doubles: false,
+            bse_renormalized_doubles_extra_width: 0.1,
+            bse_feast_precondition_type: String::from("inner_gmres"),
+            bse_feast_inner_gmres_tol: 0.0001,
+            bse_feast_inner_gmres_restart: 50,
+            bse_feast_inner_gmres_max_iter: 100,
             qsgw_max_iter: 50,
             qsgw_energy_tol: 1e-5,
             qsgw_mix_param: 0.5,
@@ -208,6 +224,7 @@ impl Default for QuasiParticle {
             bse_feast_gmres_max_iter: 500,
             bse_feast_init_guess_type: String::from("random"),
             bse_feast_gaussian_width_factor: 0.5,
+            bse_feast_contour_rayon: true,
             nonlinear_bse: false,
             nlfeast_centre: 0.0,
             nlfeast_radius: 0.5,
@@ -219,6 +236,7 @@ impl Default for QuasiParticle {
             nlfeast_gmres_max_it: 500,
             nlfeast_gmres_tol: 1e-6,
             export_matvec_count: false,
+            gw_switch_fallback_threshold: 1e6,
         }
     }
 }
@@ -289,6 +307,12 @@ impl QuasiParticle {
         if let Some(path) = &self.bse_auxbas_path {
             table.insert("bse_auxbas_path".to_string(), toml::Value::String(path.clone()));
         }
+        table.insert("bse_feast_renormalized_doubles".to_string(), toml::Value::Boolean(self.bse_feast_renormalized_doubles));
+        table.insert("bse_renormalized_doubles_extra_width".to_string(), toml::Value::Float(self.bse_renormalized_doubles_extra_width));
+        table.insert("bse_feast_precondition_type".to_string(), toml::Value::String(self.bse_feast_precondition_type.clone()));
+        table.insert("bse_feast_inner_gmres_tol".to_string(), toml::Value::Float(self.bse_feast_inner_gmres_tol));
+        table.insert("bse_feast_inner_gmres_restart".to_string(), toml::Value::Integer(self.bse_feast_inner_gmres_restart as i64));
+        table.insert("bse_feast_inner_gmres_max_iter".to_string(), toml::Value::Integer(self.bse_feast_inner_gmres_max_iter as i64));
         table.insert("qsgw_max_iter".to_string(), toml::Value::Integer(self.qsgw_max_iter as i64));
         table.insert("qsgw_energy_tol".to_string(), toml::Value::Float(self.qsgw_energy_tol));
         table.insert("qsgw_mix_param".to_string(), toml::Value::Float(self.qsgw_mix_param));
@@ -314,6 +338,7 @@ impl QuasiParticle {
         table.insert("bse_feast_gmres_max_iter".to_string(), toml::Value::Integer(self.bse_feast_gmres_max_iter as i64));
         table.insert("bse_feast_init_guess_type".to_string(), toml::Value::String(self.bse_feast_init_guess_type.clone()));
         table.insert("bse_feast_gaussian_width_factor".to_string(), toml::Value::Float(self.bse_feast_gaussian_width_factor));
+        table.insert("bse_feast_contour_rayon".to_string(), toml::Value::Boolean(self.bse_feast_contour_rayon));
         table.insert("damped_bse_solver".to_string(), toml::Value::String(self.damped_bse_solver.clone()));
         table.insert("damped_bse_tol".to_string(), toml::Value::Float(self.damped_bse_tol));
         table.insert("damped_bse_max_iter".to_string(), toml::Value::Integer(self.damped_bse_max_iter as i64));
@@ -328,6 +353,7 @@ impl QuasiParticle {
         table.insert("nlfeast_gmres_max_it".to_string(), toml::Value::Integer(self.nlfeast_gmres_max_it as i64));
         table.insert("nlfeast_gmres_tol".to_string(), toml::Value::Float(self.nlfeast_gmres_tol));
         table.insert("export_matvec_count".to_string(), toml::Value::Boolean(self.export_matvec_count));
+        table.insert("gw_switch_fallback_threshold".to_string(), toml::Value::Float(self.gw_switch_fallback_threshold));
         toml::Value::Table(table)
     }
 }
@@ -594,6 +620,39 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::String(s) => Some(s.clone()),
                 _ => None,
             };
+            tmp_input.bse_feast_renormalized_doubles = match tmp_ctrl.get("bse_feast_renormalized_doubles").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
+            };
+            tmp_input.bse_renormalized_doubles_extra_width = match tmp_ctrl.get("bse_renormalized_doubles_extra_width").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.1),
+                _ => 0.1,
+            };
+            tmp_input.bse_feast_precondition_type = match tmp_ctrl.get("bse_feast_precondition_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => {
+                    let lower = s.to_lowercase();
+                    match lower.as_str() {
+                        "inner_gmres" | "diagonal" | "diag" => {
+                            if lower == "diag" { String::from("diagonal") }
+                            else { lower }
+                        },
+                        _ => String::from("diagonal"),
+                    }
+                },
+                _ => String::from("diagonal"),
+            };
+            tmp_input.bse_feast_inner_gmres_tol = match tmp_ctrl.get("bse_feast_inner_gmres_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0001),
+                _ => 0.0001,
+            };
+            tmp_input.bse_feast_inner_gmres_restart = match tmp_ctrl.get("bse_feast_inner_gmres_restart").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(50) as usize,
+                _ => 50,
+            };
+            tmp_input.bse_feast_inner_gmres_max_iter = match tmp_ctrl.get("bse_feast_inner_gmres_max_iter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(100) as usize,
+                _ => 100,
+            };
             tmp_input.qsgw_max_iter = match tmp_ctrl.get("qsgw_max_iter").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(50) as usize,
                 _ => 50,
@@ -702,6 +761,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.5),
                 _ => 0.5,
             };
+            tmp_input.bse_feast_contour_rayon = match tmp_ctrl.get("bse_feast_contour_rayon").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => true,
+            };
             // Generate grids: OUTER LOOP X, MIDDLE LOOP Y, INNER LOOP Z
             let x_step = if tmp_input.damped_bse_x_points > 1 {
                 (tmp_input.damped_bse_x_end - tmp_input.damped_bse_x_start) / (tmp_input.damped_bse_x_points - 1) as f64
@@ -786,6 +849,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.nlfeast_gmres_tol = match tmp_ctrl.get("nlfeast_gmres_tol").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e-6),
                 _ => 1e-6,
+            };
+            tmp_input.gw_switch_fallback_threshold = match tmp_ctrl.get("gw_switch_fallback_threshold").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e6),
+                _ => 1e6,
             };
             return Ok(Some(tmp_input));
         },

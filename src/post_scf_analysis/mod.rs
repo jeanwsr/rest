@@ -487,7 +487,11 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
         }
-        ri_bse::bse_main(scf_data);
+        if qp_ctrl.bse_feast_precondition_type=="inner_gmres"{
+            ri_bse::feast_solver::test_preconditioner_working(scf_data);
+        }else{
+            ri_bse::bse_main(scf_data);
+        }
     }else if output_type.eq("damped_bse"){
         if qp_ctrl.gw_scheme=="parse from file"{
             let parse_qp_path=qp_ctrl.parse_qp_path.clone();
