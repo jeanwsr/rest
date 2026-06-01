@@ -389,7 +389,7 @@ pub fn output_result(scf_data: &scf_io::SCF) {
     } else {
         if scf_data.mol.ctrl.smear.is_some() {
             println!("The SCF energy (E)    : {:18.10} Ha", scf_data.scf_energy);
-            let sigma = scf_data.mol.ctrl.smear_sigma.unwrap_or(0.0);
+            let sigma = scf_data.current_smear_sigma;
             let s = scf_data.smearing_entropy;
             println!("Free energy  (E-TS)  : {:18.10} Ha", scf_data.scf_energy - sigma * s);
             println!("Zero-temp energy (E0): {:18.10} Ha", scf_data.scf_energy - 0.5 * sigma * s);
