@@ -85,6 +85,7 @@ pub struct SCF {
     #[pyo3(get,set)]
     pub scf_energy: f64,
     pub smearing_entropy: f64,
+    pub current_smear_sigma: f64,
     pub grids: Option<Grids>,
     pub empirical_dispersion_energy: f64,
     pub energies: HashMap<String,Vec<f64>>,
@@ -144,6 +145,7 @@ impl SCF {
             nuc_energy: 0.0,
             scf_energy: 0.0,
             smearing_entropy: 0.0,
+            current_smear_sigma: 0.0,
             empirical_dispersion_energy: 0.0,
             grids: None,
             energies: HashMap::new(),
@@ -2744,7 +2746,7 @@ impl SCF {
         let cur_index = 1;
         let pre_index = 0;
         let (cur_energy, pre_energy) = if self.mol.ctrl.smear.is_some() {
-            let sigma = self.mol.ctrl.smear_sigma.unwrap_or(0.0);
+            let sigma = self.current_smear_sigma;
             (self.scf_energy - sigma * self.smearing_entropy,
              scftracerecode.scf_energy - sigma * scftracerecode.smearing_entropy)
         } else {
@@ -4725,7 +4727,8 @@ impl ScfTraceRecord {
             tmp_records.ediis_density.push([scf.density_matrix[0].clone(),
                 if scf.mol.spin_channel>1 { scf.density_matrix[1].clone() }
                 else { MatrixFull::empty() }]);
-            tmp_records.ediis_energy.push(scf.scf_energy);
+            tmp_records.ediis_energy.push(ediis_e0(scf.scf_energy,
+                scf.smearing_entropy, Some(scf.current_smear_sigma)));
             tmp_records.target_vector.push([scf.hamiltonian[0].to_matrixfull().unwrap(),
                 if scf.mol.spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() }
                 else { MatrixFull::empty() }]);
@@ -4849,7 +4852,7 @@ impl ScfTraceRecord {
 
             // update the energy records and check the oscillation
             let e_free = if scf.mol.ctrl.smear.is_some() {
-                let sigma = scf.mol.ctrl.smear_sigma.unwrap_or(0.0);
+                let sigma = scf.current_smear_sigma;
                 scf.scf_energy - sigma * scf.smearing_entropy
             } else {
                 scf.scf_energy
@@ -4953,7 +4956,8 @@ impl ScfTraceRecord {
             if self.ediis_density.len() == self.num_max_records {
                 self.ediis_density.remove(0); self.ediis_energy.remove(0); self.target_vector.remove(0);
             }
-            self.ediis_density.push(cur_density); self.ediis_energy.push(self.scf_energy);
+            self.ediis_density.push(cur_density); self.ediis_energy.push(ediis_e0(self.scf_energy,
+                self.smearing_entropy, Some(scf.current_smear_sigma)));
             self.target_vector.push(cur_fock);
             let nhist = self.ediis_density.len();
             if nhist >= 2 {
@@ -4991,23 +4995,40 @@ impl ScfTraceRecord {
             if self.ediis_density.len() == max_rec { self.ediis_density.remove(0); self.ediis_energy.remove(0); }
             let (cur_err, cur_tgt) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel, &self.sqrt_inv_ovlp);
             self.error_vector.push(cur_err); self.target_vector.push(cur_tgt);
-            self.ediis_density.push(cur_dens); self.ediis_energy.push(self.scf_energy);
+            self.ediis_density.push(cur_dens); self.ediis_energy.push(ediis_e0(self.scf_energy,
+                self.smearing_entropy, Some(scf.current_smear_sigma)));
             let num_diis = self.error_vector.len(); let num_ediis = self.ediis_density.len();
             let diis_norm = self.error_vector.last().map(|v| v.iter().map(|x| x*x).sum::<f64>().sqrt()).unwrap_or(1.0);
             let use_ediis = num_ediis >= 2 && (num_diis < 2 || diis_norm > 1e-3);
+            let mut ediis_ok = false;
             if use_ediis && num_ediis >= 2 {
                 let bmat = generate_ediis_penalty(&self.target_vector, &self.ediis_density, spin_channel);
                 let eta = scf.mol.ctrl.ediis_penalty.unwrap_or(0.5);
                 let n = bmat.size()[0]; let mut qmat = MatrixFull::new([n, n], 0.0);
                 for i in 0..n { for j in 0..n { let bij = bmat.get2d([i, j]).unwrap_or(&0.0); qmat.set2d([i, j], -2.0*eta*bij); } }
                 let coeff = ediis_qp_solver(&qmat, &self.ediis_energy, eta);
-                for i_spin in 0..spin_channel {
-                    let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
-                    for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
-                    scf.hamiltonian[i_spin] = next_h.to_matrixupper();
+                // Energy watchdog: reject EDIIS if predicted energy exceeds current
+                let mut e_pred = 0.0f64;
+                for i in 0..n { e_pred += coeff[i] * self.ediis_energy[i]; }
+                for i in 0..n { for j in 0..n {
+                    let bij = bmat.get2d([i, j]).unwrap_or(&0.0);
+                    e_pred -= eta * coeff[i] * coeff[j] * bij;
+                }}
+                ediis_ok = e_pred <= ediis_e0(self.scf_energy, self.smearing_entropy, Some(scf.current_smear_sigma)) + 1e-10;
+                if !ediis_ok && scf.mol.ctrl.print_level > 1 {
+                    let e0_cur = ediis_e0(self.scf_energy, self.smearing_entropy, Some(scf.current_smear_sigma));
+                    println!("[EDIIS] rejected: E_pred={:14.8} > E0_cur={:14.8}", e_pred, e0_cur);
                 }
-                if scf.mol.ctrl.print_level > 1 { print!("[EDIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
-            } else if num_diis >= 2 {
+                if ediis_ok {
+                    for i_spin in 0..spin_channel {
+                        let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
+                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
+                        scf.hamiltonian[i_spin] = next_h.to_matrixupper();
+                    }
+                    if scf.mol.ctrl.print_level > 1 { print!("[EDIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
+                }
+            }
+            if (!use_ediis || num_ediis < 2 || !ediis_ok) && num_diis >= 2 {
                 if let Some(coeff) = diis_solver(&self.error_vector, &num_diis) {
                     for i_spin in 0..spin_channel {
                         let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
@@ -5108,6 +5129,15 @@ pub fn generate_diis_error_vector(hamiltonian: &[MatrixUpper<f64>;2],
             ([cur_error[0].data.clone(),cur_error[1].data.clone()].concat(),
             cur_target)
 
+}
+
+/// Compute zero-temperature extrapolated energy for EDIIS.
+/// E₀ = E(T) − ½·σ·S  eliminates smearing-entropy bias in energy comparison.
+pub fn ediis_e0(e_total: f64, smearing_entropy: f64, sigma: Option<f64>) -> f64 {
+    match sigma {
+        Some(s) if s > 0.0 => e_total - 0.5 * s * smearing_entropy,
+        _ => e_total,
+    }
 }
 
 /// Build the EDIIS penalty matrix B_{ij} = Tr[(D_i−D_j)(F_i−F_j)].
@@ -5700,6 +5730,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     scf_data.generate_occupation();
     if let Some(st) = &scf_data.mol.ctrl.smear {
         apply_smearing(scf_data, *st, scf_data.mol.ctrl.smear_sigma.unwrap());
+        scf_data.current_smear_sigma = scf_data.mol.ctrl.smear_sigma.unwrap();
     }
 
     // --- Apply guess_mix during the initial-guess stage ---
@@ -5747,6 +5778,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
                 sigma = annealed_sigma(sigma, sigma_min, scf_records.num_iter, anneal_start, anneal_length);
             }
             apply_smearing(scf_data, *st, sigma);
+            scf_data.current_smear_sigma = sigma;
         }
 
         // --- Apply guess_mix during SCF iterations ---
@@ -5824,7 +5856,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             if scf_data.mol.spin_channel == 2 {
                 let [square_spin, spin_z] = evaluate_spin_angular_momentum(&scf_data.density_matrix, &scf_data.ovlp, scf_data.mol.spin_channel, &scf_data.mol.num_elec);
                 if have_smear {
-                    let sigma = scf_data.mol.ctrl.smear_sigma.unwrap_or(0.0);
+                    let sigma = scf_data.current_smear_sigma;
                     let s = scf_data.smearing_entropy;
                     println!("E(T) {:18.10}  E_free {:18.10}  E0 {:18.10}  S^2 {:5.3}  2S+1 {:5.3}  iter {:4}  {:8.2}s",
                          e_tot, e_tot - sigma * s, e_tot - 0.5 * sigma * s,
@@ -5837,7 +5869,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
                 }
             } else {
                 if have_smear {
-                    let sigma = scf_data.mol.ctrl.smear_sigma.unwrap_or(0.0);
+                    let sigma = scf_data.current_smear_sigma;
                     let s = scf_data.smearing_entropy;
                     println!("E(T) {:18.10}  E_free {:18.10}  E0 {:18.10}  iter {:4}  {:8.2}s",
                          e_tot, e_tot - sigma * s, e_tot - 0.5 * sigma * s,
