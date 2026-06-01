@@ -301,6 +301,19 @@ impl GeomCell {
         Ok(gi-1)
     }
 
+    pub fn to_geometric_freeze_str(&self) -> Option<String> {
+        if self.nfree == self.elem.len() {
+            return None;
+        }
+        let mut s = String::from("$freeze\n");
+        for (i, &frozen) in self.fix.iter().enumerate() {
+            if frozen {
+                s.push_str(&format!("xyz {}\n", i + 1));
+            }
+        }
+        Some(s)
+    }
+
     pub fn get_start_index_of_ghost_atoms(&self) -> usize {
         self.elem.len()
     }
@@ -551,17 +564,9 @@ impl GeomCell {
                 if x == '#' {
                     continue;
                 } else {
-                    // for standard input
-                    for cap in re0.captures_iter(&line) {
-                        tmp_ele.push(cap[1].to_string());
-                        tmp_pos.push(cap[2].parse().unwrap());
-                        tmp_pos.push(cap[3].parse().unwrap());
-                        tmp_pos.push(cap[4].parse().unwrap());
-                        tmp_fix.push(false);
-                        tmp_nfree += 1;
-                    };
-                    // for the input with fix atms
-                    for cap in re1.captures_iter(&line) {
+                    // check fix-input format first (element + fix + xyz),
+                    // fallback to standard format (element + xyz)
+                    if let Some(cap) = re1.captures(&line) {
                         tmp_ele.push(cap[1].to_string());
                         tmp_pos.push(cap[3].parse().unwrap());
                         tmp_pos.push(cap[4].parse().unwrap());
@@ -573,7 +578,16 @@ impl GeomCell {
                             tmp_fix.push(false);
                             tmp_nfree += 1;
                         }
-                    };
+                    } else if let Some(cap) = re0.captures(&line) {
+                        tmp_ele.push(cap[1].to_string());
+                        tmp_pos.push(cap[2].parse().unwrap());
+                        tmp_pos.push(cap[3].parse().unwrap());
+                        tmp_pos.push(cap[4].parse().unwrap());
+                        tmp_fix.push(false);
+                        tmp_nfree += 1;
+                    } else {
+                        panic!("Error: unknown geometry format: {}", &line);
+                    }
                 }
             }
         }
