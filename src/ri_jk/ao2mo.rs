@@ -118,7 +118,7 @@ where
         timerecords.count_start("decomp");
         // reshape to 2-d, make transpose to match the functionality, then reshape back
         let j3c_vox_2d = j3c_xvo.into_shape((naux, -1)).into_reverse_axes();
-        let cderi_vox_2d = get_solved_j3c(j3c_vox_2d, &j2c_decomp);
+        let cderi_vox_2d = get_solved_j3c(j3c_vox_2d, &j2c_decomp, false);
         let cderi_xvo = cderi_vox_2d.into_reverse_axes().into_shape((naux, nvir, nocc));
         timerecords.count("decomp");
 
@@ -244,8 +244,8 @@ where
         // reshape to 2-d, make transpose to match the functionality, then reshape back
         let j3c_vox_a_2d = j3c_xvo_a.into_shape((naux, -1)).into_reverse_axes();
         let j3c_vox_b_2d = j3c_xvo_b.into_shape((naux, -1)).into_reverse_axes();
-        let cderi_vox_a_2d = get_solved_j3c(j3c_vox_a_2d, &j2c_decomp);
-        let cderi_vox_b_2d = get_solved_j3c(j3c_vox_b_2d, &j2c_decomp);
+        let cderi_vox_a_2d = get_solved_j3c(j3c_vox_a_2d, &j2c_decomp, false);
+        let cderi_vox_b_2d = get_solved_j3c(j3c_vox_b_2d, &j2c_decomp, false);
         let cderi_xvo_a = cderi_vox_a_2d.into_reverse_axes().into_shape((naux, nvir[A], nocc[A]));
         let cderi_xvo_b = cderi_vox_b_2d.into_reverse_axes().into_shape((naux, nvir[B], nocc[B]));
         timerecords.count("decomp");

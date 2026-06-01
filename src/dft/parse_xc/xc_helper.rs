@@ -1,13 +1,12 @@
-use crate::dft::libxc;
 use lazy_static::lazy_static;
 use std::collections::HashMap;
-use std::ffi;
 use serde_json;
 use crate::dft::DFAFamily;
 
 #[derive(Clone,PartialEq,Debug)]
 pub enum ComponentType {
     HF,
+    RSHF,
     PT2,
     RPA,
     SCSRPA,
@@ -29,6 +28,7 @@ impl ComponentType {
     pub fn as_str(&self) -> &'static str {
         match self {
             ComponentType::HF => "HF",
+            ComponentType::RSHF => "RSHF",
             ComponentType::PT2 => "PT2",
             ComponentType::RPA => "RPA",
             ComponentType::SCSRPA => "SCSRPA",
@@ -42,6 +42,7 @@ impl ComponentType {
     pub fn to_dfa_family(&self) -> Option<DFAFamily> {
         match self {
             ComponentType::HF => None,
+            ComponentType::RSHF => None,
             ComponentType::PT2 => Some(DFAFamily::PT2),
             ComponentType::RPA => Some(DFAFamily::RPA),
             ComponentType::SCSRPA => Some(DFAFamily::SCSRPA),
@@ -199,7 +200,9 @@ lazy_static! {
 
     pub static ref WHITELIST_NONLIBXC:HashMap<&'static str, ComponentType> = HashMap::from([
         ("HF", ComponentType::HF),
-        // todo SR_HF
+        ("SR_HF", ComponentType::RSHF),
+        ("LR_HF", ComponentType::RSHF),
+        ("RSH", ComponentType::RSHF),
         ("MP2", ComponentType::PT2),
         ("MP2_OS", ComponentType::PT2),
         ("MP2_SS", ComponentType::PT2),
@@ -247,30 +250,19 @@ pub fn get_name_with_dash() -> HashMap<String, &'static str> {
 }
 
 pub fn get_name(id: usize) -> String {
-    let name = unsafe{
-        let c_str = ffi::CStr::from_ptr(libxc::ffi_xc::xc_functional_get_name(id as i32));
-        c_str.to_str().unwrap().to_owned()
-    };
+    let name = libxc::util::libxc_functional_get_name(id as i32)
+        .unwrap_or_default();
     name.to_uppercase()
 }
 
 pub fn get_available_functionals() -> HashMap<String, usize> {
-    let n = unsafe{libxc::ffi_xc::xc_number_of_functionals()};
-    // println!("Number of functionals in libxc: {}", n);
-    let mut ids:Vec<i32> = vec![0; n as usize];
-    unsafe{
-        libxc::ffi_xc::xc_available_functional_numbers(ids.as_mut_ptr());
-    }
-    // println!("{:?}", ids);
+    let ids = libxc::util::libxc_available_functional_numbers();
     let mut available_functionals = HashMap::new();
     for id in ids {
-        let name = unsafe{
-            let c_str = ffi::CStr::from_ptr(libxc::ffi_xc::xc_functional_get_name(id));
-            c_str.to_str().unwrap().to_owned()
-        };
+        let name = libxc::util::libxc_functional_get_name(id)
+            .unwrap_or_default();
         available_functionals.insert(name.to_uppercase(), id as usize);
     }
-    // println!("Available functionals: {:?}", available_functionals);
     available_functionals
 }
 
@@ -289,6 +281,8 @@ pub fn load_json_functionals() -> HashMap<String, XC2step> {
     map1.extend(load_json(jsonfile2));
     let jsonfile3 = include_str!("./family_bdh.json");
     map1.extend(load_json(jsonfile3));
+    let jsonfile4 = include_str!("./family_bdh_omega.json");
+    map1.extend(load_json(jsonfile4));
     map1
 }
 

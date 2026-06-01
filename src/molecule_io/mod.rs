@@ -239,7 +239,9 @@ impl Molecule {
                         if !san {
                             panic!("{}", err_strings.join("\n"));
                         }
-                        (Some(dfadef.clone()), dfadef.to_dfa4rest())
+                        let mut xc_data = dfadef.to_dfa4rest();
+                        xc_data.update_pt2_params(ctrl.ri_pt2.os_factor, ctrl.ri_pt2.ss_factor);
+                        (Some(dfadef.clone()), xc_data)
                     },
                     _ => {
                         panic!("Error:: Unknown xc_parser '{}'. Please use either 'legacy' or 'parse_xc'", 
@@ -254,7 +256,7 @@ impl Molecule {
             DFTType::DeepLearning => {(None, DFA4REST::new_deep_learning(spin_channel, ctrl.print_level, &ctrl.xc_model))}
         };
 
-        xc_data.summary();
+        xc_data.summary(ctrl.print_level);
         if let Some(stop_at) = &ctrl.stop_at {
             if stop_at == "parse_xc" {
                 std::process::exit(0);
@@ -2162,6 +2164,128 @@ impl Molecule {
         ri3fn
     }
 
+    // generate the 2-center auxiliary Coulomb matrix with range-separated kernel
+    pub fn int_ij_aux_columb_with_omega(&self, omega: f64) -> MatrixFull<f64> {
+        let n_auxbas = self.num_auxbas;
+        let n_basis_shell = self.cint_bas.len();
+        let n_auxbas_shell = self.cint_aux_bas.len();
+        let mut aux_v = MatrixFull::new([n_auxbas,n_auxbas],0.0);
+        let (sender, receiver) = channel();
+        // For SR integrals: set omega < 0 (PTR_RANGE_OMEGA=8, negative → erfc(ωr)/r)
+        let range_omega = -omega;
+        self.cint_aux_fdqc.par_iter().enumerate().for_each_with(sender,|s,(l,fdqc)| {
+            let mut cint_data = self.initialize_cint(true);
+            cint_data.set_omega(range_omega);
+            cint_data.cint2c2e_optimizer_rust();
+            let basis_start_l = fdqc[0];
+            let basis_len_l = fdqc[1];
+            let gl  = l + n_basis_shell;
+            let mut loc_aux_v = MatrixFull::new([n_auxbas,basis_len_l],0.0);
+            for k in 0..n_auxbas_shell {
+                let basis_start_k = self.cint_aux_fdqc[k][0];
+                let basis_len_k = self.cint_aux_fdqc[k][1];
+                let gk  = k + n_basis_shell;
+                let buf = cint_data.cint_2c2e(gk as i32, gl as i32);
+                let mut tmp_slices = loc_aux_v.iter_submatrix_mut(
+                    basis_start_k..basis_start_k+basis_len_k,
+                    0..basis_len_l);
+                tmp_slices.zip(buf.iter()).for_each(|value| {*value.0 = *value.1});
+            }
+            cint_data.final_c2r();
+            s.send((loc_aux_v, basis_start_l, basis_len_l)).unwrap()
+        });
+        receiver.into_iter().for_each(|(loc_aux_v, basis_start_l, basis_len_l)| {
+            aux_v.copy_from_matr(0..n_auxbas, basis_start_l..basis_start_l+basis_len_l, &loc_aux_v, 0..n_auxbas, 0..basis_len_l);
+        });
+        aux_v
+    }
+
+    // generate the short-range 3-center RI integrals: (mu nu | erfc(omega*r12)/r12 | P)
+    pub fn prepare_ri3fn_sr_rayon(&self, omega: f64) -> RIFull<f64> {
+        let n_basis = self.num_basis;
+        let n_auxbas = self.num_auxbas;
+
+        // For SR integrals: set omega < 0 (PTR_RANGE_OMEGA=8, negative → erfc(ωr)/r)
+        let range_omega = -omega;
+
+        // First, the Cholesky decomposition of the SR 2-center Coulomb matrix
+        let mut aux_v = self.int_ij_aux_columb_with_omega(omega);
+        aux_v = aux_v.lapack_power(-0.5, AUXBAS_THRESHOLD).unwrap();
+
+        // Then, prepare the 3-center SR integrals
+        let mut ri3fn = RIFull::new([n_basis,n_basis,n_auxbas],0.0);
+        let n_basis_shell = self.cint_bas.len();
+        let n_auxbas_shell = self.cint_aux_bas.len();
+        let cint_type = if self.ctrl.basis_type.to_lowercase()==String::from("spheric") {
+            CintType::Spheric
+        } else if self.ctrl.basis_type.to_lowercase()==String::from("cartesian") {
+            CintType::Cartesian
+        } else {
+            panic!("Error:: Unknown basis type '{}'", self.ctrl.basis_type);
+        };
+
+        let (sender, receiver) = channel();
+        self.cint_fdqc.par_iter().enumerate().for_each_with(sender,|s, (j,bas_info_j)| {
+            omp_set_num_threads_wrapper(1);
+            let basis_start_j = bas_info_j[0];
+            let basis_len_j = bas_info_j[1];
+
+            let mut cint_data = self.initialize_cint(true);
+            cint_data.set_omega(range_omega);
+            cint_data.cint3c2e_optimizer_rust();
+            let mut ri_rayon = RIFull::new([n_basis,basis_len_j,n_auxbas],0.0);
+
+            self.cint_aux_fdqc.iter().enumerate().for_each(|(k,bas_info_k)| {
+                let basis_start_k = bas_info_k[0];
+                let basis_len_k = bas_info_k[1];
+                let gk  = k + n_basis_shell;
+                self.cint_fdqc.iter().enumerate().for_each(|(i,bas_info_i)| {
+                    let basis_start_i = bas_info_i[0];
+                    let basis_len_i = bas_info_i[1];
+                    let buf = RIFull::from_vec([basis_len_i, basis_len_j,basis_len_k], 
+                        cint_data.cint_3c2e(i as i32, j as i32, gk as i32)).unwrap();
+                    ri_rayon.copy_from_ri(
+                        basis_start_i..basis_start_i+basis_len_i,
+                        0..basis_len_j,
+                        basis_start_k..basis_start_k+basis_len_k,
+                        & buf, 
+                        0..basis_len_i, 
+                        0..basis_len_j, 
+                        0..basis_len_k);
+                });
+            });
+
+            cint_data.final_c2r();
+
+            let mut tmp_ovlp_matr = MatrixFull::new([n_basis,n_auxbas],0.0);
+            let mut aux_ovlp_matr = MatrixFull::new([n_basis,n_auxbas],0.0);
+            let size = [n_basis,n_auxbas];
+            for j in 0..basis_len_j {
+                matr_copy_from_ri(&ri_rayon.data, &ri_rayon.size,0..n_basis, 0..n_auxbas, j, 1,
+                    &mut tmp_ovlp_matr.data, &size, 0..n_basis, 0..n_auxbas);
+                _dgemm(
+                    &tmp_ovlp_matr, (0..n_basis,0..n_auxbas), 'N', 
+                    &aux_v, (0..n_auxbas, 0..n_auxbas), 'N', 
+                    &mut aux_ovlp_matr, (0..n_basis,0..n_auxbas), 1.0, 0.0);
+                ri_rayon.copy_from_matr(0..n_basis, 0..n_auxbas, j, 1, 
+                    &aux_ovlp_matr, 0..n_basis, 0..n_auxbas)
+            }
+
+            s.send((ri_rayon,basis_start_j,basis_len_j)).unwrap()
+        });
+
+        receiver.into_iter().for_each(|(ri_rayon, basis_start_j,basis_len_j)| {
+            ri3fn.copy_from_ri(
+                0..n_basis,basis_start_j..basis_start_j+basis_len_j,0..n_auxbas,
+                &ri_rayon,
+                0..n_basis,0..basis_len_j,0..n_auxbas,
+            );
+        });
+
+        omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
+        ri3fn
+    }
+
     // generate the 3-center RI integrals and the basis pair symmetry is used to save the memory
     pub fn prepare_rimatr_for_ri_v_rayon_v01(&self) -> (MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>) {
 
@@ -2904,7 +3028,7 @@ impl Molecule {
         (basbas2baspar, baspar2basbas)
     }
 
-    pub fn prepare_rimatr_for_ri_v_mpi_rayon(&self, mpi_operator: &Option<MPIOperator>) -> (MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>) {
+    pub fn prepare_rimatr_for_ri_v_mpi_rayon(&self, omega: Option<f64>, mpi_operator: &Option<MPIOperator>) -> (MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>) {
         let n_basis = self.num_basis;
         let n_auxbas = self.num_auxbas;
         let n_baspar = (self.num_basis+1)*self.num_basis/2;
@@ -2916,6 +3040,10 @@ impl Molecule {
         utilities::memory_batch::handle_memory_exceed(estimated_mem, avail_mem, self.ctrl.abort_on_mem_exceed);
 
         if let (Some(mpi_op), Some(loc_mpi_data)) = (&mpi_operator, &self.mpi_data) {
+
+            if omega.is_some() {
+                unimplemented!("The range-separated RI with MPI parallelization is not implemented yet.")
+            }
 
             let my_rank = mpi_op.rank;
 
@@ -2954,11 +3082,11 @@ impl Molecule {
 
                 (ri3fn, basbas2baspar, baspar2basbas)
             } else {
-                self.prepare_rimatr_for_ri_v_rayon()
+                self.prepare_rimatr_for_ri_v_rayon(omega)
             }
 
         } else {
-            self.prepare_rimatr_for_ri_v_rayon()
+            self.prepare_rimatr_for_ri_v_rayon(omega)
         }
 
 
@@ -3193,8 +3321,8 @@ impl Molecule {
 
     }
 
-    pub fn prepare_rimatr_for_ri_v_rayon(&self) -> (MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>) {
-        let cderi = ri_jk::generate_rimatr_bare(self);
+    pub fn prepare_rimatr_for_ri_v_rayon(&self, omega: Option<f64>) -> (MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>) {
+        let cderi = ri_jk::generate_rimatr_bare(self, omega);
         let (basbas2baspar, baspar2basbas) = ri_jk::generate_baspar(self.num_basis);
         (cderi, basbas2baspar, baspar2basbas)
     }
@@ -3495,7 +3623,7 @@ fn test_matrixupper() {
     let dd = MatrixUpper::from_vec(10, (0..10).collect::<Vec<usize>>()).unwrap();
     dd.iter_diagonal().for_each(|x| {println!("{}",x)});
 
-    let matrixupper_index = map_upper_to_full(10).unwrap();
+    let matrixupper_index = tensors::map_upper_to_full(10).unwrap();
     dd.iter_submatrix(1..3, 0..2, &matrixupper_index).for_each(|x| {println!("{}",x)});
 }
 

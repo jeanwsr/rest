@@ -11,6 +11,7 @@ use crate::molecule_io::Molecule;
 use crate::basis_io::{spheric_gto_deriv_batch_serial};
 use crate::dft::{Grids, DFA4REST};
 use crate::dft::xc_deriv::XCType;
+use crate::scf_io::util::occupied_orbital_count_with_threshold;
 use crate::dft::libxc_itrf::eval_xc_eff;
 use crate::ri_tddft::utils::tddft_occupation_parameters;
 
@@ -275,15 +276,8 @@ pub fn eval_rho5_spin_batch(ao:&RIFull<f64>, xc_type:XCType, mo:&MatrixFull<f64>
 
     
     
-    let homo = occ.iter().enumerate()
-        .filter(|(i,occ)| **occ >=1.0e-6)
-        .map(|(i,occ)| i).max();
-    let mut occ_tmp = if let Some(homo) = homo {
-            occ[0..homo+1].iter().map(|occ| occ.sqrt()).collect::<Vec<f64>>()
-    } else {
-        // In this case, no electrons in the i_spin channel, for which homo_s = None
-        vec![]
-    };
+    let num_occ = occupied_orbital_count_with_threshold(occ, 1.0e-6);
+    let mut occ_tmp = occ[0..num_occ].iter().map(|occ| occ.sqrt()).collect::<Vec<f64>>();
 
     let num_occ = occ_tmp.len();
     let mut wmo = _einsum_01_serial(&mo.to_matrixfullslice(), &occ_tmp);
@@ -475,7 +469,15 @@ pub fn prepare_fxc_data(scf: &SCF) -> FXCMatvecData {
     let ngrids = grids.weights.len();
     let num_basis = scf.mol.num_basis;
     let weights = &grids.weights;
-    let ao = grids.ao.as_ref().expect("AO on grids must be tabulated");
+    // ── Obtain dense AO: decompress from compressed storage if needed ──
+    let ao_owned: Option<MatrixFull<f64>>;
+    let ao: &MatrixFull<f64> = match &grids.ao {
+        Some(a) => { ao_owned = None; a }
+        None => match &grids.ao_compressed {
+            Some(c) => { ao_owned = Some(Grids::decompress_ao(c)); ao_owned.as_ref().unwrap() }
+            None => panic!("AO on grids must be tabulated (dense or compressed)"),
+        }
+    };
     let eigvec = &scf.eigenvectors[0];
 
     // ── Extract MO coefficients for occupied and virtual spaces ──
@@ -503,8 +505,15 @@ pub fn prepare_fxc_data(scf: &SCF) -> FXCMatvecData {
     _dgemm_full(&c_vir, 'T', ao, 'N', &mut mo_vir, 1.0, 0.0);
 
     // ── GGA: MO gradients on grids ──
+    let aop_owned: Option<RIFull<f64>>;
     let (mo_occ_grad, mo_vir_grad) = if xc_type == XCType::GGA {
-        let aop = grids.aop.as_ref().expect("AO gradients needed for GGA fxc");
+        let aop: &RIFull<f64> = match &grids.aop {
+            Some(a) => { aop_owned = None; a }
+            None => match &grids.aop_compressed {
+                Some(c) => { aop_owned = Some(Grids::decompress_aop(c)); aop_owned.as_ref().unwrap() }
+                None => panic!("AO gradients needed for GGA fxc (dense or compressed)"),
+            }
+        };
         let mut og = [
             MatrixFull::new([occ_size, ngrids], 0.0),
             MatrixFull::new([occ_size, ngrids], 0.0),
@@ -2867,7 +2876,6 @@ mod tests {
         println!("  => Compare REST times above at ngrids≈10000");
     }
 }
-
 
 
 

@@ -172,6 +172,47 @@ pub fn balancing(num_tasks:usize, num_threads: usize) -> Vec<Range<usize>> {
     distribute_vec
 }
 
+/// Apply round-robin permutation to grid data, so that contiguous ranges
+/// in `parallel_balancing` give each thread a uniform mix of grid points
+/// from all spatial regions. Call before ao/aop tabulation.
+pub fn apply_round_robin_permutation(coordinates: &mut Vec<[f64; 3]>, weights: &mut Vec<f64>) {
+    let n = coordinates.len();
+    let num_threads = rayon::current_num_threads();
+    if num_threads <= 1 {
+        return;
+    }
+
+    let base = n / num_threads;
+    let rem = n % num_threads;
+
+    let mut thread_starts = vec![0usize; num_threads + 1];
+    for t in 0..num_threads {
+        thread_starts[t + 1] = thread_starts[t] + base + if t < rem { 1 } else { 0 };
+    }
+
+    let mut pos = vec![0usize; n];
+    for i in 0..n {
+        let thread = i % num_threads;
+        let offset = i / num_threads;
+        let max_offset = base + if thread < rem { 1 } else { 0 };
+        if offset < max_offset {
+            pos[i] = thread_starts[thread] + offset;
+        }
+    }
+
+    let mut perm = vec![0usize; n];
+    for (old, &new) in pos.iter().enumerate() {
+        perm[new] = old;
+    }
+
+    let old_coords = coordinates.clone();
+    let old_weights = weights.clone();
+    for (new_idx, &old_idx) in perm.iter().enumerate() {
+        coordinates[new_idx] = old_coords[old_idx];
+        weights[new_idx] = old_weights[old_idx];
+    }
+}
+
 /// initialize the parallization vector for the sync data with the size of num_tasks * per_communication
 /// Eunsure that the data size communicated each time is less than 500 Mb
 pub fn balancing_type_02(num_tasks:usize, num_threads: usize, per_communication: usize) -> Vec<Range<usize>> {
