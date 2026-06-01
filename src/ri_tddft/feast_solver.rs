@@ -74,6 +74,9 @@ pub fn feast_solve_tddft_tda(
         init_guess_type,
         Some(hdiag),                       // init diagonal for Gaussian guess
         gaussian_width_factor,
+        true, // use_contour_rayon (not configurable from TDDFT)
+        None, // custom_init_vectors
+        None, None, "diagonal", None, 0.0001, 0, 0, // precond params
     );
 
     // Filter out spurious eigenvalues near zero (produced by the generic
@@ -166,8 +169,8 @@ pub fn feast_solve_tddft_lr(
         dim,
         &feast_a_matvec,
         &feast_b_matvec,
-        Some(&gmres_a_mul as &dyn Fn(&Vec<f64>) -> Vec<f64>),
-        Some(&gmres_b_mul as &dyn Fn(&Vec<f64>) -> Vec<f64>),
+        Some(&gmres_a_mul as &(dyn Fn(&Vec<f64>) -> Vec<f64> + Sync)),
+        Some(&gmres_b_mul as &(dyn Fn(&Vec<f64>) -> Vec<f64> + Sync)),
         eig_min,
         eig_max,
         m_expected,
@@ -180,6 +183,9 @@ pub fn feast_solve_tddft_lr(
         init_guess_type,
         Some(hdiag),
         gaussian_width_factor,
+        true, // use_contour_rayon (not configurable from TDDFT)
+        None, // custom_init_vectors
+        None, None, "diagonal", None, 0.0001, 0, 0, // precond params
     );
 
     // Post-process: convert (omega^2, X+Y) -> (omega, X)
