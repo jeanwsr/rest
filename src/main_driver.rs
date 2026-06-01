@@ -944,6 +944,17 @@ mod geometric_pyo3_impl {
             panic!("For geometric_pyo3, you must specify the parameters in the control file.")
         };
 
+        let constraint_path = if let Some(constraint_str) = scf_data.mol.geom.to_geometric_freeze_str() {
+            if scf_data.mol.ctrl.print_level > 0 {
+                println!("Fixed atoms detected, generating constraint file.");
+            }
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!("rest_constraints_{}.txt", std::process::id()));
+            std::fs::write(&path, &constraint_str).expect("Failed to write constraint file");
+            Some(path)
+        } else {
+            None
+        };
 
         let input = None;
 
@@ -958,6 +969,10 @@ mod geometric_pyo3_impl {
         let (last_energy, last_coords) = Python::with_gil(|py| -> PyResult<(f64, Vec<f64>)> {
             let custom_engine = pyo3_engine_cls.call1(py, (molecule,))?;
             custom_engine.call_method1(py, "set_driver", (driver,))?;
+
+            if let Some(ref cst_path) = constraint_path {
+                params.bind(py).set_item("constraints", cst_path.to_str().unwrap())?;
+            }
 
             let res = run_optimization(custom_engine, &params, input)?;
 
@@ -975,6 +990,10 @@ mod geometric_pyo3_impl {
 
             Ok((last_energy, last_coords))
         })?;
+
+        if let Some(ref path) = constraint_path {
+            let _ = std::fs::remove_file(path);
+        }
 
         let last_coords = MatrixFull::from_vec([3, last_coords.len()/3], last_coords).unwrap();
 
