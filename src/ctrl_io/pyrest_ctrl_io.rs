@@ -71,7 +71,7 @@ impl InputKeywords {
     pub fn py_set_mixer(&mut self, mixer: String) {
         self.mixer = mixer.to_lowercase();
         if self.mixer.eq(&"ddiis") { self.mixer = String::from("diis"); }
-        let flag = self.mixer.eq("direct") || self.mixer.eq("linear") || self.mixer.eq("diis") || self.mixer.eq("ediis") || self.mixer.eq("ediis+diis");
+        let flag = self.mixer.eq("direct") || self.mixer.eq("linear") || self.mixer.eq("diis") || self.mixer.eq("ediis") || self.mixer.eq("ediis+diis") || self.mixer.eq("adiis+diis");
         if ! flag {
             println!("Warning: please use either 'direct', 'linear', or 'diis'")
         }
