@@ -75,9 +75,9 @@ pub fn get_dF_dA(
     let atom_radii: Vec<f64> = surface.cfg.atom_radii.clone().unwrap_or_else(|| {
         surface.atomic_num.iter()
             .map(|&z| if z == 1 {
-                2.0786987370215684 * surface.cfg.vdw_scale
+                2.0786987370215684 * surface.cfg.vdw_scale.unwrap()
             } else {
-                crate::constants::solvent::VDW_RADII[z] * surface.cfg.vdw_scale
+                crate::constants::solvent::VDW_RADII[z] * surface.cfg.vdw_scale.unwrap()
             })
             .collect()
     });
