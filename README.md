@@ -359,6 +359,13 @@ fp_mode = "FP64"
 	- "each"：计算构型优化中每一步的Hessian矩阵
 - `frequency`：取值bool，当得到Hessian矩阵后，是否开展频率计算和热化学分析。缺省值：true
 - `thermo`：取值[f64;2]，提供热力学分析的状态：[温度 (K),压强 (bar)]。缺省值：[300.0, 1.0]
+- `reset`：取值bool。当近似 Hessian 的特征值低于 `epsilon` 阈值时，是否将其重置回 guess Hessian。对于稳态优化，缺省值为 true。若体系梯度含噪声、BFGS 更新每步失败（出现 "Eigenvalues below ... returning guess"），可设为 false 保留 Hessian 并加对角 shift 继续优化。
+- `trust`：取值f64。初始 trust radius（Å）。缺省值：0.1
+- `tmax`：取值f64。最大 trust radius（Å）。缺省值：0.3
+- `tmin`：取值f64。最小 trust radius（Å）。缺省值：1e-4。一般应小于 `convergence_drms` 以避免优化器在数值噪声处提前收敛。
+- `epsilon`：取值f64。Hessian 重置的特征值阈值。缺省值：1e-5。仅当 `reset = true` 时生效。
+- `subfrctor`：取值 i32。投影掉梯度中净力/净力矩分量的模式。0 = 不投影，1 = 自动检测（缺省），2 = 强制投影。DFT 梯度常含微量力矩噪声，在 QM/MM 或大体系中可能引起结构慢转而力不收敛，设为 2 可消除此噪声源。
+- `usedmax`：取值 bool。是否用最大位移分量（而非 RMS）判断 trust radius。缺省值：false。适合各方向力常数差异大的各向异性体系。
 - 例子一：开启GGA、meta-GGA或者杂化泛函的稳态构型优化（以x3lyp为例），则不需要使用[geometric_pyo3]区的设置
     ```
 	[ctrl]
