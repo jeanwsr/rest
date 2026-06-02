@@ -2,6 +2,7 @@
 // Solvent gradient module
 pub mod grad;
 pub mod surface_utils;
+pub mod smd_cds;
 pub use surface_utils::*;
 
 use std::fmt;
@@ -975,11 +976,11 @@ pub fn get_veff_pcm_by_q(
 
 /// Main function to prepare PCM object for a given molecule
 pub fn solvent_prepare(mol: &Molecule) -> PcmObject {
-    let method = mol.solvent_model.clone();
-    let epsilon = mol.solv_epsilon.clone();
+    let method = mol.ctrl.solvent_model.clone();
+    let epsilon = mol.ctrl.solv_epsilon.clone();
     let pcmcfg = PcmObjectCfg::build(method, epsilon);
     let surfacecfg = SurfaceVdwGaussianCfg::default();
-    let mut surface = SurfaceVdwGaussian::new(surfacecfg, &mol.geom);
+    let mut surface = SurfaceVdwGaussian::new(mol.ctrl.solvent_radii, &mol.geom);
     surface.build();
     let pstatic = PcmStatic::build_pcm_static(&surface, &pcmcfg, &mol);
     //let pcm_object = PcmObject::init_Pcm(pcmcfg, surface, pstatic);

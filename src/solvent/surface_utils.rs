@@ -1,3 +1,4 @@
+use std::fmt;
 use std::f64::consts;
 use rstsr::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,47 @@ impl SurfaceCalc{
     }
 }
 
+/// Radius scheme for PCM cavity construction
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum RadiusScheme {
+    #[default]
+    Bondi,
+    UFF,
+}
+
+impl RadiusScheme {
+    pub fn default_vdw_scale(&self) -> f64 {
+        match self {
+            RadiusScheme::Bondi => 1.2,
+            RadiusScheme::UFF => 1.1,
+        }
+    }
+}
+
+impl fmt::Display for RadiusScheme {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RadiusScheme::Bondi => write!(f, "Bondi"),
+            RadiusScheme::UFF => write!(f, "UFF"),
+        }
+    }
+}
+
+impl<'d> Deserialize<'d> for RadiusScheme {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'d>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_uppercase().as_str() {
+            "BONDI" => Ok(RadiusScheme::Bondi),
+            "UFF" => Ok(RadiusScheme::UFF),
+            _ => Err(serde::de::Error::custom(format!("Unknown RadiusScheme: {}", s))),
+        }
+    }
+}
+
 /// surface configurations
 #[non_exhaustive]
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -46,16 +88,40 @@ impl SurfaceCalc{
 pub struct SurfaceVdwGaussianCfg {
     pub lebedev_degree: usize,
     pub atom_radii: Option<Vec<f64>>,
-    pub vdw_scale: f64,
+    pub radius_scheme: RadiusScheme,
+    /// VdW scale factor; `None` uses the default scale for the chosen `radius_scheme`
+    pub vdw_scale: Option<f64>,
     pub switch_type: SurfaceSwitchType,
 }
 
 impl Default for SurfaceVdwGaussianCfg {
     fn default() -> Self {
-        SurfaceVdwGaussianCfg { lebedev_degree: 302, atom_radii: None, vdw_scale: 1.2, switch_type: SurfaceSwitchType::default() }
+        SurfaceVdwGaussianCfg {
+            lebedev_degree: 302,
+            atom_radii: None,
+            radius_scheme: RadiusScheme::default(),
+            vdw_scale: None,
+            switch_type: SurfaceSwitchType::default(),
+        }
     }
 }
-//lebedev_degree is usually 302
+impl SurfaceVdwGaussianCfg {
+    /// Resolve the actual vdW scale: use `vdw_scale` if set, otherwise use the default for the chosen `radius_scheme`.
+    pub fn effective_vdw_scale(&self) -> f64 {
+        self.vdw_scale.unwrap_or_else(|| self.radius_scheme.default_vdw_scale())
+    }
+
+    pub fn new(radius_scheme: RadiusScheme) -> Self {
+        SurfaceVdwGaussianCfg {
+            lebedev_degree: 302,
+            atom_radii: None,
+            radius_scheme,
+            vdw_scale: None,
+            switch_type: SurfaceSwitchType::default(),
+        }
+    }
+}
+//lebedev_degree is usually 302, vdw_scale is usually 1.2, switch_type is usually SWIG
 
 /// Gaussian VDW surface representation
 #[non_exhaustive]
@@ -70,7 +136,8 @@ pub struct SurfaceVdwGaussian {
 }
 
 impl SurfaceVdwGaussian {
-    pub fn new(cfg: SurfaceVdwGaussianCfg, geom: &GeomCell) -> Self {
+    pub fn new(radius_scheme: RadiusScheme, geom: &GeomCell) -> Self {
+        let cfg = SurfaceVdwGaussianCfg::new(radius_scheme);
         let mut surface_calc = SurfaceCalc::new();
         let gslice_by_atom = vec![];
         let mass_charge = get_mass_charge(&geom.elem);
@@ -81,10 +148,22 @@ impl SurfaceVdwGaussian {
 
     /// PySCF's `solvent.pcm.gen_surface`
     pub fn build(&mut self) {
-        // unwrap atom_radii or calculate from atom_charges
+        // unwrap atom_radii or calculate from atomic base radii
+        let vdw_scale = self.cfg.effective_vdw_scale();
+        let base_radii: &[f64] = match self.cfg.radius_scheme {
+            RadiusScheme::Bondi => &data::VDW_RADII,
+            RadiusScheme::UFF   => &data::UFF_RADII,
+        };
         let atom_radii = self.cfg.atom_radii.clone().unwrap_or_else(|| {
             self.atomic_num.iter()
-                .map(|&z| if z == 1 { 2.0786987370215684 * self.cfg.vdw_scale } else { data::VDW_RADII[z] * self.cfg.vdw_scale })
+                .map(|&z| {
+                    let mut r0 = base_radii[z];
+                    // Bondi 对 H 有特殊的半径值 (1.1 Å vs 表里的 1.2 Å)
+                    if z == 1 && self.cfg.radius_scheme == RadiusScheme::Bondi {
+                        r0 = 2.0786987370215684;
+                    }
+                    r0 * vdw_scale
+                })
                 .collect()
         });
 

@@ -631,7 +631,7 @@ impl SCF {
     }
 
     pub fn prepare_solvent_calculation(&mut self) {
-        if self.mol.use_solvent {
+        if self.mol.ctrl.solvent_enabled {
             self.solvent_static_obj = Some(solvent_prepare(&self.mol));
 
         }
@@ -2190,7 +2190,7 @@ impl SCF {
         
         let dt_solv0 = time::Local::now();
         //let mut esolv_total = 0.0;
-        if self.mol.use_solvent{
+        if self.mol.ctrl.solvent_enabled{
             if self.solvent_scf.is_some() {
                 if let Some(solvent_scf) = self.solvent_scf.as_ref() {
                     for i_spin in 0..spin_channel {
@@ -2213,7 +2213,7 @@ impl SCF {
         
         let dt_solv1 = time::Local::now();
         let timecost_solv = (dt_solv1.timestamp_millis()-dt_solv0.timestamp_millis()) as f64 /1000.0;
-        if self.mol.use_solvent && self.mol.ctrl.print_level > 2 {
+        if self.mol.ctrl.solvent_enabled && self.mol.ctrl.print_level > 2 {
             println!("The evaluation of Solvent potential costs {:10.2} seconds.", timecost_solv);
         }
 
@@ -2503,7 +2503,7 @@ impl SCF {
         //let exc_hf = self.evaluate_exact_exchange_ri_v(mpi_operator);
         //println!("Exc[HF] = {:16.8}", exc_hf);
         //println!("==== IGOR debug for Exc[HF]====");
-        if self.mol.use_solvent {
+        if self.mol.ctrl.solvent_enabled {
             if let Some(solvent_scf) = self.solvent_scf.as_ref() {
                 self.scf_energy += solvent_scf.eng_nuc;
             }
@@ -5761,7 +5761,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         scf_data.generate_density_matrix();
 
         let dt_solv0 = time::Local::now();
-        if scf_data.mol.use_solvent {
+        if scf_data.mol.ctrl.solvent_enabled {
             if let Some(solvent_static) = scf_data.solvent_static_obj.as_ref() {
                 let s_static = PcmScf::get_pcm_refresh(
                     &solvent_static.surface, 
@@ -5892,7 +5892,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     }
 
     //solvent debug
-    if scf_data.mol.use_solvent{
+    if scf_data.mol.ctrl.solvent_enabled{
 
         //println!("solvent_static_obj: {:?}", scf_data.solvent_static_obj.is_some());
         //println!("solvent_scf: {:?}", scf_data.solvent_scf.is_some());

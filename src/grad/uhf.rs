@@ -516,7 +516,7 @@ impl RIUHFGradient<'_> {
     }
 
     pub fn calc_de_solvent(&mut self) -> &mut Self {
-        if !self.scf_data.mol.use_solvent {
+        if !self.scf_data.mol.ctrl.solvent_enabled {
             let natm = self.scf_data.mol.geom.elem.len();
             self.result.insert("de_solvent".into(), MatrixFull::new([3, natm], 0.0));
             return self;
