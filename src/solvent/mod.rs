@@ -980,7 +980,7 @@ pub fn solvent_prepare(mol: &Molecule) -> PcmObject {
     let epsilon = mol.ctrl.solv_epsilon.clone();
     let pcmcfg = PcmObjectCfg::build(method, epsilon);
     let surfacecfg = SurfaceVdwGaussianCfg::default();
-    let mut surface = SurfaceVdwGaussian::new(mol.ctrl.solvent_radii, &mol.geom);
+    let mut surface = SurfaceVdwGaussian::new(mol.ctrl.pcm_cavity_radii, &mol.geom);
     surface.build();
     let pstatic = PcmStatic::build_pcm_static(&surface, &pcmcfg, &mol);
     //let pcm_object = PcmObject::init_Pcm(pcmcfg, surface, pstatic);

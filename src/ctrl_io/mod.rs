@@ -219,7 +219,7 @@ pub struct InputKeywords {
     pub solv_epsilon: f64,
     pub solvent_model: PcmMethod,
     pub solv_chunk: usize,
-    pub solvent_radii: RadiusScheme,
+    pub pcm_cavity_radii: RadiusScheme,
     #[pyo3(get, set)]
     // The initial MO coefficients and eigenvalues can be imported by setting chkfile
     pub chkfile: String,
@@ -475,7 +475,7 @@ impl InputKeywords {
             solv_epsilon:1.0,
             solvent_model: PcmMethod::CPCM,
             solv_chunk: 8,
-            solvent_radii: RadiusScheme::UFF,
+            pcm_cavity_radii: RadiusScheme::UFF,
             stop_at: None,
             xc_parser: String::from("legacy"),
             j2c_decomp: J2CDecompOption::default(),
@@ -1199,7 +1199,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 },
                 None => PcmMethod::CPCM,
             };
-            tmp_input.solvent_radii = match tmp_ctrl.get("solvent_radii") {
+            tmp_input.pcm_cavity_radii = match tmp_ctrl.get("pcm_cavity_radii") {
                 Some(value) => {
                     serde_json::from_value(value.clone())?
                 },
