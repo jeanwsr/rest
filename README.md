@@ -340,7 +340,7 @@ fp_mode = "FP64"
 - `solvent_enabled`: 取值bool，设置为true则启用溶剂化计算。如果没有`solvent_enabled`字段但有`solvent_model`的设置且内容非空的时候，同样启用溶剂化计算。其他情况缺省为false。
 - `solv_epsilon`: 取值f64, 为溶质的介电常数。缺省为1.0 (真空)。介电常数表可以参考 http://sobereva.com/g09/k_scrf.htm 的最后。
 - `solvent_ri`: 取值bool, 设置为true为溶剂化能计算开启辅助基，设置为false溶剂化计算不开启辅助基。缺省为true。目前溶剂化梯度(job_type = "opt"/"force")计算没有用辅助基。
-- `solvent_radii`: 取值String, 用于指定空腔的半径使用类型。目前支持Bondi, UFF。缺省为UFF。
+- `pcm_cavity_radii`: 取值String, 用于指定空腔的半径使用类型。目前支持Bondi, UFF。缺省为UFF。
 # Detailed descrption of [geometric_pyo3] block in the control file
 - `maxiter`：取值i32。结构优化的最大步数上限。缺省值：300
 - `converge_energy`：取值f64。构型优化中上下两步能量变化的收敛阈值。缺省值：1.0e-6
