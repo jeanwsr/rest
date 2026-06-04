@@ -437,6 +437,9 @@ pub struct FXCMatvecData {
     /// LDA: vec[ngrids] = fxc[g] × w[g]
     /// GGA: vec[ngrids × 4 × 4] f-contiguous [g, α, β] = fxc[g,α,β] × w[g]
     pub wfxc: Vec<f64>,
+    /// If true, `fxc_matvec` will use the optimized implementation
+    /// (`fxc_matvec_opt`) instead of the original.
+    pub use_opt: bool,
 }
 
 /// Prepare FXCMatvecData from converged SCF object
@@ -615,6 +618,7 @@ pub fn prepare_fxc_data(scf: &SCF) -> FXCMatvecData {
         mo_occ_grad,
         mo_vir_grad,
         wfxc,
+        use_opt: scf.mol.ctrl.use_fxc_opt,
     }
 }
 
@@ -647,10 +651,27 @@ pub fn fxc_matvec_old(data: &FXCMatvecData, z: &[f64]) -> Vec<f64> {
     assert_eq!(z.len(), data.nocc * data.nvir,
                "z vector length {} must equal nocc×nvir = {}×{}",
                z.len(), data.nocc, data.nvir);
+    if data.use_opt {
+        let mut ws = prepare_fxc_workspace(data);
+        fxc_matvec_opt(data, z, &mut ws)
+    } else {
+        match data.nvar {
+            1 => fxc_matvec_lda(data, z),
+            4 => fxc_matvec_gga(data, z),
+            _ => panic!("fxc_matvec only supports LDA (nvar=1) and GGA (nvar=4)"),
+        }
+    }
+}
+
+/// Original fxc matrix-vector product (kept for reference).
+pub fn fxc_matvec_old(data: &FXCMatvecData, z: &[f64]) -> Vec<f64> {
+    assert_eq!(z.len(), data.nocc * data.nvir,
+               "z vector length {} must equal nocc×nvir = {}×{}",
+               z.len(), data.nocc, data.nvir);
     match data.nvar {
         1 => fxc_matvec_lda(data, z),
         4 => fxc_matvec_gga(data, z),
-        _ => panic!("fxc_matvec only supports LDA (nvar=1) and GGA (nvar=4)"),
+        _ => panic!("fxc_matvec_old only supports LDA (nvar=1) and GGA (nvar=4)"),
     }
 }
 
@@ -1986,6 +2007,7 @@ mod tests {
             mo_occ_grad: None,
             mo_vir_grad: None,
             wfxc,
+            use_opt: false,
         }
     }
 
@@ -2050,6 +2072,7 @@ mod tests {
             mo_occ_grad: Some(og),
             mo_vir_grad: Some(vg),
             wfxc,
+            use_opt: false,
         }
     }
 
