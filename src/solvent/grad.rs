@@ -19,14 +19,15 @@ use std::time::Instant;
 use rest_libcint::CINTR2CDATA;
 use tensors::MatrixFull;
 use tensors::matrix_blas_lapack::_dgemm_scaled;
-
 use crate::geom_io::get_mass_charge;
 use crate::Molecule;
 use crate::scf_io::SCF;
+use crate::constants::solvent as data;
 use crate::solvent::{
     self,
     PcmMethod, PcmStatic, PcmScf, SurfaceVdwGaussian,
     solve_lu_transpose,
+    RadiusScheme,
 };
 
 // ============================================================================
@@ -71,16 +72,25 @@ pub fn get_dF_dA(
     let gslice = &surface.gslice_by_atom;
     let lebedev = surface.cfg.lebedev_degree;
 
+    let vdw_scale = surface.cfg.effective_vdw_scale();
+        let base_radii: &[f64] = match surface.cfg.radius_scheme {
+            RadiusScheme::Bondi => &data::VDW_RADII,
+            RadiusScheme::UFF   => &data::UFF_RADII,
+        };
     // Per‑atom radii;  R_in / R_sw follow the same logic as build()
-    let atom_radii: Vec<f64> = surface.cfg.atom_radii.clone().unwrap_or_else(|| {
+    let atom_radii = surface.cfg.atom_radii.clone().unwrap_or_else(|| {
         surface.atomic_num.iter()
-            .map(|&z| if z == 1 {
-                2.0786987370215684 * surface.cfg.vdw_scale.unwrap()
-            } else {
-                crate::constants::solvent::VDW_RADII[z] * surface.cfg.vdw_scale.unwrap()
+            .map(|&z| {
+                let mut r0 = base_radii[z];
+                // Bondi 对 H 有特殊的半径值 (1.1 Å vs 表里的 1.2 Å)
+                if z == 1 && surface.cfg.radius_scheme == RadiusScheme::Bondi {
+                    r0 = 2.0786987370215684;
+                }
+                r0 * vdw_scale
             })
             .collect()
     });
+
     let R_sw: Vec<f64> = atom_radii.iter()
         .map(|&r| r * (14.0 / (lebedev as f64)).sqrt())
         .collect();
