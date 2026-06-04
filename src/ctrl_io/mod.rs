@@ -73,6 +73,30 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     Ok((tmp_input,tmp_geomcell))
 }
 
+fn parse_usize_list_keyword(value: &serde_json::Value) -> Vec<usize> {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_u64().map(|x| x as usize))
+            .collect(),
+        serde_json::Value::Number(num) => {
+            num.as_u64().map(|x| vec![x as usize]).unwrap_or_default()
+        }
+        serde_json::Value::String(text) => text
+            .trim_matches(|c| c == '[' || c == ']')
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter_map(|part| {
+                let part = part.trim();
+                if part.is_empty() {
+                    None
+                } else {
+                    part.parse::<usize>().ok()
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 
 #[derive(Clone,Copy,Debug, Deserialize, Serialize)]
 pub enum JobType {
@@ -277,6 +301,9 @@ pub struct InputKeywords {
     // Keywords for DeepPot
     #[pyo3(get, set)]
     pub deep_pot: bool,
+    // Keywords for lib_rint
+    #[pyo3(get, set)]
+    pub run_lib_rint: bool,
     // Keywords for benchmarking various effective potentials, including ECP, ENXC, and Ghost EP
     #[pyo3(get, set)]
     pub bench_eps: bool,
@@ -452,6 +479,7 @@ impl InputKeywords {
             //use_dft: false,
             //dft_type: None,
             deep_pot: false,
+            run_lib_rint: false,
             bench_eps: false,
             occupation_type: OCCType::INTEGER,
             frac_tolerant: 1.0e-3,
@@ -1603,6 +1631,11 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.deep_pot = match tmp_ctrl.get("deep_potential").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
+            };
+            tmp_input.run_lib_rint = match tmp_ctrl.get("run_lib_rint").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                _ => false,
             };
             tmp_input.bench_eps = match tmp_ctrl.get("bench_eps").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},

@@ -17,7 +17,7 @@ use crate::constants::{ANG, AU2DEBYE};
 use crate::scf_io::{scf_without_build, SCFType, SCF};
 use tensors::{MathMatrix, MatrixFull};
 use tensors::matrix_blas_lapack::_dsyevd;
-use crate::{utilities, ri_pt2, ri_rpa, dft, scf_io, post_scf_analysis};
+use crate::{utilities, ri_pt2, ri_rpa, dft, scf_io, post_scf_analysis, lib_rint};
 
 //use rayon;
 use crate::constants::EV;
@@ -44,6 +44,12 @@ use crate::mpi_io::{MPIOperator,MPIData};
 use std::collections::HashMap;
 
 //use crate::mpi_io::initialization;
+
+fn print_r12inv2_export(observables: &lib_rint::RhfVeeObservables) {
+    println!("E_J(r2)            : {:.16e}", observables.ej);
+    println!("E_K(r2)            : {:.16e}", observables.ek);
+    println!("E(r2)              : {:.16e}", observables.total);
+}
 
 
 pub fn main_driver() -> anyhow::Result<()> {
@@ -262,6 +268,40 @@ pub fn main_driver() -> anyhow::Result<()> {
         scf_data.stability();
 
         time_mark.count("Stability");
+    }
+
+    // check lib_rint
+    if scf_data.mol.ctrl.run_lib_rint {
+        time_mark.count_start("RI-r2");
+        match scf_data.scftype {
+            SCFType::RHF => {
+                let p_rhf = &scf_data.density_matrix[0];
+                let r2 = lib_rint::lib_vee_rhf_r2_observables_advanced(
+                    &scf_data.mol.geom,
+                    &scf_data.mol.basis4elem,
+                    p_rhf,
+                    Some(&scf_data.eigenvectors),
+                    Some(&scf_data.occupation),
+                );
+                print_r12inv2_export(&r2);
+            }
+            SCFType::ROHF | SCFType::UHF => {
+                if scf_data.density_matrix.len() < 2 {
+                    println!("lib_rint skipped: open-shell run needs alpha/beta density matrices");
+                } else {
+                    let dm_spin = &scf_data.density_matrix[0..2];
+                    let r2 = lib_rint::lib_vee_uhf_r2_observables_advanced(
+                        &scf_data.mol.geom,
+                        &scf_data.mol.basis4elem,
+                        dm_spin,
+                        Some(&scf_data.eigenvectors),
+                        Some(&scf_data.occupation),
+                    );
+                    print_r12inv2_export(&r2);
+                }
+            }
+        }
+        time_mark.count("RI-r2");
     }
 
     //====================================
