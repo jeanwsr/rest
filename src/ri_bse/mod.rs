@@ -39,14 +39,15 @@ pub fn bse_main(scf_data:&mut SCF){
     if qp_ctrl.bse_spin =="none"{
         println!("No BSE Calculations are triggered");
     }else if qp_ctrl.bse_spin=="both"{
-        let (mut excitations_singlets,mut excitations_triplets)=bse_both_spins(&scf_data,&quasiparticle_energies);
+        let (mut excitations_singlets,mut excitations_triplets)=bse_both_spins(scf_data,&quasiparticle_energies);
         if qp_ctrl.bse_tda==true{
             println!("BSE Calculation Results of Both Singlets and Triplets with TDA:");
             let number=excitations_singlets.len();
             println!("First {} Singlet Excitations:",number);
             excitations_singlets[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
                 let v=dipoles::normalize(vec,true);
-                println!("#{} Excitation energy={}",n,e);
+                let vec_norm: f64 = vec.iter().map(|x| x*x).sum::<f64>().sqrt();
+                println!("#{} Excitation energy={}, norm={:.6}",n,e,vec_norm);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
                 leading_components(&v,occ_size,vir_size)});
@@ -54,7 +55,8 @@ pub fn bse_main(scf_data:&mut SCF){
             println!("First {} Triplet Excitations:",number);
             excitations_triplets[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
                 let v=dipoles::normalize(vec,true);
-                println!("#{} Excitation energy={}",n,e);
+                let vec_norm: f64 = vec.iter().map(|x| x*x).sum::<f64>().sqrt();
+                println!("#{} Excitation energy={}, norm={:.6}",n,e,vec_norm);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
                 leading_components(&v,occ_size,vir_size)});
@@ -64,7 +66,8 @@ pub fn bse_main(scf_data:&mut SCF){
             let number=excitations_singlets.len();
             println!("First {} Singlet Excitations:",number);
             excitations_singlets[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
-                println!("#{} Excitation energy={}",n,e);
+                let vec_norm: f64 = vec.iter().map(|x| x*x).sum::<f64>().sqrt();
+                println!("#{} Excitation energy={}, norm={:.6}",n,e,vec_norm);
                 let v=dipoles::normalize(vec,false);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,false);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
@@ -73,7 +76,8 @@ pub fn bse_main(scf_data:&mut SCF){
             println!("The first singlet excitation obtained by BSE is {}",excitations_singlets[0].0);
             println!("First {} Triplet Excitations:",number);
             excitations_triplets[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
-                println!("#{} Excitation energy={}",n,e);
+                let vec_norm: f64 = vec.iter().map(|x| x*x).sum::<f64>().sqrt();
+                println!("#{} Excitation energy={}, norm={:.6}",n,e,vec_norm);
                 let v=dipoles::normalize(vec,false);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,false);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
@@ -100,7 +104,8 @@ pub fn bse_main(scf_data:&mut SCF){
             let number = excitations.len();
             println!("{} excitations within the window:", number);
             for (n, (e, vec)) in excitations[..].iter().enumerate() {
-                println!("#{} Excitation energy={}", n, e);
+                let vec_norm: f64 = vec.iter().map(|x| x*x).sum::<f64>().sqrt();
+                println!("#{} Excitation energy={}, norm={:.6}", n, e, vec_norm);
                 let v = dipoles::normalize(vec, true);
                 let dipole_square = dipoles::transition_dipole_square(&dipole_matrix, &v, true);
                 println!("\tTransition Dipole Square:{}; Oscillator Strength:{}",
@@ -128,7 +133,9 @@ pub fn bse_main(scf_data:&mut SCF){
             }
             let number=excitations.len();
             println!("{} excitations within the window:",number);
-            excitations[..].iter().enumerate().for_each(|(n,(e,vec))|{println!("#{} Excitation energy={}",n,e);
+            excitations[..].iter().enumerate().for_each(|(n,(e,vec))|{
+            let vec_norm: f64 = vec.iter().map(|x| x*x).sum::<f64>().sqrt();
+            println!("#{} Excitation energy={}, norm={:.6}",n,e,vec_norm);
             let v=dipoles::normalize(vec,false);
             let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,false);
             println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
@@ -153,7 +160,8 @@ pub fn bse_main(scf_data:&mut SCF){
             println!("{} excitations within the window:",number);
             excitations[..].iter().enumerate().for_each(|(n,(e,vec))|{
                 let v=dipoles::normalize(vec,true);
-                println!("#{} Excitation energy={}",n,e);
+                let vec_norm: f64 = vec.iter().map(|x| x*x).sum::<f64>().sqrt();
+                println!("#{} Excitation energy={}, norm={:.6}",n,e,vec_norm);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
                 println!("\tTransition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
                 leading_components(&v,occ_size,vir_size)});
@@ -583,7 +591,7 @@ pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char
     }
     eigenpairs
 }
-pub fn bse_both_spins(scf_data:&SCF,quasiparticle_energies:&Vec<f64>)->(Vec<(f64,Vec<f64>)>,Vec<(f64,Vec<f64>)>){
+pub fn bse_both_spins(scf_data:&mut SCF,quasiparticle_energies:&Vec<f64>)->(Vec<(f64,Vec<f64>)>,Vec<(f64,Vec<f64>)>){
     let qp_ctrl_ref=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
 
     // ── FEAST solver path ──
