@@ -10,8 +10,8 @@ fn run_h2o_scf() -> SCF {
 [ctrl]
      print_level =          0
      xc =                   "blyp"
-     basis_path =           "basis-set-pool/def2-svp"
-     auxbas_path =          "basis-set-pool/def2-universal-jkfit"
+     basis_path =           "def2-svp"
+     auxbas_path =          "def2-universal-jkfit"
      eri_type =             "ri-v"
      charge =               0.0
      spin =                 1.0
