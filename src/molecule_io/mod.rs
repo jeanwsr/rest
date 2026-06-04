@@ -12,7 +12,6 @@ use rest_tensors::{ERIFull,RIFull,ERIFold4,TensorSlice,TensorSliceMut,TensorOpt,
 use tensors::{BasicMatrix, SubMatrixUpper};
 use tensors::external_libs::{matr_copy_from_ri};
 use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _power_rayon_for_symmetric_matrix};
-use tensors::matrix::matrixupper::map_upper_to_full;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::mpsc::channel;
