@@ -644,24 +644,7 @@ pub fn fxc_matvec(data: &FXCMatvecData, z: &[f64]) -> Vec<f64> {
     }
 }
 
-/// Original (non-optimised) dispatch — preserved for benchmarking and
-/// backward-compatible verification.
-#[allow(dead_code)]
-pub fn fxc_matvec_old(data: &FXCMatvecData, z: &[f64]) -> Vec<f64> {
-    assert_eq!(z.len(), data.nocc * data.nvir,
-               "z vector length {} must equal nocc×nvir = {}×{}",
-               z.len(), data.nocc, data.nvir);
-    if data.use_opt {
-        let mut ws = prepare_fxc_workspace(data);
-        fxc_matvec_opt(data, z, &mut ws)
-    } else {
-        match data.nvar {
-            1 => fxc_matvec_lda(data, z),
-            4 => fxc_matvec_gga(data, z),
-            _ => panic!("fxc_matvec only supports LDA (nvar=1) and GGA (nvar=4)"),
-        }
-    }
-}
+
 
 /// Original fxc matrix-vector product (kept for reference).
 pub fn fxc_matvec_old(data: &FXCMatvecData, z: &[f64]) -> Vec<f64> {
