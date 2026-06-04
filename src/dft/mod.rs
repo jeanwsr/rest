@@ -8,6 +8,7 @@ pub mod num_int;
 pub mod parse_xc;
 pub mod response;
 
+#[cfg(feature = "mpi")]
 use mpi::collective::SystemOperation;
 // use mpi::ffi::MPI_T_SCOPE_GROUP_EQ;
 use rest_tensors::{MatrixFull, RIFull, MatrixFullSlice};
@@ -25,7 +26,9 @@ use crate::basis_io::{gto_1st_value_batch_serial, gto_1st_value_serial, gto_valu
     spheric_gto_value_matrixfull};
 use crate::molecule_io::Molecule;
 use crate::geom_io::get_mass_charge;
-use crate::mpi_io::{mpi_broadcast, mpi_reduce, MPIData, MPIOperator};
+use crate::mpi_io::{MPIData, MPIOperator};
+#[cfg(feature = "mpi")]
+use crate::mpi_io::{mpi_broadcast, mpi_reduce};
 use crate::utilities::{self, balancing};
 use std::collections::HashMap;
 use std::fs::File;
@@ -3033,6 +3036,7 @@ impl DFA4REST {
             }
         }
         let (exc_total, _total_elec) = self.integrate_exc(&exc, &rho, &grids.weights, spin_channel);
+        #[cfg(feature = "mpi")]
         let global_exc_total = if let Some(mpi_op) = &mpi_operator {
             let my_rank = mpi_op.rank;
             let mut global_exc_total = mpi_reduce(&mpi_op.world, &exc_total , 0, &SystemOperation::sum());
@@ -3042,6 +3046,8 @@ impl DFA4REST {
         } else {
             exc_total
         };
+        #[cfg(not(feature = "mpi"))]
+        let global_exc_total = exc_total;
 
         global_exc_total
 
@@ -5447,6 +5453,7 @@ pub fn numerical_density_v01(grid: &Grids, mol: &Molecule, dm: &mut [MatrixFull<
 }
 
 pub fn numerical_density(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull<f64>>, mpi_operator: &Option<MPIOperator>) -> [f64;2] {
+    #[cfg(feature = "mpi")]
     if let Some(mpi_op) = mpi_operator {
         let mut total_density = [0.0f64;2];
         let mut tmp_density = numerical_density_rayon(grid, mol, dm);
@@ -5454,9 +5461,12 @@ pub fn numerical_density(grid: &Grids, mol: &Molecule, dm: &Vec<MatrixFull<f64>>
         mpi_broadcast(&mpi_op.world, &mut tmp_density, 0);
         total_density.iter_mut().zip(tmp_density.iter()).for_each(|(to, from)| *to += *from);
         total_density
-    } else {
+    } else
+    {
         numerical_density_rayon(grid, mol, dm)
     }
+    #[cfg(not(feature = "mpi"))]
+    { numerical_density_rayon(grid, mol, dm) }
 }
 
 pub fn numerical_orbital_population(grid: &Grids, mol: &Molecule) -> Vec<f64> {

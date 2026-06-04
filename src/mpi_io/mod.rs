@@ -1,9 +1,14 @@
 use std::iter::zip;
 use std::ops::{Range, Add, Sub, Mul, Div, AddAssign, SubAssign, MulAssign, DivAssign};
+#[cfg(feature = "mpi")]
 use mpi::collective::SystemOperation;
+#[cfg(feature = "mpi")]
 use mpi::environment::Universe;
+#[cfg(feature = "mpi")]
 use mpi::request::WaitGuard;
+#[cfg(feature = "mpi")]
 use mpi::topology::{SimpleCommunicator, Rank};
+#[cfg(feature = "mpi")]
 use mpi::traits::*;
 use num_traits::{One, Zero};
 use tensors::{BasicMatrix, MatrixFull};
@@ -42,9 +47,16 @@ use crate::utilities::balancing;
 ///    
 /// 
 
+#[cfg(feature = "mpi")]
 pub struct MPIOperator {
     pub universe: Universe,
     pub world: SimpleCommunicator,
+    pub size: usize,
+    pub rank: usize,
+}
+
+#[cfg(not(feature = "mpi"))]
+pub struct MPIOperator {
     pub size: usize,
     pub rank: usize,
 }
@@ -59,6 +71,7 @@ pub struct MPIData {
 }
 
 impl MPIData {
+    #[cfg(feature = "mpi")]
     pub fn initialization() -> (Option<MPIOperator>,Option<MPIData>) {
         let universe = mpi::initialize().unwrap();
         let world = universe.world();
@@ -84,6 +97,11 @@ impl MPIData {
         } else {
             (None, None)
         }
+    }
+
+    #[cfg(not(feature = "mpi"))]
+    pub fn initialization() -> (Option<MPIOperator>,Option<MPIData>) {
+        (None, None)
     }
 
     pub fn distribute_grids_tasks(&mut self, grids: &Grids) -> Grids {
@@ -269,6 +287,7 @@ pub fn prepare_baspair_map(n_basis: usize) -> (MatrixFull<usize>, Vec<[usize;2]>
     (basbas2baspar, baspar2basbas)
 }
 
+#[cfg(feature = "mpi")]
 pub fn mpi_reduce<Q>(world: &SimpleCommunicator, data: &[Q], root_rank: usize, op: &SystemOperation) -> Vec<Q> 
 where Q: Add<Output=Q> + AddAssign + 
          Sub<Output=Q> + SubAssign + 
@@ -298,6 +317,7 @@ where Q: Add<Output=Q> + AddAssign +
     result
 }
 
+#[cfg(feature = "mpi")]
 pub fn mpi_allreduce<Q>(world: &SimpleCommunicator, data: &[Q], reduced_data: &mut [Q], op: &SystemOperation)
 where Q: Add<Output=Q> + AddAssign + 
          Sub<Output=Q> + SubAssign + 
@@ -319,6 +339,7 @@ where Q: Add<Output=Q> + AddAssign +
 }
 
 
+#[cfg(feature = "mpi")]
 pub fn mpi_broadcast<Q>(world: &SimpleCommunicator, data: &mut Q, root_rank: usize)
 where Q: Send + Sync + Buffer + Debug + BufferMut + 'static,
 {
@@ -331,6 +352,7 @@ where Q: Send + Sync + Buffer + Debug + BufferMut + 'static,
 
 }
 
+#[cfg(feature = "mpi")]
 pub fn mpi_broadcast_vector<Q>(world: &SimpleCommunicator, data: &mut Vec<Q>, root_rank: usize)
 where Q: Zero + Send + Sync + Copy + Buffer + Equivalence + Debug + 'static,
       Vec<Q>: BufferMut
@@ -349,6 +371,7 @@ where Q: Zero + Send + Sync + Copy + Buffer + Equivalence + Debug + 'static,
     }
 }
 
+#[cfg(feature = "mpi")]
 pub fn mpi_broadcast_matrixfull<Q>(world: &SimpleCommunicator, data: &mut MatrixFull<Q>, root_rank: usize)
 where Q: Zero + Send + Sync + Copy + Buffer + Equivalence + Debug + 'static,
       [Q]: BufferMut
@@ -364,6 +387,7 @@ where Q: Zero + Send + Sync + Copy + Buffer + Equivalence + Debug + 'static,
     }
 }
 
+#[cfg(feature = "mpi")]
 pub fn mpi_isend_irecv_wrt_distribution<Q>(
     world: &SimpleCommunicator,
     data: &[Q],
@@ -515,6 +539,7 @@ pub fn communicate_by_batch(num_tasks: usize) -> Vec<Range<usize>> {
     distribute_vec
 }
 
+#[cfg(feature = "mpi")]
 pub fn mpi_isend_irecv_wrt_distribution_v02<Q>(
     world: &SimpleCommunicator,
     data: &[Q],
@@ -588,6 +613,7 @@ where
     result
 }
 
+#[cfg(feature = "mpi")]
 pub fn mpi_isend_irecv_wrt_distribution_v03<Q>(
     world: &SimpleCommunicator,
     outdata: &mut MatrixFull<Q>,

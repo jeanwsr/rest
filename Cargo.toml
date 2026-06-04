@@ -38,13 +38,13 @@ fuzzy-matcher = "0.3.7"
 #ndarray = "0.15.6"
 # for libecpint
 #cxx = "1.0"
-autocxx = "0.26.0"
+#autocxx = "0.30.*"
 #miette = "5.0"
 #katex-doc = "0.1.0"
 #rust_libecpint = {path="../rust_libecpint"}
 # seems to pull in libssl and libcrypto which is rejected by manylinux
 reqwest = { version = "0.10", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-mpi = {version = "0.8.0", features = ["user-operations", "derive"]}
+mpi = {version = "0.8.0", features = ["user-operations", "derive"], optional = true}
 # for cuda
 #cudarc = "0.10.0"
 rest_tensors = {path="../rest_tensors"}
@@ -70,6 +70,7 @@ dunce = "1.0"
 
 [dependencies.pyo3]
 version = "0.24.2"
+features = ["generate-import-lib"]
 
 #[package.metadata.docs.rs]
 #rustdoc-args = [
@@ -82,7 +83,8 @@ version = "0.24.2"
 criterion = "0.4"
 
 [features]
-default = ["dftd3", "dftd4", "geometric-pyo3"]
+default = ["dftd3", "dftd4", "geometric-pyo3", "mpi"]
+mpi = ["dep:mpi"]
 dftd3 = ["dep:dftd3"]
 dftd4 = ["dep:dftd4"]
 geometric-pyo3 = ["dep:geometric-pyo3"]
