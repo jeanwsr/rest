@@ -11,7 +11,7 @@ use crate::external_field::num_dipole::numerical_dipole;
 use crate::geom_io::{GeomUnit, get_mass_charge};
 use num_traits::Pow;
 use pyo3::prelude::*;
-use autocxx::prelude::*;
+//use autocxx::prelude::*;
 use crate::ctrl_io::JobType;
 use crate::constants::{ANG, AU2DEBYE};
 use crate::scf_io::{scf_without_build, SCFType, SCF};
