@@ -1,4 +1,5 @@
 use std::{sync::mpsc::channel, num};
+#[cfg(not(target_os = "windows"))]
 use libc::ITIMER_VIRTUAL;
 use libm::erfc;
 #[cfg(feature = "mpi")]

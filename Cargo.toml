@@ -38,7 +38,7 @@ fuzzy-matcher = "0.3.7"
 #ndarray = "0.15.6"
 # for libecpint
 #cxx = "1.0"
-autocxx = "0.26.0"
+#autocxx = "0.30.*"
 #miette = "5.0"
 #katex-doc = "0.1.0"
 #rust_libecpint = {path="../rust_libecpint"}
@@ -70,6 +70,7 @@ dunce = "1.0"
 
 [dependencies.pyo3]
 version = "0.24.2"
+features = ["generate-import-lib"]
 
 #[package.metadata.docs.rs]
 #rustdoc-args = [
