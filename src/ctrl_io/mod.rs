@@ -328,6 +328,9 @@ pub struct InputKeywords {
     pub j2c_decomp: J2CDecompOption,
     pub ri_pt2: RiPt2Option,
     pub cphf: Option<CPHFParameters>,
+    /// Use the optimized fxc_matvec_opt (rayon + pre-allocated workspace).
+    #[pyo3(get, set)]
+    pub use_fxc_opt: bool,
 }
 
 impl Default for InputKeywords {
@@ -484,6 +487,7 @@ impl InputKeywords {
             ri_pt2: RiPt2Option::default(),
             tddft: None,
             cphf: None,
+            use_fxc_opt: false,
         }
     }
 
