@@ -8,7 +8,7 @@ use array_tool::vec::Intersect;
 use pyo3::{pyclass};
 use rayon::prelude::{IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator};
 use rest_libcint::prelude::*;
-use rest_tensors::{ERIFull,RIFull,ERIFold4,TensorSlice,TensorSliceMut,TensorOpt, MatrixUpper, MatrixFull};
+use rest_tensors::{ERIFull,RIFull,ERIFold4,TensorSlice,TensorSliceMut,TensorOpt, MatrixUpper, MatrixFull, map_upper_to_full};
 use tensors::{BasicMatrix, SubMatrixUpper};
 use tensors::external_libs::{matr_copy_from_ri};
 use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _power_rayon_for_symmetric_matrix};

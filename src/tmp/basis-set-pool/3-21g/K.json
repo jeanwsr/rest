@@ -1,0 +1,122 @@
+{
+    "electron_shells": [
+        {
+            "function_type": "gto",
+            "region": "valence",
+            "angular_momentum": [
+                0
+            ],
+            "exponents": [
+                "0.1721175500E+04",
+                "0.2600163300E+03",
+                "0.5662455400E+02"
+            ],
+            "coefficients": [
+                [
+                    "0.6487469617E-01",
+                    "0.3808592775E+00",
+                    "0.6773680600E+00"
+                ]
+            ]
+        },
+        {
+            "function_type": "gto",
+            "region": "valence",
+            "angular_momentum": [
+                0,
+                1
+            ],
+            "exponents": [
+                "0.7155720000E+02",
+                "0.1543894240E+02",
+                "0.4474551050E+01"
+            ],
+            "coefficients": [
+                [
+                    "-0.1093428919E+00",
+                    "0.1130640319E+00",
+                    "0.9462575025E+00"
+                ],
+                [
+                    "0.1339654251E+00",
+                    "0.5302672723E+00",
+                    "0.5117991842E+00"
+                ]
+            ]
+        },
+        {
+            "function_type": "gto",
+            "region": "valence",
+            "angular_momentum": [
+                0,
+                1
+            ],
+            "exponents": [
+                "0.4121275290E+01",
+                "0.1188620640E+01",
+                "0.3756738350E+00"
+            ],
+            "coefficients": [
+                [
+                    "-0.2699729532E+00",
+                    "0.3646322562E+00",
+                    "0.8107532645E+00"
+                ],
+                [
+                    "0.1994922290E-01",
+                    "0.4340213019E+00",
+                    "0.6453225709E+00"
+                ]
+            ]
+        },
+        {
+            "function_type": "gto",
+            "region": "valence",
+            "angular_momentum": [
+                0,
+                1
+            ],
+            "exponents": [
+                "0.2445765580E+00",
+                "0.3897174940E-01"
+            ],
+            "coefficients": [
+                [
+                    "-0.2688250168E+00",
+                    "0.1128982555E+01"
+                ],
+                [
+                    "0.3081035470E-03",
+                    "0.9998787160E+00"
+                ]
+            ]
+        },
+        {
+            "function_type": "gto",
+            "region": "valence",
+            "angular_momentum": [
+                0,
+                1
+            ],
+            "exponents": [
+                "0.1606254630E-01"
+            ],
+            "coefficients": [
+                [
+                    "0.1000000000E+01"
+                ],
+                [
+                    "0.1000000000E+01"
+                ]
+            ]
+        }
+    ],
+    "references": [
+        {
+            "reference_description": "3-21G Split-valence basis set",
+            "reference_keys": [
+                "dobbs1986a"
+            ]
+        }
+    ]
+}

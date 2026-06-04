@@ -18,6 +18,32 @@ pub fn diagonal_elements_contribution(scf_data:&SCF,vec:&Vec<f64>)->Vec<f64>{
     (0..occ_size).cartesian_product(0..vir_size).for_each(|(i,a)|{prod_vec[i+a*occ_size]=(qp[a+occ_size]-qp[i])*vec[i+a*occ_size]});
     prod_vec
 }
+
+/// Standalone version of diagonal_elements_contribution (no SCF needed).
+pub fn diagonal_contribution_standalone(vec: &Vec<f64>, qp_energies: &Vec<f64>,
+    occ_size: usize, vir_size: usize) -> Vec<f64> {
+    let mut prod_vec = vec![0.0; occ_size * vir_size];
+    (0..occ_size).cartesian_product(0..vir_size).for_each(|(i, a)| {
+        prod_vec[i + a * occ_size] = (qp_energies[a + occ_size] - qp_energies[i]) * vec[i + a * occ_size]
+    });
+    prod_vec
+}
+
+/// Standalone w_contribution_a_block_dgemm — takes explicit occ/vir sizes instead of SCF.
+pub fn w_contribution_a_block_dgemm_standalone(
+    ri_vv: &MatrixFull<f64>, z_vec: &Vec<f64>,
+    ri_oo_tilde: &MatrixFull<f64>, qp_ctrl: &QuasiParticle,
+    occ_size: usize, vir_size: usize) -> Vec<f64> {
+    let num_auxbas = ri_vv.size[0] / ri_vv.size[1];
+    let mut t_tensor = MatrixFull::new([num_auxbas * vir_size, occ_size], 0.0);
+    let z_mat = MatrixFull::from_vec([occ_size, vir_size], z_vec.clone()).unwrap();
+    _dgemm_full(ri_vv, 'N', &z_mat, 'T', &mut t_tensor, 1.0, 0.0);
+    t_tensor = t_tensor.transpose_and_drop();
+    t_tensor.reshape([num_auxbas * occ_size, vir_size]);
+    let mut result_tensor = MatrixFull::new([occ_size, vir_size], 0.0);
+    _dgemm_full(ri_oo_tilde, 'T', &t_tensor, 'N', &mut result_tensor, 1.0, 0.0);
+    result_tensor.data.iter().map(|x| x * qp_ctrl.bse_exchange_rescaling).collect()
+}
 pub fn coulomb_contribution(ri_matrix:&MatrixFull<f64>,vec:&Vec<f64>)->Vec<f64>{
     let mut inter_result=vec![0.0;ri_matrix.size[0]];
     _dgemv(ri_matrix,vec , &mut inter_result, 'N', 1.0, 0.0, 1, 1);

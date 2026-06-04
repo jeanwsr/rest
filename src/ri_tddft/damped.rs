@@ -29,7 +29,7 @@ use crate::ri_bse::damped::{
 };
 use crate::ri_bse::davidson_solver::vector_scaled_add;
 use crate::ri_bse::dipoles;
-use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data};
+use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data, set_fxc_use_optimized};
 use crate::ri_tddft::matvec::{self, a_matvec, b_matvec};
 use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_get_submatrix};
 use crate::scf_io::SCF;
@@ -669,6 +669,9 @@ pub fn damped_tddft(scf: &mut SCF) -> Result<(), String> {
     let xlet = if tddft_ctrl.tddft_spin == "singlet" { 'S' }
                else if tddft_ctrl.tddft_spin == "triplet" { 'T' }
                else { 'R' };
+
+    // Enable optimised (rayon-parallel) fxc kernel if requested
+    set_fxc_use_optimized(tddft_ctrl.tddft_use_optimized_fxc);
 
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) = tddft_occupation_parameters(scf);
     let dim = occ_size * vir_size;

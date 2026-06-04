@@ -882,7 +882,7 @@ pub fn nlfeast_bse(
         let mut q_new = MatrixFull::new([n, m0_eff], 0.0);
 
         for node in contour_nodes {
-            let c_matvec: Box<dyn Fn(&[f64]) -> Vec<f64>> = if tda {
+            let c_matvec: Box<dyn Fn(&[f64]) -> Vec<f64> + Send + Sync> = if tda {
                 Box::new(make_shifted_tda_matvec(
                     scf_data, qp_ctrl, n,
                     ri_vv_reshaped, ri_ov, node,
@@ -1257,3 +1257,410 @@ pub fn nlfeast_bse_main(scf_data: &SCF, qp_ctrl: &QuasiParticle) {
         writeln!(file, "{}", result.eigenvalues[0]).expect("Failed to write");
     }
 }
+
+// ============================================================================
+// NLFEAST v3 — reference-correct algorithm from FEAST_Workspace
+//
+// Algorithm per iteration:
+//   1. Projected solve: for each column j: A(λ_init[j])·Q[:,j]
+//      → M_Q = Q^T·AQ → dgeev → λ_cur, Ritz vectors X
+//   2. Select λ closest to contour centre, truncate to m0
+//   3. Real-axis residual: tx_mat = T(λ_cur)·X
+//   4. Convergence check
+//   5. Contour integration:
+//      GMRES: T(z_j)·U_j = tx_mat   (RHS = current residual)
+//      Q_new += w_j · (X − U_j) · (z_j − λ_cur)⁻¹
+//   6. QR(Q_new) → new Q
+//   7. λ_init = λ_cur
+// ============================================================================
+/*
+use super::dynamicbse_matvec::{
+    dynamical_a_block_matvec_real,
+    dynamical_a_block_matvec_complex,
+    dynamical_composite_matvec_real,
+    dynamical_composite_matvec_complex,
+};
+
+pub fn nlfeast_dynamical_bse_v3(
+    scf_data: &SCF,
+    qp_ctrl: &QuasiParticle,
+    quasiparticle_energies: &Vec<f64>,
+    occ_size: usize,
+    vir_size: usize,
+    ri_ov_response: &MatrixFull<f64>,
+    ri_ov: &MatrixFull<f64>,
+    ri_oo: &MatrixFull<f64>,
+    ri_vv_reshaped: &MatrixFull<f64>,
+    vbar: &MatrixFull<f64>,
+    rpa_omega: &[f64],
+    contour_nodes: &[ContourNodeData],
+    centre: f64,
+    radius: f64,
+    m0: usize,
+    n_quad: usize,
+    max_iter: usize,
+    tol: f64,
+    gmres_restart: usize,
+    gmres_max_it: usize,
+    gmres_tol: f64,
+    tda: bool,
+) -> NLFeastResult {
+    let n = occ_size * vir_size;
+    let num_auxbas = ri_ov_response.size[0];
+    let centre_cplx = Complex::new(centre, 0.0);
+
+    let xlet = if qp_ctrl.bse_spin == "singlet" { 'S' }
+               else if qp_ctrl.bse_spin == "triplet" { 'T' }
+               else { 'R' };
+    let addition = if xlet == 'S' { 2.0 } else if xlet == 'R' { 1.0 } else { 0.0 };
+
+    let mut ri_ov_b = ri_ov.clone();
+    ri_ov_b.reshape([num_auxbas * occ_size, vir_size]);
+    let ri_ov_b_ref = &ri_ov_b;
+
+    // ── Spin factor for Coulomb ──
+    // A = D − W_dyn + (exchange_rescaling + addition)·V
+    // With exchange_rescaling = 0, addition = spin_factor
+    let er = 0.0_f64;
+    let ad = addition;
+
+    // ── QP energy gaps (preconditioner + initial guesses) ──
+    let energy_diag: Vec<f64> = {
+        let energies: Vec<f64> = if qp_ctrl.bse_qp_polarization {
+            quasiparticle_energies.clone()
+        } else { scf_data.eigenvalues[0].clone() };
+        let mut d = Vec::with_capacity(n);
+        for a in 0..vir_size { for i in 0..occ_size { d.push(energies[occ_size + a] - energies[i]); } }
+        d
+    };
+
+    // ── Initial subspace Q: random orthonormal ──
+    let mut rng = rand::thread_rng();
+    let n_init = m0.min(n);
+    let mut q = MatrixFull::new([n, n_init], 0.0);
+    for j in 0..n_init { for i in 0..n { q[[i, j]] = rng.gen::<f64>() * 2.0 - 1.0; } }
+    q = qr_orthonormalise(&q);
+    let mut m0_eff = q.size[1];
+
+    // ── Λ(0) = initial estimates from QP gaps ──
+    let mut lambda: Vec<f64> = {
+        let mut d: Vec<(f64, &f64)> = energy_diag.iter().map(|d| ((d - centre).abs(), d)).collect();
+        d.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        d.iter().take(m0_eff).map(|(_, &d)| d).collect()
+    };
+    while lambda.len() < m0_eff { lambda.push(centre); }
+    let mut prev_lambda: Vec<f64> = Vec::new();
+    let mut residuals = vec![0.0_f64; m0_eff];
+    let mut inside_flags = vec![false; m0_eff];
+
+    // ── Main NLFEAST loop ──
+    for it in 0..max_iter {
+        // ── Step 1: Projected solve ──
+        // For each column j of Q, compute A(λ_init[j])·Q[:,j]
+        // M_Q = Q^T · AQ → dgeev → eigenvalues + Ritz vectors
+        let mq_size = q.size[1];
+        let mut aq = MatrixFull::new([n, mq_size], 0.0);
+        for j in 0..mq_size {
+            let qj: Vec<f64> = (0..n).map(|i| q[[i, j]]).collect();
+            let lam = lambda[j.min(lambda.len().saturating_sub(1))];
+            let result = if tda {
+                dynamical_a_block_matvec_real(
+                    ri_oo, ri_vv_reshaped, ri_ov,
+                    vbar, rpa_omega, quasiparticle_energies,
+                    occ_size, vir_size, er, ad, lam, &qj)
+            } else {
+                let a_x = dynamical_a_block_matvec_real(
+                    ri_oo, ri_vv_reshaped, ri_ov,
+                    vbar, rpa_omega, quasiparticle_energies,
+                    occ_size, vir_size, er, ad, lam, &qj);
+                let b_x = super::matvec::b_block_matvec(
+                    scf_data, qp_ctrl, ri_ov, &ri_ov_b,
+                    &MatrixFull::new([num_auxbas * occ_size, vir_size], 0.0),
+                    &qj.to_vec());
+                let t: Vec<f64> = a_x.iter().zip(b_x.iter()).map(|(a,b)| a-b).collect();
+                let a_t = dynamical_a_block_matvec_real(
+                    ri_oo, ri_vv_reshaped, ri_ov,
+                    vbar, rpa_omega, quasiparticle_energies,
+                    occ_size, vir_size, er, ad, lam, &t);
+                let b_t = super::matvec::b_block_matvec(
+                    scf_data, qp_ctrl, ri_ov, &ri_ov_b,
+                    &MatrixFull::new([num_auxbas * occ_size, vir_size], 0.0),
+                    &t.to_vec());
+                a_t.iter().zip(b_t.iter()).map(|(a,b)| a+b).collect()
+            };
+            for i in 0..n { aq[[i, j]] = result[i]; }
+        }
+
+        // Solve M_Q · y = µ · y  (TDA: µ=λ; non-TDA: λ=√µ)
+        let mq = _dgemm_scaled(&q, 'T', &aq, 'N', 1.0);
+        let (_vr_dummy, wr, wi, _vl, vr, info) = _dgeev(&mq, 'N', 'V');
+        if info != 0 { eprintln!("  Warning: dgeev in projected solve info={}", info); }
+
+        let mut all_lambda = Vec::with_capacity(mq_size);
+        let mut all_x = MatrixFull::new([n, mq_size], 0.0);
+        for j in 0..mq_size {
+            let lam = if tda { wr[j] } else {
+                let mu_re = wr[j]; let mu_im = wi[j];
+                (mu_re * mu_re + mu_im * mu_im).powf(0.25)  // √|µ|
+            };
+            all_lambda.push(Complex::new(lam, 0.0));
+            for i in 0..n {
+                let mut val = 0.0;
+                for k in 0..mq_size { val += q[[i, k]] * vr[[k, j]]; }
+                all_x[[i, j]] = val;
+            }
+        }
+
+        // ── Step 2: Select m0_eff eigenvalues closest to centre ──
+        let mut with_dist: Vec<(f64, usize)> = (0..mq_size)
+            .map(|idx| ((all_lambda[idx] - centre_cplx).norm(), idx)).collect();
+        with_dist.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let n_sel = with_dist.len().min(m0);
+        let mut lambda_cur = Vec::with_capacity(n_sel);
+        let mut x_mat = MatrixFull::new([n, n_sel], 0.0);
+        for (pj, (_, idx)) in with_dist[..n_sel].iter().enumerate() {
+            lambda_cur.push(all_lambda[*idx].re);
+            for i in 0..n { x_mat[[i, pj]] = all_x[[i, *idx]]; }
+        }
+        let m0_eff = n_sel;
+
+        if it == 0 {
+            eprint!("  v3 initial λ:");
+            for j in 0..m0_eff.min(8) { eprint!(" {:.4}", lambda_cur[j]); }
+            eprintln!();
+        }
+
+        // ── Step 3: Compute residuals T(λ)·x on the real axis ──
+        let mut max_res = 0.0_f64;
+        let mut n_inside = 0;
+        let mut n_inside_converged = 0;
+        let mut residuals = vec![0.0_f64; m0_eff];
+        let mut inside_flags = vec![false; m0_eff];
+        let mut tx_mat = MatrixFull::new([n, m0_eff], 0.0);
+
+        for j in 0..m0_eff {
+            let lam = lambda_cur[j];
+            let xj: Vec<f64> = (0..n).map(|i| x_mat[[i, j]]).collect();
+            let txj = if tda {
+                let a_x = dynamical_a_block_matvec_real(
+                    ri_oo, ri_vv_reshaped, ri_ov,
+                    vbar, rpa_omega, quasiparticle_energies,
+                    occ_size, vir_size, er, ad, lam, &xj);
+                a_x.iter().zip(xj.iter()).map(|(a, &xi)| a - lam * xi).collect()
+            } else {
+                dynamical_composite_matvec_real(
+                    scf_data, qp_ctrl,
+                    ri_oo, ri_vv_reshaped, ri_ov, &ri_ov_b,
+                    &MatrixFull::new([num_auxbas * occ_size, vir_size], 0.0),
+                    vbar, rpa_omega, quasiparticle_energies,
+                    occ_size, vir_size, er, ad, lam, &xj)
+            };
+            let res: f64 = txj.iter().map(|v| v*v).sum::<f64>().sqrt();
+            residuals[j] = res;
+            if res > max_res { max_res = res; }
+            let inside = (Complex::new(lam, 0.0) - centre_cplx).norm() <= radius;
+            inside_flags[j] = inside;
+            if inside { n_inside += 1; if res <= tol { n_inside_converged += 1; } }
+            for i in 0..n { tx_mat[[i, j]] = txj[i]; }
+        }
+
+        eprintln!("  v3[{}]: max_res={:.2e} inside {}/{}  λ≈{:.4}..{:.4}",
+            it+1, max_res, n_inside_converged, n_inside,
+            lambda_cur.iter().cloned().fold(1e30_f64, f64::min),
+            lambda_cur.iter().cloned().fold(-1e30_f64, f64::max));
+
+        // ── Step 4: Convergence check ──
+        if n_inside > 0 && n_inside_converged == n_inside {
+            eprintln!("  → All interior eigenvalues converged.");
+            let mut result = build_final_result(n, &lambda_cur, &x_mat, &residuals, &inside_flags, centre, radius);
+            result.iterations = it + 1;
+            return result;
+        }
+
+        // Stagnation
+        let improved = if prev_lambda.len() == lambda_cur.len() {
+            let mut d = 0.0;
+            for j in 0..lambda_cur.len() { d += (lambda_cur[j] - prev_lambda[j]).abs(); }
+            d / lambda_cur.len() as f64
+        } else { 1.0 };
+        prev_lambda = lambda_cur.clone();
+        if it > 3 && improved < 1e-12 && n_inside > 0 {
+            eprintln!("  → Eigenvalues stabilised (Δλ≈{:.2e}).", improved);
+            let mut result = build_final_result(n, &lambda_cur, &x_mat, &residuals, &inside_flags, centre, radius);
+            result.iterations = it + 1;
+            return result;
+        }
+
+        // ── Step 5: Contour integration ──
+        let q_new_contribs: Vec<MatrixFull<f64>> = contour_nodes
+            .par_iter()
+            .map(|node| {
+                let z = Complex::new(node.z_re, node.z_im);
+                let c_matvec: Box<dyn Fn(&[f64]) -> Vec<f64> + Send + Sync> = if tda {
+                    use super::dynamicbse_matvec::dynamical_a_block_matvec_complex;
+                    let zr = node.z_re; let zi = node.z_im;
+                    let rr = ri_oo; let rv = ri_vv_reshaped; let ro = ri_ov;
+                    let vb = vbar; let rp = rpa_omega; let qp = quasiparticle_energies;
+                    let (oc, vs, er2, ad2) = (occ_size, vir_size, er, ad);
+                    Box::new(move |v: &[f64]| -> Vec<f64> {
+                        let n2 = oc * vs;
+                        let vr = &v[0..n2]; let vi = &v[n2..2*n2];
+                        let (a_re, a_im) = dynamical_a_block_matvec_complex(
+                            rr, rv, ro, vb, rp, qp, oc, vs, er2, ad2,
+                            Complex::new(zr, zi), vr, vi);
+                        let mut out = vec![0.0; 2*n2];
+                        for i in 0..n2 { out[i] = a_re[i] - zr*vr[i] + zi*vi[i]; out[n2+i] = a_im[i] - zr*vi[i] - zi*vr[i]; }
+                        out
+                    })
+                } else {
+                    Box::new(move |v: &[f64]| -> Vec<f64> {
+                        let n2 = occ_size * vir_size;
+                        let vr = &v[0..n2]; let vi = &v[n2..2*n2];
+                        let (t_re, t_im) = dynamical_composite_matvec_complex(
+                            scf_data, qp_ctrl,
+                            ri_oo, ri_vv_reshaped, ri_ov, ri_ov_b_ref,
+                            &node.ri_ov_tilde_re, &node.ri_ov_tilde_im,
+                            vbar, rpa_omega, quasiparticle_energies,
+                            occ_size, vir_size, er, ad, vr, vi, z);
+                        let mut out = vec![0.0; 2*n2];
+                        for i in 0..n2 { out[i] = t_re[i]; out[n2+i] = t_im[i]; }
+                        out
+                    })
+                };
+
+                // Preconditioner
+                let mut re_part = Vec::with_capacity(n);
+                let mut im_part = Vec::with_capacity(n);
+                for d in &energy_diag {
+                    if tda { re_part.push(d - z.re); im_part.push(-z.im); }
+                    else { let d2 = d*d; re_part.push(d2 - z.re*z.re + z.im*z.im); im_part.push(-2.0*z.re*z.im); }
+                }
+                let precond = BlockDiagPrecond::from_re_im(&re_part, &im_part);
+
+                // Solve T(z_j)·U_j = T(Λ)·X for each column
+                let mut u_re = vec![0.0_f64; n * m0_eff];
+                let mut u_im = vec![0.0_f64; n * m0_eff];
+                for col in 0..m0_eff {
+                    let mut b_2n = vec![0.0; 2 * n];
+                    for i in 0..n { b_2n[i] = tx_mat[[i, col]]; }
+                    let x_2n = gmres(&c_matvec, &b_2n, gmres_restart, gmres_max_it,
+                                     gmres_tol, col == 0, Some(&precond));
+                    for i in 0..n { u_re[col*n+i] = x_2n[i]; u_im[col*n+i] = x_2n[n+i]; }
+                }
+
+                // Accumulate: Q_new += w_j · (X − U_j) · (z_j I − Λ)⁻¹
+                let mut q_node = MatrixFull::new([n, m0_eff], 0.0);
+                for col in 0..m0_eff {
+                    let lam = lambda_cur[col];
+                    let dz_re = z.re - lam;
+                    let denom = dz_re*dz_re + z.im*z.im;
+                    if denom < 1e-30 { continue; }
+                    let inv_re = dz_re / denom;
+                    let inv_im = -z.im / denom;
+                    let f_re = node.w_re * inv_re - node.w_im * inv_im;
+                    let f_im = node.w_re * inv_im + node.w_im * inv_re;
+                    for i in 0..n {
+                        let dx_re = x_mat[[i, col]] - u_re[col*n+i];
+                        let dx_im = -u_im[col*n+i];
+                        q_node[[i, col]] += f_re * dx_re - f_im * dx_im;
+                    }
+                }
+                q_node
+            })
+            .collect();
+
+        let mut q_new = MatrixFull::new([n, m0_eff], 0.0);
+        for contrib in &q_new_contribs {
+            for j in 0..m0_eff { for i in 0..n { q_new[[i, j]] += contrib[[i, j]]; } }
+        }
+
+        // ── Step 6: QR → new subspace Q ──
+        q = qr_orthonormalise(&q_new);
+        if q.size[1] < m0_eff / 2 {
+            eprintln!("  Warning: subspace collapsed, stopping.");
+            break;
+        }
+
+        // ── Step 7: λ_init = λ_cur for next iteration ──
+        lambda = lambda_cur;
+        lambda.truncate(q.size[1]);  // match subspace after QR
+    }
+
+    eprintln!("  v3: max iterations reached, returning best results.");
+    let mut result = build_final_result(n, &lambda, &q, &residuals, &inside_flags, centre, radius);
+    result.iterations = max_iter;
+    result
+}
+
+pub fn nlfeast_dynamical_bse_main(scf_data: &SCF, qp_ctrl: &QuasiParticle) {
+    use super::dynamicbse_matvec::precompute_rpa_data;
+
+    let start = Instant::now();
+    let (_start_mo, _num_state, occ_size, vir_size, _homo, _lumo) =
+        get_occupation_parameters(scf_data, 'N');
+    let n = occ_size * vir_size;
+    let quasiparticle_energies = scf_data.gwqp.0.clone();
+    let num_auxbas = super::get_submatrix(scf_data, 'O', 'V', 'N').size[0];
+
+    println!("==============================================");
+    println!("  NLFEAST v3 — reference-correct algorithm");
+    println!("==============================================");
+    println!("  occ={} vir={} n={} naux={}", occ_size, vir_size, n, num_auxbas);
+    if qp_ctrl.bse_tda { println!("  Method: TDA"); }
+    else { println!("  Method: non-TDA (static B-block)"); }
+
+    let ri_ov_response = super::get_submatrix(scf_data, 'O', 'V', 'Y');
+    let ri_oo = super::get_submatrix(scf_data, 'O', 'O', 'N');
+    let mut ri_vv = super::get_submatrix(scf_data, 'V', 'V', 'N');
+    ri_vv.reshape([num_auxbas * vir_size, vir_size]);
+    let ri_ov = super::get_submatrix(scf_data, 'O', 'V', 'N');
+
+    eprintln!("  Precomputing RPA data...");
+    let rpa_data = precompute_rpa_data(
+        &quasiparticle_energies, occ_size, vir_size, &ri_ov_response,
+    );
+    eprintln!("    n_rpa = {}", rpa_data.rpa_omega.len());
+
+    let centre = qp_ctrl.nlfeast_centre;
+    let radius = qp_ctrl.nlfeast_radius;
+    let n_quad = qp_ctrl.nlfeast_n_quad;
+    let m0 = qp_ctrl.nlfeast_m0;
+
+    let contour_nodes = prepare_contour_nodes(
+        &quasiparticle_energies, occ_size, vir_size,
+        &ri_ov_response, &ri_oo, &ri_ov,
+        centre, radius, n_quad,
+    );
+
+    let result = nlfeast_dynamical_bse_v3(
+        scf_data, qp_ctrl, &quasiparticle_energies,
+        occ_size, vir_size,
+        &ri_ov_response, &ri_ov, &ri_oo, &ri_vv,
+        &rpa_data.vbar, &rpa_data.rpa_omega,
+        &contour_nodes,
+        centre, radius, m0, n_quad,
+        qp_ctrl.nlfeast_max_iter,
+        qp_ctrl.nlfeast_tol,
+        qp_ctrl.nlfeast_gmres_restart,
+        qp_ctrl.nlfeast_gmres_max_it,
+        qp_ctrl.nlfeast_gmres_tol,
+        qp_ctrl.bse_tda,
+    );
+
+    let total_time = start.elapsed();
+    println!("  NLFEASTv3 total time: {:?}", total_time);
+    println!("  Outer iterations: {}", result.iterations);
+    if result.n_found == 0 {
+        println!("  No eigenvalues found inside the contour.");
+        return;
+    }
+    println!("\n  Found {} excitation(s) inside [{:.4}, {:.4}]:\n",
+        result.n_found, centre - radius, centre + radius);
+    println!("  #       Excitation energy (eV)    ‖T(λ)x‖");
+    println!("  ───     ─────────────────────    ──────────");
+    for k in 0..result.n_found {
+        let lam_ev = result.eigenvalues[k] * 27.2114;
+        println!("  {:>3}     {:>12.6} eV             {:>9.2e}", k, lam_ev, result.residuals[k]);
+    }
+}
+*/

@@ -68,6 +68,7 @@ pub mod external_libs;
 pub mod external_field;
 pub mod mpi_io;
 pub mod grad;
+pub mod hessian;
 pub mod post_scf_analysis;
 pub mod main_driver;
 pub mod ri_jk;
@@ -78,6 +79,7 @@ pub mod ri_bse;
 pub mod solvent;
 pub mod ri_tddft;
 pub mod ri_cphf;
+pub mod lib_rint;
 
 //extern crate rest;
 
