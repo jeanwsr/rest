@@ -1,12 +1,16 @@
 use std::{sync::mpsc::channel, num};
 use libc::ITIMER_VIRTUAL;
 use libm::erfc;
+#[cfg(feature = "mpi")]
 use mpi::collective::SystemOperation;
 use num_traits::abs;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use tensors::{MatrixFull,matrix_blas_lapack::_dgemm, TensorOpt, BasicMatrix};
 
-use crate::{mpi_io::{mpi_broadcast, mpi_broadcast_matrixfull, mpi_broadcast_vector, mpi_reduce, MPIData,MPIOperator}, utilities};
+use crate::mpi_io::{MPIData, MPIOperator};
+#[cfg(feature = "mpi")]
+use crate::mpi_io::{mpi_broadcast, mpi_broadcast_matrixfull, mpi_broadcast_vector, mpi_reduce};
+use crate::utilities;
 use crate::scf_io::SCFType;
 
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
@@ -822,6 +826,7 @@ pub fn iterator_open_shell_eij_serial(
 
 pub fn close_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF,mpi_operator:&Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
 
+    #[cfg(feature = "mpi")]
     if let (Some(mpi_op), Some(mpi_ix)) = (mpi_operator, &scf_data.mol.mpi_data) {
 
         // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
@@ -1018,6 +1023,11 @@ pub fn close_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF,mpi_operator:&O
         let (pt2, eij) = close_shell_sbge2_detailed_rayon(scf_data).unwrap();
         Ok(pt2)
     }
+    #[cfg(not(feature = "mpi"))]
+    {
+        let (pt2, eij) = close_shell_sbge2_detailed_rayon(scf_data).unwrap();
+        Ok(pt2)
+    }
 
 }
 
@@ -1046,6 +1056,7 @@ pub fn iterator_close_shell_eij_rayon_mpi(
     //println!("Electron-pair coupling iterations start for sBGE2:");
     //println!("Input Eij[ss]: {:16.8}, Eij[os]: {:16.8}", init_eij_ss,init_eij_os);
     while ! (abs(delta_eij[1])<threshold_eij || num_iter >= max_iteration) {
+        #[cfg(feature = "mpi")]
         if let Some(mpi_op) = &mpi_operator {
             (eij_ss, eij_os) = close_shell_eij_rayon_mpi(
                 eri_virt, 
@@ -1060,7 +1071,8 @@ pub fn iterator_close_shell_eij_rayon_mpi(
                 num_state,
                 mpi_data,
                 mpi_operator);
-        } else {
+        } else
+        {
             (eij_ss, eij_os) = close_shell_eij_serial(
                 eri_virt, 
                 denominator, 
@@ -1073,6 +1085,18 @@ pub fn iterator_close_shell_eij_rayon_mpi(
                 lumo_min, 
                 num_state);
         }
+        #[cfg(not(feature = "mpi"))]
+        { (eij_ss, eij_os) = close_shell_eij_serial(
+                eri_virt, 
+                denominator, 
+                previous_eij_ss, 
+                previous_eij_os, 
+                enhanced_factor, 
+                screening_factor, 
+                shifted_factor, 
+                lumo, 
+                lumo_min, 
+                num_state); }
         delta_eij[0] = delta_eij[1];
         delta_eij[1] = (eij_ss-previous_eij_ss)+(eij_os-previous_eij_os);
         if delta_eij[0]*delta_eij[1]<0.0 {
@@ -1103,6 +1127,7 @@ pub fn close_shell_eij_rayon_mpi(
     mpi_data: &Option<MPIData>,
     mpi_operator:&Option<MPIOperator>) -> (f64,f64)
 {
+    #[cfg(feature = "mpi")]
     if let (Some(mpi_op), Some(mpi_ix)) = (mpi_operator, mpi_data) {
         let my_rank = mpi_ix.rank;
         let size = mpi_ix.size;
@@ -1189,10 +1214,13 @@ pub fn close_shell_eij_rayon_mpi(
     } else {
         close_shell_eij_serial(eri_virt, denominator, previous_eij_ss, previous_eij_os, enhanced_factor, screening_factor, shifted_factor, lumo, lumo_min, num_state)
     }
+    #[cfg(not(feature = "mpi"))]
+    { close_shell_eij_serial(eri_virt, denominator, previous_eij_ss, previous_eij_os, enhanced_factor, screening_factor, shifted_factor, lumo, lumo_min, num_state) }
 
 } 
 
 pub fn open_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF, mpi_operator:&Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
+    #[cfg(feature = "mpi")]
     if let (Some(mpi_op), Some(mpi_ix)) = (mpi_operator, &scf_data.mol.mpi_data) {
 
         let my_rank = mpi_ix.rank;
@@ -1519,6 +1547,11 @@ pub fn open_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF, mpi_operator:&O
         let ([e_bge2_tot, e_bge2_os,e_bge2_ss],_) = open_shell_sbge2_detailed_rayon(scf_data).unwrap();
         Ok([e_bge2_ss+e_bge2_os,e_bge2_os,e_bge2_ss])
     }
+    #[cfg(not(feature = "mpi"))]
+    {
+        let ([e_bge2_tot, e_bge2_os,e_bge2_ss],_) = open_shell_sbge2_detailed_rayon(scf_data).unwrap();
+        Ok([e_bge2_ss+e_bge2_os,e_bge2_os,e_bge2_ss])
+    }
 }
 
 pub fn iterator_open_shell_eij_rayon_mpi(
@@ -1549,6 +1582,7 @@ pub fn iterator_open_shell_eij_rayon_mpi(
     //println!("Input Eij[ss]: {:16.8}, Eij[os]: {:16.8}", init_eij_ss,init_eij_os);
 
     while ! (abs(delta_eij[1])<threshold_eij || num_iter >= max_iteration) {
+        #[cfg(feature = "mpi")]
         if let Some(mpi_op) = &mpi_operator {
             (eij_ss, eij_os) = open_shell_eij_rayon_mpi(
                 eri_virt, 
@@ -1563,7 +1597,8 @@ pub fn iterator_open_shell_eij_rayon_mpi(
                 is_same_spin,
                 lumo_min, num_state,
                 mpi_data, mpi_operator);
-        } else {
+        } else
+        {
             (eij_ss, eij_os) = open_shell_eij_serial(
                 eri_virt, 
                 denominator, 
@@ -1577,6 +1612,19 @@ pub fn iterator_open_shell_eij_rayon_mpi(
                 is_same_spin,
                 lumo_min, num_state);
         }
+        #[cfg(not(feature = "mpi"))]
+        { (eij_ss, eij_os) = open_shell_eij_serial(
+                eri_virt, 
+                denominator, 
+                previous_eij_ss, 
+                previous_eij_os, 
+                enhanced_factor, 
+                screening_factor, 
+                shifted_factor, 
+                lumo_i, 
+                lumo_j,
+                is_same_spin,
+                lumo_min, num_state); }
         delta_eij[0] = delta_eij[1];
         delta_eij[1] = (eij_ss-previous_eij_ss)+(eij_os-previous_eij_os);
         if delta_eij[0]*delta_eij[1]<0.0 {
@@ -1610,6 +1658,7 @@ pub fn open_shell_eij_rayon_mpi(
 ) -> (f64,f64)
 {
     //let mut tmp_energy = 0.0f64;
+    #[cfg(feature = "mpi")]
     if let (Some(mpi_op), Some(mpi_ix)) = (mpi_operator, mpi_data) {
         let my_rank = mpi_ix.rank;
         let size = mpi_ix.size;
@@ -1743,4 +1792,6 @@ pub fn open_shell_eij_rayon_mpi(
     } else {
         open_shell_eij_serial(eri_virt, denominator, previous_eij_ss, previous_eij_os, enhanced_factor, screening_factor, shifted_factor, lumo_i, lumo_j, is_same_spin, lumo_min, num_state)
     }
+    #[cfg(not(feature = "mpi"))]
+    { open_shell_eij_serial(eri_virt, denominator, previous_eij_ss, previous_eij_os, enhanced_factor, screening_factor, shifted_factor, lumo_i, lumo_j, is_same_spin, lumo_min, num_state) }
 } 
