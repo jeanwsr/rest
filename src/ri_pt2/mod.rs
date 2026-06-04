@@ -2,7 +2,9 @@ use std::num;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::mpsc::channel;
+#[cfg(feature = "mpi")]
 use mpi::collective::SystemOperation;
+#[cfg(feature = "mpi")]
 use crate::mpi_io::{mpi_allreduce, mpi_broadcast, mpi_broadcast_vector};
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, IntoParallelRefIterator};
 use rayon::slice::ParallelSlice;
@@ -19,7 +21,9 @@ use crate::scf_io::{determine_ri3mo_size_for_pt2_and_rpa, scf};
 use crate::molecule_io::Molecule;
 use crate::scf_io::{SCF, SCFType};
 use crate::utilities::{TimeRecords, self};
-use crate::mpi_io::{self, mpi_reduce, MPIOperator};
+use crate::mpi_io::MPIOperator;
+#[cfg(feature = "mpi")]
+use crate::mpi_io::{self, mpi_reduce};
 use crate::post_scf_analysis::{split_indices_by_spin_occ, format_indices};
 
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
@@ -740,6 +744,8 @@ pub fn open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
 
 pub fn open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
 
+    #[cfg(feature = "mpi")]
+    {
     let print_level = scf_data.mol.ctrl.print_level;
 
     if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data) {
@@ -1008,11 +1014,14 @@ pub fn open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperato
     } else {
         open_shell_pt2_rayon(scf_data)
     }
+    }
+    #[cfg(not(feature = "mpi"))]
+    { open_shell_pt2_rayon(scf_data) }
 
 }
 
-
 pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
+    #[cfg(feature = "mpi")]
     if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data) {
         // In this subroutine, we call the lapack dgemm in a rayon parallel environment.
         // In order to ensure the efficiency, we disable the openmp ability and re-open it in the end of subroutien
@@ -1159,6 +1168,8 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
     } else {
         close_shell_pt2_rayon(scf_data)
     }
+    #[cfg(not(feature = "mpi"))]
+    { close_shell_pt2_rayon(scf_data) }
         
 }
 
@@ -1405,6 +1416,8 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
 }
 
 fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
+    #[cfg(feature = "mpi")]
+    {
     let print_level = scf_data.mol.ctrl.print_level;
     
     if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data) {
@@ -1672,5 +1685,7 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
     } else {
         restricted_open_shell_pt2_rayon(scf_data)
     }
-
+    }
+    #[cfg(not(feature = "mpi"))]
+    { restricted_open_shell_pt2_rayon(scf_data) }
 }
