@@ -26,6 +26,21 @@ pub struct TDDFTParameters {
     pub damped_tddft_z_end: f64,
     pub damped_tddft_z_points: usize,
     pub damped_tddft_grids: Vec<[f64; 3]>,
+    // FEAST solver controls
+    pub tddft_feast_solver: bool,
+    pub tddft_feast_eigenrange_min: f64,
+    pub tddft_feast_eigenrange_max: f64,
+    pub tddft_feast_m_expected: usize,
+    pub tddft_feast_max_iter: usize,
+    pub tddft_feast_tol: f64,
+    pub tddft_feast_gmres_restart: usize,
+    pub tddft_feast_gmres_max_iter: usize,
+    pub tddft_feast_cg_max_iter: usize,
+    pub tddft_feast_cg_tol: f64,
+    pub tddft_feast_init_guess_type: String,
+    pub tddft_feast_gaussian_width_factor: f64,
+    // Use optimized (rayon-parallel) fxc_matvec kernel
+    pub tddft_use_optimized_fxc: bool,
 }
 
 impl Default for TDDFTParameters {
@@ -53,6 +68,19 @@ impl Default for TDDFTParameters {
             damped_tddft_z_end: 1.0,
             damped_tddft_z_points: 2,
             damped_tddft_grids: Vec::new(),
+            tddft_feast_solver: false,
+            tddft_feast_eigenrange_min: 0.0,
+            tddft_feast_eigenrange_max: 0.5,
+            tddft_feast_m_expected: 20,
+            tddft_feast_max_iter: 30,
+            tddft_feast_tol: 1.0e-8,
+            tddft_feast_gmres_restart: 200,
+            tddft_feast_gmres_max_iter: 500,
+            tddft_feast_cg_max_iter: 100,
+            tddft_feast_cg_tol: 1.0e-8,
+            tddft_feast_init_guess_type: String::from("random"),
+            tddft_feast_gaussian_width_factor: 0.5,
+            tddft_use_optimized_fxc: true,
         }
     }
 }
@@ -169,6 +197,60 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
                 }
             }
             p.damped_tddft_grids = grids;
+            // FEAST solver parameters
+            p.tddft_feast_solver = match tmp_ctrl.get("tddft_feast_solver").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
+            };
+            p.tddft_feast_eigenrange_min = match tmp_ctrl.get("tddft_feast_eigenrange_min").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            p.tddft_feast_eigenrange_max = match tmp_ctrl.get("tddft_feast_eigenrange_max").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.5),
+                _ => 0.5,
+            };
+            p.tddft_feast_m_expected = match tmp_ctrl.get("tddft_feast_m_expected").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(20) as usize,
+                _ => 20,
+            };
+            p.tddft_feast_max_iter = match tmp_ctrl.get("tddft_feast_max_iter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(30) as usize,
+                _ => 30,
+            };
+            p.tddft_feast_tol = match tmp_ctrl.get("tddft_feast_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-8),
+                _ => 1.0e-8,
+            };
+            p.tddft_feast_gmres_restart = match tmp_ctrl.get("tddft_feast_gmres_restart").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(200) as usize,
+                _ => 200,
+            };
+            p.tddft_feast_gmres_max_iter = match tmp_ctrl.get("tddft_feast_gmres_max_iter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(500) as usize,
+                _ => 500,
+            };
+            p.tddft_feast_cg_max_iter = match tmp_ctrl.get("tddft_feast_cg_max_iter").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(100) as usize,
+                _ => 100,
+            };
+            p.tddft_feast_cg_tol = match tmp_ctrl.get("tddft_feast_cg_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-8),
+                _ => 1.0e-8,
+            };
+            p.tddft_feast_init_guess_type = match tmp_ctrl.get("tddft_feast_init_guess_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("random"),
+            };
+            p.tddft_feast_gaussian_width_factor = match tmp_ctrl.get("tddft_feast_gaussian_width_factor").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.5),
+                _ => 0.5,
+            };
+            // Optimized fxc_matvec kernel
+            p.tddft_use_optimized_fxc = match tmp_ctrl.get("tddft_use_optimized_fxc").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => true,
+            };
             Ok(Some(p))
         },
         _ => Ok(None),

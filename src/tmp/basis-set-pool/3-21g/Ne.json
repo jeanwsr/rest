@@ -1,0 +1,78 @@
+{
+    "electron_shells": [
+        {
+            "function_type": "gto",
+            "region": "valence",
+            "angular_momentum": [
+                0
+            ],
+            "exponents": [
+                "0.5157240000E+03",
+                "0.7765380000E+02",
+                "0.1681360000E+02"
+            ],
+            "coefficients": [
+                [
+                    "0.5814303044E-01",
+                    "0.3479511822E+00",
+                    "0.7107143721E+00"
+                ]
+            ]
+        },
+        {
+            "function_type": "gto",
+            "region": "valence",
+            "angular_momentum": [
+                0,
+                1
+            ],
+            "exponents": [
+                "0.1248300000E+02",
+                "0.2664510000E+01"
+            ],
+            "coefficients": [
+                [
+                    "-0.4099223208E+00",
+                    "0.1224310958E+01"
+                ],
+                [
+                    "0.2474599836E+00",
+                    "0.8517429435E+00"
+                ]
+            ]
+        },
+        {
+            "function_type": "gto",
+            "region": "valence",
+            "angular_momentum": [
+                0,
+                1
+            ],
+            "exponents": [
+                "0.6062500000E+00"
+            ],
+            "coefficients": [
+                [
+                    "0.1000000000E+01"
+                ],
+                [
+                    "0.1000000000E+01"
+                ]
+            ]
+        }
+    ],
+    "references": [
+        {
+            "reference_description": "3-21G Split-valence basis set",
+            "reference_keys": [
+                "binkley1980a"
+            ]
+        },
+        {
+            "reference_description": "6-21G Split-valence basis set",
+            "reference_keys": [
+                "binkley1980a"
+            ]
+        }
+    ]
+}

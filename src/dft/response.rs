@@ -10,7 +10,7 @@
 use rest_tensors::{MatrixFull, MatrixUpper};
 use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
 use crate::scf_io::SCF;
-use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data, fxc_matvec};
+use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data, fxc_matvec, fxc_matvec_old};
 
 /// Precomputed workspace for gen_vind: caches C_occ, C_vir slices.
 pub struct VindWorkspace {
@@ -110,10 +110,11 @@ pub fn gen_vind_opt(
     let k_full = compute_k_upper(scf, &dm_vec).to_matrixfull()
         .unwrap_or_else(|| panic!("K to_matrixfull failed"));
 
-    // ── Step 3: v_ao = J - 0.5*K ──
+    // ── Step 3: v_ao = J - hyb*K ──
+    let hyb = scf.mol.xc_data.dfa_hybrid_scf;
     let mut v_ao = MatrixFull::new([nao, nao], 0.0);
     for i in 0..nao { for j in 0..nao {
-        v_ao[[i, j]] = j_full[[i, j]] - 0.5 * k_full[[i, j]];
+        v_ao[[i, j]] = j_full[[i, j]] - hyb * k_full[[i, j]];
     }}
 
     // ── Step 4: fxc contribution ──
@@ -156,8 +157,8 @@ pub fn verify_fxc_matvec(scf: &SCF) -> Result<(), String> {
     let mut z_test = vec![0.0; dim];
     for i in 0..dim { z_test[i] = ((i * 7 + 13) as f64).sin() * 0.1; }
 
-    // fxc_matvec only
-    let fxc_only = fxc_data.as_ref().map(|f| fxc_matvec(f, &z_test))
+    // fxc_matvec only (use old version for deterministic verification)
+    let fxc_only = fxc_data.as_ref().map(|f| fxc_matvec_old(f, &z_test))
         .unwrap_or_else(|| vec![0.0; dim]);
 
     let ws = VindWorkspace::new(scf, occ_size, vir_size, start_mo, lumo);
