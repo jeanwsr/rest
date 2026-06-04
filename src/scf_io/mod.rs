@@ -5174,6 +5174,19 @@ impl ScfTraceRecord {
                 }
         }
     }
+
+    pub fn refresh(&mut self) {
+        self.energy_records.clear();
+        self.prev_hamiltonian = vec![[MatrixUpper::empty(), MatrixUpper::empty()]];
+        self.eigenvectors = [MatrixFull::new([1, 1], 0.0), MatrixFull::new([1, 1], 0.0)];
+        self.eigenvalues = [Vec::<f64>::new(), Vec::<f64>::new()];
+        self.density_matrix = [
+            vec![MatrixFull::new([1, 1], 0.0), MatrixFull::new([1, 1], 0.0)],
+            vec![MatrixFull::new([1, 1], 0.0), MatrixFull::new([1, 1], 0.0)],
+        ];
+        self.target_vector = Vec::<[MatrixFull<f64>; 2]>::new();
+        self.error_vector = Vec::<Vec::<f64>>::new();
+    }
 }
 
 pub fn generate_diis_error_vector(hamiltonian: &[MatrixUpper<f64>;2], 
@@ -5908,6 +5921,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         if scf_data.mol.ctrl.guess_mix && !guess_mix_applied && (scf_records.num_iter as usize) == scf_data.mol.ctrl.start_mix_cycle {
             println!(">>> guess_mix activated at SCF iteration {}.", scf_records.num_iter);
             apply_guess_mix(scf_data);
+            scf_records.refresh();
             guess_mix_applied = true;
         }
 
@@ -5953,6 +5967,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
 
             // apply mixing and mark as applied
             apply_guess_mix(scf_data);
+            scf_records.refresh();
             guess_mix_applied = true;
 
             // rebuild dependent quantities so subsequent SCF iterations are consistent
