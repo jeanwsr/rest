@@ -8271,7 +8271,7 @@ fn build_fitted_ri3fn_from_shell_blocks(
 fn for_each_fitted_ri3fn_shell_block_rayon_kept_range<F>(
     ao_shells: &[RintShell],
     aux_shells: &[RintShell],
-    num_auxbas: usize,
+    _num_auxbas: usize,
     kernel: RiShellBlockKernel,
     metric_factor: &MatrixFull<f64>,
     kept_start: usize,
@@ -8426,13 +8426,9 @@ fn for_each_fitted_ri3fn_shell_block_rayon_kept_range<F>(
                     Vec<(usize, usize)>,
                 > = HashMap::new();
                 let mut block_buffer = MatrixFull::empty();
-                let metric_factor_columns =
-                    metric_factor.to_matrixfullslice_columns(kept_start..kept_start + kept_len);
-                let metric_factor_view = MatrixFullSlice {
-                    size: &metric_factor_columns.size,
-                    indicing: &metric_factor_columns.indicing,
-                    data: metric_factor_columns.data,
-                };
+                let mut raw_compact = MatrixFull::empty();
+                let mut metric_compact = MatrixFull::empty();
+                let mut fit_delta = MatrixFull::empty();
                 loop {
                     let task_idx = next_right_shell_task.fetch_add(1, Ordering::Relaxed);
                     if task_idx >= grouped_tasks.len() {
@@ -8447,7 +8443,7 @@ fn for_each_fitted_ri3fn_shell_block_rayon_kept_range<F>(
                         let global_pair_start = right_start * (right_start + 1) / 2;
                         let global_pair_end = right_end * (right_end + 1) / 2;
                         let pair_len = global_pair_end - global_pair_start;
-                        let mut local_raw = MatrixFull::new([pair_len, num_auxbas], 0.0_f64);
+                        let mut local_fitted = MatrixFull::new([pair_len, kept_len], 0.0_f64);
 
                         for left_shell in ao_shells.iter() {
                             if left_shell.ao_start >= right_end {
@@ -8512,25 +8508,21 @@ fn for_each_fitted_ri3fn_shell_block_rayon_kept_range<F>(
                                     entries,
                                     &mut block_buffer,
                                 );
-                                for aux_loc in 0..aux_shell.ao_len {
-                                    let aux = aux_shell.ao_start + aux_loc;
-                                    for (block_row, local_pair) in pair_index_map.iter().copied() {
-                                        local_raw[(local_pair, aux)] =
-                                            block_buffer[(block_row, aux_loc)];
-                                    }
-                                }
+                                r2_accumulate_streamed_fitted_aux_shell_block(
+                                    &block_buffer,
+                                    pair_index_map,
+                                    aux_shell,
+                                    metric_factor,
+                                    kept_start,
+                                    kept_len,
+                                    &mut local_fitted,
+                                    &mut raw_compact,
+                                    &mut metric_compact,
+                                    &mut fit_delta,
+                                );
                             }
                         }
 
-                        let mut local_fitted = MatrixFull::new([pair_len, kept_len], 0.0_f64);
-                        local_fitted.to_matrixfullslicemut().lapack_dgemm(
-                            &local_raw.to_matrixfullslice(),
-                            &metric_factor_view,
-                            'N',
-                            'N',
-                            1.0,
-                            0.0,
-                        );
                         sender
                             .send((global_pair_start, pair_len, local_fitted))
                             .expect(
@@ -8570,6 +8562,57 @@ fn for_each_fitted_ri3fn_shell_block_rayon_kept_range<F>(
         );
     }
     omp_set_num_threads_wrapper(default_omp_num_threads);
+}
+
+fn r2_accumulate_streamed_fitted_aux_shell_block(
+    block_buffer: &MatrixFull<f64>,
+    pair_index_map: &[(usize, usize)],
+    aux_shell: &RintShell,
+    metric_factor: &MatrixFull<f64>,
+    kept_start: usize,
+    kept_len: usize,
+    local_fitted: &mut MatrixFull<f64>,
+    raw_compact: &mut MatrixFull<f64>,
+    metric_compact: &mut MatrixFull<f64>,
+    fit_delta: &mut MatrixFull<f64>,
+) {
+    let valid_pairs = pair_index_map.len();
+    let aux_len = aux_shell.ao_len;
+    if valid_pairs == 0 || aux_len == 0 || kept_len == 0 {
+        return;
+    }
+
+    r2_prepare_scratch_matrix(raw_compact, [valid_pairs, aux_len], false);
+    for aux_loc in 0..aux_len {
+        for (pair_idx, (block_row, _local_pair)) in pair_index_map.iter().copied().enumerate() {
+            raw_compact[(pair_idx, aux_loc)] = block_buffer[(block_row, aux_loc)];
+        }
+    }
+
+    r2_prepare_scratch_matrix(metric_compact, [aux_len, kept_len], false);
+    for kept_loc in 0..kept_len {
+        let kept = kept_start + kept_loc;
+        for aux_loc in 0..aux_len {
+            let aux = aux_shell.ao_start + aux_loc;
+            metric_compact[(aux_loc, kept_loc)] = metric_factor[(aux, kept)];
+        }
+    }
+
+    r2_prepare_scratch_matrix(fit_delta, [valid_pairs, kept_len], false);
+    fit_delta.to_matrixfullslicemut().lapack_dgemm(
+        &raw_compact.to_matrixfullslice(),
+        &metric_compact.to_matrixfullslice(),
+        'N',
+        'N',
+        1.0,
+        0.0,
+    );
+
+    for kept_loc in 0..kept_len {
+        for (pair_idx, (_block_row, local_pair)) in pair_index_map.iter().copied().enumerate() {
+            local_fitted[(local_pair, kept_loc)] += fit_delta[(pair_idx, kept_loc)];
+        }
+    }
 }
 
 fn prepare_rimatr_from_shell_blocks_sync_with_auxbas_threshold(
@@ -8673,11 +8716,14 @@ fn r2_use_semidirect(num_basis: usize, num_auxbas: usize) -> bool {
     match std::env::var("REST_R2_DIRECT") {
         Ok(value) => {
             let value = value.trim().to_ascii_lowercase();
-            if matches!(value.as_str(), "semi-direct" | "semidirect" | "direct") {
+            if matches!(
+                value.as_str(),
+                "1" | "true" | "yes" | "on" | "semi-direct" | "semidirect" | "direct"
+            ) {
                 println!("RI-r2 semi-direct requested by REST_R2_DIRECT={value}");
                 return true;
             }
-            if matches!(value.as_str(), "incore") {
+            if matches!(value.as_str(), "0" | "false" | "no" | "off" | "incore") {
                 println!("RI-r2 incore forced by REST_R2_DIRECT={value}");
                 return false;
             }
@@ -9108,6 +9154,15 @@ fn r2_max_shell_block_pair_len(ao_shells: &[RintShell], num_basis: usize) -> usi
         .max(1)
 }
 
+fn r2_max_aux_shell_len(aux_shells: &[RintShell]) -> usize {
+    aux_shells
+        .iter()
+        .map(|shell| shell.ao_len)
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
 /// 根据常驻内存、并行 shell worker 临时块、H/K scratch 和 batch cache 估算 kept_batch。
 fn r2_direct_kept_block_size(
     nkept: usize,
@@ -9116,6 +9171,7 @@ fn r2_direct_kept_block_size(
     num_baspar: usize,
     occ_coeffs: &[MatrixFull<f64>],
     max_pair_len: usize,
+    max_aux_shell_len: usize,
 ) -> usize {
     if nkept == 0 {
         return 0;
@@ -9140,8 +9196,12 @@ fn r2_direct_kept_block_size(
     // 内存计划必须和实际 worker 数使用同一个来源，否则 kept_batch 会被错误估大或估小。
     let workers = r2_direct_requested_workers();
     let inflight_blocks = r2_direct_inflight_blocks(workers);
-    let worker_fitted_values_per_kept =
-        max_pair_len.saturating_mul(workers.saturating_add(inflight_blocks).saturating_add(1));
+    let worker_fitted_values_per_kept = max_pair_len.saturating_mul(
+        workers
+            .saturating_mul(2)
+            .saturating_add(inflight_blocks)
+            .saturating_add(1),
+    );
     let live_values_per_kept = h_values_per_kept
         .saturating_add(k_scratch_values_per_kept)
         .saturating_add(batch_cache_values_per_kept)
@@ -9163,7 +9223,8 @@ fn r2_direct_kept_block_size(
     let output_bytes = output_values.saturating_mul(std::mem::size_of::<f64>());
     let worker_raw_bytes = workers
         .saturating_mul(max_pair_len)
-        .saturating_mul(num_auxbas)
+        .saturating_mul(max_aux_shell_len)
+        .saturating_mul(2)
         .saturating_mul(std::mem::size_of::<f64>());
     let fixed_bytes = fixed_metric_factor_bytes
         .saturating_add(output_bytes)
@@ -9176,7 +9237,7 @@ fn r2_direct_kept_block_size(
     let max_kept = r2_direct_max_kept_block_size(nkept);
     let kept_block = estimated.max(1).min(max_kept).min(nkept).max(1);
     println!(
-        "RI-r2 semi-direct K kept_batch auto: kept_batch={} nkept={} limit={:.2} MB factor={:.2} kept_fraction={:.2} fixed={:.2} MB fixed_metric_factor={:.2} MB worker_raw={:.2} MB output={:.2} MB kept_budget={:.2} MB live_per_kept={:.2} KB H_per_kept={} K_scratch_per_kept={} batch_cache_per_kept={} worker_fitted_per_kept={} max_pair_len={} workers={} inflight_blocks={} nocc_sum={} nocc_max={} cap={}",
+        "RI-r2 semi-direct K kept_batch auto: kept_batch={} nkept={} limit={:.2} MB factor={:.2} kept_fraction={:.2} fixed={:.2} MB fixed_metric_factor={:.2} MB worker_raw_streamed={:.2} MB output={:.2} MB kept_budget={:.2} MB live_per_kept={:.2} KB H_per_kept={} K_scratch_per_kept={} batch_cache_per_kept={} worker_fitted_per_kept={} max_pair_len={} max_aux_shell_len={} workers={} inflight_blocks={} nocc_sum={} nocc_max={} cap={}",
         kept_block,
         nkept,
         limit_mb,
@@ -9193,6 +9254,7 @@ fn r2_direct_kept_block_size(
         batch_cache_values_per_kept,
         worker_fitted_values_per_kept,
         max_pair_len,
+        max_aux_shell_len,
         workers,
         inflight_blocks,
         nocc_sum,
@@ -9405,6 +9467,7 @@ fn r2_make_semidirect_cache_plan(
     nkept: usize,
     occ_coeffs: &[MatrixFull<f64>],
     max_pair_len: usize,
+    max_aux_shell_len: usize,
 ) -> R2SemiDirectCachePlan {
     let limit_mb = r2_memory_limit_mb();
     let factor = r2_direct_memory_factor();
@@ -9419,6 +9482,7 @@ fn r2_make_semidirect_cache_plan(
         num_baspar,
         occ_coeffs,
         max_pair_len,
+        max_aux_shell_len,
     );
     let h_batch_values = occ_coeffs
         .iter()
@@ -9457,7 +9521,8 @@ fn r2_make_semidirect_cache_plan(
     let output_bytes = output_values.saturating_mul(std::mem::size_of::<f64>());
     let worker_raw_bytes = workers
         .saturating_mul(max_pair_len)
-        .saturating_mul(num_auxbas)
+        .saturating_mul(max_aux_shell_len)
+        .saturating_mul(2)
         .saturating_mul(std::mem::size_of::<f64>());
     let fixed_bytes = fixed_metric_factor_bytes
         .saturating_add(output_bytes)
@@ -9470,7 +9535,7 @@ fn r2_make_semidirect_cache_plan(
         fixed_bytes,
     );
     println!(
-        "RI-r2 semi-direct memory plan (kept-batch-first): incore_peak={:.2} MB fixed={:.2} MB H_batch={:.2} MB K_scratch_peak={:.2} MB limit={:.2} MB factor={:.2} kept_fraction={:.2}",
+        "RI-r2 semi-direct memory plan (kept-batch-first): incore_peak={:.2} MB fixed={:.2} MB H_batch={:.2} MB K_scratch_peak={:.2} MB limit={:.2} MB factor={:.2} kept_fraction={:.2} max_aux_shell_len={}",
         bytes_to_mb(incore_peak_bytes),
         bytes_to_mb(fixed_bytes),
         bytes_to_mb(h_batch_bytes),
@@ -9478,6 +9543,7 @@ fn r2_make_semidirect_cache_plan(
         limit_mb,
         factor,
         r2_direct_kept_memory_fraction(),
+        max_aux_shell_len,
     );
     println!(
         "RI-r2 semi-direct cache plan (kept-batch-first): kept_batch={} batch_fitted_cache={}",
@@ -9699,8 +9765,15 @@ fn r2_jk_direct_from_shell_blocks_with_auxbas_threshold_kept_batch_first(
         int3c_into: int3c_r2_shell_block_batched_into_direct,
     };
     let max_pair_len = r2_max_shell_block_pair_len(ao_shells, num_basis);
-    let plan =
-        r2_make_semidirect_cache_plan(num_basis, num_auxbas, nkept, &occ_coeffs, max_pair_len);
+    let max_aux_shell_len = r2_max_aux_shell_len(aux_shells);
+    let plan = r2_make_semidirect_cache_plan(
+        num_basis,
+        num_auxbas,
+        nkept,
+        &occ_coeffs,
+        max_pair_len,
+        max_aux_shell_len,
+    );
     let kept_block = plan.kept_batch.max(1).min(nkept);
     timings.effective_kept_batch = kept_block;
     timings.hfit_build_source = "kept_batch_first";
@@ -10688,7 +10761,10 @@ mod kernel_worst_quartet_tests {
     use rest_libcint::prelude::rest_libcint_wrapper::int1e_r;
     use std::fs;
     use std::process::Command;
+    use std::sync::Mutex;
     use std::time::Instant;
+
+    static R2_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn r2_direct_requested_workers_defaults_to_configured_rayon_threads() {
@@ -10703,6 +10779,89 @@ mod kernel_worst_quartet_tests {
         pool.install(|| {
             assert_eq!(r2_direct_requested_workers(), rayon::current_num_threads());
         });
+    }
+
+    #[test]
+    fn rest_r2_direct_numeric_one_forces_semidirect() {
+        let _guard = R2_ENV_LOCK.lock().unwrap();
+        let old_direct = std::env::var_os("REST_R2_DIRECT");
+        std::env::set_var("REST_R2_DIRECT", "1");
+
+        assert!(
+            r2_use_semidirect(1, 1),
+            "REST_R2_DIRECT=1 should force the semi-direct RI-r2 path for legacy run scripts"
+        );
+
+        match old_direct {
+            Some(value) => std::env::set_var("REST_R2_DIRECT", value),
+            None => std::env::remove_var("REST_R2_DIRECT"),
+        }
+    }
+
+    #[test]
+    fn r2_semidirect_kept_planner_does_not_reserve_full_raw_aux_matrix_per_worker() {
+        let _guard = R2_ENV_LOCK.lock().unwrap();
+        let old_workers = std::env::var_os("REST_R2_DIRECT_WORKERS");
+        let old_inflight = std::env::var_os("REST_R2_DIRECT_INFLIGHT_BLOCKS");
+        let old_memory = std::env::var_os("REST_R2_DIRECT_MEMORY_MB");
+        let old_factor = std::env::var_os("REST_R2_DIRECT_MEMORY_FACTOR");
+        let old_fraction = std::env::var_os("REST_R2_DIRECT_KEPT_MEMORY_FRACTION");
+        let old_cap = std::env::var_os("REST_R2_DIRECT_MAX_KEPT_BLOCK");
+
+        std::env::set_var("REST_R2_DIRECT_WORKERS", "8");
+        std::env::set_var("REST_R2_DIRECT_INFLIGHT_BLOCKS", "16");
+        std::env::set_var("REST_R2_DIRECT_MEMORY_MB", "32768");
+        std::env::set_var("REST_R2_DIRECT_MEMORY_FACTOR", "0.70");
+        std::env::set_var("REST_R2_DIRECT_KEPT_MEMORY_FRACTION", "0.60");
+        std::env::set_var("REST_R2_DIRECT_MAX_KEPT_BLOCK", "4096");
+
+        let num_basis = 3200;
+        let num_auxbas = 24000;
+        let nkept = 24000;
+        let num_baspar = (num_basis + 1) * num_basis / 2;
+        let max_pair_len = 48000;
+        let max_aux_shell_len = 30;
+        let occ_coeffs = vec![MatrixFull::new([num_basis, 800], 0.0_f64)];
+
+        let kept_batch = r2_direct_kept_block_size(
+            nkept,
+            num_basis,
+            num_auxbas,
+            num_baspar,
+            &occ_coeffs,
+            max_pair_len,
+            max_aux_shell_len,
+        );
+
+        assert!(
+            kept_batch > 1,
+            "streamed RI-r2 semi-direct fitting should not collapse kept_batch to 1 by reserving a full pair_len x num_auxbas raw matrix per worker"
+        );
+
+        match old_workers {
+            Some(value) => std::env::set_var("REST_R2_DIRECT_WORKERS", value),
+            None => std::env::remove_var("REST_R2_DIRECT_WORKERS"),
+        }
+        match old_inflight {
+            Some(value) => std::env::set_var("REST_R2_DIRECT_INFLIGHT_BLOCKS", value),
+            None => std::env::remove_var("REST_R2_DIRECT_INFLIGHT_BLOCKS"),
+        }
+        match old_memory {
+            Some(value) => std::env::set_var("REST_R2_DIRECT_MEMORY_MB", value),
+            None => std::env::remove_var("REST_R2_DIRECT_MEMORY_MB"),
+        }
+        match old_factor {
+            Some(value) => std::env::set_var("REST_R2_DIRECT_MEMORY_FACTOR", value),
+            None => std::env::remove_var("REST_R2_DIRECT_MEMORY_FACTOR"),
+        }
+        match old_fraction {
+            Some(value) => std::env::set_var("REST_R2_DIRECT_KEPT_MEMORY_FRACTION", value),
+            None => std::env::remove_var("REST_R2_DIRECT_KEPT_MEMORY_FRACTION"),
+        }
+        match old_cap {
+            Some(value) => std::env::set_var("REST_R2_DIRECT_MAX_KEPT_BLOCK", value),
+            None => std::env::remove_var("REST_R2_DIRECT_MAX_KEPT_BLOCK"),
+        }
     }
 
     fn write_temp_ctrl_h2(basis_dir: &str) -> String {
