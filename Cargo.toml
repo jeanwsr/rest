@@ -1,6 +1,6 @@
 [package]
 name = "rest"
-version = "1.1.0"
+version = "2026.1.0"
 authors = ["Igor Ying Zhang <igor_zhangying@fudan.edu.cn>"]
 edition = "2021"
 build = "build.rs"
