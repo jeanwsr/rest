@@ -47,7 +47,10 @@ pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
         // input file in the toml format
         toml::from_str::<serde_json::Value>(&tmp_cont[..])?
     };
-    parse_ctl_from_json(&tmp_keys)
+    let (input, mut geomcell) = parse_ctl_from_json(&tmp_keys)?;
+    let input_dir = std::path::Path::new(&filename).parent().unwrap_or(std::path::Path::new("."));
+    geomcell.resolve_ghost_ep_paths(input_dir);
+    Ok((input, geomcell))
 }
 
 pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(InputKeywords,GeomCell)> {
