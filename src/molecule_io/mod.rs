@@ -30,7 +30,6 @@ use crate::utilities;
 use crate::basis_io::bse_downloader::{self, ctrl_element_checker, local_element_checker};
 use crate::basis_io::basis_list::{basis_fuzzy_matcher, check_basis_name};
 use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper};
-use crate::solvent::PcmMethod;
 use crate::ri_jk;
 
 
@@ -124,10 +123,6 @@ pub struct Molecule {
     pub cint_aux_atm : Vec<Vec<i32>>,
     pub cint_aux_env : Vec<f64>,
     pub cint_type: CintType,
-    // solvation model data
-    pub use_solvent: bool,
-    pub solvent_model: PcmMethod,
-    pub solv_epsilon: f64,
 }
 
 impl Molecule {
@@ -163,9 +158,6 @@ impl Molecule {
             cint_aux_env: vec![],
             cint_type: CintType::Spheric,
             //cint_data: CINTR2CDATA::new()
-            use_solvent: false,
-            solvent_model: PcmMethod::CPCM,
-            solv_epsilon: 1.0,
         }
     }
 
@@ -302,9 +294,6 @@ impl Molecule {
             println!("nbas: {}, natm: {} for standard basis sets", cint_bas.len(),cint_atm.len());
             println!("First valence state for the frozen-core algorithm: {:5}", start_mo);
         };
-        let use_solvent = ctrl.solvent_enabled;
-        let solvent_model=ctrl.solvent_model;
-        let solv_epsilon = ctrl.solv_epsilon;
         let mut mol = Molecule {
             ctrl,
             mpi_data,
@@ -335,9 +324,6 @@ impl Molecule {
             cint_aux_bas,
             cint_aux_env,
             cint_type,
-            use_solvent,
-            solvent_model,
-            solv_epsilon,
         };
         // check and prepare the auxiliary basis sets
         if mol.ctrl.use_auxbas {mol.initialize_auxbas()};

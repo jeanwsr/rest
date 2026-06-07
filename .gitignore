@@ -4,7 +4,10 @@ Cargo.lock
 *.log
 /examples/
 /tmp/
+*.npz
 *.py
+*.pyc
+.ipynb_checkpoints/
 *.so
 bse_pool
 /examples/WFA/fchk/*chk
