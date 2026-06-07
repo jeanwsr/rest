@@ -18,8 +18,7 @@ use crate::utilities;
 use rayon::ThreadPoolBuilder;
 use crate::check_norm::OCCType;
 use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper,omp_get_num_threads_wrapper};
-use crate::solvent::PcmMethod;
-
+use crate::solvent::{PcmMethod, RadiusScheme};
 use serde_json;
 use toml;
 
@@ -247,6 +246,7 @@ pub struct InputKeywords {
     pub solv_epsilon: f64,
     pub solvent_model: PcmMethod,
     pub solv_chunk: usize,
+    pub pcm_cavity_radii: RadiusScheme,
     #[pyo3(get, set)]
     // The initial MO coefficients and eigenvalues can be imported by setting chkfile
     pub chkfile: String,
@@ -512,6 +512,7 @@ impl InputKeywords {
             solv_epsilon:1.0,
             solvent_model: PcmMethod::CPCM,
             solv_chunk: 8,
+            pcm_cavity_radii: RadiusScheme::UFF,
             stop_at: None,
             xc_parser: String::from("legacy"),
             j2c_decomp: J2CDecompOption::default(),
@@ -1236,6 +1237,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     serde_json::from_value(value.clone())?
                 },
                 None => PcmMethod::CPCM,
+            };
+            tmp_input.pcm_cavity_radii = match tmp_ctrl.get("pcm_cavity_radii") {
+                Some(value) => {
+                    serde_json::from_value(value.clone())?
+                },
+                None => RadiusScheme::UFF,
             };
             tmp_input.solv_epsilon = match tmp_ctrl.get("solv_epsilon").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_fc) => {tmp_fc.to_lowercase().parse().unwrap_or(1.0_f64)},
