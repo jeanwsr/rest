@@ -318,6 +318,17 @@ impl GeomCell {
         self.elem.len()
     }
 
+    pub fn resolve_ghost_ep_paths(&mut self, input_dir: &std::path::Path) {
+        self.ghost_ep_path = self.ghost_ep_path.iter().map(|p| {
+            let path = std::path::PathBuf::from(p);
+            if path.is_relative() {
+                input_dir.join(path).to_string_lossy().to_string()
+            } else {
+                p.clone()
+            }
+        }).collect();
+    }
+
     pub fn geom_shift(&mut self, atm_idx:usize, vec_xyz:Vec<f64>) {
         // update the atom position in the matrix include only real atoms
         let mut given_atm = &mut self.position[(..,atm_idx)];
