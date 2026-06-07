@@ -728,7 +728,7 @@ fn get_dm(scf_data: &SCF, device: &DeviceBLAS) -> Tsr<f64> {
 pub fn calc_de_nuc(mol: &Molecule) -> MatrixFull<f64> {
     let device = DeviceBLAS::default();
 
-    let natm = mol.geom.elem.len();
+    let natm = mol.natm_real;
     let coords = (0..natm).map(|i| mol.geom.get_coord(i)).flatten().collect::<Vec<f64>>();
     let coords = rt::asarray((&coords, [3, natm], &device));
 
@@ -736,6 +736,7 @@ pub fn calc_de_nuc(mol: &Molecule) -> MatrixFull<f64> {
     let necp_by_atom = mol
         .basis4elem
         .iter()
+        .take(natm)
         .map(|i| if let Some(num_ecp) = i.ecp_electrons { num_ecp as f64 } else { 0.0 })
         .collect::<Vec<f64>>();
     let charges = rt::asarray((charges_by_atom, &device)) - rt::asarray((necp_by_atom, &device));

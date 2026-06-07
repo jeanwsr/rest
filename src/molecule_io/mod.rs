@@ -98,6 +98,10 @@ pub struct Molecule {
     pub auxbas4elem: Vec<Basis4Elem>,
 
     pub basis4elem: Vec<Basis4Elem>,
+    // natm_real: number of real atoms (geom.elem.len())
+    pub natm_real: usize,
+    // natm_all: total number of atoms with basis functions (real + ghost_bs)
+    pub natm_all: usize,
     // fdqc_bas: store information of each basis functions
     pub fdqc_bas : Vec<BasInfo>,
     //  cint_fdqc: vec![[start of a basis shell, num of basis funciton in this shell]; num of shells]
@@ -138,6 +142,8 @@ impl Molecule {
             ecp_electrons: 0,
             spin_channel: 1,
             auxbas4elem: vec![],
+            natm_real: 0,
+            natm_all: 0,
             basis4elem: vec![],
             fdqc_bas: vec![],
             cint_bas: vec![],
@@ -193,6 +199,9 @@ impl Molecule {
         let (mut basis4elem,mut cint_atm,mut cint_bas,cint_env,
             fdqc_bas,cint_fdqc,num_elec,num_basis,num_state, cint_ecpbas) 
             = Molecule::collect_basis(&mut ctrl, &mut geom);
+
+        let natm_all = cint_atm.len();
+        let natm_real = geom.elem.len();
 
 
 
@@ -301,6 +310,8 @@ impl Molecule {
             spin_channel,
             basis4elem,
             auxbas4elem: auxbas,
+            natm_real,
+            natm_all,
             fdqc_bas,
             cint_fdqc,
             cint_atm,
@@ -3348,7 +3359,7 @@ impl Molecule {
         let cint_bas = self.cint_bas.clone();
 
         let ao_loc = cint_data.ao_loc();
-        let natm = self.geom.elem.len();
+        let natm = self.natm_all;
         let nbas = cint_bas.len();
         let mut aoslice = vec![[0; 4]; natm];
 
