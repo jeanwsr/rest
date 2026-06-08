@@ -26,7 +26,7 @@ pub fn eval_ao_batch(mol:&Molecule, coords:&[[f64; 3]], ao_deriv:usize, num_grid
     let mut loc_ao = RIFull::new([mol.num_basis, num_grids, n_components_deriv], 0.0);
 
     mol.basis4elem.iter()
-    .zip(mol.geom.position.iter_columns_full())
+    .zip(mol.geom.rg_position.iter_columns_full())
     .for_each(
         |(elem, geom)|
         {
