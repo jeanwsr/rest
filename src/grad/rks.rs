@@ -218,8 +218,10 @@ impl RIRHFGradient<'_> {
         time_records.new_item("rks grad calc_de_nuc", "rks grad calc_de_nuc");
         time_records.new_item("rks grad calc_de_ovlp", "rks grad calc_de_ovlp");
         time_records.new_item("rks grad calc_de_hcore", "rks grad calc_de_hcore");
+        time_records.new_item("rks grad calc_de_ext_field", "rks grad calc_de_ext_field");
         time_records.new_item("rks grad calc_de_jk", "rks grad calc_de_jk");
         time_records.new_item("rks grad calc_de_xc", "rks grad calc_de_xc");
+        time_records.new_item("rks grad calc_de_qmmm", "rks grad calc_de_qmmm");
         time_records.new_item("rks grad calc_de_solvent", "rks grad calc_de_solvent");
         time_records.new_item("rks grad calc_de_ext_field", "rks grad calc_de_ext_field");
 
@@ -236,6 +238,12 @@ impl RIRHFGradient<'_> {
         time_records.count_start("rks grad calc_de_hcore");
         self.calc_de_hcore();
         time_records.count("rks grad calc_de_hcore");
+
+        if self.flags.ext_field_dipole.is_some() {
+            time_records.count_start("rhf grad calc_de_ext_field");
+            self.calc_de_ext_field();
+            time_records.count("rhf grad calc_de_ext_field");
+        }
 
         time_records.count_start("rks grad calc_de_qmmm");
         self.calc_de_qmmm();
@@ -254,10 +262,6 @@ impl RIRHFGradient<'_> {
         time_records.count_start("rks grad calc_de_solvent");
         self.calc_de_solvent();
         time_records.count("rks grad calc_de_solvent");
-
-        time_records.count_start("rks grad calc_de_ext_field");
-        self.calc_de_ext_field();
-        time_records.count("rks grad calc_de_ext_field");
 
         time_records.count("rks grad");
 

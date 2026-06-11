@@ -1,5 +1,6 @@
 #![warn(unused)]
 use crate::grad::traits::GradAPI;
+use crate::external_field::extfield::ExtFieldGrad;
 use crate::ri_jk::{self, get_solved_j3c, J2CDecompose};
 use crate::scf_io::{self, SCF};
 use crate::utilities::memory_batch::*;
@@ -51,6 +52,10 @@ pub struct RIHFGradientFlags {
     /// In the form of (omega, alpha, beta), corresponds to `dfa_rsh_scf`.
     #[builder(default = "None")]
     pub omega: Option<f64>,
+
+    /// External dipole field vector for gradient contribution.
+    #[builder(default = "None")]
+    pub ext_field_dipole: Option<[f64; 3]>,
 }
 
 /// Gradient structure and values for RHF method.
@@ -81,6 +86,7 @@ pub fn build_ri_jk_grad_flags(scf_data: &SCF) -> RIHFGradientFlags {
     flags.auxbasis_response(scf_data.mol.ctrl.auxbasis_response);
     flags.print_level(scf_data.mol.ctrl.print_level);
     flags.max_memory(scf_data.mol.ctrl.max_memory);
+    flags.ext_field_dipole(scf_data.mol.geom.ext_field.dipole);
 
     // set hybrid factor
     let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
@@ -573,6 +579,22 @@ impl RIRHFGradient<'_> {
         return self;
     }
 
+    pub fn calc_de_ext_field(&mut self) -> &mut Self {
+        let mol = &self.scf_data.mol;
+        // let natm = mol.geom.elem.len();
+
+        // if self.flags.ext_field_dipole.is_none() {
+        //     self.result.insert("de_ext_field".into(), MatrixFull::new([3, natm], 0.0));
+        //     return self;
+        // }
+
+        let dm = &self.scf_data.density_matrix[0];
+        let mut ext_grad = ExtFieldGrad::new(mol, dm);
+        let de_ext = ext_grad.calc();
+        self.result.insert("de_ext_field".into(), de_ext);
+        return self;
+    }
+
     pub fn calc_de_solvent(&mut self) -> &mut Self {
         if !self.scf_data.mol.ctrl.solvent_enabled {
             let natm = self.scf_data.mol.geom.elem.len();
@@ -584,71 +606,6 @@ impl RIRHFGradient<'_> {
         return self;
     }
 
-    pub fn calc_de_ext_field(&mut self) -> &mut Self {
-        let mol = &self.scf_data.mol;
-        let natm = mol.natm_real;
-        let device = DeviceBLAS::default();
-
-        let ext_field_dipole = match mol.geom.ext_field.dipole {
-            Some(d) => d,
-            None => {
-                self.result.insert("de_ext_field".into(), MatrixFull::new([3, natm], 0.0));
-                return self;
-            }
-        };
-
-        if ext_field_dipole.iter().all(|&x| x.abs() < 1e-12) {
-            self.result.insert("de_ext_field".into(), MatrixFull::new([3, natm], 0.0));
-            return self;
-        }
-
-        let charges_by_atom = crate::geom_io::get_charge(&mol.geom.elem);
-        let necp_by_atom: Vec<f64> = mol
-            .basis4elem
-            .iter()
-            .take(natm)
-            .map(|i| if let Some(num_ecp) = i.ecp_electrons { num_ecp as f64 } else { 0.0 })
-            .collect();
-
-        let mut de_ext_field = MatrixFull::new([3, natm], 0.0);
-        for a in 0..natm {
-            let z_eff = charges_by_atom[a] - necp_by_atom[a];
-            for t in 0..3 {
-                de_ext_field[[t, a]] = z_eff * ext_field_dipole[t];
-            }
-        }
-
-        let dm = get_dm(self.scf_data, &device);
-        let epsilon = 0.0013;
-
-        for a in 0..natm {
-            for t in 0..3 {
-                let tr_plus = {
-                    let mut mol_plus = mol.clone();
-                    let mut v = vec![0.0; 3];
-                    v[t] = epsilon;
-                    mol_plus.geom.geom_shift(a, v);
-                    compute_dipole_trace(&mol_plus, &dm, &device)
-                };
-
-                let tr_minus = {
-                    let mut mol_minus = mol.clone();
-                    let mut v = vec![0.0; 3];
-                    v[t] = -epsilon;
-                    mol_minus.geom.geom_shift(a, v);
-                    compute_dipole_trace(&mol_minus, &dm, &device)
-                };
-
-                for s in 0..3 {
-                    let dtr_dr = (tr_plus[s] - tr_minus[s]) / (2.0 * epsilon);
-                    de_ext_field[[t, a]] -= ext_field_dipole[s] * dtr_dr;
-                }
-            }
-        }
-
-        self.result.insert("de_ext_field".into(), de_ext_field);
-        return self;
-    }
 
     pub fn calc(&mut self) -> &MatrixFull<f64> {
         let mut time_records = crate::utilities::TimeRecords::new();
@@ -656,9 +613,10 @@ impl RIRHFGradient<'_> {
         time_records.new_item("rhf grad calc_de_nuc", "rhf grad calc_de_nuc");
         time_records.new_item("rhf grad calc_de_ovlp", "rhf grad calc_de_ovlp");
         time_records.new_item("rhf grad calc_de_hcore", "rhf grad calc_de_hcore");
+        time_records.new_item("rhf grad calc_de_ext_field", "rhf grad calc_de_ext_field");
         time_records.new_item("rhf grad calc_de_jk", "rhf grad calc_de_jk");
         time_records.new_item("rhf grad calc_de_solvent", "rhf grad calc_de_solvent");
-        time_records.new_item("rhf grad calc_de_ext_field", "rhf grad calc_de_ext_field");
+        time_records.new_item("rhf grad calc_de_qmmm", "rhf grad calc_de_qmmm");
 
         time_records.count_start("rhf grad");
 
@@ -674,6 +632,12 @@ impl RIRHFGradient<'_> {
         self.calc_de_hcore();
         time_records.count("rhf grad calc_de_hcore");
 
+        if self.flags.ext_field_dipole.is_some() {
+            time_records.count_start("rhf grad calc_de_ext_field");
+            self.calc_de_ext_field();
+            time_records.count("rhf grad calc_de_ext_field");
+        }
+
         time_records.count_start("rhf grad calc_de_qmmm");
         self.calc_de_qmmm();
         time_records.count("rhf grad calc_de_qmmm");
@@ -687,10 +651,6 @@ impl RIRHFGradient<'_> {
         time_records.count_start("rhf grad calc_de_solvent");
         self.calc_de_solvent();
         time_records.count("rhf grad calc_de_solvent");
-
-        time_records.count_start("rhf grad calc_de_ext_field");
-        self.calc_de_ext_field();
-        time_records.count("rhf grad calc_de_ext_field");
 
         time_records.count("rhf grad");
 
