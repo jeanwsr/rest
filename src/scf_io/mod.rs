@@ -6072,7 +6072,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             println!("ERROR: solvent_scf is None");
         }
 
-        if scf_data.mol.ctrl.print_level >= 2{
+        if scf_data.mol.ctrl.print_level > 2{
             debug_print_pcm(&scf_data.solvent_static_obj.as_ref().unwrap().pstatic, &scf_data.solvent_scf.as_ref().unwrap());
         }
     }
