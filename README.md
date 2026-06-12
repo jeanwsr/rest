@@ -102,7 +102,7 @@
 ## DFT积分格点相关关键词（Keyword）
 - `grid_generation_level`: 取值usize。格点精度等级，数值越大越精确。缺省为3
 - `pruning`: 取值String。DFT方法或sap初猜所选用格点筛选。目前，REST支持nwchem，sg1以及none。其中none为不筛选。缺省为nwchem
-- `radial_grid_method`: 取值String。径向格点的生成方法。目前REST支持truetler，gc2nd， delley, becke, mura_knowles及lmg。缺省为truetler
+- `radial_grid_method`: 取值String。径向格点的生成方法。目前REST支持treutler，gc2nd， delley, becke, mura_knowles及lmg。缺省为treutler
 
 ## 基组相关关键词（Keyword）
 - `eri_type`: 取值String类型。设置四中心积分计算方法。选项：
@@ -395,14 +395,14 @@ fp_mode = "FP64"
 	    xc = xyg3
 		numerical_force = true
 	```
-- 例子三：开启过渡态优化和频率计算，并且设置非常规状态（100华氏度、1.5个大气压）
+- 例子三：开启过渡态优化和频率计算，并且设置非常规状态（398开尔文、1.5个大气压）
     ```
 	[geometric_pyo3]
 	    transition = true
 		hessian = "first+last"
 		thermo = [398.0, 1.5]
 	```
-# Detailed descrption of [geom] block in the control file
+# Detailed description of [geom] block in the control file
 - `name`：取值String类型。分子体系的名称
 - `unit`：取值String类型。坐标单位。目前支持：angstrom和bohr
 - `position`：取值String类型。分子体系的坐标，目前支持xyz格式。支持两种书写方式：
