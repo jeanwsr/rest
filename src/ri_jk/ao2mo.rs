@@ -3,7 +3,6 @@ use super::prelude_dev::*;
 use super::*;
 use crate::scf_io::SCF;
 use crate::utilities::TimeRecords;
-use core::ops::Range;
 
 use rt::blas::{BlasFloat, LapackDriverAPI};
 
@@ -13,8 +12,8 @@ pub fn obtain_cderi_xvo_restricted<T>(
     scf_data: &SCF,
     timerecords: &mut TimeRecords,
     eigenvectors: Option<&MatrixFull<f64>>,
-    row_range: Option<Range<usize>>,
-    col_range: Option<Range<usize>>,
+    row_range: Option<&[usize]>,
+    col_range: Option<&[usize]>,
 ) -> Tsr<T>
 where
     T: BlasFloat + FromPrimitive + 'static,
@@ -30,13 +29,20 @@ where
     // apply occ and vir orbital indices
     let idx_core = scf_data.mol.start_mo;
     let idx_lumo = scf_data.lumo[0];
+    let nmo = mo_coeff.shape()[1];
     let occ_coeff = match col_range {
-        None => mo_coeff.i((.., idx_core..idx_lumo)),
-        Some(col_range) => mo_coeff.i((.., col_range)),
+        None => {
+            let occ_list: Vec<usize> = (idx_core..idx_lumo).collect();
+            mo_coeff.index_select(-1, &occ_list)
+        },
+        Some(indices) => mo_coeff.index_select(-1, indices),
     };
     let vir_coeff = match row_range {
-        None => mo_coeff.i((.., idx_lumo..)),
-        Some(row_range) => mo_coeff.i((.., row_range)),
+        None => {
+            let vir_list: Vec<usize> = (idx_lumo..nmo).collect();
+            mo_coeff.index_select(-1, &vir_list)
+        },
+        Some(indices) => mo_coeff.index_select(-1, indices),
     };
 
     let nocc = occ_coeff.shape()[1];
@@ -130,8 +136,8 @@ pub fn obtain_cderi_xvo_unrestricted<T>(
     scf_data: &SCF,
     timerecords: &mut TimeRecords,
     eigenvectors: Option<[&MatrixFull<f64>; 2]>,
-    row_ranges: Option<[Range<usize>; 2]>,
-    col_ranges: Option<[Range<usize>; 2]>,
+    row_ranges: [Option<&[usize]>; 2],
+    col_ranges: [Option<&[usize]>; 2],
 ) -> [Tsr<T>; 2]
 where
     T: BlasFloat + FromPrimitive + 'static,
@@ -149,14 +155,39 @@ where
     };
     let idx_core = scf_data.mol.start_mo;
     let idx_lumo = scf_data.lumo;
-    let occ_coeff = match col_ranges {
-        None => [mo_coeff.i((.., idx_core..idx_lumo[A], A)), mo_coeff.i((.., idx_core..idx_lumo[B], B))],
-        Some(col_range) => [mo_coeff.i((.., col_range[A].clone(), A)), mo_coeff.i((.., col_range[B].clone(), B))],
-    };
-    let vir_coeff = match row_ranges {
-        None => [mo_coeff.i((.., idx_lumo[A].., A)), mo_coeff.i((.., idx_lumo[B].., B))],
-        Some(row_range) => [mo_coeff.i((.., row_range[A].clone(), A)), mo_coeff.i((.., row_range[B].clone(), B))],
-    };
+    let nmo = mo_coeff.shape()[1];
+    let occ_coeff = [
+        match col_ranges[A] {
+            None => {
+                let list: Vec<usize> = (idx_core..idx_lumo[A]).collect();
+                mo_coeff.i((.., .., A)).index_select(-1, &list)
+            },
+            Some(indices) => mo_coeff.i((.., .., A)).index_select(-1, indices),
+        },
+        match col_ranges[B] {
+            None => {
+                let list: Vec<usize> = (idx_core..idx_lumo[B]).collect();
+                mo_coeff.i((.., .., B)).index_select(-1, &list)
+            },
+            Some(indices) => mo_coeff.i((.., .., B)).index_select(-1, indices),
+        },
+    ];
+    let vir_coeff = [
+        match row_ranges[A] {
+            None => {
+                let list: Vec<usize> = (idx_lumo[A]..nmo).collect();
+                mo_coeff.i((.., .., A)).index_select(-1, &list)
+            },
+            Some(indices) => mo_coeff.i((.., .., A)).index_select(-1, indices),
+        },
+        match row_ranges[B] {
+            None => {
+                let list: Vec<usize> = (idx_lumo[B]..nmo).collect();
+                mo_coeff.i((.., .., B)).index_select(-1, &list)
+            },
+            Some(indices) => mo_coeff.i((.., .., B)).index_select(-1, indices),
+        },
+    ];
 
     let nocc = [occ_coeff[A].shape()[1], occ_coeff[B].shape()[1]];
     let nvir = [vir_coeff[A].shape()[1], vir_coeff[B].shape()[1]];

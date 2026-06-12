@@ -8,7 +8,12 @@ use rstsr::prelude::*;
 
 use rt::blas::{BlasFloat, LapackDriverAPI};
 
-pub fn evaluate_ript2_eng<T>(scf_data: &SCF, timerecords: &mut TimeRecords) -> [f64; 3]
+pub fn evaluate_ript2_eng<T>(
+    scf_data: &SCF,
+    timerecords: &mut TimeRecords,
+    occidx: [Option<&[usize]>; 2],
+    viridx: [Option<&[usize]>; 2],
+) -> [f64; 3]
 where
     T: BlasFloat + FromPrimitive + 'static,
     DeviceBLAS: LapackDriverAPI<T>,
@@ -22,13 +27,28 @@ where
     // note occupation in restricted case should be divided by 2
     let idx_core = scf_data.mol.start_mo;
     let idx_lumo = scf_data.lumo[0];
-    let occ_energy = mo_energy.i(idx_core..idx_lumo);
-    let vir_energy = mo_energy.i(idx_lumo..);
-    let occ_occupation = mo_occupation.i(idx_core..idx_lumo) / 2;
-    let vir_occupation = mo_occupation.i(idx_lumo..) / 2;
+    let num_mo = mo_energy.size();
+
+    // build occupied and virtual orbital index lists
+    // when None, default to the conventional contiguous range
+    let occ_list: Vec<usize> = occidx[0]
+        .map(|x| x.to_vec())
+        .unwrap_or_else(|| (idx_core..idx_lumo).collect());
+    let vir_list: Vec<usize> = viridx[0]
+        .map(|x| x.to_vec())
+        .unwrap_or_else(|| (idx_lumo..num_mo).collect());
+
+    let occ_energy = mo_energy.index_select(-1, &occ_list);
+    let vir_energy = mo_energy.index_select(-1, &vir_list);
+    let occ_occupation = mo_occupation.index_select(-1, &occ_list) / 2;
+    let vir_occupation = mo_occupation.index_select(-1, &vir_list) / 2;
 
     // perform ao2mo
-    let cderi_xvo = ri_jk::obtain_cderi_xvo_restricted(scf_data, timerecords, None, None, None);
+    let cderi_xvo = ri_jk::obtain_cderi_xvo_restricted(
+        scf_data, timerecords, None,
+        Some(vir_list.as_slice()),
+        Some(occ_list.as_slice()),
+    );
 
     timerecords.count_start("c_r5dft");
     let pair_eng = super::pure_pt2_pair_eng::get_ript2_energy_pair_intra(
@@ -47,7 +67,12 @@ where
     [eng_tot, eng_os, eng_ss]
 }
 
-pub fn evaluate_riupt2_eng<T>(scf_data: &SCF, timerecords: &mut TimeRecords) -> [f64; 3]
+pub fn evaluate_riupt2_eng<T>(
+    scf_data: &SCF,
+    timerecords: &mut TimeRecords,
+    occidx: [Option<&[usize]>; 2],
+    viridx: [Option<&[usize]>; 2],
+) -> [f64; 3]
 where
     T: BlasFloat + FromPrimitive + 'static,
     DeviceBLAS: LapackDriverAPI<T>,
@@ -63,13 +88,45 @@ where
     // apply occ and vir orbital indices
     let idx_core = scf_data.mol.start_mo;
     let idx_lumo = scf_data.lumo;
-    let occ_energy = [mo_energy.i((idx_core..idx_lumo[A], A)), mo_energy.i((idx_core..idx_lumo[B], B))];
-    let vir_energy = [mo_energy.i((idx_lumo[A].., A)), mo_energy.i((idx_lumo[B].., B))];
-    let occ_occupation = [mo_occupation.i((idx_core..idx_lumo[A], A)), mo_occupation.i((idx_core..idx_lumo[B], B))];
-    let vir_occupation = [mo_occupation.i((idx_lumo[A].., A)), mo_occupation.i((idx_lumo[B].., B))];
+    let num_mo = mo_energy.shape()[0];
+
+    // build occupied and virtual orbital index lists per spin
+    // when None, default to the conventional contiguous range
+    let occ_lists: [Vec<usize>; 2] = [A, B].map(|spin| {
+        occidx[spin]
+            .map(|x| x.to_vec())
+            .unwrap_or_else(|| (idx_core..idx_lumo[spin]).collect())
+    });
+    let vir_lists: [Vec<usize>; 2] = [A, B].map(|spin| {
+        viridx[spin]
+            .map(|x| x.to_vec())
+            .unwrap_or_else(|| (idx_lumo[spin]..num_mo).collect())
+    });
+
+    // slice each spin channel to 1D then index_select
+    let occ_energy = [
+        mo_energy.i((.., A)).index_select(-1, &occ_lists[A]),
+        mo_energy.i((.., B)).index_select(-1, &occ_lists[B]),
+    ];
+    let vir_energy = [
+        mo_energy.i((.., A)).index_select(-1, &vir_lists[A]),
+        mo_energy.i((.., B)).index_select(-1, &vir_lists[B]),
+    ];
+    let occ_occupation = [
+        mo_occupation.i((.., A)).index_select(-1, &occ_lists[A]),
+        mo_occupation.i((.., B)).index_select(-1, &occ_lists[B]),
+    ];
+    let vir_occupation = [
+        mo_occupation.i((.., A)).index_select(-1, &vir_lists[A]),
+        mo_occupation.i((.., B)).index_select(-1, &vir_lists[B]),
+    ];
 
     // perform ao2mo
-    let cderi_xvo = ri_jk::obtain_cderi_xvo_unrestricted(scf_data, timerecords, None, None, None);
+    let cderi_xvo = ri_jk::obtain_cderi_xvo_unrestricted(
+        scf_data, timerecords, None,
+        [Some(vir_lists[A].as_slice()), Some(vir_lists[B].as_slice())],
+        [Some(occ_lists[A].as_slice()), Some(occ_lists[B].as_slice())],
+    );
 
     timerecords.count_start("c_r5dft");
     let pair_eng_aa = super::pure_pt2_pair_eng::get_ript2_energy_pair_intra(
