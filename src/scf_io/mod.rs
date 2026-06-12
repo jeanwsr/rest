@@ -3412,7 +3412,9 @@ impl SCF {
                         SCFType::ROHF => &self.semi_eigenvectors.as_ref().unwrap()[0],
                         _ => &self.eigenvectors[0],
                     };
-                    let cderi = ri_jk::obtain_cderi_xvo_restricted(&self, &mut timerecords, Some(eigenvectors), Some(row_range.clone()), Some(col_range.clone()));
+                    let row_indices: Vec<usize> = row_range.clone().collect();
+                    let col_indices: Vec<usize> = col_range.clone().collect();
+                    let cderi = ri_jk::obtain_cderi_xvo_restricted(&self, &mut timerecords, Some(eigenvectors), Some(row_indices.as_slice()), Some(col_indices.as_slice()));
                     let shape = cderi.shape().to_vec().try_into().unwrap();
                     let data = cderi.into_shape(-1).into_raw();
                     let ri3ao = RIFull::from_vec(shape, data).unwrap();
@@ -3423,9 +3425,13 @@ impl SCF {
                         SCFType::ROHF => [&self.semi_eigenvectors.as_ref().unwrap()[0], &self.semi_eigenvectors.as_ref().unwrap()[1]],
                         _ => [&self.eigenvectors[0], &self.eigenvectors[1]],
                     };
-                    let row_ranges = [row_range.clone(), row_range.clone()];
-                    let col_ranges = [col_range.clone(), col_range.clone()];
-                    let cderi = ri_jk::obtain_cderi_xvo_unrestricted(&self, &mut timerecords, Some(eigenvectors), Some(row_ranges), Some(col_ranges));
+                    let row_indices: Vec<usize> = row_range.clone().collect();
+                    let col_indices: Vec<usize> = col_range.clone().collect();
+                    let cderi = ri_jk::obtain_cderi_xvo_unrestricted(
+                        &self, &mut timerecords, Some(eigenvectors),
+                        [Some(row_indices.as_slice()), Some(row_indices.as_slice())],
+                        [Some(col_indices.as_slice()), Some(col_indices.as_slice())],
+                    );
 
                     let [cderi_a, cderi_b] = cderi;
                     // handle alpha
