@@ -23,6 +23,7 @@ use mpi::collective::SystemOperation;
 use pyo3::{pyclass};
 use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemv, _dspgvx, _dsymm, _dsyrk, _hamiltonian_fast_solver, _power_rayon_for_symmetric_matrix, _dsyevd, _pinv, _get_sqrt_and_inv_sqrt};
 use tensors::{map_upper_to_full, BasicMatUp, BasicMatrix, ERIFold4, MathMatrix, MatrixFull, MatrixFullSlice, MatrixUpper, MatrixUpperSlice, RIFull, TensorSliceMut};
+use tensors::{TensorOpt,TensorOptMut,TensorSlice};
 use itertools::{Itertools};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -30,8 +31,7 @@ use crossbeam::{channel::{unbounded},thread::{scope}};
 use std::sync::mpsc::{channel};
 use crate::isdf::{prepare_for_ri_isdf, prepare_m_isdf};
 use crate::molecule_io::{Molecule};
-use crate::tensors::{TensorOpt,TensorOptMut,TensorSlice};
-use crate::initial_guess::initial_guess;
+use crate::initial_guess::{initial_guess, update_basis_from_hdf5chk};
 use crate::external_libs::dftd;
 use crate::constants::{SQRT_THRESHOLD};
 use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
@@ -48,7 +48,6 @@ pub struct SCF {
     pub mol: Molecule,
     pub ovlp: MatrixUpper<f64>,
     pub h_core: MatrixUpper<f64>,
-    //pub ijkl: Option<Tensors<f64>>,
     //pub ijkl: Option<ERIFull<f64>>,
     pub ijkl: Option<ERIFold4<f64>>,
     pub ri3fn: Option<RIFull<f64>>,
@@ -5741,10 +5740,11 @@ pub fn generate_occupation_outside(scf_data: &SCF) -> ([Vec<f64>;2], [usize;2], 
 
 pub fn generate_density_matrix_outside(scf_data: &SCF) -> Vec<MatrixFull<f64>>{
 
-    let num_basis = scf_data.mol.num_basis;
-    let num_state = scf_data.mol.num_state;
+    // let num_basis = scf_data.mol.num_basis;
+    // let num_state = scf_data.mol.num_state;
+    let [num_basis, num_state] = scf_data.eigenvectors[0].size();
     let spin_channel = scf_data.mol.spin_channel;
-    let homo = &scf_data.homo;
+    // let homo = &scf_data.homo;
     // println!("homo: {:?}", &homo);
     let mut dm = vec![
         MatrixFull::empty(),
@@ -5797,6 +5797,8 @@ pub fn initialize_scf(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
     // for preparing the following integrals accurately
     let position = &scf_data.mol.geom.position;
     scf_data.mol.cint_env = scf_data.mol.update_geom_poisition_in_cint_env(position);
+
+    update_basis_from_hdf5chk(scf_data);
 
     // update the RI-JK algorithms if not clearly specified
     scf_data.update_jk_algorithms();
@@ -6455,7 +6457,4 @@ pub fn print_force_for_ghost_point_charges(scf_data: &SCF) {
     }
 }
 
-#[test]
-fn test_max() {
-    println!("{}, {}, {}",1,2,std::cmp::max(1, 2));
-}
+

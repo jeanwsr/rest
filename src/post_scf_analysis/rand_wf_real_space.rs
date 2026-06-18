@@ -1,10 +1,9 @@
-use std::num;
 use crate::molecule_io::Molecule;
 use crate::geom_io;
 use crate::basis_io;
 use crate::basis_io::basic_math::factorial;
 use crate::scf_io::SCF;
-use rest_tensors::{TensorOpt,MatrixFull};
+use rest_tensors::{MatrixFull};
 use rand::distributions::normal::StandardNormal;
 use itertools::Itertools;
 use rayon::iter::{IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator, IntoParallelRefMutIterator};

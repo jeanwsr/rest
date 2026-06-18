@@ -1,25 +1,21 @@
-use tensors::{MatrixFull, MatrixUpper, BasicMatrix};
-
-use crate::constants::E;
-use crate::dft::{numerical_density_rayon, numerical_orbital_population};
+#![warn(unused_imports)]
+use tensors::{MatrixFull, MatrixUpper};
 use crate::initial_guess::enxc::effective_nxc_matrix;
 #[cfg(feature = "mpi")]
 use crate::mpi_io::mpi_broadcast_matrixfull;
 use crate::mpi_io::MPIOperator;
-use crate::scf_io::{scf, SCFType};
+use crate::scf_io::{SCFType};
 use crate::{molecule_io::Molecule, scf_io::SCF, dft::Grids};
 
 use crate::initial_guess::sap::get_vsap;
-
 use self::sad::initial_guess_from_sad;
 
-//use crate::initial_guess::*;
 pub mod sap;
 pub mod sad;
 pub mod enxc;
+pub mod proj;
 mod pyrest_enxc;
-mod chkfile;
-use chkfile::{has_dm, has_mo_coeff};
+use crate::fileop::chkfile;
 
 enum RESTART {
     HDF5,
@@ -37,7 +33,7 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
             assert!(std::path::Path::new(&scf_data.mol.ctrl.guessfile).exists(), "The specified guessfile is missing \n({})", &scf_data.mol.ctrl.guessfile);
             assert!(scf_data.mol.ctrl.guessfile_type.eq(&"hdf5"), "at present only hdf5 type guess file is supported");
             let file = hdf5::File::open(&scf_data.mol.ctrl.guessfile).unwrap();
-            if has_dm(&file) {
+            if chkfile::has_dm(&file) {
                 scf_data.density_matrix = initial_guess_from_hdf5guess(&scf_data.mol);
                 // for DFT methods, it needs the eigenvectors to generate the hamiltonian. In consequence, we use the hf method to prepare the eigenvectors from the guess dm
                 scf_data.generate_hf_hamiltonian_for_guess();
@@ -46,7 +42,7 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
                 scf_data.diagonalize_hamiltonian(mpi_operator);
                 scf_data.generate_occupation();
                 scf_data.generate_density_matrix();
-            } else if has_mo_coeff(&file) {
+            } else if chkfile::has_mo_coeff(&file) {
                 println!("Read MO coefficients from guessfile: {}", &scf_data.mol.ctrl.guessfile);
                 // let (eigenvectors, eigenvalues, is_occupation) = initial_guess_from_hdf5chk(
                 //     &scf_data.mol, &scf_data.scftype, &scf_data.mol.ctrl.guessfile);
@@ -183,7 +179,7 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
 
 pub fn update_scf_from_hdf5chk(scf_data: &mut SCF, chkfile: String) {
             let (eigenvectors, eigenvalues, is_occupation) = initial_guess_from_hdf5chk(
-                &scf_data.mol, &scf_data.scftype, &chkfile);
+                &mut scf_data.mol, &scf_data.scftype, &chkfile);
 
             //=============================
             // for MOM projection
@@ -238,9 +234,15 @@ pub fn update_scf_from_hdf5chk(scf_data: &mut SCF, chkfile: String) {
             scf_data.eigenvectors = eigenvectors;
             if let Some(occupation) = is_occupation {
                 scf_data.occupation = occupation;
+                // let (homo, lumo) = scf_io::util::get_homo_lumo_from_occ_integer(&scf_data.occupation, &scf_data.scftype);
+                // scf_data.homo = homo;
+                // scf_data.lumo = lumo;
             } else {
+            // Since homo, lumo is needed, re-generate occupation temporarily
                 scf_data.generate_occupation();
             }
+            // println!("homo {:?}", scf_data.homo);
+            // println!("occ {:?}", scf_data.occupation);
             scf_data.generate_density_matrix();
         }
 
@@ -257,7 +259,50 @@ pub fn initial_guess_from_hdf5guess(mol: &Molecule) -> Vec<MatrixFull<f64>> {
     dm
 }
 
-pub fn initial_guess_from_hdf5chk(mol: &Molecule, scftype: &SCFType, chkfile: &String) -> ([MatrixFull<f64>;2],[Vec<f64>;2],Option<[Vec<f64>;2]>) {
+pub fn update_basis_from_hdf5chk(scf_data: &mut SCF) {
+    let chkbasis = scf_data.mol.ctrl.basis_path == "chkfile";
+    if !chkbasis {
+        return;
+    }
+    if scf_data.mol.ctrl.initial_guess.eq(&"inherit") {
+        return;
+    } else if scf_data.mol.ctrl.external_init_guess.is_some() { 
+        let chkfile = match scf_data.mol.ctrl.external_init_guess.as_ref().unwrap().as_str() {
+            "guessfile" => {
+                assert!(std::path::Path::new(&scf_data.mol.ctrl.guessfile).exists(), "The specified guessfile is missing \n({})", &scf_data.mol.ctrl.guessfile);
+                assert!(scf_data.mol.ctrl.guessfile_type.eq(&"hdf5"), "at present only hdf5 type guess file is supported");
+                scf_data.mol.ctrl.guessfile.clone()
+            },
+            "chkfile" => {
+                assert!(std::path::Path::new(&scf_data.mol.ctrl.chkfile).exists(), "The specified chkfile is missing \n({})", &scf_data.mol.ctrl.chkfile);
+                assert!(scf_data.mol.ctrl.chkfile_type.eq(&"hdf5"), "at present only hdf5 type check file is supported");
+                scf_data.mol.ctrl.chkfile.clone()
+            }
+            _ => {
+                panic!("Error: unknown external initial guess file type ({})", &scf_data.mol.ctrl.external_init_guess.as_ref().unwrap());
+            }
+        };
+    
+
+        println!("taking basis set information from chkfile");
+        let (loaded_nbasis, loaded_nmo, loaded_spin_channel, _, _) = chkfile::load_basic(&chkfile).unwrap();
+        let (cint_raw_data, ecp_raw, basis4elem, cint_type) = chkfile::load_cint_data(&chkfile);
+        if let Some(cint_raw_data) = cint_raw_data {
+            // mol.cint_atm = cint_raw_data.0;
+            // mol.cint_bas = cint_raw_data.1;
+            // mol.cint_env = cint_raw_data.2;
+            // mol.cint_ecpbas = ecp_raw;
+            scf_data.mol.update_from_cint(loaded_nbasis, basis4elem, cint_raw_data, ecp_raw);
+            if let Some(cint_type) = cint_type {
+                scf_data.mol.cint_type = cint_type;
+            }
+        } else {
+            panic!("Failed to load the basis set information from chkfile");
+        }
+    }
+}
+
+pub fn initial_guess_from_hdf5chk(mol: &mut Molecule, scftype: &SCFType, chkfile: &String) -> ([MatrixFull<f64>;2],[Vec<f64>;2],Option<[Vec<f64>;2]>) {
     let mut spin_channel: usize;
     if let &SCFType::ROHF = scftype {
         spin_channel = 1;
@@ -265,24 +310,52 @@ pub fn initial_guess_from_hdf5chk(mol: &Molecule, scftype: &SCFType, chkfile: &S
     } else {
         spin_channel = mol.spin_channel;
     }
-    initial_guess_from_hdf5chkfile(chkfile, 
+    let (loaded_eigenvectors,loaded_eigenvalues,loaded_occupation) = import_guess_from_hdf5chkfile(chkfile, 
+            spin_channel,
+            // mol.num_state,
+            // mol.num_basis,
+            mol.ctrl.print_level
+        );
+    let (loaded_nbasis, loaded_nmo, loaded_spin_channel, loaded_spin, loaded_charge) = chkfile::load_basic(chkfile).unwrap();
+    let basis_match = (loaded_nbasis == mol.num_basis) && (loaded_nmo == mol.num_state);
+    if basis_match {
+        return initial_guess_from_raw(
+            loaded_eigenvectors,
+            loaded_eigenvalues,
+            loaded_occupation.unwrap(),
             spin_channel,
             mol.num_state,
             mol.num_basis,
-            mol.ctrl.print_level)
+            mol.ctrl.print_level
+        );
+    } else {
+        println!("The basis set in chkfile does not match the input basis set (loaded: {} basis, {} MOs; target: {} basis, {} MOs),", loaded_nbasis, loaded_nmo, mol.num_basis, mol.num_state);
+        println!("trying to project ...");
+        let (cint_raw_data, ecp_raw, basis4elem, cint_type) = chkfile::load_cint_data(chkfile);
+        let (mo2, _, occ2) = initial_guess_from_raw(
+            loaded_eigenvectors,
+            loaded_eigenvalues,
+            loaded_occupation.unwrap(),
+            loaded_spin_channel,
+            loaded_nmo,
+            loaded_nbasis,
+            mol.ctrl.print_level
+        );
+        let mut mol_source = Molecule::init_mol();
+        mol_source.cint_type = cint_type.unwrap_or(mol.cint_type);
+        mol_source.ctrl.spin = loaded_spin.unwrap_or(mol.ctrl.spin);
+        mol_source.ctrl.charge = loaded_charge.unwrap_or(mol.ctrl.charge);
+        mol_source.ctrl.print_level = mol.ctrl.print_level;
+        mol_source.update_from_cint(loaded_nbasis, basis4elem, cint_raw_data.unwrap(), ecp_raw);
+        assert!(proj::check_proj_sanity(&mol, &mol_source));
+        let mo = proj::proj_mo(mol, &mol_source, mo2);
+        println!("projection completed.");
+        return (mo, [vec![], vec![]], occ2);
+    }
+    
 }
 
-pub fn initial_guess_from_hdf5chkfile(
-    chkname: &str, 
-    spin_channel: usize,
-    num_state: usize,
-    num_basis: usize,
-    print_level: usize
-) -> ([MatrixFull<f64>;2],[Vec<f64>;2], Option<[Vec<f64>;2]>) {
-    
-    //let mut tmp_scf = SCF::new(&mol);
-    //tmp_scf.generate_occupation();
-
+pub fn import_guess_from_hdf5chkfile(chkname: &str, spin_channel: usize, print_level: usize) -> (Vec<f64>,Vec<f64>, Option<Vec<f64>>) {
     let file = hdf5::File::open(chkname).unwrap();
     let scf = file.group("scf").unwrap();
     let member = scf.member_names().unwrap();
@@ -293,63 +366,85 @@ pub fn initial_guess_from_hdf5chkfile(
     if print_level>0 {println!("E_tot from chkfile: {:18.10}", e_tot)};
     // importing MO coefficients
     let buf01 = scf.dataset("mo_coeff").unwrap().read_raw::<f64>().unwrap();
-    if buf01.len() != num_state*num_basis*spin_channel {
-        panic!("Inconsistency happens when importing the molecular coefficients from \'{}\':\n buf01 length: {}, num_state*num_basis*spin_channel: {}", 
-        chkname, buf01.len(), num_state*num_basis*spin_channel);
-    }
     // importing MO eigenvalues
     let buf02 = scf.dataset("mo_energy").unwrap().read_raw::<f64>().unwrap();
-    if buf02.len() != num_state*spin_channel {
-        panic!("Inconsistency happens when importing the molecular orbital eigenvalues from \'{}\':\n buf02 length: {}, num_state*spin_channel: {}", 
-        chkname, buf02.len(), num_state*spin_channel);
+    // importing MO occupation
+    // let is_exist = scf.member_names().unwrap().iter().fold(false, |is_exist, x| x.eq("mo_occupation"));
+    let buf03 = Some(scf.dataset("mo_occupation").unwrap().read_raw::<f64>().unwrap());
+    (buf01, buf02, buf03)
+}
+
+pub fn initial_guess_from_raw(
+    loaded_eigenvectors: Vec<f64>,
+    loaded_eigenvalues: Vec<f64>,
+    loaded_occupation: Vec<f64>,
+    spin_channel: usize,
+    num_state: usize,
+    num_basis: usize,
+    print_level: usize
+) -> ([MatrixFull<f64>;2],[Vec<f64>;2], Option<[Vec<f64>;2]>) {
+
+    let mut mode = "";
+    if loaded_eigenvectors.len() == num_state*num_basis*spin_channel {
+        mode = "normal"; // r2r or u2u
+    } else if loaded_eigenvectors.len() == num_state*num_basis && spin_channel==2 {
+        mode = "r2u";
+    } else if loaded_eigenvalues.len() == num_state*num_basis*2 && spin_channel==1 {
+        mode = "u2r";
+        panic!("Importing UHF MOs in RHF calculation is not supported at present");
+    } else {
+        panic!("Inconsistency happens when importing the MOs:\n loaded_eigenvectors length: {}, num_state*num_basis*spin_channel: {}, num_state*num_basis: {}", 
+        loaded_eigenvectors.len(), num_state*num_basis*spin_channel, num_state*num_basis);
     }
     let mut tmp_eigenvectors: [MatrixFull<f64>;2] = [MatrixFull::empty(),MatrixFull::empty()];
     let mut tmp_eigenvalues: [Vec<f64>;2] = [vec![],vec![]];
+    let mut tmp_occupation: [Vec<f64>;2] = [vec![],vec![]];
+    match mode {
+        "normal" => {
     (0..spin_channel).into_iter().for_each(|i| {
         let start = (0 + i)*num_state*num_basis;
         let end = (1 + i)*num_state*num_basis;
 
-        let tmp_eigen = MatrixFull::from_vec([num_state,num_basis], buf01[start..end].to_vec()).unwrap();
+        let tmp_eigen = MatrixFull::from_vec([num_state,num_basis], loaded_eigenvectors[start..end].to_vec()).unwrap();
         tmp_eigenvectors[i]=tmp_eigen.transpose_and_drop();
 
         //tmp_scf.eigenvectors[i] = tmp_eigenvectors[i].transpose();
 
-        tmp_eigenvalues[i]=buf02[ (0+i)*num_state..(1+i)*num_state].to_vec();
+        tmp_eigenvalues[i]=loaded_eigenvalues[ (0+i)*num_state..(1+i)*num_state].to_vec();
     });
     if print_level>3 {
         (0..spin_channel).into_iter().for_each(|i| {
             tmp_eigenvectors[i].formated_output(5, "full");
             println!("eigenval {:?}", &tmp_eigenvalues[i]);
         });
+    }            
+    (0..spin_channel).into_iter().for_each(|i_spin| {
+                tmp_occupation[i_spin]=loaded_occupation[ (0+i_spin)*num_state..(1+i_spin)*num_state].to_vec();
+            });        
+            // println!("tmp_eigenvectors {:?}, tmp_eigenvalues {:?}, tmp_occupation {:?}", &tmp_eigenvectors, &tmp_eigenvalues, &tmp_occupation);
+        },
+        "r2u" => {
+            println!("Importing MO coefficients in RHF format and converting them to UHF format");
+            (0..spin_channel).into_iter().for_each(|i| {
+                let start = 0;
+                let end = num_state*num_basis;
+
+                let tmp_eigen = MatrixFull::from_vec([num_state,num_basis], loaded_eigenvectors[start..end].to_vec()).unwrap();
+                tmp_eigenvectors[i]=tmp_eigen.transpose_and_drop();
+
+                tmp_eigenvalues[i]=loaded_eigenvalues[ 0..num_state].to_vec();
+            });
+            (0..spin_channel).into_iter().for_each(|i_spin| {
+                tmp_occupation[i_spin]=loaded_occupation[ 0..num_state].to_vec();
+            });
+        },
+        "u2r" => {},
+        _ => {
+            panic!("Unknown mode for importing MO coefficients");
+        }
     }
 
-    // importing MO occupation
-    let is_exist = scf.member_names().unwrap().iter().fold(false, |is_exist, x| x.eq("mo_occupation"));
-    let buf03 = if is_exist {
-        Some(scf.dataset("mo_occupation").unwrap().read_raw::<f64>().unwrap())
-    } else {
-        None
-    };
-    let tmp_occupation = if let Some(tmp_buf03) = &buf03 {
-        if tmp_buf03.len() != num_state*spin_channel {
-            panic!("Inconsistency happens when importing the molecular orbital occupation from \'{}\':\n buf03 length: {}, num_state*spin_channel: {}", 
-            chkname, tmp_buf03.len(), num_state*spin_channel);
-            let mut tmp_occupation_0 = [vec![],vec![]];
-            (0..spin_channel).into_iter().for_each(|i_spin| {
-                tmp_occupation_0[i_spin]=tmp_buf03[ (0+i_spin)*num_state..(1+i_spin)*num_state].to_vec();
-            });
-            Some(tmp_occupation_0)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    //tmp_scf.generate_density_matrix();
-
-    //tmp_scf.density_matrix
-    (tmp_eigenvectors,tmp_eigenvalues,tmp_occupation)
+    (tmp_eigenvectors,tmp_eigenvalues,Some(tmp_occupation))
 
 }
 
