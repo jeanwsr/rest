@@ -1,4 +1,4 @@
-use crate::scf_io::{scf, SCFType, SCF};
+use crate::scf_io::{SCFType, SCF};
 use crate::scf_io;
 use crate::utilities::TimeRecords;
 use crate::mpi_io::MPIOperator;

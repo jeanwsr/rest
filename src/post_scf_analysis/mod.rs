@@ -1,3 +1,4 @@
+#![warn(unused_imports)]
 pub mod rand_wf_real_space;
 pub mod cube_build;
 pub mod molden_build;
@@ -6,26 +7,24 @@ pub mod strong_correlation_correction;
 pub mod rrs_pbc;
 pub mod spin_correction;
 
-use std::path::Path;
 use rest_libcint::prelude::rest_libcint_wrapper::int1e_r;
-use tensors::{MathMatrix, MatrixFull, RIFull};
+use tensors::{MathMatrix, RIFull};
 
-use crate::constants::{ANG, AU2DEBYE, SPECIES_INFO};
-use crate::dft::{DFAFamily};
-use crate::geom_io::get_mass_charge;
+use crate::constants::{ANG, AU2DEBYE};
 use crate::grad::{formated_force, formated_force_ev, numerical_force};
 use crate::mpi_io::MPIOperator;
-use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon, open_shell_sbge2_rayon, close_shell_sbge2_detailed_rayon, open_shell_sbge2_detailed_rayon};
-use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon, evaluate_spin_response_rayon, evaluate_special_radius_only};
-use crate::ri_rpa::{evaluate_rpa_correlation, evaluate_rpa_correlation_rayon};
+use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon, open_shell_sbge2_rayon};
+use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon};
+use crate::ri_rpa::{evaluate_rpa_correlation_rayon};
 use crate::ri_gw;
 use crate::ri_bse;
 use crate::scf_io::{SCF, SCFType, print_force_for_ghost_point_charges};
 use crate::ri_pt2::{close_shell_pt2_rayon, open_shell_pt2_rayon};
 use crate::utilities::TimeRecords;
 
-use self::molden_build::{gen_header, gen_molden};
+use self::molden_build::{gen_molden};
 use self::strong_correlation_correction::scc15_for_rxdh7;
+pub use crate::fileop::chkfile::{save_chkfile, save_hamiltonian, save_overlap, save_geometry};
 
 pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
     scf_data.mol.ctrl.outputs.iter().for_each(|output_type| {
@@ -153,170 +152,6 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
     });
 }
 
-pub fn write_scf_attribute<T>(group: &hdf5::Group, dataset_name: &str, value: &[T]) 
-where 
-    T: Clone + hdf5::H5Type
-{
-    if let Ok(dataset) = group.dataset(dataset_name) {
-        match dataset.write_raw(value) {
-            Ok(_) => (),
-            Err(e) => println!("Error writing dataset {}: {:?}", dataset_name, e),
-        }
-    } else {
-        let builder = group.new_dataset_builder();
-        match builder.with_data(value).create(dataset_name) {
-            Ok(_) => (),
-            Err(e) => println!("Error creating dataset {}: {:?}", dataset_name, e),
-        }
-    }
-}
-
-pub fn save_chkfile(scf_data: &SCF) {
-    let chkfile= &scf_data.mol.ctrl.chkfile;
-    let path = Path::new(chkfile);
-    //if path.exists() {std::fs::remove_file(chkfile).unwrap()};
-    //let file = hdf5::File::create(chkfile).unwrap();
-    //let scf = file.create_group("scf").unwrap();
-    let file = if path.exists() {
-        hdf5::File::open_rw(chkfile).unwrap()
-    } else {
-        hdf5::File::create(chkfile).unwrap()
-    };
-    println!("write chkfile: {}", chkfile);
-    let is_exist = file.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("scf")});
-    let scf = if is_exist {
-        file.group("scf").unwrap()
-    } else {
-        file.create_group("scf").unwrap()
-    };
-
-    write_scf_attribute(&scf, "e_tot", &[scf_data.scf_energy]);
-    write_scf_attribute(&scf, "num_basis", &[scf_data.mol.num_basis]);
-    write_scf_attribute(&scf, "spin_channel", &[scf_data.mol.spin_channel]);
-    write_scf_attribute(&scf, "num_states", &[scf_data.mol.num_state]);
-
-    // let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("mo_coeff")});
-    let mut eigenvectors: Vec<f64> = vec![];
-    for i_spin in 0..scf_data.mol.spin_channel {
-        let tmp_eigenvectors = scf_data.eigenvectors[i_spin].transpose();
-        eigenvectors.extend(tmp_eigenvectors.data.iter());
-        if let SCFType::ROHF = scf_data.scftype { // ROHF: only process i_spin = 0, since alpha/beta eigenvectors are the same
-            break
-        }
-    }
-    write_scf_attribute(&scf, "mo_coeff", &eigenvectors);
-
-    let mut eigenvalues: Vec<f64> = vec![];
-    for i_spin in 0..scf_data.mol.spin_channel {
-        eigenvalues.extend(scf_data.eigenvalues[i_spin].iter());
-        if let SCFType::ROHF = scf_data.scftype { // ROHF: only process i_spin = 0, since alpha/beta eigenvalues are the same
-            break 
-        }
-    }
-    write_scf_attribute(&scf, "mo_energy", &eigenvalues);
-
-    let mut occ: Vec<f64> = vec![];
-    for i_spin in 0..scf_data.mol.spin_channel {
-        occ.extend(scf_data.occupation[i_spin].iter());
-    }
-    // for compatibility with old rest, may be removed in the future
-    write_scf_attribute(&scf, "mo_occupation", &occ);
-    // for compatibility with pyscf
-    write_scf_attribute(&scf, "mo_occ", &occ);
-
-    file.close();
-}
-
-pub fn save_hamiltonian(scf_data: &SCF) {
-    let chkfile= &scf_data.mol.ctrl.chkfile;
-    let path = Path::new(chkfile);
-    let file = if path.exists() {
-        hdf5::File::open_rw(chkfile).unwrap()
-    } else {
-        hdf5::File::create(chkfile).unwrap()
-    };
-    let is_exist = file.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("scf")});
-    let scf = if is_exist {
-        file.group("scf").unwrap()
-    } else {
-        file.create_group("scf").unwrap()
-    };
-    let mut hamiltonians: Vec<f64> = vec![];
-    for i_spin in 0..scf_data.mol.spin_channel {
-        let tmp_eigenvectors = scf_data.hamiltonian[i_spin].to_matrixfull().unwrap();
-        hamiltonians.extend(scf_data.eigenvalues[i_spin].iter());
-    }
-    let is_hamiltonian = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("hamiltonian")});
-    if is_hamiltonian {
-        let dataset = scf.dataset("hamiltonian").unwrap();
-        dataset.write(&hamiltonians);
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&hamiltonians).create("hamiltonian");
-    };
-    file.close();
-}
-
-pub fn save_overlap(scf_data: &SCF) {
-    let chkfile= &scf_data.mol.ctrl.chkfile;
-    let path = Path::new(chkfile);
-    let file = if path.exists() {
-        hdf5::File::open_rw(chkfile).unwrap()
-    } else {
-        hdf5::File::create(chkfile).unwrap()
-    };
-    let is_exist = file.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("scf")});
-    let scf = if is_exist {
-        file.group("scf").unwrap()
-    } else {
-        file.create_group("scf").unwrap()
-    };
-    let mut overlap: Vec<f64> = vec![];
-    let overlap = scf_data.ovlp.to_matrixfull().unwrap();
-    let is_exist = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("overlap")});
-    if is_exist {
-        let dataset = scf.dataset("overlap").unwrap();
-        dataset.write(&overlap.data);
-    } else {
-        let builder = scf.new_dataset_builder();
-        builder.with_data(&overlap.data).create("overlap");
-    };
-    file.close();
-}
-
-pub fn save_geometry(scf_data: &SCF) {
-    let ang = crate::constants::ANG;
-    let chkfile= &scf_data.mol.ctrl.chkfile;
-    let path = Path::new(chkfile);
-    let file = if path.exists() {
-        hdf5::File::open_rw(chkfile).unwrap()
-    } else {
-        hdf5::File::create(chkfile).unwrap()
-    };
-    let is_geom = file.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("geom")});
-    let geom = if is_geom {
-        file.group("geom").unwrap()
-    } else {
-        file.create_group("geom").unwrap()
-    };
-    let mass_charge = get_mass_charge(&scf_data.mol.geom.elem);
-    //let mut geometry: Vec<(f64,f64,f64,f64)> = vec![];
-    let mut geometry: Vec<[f64;4]> = vec![];
-    mass_charge.iter().zip(scf_data.mol.geom.position.iter_columns_full()).for_each(|(mass_charge, position)| {
-        geometry.push([mass_charge.1,position[0]*ang,position[1]*ang,position[2]*ang]);
-        //geometry.push((mass_charge.1,position[0]*ang,position[1]*ang,position[2]*ang));
-    });
-
-    let is_geom = geom.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("position")});
-    if is_geom {
-        let dataset = geom.dataset("position").unwrap();
-        dataset.write(&geometry);
-    } else {
-        let builder = geom.new_dataset_builder();
-        builder.with_data(&geometry).create("position");
-    }
-    file.close();
-}
 
 pub fn print_out_dfa(scf_data: &SCF) {
     let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);

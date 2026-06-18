@@ -112,7 +112,7 @@
 - `basis_type`: 取值String类型。设置基函数类型。选项：
     - `Spheric`: 球谐型基函数（默认值）
 	- `Cartesian`：笛卡尔型基函数
-- `basis_path`: 取值String类型，必需参数，无默认值。指定基组文件路径。该文件夹内包含各元素的基组JSON文件（如`C.json`、`O.json`）
+- `basis_path`: 取值String类型，必需参数，无默认值。`basis_path = "chkfile"` 时将从 checkpoint 文件读取基组。其他情况下，该关键词指定基组文件路径，此路径包含各元素的基组JSON文件（如`C.json`、`O.json`）
     - 格式示例：  
       ```bash
       # 完整路径格式（明确指定）
@@ -165,27 +165,28 @@ REST 支持用户自定义或混合基组：
 ### 配置示例
 ```plaintext
 # 示例1：使用标准基组和缺省辅助基组（简写格式）
-eri_type = ri-v
 basis_type = Spheric
 basis_path = cc-pvtz                    # 程序自动搜索 cc-pvtz 文件夹
 
 # 示例2：使用标准基组，同时申明辅助基组（简写格式）
-eri_type = ri-v
 basis_type = Spheric
 basis_path = cc-pvtz                    # 程序自动搜索 cc-pvtz 文件夹
 auxbas_path = def2-universal-jkfit      # 程序自动搜索同名辅助基组文件夹
 
 # 示例3：使用自定义基组（相对路径）
-eri_type = ri-v
 basis_type = Cartesian
 basis_path = ./my_project_basis         # 使用当前目录下的自定义基组
 auxbas_path = ./my_aux_basis            # 使用自定义辅助基组
 
 # 示例4：使用完整路径
-eri_type = ri-v
 basis_type = Spheric
 basis_path = /shared/basis/def2-TZVP    # 明确指定完整路径
 auxbas_path = def2-universal-jkfit      # 简写格式，自动搜索
+
+# 示例5：从 checkpoint 文件读取初猜
+basis_path = "chkfile"
+auxbas_path = "def2-universal-jkfit"
+guessfile = "my_checkpoint.rchk"
 ```
 
 ## 自洽场计算相关关键词（Keyword）
@@ -198,7 +199,7 @@ auxbas_path = def2-universal-jkfit      # 简写格式，自动搜索
 - `guess_mix_theta_deg`: 取值`[f64;2]`或f64，分别设置两个自旋通道的混合角度（单位：度）。
     - 设为0.0，则表示完全不混合
     - 在0.0-90.0范围内，角度越大，表示破坏原始初猜效果越显著。一般建议取值0.0-45.0。缺省为[15.0, 15.0]
-- `guessfile`: 取值String。给定初猜的 checkpoint 文件。缺省为none。不会在计算结束后被覆盖。
+- `guessfile`: 取值String。给定初猜的 checkpoint 文件。缺省为none。不会在计算结束后被覆盖。guessfile/chkfile 中的基组与当前计算指定的基组不一致时，会尝试进行基组投影。
 - `chkfile`: 取值String。保存计算结果的 checkpoint 文件。缺省为none。如该文件在计算开始前已存在，则会尝试从中读取初猜，但在计算结束后会覆盖该文件。所以不推荐采用 `chkfile` 提供初猜，而是建议采用 `guessfile`。
 对于 `guessfile` 和 `chkfile`，推荐以下两种使用方式（文件后缀没有要求，可以是任意的或没有）：
 （1） 不读取初猜，只保存计算结果
