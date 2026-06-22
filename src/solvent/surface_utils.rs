@@ -44,8 +44,8 @@ impl SurfaceCalc{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum RadiusScheme {
-    #[default]
     Bondi,
+    #[default]
     UFF,
 }
 
@@ -79,6 +79,58 @@ impl<'d> Deserialize<'d> for RadiusScheme {
             _ => Err(serde::de::Error::custom(format!("Unknown RadiusScheme: {}", s))),
         }
     }
+}
+
+// =============================================================================
+//  SMD-specific cavity radii (eq. 16, Marenich et al. JPCB 2009)
+// =============================================================================
+
+/// Bohr → Å conversion factor
+const BOHR2ANG: f64 = 0.52917724924;
+
+/// SMD intrinsic atomic Coulomb radii (Å), indexed by atomic number Z.
+/// Unlisted elements fall back to Bondi vdW radii.
+const SMD_RADII_ANG: [f64; 104] = {
+    let mut r = [0.0f64; 104];
+    r[1]  = 1.20;  // H
+    r[6]  = 1.85;  // C
+    r[7]  = 1.89;  // N
+    r[9]  = 1.73;  // F
+    r[14] = 2.47;  // Si
+    r[15] = 2.12;  // P
+    r[16] = 2.49;  // S
+    r[17] = 2.38;  // Cl
+    r[35] = 2.60;  // Br  (SMD18)
+    r[53] = 2.74;  // I
+    r
+};
+
+/// Build SMD-specific cavity radii for the given atoms.
+///
+/// Oxygen radius depends on the solvent H-bond acidity `alpha`:
+/// ```text
+/// R_O = 1.52          if α ≥ 0.43
+///       1.52 + 1.8×(0.43−α)   otherwise
+/// ```
+/// All other specialized elements (H, C, N, F, Si, P, S, Cl, Br, I) use
+/// fixed SMD values. Unparameterized elements fall back to Bondi radii.
+///
+/// Returns radii in **Bohr**.
+pub fn smd_radii(alpha: f64, atomic_numbers: &[usize]) -> Vec<f64> {
+    let r_o_ang = if alpha >= 0.43 {
+        1.52
+    } else {
+        1.52 + 1.8 * (0.43 - alpha)
+    };
+    atomic_numbers.iter().map(|&z| {
+        if z == 8 {
+            r_o_ang / BOHR2ANG
+        } else if z < SMD_RADII_ANG.len() && SMD_RADII_ANG[z] > 0.0 {
+            SMD_RADII_ANG[z] / BOHR2ANG
+        } else {
+            data::VDW_RADII[z]  // fallback to Bondi (Bohr)
+        }
+    }).collect()
 }
 
 /// surface configurations

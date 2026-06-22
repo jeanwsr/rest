@@ -29,6 +29,7 @@ pub use ri_pt2_io::*;
 
 mod pyrest_ctrl_io;
 mod geometric_pyo3_io;
+mod solvent;
 pub mod quasiparticle_methods;
 pub mod tddft_parameters;
 pub mod cphf_parameters;
@@ -220,6 +221,11 @@ pub struct InputKeywords {
     pub solvent_model: PcmMethod,
     pub solv_chunk: usize,
     pub pcm_cavity_radii: RadiusScheme,
+    /// SMD solvent name (e.g. "water", "acetone"). Looked up in solvent_db.
+    /// When non-empty and method==SMD, auto-populates solvent_descriptors and solv_epsilon.
+    pub solvent_name: String,
+    /// SMD solvent descriptors [n, n25, α, β, γ, ε, φ, ψ]. Default: water.
+    pub solvent_descriptors: Option<[f64; 8]>,
     #[pyo3(get, set)]
     // The initial MO coefficients and eigenvalues can be imported by setting chkfile
     pub chkfile: String,
@@ -476,6 +482,8 @@ impl InputKeywords {
             solvent_model: PcmMethod::CPCM,
             solv_chunk: 8,
             pcm_cavity_radii: RadiusScheme::UFF,
+            solvent_name: String::new(),
+            solvent_descriptors: None, 
             stop_at: None,
             xc_parser: String::from("legacy"),
             j2c_decomp: J2CDecompOption::default(),
@@ -697,7 +705,12 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
                 ctrl.guess_mix_theta_deg[0], ctrl.guess_mix_theta_deg[1]);
         }
         if ctrl.solvent_enabled {
-                println!("Current solvent model is {}.",ctrl.solvent_model)
+            println!("Current solvent model is {}.",ctrl.solvent_model);
+            if ctrl.solvent_name.is_empty() {
+                println!("Solvent: {} (eps = {:.4})", ctrl.solvent_model, ctrl.solv_epsilon);
+            } else {
+                println!("Solvent: {} ({}, eps = {:.4})", ctrl.solvent_name, ctrl.solvent_model, ctrl.solv_epsilon);
+            }
         }
 
     }
@@ -1182,11 +1195,14 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
                 serde_json::Value::Null =>{
                     match tmp_ctrl.get("solvent_model").unwrap_or(&serde_json::Value::Null) {
-                        serde_json::Value::String(model_str) => !model_str.trim().is_empty(),
-                        _ => false,
+                        serde_json::Value::String(s) => !s.trim().is_empty(),
+                        _ => match tmp_ctrl.get("solvent").unwrap_or(&serde_json::Value::Null) {
+                            serde_json::Value::String(s) => !s.trim().is_empty(),
+                            _ => false,
+                        },
                     }
                 },
-                other => false,
+                    other => false,
             };
             tmp_input.solvent_ri = match tmp_ctrl.get("solvent_ri").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(true),
@@ -1205,12 +1221,18 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 },
                 None => RadiusScheme::UFF,
             };
+            let has_explicit_eps = matches!(
+                tmp_ctrl.get("solv_epsilon").unwrap_or(&serde_json::Value::Null),
+                serde_json::Value::String(_) | serde_json::Value::Number(_)
+            );
             tmp_input.solv_epsilon = match tmp_ctrl.get("solv_epsilon").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_fc) => {tmp_fc.to_lowercase().parse().unwrap_or(1.0_f64)},
                 serde_json::Value::Number(tmp_fc) => {tmp_fc.as_f64().unwrap_or(1.0_f64) as f64},
-                other => {
-                    println!("WARNING: No solvent epsilon provided, use epsilon of vacuum.");
+                serde_json::Value::Null => {
                     1.0_f64
+                },
+                other => {
+                    panic!("ERROR: False form of solvent epsilon provided, please write as string or float number.");
                 },
             };
             // Experimental function
@@ -1219,6 +1241,41 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
                 other => {8},
             };
+
+            // Explicit solvent_descriptors array [n, n25, α, β, γ, ε, φ, ψ]
+            tmp_input.solvent_descriptors = match tmp_ctrl.get("solvent_descriptors").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(arr) => {
+                    let vals: Vec<f64> = arr.iter()
+                        .filter_map(|v| v.as_f64())
+                        .collect();
+                    if vals.len() == 8 {
+                        let desc = [vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]];
+                        if has_explicit_eps && (desc[5] - tmp_input.solv_epsilon).abs() > 0.1 {
+                            panic!("ERROR: solvent_descriptors epsilon ({:.4}) != solv_epsilon ({:.4}). \
+                                   Please set only one or ensure they match.", desc[5], tmp_input.solv_epsilon);
+                        }
+                        if !has_explicit_eps {
+                            tmp_input.solv_epsilon = desc[5];
+                        }
+                        Some(desc)
+                    } else {
+                        panic!("ERROR: solvent_descriptors must be an array of 8 floats [n, n25, α, β, γ, ε, φ, ψ].");
+                    }
+                },
+                _ => None,
+            };
+
+            if let Some((name, eps, solv_data)) = solvent::parse_solvent_name(tmp_ctrl) {
+                tmp_input.solvent_name = name;
+                tmp_input.solv_epsilon = eps;
+                tmp_input.solvent_descriptors = Some(solv_data);
+            }
+
+            if tmp_input.solvent_enabled && tmp_input.solvent_name.is_empty()
+                && tmp_input.solvent_descriptors.is_none() && tmp_input.solv_epsilon == 1.0_f64
+            {
+                panic!("ERROR: solvent_enabled is true but solvent/solvent_descriptors/solv_epsilon is not provided. Check your solvent settings.");
+            }
 
             // ==============================================
             //  Keywords associated with the SCF procedure
