@@ -1,11 +1,15 @@
-use std::sync::{Arc, Mutex};
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use rayon::prelude::*;
 use rstsr::prelude::*;
 use rest_tensors::{MatrixFull, MatrixFullSlice, RIFull};
 use rest_tensors::matrix_blas_lapack::{ _einsum_01_serial, _einsum_02_serial};
 use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
-use tensors::matrix_blas_lapack::{_dgemm, omp_set_num_threads_wrapper, omp_get_num_threads_wrapper};
+use tensors::matrix_blas_lapack::{_dgemm};
+use rayon::iter::{
+    ParallelIterator, IndexedParallelIterator,
+    plumbing::{Consumer, Folder, Producer, ProducerCallback, bridge},
+};
 use crate::scf_io::SCF;
 use crate::molecule_io::Molecule;
 use crate::basis_io::{spheric_gto_deriv_batch_serial};
@@ -1497,7 +1501,8 @@ fn fxc_matvec_gga_nwchem_opt(data: &mut FXCMatvecDataNwchemOpt, z: &[f64]) -> Ve
     result.data
 }
 
-#[derive(Debug, Clone)]
+
+#[derive(Debug, Clone, Copy)]
 pub struct BlockSettings {
     pub ao_deriv: usize,
     pub max_memory: usize, // in MB
@@ -1570,12 +1575,121 @@ impl<'a> Iterator for GridIterator<'a> {
     }
 }
 
+/// Producer that splits block indices and evaluates AO batches in each fold.
+struct GridBlockProducer<'a> {
+    mol: &'a Molecule,
+    grids: &'a Grids,
+    settings: BlockSettings,
+    total_grids: usize,
+    /// Range of block indices this producer owns, [block_start, block_end).
+    block_range: Range<usize>,
+}
+
+impl<'a> GridBlockProducer<'a> {
+    fn block_start(&self, block_idx: usize) -> usize {
+        block_idx * self.settings.blksize
+    }
+    fn block_end(&self, block_idx: usize) -> usize {
+        (self.block_start(block_idx) + self.settings.blksize).min(self.total_grids)
+    }
+    fn produce(&self, block_idx: usize) -> BlockData<'a> {
+        let start = self.block_start(block_idx);
+        let end = self.block_end(block_idx);
+        let num_grids = end - start;
+        let coords = &self.grids.coordinates[start..end];
+        let weights = &self.grids.weights[start..end];
+        let ao = eval_ao_batch(self.mol, coords, self.settings.ao_deriv, num_grids);
+        BlockData { coords, weights, ao }
+    }
+}
+
+/// Sequential iterator over blocks for the producer's `IntoIter`.
+struct GridBlockIter<'a> {
+    producer: GridBlockProducer<'a>,
+    next_block_idx: usize,
+    block_end: usize,
+}
+
+impl<'a> Iterator for GridBlockIter<'a> {
+    type Item = BlockData<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_block_idx >= self.block_end {
+            return None;
+        }
+        let block = self.producer.produce(self.next_block_idx);
+        self.next_block_idx += 1;
+        Some(block)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.block_end - self.next_block_idx;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a> ExactSizeIterator for GridBlockIter<'a> {}
+
+impl<'a> DoubleEndedIterator for GridBlockIter<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.next_block_idx >= self.block_end {
+            return None;
+        }
+        let last_block_idx = self.block_end - 1;
+        let block = self.producer.produce(last_block_idx);
+        self.block_end = last_block_idx;
+        Some(block)
+    }
+}
+
+impl<'a> Producer for GridBlockProducer<'a> {
+    type Item = BlockData<'a>;
+    type IntoIter = GridBlockIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        GridBlockIter {
+            next_block_idx: self.block_range.start,
+            block_end: self.block_range.end,
+            producer: self,
+        }
+    }
+
+    fn split_at(self, index: usize) -> (Self, Self) {
+        let GridBlockProducer { mol, grids, settings, total_grids, block_range } = self;
+        let mid = block_range.start + index;
+        (
+            GridBlockProducer {
+                mol, grids, settings, total_grids,
+                block_range: block_range.start..mid,
+            },
+            GridBlockProducer {
+                mol, grids, settings, total_grids,
+                block_range: mid..block_range.end,
+            },
+        )
+    }
+
+    fn fold_with<F>(self, mut folder: F) -> F
+    where
+        F: Folder<Self::Item>,
+    {
+        for block_idx in self.block_range.start..self.block_range.end {
+            let block = self.produce(block_idx);
+            folder = folder.consume(block);
+            if folder.full() {
+                break;
+            }
+        }
+        folder
+    }
+}
+
 pub struct GridParallelIterator<'a> {
     mol: &'a Molecule,
     grids: &'a Grids,
     settings: BlockSettings,
-    current: Arc<Mutex<usize>>, 
     total_grids: usize,
+    num_blocks: usize,
 }
 
 impl<'a> GridParallelIterator<'a> {
@@ -1584,63 +1698,53 @@ impl<'a> GridParallelIterator<'a> {
         grids: &'a Grids,
         settings: BlockSettings,
     ) -> Self {
-        let total_grids = grids.coordinates.len() / 3;
-        Self {
-            mol,
-            grids,
-            settings,
-            current: Arc::new(Mutex::new(0)),
-            total_grids,
-        }
+        let total_grids = grids.weights.len();
+        let num_blocks = if total_grids == 0 { 0 }
+            else { (total_grids + settings.blksize - 1) / settings.blksize };
+        Self { mol, grids, settings, total_grids, num_blocks }
     }
 }
 
-// impl<'a> ParallelIterator for GridParallelIterator<'a> {
-//     type Item = BlockData<'a>;
+impl<'a> ParallelIterator for GridParallelIterator<'a> {
+    type Item = BlockData<'a>;
 
-//     fn drive_unindexed<C>(self, consumer: C) -> C::Result
-//     where
-//         C: rayon::iter::plumbing::UnindexedConsumer<Self::Item>,
-//     {
-//         rayon::iter::plumbing::bridge(self, consumer)
-//     }
+    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+    where
+        C: rayon::iter::plumbing::UnindexedConsumer<Self::Item>,
+    {
+        bridge(self, consumer)
+    }
 
-//     fn opt_len(&self) -> Option<usize> {
-//         Some((self.total_grids + self.settings.blksize - 1) / self.settings.blksize)
-//     }
-// }
+    fn opt_len(&self) -> Option<usize> {
+        Some(self.num_blocks)
+    }
+}
 
-// impl<'a> rayon::iter::plumbing::ParallelIteratorBridge for GridParallelIterator<'a> {
-//     fn fold_with<F>(self, folder: F) -> F
-//     where
-//         F: rayon::iter::plumbing::Folder<Self::Item>,
-//     {
-//         let blksize = self.settings.blksize;
-//         let mut current = self.current.lock().unwrap();
-            
-//         while *current < self.total_grids {
-//             let start = *current;
-//             let end = (start + blksize).min(self.total_grids);
-//             *current = end; 
+impl<'a> IndexedParallelIterator for GridParallelIterator<'a> {
+    fn len(&self) -> usize {
+        self.num_blocks
+    }
 
-//             drop(current);
-                
-//             let block = BlockData {
-//                 ao: eval_ao_batch(
-//                     self.mol,
-//                     &self.grids.coordinates.slice(s![start..end]),
-//                     self.settings.ao_deriv,
-//                 ),
-//                 weights: self.grids.weights.slice(s![start..end]),
-//                 coords: self.grids.coordinates.slice(s![start..end]),
-//             };
+    fn drive<C>(self, consumer: C) -> C::Result
+    where
+        C: Consumer<Self::Item>,
+    {
+        bridge(self, consumer)
+    }
 
-//             let folder = folder.consume(block);
-//             current = self.current.lock().unwrap();
-//         }
-//         folder 
-//     }
-// }
+    fn with_producer<CB>(self, callback: CB) -> CB::Output
+    where
+        CB: ProducerCallback<Self::Item>,
+    {
+        callback.callback(GridBlockProducer {
+            mol: self.mol,
+            grids: self.grids,
+            settings: self.settings,
+            total_grids: self.total_grids,
+            block_range: 0..self.num_blocks,
+        })
+    }
+}
 
 pub trait NumInt<'a> {
 
@@ -1659,7 +1763,7 @@ pub trait NumInt<'a> {
         GridIterator::new(mol, grids, settings)
     }
 
-    fn par_blook_loop(
+    fn par_block_loop(
         &'a self,
         mol: &'a Molecule,
         grids: &'a mut Grids,
