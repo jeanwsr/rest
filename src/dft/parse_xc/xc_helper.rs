@@ -1,5 +1,6 @@
 use lazy_static::lazy_static;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use serde_json;
 use crate::dft::DFAFamily;
 
@@ -286,33 +287,61 @@ pub fn load_json_functionals() -> HashMap<String, XC2step> {
     map1
 }
 
-pub fn load_user_json_functionals() -> Option<HashMap<String, XC2step>> {
-    if let Ok(data_path) = std::env::var("REST_DATA_DIR") {
-        println!("Detected REST_DATA_DIR environment variable: {}", data_path);
-        // read all json files in data_path, then load them and construct HashMap<String, XC2step>
-        let mut map = HashMap::new();
-        if let Ok(entries) = std::fs::read_dir(&data_path) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") 
-                    && path.file_name().and_then(|s| s.to_str()).map(|s| s.starts_with("xc")).unwrap_or(false) {
-                        if let Ok(json_str) = std::fs::read_to_string(&path) {
-                            let json_map = load_json(&json_str);
-                            map.extend(json_map);
-                            println!("Loaded JSON file: {:?}", path);
-                        } else {
-                            println!("Failed to read JSON file: {:?}", path);
-                        }
+fn load_json_from_dir(dir: &Path) -> HashMap<String, XC2step> {
+    let mut map = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json")
+                && path.file_name().and_then(|s| s.to_str()).map(|s| s.starts_with("xc")).unwrap_or(false) {
+                    if let Ok(json_str) = std::fs::read_to_string(&path) {
+                        map.extend(load_json(&json_str));
+                        println!("Loaded JSON file: {:?}", path);
+                    } else {
+                        println!("Failed to read JSON file: {:?}", path);
                     }
                 }
             }
-        } else {
-            println!("Failed to read directory: {}", data_path);
         }
-        return Some(map);
+    } else {
+        println!("Failed to read directory: {:?}", dir);
     }
-    None
+    map
+}
+
+pub fn load_user_json_functionals() -> Option<HashMap<String, XC2step>> {
+    // Collect candidate directories in priority order. Later directories win on
+    // name clashes (plain last-wins extend), so the current working directory is
+    // placed after REST_DATA_DIR and therefore overrides it.
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(data_path) = std::env::var("REST_DATA_DIR") {
+        println!("Detected REST_DATA_DIR environment variable: {}", data_path);
+        dirs.push(PathBuf::from(data_path));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        println!("Detected current working directory: {:?}", cwd);
+        dirs.push(cwd);
+    }
+
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut map = HashMap::new();
+    for dir in &dirs {
+        // Avoid scanning (and logging) the same directory twice, e.g. when
+        // REST_DATA_DIR points at the current working directory.
+        let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        if seen.contains(&canon) {
+            continue;
+        }
+        seen.push(canon);
+        map.extend(load_json_from_dir(dir));
+    }
+
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
+    }
 }
 
 fn load_json(json_str: &str) -> HashMap<String, XC2step> {
