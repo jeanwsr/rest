@@ -658,7 +658,8 @@ fn compute_solver_aux(
 
     // dt_q = D^T · q_sym   (SSVPE only)
     let dt_q: Vec<f64> = if is_ssvpe {
-        let dt_q_mat = _dgemm_scaled(&pstatic.D, 'T', q_sym, 'N', 1.0);
+        let q_col: Vec<f64> = (0..ngrids).map(|i| q_sym[(i, 0)]).collect();
+        let dt_q_mat = _dgemm_scaled(&pstatic.D, 'T', &q_col, 'N', 1.0);
         (0..ngrids).map(|i| dt_q_mat[(i, 0)]).collect()
     } else {
         vec![0.0; ngrids]
@@ -973,7 +974,8 @@ pub fn compute_de_dd_t(
 
     for xyz in 0..3 {
         // dD^T · q   (BLAS: dD^T[n,n] × q[n,1] → [n,1])
-        let ddt_q = _dgemm_scaled(&dd[xyz], 'T', q_sym, 'N', 1.0);
+        let q_col: Vec<f64> = (0..ngrids).map(|i| q_sym[(i, 0)]).collect();
+        let ddt_q = _dgemm_scaled(&dd[xyz], 'T', &q_col, 'N', 1.0);
 
         // dD · vk1_sa   (BLAS: dD[n,n] × vk1_sa[n,1] → [n,1])
         let vk1_sa_col: Vec<f64> = vk1_sa.to_vec();
@@ -1154,20 +1156,33 @@ pub fn grad_solvent_solver(
 
             // DEBUG: print per‑component stats for PySCF comparison
             {
-                // scale components to their final values for display
+                // All values scaled to match PySCF convention:
+                //   de_r = ½α·raw_dD + ½α·raw_dA  (full contribution)
+                //   de_s0 = −½·raw                                           ← same as PySCF
+                //   de_dD/de_dA/de_s1 = α·½·raw = final dK contribution      ← was missing α!
                 let mut de_s0_final = de_s0_raw;
                 for v in de_s0_final.data.iter_mut() { *v *= -0.5; }
                 let (s0min, s0max, s0rms) = grad_stats(&de_s0_final);
-                let (ddmin, ddmax, ddrms) = grad_stats(&de_dd);
-                let (damin, damax, darms) = grad_stats(&de_da);
-                let (s1min, s1max, s1rms) = grad_stats(&de_s1);
-                let (rmin, rmax, rrms) = grad_stats(&de_r);
+                let (rmin, rmax, rrms) = grad_stats(&de_r);                  // already ½α
                 let (tmin, tmax, trms) = grad_stats(&de);
+                // de_dd/de_da/de_s1: stored as ½·raw, multiply by α for comparison
+                let dd_scaled: Vec<f64> = de_dd.data.iter().map(|v| v * alpha).collect();
+                let da_scaled: Vec<f64> = de_da.data.iter().map(|v| v * alpha).collect();
+                let s1_scaled: Vec<f64> = de_s1.data.iter().map(|v| v * alpha).collect();
+                let dd_rms = (dd_scaled.iter().map(|x| x*x).sum::<f64>() / dd_scaled.len() as f64).sqrt();
+                let da_rms = (da_scaled.iter().map(|x| x*x).sum::<f64>() / da_scaled.len() as f64).sqrt();
+                let s1_rms = (s1_scaled.iter().map(|x| x*x).sum::<f64>() / s1_scaled.len() as f64).sqrt();
+                let dd_min = dd_scaled.iter().cloned().fold(f64::INFINITY, f64::min);
+                let dd_max = dd_scaled.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let da_min = da_scaled.iter().cloned().fold(f64::INFINITY, f64::min);
+                let da_max = da_scaled.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let s1_min = s1_scaled.iter().cloned().fold(f64::INFINITY, f64::min);
+                let s1_max = s1_scaled.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 eprintln!("[IEFPCM grad components] de_r(dR): (min={rmin:.6e}, max={rmax:.6e}, rms={rrms:.6e})");
                 eprintln!("[IEFPCM grad components] de_s0:   (min={s0min:.6e}, max={s0max:.6e}, rms={s0rms:.6e})");
-                eprintln!("[IEFPCM grad components] de_dD:   (min={ddmin:.6e}, max={ddmax:.6e}, rms={ddrms:.6e})");
-                eprintln!("[IEFPCM grad components] de_dA:   (min={damin:.6e}, max={damax:.6e}, rms={darms:.6e})");
-                eprintln!("[IEFPCM grad components] de_dS1:  (min={s1min:.6e}, max={s1max:.6e}, rms={s1rms:.6e})");
+                eprintln!("[IEFPCM grad components] de_dD:   (min={dd_min:.6e}, max={dd_max:.6e}, rms={dd_rms:.6e})");
+                eprintln!("[IEFPCM grad components] de_dA:   (min={da_min:.6e}, max={da_max:.6e}, rms={da_rms:.6e})");
+                eprintln!("[IEFPCM grad components] de_dS1:  (min={s1_min:.6e}, max={s1_max:.6e}, rms={s1_rms:.6e})");
                 eprintln!("[IEFPCM grad components] TOTAL:   (min={tmin:.6e}, max={tmax:.6e}, rms={trms:.6e})");
             }
 
@@ -1199,9 +1214,11 @@ pub fn grad_solvent_solver(
             let de_r_da = compute_de_da(&vk1_d_mul_v, &dA_deriv, natm);
             for i in 0..de_r.data.len() { de_r.data[i] += de_r_da.data[i]; }
             for v in de_r.data.iter_mut() { *v *= 0.5 * alpha; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-r", &de_r); }
 
             // --- de_s0 (same as CPCM) ---
             let de_s0_raw = compute_de_ds0(&aux.vk1, q_sym, &dS, &dSii_dF, &dF, gslice, natm);
+            if ief_debug_enabled() { ief_print_grad("assembly.de-s0", &de_s0_raw); }
 
             // --- de_dD, de_dA, de_dS1 (same as IEFPCM) ---
             let asq: Vec<f64> = pstatic.A.iter()
@@ -1210,15 +1227,18 @@ pub fn grad_solvent_solver(
                 .collect();
             let mut de_dd = compute_de_dd(&aux.vk1, dD, &asq, gslice, natm);
             for v in de_dd.data.iter_mut() { *v *= 0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-dd", &de_dd); }
 
             let vk1_d_mul_sq: Vec<f64> = (0..ngrids)
                 .map(|i| aux.vk1_d[(0, i)] * aux.sq[(i, 0)])
                 .collect();
             let mut de_da = compute_de_da(&vk1_d_mul_sq, &dA_deriv, natm);
             for v in de_da.data.iter_mut() { *v *= 0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-da", &de_da); }
 
             let mut de_s1 = compute_de_ds1(&aux.vk1_da, q_sym, &dS, &dSii_dF, &dF, gslice, natm);
             for v in de_s1.data.iter_mut() { *v *= 0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-s1", &de_s1); }
 
             // --- SSVPE transpose terms ---
             // ADT_q = A ⊙ (D^T·q)
@@ -1228,6 +1248,7 @@ pub fn grad_solvent_solver(
                 .collect();
             let mut de_s1_t = compute_de_ds1_t(&aux.vk1, &adt_q, &dS, &dSii_dF, &dF, gslice, natm);
             for v in de_s1_t.data.iter_mut() { *v *= 0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-s1_T", &de_s1_t); }
 
             // vk1_sa = vk1^T·S ⊙ A
             let vk1_sa: Vec<f64> = aux.vk1_s.iter()
@@ -1236,6 +1257,7 @@ pub fn grad_solvent_solver(
                 .collect();
             let mut de_dd_t = compute_de_dd_t(&vk1_sa, q_sym, dD, gslice, natm);
             for v in de_dd_t.data.iter_mut() { *v *= 0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-dd_T", &de_dd_t); }
 
             // vk1_S ⊙ DT_q
             let vk1_s_mul_dtq: Vec<f64> = aux.vk1_s.iter()
@@ -1244,6 +1266,7 @@ pub fn grad_solvent_solver(
                 .collect();
             let mut de_da_t = compute_de_da_t(&vk1_s_mul_dtq, &dA_deriv, natm);
             for v in de_da_t.data.iter_mut() { *v *= 0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-da_T", &de_da_t); }
 
             // de = de_r − ½·de_s0_raw + γ·(de_dd + de_da + de_s1
             //                               + de_dd_t + de_da_t + de_s1_t)
@@ -1253,29 +1276,64 @@ pub fn grad_solvent_solver(
                     - gamma * (de_dd.data[i] + de_da.data[i] + de_s1.data[i]
                              + de_dd_t.data[i] + de_da_t.data[i] + de_s1_t.data[i]);
             }
+            if ief_debug_enabled() { ief_print_grad("assembly.final", &de); }
 
             // DEBUG: print per‑component stats for PySCF comparison
             {
+                // All values scaled to match PySCF convention (pyscf_ssvpe_comps.py):
+                //   de_r = ½α·raw                              ← same as PySCF
+                //   de_s0 = −½·raw                             ← same as PySCF
+                //   de_dD/de_dA/de_s1 = γ·½·raw               ← was missing γ!
+                //   de_dS1_T/de_dD_T/de_dA_T = γ·½·raw        ← was missing γ!
                 let mut de_s0_final = de_s0_raw;
                 for v in de_s0_final.data.iter_mut() { *v *= -0.5; }
                 let (s0min, s0max, s0rms) = grad_stats(&de_s0_final);
-                let (ddmin, ddmax, ddrms) = grad_stats(&de_dd);
-                let (damin, damax, darms) = grad_stats(&de_da);
-                let (s1min, s1max, s1rms) = grad_stats(&de_s1);
-                let (s1tmin, s1tmax, s1trms) = grad_stats(&de_s1_t);
-                let (ddtmin, ddtmax, ddtrms) = grad_stats(&de_dd_t);
-                let (datmin, datmax, datrms) = grad_stats(&de_da_t);
-                let (rmin, rmax, rrms) = grad_stats(&de_r);
+                let (rmin, rmax, rrms) = grad_stats(&de_r);                  // already ½α
                 let (tmin, tmax, trms) = grad_stats(&de);
+
+                // dK terms: scale ½·raw → γ·½·raw for PySCF comparison
+                let scale_rms = |v: &[f64]| {
+                    let n = v.len() as f64;
+                    (v.iter().map(|x| (x * gamma).powi(2)).sum::<f64>() / n).sqrt()
+                };
+                let scale_minmax = |v: &[f64]| {
+                    let scaled: Vec<f64> = v.iter().map(|x| x * gamma).collect();
+                    let min = scaled.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let max = scaled.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    (min, max)
+                };
+                let (dd_min, dd_max) = scale_minmax(&de_dd.data);
+                let (da_min, da_max) = scale_minmax(&de_da.data);
+                let (s1_min, s1_max) = scale_minmax(&de_s1.data);
+                let (s1t_min, s1t_max) = scale_minmax(&de_s1_t.data);
+                let (ddt_min, ddt_max) = scale_minmax(&de_dd_t.data);
+                let (dat_min, dat_max) = scale_minmax(&de_da_t.data);
                 eprintln!("[SSVPE grad components] de_r(dR):    (min={rmin:.6e}, max={rmax:.6e}, rms={rrms:.6e})");
                 eprintln!("[SSVPE grad components] de_s0:      (min={s0min:.6e}, max={s0max:.6e}, rms={s0rms:.6e})");
-                eprintln!("[SSVPE grad components] de_dD:      (min={ddmin:.6e}, max={ddmax:.6e}, rms={ddrms:.6e})");
-                eprintln!("[SSVPE grad components] de_dA:      (min={damin:.6e}, max={damax:.6e}, rms={darms:.6e})");
-                eprintln!("[SSVPE grad components] de_dS1:     (min={s1min:.6e}, max={s1max:.6e}, rms={s1rms:.6e})");
-                eprintln!("[SSVPE grad components] de_dS1_T:   (min={s1tmin:.6e}, max={s1tmax:.6e}, rms={s1trms:.6e})");
-                eprintln!("[SSVPE grad components] de_dD_T:    (min={ddtmin:.6e}, max={ddtmax:.6e}, rms={ddtrms:.6e})");
-                eprintln!("[SSVPE grad components] de_dA_T:    (min={datmin:.6e}, max={datmax:.6e}, rms={datrms:.6e})");
+                eprintln!("[SSVPE grad components] de_dD:      (min={dd_min:.6e}, max={dd_max:.6e}, rms={:.6e})", scale_rms(&de_dd.data));
+                eprintln!("[SSVPE grad components] de_dA:      (min={da_min:.6e}, max={da_max:.6e}, rms={:.6e})", scale_rms(&de_da.data));
+                eprintln!("[SSVPE grad components] de_dS1:     (min={s1_min:.6e}, max={s1_max:.6e}, rms={:.6e})", scale_rms(&de_s1.data));
+                eprintln!("[SSVPE grad components] de_dS1_T:   (min={s1t_min:.6e}, max={s1t_max:.6e}, rms={:.6e})", scale_rms(&de_s1_t.data));
+                eprintln!("[SSVPE grad components] de_dD_T:    (min={ddt_min:.6e}, max={ddt_max:.6e}, rms={:.6e})", scale_rms(&de_dd_t.data));
+                eprintln!("[SSVPE grad components] de_dA_T:    (min={dat_min:.6e}, max={dat_max:.6e}, rms={:.6e})", scale_rms(&de_da_t.data));
                 eprintln!("[SSVPE grad components] TOTAL:      (min={tmin:.6e}, max={tmax:.6e}, rms={trms:.6e})");
+                // Per-element dump for PySCF comparison
+                let dump_component = |label: &str, g: &MatrixFull<f64>, scale: f64| {
+                    eprintln!("[SSVPE elem] {label}:");
+                    for a in 0..natm {
+                        eprintln!("  atom[{a}] = {:.12e} {:.12e} {:.12e}",
+                            g[(0,a)] * scale, g[(1,a)] * scale, g[(2,a)] * scale);
+                    }
+                };
+                dump_component("de_r(dR)", &de_r, 1.0);
+                dump_component("de_s0", &de_s0_final, 1.0);
+                dump_component("de_dD", &de_dd, gamma);
+                dump_component("de_dA", &de_da, gamma);
+                dump_component("de_dS1", &de_s1, gamma);
+                dump_component("de_dS1_T", &de_s1_t, gamma);
+                dump_component("de_dD_T", &de_dd_t, gamma);
+                dump_component("de_dA_T", &de_da_t, gamma);
+                dump_component("TOTAL", &de, 1.0);
             }
 
             de
@@ -1497,5 +1555,77 @@ mod tests {
 
         assert!((de[(0, 0)] - 1.0).abs() < 1e-12);  // 2*0.5
         assert!((de[(2, 1)] - 3.0).abs() < 1e-12);  // 3*1.0
+    }
+
+    /// Verify `compute_de_dd_t` matches standard `antisym_chain_rule` with −dD^T.
+    ///
+    /// Method A: manual antisym with −u·(dD^T·w) + w·(dD·u)  [current impl]
+    /// Method B: antisym_chain_rule(u, −dD^T, w)              [reference]
+    /// They must be identical for any input.
+    #[test]
+    fn test_compute_de_dd_t_self_consistency() {
+        let ngrids = 4;
+        let natm = 2;
+        let gslice: Vec<(usize, usize)> = vec![(0, 2), (2, 4)];
+
+        // Random-like test data (deterministic)
+        let vk1_sa: Vec<f64> = vec![1.0, -2.0, 0.5, 3.0];
+        let mut q_sym = MatrixFull::<f64>::new([ngrids, 1], 0.0);
+        q_sym[(0, 0)] = 0.8;
+        q_sym[(1, 0)] = -1.2;
+        q_sym[(2, 0)] = 0.3;
+        q_sym[(3, 0)] = -0.7;
+
+        // dD[0] — antisymmetric 4×4
+        let mut dd0 = MatrixFull::<f64>::new([ngrids, ngrids], 0.0);
+        dd0[(0, 1)] = 0.5;  dd0[(1, 0)] = -0.5;
+        dd0[(0, 2)] = 0.3;  dd0[(2, 0)] = -0.3;
+        dd0[(1, 3)] = 0.7;  dd0[(3, 1)] = -0.7;
+        dd0[(2, 3)] = 0.4;  dd0[(3, 2)] = -0.4;
+
+        // dD[1] — different values
+        let mut dd1 = MatrixFull::<f64>::new([ngrids, ngrids], 0.0);
+        dd1[(0, 1)] = -0.2; dd1[(1, 0)] = 0.2;
+        dd1[(0, 3)] = 0.6;  dd1[(3, 0)] = -0.6;
+        dd1[(1, 2)] = 0.9;  dd1[(2, 1)] = -0.9;
+
+        // dD[2] — yet different
+        let mut dd2 = MatrixFull::<f64>::new([ngrids, ngrids], 0.0);
+        dd2[(0, 2)] = -0.8; dd2[(2, 0)] = 0.8;
+        dd2[(1, 2)] = 0.1;  dd2[(2, 1)] = -0.1;
+        dd2[(1, 3)] = -0.5; dd2[(3, 1)] = 0.5;
+
+        let dd = vec![dd0.clone(), dd1.clone(), dd2.clone()];
+
+        // ── Method A: current compute_de_dd_t ──
+        let de_a = compute_de_dd_t(&vk1_sa, &q_sym, &dd, &gslice, natm);
+
+        // ── Method B: antisym_chain_rule with −dD^T ──
+        // Build −dD^T matrices for each xyz direction
+        let q_flat: Vec<f64> = (0..ngrids).map(|i| q_sym[(i, 0)]).collect();
+        let mut neg_ddt: Vec<MatrixFull<f64>> = Vec::new();
+        for xyz in 0..3 {
+            let mut nddt = MatrixFull::<f64>::new([ngrids, ngrids], 0.0);
+            for i in 0..ngrids {
+                for j in 0..ngrids {
+                    nddt[(i, j)] = -dd[xyz][(j, i)]; // −dD^T[i,j] = −dD[j,i]
+                }
+            }
+            neg_ddt.push(nddt);
+        }
+        let de_b = antisym_chain_rule(&vk1_sa, &neg_ddt, &q_flat, &gslice, natm);
+
+        // ── Compare ──
+        for xyz in 0..3 {
+            for a in 0..natm {
+                let va = de_a[(xyz, a)];
+                let vb = de_b[(xyz, a)];
+                let diff = (va - vb).abs();
+                assert!(
+                    diff < 1e-14,
+                    "de_dd_t self-consistency FAIL at [{xyz},{a}]: {va:.15e} vs {vb:.15e} (diff={diff:.2e})"
+                );
+            }
+        }
     }
 }
