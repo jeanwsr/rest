@@ -86,7 +86,11 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
-    if rootfinder == "newton".to_string() {
+    if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
+        qp_energy_no_fse = qp_eq_func_no_fse(e_ks_n) + e_ks_n;
+        println!("Orbital #{}: |E_KS|={:.6} > gw_switch_fallback_threshold={:.6}, using static fallback QP energy={:.6}",
+                 n, e_ks_n.abs(), qp_ctrl.gw_switch_fallback_threshold, qp_energy_no_fse);
+    } else if rootfinder == "newton".to_string() {
         println!("Orbital #{} (first round, no Fourier self-energy):", n);
         qp_energy_no_fse = ri_gw::newton_solver(
             ri_gw::quasiparticle_equation, n, consts, ri_ov, ri_mat,
@@ -386,7 +390,18 @@ fn single_orbital_gw_lowrank(
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
-    if rootfinder == "newton".to_string() {
+    if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
+        let qp_eq_func = |omega: f64| {
+            ri_gw::quasiparticle_equation_lowrank(
+                omega, n, consts, ri_mat, &gwqp_g, &gwqp_w,
+                occ_size, vir_size, num_state,
+                w_c_at_freqs, real_axis_vchiv, 0,
+            )
+        };
+        qp_energy_no_fse = qp_eq_func(e_ks_n) + e_ks_n;
+        println!("Orbital #{} (low-rank): |E_KS|={:.6} > gw_switch_fallback_threshold={:.6}, using static fallback QP energy={:.6}",
+                 n, e_ks_n.abs(), qp_ctrl.gw_switch_fallback_threshold, qp_energy_no_fse);
+    } else if rootfinder == "newton".to_string() {
         println!("Orbital #{} (low-rank, no FSE):", n);
         let qp_start = gwqp_g[n];
         qp_energy_no_fse = ri_gw::newton_solver_lowrank(

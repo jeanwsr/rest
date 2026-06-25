@@ -1,15 +1,9 @@
 use crate::molecule_io::Molecule;
 use crate::geom_io;
-use crate::basis_io;
 use crate::scf_io::SCF;
-use rest_tensors::MatrixFull;
 use rest_libcint::CINTR2CDATA;
-use rest_libcint::CintType;
-use std::borrow::BorrowMut;
 use std::collections::HashMap;
-use rayon::iter::{IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator, IntoParallelRefMutIterator};
-//mod lib;
-use std::fs::{self, File};
+use std::fs::{File};
 use std::io::prelude::*;
 use std::io::LineWriter;
 

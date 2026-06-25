@@ -1,12 +1,12 @@
 use tensors::MatrixFull;
 
-use crate::constants::{E, EV};
+use crate::constants::{EV};
 use crate::mpi_io::MPIOperator;
 use crate::scf_io::{SCF, SCFType};
 use crate::ri_rpa::scsrpa::{evaluate_special_radius_only, evaluate_osrpa_correlation_rayon}; 
 use crate::ri_pt2::sbge2::{close_shell_sbge2_detailed_rayon, open_shell_sbge2_detailed_rayon};
 
-use libm::{erf,erfc,pow};
+use libm::{erf,erfc};
 
 pub fn scc15_for_rxdh7(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> f64 {
     if let (Some(mpi_op), Some(mpi_ix)) = (mpi_operator, &scf_data.mol.mpi_data) {

@@ -2,18 +2,15 @@ use core::panic;
 use std::fs;
 use rest_libcint::{CintType, CINTR2CDATA};
 use serde::{Deserialize, Serialize};
-use serde_json::{Result,Value};
+use serde_json::{Value};
 use anyhow;
-use tensors::{MatrixFull, MatrixUpper, TensorSlice, TensorSliceMut};
+use tensors::{MatrixFull, MatrixUpper};
 use pyo3::pyclass;
 
-use crate::{molecule_io::Molecule, scf_io::SCF};
+use crate::{molecule_io::Molecule};
 use crate::constants::{ATM_NUC_MOD_OF, NUC_ECP, SPECIES_INFO};
 use rest_libcint::prelude::rest_libcint_wrapper::ECPscalar;
 use crate::basis_io::ecp::{PotCell, PotCellRaw};
-
-#[cfg(target_os = "linux")]
-use libc::TCA_DUMP_INVISIBLE;
 
 
 //#[derive(Clone, Debug,Serialize,Deserialize)]

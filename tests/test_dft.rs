@@ -366,7 +366,7 @@ fn test_rsh_summary_does_not_panic() {
     // Ensure summary() works without panicking for RSH and non-RSH
     for name in &["cam-b3lyp", "lc-blyp", "hse06", "b3lyp", "pbe"] {
         let dfa = DFA4REST::new(name, 1, 0);
-        dfa.summary();
+        dfa.summary(0);
     }
 }
 

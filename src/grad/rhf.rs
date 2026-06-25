@@ -1,5 +1,6 @@
 #![warn(unused)]
 use crate::grad::traits::GradAPI;
+use crate::external_field::extfield::ExtFieldGrad;
 use crate::ri_jk::{self, get_solved_j3c, J2CDecompose};
 use crate::scf_io::{self, SCF};
 use crate::utilities::memory_batch::*;
@@ -51,6 +52,10 @@ pub struct RIHFGradientFlags {
     /// In the form of (omega, alpha, beta), corresponds to `dfa_rsh_scf`.
     #[builder(default = "None")]
     pub omega: Option<f64>,
+
+    /// External dipole field vector for gradient contribution.
+    #[builder(default = "None")]
+    pub ext_field_dipole: Option<[f64; 3]>,
 }
 
 /// Gradient structure and values for RHF method.
@@ -81,6 +86,7 @@ pub fn build_ri_jk_grad_flags(scf_data: &SCF) -> RIHFGradientFlags {
     flags.auxbasis_response(scf_data.mol.ctrl.auxbasis_response);
     flags.print_level(scf_data.mol.ctrl.print_level);
     flags.max_memory(scf_data.mol.ctrl.max_memory);
+    flags.ext_field_dipole(scf_data.mol.geom.ext_field.dipole);
 
     // set hybrid factor
     let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
@@ -573,6 +579,22 @@ impl RIRHFGradient<'_> {
         return self;
     }
 
+    pub fn calc_de_ext_field(&mut self) -> &mut Self {
+        let mol = &self.scf_data.mol;
+        // let natm = mol.geom.elem.len();
+
+        // if self.flags.ext_field_dipole.is_none() {
+        //     self.result.insert("de_ext_field".into(), MatrixFull::new([3, natm], 0.0));
+        //     return self;
+        // }
+
+        let dm = &self.scf_data.density_matrix[0];
+        let mut ext_grad = ExtFieldGrad::new(mol, dm);
+        let de_ext = ext_grad.calc();
+        self.result.insert("de_ext_field".into(), de_ext);
+        return self;
+    }
+
     pub fn calc_de_solvent(&mut self) -> &mut Self {
         if !self.scf_data.mol.ctrl.solvent_enabled {
             let natm = self.scf_data.mol.geom.elem.len();
@@ -584,14 +606,17 @@ impl RIRHFGradient<'_> {
         return self;
     }
 
+
     pub fn calc(&mut self) -> &MatrixFull<f64> {
         let mut time_records = crate::utilities::TimeRecords::new();
         time_records.new_item("rhf grad", "rhf grad");
         time_records.new_item("rhf grad calc_de_nuc", "rhf grad calc_de_nuc");
         time_records.new_item("rhf grad calc_de_ovlp", "rhf grad calc_de_ovlp");
         time_records.new_item("rhf grad calc_de_hcore", "rhf grad calc_de_hcore");
+        time_records.new_item("rhf grad calc_de_ext_field", "rhf grad calc_de_ext_field");
         time_records.new_item("rhf grad calc_de_jk", "rhf grad calc_de_jk");
         time_records.new_item("rhf grad calc_de_solvent", "rhf grad calc_de_solvent");
+        time_records.new_item("rhf grad calc_de_qmmm", "rhf grad calc_de_qmmm");
 
         time_records.count_start("rhf grad");
 
@@ -606,6 +631,12 @@ impl RIRHFGradient<'_> {
         time_records.count_start("rhf grad calc_de_hcore");
         self.calc_de_hcore();
         time_records.count("rhf grad calc_de_hcore");
+
+        if self.flags.ext_field_dipole.is_some() {
+            time_records.count_start("rhf grad calc_de_ext_field");
+            self.calc_de_ext_field();
+            time_records.count("rhf grad calc_de_ext_field");
+        }
 
         time_records.count_start("rhf grad calc_de_qmmm");
         self.calc_de_qmmm();
@@ -634,6 +665,7 @@ impl RIRHFGradient<'_> {
         self.result.get("de_sraux").map(|x| de += x.clone());
         self.result.get("de_qmmm").map(|x| de += x.clone());
         self.result.get("de_solvent").map(|x| de += x.clone());
+        self.result.get("de_ext_field").map(|x| de += x.clone());
         self.result.insert("de".into(), de);
 
         if self.flags.print_level >= 2 {
@@ -672,6 +704,36 @@ pub fn generator_deriv_hcore<'a>(scf_data: &'a SCF) -> impl FnMut(usize) -> Tsr<
         let tsr_int1e_ecp_ipnuc = rt::asarray((out, shape, &device));
         h1 -= tsr_int1e_ecp_ipnuc;
     }
+
+    let has_ghost_ep = mol_obj.geom.ghost_ep_path.len() > 0;
+    let tsr_int1e_ghost_ep_ipnuc = if has_ghost_ep {
+        use crate::basis_io::ecp::initialize_gp_operator_for_cint;
+        let (gp_env, gp_atm, gpbas) = initialize_gp_operator_for_cint(
+            &mol_obj.cint_env,
+            &mol_obj.cint_atm,
+            &mol_obj.geom.ghost_ep_path,
+            &mol_obj.geom.ghost_ep_pos,
+        );
+        let mut gp_cint = CInt::new();
+        gp_cint.set_cint_type(mol_obj.cint_type);
+        gp_cint.initial_r2c_with_ecp(
+            &gp_atm,
+            gp_atm.len() as i32,
+            &mol_obj.cint_bas,
+            mol_obj.cint_bas.len() as i32,
+            &gpbas,
+            gpbas.len() as i32,
+            &gp_env,
+        );
+        let (out, shape): (Vec<f64>, _) = gp_cint.integrate("ECPscalar_ipnuc", "s1", None).into();
+        Some(rt::asarray((out, shape, &device)))
+    } else {
+        None
+    };
+    if let Some(gp_ipnuc) = tsr_int1e_ghost_ep_ipnuc {
+        h1 = h1 - &gp_ipnuc;
+    }
+
     let aoslice_by_atom = mol_obj.aoslice_by_atom();
     let charge_by_atom = crate::geom_io::get_charge(&mol_obj.geom.elem);
 
@@ -728,7 +790,7 @@ fn get_dm(scf_data: &SCF, device: &DeviceBLAS) -> Tsr<f64> {
 pub fn calc_de_nuc(mol: &Molecule) -> MatrixFull<f64> {
     let device = DeviceBLAS::default();
 
-    let natm = mol.geom.elem.len();
+    let natm = mol.natm_real;
     let coords = (0..natm).map(|i| mol.geom.get_coord(i)).flatten().collect::<Vec<f64>>();
     let coords = rt::asarray((&coords, [3, natm], &device));
 
@@ -736,6 +798,7 @@ pub fn calc_de_nuc(mol: &Molecule) -> MatrixFull<f64> {
     let necp_by_atom = mol
         .basis4elem
         .iter()
+        .take(natm)
         .map(|i| if let Some(num_ecp) = i.ecp_electrons { num_ecp as f64 } else { 0.0 })
         .collect::<Vec<f64>>();
     let charges = rt::asarray((charges_by_atom, &device)) - rt::asarray((necp_by_atom, &device));
@@ -946,6 +1009,48 @@ pub fn get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2: TsrView<f64>, itm_k_ao: TsrV
         *&mut daux_k_int3c2e_ip2.i_mut(p) += tmp;
     });
     return daux_k_int3c2e_ip2;
+}
+
+pub fn compute_dipole_trace(mol: &Molecule, dm: &Tsr<f64>, device: &DeviceBLAS) -> [f64; 3] {
+    let cint_atm = mol.cint_atm.clone();
+    let mut cint_env = mol.cint_env.clone();
+
+    for a in 0..mol.natm_real {
+        let ptr = cint_atm[a][1] as usize;
+        for t in 0..3 {
+            cint_env[ptr + t] = mol.geom.position[[t, a]];
+        }
+    }
+
+    let ghost_start = mol.natm_real;
+    for a in ghost_start..cint_atm.len() {
+        let ptr = cint_atm[a][1] as usize;
+        let local_idx = a - ghost_start;
+        for t in 0..3 {
+            cint_env[ptr + t] = mol.geom.ghost_bs_pos[[t, local_idx]];
+        }
+    }
+
+    let natm = cint_atm.len() as i32;
+    let nbas = mol.cint_bas.len() as i32;
+
+    let mut cint = CInt::new();
+    cint.set_cint_type(mol.cint_type);
+    if let Some(ecp) = &mol.cint_ecpbas {
+        let necp = ecp.len() as i32;
+        cint.initial_r2c_with_ecp(&cint_atm, natm, &mol.cint_bas, nbas, ecp, necp, &cint_env);
+    } else {
+        cint.initial_r2c(&cint_atm, natm, &mol.cint_bas, nbas, &cint_env);
+    }
+
+    let (out, shape): (Vec<f64>, _) = cint.integrate("int1e_r", "s1", None).into();
+    let r_tensor = rt::asarray((out, shape, device));
+
+    let mut result = [0.0_f64; 3];
+    for s in 0..3 {
+        result[s] = (&r_tensor.i((.., .., s)) * dm.view()).sum();
+    }
+    result
 }
 
 /* #endregion */

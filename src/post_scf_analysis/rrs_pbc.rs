@@ -2,8 +2,6 @@ use std::fs::File;
 use std::io::Write;
 use crate::scf_io::SCF;
 use num_complex::Complex;
-use rest_tensors::{MatrixFull,MatrixUpper};
-use crate::tensors::BasicMatrix;
 use std::ffi::c_char;
 use std::f64::consts::PI;
 use rayon::prelude::*;

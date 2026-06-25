@@ -50,6 +50,7 @@
 	1. `numerical dipole`: 计算数值偶极。等价设置有：`numdipole`
 - `auxbasis_response`：开启辅助基导数。缺省为true
 - `opt_engine`: 取值String类型。构型优化引擎。可选项有：`LBFGS`、`geometric-pyo3`（缺省）
+    - **注意**：固定原子功能（在 `position` 中用 `0`/`1` 标记）当前仅支持 `geometric-pyo3` 引擎，`LBFGS` 引擎暂不支持约束优化。
 - `numerical_force`: 取值布尔类型。是否计算数值力。缺省为false
 - `nforce_displacement`:　取值f64类型。数值力计算中的结构位移值，缺省是0.0013 Bohr
 - `ndipole_displacement`:　取值f64类型。数值Dipole计算中的外电场位移值，缺省是3.0E-4 Bohr
@@ -83,25 +84,35 @@
   - `density`: 生成轨道概率密度的cube文件（|ψ|²）
 
 ## 计算方法相关关键词（Keyword）
-- `xc`：取值String类型。调用的电子结构计算方法。目前REST支持
-    0. 波函数方法：HF、MP2
-    1. 局域密度泛函近似：LDA
-    2. 广义梯度泛函近似：BLYP、PBE、xPBE、XLYP
-    3. 动能密度泛函近似：SCAN、M06-L、MN15-L、TPSS
-    4. 杂化泛函近似：B3LYP、X3LYP、PBE0、M05、M05-2X、M06、M06-2X、SCAN0、MN15
-    5. 第五阶泛函近似：XYG3、XYGJOS、XYG7、xDH-PBE0、sBGE2、ZRPS、scsRPA、R-xDH7、RPA@PBE、RPA@B3LYP
+- `xc_parser`：指定用于解析`xc`关键词的方式，选项包括
+  - `legacy` 缺省值，此时用户通过 `xc` 关键词设置方法名称调用 REST 程序内置支持的电子结构方法，具体可参见 `xc` 关键词说明
+  - `parse_xc` 支持用户更自由地调用 libxc 所支持的密度泛函近似方法以及 REST 支持的第五阶密度泛函方法，覆盖 `legacy` 选项包含的情形的同时，进一步支持更复杂的、用户自定义的泛函输入场景
+- `xc`：取值String类型。调用的电子结构计算方法。目前REST支持的常用电子结构方法有
+    1. 波函数方法：HF、MP2
+    2. 局域密度泛函近似：LDA
+    3. 广义梯度泛函近似：BLYP、PBE、xPBE、XLYP
+    4. 动能密度泛函近似：SCAN、M06-L、MN15-L、TPSS
+    5. 杂化泛函近似：B3LYP、X3LYP、PBE0、M05、M05-2X、M06、M06-2X、SCAN0、MN15
+    6. 第五阶泛函近似：XYG3、XYGJOS、XYG7、xDH-PBE0、sBGE2、ZRPS、scsRPA、R-xDH7、RPA@PBE、RPA@B3LYP
     - HF、LDA、BLYP、PBE、B3LYP、PBE0是自洽场计算方法，若用户未申明具体基组，则使用def2-TZVPP基组 (`basis_path = {basis_set_pool}/def2-TZVPP`)
     - MP2、XYG3、XYGJOS、XYG7、xDH-PBE0、sBGE2、ZRPS、scsRPA、R-xDH7、RPA@PBE、RPA@B3LYP为后自洽场计算方法。若用户未申明具体基组，则使用def2-QZVPP基组 (`basis_path = {basis_set_pool}/def2-QZVPP`)
     - RPA@PBE、RPA@B3LYP表示后自洽场RPA计算使用PBE、B3LYP方法的轨道
+    - 当 `xc_parser` 设置为`xc_parser=parse_xc`时，可通过 `xc` 关键词自定义密度泛函近似方法，具体书写规则请参见[REST程序用户手册](https://rest-doc.readthedocs.io/zh_CN/contributor/dft/parse_xc.html)
 - `empirical_dispersion`:　取值为String。针对低级别密度泛函方法（包括LDA、BLYP、PBE、B3LYP、PBE0等）的经验色散校正方法。目前支持D3, D3BJ和D4。对于XYG3型双杂化泛函比如XYG3、XYG7、XYGJOS、scsRPA、R-xDH7、RPA等不需要经验色散校正
-- `post_ai_correction`：取值String。AI辅助的校正方法。目前仅支持SCC15，并只能和R-xDH7重整化双杂化泛函方法相匹配。相关文章见：Wang, Y.; Lin, Z.; Ouyang, R.; Jiang, B.; Zhang, I. Y.; Xu, X. Toward Efficient and Unified Treatment of Static and Dynamic Correlations in Generalized Kohn–Sham Density Functional Theory. JACS Au 2024, 4 (8), 3205–3216. https://doi.org/10.1021/jacsau.4c00488
+- `post_ai_correction`：取值String。AI辅助的校正方法。目前仅支持SCC15，并只能和R-xDH7重整化双杂化泛函方法相匹配。相关文章见：Wang, Y.; Lin, Z.; Ouyang, R.; Jiang, B.; Zhang, I. Y.; Xu, X. Toward Efficient and Unified Treatment of Static and Dynamic Correlations in Generalized Kohn–Sham Density Functional Theory. [JACS Au 2024, 4 (8), 3205–3216](https://doi.org/10.1021/jacsau.4c00488). 
 - `post_xc`：取值Vec\<String\>。采用自洽收敛的轨道和密度，进行不同的交换－关联泛函(xc)的计算。允许的方法包括REST支持的"xc"方法
 - `post_correlation`：取值Vec\<String\>。采用自洽收敛的轨道和密度，进行后自洽场高等级相关能方法计算。允许的方法包括PT2、sBGE2、RPA、scsRPA等
 
 ## DFT积分格点相关关键词（Keyword）
-- `grid_gen_level`: 取值usize。格点精度等级，数值越大越精确。缺省为3
+- `grid_generation_level`: 取值usize。格点精度等级，数值越大越精确。缺省为3
 - `pruning`: 取值String。DFT方法或sap初猜所选用格点筛选。目前，REST支持nwchem，sg1以及none。其中none为不筛选。缺省为nwchem
-- `radial_grid_method`: 取值String。径向格点的生成方法。目前REST支持truetler，gc2nd， delley, becke, mura_knowles及lmg。缺省为truetler
+- `radial_grid_method`: 取值String。径向格点的生成方法。目前REST支持treutler，gc2nd， delley, becke, mura_knowles及lmg。缺省为treutler
+
+### VXC 格点积分优化相关关键词（Keyword）
+- `vxc_screen_threshold`: 取值f64。密度筛选阈值，在 VXC 计算中跳过密度低于此值的格点。对于大分子（真空区域多），可节省 30-70% 的 XC 计算量。设为 0.0 可关闭筛选。缺省为 1.0e-15。
+- `ao_cutoff`: 取值f64。AO 格点值截断阈值，启用 non0tab 稀疏存储。AO 值低于此阈值的基函数-格点对被当作零处理。设为 0.0（缺省）则关闭 non0tab 压缩。推荐值 1.0e-10。
+- `non0tab_blksize`: 取值usize。non0tab 压缩存储中每个格点批次的大小。设为 0（缺省）时程序根据基组大小自动选择 [32, 256]。设为具体值则固定该批次大小。
+- `drop_dense_ao`: 取值布尔类型。non0tab 压缩存储生成后是否释放稠密 AO/AOP 矩阵以节省内存。缺省为 false。当 `ao_cutoff > 0` 且该体系 AO 稀疏率 < 90% 时，设为 true 可显著降低内存。
 
 ## 基组相关关键词（Keyword）
 - `eri_type`: 取值String类型。设置四中心积分计算方法。选项：
@@ -111,7 +122,7 @@
 - `basis_type`: 取值String类型。设置基函数类型。选项：
     - `Spheric`: 球谐型基函数（默认值）
 	- `Cartesian`：笛卡尔型基函数
-- `basis_path`: 取值String类型，必需参数，无默认值。指定基组文件路径。该文件夹内包含各元素的基组JSON文件（如`C.json`、`O.json`）
+- `basis_path`: 取值String类型，必需参数，无默认值。`basis_path = "chkfile"` 时将从 checkpoint 文件读取基组。其他情况下，该关键词指定基组文件路径，此路径包含各元素的基组JSON文件（如`C.json`、`O.json`）
     - 格式示例：  
       ```bash
       # 完整路径格式（明确指定）
@@ -164,30 +175,50 @@ REST 支持用户自定义或混合基组：
 ### 配置示例
 ```plaintext
 # 示例1：使用标准基组和缺省辅助基组（简写格式）
-eri_type = ri-v
 basis_type = Spheric
 basis_path = cc-pvtz                    # 程序自动搜索 cc-pvtz 文件夹
 
 # 示例2：使用标准基组，同时申明辅助基组（简写格式）
-eri_type = ri-v
 basis_type = Spheric
 basis_path = cc-pvtz                    # 程序自动搜索 cc-pvtz 文件夹
 auxbas_path = def2-universal-jkfit      # 程序自动搜索同名辅助基组文件夹
 
 # 示例3：使用自定义基组（相对路径）
-eri_type = ri-v
 basis_type = Cartesian
 basis_path = ./my_project_basis         # 使用当前目录下的自定义基组
 auxbas_path = ./my_aux_basis            # 使用自定义辅助基组
 
 # 示例4：使用完整路径
-eri_type = ri-v
 basis_type = Spheric
 basis_path = /shared/basis/def2-TZVP    # 明确指定完整路径
 auxbas_path = def2-universal-jkfit      # 简写格式，自动搜索
+
+# 示例5：从 checkpoint 文件读取初猜
+basis_path = "chkfile"
+auxbas_path = "def2-universal-jkfit"
+guessfile = "my_checkpoint.rchk"
 ```
 
 ## 自洽场计算相关关键词（Keyword）
+- `max_scf_cycle`: 取值i32。自洽场运算的最大迭代循环数。缺省为100
+- `noiter`: 取值布尔类型。是否跳过自洽场运算。缺省为false
+- `scf_acc_rho`: 取值f64。自洽场运算密度矩阵的收敛标准。缺省为1.0e-8
+- `scf_acc_eev`: 取值f64。自洽场运算能量差平方和的收敛标准。缺省为1.0e-6
+- `scf_acc_etot`: 取值f64。自洽场运算总能量的收敛标准。缺省为1.0e-8
+- `algorithm_jk`: 设置 Fock 矩阵计算中 J (Coulomb) 和 K (Exchange) 两部分的算法：
+    - `ri-direct`: 强制使用 direct RI 算法。对于 RI-K 部分，取决于内存大小，可能会使用 semi-direct 算法 (储存相对较小的 $O(N^3)$ 的 $g_{\mu i, P}$)。
+    - `ri-incore`: 强制使用 incore RI 算法 (储存完整的 Cholesky decomposed 3c-2e ERI $Y_{\mu \nu, P}$)。该算法对内存需求较大，但计算速度更快。
+    - `ri`: 自动选择 incore 或 direct RI 算法，取决于自洽场计算前内存大小；在内存空间较大时选择更快的 incore 方法，内存空间较小时选择 ri-direct 方法。
+    - `default`: 目前同 `ri`。
+- `algorithm_j`: 设置 Fock 矩阵计算中 J (Coulomb) 部分的算法；该关键词是高级选项，一般用户建议使用`algorithm_jk`关键词进行整体设置。
+    - 下述选项同 `algorithm_jk`：`ri-direct`, `ri-incore`, `ri`, `default`。
+- `algorithm_k`: 设置 Fock 矩阵计算中 K (Exchange) 部分的算法；该关键词是高级选项，一般用户建议使用`algorithm_jk`关键词进行整体设置。
+    - 下述选项同 `algorithm_jk`：`ri-direct`, `ri-incore`, `ri`, `default`。
+- `use_dm_only`: 取值布尔类型。控制 VK (Exchange) 和 VXC (XC Potential) 矩阵的构建方式。缺省为 false。
+    - `false`（缺省）：使用分子轨道系数构造（occ-RI-K 算法），效率更高，推荐用于大多数体系。
+    - `true`：直接使用密度矩阵构造。当轨道占据数非整数（如 dSCF 激发态）时可能需要设为 true。
+
+### 自洽场初猜相关关键词
 - `initial_guess`: 取值String。分子体系进行自洽场运算所用的初始猜测方法。目前REST支持:
     1. 从 checkpoint 文件读取初猜。不需要设定 `initial_guess`，存在 `guessfile` 或 `chkfile` 时会自动读取初猜。
 	2. `sad` : 对体系各原子进行自洽场计算得到自洽的密度矩阵后，将多个密度矩阵按顺序置于对角位置后得到初始的密度矩阵进行自洽场运算。缺省为sad
@@ -197,7 +228,7 @@ auxbas_path = def2-universal-jkfit      # 简写格式，自动搜索
 - `guess_mix_theta_deg`: 取值`[f64;2]`或f64，分别设置两个自旋通道的混合角度（单位：度）。
     - 设为0.0，则表示完全不混合
     - 在0.0-90.0范围内，角度越大，表示破坏原始初猜效果越显著。一般建议取值0.0-45.0。缺省为[15.0, 15.0]
-- `guessfile`: 取值String。给定初猜的 checkpoint 文件。缺省为none。不会在计算结束后被覆盖。
+- `guessfile`: 取值String。给定初猜的 checkpoint 文件。缺省为none。不会在计算结束后被覆盖。guessfile/chkfile 中的基组与当前计算指定的基组不一致时，会尝试进行基组投影。
 - `chkfile`: 取值String。保存计算结果的 checkpoint 文件。缺省为none。如该文件在计算开始前已存在，则会尝试从中读取初猜，但在计算结束后会覆盖该文件。所以不推荐采用 `chkfile` 提供初猜，而是建议采用 `guessfile`。
 对于 `guessfile` 和 `chkfile`，推荐以下两种使用方式（文件后缀没有要求，可以是任意的或没有）：
 （1） 不读取初猜，只保存计算结果
@@ -209,8 +240,12 @@ chkfile = "mychk.rchk"
 guessfile = "myoldchk.rchk"
 chkfile = "mychk.rchk"
 ```
-- `mixer`：取值String。辅助自洽场收敛的方法。目前REST支持direct，diis，linear，ediis及ediis+diis。Direct对应不使用辅助收敛方法，linear对应于线性辅助收敛方法，diis对应于direct inversion in the iterative subspace，是有效的加速收敛方法。缺省为diis。
-    - 当前DIIS实现已内置**正交基误差矢量**（通过 S⁻¹ᐟ² 变换改善条件数）和 **SVD 伪逆求解器**（替代直接矩阵求逆），对过渡金属等近简并体系有更好的数值稳定性。
+
+### 收敛算法相关关键词
+- `mixer`：取值String。辅助自洽场收敛的方法。目前REST支持 `"direct"`，`"diis"`，`"linear"`，`"ediis"`及`"ediis+diis"`，程序缺省采用`"diis"`方法。
+    - `"direct"` 不使用额外辅助收敛方法（naive SCF）
+    - `"linear"` 线性辅助收敛方法，
+    - `"diis"` direct inversion in the iterative subspace，是最常用的 SCF 加速收敛方法。当前DIIS实现已内置**正交基误差矢量**（通过 S⁻¹ᐟ² 变换改善条件数）和 **SVD 伪逆求解器**（替代直接矩阵求逆），对过渡金属等近简并体系有更好的数值稳定性。
     - `"ediis"`: Energy-DIIS（Kudin-Scuseria-Cancès, JCP 2002）。基于历史密度矩阵和能量的二次规划外推，保证每一步能量单调下降。适合能隙极小的体系。
     - `"ediis+diis"`（**推荐用于过渡金属体系**）：混合模式。早期使用 EDIIS（保证能量单调下降，避免 DIIS 在小能隙下失效），当 DIIS 误差范数降至可收敛区间时自动切换至 DIIS（利用超线性收敛加速）：
       ```
@@ -224,16 +259,13 @@ chkfile = "mychk.rchk"
       | diis | 常规体系（缺省） | 快 | 一般 |
       | ediis | 小能隙、过渡金属 | 较慢 | **很高** |
       | **ediis+diis** | 过渡金属、难以收敛的体系 | **快** | **很高** |
-- `mix_param`: 取值f64。Diis方法或linear方法的混合系数。缺省为0.6
+- `mix_param`: 取值f64。DIIS方法或linear方法的混合系数。缺省为0.6
 - `start_diis_cycle`: 取值i32。开始使用diis（或ediis）加速收敛方法的循环数。缺省为2
 - `num_max_diis`: 取值i32。DIIS/EDIIS子空间大小（存储的历史Fock/密度矩阵数量）。缺省为8
-- `max_scf_cycle`: 取值i32。自洽场运算的最大迭代循环数。缺省为100
-- `noiter`: 取值布尔类型。是否跳过自洽场运算。缺省为false
-- `scf_acc_rho`: 取值f64。自洽场运算密度矩阵的收敛标准。缺省为1.0e-8
-- `scf_acc_eev`: 取值f64。自洽场运算能量差平方和的收敛标准。缺省为1.0e-6
-- `scf_acc_etot`: 取值f64。自洽场运算总能量的收敛标准。缺省为1.0e-8
 - `level_shift`: 取值f64。对于发生近简并振荡不收敛的情况，可以采用level_shift的方式人为破坏简并，加速收敛。单位为hartree，缺省值为None（不开启）。
     - 注意：当体系本身可以用纯 DIIS 正常收敛时，开启 level_shift 反而会减速收敛（DIIS 子空间已充分条件良好）。仅当 DIIS 失效（近简并振荡）时才需要开启此选项。
+- `ediis_penalty`：取值f64。EDIIS 惩罚参数 η（Kudin-Scuseria, JCP 2002, 116, 8255）。η 越大，外推越保守（偏离历史数据点的惩罚越大）。缺省为 0.5。仅当 `mixer = "ediis"` 或 `"ediis+diis"` 时生效。
+- `ediis_switch_gap`：取值f64。EDIIS→DIIS 自动切换的 HOMO-LUMO 能隙阈值（单位为 Hartree）。仅当 `mixer = "ediis+diis"` 时生效。当前实现中 DIIS 误差范数的切换阈值已自动确定（1e-3），本关键词预留用于未来基于能隙的切换策略。缺省为 0.1。
 - `start_check_oscillation`: 取值i32。开始检查并自洽场计算不收敛发生振荡的循环数。当监控到自洽场发生振荡，SCF能量上升的情况，开启一次线性混合方案（linear）。缺省为20
 - `smear`：取值String。开启分数轨道占据（smearing）加速自洽场收敛。适用于能隙较小或金属性体系。目前支持：
     - `"fermi"`：Fermi-Dirac 展宽
@@ -252,40 +284,22 @@ chkfile = "mychk.rchk"
 - `smear_sigma_min`：取值f64。退火过程中 σ 的下限值，单位为 Hartree。缺省为 `max(smear_sigma × 0.01, 0.001)`。
     - **σ 不应退火至零**：对于高对称性过渡金属等具有严格简并轨道的体系，σ→0 会导致占据数在简并轨道间 ping-pong 振荡而无法收敛。保留非零下限（~0.001 Ha ≈ 300 K）可确保简并流形的平滑平均占据。
     - 若体系简并程度高、退火后仍不收敛，可手动加大该值，如 `smear_sigma_min = 0.005`。
-- `ediis_penalty`：取值f64。EDIIS 惩罚参数 η（Kudin-Scuseria, JCP 2002, 116, 8255）。η 越大，外推越保守（偏离历史数据点的惩罚越大）。缺省为 0.5。仅当 `mixer = "ediis"` 或 `"ediis+diis"` 时生效。
-- `ediis_switch_gap`：取值f64。EDIIS→DIIS 自动切换的 HOMO-LUMO 能隙阈值（单位为 Hartree）。仅当 `mixer = "ediis+diis"` 时生效。当前实现中 DIIS 误差范数的切换阈值已自动确定（1e-3），本关键词预留用于未来基于能隙的切换策略。缺省为 0.1。
-
-## VXC 格点积分优化相关关键词（Keyword）
-- `vxc_screen_threshold`: 取值f64。密度筛选阈值，在 VXC 计算中跳过密度低于此值的格点。对于大分子（真空区域多），可节省 30-70% 的 XC 计算量。设为 0.0 可关闭筛选。缺省为 1.0e-15。
-- `ao_cutoff`: 取值f64。AO 格点值截断阈值，启用 non0tab 稀疏存储。AO 值低于此阈值的基函数-格点对被当作零处理。设为 0.0（缺省）则关闭 non0tab 压缩。推荐值 1.0e-10。
-- `non0tab_blksize`: 取值usize。non0tab 压缩存储中每个格点批次的大小。设为 0（缺省）时程序根据基组大小自动选择 [32, 256]。设为具体值则固定该批次大小。
-- `drop_dense_ao`: 取值布尔类型。non0tab 压缩存储生成后是否释放稠密 AO/AOP 矩阵以节省内存。缺省为 false。当 `ao_cutoff > 0` 且该体系 AO 稀疏率 < 90% 时，设为 true 可显著降低内存。
-- `force_state_occupation`: 取值是Vector。 Constrained DFT (C-DFT) 计算方法。具体设置如下：
+### $\Delta$-SCF 计算相关关键词
+- `force_state_occupation`: 取值是Vector。 $\Delta$-SCF 方法中用于约束轨道占据数的条件。具体声明方式如下：
      - `[
   [reference, prev_state, prev_spin, target_spin, force_occ, force_check_min, force_check_max],
   [reference, prev_state, prev_spin, target_spin, force_occ, force_check_min, force_check_max],
   ...
 ]`
-     - Vector中的每一项对应于一个轨道的约束。
-     - `reference`: （可选）取值String。C-DFT的计算需要有一个常规的DFT计算结果，并以hdf5的格式存在`reference`中。若省略，则默认与chkfile相同。
+     - Vector中的每一项对应于一个轨道的约束条件。
+     - `reference`: （可选）取值String。$\Delta$-SCF 的计算需要有一个常规的 SCF 计算结果，对应的checkpoint文件的存储位置在 `reference` 中声明。若省略，则默认与 `chkfile` 设置相同。
      - `prev_state`和`prev_spin`：取值i32。定位需要约束的轨道在reference中的轨道序号和自旋通道
-     - `target_spin`：（可选）取值i32。在C-DFT计算中，约束轨道的目标自旋通道
+     - `target_spin`：（可选）取值i32。在 $\Delta$-SCF 计算中，约束轨道的目标自旋通道
         - 若省略该值，则默认与`prev_spin`相同
-        - 若给定，则会在指定自旋通道中寻找与prev_state/prev_spin最相似的轨道。
-     - `force_occ`：取值f64。设置上述定位的轨道在约束DFT（C-DFT）计算中的取值
-     - `force_check_min`和`force_check_max`：取值i32。在C-DFT的自洽计算中设置搜索窗口，仅从这个窗口中寻找和prev_state/prev_spin最相似的轨道
-- `algorithm_jk`: 设置 Fock 矩阵计算中 J (Coulomb) 和 K (Exchange) 两部分的算法：
-    - `ri-direct`: 强制使用 direct RI 算法。对于 RI-K 部分，取决于内存大小，可能会使用 semi-direct 算法 (储存相对较小的 $O(N^3)$ 的 $g_{\mu i, P}$)。
-    - `ri-incore`: 强制使用 incore RI 算法 (储存完整的 Cholesky decomposed 3c-2e ERI $Y_{\mu \nu, P}$)。该算法对内存需求较大，但计算速度更快。
-    - `ri`: 自动选择 incore 或 direct RI 算法，取决于自洽场计算前内存大小；在内存空间较大时选择更快的 incore 方法，内存空间较小时选择 ri-direct 方法。
-    - `default`: 目前同 `ri`。
-- `algorithm_j`: 设置 Fock 矩阵计算中 J (Coulomb) 部分的算法；该关键词是高级选项，一般用户建议使用`algorithm_jk`关键词进行整体设置。
-    - 下述选项同 `algorithm_jk`：`ri-direct`, `ri-incore`, `ri`, `default`。
-- `algorithm_k`: 设置 Fock 矩阵计算中 K (Exchange) 部分的算法；该关键词是高级选项，一般用户建议使用`algorithm_jk`关键词进行整体设置。
-    - 下述选项同 `algorithm_jk`：`ri-direct`, `ri-incore`, `ri`, `default`。
-- `use_dm_only`: 取值布尔类型。控制 VK (Exchange) 和 VXC (XC Potential) 矩阵的构建方式。缺省为 false。
-    - `false`（缺省）：使用分子轨道系数构造（occ-RI-K 算法），效率更高，推荐用于大多数体系。
-    - `true`：直接使用密度矩阵构造。当轨道占据数非整数（如 dSCF 激发态）时可能需要设为 true。
+        - 若给定，则会在指定自旋通道中寻找与 `prev_state`/`prev_spin` 最相似的轨道
+     - `force_occ`：取值f64。设置上述定位的轨道在 $\Delta$-SCF 计算中的占据数
+     - `force_check_min`和`force_check_max`：取值i32。在 $\Delta$-SCF 的自洽计算中设置搜索窗口，仅从这个窗口中寻找和 `prev_state`/`prev_spin` 最相似的轨道
+
 
 ## 后自洽场计算相关关键词（Keyword）
 - `frozen_core_postscf`: 取值i32，且小于100的两位正整数或者一位正整数。对于后自洽场方法，包括MP2和第五阶密度泛函近似，需要考虑激发组态的贡献。由于原子的内层电子（core electrons）通常不参与化学成键，仅有最外几个价层参与（按主量子数划分）。因此我们可以采用冻芯近似（frozen core approximation）
@@ -307,7 +321,7 @@ chkfile = "mychk.rchk"
 	 - `2`: 代表Logarithmic格点。
 - `lambda_points`：取值i32。对于SCSRPA和R-xDH7等方法，对于开窍层的强关联体系，需要对绝热涨落途径（lambda）数值积分。这里设置lambda积分的格点数目。缺省为20
 
-## RI-PT2计算相关设置
+### RI-PT2计算相关设置
 
 首先，RI-PT2 相关设置在 `[ctrl.ri_pt2]` 区块中进行，输入样例如下：
 ```toml
@@ -321,8 +335,21 @@ fp_mode = "FP64"
 - `fp_mode`: 取值 String (`"FP32"`, `"FP64"`)。设置 RI-PT2 计算中使用的浮点精度。缺省为 `"FP32"`。对于数值梯度计算，建议设置为 `"FP64"` 以获得更高的数值稳定性。
 - `mpi_mode`: 取值 usize。设置 RI-PT2 计算中使用的 MPI 模式。缺省为 0，即不使用 MPI。
 
+## 溶剂化计算相关设置
+- `solvent_model`: 取值String, 用于指定用于计算的溶剂模型。目前支持CPCM, COSMO, IEFPCM, SS(V)PE。缺省为CPCM。溶剂化梯度计算目前只支持CPCM, COSMO。
+- `solvent_enabled`: 取值bool，设置为true则启用溶剂化计算。如果没有`solvent_enabled`字段但有`solvent_model`的设置且内容非空的时候，同样启用溶剂化计算。其他情况缺省为false。
+- `solv_epsilon`: 取值f64, 为溶质的介电常数。缺省为1.0 (真空)。介电常数表可以参考 http://sobereva.com/g09/k_scrf.htm 的最后。
+- `solvent_ri`: 取值bool, 设置为true为溶剂化能计算开启辅助基，设置为false溶剂化计算不开启辅助基。缺省为true。目前溶剂化梯度(job_type = "opt"/"force")计算没有用辅助基。
+- `pcm_cavity_radii`: 取值String, 用于指定空腔的半径使用类型。目前支持Bondi, UFF。缺省为UFF。
+
+## RRS-PBC计算相关设置
+RRS-PBC方法是由张颖教授等提出的一种基于分子团簇计算结果的周期性电子结构模拟方法，相关论文见 Zhang, I.Y., Jiang, J., Gao, B. *et al.* RRS-PBC: a molecular approach for periodic systems. [*Sci. China Chem.* **57**, 1399–1404 (2014)](https://doi.org/10.1007/s11426-014-5183-y)。在 REST 中，RRS-PBC 相关的设置主要在 `[geom]` 区块中进行，请参考后续的说明。`[ctrl]`区块中的相关关键词包括：
+- `pbc_eigenval`: 取值String，用于指定存储k点和能级信息的文件路径。如果设置为`"none"`或`"None"`则直接打印到标准输出。缺省为`"none"`。
+
 ## GW-BSE计算相关设置
-- `quasiparticle_methods`: 取值String，设置为gw即开启GW计算准粒子能量，设置为bse即在计算或读取准粒子能量后进一步开启BSE计算垂直激发能。缺省为空，即不触发任何GW-BSE计算
+GW-BSE 方法相关的设置在 `[quasiparticle_methods]` 区块中进行。关键词包括：
+<!-- - `quasiparticle_methods`: 取值String，设置为gw即开启GW计算准粒子能量，设置为bse即在计算或读取准粒子能量后进一步开启BSE计算垂直激发能。缺省为空，即不触发任何GW-BSE计算 -->
+- `gw_or_bse`: 取值String，设置为gw即开启GW计算准粒子能量，设置为bse即在计算或读取准粒子能量后进一步开启BSE计算垂直激发能。缺省为空，即不触发任何GW-BSE计算
 - `gw_scheme`: 取值String，决定使用何种方式计算GW准粒子，无论进行GW还是BSE都需要设置此项。GW计算建议设置为extrapolated，即计算费米面附近一定范围内的准例子能量，其余轨道的准例子能量根据费米面附近的准粒子能量来外推。BSE计算还可以设置为parse from file，通过再设置`parse qp path`（取值String，读取纯数据文本文件的路径）即可读取预先已计算好的GW准例子能量用于BSE计算
 - `threshold`: 取值f64，单位为Hatree，在extrapolated方案中决定计算费米面附近计算准粒子能量的SCF轨道范围，费米面加减threshold范围以外的轨道的准粒子能量将由已计算的准粒子能量外推，缺省为0.1
 - `parse qp path`: 取值String，若设置gw_scheme=“parse from file”则必须设置此项，读取纯数据文本文件的路径,从此路径读取预先已计算好的GW准粒子能量用于BSE计算
@@ -333,8 +360,6 @@ fp_mode = "FP64"
 - `bse_spin`: 取值String，需要进行BSE计算时必须设置此项，指定计算何种自旋的激发，可以设置为”singlet”或”triplet”
 - `bse_cutoff_energy`: 取值f64，单位为Hatree，进行BSE计算时DFT能级高于此能量的轨道的准粒子能量将不参与BSE kernel的构建，用于削减构建的BSE kernel的维数，减少对角化计算时间，缺省为1.5
 - `bse_tda`: 取值bool，设置为true则使用TDA近似，即BSE kernel只保留左上部分的子矩阵。缺省为false
-## RRS-PBC计算相关设置
-- `pbc_eigenval`: 取值String，用于指定存储k点和能级信息的文件路径。如果设置为"none"或"None"则直接打印到标准输出。缺省为"none"。相关文章见Zhang, I.Y., Jiang, J., Gao, B. *et al.* RRS-PBC: a molecular approach for periodic systems. *Sci. China Chem.* **57**, 1399–1404 (2014). https://doi.org/10.1007/s11426-014-5183-y
 ## 溶剂化计算相关设置
 - `solvent_model`: 取值String, 用于指定用于计算的溶剂模型。目前支持CPCM, COSMO, IEFPCM, SS(V)PE,SMD。缺省为CPCM。SMD及其梯度为实验性功能。
 - `solvent`: 取值String。支持溶剂见文末附表。如果要使用SMD进行计算请设置此项(推荐)或`solvent_descriptors`(进阶)。
@@ -344,69 +369,33 @@ fp_mode = "FP64"
 - `pcm_cavity_radii`: 取值String, 用于指定空腔的半径使用类型。目前支持Bondi, UFF。缺省为UFF。当方法为SMD时将使用特定半径设置，此项不生效。
 - `solvent_enabled`: 取值bool，设置为true则启用溶剂化计算。如果没有`solvent_enabled`字段但有`solvent_model`/`solvent`/`solvent_descriptors`的设置且内容非空的时候，同样启用溶剂化计算。其他情况缺省为false。
 
-# Detailed descrption of [geometric_pyo3] block in the control file
-- `maxiter`：取值i32。结构优化的最大步数上限。缺省值：300
-- `converge_energy`：取值f64。构型优化中上下两步能量变化的收敛阈值。缺省值：1.0e-6
-- `converge_grms`：取值f64。梯度的收敛阈值。缺省值：3.0e-4
-- `converge_gmax`：取值f64。最大梯度的收敛阈值。缺省值：4.5e-4
-- `converge_drms`：取值f64。构型优化中上下两步构型变化的收敛阈值。缺省值：1.2e-3
-- `converge_dmax`：取值f64。最大构型变化的收敛阈值。缺省值：1.8e-3
-- `coordsys`：取值String。坐标系统设置。缺省值："tric"。如果有其他需求见geomeTRIC的官方说明：https://geometric.readthedocs.io/en/latest/
-- `transition`：取值bool，设置为true则开启过渡态搜索。缺省值为：false（对应于稳态搜索）
-- `hessian`：取值String。决定是否以及何时进行Hessian矩阵计算（目前只支持数值Hessian计算）。
-    - "never"：不做Hessian矩阵计算（缺省：稳态搜索）
-	- "first"：只对初始结构计算Hessian矩阵（缺省：过渡态搜索）
-	- "last"：计算优化好的结构的Hessian矩阵计算
-	- "first+last"：计算初始和优化好的两个结构的Hessian矩阵
-	- "stop"：不做构型优化，只计算初始结构的Hessian矩阵
-	- "each"：计算构型优化中每一步的Hessian矩阵
-- `frequency`：取值bool，当得到Hessian矩阵后，是否开展频率计算和热化学分析。缺省值：true
-- `thermo`：取值[f64;2]，提供热力学分析的状态：[温度 (K),压强 (bar)]。缺省值：[300.0, 1.0]
-- 例子一：开启GGA、meta-GGA或者杂化泛函的稳态构型优化（以x3lyp为例），则不需要使用[geometric_pyo3]区的设置
-    ```
-	[ctrl]
-         xc = x3lyp
-         job_type =                  "opt"
-         opt_engine =                "geometric-pyo3"
-         xc =                        "x3lyp"
-         empirical_dispersion =      "d3bj"
-         basis_path =                "cc-pVDZ"
-         auxbas_path =               "def2-universal-jkfit"
-         charge =                    0.0
-         spin =                      1.0
-         spin_polarization =         false
-    
-    [geom]
-         name = "CO"
-         unit = "angstrom"
-         position = """
-            C  0.00000000000      0.0000000000      0.0000000000
-            O  1.20000000000      0.0000000000      0.0000000000
-        """ 
-    ```
-- 例子二：如果使用双杂化泛函等没有解析力的方法，则需要在[ctrl]区开启数值力的计算功能（仅展示与上个例子不同的设置）
-    ```
-	[ctrl]
-	    xc = xyg3
-		numerical_force = true
-	```
-- 例子三：开启过渡态优化和频率计算，并且设置非常规状态（100华氏度、1.5个大气压）
-    ```
-	[geometric_pyo3]
-	    transition = true
-		hessian = "first+last"
-		thermo = [398.0, 1.5]
-	```
-# Detailed descrption of [geom] block in the control file
+<!-- ## TD-DFT计算相关设置 -->
+
+
+
+# Detailed description of [geom] block in the control file
 - `name`：取值String类型。分子体系的名称
 - `unit`：取值String类型。坐标单位。目前支持：angstrom和bohr
-- `position`：取值String类型。分子体系的坐标，目前支持xyz格式
-    - 一个例子：
+- `position`：取值String类型。分子体系的坐标，目前支持xyz格式。支持两种书写方式：
+    - **标准格式**（所有原子均可自由弛豫）：`<elem> <x> <y> <z>`
+    - **固定原子格式**（constraints）：`<elem> <fix> <x> <y> <z>`，其中`<fix>`取值0或1。`0`表示该原子固定在初始位置，`1`表示该原子允许弛豫
+    - **注意**：固定原子功能当前仅在 `opt_engine = "geometric-pyo3"` 构型优化引擎下生效。REST 会自动从 `fix` 信息生成 geometric 约束文件，冻结指定原子的 Cartesian 坐标。约束在内坐标（TRIC/DLC）空间生效，要求 `coordsys ≠ "cart"`（默认 `tric` 满足此要求）。
+    - 一个混合格式的例子（H₂O-H₂O二聚体，固定donor水分子的O和一个H，其余自由）：
+`position = """
+         O  0   0.000000     0.000000     0.000000
+         H  0   0.756950     0.585882     0.000000
+         H  1  -0.756950     0.585882     0.000000
+         O  1   0.000000     2.890000     0.000000
+         H  1   0.000000     2.390000     0.000000
+         H  1  -0.935300     3.243300     0.000000
+"""
+`
+    - 一个纯标准格式的例子（不使用固定原子功能）：
 `position = '''
-        N  -2.1988391019      1.8973746268      0.0000000000
-        H  -1.1788391019      1.8973746268      0.0000000000
-        H  -2.5388353987      1.0925460144     -0.5263586446
-        H  -2.5388400276      2.7556271745     -0.4338224694
+         N  -2.1988391019      1.8973746268      0.0000000000
+         H  -1.1788391019      1.8973746268      0.0000000000
+         H  -2.5388353987      1.0925460144     -0.5263586446
+         H  -2.5388400276      2.7556271745     -0.4338224694
 '''
 `
 - `ghost`:　取值String类型。每一行对应一个ghost原子、点电荷或者ghost赝势的设置
@@ -440,6 +429,7 @@ fp_mode = "FP64"
         """
         ext_field_dipole = [0.0, 0.1, 0.0]
         ```
+## RRS-PBC 方法相关设置
 - `rrs_pbc`: 取值为bool。如果设置为true则启动RRS-PBC计算。缺省为false
   
 - `unit_cell_index`: 取值为Vec<usize>。核心晶胞包含的原子在`position`中的序号。缺省为空
@@ -680,3 +670,65 @@ fp_mode = "FP64"
     "water"|"h2o" 
     "xe" | "xenon" 
     "xylene" | "xylene-mixture" 
+
+# Detailed descrption of [geometric_pyo3] block in the control file
+- `maxiter`：取值i32。结构优化的最大步数上限。缺省值：300
+- `converge_energy`：取值f64。构型优化中上下两步能量变化的收敛阈值。缺省值：1.0e-6
+- `converge_grms`：取值f64。梯度的收敛阈值。缺省值：3.0e-4
+- `converge_gmax`：取值f64。最大梯度的收敛阈值。缺省值：4.5e-4
+- `converge_drms`：取值f64。构型优化中上下两步构型变化的收敛阈值。缺省值：1.2e-3
+- `converge_dmax`：取值f64。最大构型变化的收敛阈值。缺省值：1.8e-3
+- `coordsys`：取值String。坐标系统设置。缺省值："tric"。如果有其他需求见geomeTRIC的官方说明：https://geometric.readthedocs.io/en/latest/
+- `transition`：取值bool，设置为true则开启过渡态搜索。缺省值为：false（对应于稳态搜索）
+- `hessian`：取值String。决定是否以及何时进行Hessian矩阵计算（目前只支持数值Hessian计算）。
+    - "never"：不做Hessian矩阵计算（缺省：稳态搜索）
+	- "first"：只对初始结构计算Hessian矩阵（缺省：过渡态搜索）
+	- "last"：计算优化好的结构的Hessian矩阵计算
+	- "first+last"：计算初始和优化好的两个结构的Hessian矩阵
+	- "stop"：不做构型优化，只计算初始结构的Hessian矩阵
+	- "each"：计算构型优化中每一步的Hessian矩阵
+- `frequency`：取值bool，当得到Hessian矩阵后，是否开展频率计算和热化学分析。缺省值：true
+- `thermo`：取值[f64;2]，提供热力学分析的状态：[温度 (K),压强 (bar)]。缺省值：[300.0, 1.0]
+- `reset`：取值bool。当近似 Hessian 的特征值低于 `epsilon` 阈值时，是否将其重置回 guess Hessian。对于稳态优化，缺省值为 true。若体系梯度含噪声、BFGS 更新每步失败（出现 "Eigenvalues below ... returning guess"），可设为 false 保留 Hessian 并加对角 shift 继续优化。
+- `trust`：取值f64。初始 trust radius（Å）。缺省值：0.1
+- `tmax`：取值f64。最大 trust radius（Å）。缺省值：0.3
+- `tmin`：取值f64。最小 trust radius（Å）。缺省值：1e-4。一般应小于 `convergence_drms` 以避免优化器在数值噪声处提前收敛。
+- `epsilon`：取值f64。Hessian 重置的特征值阈值。缺省值：1e-5。仅当 `reset = true` 时生效。
+- `subfrctor`：取值 i32。投影掉梯度中净力/净力矩分量的模式。0 = 不投影，1 = 自动检测（缺省），2 = 强制投影。DFT 梯度常含微量力矩噪声，在 QM/MM 或大体系中可能引起结构慢转而力不收敛，设为 2 可消除此噪声源。
+- `usedmax`：取值 bool。是否用最大位移分量（而非 RMS）判断 trust radius。缺省值：false。适合各方向力常数差异大的各向异性体系。
+## 配置示例 
+- 例子一：开启GGA、meta-GGA或者杂化泛函的稳态构型优化（以x3lyp为例），则不需要使用[geometric_pyo3]区的设置
+    ```
+	[ctrl]
+         xc = x3lyp
+         job_type =                  "opt"
+         opt_engine =                "geometric-pyo3"
+         xc =                        "x3lyp"
+         empirical_dispersion =      "d3bj"
+         basis_path =                "cc-pVDZ"
+         auxbas_path =               "def2-universal-jkfit"
+         charge =                    0.0
+         spin =                      1.0
+         spin_polarization =         false
+    
+    [geom]
+         name = "CO"
+         unit = "angstrom"
+         position = """
+            C  0.00000000000      0.0000000000      0.0000000000
+            O  1.20000000000      0.0000000000      0.0000000000
+        """ 
+    ```
+- 例子二：如果使用双杂化泛函等没有解析力的方法，则需要在[ctrl]区开启数值力的计算功能（仅展示与上个例子不同的设置）
+    ```
+	[ctrl]
+	    xc = xyg3
+		numerical_force = true
+	```
+- 例子三：开启过渡态优化和频率计算，并且设置非常规状态（398开尔文、1.5个大气压）
+    ```
+	[geometric_pyo3]
+	    transition = true
+		hessian = "first+last"
+		thermo = [398.0, 1.5]
+	```

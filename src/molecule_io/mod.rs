@@ -3,31 +3,36 @@ extern crate rest_tensors as tensors;
 
 mod pyrest_molecule_io;
 pub mod with_clause;
+mod int_cross;
+mod frozen;
+pub use frozen::count_frozen_core_states;
 
 use array_tool::vec::Intersect;
 use pyo3::{pyclass};
 use rayon::prelude::{IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator};
 use rest_libcint::prelude::*;
+use rest_libcint::{CINTR2CDATA, CintType};
 use rest_tensors::{ERIFull,RIFull,ERIFold4,TensorSlice,TensorSliceMut,TensorOpt, MatrixUpper, MatrixFull};
 use tensors::{BasicMatrix, SubMatrixUpper};
 use tensors::external_libs::{matr_copy_from_ri};
 use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _power_rayon_for_symmetric_matrix};
+use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::mpsc::channel;
-use rest_libcint::{CINTR2CDATA, CintType};
 use regex::Regex;
 use crate::basis_io::etb::{get_etb_elem, etb_gen_for_atom_list, InfoV2};
-use crate::constants::{ATM_NUC, ATM_NUC_MOD_OF, AUXBAS_THRESHOLD, ELEM1ST, ELEM2ND, ELEM3RD, ELEM4TH, ELEM5TH, ELEM6TH, ELEMTMS, ENV_PRT_START, NUC_ECP, NUC_STAD_CHARGE};
+use crate::constants::{ATM_NUC, ATM_NUC_MOD_OF, AUXBAS_THRESHOLD,  ENV_PRT_START, NUC_ECP, NUC_STAD_CHARGE};
 use crate::dft::{DFTType, DFA4REST, parse_xc};
 use crate::geom_io::{GeomCell, get_mass_charge, formated_element_name};
 use crate::basis_io::{BasInfo, Basis4Elem};
 use crate::ctrl_io::{overall_parse_and_report_on_ctrl_geom, InputKeywords, parse_ctl};
-use crate::mpi_io::{mpi_isend_irecv_wrt_distribution_v03, MPIData, MPIOperator};
+#[cfg(feature = "mpi")]
+use crate::mpi_io::mpi_isend_irecv_wrt_distribution_v03;
+use crate::mpi_io::{MPIData, MPIOperator};
 use crate::utilities;
 use crate::basis_io::bse_downloader::{self, ctrl_element_checker, local_element_checker};
 use crate::basis_io::basis_list::{basis_fuzzy_matcher, check_basis_name};
-use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper};
 use crate::ri_jk;
 
 
@@ -96,6 +101,10 @@ pub struct Molecule {
     pub auxbas4elem: Vec<Basis4Elem>,
 
     pub basis4elem: Vec<Basis4Elem>,
+    // natm_real: number of real atoms (geom.elem.len())
+    pub natm_real: usize,
+    // natm_all: total number of atoms with basis functions (real + ghost_bs)
+    pub natm_all: usize,
     // fdqc_bas: store information of each basis functions
     pub fdqc_bas : Vec<BasInfo>,
     //  cint_fdqc: vec![[start of a basis shell, num of basis funciton in this shell]; num of shells]
@@ -136,6 +145,8 @@ impl Molecule {
             ecp_electrons: 0,
             spin_channel: 1,
             auxbas4elem: vec![],
+            natm_real: 0,
+            natm_all: 0,
             basis4elem: vec![],
             fdqc_bas: vec![],
             cint_bas: vec![],
@@ -178,7 +189,12 @@ impl Molecule {
 
     pub fn build_native(mut ctrl: InputKeywords, mut geom: GeomCell, mpi_data: Option<MPIData>) -> anyhow::Result<Molecule> {
 
-        let spin_channel = ctrl.spin_channel;
+        let mut mol = Molecule::init_mol();
+        mol.ctrl = ctrl.clone();
+        mol.geom = geom.clone();
+        mol.mpi_data = mpi_data;
+
+        mol.spin_channel = ctrl.spin_channel;
         let cint_type = if ctrl.basis_type.to_lowercase()==String::from("spheric") {
             CintType::Spheric
         } else if ctrl.basis_type.to_lowercase()==String::from("cartesian") {
@@ -187,25 +203,44 @@ impl Molecule {
             panic!("Error:: Unknown basis type '{}'. Please use either 'spheric' or 'Cartesian'", 
                    ctrl.basis_type);
         };
+        mol.cint_type = cint_type;
 
-        let (mut basis4elem,mut cint_atm,mut cint_bas,cint_env,
-            fdqc_bas,cint_fdqc,num_elec,num_basis,num_state, cint_ecpbas) 
-            = Molecule::collect_basis(&mut ctrl, &mut geom);
+        let chkbasis = ctrl.basis_path == "chkfile";
+        if !chkbasis {
+            let (mut basis4elem,mut cint_atm,mut cint_bas,cint_env,
+                fdqc_bas,cint_fdqc,num_elec,num_basis,num_state, cint_ecpbas) 
+                = Molecule::collect_basis(&mut ctrl, &mut geom);
 
-
-
-        let bas = &basis4elem;
-        let ecp_electrons = bas.iter().fold(0, |acc, i| {
-            //println!("debug {:?}", i);
-            let ecp_electrons = if let Some(num_ecp) = i.ecp_electrons {num_ecp} else {0};
-            acc + ecp_electrons
-        });
-
+            let bas = &basis4elem;
+            let ecp_electrons = bas.iter().fold(0, |acc, i| {
+                let ecp_electrons = if let Some(num_ecp) = i.ecp_electrons {num_ecp} else {0};
+                acc + ecp_electrons
+            });
+            mol.basis4elem = basis4elem;
+            mol.cint_atm = cint_atm;
+            mol.cint_bas = cint_bas;
+            mol.cint_env = cint_env;
+            mol.fdqc_bas = fdqc_bas;
+            mol.cint_fdqc = cint_fdqc;
+            mol.num_elec = num_elec;
+            mol.num_basis = num_basis;
+            mol.num_state = num_state;
+            mol.cint_ecpbas = cint_ecpbas;
+            mol.ecp_electrons = ecp_electrons;
+        }
+        mol.natm_real = geom.elem.len();
+        mol.natm_all = mol.cint_atm.len();
 
         let (mut auxbas , mut cint_aux_atm,mut cint_aux_bas,cint_aux_env,
                 mut fdqc_aux_bas,mut cint_aux_fdqc,num_auxbas) 
             =(Vec::new(),Vec::new(),Vec::new(),Vec::new(),Vec::new(),Vec::new(),0);
-
+        mol.auxbas4elem = auxbas;
+        mol.cint_aux_atm = cint_aux_atm;
+        mol.cint_aux_bas = cint_aux_bas;
+        mol.cint_aux_env = cint_aux_env;
+        mol.fdqc_aux_bas = fdqc_aux_bas;
+        mol.cint_aux_fdqc = cint_aux_fdqc;
+        mol.num_auxbas = num_auxbas;
 
         //let mut cint_data = CINTR2CDATA::new();
         //cint_data.set_cint_type(&cint_type);
@@ -221,12 +256,12 @@ impl Molecule {
                 println!("Using xc_parser {}", ctrl.xc_parser);
                 match ctrl.xc_parser.as_str() {
                     "legacy" => {
-                    let mut cur_xc_data = DFA4REST::new(&ctrl.xc, spin_channel, ctrl.print_level);
+                    let mut cur_xc_data = DFA4REST::new(&ctrl.xc, ctrl.spin_channel, ctrl.print_level);
                     cur_xc_data.update_pt2_params(ctrl.ri_pt2.os_factor, ctrl.ri_pt2.ss_factor);
                     (None, cur_xc_data)
                     },
                     "parse_xc" => {
-                        let mut dfadef = parse_xc::parse_and_derive(&ctrl.xc, spin_channel, ctrl.print_level);
+                        let mut dfadef = parse_xc::parse_and_derive(&ctrl.xc, ctrl.spin_channel, ctrl.print_level);
                         let (san, err_strings) = dfadef.check_sanity();
                         if !san {
                             panic!("{}", err_strings.join("\n"));
@@ -243,9 +278,9 @@ impl Molecule {
             },
             DFTType::NonStandard => {
                 println!("Warning: DFTType::NonStandard is about to be deprecated. Please use xc_parser = 'parse_xc' instead.");
-                (None, DFA4REST::new_nonstandard(spin_channel, ctrl.print_level, &ctrl.xc_namelist, &ctrl.xc_paralist, &ctrl.dfa_hybrid_scf))
+                (None, DFA4REST::new_nonstandard(ctrl.spin_channel, ctrl.print_level, &ctrl.xc_namelist, &ctrl.xc_paralist, &ctrl.dfa_hybrid_scf))
             },
-            DFTType::DeepLearning => {(None, DFA4REST::new_deep_learning(spin_channel, ctrl.print_level, &ctrl.xc_model))}
+            DFTType::DeepLearning => {(None, DFA4REST::new_deep_learning(ctrl.spin_channel, ctrl.print_level, &ctrl.xc_model))}
         };
 
         xc_data.summary(ctrl.print_level);
@@ -254,64 +289,20 @@ impl Molecule {
                 std::process::exit(0);
             }
         }
+        mol.dfadef = dfadef;
+        mol.xc_data = xc_data;
 
-        let use_eri = xc_data.use_eri();
+        mol.use_eri = mol.xc_data.use_eri();
         
 
-        let mut start_mo = count_frozen_core_states(ctrl.frozen_core_postscf, &geom.elem);
-        let ecp_orbs = ecp_electrons/2;
-        if ecp_orbs == 0 {
-            if ctrl.print_level > 0 {
-                println!("For SCF calculation, no core orbital is frozen by effective core potential (ECP) approximation");
-            }
-        } else if start_mo < ecp_orbs {
-            if ctrl.print_level > 0 {
-                println!("<start_mo> for the frozen-core post-SCF methods {} is smaller than the number of ecp orbitals {}. Set <start_mo> = 0",
-                    start_mo, ecp_orbs);
-            }
-            start_mo = 0;
-        } else {
-            if ctrl.print_level > 0 {
-                println!("<start_mo> for the frozen-core post-SCF methods {} is larger than the number of ecp orbitals {}. Take the <start_mo> -= ecp_orbitals",
-                        start_mo, ecp_orbs);
-            }
-            start_mo = start_mo - ecp_orbs
-        }
+        mol.start_mo = mol.generate_start_mo(mol.ecp_electrons);
 
         if ctrl.print_level>0 {
-            xc_data.xc_version();
-            println!("nbas: {}, natm: {} for standard basis sets", cint_bas.len(),cint_atm.len());
-            println!("First valence state for the frozen-core algorithm: {:5}", start_mo);
+            mol.xc_data.xc_version();
+            println!("nbas: {}, natm: {} for standard basis sets", mol.cint_bas.len(), mol.cint_atm.len());
+            println!("First valence state for the frozen-core algorithm: {:5}", mol.start_mo);
         };
-        let mut mol = Molecule {
-            ctrl,
-            mpi_data,
-            geom,
-            dfadef,
-            xc_data,
-            use_eri,
-            num_elec,
-            num_state,
-            num_basis,
-            num_auxbas,
-            start_mo,
-            ecp_electrons,
-            spin_channel,
-            basis4elem,
-            auxbas4elem: auxbas,
-            fdqc_bas,
-            cint_fdqc,
-            cint_atm,
-            cint_bas,
-            cint_ecpbas,
-            cint_env,
-            fdqc_aux_bas,
-            cint_aux_fdqc,
-            cint_aux_atm,
-            cint_aux_bas,
-            cint_aux_env,
-            cint_type,
-        };
+
         // check and prepare the auxiliary basis sets
         if mol.ctrl.use_auxbas {mol.initialize_auxbas()};
 
@@ -328,6 +319,93 @@ impl Molecule {
         Ok(mol)
 
     }
+
+    pub fn has_ecp(&self) -> bool {
+        self.cint_ecpbas.is_some()
+    }
+
+    pub fn update_from_cint(&mut self, num_basis: usize, basis4elem: Option<Vec<Basis4Elem>>, cint_raw: (Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>), ecp_raw: Option<Vec<Vec<i32>>>) {
+        self.num_basis = num_basis;
+        if let Some(basis4elem_value) = basis4elem {
+            self.basis4elem = basis4elem_value;
+        }
+        self.cint_atm = cint_raw.0;
+        self.cint_bas = cint_raw.1;
+        self.cint_env = cint_raw.2;
+        self.cint_ecpbas = ecp_raw;
+        self.natm_real = self.geom.elem.len();
+        self.natm_all = self.cint_atm.len();
+        // update fdqc_bas, cint_fdqc
+        let mut fdqc_bas: Vec<BasInfo> = vec![];
+        let mut cint_fdqc: Vec<Vec<usize>> = vec![];
+        let mut bas_start = 0_usize;
+        self.cint_bas.iter().enumerate().for_each(|(bas_index, bas_cell)| {
+            let atm_index = bas_cell[0] as usize;
+            let ang = bas_cell[1] as usize;
+            let num_primitive = bas_cell[2] as usize;
+            let num_contracted = bas_cell[3] as usize;
+            let tmp_bas_num = match &self.cint_type {
+                CintType::Cartesian => (ang+1)*(ang+2)/2,
+                CintType::Spheric => ang*2+1,
+                CintType::Spinor => {panic!("Spinor is not yet implemented")},
+            };
+            let mut tmp_len = 0_usize;
+            (0..num_contracted).into_iter().for_each(|index0| {
+                (0..tmp_bas_num).into_iter().for_each(|index1| {
+                    let bas_type = if num_primitive == 1 {
+                        String::from("Primitive")
+                    } else {
+                        String::from("Contracted")
+                    };
+                    tmp_len += 1;
+                    fdqc_bas.push(BasInfo {
+                        bas_name: get_basis_name(ang, &self.cint_type, index1),
+                        bas_type,
+                        elem_index0: atm_index,
+                        cint_index0: bas_index,
+                        cint_index1: index0*tmp_bas_num+index1,
+                    });
+                });
+            });
+            cint_fdqc.push(vec![bas_start,tmp_len]);
+            bas_start += tmp_len;
+        });
+        self.fdqc_bas = fdqc_bas;
+        self.cint_fdqc = cint_fdqc;
+
+        let num_basis_calc = self.fdqc_bas.len();
+        if self.num_basis != num_basis_calc {
+            if self.ctrl.print_level > 0 {
+                println!("Warning: num_basis {} from chkfile does not match derived value {}. Using derived value.", self.num_basis, num_basis_calc);
+            }
+            self.num_basis = num_basis_calc;
+        }
+        self.num_state = self.num_basis;
+
+        // update num_elec
+        let mut num_elec = [0.0;3];
+        self.cint_atm.iter().for_each(|atm| {
+            num_elec[0] += atm[ATM_NUC] as f64;
+        });
+        num_elec[0] -= self.ctrl.charge;
+        if self.ctrl.use_int_nelec {
+            sanity_check_nelec(num_elec[0], self.ctrl.spin);
+        }
+        let unpair_elec = (self.ctrl.spin-1.0_f64);
+        num_elec[1] = (num_elec[0]-unpair_elec)/2.0 + unpair_elec;
+        num_elec[2] = (num_elec[0]-unpair_elec)/2.0;
+        self.num_elec = num_elec;
+
+        // update ecp_electrons
+        let ecp_electrons = self.basis4elem.iter().fold(0, |acc, i| {
+            let ecp_electrons = if let Some(num_ecp) = i.ecp_electrons {num_ecp} else {0};
+            acc + ecp_electrons
+        });
+        self.ecp_electrons = ecp_electrons;
+
+        self.start_mo = self.generate_start_mo(self.ecp_electrons);
+    }
+
     pub fn initialize_auxbas(&mut self) {
         let cint_type = if self.ctrl.basis_type.to_lowercase()==String::from("spheric") {
             CintType::Spheric
@@ -3025,6 +3103,7 @@ impl Molecule {
         let avail_mem = self.ctrl.max_memory.map(|m| m - crate::utilities::memory_batch::detect_used_memory_mb("proc"));
         utilities::memory_batch::handle_memory_exceed(estimated_mem, avail_mem, self.ctrl.abort_on_mem_exceed);
 
+        #[cfg(feature = "mpi")]
         if let (Some(mpi_op), Some(loc_mpi_data)) = (&mpi_operator, &self.mpi_data) {
 
             if omega.is_some() {
@@ -3074,6 +3153,8 @@ impl Molecule {
         } else {
             self.prepare_rimatr_for_ri_v_rayon(omega)
         }
+        #[cfg(not(feature = "mpi"))]
+        { self.prepare_rimatr_for_ri_v_rayon(omega) }
 
 
     }
@@ -3343,7 +3424,7 @@ impl Molecule {
         let cint_bas = self.cint_bas.clone();
 
         let ao_loc = cint_data.ao_loc();
-        let natm = self.geom.elem.len();
+        let natm = self.natm_all;
         let nbas = cint_bas.len();
         let mut aoslice = vec![[0; 4]; natm];
 
@@ -3390,127 +3471,6 @@ pub fn generate_ri3fn_from_rimatr(rimatr: &MatrixFull<f64>, basbas2baspar: &Matr
     ri3fn
 }
 
-pub fn count_frozen_core_states(n_frozen_shell: i32, elem: &Vec<String>) -> usize {
-    let mut n_low_state = 0_usize;
-    let mut n_tm = 0_usize;
-
-    //let n_frozen_shell = self.ctrl.frozen_core_postscf;
-    let (n_frozen_shell_1, n_frozen_shell_2) = if n_frozen_shell > 10 {
-        let n_frozen_shell_1 = n_frozen_shell%10;
-        let n_frozen_shell_2 = n_frozen_shell/10;
-        (n_frozen_shell_1, n_frozen_shell_2)
-    } else {
-        (n_frozen_shell, n_frozen_shell)
-    };
-
-    elem.iter().for_each(|sn| {
-        let formated_elem = crate::geom_io::formated_element_name(&sn);
-        let flag_first_row  = ELEM1ST.iter().fold(false, |acc, elem| acc || elem.eq(&formated_elem));
-        let flag_second_row = if flag_first_row {
-            false
-        } else {
-            ELEM2ND.iter().fold(false, |acc, elem| acc || elem.eq(&formated_elem))
-        };
-        let flag_third_row  = if flag_first_row || flag_second_row {
-            false
-        } else {
-            ELEM3RD.iter().fold(false, |acc, elem| acc || elem.eq(&formated_elem))
-        };
-        let flag_fourth_row = if flag_first_row || flag_second_row || flag_third_row {
-            false
-        } else {
-            ELEM4TH.iter().fold(false, |acc, elem| acc || elem.eq(&formated_elem))
-        };
-        let flag_fifth_row  = if flag_first_row || flag_second_row || flag_third_row || flag_fourth_row {
-            false
-        } else {
-            ELEM5TH.iter().fold(false, |acc, elem| acc || elem.eq(&formated_elem))
-        };
-        let flag_sixth_row  = if flag_first_row || flag_second_row || flag_third_row || flag_fourth_row || flag_fifth_row {
-            false
-        } else {
-            ELEM6TH.iter().fold(false, |acc, elem| acc || elem.eq(&formated_elem))
-        };
-        let flag_tm = ELEMTMS.iter().fold(false, |acc, elem| acc || elem.eq(&formated_elem));
-
-        let n_frozen_shell_curr = if flag_tm {
-            n_tm += 1;
-            n_frozen_shell_2
-        } else {
-            n_frozen_shell_1
-        };
-
-        if flag_first_row {
-            n_low_state += 0
-        } else if flag_second_row {
-            if n_frozen_shell_curr==0 {
-                n_low_state += 0
-            } else if (n_frozen_shell_curr==1) {
-                n_low_state += 1
-            } else {
-                n_low_state += 0
-            }
-        } else if flag_third_row {
-            if n_frozen_shell_curr==0 {
-                n_low_state += 0
-            } else if n_frozen_shell_curr==1 {
-                n_low_state += 5
-            } else if n_frozen_shell_curr==2 {
-                n_low_state += 1
-            } else {
-                n_low_state += 0
-            }
-        } else if flag_fourth_row {
-            if n_frozen_shell_curr==0 {
-                n_low_state += 0
-            } else if n_frozen_shell_curr==1 {
-                n_low_state += 9
-            } else if n_frozen_shell_curr==2 {
-                n_low_state += 5
-            } else if n_frozen_shell_curr==3 {
-                n_low_state += 1
-            } else {
-                n_low_state += 0
-            }
-        } else if flag_fifth_row {
-            if n_frozen_shell_curr==0 {
-                n_low_state += 0
-            } else if n_frozen_shell_curr==1 {
-                n_low_state += 18
-            } else if n_frozen_shell_curr==2 {
-                // NOTE: for 4d-block elements, 3d orbitals are frozen as well for n_frozen_shell = 2
-                if flag_tm {n_low_state += 14} else {n_low_state += 9}
-            } else if n_frozen_shell_curr==3 {
-                n_low_state += 5
-            } else if n_frozen_shell_curr==4 {
-                n_low_state += 1
-            } else {
-                n_low_state += 0
-            }
-        } else if flag_sixth_row {
-            if n_frozen_shell_curr==0 {
-                n_low_state += 0
-            } else if n_frozen_shell_curr==1 {
-                n_low_state += 34
-            } else if n_frozen_shell_curr==2 {
-                // NOTE: for 5d-block elements, 4d and 4f orbitals are frozen as well for n_frozen_shell = 2
-                //       It leads to a core shell with 60 electrons
-                if flag_tm {n_low_state += 30} else {n_low_state += 18}
-            } else if n_frozen_shell_curr==3 {
-                n_low_state += 9
-            } else if n_frozen_shell_curr==4 {
-                n_low_state += 5
-            } else if n_frozen_shell_curr==5 {
-                n_low_state += 1
-            } else {
-                n_low_state += 0
-            }
-        };
-    });
-
-    n_low_state
-
-}
 
 //pub fn basbas2baspar(index: [usize;2]) -> usize {
 //    (index[1]+1)*index[1]/2 + index[0]
@@ -3612,5 +3572,3 @@ fn test_matrixupper() {
     let matrixupper_index = tensors::map_upper_to_full(10).unwrap();
     dd.iter_submatrix(1..3, 0..2, &matrixupper_index).for_each(|x| {println!("{}",x)});
 }
-
-

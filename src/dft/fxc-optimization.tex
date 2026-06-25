@@ -1,0 +1,733 @@
+\documentclass[11pt,a4paper]{ctexart}
+
+\usepackage[a4paper,margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{caption}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=blue!60!black,
+  citecolor=blue!60!black
+}
+
+\lstdefinelanguage{Rust}{
+  keywords={fn,let,mut,pub,struct,impl,for,in,if,else,match,return,while,loop,use,mod,crate,super,self,Self,where,as,unsafe,trait,enum,move,ref,static,const},
+  keywordstyle=\color{blue!60!black}\bfseries,
+  ndkeywords={usize,f64,Vec,MatrixFull,Option,Some,None,Result,Ok,Err},
+  ndkeywordstyle=\color{teal!60!black},
+  comment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  commentstyle=\color{gray!70!black}\itshape,
+  stringstyle=\color{orange!60!black},
+  morestring=[b]",
+  sensitive=true
+}
+
+
+\lstdefinelanguage{bash}{
+  keywords={export,unset,source,echo,for,do,done,if,then,else,fi},
+  keywordstyle=\color{blue!60!black}\bfseries,
+  comment=[l]{\#},
+  commentstyle=\color{gray!70!black}\itshape,
+  stringstyle=\color{orange!60!black},
+  morestring=[b]",
+  sensitive=true
+}
+
+\lstdefinestyle{code}{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  rulecolor=\color{gray!40},
+  backgroundcolor=\color{gray!4},
+  xleftmargin=0.5em,
+  xrightmargin=0.5em,
+  aboveskip=0.8em,
+  belowskip=0.8em
+}
+
+\title{TDDFT \texttt{fxc\_matvec} 并行性能排查、优化与测试策略}
+\author{整理稿}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{背景与问题定位}
+
+当前的 \texttt{fxc\_matvec} 实现已经做了若干重要优化：例如使用 BLAS \texttt{DGEMM} 完成主要矩阵收缩，在 LDA/GGA 中按 grid 点并行计算密度响应，GGA 中融合多个 dot product，并在回传阶段通过 \texttt{beta=1.0} 累加结果。尽管如此，并行效果仍可能很差。这并不一定说明 Rayon 或 Rust 层面的并行写法有明显错误，更常见的原因是：
+
+\begin{enumerate}[leftmargin=2em]
+  \item 真正的重计算部分已经由 BLAS 内部多线程处理，Rayon 只并行了相对较小的一部分；
+  \item 手写并行的循环多为 memory-bound 操作，例如缩放、拷贝、构造临时矩阵，多线程后主要竞争内存带宽；
+  \item BLAS 线程池与 Rayon 线程池交替抢占核心，造成调度开销、缓存失效和线程过度订阅；
+  \item GGA 回传阶段存在多次 scaling 与多次 \texttt{DGEMM}，结构较碎，BLAS 调用开销和临时矩阵写入开销显著；
+  \item 每次 matvec 反复分配大临时数组，抵消了并行收益。
+\end{enumerate}
+
+因此，优化目标不应是简单地把更多 \texttt{for} 循环改成 \texttt{par\_iter}，而应重新设计并行层次、减少内存流量、合并 BLAS 调用，并建立可靠的性能与正确性测试体系。
+
+\section{建议的分段计时排查}
+
+首先需要确认瓶颈到底在什么位置。建议把一次 matvec 拆成以下阶段计时：
+
+\begin{enumerate}[leftmargin=2em]
+  \item 前向 \texttt{DGEMM}：计算 $t = Z V$ 或 GGA 中的 $t_0,t_x,t_y,t_z$；
+  \item grid 上的密度响应计算：$\delta\rho$ 和 $\nabla\delta\rho$；
+  \item grid 上的 kernel contraction：$f_{\alpha}(g)=\sum_\beta f_{\alpha\beta}^{xc}(g)\rho_\beta(g)$；
+  \item scaling：构造 $V D(f)$ 或 $O D(f)$ 一类临时矩阵；
+  \item 回传 \texttt{DGEMM}：从 grid 表示收缩回 MO-pair 表示；
+  \item 临时数组分配与初始化开销。
+\end{enumerate}
+
+可以用如下方式插入粗粒度计时：
+
+\begin{lstlisting}[language=Rust,style=code]
+use std::time::Instant;
+
+let total = Instant::now();
+
+let t = Instant::now();
+// Step 1: DGEMM
+// _dgemm_full(...)
+eprintln!("step1 gemm = {:?}", t.elapsed());
+
+let t = Instant::now();
+// Step 2: rho / grad rho on grids
+eprintln!("rho loop = {:?}", t.elapsed());
+
+let t = Instant::now();
+// Step 3: fxc grid contraction
+eprintln!("fxc grid = {:?}", t.elapsed());
+
+let t = Instant::now();
+// Step 4: scaling / packing
+eprintln!("scaling or packing = {:?}", t.elapsed());
+
+let t = Instant::now();
+// Step 5: final DGEMM
+eprintln!("final gemm = {:?}", t.elapsed());
+
+eprintln!("total = {:?}", total.elapsed());
+\end{lstlisting}
+
+如果前向和回传 \texttt{DGEMM} 合计已经占总时间 $70\%$ 以上，那么仅优化 grid-loop 的 Rayon 并行不会有明显总加速；这时应主要优化 BLAS 调用形状、合并小 GEMM、减少 scaling 临时矩阵。
+
+\section{线程组合实验}
+
+并行效果差时，首先要区分两种情形：
+
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{GEMM-bound}：主要时间在 BLAS 中，Rayon 只负责少数辅助循环；
+  \item \textbf{grid-loop/memory-bound}：BLAS 矩阵形状较 skinny，内部并行效率差，或者大量时间花在 grid 循环和 scaling 上。
+\end{itemize}
+
+建议固定测试以下线程组合。
+
+\subsection{模式 A：BLAS 主导}
+
+\begin{lstlisting}[language=bash,style=code]
+export RAYON_NUM_THREADS=1
+export OMP_NUM_THREADS=24
+export OPENBLAS_NUM_THREADS=24
+export MKL_NUM_THREADS=24
+export MKL_DYNAMIC=FALSE
+\end{lstlisting}
+
+若此模式最快，说明主要瓶颈是 \texttt{DGEMM}，应减少 Rust 层并行碎片，并优化矩阵打包方式。
+
+\subsection{模式 B：Rayon 主导}
+
+\begin{lstlisting}[language=bash,style=code]
+export RAYON_NUM_THREADS=24
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+\end{lstlisting}
+
+若此模式更快，说明 BLAS 对当前矩阵形状的多线程效率不好，可以考虑把多个独立的 GEMM 项放到 Rayon 外层并行，每个 GEMM 用单线程 BLAS。
+
+\subsection{模式 C：折中方案}
+
+例如 24 线程机器上可测试：
+
+\begin{lstlisting}[language=bash,style=code]
+export RAYON_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=6
+export OMP_NUM_THREADS=6
+export MKL_NUM_THREADS=6
+\end{lstlisting}
+
+或者：
+
+\begin{lstlisting}[language=bash,style=code]
+export RAYON_NUM_THREADS=6
+export OPENBLAS_NUM_THREADS=4
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+\end{lstlisting}
+
+但不建议一开始就使用折中方案。应先测试 BLAS-only 与 Rayon-only，明确瓶颈归属后再微调。
+
+\section{LDA 优化：优先缩放较小的一侧}
+
+当前 LDA 结构可写为
+\begin{equation}
+  Y = O D(f) V^T,
+\end{equation}
+其中 $O\in\mathbb{R}^{n_{occ}\times N_g}$，$V\in\mathbb{R}^{n_{vir}\times N_g}$，$D(f)$ 是 grid 权重或有效 kernel 响应构成的对角矩阵。
+
+现有实现倾向于构造
+\begin{equation}
+  V_f(a,g)=V(a,g)f(g),
+\end{equation}
+然后计算
+\begin{equation}
+  Y = O V_f^T.
+\end{equation}
+这会生成大小为 $n_{vir}N_g$ 的临时矩阵。
+
+在 TDDFT 中通常 $n_{vir}>n_{occ}$，因此更省内存带宽的是缩放 occupied 侧：
+\begin{equation}
+  O_f(i,g)=O(i,g)f(g),
+\end{equation}
+然后
+\begin{equation}
+  Y=O_f V^T.
+\end{equation}
+临时矩阵大小由 $n_{vir}N_g$ 降为 $n_{occ}N_g$。
+
+建议实现为：
+
+\begin{lstlisting}[language=Rust,style=code]
+let mut occ_scaled_data: Vec<f64> = Vec::with_capacity(nocc * ngrids);
+unsafe { occ_scaled_data.set_len(nocc * ngrids); }
+
+occ_scaled_data
+    .par_chunks_mut(nocc)
+    .enumerate()
+    .for_each(|(g, chunk)| {
+        let fg = f_grid[g];
+        let src_off = g * nocc;
+        for i in 0..nocc {
+            chunk[i] = mo_occ_raw[src_off + i] * fg;
+        }
+    });
+
+let mo_occ_scaled = MatrixFull {
+    size: [nocc, ngrids],
+    indicing: [1, nocc],
+    data: occ_scaled_data,
+};
+
+let mut result = MatrixFull::new([nocc, nvir], 0.0);
+_dgemm_full(&mo_occ_scaled, 'N', &data.mo_vir, 'T', &mut result, 1.0, 0.0);
+\end{lstlisting}
+
+更一般地，每一项 $L D(f) R^T$ 都可以按照如下规则选择缩放对象：
+\begin{equation}
+  \begin{cases}
+  \text{若 } n_L \le n_R, & \text{缩放 } L,\quad (L D)R^T,\\
+  \text{若 } n_R < n_L, & \text{缩放 } R,\quad L(RD)^T.
+  \end{cases}
+\end{equation}
+
+\section{GGA 优化一：合并前向四次 DGEMM}
+
+GGA 前向阶段通常需要计算
+\begin{align}
+  T_0 &= Z V_0,\\
+  T_x &= Z V_x,\\
+  T_y &= Z V_y,\\
+  T_z &= Z V_z.
+\end{align}
+
+若分别调用四次 \texttt{DGEMM}，小矩阵或 skinny 矩阵情况下 BLAS 启动开销和并行效率可能不理想。可以在 \texttt{FXCMatvecData} 初始化时预先打包
+\begin{equation}
+  V_{all} = [V_0, V_x, V_y, V_z],
+\end{equation}
+其尺寸为
+\begin{equation}
+  n_{vir}\times 4N_g.
+\end{equation}
+
+每次 matvec 只需一次大 \texttt{DGEMM}：
+\begin{equation}
+  T_{all}=ZV_{all}.
+\end{equation}
+然后将 $T_{all}$ 的四段视作 $T_0,T_x,T_y,T_z$。这种方法减少了 \texttt{DGEMM} 调用次数，也更容易让 BLAS 在较大矩阵上跑满。
+
+需要注意：如果每次 matvec 都重新打包 $V_{all}$，收益可能被打包开销抵消。因此建议在 \texttt{FXCMatvecData} 中缓存该打包矩阵。
+
+\section{GGA 优化二：融合密度响应与 kernel contraction}
+
+GGA 中密度扰动结构为
+\begin{align}
+  \delta \rho(g)
+  &= \sum_i O_i(g) T_{0,i}(g),\\
+  \partial_d \delta\rho(g)
+  &= \sum_i \left[\partial_d O_i(g)T_{0,i}(g)+O_i(g)T_{d,i}(g)\right].
+\end{align}
+
+当前若先生成 \texttt{rho\_chunks}，再 scatter 到 \texttt{rho\_z}，最后再做 $4\times 4$ kernel contraction，会多一次分配和一次遍历。可直接在每个 grid 点上计算
+\begin{equation}
+  \rho_g = (\delta\rho,\partial_x\delta\rho,\partial_y\delta\rho,\partial_z\delta\rho)^T,
+\end{equation}
+然后立刻计算
+\begin{equation}
+  f_g = W^{xc}_g \rho_g.
+\end{equation}
+
+伪代码如下：
+
+\begin{lstlisting}[language=Rust,style=code]
+let mut fxc_eff_grid = vec![0.0_f64; 4 * ngrids];
+
+let (f0, rest) = fxc_eff_grid.split_at_mut(ngrids);
+let (fx, rest) = rest.split_at_mut(ngrids);
+let (fy, fz) = rest.split_at_mut(ngrids);
+
+f0.par_iter_mut()
+  .zip(fx.par_iter_mut())
+  .zip(fy.par_iter_mut())
+  .zip(fz.par_iter_mut())
+  .enumerate()
+  .for_each(|(g, (((f0g, fxg), fyg), fzg))| {
+      let off = g * nocc;
+      let mut rho = [0.0_f64; 4];
+
+      for i in 0..nocc {
+          let o  = mo_occ_raw[off + i];
+          let t0 = t0_raw[off + i];
+
+          rho[0] += o * t0;
+
+          for d in 0..3 {
+              let og = mo_occ_grad_raw[d][off + i];
+              let tg = t_grad_raw[d][off + i];
+              rho[d + 1] += og * t0 + o * tg;
+          }
+      }
+
+      let mut f = [0.0_f64; 4];
+      for alpha in 0..4 {
+          for beta in 0..4 {
+              let idx = g + alpha * ngrids + beta * 4 * ngrids;
+              f[alpha] += wfxc_data[idx] * rho[beta];
+          }
+      }
+
+      *f0g = f[0];
+      *fxg = f[1];
+      *fyg = f[2];
+      *fzg = f[3];
+  });
+\end{lstlisting}
+
+这能减少中间数据流动。但应注意，$4\times4$ kernel contraction 本身计算量很小，不应单独为它创建过多并行任务；它更适合与 $\rho$ 计算融合。
+
+\section{GGA 优化三：回传阶段使用 blocked packed GEMM}
+
+GGA 回传阶段的数学结构为
+\begin{equation}
+  Y = O_0 D(f_0)V_0^T
+  + \sum_{d=x,y,z}\left[O_dD(f_d)V_0^T + O_0D(f_d)V_d^T\right].
+\end{equation}
+
+若直接实现，会产生 7 个项：
+\begin{equation}
+  1 + 2\times 3 = 7.
+\end{equation}
+这通常意味着 7 次 scaling、7 次临时矩阵构造和 7 次 \texttt{DGEMM}。该结构很容易造成并行效率差，因为每一项都会写入较大的临时数组，并触发一次 BLAS 调用。
+
+更推荐的结构是按 grid block 打包：
+\begin{equation}
+  Y \mathrel{+}= L_{pack}^{(b)} \left(R_{pack}^{(b)}\right)^T.
+\end{equation}
+
+对于每个 grid block $b=[g_0,g_1)$，构造
+\begin{equation}
+  L_{pack}^{(b)}=[O_0, O_x, O_0, O_y, O_0, O_z, O_0]_{b},
+\end{equation}
+以及
+\begin{equation}
+  R_{pack}^{(b)}=[V_0f_0, V_0f_x, V_xf_x, V_0f_y, V_yf_y, V_0f_z, V_zf_z]_{b}.
+\end{equation}
+
+于是原来的 7 个 GEMM 可以在每个 block 中变成 1 个较大的 GEMM。示意代码如下：
+
+\begin{lstlisting}[language=Rust,style=code]
+let block = 4096; // 可测试 1024, 2048, 4096, 8192
+let mut result = MatrixFull::new([nocc, nvir], 0.0);
+
+for g0 in (0..ngrids).step_by(block) {
+    let g1 = (g0 + block).min(ngrids);
+    let nb = g1 - g0;
+
+    // L_pack: nocc x (7 * nb)
+    // R_pack: nvir x (7 * nb)
+    let mut l_pack = MatrixFull::new([nocc, 7 * nb], 0.0);
+    let mut r_pack = MatrixFull::new([nvir, 7 * nb], 0.0);
+
+    // pack term 0: O0 * f0 * V0^T
+    // L block = O0
+    // R block = V0 scaled by f0
+
+    // pack term x1: Ox * fx * V0^T
+    // pack term x2: O0 * fx * Vx^T
+
+    // similarly y,z
+
+    _dgemm_full(&l_pack, 'N', &r_pack, 'T', &mut result, 1.0, 1.0);
+}
+\end{lstlisting}
+
+这个方案的优点包括：
+
+\begin{enumerate}[leftmargin=2em]
+  \item 减少 \texttt{DGEMM} 调用次数；
+  \item 将多个较小 GEMM 合并为较大 GEMM，提高 BLAS 效率；
+  \item 避免反复生成多个全尺寸 \texttt{scaled\_data}；
+  \item 通过 block size 控制缓存和内存占用；
+  \item 更容易在 BLAS 多线程模式下获得稳定加速。
+\end{enumerate}
+
+需要调优的 block size 主要由缓存、$n_{occ}$、$n_{vir}$ 和 $N_g$ 决定。建议测试：
+\begin{equation}
+  block\in\{1024,2048,4096,8192\}.
+\end{equation}
+
+\section{外层并行 GEMM 的备选方案}
+
+若实测发现 BLAS 多线程对当前矩阵形状效率很差，可以采用另一条路线：让 BLAS 单线程，而用 Rayon 并行多个独立 GEMM 项。例如 GGA 回传的 7 个项互相独立，可以并行计算 partial result，最后 reduce：
+
+\begin{lstlisting}[language=Rust,style=code]
+// BLAS is set to one thread externally.
+// RAYON_NUM_THREADS controls outer parallelism.
+
+let partials: Vec<MatrixFull<f64>> = terms
+    .into_par_iter()
+    .map(|term| {
+        let mut partial = MatrixFull::new([nocc, nvir], 0.0);
+        // build scaled matrix for this term
+        // _dgemm_full(..., &mut partial, 1.0, 0.0)
+        partial
+    })
+    .collect();
+
+let mut result = MatrixFull::new([nocc, nvir], 0.0);
+for p in partials {
+    axpy_into(&mut result.data, &p.data, 1.0);
+}
+\end{lstlisting}
+
+该方案的缺点是需要存储多个 $n_{occ}\times n_{vir}$ partial result，内存开销较大。它适合以下场景：
+
+\begin{itemize}[leftmargin=2em]
+  \item 单次 GEMM 很 skinny，BLAS 内部多线程效率差；
+  \item $n_{occ}n_{vir}$ 不太大，partial result 的额外内存可接受；
+  \item 多个独立项数量足够多，外层并行可以填满核心。
+\end{itemize}
+
+若 blocked packed GEMM 能取得较好效果，则通常优先使用 blocked packed GEMM。
+
+\section{Workspace 化：减少反复分配}
+
+在迭代求解 TDDFT/Casida 问题时，\texttt{fxc\_matvec} 会被调用许多次。如果每次 matvec 都分配以下临时对象：
+
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{z.to\_vec()} 与 \texttt{z\_mat}；
+  \item \texttt{t0} 与 \texttt{t\_grad[3]}；
+  \item \texttt{rho\_z} 或 \texttt{rho\_chunks}；
+  \item \texttt{fxc\_eff\_grid}；
+  \item 多个 \texttt{scaled\_data}；
+  \item \texttt{result\_mat}；
+\end{itemize}
+
+则分配与初始化开销会显著影响并行效率。建议引入 workspace：
+
+\begin{lstlisting}[language=Rust,style=code]
+pub struct FXCMatvecWorkspace {
+    pub z_mat: MatrixFull<f64>,
+    pub t0: MatrixFull<f64>,
+    pub t_grad: [MatrixFull<f64>; 3],
+    pub fxc_eff_grid: Vec<f64>,
+    pub pack_left: MatrixFull<f64>,
+    pub pack_right: MatrixFull<f64>,
+    pub result: MatrixFull<f64>,
+}
+\end{lstlisting}
+
+调用接口可改为：
+
+\begin{lstlisting}[language=Rust,style=code]
+pub fn fxc_matvec_gga_opt_ws(
+    data: &FXCMatvecData,
+    z: &[f64],
+    ws: &mut FXCMatvecWorkspace,
+) -> &[f64] {
+    // reuse all buffers
+    // return ws.result.data.as_slice()
+}
+\end{lstlisting}
+
+如果算法框架必须返回 \texttt{Vec<f64>}，也可以在最外层复制一次；但内部应尽量复用 buffer。
+
+\section{Rayon 使用策略：不要并行过小或过轻的循环}
+
+并不是所有循环都适合 Rayon。典型反例是
+\begin{equation}
+  v(g)=w(g)\rho(g),
+\end{equation}
+每个元素只有一次乘法和一次写入，基本完全 memory-bound。并行这类循环通常只能让多个核心竞争内存带宽。
+
+建议使用阈值控制：
+
+\begin{lstlisting}[language=Rust,style=code]
+fn use_rayon(work: usize) -> bool {
+    work > 2_000_000
+}
+\end{lstlisting}
+
+例如对于 LDA 中的 density contraction：
+
+\begin{lstlisting}[language=Rust,style=code]
+let work = ngrids * nocc;
+
+let rho_z: Vec<f64> = if use_rayon(work) {
+    (0..ngrids).into_par_iter().map(|g| {
+        let off = g * nocc;
+        let mut sum = 0.0;
+        for i in 0..nocc {
+            sum += mo_occ_raw[off + i] * t_raw[off + i];
+        }
+        sum
+    }).collect()
+} else {
+    (0..ngrids).map(|g| {
+        let off = g * nocc;
+        let mut sum = 0.0;
+        for i in 0..nocc {
+            sum += mo_occ_raw[off + i] * t_raw[off + i];
+        }
+        sum
+    }).collect()
+};
+\end{lstlisting}
+
+更稳健的方式是按 block 并行，而不是在逻辑上对每个 grid 点做很细粒度的并行：
+
+\begin{lstlisting}[language=Rust,style=code]
+let block = 256;
+
+rho_z
+    .par_chunks_mut(block)
+    .enumerate()
+    .for_each(|(ib, rho_block)| {
+        let g_start = ib * block;
+        for (k, rho) in rho_block.iter_mut().enumerate() {
+            let g = g_start + k;
+            let off = g * nocc;
+
+            let mut sum = 0.0;
+            for i in 0..nocc {
+                sum += mo_occ_raw[off + i] * t_raw[off + i];
+            }
+            *rho = sum;
+        }
+    });
+\end{lstlisting}
+
+可测试的 block size 包括
+\begin{equation}
+  128,\quad 256,\quad 512,\quad 1024.
+\end{equation}
+
+\section{Rust 安全性与工程建议}
+
+当前优化代码中可能使用了如下形式：
+
+\begin{lstlisting}[language=Rust,style=code]
+let mut scaled_data: Vec<f64> = Vec::with_capacity(nvir * ngrids);
+unsafe { scaled_data.set_len(nvir * ngrids); }
+\end{lstlisting}
+
+这可以避免零初始化，但建议将其封装在一个小的 helper 中，避免 unsafe 到处散落：
+
+\begin{lstlisting}[language=Rust,style=code]
+fn uninit_vec_f64(len: usize) -> Vec<f64> {
+    let mut v = Vec::with_capacity(len);
+    unsafe { v.set_len(len); }
+    v
+}
+\end{lstlisting}
+
+更严格的工程做法是使用 \texttt{MaybeUninit<f64>}，在确保完全写入后再转换为 \texttt{Vec<f64>}。虽然 \texttt{f64} 没有析构问题，但从 Rust 语义上看，读取未初始化 \texttt{f64} 仍是不安全行为。若中途发生 panic 或某个分支没有完全写入，可能引入未定义行为或难以排查的数值错误。
+
+长期建议是结合 workspace allocator：大部分临时数组不再频繁分配，也就不必频繁依赖 \texttt{set\_len} 规避初始化开销。
+
+\section{GGA 物理与数值因子检查}
+
+GGA 的实现不仅要关注性能，还必须检查变量定义是否一致。若使用变量
+\begin{equation}
+  (\rho,\nabla_x\rho,\nabla_y\rho,\nabla_z\rho),
+\end{equation}
+则当前形式的密度梯度响应与回传结构是自然的。
+
+但许多 XC 库，尤其是 Libxc 风格接口，常以
+\begin{equation}
+  (\rho,\sigma),\qquad \sigma=|\nabla\rho|^2
+\end{equation}
+为变量。若 \texttt{wfxc} 直接来自 \texttt{v2rho2}、\texttt{v2rhosigma}、\texttt{v2sigma2}，则需要显式完成从 $(\rho,\sigma)$ 到 $(\rho,\nabla\rho)$ 的张量变换。
+
+关键关系包括
+\begin{equation}
+  \delta\sigma = 2\nabla\rho\cdot\nabla\delta\rho.
+\end{equation}
+
+因此必须检查：
+
+\begin{enumerate}[leftmargin=2em]
+  \item \texttt{wfxc} 是否已经乘上 quadrature weight；
+  \item restricted closed-shell singlet 情况下是否需要额外的 spin factor；
+  \item GGA kernel 是以 $(\rho,\nabla\rho)$ 为变量，还是以 $(\rho,\sigma)$ 为变量；
+  \item 若来自 $(\rho,\sigma)$，是否正确处理了 $2$ 与 $4$ 相关因子；
+  \item LDA/GGA 与旧实现、显式矩阵实现的符号和因子是否完全一致。
+\end{enumerate}
+
+\section{正确性测试策略}
+
+性能优化必须配套正确性测试。建议至少加入以下三类测试。
+
+\subsection{显式矩阵对照}
+
+在小体系上显式构造 $K^{xc}_{ia,jb}$，然后比较
+\begin{equation}
+  Y_{explicit}=K^{xc}Z,
+\end{equation}
+与
+\begin{equation}
+  Y_{matvec}=\texttt{fxc\_matvec}(Z).
+\end{equation}
+
+误差指标可设为
+\begin{equation}
+  \epsilon=\frac{\|Y_{explicit}-Y_{matvec}\|_2}{\max(1,\|Y_{explicit}\|_2)}.
+\end{equation}
+
+建议覆盖：
+
+\begin{itemize}[leftmargin=2em]
+  \item LDA 与 GGA；
+  \item 随机 $Z$；
+  \item 不同 $n_{occ}$、$n_{vir}$、$N_g$；
+  \item 非对称尺寸，例如 $n_{vir}\gg n_{occ}$；
+  \item 不同线程组合，确认并行不改变结果。
+\end{itemize}
+
+\subsection{对称性测试}
+
+若 kernel 是实对称的，则应满足
+\begin{equation}
+  X^T K^{xc}Y \approx Y^T K^{xc}X.
+\end{equation}
+
+测试方法：随机生成两个向量 $X,Y$，计算
+\begin{equation}
+  \Delta = \left|X^T\texttt{matvec}(Y)-Y^T\texttt{matvec}(X)\right|.
+\end{equation}
+
+相对误差可定义为
+\begin{equation}
+  \epsilon_{sym}=\frac{\Delta}{\max\left(1, |X^TKY|, |Y^TKX|\right)}.
+\end{equation}
+
+该测试对 GGA 梯度项、index layout、权重因子和 spin factor 错误很敏感。
+
+\subsection{有限差分测试}
+
+可以从 grid 上的 XC potential 响应角度测试：
+\begin{equation}
+  Kz \approx \frac{v_{xc}[\rho+\epsilon\delta\rho] - v_{xc}[\rho-\epsilon\delta\rho]}{2\epsilon}.
+\end{equation}
+
+该测试尤其适合验证 GGA 中 $(\rho,\sigma)$ 与 $(\rho,\nabla\rho)$ 转换因子是否正确。建议测试多个 $\epsilon$，例如
+\begin{equation}
+  \epsilon\in\{10^{-3},10^{-4},10^{-5},10^{-6}
+  \}.
+\end{equation}
+若 $\epsilon$ 太大，非线性误差显著；若太小，浮点抵消误差显著。通常应出现一个中间区间，使有限差分误差达到最小。
+
+\section{性能测试策略}
+
+建议建立固定 benchmark 表格，至少记录：
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.25\linewidth} >{\raggedright\arraybackslash}p{0.68\linewidth}}
+\toprule
+项目 & 说明 \\
+\midrule
+体系规模 & $n_{occ}$、$n_{vir}$、$N_g$、LDA/GGA \\
+线程组合 & BLAS 线程数、Rayon 线程数 \\
+BLAS 后端 & OpenBLAS、MKL 或 BLIS \\
+分段时间 & 前向 GEMM、rho、fxc grid、scaling/packing、回传 GEMM、总时间 \\
+内存流量代理 & 临时矩阵尺寸、分配次数、是否 workspace 化 \\
+正确性误差 & 显式矩阵误差、对称性误差、有限差分误差 \\
+\bottomrule
+\end{longtable}
+
+推荐的测试矩阵如下：
+
+\begin{enumerate}[leftmargin=2em]
+  \item 原始实现；
+  \item 当前 Rayon 优化实现；
+  \item LDA scale occupied 版本；
+  \item GGA fused rho/kernel 版本；
+  \item GGA blocked packed GEMM 版本；
+  \item workspace 版本；
+  \item 不同线程组合下的最终版本。
+\end{enumerate}
+
+对每个版本至少重复运行 5--10 次，取中位数，避免单次噪声误导。若体系很小，应多次连续调用 matvec 再除以次数，以降低 timer overhead。
+
+\section{推荐实施顺序}
+
+建议按以下顺序推进，不要一次性重构所有内容：
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{插入分段计时}，确认 DGEMM、rho、scaling、allocation 分别占多少；
+  \item \textbf{测试 BLAS-only 与 Rayon-only 线程组合}，判断主要并行层次；
+  \item \textbf{LDA 先改为缩放 occupied 侧}，这是低风险且通常收益明显的内存带宽优化；
+  \item \textbf{GGA 融合 rho 与 kernel contraction}，减少中间数组与 scatter；
+  \item \textbf{GGA 回传改为 blocked packed GEMM}，减少 7 次 scaling 与 7 次 GEMM 的碎片化结构；
+  \item \textbf{引入 workspace}，消除迭代 matvec 中反复分配；
+  \item \textbf{增加阈值控制 Rayon}，小任务串行，大任务并行；
+  \item \textbf{补全正确性测试}，包括显式矩阵、对称性和有限差分测试。
+\end{enumerate}
+
+\section{结论}
+
+当前并行效果差的最可能原因不是 Rayon 本身无效，而是并行层次选得不理想：BLAS 已经负责主要浮点计算，而 Rust/Rayon 层主要并行了若干内存带宽型辅助循环。对这类 TDDFT \texttt{fxc\_matvec}，优化重点应从“增加线程”转向“减少内存流量、减少临时矩阵、合并 GEMM、复用 workspace、避免线程过度订阅”。
+
+最优先建议是：
+
+\begin{enumerate}[leftmargin=2em]
+  \item 分段计时；
+  \item 测试 BLAS-only 与 Rayon-only；
+  \item LDA/GGA 中优先缩放较小的一侧；
+  \item GGA 回传改为 blocked packed GEMM；
+  \item workspace 化；
+  \item 用显式矩阵、对称性和有限差分测试保护正确性。
+\end{enumerate}
+
+如果只能先做一个结构性改动，建议优先实现 GGA 的 blocked packed GEMM；它比继续微调单个 grid-loop 的 Rayon 并行更可能带来可观且稳定的加速。
+
+\end{document}

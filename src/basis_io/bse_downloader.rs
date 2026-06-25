@@ -3,7 +3,7 @@
 //! 
 //! [basissetexchange.org]: https://www.basissetexchange.org/
 
-
+#[cfg(not(target_os = "windows"))]
 use libc::PTHREAD_CREATE_JOINABLE;
 use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};

@@ -1111,7 +1111,7 @@ where
 pub fn debug_print_pcm(sta: &PcmStatic, scf: &PcmScf){
     println!("A:");
     print_vec_stats(&sta.A);
-    println!("vec of A:{:?}",sta.A);
+    //println!("vec of A:{:?}",sta.A);
     println!("D:");
     print_matrix_stats(&sta.D);
     println!("S:");
