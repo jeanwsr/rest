@@ -1,14 +1,11 @@
 use tensors::{MatrixFull, BasicMatrix};
 use crate::check_norm::OCCType;
-use crate::constants::{F_SHELL, KR_SHELL, NELE_IN_SHELLS, SPECIES_INFO, S_SHELL, XE_SHELL};
 use crate::molecule_io::Molecule;
 use crate::ctrl_io::InputKeywords;
 use crate::geom_io::{GeomCell, formated_element_name};
 use crate::mpi_io::MPIOperator;
-use crate::scf_io::{initialize_scf, scf};
-use crate::utilities;
+use crate::scf_io::{scf};
 use std::collections::HashMap;
-use std::num;
 
 
 pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>) -> Vec<MatrixFull<f64>> {

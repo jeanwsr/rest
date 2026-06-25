@@ -5,9 +5,8 @@ use crate::basis_io;
 use crate::scf_io::SCF;
 use rest_tensors::MatrixFull;
 use tensors::matrix_blas_lapack::_dgemm_full;
-use std::path::Iter;
 use rayon::iter::{IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator, IntoParallelRefMutIterator};
-use std::fs::{self, File};
+use std::fs::{File};
 use std::io::prelude::*;
 use std::io::LineWriter;
 

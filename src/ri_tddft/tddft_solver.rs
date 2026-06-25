@@ -13,9 +13,10 @@ use rest_tensors::MatrixFull;
 use crate::scf_io::SCF;
 use crate::ri_bse::{davidson_solver, dipoles};
 use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
-use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data};
+use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data, set_fxc_use_optimized};
 use crate::ri_tddft::matvec::{self, a_matvec, b_matvec};
 use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_get_submatrix, compute_tddft_dipole_matrix};
+use crate::ri_tddft::feast_solver;
 
 /// Main TDDFT entry point
 ///
@@ -30,6 +31,9 @@ pub fn tddft_main(scf: &mut SCF) -> Result<(), String> {
     let tddft_spin = tddft_ctrl.tddft_spin.clone();
     let xlet = if tddft_spin == "singlet" { 'S' } else if tddft_spin == "triplet" { 'T' } else { 'R' };
     let is_tda = tddft_method == "tda" || tddft_method == "TDA";
+
+    // Enable optimised (rayon-parallel) fxc kernel if requested
+    set_fxc_use_optimized(tddft_ctrl.tddft_use_optimized_fxc);
 
     println!("\n=== TDDFT Calculation ===");
     println!("Method: {}", if is_tda { "TDA" } else { "Full LR" });
@@ -155,8 +159,46 @@ pub fn tddft_main(scf: &mut SCF) -> Result<(), String> {
         }
     }
 
-    // ═══ Step 8: Call Davidson solver (or full diag for small systems) ═══
-    let eigenpairs = if dim <= 15 {
+    // ═══ Step 8: Call solver (full diag, Davidson, or FEAST) ═══
+    let eigenpairs = if tddft_ctrl.tddft_feast_solver {
+        // ── FEAST solver path ──
+        println!("Using FEAST eigensolver (experimental)");
+        let eigenrange_min = tddft_ctrl.tddft_feast_eigenrange_min;
+        let eigenrange_max = tddft_ctrl.tddft_feast_eigenrange_max;
+        let m_expected = tddft_ctrl.tddft_feast_m_expected;
+        let max_feast_iter = tddft_ctrl.tddft_feast_max_iter;
+        let tol_feast = tddft_ctrl.tddft_feast_tol;
+        let gmres_restart = tddft_ctrl.tddft_feast_gmres_restart;
+        let gmres_max_iter = tddft_ctrl.tddft_feast_gmres_max_iter;
+        let gmres_tol = tddft_ctrl.tddft_feast_cg_tol;
+        let cg_max_iter = tddft_ctrl.tddft_feast_cg_max_iter;
+        let cg_tol = tddft_ctrl.tddft_feast_cg_tol;
+        let init_guess_type = tddft_ctrl.tddft_feast_init_guess_type.as_str();
+        let gaussian_width_factor = tddft_ctrl.tddft_feast_gaussian_width_factor;
+
+        if is_tda {
+            feast_solver::feast_solve_tddft_tda(
+                scf, &fxc_data,
+                &ri_ov, &ri_oo_exch, &ri_vv_exch,
+                &hdiag, xlet, alpha_hybrid,
+                eigenrange_min, eigenrange_max,
+                m_expected, max_feast_iter, tol_feast,
+                gmres_restart, gmres_max_iter, gmres_tol,
+                init_guess_type, gaussian_width_factor,
+            )
+        } else {
+            feast_solver::feast_solve_tddft_lr(
+                scf, &fxc_data,
+                &ri_ov, &ri_oo_exch, &ri_vv_exch, &ri_ov_exch,
+                &hdiag, xlet, alpha_hybrid,
+                eigenrange_min, eigenrange_max,
+                m_expected, max_feast_iter, tol_feast,
+                gmres_restart, gmres_max_iter, gmres_tol,
+                cg_max_iter, cg_tol,
+                init_guess_type, gaussian_width_factor,
+            )
+        }
+    } else if dim <= 15 {
         println!("Small system (dim={}), building full A matrix for diagnosis...", dim);
         let mut a_mat = vec![0.0; dim * dim];
         for col in 0..dim {

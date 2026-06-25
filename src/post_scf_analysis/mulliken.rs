@@ -1,8 +1,6 @@
-use std::borrow::BorrowMut;
-
-use crate::{molecule_io,geom_io,scf_io};
+use crate::{geom_io};
 use crate::scf_io::SCF;
-use rest_tensors::{BasicMatrix, MathMatrix, MatrixFull};
+use rest_tensors::{MatrixFull};
 use tensors::matrix_blas_lapack::_dgemm_full;
 
 pub fn mulliken_pop(scf_data: &SCF) -> Vec<f64>{

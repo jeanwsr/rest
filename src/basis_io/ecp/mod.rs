@@ -174,7 +174,7 @@ fn loading_gp_operator_per_atom(gpbas: &mut Vec<Vec<i32>>, env: &mut Vec<f64>, c
     }
 }
 
-fn initialize_gp_operator_for_cint(env: &Vec<f64>, atm: &Vec<Vec<i32>>, ep_path: &Vec<String>, ep_pos: &MatrixFull<f64>) -> (Vec<f64>, Vec<Vec<i32>>, Vec<Vec<i32>>) {
+pub fn initialize_gp_operator_for_cint(env: &Vec<f64>, atm: &Vec<Vec<i32>>, ep_path: &Vec<String>, ep_pos: &MatrixFull<f64>) -> (Vec<f64>, Vec<Vec<i32>>, Vec<Vec<i32>>) {
     let mut out_env = env.clone();
     let mut out_atm = atm.clone();
     let mut gpbas: Vec<Vec<i32>> = vec![];

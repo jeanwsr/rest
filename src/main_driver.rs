@@ -11,13 +11,13 @@ use crate::external_field::num_dipole::numerical_dipole;
 use crate::geom_io::{GeomUnit, get_mass_charge};
 use num_traits::Pow;
 use pyo3::prelude::*;
-use autocxx::prelude::*;
+//use autocxx::prelude::*;
 use crate::ctrl_io::JobType;
 use crate::constants::{ANG, AU2DEBYE};
 use crate::scf_io::{scf_without_build, SCFType, SCF};
 use tensors::{MathMatrix, MatrixFull};
 use tensors::matrix_blas_lapack::_dsyevd;
-use crate::{utilities, ri_pt2, ri_rpa, dft, scf_io, post_scf_analysis};
+use crate::{utilities, ri_pt2, ri_rpa, dft, scf_io, post_scf_analysis, lib_rint};
 
 //use rayon;
 use crate::constants::EV;
@@ -44,6 +44,12 @@ use crate::mpi_io::{MPIOperator,MPIData};
 use std::collections::HashMap;
 
 //use crate::mpi_io::initialization;
+
+fn print_r12inv2_export(observables: &lib_rint::RhfVeeObservables) {
+    println!("E_J(r2)            : {:.16e}", observables.ej);
+    println!("E_K(r2)            : {:.16e}", observables.ek);
+    println!("E(r2)              : {:.16e}", observables.total);
+}
 
 
 pub fn main_driver() -> anyhow::Result<()> {
@@ -236,9 +242,9 @@ pub fn main_driver() -> anyhow::Result<()> {
             }
         },
         // UNVERIFIED NORMAL MODES CALCULATION
-        // JobType::NormalModes => {
-        //     eval_normal_modes(&mut scf_data, &mut time_mark, &mpi_operator);
-        // },
+        JobType::NormalModes => {
+            eval_normal_modes(&mut scf_data, &mut time_mark, &mpi_operator);
+        },
         // ------------
         _ => {}
     }
@@ -262,6 +268,40 @@ pub fn main_driver() -> anyhow::Result<()> {
         scf_data.stability();
 
         time_mark.count("Stability");
+    }
+
+    // check lib_rint
+    if scf_data.mol.ctrl.run_lib_rint {
+        time_mark.count_start("RI-r2");
+        match scf_data.scftype {
+            SCFType::RHF => {
+                let p_rhf = &scf_data.density_matrix[0];
+                let r2 = lib_rint::lib_vee_rhf_r2_observables_advanced(
+                    &scf_data.mol.geom,
+                    &scf_data.mol.basis4elem,
+                    p_rhf,
+                    Some(&scf_data.eigenvectors),
+                    Some(&scf_data.occupation),
+                );
+                print_r12inv2_export(&r2);
+            }
+            SCFType::ROHF | SCFType::UHF => {
+                if scf_data.density_matrix.len() < 2 {
+                    println!("lib_rint skipped: open-shell run needs alpha/beta density matrices");
+                } else {
+                    let dm_spin = &scf_data.density_matrix[0..2];
+                    let r2 = lib_rint::lib_vee_uhf_r2_observables_advanced(
+                        &scf_data.mol.geom,
+                        &scf_data.mol.basis4elem,
+                        dm_spin,
+                        Some(&scf_data.eigenvectors),
+                        Some(&scf_data.occupation),
+                    );
+                    print_r12inv2_export(&r2);
+                }
+            }
+        }
+        time_mark.count("RI-r2");
     }
 
     //====================================
@@ -389,7 +429,7 @@ pub fn output_result(scf_data: &scf_io::SCF) {
     } else {
         if scf_data.mol.ctrl.smear.is_some() {
             println!("The SCF energy (E)    : {:18.10} Ha", scf_data.scf_energy);
-            let sigma = scf_data.mol.ctrl.smear_sigma.unwrap_or(0.0);
+            let sigma = scf_data.current_smear_sigma;
             let s = scf_data.smearing_entropy;
             println!("Free energy  (E-TS)  : {:18.10} Ha", scf_data.scf_energy - sigma * s);
             println!("Zero-temp energy (E0): {:18.10} Ha", scf_data.scf_energy - 0.5 * sigma * s);
@@ -710,182 +750,182 @@ fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeR
 }
 
 // UNVERIFIED NORMAL MODES CALCULATION
-// fn eval_normal_modes(
-//     scf_data: &mut SCF,
-//     time_mark: &mut utilities::TimeRecords,
-//     mpi_operator: &Option<MPIOperator>,
-// ) {
-//     if scf_data.mol.xc_data.is_fifth_dfa() {
-//         panic!("Normal modes calculation is currently not available for post-SCF methods.");
-//     }
+fn eval_normal_modes(
+    scf_data: &mut SCF,
+    time_mark: &mut utilities::TimeRecords,
+    mpi_operator: &Option<MPIOperator>,
+) {
+    if scf_data.mol.xc_data.is_fifth_dfa() {
+        panic!("Normal modes calculation is currently not available for post-SCF methods.");
+    }
 
-//     let num_atoms = scf_data.mol.geom.nfree;
-//     let dim = num_atoms * 3;
-//     let displace_ang = scf_data.mol.ctrl.nhessian_displacement;
-//     let displace = displace_ang / ANG; // convert Angstrom to Bohr
+    let num_atoms = scf_data.mol.geom.nfree;
+    let dim = num_atoms * 3;
+    let displace_ang = scf_data.mol.ctrl.nhessian_displacement;
+    let displace = displace_ang / ANG; // convert Angstrom to Bohr
 
-//     if scf_data.mol.ctrl.print_level > 0 {
-//         println!("");
-//         println!("=========================================================");
-//         println!("      Vibrational Normal Modes (Frequency) Calculation");
-//         println!("=========================================================");
-//         println!("Number of atoms:               {}", num_atoms);
-//         println!("Hessian dimension:             {}", dim);
-//         println!("Finite-difference displacement: {:.6} Bohr ({:.6} Ang)", displace, displace_ang);
-//         println!("Number of displaced SCF jobs:  {}", dim * 2);
-//         println!("---------------------------------------------------------");
-//     }
+    if scf_data.mol.ctrl.print_level > 0 {
+        println!("");
+        println!("=========================================================");
+        println!("      Vibrational Normal Modes (Frequency) Calculation");
+        println!("=========================================================");
+        println!("Number of atoms:               {}", num_atoms);
+        println!("Hessian dimension:             {}", dim);
+        println!("Finite-difference displacement: {:.6} Bohr ({:.6} Ang)", displace, displace_ang);
+        println!("Number of displaced SCF jobs:  {}", dim * 2);
+        println!("---------------------------------------------------------");
+    }
 
-//     // Build Hessian via central finite difference of analytical gradients
-//     let mut hessian = MatrixFull::new([dim, dim], 0.0);
+    // Build Hessian via central finite difference of analytical gradients
+    let mut hessian = MatrixFull::new([dim, dim], 0.0);
 
-//     if scf_data.mol.ctrl.print_level > 0 {
-//         print!("  Hessian finite difference progress: ");
-//         io::stdout().flush().unwrap();
-//     }
+    if scf_data.mol.ctrl.print_level > 0 {
+        print!("  Hessian finite difference progress: ");
+        io::stdout().flush().unwrap();
+    }
 
-//     for atm_idx in 0..num_atoms {
-//         for xyz in 0..3 {
-//             let col_idx = atm_idx * 3 + xyz;
+    for atm_idx in 0..num_atoms {
+        for xyz in 0..3 {
+            let col_idx = atm_idx * 3 + xyz;
 
-//             // +δ displacement
-//             let mut vec_plus = vec![0.0; 3];
-//             vec_plus[xyz] = displace;
-//             let mut scf_plus = scf_data.clone();
-//             scf_plus.mol.geom.geom_shift(atm_idx, vec_plus);
-//             scf_plus.mol.ctrl.print_level = 0;
-//             scf_plus.mol.ctrl.initial_guess = String::from("inherit");
-//             initialize_scf(&mut scf_plus, mpi_operator);
-//             let _ = performance_essential_calculations(&mut scf_plus, time_mark, mpi_operator);
-//             let (_, force_plus) = eval_force(&mut scf_plus, time_mark, mpi_operator);
+            // +δ displacement
+            let mut vec_plus = vec![0.0; 3];
+            vec_plus[xyz] = displace;
+            let mut scf_plus = scf_data.clone();
+            scf_plus.mol.geom.geom_shift(atm_idx, vec_plus);
+            scf_plus.mol.ctrl.print_level = 0;
+            scf_plus.mol.ctrl.initial_guess = String::from("inherit");
+            initialize_scf(&mut scf_plus, mpi_operator);
+            let _ = performance_essential_calculations(&mut scf_plus, time_mark, mpi_operator);
+            let (_, force_plus) = eval_force(&mut scf_plus, time_mark, mpi_operator);
 
-//             // -δ displacement
-//             let mut vec_minus = vec![0.0; 3];
-//             vec_minus[xyz] = -displace;
-//             let mut scf_minus = scf_data.clone();
-//             scf_minus.mol.geom.geom_shift(atm_idx, vec_minus);
-//             scf_minus.mol.ctrl.print_level = 0;
-//             scf_minus.mol.ctrl.initial_guess = String::from("inherit");
-//             initialize_scf(&mut scf_minus, mpi_operator);
-//             let _ = performance_essential_calculations(&mut scf_minus, time_mark, mpi_operator);
-//             let (_, force_minus) = eval_force(&mut scf_minus, time_mark, mpi_operator);
+            // -δ displacement
+            let mut vec_minus = vec![0.0; 3];
+            vec_minus[xyz] = -displace;
+            let mut scf_minus = scf_data.clone();
+            scf_minus.mol.geom.geom_shift(atm_idx, vec_minus);
+            scf_minus.mol.ctrl.print_level = 0;
+            scf_minus.mol.ctrl.initial_guess = String::from("inherit");
+            initialize_scf(&mut scf_minus, mpi_operator);
+            let _ = performance_essential_calculations(&mut scf_minus, time_mark, mpi_operator);
+            let (_, force_minus) = eval_force(&mut scf_minus, time_mark, mpi_operator);
 
-//             // Hessian column = (F(+) - F(-)) / (2δ)
-//             // force_plus/minus are [3, num_atoms], we flatten to 3*num_atoms vector
-//             for a in 0..num_atoms {
-//                 for d in 0..3 {
-//                     let row_idx = a * 3 + d;
-//                     hessian[(row_idx, col_idx)] = (force_plus[(d, a)] - force_minus[(d, a)]) / (2.0 * displace);
-//                 }
-//             }
+            // Hessian column = (F(+) - F(-)) / (2δ)
+            // force_plus/minus are [3, num_atoms], we flatten to 3*num_atoms vector
+            for a in 0..num_atoms {
+                for d in 0..3 {
+                    let row_idx = a * 3 + d;
+                    hessian[(row_idx, col_idx)] = (force_plus[(d, a)] - force_minus[(d, a)]) / (2.0 * displace);
+                }
+            }
 
-//             if scf_data.mol.ctrl.print_level > 0 {
-//                 print!(".");
-//                 io::stdout().flush().unwrap();
-//             }
-//         }
-//     }
+            if scf_data.mol.ctrl.print_level > 0 {
+                print!(".");
+                io::stdout().flush().unwrap();
+            }
+        }
+    }
 
-//     if scf_data.mol.ctrl.print_level > 0 {
-//         println!(" done");
-//     }
+    if scf_data.mol.ctrl.print_level > 0 {
+        println!(" done");
+    }
 
-//     // Symmetrize Hessian: H = (H + H^T) / 2
-//     for i in 0..dim {
-//         for j in 0..i {
-//             let avg = 0.5 * (hessian[(i, j)] + hessian[(j, i)]);
-//             hessian[(i, j)] = avg;
-//             hessian[(j, i)] = avg;
-//         }
-//     }
+    // Symmetrize Hessian: H = (H + H^T) / 2
+    for i in 0..dim {
+        for j in 0..i {
+            let avg = 0.5 * (hessian[(i, j)] + hessian[(j, i)]);
+            hessian[(i, j)] = avg;
+            hessian[(j, i)] = avg;
+        }
+    }
 
-//     // Get atomic masses in amu
-//     let mass_charge = get_mass_charge(&scf_data.mol.geom.elem);
+    // Get atomic masses in amu
+    let mass_charge = get_mass_charge(&scf_data.mol.geom.elem);
 
-//     // Mass-weight Hessian: H̃_ij = H_ij / sqrt(m_i * m_j)
-//     let mut mw_hessian = MatrixFull::new([dim, dim], 0.0);
-//     for i in 0..dim {
-//         let atom_i = i / 3;
-//         let mass_i = mass_charge[atom_i].0; // mass in amu
-//         for j in 0..=i {
-//             let atom_j = j / 3;
-//             let mass_j = mass_charge[atom_j].0;
-//             let mw_val = hessian[(i, j)] / (mass_i * mass_j).sqrt();
-//             mw_hessian[(i, j)] = mw_val;
-//             mw_hessian[(j, i)] = mw_val;
-//         }
-//     }
+    // Mass-weight Hessian: H̃_ij = H_ij / sqrt(m_i * m_j)
+    let mut mw_hessian = MatrixFull::new([dim, dim], 0.0);
+    for i in 0..dim {
+        let atom_i = i / 3;
+        let mass_i = mass_charge[atom_i].0; // mass in amu
+        for j in 0..=i {
+            let atom_j = j / 3;
+            let mass_j = mass_charge[atom_j].0;
+            let mw_val = hessian[(i, j)] / (mass_i * mass_j).sqrt();
+            mw_hessian[(i, j)] = mw_val;
+            mw_hessian[(j, i)] = mw_val;
+        }
+    }
 
-//     // Diagonalize mass-weighted Hessian
-//     let (eigenvectors, eigenvalues, info) = _dsyevd(&mw_hessian, 'V');
-//     if info != 0 {
-//         panic!("DSYEVD (diagonalization of mass-weighted Hessian) failed with info = {}", info);
-//     }
+    // Diagonalize mass-weighted Hessian
+    let (eigenvectors, eigenvalues, info) = _dsyevd(&mw_hessian, 'V');
+    if info != 0 {
+        panic!("DSYEVD (diagonalization of mass-weighted Hessian) failed with info = {}", info);
+    }
 
-//     let eigvec = eigenvectors.unwrap();
+    let eigvec = eigenvectors.unwrap();
 
-//     // Conversion factor: sqrt(λ / (amu)) to cm⁻¹
-//     // λ is eigenvalue of mass-weighted Hessian in Hartree/(Bohr²·amu)
-//     // ν̃ (cm⁻¹) = sign(λ) × sqrt(|λ|) × 5140.487
-//     const FREQ_CONV: f64 = 5140.487;
+    // Conversion factor: sqrt(λ / (amu)) to cm⁻¹
+    // λ is eigenvalue of mass-weighted Hessian in Hartree/(Bohr²·amu)
+    // ν̃ (cm⁻¹) = sign(λ) × sqrt(|λ|) × 5140.487
+    const FREQ_CONV: f64 = 5140.487;
 
-//     // Print frequencies sorted by mode number (already sorted by DSYEVD)
-//     if scf_data.mol.ctrl.print_level > 0 {
-//         println!("");
-//         println!("=========================================================");
-//         println!("      Vibrational Frequencies");
-//         println!("=========================================================");
-//         println!("{:>7} {:>22} {:>22}", "Mode", "Eigenvalue", "Freq (cm⁻¹)");
-//         println!("---------------------------------------------------------");
+    // Print frequencies sorted by mode number (already sorted by DSYEVD)
+    if scf_data.mol.ctrl.print_level > 0 {
+        println!("");
+        println!("=========================================================");
+        println!("      Vibrational Frequencies");
+        println!("=========================================================");
+        println!("{:>7} {:>22} {:>22}", "Mode", "Eigenvalue", "Freq (cm⁻¹)");
+        println!("---------------------------------------------------------");
 
-//         for i in 0..dim {
-//             let lambda = eigenvalues[i];
-//             let freq_sign = if lambda < 0.0 { -1.0 } else { 1.0 };
-//             let freq = freq_sign * lambda.abs().sqrt() * FREQ_CONV;
-//             let lambda_str = if lambda >= 0.0 {
-//                 format!("{:22.8}", lambda)
-//             } else {
-//                 format!("{:22.8}", lambda)
-//             };
-//             println!("{:7} {:>22} {:>22.4}", i + 1, lambda_str, freq);
-//         }
-//         println!("=========================================================");
+        for i in 0..dim {
+            let lambda = eigenvalues[i];
+            let freq_sign = if lambda < 0.0 { -1.0 } else { 1.0 };
+            let freq = freq_sign * lambda.abs().sqrt() * FREQ_CONV;
+            let lambda_str = if lambda >= 0.0 {
+                format!("{:22.8}", lambda)
+            } else {
+                format!("{:22.8}", lambda)
+            };
+            println!("{:7} {:>22} {:>22.4}", i + 1, lambda_str, freq);
+        }
+        println!("=========================================================");
 
-//         // Identify near-zero modes (translations + rotations)
-//         println!("");
-//         println!("Near-zero modes (translations/rotations):");
-//         let threshold = 100.0; // cm⁻¹
-//         for i in 0..dim {
-//             let lambda = eigenvalues[i];
-//             let freq_sign = if lambda < 0.0 { -1.0 } else { 1.0 };
-//             let freq = freq_sign * lambda.abs().sqrt() * FREQ_CONV;
-//             if freq.abs() < threshold {
-//                 println!("  Mode {:4}: {:12.4} cm⁻¹", i + 1, freq);
-//             }
-//         }
-//     }
+        // Identify near-zero modes (translations + rotations)
+        println!("");
+        println!("Near-zero modes (translations/rotations):");
+        let threshold = 100.0; // cm⁻¹
+        for i in 0..dim {
+            let lambda = eigenvalues[i];
+            let freq_sign = if lambda < 0.0 { -1.0 } else { 1.0 };
+            let freq = freq_sign * lambda.abs().sqrt() * FREQ_CONV;
+            if freq.abs() < threshold {
+                println!("  Mode {:4}: {:12.4} cm⁻¹", i + 1, freq);
+            }
+        }
+    }
 
-//     // Print Cartesian normal mode displacements at higher print levels
-//     if scf_data.mol.ctrl.print_level > 1 {
-//         println!("");
-//         println!("Cartesian normal mode displacements:");
-//         for i in 0..dim {
-//             let lambda = eigenvalues[i];
-//             let freq_sign = if lambda < 0.0 { -1.0 } else { 1.0 };
-//             let freq = freq_sign * lambda.abs().sqrt() * FREQ_CONV;
-//             println!("");
-//             println!("Mode {:4} (ω = {:12.4} cm⁻¹):", i + 1, freq);
-//             println!("{:>6} {:>14} {:>14} {:>14}", "Atom", "dX", "dY", "dZ");
-//             for a in 0..num_atoms {
-//                 let dx = eigvec[(a * 3,     i)];
-//                 let dy = eigvec[(a * 3 + 1, i)];
-//                 let dz = eigvec[(a * 3 + 2, i)];
-//                 println!("{:>6} {:14.8} {:14.8} {:14.8}",
-//                     scf_data.mol.geom.elem[a], dx, dy, dz);
-//             }
-//         }
-//     }
-// }
+    // Print Cartesian normal mode displacements at higher print levels
+    if scf_data.mol.ctrl.print_level > 1 {
+        println!("");
+        println!("Cartesian normal mode displacements:");
+        for i in 0..dim {
+            let lambda = eigenvalues[i];
+            let freq_sign = if lambda < 0.0 { -1.0 } else { 1.0 };
+            let freq = freq_sign * lambda.abs().sqrt() * FREQ_CONV;
+            println!("");
+            println!("Mode {:4} (ω = {:12.4} cm⁻¹):", i + 1, freq);
+            println!("{:>6} {:>14} {:>14} {:>14}", "Atom", "dX", "dY", "dZ");
+            for a in 0..num_atoms {
+                let dx = eigvec[(a * 3,     i)];
+                let dy = eigvec[(a * 3 + 1, i)];
+                let dz = eigvec[(a * 3 + 2, i)];
+                println!("{:>6} {:14.8} {:14.8} {:14.8}",
+                    scf_data.mol.geom.elem[a], dx, dy, dz);
+            }
+        }
+    }
+}
 //------------------
 
 #[cfg(feature = "geometric-pyo3")]
@@ -944,6 +984,17 @@ mod geometric_pyo3_impl {
             panic!("For geometric_pyo3, you must specify the parameters in the control file.")
         };
 
+        let constraint_path = if let Some(constraint_str) = scf_data.mol.geom.to_geometric_freeze_str() {
+            if scf_data.mol.ctrl.print_level > 0 {
+                println!("Fixed atoms detected, generating constraint file.");
+            }
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!("rest_constraints_{}.txt", std::process::id()));
+            std::fs::write(&path, &constraint_str).expect("Failed to write constraint file");
+            Some(path)
+        } else {
+            None
+        };
 
         let input = None;
 
@@ -958,6 +1009,10 @@ mod geometric_pyo3_impl {
         let (last_energy, last_coords) = Python::with_gil(|py| -> PyResult<(f64, Vec<f64>)> {
             let custom_engine = pyo3_engine_cls.call1(py, (molecule,))?;
             custom_engine.call_method1(py, "set_driver", (driver,))?;
+
+            if let Some(ref cst_path) = constraint_path {
+                params.bind(py).set_item("constraints", cst_path.to_str().unwrap())?;
+            }
 
             let res = run_optimization(custom_engine, &params, input)?;
 
@@ -975,6 +1030,10 @@ mod geometric_pyo3_impl {
 
             Ok((last_energy, last_coords))
         })?;
+
+        if let Some(ref path) = constraint_path {
+            let _ = std::fs::remove_file(path);
+        }
 
         let last_coords = MatrixFull::from_vec([3, last_coords.len()/3], last_coords).unwrap();
 

@@ -80,7 +80,7 @@ fn import_ecp()-> anyhow::Result<()> {
 ///  - BasCell.angular_momentum:  The angular momentums of the GTOs in this cell  
 ///  - BasCell.exponents:         The exponents  
 ///  - BasCell.coefficients:      The coefficients 
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BasCell {
     pub function_type: Option<String>,
     pub region: Option<String>,
@@ -137,7 +137,7 @@ impl  BasInfo {
 ///     self.electron_shells: the GTO basis functions organized cell by cell [`BasCell`](BasCell)
 ///     self.references: The reference of each basis cell.
 ///     self.global_index: The global index for the given atom
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Basis4Elem {
     pub electron_shells: Vec<BasCell>,
     pub references: Option<Vec<RefCell>>,

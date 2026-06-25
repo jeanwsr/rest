@@ -48,7 +48,10 @@ pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
         // input file in the toml format
         toml::from_str::<serde_json::Value>(&tmp_cont[..])?
     };
-    parse_ctl_from_json(&tmp_keys)
+    let (input, mut geomcell) = parse_ctl_from_json(&tmp_keys)?;
+    let input_dir = std::path::Path::new(&filename).parent().unwrap_or(std::path::Path::new("."));
+    geomcell.resolve_ghost_ep_paths(input_dir);
+    Ok((input, geomcell))
 }
 
 pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(InputKeywords,GeomCell)> {
@@ -73,6 +76,30 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     Ok((tmp_input,tmp_geomcell))
 }
 
+fn parse_usize_list_keyword(value: &serde_json::Value) -> Vec<usize> {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_u64().map(|x| x as usize))
+            .collect(),
+        serde_json::Value::Number(num) => {
+            num.as_u64().map(|x| vec![x as usize]).unwrap_or_default()
+        }
+        serde_json::Value::String(text) => text
+            .trim_matches(|c| c == '[' || c == ']')
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter_map(|part| {
+                let part = part.trim();
+                if part.is_empty() {
+                    None
+                } else {
+                    part.parse::<usize>().ok()
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 
 #[derive(Clone,Copy,Debug, Deserialize, Serialize)]
 pub enum JobType {
@@ -283,6 +310,9 @@ pub struct InputKeywords {
     // Keywords for DeepPot
     #[pyo3(get, set)]
     pub deep_pot: bool,
+    // Keywords for lib_rint
+    #[pyo3(get, set)]
+    pub run_lib_rint: bool,
     // Keywords for benchmarking various effective potentials, including ECP, ENXC, and Ghost EP
     #[pyo3(get, set)]
     pub bench_eps: bool,
@@ -313,6 +343,8 @@ pub struct InputKeywords {
     pub smear_sigma_min: Option<f64>,
     /// EDIIS penalty parameter η (default 0.5). Larger η = more conservative extrapolation.
     pub ediis_penalty: Option<f64>,
+    /// ADIIS penalty parameter μ (default 0.5). Convex QP, penalizes deviation from D₀.
+    pub adiis_penalty: Option<f64>,
     /// HOMO-LUMO gap threshold (Ha) for EDIIS→DIIS auto-switch in "ediis+diis" mode.
     /// Below this gap, EDIIS is preferred. Default 0.1 Ha.
     pub ediis_switch_gap: Option<f64>,
@@ -332,6 +364,9 @@ pub struct InputKeywords {
     pub j2c_decomp: J2CDecompOption,
     pub ri_pt2: RiPt2Option,
     pub cphf: Option<CPHFParameters>,
+    /// Use the optimized fxc_matvec_opt (rayon + pre-allocated workspace).
+    #[pyo3(get, set)]
+    pub use_fxc_opt: bool,
 }
 
 impl Default for InputKeywords {
@@ -453,6 +488,7 @@ impl InputKeywords {
             //use_dft: false,
             //dft_type: None,
             deep_pot: false,
+            run_lib_rint: false,
             bench_eps: false,
             occupation_type: OCCType::INTEGER,
             frac_tolerant: 1.0e-3,
@@ -466,6 +502,7 @@ impl InputKeywords {
             smear_anneal: false,
             smear_sigma_min: None,
             ediis_penalty: None,
+            adiis_penalty: None,
             ediis_switch_gap: None,
             guess_mix: false,
             guess_mix_theta_deg: [15.0, 15.0].to_vec(),
@@ -490,6 +527,7 @@ impl InputKeywords {
             ri_pt2: RiPt2Option::default(),
             tddft: None,
             cphf: None,
+            use_fxc_opt: false,
         }
     }
 
@@ -688,7 +726,8 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
                     &tmp_mixer, &ctrl.mix_param);
     } else if tmp_mixer.eq(&"diis")
             || tmp_mixer.eq(&"ediis")
-            || tmp_mixer.eq(&"ediis+diis") {
+            || tmp_mixer.eq(&"ediis+diis")
+            || tmp_mixer.eq(&"adiis+diis") {
         mixer_log = format!("The {} mixing with (param, max_vec_len) = ({}, {}) is employed for the SCF procedure", 
                     &tmp_mixer, &ctrl.mix_param, &ctrl.num_max_diis);
         mixer_log.push_str(&format!("\nTurn on the {} mixing after {} step(s) of SCF iteractions with the linear mixing", 
@@ -1660,6 +1699,11 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };
+            tmp_input.run_lib_rint = match tmp_ctrl.get("run_lib_rint").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                _ => false,
+            };
             tmp_input.bench_eps = match tmp_ctrl.get("bench_eps").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
@@ -1740,6 +1784,19 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
 
             // for EDIIS switch gap
             tmp_input.ediis_switch_gap = match tmp_ctrl.get("ediis_switch_gap").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {
+                    let num = tmp_str.to_lowercase().parse().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                serde_json::Value::Number(tmp_num) => {
+                    let num = tmp_num.as_f64().unwrap_or(0.0);
+                    if num == 0.0 { None } else { Some(num) }
+                },
+                _ => None,
+            };
+
+            // for ADIIS penalty parameter
+            tmp_input.adiis_penalty = match tmp_ctrl.get("adiis_penalty").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {
                     let num = tmp_str.to_lowercase().parse().unwrap_or(0.0);
                     if num == 0.0 { None } else { Some(num) }

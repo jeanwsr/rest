@@ -176,15 +176,14 @@ impl<'a> NumInt<'a> for RIRHFGradient<'a> {
 impl RIRHFGradient<'_> {
     pub fn calc_de_xc(&mut self) -> &mut Self {
         // get dx vxc [nao, nao, 3]
-        // println!("Calculating dx vxc");
         let scf_data = self.scf_data; 
         let xc_data = self.gen_xc_data(scf_data, 0);
         let mut mol = scf_data.mol.clone();
         let grids = &mut Grids::build(&mut mol);
         // let dao_vxc = get_vxc(&self, &xc_data, grids, &scf_data.mol, self.flags.max_memory.unwrap_or(2000.0) as usize);
-        let dao_vxc = get_vxc_rayon(&self, &xc_data, grids, &scf_data.mol);
+        // let dao_vxc = get_vxc_rayon(&self, &xc_data, grids, &scf_data.mol);
+        let dao_vxc = get_vxc_rayon_new(&self, &xc_data, grids, &mol, 16usize);
         // println!("Print dao_vxc: {:?}", dao_vxc);
-        // println!("Finished calculating dx vxc");
         
         // contract dao_vxc and dm (tuv, uv -> tu)
         let nao = mol.num_basis;
@@ -218,9 +217,12 @@ impl RIRHFGradient<'_> {
         time_records.new_item("rks grad calc_de_nuc", "rks grad calc_de_nuc");
         time_records.new_item("rks grad calc_de_ovlp", "rks grad calc_de_ovlp");
         time_records.new_item("rks grad calc_de_hcore", "rks grad calc_de_hcore");
+        time_records.new_item("rks grad calc_de_ext_field", "rks grad calc_de_ext_field");
         time_records.new_item("rks grad calc_de_jk", "rks grad calc_de_jk");
         time_records.new_item("rks grad calc_de_xc", "rks grad calc_de_xc");
+        time_records.new_item("rks grad calc_de_qmmm", "rks grad calc_de_qmmm");
         time_records.new_item("rks grad calc_de_solvent", "rks grad calc_de_solvent");
+        time_records.new_item("rks grad calc_de_ext_field", "rks grad calc_de_ext_field");
 
         time_records.count_start("rks grad");
 
@@ -235,6 +237,12 @@ impl RIRHFGradient<'_> {
         time_records.count_start("rks grad calc_de_hcore");
         self.calc_de_hcore();
         time_records.count("rks grad calc_de_hcore");
+
+        if self.flags.ext_field_dipole.is_some() {
+            time_records.count_start("rhf grad calc_de_ext_field");
+            self.calc_de_ext_field();
+            time_records.count("rhf grad calc_de_ext_field");
+        }
 
         time_records.count_start("rks grad calc_de_qmmm");
         self.calc_de_qmmm();
@@ -268,6 +276,7 @@ impl RIRHFGradient<'_> {
         self.result.get("de_xc").map(|x| de += x.clone());
         self.result.get("de_qmmm").map(|x| de += x.clone());
         self.result.get("de_solvent").map(|x| de += x.clone());
+        self.result.get("de_ext_field").map(|x| de += x.clone());
         self.result.insert("de".into(), de);
 
         if self.flags.print_level >= 2 {
@@ -389,6 +398,7 @@ fn get_vxc(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &mut Grids,
     let ao_comp = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6; // number of components for ao derivatives 
     let blksize = max_memory * 1_000_000 / 8 / ((ao_comp + 1) * num_basis);
     let blksize = blksize.min(num_grids).max(4); 
+    // let blksize:usize = 1024;
     let block_settings = BlockSettings {
         ao_deriv,
         max_memory,
@@ -552,6 +562,87 @@ fn get_vxc_rayon(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &mut 
     // nabla R = - nabla r
     vmat *= -1.0;
     vmat
+}
+
+
+fn get_vxc_rayon_new(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &mut Grids, mol: &Molecule, max_memory: usize) -> Tsr<f64> {
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
+
+    let num_grids = grids.weights.len();
+    let num_basis = mol.num_basis;
+
+    let ao_deriv = match xc_data.xc_type {
+        XCType::HF    => 1,
+        XCType::LDA   => 1,
+        XCType::GGA   => 2,
+        XCType::MGGA  => 2,
+    };
+    let ao_comp = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
+    let batch_size = 64;
+    let blksize = (max_memory * 1_000_000 / 8 / ((ao_comp + 1) * num_basis * batch_size))
+        .min(num_grids/batch_size+1).max(4) * batch_size;
+    if gradient_method.flags.print_level >= 2 {
+        println!("In get_vxc_rayon_new: BLKSIZE={:?}.", blksize);
+    };
+    
+    let block_settings = BlockSettings { ao_deriv, max_memory, blksize };
+    let device = &xc_data.device;
+    let deriv = 1usize;
+
+    let mut vxc = rt::zeros(([num_basis, num_basis, 3], device));
+    let (sender, receiver) = channel();
+
+    gradient_method.par_block_loop(mol, grids, block_settings)
+        .for_each_with(sender, |s, block| {
+            omp_set_num_threads_wrapper(1);
+
+            let ng = block.weights.len();
+            let loc_rho = if let Some(mo) = &xc_data.mo_coeffs 
+            {
+                eval_rho5_batch(&block.ao, xc_data.xc_type, mo, xc_data.occ.as_ref().unwrap(), 1, ng)
+            } else {
+                eval_rho5_dm_only_batch(&block.ao, xc_data.xc_type, xc_data.dm, 1, ng)
+            };
+
+            let xc_ten = eval_xc_eff(xc_data.xc_code, xc_data.xc_params, xc_data.xc_type, 0, &loc_rho.raw(), ng, deriv);
+            let loc_vxc = rt::asarray(xc_ten[1].as_ref().expect("vxc not provided for this xc_type"));
+
+            let loc_w = rt::asarray((block.weights, device));
+            let ao_shape = vec![num_basis, ng, ao_comp];
+            let loc_ao = rt::asarray((&block.ao.data, ao_shape, device));
+
+            let mut wv = loc_vxc * &loc_w.i((.., None));
+            let mut loc_vmat = rt::zeros(([num_basis, num_basis, 3], device));
+
+            match xc_data.xc_type {
+                XCType::LDA => {
+                    let aow = &loc_ao.i((.., .., 0)) * &wv.i((None, .., 0)); 
+                    let aow = aow.t();
+                    for ic in 0..3 {
+                        loc_vmat.i_mut(ic).matmul_from(
+                            &loc_ao.i((.., .., ic + 1)), &aow, 1.0, 1.0);
+                    }
+                }
+                XCType::GGA => {
+                    wv.i_mut((.., 0)).mul_assign(0.5);
+                    gga_grad_sum(&mut loc_vmat, loc_ao.view(), wv.view());
+                }
+                XCType::MGGA => {
+                    wv.i_mut((.., 0)).mul_assign(0.5);
+                    wv.i_mut((.., 4)).mul_assign(0.5);
+                    gga_grad_sum(&mut loc_vmat, loc_ao.view(), wv.view());
+                    tau_grad_dot(&mut loc_vmat, loc_ao.view(), wv.view());
+                }
+                XCType::HF => unreachable!("HF gradient not supported in get_vxc_rayon_new"),
+            }
+            s.send(loc_vmat).unwrap();
+        });
+
+    receiver.into_iter().for_each(|m| vxc += m);
+
+    omp_set_num_threads_wrapper(default_omp_num_threads);
+    vxc *= -1.0;
+    vxc
 }
 
 

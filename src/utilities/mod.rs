@@ -16,7 +16,7 @@ const DEBUG_PRINT: DebugTiming = DebugTiming::Not;
 
 pub fn parse_input() -> ArgMatches {
     Command::new("rest")
-        .version("0.1")
+        .version(env!("CARGO_PKG_VERSION"))
         .author("Igor Ying Zhang <igor_zhangying@fudan.edu.cn>")
         .about("Rust-based Electronic-Structure Tool (REST)")
         .arg(Arg::new("input_file")

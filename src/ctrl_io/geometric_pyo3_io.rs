@@ -19,9 +19,19 @@ pub struct GeomeTRIC {
     pub transition: bool,       // optimize a transition state, default is false
     pub irc: bool,              // find intrinsic reaction coordinate pathway starting from a transition state 
     pub irc_direction : String, // "forward", "backward", "both" (default)
-    // Hessian options
+    // Hessian and trust-radius algorithm options
     pub hessian: String,        // "never" (defalt for minimization), "first" (default for transition state and IRC),
                                 //  "last", "first+last", "stop" (do not optimize), "each" (costly)
+    pub reset: bool,            // Reset approximate Hessian to guess when eigenvalues are below epsilon;
+                                //  default true for energy minimization, false for TS
+    pub trust: f64,             // Starting value of the trust radius; default 0.1 Å
+    pub tmax: f64,              // Maximum value of trust radius; default 0.3 Å
+    pub tmin: f64,              // Minimum value of trust radius; default 1e-4
+    pub epsilon: f64,           // Small eigenvalue threshold for resetting Hessian; default 1e-5
+    pub subfrctor: i32,         // Project net force and torque from gradient: 0=never, 1=auto (default), 2=always;
+                                //  useful for QM/MM systems where net torque causes spurious slow rotation
+    pub usedmax: bool,          // Use max displacement component (instead of RMS) when applying trust radius;
+                                //  suitable for systems with highly anisotropic force constants
     pub frequency: bool,        // perform a frequency and thermochemical analysis whenever a Hessian calculation is requested; 
                                 // default value is true
     pub thermo: [f64; 2],       // [Temperature, Pressure] 
@@ -45,6 +55,13 @@ impl Default for GeomeTRIC {
             irc: false,
             irc_direction : "both".to_string(),
             hessian: "never".to_string(),
+            reset: true,
+            trust: 0.1,
+            tmax: 0.3,
+            tmin: 1.0e-4,
+            epsilon: 1.0e-5,
+            subfrctor: 1,
+            usedmax: false,
             frequency: false,
             thermo: [300.0, 1.0],
             prefix: "GeomeTRIC".to_string(),
@@ -69,6 +86,13 @@ impl GeomeTRIC {
         table.insert("irc".to_string(), toml::Value::Boolean(self.irc));
         table.insert("irc_direction".to_string(), toml::Value::String(self.irc_direction.clone()));
         table.insert("hessian".to_string(), toml::Value::String(self.hessian.clone()));
+        table.insert("reset".to_string(), toml::Value::Boolean(self.reset));
+        table.insert("trust".to_string(), toml::Value::Float(self.trust));
+        table.insert("tmax".to_string(), toml::Value::Float(self.tmax));
+        table.insert("tmin".to_string(), toml::Value::Float(self.tmin));
+        table.insert("epsilon".to_string(), toml::Value::Float(self.epsilon));
+        table.insert("subfrctor".to_string(), toml::Value::Integer(self.subfrctor as i64));
+        table.insert("usedmax".to_string(), toml::Value::Boolean(self.usedmax));
         table.insert("frequency".to_string(), toml::Value::Boolean(self.frequency));
         
         // 对于 thermo 数组，需要转换为 TOML 数组
@@ -145,6 +169,34 @@ pub fn parse_geometric_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<
             geometric.hessian = match tmp_ctrl.get("hessian").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
                 other => String::from("never"),
+            };
+            geometric.reset = match tmp_ctrl.get("reset").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(s) => *s,
+                other => true,
+            };
+            geometric.trust = match tmp_ctrl.get("trust").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.1)},
+                other => {0.1},
+            };
+            geometric.tmax = match tmp_ctrl.get("tmax").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.3)},
+                other => {0.3},
+            };
+            geometric.tmin = match tmp_ctrl.get("tmin").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-4)},
+                other => {1.0e-4},
+            };
+            geometric.epsilon = match tmp_ctrl.get("epsilon").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-5)},
+                other => {1.0e-5},
+            };
+            geometric.subfrctor = match tmp_ctrl.get("subfrctor").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as i32},
+                other => {1},
+            };
+            geometric.usedmax = match tmp_ctrl.get("usedmax").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(s) => *s,
+                other => false,
             };
             geometric.frequency = match tmp_ctrl.get("frequency").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(s) => *s,
