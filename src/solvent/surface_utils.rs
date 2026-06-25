@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tensors::{MatrixFull, MatrixUpper, BasicMatrix};
 use super::SurfaceSwitchType;
 use crate::constants::solvent as data;
+use crate::constants::BOHR;
 use crate::dft::gen_grids::angular_grid;
 use crate::geom_io::{GeomCell, get_mass_charge};
 
@@ -85,8 +86,6 @@ impl<'d> Deserialize<'d> for RadiusScheme {
 //  SMD-specific cavity radii (eq. 16, Marenich et al. JPCB 2009)
 // =============================================================================
 
-/// Bohr → Å conversion factor
-const BOHR2ANG: f64 = 0.52917724924;
 
 /// SMD intrinsic atomic Coulomb radii (Å), indexed by atomic number Z.
 /// Unlisted elements fall back to Bondi vdW radii.
@@ -124,9 +123,9 @@ pub fn smd_radii(alpha: f64, atomic_numbers: &[usize]) -> Vec<f64> {
     };
     atomic_numbers.iter().map(|&z| {
         if z == 8 {
-            r_o_ang / BOHR2ANG
+            r_o_ang / BOHR
         } else if z < SMD_RADII_ANG.len() && SMD_RADII_ANG[z] > 0.0 {
-            SMD_RADII_ANG[z] / BOHR2ANG
+            SMD_RADII_ANG[z] / BOHR
         } else {
             data::VDW_RADII[z]  // fallback to Bondi (Bohr)
         }
