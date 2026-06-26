@@ -35,6 +35,7 @@ use crate::initial_guess::{initial_guess, update_basis_from_hdf5chk};
 use crate::external_libs::dftd;
 use crate::constants::{SQRT_THRESHOLD};
 use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
+use crate::x2c::RelativisticMethod;
 use crate::ri_jk;
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
 use self::util::{occupied_orbital_count, integer_homo_lumo};
@@ -325,7 +326,14 @@ impl SCF {
         //========================================
         // For two-center integrals
         self.ovlp = self.mol.int_ij_matrixupper(String::from("ovlp"));
-        self.h_core = self.mol.int_ij_matrixupper(String::from("hcore"));
+        match self.mol.ctrl.rel {
+            RelativisticMethod::SFX2C => {
+                self.h_core = self.mol.generate_sfx2c_hamiltonian();
+            }
+            _ => {
+                self.h_core = self.mol.int_ij_matrixupper(String::from("hcore"));
+            }
+        }
         //========================================
         // For ghost effective potential
         if self.mol.geom.ghost_ep_path.len() > 0 {

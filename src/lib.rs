@@ -81,6 +81,7 @@ pub mod ri_tddft;
 pub mod fileop;
 pub mod ri_cphf;
 pub mod lib_rint;
+pub mod x2c;
 
 //extern crate rest;
 

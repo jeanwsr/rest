@@ -361,6 +361,9 @@ GW-BSE 方法相关的设置在 `[quasiparticle_methods]` 区块中进行。关�
 - `bse_cutoff_energy`: 取值f64，单位为Hatree，进行BSE计算时DFT能级高于此能量的轨道的准粒子能量将不参与BSE kernel的构建，用于削减构建的BSE kernel的维数，减少对角化计算时间，缺省为1.5
 - `bse_tda`: 取值bool，设置为true则使用TDA近似，即BSE kernel只保留左上部分的子矩阵。缺省为false
 
+## 相对论方法计算相关设置
+- `rel`: 取值String, 指定用于计算的相对论方法。目前支持`"sfx2c"`，即 spin-free X2C 方法，缺省为 None （不启用相对论方法进行计算）。
+
 <!-- ## TD-DFT计算相关设置 -->
 
 
