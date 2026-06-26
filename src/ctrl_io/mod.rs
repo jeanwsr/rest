@@ -19,6 +19,7 @@ use rayon::ThreadPoolBuilder;
 use crate::check_norm::OCCType;
 use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper,omp_get_num_threads_wrapper};
 use crate::solvent::{PcmMethod, RadiusScheme};
+use crate::x2c::RelativisticMethod;
 use serde_json;
 use toml;
 
@@ -361,6 +362,7 @@ pub struct InputKeywords {
     /// Use the optimized fxc_matvec_opt (rayon + pre-allocated workspace).
     #[pyo3(get, set)]
     pub use_fxc_opt: bool,
+    pub rel: RelativisticMethod,
 }
 
 impl Default for InputKeywords {
@@ -520,6 +522,7 @@ impl InputKeywords {
             tddft: None,
             cphf: None,
             use_fxc_opt: false,
+            rel: RelativisticMethod::None,
         }
     }
 
@@ -1257,6 +1260,18 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(8)},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
                 other => {8},
+            };
+            // ==============================================
+            //  Keywords associated with relativistic methods 
+            // ==============================================
+            tmp_input.rel = match tmp_ctrl.get("rel").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => match tmp_str.to_lowercase().as_str() {
+                    // "x2c"   => RelativisticMethod::X2C,
+                    "sfx2c"  => RelativisticMethod::SFX2C,
+                    "none"  => RelativisticMethod::None,
+                    _       => RelativisticMethod::None,
+                },
+                _other => RelativisticMethod::None,
             };
 
             // ==============================================
