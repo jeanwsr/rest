@@ -53,6 +53,8 @@ pub enum PcmMethod {
     COSMO,
     IEFPCM,
     SSVPE,
+    /// SMD = IEFPCM (electrostatics) + CDS (cavitation-dispersion-solvent structure)
+    SMD,
 }
 
 impl fmt::Display for PcmMethod {
@@ -62,6 +64,7 @@ impl fmt::Display for PcmMethod {
             PcmMethod::CPCM => write!(f, "CPCM"),
             PcmMethod::IEFPCM => write!(f, "IEFPCM"),
             PcmMethod::SSVPE => write!(f, "SSVPE"),
+            PcmMethod::SMD => write!(f, "SMD"),
         }
     }
 }
@@ -77,6 +80,7 @@ impl<'d> Deserialize<'d> for PcmMethod {
             "COSMO" => Ok(PcmMethod::COSMO),
             "IEFPCM" => Ok(PcmMethod::IEFPCM),
             "SSVPE" | "SS(V)PE" => Ok(PcmMethod::SSVPE),
+            "SMD" => Ok(PcmMethod::SMD),
             _ => Err(serde::de::Error::custom(format!("Unknown PCM method: {}", s))),
         }
     }
@@ -89,18 +93,40 @@ impl<'d> Deserialize<'d> for PcmMethod {
 pub struct PcmObjectCfg {
     pub method: PcmMethod,
     pub epsilon: f64,
+    /// SMD solvent descriptors [n, n25, α, β, γ, ε, φ, ψ].
+    /// Default: water. Only used when method == SMD.
+    pub solvent_descriptors: [f64; 8],
+    /// SMD solvent type: 1 = water (ICDS=1, pre-tabulated sigma), 2 = non-aqueous (ICDS=2).
+    pub icds: i32,
 }
 
 impl PcmObjectCfg {
-    pub fn build(method: PcmMethod, epsilon: f64) -> Self {
-        PcmObjectCfg { method, epsilon }
+    pub fn build(method: PcmMethod, epsilon: f64, solvent_descriptors: [f64; 8], icds: i32) -> Self {
+        PcmObjectCfg { method, epsilon, solvent_descriptors, icds }
     }
 }
 
 impl Default for PcmObjectCfg {
     fn default() -> Self {
-        PcmObjectCfg { method: PcmMethod::default(), epsilon: 78.3553 }
+        PcmObjectCfg {
+            method: PcmMethod::default(),
+            epsilon: 78.3553,
+            solvent_descriptors: SMD_ERROR_DESCRIPTORS,
+            icds: 0,
+        }
     }
+}
+
+/// Water solvent descriptors for SMD: [n, n25, α, β, γ, ε, φ, ψ]
+pub const SMD_WATER_DESCRIPTORS: [f64; 8] = [1.3328, 1.3323, 0.82, 0.35, -1.0, 78.355, -1.0, -1.0];
+
+pub const SMD_ERROR_DESCRIPTORS: [f64; 8] = [-1.0; 8];
+
+/// Fuzzy water check — only compares n, α, ε. Sentinel fields ignored.
+fn is_water_descriptor(d: &[f64; 8]) -> bool {
+    (d[0] - 1.3328).abs() < 0.01
+    && (d[2] - 0.82).abs() < 0.01
+    && (d[5] - 78.355).abs() < 1.0
 }
 
 /// Surface switch function type
@@ -130,7 +156,7 @@ impl<'d> Deserialize<'d> for SurfaceSwitchType {
 //  PCM Static Structures
 //=============================================================================
 
-/// Static PCM data (computed once per calculation)
+/// Static PCM data (computed once per calculation, geometry-dependent only)
 #[derive(Clone)]
 pub struct PcmStatic {
     pub A: Vec<f64>,
@@ -142,6 +168,11 @@ pub struct PcmStatic {
     pub v_grids_n: Vec<f64>,
     pub K_ipiv: Vec<i32>,
     pub K_initial: MatrixFull<f64>,
+    /// SMD CDS energy (Hartree), total SASA (Å²), and gradient ([3] × [natm] Hartree/Bohr).
+    /// Populated when method == SMD.
+    pub e_cds: Option<f64>,
+    pub tarea: Option<f64>,
+    pub d_cds: Option<Vec<MatrixFull<f64>>>,
 }
 
 impl PcmStatic{
@@ -150,7 +181,19 @@ impl PcmStatic{
         let (A, D, S) = get_A_D_S(&surface);
         let (K, R, f_epsilon, K_ipiv, K_initial) = get_K_R_f(&surface, cfg.method, cfg.epsilon);
         let v_grids_n = get_v_grids_n(&surface, &cint_data);
-        PcmStatic { A, D, S, K, R, f_epsilon, v_grids_n, K_ipiv, K_initial }
+        let (e_cds, tarea, d_cds) = if cfg.method == PcmMethod::SMD {
+            let (e, a, d) = compute_cds_from_surface(surface, cfg);
+            let natm = surface.atomic_num.len();
+            let d_cds: Vec<MatrixFull<f64>> = (0..3).map(|dir| {
+                let mut m = MatrixFull::new([natm, 1], 0.0);
+                for i in 0..natm { m[[i, 0]] = d[i][dir]; }
+                m
+            }).collect();
+            (Some(e), Some(a), Some(d_cds))
+        } else {
+            (None, None, None)
+        };
+        PcmStatic { A, D, S, K, R, f_epsilon, v_grids_n, K_ipiv, K_initial, e_cds, tarea, d_cds }
     }
 }
 
@@ -265,7 +308,7 @@ pub fn get_K_R_f(surface: &SurfaceVdwGaussian, method: PcmMethod, epsilon: f64) 
             let (K, K_ipiv) = K_initial.clone().to_matrixfullslicemut().lapack_dgetrf_full().unwrap();
             (K, R, f_epsilon, K_ipiv, K_initial)
         },
-        PcmMethod::IEFPCM => {
+        PcmMethod::IEFPCM | PcmMethod::SMD => {
             let f_epsilon = (epsilon - 1.0) / (epsilon + 1.0);
             let mut DA = D.clone();
             for j in 0..ngrids{
@@ -977,14 +1020,62 @@ pub fn get_veff_pcm_by_q(
 /// Main function to prepare PCM object for a given molecule
 pub fn solvent_prepare(mol: &Molecule) -> PcmObject {
     let method = mol.ctrl.solvent_model.clone();
-    let epsilon = mol.ctrl.solv_epsilon.clone();
-    let pcmcfg = PcmObjectCfg::build(method, epsilon);
-    let surfacecfg = SurfaceVdwGaussianCfg::default();
+    let epsilon = mol.ctrl.solv_epsilon;
+    
+    let descriptors = {
+        if method == PcmMethod::SMD {
+            mol.ctrl.solvent_descriptors.unwrap_or_else(|| {
+                panic!("SMD solvent model requires solvent descriptors. You should set solvent_descriptors or solvent_name in the control file.");
+            })
+        } 
+        else {SMD_ERROR_DESCRIPTORS}
+    };
+    let icds = if is_water_descriptor(&descriptors) { 1 } else { 2 };
+
+    if method == PcmMethod::SMD && icds == 2 {
+        if descriptors[0] < 0.0 || descriptors[2] < 0.0 || descriptors[3] < 0.0
+            || descriptors[4] < 0.0 || descriptors[6] < 0.0 || descriptors[7] < 0.0
+        {
+            panic!("SMD solvent model requires valid [n, α, β, γ, φ, ψ]. \
+                   Found negative value in them. \
+                   Check solvent_descriptors or solvent_name in the control file.");
+        }
+    }
+    let pcmcfg = PcmObjectCfg::build(method, epsilon, descriptors, icds);
+
+    // Build cavity surface
     let mut surface = SurfaceVdwGaussian::new(mol.ctrl.pcm_cavity_radii, &mol.geom);
+    if method == PcmMethod::SMD {
+        // SMD uses intrinsic atomic Coulomb radii (eq. 16, Marenich 2009),
+        // no vdW scaling (scale = 1.0)
+        let alpha = descriptors[2]; // H-bond acidity
+        surface.cfg.atom_radii = Some(smd_radii(alpha, &surface.atomic_num));
+        surface.cfg.vdw_scale = Some(1.0);
+    }
     surface.build();
+
     let pstatic = PcmStatic::build_pcm_static(&surface, &pcmcfg, &mol);
-    //let pcm_object = PcmObject::init_Pcm(pcmcfg, surface, pstatic);
     PcmObject::init_Pcm(pcmcfg, surface, pstatic)
+}
+
+/// Compute SMD CDS energy and gradient from surface data.
+/// Returns (gcds_hartree, tarea_ang2, dcds_hartree_per_bohr).
+pub fn compute_cds_from_surface(
+    surface: &SurfaceVdwGaussian,
+    cfg: &PcmObjectCfg,
+) -> (f64, f64, Vec<[f64; 3]>) {
+    let natm = surface.atomic_num.len();
+    let atomic_numbers = surface.atomic_num.clone();
+    // Convert [3, natm] MatrixFull → [natm, 3] Vec<[f64;3]>
+    let mut coords = vec![[0.0f64; 3]; natm];
+    for i in 0..natm {
+        coords[i] = [
+            surface.atom_coords[[0, i]],
+            surface.atom_coords[[1, i]],
+            surface.atom_coords[[2, i]],
+        ];
+    }
+    smd_cds::compute_cds(&atomic_numbers, &coords, cfg.icds, &cfg.solvent_descriptors)
 }
 
 

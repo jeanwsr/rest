@@ -17,3 +17,4 @@ bse_pool
 # This file is generated automatically during the build process
 src/dft/libxc/names_and_values.rs
 src/solvent/grad_solver_derivation.md
+*.bak
