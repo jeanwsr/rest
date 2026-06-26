@@ -34,6 +34,18 @@ use crate::solvent::{
 // Switch function: h(x) first derivative
 // ============================================================================
 
+fn ief_debug_enabled() -> bool {
+    std::env::var("REST_IEF_DEBUG").map_or(false, |v| v == "1")
+}
+
+fn ief_print_grad(label: &str, de: &MatrixFull<f64>) {
+    println!("IEF_DBG| {} [3,{}]", label, de.size[1]);
+    for a in 0..de.size[1] {
+        println!("IEF_DBG|   [{a}] = {:.12e} {:.12e} {:.12e}",
+            de[(0, a)], de[(1, a)], de[(2, a)]);
+    }
+}
+
 /// First derivative dh/dx of the PCM switch‑function.
 ///
 /// h(x) = 10x³ − 15x⁴ + 6x⁵  (0 ≤ x ≤ 1)
@@ -283,10 +295,11 @@ pub fn get_dD_dS(
             .collect();
         for i in 0..ngrids {
             let xi = exponents[i];
-            let (ni, nj, nk) = (norm_vec[i].0, norm_vec[i].1, norm_vec[i].2);
             let (gix, giy, giz) = (grid_coords[i][0], grid_coords[i][1], grid_coords[i][2]);
             for j in 0..ngrids {
                 if i == j { continue; }
+                // n_j: normal vector at grid point j (D_ij is the normal derivative at j)
+                let (njx, njy, njz) = (norm_vec[j].0, norm_vec[j].1, norm_vec[j].2);
                 let (gjx, gjy, gjz) = (grid_coords[j][0], grid_coords[j][1], grid_coords[j][2]);
                 let dx = gix - gjx; let dy = giy - gjy; let dz = giz - gjz;
                 let r2 = dx*dx + dy*dy + dz*dz;
@@ -297,13 +310,14 @@ pub fn get_dD_dS(
                 let expv = f64::exp(-xr*xr);
                 let erf = libm::erf(xr);
                 let dSdr0 = -(erf - 2.0*xr/PI.sqrt()*expv) / r2;
-                let nj_rij = ni*dx + nj*dy + nk*dz;
+                // n_j · (r_i - r_j)
+                let nj_rij = njx*dx + njy*dy + njz*dz;
                 let dD_dri = 4.0 * xr*xr * xij / PI.sqrt() * expv
                            * nj_rij / (r2 * r);
                 for xyz in 0..3 {
                     let d = match xyz { 0 => dx, 1 => dy, _ => dz };
                     let dr = d / r;
-                    let nc = match xyz { 0 => ni, 1 => nj, _ => nk };
+                    let nc = match xyz { 0 => njx, 1 => njy, _ => njz };
                     dD_mat[xyz][(i, j)] = dD_dri * dr
                         + dSdr0 * (-nc/r + 3.0*nj_rij/r2 * dr);
                 }
@@ -544,6 +558,433 @@ pub fn grad_solvent_qv(
 }
 
 // ============================================================================
+// SolverAux — pre‑computed intermediate vectors (shared by all de_* fns)
+// ============================================================================
+
+/// Pre‑computed vectors for the solver gradient decomposition.
+///
+/// Each vector is computed once and reused across all `compute_de_*` calls.
+struct SolverAux {
+    /// vk1 = K^{-T} · v_grids,  [ngrids]
+    vk1: Vec<f64>,
+    /// Sq = S · q_sym,           [ngrids, 1]  (column vector)
+    sq: MatrixFull<f64>,
+    /// vk1^T · D,                [1, ngrids]  (row vector)
+    vk1_d: MatrixFull<f64>,
+    /// vk1^T · D · A  (element‑wise: vk1_d[i] · A[i]),  [ngrids]
+    vk1_da: Vec<f64>,
+    /// vk1^T · S,                [ngrids]  (SSVPE only, zeroed otherwise)
+    vk1_s: Vec<f64>,
+    /// D^T · q_sym,              [ngrids]  (SSVPE only, zeroed otherwise)
+    dt_q: Vec<f64>,
+}
+
+/// Pre‑compute all auxiliary vectors needed for solver gradient decomposition.
+///
+/// # Input
+/// - `pstatic`: contains S, D, A matrices
+/// - `v_grids`: electrostatic potential on surface grids \[ngrids\]
+/// - `q_sym`:   symmetrized apparent surface charges \[ngrids, 1\]
+/// - `method`:  PCM method (controls which vectors to compute)
+///
+/// Ref: `grad_solver_derivation.md` §11 预计算向量汇总
+fn compute_solver_aux(
+    pstatic: &PcmStatic,
+    v_grids: &[f64],
+    q_sym: &MatrixFull<f64>,
+    method: &PcmMethod,
+) -> SolverAux {
+    let ngrids = v_grids.len();
+    let K = &pstatic.K;
+    let K_ipiv = &pstatic.K_ipiv;
+
+    // vk1 = K^{-T} · v_grids
+    let vk1 = solve_lu_transpose(K, K_ipiv, v_grids)
+        .expect("compute_solver_aux: solve_lu_transpose failed");
+
+    // Sq = S · q_sym   (BLAS: S[n,n] × q_sym[n,1] → [n,1])
+    let sq = _dgemm_scaled(&pstatic.S, 'N', q_sym, 'N', 1.0);
+
+    // vk1_d = vk1^T · D   (BLAS: vk1[1,n]^T × D[n,n] → [1,n])
+    // Vec<f64> has BasicMatrix impl as [n,1] column; 'T' transposes to [1,n] row
+    let vk1_d = _dgemm_scaled(&vk1, 'T', &pstatic.D, 'N', 1.0);
+
+    // vk1_da = vk1_d ⊙ A   (element‑wise)
+    let vk1_da: Vec<f64> = (0..ngrids)
+        .map(|i| vk1_d[(0, i)] * pstatic.A[i])
+        .collect();
+
+    let is_ssvpe = matches!(method, PcmMethod::SSVPE);
+
+    // vk1_s = vk1^T · S   (SSVPE only)
+    let vk1_s: Vec<f64> = if is_ssvpe {
+        let vk1_s_mat = _dgemm_scaled(&vk1, 'T', &pstatic.S, 'N', 1.0);
+        (0..ngrids).map(|i| vk1_s_mat[(0, i)]).collect()
+    } else {
+        vec![0.0; ngrids]
+    };
+
+    // dt_q = D^T · q_sym   (SSVPE only)
+    let dt_q: Vec<f64> = if is_ssvpe {
+        let q_col: Vec<f64> = (0..ngrids).map(|i| q_sym[(i, 0)]).collect();
+        let dt_q_mat = _dgemm_scaled(&pstatic.D, 'T', &q_col, 'N', 1.0);
+        (0..ngrids).map(|i| dt_q_mat[(i, 0)]).collect()
+    } else {
+        vec![0.0; ngrids]
+    };
+
+    SolverAux { vk1, sq, vk1_d, vk1_da, vk1_s, dt_q }
+}
+
+// ============================================================================
+// Private helpers — reusable across compute_de_* functions
+// ============================================================================
+
+/// Antisymmetrised chain rule:  u^T · dM · w  →  [3, natm].
+///
+/// For each atom A and direction xyz ∈ {0,1,2}:
+/// ```text
+///   de[A, xyz] = Σ_{i∈A} u[i] · (dM_xyz · w)[i]
+///              − Σ_{j∈A} w[j] · (dM_xyz^T · u)[j]
+/// ```
+///
+/// The derivative matrices satisfy translational invariance:
+/// ```text
+///   dM[xyz][(i,j)] = ∂M_ij/∂r_i[xyz]
+///   ∂M_ij/∂r_j[xyz] = −∂M_ij/∂r_i[xyz]
+/// ```
+///
+/// # Arguments
+/// - `u`:    left vector         [ngrids]
+/// - `dm`:   dM/dr_i per xyz     [3] of [ngrids, ngrids]
+/// - `w`:    right vector        [ngrids]
+///
+/// # Returns
+/// `de` shape [3, natm] — raw geometric contribution, **no prefactor**.
+///
+/// Ref: `grad_solver_derivation.md` §5 链式法则
+fn antisym_chain_rule(
+    u: &[f64],
+    dm: &[MatrixFull<f64>],
+    w: &[f64],
+    gslice: &[(usize, usize)],
+    natm: usize,
+) -> MatrixFull<f64> {
+    let ngrids = u.len();
+    let mut de = MatrixFull::<f64>::new([3, natm], 0.0);
+
+    for xyz in 0..3 {
+        // dm_w = dM[xyz] · w   (BLAS gemv: [n,n] × [n,1] → [n,1])
+        let w_col: Vec<f64> = w.to_vec();
+        let dm_w = _dgemm_scaled(&dm[xyz], 'N', &w_col, 'N', 1.0);
+
+        // dmt_u = dM[xyz]^T · u   (BLAS gemv: [n,n]^T × [n,1] → [n,1])
+        let u_col: Vec<f64> = u.to_vec();
+        let dmt_u = _dgemm_scaled(&dm[xyz], 'T', &u_col, 'N', 1.0);
+
+        for a in 0..natm {
+            let (p0, p1) = gslice[a];
+            let mut s = 0.0;
+
+            // grid response:  Σ_{i∈A} u[i] · dm_w[i]
+            for i in p0..p1 { s += u[i] * dm_w[(i, 0)]; }
+
+            // atom response:  −Σ_{j∈A} w[j] · dmt_u[j]
+            for j in p0..p1 { s -= w[j] * dmt_u[(j, 0)]; }
+
+            de[(xyz, a)] = s;
+        }
+    }
+
+    de
+}
+
+/// Diagonal S_ii correction:  Σ_i (u_i·q_i) · (∂S_ii/∂F_i) · (∂F_i/∂R_A).
+///
+/// ```text
+///   de[A, xyz] = Σ_i (u[i]·q[i]) · dSii_dF[i] · dF[(i, a*3+xyz)]
+/// ```
+///
+/// # Arguments
+/// - `u_mul_q`: u[i] * q[i]           [ngrids]
+/// - `dsii_df`: ∂S_ii/∂F_i            [ngrids]
+/// - `df`:      ∂F_i/∂R_a[xyz]        [ngrids, natm*3]
+///
+/// # Returns
+/// `de` shape [3, natm] — raw geometric contribution, **no prefactor**.
+///
+/// Ref: `grad_solver_derivation.md` §7 对角元修正
+fn diag_s_correction(
+    u_mul_q: &[f64],
+    dsii_df: &[f64],
+    df: &MatrixFull<f64>,
+    natm: usize,
+) -> MatrixFull<f64> {
+    let ngrids = u_mul_q.len();
+    let mut de = MatrixFull::<f64>::new([3, natm], 0.0);
+    for a in 0..natm {
+        for xyz in 0..3 {
+            let mut s = 0.0;
+            for i in 0..ngrids {
+                s += u_mul_q[i] * dsii_df[i] * df[(i, a * 3 + xyz)];
+            }
+            de[(xyz, a)] = s;
+        }
+    }
+    de
+}
+
+/// dA contraction:  Σ_i w[i] · ∂A_i/∂R_A.
+///
+/// A is a diagonal matrix → no off‑diagonal chain rule.
+///
+/// ```text
+///   de[A, xyz] = Σ_i w[i] · dA[(i, a*3+xyz)]
+/// ```
+///
+/// # Arguments
+/// - `w`:    weight vector   [ngrids]
+/// - `da`:   ∂A_i/∂R_a[xyz]  [ngrids, natm*3]
+///
+/// # Returns
+/// `de` shape [3, natm] — raw geometric contribution, **no prefactor**.
+///
+/// Ref: `grad_solver_derivation.md` §9.3 项 3
+fn da_contract(
+    w: &[f64],
+    da: &MatrixFull<f64>,
+    natm: usize,
+) -> MatrixFull<f64> {
+    let ngrids = w.len();
+    let mut de = MatrixFull::<f64>::new([3, natm], 0.0);
+    for a in 0..natm {
+        for xyz in 0..3 {
+            let mut s = 0.0;
+            for i in 0..ngrids {
+                s += w[i] * da[(i, a * 3 + xyz)];
+            }
+            de[(xyz, a)] = s;
+        }
+    }
+    de
+}
+
+// ============================================================================
+// Public gradient contribution functions (prefactor‑free)
+//
+// Each function returns the raw geometric contribution (no ½, no α/γ).
+// Prefactors are applied by the caller in grad_solvent_solver.
+//
+// Ref: design spec §5, derivation §9–§10
+// ============================================================================
+
+/// `de_dS0`: pure S‑matrix derivative contribution.
+///
+/// ```text
+///   de_dS0 = antisym_chain_rule(vk1, dS, q) + diag_s_correction(vk1⊙q, dSii_dF, dF)
+/// ```
+///
+/// Used by all PCM methods. Caller applies ½ prefactor.
+///
+/// Ref: `grad_solver_derivation.md` §9.3 项 1
+pub fn compute_de_ds0(
+    vk1: &[f64],
+    q_sym: &MatrixFull<f64>,
+    ds: &[MatrixFull<f64>],
+    dsii_df: &[f64],
+    df: &MatrixFull<f64>,
+    gslice: &[(usize, usize)],
+    natm: usize,
+) -> MatrixFull<f64> {
+    let ngrids = vk1.len();
+
+    // off‑diagonal
+    let q_flat: Vec<f64> = (0..ngrids).map(|i| q_sym[(i, 0)]).collect();
+    let mut de = antisym_chain_rule(vk1, ds, &q_flat, gslice, natm);
+    if ief_debug_enabled() { ief_print_grad("de-s0.antisym", &de); }
+
+    // diagonal correction: vk1⊙q
+    let vk1_mul_q: Vec<f64> = vk1.iter()
+        .zip(q_flat.iter())
+        .map(|(v, q)| v * q)
+        .collect();
+    let de_diag = diag_s_correction(&vk1_mul_q, dsii_df, df, natm);
+    if ief_debug_enabled() { ief_print_grad("de-s0.diag", &de_diag); }
+
+    for i in 0..de.data.len() { de.data[i] += de_diag.data[i]; }
+    de
+}
+
+/// `de_dD`: D‑matrix derivative contribution.
+///
+/// ```text
+///   de_dD = antisym_chain_rule(vk1, dD, w)
+/// ```
+///
+/// `w` = A⊙v (dR part) or A⊙Sq (dK part). Caller applies ½ prefactor.
+///
+/// Ref: `grad_solver_derivation.md` §9.3 项 2
+pub fn compute_de_dd(
+    vk1: &[f64],
+    dd: &[MatrixFull<f64>],
+    w: &[f64],
+    gslice: &[(usize, usize)],
+    natm: usize,
+) -> MatrixFull<f64> {
+    antisym_chain_rule(vk1, dd, w, gslice, natm)
+}
+
+/// `de_dA`: area diagonal‑matrix derivative contribution.
+///
+/// ```text
+///   de_dA = da_contract(weight, dA)
+/// ```
+///
+/// `weight` = vk1_D⊙v (dR part) or vk1_D⊙Sq (dK part). Caller applies ½ prefactor.
+///
+/// Ref: `grad_solver_derivation.md` §9.3 项 3
+pub fn compute_de_da(
+    weight: &[f64],
+    da: &MatrixFull<f64>,
+    natm: usize,
+) -> MatrixFull<f64> {
+    da_contract(weight, da, natm)
+}
+
+/// `de_dS1`: D·A·dS correction term.
+///
+/// ```text
+///   de_dS1 = antisym_chain_rule(vk1_da, dS, q) + diag_s_correction(vk1_da⊙q, dSii_dF, dF)
+/// ```
+///
+/// vk1_da = vk1^T·D·A  (pre‑computed in SolverAux). Caller applies ½ prefactor.
+///
+/// Ref: `grad_solver_derivation.md` §9.3 项 4
+pub fn compute_de_ds1(
+    vk1_da: &[f64],
+    q_sym: &MatrixFull<f64>,
+    ds: &[MatrixFull<f64>],
+    dsii_df: &[f64],
+    df: &MatrixFull<f64>,
+    gslice: &[(usize, usize)],
+    natm: usize,
+) -> MatrixFull<f64> {
+    let ngrids = vk1_da.len();
+
+    // off‑diagonal
+    let q_flat: Vec<f64> = (0..ngrids).map(|i| q_sym[(i, 0)]).collect();
+    let mut de = antisym_chain_rule(vk1_da, ds, &q_flat, gslice, natm);
+
+    // diagonal: vk1_da⊙q
+    let vk1_da_mul_q: Vec<f64> = vk1_da.iter()
+        .zip(q_flat.iter())
+        .map(|(d, q)| d * q)
+        .collect();
+    let de_diag = diag_s_correction(&vk1_da_mul_q, dsii_df, df, natm);
+
+    for i in 0..de.data.len() { de.data[i] += de_diag.data[i]; }
+    de
+}
+
+/// `de_dS1_T`: dS·A·D^T term (SSVPE only).
+///
+/// ```text
+///   de_dS1_T = antisym_chain_rule(vk1, dS, ADT_q)
+///            + diag_s_correction(vk1⊙ADT_q, dSii_dF, dF)
+/// ```
+///
+/// ADT_q = A ⊙ (D^T·q). Caller applies ½ prefactor.
+///
+/// Ref: `grad_solver_derivation.md` §10.3 de_dS1_T
+pub fn compute_de_ds1_t(
+    vk1: &[f64],
+    adt_q: &[f64],
+    ds: &[MatrixFull<f64>],
+    dsii_df: &[f64],
+    df: &MatrixFull<f64>,
+    gslice: &[(usize, usize)],
+    natm: usize,
+) -> MatrixFull<f64> {
+    // off‑diagonal
+    let mut de = antisym_chain_rule(vk1, ds, adt_q, gslice, natm);
+
+    // diagonal: vk1⊙ADT_q
+    let vk1_mul_adtq: Vec<f64> = vk1.iter()
+        .zip(adt_q.iter())
+        .map(|(v, a)| v * a)
+        .collect();
+    let de_diag = diag_s_correction(&vk1_mul_adtq, dsii_df, df, natm);
+
+    for i in 0..de.data.len() { de.data[i] += de_diag.data[i]; }
+    de
+}
+
+/// `de_dD_T`: S·A·dD^T term (SSVPE only).
+///
+/// Uses the identity  u^T·(−dD^T)·w  expanded via the antisym chain rule:
+/// ```text
+///   de[A,xyz] = −Σ_{i∈A} u[i] · (dD^T·w)[i]  +  Σ_{j∈A} w[j] · (dD·u)[j]
+/// ```
+/// This avoids explicitly constructing the transposed dD matrix.
+///
+/// vk1_sa = vk1^T·S·A. Caller applies ½ prefactor.
+///
+/// Ref: `grad_solver_derivation.md` §10.3 de_dD_T
+pub fn compute_de_dd_t(
+    vk1_sa: &[f64],
+    q_sym: &MatrixFull<f64>,
+    dd: &[MatrixFull<f64>],
+    gslice: &[(usize, usize)],
+    natm: usize,
+) -> MatrixFull<f64> {
+    let ngrids = vk1_sa.len();
+    let mut de = MatrixFull::<f64>::new([3, natm], 0.0);
+
+    for xyz in 0..3 {
+        // dD^T · q   (BLAS: dD^T[n,n] × q[n,1] → [n,1])
+        let q_col: Vec<f64> = (0..ngrids).map(|i| q_sym[(i, 0)]).collect();
+        let ddt_q = _dgemm_scaled(&dd[xyz], 'T', &q_col, 'N', 1.0);
+
+        // dD · vk1_sa   (BLAS: dD[n,n] × vk1_sa[n,1] → [n,1])
+        let vk1_sa_col: Vec<f64> = vk1_sa.to_vec();
+        let dd_u = _dgemm_scaled(&dd[xyz], 'N', &vk1_sa_col, 'N', 1.0);
+
+        for a in 0..natm {
+            let (p0, p1) = gslice[a];
+            let mut s = 0.0;
+
+            // grid response:  −Σ_{i∈A} vk1_sa[i] · (dD^T·q)[i]
+            for i in p0..p1 { s -= vk1_sa[i] * ddt_q[(i, 0)]; }
+
+            // atom response:  +Σ_{j∈A} q[j] · (dD·vk1_sa)[j]
+            for j in p0..p1 { s += q_sym[(j, 0)] * dd_u[(j, 0)]; }
+
+            de[(xyz, a)] = s;
+        }
+    }
+
+    de
+}
+
+/// `de_dA_T`: S·dA·D^T term (SSVPE only).
+///
+/// ```text
+///   de_dA_T = da_contract(vk1_S ⊙ DT_q, dA)
+/// ```
+///
+/// vk1_S = vk1^T·S,  DT_q = D^T·q  (pre‑computed in SolverAux).
+/// Caller applies ½ prefactor.
+///
+/// Ref: `grad_solver_derivation.md` §10.3 de_dA_T
+pub fn compute_de_da_t(
+    weight: &[f64],
+    da: &MatrixFull<f64>,
+    natm: usize,
+) -> MatrixFull<f64> {
+    da_contract(weight, da, natm)
+}
+
+// ============================================================================
 // grad_solvent_solver  (cavity response)
 // ============================================================================
 
@@ -568,106 +1009,214 @@ pub fn grad_solvent_solver(
 ) -> MatrixFull<f64> {
     let _t = Instant::now();
     let gslice   = &surface.gslice_by_atom;
-    let ngrids   = surface.surface_calc.grid_coords.len();
     let v_grids  = &pscf.v_grids;            // [ngrids]
-    let K        = &pstatic.K;               // LU‑decomposed
-    let K_ipiv   = &pstatic.K_ipiv;
     let q_sym    = &pscf.q_sym;              // [ngrids, 1]
     let f_eps    = pstatic.f_epsilon;
 
-    // vK_1 = K^{-T} · v_grids   (solve transposed system)
-    let vK_1 = solve_lu_transpose(K, K_ipiv, v_grids)
-        .expect("grad_solvent_solver: solve_lu_transpose failed");
+    // ---- pre‑compute auxiliary vectors ----
+    let aux = compute_solver_aux(pstatic, v_grids, q_sym, method);
+    if ief_debug_enabled() {
+        let ng = v_grids.len();
+        let vk1_rms = (aux.vk1.iter().map(|x| x*x).sum::<f64>() / ng as f64).sqrt();
+        let q_rms = (0..ng).map(|i| q_sym[(i,0)]*q_sym[(i,0)]).sum::<f64>();
+        let q_rms = (q_rms / ng as f64).sqrt();
+        eprintln!("IEF_DBG| solver-aux vk1[0]={:.12e} vk1_rms={:.12e} q[0]={:.12e} q_rms={:.12e} f_eps={:.12e}",
+            aux.vk1[0], vk1_rms, q_sym[(0,0)], q_rms, f_eps);
+    }
 
-    let (dF, dA) = get_dF_dA(surface);
-
-    let with_D = matches!(method, PcmMethod::IEFPCM | PcmMethod::SSVPE);
-    let (_dD_opt, dS, dSii_dF) = get_dD_dS(surface, &dF, with_D);
-
-    let mut de = MatrixFull::<f64>::new([3, natm], 0.0);
-
-    match method {
-        PcmMethod::CPCM | PcmMethod::COSMO => {
-            // dK = dS,  dR = 0
-            // dE_solver = ½ vK_1^T · dS · q_sym (anti‑symmetrised)
-            //            + ½ Σ_i vK_1[i]·q_sym[i]·∂S_ii/∂R_a  (diagonal correction)
-            for xyz in 0..3 {
-                // BLAS: dS_q = dS[xyz] * q_sym  →  (dS_q)[i] = Σ_j dS[i][j] * q_sym[j]
-                let dS_q = _dgemm_scaled(&dS[xyz], 'N', q_sym, 'N', 1.0);
-                // BLAS: dST_vK1 = dS[xyz]^T * vK_1  →  (dST_vK1)[j] = Σ_i dS[i][j] * vK_1[i]
-                let dST_vK1 = _dgemm_scaled(&dS[xyz], 'T', &vK_1, 'N', 1.0);
-
-                for a in 0..natm {
-                    let (p0, p1) = gslice[a];
-
-                    // grid response – Σ_{i∈A} vK_1[i] · (dS · q_sym)[i]
-                    let mut off = 0.0;
-                    for i in p0..p1 { off += vK_1[i] * dS_q[(i, 0)]; }
-
-                    // atom response – Σ_{j∈A} q_sym[j] · (dS^T · vK_1)[j]
-                    for j in p0..p1 { off -= q_sym[(j, 0)] * dST_vK1[(j, 0)]; }
-
-                    off *= 0.5;
-
-                    // diagonal correction – Σ_i vK_1[i]·q_sym[i]·∂S_ii/∂R_a
-                    // ∂S_ii/∂R_a = dSii_dF[i] · dF[(i, a*3+xyz)]
-                    let mut diag = 0.0;
-                    for i in 0..ngrids {
-                        diag += vK_1[i] * q_sym[(i, 0)] * dSii_dF[i] * dF[(i, a*3 + xyz)];
-                    }
-                    diag *= 0.5;
-
-                    de[(xyz, a)] = -(off + diag);
-                }
-            }
-        }
-        PcmMethod::IEFPCM => {
-            // TODO: full D/dA terms
-            let _fac = f_eps / (2.0 * PI);
-            for xyz in 0..3 {
-                let dS_q = _dgemm_scaled(&dS[xyz], 'N', q_sym, 'N', 1.0);
-                let dST_vK1 = _dgemm_scaled(&dS[xyz], 'T', &vK_1, 'N', 1.0);
-                for a in 0..natm {
-                    let (p0, p1) = gslice[a];
-                    let mut off = 0.0;
-                    for i in p0..p1 { off += vK_1[i] * dS_q[(i, 0)]; }
-                    for j in p0..p1 { off -= q_sym[(j, 0)] * dST_vK1[(j, 0)]; }
-                    off *= 0.5;
-                    let mut diag = 0.0;
-                    for i in 0..ngrids {
-                        diag += vK_1[i] * q_sym[(i, 0)] * dSii_dF[i] * dF[(i, a*3 + xyz)];
-                    }
-                    diag *= 0.5;
-                    de[(xyz, a)] -= off + diag;
-                }
-            }
-            eprintln!("IEFPCM gradient: dS contribution only — missing D/dA terms");
-        }
-        PcmMethod::SSVPE => {
-            // TODO: full D/dA terms
-            let _fac = f_eps / (4.0 * PI);
-            for xyz in 0..3 {
-                let dS_q = _dgemm_scaled(&dS[xyz], 'N', q_sym, 'N', 1.0);
-                let dST_vK1 = _dgemm_scaled(&dS[xyz], 'T', &vK_1, 'N', 1.0);
-                for a in 0..natm {
-                    let (p0, p1) = gslice[a];
-                    let mut off = 0.0;
-                    for i in p0..p1 { off += vK_1[i] * dS_q[(i, 0)]; }
-                    for j in p0..p1 { off -= q_sym[(j, 0)] * dST_vK1[(j, 0)]; }
-                    off *= 0.5;
-                    let mut diag = 0.0;
-                    for i in 0..ngrids {
-                        diag += vK_1[i] * q_sym[(i, 0)] * dSii_dF[i] * dF[(i, a*3 + xyz)];
-                    }
-                    diag *= 0.5;
-                    de[(xyz, a)] -= off + diag;
-                }
-            }
-            eprintln!("SSVPE gradient: dS contribution only — missing D/dA terms");
+    // ---- derivative matrices ----
+    let (dF, dA_deriv) = get_dF_dA(surface);
+    if ief_debug_enabled() {
+        eprintln!("IEF_DBG| dF-dA dF.size={:?} dA.size={:?} dF[0,0]={:.12e} dA[0,0]={:.12e}",
+            dF.size, dA_deriv.size, dF[(0,0)], dA_deriv[(0,0)]);
+    }
+    let with_D = matches!(method, PcmMethod::IEFPCM | PcmMethod::SSVPE | PcmMethod::SMD);
+    let (dD_opt, dS, dSii_dF) = get_dD_dS(surface, &dF, with_D);
+    if ief_debug_enabled() {
+        eprintln!("IEF_DBG| dD-dS dS[0].size=({},{}) dSii_dF[0]={:.12e}",
+            dS[0].size[0], dS[0].size[1], dSii_dF[0]);
+        if let Some(ref dd) = dD_opt {
+            eprintln!("IEF_DBG| dD-dS dD[0].size=({},{}) dD[0,(0,0)]={:.12e}",
+                dd[0].size[0], dd[0].size[1], dd[0][(0,0)]);
         }
     }
 
-    de
+    match method {
+        // ================================================================
+        // CPCM / COSMO:  K = S,  R = −f_ε·I  →  dR = 0,  dK = dS
+        //   dE = −½ · vK1^T · dS · q
+        // ================================================================
+        PcmMethod::CPCM | PcmMethod::COSMO => {
+            // de_s0: raw geometric = antisym(vk1, dS, q) + diag(vk1⊙q, dSii_dF, dF)
+            let de_s0_raw = compute_de_ds0(&aux.vk1, q_sym, &dS, &dSii_dF, &dF, gslice, natm);
+            if ief_debug_enabled() { ief_print_grad("assembly.de-s0", &de_s0_raw); }
+            let mut de = de_s0_raw;
+            // de = −½ · de_s0   (sign from dE = −½ vK1^T·dK·q with dK=dS)
+            for v in de.data.iter_mut() { *v *= -0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.final", &de); }
+            de
+        }
+
+        // ================================================================
+        // IEFPCM / SMD
+        //   K = S − α·D·A·S,   R = −f_ε·I + α·D·A,   α = f_ε/(2π)
+        //   dR = α·(dD·A + D·dA)
+        //   dK = dS − α·(dD·A·S + D·dA·S + D·A·dS)
+        //   dE = +½ vK1^T·dR·v − ½ vK1^T·dK·q
+        // ================================================================
+        PcmMethod::IEFPCM | PcmMethod::SMD => {
+            let alpha = f_eps / (2.0 * PI);
+            let dD = dD_opt.as_ref().expect("IEFPCM: dD must be computed");
+            let ngrids = aux.vk1.len();
+
+            // --- de_dR ---
+            // dR part·dD:  antisym(vk1, dD, A⊙v)
+            let av: Vec<f64> = pstatic.A.iter()
+                .zip(v_grids.iter())
+                .map(|(a, v)| a * v)
+                .collect();
+            let mut de_r = compute_de_dd(&aux.vk1, dD, &av, gslice, natm);
+
+            // dR part·dA:  da_contract(vk1_D⊙v, dA)
+            let vk1_d_mul_v: Vec<f64> = (0..ngrids)
+                .map(|i| aux.vk1_d[(0, i)] * v_grids[i])
+                .collect();
+            let de_r_da = compute_de_da(&vk1_d_mul_v, &dA_deriv, natm);
+            for i in 0..de_r.data.len() { de_r.data[i] += de_r_da.data[i]; }
+            // prefactor:  ½α
+            for v in de_r.data.iter_mut() { *v *= 0.5 * alpha; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-r", &de_r); }
+
+            // --- de_dK (to be subtracted) ---
+            // de_s0: ½ · [antisym(vk1, dS, q) + diag(vk1⊙q, dSii_dF, dF)]
+            let de_s0_raw = compute_de_ds0(&aux.vk1, q_sym, &dS, &dSii_dF, &dF, gslice, natm);
+            if ief_debug_enabled() { ief_print_grad("assembly.de-s0", &de_s0_raw); }
+
+            // de_dD: ½ · antisym(vk1, dD, A⊙Sq)
+            let asq: Vec<f64> = pstatic.A.iter()
+                .zip((0..ngrids).map(|i| aux.sq[(i, 0)]))
+                .map(|(a, s)| a * s)
+                .collect();
+            let mut de_dd = compute_de_dd(&aux.vk1, dD, &asq, gslice, natm);
+            for v in de_dd.data.iter_mut() { *v *= 0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-dd", &de_dd); }
+
+            // de_dA: ½ · da_contract(vk1_D⊙Sq, dA)
+            let vk1_d_mul_sq: Vec<f64> = (0..ngrids)
+                .map(|i| aux.vk1_d[(0, i)] * aux.sq[(i, 0)])
+                .collect();
+            let mut de_da = compute_de_da(&vk1_d_mul_sq, &dA_deriv, natm);
+            for v in de_da.data.iter_mut() { *v *= 0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-da", &de_da); }
+
+            // de_dS1: ½ · [antisym(vk1_da, dS, q) + diag(vk1_da⊙q, dSii_dF, dF)]
+            let mut de_s1 = compute_de_ds1(&aux.vk1_da, q_sym, &dS, &dSii_dF, &dF, gslice, natm);
+            for v in de_s1.data.iter_mut() { *v *= 0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-s1", &de_s1); }
+
+            // de = de_r − de_s0 + α·(de_dd + de_da + de_s1)
+            let mut de = de_r.clone();
+            for i in 0..de.data.len() {
+                de.data[i] -= 0.5 * de_s0_raw.data[i]
+                    - alpha * (de_dd.data[i] + de_da.data[i] + de_s1.data[i]);
+            }
+            if ief_debug_enabled() { ief_print_grad("assembly.final", &de); }
+
+            de
+        }
+
+        // ================================================================
+        // SSVPE
+        //   K = S − γ·(D·A·S + S·A·D^T),   γ = f_ε/(4π) = α/2
+        //   R: same as IEFPCM → dR same
+        //   dK = dS − γ·(dD·A·S + D·dA·S + D·A·dS
+        //               + dS·A·D^T + S·dA·D^T + S·A·dD^T)
+        // ================================================================
+        PcmMethod::SSVPE => {
+            let alpha = f_eps / (2.0 * PI);   // for dR
+            let gamma = f_eps / (4.0 * PI);   // for dK  (= α/2)
+            let dD = dD_opt.as_ref().expect("SSVPE: dD must be computed");
+            let ngrids = aux.vk1.len();
+
+            // --- de_dR: same as IEFPCM ---
+            let av: Vec<f64> = pstatic.A.iter()
+                .zip(v_grids.iter())
+                .map(|(a, v)| a * v)
+                .collect();
+            let mut de_r = compute_de_dd(&aux.vk1, dD, &av, gslice, natm);
+            let vk1_d_mul_v: Vec<f64> = (0..ngrids)
+                .map(|i| aux.vk1_d[(0, i)] * v_grids[i])
+                .collect();
+            let de_r_da = compute_de_da(&vk1_d_mul_v, &dA_deriv, natm);
+            for i in 0..de_r.data.len() { de_r.data[i] += de_r_da.data[i]; }
+            for v in de_r.data.iter_mut() { *v *= 0.5 * alpha; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-r", &de_r); }
+
+            // --- de_s0 (same as CPCM) ---
+            let de_s0_raw = compute_de_ds0(&aux.vk1, q_sym, &dS, &dSii_dF, &dF, gslice, natm);
+            if ief_debug_enabled() { ief_print_grad("assembly.de-s0", &de_s0_raw); }
+
+            // --- de_dD, de_dA, de_dS1 (same as IEFPCM) ---
+            let asq: Vec<f64> = pstatic.A.iter()
+                .zip((0..ngrids).map(|i| aux.sq[(i, 0)]))
+                .map(|(a, s)| a * s)
+                .collect();
+            let mut de_dd = compute_de_dd(&aux.vk1, dD, &asq, gslice, natm);
+            for v in de_dd.data.iter_mut() { *v *= 0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-dd", &de_dd); }
+
+            let vk1_d_mul_sq: Vec<f64> = (0..ngrids)
+                .map(|i| aux.vk1_d[(0, i)] * aux.sq[(i, 0)])
+                .collect();
+            let mut de_da = compute_de_da(&vk1_d_mul_sq, &dA_deriv, natm);
+            for v in de_da.data.iter_mut() { *v *= 0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-da", &de_da); }
+
+            let mut de_s1 = compute_de_ds1(&aux.vk1_da, q_sym, &dS, &dSii_dF, &dF, gslice, natm);
+            for v in de_s1.data.iter_mut() { *v *= 0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-s1", &de_s1); }
+
+            // --- SSVPE transpose terms ---
+            // ADT_q = A ⊙ (D^T·q)
+            let adt_q: Vec<f64> = pstatic.A.iter()
+                .zip(aux.dt_q.iter())
+                .map(|(a, d)| a * d)
+                .collect();
+            let mut de_s1_t = compute_de_ds1_t(&aux.vk1, &adt_q, &dS, &dSii_dF, &dF, gslice, natm);
+            for v in de_s1_t.data.iter_mut() { *v *= 0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-s1_T", &de_s1_t); }
+
+            // vk1_sa = vk1^T·S ⊙ A
+            let vk1_sa: Vec<f64> = aux.vk1_s.iter()
+                .zip(pstatic.A.iter())
+                .map(|(s, a)| s * a)
+                .collect();
+            let mut de_dd_t = compute_de_dd_t(&vk1_sa, q_sym, dD, gslice, natm);
+            for v in de_dd_t.data.iter_mut() { *v *= 0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-dd_T", &de_dd_t); }
+
+            // vk1_S ⊙ DT_q
+            let vk1_s_mul_dtq: Vec<f64> = aux.vk1_s.iter()
+                .zip(aux.dt_q.iter())
+                .map(|(s, d)| s * d)
+                .collect();
+            let mut de_da_t = compute_de_da_t(&vk1_s_mul_dtq, &dA_deriv, natm);
+            for v in de_da_t.data.iter_mut() { *v *= 0.5; }
+            if ief_debug_enabled() { ief_print_grad("assembly.de-da_T", &de_da_t); }
+
+            // de = de_r − ½·de_s0_raw + γ·(de_dd + de_da + de_s1
+            //                               + de_dd_t + de_da_t + de_s1_t)
+            let mut de = de_r.clone();
+            for i in 0..de.data.len() {
+                de.data[i] -= 0.5 * de_s0_raw.data[i]
+                    - gamma * (de_dd.data[i] + de_da.data[i] + de_s1.data[i]
+                             + de_dd_t.data[i] + de_da_t.data[i] + de_s1_t.data[i]);
+            }
+            if ief_debug_enabled() { ief_print_grad("assembly.final", &de); }
+
+            de
+        }
+    }
 }
 
 // ============================================================================
@@ -752,12 +1301,209 @@ pub fn compute_solvent_gradient(scf_data: &SCF) -> MatrixFull<f64> {
         println!("{}", format_grad_component("de_solvent.solver", &de_solver, elem));
     }
 
+    // ---- SMD CDS gradient (from cache) ----
+    let de_cds = if let Some(ref d_cds) = pstatic.d_cds {
+        let mut de_cds_mf = MatrixFull::new([3, natm], 0.0);
+        for dir in 0..3 {
+            for i in 0..natm {
+                de_cds_mf[[dir, i]] = d_cds[dir][[i, 0]];
+            }
+        }
+        println!("  grad_cds     done  (min={:12.6e}, max={:12.6e}, rms={:12.6e})",
+            grad_stats(&de_cds_mf).0, grad_stats(&de_cds_mf).1, grad_stats(&de_cds_mf).2);
+        if print_lvl >= 2 {
+            println!("{}", format_grad_component("de_solvent.cds", &de_cds_mf, elem));
+        }
+        Some(de_cds_mf)
+    } else {
+        None
+    };
+
     let mut de = de_nuc;
     for i in 0..de.data.len() { de.data[i] += de_qv.data[i] + de_solver.data[i]; }
+    if let Some(ref de_cds_mf) = de_cds {
+        for i in 0..de.data.len() { de.data[i] += de_cds_mf.data[i]; }
+    }
 
     if print_lvl >= 2 {
         println!("{}", format_grad_component("de_solvent.total", &de, elem));
     }
     println!("PCM gradient total: {:.2} sec", t0.elapsed().as_secs_f64());
     de
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 3 grids, 2 atoms: verify grid/atom response cancellation for identity dM.
+    #[test]
+    fn test_antisym_chain_rule_identity() {
+        let ngrids = 3;
+        let natm = 2;
+        let gslice: Vec<(usize, usize)> = vec![(0, 1), (1, 3)];
+
+        let u = vec![1.0, 2.0, 3.0];
+        let w = vec![4.0, 5.0, 6.0];
+
+        // identity dM → dm_w = w, dmt_u = u → grid & atom cancel exactly
+        let mut dm0 = MatrixFull::<f64>::new([ngrids, ngrids], 0.0);
+        let mut dm1 = MatrixFull::<f64>::new([ngrids, ngrids], 0.0);
+        let mut dm2 = MatrixFull::<f64>::new([ngrids, ngrids], 0.0);
+        for i in 0..ngrids {
+            dm0[(i, i)] = 1.0;
+            dm1[(i, i)] = 1.0;
+            dm2[(i, i)] = 1.0;
+        }
+        let dm = vec![dm0, dm1, dm2];
+
+        let de = antisym_chain_rule(&u, &dm, &w, &gslice, natm);
+
+        // Atom 0: u[0]*w[0] - w[0]*u[0] = 0
+        // Atom 1: u[1]*w[1]+u[2]*w[2] - (w[1]*u[1]+w[2]*u[2]) = 0
+        for xyz in 0..3 {
+            assert!((de[(xyz, 0)]).abs() < 1e-12);
+            assert!((de[(xyz, 1)]).abs() < 1e-12);
+        }
+    }
+
+    /// 2×2 antisymmetric dM with hand-computed expected values.
+    #[test]
+    fn test_antisym_chain_rule_off_diag() {
+        let ngrids = 2;
+        let natm = 2;
+        let gslice: Vec<(usize, usize)> = vec![(0, 1), (1, 2)];
+
+        let u = vec![1.0, 2.0];
+        let w = vec![3.0, 4.0];
+
+        // dM = [[0, a], [-a, 0]]
+        let a_val = 2.0;
+        let mut dm0 = MatrixFull::<f64>::new([ngrids, ngrids], 0.0);
+        dm0[(0, 1)] = a_val;
+        dm0[(1, 0)] = -a_val;
+        let dm = vec![dm0.clone(), dm0.clone(), dm0.clone()];
+
+        let de = antisym_chain_rule(&u, &dm, &w, &gslice, natm);
+
+        // dM·w = [a*w1, -a*w0] = [8, -6]
+        // dM^T·u = [-a*u1, a*u0] = [-4, 2]
+        // Atom 0: grid=1*8=8, atom=3*(-4)=-12 → s=8-(-12)=20
+        // Atom 1: grid=2*(-6)=-12, atom=4*2=8 → s=-12-8=-20
+        for xyz in 0..3 {
+            assert!((de[(xyz, 0)] - 20.0).abs() < 1e-12);
+            assert!((de[(xyz, 1)] - (-20.0)).abs() < 1e-12);
+        }
+    }
+
+    /// Verify diag_s_correction hand-computed values.
+    #[test]
+    fn test_diag_s_correction() {
+        let ngrids = 2;
+        let natm = 2;
+        let u_q = vec![1.0, 2.0];
+        let dsii_df = vec![0.5, 0.3];
+        let mut df = MatrixFull::<f64>::new([ngrids, natm * 3], 0.0);
+        df[(0, 0)] = 1.0;  // dF0/dR0^x = 1
+        df[(1, 4)] = 1.0;  // dF1/dR1^y = 1
+
+        let de = diag_s_correction(&u_q, &dsii_df, &df, natm);
+
+        assert!((de[(0, 0)] - 0.5).abs() < 1e-12);  // 1*0.5*1
+        assert!((de[(1, 1)] - 0.6).abs() < 1e-12);  // 2*0.3*1
+        assert!((de[(1, 0)]).abs() < 1e-12);
+        assert!((de[(0, 1)]).abs() < 1e-12);
+    }
+
+    /// Verify da_contract hand-computed values.
+    #[test]
+    fn test_da_contract() {
+        let ngrids = 2;
+        let natm = 2;
+        let w = vec![2.0, 3.0];
+        let mut da = MatrixFull::<f64>::new([ngrids, natm * 3], 0.0);
+        da[(0, 0)] = 0.5;  // dA0/dR0^x
+        da[(1, 3)] = 1.0;  // dA1/dR1^z
+
+        let de = da_contract(&w, &da, natm);
+
+        assert!((de[(0, 0)] - 1.0).abs() < 1e-12);  // 2*0.5
+        assert!((de[(2, 1)] - 3.0).abs() < 1e-12);  // 3*1.0
+    }
+
+    /// Verify `compute_de_dd_t` matches standard `antisym_chain_rule` with −dD^T.
+    ///
+    /// Method A: manual antisym with −u·(dD^T·w) + w·(dD·u)  [current impl]
+    /// Method B: antisym_chain_rule(u, −dD^T, w)              [reference]
+    /// They must be identical for any input.
+    #[test]
+    fn test_compute_de_dd_t_self_consistency() {
+        let ngrids = 4;
+        let natm = 2;
+        let gslice: Vec<(usize, usize)> = vec![(0, 2), (2, 4)];
+
+        // Random-like test data (deterministic)
+        let vk1_sa: Vec<f64> = vec![1.0, -2.0, 0.5, 3.0];
+        let mut q_sym = MatrixFull::<f64>::new([ngrids, 1], 0.0);
+        q_sym[(0, 0)] = 0.8;
+        q_sym[(1, 0)] = -1.2;
+        q_sym[(2, 0)] = 0.3;
+        q_sym[(3, 0)] = -0.7;
+
+        // dD[0] — antisymmetric 4×4
+        let mut dd0 = MatrixFull::<f64>::new([ngrids, ngrids], 0.0);
+        dd0[(0, 1)] = 0.5;  dd0[(1, 0)] = -0.5;
+        dd0[(0, 2)] = 0.3;  dd0[(2, 0)] = -0.3;
+        dd0[(1, 3)] = 0.7;  dd0[(3, 1)] = -0.7;
+        dd0[(2, 3)] = 0.4;  dd0[(3, 2)] = -0.4;
+
+        // dD[1] — different values
+        let mut dd1 = MatrixFull::<f64>::new([ngrids, ngrids], 0.0);
+        dd1[(0, 1)] = -0.2; dd1[(1, 0)] = 0.2;
+        dd1[(0, 3)] = 0.6;  dd1[(3, 0)] = -0.6;
+        dd1[(1, 2)] = 0.9;  dd1[(2, 1)] = -0.9;
+
+        // dD[2] — yet different
+        let mut dd2 = MatrixFull::<f64>::new([ngrids, ngrids], 0.0);
+        dd2[(0, 2)] = -0.8; dd2[(2, 0)] = 0.8;
+        dd2[(1, 2)] = 0.1;  dd2[(2, 1)] = -0.1;
+        dd2[(1, 3)] = -0.5; dd2[(3, 1)] = 0.5;
+
+        let dd = vec![dd0.clone(), dd1.clone(), dd2.clone()];
+
+        // ── Method A: current compute_de_dd_t ──
+        let de_a = compute_de_dd_t(&vk1_sa, &q_sym, &dd, &gslice, natm);
+
+        // ── Method B: antisym_chain_rule with −dD^T ──
+        // Build −dD^T matrices for each xyz direction
+        let q_flat: Vec<f64> = (0..ngrids).map(|i| q_sym[(i, 0)]).collect();
+        let mut neg_ddt: Vec<MatrixFull<f64>> = Vec::new();
+        for xyz in 0..3 {
+            let mut nddt = MatrixFull::<f64>::new([ngrids, ngrids], 0.0);
+            for i in 0..ngrids {
+                for j in 0..ngrids {
+                    nddt[(i, j)] = -dd[xyz][(j, i)]; // −dD^T[i,j] = −dD[j,i]
+                }
+            }
+            neg_ddt.push(nddt);
+        }
+        let de_b = antisym_chain_rule(&vk1_sa, &neg_ddt, &q_flat, &gslice, natm);
+
+        // ── Compare ──
+        for xyz in 0..3 {
+            for a in 0..natm {
+                let va = de_a[(xyz, a)];
+                let vb = de_b[(xyz, a)];
+                let diff = (va - vb).abs();
+                assert!(
+                    diff < 1e-14,
+                    "de_dd_t self-consistency FAIL at [{xyz},{a}]: {va:.15e} vs {vb:.15e} (diff={diff:.2e})"
+                );
+            }
+        }
+    }
 }

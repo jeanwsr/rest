@@ -1,7 +1,6 @@
 //! SMD CDS (Cavitation-Dispersion-Solvent structure) energy and gradient.
 //!
-//! Translated from PySCF's Fortran source:
-//!   pyscf/lib/solvent/mnsol.F (originally from NWChem src/solvation/)
+//! Translated from Fortran source: https://github.com/nwchemgit/nwchem/blob/master/src/solvation/mnsol.F
 //!
 //! # Physical Model
 //!
@@ -40,10 +39,10 @@
 //! | `SIGMA_MOL` | Coefficients for cssigm: [c_γ, c_β², c_φ², c_ψ²] | — |
 //! | `COT(r; R₀, δ)` | Smooth bond-detection weight ∈ [0,1], C¹-continuous | dimensionless |
 //! | `sts[k]` | Effective surface tension σ_k^eff | cal/mol/Å² |
-//! | `dsts[dir,iat,k]` | ∂σ_k/∂X_{iat,dir} | cal/(mol·Å³) |
+//! | `dsts[dir]` | ∂σ_k/∂X_{iat,dir} as [nat, nat] matrix per direction | cal/(mol·Å³) |
 //! | `area0` (Ω_k) | Accessible solid angle of sphere K | steradians (sr) |
 //! | `area_atom[k]` (A_k) | SASA = Ω_k · R_k² | Å² |
-//! | `datar[dir,iat,k]` | ∂A_k/∂X_{iat,dir} | Å |
+//! | `datar[dir]` | ∂A_k/∂X_{iat,dir} as [nat, nat] matrix per direction | Å |
 //!
 //! ## Sigma Index Convention
 //!
@@ -58,7 +57,8 @@
 //! | 105 | N–C coordination | −48.22 |
 //! | 106 | O–N bond | 121.98 |
 //! | 110 | C–N bond | 0.00 |
-//! | 114 | O–P bond | −9.10 |
+//! | 114 | O–P bond | 68.85 |
+//! | 116 | N–C(3) triple bond | 84.10 |
 //!
 //! ## Unit Conversions
 //!
@@ -73,6 +73,46 @@
 //! - Rinaldi, D. & Liotard, D. — analytical derivatives
 
 use std::f64::consts::PI;
+use tensors::MatrixFull;
+
+// ============================================================================
+//  Debug printing helper (controlled by env var REST_CDS_DEBUG=1)
+// ============================================================================
+
+fn cds_debug_enabled() -> bool {
+    std::env::var("REST_CDS_DEBUG").map_or(false, |v| v == "1")
+}
+
+/// Print a labeled f64 scalar.
+fn cds_print_scalar(label: &str, val: f64) {
+    println!("CDS_DEBUG| {} = {:.12e}", label, val);
+}
+
+/// Print a labeled Vec<f64> with one value per line.
+fn cds_print_vec(label: &str, v: &[f64]) {
+    println!("CDS_DEBUG| {} [len={}]", label, v.len());
+    for (i, val) in v.iter().enumerate() {
+        println!("CDS_DEBUG|   [{}] = {:.12e}", i, val);
+    }
+}
+
+/// Print labeled [nat][3] gradient array.
+fn cds_print_grad(label: &str, g: &[[f64; 3]]) {
+    println!("CDS_DEBUG| {} [nat={}]", label, g.len());
+    for (i, row) in g.iter().enumerate() {
+        println!("CDS_DEBUG|   [{}] = {:.12e} {:.12e} {:.12e}", i, row[0], row[1], row[2]);
+    }
+}
+
+/// Print non-zero entries of a [f64; 151] array.
+fn cds_print_sigma151(label: &str, arr: &[f64; 151]) {
+    println!("CDS_DEBUG| {} non-zero entries:", label);
+    for (i, &v) in arr.iter().enumerate() {
+        if v.abs() > 1e-10 {
+            println!("CDS_DEBUG|   [{}] = {:.12e}", i, v);
+        }
+    }
+}
 
 // ============================================================================
 //  1. Constants & Parameter Data
@@ -141,9 +181,16 @@ fn rkkval(itpc: usize, jtpc: usize) -> f64 {
 /// Zeroth-order atomic surface tensions for water, σ⁰(Z), in cal/mol/Å².
 const SIGMA_AQ: [f64; 151] = {
     let mut s = [0.0f64; 151];
-    s[1]=48.69; s[6]=129.74; s[8]=38.18; s[15]=-9.10; s[16]=9.82;
-    s[34]=-8.72; s[101]=-72.95; s[103]=68.69; s[105]=-48.22;
-    s[106]=121.98; s[108]=68.85; s[109]=84.10;
+    // Zeroth-order σ⁰(Z) for elements
+    s[1]=48.69; s[6]=129.74; s[9]=38.18; s[16]=-9.10; s[17]=9.82;
+    s[35]=-8.72;
+    // Bond-type corrections Δσ (indices 101–150, matching Fortran sigma array)
+    s[101]=-72.95;  // C–C single bond
+    s[103]=68.69;   // O–C bond
+    s[105]=-48.22;  // N–C coordination
+    s[106]=121.98;  // O–N bond
+    s[114]=68.85;   // O–P bond
+    s[116]=84.10;   // N–C(3) triple bond
     s
 };
 /// H-atom bond corrections for water, Δσ_HZ, in cal/mol/Å².
@@ -172,13 +219,13 @@ const HSIGMA_N_DATA: [f64; 151] = build_hsigma_n();
 
 const fn build_sigma_n() -> [f64; 151] {
     let mut s = [0.0f64; 151];
-    s[6]=58.10; s[7]=32.62; s[8]=-17.56; s[13]=-18.04; s[15]=-33.17;
-    s[16]=-24.31; s[34]=-35.42; s[101]=-62.05; s[103]=-15.70; s[109]=-99.76;
+    s[6]=58.10; s[7]=32.62; s[8]=-17.56; s[14]=-18.04; s[16]=-33.17;
+    s[17]=-24.31; s[35]=-35.42; s[101]=-62.05; s[103]=-15.70; s[110]=-99.76;
     s
 }
 const fn build_sigma_a() -> [f64; 151] {
     let mut s = [0.0f64; 151];
-    s[6]=48.10; s[8]=193.06; s[103]=95.99; s[105]=-41.00; s[109]=152.20;
+    s[6]=48.10; s[8]=193.06; s[103]=95.99; s[105]=-41.00; s[110]=152.20;
     s
 }
 const fn build_sigma_b() -> [f64; 151] {
@@ -217,7 +264,7 @@ fn ij0(i: usize, j: usize) -> usize {
 
 /// 3-vector dot product, used for computing cos(θ) = û₁·û₂ in DAREAL.
 #[inline(always)]
-fn dot3(x: &[f64; 3], y: &[f64; 3]) -> f64 {
+fn dot3(x: &[f64], y: &[f64]) -> f64 {
     x[0] * y[0] + x[1] * y[1] + x[2] * y[2]
 }
 
@@ -312,62 +359,51 @@ fn cot_val(r: f64, rhld: f64, deltar: f64) -> (f64, f64) {
 /// σ_k^eff = σ⁰(Z_k) + Σ_bonds COT(r_kj; R₀, δ) · Δσ_bond_type
 /// ```
 ///
-/// The zeroth-order value `σ⁰(Z_k)` comes from the `sigma` table (cal/mol/Å²).
 /// Five bond-correction branches are applied (SMD-only):
-/// - **H–X**: H surface tension corrected by the heavy atom it's bonded to
-/// - **O–X**: O surface tension by bonded atom type (C, N, P, O)
-/// - **N–C**: coordination-dependent correction distinguishing –N–C–, –N=C<, –N≡C–
-/// - **C–C**: single-bond correction for each C–C pair
-/// - **C–N**: correction quadratic in C–N bond count
-///
-/// Bond detection is automatic via [`cot_val`] — no bond topology input needed.
+/// H–X, O–X, N–C (coordination-dependent), C–C, C–N. Bond detection via [`cot_val`].
 ///
 /// # Returns
 /// - `sts[nat]`: effective surface tensions σ_k^eff (cal/mol/Å²)
-/// - `dsts[3·nat·nat]`: ∂σ_k/∂X_{iat,dir}, layout `[dir + 3*(iat + nat*k)]`
+/// - `dsts[3]`: ∂σ_k/∂X_{iat,dir}, each a `[nat, nat]` matrix, `dsts[dir][[iat, k]]`
 fn smx_cds(
     atomic_numbers: &[usize], sigma: &[f64; 151], hsigma: &[f64; 151],
-    nat: usize, rlio: &[f64], urlio: &[f64],
-) -> (Vec<f64>, Vec<f64>) {
+    nat: usize, rlio: &[f64], urlio: &[MatrixFull<f64>; 3],
+) -> (Vec<f64>, [MatrixFull<f64>; 3]) {
     let mut sts = vec![0.0f64; nat];
-    let mut dsts = vec![0.0f64; 3 * nat * nat];
-    let ncot = nat * (nat + 1) / 2;
-    let mut cot = vec![0.0f64; ncot];
-    let mut dcot_dr = vec![0.0f64; ncot];
+    let mut dsts = [
+        MatrixFull::new([nat, nat], 0.0),
+        MatrixFull::new([nat, nat], 0.0),
+        MatrixFull::new([nat, nat], 0.0),
+    ];
 
     // ---- zeroth-order: σ_k = σ⁰(Z_k) ----
     for i in 0..nat {
         let z = atomic_numbers[i];
         sts[i] = sigma[z.min(150)];
     }
+    let sts_base = sts.clone(); // snapshot for debug
 
-    /// Apply a bond correction to atom i and propagate gradients:
+    /// Apply a bond correction to atom i with gradient propagation:
     ///   σ_i += COT(r_ij) · Δσ
-    ///   ∂σ_i/∂X_i += Δσ · dCOT/dr · û_{j→i}
-    ///   ∂σ_i/∂X_j -= Δσ · dCOT/dr · û_{j→i}
+    ///   ∂σ_i/∂X_i_dir += Δσ · dCOT/dr · û_{j→i}    (→ dsts[dir][[i, i]])
+    ///   ∂σ_i/∂X_j_dir -= Δσ · dCOT/dr · û_{j→i}    (→ dsts[dir][[j, i]])
     fn add_bond_corr(
-        sts: &mut [f64], dsts: &mut [f64], nat: usize,
-        i: usize, j: usize, sig_val: f64, // sig_val = Δσ (cal/mol/Å²)
-        rlio: &[f64], urlio: &[f64], rhld: f64, deltar: f64,
+        sts: &mut [f64], dsts: &mut [MatrixFull<f64>; 3], nat: usize,
+        i: usize, j: usize, sig_val: f64,
+        rlio: &[f64], urlio: &[MatrixFull<f64>; 3], rhld: f64, deltar: f64,
     ) {
         let r = rlio[ij0(i, j)];
         let (c, dc) = cot_val(r, rhld, deltar);
         sts[i] += c * sig_val;
-        let u_ji0 = urlio[0 + 3 * (j + nat * i)];
-        let u_ji1 = urlio[1 + 3 * (j + nat * i)];
-        let u_ji2 = urlio[2 + 3 * (j + nat * i)];
         let d = sig_val * dc;
-        dsts[0 + 3 * (i + nat * i)] += d * u_ji0;
-        dsts[1 + 3 * (i + nat * i)] += d * u_ji1;
-        dsts[2 + 3 * (i + nat * i)] += d * u_ji2;
-        dsts[0 + 3 * (j + nat * i)] -= d * u_ji0;
-        dsts[1 + 3 * (j + nat * i)] -= d * u_ji1;
-        dsts[2 + 3 * (j + nat * i)] -= d * u_ji2;
+        for dir in 0..3 {
+            let u_ji = urlio[dir][[j, i]];   // û_{j→i} component
+            dsts[dir][[i, i]] += d * u_ji;
+            dsts[dir][[j, i]] -= d * u_ji;
+        }
     }
 
     // ---- H–X correction: σ_H += Σ_J COT(r_HJ) · hsigma[Z_J] ----
-    // R₀ = rkkval(H_type, J_type), δ = 0.30 Å.
-    // e.g. HSIGMA_AQ[6] = −60.77 → H bonded to C has reduced surface tension.
     for i in 0..nat {
         if atomic_numbers[i] != 1 { continue; }
         let itpc = natcnv(1);
@@ -380,9 +416,10 @@ fn smx_cds(
             add_bond_corr(&mut sts, &mut dsts, nat, i, j, hsigma[ntp], rlio, urlio, rhld, 0.30);
         }
     }
+    let sts_after_hx = sts.clone();
 
-    // ---- O–X correction: σ_O += COT(r_OJ) · σ[bond_index] ----
-    // O–O uses hardcoded R₀=1.80 Å (not from rkkval) for peroxy bonds.
+    // ---- O–X correction (C, N, P, O) ----
+    // O–O uses hardcoded R₀=1.80 Å for peroxy bonds.
     for i in 0..nat {
         if atomic_numbers[i] != 8 { continue; }
         let itpc = natcnv(8);
@@ -390,24 +427,25 @@ fn smx_cds(
             if i == j { continue; }
             let ntp = atomic_numbers[j];
             let jtpc = natcnv(ntp);
-            let (sig_val, rhld, deltar): (f64, f64, f64) = match ntp {
-                6 => (sigma[103], rkkval(itpc, jtpc), 0.30),  // σ(O–C)
-                7 => (sigma[106], rkkval(itpc, jtpc), 0.30),  // σ(O–N)
-                15 => (sigma[114], rkkval(itpc, jtpc), 0.30), // σ(O–P)
-                8 => (sigma[104], 1.80, 0.30),                // σ(O–O), R₀=1.80
+            let (sig_val, rhld, deltar) = match ntp {
+                // Fortran mnsol.F:834 — O–C pair overrides R₀=1.330, δ=0.10
+                6 => (sigma[103], 1.330, 0.10),
+                7 => (sigma[106], rkkval(itpc, jtpc), 0.30),
+                15 => (sigma[114], rkkval(itpc, jtpc), 0.30),
+                8 => (sigma[104], 1.80, 0.30),
                 _ => continue,
             };
             add_bond_corr(&mut sts, &mut dsts, nat, i, j, sig_val, rlio, urlio, rhld, deltar);
         }
     }
+    let sts_after_ox = sts.clone();
 
     // ---- N–C correction (coordination-dependent) ----
-    // Distinguishes –N–C– (sp³), –N=C< (sp²), –N≡C– (sp) via C coordination number:
-    //   C_coord_J = Σ_{K≠N,C_J} COT(r_JK; R_JK, 0.30)     (≈ 3, 2, 1)
-    //   RTKKS = Σ_{C_J} COT(r_NJ; R_NC, 0.30) · (C_coord_J)²
-    //   σ_N += RTKKS^1.3 · sigma[105]   (sigma[105] = −48.22 for water)
-    // The power 1.3 nonlinearly enhances discrimination of multiple-bond environments.
-    // N.B. DSTS (gradient) is TODO — see Fortran mnsol.F lines 1053–1128.
+    // RTKKS = Σ_{C_J} COT(N,C_J) · (C_coord_J)²
+    // σ_N += RTKKS^1.3 · sigma[105],  sigma[105] = −48.22 (water).
+    //
+    // Save per-N RTKKS for gradient block below (Fortran mnsol.F:1065–1142).
+    let mut n_rtkks: Vec<(usize, f64)> = Vec::new(); // (N_atom_index, rtkk_s)
     for i in 0..nat {
         if atomic_numbers[i] != 7 { continue; }
         let mut rtkk_s = 0.0f64;
@@ -415,7 +453,7 @@ fn smx_cds(
             if i == j || atomic_numbers[j] != 6 { continue; }
             let (c_ij, _) = cot_val(rlio[ij0(i, j)], rkkval(natcnv(7), natcnv(6)), 0.30);
             if c_ij <= 0.0 { continue; }
-            let mut rtkk3 = 0.0f64; // C_coord_J
+            let mut rtkk3 = 0.0f64;
             for k in 0..nat {
                 if k == i || k == j { continue; }
                 let rhld2 = rkkval(natcnv(atomic_numbers[k]), natcnv(6));
@@ -424,24 +462,124 @@ fn smx_cds(
             }
             rtkk_s += c_ij * rtkk3 * rtkk3;
         }
-        let dholder = rtkk_s.powf(1.3);
-        sts[i] += dholder * sigma[105];
+        sts[i] += rtkk_s.powf(1.3) * sigma[105];
+        n_rtkks.push((i, rtkk_s));
+    }
+    let sts_after_nc = sts.clone();
+
+    // ---- N–C coordination gradient (Fortran mnsol.F:1065–1142) ----
+    // Chain rule through F = RTKKS^1.3 · sigma[105]:
+    //   ∂F/∂X = sigma[105] · 1.3 · RTKKS^0.3 · ∂(RTKKS)/∂X
+    //          = c0 · ∂(RTKKS)/∂X
+    // where RTKKS = Σ_J COT_IJ · SCOTC²,  SCOTC = Σ_K COT_JK.
+    //
+    // Two contributions per (N=i, C=j, K=k) triple:
+    //   A (N-C bond length):  dsts[i,i] += c0·SCOTC²·dCOT_ij·u_{C→N}
+    //                         dsts[j,i] -= c0·SCOTC²·dCOT_ij·u_{C→N}
+    //   B (C-K bond length):  dsts[j,i] += c0·2·SCOTC·COT_ij·dCOT_jk·u_{K→C}
+    //                         dsts[k,i] -= c0·2·SCOTC·COT_ij·dCOT_jk·u_{K→C}
+    //
+    // N-C(2) sigma[111] term is skipped (not used by SMD).
+    for &(i, rtkk_s) in &n_rtkks {
+        if rtkk_s <= 0.0 { continue; }
+        let c0 = sigma[105] * 1.3 * rtkk_s.powf(0.3); // [cal/(mol·Å²)]
+        let rhld_nc = rkkval(natcnv(7), natcnv(6)); // R₀(N,C)
+
+        // ---- T1 debug: checkpoint smx-cds.nc-grad.rtkks ----
+        if cds_debug_enabled() {
+            println!("CDS_DEBUG| NC-grad entry: N-atom i={} rtkk_s={:.12e} c0={:.12e} sigma[105]={:.12e}",
+                i, rtkk_s, c0, sigma[105]);
+        }
+
+        for j in 0..nat {
+            if i == j || atomic_numbers[j] != 6 { continue; }
+            let (c_ij, dc_ij) = cot_val(rlio[ij0(i, j)], rhld_nc, 0.30);
+            if c_ij <= 0.0 { continue; }
+
+            // Recompute SCOTC = Σ_K COT(C_J-K) (same as RTKK3 in energy loop)
+            let mut scotc: f64 = 0.0;
+            for k in 0..nat {
+                if k == i || k == j { continue; }
+                let rhld2 = rkkval(natcnv(atomic_numbers[k]), natcnv(6));
+                let (c_jk, _) = cot_val(rlio[ij0(j, k)], rhld2, 0.30);
+                scotc += c_jk;
+            }
+
+            // ---- T1 debug: checkpoint smx-cds.nc-grad.scotc ----
+            if cds_debug_enabled() {
+                println!("CDS_DEBUG| NC-grad scotc: i={} j={} scotc={:.12e} c_ij={:.12e} dc_ij={:.12e} r_NC={:.6e}",
+                    i, j, scotc, c_ij, dc_ij, rlio[ij0(i, j)]);
+            }
+
+            // --- Contribution A: N-C bond distance change (Fortran 1105-1112) ---
+            let pref_a = c0 * scotc * scotc * dc_ij; // [cal/(mol·Å³)]
+            // ---- T1 debug: checkpoint smx-cds.nc-grad.contrib-a ----
+            if cds_debug_enabled() {
+                let ux = urlio[0][[j, i]];
+                let uy = urlio[1][[j, i]];
+                let uz = urlio[2][[j, i]];
+                println!("CDS_DEBUG| NC-grad A: i={} j={} pref_a={:.12e} u_C→N=({:.6e},{:.6e},{:.6e}) → dsts[N,N]+=({:.6e},{:.6e},{:.6e}) dsts[C,N]-=({:.6e},{:.6e},{:.6e})",
+                    i, j, pref_a, ux, uy, uz,
+                    pref_a*ux, pref_a*uy, pref_a*uz,
+                    pref_a*ux, pref_a*uy, pref_a*uz);
+            }
+            for dir in 0..3 {
+                let u_ji = urlio[dir][[j, i]]; // û_{C→N}
+                dsts[dir][[i, i]] += pref_a * u_ji;
+                dsts[dir][[j, i]] -= pref_a * u_ji;
+            }
+
+            // --- Contribution B: C-K bond distance change (Fortran 1114-1139) ---
+            if scotc <= 0.0 { continue; }
+            let pref_b_common = c0 * 2.0 * scotc * c_ij; // [cal/(mol·Å²)]
+            for k in 0..nat {
+                if k == i || k == j { continue; }
+                let rhld2 = rkkval(natcnv(atomic_numbers[k]), natcnv(6));
+                let (_c_jk, dc_jk) = cot_val(rlio[ij0(j, k)], rhld2, 0.30);
+                if dc_jk == 0.0 { continue; } // beyond cutoff
+                let pref_b = pref_b_common * dc_jk; // [cal/(mol·Å³)]
+                // ---- T1 debug: checkpoint smx-cds.nc-grad.contrib-b ----
+                if cds_debug_enabled() {
+                    let ux = urlio[0][[k, j]];
+                    let uy = urlio[1][[k, j]];
+                    let uz = urlio[2][[k, j]];
+                    println!("CDS_DEBUG| NC-grad B: i={} j={} k={} dc_jk={:.12e} pref_b={:.12e} u_K→C=({:.6e},{:.6e},{:.6e}) → dsts[C,N]+=({:.6e},{:.6e},{:.6e}) dsts[K,N]-=({:.6e},{:.6e},{:.6e})",
+                        i, j, k, dc_jk, pref_b, ux, uy, uz,
+                        pref_b*ux, pref_b*uy, pref_b*uz,
+                        pref_b*ux, pref_b*uy, pref_b*uz);
+                }
+                for dir in 0..3 {
+                    let u_kj = urlio[dir][[k, j]]; // û_{K→C}
+                    dsts[dir][[j, i]] += pref_b * u_kj;
+                    dsts[dir][[k, i]] -= pref_b * u_kj;
+                }
+            }
+        }
     }
 
     // ---- C–C single-bond correction: σ_C += Σ_{C_J} COT(r_CJ) · sigma[101] ----
-    // sigma[101] = −72.95 for water (negative = shielding effect).
     for i in 0..nat {
         if atomic_numbers[i] != 6 { continue; }
         let itpc = natcnv(6);
         for j in 0..nat {
             if i == j || atomic_numbers[j] != 6 { continue; }
             let rhld = rkkval(itpc, natcnv(6));
+            let r = rlio[ij0(i, j)];
+            let (c, _) = cot_val(r, rhld, 0.30);
+            if cds_debug_enabled() && c > 1e-10 {
+                println!("CDS_DEBUG| C-C pair i={} j={} r={:.6e} rhld={:.4} cot={:.6e} contrib={:.6e}",
+                    i, j, r, rhld, c, c * sigma[101]);
+            }
             add_bond_corr(&mut sts, &mut dsts, nat, i, j, sigma[101], rlio, urlio, rhld, 0.30);
         }
     }
+    let sts_after_cc = sts.clone();
 
-    // ---- C–N bond correction: σ_C += (RTKK_CN)² · sigma[110] ----
-    // RTKK_CN = Σ_{N_J} COT(r_CJ; R_CN, 0.30). sigma[110] = 0.0 for water.
+    // ---- C–N bond correction: σ_C += (Σ_{N_J} COT(r_CJ))² · sigma[110] ----
+    // Energy:  σ_C += RTKK_CN² · sigma[110],  RTKK_CN = Σ_{N_J} COT(C, N_J)
+    // Gradient: ∂σ_C/∂X = sigma[110] · 2·RTKK_CN · Σ_{N_J} dCOT(C,N_J)/dr · ∂r_{C,N_J}/∂X
+    //   dsts[C,C]   += sigma[110]·2·RTKK_CN·dCOT·û_{N→C}
+    //   dsts[N_J,C] -= sigma[110]·2·RTKK_CN·dCOT·û_{N→C}
     for i in 0..nat {
         if atomic_numbers[i] != 6 { continue; }
         let mut rtkk_cn = 0.0;
@@ -452,6 +590,69 @@ fn smx_cds(
             }
         }
         sts[i] += rtkk_cn * rtkk_cn * sigma[110];
+
+        // ---- C–N gradient ----
+        if rtkk_cn > 0.0 && sigma[110] != 0.0 {
+            let pref = sigma[110] * 2.0 * rtkk_cn;
+            for j in 0..nat {
+                if atomic_numbers[j] != 7 { continue; }
+                let (_, dc) = cot_val(rlio[ij0(i, j)], rkkval(natcnv(6), natcnv(7)), 0.30);
+                if dc == 0.0 { continue; }
+                for dir in 0..3 {
+                    let u_ji = urlio[dir][[j, i]]; // û_{N→C}
+                    dsts[dir][[i, i]] += pref * dc * u_ji;
+                    dsts[dir][[j, i]] -= pref * dc * u_ji;
+                }
+            }
+        }
+    }
+    let sts_after_cn = sts.clone();
+
+    // ---- N–C(3) triple-bond correction: σ_N += Σ_{C_J} COT(r_NJ; R₀=1.225,δ=0.065) · sigma[116] ----
+    // Fortran mnsol.F lines 1132–1160.  SMD-only, not used by other MN solvation models.
+    // Gradient: ∂σ_N/∂X = Σ_{C_J} sigma[116] · ∂COT/∂r · û_{C→N}  (Fortran lines 1171-1181)
+    for i in 0..nat {
+        if atomic_numbers[i] != 7 { continue; }
+        let mut rtkk_nc3 = 0.0;
+        for j in 0..nat {
+            if atomic_numbers[j] == 6 {
+                let (c, dc) = cot_val(rlio[ij0(i, j)], 1.225, 0.065);
+                rtkk_nc3 += c;
+                if dc != 0.0 {
+                    for dir in 0..3 {
+                        let u_ji = urlio[dir][[j, i]]; // û_{C→N}
+                        dsts[dir][[i, i]] += sigma[116] * dc * u_ji;
+                        dsts[dir][[j, i]] -= sigma[116] * dc * u_ji;
+                    }
+                }
+            }
+        }
+        sts[i] += rtkk_nc3 * sigma[116];
+    }
+
+    // ---- debug: per-atom sigma breakdown ----
+    if cds_debug_enabled() {
+        let elem_name = |z: usize| -> &'static str {
+            match z {
+                1=>"H",2=>"He",3=>"Li",4=>"Be",5=>"B",6=>"C",7=>"N",8=>"O",9=>"F",
+                14=>"Si",15=>"P",16=>"S",17=>"Cl",35=>"Br",53=>"I",
+                _=>"??",
+            }
+        };
+        println!("CDS_DEBUG| smx_cds per-atom σ (cal/mol/Å²):");
+        println!("CDS_DEBUG| {:>3} {:>3} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+            "k","Z","base","+H-X","+O-X","+N-C","+C-C","+C-N","+N-C3","=final");
+        for k in 0..nat {
+            let d_hx  = sts_after_hx[k] - sts_base[k];
+            let d_ox  = sts_after_ox[k] - sts_after_hx[k];
+            let d_nc  = sts_after_nc[k] - sts_after_ox[k];
+            let d_cc  = sts_after_cc[k] - sts_after_nc[k];
+            let d_cn  = sts_after_cn[k] - sts_after_cc[k];
+            let d_nc3 = sts[k] - sts_after_cn[k];
+            println!("CDS_DEBUG| {:>3} {:>3} {:>12.6e} {:>12.6e} {:>12.6e} {:>12.6e} {:>12.6e} {:>12.6e} {:>12.6e} {:>12.6e}",
+                k, elem_name(atomic_numbers[k]),
+                sts_base[k], d_hx, d_ox, d_nc, d_cc, d_cn, d_nc3, sts[k]);
+        }
     }
 
     (sts, dsts)
@@ -461,46 +662,6 @@ fn smx_cds(
 //  5. DAREAL: Accessible Solid Angle
 // ============================================================================
 
-/// Workspace for the DAREAL accessible-solid-angle computation.
-///
-/// For a central sphere K overlapped by N neighbor spheres, each overlap defines a
-/// spherical segment (SS) on K's surface. The half-cone angle θ_i of SS i follows
-/// from the law of cosines on triangle (R_K, R_I, d_KI):
-///
-/// ```text
-/// cos(θ_i) = (R_K² + d_KI² − R_I²) / (2·R_K·d_KI)
-/// ```
-///
-/// SS connectivity determines how the sphere surface is partitioned.
-struct DarealWs {
-    stheta: Vec<f64>,        // sin(θ_i) for each SS
-    ctheta: MatrixView,      // cos(θ): diagonal = cos(θ_i), off-diagonal = cos(θ_ij)
-    conect: MatrixBool,      // connectivity: whether SS i and j share a free boundary
-    cosn: [Vec<f64>; 3],     // û_{K→I}: unit vectors from K to each neighbor I
-    dcteta: [Vec<f64>; 3],   // ∂cosθ/∂X_dir
-    dsteta: [Vec<f64>; 3],   // ∂sinθ/∂X_dir
-    dcosn: Vec<f64>,         // ∂û/∂X, layout [3×3×ncross²]
-    // Workspace for dihedral sorting (clustered-SS path)
-    work: Vec<f64>,
-    diwork: [Vec<f64>; 3],
-    djwork: [Vec<f64>; 3],
-    dkwork: [Vec<f64>; 3],
-    d0work: [Vec<f64>; 3],
-    dw_swap: Vec<f64>,
-    // Gradient accumulators
-    dca_slc: [Vec<f64>; 3],  // ∂(slice contribution)/∂X
-    dca_ply: [Vec<f64>; 3],  // ∂(polygon contribution)/∂X
-    dca_odd: [Vec<f64>; 3],  // ∂(odd/even sorting contribution)/∂X
-}
-
-/// Row-major 2D view over a `Vec<f64>`.
-struct MatrixView { data: Vec<f64>, n: usize }
-impl MatrixView {
-    fn new(n: usize) -> Self { MatrixView { data: vec![0.0; n*n], n } }
-    #[inline] fn at(&self, i: usize, j: usize) -> f64 { self.data[i * self.n + j] }
-    #[inline] fn set(&mut self, i: usize, j: usize, v: f64) { self.data[i * self.n + j] = v; }
-}
-
 /// Boolean matrix for SS connectivity.
 struct MatrixBool { data: Vec<bool>, n: usize }
 impl MatrixBool {
@@ -509,29 +670,96 @@ impl MatrixBool {
     #[inline] fn set(&mut self, i: usize, j: usize, v: bool) { self.data[i * self.n + j] = v; }
 }
 
+/// Workspace for the DAREAL accessible-solid-angle computation.
+///
+/// For a central sphere K overlapped by N neighbor spheres, each overlap defines a
+/// spherical segment (SS) on K's surface. The half-cone angle θ_i follows from
+/// the law of cosines: `cos(θ_i) = (R_K² + d_KI² − R_I²) / (2·R_K·d_KI)`.
+///
+/// ## Storage conventions
+///
+/// - `[3, ncross]` fields (`cosn`, `dsteta`, `diwork`, ...): column-major, column i
+///   corresponds to SS i, 3 rows are the 3 Cartesian directions.
+/// - `[ncross, ncross]` fields (`ctheta`, `dcteta[dir]`, ...): symmetric matrices,
+///   `[[i, j]]` is the value for SS pair (i, j).
+/// - `dcosn[i]`: `[3, 3]` Jacobian `∂û_{K→I}/∂X_I`, stored only for diagonal i=j.
+///   Derivative w.r.t. X_K has **opposite sign**: `∂û/∂X_K = −J_i`.
+///
+/// ## `dcteta` indexing
+///
+/// `dcteta[dir][[i, j]]` = `∂cosθ_ij / ∂X_I` (derivative w.r.t. atom for SS i).
+/// `dcteta[dir][[j, i]]` = `∂cosθ_ij / ∂X_J`. These are generally **not equal**.
+/// Derivative w.r.t. center K: `−dcteta[[i,j]] − dcteta[[j,i]]` (computed on the fly).
+struct DarealWs {
+    stheta: Vec<f64>,                  // [ncross] sin(θ_i)
+    ctheta: MatrixFull<f64>,           // [ncross, ncross] cos(θ)
+    conect: MatrixBool,                // [ncross, ncross] connectivity
+    cosn: MatrixFull<f64>,             // [3, ncross] û_{K→I}, column i
+    dcosn: Vec<MatrixFull<f64>>,       // [ncross] of [3, 3] ∂û/∂X_I
+    dcteta: [MatrixFull<f64>; 3],      // [3] × [ncross, ncross] ∂cosθ/∂X_dir
+    dsteta: MatrixFull<f64>,           // [3, ncross] ∂sinθ/∂X_dir (reserved)
+    // ---- Phase E: clustered-SS polygon-area workspace (energy only) ----
+    /// Free-intersection connectivity table.
+    /// Shape `[2*(ncross-1)+1, ncross]`: enough rows for every SS to have
+    /// up to 2*(ncross−1) free intersections (two per connected neighbour).
+    /// The last row stores the per-SS count (`ncnct_count[i]`).
+    ncnct: MatrixFull<isize>,
+    /// Intersection-point unit vectors PIJ on sphere K.
+    /// `cosn_ij[i]` is `[3, ncross]`, same layout as `dcosn[i]`.
+    /// `cosn_ij[i][[dir, j]]` = dir-component of unit vector from K to the
+    /// intersection point between SS i and SS j (on i's great-circle boundary).
+    cosn_ij: Vec<MatrixFull<f64>>,
+    /// `sit[i] = 1.0 / sin(theta_i)`, precomputed reciprocal for angle formulas.
+    sit: Vec<f64>,
+    /// Dihedral-angle work array (size `ncross` for sorting).
+    work: Vec<f64>,
+    /// Swap buffer for `work` during bubble sort.
+    work_buf: Vec<f64>,
+    // gradient fields
+    /// ∂(dihedral)/∂X_I   per dihedral-angle index,  [3, 2*ncross]
+    diwork: MatrixFull<f64>,
+    /// ∂(dihedral)/∂X_J   per dihedral-angle index,  [3, 2*ncross]
+    djwork: MatrixFull<f64>,
+    /// ∂(dihedral)/∂X_K   per dihedral-angle index,  [3, 2*ncross]
+    dkwork: MatrixFull<f64>,
+    /// D0 = −DI − DJ − DK  (gradient closure),       [3, 2*ncross]
+    d0work: MatrixFull<f64>,
+    dw_swap: Vec<f64>,
+    /// ∂(A_slice)/∂X,  col 0 = atom K, cols 1..ncross = neighbours,  [3, ncross+1]
+    dca_slc: MatrixFull<f64>,
+    /// ∂(A_poly)/∂X,  same layout,                                      [3, ncross+1]
+    dca_ply: MatrixFull<f64>,
+    /// ∂(A_odd )/∂X,  temporary accumulator per SS,                    [3, ncross+1]
+    dca_odd: MatrixFull<f64>,
+    /// ∂COSN(*, li, lj) / ∂X_LI  — 3×3 Jacobian per neighbour.
+    /// `dicosn[li]` is `[3*ncross, 3]`: rows `3*lj .. 3*lj+2`, cols `0..2`
+    /// store the Jacobian for neighbour `lj`.  Fortran: DICOSN(3,3,NAT,*).
+    dicosn: Vec<MatrixFull<f64>>,
+    /// ∂COSN(*, li, lj) / ∂X_LJ  — same layout.  Fortran: DJCOSN(3,3,NAT,*).
+    djcosn: Vec<MatrixFull<f64>>,
+    /// ∂(cosθ_i)/∂R_K  for radius gradient (unused)
+    dctetr: Vec<f64>,
+    /// ∂(sinθ_i)/∂R_K
+    dstetr: Vec<f64>,
+    /// ∂(sit_i)/∂R_K
+    dsitr: Vec<f64>,
+}
+
 /// Compute the accessible solid angle Ω_k of sphere K via the DAREAL algorithm
-/// (Liotard, 1992). Ω_k is the solid angle of the unit sphere region not occluded
-/// by any neighbor sphere's cap. The per-atom SASA follows as `A_k = Ω_k · R_k²`.
+/// (Liotard, 1992). The per-atom SASA follows as `A_k = Ω_k · R_k²`.
 ///
-/// # Returns
-/// - `area0`: accessible solid angle Ω_k (steradians)
-/// - `ncross`: number of overlapping neighbor spheres
-/// - `nc`: neighbor indices, nc[0] = k, nc[1..ncross] = neighbor atoms
-/// - `darea`: analytic gradient ∂Ω_k/∂X_{nc[l]}, layout `[3, ncross+1]`
-///
-/// **Current limitation:** the clustered-SS path (free intersections, dihedral sorting,
-/// polygon tracing) is not yet implemented. When nclust > 0, returns an approximation
-/// Ω_k ≈ 4π − A_slice (omitting polygon corrections, ~10% error for multi-atom molecules).
+/// Returns (area0, ncross, nc, darea) where darea[3*i+dir] = ∂Ω_k/∂X_dir
+/// for atom nc[i] (i=0 = center K, i≥1 = neighbour).
+/// Gradient is partial: Phase E2 dihedral derivatives not yet implemented.
 fn dareal(
     nat: usize, k: usize, rad: &[f64],
-    rlio: &[f64], urlio: &[f64],
+    rlio: &[f64], urlio: &[MatrixFull<f64>; 3],
 ) -> (f64, usize, Vec<usize>, Vec<f64>) {
     let twopi = 2.0 * PI;
     let fourpi = 4.0 * PI;
     let epsi: f64 = 1.0e-11;
-    let mxss = 2 * nat + 1;
 
-    let rk = rad[k];
+    let mut rk = rad[k];
     if rk <= 0.0 { return (0.0, 0, vec![0], vec![0.0; 3]); }
 
     let mut nc = vec![0usize; nat + 1];
@@ -539,9 +767,11 @@ fn dareal(
     let mut area0 = fourpi;
     let mut darea = vec![0.0f64; 3];
 
-    let mut restart;
-    loop {
-        restart = false;
+    // Fortran: outer loop target for degeneracy restart (GOTO 10, mnsol.F:1733-1735)
+    // When four spheres share a point at threshold ε, RK is increased and
+    // the entire dareal computation restarts from Phase A.
+    let mut jp_cnt: usize = 0;
+    'dareal_loop: loop {
         ncross = 0;
         nc[0] = k;
         let epsk = epsi * rk;
@@ -549,14 +779,30 @@ fn dareal(
         // ---- Phase A: overlap detection ----
         for i in 0..nat {
             if i == k || rad[i] <= 0.0 { continue; }
-            if rk + rad[i] - rlio[ij0(i, k)] < epsk { continue; }     // no overlap
-            if rlio[ij0(i, k)] - (rk - rad[i]).abs() < epsk {
+            let idx_ki = ij0(i, k);
+            let gap1 = rk + rad[i] - rlio[idx_ki];       // no-overlap gap
+            let gap2 = rlio[idx_ki] - (rk - rad[i]).abs(); // embedding gap
+            if gap1 < epsk { continue; }                  // no overlap
+            if gap2 < epsk {
                 if rk <= rad[i] {
-                    return (0.0, ncross, vec![0; nat+1], vec![0.0; 3]); // K embedded in I
+                    return (0.0, 0, vec![0; nat+1], vec![0.0; 3]); // K embedded in I
                 }
             } else {
                 ncross += 1;
-                nc[ncross] = i;                                         // partial overlap
+                nc[ncross] = i;                           // partial overlap
+            }
+        }
+
+        if cds_debug_enabled() && ncross == 0 && nat > 1 {
+            // Should never happen for molecules with bonded atoms — diagnostic
+            for i in 0..nat {
+                if i == k || rad[i] <= 0.0 { continue; }
+                let idx_ki = ij0(i, k);
+                println!("CDS_DEBUG| dareal k={} i={}: rk={:.6e} rad_i={:.6e} r_ij={:.6e} gap1={:.6e} gap2={:.6e} epsk={:.6e}",
+                    k, i, rk, rad[i], rlio[idx_ki],
+                    rk + rad[i] - rlio[idx_ki],
+                    rlio[idx_ki] - (rk - rad[i]).abs(),
+                    epsk);
             }
         }
 
@@ -564,88 +810,86 @@ fn dareal(
             return (area0, ncross, nc, vec![0.0; 3 * (ncross + 1)]);
         }
 
+        if cds_debug_enabled() {
+            print!("CDS_DEBUG| dareal k={} ncross={} neighbors:", k, ncross);
+            for l in 1..=ncross { print!(" {}", nc[l]); }
+            println!();
+        }
+
         let mut ws = DarealWs::new(ncross);
 
         // ---- Phase B: SS data initialization ----
-        // cos(θ_i) = (1/(2R_K)) · [d_KI + (R_K² − R_I²)/d_KI]
-        let rk_inv = 0.5 / rk;
-        let rk2 = rk * rk;
+        let rk_inv = 0.5 / rk;    // 1/(2R_K)
+        let rk2 = rk * rk;        // R_K²
 
         for i in 0..ncross {
             let li = nc[i + 1];
             let idx_ki = ij0(li, k);
-            let rik_inv = 1.0 / rlio[idx_ki];
+            let rik_inv = 1.0 / rlio[idx_ki];                        // 1/d_KI
 
             let ci = rk_inv * (rlio[idx_ki] + (rk2 - rad[li] * rad[li]) * rik_inv);
-            ws.ctheta.set(i, i, ci);
-            ws.stheta[i] = (1.0 - ci * ci).sqrt();
+            ws.ctheta[[i, i]] = ci;                                  // cosθ_i
+            ws.stheta[i] = (1.0 - ci * ci).sqrt();                   // sinθ_i
 
+            // unit vector û_{K→I} as column i of cosn
             for dir in 0..3 {
-                ws.cosn[dir][i * ncross + i] = urlio[dir + 3 * (k + nat * li)];
+                ws.cosn[[dir, i]] = urlio[dir][[k, li]];
             }
 
-            // Derivatives: ∂cosθ/∂X, ∂sinθ/∂X, ∂cosn/∂X
-            let x_val = -ci / ws.stheta[i];
+            // Derivatives
+            let x_val = -ci / ws.stheta[i];                          // −cosθ/sinθ
             let drctht = rk_inv * (1.0 - (rk2 - rad[li] * rad[li]) * rik_inv * rik_inv);
             for dir in 0..3 {
-                let cosni_val = ws.cosn[dir][i * ncross + i];
-                ws.dcteta[dir][i * ncross + i] = drctht * cosni_val;
-                ws.dsteta[dir][i * ncross + i] = x_val * ws.dcteta[dir][i * ncross + i];
+                let cosni = ws.cosn[[dir, i]];
+                ws.dcteta[dir][[i, i]] = drctht * cosni;             // ∂cosθ_i/∂X_dir
+                ws.dsteta[[dir, i]] = x_val * ws.dcteta[dir][[i, i]]; // ∂sinθ_i/∂X_dir
 
-                // ∂(û_{KI})_p / ∂X_q = (−û_p·û_q + δ_pq) / d_KI
-                let cosni = cosni_val * rik_inv;
+                // J_i = ∂û_{K→I}/∂X_I: symmetric 3×3, stored as dcosn[i]
+                let jac = &mut ws.dcosn[i];
+                let cosni = cosni * rik_inv;                         // û_dir / d_KI
                 for jdir in 0..3 {
-                    let cosnij = -cosni * ws.cosn[jdir][i * ncross + i];
-                    let didx = dir + 3 * (jdir + 3 * (i + ncross * i));
-                    ws.dcosn[didx] = cosnij;
-                    let djdx = jdir + 3 * (dir + 3 * (i + ncross * i));
-                    ws.dcosn[djdx] = cosnij;
+                    let cosnij = -cosni * ws.cosn[[jdir, i]];        // −û_p·û_q / d
+                    jac[[jdir, dir]] = cosnij;
+                    jac[[dir, jdir]] = cosnij;
                 }
-                let ddiag = dir + 3 * (dir + 3 * (i + ncross * i));
-                ws.dcosn[ddiag] += rik_inv;
+                jac[[dir, dir]] += rik_inv;                          // + 1/d on diagonal
             }
         }
 
         // ---- Phase C: connectivity ----
-        // Two SS i,j are connected if their intersection line lies on the sphere
-        // surface (not buried under a third SS). Connectivity test uses
-        // t_ij = cosθ_ij − cosθ_i·cosθ_j.
         for ii in 1..ncross {
             for jj in 0..ii {
                 if ws.conect.at(jj, jj) { continue; }
 
-                let cisj = ws.ctheta.at(ii, ii) * ws.stheta[jj];
-                let sicj = ws.stheta[ii] * ws.ctheta.at(jj, jj);
+                let cisj = ws.ctheta[[ii, ii]] * ws.stheta[jj];
+                let sicj = ws.stheta[ii] * ws.ctheta[[jj, jj]];
                 let sisj = ws.stheta[ii] * ws.stheta[jj];
 
-                let cij = dot3(
-                    &[ws.cosn[0][ii*ncross+ii], ws.cosn[1][ii*ncross+ii], ws.cosn[2][ii*ncross+ii]],
-                    &[ws.cosn[0][jj*ncross+jj], ws.cosn[1][jj*ncross+jj], ws.cosn[2][jj*ncross+jj]],
-                );
-                ws.ctheta.set(jj, ii, cij);
-                ws.ctheta.set(ii, jj, cij);
+                // cosθ_ij = û_{K→I} · û_{K→J}
+                let cij = dot3(ws.cosn.slice_column(ii), ws.cosn.slice_column(jj));
+                ws.ctheta[[jj, ii]] = cij;
+                ws.ctheta[[ii, jj]] = cij;
 
+                // ∂cosθ_ij/∂X: using column dir of each Jacobian (= row dir, symmetric)
                 for dir in 0..3 {
+                    let j_ii = &ws.dcosn[ii];
+                    let j_jj = &ws.dcosn[jj];
                     let di = dot3(
-                        &[ws.dcosn[dir + 3*(0 + 3*(ii + ncross*ii))],
-                          ws.dcosn[dir + 3*(1 + 3*(ii + ncross*ii))],
-                          ws.dcosn[dir + 3*(2 + 3*(ii + ncross*ii))]],
-                        &[ws.cosn[0][jj*ncross+jj], ws.cosn[1][jj*ncross+jj], ws.cosn[2][jj*ncross+jj]],
+                        &[j_ii[[0, dir]], j_ii[[1, dir]], j_ii[[2, dir]]],
+                        ws.cosn.slice_column(jj),
                     );
-                    ws.dcteta[dir][ii * ncross + jj] = di;
+                    ws.dcteta[dir][[ii, jj]] = di;
                     let dj = dot3(
-                        &[ws.cosn[0][ii*ncross+ii], ws.cosn[1][ii*ncross+ii], ws.cosn[2][ii*ncross+ii]],
-                        &[ws.dcosn[dir + 3*(0 + 3*(jj + ncross*jj))],
-                          ws.dcosn[dir + 3*(1 + 3*(jj + ncross*jj))],
-                          ws.dcosn[dir + 3*(2 + 3*(jj + ncross*jj))]],
+                        ws.cosn.slice_column(ii),
+                        &[j_jj[[0, dir]], j_jj[[1, dir]], j_jj[[2, dir]]],
                     );
-                    ws.dcteta[dir][jj * ncross + ii] = dj;
+                    ws.dcteta[dir][[jj, ii]] = dj;
                 }
 
-                let tij = cij - ws.ctheta.at(ii, ii) * ws.ctheta.at(jj, jj);
+                let tij = cij - ws.ctheta[[ii, ii]] * ws.ctheta[[jj, jj]];
 
                 if tij > sisj - epsi * (cisj - sicj).abs() {
-                    if ws.ctheta.at(jj, jj) > ws.ctheta.at(ii, ii) {
+                    if ws.ctheta[[jj, jj]] > ws.ctheta[[ii, ii]] {
                         ws.conect.set(jj, jj, true);
                     } else {
                         ws.conect.set(ii, ii, true);
@@ -666,8 +910,6 @@ fn dareal(
         }
 
         // ---- Phase D: isolated SS contribution ----
-        // Cap area on unit sphere: A_cap = 2π(1 − cosθ).
-        // A_slice = 2π · Σ_isolated (1 − cosθ_i)
         let mut a_slice = 0.0f64;
         let mut nclust = 0usize;
         let mut lab = vec![0usize; ncross];
@@ -685,52 +927,933 @@ fn dareal(
                 }
             }
             if connected_in_cluster { continue; }
-            a_slice += 1.0 - ws.ctheta.at(i, i);
+            a_slice += 1.0 - ws.ctheta[[i, i]];
+            // Fortran lines 1582-1584: DCASLC(:,I) += −DCTETA(:,I,I),  DCASLC(:,0) += +DCTETA(:,I,I)
+            for dir in 0..3 {
+                ws.dca_slc[[dir, i + 1]] -= ws.dcteta[dir][[i, i]];
+                ws.dca_slc[[dir, 0]] += ws.dcteta[dir][[i, i]];
+            }
         }
         a_slice *= twopi;
+        // Fortran line 1589: DSCALMN(3*(NCROSS+1), TWOPI, DCASLC)
+        for dir in 0..3 {
+            for col in 0..=ncross {
+                ws.dca_slc[[dir, col]] *= twopi;
+            }
+        }
 
         if nclust == 0 {
             area0 = fourpi - a_slice;
+            // Fortran lines 1594-1597: DAREA = −DCASLC
             darea.resize(3 * (ncross + 1), 0.0);
+            for i in 0..=ncross {
+                for dir in 0..3 {
+                    darea[3 * i + dir] = -ws.dca_slc[[dir, i]];
+                }
+            }
             return (area0, ncross, nc, darea);
         }
 
-        // ---- Phase E: clustered SS (NOT YET IMPLEMENTED) ----
-        // The full algorithm requires:
-        // 1. Free-intersection computation (PIJ/PJI)
-        // 2. Intersection classification (free vs buried)
-        // 3. Dihedral-angle sorting via atan2
-        // 4. Polygon vertex tracing
-        // 5. Final assembly: Ω = 4π − A_slice − (A_poly + (N_poly−N_free)·2π) mod 4π
+        // ---- Phase E: clustered SS — spherical polygon area ----
+        // Refs: Liotard (1992); Fortran mnsol.F lines 1603–2159.
         //
-        // Currently returns the isolated-SS approximation:
-        area0 = fourpi - a_slice;
+        // Algorithm in four parts:
+        //   E1  Find free intersection points between every pair of connected
+        //       SS in the cluster.  An intersection is "free" when it is
+        //       not buried inside any third SS.
+        //   E2  For each SS, walk its boundary through the ordered free
+        //       intersections, computing dihedral angles.  Accumulate
+        //       contributions to the polygon area (APOLY) and the
+        //       spherical-slice correction (ASLICE).
+        //   E3  Count distinct spherical polygons and add the interior
+        //       angle at each vertex to APOLY.
+        //   E4  Assemble the final solid angle:
+        //         AREA = 4π − ASLICE − (APOLY mod 4π).
+        //
+        // Only the energy is computed here; gradient derivatives are not
+        // implemented yet (LGRX / LGRR flags from the Fortran are omitted).
+
+        if cds_debug_enabled() {
+            println!("CDS_DEBUG| dareal k={} Phase E: nclust={} ncross={}",
+                k, nclust, ncross);
+        }
+
+        // ---- E1: free intersections between clustered SS ----
+        // WORK(L) = cosθ_L + ε·sinθ_L  (upper bound: inside SS L)
+        // WORK(L+ncross) = cosθ_L − ε·sinθ_L  (lower bound: degenerate boundary)
+        let mut work_hi = vec![0.0f64; nclust + 1]; // 1-indexed for convenience
+        let mut work_lo = vec![0.0f64; nclust + 1];
+        for ii in 0..nclust {
+            let l_ss = lab[ii]; // SS index within the full [0..ncross) range
+            work_hi[ii + 1] = ws.ctheta[[l_ss, l_ss]] + epsi * ws.stheta[l_ss];
+            work_lo[ii + 1] = ws.ctheta[[l_ss, l_ss]] - epsi * ws.stheta[l_ss];
+        }
+
+        let mut nfree: usize = 0;
+        // Last row of ncnct stores the per-SS count
+        let ncrow = if ncross > 1 { 2 * (ncross - 1) } else { 0 };
+        for ii in 0..ncross {
+            ws.ncnct[[ncrow, ii]] = 0;
+        }
+
+        for ii in 1..nclust {
+            let li = lab[ii]; // SS index
+            for jj in 0..ii {
+                let lj = lab[jj];
+                if !ws.conect.at(lj, li) {
+                    continue;
+                }
+
+                // ---- Coefficients A, B, C for the two intersection points ----
+                // PIJ = A·û_i + B·û_j + C·(û_i×û_j)    (on i's boundary)
+                // PJI = A·û_i + B·û_j − C·(û_i×û_j)    (on j's boundary)
+                let cij = ws.ctheta[[lj, li]]; // cosθ_ij
+                let sin2ij = 1.0 / (1.0 - cij * cij); // 1/sin²θ_ij
+                let a_ij = (ws.ctheta[[li, li]] - ws.ctheta[[lj, lj]] * cij) * sin2ij;
+                let b_ij = (ws.ctheta[[lj, lj]] - ws.ctheta[[li, li]] * cij) * sin2ij;
+                let c_ij = {
+                    let tmp = (1.0 - a_ij * ws.ctheta[[li, li]]
+                                   - b_ij * ws.ctheta[[lj, lj]]) * sin2ij;
+                    if tmp > 0.0 { tmp.sqrt() } else { 0.0 }
+                };
+
+                // Cross product VN = û_i × û_j
+                let vn = {
+                    let ui = ws.cosn.slice_column(li);
+                    let uj = ws.cosn.slice_column(lj);
+                    cross3(
+                        &[ui[0], ui[1], ui[2]],
+                        &[uj[0], uj[1], uj[2]],
+                    )
+                };
+
+                // PIJ and PJI (3-vectors on sphere K)
+                let mut p_ij = [0.0f64; 3];
+                let mut p_ji = [0.0f64; 3];
+                for dir in 0..3 {
+                    p_ij[dir] = a_ij * ws.cosn[[dir, li]]
+                              + b_ij * ws.cosn[[dir, lj]]
+                              + c_ij * vn[dir];
+                    p_ji[dir] = a_ij * ws.cosn[[dir, li]]
+                              + b_ij * ws.cosn[[dir, lj]]
+                              - c_ij * vn[dir];
+                }
+
+                // Store intersection vectors
+                for dir in 0..3 {
+                    ws.cosn_ij[li][[dir, lj]] = p_ij[dir];
+                    ws.cosn_ij[lj][[dir, li]] = p_ji[dir];
+                }
+
+                // ---- E1 gradient: intersection Jacobians DICOSN/DJCOSN ----
+                // Fortran mnsol.F:1635–1715.
+                // Compute the 3×3 Jacobian matrices ∂COSN/∂X for both PIJ and PJI.
+                //
+                // DICOSN(icor, jcor, li, lj) = ∂COSN(icor, li, lj) / ∂X_LI(jcor)
+                // DJCOSN(icor, jcor, li, lj) = ∂COSN(icor, li, lj) / ∂X_LJ(jcor)
+                //
+                // Stored in ws.dicosn[li] and ws.djcosn[li] as [3*ncross, 3]:
+                //   block at rows [3*lj .. 3*lj+2] = 3×3 Jacobian for neighbour lj.
+                {
+                    let dcij = 0.5 / c_ij; // 1/(2·CIJ), Fortran line 1636
+
+                    // --- DIVN, DJVN: derivatives of VN = û_i × û_j (Fortran 1638-1650) ---
+                    // DIVN[alpha][icor] = (∂û_i/∂X_icor × û_j)_alpha
+                    // DJVN[alpha][icor] = (û_i × ∂û_j/∂X_icor)_alpha
+                    let mut divn = [[0.0f64; 3]; 3];
+                    let mut djvn = [[0.0f64; 3]; 3];
+                    for icor in 0..3 {
+                        let dcos_i = &ws.dcosn[li]; // 3×3 ∂û_i/∂X
+                        let dcos_j = &ws.dcosn[lj]; // 3×3 ∂û_j/∂X
+                        let ui = ws.cosn.slice_column(li);
+                        let uj = ws.cosn.slice_column(lj);
+                        // DIVN = ∂û_i/∂X × û_j:  ε_{αβγ} * DCOSN(β,icor,LI) * COSN(γ,LJ)
+                        divn[0][icor] = dcos_i[[1, icor]] * uj[2] - dcos_i[[2, icor]] * uj[1];
+                        divn[1][icor] = dcos_i[[2, icor]] * uj[0] - dcos_i[[0, icor]] * uj[2];
+                        divn[2][icor] = dcos_i[[0, icor]] * uj[1] - dcos_i[[1, icor]] * uj[0];
+                        // DJVN = û_i × ∂û_j/∂X:  ε_{αβγ} * COSN(β,LI) * DCOSN(γ,icor,LJ)
+                        djvn[0][icor] = ui[1] * dcos_j[[2, icor]] - ui[2] * dcos_j[[1, icor]];
+                        djvn[1][icor] = ui[2] * dcos_j[[0, icor]] - ui[0] * dcos_j[[2, icor]];
+                        djvn[2][icor] = ui[0] * dcos_j[[1, icor]] - ui[1] * dcos_j[[0, icor]];
+                    }
+
+                    let dsn2ij = 2.0 * cij * sin2ij; // Fortran line 1651: 2·cosθ·sin²θ
+
+                    // Per-direction quantities: DIAIJ, DJAIJ, DJBIJ, DIBIJ, DICIJ, DJCIJ
+                    // Fortran lines 1672-1692 (DO 63 ICOR=1,3)
+                    let mut diaij = [0.0f64; 3];
+                    let mut dj_aij = [0.0f64; 3];
+                    let mut dj_bij = [0.0f64; 3];
+                    let mut di_bij = [0.0f64; 3];
+                    let mut di_cij = [0.0f64; 3];
+                    let mut dj_cij = [0.0f64; 3];
+
+                    for icor in 0..3 {
+                        let dc_li_lj = ws.dcteta[icor][[li, lj]];
+                        let dc_lj_li = ws.dcteta[icor][[lj, li]];
+                        let dc_li_li = ws.dcteta[icor][[li, li]];
+                        let dc_lj_lj = ws.dcteta[icor][[lj, lj]];
+                        let dis2ij = dsn2ij * dc_li_lj;
+                        let djs2ij = dsn2ij * dc_lj_li;
+
+                        // DIAIJ = (DCTETA(LI,LI)-CTHETA(LJ,LJ)*DCTETA(LI,LJ))*SIN2IJ + AIJ*DIS2IJ
+                        diaij[icor] = (dc_li_li - ws.ctheta[[lj, lj]] * dc_li_lj) * sin2ij
+                                    + a_ij * dis2ij;
+                        // DJAIJ (Fortran 1678-1680)
+                        dj_aij[icor] = (-dc_lj_lj * cij - ws.ctheta[[lj, lj]] * dc_lj_li) * sin2ij
+                                     + a_ij * djs2ij;
+                        // DJBIJ (Fortran 1681-1683)
+                        dj_bij[icor] = (dc_lj_lj - ws.ctheta[[li, li]] * dc_lj_li) * sin2ij
+                                     + b_ij * djs2ij;
+                        // DIBIJ (Fortran 1684-1686)
+                        di_bij[icor] = (-dc_li_li * cij - ws.ctheta[[li, li]] * dc_li_lj) * sin2ij
+                                     + b_ij * dis2ij;
+                        // DICIJ (Fortran 1687-1689)
+                        di_cij[icor] = -dcij * ((diaij[icor] * ws.ctheta[[li, li]]
+                                                + a_ij * dc_li_li
+                                                + di_bij[icor] * ws.ctheta[[lj, lj]]) * sin2ij)
+                                     + 0.5 * c_ij * dis2ij;
+                        // DJCIJ (Fortran 1690-1692)
+                        dj_cij[icor] = -dcij * ((dj_bij[icor] * ws.ctheta[[lj, lj]]
+                                                + b_ij * dc_lj_lj
+                                                + dj_aij[icor] * ws.ctheta[[li, li]]) * sin2ij)
+                                     + 0.5 * c_ij * djs2ij;
+                    }
+
+                    // --- Assemble DICOSN/DJCOSN (Fortran 1702-1714, DO 64) ---
+                    // For each (icor, jcor) pair, build the 3×3 Jacobian blocks
+                    // for both PIJ=(LI,LJ) with +C·VN and PJI=(LJ,LI) with −C·VN.
+                    for icor in 0..3 {
+                        for jcor in 0..3 {
+                            let dicos = diaij[jcor] * ws.cosn[[icor, li]]
+                                      + a_ij * ws.dcosn[li][[icor, jcor]]
+                                      + di_bij[jcor] * ws.cosn[[icor, lj]];
+                            let djcos = dj_aij[jcor] * ws.cosn[[icor, li]]
+                                      + dj_bij[jcor] * ws.cosn[[icor, lj]]
+                                      + b_ij * ws.dcosn[lj][[icor, jcor]];
+                            let diwij = di_cij[jcor] * vn[icor] + c_ij * divn[icor][jcor];
+                            let djwij = dj_cij[jcor] * vn[icor] + c_ij * djvn[icor][jcor];
+
+                            // PIJ (COSN(*,LI,LJ)): +C·VN
+                            ws.dicosn[li][[3 * lj + icor, jcor]] = dicos + diwij;
+                            ws.djcosn[li][[3 * lj + icor, jcor]] = djcos + djwij;
+                            // PJI (COSN(*,LJ,LI)): −C·VN  — Fortran 1713-1714
+                            ws.dicosn[lj][[3 * li + icor, jcor]] = dicos - diwij;
+                            ws.djcosn[lj][[3 * li + icor, jcor]] = djcos - djwij;
+                        }
+                    }
+                }
+
+                // ---- Check whether PIJ and PJI are "free" ----
+                let mut free_ij = true;
+                let mut free_ji = true;
+
+                for ll_idx in 1..=nclust {
+                    let ll_s = lab[ll_idx - 1];
+                    if ll_s == li || ll_s == lj {
+                        continue;
+                    }
+                    if ws.conect.at(ll_s, li) && ws.conect.at(ll_s, lj) {
+                        // Is PJI inside SS L?
+                        if free_ji {
+                            let chek = dot3(&p_ji, ws.cosn.slice_column(ll_s));
+                            if chek > work_hi[ll_idx] {
+                                free_ji = false;
+                            } else if chek >= work_lo[ll_idx] {
+                                // Fortran: four spheres K, LI, LJ, LL share a point
+                                // at threshold ε. Increase RK and restart (GOTO 10).
+                                rk *= 1.0 + 4.0 * epsi;
+                                jp_cnt += 1;
+                                if cds_debug_enabled() {
+                                    println!("CDS_DEBUG| dareal k={} E1 degeneracy (PJI): rk*={:.6e} jp_cnt={}",
+                                        k, rk, jp_cnt);
+                                }
+                                continue 'dareal_loop;
+                            }
+                        }
+                        // Is PIJ inside SS L?
+                        if free_ij {
+                            let chek = dot3(&p_ij, ws.cosn.slice_column(ll_s));
+                            if chek > work_hi[ll_idx] {
+                                free_ij = false;
+                            } else if chek >= work_lo[ll_idx] {
+                                // Fortran: degeneracy on PIJ side
+                                rk *= 1.0 + 4.0 * epsi;
+                                jp_cnt += 1;
+                                if cds_debug_enabled() {
+                                    println!("CDS_DEBUG| dareal k={} E1 degeneracy (PIJ): rk*={:.6e} jp_cnt={}",
+                                        k, rk, jp_cnt);
+                                }
+                                continue 'dareal_loop;
+                            }
+                        }
+                        if !free_ij && !free_ji {
+                            break;
+                        }
+                    }
+                }
+
+                // ---- Record free intersections in ncnct ----
+                // Positive neighbour → use cosn_ij[neighbour][ss]
+                // Negative neighbour → use cosn_ij[ss][neighbour] (sign fixed later)
+                // NCNCT stores (SS‑index + 1) with a sign convention:
+                //   +val  → neighbour = val−1,  use cosn_ij[neighbour][ss]
+                //   −val  → neighbour = val−1,  use cosn_ij[ss][neighbour]
+                // The +1 offset avoids −0 ≡ 0 ambiguity with 0‑based indices.
+                // Fortran uses 1‑based indices naturally; we mimic it here.
+                if free_ji {
+                    nfree += 1;
+                    let m = ws.ncnct[[ncrow, li]] as usize;
+                    ws.ncnct[[m, li]] = (lj + 1) as isize;               // +val
+                    ws.ncnct[[ncrow, li]] = (m + 1) as isize;
+                    let m2 = ws.ncnct[[ncrow, lj]] as usize;
+                    ws.ncnct[[m2, lj]] = -((li + 1) as isize);           // −val
+                    ws.ncnct[[ncrow, lj]] = (m2 + 1) as isize;
+                }
+                if free_ij {
+                    nfree += 1;
+                    let m = ws.ncnct[[ncrow, li]] as usize;
+                    ws.ncnct[[m, li]] = -((lj + 1) as isize);            // −val
+                    ws.ncnct[[ncrow, li]] = (m + 1) as isize;
+                    let m2 = ws.ncnct[[ncrow, lj]] as usize;
+                    ws.ncnct[[m2, lj]] = (li + 1) as isize;              // +val
+                    ws.ncnct[[ncrow, lj]] = (m2 + 1) as isize;
+                }
+                if cds_debug_enabled() {
+                    println!("CDS_DEBUG| E1 pair li={} lj={}: free_ji={} free_ij={}  nfree_sofar={}",
+                        li, lj, free_ji, free_ij, nfree);
+                }
+            } // jj
+        } // ii
+
+        if cds_debug_enabled() {
+            println!("CDS_DEBUG| dareal k={} Phase E1: nfree={}", k, nfree);
+        }
+
+        // No free intersections → sphere K buried by the cluster
+        if nfree == 0 {
+            if cds_debug_enabled() {
+                println!("CDS_DEBUG| dareal k={} buried by cluster -> area=0", k);
+            }
+            return (0.0, 0, vec![0; nat + 1], vec![0.0; 3]);
+        }
+
+        // ---- E2: oriented dihedral angles along each SS boundary ----
+        // Precompute sit[i] = 1 / sinθ_i
+        for i_ss in 0..ncross {
+            ws.sit[i_ss] = 1.0 / ws.stheta[i_ss];
+        }
+
+        let mut apoly = 0.0f64; // accumulated spherical polygon area
+        let mut aslice = a_slice; // start from isolated-SS slice area
+
+        for ii in 1..=nclust {
+            let li = lab[ii - 1];
+            let nphi = ws.ncnct[[ncrow, li]] as usize;
+            if nphi == 0 {
+                continue;
+            }
+
+            // --- E2 gradient A: zero DCAODD for this SS (Fortran 1801) ---
+            for dir in 0..3 {
+                for col in 0..=ncross {
+                    ws.dca_odd[[dir, col]] = 0.0;
+                }
+            }
+
+            // ---- Sign fixup for the first neighbour ----
+            // NCNCT stores (SS‑index + 1), signed.  Decode to 0‑based lj.
+            let lj_enc = ws.ncnct[[0, li]];
+            // Guard against stale/zero entries (should never happen, but be safe)
+            if lj_enc == 0 {
+                // No valid neighbour — skip this SS
+                break;
+            }
+            let (lj0, lj_positive) = if lj_enc > 0 {
+                ((lj_enc - 1) as usize, true)                 // +val → neighbour is lj0
+            } else {
+                let pos = -lj_enc;
+                ws.ncnct[[0, li]] = pos;                       // fix sign in table
+                ((pos - 1) as usize, false)                    // −val → reverse direction
+            };
+
+            // Build CNIJ(1:3), the unit vector from K to the intersection point
+            let mut cnij = [0.0f64; 3];
+            for dir in 0..3 {
+                cnij[dir] = if lj_positive {
+                    ws.cosn_ij[lj0][[dir, li]]                 // + → cosn_ij[neighbour][li]
+                } else {
+                    ws.cosn_ij[li][[dir, lj0]]                 // − → cosn_ij[li][neighbour]
+                };
+            }
+
+            // Cross product VIJ = û_i × CNIJ
+            let vij = {
+                let ui = ws.cosn.slice_column(li);
+                cross3(&[ui[0], ui[1], ui[2]], &cnij)
+            };
+            // LPOLY = (VIJ · û_j) > 0  — determines whether odd or even
+            // angles belong to the polygon
+            let lpoly = dot3(&vij, ws.cosn.slice_column(lj0)) > 0.0;
+
+            let c2i = ws.ctheta[[li, li]] * ws.ctheta[[li, li]];
+
+            // --- E2 gradient B: CNIJ derivatives (Fortran 1809-1866) ---
+            // B1: Decode DICNIJ/DJCNIJ from E1's DICOSN/DJCOSN with LI≥LJ symmetry.
+            // DICNIJ[alpha][icor] = ∂CNIJ(alpha)/∂X_LI(icor)
+            // DJCNIJ[alpha][icor] = ∂CNIJ(alpha)/∂X_LJ(icor)
+            let mut dicnij = [[0.0f64; 3]; 3];
+            let mut djcnij = [[0.0f64; 3]; 3];
+            {
+                let (src_li, src_lj) = if lj_positive {
+                    (lj0, li) // CNIJ = COSN(*, LJ, LI) → DICOSN(*,*, LJ, LI)
+                } else {
+                    (li, lj0) // CNIJ = COSN(*, LI, LJ) → DICOSN(*,*, LI, LJ)
+                };
+                let use_normal = li >= lj0;
+                for icor in 0..3 {
+                    for jcor in 0..3 {
+                        if use_normal {
+                            dicnij[icor][jcor] = ws.dicosn[src_li][[3 * src_lj + icor, jcor]];
+                            djcnij[icor][jcor] = ws.djcosn[src_li][[3 * src_lj + icor, jcor]];
+                        } else {
+                            // LI < LJ: swap DICOSN ↔ DJCOSN roles
+                            dicnij[icor][jcor] = ws.djcosn[src_li][[3 * src_lj + icor, jcor]];
+                            djcnij[icor][jcor] = ws.dicosn[src_li][[3 * src_lj + icor, jcor]];
+                        }
+                    }
+                }
+            }
+
+            // B2: DCSIT = -SIT² · DSTETA  —  ∂(1/sinθ)/∂X  (Fortran 1848-1849)
+            let mut dcsit = [0.0f64; 3];
+            for dir in 0..3 {
+                dcsit[dir] = -ws.sit[li].powi(2) * ws.dsteta[[dir, li]];
+            }
+            // B3: DCC2I = 2·cosθ · DCTETA  —  ∂(cos²θ)/∂X  (Fortran 1850)
+            let mut dcc2i = [0.0f64; 3];
+            for dir in 0..3 {
+                dcc2i[dir] = 2.0 * ws.ctheta[[li, li]] * ws.dcteta[dir][[li, li]];
+            }
+            // B4: DIVIJ = ∂(û_i × CNIJ)/∂X_LI,  DJVIJ = ∂(û_i × CNIJ)/∂X_LJ
+            // Fortran 1851-1865.
+            let mut divij = [[0.0f64; 3]; 3];
+            let mut djvij = [[0.0f64; 3]; 3];
+            {
+                let ui_data = ws.cosn.slice_column(li);
+                let ui = [ui_data[0], ui_data[1], ui_data[2]];
+                for icor in 0..3 {
+                    // DIVIJ[alpha][icor] = (∂û_i/∂X_{icor} × CNIJ)_alpha + (û_i × DICNIJ(:,[icor]))_alpha
+                    let du = &ws.dcosn[li];
+                    divij[0][icor] = du[[1, icor]] * cnij[2] - du[[2, icor]] * cnij[1]
+                                   + ui[1] * dicnij[2][icor] - ui[2] * dicnij[1][icor];
+                    divij[1][icor] = du[[2, icor]] * cnij[0] - du[[0, icor]] * cnij[2]
+                                   + ui[2] * dicnij[0][icor] - ui[0] * dicnij[2][icor];
+                    divij[2][icor] = du[[0, icor]] * cnij[1] - du[[1, icor]] * cnij[0]
+                                   + ui[0] * dicnij[1][icor] - ui[1] * dicnij[0][icor];
+                    // DJVIJ[alpha][icor] = û_i × DJCNIJ(:,[icor])  (only second term — û_i independent of X_LJ)
+                    djvij[0][icor] = ui[1] * djcnij[2][icor] - ui[2] * djcnij[1][icor];
+                    djvij[1][icor] = ui[2] * djcnij[0][icor] - ui[0] * djcnij[2][icor];
+                    djvij[2][icor] = ui[0] * djcnij[1][icor] - ui[1] * djcnij[0][icor];
+                }
+            }
+
+            // ---- Compute dihedral angles for each consecutive pair ----
+            for j_idx in 1..nphi {
+                let lk_enc = ws.ncnct[[j_idx, li]];
+                // Guard against zero entries (unvisited or stale); skip if invalid
+                if lk_enc == 0 {
+                    continue;
+                }
+                let lk0;
+                let mut cnik = [0.0f64; 3];
+                if lk_enc > 0 {
+                    lk0 = (lk_enc - 1) as usize;
+                    if lk0 >= ncross { continue; }
+                    for dir in 0..3 {
+                        cnik[dir] = ws.cosn_ij[lk0][[dir, li]];
+                    }
+                } else {
+                    let pos = -lk_enc;
+                    lk0 = (pos - 1) as usize;
+                    if lk0 >= ncross { continue; }
+                    ws.ncnct[[j_idx, li]] = pos;              // fix sign in table
+                    for dir in 0..3 {
+                        cnik[dir] = ws.cosn_ij[li][[dir, lk0]];
+                    }
+                }
+
+                // Dihedral angle between planes (û_i, CNIJ_prev) and (û_i, CNIK)
+                let x = dot3(&vij, &cnik);
+                let y = dot3(&cnik, &cnij) - c2i;
+                ws.work[j_idx - 1] = f64::atan2(x, y);
+                if ws.work[j_idx - 1] <= 0.0 {
+                    ws.work[j_idx - 1] += twopi;
+                }
+
+                // --- E2 gradient C: DICNIK/DKCNIK decode + atan2 chain rule ----
+                // Fortran 1883-1936.
+                // C1: Decode DICNIK/DKCNIK from E1's DICOSN/DJCOSN (same symmetry rule as B1).
+                let mut dicnik = [[0.0f64; 3]; 3];
+                let mut dkcnk = [[0.0f64; 3]; 3];
+                {
+                    let lk0_decoded = if lk_enc > 0 { (lk_enc - 1) as usize } else { ((-lk_enc) - 1) as usize };
+                    let (src_li2, src_lk) = if lk_enc > 0 {
+                        (lk0_decoded, li) // CNIK = COSN(*, LK, LI)
+                    } else {
+                        (li, lk0_decoded) // CNIK = COSN(*, LI, LK)
+                    };
+                    let use_normal2 = li >= lk0_decoded;
+                    for icor in 0..3 {
+                        for jcor in 0..3 {
+                            if use_normal2 {
+                                dicnik[icor][jcor] = ws.dicosn[src_li2][[3 * src_lk + icor, jcor]];
+                                dkcnk[icor][jcor] = ws.djcosn[src_li2][[3 * src_lk + icor, jcor]];
+                            } else {
+                                dicnik[icor][jcor] = ws.djcosn[src_li2][[3 * src_lk + icor, jcor]];
+                                dkcnk[icor][jcor] = ws.dicosn[src_li2][[3 * src_lk + icor, jcor]];
+                            }
+                        }
+                    }
+                }
+
+                // C2: atan2 chain rule (Fortran 1918-1935).
+                //   φ = atan2(x, y),  dx = -x/(x²+y²),  dy = y/(x²+y²)
+                //   dφ = dy·dx + dx·dy
+                let r2 = x * x + y * y;
+                if r2 > 1e-30 {
+                    let dx = -x / r2;
+                    let dy = y / r2;
+                    for icor in 0..3 {
+                        // DIX = DIVIJ(:,icor)·CNIK + VIJ·DICNIK(:,icor)
+                        let dix = divij[0][icor] * cnik[0] + divij[1][icor] * cnik[1] + divij[2][icor] * cnik[2]
+                                + vij[0] * dicnik[0][icor] + vij[1] * dicnik[1][icor] + vij[2] * dicnik[2][icor];
+                        // DIY = DICNIK(:,icor)·CNIJ + CNIK·DICNIJ(:,icor) − DCC2I(icor)
+                        let diy = dicnik[0][icor] * cnij[0] + dicnik[1][icor] * cnij[1] + dicnik[2][icor] * cnij[2]
+                                + cnik[0] * dicnij[0][icor] + cnik[1] * dicnij[1][icor] + cnik[2] * dicnij[2][icor]
+                                - dcc2i[icor];
+                        // DJX = DJVIJ(:,icor)·CNIK
+                        let djx = djvij[0][icor] * cnik[0] + djvij[1][icor] * cnik[1] + djvij[2][icor] * cnik[2];
+                        // DJY = CNIK·DJCNIJ(:,icor)
+                        let djy = cnik[0] * djcnij[0][icor] + cnik[1] * djcnij[1][icor] + cnik[2] * djcnij[2][icor];
+                        // DKX = VIJ·DKCNIK(:,icor)
+                        let dkx = vij[0] * dkcnk[0][icor] + vij[1] * dkcnk[1][icor] + vij[2] * dkcnk[2][icor];
+                        // DKY = DKCNIK(:,icor)·CNIJ
+                        let dky = dkcnk[0][icor] * cnij[0] + dkcnk[1][icor] * cnij[1] + dkcnk[2][icor] * cnij[2];
+
+                        // DIWORK / DJWORK / DKWORK / D0WORK (Fortran 1932-1935)
+                        ws.diwork[[icor, j_idx - 1]] = dy * dix + dx * diy;
+                        ws.djwork[[icor, j_idx - 1]] = dy * djx + dx * djy;
+                        ws.dkwork[[icor, j_idx - 1]] = dy * dkx + dx * dky;
+                        ws.d0work[[icor, j_idx - 1]] = -(ws.diwork[[icor, j_idx - 1]]
+                                                        + ws.djwork[[icor, j_idx - 1]]
+                                                        + ws.dkwork[[icor, j_idx - 1]]);
+                    }
+                } else {
+                    // Degenerate: angle is indeterminate, zero out gradient columns
+                    for icor in 0..3 {
+                        ws.diwork[[icor, j_idx - 1]] = 0.0;
+                        ws.djwork[[icor, j_idx - 1]] = 0.0;
+                        ws.dkwork[[icor, j_idx - 1]] = 0.0;
+                        ws.d0work[[icor, j_idx - 1]] = 0.0;
+                    }
+                }
+            }
+
+            // ---- Sort dihedral angles (ascending), bubble sort ----
+            if nphi > 2 {
+                for j_a in 0..nphi - 2 {
+                    for j_b in j_a + 1..nphi - 1 {
+                        if ws.work[j_a] > ws.work[j_b] {
+                            // swap work
+                            let tmp_w = ws.work[j_b];
+                            ws.work[j_b] = ws.work[j_a];
+                            ws.work[j_a] = tmp_w;
+                            // swap corresponding ncnct entries
+                            let tmp_n = ws.ncnct[[j_b + 1, li]];
+                            ws.ncnct[[j_b + 1, li]] = ws.ncnct[[j_a + 1, li]];
+                            ws.ncnct[[j_a + 1, li]] = tmp_n;
+                            // --- E2 gradient D: swap gradient columns (Fortran 1972-1977) ---
+                            for dir in 0..3 {
+                                ws.dw_swap[dir] = ws.diwork[[dir, j_b]];
+                                ws.diwork[[dir, j_b]] = ws.diwork[[dir, j_a]];
+                                ws.diwork[[dir, j_a]] = ws.dw_swap[dir];
+
+                                ws.dw_swap[dir] = ws.djwork[[dir, j_b]];
+                                ws.djwork[[dir, j_b]] = ws.djwork[[dir, j_a]];
+                                ws.djwork[[dir, j_a]] = ws.dw_swap[dir];
+
+                                ws.dw_swap[dir] = ws.dkwork[[dir, j_b]];
+                                ws.dkwork[[dir, j_b]] = ws.dkwork[[dir, j_a]];
+                                ws.dkwork[[dir, j_a]] = ws.dw_swap[dir];
+
+                                ws.dw_swap[dir] = ws.d0work[[dir, j_b]];
+                                ws.d0work[[dir, j_b]] = ws.d0work[[dir, j_a]];
+                                ws.d0work[[dir, j_a]] = ws.dw_swap[dir];
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- Compute odd/even area contributions ----
+            let mut aodd = ws.work[0];
+            // --- E2 gradient E: DCAODD accumulation (Fortran 1949-2016) ---
+            // First term (work[0]) — contribution from the first dihedral angle.
+            {
+                let lj_d = lj0; // first neighbour (already decoded above)
+                let lk_enc1 = ws.ncnct[[1, li]] as usize; // second neighbour (encoded)
+                if lk_enc1 > 0 && lk_enc1 <= ncross + 1 {
+                    let lk_d = lk_enc1 - 1; // 0-based SS index
+                    for dir in 0..3 {
+                        ws.dca_odd[[dir, li + 1]] += ws.diwork[[dir, 0]];
+                        ws.dca_odd[[dir, lj_d + 1]] += ws.djwork[[dir, 0]];
+                        ws.dca_odd[[dir, lk_d + 1]] += ws.dkwork[[dir, 0]];
+                        ws.dca_odd[[dir, 0]] += ws.d0work[[dir, 0]];
+                    }
+                }
+            }
+            if nphi > 2 {
+                for j_idx in (2..nphi - 1).step_by(2) {
+                    aodd += ws.work[j_idx] - ws.work[j_idx - 1];
+                    // DCAODD alternating sum (Fortran 2000-2016)
+                    // j_idx = 2,4,...,nphi-2  (Rust 0-based; Fortran J=3,5,...,NPHI-1)
+                    let lk_enc_even = ws.ncnct[[j_idx, li]] as usize;      // even-index neighbour
+                    let ll_enc_odd  = ws.ncnct[[j_idx + 1, li]] as usize;  // odd-index neighbour
+                    for dir in 0..3 {
+                        ws.dca_odd[[dir, li + 1]] += ws.diwork[[dir, j_idx]]
+                                                   - ws.diwork[[dir, j_idx - 1]];
+                        ws.dca_odd[[dir, lj0 + 1]] += ws.djwork[[dir, j_idx]]
+                                                    - ws.djwork[[dir, j_idx - 1]];
+                    }
+                    if lk_enc_even > 0 && lk_enc_even <= ncross + 1 {
+                        let lk_ev = lk_enc_even - 1;
+                        for dir in 0..3 {
+                            ws.dca_odd[[dir, lk_ev + 1]] -= ws.dkwork[[dir, j_idx - 1]];
+                        }
+                    }
+                    if ll_enc_odd > 0 && ll_enc_odd <= ncross + 1 {
+                        let ll_od = ll_enc_odd - 1;
+                        for dir in 0..3 {
+                            ws.dca_odd[[dir, ll_od + 1]] += ws.dkwork[[dir, j_idx]];
+                        }
+                    }
+                    for dir in 0..3 {
+                        ws.dca_odd[[dir, 0]] += ws.d0work[[dir, j_idx]]
+                                               - ws.d0work[[dir, j_idx - 1]];
+                    }
+                }
+            }
+            let aeven = twopi - aodd;
+            let x_slice = 1.0 - ws.ctheta[[li, li]];
+
+            if cds_debug_enabled() {
+                print!("CDS_DEBUG| E2 li={}: lpoly={} nphi={} work[0]={:.6e} aodd={:.6e} aeven={:.6e} x_slice={:.6e}",
+                    li, lpoly, nphi, ws.work[0], aodd, aeven, x_slice);
+                print!("  ncnct_pre=[");
+                for kk in 0..nphi { print!(" {}", ws.ncnct[[kk, li]]); }
+                print!(" ]");
+            }
+            if lpoly {
+                // odd dihedrals are polygon vertices
+                apoly += aodd;
+                aslice += aeven * x_slice;
+                // Fortran 2020-2025: DCASLC(:,LI) -= AEVEN*DCTETA,  DCASLC(:,0) += AEVEN*DCTETA
+                for dir in 0..3 {
+                    ws.dca_slc[[dir, li + 1]] -= aeven * ws.dcteta[dir][[li, li]];
+                    ws.dca_slc[[dir, 0]] += aeven * ws.dcteta[dir][[li, li]];
+                }
+                // --- E2 gradient F (lpoly=true): DCAODD → DCAPLY/DCASLC (Fortran 2024-2037) ---
+                // DCAPLY += DCAODD,  DCASLC -= DCAODD * X
+                for dir in 0..3 {
+                    for col in 0..=ncross {
+                        let d_odd = ws.dca_odd[[dir, col]];
+                        ws.dca_ply[[dir, col]] += d_odd;
+                        ws.dca_slc[[dir, col]] -= d_odd * x_slice;
+                    }
+                }
+            } else {
+                // even dihedrals are polygon vertices
+                apoly += aeven;
+                aslice += aodd * x_slice;
+                // Fortran 2043-2048: DCASLC(:,LI) -= AODD*DCTETA,  DCASLC(:,0) += AODD*DCTETA
+                for dir in 0..3 {
+                    ws.dca_slc[[dir, li + 1]] -= aodd * ws.dcteta[dir][[li, li]];
+                    ws.dca_slc[[dir, 0]] += aodd * ws.dcteta[dir][[li, li]];
+                }
+                // --- E2 gradient F (lpoly=false): DCAODD → DCAPLY/DCASLC (Fortran 2047-2060) ---
+                // DCAPLY -= DCAODD,  DCASLC += DCAODD * X
+                for dir in 0..3 {
+                    for col in 0..=ncross {
+                        let d_odd = ws.dca_odd[[dir, col]];
+                        ws.dca_ply[[dir, col]] -= d_odd;
+                        ws.dca_slc[[dir, col]] += d_odd * x_slice;
+                    }
+                }
+            }
+
+            // Reorder labels so polygon vertices are at odd ranks.
+            // Fortran (mnsol.F:2054-2058): only when .NOT.LPOLY.
+            //   LPOLY=true  → odd dihedrals are already polygon vertices → no rotate
+            //   LPOLY=false → even dihedrals are polygon vertices → shift by 1
+            if !lpoly && nphi > 0 {
+                let first = ws.ncnct[[0, li]];
+                for j_idx in 0..nphi - 1 {
+                    ws.ncnct[[j_idx, li]] = ws.ncnct[[j_idx + 1, li]];
+                }
+                ws.ncnct[[nphi - 1, li]] = first;
+                // Rotate gradient columns to match NCNCT rotation (Fortran implicit:
+                // the gradient arrays are indexed by dihedral position, not by
+                // NCNCT position, so no column rotation is needed for DIWORK etc.
+                // The NCNCT rotation already reorders the labels for E3.)
+            }
+            if cds_debug_enabled() {
+                let rotated = !lpoly && nphi > 0;
+                print!("  ncnct_post=[");
+                for kk in 0..nphi { print!(" {}", ws.ncnct[[kk, li]]); }
+                println!(" ]  rotate_applied={} (Fortran: only if !lpoly)", rotated);
+                // Per-column E2 gradient accumulators (non-zero only)
+                for col in 0..=ncross {
+                    let has_nonzero = (0..3).any(|dir|
+                        ws.dca_odd[[dir, col]].abs() > 1e-20
+                        || ws.dca_ply[[dir, col]].abs() > 1e-20
+                        || ws.dca_slc[[dir, col]].abs() > 1e-20
+                    );
+                    if has_nonzero {
+                        print!("    E2 grad col={}: odd=[", col);
+                        for dir in 0..3 { print!(" {:.6e}", ws.dca_odd[[dir, col]]); }
+                        print!(" ] ply=[");
+                        for dir in 0..3 { print!(" {:.6e}", ws.dca_ply[[dir, col]]); }
+                        print!(" ] slc=[");
+                        for dir in 0..3 { print!(" {:.6e}", ws.dca_slc[[dir, col]]); }
+                        println!(" ]");
+                    }
+                }
+            }
+        } // ii (E2)
+
+        // ---- E3: count polygons and sum vertex interior angles ----
+        // Fortran DAREAL lines 2065–2152.  For each unvisited edge in the
+        // NCNCT table, walk the full spherical polygon, computing the interior
+        // angle φ at each vertex:
+        //   φ = acos( (cosθ_AB − cosθ_A·cosθ_B) / (sinθ_A · sinθ_B) )
+        //
+        // Helper: compute φ(ia, ib) and accumulate its gradient (Fortran 2078-2090).
+        /// Compute interior angle φ(ia, ib) and its gradient.
+        /// Returns (φ, dφ/dR_ia, dφ/dR_ib).  The caller must accumulate into dca_ply.
+        fn phi_with_grad(
+            ia: usize, ib: usize, ws: &DarealWs,
+        ) -> (f64, [f64; 3], [f64; 3]) {
+            let p1 = ws.ctheta[[ia, ib]] - ws.ctheta[[ia, ia]] * ws.ctheta[[ib, ib]];
+            let p2 = ws.sit[ia] * ws.sit[ib];
+            let phi = f64::acos((p1 * p2).clamp(-1.0, 1.0));
+            let mut daphi = [0.0f64; 3];
+            let mut dbphi = [0.0f64; 3];
+            let sin_phi = phi.sin();
+            if sin_phi.abs() > 1e-15 {
+                let s1nphi = 1.0 / sin_phi;
+                let p1m = s1nphi * p1;
+                let p2m = s1nphi * p2;
+                for dir in 0..3 {
+                    let dcsit_a = -ws.sit[ia].powi(2) * ws.dsteta[[dir, ia]];
+                    let dcsit_b = -ws.sit[ib].powi(2) * ws.dsteta[[dir, ib]];
+                    daphi[dir] = (ws.dcteta[dir][[ia, ib]] - ws.ctheta[[ib, ib]] * ws.dcteta[dir][[ia, ia]]) * p2m
+                               + p1m * dcsit_a * ws.sit[ib];
+                    dbphi[dir] = (ws.dcteta[dir][[ib, ia]] - ws.ctheta[[ia, ia]] * ws.dcteta[dir][[ib, ib]]) * p2m
+                               + p1m * ws.sit[ia] * dcsit_b;
+                }
+            }
+            (phi, daphi, dbphi)
+        }
+        /// Accumulate phi gradient into dca_ply columns.
+        fn accum_phi_grad(ia: usize, ib: usize, daphi: &[f64; 3], dbphi: &[f64; 3], ws: &mut DarealWs) {
+            for dir in 0..3 {
+                ws.dca_ply[[dir, ia + 1]] -= daphi[dir];
+                ws.dca_ply[[dir, ib + 1]] -= dbphi[dir];
+                ws.dca_ply[[dir, 0]] += daphi[dir] + dbphi[dir];
+            }
+        }
+        let mut npoly: usize = 0;
+        for ii in 1..=nclust {
+            let li = lab[ii - 1];
+            let ncnt = ws.ncnct[[ncrow, li]] as usize;
+            if cds_debug_enabled() {
+                print!("CDS_DEBUG| E3 entry: li={} ncnt={}  ncnct=[", li, ncnt);
+                for k in 0..ncnt {
+                    print!(" {}", ws.ncnct[[k, li]]);
+                }
+                println!(" ]");
+            }
+            // Fortran loop: DO 160 J=2,NCNCT(MXSS,LI),2  (1-indexed, even → 0-idx odd)
+            for j_idx in (1..ncnt).step_by(2) {
+                if ws.ncnct[[j_idx, li]] == 0 {
+                    continue; // already visited
+                }
+                // NCNCT stores (0‑based + 1): decode to 0‑based SS indices
+                let ia_enc = ws.ncnct[[j_idx - 1, li]] as usize; // 1‑based encoded
+                let mut ia = ia_enc - 1;                          // 0‑based
+                if cds_debug_enabled() {
+                    println!("CDS_DEBUG| E3 raw: j_idx={} ncnct[[{}]]={} ncnct[[{}]]={} ia_enc={} ia={}",
+                        j_idx, j_idx - 1, ws.ncnct[[j_idx - 1, li]],
+                        j_idx, ws.ncnct[[j_idx, li]], ia_enc, ia);
+                }
+                let mut ib = li;
+                let ia_start = ia;       // Fortran NCNCT(J‑1,LI) — first vertex
+                ws.ncnct[[j_idx, li]] = 0; // mark edge visited
+
+                // --- first vertex φ(ia, ib) ---
+                let (phi_first, daphi_first, dbphi_first) = phi_with_grad(ia, ib, &ws);
+                apoly += phi_first;
+                accum_phi_grad(ia, ib, &daphi_first, &dbphi_first, &mut ws);
+                let mut last_phi = phi_first;
+                let mut last_daphi = daphi_first;
+                let mut last_dbphi = dbphi_first;
+
+                if cds_debug_enabled() {
+                    println!("CDS_DEBUG| E3 start edge: li={} ia={} ib={} phi={:.6e}",
+                        li, ia, ib, phi_first);
+                }
+
+                // --- polygon walk (Fortran DO 140, mnsol.F:2102-2147) ---
+                let mut polygon_closed = false;
+                loop {
+                    let ncnt_a = ws.ncnct[[ncrow, ia]] as usize;
+                    let mut found = false;
+                    for m_idx in (1..ncnt_a).step_by(2) {
+                        if (ws.ncnct[[m_idx, ia]] as usize) == (ib + 1)          // encoded cmp
+                            && ws.ncnct[[m_idx - 1, ia]] > 0
+                        {
+                            let ibold = ib; // Fortran IBOLD — save BEFORE update
+                            ws.ncnct[[m_idx, ia]] = 0; // mark visited
+                            let ia_new = (ws.ncnct[[m_idx - 1, ia]] as usize) - 1; // decode
+                            // IB = IA (new IB = old IA), IA = NCNCT(L-1, IB) (new IA)
+                            let ib_new = ia;
+
+                            if ia_new != ibold {
+                                // Fortran: normal step — φ(new_IA, new_IB)
+                                let (phi, daphi_new, dbphi_new) = phi_with_grad(ia_new, ib_new, &ws);
+                                apoly += phi;
+                                accum_phi_grad(ia_new, ib_new, &daphi_new, &dbphi_new, &mut ws);
+                                last_phi = phi;
+                                last_daphi = daphi_new;
+                                last_dbphi = dbphi_new;
+                                if cds_debug_enabled() {
+                                    println!("CDS_DEBUG| E3 walk: ia_old={} ib_old={} → ia_new={} ib_new={}  ibold={} (ibold≠ia_new→normal)  φ={:.6e}",
+                                        ia, ib, ia_new, ib_new, ibold, phi);
+                                }
+                                ib = ib_new;
+                                ia = ia_new;
+                                found = true;
+                                break;
+                            } else {
+                                // Fortran: IA == IBOLD — polygon closed (ELSE branch)
+                                //   IB = LI, IA = NCNCT(J-1, LI)  (reset to start)
+                                //   APOLY += PHI  (reuses last computed φ)
+                                //   DCAPLY(IA, IB) -= DAPHI/DBPHI  (reuses last gradient)
+                                apoly += last_phi;
+                                accum_phi_grad(ia_start, li, &last_daphi, &last_dbphi, &mut ws);
+                                ib = li;          // Fortran: IB = LI
+                                ia = ia_start;    // Fortran: IA = NCNCT(J-1, LI)
+                                if cds_debug_enabled() {
+                                    println!("CDS_DEBUG| E3 walk-close: ia_old={} ib_old={} ia_new={} ib_new={}  ibold={} (ibold=ia_new→close)  reusing_last_phi={:.6e}  reset→(ia={} ib={})",
+                                        ia, ib, ia_new, ib_new, ibold, last_phi, ia, ib);
+                                }
+                                polygon_closed = true;
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !found || polygon_closed {
+                        break;
+                    }
+                }
+
+                // Fortran line 2149: walking loop exhausted → just NPOLY = NPOLY + 1.
+                // No closing vertex is added (unlike the IA==IBOLD branch, which
+                // reuses the last PHI and proceeds to GOTO 140).
+                npoly += 1;
+            }
+        }
+
+        if cds_debug_enabled() {
+            println!("CDS_DEBUG| dareal k={}  pre-E4: apoly_raw={:.6e} aslice={:.6e} npoly={} nfree={}",
+                k, apoly, aslice, npoly, nfree);
+        }
+        // ---- E4: final solid angle ----
+        // Fortran: APOLY=APOLY+(NPOLY-NFREE)*TWOPI
+        //          AREA=FOURPI-ASLICE-MOD(APOLY,FOURPI)
+        apoly += (npoly as isize - nfree as isize) as f64 * twopi;
+        // Fortran MOD truncates toward zero; Rust's % (rem) does the same.
+        // rem_euclid would give the positive remainder, which differs by 4π for negative APOLY.
+        area0 = fourpi - aslice - apoly % fourpi;
+
+        if cds_debug_enabled() {
+            println!("CDS_DEBUG| dareal k={} Phase E done: nfree={} npoly={} aslice={:.6e} apoly={:.6e} area0={:.6e}",
+                k, nfree, npoly, aslice, apoly, area0);
+            // Print per-column gradient accumulators (the components of darea)
+            for i in 0..=ncross {
+                let has_nonzero = (0..3).any(|dir|
+                    ws.dca_slc[[dir, i]].abs() > 1e-20 || ws.dca_ply[[dir, i]].abs() > 1e-20
+                );
+                if has_nonzero {
+                    print!("CDS_DEBUG|   darea comps i={}: dca_slc=[", i);
+                    for dir in 0..3 { print!(" {:.6e}", ws.dca_slc[[dir, i]]); }
+                    print!(" ] dca_ply=[");
+                    for dir in 0..3 { print!(" {:.6e}", ws.dca_ply[[dir, i]]); }
+                    print!(" ] dca_odd=[");
+                    for dir in 0..3 { print!(" {:.6e}", ws.dca_odd[[dir, i]]); }
+                    println!(" ]");
+                }
+            }
+        }
+
+        // ---- assemble darea (Fortran lines 2160-2163) ----
+        // DAREA(:,I) = −DCASLC(:,I) − DCAPLY(:,I)  for I = 0..NCROSS
         darea.resize(3 * (ncross + 1), 0.0);
+        for i in 0..=ncross {
+            for dir in 0..3 {
+                darea[3 * i + dir] = -ws.dca_slc[[dir, i]] - ws.dca_ply[[dir, i]];
+            }
+        }
         return (area0, ncross, nc, darea);
     }
 }
 
 impl DarealWs {
     fn new(ncross: usize) -> Self {
-        let n2 = ncross * ncross;
-        let n3 = 3 * ncross;
         DarealWs {
             stheta: vec![0.0; ncross],
-            ctheta: MatrixView::new(ncross),
+            ctheta: MatrixFull::new([ncross, ncross], 0.0),
             conect: MatrixBool::new(ncross),
-            cosn: [vec![0.0; n2], vec![0.0; n2], vec![0.0; n2]],
-            dcteta: [vec![0.0; n2], vec![0.0; n2], vec![0.0; n2]],
-            dsteta: [vec![0.0; n3], vec![0.0; n3], vec![0.0; n3]],
-            dcosn: vec![0.0; 3 * 3 * n2],
-            work: vec![],
-            diwork: [vec![], vec![], vec![]],
-            djwork: [vec![], vec![], vec![]],
-            dkwork: [vec![], vec![], vec![]],
-            d0work: [vec![], vec![], vec![]],
-            dw_swap: vec![],
-            dca_slc: [vec![], vec![], vec![]],
-            dca_ply: [vec![], vec![], vec![]],
-            dca_odd: [vec![], vec![], vec![]],
+            cosn: MatrixFull::new([3, ncross], 0.0),
+            dcosn: (0..ncross).map(|_| MatrixFull::new([3, 3], 0.0)).collect(),
+            dcteta: [
+                MatrixFull::new([ncross, ncross], 0.0),
+                MatrixFull::new([ncross, ncross], 0.0),
+                MatrixFull::new([ncross, ncross], 0.0),
+            ],
+            dsteta: MatrixFull::new([3, ncross], 0.0),
+            // Phase E
+            ncnct: MatrixFull::new([2 * (ncross - 1) + 1, ncross], 0),
+            cosn_ij: (0..ncross).map(|_| MatrixFull::new([3, ncross], 0.0)).collect(),
+            sit: vec![0.0; ncross],
+            work: vec![0.0; 2 * ncross.max(1)],
+            work_buf: vec![0.0; ncross],
+            // gradient (unused)
+            diwork: MatrixFull::new([3, 2 * ncross.max(1)], 0.0),
+            djwork: MatrixFull::new([3, 2 * ncross.max(1)], 0.0),
+            dkwork: MatrixFull::new([3, 2 * ncross.max(1)], 0.0),
+            d0work: MatrixFull::new([3, 2 * ncross.max(1)], 0.0),
+            dw_swap: vec![0.0f64; 3 * ncross.max(1)],
+            dca_slc: MatrixFull::new([3, ncross + 1], 0.0),
+            dca_ply: MatrixFull::new([3, ncross + 1], 0.0),
+            dca_odd: MatrixFull::new([3, ncross + 1], 0.0),
+            dicosn: (0..ncross).map(|_| MatrixFull::new([3 * ncross.max(1), 3], 0.0)).collect(),
+            djcosn: (0..ncross).map(|_| MatrixFull::new([3 * ncross.max(1), 3], 0.0)).collect(),
+            dctetr: vec![0.0; ncross],
+            dstetr: vec![0.0; ncross],
+            dsitr: vec![0.0; ncross],
         }
     }
 }
@@ -742,14 +1865,11 @@ impl DarealWs {
 /// Compute the total CDS energy and gradient.
 ///
 /// Workflow:
-/// 1. Build interatomic distance matrix `rlio` (Å) and unit-vector matrix `urlio`
-/// 2. [`smx_cds`] → effective surface tensions σ_k^eff and their gradients
-/// 3. For each atom k: [`dareal`] → accessible solid angle Ω_k → SASA A_k = Ω_k · R_k²
-/// 4. `E_CDS = Σ_k A_k · (σ_k^eff + cssigm) · 0.001` [kcal/mol]
-/// 5. `∂E/∂X = Σ_j [(σ_j+cssigm)·∂A_j/∂X + A_j·∂σ_j/∂X] · 0.001` [→ Hartree/Bohr]
-///
-/// Internal computation uses Å and kcal/mol. Unit conversion to Hartree/Bohr
-/// is applied at output.
+/// 1. Build interatomic distance matrix `rlio` (Å) and unit-vector matrices `urlio[3]`
+/// 2. [`smx_cds`] → effective surface tensions σ_k^eff and gradients `dsts[3]`
+/// 3. For each atom k: [`dareal`] → Ω_k → A_k = Ω_k·R_k²
+/// 4. `E_CDS = Σ_k A_k·(σ_k+cssigm)·0.001` [kcal/mol]
+/// 5. `∂E/∂X = Σ_j[(σ_j+cssigm)·∂A_j/∂X + A_j·∂σ_j/∂X]·0.001` → Hartree/Bohr
 ///
 /// # Returns
 /// - `cdst_kcal`: total CDS energy (kcal/mol)
@@ -765,27 +1885,25 @@ fn cds_eg(
 
     // ---- Build rlio (pairwise distances, Å) and urlio (unit vectors) ----
     let ncot = nat * (nat + 1) / 2;
-    let mut rlio = vec![0.0f64; ncot];            // |X_i − X_j|, upper-triangular
-    let mut urlio = vec![0.0f64; 3 * nat * nat];  // û_{j→i}, layout [dir + 3*(i + nat*j)]
+    let mut rlio = vec![0.0f64; ncot];
+    let mut urlio = [
+        MatrixFull::new([nat, nat], 0.0),   // û_{j→i} x-component
+        MatrixFull::new([nat, nat], 0.0),   // y-component
+        MatrixFull::new([nat, nat], 0.0),   // z-component
+    ];
 
     for i in 0..nat {
         for j in 0..=i {
             let idx = ij0(i, j);
-            if i == j {
-                rlio[idx] = 0.0;
-                continue;
-            }
+            if i == j { rlio[idx] = 0.0; continue; }
             let dx = (coords[i][0] - coords[j][0]) * TO_ANGS;
             let dy = (coords[i][1] - coords[j][1]) * TO_ANGS;
             let dz = (coords[i][2] - coords[j][2]) * TO_ANGS;
             let r = (dx * dx + dy * dy + dz * dz).sqrt();
             rlio[idx] = r;
-            urlio[0 + 3 * (i + nat * j)] = -dx / r;
-            urlio[1 + 3 * (i + nat * j)] = -dy / r;
-            urlio[2 + 3 * (i + nat * j)] = -dz / r;
-            urlio[0 + 3 * (j + nat * i)] = dx / r;
-            urlio[1 + 3 * (j + nat * i)] = dy / r;
-            urlio[2 + 3 * (j + nat * i)] = dz / r;
+            // û_{j→i} = (X_i−X_j)/r,  û_{i→j} = −û_{j→i}
+            urlio[0][[i, j]] = -dx / r; urlio[1][[i, j]] = -dy / r; urlio[2][[i, j]] = -dz / r;
+            urlio[0][[j, i]] =  dx / r; urlio[1][[j, i]] =  dy / r; urlio[2][[j, i]] =  dz / r;
         }
     }
 
@@ -797,7 +1915,11 @@ fn cds_eg(
     let mut tarea = 0.0f64;
     let mut area_atom = vec![0.0f64; nat];            // A_k (Å²)
     let mut cd_sa = vec![0.0f64; nat];                 // per-atom CDS (kcal/mol)
-    let mut datar = vec![0.0f64; 3 * nat * nat];       // ∂A_k/∂X_{iat,dir}
+    let mut datar = [
+        MatrixFull::new([nat, nat], 0.0),              // ∂A/∂X_x
+        MatrixFull::new([nat, nat], 0.0),              // ∂A/∂X_y
+        MatrixFull::new([nat, nat], 0.0),              // ∂A/∂X_z
+    ];
 
     for k in 0..nat {
         let (area0, ncross, nc, darea) = dareal(nat, k, rad, &rlio, &urlio);
@@ -807,30 +1929,144 @@ fn cds_eg(
         tarea += area_atom[k];
         cd_sa[k] = area_atom[k] * (sts[k] + cssigm) * 0.001;
 
-        // Propagate darea (∂Ω/∂X) → datar (∂A/∂X): ∂A/∂X = R_k² · ∂Ω/∂X
-        for l in 0..=ncross {
-            let j = if l == 0 { k } else { nc[l] };
+        // ---- Debug: darea per-atom ----
+        if cds_debug_enabled() && ncross > 0 {
+            println!("CDS_DEBUG| darea k={} ncross={} (∂Ω/∂X, sr⁻¹/Bohr) [len={}]",
+                k, ncross, darea.len());
+            for l in 0..=ncross {
+                let j = if l == 0 { k } else { nc[l] };
+                println!("CDS_DEBUG|   darea[l={}→atom={}] = {:.12e} {:.12e} {:.12e}",
+                    l, j,
+                    darea[3 * l], darea[3 * l + 1], darea[3 * l + 2]);
+            }
+        }
+
+        // ∂A/∂X = R_k² · ∂Ω/∂X — accumulated into datar matrix
+        // darea[l] is ∂Ω/∂X_{center} for l=0, ∂Ω/∂X_{neighbor_l} for l>0
+        let expected_len = 3 * (ncross + 1);
+        if ncross > 0 && darea.len() >= expected_len {
+            for l in 0..=ncross {
+                let j = if l == 0 { k } else { nc[l] };
+                // Guard against malformed nc entries
+                if j >= nat {
+                    if cds_debug_enabled() {
+                        eprintln!("CDS_DEBUG| WARNING: dareal returned bad nc[{}]={} (nat={}), skipping",
+                            l, j, nat);
+                    }
+                    continue;
+                }
+                for dir in 0..3 {
+                    datar[dir][[j, k]] += darea[dir + 3 * l] * ras2;
+                }
+            }
+        } else if ncross > 0 {
+            // darea/ncross mismatch — indicates a bug in dareal return path
+            if cds_debug_enabled() {
+                eprintln!("CDS_DEBUG| WARNING: dareal k={} ncross={} but darea.len={} (expected {}), skipping gradient accumulation",
+                    k, ncross, darea.len(), expected_len);
+            }
+        }
+    }
+
+    // ---- Debug: datar matrix (∂A/∂X per atom pair) ----
+    if cds_debug_enabled() {
+        println!("CDS_DEBUG| datar[dir][iat,j] — ∂A_j/∂X_{{iat,dir}} (Å²/Bohr):");
+        for dir in 0..3 {
+            let ax = ["x", "y", "z"][dir];
+            for iat in 0..nat {
+                for j in 0..nat {
+                    let v = datar[dir][[iat, j]];
+                    if v.abs() > 1e-16 {
+                        println!("CDS_DEBUG|   datar[{iat},{j}].{ax} = {:.12e}", v);
+                    }
+                }
+            }
+        }
+        // Debug: dsts matrix (∂σ/∂X from smx_cds)
+        let has_dsts = (0..3usize).any(|dir|
+            (0..nat).any(|iat| (0..nat).any(|j| dsts[dir][[iat, j]].abs() > 1e-20))
+        );
+        if has_dsts {
+            println!("CDS_DEBUG| dsts[dir][iat,j] — ∂σ_j/∂X_{{iat,dir}} (cal/mol/Å²/Å):");
             for dir in 0..3 {
-                datar[dir + 3 * (j + nat * k)] += darea[dir + 3 * l] * ras2;
+                let ax = ["x", "y", "z"][dir];
+                for iat in 0..nat {
+                    for j in 0..nat {
+                        let v = dsts[dir][[iat, j]];
+                        if v.abs() > 1e-20 {
+                            println!("CDS_DEBUG|   dsts[{iat},{j}].{ax} = {:.12e}", v);
+                        }
+                    }
+                }
+            }
+        } else {
+            println!("CDS_DEBUG| dsts — all zero (no sigma gradient contribution)");
+        }
+        // Debug: per-atom contribution breakdown to dcds
+        println!("CDS_DEBUG| Gradient contribution breakdown (kcal/mol/Å → Hartree/Bohr):");
+        for iat in 0..nat {
+            for dir in 0..3 {
+                let ax = ["x", "y", "z"][dir];
+                let mut sasa_term = 0.0f64;   // Σ_j σ_j · ∂A_j/∂X_iat
+                let mut sig_term = 0.0f64;    // Σ_j A_j · ∂σ_j/∂X_iat
+                for j in 0..nat {
+                    sasa_term += (sts[j] + cssigm) * datar[dir][[iat, j]] * 0.001;
+                    sig_term += dsts[dir][[iat, j]] * area_atom[j] * 0.001;
+                }
+                let total_kcal_a = sasa_term + sig_term;
+                let total_h_b = total_kcal_a / TO_KCAL * TO_ANGS;
+                if total_kcal_a.abs() > 1e-20 {
+                    println!("CDS_DEBUG|   dcds[{iat}].{ax}: sasa={:.6e} sigma={:.6e} sum(kcal/mol/Å)={:.6e} → {:.6e} Hartree/Bohr",
+                        sasa_term, sig_term, total_kcal_a, total_h_b);
+                }
             }
         }
     }
 
     // ---- CDS gradient ----
     // ∂E/∂X_{iat} = Σ_j [(σ_j+cssigm)·∂A_j/∂X_{iat} + A_j·∂σ_j/∂X_{iat}] · 0.001
-    // Term 1: surface tension × area derivative
-    // Term 2: area × surface tension derivative
-    // Final conversion: kcal/(mol·Å) → Hartree/Bohr via /TO_KCAL * TO_ANGS
+    // kcal/(mol·Å) → Hartree/Bohr via /TO_KCAL * TO_ANGS
     let mut dcds = vec![[0.0f64; 3]; nat];
     for iat in 0..nat {
         for dir in 0..3 {
             let mut dcds_dir = 0.0f64;
             for j in 0..nat {
-                dcds_dir += (sts[j] + cssigm) * datar[dir + 3 * (iat + nat * j)] * 0.001;
-                dcds_dir += dsts[dir + 3 * (iat + nat * j)] * area_atom[j] * 0.001;
+                dcds_dir += (sts[j] + cssigm) * datar[dir][[iat, j]] * 0.001;
+                dcds_dir += dsts[dir][[iat, j]] * area_atom[j] * 0.001;
             }
             dcds[iat][dir] = dcds_dir / TO_KCAL * TO_ANGS;
         }
+    }
+
+    // ---- Debug output ----
+    if cds_debug_enabled() {
+        println!("CDS_DEBUG| ====== cds_eg intermediates ======");
+        cds_print_scalar("cssigm", cssigm);
+        println!("CDS_DEBUG| nat = {}", nat);
+        // Effective radii (Å)
+        for k in 0..nat {
+            println!("CDS_DEBUG| rad[{}] = {:.12e} (Z={})", k, rad[k], atomic_numbers[k]);
+        }
+        // Distance matrix rlio (Å) — upper triangular
+        println!("CDS_DEBUG| rlio distances (Ang):");
+        for i in 0..nat {
+            for j in 0..=i {
+                if i != j { println!("CDS_DEBUG|   r[{}][{}] = {:.12e}", i, j, rlio[ij0(i, j)]); }
+            }
+        }
+        cds_print_vec("sts (effective sigma_k, cal/mol/A^2)", &sts);
+        cds_print_vec("area_atom (SASA per atom, A^2)", &area_atom);
+        cds_print_vec("cd_sa (per-atom CDS, kcal/mol)", &cd_sa);
+        // Compact per-atom line: Z sigma area → cd_sa
+        print!("CDS_DEBUG| per-atom: ");
+        for k in 0..nat {
+            print!(" [{}]Z={} σ={:.2e} A={:.4}→{:.4}",
+                k, atomic_numbers[k], sts[k], area_atom[k], cd_sa[k]);
+        }
+        println!();
+        cds_print_scalar("cdst_kcal (total CDS, kcal/mol)", cdst_kcal);
+        cds_print_scalar("tarea (total SASA, A^2)", tarea);
+        cds_print_grad("dcds (Hartree/Bohr)", &dcds);
     }
 
     (cdst_kcal, tarea, dcds)
@@ -841,8 +2077,6 @@ fn cds_eg(
 // ============================================================================
 
 /// Compute the SMD CDS (Cavitation-Dispersion-Solvent structure) energy and gradient.
-///
-/// This is the main entry point for CDS calculations.
 ///
 /// # Arguments
 /// - `atomic_numbers`: atomic numbers Z ∈ [1, 102]
@@ -886,6 +2120,24 @@ pub fn compute_cds(
     let (gcds_kcal, tarea, dcds) = cds_eg(
         cssigm, nat, coords, atomic_numbers, &sigma, &hsigma, &rad,
     );
+
+    // ---- Debug output ----
+    if cds_debug_enabled() {
+        println!("CDS_DEBUG| ====== compute_cds ======");
+        cds_print_scalar("icds", icds as f64);
+        cds_print_sigma151("sigma", &sigma);
+        cds_print_sigma151("hsigma", &hsigma);
+        cds_print_scalar("cssigm", cssigm);
+        cds_print_vec("effective_radii (Bondi+0.4, Ang)", &rad);
+        // solvent descriptors
+        println!("CDS_DEBUG| solvent_descriptors = {:?}", solvent_descriptors);
+        // Final outputs
+        cds_print_scalar("gcds_kcal (CDS energy, kcal/mol)", gcds_kcal);
+        cds_print_scalar("tarea (total SASA, A^2)", tarea);
+        cds_print_grad("dcds (CDS gradient, Hartree/Bohr)", &dcds);
+        const TO_KCAL: f64 = 627.509451;
+        cds_print_scalar("gcds_hartree (CDS energy, Hartree)", gcds_kcal / TO_KCAL);
+    }
 
     // kcal/mol → Hartree (gradient already in Hartree/Bohr from cds_eg)
     const TO_KCAL: f64 = 627.509451;

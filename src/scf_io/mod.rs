@@ -2519,6 +2519,12 @@ impl SCF {
             if let Some(solvent_scf) = self.solvent_scf.as_ref() {
                 self.scf_energy += solvent_scf.eng_nuc;
             }
+            // SMD: add CDS energy from PcmStatic (geometry-dependent, computed once)
+            if let Some(ref pstatic) = self.solvent_static_obj.as_ref().map(|s| &s.pstatic) {
+                if let Some(e_cds) = pstatic.e_cds {
+                    self.scf_energy += e_cds;
+                }
+            }
         }
         if self.mol.ctrl.print_level>1 {
             println!("Exc: {:16.8}, Vxc: {:16.8}", exc_total, vxc_total)
@@ -5947,9 +5953,9 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         if scf_data.mol.ctrl.solvent_enabled {
             if let Some(solvent_static) = scf_data.solvent_static_obj.as_ref() {
                 let s_static = PcmScf::get_pcm_refresh(
-                    &solvent_static.surface, 
-                    &scf_data.mol, 
-                    &scf_data.density_matrix, 
+                    &solvent_static.surface,
+                    &scf_data.mol,
+                    &scf_data.density_matrix,
                     &solvent_static.pstatic.K,
                     &solvent_static.pstatic.K_ipiv,
                     &solvent_static.pstatic.R,
@@ -5959,7 +5965,9 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
                     &scf_data.mol.ctrl.solv_chunk,
                     scf_data.mol.ctrl.solvent_ri
                 );
-                scf_data.energies.insert(String::from("solvent_energy"), vec![s_static.eng]);
+                // SMD: CDS energy from PcmStatic (computed once in solvent_prepare)
+                let e_cds = solvent_static.pstatic.e_cds.unwrap_or(0.0);
+                scf_data.energies.insert(String::from("solvent_energy"), vec![s_static.eng + e_cds]);
                 scf_data.solvent_scf = Some(s_static);
             }
         }

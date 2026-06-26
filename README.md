@@ -335,13 +335,6 @@ fp_mode = "FP64"
 - `fp_mode`: 取值 String (`"FP32"`, `"FP64"`)。设置 RI-PT2 计算中使用的浮点精度。缺省为 `"FP32"`。对于数值梯度计算，建议设置为 `"FP64"` 以获得更高的数值稳定性。
 - `mpi_mode`: 取值 usize。设置 RI-PT2 计算中使用的 MPI 模式。缺省为 0，即不使用 MPI。
 
-## 溶剂化计算相关设置
-- `solvent_model`: 取值String, 用于指定用于计算的溶剂模型。目前支持CPCM, COSMO, IEFPCM, SS(V)PE。缺省为CPCM。溶剂化梯度计算目前只支持CPCM, COSMO。
-- `solvent_enabled`: 取值bool，设置为true则启用溶剂化计算。如果没有`solvent_enabled`字段但有`solvent_model`的设置且内容非空的时候，同样启用溶剂化计算。其他情况缺省为false。
-- `solv_epsilon`: 取值f64, 为溶质的介电常数。缺省为1.0 (真空)。介电常数表可以参考 http://sobereva.com/g09/k_scrf.htm 的最后。
-- `solvent_ri`: 取值bool, 设置为true为溶剂化能计算开启辅助基，设置为false溶剂化计算不开启辅助基。缺省为true。目前溶剂化梯度(job_type = "opt"/"force")计算没有用辅助基。
-- `pcm_cavity_radii`: 取值String, 用于指定空腔的半径使用类型。目前支持Bondi, UFF。缺省为UFF。
-
 ## RRS-PBC计算相关设置
 RRS-PBC方法是由张颖教授等提出的一种基于分子团簇计算结果的周期性电子结构模拟方法，相关论文见 Zhang, I.Y., Jiang, J., Gao, B. *et al.* RRS-PBC: a molecular approach for periodic systems. [*Sci. China Chem.* **57**, 1399–1404 (2014)](https://doi.org/10.1007/s11426-014-5183-y)。在 REST 中，RRS-PBC 相关的设置主要在 `[geom]` 区块中进行，请参考后续的说明。`[ctrl]`区块中的相关关键词包括：
 - `pbc_eigenval`: 取值String，用于指定存储k点和能级信息的文件路径。如果设置为`"none"`或`"None"`则直接打印到标准输出。缺省为`"none"`。
@@ -360,6 +353,14 @@ GW-BSE 方法相关的设置在 `[quasiparticle_methods]` 区块中进行。关�
 - `bse_spin`: 取值String，需要进行BSE计算时必须设置此项，指定计算何种自旋的激发，可以设置为”singlet”或”triplet”
 - `bse_cutoff_energy`: 取值f64，单位为Hatree，进行BSE计算时DFT能级高于此能量的轨道的准粒子能量将不参与BSE kernel的构建，用于削减构建的BSE kernel的维数，减少对角化计算时间，缺省为1.5
 - `bse_tda`: 取值bool，设置为true则使用TDA近似，即BSE kernel只保留左上部分的子矩阵。缺省为false
+## 溶剂化计算相关设置
+- `solvent_model`: 取值String, 用于指定用于计算的溶剂模型。目前支持CPCM, COSMO, IEFPCM, SS(V)PE,SMD。缺省为CPCM。SMD及其梯度为实验性功能。
+- `solvent`: 取值String。支持溶剂见用户手册。进行CPCM, COSMO, IEFPCM, SS(V)PE计算请设置此项(推荐)或`solv_epsilon`(进阶, 自定义用)。使用SMD进行计算请设置此项(推荐)或`solvent_descriptors`(进阶, 自定义用)。
+- `solv_epsilon`: 取值f64, 为溶质的介电常数。缺省为1.0 (真空)。介电常数表可以参考用户手册或 <http://sobereva.com/g09/k_scrf.htm> 的最后。
+- `solvent_descriptors`: 取值[f64, 8]。各项含义见<https://comp.chem.umn.edu/solvation/mnsddb.pdf>。第二项25度折射率为非必须项，可以设为-1.0。
+- `solvent_ri`: 取值bool, 设置为true为溶剂化能计算开启辅助基，设置为false溶剂化计算不开启辅助基。缺省为true。目前溶剂化梯度(job_type = "opt"/"force")计算没有用辅助基。
+- `pcm_cavity_radii`: 取值String, 用于指定空腔的半径使用类型。目前支持Bondi, UFF。缺省为UFF。当方法为SMD时将使用特定半径设置，此项不生效。
+- `solvent_enabled`: 取值bool，设置为true则启用溶剂化计算。如果没有`solvent_enabled`字段但有`solvent_model`/`solvent`/`solvent_descriptors`的设置且内容非空的时候，同样启用溶剂化计算。其他情况缺省为false。
 
 ## 相对论方法计算相关设置
 - `rel`: 取值String, 指定用于计算的相对论方法。目前支持`"sfx2c"`，即 spin-free X2C 方法，缺省为 None （不启用相对论方法进行计算）。
@@ -477,7 +478,6 @@ GW-BSE 方法相关的设置在 `[quasiparticle_methods]` 区块中进行。关�
 - `k_points`: 取值为Vec<usize>。每个周期性维度下的k点数量。缺省为空
   
   - **注意**：k点的选取方法为在倒格矢和倒格矢的反向之间均匀分布，并包含两侧边界。为了确保均匀分布的k点能够覆盖高对称点，推荐将数量设置的大一些
-
 
 
 # Detailed descrption of [geometric_pyo3] block in the control file
