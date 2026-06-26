@@ -6,6 +6,7 @@ use regex::Regex;
 use crate::constants::{SPECIES_INFO};
 use crate::external_libs::py2fch;
 use crate::scf_io::SCF;
+use crate::scf_io::SCFType;
 
 
 macro_rules! dump_real_r2f {
@@ -292,6 +293,7 @@ impl SCF {
                 write!(input, "Beta Orbital Energies                      R   N={:12}\n", self.eigenvalues[i_spin].len());
             }
             dump_real_r2f!(input, self.eigenvalues[i_spin]);
+            if let SCFType::ROHF = self.scftype { break } // ROHF: alpha == beta
         }
         // ==============================
         // Now for orbital coefficients
@@ -304,6 +306,7 @@ impl SCF {
             } else {
                 write!(input, "Beta MO coefficients                       R   N={:12}\n", self.eigenvectors[i_spin].data.len());
             }
+            if let SCFType::ROHF = self.scftype { break } // ROHF: alpha == beta
         }
         // leave MOs blank, it will be written by librest2fch
         let n_dm = nbf*(nbf+1)/2;
@@ -332,6 +335,7 @@ impl SCF {
             } else {
                 py2fch(format!("{}.fchk", self.mol.geom.name), nbf, nif, &self.eigenvectors[i_spin].data, 'b', &self.eigenvalues[i_spin], 0, 0);
             }
+            if let SCFType::ROHF = self.scftype { break } // ROHF: alpha == beta
         }
     }
 
