@@ -370,7 +370,11 @@ pub fn import_guess_from_hdf5chkfile(chkname: &str, spin_channel: usize, print_l
     let buf02 = scf.dataset("mo_energy").unwrap().read_raw::<f64>().unwrap();
     // importing MO occupation
     // let is_exist = scf.member_names().unwrap().iter().fold(false, |is_exist, x| x.eq("mo_occupation"));
-    let buf03 = Some(scf.dataset("mo_occupation").unwrap().read_raw::<f64>().unwrap());
+    let buf03 = if scf.dataset("mo_occ").is_ok() {
+        Some(scf.dataset("mo_occ").unwrap().read_raw::<f64>().unwrap())
+    } else {
+        None
+    };
     (buf01, buf02, buf03)
 }
 

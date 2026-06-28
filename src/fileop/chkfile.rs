@@ -252,17 +252,19 @@ pub fn load_cint_data(chkfile: &String) -> (Option<(Vec<Vec<i32>>, Vec<Vec<i32>>
         None
     };
     // let bs = file.dataset("molecule/basis4elem").ok();
-    let basis4elem: Option<Vec<Basis4Elem>> = if let Some(basis4elem_value) = file.dataset("molecule/basis4elem").unwrap().read_scalar::<VarLenUnicode>().ok() {
-        Some(serde_json::from_str(basis4elem_value.as_str()).unwrap())
-    } else {
-        None
-    };
+    let mut basis4elem: Option<Vec<Basis4Elem>> = None;
+    if let Ok(ds) = file.dataset("molecule/basis4elem") {
+        if let Some(basis4elem_value) = ds.read_scalar::<VarLenUnicode>().ok() {
+            basis4elem = Some(serde_json::from_str(basis4elem_value.as_str()).unwrap());
+        }
+    }
 
-    let cinttype: Option<CintType> = if let Some(cinttype_value) = file.dataset("molecule/cinttype").unwrap().read_scalar::<VarLenUnicode>().ok() {
-        Some(cinttype_value.as_str().into())
-    } else {
-        None
-    };
+    let mut cinttype: Option<CintType> = None;
+    if let Ok(ds) = file.dataset("molecule/cinttype") {
+        if let Some(cinttype_value) = ds.read_scalar::<VarLenUnicode>().ok() {
+            cinttype = Some(cinttype_value.as_str().into());
+        }
+    }
 
     (Some((atm, bas, env)), ecpbas, basis4elem, cinttype)
 }
@@ -273,14 +275,16 @@ pub fn load_basic(chkfile: &String) -> Option<(usize, usize, usize, Option<f64>,
     let mut num_basis = None;
     let mut num_states = None;
     let mut spin_channel = None;
-    if let Ok(nb) = scf.dataset("num_basis").unwrap().read_raw::<usize>() {
-        num_basis = Some(nb[0]);
+    let mut spin = None;
+    let mut charge = None;
+    if let Ok(nb) = scf.dataset("num_basis") {
+        num_basis = Some(nb.read_raw::<usize>().unwrap()[0]);
     }
-    if let Ok(nmo) = scf.dataset("num_states").unwrap().read_raw::<usize>() {
-        num_states = Some(nmo[0]);
+    if let Ok(nmo) = scf.dataset("num_states") {
+        num_states = Some(nmo.read_raw::<usize>().unwrap()[0]);
     }
-    if let Ok(s) = scf.dataset("spin_channel").unwrap().read_raw::<usize>() {
-        spin_channel = Some(s[0]);
+    if let Ok(s) = scf.dataset("spin_channel") {
+        spin_channel = Some(s.read_raw::<usize>().unwrap()[0]);
     }
     if num_basis.is_none() || num_states.is_none() || spin_channel.is_none() {
         let mo_coeff_data = scf.dataset("mo_coeff").unwrap();
@@ -302,12 +306,18 @@ pub fn load_basic(chkfile: &String) -> Option<(usize, usize, usize, Option<f64>,
         }
     }
 
-    let spin = scf.dataset("spin").ok()
-        .and_then(|ds| ds.read_raw::<f64>().ok())
-        .map(|v| v[0]);
-    let charge = scf.dataset("charge").ok()
-        .and_then(|ds| ds.read_raw::<f64>().ok())
-        .map(|v| v[0]);
+    // let spin = scf.dataset("spin").ok()
+    //     .and_then(|ds| ds.read_raw::<f64>().ok())
+    //     .map(|v| v[0]);
+    // let charge = scf.dataset("charge").ok()
+    //     .and_then(|ds| ds.read_raw::<f64>().ok())
+    //     .map(|v| v[0]);
+    if let Ok(s) = scf.dataset("spin") {
+        spin = Some(s.read_raw::<f64>().unwrap()[0]);
+    }
+    if let Ok(c) = scf.dataset("charge") {
+        charge = Some(c.read_raw::<f64>().unwrap()[0]);
+    }
 
     if num_basis.is_some() && num_states.is_some() && spin_channel.is_some() {
         Some((num_basis.unwrap(), num_states.unwrap(), spin_channel.unwrap(), spin, charge))
