@@ -418,9 +418,12 @@ pub fn initial_guess_from_raw(
             println!("eigenval {:?}", &tmp_eigenvalues[i]);
         });
     }            
-    (0..spin_channel).into_iter().for_each(|i_spin| {
+    // occupation may span more channels than spin_channel suggests
+    // (e.g. ROHF chkfile stores both alpha+beta occupation, but spin_channel=1 for eigenvectors)
+    let occ_channels = loaded_occupation.len() / num_state;
+    (0..occ_channels).into_iter().for_each(|i_spin| {
                 tmp_occupation[i_spin]=loaded_occupation[ (0+i_spin)*num_state..(1+i_spin)*num_state].to_vec();
-            });        
+            });
             // println!("tmp_eigenvectors {:?}, tmp_eigenvalues {:?}, tmp_occupation {:?}", &tmp_eigenvectors, &tmp_eigenvalues, &tmp_occupation);
         },
         "r2u" => {
