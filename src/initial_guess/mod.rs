@@ -420,6 +420,11 @@ pub fn initial_guess_from_raw(
     }            
     // occupation may span more channels than spin_channel suggests
     // (e.g. ROHF chkfile stores both alpha+beta occupation, but spin_channel=1 for eigenvectors)
+    assert!(
+        loaded_occupation.len() == num_state || loaded_occupation.len() == 2 * num_state,
+        "Unexpected occupation size in chkfile: {} (expected {} or {} for num_state={})",
+        loaded_occupation.len(), num_state, 2 * num_state, num_state
+    );
     let occ_channels = loaded_occupation.len() / num_state;
     (0..occ_channels).into_iter().for_each(|i_spin| {
                 tmp_occupation[i_spin]=loaded_occupation[ (0+i_spin)*num_state..(1+i_spin)*num_state].to_vec();
