@@ -140,8 +140,9 @@ pub fn save_hamiltonian(scf_data: &SCF) {
     };
     let mut hamiltonians: Vec<f64> = vec![];
     for i_spin in 0..scf_data.mol.spin_channel {
-        // let tmp_eigenvectors = scf_data.hamiltonian[i_spin].to_matrixfull().unwrap();
-        hamiltonians.extend(scf_data.eigenvalues[i_spin].iter());
+        let tmp_eigenvectors = scf_data.hamiltonian[i_spin].to_matrixfull().unwrap();
+        hamiltonians.extend(tmp_eigenvectors.data);
+        // hamiltonians.extend(scf_data.eigenvalues[i_spin].iter());
     }
     let is_hamiltonian = scf.member_names().unwrap().iter().fold(false,|is_exist,x| {is_exist || x.eq("hamiltonian")});
     if is_hamiltonian {
