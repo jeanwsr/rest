@@ -5,8 +5,7 @@ pub mod traits;
 pub mod xc_hessian;
 pub use ej_ek_baseline::{EjEkBaseline, BASELINE_TERM_KEYS};
 pub use rhf::{
-    test_cphf_hessian, test_ck7_h1ao, test_ck8_aux_response,
-    compute_hessian, compute_frequencies,
+    compute_hessian, compute_frequencies, compute_frequencies_from_hessian,
     rhf_hessian_main,
 };
 
