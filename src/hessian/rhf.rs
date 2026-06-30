@@ -3544,20 +3544,13 @@ impl RIRHFHessian<'_> {
         let s1_zero = vec![0.0; nmo * nocc];
 
         // ── Step 1: Solve CP-HF per atom, per direction ──
-        use crate::dft::response::{reset_fxc_timing, read_fxc_timing_s, read_fxc_subtimings_s,
-            prepare_fxc_hessian_cache, compute_fxc_response_ao_cached, FxcHessianCache};
-        reset_fxc_timing();
-        // Build the fxc kernel cache ONCE for the entire CP-HF phase (PySCF
-        // `cache_xc_kernel` analog). This amortises AO/ρ₀/libxc-fxc evaluation
-        // across all Krylov matvecs (~100s for H₂O, ~1000s for larger systems).
-        // `is_dft` decides whether to populate the cache; HF passes None.
-        let is_hf_for_cache = scf.mol.xc_data.dfa_compnt_scf.is_empty();
+        // RKS fxc cache preparation is extracted to rks.rs. Note:
+        // `fxc_cache_ref` is threaded through the SHARED Krylov/dense solve
+        // calls below (HF passes None); that threading stays here because
+        // extracting it would mean restructuring the entire solve phase.
         let _t_cache = std::time::Instant::now();
-        let fxc_cache: Option<FxcHessianCache> = if is_hf_for_cache {
-            None
-        } else {
-            Some(prepare_fxc_hessian_cache(scf))
-        };
+        let fxc_cache: Option<crate::dft::response::FxcHessianCache> =
+            crate::hessian::rks::prepare_fxc_cache(scf);
         let fxc_cache_ref = fxc_cache.as_ref();
         let _t_cache_elapsed = _t_cache.elapsed();
         let _t_solve = std::time::Instant::now();
@@ -3703,22 +3696,17 @@ impl RIRHFHessian<'_> {
             }
         }
 
-        self.timings.push(("  cphf: fxc_cache", _t_cache_elapsed));
+        // RKS fxc solve-phase timings extracted to rks.rs. Note: the fxc timing
+        // counter must be read BEFORE the mo_e1 phase resets it, so this call
+        // happens immediately after the solve phase ends.
+        crate::hessian::rks::record_fxc_solve_timings(&mut self.timings, _t_cache_elapsed);
         self.timings.push(("  cphf: solve", _t_solve.elapsed()));
-        let fxc_solve_ns = (read_fxc_timing_s() * 1e9) as u64;
-        self.timings.push(("  cphf: fxc_solve", std::time::Duration::from_nanos(fxc_solve_ns)));
-        // Detailed fxc sub-component breakdown (matches PySCF's nr_rks_fxc internals).
-        for (name, secs) in read_fxc_subtimings_s() {
-            if secs > 0.0 {
-                let label: &'static str = Box::leak(
-                    format!("    {}", name).into_boxed_str());
-                self.timings.push((label, std::time::Duration::from_secs_f64(secs)));
-            }
-        }
 
         // Also compute mo_e1 (first-order orbital energy correction) for each atom/direction
         // mo_e1 = (h1 - s1*e_i + fvind(mo1))_oo + mo1_oo*(e_i - e_i)
-        reset_fxc_timing();
+        // Reset the fxc timing counter before the mo_e1 phase so the fxc work
+        // done inside this loop (via add_fxc_to_v_ao) is attributed to fxc_moe1.
+        crate::dft::response::reset_fxc_timing();
         let _t_mo_e1 = std::time::Instant::now();
         let mut mo_e1_all: Vec<Vec<Vec<f64>>> = vec![vec![vec![]; 3]; natm];
         {
@@ -3767,12 +3755,10 @@ impl RIRHFHessian<'_> {
                     // Add fxc response for RKS (matches PySCF `gen_rks_response`
                     // with `singlet=None`: vind(dm1) = J - 0.5*hyb*K + nr_rks_fxc(dm1)).
                     // Uses the precomputed `FxcHessianCache` — no AO/ρ₀/libxc
-                    // re-evaluation here.
+                    // re-evaluation here. The in-place addition is extracted to
+                    // rks.rs (writes into the loop-local v_ao buffer, zero alloc).
                     if let Some(cache) = fxc_cache_ref {
-                        let fxc_ao = compute_fxc_response_ao_cached(cache, &dm1);
-                        for p in 0..nao { for q in 0..nao {
-                            v_ao[[p, q]] += fxc_ao[[p, q]];
-                        }}
+                        crate::hessian::rks::add_fxc_to_v_ao(cache, &dm1, &mut v_ao);
                     }
 
                     // Project to OO: C_occ^T @ v_ao @ C_occ
@@ -3798,8 +3784,8 @@ impl RIRHFHessian<'_> {
         }
 
         self.timings.push(("  cphf: mo_e1", _t_mo_e1.elapsed()));
-        let fxc_moe1_ns = (read_fxc_timing_s() * 1e9) as u64;
-        self.timings.push(("  cphf: fxc_moe1", std::time::Duration::from_nanos(fxc_moe1_ns)));
+        // RKS fxc mo_e1-phase timing extracted to rks.rs.
+        crate::hessian::rks::record_fxc_moe1_timings(&mut self.timings);
 
         // ── Step 2: Contract mo1[ja] with h1ao[ia] → CP-HF contribution ──
         let _t_contract = std::time::Instant::now();
