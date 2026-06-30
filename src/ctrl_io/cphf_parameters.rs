@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 pub struct CPHFParameters {
     /// Solver type: "krylov" or "dense" (default "krylov")
     pub solver: String,
+    /// Calculation task: "response", "hessian", "ck7", "ck8", "cphf_hess"
+    #[serde(default = "default_calculation")]
+    pub calculation: String,
     /// Krylov solver maximum iterations (default 50)
     pub krylov_max_cycle: usize,
     /// Krylov convergence tolerance (default 1e-12)
@@ -12,10 +15,13 @@ pub struct CPHFParameters {
     pub verbose: usize,
 }
 
+fn default_calculation() -> String { String::from("response") }
+
 impl Default for CPHFParameters {
     fn default() -> Self {
         CPHFParameters {
             solver: String::from("krylov"),
+            calculation: String::from("response"),
             krylov_max_cycle: 50,
             krylov_tol: 1.0e-12,
             verbose: 1,
@@ -30,6 +36,10 @@ pub fn parse_cphf_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Optio
             p.solver = match tmp_ctrl.get("solver").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.to_lowercase(),
                 _ => String::from("krylov"),
+            };
+            p.calculation = match tmp_ctrl.get("calculation").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase(),
+                _ => String::from("response"),
             };
             p.krylov_max_cycle = match tmp_ctrl.get("krylov_max_cycle").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(50) as usize,
