@@ -86,7 +86,9 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
     // generate the VSAP initial guess
     } else if scf_data.mol.ctrl.initial_guess.eq(&"vsap") {
         let init_fock = initial_guess_from_vsap(&scf_data.mol,&scf_data.grids);
-        if scf_data.mol.spin_channel==1 {
+        if let SCFType::ROHF = scf_data.scftype {
+            scf_data.roothaan_hamiltonian = Some(init_fock);
+        } else if scf_data.mol.spin_channel==1 {
             scf_data.hamiltonian = [init_fock,MatrixUpper::new(1,0.0)];
         } else {
             let init_fock_beta = init_fock.clone();
