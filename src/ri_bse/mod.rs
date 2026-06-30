@@ -18,7 +18,7 @@ use std::{f64, fs::File, io::Write};
 pub mod dipoles;
 pub mod davidson_solver;
 pub mod matvec;
-pub mod damped;
+pub mod response;
 pub mod feast_solver;
 pub mod nonlinbse_matvec;
 pub mod nonlinbse;
@@ -388,7 +388,7 @@ pub fn construct_full_bse_hamitonian(scf_data:&SCF,xlet:char,inverse_dielectric:
     }
     hamiltonian
 }
-pub fn construct_damped_full_bse_hamitonian(scf_data:&SCF,xlet:char,inverse_dielectric:&MatrixFull<f64>,quasiparticle_energies:&Vec<f64>)->MatrixFull<f64>{
+pub fn construct_response_full_bse_hamitonian(scf_data:&SCF,xlet:char,inverse_dielectric:&MatrixFull<f64>,quasiparticle_energies:&Vec<f64>)->MatrixFull<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let mut hamiltonian:MatrixFull<f64>=MatrixFull::new([2*occ_size*vir_size,2*occ_size*vir_size],0.0);
     let a:MatrixFull<f64>=construct_submat_a(scf_data,inverse_dielectric,quasiparticle_energies, xlet);
