@@ -4284,8 +4284,10 @@ pub fn compute_hessian(scf: &SCF) -> Result<MatrixFull<f64>, String> {
 ///     Imaginary frequencies reported as negative.
 ///   - normal_modes: [natm*3, natm*3] column-major, each column is a
 ///     mass-weighted Cartesian displacement vector (3*atom + xyz).
-pub fn compute_frequencies(scf: &SCF) -> Result<(Vec<f64>, MatrixFull<f64>), String> {
-    let hess_total = compute_hessian(scf)?;
+pub fn compute_frequencies_from_hessian(
+    hess_total: &MatrixFull<f64>,
+    scf: &SCF,
+) -> Result<(Vec<f64>, MatrixFull<f64>), String> {
     let mol = &scf.mol;
     let natm = mol.geom.nfree;
     let n3 = natm * 3;
@@ -4332,440 +4334,302 @@ pub fn compute_frequencies(scf: &SCF) -> Result<(Vec<f64>, MatrixFull<f64>), Str
     Ok((freqs, eigvecs))
 }
 
-/// Main entry point for CP-HF / Hessian / frequency calculations.
-/// Dispatches based on HessianParameters::calculation field.
+pub fn compute_frequencies(scf: &SCF) -> Result<(Vec<f64>, MatrixFull<f64>), String> {
+    let h = compute_hessian(scf)?;
+    compute_frequencies_from_hessian(&h, scf)
+}
+
+/// Main entry point for analytical Hessian / frequency calculations.
+///
+/// Always computes and saves the analytical Hessian. If
+/// `HessianParameters::frequencies` is set, also computes and saves the
+/// vibrational frequencies and eigenmodes (reusing the already-computed
+/// Hessian matrix).
 pub fn rhf_hessian_main(
     scf: &SCF,
     hess_ctrl: &crate::ctrl_io::hessian_parameters::HessianParameters,
     time_mark: &mut crate::utilities::TimeRecords,
 ) {
-    match hess_ctrl.calculation.as_str() {
-        "h_partial" => {
-            println!("\n=== h_partial Only Calculation ===");
+    let hess_total: MatrixFull<f64> = match run_hessian_pipeline(scf, hess_ctrl, time_mark) {
+        Ok(m) => m,
+        Err(e) => { eprintln!("Error in Hessian calculation: {}", e); return; }
+    };
+    if hess_ctrl.frequencies {
+        run_frequencies_from(scf, hess_ctrl, &hess_total, time_mark);
+    }
+}
 
-            let mut hess = RIRHFHessian::new(scf);
-            // Env var override for development: REST_EJ_EK_GX=inline|verify
-            {
-                let opt = &mut hess.flags.ej_ek_opt;
-                for (name, field) in [
-                    ("REST_EJ_EK_G4", &mut opt.g4_ek_vk1),
-                    ("REST_EJ_EK_G5", &mut opt.g5_ek_ri1),
-                    ("REST_EJ_EK_G6", &mut opt.g6_ek_ri2d),
-                    ("REST_EJ_EK_G7", &mut opt.g7_ek_ri2o),
-                    ("REST_EJ_EK_G8", &mut opt.g8_ej_ri1),
-                    ("REST_EJ_EK_G9", &mut opt.g9_ej_ri2d),
-                    ("REST_EJ_EK_G10", &mut opt.g10_ej_ri2o),
-                ] {
-                    if let Ok(v) = std::env::var(name) {
-                        if v == "inline" || v == "verify" {
-                            *field = TermPath::Inline;
-                        } else if v == "blas" {
-                            *field = TermPath::Blas;
-                        }
-                    }
+/// Run the full analytical Hessian pipeline: calc_e1 → calc_ej_ek →
+/// calc_h1ao → compute_hessian. Prints diagnostics, saves HessianMatrix.txt
+/// and (when verbose) component .npy files. Returns the total Hessian matrix
+/// (natm*3, natm*3) in column-major layout.
+fn run_hessian_pipeline(
+    scf: &SCF,
+    hess_ctrl: &crate::ctrl_io::hessian_parameters::HessianParameters,
+    time_mark: &mut crate::utilities::TimeRecords,
+) -> Result<MatrixFull<f64>, String> {
+    let pl = scf.mol.ctrl.print_level;
+    let hess_start = std::time::Instant::now();
+    if pl > 0 {
+        println!("\n=== Analytical Hessian Calculation (solver={}) ===", hess_ctrl.solver);
+    }
+    time_mark.new_item("Hessian", "analytical Hessian");
+    time_mark.count_start("Hessian");
+
+    // ── System-size report & memory monitor setup ───────────────
+    let nao = scf.mol.num_basis;
+    let nocc = (scf.homo[0] + 1) as usize;
+    let natm = scf.mol.geom.nfree;
+    let naux = scf.mol.make_auxmol_fake().num_basis;
+    let ngrids = scf.grids.as_ref().map(|g| g.coordinates.len()).unwrap_or(0);
+    if pl > 1 {
+        memory_monitor::print_system_size(
+            "before Hessian pipeline", natm, nao, nocc, naux, ngrids,
+        );
+    }
+    let limit_gb = scf.mol.ctrl.max_memory;
+    let monitor = MemMonitor::start(limit_gb, std::time::Duration::from_millis(20));
+    if pl > 1 {
+        println!(
+            "  Memory monitor: limit = {}",
+            limit_gb.map(|g| format!("{:.3} GiB (abort on exceed)", g))
+                    .unwrap_or_else(|| "NONE (peak tracking only)".to_string())
+        );
+    }
+
+    // Build full object to access components
+    let mut hess = RIRHFHessian::new(scf);
+    // Env var override for development: REST_EJ_EK_GX=inline|verify
+    // BLAS is the default (no env var needed). Set to 'inline' or 'verify'
+    // to run the old for-loop path and diff against the BLAS baseline.
+    {
+        let opt = &mut hess.flags.ej_ek_opt;
+        for (name, field) in [
+            ("REST_EJ_EK_G4", &mut opt.g4_ek_vk1),
+            ("REST_EJ_EK_G5", &mut opt.g5_ek_ri1),
+            ("REST_EJ_EK_G6", &mut opt.g6_ek_ri2d),
+            ("REST_EJ_EK_G7", &mut opt.g7_ek_ri2o),
+            ("REST_EJ_EK_G8", &mut opt.g8_ej_ri1),
+            ("REST_EJ_EK_G9", &mut opt.g9_ej_ri2d),
+            ("REST_EJ_EK_G10", &mut opt.g10_ej_ri2o),
+        ] {
+            if let Ok(v) = std::env::var(name) {
+                if v == "inline" || v == "verify" {
+                    *field = TermPath::Inline;
+                } else if v == "blas" {
+                    *field = TermPath::Blas;
                 }
             }
-            // Only compute e1 and ej/ek — skip h1ao, cphf_contrib, hess_nuc
-            hess.calc_e1().calc_ej_ek();
-
-            // Print h_partial max_abs
-            if let Some(hp) = hess.result.get("h_partial") {
-                let n3 = hp.size[0];
-                let mut hp_max = 0.0;
-                for i in 0..n3 * n3 { let v = hp.data[i].abs(); if v > hp_max { hp_max = v; }}
-                println!("  h_partial max_abs={:.4e}", hp_max);
-            }
-            // Print full timing profile
-            hess.print_timings();
         }
-        "hessian" => {
-            let pl = scf.mol.ctrl.print_level;
-            let hess_start = std::time::Instant::now();
+    }
+    let mut overall_peak_mb: f64 = 0.0_f64;
+    let stage_report = |label: &str, monitor: &MemMonitor, overall: &mut f64, pl: usize| {
+        let stage_peak = monitor.stage_peak_mb();
+        if stage_peak > *overall { *overall = stage_peak; }
+        if pl > 1 {
+            println!(
+                "  [mem] after {:<16}: stage peak RSS = {:8.3} MiB ({:.3} GiB) | overall peak = {:.3} MiB ({:.3} GiB)",
+                label, stage_peak, stage_peak / 1024.0, *overall, *overall / 1024.0
+            );
+        }
+    };
+    hess.calc_e1();
+    stage_report("calc_e1", &monitor, &mut overall_peak_mb, pl);
+    memory_monitor::trim_to_os();
+    hess.calc_ej_ek();
+    stage_report("calc_ej_ek", &monitor, &mut overall_peak_mb, pl);
+    memory_monitor::trim_to_os();
+    hess.calc_h1ao();
+    stage_report("calc_h1ao", &monitor, &mut overall_peak_mb, pl);
+    memory_monitor::trim_to_os();
+    hess.compute_hessian();
+    stage_report("compute_hessian", &monitor, &mut overall_peak_mb, pl);
+    let hess_total = hess.result.get("hess_total")
+        .cloned()
+        .ok_or_else(|| "hess_total not found".to_string())?;
+
+    let n3 = hess_total.size[0];
+    let natm = n3 / 3;
+    if pl > 1 {
+        println!("  Hessian matrix [{}x{}]:", n3, n3);
+        if hess_ctrl.verbose > 0 {
+            for i in 0..n3.min(9) {
+                print!("    row[{:2}]:", i);
+                for j in 0..n3.min(9) { print!(" {:10.4e}", hess_total[[i, j]]); }
+                println!();
+            }
+        }
+        // Also print individual components
+        if let Some(hp) = hess.result.get("h_partial") {
+            let mut hp_max = 0.0;
+            for i in 0..n3*n3 { let v = hp.data[i].abs(); if v > hp_max { hp_max = v; }}
+            println!("  h_partial max_abs={:.4e}", hp_max);
+        }
+        if let Some(cc) = hess.result.get("cphf_contrib") {
+            let mut cc_max = 0.0;
+            for i in 0..n3*n3 { let v = cc.data[i].abs(); if v > cc_max { cc_max = v; }}
+            println!("  cphf_contrib max_abs={:.4e}", cc_max);
+        }
+        if let Some(hn) = hess.result.get("hess_nuc") {
+            let mut hn_max = 0.0;
+            for i in 0..n3*n3 { let v = hn.data[i].abs(); if v > hn_max { hn_max = v; }}
+            println!("  hess_nuc max_abs={:.4e}", hn_max);
+        }
+    }
+    let mut max_abs = 0.0;
+    for i in 0..n3*n3 { let v = hess_total.data[i].abs(); if v > max_abs { max_abs = v; }}
+    if pl > 0 {
+        println!("  Hessian total max_abs={:.4e}", max_abs);
+    }
+
+    // ── Save Hessian matrix to txt (always, path from ctrl) ──
+    let mol_name = &scf.mol.geom.name;
+    let mut out = String::new();
+    out.push_str(&format!("# {} Hessian: natm={} n3={} (Hartree/Bohr^2)\n", mol_name, natm, n3));
+    for i in 0..n3 {
+        let mut row = String::new();
+        for j in 0..n3 {
+            row.push_str(&format!(" {:17.10e}", hess_total[[i, j]]));
+        }
+        out.push_str(row.trim_start());
+        out.push('\n');
+    }
+    match std::fs::write(&hess_ctrl.hessian_matrix_path, out) {
+        Ok(_) => { if pl > 0 {
+            println!("  Hessian matrix saved to {}", hess_ctrl.hessian_matrix_path);
+        }}
+        Err(e) => eprintln!("  WARNING: failed to write Hessian matrix to {}: {}", hess_ctrl.hessian_matrix_path, e),
+    }
+
+    // Save components as .npy for external comparison
+    if hess_ctrl.verbose > 0 {
+        let tmpdir = std::env::temp_dir().join(format!("rest_hess_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmpdir);
+        let save_mat = |name: &str, key: &str, res: &HashMap<String, MatrixFull<f64>>| {
+            if let Some(m) = res.get(key) {
+                write_npy_f64(tmpdir.join(name).to_str().unwrap(), &m.data);
+            }
+        };
+        save_mat("rest_hess_tot.npy", "hess_total", &hess.result);
+        save_mat("rest_h_partial.npy", "h_partial", &hess.result);
+        save_mat("rest_cphf.npy", "cphf_contrib", &hess.result);
+        save_mat("rest_hess_nuc.npy", "hess_nuc", &hess.result);
+        let scf_data = hess.scf_data;
+        let dm0_mat = &scf_data.density_matrix[0];
+        let nao = scf_data.mol.num_basis;
+        let mut dm0_c = vec![0.0; nao * nao];
+        for r in 0..nao { for c in 0..nao { dm0_c[r * nao + c] = dm0_mat[[r, c]]; }}
+        write_npy_f64(tmpdir.join("dm0.npy").to_str().unwrap(), &dm0_c);
+        let nmo = scf_data.eigenvalues[0].len();
+        let c = &scf_data.eigenvectors[0];
+        let mut mc_c = vec![0.0; nao * nmo];
+        for r in 0..nao { for c2 in 0..nmo { mc_c[r * nao + c2] = c[[r, c2]]; }}
+        write_npy_f64(tmpdir.join("mo_coeff.npy").to_str().unwrap(), &mc_c);
+        write_npy_f64(tmpdir.join("mo_energy.npy").to_str().unwrap(), &scf_data.eigenvalues[0]);
+        let mut mo_occ_flat = vec![0.0; nmo];
+        for i in 0..nmo { mo_occ_flat[i] = scf_data.occupation[0][i] as f64; }
+        write_npy_f64(tmpdir.join("mo_occ.npy").to_str().unwrap(), &mo_occ_flat);
+        if pl > 1 {
+            println!("  Saved components to {:?}", tmpdir);
+        }
+    }
+
+    if pl > 1 {
+        hess.print_timings();
+    }
+    // Final memory report
+    let final_rss = memory_monitor::current_rss_mb();
+    if pl > 1 {
+        println!(
+            "\n  [mem] Hessian pipeline finished: final RSS = {:.3} MiB ({:.3} GiB), overall peak observed = {:.3} MiB ({:.3} GiB)",
+            final_rss, final_rss / 1024.0,
+            overall_peak_mb, overall_peak_mb / 1024.0
+        );
+    } else if pl > 0 {
+        println!(
+            "  Hessian memory peak: {:.3} MiB ({:.3} GiB)",
+            overall_peak_mb, overall_peak_mb / 1024.0
+        );
+    }
+    monitor.stop();
+    time_mark.count("Hessian");
+    if pl > 0 {
+        println!("  Hessian elapsed: {:.3} s", hess_start.elapsed().as_secs_f64());
+    }
+
+    Ok(hess_total)
+}
+
+/// Compute and print vibrational frequencies + normal modes from an
+/// already-computed total Hessian matrix, and save EigenModes.txt.
+/// Reuses `compute_frequencies_from_hessian` so the Hessian is NOT recomputed.
+fn run_frequencies_from(
+    scf: &SCF,
+    hess_ctrl: &crate::ctrl_io::hessian_parameters::HessianParameters,
+    hess_total: &MatrixFull<f64>,
+    time_mark: &mut crate::utilities::TimeRecords,
+) {
+    let pl = scf.mol.ctrl.print_level;
+    if pl > 0 {
+        println!("\n=== Vibrational Frequency Calculation (solver={}) ===", hess_ctrl.solver);
+    }
+    time_mark.new_item("Frequencies", "vibrational frequencies");
+    time_mark.count_start("Frequencies");
+    match compute_frequencies_from_hessian(hess_total, scf) {
+        Ok((freqs, modes)) => {
+            let n3 = freqs.len();
+            let natm = n3 / 3;
+            let mol_name = &scf.mol.geom.name;
+            let elems: Vec<String> = scf.mol.geom.elem.iter()
+                .map(|e| crate::geom_io::formated_element_name(e)).collect();
             if pl > 0 {
-                println!("\n=== Analytical Hessian Calculation (solver={}) ===", hess_ctrl.solver);
-            }
-            time_mark.new_item("Hessian", "analytical Hessian");
-            time_mark.count_start("Hessian");
-
-            // ── System-size report & memory monitor setup ───────────────
-            let nao = scf.mol.num_basis;
-            let nocc = (scf.homo[0] + 1) as usize;
-            let natm = scf.mol.geom.nfree;
-            let naux = scf.mol.make_auxmol_fake().num_basis;
-            let ngrids = scf.grids.as_ref().map(|g| g.coordinates.len()).unwrap_or(0);
-            if pl > 1 {
-                memory_monitor::print_system_size(
-                    "before Hessian pipeline", natm, nao, nocc, naux, ngrids,
-                );
-            }
-            let limit_gb = scf.mol.ctrl.max_memory;
-            let monitor = MemMonitor::start(limit_gb, std::time::Duration::from_millis(20));
-            if pl > 1 {
-                println!(
-                    "  Memory monitor: limit = {}",
-                    limit_gb.map(|g| format!("{:.3} GiB (abort on exceed)", g))
-                            .unwrap_or_else(|| "NONE (peak tracking only)".to_string())
-                );
-            }
-
-            // Build full object to access components
-            let mut hess = RIRHFHessian::new(scf);
-            // Env var override for development: REST_EJ_EK_GX=inline|verify
-            // BLAS is the default (no env var needed). Set to 'inline' or 'verify'
-            // to run the old for-loop path and diff against the BLAS baseline.
-            {
-                let opt = &mut hess.flags.ej_ek_opt;
-                for (name, field) in [
-                    ("REST_EJ_EK_G4", &mut opt.g4_ek_vk1),
-                    ("REST_EJ_EK_G5", &mut opt.g5_ek_ri1),
-                    ("REST_EJ_EK_G6", &mut opt.g6_ek_ri2d),
-                    ("REST_EJ_EK_G7", &mut opt.g7_ek_ri2o),
-                    ("REST_EJ_EK_G8", &mut opt.g8_ej_ri1),
-                    ("REST_EJ_EK_G9", &mut opt.g9_ej_ri2d),
-                    ("REST_EJ_EK_G10", &mut opt.g10_ej_ri2o),
-                ] {
-                    if let Ok(v) = std::env::var(name) {
-                        if v == "inline" || v == "verify" {
-                            *field = TermPath::Inline;
-                        } else if v == "blas" {
-                            *field = TermPath::Blas;
-                        }
-                    }
+                println!("\n  Vibrational Frequencies (cm):");
+                println!("  {:>4}  {:>10}  {:>10}", "Mode", "Freq/cm", "Symmetry");
+                println!("  {}  {}  {}", "----", "----------", "----------");
+                for i in 0..n3 {
+                    let sym = if freqs[i].abs() < 10.0 { "---" } else { "A" };
+                    println!("  {:>4}  {:>10.2}  {:>10}", i + 1, freqs[i], sym);
                 }
             }
-            let mut overall_peak_mb: f64 = 0.0_f64;
-            let stage_report = |label: &str, monitor: &MemMonitor, overall: &mut f64, pl: usize| {
-                let stage_peak = monitor.stage_peak_mb();
-                if stage_peak > *overall { *overall = stage_peak; }
-                if pl > 1 {
-                    println!(
-                        "  [mem] after {:<16}: stage peak RSS = {:8.3} MiB ({:.3} GiB) | overall peak = {:.3} MiB ({:.3} GiB)",
-                        label, stage_peak, stage_peak / 1024.0, *overall, *overall / 1024.0
-                    );
-                }
-            };
-            hess.calc_e1();
-            stage_report("calc_e1", &monitor, &mut overall_peak_mb, pl);
-            memory_monitor::trim_to_os();
-            hess.calc_ej_ek();
-            stage_report("calc_ej_ek", &monitor, &mut overall_peak_mb, pl);
-            memory_monitor::trim_to_os();
-            hess.calc_h1ao();
-            stage_report("calc_h1ao", &monitor, &mut overall_peak_mb, pl);
-            memory_monitor::trim_to_os();
-            hess.compute_hessian();
-            stage_report("compute_hessian", &monitor, &mut overall_peak_mb, pl);
-            let hess_total = hess.result.get("hess_total")
-                .cloned()
-                .ok_or_else(|| "hess_total not found".to_string());
-            match hess_total {
-                Ok(hess_total) => {
-                    let n3 = hess_total.size[0];
-                    let natm = n3 / 3;
-                    if pl > 1 {
-                        println!("  Hessian matrix [{}x{}]:", n3, n3);
-                        if hess_ctrl.verbose > 0 {
-                            for i in 0..n3.min(9) {
-                                print!("    row[{:2}]:", i);
-                                for j in 0..n3.min(9) { print!(" {:10.4e}", hess_total[[i, j]]); }
-                                println!();
-                            }
-                        }
-                        // Also print individual components
-                        if let Some(hp) = hess.result.get("h_partial") {
-                            let mut hp_max = 0.0;
-                            for i in 0..n3*n3 { let v = hp.data[i].abs(); if v > hp_max { hp_max = v; }}
-                            println!("  h_partial max_abs={:.4e}", hp_max);
-                        }
-                        if let Some(cc) = hess.result.get("cphf_contrib") {
-                            let mut cc_max = 0.0;
-                            for i in 0..n3*n3 { let v = cc.data[i].abs(); if v > cc_max { cc_max = v; }}
-                            println!("  cphf_contrib max_abs={:.4e}", cc_max);
-                        }
-                        if let Some(hn) = hess.result.get("hess_nuc") {
-                            let mut hn_max = 0.0;
-                            for i in 0..n3*n3 { let v = hn.data[i].abs(); if v > hn_max { hn_max = v; }}
-                            println!("  hess_nuc max_abs={:.4e}", hn_max);
-                        }
-                    }
-                    let mut max_abs = 0.0;
-                    for i in 0..n3*n3 { let v = hess_total.data[i].abs(); if v > max_abs { max_abs = v; }}
-                    if pl > 0 {
-                        println!("  Hessian total max_abs={:.4e}", max_abs);
-                    }
-
-                    // ── Save Hessian matrix to txt (always, path from ctrl) ──
-                    let mol_name = &scf.mol.geom.name;
-                    let mut out = String::new();
-                    out.push_str(&format!("# {} Hessian: natm={} n3={} (Hartree/Bohr^2)\n", mol_name, natm, n3));
-                    for i in 0..n3 {
-                        let mut row = String::new();
-                        for j in 0..n3 {
-                            row.push_str(&format!(" {:17.10e}", hess_total[[i, j]]));
-                        }
-                        out.push_str(row.trim_start());
-                        out.push('\n');
-                    }
-                    match std::fs::write(&hess_ctrl.hessian_matrix_path, out) {
-                        Ok(_) => { if pl > 0 {
-                            println!("  Hessian matrix saved to {}", hess_ctrl.hessian_matrix_path);
-                        }}
-                        Err(e) => eprintln!("  WARNING: failed to write Hessian matrix to {}: {}", hess_ctrl.hessian_matrix_path, e),
-                    }
-
-                    // Save components as .npy for external comparison
-                    if hess_ctrl.verbose > 0 {
-                        let tmpdir = std::env::temp_dir().join(format!("rest_hess_{}", std::process::id()));
-                        let _ = std::fs::create_dir_all(&tmpdir);
-                        let save_mat = |name: &str, key: &str, res: &HashMap<String, MatrixFull<f64>>| {
-                            if let Some(m) = res.get(key) {
-                                write_npy_f64(tmpdir.join(name).to_str().unwrap(), &m.data);
-                            }
-                        };
-                        save_mat("rest_hess_tot.npy", "hess_total", &hess.result);
-                        save_mat("rest_h_partial.npy", "h_partial", &hess.result);
-                        save_mat("rest_cphf.npy", "cphf_contrib", &hess.result);
-                        save_mat("rest_hess_nuc.npy", "hess_nuc", &hess.result);
-                        let scf_data = hess.scf_data;
-                        let dm0_mat = &scf_data.density_matrix[0];
-                        let nao = scf_data.mol.num_basis;
-                        let mut dm0_c = vec![0.0; nao * nao];
-                        for r in 0..nao { for c in 0..nao { dm0_c[r * nao + c] = dm0_mat[[r, c]]; }}
-                        write_npy_f64(tmpdir.join("dm0.npy").to_str().unwrap(), &dm0_c);
-                        let nmo = scf_data.eigenvalues[0].len();
-                        let c = &scf_data.eigenvectors[0];
-                        let mut mc_c = vec![0.0; nao * nmo];
-                        for r in 0..nao { for c2 in 0..nmo { mc_c[r * nao + c2] = c[[r, c2]]; }}
-                        write_npy_f64(tmpdir.join("mo_coeff.npy").to_str().unwrap(), &mc_c);
-                        write_npy_f64(tmpdir.join("mo_energy.npy").to_str().unwrap(), &scf_data.eigenvalues[0]);
-                        let mut mo_occ_flat = vec![0.0; nmo];
-                        for i in 0..nmo { mo_occ_flat[i] = scf_data.occupation[0][i] as f64; }
-                        write_npy_f64(tmpdir.join("mo_occ.npy").to_str().unwrap(), &mo_occ_flat);
-                        if pl > 1 {
-                            println!("  Saved components to {:?}", tmpdir);
-                        }
-                    }
-                },
-                Err(e) => eprintln!("Error in Hessian calculation: {}", e),
-            }
             if pl > 1 {
-                hess.print_timings();
-            }
-            // Final memory report
-            let final_rss = memory_monitor::current_rss_mb();
-            if pl > 1 {
-                println!(
-                    "\n  [mem] Hessian pipeline finished: final RSS = {:.3} MiB ({:.3} GiB), overall peak observed = {:.3} MiB ({:.3} GiB)",
-                    final_rss, final_rss / 1024.0,
-                    overall_peak_mb, overall_peak_mb / 1024.0
-                );
-            } else if pl > 0 {
-                println!(
-                    "  Hessian memory peak: {:.3} MiB ({:.3} GiB)",
-                    overall_peak_mb, overall_peak_mb / 1024.0
-                );
-            }
-            monitor.stop();
-            time_mark.count("Hessian");
-            if pl > 0 {
-                println!("  Hessian elapsed: {:.3} s", hess_start.elapsed().as_secs_f64());
-            }
-        },
-        "frequencies" => {
-            let pl = scf.mol.ctrl.print_level;
-            if pl > 0 {
-                println!("\n=== Vibrational Frequency Calculation (solver={}) ===", hess_ctrl.solver);
-            }
-            time_mark.new_item("Frequencies", "vibrational frequencies");
-            time_mark.count_start("Frequencies");
-            match compute_frequencies(scf) {
-                Ok((freqs, modes)) => {
-                    let n3 = freqs.len();
-                    let natm = n3 / 3;
-                    let mol_name = &scf.mol.geom.name;
-                    let elems: Vec<String> = scf.mol.geom.elem.iter()
-                        .map(|e| crate::geom_io::formated_element_name(e)).collect();
-                    if pl > 0 {
-                        println!("\n  Vibrational Frequencies (cm):");
-                        println!("  {:>4}  {:>10}  {:>10}", "Mode", "Freq/cm", "Symmetry");
-                        println!("  {}  {}  {}", "----", "----------", "----------");
-                        for i in 0..n3 {
-                            let sym = if freqs[i].abs() < 10.0 { "---" } else { "A" };
-                            println!("  {:>4}  {:>10.2}  {:>10}", i + 1, freqs[i], sym);
-                        }
-                    }
-                    if pl > 1 {
-                        println!("\n  Normal Modes (mass-weighted Cartesian, column-major):");
-                        for i in 0..n3 {
-                            println!("  Mode {} ({:10.2} cm):", i + 1, freqs[i]);
-                            for ia in 0..natm {
-                                print!("    atom {:>2}:", ia + 1);
-                                for x in 0..3 { print!(" {:10.4e}", modes[[ia * 3 + x, i]]); }
-                                println!();
-                            }
-                        }
-                    }
-
-                    // ── Save eigenmodes to txt (always) ──
-                    let mut out = String::new();
-                    out.push_str(&format!("# EigenModes: {}, natm={}\n", mol_name, natm));
-                    out.push_str("# Frequencies (cm^-1):\n");
-                    for i in 0..n3 {
-                        out.push_str(&format!("  Mode {:>3}: {:12.4}\n", i + 1, freqs[i]));
-                    }
-                    for i in 0..n3 {
-                        out.push_str(&format!("\n# Mode {} ({:.4} cm^-1) displacements:\n", i + 1, freqs[i]));
-                        for ia in 0..natm {
-                            let dx = modes[[ia * 3, i]];
-                            let dy = modes[[ia * 3 + 1, i]];
-                            let dz = modes[[ia * 3 + 2, i]];
-                            out.push_str(&format!("  atom {:>3} ({}): {:14.6e} {:14.6e} {:14.6e}\n",
-                                ia + 1, elems.get(ia).map(|s| s.as_str()).unwrap_or("?"), dx, dy, dz));
-                        }
-                    }
-                    match std::fs::write(&hess_ctrl.eigenmodes_path, out) {
-                        Ok(_) => { if pl > 0 {
-                            println!("  Eigenmodes saved to {}", hess_ctrl.eigenmodes_path);
-                        }}
-                        Err(e) => eprintln!("  WARNING: failed to write eigenmodes to {}: {}", hess_ctrl.eigenmodes_path, e),
-                    }
-                },
-                Err(e) => eprintln!("Error in frequency calculation: {}", e),
-            }
-            time_mark.count("Frequencies");
-        },
-        "rks_vxc_deriv1" => {
-            println!("\n=== RKS vxc_deriv1 (XC first derivative for h1ao) ===");
-            let xc_type = if scf.mol.xc_data.use_density_gradient() {
-                crate::dft::xc_deriv::XCType::GGA
-            } else {
-                crate::dft::xc_deriv::XCType::LDA
-            };
-            let vmat = crate::hessian::xc_hessian::vxc_deriv1(scf, xc_type);
-            let natm = vmat.len();
-            let nao = scf.mol.num_basis;
-            println!("  vxc_deriv1: {} atoms, nao = {}", natm, nao);
-            let mut all_max = 0.0f64;
-            for (ia, m) in vmat.iter().enumerate() {
-                let max_abs = m.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-                if max_abs > all_max { all_max = max_abs; }
-                println!("    vxc_deriv1[{}]: max_abs={:.6e}", ia, max_abs);
-                if hess_ctrl.verbose > 1 {
-                    for x in 0..3 {
-                        print!("      x={} first 3 rows, 1 col:", x);
-                        for i in 0..3 { print!(" {:11.4e}", m[[x * nao + i, 0]]); }
+                println!("\n  Normal Modes (mass-weighted Cartesian, column-major):");
+                for i in 0..n3 {
+                    println!("  Mode {} ({:10.2} cm):", i + 1, freqs[i]);
+                    for ia in 0..natm {
+                        print!("    atom {:>2}:", ia + 1);
+                        for x in 0..3 { print!(" {:10.4e}", modes[[ia * 3 + x, i]]); }
                         println!();
                     }
                 }
             }
-            println!("  overall max_abs = {:.6e}", all_max);
-            // Save flat (natm*3*nao, nao) row-major-friendly data to .npy for comparison.
-            // vmat[ia] is [3*nao, nao] column-major (REST layout). Stack ia along dim 0.
-            // Output shape: (natm, 3, nao, nao) in C-order to match PySCF.
-            let mut flat = vec![0.0; natm * 3 * nao * nao];
-            for ia in 0..natm {
-                for x in 0..3 {
-                    for i in 0..nao {
-                        for j in 0..nao {
-                            // REST vmat[ia] is column-major [3*nao, nao]: element (row=x*nao+i, col=j)
-                            let v = vmat[ia][[x * nao + i, j]];
-                            // C-order [ia, x, i, j]
-                            flat[((ia * 3 + x) * nao + i) * nao + j] = v;
-                        }
-                    }
+
+            // ── Save eigenmodes to txt (always) ──
+            let mut out = String::new();
+            out.push_str(&format!("# EigenModes: {}, natm={}\n", mol_name, natm));
+            out.push_str("# Frequencies (cm^-1):\n");
+            for i in 0..n3 {
+                out.push_str(&format!("  Mode {:>3}: {:12.4}\n", i + 1, freqs[i]));
+            }
+            for i in 0..n3 {
+                out.push_str(&format!("\n# Mode {} ({:.4} cm^-1) displacements:\n", i + 1, freqs[i]));
+                for ia in 0..natm {
+                    let dx = modes[[ia * 3, i]];
+                    let dy = modes[[ia * 3 + 1, i]];
+                    let dz = modes[[ia * 3 + 2, i]];
+                    out.push_str(&format!("  atom {:>3} ({}): {:14.6e} {:14.6e} {:14.6e}\n",
+                        ia + 1, elems.get(ia).map(|s| s.as_str()).unwrap_or("?"), dx, dy, dz));
                 }
             }
-            write_npy_f64("/tmp/rks_vxc_deriv1_h2o_rest.npy", &flat);
-            println!("  Saved /tmp/rks_vxc_deriv1_h2o_rest.npy as 1D ({} elements)", flat.len());
-            println!("  Reshape in Python to ({}, 3, {}, {})", natm, nao, nao);
-        },
-        "rks_vxc_diag" => {
-            println!("\n=== RKS vxc_diag (XC diagonal 2nd-deriv for h_partial) ===");
-            let xc_type = if scf.mol.xc_data.use_density_gradient() {
-                crate::dft::xc_deriv::XCType::GGA
-            } else {
-                crate::dft::xc_deriv::XCType::LDA
-            };
-            let veff = crate::hessian::xc_hessian::vxc_diag(scf, xc_type);
-            let nao = scf.mol.num_basis;
-            // veff is [9*nao, nao] column-major; (alpha, beta) block at rows [(alpha*3+beta)*nao .. +nao].
-            // Per-block max_abs:
-            let mut all_max = 0.0f64;
-            for alpha in 0..3 { for beta in 0..3 {
-                let row0 = (alpha * 3 + beta) * nao;
-                let mut m_max = 0.0f64;
-                for i in 0..nao { for j in 0..nao {
-                    let v = veff[[row0 + i, j]].abs();
-                    if v > m_max { m_max = v; }
+            match std::fs::write(&hess_ctrl.eigenmodes_path, out) {
+                Ok(_) => { if pl > 0 {
+                    println!("  Eigenmodes saved to {}", hess_ctrl.eigenmodes_path);
                 }}
-                println!("  veff_diag[alpha={}, beta={}]: max_abs={:.6e}", alpha, beta, m_max);
-                if m_max > all_max { all_max = m_max; }
-            }}
-            println!("  overall max_abs = {:.6e}", all_max);
-            // Save flat C-order (3, 3, nao, nao) for Python comparison.
-            let mut flat = vec![0.0; 9 * nao * nao];
-            for alpha in 0..3 { for beta in 0..3 {
-                let row0 = (alpha * 3 + beta) * nao;
-                for i in 0..nao { for j in 0..nao {
-                    flat[((alpha * 3 + beta) * nao + i) * nao + j] = veff[[row0 + i, j]];
-                }}
-            }}
-            write_npy_f64("/tmp/rks_vxc_diag_h2o_rest.npy", &flat);
-            println!("  Saved /tmp/rks_vxc_diag_h2o_rest.npy as 1D ({} elements)", flat.len());
-            println!("  Reshape in Python to (3, 3, {}, {})", nao, nao);
-        },
-        "rks_vxc_deriv2" => {
-            println!("\n=== RKS vxc_deriv2 (XC off-diagonal 2nd-deriv for h_partial) ===");
-            let xc_type = if scf.mol.xc_data.use_density_gradient() {
-                crate::dft::xc_deriv::XCType::GGA
-            } else {
-                crate::dft::xc_deriv::XCType::LDA
-            };
-            let vmat = crate::hessian::xc_hessian::vxc_deriv2(scf, xc_type);
-            let natm = vmat.len();
-            let nao = scf.mol.num_basis;
-            println!("  vxc_deriv2: {} atoms, nao = {}", natm, nao);
-            let mut all_max = 0.0f64;
-            for (ia, m) in vmat.iter().enumerate() {
-                let max_abs = m.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-                if max_abs > all_max { all_max = max_abs; }
-                if hess_ctrl.verbose > 0 {
-                    // Per (α, β) block max
-                    let mut per_block = String::new();
-                    for alpha in 0..3 { for beta in 0..3 {
-                        let row0 = (alpha * 3 + beta) * nao;
-                        let mut m_max = 0.0f64;
-                        for i in 0..nao { for j in 0..nao {
-                            let v = m[[row0 + i, j]].abs();
-                            if v > m_max { m_max = v; }
-                        }}
-                        per_block.push_str(&format!(" ({},{})={:.3e}", alpha, beta, m_max));
-                    }}
-                    println!("    vmat[{}]: max_abs={:.6e} blocks:{}", ia, max_abs, per_block);
-                } else {
-                    println!("    vmat[{}]: max_abs={:.6e}", ia, max_abs);
-                }
+                Err(e) => eprintln!("  WARNING: failed to write eigenmodes to {}: {}", hess_ctrl.eigenmodes_path, e),
             }
-            println!("  overall max_abs = {:.6e}", all_max);
-            // Save flat C-order (natm, 3, 3, nao, nao) for Python comparison.
-            let mut flat = vec![0.0; natm * 9 * nao * nao];
-            for ia in 0..natm {
-                for alpha in 0..3 { for beta in 0..3 {
-                    let row0 = (alpha * 3 + beta) * nao;
-                    for i in 0..nao { for j in 0..nao {
-                        flat[((ia * 9 + alpha * 3 + beta) * nao + i) * nao + j] =
-                            vmat[ia][[row0 + i, j]];
-                    }}
-                }}
-            }
-            write_npy_f64("/tmp/rks_vxc_deriv2_h2o_rest.npy", &flat);
-            println!("  Saved /tmp/rks_vxc_deriv2_h2o_rest.npy as 1D ({} elements)", flat.len());
-            println!("  Reshape in Python to ({}, 3, 3, {}, {})", natm, nao, nao);
         },
-        other => {
-            eprintln!("Unknown CPHF calculation type: '{}'. Supported: hessian, h_partial, frequencies, rks_vxc_deriv1, rks_vxc_diag, rks_vxc_deriv2", other);
-        },
+        Err(e) => eprintln!("Error in frequency calculation: {}", e),
     }
+    time_mark.count("Frequencies");
 }
 
 /// Compute the CP-HF Hessian contribution and compare with PySCF reference.

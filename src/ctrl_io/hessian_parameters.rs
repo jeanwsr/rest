@@ -4,10 +4,9 @@ use serde::{Deserialize, Serialize};
 pub struct HessianParameters {
     /// Solver type: "krylov" or "dense" (default "krylov")
     pub solver: String,
-    /// Calculation task — TEMPORARY field, removed in the next commit.
-    /// Kept so the existing `match calculation` in rhf_hessian_main still compiles.
-    #[serde(default = "default_calculation")]
-    pub calculation: String,
+    /// If true, also compute and save vibrational frequencies after the Hessian.
+    #[serde(default)]
+    pub frequencies: bool,
     /// Krylov solver maximum iterations (default 50)
     #[serde(default = "default_krylov_max_cycle")]
     pub krylov_max_cycle: usize,
@@ -25,7 +24,6 @@ pub struct HessianParameters {
     pub eigenmodes_path: String,
 }
 
-fn default_calculation() -> String { String::from("hessian") }
 fn default_krylov_max_cycle() -> usize { 50 }
 fn default_krylov_tol() -> f64 { 1.0e-12 }
 fn default_verbose() -> usize { 1 }
@@ -36,7 +34,7 @@ impl Default for HessianParameters {
     fn default() -> Self {
         HessianParameters {
             solver: String::from("krylov"),
-            calculation: default_calculation(),
+            frequencies: false,
             krylov_max_cycle: default_krylov_max_cycle(),
             krylov_tol: default_krylov_tol(),
             verbose: default_verbose(),
@@ -57,9 +55,9 @@ pub fn parse_hessian_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Op
                 serde_json::Value::String(s) => s.to_lowercase(),
                 _ => String::from("krylov"),
             };
-            p.calculation = match o.get("calculation").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(s) => s.to_lowercase(),
-                _ => default_calculation(),
+            p.frequencies = match o.get("frequencies").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
             };
             p.krylov_max_cycle = match o.get("krylov_max_cycle").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(50) as usize,
