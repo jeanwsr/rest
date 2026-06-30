@@ -4380,7 +4380,7 @@ pub fn rhf_hessian_main(
             memory_monitor::print_system_size(
                 "before Hessian pipeline", natm, nao, nocc, naux, ngrids,
             );
-            let limit_gb = scf.mol.ctrl.max_memory_gb;
+            let limit_gb = scf.mol.ctrl.max_memory;
             let monitor = MemMonitor::start(limit_gb, std::time::Duration::from_millis(20));
             println!(
                 "  Memory monitor: limit = {}",
