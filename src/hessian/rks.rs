@@ -36,7 +36,7 @@ pub fn add_vxc_h_partial(
     let dm0_xc = &scf.density_matrix[0];
 
     // Return freed Phase 1-4 memory to OS before the DFT grid sweep.
-    memory_monitor::trim_to_os();
+    memory_monitor::trim_to_os(scf.mol.ctrl.print_level);
 
     // vxc_diag (computed once, scattered to diagonal atom blocks)
     let _t_diag = std::time::Instant::now();
@@ -59,7 +59,7 @@ pub fn add_vxc_h_partial(
     timings.push(("  rks: vxc_diag", _t_diag.elapsed()));
     // Free vxc_diag intermediates before the heavier vxc_deriv2 sweep.
     drop(vxc_diag_mat);
-    memory_monitor::trim_to_os();
+    memory_monitor::trim_to_os(scf.mol.ctrl.print_level);
 
     // vxc_deriv2 (per-atom, symmetrized) — streaming with deriv=2.
     let _t_d2 = std::time::Instant::now();

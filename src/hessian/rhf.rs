@@ -2558,7 +2558,8 @@ impl RIRHFHessian<'_> {
         // ── Save baseline (when no Inline verification happened and no baseline yet) ──
         // Saves BLAS (trusted) output as reference for future Inline verification runs.
         // The save happens once per (system, config) — delete the file to regenerate.
-        if baseline.is_none() && !baseline_path.exists() {
+        if baseline.is_none() && !baseline_path.exists()
+            && self.scf_data.mol.ctrl.print_level > 1 {
             let mut terms = HashMap::new();
             for &key in BASELINE_TERM_KEYS {
                 let arr: &[f64] = match key {
@@ -4365,13 +4366,13 @@ fn run_hessian_pipeline(
     };
     hess.calc_e1();
     stage_report("calc_e1", &monitor, &mut overall_peak_mb, pl);
-    memory_monitor::trim_to_os();
+    memory_monitor::trim_to_os(pl);
     hess.calc_ej_ek();
     stage_report("calc_ej_ek", &monitor, &mut overall_peak_mb, pl);
-    memory_monitor::trim_to_os();
+    memory_monitor::trim_to_os(pl);
     hess.calc_h1ao();
     stage_report("calc_h1ao", &monitor, &mut overall_peak_mb, pl);
-    memory_monitor::trim_to_os();
+    memory_monitor::trim_to_os(pl);
     hess.compute_hessian();
     stage_report("compute_hessian", &monitor, &mut overall_peak_mb, pl);
     let hess_total = hess.result.get("hess_total")

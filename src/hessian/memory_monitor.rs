@@ -22,14 +22,16 @@ use std::time::Duration;
 /// heap pages in its arena rather than `munmap`-ing them, which inflates the
 /// apparent peak of the following stage. `malloc_trim(0)` releases everything
 /// it safely can. No-op (returns 0) on non-glibc allocators.
-pub fn trim_to_os() {
+pub fn trim_to_os(print_level: usize) {
     let rss_before = current_rss_mb();
     unsafe { let _ = libc::malloc_trim(0); }
     let rss_after = current_rss_mb();
-    println!(
-        "  [mem] malloc_trim: RSS {:.3} -> {:.3} MiB (released {:.3} MiB to OS)",
-        rss_before, rss_after, (rss_before - rss_after).max(0.0),
-    );
+    if print_level > 1 {
+        println!(
+            "  [mem] malloc_trim: RSS {:.3} -> {:.3} MiB (released {:.3} MiB to OS)",
+            rss_before, rss_after, (rss_before - rss_after).max(0.0),
+        );
+    }
 }
 
 /// Read current RSS of this process in MiB by parsing `/proc/self/status`.
