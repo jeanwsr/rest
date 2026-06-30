@@ -106,3 +106,109 @@ pub fn compute_vxc_h1ao(scf: &SCF) -> Vec<Vec<f64>> {
     let v = crate::hessian::xc_hessian::vxc_deriv1_streaming(scf, xct);
     v.iter().map(|m| m.iter().copied().collect()).collect()
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// RKS fxc CP-HF response glue
+//
+// These three free functions are the cleanly-separable pieces of the RKS
+// fxc CP-HF contribution. They are invoked from `calc_cphf_contrib` in
+// rhf.rs at three points:
+//   1. once before the solve phase   → `prepare_fxc_cache`
+//   2. inside the mo_e1 loop body     → `add_fxc_to_v_ao`  (in-place)
+//   3. twice after fxc-heavy phases   → `record_fxc_*_timings`
+//
+// The genuinely entangled bit — threading `fxc_cache_ref` (None for HF,
+// Some(cache) for RKS) into the shared Krylov/dense solve calls — stays
+// in rhf.rs because extracting it would require restructuring the entire
+// solve phase, which violates the "leave RHF-shared solve logic untouched"
+// constraint. HF passing `None` is benign and does not branch on RKS-ness.
+//
+// Memory: zero new allocation. `add_fxc_to_v_ao` writes into the existing
+// `v_ao` MatrixFull the mo_e1 loop already owns; no n3*n3 buffer is
+// allocated anywhere in this module. The XC kernels themselves
+// (`FxcHessianCache`, `compute_fxc_response_ao_cached`) live in
+// `dft::response` and are invoked, not duplicated.
+// ═══════════════════════════════════════════════════════════════════
+
+use crate::dft::response::{
+    reset_fxc_timing, read_fxc_timing_s, read_fxc_subtimings_s,
+    prepare_fxc_hessian_cache, compute_fxc_response_ao_cached, FxcHessianCache,
+};
+use tensors::MatrixFull;
+
+/// Build the fxc kernel cache for the CP-HF phase (PySCF `cache_xc_kernel`
+/// analog). Returns `None` for HF (no DFA components) so the caller can pass
+/// the resulting `Option<&FxcHessianCache>` uniformly into the shared solve
+/// calls without branching.
+///
+/// Resets the global fxc timing counter first so the subsequent solve-phase
+/// fxc work is attributed correctly.
+pub fn prepare_fxc_cache(scf: &SCF) -> Option<FxcHessianCache> {
+    reset_fxc_timing();
+    let is_hf = scf.mol.xc_data.dfa_compnt_scf.is_empty();
+    if is_hf {
+        None
+    } else {
+        Some(prepare_fxc_hessian_cache(scf))
+    }
+}
+
+/// Add the RKS fxc AO response to the in-loop `v_ao` buffer, in place.
+///
+/// This is the per-(atom,direction) fxc contribution to the mo_e1 vind
+/// response: `v_ao += compute_fxc_response_ao_cached(cache, dm1)`. It is the
+/// RKS analog of the `J - 0.5*hyb*K` terms that the caller has already added
+/// to `v_ao` for both HF and RKS.
+///
+/// `dm1` and `v_ao` are the loop-local `[nao, nao]` MatrixFull buffers the
+/// mo_e1 loop already owns; this function does not allocate. Iteration order
+/// over `(p, q)` matches the inline block it replaced exactly.
+pub fn add_fxc_to_v_ao(
+    cache: &FxcHessianCache,
+    dm1: &MatrixFull<f64>,
+    v_ao: &mut MatrixFull<f64>,
+) {
+    let nao = cache.nao;
+    let fxc_ao = compute_fxc_response_ao_cached(cache, dm1);
+    for p in 0..nao {
+        for q in 0..nao {
+            v_ao[[p, q]] += fxc_ao[[p, q]];
+        }
+    }
+}
+
+/// Record the post-solve-phase fxc timings into the caller's timing profile.
+///
+/// Mirrors the inline block that previously lived in `calc_cphf_contrib`
+/// after the Krylov/dense solve: the `cphf: fxc_solve` total plus the
+/// detailed per-subcomponent breakdown (matches PySCF `nr_rks_fxc` internals).
+/// `cache_elapsed` is the wall-clock time spent building the cache (returned
+/// by the caller from around its `prepare_fxc_cache` call).
+pub fn record_fxc_solve_timings(
+    timings: &mut Vec<(&'static str, std::time::Duration)>,
+    cache_elapsed: std::time::Duration,
+) {
+    timings.push(("  cphf: fxc_cache", cache_elapsed));
+    let fxc_solve_ns = (read_fxc_timing_s() * 1e9) as u64;
+    timings.push(("  cphf: fxc_solve", std::time::Duration::from_nanos(fxc_solve_ns)));
+    for (name, secs) in read_fxc_subtimings_s() {
+        if secs > 0.0 {
+            let label: &'static str = Box::leak(
+                format!("    {}", name).into_boxed_str());
+            timings.push((label, std::time::Duration::from_secs_f64(secs)));
+        }
+    }
+}
+
+/// Record the post-mo_e1-phase fxc timings into the caller's timing profile.
+///
+/// Mirrors the inline block that previously lived in `calc_cphf_contrib`
+/// after the mo_e1 loop: the `cphf: fxc_moe1` total. The sub-component
+/// counters were reset by the caller before the mo_e1 phase via
+/// `reset_fxc_timing`.
+pub fn record_fxc_moe1_timings(
+    timings: &mut Vec<(&'static str, std::time::Duration)>,
+) {
+    let fxc_moe1_ns = (read_fxc_timing_s() * 1e9) as u64;
+    timings.push(("  cphf: fxc_moe1", std::time::Duration::from_nanos(fxc_moe1_ns)));
+}
