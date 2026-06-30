@@ -433,7 +433,8 @@ impl CPHFSolverPySCF {
                          h1_nmc: &[f64], s1_nmc: &[f64],
                          max_cycle: usize, tol: f64) -> Vec<f64> {
         let dim = self.dim;
-        let debug = std::env::var("REST_CPHF_KRYLOV_DEBUG").is_ok();
+        let debug = std::env::var("REST_CPHF_KRYLOV_DEBUG").is_ok()
+            || scf.mol.ctrl.print_level >= 1;
 
         // Build RHS
         let mut b = self.build_rhs_with_s1(h1_nmc, s1_nmc);
@@ -514,8 +515,8 @@ impl CPHFSolverPySCF {
 
             let norm2: f64 = x_new.iter().map(|x| x * x).sum();
             innerprod.push(norm2);
-            if debug && (cycle < 3 || cycle % 10 == 0 || norm2 < tol * tol) {
-                println!("    krylov cycle {}: norm2={:.4e}", cycle, norm2);
+            if debug {
+                println!("    CP-HF iteration {}: residual={:.4e}", cycle, norm2.sqrt());
             }
             if norm2 < tol * tol { break; }
             x1 = x_new;
@@ -678,7 +679,8 @@ impl CPHFSolverPySCF {
     ) -> Vec<Vec<f64>> {
         let n_rhs = rhs_all.len();
         let dim = self.dim;
-        let debug = std::env::var("REST_CPHF_KRYLOV_DEBUG").is_ok();
+        let debug = std::env::var("REST_CPHF_KRYLOV_DEBUG").is_ok()
+            || scf.mol.ctrl.print_level >= 1;
         let profile = std::env::var("REST_CPHF_PROFILE").is_ok() || debug;
         // Match PySCF krylov's lindep threshold (DSOLVE_LINDEP default = 1e-13).
         let lindep: f64 = 1e-13;
@@ -738,8 +740,8 @@ impl CPHFSolverPySCF {
             let max_innerprod = innerprod_new.iter().fold(0.0f64, |a, &b| a.max(b));
 
             if debug || profile {
-                println!("    krylov_batched cycle {}: n_active_in={}, n_active_out={}, max|r|²={:.4e}",
-                    cycle, n_active, x_new_orth.len(), max_innerprod);
+                println!("    CP-HF iteration {}: residual={:.4e} (n_active={}/{})",
+                    cycle, max_innerprod.sqrt(), n_active, x_new_orth.len());
             }
 
             if max_innerprod < lindep || max_innerprod < tol2 {

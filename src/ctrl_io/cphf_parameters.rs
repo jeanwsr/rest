@@ -13,9 +13,17 @@ pub struct CPHFParameters {
     pub krylov_tol: f64,
     /// Verbose output level (0=silent, 1=normal, 2=debug)
     pub verbose: usize,
+    /// Output path for the Hessian matrix txt file
+    #[serde(default = "default_hessian_matrix_path")]
+    pub hessian_matrix_path: String,
+    /// Output path for the vibrational eigenmodes txt file
+    #[serde(default = "default_eigenmodes_path")]
+    pub eigenmodes_path: String,
 }
 
 fn default_calculation() -> String { String::from("response") }
+fn default_hessian_matrix_path() -> String { String::from("./HessianMatrix.txt") }
+fn default_eigenmodes_path() -> String { String::from("./EigenModes.txt") }
 
 impl Default for CPHFParameters {
     fn default() -> Self {
@@ -25,6 +33,8 @@ impl Default for CPHFParameters {
             krylov_max_cycle: 50,
             krylov_tol: 1.0e-12,
             verbose: 1,
+            hessian_matrix_path: default_hessian_matrix_path(),
+            eigenmodes_path: default_eigenmodes_path(),
         }
     }
 }
@@ -55,6 +65,14 @@ pub fn parse_cphf_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Optio
             p.verbose = match tmp_ctrl.get("verbose").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(1) as usize,
                 _ => 1,
+            };
+            p.hessian_matrix_path = match tmp_ctrl.get("hessian_matrix_path").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => default_hessian_matrix_path(),
+            };
+            p.eigenmodes_path = match tmp_ctrl.get("eigenmodes_path").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => default_eigenmodes_path(),
             };
             Ok(Some(p))
         },
