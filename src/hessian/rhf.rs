@@ -2535,80 +2535,16 @@ impl RIRHFHessian<'_> {
         self.result.insert("h_partial".to_string(), to_mat(&hp));
 
         // ── RKS: add XC contributions (vxc_diag + vxc_deriv2) ──
+        // Scatters directly into the live h_partial buffer (zero new allocation).
+        // The implementation lives in rks.rs; split-borrow of self.result.data
+        // and self.timings from a shared &SCF ref compiles cleanly here.
         if self.is_rks() {
-            let _t_rks_xc = std::time::Instant::now();
-            let scf_rks: &SCF = self.scf_data;
-            let mol_rks = &scf_rks.mol;
-            let nao_xc = mol_rks.num_basis;
-            let natm_xc = mol_rks.geom.nfree;
-            let n3_xc = natm_xc * 3;
-            let xc_type = if mol_rks.xc_data.use_density_gradient() {
-                crate::dft::xc_deriv::XCType::GGA
-            } else {
-                crate::dft::xc_deriv::XCType::LDA
-            };
-            let aoslices_xc = crate::hessian::xc_hessian::build_aoslices(mol_rks);
-            let dm0_xc = &scf_rks.density_matrix[0];
-
-            let hp_entry = self.result.remove("h_partial")
-                .expect("h_partial not set");
-            let mut hp_flat: Vec<f64> = hp_entry.iter().copied().collect();
-
-            // Return freed Phase 1-4 memory to OS before the DFT grid sweep.
-            memory_monitor::trim_to_os();
-
-            // vxc_diag (computed once, scattered to diagonal atom blocks)
-            let _t_diag = std::time::Instant::now();
-            // Phase 2: streaming mode — process grid blocks in small concurrent
-            // batches instead of collecting all AO data in a cache. Peak AO
-            // memory ≈ grid_concurrency() × per_block_size instead of
-            // num_blocks × per_block_size.
-            let vxc_diag_mat = crate::hessian::xc_hessian::vxc_diag_streaming(scf_rks, xc_type);
-            for ia in 0..natm_xc {
-                let (p0, p1) = aoslices_xc[ia];
-                for a in 0..3 { for b in 0..3 {
-                    let row0 = (a * 3 + b) * nao_xc;
-                    let mut s = 0.0;
-                    for mu in p0..p1 { for nu in 0..nao_xc {
-                        s += vxc_diag_mat[[row0 + mu, nu]] * dm0_xc[[mu, nu]];
-                    }}
-                    hp_flat[(ia * 3 + a) * n3_xc + (ia * 3 + b)] += s * 2.0;
-                }}
-            }
-            self.timings.push(("  rks: vxc_diag", _t_diag.elapsed()));
-            // Free vxc_diag intermediates before the heavier vxc_deriv2 sweep.
-            drop(vxc_diag_mat);
-            memory_monitor::trim_to_os();
-
-            // vxc_deriv2 (per-atom, symmetrized) — streaming with deriv=2.
-            let _t_d2 = std::time::Instant::now();
-            let vxc_d2 = crate::hessian::xc_hessian::vxc_deriv2_streaming(scf_rks, xc_type);
-            for ia in 0..natm_xc {
-                for ja in 0..=ia {
-                    let (q0, q1) = aoslices_xc[ja];
-                    for a in 0..3 { for b in 0..3 {
-                        let row0 = (a * 3 + b) * nao_xc;
-                        let mut s = 0.0;
-                        for mu in q0..q1 { for nu in 0..nao_xc {
-                            s += vxc_d2[ia][[row0 + mu, nu]] * dm0_xc[[mu, nu]];
-                        }}
-                        hp_flat[(ia * 3 + a) * n3_xc + (ja * 3 + b)] += s * 2.0;
-                    }}
-                }
-            }
-            for ia in 0..natm_xc {
-                for ja in 0..ia {
-                    for a in 0..3 { for b in 0..3 {
-                        hp_flat[(ja * 3 + b) * n3_xc + (ia * 3 + a)] =
-                            hp_flat[(ia * 3 + a) * n3_xc + (ja * 3 + b)];
-                    }}
-                }
-            }
-
-            self.result.insert("h_partial".to_string(),
-                MatrixFull::from_vec([n3_xc, n3_xc], hp_flat).unwrap());
-            self.timings.push(("  rks: vxc_deriv2", _t_d2.elapsed()));
-            self.timings.push(("  rks: xc_add", _t_rks_xc.elapsed()));
+            let scf = self.scf_data;
+            let hp_data = &mut self.result.get_mut("h_partial")
+                .expect("h_partial not set").data;
+            crate::hessian::rks::add_vxc_h_partial(
+                scf, hp_data, &mut self.timings,
+            );
         }
 
         // ── Save baseline (when no Inline verification happened and no baseline yet) ──

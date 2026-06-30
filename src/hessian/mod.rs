@@ -1,6 +1,7 @@
 pub mod ej_ek_baseline;
 pub mod memory_monitor;
 pub mod rhf;
+pub mod rks;
 pub mod traits;
 pub mod xc_hessian;
 pub use ej_ek_baseline::{EjEkBaseline, BASELINE_TERM_KEYS};
