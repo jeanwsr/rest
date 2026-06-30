@@ -7,8 +7,8 @@ use rest_tensors::MatrixFull;
 use rest_tensors::matrix::matrix_blas_lapack::_dsolve;
 use crate::scf_io::SCF;
 use crate::ri_tddft::utils::tddft_occupation_parameters;
-use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data};
-use crate::dft::response::{gen_vind_opt, VindWorkspace};
+use crate::dft::response::{gen_vind_opt, VindWorkspace, FxcHessianCache,
+    prepare_fxc_hessian_cache};
 
 pub struct CPHFSolver {
     pub nocc: usize,
@@ -17,8 +17,9 @@ pub struct CPHFSolver {
     pub e_ai: Vec<f64>,
     pub start_mo: usize,
     pub lumo: usize,
-    /// Precomputed fxc data (None for HF)
-    pub fxc_data: Option<FXCMatvecData>,
+    /// Precomputed fxc cache (None for HF). Built once at construction;
+    /// reused by every fvind call inside the CP-HF loop.
+    pub fxc_cache: Option<FxcHessianCache>,
     /// Cached MO slices for optimized fvind
     pub ws: VindWorkspace,
 }
@@ -41,22 +42,24 @@ impl CPHFSolver {
             }
         }
 
-        // fxc data for DFT
+        // fxc cache for DFT (built once; reused across every fvind call)
         let is_dft = !scf.mol.xc_data.dfa_compnt_scf.is_empty();
-        let fxc_data = if is_dft {
-            println!("  Preparing fxc data for CP-HF...");
-            Some(prepare_fxc_data(scf))
+        let fxc_cache = if is_dft {
+            Some(prepare_fxc_hessian_cache(scf))
         } else {
             None
         };
 
         let ws = VindWorkspace::new(scf, occ_size, vir_size, start_mo, lumo);
-        CPHFSolver { nocc: occ_size, nvir: vir_size, dim, e_ai, start_mo, lumo, fxc_data, ws }
+        CPHFSolver { nocc: occ_size, nvir: vir_size, dim, e_ai, start_mo, lumo, fxc_cache, ws }
     }
 
     /// Compute orbital Hessian G[z] using optimized AO-based gen_vind.
     pub fn fvind(&self, scf: &SCF, z: &[f64]) -> Vec<f64> {
-        gen_vind_opt(scf, &self.ws, z, self.fxc_data.as_ref())
+        let full = gen_vind_opt(scf, &self.ws, z, self.fxc_cache.as_ref(), None, None);
+        // Extract VO part only (skip frozen rows)
+        let fo_size = self.ws.nfrozen * self.ws.nocc;
+        full[fo_size..fo_size + self.dim].to_vec()
     }
 
     /// Build LHS = I + G̃ column by column and RHS.
