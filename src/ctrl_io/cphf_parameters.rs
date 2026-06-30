@@ -30,7 +30,10 @@ impl Default for CPHFParameters {
 }
 
 pub fn parse_cphf_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Option<CPHFParameters>> {
-    match tmp_keys.get("cphf").unwrap_or(&serde_json::Value::Null) {
+    let cphf_section = tmp_keys.get("cphf").or_else(|| {
+        tmp_keys.get("ctrl").and_then(|c| c.get("cphf"))
+    }).unwrap_or(&serde_json::Value::Null);
+    match cphf_section {
         serde_json::Value::Object(tmp_ctrl) => {
             let mut p = CPHFParameters::default();
             p.solver = match tmp_ctrl.get("solver").unwrap_or(&serde_json::Value::Null) {

@@ -379,17 +379,10 @@ pub fn main_driver() -> anyhow::Result<()> {
     }
 
     //===================================
-    // Now for CP-HF calculations
+    // CP-HF / Hessian / Frequency calculations
     //===================================
-    if let Some(cphf_ctrl) = &scf_data.mol.ctrl.cphf {
-        let label = if cphf_ctrl.solver == "dense" { "dense" } else { "krylov" };
-        println!("\n=== CP-HF Calculation (solver={}) ===", label);
-        time_mark.new_item("CPHF", &format!("the CP-HF {} solver test", label));
-        time_mark.count_start("CPHF");
-        if let Err(e) = crate::ri_cphf::test_cphf_dense(&scf_data) {
-            eprintln!("Error in CP-HF calculation: {}", e);
-        }
-        time_mark.count("CPHF");
+    if let Some(ref cphf_ctrl) = scf_data.mol.ctrl.cphf {
+        crate::hessian::rhf_hessian_main(&scf_data, cphf_ctrl, &mut time_mark);
     }
 
     time_mark.count("Overall");
