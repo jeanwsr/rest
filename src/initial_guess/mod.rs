@@ -86,7 +86,9 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
     // generate the VSAP initial guess
     } else if scf_data.mol.ctrl.initial_guess.eq(&"vsap") {
         let init_fock = initial_guess_from_vsap(&scf_data.mol,&scf_data.grids);
-        if scf_data.mol.spin_channel==1 {
+        if let SCFType::ROHF = scf_data.scftype {
+            scf_data.roothaan_hamiltonian = Some(init_fock);
+        } else if scf_data.mol.spin_channel==1 {
             scf_data.hamiltonian = [init_fock,MatrixUpper::new(1,0.0)];
         } else {
             let init_fock_beta = init_fock.clone();
@@ -422,9 +424,17 @@ pub fn initial_guess_from_raw(
             println!("eigenval {:?}", &tmp_eigenvalues[i]);
         });
     }            
-    (0..spin_channel).into_iter().for_each(|i_spin| {
+    // occupation may span more channels than spin_channel suggests
+    // (e.g. ROHF chkfile stores both alpha+beta occupation, but spin_channel=1 for eigenvectors)
+    assert!(
+        loaded_occupation.len() == num_state || loaded_occupation.len() == 2 * num_state,
+        "Unexpected occupation size in chkfile: {} (expected {} or {} for num_state={})",
+        loaded_occupation.len(), num_state, 2 * num_state, num_state
+    );
+    let occ_channels = loaded_occupation.len() / num_state;
+    (0..occ_channels).into_iter().for_each(|i_spin| {
                 tmp_occupation[i_spin]=loaded_occupation[ (0+i_spin)*num_state..(1+i_spin)*num_state].to_vec();
-            });        
+            });
             // println!("tmp_eigenvectors {:?}, tmp_eigenvalues {:?}, tmp_occupation {:?}", &tmp_eigenvectors, &tmp_eigenvalues, &tmp_occupation);
         },
         "r2u" => {
