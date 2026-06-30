@@ -381,8 +381,8 @@ pub fn main_driver() -> anyhow::Result<()> {
     //===================================
     // CP-HF / Hessian / Frequency calculations
     //===================================
-    if let Some(ref cphf_ctrl) = scf_data.mol.ctrl.cphf {
-        crate::hessian::rhf_hessian_main(&scf_data, cphf_ctrl, &mut time_mark);
+    if let Some(ref hess_ctrl) = scf_data.mol.ctrl.hessian {
+        crate::hessian::rhf_hessian_main(&scf_data, hess_ctrl, &mut time_mark);
     }
 
     time_mark.count("Overall");

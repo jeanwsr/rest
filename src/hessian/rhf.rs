@@ -4333,13 +4333,13 @@ pub fn compute_frequencies(scf: &SCF) -> Result<(Vec<f64>, MatrixFull<f64>), Str
 }
 
 /// Main entry point for CP-HF / Hessian / frequency calculations.
-/// Dispatches based on CPHFParameters::calculation field.
+/// Dispatches based on HessianParameters::calculation field.
 pub fn rhf_hessian_main(
     scf: &SCF,
-    cphf_ctrl: &crate::ctrl_io::cphf_parameters::CPHFParameters,
+    hess_ctrl: &crate::ctrl_io::hessian_parameters::HessianParameters,
     time_mark: &mut crate::utilities::TimeRecords,
 ) {
-    match cphf_ctrl.calculation.as_str() {
+    match hess_ctrl.calculation.as_str() {
         "h_partial" => {
             println!("\n=== h_partial Only Calculation ===");
 
@@ -4382,7 +4382,7 @@ pub fn rhf_hessian_main(
             let pl = scf.mol.ctrl.print_level;
             let hess_start = std::time::Instant::now();
             if pl > 0 {
-                println!("\n=== Analytical Hessian Calculation (solver={}) ===", cphf_ctrl.solver);
+                println!("\n=== Analytical Hessian Calculation (solver={}) ===", hess_ctrl.solver);
             }
             time_mark.new_item("Hessian", "analytical Hessian");
             time_mark.count_start("Hessian");
@@ -4464,7 +4464,7 @@ pub fn rhf_hessian_main(
                     let natm = n3 / 3;
                     if pl > 1 {
                         println!("  Hessian matrix [{}x{}]:", n3, n3);
-                        if cphf_ctrl.verbose > 0 {
+                        if hess_ctrl.verbose > 0 {
                             for i in 0..n3.min(9) {
                                 print!("    row[{:2}]:", i);
                                 for j in 0..n3.min(9) { print!(" {:10.4e}", hess_total[[i, j]]); }
@@ -4506,15 +4506,15 @@ pub fn rhf_hessian_main(
                         out.push_str(row.trim_start());
                         out.push('\n');
                     }
-                    match std::fs::write(&cphf_ctrl.hessian_matrix_path, out) {
+                    match std::fs::write(&hess_ctrl.hessian_matrix_path, out) {
                         Ok(_) => { if pl > 0 {
-                            println!("  Hessian matrix saved to {}", cphf_ctrl.hessian_matrix_path);
+                            println!("  Hessian matrix saved to {}", hess_ctrl.hessian_matrix_path);
                         }}
-                        Err(e) => eprintln!("  WARNING: failed to write Hessian matrix to {}: {}", cphf_ctrl.hessian_matrix_path, e),
+                        Err(e) => eprintln!("  WARNING: failed to write Hessian matrix to {}: {}", hess_ctrl.hessian_matrix_path, e),
                     }
 
                     // Save components as .npy for external comparison
-                    if cphf_ctrl.verbose > 0 {
+                    if hess_ctrl.verbose > 0 {
                         let tmpdir = std::env::temp_dir().join(format!("rest_hess_{}", std::process::id()));
                         let _ = std::fs::create_dir_all(&tmpdir);
                         let save_mat = |name: &str, key: &str, res: &HashMap<String, MatrixFull<f64>>| {
@@ -4574,7 +4574,7 @@ pub fn rhf_hessian_main(
         "frequencies" => {
             let pl = scf.mol.ctrl.print_level;
             if pl > 0 {
-                println!("\n=== Vibrational Frequency Calculation (solver={}) ===", cphf_ctrl.solver);
+                println!("\n=== Vibrational Frequency Calculation (solver={}) ===", hess_ctrl.solver);
             }
             time_mark.new_item("Frequencies", "vibrational frequencies");
             time_mark.count_start("Frequencies");
@@ -4623,11 +4623,11 @@ pub fn rhf_hessian_main(
                                 ia + 1, elems.get(ia).map(|s| s.as_str()).unwrap_or("?"), dx, dy, dz));
                         }
                     }
-                    match std::fs::write(&cphf_ctrl.eigenmodes_path, out) {
+                    match std::fs::write(&hess_ctrl.eigenmodes_path, out) {
                         Ok(_) => { if pl > 0 {
-                            println!("  Eigenmodes saved to {}", cphf_ctrl.eigenmodes_path);
+                            println!("  Eigenmodes saved to {}", hess_ctrl.eigenmodes_path);
                         }}
-                        Err(e) => eprintln!("  WARNING: failed to write eigenmodes to {}: {}", cphf_ctrl.eigenmodes_path, e),
+                        Err(e) => eprintln!("  WARNING: failed to write eigenmodes to {}: {}", hess_ctrl.eigenmodes_path, e),
                     }
                 },
                 Err(e) => eprintln!("Error in frequency calculation: {}", e),
@@ -4650,7 +4650,7 @@ pub fn rhf_hessian_main(
                 let max_abs = m.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
                 if max_abs > all_max { all_max = max_abs; }
                 println!("    vxc_deriv1[{}]: max_abs={:.6e}", ia, max_abs);
-                if cphf_ctrl.verbose > 1 {
+                if hess_ctrl.verbose > 1 {
                     for x in 0..3 {
                         print!("      x={} first 3 rows, 1 col:", x);
                         for i in 0..3 { print!(" {:11.4e}", m[[x * nao + i, 0]]); }
@@ -4729,7 +4729,7 @@ pub fn rhf_hessian_main(
             for (ia, m) in vmat.iter().enumerate() {
                 let max_abs = m.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
                 if max_abs > all_max { all_max = max_abs; }
-                if cphf_ctrl.verbose > 0 {
+                if hess_ctrl.verbose > 0 {
                     // Per (α, β) block max
                     let mut per_block = String::new();
                     for alpha in 0..3 { for beta in 0..3 {
