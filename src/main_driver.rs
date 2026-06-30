@@ -354,7 +354,7 @@ pub fn main_driver() -> anyhow::Result<()> {
     // Now for TDDFT calculations
     //===================================
     if let Some(tddft_ctrl) = &scf_data.mol.ctrl.tddft {
-        if !tddft_ctrl.damped_tddft {
+        if !tddft_ctrl.response_tddft {
             time_mark.new_item("TDDFT", "the TDDFT eigenvalue calculation");
             time_mark.count_start("TDDFT");
             if let Err(e) = crate::ri_tddft::tddft_main(&mut scf_data) {
@@ -365,16 +365,16 @@ pub fn main_driver() -> anyhow::Result<()> {
     }
 
     //===================================
-    // Now for damped TDDFT calculations
+    // Now for response TDDFT calculations
     //===================================
     if let Some(tddft_ctrl) = &scf_data.mol.ctrl.tddft {
-        if tddft_ctrl.damped_tddft {
-            time_mark.new_item("DampedTDDFT", "the damped TDDFT calculation");
-            time_mark.count_start("DampedTDDFT");
-            if let Err(e) = crate::ri_tddft::damped_tddft(&mut scf_data) {
-                eprintln!("Error in damped TDDFT calculation: {}", e);
+        if tddft_ctrl.response_tddft {
+            time_mark.new_item("ResponseTDDFT", "the response TDDFT calculation");
+            time_mark.count_start("ResponseTDDFT");
+            if let Err(e) = crate::ri_tddft::response_tddft(&mut scf_data) {
+                eprintln!("Error in response TDDFT calculation: {}", e);
             }
-            time_mark.count("DampedTDDFT");
+            time_mark.count("ResponseTDDFT");
         }
     }
 
