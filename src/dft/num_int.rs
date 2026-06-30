@@ -1,5 +1,5 @@
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rayon::prelude::*;
 use rstsr::prelude::*;
 use rest_tensors::{MatrixFull, MatrixFullSlice, RIFull};
@@ -626,8 +626,229 @@ pub fn prepare_fxc_data(scf: &SCF) -> FXCMatvecData {
     }
 }
 
+/// Full-occupation variant of `prepare_fxc_data` for analytic Hessian.
+///
+/// Uses `start_mo = 0` and `occ_size = homo + 1` (no frozen core), matching
+/// `CPHFSolverPySCF::new_full`. This is required for RKS Hessian consistency:
+/// PySCF's `kernel()` uses full occupation for everything.
+pub fn prepare_fxc_data_full(scf: &SCF) -> FXCMatvecData {
+    let nmo = scf.eigenvalues[0].len();
+    let homo = scf.homo[0] as usize;
+    let lumo = scf.lumo[0] as usize;
+    let start_mo = 0;
+    let occ_size = homo + 1;
+    let vir_size = nmo - lumo;
+    prepare_fxc_data_impl(scf, start_mo, occ_size, vir_size, lumo)
+}
+
+/// Implementation body shared by `prepare_fxc_data` (frozen-core) and
+/// `prepare_fxc_data_full` (full occupation). Transplanted verbatim from
+/// master during the group-progress/master semantic merge.
+fn prepare_fxc_data_impl(
+    scf: &SCF,
+    start_mo: usize,
+    occ_size: usize,
+    vir_size: usize,
+    lumo: usize,
+) -> FXCMatvecData {
+    let xc_data = &scf.mol.xc_data;
+    let xc_type = if xc_data.use_density_gradient() {
+        XCType::GGA
+    } else {
+        XCType::LDA
+    };
+    let nvar = match xc_type {
+        XCType::LDA => 1,
+        XCType::GGA => 4,
+        _ => panic!("fxc only supports LDA and GGA"),
+    };
+    let alpha_hybrid = xc_data.dfa_hybrid_scf;
+
+    let grids = scf.grids.as_ref().expect("DFT grids must be initialized for fxc");
+    let ngrids = grids.weights.len();
+    let num_basis = scf.mol.num_basis;
+    let weights = &grids.weights;
+    // ── Obtain dense AO: decompress from compressed storage if needed ──
+    let ao_owned: Option<MatrixFull<f64>>;
+    let ao: &MatrixFull<f64> = match &grids.ao {
+        Some(a) => { ao_owned = None; a }
+        None => match &grids.ao_compressed {
+            Some(c) => { ao_owned = Some(Grids::decompress_ao(c)); ao_owned.as_ref().unwrap() }
+            None => panic!("AO on grids must be tabulated (dense or compressed)"),
+        }
+    };
+    let eigvec = &scf.eigenvectors[0];
+
+    // ── Extract MO coefficients for occupied and virtual spaces ──
+    let mut c_occ = MatrixFull::new([num_basis, occ_size], 0.0);
+    for j in 0..occ_size {
+        for i in 0..num_basis {
+            c_occ[[i, j]] = eigvec[[i, start_mo + j]];
+        }
+    }
+    let mut c_vir = MatrixFull::new([num_basis, vir_size], 0.0);
+    for j in 0..vir_size {
+        for i in 0..num_basis {
+            c_vir[[i, j]] = eigvec[[i, lumo + j]];
+        }
+    }
+
+    // ── Project MO values onto grids ──
+    // mo_occ[i,g] = Σ_p C_occ[p,i] × ao[p,g]
+    // mo_vir[a,g] = Σ_p C_vir[p,a] × ao[p,g]
+    // In BLAS: mo_occ = C_occ^T × ao
+    let mut mo_occ = MatrixFull::new([occ_size, ngrids], 0.0);
+    _dgemm_full(&c_occ, 'T', ao, 'N', &mut mo_occ, 1.0, 0.0);
+
+    let mut mo_vir = MatrixFull::new([vir_size, ngrids], 0.0);
+    _dgemm_full(&c_vir, 'T', ao, 'N', &mut mo_vir, 1.0, 0.0);
+
+    // ── GGA: MO gradients on grids ──
+    let aop_owned: Option<RIFull<f64>>;
+    let (mo_occ_grad, mo_vir_grad) = if xc_type == XCType::GGA {
+        let aop: &RIFull<f64> = match &grids.aop {
+            Some(a) => { aop_owned = None; a }
+            None => match &grids.aop_compressed {
+                Some(c) => { aop_owned = Some(Grids::decompress_aop(c)); aop_owned.as_ref().unwrap() }
+                None => panic!("AO gradients needed for GGA fxc (dense or compressed)"),
+            }
+        };
+        let mut og = [
+            MatrixFull::new([occ_size, ngrids], 0.0),
+            MatrixFull::new([occ_size, ngrids], 0.0),
+            MatrixFull::new([occ_size, ngrids], 0.0),
+        ];
+        let mut vg = [
+            MatrixFull::new([vir_size, ngrids], 0.0),
+            MatrixFull::new([vir_size, ngrids], 0.0),
+            MatrixFull::new([vir_size, ngrids], 0.0),
+        ];
+        for d in 0..3 {
+            let aop_d_slice = aop.get_reducing_matrix(d).unwrap();
+            let aop_d = MatrixFull::from_vec(
+                [num_basis, ngrids],
+                aop_d_slice.iter().cloned().collect(),
+            ).unwrap();
+            _dgemm_full(&c_occ, 'T', &aop_d, 'N', &mut og[d], 1.0, 0.0);
+            _dgemm_full(&c_vir, 'T', &aop_d, 'N', &mut vg[d], 1.0, 0.0);
+        }
+        (Some(og), Some(vg))
+    } else {
+        (None, None)
+    };
+
+    // ── Compute ground-state density on grids for fxc evaluation ──
+    let ao_deriv = if xc_type == XCType::GGA { 1 } else { 0 };
+    let ao_rifull = eval_ao_batch(&scf.mol, &grids.coordinates, ao_deriv, ngrids);
+    let mo_coeffs = vec![scf.eigenvectors[0].clone()];
+    let occ = vec![scf.occupation[0].clone()];
+    let rho_tensor = eval_rho5_batch(&ao_rifull, xc_type, &mo_coeffs, &occ, 1, ngrids);
+
+    // Extract rho_array in the format expected by eval_xc_eff
+    // For spin=0: column-major [ngrids, nvar], i.e. rho_array[g + v*ngrids]
+    let rho_array: Vec<f64> = rho_tensor.raw()[rho_tensor.offset()..]
+        .chunks(ngrids * nvar)
+        .next()
+        .unwrap_or(&[])
+        .to_vec();
+    let rho_array = if rho_array.is_empty() {
+        let raw = rho_tensor.raw();
+        let offset = rho_tensor.offset();
+        let len = ngrids * nvar;
+        raw[offset..offset + len].to_vec()
+    } else {
+        rho_array
+    };
+
+    // ── Compute fxc kernel analytically via libxc ──
+    let func_ids = &xc_data.dfa_compnt_scf;
+    let func_factors = &xc_data.dfa_paramr_scf;
+    let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_array, ngrids, 2);
+
+    // xc_tensors[2] = fxc kernel (deriv=2)
+    let fxc_tensor = xc_tensors[2].as_ref()
+        .expect("fxc (deriv=2) should be available");
+    let fxc_raw: Vec<f64> = {
+        let raw = fxc_tensor.raw();
+        let offset = fxc_tensor.offset();
+        let nv2 = nvar * nvar;
+        let len = ngrids * nv2;
+        raw[offset..offset + len].to_vec()
+    };
+
+    // ── Multiply fxc by grid weights ──
+    // IMPORTANT: eval_xc_eff(spin=0) returns the unpolarized fxc = (δ²Exc/δρ²)
+    // For RKS closed shell, the unpolarized fxc corresponds to:
+    //   f_u = (f_↑↑ + f_↑↓) / 2 = δ²Exc/δρ² (where ρ = ρ_↑+ρ_↓)
+    // The singlet TDDFT kernel needs f_s = f_↑↑ + f_↑↓ = 2 × f_u
+    // Reference: PySCF nr_rks_fxc_st for singlet
+    const SINGLET_FXC_FACTOR: f64 = 2.0;
+    let wfxc: Vec<f64> = if nvar == 1 {
+        (0..ngrids).map(|g| fxc_raw[g] * weights[g] * SINGLET_FXC_FACTOR).collect()
+    } else {
+        let nv2 = nvar * nvar;
+        let mut wfxc = vec![0.0; ngrids * nv2];
+        for g in 0..ngrids {
+            let w = weights[g];
+            for k in 0..nv2 {
+                wfxc[g + k * ngrids] = fxc_raw[g + k * ngrids] * w * SINGLET_FXC_FACTOR;
+            }
+        }
+        wfxc
+    };
+
+    println!(
+        "FXCMatvecData prepared: nocc={}, nvir={}, ngrids={}, nvar={}, alpha_hybrid={}",
+        occ_size, vir_size, ngrids, nvar, alpha_hybrid
+    );
+
+    FXCMatvecData {
+        nvar,
+        ngrids,
+        nocc: occ_size,
+        nvir: vir_size,
+        start_mo,
+        alpha_hybrid,
+        mo_occ,
+        mo_vir,
+        mo_occ_grad,
+        mo_vir_grad,
+        wfxc,
+        use_opt: scf.mol.ctrl.use_fxc_opt,
+    }
+}
+
 // ── Global flag to enable the optimised (rayon-parallel) kernel ──
 static USE_OPTIMIZED_FXC: AtomicBool = AtomicBool::new(true);
+
+// ── Benchmarking accumulators for fxc_matvec timing ──
+// NOTE: On group-progress the production `fxc_matvec` router does not
+// accumulate into these counters (the team version of `fxc_matvec` is kept
+// verbatim per merge rules). `fxc_matvec_reset_bench` /
+// `fxc_matvec_report_bench` are still provided so external call sites compile;
+// they will report zeros until the router is instrumented (handled by Task 3).
+static FXC_MATVEC_COUNT: AtomicU64 = AtomicU64::new(0);
+static FXC_MATVEC_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Reset the fxc_matvec benchmark counters.
+pub fn fxc_matvec_reset_bench() {
+    FXC_MATVEC_COUNT.store(0, Ordering::Relaxed);
+    FXC_MATVEC_NS.store(0, Ordering::Relaxed);
+}
+
+/// Read and report cumulative fxc_matvec timing.
+pub fn fxc_matvec_report_bench() {
+    let count = FXC_MATVEC_COUNT.load(Ordering::Relaxed);
+    let total_ns = FXC_MATVEC_NS.load(Ordering::Relaxed);
+    if count > 0 {
+        let total_s = total_ns as f64 / 1e9;
+        let avg_ms = total_s / count as f64 * 1000.0;
+        println!("\n[FXC_BENCH] fxc_matvec called {} times", count);
+        println!("[FXC_BENCH] Total time: {:.6} s", total_s);
+        println!("[FXC_BENCH] Average time per call: {:.6} ms ({:.3} µs)",
+                 avg_ms, avg_ms * 1000.0);
+    }
+}
 
 /// Set whether the production `fxc_matvec` should use the optimised kernel.
 ///
