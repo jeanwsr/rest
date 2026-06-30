@@ -1071,6 +1071,11 @@ pub struct RIRHFHessian<'a> {
     /// in `calc_ej_ek` and reused in `calc_h1ao` to avoid recomputing
     /// expensive libcint calls.
     pub shared_integrals: Option<SharedHessianIntegrals>,
+    /// CP-HF solver config (sourced from HessianParameters; env vars override
+    /// for the dev comparison workflow). Set after `new()` from hess_ctrl.
+    pub solver: String,
+    pub krylov_max_cycle: usize,
+    pub krylov_tol: f64,
 }
 
 /// Shared RI integrals between `calc_ej_ek` and `calc_h1ao`.
@@ -1104,6 +1109,9 @@ impl RIRHFHessian<'_> {
             h1ao: Vec::new(),
             timings: Vec::new(),
             shared_integrals: None,
+            solver: String::from("krylov"),
+            krylov_max_cycle: 50,
+            krylov_tol: 1.0e-12,
         }
     }
 
@@ -3561,15 +3569,16 @@ impl RIRHFHessian<'_> {
         // transform_h1ao_ao2mo in the mo_e1 loop below.
         let mut h1_mo_all: Vec<Vec<Vec<f64>>> = vec![vec![vec![]; 3]; natm];
 
-        // Solver selection: override via REST_CPHF_METHOD env var (default "krylov").
+        // Solver selection: primary source is HessianParameters (self.solver);
+        // REST_CPHF_METHOD env var still overrides for the dev workflow.
         // REST_CPHF_COMPARE=1 → for atom 0, dir 0, also run dense and print maxdiff.
-        let cphf_method = std::env::var("REST_CPHF_METHOD").unwrap_or_default();
-        let use_krylov = cphf_method.eq_ignore_ascii_case("krylov") || cphf_method.is_empty();
+        let cphf_method = std::env::var("REST_CPHF_METHOD").unwrap_or_else(|_| self.solver.clone());
+        let use_krylov = cphf_method.eq_ignore_ascii_case("krylov");
         let do_compare = std::env::var("REST_CPHF_COMPARE").is_ok();
         let krylov_max_cycle: usize = std::env::var("REST_CPHF_KRYLOV_MAXCYCLE")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(self.krylov_max_cycle);
         let krylov_tol: f64 = std::env::var("REST_CPHF_KRYLOV_TOL")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(1e-8);
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(self.krylov_tol);
         if use_krylov {
             println!("  CP-HF: using Krylov solver (max_cycle={}, tol={:.1e})",
                      krylov_max_cycle, krylov_tol);
@@ -4315,6 +4324,11 @@ fn run_hessian_pipeline(
 
     // Build full object to access components
     let mut hess = RIRHFHessian::new(scf);
+    // Wire CP-HF solver config from HessianParameters (env vars still override
+    // for the dev REST_CPHF_COMPARE workflow).
+    hess.solver = hess_ctrl.solver.clone();
+    hess.krylov_max_cycle = hess_ctrl.krylov_max_cycle;
+    hess.krylov_tol = hess_ctrl.krylov_tol;
     // Env var override for development: REST_EJ_EK_GX=inline|verify
     // BLAS is the default (no env var needed). Set to 'inline' or 'verify'
     // to run the old for-loop path and diff against the BLAS baseline.
