@@ -3131,13 +3131,7 @@ impl RIRHFHessian<'_> {
         // Per-atom: h1ao = hcore_deriv + vj1 - 0.5*vk1 + vxc_deriv1
         let _t_vxc_d1 = std::time::Instant::now();
         let vxc_d1: Option<Vec<Vec<f64>>> = if self.is_rks() {
-            let xct = if mol.xc_data.use_density_gradient() {
-                crate::dft::xc_deriv::XCType::GGA
-            } else {
-                crate::dft::xc_deriv::XCType::LDA
-            };
-            let v = crate::hessian::xc_hessian::vxc_deriv1_streaming(scf, xct);
-            Some(v.iter().map(|m| m.iter().copied().collect()).collect())
+            Some(crate::hessian::rks::compute_vxc_h1ao(scf))
         } else { None };
         self.h1ao.clear();
         for ia in 0..natm {
