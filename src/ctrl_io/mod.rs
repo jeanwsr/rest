@@ -9,7 +9,7 @@ use crate::ctrl_io::geometric_pyo3_io::parse_geometric_keywords;
 use crate::ctrl_io::quasiparticle_methods::parse_quasiparticle_keywords;
 use crate::ri_jk::decompose::J2CDecompOption;
 use crate::ctrl_io::tddft_parameters::parse_tddft_keywords;
-use crate::ctrl_io::cphf_parameters::parse_cphf_keywords;
+use crate::ctrl_io::hessian_parameters::parse_hessian_keywords;
 use crate::{check_norm::force_state_occupation::ForceStateOccupation};
 use crate::scf_io::smear::SmearingType;
 use crate::dft::{DFAFamily, DFTType, DFA4REST};
@@ -33,12 +33,12 @@ mod geometric_pyo3_io;
 mod solvent;
 pub mod quasiparticle_methods;
 pub mod tddft_parameters;
-pub mod cphf_parameters;
+pub mod hessian_parameters;
 use geometric_pyo3_io::GeomeTRIC;
 mod path_util;
 use quasiparticle_methods::QuasiParticle;
 use tddft_parameters::TDDFTParameters;
-use cphf_parameters::CPHFParameters;
+use hessian_parameters::HessianParameters;
 
 pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
     let tmp_cont = fs::read_to_string(&filename[..])?;
@@ -61,7 +61,7 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     let mut tmp_geomtric = parse_geometric_keywords(tmp_keys)?;
     let mut tmp_quasiparticle=parse_quasiparticle_keywords(tmp_keys)?;
     let mut tmp_tddft = parse_tddft_keywords(tmp_keys)?;
-    let mut tmp_cphf = parse_cphf_keywords(tmp_keys)?;
+    let mut tmp_hessian = parse_hessian_keywords(tmp_keys)?;
     if let Some(tmp_geomtric) = &mut tmp_geomtric {
         tmp_input.geometric_pyo3 = Some(std::mem::take(tmp_geomtric));
     }
@@ -71,8 +71,8 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     if let Some(tmp_tddft) = &mut tmp_tddft {
         tmp_input.tddft = Some(std::mem::take(tmp_tddft));
     }
-    if let Some(tmp_cphf) = &mut tmp_cphf {
-        tmp_input.cphf = Some(std::mem::take(tmp_cphf));
+    if let Some(tmp_hessian) = &mut tmp_hessian {
+        tmp_input.hessian = Some(std::mem::take(tmp_hessian));
     }
     Ok((tmp_input,tmp_geomcell))
 }
@@ -364,7 +364,7 @@ pub struct InputKeywords {
     pub tddft: Option<TDDFTParameters>,
     pub j2c_decomp: J2CDecompOption,
     pub ri_pt2: RiPt2Option,
-    pub cphf: Option<CPHFParameters>,
+    pub hessian: Option<HessianParameters>,
     /// Use the optimized fxc_matvec_opt (rayon + pre-allocated workspace).
     #[pyo3(get, set)]
     pub use_fxc_opt: bool,
@@ -528,7 +528,7 @@ impl InputKeywords {
             j2c_decomp: J2CDecompOption::default(),
             ri_pt2: RiPt2Option::default(),
             tddft: None,
-            cphf: None,
+            hessian: None,
             use_fxc_opt: false,
             rel: RelativisticMethod::None,
         }
