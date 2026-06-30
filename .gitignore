@@ -18,3 +18,4 @@ bse_pool
 src/dft/libxc/names_and_values.rs
 src/solvent/grad_solver_derivation.md
 *.bak
+/docs/
