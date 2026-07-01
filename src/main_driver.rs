@@ -354,7 +354,7 @@ pub fn main_driver() -> anyhow::Result<()> {
     // Now for TDDFT calculations
     //===================================
     if let Some(tddft_ctrl) = &scf_data.mol.ctrl.tddft {
-        if !tddft_ctrl.damped_tddft {
+        if !tddft_ctrl.response_tddft {
             time_mark.new_item("TDDFT", "the TDDFT eigenvalue calculation");
             time_mark.count_start("TDDFT");
             if let Err(e) = crate::ri_tddft::tddft_main(&mut scf_data) {
@@ -365,31 +365,24 @@ pub fn main_driver() -> anyhow::Result<()> {
     }
 
     //===================================
-    // Now for damped TDDFT calculations
+    // Now for response TDDFT calculations
     //===================================
     if let Some(tddft_ctrl) = &scf_data.mol.ctrl.tddft {
-        if tddft_ctrl.damped_tddft {
-            time_mark.new_item("DampedTDDFT", "the damped TDDFT calculation");
-            time_mark.count_start("DampedTDDFT");
-            if let Err(e) = crate::ri_tddft::damped_tddft(&mut scf_data) {
-                eprintln!("Error in damped TDDFT calculation: {}", e);
+        if tddft_ctrl.response_tddft {
+            time_mark.new_item("ResponseTDDFT", "the response TDDFT calculation");
+            time_mark.count_start("ResponseTDDFT");
+            if let Err(e) = crate::ri_tddft::response_tddft(&mut scf_data) {
+                eprintln!("Error in response TDDFT calculation: {}", e);
             }
-            time_mark.count("DampedTDDFT");
+            time_mark.count("ResponseTDDFT");
         }
     }
 
     //===================================
-    // Now for CP-HF calculations
+    // CP-HF / Hessian / Frequency calculations
     //===================================
-    if let Some(cphf_ctrl) = &scf_data.mol.ctrl.cphf {
-        let label = if cphf_ctrl.solver == "dense" { "dense" } else { "krylov" };
-        println!("\n=== CP-HF Calculation (solver={}) ===", label);
-        time_mark.new_item("CPHF", &format!("the CP-HF {} solver test", label));
-        time_mark.count_start("CPHF");
-        if let Err(e) = crate::ri_cphf::test_cphf_dense(&scf_data) {
-            eprintln!("Error in CP-HF calculation: {}", e);
-        }
-        time_mark.count("CPHF");
+    if let Some(ref hess_ctrl) = scf_data.mol.ctrl.hessian {
+        crate::hessian::rhf_hessian_main(&scf_data, hess_ctrl, &mut time_mark);
     }
 
     time_mark.count("Overall");

@@ -1453,23 +1453,27 @@ pub fn cartesian_gto_3rd_batch_v04(a: f64, l: usize, c: &[f64;3], r:&[[f64;3]]) 
             r
         )
     ).for_each(
-        |(ao, aox, aoy, aoz, aoxx, aoxy, aoxz, aoyy, aoyz, aozz, aoxxx, aoxxy, aoxxz, aoxyy, aoxyz, aoxzz, aoyyy, aoyyz, aoyzz, aozzz, r)| 
+        |(ao, aox, aoy, aoz, aoxx, aoxy, aoxz, aoyy, aoyz, aozz, aoxxx, aoxxy, aoxxz, aoxyy, aoxyz, aoxzz, aoyyy, aoyyz, aoyzz, aozzz, r)|
         {
-            // exp part 
+            // exp part
             let mut rr = [0.0; 3];
             let rdot = izip!(
-                rr.iter_mut(), r.iter(), c.iter()).fold(0.0, |rdot, (rr, r, c)| 
+                rr.iter_mut(), r.iter(), c.iter()).fold(0.0, |rdot, (rr, r, c)|
                 {
                     *rr= r - c;
                     rdot + *rr*(*rr)
                 }
             );
             let e = norm0 * libm::exp(-a*rdot);
-            // polynomial part 
-            // initialize the 0th order 
+            // polynomial part
+            // initialize the 0th order
             fx0[0] = 1.0; fy0[0] = 1.0; fz0[0] = 1.0;
             // check if it should be ri - rA
-            for lx in 1..=l+2 {
+            // NOTE: must initialize up to l+3 (not l+2) because the deepest _gto_nabla1
+            // call for fx1 (with l_input=l+2) accesses fx0[l+3] when computing fx1[l+2].
+            // For 2nd-order code (cartesian_gto_2nd_batch_v04), l+2 suffices since
+            // the deepest call uses l_input=l+1 which only reads fx0[l+2].
+            for lx in 1..=l+3 {
                 fx0[lx] = fx0[lx-1] * rr[0];
                 fy0[lx] = fy0[lx-1] * rr[1];
                 fz0[lx] = fz0[lx-1] * rr[2];

@@ -1,5 +1,14 @@
+pub mod ej_ek_baseline;
+pub mod memory_monitor;
 pub mod rhf;
+pub mod rks;
 pub mod traits;
+pub mod xc_hessian;
+pub use ej_ek_baseline::{EjEkBaseline, BASELINE_TERM_KEYS};
+pub use rhf::{
+    compute_hessian, compute_frequencies, compute_frequencies_from_hessian,
+    rhf_hessian_main,
+};
 
 use std::io::{self, Write};
 

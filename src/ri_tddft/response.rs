@@ -1,6 +1,6 @@
-/// Damped (frequency-domain) TDDFT linear response solver
+/// Response (frequency-domain) TDDFT solver
 ///
-/// Implements the damped TDDFT response calculation, solving the 4-component
+/// Implements the response TDDFT calculation, solving the 4-component
 /// non-Hermitian linear system:
 ///
 ///   [A - ω,   B,    -γ,    0 ] [rp]   [μ_z]
@@ -12,7 +12,7 @@
 /// and exchange contributions, using KS orbital energy differences), ω is
 /// the external field frequency, and γ is the lifetime broadening.
 ///
-/// Reference: ri_bse::damped implementation adapted for TDDFT operators.
+/// Reference: ri_bse::response implementation adapted for TDDFT operators.
 
 use itertools::Itertools;
 use std::time::Instant;
@@ -22,7 +22,7 @@ use std::io::Write;
 use rest_tensors::MatrixFull;
 use rest_tensors::matrix::matrix_blas_lapack::{_dsolve, _dgemm_full};
 
-use crate::ri_bse::damped::{
+use crate::ri_bse::response::{
     fourvec_dot_product, fourvec_scaled_add,
     klopper_subspace_solver, fourvec_gmres, poples_numerical_trick,
     obtain_mu_ia_z, eval_ao_on_grids,
@@ -146,7 +146,7 @@ fn pairvec_matvec_tddft(
 
 /// Update W vectors with diagonal correction using KS energy gaps
 ///
-/// TDDFT version of update_w_vecs from ri_bse::damped, using KS energy gaps
+/// TDDFT version of update_w_vecs from ri_bse::response, using KS energy gaps
 /// instead of QP energies. Applies the T(z) = A_4c_diag^{-1} * Interaction(z)
 /// operator needed by the Pople subspace solver.
 fn update_w_vecs_tddft<F1>(
@@ -204,8 +204,8 @@ where
 // Result printing
 // ========================================================================
 
-/// Print damped TDDFT results: polarizability and induced density norm
-fn print_damped_tddft_results(
+/// Print response TDDFT results: polarizability and induced density norm
+fn print_response_tddft_results(
     solution: &(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>),
     mu_z_vec: &[f64],
     occ_size: usize,
@@ -221,7 +221,7 @@ fn print_damped_tddft_results(
     let pol_re: f64 = density_real.iter().zip(mu_z_vec.iter()).map(|(d, m)| d * m).sum();
     let pol_im: f64 = density_imag.iter().zip(mu_z_vec.iter()).map(|(d, m)| d * m).sum();
 
-    println!("  --- Damped TDDFT Results ---");
+    println!("  --- Response TDDFT Results ---");
     println!("    Frequency ω = {:.8} Ha ({:.4} eV)", omega, omega * 27.2114);
     println!("    Lifetime  γ = {:.8} Ha", gamma);
     println!("    Re[α_zz(ω)] = {:.12e} a.u.", pol_re);
@@ -233,7 +233,7 @@ fn print_damped_tddft_results(
 }
 
 /// Export polarized density to AO_Polarized_Density_Matrix.txt and
-/// Polarized_Density_Grids.txt (mirrors ri_bse::damped::export_density).
+/// Polarized_Density_Grids.txt (mirrors ri_bse::response::export_density).
 fn export_density_tddft(
     scf: &SCF,
     solution: &(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>),
@@ -267,7 +267,7 @@ fn export_density_tddft(
     // Write AO matrix
     let mut file = OpenOptions::new().write(true).create(true).truncate(true)
         .open("AO_Polarized_Density_Matrix.txt").expect("open failure");
-    writeln!(file, "AO Basis Polarized Density Matrix (damped TDDFT):\nSize:{:?}\nData(Column Major){:#?}",
+    writeln!(file, "AO Basis Polarized Density Matrix (response TDDFT):\nSize:{:?}\nData(Column Major){:#?}",
              ao_polarized_density_matrix.size, ao_polarized_density_matrix.data).expect("write failure");
 
     // Evaluate AO on grids and compute grid density
@@ -285,7 +285,7 @@ fn export_density_tddft(
         .open("Polarized_Density_Grids.txt").expect("open failure");
 
     writeln!(file, "{}", "=".repeat(70)).expect("write failure");
-    writeln!(file, "POLARIZED DENSITY ON SPATIAL GRIDS (damped TDDFT result)").expect("write failure");
+    writeln!(file, "POLARIZED DENSITY ON SPATIAL GRIDS (response TDDFT result)").expect("write failure");
     writeln!(file, "{}", "=".repeat(70)).expect("write failure");
 
     // Geometry
@@ -338,11 +338,11 @@ fn export_density_tddft(
 // Solver implementations
 // ========================================================================
 
-/// Pople-Krylov subspace solver for damped TDDFT
+/// Pople-Krylov subspace solver for response TDDFT
 ///
 /// Uses poples_numerical_trick with TDDFT-specific pair matvec and
 /// KS-energy-based diagonal correction.
-fn damped_tddft_pople(
+fn response_tddft_pople(
     scf: &SCF,
     fxc_data: &FXCMatvecData,
     ri_ov: &MatrixFull<f64>,
@@ -397,7 +397,7 @@ fn damped_tddft_pople(
     let elapsed = start.elapsed();
     println!("  Pople solver finished in {:?}", elapsed);
 
-    print_damped_tddft_results(&solution, mu_z_vec, occ_size, vir_size, omega, gamma);
+    print_response_tddft_results(&solution, mu_z_vec, occ_size, vir_size, omega, gamma);
     solution
 }
 
@@ -405,7 +405,7 @@ fn damped_tddft_pople(
 ///
 /// Returns a closure that computes:
 ///   A_4c * (rp, rm, ip, im) = (vec1, vec2, vec3, vec4)
-/// with the full damped TDDFT linear response operator.
+/// with the full response TDDFT operator.
 fn build_fourvec_matvec_tddft<'a>(
     scf: &'a SCF,
     fxc_data: &'a FXCMatvecData,
@@ -445,7 +445,7 @@ fn build_fourvec_matvec_tddft<'a>(
     }
 }
 
-/// Build diagonal preconditioner closure for damped TDDFT
+/// Build diagonal preconditioner closure for response TDDFT
 fn build_precond_tddft(
     ks_diag: &[f64],
     omega: f64,
@@ -463,8 +463,8 @@ fn build_precond_tddft(
     }
 }
 
-/// GMRES solver for damped TDDFT
-fn damped_tddft_gmres(
+/// GMRES solver for response TDDFT
+fn response_tddft_gmres(
     scf: &SCF,
     fxc_data: &FXCMatvecData,
     ri_ov: &MatrixFull<f64>,
@@ -499,12 +499,12 @@ fn damped_tddft_gmres(
     let elapsed = start.elapsed();
     println!("  GMRES solver finished in {:?}", elapsed);
 
-    print_damped_tddft_results(&solution, mu_z_vec, occ_size, vir_size, omega, gamma);
+    print_response_tddft_results(&solution, mu_z_vec, occ_size, vir_size, omega, gamma);
     solution
 }
 
-/// Klopper subspace solver for damped TDDFT
-fn damped_tddft_klopper(
+/// Klopper subspace solver for response TDDFT
+fn response_tddft_klopper(
     scf: &SCF,
     fxc_data: &FXCMatvecData,
     ri_ov: &MatrixFull<f64>,
@@ -543,12 +543,12 @@ fn damped_tddft_klopper(
     let elapsed = start.elapsed();
     println!("  Klopper solver finished in {:?}", elapsed);
 
-    print_damped_tddft_results(&solution, mu_z_vec, occ_size, vir_size, omega, gamma);
+    print_response_tddft_results(&solution, mu_z_vec, occ_size, vir_size, omega, gamma);
     solution
 }
 
-/// Dense solver for damped TDDFT (small systems only)
-fn damped_tddft_dense(
+/// Dense solver for response TDDFT (small systems only)
+fn response_tddft_dense(
     scf: &SCF,
     fxc_data: &FXCMatvecData,
     ri_ov: &MatrixFull<f64>,
@@ -627,7 +627,7 @@ fn damped_tddft_dense(
 
     // Solve via LAPACK LU
     let solve_start = Instant::now();
-    let result = _dsolve(&a_4c, &rhs).expect("Dense LU solve failed for damped TDDFT");
+    let result = _dsolve(&a_4c, &rhs).expect("Dense LU solve failed for response TDDFT");
     println!("  Dense LU solve took {:?}", solve_start.elapsed());
 
     let solution = (
@@ -637,7 +637,7 @@ fn damped_tddft_dense(
         result[3 * dim..4 * dim].to_vec(),
     );
 
-    print_damped_tddft_results(&solution, mu_z_vec, occ_size, vir_size, omega, gamma);
+    print_response_tddft_results(&solution, mu_z_vec, occ_size, vir_size, omega, gamma);
     solution
 }
 
@@ -645,27 +645,27 @@ fn damped_tddft_dense(
 // Public entry point
 // ========================================================================
 
-/// Main damped TDDFT entry point
+/// Main response TDDFT entry point
 ///
-/// Called from main_driver when `damped_tddft = true` in the `[tddft]` section.
+/// Called from main_driver when `response_tddft = true` in the `[tddft]` section.
 /// Dispatches to the selected solver variant (pople, gmres, klopper, dense).
 ///
-/// The damped TDDFT calculation solves the frequency-domain linear response:
+/// The response TDDFT calculation solves the frequency-domain linear system:
 ///   (H_4c - ω - iγ) · Z(ω) = μ
 /// and computes the frequency-dependent polarizability α_zz(ω).
-pub fn damped_tddft(scf: &mut SCF) -> Result<(), String> {
+pub fn response_tddft(scf: &mut SCF) -> Result<(), String> {
     let tddft_ctrl = scf.mol.ctrl.tddft.clone()
-        .ok_or_else(|| "TDDFT control parameters not set for damped TDDFT".to_string())?;
+        .ok_or_else(|| "TDDFT control parameters not set for response TDDFT".to_string())?;
 
-    if !tddft_ctrl.damped_tddft {
+    if !tddft_ctrl.response_tddft {
         return Ok(());
     }
 
     let omega = tddft_ctrl.external_field_freq;
     let gamma = tddft_ctrl.lifetime_gamma;
-    let solver = tddft_ctrl.damped_tddft_solver.clone();
-    let tol = tddft_ctrl.damped_tddft_tol;
-    let max_iter = tddft_ctrl.damped_tddft_max_iter;
+    let solver = tddft_ctrl.response_tddft_solver.clone();
+    let tol = tddft_ctrl.response_tddft_tol;
+    let max_iter = tddft_ctrl.response_tddft_max_iter;
     let xlet = if tddft_ctrl.tddft_spin == "singlet" { 'S' }
                else if tddft_ctrl.tddft_spin == "triplet" { 'T' }
                else { 'R' };
@@ -676,13 +676,13 @@ pub fn damped_tddft(scf: &mut SCF) -> Result<(), String> {
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) = tddft_occupation_parameters(scf);
     let dim = occ_size * vir_size;
     if dim == 0 {
-        return Err("No occupied-virtual excitation space for damped TDDFT".to_string());
+        return Err("No occupied-virtual excitation space for response TDDFT".to_string());
     }
 
     let ks_energies = &scf.eigenvalues[0].clone();
 
-    println!("\n=== Damped TDDFT Calculation ===");
-    println!("  Method: Damped linear response (frequency-domain)");
+    println!("\n=== Response TDDFT Calculation ===");
+    println!("  Method: Response (frequency-domain)");
     println!("  Spin: {}", if xlet == 'S' { "Singlet" } else if xlet == 'T' { "Triplet" } else { "Generic" });
     println!("  occ_size={}, vir_size={}, dim={}", occ_size, vir_size, dim);
     println!("  ω = {:.8} Ha ({:.4} eV)", omega, omega * 27.2114);
@@ -717,45 +717,45 @@ pub fn damped_tddft(scf: &mut SCF) -> Result<(), String> {
 
     // Dispatch to solver
     let solution = match solver.as_str() {
-        "pople" => damped_tddft_pople(
+        "pople" => response_tddft_pople(
             scf, &fxc_data, &ri_ov, &ri_oo_exch, &ri_vv_exch, &ri_ov_exch,
             &mu_z_vec, ks_energies, start_mo, lumo, occ_size, vir_size,
             omega, gamma, xlet, alpha_hybrid, tol, max_iter,
         ),
-        "gmres" => damped_tddft_gmres(
+        "gmres" => response_tddft_gmres(
             scf, &fxc_data, &ri_ov, &ri_oo_exch, &ri_vv_exch, &ri_ov_exch,
             &mu_z_vec, occ_size, vir_size,
             omega, gamma, xlet, alpha_hybrid, tol, max_iter,
         ),
-        "klopper" => damped_tddft_klopper(
+        "klopper" => response_tddft_klopper(
             scf, &fxc_data, &ri_ov, &ri_oo_exch, &ri_vv_exch, &ri_ov_exch,
             &mu_z_vec, ks_energies, start_mo, lumo, occ_size, vir_size,
             omega, gamma, xlet, alpha_hybrid, tol, max_iter,
         ),
-        "dense" => damped_tddft_dense(
+        "dense" => response_tddft_dense(
             scf, &fxc_data, &ri_ov, &ri_oo_exch, &ri_vv_exch, &ri_ov_exch,
             &mu_z_vec, occ_size, vir_size,
             omega, gamma, xlet, alpha_hybrid,
         ),
         other => return Err(format!(
-            "Invalid damped_tddft_solver: \"{}\". Expected \"pople\", \"gmres\", \"klopper\", or \"dense\".",
+            "Invalid response_tddft_solver: \"{}\". Expected \"pople\", \"gmres\", \"klopper\", or \"dense\".",
             other
         )),
     };
 
     // Export polarized density to grid files
-    if !tddft_ctrl.damped_tddft_grids.is_empty() {
+    if !tddft_ctrl.response_tddft_grids.is_empty() {
         println!("  Exporting polarized density to grid files...");
         export_density_tddft(
             scf, &solution,
             start_mo, occ_size, vir_size, lumo, num_state,
-            &tddft_ctrl.damped_tddft_grids,
-            tddft_ctrl.damped_tddft_x_start, tddft_ctrl.damped_tddft_x_end, tddft_ctrl.damped_tddft_x_points,
-            tddft_ctrl.damped_tddft_y_start, tddft_ctrl.damped_tddft_y_end, tddft_ctrl.damped_tddft_y_points,
-            tddft_ctrl.damped_tddft_z_start, tddft_ctrl.damped_tddft_z_end, tddft_ctrl.damped_tddft_z_points,
+            &tddft_ctrl.response_tddft_grids,
+            tddft_ctrl.response_tddft_x_start, tddft_ctrl.response_tddft_x_end, tddft_ctrl.response_tddft_x_points,
+            tddft_ctrl.response_tddft_y_start, tddft_ctrl.response_tddft_y_end, tddft_ctrl.response_tddft_y_points,
+            tddft_ctrl.response_tddft_z_start, tddft_ctrl.response_tddft_z_end, tddft_ctrl.response_tddft_z_points,
         );
     }
 
-    println!("  Damped TDDFT calculation completed.\n");
+    println!("  Response TDDFT calculation completed.\n");
     Ok(())
 }
