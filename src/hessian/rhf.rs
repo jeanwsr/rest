@@ -1094,12 +1094,16 @@ impl RIRHFHessian<'_> {
         match scf_data.scftype { scf_io::SCFType::RHF => {},
             _ => panic!("SCF type is not suitable for RHF Hessian."),
         }
-        // Auto-detect RKS: skip exchange for pure DFT, set factor_k=0
+        // Auto-detect RKS: pure DFA keeps factor_k=0 (no exact exchange);
+        // hybrid DFA (e.g. B3LYP, hyb=0.2) scales the K term by hyb so that
+        //   h_partial = e1 + ej - hyb*ek        (PySCF df/hessian/rks.py:60)
+        //   h1ao      = h1 + vj1 - 0.5*hyb*vk1  (PySCF df/hessian/rks.py:109)
         let is_dft = !scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
         let flags = if is_dft {
+            let hyb = scf_data.mol.xc_data.dfa_hybrid_scf;
             RIRHFHessianFlagsBuilder::default()
-                .with_k(false)
-                .factor_k(Some(0.0))
+                .with_k(hyb.abs() >= 1e-6)
+                .factor_k(Some(hyb))
                 .build().unwrap()
         } else {
             RIRHFHessianFlagsBuilder::default().build().unwrap()
@@ -1121,9 +1125,7 @@ impl RIRHFHessian<'_> {
     }
     /// Check if the XC functional contains a hybrid (exact-exchange) component.
     fn _is_hybrid(&self) -> bool {
-        // libxc_is_hybrid equivalent: check if any func_id is a hybrid
-        // For now, rely on mol.xc_data.dfa_paramr_scf factor_k values
-        false
+        self.scf_data.mol.xc_data.is_hybrid()
     }
 
     pub fn print_timings(&self) {
