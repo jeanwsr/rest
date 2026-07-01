@@ -24,6 +24,7 @@ use std::time::Duration;
 /// it safely can. No-op (returns 0) on non-glibc allocators.
 pub fn trim_to_os(print_level: usize) {
     let rss_before = current_rss_mb();
+    #[cfg(target_os = "linux")]
     unsafe { let _ = libc::malloc_trim(0); }
     let rss_after = current_rss_mb();
     if print_level > 1 {
