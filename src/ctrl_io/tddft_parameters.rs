@@ -41,6 +41,10 @@ pub struct TDDFTParameters {
     pub tddft_feast_gaussian_width_factor: f64,
     // Use optimized (rayon-parallel) fxc_matvec kernel
     pub tddft_use_optimized_fxc: bool,
+    // Virtual orbital energy cutoff (Hartree); orbitals with KS eigenvalue
+    // above this are excluded from the TDDFT excitation space. Default 1e6
+    // (effectively no cutoff).
+    pub tddft_cutoff_energy: f64,
 }
 
 impl Default for TDDFTParameters {
@@ -81,6 +85,7 @@ impl Default for TDDFTParameters {
             tddft_feast_init_guess_type: String::from("random"),
             tddft_feast_gaussian_width_factor: 0.5,
             tddft_use_optimized_fxc: true,
+            tddft_cutoff_energy: 1.0e6,
         }
     }
 }
@@ -250,6 +255,11 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
             p.tddft_use_optimized_fxc = match tmp_ctrl.get("tddft_use_optimized_fxc").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(b) => *b,
                 _ => true,
+            };
+            // Virtual orbital energy cutoff
+            p.tddft_cutoff_energy = match tmp_ctrl.get("tddft_cutoff_energy").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e6),
+                _ => 1.0e6,
             };
             Ok(Some(p))
         },

@@ -491,7 +491,13 @@ pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:
         let initial_guess=davidson_solver::generate_initial_guess(&energy_diag,qp_ctrl.davidson_target_excitations);
         let preptime=start.elapsed();
         println!("BSE Preparation Time:{:?}",preptime);
-        eigenpairs=davidson_solver::lr_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),|z|matvec::b_block_matvec(scf_data,&qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess);
+        let davidson_cfg = davidson_solver::DavidsonConfig {
+            max_subspace: qp_ctrl.davidson_maximum_subspace_size,
+            add_dim: qp_ctrl.davidson_add_dimensions,
+            restart_dim: qp_ctrl.davidson_restart_dimensions,
+            max_iter: qp_ctrl.davidson_max_iter,
+        };
+        eigenpairs=davidson_solver::lr_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),|z|matvec::b_block_matvec(scf_data,&qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&davidson_cfg);
         println!("Davidson Solver took {:?}",start.elapsed()-preptime);
     }else{
         println!("starts contructing Full BSE hamiltonian!!!");
@@ -575,7 +581,13 @@ pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char
         let initial_guess=davidson_solver::generate_initial_guess(&energy_diag,qp_ctrl.davidson_target_excitations);
         let preptime=start.elapsed();
         println!("BSE Preparation Time:{:?}",preptime);
-        eigenpairs=davidson_solver::tda_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&qp_ctrl);
+        let davidson_cfg = davidson_solver::DavidsonConfig {
+            max_subspace: qp_ctrl.davidson_maximum_subspace_size,
+            add_dim: qp_ctrl.davidson_add_dimensions,
+            restart_dim: qp_ctrl.davidson_restart_dimensions,
+            max_iter: qp_ctrl.davidson_max_iter,
+        };
+        eigenpairs=davidson_solver::tda_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&davidson_cfg);
         println!("Davidson Solver took {:?}",start.elapsed());
     }else{
         println!("starts contructing TDA BSE hamiltonian!!!");
@@ -639,14 +651,20 @@ pub fn bse_both_spins(scf_data:&mut SCF,quasiparticle_energies:&Vec<f64>)->(Vec<
         let energy_diag=construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
         let preptime=start.elapsed();
         println!("BSE Preparation Time:{:?}",preptime);
+        let davidson_cfg = davidson_solver::DavidsonConfig {
+            max_subspace: qp_ctrl.davidson_maximum_subspace_size,
+            add_dim: qp_ctrl.davidson_add_dimensions,
+            restart_dim: qp_ctrl.davidson_restart_dimensions,
+            max_iter: qp_ctrl.davidson_max_iter,
+        };
         qp_ctrl.bse_spin=String::from("singlet");
         let initial_guess=davidson_solver::generate_initial_guess(&energy_diag,qp_ctrl.davidson_target_excitations);
-        eigenpairs_singlet=davidson_solver::tda_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&qp_ctrl);
+        eigenpairs_singlet=davidson_solver::tda_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&davidson_cfg);
         let one_dav_time=start.elapsed();
         println!("Singlets calculation took {:?}",one_dav_time-preptime);
         qp_ctrl.bse_spin=String::from("triplet");
         let initial_guess=davidson_solver::generate_initial_guess(&energy_diag,qp_ctrl.davidson_target_excitations);
-        eigenpairs_triplet=davidson_solver::tda_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&qp_ctrl);
+        eigenpairs_triplet=davidson_solver::tda_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&davidson_cfg);
         println!("Triplets calculation took {:?}",start.elapsed()-one_dav_time);
     }else{
         let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
@@ -682,12 +700,18 @@ pub fn bse_both_spins(scf_data:&mut SCF,quasiparticle_energies:&Vec<f64>)->(Vec<
         let initial_guess=davidson_solver::generate_initial_guess(&energy_diag,qp_ctrl.davidson_target_excitations);
         let preptime=start.elapsed();
         println!("BSE Preparation Time:{:?}",preptime);
+        let davidson_cfg = davidson_solver::DavidsonConfig {
+            max_subspace: qp_ctrl.davidson_maximum_subspace_size,
+            add_dim: qp_ctrl.davidson_add_dimensions,
+            restart_dim: qp_ctrl.davidson_restart_dimensions,
+            max_iter: qp_ctrl.davidson_max_iter,
+        };
         qp_ctrl.bse_spin=String::from("singlet");
-        eigenpairs_singlet=davidson_solver::lr_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),|z|matvec::b_block_matvec(scf_data,&qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess.clone());
+        eigenpairs_singlet=davidson_solver::lr_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),|z|matvec::b_block_matvec(scf_data,&qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess.clone(),&davidson_cfg);
         let one_dav_time=start.elapsed();
         println!("Singlets calculation took {:?}",one_dav_time-preptime);
         qp_ctrl.bse_spin=String::from("triplet");
-        eigenpairs_triplet=davidson_solver::lr_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),|z|matvec::b_block_matvec(scf_data,&qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess);
+        eigenpairs_triplet=davidson_solver::lr_davidson_solver(scf_data.mol.ctrl.print_level,|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),|z|matvec::b_block_matvec(scf_data,&qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&davidson_cfg);
         println!("Triplets calculation took {:?}",start.elapsed()-one_dav_time);
     }
     (eigenpairs_singlet,eigenpairs_triplet)

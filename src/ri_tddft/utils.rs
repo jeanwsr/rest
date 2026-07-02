@@ -16,7 +16,10 @@ use crate::scf_io::SCF;
 /// TDDFT excitation space, which would cause convergence issues in the
 /// Davidson solver.
 pub fn tddft_occupation_parameters(scf: &SCF) -> (usize, usize, usize, usize, usize, usize) {
-    let num_state = scf.mol.num_state;
+    let cutoff = scf.mol.ctrl.tddft.as_ref()
+        .map(|c| c.tddft_cutoff_energy)
+        .unwrap_or(1.0e6);
+    let mut num_state = scf.mol.num_state;
     let mut homo = 0;
     let mut lumo = num_state;
     for i_spin in 0..scf.mol.spin_channel {
@@ -36,7 +39,16 @@ pub fn tddft_occupation_parameters(scf: &SCF) -> (usize, usize, usize, usize, us
         .map(|i| i + 1)
         .unwrap_or(scf.mol.start_mo);
     let occ_size = homo - start_mo + 1;
-    // Use all virtual orbitals (no energy cutoff)
+    // Apply virtual orbital energy cutoff (mirrors BSE's get_occupation_parameters)
+    if cutoff < 1.0e5 {
+        num_state = ks.iter().filter(|x| **x < cutoff).count();
+        if num_state < homo + 1 {
+            num_state = homo + 1; // keep at least all occupied orbitals
+        }
+        if scf.mol.ctrl.print_level > 1 {
+            println!("  TDDFT virtual cutoff: {:.4} Ha, {} states retained", cutoff, num_state);
+        }
+    }
     let vir_size = num_state - lumo;
     if start_mo > scf.mol.start_mo && scf.mol.ctrl.print_level>1 {
         println!("  TDDFT frozen core: {:.2} Ha threshold, {} orbitals frozen (MO 0..{})",

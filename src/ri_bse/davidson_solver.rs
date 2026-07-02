@@ -9,7 +9,15 @@ use crate::ri_bse;
 use rayon::prelude::*;
 use rayon::iter::ParallelBridge;
 use itertools::Itertools;
-use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
+
+/// Davidson solver configuration, decoupled from QuasiParticle/TDDFTParameters.
+#[derive(Debug, Clone)]
+pub struct DavidsonConfig {
+    pub max_subspace: usize,
+    pub add_dim: usize,
+    pub restart_dim: usize,
+    pub max_iter: usize,
+}
 
 pub fn zip_and_sort(
     eigenvalues: &Vec<f64>,
@@ -33,7 +41,7 @@ pub fn generate_initial_guess(diag:&Vec<f64>,nroots_ctrl:usize)->MatrixFull<f64>
     });
     initial_guess
 }
-pub fn tda_davidson_solver<F1>(print_level:usize,a_matvec:F1,nroots:usize,diag:&Vec<f64>,initial_guess:MatrixFull<f64>,qp_ctrl:&QuasiParticle)->Vec<(f64,Vec<f64>)>
+pub fn tda_davidson_solver<F1>(print_level:usize,a_matvec:F1,nroots:usize,diag:&Vec<f64>,initial_guess:MatrixFull<f64>,config:&DavidsonConfig)->Vec<(f64,Vec<f64>)>
 where F1:Fn(&Vec<f64>)->Vec<f64>+Send+Sync{
     let mut ss=initial_guess;
     //ss:search space S, where each column in S is a search vector
@@ -44,7 +52,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>+Send+Sync{
     let mut iter_num=0;
     loop{
         let start=Instant::now();
-        let restart=if ss.size[1]>qp_ctrl.davidson_maximum_subspace_size-qp_ctrl.davidson_add_dimensions{true}else{false};
+        let restart=if ss.size[1]>config.max_subspace-config.add_dim{true}else{false};
         iter_num+=1;
         let m=ss.size[1];
         let mut a_ss=MatrixFull::new([occ_vir,0],0.0);
@@ -75,7 +83,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>+Send+Sync{
         let mut x_proj_nroots=MatrixFull::new([m,0],0.0);
         let mut omega_nroots:Vec<f64>=Vec::new();
         if print_level>1{println!("omega={:#?}",omega);}
-        let collect_sol_num=if restart{qp_ctrl.davidson_restart_dimensions}else{cmp::min(ss.size[1],qp_ctrl.davidson_add_dimensions)};
+        let collect_sol_num=if restart{config.restart_dim}else{cmp::min(ss.size[1],config.add_dim)};
         omega.iter().zip(x_proj.iter_columns_full()).enumerate().for_each(|(n,(omega_i,x_i))|
             if n<collect_sol_num{
                 omega_nroots.push(*omega_i);
@@ -162,7 +170,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>+Send+Sync{
         });}else{
             println!("Explicit Restart");
             ss=MatrixFull::new([occ_vir,0],0.0);
-            x_full.iter_columns_full().take(qp_ctrl.davidson_restart_dimensions).for_each(|x_i|ss.push_column(x_i));
+            x_full.iter_columns_full().take(config.restart_dim).for_each(|x_i|ss.push_column(x_i));
             residues.iter_columns_full().enumerate().for_each(|(i,residue_i)|{
                 let mut preconditioned=residue_i.iter().enumerate().map(|(j,v_k)|v_k/(omega[i]-diag[j])).collect();
                 //preconditioned:preconditioned vector:
@@ -185,7 +193,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>+Send+Sync{
         }
         if print_level>2{println!("Search Space:");
         ss.formated_output(1000,"full");}
-        if iter_num>qp_ctrl.davidson_max_iter{
+        if iter_num>config.max_iter{
             break;
         }
         println!("Converged Pairs:{} out of the {} desired solutions",converge_pairs,nroots);
@@ -202,7 +210,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>+Send+Sync{
 
 
 
-pub fn lr_davidson_solver<F1,F2>(print_level:usize,a_matvec:F1,b_matvec:F2,nroots:usize,diag:&Vec<f64>,initial_guess:MatrixFull<f64>)->Vec<(f64,Vec<f64>)>
+pub fn lr_davidson_solver<F1,F2>(print_level:usize,a_matvec:F1,b_matvec:F2,nroots:usize,diag:&Vec<f64>,initial_guess:MatrixFull<f64>,config:&DavidsonConfig)->Vec<(f64,Vec<f64>)>
 where F1:Fn(&Vec<f64>)->Vec<f64>+ Send + Sync,F2:Fn(&Vec<f64>)->Vec<f64>+ Send + Sync{
     let mut ss=initial_guess;
     //ss:search space S, where each column in S is a search vector
@@ -519,7 +527,7 @@ where F1:Fn(&Vec<f64>)->Vec<f64>+ Send + Sync,F2:Fn(&Vec<f64>)->Vec<f64>+ Send +
         });
         if print_level>1{println!("Search Space:");
         ss.formated_output(1000,"full");}
-        if iter_num>20{
+        if iter_num>config.max_iter{
             break;
         }
         println!("For Left Residues, {} out of the {} desired solutions have converged",left_converge_pair,nroots);
