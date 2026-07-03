@@ -69,6 +69,7 @@ pub mod external_field;
 pub mod mpi_io;
 pub mod grad;
 pub mod hessian;
+pub mod thermo;
 pub mod post_scf_analysis;
 pub mod main_driver;
 pub mod ri_jk;
