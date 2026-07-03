@@ -12,7 +12,7 @@
 use rest_tensors::MatrixFull;
 use crate::scf_io::SCF;
 use crate::ri_bse::{davidson_solver, dipoles};
-use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
+use crate::ri_bse::davidson_solver::DavidsonConfig;
 use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data, set_fxc_use_optimized};
 use crate::ri_tddft::matvec::{self, a_matvec, b_matvec};
 use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_get_submatrix, compute_tddft_dipole_matrix};
@@ -94,18 +94,12 @@ pub fn tddft_main(scf: &mut SCF) -> Result<(), String> {
     // Ensure max_subspace > add_dim to prevent subtraction underflow
     let max_subspace = max_subspace.max(add_dim + 1).min(dim);
 
-    // The tda_davidson_solver needs QuasiParticle for control params.
-    // Construct a minimal one with TDDFT-specific settings.
-    let qp_ctrl = QuasiParticle {
-        davidson_maximum_subspace_size: max_subspace,
-        davidson_restart_dimensions: nroots.max(2),
-        davidson_add_dimensions: add_dim,
-        davidson_max_iter: max_iter,
-        bse_spin: tddft_spin.clone(),
-        bse_cutoff_energy: 1e6,
-        bse_exchange_rescaling: 1.0,
-        davidson_converge_threshold: converged_tol,
-        ..QuasiParticle::default()
+    // Davidson solver configuration (decoupled from QuasiParticle)
+    let davidson_cfg = DavidsonConfig {
+        max_subspace,
+        add_dim,
+        restart_dim: nroots.max(2),
+        max_iter,
     };
 
     // ═══ Step 8: Diagnostic: check A matrix symmetry for first few columns ═══
@@ -232,7 +226,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<(), String> {
             nroots,
             &hdiag,
             initial_guess,
-            &qp_ctrl,
+            &davidson_cfg,
         )
     } else {
         println!("Solving full linear response eigenvalue problem...");
@@ -243,58 +237,49 @@ pub fn tddft_main(scf: &mut SCF) -> Result<(), String> {
             nroots,
             &hdiag,
             initial_guess,
+            &davidson_cfg,
         )
     };
 
-    // ═══ Step 9: Compute and print results ═══
+    // ═══ Step 9: Compute and print results (BSE-compatible format) ═══
     let n_found = eigenpairs.len();
-    println!("\n{} {} excitations found (requested {})", n_found, tddft_spin, nroots);
-
-    // Compute dipole matrix for transition properties
-    let dipole_matrix = compute_tddft_dipole_matrix(scf, start_mo, occ_size, vir_size, homo, lumo);
-
     let tda_flag = is_tda;
     let n_print = n_found.min(30);
-
-    println!("\n{}", "-".repeat(80));
-    println!("{:>4}  {:>16}  {:>12}  {:>12}  {:>20}",
-        "State", "Energy (Ha)", "Energy (eV)", "Wavelength (nm)", "Osc. Strength");
-    println!("{}", "-".repeat(80));
+    let dipole_matrix = compute_tddft_dipole_matrix(scf, start_mo, occ_size, vir_size, homo, lumo);
+    let singlet_triplet = if xlet == 'S' { "Singlet" } else if xlet == 'T' { "Triplet" } else { "" };
+    println!("\nFirst {} {} Excitations:", n_found.min(n_print), singlet_triplet);
 
     for (n, (energy, vector)) in eigenpairs[..n_print].iter().enumerate() {
-        let energy_ev = energy * 27.2114;
-        let wavelength = 1239.84 / energy_ev;
+        let vec_norm: f64 = vector.iter().map(|x| x*x).sum::<f64>().sqrt();
 
-        // Normalize and compute transition dipole
+        println!("#{} Excitation energy={}, norm={:.6}", n, energy, vec_norm);
+
+        // Normalize and compute transition dipole (BSE-compatible order:
+        // transition_dipole_square prints "Dipole Moment Components" as a side effect)
         let norm_vec = dipoles::normalize(vector, tda_flag);
         let dipole_sq = dipoles::transition_dipole_square(&dipole_matrix, &norm_vec, tda_flag);
         let osc_strength = dipole_sq * energy * 2.0 / 3.0;
-
-        println!("{:>4}  {:>16.8}  {:>12.4}  {:>12.2}  {:>20.8}",
-            n + 1, energy, energy_ev, wavelength, osc_strength);
+        println!("\tTransition Dipole Square:{}; Oscillator Strength:{}",
+            dipole_sq, osc_strength);
 
         // Print leading components
-        if scf.mol.ctrl.print_level > 1 {
-            let mut components: Vec<(usize, usize, f64)> = norm_vec.iter()
-                .enumerate()
-                .map(|(idx, &val)| {
-                    let i = idx % occ_size;
-                    let a = idx / occ_size;
-                    (i, a, val)
-                })
-                .collect();
-            components.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap());
-            println!("  Leading components:");
-            for (k, (i, a, val)) in components.iter().enumerate() {
-                if val.abs() > 0.05 && k < 5 {
-                    println!("    occ {} -> vir {}, amplitude = {:.6}",
-                        start_mo + i, lumo + a, val);
-                }
+        let mut components: Vec<(usize, usize, f64)> = norm_vec.iter()
+            .enumerate()
+            .map(|(idx, &val)| {
+                let i = idx % occ_size;
+                let a = idx / occ_size;
+                (i, a, val)
+            })
+            .collect();
+        components.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap());
+        for (k, (i, a, val)) in components.iter().enumerate() {
+            if k < 5 {
+                println!("      #{}->#{},amplitude={}", start_mo + i, lumo + a, val);
             }
         }
     }
 
-    println!("{}", "-".repeat(80));
+    println!("The first excitation obtained by TDDFT is {}", eigenpairs[0].0);
     println!("TDDFT calculation completed successfully.");
     Ok(())
 }

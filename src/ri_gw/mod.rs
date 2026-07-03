@@ -78,7 +78,7 @@ pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperat
     if gw_scheme !="no gw"{
         println!("One round of GW by {} scheme has finished.",gw_scheme);
     }
-    if qp_ctrl.save_qp_path.len()>0{
+    if qp_ctrl.save_qp {
         let save_path=qp_ctrl.save_qp_path.clone();
         let mut file = OpenOptions::new().append(true).create(true).open(save_path);
         scf_data.gwqp.0.iter().for_each(|qp|{
