@@ -5,7 +5,8 @@
 # 用于生成REST输入卡的系统提示词
 - 基于Rust语言的新一代电子结构计算软件REST（Rust-based Electronic Structure Toolkit）由复旦大学化学理论研究中心开发，在徐昕教授的领导下，由张颖教授担任首席开发者完成。
 - 根据用户需求，结合知识库和上下文，帮助用户生成REST程序的输入卡。 
-- REST输入卡使用TOML格式，包含[ctrl]、[geom]和[geometric_pyo3]三个控制区
+- REST输入卡使用TOML格式，包含[ctrl]、[geom]、[hessian]、[thermo]和[geometric_pyo3]等控制区
+    - [ctrl]、[geom]为必需区；[hessian]、[thermo]、[geometric_pyo3]等根据任务类型按需开启
     - [ctrl]申明具体计算方法、（辅助）基组、数值方法参数等
     - [geom]提供研究体系的名字、结构以及结构相关的ghost原子、点电荷以及赝势等
 	- [geometric_pyo3]设置的参数仅用于`opt_engine=geometric_pyo3`结构优化引擎的控制
@@ -479,6 +480,114 @@ GW-BSE 方法相关的设置在 `[quasiparticle_methods]` 区块中进行。关�
   
   - **注意**：k点的选取方法为在倒格矢和倒格矢的反向之间均匀分布，并包含两侧边界。为了确保均匀分布的k点能够覆盖高对称点，推荐将数量设置的大一些
 
+
+# Hessian 矩阵、振动频率与热化学分析相关设置
+
+REST 提供两条独立的频率/热化学计算路径，请勿混淆：
+
+- **路径一（推荐）：REST 原生解析 Hessian + 热化学**。通过 `[hessian]` 和 `[thermo]` 区块触发。`[hessian]` 进行全解析的 RI-RHF/RKS Hessian 计算（含 CP-HF 响应），`[thermo]` 基于所得谐振频率做理想气体刚体转子-谐振子（RRHO）/ quasi-RRHO 热化学分析。本节即介绍此路径。
+- **路径二：geomeTRIC 数值 Hessian**。在结构优化流程中由 `[geometric_pyo3]` 区块的 `hessian`/`frequency`/`thermo` 关键词控制（见下文章节），频率与热化学交由 Python 端 geomeTRIC 完成，REST 仅提供数值 Hessian。
+
+> 注意两条路径下热化学的压强单位不同：`[thermo]` 区块用 **atm**；`[geometric_pyo3]` 的 `thermo` 关键词用 **bar**。
+> 当前 REST 热化学的转动对称数 σ 需用户手动指定（点群自动识别尚未实现）。
+
+## `[hessian]` 区块关键词
+
+只要输入卡中存在 `[hessian]` 区块（可位于顶层或嵌套于 `[ctrl]` 下），SCF 收敛后即**无条件**触发解析 Hessian 计算（与 `job_type` 无关）。关键词包括：
+
+- `solver`: 取值 String。CP-HF 方程求解器，`"krylov"`（缺省，推荐；批量子空间迭代，一次派发所有 3N 个右端项）或 `"dense"`（稠密矩阵直接求解，仅用于小体系或校验）。
+- `frequencies`: 取值 bool。是否在 Hessian 计算后顺带做振动频率与简正模分析并输出 `EigenModes.txt`。缺省 false。注意：若同时设置了 `[thermo]` 区块，频率会被自动计算，无需手动开启此项。
+- `krylov_max_cycle`: 取值 usize。Krylov 求解器最大迭代数。缺省 50。
+- `krylov_tol`: 取值 f64。Krylov 收敛阈值。缺省 1e-12。
+- `verbose`: 取值 usize。输出详细程度（0=静默，1=正常，2=调试；调试时额外输出各分量 .npy 文件）。缺省 1。
+- `hessian_matrix_path`: 取值 String。Hessian 矩阵输出路径。缺省 `"./HessianMatrix.txt"`。
+- `eigenmodes_path`: 取值 String。简正模输出路径。缺省 `"./EigenModes.txt"`。
+
+频率计算约定：对 Hessian 做质量加权后经 LAPACK `dsyev` 对角化，本征值转换为 cm⁻¹（虚频记为负值）。6（线性分子为 5）个平动/转动零模会自然产生（数值上接近 0；若几何未完全优化可能呈小幅虚频，不影响真实振动模式）。REST 内置质量为元素质量（如 H=1.008、C=12.011），与 Gaussian 默认同位素质量略有差异，对频率与热化学量的影响通常在 0.1% 量级。
+
+## `[thermo]` 区块关键词
+
+只要输入卡中存在 `[thermo]` 区块（顶层或 `[ctrl]` 下），在（解析）Hessian + 频率计算完成后即自动进行理想气体热化学分析。所有热力学量基于 RRHO 模型，按平动、转动、振动、电子四部分分别计算并求和（公式与 Shermo 一致，T. Lu, *Comput. Theor. Chem.* 1200, 113249, 2021）。关键词包括：
+
+- `temperature`（或 `T`）：温度 (K)。可设为单值（缺省 298.15），或设为扫描区间 `[下限, 上限, 步长]`（见下文"温度/压强扫描"）。
+- `pressure`（或 `P`）：压强 (**atm**)。可设为单值（缺省 1.0）或扫描区间。压强仅影响平动熵。
+- `symmetry_number`（或 `sigma`）：转动对称数 σ。**用户必须根据分子点群手动设置**，参考值：C1/Ci/Cs/C∞v→1，Cn/Cnv/Cnh→n，D∞h→2，Dn/Dnh/Dnd→2n，Sn→n/2，Td/T→12，Oh→24，Ih→60。缺省 1.0。
+- `electronic_energy`（或 `E`）：用于 U/H/G 求和的电子能量 (a.u.)。缺省 0.0 表示使用当前 SCF 总能量。若想在频率分析级别之上采用更高级别单点能，可在此指定。
+- 频率标度因子（四项可独立设置，缺省均为 1.0）：
+    - `sclzpe`：用于零点能 ZPE。
+    - `sclheat`：用于 U(T)−U(0) 升温贡献。
+    - `scls`：用于熵 S。
+    - `sclcv`：用于热容 CV/CP。
+    - 便捷别名：`scale_factor`（或 `scl`）若设置则同时覆盖以上四项（便于简单使用）。
+- `ilowfreq`：低频处理模型。缺省 0。
+    - `0`：标准 RRHO（谐振子近似）。
+    - `1`：Truhlar 模型——把低于 `ravib` 的频率提升到 `ravib`（仅影响 S、CV、U0→T，不影响 ZPE）。
+    - `2`：Grimme quasi-RRHO——熵在谐振子与自由转子间插值（仅影响熵）。参考 *Chem. Eur. J.* 18, 9955 (2012)。
+    - `3`：Minenkov quasi-RRHO——熵与内能均在谐振子与自由转子间插值（**推荐用于柔性大分子**）。参考 *J. Comput. Chem.* 44, 1807 (2023)。
+- `ravib`：Truhlar 提频阈值 (cm⁻¹)。缺省 100.0。
+- `intpvib`：Grimme/Minenkov 插值的特征频率阈值 (cm⁻¹)。缺省 100.0（50–150 之间结果相近）。
+- `imagreal`：把绝对值小于此值的虚频当作实频处理 (cm⁻¹)。缺省 0.0（禁用）。仅在 `ilowfreq ≠ 0` 时有意义，常取 50–100。
+- `conc`：浓度校正。形如 `"1.5M"`（mol/L）或 `"2.3atm"`，计算 ΔG = RT ln(cB/cA)，其中 cA 由当前 T、P 按理想气体给出。缺省 `""`/`"0"`（不做校正）。仅单点模式生效，扫描时不生效。
+- `output_path`：单点热化学报告输出路径。缺省 `"./Thermochemistry.txt"`。
+
+> quasi-RRHO 插值公式（Grimme/Minenkov）：权重 `w(ν) = 1/[1+(ν₀/ν)^4]`，`ν` 取未标度频率；熵 `S = w·S_RRHO + (1−w)·S_FR`；自由转子熵基于有效转动惯量 μ' = μ·Bav/(μ+Bav)，其中 μ = h/(8π²ν)、Bav = 10⁻⁴⁴ kg·m²。Minenkov 模型进一步对内能做 `U = w·U_RRHO + (1−w)·(RT/2)`。
+
+### 温度/压强扫描
+将 `temperature` 或 `pressure` 设为三元素数组 `[下限, 上限, 步长]` 即开启扫描。程序对 (T, P) 笛卡尔积逐点计算，并输出两个文件：
+- `scan_SCq.txt`：S、CV、CP（cal/mol·K）及 q(V=0)/NA、q(bot)/NA 随 T、P 变化。
+- `scan_UHG.txt`：Ucorr、Hcorr、Gcorr（kcal/mol）及 U、H、G（a.u.）随 T、P 变化。
+
+### 输出说明
+单点模式下，屏幕与 `Thermochemistry.txt` 同时输出：分子量、主转动惯量（amu·Bohr²）、转动常数（GHz）、转动温度（K）、线性/非线性判定、σ、采用的实频数目；各部分（平动/转动/振动/电子）对 U、S、CV 的贡献；ZPE、U_corr、H_corr、G_corr（同时给出 kJ/mol、kcal/mol、a.u.）；以及 E + ZPE / E + U_corr / E + H_corr / E + G_corr 的求和。配分函数 q_trans、q_rot、q_vib(V=0)、q_vib(bot)、q_ele 亦一并给出。
+
+## 热化学配置示例
+- 例子一：B3LYP/cc-pVDZ 下 CH₄ 的解析 Hessian + 频率 + RRHO 热化学（σ=12，Td 球陀螺）
+    ```
+    [ctrl]
+         xc = "b3lyp"
+         basis_path = "cc-pVDZ"
+         auxbas_path = "def2-universal-jkfit"
+         charge = 0.0
+         spin = 1.0
+         spin_polarization = false
+    [geom]
+         name = "CH4"
+         unit = "Angstrom"
+         position = """
+            C  0.000000  0.000000  0.000000
+            H  0.629118  0.629118  0.629118
+            H -0.629118 -0.629118  0.629118
+            H  0.629118 -0.629118 -0.629118
+            H -0.629118  0.629118 -0.629118
+         """
+    [hessian]
+         solver = "krylov"
+         frequencies = true
+    [thermo]
+         temperature = 298.15
+         pressure = 1.0
+         symmetry_number = 12.0
+         ilowfreq = 0
+    ```
+- 例子二：柔性大分子用 Grimme quasi-RRHO 处理低频，并扫描温度
+    ```
+    [thermo]
+         temperature = [300.0, 800.0, 50.0]
+         pressure = 1.0
+         symmetry_number = 1.0
+         ilowfreq = 2            # Grimme quasi-RRHO
+         sclzpe = 0.9806
+         imagreal = 50
+    ```
+- 例子三：使用更高级别单点能 + 1 M 浓度校正（C2v 分子，σ=2）
+    ```
+    [thermo]
+         temperature = 298.15
+         pressure = 1.0
+         symmetry_number = 2.0
+         electronic_energy = -114.5521
+         conc = "1.0M"
+    ```
 
 # Detailed descrption of [geometric_pyo3] block in the control file
 - `maxiter`：取值i32。结构优化的最大步数上限。缺省值：300

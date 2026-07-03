@@ -326,6 +326,9 @@ pub const G_ELECTRON: f64 = 2.00231930436182;  // http://physics.nist.gov/cgi-bi
 pub const E_MASS: f64 = 9.10938356e-31;         // kg https://physics.nist.gov/cgi-bin/cuu/Value?me
 pub const AVOGADRO: f64 = 6.022140857e23;       // https://physics.nist.gov/cgi-bin/cuu/Value?na
 pub const PLANCK: f64 = 6.626070040e-34;        // J*s http://physics.nist.gov/cgi-bin/cuu/Value?h
+pub const BOLTZMANN: f64 = 1.380649e-23;        // J/K https://physics.nist.gov/cgi-bin/cuu/Value?k
+pub const CLIGHT_CMS: f64 = 2.99792458e10;      // speed of light, cm/s
+pub const R_GAS: f64 = BOLTZMANN * AVOGADRO;    // J/(mol*K) ideal gas constant
 pub const E_CHARGE: f64 = 1.6021766208e-19;
 pub const DEBYE:f64 = 3.335641e-30;            // C*m = 1e-18/LIGHT_SPEED_SI https://cccbdb.nist.gov/debye.asp
 pub const AU2DEBYE:f64 = E_CHARGE * BOHR*1e-10 / DEBYE; // 2.541746
