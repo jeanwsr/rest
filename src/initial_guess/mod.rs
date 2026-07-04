@@ -188,13 +188,15 @@ pub fn update_scf_from_hdf5chk(scf_data: &mut SCF, chkfile: String) {
             //=============================
             if scf_data.mol.ctrl.force_state_occupation.len()>0 {
                 let restart = chkfile.clone();
-                //let is_exist = scf_data.ref_eigenvectors.contains_key(&restart);
-                //if ! is_exist {
-                scf_data.ref_eigenvectors.insert(
-                    restart, 
-                    (eigenvectors.clone(),[0,scf_data.mol.num_basis,scf_data.mol.num_state,scf_data.mol.spin_channel])
-                );
-                //};
+                let entry = (eigenvectors.clone(),[0,scf_data.mol.num_basis,scf_data.mol.num_state,scf_data.mol.spin_channel]);
+                scf_data.ref_eigenvectors.insert(restart, entry.clone());
+                // also register under ctrl.chkfile so that force_state_occupation
+                // entries with default ref_index (which defaults to chkfile) can find
+                // the reference even when the initial guess was loaded from guessfile
+                let ctrl_chk = &scf_data.mol.ctrl.chkfile;
+                if ctrl_chk.to_lowercase() != "none" && *ctrl_chk != chkfile {
+                    scf_data.ref_eigenvectors.insert(ctrl_chk.clone(), entry);
+                }
                 match scf_data.scftype {
                     SCFType::RHF => {
                         scf_data.mol.ctrl.force_state_occupation.iter().enumerate().for_each(|(i,x)| {
