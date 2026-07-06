@@ -47,6 +47,8 @@ pub struct ThermoInput {
     pub intpvib: f64,
     pub imagreal: f64,
     pub print_level: usize,
+    /// Best-effort point-group label (informational; e.g. auto-detected).
+    pub point_group: String,
 }
 
 impl Default for ThermoInput {
@@ -55,6 +57,7 @@ impl Default for ThermoInput {
             temperature: 298.15, pressure: 1.0, symmetry_number: 1.0,
             electronic_energy_au: 0.0, sclzpe: 1.0, sclheat: 1.0, scls: 1.0, sclcv: 1.0,
             ilowfreq: 0, ravib: 100.0, intpvib: 100.0, imagreal: 0.0, print_level: 1,
+            point_group: String::new(),
         }
     }
 }
@@ -73,6 +76,7 @@ struct MolInfo {
     vib_freqs: Vec<f64>, // real (positive) vibrational wavenumbers (cm^-1)
     n_imag: usize,
     spin_mult: f64,
+    point_group: String,
 }
 
 /// Full thermochemistry result at a single (T, P). Energies in J/mol,
@@ -89,6 +93,7 @@ pub struct ThermoResult {
     pub n_real_vib_modes: usize,
     pub n_imag_vib_modes: usize,
     pub ilowfreq: u32,
+    pub point_group: String,
     // partition functions
     pub q_trans: f64,
     pub q_rot: f64,
@@ -268,6 +273,7 @@ fn prepare_molecular_info(
         vib_freqs: vib,
         n_imag,
         spin_mult,
+        point_group: input.point_group.clone(),
     })
 }
 
@@ -288,6 +294,7 @@ fn compute_thermo_at(mi: &MolInfo, t: f64, p_pa: f64, input: &ThermoInput) -> Th
     res.rot_constants_ghz = mi.rot_constants_ghz;
     res.rot_temperatures_k = mi.rot_temperatures_k;
     res.electronic_energy_au = input.electronic_energy_au;
+    res.point_group = mi.point_group.clone();
 
     // electron ground-state degeneracy
     res.q_ele = g0;
@@ -485,6 +492,9 @@ pub fn print_thermo(res: &ThermoResult, pl: usize) {
         out.push_str(&format!("  Rotational constants (GHz):               {:>12.6} {:>12.6} {:>12.6}\n", g[0], g[1], g[2]));
         out.push_str(&format!("  Rotational temperatures (K):              {:>12.6} {:>12.6} {:>12.6}\n", rt[0], rt[1], rt[2]));
         out.push_str(&format!("  Linear molecule: {}   sigma = {}\n", res.is_linear, res.symmetry_number));
+        if !res.point_group.is_empty() {
+            out.push_str(&format!("  Point group (auto-detected): {}\n", res.point_group));
+        }
     }
     out.push_str(&format!("  Vibrational modes used: {} real ({} imaginary ignored)\n",
         res.n_real_vib_modes, res.n_imag_vib_modes));
@@ -612,10 +622,23 @@ pub fn run_thermochemistry(
     let pl = scf.mol.ctrl.print_level;
     let mol = &scf.mol;
     let e_au = if params.electronic_energy != 0.0 { params.electronic_energy } else { scf.scf_energy };
+
+    // resolve symmetry number: 0 (or negative) => auto-detect from geometry
+    let (sym_num, pg_label) = if params.symmetry_number <= 0.0 {
+        let pg = crate::symmetry::detect_point_group(&mol.geom.position, &mol.geom.elem);
+        if pl > 0 {
+            println!("  Auto-detected point group: {} (rotational symmetry number sigma = {})",
+                pg.label, pg.sigma);
+        }
+        (pg.sigma as f64, pg.label)
+    } else {
+        (params.symmetry_number, String::new())
+    };
+
     let input = ThermoInput {
         temperature: params.temperature,
         pressure: params.pressure,
-        symmetry_number: params.symmetry_number,
+        symmetry_number: sym_num,
         electronic_energy_au: e_au,
         sclzpe: params.sclzpe,
         sclheat: params.sclheat,
@@ -626,6 +649,7 @@ pub fn run_thermochemistry(
         intpvib: params.intpvib,
         imagreal: params.imagreal,
         print_level: pl,
+        point_group: pg_label,
     };
 
     time_mark.new_item("Thermochemistry", "RRHO thermochemistry");
