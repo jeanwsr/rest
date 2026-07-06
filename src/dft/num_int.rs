@@ -2287,6 +2287,9 @@ impl<'a> NumInt<'a> for DFA4REST {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tensors::matrix_blas_lapack::{
+        omp_get_num_threads_wrapper, omp_set_num_threads_wrapper,
+    };
 
     fn make_lda_data(nocc: usize, nvir: usize, ngrids: usize) -> FXCMatvecData {
         let mut mo_occ = MatrixFull::new([nocc, ngrids], 0.0);

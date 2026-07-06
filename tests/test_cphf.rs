@@ -241,7 +241,7 @@ fn test_cphf_pyscf_s0_vs_old_solver() {
 
     // Solve with new solver (dense)
     let u_new: Vec<Vec<f64>> = h1_new.iter().map(|h| {
-        let u_full = new_solver.solve_dense(&scf, h, &s1_zero)
+        let u_full = new_solver.solve_dense(&scf, None, h, &s1_zero)
             .expect("new dense");
         // Extract VO block to compare with old solver
         let mut u_vo = vec![0.0; new_solver.dim];
@@ -294,9 +294,9 @@ fn test_cphf_pyscf_dense_vs_krylov() {
             }
         }
 
-        let u_dense = solver.solve_dense(&scf, &h1_nmc, &s1_zero)
+        let u_dense = solver.solve_dense(&scf, None, &h1_nmc, &s1_zero)
             .expect("dense");
-        let u_krylov = solver.solve_krylov(&scf, &h1_nmc, &s1_zero, 50, 1e-12);
+        let u_krylov = solver.solve_krylov(&scf, None, &h1_nmc, &s1_zero, 50, 1e-12);
 
         let diff_sq = u_dense.iter().zip(u_krylov.iter())
             .map(|(a,b)| (a-b)*(a-b)).sum::<f64>();
@@ -332,7 +332,7 @@ fn test_cphf_pyscf_vs_pyscf_h2o_sto3g() {
             }
         }
 
-        let u_full = solver.solve_dense(&scf, &h1_nmc, &s1_zero)
+        let u_full = solver.solve_dense(&scf, None, &h1_nmc, &s1_zero)
             .expect("dense");
 
         // Polarizability: α = -4 * Σ h1 * U (VO block only; occ-occ is 0 for s1=0)
@@ -412,10 +412,10 @@ fn test_cphf_pyscf_u_vector_vs_pyscf() {
 
     // Solve with dense and krylov
     let u_dense: Vec<Vec<f64>> = h1_all.iter().map(|h| {
-        solver.solve_dense(&scf, h, &s1_zero).expect("dense")
+        solver.solve_dense(&scf, None, h, &s1_zero).expect("dense")
     }).collect();
     let u_krylov: Vec<Vec<f64>> = h1_all.iter().map(|h| {
-        solver.solve_krylov(&scf, h, &s1_zero, 50, 1e-12)
+        solver.solve_krylov(&scf, None, h, &s1_zero, 50, 1e-12)
     }).collect();
 
     // Print REST U vectors (VO block only)
@@ -430,7 +430,7 @@ fn test_cphf_pyscf_u_vector_vs_pyscf() {
             let a = i / solver.nocc;
             let row = solver.lumo + a;
             let u_val = u_dense[comp][row + col * solver.nmo];
-            println!("    [{:>2}] = {: .16e}", i, u_val);
+            println!("    [{:>2}] = {:.16e}", i, u_val);
         }
     }
     // Verify dense ≈ krylov
@@ -524,7 +524,7 @@ fn test_cphf_pyscf_u_vector_vs_pyscf() {
             let diff = (rest_val - py_val).abs();
             if diff > u_maxdiff { u_maxdiff = diff; }
             let marker = if diff > 1e-6 { " <---" } else { "" };
-            println!("    [{:>2}] REST={: .12e}  PySCF={: .12e}  diff={:.4e}{}",
+            println!("    [{:>2}] REST={:.12e}  PySCF={:.12e}  diff={:.4e}{}",
                      i, rest_val, py_val, diff, marker);
         }
     }

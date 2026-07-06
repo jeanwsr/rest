@@ -17,7 +17,7 @@
   - 如果用户没有明确要求，设置num_threads为10
   - [ctr]区块中必须声明的关键词：
      1. 计算方法和配置相关：`xc`，`basis_path`，`print_level`，以及`num_threads`等
-     1. 体系相关: `spin`, `charge`, `spin_polarization`等
+     2. 体系相关: `spin`, `charge`, `spin_polarization`等
   - 仅当使用了`opt_engine=geometric_pyo3`时，才要申明[geometric_pyo3]区
   - 当调用geometric_pyo3引擎做缺省的最稳结构优化时，不需要申请[geometric_pyo3]
   - 调用的方法的关键词是否使用"xc"，不能无中生有地用其它的关键词，比如“method"等
@@ -46,9 +46,9 @@
 ## 具体计算任务相关关键词（Keyword）
 - `job_type`: 取值String类型。设置计算任务类型。目前可以进行的计算任务为:
     1. `energy`: 单点能量计算（缺省）。等价设置有：`single point`，`single_point`等
-    1. `opt`: 基于数值力的构型优化。等价设置有：`geometry optimization`, `relax`, `geom_opt`等
-	1. `force`: 计算当前结构下的受力。等价设置有：`gradient`
-	1. `numerical dipole`: 计算数值偶极。等价设置有：`numdipole`
+    2. `opt`: 基于数值力的构型优化。等价设置有：`geometry optimization`, `relax`, `geom_opt`等
+	3. `force`: 计算当前结构下的受力。等价设置有：`gradient`
+	4. `numerical dipole`: 计算数值偶极。等价设置有：`numdipole`
 - `auxbasis_response`：开启辅助基导数。缺省为true
 - `opt_engine`: 取值String类型。构型优化引擎。可选项有：`LBFGS`、`geometric-pyo3`（缺省）
     - **注意**：固定原子功能（在 `position` 中用 `0`/`1` 标记）当前仅支持 `geometric-pyo3` 引擎，`LBFGS` 引擎暂不支持约束优化。
@@ -203,8 +203,8 @@ guessfile = "my_checkpoint.rchk"
 ## 自洽场计算相关关键词（Keyword）
 - `max_scf_cycle`: 取值i32。自洽场运算的最大迭代循环数。缺省为100
 - `noiter`: 取值布尔类型。是否跳过自洽场运算。缺省为false
-- `scf_acc_rho`: 取值f64。自洽场运算密度矩阵的收敛标准。缺省为1.0e-8
-- `scf_acc_eev`: 取值f64。自洽场运算能量差平方和的收敛标准。缺省为1.0e-6
+- `scf_acc_rho`: 取值f64。自洽场运算密度矩阵的收敛标准。缺省为1.0e-7
+- `scf_acc_eev`: 取值f64。自洽场运算能量差平方和的收敛标准。缺省为1.0e-5
 - `scf_acc_etot`: 取值f64。自洽场运算总能量的收敛标准。缺省为1.0e-8
 - `algorithm_jk`: 设置 Fock 矩阵计算中 J (Coulomb) 和 K (Exchange) 两部分的算法：
     - `ri-direct`: 强制使用 direct RI 算法。对于 RI-K 部分，取决于内存大小，可能会使用 semi-direct 算法 (储存相对较小的 $O(N^3)$ 的 $g_{\mu i, P}$)。
@@ -724,16 +724,13 @@ hessian = { solver = "krylov", frequencies = true, verbose = 2 }
         """
         ext_field_dipole = [0.0, 0.1, 0.0]
         ```
-## RRS-PBC 方法相关设置
+### RRS-PBC 方法相关设置
 - `rrs_pbc`: 取值为bool。如果设置为true则启动RRS-PBC计算。缺省为false
-  
-- `unit_cell_index`: 取值为Vec<usize>。核心晶胞包含的原子在`position`中的序号。缺省为空
-  
-  - **注意**：原子的序号从0开始
+-  `unit_cell_index`: 取值为`Vec<usize>`。核心晶胞包含的原子在`position`中的序号。缺省为空
+- **注意**：原子的序号从0开始
     
   - 一个例子：
-    
-    ```
+```toml
     [geom]
     name = "NH3"
     unit = "Angstrom"
@@ -749,34 +746,25 @@ hessian = { solver = "krylov", frequencies = true, verbose = 2 }
     """
     rrs_pbc = true
     unit_cell_index = [3,4]
-    ```
-    
+```
 - `pbc_dim`: 取值为usize。周期性的维度。缺省为1
   
-- `rrs_pbc_vec`：取值为Vec<f64>。周期性体系的晶格矢量。缺省为空
-  
+- `rrs_pbc_vec`：取值为`Vec<f64>`。周期性体系的晶格矢量。缺省为空
   - **注意**：每个晶格矢量均为三维，如果周期性的维度不为1，则将所有晶格矢量拼接为一个作为该参数。如果晶格矢量的总长度超过周期性维度对应的长度，将抛出一个警告并忽略多余部分
-    
   - 一个例子：
-    
-    ```
+```toml
     pbc_dim = 2  # 视为二维周期性体系
     rrs_pbc_vec = [1.0,0.0,0.0,0.0,1.0,0.0,5.14]  # 两个晶格矢量分别为[1.0,0.0,0.0]和[0.0,1.0,0.0]，多余的5.14被忽略
-    ```
-    
-- `max_step`：取值为Vec<String>。从核心晶胞开始作用晶格矢量的最大次数。缺省为空
-  
-  - **注意**：RRS-PBC算法会从核心晶胞开始按照平移矢量向正负方向各平移至多`max_step`次，匹配元素和位置均符合的晶胞，并跳过不符合的。如果长度超过周期性维度，将忽略多余部分。匹配结果会在`print_level`至少为1时输出，例如：
-    
-    ```
+```
+-  `max_step`：取值为`Vec<String>`。从核心晶胞开始作用晶格矢量的最大次数。缺省为空
+   -  **注意**：RRS-PBC算法会从核心晶胞开始按照平移矢量向正负方向各平移至多`max_step`次，匹配元素和位置均符合的晶胞，并跳过不符合的。如果长度超过周期性维度，将忽略多余部分。匹配结果会在`print_level`至少为1时输出，例如：
+```
     For step path = (-1, 0, 0), found target index = [0, 1, 2, 3]
     For step path = (0, 0, 0), found target index = [4，5，6，7]
     For step path = (1, 0, 0), found target index = [8，9，10，11] 
-    ```
-    
-- `k_points`: 取值为Vec<usize>。每个周期性维度下的k点数量。缺省为空
-  
-  - **注意**：k点的选取方法为在倒格矢和倒格矢的反向之间均匀分布，并包含两侧边界。为了确保均匀分布的k点能够覆盖高对称点，推荐将数量设置的大一些
+```
+- `k_points`: 取值为`Vec<usize>`。每个周期性维度下的k点数量。缺省为空
+   - **注意**：k点的选取方法为在倒格矢和倒格矢的反向之间均匀分布，并包含两侧边界。为了确保均匀分布的k点能够覆盖高对称点，推荐将数量设置的大一些
 
 
 # Hessian 矩阵、振动频率与热化学分析相关设置
@@ -787,7 +775,7 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 - **路径二：geomeTRIC 数值 Hessian**。在结构优化流程中由 `[geometric_pyo3]` 区块的 `hessian`/`frequency`/`thermo` 关键词控制（见下文章节），频率与热化学交由 Python 端 geomeTRIC 完成，REST 仅提供数值 Hessian。
 
 > 注意两条路径下热化学的压强单位不同：`[thermo]` 区块用 **atm**；`[geometric_pyo3]` 的 `thermo` 关键词用 **bar**。
-> 当前 REST 热化学的转动对称数 σ 需用户手动指定（点群自动识别尚未实现）。
+> 转动对称数 σ 可由用户手动指定，也可设 `symmetry_number = 0` 让程序自动识别点群（见下文「点群自动识别」）。
 
 ## `[hessian]` 区块关键词
 
@@ -805,11 +793,11 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 
 ## `[thermo]` 区块关键词
 
-只要输入卡中存在 `[thermo]` 区块（顶层或 `[ctrl]` 下），在（解析）Hessian + 频率计算完成后即自动进行理想气体热化学分析。所有热力学量基于 RRHO 模型，按平动、转动、振动、电子四部分分别计算并求和（公式与 Shermo 一致，T. Lu, *Comput. Theor. Chem.* 1200, 113249, 2021）。关键词包括：
+只要输入卡中存在 `[thermo]` 区块（顶层或 `[ctrl]` 下），在（解析）Hessian + 频率计算完成后即自动进行理想气体热化学分析。所有热力学量基于 RRHO 模型，按平动、转动、振动、电子四部分分别计算并求和（T. Lu, *Comput. Theor. Chem.* 1200, 113249, 2021）。关键词包括：
 
 - `temperature`（或 `T`）：温度 (K)。可设为单值（缺省 298.15），或设为扫描区间 `[下限, 上限, 步长]`（见下文"温度/压强扫描"）。
 - `pressure`（或 `P`）：压强 (**atm**)。可设为单值（缺省 1.0）或扫描区间。压强仅影响平动熵。
-- `symmetry_number`（或 `sigma`）：转动对称数 σ。**用户必须根据分子点群手动设置**，参考值：C1/Ci/Cs/C∞v→1，Cn/Cnv/Cnh→n，D∞h→2，Dn/Dnh/Dnd→2n，Sn→n/2，Td/T→12，Oh→24，Ih→60。缺省 1.0。
+- `symmetry_number`（或 `sigma`）：转动对称数 σ。可手动指定（参考值：C1/Ci/Cs/C∞v→1，Cn/Cnv/Cnh→n，D∞h→2，Dn/Dnh/Dnd→2n，Sn→n/2，Td/T→12，Oh→24，Ih→60）。**设为 `0` 则启用点群自动识别**（见下文「点群自动识别」）。缺省 1.0。
 - `electronic_energy`（或 `E`）：用于 U/H/G 求和的电子能量 (a.u.)。缺省 0.0 表示使用当前 SCF 总能量。若想在频率分析级别之上采用更高级别单点能，可在此指定。
 - 频率标度因子（四项可独立设置，缺省均为 1.0）：
     - `sclzpe`：用于零点能 ZPE。
@@ -830,6 +818,11 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 
 > quasi-RRHO 插值公式（Grimme/Minenkov）：权重 `w(ν) = 1/[1+(ν₀/ν)^4]`，`ν` 取未标度频率；熵 `S = w·S_RRHO + (1−w)·S_FR`；自由转子熵基于有效转动惯量 μ' = μ·Bav/(μ+Bav)，其中 μ = h/(8π²ν)、Bav = 10⁻⁴⁴ kg·m²。Minenkov 模型进一步对内能做 `U = w·U_RRHO + (1−w)·(RT/2)`。
 
+### 点群自动识别
+将 `symmetry_number` 设为 `0` 即启用点群自动识别：程序从分子几何出发，搜索所有真转动对称操作（Cn^k，含恒等操作 E），其总数即为转动对称数 σ（σ = 真转动子群的阶）。同时给出 Schoenflies 点群标签（如 `Td`、`C2v`、`D6h`、`D∞h`，尽力而为）。候选转轴来自原子位置、同种元素原子对连线、以及主转动惯量轴；每个候选轴测试 C2–C8。线性分子（一个主转动惯量为零）按 C∞v（σ=1）或 D∞h（σ=2，含反演中心）处理。
+- 优点：σ 严格正确（直接数真转动操作的个数），对 CH₄ 自动给出 Td/σ=12、H₂O 给出 C2v/σ=2、CO₂ 给出 D∞h/σ=2。
+- 限制：点群标签对极少数纯 Sn 群可能显示为 C_{n/2}（但 σ 仍正确）；要求几何接近对称（优化良好的结构默认容差 1e-2 Bohr 即可，必要时可手工指定 σ）。
+
 ### 温度/压强扫描
 将 `temperature` 或 `pressure` 设为三元素数组 `[下限, 上限, 步长]` 即开启扫描。程序对 (T, P) 笛卡尔积逐点计算，并输出两个文件：
 - `scan_SCq.txt`：S、CV、CP（cal/mol·K）及 q(V=0)/NA、q(bot)/NA 随 T、P 变化。
@@ -840,7 +833,7 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 
 ## 热化学配置示例
 - 例子一：B3LYP/cc-pVDZ 下 CH₄ 的解析 Hessian + 频率 + RRHO 热化学（σ=12，Td 球陀螺）
-    ```
+    ```toml
     [ctrl]
          xc = "b3lyp"
          basis_path = "cc-pVDZ"
@@ -864,11 +857,11 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
     [thermo]
          temperature = 298.15
          pressure = 1.0
-         symmetry_number = 12.0
+         symmetry_number = 0       # 0 = 自动识别点群（CH4 → Td, σ=12）
          ilowfreq = 0
     ```
 - 例子二：柔性大分子用 Grimme quasi-RRHO 处理低频，并扫描温度
-    ```
+    ```toml
     [thermo]
          temperature = [300.0, 800.0, 50.0]
          pressure = 1.0
@@ -878,7 +871,7 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
          imagreal = 50
     ```
 - 例子三：使用更高级别单点能 + 1 M 浓度校正（C2v 分子，σ=2）
-    ```
+    ```toml
     [thermo]
          temperature = 298.15
          pressure = 1.0
@@ -914,7 +907,7 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 - `usedmax`：取值 bool。是否用最大位移分量（而非 RMS）判断 trust radius。缺省值：false。适合各方向力常数差异大的各向异性体系。
 ## 配置示例 
 - 例子一：开启GGA、meta-GGA或者杂化泛函的稳态构型优化（以x3lyp为例），则不需要使用[geometric_pyo3]区的设置
-    ```
+    ```toml
 	[ctrl]
          xc = x3lyp
          job_type =                  "opt"
@@ -936,13 +929,13 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
         """ 
     ```
 - 例子二：如果使用双杂化泛函等没有解析力的方法，则需要在[ctrl]区开启数值力的计算功能（仅展示与上个例子不同的设置）
-    ```
+    ```toml
 	[ctrl]
 	    xc = xyg3
 		numerical_force = true
 	```
 - 例子三：开启过渡态优化和频率计算，并且设置非常规状态（398开尔文、1.5个大气压）
-    ```
+    ```toml
 	[geometric_pyo3]
 	    transition = true
 		hessian = "first+last"
