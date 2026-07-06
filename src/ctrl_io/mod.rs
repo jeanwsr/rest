@@ -712,6 +712,16 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         if ! ctrl.external_init_guess.is_some() {
             panic!("ERROR: force_state_occupation can not be involved without an existing guessfile/chkfile");
         }
+        // Normalize ref_index: entries without explicit reference default to
+        // whichever file provides the initial guess.
+        let actual_file = match ctrl.external_init_guess.as_ref().unwrap().as_str() {
+            "guessfile" => &ctrl.guessfile,
+            "chkfile" => &ctrl.chkfile,
+            _ => unreachable!(),
+        };
+        for fso in ctrl.force_state_occupation.iter_mut() {
+            fso.normalize_ref_index(actual_file);
+        }
     }
 
     if ctrl.print_level>1 {
@@ -1525,7 +1535,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                                         let check_min = tmp_value[3].as_u64().unwrap_or(0) as usize;
                                         let check_max = tmp_value[4].as_u64().unwrap_or(0) as usize;
                                         Some(ForceStateOccupation::init(
-                                            tmp_input.chkfile.clone(),
+                                            String::new(),
                                             ref_state,
                                             ref_spin,
                                             target_spin,
@@ -1563,7 +1573,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                                                 let check_min = tmp_value[4].as_u64().unwrap_or(0) as usize;
                                                 let check_max = tmp_value[5].as_u64().unwrap_or(0) as usize;
                                                 Some(ForceStateOccupation::init(
-                                                    tmp_input.chkfile.clone(),
+                                                    String::new(),
                                                     ref_state,
                                                     ref_spin,
                                                     target_spin,
