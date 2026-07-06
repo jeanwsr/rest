@@ -10,6 +10,7 @@ use crate::ctrl_io::quasiparticle_methods::parse_quasiparticle_keywords;
 use crate::ri_jk::decompose::J2CDecompOption;
 use crate::ctrl_io::tddft_parameters::parse_tddft_keywords;
 use crate::ctrl_io::hessian_parameters::parse_hessian_keywords;
+use crate::ctrl_io::thermo_parameters::parse_thermo_keywords;
 use crate::{check_norm::force_state_occupation::ForceStateOccupation};
 use crate::scf_io::smear::SmearingType;
 use crate::dft::{DFAFamily, DFTType, DFA4REST};
@@ -34,11 +35,13 @@ mod solvent;
 pub mod quasiparticle_methods;
 pub mod tddft_parameters;
 pub mod hessian_parameters;
+pub mod thermo_parameters;
 use geometric_pyo3_io::GeomeTRIC;
 mod path_util;
 use quasiparticle_methods::QuasiParticle;
 use tddft_parameters::TDDFTParameters;
 use hessian_parameters::HessianParameters;
+use thermo_parameters::ThermoParameters;
 
 pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
     let tmp_cont = fs::read_to_string(&filename[..])?;
@@ -62,6 +65,7 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     let mut tmp_quasiparticle=parse_quasiparticle_keywords(tmp_keys)?;
     let mut tmp_tddft = parse_tddft_keywords(tmp_keys)?;
     let mut tmp_hessian = parse_hessian_keywords(tmp_keys)?;
+    let mut tmp_thermo = parse_thermo_keywords(tmp_keys)?;
     if let Some(tmp_geomtric) = &mut tmp_geomtric {
         tmp_input.geometric_pyo3 = Some(std::mem::take(tmp_geomtric));
     }
@@ -73,6 +77,9 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     }
     if let Some(tmp_hessian) = &mut tmp_hessian {
         tmp_input.hessian = Some(std::mem::take(tmp_hessian));
+    }
+    if let Some(tmp_thermo) = &mut tmp_thermo {
+        tmp_input.thermo = Some(std::mem::take(tmp_thermo));
     }
     Ok((tmp_input,tmp_geomcell))
 }
@@ -365,6 +372,7 @@ pub struct InputKeywords {
     pub j2c_decomp: J2CDecompOption,
     pub ri_pt2: RiPt2Option,
     pub hessian: Option<HessianParameters>,
+    pub thermo: Option<ThermoParameters>,
     /// Use the optimized fxc_matvec_opt (rayon + pre-allocated workspace).
     #[pyo3(get, set)]
     pub use_fxc_opt: bool,
@@ -529,6 +537,7 @@ impl InputKeywords {
             ri_pt2: RiPt2Option::default(),
             tddft: None,
             hessian: None,
+            thermo: None,
             use_fxc_opt: false,
             rel: RelativisticMethod::None,
         }
@@ -1360,12 +1369,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
             tmp_input.scf_acc_rho = match tmp_ctrl.get("scf_acc_rho").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-6)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-8)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-6)},
                 other => {1.0e-8}
             };
             tmp_input.scf_acc_eev = match tmp_ctrl.get("scf_acc_eev").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-6)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-6)},
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-5)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-5)},
                 other => {1.0e-6}
             };
             tmp_input.scf_acc_etot = match tmp_ctrl.get("scf_acc_etot").unwrap_or(&serde_json::Value::Null) {

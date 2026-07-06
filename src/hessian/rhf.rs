@@ -4282,8 +4282,23 @@ pub fn rhf_hessian_main(
         Ok(m) => m,
         Err(e) => { eprintln!("Error in Hessian calculation: {}", e); return; }
     };
-    if hess_ctrl.frequencies {
-        run_frequencies_from(scf, hess_ctrl, &hess_total, time_mark);
+    // Compute frequencies when requested directly, or implicitly when
+    // thermochemistry is requested (it needs the harmonic frequencies).
+    let thermo_ctrl = scf.mol.ctrl.thermo.clone();
+    let need_freq = hess_ctrl.frequencies || thermo_ctrl.is_some();
+    let freqs_opt: Option<Vec<f64>> = if need_freq {
+        if hess_ctrl.frequencies {
+            run_frequencies_from(scf, hess_ctrl, &hess_total, time_mark)
+        } else {
+            // thermo requested without the frequencies flag: still need freqs
+            match compute_frequencies_from_hessian(&hess_total, scf) {
+                Ok((freqs, _)) => Some(freqs),
+                Err(e) => { eprintln!("Error computing frequencies for thermochemistry: {}", e); None }
+            }
+        }
+    } else { None };
+    if let (Some(params), Some(freqs)) = (thermo_ctrl.as_ref(), freqs_opt.as_ref()) {
+        crate::thermo::run_thermochemistry(scf, freqs, params, time_mark);
     }
 }
 
@@ -4501,14 +4516,14 @@ fn run_frequencies_from(
     hess_ctrl: &crate::ctrl_io::hessian_parameters::HessianParameters,
     hess_total: &MatrixFull<f64>,
     time_mark: &mut crate::utilities::TimeRecords,
-) {
+) -> Option<Vec<f64>> {
     let pl = scf.mol.ctrl.print_level;
     if pl > 0 {
         println!("\n=== Vibrational Frequency Calculation (solver={}) ===", hess_ctrl.solver);
     }
     time_mark.new_item("Frequencies", "vibrational frequencies");
     time_mark.count_start("Frequencies");
-    match compute_frequencies_from_hessian(hess_total, scf) {
+    let freqs_opt = match compute_frequencies_from_hessian(hess_total, scf) {
         Ok((freqs, modes)) => {
             let n3 = freqs.len();
             let natm = n3 / 3;
@@ -4559,10 +4574,12 @@ fn run_frequencies_from(
                 }}
                 Err(e) => eprintln!("  WARNING: failed to write eigenmodes to {}: {}", hess_ctrl.eigenmodes_path, e),
             }
+            Some(freqs)
         },
-        Err(e) => eprintln!("Error in frequency calculation: {}", e),
-    }
+        Err(e) => { eprintln!("Error in frequency calculation: {}", e); None }
+    };
     time_mark.count("Frequencies");
+    freqs_opt
 }
 
 
