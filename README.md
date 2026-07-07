@@ -243,30 +243,35 @@ chkfile = "mychk.rchk"
 ```
 
 ### 收敛算法相关关键词
-- `mixer`：取值String。辅助自洽场收敛的方法。目前REST支持 `"direct"`，`"diis"`，`"linear"`，`"ediis"`及`"ediis+diis"`，程序缺省采用`"diis"`方法。
+- `mixer`：取值String。辅助自洽场收敛的方法。目前REST支持 `"direct"`，`"diis"`，`"linear"`，`"ediis"`，`"ediis+diis"`及`"adiis+diis"`，程序缺省采用`"diis"`方法。
     - `"direct"` 不使用额外辅助收敛方法（naive SCF）
     - `"linear"` 线性辅助收敛方法，
     - `"diis"` direct inversion in the iterative subspace，是最常用的 SCF 加速收敛方法。当前DIIS实现已内置**正交基误差矢量**（通过 S⁻¹ᐟ² 变换改善条件数）和 **SVD 伪逆求解器**（替代直接矩阵求逆），对过渡金属等近简并体系有更好的数值稳定性。
-    - `"ediis"`: Energy-DIIS（Kudin-Scuseria-Cancès, JCP 2002）。基于历史密度矩阵和能量的二次规划外推，保证每一步能量单调下降。适合能隙极小的体系。
-    - `"ediis+diis"`（**推荐用于过渡金属体系**）：混合模式。早期使用 EDIIS（保证能量单调下降，避免 DIIS 在小能隙下失效），当 DIIS 误差范数降至可收敛区间时自动切换至 DIIS（利用超线性收敛加速）：
+    - `"ediis"`: Energy-DIIS（Kudin-Scuseria-Cancès, JCP 2002, 116, 8255）。通过最小化历史密度的能量二次规划模型 `f^EDIIS(c) = ΣcᵢEᵢ − ½ΣcᵢcⱼBᵢⱼ`（`Bᵢⱼ = Tr[(Dᵢ−Dⱼ)(Fᵢ−Fⱼ)]`），求得最优凸组合系数后对 Fock 矩阵做线性组合 `F̃ = ΣcᵢFᵢ`，再对角化得到下一步密度。对 HF 精确成立（Fock 对密度仿射），对 DFT 为近似（论文指出 V_xc 非线性"可忽略"）。
+    - `"ediis+diis"`：混合模式。早期使用 EDIIS，当 DIIS 误差范数降至 1e-3 时自动切换至 DIIS：
       ```
       DIIS误差范数 > 1e-3  →  EDIIS  # 保守的稳速下降
       DIIS误差范数 ≤ 1e-3  →  DIIS   # 快速的末段冲刺
       ```
+      在常规体系（C₂/HF、H₂O/PBE、Fe²⁺/UHF、N₂/PBE 等）中，`ediis+diis` 的迭代数与纯 `diis` 一致，同时具有 EDIIS 的早期能量稳定性。
+    - `"adiis+diis"`：ADIIS-DIIS 混合（Hu-Yang, JCP 2010, 132, 054109）。与 `ediis+diis` 类似，但使用以最新历史点为参考的惩罚矩阵。
     - 各 mixer 策略对比：
-      | 策略 | 场景 | 收敛速度 | 稳定性 |
-      |------|------|---------|--------|
-      | direct/linear | 非常简单的闭壳层小分子 | 慢 | 高 |
-      | diis | 常规体系（缺省） | 快 | 一般 |
-      | ediis | 小能隙、过渡金属 | 较慢 | **很高** |
-      | **ediis+diis** | 过渡金属、难以收敛的体系 | **快** | **很高** |
+      | 策略 | 场景 | 收敛速度 | 备注 |
+      |------|------|---------|------|
+      | direct/linear | 非常简单的闭壳层小分子 | 慢 | 最朴素的方法 |
+      | diis | 常规体系（缺省） | 快 | 内置振荡检测回退机制，实践中最稳定 |
+      | ediis | HF 近简并体系 | 较慢 | 理论上有能量单调性（仅 HF），但 DFT 下为近似 |
+      | **ediis+diis** | 常规体系 | **快** | 与 diis 等速，兼具 EDIIS 早期稳定性 |
+      | adiis+diis | 与 ediis+diis 类似 | 快 | B 矩阵保证 PSD，数值更鲁棒 |
+    - 已知局限：纯 `ediis` 在极端拉伸的 DFT 体系（如 N₂ r=3Å PBE）中可能不收敛——此时 Fock 混合近似 `ΣcᵢFᵢ ≈ F(D̃)` 因 V_xc 强非线性而失效，建议使用 `ediis+diis`（自动切换到 DIIS）。
 - `mix_param`: 取值f64。DIIS方法或linear方法的混合系数。缺省为0.6
 - `start_diis_cycle`: 取值i32。开始使用diis（或ediis）加速收敛方法的循环数。缺省为2
 - `num_max_diis`: 取值i32。DIIS/EDIIS子空间大小（存储的历史Fock/密度矩阵数量）。缺省为8
 - `level_shift`: 取值f64。对于发生近简并振荡不收敛的情况，可以采用level_shift的方式人为破坏简并，加速收敛。单位为hartree，缺省值为None（不开启）。
     - 注意：当体系本身可以用纯 DIIS 正常收敛时，开启 level_shift 反而会减速收敛（DIIS 子空间已充分条件良好）。仅当 DIIS 失效（近简并振荡）时才需要开启此选项。
-- `ediis_penalty`：取值f64。EDIIS 惩罚参数 η（Kudin-Scuseria, JCP 2002, 116, 8255）。η 越大，外推越保守（偏离历史数据点的惩罚越大）。缺省为 0.5。仅当 `mixer = "ediis"` 或 `"ediis+diis"` 时生效。
-- `ediis_switch_gap`：取值f64。EDIIS→DIIS 自动切换的 HOMO-LUMO 能隙阈值（单位为 Hartree）。仅当 `mixer = "ediis+diis"` 时生效。当前实现中 DIIS 误差范数的切换阈值已自动确定（1e-3），本关键词预留用于未来基于能隙的切换策略。缺省为 0.1。
+- `ediis_penalty`：取值f64。EDIIS 惩罚参数 η（Kudin-Scuseria, JCP 2002, 116, 8255）。η 越大，外推越保守（偏离历史数据点的惩罚越大）。缺省为 0.5。仅当 `mixer = "ediis"`、`"ediis+diis"` 或 `"adiis+diis"` 时生效。
+- `ediis_switch_gap`：取值f64。预留关键词。当前实现中 EDIIS→DIIS 的切换由 DIIS 误差范数自动确定（阈值 1e-3），本关键词暂不生效。缺省为 0.1。
+- `adiis_penalty`：取值f64。ADIIS 惩罚参数 μ（Hu-Yang, JCP 2010, 132, 054109）。缺省为 0.5。仅当 `mixer = "adiis+diis"` 时生效。
 - `start_check_oscillation`: 取值i32。开始检查并自洽场计算不收敛发生振荡的循环数。当监控到自洽场发生振荡，SCF能量上升的情况，开启一次线性混合方案（linear）。缺省为20
 - `smear`：取值String。开启分数轨道占据（smearing）加速自洽场收敛。适用于能隙较小或金属性体系。目前支持：
     - `"fermi"`：Fermi-Dirac 展宽
