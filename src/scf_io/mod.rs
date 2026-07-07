@@ -3666,9 +3666,16 @@ impl SCF {
 
         // compute vk only for specified spin channels
         let mut vks = if alg_semi {
-            let mo_coeff = &self.eigenvectors[0..self.mol.spin_channel];
+            // we assume copying molecular coefficients is cheap operation, to avoid lifetime issues
+            let mut mo_coeff = self.eigenvectors[0..self.mol.spin_channel].iter().cloned().collect::<Vec<_>>();
             let mo_occ = &self.occupation[0..self.mol.spin_channel];
             let mol_obj = &self.mol;
+            // special case for ROHF: copy alpha mo_coeff to beta (ROHF only store the alpha channel)
+            match self.scftype {
+                SCFType::ROHF => mo_coeff[1] = self.eigenvectors[0].clone(),
+                _ => {}
+            };
+            let mo_coeff = &mo_coeff;
             ri_jk::generate_vk_ri_semi_direct_coeff(scaling_factor, mo_coeff, mo_occ, mol_obj, omega, batch_size)
         } else {
             let dms = &self.density_matrix[0..self.mol.spin_channel];
