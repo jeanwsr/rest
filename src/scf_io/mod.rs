@@ -4715,6 +4715,21 @@ pub struct ScfTraceRecord {
     pub sqrt_inv_ovlp: Option<MatrixFull<f64>>,
     pub ediis_density: Vec<[MatrixFull<f64>;2]>,
     pub ediis_energy: Vec<f64>,
+    /// Separate Fock history for EDIIS/ADIIS B-matrix, independent from DIIS
+    /// target_vector. This allows clearing DIIS history (when transitioning
+    /// from EDIIS to DIIS) without losing the EDIIS B-matrix data.
+    pub ediis_fock: Vec<[MatrixFull<f64>;2]>,
+    /// Flag set when prepare_next_input applied density-matrix extrapolation
+    /// (EDIIS/ADIIS) for HF: D_mixed is the next density, skip generate_density_matrix.
+    pub extrapolated_density: bool,
+    /// Flag set when prepare_next_input applied density-matrix extrapolation
+    /// (EDIIS/ADIIS) for DFT: after generate_density_matrix (Roothaan step
+    /// from D_mixed → D_idem), rebuild F(D_idem) for correct physical energy.
+    pub needs_fock_rebuild: bool,
+    /// Persistent flag: true if the density entering prepare_next_input is a
+    /// non-idempotent EDIIS/ADIIS extrapolated density. Used to clear DIIS
+    /// history before it gets contaminated.
+    pub prev_density_extrapolated: bool,
 }
 
 impl ScfTraceRecord {
@@ -4744,6 +4759,10 @@ impl ScfTraceRecord {
             sqrt_inv_ovlp: None,
             ediis_density: Vec::<[MatrixFull<f64>;2]>::new(),
             ediis_energy: Vec::<f64>::new(),
+            ediis_fock: Vec::<[MatrixFull<f64>;2]>::new(),
+            extrapolated_density: false,
+            needs_fock_rebuild: false,
+            prev_density_extrapolated: false,
         }
     }
     pub fn initialize(scf: &SCF) -> ScfTraceRecord {
@@ -4770,7 +4789,7 @@ impl ScfTraceRecord {
                 else { MatrixFull::empty() }]);
             tmp_records.ediis_energy.push(ediis_e0(scf.scf_energy,
                 scf.smearing_entropy, Some(scf.current_smear_sigma)));
-            tmp_records.target_vector.push([scf.hamiltonian[0].to_matrixfull().unwrap(),
+            tmp_records.ediis_fock.push([scf.hamiltonian[0].to_matrixfull().unwrap(),
                 if scf.mol.spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() }
                 else { MatrixFull::empty() }]);
         }
@@ -4989,27 +5008,34 @@ impl ScfTraceRecord {
             }
             
         } else if self.mixer.eq(&"ediis") && self.num_iter>=start_pulay {
+            // EDIIS: energy-DIIS per Kudin, Scuseria, Cancès, JCP 2002.
+            // Fock mixing F̃ = ΣcᵢFᵢ is used for BOTH HF and DFT (the paper
+            // shows DFT nonlinearity is negligible for convergence acceleration).
             scf.generate_hf_hamiltonian(mpi_operator);
             let cur_density = [scf.density_matrix[0].clone(),
                 if spin_channel>1 { scf.density_matrix[1].clone() } else { MatrixFull::empty() }];
             let cur_fock = [scf.hamiltonian[0].to_matrixfull().unwrap(),
                 if spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() } else { MatrixFull::empty() }];
             if self.ediis_density.len() == self.num_max_records {
-                self.ediis_density.remove(0); self.ediis_energy.remove(0); self.target_vector.remove(0);
+                self.ediis_density.remove(0); self.ediis_energy.remove(0); self.ediis_fock.remove(0);
             }
-            self.ediis_density.push(cur_density); self.ediis_energy.push(ediis_e0(self.scf_energy,
-                self.smearing_entropy, Some(scf.current_smear_sigma)));
-            self.target_vector.push(cur_fock);
+            self.ediis_density.push(cur_density); self.ediis_energy.push(ediis_e0(scf.scf_energy,
+                scf.smearing_entropy, Some(scf.current_smear_sigma)));
+            self.ediis_fock.push(cur_fock);
             let nhist = self.ediis_density.len();
             if nhist >= 2 {
-                let bmat = generate_ediis_penalty(&self.target_vector, &self.ediis_density, spin_channel);
+                let bmat = generate_ediis_penalty(&self.ediis_fock, &self.ediis_density, spin_channel);
                 let eta = scf.mol.ctrl.ediis_penalty.unwrap_or(0.5);
                 let n = bmat.size()[0]; let mut qmat = MatrixFull::new([n, n], 0.0);
                 for i in 0..n { for j in 0..n { let bij = bmat.get2d([i, j]).unwrap_or(&0.0); qmat.set2d([i, j], -2.0*eta*bij); } }
                 let coeff = ediis_qp_solver(&qmat, &self.ediis_energy, eta);
+                // Fock mixing: F̃ = ΣcᵢFᵢ (paper Eq. 10).
+                // The SCF loop diagonalizes F̃ → idempotent D_next.
                 for i_spin in 0..spin_channel {
-                    let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
-                    for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
+                    let mut next_h = MatrixFull::new(self.ediis_fock[0][i_spin].size.clone(), 0.0);
+                    for (k, ck) in coeff.iter().enumerate() {
+                        next_h.self_scaled_add(&self.ediis_fock[k][i_spin], *ck);
+                    }
                     scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                 }
                 if scf.mol.ctrl.print_level > 1 {
@@ -5032,17 +5058,18 @@ impl ScfTraceRecord {
             let cur_fock = [scf.hamiltonian[0].to_matrixfull().unwrap(), if spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() } else { MatrixFull::empty() }];
             let max_rec = self.num_max_records;
             if self.target_vector.len() == max_rec { self.target_vector.remove(0); self.error_vector.remove(0); }
-            if self.ediis_density.len() == max_rec { self.ediis_density.remove(0); self.ediis_energy.remove(0); }
+            if self.ediis_density.len() == max_rec { self.ediis_density.remove(0); self.ediis_energy.remove(0); self.ediis_fock.remove(0); }
             let (cur_err, cur_tgt) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel, &self.sqrt_inv_ovlp);
             self.error_vector.push(cur_err); self.target_vector.push(cur_tgt);
-            self.ediis_density.push(cur_dens); self.ediis_energy.push(ediis_e0(self.scf_energy,
-                self.smearing_entropy, Some(scf.current_smear_sigma)));
+            self.ediis_density.push(cur_dens); self.ediis_energy.push(ediis_e0(scf.scf_energy,
+                scf.smearing_entropy, Some(scf.current_smear_sigma)));
+            self.ediis_fock.push(cur_fock);
             let num_diis = self.error_vector.len(); let num_ediis = self.ediis_density.len();
             let diis_norm = self.error_vector.last().map(|v| v.iter().map(|x| x*x).sum::<f64>().sqrt()).unwrap_or(1.0);
             let use_ediis = num_ediis >= 2 && (num_diis < 2 || diis_norm > 1e-3);
             let mut ediis_used = false;
             if use_ediis && num_ediis >= 2 {
-                let bmat = generate_ediis_penalty(&self.target_vector, &self.ediis_density, spin_channel);
+                let bmat = generate_ediis_penalty(&self.ediis_fock, &self.ediis_density, spin_channel);
                 let eta = scf.mol.ctrl.ediis_penalty.unwrap_or(0.5);
                 let n = bmat.size()[0]; let mut qmat = MatrixFull::new([n, n], 0.0);
                 for i in 0..n { for j in 0..n { let bij = bmat.get2d([i, j]).unwrap_or(&0.0); qmat.set2d([i, j], -2.0*eta*bij); } }
@@ -5053,15 +5080,15 @@ impl ScfTraceRecord {
                     let bij = bmat.get2d([i, j]).unwrap_or(&0.0);
                     e_pred -= eta * coeff[i] * coeff[j] * bij;
                 }}
-                let e0_cur = ediis_e0(self.scf_energy, self.smearing_entropy, Some(scf.current_smear_sigma));
+                let e0_cur = ediis_e0(scf.scf_energy, scf.smearing_entropy, Some(scf.current_smear_sigma));
                 let ediis_ok = e_pred <= e0_cur + 1e-10;
                 if !ediis_ok && scf.mol.ctrl.print_level > 1 {
                     println!("[EDIIS] rejected: E_pred={:14.8} > E0_cur={:14.8}", e_pred, e0_cur);
                 }
                 if ediis_ok {
                     for i_spin in 0..spin_channel {
-                        let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
+                        let mut next_h = MatrixFull::new(self.ediis_fock[0][i_spin].size.clone(), 0.0);
+                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
                         scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                     }
                     if scf.mol.ctrl.print_level > 1 { print!("[EDIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
@@ -5084,7 +5111,7 @@ impl ScfTraceRecord {
                     scf.generate_hf_hamiltonian(mpi_operator);
                     level_shift_applied = false;
                     self.target_vector.clear(); self.error_vector.clear();
-                    self.ediis_density.clear(); self.ediis_energy.clear();
+                    self.ediis_density.clear(); self.ediis_energy.clear(); self.ediis_fock.clear();
                 }
             }
         } else if self.mixer.eq(&"adiis+diis") && self.num_iter>=start_pulay {
@@ -5102,17 +5129,18 @@ impl ScfTraceRecord {
             let cur_fock = [scf.hamiltonian[0].to_matrixfull().unwrap(), if spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() } else { MatrixFull::empty() }];
             let max_rec = self.num_max_records;
             if self.target_vector.len() == max_rec { self.target_vector.remove(0); self.error_vector.remove(0); }
-            if self.ediis_density.len() == max_rec { self.ediis_density.remove(0); self.ediis_energy.remove(0); }
+            if self.ediis_density.len() == max_rec { self.ediis_density.remove(0); self.ediis_energy.remove(0); self.ediis_fock.remove(0); }
             let (cur_err, cur_tgt) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel, &self.sqrt_inv_ovlp);
             self.error_vector.push(cur_err); self.target_vector.push(cur_tgt);
-            self.ediis_density.push(cur_dens.clone()); self.ediis_energy.push(ediis_e0(self.scf_energy,
-                self.smearing_entropy, Some(scf.current_smear_sigma)));
+            self.ediis_density.push(cur_dens.clone()); self.ediis_energy.push(ediis_e0(scf.scf_energy,
+                scf.smearing_entropy, Some(scf.current_smear_sigma)));
+            self.ediis_fock.push(cur_fock);
             let num_diis = self.error_vector.len(); let num_ediis = self.ediis_density.len();
             let diis_norm = self.error_vector.last().map(|v| v.iter().map(|x| x*x).sum::<f64>().sqrt()).unwrap_or(1.0);
             let use_adiis = num_ediis >= 2 && (num_diis < 2 || diis_norm > 1e-3);
             let mut adiis_used = false;
             if use_adiis && num_ediis >= 2 {
-                let bmat = generate_adiis_penalty(&self.ediis_density, &self.target_vector, spin_channel);
+                let bmat = generate_adiis_penalty(&self.ediis_density, &self.ediis_fock, spin_channel);
                 let mu = scf.mol.ctrl.adiis_penalty.unwrap_or(0.5);
                 let bmax = bmat.data.iter().fold(0.0f64, |m, &x| m.max(x.abs()));
                 let mu_eff = if bmax > 1e-10 { mu / bmax } else { mu };
@@ -5125,15 +5153,15 @@ impl ScfTraceRecord {
                     let bij = bmat.get2d([i, j]).unwrap_or(&0.0);
                     e_pred += 0.5 * mu_eff * coeff[i] * coeff[j] * bij;
                 }}
-                let e0_cur = ediis_e0(self.scf_energy, self.smearing_entropy, Some(scf.current_smear_sigma));
+                let e0_cur = ediis_e0(scf.scf_energy, scf.smearing_entropy, Some(scf.current_smear_sigma));
                 let adiis_ok = e_pred <= e0_cur + 1e-8;
                 if !adiis_ok && scf.mol.ctrl.print_level > 1 {
                     println!("[ADIIS] rejected: E_pred={:14.8} > E0_cur={:14.8}", e_pred, e0_cur);
                 }
                 if adiis_ok {
                     for i_spin in 0..spin_channel {
-                        let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
+                        let mut next_h = MatrixFull::new(self.ediis_fock[0][i_spin].size.clone(), 0.0);
+                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
                         scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                     }
                     if scf.mol.ctrl.print_level > 1 { print!("[ADIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
@@ -5156,7 +5184,7 @@ impl ScfTraceRecord {
                     scf.generate_hf_hamiltonian(mpi_operator);
                     level_shift_applied = false;
                     self.target_vector.clear(); self.error_vector.clear();
-                    self.ediis_density.clear(); self.ediis_energy.clear();
+                    self.ediis_density.clear(); self.ediis_energy.clear(); self.ediis_fock.clear();
                 }
             }
         };
@@ -5205,6 +5233,12 @@ impl ScfTraceRecord {
         ];
         self.target_vector = Vec::<[MatrixFull<f64>; 2]>::new();
         self.error_vector = Vec::<Vec::<f64>>::new();
+        self.ediis_density = Vec::<[MatrixFull<f64>; 2]>::new();
+        self.ediis_energy = Vec::<f64>::new();
+        self.ediis_fock = Vec::<[MatrixFull<f64>; 2]>::new();
+        self.extrapolated_density = false;
+        self.needs_fock_rebuild = false;
+        self.prev_density_extrapolated = false;
     }
 }
 
