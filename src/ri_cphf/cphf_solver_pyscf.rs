@@ -305,39 +305,11 @@ impl CPHFSolverPySCF {
         let nmo = self.nmo;
         let start_mo = self.start_mo;
         let nfrozen = start_mo;  // MOs 0..start_mo are frozen
-        let dim_total = (nfrozen + self.nvir) * nocc;  // frozen rows + active VO rows
 
-        // e_ai for frozen rows: e_ai_frozen[k,i] = 1/(e_frozen[k] - e_occ[i])
-        let mut e_ai_frozen = vec![0.0; nfrozen * nocc];
-        for k in 0..nfrozen {
-            let e_f = self.mo_energy[k];
-            for i in 0..nocc {
-                e_ai_frozen[i + k * nocc] = 1.0 / (e_f - self.mo_energy[start_mo + i]);
-            }
-        }
-
-        // Build base RHS (VO only, for active virtual rows): b_vo[a,i] = -(h1 - s1*e_i) * e_ai
-        let rhs_vo = self.build_rhs_with_s1(h1_nmc, s1_nmc);
-
-        // Build frozen row RHS: b_frozen[k,i] = -(h1 - s1*e_i)[k,i] * e_ai_frozen[k,i]
-        let mut rhs_frozen = vec![0.0; nfrozen * nocc];
-        for k in 0..nfrozen {
-            for i in 0..nocc {
-                let nmc_idx = k + i * nmo;
-                let h1v = h1_nmc[nmc_idx];
-                let s1v = s1_nmc[nmc_idx];
-                let e_occ = self.mo_energy[start_mo + i];
-                rhs_frozen[i + k * nocc] = -(h1v - s1v * e_occ) * e_ai_frozen[i + k * nocc];
-            }
-        }
-
-        // Combine RHS: [rhs_frozen, rhs_vo]
-        let mut rhs = vec![0.0; dim_total];
-        for i in 0..nfrozen*nocc { rhs[i] = rhs_frozen[i]; }
-        for i in 0..dim { rhs[nfrozen*nocc + i] = rhs_vo[i]; }
-
-        // Add OO correction to BOTH frozen and VO rows of RHS
-        // fvind(mo1_oo)_rows * e_ai for all rows (frozen + VO), where mo1_oo = -0.5*s1
+        // Build RHS (VO only): b_vo[a,i] = -(h1 - s1*e_i) * e_ai + OO correction
+        let mut rhs = self.build_rhs_with_s1(h1_nmc, s1_nmc);
+        // Add OO correction: subtract fvind(mo1_oo) * e_ai from RHS (occ-occ block response)
+        // where mo1_oo[i,j] = -0.5 * s1_nmc for active occupied rows
         {
             let mut z_oo_full = vec![0.0; nmo * nocc];
             for j in 0..nocc { for i in 0..nocc {
@@ -345,82 +317,55 @@ impl CPHFSolverPySCF {
                 z_oo_full[nmc_idx] = -0.5 * s1_nmc[nmc_idx];
             }}
             let oo_resp_full = self.fvind_nmo_nocc(scf, fxc_cache, &z_oo_full);
-            // Subtract from frozen rows
-            for k in 0..nfrozen {
-                for ia in 0..nocc {
-                    let g_oo = oo_resp_full[k + ia * nmo];
-                    rhs[ia + k * nocc] -= g_oo * e_ai_frozen[ia + k * nocc];
-                }
-            }
-            // Subtract from VO rows
             for ia in 0..dim {
                 let ia_col = ia / nocc;
                 let ia_row = ia % nocc;
                 let r = self.lumo + ia_col;
-                let g_oo = oo_resp_full[r + ia_row * nmo];
-                rhs[nfrozen*nocc + ia] -= g_oo * self.e_ai[ia];
+                rhs[ia] -= oo_resp_full[r + ia_row * nmo] * self.e_ai[ia];
             }
         }
 
-        // Build augmented LHS: (dim_total) × (dim_total) = 80 × 80
-        let mut lhs = MatrixFull::new([dim_total, dim_total], 0.0);
-        let mut z_full = vec![0.0; self.nmo * self.nocc];
+        // Build LHS: dim × dim VO-only system (I + G̃)
+        let mut lhs = MatrixFull::new([dim, dim], 0.0);
+        let mut z_full = vec![0.0; nmo * nocc];
 
-        // Column index in augmented space = [frozen columns, VO columns]
-        // frozen column offset: 0
-        // VO column offset: nfrozen * nocc
-
-        for jb in 0..dim_total {
+        for jb in 0..dim {
             z_full.fill(0.0);
-            let (row, col_jb);  // position in (nmo, nocc) space
-
-            if jb < nfrozen * nocc {
-                // Frozen row unit vector
-                let k_frozen = jb / nocc;
-                let occ_j = jb % nocc;
-                row = k_frozen;
-                col_jb = occ_j;
-            } else {
-                // Active VO unit vector
-                let jb_vo = jb - nfrozen * nocc;
-                let a_vir = jb_vo / nocc;
-                let occ_j = jb_vo % nocc;
-                row = self.lumo + a_vir;
-                col_jb = occ_j;
-            }
-            z_full[row + col_jb * self.nmo] = 1.0;
+            let a_vir = jb / nocc;
+            let occ_j = jb % nocc;
+            let row = self.lumo + a_vir;
+            z_full[row + occ_j * nmo] = 1.0;
 
             let resp_full = self.fvind_nmo_nocc(scf, fxc_cache, &z_full);
 
-            // Fill LHS column jb:
-            //   For frozen rows: LHS[ia_frozen, jb] = resp_frozen * e_ai_frozen + δ
-            //   For VO rows:    LHS[ia_vo + fo_off, jb] = resp_vo * e_ai + δ
-            for ia in 0..nfrozen * nocc {
-                let k_fr = ia / nocc;
-                let occ_i = ia % nocc;
-                lhs[[ia, jb]] = resp_full[k_fr + occ_i * self.nmo] * e_ai_frozen[ia];
-            }
             for ia in 0..dim {
                 let ia_col = ia / nocc;
                 let ia_row = ia % nocc;
                 let r = self.lumo + ia_col;
-                lhs[[nfrozen*nocc + ia, jb]] = resp_full[r + ia_row * self.nmo] * self.e_ai[ia];
+                lhs[[ia, jb]] = resp_full[r + ia_row * nmo] * self.e_ai[ia];
             }
-
-            // Add identity
-            lhs[[jb, jb]] += 1.0;
+            lhs[[jb, jb]] += 1.0; // identity
         }
 
-        // Solve augmented system
-        let u_total = _dsolve(&lhs, &rhs)?;
+        // Solve VO system
+        let u_vo = _dsolve(&lhs, &rhs)?;
 
-        // Extract frozen and VO parts
-        let u_frozen = &u_total[..nfrozen * nocc];
-        let u_vo = &u_total[nfrozen * nocc..];
+        // u_frozen from s1 (frozen orbitals don't rotate independently):
+        // u_frozen[k, i] = -0.5 * s1[k, i] for frozen MO k, active occupied i
+        let u_frozen: Vec<f64> = {
+            let mut uf = vec![0.0; nfrozen * nocc];
+            for k in 0..nfrozen {
+                for i in 0..nocc {
+                    let nmc_idx = k + i * nmo;
+                    uf[i + k * nocc] = -0.5 * s1_nmc[nmc_idx];
+                }
+            }
+            uf
+        };
 
         // Assemble full (nmo, nocc) solution
         let u_oo = self.solve_occ_occ_from_s1(s1_nmc);
-        Some(self.assemble_full_solution_with_frozen(u_vo, &u_oo, u_frozen))
+        Some(self.assemble_full_solution_with_frozen(&u_vo, &u_oo, &u_frozen))
     }
 
     // ── Krylov solver (Pople-style) ────────────────────────────────────
