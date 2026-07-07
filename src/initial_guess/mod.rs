@@ -191,7 +191,7 @@ pub fn update_scf_from_hdf5chk(scf_data: &mut SCF, chkfile: String) {
                 //let is_exist = scf_data.ref_eigenvectors.contains_key(&restart);
                 //if ! is_exist {
                 scf_data.ref_eigenvectors.insert(
-                    restart, 
+                    restart,
                     (eigenvectors.clone(),[0,scf_data.mol.num_basis,scf_data.mol.num_state,scf_data.mol.spin_channel])
                 );
                 //};
