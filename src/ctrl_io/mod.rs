@@ -42,6 +42,10 @@ use quasiparticle_methods::QuasiParticle;
 use tddft_parameters::TDDFTParameters;
 use hessian_parameters::HessianParameters;
 use thermo_parameters::ThermoParameters;
+use std::io::Write;
+use log::{info, debug, warn, Level};
+use env_logger::Builder;
+use utilities::log::printlevel2loglevel;
 
 pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
     let tmp_cont = fs::read_to_string(&filename[..])?;
@@ -246,6 +250,10 @@ pub struct InputKeywords {
     pub scf_acc_eev: f64,
     #[pyo3(get, set)]
     pub scf_acc_etot:f64,
+    #[pyo3(get, set)]
+    pub scf_conv_criteria: String,
+    #[pyo3(get, set)]
+    pub scf_acc_g: f64,
     #[pyo3(get, set)]
     pub has_chkfile: bool,
     #[pyo3(get, set)]
@@ -463,6 +471,8 @@ impl InputKeywords {
             scf_acc_rho: 1.0e-6,
             scf_acc_eev: 1.0e-5,
             scf_acc_etot:1.0e-8,
+            scf_conv_criteria: String::from("dm,eev"),
+            scf_acc_g: 1.0e-5,
             has_chkfile: false, // not directly set by input
             external_init_guess: None, // not directly set by input
             initial_guess: String::from("sad"),
@@ -644,7 +654,8 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
             }
         },
     };
-    println!("Print level:                {}", ctrl.print_level);
+    print!("Print level:   {}", ctrl.print_level);
+    println!("    max log level: {}", log::max_level());
     if let Some(num_threads) = ctrl.num_threads {
         println!("The number of threads used for parallelism:      {}", num_threads);
     } else {
@@ -676,6 +687,8 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         println!("SCF convergency thresholds: {:e} for density matrix", ctrl.scf_acc_rho);
         println!("                            {:e} Ha. for sum of eigenvalues", ctrl.scf_acc_eev);
         println!("                            {:e} Ha. for total energy", ctrl.scf_acc_etot);
+        println!("                            {:e} Ha. for grad_dm", ctrl.scf_acc_g);
+        println!("SCF convergence criteria:       {}", ctrl.scf_conv_criteria);
         println!("Max. SCF cycle number:      {}", ctrl.max_scf_cycle);
         match geom.pbc {
             MOrC::Molecule => println!("It is a finite cluster calculation"),
@@ -796,6 +809,17 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(1) as usize},
                 other => {1_usize},
             };
+            let mut builder = Builder::new();
+            builder.filter_level(printlevel2loglevel(tmp_input.print_level));
+            builder.format(|buf, record| {
+                if record.level() == Level::Info {
+                    writeln!(buf, "{}", record.args())
+                } else {
+                    writeln!(buf, "[{:<5} {}] {}", record.level(), record.target().split_once("::").map(|(_, rest)| rest).unwrap_or(record.target()), record.args())
+                }
+            });
+            builder.init();
+            // log::set_max_level(printlevel2loglevel(tmp_input.print_level));
             //let default_rayon_current_num_threads = rayon::current_num_threads();
             tmp_input.num_threads = match tmp_ctrl.get("num_threads").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {Some(tmp_str.to_lowercase().parse().unwrap_or(1))},
@@ -1391,6 +1415,15 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-8)},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-8)},
                 other => {1.0e-8}
+            };
+            tmp_input.scf_conv_criteria = match tmp_ctrl.get("scf_conv_criteria").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
+                other => {String::from("dm,eev")}
+            };
+            tmp_input.scf_acc_g = match tmp_ctrl.get("scf_acc_g").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-5)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-5)},
+                other => {1.0e-5}
             };
 
             tmp_input.mixer = match tmp_ctrl.get("mixer").unwrap_or(&serde_json::Value::Null) {

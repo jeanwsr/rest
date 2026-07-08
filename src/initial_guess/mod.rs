@@ -6,9 +6,9 @@ use crate::mpi_io::mpi_broadcast_matrixfull;
 use crate::mpi_io::MPIOperator;
 use crate::scf_io::{SCFType};
 use crate::{molecule_io::Molecule, scf_io::SCF, dft::Grids};
-
 use crate::initial_guess::sap::get_vsap;
 use self::sad::initial_guess_from_sad;
+use log::{self, LevelFilter};
 
 pub mod sap;
 pub mod sad;
@@ -37,6 +37,7 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
                 scf_data.density_matrix = initial_guess_from_hdf5guess(&scf_data.mol);
                 // for DFT methods, it needs the eigenvectors to generate the hamiltonian. In consequence, we use the hf method to prepare the eigenvectors from the guess dm
                 scf_data.generate_hf_hamiltonian_for_guess();
+                scf_data.grad_dm = scf_data.get_grad_dm();
                 //scf_data.generate_hf_hamiltonian();
                 if scf_data.mol.ctrl.print_level>0 {println!("Initial guess energy: {:16.8}", scf_data.evaluate_hf_total_energy())};
                 scf_data.diagonalize_hamiltonian(mpi_operator);
@@ -99,7 +100,10 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
         scf_data.generate_density_matrix();
         //scf_data.generate_hf_hamiltonian();
     } else if scf_data.mol.ctrl.initial_guess.eq(&"sad") {
+        let cur_log_level = log::max_level();
+        log::set_max_level(LevelFilter::Info);
         scf_data.density_matrix = initial_guess_from_sad(&scf_data.mol, mpi_operator);
+        log::set_max_level(cur_log_level);
         //for DFT methods, it needs the eigenvectors to generate the hamiltoniam. In consequence, we use the hf method to prepare the eigenvectors from the guess dm
         //scf_data.generate_hf_hamiltonian_for_guess();
         //if scf_data.mol.ctrl.print_level>0 {println!("Initial guess HF energy: {:16.8}", scf_data.evaluate_hf_total_energy())};
