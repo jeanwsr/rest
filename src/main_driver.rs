@@ -977,6 +977,39 @@ mod geometric_pyo3_impl {
             panic!("For geometric_pyo3, you must specify the parameters in the control file.")
         };
 
+        // ── Compute analytical Hessian before optimization (if requested) ──
+        let hessian_analytic_path: Option<std::path::PathBuf> =
+            if scf_data.mol.ctrl.geometric_pyo3.as_ref().map_or(false, |g| g.analytic_hessian) {
+                let pl = scf_data.mol.ctrl.print_level;
+                if pl > 0 {
+                    println!("  Computing analytical Hessian for geomeTRIC initial guess...");
+                }
+                let hess_total = crate::hessian::compute_hessian(&*scf_data)
+                    .expect("Analytical Hessian computation failed for geometry optimization");
+                let natm = scf_data.mol.geom.nfree;
+                let n3 = natm * 3;
+                let mut out = String::new();
+                for i in 0..n3 {
+                    let mut row = String::new();
+                    for j in 0..n3 {
+                        use std::fmt::Write;
+                        let _ = write!(&mut row, " {:17.10e}", hess_total[[i, j]]);
+                    }
+                    out.push_str(row.trim_start());
+                    out.push('\n');
+                }
+                let hess_path = std::env::temp_dir()
+                    .join(format!("rest_hess_analytic_{}.txt", std::process::id()));
+                std::fs::write(&hess_path, &out)
+                    .expect("Failed to write analytical Hessian file");
+                if pl > 0 {
+                    println!("  Analytical Hessian saved to {}", hess_path.display());
+                }
+                Some(hess_path)
+            } else {
+                None
+            };
+
         let constraint_path = if let Some(constraint_str) = scf_data.mol.geom.to_geometric_freeze_str() {
             if scf_data.mol.ctrl.print_level > 0 {
                 println!("Fixed atoms detected, generating constraint file.");
@@ -1007,6 +1040,11 @@ mod geometric_pyo3_impl {
                 params.bind(py).set_item("constraints", cst_path.to_str().unwrap())?;
             }
 
+            // Inject analytical Hessian file path into geomeTRIC params
+            if let Some(ref hess_path) = hessian_analytic_path {
+                params.bind(py).set_item("hessian", format!("file:{}", hess_path.display()))?;
+            }
+
             let res = run_optimization(custom_engine, &params, input)?;
 
             let last_energy = res
@@ -1025,6 +1063,9 @@ mod geometric_pyo3_impl {
         })?;
 
         if let Some(ref path) = constraint_path {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(ref path) = hessian_analytic_path {
             let _ = std::fs::remove_file(path);
         }
 

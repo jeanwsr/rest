@@ -894,13 +894,14 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 - `converge_dmax`：取值f64。最大构型变化的收敛阈值。缺省值：1.8e-3
 - `coordsys`：取值String。坐标系统设置。缺省值："tric"。如果有其他需求见geomeTRIC的官方说明：https://geometric.readthedocs.io/en/latest/
 - `transition`：取值bool，设置为true则开启过渡态搜索。缺省值为：false（对应于稳态搜索）
-- `hessian`：取值String。决定是否以及何时进行Hessian矩阵计算（目前只支持数值Hessian计算）。
+- `hessian`：取值String。决定是否以及何时进行Hessian矩阵计算。**数值 Hessian**（由 geomeTRIC 通过有限差分梯度计算）和 **REST 解析 Hessian**（由 `analytic_hessian` 开关控制）二选一。
     - "never"：不做Hessian矩阵计算（缺省：稳态搜索）
-	- "first"：只对初始结构计算Hessian矩阵（缺省：过渡态搜索）
+    - "first"：只对初始结构计算Hessian矩阵（缺省：过渡态搜索）
 	- "last"：计算优化好的结构的Hessian矩阵计算
 	- "first+last"：计算初始和优化好的两个结构的Hessian矩阵
 	- "stop"：不做构型优化，只计算初始结构的Hessian矩阵
 	- "each"：计算构型优化中每一步的Hessian矩阵
+- `analytic_hessian`：取值 bool。若设为 `true`，则在调用 geomeTRIC 优化前先用 REST 的解析 Hessian 模块计算结果并注入 geomeTRIC，**完全避免 geomeTRIC 的数值有限差分 Hessian 计算**。解析 Hessian 含 CP-HF 轨道弛豫贡献，精度远优于有限差分，且后续 BFGS 更新不受影响。缺省值：`false`。建议在过渡态搜索（`transition = true`）或 IRC 追踪（`irc = true`）中启用。
 - `frequency`：取值bool，当得到Hessian矩阵后，是否开展频率计算和热化学分析。缺省值：true
 - `thermo`：取值[f64;2]，提供热力学分析的状态：[温度 (K),压强 (bar)]。缺省值：[300.0, 1.0]
 - `reset`：取值bool。当近似 Hessian 的特征值低于 `epsilon` 阈值时，是否将其重置回 guess Hessian。对于稳态优化，缺省值为 true。若体系梯度含噪声、BFGS 更新每步失败（出现 "Eigenvalues below ... returning guess"），可设为 false 保留 Hessian 并加对角 shift 继续优化。
@@ -946,3 +947,10 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 		hessian = "first+last"
 		thermo = [398.0, 1.5]
 	```
+- 例子四：开启过渡态优化，并用 REST 解析 Hessian 替代 geomeTRIC 数值有限差分 Hessian
+    ```toml
+	[geometric_pyo3]
+	    transition = true
+		analytic_hessian = true
+	```
+    - 启用后，REST 在初始结构上计算解析 Hessian（含 CP-HF 轨道弛豫），写入临时文件并注入 geomeTRIC。geomeTRIC 读取后用于第一步优化方向，后续所有步正常走 BFGS 更新，整个过程不产生任何数值有限差分计算。
