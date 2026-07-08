@@ -1,3 +1,4 @@
+pub mod cpu_monitor;
 pub mod ej_ek_baseline;
 pub mod memory_monitor;
 pub mod rhf;

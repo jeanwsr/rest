@@ -637,14 +637,91 @@ pub fn vxc_diag_cached(scf: &SCF, xc_type: XCType, cache: &VxcHessianCache) -> M
 }
 
 /// Maximum number of grid blocks processed concurrently in streaming mode.
-/// Reads `REST_HESS_GRID_CONCURRENCY` env var (default 2). Lower values
-/// reduce peak RSS at the cost of less grid-level parallelism.
+///
+/// When `REST_HESS_GRID_CONCURRENCY` env var is set, returns that value (legacy
+/// fixed-concurrency mode without sub-block splitting).
+///
+/// When NOT set, returns a sentinel value (0) signalling that the streaming
+/// functions should use [`plan_grid_split`] to determine the optimal
+/// concurrency and sub-block layout adaptively based on available threads.
 fn grid_concurrency() -> usize {
     std::env::var("REST_HESS_GRID_CONCURRENCY")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&v| v >= 1)
-        .unwrap_or(2)
+        .unwrap_or(0) // 0 = "use adaptive plan"
+}
+
+/// Public wrapper exposing the concurrency value for diagnostic output.
+/// When the env var is unset, returns 0 to signal adaptive mode.
+pub fn grid_concurrency_debug() -> usize {
+    grid_concurrency()
+}
+
+/// Adaptive grid parallelism plan.
+///
+/// When `REST_HESS_GRID_CONCURRENCY` is set, returns the original blocks
+/// as-is with the user-specified fixed concurrency (legacy mode).
+///
+/// Otherwise, splits grid blocks into sub-blocks of a calculated size so that
+/// the peak AO memory stays bounded (same as concurrency=2 with original
+/// blocks) while concurrency is raised to match the available rayon threads.
+///
+/// Returns `(sub_blocks, concurrency, target_sub_block_size)`.
+pub fn plan_grid_split(
+    block_ranges: &[std::ops::Range<usize>],
+) -> (Vec<std::ops::Range<usize>>, usize, usize) {
+    let n_orig = block_ranges.len();
+    if n_orig == 0 {
+        return (vec![], 1, 0);
+    }
+
+    // Legacy fixed-concurrency mode (env var override)
+    if let Some(c) = std::env::var("REST_HESS_GRID_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v >= 1)
+    {
+        return (block_ranges.to_vec(), c, 0);
+    }
+
+    let num_threads = rayon::current_num_threads().max(1);
+    let max_orig_nb = block_ranges
+        .iter()
+        .map(|r| r.end.saturating_sub(r.start))
+        .max()
+        .unwrap_or(0);
+    if max_orig_nb == 0 {
+        return (vec![], 1, 0);
+    }
+
+    // Minimum sub-block size for reasonable BLAS efficiency
+    let min_nb = 256usize;
+
+    // Peak memory budget (in grid-point units): concurrency × nb = constant.
+    // Current default concurrency=2 gives: budget = 2 × max_orig_nb.
+    let peak_budget = 2 * max_orig_nb;
+
+    // Target: use up to num_threads concurrent sub-blocks within the budget
+    let ideal_nb = (peak_budget as f64 / num_threads as f64).ceil() as usize;
+    let target_nb = ideal_nb.max(min_nb).min(max_orig_nb);
+    let concurrency = (peak_budget / target_nb).max(1).min(num_threads);
+
+    // Split original blocks into sub-blocks
+    let est_capacity = n_orig * (max_orig_nb / target_nb + 1);
+    let mut sub_blocks = Vec::with_capacity(est_capacity);
+    for range in block_ranges {
+        let mut pos = range.start;
+        while pos < range.end {
+            let end = (pos + target_nb).min(range.end);
+            if end > pos {
+                sub_blocks.push(pos..end);
+            }
+            pos = end;
+        }
+    }
+
+    (sub_blocks, concurrency, target_nb)
 }
 
 /// Streaming variant of `vxc_diag`: evaluates AO + ρ₀ + XC kernel per block
@@ -664,14 +741,14 @@ pub fn vxc_diag_streaming(scf: &SCF, xc_type: XCType) -> MatrixFull<f64> {
     let ao_deriv = match xc_type { XCType::LDA => 2, XCType::GGA => 3, _ => panic!() };
     let nderiv_max = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
 
-    let concurrency = grid_concurrency();
     let block_ranges: &[std::ops::Range<usize>] = &grids.parallel_balancing;
+    let (sub_blocks, concurrency, _sub_nb) = plan_grid_split(block_ranges);
 
     // Accumulator: 6 partial [nao,nao] matrices
     let mut acc_v6: Vec<MatrixFull<f64>> =
         (0..6).map(|_| MatrixFull::new([nao, nao], 0.0)).collect();
 
-    for chunk in block_ranges.chunks(concurrency) {
+    for chunk in sub_blocks.chunks(concurrency) {
         let partials: Vec<Vec<MatrixFull<f64>>> = chunk
             .par_iter()
             .filter_map(|range| {
@@ -804,15 +881,15 @@ pub fn vxc_deriv2_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
     let ao_deriv = match xc_type { XCType::LDA => 1, XCType::GGA => 2, _ => panic!() };
     let nderiv_max = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
 
-    let concurrency = grid_concurrency();
     let block_ranges: &[std::ops::Range<usize>] = &grids.parallel_balancing;
+    let (sub_blocks, concurrency, _sub_nb) = plan_grid_split(block_ranges);
 
     // Accumulators
     let mut acc_vmat: Vec<MatrixFull<f64>> =
         (0..natm).map(|_| MatrixFull::new([9 * nao, nao], 0.0)).collect();
     let mut acc_ipip = MatrixFull::new([9 * nao, nao], 0.0);
 
-    for chunk in block_ranges.chunks(concurrency) {
+    for chunk in sub_blocks.chunks(concurrency) {
         let partials: Vec<(Vec<MatrixFull<f64>>, MatrixFull<f64>)> = chunk
             .par_iter()
             .filter_map(|range| {
@@ -884,7 +961,8 @@ pub fn vxc_deriv2_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                         let ao_dm0 = compute_ao_dm0(dm0, &ao_d_refs[..1], 1, nao, nb);
                         let mut wf = vec![0.0; nb];
                         for g in 0..nb { wf[g] = weights_block[g] * fxc_raw[fxc_off + g]; }
-                        for ia in 0..natm {
+                        vmat.par_iter_mut().enumerate().for_each(|(ia, vmat_ia)| {
+                            omp_set_num_threads_wrapper(1);
                             let (p0, p1) = aoslices[ia];
                             for d1 in 0..3 {
                                 let mut wv_d1 = vec![0.0; nb];
@@ -900,10 +978,10 @@ pub fn vxc_deriv2_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                                     aow_d1[[mu, g]] = ao_d[0][[mu, g]] * wv_d1[g];
                                 }}
                                 for d2 in 0..3 {
-                                    add_block(&mut vmat[ia], d1, d2, &aow_d1, &ao_d[1 + d2]);
+                                    add_block(vmat_ia, d1, d2, &aow_d1, &ao_d[1 + d2]);
                                 }
                             }
-                        }
+                        });
                     }
                     XCType::GGA => {
                         let mut wv0 = vec![0.0; nb];
@@ -924,7 +1002,8 @@ pub fn vxc_deriv2_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                             }
                         }
                         let ao_dm0 = compute_ao_dm0(dm0, &ao_d_refs[..nvar], nvar, nao, nb);
-                        for ia in 0..natm {
+                        vmat.par_iter_mut().enumerate().for_each(|(ia, vmat_ia)| {
+                            omp_set_num_threads_wrapper(1);
                             let (p0, p1) = aoslices[ia];
                             let dR_rho1 = make_dR_rho1(&ao_d_refs, &ao_dm0, p0, p1, xc_type, nb);
                             let mut wv_block = vec![0.0; 3 * nvar * nb];
@@ -951,7 +1030,7 @@ pub fn vxc_deriv2_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                                 let wv_i3: Vec<f64> = (0..nb).map(|g| wv_block[i + 3 * 3 + g * 3 * nvar]).collect();
                                 let aow_i = make_dR_dao_w(&ao_d, &wv_i0, &wv_i1, &wv_i2, &wv_i3, nao, nb);
                                 for d2 in 0..3 {
-                                    add_block(&mut vmat[ia], i, d2, &aow_i[d2], &ao_d[0]);
+                                    add_block(vmat_ia, i, d2, &aow_i[d2], &ao_d[0]);
                                 }
                             }
                             for d1 in 0..3 {
@@ -964,10 +1043,10 @@ pub fn vxc_deriv2_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                                     aow_d1[[mu, g]] = v;
                                 }}
                                 for d2 in 0..3 {
-                                    add_block(&mut vmat[ia], d1, d2, &ao_d[1 + d2], &aow_d1);
+                                    add_block(vmat_ia, d1, d2, &ao_d[1 + d2], &aow_d1);
                                 }
                             }
-                        }
+                        });
                     }
                     _ => unreachable!(),
                 }
@@ -1024,8 +1103,8 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
     let ao_deriv = match xc_type { XCType::LDA => 1, XCType::GGA => 2, _ => panic!() };
     let nderiv_max = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
 
-    let concurrency = grid_concurrency();
     let block_ranges: &[std::ops::Range<usize>] = &grids.parallel_balancing;
+    let (sub_blocks, concurrency, _sub_nb) = plan_grid_split(block_ranges);
 
     // Accumulators
     let mut acc_vmat: Vec<MatrixFull<f64>> =
@@ -1033,7 +1112,7 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
     let mut acc_vip: Vec<MatrixFull<f64>> =
         (0..3).map(|_| MatrixFull::new([nao, nao], 0.0)).collect();
 
-    for chunk in block_ranges.chunks(concurrency) {
+    for chunk in sub_blocks.chunks(concurrency) {
         let partials: Vec<(Vec<MatrixFull<f64>>, Vec<MatrixFull<f64>>)> = chunk
             .par_iter()
             .filter_map(|range| {
