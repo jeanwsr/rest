@@ -18,7 +18,8 @@ use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon};
 use crate::ri_rpa::{evaluate_rpa_correlation_rayon};
 use crate::ri_gw;
 use crate::ri_bse;
-use crate::scf_io::{SCF, SCFType, print_force_for_ghost_point_charges};
+use crate::scf_io::{SCF, SCFType};
+use crate::scf_io::print::print_force_for_ghost_point_charges;
 use crate::ri_pt2::{close_shell_pt2_rayon, open_shell_pt2_rayon};
 use crate::utilities::TimeRecords;
 

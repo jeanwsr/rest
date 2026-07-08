@@ -1,3 +1,6 @@
+use rayon::prelude::*;
+use tensors::{BasicMatrix, MatrixFull};
+
 pub const ORB_OCCUPATION_THRESHOLD: f64 = 1.0e-6;
 
 pub fn occupied_orbital_count_with_threshold(occupation: &[f64], threshold: f64) -> usize {
@@ -40,6 +43,19 @@ pub fn integer_homo_lumo(num_elec: &[f64; 3], spin_channel: usize) -> ([usize; 2
         }
     }
     (homo, lumo)
+}
+
+pub fn norm(m: &MatrixFull<f64>, kind: &str) -> f64 {
+    let sqsum = m.data.par_iter().map(|x| x * x).sum::<f64>();
+    match kind {
+        "rms" => {
+            let size = m.size();
+            let n_elem = (size[0] * size[1]) as f64;
+            (sqsum / n_elem).sqrt()
+        }
+        "l2" => sqsum.sqrt(),
+        _ => panic!("unknown norm kind '{}', must be 'rms' or 'l2'", kind),
+    }
 }
 
 #[cfg(test)]
