@@ -44,7 +44,7 @@ fuzzy-matcher = "0.3.7"
 #rust_libecpint = {path="../rust_libecpint"}
 # seems to pull in libssl and libcrypto which is rejected by manylinux
 reqwest = { version = "0.10", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-mpi = {version = "0.8.0", features = ["user-operations", "derive"], optional = true}
+mpi = {version = "0.8", features = ["user-operations", "derive"], optional = true}
 # for cuda
 #cudarc = "0.10.0"
 rest_tensors = {path="../rest_tensors"}
