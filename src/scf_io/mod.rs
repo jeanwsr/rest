@@ -48,6 +48,9 @@ use self::util::norm;
 use smear::apply_smearing;
 use smear::annealed_sigma;
 
+#[allow(unused_imports)]
+use tensors::BasicMatUp;
+
 #[pyclass]
 #[derive(Clone)]
 pub struct SCF {
