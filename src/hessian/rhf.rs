@@ -3,6 +3,9 @@ use crate::scf_io::SCF;
 use crate::Molecule;
 use crate::hessian::ej_ek_baseline::{EjEkBaseline, BASELINE_TERM_KEYS};
 use crate::hessian::memory_monitor::{self, MemMonitor};
+use crate::hessian::schwarz::{
+    build_schwarz_shell, compute_psum, SCHWARZ_Q4MAX, SCHWARZ_TOL2E,
+};
 use rest_libcint::prelude::*;
 use rstsr::prelude::*;
 use std::collections::HashMap;
@@ -130,6 +133,126 @@ fn int3c_atom_block(cint_all: &CINTR2CDATA, name: &str,
     let (v, _): (Vec<f64>, Vec<usize>) =
         cint_all.integrate_row_major(name, "s1", Some(slc)).into();
     v
+}
+
+// ── Direct (4-center) ej_ek helpers ───────────────────────────────────────
+// Used by calc_ej_ek_direct() — NWChem-style direct method with Schwarz screening.
+
+/// Evaluate a 2nd-derivative 4-center ERI for one shell quartet via libcint.
+///
+/// `func`: `"ipip1"` (∂²/∂R₁²), `"ipvip1"` (∂²/∂R₁∂R₂), or `"ip1ip2"` (∂²/∂R₁∂R₃).
+///
+/// Returns `Vec<f64>` in **row-major** `[9, d0, d1, d2, d3]` layout.
+/// Element (comp, a, b, c, d) at: `buf[comp*d0*d1*d2*d3 + a*d1*d2*d3 + b*d2*d3 + c*d3 + d]`.
+fn int2e_2nd_deriv_shell(
+    cint: &CINTR2CDATA,
+    func: &str,
+    shls: [i32; 4],
+) -> Vec<f64> {
+    let intor = match func {
+        "ipip1" => "int2e_ipip1",
+        "ipvip1" => "int2e_ipvip1",
+        "ip1ip2" => "int2e_ip1ip2",
+        _ => panic!("int2e_2nd_deriv_shell: unknown func '{}'", func),
+    };
+    let slc: &[[usize; 2]] = &[
+        [shls[0] as usize, shls[0] as usize + 1],
+        [shls[1] as usize, shls[1] as usize + 1],
+        [shls[2] as usize, shls[2] as usize + 1],
+        [shls[3] as usize, shls[3] as usize + 1],
+    ];
+    let (buf, _shape): (Vec<f64>, Vec<usize>) =
+        cint.integrate_row_major(intor, "s1", Some(slc)).into();
+    buf
+}
+
+/// Contract a derivative integral buffer with the density and scatter into the
+/// ej/ek Hessian contribution arrays.
+///
+/// For each buffer position (a,b,c,d), the original AO indices are determined
+/// by `ao_off` and `pos_map`. The Coulomb contraction uses D_{μν}·D_{λσ} and
+/// the exchange contraction uses D_{μλ}·D_{νσ} (only if `with_k`).
+///
+/// - `ej`, `ek`: flat `[natm*natm*9]` arrays indexed by `i_t(atom_p, atom_q, ia, ib)`
+/// - `buf`: libcint row-major `[9, d0, d1, d2, d3]`
+/// - `ds`: `[d0, d1, d2, d3]` shell dimensions for the called ordering
+/// - `ao_off`: `[ao_loc[s0], ao_loc[s1], ao_loc[s2], ao_loc[s3]]`
+/// - `pos_map`: `[pos_mu, pos_nu, pos_la, pos_si]` — which buffer position (0..3)
+///   holds the basis functions of ish (μ), jsh (ν), ksh (λ), lsh (σ)
+/// - `atom_p`, `atom_q`: the Hessian atom pair this block contributes to
+#[allow(clippy::too_many_arguments)]
+fn scatter_deriv(
+    ej: &mut [f64],
+    ek: &mut [f64],
+    buf: &[f64],
+    ds: [usize; 4],
+    ao_off: [usize; 4],
+    pos_map: [usize; 4],
+    atom_p: usize,
+    atom_q: usize,
+    natm: usize,
+    nao: usize,
+    dm0: &[f64],
+    with_k: bool,
+    factor: f64,
+    symmetrize_comp: bool,
+) {
+    let base = atom_p * natm * 9 + atom_q * 9;
+    let d0 = ds[0]; let d1 = ds[1]; let d2 = ds[2]; let d3 = ds[3];
+    let vol = d0 * d1 * d2 * d3;
+
+    let p_mu = pos_map[0]; let p_nu = pos_map[1];
+    let p_la = pos_map[2]; let p_si = pos_map[3];
+    let tr = |c: usize| 3 * (c % 3) + (c / 3);
+
+    for a in 0..d0 {
+        for b in 0..d1 {
+            for c in 0..d2 {
+                for dd in 0..d3 {
+                    let bi = [a, b, c, dd];
+                    let g_ao = [
+                        ao_off[0] + bi[0], ao_off[1] + bi[1],
+                        ao_off[2] + bi[2], ao_off[3] + bi[3],
+                    ];
+                    let mu = g_ao[p_mu]; let nu = g_ao[p_nu];
+                    let la = g_ao[p_la]; let si = g_ao[p_si];
+
+                    let gj = 0.5 * dm0[mu + nu * nao] * dm0[la + si * nao];
+                    let buf_off = a * d1 * d2 * d3 + b * d2 * d3 + c * d3 + dd;
+                    let gk = if with_k {
+                        Some(0.125 * (dm0[mu + la * nao] * dm0[nu + si * nao]
+                            + dm0[mu + si * nao] * dm0[nu + la * nao]))
+                    } else { None };
+
+                    if symmetrize_comp {
+                        for ia in 0..3 {
+                            for ib in ia..3 {
+                                let comp = 3 * ia + ib;
+                                let comp_t = tr(comp);
+                                let val = buf[comp * vol + buf_off] + buf[comp_t * vol + buf_off];
+                                let vj = gj * val * factor;
+                                ej[base + comp] += vj;
+                                if comp_t != comp { ej[base + comp_t] += vj; }
+                                if let Some(gk) = gk {
+                                    let vk = gk * val * factor;
+                                    ek[base + comp] += vk;
+                                    if comp_t != comp { ek[base + comp_t] += vk; }
+                                }
+                            }
+                        }
+                    } else {
+                        for comp in 0..9 {
+                            let val = buf[comp * vol + buf_off];
+                            ej[base + comp] += gj * val * factor;
+                            if let Some(gk) = gk {
+                                ek[base + comp] += gk * val * factor;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ── BLAS-optimized G-term stubs (replaced per-task in Tasks 5-11) ──
@@ -2621,6 +2744,256 @@ impl RIRHFHessian<'_> {
         self
     }
 
+    /// Direct (4-center, no RI) computation of ej/ek Hessian contributions.
+    ///
+    /// Computes `ej[a,b] = (1/2) ∑ D_μν D_λσ · ∂²(μν|λσ)/∂R_a ∂R_b`
+    /// and     `ek[a,b] = (1/4) ∑ D_μλ D_νσ · ∂²(μν|λσ)/∂R_a ∂R_b`
+    /// via full-ordered shell quartet loop with libcint 2nd-derivative integrals
+    /// (int2e_ipip1, int2e_ipvip1, int2e_ip1ip2 with shell permutations).
+    /// Assembles `h_partial = e1 + factor_j*ej - factor_k*ek`.
+    pub fn calc_ej_ek_direct(&mut self) -> &mut Self {
+        let _t_global = std::time::Instant::now();
+        let scf = self.scf_data;
+        if scf.mol.ctrl.print_level > 0 {
+            println!("  >> Entering h_partial (ej_ek_direct) stage ...");
+        }
+        let mol = &scf.mol;
+        let nao = mol.num_basis;
+        let natm = mol.geom.nfree;
+        let aa9 = natm * natm * 9;
+
+        // Density matrix (col-major [nao, nao])
+        let dm0_mat = &scf.density_matrix[0];
+        let dm0: Vec<f64> = dm0_mat.iter().copied().collect();
+
+        let factor_j = self.flags.factor_j.unwrap_or(1.0);
+        let factor_k = self.flags.factor_k.unwrap_or(1.0);
+        let with_k = self.flags.with_k;
+
+        // Initialize CInt (AO basis only) and 2e optimizer
+        let mut cint = mol.initialize_cint(false);
+        cint.cint2e_optimizer_rust();
+
+        let nsh = cint.bas.len();
+        let ao_loc = cint.ao_loc(); // [nsh+1]
+        let sh_atom: Vec<usize> = (0..nsh).map(|s| cint.bas[s][0] as usize).collect();
+        let sh_dim: Vec<usize> = (0..nsh).map(|s| cint.cint_cgto_rust(s as i32) as usize).collect();
+
+        let i_t = |i0: usize, j0: usize, x: usize, y: usize| -> usize {
+            i0 * natm * 9 + j0 * 9 + x * 3 + y
+        };
+
+        let mut ej = vec![0.0f64; aa9];
+        let mut ek = vec![0.0f64; aa9];
+
+        let pl = mol.ctrl.print_level;
+        let _t_loop = std::time::Instant::now();
+
+        // ── Schwarz screening matrix (NWChem schwarz_init) ──
+        let (schwarz, sch_max) = build_schwarz_shell(&cint, nsh);
+        if pl > 1 {
+            println!("  >> Schwarz screening: sch_max={:.6e}, nsh={}, tol2e={:.1e}",
+                     sch_max, nsh, SCHWARZ_TOL2E);
+        }
+
+        // ── Unique quartet loop with 8-fold ERI symmetry ──
+        // Matches NWChem twodd_coul_ex: ish>=jsh, ksh>=lsh, (ish,jsh)>=(ksh,lsh)
+        // Each unique quartet gets a permutation scale factor (1, 2, 4, or 8).
+        // The symmetrized 2PDM includes both exchange pairings.
+        for ish in 0..nsh {
+            let di = sh_dim[ish]; let i0 = ao_loc[ish]; let A = sh_atom[ish];
+            for jsh in 0..=ish {
+                let dj = sh_dim[jsh]; let j0 = ao_loc[jsh]; let B = sh_atom[jsh];
+
+                // Schwarz level 1: shell-pair pre-screen
+                let sij = schwarz[ish * nsh + jsh];
+                if sij * sch_max * SCHWARZ_Q4MAX < SCHWARZ_TOL2E { continue; }
+
+                for ksh in 0..=ish {
+                    let lmax = if ksh == ish { jsh } else { ksh };
+                    for lsh in 0..=lmax {
+                        let dk = sh_dim[ksh]; let k0 = ao_loc[ksh]; let C = sh_atom[ksh];
+                        let dl = sh_dim[lsh]; let l0 = ao_loc[lsh]; let D = sh_atom[lsh];
+
+                        // Skip single-center quartets (contribute zero to Hessian)
+                        if A == B && B == C && C == D { continue; }
+
+                        // Schwarz level 2: quartet pre-screen
+                        let sijkl = sij * schwarz[ksh * nsh + lsh];
+                        if sijkl * SCHWARZ_Q4MAX < SCHWARZ_TOL2E { continue; }
+
+                        // Permutation scale factor
+                        let mut scale = 1.0f64;
+                        if ish != jsh { scale *= 2.0; }
+                        if ksh != lsh { scale *= 2.0; }
+                        if ish != ksh || jsh != lsh { scale *= 2.0; }
+
+                        // Schwarz level 3: density-aware screen (NWChem final screen)
+                        let psum = compute_psum(
+                            &dm0, nao, [i0, j0, k0, l0], [di, dj, dk, dl],
+                            factor_j, factor_k, with_k,
+                        );
+                        if sijkl * psum * scale <= SCHWARZ_TOL2E { continue; }
+
+                        // ── 10 derivative blocks with scale × chain-rule factor ──
+
+                        // AA: ∂²/∂A² — ipip1(ish,jsh,ksh,lsh)
+                        {
+                            let buf = int2e_2nd_deriv_shell(&cint, "ipip1", [ish as i32, jsh as i32, ksh as i32, lsh as i32]);
+                            scatter_deriv(&mut ej, &mut ek, &buf, [di, dj, dk, dl], [i0, j0, k0, l0], [0, 1, 2, 3], A, A, natm, nao, &dm0, with_k, scale, false);
+                        }
+                        // BB: ∂²/∂B² — ipip1(jsh,ish,ksh,lsh)
+                        {
+                            let buf = int2e_2nd_deriv_shell(&cint, "ipip1", [jsh as i32, ish as i32, ksh as i32, lsh as i32]);
+                            scatter_deriv(&mut ej, &mut ek, &buf, [dj, di, dk, dl], [j0, i0, k0, l0], [1, 0, 2, 3], B, B, natm, nao, &dm0, with_k, scale, false);
+                        }
+                        // CC: ∂²/∂C² — ipip1(ksh,lsh,ish,jsh)
+                        {
+                            let buf = int2e_2nd_deriv_shell(&cint, "ipip1", [ksh as i32, lsh as i32, ish as i32, jsh as i32]);
+                            scatter_deriv(&mut ej, &mut ek, &buf, [dk, dl, di, dj], [k0, l0, i0, j0], [2, 3, 0, 1], C, C, natm, nao, &dm0, with_k, scale, false);
+                        }
+                        // DD: ∂²/∂D² — ipip1(lsh,ksh,ish,jsh)
+                        {
+                            let buf = int2e_2nd_deriv_shell(&cint, "ipip1", [lsh as i32, ksh as i32, ish as i32, jsh as i32]);
+                            scatter_deriv(&mut ej, &mut ek, &buf, [dl, dk, di, dj], [l0, k0, i0, j0], [2, 3, 1, 0], D, D, natm, nao, &dm0, with_k, scale, false);
+                        }
+                        // AB: ∂²/∂A∂B — ipvip1(ish,jsh,ksh,lsh)
+                        {
+                            let buf = int2e_2nd_deriv_shell(&cint, "ipvip1", [ish as i32, jsh as i32, ksh as i32, lsh as i32]);
+                            scatter_deriv(&mut ej, &mut ek, &buf, [di, dj, dk, dl], [i0, j0, k0, l0], [0, 1, 2, 3], A, B, natm, nao, &dm0, with_k, scale, A == B);
+                        }
+                        // CD: ∂²/∂C∂D — ipvip1(ksh,lsh,ish,jsh)
+                        {
+                            let buf = int2e_2nd_deriv_shell(&cint, "ipvip1", [ksh as i32, lsh as i32, ish as i32, jsh as i32]);
+                            scatter_deriv(&mut ej, &mut ek, &buf, [dk, dl, di, dj], [k0, l0, i0, j0], [2, 3, 0, 1], C, D, natm, nao, &dm0, with_k, scale, C == D);
+                        }
+                        // AC: ∂²/∂A∂C — ip1ip2(ish,jsh,ksh,lsh)
+                        {
+                            let buf = int2e_2nd_deriv_shell(&cint, "ip1ip2", [ish as i32, jsh as i32, ksh as i32, lsh as i32]);
+                            scatter_deriv(&mut ej, &mut ek, &buf, [di, dj, dk, dl], [i0, j0, k0, l0], [0, 1, 2, 3], A, C, natm, nao, &dm0, with_k, scale, A == C);
+                        }
+                        // AD: ∂²/∂A∂D — ip1ip2(ish,jsh,lsh,ksh)
+                        {
+                            let buf = int2e_2nd_deriv_shell(&cint, "ip1ip2", [ish as i32, jsh as i32, lsh as i32, ksh as i32]);
+                            scatter_deriv(&mut ej, &mut ek, &buf, [di, dj, dl, dk], [i0, j0, l0, k0], [0, 1, 3, 2], A, D, natm, nao, &dm0, with_k, scale, A == D);
+                        }
+                        // BC: ∂²/∂B∂C — ip1ip2(jsh,ish,ksh,lsh)
+                        {
+                            let buf = int2e_2nd_deriv_shell(&cint, "ip1ip2", [jsh as i32, ish as i32, ksh as i32, lsh as i32]);
+                            scatter_deriv(&mut ej, &mut ek, &buf, [dj, di, dk, dl], [j0, i0, k0, l0], [1, 0, 2, 3], B, C, natm, nao, &dm0, with_k, scale, B == C);
+                        }
+                        // BD: ∂²/∂B∂D — ip1ip2(jsh,ish,lsh,ksh)
+                        {
+                            let buf = int2e_2nd_deriv_shell(&cint, "ip1ip2", [jsh as i32, ish as i32, lsh as i32, ksh as i32]);
+                            scatter_deriv(&mut ej, &mut ek, &buf, [dj, di, dl, dk], [j0, i0, l0, k0], [1, 0, 3, 2], B, D, natm, nao, &dm0, with_k, scale, B == D);
+                        }
+                    }
+                }
+            }
+        }
+
+        if pl > 0 {
+            println!("  >> ej_ek_direct quartet loop: {:.3?}", _t_loop.elapsed());
+        }
+
+        // ── Symmetrize: sum upper + lower triangles, distribute equally ──
+        // In the unique quartet approach, H(a,b) and H(b,a) get contributions
+        // from different center-pair blocks. NWChem fills both via symmetric
+        // scatter. We sum the two halves to get the correct total.
+        for i0 in 0..natm {
+            for j0 in 0..i0 {
+                for x in 0..3 {
+                    for y in 0..3 {
+                        let a = i_t(i0, j0, x, y);
+                        let b = i_t(j0, i0, y, x);
+                        let s_ej = ej[a] + ej[b];
+                        let s_ek = ek[a] + ek[b];
+                        ej[a] = s_ej; ej[b] = s_ej;
+                        ek[a] = s_ek; ek[b] = s_ek;
+                    }
+                }
+            }
+        }
+
+        // ── Store results as MatrixFull ──
+        let to_mat = |arr: &[f64]| -> MatrixFull<f64> {
+            let n3 = natm * 3;
+            let mut m = vec![0.0; n3 * n3];
+            for i0 in 0..natm {
+                for j0 in 0..natm {
+                    for x in 0..3 {
+                        for y in 0..3 {
+                            m[(i0 * 3 + x) + (j0 * 3 + y) * n3] = arr[i_t(i0, j0, x, y)];
+                        }
+                    }
+                }
+            }
+            for i0 in 0..natm {
+                for j0 in 0..i0 {
+                    for x in 0..3 {
+                        for y in 0..3 {
+                            m[(j0 * 3 + y) + (i0 * 3 + x) * n3] =
+                                m[(i0 * 3 + x) + (j0 * 3 + y) * n3];
+                        }
+                    }
+                }
+            }
+            MatrixFull::from_vec([n3, n3], m).unwrap()
+        };
+
+        self.result.insert("ej".to_string(), to_mat(&ej));
+        self.result.insert("ek".to_string(), to_mat(&ek));
+
+        // ── Assemble h_partial = e1 + factor_j*ej - factor_k*ek ──
+        let e1_arr = if let Some(e1_mat) = self.result.get("e1") {
+            let mut e1_flat = vec![0.0; aa9];
+            for i0 in 0..natm {
+                for j0 in 0..natm {
+                    for x in 0..3 {
+                        for y in 0..3 {
+                            e1_flat[i_t(i0, j0, x, y)] =
+                                e1_mat[[(i0 * 3 + x) as _, (j0 * 3 + y) as _]];
+                        }
+                    }
+                }
+            }
+            e1_flat
+        } else {
+            vec![0.0; aa9]
+        };
+
+        let mut hp = vec![0.0; aa9];
+        for i in 0..aa9 {
+            hp[i] = e1_arr[i] + factor_j * ej[i] - factor_k * ek[i];
+        }
+        self.result.insert("h_partial".to_string(), to_mat(&hp));
+
+        // ── RKS: add XC contributions ──
+        if self.is_rks() {
+            let scf2 = self.scf_data;
+            let hp_data = &mut self
+                .result
+                .get_mut("h_partial")
+                .expect("h_partial not set")
+                .data;
+            crate::hessian::rks::add_vxc_h_partial(scf2, hp_data, &mut self.timings);
+        }
+
+        if pl > 0 {
+            let hp_max = hp.iter().cloned().map(|v| v.abs()).fold(0.0f64, f64::max);
+            let ej_max = ej.iter().cloned().map(|v| v.abs()).fold(0.0f64, f64::max);
+            let ek_max = ek.iter().cloned().map(|v| v.abs()).fold(0.0f64, f64::max);
+            println!(
+                "  >> ej_ek_direct done: |ej|_max={:.6}, |ek|_max={:.6}, |hp|_max={:.6}",
+                ej_max, ek_max, hp_max
+            );
+        }
+
+        self.timings
+            .push(("calc_ej_ek_direct", _t_global.elapsed()));
+        self
+    }
+
     /// Compute h1ao[ia] = hcore^{(1)}(ia) + vj1[ia] - 0.5*vk1[ia].
     /// Self-contained: recomputes all intermediates from SCF data.
     pub fn calc_h1ao(&mut self) -> &mut Self {
@@ -4384,8 +4757,16 @@ fn run_hessian_pipeline(
     hess.calc_e1();
     stage_report("calc_e1", &monitor, &mut overall_peak_mb, pl);
     memory_monitor::trim_to_os(pl);
-    hess.calc_ej_ek();
-    stage_report("calc_ej_ek", &monitor, &mut overall_peak_mb, pl);
+    match hess_ctrl.ej_ek_backend.as_str() {
+        "direct" => {
+            hess.calc_ej_ek_direct();
+            stage_report("calc_ej_ek_direct", &monitor, &mut overall_peak_mb, pl);
+        }
+        _ => {
+            hess.calc_ej_ek();
+            stage_report("calc_ej_ek", &monitor, &mut overall_peak_mb, pl);
+        }
+    }
     memory_monitor::trim_to_os(pl);
     hess.calc_h1ao();
     stage_report("calc_h1ao", &monitor, &mut overall_peak_mb, pl);
