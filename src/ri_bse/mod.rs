@@ -25,6 +25,7 @@ pub mod nonlinbse;
 pub mod matvec_trace;
 pub mod dynamicbse_matvec;
 pub mod dynamicbse;
+pub mod pysoc_export;
 
 
 #[cfg(target_os = "linux")]
@@ -40,6 +41,15 @@ pub fn bse_main(scf_data:&mut SCF){
         println!("No BSE Calculations are triggered");
     }else if qp_ctrl.bse_spin=="both"{
         let (mut excitations_singlets,mut excitations_triplets)=bse_both_spins(scf_data,&quasiparticle_energies);
+        if qp_ctrl.pysoc {
+            pysoc_export::export_pysoc_json(
+                scf_data,
+                &excitations_singlets,
+                &excitations_triplets,
+                qp_ctrl.bse_tda,
+                "rest_pysoc_export.json",
+            );
+        }
         if qp_ctrl.bse_tda==true{
             println!("BSE Calculation Results of Both Singlets and Triplets with TDA:");
             let number=excitations_singlets.len();

@@ -22,6 +22,9 @@ pub struct HessianParameters {
     /// Output path for the vibrational eigenmodes txt file (default "./EigenModes.txt")
     #[serde(default = "default_eigenmodes_path")]
     pub eigenmodes_path: String,
+    /// Backend for ej_ek calculation: "direct" or "ri" (default "ri")
+    #[serde(default = "default_ej_ek_backend")]
+    pub ej_ek_backend: String,
 }
 
 fn default_krylov_max_cycle() -> usize { 50 }
@@ -29,6 +32,7 @@ fn default_krylov_tol() -> f64 { 1.0e-12 }
 fn default_verbose() -> usize { 1 }
 fn default_hessian_matrix_path() -> String { String::from("./HessianMatrix.txt") }
 fn default_eigenmodes_path() -> String { String::from("./EigenModes.txt") }
+fn default_ej_ek_backend() -> String { String::from("ri") }
 
 impl Default for HessianParameters {
     fn default() -> Self {
@@ -40,6 +44,7 @@ impl Default for HessianParameters {
             verbose: default_verbose(),
             hessian_matrix_path: default_hessian_matrix_path(),
             eigenmodes_path: default_eigenmodes_path(),
+            ej_ek_backend: default_ej_ek_backend(),
         }
     }
 }
