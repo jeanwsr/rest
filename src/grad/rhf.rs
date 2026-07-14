@@ -224,7 +224,8 @@ impl RIRHFGradient<'_> {
 
         // eigen-decomposed ERI
         let ederi_utp = {
-            let tsr = self.scf_data.rimatr.as_ref().unwrap();
+            let msg = "Decomposed ERI not found, possibly due to insufficient memory. We do not support ri-direct gradient calculation.";
+            let tsr = self.scf_data.rimatr.as_ref().expect(msg);
             rt::asarray((&tsr.0.data, tsr.0.size, &device))
         };
         let naux = ederi_utp.shape()[1];
