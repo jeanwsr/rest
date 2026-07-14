@@ -5646,5 +5646,26 @@ impl SCF {
     }
 }
 
-
-
+impl SCF {
+    /// Free the large tensors in SCF struct to save memory after SCF calculation is done.
+    /// 
+    /// This function is initially written for geometric optimization, in order to give
+    /// approximately correct memory estimation for next step.
+    pub fn free_large_tensors(&mut self) {
+        self.ijkl = None;
+        self.ri3fn = None;
+        self.ri3fn_sr = None;
+        self.ri3fn_isdf = None;
+        self.tab_ao = None;
+        self.m = None;
+        self.rimatr = None;
+        self.rimatr_sr = None;
+        self.ri3mo = None;
+        self.ri3mo_full = None;
+        self.ri3fn_bse = None;
+        self.rimatr_bse = None;
+        self.grids = None;
+        self.solvent_static_obj = None;
+        self.solvent_scf = None;
+    }
+}
