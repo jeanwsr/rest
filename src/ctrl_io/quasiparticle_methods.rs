@@ -41,6 +41,7 @@ pub struct QuasiParticle {
     pub low_rank_grid_type:String,   // "linear" or "quadratic" (power-law, denser near zero)
     pub nomega_chi_real:usize,
     pub low_rank_tolerance:f64,
+    pub omega_chi_max:f64,          // real-axis freq grid max (Ha); 0=auto from de_max
     pub nomega_sigma:usize,         // number of sigma sampling points on each side (de_max scan)
     pub step_sigma:f64,             // spacing of sigma grid in Ha (de_max scan)
     pub fourier_self_energy:bool,
@@ -77,6 +78,9 @@ pub struct QuasiParticle {
     pub qsgw_energy_tol: f64,
     pub qsgw_mix_param: f64,
     pub qsgw_eta: f64,
+    /// Lorentzian broadening (Ha) for CD-GW real-axis contour deformation.
+    /// Default 0.0 (no broadening, backward compatible). 0.01 recommended for stability.
+    pub cdgw_eta: f64,
     // response BSE grid sampling parameters
     pub response_bse_x_start: f64,
     pub response_bse_x_end: f64,
@@ -164,6 +168,7 @@ impl Default for QuasiParticle {
             low_rank_grid_type:String::from("linear"),
             nomega_chi_real:6,
             low_rank_tolerance:1e-3,
+            omega_chi_max:0.0,
             nomega_sigma:10,
             step_sigma:0.05,
             parse_qp_path:String::from("./qp_energies"),
@@ -200,6 +205,7 @@ impl Default for QuasiParticle {
             qsgw_energy_tol: 1e-5,
             qsgw_mix_param: 0.5,
             qsgw_eta: 0.001,
+            cdgw_eta: 0.0,
             // response BSE grid sampling parameters (default: 2 points per dimension)
             response_bse_x_start: 0.0,
             response_bse_x_end: 1.0,
@@ -283,6 +289,7 @@ impl QuasiParticle {
         table.insert("low_rank_grid_type".to_string(), toml::Value::String(self.low_rank_grid_type.clone()));
         table.insert("nomega_chi_real".to_string(), toml::Value::Integer(self.nomega_chi_real as i64));
         table.insert("low_rank_tolerance".to_string(), toml::Value::Float(self.low_rank_tolerance));
+        table.insert("omega_chi_max".to_string(), toml::Value::Float(self.omega_chi_max));
         table.insert("nomega_sigma".to_string(), toml::Value::Integer(self.nomega_sigma as i64));
         table.insert("step_sigma".to_string(), toml::Value::Float(self.step_sigma));
         table.insert("fse_sin_coeff_path".to_string(), toml::Value::String(self.fse_sin_coeff_path.clone()));
@@ -320,6 +327,7 @@ impl QuasiParticle {
         table.insert("qsgw_energy_tol".to_string(), toml::Value::Float(self.qsgw_energy_tol));
         table.insert("qsgw_mix_param".to_string(), toml::Value::Float(self.qsgw_mix_param));
         table.insert("qsgw_eta".to_string(), toml::Value::Float(self.qsgw_eta));
+        table.insert("cdgw_eta".to_string(), toml::Value::Float(self.cdgw_eta));
         table.insert("response_bse_x_start".to_string(), toml::Value::Float(self.response_bse_x_start));
         table.insert("response_bse_x_end".to_string(), toml::Value::Float(self.response_bse_x_end));
         table.insert("response_bse_x_points".to_string(), toml::Value::Integer(self.response_bse_x_points as i64));
@@ -600,6 +608,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-3)},
                 _ => {1e-3},
             };
+            tmp_input.omega_chi_max = match tmp_ctrl.get("omega_chi_max").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.0)},
+                _ => {0.0},
+            };
             tmp_input.nomega_sigma = match tmp_ctrl.get("nomega_sigma").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(10) as usize},
                 _ => {10},
@@ -672,6 +684,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.qsgw_eta = match tmp_ctrl.get("qsgw_eta").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),
                 _ => 0.001,
+            };
+            tmp_input.cdgw_eta = match tmp_ctrl.get("cdgw_eta").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
             };
             // Parse response BSE grid sampling parameters
             tmp_input.response_bse_x_start = match tmp_ctrl.get("response_bse_x_start").unwrap_or(&serde_json::Value::Null) {

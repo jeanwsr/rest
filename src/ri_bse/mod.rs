@@ -48,6 +48,8 @@ pub fn bse_main(scf_data:&mut SCF){
                 &excitations_triplets,
                 qp_ctrl.bse_tda,
                 "rest_pysoc_export.json",
+                "BSE",
+                start_mo, num_state, occ_size, vir_size,
             );
         }
         if qp_ctrl.bse_tda==true{
@@ -62,8 +64,9 @@ pub fn bse_main(scf_data:&mut SCF){
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
                 leading_components(&v,occ_size,vir_size)});
             println!("The first singlet excitation obtained by BSE is {}",excitations_singlets[0].0);
-            println!("First {} Triplet Excitations:",number);
-            excitations_triplets[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
+            let t_number = number.min(excitations_triplets.len());
+            println!("First {} Triplet Excitations:",t_number);
+            excitations_triplets[0..t_number].iter().enumerate().for_each(|(n,(e,vec))|{
                 let v=dipoles::normalize(vec,true);
                 let vec_norm: f64 = vec.iter().map(|x| x*x).sum::<f64>().sqrt();
                 println!("#{} Excitation energy={}, norm={:.6}",n,e,vec_norm);
@@ -84,8 +87,9 @@ pub fn bse_main(scf_data:&mut SCF){
                 leading_components(&v,occ_size,vir_size)
             });
             println!("The first singlet excitation obtained by BSE is {}",excitations_singlets[0].0);
-            println!("First {} Triplet Excitations:",number);
-            excitations_triplets[0..number].iter().enumerate().for_each(|(n,(e,vec))|{
+            let t_number = number.min(excitations_triplets.len());
+            println!("First {} Triplet Excitations:",t_number);
+            excitations_triplets[0..t_number].iter().enumerate().for_each(|(n,(e,vec))|{
                 let vec_norm: f64 = vec.iter().map(|x| x*x).sum::<f64>().sqrt();
                 println!("#{} Excitation energy={}, norm={:.6}",n,e,vec_norm);
                 let v=dipoles::normalize(vec,false);
@@ -197,9 +201,8 @@ pub fn get_submatrix(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:c
     let range_ov=(start_mo..homo+1, lumo..num_state);
     let range_ff=(start_mo..num_state,start_mo..num_state);
 
-    // Check if BSE-specific RI integrals are available and not for response calculation
-    let use_bse_integrals = (scf_data.ri3fn_bse.is_some() || scf_data.rimatr_bse.is_some())
-                            && response_or_not == 'N';
+    // Check if BSE-specific RI integrals are available
+    let use_bse_integrals = scf_data.ri3fn_bse.is_some() || scf_data.rimatr_bse.is_some();
 
     if choice_a=='F'&&choice_b=='F'{
         vector=scf_data.generate_ri3mo_rayon_for_multiple_times(range_ff.0,range_ff.1);
@@ -327,7 +330,7 @@ pub fn construct_inverse_dielectric(scf_data:&SCF,epsilon:&Vec<f64>)->MatrixFull
     // For response function, use BSE-specific integrals if available
     // This ensures dimensional consistency with BSE Hamiltonian construction
     let mut ri_ov = if use_bse_integrals {
-        get_submatrix(scf_data,'O','V','N')  // Use BSE-specific integrals
+        get_submatrix(scf_data,'O','V','Y')  // Use BSE-specific integrals with full ov space
     } else {
         get_submatrix(scf_data,'O','V','Y')  // Use regular integrals
     };
@@ -336,8 +339,8 @@ pub fn construct_inverse_dielectric(scf_data:&SCF,epsilon:&Vec<f64>)->MatrixFull
     if scf_data.mol.ctrl.print_level>1{
         println!("occ_size={},vir_size(for response)={}",occ_size,vir_size);
     }
-    let response=ri_gw::response_matrix(epsilon,occ_size,vir_size,&ri_ov,0.0,'R');
-    let inverse_dielectric=ri_gw::inverse_dielectric_matrix(&response,'R');
+    let response=ri_gw::response_matrix(epsilon,occ_size,vir_size,&ri_ov,0.0,'R',0.0);
+    let inverse_dielectric=ri_gw::inverse_dielectric_matrix(response,'R');
     inverse_dielectric
 }
 pub fn construct_submat_a(scf_data:&SCF,inverse_dielectric:&MatrixFull<f64>,quasiparticle_energies:&Vec<f64>,xlet:char)->MatrixFull<f64>{
