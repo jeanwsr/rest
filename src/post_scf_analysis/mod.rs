@@ -313,9 +313,9 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             }
         }
     }else if output_type.eq("bse"){
-        // Prepare BSE-specific RI integrals before BSE calculation
-        scf_data.prepare_bse_integrals(mpi_operator);
-
+        // BSE-specific integrals must be prepared AFTER GW calculation,
+        // otherwise get_submatrix would pick them up during GW and return
+        // wrong-dimensional RI matrices (BSE aux basis instead of full).
         if qp_ctrl.gw_scheme=="parse from file"{
             let parse_qp_path=qp_ctrl.parse_qp_path.clone();
             scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
@@ -323,6 +323,7 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
         }
+        scf_data.prepare_bse_integrals(mpi_operator);
         ri_bse::bse_main(scf_data);
     }else if output_type.eq("response_bse"){
         if qp_ctrl.gw_scheme=="parse from file"{

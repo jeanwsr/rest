@@ -9,7 +9,6 @@
 //! - No frozen core (REST BSE doesn't freeze core)
 
 use crate::scf_io::SCF;
-use crate::ri_gw::get_occupation_parameters;
 use rest_libcint::CINTR2CDATA;
 use rest_libcint::prelude::CintType;
 use serde::Serialize;
@@ -60,6 +59,11 @@ pub fn export_pysoc_json(
     triplet_excitations: &[(f64, Vec<f64>)],
     tda: bool,
     output_path: &str,
+    method: &str,
+    start_mo: usize,
+    num_state: usize,
+    occ_size: usize,
+    vir_size: usize,
 ) {
     // 1. Enforce Cartesian basis (molsoc only computes Cartesian SOC integrals)
     if !matches!(scf.mol.cint_type, CintType::Cartesian) {
@@ -68,9 +72,8 @@ pub fn export_pysoc_json(
         );
     }
 
-    let (start_mo, num_state, occ_size, vir_size, _homo, _lumo) =
-        get_occupation_parameters(scf, 'N');
     let nao = scf.mol.num_basis;
+    let n_active = occ_size + vir_size; // number of active MOs to export
 
     // 2. Geometry: REST stores in Bohr, convert to Angstrom for molsoc (ANG keyword)
     let geometry = export_geometry(scf);
@@ -84,10 +87,10 @@ pub fn export_pysoc_json(
     //    so <d_xy|d_xy> = 1/3 while molsoc normalizes each component to 1.
     //    Scale factor for component (a,b,c) with a+b+c=l:
     //      sqrt((2a-1)!!*(2b-1)!!*(2c-1)!! / (2l-1)!!)
-    let mo_coefficients = export_mo_coefficients(scf, start_mo, num_state, nao);
+    let mo_coefficients = export_mo_coefficients(scf, start_mo, n_active, nao);
 
     // 5. MO energies: Hartree, active orbitals only (soc_td converts to eV internally)
-    let mo_energies_hartree = export_mo_energies(scf, start_mo, num_state);
+    let mo_energies_hartree = export_mo_energies(scf, start_mo, n_active, method);
 
     // 6. Excitation energies: convert Hartree → eV
     let singlet_states: Vec<(usize, f64)> = singlet_excitations
@@ -109,7 +112,7 @@ pub fn export_pysoc_json(
 
     let export = PysocExport {
         program: "REST".to_string(),
-        method: "BSE".to_string(),
+        method: method.to_string(),
         basis_type: "cartesian".to_string(),
         geometry,
         basis_set_gaussian,
@@ -305,13 +308,16 @@ fn double_factorial_odd(n: i32) -> i32 {
 
 /// Extract active MO energies in Hartree.
 ///
-/// Uses `gwqp.0` (GW quasiparticle energies) which is always populated before BSE.
+/// For BSE: uses `gwqp.0` (GW quasiparticle energies).
+/// For TDDFT: uses `eigenvalues[0]` (KS eigenvalues).
 /// soc_td converts Hartree → eV internally for `qm_flag != 'tddftb'`.
-fn export_mo_energies(scf: &SCF, start_mo: usize, num_state: usize) -> Vec<f64> {
-    let energies = if scf.gwqp.0.is_empty() {
+fn export_mo_energies(scf: &SCF, start_mo: usize, num_state: usize, method: &str) -> Vec<f64> {
+    let energies = if method == "TDDFT" {
         &scf.eigenvalues[0]
-    } else {
+    } else if !scf.gwqp.0.is_empty() {
         &scf.gwqp.0
+    } else {
+        &scf.eigenvalues[0]
     };
     energies[start_mo..start_mo + num_state].to_vec()
 }

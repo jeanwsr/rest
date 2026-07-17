@@ -45,6 +45,9 @@ pub struct TDDFTParameters {
     // above this are excluded from the TDDFT excitation space. Default 1e6
     // (effectively no cutoff).
     pub tddft_cutoff_energy: f64,
+    /// If true, export TDDFT results to rest_pysoc_export.json for PySOC.
+    /// Requires tddft_spin = "both" and basis_type = "cartesian".
+    pub pysoc: bool,
 }
 
 impl Default for TDDFTParameters {
@@ -86,6 +89,7 @@ impl Default for TDDFTParameters {
             tddft_feast_gaussian_width_factor: 0.5,
             tddft_use_optimized_fxc: true,
             tddft_cutoff_energy: 1.0e6,
+            pysoc: false,
         }
     }
 }
@@ -260,6 +264,10 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
             p.tddft_cutoff_energy = match tmp_ctrl.get("tddft_cutoff_energy").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e6),
                 _ => 1.0e6,
+            };
+            p.pysoc = match tmp_ctrl.get("pysoc").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
             };
             Ok(Some(p))
         },
