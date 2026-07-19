@@ -6,7 +6,7 @@ use rest_libcint::prelude::*;
 use rest_libcint::CINTR2CDATA;
 use rest_libcint_wrapper::*;
 use crate::basis_io::BasInfo;
-use crate::constants::ENV_PRT_START;
+use crate::constants::{ENV_PRT_START, LIGHT_SPEED};
 use crate::molecule_io::{Molecule, get_basis_name};
 use serde::{Deserialize, Serialize};
 
@@ -168,7 +168,7 @@ impl Molecule {
 
     
     pub fn generate_sfx2c_hamiltonian(&self) -> MatrixUpper<f64> {
-        let light_speed: f64 = 137.03599967994;
+        let light_speed: f64 = LIGHT_SPEED;
 
         let (xmol, contr_coeff) = self.decontract_basis();
         let n_contracted = self.num_basis;

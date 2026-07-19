@@ -14,7 +14,7 @@ use serde_json::Value;
 //use tensors::Tensors;
 
 use crate::basis_io::Basis4Elem;
-use crate::constants::{ANG, ATOMIC_RADII, MASS_CHARGE, SPECIES_INFO, SPECIES_NAME};
+use crate::constants::{BOHR, ATOMIC_RADII, MASS_CHARGE, SPECIES_INFO, SPECIES_NAME};
 use crate::external_field::ExtField;
 mod pyrest_geom_io;
 
@@ -343,7 +343,7 @@ impl GeomCell {
     }
     pub fn geom_update(&mut self, new_position:&[f64], unit: GeomUnit) {
         let factor = match unit {
-            GeomUnit::Angstrom => ANG,
+            GeomUnit::Angstrom => BOHR,
             GeomUnit::Bohr => 1.0,
         };
         if self.position.data.len() != new_position.len() {
@@ -423,7 +423,7 @@ impl GeomCell {
         let mut tmp_pos_tensor = MatrixFull::from_vec(tmp_size, tmp_pos).unwrap();
         if let GeomUnit::Angstrom = unit {
             // To store the geometry position in "Bohr" according to the convention of quantum chemistry. 
-            tmp_pos_tensor.self_multiple(ANG.powf(-1.0));
+            tmp_pos_tensor.self_multiple(BOHR.powf(-1.0));
         };
         Ok((tmp_ele, tmp_fix, tmp_pos_tensor, tmp_nfree))
     }
@@ -457,7 +457,7 @@ impl GeomCell {
         let mut tmp_lat = unsafe{MatrixFull::from_vec_unchecked([3,3],tmp_vec)};
         if let GeomUnit::Angstrom = unit {
             // To store the lattice vector in "Bohr" according to the convention of quantum chemistry. 
-            tmp_lat.self_multiple(ANG.powf(-1.0));
+            tmp_lat.self_multiple(BOHR.powf(-1.0));
         };
         Ok(tmp_lat)
         //if frac_bool {
@@ -534,7 +534,7 @@ impl GeomCell {
         let mut tmp_pos_tensor = MatrixFull::from_vec(tmp_size, tmp_pos).unwrap();
         if let GeomUnit::Angstrom = unit {
             // To store the geometry position in "Bohr" according to the convention of quantum chemistry. 
-            tmp_pos_tensor.self_multiple(ANG.powf(-1.0));
+            tmp_pos_tensor.self_multiple(BOHR.powf(-1.0));
         };
         Ok((tmp_ele, tmp_fix, tmp_pos_tensor, tmp_nfree))
     }
@@ -606,7 +606,7 @@ impl GeomCell {
         let mut tmp_pos_tensor = MatrixFull::from_vec(tmp_size, tmp_pos).unwrap();
         if let GeomUnit::Angstrom = unit {
             // To store the geometry position in "Bohr" according to the convention of quantum chemistry. 
-            tmp_pos_tensor.self_multiple(ANG.powf(-1.0));
+            tmp_pos_tensor.self_multiple(BOHR.powf(-1.0));
         };
         Ok((tmp_ele, tmp_fix, tmp_pos_tensor, tmp_nfree))
 
@@ -700,7 +700,7 @@ impl GeomCell {
             let mut tmp_pos_tensor = MatrixFull::from_vec(tmp_size, tmp_bs_pos).unwrap();
             if let GeomUnit::Angstrom = unit {
                 // To store the geometry position in "Bohr" according to the convention of quantum chemistry. 
-                tmp_pos_tensor.self_multiple(ANG.powf(-1.0));
+                tmp_pos_tensor.self_multiple(BOHR.powf(-1.0));
             };
             Some((tmp_bs_ele, tmp_pos_tensor))
         };
@@ -712,7 +712,7 @@ impl GeomCell {
             let mut tmp_pos_tensor = MatrixFull::from_vec(tmp_size, tmp_pc_pos).unwrap();
             if let GeomUnit::Angstrom = unit {
                 // To store the geometry position in "Bohr" according to the convention of quantum chemistry. 
-                tmp_pos_tensor.self_multiple(ANG.powf(-1.0));
+                tmp_pos_tensor.self_multiple(BOHR.powf(-1.0));
             };
             Some((tmp_pc_chg, tmp_pos_tensor))
         };
@@ -724,7 +724,7 @@ impl GeomCell {
             let mut tmp_pos_tensor = MatrixFull::from_vec(tmp_size, tmp_ep_pos).unwrap();
             if let GeomUnit::Angstrom = unit {
                 // To store the geometry position in "Bohr" according to the convention of quantum chemistry. 
-                tmp_pos_tensor.self_multiple(ANG.powf(-1.0));
+                tmp_pos_tensor.self_multiple(BOHR.powf(-1.0));
             };
             Some((tmp_ep_pth, tmp_pos_tensor))
         };
@@ -738,7 +738,7 @@ impl GeomCell {
     }
 
     pub fn to_xyz(&self, filename: String) {
-        let ang = crate::constants::ANG;
+        let ang = BOHR;
         let mut input = fs::File::create(&filename).unwrap();
         write!(input, "{}\n\n", self.elem.len());
         self.position.iter_columns_full().zip(self.elem.iter()).for_each(|(pos, elem)| {
@@ -747,7 +747,7 @@ impl GeomCell {
     }
 
     pub fn formated_geometry(&self) -> String {
-        let ang = crate::constants::ANG;
+        let ang = BOHR;
         let mut input = String::new();
         //write!(input, "{}\n\n", self.elem.len());
         self.position.iter_columns_full().zip(self.elem.iter()).for_each(|(pos, elem)| {
@@ -808,7 +808,7 @@ impl GeomCell {
         let rj = self.position.iter_column(j);
         let mut dd = ri.zip(rj)
             .fold(0.0,|acc,(ri,rj)| acc + (ri-rj).powf(2.0)).sqrt();
-        dd *= crate::constants::ANG.powf(-1.0);
+        dd *= BOHR.powf(-1.0);
         dd
     }
 

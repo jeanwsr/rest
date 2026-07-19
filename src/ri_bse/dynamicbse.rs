@@ -17,6 +17,7 @@ use num::Complex;
 use rand::Rng;
 use std::time::Instant;
 use tensors::{MathMatrix, MatrixFull};
+use crate::constants::EV;
 use rest_tensors::matrix::matrix_blas_lapack::{
     _dgemm_full, _dgemm_scaled, _dgeev,
 };
@@ -833,7 +834,7 @@ pub fn dynamic_bse_main(scf_data: &SCF, qp_ctrl: &QuasiParticle) {
     println!("  #       Excitation energy (eV)    ‖T(λ)x‖");
     println!("  ───     ─────────────────────    ──────────");
     for k in 0..result.n_found {
-        let lam_ev = result.eigenvalues[k] * 27.2114;
+        let lam_ev = result.eigenvalues[k] * EV;
         println!("  {:>3}     {:>12.6} eV             {:>9.2e}",
             k, lam_ev, result.residuals[k]);
     }
@@ -842,7 +843,7 @@ pub fn dynamic_bse_main(scf_data: &SCF, qp_ctrl: &QuasiParticle) {
         for k in 0..result.n_found {
             let xv: Vec<f64> = (0..n).map(|i| result.eigenvectors[[i, k]]).collect();
             println!("\n  Excitation #{}: λ = {:.6} Ha = {:.6} eV",
-                k, result.eigenvalues[k], result.eigenvalues[k] * 27.2114);
+                k, result.eigenvalues[k], result.eigenvalues[k] * EV);
             super::leading_components(&xv, occ_size, vir_size);
         }
     }

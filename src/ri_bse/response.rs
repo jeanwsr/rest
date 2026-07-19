@@ -3,7 +3,7 @@ use crate::mpi_io::MPIOperator;
 use std::path::Path;
 use rest_libcint::rest_libcint_wrapper::int1e_r;
 use tensors::{MathMatrix, MatrixFull, RIFull,MatrixFullSlice};
-use crate::constants::{ANG, AU2DEBYE, SPECIES_INFO};
+use crate::constants::{AU2DEBYE, SPECIES_INFO};
 use itertools::Itertools;
 use crate::ri_gw::get_occupation_parameters;
 use std::f64::consts::SQRT_2;

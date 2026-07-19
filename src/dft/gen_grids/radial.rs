@@ -28,7 +28,8 @@ use std::f64::consts::PI;
 use super::bragg;
 use super::bse;
 use super::parameters;
-use super::parameters::{BOHR, BRAGG0};
+use super::parameters::BRAGG0;
+use crate::constants::BOHR;
 use statrs::function::gamma;
 
 /// Krack-Koster radial grid according to _M. Krack, A. M. Köster. The Journal of Chemical Physics 108, 3226-3234 (1998)_, eqs. 9-13.<br>

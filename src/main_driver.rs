@@ -13,7 +13,7 @@ use num_traits::Pow;
 use pyo3::prelude::*;
 //use autocxx::prelude::*;
 use crate::ctrl_io::JobType;
-use crate::constants::{ANG, AU2DEBYE};
+use crate::constants::{BOHR, AU2DEBYE};
 use crate::scf_io::{scf_without_build, SCFType, SCF};
 use tensors::{MathMatrix, MatrixFull};
 use tensors::matrix_blas_lapack::_dsyevd;
@@ -180,7 +180,7 @@ pub fn main_driver() -> anyhow::Result<()> {
                 if scf_data.mol.ctrl.print_level>0 {
                     println!("Geometry optimization invoked");
                 }
-                let displace = scf_data.mol.ctrl.nforce_displacement/ANG;
+                let displace = scf_data.mol.ctrl.nforce_displacement/BOHR;
 
                 let mut position = scf_data.mol.geom.position.iter().map(|x| *x).collect::<Vec<f64>>();
                 lbfgs().minimize(
@@ -637,7 +637,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         if scf_data.mol.ctrl.print_level > 1 {
             println!("Gradient evaluation using numerical differentiation");
         }
-        let displace = scf_data.mol.ctrl.nforce_displacement / ANG;
+        let displace = scf_data.mol.ctrl.nforce_displacement / BOHR;
         let (energy, nforce) = numerical_force(&scf_data, displace, &mpi_operator);
         println!("------ Output gradient [a.u.] ------");
         println!("{}", formated_force(&nforce, &scf_data.mol.geom.elem));
@@ -755,7 +755,7 @@ fn eval_normal_modes(
     let num_atoms = scf_data.mol.geom.nfree;
     let dim = num_atoms * 3;
     let displace_ang = scf_data.mol.ctrl.nhessian_displacement;
-    let displace = displace_ang / ANG; // convert Angstrom to Bohr
+    let displace = displace_ang / BOHR; // convert Angstrom to Bohr
 
     if scf_data.mol.ctrl.print_level > 0 {
         println!("");
@@ -954,7 +954,6 @@ mod geometric_pyo3_impl {
         pyo3::prepare_freethreaded_python();
         
         let elem = scf_data.mol.geom.elem.iter().map(|x| x.as_str()).collect::<Vec<&str>>();
-        const BOHR: f64 = crate::constants::BOHR;
         let xyz = scf_data.mol.geom.position.data.iter().map(|x| x * BOHR).collect::<Vec<f64>>();
         //let xyz = scf_data.mol.geom.position.iter().map(|x| *x).collect::<Vec<f64>>();
         let xyzs = vec![xyz];

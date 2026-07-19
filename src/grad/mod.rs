@@ -8,7 +8,7 @@ pub mod traits;
 use std::io::{self, Write};
 
 use crate::main_driver::{collect_total_energy, performance_essential_calculations};
-use crate::{constants::{ANG, EV}, scf_io::{initialize_scf, scf_without_build, SCF}, utilities};
+use crate::{constants::{BOHR, EV}, scf_io::{initialize_scf, scf_without_build, SCF}, utilities};
 use crate::mpi_io::{MPIData, MPIOperator};
 use tensors::MatrixFull;
 
@@ -132,7 +132,7 @@ pub fn formated_force(force: &MatrixFull<f64>, elem: &Vec<String>) -> String {
 pub fn formated_force_ev(force: &MatrixFull<f64>, elem: &Vec<String>) -> String {
     let mut output = String::new();
     force.iter_columns_full().zip(elem.iter()).for_each(|(force, elem)| {
-        output  = format!("{}{:3}{:16.8}{:16.8}{:16.8}\n", output, elem, force[0]*EV/ANG,force[1]*EV/ANG,force[2]*EV/ANG);
+        output  = format!("{}{:3}{:16.8}{:16.8}{:16.8}\n", output, elem, force[0]*EV/BOHR,force[1]*EV/BOHR,force[2]*EV/BOHR);
     });
 
     output

@@ -10,6 +10,7 @@ use tensors::matrix_blas_lapack::_power_rayon_for_symmetric_matrix;
 use tensors::MatrixFull;
 
 use crate::utilities::rstsr_util::*;
+use crate::constants::{FQ, HARTREE2WAVENUMBER};
 
 /// Routing for each optimizable G-term in calc_ej_ek().
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -4247,7 +4248,7 @@ pub fn compute_frequencies_from_hessian(
     // Convert eigenvalues to frequencies in cm⁻¹
     // ω² = λ (in a.u.), ω = √λ (a.u.), ν = ω/(2π) (a.u.)
     // 1 Hartree = 219474.63 cm⁻¹
-    let conv = 219474.63 / 1822.8885f64.sqrt();  // = 5140.49
+    let conv = HARTREE2WAVENUMBER / FQ.sqrt();  // = 5140.49
     let mut freqs = vec![0.0; n3];
     for i in 0..n3 {
         let lambda = eigvals[i];

@@ -7,7 +7,7 @@ use std::f64::consts::PI;
 use rayon::prelude::*;
 use approx::abs_diff_eq;
 use std::collections::HashMap;
-use crate::constants::ANG;
+use crate::constants::{BOHR, EV};
 use crate::geom_io::{GeomUnit,get_charge};
 use crate::molecule_io::Molecule;
 
@@ -52,12 +52,12 @@ pub fn rrs_pbc_output(scf_data: &SCF, unit_cell_elem: Vec<String>, index_map: Ha
     }
     let mut homo_lumo_gap = vec![0.0;tot_k_points];
     homo_lumo_gap.iter_mut().zip(pbc_result.iter()).for_each(|(h,p)| {
-        *h = (p[(cell_charge/2.0) as usize] - p[(cell_charge/2.0) as usize - 1])*27.2113863;
+        *h = (p[(cell_charge/2.0) as usize] - p[(cell_charge/2.0) as usize - 1])*EV;
     });
     let min_hlg = homo_lumo_gap.iter().filter(|&&x| !x.is_nan()).min_by(|a, b| a.partial_cmp(b).unwrap());
     println!("HOCO-LUCO gap: {:?} eV",min_hlg.unwrap());
     let elec = scf_data.mol.num_elec[0];
-    let hlg = (scf_data.eigenvalues[0][(elec/2.0) as usize] - scf_data.eigenvalues[0][(elec/2.0) as usize - 1])*27.2113863;
+    let hlg = (scf_data.eigenvalues[0][(elec/2.0) as usize] - scf_data.eigenvalues[0][(elec/2.0) as usize - 1])*EV;
     println!("HOMO-LUMO gap: {:?} eV",hlg);
 }
 
@@ -126,7 +126,7 @@ pub fn rrs_pbc_match(mol: &Molecule) -> (HashMap<(i32,i32,i32),Vec<usize>>, Vec<
     let vec_rrs_pbc_vec = rrs_pbc_vec.data;
     let mut tot_pbc_vec = vec![vec![0.0;3];3]; //[3,3]
     let factor = match unit {
-        GeomUnit::Angstrom => ANG,
+        GeomUnit::Angstrom => BOHR,
         GeomUnit::Bohr => 1.0,
     };
     for i in 0..rrs_pbc_dim {
@@ -194,7 +194,7 @@ pub fn rrs_pbc_new(scf: &SCF,index_map: HashMap<(i32,i32,i32),Vec<usize>>) -> (V
     let rrs_pbc_dim = scf.mol.geom.pbc_dim;
     let unit = scf.mol.geom.unit.clone();
     let factor = match unit {
-        GeomUnit::Angstrom => ANG,
+        GeomUnit::Angstrom => BOHR,
         GeomUnit::Bohr => 1.0,
     };
     let mut vec_rrs_pbc_vec = rrs_pbc_vec.data.clone();

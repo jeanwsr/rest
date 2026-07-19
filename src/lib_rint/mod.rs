@@ -1,6 +1,6 @@
 use crate::basis_io::etb::{etb_gen_for_atom_list, get_etb_elem};
 use crate::basis_io::Basis4Elem;
-use crate::constants::{AUXBAS_THRESHOLD, SQRT_THRESHOLD};
+use crate::constants::{AUXBAS_THRESHOLD, BOHR, SQRT_THRESHOLD};
 use crate::geom_io::GeomCell;
 use crate::molecule_io::Molecule;
 use crate::scf_io::{
@@ -11728,7 +11728,7 @@ position = [
             scf_without_build(&mut scf_data, &None);
             let cov_a = fragment_dipole_fluctuation_tensor(&scf_data, &[0]);
             let cov_b = fragment_dipole_fluctuation_tensor(&scf_data, &[1]);
-            let distance_bohr = distance_ang / crate::constants::ANG;
+            let distance_bohr = distance_ang / BOHR;
             let x = fragment_connected_dipole_x(cov_a, cov_b, distance_bohr);
             println!(
                 "occ-closure dipole X_disp(He2): R={distance_ang:.3} Ang ({distance_bohr:.6} bohr) X={x:.16e} logR={:.8} log|X|={:.8}",
