@@ -52,8 +52,12 @@ pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperat
     if renormalized_singles==true{
         println!("Starts renormalized singles calculations!");
         let w_rs=qp_ctrl.w_rs;
-        //println!("Now starting to compute rs_particles");
-        rs_particles=renormalized_singles::renormalized_singles_diagonalization(scf_data,w_rs,mpi_operator);
+        let rs_full_space=qp_ctrl.rs_full_space;
+        if rs_full_space{
+            rs_particles=renormalized_singles::renormalized_singles_diagonalization_fullspace(scf_data,w_rs,mpi_operator);
+        }else{
+            rs_particles=renormalized_singles::renormalized_singles_diagonalization(scf_data,w_rs,mpi_operator);
+        }
         if printlevel>0{
             println!("Renormalized Singles particles:{:#?}",rs_particles);
         }
@@ -1179,8 +1183,12 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     if renormalized_singles==true{
         println!("Starts renormalized singles calculations!");
         let w_rs=qp_ctrl.w_rs;
-        //println!("Now starting to compute rs_particles");
-        rs_particles=renormalized_singles::renormalized_singles_diagonalization(scf_data,w_rs,mpi_operator);
+        let rs_full_space=qp_ctrl.rs_full_space;
+        if rs_full_space{
+            rs_particles=renormalized_singles::renormalized_singles_diagonalization_fullspace(scf_data,w_rs,mpi_operator);
+        }else{
+            rs_particles=renormalized_singles::renormalized_singles_diagonalization(scf_data,w_rs,mpi_operator);
+        }
         if printlevel>0{
             println!("rs_particles:{:?}",rs_particles);
         }
