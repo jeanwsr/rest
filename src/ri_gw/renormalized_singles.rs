@@ -77,6 +77,47 @@ pub fn renormalized_singles_diagonalization(scf_data:&mut SCF,w_rs:bool,mpi_oper
     }
     occ_rs_values.into_iter().chain(vir_rs_values.into_iter()).collect()
 }
+pub fn renormalized_singles_diagonalization_fullspace(scf_data:&mut SCF,w_rs:bool,mpi_operator:&Option<MPIOperator>)->Vec<f64>{
+    println!("You are doing full-space renormalized singles GW calculations:");
+    println!("The full HF Hamiltonian in MO basis is diagonalized and renormalized.");
+    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
+    
+    scf_data.mol.xc_data.dfa_compnt_scf=vec![];
+    scf_io::SCF::generate_hf_hamiltonian_ri_v_dm_only(scf_data,mpi_operator);
+    let hf_full_hamiltonian=hamiltonian_ao2mo_full(scf_data);
+    
+    let (mut eigenvectors_opt, eigenvalues_opt, ndim) = _dsyev(&hf_full_hamiltonian, 'V');
+    let ndim = ndim as usize;
+    let mut eigenvectors = eigenvectors_opt.unwrap();
+    let eigenvalues = eigenvalues_opt;
+    
+    for i in 0..ndim{
+        let mut norm=0.0;
+        for j in 0..ndim{
+            norm+=(eigenvectors[[j,i]].powf(2.0));
+        }
+        norm=norm.sqrt();
+        for j in 0..ndim{
+            eigenvectors[[j,i]]*=norm.powf(-1.0);
+        }
+    }
+    
+    let previous_coeff=scf_data.eigenvectors[0].clone();
+    let mut vectors=MatrixFull::new([num_state,ndim],0.0);
+    _dgemm(&previous_coeff,((0..num_state),(0..ndim)),'N',
+           &eigenvectors,((0..ndim),(0..ndim)),'N',
+           &mut vectors,((0..num_state),(0..ndim)),1.0,0.0);
+    
+    if w_rs==true{
+        for i in 0..num_state{
+            for j in 0..num_state{
+                scf_data.eigenvectors[0][[j,i]]=vectors[[j,i]]
+            }
+        }
+    }
+    
+    eigenvalues
+}
 pub fn hamiltonian_ao2mo(scf_data:&SCF,choice:char)->MatrixFull<f64>{
     println!("now computing:{}",choice);
     let ao_hamiltonian=scf_data.hamiltonian[0].clone().to_matrixfull().unwrap();
@@ -174,4 +215,22 @@ pub fn diagonalize_and_renormalize(scf_data:&SCF,subspace_hamiltonian:&MatrixFul
     }
     eigenvectors_for_scf*/
     (eigenvalues,vectors)
+}
+pub fn hamiltonian_ao2mo_full(scf_data:&SCF)->MatrixFull<f64>{
+    let ao_hamiltonian=scf_data.hamiltonian[0].clone().to_matrixfull().unwrap();
+    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
+    let eigenvecs=scf_data.eigenvectors[0].clone();
+    let ao_dimensions=ao_hamiltonian.size[0];
+    
+    let mut c_t_h_ao=MatrixFull::new([num_state,ao_dimensions],0.0);
+    let mut h_mo=MatrixFull::new([num_state,num_state],0.0);
+    
+    _dgemm(&eigenvecs,((0..ao_dimensions),(0..num_state)),'T',
+           &ao_hamiltonian,((0..ao_dimensions),(0..ao_dimensions)),'N',
+           &mut c_t_h_ao,((0..num_state),(0..ao_dimensions)),1.0,0.0);
+    _dgemm(&c_t_h_ao,((0..num_state),(0..ao_dimensions)),'N',
+           &eigenvecs,((0..ao_dimensions),(0..num_state)),'N',
+           &mut h_mo,((0..num_state),(0..num_state)),1.0,0.0);
+    
+    h_mo
 }

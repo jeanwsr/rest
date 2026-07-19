@@ -28,6 +28,7 @@ pub struct QuasiParticle {
     pub gw_linearize_derivative_h:f64,
     pub renormalized_singles:bool,
     pub w_rs:bool,
+    pub rs_full_space:bool,
     pub scgw:String,
     pub gw:bool,
     pub bse_exchange_rescaling:f64,
@@ -156,6 +157,7 @@ impl Default for QuasiParticle {
             gw_linearize_derivative_h:1e-10,
             renormalized_singles:false,
             w_rs:false,
+            rs_full_space:false,
             scgw:String::from("g0w0"),
             gw:false,
             save_bse_excitations:false, 
@@ -276,6 +278,7 @@ impl QuasiParticle {
         table.insert("gw_linearize_derivative_h".to_string(), toml::Value::Float(self.gw_linearize_derivative_h));
         table.insert("renormalized_singles".to_string(), toml::Value::Boolean(self.renormalized_singles));
         table.insert("w_rs".to_string(), toml::Value::Boolean(self.w_rs));
+        table.insert("rs_full_space".to_string(), toml::Value::Boolean(self.rs_full_space));
         table.insert("scgw".to_string(), toml::Value::String(self.scgw.clone()));
         table.insert("gw_rootfinder".to_string(), toml::Value::String(self.gw_rootfinder.clone()));
         table.insert("gw".to_string(), toml::Value::Boolean(self.gw));
@@ -518,6 +521,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 other => {false},
             };
             tmp_input.w_rs = match tmp_ctrl.get("w_rs").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.rs_full_space = match tmp_ctrl.get("rs_full_space").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };
