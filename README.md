@@ -338,8 +338,62 @@ fp_mode = "FP64"
 输入卡关键词包括：
 - `ss_factor`: 取值f64。采用 Spin-Component-Scaled 方式计算 MP2 型相关能（SCS-MP2）时, 用于控制自旋平行（same spin）分量贡献的缩放系数，适用于 `xc` 关键词为 MP2、SCS-MP2或双杂化泛函，以及 `post_correlation` 设置为 PT2 的情况。缺省为 None，即依 `xc` 设置的泛函进行设定。
 - `os_factor`: 取值f64。适用场景与 `ss_factor` 一致，采用 SCS-MP2 方法计算相关能贡献时，用于缩放自旋反平行（opposite spin）分量贡献的系数。缺省为 None，即依 `xc` 设置的泛函进行设定。
-- `fp_mode`: 取值 String (`"FP32"`, `"FP64"`)。设置 RI-PT2 计算中使用的浮点精度。缺省为 `"FP32"`。对于数值梯度计算，建议设置为 `"FP64"` 以获得更高的数值稳定性。
+- `fp_mode`: 取值 String (`"FP32"`, `"FP64"`)。设置 RI-PT2 计算中使用的浮点精度。仅当 `new_driver = true` 时生效。缺省为 `"FP32"`。对于数值梯度计算，建议设置为 `"FP64"` 以获得更高的数值稳定性。
 - `mpi_mode`: 取值 usize。设置 RI-PT2 计算中使用的 MPI 模式。缺省为 0，即不使用 MPI。
+
+#### PT2 算法选择
+
+REST 提供三种 PT2 实现算法，通过以下关键词选择：
+
+- `streaming`: 取值 bool。是否启用**流式 PT2 算法**（缺省 `true`）。
+  - `true`（推荐，缺省）：采用分块流式 ao2mo + PT2 主循环。不物化完整的 `ri3mo[naux, nvir, nocc]` 张量，而是按占据轨道分块（block_size 个轨道/块）逐块做 AO→MO 变换和 PT2 收缩。内嵌 M1 优化（dsymm 先收缩小边），且通过 scoped thread 预取下一块的 ao2mo（Fix B 流水线），将 ao2mo 时间隐藏在 PT2 主循环后面。
+    - 内存峰值：`rimatr + 3 × [naux, nvir, B]`，比原始算法少约 130 GB（对于 nao≈3000 的体系）。
+    - 支持：RHF、UHF、ROHF；rayon 并行；单节点计算。
+    - 限制：当前不支持 MPI 并行（MPI 激活时自动回退到原始算法）。
+  - `false`：使用**原始 legacy 算法**。先一次性生成完整 `ri3mo` 张量（`generate_ri3mo_rayon`），再做 PT2 主循环。
+    - 内存峰值：`rimatr + ri3mo`，比流式算法多约 130–185 GB。
+    - 支持：RHF、UHF、ROHF；rayon 并行；**MPI 并行**。
+    - 适用场景：需要 MPI 并行的大体系。
+
+- `new_driver`: 取值 bool。是否启用**新 rstsr 驱动**（缺省 `false`）。
+  - `true`：采用基于 rstsr 张量库的 pair-engine 架构。支持 FP32 半精度、UKS 三自旋对统一处理。但内存峰值最高（存在大 scratch_buf 且不释放 rimatr），且不支持 ROHF 和 MPI。
+  - `false`（缺省）：不使用新驱动。
+
+- `stream_block_size`: 取值 usize。流式算法的块大小（仅当 `streaming = true` 时生效）。
+  - 缺省（不设置或设为 0）：自动选择。规则为 `B² ≥ 4 × num_threads`，clamp 到 [16, 128]。
+  - 典型值：48 核机器 RHF 取 64，96 核机器 UKS 取 32。
+  - 调优建议：内存紧张时减小 B（如 32），PT2 主循环并行度不足时增大 B（如 128）。
+
+**算法选择优先级**（满足条件时依次尝试）：
+
+| 优先级 | 条件 | 算法 |
+|---|---|---|
+| 1 | `new_driver = true` 且非 MPI 且 PT2 且 RHF/UHF | 新 rstsr 驱动 |
+| 2 | `streaming = true`（缺省）且非 MPI 且 `use_ri_symm = true` 且 PT2 | **流式算法** |
+| 3 | 其它情况 | 原始 legacy 算法 |
+
+**输入卡示例**：
+
+```toml
+# 缺省配置（推荐）：流式算法，自动块大小
+[ctrl.ri_pt2]
+# streaming = true        # 缺省，无需显式设置
+# stream_block_size = 0   # 缺省，自动选择
+
+# 显式使用原始 legacy 算法（需要 MPI 时）
+[ctrl.ri_pt2]
+streaming = false
+
+# 流式算法 + 自定义块大小
+[ctrl.ri_pt2]
+streaming = true
+stream_block_size = 32
+
+# 使用新 rstsr 驱动（仅非 MPI 的 RHF/UHF）
+[ctrl.ri_pt2]
+new_driver = true
+fp_mode = "FP32"
+```
 
 ## RRS-PBC计算相关设置
 RRS-PBC方法是由张颖教授等提出的一种基于分子团簇计算结果的周期性电子结构模拟方法，相关论文见 Zhang, I.Y., Jiang, J., Gao, B. *et al.* RRS-PBC: a molecular approach for periodic systems. [*Sci. China Chem.* **57**, 1399–1404 (2014)](https://doi.org/10.1007/s11426-014-5183-y)。在 REST 中，RRS-PBC 相关的设置主要在 `[geom]` 区块中进行，请参考后续的说明。`[ctrl]`区块中的相关关键词包括：
