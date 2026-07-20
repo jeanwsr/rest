@@ -14,7 +14,7 @@ pub struct ThermoParameters {
     /// Pressure in atm (single-point primary value)
     #[serde(default = "default_pressure")]
     pub pressure: f64,
-    /// Rotational symmetry number sigma (default 1.0)
+    /// Rotational symmetry number sigma (default None, which means auto-detect from geometry)
     #[serde(default = "default_symmetry_number")]
     pub symmetry_number: f64,
     /// Electronic energy in a.u. used for U/H/G sums. If 0.0, the SCF total
@@ -64,7 +64,7 @@ pub struct ThermoParameters {
 fn one() -> f64 { 1.0 }
 fn default_temperature() -> f64 { 298.15 }
 fn default_pressure() -> f64 { 1.0 }
-fn default_symmetry_number() -> f64 { 1.0 }
+fn default_symmetry_number() -> f64 { 0.0 }
 fn default_ravib() -> f64 { 100.0 }
 fn default_intpvib() -> f64 { 100.0 }
 fn default_output_path() -> String { String::from("./Thermochemistry.txt") }

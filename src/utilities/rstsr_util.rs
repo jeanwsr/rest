@@ -1,16 +1,18 @@
 //! rest_tensor to RSTSR interchange.
 
-use rayon::prelude::*;
 use rstsr::prelude::*;
+use rayon::prelude::*;
 use rstsr_core::{prelude_dev::OpAssignAPI, storage::creation::DeviceCreationAnyAPI};
 use tensors::{BasicMatrix, MatrixFull};
+
+pub type Tsr<T = f64> = Tensor<T, DeviceBLAS, IxD>;
+pub type TsrView<'a, T = f64> = TensorView<'a, T, DeviceBLAS, IxD>;
+pub type TsrMut<'a, T = f64> = TensorMut<'a, T, DeviceBLAS, IxD>;
+pub type TsrCow<'a, T = f64> = TensorCow<'a, T, DeviceBLAS, IxD>;
 
 /* #region interchange between rstsr and rest_tensor */
 
 // In REST, we always use DeviceBLAS as backend in most cases.
-pub type Tsr<T> = Tensor<T, DeviceBLAS, IxD>;
-pub type TsrView<'a, T> = TensorView<'a, T, DeviceBLAS, IxD>;
-pub type TsrMut<'a, T> = TensorMut<'a, T, DeviceBLAS, IxD>;
 
 pub trait RestTensorToRstsrTsrAPI<T> {
     fn to_rstsr(&self, device: &DeviceBLAS) -> Tsr<T>;

@@ -8,6 +8,7 @@ use std::{fs, sync::Arc};
 use crate::ctrl_io::geometric_pyo3_io::parse_geometric_keywords;
 use crate::ctrl_io::quasiparticle_methods::parse_quasiparticle_keywords;
 use crate::ri_jk::decompose::J2CDecompOption;
+use crate::analdrv::config::{AnalDrvConfig, AnalDrvTask};
 use crate::ctrl_io::tddft_parameters::parse_tddft_keywords;
 use crate::ctrl_io::hessian_parameters::parse_hessian_keywords;
 use crate::ctrl_io::thermo_parameters::parse_thermo_keywords;
@@ -85,6 +86,7 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     if let Some(tmp_thermo) = &mut tmp_thermo {
         tmp_input.thermo = Some(std::mem::take(tmp_thermo));
     }
+    tmp_input.analdrv = tmp_keys.get("analdrv").map(serde_from_value);
     Ok((tmp_input,tmp_geomcell))
 }
 
@@ -385,6 +387,10 @@ pub struct InputKeywords {
     #[pyo3(get, set)]
     pub use_fxc_opt: bool,
     pub rel: RelativisticMethod,
+    /// Analytical derivative driver configuration.
+    pub analdrv: Option<AnalDrvConfig>,
+    /// Analytical derivative tasks to perform.
+    pub analdrv_tasks: Vec<AnalDrvTask>,
 }
 
 impl Default for InputKeywords {
@@ -550,6 +556,8 @@ impl InputKeywords {
             thermo: None,
             use_fxc_opt: false,
             rel: RelativisticMethod::None,
+            analdrv: None,
+            analdrv_tasks: Vec::new(),
         }
     }
 
@@ -1936,6 +1944,13 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.xc_parser = match tmp_ctrl.get("xc_parser").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => { tmp_str.to_lowercase() },
                 other => String::from("legacy"),
+            };
+            
+            tmp_input.analdrv_tasks = match tmp_ctrl.get("analdrv_tasks").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Null => vec![],
+                serde_json::Value::String(tmp_str) => vec![serde_from_value(&tmp_str.to_string().into())],
+                serde_json::Value::Array(tmp_arr) => tmp_arr.iter().map(|x| serde_from_value(x)).collect(),
+                _ => panic!("analdrv_tasks must be a string or an array of strings"),
             };
             
             //===========================================================

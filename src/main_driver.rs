@@ -384,6 +384,19 @@ pub fn main_driver() -> anyhow::Result<()> {
     if let Some(ref hess_ctrl) = scf_data.mol.ctrl.hessian {
         crate::hessian::rhf_hessian_main(&scf_data, hess_ctrl, &mut time_mark);
     }
+    
+    //===================================
+    // Analytical derivative module calculations
+    //===================================
+    if !scf_data.mol.ctrl.analdrv_tasks.is_empty() {
+        time_mark.new_item("AnalDrv", "analytical derivative module");
+        time_mark.count_start("AnalDrv");
+        use crate::analdrv::interface::analdrv_interface;
+        let tasks = &scf_data.mol.ctrl.analdrv_tasks;
+        let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
+        analdrv_interface(&scf_data, tasks, &config);
+        time_mark.count("AnalDrv");
+    }
 
     time_mark.count("Overall");
 
@@ -969,22 +982,38 @@ mod geometric_pyo3_impl {
         //"#;
         //let mut params = tomlstr2py(optimizer_params)?;
 
-        let mut params = if let Some(params) = &scf_data.mol.ctrl.geometric_pyo3 {
-            let params = toml2py(&params.to_toml())?;
-            params
-        } else {
-            panic!("For geometric_pyo3, you must specify the parameters in the control file.")
-        };
+        let rust_params = scf_data.mol.ctrl.geometric_pyo3.as_ref().expect("For geometric_pyo3, you must specify the parameters in the control file.");
+        let params = toml2py(&rust_params.to_toml())?;
 
         // ── Compute analytical Hessian before optimization (if requested) ──
         let hessian_analytic_path: Option<std::path::PathBuf> =
-            if scf_data.mol.ctrl.geometric_pyo3.as_ref().map_or(false, |g| g.analytic_hessian) {
+            if rust_params.analytic_hessian {
                 let pl = scf_data.mol.ctrl.print_level;
                 if pl > 0 {
                     println!("  Computing analytical Hessian for geomeTRIC initial guess...");
                 }
-                let hess_total = crate::hessian::compute_hessian(&*scf_data)
-                    .expect("Analytical Hessian computation failed for geometry optimization");
+                let is_hessian_enabled = scf_data.mol.ctrl.hessian.is_some();
+                let use_analdrv = scf_data.mol.ctrl.geometric_pyo3.as_ref().map_or(None, |g| g.use_analdrv);
+                // if `[hessian]` is specified in the control file, then we will use it to compute the Hessian.
+                // otherwise, use `analdrv`.
+                let use_analdrv = use_analdrv.unwrap_or(!is_hessian_enabled);
+                let hess_total = if !use_analdrv {
+                    crate::hessian::compute_hessian(&*scf_data)
+                        .expect("Analytical Hessian computation failed for geometry optimization")
+                } else {
+                    use crate::analdrv::interface::hess_interface;
+                    use rstsr::prelude::*;
+                    
+                    let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
+                    let (hess_raw, _, _) = hess_interface(&scf_data, &config);
+                    let natm = (hess_raw.len() / 9).isqrt();
+                    assert!(natm * natm * 9 == hess_raw.len(), "Hessian raw data length does not match expected size for {} atoms", natm);
+                    let device = DeviceBLAS::default();
+                    let hess_rt = rt::asarray((&hess_raw, [3, 3, natm, natm].f(), &device));
+                    let hess_rt = hess_rt.transpose([0, 2, 1, 3]).into_shape((3 * natm, 3 * natm));
+                    let hess_vec = hess_rt.into_shape(-1).into_vec();
+                    MatrixFull::from_vec([3 * natm, 3 * natm], hess_vec).unwrap()
+                };
                 let natm = scf_data.mol.geom.nfree;
                 let n3 = natm * 3;
                 let mut out = String::new();
