@@ -11,8 +11,6 @@ pub enum OCCType {
     ATMSAD,
 }
 
-pub mod force_state_occupation;
-
 pub fn generate_occupation_frac_occ(mol: &Molecule, scftype: &SCFType, eigenvalues: &[Vec<f64>;2], tolerant: f64) -> ([Vec<f64>;2],[usize;2],[usize;2]) {
     let num_state = mol.num_state;
     let spin_channel = mol.ctrl.spin_channel;

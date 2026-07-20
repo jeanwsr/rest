@@ -1,5 +1,5 @@
 use tensors::{MatrixFull, BasicMatrix};
-use crate::check_norm::OCCType;
+use crate::scf_io::occupation::OCCType;
 use crate::molecule_io::Molecule;
 use crate::ctrl_io::InputKeywords;
 use crate::geom_io::{GeomCell, formated_element_name};
