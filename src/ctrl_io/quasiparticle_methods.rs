@@ -203,7 +203,7 @@ impl Default for QuasiParticle {
             qsgw_energy_tol: 1e-5,
             qsgw_mix_param: 0.5,
             qsgw_eta: 0.001,
-            cdgw_eta: 0.0,
+            cdgw_eta: 0.001,
             // response BSE grid sampling parameters (default: 2 points per dimension)
             response_bse_x_start: 0.0,
             response_bse_x_end: 1.0,

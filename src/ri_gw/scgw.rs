@@ -419,6 +419,7 @@ fn single_orbital_gw_lowrank(
     let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
 
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let cdgw_eta = qp_ctrl.cdgw_eta;
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
@@ -427,7 +428,7 @@ fn single_orbital_gw_lowrank(
             ri_gw::quasiparticle_equation_lowrank(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
                 occ_size, vir_size, num_state,
-                w_c_at_freqs, real_axis_vchiv, 0,
+                w_c_at_freqs, real_axis_vchiv, 0, cdgw_eta,
             )
         };
         qp_energy_no_fse = qp_eq_func(e_ks_n) + e_ks_n;
@@ -439,7 +440,7 @@ fn single_orbital_gw_lowrank(
         qp_energy_no_fse = ri_gw::newton_solver_lowrank(
             n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
             w_c_at_freqs, real_axis_vchiv,
-            qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level,
+            qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
         );
         println!("QP energy (low-rank, no FSE): {}", qp_energy_no_fse);
     } else if rootfinder == "interpolation".to_string() {
@@ -452,13 +453,13 @@ fn single_orbital_gw_lowrank(
         ri_gw::quasiparticle_equation_lowrank(
             debug_omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
             occ_size, vir_size, num_state,
-            w_c_at_freqs, real_axis_vchiv, pl,
+            w_c_at_freqs, real_axis_vchiv, pl, cdgw_eta,
         );
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
                 occ_size, vir_size, num_state,
-                w_c_at_freqs, real_axis_vchiv, 0,
+                w_c_at_freqs, real_axis_vchiv, 0, cdgw_eta,
             )
         };
         // Use gwqp_g[n] as starting_point so the self-pole (de=0) at omega = qp_energy
@@ -475,7 +476,7 @@ fn single_orbital_gw_lowrank(
             qp_energy = ri_gw::newton_solver_lowrank(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 w_c_at_freqs, real_axis_vchiv,
-                qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level,
+                qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
             );
         }
         qp_energy_no_fse = qp_energy;
@@ -498,7 +499,7 @@ fn single_orbital_gw_lowrank(
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
-                occ_size, vir_size, num_state, w_c_at_freqs, real_axis_vchiv, 0,
+                occ_size, vir_size, num_state,                 w_c_at_freqs, real_axis_vchiv, 0, cdgw_eta,
             ) + ri_gw::fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin)
         };
         let (have_crossing, qp) = ri_gw::linear_interpolation_solver(
@@ -508,7 +509,7 @@ fn single_orbital_gw_lowrank(
             ri_gw::newton_solver_lowrank(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 w_c_at_freqs, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level,
+                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
             )
         } else {
             qp
@@ -518,7 +519,7 @@ fn single_orbital_gw_lowrank(
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
-                occ_size, vir_size, num_state, w_c_at_freqs, real_axis_vchiv, 0,
+                occ_size, vir_size, num_state,                 w_c_at_freqs, real_axis_vchiv, 0, cdgw_eta,
             ) + ri_gw::fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff)
         };
         let (have_crossing, qp) = ri_gw::linear_interpolation_solver(
@@ -528,7 +529,7 @@ fn single_orbital_gw_lowrank(
             ri_gw::newton_solver_lowrank(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 w_c_at_freqs, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level,
+                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
             )
         } else {
             qp
@@ -572,6 +573,7 @@ fn single_orbital_gw_lowrank_v2(
     let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
 
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let cdgw_eta = qp_ctrl.cdgw_eta;
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
@@ -580,7 +582,7 @@ fn single_orbital_gw_lowrank_v2(
             ri_gw::quasiparticle_equation_lowrank_v2(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
                 occ_size, vir_size, num_state,
-                wc_rows, real_axis_vchiv, 0,
+                wc_rows, real_axis_vchiv, 0, cdgw_eta,
             )
         };
         qp_energy_no_fse = qp_eq_func(e_ks_n) + e_ks_n;
@@ -592,7 +594,7 @@ fn single_orbital_gw_lowrank_v2(
         qp_energy_no_fse = ri_gw::newton_solver_lowrank_v2(
             n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
             wc_rows, real_axis_vchiv,
-            qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level,
+            qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
         );
         println!("QP energy (low-rank v2, no FSE): {}", qp_energy_no_fse);
     } else if rootfinder == "interpolation".to_string() {
@@ -601,13 +603,13 @@ fn single_orbital_gw_lowrank_v2(
         ri_gw::quasiparticle_equation_lowrank_v2(
             debug_omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
             occ_size, vir_size, num_state,
-            wc_rows, real_axis_vchiv, pl,
+            wc_rows, real_axis_vchiv, pl, cdgw_eta,
         );
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank_v2(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
                 occ_size, vir_size, num_state,
-                wc_rows, real_axis_vchiv, 0,
+                wc_rows, real_axis_vchiv, 0, cdgw_eta,
             )
         };
         let qp_start = gwqp_g[n];
@@ -619,7 +621,7 @@ fn single_orbital_gw_lowrank_v2(
             qp_energy = ri_gw::newton_solver_lowrank_v2(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 wc_rows, real_axis_vchiv,
-                qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level,
+                qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
             );
         }
         qp_energy_no_fse = qp_energy;
@@ -642,7 +644,7 @@ fn single_orbital_gw_lowrank_v2(
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank_v2(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
-                occ_size, vir_size, num_state, wc_rows, real_axis_vchiv, 0,
+                occ_size, vir_size, num_state, wc_rows, real_axis_vchiv, 0, cdgw_eta,
             ) + ri_gw::fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin)
         };
         let (have_crossing, qp) = ri_gw::linear_interpolation_solver(
@@ -652,7 +654,7 @@ fn single_orbital_gw_lowrank_v2(
             ri_gw::newton_solver_lowrank_v2(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 wc_rows, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level,
+                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
             )
         } else {
             qp
@@ -662,7 +664,7 @@ fn single_orbital_gw_lowrank_v2(
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank_v2(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
-                occ_size, vir_size, num_state, wc_rows, real_axis_vchiv, 0,
+                occ_size, vir_size, num_state, wc_rows, real_axis_vchiv, 0, cdgw_eta,
             ) + ri_gw::fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff)
         };
         let (have_crossing, qp) = ri_gw::linear_interpolation_solver(
@@ -672,7 +674,7 @@ fn single_orbital_gw_lowrank_v2(
             ri_gw::newton_solver_lowrank_v2(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 wc_rows, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level,
+                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
             )
         } else {
             qp
