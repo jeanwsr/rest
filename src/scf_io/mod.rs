@@ -4691,6 +4691,83 @@ fn ao2mo_rayon_v02<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
     Ok((rimo, row_dim, column_dim))
 }
 
+/// M1-optimized AO→MO transformation for a block of occupied (or virtual) orbitals.
+///
+/// Compared to `ao2mo_rayon_v02`, this routine contracts the *smaller* side
+/// first in the dsymm step: instead of computing `tmp_mat = reduced_ri × eigenvector`
+/// over the full eigenvector `[nao, nmo]` and then slicing, we pre-slice
+/// `eigenvector[:, column_dim]` once (one-time copy of `[nao, |column_dim|]`)
+/// and run dsymm on the smaller RHS. This saves a factor `nmo / |column_dim|`
+/// in dsymm FLOPs.
+///
+/// Used by streaming PT2 (`*_pt2_rayon_streaming` in `ri_pt2/mod.rs`), where
+/// `column_dim` is a small block of occupied orbitals (typical |column_dim| ≤ 64)
+/// rather than the full `nocc`. The full `ri3mo` tensor is never materialized.
+pub(crate) fn ao2mo_rayon_m1<'a, T, P>(
+    eigenvector: &T,
+    rimatr_chunk: &P,
+    row_dim: std::ops::Range<usize>,
+    column_dim: std::ops::Range<usize>,
+) -> anyhow::Result<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)>
+where T: BasicMatrix<'a, f64> + std::marker::Sync,
+      P: BasicMatrix<'a, f64>
+{
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
+
+    let num_basis = eigenvector.size()[0];
+    //let num_state = eigenvector.size()[1];
+    let num_bpair = rimatr_chunk.size()[0];
+    let num_auxbs = rimatr_chunk.size()[1];
+    let num_loc_row = row_dim.len();
+    let num_loc_col = column_dim.len();
+
+    // M1 optimization: pre-slice eigenvector to the occ block.
+    // Cost: one-time copy of [nao, |column_dim|] = num_basis * num_loc_col * 8 bytes.
+    // For num_loc_col=64, num_basis=3035: ~1.5 MB. Negligible.
+    let mut eigvec_occ_data = vec![0.0_f64; num_basis * num_loc_col];
+    let eigvec_src = eigenvector.data_ref().expect("eigenvector must be contiguous");
+    for j in 0..num_loc_col {
+        let src_off = (column_dim.start + j) * num_basis;
+        let dst_off = j * num_basis;
+        eigvec_occ_data[dst_off..dst_off + num_basis]
+            .copy_from_slice(&eigvec_src[src_off..src_off + num_basis]);
+    }
+    let eigvec_occ = MatrixFull::from_vec([num_basis, num_loc_col], eigvec_occ_data).unwrap();
+
+    let mut rimo = RIFull::new([num_auxbs, num_loc_row, num_loc_col], 0.0);
+    let (sender, receiver) = channel();
+
+    rimatr_chunk.data_ref().unwrap().par_chunks_exact(num_bpair).enumerate().for_each_with(sender, |s, (i_auxbs, m)| {
+
+        omp_set_num_threads_wrapper(1);
+
+        let mut reduced_ri = MatrixFull::new([num_basis, num_basis], 0.0_f64);
+        reduced_ri.iter_matrixupper_mut().unwrap().zip(m.iter()).for_each(|(to, from)| {*to = *from});
+
+        // M1: dsymm with sliced eigenvector [nao, |column_dim|] (NOT full [nao, nmo])
+        let mut tmp_mat = MatrixFull::new([num_basis, num_loc_col], 0.0_f64);
+        _dsymm(&reduced_ri, &eigvec_occ, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
+
+        // dgemm: eigenvector[:, row_dim].T × tmp_mat -> [num_loc_row, num_loc_col]
+        // loc_ri3mo[a, i] = sum_u eigenvector[u, a] * tmp_mat[u, i]
+        let mut loc_ri3mo = MatrixFull::new([num_loc_row, num_loc_col], 0.0_f64);
+        _dgemm(
+            eigenvector, ((0..num_basis), row_dim.clone()), 'T',
+            &tmp_mat, ((0..num_basis), (0..num_loc_col)), 'N',
+            &mut loc_ri3mo, ((0..num_loc_row), (0..num_loc_col)),
+            1.0, 0.0
+        );
+        s.send((loc_ri3mo, i_auxbs)).unwrap()
+    });
+    receiver.into_iter().for_each(|(loc_ri3mo, i_auxbs)| {
+        rimo.copy_from_matr(0..num_loc_row, 0..num_loc_col, i_auxbs, 2, &loc_ri3mo, 0..num_loc_row, 0..num_loc_col)
+    });
+
+    omp_set_num_threads_wrapper(default_omp_num_threads);
+
+    Ok((rimo, row_dim, column_dim))
+}
+
 pub fn diagonalize_hamiltonian_outside(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> ([MatrixFull<f64>;2], [Vec<f64>;2], usize) {
     let mut eigenvectors = [MatrixFull::empty(),MatrixFull::empty()];
     let mut eigenvalues = [Vec::new(),Vec::new()];
