@@ -748,6 +748,7 @@ fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeR
         println!("Input geometry in this round is:");
         println!("{}", scf_data.mol.geom.formated_geometry());
     }
+    scf_data.free_large_tensors();
     scf_data.mol.ctrl.initial_guess = String::from("inherit");
     initialize_scf(scf_data, mpi_operator);
     performance_essential_calculations(scf_data, time_mark, mpi_operator);
