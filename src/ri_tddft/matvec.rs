@@ -113,16 +113,24 @@ pub fn exchange_b_matvec(
     let mut t_tensor = MatrixFull::new([num_auxbas * occ_size, occ_size], 0.0);
     _dgemm_full(ri_ov_reshaped, 'N', &z_mat, 'T', &mut t_tensor, 1.0, 0.0);
 
-    // Step 2: Transpose and reshape (converting RI index ordering)
-    // t_tensor: [naux*occ, occ] → we need to swap the occ and aux dimensions
-    // Result should be [occ, naux*occ] in a DGEMM-compatible form
-    t_tensor = t_tensor.transpose_and_drop();
-    // Now [occ, naux*occ]
-    t_tensor.reshape([num_auxbas * occ_size, occ_size]);
-    // Now [naux*occ, occ] with transposed data
+    // Step 2: Block-swap to convert RI index ordering
+    // t_tensor[P*occ + j, i] → t_tensor[P*occ + i, j]
+    // This swaps the two occupied indices in the block structure:
+    // original block at position (j,i) moves to position (i,j)
+    let mut swapped_data = vec![0.0; t_tensor.data.len()];
+    for new_idx in 0..occ_size * occ_size {
+        let n2 = new_idx / occ_size;
+        let n1 = new_idx % occ_size;
+        let orig_idx = n1 * occ_size + n2;
+        let source_start = orig_idx * num_auxbas;
+        let source_end = source_start + num_auxbas;
+        swapped_data[new_idx * num_auxbas..(new_idx + 1) * num_auxbas]
+            .copy_from_slice(&t_tensor.data[source_start..source_end]);
+    }
+    t_tensor = MatrixFull::from_vec([num_auxbas * occ_size, occ_size], swapped_data).unwrap();
 
     // Step 3: result[i, a] = -alpha * Σ_j Σ_P t_tensor^T[i, j*naux+P] * ri_ov[P*nocc + j, a]
-    // t_tensor after reshape-transpose: [naux*occ, occ]
+    // t_tensor after block-swap: [naux*occ, occ], with t_tensor[P*occ + i, j] = Σ_b (P|jb) * z_{ib}
     // t_tensor^T: [occ, naux*occ]
     // ri_ov_reshaped: [naux*occ, vir]
     // result: [occ, vir]
