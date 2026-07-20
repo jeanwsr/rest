@@ -772,14 +772,15 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
     if sign==1{
         (0..vir_size).into_par_iter().map(|a|{
             let mut residue=0.0;
-            if quasiparticle_energies_g[occ_size+a]<omega{
-                let gap=omega-quasiparticle_energies_g[occ_size+a];
-                let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,gap,'C',eta);
+            let de=omega-quasiparticle_energies_g[occ_size+a];
+            if de>-eta{
+                let pole_factor=if de.abs()<eta{0.5}else{1.0};
+                let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,de,'C',eta);
                 let inverse_dielectric=inverse_dielectric_matrix(response,'C');
                 let vec:Vec<f64>=ri_row_n.iter_column(occ_size+a).copied().collect::<Vec<f64>>();
                 let mut first_product=vec![0.0;num_auxbas];
                 _dgemv(&inverse_dielectric, &vec, &mut first_product, 'N', 1.0, 0.0, 1, 1);
-                residue=first_product.iter().zip(vec.iter()).map(|(a,b)|a*b).sum::<f64>();
+                residue=first_product.iter().zip(vec.iter()).map(|(a,b)|a*b).sum::<f64>()*pole_factor;
             }
             residue*=(sign as f64);
             residue
@@ -787,14 +788,15 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
     }else{
         (0..occ_size).into_par_iter().map(|i|{
             let mut residue=0.0;
-            if quasiparticle_energies_g[i]>omega{
-                let gap=quasiparticle_energies_g[i]-omega;
-                let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,gap,'C',eta);
+            let de=quasiparticle_energies_g[i]-omega;
+            if de>-eta{
+                let pole_factor=if de.abs()<eta{0.5}else{1.0};
+                let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,de,'C',eta);
                 let inverse_dielectric=inverse_dielectric_matrix(response,'C');
                 let vec:Vec<f64>=ri_row_n.iter_column(i).copied().collect::<Vec<f64>>();
                 let mut first_product=vec![0.0;num_auxbas];
                 _dgemv(&inverse_dielectric, &vec, &mut first_product, 'N', 1.0, 0.0, 1, 1);
-                residue=first_product.iter().zip(vec.iter()).map(|(a,b)|a*b).sum::<f64>();
+                residue=first_product.iter().zip(vec.iter()).map(|(a,b)|a*b).sum::<f64>()*pole_factor;
             }
             residue*=(sign as f64);
             residue
@@ -1361,7 +1363,7 @@ fn get_homo_lumo_qp_only_lowrank(
         &quasiparticle_energies_g, &quasiparticle_energies_w,
         occ_size, vir_size, num_state,
         &wc_rows, &real_axis_vchiv,
-        eigenenergies[n], 0.00001, 50, side, printlevel,
+        eigenenergies[n], 0.00001, 50, side, printlevel, qp_ctrl.cdgw_eta,
     );
     println!("The QP energy of HOMO obtained by GWA (low-rank) is {}", homo_qp);
 
@@ -1383,7 +1385,7 @@ fn get_homo_lumo_qp_only_lowrank(
         &quasiparticle_energies_g, &quasiparticle_energies_w,
         occ_size, vir_size, num_state,
         &wc_rows, &real_axis_vchiv,
-        eigenenergies[n], 0.00001, 50, side, printlevel,
+        eigenenergies[n], 0.00001, 50, side, printlevel, qp_ctrl.cdgw_eta,
     );
 
     let save_path = qp_ctrl.save_qp_path.clone();
@@ -1646,7 +1648,6 @@ pub fn generate_real_axis_vchiv(
     }
 
     // Step 1: Find de_max
-    let eta = 1e-6_f64;
     let mut de_max = 0.0_f64;
 
     for mstate in nsemin..=nsemax {
@@ -1991,10 +1992,11 @@ pub fn quasiparticle_equation_lowrank_v2(
     wc_rows: &Vec<(f64, f64, Vec<f64>)>,
     real_axis_vchiv: &RealAxisVChiV,
     print_level: usize,
+    eta: f64,
 ) -> f64 {
     let contour = contour_rayon_lowrank(
         omega, n, quasiparticle_energies_g, quasiparticle_energies_w, occ_size, vir_size,
-        num_state, ri_row_n, real_axis_vchiv, print_level,
+        num_state, ri_row_n, real_axis_vchiv, print_level, eta,
     );
     let imag = calculate_imag_from_rows(wc_rows, omega, quasiparticle_energies_g);
     if print_level > 2 {
@@ -2023,6 +2025,7 @@ pub fn newton_solver_lowrank_v2(
     max_iter: usize,
     side: f64,
     printlevel: usize,
+    eta: f64,
 ) -> f64 {
     let h = 0.000001;
     let delta = 0.02;
@@ -2031,7 +2034,7 @@ pub fn newton_solver_lowrank_v2(
     let qp_eq = |omega: f64| {
         quasiparticle_equation_lowrank_v2(
             omega, n, consts, ri_row_n, quasiparticle_energies_g, quasiparticle_energies_w,
-            occ_size, vir_size, num_state, wc_rows, real_axis_vchiv, 0,
+            occ_size, vir_size, num_state, wc_rows, real_axis_vchiv, 0, eta,
         )
     };
 
@@ -2099,10 +2102,10 @@ pub fn contour_rayon_lowrank(
     ri_row_n: &MatrixFull<f64>,
     real_axis_vchiv: &RealAxisVChiV,
     print_level: usize,
+    eta_pole: f64,
 ) -> f64 {
     let fermi_energy = (quasiparticle_energies_g[occ_size - 1] + quasiparticle_energies_g[occ_size]) / 2.0;
     let sign = if omega > fermi_energy { 1.0_f64 } else { -1.0_f64 };
-    let eta_pole = 1e-6_f64;   // MOLGW uses eta=1e-6 for pole protection
 
     if sign == 1.0 {
         // Empty state residue (omega > epsilon_F): sign is +1
@@ -2228,10 +2231,11 @@ pub fn quasiparticle_equation_lowrank(
     w_c_at_freqs: &Vec<(f64, f64, MatrixFull<f64>)>,
     real_axis_vchiv: &RealAxisVChiV,
     print_level: usize,
+    eta: f64,
 ) -> f64 {
     let contour = contour_rayon_lowrank(
         omega, n, quasiparticle_energies_g, quasiparticle_energies_w,
-        occ_size, vir_size, num_state, ri_row_n, real_axis_vchiv, print_level,
+        occ_size, vir_size, num_state, ri_row_n, real_axis_vchiv, print_level, eta,
     );
     let imag = calculate_imag(
         w_c_at_freqs, num_state, n, omega,
@@ -2262,6 +2266,7 @@ pub fn newton_solver_lowrank(
     max_iter: usize,
     side: f64,
     printlevel: usize,
+    eta: f64,
 ) -> f64 {
     let h = 0.000001;
     let delta = 0.02;
@@ -2271,7 +2276,7 @@ pub fn newton_solver_lowrank(
         quasiparticle_equation_lowrank(
             omega, n, consts, ri_row_n,
             quasiparticle_energies_g, quasiparticle_energies_w,
-            occ_size, vir_size, num_state, w_c_at_freqs, real_axis_vchiv, 0,
+            occ_size, vir_size, num_state, w_c_at_freqs, real_axis_vchiv, 0, eta,
         )
     };
 
@@ -2396,6 +2401,7 @@ pub fn gw_calculations_lowrank(
     // Check whether self-energy correction is enabled
     let use_fourier = qp_ctrl.fourier_self_energy;
     let use_hermite = qp_ctrl.hermite_self_energy;
+    let cdgw_eta = qp_ctrl.cdgw_eta;
 
     if use_fourier && use_hermite {
         panic!("Cannot enable both Fourier self-energy and Hermite self-energy simultaneously!");
@@ -2424,7 +2430,7 @@ pub fn gw_calculations_lowrank(
                     omega, n, consts, &ri_row_n,
                     &quasiparticle_energies_g, &quasiparticle_energies_w,
                     occ_size, vir_size, num_state,
-                    &wc_rows, &real_axis_vchiv, 0,
+                    &wc_rows, &real_axis_vchiv, 0, cdgw_eta,
                 )
             };
             let (_have_crossing, real_qp) =
@@ -2474,7 +2480,7 @@ pub fn gw_calculations_lowrank(
                         omega, n, consts, &ri_row_n,
                         &quasiparticle_energies_g, &quasiparticle_energies_w,
                         occ_size, vir_size, num_state,
-                        &wc_rows, &real_axis_vchiv, 0,
+                        &wc_rows, &real_axis_vchiv, 0, cdgw_eta,
                     ) + fourier_self_energy::fourier_series(
                         &sin_coeff, &cos_coeff, powers, t, omega - origin,
                     )
@@ -2521,7 +2527,7 @@ pub fn gw_calculations_lowrank(
                         omega, n, consts, &ri_row_n,
                         &quasiparticle_energies_g, &quasiparticle_energies_w,
                         occ_size, vir_size, num_state,
-                        &wc_rows, &real_axis_vchiv, 0,
+                        &wc_rows, &real_axis_vchiv, 0, cdgw_eta,
                     ) + fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff)
                 };
 
@@ -2613,6 +2619,7 @@ pub fn linearized_gw_lowrank(
     let h = qp_ctrl.gw_linearize_derivative_h;
     let use_fourier = qp_ctrl.fourier_self_energy;
     let use_hermite = qp_ctrl.hermite_self_energy;
+    let cdgw_eta = qp_ctrl.cdgw_eta;
 
     if use_fourier && use_hermite {
         panic!("Cannot enable both Fourier self-energy and Hermite self-energy simultaneously!");
@@ -2631,7 +2638,7 @@ pub fn linearized_gw_lowrank(
                     omega, n, 0.0, &ri_row_n,
                     &quasiparticle_energies_g, &quasiparticle_energies_w,
                     occ_size, vir_size, num_state,
-                    &wc_rows, &real_axis_vchiv, 0,
+                    &wc_rows, &real_axis_vchiv, 0, cdgw_eta,
                 )
             };
 
@@ -2640,7 +2647,7 @@ pub fn linearized_gw_lowrank(
                 omega_shifted, n,
                 &quasiparticle_energies_g, &quasiparticle_energies_w,
                 occ_size, vir_size, num_state,
-                &ri_row_n, &real_axis_vchiv, 0,
+                &ri_row_n, &real_axis_vchiv, 0, cdgw_eta,
             );
 
             let imag_plus_h = calculate_imag_from_rows(
@@ -2653,13 +2660,13 @@ pub fn linearized_gw_lowrank(
                 omega_shifted + h, n,
                 &quasiparticle_energies_g, &quasiparticle_energies_w,
                 occ_size, vir_size, num_state,
-                &ri_row_n, &real_axis_vchiv, 0,
+                &ri_row_n, &real_axis_vchiv, 0, cdgw_eta,
             );
             let contour_minus_h = contour_rayon_lowrank(
                 omega_shifted - h, n,
                 &quasiparticle_energies_g, &quasiparticle_energies_w,
                 occ_size, vir_size, num_state,
-                &ri_row_n, &real_axis_vchiv, 0,
+                &ri_row_n, &real_axis_vchiv, 0, cdgw_eta,
             );
 
             let self_energy_plus_h = contour_plus_h - imag_plus_h;
@@ -2713,7 +2720,7 @@ pub fn linearized_gw_lowrank(
                         omega, n,
                         &quasiparticle_energies_g, &quasiparticle_energies_w,
                         occ_size, vir_size, num_state,
-                        &ri_row_n, &real_axis_vchiv, 0,
+                        &ri_row_n, &real_axis_vchiv, 0, cdgw_eta,
                     );
                     let imag = calculate_imag_from_rows(&wc_rows, omega, &quasiparticle_energies_g);
                     let fse = fourier_self_energy::fourier_series(
@@ -2771,7 +2778,7 @@ pub fn linearized_gw_lowrank(
                         omega, n,
                         &quasiparticle_energies_g, &quasiparticle_energies_w,
                         occ_size, vir_size, num_state,
-                        &ri_row_n, &real_axis_vchiv, 0,
+                        &ri_row_n, &real_axis_vchiv, 0, cdgw_eta,
                     );
                     let imag = calculate_imag_from_rows(&wc_rows, omega, &quasiparticle_energies_g);
                     let hse = fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff);
