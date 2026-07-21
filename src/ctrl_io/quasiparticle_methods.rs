@@ -18,6 +18,7 @@ pub struct QuasiParticle {
     pub davidson_max_iter:usize,
     pub davidson_add_dimensions:usize,
     pub bse_tda:bool,
+    pub print_nto:bool,
     pub bse_spin:String,
     pub bse_cutoff_energy:f64,
     pub save_bse_terms:bool,
@@ -147,6 +148,7 @@ impl Default for QuasiParticle {
             davidson_add_dimensions:4,
             davidson_max_iter:20,
             bse_tda:false,
+            print_nto:false,
             bse_spin:String::from("none"),
             bse_cutoff_energy:1000000.0,
             save_bse_terms:false,
@@ -260,6 +262,7 @@ impl QuasiParticle {
         table.insert("homo_lumo_gw_qp".to_string(), toml::Value::Boolean(self.homo_lumo_gw_qp));
         table.insert("x_alpha".to_string(), toml::Value::Float(self.x_alpha));
         table.insert("save_qp".to_string(), toml::Value::Boolean(self.save_qp));
+        table.insert("print_nto".to_string(), toml::Value::Boolean(self.print_nto));
         table.insert("bse_davidson_solver".to_string(), toml::Value::Boolean(self.bse_davidson_solver));
         table.insert("davidson_target_excitations".to_string(), toml::Value::Integer(self.davidson_target_excitations as i64));
         table.insert("davidson_converge_threshold".to_string(), toml::Value::Float(self.davidson_converge_threshold));
@@ -384,6 +387,13 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.homo_lumo_gw_qp=match tmp_ctrl.get("homo_lumo_gw_qp").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
+            };
+            tmp_input.print_nto = match tmp_ctrl
+                .get("print_nto")
+                .unwrap_or(&serde_json::Value::Null)
+            {
+                serde_json::Value::Bool(value) => *value,
+                _ => tmp_input.print_nto,
             };
             tmp_input.x_alpha=match tmp_ctrl.get("x_alpha").unwrap_or(&serde_json::Value::Null){
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(2.0_f64)},
