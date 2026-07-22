@@ -572,16 +572,21 @@ pub fn v_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
             start_mo + n_start..start_mo + n_end,
             start_mo..num_state,
         );
+        // rifull_to_matfull_i_jk() flattens the RIFull [naux, block_n, nmo]
+        // (column-major: naux fastest) into a MatrixFull [naux, block_n*nmo]
+        // (column-major: naux fastest). Therefore the flattened column index is
+        //   col = local_n + local_m * block_n
+        // (local_m runs in the OUTER/slow strided direction). Using the wrong
+        // stride (nmo instead of block_n) silently corrupts V whenever
+        // block_n != nmo, i.e. whenever the row range is blocked.
         let ri_block = ri_block_vec[0].0.rifull_to_matfull_i_jk();
         let naux = ri_block.size[0];
         let block_n = n_end - n_start;
-        // ri_block has shape [naux, block_n * nmo]
-        // column (local_n * nmo + local_m) = ri3mo[:, start_mo+local_n, start_mo+local_m]
         for local_n in 0..block_n {
             for local_m in 0..nmo {
                 let global_n = n_start + local_n;
                 let global_m = local_m;
-                let col = local_n * nmo + local_m;
+                let col = local_n + local_m * block_n;
                 let start = col * naux;
                 let sum: f64 = ri_block.data[start..start + naux].iter().map(|x| x * x).sum();
                 v_matrix[[global_n, global_m]] = sum;
