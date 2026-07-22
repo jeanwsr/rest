@@ -146,7 +146,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         if let SCFType::ROHF = scf_data.scftype {
             scf_data.semi_diagonalize_hamiltonian();
         }
-        let block_size = scf_data.mol.ctrl.ri_pt2.stream_block_size.unwrap_or(0);
+        let block_size = scf_data.mol.ctrl.ri_pt2.stream_block_size;
         timerecords.count_start("ao2mo");
         // (ao2mo is interleaved with PT2 contraction inside the streaming drivers;
         // we keep the timer label for parity with the legacy driver.)
@@ -1848,7 +1848,7 @@ fn pt2_pair_contrib_closed(
 ///
 /// Memory: block_i + block_j + pre-fetch-in-progress ≤ 3 × [naux, nvir, B].
 /// For B=64, naux=7619, nvir=1517: 3 × 5.9 GB ≈ 18 GB.
-pub fn close_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: usize) -> anyhow::Result<[f64;3]> {
+pub fn close_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>) -> anyhow::Result<[f64;3]> {
     let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
     let print_level = scf_data.mol.ctrl.print_level;
 
@@ -1875,7 +1875,7 @@ pub fn close_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: usize) -> any
     let nocc = occ_range.len();
     let num_auxbas = scf_data.mol.num_auxbas;
 
-    let b = resolve_block_size(Some(block_size), nocc);
+    let b = resolve_block_size(block_size, nocc);
     if print_level > 1 {
         println!("[streaming-PT2] close_shell: nocc={}, nvir={}, naux={}, block_size={}",
                  nocc, vir_range.len(), num_auxbas, b);
@@ -2228,7 +2228,7 @@ fn open_shell_pt2_streaming_block_pair(
 ///
 /// Loops over the three spin-pair types (αα, αβ, ββ). For each, runs the
 /// closed-shell-style block streaming over occ blocks of the two spin channels.
-pub fn open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: usize) -> anyhow::Result<[f64;3]> {
+pub fn open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>) -> anyhow::Result<[f64;3]> {
     let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
     let print_level = scf_data.mol.ctrl.print_level;
 
@@ -2266,8 +2266,8 @@ pub fn open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: usize) -> anyh
         let nocc_2 = occ_range_2.len();
         if nocc_1 == 0 || nocc_2 == 0 { continue; }
 
-        let b1 = resolve_block_size(Some(block_size), nocc_1);
-        let b2 = resolve_block_size(Some(block_size), nocc_2);
+        let b1 = resolve_block_size(block_size, nocc_1);
+        let b2 = resolve_block_size(block_size, nocc_2);
         if print_level > 1 {
             println!("[streaming-PT2] open_shell spin-pair ({}, {}): nocc=({}, {}), block_size=({}, {})",
                      i_spin_1, i_spin_2, nocc_1, nocc_2, b1, b2);
@@ -2334,7 +2334,7 @@ pub fn open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: usize) -> anyh
 /// different occupation/eigenvalue vectors. The single-excitation correction
 /// (CIS-like contribution from singly-occupied orbitals) is computed using
 /// the same logic as `restricted_open_shell_pt2_rayon`.
-pub fn restricted_open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: usize) -> anyhow::Result<[f64;3]> {
+pub fn restricted_open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>) -> anyhow::Result<[f64;3]> {
     let print_level = scf_data.mol.ctrl.print_level;
 
     // Single-excitation contribution (no ao2mo or rimatr needed; uses semi Fock).
@@ -2401,8 +2401,8 @@ pub fn restricted_open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: usi
         let nocc_2 = occ_range_2.len();
         if nocc_1 == 0 || nocc_2 == 0 { continue; }
 
-        let b1 = resolve_block_size(Some(block_size), nocc_1);
-        let b2 = resolve_block_size(Some(block_size), nocc_2);
+        let b1 = resolve_block_size(block_size, nocc_1);
+        let b2 = resolve_block_size(block_size, nocc_2);
         if print_level > 1 {
             println!("[streaming-PT2] ROHF spin-pair ({}, {}): nocc=({}, {}), block_size=({}, {})",
                      i_spin_1, i_spin_2, nocc_1, nocc_2, b1, b2);
