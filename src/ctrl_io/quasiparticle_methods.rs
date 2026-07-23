@@ -78,6 +78,22 @@ pub struct QuasiParticle {
     /// Lorentzian broadening (Ha) for CD-GW real-axis contour deformation.
     /// Default 0.0 (no broadening, backward compatible). 0.01 recommended for stability.
     pub cdgw_eta: f64,
+    /// Numerical tolerance (Ha) for residue pole detection in CD-GW:
+    /// - de > -tol  → include the residue pole
+    /// - |de| < tol → pole lies on the contour, apply half-weight (×0.5)
+    /// - de_max scan: only collect de > tol
+    /// Must be a small numerical tolerance (∼1e-3), NOT a physics broadening.
+    /// Default 0.001 (matching MolGW). Separated from cdgw_eta to prevent
+    /// large broadening from incorrectly halving off-contour residues.
+    pub cdgw_res_tol: f64,
+    /// Number of states below/above HOMO-LUMO for the self-energy evaluation
+    /// and for the real-axis de_max scan. States far from the gap (e.g. core states)
+    /// contribute negligibly to the real-axis residues and inflate de_max, making
+    /// the low-rank grid excessively sparse. Restricting this range to ~20-50
+    /// around HOMO gives a much finer de_max grid that captures the pole structure
+    /// properly — exactly as MolGW does with selfenergy_state_range.
+    /// Default 100000 (essentially all states, backward compatible).
+    pub selfenergy_state_range: usize,
     // response BSE grid sampling parameters
     pub response_bse_x_start: f64,
     pub response_bse_x_end: f64,
@@ -204,6 +220,8 @@ impl Default for QuasiParticle {
             qsgw_mix_param: 0.5,
             qsgw_eta: 0.001,
             cdgw_eta: 0.001,
+            cdgw_res_tol: 0.001,
+            selfenergy_state_range: 100000,
             // response BSE grid sampling parameters (default: 2 points per dimension)
             response_bse_x_start: 0.0,
             response_bse_x_end: 1.0,
@@ -327,6 +345,8 @@ impl QuasiParticle {
         table.insert("qsgw_mix_param".to_string(), toml::Value::Float(self.qsgw_mix_param));
         table.insert("qsgw_eta".to_string(), toml::Value::Float(self.qsgw_eta));
         table.insert("cdgw_eta".to_string(), toml::Value::Float(self.cdgw_eta));
+        table.insert("cdgw_res_tol".to_string(), toml::Value::Float(self.cdgw_res_tol));
+        table.insert("selfenergy_state_range".to_string(), toml::Value::Integer(self.selfenergy_state_range as i64));
         table.insert("response_bse_x_start".to_string(), toml::Value::Float(self.response_bse_x_start));
         table.insert("response_bse_x_end".to_string(), toml::Value::Float(self.response_bse_x_end));
         table.insert("response_bse_x_points".to_string(), toml::Value::Integer(self.response_bse_x_points as i64));
@@ -623,6 +643,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.05)},
                 _ => {0.05},
             };
+            tmp_input.selfenergy_state_range = match tmp_ctrl.get("selfenergy_state_range").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(100000) as usize},
+                _ => {100000},
+            };
             tmp_input.parse_qp_path = match tmp_ctrl.get("parse_qp_path").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::from("./qp_energies"),
@@ -691,6 +715,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.cdgw_eta = match tmp_ctrl.get("cdgw_eta").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
                 _ => 0.0,
+            };
+            tmp_input.cdgw_res_tol = match tmp_ctrl.get("cdgw_res_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),
+                _ => 0.001,
             };
             // Parse response BSE grid sampling parameters
             tmp_input.response_bse_x_start = match tmp_ctrl.get("response_bse_x_start").unwrap_or(&serde_json::Value::Null) {

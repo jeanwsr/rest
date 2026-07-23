@@ -166,6 +166,7 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,0);
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
     let cdgw_eta = qp_ctrl.cdgw_eta;
+    let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
 
     // 检查是否启用自能校正
     let use_fourier = qp_ctrl.fourier_self_energy;
@@ -191,7 +192,7 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
         let mut have_crossing=true;
         let ri_row_n=compute_ri3mo_row(scf_data,n);
         let qp_eq_func=|omega: f64|{
-            quasiparticle_equation(omega,n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,cdgw_eta)
+            quasiparticle_equation(omega,n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,cdgw_res_tol,cdgw_eta)
         };
         (have_crossing,real_qp)=linear_interpolation_solver(qp_eq_func,scf_data.eigenvalues[0][n],side,21,0.1);
         println!("for n={}, first round (no self-energy correction): qp energy={}",n,real_qp);
@@ -227,7 +228,7 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
 
             let ri_row_n=compute_ri3mo_row(scf_data,n);
             let qp_eq_func_with_fse=|omega: f64|{
-                quasiparticle_equation(omega,n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,cdgw_eta)
+                quasiparticle_equation(omega,n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,cdgw_res_tol,cdgw_eta)
                     + fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin)
             };
 
@@ -253,7 +254,7 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
 
             let ri_row_n=compute_ri3mo_row(scf_data,n);
             let qp_eq_func_with_hse=|omega: f64|{
-                quasiparticle_equation(omega,n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,cdgw_eta)
+                quasiparticle_equation(omega,n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,cdgw_res_tol,cdgw_eta)
                     + fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff)
             };
 
@@ -769,7 +770,7 @@ pub fn w_c_matrix(inverse_dielectric:&MatrixFull<f64>,num_state:usize,ri_full:&M
     }
     w_c
 }
-pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,num_state:usize,ri_ov:&MatrixFull<f64>,ri_row_n:&MatrixFull<f64>,eta:f64)->f64{
+pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,num_state:usize,ri_ov:&MatrixFull<f64>,ri_row_n:&MatrixFull<f64>,res_tol:f64,eta:f64)->f64{
     let fermi_energy=(quasiparticle_energies_g[occ_size-1]+quasiparticle_energies_g[occ_size])/2.0;
     let sign=if omega>fermi_energy{1}else{-1};
     let num_auxbas=ri_ov.size[0];
@@ -777,8 +778,8 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
         (0..vir_size).into_par_iter().map(|a|{
             let mut residue=0.0;
             let de=omega-quasiparticle_energies_g[occ_size+a];
-            if de>-eta{
-                let pole_factor=if de.abs()<eta{0.5}else{1.0};
+            if de>-res_tol{
+                let pole_factor=if de.abs()<res_tol{0.5}else{1.0};
                 let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,de,'C',eta);
                 let inverse_dielectric=inverse_dielectric_matrix(response,'C');
                 let vec:Vec<f64>=ri_row_n.iter_column(occ_size+a).copied().collect::<Vec<f64>>();
@@ -793,8 +794,8 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
         (0..occ_size).into_par_iter().map(|i|{
             let mut residue=0.0;
             let de=quasiparticle_energies_g[i]-omega;
-            if de>-eta{
-                let pole_factor=if de.abs()<eta{0.5}else{1.0};
+            if de>-res_tol{
+                let pole_factor=if de.abs()<res_tol{0.5}else{1.0};
                 let response=response_matrix(quasiparticle_energies_w,occ_size,vir_size,ri_ov,de,'C',eta);
                 let inverse_dielectric=inverse_dielectric_matrix(response,'C');
                 let vec:Vec<f64>=ri_row_n.iter_column(i).copied().collect::<Vec<f64>>();
@@ -913,8 +914,8 @@ pub fn linear_interpolation_solver<F>(mut f:F,starting_point:f64,side:f64,grid_f
     }
     (have_crossing,answer)
 }
-pub fn quasiparticle_equation(omega:f64,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_row_n:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,num_state:usize,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,eta:f64)->f64{
-    let contour=contour_rayon(omega,n,quasiparticle_energies_g,quasiparticle_energies_w,occ_size,vir_size,num_state,ri_ov,ri_row_n,eta);
+pub fn quasiparticle_equation(omega:f64,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_row_n:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,num_state:usize,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,res_tol:f64,eta:f64)->f64{
+    let contour=contour_rayon(omega,n,quasiparticle_energies_g,quasiparticle_energies_w,occ_size,vir_size,num_state,ri_ov,ri_row_n,res_tol,eta);
     let imag=calculate_imag(&w_c_at_freqs,num_state,n,omega,quasiparticle_energies_g,quasiparticle_energies_w);
     //println!("quasiparticle equation residue now:={}",consts+contour-imag-omega);
     consts+contour-imag-omega
@@ -939,7 +940,7 @@ pub fn spectrum_test(scf_data:&SCF,num_freq:usize){
         let ri_row_n=compute_ri3mo_row(scf_data,n);
         (0..steps+1).into_par_iter().for_each(|w|{
             let freq=start_freq+(w as f64)*step;
-            let contour=contour_rayon(freq,n,&quasiparticle_energies,&quasiparticle_energies,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,0.0);
+            let contour=contour_rayon(freq,n,&quasiparticle_energies,&quasiparticle_energies,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,0.0,0.0);
             let imag=calculate_imag(&w_c_at_freqs,num_state,n,freq,&quasiparticle_energies,&quasiparticle_energies);
             let sigma=contour-imag;
             println!("{},{}",freq,sigma);
@@ -1002,16 +1003,17 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
 
     // 第一轮：正常线性化GW计算（不添加自能校正）
     let cdgw_eta = qp_ctrl.cdgw_eta;
+    let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
     let mut save_energies_no_se:Vec<f64>=vec![0.0;num_state];
     save_energies_no_se=(0..num_state_qp_range).map(|n|{
         let side=if n>=occ_size{1.0}else{-1.0};
         let omega_shifted=scf_data.eigenvalues[0][n]-delta*side;
         let ri_row_n=compute_ri3mo_row(scf_data,n);
-        let contour=contour_rayon(omega_shifted,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,cdgw_eta);
+        let contour=contour_rayon(omega_shifted,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,cdgw_res_tol,cdgw_eta);
         let imag_n=calculate_imag(&w_c_at_freqs,num_state,n,omega_shifted,&quasiparticle_energies_g,&quasiparticle_energies_w);
 
-        let contour_plus_h=contour_rayon(omega_shifted+h,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,cdgw_eta);
-        let contour_minus_h=contour_rayon(omega_shifted-h,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,cdgw_eta);
+        let contour_plus_h=contour_rayon(omega_shifted+h,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,cdgw_res_tol,cdgw_eta);
+        let contour_minus_h=contour_rayon(omega_shifted-h,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,cdgw_res_tol,cdgw_eta);
         let imag_plus_h=calculate_imag(&w_c_at_freqs,num_state,n,omega_shifted+h,&quasiparticle_energies_g,&quasiparticle_energies_w);
         let imag_minus_h=calculate_imag(&w_c_at_freqs,num_state,n,omega_shifted-h,&quasiparticle_energies_g,&quasiparticle_energies_w);
         let self_energy_plus_h=contour_plus_h-imag_plus_h;
@@ -1055,7 +1057,7 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
 
             // 计算带FSE的自能及其导数
             let sigma_with_fse = |omega: f64| -> f64 {
-                let contour=contour_rayon(omega,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,cdgw_eta);
+                let contour=contour_rayon(omega,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,cdgw_res_tol,cdgw_eta);
                 let imag=calculate_imag(&w_c_at_freqs,num_state,n,omega,&quasiparticle_energies_g,&quasiparticle_energies_w);
                 let fse=fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin);
                 contour - imag + fse
@@ -1094,7 +1096,7 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
 
             // 计算带HSE的自能及其导数
             let sigma_with_hse = |omega: f64| -> f64 {
-                let contour=contour_rayon(omega,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,cdgw_eta);
+                let contour=contour_rayon(omega,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,cdgw_res_tol,cdgw_eta);
                 let imag=calculate_imag(&w_c_at_freqs,num_state,n,omega,&quasiparticle_energies_g,&quasiparticle_energies_w);
                 let hse=fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff);
                 contour - imag + hse
@@ -1235,6 +1237,7 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
 
     let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
     let cdgw_eta = qp_ctrl.cdgw_eta;
+    let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
     let n=homo;
     let mut exchange=0.0;
     for i in 0..homo+1{
@@ -1247,7 +1250,7 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     let side=if n>=occ_size{1.0}else{-1.0};
     let printlevel=scf_data.mol.ctrl.print_level;
     let ri_row_n=compute_ri3mo_row(scf_data,n);
-    let homo_qp=newton_solver(|om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf| quasiparticle_equation(om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf,cdgw_eta),n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],0.00001,50,side,printlevel);
+    let homo_qp=newton_solver(|om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf| quasiparticle_equation(om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf,cdgw_res_tol,cdgw_eta),n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],0.00001,50,side,printlevel);
     //println!("for n={}, quasiparticle equation yields:qp energy={}",n,homo_qp);
     let save_path=qp_ctrl.save_qp_path.clone();
     println!("The QP energy of HOMO obtained by GWA is {}",homo_qp);
@@ -1263,7 +1266,7 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     let side=if n>=occ_size{1.0}else{-1.0};
     let printlevel=scf_data.mol.ctrl.print_level;
     let ri_row_n=compute_ri3mo_row(scf_data,n);
-    let lumo_qp=newton_solver(|om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf| quasiparticle_equation(om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf,cdgw_eta),n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],0.00001,50,side,printlevel);
+    let lumo_qp=newton_solver(|om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf| quasiparticle_equation(om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf,cdgw_res_tol,cdgw_eta),n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],0.00001,50,side,printlevel);
     let save_path=qp_ctrl.save_qp_path.clone();
     if qp_ctrl.save_gw_homo_lumo_qp==true{
         let mut file = OpenOptions::new().append(true).create(true).open(save_path);
@@ -1347,9 +1350,8 @@ fn get_homo_lumo_qp_only_lowrank(
         qp_ctrl.omega_chi_max,
         pl,
         qp_ctrl.cdgw_eta,
+        qp_ctrl.cdgw_res_tol,
     );
-
-    // HOMO
     let n = homo;
     let mut exchange = 0.0;
     for i in 0..homo + 1 {
@@ -1641,7 +1643,8 @@ pub fn generate_real_axis_vchiv(
     grid_type: usize,
     omega_chi_max: f64,            // 0.0 = auto (use de_max)
     print_level: usize,
-    eta: f64,                      // Lorentzian broadening for real-axis response (0.0 = no broadening)
+    eta: f64,                      // Lorentzian broadening for real-axis chi0
+    res_tol: f64,                  // numerical tolerance for de_max scan (de > res_tol)
 ) -> RealAxisVChiV {
     if print_level > 2 {
         println!("[DEBUG generate_real_axis_vchiv] === Real-axis frequency grid setup ===");
@@ -1666,7 +1669,7 @@ pub fn generate_real_axis_vchiv(
             // Occupied state poles: eps_p > omega, de = eps_p - omega
             for p in 0..occ_size {
                 let de = quasiparticle_energies_g[p] - omega;
-                if de > eta {
+                if de > res_tol {
                     de_max = de_max.max(de);
                     state_de_max = state_de_max.max(de);
                 }
@@ -1675,7 +1678,7 @@ pub fn generate_real_axis_vchiv(
             // Empty state poles: omega > eps_a, de = omega - eps_a
             for a in occ_size..num_state {
                 let de = omega - quasiparticle_energies_g[a];
-                if de > eta {
+                if de > res_tol {
                     de_max = de_max.max(de);
                     state_de_max = state_de_max.max(de);
                 }
@@ -2106,7 +2109,7 @@ pub fn contour_rayon_lowrank(
     ri_row_n: &MatrixFull<f64>,
     real_axis_vchiv: &RealAxisVChiV,
     print_level: usize,
-    eta_pole: f64,
+    res_tol: f64,
 ) -> f64 {
     let fermi_energy = (quasiparticle_energies_g[occ_size - 1] + quasiparticle_energies_g[occ_size]) / 2.0;
     let sign = if omega > fermi_energy { 1.0_f64 } else { -1.0_f64 };
@@ -2119,10 +2122,10 @@ pub fn contour_rayon_lowrank(
             let a_global = occ_size + a;
             let mut residue = 0.0_f64;
             let de = omega - quasiparticle_energies_g[a_global];
-            if de >= -eta_pole {
+            if de >= -res_tol {
                 let lr = interpolate_vchiv_nearest(real_axis_vchiv, de);
                 let ri_vec: Vec<f64> = ri_row_n.iter_column(a_global).copied().collect();
-                let pole_factor = if de.abs() < eta_pole { 0.5 } else { 1.0 };
+                let pole_factor = if de.abs() < res_tol { 0.5 } else { 1.0 };
                 residue = compute_single_residue_lowrank(lr, &ri_vec) * pole_factor;
                 if print_level > 2 {
                     println!("[DEBUG individual residue] virtual a={} eps_a={:.6} de={:.6}  factor={:.2}  residue_contrib={:.10}",
@@ -2202,10 +2205,10 @@ pub fn contour_rayon_lowrank(
         (0..occ_size).into_par_iter().map(|i| {
             let mut residue = 0.0_f64;
             let de = quasiparticle_energies_g[i] - omega;
-            if de >= -eta_pole {
+            if de >= -res_tol {
                 let lr = interpolate_vchiv_nearest(real_axis_vchiv, de);
                 let ri_vec: Vec<f64> = ri_row_n.iter_column(i).copied().collect();
-                let pole_factor = if de.abs() < eta_pole { 0.5 } else { 1.0 };
+                let pole_factor = if de.abs() < res_tol { 0.5 } else { 1.0 };
                 residue = compute_single_residue_lowrank(lr, &ri_vec) * pole_factor;
                 if print_level > 2 {
                     println!("[DEBUG individual residue] occupied i={} eps_i={:.6} de={:.6}  factor={:.2}  residue_contrib={:.10}",
@@ -2377,8 +2380,20 @@ pub fn gw_calculations_lowrank(
 
     // Step B: Precompute low-rank sqrt(v)*chi*sqrt(v) on real axis
     println!("Low-rank contour: Precomputing real-axis sqrt(v)*chi*sqrt(v)...");
-    let nsemin = 0;
-    let nsemax = num_state_cutoff - 1;
+
+    // MOLGW-style state range for the de_max scan:
+    //   nsemin = max(0, HOMO - selfenergy_state_range)
+    //   nsemax = min(N-1, HOMO + selfenergy_state_range)
+    // This limits the de_max scan to states near HOMO/LUMO, preventing
+    // deep core states from inflating de_max to the full energy span.
+    // The QP evaluation below still covers all states (0..num_state_cutoff)
+    // — residues far outside the grid are safely clamped to the boundary.
+    let nsemin_demax = (occ_size.saturating_sub(1))
+        .saturating_sub(qp_ctrl.selfenergy_state_range)
+        .max(0);
+    let nsemax_demax = (occ_size + qp_ctrl.selfenergy_state_range)
+        .min(num_state_cutoff.saturating_sub(1));
+
     let nomega_sigma = qp_ctrl.nomega_sigma;
     let step_sigma = qp_ctrl.step_sigma;
     let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
@@ -2391,8 +2406,8 @@ pub fn gw_calculations_lowrank(
         num_state,
         &ri_ov,
         nomega_chi_real,
-        nsemin,
-        nsemax,
+        nsemin_demax,
+        nsemax_demax,
         nomega_sigma,
         step_sigma,
         low_rank_tolerance,
@@ -2400,6 +2415,7 @@ pub fn gw_calculations_lowrank(
         qp_ctrl.omega_chi_max,
         pl,
         qp_ctrl.cdgw_eta,
+        qp_ctrl.cdgw_res_tol,
     );
 
     // Check whether self-energy correction is enabled
@@ -2595,8 +2611,12 @@ pub fn linearized_gw_lowrank(
     );
 
     // Precompute low-rank on real axis
-    let nsemin = 0;
-    let nsemax = num_state_qp_range - 1;
+    let nsemin_demax = (occ_size.saturating_sub(1))
+        .saturating_sub(qp_ctrl.selfenergy_state_range)
+        .max(0);
+    let nsemax_demax = (occ_size + qp_ctrl.selfenergy_state_range)
+        .min(num_state_qp_range.saturating_sub(1));
+
     let nomega_sigma = qp_ctrl.nomega_sigma;
     let step_sigma = qp_ctrl.step_sigma;
     let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
@@ -2609,8 +2629,8 @@ pub fn linearized_gw_lowrank(
         num_state,
         &ri_ov,
         nomega_chi_real,
-        nsemin,
-        nsemax,
+        nsemin_demax,
+        nsemax_demax,
         nomega_sigma,
         step_sigma,
         low_rank_tolerance,
@@ -2618,6 +2638,7 @@ pub fn linearized_gw_lowrank(
         qp_ctrl.omega_chi_max,
         pl,
         qp_ctrl.cdgw_eta,
+        qp_ctrl.cdgw_res_tol,
     );
 
     let h = qp_ctrl.gw_linearize_derivative_h;

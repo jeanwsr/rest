@@ -78,10 +78,11 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
     //println!("Static Self Energy(Correlation part) Sigma_c(omega=0)={}(imag={},contour={})",contour-imag,imag,contour);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let cdgw_eta = qp_ctrl.cdgw_eta;
+    let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
     //let self_energy_static=ri_gw::contour_rayon(scf_data.eigenvalues[0][n],n,&gwqp_g, &gwqp_w, occ_size, vir_size, num_state,ri_ov,ri_row_n)-ri_gw::calculate_imag(w_c_at_freqs,num_state,n,scf_data.eigenvalues[0][n],&gwqp_g, &gwqp_w);
     // 第一轮：正常GW计算（不添加Fourier自能）
     let qp_eq_func_no_fse = |omega: f64| {
-        ri_gw::quasiparticle_equation(omega, n, consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs, cdgw_eta)
+        ri_gw::quasiparticle_equation(omega, n, consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs, cdgw_res_tol, cdgw_eta)
     };
     //println!("Static Approximation Yields:{},Sigma_c[E_KS]={},consts={},E_ks={}",qp_eq_func_no_fse(scf_data.eigenvalues[0][n])+scf_data.eigenvalues[0][n],self_energy_static,consts,scf_data.eigenvalues[0][n]);
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
@@ -94,7 +95,7 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
     } else if rootfinder == "newton".to_string() {
         println!("Orbital #{} (first round, no Fourier self-energy):", n);
         qp_energy_no_fse = ri_gw::newton_solver(
-            |om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf| ri_gw::quasiparticle_equation(om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf, cdgw_eta),
+            |om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf| ri_gw::quasiparticle_equation(om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf, cdgw_res_tol, cdgw_eta),
             n, consts, ri_ov, ri_row_n,
             &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
             e_ks_n, 0.00001, 50, side, scf_data.mol.ctrl.print_level
@@ -108,7 +109,7 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
         if !have_crossing {
             println!("No graphical crossings found for n={}, using Newton solver instead.", n);
             qp_energy = ri_gw::newton_solver(
-                |om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf| ri_gw::quasiparticle_equation(om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf, cdgw_eta),
+                |om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf| ri_gw::quasiparticle_equation(om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf, cdgw_res_tol, cdgw_eta),
                 n, consts, ri_ov, ri_row_n,
                 &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
                 e_ks_n, 0.00001, 50, side, scf_data.mol.ctrl.print_level
@@ -116,7 +117,7 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
         }
         qp_energy_no_fse = qp_energy;
         println!("First round QP energy (no FSE): {}", qp_energy_no_fse);
-        let self_energy_final=ri_gw::contour_rayon(qp_energy_no_fse,n,&gwqp_g, &gwqp_w, occ_size, vir_size, num_state,ri_ov,ri_row_n,cdgw_eta)-ri_gw::calculate_imag(w_c_at_freqs,num_state,n,qp_energy_no_fse,&gwqp_g, &gwqp_w);
+        let self_energy_final=ri_gw::contour_rayon(qp_energy_no_fse,n,&gwqp_g, &gwqp_w, occ_size, vir_size, num_state,ri_ov,ri_row_n,cdgw_res_tol,cdgw_eta)-ri_gw::calculate_imag(w_c_at_freqs,num_state,n,qp_energy_no_fse,&gwqp_g, &gwqp_w);
         println!("Sigma_c[E_QP]={}",self_energy_final);
     } else {
         panic!("Invalid choice of GW rootfinder!");
@@ -152,7 +153,7 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
                  origin, powers, t, sin_coeff, cos_coeff);
 
         let qp_eq_func_with_se = |omega: f64| {
-            ri_gw::quasiparticle_equation(omega, n, consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs, cdgw_eta)
+            ri_gw::quasiparticle_equation(omega, n, consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs, cdgw_res_tol, cdgw_eta)
                 + ri_gw::fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin)
         };
 
@@ -168,7 +169,7 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
                  origin, hermite_coeff.len(), hermite_coeff);
 
         let qp_eq_func_with_se = |omega: f64| {
-            ri_gw::quasiparticle_equation(omega, n, consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs, cdgw_eta)
+            ri_gw::quasiparticle_equation(omega, n, consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs, cdgw_res_tol, cdgw_eta)
                 + ri_gw::fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff)
         };
 
@@ -307,15 +308,18 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,t
         let gwqp_g = scf_data.gwqp.0.clone();
         let gwqp_w = scf_data.gwqp.1.clone();
         let (start_mo_2,num_state_2,occ_size_2,vir_size_2,homo_2,lumo_2)=ri_gw::get_occupation_parameters(&scf_data,'Y');
-        let nsemin = 0;
-        let nsemax = num_state_2 - 1;
+        let nsemin_demax = (occ_size_2.saturating_sub(1))
+            .saturating_sub(qp_ctrl.selfenergy_state_range)
+            .max(0);
+        let nsemax_demax = (occ_size_2 + qp_ctrl.selfenergy_state_range)
+            .min(num_state_2.saturating_sub(1));
         let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
         let pl = scf_data.mol.ctrl.print_level;
         Some(ri_gw::generate_real_axis_vchiv(
             &gwqp_g, &gwqp_w, occ_size_2, vir_size_2, num_state_2,
             &ri_ov,
             qp_ctrl.nomega_chi_real,
-            nsemin, nsemax,
+            nsemin_demax, nsemax_demax,
             qp_ctrl.nomega_sigma,
             qp_ctrl.step_sigma,
             qp_ctrl.low_rank_tolerance,
@@ -323,6 +327,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,t
             qp_ctrl.omega_chi_max,
             pl,
             qp_ctrl.cdgw_eta,
+            qp_ctrl.cdgw_res_tol,
         ))
     } else {
         None
