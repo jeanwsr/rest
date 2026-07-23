@@ -94,6 +94,14 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     let xc_energy_xdh = scf_data.evaluate_xc_energy(1, mpi_operator);
     scf_data.energies.insert(String::from("x_hf"), vec![x_energy]);
     timerecords.count("xc_energy");
+
+    // Free DFT grid data before entering PT2/post-SCF correlation.
+    // The grids (ao, aop, compressed variants) can consume 40-100+ GB for
+    // large systems and are never needed again after XC energy evaluation.
+    // Releasing them here reduces peak memory and eases memory subsystem
+    // pressure during PT2 contraction.
+    scf_data.grids = None;
+
     let dfa_family_pos = scf_data.mol.xc_data.dfa_family_pos.clone().unwrap();
 
     let use_new_driver = scf_data.mol.ctrl.ri_pt2.new_driver
