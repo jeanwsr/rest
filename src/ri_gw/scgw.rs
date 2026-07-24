@@ -40,7 +40,7 @@ pub fn g0w0(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool
     }else if gw_scheme=="x alpha"{
         ri_gw::x_alpha_gw(scf_data)
     }else if gw_scheme=="extrapolated"{
-        gw_near_fermi_surface(scf_data,20,&vxc_nn,qp_ctrl.threshold)
+        gw_near_fermi_surface(scf_data,20,&vxc_nn,qp_ctrl.gw_extrapolate_occ_threshold,qp_ctrl.gw_extrapolate_vir_threshold)
     }
     else if gw_scheme=="no gw"{
         Vec::new()
@@ -261,7 +261,7 @@ where
     }
 }
 
-pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,threshold:f64)->Vec<f64>{
+pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,occ_threshold:f64,vir_threshold:f64)->Vec<f64>{
     let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
     println!("RI-OV Shape={:?}",ri_ov.size);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
@@ -335,7 +335,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,t
 
     let e_homo=ks_energies[occ_size-1];
     let e_lumo=ks_energies[occ_size];
-    let calc_orbs_indices:Vec<usize>=ks_energies.into_iter().enumerate().filter(|(n,e_n)|*e_n>e_homo-threshold && *e_n<e_lumo+threshold).map(|(n,e_n)|n).collect();
+    let calc_orbs_indices:Vec<usize>=ks_energies.into_iter().enumerate().filter(|(n,e_n)|*e_n>e_homo-occ_threshold && *e_n<e_lumo+vir_threshold).map(|(n,e_n)|n).collect();
     println!("calculated orbital indices:{:?}",calc_orbs_indices);
     let calc_orbs:Vec<(usize,f64)>=calc_orbs_indices.iter().map(|&n|{
         let ri_row_n=ri_gw::compute_ri3mo_row(scf_data,n);
@@ -369,7 +369,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,t
         gwqp.push(scf_data.eigenvalues[0][i]+vir_shift)
     }
     //println!("extrapolated GW Results:{:#?}",gwqp);
-    ri_gw::display::extrapolation_quasiparticles(&gwqp,occ_size,&calc_orbs_indices,threshold);
+    ri_gw::display::extrapolation_quasiparticles(&gwqp,occ_size,&calc_orbs_indices,occ_threshold,vir_threshold);
     scf_data.gwqp=(gwqp.clone(),gwqp.clone());
     return gwqp
 }

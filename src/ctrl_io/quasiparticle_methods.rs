@@ -48,7 +48,8 @@ pub struct QuasiParticle {
     pub hermite_coeff_path:String,
     pub parse_qp_path:String,
     pub bse_qp_polarization:bool,
-    pub threshold:f64,
+    pub gw_extrapolate_occ_threshold:f64,
+    pub gw_extrapolate_vir_threshold:f64,
     pub external_field_freq:f64,
     pub lifetime_gamma:f64,
     pub gw_or_bse:String,
@@ -192,7 +193,8 @@ impl Default for QuasiParticle {
             hermite_self_energy:false,
             hermite_coeff_path:String::from("./hermite_coeff.txt"),
             bse_qp_polarization:false,
-            threshold:0.1,
+            gw_extrapolate_occ_threshold:0.1,
+            gw_extrapolate_vir_threshold:0.1,
             gw_or_bse:String::new(),
             gw_span_energy:0.2,
             bse_exchange_rescaling:1.0,
@@ -315,7 +317,8 @@ impl QuasiParticle {
         table.insert("hermite_coeff_path".to_string(), toml::Value::String(self.hermite_coeff_path.clone()));
         table.insert("parse_qp_path".to_string(), toml::Value::String(self.parse_qp_path.clone()));
         table.insert("bse_qp_polarization".to_string(), toml::Value::Boolean(self.bse_qp_polarization));
-        table.insert("threshold".to_string(), toml::Value::Float(self.threshold));
+        table.insert("gw_extrapolate_occ_threshold".to_string(), toml::Value::Float(self.gw_extrapolate_occ_threshold));
+        table.insert("gw_extrapolate_vir_threshold".to_string(), toml::Value::Float(self.gw_extrapolate_vir_threshold));
         table.insert("gw_span_energy".to_string(), toml::Value::Float(self.gw_span_energy));
         table.insert("external_field_freq".to_string(), toml::Value::Float(self.external_field_freq));
         table.insert("lifetime_gamma".to_string(), toml::Value::Float(self.lifetime_gamma));
@@ -524,7 +527,11 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-10_f64)},
                 other => {1e-10},
             };
-            tmp_input.threshold= match tmp_ctrl.get("threshold").unwrap_or(&serde_json::Value::Null) {
+            tmp_input.gw_extrapolate_occ_threshold= match tmp_ctrl.get("gw_extrapolate_occ_threshold").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.1)},
+                other => {0.1},
+            };
+            tmp_input.gw_extrapolate_vir_threshold= match tmp_ctrl.get("gw_extrapolate_vir_threshold").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.1)},
                 other => {0.1},
             };
