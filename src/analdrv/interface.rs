@@ -1,0 +1,36 @@
+//! Interface to REST other programs.
+
+use crate::analdrv::config::{AnalDrvConfig, AnalDrvTask};
+use crate::analdrv::vib::{GauThermoInfo, VibInfo};
+use crate::scf_io::{SCFType, SCF};
+
+pub fn analdrv_interface(scf_data: &SCF, tasks: &[AnalDrvTask], config: &AnalDrvConfig) {
+    for task in tasks {
+        match task {
+            AnalDrvTask::Hessian => hess_interface(scf_data, config),
+        };
+    }
+}
+
+pub fn hess_interface(scf_data: &SCF, analdrv_ctrl: &AnalDrvConfig) -> (Vec<f64>, VibInfo, Option<GauThermoInfo>) {
+    use crate::analdrv::rscf_interface::rscf_hess_interface;
+    use crate::analdrv::uscf_interface::uscf_hess_interface;
+
+    eprintln!("[WARN] You are using analdrv module, which is still under development.");
+    eprintln!("[WARN] Keywords of analdrv will be updated in future versions.");
+
+    // simple guard, but currently many methods (solvent, range-separate, dftd are not supported)
+    if scf_data.mol.xc_data.is_fifth_dfa() {
+        panic!("Normal modes calculation is currently not available for post-SCF methods.");
+    }
+
+    match scf_data.scftype {
+        SCFType::RHF => {
+            rscf_hess_interface(&scf_data, analdrv_ctrl)
+        },
+        SCFType::UHF => {
+            uscf_hess_interface(&scf_data, analdrv_ctrl)
+        },
+        _ => unimplemented!("Normal modes calculation is only implemented for RHF and UHF SCF types."),
+    }
+}

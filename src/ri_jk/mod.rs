@@ -29,6 +29,10 @@ pub mod decompose;
 pub mod direct;
 pub mod incore;
 
+// hessian implementations
+pub mod hess_r;
+pub mod hess_u;
+
 // exports
 pub use ao2mo::*;
 pub use decompose::*;

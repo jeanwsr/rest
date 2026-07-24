@@ -20,6 +20,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 
 use rest_tensors::MatrixFull;
+use crate::constants::EV;
 use rest_tensors::matrix::matrix_blas_lapack::{_dsolve, _dgemm_full};
 
 use crate::ri_bse::response::{
@@ -222,7 +223,7 @@ fn print_response_tddft_results(
     let pol_im: f64 = density_imag.iter().zip(mu_z_vec.iter()).map(|(d, m)| d * m).sum();
 
     println!("  --- Response TDDFT Results ---");
-    println!("    Frequency ω = {:.8} Ha ({:.4} eV)", omega, omega * 27.2114);
+    println!("    Frequency ω = {:.8} Ha ({:.4} eV)", omega, omega * EV);
     println!("    Lifetime  γ = {:.8} Ha", gamma);
     println!("    Re[α_zz(ω)] = {:.12e} a.u.", pol_re);
     println!("    Im[α_zz(ω)] = {:.12e} a.u.", pol_im);
@@ -685,7 +686,7 @@ pub fn response_tddft(scf: &mut SCF) -> Result<(), String> {
     println!("  Method: Response (frequency-domain)");
     println!("  Spin: {}", if xlet == 'S' { "Singlet" } else if xlet == 'T' { "Triplet" } else { "Generic" });
     println!("  occ_size={}, vir_size={}, dim={}", occ_size, vir_size, dim);
-    println!("  ω = {:.8} Ha ({:.4} eV)", omega, omega * 27.2114);
+    println!("  ω = {:.8} Ha ({:.4} eV)", omega, omega * EV);
     println!("  γ = {:.8} Ha", gamma);
 
     // Prepare fxc data

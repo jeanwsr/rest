@@ -338,8 +338,62 @@ fp_mode = "FP64"
 输入卡关键词包括：
 - `ss_factor`: 取值f64。采用 Spin-Component-Scaled 方式计算 MP2 型相关能（SCS-MP2）时, 用于控制自旋平行（same spin）分量贡献的缩放系数，适用于 `xc` 关键词为 MP2、SCS-MP2或双杂化泛函，以及 `post_correlation` 设置为 PT2 的情况。缺省为 None，即依 `xc` 设置的泛函进行设定。
 - `os_factor`: 取值f64。适用场景与 `ss_factor` 一致，采用 SCS-MP2 方法计算相关能贡献时，用于缩放自旋反平行（opposite spin）分量贡献的系数。缺省为 None，即依 `xc` 设置的泛函进行设定。
-- `fp_mode`: 取值 String (`"FP32"`, `"FP64"`)。设置 RI-PT2 计算中使用的浮点精度。缺省为 `"FP32"`。对于数值梯度计算，建议设置为 `"FP64"` 以获得更高的数值稳定性。
+- `fp_mode`: 取值 String (`"FP32"`, `"FP64"`)。设置 RI-PT2 计算中使用的浮点精度。仅当 `new_driver = true` 时生效。缺省为 `"FP32"`。对于数值梯度计算，建议设置为 `"FP64"` 以获得更高的数值稳定性。
 - `mpi_mode`: 取值 usize。设置 RI-PT2 计算中使用的 MPI 模式。缺省为 0，即不使用 MPI。
+
+#### PT2 算法选择
+
+REST 提供三种 PT2 实现算法，通过以下关键词选择：
+
+- `streaming`: 取值 bool。是否启用**流式 PT2 算法**（缺省 `true`）。
+  - `true`（推荐，缺省）：采用分块流式 ao2mo + PT2 主循环。不物化完整的 `ri3mo[naux, nvir, nocc]` 张量，而是按占据轨道分块（block_size 个轨道/块）逐块做 AO→MO 变换和 PT2 收缩。内嵌 M1 优化（dsymm 先收缩小边），且通过 scoped thread 预取下一块的 ao2mo（Fix B 流水线），将 ao2mo 时间隐藏在 PT2 主循环后面。
+    - 内存峰值：`rimatr + 3 × [naux, nvir, B]`，比原始算法少约 130 GB（对于 nao≈3000 的体系）。
+    - 支持：RHF、UHF、ROHF；rayon 并行；单节点计算。
+    - 限制：当前不支持 MPI 并行（MPI 激活时自动回退到原始算法）。
+  - `false`：使用**原始 legacy 算法**。先一次性生成完整 `ri3mo` 张量（`generate_ri3mo_rayon`），再做 PT2 主循环。
+    - 内存峰值：`rimatr + ri3mo`，比流式算法多约 130–185 GB。
+    - 支持：RHF、UHF、ROHF；rayon 并行；**MPI 并行**。
+    - 适用场景：需要 MPI 并行的大体系。
+
+- `new_driver`: 取值 bool。是否启用**新 rstsr 驱动**（缺省 `false`）。
+  - `true`：采用基于 rstsr 张量库的 pair-engine 架构。支持 FP32 半精度、UKS 三自旋对统一处理。但内存峰值最高（存在大 scratch_buf 且不释放 rimatr），且不支持 ROHF 和 MPI。
+  - `false`（缺省）：不使用新驱动。
+
+- `stream_block_size`: 取值 usize。流式算法的块大小（仅当 `streaming = true` 时生效）。
+  - 缺省（不设置或设为 0）：自动选择。规则为 `B² ≥ 4 × num_threads`，clamp 到 [16, 128]。
+  - 典型值：48 核机器 RHF 取 64，96 核机器 UKS 取 32。
+  - 调优建议：内存紧张时减小 B（如 32），PT2 主循环并行度不足时增大 B（如 128）。
+
+**算法选择优先级**（满足条件时依次尝试）：
+
+| 优先级 | 条件 | 算法 |
+|---|---|---|
+| 1 | `new_driver = true` 且非 MPI 且 PT2 且 RHF/UHF | 新 rstsr 驱动 |
+| 2 | `streaming = true`（缺省）且非 MPI 且 `use_ri_symm = true` 且 PT2 | **流式算法** |
+| 3 | 其它情况 | 原始 legacy 算法 |
+
+**输入卡示例**：
+
+```toml
+# 缺省配置（推荐）：流式算法，自动块大小
+[ctrl.ri_pt2]
+# streaming = true        # 缺省，无需显式设置
+# stream_block_size = 0   # 缺省，自动选择
+
+# 显式使用原始 legacy 算法（需要 MPI 时）
+[ctrl.ri_pt2]
+streaming = false
+
+# 流式算法 + 自定义块大小
+[ctrl.ri_pt2]
+streaming = true
+stream_block_size = 32
+
+# 使用新 rstsr 驱动（仅非 MPI 的 RHF/UHF）
+[ctrl.ri_pt2]
+new_driver = true
+fp_mode = "FP32"
+```
 
 ## RRS-PBC计算相关设置
 RRS-PBC方法是由张颖教授等提出的一种基于分子团簇计算结果的周期性电子结构模拟方法，相关论文见 Zhang, I.Y., Jiang, J., Gao, B. *et al.* RRS-PBC: a molecular approach for periodic systems. [*Sci. China Chem.* **57**, 1399–1404 (2014)](https://doi.org/10.1007/s11426-014-5183-y)。在 REST 中，RRS-PBC 相关的设置主要在 `[geom]` 区块中进行，请参考后续的说明。`[ctrl]`区块中的相关关键词包括：
@@ -673,6 +727,50 @@ spin = 1
 hessian = { solver = "krylov", frequencies = true, verbose = 2 }
 ```
 
+## 解析梯度性质模块 `analdrv` 计算相关设置
+
+解析梯度模块 `analdrv` 模块是实验性质模块。目前实现了 Hessian (原子核坐标二阶梯度) 功能。
+它实现了不同于 `hessian` 模块的解析 Hessian 计算。目前该模块的 Hessian 功能支持 RHF/RKS/UHF/UKS 方法。对于 DFT，支持 LDA/GGA/mGGA 以及其对应的杂化泛函。该模块的程序有性能优化，与目前顶级的量化程序 (ORCA 等) 有相当或更好的性能。
+
+### 设置待计算性质的任务
+
+目前仅支持 Hessian 计算。需要在 `[ctrl]` 区块中设置 `analdrv_tasks` 关键词以启动对应性质的计算。若希望同时计算热力学矫正，请同时指定 `[thermo]` 区块。
+```toml
+[ctrl]
+analdrv_tasks = "freq"
+
+[thermo]
+```
+
+### 解析梯度模块 `analdrv` 区块选项
+
+在设置任务后，用户可以在 `[analdrv]` 区块中设置对应的计算选项。该区块的关键词包括：
+- `cphf_level_shift`：CPHF 求解时对 $\varepsilon_i - \varepsilon_a$ 的求解偏移。默认为 0，单位 Hartree。
+- `cphf_tol`：CPHF 中的 Krylov 求解阈值。默认 1e-8，无量纲。实际求解阈值也受制于 `cphf_lindep`，且 `cphf_lindep` 经常是更宽松的阈值。
+- `cphf_max_cycle`：CPHF 最大迭代步数。默认为 42 步。CPHF 与 SCF 不同，一般 6-10 步能收敛。这里的最大步数一般不需要设得很大。
+- `cphf_max_space`：CPHF 中 Krylov 空间的数量。默认为 14。该数值不宜设太小，因为超过该数值时，Krylov 求解器会代入最后一次迭代重新作为初猜，重置求解过程。但该数值设太大会对内存产生压力。
+- `cphf_lindep`：CPHF 中一些数值过程的数值精度阈值。默认 1e-14，无量纲。
+- `verbose`：打印强度。默认为 None，使用输入卡 `[ctrl]` 区块的 verbose。
+- `atm_list`：选择一部分原子进行 Hessian 计算。默认为 None，即所有原子参与 Hessian 计算。
+- `grid_level_cphf`：CPHF 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None，是 `[ctrl]` 中 grid_generation_level 关键词设定值减 2 (SCF 默认格点级别是 3，对应 Hessian 的级别是 1)；最低级别是 1。
+- `grid_level_skeleton`：Skeleton 导数 (包括 2 阶 Hessian 贡献、1 阶 Fock 贡献) 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None：
+  - LDA/GGA 使用与 SCF 同样的格点；
+  - mGGA 将比 `grid_generation_level` 增加 2 级别。
+- `tol_point_group`：振动分析中的点群对称性判断阈值 (用于计算转动对称性，对熵矫正有贡献)。默认 1e-5，单位 Bohr / sqrt(atom)。
+- `gau_thermo`：是否使用 Gaussian 类型的热力学能矫正。默认 false。该选项仅作参考；目前 REST 的热力学矫正通常是定义 `[thermo]` 区块以进行计算。Gaussian 类型热力学能矫正接受输入卡中 `[thermo]` 区块的关键词 `temperature`, `pressure`, `symmetry_number` 与 `electronic_energy`。
+
+作为例子，运行 Hessian 计算、增大 CP-HF Krylov 求解器空间到 20、强制 CP-HF 中 DFT 格点积分级别为 2，所需要引入的、相比于能量计算的额外设置如下：
+```toml
+[ctrl]
+analdrv_tasks = "freq"
+
+[analdrv]
+cphf_max_space = 20
+grid_level_cphf = 2
+
+[thermo]
+```
+
 # Detailed description of [geom] block in the control file
 - `name`：取值String类型。分子体系的名称
 - `unit`：取值String类型。坐标单位。目前支持：angstrom和bohr
@@ -802,7 +900,7 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 
 - `temperature`（或 `T`）：温度 (K)。可设为单值（缺省 298.15），或设为扫描区间 `[下限, 上限, 步长]`（见下文"温度/压强扫描"）。
 - `pressure`（或 `P`）：压强 (**atm**)。可设为单值（缺省 1.0）或扫描区间。压强仅影响平动熵。
-- `symmetry_number`（或 `sigma`）：转动对称数 σ。可手动指定（参考值：C1/Ci/Cs/C∞v→1，Cn/Cnv/Cnh→n，D∞h→2，Dn/Dnh/Dnd→2n，Sn→n/2，Td/T→12，Oh→24，Ih→60）。**设为 `0` 则启用点群自动识别**（见下文「点群自动识别」）。缺省 1.0。
+- `symmetry_number`（或 `sigma`）：转动对称数 σ。可手动指定（参考值：C1/Ci/Cs/C∞v→1，Cn/Cnv/Cnh→n，D∞h→2，Dn/Dnh/Dnd→2n，Sn→n/2，Td/T→12，Oh→24，Ih→60）。**设为 `0` 则启用点群自动识别**（见下文「点群自动识别」）。缺省 0 即自动识别点群。
 - `electronic_energy`（或 `E`）：用于 U/H/G 求和的电子能量 (a.u.)。缺省 0.0 表示使用当前 SCF 总能量。若想在频率分析级别之上采用更高级别单点能，可在此指定。
 - 频率标度因子（四项可独立设置，缺省均为 1.0）：
     - `sclzpe`：用于零点能 ZPE。
@@ -902,6 +1000,7 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 	- "stop"：不做构型优化，只计算初始结构的Hessian矩阵
 	- "each"：计算构型优化中每一步的Hessian矩阵
 - `analytic_hessian`：取值 bool。若设为 `true`，则在调用 geomeTRIC 优化前先用 REST 的解析 Hessian 模块计算结果并注入 geomeTRIC，**完全避免 geomeTRIC 的数值有限差分 Hessian 计算**。解析 Hessian 含 CP-HF 轨道弛豫贡献，精度远优于有限差分，且后续 BFGS 更新不受影响。缺省值：`false`。建议在过渡态搜索（`transition = true`）或 IRC 追踪（`irc = true`）中启用。
+- `use_analdrv`：取值 bool。若设为 `true`，使用 `analdrv` 模块进行 Hessian 计算；若设为 `false`，使用 `hessian` 模块进行 Hessian 计算。缺省值：`None`，如果输入卡检测到 `[hessian]` 区块会使用 `hessian` 模块，否则使用 `analdrv` 模块。
 - `frequency`：取值bool，当得到Hessian矩阵后，是否开展频率计算和热化学分析。缺省值：true
 - `thermo`：取值[f64;2]，提供热力学分析的状态：[温度 (K),压强 (bar)]。缺省值：[300.0, 1.0]
 - `reset`：取值bool。当近似 Hessian 的特征值低于 `epsilon` 阈值时，是否将其重置回 guess Hessian。对于稳态优化，缺省值为 true。若体系梯度含噪声、BFGS 更新每步失败（出现 "Eigenvalues below ... returning guess"），可设为 false 保留 Hessian 并加对角 shift 继续优化。

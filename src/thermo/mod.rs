@@ -177,13 +177,35 @@ fn principal_moments(
     natm: usize,
 ) -> ([f64; 3], [f64; 3], [f64; 3]) {
     let mass_amu = get_mass_charge(elems);
+    
+    // generate mass-centered geometry (position)
+    let mass_sum = mass_amu.iter().map(|(m, _)| *m).sum::<f64>();
+    let mut mass_center = [0.0; 3];
+    for ia in 0..natm {
+        let m = mass_amu[ia].0;
+        mass_center[0] += m * position[[0, ia]];
+        mass_center[1] += m * position[[1, ia]];
+        mass_center[2] += m * position[[2, ia]];
+    }
+    mass_center[0] /= mass_sum;
+    mass_center[1] /= mass_sum;
+    mass_center[2] /= mass_sum;
+    let pos_mc: Vec<[f64; 3]> = (0..natm).map(|ia| {
+        [
+            position[[0, ia]] - mass_center[0],
+            position[[1, ia]] - mass_center[1],
+            position[[2, ia]] - mass_center[2],
+        ]
+    }).collect();
+
     let mut ixx = 0.0; let mut iyy = 0.0; let mut izz = 0.0;
     let mut ixy = 0.0; let mut ixz = 0.0; let mut iyz = 0.0;
+    let mut im_rr = [[0.0; 3]; 3];
     for ia in 0..natm {
         let m = mass_amu[ia].0 * AMU_KG;
-        let x = position[[0, ia]] * BOHR_M;
-        let y = position[[1, ia]] * BOHR_M;
-        let z = position[[2, ia]] * BOHR_M;
+        let x = pos_mc[ia][0] * BOHR_M;
+        let y = pos_mc[ia][1] * BOHR_M;
+        let z = pos_mc[ia][2] * BOHR_M;
         ixx += m * (y * y + z * z);
         iyy += m * (x * x + z * z);
         izz += m * (x * x + y * y);
@@ -324,6 +346,14 @@ fn compute_thermo_at(mi: &MolInfo, t: f64, p_pa: f64, input: &ThermoInput) -> Th
                 + 1.5 * (8.0 * PI * PI * BOLTZMANN * t / (PLANCK * PLANCK)).ln()
                 + 0.5 * (mom[0].ln() + mom[1].ln() + mom[2].ln())
                 - sigma.ln();
+            println!("[DEBUG] t.ln {}", (8.0 * PI * PI * BOLTZMANN * t / (PLANCK * PLANCK)).ln());
+            println!("[DEBUG] mom[0].ln {}", mom[0].ln());
+            println!("[DEBUG] mom[1].ln {}", mom[1].ln());
+            println!("[DEBUG] mom[2].ln {}", mom[2].ln());
+            let intermediate = 0.5 * PI.ln()
+                + 1.5 * (8.0 * PI * PI * BOLTZMANN * t / (PLANCK * PLANCK)).ln()
+                + 0.5 * (mom[0].ln() + mom[1].ln() + mom[2].ln());
+            println!("[DEBUG] intermediate {}", intermediate);
             res.q_rot = ln_q.exp();
             res.u_rot = 1.5 * R_GAS * t;
             res.cv_rot = 1.5 * R_GAS;
@@ -624,15 +654,15 @@ pub fn run_thermochemistry(
     let e_au = if params.electronic_energy != 0.0 { params.electronic_energy } else { scf.scf_energy };
 
     // resolve symmetry number: 0 (or negative) => auto-detect from geometry
-    let (sym_num, pg_label) = if params.symmetry_number <= 0.0 {
+    let (sym_num, pg_label) = if params.symmetry_number > 0.0 {
+        (params.symmetry_number, String::new())
+    } else {
         let pg = crate::symmetry::detect_point_group(&mol.geom.position, &mol.geom.elem);
         if pl > 0 {
             println!("  Auto-detected point group: {} (rotational symmetry number sigma = {})",
                 pg.label, pg.sigma);
         }
         (pg.sigma as f64, pg.label)
-    } else {
-        (params.symmetry_number, String::new())
     };
 
     let input = ThermoInput {

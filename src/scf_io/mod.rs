@@ -24,7 +24,7 @@ pub mod util;
 use mpi::collective::SystemOperation;
 use pyo3::{pyclass};
 use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemv, _dspgvx, _dsymm, _dsyrk, _hamiltonian_fast_solver, _power_rayon_for_symmetric_matrix, _dsyevd};
-use tensors::{map_upper_to_full, BasicMatUp, BasicMatrix, ERIFold4, MathMatrix, MatrixFull, MatrixFullSlice, MatrixUpper, MatrixUpperSlice, RIFull, TensorSliceMut};
+use tensors::{map_upper_to_full, BasicMatrix, ERIFold4, MathMatrix, MatrixFull, MatrixFullSlice, MatrixUpper, MatrixUpperSlice, RIFull, TensorSliceMut};
 use tensors::{TensorOpt,TensorSlice};
 use itertools::{Itertools};
 use rayon::prelude::*;
@@ -40,12 +40,15 @@ use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
 use crate::x2c::RelativisticMethod;
 use crate::ri_jk;
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
-use log::info;
+use log::{debug, info, trace, warn};
 use scfrecord::ScfTraceRecord;
 use self::util::occupied_orbital_count;
 use self::util::norm;
 use smear::apply_smearing;
 use smear::annealed_sigma;
+
+#[allow(unused_imports)]
+use tensors::BasicMatUp;
 
 #[pyclass]
 #[derive(Clone)]
@@ -176,9 +179,9 @@ impl SCF {
         };
         match &scf_data.scftype {
             SCFType::RHF => {
-                if mol.ctrl.print_level>0 {println!("Restricted Hartree-Fock (or Kohn-Sham) algorithm is invoked.")}},
+                info!("Restricted Hartree-Fock (or Kohn-Sham) algorithm is invoked.")},
             SCFType::ROHF => {
-                if mol.ctrl.print_level>0 {println!("Restricted open shell Hartree-Fock (or Kohn-Sham) algorithm is invoked.")};
+                info!("Restricted open shell Hartree-Fock (or Kohn-Sham) algorithm is invoked.");
                 // In ROHF, although the Roothaan Fock matrix is not separated into alpha and beta spin channels, 
                 // it is derived based on the density matrices of the alpha and beta spin channels. 
                 // Therefore, even though "spin_polarization=False" is specified as input, we handle it as "spin_channel=2".
@@ -187,7 +190,7 @@ impl SCF {
                 scf_data.mol.xc_data.spin_channel=2;
             },
             SCFType::UHF => {
-                if mol.ctrl.print_level>0 {println!("Unrestricted Hartree-Fock (or Kohn-Sham) algorithm is invoked.")}
+                info!("Unrestricted Hartree-Fock (or Kohn-Sham) algorithm is invoked.")
             },
         };
 
@@ -226,7 +229,7 @@ impl SCF {
             _ => false,
         };
         let algorithm_jk = if has_ri_non_specified {
-            println!("Checking memory requirement for RI J/K algorithms...");
+            info!("Checking memory requirement for RI J/K algorithms...");
             let nao = mol.num_basis;
             let naux = mol.num_auxbas;
             // range-separate hybrid functionals requires double memory for RI integrals due to the need of both standard RI and short-range RI integrals.
@@ -237,8 +240,8 @@ impl SCF {
                 max_memory - detect_used_memory_mb("proc")
             }).unwrap_or_else(detect_available_memory_mb);
             let algorithm_jk = if mem_avail_mb  < mem_cderi_mb {
-                println!("Memory available for 1.5 times of RI integrals ({:.2} MB) is less than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
-                println!("Switch to direct RI-J/K algorithms.");
+                info!("Memory available for 1.5 times of RI integrals ({:.2} MB) is less than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
+                info!("Switch to direct RI-J/K algorithms.");
                 if algorithm_jk == AlgorithmJK::Ri {
                     AlgorithmJK::RiDirect
                 } else if let AlgorithmJK::Separated(algorithm_j, algorithm_k) = algorithm_jk {
@@ -249,8 +252,8 @@ impl SCF {
                     algorithm_jk
                 }
             } else {
-                println!("Memory available for 1.5 times of RI integrals ({:.2} MB) is more than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
-                println!("Using standard incore RI-J/K algorithms.");
+                info!("Memory available for 1.5 times of RI integrals ({:.2} MB) is more than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
+                info!("Using standard incore RI-J/K algorithms.");
                 if algorithm_jk == AlgorithmJK::Ri {
                     AlgorithmJK::RiIncore
                 } else if let AlgorithmJK::Separated(algorithm_j, algorithm_k) = algorithm_jk {
@@ -286,14 +289,12 @@ impl SCF {
         self.nuc_energy += nuc_energy_pc;
         self.nuc_energy += nuc_energy_ext_field;
 
-        if print_level>0 {
-            println!("Nuc_energy: {:16.8} Hartree",self.nuc_energy);
-            if nuc_energy_pc.abs() > 1.0e-4 {
-                println!("External potential due to point charges exists: {:16.8} Hartree", &nuc_energy_pc);
-            }
-            if nuc_energy_ext_field.abs() > 1.0e-10 {
-                println!("External dipole field contribution to nuc energy exists: {:16.8} Hartree", &nuc_energy_ext_field);
-            }
+        info!("Nuc_energy: {:16.8} Hartree",self.nuc_energy);
+        if nuc_energy_pc.abs() > 1.0e-4 {
+            info!("External potential due to point charges exists: {:16.8} Hartree", &nuc_energy_pc);
+        }
+        if nuc_energy_ext_field.abs() > 1.0e-10 {
+            info!("External dipole field contribution to nuc energy exists: {:16.8} Hartree", &nuc_energy_ext_field);
         }
         //========================================
         // For emperial dispersion correction
@@ -314,21 +315,15 @@ impl SCF {
             } else {
                 self.mol.ctrl.empirical_dispersion.clone().unwrap()
             };
-            if self.mol.ctrl.print_level>1 { 
-                println!("The empirical dispersion energy of {} is {}.", disp_name.to_uppercase(), engy_disp)
-            };
-            if self.mol.ctrl.print_level>3 { 
-                println!("{:?}, {:?}", &grad_disp, &sigma_disp);
-            };
+            debug!("The empirical dispersion energy of {} is {}.", disp_name.to_uppercase(), engy_disp);
+            trace!("{:?}, {:?}", &grad_disp, &sigma_disp);
             self.empirical_dispersion_energy = engy_disp;
             
             // empirical dispersion energy added to the nuc_energy
             self.nuc_energy += engy_disp;
         }
         if !disp_from_ctrl && !disp_from_parse_xc {
-            if self.mol.ctrl.print_level>1 { 
-                println!("no empirical dispersion correction is employed");
-            }
+            debug!("no empirical dispersion correction is employed");
         }
         //========================================
         // For two-center integrals
@@ -350,9 +345,7 @@ impl SCF {
             );
             self.h_core.iter_mut().zip(tmp_matr.iter()).for_each(|(a,b)| *a += *b);
         } else {
-            if self.mol.ctrl.print_level > 0 {
-                println!("No ghost effective potential");
-            }
+            info!("No ghost effective potential");
         }
 
         // ========================================
@@ -368,15 +361,11 @@ impl SCF {
 
         // For the ghost point charge term
         if self.mol.geom.ghost_pc_chrg.len() > 0 {
-            if self.mol.ctrl.print_level > 0 {
-                println!("There are {} point charges specified", self.mol.geom.ghost_pc_chrg.len());
-            }
+            info!("There are {} point charges specified", self.mol.geom.ghost_pc_chrg.len());
             let tmp_matr = self.mol.int_ij_matrixupper(String::from("point charge"));
             self.h_core.iter_mut().zip(tmp_matr.iter()).for_each(|(a,b)| *a += *b);
         } else {
-            if self.mol.ctrl.print_level > 0 {
-                println!("No ghost point charges");
-            }
+            info!("No ghost point charges");
         }
 
         //========================================
@@ -477,35 +466,27 @@ impl SCF {
         // build short-range 3c RI integrals for range-separated hybrid (RSH) functionals
         if is_rsh && use_eri_jk {
             let omega = self.mol.xc_data.omega().unwrap();
-            if self.mol.ctrl.print_level > 0 {
-                println!("Building short-range 3c RI integrals for RSH (omega = {:.4})", omega);
-            }
+            info!("Building short-range 3c RI integrals for RSH (omega = {:.4})", omega);
             if ri3fn_symm {
                 // Note: SR RI omega is negative in libcint's convention.
                 self.rimatr_sr = Some(self.mol.prepare_rimatr_for_ri_v_mpi_rayon(Some(-omega), mpi_operator));
             } else {
                 self.ri3fn_sr = Some(self.mol.prepare_ri3fn_sr_rayon(omega));
             }
-            if self.mol.ctrl.print_level > 0 {
-                println!("  SR 3c integrals built.");
-            }
+            info!("  SR 3c integrals built.");
         }
 
         // initial eigenvectors and eigenvalues
         let (eigenvectors, eigenvalues,n_found)=self.ovlp.to_matrixupperslicemut().lapack_dspevx().unwrap();
 
         if (n_found as usize) < self.mol.fdqc_bas.len() {
-            if self.mol.ctrl.print_level>0 {
-                println!("Overlap matrix is singular:");
-                println!("  Using {} out of a possible {} specified basis functions",n_found, self.mol.fdqc_bas.len());
-                println!("  Lowest remaining eigenvalue: {:16.8}",eigenvalues[0]);
-            }
+            info!("Overlap matrix is singular:");
+            info!("  Using {} out of a possible {} specified basis functions",n_found, self.mol.fdqc_bas.len());
+            info!("  Lowest remaining eigenvalue: {:16.8}",eigenvalues[0]);
             self.mol.num_state = n_found as usize;
         } else {
-            if self.mol.ctrl.print_level>0 {
-                println!("Overlap matrix is nonsigular:");
-                println!("  Lowest eigenvalue: {:16.8} with the total number of basis functions: {:6}",eigenvalues[0],self.mol.num_state);
-            }
+            info!("Overlap matrix is nonsigular:");
+            info!("  Lowest eigenvalue: {:16.8} with the total number of basis functions: {:6}",eigenvalues[0],self.mol.num_state);
         };
 
 
@@ -524,9 +505,7 @@ impl SCF {
             return;
         };
 
-        if self.mol.ctrl.print_level > 0 {
-            println!("Preparing BSE-specific RI integrals with auxiliary basis: {}", bse_auxbas_path);
-        }
+        info!("Preparing BSE-specific RI integrals with auxiliary basis: {}", bse_auxbas_path);
 
         // Save original auxiliary basis information
         let original_auxbas_path = self.mol.ctrl.auxbas_path.clone();
@@ -556,20 +535,16 @@ impl SCF {
         // Restore original auxiliary basis
         self.mol.reload_auxbas(original_auxbas_path);
 
-        if self.mol.ctrl.print_level > 0 {
-            println!("BSE-specific RI integrals prepared successfully");
-            println!("BSE auxiliary basis size: {}, Regular auxiliary basis size: {}",
-                     self.num_auxbas_bse.unwrap(), original_num_auxbas);
-        }
+        info!("BSE-specific RI integrals prepared successfully");
+        info!("BSE auxiliary basis size: {}, Regular auxiliary basis size: {}",
+                 self.num_auxbas_bse.unwrap(), original_num_auxbas);
     }
 
     pub fn prepare_density_grids(&mut self) {
 
         self.grids = if self.mol.xc_data.is_dfa_scf() || self.mol.ctrl.use_isdf || self.mol.ctrl.initial_guess == "vsap" {
             let grids = Grids::build(&mut self.mol);
-            if self.mol.ctrl.print_level>0 {
-                println!("Grid size: {:}", grids.coordinates.len());
-            }
+            info!("Grid size: {:}", grids.coordinates.len());
             Some(grids)
         } else {None};
 
@@ -588,7 +563,7 @@ impl SCF {
                 if self.mol.ctrl.print_level >= 1 {
                     let (dense_bytes, comp_bytes, _) = grids.memory_footprint();
                     let ratio = if dense_bytes > 0 { comp_bytes as f64 / dense_bytes as f64 * 100.0 } else { 0.0 };
-                    println!(" [non0tab] dropping dense ao/aop, dense={:.1}GB, compressed={:.1}GB ({:.1}%)",
+                    info!(" [non0tab] dropping dense ao/aop, dense={:.1}GB, compressed={:.1}GB ({:.1}%)",
                         dense_bytes as f64 / 1e9, comp_bytes as f64 / 1e9, ratio);
                 }
                 grids.ao = None;
@@ -2479,9 +2454,7 @@ impl SCF {
                 }
             }
         }
-        if self.mol.ctrl.print_level>1 {
-            println!("Exc: {:16.8}, Vxc: {:16.8}", exc_total, vxc_total)
-        };
+        debug!("Exc: {:16.8}, Vxc: {:16.8}", exc_total, vxc_total);
         match self.scftype {
             SCFType::RHF => {
                 // D*(H^{core}+F)
@@ -3076,13 +3049,11 @@ impl SCF {
         #[cfg(not(feature = "mpi"))]
         let (total_elec, tot_exc, tot_xc) = self.generate_vxc_rayon_dm_only(scaling_factor);
 
-        if self.mol.ctrl.print_level>1 {
-            if self.mol.spin_channel==1 {
-                println!("total electron number: {:16.8}", total_elec[0]);
-            } else {
-                println!("electron number in alpha-channel: {:12.8}", total_elec[0]);
-                println!("electron number in beta-channel:  {:12.8}", total_elec[1]);
-            }
+        if self.mol.spin_channel==1 {
+            debug!("total electron number: {:16.8}", total_elec[0]);
+        } else {
+            debug!("electron number in alpha-channel: {:12.8}", total_elec[0]);
+            debug!("electron number in beta-channel:  {:12.8}", total_elec[1]);
         }
 
         (total_elec, tot_exc, tot_xc)
@@ -3126,13 +3097,11 @@ impl SCF {
         #[cfg(not(feature = "mpi"))]
         let (total_elec, tot_exc, tot_xc) = self.generate_vxc_rayon(scaling_factor);
 
-        if self.mol.ctrl.print_level>1 {
-            if self.mol.spin_channel==1 {
-                println!("total electron number: {:16.8}", total_elec[0]);
-            } else {
-                println!("electron number in alpha-channel: {:12.8}", total_elec[0]);
-                println!("electron number in beta-channel:  {:12.8}", total_elec[1]);
-            }
+        if self.mol.spin_channel==1 {
+            debug!("total electron number: {:16.8}", total_elec[0]);
+        } else {
+            debug!("electron number in alpha-channel: {:12.8}", total_elec[0]);
+            debug!("electron number in beta-channel:  {:12.8}", total_elec[1]);
         }
 
         (total_elec, tot_exc, tot_xc)
@@ -3431,16 +3400,16 @@ impl SCF {
 
         // if estimated batch size is smaller than minimum, warn and set to minimum
         if batch_size_estimate < min_batch_size {
-            eprintln!("[WARN] in generate_vj_ri_direct, the estimated batch size ({batch_size_estimate}) is smaller than the minimum batch size ({min_batch_size}).");
-            eprintln!("[WARN] Setting batch size to {min_batch_size}. Memory could be insufficient.");
+            warn!("in generate_vj_ri_direct, the estimated batch size ({batch_size_estimate}) is smaller than the minimum batch size ({min_batch_size}).");
+            warn!("Setting batch size to {min_batch_size}. Memory could be insufficient.");
             batch_size_estimate = min_batch_size;
         }
 
         // if user specified batch size is smaller than minimum, warn and set to minimum
         let batch_size = if let Some(user_batch_size) = batch_size {
             if user_batch_size < min_batch_size {
-                eprintln!("[WARN] in generate_vj_ri_direct, the specified batch size ({user_batch_size}) is smaller than the minimum batch size ({min_batch_size}).");
-                eprintln!("[WARN] Setting batch size to {min_batch_size}.");
+                warn!("in generate_vj_ri_direct, the specified batch size ({user_batch_size}) is smaller than the minimum batch size ({min_batch_size}).");
+                warn!("Setting batch size to {min_batch_size}.");
             }
             user_batch_size.max(min_batch_size)
         } else {
@@ -3449,10 +3418,10 @@ impl SCF {
         handle_memory_exceed(mem_est.estimate_mem::<f64>(batch_size), mem_avail, self.mol.ctrl.abort_on_mem_exceed);
 
         // batch size info output
+        info!("in generate_vj_ri_direct, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
+        info!("in generate_vj_ri_direct, batch size      : {batch_size}");
+        info!("in generate_vj_ri_direct, memory estimation");
         if print_level > 0 {
-            println!("[INFO] in generate_vj_ri_direct, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
-            println!("[INFO] in generate_vj_ri_direct, batch size      : {batch_size}");
-            println!("[INFO] in generate_vj_ri_direct, memory estimation");
             mem_est.print_with_dtype::<f64>();
         }
 
@@ -3491,29 +3460,25 @@ impl SCF {
 
         // prefer semi-direct if possible
         let (alg_semi, mut batch_size_estimate) = if !use_dm_only && batch_size_estimate_semi >= min_batch_size {
-            if print_level > 1 {
-                println!("[INFO] in generate_vk_ri_direct_dm, using semi-direct algorithm for vk computation.");
-            }
+            debug!("in generate_vk_ri_direct_dm, using semi-direct algorithm for vk computation.");
             (true, batch_size_estimate_semi)
         } else {
-            if print_level > 1 {
-                println!("[INFO] in generate_vk_ri_direct_dm, using direct algorithm for vk computation.");
-            }
+            debug!("in generate_vk_ri_direct_dm, using direct algorithm for vk computation.");
             (false, batch_size_estimate_direct)
         };
 
         // if estimated batch size is smaller than minimum, warn and set to minimum
         if batch_size_estimate < min_batch_size {
-            eprintln!("[WARN] in generate_vk_ri_direct_dm, the estimated batch size ({batch_size_estimate}) is smaller than the minimum batch size ({min_batch_size}).");
-            eprintln!("[WARN] Setting batch size to {min_batch_size}. Memory could be insufficient.");
+            warn!("in generate_vk_ri_direct_dm, the estimated batch size ({batch_size_estimate}) is smaller than the minimum batch size ({min_batch_size}).");
+            warn!("Setting batch size to {min_batch_size}. Memory could be insufficient.");
             batch_size_estimate = min_batch_size
         }
 
         // if user specified batch size is smaller than minimum, warn and set to minimum
         let batch_size = if let Some(user_batch_size) = batch_size {
             if user_batch_size < min_batch_size {
-                eprintln!("[WARN] in generate_vk_ri_direct_dm, the specified batch size ({user_batch_size}) is smaller than the minimum batch size ({min_batch_size}).");
-                eprintln!("[WARN] Setting batch size to {min_batch_size}.");
+                warn!("in generate_vk_ri_direct_dm, the specified batch size ({user_batch_size}) is smaller than the minimum batch size ({min_batch_size}).");
+                warn!("Setting batch size to {min_batch_size}.");
             }
             user_batch_size.max(min_batch_size)
         } else {
@@ -3523,10 +3488,10 @@ impl SCF {
         handle_memory_exceed(mem_est.estimate_mem::<f64>(batch_size), mem_avail, self.mol.ctrl.abort_on_mem_exceed);
 
         // info output
+        debug!("in generate_vk_ri_direct_dm, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
+        debug!("in generate_vk_ri_direct_dm, batch size      : {batch_size}");
+        debug!("in generate_vk_ri_direct_dm, memory estimation");
         if print_level > 1 {
-            println!("[INFO] in generate_vk_ri_direct_dm, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
-            println!("[INFO] in generate_vk_ri_direct_dm, batch size      : {batch_size}");
-            println!("[INFO] in generate_vk_ri_direct_dm, memory estimation");
             mem_est.print_with_dtype::<f64>();
         }
 
@@ -3657,18 +3622,16 @@ pub fn generate_ri3mo_rayon_for_pt2_and_rpa(scf_data: &mut SCF) {
         //println!("generate RI3MO only for occ_range:{:?}, vir_range:{:?}", &occ_range, &vir_range);
         let spin_orb_indices = split_indices_by_spin_occ(&scf_data.occupation, 0.5);
         let (alpha_occ, alpha_vir) = &spin_orb_indices[0];
-        println!("Occupied orbitals (alpha): {}", format_indices(alpha_occ));
-        println!("Virtual orbitals (alpha): {}", format_indices(alpha_vir));
+        debug!("Occupied orbitals (alpha): {}", format_indices(alpha_occ));
+        debug!("Virtual orbitals (alpha): {}", format_indices(alpha_vir));
         if matches!(scf_data.scftype, SCFType::UHF | SCFType::ROHF) {
             let (beta_occ,  beta_vir)  = &spin_orb_indices[1];
-            println!("Occupied orbitals (beta): {}", format_indices(beta_occ));
-            println!("Virtual orbitals (beta): {}", format_indices(beta_vir));
+            debug!("Occupied orbitals (beta): {}", format_indices(beta_occ));
+            debug!("Virtual orbitals (beta): {}", format_indices(beta_vir));
         }
     };
     scf_data.generate_ri3mo_rayon(vir_range, occ_range);
-    if scf_data.mol.ctrl.print_level>1 {
-        println!("Finish the RI3MO generation")
-    };
+    debug!("Finish the RI3MO generation");
 }
 
 
@@ -4688,6 +4651,83 @@ fn ao2mo_rayon_v02<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
     Ok((rimo, row_dim, column_dim))
 }
 
+/// M1-optimized AO→MO transformation for a block of occupied (or virtual) orbitals.
+///
+/// Compared to `ao2mo_rayon_v02`, this routine contracts the *smaller* side
+/// first in the dsymm step: instead of computing `tmp_mat = reduced_ri × eigenvector`
+/// over the full eigenvector `[nao, nmo]` and then slicing, we pre-slice
+/// `eigenvector[:, column_dim]` once (one-time copy of `[nao, |column_dim|]`)
+/// and run dsymm on the smaller RHS. This saves a factor `nmo / |column_dim|`
+/// in dsymm FLOPs.
+///
+/// Used by streaming PT2 (`*_pt2_rayon_streaming` in `ri_pt2/mod.rs`), where
+/// `column_dim` is a small block of occupied orbitals (typical |column_dim| ≤ 64)
+/// rather than the full `nocc`. The full `ri3mo` tensor is never materialized.
+pub(crate) fn ao2mo_rayon_m1<'a, T, P>(
+    eigenvector: &T,
+    rimatr_chunk: &P,
+    row_dim: std::ops::Range<usize>,
+    column_dim: std::ops::Range<usize>,
+) -> anyhow::Result<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)>
+where T: BasicMatrix<'a, f64> + std::marker::Sync,
+      P: BasicMatrix<'a, f64>
+{
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
+
+    let num_basis = eigenvector.size()[0];
+    //let num_state = eigenvector.size()[1];
+    let num_bpair = rimatr_chunk.size()[0];
+    let num_auxbs = rimatr_chunk.size()[1];
+    let num_loc_row = row_dim.len();
+    let num_loc_col = column_dim.len();
+
+    // M1 optimization: pre-slice eigenvector to the occ block.
+    // Cost: one-time copy of [nao, |column_dim|] = num_basis * num_loc_col * 8 bytes.
+    // For num_loc_col=64, num_basis=3035: ~1.5 MB. Negligible.
+    let mut eigvec_occ_data = vec![0.0_f64; num_basis * num_loc_col];
+    let eigvec_src = eigenvector.data_ref().expect("eigenvector must be contiguous");
+    for j in 0..num_loc_col {
+        let src_off = (column_dim.start + j) * num_basis;
+        let dst_off = j * num_basis;
+        eigvec_occ_data[dst_off..dst_off + num_basis]
+            .copy_from_slice(&eigvec_src[src_off..src_off + num_basis]);
+    }
+    let eigvec_occ = MatrixFull::from_vec([num_basis, num_loc_col], eigvec_occ_data).unwrap();
+
+    let mut rimo = RIFull::new([num_auxbs, num_loc_row, num_loc_col], 0.0);
+    let (sender, receiver) = channel();
+
+    rimatr_chunk.data_ref().unwrap().par_chunks_exact(num_bpair).enumerate().for_each_with(sender, |s, (i_auxbs, m)| {
+
+        omp_set_num_threads_wrapper(1);
+
+        let mut reduced_ri = MatrixFull::new([num_basis, num_basis], 0.0_f64);
+        reduced_ri.iter_matrixupper_mut().unwrap().zip(m.iter()).for_each(|(to, from)| {*to = *from});
+
+        // M1: dsymm with sliced eigenvector [nao, |column_dim|] (NOT full [nao, nmo])
+        let mut tmp_mat = MatrixFull::new([num_basis, num_loc_col], 0.0_f64);
+        _dsymm(&reduced_ri, &eigvec_occ, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
+
+        // dgemm: eigenvector[:, row_dim].T × tmp_mat -> [num_loc_row, num_loc_col]
+        // loc_ri3mo[a, i] = sum_u eigenvector[u, a] * tmp_mat[u, i]
+        let mut loc_ri3mo = MatrixFull::new([num_loc_row, num_loc_col], 0.0_f64);
+        _dgemm(
+            eigenvector, ((0..num_basis), row_dim.clone()), 'T',
+            &tmp_mat, ((0..num_basis), (0..num_loc_col)), 'N',
+            &mut loc_ri3mo, ((0..num_loc_row), (0..num_loc_col)),
+            1.0, 0.0
+        );
+        s.send((loc_ri3mo, i_auxbs)).unwrap()
+    });
+    receiver.into_iter().for_each(|(loc_ri3mo, i_auxbs)| {
+        rimo.copy_from_matr(0..num_loc_row, 0..num_loc_col, i_auxbs, 2, &loc_ri3mo, 0..num_loc_row, 0..num_loc_col)
+    });
+
+    omp_set_num_threads_wrapper(default_omp_num_threads);
+
+    Ok((rimo, row_dim, column_dim))
+}
+
 pub fn diagonalize_hamiltonian_outside(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> ([MatrixFull<f64>;2], [Vec<f64>;2], usize) {
     let mut eigenvectors = [MatrixFull::empty(),MatrixFull::empty()];
     let mut eigenvalues = [Vec::new(),Vec::new()];
@@ -5220,7 +5260,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         }
     }
     if scf_converge[0] {
-        if scf_data.mol.ctrl.print_level>0 {println!("SCF is converged after {:4} iterations.", scf_records.num_iter-1)};
+        info!("SCF is converged after {:4} iterations.", scf_records.num_iter-1);
         // Level shift is disabled before the final diagonalization to ensure accurate eigenvalues.
         // Formatted printing of eigenvalues and eigenvectors is now performed after re-diagonalizing the HF Hamiltonian.
     } else {
@@ -5646,5 +5686,26 @@ impl SCF {
     }
 }
 
-
-
+impl SCF {
+    /// Free the large tensors in SCF struct to save memory after SCF calculation is done.
+    /// 
+    /// This function is initially written for geometric optimization, in order to give
+    /// approximately correct memory estimation for next step.
+    pub fn free_large_tensors(&mut self) {
+        self.ijkl = None;
+        self.ri3fn = None;
+        self.ri3fn_sr = None;
+        self.ri3fn_isdf = None;
+        self.tab_ao = None;
+        self.m = None;
+        self.rimatr = None;
+        self.rimatr_sr = None;
+        self.ri3mo = None;
+        self.ri3mo_full = None;
+        self.ri3fn_bse = None;
+        self.rimatr_bse = None;
+        self.grids = None;
+        self.solvent_static_obj = None;
+        self.solvent_scf = None;
+    }
+}

@@ -10,7 +10,7 @@ anyhow = "1"
 time = "0.1.12"
 clap = "3.0.0-beta.2"
 regex = "1.*"
-itertools = "0.8"
+itertools = "0.15"
 serde_json = "1.0"
 serde = {version="1.0",features=["derive"]}
 serde-inline-default = "1.0"
@@ -44,7 +44,7 @@ fuzzy-matcher = "0.3.7"
 #rust_libecpint = {path="../rust_libecpint"}
 # seems to pull in libssl and libcrypto which is rejected by manylinux
 reqwest = { version = "0.10", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-mpi = {version = "0.8.0", features = ["user-operations", "derive"], optional = true}
+mpi = {version = "0.8", features = ["user-operations", "derive"], optional = true}
 # for cuda
 #cudarc = "0.10.0"
 rest_tensors = {path="../rest_tensors"}
@@ -57,6 +57,7 @@ rstsr-core = { version = "0.7", default-features = false }
 rstsr-openblas = { version = "0.7", features = ["openmp"] }
 tblis = { version = "0.2", features = ["dynamic_loading"] }
 derive_builder = { version = "0.20" }
+indexmap = { version = "2.14" }
 
 dftd3 = { version = "0.2", optional = true }
 dftd4 = { version = "0.2", optional = true }

@@ -1,24 +1,24 @@
-
+#![warn(unused_imports)]
 use pyo3::pyclass;
 use serde::{Deserialize,Serialize};
-use tensors::MatrixFull;
 use core::panic;
 //use std::{fs, str::pattern::StrSearcher};
-use std::{fs, sync::Arc};
+use std::{fs};
 use crate::ctrl_io::geometric_pyo3_io::parse_geometric_keywords;
 use crate::ctrl_io::quasiparticle_methods::parse_quasiparticle_keywords;
 use crate::ri_jk::decompose::J2CDecompOption;
+use crate::analdrv::config::{AnalDrvConfig, AnalDrvTask};
 use crate::ctrl_io::tddft_parameters::parse_tddft_keywords;
 use crate::ctrl_io::hessian_parameters::parse_hessian_keywords;
 use crate::ctrl_io::thermo_parameters::parse_thermo_keywords;
 use crate::{check_norm::force_state_occupation::ForceStateOccupation};
 use crate::scf_io::smear::SmearingType;
-use crate::dft::{DFAFamily, DFTType, DFA4REST};
-use crate::geom_io::{GeomCell, GeomUnit, MOrC, parse_geom_keywords};
+use crate::dft::{DFAFamily, DFTType};
+use crate::geom_io::{GeomCell, MOrC, parse_geom_keywords};
 use crate::utilities;
-use rayon::ThreadPoolBuilder;
+// use rayon::ThreadPoolBuilder;
 use crate::check_norm::OCCType;
-use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper,omp_get_num_threads_wrapper};
+use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper};
 use crate::solvent::{PcmMethod, RadiusScheme};
 use crate::x2c::RelativisticMethod;
 use serde_json;
@@ -44,7 +44,7 @@ use hessian_parameters::HessianParameters;
 use thermo_parameters::ThermoParameters;
 use std::io::Write;
 use log::{info, debug, warn, Level};
-use env_logger::Builder;
+use env_logger::{Builder, Target};
 use utilities::log::printlevel2loglevel;
 
 pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
@@ -85,6 +85,7 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     if let Some(tmp_thermo) = &mut tmp_thermo {
         tmp_input.thermo = Some(std::mem::take(tmp_thermo));
     }
+    tmp_input.analdrv = tmp_keys.get("analdrv").map(serde_from_value);
     Ok((tmp_input,tmp_geomcell))
 }
 
@@ -385,6 +386,10 @@ pub struct InputKeywords {
     #[pyo3(get, set)]
     pub use_fxc_opt: bool,
     pub rel: RelativisticMethod,
+    /// Analytical derivative driver configuration.
+    pub analdrv: Option<AnalDrvConfig>,
+    /// Analytical derivative tasks to perform.
+    pub analdrv_tasks: Vec<AnalDrvTask>,
 }
 
 impl Default for InputKeywords {
@@ -550,6 +555,8 @@ impl InputKeywords {
             thermo: None,
             use_fxc_opt: false,
             rel: RelativisticMethod::None,
+            analdrv: None,
+            analdrv_tasks: Vec::new(),
         }
     }
 
@@ -737,20 +744,18 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         }
     }
 
-    if ctrl.print_level>1 {
-        if ctrl.use_ri_symm {
-            println!("Turn on the basis pair symmetry for RI 3D-tensors")
-        } else {
-            println!("Turn off the basis pair symmetry for RI 3D-tensors")
-        };
-        println!("The pruning method is {}", ctrl.pruning);
-        println!("The radial grid generation method is {}", ctrl.rad_grid_method);
-        println!("min_num_angular_points: {}", ctrl.min_num_angular_points);
-        println!("max_num_angular_points: {}", ctrl.max_num_angular_points);
-        println!("hardness: {}", ctrl.hardness);
-        println!("Grid generation level: {}", ctrl.grid_gen_level);
-        println!("Even tempered basis generation: {}", ctrl.even_tempered_basis);
-    }
+    if ctrl.use_ri_symm {
+        debug!("Turn on the basis pair symmetry for RI 3D-tensors")
+    } else {
+        debug!("Turn off the basis pair symmetry for RI 3D-tensors")
+    };
+    debug!("The pruning method is {}", ctrl.pruning);
+    debug!("The radial grid generation method is {}", ctrl.rad_grid_method);
+    debug!("min_num_angular_points: {}", ctrl.min_num_angular_points);
+    debug!("max_num_angular_points: {}", ctrl.max_num_angular_points);
+    debug!("hardness: {}", ctrl.hardness);
+    debug!("Grid generation level: {}", ctrl.grid_gen_level);
+    debug!("Even tempered basis generation: {}", ctrl.even_tempered_basis);
 
     let tmp_mixer = ctrl.mixer.clone();
     let mut mixer_log = "".to_string();
@@ -771,23 +776,23 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         //ctrl.mixer = String::from("direct");
         panic!("Unknown charge density mixer ({})! No charge density mixing will be invoked.", ctrl.mixer);
     };
-    if ctrl.print_level>1 {
-        println!("{}", mixer_log);
+    debug!("{}", mixer_log);
 
-        if ctrl.guess_mix {
-            println!("Initial guess mixing enabled: HOMO-LUMO rotated with theta = {:.1}° (alpha), {:.1}° (beta) to induce symmetry breaking",
-                ctrl.guess_mix_theta_deg[0], ctrl.guess_mix_theta_deg[1]);
-        }
-        if ctrl.solvent_enabled {
-            println!("Current solvent model is {}.",ctrl.solvent_model);
-            if ctrl.solvent_name.is_empty() {
-                println!("Solvent: {} (eps = {:.4})", ctrl.solvent_model, ctrl.solv_epsilon);
-            } else {
-                println!("Solvent: {} ({}, eps = {:.4})", ctrl.solvent_name, ctrl.solvent_model, ctrl.solv_epsilon);
-            }
-        }
-
+    if ctrl.guess_mix {
+        info!("Initial guess mixing enabled");
+        debug!("HOMO-LUMO rotated with theta = {:.1}° (alpha), {:.1}° (beta) to induce symmetry breaking",
+            ctrl.guess_mix_theta_deg[0], ctrl.guess_mix_theta_deg[1]);
     }
+    if ctrl.solvent_enabled {
+        info!("Current solvent model is {}.",ctrl.solvent_model);
+        if ctrl.solvent_name.is_empty() {
+            debug!("Solvent: {} (eps = {:.4})", ctrl.solvent_model, ctrl.solv_epsilon);
+        } else {
+            debug!("Solvent: {} ({}, eps = {:.4})", ctrl.solvent_name, ctrl.solvent_model, ctrl.solv_epsilon);
+        }
+    }
+
+
     println!("=========================================================");
 
 }
@@ -810,6 +815,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => {1_usize},
             };
             let mut builder = Builder::new();
+            builder.target(Target::Stdout);
             builder.filter_level(printlevel2loglevel(tmp_input.print_level));
             builder.format(|buf, record| {
                 if record.level() == Level::Info {
@@ -818,7 +824,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     writeln!(buf, "[{:<5} {}] {}", record.level(), record.target().split_once("::").map(|(_, rest)| rest).unwrap_or(record.target()), record.args())
                 }
             });
-            builder.init();
+            let _ = builder.try_init();
             // log::set_max_level(printlevel2loglevel(tmp_input.print_level));
             //let default_rayon_current_num_threads = rayon::current_num_threads();
             tmp_input.num_threads = match tmp_ctrl.get("num_threads").unwrap_or(&serde_json::Value::Null) {
@@ -1245,7 +1251,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
 
             tmp_input.external_grids = match tmp_ctrl.get("external_grids").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_type) => {
-                    if tmp_input.print_level>0 {println!("Read grids from the external file: {}", tmp_type)};
+                    info!("Read grids from the external file: {}", tmp_type);
                     tmp_type.to_string()},
                 other => {String::from("grids")}
             };
@@ -1522,7 +1528,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.j2c_decomp = tmp_ctrl.get("j2c_decomp").map(serde_from_value).unwrap_or_default();
             if (tmp_input.algorithm_j != AlgorithmJ::Default || tmp_input.algorithm_k != AlgorithmK::Default) {
                 if tmp_input.algorithm_jk != AlgorithmJK::Default {
-                    println!("Warning: algorithm_j or algorithm_k are specified, the setting in algorithm_jk will be ignored.");
+                    warn!("algorithm_j or algorithm_k are specified, the setting in algorithm_jk will be ignored.");
                 }
                 tmp_input.algorithm_jk = AlgorithmJK::Separated(tmp_input.algorithm_j, tmp_input.algorithm_k);
             }
@@ -1797,7 +1803,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     } else if tmp_smear.eq("gaussian") || tmp_smear.eq("gauss") {
                         Some(SmearingType::GAUSSIAN)
                     } else {
-                        println!("Warning: unknown smear type '{}', smearing not turned on.", tmp_type);
+                        warn!("unknown smear type '{}', smearing not turned on.", tmp_type);
                         None
                     }
                 }
@@ -1938,12 +1944,19 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => String::from("legacy"),
             };
             
+            tmp_input.analdrv_tasks = match tmp_ctrl.get("analdrv_tasks").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Null => vec![],
+                serde_json::Value::String(tmp_str) => vec![serde_from_value(&tmp_str.to_string().into())],
+                serde_json::Value::Array(tmp_arr) => tmp_arr.iter().map(|x| serde_from_value(x)).collect(),
+                _ => panic!("analdrv_tasks must be a string or an array of strings"),
+            };
+            
             //===========================================================
             // Global check of ctrl keywords and futher modification
             //============================================================
             if tmp_input.even_tempered_basis == true {
                 if tmp_input.etb_beta<=1.0f64 {
-                    println!("WARNING: etb_beta cannot be below 1.0. REST will use etb_beta=2.0 instead in this calculation");
+                    warn!("etb_beta cannot be below 1.0. REST will use etb_beta=2.0 instead in this calculation");
                     tmp_input.etb_beta=2.0f64;
                 }
                 //if tmp_input.print_level>0 {

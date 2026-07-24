@@ -7,6 +7,7 @@ use crate::scf_io::{SCF, SCFType};
 use crate::geom_io::get_mass_charge;
 use crate::basis_io::Basis4Elem;
 use rest_libcint::CintType;
+use crate::constants::BOHR;
 
 pub fn write_scf_attribute<T>(group: &hdf5::Group, dataset_name: &str, value: &[T]) 
 where 
@@ -183,7 +184,7 @@ pub fn save_overlap(scf_data: &SCF) {
 }
 
 pub fn save_geometry(scf_data: &SCF) {
-    let ang = crate::constants::ANG;
+    let ang = BOHR;
     let chkfile= &scf_data.mol.ctrl.chkfile;
     let path = Path::new(chkfile);
     let file = if path.exists() {

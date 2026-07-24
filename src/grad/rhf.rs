@@ -224,7 +224,8 @@ impl RIRHFGradient<'_> {
 
         // eigen-decomposed ERI
         let ederi_utp = {
-            let tsr = self.scf_data.rimatr.as_ref().unwrap();
+            let msg = "Decomposed ERI not found, possibly due to insufficient memory. We do not support ri-direct gradient calculation.";
+            let tsr = self.scf_data.rimatr.as_ref().expect(msg);
             rt::asarray((&tsr.0.data, tsr.0.size, &device))
         };
         let naux = ederi_utp.shape()[1];
@@ -820,9 +821,8 @@ pub fn calc_de_nuc(mol: &Molecule) -> MatrixFull<f64> {
     return de_nuc;
 }
 
-pub fn pack_triu_tilde(dm: TsrView<f64>) -> Tsr<f64> {
-    // Pack the lower triangular part of a matrix into a 1D array
-    // and non-diagonal values are multiplied by 2.
+/// Pack the lower triangular part of a matrix into a 1D array, multiply non-diagonal values by 2.
+pub fn pack_triu_tilde_2d(dm: TsrView<f64>) -> Tsr<f64> {
     assert_eq!(dm.ndim(), 2);
     assert_eq!(dm.shape()[0], dm.shape()[1]);
     let nao = dm.shape()[0];
@@ -830,7 +830,27 @@ pub fn pack_triu_tilde(dm: TsrView<f64>) -> Tsr<f64> {
     for i in 0..nao {
         dm_triu[[(i + 2) * (i + 1) / 2 - 1]] *= 0.5;
     }
-    return dm_triu;
+    dm_triu
+}
+
+/// Pack the lower triangular part of a multi-dimensional array into a smaller-one dimension array,
+/// multiply non-diagonal values by 2.
+pub fn pack_triu_tilde(dm: TsrView<f64>) -> Tsr<f64> {
+    if dm.ndim() == 2 {
+        return pack_triu_tilde_2d(dm);
+    }
+    assert!(dm.ndim() > 2);
+    assert_eq!(dm.shape()[0], dm.shape()[1]);
+    let shape_remaining = &dm.shape()[2..];
+    let nao = dm.shape()[0];
+    let nao_tp = nao * (nao + 1) / 2;
+    let dm = dm.reshape((nao, nao, -1));
+    let mut out = rt::zeros(([nao_tp, dm.shape()[2]], dm.device()));
+    for (i, dm_i) in dm.axes_iter(-1).enumerate() {
+        out.i_mut((.., i)).assign(&pack_triu_tilde_2d(dm_i));
+    }
+    let shape_recap = [nao_tp].iter().chain(shape_remaining.iter()).copied().collect::<Vec<usize>>();
+    out.into_shape(shape_recap)
 }
 
 pub fn get_dme0(mo_coeff: TsrView<f64>, mo_occ: TsrView<f64>, mo_energy: TsrView<f64>) -> Tsr<f64> {

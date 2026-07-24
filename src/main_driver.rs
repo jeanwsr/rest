@@ -13,7 +13,7 @@ use num_traits::Pow;
 use pyo3::prelude::*;
 //use autocxx::prelude::*;
 use crate::ctrl_io::JobType;
-use crate::constants::{ANG, AU2DEBYE};
+use crate::constants::{BOHR, AU2DEBYE};
 use crate::scf_io::{scf_without_build, SCFType, SCF};
 use tensors::{MathMatrix, MatrixFull};
 use tensors::matrix_blas_lapack::_dsyevd;
@@ -180,7 +180,7 @@ pub fn main_driver() -> anyhow::Result<()> {
                 if scf_data.mol.ctrl.print_level>0 {
                     println!("Geometry optimization invoked");
                 }
-                let displace = scf_data.mol.ctrl.nforce_displacement/ANG;
+                let displace = scf_data.mol.ctrl.nforce_displacement/BOHR;
 
                 let mut position = scf_data.mol.geom.position.iter().map(|x| *x).collect::<Vec<f64>>();
                 lbfgs().minimize(
@@ -383,6 +383,19 @@ pub fn main_driver() -> anyhow::Result<()> {
     //===================================
     if let Some(ref hess_ctrl) = scf_data.mol.ctrl.hessian {
         crate::hessian::rhf_hessian_main(&scf_data, hess_ctrl, &mut time_mark);
+    }
+    
+    //===================================
+    // Analytical derivative module calculations
+    //===================================
+    if !scf_data.mol.ctrl.analdrv_tasks.is_empty() {
+        time_mark.new_item("AnalDrv", "analytical derivative module");
+        time_mark.count_start("AnalDrv");
+        use crate::analdrv::interface::analdrv_interface;
+        let tasks = &scf_data.mol.ctrl.analdrv_tasks;
+        let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
+        analdrv_interface(&scf_data, tasks, &config);
+        time_mark.count("AnalDrv");
     }
 
     time_mark.count("Overall");
@@ -637,7 +650,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         if scf_data.mol.ctrl.print_level > 1 {
             println!("Gradient evaluation using numerical differentiation");
         }
-        let displace = scf_data.mol.ctrl.nforce_displacement / ANG;
+        let displace = scf_data.mol.ctrl.nforce_displacement / BOHR;
         let (energy, nforce) = numerical_force(&scf_data, displace, &mpi_operator);
         println!("------ Output gradient [a.u.] ------");
         println!("{}", formated_force(&nforce, &scf_data.mol.geom.elem));
@@ -735,6 +748,7 @@ fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeR
         println!("Input geometry in this round is:");
         println!("{}", scf_data.mol.geom.formated_geometry());
     }
+    scf_data.free_large_tensors();
     scf_data.mol.ctrl.initial_guess = String::from("inherit");
     initialize_scf(scf_data, mpi_operator);
     performance_essential_calculations(scf_data, time_mark, mpi_operator);
@@ -755,7 +769,7 @@ fn eval_normal_modes(
     let num_atoms = scf_data.mol.geom.nfree;
     let dim = num_atoms * 3;
     let displace_ang = scf_data.mol.ctrl.nhessian_displacement;
-    let displace = displace_ang / ANG; // convert Angstrom to Bohr
+    let displace = displace_ang / BOHR; // convert Angstrom to Bohr
 
     if scf_data.mol.ctrl.print_level > 0 {
         println!("");
@@ -954,7 +968,6 @@ mod geometric_pyo3_impl {
         pyo3::prepare_freethreaded_python();
         
         let elem = scf_data.mol.geom.elem.iter().map(|x| x.as_str()).collect::<Vec<&str>>();
-        const BOHR: f64 = crate::constants::BOHR;
         let xyz = scf_data.mol.geom.position.data.iter().map(|x| x * BOHR).collect::<Vec<f64>>();
         //let xyz = scf_data.mol.geom.position.iter().map(|x| *x).collect::<Vec<f64>>();
         let xyzs = vec![xyz];
@@ -970,22 +983,38 @@ mod geometric_pyo3_impl {
         //"#;
         //let mut params = tomlstr2py(optimizer_params)?;
 
-        let mut params = if let Some(params) = &scf_data.mol.ctrl.geometric_pyo3 {
-            let params = toml2py(&params.to_toml())?;
-            params
-        } else {
-            panic!("For geometric_pyo3, you must specify the parameters in the control file.")
-        };
+        let rust_params = scf_data.mol.ctrl.geometric_pyo3.as_ref().expect("For geometric_pyo3, you must specify the parameters in the control file.");
+        let params = toml2py(&rust_params.to_toml())?;
 
         // ── Compute analytical Hessian before optimization (if requested) ──
         let hessian_analytic_path: Option<std::path::PathBuf> =
-            if scf_data.mol.ctrl.geometric_pyo3.as_ref().map_or(false, |g| g.analytic_hessian) {
+            if rust_params.analytic_hessian {
                 let pl = scf_data.mol.ctrl.print_level;
                 if pl > 0 {
                     println!("  Computing analytical Hessian for geomeTRIC initial guess...");
                 }
-                let hess_total = crate::hessian::compute_hessian(&*scf_data)
-                    .expect("Analytical Hessian computation failed for geometry optimization");
+                let is_hessian_enabled = scf_data.mol.ctrl.hessian.is_some();
+                let use_analdrv = scf_data.mol.ctrl.geometric_pyo3.as_ref().map_or(None, |g| g.use_analdrv);
+                // if `[hessian]` is specified in the control file, then we will use it to compute the Hessian.
+                // otherwise, use `analdrv`.
+                let use_analdrv = use_analdrv.unwrap_or(!is_hessian_enabled);
+                let hess_total = if !use_analdrv {
+                    crate::hessian::compute_hessian(&*scf_data)
+                        .expect("Analytical Hessian computation failed for geometry optimization")
+                } else {
+                    use crate::analdrv::interface::hess_interface;
+                    use rstsr::prelude::*;
+                    
+                    let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
+                    let (hess_raw, _, _) = hess_interface(&scf_data, &config);
+                    let natm = (hess_raw.len() / 9).isqrt();
+                    assert!(natm * natm * 9 == hess_raw.len(), "Hessian raw data length does not match expected size for {} atoms", natm);
+                    let device = DeviceBLAS::default();
+                    let hess_rt = rt::asarray((&hess_raw, [3, 3, natm, natm].f(), &device));
+                    let hess_rt = hess_rt.transpose([0, 2, 1, 3]).into_shape((3 * natm, 3 * natm));
+                    let hess_vec = hess_rt.into_shape(-1).into_vec();
+                    MatrixFull::from_vec([3 * natm, 3 * natm], hess_vec).unwrap()
+                };
                 let natm = scf_data.mol.geom.nfree;
                 let n3 = natm * 3;
                 let mut out = String::new();

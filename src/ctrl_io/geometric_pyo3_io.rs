@@ -1,8 +1,8 @@
-use pyo3::types::PyDict;
-use pyo3::{Py, PyResult, Python};
+// use pyo3::types::PyDict;
+// use pyo3::{Py, PyResult, Python};
 use serde::{Deserialize,Serialize};
-use crate::geom_io::GeomCell;
-use crate::ctrl_io::InputKeywords;
+// use crate::geom_io::GeomCell;
+// use crate::ctrl_io::InputKeywords;
 
 #[derive(Debug,Clone,Serialize, Deserialize)]
 pub struct GeomeTRIC {
@@ -40,7 +40,9 @@ pub struct GeomeTRIC {
     pub verbose: i32,           // 0: concise and default, 1: normal, 2: verbose, 3: low-level function output
     // Hessian computation
     pub analytic_hessian: bool, // If true, use REST analytical Hessian instead of geomeTRIC numerical finite-difference
-
+    pub use_analdrv: Option<bool>,  // Use analytical derivative module (analdrv) for Hessian computation.
+                                    // Default None, which means usually uses driver `analdrv`; but if `[hessian]` section is present, then prefer `[hessian]` section.
+                                    // If set to true, always use `analdrv` for Hessian computation; if set to false, always use `[hessian]` section.
 }
 
 impl Default for GeomeTRIC {
@@ -69,6 +71,7 @@ impl Default for GeomeTRIC {
             prefix: "GeomeTRIC".to_string(),
             verbose: 0,
             analytic_hessian: false,
+            use_analdrv: None,
         }
     }
 }
@@ -214,6 +217,10 @@ pub fn parse_geometric_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<
             geometric.analytic_hessian = match tmp_ctrl.get("analytic_hessian").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(b) => *b,
                 other => false,
+            };
+            geometric.use_analdrv = match tmp_ctrl.get("use_analdrv").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => Some(*b),
+                other => None,
             };
             return Ok(Some(geometric));
         },

@@ -48,6 +48,8 @@
 //! 
 #![allow(unused)]
 #![allow(non_snake_case)]
+#![allow(mixed_script_confusables)]
+#![allow(confusable_idents)]
 extern crate rest_tensors as tensors;
 extern crate hdf5_metno as hdf5;
 extern crate chrono as time;
@@ -84,6 +86,7 @@ pub mod fileop;
 pub mod ri_cphf;
 pub mod lib_rint;
 pub mod x2c;
+pub mod analdrv;
 
 //extern crate rest;
 

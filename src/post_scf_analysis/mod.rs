@@ -10,7 +10,7 @@ pub mod spin_correction;
 use rest_libcint::prelude::rest_libcint_wrapper::int1e_r;
 use tensors::{MathMatrix, RIFull};
 
-use crate::constants::{ANG, AU2DEBYE};
+use crate::constants::{BOHR, AU2DEBYE};
 use crate::grad::{formated_force, formated_force_ev, numerical_force};
 use crate::mpi_io::MPIOperator;
 use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon, open_shell_sbge2_rayon};
@@ -130,7 +130,7 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
             }
         } else if output_type.eq("num_force") {
             let displace = match scf_data.mol.geom.unit {
-                crate::geom_io::GeomUnit::Angstrom => scf_data.mol.ctrl.nforce_displacement/ANG,
+                crate::geom_io::GeomUnit::Angstrom => scf_data.mol.ctrl.nforce_displacement/BOHR,
                 crate::geom_io::GeomUnit::Bohr => scf_data.mol.ctrl.nforce_displacement,
             };
             let (energy, num_force) = numerical_force(scf_data, displace, mpi_operator);

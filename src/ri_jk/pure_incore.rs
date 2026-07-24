@@ -1,4 +1,5 @@
 use super::prelude_dev::*;
+use log::warn;
 
 /* #region ri-vj incore */
 
@@ -127,7 +128,7 @@ pub fn get_vk_ri_incore_coeff(
     // check occupation not less than zero
     let occ_neg = rt::lt(&mo_occ, 0.0).sum();
     if occ_neg > 0 {
-        println!("[WARN] in generate_vk_ri_incore_coeff_with_rstsr, negative occupation found: {occ_neg} elements < 0");
+        warn!("in generate_vk_ri_incore_coeff_with_rstsr, negative occupation found: {occ_neg} elements < 0");
     }
 
     // compress mo_coeff with occupation
