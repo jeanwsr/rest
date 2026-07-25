@@ -40,7 +40,11 @@ pub fn g0w0(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool
     }else if gw_scheme=="x alpha"{
         ri_gw::x_alpha_gw(scf_data)
     }else if gw_scheme=="extrapolated"{
+        if gw_variant="CD"{
         gw_near_fermi_surface(scf_data,20,&vxc_nn,qp_ctrl.threshold)
+        }else if gw_="AC"{
+            
+        }
     }
     else if gw_scheme=="no gw"{
         Vec::new()
@@ -59,6 +63,7 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
     }
     scf_data.gwqp.0.clone()
 }
+single_orbital_gw_ac
 pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&MatrixFull<f64>,ri_row_n:&MatrixFull<f64>,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,n:usize,num_freq:usize,vxc_nn:f64)->f64{
     let start=Instant::now();
     let mut exchange=0.0;
@@ -261,6 +266,7 @@ where
     }
 }
 
+gw_near_fermi_surface_ac
 pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,threshold:f64)->Vec<f64>{
     let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
     println!("RI-OV Shape={:?}",ri_ov.size);
