@@ -267,4 +267,111 @@ mod tests {
             Err(AcError::InvalidEvaluationPoint)
         );
     }
+
+    #[test]
+    fn reproduces_rational_function_over_larger_grid() {
+        // f(z) = (3 + z) / (2 + 3z + z^2), rational (order-2 non-degenerate).
+        // Sample on 7 imaginary-axis points, then evaluate at a complex test point.
+        fn target(z: Complex64) -> Complex64 {
+            (Complex64::new(3.0, 0.0) + z) / (Complex64::new(2.0, 0.0) + z * Complex64::new(3.0, 0.0) + z * z)
+        }
+
+        let omegas = [0.1, 0.3, 0.7, 1.2, 2.0, 3.5, 6.0];
+        let samples: Vec<_> = omegas
+            .iter()
+            .map(|&omega| {
+                let z = Complex64::new(0.0, omega);
+                ImaginaryAxisSample::new(omega, target(z))
+            })
+            .collect();
+
+        let approx = PadeApproximant::from_imaginary_axis(&samples).unwrap();
+
+        // Evaluate near the real axis with a small broadening.
+        let z = Complex64::new(0.5, 0.002);
+        let err = (approx.evaluate(z).unwrap() - target(z)).norm();
+        assert!(err < 5.0e-10, "large error {:.2e} at z={}", err, z);
+
+        // Also test evaluate_retarded wrapper.
+        let sigma = approx.evaluate_retarded(0.5, 0.002).unwrap();
+        let err2 = (sigma - target(z)).norm();
+        assert!(err2 < 5.0e-10, "retarded error {:.2e}", err2);
+    }
+
+    #[test]
+    fn pade_interpolates_complex_test_points() {
+        // Sample the known rational function at a few points.
+        fn target(z: Complex64) -> Complex64 {
+            (Complex64::new(1.0, 0.0) + 0.5 * z) / (Complex64::new(1.0, 0.0) + 0.25 * z)
+        }
+
+        // Use fewer samples (<= order of rational function + 1)
+        // to avoid continued-fraction breakdown from over-sampling.
+        let omegas = [0.5, 2.0, 5.0];
+        let samples: Vec<_> = omegas
+            .iter()
+            .map(|&omega| {
+                let z = Complex64::new(0.0, omega);
+                ImaginaryAxisSample::new(omega, target(z))
+            })
+            .collect();
+
+        let approx = PadeApproximant::from_imaginary_axis(&samples).unwrap();
+
+        // Evaluate at a point near the real axis.
+        let z = Complex64::new(0.8, 0.01);
+        let err = (approx.evaluate(z).unwrap() - target(z)).norm();
+        assert!(err < 1.0e-10, "interpolation error {:.2e}", err);
+
+        // Retarded evaluation with positive broadening.
+        let sigma = approx.evaluate_retarded(0.8, 0.01).unwrap();
+        let exact_ret = target(Complex64::new(0.8, 0.01));
+        let err2 = (sigma - exact_ret).norm();
+        assert!(err2 < 1.0e-10, "retarded error {:.2e}", err2);
+    }
+
+    #[test]
+    fn pade_single_sample_returns_constant() {
+        let value = Complex64::new(1.7, -0.3);
+        let samples = [ImaginaryAxisSample::new(2.0, value)];
+        let approx = PadeApproximant::from_imaginary_axis(&samples).unwrap();
+
+        let result = approx.evaluate_retarded(0.5, 0.01).unwrap();
+        assert!((result - value).norm() < 1.0e-14);
+    }
+
+    #[test]
+    fn rejects_zero_imaginary_samples() {
+        assert!(matches!(
+            PadeApproximant::from_imaginary_axis(&[]),
+            Err(AcError::EmptySamples)
+        ));
+    }
+
+    #[test]
+    fn rejects_negative_frequency() {
+        let samples = [ImaginaryAxisSample::new(-0.5, Complex64::new(1.0, 0.0))];
+        assert!(matches!(
+            PadeApproximant::from_imaginary_axis(&samples),
+            Err(AcError::NegativeFrequency { index: 0 })
+        ));
+    }
+
+    #[test]
+    fn rejects_nan_imaginary_value() {
+        let samples = [ImaginaryAxisSample::new(1.0, Complex64::new(f64::NAN, 0.0))];
+        assert!(matches!(
+            PadeApproximant::from_imaginary_axis(&samples),
+            Err(AcError::NonFiniteSample { index: 0 })
+        ));
+    }
+
+    #[test]
+    fn rejects_inf_imaginary_value() {
+        let samples = [ImaginaryAxisSample::new(1.0, Complex64::new(f64::INFINITY, 0.0))];
+        assert!(matches!(
+            PadeApproximant::from_imaginary_axis(&samples),
+            Err(AcError::NonFiniteSample { index: 0 })
+        ));
+    }
 }
