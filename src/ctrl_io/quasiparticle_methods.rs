@@ -110,6 +110,12 @@ pub struct QuasiParticle {
     /// Default 0.001 (matching MolGW). Separated from cdgw_eta to prevent
     /// large broadening from incorrectly halving off-contour residues.
     pub cdgw_res_tol: f64,
+    /// Number of imaginary-axis self-energy samples used for Padé continuation.
+    pub ac_num_samples: usize,
+    /// Maximum external imaginary frequency (Ha) used for Padé sampling.
+    pub ac_omega_max: f64,
+    /// Positive broadening (Ha) used to evaluate Sigma(omega + i*eta).
+    pub ac_eta: f64,
     /// Number of states below/above HOMO-LUMO for the self-energy evaluation
     /// and for the real-axis de_max scan. States far from the gap (e.g. core states)
     /// contribute negligibly to the real-axis residues and inflate de_max, making
@@ -247,6 +253,9 @@ impl Default for QuasiParticle {
             qsgw_eta: 0.001,
             cdgw_eta: 0.001,
             cdgw_res_tol: 0.001,
+            ac_num_samples: 16,
+            ac_omega_max: 5.0,
+            ac_eta: 0.001,
             selfenergy_state_range: 100000,
             // response BSE grid sampling parameters (default: 2 points per dimension)
             response_bse_x_start: 0.0,
@@ -377,6 +386,9 @@ impl QuasiParticle {
         table.insert("qsgw_eta".to_string(), toml::Value::Float(self.qsgw_eta));
         table.insert("cdgw_eta".to_string(), toml::Value::Float(self.cdgw_eta));
         table.insert("cdgw_res_tol".to_string(), toml::Value::Float(self.cdgw_res_tol));
+        table.insert("ac_num_samples".to_string(), toml::Value::Integer(self.ac_num_samples as i64));
+        table.insert("ac_omega_max".to_string(), toml::Value::Float(self.ac_omega_max));
+        table.insert("ac_eta".to_string(), toml::Value::Float(self.ac_eta));
         table.insert("selfenergy_state_range".to_string(), toml::Value::Integer(self.selfenergy_state_range as i64));
         table.insert("response_bse_x_start".to_string(), toml::Value::Float(self.response_bse_x_start));
         table.insert("response_bse_x_end".to_string(), toml::Value::Float(self.response_bse_x_end));
@@ -779,6 +791,18 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 _ => 0.0,
             };
             tmp_input.cdgw_res_tol = match tmp_ctrl.get("cdgw_res_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),
+                _ => 0.001,
+            };
+            tmp_input.ac_num_samples = match tmp_ctrl.get("ac_num_samples").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(16) as usize,
+                _ => 16,
+            };
+            tmp_input.ac_omega_max = match tmp_ctrl.get("ac_omega_max").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(5.0),
+                _ => 5.0,
+            };
+            tmp_input.ac_eta = match tmp_ctrl.get("ac_eta").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),
                 _ => 0.001,
             };
