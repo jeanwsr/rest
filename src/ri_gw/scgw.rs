@@ -1,5 +1,6 @@
 //use std::simd::num;
 use crate::constants::PI;
+use crate::ctrl_io::quasiparticle_methods::GwVariant;
 use itertools::Itertools;
 use std::ops::Range;
 use crate::utilities;
@@ -30,25 +31,35 @@ use std::cmp;
 #[cfg(target_os = "linux")]
 use libc::seccomp_notif;
 
-pub fn g0w0(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
-    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let gw_scheme=qp_ctrl.gw_scheme.clone();
-    if gw_scheme=="qp equation"{
-        ri_gw::gw_calculations(scf_data,20,&vxc_nn,cancel_dfa_xc)
-    }else if gw_scheme=="linearize"{
-        ri_gw::linearized_gw(scf_data,20,&vxc_nn,cancel_dfa_xc)
-    }else if gw_scheme=="x alpha"{
+pub fn g0w0(
+    scf_data: &mut SCF,
+    num_freq: usize,
+    vxc_nn: &Vec<f64>,
+    cancel_dfa_xc: bool,
+) -> Vec<f64> {
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let gw_scheme = qp_ctrl.gw_scheme.clone();
+
+    if gw_scheme == "qp equation" {
+        ri_gw::gw_calculations(scf_data, 20, &vxc_nn, cancel_dfa_xc)
+    } else if gw_scheme == "linearize" {
+        ri_gw::linearized_gw(scf_data, 20, &vxc_nn, cancel_dfa_xc)
+    } else if gw_scheme == "x alpha" {
         ri_gw::x_alpha_gw(scf_data)
-    }else if gw_scheme=="extrapolated"{
-        if gw_variant="CD"{
-        gw_near_fermi_surface(scf_data,20,&vxc_nn,qp_ctrl.threshold)
-        }else if gw_="AC"{
-            
+    } else if gw_scheme == "extrapolated" {
+        match qp_ctrl.gw_variant {
+            GwVariant::Cd => {
+                gw_near_fermi_surface(scf_data, num_freq, &vxc_nn, qp_ctrl.threshold)
+            }
+            GwVariant::Ac => {
+                gw_near_fermi_surface_ac(scf_data, num_freq, &vxc_nn, qp_ctrl.threshold)
+            }
         }
-    }
-    else if gw_scheme=="no gw"{
+    } else if gw_scheme == "no gw" {
         Vec::new()
-    }else {panic!("invalid expression for gw scheme!")}
+    } else {
+        panic!("invalid expression for gw scheme!")
+    }
 }
 pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)->Vec<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
@@ -63,7 +74,20 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
     }
     scf_data.gwqp.0.clone()
 }
-single_orbital_gw_ac
+pub fn single_orbital_gw_ac(
+    _scf_data: &mut SCF,
+    _v_matrix: &MatrixFull<f64>,
+    _ri_ov: &MatrixFull<f64>,
+    _ri_row_n: &MatrixFull<f64>,
+    _w_c_at_freqs: &Vec<(f64, f64, MatrixFull<f64>)>,
+    _n: usize,
+    _num_freq: usize,
+    _vxc_nn: f64,
+) -> f64 {
+    unimplemented!(
+        "AC-REQ-01: orbital-resolved analytic-continuation GW kernel          has been registered but is not implemented yet"
+    )
+}
 pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&MatrixFull<f64>,ri_row_n:&MatrixFull<f64>,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,n:usize,num_freq:usize,vxc_nn:f64)->f64{
     let start=Instant::now();
     let mut exchange=0.0;
@@ -266,7 +290,16 @@ where
     }
 }
 
-gw_near_fermi_surface_ac
+pub fn gw_near_fermi_surface_ac(
+    _scf_data: &mut SCF,
+    _num_freq: usize,
+    _vxc_nn: &Vec<f64>,
+    _threshold: f64,
+) -> Vec<f64> {
+    unimplemented!(
+        "AC-REQ-02: near-Fermi analytic-continuation GW driver          has been registered but is not implemented yet"
+    )
+}
 pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,threshold:f64)->Vec<f64>{
     let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
     println!("RI-OV Shape={:?}",ri_ov.size);
