@@ -1330,7 +1330,13 @@ fn rayleigh_ritz_refine(
     };
     let inverse_dielectric = construct_inverse_dielectric(scf_data, &epsilon);
 
-    // Build full A-matrix matvec closure (same pattern as feast_solve_bse_tda)
+    // Build full A-matrix matvec closure (same pattern as feast_solve_bse_tda).
+    //
+    // For non-TDA the squared-form operator is (A-B) with metric (A+B)^{-1},
+    // mirroring feast_solve_bse_nontda; the Round-1 FEAST eigenvectors are
+    // X+Y vectors that are orthonormal in the (A+B)^{-1} metric (NOT in L2).
+    // The old code used the A-block operator with an L2 metric, which made the
+    // projected Gram matrix indefinite → Cholesky failed → empty result → panic.
     let num_auxbas = inverse_dielectric.size[0];
     let ri_ov = get_submatrix(scf_data, 'O', 'V', 'N');
     let mut ri_vv = get_submatrix(scf_data, 'V', 'V', 'N');
@@ -1343,9 +1349,25 @@ fn rayleigh_ritz_refine(
     ri_oo_tilde.reshape([occ_size * num_auxbas, occ_size]);
     ri_vv.reshape([num_auxbas * vir_size, vir_size]);
 
+    // For non-TDA also need the B-block integrals (mirrors feast_solve_bse_nontda).
+    // Built unconditionally so the same closures can be reused below; cheap.
+    let mut ri_ov_b = ri_ov.clone();
+    ri_ov_b.reshape([num_auxbas * occ_size, vir_size]);
+    let mut ri_ov_tilde = MatrixFull::new(ri_ov.size, 0.0);
+    _dgemm_full(&inverse_dielectric, 'N', &ri_ov, 'N', &mut ri_ov_tilde, 1.0, 0.0);
+    ri_ov_tilde.reshape([num_auxbas * occ_size, vir_size]);
+
+    // TDA operator = A; non-TDA operator = (A-B).  Both are borrowing closures so the
+    // integral matrices stay usable for the metric construction further below.
     let a_matvec = |z: &Vec<f64>| -> Vec<f64> {
         matvec::a_block_matvec(scf_data, qp_ctrl, &ri_vv, &ri_ov, &ri_oo_tilde, z)
     };
+    let amb_matvec = |z: &Vec<f64>| -> Vec<f64> {
+        let a = matvec::a_block_matvec(scf_data, qp_ctrl, &ri_vv, &ri_ov, &ri_oo_tilde, z);
+        let b = matvec::b_block_matvec(scf_data, qp_ctrl, &ri_ov, &ri_ov_b, &ri_ov_tilde, z);
+        a.into_iter().zip(b.into_iter()).map(|(ai, bi)| ai - bi).collect()
+    };
+    let op_matvec: &dyn Fn(&Vec<f64>) -> Vec<f64> = if qp_ctrl.bse_tda { &a_matvec } else { &amb_matvec };
 
     // Normalize input eigenvectors to unit L2 norm
     let mut eigvecs_norm: Vec<Vec<f64>> = Vec::with_capacity(k);
@@ -1358,8 +1380,8 @@ fn rayleigh_ritz_refine(
         }
     }
 
-    // Compute A * v_i for each normalized eigenvector
-    let av: Vec<Vec<f64>> = eigvecs_norm.iter().map(|v| a_matvec(v)).collect();
+    // Compute op * v_i for each normalized eigenvector
+    let av: Vec<Vec<f64>> = eigvecs_norm.iter().map(|v| op_matvec(v)).collect();
 
     // Check for NaN/Inf in A*v results
     let mut av_bad = false;
@@ -1435,15 +1457,93 @@ fn rayleigh_ritz_refine(
         }
         (evals, Some(psi_mat))
     } else {
-        // Non-TDA: vectors are 2X components, not orthonormal → generalized EVP
-        let mut s_proj = _dgemm_scaled(&v_mat, 'T', &v_mat, 'N', 1.0);
-        let mut s_min = f64::INFINITY; let mut s_max = f64::NEG_INFINITY;
-        for i in 0..k { for j in 0..k {
-            let sv = s_proj[[i, j]];
-            if sv.is_finite() { s_min = s_min.min(sv); s_max = s_max.max(sv); }
+        // Non-TDA: Round-1 FEAST solved (A-B)u = ω²(A+B)^{-1}u, equivalently
+        //   (A+B)(A-B) u = ω² u ,            u = X+Y .
+        // The converged X+Y vectors are orthonormal in the (A+B)^{-1} metric,
+        // NOT in L2, so any metric-based Cholesky/GEP projection is fragile
+        // (indefinite Gram matrix / CG asymmetry).  Instead we project the
+        // (generally non-symmetric) operator T = (A+B)(A-B) onto an L2-
+        // orthonormal basis Q and solve the resulting standard (non-symmetric)
+        // eigenproblem with dgeev — no metric, no Cholesky, no CG.
+
+        // (1) Build an L2-orthonormal basis Q from the input vectors via
+        //     modified Gram-Schmidt.  (eigvecs_norm are unit L2-norm but not
+        //     mutually orthogonal.)
+        let mut q_orth: Vec<Vec<f64>> = Vec::with_capacity(k);
+        for v in eigvecs_norm.iter() {
+            let mut w = v.clone();
+            for q in q_orth.iter() {
+                let proj: f64 = w.iter().zip(q.iter()).map(|(wi, qi)| wi * qi).sum();
+                for i in 0..n { w[i] -= proj * q[i]; }
+            }
+            let nrm: f64 = w.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if nrm > 1e-12 {
+                for x in w.iter_mut() { *x /= nrm; }
+                q_orth.push(w);
+            }
+        }
+        let k_eff = q_orth.len();
+        if k_eff == 0 {
+            eprintln!("Warning: Rayleigh-Ritz non-TDA: subspace collapsed to rank 0, using original eigenvectors");
+            return (Vec::new(), eigvecs.clone());
+        }
+        // Pack Q (n × k_eff)
+        let mut q_mat = MatrixFull::new([n, k_eff], 0.0);
+        for j in 0..k_eff { for i in 0..n { q_mat[[i, j]] = q_orth[j][i]; } }
+
+        // (2) T·Q where T = (A+B)(A-B): apply (A-B) then (A+B) to each column.
+        //     op_matvec is (A-B); apb_matvec is (A+B).
+        let apb_matvec = |p: &Vec<f64>| -> Vec<f64> {
+            let a = matvec::a_block_matvec(scf_data, qp_ctrl, &ri_vv, &ri_ov, &ri_oo_tilde, p);
+            let b = matvec::b_block_matvec(scf_data, qp_ctrl, &ri_ov, &ri_ov_b, &ri_ov_tilde, p);
+            a.into_iter().zip(b.into_iter()).map(|(ai, bi)| ai + bi).collect()
+        };
+        let mut tq = MatrixFull::new([n, k_eff], 0.0);
+        for j in 0..k_eff {
+            let qj: Vec<f64> = (0..n).map(|i| q_mat[[i, j]]).collect();
+            let amb_qj = op_matvec(&qj);      // (A-B) q_j
+            let t_qj = apb_matvec(&amb_qj);   // (A+B)(A-B) q_j
+            for i in 0..n { tq[[i, j]] = t_qj[i]; }
+        }
+
+        // (3) T_proj = Q^T · (T·Q)  (k_eff × k_eff, generally non-symmetric)
+        let t_proj = _dgemm_scaled(&q_mat, 'T', &tq, 'N', 1.0);
+        let mut t_min = f64::INFINITY; let mut t_max = f64::NEG_INFINITY;
+        for i in 0..k_eff { for j in 0..k_eff {
+            let tv = t_proj[[i, j]];
+            if tv.is_finite() { t_min = t_min.min(tv); t_max = t_max.max(tv); }
         }}
-        println!("Rayleigh-Ritz: S_proj range=[{:.3e}, {:.3e}] (k={})", s_min, s_max, k);
-        solve_generalized_eigenproblem(&h_proj, &mut s_proj, k)
+        println!("Rayleigh-Ritz: T_proj range=[{:.3e}, {:.3e}] (k_eff={})", t_min, t_max, k_eff);
+
+        // (4) Standard (non-symmetric) EVP on T_proj → eigenvalues are ω².
+        let (_, wr, wi, _, vr, info) = _dgeev(&t_proj, 'N', 'V');
+        if info != 0 {
+            eprintln!("Warning: Rayleigh-Ritz non-TDA dgeev failed with info={}, using original eigenvectors", info);
+            return (Vec::new(), eigvecs.clone());
+        }
+        // Keep real, positive ω² eigenvalues, sort ascending by ω.
+        let mut eigen_pairs: Vec<(usize, f64)> = (0..k_eff)
+            .filter(|&j| wi[j].abs() < 1e-8 && wr[j] > 0.0)
+            .map(|j| (j, wr[j]))
+            .collect();
+        if eigen_pairs.is_empty() {
+            eprintln!("Warning: Rayleigh-Ritz non-TDA: no real positive ω² eigenvalues, using original eigenvectors");
+            return (Vec::new(), eigvecs.clone());
+        }
+        eigen_pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let m_sel = eigen_pairs.len();
+        let omega: Vec<f64> = eigen_pairs.iter().map(|&(_, w2)| w2.sqrt()).collect();
+        // Eigenvector coefficients in the Q basis: vr[:,orig_j]
+        let mut psi_mat = MatrixFull::new([k_eff, m_sel], 0.0);
+        for (col, &(orig_j, _)) in eigen_pairs.iter().enumerate() {
+            for row in 0..k_eff { psi_mat[[row, col]] = vr[[row, orig_j]]; }
+        }
+        // Stash Q so the Ritz-transform below uses the orthonormal basis:
+        // ritz_vec[i] = Σ_j psi[j,i] * q_orth[j].  We return evals=ω here; the
+        // caller filters by [emin, emax] (the ω window).  Replace eigvecs_norm
+        // with Q (length k_eff) — the transform loop below uses eigvecs_norm.len().
+        eigvecs_norm = q_orth.clone();
+        (omega, Some(psi_mat))
     };
     let psi = match psi_opt {
         Some(p) => p,
@@ -1455,10 +1555,14 @@ fn rayleigh_ritz_refine(
 
     // Transform: ritz_vec[i] = Σ_j psi[j,i] * eigvecs_norm[j], then L2-normalize.
     // _dgeev eigenvectors are not unit-norm, so explicit normalization is needed.
+    // Use eigvecs_norm.len() as the row dimension: it equals k for TDA, and
+    // k_eff (≤ k) for non-TDA where eigvecs_norm was replaced by the orthonormal
+    // basis q_orth above.
+    let k_rows = eigvecs_norm.len();
     let mut ritz_vecs: Vec<Vec<f64>> = Vec::with_capacity(ritz_eigenvalues.len());
     for i in 0..ritz_eigenvalues.len() {
         let mut new_v = vec![0.0; n];
-        for j in 0..k {
+        for j in 0..k_rows {
             let coeff = psi[[j, i]];
             for idx in 0..n {
                 new_v[idx] += coeff * eigvecs_norm[j][idx];

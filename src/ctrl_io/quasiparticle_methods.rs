@@ -212,7 +212,7 @@ impl Default for QuasiParticle {
             gw_imag_rayon:true,
             bse_auxbas_path: None,
             bse_feast_renormalized_doubles: false,
-            bse_renormalized_doubles_extra_width: 0.1,
+            bse_renormalized_doubles_extra_width: 0.5,
             bse_feast_precondition_type: String::from("inner_gmres"),
             bse_feast_inner_gmres_tol: 0.0001,
             bse_feast_inner_gmres_restart: 50,
@@ -675,8 +675,8 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 _ => false,
             };
             tmp_input.bse_renormalized_doubles_extra_width = match tmp_ctrl.get("bse_renormalized_doubles_extra_width").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.1),
-                _ => 0.1,
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.5),
+                _ => 0.5,
             };
             tmp_input.bse_feast_precondition_type = match tmp_ctrl.get("bse_feast_precondition_type").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => {
