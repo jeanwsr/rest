@@ -11,7 +11,7 @@ use crate::ri_gw::get_occupation_parameters;
 //use rest::molecule_io::Molecule;
 use crate::ri_gw;
 use crate::molecule_io::Molecule;
-use rest_tensors::matrix::matrix_blas_lapack::{_dgeev,_dgemm_full,_newton_schulz_inverse_square_root_v02};
+use rest_tensors::matrix::matrix_blas_lapack::{_dgeev,_dgemm_full,_newton_schulz_inverse_square_root_v02,_dsvd,_dsyevd};
 use std::fs::OpenOptions;
 use std::time::Instant;
 use std::{f64, fs::File, io::Write};
@@ -62,7 +62,7 @@ pub fn bse_main(scf_data:&mut SCF){
                 println!("#{} Excitation energy={}, norm={:.6}",n,e,vec_norm);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
-                leading_components(&v,occ_size,vir_size)});
+                leading_components(&v,occ_size,vir_size,qp_ctrl.print_nto)});
             println!("The first singlet excitation obtained by BSE is {}",excitations_singlets[0].0);
             let t_number = number.min(excitations_triplets.len());
             println!("First {} Triplet Excitations:",t_number);
@@ -72,7 +72,7 @@ pub fn bse_main(scf_data:&mut SCF){
                 println!("#{} Excitation energy={}, norm={:.6}",n,e,vec_norm);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
-                leading_components(&v,occ_size,vir_size)});
+                leading_components(&v,occ_size,vir_size,qp_ctrl.print_nto)});
             println!("The first triplet excitation obtained by BSE is {}",excitations_triplets[0].0);
         }else{
             println!("BSE Calculation Results of Both Singlets and Triplets without TDA:");
@@ -84,7 +84,7 @@ pub fn bse_main(scf_data:&mut SCF){
                 let v=dipoles::normalize(vec,false);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,false);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
-                leading_components(&v,occ_size,vir_size)
+                leading_components(&v,occ_size,vir_size,qp_ctrl.print_nto)
             });
             println!("The first singlet excitation obtained by BSE is {}",excitations_singlets[0].0);
             let t_number = number.min(excitations_triplets.len());
@@ -95,7 +95,7 @@ pub fn bse_main(scf_data:&mut SCF){
                 let v=dipoles::normalize(vec,false);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,false);
                 println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
-                leading_components(&v,occ_size,vir_size)
+                leading_components(&v,occ_size,vir_size,qp_ctrl.print_nto)
             });
             println!("The first triplet excitation obtained by BSE is {}",excitations_triplets[0].0);
         }
@@ -124,7 +124,7 @@ pub fn bse_main(scf_data:&mut SCF){
                 let dipole_square = dipoles::transition_dipole_square(&dipole_matrix, &v, true);
                 println!("\tTransition Dipole Square:{}; Oscillator Strength:{}",
                     dipole_square, dipole_square * e * 2.0 / 3.0);
-                leading_components(&v, occ_size, vir_size);
+                leading_components(&v, occ_size, vir_size,qp_ctrl.print_nto);
             }
             println!("The first excitation obtained by BSE is {}", excitations[0].0);
             if qp_ctrl.save_bse_excitations {
@@ -153,7 +153,7 @@ pub fn bse_main(scf_data:&mut SCF){
             let v=dipoles::normalize(vec,false);
             let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,false);
             println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
-            leading_components(&v,occ_size,vir_size)});
+            leading_components(&v,occ_size,vir_size,qp_ctrl.print_nto)});
             println!("\n\nThe first excitation obtained by BSE is {}",excitations[0].0);
             if qp_ctrl.save_bse_excitations==true{
                 let line = excitations.iter().map(|(num,vec)| num.to_string()).collect::<Vec<_>>().join(",");
@@ -178,7 +178,7 @@ pub fn bse_main(scf_data:&mut SCF){
                 println!("#{} Excitation energy={}, norm={:.6}",n,e,vec_norm);
                 let dipole_square=dipoles::transition_dipole_square(&dipole_matrix,&v,true);
                 println!("\tTransition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
-                leading_components(&v,occ_size,vir_size)});
+                leading_components(&v,occ_size,vir_size,qp_ctrl.print_nto)});
             println!("The first excitation obtained by BSE is {}",excitations[0].0);
             if qp_ctrl.save_bse_excitations==true{
                 let line = excitations.iter().map(|(num,vec)| num.to_string()).collect::<Vec<_>>().join(",");
@@ -737,7 +737,81 @@ pub fn zip_and_sort(
     eigens.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     eigens
 }
-pub fn leading_components(eigenvector: &Vec<f64>,occ_size:usize, vir_size: usize){
+pub fn promoted_density_analysis(x:&Vec<f64>,y:&Vec<f64>,occ_size:usize,vir_size:usize){
+    let x_mat=MatrixFull::from_vec([occ_size,vir_size],x.clone()).unwrap();
+    let y_mat=MatrixFull::from_vec([occ_size,vir_size],y.clone()).unwrap();
+
+    let mut d_h=MatrixFull::new([occ_size,occ_size],0.0);
+    _dgemm_full(&x_mat,'N',&x_mat,'T',&mut d_h,1.0,0.0);
+    let mut tmp=MatrixFull::new([occ_size,occ_size],0.0);
+    _dgemm_full(&y_mat,'N',&y_mat,'T',&mut tmp,1.0,0.0);
+    d_h.iter_mut().zip(tmp.iter()).for_each(|(d,t)| *d+=*t);
+
+    let mut d_p=MatrixFull::new([vir_size,vir_size],0.0);
+    _dgemm_full(&x_mat,'T',&x_mat,'N',&mut d_p,1.0,0.0);
+    tmp=MatrixFull::new([vir_size,vir_size],0.0);
+    _dgemm_full(&y_mat,'T',&y_mat,'N',&mut tmp,1.0,0.0);
+    d_p.iter_mut().zip(tmp.iter()).for_each(|(d,t)| *d+=*t);
+
+    let (eigvecs_h,eigvals_h,_)=_dsyevd(&d_h,'V');
+    let (eigvecs_p,eigvals_p,_)=_dsyevd(&d_p,'V');
+    let eigvecs_h=eigvecs_h.unwrap();
+    let eigvecs_p=eigvecs_p.unwrap();
+    let trace_h: f64 = eigvals_h.iter().sum();
+    let trace_p: f64 = eigvals_p.iter().sum();
+
+    println!("Promoted Electron Number: Dh={:.6}, Dp={:.6}", trace_h*2.0, trace_p*2.0);
+
+    let num_h = eigvals_h.len();
+    let num_p = eigvals_p.len();
+    let mut h_indices: Vec<usize> = (0..num_h).collect();
+    h_indices.sort_by(|&a,&b| eigvals_h[b].partial_cmp(&eigvals_h[a]).unwrap());
+    let mut p_indices: Vec<usize> = (0..num_p).collect();
+    p_indices.sort_by(|&a,&b| eigvals_p[b].partial_cmp(&eigvals_p[a]).unwrap());
+
+    let max_ch=5;
+    for ch in 0..max_ch.min(num_h) {
+        let k = h_indices[ch];
+        let lambda = eigvals_h[k];
+        if lambda < 1e-8 { continue; }
+        let contribution = if trace_h > 1e-12 { lambda / trace_h } else { 0.0 };
+        let vec_slice = &eigvecs_h.data[k * occ_size..(k + 1) * occ_size];
+        let mut pairs: Vec<(usize, f64)> = vec_slice.iter()
+            .enumerate()
+            .filter(|(_, &amp)| amp.abs() > 0.1)
+            .map(|(i, &amp)| (i, amp))
+            .collect();
+        pairs.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
+        print!("      Detachment Channel #{}: contribution={:.4}, leading MOs(only including amplitudes greater than 0.1): ", ch + 1, contribution);
+        for (idx, (mo, amp)) in pairs.iter().enumerate() {
+            if idx > 0 { print!(", "); }
+            print!("#{}({:.2})", mo + 1, amp);
+        }
+        println!();
+    }
+
+    for ch in 0..max_ch.min(num_p) {
+        let k = p_indices[ch];
+        let lambda = eigvals_p[k];
+        if lambda < 1e-8 { continue; }
+        let contribution = if trace_p > 1e-12 { lambda / trace_p } else { 0.0 };
+        let vec_slice = &eigvecs_p.data[k * vir_size..(k + 1) * vir_size];
+        let mut pairs: Vec<(usize, f64)> = vec_slice.iter()
+            .enumerate()
+            .filter(|(_, &amp)| amp.abs() > 0.1)
+            .map(|(a, &amp)| (a, amp))
+            .collect();
+        pairs.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
+        print!("      Attachment Channel #{}: contribution={:.4}, leading MOs(only including amplitudes greater than 0.1): ", ch + 1, contribution);
+        for (idx, (mo, amp)) in pairs.iter().enumerate() {
+            if idx > 0 { print!(", "); }
+            print!("#{}({:.2})", occ_size + mo + 1, amp);
+        }
+        println!();
+    }
+}
+
+pub fn leading_components(eigenvector: &Vec<f64>,occ_size:usize, vir_size: usize, print_nto: bool,){
     let mut components: Vec<(usize, usize, f64)> = eigenvector
         .iter()
         .enumerate()
@@ -764,6 +838,56 @@ pub fn leading_components(eigenvector: &Vec<f64>,occ_size:usize, vir_size: usize
     for i in 0..length{
         println!("      #{}->#{},amplitude={}",components[i].0,components[i].1,components[i].2);
     }
+    if !print_nto {
+        return;
+    }   
+    println!("Primary Components (Natural Transition Orbitals) of this excitation:");
+    if eigenvector.len()==occ_size*vir_size{
+        let density_matrix=MatrixFull::from_vec([occ_size,vir_size],eigenvector.clone()).unwrap();
+        let (holes,sigmas,electrons_t)=_dsvd(&density_matrix,'A','A');
+        let electrons=electrons_t.transpose();
+        for component in 0..3{
+            println!("      sigma_{}={:.4}:",component,sigmas[component]);
+            let hole=&holes.data[component*occ_size..(component+1)*occ_size].to_vec();
+            let electron=&electrons.data[component*vir_size..(component+1)*vir_size].to_vec();
+            let mut h_pairs:Vec<(usize,f64)>=hole.iter().enumerate().filter(|(_,&v)|v.abs()>0.1).map(|(i,&v)|(i+1,v)).collect();
+            h_pairs.sort_by(|a,b|b.1.abs().partial_cmp(&a.1.abs()).unwrap());
+            print!("        hole: ");
+            h_pairs.iter().enumerate().for_each(|(idx,(mo,amp))|{if idx>0{print!(", ")};print!("#{}({:.2})",mo,amp)});
+            println!();
+            let mut e_pairs:Vec<(usize,f64)>=electron.iter().enumerate().filter(|(_,&v)|v.abs()>0.1).map(|(a,&v)|(occ_size+a+1,v)).collect();
+            e_pairs.sort_by(|a,b|b.1.abs().partial_cmp(&a.1.abs()).unwrap());
+            print!("        electron: ");
+            e_pairs.iter().enumerate().for_each(|(idx,(mo,amp))|{if idx>0{print!(", ")};print!("#{}({:.2})",mo,amp)});
+            println!();
+        }
+        promoted_density_analysis(eigenvector,&vec![0.0;occ_size*vir_size],occ_size,vir_size);
+    }else{
+        let x_vec=eigenvector[0..occ_size*vir_size].to_vec();
+        let y_vec=eigenvector[occ_size*vir_size..occ_size*vir_size*2].to_vec();
+        let xpy_vec=x_vec.iter().zip(y_vec.iter()).map(|(x_ia,y_ia)|x_ia+y_ia).collect();
+        let density_matrix=MatrixFull::from_vec([occ_size,vir_size],xpy_vec).unwrap();
+        let (holes,sigmas,electrons_t)=_dsvd(&density_matrix,'A','A');
+        let electrons=electrons_t.transpose();
+        for component in 0..3{
+            println!("      sigma_{}={:.4}:",component,sigmas[component]);
+            let hole=&holes.data[component*occ_size..(component+1)*occ_size].to_vec();
+            let electron=&electrons.data[component*vir_size..(component+1)*vir_size].to_vec();
+            let mut h_pairs:Vec<(usize,f64)>=hole.iter().enumerate().filter(|(_,&v)|v.abs()>0.1).map(|(i,&v)|(i+1,v)).collect();
+            h_pairs.sort_by(|a,b|b.1.abs().partial_cmp(&a.1.abs()).unwrap());
+            print!("        hole: ");
+            h_pairs.iter().enumerate().for_each(|(idx,(mo,amp))|{if idx>0{print!(", ")};print!("#{}({:.2})",mo,amp)});
+            println!();
+            let mut e_pairs:Vec<(usize,f64)>=electron.iter().enumerate().filter(|(_,&v)|v.abs()>0.1).map(|(a,&v)|(occ_size+a+1,v)).collect();
+            e_pairs.sort_by(|a,b|b.1.abs().partial_cmp(&a.1.abs()).unwrap());
+            print!("        electron: ");
+            e_pairs.iter().enumerate().for_each(|(idx,(mo,amp))|{if idx>0{print!(", ")};print!("#{}({:.2})",mo,amp)});
+            println!();
+        }
+        promoted_density_analysis(&x_vec,&y_vec,occ_size,vir_size);
+    }
+
+
 }
 pub fn show_all_eigenpairs(eigenpairs:&Vec<(f64,Vec<f64>)>){
     eigenpairs.iter().for_each(|(val,vec)|println!("eigenvalue:{},eigenvector:{:#?}",val,vec))

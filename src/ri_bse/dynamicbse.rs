@@ -844,7 +844,7 @@ pub fn dynamic_bse_main(scf_data: &SCF, qp_ctrl: &QuasiParticle) {
             let xv: Vec<f64> = (0..n).map(|i| result.eigenvectors[[i, k]]).collect();
             println!("\n  Excitation #{}: λ = {:.6} Ha = {:.6} eV",
                 k, result.eigenvalues[k], result.eigenvalues[k] * EV);
-            super::leading_components(&xv, occ_size, vir_size);
+            super::leading_components(&xv, occ_size, vir_size, qp_ctrl.print_nto);
         }
     }
 

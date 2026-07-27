@@ -1291,6 +1291,7 @@ fn print_ritz_eigenpairs(
     occ_size: usize,
     vir_size: usize,
 ) {
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let dipole_matrix = super::dipoles::compute_dipole_matrix(scf_data);
     let k = ritz_eigenvalues.len();
     println!("Rayleigh-Ritz {}: {} excitations within the window:", label, k);
@@ -1301,7 +1302,7 @@ fn print_ritz_eigenpairs(
                  vec.iter().map(|x| x*x).sum::<f64>().sqrt());
         println!("Transition Dipole Square:{}; Oscillator Strength:{}",
                  dipole_square, dipole_square * e * 2.0 / 3.0);
-        super::leading_components(&v, occ_size, vir_size);
+        super::leading_components(&v, occ_size, vir_size,qp_ctrl.print_nto);
     }
 }
 
