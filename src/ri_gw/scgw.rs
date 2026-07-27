@@ -113,16 +113,10 @@ pub fn single_orbital_gw_ac(
             ac_num_samples
         );
     }
-    if ac_omega_max <= 0.0 {
+    if ac_omega_max < 0.0 {
         panic!(
             "ac_omega_max must be > 0 (got {})",
             ac_omega_max
-        );
-    }
-    if ac_eta <= 0.0 {
-        panic!(
-            "ac_eta must be > 0 (got {})",
-            ac_eta
         );
     }
 
@@ -528,7 +522,6 @@ pub fn gw_near_fermi_surface_ac(
             &scf_data.gwqp.0,
             &scf_data.gwqp.1,
             num_state,
-            occ_size,
             vir_size,
             num_freq,
         )
