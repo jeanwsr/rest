@@ -3,7 +3,6 @@ use std::{sync::mpsc::channel, num};
 use libm::{erf, erfc, sqrt};
 use num_traits::{abs, Float};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator, IndexedParallelIterator};
-use statrs::statistics::Max;
 use tensors::{MatrixFull, MathMatrix, BasicMatrix, matrix_blas_lapack::_dgemm_full};
 
 use crate::{scf_io::{SCF,scf, SCFType}, utilities::{self, TimeRecords}};
@@ -632,7 +631,7 @@ pub fn evaluate_osrpa_response(
 #[test]
 fn test_absmax() {
     let dd = vec![1.0,-2.0,3.0,-4.3, -6.0, 5.0];
-    let ff = dd.iter().map(|x| (*x).abs()).collect::<Vec<f64>>().max();
+    let ff = dd.iter().map(|x| x.abs()).reduce(f64::max).unwrap();
 
 
     println!("abs_max = {}", ff);

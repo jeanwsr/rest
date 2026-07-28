@@ -695,7 +695,7 @@ pub fn nlfeast_bse(
     };
 
     // ── Initial subspace: Gaussian-weighted by QP energy gaps ──
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut q_mat = MatrixFull::new([n, m0], 0.0);
     let step = if m0 > 1 { (2.0 * radius) / (m0 - 1) as f64 } else { 0.0 };
     let half_step = step * 0.5;
@@ -705,7 +705,7 @@ pub fn nlfeast_bse(
         for i in 0..n {
             let de = energy_diag[i] - e_k;
             let weight = (-de * de / a_width.max(1e-30)).exp();
-            let sign = if rng.gen::<f64>() > 0.5 { 1.0 } else { -1.0 };
+            let sign = if rng.random::<f64>() > 0.5 { 1.0 } else { -1.0 };
             q_mat[[i, j]] = sign * weight;
         }
     }
@@ -1336,10 +1336,10 @@ pub fn nlfeast_dynamical_bse_v3(
     };
 
     // ── Initial subspace Q: random orthonormal ──
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let n_init = m0.min(n);
     let mut q = MatrixFull::new([n, n_init], 0.0);
-    for j in 0..n_init { for i in 0..n { q[[i, j]] = rng.gen::<f64>() * 2.0 - 1.0; } }
+    for j in 0..n_init { for i in 0..n { q[[i, j]] = rng.random::<f64>() * 2.0 - 1.0; } }
     q = qr_orthonormalise(&q);
     let mut m0_eff = q.size[1];
 

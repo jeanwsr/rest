@@ -6,7 +6,8 @@ use crate::scf_io::SCF;
 use crate::{geom_io,dft,molecule_io, basis_io, utilities};
 use crate::dft::Grids as dftgrids;
 use crate::molecule_io::Molecule;
-use rand::{Rng, SeedableRng, StdRng};
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
 use rayon::prelude::{IntoParallelRefMutIterator, IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator};
 use rest_tensors::{MatrixFull, RIFull, ERIFull};
 use tensors::external_libs::matr_copy_from_ri;
@@ -165,10 +166,11 @@ pub fn cvt_isdf_v2(rgrids_old: &Vec<[f64;3]>, lambda_r_old: &Vec<f64>, n_mu: usi
 
     //类manual_seed
     let seed: [usize; 64] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64];
-    let mut rng: StdRng = SeedableRng::from_seed(&seed[..]);
+    let seed_bytes = std::array::from_fn::<u8, 32, _>(|i| seed[i] as u8);
+    let mut rng: StdRng = SeedableRng::from_seed(seed_bytes);
     let mut c_mu: Vec<[f64;3]> = vec![[0.0;3];n_mu];
     for i in 0..n_mu {
-        let mut random_number: u32 = rng.gen_range(0, lambda_r.len() as u32);
+        let mut random_number: u32 = rng.random_range(0u32..lambda_r.len() as u32);
         c_mu[i] = rgrids[random_number as usize]
         
     }
@@ -788,8 +790,8 @@ pub fn atom_isdf(rgrids_old: &Vec<[f64;3]>, lambda_r_old: &Vec<f64>, n_mu: usize
     // 随机从格点中选取c_mu
     let mut c_mu: Vec<[f64;3]> = vec![[0.0;3];n_mu];
     for i in 0..n_mu{
-        let mut rng = rand::thread_rng();
-        let mut random_number = rng.gen_range(0, lambda_r.len());
+        let mut rng = rand::rng();
+        let mut random_number = rng.random_range(0..lambda_r.len());
         c_mu[i] = rgrids[random_number];
     }
     

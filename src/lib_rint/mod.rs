@@ -13,7 +13,7 @@ use rest_tensors::matrix_blas_lapack::{
     _dsolve, _dsyev, _dsyrk, omp_get_num_threads_wrapper, omp_set_num_threads_wrapper,
 };
 use rest_tensors::{MatrixFull, MatrixFullSlice, MatrixUpper, RIFull, TensorOpt, TensorOptMut};
-use statrs::function::erf::erf;
+use libm::erf;
 use std::array;
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
