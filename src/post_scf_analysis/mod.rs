@@ -1,6 +1,7 @@
 #![warn(unused_imports)]
 pub mod rand_wf_real_space;
 pub mod cube_build;
+pub mod hirshfeld;
 pub mod molden_build;
 pub mod mulliken;
 pub mod strong_correlation_correction;
@@ -128,6 +129,11 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
                 let dp = evaluate_dipole_moment(scf_data, None);
                 println!("Dipole Moment in DEBYE: {:16.8}, {:16.8}, {:16.8}", dp[0], dp[1], dp[2]);
             }
+        } else if output_type.eq("hirshfeld") || output_type.eq("hirshfeld_charge") {
+            if mpi_operator.is_some() {
+                panic!("The MPI version is not yet implemented for Hirshfeld charge analysis");
+            }
+            hirshfeld::print_hirshfeld_analysis(scf_data);
         } else if output_type.eq("num_force") {
             let displace = match scf_data.mol.geom.unit {
                 crate::geom_io::GeomUnit::Angstrom => scf_data.mol.ctrl.nforce_displacement/BOHR,

@@ -1193,6 +1193,54 @@ pub fn transform_density_to_cartesian_shell_shared(
     p_cart
 }
 
+pub fn transform_operator_from_cartesian_shell_shared(
+    geom: &GeomCell,
+    basis4elem: &[Basis4Elem],
+    v_cart: &MatrixFull<f64>,
+    target_nao: usize,
+    caller: &str,
+    is_aux: bool,
+) -> MatrixFull<f64> {
+    if v_cart.size == [target_nao, target_nao] {
+        return v_cart.clone();
+    }
+    let nao_cart = v_cart.size[0];
+    assert_eq!(
+        v_cart.size,
+        [nao_cart, nao_cart],
+        "{}: shell_shared operator must be square, got {:?}",
+        caller,
+        v_cart.size,
+    );
+    let nao_sph = count_spheric_ao_shell_shared(geom, basis4elem, is_aux);
+    assert_eq!(
+        target_nao, nao_sph,
+        "{}: shell_shared operator target size mismatch, got {}, expected {}",
+        caller, target_nao, nao_sph
+    );
+    let transform =
+        build_cart_from_spheric_transform_shell_shared(geom, basis4elem, nao_cart, nao_sph, is_aux);
+    let mut work = MatrixFull::new([nao_cart, nao_sph], 0.0);
+    work.to_matrixfullslicemut().lapack_dgemm(
+        &v_cart.to_matrixfullslice(),
+        &transform.to_matrixfullslice(),
+        'N',
+        'N',
+        1.0,
+        0.0,
+    );
+    let mut v_sph = MatrixFull::new([nao_sph, nao_sph], 0.0);
+    v_sph.to_matrixfullslicemut().lapack_dgemm(
+        &transform.to_matrixfullslice(),
+        &work.to_matrixfullslice(),
+        'T',
+        'N',
+        1.0,
+        0.0,
+    );
+    v_sph
+}
+
 pub fn transform_mo_coeff_to_cartesian_shell_shared(
     geom: &GeomCell,
     basis4elem: &[Basis4Elem],
