@@ -43,6 +43,11 @@ pub struct GeomeTRIC {
     pub use_analdrv: Option<bool>,  // Use analytical derivative module (analdrv) for Hessian computation.
                                     // Default None, which means usually uses driver `analdrv`; but if `[hessian]` section is present, then prefer `[hessian]` section.
                                     // If set to true, always use `analdrv` for Hessian computation; if set to false, always use `[hessian]` section.
+    pub fac: Option<f64>,           // Multiplicative factor to covalent-radii criterion for bond detection
+                                    // in geomeTRIC's build_topology (REST-internal, not forwarded to run_optimization).
+                                    // Default None -> geomeTRIC default 1.2. Lower values (e.g. 0.9) prune spurious
+                                    // long-range contacts such as ionic Sr-O in perovskite clusters, which sharply
+                                    // reduces the number of redundant internal coordinates (distances/angles/dihedrals).
 }
 
 impl Default for GeomeTRIC {
@@ -72,6 +77,7 @@ impl Default for GeomeTRIC {
             verbose: 0,
             analytic_hessian: false,
             use_analdrv: None,
+            fac: None,
         }
     }
 }
@@ -220,6 +226,10 @@ pub fn parse_geometric_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<
             };
             geometric.use_analdrv = match tmp_ctrl.get("use_analdrv").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(b) => Some(*b),
+                other => None,
+            };
+            geometric.fac = match tmp_ctrl.get("fac").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => tmp_num.as_f64(),
                 other => None,
             };
             return Ok(Some(geometric));

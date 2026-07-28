@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use num_complex::ComplexFloat;
+//use num_complex::ComplexFloat;
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use tensors::{matrix_blas_lapack::_dgemv, BasicMatrix, MatrixFull, MatrixUpper};
 
-use crate::{molecule_io::Molecule, scf_io::{SCFType, SCF}};
+use crate::scf_io::SCFType;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ForceStateOccupation {
