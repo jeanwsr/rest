@@ -991,6 +991,11 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 - `converge_drms`：取值f64。构型优化中上下两步构型变化的收敛阈值。缺省值：1.2e-3
 - `converge_dmax`：取值f64。最大构型变化的收敛阈值。缺省值：1.8e-3
 - `coordsys`：取值String。坐标系统设置。缺省值："tric"。如果有其他需求见geomeTRIC的官方说明：https://geometric.readthedocs.io/en/latest/
+    - 可选项：`"tric"`（缺省，平动-转动内坐标，适合弱键复合物/团簇）、`"dlc"`（标准离域内坐标，按共价键连接性生成）、`"hdlc"`（混合 DLC，每原子补 Cartesian）、`"cart"`（纯笛卡尔）、`"prim"`/`"tric-p"`（不离域的原始内坐标）
+    - **约束优化（固定原子）仅支持 DLC 类坐标**（`tric`/`dlc`/`hdlc`）；`cart`/`prim`/`tric-p` 用约束时 geomeTRIC 会报错
+- `fac`：取值f64（可选）。geomeTRIC 成键判据中共价半径的乘性因子（`build_topology` 的 `Fac` 参数）。原子间距离 < `fac` ×（共价半径和）时判为成键，键图决定后续生成的内坐标（键长/键角/二面）数目。缺省值：不设置时沿用 geomeTRIC 缺省 1.2。
+    - 对密堆积或含大阳离子的体系（如 SrTiO₃ 团簇、金属有机框架），缺省 1.2 可能将离子接触（如 Sr–O）误判为共价键，生成过多冗余内坐标；此时可降到 **0.9–1.0** 以减少内坐标数目
+    - 取值过小（如 0.8）会漏掉真实共价键，需根据体系经验性调整；普通有机/小分子体系一般无需设置
 - `transition`：取值bool，设置为true则开启过渡态搜索。缺省值为：false（对应于稳态搜索）
 - `hessian`：取值String。决定是否以及何时进行Hessian矩阵计算。**数值 Hessian**（由 geomeTRIC 通过有限差分梯度计算）和 **REST 解析 Hessian**（由 `analytic_hessian` 开关控制）二选一。
     - "never"：不做Hessian矩阵计算（缺省：稳态搜索）
@@ -1053,3 +1058,10 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 		analytic_hessian = true
 	```
     - 启用后，REST 在初始结构上计算解析 Hessian（含 CP-HF 轨道弛豫），写入临时文件并注入 geomeTRIC。geomeTRIC 读取后用于第一步优化方向，后续所有步正常走 BFGS 更新，整个过程不产生任何数值有限差分计算。
+- 例子五：密堆积体系收紧成键判据，减少冗余内坐标数目
+    ```toml
+	[geometric_pyo3]
+	    coordsys = "tric"
+	    fac = 0.9
+	    maxiter = 300
+	```
