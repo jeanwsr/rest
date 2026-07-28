@@ -1,5 +1,6 @@
 //use std::simd::num;
 use crate::constants::PI;
+use crate::ctrl_io::quasiparticle_methods::GwVariant;
 use itertools::Itertools;
 use std::ops::Range;
 use crate::utilities;
@@ -24,27 +25,43 @@ use rayon::iter::IndexedParallelIterator;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefMutIterator;
 use crate::ri_gw;
+use crate::ri_gw::ac::{ImaginaryAxisSample, PadeApproximant};
+use num_complex::Complex64;
 use std::time::Instant;
 use std::cmp;
 
 #[cfg(target_os = "linux")]
 use libc::seccomp_notif;
 
-pub fn g0w0(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
-    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let gw_scheme=qp_ctrl.gw_scheme.clone();
-    if gw_scheme=="qp equation"{
-        ri_gw::gw_calculations(scf_data,20,&vxc_nn,cancel_dfa_xc)
-    }else if gw_scheme=="linearize"{
-        ri_gw::linearized_gw(scf_data,20,&vxc_nn,cancel_dfa_xc)
-    }else if gw_scheme=="x alpha"{
+pub fn g0w0(
+    scf_data: &mut SCF,
+    num_freq: usize,
+    vxc_nn: &Vec<f64>,
+    cancel_dfa_xc: bool,
+) -> Vec<f64> {
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let gw_scheme = qp_ctrl.gw_scheme.clone();
+
+    if gw_scheme == "qp equation" {
+        ri_gw::gw_calculations(scf_data, 20, &vxc_nn, cancel_dfa_xc)
+    } else if gw_scheme == "linearize" {
+        ri_gw::linearized_gw(scf_data, 20, &vxc_nn, cancel_dfa_xc)
+    } else if gw_scheme == "x alpha" {
         ri_gw::x_alpha_gw(scf_data)
-    }else if gw_scheme=="extrapolated"{
-        gw_near_fermi_surface(scf_data,20,&vxc_nn,qp_ctrl.gw_extrapolate_occ_threshold,qp_ctrl.gw_extrapolate_vir_threshold)
-    }
-    else if gw_scheme=="no gw"{
+    } else if gw_scheme == "extrapolated" {
+        match qp_ctrl.gw_variant {
+            GwVariant::Cd => {
+                gw_near_fermi_surface(scf_data, 20, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold, qp_ctrl.gw_extrapolate_vir_threshold)
+            }
+            GwVariant::Ac => {
+                gw_near_fermi_surface_ac(scf_data, num_freq, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold)
+            }
+        }
+    } else if gw_scheme == "no gw" {
         Vec::new()
-    }else {panic!("invalid expression for gw scheme!")}
+    } else {
+        panic!("invalid expression for gw scheme!")
+    }
 }
 pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)->Vec<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
@@ -58,6 +75,217 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
         scf_data.gwqp.1=qp.clone();
     }
     scf_data.gwqp.0.clone()
+}
+pub fn single_orbital_gw_ac(
+    scf_data: &mut SCF,
+    v_matrix: &MatrixFull<f64>,
+    ri_ov: &MatrixFull<f64>,
+    ri_row_n: &MatrixFull<f64>,
+    w_c_at_freqs: &Vec<(f64, f64, MatrixFull<f64>)>,
+    n: usize,
+    _num_freq: usize,
+    vxc_nn: f64,
+) -> f64 {
+    let start = Instant::now();
+    let gwqp_g = scf_data.gwqp.0.clone();
+    let gwqp_w = scf_data.gwqp.1.clone();
+    let e_ks_n = scf_data.eigenvalues[0][n];
+    let (_start_mo, num_state, occ_size, vir_size, homo, _lumo) =
+        ri_gw::get_occupation_parameters(&scf_data, 'Y');
+
+    let mut exchange = 0.0;
+    for i in 0..homo + 1 {
+        exchange -= v_matrix[[n, i]];
+    }
+    let hybrid_param = scf_data.mol.xc_data.dfa_hybrid_scf;
+    let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
+    let side = if n >= occ_size { 1.0 } else { -1.0 };
+
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+
+    let ac_num_samples = qp_ctrl.ac_num_samples;
+    let ac_omega_max = qp_ctrl.ac_omega_max;
+    let ac_eta = qp_ctrl.ac_eta;
+    let ef = (gwqp_g[occ_size - 1] + gwqp_g[occ_size]) / 2.0;
+
+    if ac_num_samples < 2 {
+        panic!(
+            "ac_num_samples must be >= 2 (got {})",
+            ac_num_samples
+        );
+    }
+    if ac_omega_max < 0.0 {
+        panic!(
+            "ac_omega_max must be > 0 (got {})",
+            ac_omega_max
+        );
+    }
+
+    // AC imaginary-axis sampling grid.
+    // Use PySCF-style frequency selection via get_ac_idx.
+    // Select ac_num_samples indices from the num_freq quadrature points,
+    // skipping ω=0, with step_ratio=2/3 (PySCF default).
+    let ac_step_ratio = 2.0 / 3.0;
+    let ac_indices = ri_gw::ac::get_ac_idx(_num_freq, ac_num_samples, ac_step_ratio);
+    let ac_freqs: Vec<f64> = ac_indices
+        .iter()
+        .map(|&idx| {
+            // idx ranges from 1 to num_freq (1-based), mapping to quad_freqs[idx-1]
+            let idx0 = idx.saturating_sub(1).min(w_c_at_freqs.len().saturating_sub(1));
+            w_c_at_freqs[idx0].0
+        })
+        .collect();
+
+    let samples: Vec<ImaginaryAxisSample> = ac_freqs
+        .iter()
+        .map(|&lambda| {
+            let sigma_c = ri_gw::calculate_sigma_c_imag_freq(w_c_at_freqs, n, lambda, ef, &gwqp_g);
+            ImaginaryAxisSample::new_shifted(lambda, ef, sigma_c)
+        })
+        .collect();
+
+    let pade = match PadeApproximant::from_imaginary_axis(&samples) {
+        Ok(p) => p,
+        Err(e) => {
+            panic!(
+                "Pade construction failed for orbital {}: {}",
+                n, e
+            );
+        }
+    };
+
+    let qp_eq_func = |omega: f64| -> f64 {
+        match pade.evaluate_retarded(omega, ac_eta) {
+            Ok(sigma_c) => consts + sigma_c.re - omega,
+            Err(_) => f64::NAN,
+        }
+    };
+
+    let rootfinder = qp_ctrl.gw_rootfinder.clone();
+    let qp_energy_no_fse;
+
+    if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
+        // Static approximation: Σ_c evaluated at the KS energy.
+        let sigma_static = match pade.evaluate_retarded(e_ks_n, ac_eta) {
+            Ok(s) => s.re,
+            Err(e) => panic!(
+                "Pade evaluation failed for orbital {} at static fallback: {}",
+                n, e
+            ),
+        };
+        qp_energy_no_fse = consts + sigma_static;
+        println!(
+            "Orbital #{} (AC): |E_KS|={:.6} > gw_switch_fallback_threshold={:.6}, using static fallback QP energy={:.6}",
+            n,
+            e_ks_n.abs(),
+            qp_ctrl.gw_switch_fallback_threshold,
+            qp_energy_no_fse
+        );
+    } else if rootfinder == "newton".to_string() {
+        println!("Orbital #{} (AC):", n);
+        let wrapped_f = |omega: f64,
+                          _n: usize,
+                          _consts: f64,
+                          _ri_ov: &MatrixFull<f64>,
+                          _ri_row_n: &MatrixFull<f64>,
+                          _qpg: &Vec<f64>,
+                          _qpw: &Vec<f64>,
+                          _occ: usize,
+                          _vir: usize,
+                          _ns: usize,
+                          _wcf: &Vec<(f64, f64, MatrixFull<f64>)>|
+         -> f64 { qp_eq_func(omega) };
+
+        qp_energy_no_fse = ri_gw::newton_solver(
+            wrapped_f,
+            n,
+            consts,
+            ri_ov,
+            ri_row_n,
+            &gwqp_g,
+            &gwqp_w,
+            occ_size,
+            vir_size,
+            num_state,
+            w_c_at_freqs,
+            e_ks_n,
+            0.00001,
+            50,
+            side,
+            scf_data.mol.ctrl.print_level,
+        );
+        println!("QP energy (AC): {}", qp_energy_no_fse);
+    } else if rootfinder == "interpolation".to_string() {
+        println!("Orbital #{} (AC):", n);
+        let (have_crossing, mut qp_energy) = ri_gw::linear_interpolation_solver(
+            qp_eq_func,
+            e_ks_n,
+            side,
+            qp_ctrl.gw_search_grid,
+            qp_ctrl.gw_span_energy,
+        );
+        if !have_crossing {
+            println!(
+                "No graphical crossings found for n={} (AC), using Newton solver instead.",
+                n
+            );
+            let wrapped_f = |omega: f64,
+                              _n: usize,
+                              _consts: f64,
+                              _ri_ov: &MatrixFull<f64>,
+                              _ri_row_n: &MatrixFull<f64>,
+                              _qpg: &Vec<f64>,
+                              _qpw: &Vec<f64>,
+                              _occ: usize,
+                              _vir: usize,
+                              _ns: usize,
+                              _wcf: &Vec<(f64, f64, MatrixFull<f64>)>|
+             -> f64 { qp_eq_func(omega) };
+
+            qp_energy = ri_gw::newton_solver(
+                wrapped_f,
+                n,
+                consts,
+                ri_ov,
+                ri_row_n,
+                &gwqp_g,
+                &gwqp_w,
+                occ_size,
+                vir_size,
+                num_state,
+                w_c_at_freqs,
+                e_ks_n,
+                0.00001,
+                50,
+                side,
+                scf_data.mol.ctrl.print_level,
+            );
+        }
+        qp_energy_no_fse = qp_energy;
+        println!("QP energy (AC): {}", qp_energy_no_fse);
+    } else {
+        panic!("Invalid choice of GW rootfinder!");
+    }
+
+    if !qp_energy_no_fse.is_finite() {
+        panic!(
+            "AC-GW failed to produce a finite QP energy for orbital {}",
+            n
+        );
+    }
+
+    if qp_ctrl.fourier_self_energy || qp_ctrl.hermite_self_energy {
+        println!(
+            "GW(AC) orbital #{}: Fourier/Hermite self-energy correction is not supported in AC path; using bare AC result.",
+            n
+        );
+    }
+
+    println!("GW of orbital #{} (AC) took {:?}", n, start.elapsed());
+    if scf_data.mol.ctrl.print_level > 1 {
+        println!("Shift = {}", qp_energy_no_fse - e_ks_n);
+    }
+    qp_energy_no_fse
 }
 pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&MatrixFull<f64>,ri_row_n:&MatrixFull<f64>,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,n:usize,num_freq:usize,vxc_nn:f64)->f64{
     let start=Instant::now();
@@ -261,6 +489,109 @@ where
     }
 }
 
+pub fn gw_near_fermi_surface_ac(
+    scf_data: &mut SCF,
+    num_freq: usize,
+    vxc_nn: &Vec<f64>,
+    threshold: f64,
+) -> Vec<f64> {
+    let mut ri_ov: MatrixFull<f64> = ri_bse::get_submatrix(scf_data, 'O', 'V', 'Y');
+    println!("RI-OV Shape={:?}", ri_ov.size);
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let start = Instant::now();
+    let v_matrix = ri_gw::v_matrix_from_scf(scf_data);
+    let time1 = start.elapsed();
+    println!("V Matrix Constructed. This step took {:?}", time1);
+    let ks_energies = scf_data.eigenvalues[0].clone();
+    let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
+        ri_gw::get_occupation_parameters(&scf_data, 'Y');
+
+    // AC does not use the low-rank contour or real-axis v*chi*v path.
+    // The low-rank machinery (generate_w_c_lowrank, real_axis_vchiv) is
+    // designed for CD and relies on residue-pole decomposition on the
+    // real axis. The AC approach bypasses the real axis entirely by
+    // continuing from the imaginary axis via Padé. Therefore we always
+    // use the full W_c matrix on the imaginary axis (the v1 path).
+    let w_c_at_freqs: Vec<(f64, f64, MatrixFull<f64>)> = if qp_ctrl.gw_imag_rayon {
+        ri_gw::generate_w_c(
+            scf_data,
+            &ri_ov,
+            &scf_data.gwqp.0,
+            &scf_data.gwqp.1,
+            num_state,
+            occ_size,
+            vir_size,
+            num_freq,
+        )
+    } else {
+        ri_gw::generate_w_c_serial(
+            scf_data,
+            &ri_ov,
+            &scf_data.gwqp.0,
+            &scf_data.gwqp.1,
+            num_state,
+            occ_size,
+            vir_size,
+            num_freq,
+        )
+    };
+
+    let e_homo = ks_energies[occ_size - 1];
+    let e_lumo = ks_energies[occ_size];
+    let calc_orbs_indices: Vec<usize> = ks_energies
+        .into_iter()
+        .enumerate()
+        .filter(|(n, e_n)| *e_n > e_homo - threshold && *e_n < e_lumo + threshold)
+        .map(|(n, _e_n)| n)
+        .collect();
+    println!("calculated orbital indices:{:?}", calc_orbs_indices);
+
+    let calc_orbs: Vec<(usize, f64)> = calc_orbs_indices
+        .iter()
+        .map(|&n| {
+            let ri_row_n = ri_gw::compute_ri3mo_row(scf_data, n);
+            (
+                n,
+                single_orbital_gw_ac(
+                    scf_data,
+                    &v_matrix,
+                    &ri_ov,
+                    &ri_row_n,
+                    &w_c_at_freqs,
+                    n,
+                    num_freq,
+                    vxc_nn[n],
+                ),
+            )
+        })
+        .collect();
+
+    let occ_shift = calc_orbs[0].1 - scf_data.eigenvalues[0][calc_orbs[0].0];
+    let vir_shift =
+        calc_orbs[calc_orbs.len() - 1].1 - scf_data.eigenvalues[0][calc_orbs[calc_orbs.len() - 1].0];
+    let mut gwqp: Vec<f64> = Vec::new();
+    if scf_data.mol.ctrl.print_level > 1 {
+        println!("low extrapolations:{}", calc_orbs[0].0);
+        println!("calculated orbitals:{}", calc_orbs.len());
+        println!(
+            "high extrapolations:{}",
+            num_state - 1 - calc_orbs[calc_orbs.len() - 1].0
+        );
+        println!("Occ Shift={}, Vir Shift={}", occ_shift, vir_shift);
+    }
+    for i in 0..calc_orbs[0].0 {
+        gwqp.push(scf_data.eigenvalues[0][i] + occ_shift)
+    }
+    for i in 0..calc_orbs.len() {
+        gwqp.push(calc_orbs[i].1)
+    }
+    for i in calc_orbs[calc_orbs.len() - 1].0 + 1..num_state {
+        gwqp.push(scf_data.eigenvalues[0][i] + vir_shift)
+    }
+    ri_gw::display::extrapolation_quasiparticles(&gwqp, occ_size, &calc_orbs_indices, threshold, threshold);
+    scf_data.gwqp = (gwqp.clone(), gwqp.clone());
+    gwqp
+}
 pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,occ_threshold:f64,vir_threshold:f64)->Vec<f64>{
     let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
     println!("RI-OV Shape={:?}",ri_ov.size);

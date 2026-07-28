@@ -1,5 +1,6 @@
 //use std::simd::num;
 use crate::constants::{EV, PI};
+use num_complex::Complex64;
 use itertools::Itertools;
 use std::ops::Range;
 use crate::utilities;
@@ -32,6 +33,7 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use rayon::iter::IndexedParallelIterator;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefMutIterator;
+pub mod ac;
 pub mod renormalized_singles;
 pub mod scgw;
 pub mod display;
@@ -510,6 +512,75 @@ pub fn calculate_imag(w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,num_state:usi
     omp_get_num_threads_wrapper();
     imag_n
     //No need to worry about cutoff
+}
+/// Correlation self-energy at a purely imaginary frequency z = i*lambda.
+///
+/// Reuses the W_c matrix evaluated on the standard imaginary-axis integration
+/// grid {omega_p, weight, W_c(i*omega_p)} to compute Σ_c,nn(i*lambda) for a
+/// target orbital n.
+///
+/// ── Derivation ──
+/// The defining G0W0 spectral convolution is:
+///
+///   Σ_c,nn(iλ) = (i/2π) Σ_m ∫_{-∞}^{+∞} dω  W_c,nm(iω)
+///                        / (i(λ+ω) - ε_m)
+///
+/// Since W_c(iω) = W_c(-iω) (real, even function on the imaginary axis),
+/// the integral over the full real line can be folded onto the positive
+/// half-line:
+///
+///   Σ_c,nn(iλ) = 1/(2π) Σ_m ∫_0^{+∞} dω  W_c,nm(iω) ×
+///     [ (λ+ω - i·ε_m) / ((λ+ω)² + ε_m²)   +   (λ-ω - i·ε_m) / ((λ-ω)² + ε_m²) ]
+///
+/// The first term arises from G(i(λ+ω)) (positive-frequency branch of the
+/// imaginary-axis contour) and the second from G(i(λ-ω)) (the mirror
+/// contribution at negative ω, folded by symmetry).
+///
+/// The quadrature weights {w_p} are defined for the half-integral domain
+/// (0, ∞), so the discretised form is:
+///
+///   Σ_c,nn(iλ) = 1/(2π) Σ_p  w_p  Σ_m  W_c,nm(iω_p) ×
+///     [ (λ+ω_p - i·ε_m) / ((λ+ω_p)² + ε_m²)
+///     + (λ-ω_p - i·ε_m) / ((λ-ω_p)² + ε_m²) ]
+pub fn calculate_sigma_c_imag_freq(
+    w_c_at_freqs: &Vec<(f64, f64, MatrixFull<f64>)>,
+    n: usize,
+    lambda: f64,
+    fermi_level: f64,
+    quasiparticle_energies_g: &Vec<f64>,
+) -> Complex64 {
+    let mut real_sum = 0.0_f64;
+    let mut imag_sum = 0.0_f64;
+    for (omega_p, weight, w_c) in w_c_at_freqs.iter() {
+        for (m, &qp_m) in quasiparticle_energies_g.iter().enumerate() {
+            let wc_nm = w_c[[n, m]];
+            if wc_nm == 0.0 {
+                continue;
+            }
+            // PySCF-style formula:
+            //   g0 = weight * (ef + iλ - ε_m) / ((ef + iλ - ε_m)² + ω_p²)
+            //   Σ_c += -1/π * w_c[n,m] * g0
+            //
+            // Expand: z = ef + iλ, z - ε_m = (ef - ε_m) + i·λ
+            // (z - ε_m)² + ω_p² = (ef - ε_m)² - λ² + ω_p² + 2i·λ·(ef - ε_m)
+            let de = fermi_level - qp_m;
+            let num_re = de;
+            let num_im = lambda;
+            let denom_re = de * de - lambda * lambda + omega_p * omega_p;
+            let denom_im = 2.0 * lambda * de;
+            let dnorm = denom_re * denom_re + denom_im * denom_im;
+            if dnorm == 0.0 {
+                continue;
+            }
+            let inv_re = denom_re / dnorm;
+            let inv_im = -denom_im / dnorm;
+            let g0_re = weight * (num_re * inv_re - num_im * inv_im);
+            let g0_im = weight * (num_re * inv_im + num_im * inv_re);
+            real_sum += (-1.0 / PI) * wc_nm * g0_re;
+            imag_sum += (-1.0 / PI) * wc_nm * g0_im;
+        }
+    }
+    Complex64::new(real_sum, imag_sum)
 }
 pub fn get_occupation_parameters(scf_data:&SCF,response_or_not:char)->(usize,usize,usize,usize,usize,usize){
     let cutoff=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().bse_cutoff_energy;
@@ -2844,4 +2915,115 @@ pub fn linearized_gw_lowrank(
     }
     // Should not reach here
     panic!("Invalid self-energy correction configuration in linearized_gw_lowrank");
+}
+
+#[cfg(test)]
+mod ac_integration_tests {
+    use super::*;
+
+    /// Build a minimal W_c triple with a single freq point and a 2×2 matrix.
+    fn wc_mock(omega: f64, weight: f64, w00: f64, w01: f64, w10: f64, w11: f64) -> (f64, f64, MatrixFull<f64>) {
+        let mut w = MatrixFull::new([2, 2], 0.0);
+        w[[0, 0]] = w00;
+        w[[0, 1]] = w01;
+        w[[1, 0]] = w10;
+        w[[1, 1]] = w11;
+        (omega, weight, w)
+    }
+
+    #[test]
+    fn sigma_c_imag_vanishes_for_zero_wc() {
+        let wc = vec![wc_mock(0.5, 1.0, 0.0, 0.0, 0.0, 0.0)];
+        let qp = vec![-0.3, 0.2];
+        let s = calculate_sigma_c_imag_freq(&wc, 0, 0.8, 0.0, &qp);
+        assert_eq!(s.norm(), 0.0);
+    }
+
+
+
+    fn sigma_analytical(
+        w_c_at_freqs: &[(f64, f64, MatrixFull<f64>)],
+        n: usize,
+        lambda: f64,
+        ef: f64,
+        qp: &[f64],
+    ) -> Complex64 {
+        let mut sigma = Complex64::new(0.0, 0.0);
+        for (omega_p, weight, w_c) in w_c_at_freqs.iter() {
+            for (m, &eps) in qp.iter().enumerate() {
+                let wnm = w_c[[n, m]];
+                if wnm == 0.0 {
+                    continue;
+                }
+                // PySCF kernel: -(1/π) * w * (ef + iλ - ε) / ((ef + iλ - ε)² + ω_p²)
+                let de = ef - eps;
+                let denom_re = de * de - lambda * lambda + omega_p * omega_p;
+                let denom_im = 2.0 * lambda * de;
+                let dnorm = denom_re * denom_re + denom_im * denom_im;
+                if dnorm == 0.0 {
+                    continue;
+                }
+                let inv_re = denom_re / dnorm;
+                let inv_im = -denom_im / dnorm;
+                let g0_re = weight * (de * inv_re - lambda * inv_im);
+                let g0_im = weight * (de * inv_im + lambda * inv_re);
+                sigma.re += (-1.0 / PI) * wnm * g0_re;
+                sigma.im += (-1.0 / PI) * wnm * g0_im;
+            }
+        }
+        sigma
+    }
+
+    #[test]
+    fn sigma_c_imag_diagonal_dominance() {
+        let omega = 0.4_f64;
+        let weight = 1.5_f64;
+        let w = 2.0_f64;
+        let ef = 0.0_f64;
+        let qp = vec![0.5_f64, 0.9_f64];
+        let wc = vec![wc_mock(omega, weight, w, 0.0, 0.0, w)];
+
+        let lambda = 0.6;
+        let s0 = calculate_sigma_c_imag_freq(&wc, 0, lambda, ef, &qp);
+        let s1 = calculate_sigma_c_imag_freq(&wc, 1, lambda, ef, &qp);
+
+        let a0 = sigma_analytical(&wc, 0, lambda, ef, &qp);
+        let a1 = sigma_analytical(&wc, 1, lambda, ef, &qp);
+        assert!((s0 - a0).norm() < 1.0e-14);
+        assert!((s1 - a1).norm() < 1.0e-14);
+    }
+
+    #[test]
+    fn sigma_c_imag_cross_term_sum() {
+        let omega = 0.5_f64;
+        let weight = 2.0_f64;
+        let ef = 0.0_f64;
+        let qp = vec![-0.2_f64, 0.3_f64];
+        let w00 = 1.0_f64;
+        let w01 = 0.4_f64;
+        let w10 = 0.4_f64;
+        let w11 = 2.0_f64;
+        let wc = vec![wc_mock(omega, weight, w00, w01, w10, w11)];
+
+        let lambda = 0.8;
+        let s0 = calculate_sigma_c_imag_freq(&wc, 0, lambda, ef, &qp);
+        let a0 = sigma_analytical(&wc, 0, lambda, ef, &qp);
+        assert!((s0 - a0).norm() < 1.0e-14);
+    }
+
+    #[test]
+    fn sigma_c_imag_freq_multi_point() {
+        let ef = 0.0_f64;
+        let qp = vec![0.3_f64, -0.7_f64];
+        let omega0 = 0.2; let w0 = 0.8; let val0 = 1.5;
+        let omega1 = 1.0; let w1 = 1.2; let val1 = 0.5;
+        let wc = vec![
+            wc_mock(omega0, w0, val0, 0.0, 0.0, val0),
+            wc_mock(omega1, w1, val1, 0.0, 0.0, val1),
+        ];
+        let lambda = 1.2;
+        let s0 = calculate_sigma_c_imag_freq(&wc, 0, lambda, ef, &qp);
+        let a0 = sigma_analytical(&wc, 0, lambda, ef, &qp);
+        assert!((s0 - a0).norm() < 1.0e-14);
+    }
 }

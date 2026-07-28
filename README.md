@@ -418,7 +418,8 @@ GW计算通过 `gw_or_bse = “gw”` 启动（也内置于 `”bse”` 模式�
     - `”g0w0”`（缺省）：单次GW计算，不做自洽迭代。
     - `”evgw”`：本征值自洽GW（evGW），迭代更新准粒子能量中的G部分。需配合 `evgw_rounds` 设置迭代次数。
 - `evgw_rounds`: 取值usize，evGW自洽迭代的轮数。仅在 `scgw = “evgw”` 时需要设置。缺省为0。
-- `threshold`: 取值f64，单位Hartree。在 `gw_scheme = “extrapolated”` 方案中，决定费米面附近精确求解准粒子方程的能量窗口。计算范围包括KS轨道能量落入 `[HOMO - threshold, LUMO + threshold]` 的所有轨道，超出范围者通过已计算的准粒子能量外推得到。缺省为0.1。
+- `gw_extrapolate_occ_threshold`: 取值f64，单位Hartree。在 `gw_scheme = “extrapolated”` 方案中，决定费米面以下精确求解准粒子方程的能量窗口。计算范围包括KS轨道能量落在 `[HOMO - gw_extrapolate_occ_threshold, HOMO]` 的占据轨道。缺省为0.1。
+- `gw_extrapolate_vir_threshold`: 取值f64，单位Hartree。在 `gw_scheme = “extrapolated”` 方案中，决定费米面以上精确求解准粒子方程的能量窗口。计算范围包括KS轨道能量落在 `[LUMO, LUMO + gw_extrapolate_vir_threshold]` 的虚轨道。缺省为0.1。
 
 ### Renormalized Singles（rsGW）
 
@@ -445,6 +446,60 @@ Renormalized Singles方法通过投影DFT密度矩阵构造单激发HF哈密顿�
 - `gw_span_energy`: 取值f64，单位Hartree，插值求根法的能量扫描范围。缺省为0.2。
 - `gw_linearize_shift`: 取值f64，线性化GW中的有限差分位移量，单位Hartree。缺省为0.01。
 - `homo_lumo_gw_qp`: 取值bool，设置为 `true` 仅计算HOMO和LUMO的准粒子能量（不计算其他轨道）。缺省为false。
+
+### AC-GW（解析延拓 GW 变体）
+
+AC-GW 通过先在虚频轴计算相关自能 Σ_c(iλ)，再使用 Thiele 连分式 Padé 近似解析延拓到实轴，避免 CD 路径的实轴留数计算。适用于价层准粒子能量计算，与 CD-GW 精度相当。
+
+- `gw_variant`: 取值String，GW 变体类型：
+    - `"cd"`（缺省）：轮廓变形（Contour Deformation）路径。
+    - `"ac"`：解析延拓（Analytic Continuation）路径。配合 `gw_scheme = "extrapolated"` 使用。`ac` 路径暂不支持 `fourier_self_energy` 或 `hermite_self_energy`。
+- `ac_num_samples`: 取值usize，Padé 虚轴采样点数。从 quadrature 频点中按 PySCF 风格的指数递减步长选取。缺省为 16。
+- `ac_eta`: 取值f64，Padé 求值的展宽参数 η（小正数）。缺省为 0.001。
+- `ac_pade_step_ratio`: 取值f64，PySCF 风格 Padé 采样的步长衰减比（< 1.0 时低频更密）。缺省为 2/3。
+- `gw_switch_fallback_threshold`: 取值f64。当 |E_KS| 超过此值时退化为静态近似。缺省为 1e6。
+
+### AC-GW 输入卡示例
+
+**最小 AC-GW 计算（默认参数）**：
+```toml
+[ctrl]
+xc = "pbe0"
+basis_path = "def2-TZVP"
+auxbas_path = "def2-universal-jkfit"
+charge = 0.0
+spin = 1
+
+[geom]
+name = "H2O"
+unit = "angstrom"
+position = """
+    O  0.0000000000      0.0000000000      0.0000000000
+    H  0.0000000000      0.7569500000      0.5858820000
+    H  0.0000000000     -0.7569500000      0.5858820000
+"""
+
+[quasiparticle_methods]
+gw_or_bse = "gw"
+gw_scheme = "extrapolated"
+gw_variant = "ac"
+gw_extrapolate_occ_threshold = 0.1
+gw_extrapolate_vir_threshold = 0.1
+```
+
+**高精度 AC-GW（32 采样点）**：
+```toml
+[quasiparticle_methods]
+gw_or_bse = "gw"
+gw_scheme = "extrapolated"
+gw_variant = "ac"
+ac_num_samples = 32
+ac_eta = 0.001
+ac_pade_step_ratio = 0.6667
+gw_rootfinder = "newton"
+gw_extrapolate_occ_threshold = 0.2
+gw_extrapolate_vir_threshold = 0.2
+```
 
 ### GW结果输出
 

@@ -1,8 +1,31 @@
 use serde::{Deserialize,Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GwVariant {
+    Cd,
+    Ac,
+}
+
+impl Default for GwVariant {
+    fn default() -> Self {
+        Self::Cd
+    }
+}
+
+impl GwVariant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cd => "cd",
+            Self::Ac => "ac",
+        }
+    }
+}
+
 #[derive(Debug,Clone,Serialize, Deserialize)]
 pub struct QuasiParticle {
     pub gw_scheme:String,
+    pub gw_variant: GwVariant,
     pub homo_lumo_gw_qp:bool,
     pub x_alpha:f64,
     pub save_qp:bool,
@@ -88,6 +111,12 @@ pub struct QuasiParticle {
     /// Default 0.001 (matching MolGW). Separated from cdgw_eta to prevent
     /// large broadening from incorrectly halving off-contour residues.
     pub cdgw_res_tol: f64,
+    /// Number of imaginary-axis self-energy samples used for Padé continuation.
+    pub ac_num_samples: usize,
+    /// Maximum external imaginary frequency (Ha) used for Padé sampling.
+    pub ac_omega_max: f64,
+    /// Positive broadening (Ha) used to evaluate Sigma(omega + i*eta).
+    pub ac_eta: f64,
     /// Number of states below/above HOMO-LUMO for the self-energy evaluation
     /// and for the real-axis de_max scan. States far from the gap (e.g. core states)
     /// contribute negligibly to the real-axis residues and inflate de_max, making
@@ -150,6 +179,7 @@ impl Default for QuasiParticle {
     fn default() -> Self {
         QuasiParticle {
             gw_scheme:String::from("no gw"),
+            gw_variant: GwVariant::Cd,
             homo_lumo_gw_qp:false,
             x_alpha:0.5,
             save_qp:false,
@@ -225,6 +255,9 @@ impl Default for QuasiParticle {
             qsgw_eta: 0.001,
             cdgw_eta: 0.001,
             cdgw_res_tol: 0.001,
+            ac_num_samples: 16,
+            ac_omega_max: 5.0,
+            ac_eta: 0.001,
             selfenergy_state_range: 100000,
             // response BSE grid sampling parameters (default: 2 points per dimension)
             response_bse_x_start: 0.0,
@@ -275,6 +308,10 @@ impl QuasiParticle {
         let mut table = toml::map::Map::new();
         
         table.insert("gw_scheme".to_string(), toml::Value::String(self.gw_scheme.clone()));
+        table.insert(
+            "gw_variant".to_string(),
+            toml::Value::String(self.gw_variant.as_str().to_string()),
+        );
         table.insert("homo_lumo_gw_qp".to_string(), toml::Value::Boolean(self.homo_lumo_gw_qp));
         table.insert("x_alpha".to_string(), toml::Value::Float(self.x_alpha));
         table.insert("save_qp".to_string(), toml::Value::Boolean(self.save_qp));
@@ -352,6 +389,9 @@ impl QuasiParticle {
         table.insert("qsgw_eta".to_string(), toml::Value::Float(self.qsgw_eta));
         table.insert("cdgw_eta".to_string(), toml::Value::Float(self.cdgw_eta));
         table.insert("cdgw_res_tol".to_string(), toml::Value::Float(self.cdgw_res_tol));
+        table.insert("ac_num_samples".to_string(), toml::Value::Integer(self.ac_num_samples as i64));
+        table.insert("ac_omega_max".to_string(), toml::Value::Float(self.ac_omega_max));
+        table.insert("ac_eta".to_string(), toml::Value::Float(self.ac_eta));
         table.insert("selfenergy_state_range".to_string(), toml::Value::Integer(self.selfenergy_state_range as i64));
         table.insert("response_bse_x_start".to_string(), toml::Value::Float(self.response_bse_x_start));
         table.insert("response_bse_x_end".to_string(), toml::Value::Float(self.response_bse_x_end));
@@ -402,6 +442,30 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.gw_scheme = match tmp_ctrl.get("gw_scheme").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::from("no gw"),
+            };
+            tmp_input.gw_variant = match tmp_ctrl
+                .get("gw_variant")
+                .unwrap_or(&serde_json::Value::Null)
+            {
+                serde_json::Value::String(value) => {
+                    match value.trim().to_ascii_lowercase().as_str() {
+                        "cd" => GwVariant::Cd,
+                        "ac" => GwVariant::Ac,
+                        other => {
+                            anyhow::bail!(
+                                "Invalid gw_variant '{}'. Supported values are 'cd' and 'ac'.",
+                                other
+                            );
+                        }
+                    }
+                }
+                serde_json::Value::Null => GwVariant::Cd,
+                other => {
+                    anyhow::bail!(
+                        "Invalid type for gw_variant: {:?}. Expected the string 'cd' or 'ac'.",
+                        other
+                    );
+                }
             };
             tmp_input.homo_lumo_gw_qp=match tmp_ctrl.get("homo_lumo_gw_qp").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
@@ -737,6 +801,18 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),
                 _ => 0.001,
             };
+            tmp_input.ac_num_samples = match tmp_ctrl.get("ac_num_samples").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(16) as usize,
+                _ => 16,
+            };
+            tmp_input.ac_omega_max = match tmp_ctrl.get("ac_omega_max").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(5.0),
+                _ => 5.0,
+            };
+            tmp_input.ac_eta = match tmp_ctrl.get("ac_eta").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),
+                _ => 0.001,
+            };
             // Parse response BSE grid sampling parameters
             tmp_input.response_bse_x_start = match tmp_ctrl.get("response_bse_x_start").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
@@ -933,4 +1009,45 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
         },
     }
     
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn gw_variant_defaults_to_cd() {
+        let input = json!({
+            "quasiparticle_methods": {}
+        });
+
+        let qp = parse_quasiparticle_keywords(&input).unwrap().unwrap();
+        assert_eq!(qp.gw_variant, GwVariant::Cd);
+    }
+
+    #[test]
+    fn gw_variant_accepts_ac_case_insensitively() {
+        for value in ["ac", "AC", "Ac"] {
+            let input = json!({
+                "quasiparticle_methods": {
+                    "gw_variant": value
+                }
+            });
+
+            let qp = parse_quasiparticle_keywords(&input).unwrap().unwrap();
+            assert_eq!(qp.gw_variant, GwVariant::Ac);
+        }
+    }
+
+    #[test]
+    fn gw_variant_rejects_unknown_value() {
+        let input = json!({
+            "quasiparticle_methods": {
+                "gw_variant": "unknown"
+            }
+        });
+
+        assert!(parse_quasiparticle_keywords(&input).is_err());
+    }
 }
