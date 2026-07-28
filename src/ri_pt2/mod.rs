@@ -95,11 +95,25 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     scf_data.energies.insert(String::from("x_hf"), vec![x_energy]);
     timerecords.count("xc_energy");
 
+    // If post_ai_correction (e.g. SCC15) will run after xdh_calculations,
+    // pre-compute the PBE exchange energy it needs, since we are about to
+    // free the DFT grids.  SCC15 uses x_pbe to compute dxpbe = (x_pbe - x_hf)/x_hf.
+    if !scf_data.mol.ctrl.post_ai_correction.to_lowercase().eq("none") {
+        if let Some(grids) = &scf_data.grids {
+            let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);
+            let post_xc_energy = dfa.post_xc_exc(
+                &vec![String::from("gga_x_pbe")], grids,
+                &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation,
+            );
+            let x_pbe = post_xc_energy[0][0] + post_xc_energy[0][1];
+            scf_data.energies.insert(String::from("x_pbe"), vec![x_pbe]);
+        }
+    }
+
     // Free DFT grid data before entering PT2/post-SCF correlation.
     // The grids (ao, aop, compressed variants) can consume 40-100+ GB for
-    // large systems and are never needed again after XC energy evaluation.
-    // Releasing them here reduces peak memory and eases memory subsystem
-    // pressure during PT2 contraction.
+    // large systems.  After the XC energy evaluation (and the optional PBE
+    // pre-computation above), grids are no longer needed.
     scf_data.grids = None;
 
     let dfa_family_pos = scf_data.mol.xc_data.dfa_family_pos.clone().unwrap();
