@@ -1,7 +1,7 @@
 #![warn(unused_imports)]
 use crate::basis_io::ecp::ghost_effective_potential_matrix;
-use crate::check_norm::force_state_occupation::adapt_occupation_with_force_projection;
-use crate::check_norm::{self, generate_occupation_frac_occ, generate_occupation_integer, generate_occupation_sad, OCCType};
+use self::force_state_occupation::adapt_occupation_with_force_projection;
+use self::occupation::{generate_occupation_frac_occ, generate_occupation_integer, generate_occupation_sad, OCCType};
 use crate::dft::gen_grids::prune::prune_by_rho;
 use crate::dft::{DFTType, Grids};
 use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges};
@@ -19,6 +19,8 @@ mod pyrest_scf_io;
 pub mod scfrecord;
 pub mod smear;
 pub mod util;
+pub mod occupation;
+pub mod force_state_occupation;
 
 #[cfg(feature = "mpi")]
 use mpi::collective::SystemOperation;
@@ -5269,7 +5271,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     }
     match scf_data.mol.ctrl.occupation_type {
         OCCType::FRAC => {
-            let (occupation, homo, lumo) = check_norm::generate_occupation_integer(&scf_data.mol, &scf_data.scftype);
+            let (occupation, homo, lumo) = occupation::generate_occupation_integer(&scf_data.mol, &scf_data.scftype);
             scf_data.occupation = occupation;
             scf_data.homo = homo;
             scf_data.lumo = lumo;
