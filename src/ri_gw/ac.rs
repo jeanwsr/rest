@@ -8,15 +8,20 @@ const BREAKDOWN_TOLERANCE: f64 = 1.0e-14;
 pub struct ImaginaryAxisSample {
     pub omega: f64,
     pub value: Complex64,
+    pub real_part: f64,
 }
 
 impl ImaginaryAxisSample {
     pub fn new(omega: f64, value: Complex64) -> Self {
-        Self { omega, value }
+        Self { omega, value, real_part: 0.0 }
+    }
+
+    pub fn new_shifted(omega: f64, real_part: f64, value: Complex64) -> Self {
+        Self { omega, value, real_part }
     }
 
     fn node(self) -> Complex64 {
-        Complex64::new(0.0, self.omega)
+        Complex64::new(self.real_part, self.omega)
     }
 }
 
@@ -180,6 +185,28 @@ fn validate_samples(samples: &[ImaginaryAxisSample]) -> Result<(), AcError> {
 
 fn is_finite_complex(value: Complex64) -> bool {
     value.re.is_finite() && value.im.is_finite()
+}
+
+/// Get Pade sampling indices matching PySCF's `_get_ac_idx`.
+/// Selects `npts` indices from [1..nw+1] (skipping ω=0) with decreasing step sizes.
+pub fn get_ac_idx(nw: usize, npts: usize, step_ratio: f64) -> Vec<usize> {
+    let mut steps: Vec<f64> = (0..npts)
+        .map(|i| 1.0 + (step_ratio - 1.0) * i as f64 / (npts.max(2) - 1) as f64)
+        .collect();
+    if npts == 1 {
+        return vec![1];
+    }
+    steps[npts - 1] = step_ratio;
+    let sum: f64 = steps.iter().sum();
+    let step_nw: Vec<f64> = steps.iter().map(|s| s / sum * nw as f64).collect();
+    let mut cumsum: Vec<f64> = Vec::with_capacity(npts);
+    let mut acc = 0.0_f64;
+    for s in &step_nw {
+        acc += s;
+        cumsum.push(acc);
+    }
+    let offset = 1.0_f64 - cumsum[0];
+    cumsum.iter().map(|c| (c + offset).round() as usize).collect()
 }
 
 #[cfg(test)]

@@ -51,10 +51,10 @@ pub fn g0w0(
     } else if gw_scheme == "extrapolated" {
         match qp_ctrl.gw_variant {
             GwVariant::Cd => {
-                gw_near_fermi_surface(scf_data, num_freq, &vxc_nn, qp_ctrl.threshold)
+                gw_near_fermi_surface(scf_data, 20, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold, qp_ctrl.gw_extrapolate_vir_threshold)
             }
             GwVariant::Ac => {
-                gw_near_fermi_surface_ac(scf_data, num_freq, &vxc_nn, qp_ctrl.threshold)
+                gw_near_fermi_surface_ac(scf_data, num_freq, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold)
             }
         }
     } else if gw_scheme == "no gw" {
@@ -106,6 +106,7 @@ pub fn single_orbital_gw_ac(
     let ac_num_samples = qp_ctrl.ac_num_samples;
     let ac_omega_max = qp_ctrl.ac_omega_max;
     let ac_eta = qp_ctrl.ac_eta;
+    let ef = (gwqp_g[occ_size - 1] + gwqp_g[occ_size]) / 2.0;
 
     if ac_num_samples < 2 {
         panic!(
@@ -121,18 +122,25 @@ pub fn single_orbital_gw_ac(
     }
 
     // AC imaginary-axis sampling grid.
-    // lambda_j = ac_omega_max * (j+1) / ac_num_samples, j = 0..ac_num_samples-1.
-    // The +1 offset removes lambda=0 to avoid singular dielectric behaviour
-    // at the static limit where the Padé fractions involve small differences.
-    let ac_freqs: Vec<f64> = (0..ac_num_samples)
-        .map(|j| ac_omega_max * (j as f64 + 1.0) / (ac_num_samples as f64))
+    // Use PySCF-style frequency selection via get_ac_idx.
+    // Select ac_num_samples indices from the num_freq quadrature points,
+    // skipping ω=0, with step_ratio=2/3 (PySCF default).
+    let ac_step_ratio = 2.0 / 3.0;
+    let ac_indices = ri_gw::ac::get_ac_idx(_num_freq, ac_num_samples, ac_step_ratio);
+    let ac_freqs: Vec<f64> = ac_indices
+        .iter()
+        .map(|&idx| {
+            // idx ranges from 1 to num_freq (1-based), mapping to quad_freqs[idx-1]
+            let idx0 = idx.saturating_sub(1).min(w_c_at_freqs.len().saturating_sub(1));
+            w_c_at_freqs[idx0].0
+        })
         .collect();
 
     let samples: Vec<ImaginaryAxisSample> = ac_freqs
         .iter()
         .map(|&lambda| {
-            let sigma_c = ri_gw::calculate_sigma_c_imag_freq(w_c_at_freqs, n, lambda, &gwqp_g);
-            ImaginaryAxisSample::new(lambda, sigma_c)
+            let sigma_c = ri_gw::calculate_sigma_c_imag_freq(w_c_at_freqs, n, lambda, ef, &gwqp_g);
+            ImaginaryAxisSample::new_shifted(lambda, ef, sigma_c)
         })
         .collect();
 
@@ -522,6 +530,7 @@ pub fn gw_near_fermi_surface_ac(
             &scf_data.gwqp.0,
             &scf_data.gwqp.1,
             num_state,
+            occ_size,
             vir_size,
             num_freq,
         )
@@ -579,11 +588,11 @@ pub fn gw_near_fermi_surface_ac(
     for i in calc_orbs[calc_orbs.len() - 1].0 + 1..num_state {
         gwqp.push(scf_data.eigenvalues[0][i] + vir_shift)
     }
-    ri_gw::display::extrapolation_quasiparticles(&gwqp, occ_size, &calc_orbs_indices, threshold);
+    ri_gw::display::extrapolation_quasiparticles(&gwqp, occ_size, &calc_orbs_indices, threshold, threshold);
     scf_data.gwqp = (gwqp.clone(), gwqp.clone());
     gwqp
 }
-pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,threshold:f64)->Vec<f64>{
+pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,occ_threshold:f64,vir_threshold:f64)->Vec<f64>{
     let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
     println!("RI-OV Shape={:?}",ri_ov.size);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
@@ -657,7 +666,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,t
 
     let e_homo=ks_energies[occ_size-1];
     let e_lumo=ks_energies[occ_size];
-    let calc_orbs_indices:Vec<usize>=ks_energies.into_iter().enumerate().filter(|(n,e_n)|*e_n>e_homo-threshold && *e_n<e_lumo+threshold).map(|(n,e_n)|n).collect();
+    let calc_orbs_indices:Vec<usize>=ks_energies.into_iter().enumerate().filter(|(n,e_n)|*e_n>e_homo-occ_threshold && *e_n<e_lumo+vir_threshold).map(|(n,e_n)|n).collect();
     println!("calculated orbital indices:{:?}",calc_orbs_indices);
     let calc_orbs:Vec<(usize,f64)>=calc_orbs_indices.iter().map(|&n|{
         let ri_row_n=ri_gw::compute_ri3mo_row(scf_data,n);
@@ -691,7 +700,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,t
         gwqp.push(scf_data.eigenvalues[0][i]+vir_shift)
     }
     //println!("extrapolated GW Results:{:#?}",gwqp);
-    ri_gw::display::extrapolation_quasiparticles(&gwqp,occ_size,&calc_orbs_indices,threshold);
+    ri_gw::display::extrapolation_quasiparticles(&gwqp,occ_size,&calc_orbs_indices,occ_threshold,vir_threshold);
     scf_data.gwqp=(gwqp.clone(),gwqp.clone());
     return gwqp
 }
