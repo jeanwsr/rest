@@ -452,9 +452,21 @@ pub fn initial_guess_from_raw(
 
                 tmp_eigenvalues[i]=loaded_eigenvalues[ 0..num_state].to_vec();
             });
-            (0..spin_channel).into_iter().for_each(|i_spin| {
-                tmp_occupation[i_spin]=loaded_occupation[ 0..num_state].to_vec();
-            });
+            if loaded_occupation.len() == 2 * num_state {
+                // ROHF source: alpha and beta occupation stored separately
+                tmp_occupation[0] = loaded_occupation[0..num_state].to_vec();
+                tmp_occupation[1] = loaded_occupation[num_state..2*num_state].to_vec();
+            } else {
+                // RHF/RKS source: occupation is total (e.g. [2,2,0]), divide by 2 for per-spin
+                assert!(loaded_occupation.len() == num_state,
+                    "r2u: unexpected occupation length {} (expected {} or {})",
+                    loaded_occupation.len(), num_state, 2*num_state);
+                (0..spin_channel).into_iter().for_each(|i_spin| {
+                    tmp_occupation[i_spin] = loaded_occupation[0..num_state].iter()
+                        .map(|x| x * 0.5)
+                        .collect();
+                });
+            }
         },
         "u2r" => {},
         _ => {
