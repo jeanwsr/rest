@@ -1177,6 +1177,105 @@ fn extract_eigenpairs(
 // Section 4: BSE-specific FEAST solver entry points
 // ============================================================================
 
+/// Reconstruct a Davidson-style `[X; Y]` eigenvector (length 2n) from a FEAST
+/// non-TDA X-block eigenvector.
+///
+/// FEAST's non-TDA path solves the squared Hermitian problem
+///   (A−B)·(A+B)⁻¹·u = ω²·u        (GEP: operator = (A−B), metric = (A+B)⁻¹)
+/// whose eigenvector is `u = X+Y` (length n = occ·vir). From the BSE identity
+///   (A−B)(X+Y) = ω·(X−Y)
+/// we recover
+///   X = (u + (A−B)u / ω) / 2
+///   Y = (u − (A−B)u / ω) / 2
+/// and return them stacked as `[X ; Y]` (length 2n), matching the layout of
+/// `lr_davidson_solver` so that `export_pysoc_json`, `dipoles::normalize`, etc.
+/// work unchanged.
+///
+/// # Arguments
+/// * `xpy_block` - the FEAST eigenvector `u = X+Y` (length n)
+/// * `amb_xpy`   - `(A−B)·xpy_block`, i.e. `ω·(X−Y)` (length n); caller computes
+///                 this with whatever RI integrals are currently in scope
+/// * `omega`     - the excitation energy ω (> 0)
+fn reconstruct_xy_from_xpy(xpy_block: &[f64], amb_xpy: &[f64], omega: f64) -> Vec<f64> {
+    debug_assert_eq!(xpy_block.len(), amb_xpy.len());
+    let n = xpy_block.len();
+    let mut full = vec![0.0; 2 * n];
+    for i in 0..n {
+        let x = (xpy_block[i] + amb_xpy[i] / omega) * 0.5;
+        let y = (xpy_block[i] - amb_xpy[i] / omega) * 0.5;
+        full[i] = x;
+        full[n + i] = y;
+    }
+    full
+}
+
+/// Reconstruct FEAST non-TDA eigenpairs into Davidson-style `[X;Y]` layout.
+///
+/// FEAST non-TDA returns eigenvectors that are length `n = occ·vir` and live in
+/// the "X+Y space" (the squared-problem eigenvector `u = X+Y`, recovered as
+/// `(A−B)u/ω + u = 2X` by `feast_solve_bse_nontda`). Downstream consumers
+/// (`export_pysoc_json`, `dipoles::normalize(_, false)`, `leading_components`)
+/// expect the Davidson `[X;Y]` layout (length 2n). This helper applies the BSE
+/// identity `(A−B)(X+Y) = ω(X−Y)` to rebuild `[X;Y]` for every eigenpair.
+///
+/// Builds the (A−B) matvec from the regular RI integrals (mirrors
+/// `feast_solve_bse_nontda`'s construction). `qp_ctrl.bse_spin` selects the
+/// spin channel.
+fn reconstruct_nontda_pairs_to_xy(
+    scf_data: &SCF,
+    qp_ctrl: &QuasiParticle,
+    eigenpairs: Vec<(f64, Vec<f64>)>,
+    occ_size: usize,
+    vir_size: usize,
+) -> Vec<(f64, Vec<f64>)> {
+    if eigenpairs.is_empty() {
+        return eigenpairs;
+    }
+    let ks_energies: Vec<f64> = scf_data.eigenvalues[0].clone();
+    let epsilon: Vec<f64> = if qp_ctrl.bse_qp_polarization {
+        scf_data.gwqp.0.clone()
+    } else {
+        ks_energies
+    };
+    let inverse_dielectric = construct_inverse_dielectric(scf_data, &epsilon);
+    let num_auxbas = inverse_dielectric.size[0];
+
+    let ri_oo = get_submatrix(scf_data, 'O', 'O', 'N');
+    let mut ri_oo_tilde = MatrixFull::new(ri_oo.size, 0.0);
+    _dgemm_full(&inverse_dielectric, 'N', &ri_oo, 'N', &mut ri_oo_tilde, 1.0, 0.0);
+    drop(ri_oo);
+    ri_oo_tilde.reshape([num_auxbas * occ_size, occ_size]);
+    ri_oo_tilde = ri_oo_tilde.transpose_and_drop();
+    ri_oo_tilde.reshape([occ_size * num_auxbas, occ_size]);
+
+    let ri_ov = get_submatrix(scf_data, 'O', 'V', 'N');
+    let mut ri_vv = get_submatrix(scf_data, 'V', 'V', 'N');
+    ri_vv.reshape([num_auxbas * vir_size, vir_size]);
+
+    let mut ri_ov_tilde = MatrixFull::new(ri_ov.size, 0.0);
+    _dgemm_full(&inverse_dielectric, 'N', &ri_ov, 'N', &mut ri_ov_tilde, 1.0, 0.0);
+    ri_ov_tilde.reshape([num_auxbas * occ_size, vir_size]);
+
+    let mut ri_ov_b = ri_ov.clone();
+    ri_ov_b.reshape([num_auxbas * occ_size, vir_size]);
+
+    // (A−B) matvec closure
+    let amb_matvec = |z: &Vec<f64>| -> Vec<f64> {
+        let a = matvec::a_block_matvec(scf_data, qp_ctrl, &ri_vv, &ri_ov, &ri_oo_tilde, z);
+        let b = matvec::b_block_matvec(scf_data, qp_ctrl, &ri_ov, &ri_ov_b, &ri_ov_tilde, z);
+        a.into_iter().zip(b.into_iter()).map(|(ai, bi)| ai - bi).collect()
+    };
+
+    eigenpairs
+        .into_iter()
+        .map(|(omega, vec)| {
+            let amb = amb_matvec(&vec);                  // (A−B)(X+Y) = ω(X−Y)
+            let xy = reconstruct_xy_from_xpy(&vec, &amb, omega);  // [X;Y], length 2n
+            (omega, xy)
+        })
+        .collect()
+}
+
 /// Build s-only matvec closures and diag for use as inner GMRES preconditioner.
 /// Must be called while `ri3fn_bse`/`rimatr_bse` are still populated (before clearing).
 /// Returns (a_mul, b_mul, diag) where a_mul/b_mul are `Box<dyn Fn>` closures
@@ -1696,11 +1795,19 @@ pub fn feast_solve_bse_singlet(scf_data:&mut SCF)->Vec<(f64,Vec<f64>)>{
         let emax = qp_ctrl.bse_eigenrange_max;
         let (fil_vals, fil_vecs) = filter_eigenpairs(ritz_vals, ritz_vecs, emin, emax);
         print_ritz_eigenpairs(scf_data, &fil_vals, &fil_vecs, "singlet", occ_size, vir_size);
-        fil_vals.into_iter().zip(fil_vecs.into_iter()).collect()
+        let raw: Vec<(f64, Vec<f64>)> = fil_vals.into_iter().zip(fil_vecs.into_iter()).collect();
+        // Rebuild [X;Y] for non-TDA so downstream export/print code is consistent.
+        if qp_ctrl.bse_tda { raw } else {
+            reconstruct_nontda_pairs_to_xy(scf_data, &qp_ctrl_singlet, raw, occ_size, vir_size)
+        }
     } else {
-        feast_solve_bse_spin(scf_data,&qp_ctrl_singlet,&quasiparticle_energies,
+        let raw = feast_solve_bse_spin(scf_data,&qp_ctrl_singlet,&quasiparticle_energies,
                              eigenrange_min,eigenrange_max,m_expected,max_feast_iter,tol_feast,None,
-                             None, None, "diagonal", None, 0.0001, 0, 0)
+                             None, None, "diagonal", None, 0.0001, 0, 0);
+        let (_, _, occ_size, vir_size, _, _) = get_occupation_parameters(scf_data, 'N');
+        if qp_ctrl.bse_tda { raw } else {
+            reconstruct_nontda_pairs_to_xy(scf_data, &qp_ctrl_singlet, raw, occ_size, vir_size)
+        }
     }
 }
 
@@ -1757,11 +1864,19 @@ pub fn feast_solve_bse_triplet(scf_data:&mut SCF)->Vec<(f64,Vec<f64>)>{
         let emax = qp_ctrl.bse_eigenrange_max;
         let (fil_vals, fil_vecs) = filter_eigenpairs(ritz_vals, ritz_vecs, emin, emax);
         print_ritz_eigenpairs(scf_data, &fil_vals, &fil_vecs, "triplet", occ_size, vir_size);
-        fil_vals.into_iter().zip(fil_vecs.into_iter()).collect()
+        let raw: Vec<(f64, Vec<f64>)> = fil_vals.into_iter().zip(fil_vecs.into_iter()).collect();
+        // Rebuild [X;Y] for non-TDA so downstream export/print code is consistent.
+        if qp_ctrl.bse_tda { raw } else {
+            reconstruct_nontda_pairs_to_xy(scf_data, &qp_ctrl_triplet, raw, occ_size, vir_size)
+        }
     } else {
-        feast_solve_bse_spin(scf_data,&qp_ctrl_triplet,&quasiparticle_energies,
+        let raw = feast_solve_bse_spin(scf_data,&qp_ctrl_triplet,&quasiparticle_energies,
                              eigenrange_min,eigenrange_max,m_expected,max_feast_iter,tol_feast,None,
-                             None, None, "diagonal", None, 0.0001, 0, 0)
+                             None, None, "diagonal", None, 0.0001, 0, 0);
+        let (_, _, occ_size, vir_size, _, _) = get_occupation_parameters(scf_data, 'N');
+        if qp_ctrl.bse_tda { raw } else {
+            reconstruct_nontda_pairs_to_xy(scf_data, &qp_ctrl_triplet, raw, occ_size, vir_size)
+        }
     }
 }
 
@@ -2016,20 +2131,26 @@ pub fn feast_solve_bse(scf_data:&mut SCF)->(Vec<(f64,Vec<f64>)>,Vec<(f64,Vec<f64
         }else{
             let mut qp_ctrl_s=qp_ctrl.clone();
             qp_ctrl_s.bse_spin=String::from("singlet");
-            eigenpairs_singlet=feast_solve_bse_nontda(
+            let singlet_raw=feast_solve_bse_nontda(
                 scf_data,&qp_ctrl_s,&inverse_dielectric,occ_size,vir_size,
                 eigenrange_min,eigenrange_max,m_expected,max_feast_iter,tol_feast,None,
                 None, None, "diagonal", None, 0.0001, 0, 0);
             let one_feast_time=start.elapsed();
             println!("Singlets (FEAST) calculation took {:?}",one_feast_time);
+            // Rebuild [X;Y] (length 2n) from FEAST's X+Y-space vectors so that
+            // downstream export/dipole code (written for Davidson's [X;Y]) works.
+            eigenpairs_singlet=reconstruct_nontda_pairs_to_xy(
+                scf_data,&qp_ctrl_s,singlet_raw,occ_size,vir_size);
 
             let mut qp_ctrl_t=qp_ctrl.clone();
             qp_ctrl_t.bse_spin=String::from("triplet");
-            eigenpairs_triplet=feast_solve_bse_nontda(
+            let triplet_raw=feast_solve_bse_nontda(
                 scf_data,&qp_ctrl_t,&inverse_dielectric,occ_size,vir_size,
                 eigenrange_min,eigenrange_max,m_expected,max_feast_iter,tol_feast,None,
                 None, None, "diagonal", None, 0.0001, 0, 0);
             println!("Triplets (FEAST) calculation took {:?}",start.elapsed()-one_feast_time);
+            eigenpairs_triplet=reconstruct_nontda_pairs_to_xy(
+                scf_data,&qp_ctrl_t,triplet_raw,occ_size,vir_size);
         }
 
         return (eigenpairs_singlet,eigenpairs_triplet);
@@ -2110,7 +2231,23 @@ pub fn feast_solve_bse(scf_data:&mut SCF)->(Vec<(f64,Vec<f64>)>,Vec<(f64,Vec<f64
                                                       eigenrange_min_orig, eigenrange_max_orig);
     print_ritz_eigenpairs(scf_data, &fil_vals_t, &fil_vecs_t, "triplet", occ_size, vir_size);
 
-    let eigenpairs_singlet = fil_vals_s.into_iter().zip(fil_vecs_s.into_iter()).collect();
-    let eigenpairs_triplet = fil_vals_t.into_iter().zip(fil_vecs_t.into_iter()).collect();
+    let eigenpairs_singlet_raw: Vec<(f64, Vec<f64>)> =
+        fil_vals_s.into_iter().zip(fil_vecs_s.into_iter()).collect();
+    let eigenpairs_triplet_raw: Vec<(f64, Vec<f64>)> =
+        fil_vals_t.into_iter().zip(fil_vecs_t.into_iter()).collect();
+
+    // For non-TDA the Ritz vectors are length-n X+Y-space vectors; rebuild them
+    // into Davidson-style [X;Y] (length 2n) so export/dipole code works. TDA
+    // vectors are already in the correct layout (X block, Y=0) — pass through.
+    let eigenpairs_singlet = if qp_ctrl.bse_tda {
+        eigenpairs_singlet_raw
+    } else {
+        reconstruct_nontda_pairs_to_xy(scf_data, &qp_ctrl_rr_s, eigenpairs_singlet_raw, occ_size, vir_size)
+    };
+    let eigenpairs_triplet = if qp_ctrl.bse_tda {
+        eigenpairs_triplet_raw
+    } else {
+        reconstruct_nontda_pairs_to_xy(scf_data, &qp_ctrl_rr_t, eigenpairs_triplet_raw, occ_size, vir_size)
+    };
     (eigenpairs_singlet,eigenpairs_triplet)
 }
