@@ -971,16 +971,25 @@ mod geometric_pyo3_impl {
         //let xyz = scf_data.mol.geom.position.iter().map(|x| *x).collect::<Vec<f64>>();
         let xyzs = vec![xyz];
         let molecule = init_pyo3_molecule(&elem, &xyzs).unwrap();
-        // Build topology. The Fac (covalent-radii multiplier) controls bond detection;
-        // a value below the default 1.2 prunes spurious long-range contacts (e.g. ionic
-        // Sr-O in perovskite clusters), sharply reducing redundant internal coordinates.
-        // Fac must be written into molecule.top_settings (read by build_bonds), not passed
-        // as a kwarg, so it also applies to the rebuild that geomeTRIC does inside makePrimitives.
-        let fac = scf_data.mol.ctrl.geometric_pyo3.as_ref().and_then(|g| g.fac);
+        // Build topology. Fac / radii control bond detection and must be written into
+        // molecule.top_settings (read by build_bonds), not passed as kwargs, so they also
+        // apply to the rebuild that geomeTRIC does inside makePrimitives.
+        //   fac   : multiplicative factor to covalent radii (default 1.2).
+        //   radii : per-element radius overrides, e.g. [("Sr", 0.0)] to make Sr non-bonding.
+        let geo_params = scf_data.mol.ctrl.geometric_pyo3.as_ref();
+        let fac = geo_params.and_then(|g| g.fac);
+        let radii = geo_params.and_then(|g| g.radii.as_ref());
         Python::with_gil(|py| -> PyResult<()> {
+            let ts = molecule.getattr(py, "top_settings")?;
             if let Some(f) = fac {
-                let ts = molecule.getattr(py, "top_settings")?;
                 ts.call_method1(py, "__setitem__", ("Fac", f))?;
+            }
+            if let Some(ref pairs) = radii {
+                let radii_dict = pyo3::types::PyDict::new(py);
+                for (elem, r) in pairs.iter() {
+                    radii_dict.set_item(elem, r)?;
+                }
+                ts.call_method1(py, "__setitem__", ("radii", radii_dict))?;
             }
             molecule.call_method(py, "build_topology", (), None)?;
             Ok(())

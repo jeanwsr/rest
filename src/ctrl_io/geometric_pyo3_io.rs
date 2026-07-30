@@ -48,6 +48,15 @@ pub struct GeomeTRIC {
                                     // Default None -> geomeTRIC default 1.2. Lower values (e.g. 0.9) prune spurious
                                     // long-range contacts such as ionic Sr-O in perovskite clusters, which sharply
                                     // reduces the number of redundant internal coordinates (distances/angles/dihedrals).
+    pub radii: Option<Vec<(String, f64)>>, // Per-element covalent-radii overrides for bond detection
+                                    // (REST-internal, written to molecule.top_settings['radii']).
+                                    // e.g. [("Sr", 0.0)] makes Sr form no bonds, useful for ionically-bonded cations
+                                    // in clusters/surfaces. Default None -> geomeTRIC's built-in covalent radii.
+    pub check: Option<i32>,         // Interval (in optimization steps) for rebuilding the internal coordinate system,
+                                    // forwarded to geomeTRIC's run_optimization as the "check" parameter.
+                                    // Default None (= 0, disabled). For large/condensed systems where the DLC basis
+                                    // becomes stale as geometry evolves (causing Grad_T to diverge from the true force),
+                                    // set to e.g. 10 to refresh the coordinate system every 10 steps.
 }
 
 impl Default for GeomeTRIC {
@@ -78,6 +87,8 @@ impl Default for GeomeTRIC {
             analytic_hessian: false,
             use_analdrv: None,
             fac: None,
+            radii: None,
+            check: None,
         }
     }
 }
@@ -115,6 +126,9 @@ impl GeomeTRIC {
         
         table.insert("prefix".to_string(), toml::Value::String(self.prefix.clone()));
         table.insert("verbose".to_string(), toml::Value::Integer(self.verbose as i64));
+        if let Some(c) = self.check {
+            table.insert("check".to_string(), toml::Value::Integer(c as i64));
+        }
         
         toml::Value::Table(table)
 
@@ -230,6 +244,16 @@ pub fn parse_geometric_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<
             };
             geometric.fac = match tmp_ctrl.get("fac").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => tmp_num.as_f64(),
+                other => None,
+            };
+            geometric.radii = match tmp_ctrl.get("radii").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Object(map) => {
+                    Some(map.iter().filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f))).collect())
+                },
+                other => None,
+            };
+            geometric.check = match tmp_ctrl.get("check").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => tmp_num.as_i64().map(|i| i as i32),
                 other => None,
             };
             return Ok(Some(geometric));
