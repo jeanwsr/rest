@@ -179,6 +179,8 @@ const ZZZ: usize = 19;
 /// Returns `(sub_blocks, concurrency, target_sub_block_size)`.
 pub fn plan_grid_split(
     block_ranges: &[std::ops::Range<usize>],
+    nao: usize,
+    nderiv: usize,
 ) -> (Vec<std::ops::Range<usize>>, usize, usize) {
     let n_orig = block_ranges.len();
     if n_orig == 0 {
@@ -198,9 +200,16 @@ pub fn plan_grid_split(
     // Minimum sub-block size for reasonable BLAS efficiency
     let min_nb = 256usize;
 
-    // Peak memory budget (in grid-point units): concurrency × nb = constant.
-    // Current default concurrency=2 gives: budget = 2 × max_orig_nb.
-    let peak_budget = 2 * max_orig_nb;
+    // Cap the in-flight AO memory: each grid point contributes
+    // nderiv·nao·8 B (RIFull) plus an equal-sized owned ao_d copy (×2).
+    // Bound the total across concurrent tasks to ~1.5 GiB regardless of
+    // system size, so large basis sets / high derivative orders do not blow
+    // up the Hessian peak RSS. (2·max_orig_nb is kept as an upper limit so we
+    // never sub-split more aggressively than the old behavior allowed.)
+    let ao_mem_cap = 1.5 * 1024.0 * 1024.0 * 1024.0; // 1.5 GiB
+    let bytes_per_point = 2.0 * nderiv.max(1) as f64 * nao.max(1) as f64 * 8.0;
+    let points_cap = (ao_mem_cap / bytes_per_point) as usize;
+    let peak_budget = points_cap.max(min_nb).min(2 * max_orig_nb);
 
     // Target: use up to num_threads concurrent sub-blocks within the budget
     let ideal_nb = (peak_budget as f64 / num_threads as f64).ceil() as usize;
@@ -242,7 +251,7 @@ pub fn vxc_diag_streaming(scf: &SCF, xc_type: XCType) -> MatrixFull<f64> {
     let nderiv_max = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
 
     let block_ranges: &[std::ops::Range<usize>] = &grids.parallel_balancing;
-    let (sub_blocks, concurrency, _sub_nb) = plan_grid_split(block_ranges);
+    let (sub_blocks, concurrency, _sub_nb) = plan_grid_split(block_ranges, nao, nderiv_max);
 
     // Accumulator: 6 partial [nao,nao] matrices
     let mut acc_v6: Vec<MatrixFull<f64>> =
@@ -382,7 +391,7 @@ pub fn vxc_deriv2_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
     let nderiv_max = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
 
     let block_ranges: &[std::ops::Range<usize>] = &grids.parallel_balancing;
-    let (sub_blocks, concurrency, _sub_nb) = plan_grid_split(block_ranges);
+    let (sub_blocks, concurrency, _sub_nb) = plan_grid_split(block_ranges, nao, nderiv_max);
 
     // Accumulators
     let mut acc_vmat: Vec<MatrixFull<f64>> =
@@ -603,7 +612,7 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
     let nderiv_max = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
 
     let block_ranges: &[std::ops::Range<usize>] = &grids.parallel_balancing;
-    let (sub_blocks, concurrency, _sub_nb) = plan_grid_split(block_ranges);
+    let (sub_blocks, concurrency, _sub_nb) = plan_grid_split(block_ranges, nao, nderiv_max);
 
     // Accumulators
     let mut acc_vmat: Vec<MatrixFull<f64>> =

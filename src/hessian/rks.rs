@@ -44,8 +44,9 @@ pub fn add_vxc_h_partial(
         // Show grid parallelism plan
         if let Some(ref grids) = scf.grids {
             let block_ranges: &[std::ops::Range<usize>] = &grids.parallel_balancing;
+            let nao_diag = scf.mol.num_basis;
             let (sub_blocks, concurrency, sub_nb) =
-                crate::hessian::xc_hessian::plan_grid_split(block_ranges);
+                crate::hessian::xc_hessian::plan_grid_split(block_ranges, nao_diag, 20);
             let n_sub = if sub_nb > 0 { sub_blocks.len() } else { block_ranges.len() };
             let sub_info = if sub_nb > 0 {
                 format!("| {} sub-blocks (max {} pts each)", n_sub, sub_nb)

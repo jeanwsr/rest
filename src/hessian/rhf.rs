@@ -1222,21 +1222,19 @@ impl RIRHFHessian<'_> {
             v
         };
         // Phase 1-3 + G3 need: t3c, ip1, ip2, ipip1, ipv.
-        // ip12 (g5/g8) and ipip2 (g6/g9) are only needed later — delay their
-        // computation until just before their respective G-terms to avoid
-        // holding 2×324 MiB of dead integrals through Phases 1-3.
+        // Each derivative integral is computed lazily right before its first
+        // consumer and dropped after its last, so the O(9·N²·P) tensors never
+        // coexist: ipip1 → Phase 1b, ip1 → Phase 2 (kept through g4), ip2 →
+        // Phase 3b, ipv → Phase 4 G3/G4. This keeps the calc_ej_ek peak RSS
+        // down to ~the largest single 3c derivative tensor + staging buffers.
         let t3c  = int3c("int3c2e");        // (N,N,P)
         let ip1  = int3c("int3c2e_ip1");    // (3,N,N,P)
-        let ip2  = int3c("int3c2e_ip2");    // (3,N,N,P)
-        let ipv  = int3c("int3c2e_ipvip1"); // (9,N,N,P)  — also used by G3
-        let ipip1= int3c("int3c2e_ipip1");  // (9,N,N,P)
-        // H2 optimization: cache the four integrals that `calc_h1ao` would
-        // otherwise recompute. Clones are O(naux²) or O(naux·nao²), cheap
-        // compared to the libcint evaluation it saves.
+        // H2 optimization: cache the two 2c/3c integrals that `calc_h1ao`
+        // would otherwise recompute (int3c2e is moved in after Phase 1a).
         self.shared_integrals = Some(SharedHessianIntegrals {
             int2c2e_ip1: i21.clone(),
             vinv: vinv.clone(),
-            int3c2e: t3c.clone(),
+            int3c2e: Vec::new(),
         });
         self.timings
             .push(("  ej_ek: integrals", _t_global.elapsed()));
@@ -1250,10 +1248,6 @@ impl RIRHFHessian<'_> {
         let vinv_t: TsrView<f64> = rt::asarray((&vinv, [naux, naux].f(), &device));
         // Row-major integrals → F-order by reversing dims (p fastest → first axis)
         let t3c_t: TsrView<f64> = rt::asarray((&t3c, [naux, nao, nao].f(), &device));
-        let ip1_t: TsrView<f64>  = rt::asarray((&ip1, [naux, nao, nao, 3].f(), &device));
-        let ip2_t: TsrView<f64>  = rt::asarray((&ip2, [naux, nao, nao, 3].f(), &device));
-        let ipv_t: TsrView<f64>  = rt::asarray((&ipv, [naux, nao, nao, 9].f(), &device));
-        let ipip1_t: TsrView<f64> = rt::asarray((&ipip1, [naux, nao, nao, 9].f(), &device));
         let i21_t: TsrView<f64>  = rt::asarray((&i21, [naux, naux, 3].f(), &device));
         let i2inv_t: TsrView<f64> = rt::asarray((&i2inv, [naux, naux].f(), &device));
 
@@ -1332,15 +1326,19 @@ impl RIRHFHessian<'_> {
             rk.copy_from_slice(&rk_raw);
         }
 
-        // t3c (and its unused view t3c_t) is no longer needed after Phase 1a —
-        // the cached clone in shared_integrals (for calc_h1ao) was taken above.
-        // Free ~naux*nao² doubles before the rest of calc_ej_ek runs.
+        // t3c (and its unused view t3c_t) is no longer needed after Phase 1a.
+        // Move it into shared_integrals for calc_h1ao instead of keeping the
+        // earlier clone, freeing ~naux·nao² doubles during the rest of the
+        // phase.
         drop(t3c_t);
-        drop(t3c);
+        self.shared_integrals.as_mut().unwrap().int3c2e = t3c;
 
         self.timings.push(("  p1a_rhoj0_rhok0", _tp1a.elapsed()));
         // ══ Phase 1b: vj1_diag, vk1_diag (prototype L68-76) ══
         let _tp1b = std::time::Instant::now();
+        // ipip1 (9,N,N,P) is consumed only within Phase 1b — evaluate it just
+        // before use so it never coexists with the other 3c tensors.
+        let ipip1 = int3c("int3c2e_ipip1"); // (9,N,N,P)
         let mut vjd = vec![0.0; 9 * nao * nao];
         let mut vkd = vec![0.0; 9 * nao * nao];
         // ── vjd[x, i, j] = Σ_p ipip1[x, i, j, p] · r0[p]  (single GEMM) ──
@@ -1424,10 +1422,8 @@ impl RIRHFHessian<'_> {
             }
         }
 
-        // ipip1 (9*naux*nao²), rkm and rkm_jpl_stage (naux*nao² each), and the
-        // unused ipip1_t view are only used in Phase 1b. Free before the
-        // heavier Phase 2/3 allocations.
-        drop(ipip1_t);
+        // ipip1 (9*naux*nao²), rkm and rkm_jpl_stage (naux*nao² each) are only
+        // used in Phase 1b. Free before the heavier Phase 2/3 allocations.
         drop(rkm_jpl_t);
         drop(ipip1);
         drop(rkm);
@@ -1523,9 +1519,14 @@ impl RIRHFHessian<'_> {
         let _tp3a = std::time::Instant::now();
         // rhok_ip1_IkP = einsum('pykl,li->ikpy', tmp_ip1, dm0)
         // → result[i(ALL_AO), k(BLOCK), p(AUX), y(DERIV)] of shape (N, ni, P, 3)
-        // Store per-atom as (N * ni * P * 3) flat
-        let mut rhok_IkP_per_atom: Vec<Vec<f64>> =
-            (0..natm).map(|_| vec![0.0; nao * nao * naux * 3]).collect();
+        // Store per-atom as (N * ni * P * 3) flat — each atom only owns the
+        // compact [nao, ni, naux, 3] block for its own AO slice (ni per atom).
+        // The previous nao*nao*naux*3 allocation repeated the full AO range for
+        // every atom, wasting (natm-1) copies of nao*naux*3 doubles.
+        let mut rhok_IkP_per_atom: Vec<Vec<f64>> = blk
+            .iter()
+            .map(|&(_, _, ni)| vec![0.0; nao * ni * naux * 3])
+            .collect();
         let mut rhok_PkI_full = vec![0.0; naux * nao * nao * 3];
         // ── Per-atom: rhok[i, k, p, y] = Σ_l tmpf[p, y*nao² + (p0+k)*nao + l] · dm0[l, i]  (1 GEMM per atom) ──
         // staging tmp_ikp_2d[nao, ni*naux*3] F-order: element (l, k + p*ni + y*ni*naux) = tmpf[p, c]
@@ -1623,6 +1624,8 @@ impl RIRHFHessian<'_> {
         self.timings.push(("  p3a_vk2buf_rhok", _tp3a.elapsed()));
         // ══ Phase 3b: wj_ip2, wk_ip2_Ipk, wk_ip2_P__ (prototype L92-97) ══
         let _tp3b = std::time::Instant::now();
+        // ip2 (3,N,N,P) is consumed only within Phase 3b — evaluate it lazily.
+        let ip2 = int3c("int3c2e_ip2");     // (3,N,N,P)
         let mut wj2 = vec![0.0; naux * 3];
         let mut wki = vec![0.0; nao * naux * 3 * nao];
         let mut wk2 = vec![0.0; naux * 3 * nocc * nocc];
@@ -1734,8 +1737,7 @@ impl RIRHFHessian<'_> {
             }
         }
 
-        // ip2 (3*naux*nao²) and its unused view ip2_t are only used in Phase 3b.
-        drop(ip2_t);
+        // ip2 (3*naux*nao²) is only used in Phase 3b.
         drop(ip2);
 
         self.timings.push(("  p3b_wj2_wk2", _tp3b.elapsed()));
@@ -1887,6 +1889,9 @@ impl RIRHFHessian<'_> {
 
         // ══ rstsr accelerated G1-G3 (standard path, replaces for loops) ══
         let device = DeviceBLAS::default();
+        // ipv (9,N,N,P) is consumed by G3 (ej_vj1) and g4 (ek_vk1). Evaluate it
+        // lazily here so the 9·N²·P tensor does not linger through Phases 1-3.
+        let ipv = int3c("int3c2e_ipvip1"); // (9,N,N,P)
         let dm0_t: TsrView<f64> = rt::asarray((&dm0, [nao, nao].f(), &device));
         let vjd_t: TsrView<f64> = rt::asarray((&vjd, [nao, nao, 9].f(), &device));
         let vkd_t: TsrView<f64> = rt::asarray((&vkd, [nao, nao, 9].f(), &device));
@@ -1954,36 +1959,34 @@ impl RIRHFHessian<'_> {
         let r0_t_ri: TsrView<f64> = rt::asarray((&r0, [naux].f(), &device));
         let rj1_t_ri: TsrView<f64> = rt::asarray((&rj1, [3, naux, natm].f(), &device));
 
-                let _t_g4 = std::time::Instant::now();
-                let ctx = build_ej_ek_ctx!();
-                g4_ek_vk1_blas(&ctx, &ip1, &ipv, &mut ek_vk1);
-                self.timings.push(("  g4_ek_vk1", _t_g4.elapsed()));
+        // g4/g5/g6/g7 build the exchange block `ek`. For pure LDA/GGA DFAs
+        // factor_k == 0, so `ek` is scaled out of h_partial entirely — skip the
+        // exchange G-terms (and their O(naux·nao³) contractions) altogether.
+        // g4 is the last consumer of ip1 and ipv.
+        if self.factor_k != 0.0 {
+            let _t_g4 = std::time::Instant::now();
+            let ctx = build_ej_ek_ctx!();
+            g4_ek_vk1_blas(&ctx, &ip1, &ipv, &mut ek_vk1);
+            self.timings.push(("  g4_ek_vk1", _t_g4.elapsed()));
+        }
 
         // g4 is the last consumer of ip1 and ipv — free them before computing
         // the delayed ip12/ipip2 integrals. Saves ~432 MiB (108+324).
         drop(ip1);
         drop(ipv);
 
-        // Delayed integrals (only used in Phase 4 G-terms):
+        // Delayed 3c derivative integrals, computed one at a time so ip12 and
+        // ipip2 never coexist (each is 9·N²·P doubles).
         //   ip12  ~324 MiB — used by g5 and g8
         //   ipip2 ~324 MiB — used by g6 and g9
         let ip12  = int3c("int3c2e_ip1ip2"); // (9,N,N,P)
-        let ipip2 = int3c("int3c2e_ipip2");  // (9,N,N,P)
 
-                let _t_e5 = std::time::Instant::now();
-                let ctx = build_ej_ek_ctx!();
-                g5_ek_ri1_blas(&ctx, &ip12, &mut ek_ri1);
-                self.timings.push(("  ek_ri1", _t_e5.elapsed()));
-
-                let _t_e6 = std::time::Instant::now();
-                let ctx = build_ej_ek_ctx!();
-                g6_ek_ri2d_blas(&ctx, &ipip2, &mut ek_ri2d);
-                self.timings.push(("  ek_ri2d", _t_e6.elapsed()));
-
-                let _t_e7 = std::time::Instant::now();
-                let ctx = build_ej_ek_ctx!();
-                g7_ek_ri2o_blas(&ctx, &mut ek_ri2o);
-                self.timings.push(("  ek_ri2o", _t_e7.elapsed()));
+        if self.factor_k != 0.0 {
+            let _t_e5 = std::time::Instant::now();
+            let ctx = build_ej_ek_ctx!();
+            g5_ek_ri1_blas(&ctx, &ip12, &mut ek_ri1);
+            self.timings.push(("  ek_ri1", _t_e5.elapsed()));
+        }
 
                 let _t_e8 = std::time::Instant::now();
                 let ctx = build_ej_ek_ctx!();
@@ -1992,6 +1995,20 @@ impl RIRHFHessian<'_> {
 
         // g8 is the last consumer of ip12 — free it. Saves ~324 MiB.
         drop(ip12);
+
+        let ipip2 = int3c("int3c2e_ipip2");  // (9,N,N,P)
+
+        if self.factor_k != 0.0 {
+            let _t_e6 = std::time::Instant::now();
+            let ctx = build_ej_ek_ctx!();
+            g6_ek_ri2d_blas(&ctx, &ipip2, &mut ek_ri2d);
+            self.timings.push(("  ek_ri2d", _t_e6.elapsed()));
+
+            let _t_e7 = std::time::Instant::now();
+            let ctx = build_ej_ek_ctx!();
+            g7_ek_ri2o_blas(&ctx, &mut ek_ri2o);
+            self.timings.push(("  ek_ri2o", _t_e7.elapsed()));
+        }
 
                 let _t_e9 = std::time::Instant::now();
                 let ctx = build_ej_ek_ctx!();
@@ -2295,6 +2312,8 @@ impl RIRHFHessian<'_> {
             }
 
             // ── H6: rhok0_Pl_ += scatter(co @ mc2) ──
+            // K-only intermediate: skipped for pure DFAs (factor_k == 0).
+            if self.factor_k != 0.0 {
             // co staged as F-order [naux*ni, nao]: (P*ni+ii, j) at (P*ni+ii) + j*(naux*ni)
             //   source: co[P*ni*nao + ii*nao + j] = co row-major [naux, ni, nao]
             // mc2 row-major [nao, nocc]: (j, occ) at j*nocc + occ
@@ -2329,6 +2348,7 @@ impl RIRHFHessian<'_> {
                             rk_pl_raw[(p * ni + ii) + occ * (naux * ni)];
                     }
                 }
+            }
             }
         }
 
@@ -2420,11 +2440,18 @@ impl RIRHFHessian<'_> {
         //       element (j*naux+P, l) at (j*naux+P) + l*(nao*naux)
         //   vk1[x] F-order [nao, nao]: (i, l) at i + l*nao
         //     scatter to vk1_buf row-major [3, nao, nao]: (x,i,l) at x*nao² + i*nao + l
-        let mut rhok0_PlJ = vec![0.0; naux * nao * nao];
+        // H2a/H2b build the exchange-side vk1_buf (K-only). For pure DFAs
+        // factor_k == 0 so vk1 is scaled out of h1ao — skip all of it. The
+        // consumed vars are hoisted so the (also gated) per-atom vk1 block
+        // below can borrow them without recomputation.
         let mut vk1_buf = vec![0.0; 3 * nao3];
+        let mut rk_pl_stage: Vec<f64> = Vec::new();
+        if self.factor_k != 0.0 {
+        let mut rhok0_PlJ = vec![0.0; naux * nao * nao];
+        let mut vk1_buf_new = vec![0.0; 3 * nao3];
         // Pre-stage rhok0_Pl_ once as F-order [naux*nao, nocc] — shared by H2a and H3a.
         // Previously H3a re-staged this (2.5M elements × natm = 30M useless copies for C6H6).
-        let rk_pl_stage: Vec<f64> = {
+        let rk_pl_stage_new: Vec<f64> = {
             let mut stage = vec![0.0; naux * nao * nocc];
             for p in 0..naux {
                 for l in 0..nao {
@@ -2439,7 +2466,7 @@ impl RIRHFHessian<'_> {
 
         use rstsr::prelude::*;
         // ── H2a: rhok0_PlJ = rhok0_Pl_ @ mc2^T ── (uses pre-staged rk_pl_stage)
-        let rk_pl_t = rt::asarray((&rk_pl_stage, [naux * nao, nocc].f(), &device));
+        let rk_pl_t = rt::asarray((&rk_pl_stage_new, [naux * nao, nocc].f(), &device));
         let mc2_t_h2 = rt::asarray((mc2.as_slice(), [nocc, nao].f(), &device));
         let plj_t = (&rk_pl_t % &mc2_t_h2); // [naux*nao, nao] F-order
         let plj_raw = plj_t.into_shape(-1).into_raw();
@@ -2516,10 +2543,13 @@ impl RIRHFHessian<'_> {
                 // Accumulate to vk1_buf row-major [3, nao, nao]
                 for i in 0..nao {
                     for l in 0..nao {
-                        vk1_buf[x * nao3 + i * nao + l] += vk1_block_raw[i + l * nao];
+                        vk1_buf_new[x * nao3 + i * nao + l] += vk1_block_raw[i + l * nao];
                     }
                 }
             }
+        }
+        vk1_buf = vk1_buf_new;
+        rk_pl_stage = rk_pl_stage_new;
         }
 
         // Stage rho0_full once as F-order [naux, nao²] — it is constant across atoms.
@@ -2871,14 +2901,18 @@ impl RIRHFHessian<'_> {
                 }
             }
 
-            // vk1
+            // vk1 (K-only): skipped entirely for pure DFAs (factor_k == 0),
+            // in which case vk1 stays zero and 0.5*factor_k*vk1 == 0 in h1ao.
+            let mut vk1 = vec![0.0; 3 * nao3];
+            let mut vk1_step1 = vk1.clone();
+            let mut vk1_presym = vk1.clone();
+            if self.factor_k != 0.0 {
             // H3a: rhok0_PlJ_a[P,l,J] = Σ_j rhok0_Pl_[P,l,j] * mc2[(p0+J),j]
             //   GEMM: rhok0_Pl_ [naux*nao, nocc] @ mc2_slice^T [nocc, ni] = rhok0_PlJ_a [naux*nao, ni]
             //   (rhok0_Pl_ staging same as H2a, mc2_slice needs staging for p0..p0+ni rows)
             // H3b: vk1[x,k,jj] = -Σ_{P,ii} ip1_a[x,ii,jj,P] * rhok0_PlJ_a[P,k,ii]
             //   Per x: GEMM ip1_a[x] [nao, ni*naux] @ rhok0_PlJ_a_reord [ni*naux, nao] = vk1[x] [nao, nao]
             let mut rhok0_PlJ_a = vec![0.0; naux * nao * ni];
-            let mut vk1 = vec![0.0; 3 * nao3];
 
             use rstsr::prelude::*;
             // ── H3a ── (reuses pre-staged rk_pl_stage)
@@ -2939,7 +2973,7 @@ impl RIRHFHessian<'_> {
                 }
             }
 
-            let vk1_step1 = vk1.clone(); // before vk1_buf correction
+            vk1_step1 = vk1.clone(); // before vk1_buf correction
                                          // vk1_buf correction (on rows, matching vk1_buf's layout)
             for x in 0..3 {
                 for i in p0..p1 {
@@ -2949,7 +2983,7 @@ impl RIRHFHessian<'_> {
                 }
             }
             // Save pre-sym vk1 for debug comparison with PySCF _gen_jk
-            let vk1_presym = vk1.clone();
+            vk1_presym = vk1.clone();
             // ── Auxiliary-basis response corrections (before vk1 symmetrization) ──
             if qi_aux > 0 {
                 let q0 = q0_aux;
@@ -3077,6 +3111,7 @@ impl RIRHFHessian<'_> {
                     vk1[x * nao3 + i * nao + i] *= 2.0;
                 }
             }
+            }
 
             // hcore_deriv
             let h1 = build_hcore_first_deriv(mol, ia);
@@ -3178,6 +3213,7 @@ impl RIRHFHessian<'_> {
         use crate::ri_cphf::{
             build_s1ao_deriv, transform_h1ao_ao2mo, transform_s1ao_ao2mo, CPHFSolverPySCF,
         };
+        use crate::dft::response::gen_vind_opt_batched;
         use tensors::matrix_blas_lapack::_dgemm_full;
 
         let scf = self.scf_data;
@@ -3253,6 +3289,12 @@ impl RIRHFHessian<'_> {
         let mut rhs_meta: Vec<(usize, usize)> = Vec::with_capacity(n_pert);
 
         // ── First pass: build RHS, cache h1_mo / s1ao / s1_mo per (ia, dir) ──
+        // The occupied-occupied correction is z_oo = -0.5·s1_oo. Instead of one
+        // gen_vind_opt call (with a full fxc grid sweep) per RHS, collect all
+        // 3*natm OO blocks and evaluate them in ONE batched call below.
+        let fo_size_oo = solver.ws.nfrozen * nocc;
+        let mut rhs_base_all: Vec<Vec<f64>> = Vec::with_capacity(n_pert);
+        let mut z_oo_batch: Vec<Vec<f64>> = Vec::with_capacity(n_pert);
         for ia in 0..natm {
             let h1_mo = transform_h1ao_ao2mo(&solver, &self.h1ao[ia]);
             let s1ao_ia = build_s1ao_deriv(mol, ia);
@@ -3264,16 +3306,42 @@ impl RIRHFHessian<'_> {
             for dir in 0..3 {
                 s1ao_all[ia][dir] = s1ao_ia[dir].clone();
                 s1_mo_all[ia][dir] = s1_mo_ia[dir].clone();
-                // Includes the occupied-occupied correction (one fvind call per RHS).
-                let rhs = solver.build_rhs_with_oo_correction(
-                    scf,
-                    fxc_cache_ref,
-                    &h1_mo[dir],
-                    &s1_mo_ia[dir],
-                );
-                rhs_all.push(rhs);
+                // VO RHS without the OO correction.
+                let b_base = solver.build_rhs_with_s1(&h1_mo[dir], &s1_mo_ia[dir]);
+                // OO correction block: z_oo[i,j] = -0.5·s1_oo[i,j].
+                let mut z_oo = vec![0.0; nocc * nocc];
+                for j in 0..nocc {
+                    for i in 0..nocc {
+                        z_oo[i + j * nocc] =
+                            -0.5 * s1_mo_ia[dir][(start_mo + i) + j * nmo];
+                    }
+                }
+                rhs_base_all.push(b_base);
+                z_oo_batch.push(z_oo);
                 rhs_meta.push((ia, dir));
             }
+        }
+        // One batched fvind call for all 3*natm OO corrections (shares a single
+        // fxc grid sweep across RHS instead of 3*natm separate ones).
+        let zero_vo = vec![0.0; solver.dim];
+        let z_vo_refs: Vec<&[f64]> = (0..n_pert).map(|_| zero_vo.as_slice()).collect();
+        let z_oo_refs: Vec<&[f64]> = z_oo_batch.iter().map(|v| v.as_slice()).collect();
+        let oo_resp_batch = gen_vind_opt_batched(
+            scf,
+            &solver.ws,
+            &z_vo_refs,
+            fxc_cache_ref,
+            Some(&z_oo_refs),
+            None,
+        );
+        for (k, _) in rhs_meta.iter().enumerate() {
+            // g_oo[ia] = VO response of the OO perturbation at (ia_row, ia_col).
+            let resp = &oo_resp_batch[k];
+            let mut rhs = rhs_base_all[k].clone();
+            for ia in 0..solver.dim {
+                rhs[ia] -= resp[fo_size_oo + ia] * solver.e_ai[ia];
+            }
+            rhs_all.push(rhs);
         }
 
         // ── Second pass: one batched Krylov solve for all 3*natom RHS ──
@@ -3284,18 +3352,12 @@ impl RIRHFHessian<'_> {
             CPHF_KRYLOV_MAX_CYCLE,
             CPHF_KRYLOV_TOL,
         );
-        let mo1_full_all: Vec<Vec<f64>> = rhs_meta
-            .iter()
-            .zip(u_vo_all.iter())
-            .map(|(&(ia, dir), u_vo)| {
-                let u_oo = solver.solve_occ_occ_from_s1(&s1_mo_all[ia][dir]);
-                solver.assemble_full_solution(u_vo, &u_oo)
-            })
-            .collect();
 
-        // ── Third pass: distribute to mo1_all + preserve debug output ──
+        // ── Third pass: assemble each full solution directly into mo1_all
+        // (no intermediate mo1_full_all copy), plus preserve debug output ──
         for (k, &(ia, dir)) in rhs_meta.iter().enumerate() {
-            let mo1_full = mo1_full_all[k].clone();
+            let u_oo = solver.solve_occ_occ_from_s1(&s1_mo_all[ia][dir]);
+            let mo1_full = solver.assemble_full_solution(&u_vo_all[k], &u_oo);
             mo1_all[ia][dir] = mo1_full.clone();
 
             // Save h1_mo, s1_mo, mo1 for atom 0, direction 0 for debug comparison.
@@ -3412,7 +3474,13 @@ impl RIRHFHessian<'_> {
                     // Compute J and K
                     let dm_vec = vec![dm1.clone()];
                     let j_full = compute_j_upper(scf, &dm_vec).to_matrixfull().unwrap();
-                    let k_full = compute_k_upper(scf, &dm_vec).to_matrixfull().unwrap();
+                    // Skip the exchange response for pure (LDA/GGA) DFAs where
+                    // k_scaling_e1 == 0 — K is O(naux·nao³) pure waste here.
+                    let k_full = if k_scaling_e1 != 0.0 {
+                        compute_k_upper(scf, &dm_vec).to_matrixfull().unwrap()
+                    } else {
+                        MatrixFull::new([nao, nao], 0.0)
+                    };
                     let mut v_ao = MatrixFull::new([nao, nao], 0.0);
                     for p in 0..nao {
                         for q in 0..nao {

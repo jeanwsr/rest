@@ -8,7 +8,7 @@
 /// For DFT: vind(dm1) = fxc[dm1] + J[dm1] - hyb*K[dm1]
 
 use rest_tensors::{MatrixFull, MatrixUpper};
-use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
+use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, omp_set_num_threads_wrapper};
 use crate::scf_io::{SCF, SCFType};
 use crate::dft::num_int::{prepare_fxc_data, fxc_matvec_old,
     eval_ao_batch, eval_rho5_batch};
@@ -331,6 +331,10 @@ fn compute_fxc_response_block(
     let nb = block.nb;
     let ao_d = &block.ao_d;
     let fxc_raw = &block.fxc_raw;
+    // Force single-threaded BLAS inside this (possibly parallel) grid task:
+    // the process-wide OpenBLAS pool would otherwise oversubscribe the CPU
+    // (n_blocks rayon tasks × OpenBLAS threads) and stall the contractions.
+    omp_set_num_threads_wrapper(1);
     let mut vmat = MatrixFull::new([nao, nao], 0.0);
     // Subtimings are opt-in (env var) to avoid atomic-cache-line contention
     // that otherwise costs ~3x wall time on small systems.
@@ -501,12 +505,6 @@ pub fn gen_vind_opt(
     let dm_vec = vec![dm1.clone()];
 
     // ── Step 2: Compute J, K via REST JK ──
-    let j_full = compute_j_upper(scf, &dm_vec).to_matrixfull()
-        .unwrap_or_else(|| panic!("J to_matrixfull failed"));
-    let k_full = compute_k_upper(scf, &dm_vec).to_matrixfull()
-        .unwrap_or_else(|| panic!("K to_matrixfull failed"));
-
-    // ── Step 3: v_ao = J - 0.5*hyb*K (RHF) or J - hyb*K (UHF/ROHF) ──
     // hyb from DFA: for HF (dfa_compnt_scf empty), dfa_hybrid_scf=0, but
     // the SCF HF uses hardcoded scaling=-0.5 (generate_hf_hamiltonian_ri_v),
     // so we must set hyb=1.0 for HF to get the correct exchange response.
@@ -520,6 +518,19 @@ pub fn gen_vind_opt(
         SCFType::RHF => 0.5 * hyb,
         _ => hyb,
     };
+    let j_full = compute_j_upper(scf, &dm_vec).to_matrixfull()
+        .unwrap_or_else(|| panic!("J to_matrixfull failed"));
+    // Skip the exchange response entirely for pure (LDA/GGA) DFAs: the K term
+    // is scaled by k_scaling = 0, so compute_k_upper would be pure waste. K is
+    // O(naux·nao³) per call and dominates the JK phase of every matvec.
+    let k_full = if k_scaling != 0.0 {
+        compute_k_upper(scf, &dm_vec).to_matrixfull()
+            .unwrap_or_else(|| panic!("K to_matrixfull failed"))
+    } else {
+        MatrixFull::new([nao, nao], 0.0)
+    };
+
+    // ── Step 3: v_ao = J - k_scaling*K ──
     let mut v_ao = MatrixFull::new([nao, nao], 0.0);
     for i in 0..nao { for j in 0..nao {
         v_ao[[i, j]] = j_full[[i, j]] - k_scaling * k_full[[i, j]];
@@ -664,8 +675,14 @@ pub fn gen_vind_opt_batched(
         let dm_vec = vec![dms[i].clone()];
         let j_full = compute_j_upper(scf, &dm_vec).to_matrixfull()
             .unwrap_or_else(|| panic!("J to_matrixfull failed"));
-        let k_full = compute_k_upper(scf, &dm_vec).to_matrixfull()
-            .unwrap_or_else(|| panic!("K to_matrixfull failed"));
+        // Skip the exchange response for pure DFAs (k_scaling == 0); K is
+        // O(naux·nao³) and would dominate the per-RHS matvec cost as waste.
+        let k_full = if k_scaling != 0.0 {
+            compute_k_upper(scf, &dm_vec).to_matrixfull()
+                .unwrap_or_else(|| panic!("K to_matrixfull failed"))
+        } else {
+            MatrixFull::new([nao, nao], 0.0)
+        };
         let mut v_ao = MatrixFull::new([nao, nao], 0.0);
         for r in 0..nao { for c in 0..nao {
             v_ao[[r, c]] = j_full[[r, c]] - k_scaling * k_full[[r, c]];
