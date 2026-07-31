@@ -309,56 +309,48 @@ pub fn update_basis_from_hdf5chk(scf_data: &mut SCF) {
 }
 
 pub fn initial_guess_from_hdf5chk(mol: &mut Molecule, scftype: &SCFType, chkfile: &String) -> ([MatrixFull<f64>;2],[Vec<f64>;2],Option<[Vec<f64>;2]>) {
-    let mut spin_channel: usize;
-    if let &SCFType::ROHF = scftype {
-        spin_channel = 1;
-
-    } else {
-        spin_channel = mol.spin_channel;
+    match proj::decide_guess(chkfile, &*mol) {
+        proj::GuessAction::Refuse(reason) => {
+            panic!("Cannot use chkfile '{}' for initial guess: {}", chkfile, reason);
+        }
+        proj::GuessAction::DirectReuse => {
+            let spin_channel = if let &SCFType::ROHF = scftype { 1 } else { mol.spin_channel };
+            let (loaded_eigenvectors, loaded_eigenvalues, loaded_occupation) = import_guess_from_hdf5chkfile(chkfile,
+                    spin_channel,
+                    mol.ctrl.print_level
+                );
+            initial_guess_from_raw(
+                loaded_eigenvectors,
+                loaded_eigenvalues,
+                loaded_occupation.unwrap(),
+                spin_channel,
+                mol.num_state,
+                mol.num_basis,
+                mol.ctrl.print_level
+            )
+        }
+        proj::GuessAction::Project(source) => {
+            let spin_channel = source.spin_channel;
+            let (loaded_eigenvectors, loaded_eigenvalues, loaded_occupation) = import_guess_from_hdf5chkfile(chkfile,
+                    spin_channel,
+                    mol.ctrl.print_level
+                );
+            println!("The basis set in chkfile does not match the input basis set (loaded: {} basis, {} MOs; target: {} basis, {} MOs),", source.num_basis, source.num_state, mol.num_basis, mol.num_state);
+            println!("trying to project ...");
+            let (mo2, _, occ2) = initial_guess_from_raw(
+                loaded_eigenvectors,
+                loaded_eigenvalues,
+                loaded_occupation.unwrap(),
+                source.spin_channel,
+                source.num_state,
+                source.num_basis,
+                mol.ctrl.print_level
+            );
+            let mo = proj::proj_mo(mol, &source, mo2);
+            println!("projection completed.");
+            (mo, [vec![], vec![]], occ2)
+        }
     }
-    let (loaded_eigenvectors,loaded_eigenvalues,loaded_occupation) = import_guess_from_hdf5chkfile(chkfile, 
-            spin_channel,
-            // mol.num_state,
-            // mol.num_basis,
-            mol.ctrl.print_level
-        );
-    let (loaded_nbasis, loaded_nmo, loaded_spin_channel, loaded_spin, loaded_charge) = chkfile::load_basic(chkfile).unwrap();
-    let basis_match = (loaded_nbasis == mol.num_basis) && (loaded_nmo == mol.num_state);
-    if basis_match {
-        return initial_guess_from_raw(
-            loaded_eigenvectors,
-            loaded_eigenvalues,
-            loaded_occupation.unwrap(),
-            spin_channel,
-            mol.num_state,
-            mol.num_basis,
-            mol.ctrl.print_level
-        );
-    } else {
-        println!("The basis set in chkfile does not match the input basis set (loaded: {} basis, {} MOs; target: {} basis, {} MOs),", loaded_nbasis, loaded_nmo, mol.num_basis, mol.num_state);
-        println!("trying to project ...");
-        let (cint_raw_data, ecp_raw, basis4elem, cint_type) = chkfile::load_cint_data(chkfile);
-        let (mo2, _, occ2) = initial_guess_from_raw(
-            loaded_eigenvectors,
-            loaded_eigenvalues,
-            loaded_occupation.unwrap(),
-            loaded_spin_channel,
-            loaded_nmo,
-            loaded_nbasis,
-            mol.ctrl.print_level
-        );
-        let mut mol_source = Molecule::init_mol();
-        mol_source.cint_type = cint_type.unwrap_or(mol.cint_type);
-        mol_source.ctrl.spin = loaded_spin.unwrap_or(mol.ctrl.spin);
-        mol_source.ctrl.charge = loaded_charge.unwrap_or(mol.ctrl.charge);
-        mol_source.ctrl.print_level = mol.ctrl.print_level;
-        mol_source.update_from_cint(loaded_nbasis, basis4elem, cint_raw_data.unwrap(), ecp_raw);
-        assert!(proj::check_proj_sanity(&mol, &mol_source));
-        let mo = proj::proj_mo(mol, &mol_source, mo2);
-        println!("projection completed.");
-        return (mo, [vec![], vec![]], occ2);
-    }
-    
 }
 
 pub fn import_guess_from_hdf5chkfile(chkname: &str, spin_channel: usize, print_level: usize) -> (Vec<f64>,Vec<f64>, Option<Vec<f64>>) {

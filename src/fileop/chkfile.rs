@@ -4,7 +4,9 @@ use hdf5;
 use hdf5::types::VarLenUnicode;
 // use hdf5::types::TypeDescriptor;
 use crate::scf_io::{SCF, SCFType};
-use crate::geom_io::get_mass_charge;
+use tensors::matrix::MatrixFull;
+use crate::geom_io::{GeomCell, GeomUnit, MOrC, get_mass_charge};
+use crate::external_field::extfield::ExtField;
 use crate::basis_io::Basis4Elem;
 use rest_libcint::CintType;
 use crate::constants::BOHR;
@@ -113,6 +115,15 @@ pub fn save_chkfile(scf_data: &SCF) {
     write_string_scalar(&file, "molecule/basis4elem", &basis4elem);
     let cinttype = cint_type_as_str(&mol.cint_type);
     write_string_scalar(&file, "molecule/cinttype", &cinttype);
+
+    let geom = &scf_data.mol.geom;
+    let geom_json = serde_json::to_string(&serde_json::json!({
+        "name":     geom.name.clone(),
+        "elem":     geom.elem.clone(),
+        "unit":     geom.unit,
+        "position": geom.position.iter().copied().collect::<Vec<f64>>(),
+    })).unwrap();
+    write_string_scalar(&file, "molecule/geom", &geom_json);
 
     file.close();
 }
@@ -269,6 +280,51 @@ pub fn load_cint_data(chkfile: &String) -> (Option<(Vec<Vec<i32>>, Vec<Vec<i32>>
     }
 
     (Some((atm, bas, env)), ecpbas, basis4elem, cinttype)
+}
+
+pub fn load_geom(chkfile: &String) -> Option<GeomCell> {
+    let file = hdf5::File::open(chkfile).unwrap();
+    let ds = file.dataset("molecule/geom").ok()?;
+    let json_str = ds.read_scalar::<VarLenUnicode>().ok()?;
+    let json: HashMap<String, serde_json::Value> = serde_json::from_str(json_str.as_str()).ok()?;
+
+    let name = json.get("name").and_then(|v| v.as_str()).unwrap_or("a molecule").to_string();
+    let elem: Vec<String> = serde_json::from_value(json.get("elem")?.clone()).ok()?;
+    let unit: GeomUnit = serde_json::from_value(json.get("unit")?.clone()).ok()?;
+    let natoms = elem.len();
+    let position = if natoms > 0 {
+        let position_data: Vec<f64> = serde_json::from_value(json.get("position")?.clone()).ok()?;
+        MatrixFull::from_vec([3, natoms], position_data).unwrap()
+    } else {
+        MatrixFull::empty()
+    };
+
+    Some(GeomCell {
+        name,
+        elem,
+        fix: vec![],
+        unit,
+        position,
+        nfree: 0,
+        lattice: MatrixFull::empty(),
+        pbc: MOrC::Molecule,
+        ghost_bs_elem: vec![],
+        ghost_bs_pos: MatrixFull::empty(),
+        ghost_pc_chrg: vec![],
+        ghost_pc_pos: MatrixFull::empty(),
+        ghost_ep_path: vec![],
+        ghost_ep_pos: MatrixFull::empty(),
+        rest: vec![],
+        ext_field: ExtField::empty(),
+        rg_position: MatrixFull::empty(),
+        rg_elem: vec![],
+        rrs_pbc: false,
+        unit_cell_index: vec![],
+        pbc_dim: 1,
+        rrs_pbc_vec: MatrixFull::empty(),
+        max_step: vec![],
+        k_points: vec![],
+    })
 }
 
 pub fn load_basic(chkfile: &String) -> Option<(usize, usize, usize, Option<f64>, Option<f64>)> {
