@@ -702,12 +702,7 @@ nroots = 5
 
 `hessian` 子表位于 `[ctrl]` 区块中，若存在则触发解析Hessian计算；若不存在（缺省），则不进行Hessian计算。子表内的关键词包括：
 
-- `solver`: 取值String，CP-HF（Coupled-Perturbed Hartree-Fock）方程求解器。可选项：
-    - `"krylov"`（**缺省，强烈推荐**）：分批次Pople-Krylov子空间迭代求解器。共享子空间使所有微扰方向复用同一Krylov空间，对于多原子体系比稠密求解器快约30-47倍。
-    - `"dense"`：直接矩阵求逆求解。仅适用于极小体系或开发验证。
 - `frequencies`: 取值bool，设置为 `true` 在Hessian矩阵计算完成后对角化质量加权Hessian，计算振动频率（cm⁻¹）和简正模式并保存到文件。缺省为false。
-- `krylov_max_cycle`: 取值usize，Krylov求解器的最大迭代次数。对于绝大多数体系，50轮已足以收敛到机器精度。缺省为50。
-- `krylov_tol`: 取值f64，Krylov求解器的残差范数收敛阈值。缺省为1e-12（机器精度）。若仅需振动频率且对数值精度要求不高，可适度放松至1e-8以缩短求解时间。
 - `verbose`: 取值usize，Hessian计算的信息输出等级：
     - `0`：静默模式，仅输出最终结果。
     - `1`（缺省）：正常输出，打印各阶段耗时和Hessian矩阵摘要。
@@ -719,7 +714,7 @@ nroots = 5
 
 以下 `[ctrl]` 区的全局关键词对Hessian计算有直接影响：
 
-- `auxbasis_response`: 取值bool，是否包含辅助基组响应修正（level 2）。缺省为true。**强烈建议保持开启**：关闭后Hessian矩阵会产生约7×10⁻³的系统误差。
+- 辅助基组响应修正在Hessian流程中始终启用；全局 `auxbasis_response` 开关不再改变Hessian计算。
 - `max_memory`: 取值f64，全局内存限制（单位MB）。Hessian流水线内嵌内存监控器（MemMonitor），在峰值RSS超过此限制时提前终止以防止系统OOM。
 
 ### 计算流水线
@@ -728,15 +723,7 @@ nroots = 5
 1. **Hess核贡献（calc_e1）**：动能+核吸引积分二阶导数，计算量小。
 2. **部分Hessian（calc_ej_ek）**：库仑+交换积分对Hessian的贡献，所有G项均采用BLAS GEMM优化。HF/杂化泛函的主要计算量集中于此。
 3. **一阶Fock响应（calc_h1ao）**：对所有原子方向的RI积分一阶响应生成h1ao矩阵。
-4. **CP-HF贡献+组装（calc_cphf_contrib + calc_hess_nuc）**：通过Krylov或稠密求解器计算轨道弛豫对Hessian的贡献，与核Hessian相加得到总Hessian。
-
-### 高级环境变量
-
-以下环境变量用于性能调优和开发验证，一般用户无需设置：
-
-- `REST_HESS_GRID_CONCURRENCY`: 取值usize，DFT Hessian中XC格点流式处理的并发块数。缺省为2（保守值）。对于大基组/大格点体系，增大此值可提升XC部分并行度但会增加峰值内存。Hessian对内存敏感，建议首选缺省值。
-- `REST_CPHF_METHOD`：覆盖 `solver` 设置。取值 `"krylov"` 或 `"dense"`。
-- `REST_CPHF_KRYLOV_MAXCYCLE` / `REST_CPHF_KRYLOV_TOL`：覆盖Krylov求解器的迭代次数和收敛阈值。
+4. **CP-HF贡献+组装（calc_cphf_contrib + calc_hess_nuc）**：通过固定的批量Krylov求解器（最大50轮、阈值1e-12）计算轨道弛豫对Hessian的贡献，与核Hessian相加得到总Hessian。
 
 ### 推荐配置
 
@@ -748,7 +735,7 @@ basis_path = "def2-SVP"
 auxbas_path = "def2-SVP-ri"
 charge = 0.0
 spin = 1
-hessian = { solver = "krylov" }
+hessian = {}
 
 [geom]
 name = "H2O"
@@ -768,7 +755,7 @@ basis_path = "def2-TZVP"
 auxbas_path = "def2-TZVP-ri"
 charge = 0.0
 spin = 1
-hessian = { solver = "krylov", frequencies = true }
+hessian = { frequencies = true }
 ```
 
 **完整调试输出（含中间量.npy保存，用于对比PySCF等参考程序）**：
@@ -779,7 +766,7 @@ basis_path = "def2-SVP"
 auxbas_path = "def2-SVP-ri"
 charge = 0.0
 spin = 1
-hessian = { solver = "krylov", frequencies = true, verbose = 2 }
+hessian = { frequencies = true, verbose = 2 }
 ```
 
 ## 解析梯度性质模块 `analdrv` 计算相关设置
@@ -939,10 +926,7 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 
 只要输入卡中存在 `[hessian]` 区块（可位于顶层或嵌套于 `[ctrl]` 下），SCF 收敛后即**无条件**触发解析 Hessian 计算（与 `job_type` 无关）。关键词包括：
 
-- `solver`: 取值 String。CP-HF 方程求解器，`"krylov"`（缺省，推荐；批量子空间迭代，一次派发所有 3N 个右端项）或 `"dense"`（稠密矩阵直接求解，仅用于小体系或校验）。
 - `frequencies`: 取值 bool。是否在 Hessian 计算后顺带做振动频率与简正模分析并输出 `EigenModes.txt`。缺省 false。注意：若同时设置了 `[thermo]` 区块，频率会被自动计算，无需手动开启此项。
-- `krylov_max_cycle`: 取值 usize。Krylov 求解器最大迭代数。缺省 50。
-- `krylov_tol`: 取值 f64。Krylov 收敛阈值。缺省 1e-12。
 - `verbose`: 取值 usize。输出详细程度（0=静默，1=正常，2=调试；调试时额外输出各分量 .npy 文件）。缺省 1。
 - `hessian_matrix_path`: 取值 String。Hessian 矩阵输出路径。缺省 `"./HessianMatrix.txt"`。
 - `eigenmodes_path`: 取值 String。简正模输出路径。缺省 `"./EigenModes.txt"`。
@@ -1010,7 +994,6 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
             H -0.629118  0.629118 -0.629118
          """
     [hessian]
-         solver = "krylov"
          frequencies = true
     [thermo]
          temperature = 298.15

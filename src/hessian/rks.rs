@@ -47,20 +47,14 @@ pub fn add_vxc_h_partial(
             let (sub_blocks, concurrency, sub_nb) =
                 crate::hessian::xc_hessian::plan_grid_split(block_ranges);
             let n_sub = if sub_nb > 0 { sub_blocks.len() } else { block_ranges.len() };
-            let env_override = std::env::var("REST_HESS_GRID_CONCURRENCY").ok()
-                .and_then(|s| s.parse::<usize>().ok());
-            let mode = match env_override {
-                Some(c) => format!("fixed (REST_HESS_GRID_CONCURRENCY={})", c),
-                None => "adaptive".to_string(),
-            };
             let sub_info = if sub_nb > 0 {
                 format!("| {} sub-blocks (max {} pts each)", n_sub, sub_nb)
             } else {
                 format!("| {} blocks", block_ranges.len())
             };
             println!(
-                "  [cpu] grid plan: {} {} | concurrency = {} | {} ngrid | rayon {} threads",
-                mode, sub_info, concurrency, grids.coordinates.len(),
+                "  [cpu] grid plan: adaptive {} | concurrency = {} | {} ngrid | rayon {} threads",
+                sub_info, concurrency, grids.coordinates.len(),
                 rayon::current_num_threads()
             );
         }
@@ -99,8 +93,7 @@ pub fn add_vxc_h_partial(
     let _t_diag = std::time::Instant::now();
     // Phase 2: streaming mode — process grid blocks in small concurrent
     // batches instead of collecting all AO data in a cache. Peak AO
-    // memory ≈ grid_concurrency() × per_block_size instead of
-    // num_blocks × per_block_size.
+    // memory stays bounded by the adaptive grid split plan.
     {
         cpu_section!(_cpu_mon, "rks:vxc_diag:grid");
         let vxc_diag_mat = crate::hessian::xc_hessian::vxc_diag_streaming(scf, xc_type);
@@ -188,7 +181,7 @@ pub fn compute_vxc_h1ao(scf: &SCF) -> Vec<Vec<f64>> {
 //   3. twice after fxc-heavy phases   → `record_fxc_*_timings`
 //
 // The genuinely entangled bit — threading `fxc_cache_ref` (None for HF,
-// Some(cache) for RKS) into the shared Krylov/dense solve calls — stays
+// Some(cache) for RKS) into the shared batched Krylov solve — stays
 // in rhf.rs because extracting it would require restructuring the entire
 // solve phase, which violates the "leave RHF-shared solve logic untouched"
 // constraint. HF passing `None` is benign and does not branch on RKS-ness.
@@ -250,7 +243,7 @@ pub fn add_fxc_to_v_ao(
 /// Record the post-solve-phase fxc timings into the caller's timing profile.
 ///
 /// Mirrors the inline block that previously lived in `calc_cphf_contrib`
-/// after the Krylov/dense solve: the `cphf: fxc_solve` total plus the
+/// after the Krylov solve: the `cphf: fxc_solve` total plus the
 /// detailed per-subcomponent breakdown (matches PySCF `nr_rks_fxc` internals).
 /// `cache_elapsed` is the wall-clock time spent building the cache (returned
 /// by the caller from around its `prepare_fxc_cache` call).
