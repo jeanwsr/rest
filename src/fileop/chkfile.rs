@@ -356,14 +356,8 @@ pub fn reconstruct_cint_data(
         }
     };
 
-    let basic = load_basic(chkfile);
-    let (charge, spin) = match &basic {
-        Some((_, _, _, s, c)) => (c.unwrap_or(0.0), s.unwrap_or(1.0)),
-        None => (0.0, 1.0),
-    };
-
-    let (atm, bas, env, bas_info, cint_fdqc, _num_elec, _nbasis, _nstate, ecpbas) =
-        build_cint(&basis4elem, &geom, &cint_type, charge, spin, false);
+    let (atm, bas, env, bas_info, cint_fdqc, _nbasis, _nstate, ecpbas) =
+        build_cint(&basis4elem, &geom, &cint_type);
 
     let basis4elem = Some(basis4elem);
     let cint_type = Some(cint_type);

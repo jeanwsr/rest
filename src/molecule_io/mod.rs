@@ -5,6 +5,7 @@ mod pyrest_molecule_io;
 pub mod with_clause;
 mod int_cross;
 mod frozen;
+pub mod basis;
 pub use frozen::count_frozen_core_states;
 
 use array_tool::vec::Intersect;
@@ -25,7 +26,7 @@ use crate::basis_io::etb::{get_etb_elem, etb_gen_for_atom_list, InfoV2};
 use crate::constants::{ATM_NUC, ATM_NUC_MOD_OF, AUXBAS_THRESHOLD, ENV_PRT_START, NUC_ECP, NUC_STAD_CHARGE};
 use crate::dft::{DFTType, DFA4REST, parse_xc};
 use crate::geom_io::{GeomCell, get_mass_charge, formated_element_name};
-use crate::basis_io::{BasCell, BasInfo, Basis4Elem};
+use crate::basis_io::{BasInfo, Basis4Elem};
 use crate::ctrl_io::{overall_parse_and_report_on_ctrl_geom, InputKeywords, parse_ctl};
 #[cfg(feature = "mpi")]
 use crate::mpi_io::mpi_isend_irecv_wrt_distribution_v03;
@@ -743,25 +744,13 @@ impl Molecule {
     }
 }
 
-fn count_basis_functions(shells: &[BasCell], cint_type: &CintType) -> usize {
-    shells.iter().map(|shell| {
-        let ang = shell.angular_momentum[0] as usize;
-        let bas_num = match cint_type {
-            CintType::Cartesian => (ang + 1) * (ang + 2) / 2,
-            CintType::Spheric => ang * 2 + 1,
-            CintType::Spinor => panic!("Spinor is not yet implemented"),
-        };
-        bas_num * shell.coefficients.len()
-    }).sum()
-}
-
 fn read_basis_per_atom(ctrl: &InputKeywords, geom: &GeomCell, cint_type: &CintType) -> Vec<Basis4Elem> {
     let mut basis_total: Vec<Basis4Elem> = vec![];
 
     for (atm_index, atm_elem) in geom.elem.iter().enumerate() {
         let tmp_path = format!("{}/{}.json", &ctrl.basis_path, &formated_element_name(atm_elem));
         let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path, &cint_type).unwrap();
-        let num_basis_per_atm = count_basis_functions(&tmp_basis.electron_shells, &cint_type);
+        let num_basis_per_atm = basis::count_basis_functions(&tmp_basis.electron_shells, &cint_type);
         if atm_index != 0 {
             tmp_basis.global_index.0 = basis_total[atm_index - 1].global_index.0 + basis_total[atm_index - 1].global_index.1;
             tmp_basis.global_index.1 = num_basis_per_atm;
@@ -778,7 +767,7 @@ fn read_basis_per_atom(ctrl: &InputKeywords, geom: &GeomCell, cint_type: &CintTy
             let atm_index = local_atm_index + atm_index_start;
             let tmp_path = format!("{}/{}.json", &ctrl.basis_path, &formated_element_name(atm_elem));
             let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path, &cint_type).unwrap();
-            let num_basis_per_atm = count_basis_functions(&tmp_basis.electron_shells, &cint_type);
+            let num_basis_per_atm = basis::count_basis_functions(&tmp_basis.electron_shells, &cint_type);
             if atm_index != 0 {
                 tmp_basis.global_index.0 = basis_total[atm_index - 1].global_index.0 + basis_total[atm_index - 1].global_index.1;
                 tmp_basis.global_index.1 = num_basis_per_atm;
@@ -797,10 +786,7 @@ pub fn build_cint(
     basis_per_atom: &[Basis4Elem],
     geom: &GeomCell,
     cint_type: &CintType,
-    charge: f64,
-    spin: f64,
-    use_int_nelec: bool,
-) -> (Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>, Vec<BasInfo>, Vec<Vec<usize>>, [f64;3], usize, usize, Option<Vec<Vec<i32>>>) {
+) -> (Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>, Vec<BasInfo>, Vec<Vec<usize>>, usize, usize, Option<Vec<Vec<i32>>>) {
     // Prepare atm info.
     let mut atm: Vec<Vec<i32>> = vec![];
     let mut env: Vec<f64> = vec![0.0;ENV_PRT_START];
@@ -808,10 +794,8 @@ pub fn build_cint(
 
     // for standard atoms
     let mass_charge = get_mass_charge(&geom.elem);
-    let mut num_elec = [0.0;3];
     geom.elem.iter().enumerate().zip(mass_charge.iter())
         .for_each(|((atm_index,atm_elem),(tmp_mass,tmp_charge))| {
-        num_elec[0] += tmp_charge;
         atm.push(vec![*tmp_charge as i32,geom_start,NUC_STAD_CHARGE,geom_start+3,0,0]);
         (0..3).into_iter().for_each(|i| {
             if let Some(tmp_value) = geom.position.get(&[i,atm_index]) {
@@ -910,7 +894,6 @@ pub fn build_cint(
             if let (Some(ecp), Some(necp))  = (&bas.ecp_potentials, &bas.ecp_electrons) {
                 cur_atm[ATM_NUC] -= *necp as i32;
                 cur_atm[ATM_NUC_MOD_OF] = NUC_ECP;
-                num_elec[0] -= *necp as f64;
 
                 let ecp_ang_start = (ecp.len()-1) as i32;
                 for ecpcell in ecp.iter() {
@@ -967,19 +950,9 @@ pub fn build_cint(
         }
     });
 
-    num_elec[0]-=charge;
-
-    if use_int_nelec {
-        sanity_check_nelec(num_elec[0], spin);
-    }
-
-    let unpair_elec = (spin-1.0_f64);
-    num_elec[1] = (num_elec[0]-unpair_elec)/2.0 + unpair_elec;
-    num_elec[2] = (num_elec[0]-unpair_elec)/2.0;
-
     let final_ecpbas = if ecpbas.len() == 0 {None} else {Some(ecpbas)};
 
-    (atm, bas, env,bas_info,cint_fdqc,num_elec,num_basis, num_state, final_ecpbas)
+    (atm, bas, env,bas_info,cint_fdqc,num_basis, num_state, final_ecpbas)
 }
 
 impl Molecule {
@@ -1025,8 +998,20 @@ impl Molecule {
 
         let basis_total = read_basis_per_atom(ctrl, geom, &cint_type);
 
-        let (atm, bas, env, bas_info, cint_fdqc, num_elec, num_basis, num_state, ecpbas) =
-            build_cint(&basis_total, geom, &cint_type, ctrl.charge, ctrl.spin, ctrl.use_int_nelec);
+        let (atm, bas, env, bas_info, cint_fdqc, num_basis, num_state, ecpbas) =
+            build_cint(&basis_total, geom, &cint_type);
+
+        let mut num_elec = [0.0;3];
+        for a in &atm {
+            num_elec[0] += a[ATM_NUC] as f64;
+        }
+        num_elec[0] -= ctrl.charge;
+        if ctrl.use_int_nelec {
+            sanity_check_nelec(num_elec[0], ctrl.spin);
+        }
+        let unpair = ctrl.spin - 1.0;
+        num_elec[1] = (num_elec[0] - unpair) / 2.0 + unpair;
+        num_elec[2] = (num_elec[0] - unpair) / 2.0;
 
         (basis_total, atm, bas, env, bas_info, cint_fdqc, num_elec, num_basis, num_state, ecpbas)
     }
