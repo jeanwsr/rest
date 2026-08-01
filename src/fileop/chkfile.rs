@@ -7,7 +7,8 @@ use crate::scf_io::{SCF, SCFType};
 use tensors::matrix::MatrixFull;
 use crate::geom_io::{GeomCell, GeomUnit, MOrC, get_mass_charge};
 use crate::external_field::extfield::ExtField;
-use crate::basis_io::Basis4Elem;
+use crate::basis_io::{BasInfo, Basis4Elem};
+use crate::molecule_io::build_cint;
 use rest_libcint::CintType;
 use crate::constants::BOHR;
 
@@ -101,19 +102,9 @@ pub fn save_chkfile(scf_data: &SCF) {
     // for compatibility with pyscf
     write_scf_attribute(&scf, "mo_occ", &occ);
 
-    let mol = &scf_data.mol;
-    // let (atm, bas, env) = (mol.cint_atm.clone(), mol.cint_bas.clone(), mol.cint_env.clone());
-    // convert hashmap of atm, bas, env to one json string
-    let mol_info = serde_json::to_string(&serde_json::json!({
-        "_atm": mol.cint_atm.clone(),
-        "_bas": mol.cint_bas.clone(),
-        "_ecpbas": mol.cint_ecpbas.clone(),
-        "_env": mol.cint_env.clone(),
-    })).unwrap();
-    write_string_scalar(&file, "mol", &mol_info);
-    let basis4elem = serde_json::to_string(&mol.basis4elem).unwrap();
+    let basis4elem = serde_json::to_string(&scf_data.mol.basis4elem).unwrap();
     write_string_scalar(&file, "molecule/basis4elem", &basis4elem);
-    let cinttype = cint_type_as_str(&mol.cint_type);
+    let cinttype = cint_type_as_str(&scf_data.mol.cint_type);
     write_string_scalar(&file, "molecule/cinttype", &cinttype);
 
     let geom = &scf_data.mol.geom;
@@ -247,6 +238,7 @@ pub fn has_mo_coeff(file: &hdf5::File) -> bool {
 }
 
 pub fn load_cint_data(chkfile: &String) -> (Option<(Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>)>, Option<Vec<Vec<i32>>>, Option<Vec<Basis4Elem>>, Option<CintType>) {
+    // Load legacy "mol" JSON path only. For new-format chkfiles, use reconstruct_cint_data.
     let file = hdf5::File::open(chkfile).unwrap();
     let mol_info = file.dataset("mol").unwrap().read_scalar::<VarLenUnicode>().unwrap();
     let json_string = mol_info.as_str();
@@ -325,6 +317,58 @@ pub fn load_geom(chkfile: &String) -> Option<GeomCell> {
         max_step: vec![],
         k_points: vec![],
     })
+}
+
+pub fn reconstruct_cint_data(
+    chkfile: &String,
+    geom_override: Option<&GeomCell>,
+) -> (Option<(Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>)>, Option<Vec<Vec<i32>>>, Option<Vec<Basis4Elem>>, Option<CintType>, Option<Vec<BasInfo>>, Option<Vec<Vec<usize>>>) {
+    let file = hdf5::File::open(chkfile).unwrap();
+
+    let has_basis4elem = file.dataset("molecule/basis4elem").is_ok();
+    let has_cinttype = file.dataset("molecule/cinttype").is_ok();
+
+    if !has_basis4elem || !has_cinttype {
+        let (a, b, c, d) = load_cint_data(chkfile);
+        return (a, b, c, d, None, None);
+    }
+
+    let basis4elem: Option<Vec<Basis4Elem>> = if let Ok(ds) = file.dataset("molecule/basis4elem") {
+        ds.read_scalar::<VarLenUnicode>().ok()
+            .and_then(|s| serde_json::from_str(s.as_str()).ok())
+    } else {
+        None
+    };
+
+    let cint_type: Option<CintType> = if let Ok(ds) = file.dataset("molecule/cinttype") {
+        ds.read_scalar::<VarLenUnicode>().ok()
+            .map(|s| s.as_str().into())
+    } else {
+        None
+    };
+
+    let geom = geom_override.cloned().or_else(|| load_geom(chkfile));
+    let (basis4elem, cint_type, geom) = match (basis4elem, cint_type, geom) {
+        (Some(b), Some(ct), Some(g)) => (b, ct, g),
+        _ => {
+            let (a, b, c, d) = load_cint_data(chkfile);
+            return (a, b, c, d, None, None);
+        }
+    };
+
+    let basic = load_basic(chkfile);
+    let (charge, spin) = match &basic {
+        Some((_, _, _, s, c)) => (c.unwrap_or(0.0), s.unwrap_or(1.0)),
+        None => (0.0, 1.0),
+    };
+
+    let (atm, bas, env, bas_info, cint_fdqc, _num_elec, _nbasis, _nstate, ecpbas) =
+        build_cint(&basis4elem, &geom, &cint_type, charge, spin, false);
+
+    let basis4elem = Some(basis4elem);
+    let cint_type = Some(cint_type);
+
+    (Some((atm, bas, env)), ecpbas, basis4elem, cint_type, Some(bas_info), Some(cint_fdqc))
 }
 
 pub fn load_basic(chkfile: &String) -> Option<(usize, usize, usize, Option<f64>, Option<f64>)> {

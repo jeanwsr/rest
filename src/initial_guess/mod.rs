@@ -292,16 +292,12 @@ pub fn update_basis_from_hdf5chk(scf_data: &mut SCF) {
 
         println!("taking basis set information from chkfile");
         let (loaded_nbasis, loaded_nmo, loaded_spin_channel, _, _) = chkfile::load_basic(&chkfile).unwrap();
-        let (cint_raw_data, ecp_raw, basis4elem, cint_type) = chkfile::load_cint_data(&chkfile);
-        if let Some(cint_raw_data) = cint_raw_data {
-            // mol.cint_atm = cint_raw_data.0;
-            // mol.cint_bas = cint_raw_data.1;
-            // mol.cint_env = cint_raw_data.2;
-            // mol.cint_ecpbas = ecp_raw;
-            scf_data.mol.update_from_cint(loaded_nbasis, basis4elem, cint_raw_data, ecp_raw);
-            if let Some(cint_type) = cint_type {
-                scf_data.mol.cint_type = cint_type;
+        let (cint_raw_data, ecp_raw, basis4elem, cint_type, fdqc_bas, cint_fdqc) = chkfile::reconstruct_cint_data(&chkfile, Some(&scf_data.mol.geom));
+        if let Some((atm, bas, env)) = cint_raw_data {
+            if let Some(ct) = cint_type {
+                scf_data.mol.cint_type = ct;
             }
+            scf_data.mol.set_cint_data(atm, bas, env, ecp_raw, None, basis4elem, fdqc_bas, cint_fdqc);
         } else {
             panic!("Failed to load the basis set information from chkfile");
         }

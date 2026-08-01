@@ -22,10 +22,10 @@ use std::ops::Range;
 use std::sync::mpsc::channel;
 use regex::Regex;
 use crate::basis_io::etb::{get_etb_elem, etb_gen_for_atom_list, InfoV2};
-use crate::constants::{ATM_NUC, ATM_NUC_MOD_OF, AUXBAS_THRESHOLD,  ENV_PRT_START, NUC_ECP, NUC_STAD_CHARGE};
+use crate::constants::{ATM_NUC, ATM_NUC_MOD_OF, AUXBAS_THRESHOLD, ENV_PRT_START, NUC_ECP, NUC_STAD_CHARGE};
 use crate::dft::{DFTType, DFA4REST, parse_xc};
 use crate::geom_io::{GeomCell, get_mass_charge, formated_element_name};
-use crate::basis_io::{BasInfo, Basis4Elem};
+use crate::basis_io::{BasCell, BasInfo, Basis4Elem};
 use crate::ctrl_io::{overall_parse_and_report_on_ctrl_geom, InputKeywords, parse_ctl};
 #[cfg(feature = "mpi")]
 use crate::mpi_io::mpi_isend_irecv_wrt_distribution_v03;
@@ -324,86 +324,72 @@ impl Molecule {
         self.cint_ecpbas.is_some()
     }
 
-    pub fn update_from_cint(&mut self, num_basis: usize, basis4elem: Option<Vec<Basis4Elem>>, cint_raw: (Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>), ecp_raw: Option<Vec<Vec<i32>>>) {
-        self.num_basis = num_basis;
-        if let Some(basis4elem_value) = basis4elem {
-            self.basis4elem = basis4elem_value;
+    pub fn set_cint_data(
+        &mut self,
+        atm: Vec<Vec<i32>>,
+        bas: Vec<Vec<i32>>,
+        env: Vec<f64>,
+        ecpbas: Option<Vec<Vec<i32>>>,
+        cint_type: Option<CintType>,
+        basis4elem: Option<Vec<Basis4Elem>>,
+        fdqc_bas: Option<Vec<BasInfo>>,
+        cint_fdqc: Option<Vec<Vec<usize>>>,
+    ) {
+        self.cint_atm = atm;
+        self.cint_bas = bas;
+        self.cint_env = env;
+        self.cint_ecpbas = ecpbas;
+        if let Some(ct) = cint_type {
+            self.cint_type = ct;
         }
-        self.cint_atm = cint_raw.0;
-        self.cint_bas = cint_raw.1;
-        self.cint_env = cint_raw.2;
-        self.cint_ecpbas = ecp_raw;
-        self.natm_real = self.geom.elem.len();
-        self.natm_all = self.cint_atm.len();
-        // update fdqc_bas, cint_fdqc
-        let mut fdqc_bas: Vec<BasInfo> = vec![];
-        let mut cint_fdqc: Vec<Vec<usize>> = vec![];
-        let mut bas_start = 0_usize;
-        self.cint_bas.iter().enumerate().for_each(|(bas_index, bas_cell)| {
-            let atm_index = bas_cell[0] as usize;
-            let ang = bas_cell[1] as usize;
-            let num_primitive = bas_cell[2] as usize;
-            let num_contracted = bas_cell[3] as usize;
-            let tmp_bas_num = match &self.cint_type {
-                CintType::Cartesian => (ang+1)*(ang+2)/2,
-                CintType::Spheric => ang*2+1,
-                CintType::Spinor => {panic!("Spinor is not yet implemented")},
-            };
-            let mut tmp_len = 0_usize;
-            (0..num_contracted).into_iter().for_each(|index0| {
-                (0..tmp_bas_num).into_iter().for_each(|index1| {
-                    let bas_type = if num_primitive == 1 {
-                        String::from("Primitive")
-                    } else {
-                        String::from("Contracted")
-                    };
-                    tmp_len += 1;
-                    fdqc_bas.push(BasInfo {
-                        bas_name: get_basis_name(ang, &self.cint_type, index1),
-                        bas_type,
-                        elem_index0: atm_index,
-                        cint_index0: bas_index,
-                        cint_index1: index0*tmp_bas_num+index1,
+        if let Some(b) = basis4elem {
+            self.basis4elem = b;
+        }
+        if let Some(fdqc) = fdqc_bas {
+            self.fdqc_bas = fdqc;
+            self.cint_fdqc = cint_fdqc.unwrap_or(vec![]);
+            self.num_basis = self.fdqc_bas.len();
+        } else {
+            let mut fdqc_bas: Vec<BasInfo> = vec![];
+            let mut cint_fdqc: Vec<Vec<usize>> = vec![];
+            let mut bas_start = 0_usize;
+            self.cint_bas.iter().enumerate().for_each(|(bas_index, bas_cell)| {
+                let atm_index = bas_cell[0] as usize;
+                let ang = bas_cell[1] as usize;
+                let num_primitive = bas_cell[2] as usize;
+                let num_contracted = bas_cell[3] as usize;
+                let tmp_bas_num = match &self.cint_type {
+                    CintType::Cartesian => (ang+1)*(ang+2)/2,
+                    CintType::Spheric => ang*2+1,
+                    CintType::Spinor => {panic!("Spinor is not yet implemented")},
+                };
+                let mut tmp_len = 0_usize;
+                (0..num_contracted).into_iter().for_each(|index0| {
+                    (0..tmp_bas_num).into_iter().for_each(|index1| {
+                        tmp_len += 1;
+                        fdqc_bas.push(BasInfo {
+                            bas_name: get_basis_name(ang, &self.cint_type, index1),
+                            bas_type: if num_primitive == 1 {
+                                String::from("Primitive")
+                            } else {
+                                String::from("Contracted")
+                            },
+                            elem_index0: atm_index,
+                            cint_index0: bas_index,
+                            cint_index1: index0*tmp_bas_num+index1,
+                        });
                     });
                 });
+                cint_fdqc.push(vec![bas_start,tmp_len]);
+                bas_start += tmp_len;
             });
-            cint_fdqc.push(vec![bas_start,tmp_len]);
-            bas_start += tmp_len;
-        });
-        self.fdqc_bas = fdqc_bas;
-        self.cint_fdqc = cint_fdqc;
-
-        let num_basis_calc = self.fdqc_bas.len();
-        if self.num_basis != num_basis_calc {
-            if self.ctrl.print_level > 0 {
-                println!("Warning: num_basis {} from chkfile does not match derived value {}. Using derived value.", self.num_basis, num_basis_calc);
-            }
-            self.num_basis = num_basis_calc;
+            self.fdqc_bas = fdqc_bas;
+            self.cint_fdqc = cint_fdqc;
+            self.num_basis = self.fdqc_bas.len();
         }
+        self.natm_real = self.geom.elem.len();
+        self.natm_all = self.cint_atm.len();
         self.num_state = self.num_basis;
-
-        // update num_elec
-        let mut num_elec = [0.0;3];
-        self.cint_atm.iter().for_each(|atm| {
-            num_elec[0] += atm[ATM_NUC] as f64;
-        });
-        num_elec[0] -= self.ctrl.charge;
-        if self.ctrl.use_int_nelec {
-            sanity_check_nelec(num_elec[0], self.ctrl.spin);
-        }
-        let unpair_elec = (self.ctrl.spin-1.0_f64);
-        num_elec[1] = (num_elec[0]-unpair_elec)/2.0 + unpair_elec;
-        num_elec[2] = (num_elec[0]-unpair_elec)/2.0;
-        self.num_elec = num_elec;
-
-        // update ecp_electrons
-        let ecp_electrons = self.basis4elem.iter().fold(0, |acc, i| {
-            let ecp_electrons = if let Some(num_ecp) = i.ecp_electrons {num_ecp} else {0};
-            acc + ecp_electrons
-        });
-        self.ecp_electrons = ecp_electrons;
-
-        self.start_mo = self.generate_start_mo(self.ecp_electrons);
     }
 
     pub fn initialize_auxbas(&mut self) {
@@ -755,13 +741,250 @@ impl Molecule {
         //println!("auxbas_total = {:?}", auxbas_total);
         (auxbas_total, aux_atm, aux_bas, aux_env,auxbas_info,aux_cint_fdqc,num_auxbas)
     }
+}
 
+fn count_basis_functions(shells: &[BasCell], cint_type: &CintType) -> usize {
+    shells.iter().map(|shell| {
+        let ang = shell.angular_momentum[0] as usize;
+        let bas_num = match cint_type {
+            CintType::Cartesian => (ang + 1) * (ang + 2) / 2,
+            CintType::Spheric => ang * 2 + 1,
+            CintType::Spinor => panic!("Spinor is not yet implemented"),
+        };
+        bas_num * shell.coefficients.len()
+    }).sum()
+}
+
+fn read_basis_per_atom(ctrl: &InputKeywords, geom: &GeomCell, cint_type: &CintType) -> Vec<Basis4Elem> {
+    let mut basis_total: Vec<Basis4Elem> = vec![];
+
+    for (atm_index, atm_elem) in geom.elem.iter().enumerate() {
+        let tmp_path = format!("{}/{}.json", &ctrl.basis_path, &formated_element_name(atm_elem));
+        let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path, &cint_type).unwrap();
+        let num_basis_per_atm = count_basis_functions(&tmp_basis.electron_shells, &cint_type);
+        if atm_index != 0 {
+            tmp_basis.global_index.0 = basis_total[atm_index - 1].global_index.0 + basis_total[atm_index - 1].global_index.1;
+            tmp_basis.global_index.1 = num_basis_per_atm;
+        } else {
+            tmp_basis.global_index.0 = 0;
+            tmp_basis.global_index.1 = num_basis_per_atm;
+        }
+        basis_total.push(tmp_basis);
+    }
+
+    if geom.ghost_bs_elem.len() > 0 {
+        let atm_index_start = geom.elem.len();
+        for (local_atm_index, atm_elem) in geom.ghost_bs_elem.iter().enumerate() {
+            let atm_index = local_atm_index + atm_index_start;
+            let tmp_path = format!("{}/{}.json", &ctrl.basis_path, &formated_element_name(atm_elem));
+            let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path, &cint_type).unwrap();
+            let num_basis_per_atm = count_basis_functions(&tmp_basis.electron_shells, &cint_type);
+            if atm_index != 0 {
+                tmp_basis.global_index.0 = basis_total[atm_index - 1].global_index.0 + basis_total[atm_index - 1].global_index.1;
+                tmp_basis.global_index.1 = num_basis_per_atm;
+            } else {
+                tmp_basis.global_index.0 = 0;
+                tmp_basis.global_index.1 = num_basis_per_atm;
+            }
+            basis_total.push(tmp_basis);
+        }
+    }
+
+    basis_total
+}
+
+pub fn build_cint(
+    basis_per_atom: &[Basis4Elem],
+    geom: &GeomCell,
+    cint_type: &CintType,
+    charge: f64,
+    spin: f64,
+    use_int_nelec: bool,
+) -> (Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>, Vec<BasInfo>, Vec<Vec<usize>>, [f64;3], usize, usize, Option<Vec<Vec<i32>>>) {
+    // Prepare atm info.
+    let mut atm: Vec<Vec<i32>> = vec![];
+    let mut env: Vec<f64> = vec![0.0;ENV_PRT_START];
+    let mut geom_start: i32 = ENV_PRT_START as i32;
+
+    // for standard atoms
+    let mass_charge = get_mass_charge(&geom.elem);
+    let mut num_elec = [0.0;3];
+    geom.elem.iter().enumerate().zip(mass_charge.iter())
+        .for_each(|((atm_index,atm_elem),(tmp_mass,tmp_charge))| {
+        num_elec[0] += tmp_charge;
+        atm.push(vec![*tmp_charge as i32,geom_start,NUC_STAD_CHARGE,geom_start+3,0,0]);
+        (0..3).into_iter().for_each(|i| {
+            if let Some(tmp_value) = geom.position.get(&[i,atm_index]) {
+                env.push(*tmp_value);
+            }
+        });
+        env.push(0.0);
+        geom_start += 4;
+    });
+    // for ghost atoms with basis sets
+    if geom.ghost_bs_elem.len() > 0 {
+        let ghost_mass_charge = get_mass_charge(&geom.ghost_bs_elem);
+        geom.ghost_bs_elem.iter().enumerate().zip(ghost_mass_charge.iter())
+            .for_each(|((atm_index, atm_elem), (tmp_mass, tmp_charge))| {
+            atm.push(vec![0, geom_start, NUC_STAD_CHARGE, geom_start+3, 0, 0]);
+            (0..3).into_iter().for_each(|i| {
+                if let Some(tmp_value) = geom.ghost_bs_pos.get(&[i, atm_index]) {
+                    env.push(*tmp_value);
+                }
+            });
+            env.push(0.0);
+            geom_start += 4;
+        });
+    }
+
+    // Now for bas inf.
+    let mut bas: Vec<Vec<i32>> = vec![];
+    let mut basis_start = geom_start;
+    let mut bas_info: Vec<BasInfo> = vec![];
+    let mut cint_fdqc: Vec<Vec<usize>> = vec![];
+
+    for (atm_index, tmp_basis) in basis_per_atom.iter().enumerate() {
+        let mut num_basis_per_atm = 0_usize;
+        for tmp_bascell in &tmp_basis.electron_shells {
+            let mut num_primitive: i32 = tmp_bascell.exponents.len() as i32;
+            let mut num_contracted: i32 = tmp_bascell.coefficients.len() as i32;
+            let mut angular_mom: i32 = tmp_bascell.angular_momentum[0];
+            let tmp_bas_info = BasInfo::new();
+            tmp_bascell.exponents.iter().for_each(|x| {
+                env.push(*x);
+            });
+            for (index, coe_vec) in tmp_bascell.coefficients.iter().enumerate() {
+                coe_vec.iter().for_each(|x| {
+                    env.push(*x);
+                });
+            };
+            let mut tmp_bas_vec: Vec<i32> = vec![atm_index as i32,
+                        angular_mom,
+                        num_primitive,
+                        num_contracted,
+                        0,
+                        basis_start,
+                        basis_start+num_primitive,
+                        0];
+            let (ang,tmp_bas_num) = match &cint_type {
+                CintType::Cartesian => {let ang = tmp_bas_vec[1] as usize; (ang,(ang+1)*(ang+2)/2)},
+                CintType::Spheric => {let ang = tmp_bas_vec[1] as usize; (ang, ang*2+1)},
+                CintType::Spinor => {panic!("Spinor is not yet implemented")},
+            };
+            let mut tmp_len = 0;
+            let tmp_start = if cint_fdqc.len()==0 {0}
+                                else {cint_fdqc[cint_fdqc.len()-1][0]+cint_fdqc[cint_fdqc.len()-1][1]};
+            (0..num_contracted as usize).into_iter().for_each(|index0| {
+                (0..tmp_bas_num).into_iter().for_each(|index1| {
+                    let bas_type = if num_primitive == 1 {
+                        String::from("Primitive")
+                    } else {
+                        String::from("Contracted")
+                    };
+                    tmp_len += 1;
+                    bas_info.push(BasInfo {
+                        bas_name: get_basis_name(ang, &cint_type, index1),
+                        bas_type,
+                        elem_index0: atm_index,
+                        cint_index0: bas.len(),
+                        cint_index1: index0*tmp_bas_num+index1,
+                    })
+                });
+            });
+            cint_fdqc.push(vec![tmp_start,tmp_len]);
+            bas.push(tmp_bas_vec);
+            basis_start += num_primitive + num_primitive*num_contracted;
+            num_basis_per_atm += tmp_len;
+        }
+    }
+
+    let num_basis = bas_info.len();
+    let num_state = num_basis;
+
+    // now import ecp basis infom.
+    let mut ecpbas: Vec<Vec<i32>> = vec![];
+    let mut ecp_start = env.len() as i32;
+    let ghost_atm_index = geom.get_start_index_of_ghost_atoms();
+    basis_per_atom.iter().zip(atm.iter_mut().enumerate()).for_each(|(bas, (atm_index,cur_atm))| {
+        if atm_index < ghost_atm_index {
+            if let (Some(ecp), Some(necp))  = (&bas.ecp_potentials, &bas.ecp_electrons) {
+                cur_atm[ATM_NUC] -= *necp as i32;
+                cur_atm[ATM_NUC_MOD_OF] = NUC_ECP;
+                num_elec[0] -= *necp as f64;
+
+                let ecp_ang_start = (ecp.len()-1) as i32;
+                for ecpcell in ecp.iter() {
+                    let angl = ecpcell.angular_momentum[0];
+                    let coeffs = &ecpcell.coefficients;
+                    let gaussian_exponents = &ecpcell.gaussian_exponents;
+                    let num_exp = gaussian_exponents.len() as i32;
+                    let num_coeffs = coeffs.len() as i32;
+
+                    let mut r_exponents_group: HashMap<i32, Vec<usize>> = HashMap::new();
+
+                    ecpcell.r_exponents.iter().enumerate().for_each(|(index, r_exponents)| {
+                        if r_exponents_group.contains_key(r_exponents) {
+                            r_exponents_group.get_mut(r_exponents).unwrap().push(index);
+                        } else {
+                            r_exponents_group.insert(*r_exponents, vec![index]);
+                        }
+                    });
+
+                    r_exponents_group.iter().for_each(|(r_exponent, index_vec)| {
+                        let mut ecp_exp_start = env.len() as i32;
+                        let num_index_vec = index_vec.len() as i32;
+                        env.extend(gaussian_exponents.iter().enumerate()
+                            .filter(|(index, x)| index_vec.contains(index) )
+                            .map(|(_, x)| x)
+                        );
+                        if num_index_vec > num_exp {
+                            panic!("bad ecp basis for the elem of {}", &geom.elem[atm_index]);
+                        }
+                        coeffs.iter().for_each(|each_coeffs| {
+                            let len_coeffs = each_coeffs.len() as i32;
+                            if len_coeffs != num_exp {
+                                panic!("bad ecp basis for the elem of {}", &geom.elem[atm_index]);
+                            }
+                            let mut ecp_coeff_start = env.len() as i32;
+                            let mut tmp_ecpbas_vec: Vec<i32> = vec![atm_index as i32,
+                                        if angl==ecp_ang_start {-1} else {angl},
+                                        num_index_vec,
+                                        *r_exponent,
+                                        0,
+                                        ecp_exp_start,
+                                        ecp_coeff_start,
+                                        0];
+                            ecpbas.push(tmp_ecpbas_vec);
+
+                            env.extend(each_coeffs.iter().enumerate()
+                                .filter(|(index, x)| index_vec.contains(index))
+                                .map(|(_, x)| x)
+                            );
+                        });
+                    });
+                }
+            };
+        }
+    });
+
+    num_elec[0]-=charge;
+
+    if use_int_nelec {
+        sanity_check_nelec(num_elec[0], spin);
+    }
+
+    let unpair_elec = (spin-1.0_f64);
+    num_elec[1] = (num_elec[0]-unpair_elec)/2.0 + unpair_elec;
+    num_elec[2] = (num_elec[0]-unpair_elec)/2.0;
+
+    let final_ecpbas = if ecpbas.len() == 0 {None} else {Some(ecpbas)};
+
+    (atm, bas, env,bas_info,cint_fdqc,num_elec,num_basis, num_state, final_ecpbas)
+}
+
+impl Molecule {
     pub fn collect_basis(ctrl: &InputKeywords,geom: &GeomCell) -> 
             (Vec<Basis4Elem>, Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>, Vec<BasInfo>, Vec<Vec<usize>>, [f64;3],usize, usize, Option<Vec<Vec<i32>>>) {
-        //let (elem_name, elem_charge, elem_mass) = elements();
-        let mut atm: Vec<Vec<i32>> = vec![];
-        let mut env: Vec<f64> = vec![0.0;ENV_PRT_START];
-        let mut geom_start: i32 = ENV_PRT_START as i32;
 
         let cint_type = if ctrl.basis_type.to_lowercase()==String::from("spheric") {
             CintType::Spheric
@@ -772,49 +995,6 @@ impl Molecule {
                    ctrl.basis_type);
         };
 
-        // Prepare atm info.
-        // for standard atoms
-        let mass_charge = get_mass_charge(&geom.elem);
-        let  mut num_elec = [0.0;3];
-        geom.elem.iter().enumerate().zip(mass_charge.iter())
-            .for_each(|((atm_index,atm_elem),(tmp_mass,tmp_charge))| {
-            num_elec[0] += tmp_charge;
-            atm.push(vec![*tmp_charge as i32,geom_start,NUC_STAD_CHARGE,geom_start+3,0,0]);
-            (0..3).into_iter().for_each(|i| {
-                if let Some(tmp_value) = geom.position.get(&[i,atm_index]) {
-                    //for the coordinates
-                    env.push(*tmp_value);
-                }
-            });
-            //for the nuclear charge distribution parameter
-            env.push(0.0);
-            geom_start += 4;
-        });
-        // for ghost atoms with basis sets
-        if geom.ghost_bs_elem.len() > 0 {
-            let ghost_mass_charge = get_mass_charge(&geom.ghost_bs_elem);
-            geom.ghost_bs_elem.iter().enumerate().zip(ghost_mass_charge.iter())
-                .for_each(|((atm_index, atm_elem), (tmp_mass, tmp_charge))| {
-                atm.push(vec![0, geom_start, NUC_STAD_CHARGE, geom_start+3, 0, 0]);
-                (0..3).into_iter().for_each(|i| {
-                    if let Some(tmp_value) = geom.ghost_bs_pos.get(&[i, atm_index]) {
-                        //for the coordinates
-                        env.push(*tmp_value);
-                    }
-                });
-                //for the nuclear charge distribution parameter
-                env.push(0.0);
-                geom_start += 4;
-            });
-        }
-
-        // Now for bas inf.
-        let mut basis_total: Vec<Basis4Elem> = vec![];
-        let mut bas: Vec<Vec<i32>> = vec![];
-        let mut basis_start = geom_start;
-        let mut bas_info: Vec<BasInfo> = vec![];
-        let mut cint_fdqc: Vec<Vec<usize>> = vec![];
-
         let ctrl_elem = ctrl_element_checker(geom);
         let local_elem = local_element_checker(&ctrl.basis_path);
         let elem_intersection = ctrl_elem.intersect(local_elem.clone());
@@ -824,7 +1004,7 @@ impl Molecule {
                 required_elem.push(ctrl_item)
             }
         }
-    
+
         if required_elem.len() != 0 {
             let re = Regex::new(r"/?(?P<basis>[^/]*)/?$").unwrap();
             let cap = re.captures(&ctrl.basis_path).unwrap();
@@ -843,244 +1023,12 @@ impl Molecule {
             }
         };
 
+        let basis_total = read_basis_per_atom(ctrl, geom, &cint_type);
 
-        // for standard atoms
-        for (atm_index, atm_elem) in geom.elem.iter().enumerate() {
-            let tmp_path = format!("{}/{}.json",&ctrl.basis_path, &formated_element_name(atm_elem));
-            let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path,&cint_type).unwrap();
-            let mut num_basis_per_atm = 0_usize;
-            for tmp_bascell in &tmp_basis.electron_shells {
-                let mut num_primitive: i32 = tmp_bascell.exponents.len() as i32;
-                let mut num_contracted: i32 = tmp_bascell.coefficients.len() as i32;
-                let mut angular_mom: i32 = tmp_bascell.angular_momentum[0];
-                let tmp_bas_info = BasInfo::new();
-                tmp_bascell.exponents.iter().for_each(|x| {
-                    env.push(*x);
-                });
-                for (index, coe_vec) in tmp_bascell.coefficients.iter().enumerate() {
-                    coe_vec.iter().for_each(|x| {
-                        env.push(*x);
-                    });
-                };
-                let mut tmp_bas_vec: Vec<i32> = vec![atm_index as i32, 
-                            angular_mom,
-                            num_primitive,
-                            num_contracted,
-                            0,
-                            basis_start,
-                            basis_start+num_primitive,
-                            0];
-                let (ang,tmp_bas_num) = match &cint_type {
-                    CintType::Cartesian => {let ang = tmp_bas_vec[1] as usize; (ang,(ang+1)*(ang+2)/2)},
-                    CintType::Spheric => {let ang = tmp_bas_vec[1] as usize; (ang, ang*2+1)},
-                    // NOTE: Spinor is not yet implemented properly, IGOR 2024-08-18
-                    CintType::Spinor => {panic!("Spinor is not yet implemented")},
-                };
-                let mut tmp_len = 0;
-                let tmp_start = if cint_fdqc.len()==0 {0} 
-                                    else {cint_fdqc[cint_fdqc.len()-1][0]+cint_fdqc[cint_fdqc.len()-1][1]};
-                //Now for bas info. of each basis function and their link to the libcint data structure
-                (0..num_contracted as usize).into_iter().for_each(|index0| {
-                    (0..tmp_bas_num).into_iter().for_each(|index1| {
-                        let bas_type = if num_primitive == 1 {
-                            String::from("Primitive")
-                        } else {
-                            String::from("Contracted")
-                        };
-                        tmp_len += 1;
-                        bas_info.push(BasInfo {
-                            bas_name: get_basis_name(ang, &cint_type, index1),
-                            bas_type,
-                            elem_index0: atm_index,
-                            cint_index0: bas.len(),
-                            cint_index1: index0*tmp_bas_num+index1,
-                        })
-                    });
-                });
-                cint_fdqc.push(vec![tmp_start,tmp_len]);
-                bas.push(tmp_bas_vec);
-                basis_start += num_primitive + num_primitive*num_contracted;
-                num_basis_per_atm += tmp_len;
-            }
+        let (atm, bas, env, bas_info, cint_fdqc, num_elec, num_basis, num_state, ecpbas) =
+            build_cint(&basis_total, geom, &cint_type, ctrl.charge, ctrl.spin, ctrl.use_int_nelec);
 
-            basis_total.push(tmp_basis);
-
-            if atm_index !=0 {
-                basis_total[atm_index].global_index.0 = basis_total[atm_index-1].global_index.0 + basis_total[atm_index-1].global_index.1; 
-                basis_total[atm_index].global_index.1 = num_basis_per_atm;
-            } else {
-                basis_total[atm_index].global_index.0 = 0;
-                basis_total[atm_index].global_index.1 = num_basis_per_atm;
-            }
-        };
-        // for ghost atoms with basis sets
-        if geom.ghost_bs_elem.len() > 0 {
-            let atm_index_start = geom.elem.len();
-            for (local_atm_index, atm_elem) in geom.ghost_bs_elem.iter().enumerate() {
-                let atm_index = local_atm_index+atm_index_start;
-                let tmp_path = format!("{}/{}.json",&ctrl.basis_path, &formated_element_name(atm_elem));
-                let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path,&cint_type).unwrap();
-                let mut num_basis_per_atm = 0_usize;
-                for tmp_bascell in &tmp_basis.electron_shells {
-                    let mut num_primitive: i32 = tmp_bascell.exponents.len() as i32;
-                    let mut num_contracted: i32 = tmp_bascell.coefficients.len() as i32;
-                    let mut angular_mom: i32 = tmp_bascell.angular_momentum[0];
-                    let tmp_bas_info = BasInfo::new();
-                    tmp_bascell.exponents.iter().for_each(|x| {
-                        env.push(*x);
-                    });
-                    for (index, coe_vec) in tmp_bascell.coefficients.iter().enumerate() {
-                        coe_vec.iter().for_each(|x| {
-                            env.push(*x);
-                        });
-                    };
-                    let mut tmp_bas_vec: Vec<i32> = vec![atm_index as i32, 
-                                angular_mom,
-                                num_primitive,
-                                num_contracted,
-                                0,
-                                basis_start,
-                                basis_start+num_primitive,
-                                0];
-                    let (ang,tmp_bas_num) = match &cint_type {
-                        CintType::Cartesian => {let ang = tmp_bas_vec[1] as usize; (ang,(ang+1)*(ang+2)/2)},
-                        CintType::Spheric => {let ang = tmp_bas_vec[1] as usize; (ang, ang*2+1)},
-                        // NOTE: Spinor is not yet implemented properly, IGOR 2024-08-18
-                        CintType::Spinor => {panic!("Spinor is not yet implemented")},
-                    };
-                    let mut tmp_len = 0;
-                    let tmp_start = if cint_fdqc.len()==0 {0} 
-                                        else {cint_fdqc[cint_fdqc.len()-1][0]+cint_fdqc[cint_fdqc.len()-1][1]};
-                    //Now for bas info. of each basis function and their link to the libcint data structure
-                    (0..num_contracted as usize).into_iter().for_each(|index0| {
-                        (0..tmp_bas_num).into_iter().for_each(|index1| {
-                            let bas_type = if num_primitive == 1 {
-                                String::from("Primitive")
-                            } else {
-                                String::from("Contracted")
-                            };
-                            tmp_len += 1;
-                            bas_info.push(BasInfo {
-                                bas_name: get_basis_name(ang, &cint_type, index1),
-                                bas_type,
-                                elem_index0: atm_index,
-                                cint_index0: bas.len(),
-                                cint_index1: index0*tmp_bas_num+index1,
-                            })
-                        });
-                    });
-                    cint_fdqc.push(vec![tmp_start,tmp_len]);
-                    bas.push(tmp_bas_vec);
-                    basis_start += num_primitive + num_primitive*num_contracted;
-                    num_basis_per_atm += tmp_len;
-                }
-
-                basis_total.push(tmp_basis);
-
-                if atm_index !=0 {
-                    basis_total[atm_index].global_index.0 = basis_total[atm_index-1].global_index.0 + basis_total[atm_index-1].global_index.1; 
-                    basis_total[atm_index].global_index.1 = num_basis_per_atm;
-                } else {
-                    basis_total[atm_index].global_index.0 = 0;
-                    basis_total[atm_index].global_index.1 = num_basis_per_atm;
-                }
-            };
-        }
-
-
-        let num_basis = bas_info.len();
-        // IMPORTRANT:: At current stage, we skip the linear-dependence check of the basis sets
-        let num_state = num_basis;
-
-        // now import ecp basis infom.
-        let mut ecpbas: Vec<Vec<i32>> = vec![];
-        let mut ecp_start = env.len() as i32;
-        let ghost_atm_index = geom.get_start_index_of_ghost_atoms(); 
-        basis_total.iter().zip(atm.iter_mut().enumerate()).for_each(|(bas, (atm_index,cur_atm))| {
-            // only act for the ecp of real atoms
-            if atm_index < ghost_atm_index { 
-                if let (Some(ecp), Some(necp))  = (&bas.ecp_potentials, &bas.ecp_electrons) {
-                    // IMPORTANCE. to uncount the electrons in ECP
-                    cur_atm[ATM_NUC] -= *necp as i32;
-                    cur_atm[ATM_NUC_MOD_OF] = NUC_ECP;
-                    num_elec[0] -= *necp as f64;
-
-                    // import ecpbas and ecp for env
-                    let ecp_ang_start = (ecp.len()-1) as i32;
-                    for ecpcell in ecp.iter() {
-
-                        let angl = ecpcell.angular_momentum[0];
-                        let coeffs = &ecpcell.coefficients;
-                        let gaussian_exponents = &ecpcell.gaussian_exponents;
-                        let num_exp = gaussian_exponents.len() as i32;
-                        let num_coeffs = coeffs.len() as i32;
-
-                        let mut r_exponents_group: HashMap<i32, Vec<usize>> = HashMap::new();
-                        //let r_exponents_list: Vec<i32> = vec![];
-
-                        ecpcell.r_exponents.iter().enumerate().for_each(|(index, r_exponents)| {
-                            if r_exponents_group.contains_key(r_exponents) {
-                                r_exponents_group.get_mut(r_exponents).unwrap().push(index);
-                            } else {
-                                r_exponents_group.insert(*r_exponents, vec![index]);
-                            }
-                        });
-                        //let r_exponents = *ecpcell.r_exponents.get(0).unwrap();
-                        //if num_coeffs != num_exp {
-                        //    panic!("bad ecp basis for the elem of {}", &geom.elem[atm_index]);
-                        //}
-
-                        r_exponents_group.iter().for_each(|(r_exponent, index_vec)| {
-                            let mut ecp_exp_start = env.len() as i32;
-                            let num_index_vec = index_vec.len() as i32;
-                            env.extend(gaussian_exponents.iter().enumerate()
-                                .filter(|(index, x)| index_vec.contains(index) )
-                                .map(|(_, x)| x)
-                            );
-                            if num_index_vec > num_exp {
-                                panic!("bad ecp basis for the elem of {}", &geom.elem[atm_index]);
-                            }
-                            coeffs.iter().for_each(|each_coeffs| {
-                                let len_coeffs = each_coeffs.len() as i32;
-                                if len_coeffs != num_exp {
-                                    panic!("bad ecp basis for the elem of {}", &geom.elem[atm_index]);
-                                }
-                                let mut ecp_coeff_start = env.len() as i32;
-                                let mut tmp_ecpbas_vec: Vec<i32> = vec![atm_index as i32, 
-                                            if angl==ecp_ang_start {-1} else {angl},
-                                            num_index_vec,
-                                            *r_exponent,
-                                            0,
-                                            ecp_exp_start,
-                                            ecp_coeff_start,
-                                            0];
-                                ecpbas.push(tmp_ecpbas_vec);
-
-                                env.extend(each_coeffs.iter().enumerate()
-                                    .filter(|(index, x)| index_vec.contains(index))
-                                    .map(|(_, x)| x)
-                                );
-                            });
-                        });
-                    }
-                };
-            }
-        });
-
-        // determine the electron number in total and in each spin channel.
-        num_elec[0]-=ctrl.charge;
-
-        if ctrl.use_int_nelec {
-            sanity_check_nelec(num_elec[0], ctrl.spin);
-        }
-
-        let unpair_elec = (ctrl.spin-1.0_f64);
-        num_elec[1] = (num_elec[0]-unpair_elec)/2.0 + unpair_elec;
-        num_elec[2] = (num_elec[0]-unpair_elec)/2.0;
-
-        let final_ecpbas = if ecpbas.len() == 0 {None} else {Some(ecpbas)};
-
-        (basis_total, atm, bas, env,bas_info,cint_fdqc,num_elec,num_basis, num_state, final_ecpbas)
+        (basis_total, atm, bas, env, bas_info, cint_fdqc, num_elec, num_basis, num_state, ecpbas)
     }
 
     pub fn int_ij_matrixuppers(&self,op_name: String, comp: usize) -> Vec<MatrixUpper<f64>> {
@@ -3503,72 +3451,4 @@ pub fn sanity_check_nelec(num_elec: f64, spin: f64) -> (i32, i32) {
         panic!("Error:: The total number of electrons ({}) and the spin multiplicity ({}) do not match.", num_elec, spin);
     };
     (num_elec_int, spin_int)
-}
-
-#[test]
-fn test_sanity_check_nelec() {
-    let (n, s) = sanity_check_nelec(10.0, 1.0);
-    assert_eq!(n, 10);
-    assert_eq!(s, 1);
-}
-
-#[test]
-#[should_panic]
-fn test_sanity_check_nelec_panic1() {
-    let (n, s) = sanity_check_nelec(10.1, 1.0);
-}
-
-#[test]
-#[should_panic]
-fn test_sanity_check_nelec_panic2() {
-    let (n, s) = sanity_check_nelec(10.0, 0.0);
-}
-
-#[test]
-fn test_get_slices_mut() {
-    //let mut test_matrix = MatrixFull::from_vec([3,3],[0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0].to_vec()).unwrap();
-    let mut test_matrix = MatrixFull::from_vec([3,3], vec![
-         4.0,  12.0, -16.0,
-        12.0,  37.0, -43.0,
-       -16.0, -43.0,  98.0
-    ]).unwrap();
-    omp_set_num_threads_wrapper(1);
-    //aux_v = aux_v.lapack_power(-0.5, 1.0E-6).unwrap();
-    let aux_v = test_matrix.to_matrixfullslicemut().cholesky_decompose_inverse('L').unwrap();
-    println!("{:?}", aux_v);
-    omp_set_num_threads_wrapper(2);
-    let aux_v = test_matrix.to_matrixfullslicemut().cholesky_decompose_inverse('L').unwrap();
-    println!("{:?}", aux_v);
-    omp_set_num_threads_wrapper(3);
-    let aux_v = test_matrix.to_matrixfullslicemut().cholesky_decompose_inverse('L').unwrap();
-    println!("{:?}", aux_v);
-    omp_set_num_threads_wrapper(4);
-    let aux_v = test_matrix.to_matrixfullslicemut().cholesky_decompose_inverse('L').unwrap();
-    println!("{:?}", aux_v);
-    omp_set_num_threads_wrapper(5);
-    let aux_v = test_matrix.to_matrixfullslicemut().cholesky_decompose_inverse('L').unwrap();
-    println!("{:?}", aux_v);
-    omp_set_num_threads_wrapper(6);
-    let aux_v = test_matrix.to_matrixfullslicemut().cholesky_decompose_inverse('L').unwrap();
-    println!("{:?}", aux_v);
-    //let aa = test_matrix.iter_submatrix_mut(0..3, 0..2).map(|a| *a).collect::<Vec<i32>>();
-    //println!("{:?}",aa);
-    //let bb = test_matrix.iter_submatrix_mut(0..3, 0..2).map(|a| *a).collect::<Vec<i32>>();
-    //println!("{:?}",bb);
-}
-
-#[test]
-fn test_regex() {
-    let re = Regex::new(r"/?(?P<basis>[^/]*)/?$").unwrap();
-    let cap = re.captures("./p1/p2/p3").unwrap();
-    println!("{:?}",cap.name("basis").unwrap());
-}
-
-#[test]
-fn test_matrixupper() {
-    let dd = MatrixUpper::from_vec(10, (0..10).collect::<Vec<usize>>()).unwrap();
-    dd.iter_diagonal().for_each(|x| {println!("{}",x)});
-
-    let matrixupper_index = tensors::map_upper_to_full(10).unwrap();
-    dd.iter_submatrix(1..3, 0..2, &matrixupper_index).for_each(|x| {println!("{}",x)});
 }

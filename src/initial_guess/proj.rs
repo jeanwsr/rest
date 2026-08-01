@@ -111,7 +111,7 @@ pub fn decide_guess(chkfile: &String, mol_target: &Molecule) -> GuessAction {
     let (loaded_nbasis, loaded_nmo, loaded_spin_channel, loaded_spin, loaded_charge) =
         chkfile::load_basic(chkfile).unwrap();
 
-    let (cint_raw_data, ecp_raw, basis4elem, cint_type) = chkfile::load_cint_data(chkfile);
+    let (cint_raw_data, ecp_raw, basis4elem, cint_type, _, _) = chkfile::reconstruct_cint_data(chkfile, None);
     let (source_atm, source_bas, source_env) = cint_raw_data.unwrap();
 
     let source_geom = chkfile::load_geom(chkfile);
@@ -194,7 +194,10 @@ pub fn decide_guess(chkfile: &String, mol_target: &Molecule) -> GuessAction {
     mol_source.ctrl.spin = loaded_spin.unwrap_or(mol_target.ctrl.spin);
     mol_source.ctrl.charge = loaded_charge.unwrap_or(mol_target.ctrl.charge);
     mol_source.ctrl.print_level = mol_target.ctrl.print_level;
-    mol_source.update_from_cint(loaded_nbasis, basis4elem, (source_atm, source_bas, source_env), ecp_raw);
+    mol_source.cint_atm = source_atm;
+    mol_source.cint_bas = source_bas;
+    mol_source.cint_env = source_env;
+    mol_source.cint_ecpbas = ecp_raw;
     mol_source.num_state = loaded_nmo;
     mol_source.num_basis = loaded_nbasis;
     mol_source.spin_channel = loaded_spin_channel;
