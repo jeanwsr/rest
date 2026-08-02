@@ -356,7 +356,7 @@ pub fn reconstruct_cint_data(
         }
     };
 
-    let (atm, bas, env, bas_info, cint_fdqc, _nbasis, _nstate, ecpbas) =
+    let (atm, bas, env, bas_info, cint_fdqc, _nbasis, ecpbas) =
         build_cint(&basis4elem, &geom, &cint_type);
 
     let basis4elem = Some(basis4elem);

@@ -51,11 +51,10 @@ fn test_single_h_sto3g_spheric() {
         ..GeomCell::init_geom()
     };
 
-    let (atm, bas, env, _bas_info, _cint_fdqc, nbasis, nstate, ecpbas) =
+    let (atm, bas, env, _bas_info, _cint_fdqc, nbasis, ecpbas) =
         build_cint(&basis_per_atom, &geom, &CintType::Spheric);
 
     assert_eq!(nbasis, 1, "H STO-3G spheric -> 1 basis function");
-    assert_eq!(nstate, 1);
     assert_eq!(atm.len(), 1);
     assert_eq!(atm[0][ATM_NUC] as i32, 1);
     assert_eq!(bas.len(), 1);
@@ -111,7 +110,7 @@ fn test_h2_two_atom() {
         ..GeomCell::init_geom()
     };
 
-    let (atm, bas, env, _bas_info, _cint_fdqc, nbasis, _nstate, ecpbas) =
+    let (atm, bas, env, _bas_info, _cint_fdqc, nbasis, ecpbas) =
         build_cint(&basis_per_atom, &geom, &CintType::Spheric);
 
     assert_eq!(nbasis, 2);

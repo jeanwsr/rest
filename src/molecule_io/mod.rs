@@ -345,45 +345,16 @@ impl Molecule {
         }
         if let Some(b) = basis4elem {
             self.basis4elem = b;
+            self.ecp_electrons = self.basis4elem.iter().fold(0, |acc, i| {
+                acc + i.ecp_electrons.unwrap_or(0)
+            });
         }
         if let Some(fdqc) = fdqc_bas {
             self.fdqc_bas = fdqc;
             self.cint_fdqc = cint_fdqc.unwrap_or(vec![]);
             self.num_basis = self.fdqc_bas.len();
         } else {
-            let mut fdqc_bas: Vec<BasInfo> = vec![];
-            let mut cint_fdqc: Vec<Vec<usize>> = vec![];
-            let mut bas_start = 0_usize;
-            self.cint_bas.iter().enumerate().for_each(|(bas_index, bas_cell)| {
-                let atm_index = bas_cell[0] as usize;
-                let ang = bas_cell[1] as usize;
-                let num_primitive = bas_cell[2] as usize;
-                let num_contracted = bas_cell[3] as usize;
-                let tmp_bas_num = match &self.cint_type {
-                    CintType::Cartesian => (ang+1)*(ang+2)/2,
-                    CintType::Spheric => ang*2+1,
-                    CintType::Spinor => {panic!("Spinor is not yet implemented")},
-                };
-                let mut tmp_len = 0_usize;
-                (0..num_contracted).into_iter().for_each(|index0| {
-                    (0..tmp_bas_num).into_iter().for_each(|index1| {
-                        tmp_len += 1;
-                        fdqc_bas.push(BasInfo {
-                            bas_name: get_basis_name(ang, &self.cint_type, index1),
-                            bas_type: if num_primitive == 1 {
-                                String::from("Primitive")
-                            } else {
-                                String::from("Contracted")
-                            },
-                            elem_index0: atm_index,
-                            cint_index0: bas_index,
-                            cint_index1: index0*tmp_bas_num+index1,
-                        });
-                    });
-                });
-                cint_fdqc.push(vec![bas_start,tmp_len]);
-                bas_start += tmp_len;
-            });
+            let (fdqc_bas, cint_fdqc) = basis::build_fdqc(&self.cint_bas, &self.cint_type);
             self.fdqc_bas = fdqc_bas;
             self.cint_fdqc = cint_fdqc;
             self.num_basis = self.fdqc_bas.len();
@@ -750,7 +721,7 @@ fn read_basis_per_atom(ctrl: &InputKeywords, geom: &GeomCell, cint_type: &CintTy
     for (atm_index, atm_elem) in geom.elem.iter().enumerate() {
         let tmp_path = format!("{}/{}.json", &ctrl.basis_path, &formated_element_name(atm_elem));
         let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path, &cint_type).unwrap();
-        let num_basis_per_atm = basis::count_basis_functions(&tmp_basis.electron_shells, &cint_type);
+        let num_basis_per_atm = basis::shell_nao(&tmp_basis.electron_shells, &cint_type);
         if atm_index != 0 {
             tmp_basis.global_index.0 = basis_total[atm_index - 1].global_index.0 + basis_total[atm_index - 1].global_index.1;
             tmp_basis.global_index.1 = num_basis_per_atm;
@@ -767,7 +738,7 @@ fn read_basis_per_atom(ctrl: &InputKeywords, geom: &GeomCell, cint_type: &CintTy
             let atm_index = local_atm_index + atm_index_start;
             let tmp_path = format!("{}/{}.json", &ctrl.basis_path, &formated_element_name(atm_elem));
             let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path, &cint_type).unwrap();
-            let num_basis_per_atm = basis::count_basis_functions(&tmp_basis.electron_shells, &cint_type);
+            let num_basis_per_atm = basis::shell_nao(&tmp_basis.electron_shells, &cint_type);
             if atm_index != 0 {
                 tmp_basis.global_index.0 = basis_total[atm_index - 1].global_index.0 + basis_total[atm_index - 1].global_index.1;
                 tmp_basis.global_index.1 = num_basis_per_atm;
@@ -786,7 +757,7 @@ pub fn build_cint(
     basis_per_atom: &[Basis4Elem],
     geom: &GeomCell,
     cint_type: &CintType,
-) -> (Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>, Vec<BasInfo>, Vec<Vec<usize>>, usize, usize, Option<Vec<Vec<i32>>>) {
+) -> (Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>, Vec<BasInfo>, Vec<Vec<usize>>, usize, Option<Vec<Vec<i32>>>) {
     // Prepare atm info.
     let mut atm: Vec<Vec<i32>> = vec![];
     let mut env: Vec<f64> = vec![0.0;ENV_PRT_START];
@@ -824,66 +795,34 @@ pub fn build_cint(
     // Now for bas inf.
     let mut bas: Vec<Vec<i32>> = vec![];
     let mut basis_start = geom_start;
-    let mut bas_info: Vec<BasInfo> = vec![];
-    let mut cint_fdqc: Vec<Vec<usize>> = vec![];
 
     for (atm_index, tmp_basis) in basis_per_atom.iter().enumerate() {
-        let mut num_basis_per_atm = 0_usize;
         for tmp_bascell in &tmp_basis.electron_shells {
-            let mut num_primitive: i32 = tmp_bascell.exponents.len() as i32;
-            let mut num_contracted: i32 = tmp_bascell.coefficients.len() as i32;
-            let mut angular_mom: i32 = tmp_bascell.angular_momentum[0];
-            let tmp_bas_info = BasInfo::new();
+            let num_primitive: i32 = tmp_bascell.exponents.len() as i32;
+            let num_contracted: i32 = tmp_bascell.coefficients.len() as i32;
+            let angular_mom: i32 = tmp_bascell.angular_momentum[0];
             tmp_bascell.exponents.iter().for_each(|x| {
                 env.push(*x);
             });
-            for (index, coe_vec) in tmp_bascell.coefficients.iter().enumerate() {
+            for coe_vec in &tmp_bascell.coefficients {
                 coe_vec.iter().for_each(|x| {
                     env.push(*x);
                 });
             };
-            let mut tmp_bas_vec: Vec<i32> = vec![atm_index as i32,
+            bas.push(vec![atm_index as i32,
                         angular_mom,
                         num_primitive,
                         num_contracted,
                         0,
                         basis_start,
                         basis_start+num_primitive,
-                        0];
-            let (ang,tmp_bas_num) = match &cint_type {
-                CintType::Cartesian => {let ang = tmp_bas_vec[1] as usize; (ang,(ang+1)*(ang+2)/2)},
-                CintType::Spheric => {let ang = tmp_bas_vec[1] as usize; (ang, ang*2+1)},
-                CintType::Spinor => {panic!("Spinor is not yet implemented")},
-            };
-            let mut tmp_len = 0;
-            let tmp_start = if cint_fdqc.len()==0 {0}
-                                else {cint_fdqc[cint_fdqc.len()-1][0]+cint_fdqc[cint_fdqc.len()-1][1]};
-            (0..num_contracted as usize).into_iter().for_each(|index0| {
-                (0..tmp_bas_num).into_iter().for_each(|index1| {
-                    let bas_type = if num_primitive == 1 {
-                        String::from("Primitive")
-                    } else {
-                        String::from("Contracted")
-                    };
-                    tmp_len += 1;
-                    bas_info.push(BasInfo {
-                        bas_name: get_basis_name(ang, &cint_type, index1),
-                        bas_type,
-                        elem_index0: atm_index,
-                        cint_index0: bas.len(),
-                        cint_index1: index0*tmp_bas_num+index1,
-                    })
-                });
-            });
-            cint_fdqc.push(vec![tmp_start,tmp_len]);
-            bas.push(tmp_bas_vec);
+                        0]);
             basis_start += num_primitive + num_primitive*num_contracted;
-            num_basis_per_atm += tmp_len;
         }
     }
 
+    let (bas_info, cint_fdqc) = basis::build_fdqc(&bas, cint_type);
     let num_basis = bas_info.len();
-    let num_state = num_basis;
 
     // now import ecp basis infom.
     let mut ecpbas: Vec<Vec<i32>> = vec![];
@@ -952,7 +891,7 @@ pub fn build_cint(
 
     let final_ecpbas = if ecpbas.len() == 0 {None} else {Some(ecpbas)};
 
-    (atm, bas, env,bas_info,cint_fdqc,num_basis, num_state, final_ecpbas)
+    (atm, bas, env, bas_info, cint_fdqc, num_basis, final_ecpbas)
 }
 
 impl Molecule {
@@ -998,8 +937,10 @@ impl Molecule {
 
         let basis_total = read_basis_per_atom(ctrl, geom, &cint_type);
 
-        let (atm, bas, env, bas_info, cint_fdqc, num_basis, num_state, ecpbas) =
+        let (atm, bas, env, bas_info, cint_fdqc, num_basis, ecpbas) =
             build_cint(&basis_total, geom, &cint_type);
+
+        let num_state = num_basis;
 
         let mut num_elec = [0.0;3];
         for a in &atm {
