@@ -1,4 +1,4 @@
-# Chkfile Refactor (2026-08-01)
+# Chkfile Refactor
 
 ## Summary
 
@@ -8,17 +8,24 @@ Reworked the chkfile save/load pipeline and initial guess projection logic to el
 
 ## Collect Basis Refactor
 
-**File**: `molecule_io/mod.rs`
+**Files**: `molecule_io/mod.rs`, `molecule_io/basis.rs`
 
 **`collect_basis`** split into three phases:
 
 | Phase | Function | Role |
 |---|---|---|
 | A | inline | Determine `CintType`, download missing basis files |
-| B | `read_basis_per_atom` (private) | Read per-atom basis JSON files, normalize, set `global_index` → `Vec<Basis4Elem>` |
-| C | `build_cint` (`pub`) | Pure function: `&[Basis4Elem] + &GeomCell + &CintType + charge + spin` → `(cint_atm, cint_bas, cint_env, fdqc_bas, cint_fdqc, num_elec, num_basis, num_state, ecpbas)` |
+| B | `read_basis_per_atom` (`pub fn` in `basis.rs`) | Read per-atom basis JSON files, normalize, set `global_index` → `Vec<Basis4Elem>` |
+| C | `build_cint` (`pub fn` in `mod.rs`) | Pure function: `&[Basis4Elem] + &GeomCell + &CintType` → `(cint_atm, cint_bas, cint_env, fdqc_bas, cint_fdqc, num_basis, ecpbas)` |
 
-No behavior change — output bit-identical to the interleaved original.
+Shared helpers in `molecule_io/basis.rs`:
+
+| Function | Role |
+|---|---|
+| `shell_nao` | Count AO basis functions from shell descriptors |
+| `build_fdqc` | Build `fdqc_bas` + `cint_fdqc` from `cint_bas` + `cint_type` (used by `build_cint` and `set_cint_data` fallback) |
+
+`num_elec` is computed by `collect_basis` after `build_cint` returns (from the final `cint_atm` nuclear charges, accounting for ECP, charge, and spin). `num_state` is set to `num_basis` in `collect_basis`.
 
 ---
 
@@ -50,7 +57,7 @@ No behavior change — output bit-identical to the interleaved original.
   | **New** | `molecule/basis4elem` + `molecule/cinttype` exist | Reads `basis4elem` + `geom` (or `geom_override`) + `cint_type` → calls `build_cint` to reconstruct `cint_env`, `fdqc_bas`, `cint_fdqc`. No stale coords. |
   | **Old** | No `molecule/basis4elem` | Falls back to `load_cint_data` (reads legacy `"mol"` JSON). Backward compatible. |
 
-- **`set_cint_data`** (on `Molecule`, `molecule_io/mod.rs`) — replaces `update_from_cint`. Pure field assignment (`cint_atm/bas/env/ecpbas`, optionally `fdqc_bas`/`cint_fdqc`/`basis4elem`/`cint_type`, `natm_real`/`natm_all`, `num_state=num_basis`). No recomputation.
+- **`set_cint_data`** (on `Molecule`, `molecule_io/mod.rs`) — replaces `update_from_cint`. Pure field assignment (`cint_atm/bas/env/ecpbas`, optionally `fdqc_bas`/`cint_fdqc`/`basis4elem`/`cint_type`, `natm_real`/`natm_all`, `num_state=num_basis`). When `basis4elem` is set, also recomputes `ecp_electrons`. If `fdqc_bas` is not passed, recomputes it via `build_fdqc` fallback. No `num_elec`/`start_mo` computation.
 
 ### `load_cint_data`
 
@@ -105,7 +112,7 @@ pub enum GuessAction {
 
 Previously: loaded chkfile's `cint_env` (which contains stale coordinates) → SCF used wrong geometry.
 
-Now: calls `reconstruct_cint_data(&chkfile, Some(&scf_data.mol.geom))` → basis exponents/coefficients from chkfile, **coordinates from current input**. Then `set_cint_data` with `fdqc_bas`/`cint_fdqc` from `reconstruct_cint_data` (no recomputation).
+Now: calls `reconstruct_cint_data(&chkfile, Some(&scf_data.mol.geom))` → basis exponents/coefficients from chkfile, **coordinates from current input**. Then `set_cint_data` with `fdqc_bas`/`cint_fdqc` from `reconstruct_cint_data` (no recomputation), followed by `start_mo` recomputation from the updated `ecp_electrons`.
 
 ### Behavior change for this feature
 
