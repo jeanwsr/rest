@@ -1,3 +1,4 @@
+use log::warn;
 use rstsr::prelude::*;
 use tensors::matrix::MatrixFull;
 use tensors::BasicMatrix;
@@ -22,7 +23,7 @@ fn cho_solve(s22: &MatrixFull<f64>, b: &MatrixFull<f64>, device: &DeviceBLAS) ->
             MatrixFull::from_vec(shape, x.into_shape(-1).into_vec()).unwrap()
         },
         Err(_) => {
-            println!("Cholesky decomposition failed, falling back to general solve.");
+            warn!("Cholesky decomposition failed, falling back to general solve.");
             let x = rt::linalg::solve_general((&s22_tsr, &b_tsr));
             let shape: [usize; 2] = x.shape().to_vec().try_into().unwrap();
             MatrixFull::from_vec(shape, x.into_shape(-1).into_vec()).unwrap()

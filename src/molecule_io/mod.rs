@@ -36,24 +36,7 @@ use crate::basis_io::basis_list::{basis_fuzzy_matcher, check_basis_name};
 use crate::ri_jk;
 
 
-pub fn get_basis_name(ang: usize, ctype: &CintType, index: usize) -> String {
-    let mut ang_name = if ang==0 {String::from("S")
-    } else if ang==1 {String::from("P")
-    } else if ang==2 {String::from("D")
-    } else if ang==3 {String::from("F")
-    } else if ang==4 {String::from("G")
-    } else if ang==5 {String::from("H")
-    } else if ang==6 {String::from("I")
-    } else {
-        panic!("Error:: the GTO basis function with angular momentum larger than 6 is not yet supported");
-    };
-    match ctype {
-        CintType::Spheric => {ang_name = format!("{}-{}",ang_name, index)},
-        CintType::Cartesian => {ang_name = format!("{}-{}",ang_name, index)},
-        CintType::Spinor => {panic!("Spinor is not yet implemented")}, 
-    };
-    ang_name
-}
+pub use basis::get_basis_name;
 
 #[derive(Clone)]
 #[pyclass]

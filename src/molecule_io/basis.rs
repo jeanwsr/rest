@@ -3,6 +3,25 @@ use crate::basis_io::{BasCell, BasInfo, Basis4Elem};
 use crate::ctrl_io::InputKeywords;
 use crate::geom_io::{GeomCell, formated_element_name};
 
+pub fn get_basis_name(ang: usize, ctype: &CintType, index: usize) -> String {
+    let mut ang_name = if ang==0 {String::from("S")
+    } else if ang==1 {String::from("P")
+    } else if ang==2 {String::from("D")
+    } else if ang==3 {String::from("F")
+    } else if ang==4 {String::from("G")
+    } else if ang==5 {String::from("H")
+    } else if ang==6 {String::from("I")
+    } else {
+        panic!("Error:: the GTO basis function with angular momentum larger than 6 is not yet supported");
+    };
+    match ctype {
+        CintType::Spheric => {ang_name = format!("{}-{}",ang_name, index)},
+        CintType::Cartesian => {ang_name = format!("{}-{}",ang_name, index)},
+        CintType::Spinor => {panic!("Spinor is not yet implemented")},
+    };
+    ang_name
+}
+
 pub fn shell_nao(shells: &[BasCell], cint_type: &CintType) -> usize {
     shells.iter().map(|shell| {
         let ang = shell.angular_momentum[0] as usize;
@@ -38,7 +57,7 @@ pub fn build_fdqc(
             (0..tmp_bas_num).for_each(|index1| {
                 tmp_len += 1;
                 fdqc_bas.push(BasInfo {
-                    bas_name: super::get_basis_name(ang, cint_type, index1),
+                    bas_name: get_basis_name(ang, cint_type, index1),
                     bas_type: if num_primitive == 1 {
                         String::from("Primitive")
                     } else {
