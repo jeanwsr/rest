@@ -1,5 +1,7 @@
 use rest_libcint::CintType;
-use crate::basis_io::{BasCell, BasInfo};
+use crate::basis_io::{BasCell, BasInfo, Basis4Elem};
+use crate::ctrl_io::InputKeywords;
+use crate::geom_io::{GeomCell, formated_element_name};
 
 pub fn shell_nao(shells: &[BasCell], cint_type: &CintType) -> usize {
     shells.iter().map(|shell| {
@@ -52,4 +54,42 @@ pub fn build_fdqc(
         bas_start += tmp_len;
     });
     (fdqc_bas, cint_fdqc)
+}
+
+pub fn read_basis_per_atom(ctrl: &InputKeywords, geom: &GeomCell, cint_type: &CintType) -> Vec<Basis4Elem> {
+    let mut basis_total: Vec<Basis4Elem> = vec![];
+
+    for (atm_index, atm_elem) in geom.elem.iter().enumerate() {
+        let tmp_path = format!("{}/{}.json", &ctrl.basis_path, &formated_element_name(atm_elem));
+        let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path, &cint_type).unwrap();
+        let num_basis_per_atm = shell_nao(&tmp_basis.electron_shells, &cint_type);
+        if atm_index != 0 {
+            tmp_basis.global_index.0 = basis_total[atm_index - 1].global_index.0 + basis_total[atm_index - 1].global_index.1;
+            tmp_basis.global_index.1 = num_basis_per_atm;
+        } else {
+            tmp_basis.global_index.0 = 0;
+            tmp_basis.global_index.1 = num_basis_per_atm;
+        }
+        basis_total.push(tmp_basis);
+    }
+
+    if geom.ghost_bs_elem.len() > 0 {
+        let atm_index_start = geom.elem.len();
+        for (local_atm_index, atm_elem) in geom.ghost_bs_elem.iter().enumerate() {
+            let atm_index = local_atm_index + atm_index_start;
+            let tmp_path = format!("{}/{}.json", &ctrl.basis_path, &formated_element_name(atm_elem));
+            let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path, &cint_type).unwrap();
+            let num_basis_per_atm = shell_nao(&tmp_basis.electron_shells, &cint_type);
+            if atm_index != 0 {
+                tmp_basis.global_index.0 = basis_total[atm_index - 1].global_index.0 + basis_total[atm_index - 1].global_index.1;
+                tmp_basis.global_index.1 = num_basis_per_atm;
+            } else {
+                tmp_basis.global_index.0 = 0;
+                tmp_basis.global_index.1 = num_basis_per_atm;
+            }
+            basis_total.push(tmp_basis);
+        }
+    }
+
+    basis_total
 }

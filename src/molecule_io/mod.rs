@@ -1,5 +1,4 @@
 #![warn(unused_imports)]
-extern crate rest_tensors as tensors;
 
 mod pyrest_molecule_io;
 pub mod with_clause;
@@ -25,7 +24,7 @@ use regex::Regex;
 use crate::basis_io::etb::{get_etb_elem, etb_gen_for_atom_list, InfoV2};
 use crate::constants::{ATM_NUC, ATM_NUC_MOD_OF, AUXBAS_THRESHOLD, ENV_PRT_START, NUC_ECP, NUC_STAD_CHARGE};
 use crate::dft::{DFTType, DFA4REST, parse_xc};
-use crate::geom_io::{GeomCell, get_mass_charge, formated_element_name};
+use crate::geom_io::{GeomCell, get_mass_charge};
 use crate::basis_io::{BasInfo, Basis4Elem};
 use crate::ctrl_io::{overall_parse_and_report_on_ctrl_geom, InputKeywords, parse_ctl};
 #[cfg(feature = "mpi")]
@@ -715,44 +714,6 @@ impl Molecule {
     }
 }
 
-fn read_basis_per_atom(ctrl: &InputKeywords, geom: &GeomCell, cint_type: &CintType) -> Vec<Basis4Elem> {
-    let mut basis_total: Vec<Basis4Elem> = vec![];
-
-    for (atm_index, atm_elem) in geom.elem.iter().enumerate() {
-        let tmp_path = format!("{}/{}.json", &ctrl.basis_path, &formated_element_name(atm_elem));
-        let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path, &cint_type).unwrap();
-        let num_basis_per_atm = basis::shell_nao(&tmp_basis.electron_shells, &cint_type);
-        if atm_index != 0 {
-            tmp_basis.global_index.0 = basis_total[atm_index - 1].global_index.0 + basis_total[atm_index - 1].global_index.1;
-            tmp_basis.global_index.1 = num_basis_per_atm;
-        } else {
-            tmp_basis.global_index.0 = 0;
-            tmp_basis.global_index.1 = num_basis_per_atm;
-        }
-        basis_total.push(tmp_basis);
-    }
-
-    if geom.ghost_bs_elem.len() > 0 {
-        let atm_index_start = geom.elem.len();
-        for (local_atm_index, atm_elem) in geom.ghost_bs_elem.iter().enumerate() {
-            let atm_index = local_atm_index + atm_index_start;
-            let tmp_path = format!("{}/{}.json", &ctrl.basis_path, &formated_element_name(atm_elem));
-            let mut tmp_basis = Basis4Elem::parse_json_from_file(tmp_path, &cint_type).unwrap();
-            let num_basis_per_atm = basis::shell_nao(&tmp_basis.electron_shells, &cint_type);
-            if atm_index != 0 {
-                tmp_basis.global_index.0 = basis_total[atm_index - 1].global_index.0 + basis_total[atm_index - 1].global_index.1;
-                tmp_basis.global_index.1 = num_basis_per_atm;
-            } else {
-                tmp_basis.global_index.0 = 0;
-                tmp_basis.global_index.1 = num_basis_per_atm;
-            }
-            basis_total.push(tmp_basis);
-        }
-    }
-
-    basis_total
-}
-
 pub fn build_cint(
     basis_per_atom: &[Basis4Elem],
     geom: &GeomCell,
@@ -935,7 +896,7 @@ impl Molecule {
             }
         };
 
-        let basis_total = read_basis_per_atom(ctrl, geom, &cint_type);
+        let basis_total = basis::read_basis_per_atom(ctrl, geom, &cint_type);
 
         let (atm, bas, env, bas_info, cint_fdqc, num_basis, ecpbas) =
             build_cint(&basis_total, geom, &cint_type);

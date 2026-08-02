@@ -298,6 +298,7 @@ pub fn update_basis_from_hdf5chk(scf_data: &mut SCF) {
                 scf_data.mol.cint_type = ct;
             }
             scf_data.mol.set_cint_data(atm, bas, env, ecp_raw, None, basis4elem, fdqc_bas, cint_fdqc);
+            scf_data.mol.start_mo = scf_data.mol.generate_start_mo(scf_data.mol.ecp_electrons);
         } else {
             panic!("Failed to load the basis set information from chkfile");
         }
