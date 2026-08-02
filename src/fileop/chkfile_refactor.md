@@ -150,3 +150,32 @@ No derived `cint_env` is stored. `build_cint` is the canonical reconstruction pa
 | Same basis, different geometry | Direct MO reuse (poor guess) | **Project** via cross-overlap S21 |
 | Same total nbasis, different basis set (e.g., reordered atoms, different exponents) | Direct MO reuse (wrong) | **Project** via S21 |
 | Identical basis + geometry | Direct MO reuse | Direct MO reuse (unchanged) |
+
+---
+
+## TODO: Projection for `inherit` initial guess on geometry change
+
+When `initial_guess = "inherit"` and geometry has changed (geom opt), project old eigenvectors to the new geometry via `proj_mo` instead of using them directly. Relies on the chkfile saved after each SCF convergence (chkfile contains `molecule/geom` with the geometry the eigenvectors were computed at).
+
+### Planned steps
+
+1. In `initial_guess/mod.rs` `inherit` branch: check if chkfile exists and `load_geom` returns a `GeomCell`.
+2. Compare `prev_geom.positions` with current `mol.geom.positions` (tol 1e-6).
+3. If geometry changed: `build_cint(&mol.basis4elem, &prev_geom, &mol.cint_type)` → build `mol_source`, call `proj::proj_mo`, replace eigenvectors.
+4. Proceed with `generate_occupation()` + `generate_density_matrix()` as before.
+
+### Needed imports
+
+`std::path::Path`, `crate::molecule_io::build_cint`, `crate::molecule_io::Molecule`, `crate::fileop::chkfile::load_geom`.
+
+### Behavior
+
+| Scenario | Result |
+|---|---|
+| Geom opt step, geometry changed | Projected to new geometry |
+| Geom opt step, same geometry | Skip projection (geom matches) |
+| Restart / same-geometry inherit | Skip projection |
+| First SCF (no chkfile yet) | Skip (no chkfile) |
+| Old chkfile (no `molecule/geom`) | Skip (`load_geom` returns None) |
+
+No new struct fields, no API changes.
