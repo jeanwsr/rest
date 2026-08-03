@@ -45,6 +45,7 @@ Shared helpers in `molecule_io/basis.rs`:
 | `molecule/basis4elem` | `Vec<Basis4Elem>` (JSON) | Basis reconstruction |
 | `molecule/geom` | GeomCell (JSON: name, elem, unit, position) | Coord reconstruction + element checks |
 | `molecule/cinttype` | "spheric" / "cartesian" | Basis reconstruction |
+| `molecule/num_elec` | Total electron count (`f64`, JSON) | Electron-count Refuse check |
 
 ### What was added
 
@@ -73,8 +74,8 @@ Preserved as private fallback (called only by `reconstruct_cint_data` for old-fo
 
 Three-outcome decision pipeline:
 
-- Load data: `load_basic` + `reconstruct_cint_data` + `load_geom`
-- **Refuse checks** (O(1)): atom count, element order (GeomCell.elem or ATM_NUC fallback), CintType, ECP electron count. Any mismatch → `Refuse(String)`.
+- Load data: `load_basic` (per-field `Option`s) + `reconstruct_cint_data` + `load_geom`
+- **Refuse checks** (O(1)): atom count, element order (GeomCell.elem or ATM_NUC fallback), CintType, ECP electron count, electron count (`molecule/num_elec`, fallback `scf/mo_occ` sum). Any mismatch → `Refuse(String)`.
 - **Geom diff** (O(natoms)): compare positions via GeomCell or cint_env/ATM_ENV fallback.
 - **Early exit**: `basis_diff || geom_diff` → `Project(mol_source)`.
 - **S21 final gate** (O(nbasis²)): if counts and geometry match, compute `S22 = int_ij_matrixupper("ovlp")`, `S21 = int_cross(&mol_source, "ovlp")`. If ∥S21 − S22∥_F / ∥S22∥_F > 1e-5 → `Project`. Otherwise → `DirectReuse`.
@@ -82,7 +83,7 @@ Three-outcome decision pipeline:
 
 | Tier | Check | Cost | Catches |
 |---|---|---|---|
-| Refuse | atom count / element / CintType / ECP | O(1) | Genuinely different molecules |
+| Refuse | atom count / element / CintType / ECP / electron count | O(1) | Genuinely different molecules |
 | Early exit | basis_diff ‖ geom_diff | O(1) / O(natoms) | Different basis / geometry → Project |
 | S21 | ‖S21 − S22‖ / ‖S22‖ | O(nbasis²) | Same count + same geometry but different exponents |
 
@@ -95,6 +96,22 @@ pub enum GuessAction {
     Refuse(String),
 }
 ```
+
+### Basis projection: `basis_projection` keyword + `proj_mo`
+
+New input keyword `basis_projection` (default `"occupied"`):
+
+| Value | Behavior | `mo_range` |
+|---|---|---|
+| `"occupied"` | Project only occupied MOs from source | `[0..nocc_alpha, 0..nocc_beta]` (nocc from `mol.num_elec`, `round()`) |
+| `"full"` | Project all source MOs | `[0..source.num_state, 0..source.num_state]` |
+
+`proj_mo(mol_target, mol_source, mo_source, mo_range: [Range<usize>; 2])`:
+- Projects only columns in `mo_range[spin]`, then zero-pads output to `mol_target.num_state`.
+- Clamps `end` to `mol_target.num_state` with `warn!` when the range exceeds target (e.g., large→small basis projection).
+- Panics only for `start > end` or `end > src_nmo` (nonexistent source columns).
+
+Safety: `decide_guess` Refuse rejects different electron counts before projection, so source and target MO spaces always span the same occupied orbitals.
 
 ---
 
@@ -146,6 +163,7 @@ No derived `cint_env` is stored. `build_cint` is the canonical reconstruction pa
 | Situation | Old | New |
 |---|---|---|
 | Different element/atom count in chkfile | Projected (silently wrong) | **Refuse** — panics with message |
+| Different electron count | Projected (silently wrong MO space) | **Refuse** — panics with message |
 | Different CintType / ECP | Assert failure | **Refuse** — panics with message |
 | Same basis, different geometry | Direct MO reuse (poor guess) | **Project** via cross-overlap S21 |
 | Same total nbasis, different basis set (e.g., reordered atoms, different exponents) | Direct MO reuse (wrong) | **Project** via S21 |

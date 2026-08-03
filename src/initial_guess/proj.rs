@@ -1,4 +1,5 @@
 use log::warn;
+use std::ops::Range;
 use rstsr::prelude::*;
 use tensors::matrix::MatrixFull;
 use tensors::BasicMatrix;
@@ -60,26 +61,47 @@ fn normalize_mo(mo: &mut MatrixFull<f64>, s: &MatrixFull<f64>, device: &DeviceBL
 /// - `mol_target`: the target molecule (basis set 2)
 /// - `mol_source`: the source molecule (basis set 1)
 /// - `mo_source`: MO coefficients in the source basis
+/// - `mo_range`: column ranges to project per spin channel (e.g. [0..nocc_alpha, 0..nocc_beta]).
+///   Columns outside each range are not projected.
 ///
 /// # Returns
-/// - MO coefficients projected to the target basis (C2), normalized so that C2^T S22 C2 = I
-pub fn proj_mo(mol_target: &Molecule, mol_source: &Molecule, mo_source: [MatrixFull<f64>;2]) -> [MatrixFull<f64>;2] {
-    // S22 = target self-overlap
+/// - MO coefficients projected to the target basis, zero-padded to `mol_target.num_state` columns,
+///   normalized so that C2^T S22 C2 = I
+pub fn proj_mo(mol_target: &Molecule, mol_source: &Molecule, mo_source: [MatrixFull<f64>;2], mo_range: [Range<usize>; 2]) -> [MatrixFull<f64>;2] {
     let s22_full = mol_target.int_ij_matrixupper("ovlp".to_string()).to_matrixfull().unwrap();
 
-    // S21 = <AO_target|AO_source>
     let s21 = mol_target.int_cross(mol_source, "ovlp".to_string());
 
     let device = DeviceBLAS::default();
     let s21_tsr = s21.to_rstsr(&device);
 
+    let tgt_nmo = mol_target.num_state;
     let mut mo_target: [MatrixFull<f64>; 2] = [MatrixFull::empty(), MatrixFull::empty()];
     for spin in 0..2 {
         if mo_source[spin].size()[0] == 0 {
             continue;
         }
+        let src_nmo = mo_source[spin].size()[1];
+        let start = mo_range[spin].start;
+        let mut end = mo_range[spin].end;
+        assert!(start <= end, "proj_mo: mo_range[{spin}] start={start} > end={end}");
+        if end > src_nmo {
+            panic!("proj_mo: mo_range[{spin}] end={end} exceeds source MOs={src_nmo}");
+        }
+        if end > mol_target.num_state {
+            warn!(
+                "proj_mo: mo_range[{spin}] end={end} exceeds target num_state={}, clamping to target",
+                mol_target.num_state
+            );
+            end = mol_target.num_state;
+        }
+        if start == end {
+            continue;
+        }
+        let n_mo = end - start;
         let mo_source_tsr = mo_source[spin].to_rstsr_view(&device);
-        let temp_tsr = &s21_tsr % &mo_source_tsr;
+        let mo_slice = mo_source_tsr.slice((.., start..end));
+        let temp_tsr = &s21_tsr % &mo_slice;
         let temp = MatrixFull::from_vec(
             temp_tsr.shape().to_vec().try_into().unwrap(),
             temp_tsr.into_shape(-1).into_vec(),
@@ -87,8 +109,17 @@ pub fn proj_mo(mol_target: &Molecule, mol_source: &Molecule, mo_source: [MatrixF
 
         mo_target[spin] = cho_solve(&s22_full, &temp, &device);
         normalize_mo(&mut mo_target[spin], &s22_full, &device);
+
+        let proj_nmo = end - start;
+        if proj_nmo < tgt_nmo && mo_target[spin].size()[0] > 0 {
+            let nrows = mol_target.num_basis;
+            let src_data: Vec<f64> = mo_target[spin].iter().copied().collect();
+            let mut dst_data = vec![0.0; nrows * tgt_nmo];
+            let copy_len = (proj_nmo * nrows).min(src_data.len());
+            dst_data[..copy_len].copy_from_slice(&src_data[..copy_len]);
+            mo_target[spin] = MatrixFull::from_vec([nrows, tgt_nmo], dst_data).unwrap();
+        }
     }
-    // mo_target[0].formated_output(5, "full");
 
     mo_target
 }
@@ -108,9 +139,29 @@ fn ecp_electrons_from_basis(basis4elem: &Option<Vec<Basis4Elem>>) -> usize {
     }
 }
 
+fn load_num_elec(chkfile: &str, spin: f64) -> Option<[f64; 3]> {
+    use hdf5::types::VarLenUnicode;
+    let file = hdf5::File::open(chkfile).unwrap();
+    let total: f64 = if let Ok(ds) = file.dataset("molecule/num_elec") {
+        if let Ok(s) = ds.read_scalar::<VarLenUnicode>() {
+            serde_json::from_str(s.as_str()).ok()?
+        } else {
+            return None;
+        }
+    } else {
+        let scf = file.group("scf").unwrap();
+        let occ = scf.dataset("mo_occ").or_else(|_| scf.dataset("mo_occupation")).ok()?;
+        occ.read_raw::<f64>().unwrap().iter().sum()
+    };
+    let unpair = (spin - 1.0).min(total);
+    Some([total, (total - unpair) / 2.0 + unpair, (total - unpair) / 2.0])
+}
+
 pub fn decide_guess(chkfile: &String, mol_target: &Molecule) -> GuessAction {
-    let (loaded_nbasis, loaded_nmo, loaded_spin_channel, loaded_spin, loaded_charge) =
-        chkfile::load_basic(chkfile).unwrap();
+    let (nbasis, nmo, spin_channel, loaded_spin, loaded_charge) = chkfile::load_basic(chkfile);
+    let loaded_nbasis = nbasis.expect("chkfile missing scf/num_basis");
+    let loaded_nmo = nmo.expect("chkfile missing scf/num_states");
+    let loaded_spin_channel = spin_channel;
 
     let (cint_raw_data, ecp_raw, basis4elem, cint_type, _, _) = chkfile::reconstruct_cint_data(chkfile, None);
     let (source_atm, source_bas, source_env) = cint_raw_data.unwrap();
@@ -166,6 +217,16 @@ pub fn decide_guess(chkfile: &String, mol_target: &Molecule) -> GuessAction {
         ));
     }
 
+    let src_spin = loaded_spin.unwrap_or(1.0);
+    let src_ne = load_num_elec(chkfile, src_spin)
+        .expect("chkfile missing electron count (molecule/num_elec or scf/mo_occ)");
+    if (src_ne[0] - mol_target.num_elec[0]).abs() > 0.5 {
+            return GuessAction::Refuse(format!(
+                "electron count mismatch: chkfile has {}, target has {}",
+                src_ne[0], mol_target.num_elec[0]
+            ));
+        }
+
     let mut geom_diff = true;
     if let Some(ref sgeom) = source_geom {
         if sgeom.unit == mol_target.geom.unit
@@ -201,7 +262,8 @@ pub fn decide_guess(chkfile: &String, mol_target: &Molecule) -> GuessAction {
     mol_source.cint_ecpbas = ecp_raw;
     mol_source.num_state = loaded_nmo;
     mol_source.num_basis = loaded_nbasis;
-    mol_source.spin_channel = loaded_spin_channel;
+    mol_source.spin_channel = loaded_spin_channel.unwrap_or(mol_target.spin_channel);
+    mol_source.num_elec = src_ne;
 
     let basis_diff = loaded_nbasis != mol_target.num_basis || loaded_nmo != mol_target.num_state;
 

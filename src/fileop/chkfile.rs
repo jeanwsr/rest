@@ -116,6 +116,9 @@ pub fn save_chkfile(scf_data: &SCF) {
     })).unwrap();
     write_string_scalar(&file, "molecule/geom", &geom_json);
 
+    let num_elec_json = serde_json::to_string(&scf_data.mol.num_elec[0]).unwrap();
+    write_string_scalar(&file, "molecule/num_elec", &num_elec_json);
+
     file.close();
 }
 
@@ -365,7 +368,7 @@ pub fn reconstruct_cint_data(
     (Some((atm, bas, env)), ecpbas, basis4elem, cint_type, Some(bas_info), Some(cint_fdqc))
 }
 
-pub fn load_basic(chkfile: &String) -> Option<(usize, usize, usize, Option<f64>, Option<f64>)> {
+pub fn load_basic(chkfile: &String) -> (Option<usize>, Option<usize>, Option<usize>, Option<f64>, Option<f64>) {
     let file = hdf5::File::open(chkfile).unwrap();
     let scf = file.group("scf").unwrap();
     let mut num_basis = None;
@@ -415,9 +418,5 @@ pub fn load_basic(chkfile: &String) -> Option<(usize, usize, usize, Option<f64>,
         charge = Some(c.read_raw::<f64>().unwrap()[0]);
     }
 
-    if num_basis.is_some() && num_states.is_some() && spin_channel.is_some() {
-        Some((num_basis.unwrap(), num_states.unwrap(), spin_channel.unwrap(), spin, charge))
-    } else {
-        None
-    }
+    (num_basis, num_states, spin_channel, spin, charge)
 }

@@ -288,7 +288,6 @@ pub fn update_basis_from_hdf5chk(scf_data: &mut SCF) {
     
 
         info!("taking basis set information from chkfile");
-        let (loaded_nbasis, loaded_nmo, loaded_spin_channel, _, _) = chkfile::load_basic(&chkfile).unwrap();
         let (cint_raw_data, ecp_raw, basis4elem, cint_type, fdqc_bas, cint_fdqc) = chkfile::reconstruct_cint_data(&chkfile, Some(&scf_data.mol.geom));
         if let Some((atm, bas, env)) = cint_raw_data {
             if let Some(ct) = cint_type {
@@ -310,8 +309,7 @@ pub fn initial_guess_from_hdf5chk(mol: &mut Molecule, scftype: &SCFType, chkfile
         proj::GuessAction::DirectReuse => {
             let spin_channel = if let &SCFType::ROHF = scftype { 1 } else { mol.spin_channel };
             let (loaded_eigenvectors, loaded_eigenvalues, loaded_occupation) = import_guess_from_hdf5chkfile(chkfile,
-                    spin_channel,
-                    mol.ctrl.print_level
+                    spin_channel
                 );
             initial_guess_from_raw(
                 loaded_eigenvectors,
@@ -326,8 +324,7 @@ pub fn initial_guess_from_hdf5chk(mol: &mut Molecule, scftype: &SCFType, chkfile
         proj::GuessAction::Project(source) => {
             let spin_channel = source.spin_channel;
             let (loaded_eigenvectors, loaded_eigenvalues, loaded_occupation) = import_guess_from_hdf5chkfile(chkfile,
-                    spin_channel,
-                    mol.ctrl.print_level
+                    spin_channel
                 );
             info!("The basis set in chkfile does not match the input basis set (loaded: {} basis, {} MOs; target: {} basis, {} MOs),", source.num_basis, source.num_state, mol.num_basis, mol.num_state);
             info!("invoke basis projection");
@@ -340,21 +337,24 @@ pub fn initial_guess_from_hdf5chk(mol: &mut Molecule, scftype: &SCFType, chkfile
                 source.num_basis,
                 mol.ctrl.print_level
             );
-            let mo = proj::proj_mo(mol, &source, mo2);
-            // info!("projection completed.");
+            let ne = mol.num_elec;
+            let nocc = [ne[1].round() as usize, ne[2].round() as usize];
+            let mo_range = match mol.ctrl.basis_projection.as_str() {
+                "full" => [0..source.num_state, 0..source.num_state],
+                _ => [0..nocc[0], 0..nocc[1]],
+            };
+            let mo = proj::proj_mo(mol, &source, mo2, mo_range);
             (mo, [vec![], vec![]], occ2)
         }
     }
 }
 
-pub fn import_guess_from_hdf5chkfile(chkname: &str, spin_channel: usize, print_level: usize) -> (Vec<f64>,Vec<f64>, Option<Vec<f64>>) {
+pub fn import_guess_from_hdf5chkfile(chkname: &str, spin_channel: usize) -> (Vec<f64>,Vec<f64>, Option<Vec<f64>>) {
     let file = hdf5::File::open(chkname).unwrap();
     let scf = file.group("scf").unwrap();
     let member = scf.member_names().unwrap();
     let e_tot = scf.dataset("e_tot").unwrap().read_raw::<f64>().unwrap()[0];
-    if print_level>1 {
-        debug!("HDF5 Group: {:?} \nMembers: {:?}", scf, member);
-    }
+    debug!("HDF5 Group: {:?} \nMembers: {:?}", scf, member);
     info!("E_tot from chkfile: {:18.10}", e_tot);
     // importing MO coefficients
     let buf01 = scf.dataset("mo_coeff").unwrap().read_raw::<f64>().unwrap();
