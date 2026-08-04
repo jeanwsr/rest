@@ -101,10 +101,17 @@ pub enum GuessAction {
 
 New input keyword `basis_projection` (default `"occupied"`):
 
-| Value | Behavior | `mo_range` |
+| Value | Behavior |
+|---|---|
+| `"occupied"` | Project only occupied MOs from source (nocc from `mol.num_elec`, `round()`) |
+| `"full"` | Project all source MOs |
+
+`mo_range` depends on the **target** scftype:
+
+| Target | `"occupied"` mo_range | `"full"` mo_range |
 |---|---|---|
-| `"occupied"` | Project only occupied MOs from source | `[0..nocc_alpha, 0..nocc_beta]` (nocc from `mol.num_elec`, `round()`) |
-| `"full"` | Project all source MOs | `[0..source.num_state, 0..source.num_state]` |
+| RKS / UKS | `[0..nocc_alpha, 0..nocc_beta]` | `[0..source.num_state, 0..source.num_state]` |
+| ROKS / ROHF | `[0..nocc_alpha, 0..0]` (beta empty) | `[0..source.num_state, 0..0]` |
 
 `proj_mo(mol_target, mol_source, mo_source, mo_range: [Range<usize>; 2])`:
 - Projects only columns in `mo_range[spin]`, then zero-pads output to `mol_target.num_state`.
@@ -112,6 +119,30 @@ New input keyword `basis_projection` (default `"occupied"`):
 - Panics only for `start > end` or `end > src_nmo` (nonexistent source columns).
 
 Safety: `decide_guess` Refuse rejects different electron counts before projection, so source and target MO spaces always span the same occupied orbitals.
+
+### MO import mode: `initial_guess_from_raw`
+
+**File**: `initial_guess/mod.rs`
+
+`initial_guess_from_raw` now takes `target_scftype: &SCFType` (replacing the old `spin_channel: usize` heuristic). The **source** SCFType is derived from the chkfile data channel counts:
+
+| Eigenvector channels | Occupation channels | Source SCFType |
+|---|---|---|
+| 1 | 1 | RHF (RKS) |
+| 1 | 2 | ROHF (ROKS) |
+| 2 | — | UHF (UKS) |
+
+Mode = `import_mode(source, target)`:
+
+| src \ tgt | RKS (RHF) | ROKS (ROHF) | UKS (UHF) |
+|---|---|---|---|
+| RKS (RHF) | `R2R` | panic (r2ro) | `R2U` |
+| ROKS (ROHF) | panic (ro2r) | `RO2RO` | `RO2U` |
+| UKS (UHF) | `U2R` panic | `U2R` panic | `U2U` |
+
+Eigenvector output structure depends on the target: RKS/ROKS targets store the shared spatial set in `eigenvectors[0]` only (ROHF's `eigenvectors[1]` stays empty — REST synthesizes it on the fly), so `R2R`/`RO2RO` return `[spatial, empty]`. UKS targets need both channels, so `R2U`/`RO2U` return `[spatial, spatial]`. `U2U` reads both channels directly. Occupation: RKS source total occ is halved per channel; ROKS source 2-channel occ is read as-is.
+
+`import_guess_from_hdf5chkfile` no longer takes a `spin_channel` parameter (was unused).
 
 ---
 

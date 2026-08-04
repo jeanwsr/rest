@@ -307,41 +307,43 @@ pub fn initial_guess_from_hdf5chk(mol: &mut Molecule, scftype: &SCFType, chkfile
             panic!("Cannot use chkfile '{}' for initial guess: {}", chkfile, reason);
         }
         proj::GuessAction::DirectReuse => {
-            let spin_channel = if let &SCFType::ROHF = scftype { 1 } else { mol.spin_channel };
-            let (loaded_eigenvectors, loaded_eigenvalues, loaded_occupation) = import_guess_from_hdf5chkfile(chkfile,
-                    spin_channel
-                );
+            let (loaded_eigenvectors, loaded_eigenvalues, loaded_occupation) = import_guess_from_hdf5chkfile(chkfile);
             initial_guess_from_raw(
                 loaded_eigenvectors,
                 loaded_eigenvalues,
                 loaded_occupation.unwrap(),
-                spin_channel,
+                scftype,
                 mol.num_state,
                 mol.num_basis,
                 mol.ctrl.print_level
             )
         }
         proj::GuessAction::Project(source) => {
-            let spin_channel = source.spin_channel;
-            let (loaded_eigenvectors, loaded_eigenvalues, loaded_occupation) = import_guess_from_hdf5chkfile(chkfile,
-                    spin_channel
-                );
+            let (loaded_eigenvectors, loaded_eigenvalues, loaded_occupation) = import_guess_from_hdf5chkfile(chkfile);
             info!("The basis set in chkfile does not match the input basis set (loaded: {} basis, {} MOs; target: {} basis, {} MOs),", source.num_basis, source.num_state, mol.num_basis, mol.num_state);
             info!("invoke basis projection");
             let (mo2, _, occ2) = initial_guess_from_raw(
                 loaded_eigenvectors,
                 loaded_eigenvalues,
                 loaded_occupation.unwrap(),
-                source.spin_channel,
+                scftype,
                 source.num_state,
                 source.num_basis,
                 mol.ctrl.print_level
             );
             let ne = mol.num_elec;
             let nocc = [ne[1].round() as usize, ne[2].round() as usize];
-            let mo_range = match mol.ctrl.basis_projection.as_str() {
-                "full" => [0..source.num_state, 0..source.num_state],
-                _ => [0..nocc[0], 0..nocc[1]],
+            let mo_range = if matches!(scftype, SCFType::ROHF) {
+                // ROKS/ROHF: shared spatial MOs stored in the alpha channel only
+                match mol.ctrl.basis_projection.as_str() {
+                    "full" => [0..source.num_state, 0..0],
+                    _ => [0..nocc[0], 0..0],
+                }
+            } else {
+                match mol.ctrl.basis_projection.as_str() {
+                    "full" => [0..source.num_state, 0..source.num_state],
+                    _ => [0..nocc[0], 0..nocc[1]],
+                }
             };
             let mo = proj::proj_mo(mol, &source, mo2, mo_range);
             (mo, [vec![], vec![]], occ2)
@@ -349,7 +351,7 @@ pub fn initial_guess_from_hdf5chk(mol: &mut Molecule, scftype: &SCFType, chkfile
     }
 }
 
-pub fn import_guess_from_hdf5chkfile(chkname: &str, spin_channel: usize) -> (Vec<f64>,Vec<f64>, Option<Vec<f64>>) {
+pub fn import_guess_from_hdf5chkfile(chkname: &str) -> (Vec<f64>,Vec<f64>, Option<Vec<f64>>) {
     let file = hdf5::File::open(chkname).unwrap();
     let scf = file.group("scf").unwrap();
     let member = scf.member_names().unwrap();
@@ -370,98 +372,154 @@ pub fn import_guess_from_hdf5chkfile(chkname: &str, spin_channel: usize) -> (Vec
     (buf01, buf02, buf03)
 }
 
+#[derive(Clone, Copy)]
+enum ImportMode {
+    /// 1-channel source spatial MOs → restricted target (RKS → RKS)
+    R2R,
+    /// 1-channel source spatial MOs → unrestricted target (RKS → UKS)
+    R2U,
+    /// 1-channel source spatial MOs → restricted-open target (ROKS → ROKS)
+    RO2RO,
+    /// 1-channel source spatial MOs → unrestricted target (ROKS → UKS)
+    RO2U,
+    /// 2-channel source → unrestricted target (UKS → UKS)
+    U2U,
+    /// 2-channel source → restricted target (UKS → RKS/ROKS), unsupported
+    U2R,
+}
+
+fn derive_source_scftype(nch_evec: usize, nch_occ: usize) -> SCFType {
+    match (nch_evec, nch_occ) {
+        (1, 1) => SCFType::RHF,   // RKS
+        (1, 2) => SCFType::ROHF,  // ROKS
+        (2, _) => SCFType::UHF,   // UKS
+        _ => panic!(
+            "Cannot determine source SCF type from eigenvector channels ({}) and occupation channels ({})",
+            nch_evec, nch_occ
+        ),
+    }
+}
+
+fn import_mode(target_scftype: &SCFType, source: SCFType) -> ImportMode {
+    match (source, target_scftype) {
+        (SCFType::RHF, SCFType::RHF) => ImportMode::R2R,
+        (SCFType::RHF, SCFType::UHF) => ImportMode::R2U,
+        (SCFType::RHF, SCFType::ROHF) => {
+            panic!("RKS/RHF source cannot map to an ROKS/ROHF target (r2ro)");
+        },
+        (SCFType::ROHF, SCFType::RHF) => {
+            panic!("ROKS/ROHF source cannot map to an RKS/RHF target (ro2r)");
+        },
+        (SCFType::ROHF, SCFType::ROHF) => ImportMode::RO2RO,
+        (SCFType::ROHF, SCFType::UHF) => ImportMode::RO2U,
+        (SCFType::UHF, SCFType::UHF) => ImportMode::U2U,
+        (SCFType::UHF, SCFType::RHF) | (SCFType::UHF, SCFType::ROHF) => ImportMode::U2R,
+    }
+}
+
 pub fn initial_guess_from_raw(
     loaded_eigenvectors: Vec<f64>,
     loaded_eigenvalues: Vec<f64>,
     loaded_occupation: Vec<f64>,
-    spin_channel: usize,
+    target_scftype: &SCFType,
     num_state: usize,
     num_basis: usize,
     print_level: usize
 ) -> ([MatrixFull<f64>;2],[Vec<f64>;2], Option<[Vec<f64>;2]>) {
 
-    let mut mode = "";
-    if loaded_eigenvectors.len() == num_state*num_basis*spin_channel {
-        mode = "normal"; // r2r or u2u
-    } else if loaded_eigenvectors.len() == num_state*num_basis && spin_channel==2 {
-        mode = "r2u";
-    } else if loaded_eigenvalues.len() == num_state*num_basis*2 && spin_channel==1 {
-        mode = "u2r";
-        panic!("Importing UHF MOs in RHF calculation is not supported at present");
-    } else {
-        panic!("Inconsistency happens when importing the MOs:\n loaded_eigenvectors length: {}, num_state*num_basis*spin_channel: {}, num_state*num_basis: {}", 
-        loaded_eigenvectors.len(), num_state*num_basis*spin_channel, num_state*num_basis);
-    }
-    let mut tmp_eigenvectors: [MatrixFull<f64>;2] = [MatrixFull::empty(),MatrixFull::empty()];
-    let mut tmp_eigenvalues: [Vec<f64>;2] = [vec![],vec![]];
-    let mut tmp_occupation: [Vec<f64>;2] = [vec![],vec![]];
-    match mode {
-        "normal" => {
-    (0..spin_channel).into_iter().for_each(|i| {
-        let start = (0 + i)*num_state*num_basis;
-        let end = (1 + i)*num_state*num_basis;
-
-        let tmp_eigen = MatrixFull::from_vec([num_state,num_basis], loaded_eigenvectors[start..end].to_vec()).unwrap();
-        tmp_eigenvectors[i]=tmp_eigen.transpose_and_drop();
-
-        //tmp_scf.eigenvectors[i] = tmp_eigenvectors[i].transpose();
-
-        tmp_eigenvalues[i]=loaded_eigenvalues[ (0+i)*num_state..(1+i)*num_state].to_vec();
-    });
-    if print_level>3 {
-        (0..spin_channel).into_iter().for_each(|i| {
-            tmp_eigenvectors[i].formated_output(5, "full");
-            trace!("eigenval {:?}", &tmp_eigenvalues[i]);
-        });
-    }            
-    // occupation may span more channels than spin_channel suggests
-    // (e.g. ROHF chkfile stores both alpha+beta occupation, but spin_channel=1 for eigenvectors)
+    assert_eq!(
+        loaded_eigenvectors.len() % (num_state * num_basis), 0,
+        "Inconsistent eigenvector buffer length {} for num_state*num_basis = {}",
+        loaded_eigenvectors.len(), num_state * num_basis
+    );
     assert!(
         loaded_occupation.len() == num_state || loaded_occupation.len() == 2 * num_state,
         "Unexpected occupation size in chkfile: {} (expected {} or {} for num_state={})",
         loaded_occupation.len(), num_state, 2 * num_state, num_state
     );
-    let occ_channels = loaded_occupation.len() / num_state;
-    (0..occ_channels).into_iter().for_each(|i_spin| {
-                tmp_occupation[i_spin]=loaded_occupation[ (0+i_spin)*num_state..(1+i_spin)*num_state].to_vec();
-            });
-            // println!("tmp_eigenvectors {:?}, tmp_eigenvalues {:?}, tmp_occupation {:?}", &tmp_eigenvectors, &tmp_eigenvalues, &tmp_occupation);
-        },
-        "r2u" => {
-            info!("Importing MO coefficients in RHF format and converting them to UHF format");
-            (0..spin_channel).into_iter().for_each(|i| {
-                let start = 0;
-                let end = num_state*num_basis;
 
-                let tmp_eigen = MatrixFull::from_vec([num_state,num_basis], loaded_eigenvectors[start..end].to_vec()).unwrap();
-                tmp_eigenvectors[i]=tmp_eigen.transpose_and_drop();
+    let source = derive_source_scftype(
+        loaded_eigenvectors.len() / (num_state * num_basis),
+        loaded_occupation.len() / num_state,
+    );
+    let mode = import_mode(target_scftype, source);
 
-                tmp_eigenvalues[i]=loaded_eigenvalues[ 0..num_state].to_vec();
-            });
-            if loaded_occupation.len() == 2 * num_state {
-                // ROHF source: alpha and beta occupation stored separately
-                tmp_occupation[0] = loaded_occupation[0..num_state].to_vec();
-                tmp_occupation[1] = loaded_occupation[num_state..2*num_state].to_vec();
-            } else {
-                // RHF/RKS source: occupation is total (e.g. [2,2,0]), divide by 2 for per-spin
-                assert!(loaded_occupation.len() == num_state,
-                    "r2u: unexpected occupation length {} (expected {} or {})",
-                    loaded_occupation.len(), num_state, 2*num_state);
-                (0..spin_channel).into_iter().for_each(|i_spin| {
-                    tmp_occupation[i_spin] = loaded_occupation[0..num_state].iter()
-                        .map(|x| x * 0.5)
-                        .collect();
-                });
+    let mut tmp_eigenvectors: [MatrixFull<f64>;2] = [MatrixFull::empty(),MatrixFull::empty()];
+    let mut tmp_eigenvalues: [Vec<f64>;2] = [vec![],vec![]];
+    let mut tmp_occupation: [Vec<f64>;2] = [vec![],vec![]];
+    match mode {
+        ImportMode::R2R => {
+            info!("Importing MO coefficients in restricted format (RKS/RHF)");
+            let tmp_eigen = MatrixFull::from_vec([num_state,num_basis], loaded_eigenvectors[0..num_state*num_basis].to_vec()).unwrap();
+            tmp_eigenvectors[0] = tmp_eigen.transpose_and_drop();
+            tmp_eigenvalues[0] = loaded_eigenvalues[0..num_state].to_vec();
+            tmp_occupation[0] = loaded_occupation[0..num_state].to_vec();
+            if print_level>3 {
+                tmp_eigenvectors[0].formated_output(5, "full");
+                trace!("eigenval {:?}", &tmp_eigenvalues[0]);
             }
         },
-        "u2r" => {},
-        _ => {
-            panic!("Unknown mode for importing MO coefficients");
+        ImportMode::R2U => {
+            info!("Importing MO coefficients in RHF/RKS format and converting them to UHF/UKS format");
+            // UKS target needs both channels populated; both start from the shared RKS spatial MOs
+            (0..2).into_iter().for_each(|i| {
+                let tmp_eigen = MatrixFull::from_vec([num_state,num_basis], loaded_eigenvectors[0..num_state*num_basis].to_vec()).unwrap();
+                tmp_eigenvectors[i]=tmp_eigen.transpose_and_drop();
+                tmp_eigenvalues[i]=loaded_eigenvalues[0..num_state].to_vec();
+            });
+            // RKS/RHF source: occupation is total (e.g. [2,2,0]), divide by 2 for per-spin
+            (0..2).into_iter().for_each(|i_spin| {
+                tmp_occupation[i_spin] = loaded_occupation[0..num_state].iter()
+                    .map(|x| x * 0.5)
+                    .collect();
+            });
+        },
+        ImportMode::RO2RO => {
+            info!("Importing ROKS/ROHF MOs in ROKS/ROHF format: shared spatial MOs in the alpha channel only");
+            // ROKS/ROHF stores the shared spatial set in channel 0 only; channel 1 stays empty
+            let tmp_eigen = MatrixFull::from_vec([num_state,num_basis], loaded_eigenvectors[0..num_state*num_basis].to_vec()).unwrap();
+            tmp_eigenvectors[0]=tmp_eigen.transpose_and_drop();
+            tmp_eigenvalues[0]=loaded_eigenvalues[0..num_state].to_vec();
+            // ROKS/ROHF source: alpha and beta occupation stored separately
+            tmp_occupation[0] = loaded_occupation[0..num_state].to_vec();
+            tmp_occupation[1] = loaded_occupation[num_state..2*num_state].to_vec();
+        },
+        ImportMode::RO2U => {
+            info!("Importing ROKS/ROHF MOs in UHF/UKS format: sharing spatial MOs across alpha and beta channels");
+            // UKS target needs both channels populated; both start from the shared ROKS spatial MOs
+            (0..2).into_iter().for_each(|i| {
+                let tmp_eigen = MatrixFull::from_vec([num_state,num_basis], loaded_eigenvectors[0..num_state*num_basis].to_vec()).unwrap();
+                tmp_eigenvectors[i]=tmp_eigen.transpose_and_drop();
+                tmp_eigenvalues[i]=loaded_eigenvalues[0..num_state].to_vec();
+            });
+            // ROKS/ROHF source: alpha and beta occupation stored separately
+            tmp_occupation[0] = loaded_occupation[0..num_state].to_vec();
+            tmp_occupation[1] = loaded_occupation[num_state..2*num_state].to_vec();
+        },
+        ImportMode::U2U => {
+            info!("Importing MO coefficients in unrestricted format (UKS/UHF)");
+            (0..2).into_iter().for_each(|i| {
+                let start = (0 + i)*num_state*num_basis;
+                let end = (1 + i)*num_state*num_basis;
+                let tmp_eigen = MatrixFull::from_vec([num_state,num_basis], loaded_eigenvectors[start..end].to_vec()).unwrap();
+                tmp_eigenvectors[i]=tmp_eigen.transpose_and_drop();
+                tmp_eigenvalues[i]=loaded_eigenvalues[ (0+i)*num_state..(1+i)*num_state].to_vec();
+            });
+            if print_level>3 {
+                (0..2).into_iter().for_each(|i| {
+                    tmp_eigenvectors[i].formated_output(5, "full");
+                    trace!("eigenval {:?}", &tmp_eigenvalues[i]);
+                });
+            }
+            tmp_occupation[0] = loaded_occupation[0..num_state].to_vec();
+            tmp_occupation[1] = loaded_occupation[num_state..2*num_state].to_vec();
+        },
+        ImportMode::U2R => {
+            panic!("Importing UHF/UKS MOs in an RHF/RKS calculation is not supported at present");
         }
     }
 
     (tmp_eigenvectors,tmp_eigenvalues,Some(tmp_occupation))
-
 }
 
 pub fn import_mo_coeff_from_hdf5chkfile(chkname: &str) -> ([MatrixFull<f64>;2], [usize;3]) {
