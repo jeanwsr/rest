@@ -46,7 +46,7 @@ reqwest = { version = "0.10", default-features = false, features = ["blocking", 
 mpi = {version = "0.8", features = ["user-operations", "derive"], optional = true}
 # for cuda
 #cudarc = "0.10.0"
-rest_tensors = {path="../rest_tensors"}
+rest_tensors = {path="../rest_tensors", default = false, features = []}
 rest_libcint = {path="../rest_libcint"}
 #liblbfgs = {path="../rust-lbfgs"}
 liblbfgs = "0.1.0"
@@ -92,6 +92,7 @@ dftd4 = ["dep:dftd4"]
 geometric-pyo3 = ["dep:geometric-pyo3"]
 openblas = []
 intel-mkl = []
+scalapack = ["rest_tensors/scalapack"]
 
 #[[bench]]
 #name = "bench_tensors"
