@@ -666,21 +666,39 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
 
     let e_homo=ks_energies[occ_size-1];
     let e_lumo=ks_energies[occ_size];
+    // [DBG] KS-eigenvalue diagnostics (electron count / homo / window), only at print_level >= 2
+    if scf_data.mol.ctrl.print_level >= 2 {
+        println!("[DBG KS] occ_size={} start_mo={} num_state={} e_homo={:.12e} e_lumo={:.12e}", occ_size, start_mo, num_state, e_homo, e_lumo);
+        println!("[DBG KS] num_elec={:?} scf_homo={:?} scf_lumo={:?}", scf_data.mol.num_elec, scf_data.homo, scf_data.lumo);
+        for dbg_n in 0..25usize.min(ks_energies.len()) {
+            println!("[DBG KS] n={} e={:.12e}", dbg_n, ks_energies[dbg_n]);
+        }
+    }
     let calc_orbs_indices:Vec<usize>=ks_energies.into_iter().enumerate().filter(|(n,e_n)|*e_n>e_homo-occ_threshold && *e_n<e_lumo+vir_threshold).map(|(n,e_n)|n).collect();
     println!("calculated orbital indices:{:?}",calc_orbs_indices);
-    let calc_orbs:Vec<(usize,f64)>=calc_orbs_indices.iter().map(|&n|{
-        let ri_row_n=ri_gw::compute_ri3mo_row(scf_data,n);
-        if let (Some(ref wlr), Some(ref ra)) = (&w_c_lr, &real_axis_vchiv) {
-            // v2 path: imaginary-axis low-rank with pre-computed wc_rows.
-            let wc_rows = ri_gw::precompute_wc_rows_lowrank(wlr, &ri_row_n, num_state);
-            (n, single_orbital_gw_lowrank_v2(scf_data, &v_matrix, &ri_ov, &ri_row_n, &wc_rows, ra, n, num_freq, vxc_nn[n]))
-        } else if let Some(ref ra) = real_axis_vchiv {
-            // v1 path: full W_c on imag axis + real-axis low-rank.
-            (n, single_orbital_gw_lowrank(scf_data, &v_matrix, &ri_ov, &ri_row_n, &w_c_at_freqs, ra, n, num_freq, vxc_nn[n]))
-        } else {
+    // v1/v2 paths use only ri_row_n (per-orbital) + pre-computed low-rank data;
+    // the full naux×nov ri_ov is not read in the orbital loop. Drop it (free the
+    // N³ resident) before entering the loop. Only the v0 path (contour_rayon
+    // builds response matrices from ri_ov) keeps it alive.
+    let calc_orbs:Vec<(usize,f64)>=if let Some(ref ra) = real_axis_vchiv {
+        drop(ri_ov);
+        calc_orbs_indices.iter().map(|&n|{
+            let ri_row_n=ri_gw::compute_ri3mo_row(scf_data,n);
+            if let Some(ref wlr) = w_c_lr {
+                // v2 path: imaginary-axis low-rank with pre-computed wc_rows.
+                let wc_rows = ri_gw::precompute_wc_rows_lowrank(wlr, &ri_row_n, num_state);
+                (n, single_orbital_gw_lowrank_v2(scf_data, &v_matrix, &ri_row_n, &wc_rows, ra, n, num_freq, vxc_nn[n]))
+            } else {
+                // v1 path: full W_c on imag axis + real-axis low-rank.
+                (n, single_orbital_gw_lowrank(scf_data, &v_matrix, &ri_row_n, &w_c_at_freqs, ra, n, num_freq, vxc_nn[n]))
+            }
+        }).collect()
+    } else {
+        calc_orbs_indices.iter().map(|&n|{
+            let ri_row_n=ri_gw::compute_ri3mo_row(scf_data,n);
             (n, single_orbital_gw(scf_data, &v_matrix, &ri_ov, &ri_row_n, &w_c_at_freqs, n, num_freq, vxc_nn[n]))
-        }
-    }).collect();
+        }).collect()
+    };
     let occ_shift=calc_orbs[0].1-scf_data.eigenvalues[0][calc_orbs[0].0];
     let vir_shift=calc_orbs[calc_orbs.len()-1].1-scf_data.eigenvalues[0][calc_orbs[calc_orbs.len()-1].0];
     let mut gwqp:Vec<f64>=Vec::new();
@@ -733,7 +751,6 @@ pub fn prepare_gwqp(scf_data:&mut SCF){
 fn single_orbital_gw_lowrank(
     scf_data: &mut SCF,
     v_matrix: &MatrixFull<f64>,
-    ri_ov: &MatrixFull<f64>,
     ri_row_n: &MatrixFull<f64>,
     w_c_at_freqs: &Vec<(f64, f64, MatrixFull<f64>)>,
     real_axis_vchiv: &ri_gw::RealAxisVChiV,
@@ -887,7 +904,6 @@ fn single_orbital_gw_lowrank(
 fn single_orbital_gw_lowrank_v2(
     scf_data: &mut SCF,
     v_matrix: &MatrixFull<f64>,
-    ri_ov: &MatrixFull<f64>,
     ri_row_n: &MatrixFull<f64>,
     wc_rows: &Vec<(f64, f64, Vec<f64>)>,
     real_axis_vchiv: &ri_gw::RealAxisVChiV,

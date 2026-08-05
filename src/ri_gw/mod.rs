@@ -18,7 +18,7 @@ use rest_tensors::{RIFull};
 use rayon::prelude::ParallelSliceMut;
 use tensors::{matrix_blas_lapack::{_dinverse,_dsyev}, ri, MathMatrix, MatrixFull};
 //use rest::molecule_io::Molecule;
-use rest_tensors::matrix::matrix_blas_lapack::{_dgees,_dgemm,_dgemm_full,_dgemv,_dinverse_inplace};
+use rest_tensors::matrix::matrix_blas_lapack::{_dgees,_dgemm,_dgemm_full,_dgemv,_dinverse_inplace,_dsyev_inplace};
 use crate::tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
 use rest_tensors::MatrixUpper;
 use crate::ri_bse;
@@ -624,7 +624,8 @@ pub fn compute_ri3mo_row(scf_data: &SCF, n: usize) -> MatrixFull<f64> {
         start_mo + n..start_mo + n + 1,
         start_mo..num_state,
     );
-    vector[0].0.rifull_to_matfull_i_jk()
+    // Zero-copy: reuse the RIFull data buffer (identical column-major layout).
+    vector.into_iter().next().unwrap().0.into_matfull_i_jk()
 }
 
 /// Compute V[n,m] = Σ_Q (Q|nm)² directly from scf_data via blocked MO transformation.
@@ -651,7 +652,7 @@ pub fn v_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
         // (local_m runs in the OUTER/slow strided direction). Using the wrong
         // stride (nmo instead of block_n) silently corrupts V whenever
         // block_n != nmo, i.e. whenever the row range is blocked.
-        let ri_block = ri_block_vec[0].0.rifull_to_matfull_i_jk();
+        let ri_block = ri_block_vec.into_iter().next().unwrap().0.into_matfull_i_jk();
         let naux = ri_block.size[0];
         let block_n = n_end - n_start;
         for local_n in 0..block_n {
@@ -690,25 +691,58 @@ pub fn w_c_matrix_from_scf(
     let nmo = num_state - start_mo;
     let mut w_c = MatrixFull::new([num_state, num_state], 0.0);
 
-    for local_n in 0..nmo {
-        let global_n = local_n;
-        // Compute ri_row_n = ri3mo[:, global_n, start_mo..num_state] → [naux, nmo]
-        let ri_row_n = compute_ri3mo_row(scf_data, global_n);
-        // tmp = ε⁻¹ · ri_row_n → [naux, nmo]
+    // Blocked row processing: transform BLOCK rows of ri3mo in ONE AO→MO pass
+    // (the dsymm inside the transform dominates and is independent of the row
+    // count, so per-row calls were nmo× redundant), then contract each row with
+    // ε⁻¹. This cuts the AO→MO pass count per frequency from nmo to nmo/BLOCK,
+    // and the [naux, BLOCK*nmo] output is adopted zero-copy (no clone).
+    //
+    // NOTE the flattened column layout of ri_block: col = local_n + local_m*block_n
+    // (naux fastest, local_m in the OUTER/slow direction). Each row is therefore
+    // extracted into a contiguous [naux, nmo] buffer before contraction.
+    let block = 25_usize.min(nmo).max(1);
+    let mut row_start = 0_usize;
+    while row_start < nmo {
+        let row_end = (row_start + block).min(nmo);
+        let block_n = row_end - row_start;
+        let ri_block = scf_data
+            .generate_ri3mo_rayon_for_multiple_times(
+                start_mo + row_start..start_mo + row_end,
+                start_mo..num_state,
+            )
+            .into_iter()
+            .next()
+            .unwrap()
+            .0
+            .into_matfull_i_jk();
+        // reusable per-row buffers
+        let mut ri_row_n = MatrixFull::new([num_auxbas, nmo], 0.0);
         let mut tmp = MatrixFull::new([num_auxbas, nmo], 0.0);
-        _dgemm_full(inverse_dielectric, 'N', &ri_row_n, 'N', &mut tmp, 1.0, 0.0);
-        // W_c[global_n, global_m] = dot(ri_row_n[:,local_m], tmp[:,local_m])
-        for local_m in 0..nmo {
-            let global_m = local_m;
-            let col_start = local_m * num_auxbas;
-            let dot: f64 = ri_row_n.data[col_start..col_start + num_auxbas]
-                .iter()
-                .zip(tmp.data[col_start..col_start + num_auxbas].iter())
-                .map(|(a, b)| a * b)
-                .sum();
-            w_c[[global_n, global_m]] = dot;
-            w_c[[global_m, global_n]] = dot; // symmetry
+        for local_n in 0..block_n {
+            let global_n = row_start + local_n;
+            // extract ri_row_n[:, local_m] = ri_block[:, local_n + local_m*block_n]
+            for local_m in 0..nmo {
+                let src = (local_n + local_m * block_n) * num_auxbas;
+                let dst = local_m * num_auxbas;
+                ri_row_n.data[dst..dst + num_auxbas]
+                    .copy_from_slice(&ri_block.data[src..src + num_auxbas]);
+            }
+            // tmp = ε⁻¹ · ri_row_n → [naux, nmo]
+            tmp.data.iter_mut().for_each(|x| *x = 0.0);
+            _dgemm_full(inverse_dielectric, 'N', &ri_row_n, 'N', &mut tmp, 1.0, 0.0);
+            // W_c[global_n, global_m] = dot(ri_row_n[:,local_m], tmp[:,local_m])
+            for local_m in 0..nmo {
+                let col_start = local_m * num_auxbas;
+                let dot: f64 = ri_row_n.data[col_start..col_start + num_auxbas]
+                    .iter()
+                    .zip(tmp.data[col_start..col_start + num_auxbas].iter())
+                    .map(|(a, b)| a * b)
+                    .sum();
+                w_c[[global_n, local_m]] = dot;
+                w_c[[local_m, global_n]] = dot; // symmetry
+            }
         }
+        row_start = row_end;
     }
     w_c
 }
@@ -1537,137 +1571,95 @@ pub fn low_rank_vchi_vsqrt(
     tolerance: f64,              // eigenvalue cutoff (e.g., 1e-3)
     part: char,                  // 'R' = real-axis residue, 'I' = imaginary-axis integration
     eta: f64,                    // Lorentzian broadening for real-axis (0.0 = no broadening)
+    print_level: usize,          // verbosity; >= 2 prints low-rank eigenvalue diagnostics
 ) -> LowRankVChiV {
     let n_aux = ri_ov.size[0];
     let n_trans = occ_size * vir_size;
 
-    // Step 1: Build ri_weighted(I, ia) = ri_ov(I, ia) * sqrt(|factor|)
-    // where for 'R': factor = 2 * docc * de / (omega^2 - de^2)
-    //   and for 'I': factor = -2 * docc * de / (de^2 + omega^2)
-    // Note: For real omega ('R'), omega^2 - de^2 could be negative → factor sign handled properly
     let zero_threshold = 1e-12_f64;
-    let mut ri_weighted = MatrixFull::new([n_aux, n_trans], 0.0);
-    for ia in 0..n_trans {
-        let i = ia % occ_size;
-        let a = occ_size + ia / occ_size;
-        let de = quasiparticle_energies_w[a] - quasiparticle_energies_w[i];
-        let docc = 2.0;  // spin-restricted, occupation difference
-        let denom = if part == 'I' {
-            de * de + omega * omega
-        } else {
-            omega * omega - de * de
-        };
-        if denom.abs() < zero_threshold {
-            continue;
-        }
-        let factor = if part == 'I' {
-            -2.0 * docc * de / denom
-        } else {
-            2.0 * docc * de / denom
-        };
-        let factor_scaled = if factor.abs() < zero_threshold {
-            0.0
-        } else {
-            factor.abs().sqrt() * if factor > 0.0 { 1.0 } else { -1.0 }
-        };
-        for aux in 0..n_aux {
-            ri_weighted[[aux, ia]] = ri_ov[[aux, ia]] * factor_scaled;
-        }
-    }
 
-    // Step 2: chi0 = ri_weighted * ri_weighted^T  (n_aux × n_aux)
-    // Note: The absolute and sign handling above means we effectively build
-    // chi0 = sum_{ia} factor * (I|ia) * (J|ia)
-    // via DGEMM with ri_weighted (which carries sqrt(|factor|) * sign)
-    // However, DGEMM gives us ri_weighted * ri_weighted^T = sum (sqrt|f|*sign * I) * (sqrt|f|*sign * J)
-    // = sum f * (I|ia) * (J|ia). Wait, no. DGEMM of A * A^T gives sum_k A_ik * A_jk.
-    // If A(I,ia) = ri_ov(I,ia) * sqrt(|factor|) * sign, then
-    // sum_ia A(I,ia)*A(J,ia) = sum_ia ri_ov(I,ia)*ri_ov(J,ia) * |factor| * sign^2
-    // = sum_ia factor * ri_ov(I,ia) * ri_ov(J,ia) -- correct!
-    // Wait, sign^2 = 1 always. So we lose the sign information.
-    // We need a different approach. Let me reconsider.
-
-    // Actually, the chi0 matrix is:
-    // chi0(I,J) = sum_{ia} 2*docc*de/(omega^2 - de^2) * (I|ia) * (J|ia)
-    //
-    // If omega < de_min, then omega^2 - de^2 < 0 for all ia, so factor < 0.
-    // But for residue corrections on the real axis, omega = |de| where de is the pole energy,
-    // so omega < de for some transitions and omega > de for others.
-    // The factor can be positive or negative.
-    //
-    // To handle this with DGEMM, we split:
-    // ri_pos: (I,ia) * sqrt(|factor|) for factor > 0
-    // ri_neg: (I,ia) * sqrt(|factor|) for factor < 0
-    // chi0 = ri_pos * ri_pos^T - ri_neg * ri_neg^T
-
-    // Actually, a simpler approach: build chi0 directly as described in MOLGW.
-    // Let's just fill eri3_t1 and eri3_t2 separately, where eri3_t1 carries the factor
-    // and eri3_t2 is the bare integral. Then: chi0 = eri3_t1 * eri3_t2^T
-
-    // Let me redo this more carefully, following MOLGW exactly:
-    // eri3_t1(:, ia) = (I|ia) * factor
-    // eri3_t2(:, ia) = (I|ia)
-    // chi0 = eri3_t1 * eri3_t2^T
-
-    let mut eri3_t1 = MatrixFull::new([n_aux, n_trans], 0.0);
-    let mut eri3_t2 = MatrixFull::new([n_aux, n_trans], 0.0);
-    for ia in 0..n_trans {
-        let i = ia % occ_size;
-        let a = occ_size + ia / occ_size;
-        let de = quasiparticle_energies_w[a] - quasiparticle_energies_w[i];
-        let docc = 2.0;
-        let factor = if part == 'I' {
-            let denom = de * de + omega * omega;
-            if denom.abs() < zero_threshold { 0.0 }
-            else { -2.0 * docc * de / denom }
-        } else {
-            let de2 = de * de;
-            let omega2 = omega * omega;
-            let eta2 = eta * eta;
-            let num = de2 - omega2 + eta2;
-            let den = (de2 - omega2).powi(2) + 2.0 * eta2 * (de2 + omega2) + eta2 * eta2;
-            if den.abs() < zero_threshold { 0.0 }
-            else { -2.0 * docc * de * num / den }
-        };
-        for aux in 0..n_aux {
-            eri3_t1[[aux, ia]] = ri_ov[[aux, ia]] * factor;
-            eri3_t2[[aux, ia]] = ri_ov[[aux, ia]];
-        }
-    }
-
+    // Build chi0(I,J) = sum_{ia} factor_ia * (I|ia) * (J|ia) in a single pass with
+    // blocked column scaling, exactly like response_matrix. Each block materializes
+    // only one [n_aux, block] scaled copy of ri_ov, instead of the previous two full
+    // [n_aux, n_trans] copies (eri3_t1/eri3_t2) plus a dead ri_weighted copy.
+    // Per-worker transient memory drops from O(3*n_aux*n_trans) to O(n_aux*block + n_aux^2).
     let mut chi0 = MatrixFull::new([n_aux, n_aux], 0.0);
-    _dgemm_full(&eri3_t1, 'N', &eri3_t2, 'T', &mut chi0, 1.0, 0.0);
-
-    // Step 3: Diagonalize chi0
-    let (eigvecs_opt, eigvals_raw, _info) = _dsyev(&chi0, 'V');
-    let eigvecs = eigvecs_opt.expect("low_rank_vchi_vsqrt: dsyev failed");
-    // _dsyev returns eigenvalues in ascending order, but we want descending by magnitude
-    // Collect and sort
-    let mut pairs: Vec<(f64, Vec<f64>)> = eigvals_raw.iter().enumerate().map(|(v, &lam0)| {
-        let lam = lam0 / (1.0 - lam0);
-        let vec: Vec<f64> = (0..n_aux).map(|r| eigvecs[[r, v]]).collect();
-        (lam, vec)
-    }).collect();
-
-    // Sort by absolute eigenvalue descending
-    pairs.sort_by(|a, b| b.0.abs().partial_cmp(&a.0.abs()).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Step 4: Keep only non-negligible eigenvalues
-    let mut keep_idx: Vec<usize> = Vec::new();
-    for (idx, (lam, _)) in pairs.iter().enumerate() {
-        if lam.abs() > tolerance {
-            keep_idx.push(idx);
+    let block_size = 1000_usize.min(n_trans).max(1);
+    let mut col_start = 0_usize;
+    while col_start < n_trans {
+        let col_end = (col_start + block_size).min(n_trans);
+        let block_n = col_end - col_start;
+        // ri_block[:, k] = ri_ov[:, col_start+k] * factor(col_start+k)
+        let mut ri_block = MatrixFull::new([n_aux, block_n], 0.0);
+        for k in 0..block_n {
+            let ia = col_start + k;
+            let i = ia % occ_size;
+            let a = occ_size + ia / occ_size;
+            let de = quasiparticle_energies_w[a] - quasiparticle_energies_w[i];
+            let docc = 2.0;
+            let factor = if part == 'I' {
+                let denom = de * de + omega * omega;
+                if denom.abs() < zero_threshold { 0.0 }
+                else { -2.0 * docc * de / denom }
+            } else {
+                let de2 = de * de;
+                let omega2 = omega * omega;
+                let eta2 = eta * eta;
+                let num = de2 - omega2 + eta2;
+                let den = (de2 - omega2).powi(2) + 2.0 * eta2 * (de2 + omega2) + eta2 * eta2;
+                if den.abs() < zero_threshold { 0.0 }
+                else { -2.0 * docc * de * num / den }
+            };
+            let dst_start = k * n_aux;
+            let src_start = ia * n_aux;
+            for r in 0..n_aux {
+                ri_block.data[dst_start + r] = ri_ov.data[src_start + r] * factor;
+            }
         }
+        // chi0 += ri_ov[:, col_start..col_end] * ri_block^T
+        //   chi0[I,J] += sum_k ri_ov[I, col_start+k] * ri_block[J, k]
+        //              = sum_ia ri_ov[I,ia] * factor_ia * ri_ov[J,ia]  (same as before)
+        _dgemm(
+            ri_ov, (0..n_aux, col_start..col_end), 'N',
+            &ri_block, (0..n_aux, 0..block_n), 'T',
+            &mut chi0, (0..n_aux, 0..n_aux),
+            1.0, 1.0,
+        );
+        col_start = col_end;
     }
-    let n_keep = keep_idx.len();
 
-    // Build eigvec and eigval arrays
+    // Step 3: Diagonalize chi0 in place (LAPACK dsyev overwrites the input with
+    // the eigenvectors, so chi0's buffer is reused — no n² copy).
+    let (eigvecs_opt, eigvals_raw, _info) = _dsyev_inplace(chi0, 'V');
+    let eigvecs = eigvecs_opt.expect("low_rank_vchi_vsqrt: dsyev failed");
+
+    // _dsyev returns eigenvalues in ascending order, but we want descending by
+    // magnitude. Sort (index, lambda) pairs only — no per-vector heap copies
+    // (previously `pairs: Vec<(f64, Vec<f64>)>` duplicated every eigenvector).
+    let mut idx_eig: Vec<(usize, f64)> = eigvals_raw.iter().enumerate()
+        .map(|(v, &lam0)| (v, lam0 / (1.0 - lam0)))
+        .collect();
+    idx_eig.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Step 4: Keep only non-negligible eigenvalues (|lambda| > tolerance)
+    let n_keep = idx_eig.iter().take_while(|(_, lam)| lam.abs() > tolerance).count();
+    // Low-rank eigenvalue diagnostics (max |lambda|, min |1-lambda0|), only at print_level >= 2
+    if print_level >= 2 {
+        let max_lam = idx_eig.first().map(|x| x.1.abs()).unwrap_or(0.0);
+        let min_gap = idx_eig.iter()
+            .map(|(v, _)| (1.0 - eigvals_raw[*v]).abs())
+            .fold(f64::MAX, f64::min);
+        println!("[DBG LR] part={} omega={:.6e} n_keep={} max|lam|={:.6e} min|1-lam0|={:.6e}",
+                 part, omega, n_keep, max_lam, min_gap);
+    }
+
+    // Build eigvec and eigval arrays (copy columns of eigvecs in sorted order)
     let mut eigvec_mat = MatrixFull::new([n_aux, n_keep], 0.0);
     let mut eigval_vec = Vec::with_capacity(n_keep);
-    for (j, &idx) in keep_idx.iter().enumerate() {
-        eigval_vec.push(pairs[idx].0);
+    for (j, &(v, lam)) in idx_eig.iter().take(n_keep).enumerate() {
+        eigval_vec.push(lam);
         for aux in 0..n_aux {
-            eigvec_mat[[aux, j]] = pairs[idx].1[aux];
+            eigvec_mat[[aux, j]] = eigvecs[[aux, v]];
         }
     }
 
@@ -1809,8 +1801,11 @@ pub fn generate_real_axis_vchiv(
         }
         let lr = low_rank_vchi_vsqrt(
             quasiparticle_energies_w, occ_size, vir_size, ri_ov, omega_real, tolerance, 'R', eta,
+            print_level,
         );
-        println!("    Non-negligible eigenvalues: {} / {}", lr.n_keep, ri_ov.size[0]);
+        if print_level >= 2 {
+            println!("    Non-negligible eigenvalues: {} / {}", lr.n_keep, ri_ov.size[0]);
+        }
         grid.push(lr);
     }
 
@@ -1968,6 +1963,7 @@ pub fn generate_w_c_lowrank(
                     tolerance,
                     'I',
                     0.0,  // eta not used for imaginary axis
+                    scf_data.mol.ctrl.print_level,
                 );
                 println!(
                     "Evaluation of W_c (lowrank) for omega={} has finished. This step took {:?}",
