@@ -249,18 +249,6 @@ pub fn main_driver() -> anyhow::Result<()> {
         _ => {}
     }
 
-    if scf_data.mol.ctrl.has_chkfile {
-        if let Some(mp_op) = &mpi_operator {
-            if mp_op.rank == 0 {
-                println!("Rank 0: now save the converged SCF results");
-                save_chkfile(&scf_data)
-            }
-        } else {
-            println!("now save the converged SCF results");
-            save_chkfile(&scf_data)
-        }
-    };
-
     if scf_data.mol.ctrl.check_stab {
         time_mark.new_item("Stability", "the scf stability check");
         time_mark.count_start("Stability");
@@ -506,6 +494,21 @@ pub fn performance_essential_calculations(scf_data: &mut SCF, time_mark: &mut ut
     scf_without_build(scf_data, mpi_operator);
     //println!("debug time mark SCF turn off");
     time_mark.count("SCF");
+
+    //==================================================================
+    // Save the converged SCF results to the chkfile
+    //==================================================================
+    if scf_data.mol.ctrl.has_chkfile {
+        if let Some(mp_op) = mpi_operator {
+            if mp_op.rank == 0 {
+                println!("Rank 0: now save the converged SCF results");
+                save_chkfile(scf_data)
+            }
+        } else {
+            println!("now save the converged SCF results");
+            save_chkfile(scf_data)
+        }
+    }
 
     //==================================================================
     // Now evaluate the advanced correction energy for the given method
