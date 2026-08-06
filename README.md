@@ -464,7 +464,7 @@ BSE计算在 `gw_or_bse = “bse”` 时进行，在GW准粒子能量（或从�
 - `bse_cutoff_energy`: 取值f64，单位Hartree。KS能级高于此能量的虚轨道将被排除在BSE激发空间之外，缩减BSE kernel维度。建议根据体系设置为合理值（含几百条虚轨道即可），缺省为1e6（几乎不截断）。
 - `davidson_target_excitations`: 取值usize，需要计算的激发态数目。缺省为6。
 - `bse_davidson_solver`: 取值bool，设置为 `true` 使用Davidson迭代对角化（推荐用于仅需少数低能激发态的体系），设置为 `false`（缺省）使用完整矩阵对角化（适合小体系或需要全部激发态的情况）。
-- `davidson_converge_threshold`: 取值f64，Davidson求解器的收敛阈值。缺省为1e-6。
+- `davidson_converge_threshold`: 取值f64，Davidson求解器的收敛阈值。缺省为1e-10。收敛判据：`||r|| < sqrt(tol)` 且 `|de| < tol`。
 - `davidson_max_iter`: 取值usize，Davidson最大迭代次数。缺省为20。
 - `davidson_maximum_subspace_size`: 取值usize，Davidson最大子空间维度倍数。实际最大子空间 = max(目标激发数 × 此值, 最小维度)。缺省为2。
 - `davidson_restart_dimensions`: 取值usize，Davidson重启动维度。当子空间达到上限后，收缩至此数量的近似特征向量后再继续扩张。缺省为5。
@@ -586,7 +586,7 @@ TD-DFT方法相关的设置在 `[tddft]` 区块中进行。REST支持基于RI积
 
 REST默认使用Davidson迭代对角化算法求解TD-DFT本征值问题。
 
-- `davidson_tol`: 取值f64，Davidson求解器的收敛阈值。缺省为1e-6。
+- `davidson_tol`: 取值f64，Davidson求解器的收敛阈值。缺省为1e-10。收敛判据：`||r|| < sqrt(tol)` 且 `|de| < tol`。
 - `davidson_max_iter`: 取值usize，Davidson最大迭代次数。缺省为50。
 - `davidson_max_subspace`: 取值usize，最大子空间维度倍数。实际最大子空间 = min(nroots × 此值, 激发空间总维度)。缺省为8。
 
@@ -627,7 +627,7 @@ TD-DFT单重态完整线性响应计算（10个激发态）：
 tddft_method = "lr"
 tddft_spin = "singlet"
 nroots = 10
-davidson_tol = 1.0e-5
+davidson_tol = 1.0e-10
 tddft_cutoff_energy = 50.0
 ```
 
@@ -652,7 +652,9 @@ nroots = 5
     - `"dense"`：直接矩阵求逆求解。仅适用于极小体系或开发验证。
 - `frequencies`: 取值bool，设置为 `true` 在Hessian矩阵计算完成后对角化质量加权Hessian，计算振动频率（cm⁻¹）和简正模式并保存到文件。缺省为false。
 - `krylov_max_cycle`: 取值usize，Krylov求解器的最大迭代次数。对于绝大多数体系，50轮已足以收敛到机器精度。缺省为50。
-- `krylov_tol`: 取值f64，Krylov求解器的残差范数收敛阈值。缺省为1e-12（机器精度）。若仅需振动频率且对数值精度要求不高，可适度放松至1e-8以缩短求解时间。
+- `krylov_tol`: 取值f64，Krylov求解器的残差范数收敛阈值。缺省为1e-9。实际收敛还受 `krylov_lindep` 约束。
+- `krylov_lindep`: 取值f64，Krylov求解器的线性相关阈值。缺省为1e-15。
+- `krylov_tol_inflation`: 取值f64，容忍系数。若真残差 `||r|| < factor * tol`，接受该解而不触发 per-root 求解。缺省为1000.0。
 - `verbose`: 取值usize，Hessian计算的信息输出等级：
     - `0`：静默模式，仅输出最终结果。
     - `1`（缺省）：正常输出，打印各阶段耗时和Hessian矩阵摘要。
@@ -746,10 +748,11 @@ analdrv_tasks = "freq"
 
 在设置任务后，用户可以在 `[analdrv]` 区块中设置对应的计算选项。该区块的关键词包括：
 - `cphf_level_shift`：CPHF 求解时对 $\varepsilon_i - \varepsilon_a$ 的求解偏移。默认为 0，单位 Hartree。
-- `cphf_tol`：CPHF 中的 Krylov 求解阈值。默认 1e-8，无量纲。实际求解阈值也受制于 `cphf_lindep`，且 `cphf_lindep` 经常是更宽松的阈值。
+- `cphf_tol`：CPHF 中的 Krylov 求解阈值。默认 1e-9，无量纲。实际求解阈值也受制于 `cphf_lindep`。
 - `cphf_max_cycle`：CPHF 最大迭代步数。默认为 42 步。CPHF 与 SCF 不同，一般 6-10 步能收敛。这里的最大步数一般不需要设得很大。
 - `cphf_max_space`：CPHF 中 Krylov 空间的数量。默认为 14。该数值不宜设太小，因为超过该数值时，Krylov 求解器会代入最后一次迭代重新作为初猜，重置求解过程。但该数值设太大会对内存产生压力。
-- `cphf_lindep`：CPHF 中一些数值过程的数值精度阈值。默认 1e-14，无量纲。
+- `cphf_lindep`：CPHF 中一些数值过程的数值精度阈值。默认 1e-15，无量纲。
+- `cphf_tol_inflation`：容忍系数。若 Krylov 真残差 `||r|| < factor * tol`，接受该解而不触发 per-root 求解。缺省为1000.0。
 - `verbose`：打印强度。默认为 None，使用输入卡 `[ctrl]` 区块的 verbose。
 - `atm_list`：选择一部分原子进行 Hessian 计算。默认为 None，即所有原子参与 Hessian 计算。
 - `grid_level_cphf`：CPHF 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None，是 `[ctrl]` 中 grid_generation_level 关键词设定值减 2 (SCF 默认格点级别是 3，对应 Hessian 的级别是 1)；最低级别是 1。
@@ -882,15 +885,7 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 
 ## `[hessian]` 区块关键词
 
-只要输入卡中存在 `[hessian]` 区块（可位于顶层或嵌套于 `[ctrl]` 下），SCF 收敛后即**无条件**触发解析 Hessian 计算（与 `job_type` 无关）。关键词包括：
-
-- `solver`: 取值 String。CP-HF 方程求解器，`"krylov"`（缺省，推荐；批量子空间迭代，一次派发所有 3N 个右端项）或 `"dense"`（稠密矩阵直接求解，仅用于小体系或校验）。
-- `frequencies`: 取值 bool。是否在 Hessian 计算后顺带做振动频率与简正模分析并输出 `EigenModes.txt`。缺省 false。注意：若同时设置了 `[thermo]` 区块，频率会被自动计算，无需手动开启此项。
-- `krylov_max_cycle`: 取值 usize。Krylov 求解器最大迭代数。缺省 50。
-- `krylov_tol`: 取值 f64。Krylov 收敛阈值。缺省 1e-12。
-- `verbose`: 取值 usize。输出详细程度（0=静默，1=正常，2=调试；调试时额外输出各分量 .npy 文件）。缺省 1。
-- `hessian_matrix_path`: 取值 String。Hessian 矩阵输出路径。缺省 `"./HessianMatrix.txt"`。
-- `eigenmodes_path`: 取值 String。简正模输出路径。缺省 `"./EigenModes.txt"`。
+只要输入卡中存在 `[hessian]` 区块（可位于顶层或嵌套于 `[ctrl]` 下），SCF 收敛后即**无条件**触发解析 Hessian 计算（与 `job_type` 无关）。关键词见 hessian 部分。
 
 频率计算约定：对 Hessian 做质量加权后经 LAPACK `dsyev` 对角化，本征值转换为 cm⁻¹（虚频记为负值）。6（线性分子为 5）个平动/转动零模会自然产生（数值上接近 0；若几何未完全优化可能呈小幅虚频，不影响真实振动模式）。REST 内置质量为元素质量（如 H=1.008、C=12.011），与 Gaussian 默认同位素质量略有差异，对频率与热化学量的影响通常在 0.1% 量级。
 

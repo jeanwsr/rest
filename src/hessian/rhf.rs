@@ -1077,6 +1077,8 @@ pub struct RIRHFHessian<'a> {
     pub solver: String,
     pub krylov_max_cycle: usize,
     pub krylov_tol: f64,
+    pub krylov_tol_inflation: f64,
+    pub krylov_lindep: f64,
 }
 
 /// Shared RI integrals between `calc_ej_ek` and `calc_h1ao`.
@@ -1116,7 +1118,9 @@ impl RIRHFHessian<'_> {
             shared_integrals: None,
             solver: String::from("krylov"),
             krylov_max_cycle: 50,
-            krylov_tol: 1.0e-12,
+            krylov_tol: 1.0e-9,
+            krylov_tol_inflation: 1000.0,
+            krylov_lindep: 1e-15,
         }
     }
 
@@ -3583,6 +3587,8 @@ impl RIRHFHessian<'_> {
             .ok().and_then(|s| s.parse().ok()).unwrap_or(self.krylov_max_cycle);
         let krylov_tol: f64 = std::env::var("REST_CPHF_KRYLOV_TOL")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(self.krylov_tol);
+        let krylov_tol_inflation = self.krylov_tol_inflation;
+        let krylov_lindep = self.krylov_lindep;
         if use_krylov {
             println!("  CP-HF: using Krylov solver (max_cycle={}, tol={:.1e})",
                      krylov_max_cycle, krylov_tol);
@@ -3630,7 +3636,7 @@ impl RIRHFHessian<'_> {
         let mo1_full_all: Vec<Vec<f64>> = if use_krylov {
             // Single batched solve for all 3*natom RHS.
             let u_vo_all = solver.solve_krylov_batched(
-                scf, fxc_cache_ref, &rhs_all, krylov_max_cycle, krylov_tol);
+                scf, fxc_cache_ref, &rhs_all, krylov_max_cycle, krylov_tol, krylov_tol_inflation, krylov_lindep);
             // Assemble full (nmo*nocc) solution per RHS from VO + OO blocks.
             rhs_meta.iter().zip(u_vo_all.iter()).map(|(&(ia, dir), u_vo)| {
                 let u_oo = solver.solve_occ_occ_from_s1(&s1_mo_all[ia][dir]);
@@ -4348,6 +4354,8 @@ fn run_hessian_pipeline(
     hess.solver = hess_ctrl.solver.clone();
     hess.krylov_max_cycle = hess_ctrl.krylov_max_cycle;
     hess.krylov_tol = hess_ctrl.krylov_tol;
+    hess.krylov_tol_inflation = hess_ctrl.krylov_tol_inflation;
+    hess.krylov_lindep = hess_ctrl.krylov_lindep;
     // Env var override for development: REST_EJ_EK_GX=inline|verify
     // BLAS is the default (no env var needed). Set to 'inline' or 'verify'
     // to run the old for-loop path and diff against the BLAS baseline.

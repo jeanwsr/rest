@@ -21,14 +21,16 @@ pub enum AnalDrvTask {
 pub struct AnalDrvConfig {
     #[serde_inline_default(0.0)]
     pub cphf_level_shift: f64,
-    #[serde_inline_default(1e-8)]
+    #[serde_inline_default(1e-9)]
     pub cphf_tol: f64,
     #[serde_inline_default(42)]
     pub cphf_max_cycle: usize,
     #[serde_inline_default(14)]
     pub cphf_max_space: usize,
-    #[serde_inline_default(1e-14)]
+    #[serde_inline_default(1e-15)]
     pub cphf_lindep: f64,
+    #[serde_inline_default(1000.0)]
+    pub cphf_tol_inflation: f64,
     #[serde_inline_default(None)]
     pub verbose: Option<usize>,
     #[serde_inline_default(None)]
@@ -64,10 +66,11 @@ impl Default for AnalDrvConfig {
     fn default() -> Self {
         Self {
             cphf_level_shift: 0.0,
-            cphf_tol: 1e-8,
+            cphf_tol: 1e-9,
             cphf_max_cycle: 42,
             cphf_max_space: 14,
-            cphf_lindep: 1e-14,
+            cphf_lindep: 1e-15,
+            cphf_tol_inflation: 1000.0,
             verbose: None,
             atm_list: None,
             grid_level_cphf: None,

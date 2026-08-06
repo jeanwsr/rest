@@ -75,7 +75,7 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
                 .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Unpolarized)))
                 .collect_vec()
         };
-        let verbose = scf_data.mol.ctrl.print_level >= 2;
+        let verbose = scf_data.mol.ctrl.print_level > 2;
 
         // Determine skeleton / cphf grid levels.
         // - skeleton: LDA/GGA use the SCF DFT grid; MGGA (TAU) adds 2 levels.

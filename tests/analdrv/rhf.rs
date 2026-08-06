@@ -10,7 +10,7 @@ use rstsr::prelude::*;
 static INPUT_NH3: &str = r##"
 [ctrl]
     print_level =          2
-    num_threads =          16
+    num_threads =          4
     xc =                   "hf"
     basis_path =           "def2-tzvp"
     auxbas_path =          "def2-universal-jkfit"
@@ -27,6 +27,8 @@ static INPUT_NH3: &str = r##"
 
 [analdrv]
 gau_thermo = true
+cphf_tol = 1e-9
+cphf_tol_inflation = 1000
 
 [geom]
     name = "NH3"
@@ -52,6 +54,7 @@ fn test_nh3() {
     let th = th.unwrap();
 
     let ref_freqs = [1263.343780, 1367.102321, 1424.072405, 2132.997526, 2443.140863, 3517.051480];
+    println!("freqs: {:?}", vib.omega);
     for (k, &i) in vib.vib_indices().iter().enumerate() {
         assert!((vib.omega[i] - ref_freqs[k]).abs() < 1e-2, "freq {}: {} != {}", i, vib.omega[i], ref_freqs[k]);
     }

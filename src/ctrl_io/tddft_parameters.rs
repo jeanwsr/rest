@@ -5,7 +5,7 @@ pub struct TDDFTParameters {
     pub tddft_method: String,       // "tda" or "lr" (full linear response)
     pub tddft_spin: String,         // "singlet" or "triplet"
     pub nroots: usize,              // number of excitation energies to compute
-    pub davidson_tol: f64,          // Davidson convergence threshold
+    pub davidson_tol: f64,          // Davidson convergence: ||r|| < sqrt(tol), |de| < tol
     pub davidson_max_iter: usize,   // maximum Davidson iterations
     pub davidson_max_subspace: usize, // maximum subspace dimension multiplier
     // Response (frequency-domain) TDDFT controls
@@ -53,7 +53,7 @@ impl Default for TDDFTParameters {
             tddft_method: String::from("lr"),
             tddft_spin: String::from("singlet"),
             nroots: 6,
-            davidson_tol: 1.0e-6,
+            davidson_tol: 1.0e-10,
             davidson_max_iter: 50,
             davidson_max_subspace: 8,
             response_tddft: false,
@@ -107,8 +107,8 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
                 _ => 6,
             };
             p.davidson_tol = match tmp_ctrl.get("davidson_tol").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-6),
-                _ => 1.0e-6,
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-10),
+                _ => 1.0e-10,
             };
             p.davidson_max_iter = match tmp_ctrl.get("davidson_max_iter").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(50) as usize,

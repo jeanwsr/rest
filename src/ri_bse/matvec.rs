@@ -5,7 +5,7 @@ use crate::ri_gw::get_occupation_parameters;
 use itertools::Itertools;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgeev, _dgemv,_dgemm_full};
 use crate::ri_bse;
-use crate::ri_bse::davidson_solver;
+use crate::solvers::davidson;
 use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
 use rayon::prelude::*;
 use std::time::Instant;

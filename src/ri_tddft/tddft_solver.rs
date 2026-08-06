@@ -11,8 +11,9 @@
 
 use rest_tensors::MatrixFull;
 use crate::scf_io::SCF;
-use crate::ri_bse::{davidson_solver, dipoles};
-use crate::ri_bse::davidson_solver::DavidsonConfig;
+use crate::ri_bse::dipoles;
+use crate::solvers::davidson as davidson_solver;
+use crate::solvers::davidson::DavidsonConfig;
 use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data, set_fxc_use_optimized};
 use crate::ri_tddft::matvec::{self, a_matvec, b_matvec};
 use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_get_submatrix, compute_tddft_dipole_matrix};
@@ -43,7 +44,17 @@ pub fn tddft_main(scf: &mut SCF) -> Result<(), String> {
     // ═══ Step 2: Get orbital dimensions ═══
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
         tddft_occupation_parameters(scf);
-    let dim = occ_size * vir_size;
+        if scf.mol.ctrl.print_level > 1 {
+            let cutoff = scf.mol.ctrl.tddft.as_ref().map(|c| c.tddft_cutoff_energy).unwrap_or(1.0e6);
+            if cutoff < 1.0e5 {
+                println!("  TDDFT virtual cutoff: {:.4} Ha, {} states retained", cutoff, num_state);
+            }
+            if start_mo > scf.mol.start_mo {
+                println!("  TDDFT frozen core: -2.00 Ha threshold, {} orbitals frozen (MO 0..{})",
+                    start_mo - scf.mol.start_mo, start_mo);
+            }
+        }
+        let dim = occ_size * vir_size;
     if dim == 0 {
         return Err("No occupied-virtual excitation space (all orbitals frozen)".to_string());
     }
@@ -100,6 +111,8 @@ pub fn tddft_main(scf: &mut SCF) -> Result<(), String> {
         add_dim,
         restart_dim: nroots.max(2),
         max_iter,
+        tol: converged_tol,
+        ..Default::default()
     };
 
     // ═══ Step 8: Diagnostic: check A matrix symmetry for first few columns ═══
@@ -221,7 +234,6 @@ pub fn tddft_main(scf: &mut SCF) -> Result<(), String> {
     } else if is_tda {
         println!("Solving TDA eigenvalue problem...");
         davidson_solver::tda_davidson_solver(
-            scf.mol.ctrl.print_level,
             |z: &Vec<f64>| a_matvec(scf, &fxc_data, &ri_ov, &ri_oo_exch, &ri_vv_exch, z, xlet, alpha_hybrid),
             nroots,
             &hdiag,
@@ -230,9 +242,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<(), String> {
         )
     } else {
         println!("Solving full linear response eigenvalue problem...");
-        davidson_solver::lr_davidson_solver(
-            scf.mol.ctrl.print_level,
-            |z: &Vec<f64>| a_matvec(scf, &fxc_data, &ri_ov, &ri_oo_exch, &ri_vv_exch, z, xlet, alpha_hybrid),
+        davidson_solver::lr_davidson_solver(|z: &Vec<f64>| a_matvec(scf, &fxc_data, &ri_ov, &ri_oo_exch, &ri_vv_exch, z, xlet, alpha_hybrid),
             |z: &Vec<f64>| b_matvec(scf, &fxc_data, &ri_ov, &ri_ov_exch, z, xlet, alpha_hybrid),
             nroots,
             &hdiag,
@@ -250,7 +260,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<(), String> {
     println!("\nFirst {} {} Excitations:", n_found.min(n_print), singlet_triplet);
 
     for (n, (energy, vector)) in eigenpairs[..n_print].iter().enumerate() {
-        let vec_norm: f64 = vector.iter().map(|x| x*x).sum::<f64>().sqrt();
+        let vec_norm: f64 = vector.iter().map(|x| x * x).sum::<f64>().sqrt();
 
         println!("#{} Excitation energy={}, norm={:.6}", n, energy, vec_norm);
 

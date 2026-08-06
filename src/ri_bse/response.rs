@@ -9,7 +9,7 @@ use crate::ri_gw::get_occupation_parameters;
 use std::f64::consts::SQRT_2;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgeev, _dgemv,_dgemm_full,_dsolve};
 use crate::ri_bse;
-use crate::ri_bse::davidson_solver::{dot_product,num_product,vector_scaled_add};
+use crate::solvers::davidson::{dot_product,num_product,vector_scaled_add};
 use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
 use rayon::prelude::*;
 use std::time::Instant;

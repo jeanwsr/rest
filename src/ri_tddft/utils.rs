@@ -45,15 +45,8 @@ pub fn tddft_occupation_parameters(scf: &SCF) -> (usize, usize, usize, usize, us
         if num_state < homo + 1 {
             num_state = homo + 1; // keep at least all occupied orbitals
         }
-        if scf.mol.ctrl.print_level > 1 {
-            println!("  TDDFT virtual cutoff: {:.4} Ha, {} states retained", cutoff, num_state);
-        }
     }
     let vir_size = num_state - lumo;
-    if start_mo > scf.mol.start_mo && scf.mol.ctrl.print_level>1 {
-        println!("  TDDFT frozen core: {:.2} Ha threshold, {} orbitals frozen (MO 0..{})",
-            FROZEN_CORE_THRESHOLD, start_mo - scf.mol.start_mo, start_mo);
-    }
     (start_mo, num_state, occ_size, vir_size, homo, lumo)
 }
 
