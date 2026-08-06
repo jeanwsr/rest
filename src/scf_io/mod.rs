@@ -2724,12 +2724,19 @@ impl SCF {
             g_err[i_spin] = norm(&self.grad_dm[i_spin], "l2");
         }
 
-        if spin_channel==1 {
-            info!("SCF Change: DM {:10.5e}; eev {:10.5e} Ha; etot {:10.5e} Ha; grad {:10.5e} Ha",
-                dm_err[0], eev_err, diff_energy, g_err[0])
-        } else {
-            info!("SCF Change: DM ({:10.5e},{:10.5e}); eev {:10.5e} Ha; etot {:10.5e} Ha; grad ({:10.5e},{:10.5e}) Ha",
-                dm_err[0], dm_err[1], eev_err, diff_energy, g_err[0], g_err[1])
+        match self.scftype {
+            SCFType::RHF => {
+                info!("SCF Change: DM {:10.5e}; eev {:10.5e} Ha; etot {:10.5e} Ha; grad {:10.5e} Ha",
+                    dm_err[0], eev_err, diff_energy, g_err[0])
+            }
+            SCFType::ROHF => {
+                info!("SCF Change: DM ({:10.5e},{:10.5e}); eev {:10.5e} Ha; etot {:10.5e} Ha; grad {:10.5e} Ha",
+                    dm_err[0], dm_err[1], eev_err, diff_energy, g_err[0])
+            }
+            SCFType::UHF => {
+                info!("SCF Change: DM ({:10.5e},{:10.5e}); eev {:10.5e} Ha; etot {:10.5e} Ha; grad ({:10.5e},{:10.5e}) Ha",
+                    dm_err[0], dm_err[1], eev_err, diff_energy, g_err[0], g_err[1])
+            }
         };
 
         if scftracerecode.num_iter<2 {
@@ -5071,11 +5078,14 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
 
     if scf_data.mol.ctrl.print_level>0 {
         info!("The total energy: {:20.10} Ha by the initial guess",scf_data.scf_energy);
-        if scf_data.mol.spin_channel==1 {
-            info!("Initial grad_dm l2: {:10.5e} Ha", norm(&scf_data.grad_dm[0], "l2"));
-        } else {
-            info!("Initial grad_dm l2: ({:10.5e},{:10.5e}) Ha",
-                norm(&scf_data.grad_dm[0], "l2"), norm(&scf_data.grad_dm[1], "l2"));
+        match scf_data.scftype {
+            SCFType::RHF | SCFType::ROHF => {
+                info!("Initial grad_dm l2: {:10.5e} Ha", norm(&scf_data.grad_dm[0], "l2"))
+            }
+            SCFType::UHF => {
+                info!("Initial grad_dm l2: ({:10.5e},{:10.5e}) Ha",
+                    norm(&scf_data.grad_dm[0], "l2"), norm(&scf_data.grad_dm[1], "l2"))
+            }
         }
     }
     //let mut scf_continue = true;
@@ -5680,12 +5690,19 @@ impl SCF {
     pub fn get_grad_dm(&self) -> [MatrixFull<f64>; 2] {
         let ovlp_full = self.ovlp.to_matrixfull().unwrap();
         let mut e = [MatrixFull::empty(), MatrixFull::empty()];
+        if let SCFType::ROHF = self.scftype {
+            let dm_tot = self.density_matrix[0].clone() + self.density_matrix[1].clone();
+            let fock = self.roothaan_hamiltonian.as_ref().unwrap().to_matrixfull().unwrap();
+            let grad = get_grad_dm(&fock, &ovlp_full, &dm_tot);
+            return [grad, MatrixFull::empty()];
+        }
         for i_spin in 0..self.mol.spin_channel {
             let f = self.hamiltonian[i_spin].to_matrixfull().unwrap();
             e[i_spin] = get_grad_dm(&f, &ovlp_full, &self.density_matrix[i_spin]);
         }
         e
     }
+
 }
 
 impl SCF {
