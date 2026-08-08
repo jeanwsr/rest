@@ -4042,6 +4042,7 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v01(
     //let mut bm = RIFull::new([num_state,num_basis,num_auxbas], 0.0f64);
     let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
 
+
     if let Some((ri3fn,basbas2baspar,baspar2basbas)) = ri3fn {
         let num_basis = dm[0].size()[0];
         let num_baspair = (num_basis+1)*num_basis/2;
@@ -4050,33 +4051,51 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v01(
             let mut vk_s = &mut vk[i_spin];
             *vk_s = MatrixUpper::new(num_baspair,0.0_f64);
             let dm_s = &dm[i_spin];
-            let (sender, receiver) = channel();
-            ri3fn.par_iter_columns_full().for_each_with(sender,|s, m| {
-
-                // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
-                omp_set_num_threads_wrapper(1);
-
-                let mut tmp_mat = MatrixFull::new([num_basis,num_basis],0.0_f64);
-                let mut reduced_ri3fn = MatrixFull::new([num_basis,num_basis],0.0_f64);
-
-                reduced_ri3fn.iter_matrixupper_mut().unwrap().zip(m.iter()).for_each(|(to, from)| {*to = *from});
-
-                _dsymm(&reduced_ri3fn, dm_s, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
-                let mut vk_sm = MatrixFull::new([num_basis,num_basis],0.0_f64);
-                _dsymm(&reduced_ri3fn, &tmp_mat, &mut vk_sm, 'R', 'U', 1.0, 0.0);
-
-                s.send(vk_sm.to_matrixupper()).unwrap();
-            });
-
-            receiver.into_iter().for_each(|vk_mu_upper| {
-                vk_s.data.iter_mut()
-                    .zip(vk_mu_upper.data.iter()).for_each(|value| {
-                    *value.0 += *value.1
-                })
-            });
+            // ── Preallocated per-thread workspaces + fold/reduce: eliminates the
+            //    per-column 1MB MatrixFull allocations (~157 GB of zeroing per
+            //    batch), the channel sends, and the to_matrixupper copies that
+            //    dominated the old for_each_with(sender) structure. The second
+            //    dsymm accumulates in place (beta=1.0) into a per-thread full
+            //    [N,N] accumulator; the 24 accumulators are merged once. ──
+            let vk_full: MatrixFull<f64> = ri3fn.par_iter_columns_full()
+                .fold(
+                    || (MatrixFull::new([num_basis, num_basis], 0.0),
+                        MatrixFull::new([num_basis, num_basis], 0.0),
+                        MatrixFull::new([num_basis, num_basis], 0.0)),
+                    |(mut b_p, mut tmp_mat, mut vk_loc), m| {
+                        // 展开 ri3fn 列 → b_p 上三角 (dsymm 'U' 只读上三角).
+                        // OpenBLAS stays single-threaded inside the rayon
+                        // parallel region (no nested OpenMP thread explosion).
+                        omp_set_num_threads_wrapper(1);
+                        let mut iter = m.iter();
+                        for nu in 0..num_basis {
+                            for mu in 0..=nu {
+                                b_p[[mu, nu]] = *iter.next().unwrap();
+                            }
+                        }
+                        _dsymm(&b_p, dm_s, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
+                        _dsymm(&b_p, &tmp_mat, &mut vk_loc, 'R', 'U', 1.0, 1.0);
+                        (b_p, tmp_mat, vk_loc)
+                    },
+                )
+                .map(|(_, _, vk_loc)| vk_loc)
+                .reduce(
+                    || MatrixFull::new([num_basis, num_basis], 0.0),
+                    |mut acc, v| {
+                        for i in 0..v.data.len() { acc.data[i] += v.data[i]; }
+                        acc
+                    },
+                );
+            // 合并: 取上三角 (vk_full.data[mu + nu*num_basis], mu<=nu)
+            let mut idx = 0;
+            for nu in 0..num_basis {
+                for mu in 0..=nu {
+                    vk_s.data[idx] = vk_full.data[mu + nu * num_basis];
+                    idx += 1;
+                }
+            }
         }
     }
-
     if scaling_factor!=1.0f64 {
         for i_spin in (0..spin_channel) {
             vk[i_spin].data.par_iter_mut().for_each(|f| *f = *f*scaling_factor)

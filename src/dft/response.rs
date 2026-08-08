@@ -690,6 +690,7 @@ pub fn gen_vind_opt_batched(
         v_ao_batch.push(v_ao);
     }
 
+
     // ── Step 3: Add batched fxc response (KEY Phase A win) ──
     if let Some(cache) = fxc_cache {
         let fxc_batch = compute_fxc_response_ao_cached_batched(cache, &dms);
