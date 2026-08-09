@@ -1733,16 +1733,17 @@ impl RIRHFHessian<'_> {
             }
             let dm0_atom_col_t = rt::asarray((&dm0_atom_col, [ninao, 1].f(), &device));
             for x in 0..3 {
-                // wj1
+                // wj1: staging with ii,j outer + p inner → both ip1 read and
+                // ip1_x_stage write stride-1 (old p-outer/j-inner order had
+                // 7 KB jumps on both sides).
                 let mut ip1_x_stage = vec![0.0; naux * ninao];
-                for p in 0..naux {
-                    for ii in 0..ni {
-                        for j in 0..nao {
-                    ip1_x_stage[p + (ii * nao + j) * naux] =
-                        ip1[x * nao3 * naux + (p0 + ii) * nao * naux + j * naux + p];
-                        }
+                for ii in 0..ni { for j in 0..nao {
+                    let base_s = (ii * nao + j) * naux;
+                    let base_i = x * nao3 * naux + (p0 + ii) * nao * naux + j * naux;
+                    for p in 0..naux {
+                        ip1_x_stage[base_s + p] = ip1[base_i + p];
                     }
-                }
+                }}
                 let ip1_x_t = rt::asarray((&ip1_x_stage, [naux, ninao].f(), &device));
                 let wj1_x_col = (&ip1_x_t % &dm0_atom_col_t); // [naux, 1]
                 let wj1_x_raw = wj1_x_col.into_shape(-1).into_raw();
@@ -1778,19 +1779,12 @@ impl RIRHFHessian<'_> {
         //    (zero-copy F-order views of ip1 are unreliable in rstsr GEMM). ──
         let mut tmpf = vec![0.0; naux * m3];
         {
-            let mut ip1c = vec![0.0; m3 * naux];
-            for x in 0..3 {
-                for i in 0..nao {
-                    for j in 0..nao {
-                        for p in 0..naux {
-                            ip1c[(x * nao * nao + i * nao + j) + p * m3] =
-                                ip1[x * nao3 * naux + i * nao * naux + j * naux + p];
-                        }
-                    }
-                }
-            }
-            let ip1c_t: TsrView<f64> = rt::asarray((&ip1c, [m3, naux].f(), &device));
-            let tmpf_t = &vinv_t % &ip1c_t.t(); // [naux, naux] % [naux, m3] → [naux, m3]
+            // ip1 is row-major [m3, P] which IS F-order [P, m3] (row p, col c)
+            // — zero-copy. tmpf = V⁻¹·ip1ᵀ = V⁻¹ [P,P] @ ip1_view [P, m3],
+            // eliminating the old 2.7 GB ip1c transpose staging (which wrote
+            // with a 2.5 MB column stride, 8× write amplification).
+            let ip1_view: TsrView<f64> = rt::asarray((&ip1, [naux, m3].f(), &device));
+            let tmpf_t = &vinv_t % &ip1_view; // [naux, m3]
             let flat = tmpf_t.into_shape(-1).into_raw();
             tmpf.copy_from_slice(&flat);
         }
@@ -1823,32 +1817,36 @@ impl RIRHFHessian<'_> {
             // ip2_b[y*ni*nao*naux + ii*nao*naux + j*naux + p] = ip2[y, p0+ii, j, p]
 
             // ── wj2[p, y] += Σ_{ii∈block, j} ip2_b[y, ii, j, p] · dm0[(p0+ii), j] ──
-            // (dm0 block column vector; dm0 is symmetric so row-major access is safe)
-            let mut dm0b = vec![0.0; ni * nao];
-            for ii in 0..ni { for j in 0..nao {
-                dm0b[ii * nao + j] = dm0[(p0 + ii) * nao + j];
-            }}
-            let dm0b_t = rt::asarray((&dm0b, [ni * nao, 1].f(), &device));
+            // Explicit SIMD loop (p inner): the staging + [P, ni·N]×[ni·N,1]
+            // GEMM wrote `st` with 7 KB jumps on both sides. The plain loop
+            // reads ip2_b p-contiguous and accumulates into wj2 (24 B stride).
             for y in 0..3 {
-                let m = ni * nao;
-                let mut st = vec![0.0; naux * m];
-                for p in 0..naux { for ii in 0..ni { for j in 0..nao {
-                    st[p + (ii * nao + j) * naux] =
-                        ip2_b[y * ni * nao * naux + ii * nao * naux + j * naux + p];
-                }}}
-                let t = rt::asarray((&st, [naux, m].f(), &device));
-                let col = &t % &dm0b_t; // [naux, 1]
-                let raw = col.into_shape(-1).into_raw();
-                for p in 0..naux { wj2[p * 3 + y] += raw[p]; }
+                for ii in 0..ni { for j in 0..nao {
+                    let dmv = dm0[(p0 + ii) * nao + j];
+                    let base = y * ni * nao * naux + ii * nao * naux + j * naux;
+                    let row = &ip2_b[base..base + naux];
+                    let mut p = 0usize;
+                    while p + 4 <= naux {
+                        wj2[p * 3 + y] += row[p] * dmv;
+                        wj2[(p + 1) * 3 + y] += row[p + 1] * dmv;
+                        wj2[(p + 2) * 3 + y] += row[p + 2] * dmv;
+                        wj2[(p + 3) * 3 + y] += row[p + 3] * dmv;
+                        p += 4;
+                    }
+                    while p < naux { wj2[p * 3 + y] += row[p] * dmv; p += 1; }
+                }}
             }
 
             // ── wki[i, p, y, p0+ii] = Σ_j ip2_b[y, ii, j, p] · dm0[j, i]  (3 GEMMs) ──
             for y in 0..3 {
+                // staging: ii,j outer + p inner → both sides stride-1 (old
+                // j-inner order jumped 7 KB on read and 214 KB on write).
                 let mut st = vec![0.0; ni * naux * nao];
-                for ii in 0..ni { for p in 0..naux { for j in 0..nao {
-                    st[(ii * naux + p) + j * (ni * naux)] =
-                        ip2_b[y * ni * nao * naux + ii * nao * naux + j * naux + p];
-                }}}
+                for ii in 0..ni { for j in 0..nao {
+                    let base_s = ii * naux + j * (ni * naux);
+                    let base_i = y * ni * nao * naux + ii * nao * naux + j * naux;
+                    for p in 0..naux { st[base_s + p] = ip2_b[base_i + p]; }
+                }}
                 let t = rt::asarray((&st, [ni * naux, nao].f(), &device));
                 let wki_y = &t % &dm0_t; // [ni*naux, nao]
                 let raw = wki_y.into_shape(-1).into_raw();
@@ -1862,18 +1860,25 @@ impl RIRHFHessian<'_> {
             //    Step 1: tmp1[ii, p, i] = Σ_u ip2_b[x, ii, u, p] · mc2[u, i]  (symmetry: v=p0+ii)
             //    Step 2: wk2[x, p, i, j] += Σ_ii mc2[p0+ii, j] · tmp1[ii, p, i] ──
             for x in 0..3 {
+                // staging: ii,u outer + p inner → both sides stride-1.
                 let mut st = vec![0.0; ni * naux * nao];
-                for ii in 0..ni { for p in 0..naux { for u in 0..nao {
-                    st[(ii * naux + p) + u * (ni * naux)] =
-                        ip2_b[x * ni * nao * naux + ii * nao * naux + u * naux + p];
-                }}}
+                for ii in 0..ni { for u in 0..nao {
+                    let base_s = ii * naux + u * (ni * naux);
+                    let base_i = x * ni * nao * naux + ii * nao * naux + u * naux;
+                    for p in 0..naux { st[base_s + p] = ip2_b[base_i + p]; }
+                }}
                 let t = rt::asarray((&st, [ni * naux, nao].f(), &device));
                 let tmp1 = &t % &mc2_t.t(); // [ni*naux, nocc]
                 let tmp1_raw = tmp1.into_shape(-1).into_raw();
+                // tv scatter: ii,i outer + p inner → tmp1 read stride-1,
+                // tv write 272 B stride (was 214 KB read jumps).
                 let mut tv = vec![0.0; ni * naux * nocc];
-                for ii in 0..ni { for p in 0..naux { for i in 0..nocc {
-                    tv[ii + (p * nocc + i) * ni] = tmp1_raw[(ii * naux + p) + i * (ni * naux)];
-                }}}
+                for ii in 0..ni { for i in 0..nocc {
+                    let rbase = ii * naux + i * (ni * naux);
+                    for p in 0..naux {
+                        tv[ii + (p * nocc + i) * ni] = tmp1_raw[rbase + p];
+                    }
+                }}
                 let tv_t = rt::asarray((&tv, [ni, naux * nocc].f(), &device));
                 // mc2 block rows [p0..p0+ni] as F-order [nocc, ni]: element (j, ii) = mc2[(p0+ii)*nocc + j]
                 let mut mc2_blk = vec![0.0; nocc * ni];
