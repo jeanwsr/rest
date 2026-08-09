@@ -534,6 +534,9 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
             }
 
             // ── rk_PJI (1 GEMM) ──
+            // Stored p-inner: rk_PJI[p + (j·ni+ii)·P] (F-order [P, N·ni]) so
+            // t1 reads it pg-contiguous (the old [P, N, ni] layout forced
+            // 31 KB jumps in t1's pg loop, 8× amplified).
             let mut rk_PJI = vec![0.0; naux * nao * ni];
             {
                 // staging: j_occ outer, p mid, ii inner → both sides stride-1.
@@ -548,15 +551,17 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                 let rk_P_I_t = rt::asarray((&rk_P_I_stage, [naux * ni, nocc].f(), &device));
                 let rk_PJI_2d = (&rk_P_I_t % &mc2_t);
                 let rk_PJI_raw = rk_PJI_2d.into_shape(-1).into_raw();
-                for p in 0..naux { for ii in 0..ni { for j in 0..nao {
-                    rk_PJI[p * nao * ni + j * ni + ii] =
-                        rk_PJI_raw[(p * ni + ii) + j * (naux * ni)];
-                }}}
+                for j in 0..nao { for ii in 0..ni {
+                    let rbase = j * (naux * ni) + ii;
+                    for p in 0..naux {
+                        rk_PJI[p + (j * ni + ii) * naux] = rk_PJI_raw[rbase + p * ni];
+                    }
+                }}
             }
 
             // ── wk1_pJI via 1 batched GEMM [3*naux, naux] @ [naux, nao*ni] ──
-            let rk_pji_t_g5 = rt::asarray((&rk_PJI, [nao * ni, naux].f(), &device));
-            let wk1_pJI_res = &i21_batch_t % &rk_pji_t_g5.t(); // [3*naux, nao*ni]
+            let rk_pji_t_g5 = rt::asarray((&rk_PJI, [naux, nao * ni].f(), &device));
+            let wk1_pJI_res = &i21_batch_t % &rk_pji_t_g5; // [3*naux, nao*ni]
             // Keep the raw [3P, N·ni] F-order layout: t2 consumes it directly
             // with pg inner (stride-1 both sides), avoiding a 234 MB scatter.
             let wk1_pJI_raw = wk1_pJI_res.into_shape(-1).into_raw();
@@ -598,7 +603,8 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
             let wkp_t_g5 = rt::asarray((&wkp_stage_g5, [naux3, ni_nao].f(), &device));
             let mut rk_pji_rho_stage = vec![0.0; ni_nao * naux];
             for q in 0..naux { for J in 0..nao { for ii in 0..ni {
-                rk_pji_rho_stage[(ii * nao + J) + q * ni_nao] = rk_PJI[q * nao * ni + J * ni + ii];
+                rk_pji_rho_stage[(ii * nao + J) + q * ni_nao] =
+                    rk_PJI[q + (J * ni + ii) * naux];
             }}}
             let rk_pji_rho2c_t = rt::asarray((&rk_pji_rho_stage, [ni_nao, naux].f(), &device));
             let rho2c_res = &wkp_t_g5 % &rk_pji_rho2c_t;
@@ -610,10 +616,12 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
             // T1-T4 for-loops (g5, exchange part)
             for j0 in 0..natm { let (_, aq0, ql) = aux_blk[j0]; if ql == 0 { continue; }
                 let mut t1 = vec![0.0; 9];
+                // rk_PJI stored p-inner: both ip12_i0 and rk_PJI read
+                // pg-contiguous (stride-1) — was 31 KB jumps on rk_PJI.
                 for x in 0..9 { let mut s = 0.0; for ii in 0..ni { for j in 0..nao { for qp in 0..ql {
                     let pg = aq0 + qp;
                     s += ip12_i0[x * ni * nao * naux + ii * nao * naux + j * naux + pg]
-                        * rk_PJI[pg * nao * ni + j * ni + ii];
+                        * rk_PJI[pg + (j * ni + ii) * naux];
                 }}} t1[x] = s; }
                 let mut t2 = vec![0.0; 9];
                 // Read tmpf directly (pg inner, stride-1) instead of the
