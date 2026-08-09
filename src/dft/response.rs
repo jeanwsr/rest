@@ -7,8 +7,8 @@
 /// For HF: vind(dm1) = J[dm1] - 0.5*K[dm1]
 /// For DFT: vind(dm1) = fxc[dm1] + J[dm1] - hyb*K[dm1]
 
-use rest_tensors::{MatrixFull, MatrixUpper};
-use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, omp_set_num_threads_wrapper};
+use rest_tensors::{MatrixFull, MatrixUpper, RIFull};
+use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, _dsymm, omp_set_num_threads_wrapper};
 use crate::scf_io::{SCF, SCFType};
 use crate::dft::num_int::{prepare_fxc_data, fxc_matvec_old,
     eval_ao_batch, eval_rho5_batch};
@@ -437,6 +437,230 @@ fn compute_fxc_response_block(
 /// `fxc_cache`: when `Some`, adds the RKS fxc kernel response using the
 /// precomputed `FxcHessianCache` (PySCF `cache_xc_kernel` analog). Pass
 /// `None` for HF or when no XC contribution is desired.
+// ============================================================================
+// Low-rank CPHF exchange-response (K) precomputation
+//
+// In the CPHF Krylov matvec, dm1 = dp1 + dp1ᵀ with dp1 = C_vir·Z'·C_occᵀ
+// (rank ≤ 2·nocc). The K term
+//     K = Σ_p B_p·dm1·B_pᵀ            (B_p = RI 3-center column, symmetric)
+// then needs only its VO projection:
+//     C_occᵀ·K·C_vir = Σ_p K_p·Z'·N_pᵀ  +  (Σ_p M_p·Z'·L_pᵀ)ᵀ
+// with the four ground-state (z-independent) factors
+//     K_p = C_occᵀ·B_p·C_vir   [nocc, nvir]
+//     N_p = C_virᵀ·B_p·C_occ   [nvir, nocc]
+//     M_p = C_virᵀ·B_p·C_vir   [nvir, nvir]   (symmetric)
+//     L_p = C_occᵀ·B_p·C_occ   [nocc, nocc]   (symmetric)
+// Precomputed once per Hessian; each matvec does 2 batched GEMMs
+// (K_batch·Z', M_batch·Z') + 2 small accumulations. FLOPs per matvec drop
+// from ~2·P·N³ (dsymm pair) to ~2·P·nvir²·nocc (~10× for N=358, nocc=34).
+// ============================================================================
+pub struct KLowRankPrecompute {
+    pub nocc: usize,
+    pub nvir: usize,
+    pub naux: usize,
+    /// K_p [P·nocc, nvir] col-major
+    pub k_batch: MatrixFull<f64>,
+    /// N_p [P·nvir, nocc] col-major
+    pub n_batch: MatrixFull<f64>,
+    /// M_p [P·nvir, nvir] col-major
+    pub m_batch: MatrixFull<f64>,
+    /// L_p [P·nocc, nocc] col-major
+    pub l_batch: MatrixFull<f64>,
+}
+
+impl KLowRankPrecompute {
+    /// Build from the RI 3-center tensor (rimatr preferred, ri3fn fallback)
+    /// and the MO coefficients. Returns None if no RI tensor is available.
+    pub fn new(scf: &SCF, ws: &VindWorkspace) -> Option<Self> {
+        use rayon::prelude::*;
+        let nao = ws.nao;
+        let nocc = ws.nocc;
+        let nvir = ws.nvir;
+        let c_occ = &ws.c_occ;
+        let c_vir = &ws.c_vir;
+        enum Src<'a> {
+            Rim(&'a MatrixFull<f64>, usize), // packed upper [N(N+1)/2, P]
+            Ri3(&'a RIFull<f64>),            // full symmetric [N, N, P]
+        }
+        let src: Src<'_>;
+        let naux;
+        if let Some((ri, _, _)) = &scf.rimatr {
+            naux = ri.size[1];
+            src = Src::Rim(ri, ri.size[0]);
+        } else if let Some(ri3) = &scf.ri3fn {
+            naux = ri3.size[2];
+            src = Src::Ri3(ri3);
+        } else {
+            return None;
+        }
+        if std::env::var("REST_VERIFY_LOWRANK").is_ok() {
+            match &src {
+                Src::Rim(ri, nbp) => eprintln!("DBG lowrank src: rimatr size={:?} naux={}", ri.size, naux),
+                Src::Ri3(ri3) => eprintln!("DBG lowrank src: ri3fn size={:?} naux={}", ri3.size, naux),
+            }
+        }
+        let size_kn = naux * nocc * nvir;
+        let size_nn = naux * nvir * nocc;
+        let size_mm = naux * nvir * nvir;
+        let size_ll = naux * nocc * nocc;
+        // Ordered collect (rayon collect preserves order) then concatenate.
+        let cols: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> = (0..naux)
+            .into_par_iter()
+            .map(|p| {
+                let mut b = vec![0.0; nao * nao];
+                match &src {
+                    Src::Rim(ri, num_baspair) => {
+                        let col = &ri.data[p * num_baspair..(p + 1) * num_baspair];
+                        let mut it = col.iter();
+                        for nu in 0..nao {
+                            for mu in 0..=nu {
+                                let v = *it.next().unwrap();
+                                b[mu + nu * nao] = v;
+                                b[nu + mu * nao] = v;
+                            }
+                        }
+                    }
+                    Src::Ri3(ri3) => {
+                        let col = &ri3.data[p * nao * nao..(p + 1) * nao * nao];
+                        b.copy_from_slice(col);
+                    }
+                }
+                let b_mat = MatrixFull::from_vec([nao, nao], b).unwrap();
+                let mut bcv = MatrixFull::new([nao, nvir], 0.0);
+                _dsymm(&b_mat, c_vir, &mut bcv, 'L', 'U', 1.0, 0.0); // B_p·C_vir
+                let mut bco = MatrixFull::new([nao, nocc], 0.0);
+                _dsymm(&b_mat, c_occ, &mut bco, 'L', 'U', 1.0, 0.0); // B_p·C_occ
+                let mut kp = MatrixFull::new([nocc, nvir], 0.0);
+                _dgemm_full(c_occ, 'T', &bcv, 'N', &mut kp, 1.0, 0.0);
+                let mut np = MatrixFull::new([nvir, nocc], 0.0);
+                _dgemm_full(c_vir, 'T', &bco, 'N', &mut np, 1.0, 0.0);
+                let mut mp = MatrixFull::new([nvir, nvir], 0.0);
+                _dgemm_full(c_vir, 'T', &bcv, 'N', &mut mp, 1.0, 0.0);
+                let mut lp = MatrixFull::new([nocc, nocc], 0.0);
+                _dgemm_full(c_occ, 'T', &bco, 'N', &mut lp, 1.0, 0.0);
+                (kp.data, np.data, mp.data, lp.data)
+            })
+            .collect();
+        let mut k_p = vec![0.0; size_kn];
+        let mut n_p = vec![0.0; size_nn];
+        let mut m_p = vec![0.0; size_mm];
+        let mut l_p = vec![0.0; size_ll];
+        // Scatter each per-column block into the batched col-major layout:
+        //   K_batch[(p,i) + a·(P·nocc)]  etc. (the raw kp.data is [nocc,nvir]
+        //   col-major with a-stride nocc — NOT the batched stride P·nocc).
+        for (p, (kp, np, mp, lp)) in cols.iter().enumerate() {
+            for a in 0..nvir {
+                for i in 0..nocc {
+                    k_p[p * nocc + i + a * nocc * naux] = kp[i + a * nocc];
+                }
+            }
+            for c in 0..nocc {
+                for a in 0..nvir {
+                    n_p[p * nvir + a + c * nvir * naux] = np[a + c * nvir];
+                }
+            }
+            for v in 0..nvir {
+                for u in 0..nvir {
+                    m_p[p * nvir + u + v * nvir * naux] = mp[u + v * nvir];
+                }
+            }
+            for c in 0..nocc {
+                for i in 0..nocc {
+                    l_p[p * nocc + i + c * nocc * naux] = lp[i + c * nocc];
+                }
+            }
+        }
+        Some(KLowRankPrecompute {
+            nocc, nvir, naux,
+            k_batch: MatrixFull::from_vec([nocc * naux, nvir], k_p).unwrap(),
+            n_batch: MatrixFull::from_vec([nvir * naux, nocc], n_p).unwrap(),
+            m_batch: MatrixFull::from_vec([nvir * naux, nvir], m_p).unwrap(),
+            l_batch: MatrixFull::from_vec([nocc * naux, nocc], l_p).unwrap(),
+        })
+    }
+}
+
+/// K contribution to the VO-projected CPHF response for one RHS z (flat
+/// [nocc·nvir], index i + a·nocc — same layout as the z input).
+///
+///   C_occᵀ·K·C_vir = Σ_p K_p·Z'·N_pᵀ  +  (Σ_p M_p·Z'·L_pᵀ)ᵀ
+///
+/// Two batched GEMMs (K_batch·Z', M_batch·Z') + two parallel accumulations.
+/// FLOPs: ~2·P·(nvir²·nocc + nocc²·nvir) vs ~2·P·N³ for the dsymm pair.
+pub fn k_vo_lowrank(pre: &KLowRankPrecompute, z: &[f64]) -> Vec<f64> {
+    use rayon::prelude::*;
+    let nocc = pre.nocc;
+    let nvir = pre.nvir;
+    let naux = pre.naux;
+    // Z' [nvir, nocc] col-major: Z'[u + c·nvir] = 2·z[c + u·nocc]
+    let mut zp = vec![0.0; nvir * nocc];
+    for u in 0..nvir {
+        for c in 0..nocc {
+            zp[u + c * nvir] = 2.0 * z[c + u * nocc];
+        }
+    }
+    let z_mat = MatrixFull::from_vec([nvir, nocc], zp).unwrap();
+    // Tk = K_batch [P·nocc, nvir] @ Z' → [P·nocc, nocc]
+    let mut tk = MatrixFull::new([nocc * naux, nocc], 0.0);
+    _dgemm_full(&pre.k_batch, 'N', &z_mat, 'N', &mut tk, 1.0, 0.0);
+    // T = M_batch [P·nvir, nvir] @ Z' → [P·nvir, nocc]
+    let mut t = MatrixFull::new([nvir * naux, nocc], 0.0);
+    _dgemm_full(&pre.m_batch, 'N', &z_mat, 'N', &mut t, 1.0, 0.0);
+    let tk_d = &tk.data;
+    let t_d = &t.data;
+    let n_p = &pre.n_batch.data;
+    let l_p = &pre.l_batch.data;
+    // vo_pos[i,a] += Σ_c Tk_p[i,c]·N_p[a,c] ; vo_neg[u,c] += Σ_d T_p[u,d]·L_p[c,d]
+    let (pos, neg) = (0..naux)
+        .into_par_iter()
+        .fold(
+            || (vec![0.0; nocc * nvir], vec![0.0; nvir * nocc]),
+            |(mut pos, mut neg), p| {
+                for i in 0..nocc {
+                    for a in 0..nvir {
+                        let mut s = 0.0;
+                        for c in 0..nocc {
+                            s += tk_d[p * nocc + i + c * nocc * naux]
+                                * n_p[p * nvir + a + c * nvir * naux];
+                        }
+                        pos[i + a * nocc] += s;
+                    }
+                }
+                for u in 0..nvir {
+                    for c in 0..nocc {
+                        let mut s = 0.0;
+                        for d in 0..nocc {
+                            s += t_d[p * nvir + u + d * nvir * naux]
+                                * l_p[p * nocc + c + d * nocc * naux];
+                        }
+                        neg[u + c * nvir] += s;
+                    }
+                }
+                (pos, neg)
+            },
+        )
+        .reduce(
+            || (vec![0.0; nocc * nvir], vec![0.0; nvir * nocc]),
+            |(mut a1, mut b1), (a2, b2)| {
+                for k in 0..a1.len() {
+                    a1[k] += a2[k];
+                }
+                for k in 0..b1.len() {
+                    b1[k] += b2[k];
+                }
+                (a1, b1)
+            },
+        );
+    // result[i + a·nocc] = vo_pos[i,a] + vo_neg[a,i]
+    let mut res = vec![0.0; nocc * nvir];
+    for i in 0..nocc {
+        for a in 0..nvir {
+            res[i + a * nocc] = pos[i + a * nocc] + neg[a + i * nvir];
+        }
+    }
+    res
+}
+
 pub fn gen_vind_opt(
     scf: &SCF,
     ws: &VindWorkspace,
@@ -596,6 +820,7 @@ pub fn gen_vind_opt_batched(
     fxc_cache: Option<&FxcHessianCache>,
     z_oo_batch: Option<&[&[f64]]>,    // n_rhs × nocc²  (None or all zeros for Krylov)
     z_fo_batch: Option<&[&[f64]]>,    // n_rhs × nfrozen*nocc
+    k_lowrank: Option<&KLowRankPrecompute>, // low-rank K path (Krylov matvec)
 ) -> Vec<Vec<f64>> {
     let nao = ws.nao;
     let nocc = ws.nocc;
@@ -604,6 +829,12 @@ pub fn gen_vind_opt_batched(
     let dim = ws.dim;
     let n_rhs = z_vo_batch.len();
     if n_rhs == 0 { return Vec::new(); }
+    // Low-rank K applies only when dm1 is the pure VO low-rank form
+    // (no OO/FO blocks) and there are no frozen orbitals to project onto.
+    let use_lowrank_k = k_lowrank.is_some()
+        && z_oo_batch.is_none()
+        && z_fo_batch.is_none()
+        && nfrozen == 0;
 
     // ── Step 1: Build AO density matrix per RHS ──
     // dm1[i] = dp1[i] + dp1[i]^T (+ OO and FO contributions if provided)
@@ -671,13 +902,44 @@ pub fn gen_vind_opt_batched(
     };
 
     let mut v_ao_batch: Vec<MatrixFull<f64>> = Vec::with_capacity(n_rhs);
+    // Low-rank K: precompute the VO projection once per RHS (bypasses the
+    // full [N,N] K assembly + Step-4 projection entirely).
+    let mut k_vo_batch: Option<Vec<Vec<f64>>> = if use_lowrank_k {
+        Some(
+            z_vo_batch
+                .iter()
+                .map(|z| k_vo_lowrank(k_lowrank.unwrap(), z))
+                .collect(),
+        )
+    } else {
+        None
+    };
+    if std::env::var("REST_VERIFY_LOWRANK").is_ok() && use_lowrank_k {
+        for i in 0..n_rhs {
+            let dm_vec = vec![dms[i].clone()];
+            let k_full = compute_k_upper(scf, &dm_vec).to_matrixfull()
+                .unwrap_or_else(|| panic!("K to_matrixfull failed"));
+            let mut tmp_vo = MatrixFull::new([nao, nvir], 0.0);
+            _dgemm_full(&k_full, 'N', &ws.c_vir, 'N', &mut tmp_vo, 1.0, 0.0);
+            let mut vo_orig = MatrixFull::new([nocc, nvir], 0.0);
+            _dgemm_full(&ws.c_occ, 'T', &tmp_vo, 'N', &mut vo_orig, 1.0, 0.0);
+            let kv = &k_vo_batch.as_ref().unwrap()[i];
+            let mut mx = 0.0f64;
+            for a in 0..nvir { for r in 0..nocc {
+                let d = (vo_orig[[r, a]] - kv[r + a * nocc]).abs();
+                if d > mx { mx = d; }
+            }}
+            let norm = (0..nvir*nocc).map(|k| vo_orig.data[k]*vo_orig.data[k]).sum::<f64>().sqrt();
+            eprintln!("DBG lowrank[{}]: max_diff={:.3e} orig_norm={:.3e}", i, mx, norm);
+        }
+    }
     for i in 0..n_rhs {
         let dm_vec = vec![dms[i].clone()];
         let j_full = compute_j_upper(scf, &dm_vec).to_matrixfull()
             .unwrap_or_else(|| panic!("J to_matrixfull failed"));
         // Skip the exchange response for pure DFAs (k_scaling == 0); K is
         // O(naux·nao³) and would dominate the per-RHS matvec cost as waste.
-        let k_full = if k_scaling != 0.0 {
+        let k_full = if k_scaling != 0.0 && !use_lowrank_k {
             compute_k_upper(scf, &dm_vec).to_matrixfull()
                 .unwrap_or_else(|| panic!("K to_matrixfull failed"))
         } else {
@@ -720,6 +982,13 @@ pub fn gen_vind_opt_batched(
         let mut res = vec![0.0; total];
         for k in 0..nfrozen { for r in 0..nocc { res[r + k * nocc] = fro_result[[r, k]]; }}
         for a in 0..nvir { for r in 0..nocc { res[fo_size + r + a * nocc] = vo_result[[r, a]]; }}
+        // Low-rank K: the K contribution to the VO projection was computed
+        // directly in MO space — subtract k_scaling·K_vo.
+        if let Some(kvb) = &k_vo_batch {
+            for k in 0..dim {
+                res[fo_size + k] -= k_scaling * kvb[i][k];
+            }
+        }
         results.push(res);
     }
     results

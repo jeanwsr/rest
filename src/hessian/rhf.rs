@@ -3445,6 +3445,7 @@ impl RIRHFHessian<'_> {
             fxc_cache_ref,
             Some(&z_oo_refs),
             None,
+            None, // OO path keeps the dense K (z_oo is present)
         );
         for (k, _) in rhs_meta.iter().enumerate() {
             // g_oo[ia] = VO response of the OO perturbation at (ia_row, ia_col).

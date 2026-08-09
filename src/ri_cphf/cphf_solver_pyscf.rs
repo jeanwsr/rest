@@ -12,7 +12,7 @@ use rest_tensors::MatrixFull;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, _dsolve};
 use crate::scf_io::SCF;
 use crate::ri_tddft::utils::tddft_occupation_parameters;
-use crate::dft::response::{gen_vind_opt, gen_vind_opt_batched, VindWorkspace, FxcHessianCache};
+use crate::dft::response::{gen_vind_opt, gen_vind_opt_batched, VindWorkspace, FxcHessianCache, KLowRankPrecompute};
 
 /// Solves (I + G̃)U = -(h1 - s1·e_i)·e_ai  in (nmo, nocc) space.
 ///
@@ -569,12 +569,14 @@ impl CPHFSolverPySCF {
         scf: &SCF,
         fxc_cache: Option<&FxcHessianCache>,
         z_vo_batch: &[&[f64]],
+        k_lowrank: Option<&KLowRankPrecompute>,
     ) -> Vec<Vec<f64>> {
         let n_rhs = z_vo_batch.len();
         // Direct batched response: z_vo_batch is already in the (nvir*nocc)
-        // layout expected by gen_vind_opt_batched. OO/FO are zero (None).
+        // layout expected by gen_vind_opt_batched. OO/FO are zero (None); the
+        // low-rank K path is used when the precomputation is available.
         let resp_full_batch = gen_vind_opt_batched(
-            scf, &self.ws, z_vo_batch, fxc_cache, None, None,
+            scf, &self.ws, z_vo_batch, fxc_cache, None, None, k_lowrank,
         );
 
         // Each resp_full is laid out as [frozen_resp(fo_size), VO_resp(dim)].
@@ -651,6 +653,10 @@ impl CPHFSolverPySCF {
         let mut total_matvecs: usize = 0;
         let mut cycles_done: usize = 0;
 
+        // Low-rank exchange-response precomputation (ground-state, built once
+        // per solve; None if no RI tensor or not applicable).
+        let k_lowrank = KLowRankPrecompute::new(scf, &self.ws);
+
         for cycle in 0..max_cycle {
             if x1.is_empty() { break; }
             let n_active = x1.len();
@@ -659,7 +665,7 @@ impl CPHFSolverPySCF {
 
             // ── Block matvec on active vectors ───────────────────────────
             let x1_refs: Vec<&[f64]> = x1.iter().map(|v| &v[..]).collect();
-            let axt_batch = self.matvec_vo_batched(scf, fxc_cache, &x1_refs);
+            let axt_batch = self.matvec_vo_batched(scf, fxc_cache, &x1_refs, k_lowrank.as_ref());
 
             // ── Extend shared subspace with current active vectors ───────
             for k in 0..n_active {
