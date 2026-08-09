@@ -1569,7 +1569,15 @@ impl RIRHFHessian<'_> {
         // coexist: ipip1 → Phase 1b, ip1 → Phase 2 (kept through g4), ip2 →
         // Phase 3b, ipv → Phase 4 G3/G4. This keeps the calc_ej_ek peak RSS
         // down to ~the largest single 3c derivative tensor + staging buffers.
+        let mem_trace = std::env::var("REST_MEM_TRACE").is_ok();
+        let mt = |tag: &str| {
+            if mem_trace {
+                eprintln!("MEMTRACE {:<22} RSS = {:.1} MiB",
+                    tag, memory_monitor::current_rss_mb());
+            }
+        };
         let t3c  = int3c("int3c2e");        // (N,N,P)
+        mt("t3c+ip1 alloc");
         let ip1  = int3c("int3c2e_ip1");    // (3,N,N,P)
         // H2 optimization: cache the two 2c/3c integrals that `calc_h1ao`
         // would otherwise recompute (int3c2e is moved in after Phase 1a).
@@ -1687,6 +1695,7 @@ impl RIRHFHessian<'_> {
         self.shared_integrals.as_mut().unwrap().rk = rk.clone();
 
         self.timings.push(("  p1a_rhoj0_rhok0", _tp1a.elapsed()));
+        mt("after Phase1a");
         // ══ Phase 1b: vj1_diag, vk1_diag (prototype L68-76) ══
         //
         // The 9·N²·P derivative integral `int3c2e_ipip1` is never materialized
@@ -1793,6 +1802,7 @@ impl RIRHFHessian<'_> {
         drop(rkm_jpl_stage);
 
         self.timings.push(("  p1b_vjd_vkd", _tp1b.elapsed()));
+        mt("after Phase1b");
         // ══ Phase 2: rhoj1, wj1 (prototype L79-88) ══
         let _tp2 = std::time::Instant::now();
         let m3 = 3 * nao * nao;
@@ -1873,6 +1883,7 @@ impl RIRHFHessian<'_> {
         self.timings.push(("  p2_rhoj1_wj1", _tp2.elapsed()));
 
 
+        mt("after Phase2");
         // ══ Phase 3b: wj_ip2, wk_ip2_Ipk, wk_ip2_P__ (prototype L92-97) ══
         //
         // The 3·N²·P derivative integral `int3c2e_ip2` is never materialized
@@ -1978,6 +1989,7 @@ impl RIRHFHessian<'_> {
         }
 
         self.timings.push(("  p3b_wj2_wk2", _tp3b.elapsed()));
+        mt("after Phase3b");
         // ══ Phase 3c: rhok0_P__, rho2c_0, int2c_ip_ip (prototype L98-106) ══
         let _tp3c = std::time::Instant::now();
         let mut rkoo = vec![0.0; naux * nocc * nocc];
@@ -2108,6 +2120,7 @@ impl RIRHFHessian<'_> {
 
         // Phase 4: Contribution arrays
         // ══════════════════════════════════════════════════════════
+        mt("after Phase3c");
         let _tp4 = std::time::Instant::now();
         let aa9 = natm * natm * 9;
         let mut ej_basic = vec![0.0; aa9];
@@ -2188,6 +2201,7 @@ impl RIRHFHessian<'_> {
             self.timings.push(("  g3_g4_vj1_vk1", _t_g4.elapsed()));
         }
 
+        mt("after g3_g4");
         // g4 is the last consumer of ip1 — free it before g5 (g5 reads tmpf).
         drop(ip1);
 
@@ -2202,6 +2216,7 @@ impl RIRHFHessian<'_> {
         }
 
         // g5 is the last consumer of tmpf — free it before the ipip2 blocks.
+        mt("after g5_g8");
         drop(tmpf);
 
         // ipip2 (9·N²·P) is evaluated per-aux-atom block inside g6_g9_ri2d_blas,
