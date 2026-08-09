@@ -1641,23 +1641,32 @@ impl RIRHFHessian<'_> {
             }
 
             // ── vkd 块: vkd[x, p0+ii, l] = Σ_{p,j} ipip1_b[x, ii, j, p] · rkm[p, l, j] ──
-            // per x: [ni, nao*naux] @ [nao*naux, nao] → [ni, nao]
-            for x in 0..9 {
-                let mut st = vec![0.0; ni * nao * naux];
-                for ii in 0..ni {
-                    for j in 0..nao {
-                        for p in 0..naux {
-                            st[ii + (j * naux + p) * ni] =
-                                ipip1_b[x * ni * nao * naux + ii * nao * naux + j * naux + p];
+            // All 9 x-components share rkm_jpl (0.9 GB, re-read 9× per atom
+            // before). Merging the x dimension into one [9·ni, N·P]@[N·P, N]
+            // GEMM reads rkm_jpl once per atom and doubles BLAS efficiency
+            // (M=180 vs M=20): ~130 GB less traffic, ~2× faster GEMM.
+            {
+                let m9 = 9 * ni;
+                let mut st_all = vec![0.0; m9 * nao * naux];
+                for x in 0..9 {
+                    for ii in 0..ni {
+                        for j in 0..nao {
+                            for p in 0..naux {
+                                st_all[(x * ni + ii) + (j * naux + p) * m9] =
+                                    ipip1_b[x * ni * nao * naux + ii * nao * naux + j * naux + p];
+                            }
                         }
                     }
                 }
-                let t = rt::asarray((&st, [ni, nao * naux].f(), &device));
-                let vkd_x = (&t % &rkm_jpl_t); // [ni, nao]
-                let raw = vkd_x.into_shape(-1).into_raw();
-                for ii in 0..ni {
-                    for l in 0..nao {
-                        vkd[x * nao3 + (p0 + ii) * nao + l] = raw[ii + l * ni];
+                let t_all = rt::asarray((&st_all, [m9, nao * naux].f(), &device));
+                let vkd_all = (&t_all % &rkm_jpl_t); // [9·ni, nao]
+                let raw = vkd_all.into_shape(-1).into_raw();
+                for x in 0..9 {
+                    for ii in 0..ni {
+                        for l in 0..nao {
+                            vkd[x * nao3 + (p0 + ii) * nao + l] =
+                                raw[(x * ni + ii) + l * m9];
+                        }
                     }
                 }
             }
