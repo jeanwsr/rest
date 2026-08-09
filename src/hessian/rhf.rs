@@ -410,12 +410,23 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, ip1: &[f64], out_vj1: &mut [f64], out_v
             let out_b: [f64; 9];
             {
                 let mut z2_h = vec![0.0; m_h * 3 * qj];
-                for p in 0..naux { for a in 0..nocc {
-                    let row = p * nocc + a;
-                    for y in 0..3 { for k in 0..qj {
-                        z2_h[row + (y * qj + k) * m_h] =
-                            z2[(p * 3 + y) * qj + k + a * m_z2];
-                    }}
+                // Blocked staging: (a,k) 8×16 blocks — z2 read k-contiguous
+                // and z2_h write a-contiguous (both full cache lines), vs the
+                // old k-inner order writing z2_h at a 2.5 MB column stride.
+                for p in 0..naux { for y in 0..3 {
+                    for ab in (0..nocc).step_by(8) {
+                        let ae = (ab + 8).min(nocc);
+                        for kb in (0..qj).step_by(16) {
+                            let ke = (kb + 16).min(qj);
+                            for a in ab..ae {
+                                let rbase = (p * 3 + y) * qj + a * m_z2;
+                                for k in kb..ke {
+                                    z2_h[(p * nocc + a) + (y * qj + k) * m_h] =
+                                        z2[rbase + k];
+                                }
+                            }
+                        }
+                    }
                 }}
                 let w2_h_t = rt::asarray((&w2_h, [3 * ni, m_h].f(), &device));
                 let z2_h_t = rt::asarray((&z2_h, [m_h, 3 * qj].f(), &device));
@@ -1769,32 +1780,27 @@ impl RIRHFHessian<'_> {
         // GEMM: wj1_x_col[naux, 1] = ip1_x_atom_2d @ dm0_atom_col
         // scatter: wj1[ib*naux*3 + p*3 + x] = wj1_x_col_raw[p]
         for (ib, &(_, p0, ni)) in blk.iter().enumerate() {
-            let ninao = ni * nao;
-            let mut dm0_atom_col = vec![0.0; ninao];
-            for ii in 0..ni {
-                for j in 0..nao {
-                dm0_atom_col[ii * nao + j] = dm0[(p0 + ii) * nao + j];
-                }
-            }
-            let dm0_atom_col_t = rt::asarray((&dm0_atom_col, [ninao, 1].f(), &device));
+            // wj1[ib,p,x] = Σ_{ii,j} ip1[x,p0+ii,j,p]·dm0[(p0+ii),j]
+            // Explicit SIMD loop (p inner): ip1 read p-contiguous, wj1
+            // accumulate at 24 B stride. The old staging was 78 MB/atom × 3 x
+            // (stride-1 after reorder) + a bandwidth-bound [P, ni·N]×[ni·N,1]
+            // matvec; the plain loop is pure streaming.
             for x in 0..3 {
-                // wj1: staging with ii,j outer + p inner → both ip1 read and
-                // ip1_x_stage write stride-1 (old p-outer/j-inner order had
-                // 7 KB jumps on both sides).
-                let mut ip1_x_stage = vec![0.0; naux * ninao];
                 for ii in 0..ni { for j in 0..nao {
-                    let base_s = (ii * nao + j) * naux;
-                    let base_i = x * nao3 * naux + (p0 + ii) * nao * naux + j * naux;
-                    for p in 0..naux {
-                        ip1_x_stage[base_s + p] = ip1[base_i + p];
+                    let dmv = dm0[(p0 + ii) * nao + j];
+                    let base = x * nao3 * naux + (p0 + ii) * nao * naux + j * naux;
+                    let row = &ip1[base..base + naux];
+                    let wbase = ib * naux * 3 + x;
+                    let mut p = 0usize;
+                    while p + 4 <= naux {
+                        wj1[wbase + p * 3] += row[p] * dmv;
+                        wj1[wbase + (p + 1) * 3] += row[p + 1] * dmv;
+                        wj1[wbase + (p + 2) * 3] += row[p + 2] * dmv;
+                        wj1[wbase + (p + 3) * 3] += row[p + 3] * dmv;
+                        p += 4;
                     }
+                    while p < naux { wj1[wbase + p * 3] += row[p] * dmv; p += 1; }
                 }}
-                let ip1_x_t = rt::asarray((&ip1_x_stage, [naux, ninao].f(), &device));
-                let wj1_x_col = (&ip1_x_t % &dm0_atom_col_t); // [naux, 1]
-                let wj1_x_raw = wj1_x_col.into_shape(-1).into_raw();
-                for p in 0..naux {
-                    wj1[ib * naux * 3 + p * 3 + x] = wj1_x_raw[p];
-                }
             }
         }
         // ── rj1 = V⁻¹ @ wj1 :  rj1[ib,p,x] = Σ_q V⁻¹[p,q]·wj1[ib,q,x]  (1 GEMM) ──
