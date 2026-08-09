@@ -219,21 +219,25 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, ip1: &[f64], out_vj1: &mut [f64], out_v
         // ── G3: ej_vj1[i0, j0, c] = Σ_{ii∈i0, j∈j0} [Σ_p ipv[c,ii,j,p]·r0[p]] · dm0[j, ii] · 2 ──
         // Step 1: vj1_mat[c, ii, j] = Σ_p ipv_i0[c,ii,j,p]·r0[p]  (1 GEMM)
         let mut vj1_mat = vec![0.0; 9 * ni * nao];
-        {
-            let m = 9 * ni * nao;
-            let mut st = vec![0.0; m * naux];
-            for c in 0..9 { for ii in 0..ni { for j in 0..nao { for p in 0..naux {
-                st[(c * ni * nao + ii * nao + j) + p * m] =
-                    ipv_i0[c * ni * nao * naux + ii * nao * naux + j * naux + p];
-            }}}}
-            let t = rt::asarray((&st, [m, naux].f(), &device));
-            let r0_col = rt::asarray((r0, [naux, 1].f(), &device));
-            let col = &t % &r0_col; // [m, 1]
-            let raw = col.into_shape(-1).into_raw();
-            for c in 0..9 { for ii in 0..ni { for j in 0..nao {
-                vj1_mat[c * ni * nao + ii * nao + j] = raw[c * ni * nao + ii * nao + j];
-            }}}
-        }
+        // Explicit SIMD-friendly loop instead of staging+GEMM: the staging
+        // transpose wrote with a 1MB column stride (cache-hostile), and the
+        // [9·ni·N, P]×[P,1] GEMM is a bandwidth-bound matvec. The plain loop
+        // reads ipv (p contiguous) and r0 (L2-resident) at full DRAM rate.
+        for c in 0..9 { for ii in 0..ni { for j in 0..nao {
+            let base = c * ni * nao * naux + ii * nao * naux + j * naux;
+            let row = &ipv_i0[base..base + naux];
+            let mut s0 = 0.0f64; let mut s1 = 0.0f64; let mut s2 = 0.0f64; let mut s3 = 0.0f64;
+            let mut p = 0usize;
+            while p + 4 <= naux {
+                s0 += row[p] * r0[p];
+                s1 += row[p + 1] * r0[p + 1];
+                s2 += row[p + 2] * r0[p + 2];
+                s3 += row[p + 3] * r0[p + 3];
+                p += 4;
+            }
+            while p < naux { s0 += row[p] * r0[p]; p += 1; }
+            vj1_mat[c * ni * nao + ii * nao + j] = s0 + s1 + s2 + s3;
+        }}}
         for j0 in 0..=i0 {
             let (_, q0, qj) = blk[j0];
             if qj == 0 { continue; }
@@ -257,13 +261,15 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, ip1: &[f64], out_vj1: &mut [f64], out_v
         let m_w2 = 3 * ni * naux;
         let w2: Vec<f64>;
         {
+            // Cache-friendly staging: j outer, p inner → both `a` (row-major
+            // [m_w2, N] cols contiguous) and ip1 (p fastest) write/read with
+            // stride 1. The old p-outer/j-inner order wrote `a` with a
+            // 3·ni·P-element column stride (655 KB jumps, cache-hostile).
             let mut a = vec![0.0; m_w2 * nao];
-            for x in 0..3 { for i in 0..ni { for p in 0..naux {
-                let row = (x * ni + i) * naux + p;
-                for j in 0..nao {
-                    a[row + j * m_w2] =
-                        ip1[x * nao3 * naux + (p0 + i) * nao * naux + j * naux + p];
-                }
+            for x in 0..3 { for i in 0..ni { for j in 0..nao {
+                let ba = (x * ni + i) * naux + j * m_w2;
+                let bi = x * nao3 * naux + (p0 + i) * nao * naux + j * naux;
+                for p in 0..naux { a[ba + p] = ip1[bi + p]; }
             }}}
             let a_t = rt::asarray((&a, [m_w2, nao].f(), &device));
             let w2_t = &a_t % &mc2_t_full.t(); // [m_w2, O]
@@ -666,6 +672,7 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
         }
     }
 }
+
 /// g6 (ek_ri2d) + g9 (ej_ri2d) combined, per-aux-atom streaming implementation.
 ///
 /// The 9·N²·P derivative integral `int3c2e_ipip2` is never materialized in
@@ -2144,8 +2151,7 @@ impl RIRHFHessian<'_> {
             ek[i] = ek_vkd[i] + ek_vk1[i] + ek_ri1[i] + ek_ri2d[i] + ek_ri2o[i];
         }
         self.timings.push(("  phases_4-sum", _tp4.elapsed()));
-        self.timings
-            .push(("  ej_ek: contributions", _tej.elapsed()));
+        self.timings.push(("  ej_ek: contributions", _tej.elapsed()));
         // Symmetrize: (i0,j0) → (j0,i0) by copying
         for i0 in 0..natm {
             for j0 in 0..i0 {
