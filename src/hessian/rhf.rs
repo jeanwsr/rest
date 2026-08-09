@@ -657,17 +657,33 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                         s += rho2c_PQ[x * naux * naux + qg * naux + paux] * i21[y * naux * naux + qg * naux + paux];
                 }} t3[x*3+y] = s; }}
                 let mut t4 = vec![0.0; 9];
-                // tmpf direct read as in t2; wk1_IpJ consumed with j inner
-                // (contiguous per (ii,pg,y) row).
-                for x in 0..3 { for y in 0..3 { for ii in 0..ni { for j in 0..nao {
-                    let c = x * nao3 + (p0 + ii) * nao + j;
+                // tmpf direct read as in t2. wk1_IpJ is [ni, P, 3, N] (j
+                // contiguous) while the pg-inner loop wants pg contiguous —
+                // blocked (j 64 × pg 32) loop: tmpf reads pg-contiguous and
+                // wk1_IpJ reads j-contiguous within each block, no jumps
+                // (the old pg-inner order jumped 2.9 KB on wk1_IpJ, 8×
+                // amplified over 234 MB/atom).
+                for x in 0..3 { for y in 0..3 {
                     let mut s = 0.0;
-                    for qp in 0..ql { let pg = aq0 + qp;
-                        s += tmpf[pg + c * naux]
-                            * wk1_IpJ[ii * naux * 3 * nao + pg * 3 * nao + y * nao + j];
+                    for ii in 0..ni {
+                        for jb in (0..nao).step_by(64) {
+                            let je = (jb + 64).min(nao);
+                            for pb in (0..ql).step_by(32) {
+                                let pe = (pb + 32).min(ql);
+                                for j in jb..je {
+                                    let c = x * nao3 + (p0 + ii) * nao + j;
+                                    let wrow = ii * naux * 3 * nao + y * nao + j;
+                                    for pp in pb..pe {
+                                        let pg = aq0 + pp;
+                                        s += tmpf[pg + c * naux]
+                                            * wk1_IpJ[wrow + pg * 3 * nao];
+                                    }
+                                }
+                            }
+                        }
                     }
-                    t4[x * 3 + y] += s;
-                }}}}
+                    t4[x * 3 + y] = s;
+                }}
                 for x in 0..3 { for y in 0..3 {
                     let v = t1[x*3+y] - t2[x*3+y] - t3[x*3+y] + t4[x*3+y];
                     out_ek[i_t(i0,j0,x,y)] += v;
