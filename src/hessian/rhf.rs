@@ -378,12 +378,27 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, ip1: &[f64], out_vj1: &mut [f64], out_v
                 let z = &z2_a_t % &mc2_blk2_t; // [m_z, O]
                 let z_raw = z.into_shape(-1).into_raw();
                 let mut z_a = vec![0.0; m_ao * 3];
-                for p in 0..naux { for b in 0..nocc { for a in 0..nocc {
-                    let row = (p * nocc + b) * nocc + a;
-                    for y in 0..3 {
-                        z_a[row + y * m_ao] = z_raw[(p * 3 + y) * nocc + b + a * m_z];
+                // Blocked transpose: y outer, (a,b) 8×8 blocks — z_raw read
+                // b-contiguous (full cache line) and z_a write a-contiguous
+                // (full cache line). The old y-inner order wrote z_a at a
+                // 2.5 MB column stride (8× write amplification, ~1.5 s).
+                for y in 0..3 {
+                    for p in 0..naux {
+                        for ab in (0..nocc).step_by(8) {
+                            let ae = (ab + 8).min(nocc);
+                            for bb in (0..nocc).step_by(8) {
+                                let be = (bb + 8).min(nocc);
+                                for a in ab..ae {
+                                    let rbase = (p * 3 + y) * nocc + a * m_z;
+                                    for b in bb..be {
+                                        z_a[((p * nocc + b) * nocc + a) + y * m_ao] =
+                                            z_raw[rbase + b];
+                                    }
+                                }
+                            }
+                        }
                     }
-                }}}
+                }
                 let w_a_t = rt::asarray((&w_a, [3, m_ao].f(), &device));
                 let z_a_t = rt::asarray((&z_a, [m_ao, 3].f(), &device));
                 let oa = &w_a_t % &z_a_t; // [3, 3]
@@ -1536,20 +1551,23 @@ impl RIRHFHessian<'_> {
         //   result element (p, 0) = Σ_{i,j} t3c[i, j, p] · dm0[i, j] = r0r[p]  ✓
         let mut r0r = vec![0.0; naux];
         {
-            let mut t3c_pij_stage = vec![0.0; naux * nao3];
-            for p in 0..naux {
-                for i in 0..nao {
-                    for j in 0..nao {
-                        t3c_pij_stage[p + (i * nao + j) * naux] =
-                            t3c[i * nao * naux + j * naux + p];
-                    }
+            // Explicit SIMD loop: r0r[p] = Σ_{i,j} t3c[i,j,p]·dm0[i,j], p inner
+            // (t3c read p-contiguous, r0r accumulate contiguous). The old
+            // staging wrote t3c_pij with 7 KB jumps on both sides over 902 MB.
+            for i in 0..nao { for j in 0..nao {
+                let dmv = dm0[i * nao + j];
+                let base = i * nao * naux + j * naux;
+                let row = &t3c[base..base + naux];
+                let mut p = 0usize;
+                while p + 4 <= naux {
+                    r0r[p] += row[p] * dmv;
+                    r0r[p + 1] += row[p + 1] * dmv;
+                    r0r[p + 2] += row[p + 2] * dmv;
+                    r0r[p + 3] += row[p + 3] * dmv;
+                    p += 4;
                 }
-            }
-            let t3c_pij_t = rt::asarray((&t3c_pij_stage, [naux, nao3].f(), &device));
-            let dm0_col_t = rt::asarray((&dm0, [nao3, 1].f(), &device));
-            let r0r_col = (&t3c_pij_t % &dm0_col_t); // [naux, 1]
-            let r0r_raw = r0r_col.into_shape(-1).into_raw();
-            r0r.copy_from_slice(&r0r_raw);
+                while p < naux { r0r[p] += row[p] * dmv; p += 1; }
+            }}
         }
         // ── rhok0: rkr[p, i, oc] = Σ_j t3c[i, j, p] · mc2[j, oc]  (single GEMM) ──
         // Per-atom loop writes disjoint i_ao ranges (p0+ii), covering all AOs after all atoms.
@@ -1562,15 +1580,17 @@ impl RIRHFHessian<'_> {
         //   = rkr_2d_raw[(p + i*naux) + oc*(naux*nao)] (F-order flat of [naux*nao, nocc])  ✓
         let mut rkr = vec![0.0; naux * nao * nocc];
         {
+            // staging: j,i outer + p inner → t3c read and t3c_pi_j write both
+            // stride-1 (old p-outer/j-inner order had 7 KB read jumps and
+            // 2.5 MB write jumps over 902 MB).
             let mut t3c_pi_j_stage = vec![0.0; naux * nao * nao];
-            for p in 0..naux {
-                for i in 0..nao {
-                    for j in 0..nao {
-                        t3c_pi_j_stage[(p + i * naux) + j * (naux * nao)] =
-                            t3c[i * nao * naux + j * naux + p];
-                    }
+            for j in 0..nao { for i in 0..nao {
+                let rbase = i * nao * naux + j * naux;
+                let wbase = i * naux + j * (naux * nao);
+                for p in 0..naux {
+                    t3c_pi_j_stage[wbase + p] = t3c[rbase + p];
                 }
-            }
+            }}
             let t3c_pi_j_t = rt::asarray((&t3c_pi_j_stage, [naux * nao, nao].f(), &device));
             let rkr_2d = (&t3c_pi_j_t % &mc2_t.t()); // [naux*nao, nocc]
             let rkr_raw = rkr_2d.into_shape(-1).into_raw();
