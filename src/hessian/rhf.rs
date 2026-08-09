@@ -419,38 +419,39 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, ip1: &[f64], out_vj1: &mut [f64], out_v
             }
 
             // ── part2 ──
-            // V [P·ni, qj] F-order: row (p,i), col j ; V[p,i,j] = Σ_a Ua[p,i,a]·mc2[q0+j,a]
-            //   = Ua [P·ni, O] @ mc2_blk2^T [O, qj]
+            // V[p,i,j] = Σ_a Ua[p,i,a]·mc2[q0+j,a]
             // out_P2[c] = Σ_{i,j,p} ipv[c,p0+i,q0+j,p]·V[p,i,j]
-            //   = ipvP [9, ni·qj·P] @ Vflat [ni·qj·P, 1]
+            // GEMM: v2 [qj, P·ni] = mc2_blk2 [qj, O] @ Uaᵀ [O, P·ni], where
+            // v2[j + (p·ni+i)·qj] = V[p,i,j] — the F-order (p,i) column is
+            // i-contiguous, matching the fused loop below. The old code staged
+            // ipv into [9, ni·qj·P] (2.2 MB-stride writes) and vflat (214 KB
+            // read jumps), both 8× amplified (~10 s of g3_g4); now ipv is read
+            // p-contiguous and v2 i-contiguous in a blocked loop, no staging.
             let out_p2: Vec<f64>;
             {
-                // mc2_blk2_T [O, qj] F-order: row o, col k
-                let mut mc2_blk2_t2 = vec![0.0; nocc * qj];
-                for k in 0..qj { for o in 0..nocc {
-                    mc2_blk2_t2[o + k * nocc] = mc2[(q0 + k) * nocc + o];
-                }}
-                let mc2_blk2_t2_t = rt::asarray((&mc2_blk2_t2, [nocc, qj].f(), &device));
                 let ua_t = rt::asarray((&ua, [naux * ni, nocc].f(), &device));
-                let v = &ua_t % &mc2_blk2_t2_t; // [P·ni, qj]
-                let v_raw = v.into_shape(-1).into_raw();
-                // Vflat [(i,j) + p·(ni·qj)] = V[p·ni+i + j·(P·ni)]
-                let mut vflat = vec![0.0; ni * qj * naux];
-                for p in 0..naux { for i in 0..ni { for j in 0..qj {
-                    vflat[(i * qj + j) + p * (ni * qj)] = v_raw[p * ni + i + j * (naux * ni)];
-                }}}
-                // ipvP [9, ni·qj·P] F-order: row c, col (i,j,p)
-                let mut ipv_p = vec![0.0; 9 * ni * qj * naux];
-                for c in 0..9 { for i in 0..ni { for j in 0..qj {
-                    for p in 0..naux {
-                        ipv_p[c + ((i * qj + j) + p * (ni * qj)) * 9] =
-                            ipv_i0[c * ni * nao * naux + i * nao * naux + (q0 + j) * naux + p];
+                let v2_t = &mc2_blk2_t % &ua_t.t(); // [qj, P·ni]
+                let v2_raw = v2_t.into_shape(-1).into_raw();
+                let mut op = vec![0.0; 9];
+                for c in 0..9 {
+                    let mut s = 0.0;
+                    for j in 0..qj {
+                        let vj = j; // v2 [qj, P·ni]: row j (stride 1), col (p,i) stride qj
+                        let ibase = c * ni * nao * naux + (q0 + j) * naux;
+                        for pb in (0..naux).step_by(64) {
+                            let pe = (pb + 64).min(naux);
+                            for ib in (0..ni).step_by(8) {
+                                let ie = (ib + 8).min(ni);
+                                for p in pb..pe { for i in ib..ie {
+                                    s += ipv_i0[ibase + i * nao * naux + p]
+                                        * v2_raw[vj + (p * ni + i) * qj];
+                                }}
+                            }
+                        }
                     }
-                }}}
-                let ipv_p_t = rt::asarray((&ipv_p, [9, ni * qj * naux].f(), &device));
-                let vflat_t = rt::asarray((&vflat, [ni * qj * naux, 1].f(), &device));
-                let o2 = &ipv_p_t % &vflat_t; // [9, 1]
-                out_p2 = o2.into_shape(-1).into_raw();
+                    op[c] = s;
+                }
+                out_p2 = op;
             }
 
             for x in 0..3 { for y in 0..3 {
