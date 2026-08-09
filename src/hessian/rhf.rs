@@ -598,11 +598,28 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
             let mut wk1_IpJ = vec![0.0; ni * naux * 3 * nao];
             {
                 let n3a_blk = ni * naux * 3;
+                // wki read j-contiguous (y outer segment), wki_stage write
+                // y-contiguous 24 B rows (37% line utilization vs the old
+                // j-inner order writing at a 655 KB stride, 8× amplified over
+                // 234 MB/atom).
                 let mut wki_stage = vec![0.0; n3a_blk * nao];
-                for ii in 0..ni { for p in 0..naux { for y in 0..3 { for j in 0..nao {
-                    wki_stage[(ii * naux * 3 + p * 3 + y) + j * n3a_blk] =
-                        wki[(p0 + ii) * naux * 3 * nao + p * 3 * nao + y * nao + j];
-                }}}}
+                for ii in 0..ni {
+                    let wbase_i = (p0 + ii) * naux * 3 * nao;
+                    let sbase_i = ii * naux * 3;
+                    for jb in (0..nao).step_by(64) {
+                        let je = (jb + 64).min(nao);
+                        for p in 0..naux {
+                            let wbase = wbase_i + p * 3 * nao;
+                            let sbase = sbase_i + p * 3;
+                            for y in 0..3 {
+                                let wrow = wbase + y * nao;
+                                for j in jb..je {
+                                    wki_stage[sbase + j * n3a_blk + y] = wki[wrow + j];
+                                }
+                            }
+                        }
+                    }
+                }
                 let wki_t_blk = rt::asarray((&wki_stage, [n3a_blk, nao].f(), &device));
                 let wk1_blk = &wki_t_blk % &dm0_t; // [n3a_blk, nao]
                 let wk1_blk_raw = wk1_blk.into_shape(-1).into_raw();
@@ -704,13 +721,26 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
         }
 
         // ── g8 (ej_ri1): w11 from the ip12 block, then t1-t4 for-loops ──
+        // w11[x,p] = Σ_{ii,j} ip12[x,ii,j,p]·dm0[(p0+ii),j] — explicit SIMD
+        // loop (p inner): ip12 read p-contiguous, w11 accumulate contiguous.
+        // The old p-outer/j-inner order read ip12 at 7 KB jumps (8×
+        // amplification over 234 MB/atom).
         let mut w11 = vec![0.0; 9 * naux];
-        for x in 0..9 { for p in 0..naux { let mut ss = 0.0;
-            for ii in 0..ni { for j in 0..nao {
-                ss += ip12_i0[x * ni * nao * naux + ii * nao * naux + j * naux + p]
-                    * dm0[(p0 + ii) * nao + j];
-            }} w11[x * naux + p] = ss;
-        }}
+        for x in 0..9 { for ii in 0..ni { for j in 0..nao {
+            let dmv = dm0[(p0 + ii) * nao + j];
+            let base = x * ni * nao * naux + ii * nao * naux + j * naux;
+            let row = &ip12_i0[base..base + naux];
+            let wbase = x * naux;
+            let mut p = 0usize;
+            while p + 4 <= naux {
+                w11[wbase + p] += row[p] * dmv;
+                w11[wbase + p + 1] += row[p + 1] * dmv;
+                w11[wbase + p + 2] += row[p + 2] * dmv;
+                w11[wbase + p + 3] += row[p + 3] * dmv;
+                p += 4;
+            }
+            while p < naux { w11[wbase + p] += row[p] * dmv; p += 1; }
+        }}}
         for j0 in 0..natm { let (_, aq0, ql) = aux_blk[j0];
             let q0 = aq0;
             let mut t1 = vec![0.0; 9];
