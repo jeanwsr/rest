@@ -503,12 +503,15 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
     let natm = ctx.natm; let nao3 = ctx.nao3;
     let blk = ctx.blk; let aux_blk = ctx.aux_blk;
     let dm0 = ctx.dm0; let mc2 = ctx.mc2;
-    let i21 = ctx.i21; let rk = ctx.rk; let wki = ctx.wki; let tmpf = ctx.tmpf;
+    let i21 = ctx.i21; let rk = ctx.rk; let wki = ctx.wki;
+    let ip1 = ctx.ip1; let i2inv = ctx.i2inv;
     let r0 = ctx.r0; let rj1 = ctx.rj1; let wj001 = ctx.wj001; let wj2 = ctx.wj2;
     let device = ctx.device.clone();
+    let i2inv_t = rt::asarray((i2inv, [naux, naux].f(), &device));
     let i_t = |i0: usize, j0: usize, x: usize, y: usize| -> usize {
         i0 * natm * 9 + j0 * 9 + x * 3 + y
     };
+
 
     // mc2_t: F-order [nocc, nao], element (i_occ, J) = mc2[J*nocc + i_occ]
     let mc2_t = rt::asarray((mc2, [nocc, nao].f(), &device));
@@ -520,6 +523,21 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
         i21_batch[(y * naux + p) + q * (3 * naux)] = i21[y * naux * naux + p * naux + q];
     }}}
     let i21_batch_t = rt::asarray((&i21_batch, [3 * naux, naux].f(), &device));
+
+    // L[y,q,q'] = Σ_pg V⁻¹[pg,q]·i21[y, q', pg]  ([3,P,P] row-major) — the
+    // V⁻¹ weight absorbed on the i21 side for t3 (whose aux sum runs over
+    // the rk_PJI row block j0, unlike t2's tmpf row block j0). NOTE: i21 is
+    // NOT symmetric in (p,q) — int2c2e_ip1 is antisymmetric (i21[y,p,q] =
+    // -i21[y,q,p]) — so the index order here (q' first, pg second) must match
+    // t3's contraction i21[y, qg, paux].
+    let mut L_vinv = vec![0.0; 3 * naux * naux];
+    for y in 0..3 { for q in 0..naux { for qp in 0..naux {
+        let mut s = 0.0;
+        for pg in 0..naux {
+            s += i2inv[pg + q * naux] * i21[y * naux * naux + qp * naux + pg];
+        }
+        L_vinv[(y * naux + q) * naux + qp] = s;
+    }}}
 
     for i0 in 0..natm { let (_, p0, ni) = blk[i0];
         if ni == 0 { continue; }
@@ -533,192 +551,9 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
             .integrate_row_major("int3c2e_ip1ip2", "s1", Some(ip12_slc))
             .into();
 
-        if do_k {
-            // ── rk_P_I (1 GEMM) ──
-            let mut rk_P_I = vec![0.0; naux * nocc * ni];
-            {
-                let m_rk = naux * nocc;
-                // staging: l outer, p inner → rk read stride-1 (p fastest),
-                // rk_stage write stride nocc (272 B, L2-resident). Old l-inner
-                // order wrote with a 239 KB column stride and read rk at
-                // 7 KB jumps (cache-hostile).
-                let mut rk_stage = vec![0.0; m_rk * nao];
-                for l in 0..nao { for j_occ in 0..nocc {
-                    let rbase = l * naux + j_occ * naux * nao;
-                    for p in 0..naux {
-                        rk_stage[(p * nocc + j_occ) + l * m_rk] = rk[p + rbase];
-                    }
-                }}
-                let rk_2d_g5 = rt::asarray((&rk_stage, [m_rk, nao].f(), &device));
-                let dm0_block_t = dm0_t.i((.., p0..p0 + ni));
-                let rk_P_I_2d = (&rk_2d_g5 % &dm0_block_t);
-                let rk_P_I_raw = rk_P_I_2d.into_shape(-1).into_raw();
-                for p in 0..naux { for j_occ in 0..nocc { for ii in 0..ni {
-                    rk_P_I[p * nocc * ni + j_occ * ni + ii] =
-                        rk_P_I_raw[(p * nocc + j_occ) + ii * (naux * nocc)];
-                }}}
-            }
-
-            // ── rk_PJI (1 GEMM) ──
-            // Stored p-inner: rk_PJI[p + (j·ni+ii)·P] (F-order [P, N·ni]) so
-            // t1 reads it pg-contiguous (the old [P, N, ni] layout forced
-            // 31 KB jumps in t1's pg loop, 8× amplified).
-            let mut rk_PJI = vec![0.0; naux * nao * ni];
-            {
-                // staging: j_occ outer, p mid, ii inner → both sides stride-1.
-                let mut rk_P_I_stage = vec![0.0; naux * ni * nocc];
-                for j_occ in 0..nocc { for p in 0..naux {
-                    let rbase = p * nocc * ni + j_occ * ni;
-                    for ii in 0..ni {
-                        rk_P_I_stage[(p * ni + ii) + j_occ * (naux * ni)] =
-                            rk_P_I[rbase + ii];
-                    }
-                }}
-                let rk_P_I_t = rt::asarray((&rk_P_I_stage, [naux * ni, nocc].f(), &device));
-                let rk_PJI_2d = (&rk_P_I_t % &mc2_t);
-                let rk_PJI_raw = rk_PJI_2d.into_shape(-1).into_raw();
-                for j in 0..nao { for ii in 0..ni {
-                    let rbase = j * (naux * ni) + ii;
-                    for p in 0..naux {
-                        rk_PJI[p + (j * ni + ii) * naux] = rk_PJI_raw[rbase + p * ni];
-                    }
-                }}
-            }
-
-            // ── wk1_pJI via 1 batched GEMM [3*naux, naux] @ [naux, nao*ni] ──
-            let rk_pji_t_g5 = rt::asarray((&rk_PJI, [naux, nao * ni].f(), &device));
-            let wk1_pJI_res = &i21_batch_t % &rk_pji_t_g5; // [3*naux, nao*ni]
-            // Keep the raw [3P, N·ni] F-order layout: t2 consumes it directly
-            // with pg inner (stride-1 both sides), avoiding a 234 MB scatter.
-            let wk1_pJI_raw = wk1_pJI_res.into_shape(-1).into_raw();
-
-            // ── wk1_IpJ block: wk1_IpJ[ii, p, y, k] = Σ_j wki[(p0+ii), p, y, j]·dm0[j, k]
-            //    (per-atom block of the old full wki·dm0 product — same FLOPs,
-            //     memory 3·N²·P → 3·ni·N·P)
-            let mut wk1_IpJ = vec![0.0; ni * naux * 3 * nao];
-            {
-                let n3a_blk = ni * naux * 3;
-                // wki read j-contiguous (y outer segment), wki_stage write
-                // y-contiguous 24 B rows (37% line utilization vs the old
-                // j-inner order writing at a 655 KB stride, 8× amplified over
-                // 234 MB/atom).
-                let mut wki_stage = vec![0.0; n3a_blk * nao];
-                for ii in 0..ni {
-                    let wbase_i = (p0 + ii) * naux * 3 * nao;
-                    let sbase_i = ii * naux * 3;
-                    for jb in (0..nao).step_by(64) {
-                        let je = (jb + 64).min(nao);
-                        for p in 0..naux {
-                            let wbase = wbase_i + p * 3 * nao;
-                            let sbase = sbase_i + p * 3;
-                            for y in 0..3 {
-                                let wrow = wbase + y * nao;
-                                for j in jb..je {
-                                    wki_stage[sbase + j * n3a_blk + y] = wki[wrow + j];
-                                }
-                            }
-                        }
-                    }
-                }
-                let wki_t_blk = rt::asarray((&wki_stage, [n3a_blk, nao].f(), &device));
-                let wk1_blk = &wki_t_blk % &dm0_t; // [n3a_blk, nao]
-                let wk1_blk_raw = wk1_blk.into_shape(-1).into_raw();
-                for ii in 0..ni { for p in 0..naux { for y in 0..3 { for k in 0..nao {
-                    wk1_IpJ[ii * naux * 3 * nao + p * 3 * nao + y * nao + k] =
-                        wk1_blk_raw[(ii * naux * 3 + p * 3 + y) + k * n3a_blk];
-                }}}}
-            }
-
-            // ── rho2c_PQ via GEMM: wkp_2d @ rk_PJI_2d (read from tmpf directly) ──
-            let naux3 = naux * 3;
-            let ni_nao = ni * nao;
-            // wkp_stage_g5 [(x,p) row, (ii,j) col] F-order. p inner keeps BOTH
-            // tmpf read and wkp_stage_g5 write stride-1 (old j-inner read tmpf
-            // at 7 KB jumps).
-            let mut wkp_stage_g5 = vec![0.0; naux3 * ni_nao];
-            for x in 0..3 { for ii in 0..ni { for j in 0..nao {
-                let c = x * nao3 + (p0 + ii) * nao + j;
-                let base = (ii * nao + j) * naux3 + x * naux;
-                for p in 0..naux {
-                    wkp_stage_g5[base + p] = tmpf[p + c * naux];
-                }
-            }}}
-            let wkp_t_g5 = rt::asarray((&wkp_stage_g5, [naux3, ni_nao].f(), &device));
-            let mut rk_pji_rho_stage = vec![0.0; ni_nao * naux];
-            for q in 0..naux { for J in 0..nao { for ii in 0..ni {
-                rk_pji_rho_stage[(ii * nao + J) + q * ni_nao] =
-                    rk_PJI[q + (J * ni + ii) * naux];
-            }}}
-            let rk_pji_rho2c_t = rt::asarray((&rk_pji_rho_stage, [ni_nao, naux].f(), &device));
-            let rho2c_res = &wkp_t_g5 % &rk_pji_rho2c_t;
-            let mut rho2c_PQ = vec![0.0; 3 * naux * naux];
-            for x in 0..3 { for q in 0..naux { for p in 0..naux {
-                rho2c_PQ[x * naux * naux + q * naux + p] = rho2c_res[[x * naux + p, q]];
-            }}}
-
-            // T1-T4 for-loops (g5, exchange part)
-            for j0 in 0..natm { let (_, aq0, ql) = aux_blk[j0]; if ql == 0 { continue; }
-                let mut t1 = vec![0.0; 9];
-                // rk_PJI stored p-inner: both ip12_i0 and rk_PJI read
-                // pg-contiguous (stride-1) — was 31 KB jumps on rk_PJI.
-                for x in 0..9 { let mut s = 0.0; for ii in 0..ni { for j in 0..nao { for qp in 0..ql {
-                    let pg = aq0 + qp;
-                    s += ip12_i0[x * ni * nao * naux + ii * nao * naux + j * naux + pg]
-                        * rk_PJI[pg + (j * ni + ii) * naux];
-                }}} t1[x] = s; }
-                let mut t2 = vec![0.0; 9];
-                // Read tmpf directly (pg inner, stride-1) instead of the
-                // 234 MB wkp staging; wk1_pJI_raw consumed in its native
-                // [3P, N·ni] layout (pg inner, stride-1 too).
-                for x in 0..3 { for y in 0..3 { for ii in 0..ni { for j in 0..nao {
-                    let c = x * nao3 + (p0 + ii) * nao + j;
-                    let mut s = 0.0;
-                    for qp in 0..ql { let pg = aq0 + qp;
-                        s += tmpf[pg + c * naux]
-                            * wk1_pJI_raw[(y * naux + pg) + (j * ni + ii) * naux3];
-                    }
-                    t2[x * 3 + y] += s;
-                }}}}
-                let mut t3 = vec![0.0; 9];
-                for x in 0..3 { for y in 0..3 { let mut s = 0.0; for qp in 0..ql { let qg = aq0 + qp;
-                    for paux in 0..naux {
-                        s += rho2c_PQ[x * naux * naux + qg * naux + paux] * i21[y * naux * naux + qg * naux + paux];
-                }} t3[x*3+y] = s; }}
-                let mut t4 = vec![0.0; 9];
-                // tmpf direct read as in t2. wk1_IpJ is [ni, P, 3, N] (j
-                // contiguous) while the pg-inner loop wants pg contiguous —
-                // blocked (j 64 × pg 32) loop: tmpf reads pg-contiguous and
-                // wk1_IpJ reads j-contiguous within each block, no jumps
-                // (the old pg-inner order jumped 2.9 KB on wk1_IpJ, 8×
-                // amplified over 234 MB/atom).
-                for x in 0..3 { for y in 0..3 {
-                    let mut s = 0.0;
-                    for ii in 0..ni {
-                        for jb in (0..nao).step_by(64) {
-                            let je = (jb + 64).min(nao);
-                            for pb in (0..ql).step_by(32) {
-                                let pe = (pb + 32).min(ql);
-                                for j in jb..je {
-                                    let c = x * nao3 + (p0 + ii) * nao + j;
-                                    let wrow = ii * naux * 3 * nao + y * nao + j;
-                                    for pp in pb..pe {
-                                        let pg = aq0 + pp;
-                                        s += tmpf[pg + c * naux]
-                                            * wk1_IpJ[wrow + pg * 3 * nao];
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    t4[x * 3 + y] = s;
-                }}
-                for x in 0..3 { for y in 0..3 {
-                    let v = t1[x*3+y] - t2[x*3+y] - t3[x*3+y] + t4[x*3+y];
-                    out_ek[i_t(i0,j0,x,y)] += v;
-                    out_ek[i_t(j0,i0,x,y)] += t1[y*3+x] - t2[y*3+x] - t3[y*3+x] + t4[y*3+x];
-                }}
-            }
-        }
+        // (do_k Loop A/B moved below the main i0 loop — they re-traverse
+        //  all atoms once; keeping them inside this per-i0 loop would
+        //  multiply their out_ek contributions by natm)
 
         // ── g8 (ej_ri1): w11 from the ip12 block, then t1-t4 for-loops ──
         // w11[x,p] = Σ_{ii,j} ip12[x,ii,j,p]·dm0[(p0+ii),j] — explicit SIMD
@@ -774,6 +609,244 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
             }}
         }
     }
+
+        if do_k {
+            // ══════════════════════════════════════════════════════════
+            // Loop A (i0 outer): t1 + t3.
+            //   ip12[i0-block] integrated once; rk_PJI[i0-block] built once.
+            //   t3's rho2c_PQ is rebuilt from ip1 (V⁻¹ absorbed on the i21
+            //   side: R = ip1_xᵀ·rk_PJI, rho2c = V⁻¹·R) — no tmpf, no
+            //   per-(i0,j0) re-expansion.
+            // Loop B (j0 outer): t2 + t4.
+            //   tmpf[j0-block] = V⁻¹[j0-block,:]·ip1ᵀ built once per aux atom
+            //   (full-K GEMM); rk_PJI[i0-block] rebuilt per (j0,i0) (~2 s);
+            //   wk1_pJI[j0-block] = i21[pg∈j0]·rk_PJI and
+            //   wk1_IpJ[j0-block] = wki[·,pg∈j0,·,·]·dm0 both full-K GEMMs.
+            // ══════════════════════════════════════════════════════════
+            // ── Loop A: t1 + t3 ──
+            for i0 in 0..natm {
+                let (_, p0, ni) = blk[i0];
+                if ni == 0 { continue; }
+                let shl0 = ctx.aoslices[i0][0] as usize;
+                let shl1 = ctx.aoslices[i0][1] as usize;
+                let ip12_slc: &[[usize; 2]] =
+                    &[[shl0, shl1], [0, ctx.nreg], [ctx.nreg, ctx.aux_nbas]];
+                let (ip12_i0, _): (Vec<f64>, Vec<usize>) = ctx.cint_all
+                    .integrate_row_major("int3c2e_ip1ip2", "s1", Some(ip12_slc))
+                    .into();
+                // ── rk_P_I (1 GEMM) ──
+                let mut rk_P_I = vec![0.0; naux * nocc * ni];
+                {
+                    let m_rk = naux * nocc;
+                    let mut rk_stage = vec![0.0; m_rk * nao];
+                    for l in 0..nao { for j_occ in 0..nocc {
+                        let rbase = l * naux + j_occ * naux * nao;
+                        for p in 0..naux {
+                            rk_stage[(p * nocc + j_occ) + l * m_rk] = rk[p + rbase];
+                        }
+                    }}
+                    let rk_2d_g5 = rt::asarray((&rk_stage, [m_rk, nao].f(), &device));
+                    let dm0_block_t = dm0_t.i((.., p0..p0 + ni));
+                    let rk_P_I_2d = (&rk_2d_g5 % &dm0_block_t);
+                    let rk_P_I_raw = rk_P_I_2d.into_shape(-1).into_raw();
+                    for p in 0..naux { for j_occ in 0..nocc { for ii in 0..ni {
+                        rk_P_I[p * nocc * ni + j_occ * ni + ii] =
+                            rk_P_I_raw[(p * nocc + j_occ) + ii * (naux * nocc)];
+                    }}}
+                }
+                // ── rk_PJI (1 GEMM), p-inner [P, N·ni] F-order ──
+                let mut rk_PJI = vec![0.0; naux * nao * ni];
+                {
+                    let mut rk_P_I_stage = vec![0.0; naux * ni * nocc];
+                    for j_occ in 0..nocc { for p in 0..naux {
+                        let rbase = p * nocc * ni + j_occ * ni;
+                        for ii in 0..ni {
+                            rk_P_I_stage[(p * ni + ii) + j_occ * (naux * ni)] =
+                                rk_P_I[rbase + ii];
+                        }
+                    }}
+                    let rk_P_I_t = rt::asarray((&rk_P_I_stage, [naux * ni, nocc].f(), &device));
+                    let rk_PJI_2d = (&rk_P_I_t % &mc2_t);
+                    let rk_PJI_raw = rk_PJI_2d.into_shape(-1).into_raw();
+                    for j in 0..nao { for ii in 0..ni {
+                        let rbase = j * (naux * ni) + ii;
+                        for p in 0..naux {
+                            rk_PJI[p + (j * ni + ii) * naux] = rk_PJI_raw[rbase + p * ni];
+                        }
+                    }}
+                }
+                // ── rho2c_PQ[x,q,p] rebuilt from ip1 (no tmpf):
+                //    R[x,p,q] = Σ_{ii,j} ip1[x,p0+ii,j,p]·rk_PJI[q,j,ii]  (GEMM
+                //    [P, N·ni]@[N·ni, P] per x), rho2c = V⁻¹·R. ──
+                let mut rho2c = vec![0.0; 3 * naux * naux];
+                {
+                    let rk_pji_t_r = rt::asarray((&rk_PJI, [naux, nao * ni].f(), &device));
+                    let mut ip1_x_blk = vec![0.0; naux * nao * ni];
+                    for x in 0..3 {
+                        for ii in 0..ni { for j in 0..nao {
+                            let ibase = x * nao3 * naux + (p0 + ii) * nao * naux + j * naux;
+                            // column c = j·ni + ii must match rk_PJI's
+                            // [P, N·ni] column order (j outer, ii inner)
+                            let cbase = (j * ni + ii) * naux;
+                            for p in 0..naux { ip1_x_blk[p + cbase] = ip1[ibase + p]; }
+                        }}
+                        let ip1_x_t = rt::asarray((&ip1_x_blk, [naux, nao * ni].f(), &device));
+                        let r_x = &ip1_x_t % &rk_pji_t_r.t(); // [P, P] row p, col q
+                        let r_x_raw = r_x.into_shape(-1).into_raw();
+                        let r_x_t = rt::asarray((&r_x_raw, [naux, naux].f(), &device));
+                        let rho_x = &i2inv_t % &r_x_t; // [P, P]
+                        let rho_x_raw = rho_x.into_shape(-1).into_raw();
+                        for q in 0..naux { for p in 0..naux {
+                            rho2c[x * naux * naux + q * naux + p] = rho_x_raw[p + q * naux];
+                        }}
+                    }
+                }
+                for j0 in 0..natm { let (_, aq0, ql) = aux_blk[j0]; if ql == 0 { continue; }
+                    // ── t1 ──
+                    let mut t1 = [0.0f64; 9];
+                    for x in 0..9 { let mut s = 0.0; for ii in 0..ni { for j in 0..nao { for qp in 0..ql {
+                        let pg = aq0 + qp;
+                        s += ip12_i0[x * ni * nao * naux + ii * nao * naux + j * naux + pg]
+                            * rk_PJI[pg + (j * ni + ii) * naux];
+                    }}} t1[x] = s; }
+                    // ── t3 (rho2c·i21, i21 NOT symmetric in (p,q)) ──
+                    let mut t3 = [0.0f64; 9];
+                    for x in 0..3 { for y in 0..3 { let mut s = 0.0;
+                        for qg in 0..ql { for paux in 0..naux {
+                            s += rho2c[x * naux * naux + (aq0 + qg) * naux + paux]
+                               * i21[y * naux * naux + (aq0 + qg) * naux + paux];
+                        }}
+                        t3[x * 3 + y] = s;
+                    }}
+
+
+                    for x in 0..3 { for y in 0..3 {
+                        out_ek[i_t(i0,j0,x,y)] += t1[x*3+y] - t3[x*3+y];
+                        out_ek[i_t(j0,i0,x,y)] += t1[y*3+x] - t3[y*3+x];
+                    }}
+                }
+                drop(ip12_i0);
+            }
+            // ── Loop B: t2 + t4 ──
+            for j0 in 0..natm { let (_, aq0, ql) = aux_blk[j0]; if ql == 0 { continue; }
+                // tmpf[j0-block] = V⁻¹[j0-block,:]·ip1ᵀ : [ql, 3N²] F-order
+                let mut tmpf_j0 = vec![0.0; ql * 3 * nao3];
+                {
+                    let mut vinv_j0 = vec![0.0; ql * naux]; // [ql, P] F-order (pl, q)
+                    for pl in 0..ql { for q in 0..naux {
+                        vinv_j0[pl + q * ql] = i2inv[(aq0 + pl) + q * naux];
+                    }}
+                    let vinv_j0_t = rt::asarray((&vinv_j0, [ql, naux].f(), &device));
+                    // ip1 row-major [m3, P] IS F-order [P, m3] (row q, col c) — zero-copy
+                    let ip1_f = rt::asarray((ip1, [naux, 3 * nao3].f(), &device));
+                    let tf = &vinv_j0_t % &ip1_f; // [ql, 3N²]
+                    let tf_raw = tf.into_shape(-1).into_raw();
+                    tmpf_j0.copy_from_slice(&tf_raw);
+                }
+                // i21[j0-block] : [3ql, P] F-order (y,pl) row, q col
+                let mut i21_j0 = vec![0.0; 3 * ql * naux];
+                for y in 0..3 { for pl in 0..ql { for q in 0..naux {
+                    i21_j0[(y * ql + pl) + q * (3 * ql)] =
+                        i21[y * naux * naux + (aq0 + pl) * naux + q];
+                }}}
+                let i21_j0_t = rt::asarray((&i21_j0, [3 * ql, naux].f(), &device));
+                for i0 in 0..natm {
+                    let (_, p0, ni) = blk[i0];
+                    if ni == 0 { continue; }
+                    // rk_P_I / rk_PJI rebuilt per (j0,i0)
+                    let mut rk_P_I = vec![0.0; naux * nocc * ni];
+                    {
+                        let m_rk = naux * nocc;
+                        let mut rk_stage = vec![0.0; m_rk * nao];
+                        for l in 0..nao { for j_occ in 0..nocc {
+                            let rbase = l * naux + j_occ * naux * nao;
+                            for p in 0..naux {
+                                rk_stage[(p * nocc + j_occ) + l * m_rk] = rk[p + rbase];
+                            }
+                        }}
+                        let rk_2d_g5 = rt::asarray((&rk_stage, [m_rk, nao].f(), &device));
+                        let dm0_block_t = dm0_t.i((.., p0..p0 + ni));
+                        let rk_P_I_2d = (&rk_2d_g5 % &dm0_block_t);
+                        let rk_P_I_raw = rk_P_I_2d.into_shape(-1).into_raw();
+                        for p in 0..naux { for j_occ in 0..nocc { for ii in 0..ni {
+                            rk_P_I[p * nocc * ni + j_occ * ni + ii] =
+                                rk_P_I_raw[(p * nocc + j_occ) + ii * (naux * nocc)];
+                        }}}
+                    }
+                    let mut rk_PJI = vec![0.0; naux * nao * ni];
+                    {
+                        let mut rk_P_I_stage = vec![0.0; naux * ni * nocc];
+                        for j_occ in 0..nocc { for p in 0..naux {
+                            let rbase = p * nocc * ni + j_occ * ni;
+                            for ii in 0..ni {
+                                rk_P_I_stage[(p * ni + ii) + j_occ * (naux * ni)] =
+                                    rk_P_I[rbase + ii];
+                            }
+                        }}
+                        let rk_P_I_t = rt::asarray((&rk_P_I_stage, [naux * ni, nocc].f(), &device));
+                        let rk_PJI_2d = (&rk_P_I_t % &mc2_t);
+                        let rk_PJI_raw = rk_PJI_2d.into_shape(-1).into_raw();
+                        for j in 0..nao { for ii in 0..ni {
+                            let rbase = j * (naux * ni) + ii;
+                            for p in 0..naux {
+                                rk_PJI[p + (j * ni + ii) * naux] = rk_PJI_raw[rbase + p * ni];
+                            }
+                        }}
+                    }
+                    // wk1_pJI[j0-block] : [3ql, N·ni] = i21[j0-block]·rk_PJI
+                    let rk_pji_t_g5b = rt::asarray((&rk_PJI, [naux, nao * ni].f(), &device));
+                    let wk1_pji_j0_t = &i21_j0_t % &rk_pji_t_g5b; // [3ql, N·ni]
+                    let wk1_pji_j0_raw = wk1_pji_j0_t.into_shape(-1).into_raw();
+                    // wk1_IpJ[j0-block] : wk1_IpJ[ii, aq0+pl, y, j] =
+                    //   Σ_{j'} wki[(p0+ii), aq0+pl, y, j']·dm0[j', j]
+                    // wki_j0 [ql·ni·3, N] F-order (row (pl,ii,y), col j')
+                    let mut wki_j0 = vec![0.0; ql * ni * 3 * nao];
+                    for pl in 0..ql { for ii in 0..ni { for y in 0..3 {
+                        let row = (pl * ni + ii) * 3 + y;
+                        let wbase = (p0 + ii) * naux * 3 * nao + (aq0 + pl) * 3 * nao + y * nao;
+                        for jp in 0..nao {
+                            wki_j0[row + jp * (ql * ni * 3)] = wki[wbase + jp];
+                        }
+                    }}}
+                    let wki_j0_t = rt::asarray((&wki_j0, [ql * ni * 3, nao].f(), &device));
+                    let wk1_ipj_t = &wki_j0_t % &dm0_t; // [ql·ni·3, N] row (pl,ii,y), col j
+                    let wk1_ipj_raw = wk1_ipj_t.into_shape(-1).into_raw();
+                    // transpose to [ql, ni·3·N] (row pl, col ii·3N + y·N + j)
+                    let mut wk1_ipj_alt = vec![0.0; ql * ni * 3 * nao];
+                    for pl in 0..ql { for ii in 0..ni { for y in 0..3 {
+                        let r = (pl * ni + ii) * 3 + y;
+                        let c = (ii * 3 * nao + y * nao) * ql;
+                        for j in 0..nao {
+                            wk1_ipj_alt[pl + c + j * ql] = wk1_ipj_raw[r + j * (ql * ni * 3)];
+                        }
+                    }}}
+                    // t2 / t4 (single pass over tmpf_j0)
+                    let mut t2 = [0.0f64; 9];
+                    let mut t4 = [0.0f64; 9];
+                    for x in 0..3 { for y in 0..3 {
+                        let mut s2 = 0.0; let mut s4 = 0.0;
+                        for ii in 0..ni { for j in 0..nao {
+                            let c = x * nao3 + (p0 + ii) * nao + j;
+                            let c_pji = (j * ni + ii) * (3 * ql);
+                            let c_ipj = (ii * 3 * nao + y * nao + j) * ql;
+                            for pl in 0..ql {
+                                let v = tmpf_j0[pl + c * ql];
+                                s2 += v * wk1_pji_j0_raw[y * ql + pl + c_pji];
+                                s4 += v * wk1_ipj_alt[pl + c_ipj];
+                            }
+                        }}
+                        t2[x * 3 + y] = s2;
+                        t4[x * 3 + y] = s4;
+                    }}
+                    for x in 0..3 { for y in 0..3 {
+                        out_ek[i_t(i0,j0,x,y)] += -t2[x*3+y] + t4[x*3+y];
+                        out_ek[i_t(j0,i0,x,y)] += -t2[y*3+x] + t4[y*3+x];
+                    }}
+
+                }
+            }
+
+        }
 }
 
 /// g6 (ek_ri2d) + g9 (ej_ri2d) combined, per-aux-atom streaming implementation.
@@ -1864,21 +1937,9 @@ impl RIRHFHessian<'_> {
             }}
         }
 
-        // ── tmpf = V⁻¹·ip1ᵀ (built here, after rj1 = V⁻¹·wj1, before the
-        //    wki allocation in Phase 3b): g4's Z2u-then-V⁻¹ path does not need
-        //    tmpf, but g5's wkp does. ip1c is the explicit transpose staging
-        //    (zero-copy F-order views of ip1 are unreliable in rstsr GEMM). ──
-        let mut tmpf = vec![0.0; naux * m3];
-        {
-            // ip1 is row-major [m3, P] which IS F-order [P, m3] (row p, col c)
-            // — zero-copy. tmpf = V⁻¹·ip1ᵀ = V⁻¹ [P,P] @ ip1_view [P, m3],
-            // eliminating the old 2.7 GB ip1c transpose staging (which wrote
-            // with a 2.5 MB column stride, 8× write amplification).
-            let ip1_view: TsrView<f64> = rt::asarray((&ip1, [naux, m3].f(), &device));
-            let tmpf_t = &vinv_t % &ip1_view; // [naux, m3]
-            let flat = tmpf_t.into_shape(-1).into_raw();
-            tmpf.copy_from_slice(&flat);
-        }
+        // tmpf = V⁻¹·ip1ᵀ is NOT materialized anymore: g5 absorbs the V⁻¹
+        // weight into wk1_pJI/wk1_IpJ per aux-atom block (see g5_g8_ri1_blas),
+        // so the 2.7 GB (P, 3·N²) tensor is gone entirely.
 
         self.timings.push(("  p2_rhoj1_wj1", _tp2.elapsed()));
 
@@ -2196,28 +2257,30 @@ impl RIRHFHessian<'_> {
         // g4 is the last consumer of ip1.
         {
             let _t_g4 = std::time::Instant::now();
-            let ctx = build_ej_ek_ctx!(&ip1, &tmpf);
+            let ctx = build_ej_ek_ctx!(&ip1, &[]);
             g3_g4_vj1_vk1_blas(&ctx, &ip1, &mut ej_vj1, &mut ek_vk1, self.factor_k != 0.0);
             self.timings.push(("  g3_g4_vj1_vk1", _t_g4.elapsed()));
         }
 
         mt("after g3_g4");
-        // g4 is the last consumer of ip1 — free it before g5 (g5 reads tmpf).
-        drop(ip1);
+        // g4 consumed ip1 (W2/Z2u). g5 still reads ip1 (t2/t4 V⁻¹-absorbed
+        // forms), so ip1 stays alive until after g5.
 
         // ip12 (9·N²·P) is evaluated per-AO-atom block inside g5_g8_ri1_blas,
         // so the full tensor never exists. ipip2 (below) is likewise streamed
         // per-aux-atom block by g6/g9.
         {
             let _t_e5 = std::time::Instant::now();
-            let ctx = build_ej_ek_ctx!(&[], &tmpf);
+            let ctx = build_ej_ek_ctx!(&ip1, &[]);
             g5_g8_ri1_blas(&ctx, &mut ek_ri1, &mut ej_ri1, self.factor_k != 0.0);
             self.timings.push(("  g5g8_ri1", _t_e5.elapsed()));
         }
 
-        // g5 is the last consumer of tmpf — free it before the ipip2 blocks.
+        // g5 was the last consumer of ip1 (t2/t4 V⁻¹-absorbed forms) — free
+        // the 2.7 GB tensor before the ipip2 blocks. tmpf was eliminated in
+        // Step 2 (V⁻¹ absorbed into g5's wk1 factors).
         mt("after g5_g8");
-        drop(tmpf);
+        drop(ip1);
 
         // ipip2 (9·N²·P) is evaluated per-aux-atom block inside g6_g9_ri2d_blas,
         // so the full tensor never exists.
@@ -2270,6 +2333,13 @@ impl RIRHFHessian<'_> {
         for i in 0..aa9 {
             ej[i] = ej_basic[i] + ej_vjd[i] + ej_vj1[i] + ej_ri1[i] + ej_ri2d[i] + ej_ri2o[i];
             ek[i] = ek_vkd[i] + ek_vk1[i] + ek_ri1[i] + ek_ri2d[i] + ek_ri2o[i];
+        }
+        if std::env::var("REST_VERIFY_WK1").is_ok() {
+            let sum = |v: &[f64]| v.iter().fold(0.0f64, |a, &b| a + b);
+            eprintln!("COMP ek_ri1={:.6e} ek_vk1={:.6e} ek_ri2d={:.6e} ek_ri2o={:.6e}",
+                sum(&ek_ri1), sum(&ek_vk1), sum(&ek_ri2d), sum(&ek_ri2o));
+            eprintln!("COMP ej_ri1={:.6e} ej_vj1={:.6e} ej_ri2d={:.6e}",
+                sum(&ej_ri1), sum(&ej_vj1), sum(&ej_ri2d));
         }
         self.timings.push(("  phases_4-sum", _tp4.elapsed()));
         self.timings.push(("  ej_ek: contributions", _tej.elapsed()));
