@@ -503,72 +503,79 @@ impl KLowRankPrecompute {
         let size_nn = naux * nvir * nocc;
         let size_mm = naux * nvir * nvir;
         let size_ll = naux * nocc * nocc;
-        // Ordered collect (rayon collect preserves order) then concatenate.
-        let cols: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> = (0..naux)
-            .into_par_iter()
-            .map(|p| {
-                let mut b = vec![0.0; nao * nao];
-                match &src {
-                    Src::Rim(ri, num_baspair) => {
-                        let col = &ri.data[p * num_baspair..(p + 1) * num_baspair];
-                        let mut it = col.iter();
-                        for nu in 0..nao {
-                            for mu in 0..=nu {
-                                let v = *it.next().unwrap();
-                                b[mu + nu * nao] = v;
-                                b[nu + mu * nao] = v;
-                            }
-                        }
-                    }
-                    Src::Ri3(ri3) => {
-                        let col = &ri3.data[p * nao * nao..(p + 1) * nao * nao];
-                        b.copy_from_slice(col);
-                    }
-                }
-                let b_mat = MatrixFull::from_vec([nao, nao], b).unwrap();
-                let mut bcv = MatrixFull::new([nao, nvir], 0.0);
-                _dsymm(&b_mat, c_vir, &mut bcv, 'L', 'U', 1.0, 0.0); // B_p·C_vir
-                let mut bco = MatrixFull::new([nao, nocc], 0.0);
-                _dsymm(&b_mat, c_occ, &mut bco, 'L', 'U', 1.0, 0.0); // B_p·C_occ
-                let mut kp = MatrixFull::new([nocc, nvir], 0.0);
-                _dgemm_full(c_occ, 'T', &bcv, 'N', &mut kp, 1.0, 0.0);
-                let mut np = MatrixFull::new([nvir, nocc], 0.0);
-                _dgemm_full(c_vir, 'T', &bco, 'N', &mut np, 1.0, 0.0);
-                let mut mp = MatrixFull::new([nvir, nvir], 0.0);
-                _dgemm_full(c_vir, 'T', &bcv, 'N', &mut mp, 1.0, 0.0);
-                let mut lp = MatrixFull::new([nocc, nocc], 0.0);
-                _dgemm_full(c_occ, 'T', &bco, 'N', &mut lp, 1.0, 0.0);
-                (kp.data, np.data, mp.data, lp.data)
-            })
-            .collect();
+        // Batched layout buffers (col-major: K_batch[(p,i) + a·(P·nocc)] etc.).
         let mut k_p = vec![0.0; size_kn];
         let mut n_p = vec![0.0; size_nn];
         let mut m_p = vec![0.0; size_mm];
         let mut l_p = vec![0.0; size_ll];
-        // Scatter each per-column block into the batched col-major layout:
-        //   K_batch[(p,i) + a·(P·nocc)]  etc. (the raw kp.data is [nocc,nvir]
-        //   col-major with a-stride nocc — NOT the batched stride P·nocc).
-        for (p, (kp, np, mp, lp)) in cols.iter().enumerate() {
-            for a in 0..nvir {
-                for i in 0..nocc {
-                    k_p[p * nocc + i + a * nocc * naux] = kp[i + a * nocc];
-                }
-            }
-            for c in 0..nocc {
+        // Per-p blocks are built in chunks (128 p each) so the intermediate
+        // (kp/np/mp/lp tuples, ~0.9 GB for all p) never coexists with the
+        // final batched buffers — peak build RSS ≈ k_p+n_p+m_p+l_p (0.9 GB)
+        // + one chunk (0.13 GB) instead of 1.8 GB.
+        const CHUNK: usize = 128;
+        for p_lo in (0..naux).step_by(CHUNK) {
+            let p_hi = (p_lo + CHUNK).min(naux);
+            let cols_chunk: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> = (p_lo..p_hi)
+                .into_par_iter()
+                .map(|p| {
+                    let mut b = vec![0.0; nao * nao];
+                    match &src {
+                        Src::Rim(ri, num_baspair) => {
+                            let col = &ri.data[p * num_baspair..(p + 1) * num_baspair];
+                            let mut it = col.iter();
+                            for nu in 0..nao {
+                                for mu in 0..=nu {
+                                    let v = *it.next().unwrap();
+                                    b[mu + nu * nao] = v;
+                                    b[nu + mu * nao] = v;
+                                }
+                            }
+                        }
+                        Src::Ri3(ri3) => {
+                            let col = &ri3.data[p * nao * nao..(p + 1) * nao * nao];
+                            b.copy_from_slice(col);
+                        }
+                    }
+                    let b_mat = MatrixFull::from_vec([nao, nao], b).unwrap();
+                    let mut bcv = MatrixFull::new([nao, nvir], 0.0);
+                    _dsymm(&b_mat, c_vir, &mut bcv, 'L', 'U', 1.0, 0.0); // B_p·C_vir
+                    let mut bco = MatrixFull::new([nao, nocc], 0.0);
+                    _dsymm(&b_mat, c_occ, &mut bco, 'L', 'U', 1.0, 0.0); // B_p·C_occ
+                    let mut kp = MatrixFull::new([nocc, nvir], 0.0);
+                    _dgemm_full(c_occ, 'T', &bcv, 'N', &mut kp, 1.0, 0.0);
+                    let mut np = MatrixFull::new([nvir, nocc], 0.0);
+                    _dgemm_full(c_vir, 'T', &bco, 'N', &mut np, 1.0, 0.0);
+                    let mut mp = MatrixFull::new([nvir, nvir], 0.0);
+                    _dgemm_full(c_vir, 'T', &bcv, 'N', &mut mp, 1.0, 0.0);
+                    let mut lp = MatrixFull::new([nocc, nocc], 0.0);
+                    _dgemm_full(c_occ, 'T', &bco, 'N', &mut lp, 1.0, 0.0);
+                    (kp.data, np.data, mp.data, lp.data)
+                })
+                .collect();
+            for (p_local, (kp, np, mp, lp)) in cols_chunk.iter().enumerate() {
+                let p = p_lo + p_local;
                 for a in 0..nvir {
-                    n_p[p * nvir + a + c * nvir * naux] = np[a + c * nvir];
+                    for i in 0..nocc {
+                        k_p[p * nocc + i + a * nocc * naux] = kp[i + a * nocc];
+                    }
+                }
+                for c in 0..nocc {
+                    for a in 0..nvir {
+                        n_p[p * nvir + a + c * nvir * naux] = np[a + c * nvir];
+                    }
+                }
+                for v in 0..nvir {
+                    for u in 0..nvir {
+                        m_p[p * nvir + u + v * nvir * naux] = mp[u + v * nvir];
+                    }
+                }
+                for c in 0..nocc {
+                    for i in 0..nocc {
+                        l_p[p * nocc + i + c * nocc * naux] = lp[i + c * nocc];
+                    }
                 }
             }
-            for v in 0..nvir {
-                for u in 0..nvir {
-                    m_p[p * nvir + u + v * nvir * naux] = mp[u + v * nvir];
-                }
-            }
-            for c in 0..nocc {
-                for i in 0..nocc {
-                    l_p[p * nocc + i + c * nocc * naux] = lp[i + c * nocc];
-                }
-            }
+            drop(cols_chunk);
         }
         Some(KLowRankPrecompute {
             nocc, nvir, naux,
