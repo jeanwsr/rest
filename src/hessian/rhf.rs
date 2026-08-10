@@ -233,60 +233,6 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, out_vj1: &mut [f64], out_vk1: &mut [f64
 
             // ── Evaluate ipv block for atom i0: [9, ni, nao, naux] row-major ──
             // element (c, ii, j, p) at c*ni*nao*naux + ii*nao*naux + j*naux + p
-            let shl0 = ctx.aoslices[i0][0] as usize;
-            let shl1 = ctx.aoslices[i0][1] as usize;
-            let ipv_slc: &[[usize; 2]] = &[[shl0, shl1], [0, ctx.nreg], [ctx.nreg, ctx.aux_nbas]];
-            let (ipv_i0, _): (Vec<f64>, Vec<usize>) = ctx.cint_all
-                .integrate_row_major("int3c2e_ipvip1", "s1", Some(ipv_slc))
-                .into();
-            if i0 == 0 {
-            }
-            if i0 == 1 {
-            }
-            if i0 == 2 {
-            }
-
-            // ── G3: ej_vj1[i0, j0, c] = Σ_{ii∈i0, j∈j0} [Σ_p ipv[c,ii,j,p]·r0[p]] · dm0[j, ii] · 2 ──
-            // Step 1: vj1_mat[c, ii, j] = Σ_p ipv_i0[c,ii,j,p]·r0[p]  (1 GEMM)
-            let mut vj1_mat = vec![0.0; 9 * ni * nao];
-            // Explicit SIMD-friendly loop instead of staging+GEMM: the staging
-            // transpose wrote with a 1MB column stride (cache-hostile), and the
-            // [9·ni·N, P]×[P,1] GEMM is a bandwidth-bound matvec. The plain loop
-            // reads ipv (p contiguous) and r0 (L2-resident) at full DRAM rate.
-            for c in 0..9 { for ii in 0..ni { for j in 0..nao {
-                let base = c * ni * nao * naux + ii * nao * naux + j * naux;
-                let row = &ipv_i0[base..base + naux];
-                let mut s0 = 0.0f64; let mut s1 = 0.0f64; let mut s2 = 0.0f64; let mut s3 = 0.0f64;
-                let mut p = 0usize;
-                while p + 4 <= naux {
-                    s0 += row[p] * r0[p];
-                    s1 += row[p + 1] * r0[p + 1];
-                    s2 += row[p + 2] * r0[p + 2];
-                    s3 += row[p + 3] * r0[p + 3];
-                    p += 4;
-                }
-                while p < naux { s0 += row[p] * r0[p]; p += 1; }
-                vj1_mat[c * ni * nao + ii * nao + j] = s0 + s1 + s2 + s3;
-            }}}
-            for j0 in 0..=i0 {
-
-                let (_, q0, qj) = blk[j0];
-                if qj == 0 { continue; }
-                for c in 0..9 {
-                    let mut s = 0.0;
-                    // dm0 col-major: dm0[(q0+jj) + (p0+ii)*nao] = element (q0+jj, p0+ii)
-                    for ii in 0..ni { for jj in 0..qj {
-                        s += vj1_mat[c * ni * nao + ii * nao + (q0 + jj)]
-                            * dm0[(q0 + jj) + (p0 + ii) * nao];
-                    }}
-                    let (x1, x2) = (c / 3, c % 3);
-                    out_vj1[i_t(i0, j0, x1, x2)] = s * 2.0;
-                }
-            }
-
-            if !do_k { continue; }
-
-            // ══════════ G4 plan B ══════════
             // ── W2 [3·ni·P, O] F-order: row (x,i,p), col a
             //    W2[x,i,p,a] = Σ_j ip1[x,p0+i,j,p]·mc2[j,a]  (1 GEMM per i0) ──
             // ip1[i0-row-block] integrated once per atom (234 MB), dropped after.
@@ -331,7 +277,6 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, out_vj1: &mut [f64], out_vk1: &mut [f64
                     ua[p * ni + i + a * (naux * ni)] = ua_t_raw[i + (p * nocc + a) * ni];
                 }}}
             }
-
             // ── Per-i0 GEMM inputs (reused across j0) ──
             // W2_A [m_w, ni] F-order: row (x,p,b), col i ; W2_A[(x,p,b), i] = W2[x,i,p,b]
             // W [m_w, O] = W2_A @ mc2_blk : W[(x,p,b), a] = Σ_i W2[x,i,p,b]·mc2[i,a]
@@ -378,6 +323,107 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, out_vj1: &mut [f64], out_vk1: &mut [f64
 
             if i0 == 0 {
             }
+
+            // ── v2_all[j0] = mc2_blk2[j0]·Uaᵀ ([qj, P·ni] per j0≤i0, 190 MB)
+            //    precomputed so ipv can stream per aux block. ──
+            let mut v2_all: Vec<Vec<f64>> = Vec::with_capacity(i0 + 1);
+            for j0 in 0..=i0 {
+                let (_, q0, qj) = blk[j0];
+                if qj == 0 { v2_all.push(Vec::new()); continue; }
+                let mut mc2_blk2 = vec![0.0; qj * nocc];
+                for k in 0..qj { for o in 0..nocc {
+                    mc2_blk2[k + o * qj] = mc2[(q0 + k) * nocc + o];
+                }}
+                let mc2_blk2_t = rt::asarray((&mc2_blk2, [qj, nocc].f(), &device));
+                let ua_t = rt::asarray((&ua, [naux * ni, nocc].f(), &device));
+                let v2_t = &mc2_blk2_t % &ua_t.t(); // [qj, P·ni]
+                v2_all.push(v2_t.into_shape(-1).into_raw());
+            }
+
+            // ── ipv streamed per aux block ([9, ni, N, qi], 39 MB each):
+            //    vj1_mat += Σ_p ipv·r0 and out_p2_all[j0] += Σ_p ipv·v2 —
+            //    the 700 MB full ipv block never exists. ──
+            let shl0 = ctx.aoslices[i0][0] as usize;
+            let shl1 = ctx.aoslices[i0][1] as usize;
+            let mut vj1_mat = vec![0.0; 9 * ni * nao];
+            let mut out_p2_all = vec![0.0; (i0 + 1) * 9];
+            for aux_qb in 0..natm {
+                let aux_shl0 = ctx.auxslices[aux_qb][0] as usize;
+                let aux_shl1 = ctx.auxslices[aux_qb][1] as usize;
+                let ipv_slc: &[[usize; 2]] = &[[shl0, shl1], [0, ctx.nreg],
+                    [ctx.nreg + aux_shl0, ctx.nreg + aux_shl1]];
+                let (ipv_qb, _): (Vec<f64>, Vec<usize>) = ctx.cint_all
+                    .integrate_row_major("int3c2e_ipvip1", "s1", Some(ipv_slc))
+                    .into();
+                let qi = ctx.auxslices[aux_qb][3] as usize - ctx.auxslices[aux_qb][2] as usize;
+                let qbp = ctx.auxslices[aux_qb][2] as usize;
+                // vj1_mat[c, ii, j] += Σ_{p∈qb} ipv_qb[c,ii,j,p]·r0[p]
+                for c in 0..9 {
+                    for ii in 0..ni {
+                        for j in 0..nao {
+                            let base = c * ni * nao * qi + ii * nao * qi + j * qi;
+                            let row = &ipv_qb[base..base + qi];
+                            let mut s0 = 0.0f64; let mut s1 = 0.0f64;
+                            let mut s2 = 0.0f64; let mut s3 = 0.0f64;
+                            let mut p = 0usize;
+                            while p + 4 <= qi {
+                                s0 += row[p] * r0[qbp + p];
+                                s1 += row[p + 1] * r0[qbp + p + 1];
+                                s2 += row[p + 2] * r0[qbp + p + 2];
+                                s3 += row[p + 3] * r0[qbp + p + 3];
+                                p += 4;
+                            }
+                            while p < qi { s0 += row[p] * r0[qbp + p]; p += 1; }
+                            vj1_mat[c * ni * nao + ii * nao + j] += s0 + s1 + s2 + s3;
+                        }
+                    }
+                }
+                // out_p2_all[j0][c] += Σ_{p∈qb, i, j} ipv_qb[c,i,q0+j,p]·v2[j,(p,i)]
+                for j0 in 0..=i0 {
+                    let v2 = &v2_all[j0];
+                    if v2.is_empty() { continue; }
+                    let (_, q0, qj) = blk[j0];
+                    let op_base = j0 * 9;
+                    for c in 0..9 {
+                        let mut s = 0.0;
+                        for j in 0..qj {
+                            let vj = j;
+                            let ibase = c * ni * nao * qi + (q0 + j) * qi;
+                            for pb in (0..qi).step_by(64) {
+                                let pe = (pb + 64).min(qi);
+                                for ib in (0..ni).step_by(8) {
+                                    let ie = (ib + 8).min(ni);
+                                    for p in pb..pe { for i in ib..ie {
+                                        s += ipv_qb[ibase + i * nao * qi + p]
+                                            * v2[vj + ((qbp + p) * ni + i) * qj];
+                                    }}
+                                }
+                            }
+                        }
+                        out_p2_all[op_base + c] += s;
+                    }
+                }
+                drop(ipv_qb);
+            }
+
+            // ── G3: ej_vj1[i0, j0, c] = Σ_{ii∈i0, j∈j0} vj1_mat[c,ii,j]·dm0[j,ii]·2 ──
+            for j0 in 0..=i0 {
+                let (_, q0, qj) = blk[j0];
+                if qj == 0 { continue; }
+                for c in 0..9 {
+                    let mut s = 0.0;
+                    for ii in 0..ni { for jj in 0..qj {
+                        s += vj1_mat[c * ni * nao + ii * nao + (q0 + jj)]
+                            * dm0[(q0 + jj) + (p0 + ii) * nao];
+                    }}
+                    let (x1, x2) = (c / 3, c % 3);
+                    out_vj1[i_t(i0, j0, x1, x2)] = s * 2.0;
+                }
+            }
+
+            if !do_k { continue; }
+
+            // ══════════ G4 plan B ══════════
             for j0 in 0..=i0 {
                 if z2_per_atom[j0].is_empty() { continue; }
                 let (_, q0, qj) = blk[j0];
@@ -476,45 +522,10 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, out_vj1: &mut [f64], out_vk1: &mut [f64
                     out_b = ob;
                 }
 
-                // ── part2 ──
-                // V[p,i,j] = Σ_a Ua[p,i,a]·mc2[q0+j,a]
-                // out_P2[c] = Σ_{i,j,p} ipv[c,p0+i,q0+j,p]·V[p,i,j]
-                // GEMM: v2 [qj, P·ni] = mc2_blk2 [qj, O] @ Uaᵀ [O, P·ni], where
-                // v2[j + (p·ni+i)·qj] = V[p,i,j] — the F-order (p,i) column is
-                // i-contiguous, matching the fused loop below. The old code staged
-                // ipv into [9, ni·qj·P] (2.2 MB-stride writes) and vflat (214 KB
-                // read jumps), both 8× amplified (~10 s of g3_g4); now ipv is read
-                // p-contiguous and v2 i-contiguous in a blocked loop, no staging.
-                let out_p2: Vec<f64>;
-                {
-                    let ua_t = rt::asarray((&ua, [naux * ni, nocc].f(), &device));
-                    let v2_t = &mc2_blk2_t % &ua_t.t(); // [qj, P·ni]
-                    let v2_raw = v2_t.into_shape(-1).into_raw();
-                    let mut op = vec![0.0; 9];
-                    for c in 0..9 {
-                        let mut s = 0.0;
-                        for j in 0..qj {
-                            let vj = j; // v2 [qj, P·ni]: row j (stride 1), col (p,i) stride qj
-                            let ibase = c * ni * nao * naux + (q0 + j) * naux;
-                            for pb in (0..naux).step_by(64) {
-                                let pe = (pb + 64).min(naux);
-                                for ib in (0..ni).step_by(8) {
-                                    let ie = (ib + 8).min(ni);
-                                    for p in pb..pe { for i in ib..ie {
-                                        s += ipv_i0[ibase + i * nao * naux + p]
-                                            * v2_raw[vj + (p * ni + i) * qj];
-                                    }}
-                                }
-                            }
-                        }
-                        op[c] = s;
-                    }
-                    out_p2 = op;
-                }
-
+                // ── part2 (ipv streamed per aux block above): out_p2_all[j0] ──
                 for x in 0..3 { for y in 0..3 {
                     let c = x * 3 + y;
-                    out_vk1[i_t(i0, j0, x, y)] = out_a[x + y * 3] + out_b[c] + out_p2[c];
+                    out_vk1[i_t(i0, j0, x, y)] = out_a[x + y * 3] + out_b[c] + out_p2_all[j0 * 9 + c];
                 }}
             }
         }
