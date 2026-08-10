@@ -218,6 +218,9 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, out_vj1: &mut [f64], out_vk1: &mut [f64
     for i0 in 0..natm {
         let (_, p0, ni) = blk[i0];
         if ni == 0 { continue; }
+        if std::env::var("REST_MEM_TRACE").is_ok() && i0 % 3 == 0 {
+            eprintln!("MEMTRACE g34-iter-{:02}        RSS = {:.1} MiB", i0, memory_monitor::current_rss_mb());
+        }
 
         // ── Evaluate ipv block for atom i0: [9, ni, nao, naux] row-major ──
         // element (c, ii, j, p) at c*ni*nao*naux + ii*nao*naux + j*naux + p
@@ -781,6 +784,9 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                     for qb in 0..natm {
                         let (_, qb0, qbi) = aux_blk[qb];
                         if qbi == 0 { continue; }
+                        if std::env::var("REST_MEM_TRACE").is_ok() && j0 == 0 && qb % 3 == 0 {
+                            eprintln!("MEMTRACE tmpf-j0:{}-qb:{}   RSS = {:.1} MiB", j0, qb, memory_monitor::current_rss_mb());
+                        }
                         let aux_shl0 = ctx.auxslices[qb][0] as usize;
                         let aux_shl1 = ctx.auxslices[qb][1] as usize;
                         let ip1_qb_slc: &[[usize; 2]] = &[[0, ctx.nreg], [0, ctx.nreg],
@@ -1870,42 +1876,31 @@ impl RIRHFHessian<'_> {
         let _tp1b = std::time::Instant::now();
         let mut vjd = vec![0.0; 9 * nao * nao];
         let mut vkd = vec![0.0; 9 * nao * nao];
-        let mut rkm = vec![0.0; naux * nao * nao];
-        // rkm[p,l,J] = Σ_j rk[p,l,j] * mc2[J,j]  (already BLAS, kept as-is)
-        // rk: [naux, nao, nocc] = (p, l, j). Reshape to [naux*nao, nocc]
-        // mc2: [nocc, nao] = (j, J). mc2.T: [nao, nocc]
-        // rkm_2d = rk_2d @ mc2.T: [naux*nao, nocc] @ [nocc, nao] → [naux*nao, nao]
-        {
+        // vkd[x, i, l] = Σ_{p,j} ipip1[x, i, j, p] · rkm[p, l, j], with
+        // rkm[p,l,j] = Σ_occ rk[p,l,occ]·mc2[j,occ]. The 0.9 GB rkm is built
+        // ONCE by GEMM (fast); the old 0.9 GB rkm_jpl_stage transposed copy
+        // is gone — per (atom, l-block) only the [N·P, lcnt] slice rkm_l is
+        // re-staged (memcpy-class, 0.11 GB) then vkd_l = rkm_lᵀ·ipip1 GEMMs.
+        let r0_col_t = rt::asarray((&r0, [naux, 1].f(), &device));
+        // rkm = rk·mc2ᵀ: the GEMM output layout [P·N, N] F-order (combined
+        // (p,l) row with p fastest, AO col j) IS the rkm[p,l,j] layout
+        // (p + l*naux + j*naux*nao) — take the raw GEMM buffer directly, no
+        // 0.9 GB copy (avoids peak = GEMM out + rkm copy).
+        let rkm: Vec<f64> = {
             let rk_2d: TsrView<f64> = rt::asarray((&rk, [naux * nao, nocc].f(), &device));
             let rkm_2d = &rk_2d % &mc2_t; // [naux*nao, nocc] @ [nocc, nao] → [naux*nao, nao]
-            let flat = rkm_2d.into_shape(-1).into_raw();
-            // Map from flat[p*l+J*naux*nao] to rkm[p + l*naux + J*naux*nao]
-            // flat is col-major [naux*nao, nao] = (combined_idx, J)
-            // flat[p*l + J*(naux*nao)] → rkm[p + l*naux + J*naux*nao]
-            // where combined_idx = p + l*naux = p*1 + l*naux (F-order within [naux, nao])
-            // so flat[p + l*naux + J*naux*nao] = rkm[p + l*naux + J*naux*nao]
-            // They match! ✓
-            rkm.copy_from_slice(&flat);
-        }
-        // ── vkd[x, i, l] = Σ_{p,j} ipip1[x, i, j, p] · rkm[p, l, j]  (9 GEMMs, one per x) ──
-        // rkm_jpl_2d[nao*naux, nao] is the SAME for all x and all atom blocks,
-        // stage once outside the block loop.
-        let mut rkm_jpl_stage = vec![0.0; nao * naux * nao];
-        for j in 0..nao {
-            for p in 0..naux {
-                for l in 0..nao {
-            rkm_jpl_stage[(j * naux + p) + l * (nao * naux)] =
-                rkm[p + l * naux + j * naux * nao];
-                }
-            }
-        }
-        let rkm_jpl_t = rt::asarray((&rkm_jpl_stage, [nao * naux, nao].f(), &device));
-        let r0_col_t = rt::asarray((&r0, [naux, 1].f(), &device));
+            rkm_2d.into_shape(-1).into_raw()
+        };
+        // l-block count: ~45 l per block → 8 blocks for nao = 358.
+        let lcnt = 45usize;
 
         // Stream over AO atom blocks: one libcint shell-slice call per atom,
         // contract into vjd/vkd, drop the block.
         for (ia, &(_, p0, ni)) in blk.iter().enumerate() {
             if ni == 0 { continue; }
+            if mem_trace && ia % 3 == 0 {
+                eprintln!("MEMTRACE p1b-iter-{:02}         RSS = {:.1} MiB", ia, memory_monitor::current_rss_mb());
+            }
             let shl0 = aoslices[ia][0] as usize;
             let shl1 = aoslices[ia][1] as usize;
             let ipip1_slc: &[[usize; 2]] =
@@ -1938,33 +1933,47 @@ impl RIRHFHessian<'_> {
             }}}
 
             // ── vkd 块: vkd[x, p0+ii, l] = Σ_{p,j} ipip1_b[x, ii, j, p] · rkm[p, l, j] ──
-            // Zero-copy: ipip1_b row-major [9, ni, N, P] IS F-order [P·N, m9]
-            // (row (p,j) with p fastest, col (ii,x)), which matches rkm_jpl's
-            // row order — so vkdᵀ [N, m9] = rkm_jplᵀ [N, N·P] @ ipip1 [N·P, m9]
-            // with no staging (the old st_all write had 2.2 KB jumps, 4.2 GB
-            // total across atoms).
+            // Zero-copy ipip1 view: row-major [9, ni, N, P] IS F-order
+            // [P·N, m9] (row (p,j) with p fastest, col (ii,x)). Per l-block:
+            // rkm_l [N·P, lcnt] built on the fly, vkd_lᵀ = rkm_lᵀ·ipip1.
             {
                 let m9 = 9 * ni;
                 let ipip1_view = rt::asarray((&ipip1_b, [naux * nao, ni * 9].f(), &device));
-                let vkd_all = &rkm_jpl_t.t() % &ipip1_view; // [nao, 9·ni]
-                let raw = vkd_all.into_shape(-1).into_raw();
-                for x in 0..9 {
-                    for ii in 0..ni {
-                        for l in 0..nao {
-                            vkd[x * nao3 + (p0 + ii) * nao + l] =
-                                raw[l + (x * ni + ii) * nao];
+                for lb in (0..nao).step_by(lcnt) {
+                    let le = (lb + lcnt).min(nao);
+                    let lc = le - lb;
+                    // rkm_l [(j*naux+p) + l_loc*(nao*naux)] = Σ_occ rk[p,lb+l_loc,occ]·mc2[j,occ]
+                    // SIMD: per (l_loc,p), outer occ loop accumulates s[j] (contiguous).
+                    // rkm_l [(j*naux+p) + l_loc*(nao*naux)] = rkm[p, lb+l_loc, j]
+                    // — pure re-staging from the 0.9 GB rkm (built once).
+                    let mut rkm_l = vec![0.0; nao * naux * lc];
+                    for l_loc in 0..lc {
+                        let lg = lb + l_loc;
+                        for p in 0..naux {
+                            let rbase = p + lg * naux;
+                            let wbase = l_loc * (nao * naux);
+                            for j in 0..nao {
+                                rkm_l[j * naux + p + wbase] = rkm[rbase + j * naux * nao];
+                            }
+                        }
+                    }
+                    let rkm_l_t = rt::asarray((&rkm_l, [naux * nao, lc].f(), &device));
+                    let vkd_l = &rkm_l_t.t() % &ipip1_view; // [lc, 9·ni]
+                    let raw = vkd_l.into_shape(-1).into_raw();
+                    for x in 0..9 {
+                        for ii in 0..ni {
+                            for l_loc in 0..lc {
+                                vkd[x * nao3 + (p0 + ii) * nao + (lb + l_loc)] +=
+                                    raw[l_loc + (x * ni + ii) * lc];
+                            }
                         }
                     }
                 }
             }
             drop(ipip1_b);
         }
-
-        // rkm and rkm_jpl_stage (naux*nao² each) are only used in Phase 1b.
-        // Free before the heavier Phase 2/3 allocations.
-        drop(rkm_jpl_t);
+        // rkm (0.9 GB) is only consumed inside the Phase 1b block loop.
         drop(rkm);
-        drop(rkm_jpl_stage);
 
         self.timings.push(("  p1b_vjd_vkd", _tp1b.elapsed()));
         mt("after Phase1b");
