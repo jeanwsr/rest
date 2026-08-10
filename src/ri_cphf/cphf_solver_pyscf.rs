@@ -653,9 +653,15 @@ impl CPHFSolverPySCF {
         let mut total_matvecs: usize = 0;
         let mut cycles_done: usize = 0;
 
+        if std::env::var("REST_MEM_TRACE").is_ok() {
+            eprintln!("MEMTRACE cphf-solve-start  RSS = {:.1} MiB", crate::hessian::memory_monitor::current_rss_mb());
+        }
         // Low-rank exchange-response precomputation (ground-state, built once
         // per solve; None if no RI tensor or not applicable).
         let k_lowrank = KLowRankPrecompute::new(scf, &self.ws);
+        if std::env::var("REST_MEM_TRACE").is_ok() {
+            eprintln!("MEMTRACE cphf-lowrank-built RSS = {:.1} MiB", crate::hessian::memory_monitor::current_rss_mb());
+        }
 
         for cycle in 0..max_cycle {
             if x1.is_empty() { break; }

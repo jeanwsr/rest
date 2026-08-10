@@ -2550,6 +2550,10 @@ impl RIRHFHessian<'_> {
     /// Requires the RI intermediates produced by `calc_ej_ek`.
     pub fn calc_h1ao(&mut self) -> &mut Self {
         let _t = std::time::Instant::now();
+        // Debug intermediates (vj1_*/vk1_* per-atom matrices, ~0.6 GB) are
+        // gated behind REST_VERIFY_H1AO — they are not needed for the
+        // Hessian itself and were the dominant RSS left behind in `result`.
+        let keep_debug = std::env::var("REST_VERIFY_H1AO").is_ok();
         let scf = self.scf_data;
         let mol = &scf.mol;
         let nao = mol.num_basis;
@@ -3036,10 +3040,12 @@ impl RIRHFHessian<'_> {
 
         // Save intermediates for debug comparison (reindex to MatrixFull column-major)
         // rhoj0_P: store as [naux, 1]
-        self.result.insert(
-            "rhoj0_P".to_string(),
-            MatrixFull::from_vec([naux, 1], rhoj0_P.clone()).unwrap(),
-        );
+        if keep_debug {
+            self.result.insert(
+                "rhoj0_P".to_string(),
+                MatrixFull::from_vec([naux, 1], rhoj0_P.clone()).unwrap(),
+            );
+        }
         // vk1_buf: store as [3*nao, nao]
         {
             let mut vk1b_mf = vec![0.0; 3 * nao3];
@@ -3052,10 +3058,12 @@ impl RIRHFHessian<'_> {
                     }
                 }
             }
-            self.result.insert(
-                "vk1_buf".to_string(),
-                MatrixFull::from_vec([3 * nao, nao], vk1b_mf).unwrap(),
-            );
+            if keep_debug {
+                self.result.insert(
+                    "vk1_buf".to_string(),
+                    MatrixFull::from_vec([3 * nao, nao], vk1b_mf).unwrap(),
+                );
+            }
         }
         // vj1_buf[ia]: per-atom raw buffer before any correction
         for ia in 0..natm {
@@ -3070,10 +3078,12 @@ impl RIRHFHessian<'_> {
                     }
                 }
             }
-            self.result.insert(
-                format!("vj1_buf_{}", ia),
-                MatrixFull::from_vec([3 * nao, nao], vj1b_mf).unwrap(),
-            );
+            if keep_debug {
+                self.result.insert(
+                    format!("vj1_buf_{}", ia),
+                    MatrixFull::from_vec([3 * nao, nao], vj1b_mf).unwrap(),
+                );
+            }
         }
 
         // Per-atom: h1ao = hcore_deriv + vj1 - 0.5*vk1 + vxc_deriv1
@@ -3132,14 +3142,16 @@ impl RIRHFHessian<'_> {
                         }
                     }
                 }
-                self.result.insert(
-                    format!("vj1_neg_buf_{}", ia),
-                    MatrixFull::from_vec([3 * nao, nao], nbuf).unwrap(),
-                );
-                self.result.insert(
-                    format!("vj1_presym_{}", ia),
-                    MatrixFull::from_vec([3 * nao, nao], pres).unwrap(),
-                );
+                if keep_debug {
+                    self.result.insert(
+                        format!("vj1_neg_buf_{}", ia),
+                        MatrixFull::from_vec([3 * nao, nao], nbuf).unwrap(),
+                    );
+                    self.result.insert(
+                        format!("vj1_presym_{}", ia),
+                        MatrixFull::from_vec([3 * nao, nao], pres).unwrap(),
+                    );
+                }
             }
             // ── Auxiliary-basis response corrections (before symmetrization) ──
             let mut ip2_a: Vec<f64> = Vec::new();
@@ -3187,10 +3199,12 @@ impl RIRHFHessian<'_> {
                         }
                     }
                 }
-                self.result.insert(
-                    format!("vj1_aux_{}", ia),
-                    MatrixFull::from_vec([3 * nao, nao], aux_mat).unwrap(),
-                );
+                if keep_debug {
+                    self.result.insert(
+                        format!("vj1_aux_{}", ia),
+                        MatrixFull::from_vec([3 * nao, nao], aux_mat).unwrap(),
+                    );
+                }
             }
 
             for x in 0..3 {
@@ -3388,10 +3402,12 @@ impl RIRHFHessian<'_> {
                             }
                         }
                     }
-                    self.result.insert(
-                        format!("vk1_aux_{}", ia),
-                        MatrixFull::from_vec([3 * nao, nao], aux_mat).unwrap(),
-                    );
+                    if keep_debug {
+                        self.result.insert(
+                            format!("vk1_aux_{}", ia),
+                            MatrixFull::from_vec([3 * nao, nao], aux_mat).unwrap(),
+                        );
+                    }
                 }
             }
             for x in 0..3 {
@@ -3442,30 +3458,32 @@ impl RIRHFHessian<'_> {
             }
             self.h1ao
                 .push(MatrixFull::from_vec([3 * nao, nao], h1ao_mat).unwrap());
-            self.result.insert(
-                format!("vj1_{}", ia),
-                MatrixFull::from_vec([3 * nao, nao], vj1_mat).unwrap(),
-            );
-            self.result.insert(
-                format!("vk1_{}", ia),
-                MatrixFull::from_vec([3 * nao, nao], vk1_mat).unwrap(),
-            );
-            self.result.insert(
-                format!("vj1_presym_{}", ia),
-                MatrixFull::from_vec([3 * nao, nao], vj1p_mat).unwrap(),
-            );
-            self.result.insert(
-                format!("vk1_presym_{}", ia),
-                MatrixFull::from_vec([3 * nao, nao], vk1p_mat).unwrap(),
-            );
-            self.result.insert(
-                format!("vj1_neg_buf_{}", ia),
-                MatrixFull::from_vec([3 * nao, nao], vj1s1_mat).unwrap(),
-            );
-            self.result.insert(
-                format!("vk1_step1_{}", ia),
-                MatrixFull::from_vec([3 * nao, nao], vk1s1_mat).unwrap(),
-            );
+            if keep_debug {
+                self.result.insert(
+                    format!("vj1_{}", ia),
+                    MatrixFull::from_vec([3 * nao, nao], vj1_mat).unwrap(),
+                );
+                self.result.insert(
+                    format!("vk1_{}", ia),
+                    MatrixFull::from_vec([3 * nao, nao], vk1_mat).unwrap(),
+                );
+                self.result.insert(
+                    format!("vj1_presym_{}", ia),
+                    MatrixFull::from_vec([3 * nao, nao], vj1p_mat).unwrap(),
+                );
+                self.result.insert(
+                    format!("vk1_presym_{}", ia),
+                    MatrixFull::from_vec([3 * nao, nao], vk1p_mat).unwrap(),
+                );
+                self.result.insert(
+                    format!("vj1_neg_buf_{}", ia),
+                    MatrixFull::from_vec([3 * nao, nao], vj1s1_mat).unwrap(),
+                );
+                self.result.insert(
+                    format!("vk1_step1_{}", ia),
+                    MatrixFull::from_vec([3 * nao, nao], vk1s1_mat).unwrap(),
+                );
+            }
         }
         // Save int2c_ip1 for debug comparison
         {
@@ -3479,10 +3497,12 @@ impl RIRHFHessian<'_> {
                     }
                 }
             }
-            self.result.insert(
-                "int2c_ip1".to_string(),
-                MatrixFull::from_vec([3 * naux, naux], i21_mf).unwrap(),
-            );
+            if keep_debug {
+                self.result.insert(
+                    "int2c_ip1".to_string(),
+                    MatrixFull::from_vec([3 * naux, naux], i21_mf).unwrap(),
+                );
+            }
         }
         if self.is_rks() {
             self.timings
@@ -3504,6 +3524,7 @@ impl RIRHFHessian<'_> {
     /// Stores result in `self.result["cphf_contrib"]` as MatrixFull [n3, n3].
     pub fn calc_cphf_contrib(&mut self) -> &mut Self {
         let _t = std::time::Instant::now();
+        crate::hessian::memory_monitor::trim_to_os(0);
         if self.scf_data.mol.ctrl.print_level > 0 {
             println!("  >> Entering CP-HF contribution stage ...");
         }
