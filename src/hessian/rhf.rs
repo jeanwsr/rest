@@ -2639,73 +2639,267 @@ impl RIRHFHessian<'_> {
         // Per-atom stream: co = V⁻¹·t3c_block is scattered straight into
         // rho0_full and immediately consumed by the wj_ip1_pij GEMM; the
         // per-atom co (rho0_all) is never stored, saving a full N²·P buffer.
-        let mut coef_cache: Vec<Vec<f64>> = Vec::with_capacity(natm);
+        // ══ coef_cache built in TWO batches (half the atoms each): the 1.4 GB
+        // cache never coexists with per-atom ip2/pij_all/rho0_qb blocks.
+        // vj1_accum/vk1_accum (55 MB each) collect the coef-dependent pieces
+        // across batches; batch-independent assembly runs once after. ══
+        // H7a: wj1[ia][x,P] = Σ_{ii∈ia,j} ip1[x,p0+ii,j,P]·dm0[j,q0+ii], cached
+        // once (47 KB/atom), reused by H7b in every batch.
+        let mut wj1_cache: Vec<Vec<f64>> = Vec::with_capacity(natm);
         for ia in 0..natm {
-            let p0 = aoslices[ia][2] as usize;
-            let p1 = aoslices[ia][3] as usize;
-            let ni = p1 - p0;
-            if ni == 0 {
-                coef_cache.push(Vec::new());
-                continue;
-            }
-            // int3c2e is re-integrated per-AO-atom block (was read from the
-            // full tensor shared from calc_ej_ek). Shell-slice layout matches
-            // the full tensor exactly: element (ii, j, P) at ii*nao*naux +
-            // j*naux + P for the block, (p0+ii)*nao*naux + j*naux + P full.
             let shl0 = aoslices[ia][0] as usize;
             let shl1 = aoslices[ia][1] as usize;
-            let t3c_slc: &[[usize; 2]] =
-                &[[shl0, shl1], [0, nreg], [nreg, nreg + naux_shell]];
-            let (t3c_b, _): (Vec<f64>, Vec<usize>) = cint_all
-                .integrate_row_major("int3c2e", "s1", Some(t3c_slc))
+            let q0 = aoslices[ia][2] as usize;
+            let q1 = aoslices[ia][3] as usize;
+            let ni = q1 - q0;
+            if ni == 0 { wj1_cache.push(Vec::new()); continue; }
+            let atom_slc_h7: &[[usize; 2]] = &[[shl0, shl1], [0, nreg], [nreg, nreg + naux_shell]];
+            let (ip1_atom, _): (Vec<f64>, Vec<usize>) = cint_all
+                .integrate_row_major("int3c2e_ip1", "s1", Some(atom_slc_h7))
                 .into();
-            // Reindex t3c to block row-major [naux, ni, nao]
-            let mut block = vec![0.0; naux * ni * nao];
-            for P in 0..naux {
+            let mut wj1 = vec![0.0; 3 * naux];
+            for x in 0..3 {
                 for ii in 0..ni {
                     for j in 0..nao {
-                        block[P * ni * nao + ii * nao + j] =
-                            t3c_b[ii * nao * naux + j * naux + P];
+                        let dmv = dm0[j * nao + (q0 + ii)];
+                        let base = x * ni * nao * naux + ii * nao * naux + j * naux;
+                        let row = &ip1_atom[base..base + naux];
+                        let wbase = x * naux;
+                        let mut p = 0usize;
+                        while p + 4 <= naux {
+                            wj1[wbase + p] += row[p] * dmv;
+                            wj1[wbase + p + 1] += row[p + 1] * dmv;
+                            wj1[wbase + p + 2] += row[p + 2] * dmv;
+                            wj1[wbase + p + 3] += row[p + 3] * dmv;
+                            p += 4;
+                        }
+                        while p < naux { wj1[wbase + p] += row[p] * dmv; p += 1; }
                     }
                 }
             }
-            drop(t3c_b);
-            let mut coef = vec![0.0; naux * ni * nao];
-
-            // vinv is already F-order [naux, naux] (element (P,Q) at P + Q*naux)
-            let vinv_t = rt::asarray((&vinv, [naux, naux].f(), &device));
-            // Stage block as F-order [naux, ni*nao]: element (P, ii*nao+j) at P + (ii*nao+j)*naux
-            let mut block_stage = vec![0.0; naux * ni * nao];
-            for p in 0..naux {
-                for idx in 0..ni * nao {
-                    block_stage[p + idx * naux] = block[p * ni * nao + idx];
+            wj1_cache.push(wj1);
+            drop(ip1_atom);
+        }
+        let mut vj1_accum = vec![0.0; natm * 3 * nao3];
+        let mut vk1_accum = vec![0.0; natm * 3 * nao3];
+        let n_half = (natm + 1) / 2;
+        for half in 0..2 {
+            let alo = half * n_half;
+            let ahi = ((half + 1) * n_half).min(natm);
+            if alo >= ahi { continue; }
+            let mut coef_cache: Vec<Vec<f64>> = vec![Vec::new(); natm];
+            // ── coef batch build: coef_cache[ia] = V⁻¹·t3c[ia] (F-order [naux, ni·nao]) ──
+            for ia in alo..ahi {
+                let p0 = aoslices[ia][2] as usize;
+                let p1 = aoslices[ia][3] as usize;
+                let ni = p1 - p0;
+                if ni == 0 { continue; }
+                let shl0 = aoslices[ia][0] as usize;
+                let shl1 = aoslices[ia][1] as usize;
+                let t3c_slc: &[[usize; 2]] =
+                    &[[shl0, shl1], [0, nreg], [nreg, nreg + naux_shell]];
+                let (t3c_b, _): (Vec<f64>, Vec<usize>) = cint_all
+                    .integrate_row_major("int3c2e", "s1", Some(t3c_slc))
+                    .into();
+                let mut block = vec![0.0; naux * ni * nao];
+                for P in 0..naux {
+                    for ii in 0..ni {
+                        for j in 0..nao {
+                            block[P * ni * nao + ii * nao + j] =
+                                t3c_b[ii * nao * naux + j * naux + P];
+                        }
+                    }
+                }
+                drop(t3c_b);
+                let vinv_t = rt::asarray((&vinv, [naux, naux].f(), &device));
+                let mut block_stage = vec![0.0; naux * ni * nao];
+                for p in 0..naux {
+                    for idx in 0..ni * nao {
+                        block_stage[p + idx * naux] = block[p * ni * nao + idx];
+                    }
+                }
+                let block_t = rt::asarray((&block_stage, [naux, ni * nao].f(), &device));
+                let coef_t = (&vinv_t % &block_t);
+                let coef_raw = coef_t.into_shape(-1).into_raw();
+                coef_cache[ia] = coef_raw;
+            }
+            // ── H7b: vj1_accum[ia] += Σ_{ia2∈batch} wj1_cache[ia]·coef[ia2] ──
+            for ia in 0..natm {
+                let wj1 = &wj1_cache[ia];
+                if wj1.is_empty() { continue; }
+                let mut wj1_f_stage = vec![0.0; 3 * naux];
+                for x in 0..3 {
+                    for p in 0..naux {
+                        wj1_f_stage[x + p * 3] = wj1[x * naux + p];
+                    }
+                }
+                let wj1_f_t = rt::asarray((&wj1_f_stage, [3, naux].f(), &device));
+                let off = ia * 3 * nao3;
+                for ia2 in alo..ahi {
+                    let i0b = aoslices[ia2][2] as usize;
+                    let i1b = aoslices[ia2][3] as usize;
+                    let ni2 = i1b - i0b;
+                    if ni2 == 0 { continue; }
+                    let coef7_t = rt::asarray((&coef_cache[ia2], [naux, ni2 * nao].f(), &device));
+                    let vj1_t = (&wj1_f_t % &coef7_t);
+                    let vj1_raw = vj1_t.into_shape(-1).into_raw();
+                    for x in 0..3 {
+                        for ii in 0..ni2 {
+                            for j in 0..nao {
+                                vj1_accum[off + x * nao3 + (i0b + ii) * nao + j] +=
+                                    vj1_raw[x + (ii * nao + j) * 3];
+                            }
+                        }
+                    }
                 }
             }
-            let block_t = rt::asarray((&block_stage, [naux, ni * nao].f(), &device));
-            let coef_t = (&vinv_t % &block_t); // [naux, ni*nao] F-order
-            let coef_raw = coef_t.into_shape(-1).into_raw();
-            // Scatter to row-major [naux, ni, nao]
-            for p in 0..naux {
-                for idx in 0..ni * nao {
-                    coef[p * ni * nao + idx] = coef_raw[p + idx * naux];
+            // ── coef-dependent vj1/vk1 corrections (this batch) ──
+            for ia in 0..natm {
+                let aux_shl0 = auxslices[ia][0] as usize;
+                let aux_shl1 = auxslices[ia][1] as usize;
+                let q0_aux = auxslices[ia][2] as usize;
+                let q1 = auxslices[ia][3] as usize;
+                let qi_aux = q1 - q0_aux;
+                if qi_aux == 0 { continue; }
+                let ip2_slc: &[[usize; 2]] =
+                    &[[0, nreg], [0, nreg], [nreg + aux_shl0, nreg + aux_shl1]];
+                let (ip2_a, _): (Vec<f64>, Vec<usize>) = cint_all
+                    .integrate_row_major("int3c2e_ip2", "s1", Some(ip2_slc))
+                    .into();
+                let mut rhoj1 = vec![0.0; 3 * qi_aux];
+                for x in 0..3 {
+                    for P in 0..qi_aux {
+                        let mut s = 0.0;
+                        for i in 0..nao {
+                            for j in 0..nao {
+                                s += ip2_a[x * nao * nao * qi_aux + i * nao * qi_aux + j * qi_aux + P]
+                                    * dm0[j * nao + i];
+                            }
+                        }
+                        rhoj1[x * qi_aux + P] = s;
+                    }
                 }
+                let mut pij_all = vec![0.0; qi_aux * nao * 3 * nao];
+                {
+                    let mut i21_qb = vec![0.0; 3 * qi_aux * naux];
+                    for x in 0..3 { for p_off in 0..qi_aux { for p in 0..naux {
+                        i21_qb[(x * qi_aux + p_off) + p * (3 * qi_aux)] =
+                            i21[x * naux * naux + (q0_aux + p_off) * naux + p];
+                    }}}
+                    let i21_qb_t = rt::asarray((&i21_qb, [3 * qi_aux, naux].f(), &device));
+                    for ia2 in alo..ahi {
+                        let i0 = aoslices[ia2][2] as usize;
+                        let i1 = aoslices[ia2][3] as usize;
+                        let ni2 = i1 - i0;
+                        if ni2 == 0 { continue; }
+                        let coef_t = rt::asarray((&coef_cache[ia2], [naux, ni2 * nao].f(), &device));
+                        let out_t = &i21_qb_t % &coef_t;
+                        let out_raw = out_t.into_shape(-1).into_raw();
+                        for p_off in 0..qi_aux {
+                            for i_off in 0..ni2 {
+                                let ig = i0 + i_off;
+                                for x in 0..3 { for j in 0..nao {
+                                    pij_all[p_off * nao * 3 * nao + ig * 3 * nao + x * nao + j] =
+                                        out_raw[(x * qi_aux + p_off) + (i_off * nao + j) * (3 * qi_aux)];
+                                }}
+                            }
+                        }
+                    }
+                }
+                let mut rho0_qb = vec![0.0; qi_aux * nao * nao];
+                for ia2 in alo..ahi {
+                    let i0 = aoslices[ia2][2] as usize;
+                    let i1 = aoslices[ia2][3] as usize;
+                    let ni2 = i1 - i0;
+                    if ni2 == 0 { continue; }
+                    let cb = &coef_cache[ia2];
+                    for p_off in 0..qi_aux { for i_off in 0..ni2 {
+                        let ig = i0 + i_off;
+                        for j in 0..nao {
+                            rho0_qb[p_off * nao * nao + ig * nao + j] =
+                                cb[(q0_aux + p_off) + (i_off * nao + j) * naux];
+                        }
+                    }}
+                }
+                let aoff = ia * 3 * nao3;
+                // term1: vj1 -= 0.5·Σ rho0_qb·rhoj1  →  vj1_accum += 0.5·Σ
+                for x in 0..3 { for i in 0..nao { for j in 0..nao {
+                    let mut s = 0.0;
+                    for p_off in 0..qi_aux {
+                        s += rho0_qb[p_off * nao * nao + i * nao + j] * rhoj1[x * qi_aux + p_off];
+                    }
+                    vj1_accum[aoff + x * nao3 + i * nao + j] += 0.5 * s;
+                }}}
+                // term3: vj1 += 0.5·Σ temp·rho0_qb  →  vj1_accum -= 0.5·Σ
+                {
+                    let mut temp = vec![0.0; 3 * qi_aux];
+                    for x in 0..3 { for p_off in 0..qi_aux {
+                        let mut s = 0.0;
+                        for q in 0..naux {
+                            s += i21[x * naux * naux + (q0_aux + p_off) * naux + q] * rhoj0_P[q];
+                        }
+                        temp[x * qi_aux + p_off] = s;
+                    }}
+                    for x in 0..3 { for i in 0..nao { for j in 0..nao {
+                        let mut s = 0.0;
+                        for p_off in 0..qi_aux {
+                            s += temp[x * qi_aux + p_off] * rho0_qb[p_off * nao * nao + i * nao + j];
+                        }
+                        vj1_accum[aoff + x * nao3 + i * nao + j] -= 0.5 * s;
+                    }}}
+                }
+                // term4: vj1 += 0.5·Σ pij_all·rhoj0_P  →  vj1_accum -= 0.5·Σ
+                for x in 0..3 { for i in 0..nao { for j in 0..nao {
+                    let mut s = 0.0;
+                    for p_off in 0..qi_aux {
+                        s += pij_all[p_off * nao * 3 * nao + i * 3 * nao + x * nao + j]
+                            * rhoj0_P[q0_aux + p_off];
+                    }
+                    vj1_accum[aoff + x * nao3 + i * nao + j] -= 0.5 * s;
+                }}}
+                // vk1 term2: vk1 += pij@plj_reord  →  vk1_accum +=
+                if self.factor_k != 0.0 {
+                    let q0 = q0_aux;
+                    let mut rhok0_PlJ = vec![0.0; qi_aux * nao * nao];
+                    {
+                        let mut rkp_stage = vec![0.0; qi_aux * nao * nocc];
+                        for p in 0..qi_aux { for l in 0..nao { for j in 0..nocc {
+                            rkp_stage[(p * nao + l) + j * (qi_aux * nao)] =
+                                rhok0_Pl_[(q0 + p) * nao * nocc + l * nocc + j];
+                        }}}
+                        let rkp_t = rt::asarray((&rkp_stage, [qi_aux * nao, nocc].f(), &device));
+                        let mc2_t_aux = rt::asarray((mc2.as_slice(), [nocc, nao].f(), &device));
+                        let plj_t = (&rkp_t % &mc2_t_aux);
+                        let plj_raw = plj_t.into_shape(-1).into_raw();
+                        for p in 0..qi_aux { for l in 0..nao { for j_idx in 0..nao {
+                            rhok0_PlJ[p * nao * nao + l * nao + j_idx] =
+                                plj_raw[(p * nao + l) + j_idx * (qi_aux * nao)];
+                        }}}
+                    }
+                    let mut plj_reord_aux = vec![0.0; nao * qi_aux * nao];
+                    for j in 0..nao { for p in 0..qi_aux { for l in 0..nao {
+                        plj_reord_aux[(j * qi_aux + p) + l * (nao * qi_aux)] =
+                            rhok0_PlJ[p * nao * nao + l * nao + j];
+                    }}}
+                    let plj_reord_t = rt::asarray((&plj_reord_aux, [nao * qi_aux, nao].f(), &device));
+                    for x in 0..3 {
+                        let mut pij_stage = vec![0.0; nao * nao * qi_aux];
+                        for i in 0..nao { for j in 0..nao { for p in 0..qi_aux {
+                            pij_stage[i + (j * qi_aux + p) * nao] =
+                                pij_all[p * nao * 3 * nao + j * 3 * nao + x * nao + i];
+                        }}}
+                        let pij_t = rt::asarray((&pij_stage, [nao, nao * qi_aux].f(), &device));
+                        let vk1_corr_t = (&pij_t % &plj_reord_t);
+                        let vk1_corr_raw = vk1_corr_t.into_shape(-1).into_raw();
+                        for i in 0..nao { for l in 0..nao {
+                            vk1_accum[aoff + x * nao3 + i * nao + l] += vk1_corr_raw[i + l * nao];
+                        }}
+                    }
+                }
+                drop(ip2_a); drop(pij_all); drop(rho0_qb);
             }
-
-            // coef_cache[ia]: F-order [naux, ni·nao] (row P, col ii·nao+j) —
-            //   V⁻¹·t3c[ia]. Replaces both the dead rho0_full scatter and the
-            //   2.7 GB wj_ip1_pij (i21·coef is applied per aux-atom block in
-            //   the consumer loop instead — 18× less storage).
-            coef_cache.push(coef_raw);
         }
-        // (rhoj0_P / rhok0_Pl_ reuse r0/rk from calc_ej_ek — the old per-atom
-        //  co·dm0 / co·mc2 contraction loops are gone. rho0_full scatter and
-        //  wj_ip1_pij now happen inside the single per-atom stream above.)
 
-        if std::env::var("REST_MEM_TRACE").is_ok() {
-            eprintln!("MEMTRACE h1ao-coef-built     RSS = {:.1} MiB", memory_monitor::current_rss_mb());
-        }
-        // vj1_buf (per-atom) + vk1_buf (single, accumulated once)
-        let mut vj1_buf = vec![0.0; natm * 3 * nao3];
         // H2a: rhok0_PlJ[P,l,J] = Σ_j rhok0_Pl_[P,l,j] * mc2[J,j]
         //   GEMM: rhok0_Pl_ staged F-order [naux*nao, nocc] @ mc2^T F-order [nocc, nao]
         //         = rhok0_PlJ F-order [naux*nao, nao]
@@ -2840,97 +3034,6 @@ impl RIRHFHessian<'_> {
         rk_pl_stage = rk_pl_stage_new;
         }
 
-        // rho0_full is used directly as a zero-copy F-order view in H7b:
-        // rho0_full row-major [naux, nao²] element (P, idx) at P*nao²+idx equals
-        // F-order [nao², naux] flat idx + P*nao², so .t() gives [naux, nao²]
-        // with element (P, idx) at P*nao² + idx. No staging copy needed.
-        // ── H7: vj1_buf per-atom ──
-        // PySCF-style: compute int3c2e_ip1 per atom (not global), contract immediately.
-        // This avoids loading a 640MB global ip1 tensor and its cache-unfriendly staging.
-        // ip1_atom[3, ni, nao, naux] = ∂(ii,jj|P)/∂x for ii in atom ia's shells
-        for ia in 0..natm {
-            let shl0 = aoslices[ia][0] as usize;
-            let shl1 = aoslices[ia][1] as usize;
-            let q0 = aoslices[ia][2] as usize;
-            let q1 = aoslices[ia][3] as usize;
-            let ni = q1 - q0;
-            if std::env::var("REST_MEM_TRACE").is_ok() {
-                eprintln!("MEMTRACE h1ao-H7-iter-{:02}   RSS = {:.1} MiB", ia, memory_monitor::current_rss_mb());
-            }
-            // Compute per-atom int3c2e_ip1 (same as ip1_a computed later in per-atom loop)
-            let atom_slc_h7: &[[usize; 2]] = &[[shl0, shl1], [0, nreg], [nreg, nreg + naux_shell]];
-            let (ip1_atom, _): (Vec<f64>, Vec<usize>) = cint_all
-                .integrate_row_major("int3c2e_ip1", "s1", Some(atom_slc_h7))
-                .into();
-            // ip1_atom layout: [3, ni, nao, naux] row-major, element (x, ii, j, P) at
-            //   x*ni*nao*naux + ii*nao*naux + j*naux + P
-            // H7a: wj1[x,P] = Σ_{ii,j} ip1_atom[x,ii,j,P] * dm0[j, q0+ii]
-            //   = Σ_{ii,j} ip1_atom[x,ii,j,P] * dm0[j*nao + (q0+ii)]
-            // H7b: vj1_buf[ia][x,i,j] += Σ_P wj1[x,P] * rho0_full[P,i,j]
-            let mut wj1 = vec![0.0; 3 * naux];
-
-            use rstsr::prelude::*;
-            // ── H7a: wj1 = ip1_atom^T · dm0_vec ──
-            // ip1_atom staged as F-order [3*naux, ni*nao]:
-            //   row (x*naux+P), col (ii*nao+j): element = ip1_atom[x*ni*nao*naux + ii*nao*naux + j*naux + P]
-            let mut ip1_stage = vec![0.0; 3 * naux * ni * nao];
-            for x in 0..3 {
-                for p in 0..naux {
-                    for ii in 0..ni {
-                        for j in 0..nao {
-                            ip1_stage[(x * naux + p) + (ii * nao + j) * (3 * naux)] =
-                                ip1_atom[x * ni * nao * naux + ii * nao * naux + j * naux + p];
-                        }
-                    }
-                }
-            }
-            let ip1_t = rt::asarray((&ip1_stage, [3 * naux, ni * nao].f(), &device));
-            // dm0_vec: dm0[j, q0+ii] → F-order [ni*nao, 1]
-            let mut dm0_vec = vec![0.0; ni * nao];
-            for ii in 0..ni {
-                for j in 0..nao {
-                    dm0_vec[ii * nao + j] = dm0[j * nao + (q0 + ii)];
-                }
-            }
-            let dm0_t = rt::asarray((&dm0_vec, [ni * nao, 1].f(), &device));
-            let wj1_t = (&ip1_t % &dm0_t); // [3*naux, 1] F-order
-            let wj1_raw = wj1_t.into_shape(-1).into_raw();
-            for x in 0..3 {
-                for p in 0..naux {
-                    wj1[x * naux + p] = wj1_raw[x * naux + p];
-                }
-            }
-
-            // ── H7b: vj1_buf[ia] += wj1 · rho0_full (full nao² rows, i.e.
-            //    over every AO atom block ia2 via coef_cache[ia2]) ──
-            // vj1_buf[ia][x, p0_ia2+ii, j] += Σ_P wj1[x,P]·coef_cache[ia2][P + (ii·nao+j)·naux]
-            let mut wj1_f_stage = vec![0.0; 3 * naux];
-            for x in 0..3 {
-                for p in 0..naux {
-                    wj1_f_stage[x + p * 3] = wj1[x * naux + p];
-                }
-            }
-            let wj1_f_t = rt::asarray((&wj1_f_stage, [3, naux].f(), &device));
-            let off = ia * 3 * nao3;
-            for ia2 in 0..natm {
-                let i0b = aoslices[ia2][2] as usize;
-                let i1b = aoslices[ia2][3] as usize;
-                let ni2 = i1b - i0b;
-                if ni2 == 0 { continue; }
-                let coef7_t = rt::asarray((&coef_cache[ia2], [naux, ni2 * nao].f(), &device));
-                let vj1_t = (&wj1_f_t % &coef7_t); // [3, ni2·nao] F-order
-                let vj1_raw = vj1_t.into_shape(-1).into_raw();
-                for x in 0..3 {
-                    for ii in 0..ni2 {
-                        for j in 0..nao {
-                            vj1_buf[off + x * nao3 + (i0b + ii) * nao + j] +=
-                                vj1_raw[x + (ii * nao + j) * 3];
-                        }
-                    }
-                }
-            }
-        }
-
         // Save intermediates for debug comparison (reindex to MatrixFull column-major)
         // rhoj0_P: store as [naux, 1]
         self.result.insert(
@@ -2963,7 +3066,7 @@ impl RIRHFHessian<'_> {
                     for j in 0..nao {
                         let src = x * nao3 + i * nao + j;
                         let dst = (x * nao + i) + j * 3 * nao;
-                        vj1b_mf[dst] = vj1_buf[off + src];
+                        vj1b_mf[dst] = vj1_accum[off + src];
                     }
                 }
             }
@@ -2996,7 +3099,7 @@ impl RIRHFHessian<'_> {
                 .into();
             let mut vj1 = vec![0.0; 3 * nao3];
             for i in 0..3 * nao3 {
-                vj1[i] = -vj1_buf[off + i];
+                vj1[i] = -vj1_accum[off + i];
             }
             // Save neg_buf (before any rhoj0 correction, for debug comparison)
             let vj1_neg_buf = vj1.clone();
@@ -3042,107 +3145,22 @@ impl RIRHFHessian<'_> {
             let mut ip2_a: Vec<f64> = Vec::new();
             let mut qi_aux: usize = 0;
             let mut q0_aux: usize = 0;
-            let mut pij_all: Vec<f64> = Vec::new();
 
             let aux_shl0 = auxslices[ia][0] as usize;
             let aux_shl1 = auxslices[ia][1] as usize;
             q0_aux = auxslices[ia][2] as usize;
             let q1 = auxslices[ia][3] as usize;
             qi_aux = q1 - q0_aux;
-            // int3c2e_ip2 for this aux atom: (ij|∂P/∂x)
-            let ip2_slc: &[[usize; 2]] =
-                &[[0, nreg], [0, nreg], [nreg + aux_shl0, nreg + aux_shl1]];
-            let ip2_result: (Vec<f64>, Vec<usize>) = cint_all
-                .integrate_row_major("int3c2e_ip2", "s1", Some(ip2_slc))
-                .into();
-            ip2_a = ip2_result.0;
-            if std::env::var("REST_MEM_TRACE").is_ok() && ia % 2 == 0 {
-                eprintln!("MEMTRACE h1ao-ip2-{:02}       RSS = {:.1} MiB", ia, memory_monitor::current_rss_mb());
-            }
-            // Build pij_all from coef_cache (equivalent to _load_dim0 for
-            // q0_aux:q1): pij_all[p_off, i_global, x, j] =
-            //   Σ_p i21[x, q0_aux+p_off, p]·coef_cache[ia2][p, ii, j] — the
-            //   per-aux-atom i21 slice contracts coef on the fly (no 2.7 GB
-            //   wj_ip1_pij full tensor).
-            if std::env::var("REST_MEM_TRACE").is_ok() {
-                eprintln!("MEMTRACE h1ao-pij-{:02}      RSS = {:.1} MiB", ia, memory_monitor::current_rss_mb());
-            }
-            pij_all = vec![0.0; qi_aux * nao * 3 * nao];
-            {
-                let mut i21_qb = vec![0.0; 3 * qi_aux * naux];
-                for x in 0..3 { for p_off in 0..qi_aux { for p in 0..naux {
-                    i21_qb[(x * qi_aux + p_off) + p * (3 * qi_aux)] =
-                        i21[x * naux * naux + (q0_aux + p_off) * naux + p];
-                }}}
-                let i21_qb_t = rt::asarray((&i21_qb, [3 * qi_aux, naux].f(), &device));
-                for ia2 in 0..natm {
-                    let i0 = aoslices[ia2][2] as usize;
-                    let i1 = aoslices[ia2][3] as usize;
-                    let ni2 = i1 - i0;
-                    if ni2 == 0 { continue; }
-                    let coef_t = rt::asarray((&coef_cache[ia2], [naux, ni2 * nao].f(), &device));
-                    let out_t = &i21_qb_t % &coef_t; // [3qi, ni2·nao] F-order
-                    let out_raw = out_t.into_shape(-1).into_raw();
-                    for p_off in 0..qi_aux {
-                        let i_global = i0;
-                        for i_off in 0..ni2 {
-                            let ig = i0 + i_off;
-                            for x in 0..3 {
-                                for j in 0..nao {
-                                    pij_all[p_off * nao * 3 * nao + ig * 3 * nao + x * nao + j] =
-                                        out_raw[(x * qi_aux + p_off) + (i_off * nao + j) * (3 * qi_aux)];
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // rhoj1[x,P] = Σ_{i,j} ip2[x,i,j,P] * dm0[j,i]
-            let mut rhoj1 = vec![0.0; 3 * qi_aux];
-            for x in 0..3 {
-                for P in 0..qi_aux {
-                    let mut s = 0.0;
-                    for i in 0..nao {
-                        for j in 0..nao {
-                            s += ip2_a[x * nao * nao * qi_aux + i * nao * qi_aux + j * qi_aux + P]
-                                * dm0[j * nao + i];
-                        }
-                    }
-                    rhoj1[x * qi_aux + P] = s;
-                }
-            }
-            // rho0_qb[qb-block] = coef_cache scattered to full AO rows
-            // (i_global = p0+ii): [qi, N, N] — replaces the global rho0_full.
-            let mut rho0_qb = vec![0.0; qi_aux * nao * nao];
-            for ia2 in 0..natm {
-                let i0 = aoslices[ia2][2] as usize;
-                let i1 = aoslices[ia2][3] as usize;
-                let ni2 = i1 - i0;
-                if ni2 == 0 { continue; }
-                let cb = &coef_cache[ia2];
-                for p_off in 0..qi_aux {
-                    for i_off in 0..ni2 {
-                        let ig = i0 + i_off;
-                        for j in 0..nao {
-                            rho0_qb[p_off * nao * nao + ig * nao + j] =
-                                cb[(q0_aux + p_off) + (i_off * nao + j) * naux];
-                        }
-                    }
-                }
-            }
-            // vj1 correction term 1: += -0.5 * Σ_P rho0_full[q0_aux+P,i,j] * rhoj1[x,P]
-            //   (rho0_qb[p_off, i, j] — full AO rows, rebuilt from coef_cache)
-            for x in 0..3 {
-                for i in 0..nao {
-                    for j in 0..nao {
-                        let mut s = 0.0;
-                        for p_off in 0..qi_aux {
-                            s += rho0_qb[p_off * nao * nao + i * nao + j]
-                                * rhoj1[x * qi_aux + p_off];
-                        }
-                        vj1[x * nao3 + i * nao + j] -= 0.5 * s;
-                    }
-                }
+            // int3c2e_ip2 for this aux atom: (ij|∂P/∂x) — used by term2 and
+            // vk1 term1 (both batch-independent); coef-dependent terms 1/3/4
+            // were accumulated into vj1_accum/vk1_accum in the batch loop.
+            if qi_aux > 0 {
+                let ip2_slc: &[[usize; 2]] =
+                    &[[0, nreg], [0, nreg], [nreg + aux_shl0, nreg + aux_shl1]];
+                let ip2_result: (Vec<f64>, Vec<usize>) = cint_all
+                    .integrate_row_major("int3c2e_ip2", "s1", Some(ip2_slc))
+                    .into();
+                ip2_a = ip2_result.0;
             }
             // vj1 correction term 2: += -0.5 * Σ_P ip2[x,i,j,P] * rhoj0_P[q0_aux+P]
             for x in 0..3 {
@@ -3156,55 +3174,6 @@ impl RIRHFHessian<'_> {
                         vj1[x * nao3 + i * nao + j] -= 0.5 * s;
                     }
                 }
-            }
-            // vj1 correction term 3: += +0.5 * Σ_{p,q} i21[x,q0_aux+p,q] * rhoj0_P[q] * rho0_full[q0_aux+p,i,j]
-            // Factorized: the inner Σ_q is independent of (i,j).
-            //   Step 1: temp[x, p_off] = Σ_q i21[x, q0_aux+p_off, q] * rhoj0_P[q]  (3×qi_aux×naux FLOPs)
-            //   Step 2: vj1[x,i,j] += 0.5 * Σ_{p_off} temp[x,p_off] * rho0_full[q0_aux+p_off, i, j]  (3×nao²×qi_aux FLOPs)
-            // This reduces ~212M FLOPs/atom to ~715K for C4H6 (~300x reduction).
-            {
-                // Step 1: compute temp[x, p_off]
-                let mut temp = vec![0.0; 3 * qi_aux];
-                for x in 0..3 {
-                    for p_off in 0..qi_aux {
-                        let mut s = 0.0;
-                        for q in 0..naux {
-                            s += i21[x * naux * naux + (q0_aux + p_off) * naux + q] * rhoj0_P[q];
-                        }
-                        temp[x * qi_aux + p_off] = s;
-                    }
-                }
-                // Step 2: vj1[x,i,j] += 0.5 * Σ_{p_off} temp[x,p_off] * rho0_qb[p_off, i, j]
-                //   (rho0_full[P,i,j] rebuilt per aux block from coef_cache —
-                //    150 MB transient, no 902 MB global)
-                for x in 0..3 {
-                    for i in 0..nao {
-                        for j in 0..nao {
-                            let mut s = 0.0;
-                            for p_off in 0..qi_aux {
-                                s += temp[x * qi_aux + p_off]
-                                    * rho0_qb[p_off * nao * nao + i * nao + j];
-                            }
-                            vj1[x * nao3 + i * nao + j] += 0.5 * s;
-                        }
-                    }
-                }
-            }
-            // vj1 correction term 4: += +0.5 * Σ_p pij_all[p,i,x,j] * rhoj0_P[q0_aux+p]
-            for x in 0..3 {
-                for i in 0..nao {
-                    for j in 0..nao {
-                        let mut s = 0.0;
-                        for p_off in 0..qi_aux {
-                            s += pij_all[p_off * nao * 3 * nao + i * 3 * nao + x * nao + j]
-                                * rhoj0_P[q0_aux + p_off];
-                        }
-                        vj1[x * nao3 + i * nao + j] += 0.5 * s;
-                    }
-                }
-            }
-            if std::env::var("REST_MEM_TRACE").is_ok() && ia % 2 == 0 {
-                eprintln!("MEMTRACE h1ao-corr-{:02}      RSS = {:.1} MiB", ia, memory_monitor::current_rss_mb());
             }
             // Save vj1_aux for debug comparison
             {
@@ -3396,23 +3365,13 @@ impl RIRHFHessian<'_> {
                             }
                         }
                     }
-                    // Term 2: vk1 += pij @ plj_reord (reuse plj_reord_t)
+                    // Term 2 (coef-dependent): vk1 += vk1_accum[ia]
+                    // (accumulated across coef batches in the batch loop)
                     for x in 0..3 {
-                        let mut pij_stage = vec![0.0; nao * nao * qi_aux];
-                        for i in 0..nao {
-                            for j in 0..nao {
-                                for p in 0..qi_aux {
-                                    pij_stage[i + (j * qi_aux + p) * nao] =
-                                        pij_all[p * nao * 3 * nao + j * 3 * nao + x * nao + i];
-                                }
-                            }
-                        }
-                        let pij_t = rt::asarray((&pij_stage, [nao, nao * qi_aux].f(), &device));
-                        let vk1_corr_t = (&pij_t % &plj_reord_t);
-                        let vk1_corr_raw = vk1_corr_t.into_shape(-1).into_raw();
                         for i in 0..nao {
                             for l in 0..nao {
-                                vk1[x * nao3 + i * nao + l] += vk1_corr_raw[i + l * nao];
+                                vk1[x * nao3 + i * nao + l] +=
+                                    vk1_accum[ia * 3 * nao3 + x * nao3 + i * nao + l];
                             }
                         }
                     }
