@@ -2692,6 +2692,9 @@ impl RIRHFHessian<'_> {
         //  co·dm0 / co·mc2 contraction loops are gone. rho0_full scatter and
         //  wj_ip1_pij now happen inside the single per-atom stream above.)
 
+        if std::env::var("REST_MEM_TRACE").is_ok() {
+            eprintln!("MEMTRACE h1ao-coef-built     RSS = {:.1} MiB", memory_monitor::current_rss_mb());
+        }
         // vj1_buf (per-atom) + vk1_buf (single, accumulated once)
         let mut vj1_buf = vec![0.0; natm * 3 * nao3];
         // H2a: rhok0_PlJ[P,l,J] = Σ_j rhok0_Pl_[P,l,j] * mc2[J,j]
@@ -2726,7 +2729,6 @@ impl RIRHFHessian<'_> {
         let mut vk1_buf = vec![0.0; 3 * nao3];
         let mut rk_pl_stage: Vec<f64> = Vec::new();
         if self.factor_k != 0.0 {
-        let mut rhok0_PlJ = vec![0.0; naux * nao * nao];
         let mut vk1_buf_new = vec![0.0; 3 * nao3];
         // Pre-stage rhok0_Pl_ once as F-order [naux*nao, nocc] — shared by H2a and H3a.
         // Previously H3a re-staged this (2.5M elements × natm = 30M useless copies for C6H6).
@@ -2743,20 +2745,9 @@ impl RIRHFHessian<'_> {
             stage
         };
 
-        use rstsr::prelude::*;
-        // ── H2a: rhok0_PlJ = rhok0_Pl_ @ mc2^T ── (uses pre-staged rk_pl_stage)
-        let rk_pl_t = rt::asarray((&rk_pl_stage_new, [naux * nao, nocc].f(), &device));
-        let mc2_t_h2 = rt::asarray((mc2.as_slice(), [nocc, nao].f(), &device));
-        let plj_t = (&rk_pl_t % &mc2_t_h2); // [naux*nao, nao] F-order
-        let plj_raw = plj_t.into_shape(-1).into_raw();
-        for p in 0..naux {
-            for l in 0..nao {
-                for j_idx in 0..nao {
-                    rhok0_PlJ[p * nao * nao + l * nao + j_idx] =
-                        plj_raw[(p * nao + l) + j_idx * (naux * nao)];
-                }
-            }
-        }
+        // H2a/H2b: the 0.9 GB rhok0_PlJ (= rhok0_Pl_·mc2ᵀ) is NOT built in
+        // full: each aux-atom block builds only its [nq, N, N] slice on the
+        // fly from rhok0_Pl_ + mc2 (~50 MB) and contracts with ip1_block.
 
         // ── H2b: vk1_buf[x,i,l] = Σ_{P,j} ip1[x,i,j,P] * rhok0_PlJ[P,l,j] ──
         // PySCF-style aux-blocked: compute int3c2e_ip1 per aux-atom-block,
@@ -2784,6 +2775,9 @@ impl RIRHFHessian<'_> {
             if nq == 0 {
                 continue;
             }
+            if std::env::var("REST_MEM_TRACE").is_ok() && ia_aux == 0 {
+                eprintln!("MEMTRACE h1ao-H2b-iter      RSS = {:.1} MiB", memory_monitor::current_rss_mb());
+            }
             // Compute int3c2e_ip1 for this aux block: [3, nao, nao, nq]
             let aux_block_slc: &[[usize; 2]] =
                 &[[0, nreg], [0, nreg], [nreg + aux_shl0, nreg + aux_shl1]];
@@ -2793,13 +2787,19 @@ impl RIRHFHessian<'_> {
             // ip1_block layout: [3, nao, nao, nq] row-major
             //   element (x, i, j, p_local) at x*nao*nao*nq + i*nao*nq + j*nq + p_local
 
-            // Stage plj_block_reord as F-order [nao*nq, nao]: rows (j, p_local), cols l
+            // plj_block_stage [N·nq, N] F-order: rows (j, p_loc), cols l
+            // = Σ_occ rhok0_Pl_[(ap0+p_loc), l, occ]·mc2[j, occ] — built on the
+            // fly (no 0.9 GB rhok0_PlJ); SIMD over j (contiguous).
             let mut plj_block_stage = vec![0.0; nao * nq * nao];
-            for j in 0..nao {
-                for p_loc in 0..nq {
-                    for l in 0..nao {
-                        plj_block_stage[(j * nq + p_loc) + l * (nao * nq)] =
-                            rhok0_PlJ[(ap0 + p_loc) * nao * nao + l * nao + j];
+            for p_loc in 0..nq {
+                for l in 0..nao {
+                    let rbase = (ap0 + p_loc) * nao * nocc + l * nocc;
+                    let rrow = &rhok0_Pl_[rbase..rbase + nocc];
+                    for j in 0..nao {
+                        let mut s = 0.0;
+                        let mbase = j * nocc;
+                        for occ in 0..nocc { s += rrow[occ] * mc2[mbase + occ]; }
+                        plj_block_stage[(j * nq + p_loc) + l * (nao * nq)] = s;
                     }
                 }
             }
@@ -2845,6 +2845,9 @@ impl RIRHFHessian<'_> {
             let q0 = aoslices[ia][2] as usize;
             let q1 = aoslices[ia][3] as usize;
             let ni = q1 - q0;
+            if std::env::var("REST_MEM_TRACE").is_ok() {
+                eprintln!("MEMTRACE h1ao-H7-iter-{:02}   RSS = {:.1} MiB", ia, memory_monitor::current_rss_mb());
+            }
             // Compute per-atom int3c2e_ip1 (same as ip1_a computed later in per-atom loop)
             let atom_slc_h7: &[[usize; 2]] = &[[shl0, shl1], [0, nreg], [nreg, nreg + naux_shell]];
             let (ip1_atom, _): (Vec<f64>, Vec<usize>) = cint_all
@@ -3049,6 +3052,9 @@ impl RIRHFHessian<'_> {
             //   Σ_p i21[x, q0_aux+p_off, p]·coef_cache[ia2][p, ii, j] — the
             //   per-aux-atom i21 slice contracts coef on the fly (no 2.7 GB
             //   wj_ip1_pij full tensor).
+            if std::env::var("REST_MEM_TRACE").is_ok() {
+                eprintln!("MEMTRACE h1ao-pij-{:02}      RSS = {:.1} MiB", ia, memory_monitor::current_rss_mb());
+            }
             pij_all = vec![0.0; qi_aux * nao * 3 * nao];
             {
                 let mut i21_qb = vec![0.0; 3 * qi_aux * naux];
