@@ -41,7 +41,6 @@ pub struct EjEkContext<'a> {
     pub vjd: &'a [f64],
     pub vkd: &'a [f64],
     pub wj2: &'a [f64],
-    pub wki: &'a [f64],
     pub wk2: &'a [f64],
     pub rkoo: &'a [f64],
     pub r2c0: &'a [f64],
@@ -503,7 +502,7 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
     let natm = ctx.natm; let nao3 = ctx.nao3;
     let blk = ctx.blk; let aux_blk = ctx.aux_blk;
     let dm0 = ctx.dm0; let mc2 = ctx.mc2;
-    let i21 = ctx.i21; let rk = ctx.rk; let wki = ctx.wki;
+    let i21 = ctx.i21; let rk = ctx.rk;
     let ip1 = ctx.ip1; let i2inv = ctx.i2inv;
     let r0 = ctx.r0; let rj1 = ctx.rj1; let wj001 = ctx.wj001; let wj2 = ctx.wj2;
     let device = ctx.device.clone();
@@ -624,6 +623,9 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
             //   wk1_IpJ[j0-block] = wki[·,pg∈j0,·,·]·dm0 both full-K GEMMs.
             // ══════════════════════════════════════════════════════════
             // ── Loop A: t1 + t3 ──
+            if std::env::var("REST_MEM_TRACE").is_ok() {
+                eprintln!("MEMTRACE g5-loopA-start      RSS = {:.1} MiB", memory_monitor::current_rss_mb());
+            }
             for i0 in 0..natm {
                 let (_, p0, ni) = blk[i0];
                 if ni == 0 { continue; }
@@ -728,6 +730,9 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                 drop(ip12_i0);
             }
             // ── Loop B: t2 + t4 ──
+            if std::env::var("REST_MEM_TRACE").is_ok() {
+                eprintln!("MEMTRACE g5-loopB-start      RSS = {:.1} MiB", memory_monitor::current_rss_mb());
+            }
             for j0 in 0..natm { let (_, aq0, ql) = aux_blk[j0]; if ql == 0 { continue; }
                 // tmpf[j0-block] = V⁻¹[j0-block,:]·ip1ᵀ : [ql, 3N²] F-order
                 let mut tmpf_j0 = vec![0.0; ql * 3 * nao3];
@@ -750,6 +755,37 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                         i21[y * naux * naux + (aq0 + pl) * naux + q];
                 }}}
                 let i21_j0_t = rt::asarray((&i21_j0, [3 * ql, naux].f(), &device));
+                // ip2[pg∈j0] block: [3, N, N, ql] row-major (y, j', u, pl).
+                // wk1_IpJ[ii,pl,y,j] = (dm0·ip2_y_pl·dm0)[p0+ii, j] — built on
+                // the fly (two batched GEMMs per y), no wki full tensor.
+                let aux_shl0 = ctx.auxslices[j0][0] as usize;
+                let aux_shl1 = ctx.auxslices[j0][1] as usize;
+                let ip2_slc: &[[usize; 2]] =
+                    &[[0, ctx.nreg], [0, ctx.nreg], [ctx.nreg + aux_shl0, ctx.nreg + aux_shl1]];
+                let (ip2_j0, _): (Vec<f64>, Vec<usize>) = ctx.cint_all
+                    .integrate_row_major("int3c2e_ip2", "s1", Some(ip2_slc))
+                    .into();
+                // A_all[(pl,j'),j] = Σ_u ip2_y[j',u,pl]·dm0[u,j] per y — j0-level
+                // (independent of i0); stored transposed as A_r [N, N·ql]
+                // (row j', col (pl,j)) so the per-i0 B = dm0·A is one GEMM.
+                let mut a_r_all = vec![0.0; 3 * nao * nao * ql];
+                for y in 0..3 {
+                    let mut ip2_y_2d = vec![0.0; nao * ql * nao];
+                    for jp in 0..nao { for u in 0..nao { for pl in 0..ql {
+                        ip2_y_2d[(pl * nao + jp) + u * (nao * ql)] =
+                            ip2_j0[y * nao * nao * ql + jp * nao * ql + u * ql + pl];
+                    }}}
+                    let ip2_y_t = rt::asarray((&ip2_y_2d, [nao * ql, nao].f(), &device));
+                    let a_t = &ip2_y_t % &dm0_t; // [N·ql, N] row (pl,j'), col j
+                    let a_raw = a_t.into_shape(-1).into_raw();
+                    let mut a_r = vec![0.0; nao * nao * ql];
+                    for pl in 0..ql { for j in 0..nao { for jp in 0..nao {
+                        a_r[jp + (pl * nao + j) * nao] =
+                            a_raw[(pl * nao + jp) + j * (nao * ql)];
+                    }}}
+                    a_r_all[y * nao * nao * ql..(y + 1) * nao * nao * ql]
+                        .copy_from_slice(&a_r);
+                }
                 for i0 in 0..natm {
                     let (_, p0, ni) = blk[i0];
                     if ni == 0 { continue; }
@@ -797,29 +833,24 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                     let rk_pji_t_g5b = rt::asarray((&rk_PJI, [naux, nao * ni].f(), &device));
                     let wk1_pji_j0_t = &i21_j0_t % &rk_pji_t_g5b; // [3ql, N·ni]
                     let wk1_pji_j0_raw = wk1_pji_j0_t.into_shape(-1).into_raw();
-                    // wk1_IpJ[j0-block] : wk1_IpJ[ii, aq0+pl, y, j] =
-                    //   Σ_{j'} wki[(p0+ii), aq0+pl, y, j']·dm0[j', j]
-                    // wki_j0 [ql·ni·3, N] F-order (row (pl,ii,y), col j')
-                    let mut wki_j0 = vec![0.0; ql * ni * 3 * nao];
-                    for pl in 0..ql { for ii in 0..ni { for y in 0..3 {
-                        let row = (pl * ni + ii) * 3 + y;
-                        let wbase = (p0 + ii) * naux * 3 * nao + (aq0 + pl) * 3 * nao + y * nao;
-                        for jp in 0..nao {
-                            wki_j0[row + jp * (ql * ni * 3)] = wki[wbase + jp];
-                        }
-                    }}}
-                    let wki_j0_t = rt::asarray((&wki_j0, [ql * ni * 3, nao].f(), &device));
-                    let wk1_ipj_t = &wki_j0_t % &dm0_t; // [ql·ni·3, N] row (pl,ii,y), col j
-                    let wk1_ipj_raw = wk1_ipj_t.into_shape(-1).into_raw();
-                    // transpose to [ql, ni·3·N] (row pl, col ii·3N + y·N + j)
+                    // wk1_IpJ[j0-block] = dm0·A per i0: B[ii,(pl,j)] =
+                    //   Σ_j' dm0[p0+ii,j']·A_r[j',(pl,j)] — GEMM [ni,N]@[N,N·ql]
+                    //   per y (A_r precomputed at j0 level). wk1_IpJ[pl,ii,y,j]=B[ii,(pl,j)].
+                    let mut dm0_p0 = vec![0.0; ni * nao]; // [ni, N] F-order (row ii, col j')
+                    for ii in 0..ni { for jp in 0..nao {
+                        dm0_p0[ii + jp * ni] = dm0[(p0 + ii) * nao + jp];
+                    }}
+                    let dm0_p0_t = rt::asarray((&dm0_p0, [ni, nao].f(), &device));
                     let mut wk1_ipj_alt = vec![0.0; ql * ni * 3 * nao];
-                    for pl in 0..ql { for ii in 0..ni { for y in 0..3 {
-                        let r = (pl * ni + ii) * 3 + y;
-                        let c = (ii * 3 * nao + y * nao) * ql;
-                        for j in 0..nao {
-                            wk1_ipj_alt[pl + c + j * ql] = wk1_ipj_raw[r + j * (ql * ni * 3)];
-                        }
-                    }}}
+                    for y in 0..3 {
+                        let a_r_t = rt::asarray((&a_r_all[y * nao * nao * ql..], [nao, nao * ql].f(), &device));
+                        let b_t = &dm0_p0_t % &a_r_t; // [ni, N·ql] row ii, col (pl,j)
+                        let b_raw = b_t.into_shape(-1).into_raw();
+                        for pl in 0..ql { for ii in 0..ni { for j in 0..nao {
+                            wk1_ipj_alt[pl + (ii * 3 * nao + y * nao + j) * ql] =
+                                b_raw[ii + (pl * nao + j) * ni];
+                        }}}
+                    }
                     // t2 / t4 (single pass over tmpf_j0)
                     let mut t2 = [0.0f64; 9];
                     let mut t4 = [0.0f64; 9];
@@ -1955,7 +1986,9 @@ impl RIRHFHessian<'_> {
         // provides the second-index block via transposition (used by wk2).
         let _tp3b = std::time::Instant::now();
         let mut wj2 = vec![0.0; naux * 3];
-        let mut wki = vec![0.0; nao * naux * 3 * nao];
+        // wki (N·P·3·N, 2.7 GB) is NOT materialized anymore: its only
+        // consumer (g5's wk1_IpJ[j0-block]) now integrates int3c2e_ip2 per
+        // aux-atom block and builds wk1_IpJ = dm0·ip2·dm0 on the fly.
         let mut wk2 = vec![0.0; naux * 3 * nocc * nocc];
         let dm0_col_t = rt::asarray((&dm0, [nao3, 1].f(), &device));
 
@@ -1988,25 +2021,6 @@ impl RIRHFHessian<'_> {
                     }
                     while p < naux { wj2[p * 3 + y] += row[p] * dmv; p += 1; }
                 }}
-            }
-
-            // ── wki[i, p, y, p0+ii] = Σ_j ip2_b[y, ii, j, p] · dm0[j, i]  (3 GEMMs) ──
-            for y in 0..3 {
-                // staging: ii,j outer + p inner → both sides stride-1 (old
-                // j-inner order jumped 7 KB on read and 214 KB on write).
-                let mut st = vec![0.0; ni * naux * nao];
-                for ii in 0..ni { for j in 0..nao {
-                    let base_s = ii * naux + j * (ni * naux);
-                    let base_i = y * ni * nao * naux + ii * nao * naux + j * naux;
-                    for p in 0..naux { st[base_s + p] = ip2_b[base_i + p]; }
-                }}
-                let t = rt::asarray((&st, [ni * naux, nao].f(), &device));
-                let wki_y = &t % &dm0_t; // [ni*naux, nao]
-                let raw = wki_y.into_shape(-1).into_raw();
-                for i in 0..nao { for p in 0..naux { for ii in 0..ni {
-                    wki[i * naux * 3 * nao + p * 3 * nao + y * nao + (p0 + ii)] =
-                        raw[(ii * naux + p) + i * (ni * naux)];
-                }}}
             }
 
             // ── wk2[p, x, i, j] += Σ_{u, v∈block} ip2[x, u, v, p] · mc2[u, i] · mc2[v, j]
@@ -2051,6 +2065,10 @@ impl RIRHFHessian<'_> {
 
         self.timings.push(("  p3b_wj2_wk2", _tp3b.elapsed()));
         mt("after Phase3b");
+        if mem_trace {
+            crate::hessian::memory_monitor::trim_to_os(0);
+            eprintln!("MEMTRACE after-trim-3b      RSS = {:.1} MiB", memory_monitor::current_rss_mb());
+        }
         // ══ Phase 3c: rhok0_P__, rho2c_0, int2c_ip_ip (prototype L98-106) ══
         let _tp3c = std::time::Instant::now();
         let mut rkoo = vec![0.0; naux * nocc * nocc];
@@ -2162,7 +2180,6 @@ impl RIRHFHessian<'_> {
                     vjd: &vjd,
                     vkd: &vkd,
                     wj2: &wj2,
-                    wki: &wki,
                     wk2: &wk2,
                     rkoo: &rkoo,
                     r2c0: &r2c0,
@@ -2281,6 +2298,10 @@ impl RIRHFHessian<'_> {
         // Step 2 (V⁻¹ absorbed into g5's wk1 factors).
         mt("after g5_g8");
         drop(ip1);
+        if mem_trace {
+            crate::hessian::memory_monitor::trim_to_os(0);
+            eprintln!("MEMTRACE after-trim-g5      RSS = {:.1} MiB", memory_monitor::current_rss_mb());
+        }
 
         // ipip2 (9·N²·P) is evaluated per-aux-atom block inside g6_g9_ri2d_blas,
         // so the full tensor never exists.
@@ -2315,7 +2336,6 @@ impl RIRHFHessian<'_> {
         drop((i21, i211, i2ip));
         drop((
             wj2,
-            wki,
             wk2,
             rkoo,
             r2c0,
