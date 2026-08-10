@@ -618,6 +618,9 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
             //   per-(i0,j0) re-expansion.
             // Loop B (j0 outer): t2 + t4.
             //   tmpf[j0-block] = V⁻¹[j0-block,:]·ip1ᵀ built once per aux atom
+            if std::env::var("REST_MEM_TRACE").is_ok() {
+                eprintln!("MEMTRACE g5-LB-iter         RSS = {:.1} MiB", memory_monitor::current_rss_mb());
+            }
             //   (full-K GEMM); rk_PJI[i0-block] rebuilt per (j0,i0) (~2 s);
             //   wk1_pJI[j0-block] = i21[pg∈j0]·rk_PJI and
             //   wk1_IpJ[j0-block] = wki[·,pg∈j0,·,·]·dm0 both full-K GEMMs.
@@ -2280,6 +2283,9 @@ impl RIRHFHessian<'_> {
         }
 
         mt("after g3_g4");
+        if mem_trace {
+            eprintln!("MEMTRACE g3_g4-start        RSS = {:.1} MiB", memory_monitor::current_rss_mb());
+        }
         // g4 consumed ip1 (W2/Z2u). g5 still reads ip1 (t2/t4 V⁻¹-absorbed
         // forms), so ip1 stays alive until after g5.
 
