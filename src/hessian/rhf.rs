@@ -1684,11 +1684,11 @@ impl RIRHFHessian<'_> {
         }
 
         // t3c (and its unused view t3c_t) is no longer needed after Phase 1a.
-        // Move it into shared_integrals for calc_h1ao instead of keeping the
-        // earlier clone, freeing ~naux·nao² doubles during the rest of the
-        // phase.
+        // Dropped here instead of moving into shared_integrals: calc_h1ao now
+        // re-integrates int3c2e per-AO-atom block (shell slice), so the
+        // 0.9 GB (N,N,P) full tensor never coexists with ip1/tmpf/wki.
         drop(t3c_t);
-        self.shared_integrals.as_mut().unwrap().int3c2e = t3c;
+        drop(t3c);
         // Hand off r0/rk (computed in Phase 1a above) to calc_h1ao, which
         // would otherwise rebuild rhoj0_P / rhok0_Pl_ from scratch.
         self.shared_integrals.as_mut().unwrap().r0 = r0.clone();
@@ -2398,7 +2398,6 @@ impl RIRHFHessian<'_> {
             .expect("calc_h1ao: call calc_ej_ek() first");
         let i21 = shared.int2c2e_ip1.clone();
         let vinv = shared.vinv.clone();
-        let t3c = shared.int3c2e.clone();
 
         // SCF data
         let dm0_mat = &scf.density_matrix[0];
@@ -2478,16 +2477,28 @@ impl RIRHFHessian<'_> {
                 wj_ip1_pij.push(Vec::new());
                 continue;
             }
+            // int3c2e is re-integrated per-AO-atom block (was read from the
+            // full tensor shared from calc_ej_ek). Shell-slice layout matches
+            // the full tensor exactly: element (ii, j, P) at ii*nao*naux +
+            // j*naux + P for the block, (p0+ii)*nao*naux + j*naux + P full.
+            let shl0 = aoslices[ia][0] as usize;
+            let shl1 = aoslices[ia][1] as usize;
+            let t3c_slc: &[[usize; 2]] =
+                &[[shl0, shl1], [0, nreg], [nreg, nreg + naux_shell]];
+            let (t3c_b, _): (Vec<f64>, Vec<usize>) = cint_all
+                .integrate_row_major("int3c2e", "s1", Some(t3c_slc))
+                .into();
             // Reindex t3c to block row-major [naux, ni, nao]
             let mut block = vec![0.0; naux * ni * nao];
             for P in 0..naux {
                 for ii in 0..ni {
                     for j in 0..nao {
                         block[P * ni * nao + ii * nao + j] =
-                            t3c[(p0 + ii) * nao * naux + j * naux + P];
+                            t3c_b[ii * nao * naux + j * naux + P];
                     }
                 }
             }
+            drop(t3c_b);
             let mut coef = vec![0.0; naux * ni * nao];
 
             // vinv is already F-order [naux, naux] (element (P,Q) at P + Q*naux)
