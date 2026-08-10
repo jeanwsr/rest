@@ -3056,6 +3056,9 @@ impl RIRHFHessian<'_> {
                 .integrate_row_major("int3c2e_ip2", "s1", Some(ip2_slc))
                 .into();
             ip2_a = ip2_result.0;
+            if std::env::var("REST_MEM_TRACE").is_ok() && ia % 2 == 0 {
+                eprintln!("MEMTRACE h1ao-ip2-{:02}       RSS = {:.1} MiB", ia, memory_monitor::current_rss_mb());
+            }
             // Build pij_all from coef_cache (equivalent to _load_dim0 for
             // q0_aux:q1): pij_all[p_off, i_global, x, j] =
             //   Σ_p i21[x, q0_aux+p_off, p]·coef_cache[ia2][p, ii, j] — the
@@ -3199,6 +3202,9 @@ impl RIRHFHessian<'_> {
                         vj1[x * nao3 + i * nao + j] += 0.5 * s;
                     }
                 }
+            }
+            if std::env::var("REST_MEM_TRACE").is_ok() && ia % 2 == 0 {
+                eprintln!("MEMTRACE h1ao-corr-{:02}      RSS = {:.1} MiB", ia, memory_monitor::current_rss_mb());
             }
             // Save vj1_aux for debug comparison
             {
