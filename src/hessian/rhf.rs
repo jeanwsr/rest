@@ -2526,7 +2526,6 @@ impl RIRHFHessian<'_> {
         //     (row-major flat = P*ni*nao + idx; F-order flat = P + idx*naux; these differ!)
         //     Need to scatter coef_t to row-major for downstream code that reads rho0_all as row-major.
         let nao3 = nao * nao;
-        let mut rho0_full = vec![0.0; naux * nao3];
         // rhoj0_P ≡ r0 and rhok0_Pl_ ≡ rk were already computed in calc_ej_ek
         // Phase 1a (V⁻¹·t3c·dm0 / V⁻¹·t3c·mc2); reuse instead of recomputing.
         let rhoj0_P = shared.r0.clone();
@@ -2558,13 +2557,13 @@ impl RIRHFHessian<'_> {
         // Per-atom stream: co = V⁻¹·t3c_block is scattered straight into
         // rho0_full and immediately consumed by the wj_ip1_pij GEMM; the
         // per-atom co (rho0_all) is never stored, saving a full N²·P buffer.
-        let mut wj_ip1_pij: Vec<Vec<f64>> = Vec::with_capacity(natm);
+        let mut coef_cache: Vec<Vec<f64>> = Vec::with_capacity(natm);
         for ia in 0..natm {
             let p0 = aoslices[ia][2] as usize;
             let p1 = aoslices[ia][3] as usize;
             let ni = p1 - p0;
             if ni == 0 {
-                wj_ip1_pij.push(Vec::new());
+                coef_cache.push(Vec::new());
                 continue;
             }
             // int3c2e is re-integrated per-AO-atom block (was read from the
@@ -2610,38 +2609,11 @@ impl RIRHFHessian<'_> {
                 }
             }
 
-            // rho0_full scatter (data movement, no contraction)
-            for P in 0..naux {
-                for ii in 0..ni {
-                    for j in 0..nao {
-                        rho0_full[P * nao3 + (p0 + ii) * nao + j] =
-                            coef[P * ni * nao + ii * nao + j];
-                    }
-                }
-            }
-
-            // wj_ip1_pij[ia]: block_out[q, ii, x, j] = Σ_p i21[x, q, p]·coef[p, ii, j]
-            let mut rho0_stage = vec![0.0; naux * ni * nao];
-            for p in 0..naux {
-                for idx in 0..ni * nao {
-                    rho0_stage[p + idx * naux] = coef[p * ni * nao + idx];
-                }
-            }
-            let rho0_t = rt::asarray((&rho0_stage, [naux, ni * nao].f(), &device));
-            let out_t = (&i21_t % &rho0_t); // [3*naux, ni*nao] F-order
-            let out_raw = out_t.into_shape(-1).into_raw();
-            let mut block_out = vec![0.0; naux * ni * 3 * nao];
-            for x in 0..3 {
-                for q in 0..naux {
-                    for ii in 0..ni {
-                        for j in 0..nao {
-                            block_out[q * ni * 3 * nao + ii * 3 * nao + x * nao + j] =
-                                out_raw[(x * naux + q) + (ii * nao + j) * (3 * naux)];
-                        }
-                    }
-                }
-            }
-            wj_ip1_pij.push(block_out);
+            // coef_cache[ia]: F-order [naux, ni·nao] (row P, col ii·nao+j) —
+            //   V⁻¹·t3c[ia]. Replaces both the dead rho0_full scatter and the
+            //   2.7 GB wj_ip1_pij (i21·coef is applied per aux-atom block in
+            //   the consumer loop instead — 18× less storage).
+            coef_cache.push(coef_raw);
         }
         // (rhoj0_P / rhok0_Pl_ reuse r0/rk from calc_ej_ek — the old per-atom
         //  co·dm0 / co·mc2 contraction loops are gone. rho0_full scatter and
@@ -2844,10 +2816,9 @@ impl RIRHFHessian<'_> {
                 }
             }
 
-            // ── H7b: vj1_buf[ia] += wj1 · rho0_full ──
-            // Reuse rho0_full as a zero-copy F-order [naux, nao²] view (constant
-            // across atoms): rho0_full row-major [naux, nao²] == F-order
-            // [nao², naux] flat, so .t() yields the needed (P, idx) layout.
+            // ── H7b: vj1_buf[ia] += wj1 · rho0_full (full nao² rows, i.e.
+            //    over every AO atom block ia2 via coef_cache[ia2]) ──
+            // vj1_buf[ia][x, p0_ia2+ii, j] += Σ_P wj1[x,P]·coef_cache[ia2][P + (ii·nao+j)·naux]
             let mut wj1_f_stage = vec![0.0; 3 * naux];
             for x in 0..3 {
                 for p in 0..naux {
@@ -2855,14 +2826,22 @@ impl RIRHFHessian<'_> {
                 }
             }
             let wj1_f_t = rt::asarray((&wj1_f_stage, [3, naux].f(), &device));
-            let rho0f_raw = rt::asarray((&rho0_full, [nao3, naux].f(), &device));
-            let rho0f_t = rho0f_raw.t();
-            let vj1_t = (&wj1_f_t % &rho0f_t); // [3, nao²] F-order
-            let vj1_raw = vj1_t.into_shape(-1).into_raw();
             let off = ia * 3 * nao3;
-            for x in 0..3 {
-                for idx in 0..nao3 {
-                    vj1_buf[off + x * nao3 + idx] += vj1_raw[x + idx * 3];
+            for ia2 in 0..natm {
+                let i0b = aoslices[ia2][2] as usize;
+                let i1b = aoslices[ia2][3] as usize;
+                let ni2 = i1b - i0b;
+                if ni2 == 0 { continue; }
+                let coef7_t = rt::asarray((&coef_cache[ia2], [naux, ni2 * nao].f(), &device));
+                let vj1_t = (&wj1_f_t % &coef7_t); // [3, ni2·nao] F-order
+                let vj1_raw = vj1_t.into_shape(-1).into_raw();
+                for x in 0..3 {
+                    for ii in 0..ni2 {
+                        for j in 0..nao {
+                            vj1_buf[off + x * nao3 + (i0b + ii) * nao + j] +=
+                                vj1_raw[x + (ii * nao + j) * 3];
+                        }
+                    }
                 }
             }
         }
@@ -2992,21 +2971,36 @@ impl RIRHFHessian<'_> {
                 .integrate_row_major("int3c2e_ip2", "s1", Some(ip2_slc))
                 .into();
             ip2_a = ip2_result.0;
-            // Build pij_all from wj_ip1_pij (equivalent to _load_dim0 for q0_aux:q1)
+            // Build pij_all from coef_cache (equivalent to _load_dim0 for
+            // q0_aux:q1): pij_all[p_off, i_global, x, j] =
+            //   Σ_p i21[x, q0_aux+p_off, p]·coef_cache[ia2][p, ii, j] — the
+            //   per-aux-atom i21 slice contracts coef on the fly (no 2.7 GB
+            //   wj_ip1_pij full tensor).
             pij_all = vec![0.0; qi_aux * nao * 3 * nao];
-            for ia2 in 0..natm {
-                let i0 = aoslices[ia2][2] as usize;
-                let i1 = aoslices[ia2][3] as usize;
-                let ni2 = i1 - i0;
-                let block = &wj_ip1_pij[ia2];
-                for p_off in 0..qi_aux {
-                    let p_global = q0_aux + p_off;
-                    for i_off in 0..ni2 {
-                        let i_global = i0 + i_off;
-                        for x in 0..3 {
-                            for j in 0..nao {
-                                pij_all[p_off * nao * 3 * nao + i_global * 3 * nao + x * nao + j] =
-                                    block[p_global * ni2 * 3 * nao + i_off * 3 * nao + x * nao + j];
+            {
+                let mut i21_qb = vec![0.0; 3 * qi_aux * naux];
+                for x in 0..3 { for p_off in 0..qi_aux { for p in 0..naux {
+                    i21_qb[(x * qi_aux + p_off) + p * (3 * qi_aux)] =
+                        i21[x * naux * naux + (q0_aux + p_off) * naux + p];
+                }}}
+                let i21_qb_t = rt::asarray((&i21_qb, [3 * qi_aux, naux].f(), &device));
+                for ia2 in 0..natm {
+                    let i0 = aoslices[ia2][2] as usize;
+                    let i1 = aoslices[ia2][3] as usize;
+                    let ni2 = i1 - i0;
+                    if ni2 == 0 { continue; }
+                    let coef_t = rt::asarray((&coef_cache[ia2], [naux, ni2 * nao].f(), &device));
+                    let out_t = &i21_qb_t % &coef_t; // [3qi, ni2·nao] F-order
+                    let out_raw = out_t.into_shape(-1).into_raw();
+                    for p_off in 0..qi_aux {
+                        let i_global = i0;
+                        for i_off in 0..ni2 {
+                            let ig = i0 + i_off;
+                            for x in 0..3 {
+                                for j in 0..nao {
+                                    pij_all[p_off * nao * 3 * nao + ig * 3 * nao + x * nao + j] =
+                                        out_raw[(x * qi_aux + p_off) + (i_off * nao + j) * (3 * qi_aux)];
+                                }
                             }
                         }
                     }
@@ -3026,14 +3020,34 @@ impl RIRHFHessian<'_> {
                     rhoj1[x * qi_aux + P] = s;
                 }
             }
+            // rho0_qb[qb-block] = coef_cache scattered to full AO rows
+            // (i_global = p0+ii): [qi, N, N] — replaces the global rho0_full.
+            let mut rho0_qb = vec![0.0; qi_aux * nao * nao];
+            for ia2 in 0..natm {
+                let i0 = aoslices[ia2][2] as usize;
+                let i1 = aoslices[ia2][3] as usize;
+                let ni2 = i1 - i0;
+                if ni2 == 0 { continue; }
+                let cb = &coef_cache[ia2];
+                for p_off in 0..qi_aux {
+                    for i_off in 0..ni2 {
+                        let ig = i0 + i_off;
+                        for j in 0..nao {
+                            rho0_qb[p_off * nao * nao + ig * nao + j] =
+                                cb[(q0_aux + p_off) + (i_off * nao + j) * naux];
+                        }
+                    }
+                }
+            }
             // vj1 correction term 1: += -0.5 * Σ_P rho0_full[q0_aux+P,i,j] * rhoj1[x,P]
+            //   (rho0_qb[p_off, i, j] — full AO rows, rebuilt from coef_cache)
             for x in 0..3 {
                 for i in 0..nao {
                     for j in 0..nao {
                         let mut s = 0.0;
-                        for P in 0..qi_aux {
-                            s += rho0_full[(q0_aux + P) * nao3 + i * nao + j]
-                                * rhoj1[x * qi_aux + P];
+                        for p_off in 0..qi_aux {
+                            s += rho0_qb[p_off * nao * nao + i * nao + j]
+                                * rhoj1[x * qi_aux + p_off];
                         }
                         vj1[x * nao3 + i * nao + j] -= 0.5 * s;
                     }
@@ -3069,14 +3083,16 @@ impl RIRHFHessian<'_> {
                         temp[x * qi_aux + p_off] = s;
                     }
                 }
-                // Step 2: vj1[x,i,j] += 0.5 * Σ_{p_off} temp[x,p_off] * rho0_full[q0_aux+p_off, i, j]
+                // Step 2: vj1[x,i,j] += 0.5 * Σ_{p_off} temp[x,p_off] * rho0_qb[p_off, i, j]
+                //   (rho0_full[P,i,j] rebuilt per aux block from coef_cache —
+                //    150 MB transient, no 902 MB global)
                 for x in 0..3 {
                     for i in 0..nao {
                         for j in 0..nao {
                             let mut s = 0.0;
                             for p_off in 0..qi_aux {
                                 s += temp[x * qi_aux + p_off]
-                                    * rho0_full[(q0_aux + p_off) * nao3 + i * nao + j];
+                                    * rho0_qb[p_off * nao * nao + i * nao + j];
                             }
                             vj1[x * nao3 + i * nao + j] += 0.5 * s;
                         }
