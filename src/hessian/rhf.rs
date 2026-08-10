@@ -707,10 +707,6 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                     }
                 }
                 for j0 in 0..natm { let (_, aq0, ql) = aux_blk[j0]; if ql == 0 { continue; }
-                    if std::env::var("REST_MEM_TRACE").is_ok() && i0 == 0 {
-                        crate::hessian::memory_monitor::trim_to_os(0);
-                        eprintln!("MEMTRACE trim-loopA      RSS = {:.1} MiB", memory_monitor::current_rss_mb());
-                    }
                     // ── t1 ──
                     let mut t1 = [0.0f64; 9];
                     for x in 0..9 { let mut s = 0.0; for ii in 0..ni { for j in 0..nao { for qp in 0..ql {
