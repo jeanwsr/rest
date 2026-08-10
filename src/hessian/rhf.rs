@@ -674,6 +674,10 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                 let shl1 = ctx.aoslices[i0][1] as usize;
                 let ip12_slc: &[[usize; 2]] =
                     &[[shl0, shl1], [0, ctx.nreg], [ctx.nreg, ctx.aux_nbas]];
+                if std::env::var("REST_MEM_TRACE").is_ok() && i0 % 2 == 0 {
+                    crate::hessian::memory_monitor::trim_to_os(0);
+                    eprintln!("MEMTRACE g5A-ip12-{:02}      RSS = {:.1} MiB", i0, memory_monitor::current_rss_mb());
+                }
                 let (ip12_i0, _): (Vec<f64>, Vec<usize>) = ctx.cint_all
                     .integrate_row_major("int3c2e_ip1ip2", "s1", Some(ip12_slc))
                     .into();
@@ -753,6 +757,9 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                     }
                 }
                 drop(ip1_b);
+                if std::env::var("REST_MEM_TRACE").is_ok() && i0 % 2 == 0 {
+                    eprintln!("MEMTRACE g5A-rho2c-{:02}    RSS = {:.1} MiB", i0, memory_monitor::current_rss_mb());
+                }
                 for j0 in 0..natm { let (_, aq0, ql) = aux_blk[j0]; if ql == 0 { continue; }
                     // ── t1 ──
                     let mut t1 = [0.0f64; 9];
@@ -827,6 +834,9 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                         }
                         drop(ip1_qb);
                     }
+                }
+                if std::env::var("REST_MEM_TRACE").is_ok() && j0 % 3 == 0 {
+                    eprintln!("MEMTRACE g5B-tmpf-{:02}     RSS = {:.1} MiB", j0, memory_monitor::current_rss_mb());
                 }
                 // i21[j0-block] : [3ql, P] F-order (y,pl) row, q col
                 let mut i21_j0 = vec![0.0; 3 * ql * naux];
@@ -1832,21 +1842,29 @@ impl RIRHFHessian<'_> {
         //   = rkr_2d_raw[(p + i*naux) + oc*(naux*nao)] (F-order flat of [naux*nao, nocc])  ✓
         let mut rkr = vec![0.0; naux * nao * nocc];
         {
-            // staging: j,i outer + p inner → t3c read and t3c_pi_j write both
-            // stride-1 (old p-outer/j-inner order had 7 KB read jumps and
-            // 2.5 MB write jumps over 902 MB).
-            let mut t3c_pi_j_stage = vec![0.0; naux * nao * nao];
-            for j in 0..nao { for i in 0..nao {
-                let rbase = i * nao * naux + j * naux;
-                let wbase = i * naux + j * (naux * nao);
-                for p in 0..naux {
-                    t3c_pi_j_stage[wbase + p] = t3c[rbase + p];
+            // SIMD: rkr[p + i*naux + occ*naux*nao] += Σ_j t3c[i,j,p]·mc2[j,occ]
+            // (p inner, t3c read p-contiguous; no 0.9 GB t3c_pi_j_stage —
+            //  the old staging + GEMM held t3c AND the staging copy together,
+            //  inflating the Phase 1a peak to ~2.5 GB).
+            for i in 0..nao {
+                for j in 0..nao {
+                    let rbase = i * nao * naux + j * naux;
+                    let row = &t3c[rbase..rbase + naux];
+                    for occ in 0..nocc {
+                        let mc = mc2[j * nocc + occ];
+                        let wbase = i * naux + occ * naux * nao;
+                        let mut p = 0usize;
+                        while p + 4 <= naux {
+                            rkr[p + wbase] += row[p] * mc;
+                            rkr[p + 1 + wbase] += row[p + 1] * mc;
+                            rkr[p + 2 + wbase] += row[p + 2] * mc;
+                            rkr[p + 3 + wbase] += row[p + 3] * mc;
+                            p += 4;
+                        }
+                        while p < naux { rkr[p + wbase] += row[p] * mc; p += 1; }
+                    }
                 }
-            }}
-            let t3c_pi_j_t = rt::asarray((&t3c_pi_j_stage, [naux * nao, nao].f(), &device));
-            let rkr_2d = (&t3c_pi_j_t % &mc2_t.t()); // [naux*nao, nocc]
-            let rkr_raw = rkr_2d.into_shape(-1).into_raw();
-            rkr.copy_from_slice(&rkr_raw);
+            }
         }
         // ── Apply V⁻¹: r0 = V⁻¹ · r0r  (GEMM), rk = V⁻¹ · rkr  (GEMM) ──
         // r0_col[naux, 1] = vinv_t[naux, naux] @ r0r_col[naux, 1]
@@ -1919,7 +1937,7 @@ impl RIRHFHessian<'_> {
             let (ipip1_b, _): (Vec<f64>, Vec<usize>) = cint_all
                 .integrate_row_major("int3c2e_ipip1", "s1", Some(ipip1_slc))
                 .into();
-            if mem_trace && ia == 0 {
+            if mem_trace {
                 eprintln!("MEMTRACE p1b-ipip1-{:02}     RSS = {:.1} MiB", ia, memory_monitor::current_rss_mb());
             }
             // ipip1_b layout: [9, ni, nao, naux] row-major, element (x, ii, j, p)
@@ -1969,8 +1987,14 @@ impl RIRHFHessian<'_> {
                             }
                         }
                     }
+                    if mem_trace && ia == 0 && lb == 0 {
+                        eprintln!("MEMTRACE p1b-rkml-gemm-a  RSS = {:.1} MiB", memory_monitor::current_rss_mb());
+                    }
                     let rk_l_t = rt::asarray((&rk_l_stage, [naux * lc, nocc].f(), &device));
                     let c_t = &rk_l_t % &mc2_t; // [P·lc, N] row (p,l), col j
+                    if mem_trace && ia == 0 && lb == 0 {
+                        eprintln!("MEMTRACE p1b-rkml-gemm-b  RSS = {:.1} MiB", memory_monitor::current_rss_mb());
+                    }
                     let c_raw = c_t.into_shape(-1).into_raw();
                     let mut rkm_l = vec![0.0; nao * naux * lc];
                     for p in 0..naux {
@@ -1985,7 +2009,14 @@ impl RIRHFHessian<'_> {
                         eprintln!("MEMTRACE p1b-vkdgemm      RSS = {:.1} MiB", memory_monitor::current_rss_mb());
                     }
                     let rkm_l_t = rt::asarray((&rkm_l, [naux * nao, lc].f(), &device));
+                    if mem_trace && ia == 0 && lb == 0 {
+                        crate::hessian::memory_monitor::trim_to_os(0);
+                        eprintln!("MEMTRACE p1b-vkdgemm-b    RSS = {:.1} MiB", memory_monitor::current_rss_mb());
+                    }
                     let vkd_l = &rkm_l_t.t() % &ipip1_view; // [lc, 9·ni]
+                    if mem_trace && ia == 0 && lb == 0 {
+                        eprintln!("MEMTRACE p1b-vkdgemm-a    RSS = {:.1} MiB", memory_monitor::current_rss_mb());
+                    }
                     let raw = vkd_l.into_shape(-1).into_raw();
                     for x in 0..9 {
                         for ii in 0..ni {

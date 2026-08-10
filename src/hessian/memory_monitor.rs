@@ -94,6 +94,9 @@ impl MemMonitor {
             .spawn(move || {
                 while running_clone.load(Ordering::Relaxed) {
                     let rss = current_rss_mb();
+                    if std::env::var("REST_MEM_TRACE").is_ok() && rss > 1800.0 {
+                        eprintln!("POLL {} MiB", rss);
+                    }
                     let kib = (rss * 1024.0) as u64;
                     // Update peak
                     let mut cur = peak_clone.load(Ordering::Relaxed);
