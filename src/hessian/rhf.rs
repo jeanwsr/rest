@@ -784,6 +784,9 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                         out_ek[i_t(j0,i0,x,y)] += t1[y*3+x] - t3[y*3+x];
                     }}
                 }
+                if std::env::var("REST_MEM_TRACE").is_ok() && i0 % 2 == 0 {
+                    eprintln!("MEMTRACE g5A-t1-{:02}        RSS = {:.1} MiB", i0, memory_monitor::current_rss_mb());
+                }
                 drop(ip12_i0);
             }
             // ── Loop B: t2 + t4 ──
@@ -2419,6 +2422,10 @@ impl RIRHFHessian<'_> {
         mt("after g3_g4");
         if mem_trace {
             eprintln!("MEMTRACE g3_g4-start        RSS = {:.1} MiB", memory_monitor::current_rss_mb());
+        }
+        if mem_trace {
+            crate::hessian::memory_monitor::trim_to_os(0);
+            eprintln!("MEMTRACE trim-g34         RSS = {:.1} MiB", memory_monitor::current_rss_mb());
         }
         // g4 consumed ip1 (W2/Z2u). g5 still reads ip1 (t2/t4 V⁻¹-absorbed
         // forms), so ip1 stays alive until after g5.
