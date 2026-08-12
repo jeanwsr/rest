@@ -826,6 +826,64 @@ pub fn k_vo_lowrank_batched(pre: &KLowRankPrecompute, z_batch: &[&[f64]]) -> Vec
     res_all
 }
 
+/// Batched RI-J: computes J = V⁻¹·(Cᵀ·dm) for all n_rhs densities in ONE
+/// pair of GEMMs (ri3fnᵀ·dm_upper_batch, ri3fn·tmp_mu), amortizing the
+/// 176 MB ri3fn read across the batch (was 1 dgemv pair per RHS).
+pub fn vj_upper_rimatr_batched(
+    scf: &SCF,
+    dms: &[MatrixFull<f64>],
+) -> Vec<MatrixFull<f64>> {
+    use itertools::Itertools;
+    let n_rhs = dms.len();
+    let nao = dms[0].size[0];
+    let (ri3fn, _, baspar2basbas) = scf.rimatr.as_ref().unwrap();
+    let npair = ri3fn.size[0];
+    let naux = ri3fn.size[1];
+    // Upper-triangle compressed density per RHS (diagonal halved), using
+    // MatrixUpper's compression order (identical to vj_upper_with_rimatr_sync
+    // so the ri3fn rows match).
+    let mut dm_upper = vec![0.0; npair * n_rhs];
+    for k in 0..n_rhs {
+        let mut upper =
+            MatrixUpper::from_vec(npair, dms[k].iter_matrixupper().unwrap().map(|x| *x).collect())
+                .unwrap();
+        upper.iter_diagonal_mut().for_each(|x| *x *= 0.5);
+        dm_upper[k * npair..(k + 1) * npair].copy_from_slice(&upper.data);
+    }
+    let dm_m = MatrixFull::from_vec([npair, n_rhs], dm_upper).unwrap();
+    // tmp_mu[aux, k] = Σ_pair ri3fn[pair,aux]·dm_upper[pair,k] (×2)
+    let mut tmp_mu = MatrixFull::new([naux, n_rhs], 0.0);
+    _dgemm_full(ri3fn, 'T', &dm_m, 'N', &mut tmp_mu, 2.0, 0.0);
+    // vj[pair', k] = Σ_aux ri3fn[pair',aux]·tmp_mu[aux,k]
+    let mut vj = MatrixFull::new([npair, n_rhs], 0.0);
+    _dgemm_full(ri3fn, 'N', &tmp_mu, 'N', &mut vj, 1.0, 0.0);
+    // Expand to symmetric [nao, nao].
+    let mut out: Vec<MatrixFull<f64>> = Vec::with_capacity(n_rhs);
+    for k in 0..n_rhs {
+        let mut m = vec![0.0; nao * nao];
+        for (ipair, &[mu, nu]) in baspar2basbas.iter().enumerate() {
+            let v = vj.data[ipair + k * npair];
+            m[mu + nu * nao] = v;
+            if mu != nu {
+                m[nu + mu * nao] = v;
+            }
+        }
+        out.push(MatrixFull::from_vec([nao, nao], m).unwrap());
+    }
+    if std::env::var("REST_VERIFY_LOWRANK").is_ok() {
+        let j_ref = compute_j_upper(scf, &vec![dms[0].clone()]).to_matrixfull().unwrap();
+        let mut mx = 0.0f64;
+        for r in 0..nao {
+            for c in 0..nao {
+                let d = (out[0][[r, c]] - j_ref[[r, c]]).abs();
+                if d > mx { mx = d; }
+            }
+        }
+        eprintln!("DBG vj_batched[0] max_diff={:.3e}", mx);
+    }
+    out
+}
+
 pub fn gen_vind_opt(
     scf: &SCF,
     ws: &VindWorkspace,
@@ -1093,22 +1151,36 @@ pub fn gen_vind_opt_batched(
             eprintln!("DBG lowrank[{}]: max_diff={:.3e} orig_norm={:.3e}", i, mx, norm);
         }
     }
+    let j_batch: Vec<MatrixFull<f64>> = if let Some(_rimatr) = &scf.rimatr {
+        vj_upper_rimatr_batched(scf, &dms)
+    } else {
+        (0..n_rhs)
+            .map(|i| {
+                let dm_vec = vec![dms[i].clone()];
+                compute_j_upper(scf, &dm_vec)
+                    .to_matrixfull()
+                    .unwrap_or_else(|| panic!("J to_matrixfull failed"))
+            })
+            .collect()
+    };
     for i in 0..n_rhs {
-        let dm_vec = vec![dms[i].clone()];
-        let j_full = compute_j_upper(scf, &dm_vec).to_matrixfull()
-            .unwrap_or_else(|| panic!("J to_matrixfull failed"));
+        let j_full = &j_batch[i];
         // Skip the exchange response for pure DFAs (k_scaling == 0); K is
         // O(naux·nao³) and would dominate the per-RHS matvec cost as waste.
         let k_full = if k_scaling != 0.0 && !use_lowrank_k {
-            compute_k_upper(scf, &dm_vec).to_matrixfull()
+            let dm_vec = vec![dms[i].clone()];
+            compute_k_upper(scf, &dm_vec)
+                .to_matrixfull()
                 .unwrap_or_else(|| panic!("K to_matrixfull failed"))
         } else {
             MatrixFull::new([nao, nao], 0.0)
         };
         let mut v_ao = MatrixFull::new([nao, nao], 0.0);
-        for r in 0..nao { for c in 0..nao {
-            v_ao[[r, c]] = j_full[[r, c]] - k_scaling * k_full[[r, c]];
-        }}
+        for r in 0..nao {
+            for c in 0..nao {
+                v_ao[[r, c]] = j_full[[r, c]] - k_scaling * k_full[[r, c]];
+            }
+        }
         v_ao_batch.push(v_ao);
     }
 
