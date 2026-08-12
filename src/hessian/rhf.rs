@@ -2003,6 +2003,9 @@ impl RIRHFHessian<'_> {
         // shell slices, contracted immediately into vjd/vkd, and dropped. Peak
         // integral memory drops from 9·N²·P to 9·ni·N·P (÷natm).
         let _tp1b = std::time::Instant::now();
+        let mut _p1b_int = 0.0f64;
+        let mut _p1b_vjd = 0.0f64;
+        let mut _p1b_vkd = 0.0f64;
         let mut vjd = vec![0.0; 9 * nao * nao];
         let mut vkd = vec![0.0; 9 * nao * nao];
         // vkd[x, i, l] = Σ_{p,j} ipip1[x, i, j, p] · rkm[p, l, j], with
@@ -2029,9 +2032,12 @@ impl RIRHFHessian<'_> {
             let shl1 = aoslices[ia][1] as usize;
             let ipip1_slc: &[[usize; 2]] =
                 &[[shl0, shl1], [0, nreg], [nreg, nreg + naux_shell]];
+            let _tpi = std::time::Instant::now();
             let (ipip1_b, _): (Vec<f64>, Vec<usize>) = cint_all
                 .integrate_row_major("int3c2e_ipip1", "s1", Some(ipip1_slc))
                 .into();
+            _p1b_int += _tpi.elapsed().as_secs_f64();
+            let _tpv = std::time::Instant::now();
             if mem_trace {
                 eprintln!("MEMTRACE p1b-ipip1-{:02}     RSS = {:.1} MiB", ia, memory_monitor::current_rss_mb());
             }
@@ -2059,6 +2065,8 @@ impl RIRHFHessian<'_> {
                 vjd[x * nao3 + (p0 + ii) * nao + j] = s0 + s1 + s2 + s3;
             }}}
 
+            _p1b_vjd += _tpv.elapsed().as_secs_f64();
+            let _tpk = std::time::Instant::now();
             // ── vkd 块: vkd[x, p0+ii, l] = Σ_{p,j} ipip1_b[x, ii, j, p] · rkm[p, l, j] ──
             // Zero-copy ipip1 view: row-major [9, ni, N, P] IS F-order
             // [P·N, m9] (row (p,j) with p fastest, col (ii,x)). Per l-block:
@@ -2074,11 +2082,16 @@ impl RIRHFHessian<'_> {
                     // rkm_l [(j*naux+p) + l_loc*(nao*naux)] = Σ_occ rk[p,lb+l_loc,occ]
                     // ·mc2[j,occ] — GEMM rk[l-block]·mc2ᵀ then re-stage.
                     let mut rk_l_stage = vec![0.0; naux * lc * nocc];
-                    for p in 0..naux {
+                    // Cache-friendly: occ outer (contiguous write blocks of
+                    // naux·lc), l_loc mid (stride naux), p inner (contiguous
+                    // rk read).
+                    for occ in 0..nocc {
+                        let rbase = occ * naux * nao;
+                        let wbase = occ * (naux * lc);
                         for l_loc in 0..lc {
-                            for occ in 0..nocc {
-                                rk_l_stage[(p * lc + l_loc) + occ * (naux * lc)] =
-                                    rk[p + (lb + l_loc) * naux + occ * naux * nao];
+                            let rl = (lb + l_loc) * naux;
+                            for p in 0..naux {
+                                rk_l_stage[p * lc + l_loc + wbase] = rk[p + rl + rbase];
                             }
                         }
                     }
@@ -2092,11 +2105,15 @@ impl RIRHFHessian<'_> {
                     }
                     let c_raw = c_t.into_shape(-1).into_raw();
                     let mut rkm_l = vec![0.0; nao * naux * lc];
-                    for p in 0..naux {
-                        for l_loc in 0..lc {
-                            for j in 0..nao {
-                                rkm_l[j * naux + p + l_loc * (nao * naux)] =
-                                    c_raw[(p * lc + l_loc) + j * (naux * lc)];
+                    // Cache-friendly: j outer, l_loc mid (contiguous c_raw
+                    // reads of lc), p inner (contiguous rkm_l writes).
+                    for j in 0..nao {
+                        let cbase = j * (naux * lc);
+                        let wbase = j * naux;
+                        for p in 0..naux {
+                            let wp = wbase + p;
+                            for l_loc in 0..lc {
+                                rkm_l[wp + l_loc * (nao * naux)] = c_raw[p * lc + l_loc + cbase];
                             }
                         }
                     }
@@ -2123,7 +2140,11 @@ impl RIRHFHessian<'_> {
                     }
                 }
             }
+            _p1b_vkd += _tpk.elapsed().as_secs_f64();
             drop(ipip1_b);
+        }
+        if std::env::var("REST_CPHF_PROFILE").is_ok() {
+            eprintln!("P1B-T int {:.2}s vjd {:.2}s vkd {:.2}s", _p1b_int, _p1b_vjd, _p1b_vkd);
         }
         self.timings.push(("  p1b_vjd_vkd", _tp1b.elapsed()));
         mt("after Phase1b");
