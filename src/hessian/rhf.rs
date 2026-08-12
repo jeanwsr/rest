@@ -4340,6 +4340,59 @@ fn compute_vinv(int2c_col_major: &[f64], n: usize) -> Vec<f64> {
 // ══════════════════════════════════════════════════════════
 
 /// Build hcore matrix for atom pair (ia,ja) matching PySCF's hcore_generator.
+/// build_hcore with all integrals pre-computed by the caller (compute_e1
+/// integrates the 4 atom-independent 1e kernels once and the rinv kernels
+/// once per nucleus — the old code re-integrated all of them inside every
+/// one of the 324 (i0,j0) pairs).
+fn build_hcore_cached(
+    mol: &Molecule,
+    ia: usize,
+    ja: usize,
+    h1aa: &[f64],
+    h1ab: &[f64],
+    rinv_cache: &[(Vec<f64>, Vec<f64>)],
+) -> Vec<f64> {
+    let nao = mol.num_basis; let n3 = nao * nao;
+    let aoslices = mol.aoslice_by_atom();
+    let p0 = aoslices[ia][2] as usize; let ni = aoslices[ia][3] - p0;
+    let q0 = aoslices[ja][2] as usize; let qj = aoslices[ja][3] - q0;
+    let atom_charges: Vec<f64> = crate::geom_io::get_charge(&mol.geom.elem);
+    let i9 = |c: usize, p: usize, q: usize| c * n3 + p * nao + q;
+    let mut h = vec![0.0; 9 * n3];
+    if ia == ja {
+        let zi = atom_charges[ia];
+        let (r2aa, r2ab) = &rinv_cache[ia];
+        for c in 0..9 { for p in 0..nao { for q in 0..nao {
+            let i = i9(c, p, q); h[i] = -zi * (r2aa[i] + r2ab[i]);
+            if p >= p0 && p < p0+ni { h[i] += h1aa[i] + zi * (r2aa[i] + r2ab[i]); }
+            if q >= p0 && q < p0+ni { h[i] += zi * r2aa[i9(c, q, p)] + zi * r2ab[i]; }
+            if p >= p0 && p < p0+ni && q >= p0 && q < p0+ni { h[i] += h1ab[i]; }
+        }}}
+        for c in 0..9 { for p in 0..nao { for q in 0..p {
+            let i1=i9(c,p,q);let i2=i9(c,q,p);let v=h[i1]+h[i2];h[i1]=v;h[i2]=v;
+        }}}
+        for c in 0..9 { for p in 0..nao { h[i9(c, p, p)] *= 2.0; }}
+    } else {
+        let zi = atom_charges[ia]; let zj = atom_charges[ja];
+        for c in 0..9 { for p in 0..ni { for q in 0..qj {
+            h[i9(c, p0+p, q0+q)] += h1ab[i9(c, p0+p, q0+q)];
+        }}}
+        let (r2aa_i, r2ab_i) = &rinv_cache[ia];
+        for c in 0..9 { for p in 0..qj { for q in 0..nao { h[i9(c, q0+p, q)] += zi * r2aa_i[i9(c, q0+p, q)]; }}}
+        for x in 0..3 { for y in 0..3 { let cs=x*3+y;let cd=y*3+x;
+            for p in 0..qj { for q in 0..nao { h[i9(cd, q0+p, q)] += zi * r2ab_i[i9(cs, q0+p, q)]; }}
+        }}
+        let (r2aa_j, r2ab_j) = &rinv_cache[ja];
+        for c in 0..9 { for p in 0..ni { for q in 0..nao { h[i9(c, p0+p, q)] += zj * r2aa_j[i9(c, p0+p, q)]; }}}
+        for c in 0..9 { for p in 0..ni { for q in 0..nao { h[i9(c, p0+p, q)] += zj * r2ab_j[i9(c, p0+p, q)]; }}}
+        for c in 0..9 { for p in 0..nao { for q in 0..p {
+            let i1=i9(c,p,q);let i2=i9(c,q,p);let v=h[i1]+h[i2];h[i1]=v;h[i2]=v;
+        }}}
+        for c in 0..9 { for p in 0..nao { h[i9(c, p, p)] *= 2.0; }}
+    }
+    h
+}
+
 fn build_hcore(mol: &Molecule, ia: usize, ja: usize) -> Vec<f64> {
     let nao = mol.num_basis; let n3 = nao * nao;
     let aoslices = mol.aoslice_by_atom();
@@ -4454,6 +4507,27 @@ pub fn compute_e1(mol: &Molecule, dm0: &[f64], dme0: &[f64]) -> MatrixFull<f64> 
     let i9 = |c: usize, p: usize, q: usize| c * nao * nao + p * nao + q;
     let (s1aa,_) = cint_mol.integrate_row_major("int1e_ipipovlp","s1",None).into();
     let (s1ab,_) = cint_mol.integrate_row_major("int1e_ipovlpip","s1",None).into();
+    // Pre-compute the (i0,j0)-independent hcore derivative kernels once
+    // (build_hcore used to re-integrate all of them per (i0,j0) pair).
+    let (k_aa,_): (Vec<f64>,_) = cint_mol.integrate_row_major("int1e_ipipkin","s1",None).into();
+    let (n_aa,_): (Vec<f64>,_) = cint_mol.integrate_row_major("int1e_ipipnuc","s1",None).into();
+    let (k_ab,_): (Vec<f64>,_) = cint_mol.integrate_row_major("int1e_ipkinip","s1",None).into();
+    let (n_ab,_): (Vec<f64>,_) = cint_mol.integrate_row_major("int1e_ipnucip","s1",None).into();
+    let h1aa: Vec<f64> = k_aa.iter().zip(n_aa.iter()).map(|(k,n)| k+n).collect();
+    let h1ab: Vec<f64> = k_ab.iter().zip(n_ab.iter()).map(|(k,n)| k+n).collect();
+    // rinv kernels per nucleus (18 integrates instead of ~324·3).
+    let mut rinv_cache: Vec<(Vec<f64>, Vec<f64>)> = Vec::with_capacity(natm);
+    for ia in 0..natm {
+        let mut rmol = mol.initialize_cint(false);
+        let mut r2aa = Vec::new();
+        let mut r2ab = Vec::new();
+        rmol.with_rinv_at_nucleus(ia, |mr| {
+            let (a,_): (Vec<f64>,_) = mr.integrate_row_major("int1e_ipiprinv","s1",None).into();
+            let (b,_): (Vec<f64>,_) = mr.integrate_row_major("int1e_iprinvip","s1",None).into();
+            r2aa = a; r2ab = b;
+        });
+        rinv_cache.push((r2aa, r2ab));
+    }
     let mut e1_ten = vec![0.0; natm * natm * 9];
     let i_t = |i0, j0, x, y| i0 * natm * 9 + j0 * 9 + x * 3 + y;
     for i0 in 0..natm {
@@ -4470,7 +4544,7 @@ pub fn compute_e1(mol: &Molecule, dm0: &[f64], dme0: &[f64]) -> MatrixFull<f64> 
                 for p in 0..ni { for q in 0..qj { s += s1ab[i9(c, p0+p, q0+q)] * dme0[(p0+p)*nao+q0+q]; }}
                 e1_ten[i_t(i0, j0, x, y)] -= s * 2.0;
             }}
-            let hc = build_hcore(mol, i0, j0);
+            let hc = build_hcore_cached(mol, i0, j0, &h1aa, &h1ab, &rinv_cache);
             for x in 0..3 { for y in 0..3 {
                 let c = x*3+y; let mut s=0.0;
                 for p in 0..nao { for q in 0..nao { s += hc[i9(c, p, q)] * dm0[p + q*nao]; }}
