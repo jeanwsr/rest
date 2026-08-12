@@ -3021,13 +3021,20 @@ impl RIRHFHessian<'_> {
                 let _t_term = std::time::Instant::now();
                 let aoff = ia * 3 * nao3;
                 // term1: vj1 -= 0.5·Σ rho0_qb·rhoj1  →  vj1_accum += 0.5·Σ
-                for x in 0..3 { for i in 0..nao { for j in 0..nao {
-                    let mut s = 0.0;
+                // p outer: rho0_qb rows read contiguous (was p-inner, 128 KB stride)
+                for x in 0..3 {
                     for p_off in 0..qi_aux {
-                        s += rho0_qb[p_off * nao * nao + i * nao + j] * rhoj1[x * qi_aux + p_off];
+                        let rj = 0.5 * rhoj1[x * qi_aux + p_off];
+                        let rb = &rho0_qb[p_off * nao * nao..];
+                        for i in 0..nao {
+                            let wb = aoff + x * nao3 + i * nao;
+                            let rbi = &rb[i * nao..];
+                            for j in 0..nao {
+                                vj1_accum[wb + j] += rbi[j] * rj;
+                            }
+                        }
                     }
-                    vj1_accum[aoff + x * nao3 + i * nao + j] += 0.5 * s;
-                }}}
+                }
                 // term3: vj1 += 0.5·Σ temp·rho0_qb  →  vj1_accum -= 0.5·Σ
                 {
                     let mut temp = vec![0.0; 3 * qi_aux];
@@ -3038,23 +3045,35 @@ impl RIRHFHessian<'_> {
                         }
                         temp[x * qi_aux + p_off] = s;
                     }}
-                    for x in 0..3 { for i in 0..nao { for j in 0..nao {
-                        let mut s = 0.0;
+                    for x in 0..3 {
                         for p_off in 0..qi_aux {
-                            s += temp[x * qi_aux + p_off] * rho0_qb[p_off * nao * nao + i * nao + j];
+                            let rj = -0.5 * temp[x * qi_aux + p_off];
+                            let rb = &rho0_qb[p_off * nao * nao..];
+                            for i in 0..nao {
+                                let wb = aoff + x * nao3 + i * nao;
+                                let rbi = &rb[i * nao..];
+                                for j in 0..nao {
+                                    vj1_accum[wb + j] += rbi[j] * rj;
+                                }
+                            }
                         }
-                        vj1_accum[aoff + x * nao3 + i * nao + j] -= 0.5 * s;
-                    }}}
+                    }
                 }
                 // term4: vj1 += 0.5·Σ pij_all·rhoj0_P  →  vj1_accum -= 0.5·Σ
-                for x in 0..3 { for i in 0..nao { for j in 0..nao {
-                    let mut s = 0.0;
+                // p outer: pij_all (p,i,x,j) block read contiguous per p
+                for x in 0..3 {
                     for p_off in 0..qi_aux {
-                        s += pij_all[p_off * nao * 3 * nao + i * 3 * nao + x * nao + j]
-                            * rhoj0_P[q0_aux + p_off];
+                        let rj = -0.5 * rhoj0_P[q0_aux + p_off];
+                        let pb = &pij_all[p_off * nao * 3 * nao..];
+                        for i in 0..nao {
+                            let wb = aoff + x * nao3 + i * nao;
+                            let pbi = &pb[i * 3 * nao + x * nao..];
+                            for j in 0..nao {
+                                vj1_accum[wb + j] += pbi[j] * rj;
+                            }
+                        }
                     }
-                    vj1_accum[aoff + x * nao3 + i * nao + j] -= 0.5 * s;
-                }}}
+                }
                 // vk1 term2: vk1 += pij@plj_reord  →  vk1_accum +=
                 if self.factor_k != 0.0 {
                     let q0 = q0_aux;
