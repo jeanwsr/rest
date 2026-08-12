@@ -812,8 +812,10 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                 _t_g5a_t1t3 += _t_a2.elapsed().as_secs_f64();
                 drop(ip12_i0);
             }
-            eprintln!("G5T LoopA total {:.2}s  rho2c {:.2}s  t1t3 {:.2}s",
-                _t_g5a.elapsed().as_secs_f64(), _t_g5a_rho2c, _t_g5a_t1t3);
+            if std::env::var("REST_CPHF_PROFILE").is_ok() {
+                eprintln!("G5T LoopA total {:.2}s  rho2c {:.2}s  t1t3 {:.2}s",
+                    _t_g5a.elapsed().as_secs_f64(), _t_g5a_rho2c, _t_g5a_t1t3);
+            }
             // ── Loop B: t2 + t4 ──
             if std::env::var("REST_MEM_TRACE").is_ok() {
                 eprintln!("MEMTRACE g5-loopB-start      RSS = {:.1} MiB", memory_monitor::current_rss_mb());
@@ -897,7 +899,9 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                         drop(ip1_qb);
                     }
                 }
-                eprintln!("G5T tmpf-j{} int {:.2}s gemm+copy {:.2}s", j0, _ttmpf_int, _ttmpf_gemm);
+                if std::env::var("REST_CPHF_PROFILE").is_ok() {
+                    eprintln!("G5T tmpf-j{} int {:.2}s gemm+copy {:.2}s", j0, _ttmpf_int, _ttmpf_gemm);
+                }
                 if std::env::var("REST_MEM_TRACE").is_ok() && j0 % 3 == 0 {
                     eprintln!("MEMTRACE g5B-tmpf-{:02}     RSS = {:.1} MiB", j0, memory_monitor::current_rss_mb());
                 }
@@ -1016,16 +1020,18 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                     let _tt = _t_t24.elapsed().as_secs_f64();
                     _t_g5b_t2t4 += _tt;
                     _twk_gemm += _tg2.elapsed().as_secs_f64();
-                    if i0 == 0 {
+                    if i0 == 0 && std::env::var("REST_CPHF_PROFILE").is_ok() {
                         eprintln!("G5T wk-j{} rk {:.2}s gemm {:.2}s", j0, _twk_rk, _twk_gemm);
                     }
 
                 }
                 _t_g5b_wk += _t_wk.elapsed().as_secs_f64();
             }
-            eprintln!("G5T LoopA total {:.2}s  rho2c {:.2}s  t1t3 {:.2}s | LoopB tmpf {:.2}s  wk {:.2}s  t2t4 {:.2}s",
-                _t_g5a.elapsed().as_secs_f64(), _t_g5a_rho2c, _t_g5a_t1t3,
-                _t_g5b_tmpf, _t_g5b_wk, _t_g5b_t2t4);
+            if std::env::var("REST_CPHF_PROFILE").is_ok() {
+                eprintln!("G5T LoopA total {:.2}s  rho2c {:.2}s  t1t3 {:.2}s | LoopB tmpf {:.2}s  wk {:.2}s  t2t4 {:.2}s",
+                    _t_g5a.elapsed().as_secs_f64(), _t_g5a_rho2c, _t_g5a_t1t3,
+                    _t_g5b_tmpf, _t_g5b_wk, _t_g5b_t2t4);
+            }
 
         }
 }
@@ -2768,6 +2774,7 @@ impl RIRHFHessian<'_> {
         // across batches; batch-independent assembly runs once after. ══
         // H7a: wj1[ia][x,P] = Σ_{ii∈ia,j} ip1[x,p0+ii,j,P]·dm0[j,q0+ii], cached
         // once (47 KB/atom), reused by H7b in every batch.
+        let _t_h1a = std::time::Instant::now();
         let mut wj1_cache: Vec<Vec<f64>> = Vec::with_capacity(natm);
         for ia in 0..natm {
             let shl0 = aoslices[ia][0] as usize;
@@ -2803,9 +2810,13 @@ impl RIRHFHessian<'_> {
             wj1_cache.push(wj1);
             drop(ip1_atom);
         }
+        let _t_h1b = std::time::Instant::now();
         let mut vj1_accum = vec![0.0; natm * 3 * nao3];
         let mut vk1_accum = vec![0.0; natm * 3 * nao3];
         let n_half = (natm + 1) / 2;
+        let mut _h7b_acc = 0.0f64;
+        let mut _corr_acc = 0.0f64;
+        let mut _coef_acc = 0.0f64;
         for half in 0..2 {
             let alo = half * n_half;
             let ahi = ((half + 1) * n_half).min(natm);
@@ -2847,6 +2858,7 @@ impl RIRHFHessian<'_> {
                 coef_cache[ia] = coef_raw;
             }
             // ── H7b: vj1_accum[ia] += Σ_{ia2∈batch} wj1_cache[ia]·coef[ia2] ──
+            let _t_h7b = std::time::Instant::now();
             for ia in 0..natm {
                 let wj1 = &wj1_cache[ia];
                 if wj1.is_empty() { continue; }
@@ -2876,6 +2888,8 @@ impl RIRHFHessian<'_> {
                     }
                 }
             }
+            _h7b_acc += _t_h7b.elapsed().as_secs_f64();
+            let _t_corr = std::time::Instant::now();
             // ── coef-dependent vj1/vk1 corrections (this batch) ──
             for ia in 0..natm {
                 let aux_shl0 = auxslices[ia][0] as usize;
@@ -3633,6 +3647,10 @@ impl RIRHFHessian<'_> {
         // so free them now instead of carrying them until RIRHFHessian drops.
         self.shared_integrals = None;
         self.timings.push(("calc_h1ao", _t.elapsed()));
+        if std::env::var("REST_CPHF_PROFILE").is_ok() {
+            eprintln!("H1AO-T prep {:.2}s coef {:.2}s h7b {:.2}s corr {:.2}s",
+                _t_h1b.elapsed().as_secs_f64(), _coef_acc, _h7b_acc, _corr_acc);
+        }
         self
     }
 
