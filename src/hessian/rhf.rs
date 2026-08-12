@@ -4280,14 +4280,24 @@ pub fn compute_frequencies(scf: &SCF) -> Result<(Vec<f64>, MatrixFull<f64>), Str
 /// `HessianParameters::frequencies` is set, also computes and saves the
 /// vibrational frequencies and eigenmodes (reusing the already-computed
 /// Hessian matrix).
+
+pub struct HessianOutput {
+    pub total_max_abs: f64,
+    pub h_partial_max_abs: f64,
+    pub cphf_contrib_max_abs: f64,
+    pub frequencies_cm: Vec<f64>,
+}
+
 pub fn rhf_hessian_main(
     scf: &SCF,
     hess_ctrl: &crate::ctrl_io::hessian_parameters::HessianParameters,
     time_mark: &mut crate::utilities::TimeRecords,
-) {
-    let hess_total: MatrixFull<f64> = match run_hessian_pipeline(scf, hess_ctrl, time_mark) {
+) -> HessianOutput {
+    let (hess_total, mut diagnostics) = match run_hessian_pipeline(scf, hess_ctrl, time_mark) {
         Ok(m) => m,
-        Err(e) => { eprintln!("Error in Hessian calculation: {}", e); return; }
+        Err(e) => { eprintln!("Error in Hessian calculation: {}", e); return HessianOutput {
+            total_max_abs: 0.0, h_partial_max_abs: 0.0, cphf_contrib_max_abs: 0.0,
+            frequencies_cm: vec![], }; }
     };
     // Compute frequencies when requested directly, or implicitly when
     // thermochemistry is requested (it needs the harmonic frequencies).
@@ -4307,6 +4317,8 @@ pub fn rhf_hessian_main(
     if let (Some(params), Some(freqs)) = (thermo_ctrl.as_ref(), freqs_opt.as_ref()) {
         crate::thermo::run_thermochemistry(scf, freqs, params, time_mark);
     }
+    diagnostics.frequencies_cm = freqs_opt.unwrap_or_default();
+    diagnostics
 }
 
 /// Run the full analytical Hessian pipeline: calc_e1 → calc_ej_ek →
@@ -4317,7 +4329,7 @@ fn run_hessian_pipeline(
     scf: &SCF,
     hess_ctrl: &crate::ctrl_io::hessian_parameters::HessianParameters,
     time_mark: &mut crate::utilities::TimeRecords,
-) -> Result<MatrixFull<f64>, String> {
+) -> Result<(MatrixFull<f64>, HessianOutput), String> {
     let pl = scf.mol.ctrl.print_level;
     let hess_start = std::time::Instant::now();
     if pl > 0 {
@@ -4407,6 +4419,25 @@ fn run_hessian_pipeline(
 
     let n3 = hess_total.size[0];
     let natm = n3 / 3;
+
+    let mut hp_max = 0.0;
+    if let Some(hp) = hess.result.get("h_partial") {
+        for i in 0..n3*n3 { let v = hp.data[i].abs(); if v > hp_max { hp_max = v; }}
+    }
+    let mut cc_max = 0.0;
+    if let Some(cc) = hess.result.get("cphf_contrib") {
+        for i in 0..n3*n3 { let v = cc.data[i].abs(); if v > cc_max { cc_max = v; }}
+    }
+    let mut max_abs = 0.0;
+    for i in 0..n3*n3 { let v = hess_total.data[i].abs(); if v > max_abs { max_abs = v; }}
+
+    let diagnostics = HessianOutput {
+        total_max_abs: max_abs,
+        h_partial_max_abs: hp_max,
+        cphf_contrib_max_abs: cc_max,
+        frequencies_cm: vec![],
+    };
+
     if pl > 1 {
         println!("  Hessian matrix [{}x{}]:", n3, n3);
         if hess_ctrl.verbose > 0 {
@@ -4416,25 +4447,14 @@ fn run_hessian_pipeline(
                 println!();
             }
         }
-        // Also print individual components
-        if let Some(hp) = hess.result.get("h_partial") {
-            let mut hp_max = 0.0;
-            for i in 0..n3*n3 { let v = hp.data[i].abs(); if v > hp_max { hp_max = v; }}
-            println!("  h_partial max_abs={:.4e}", hp_max);
-        }
-        if let Some(cc) = hess.result.get("cphf_contrib") {
-            let mut cc_max = 0.0;
-            for i in 0..n3*n3 { let v = cc.data[i].abs(); if v > cc_max { cc_max = v; }}
-            println!("  cphf_contrib max_abs={:.4e}", cc_max);
-        }
+        if hess.result.contains_key("h_partial") { println!("  h_partial max_abs={:.4e}", hp_max); }
+        if hess.result.contains_key("cphf_contrib") { println!("  cphf_contrib max_abs={:.4e}", cc_max); }
         if let Some(hn) = hess.result.get("hess_nuc") {
             let mut hn_max = 0.0;
             for i in 0..n3*n3 { let v = hn.data[i].abs(); if v > hn_max { hn_max = v; }}
             println!("  hess_nuc max_abs={:.4e}", hn_max);
         }
     }
-    let mut max_abs = 0.0;
-    for i in 0..n3*n3 { let v = hess_total.data[i].abs(); if v > max_abs { max_abs = v; }}
     if pl > 0 {
         println!("  Hessian total max_abs={:.4e}", max_abs);
     }
@@ -4514,7 +4534,7 @@ fn run_hessian_pipeline(
         println!("  Hessian elapsed: {:.3} s", hess_start.elapsed().as_secs_f64());
     }
 
-    Ok(hess_total)
+    Ok((hess_total, diagnostics))
 }
 
 /// Compute and print vibrational frequencies + normal modes from an

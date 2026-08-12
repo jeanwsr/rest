@@ -4,12 +4,24 @@ use crate::analdrv::config::{AnalDrvConfig, AnalDrvTask};
 use crate::analdrv::vib::{GauThermoInfo, VibInfo};
 use crate::scf_io::{SCFType, SCF};
 
-pub fn analdrv_interface(scf_data: &SCF, tasks: &[AnalDrvTask], config: &AnalDrvConfig) {
+pub struct AnaldrvOutput {
+    pub frequencies_cm: Vec<f64>,
+}
+
+pub fn analdrv_interface(scf_data: &SCF, tasks: &[AnalDrvTask], config: &AnalDrvConfig) -> Option<AnaldrvOutput> {
+    let mut output: Option<AnaldrvOutput> = None;
     for task in tasks {
         match task {
-            AnalDrvTask::Hessian => hess_interface(scf_data, config),
+            AnalDrvTask::Hessian => {
+                let (_, vib, _) = hess_interface(scf_data, config);
+                let freqs: Vec<f64> = vib.omega.iter().zip(vib.imag.iter())
+                    .map(|(&f, &imag)| if imag { -f } else { f })
+                    .collect();
+                output = Some(AnaldrvOutput { frequencies_cm: freqs });
+            }
         };
     }
+    output
 }
 
 pub fn hess_interface(scf_data: &SCF, analdrv_ctrl: &AnalDrvConfig) -> (Vec<f64>, VibInfo, Option<GauThermoInfo>) {

@@ -23,7 +23,13 @@ use crate::ri_tddft::feast_solver;
 ///
 /// Called from main_driver after SCF convergence.
 /// Expects scf.mol.ctrl.tddft to be Some(...) with valid TDDFT parameters.
-pub fn tddft_main(scf: &mut SCF) -> Result<(), String> {
+
+pub struct TddftOutput {
+    pub energies: Vec<f64>,
+    pub osc: Vec<f64>,
+}
+
+pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     // ═══ Step 1: Extract control parameters ═══
     let tddft_ctrl = scf.mol.ctrl.tddft.clone()
         .ok_or_else(|| "TDDFT control parameters not set".to_string())?;
@@ -259,6 +265,8 @@ pub fn tddft_main(scf: &mut SCF) -> Result<(), String> {
     let singlet_triplet = if xlet == 'S' { "Singlet" } else if xlet == 'T' { "Triplet" } else { "" };
     println!("\nFirst {} {} Excitations:", n_found.min(n_print), singlet_triplet);
 
+    let mut td_energies: Vec<f64> = Vec::new();
+    let mut td_osc: Vec<f64> = Vec::new();
     for (n, (energy, vector)) in eigenpairs[..n_print].iter().enumerate() {
         let vec_norm: f64 = vector.iter().map(|x| x * x).sum::<f64>().sqrt();
 
@@ -269,6 +277,8 @@ pub fn tddft_main(scf: &mut SCF) -> Result<(), String> {
         let norm_vec = dipoles::normalize(vector, tda_flag);
         let dipole_sq = dipoles::transition_dipole_square(&dipole_matrix, &norm_vec, tda_flag);
         let osc_strength = dipole_sq * energy * 2.0 / 3.0;
+        td_energies.push(*energy);
+        td_osc.push(osc_strength);
         println!("\tTransition Dipole Square:{}; Oscillator Strength:{}",
             dipole_sq, osc_strength);
 
@@ -291,7 +301,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<(), String> {
 
     println!("The first excitation obtained by TDDFT is {}", eigenpairs[0].0);
     println!("TDDFT calculation completed successfully.");
-    Ok(())
+    Ok(TddftOutput { energies: td_energies, osc: td_osc })
 }
 
 /// Full TDA diagonalization for small systems (dim <= 3)

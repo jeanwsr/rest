@@ -296,9 +296,10 @@ pub fn post_scf_correlation(scf_data: &mut SCF) {
     }
 }
 
-pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>){
+pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>) -> crate::ri_bse::BseOutput {
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let output_type=qp_ctrl.gw_or_bse.clone();
+    let mut bse_output = crate::ri_bse::BseOutput { first_excitation: None };
     if output_type.eq("gw"){
         let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
         let xc_data=scf_data.mol.xc_data.clone();
@@ -329,7 +330,7 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
         }
-        ri_bse::bse_main(scf_data);
+        bse_output = ri_bse::bse_main(scf_data);
     }else if output_type.eq("response_bse"){
         if qp_ctrl.gw_scheme=="parse from file"{
             let parse_qp_path=qp_ctrl.parse_qp_path.clone();
@@ -368,6 +369,7 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
     }else{
         print!("Warning: You entered an invalid quasiparticle method. No quasiparticle methods Were triggered.")
     }
+    bse_output
 }
 
 fn fciqmc_dump(scf_data: &SCF) {
@@ -443,6 +445,7 @@ pub fn evaluate_dipole_moment(scf_data: &SCF, orig: Option<[f64;3]>) -> [f64;3] 
             let acc_r = dm_col.iter().zip(ao_dip_col.iter()).fold(0.0, |acc_r, (dm_val, ao_dip_val)| {acc_r + dm_val*ao_dip_val});
             acc_c + acc_r
         });
+
     }
 
     cint_data.set_common_origin(p_orig);

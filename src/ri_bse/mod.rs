@@ -30,7 +30,11 @@ pub mod dynamicbse;
 #[cfg(target_os = "linux")]
 use libc::seccomp_notif;
 
-pub fn bse_main(scf_data:&mut SCF){
+pub struct BseOutput {
+    pub first_excitation: Option<f64>,
+}
+
+pub fn bse_main(scf_data:&mut SCF) -> BseOutput {
     let start=Instant::now();
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let quasiparticle_energies=scf_data.gwqp.0.clone();
@@ -38,6 +42,7 @@ pub fn bse_main(scf_data:&mut SCF){
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     if qp_ctrl.bse_spin =="none"{
         println!("No BSE Calculations are triggered");
+        return BseOutput { first_excitation: None };
     }else if qp_ctrl.bse_spin=="both"{
         let (mut excitations_singlets,mut excitations_triplets)=bse_both_spins(scf_data,&quasiparticle_energies);
         if qp_ctrl.bse_tda==true{
@@ -85,6 +90,7 @@ pub fn bse_main(scf_data:&mut SCF){
             });
             println!("The first triplet excitation obtained by BSE is {}",excitations_triplets[0].0);
         }
+        return BseOutput { first_excitation: Some(excitations_singlets[0].0) };
     }else{
         println!("Specific BSE calculations are triggered");
         let bse_spin=qp_ctrl.bse_spin.clone();
@@ -123,7 +129,7 @@ pub fn bse_main(scf_data:&mut SCF){
                 let mut file = OpenOptions::new().append(true).create(true).open(save_path);
                 writeln!(file.expect("write failure"), "{}", excitations[0].0);
             }
-            return;
+            return BseOutput { first_excitation: Some(excitations[0].0) };
         }
 
         if qp_ctrl.bse_tda==false{
@@ -151,6 +157,7 @@ pub fn bse_main(scf_data:&mut SCF){
                 let mut file = OpenOptions::new().append(true).create(true).open(save_path);
                 writeln!(file.expect("write failure"), "{}", excitations[0].0);
             }
+            return BseOutput { first_excitation: Some(excitations[0].0) };
         }else{
             let excitations=tda_calculations(&scf_data,&quasiparticle_energies,xlet);
             if scf_data.mol.ctrl.print_level>2{
@@ -176,8 +183,10 @@ pub fn bse_main(scf_data:&mut SCF){
                 let mut file = OpenOptions::new().append(true).create(true).open(save_path);
                 writeln!(file.expect("write failure"), "{}", excitations[0].0);
             }
+            return BseOutput { first_excitation: Some(excitations[0].0) };
         }
     }
+    BseOutput { first_excitation: None }
 }
 pub fn get_submatrix(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:char)->MatrixFull<f64>{
     let mut vector:Vec<(RIFull<f64>,Range<usize>,Range<usize>)>=Vec::new();

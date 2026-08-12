@@ -42,6 +42,7 @@ use crate::post_scf_analysis::{post_scf_correlation, print_out_dfa, save_chkfile
 use liblbfgs::{lbfgs,Progress};
 use crate::mpi_io::{MPIOperator,MPIData};
 use std::collections::HashMap;
+use serde_json::json;
 
 //use crate::mpi_io::initialization;
 
@@ -138,6 +139,8 @@ pub fn main_driver() -> anyhow::Result<()> {
     // perform the SCF and post SCF evaluation for the specified xc method
     performance_essential_calculations(&mut scf_data, &mut time_mark, &mpi_operator);
 
+    let mut json_extra: HashMap<String, serde_json::Value> = HashMap::new();
+
     let spin_correction_scheme: Option<String> = scf_data.mol.ctrl.spin_correction_scheme.clone();
     match spin_correction_scheme.as_deref() {
         Some("yamaguchi") => {
@@ -157,7 +160,8 @@ pub fn main_driver() -> anyhow::Result<()> {
     let jobtype = scf_data.mol.ctrl.job_type.clone();
     match jobtype {
         JobType::Force => {
-            eval_force(&mut scf_data, &mut time_mark, &mpi_operator);
+            let (_, gradient) = eval_force(&mut scf_data, &mut time_mark, &mpi_operator);
+            json_extra.insert("gradient".to_string(), json!(gradient.data));
         },
         JobType::NumDipole => {
             time_mark.count_start("numerical dipole");
@@ -335,18 +339,27 @@ pub fn main_driver() -> anyhow::Result<()> {
     }    
     if let Some(qp_ctrl)=scf_data.mol.ctrl.quasiparticle_methods.clone(){
         print!("Now starts quasiparticle method computation!\n");
-        quasiparticle_methods(&mut scf_data,&mpi_operator);
+        let qp_output = quasiparticle_methods(&mut scf_data,&mpi_operator);
+        if let Some(e1) = qp_output.first_excitation {
+            json_extra.insert("bse".to_string(), json!({ "first_excitation": e1 }));
+        }
     }
 
     //===================================
     // Now for TDDFT calculations
     //===================================
-    if let Some(tddft_ctrl) = &scf_data.mol.ctrl.tddft {
+            if let Some(tddft_ctrl) = &scf_data.mol.ctrl.tddft {
         if !tddft_ctrl.response_tddft {
             time_mark.new_item("TDDFT", "the TDDFT eigenvalue calculation");
             time_mark.count_start("TDDFT");
-            if let Err(e) = crate::ri_tddft::tddft_main(&mut scf_data) {
-                eprintln!("Error in TDDFT calculation: {}", e);
+            match crate::ri_tddft::tddft_main(&mut scf_data) {
+                Ok(output) => {
+                    json_extra.insert("tddft".to_string(), json!({
+                        "energies": output.energies,
+                        "osc": output.osc,
+                    }));
+                }
+                Err(e) => eprintln!("Error in TDDFT calculation: {}", e),
             }
             time_mark.count("TDDFT");
         }
@@ -370,7 +383,16 @@ pub fn main_driver() -> anyhow::Result<()> {
     // CP-HF / Hessian / Frequency calculations
     //===================================
     if let Some(ref hess_ctrl) = scf_data.mol.ctrl.hessian {
-        crate::hessian::rhf_hessian_main(&scf_data, hess_ctrl, &mut time_mark);
+        let ho = crate::hessian::rhf_hessian_main(&scf_data, hess_ctrl, &mut time_mark);
+        let mut hessian = json!({
+            "total_max_abs": ho.total_max_abs,
+            "h_partial_max_abs": ho.h_partial_max_abs,
+            "cphf_contrib_max_abs": ho.cphf_contrib_max_abs,
+        });
+        if !ho.frequencies_cm.is_empty() {
+            hessian["frequencies_cm"] = json!(ho.frequencies_cm);
+        }
+        json_extra.insert("hessian".to_string(), hessian);
     }
     
     //===================================
@@ -382,7 +404,11 @@ pub fn main_driver() -> anyhow::Result<()> {
         use crate::analdrv::interface::analdrv_interface;
         let tasks = &scf_data.mol.ctrl.analdrv_tasks;
         let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
-        analdrv_interface(&scf_data, tasks, &config);
+        if let Some(ao) = analdrv_interface(&scf_data, tasks, &config) {
+            json_extra.insert("analdrv".to_string(), json!({
+                "frequencies_cm": ao.frequencies_cm,
+            }));
+        }
         time_mark.count("AnalDrv");
     }
 
@@ -395,6 +421,14 @@ pub fn main_driver() -> anyhow::Result<()> {
         println!("====================================================");
         output_result(&scf_data);
         time_mark.report_all();
+    }
+
+    if let Some(mpi_op) = &mpi_operator {
+        if mpi_op.rank == 0 {
+            crate::fileop::json_dump::dump_json(&scf_data, &json_extra);
+        }
+    } else {
+        crate::fileop::json_dump::dump_json(&scf_data, &json_extra);
     }
 
     //if let Some(mpi_op) = &mpi_operator {
@@ -544,7 +578,9 @@ pub fn performance_essential_calculations(scf_data: &mut SCF, time_mark: &mut ut
         scf_data.energies.insert("ai_correction".to_string(), scc);
     }
 
-    collect_total_energy(scf_data)
+    let total_energy = collect_total_energy(scf_data);
+    scf_data.energies.insert("total_energy".to_string(), vec![total_energy]);
+    total_energy
 
 }
 
@@ -554,35 +590,6 @@ pub fn collect_total_energy(scf_data: &SCF) -> f64 {
     //====================================
     let mut total_energy = scf_data.scf_energy;
     
-    // let xc_name = scf_data.mol.ctrl.xc.to_lowercase();
-
-
-    // total_energy = match xc_name.as_str() {
-    //     "mp2" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "scs-mp2" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "b2plyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "b2gpplyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "pbe-qidh" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "pbe0dh" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "dsdpbep86-nodisp" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "dsdpbep86" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "dsdpbeb95" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "dsdblyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "xyg7" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "xyg2" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "r-xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "r-xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "r-xyg7" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "r-xyg2" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "xdh-pbe0" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "r-xdh7" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "zrps" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "scsrpa" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "rpa@pbe" => scf_data.energies.get("rpa_energy").unwrap()[0],
-    //     _ => scf_data.scf_energy,
-    // };
     if scf_data.mol.xc_data.is_rpa() {
         total_energy = scf_data.energies.get("rpa_energy").unwrap()[0];
     } else if scf_data.mol.xc_data.is_fifth_dfa() {

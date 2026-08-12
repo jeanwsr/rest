@@ -309,6 +309,7 @@ pub struct InputKeywords {
     pub fciqmc_dump: bool,
     // Kyewords for post scf analysis
     pub outputs: Vec<String>,
+    pub outname: Option<String>,
     pub cube_orb_setting: [f64;2],
     pub cube_orb_indices: Vec<[usize;3]>,
     pub cube_orb_type: String,
@@ -498,6 +499,7 @@ impl InputKeywords {
             fciqmc_dump: false,
             // Keywords for post scf
             outputs: vec![],
+            outname: None,
             cube_orb_setting: [3.0,80.0],
             cube_orb_indices: Vec::new(),
             cube_orb_type: String::from("wavefunction"),
@@ -1718,6 +1720,10 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     tmp_vec
                 },
                 other => {vec![]},
+            };
+            tmp_input.outname = match tmp_ctrl.get("outname").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp) => Some(tmp.to_string()),
+                _ => None
             };
             tmp_input.cube_orb_type = match tmp_ctrl.get("cube_orb_type").unwrap_or(&serde_json::Value::Null) {
                serde_json::Value::String(tmp_type) => {
