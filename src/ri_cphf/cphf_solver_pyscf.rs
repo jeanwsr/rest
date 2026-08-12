@@ -571,6 +571,7 @@ impl CPHFSolverPySCF {
         z_vo_batch: &[&[f64]],
         k_lowrank: Option<&KLowRankPrecompute>,
     ) -> Vec<Vec<f64>> {
+        let _tmv = std::time::Instant::now();
         let n_rhs = z_vo_batch.len();
         // Direct batched response: z_vo_batch is already in the (nvir*nocc)
         // layout expected by gen_vind_opt_batched. OO/FO are zero (None); the
@@ -592,6 +593,9 @@ impl CPHFSolverPySCF {
                 g_vo[k] = resp_full[fo_size + k] * self.e_ai[k];
             }
             g_vo_batch.push(g_vo);
+        }
+        if std::env::var("REST_CPHF_PROFILE").is_ok() {
+            eprintln!("CPHF-PROF matvec n={} {:.3}s", n_rhs, _tmv.elapsed().as_secs_f64());
         }
         g_vo_batch
     }

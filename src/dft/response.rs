@@ -596,6 +596,7 @@ impl KLowRankPrecompute {
 /// FLOPs: ~2·P·(nvir²·nocc + nocc²·nvir) vs ~2·P·N³ for the dsymm pair.
 pub fn k_vo_lowrank(pre: &KLowRankPrecompute, z: &[f64]) -> Vec<f64> {
     use rayon::prelude::*;
+    let _tk = std::time::Instant::now();
     let nocc = pre.nocc;
     let nvir = pre.nvir;
     let naux = pre.naux;
@@ -665,7 +666,164 @@ pub fn k_vo_lowrank(pre: &KLowRankPrecompute, z: &[f64]) -> Vec<f64> {
             res[i + a * nocc] = pos[i + a * nocc] + neg[a + i * nvir];
         }
     }
+    if std::env::var("REST_CPHF_PROFILE").is_ok() {
+        eprintln!("CPHF-PROF kvo {:.4}s", _tk.elapsed().as_secs_f64());
+    }
     res
+}
+
+/// Batched version of [`k_vo_lowrank`]: processes n_rhs z-vectors in one call
+/// so the big M_batch/K_batch GEMMs amortize the 740 MB read across all RHS
+/// (N = nocc·n_rhs instead of nocc per call). T/Tk are streamed in p-blocks
+/// (PB aux p each) and contracted immediately, keeping peak RSS ≈ PB-block
+/// outputs (133 MB at PB=32) instead of the full [P·nvir, nocc·n_rhs] T.
+pub fn k_vo_lowrank_batched(pre: &KLowRankPrecompute, z_batch: &[&[f64]]) -> Vec<Vec<f64>> {
+    use rayon::prelude::*;
+    let _tkb = std::time::Instant::now();
+    let mut _t_copy = 0.0f64;
+    let mut _t_gemm = 0.0f64;
+    let mut _t_contr = 0.0f64;
+    let nocc = pre.nocc;
+    let nvir = pre.nvir;
+    let naux = pre.naux;
+    let n_rhs = z_batch.len();
+    let dim = nocc * nvir;
+    // Z' [nvir, nocc·n_rhs] col-major: Z'[u + (c + z·nocc)·nvir] = 2·z[c + u·nocc]
+    let mut zp = vec![0.0; nvir * nocc * n_rhs];
+    for z in 0..n_rhs {
+        for u in 0..nvir {
+            for c in 0..nocc {
+                zp[u + (c + z * nocc) * nvir] = 2.0 * z_batch[z][c + u * nocc];
+            }
+        }
+    }
+    let z_mat = MatrixFull::from_vec([nvir, nocc * n_rhs], zp).unwrap();
+    let n_p = &pre.n_batch.data;
+    let l_p = &pre.l_batch.data;
+    const PB: usize = 32;
+    let mut res_all = vec![vec![0.0; dim]; n_rhs];
+    for p0 in (0..naux).step_by(PB) {
+        let pe = (p0 + PB).min(naux);
+        let npb = pe - p0;
+        // Tk_blk = K_batch[p-block]·Z' → [npb·nocc, nocc·n_rhs].
+        // K_batch/M_batch are col-major [P·rows, nvir]: the p-block rows are
+        // contiguous *within each column*, so the block matrix must be copied
+        // column by column (not sliced).
+        let _tc = std::time::Instant::now();
+        let mut tk_blk = MatrixFull::new([npb * nocc, nocc * n_rhs], 0.0);
+        {
+            // p-block rows are contiguous within each column of the col-major
+            // K_batch; copy columns in parallel, assemble col-major afterwards.
+            let k_cols: Vec<Vec<f64>> = (0..nvir)
+                .into_par_iter()
+                .map(|a| {
+                    let s = p0 * nocc + a * (nocc * naux);
+                    pre.k_batch.data[s..s + npb * nocc].to_vec()
+                })
+                .collect();
+            let mut k_blk_m = MatrixFull::new([npb * nocc, nvir], 0.0);
+            for (a, col) in k_cols.iter().enumerate() {
+                k_blk_m.data[a * (npb * nocc)..(a + 1) * (npb * nocc)].copy_from_slice(col);
+            }
+            let _tg1 = std::time::Instant::now();
+            _dgemm_full(&k_blk_m, 'N', &z_mat, 'N', &mut tk_blk, 1.0, 0.0);
+            _t_gemm += _tg1.elapsed().as_secs_f64();
+        }
+        // T_blk = M_batch[p-block]·Z' → [npb·nvir, nocc·n_rhs]
+        let mut t_blk = MatrixFull::new([npb * nvir, nocc * n_rhs], 0.0);
+        {
+            let m_cols: Vec<Vec<f64>> = (0..nvir)
+                .into_par_iter()
+                .map(|a| {
+                    let s = p0 * nvir + a * (nvir * naux);
+                    pre.m_batch.data[s..s + npb * nvir].to_vec()
+                })
+                .collect();
+            let mut m_blk_m = MatrixFull::new([npb * nvir, nvir], 0.0);
+            for (a, col) in m_cols.iter().enumerate() {
+                m_blk_m.data[a * (npb * nvir)..(a + 1) * (npb * nvir)].copy_from_slice(col);
+            }
+            let _tg2 = std::time::Instant::now();
+            _dgemm_full(&m_blk_m, 'N', &z_mat, 'N', &mut t_blk, 1.0, 0.0);
+            _t_gemm += _tg2.elapsed().as_secs_f64();
+            _t_copy += _tc.elapsed().as_secs_f64();
+        }
+        let tk_d = &tk_blk.data;
+        let t_d = &t_blk.data;
+        // Contract Tk/T into res_all via per-worker private accumulators
+        // (par_chunks, one merge per worker — no fold/reduce tree).
+        let _tc2 = std::time::Instant::now();
+        {
+            let nw = rayon::current_num_threads().max(1);
+            let chunk = npb.div_ceil(nw);
+            let partials: Vec<((Vec<f64>, Vec<f64>))> = (0..nw)
+                .into_par_iter()
+                .map(|w| {
+                    let lo = (w * chunk).min(npb);
+                    let hi = ((w + 1) * chunk).min(npb);
+                    let mut pos = vec![0.0; n_rhs * dim];
+                    let mut neg = vec![0.0; n_rhs * nvir * nocc];
+                    for pl in lo..hi {
+                        let p = p0 + pl;
+                        let tkb = &tk_d[pl * nocc..];
+                        let tb = &t_d[pl * nvir..];
+                        // Cache-friendly: c/d outer; contiguous inner writes
+                        // (pos[i·nvir+a], neg[u·nocc+c]).
+                        for z in 0..n_rhs {
+                            let pb = &mut pos[z * dim..];
+                            for c in 0..nocc {
+                                let ncol = &n_p[p * nvir + c * nvir * naux..p * nvir + c * nvir * naux + nvir];
+                                let tcol_base = (c + z * nocc) * (npb * nocc);
+                                for i in 0..nocc {
+                                    let tki = tkb[i + tcol_base];
+                                    for a in 0..nvir {
+                                        pb[i * nvir + a] += tki * ncol[a];
+                                    }
+                                }
+                            }
+                            let nb = &mut neg[z * nvir * nocc..];
+                            for d in 0..nocc {
+                                let tcol_base = (d + z * nocc) * (npb * nvir);
+                                for u in 0..nvir {
+                                    let tu = tb[u + tcol_base];
+                                    for c in 0..nocc {
+                                        nb[u * nocc + c] += tu
+                                            * l_p[p * nocc + c + d * nocc * naux];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (pos, neg)
+                })
+                .collect();
+            for (pos, neg) in partials {
+                for z in 0..n_rhs {
+                    let r = &mut res_all[z];
+                    let pz = &pos[z * dim..];
+                    for i in 0..nocc {
+                        for a in 0..nvir {
+                            r[i + a * nocc] += pz[i * nvir + a];
+                        }
+                    }
+                    let nz = &neg[z * nvir * nocc..];
+                    for u in 0..nvir {
+                        for c in 0..nocc {
+                            r[c + u * nocc] += nz[u * nocc + c];
+                        }
+                    }
+                }
+            }
+        }
+        _t_contr += _tc2.elapsed().as_secs_f64();
+        drop(tk_blk);
+        drop(t_blk);
+    }
+    if std::env::var("REST_CPHF_PROFILE").is_ok() {
+        eprintln!("CPHF-PROF kvob n={} total {:.3}s copy {:.3}s gemm {:.3}s contr {:.3}s",
+            n_rhs, _tkb.elapsed().as_secs_f64(), _t_copy, _t_gemm, _t_contr);
+    }
+    res_all
 }
 
 pub fn gen_vind_opt(
@@ -912,12 +1070,7 @@ pub fn gen_vind_opt_batched(
     // Low-rank K: precompute the VO projection once per RHS (bypasses the
     // full [N,N] K assembly + Step-4 projection entirely).
     let mut k_vo_batch: Option<Vec<Vec<f64>>> = if use_lowrank_k {
-        Some(
-            z_vo_batch
-                .iter()
-                .map(|z| k_vo_lowrank(k_lowrank.unwrap(), z))
-                .collect(),
-        )
+        Some(k_vo_lowrank_batched(k_lowrank.unwrap(), z_vo_batch))
     } else {
         None
     };
