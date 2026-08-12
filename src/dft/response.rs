@@ -8,7 +8,9 @@
 /// For DFT: vind(dm1) = fxc[dm1] + J[dm1] - hyb*K[dm1]
 
 use rest_tensors::{MatrixFull, MatrixUpper, RIFull};
-use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, _dsymm, omp_set_num_threads_wrapper};
+use rest_tensors::matrix::matrix_blas_lapack::{
+    _dgemm_full, _dsymm, omp_get_num_threads_wrapper, omp_set_num_threads_wrapper,
+};
 use crate::scf_io::{SCF, SCFType};
 use crate::dft::num_int::{prepare_fxc_data, fxc_matvec_old,
     eval_ao_batch, eval_rho5_batch};

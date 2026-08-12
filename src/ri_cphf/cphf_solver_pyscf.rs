@@ -645,8 +645,12 @@ impl CPHFSolverPySCF {
         // ══ Initial QR: orthogonalize RHS into shared basis ══════════════
         // Matches PySCF: x1, rmat = _qr(rhs); x1 *= rmat.diagonal()[:,None];
         //                innerprod = rmat.diagonal()**2
+        let _t_qr0 = std::time::Instant::now();
         let (mut x1, init_innerprod) = krylov_qr(rhs_all, lindep);
         innerprod.extend(init_innerprod);
+        if std::env::var("REST_CPHF_PROFILE").is_ok() {
+            eprintln!("CPHF-PROF init-qr {:.3}s", _t_qr0.elapsed().as_secs_f64());
+        }
 
         // PySCF termination: if initial RHS are essentially zero, return zeros.
         let max_init = innerprod.iter().fold(0.0f64, |a, &b| a.max(b));
@@ -662,9 +666,13 @@ impl CPHFSolverPySCF {
         }
         // Low-rank exchange-response precomputation (ground-state, built once
         // per solve; None if no RI tensor or not applicable).
+        let _t_kl = std::time::Instant::now();
         let k_lowrank = KLowRankPrecompute::new(scf, &self.ws);
         if std::env::var("REST_MEM_TRACE").is_ok() {
             eprintln!("MEMTRACE cphf-lowrank-built RSS = {:.1} MiB", crate::hessian::memory_monitor::current_rss_mb());
+        }
+        if std::env::var("REST_CPHF_PROFILE").is_ok() {
+            eprintln!("CPHF-PROF lowrank-build {:.3}s", _t_kl.elapsed().as_secs_f64());
         }
 
         for cycle in 0..max_cycle {
@@ -675,7 +683,9 @@ impl CPHFSolverPySCF {
 
             // ── Block matvec on active vectors ───────────────────────────
             let x1_refs: Vec<&[f64]> = x1.iter().map(|v| &v[..]).collect();
+            let _t_mv = std::time::Instant::now();
             let axt_batch = self.matvec_vo_batched(scf, fxc_cache, &x1_refs, k_lowrank.as_ref());
+            let t_mv = _t_mv.elapsed().as_secs_f64();
 
             // ── Extend shared subspace with current active vectors ───────
             for k in 0..n_active {
@@ -683,6 +693,7 @@ impl CPHFSolverPySCF {
                 axs.push(axt_batch[k].clone());
             }
 
+            let _t_cgs = std::time::Instant::now();
             // ── CGS against full shared history ──────────────────────────
             // PySCF uses `axt` (original matvec output) for projection
             // coefficients, making this classical GS (numerically adequate
@@ -696,6 +707,8 @@ impl CPHFSolverPySCF {
                 }
             }
 
+            let t_cgs = _t_cgs.elapsed().as_secs_f64();
+            let _t_qr = std::time::Instant::now();
             // ── QR + threshold → new active set ──────────────────────────
             let (x_new_orth, innerprod_new) = krylov_qr(&x_new, lindep);
             let max_innerprod = innerprod_new.iter().fold(0.0f64, |a, &b| a.max(b));
@@ -703,6 +716,9 @@ impl CPHFSolverPySCF {
             if debug || profile {
                 println!("    CP-HF iteration {}: residual={:.4e} (n_active={}/{})",
                     cycle, max_innerprod.sqrt(), n_active, x_new_orth.len());
+                eprintln!("CPHF-PROF cycle {} mv {:.3}s cgs {:.3}s qr {:.3}s rest {:.3}s",
+                    cycle, t_mv, t_cgs, _t_qr.elapsed().as_secs_f64(),
+                    _t_mv.elapsed().as_secs_f64() - t_mv - t_cgs - _t_qr.elapsed().as_secs_f64());
             }
 
             if max_innerprod < lindep || max_innerprod < tol2 {
@@ -728,6 +744,7 @@ impl CPHFSolverPySCF {
         }
 
         // ══ Single projected solve: H·C = G (one H, multiple RHS) ═══════
+        let _t_fh = std::time::Instant::now();
         let nd = xs.len();
         let mut u_vo: Vec<Vec<f64>> = (0..n_rhs).map(|_| vec![0.0; dim]).collect();
         if nd == 0 { return u_vo; }
@@ -759,6 +776,9 @@ impl CPHFSolverPySCF {
             }
         }
 
+        if std::env::var("REST_CPHF_PROFILE").is_ok() {
+            eprintln!("CPHF-PROF final-H {:.3}s", _t_fh.elapsed().as_secs_f64());
+        }
         u_vo
     }
 }

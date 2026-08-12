@@ -3700,6 +3700,7 @@ impl RIRHFHessian<'_> {
         let fxc_cache_ref = fxc_cache.as_ref();
         let _t_cache_elapsed = _t_cache.elapsed();
         let _t_solve = std::time::Instant::now();
+        let _t_rhsbuild = std::time::Instant::now();
         let mut mo1_all: Vec<Vec<Vec<f64>>> = vec![vec![vec![]; 3]; natm];
         let mut s1ao_all: Vec<Vec<Vec<f64>>> = vec![vec![vec![]; 3]; natm];
         let mut s1_mo_all: Vec<Vec<Vec<f64>>> = vec![vec![vec![]; 3]; natm];
@@ -3763,6 +3764,10 @@ impl RIRHFHessian<'_> {
         let zero_vo = vec![0.0; solver.dim];
         let z_vo_refs: Vec<&[f64]> = (0..n_pert).map(|_| zero_vo.as_slice()).collect();
         let z_oo_refs: Vec<&[f64]> = z_oo_batch.iter().map(|v| v.as_slice()).collect();
+        if std::env::var("REST_CPHF_PROFILE").is_ok() {
+            eprintln!("CPHF-PROF rhs-build-p1 {:.3}s", _t_rhsbuild.elapsed().as_secs_f64());
+        }
+        let _t_oob = std::time::Instant::now();
         let oo_resp_batch = gen_vind_opt_batched(
             scf,
             &solver.ws,
@@ -3772,6 +3777,9 @@ impl RIRHFHessian<'_> {
             None,
             None, // OO path keeps the dense K (z_oo is present)
         );
+        if std::env::var("REST_CPHF_PROFILE").is_ok() {
+            eprintln!("CPHF-PROF rhs-build-oo {:.3}s", _t_oob.elapsed().as_secs_f64());
+        }
         for (k, _) in rhs_meta.iter().enumerate() {
             // g_oo[ia] = VO response of the OO perturbation at (ia_row, ia_col).
             let resp = &oo_resp_batch[k];
