@@ -659,6 +659,14 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
     }
 
         if do_k {
+            use std::time::Instant;
+            let _t_g5a = Instant::now();
+            let mut _t_g5a_rho2c = 0.0f64;
+            let mut _t_g5a_t1t3 = 0.0f64;
+            let mut _t_g5b_tmpf = 0.0f64;
+            let mut _t_g5b_rkpji = 0.0f64;
+            let mut _t_g5b_wk = 0.0f64;
+            let mut _t_g5b_t2t4 = 0.0f64;
             // ══════════════════════════════════════════════════════════
             // Loop A (i0 outer): t1 + t3.
             //   ip12[i0-block] integrated once; rk_PJI[i0-block] built once.
@@ -744,6 +752,7 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                 let (ip1_b, _): (Vec<f64>, Vec<usize>) = ctx.cint_all
                     .integrate_row_major("int3c2e_ip1", "s1", Some(ip1_slc))
                     .into();
+                let _t_r = Instant::now();
                 let mut rho2c = vec![0.0; 3 * naux * naux];
                 {
                     let rk_pji_t_r = rt::asarray((&rk_PJI, [naux, nao * ni].f(), &device));
@@ -768,9 +777,11 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                     }
                 }
                 drop(ip1_b);
+                _t_g5a_rho2c += _t_r.elapsed().as_secs_f64();
                 if std::env::var("REST_MEM_TRACE").is_ok() && i0 % 2 == 0 {
                     eprintln!("MEMTRACE g5A-rho2c-{:02}    RSS = {:.1} MiB", i0, memory_monitor::current_rss_mb());
                 }
+                let _t_a2 = Instant::now();
                 for j0 in 0..natm { let (_, aq0, ql) = aux_blk[j0]; if ql == 0 { continue; }
                     // ── t1 ──
                     let mut t1 = [0.0f64; 9];
@@ -798,13 +809,44 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                 if std::env::var("REST_MEM_TRACE").is_ok() && i0 % 2 == 0 {
                     eprintln!("MEMTRACE g5A-t1-{:02}        RSS = {:.1} MiB", i0, memory_monitor::current_rss_mb());
                 }
+                _t_g5a_t1t3 += _t_a2.elapsed().as_secs_f64();
                 drop(ip12_i0);
             }
+            eprintln!("G5T LoopA total {:.2}s  rho2c {:.2}s  t1t3 {:.2}s",
+                _t_g5a.elapsed().as_secs_f64(), _t_g5a_rho2c, _t_g5a_t1t3);
             // ── Loop B: t2 + t4 ──
             if std::env::var("REST_MEM_TRACE").is_ok() {
                 eprintln!("MEMTRACE g5-loopB-start      RSS = {:.1} MiB", memory_monitor::current_rss_mb());
             }
+            // rk_P_I cache [P·ni, O] F-order (row (p,ii), col o) built once per
+            // i0 (i0-dependent only — was rebuilt 324× inside the (j0,i0)
+            // loops with an 86 MB rk_stage each): 133 MB resident.
+            let mut rk_p_i_cache: Vec<Vec<f64>> = Vec::with_capacity(natm);
+            for i0c in 0..natm {
+                let (_, p0c, nic) = blk[i0c];
+                if nic == 0 { rk_p_i_cache.push(Vec::new()); continue; }
+                let m_rk = naux * nocc;
+                let mut rk_stage = vec![0.0; m_rk * nao];
+                for l in 0..nao { for j_occ in 0..nocc {
+                    let rbase = l * naux + j_occ * naux * nao;
+                    for p in 0..naux {
+                        rk_stage[(p * nocc + j_occ) + l * m_rk] = rk[p + rbase];
+                    }
+                }}
+                let rk_2d_g5 = rt::asarray((&rk_stage, [m_rk, nao].f(), &device));
+                let dm0_block_t = dm0_t.i((.., p0c..p0c + nic));
+                let rk_P_I_2d = (&rk_2d_g5 % &dm0_block_t); // [P·O, ni]
+                let rk_P_I_raw = rk_P_I_2d.into_shape(-1).into_raw();
+                // stage to [P, ni·O] F-order: element (p, (ii,o)) at p + (ii·O+o)·P
+                let mut rk_p_i_c = vec![0.0; naux * nic * nocc];
+                for o in 0..nocc { for p in 0..naux { for ii in 0..nic {
+                    rk_p_i_c[p + (ii * nocc + o) * naux] =
+                        rk_P_I_raw[(p * nocc + o) + ii * (naux * nocc)];
+                }}}
+                rk_p_i_cache.push(rk_p_i_c);
+            }
             for j0 in 0..natm { let (_, aq0, ql) = aux_blk[j0]; if ql == 0 { continue; }
+                let _t_b = Instant::now();
                 // tmpf[j0-block] = V⁻¹[j0-block,:]·ip1ᵀ : [ql, 3N²] F-order
                 // The full 2.7 GB int3c2e_ip1 tensor is NOT built: ip1 is
                 // re-integrated per aux-atom block (150 MB) inside a qb loop
@@ -812,6 +854,8 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                 // (K = qbi) per (j0, qb); ~18× the integrate calls but each
                 // block is only 150 MB, keeping the peak RSS ≈ ip1[qb] +
                 // tmpf_j0 + per-block working set (~0.5 GB).
+                let mut _ttmpf_int = 0.0f64;
+                let mut _ttmpf_gemm = 0.0f64;
                 let mut tmpf_j0 = vec![0.0; ql * 3 * nao3];
                 {
                     let mut vinv_j0 = vec![0.0; ql * naux]; // [ql, P] F-order (pl, q)
@@ -828,9 +872,12 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                         let aux_shl1 = ctx.auxslices[qb][1] as usize;
                         let ip1_qb_slc: &[[usize; 2]] = &[[0, ctx.nreg], [0, ctx.nreg],
                             [ctx.nreg + aux_shl0, ctx.nreg + aux_shl1]];
+                        let _ti = Instant::now();
                         let (ip1_qb, _): (Vec<f64>, Vec<usize>) = ctx.cint_all
                             .integrate_row_major("int3c2e_ip1", "s1", Some(ip1_qb_slc))
                             .into();
+                        _ttmpf_int += _ti.elapsed().as_secs_f64();
+                        let _tg = Instant::now();
                         // ip1_qb row-major [3, N, N, qbi] IS F-order [qbi, 3N²]
                         // (row q, col (x,i,j)) — zero-copy view.
                         let ip1_qb_f = rt::asarray((&ip1_qb, [qbi, 3 * nao3].f(), &device));
@@ -846,12 +893,16 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                                 tmpf_j0[pl + c * ql] += tf_raw[pl + c * ql];
                             }
                         }
+                        _ttmpf_gemm += _tg.elapsed().as_secs_f64();
                         drop(ip1_qb);
                     }
                 }
+                eprintln!("G5T tmpf-j{} int {:.2}s gemm+copy {:.2}s", j0, _ttmpf_int, _ttmpf_gemm);
                 if std::env::var("REST_MEM_TRACE").is_ok() && j0 % 3 == 0 {
                     eprintln!("MEMTRACE g5B-tmpf-{:02}     RSS = {:.1} MiB", j0, memory_monitor::current_rss_mb());
                 }
+                _t_g5b_tmpf += _t_b.elapsed().as_secs_f64();
+                let _t_wk = Instant::now();
                 // i21[j0-block] : [3ql, P] F-order (y,pl) row, q col
                 let mut i21_j0 = vec![0.0; 3 * ql * naux];
                 for y in 0..3 { for pl in 0..ql { for q in 0..naux {
@@ -890,53 +941,37 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                     a_r_all[y * nao * nao * ql..(y + 1) * nao * nao * ql]
                         .copy_from_slice(&a_r);
                 }
+                let mut _twk_rk = 0.0f64;
+                let mut _twk_gemm = 0.0f64;
                 for i0 in 0..natm {
                     let (_, p0, ni) = blk[i0];
                     if ni == 0 { continue; }
-                    // rk_P_I / rk_PJI rebuilt per (j0,i0)
-                    let mut rk_P_I = vec![0.0; naux * nocc * ni];
-                    {
-                        let m_rk = naux * nocc;
-                        let mut rk_stage = vec![0.0; m_rk * nao];
-                        for l in 0..nao { for j_occ in 0..nocc {
-                            let rbase = l * naux + j_occ * naux * nao;
-                            for p in 0..naux {
-                                rk_stage[(p * nocc + j_occ) + l * m_rk] = rk[p + rbase];
-                            }
-                        }}
-                        let rk_2d_g5 = rt::asarray((&rk_stage, [m_rk, nao].f(), &device));
-                        let dm0_block_t = dm0_t.i((.., p0..p0 + ni));
-                        let rk_P_I_2d = (&rk_2d_g5 % &dm0_block_t);
-                        let rk_P_I_raw = rk_P_I_2d.into_shape(-1).into_raw();
-                        for p in 0..naux { for j_occ in 0..nocc { for ii in 0..ni {
-                            rk_P_I[p * nocc * ni + j_occ * ni + ii] =
-                                rk_P_I_raw[(p * nocc + j_occ) + ii * (naux * nocc)];
+                    let _tr = Instant::now();
+                    // wk1_pJI[j0-block, i0] = i21[j0-block]·rk_PJI, rk_PJI = rk_P_I·mc2.
+                    // Associative reorder: W1 = i21_j0·rk_P_I_cache[i0] ([3ql, P]@[P, ni·O]),
+                    // then wk1_pji = W1·mc2 per-ii GEMM — avoids materializing
+                    // rk_PJI [P, N·ni] (78 MB staging × 324) entirely.
+                    let rk_p_i_c_t = rt::asarray((&rk_p_i_cache[i0], [naux, ni * nocc].f(), &device));
+                    let w1_t = &i21_j0_t % &rk_p_i_c_t; // [3ql, ni·O] row (y,pl), col (ii,o)
+                    let w1_raw = w1_t.into_shape(-1).into_raw();
+                    // wk1_pji layout [3ql, ni·N] F-order: row (y,pl), col (ii·N+j)
+                    let mut wk1_pji_j0 = vec![0.0; 3 * ql * ni * nao];
+                    for ii in 0..ni {
+                        let mut w1_ii = vec![0.0; 3 * ql * nocc];
+                        for y in 0..3 { for pl in 0..ql { for o in 0..nocc {
+                            w1_ii[(y * ql + pl) + o * (3 * ql)] =
+                                w1_raw[(y * ql + pl) + (ii * nocc + o) * (3 * ql)];
+                        }}}
+                        let w1_ii_t = rt::asarray((&w1_ii, [3 * ql, nocc].f(), &device));
+                        let out_ii_t = &w1_ii_t % &mc2_t; // [3ql, N]
+                        let out_ii_raw = out_ii_t.into_shape(-1).into_raw();
+                        for y in 0..3 { for pl in 0..ql { for j in 0..nao {
+                            wk1_pji_j0[(y * ql + pl) + (ii * nao + j) * (3 * ql)] =
+                                out_ii_raw[(y * ql + pl) + j * (3 * ql)];
                         }}}
                     }
-                    let mut rk_PJI = vec![0.0; naux * nao * ni];
-                    {
-                        let mut rk_P_I_stage = vec![0.0; naux * ni * nocc];
-                        for j_occ in 0..nocc { for p in 0..naux {
-                            let rbase = p * nocc * ni + j_occ * ni;
-                            for ii in 0..ni {
-                                rk_P_I_stage[(p * ni + ii) + j_occ * (naux * ni)] =
-                                    rk_P_I[rbase + ii];
-                            }
-                        }}
-                        let rk_P_I_t = rt::asarray((&rk_P_I_stage, [naux * ni, nocc].f(), &device));
-                        let rk_PJI_2d = (&rk_P_I_t % &mc2_t);
-                        let rk_PJI_raw = rk_PJI_2d.into_shape(-1).into_raw();
-                        for j in 0..nao { for ii in 0..ni {
-                            let rbase = j * (naux * ni) + ii;
-                            for p in 0..naux {
-                                rk_PJI[p + (j * ni + ii) * naux] = rk_PJI_raw[rbase + p * ni];
-                            }
-                        }}
-                    }
-                    // wk1_pJI[j0-block] : [3ql, N·ni] = i21[j0-block]·rk_PJI
-                    let rk_pji_t_g5b = rt::asarray((&rk_PJI, [naux, nao * ni].f(), &device));
-                    let wk1_pji_j0_t = &i21_j0_t % &rk_pji_t_g5b; // [3ql, N·ni]
-                    let wk1_pji_j0_raw = wk1_pji_j0_t.into_shape(-1).into_raw();
+                    _twk_rk += _tr.elapsed().as_secs_f64();
+                    let _tg2 = Instant::now();
                     // wk1_IpJ[j0-block] = dm0·A per i0: B[ii,(pl,j)] =
                     //   Σ_j' dm0[p0+ii,j']·A_r[j',(pl,j)] — GEMM [ni,N]@[N,N·ql]
                     //   per y (A_r precomputed at j0 level). wk1_IpJ[pl,ii,y,j]=B[ii,(pl,j)].
@@ -955,18 +990,19 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                                 b_raw[ii + (pl * nao + j) * ni];
                         }}}
                     }
-                    // t2 / t4 (single pass over tmpf_j0)
+                let _t_t24 = Instant::now();
+                // t2 / t4 (single pass over tmpf_j0)
                     let mut t2 = [0.0f64; 9];
                     let mut t4 = [0.0f64; 9];
                     for x in 0..3 { for y in 0..3 {
                         let mut s2 = 0.0; let mut s4 = 0.0;
                         for ii in 0..ni { for j in 0..nao {
                             let c = x * nao3 + (p0 + ii) * nao + j;
-                            let c_pji = (j * ni + ii) * (3 * ql);
+                            let c_pji = (ii * nao + j) * (3 * ql);
                             let c_ipj = (ii * 3 * nao + y * nao + j) * ql;
                             for pl in 0..ql {
                                 let v = tmpf_j0[pl + c * ql];
-                                s2 += v * wk1_pji_j0_raw[y * ql + pl + c_pji];
+                                s2 += v * wk1_pji_j0[(y * ql + pl) + c_pji];
                                 s4 += v * wk1_ipj_alt[pl + c_ipj];
                             }
                         }}
@@ -977,9 +1013,19 @@ fn g5_g8_ri1_blas(ctx: &EjEkContext, out_ek: &mut [f64], out_ej: &mut [f64], do_
                         out_ek[i_t(i0,j0,x,y)] += -t2[x*3+y] + t4[x*3+y];
                         out_ek[i_t(j0,i0,x,y)] += -t2[y*3+x] + t4[y*3+x];
                     }}
+                    let _tt = _t_t24.elapsed().as_secs_f64();
+                    _t_g5b_t2t4 += _tt;
+                    _twk_gemm += _tg2.elapsed().as_secs_f64();
+                    if i0 == 0 {
+                        eprintln!("G5T wk-j{} rk {:.2}s gemm {:.2}s", j0, _twk_rk, _twk_gemm);
+                    }
 
                 }
+                _t_g5b_wk += _t_wk.elapsed().as_secs_f64();
             }
+            eprintln!("G5T LoopA total {:.2}s  rho2c {:.2}s  t1t3 {:.2}s | LoopB tmpf {:.2}s  wk {:.2}s  t2t4 {:.2}s",
+                _t_g5a.elapsed().as_secs_f64(), _t_g5a_rho2c, _t_g5a_t1t3,
+                _t_g5b_tmpf, _t_g5b_wk, _t_g5b_t2t4);
 
         }
 }
