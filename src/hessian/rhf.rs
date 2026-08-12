@@ -147,20 +147,21 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, out_vj1: &mut [f64], out_vk1: &mut [f64
         }
         q_t_raw = qt;
     }
-    let n_batch = if do_k { 2 } else { 1 };
+    let n_batch = 1usize;
     let mut z2_per_atom: Vec<Vec<f64>> = vec![Vec::new(); natm];
-    // Z2 atoms built in two batches (half the aux atoms each) so the
-        // ── Z2_per_atom[j0] = [P·3·qj, O] F-order: row (p,y,k), col a
-        //    Z2[p,y,k,a] = Σ_l tmpf[p,y,q0+k,l]·mc2[l,a]
-        //    Deferred V⁻¹: Z2u[p,y,k,a] = Σ_l ip1[y,q0+k,l,p]·mc2[l,a],
-        //    then Z2 = V⁻¹·Z2u  (avoids the 3·N²·P tmpf intermediate) ──
-        // Z2 atoms built in two batches (half the aux atoms each) so the
-        // 0.8 GB z2_per_atom never coexists with the ipv block. The whole
-        // i0 loop runs per batch (G3 re-assigns the same values — fine);
-        // G4's j0 loop skips z2 atoms not in the current batch.
+    // ── Z2_per_atom[j0] = [P·3·qj, O] F-order: row (p,y,k), col a
+    //    Z2[p,y,k,a] = Σ_l tmpf[p,y,q0+k,l]·mc2[l,a]
+    //    Deferred V⁻¹: Z2u[p,y,k,a] = Σ_l ip1[y,q0+k,l,p]·mc2[l,a],
+    //    then Z2 = V⁻¹·Z2u  (avoids the 3·N²·P tmpf intermediate) ──
+    // All z2 atoms built up front (0.8 GB resident); the main i0 loop then
+    // runs ONCE (was 2× under the half-batch scheme — halved ipv/W2
+    // re-integration). Peak ≈ z2 0.8 + per-i0 transient ~0.5 GB.
+        let _t_z2 = std::time::Instant::now();
+        let mut _z2_int = 0.0f64;
+        let mut _z2_stage = 0.0f64;
         for half in 0..n_batch {
-            let j0_lo = half * natm / 2;
-            let j0_hi = (half + 1) * natm / 2;
+            let j0_lo = 0usize;
+            let j0_hi = natm;
             if do_k {
             for j0 in j0_lo..j0_hi {
             let (_, q0, qj) = blk[j0];
@@ -173,9 +174,12 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, out_vj1: &mut [f64], out_vk1: &mut [f64
             let shl1z = ctx.aoslices[j0][1] as usize;
             let ip1_slc: &[[usize; 2]] = &[[shl0z, shl1z], [0, ctx.nreg],
                 [ctx.nreg, ctx.aux_nbas]];
+            let _ti1 = std::time::Instant::now();
             let (ip1_b, _): (Vec<f64>, Vec<usize>) = ctx.cint_all
                 .integrate_row_major("int3c2e_ip1", "s1", Some(ip1_slc))
                 .into();
+            _z2_int += _ti1.elapsed().as_secs_f64();
+            let _ts1 = std::time::Instant::now();
             // ip1_b layout: [3, qj, N, P] row-major (y, k, l, p)
             let mut b = vec![0.0; m * nao];
             for p in 0..naux {
@@ -190,9 +194,12 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, out_vj1: &mut [f64], out_vk1: &mut [f64
                 }
             }
             drop(ip1_b);
+            _z2_stage += _ts1.elapsed().as_secs_f64();
+            let _tg1z = std::time::Instant::now();
             let b_t = rt::asarray((&b, [m, nao].f(), &device));
             let z2u = &b_t % &mc2_t_full.t(); // [m, O]
             // stage Z2u as [P, 3·qj·O] F-order: row p, col (y,k,a)
+            let _tz_u = std::time::Instant::now();
             let z2u_raw = z2u.into_shape(-1).into_raw();
             let mut z2u_p = vec![0.0; naux * 3 * qj * nocc];
             for p in 0..naux {
@@ -205,9 +212,17 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, out_vj1: &mut [f64], out_vk1: &mut [f64
                     }
                 }
             }
+            if std::env::var("REST_CPHF_PROFILE").is_ok() {
+                eprintln!("G34-T z2-j{} qj {} u_p {:.3}s", j0, qj, _tz_u.elapsed().as_secs_f64());
+            }
             let z2u_p_t = rt::asarray((&z2u_p, [naux, 3 * qj * nocc].f(), &device));
+            let _tz_v = std::time::Instant::now();
             let z2 = &i2inv_t % &z2u_p_t; // [P, 3·qj·O] row p, col (y,k,a)
             // scatter back to [P·3·qj, O] F-order layout (as consumed by g4)
+            if std::env::var("REST_CPHF_PROFILE").is_ok() {
+                eprintln!("G34-T z2-j{} vinv {:.3}s", j0, _tz_v.elapsed().as_secs_f64());
+            }
+            let _tz_o = std::time::Instant::now();
             let z2_raw = z2.into_shape(-1).into_raw();
             let mut z2_out = vec![0.0; m * nocc];
             for p in 0..naux {
@@ -221,12 +236,20 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, out_vj1: &mut [f64], out_vk1: &mut [f64
                 }
             }
             z2_per_atom[j0] = z2_out;
+            if std::env::var("REST_CPHF_PROFILE").is_ok() {
+                eprintln!("G34-T z2-j{} zout {:.3}s", j0, _tz_o.elapsed().as_secs_f64());
             }
+            }
+            }
+            if std::env::var("REST_CPHF_PROFILE").is_ok() {
+                eprintln!("G34-T z2build total {:.2}s int {:.2}s stage {:.2}s",
+                    _t_z2.elapsed().as_secs_f64(), _z2_int, _z2_stage);
             }
             // ── main i0 loop (G3 + G4; G4's j0 filtered to current z2 batch) ──
         for i0 in 0..natm {
             let (_, p0, ni) = blk[i0];
             if ni == 0 { continue; }
+            let _t_g34 = std::time::Instant::now();
             if std::env::var("REST_MEM_TRACE").is_ok() && i0 % 3 == 0 {
                 eprintln!("MEMTRACE g34-iter-{:02}        RSS = {:.1} MiB", i0, memory_monitor::current_rss_mb());
             }
@@ -340,6 +363,7 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, out_vj1: &mut [f64], out_vk1: &mut [f64
                 v2_all.push(v2_t.into_shape(-1).into_raw());
             }
 
+            let _t_g34_w2 = _t_g34.elapsed().as_secs_f64();
             // ── ipv streamed per aux block ([9, ni, N, qi], 39 MB each):
             //    vj1_mat += Σ_p ipv·r0 and out_p2_all[j0] += Σ_p ipv·v2 —
             //    the 700 MB full ipv block never exists. ──
@@ -406,6 +430,7 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, out_vj1: &mut [f64], out_vk1: &mut [f64
                 drop(ipv_qb);
             }
 
+            let _t_g34_ipv = _t_g34.elapsed().as_secs_f64();
             // ── G3: ej_vj1[i0, j0, c] = Σ_{ii∈i0, j∈j0} vj1_mat[c,ii,j]·dm0[j,ii]·2 ──
             for j0 in 0..=i0 {
                 let (_, q0, qj) = blk[j0];
@@ -424,6 +449,7 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, out_vj1: &mut [f64], out_vk1: &mut [f64
             if !do_k { continue; }
 
             // ══════════ G4 plan B ══════════
+            let _t_g34_g3 = _t_g34.elapsed().as_secs_f64();
             for j0 in 0..=i0 {
                 if z2_per_atom[j0].is_empty() { continue; }
                 let (_, q0, qj) = blk[j0];
@@ -528,11 +554,14 @@ fn g3_g4_vj1_vk1_blas(ctx: &EjEkContext, out_vj1: &mut [f64], out_vk1: &mut [f64
                     out_vk1[i_t(i0, j0, x, y)] = out_a[x + y * 3] + out_b[c] + out_p2_all[j0 * 9 + c];
                 }}
             }
+            if std::env::var("REST_CPHF_PROFILE").is_ok() && i0 == 0 {
+                let _t_g34_g4 = _t_g34.elapsed().as_secs_f64();
+                eprintln!("G34-T w2+ua {:.2}s ipv {:.2}s g3 {:.2}s g4 {:.2}s",
+                    _t_g34_w2, _t_g34_ipv - _t_g34_w2, _t_g34_g3 - _t_g34_ipv,
+                    _t_g34_g4 - _t_g34_g3);
+            }
         }
 
-            for j0 in j0_lo..j0_hi {
-                z2_per_atom[j0] = Vec::new();
-            }
         }
 }
 
@@ -2817,6 +2846,9 @@ impl RIRHFHessian<'_> {
         let mut _h7b_acc = 0.0f64;
         let mut _corr_acc = 0.0f64;
         let mut _coef_acc = 0.0f64;
+        let mut _corr_pij_total = 0.0f64;
+        let mut _corr_rho0_total = 0.0f64;
+        let mut _corr_term_total = 0.0f64;
         for half in 0..2 {
             let alo = half * n_half;
             let ahi = ((half + 1) * n_half).min(natm);
@@ -2890,6 +2922,9 @@ impl RIRHFHessian<'_> {
             }
             _h7b_acc += _t_h7b.elapsed().as_secs_f64();
             let _t_corr = std::time::Instant::now();
+            let mut _corr_pij = 0.0f64;
+            let mut _corr_rho0 = 0.0f64;
+            let mut _corr_term = 0.0f64;
             // ── coef-dependent vj1/vk1 corrections (this batch) ──
             for ia in 0..natm {
                 let aux_shl0 = auxslices[ia][0] as usize;
@@ -2916,6 +2951,7 @@ impl RIRHFHessian<'_> {
                         rhoj1[x * qi_aux + P] = s;
                     }
                 }
+                let _t_pij = std::time::Instant::now();
                 let mut pij_all = vec![0.0; qi_aux * nao * 3 * nao];
                 {
                     let mut i21_qb = vec![0.0; 3 * qi_aux * naux];
@@ -2943,6 +2979,8 @@ impl RIRHFHessian<'_> {
                         }
                     }
                 }
+                _corr_pij += _t_pij.elapsed().as_secs_f64();
+                let _t_rho0 = std::time::Instant::now();
                 let mut rho0_qb = vec![0.0; qi_aux * nao * nao];
                 for ia2 in alo..ahi {
                     let i0 = aoslices[ia2][2] as usize;
@@ -2958,6 +2996,8 @@ impl RIRHFHessian<'_> {
                         }
                     }}
                 }
+                _corr_rho0 += _t_rho0.elapsed().as_secs_f64();
+                let _t_term = std::time::Instant::now();
                 let aoff = ia * 3 * nao3;
                 // term1: vj1 -= 0.5·Σ rho0_qb·rhoj1  →  vj1_accum += 0.5·Σ
                 for x in 0..3 { for i in 0..nao { for j in 0..nao {
@@ -3034,7 +3074,11 @@ impl RIRHFHessian<'_> {
                     }
                 }
                 drop(ip2_a); drop(pij_all); drop(rho0_qb);
+                _corr_term += _t_term.elapsed().as_secs_f64();
             }
+            _corr_pij_total += _corr_pij;
+            _corr_rho0_total += _corr_rho0;
+            _corr_term_total += _corr_term;
         }
 
         // H2a: rhok0_PlJ[P,l,J] = Σ_j rhok0_Pl_[P,l,j] * mc2[J,j]
@@ -3648,8 +3692,9 @@ impl RIRHFHessian<'_> {
         self.shared_integrals = None;
         self.timings.push(("calc_h1ao", _t.elapsed()));
         if std::env::var("REST_CPHF_PROFILE").is_ok() {
-            eprintln!("H1AO-T prep {:.2}s coef {:.2}s h7b {:.2}s corr {:.2}s",
-                _t_h1b.elapsed().as_secs_f64(), _coef_acc, _h7b_acc, _corr_acc);
+            eprintln!("H1AO-T prep {:.2}s coef {:.2}s h7b {:.2}s corr {:.2}s [pij {:.2} rho0 {:.2} term {:.2}]",
+                _t_h1b.elapsed().as_secs_f64(), _coef_acc, _h7b_acc, _corr_acc,
+                _corr_pij_total, _corr_rho0_total, _corr_term_total);
         }
         self
     }
