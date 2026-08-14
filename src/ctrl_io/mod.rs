@@ -18,7 +18,7 @@ use crate::geom_io::{GeomCell, MOrC, parse_geom_keywords};
 use crate::utilities;
 // use rayon::ThreadPoolBuilder;
 use crate::scf_io::occupation::OCCType;
-use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper};
+use tensors::matrix_blas_lapack::omp_set_num_threads_global_wrapper;
 use crate::solvent::{PcmMethod, RadiusScheme};
 use crate::x2c::RelativisticMethod;
 use serde_json;
@@ -844,9 +844,9 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 // Now move the setting of rayon thread numbers to the main.rs
                 //rayon::ThreadPoolBuilder::new().num_threads(num_threads);
                 rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global().unwrap_or_else(|x| {println!("{:?}", &x)});
-                omp_set_num_threads_wrapper(num_threads);
+                omp_set_num_threads_global_wrapper(num_threads);
             } else {
-                omp_set_num_threads_wrapper(rayon::current_num_threads());
+                omp_set_num_threads_global_wrapper(rayon::current_num_threads());
                 //if tmp_input.print_level>0 {println!("The default rayon num_threads value is used:      {}", rayon::current_num_threads())};
             };
             //println!("max_num_threads: {}, current_num_threads: {}", rayon::max_num_threads(), rayon::current_num_threads());
