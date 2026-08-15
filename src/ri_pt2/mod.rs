@@ -6,6 +6,8 @@ use std::sync::mpsc::channel;
 use mpi::collective::SystemOperation;
 #[cfg(feature = "mpi")]
 use crate::mpi_io::{mpi_allreduce, mpi_broadcast, mpi_broadcast_vector};
+#[cfg(feature = "mpi")]
+use mpi::traits::*;
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, IntoParallelRefIterator};
 use rayon::slice::ParallelSlice;
 use rest_tensors::{TensorOpt,RIFull, MatrixFull, MatrixFullSlice};
@@ -14,6 +16,9 @@ use sbge2::{close_shell_sbge2_rayon_mpi, open_shell_sbge2_rayon_mpi};
 use serde::{Deserialize, Serialize};
 use tensors::BasicMatrix;
 use tensors::matrix_blas_lapack::{_dsymm, _dgemm};
+
+#[cfg(feature = "mpi")]
+use crate::ri_pt2::pt2_25d::*;
 
 use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon,open_shell_sbge2_rayon};
 use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon, evaluate_osrpa_correlation_rayon_mpi};
@@ -27,6 +32,9 @@ use crate::mpi_io::{self, mpi_reduce};
 use crate::post_scf_analysis::{split_indices_by_spin_occ, format_indices};
 
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
+
+#[cfg(feature = "mpi")]
+pub mod pt2_25d;
 
 pub mod sbge2;
 pub mod pure_pt2_pair_eng;
@@ -87,6 +95,8 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     timerecords.new_item("c_r5dft", "for advanced correlations");
     timerecords.new_item("ao2mo", "for the generation of RI3MO");
 
+    timerecords.new_item("primitive pt2", "for ref");
+    timerecords.new_item("2.5d pt2", "for test");
 
     timerecords.count_start("xc_energy");
     let x_energy = scf_data.evaluate_exact_exchange_ri_v(mpi_operator);
@@ -185,6 +195,10 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         crate::scf_io::generate_ri3mo_rayon_for_pt2_and_rpa(scf_data);
         timerecords.count("ao2mo");
         timerecords.count_start("c_r5dft");
+        timerecords.count_start("2.5d pt2");
+        let pt2_tmp = close_shell_pt2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap();
+        timerecords.count("2.5d pt2");
+        timerecords.count_start("primitive pt2");
         pt2_c = match scf_data.scftype {
             SCFType::RHF => match  dfa_family_pos {
                 crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi(&scf_data,mpi_operator).unwrap(),
@@ -205,6 +219,15 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
                 _ => [0.0,0.0,0.0]
             }
         };
+        timerecords.count("primitive pt2");
+        let names = ["total", "os", "ss"];
+        for i in 0..3 {
+            let diff = pt2_c[i] - pt2_tmp[i];
+            let rel = diff.abs() / pt2_c[i].abs().max(1e-15);
+            assert!(rel < 1e-12, "25d method diff to large!");
+        }
+
+
         timerecords.count("c_r5dft");
     } else {
         pt2_c = if scf_data.mol.spin_channel == 1 {
@@ -1236,12 +1259,69 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
     }
     #[cfg(not(feature = "mpi"))]
     { close_shell_pt2_rayon(scf_data) }
-        
+
+}
+
+pub fn close_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
+    if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
+
+        let my_rank = mpi_ix.rank;
+        let size = mpi_ix.size;
+        let local_n0_range = if let Some(loc_auxbas) = &mpi_ix.auxbas {
+            loc_auxbas[my_rank].clone()
+        } else {
+            panic!("Memory distrubtion should be initalized for the auxiliary basis sets before post-SCF calculations")
+        };
+
+        let grid = mpi_op.initialize_grid();
+        let mut global_term_os:f64 = 0.0_f64;
+        let mut global_term_ss:f64 = 0.0_f64;
+        if let Some(ri3mo_vec) = &scf_data.ri3mo {
+
+            let eigenvector = scf_data.eigenvectors.get(0).unwrap();
+            let eigenvalues = scf_data.eigenvalues.get(0).unwrap();
+            let occupation = scf_data.occupation.get(0).unwrap();
+
+            let homo = scf_data.homo.get(0).unwrap().clone();
+            let lumo = scf_data.lumo.get(0).unwrap().clone();
+            let num_basis = eigenvector.size.get(0).unwrap().clone();
+            //let num_auxbas = rimo.size[0];
+            let num_state = eigenvector.size.get(1).unwrap().clone();
+            let start_mo: usize = scf_data.mol.start_mo;
+            //let num_occu = homo + 1;
+            //let num_occu = lumo;
+            let num_occu = if scf_data.mol.num_elec[0] <= 1.0e-6 {0} else {homo + 1};
+            let (rimo, vir_range, occ_range) = &ri3mo_vec[0];
+            let n0_local = rimo.size[0];
+            let n1_global = rimo.size[1];
+            let n2_global = rimo.size[2];
+
+            //println!("rank:{}, cart_rank:{}, tensor_size=({},{},{}), local_n0_range:{:?})",
+                //my_rank, grid.rank, n0_local, n1_global, n2_global, local_n0_range);
+            assert_eq!(n0_local, local_n0_range.len());
+            assert_eq!(n1_global, vir_range.len());
+            assert_eq!(n2_global, occ_range.len());
+            let ctx = initialize_metadata(&grid, n2_global);
+            let mut n0_global_tmp: u64 = 0;
+            grid.cart_comm.all_reduce_into(&(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
+            let n0_global = n0_global_tmp as usize;
+            let memory_flag = check_memory_25d(&grid, &ctx, n0_global * n1_global, n2_global);
+            assert!(memory_flag, "not enough memory for 2.5d pt2");
+            let redistributed_rimo = swap_ownership(&grid, &ctx, &rimo, n0_global, n1_global, n2_global, &local_n0_range);
+            let (local_term_os, local_term_ss) = local_computation_batch(&redistributed_rimo, &ctx, n2_global, eigenvalues, occupation, occ_range.start, vir_range.start);
+            grid.cart_comm.all_reduce_into(&local_term_os, &mut global_term_os, &SystemOperation::sum());
+            grid.cart_comm.all_reduce_into(&local_term_ss, &mut global_term_ss, &SystemOperation::sum());
+        }
+        Ok([global_term_os + global_term_ss, global_term_os, global_term_ss])
+    }
+    else {
+        panic!("MPI not initialized for 2.5d");
+    }
 }
 
 pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
     let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
-    
+
     // Calculate the contribution of singly excited states.
     let mut e_mp2_single_list = [0.0_f64, 0.0_f64];
 
