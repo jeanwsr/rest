@@ -682,6 +682,7 @@ pub fn swap_ownership(grid: &MPIGrid, ctx: &Ctx25dBlock, local_tensor: &RIFull<f
     //assert!(flag, "redistribution fails");
     let mut row_buffer = broadcast_by_axis(&grid.row_comm, &diag_tensor);
     let mut col_buffer = broadcast_by_axis(&grid.col_comm, &diag_tensor);
+    drop(diag_tensor);
     let final_tensor = final_assembly(&grid, &mut row_buffer, &mut col_buffer, &ctx, n0_global, n1_global, n2_global);
     //let final_flag = validate_redistribution(&grid, &local_tensor, &final_tensor);
     //assert!(final_flag, "final assembly fails");

@@ -196,6 +196,10 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         timerecords.count("ao2mo");
         timerecords.count_start("c_r5dft");
         timerecords.count_start("2.5d pt2");
+        let use_25d = check_conditions_25d(&scf_data, mpi_operator);
+        if use_25d {
+            println!("2.5d pt2 running");
+        }
         let pt2_tmp = close_shell_pt2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap();
         timerecords.count("2.5d pt2");
         timerecords.count_start("primitive pt2");
@@ -1262,6 +1266,75 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
 
 }
 
+fn check_conditions_25d(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> bool {
+    let mut use_25d = true;
+
+    let (mpi_op, mpi_ix) = match (&mpi_operator, &scf_data.mol.mpi_data) {
+        (Some(op), Some(ix)) => (op, ix),
+        _ => return false,
+    };
+
+    let my_rank = mpi_ix.rank;
+
+    let local_n0_range = match &mpi_ix.auxbas {
+        Some(loc_auxbas) => loc_auxbas[my_rank].clone(),
+        None => {
+            eprintln!("Auxiliary basis distribution not initialized");
+            return false;
+        }
+    };
+
+    let grid = mpi_op.initialize_grid();
+
+    let ri3mo_vec = match &scf_data.ri3mo {
+        Some(vec) => vec,
+        None => {
+            eprintln!("RI3MO not initialized, fallback to primitive PT2");
+            return false;
+        }
+    };
+
+    let (rimo, vir_range, occ_range) = &ri3mo_vec[0];
+    let n0_local = rimo.size[0];
+    let n1_global = rimo.size[1];
+    let n2_global = rimo.size[2];
+
+    if n0_local != local_n0_range.len()
+        || n1_global != vir_range.len()
+        || n2_global != occ_range.len()
+    {
+        eprintln!("Inconsistent RI3MO dimensions, fallback to primitive PT2");
+        return false;
+    }
+
+    if n2_global < 20 {
+        eprintln!("num_occ smaller than 20, fallback to primitive PT2");
+        use_25d = false;
+    }
+
+    if use_25d {
+        let ctx = initialize_metadata(&grid, n2_global);
+        let mut n0_global_tmp: u64 = 0;
+        grid.cart_comm.all_reduce_into( &(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
+        let n0_global = n0_global_tmp as usize;
+
+        let memory_flag = check_memory_25d(&grid, &ctx, n0_global * n1_global, n2_global);
+        if !memory_flag {
+            eprintln!("Not enough memory for 2.5D, fallback to primitive PT2");
+            use_25d = false;
+        }
+    }
+
+    let mut global_use_25d = false;
+    grid.cart_comm.all_reduce_into(
+        &use_25d,
+        &mut global_use_25d,
+        &SystemOperation::logical_and(),
+    );
+
+    global_use_25d
+}
+
 pub fn close_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
     if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
 
@@ -1285,11 +1358,10 @@ pub fn close_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Option<MPIOp
             let homo = scf_data.homo.get(0).unwrap().clone();
             let lumo = scf_data.lumo.get(0).unwrap().clone();
             let num_basis = eigenvector.size.get(0).unwrap().clone();
-            //let num_auxbas = rimo.size[0];
+
             let num_state = eigenvector.size.get(1).unwrap().clone();
             let start_mo: usize = scf_data.mol.start_mo;
-            //let num_occu = homo + 1;
-            //let num_occu = lumo;
+
             let num_occu = if scf_data.mol.num_elec[0] <= 1.0e-6 {0} else {homo + 1};
             let (rimo, vir_range, occ_range) = &ri3mo_vec[0];
             let n0_local = rimo.size[0];
@@ -1298,15 +1370,12 @@ pub fn close_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Option<MPIOp
 
             //println!("rank:{}, cart_rank:{}, tensor_size=({},{},{}), local_n0_range:{:?})",
                 //my_rank, grid.rank, n0_local, n1_global, n2_global, local_n0_range);
-            assert_eq!(n0_local, local_n0_range.len());
-            assert_eq!(n1_global, vir_range.len());
-            assert_eq!(n2_global, occ_range.len());
+
             let ctx = initialize_metadata(&grid, n2_global);
             let mut n0_global_tmp: u64 = 0;
             grid.cart_comm.all_reduce_into(&(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
             let n0_global = n0_global_tmp as usize;
-            let memory_flag = check_memory_25d(&grid, &ctx, n0_global * n1_global, n2_global);
-            assert!(memory_flag, "not enough memory for 2.5d pt2");
+
             let redistributed_rimo = swap_ownership(&grid, &ctx, &rimo, n0_global, n1_global, n2_global, &local_n0_range);
             let (local_term_os, local_term_ss) = local_computation_batch(&redistributed_rimo, &ctx, n2_global, eigenvalues, occupation, occ_range.start, vir_range.start);
             grid.cart_comm.all_reduce_into(&local_term_os, &mut global_term_os, &SystemOperation::sum());
