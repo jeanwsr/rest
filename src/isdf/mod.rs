@@ -3,12 +3,13 @@ use std::ops::Range;
 use std::sync::mpsc::channel;
 use crate::basis_io::{spheric_gto_value_serial, spheric_gto_1st_value_serial};
 use crate::scf_io::SCF;
+use crate::scf_io::SCFType;
 use crate::{geom_io,dft,molecule_io, basis_io, utilities};
 use crate::dft::Grids as dftgrids;
 use crate::molecule_io::Molecule;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
-use rayon::prelude::{IntoParallelRefMutIterator, IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator};
+use rayon::prelude::{IntoParallelRefMutIterator, IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 use rest_tensors::{MatrixFull, RIFull, ERIFull};
 use tensors::external_libs::matr_copy_from_ri;
 use tensors::{TensorSlice, TensorSliceMut};
@@ -18,7 +19,11 @@ use dft::gen_grids;
 use crate::utilities::balancing;
 use crate::geom_io::get_mass_charge;
 mod lib;
-use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
+use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper,_dgemm_full,_qrpinv};
+use itertools::Itertools;
+use num_traits::ToPrimitive;
+use std::ffi::{c_char,c_double,c_int};
+use std::process::Command;
 
 /* Given grid points and center of each clusters, classify points to nearest cluster centers.
 Input:
@@ -1191,4 +1196,731 @@ pub fn prepare_m_isdf(k_mu: usize, mol: &Molecule, grids: &dft::Grids) -> (Matri
         }
     }
     (varphi, kernel_part)
+}
+
+pub fn find_current_python() -> Option<String> {
+    println!("=========================================================");
+    println!("Check Python interpreter");
+    let python_commands = ["python", "python3"];
+    for cmd in &python_commands {
+        match Command::new(cmd).arg("--version").output() {
+            Ok(output) => {
+                let version = String::from_utf8_lossy(&output.stdout);
+                println!("Find {}: {}", cmd, version.trim());
+                println!("=========================================================");
+                return Some(cmd.to_string());
+            },
+            Err(_) => {}
+        }
+    }
+    println!("Could not find python or python3!");
+    None
+}
+
+// \alpha = 1.0, 2.0, 3.0
+// \Omega = ZC^T(CC^T)^{-1}
+pub fn prepare_m_isdf_weight(k_mu: usize, mol: &Molecule, grids: &dft::Grids, occupation: &[Vec<f64>; 2], scftype: SCFType) -> (MatrixFull<f64>, MatrixFull<f64>) {
+    let nao = mol.num_basis;
+    let nri = mol.num_auxbas;
+
+    let rgrids = &grids.coordinates;
+    let ngrids = rgrids.len();
+    let mut phi = tabulated_ao(&mol, &rgrids);
+
+    //prepare weight function
+    let mut lambda_r = vec![0.0; ngrids];
+    let alpha = 1.0;
+    for i in 0..ngrids{
+        let mut sum = 1.0;
+        let scaling_factor = match scftype {
+            SCFType::RHF => 2.0,
+            _ => 1.0,
+        };
+
+        //===========================weight_function================================
+        //\omega(r_j) = (\sum_1^{N_e}|\phi_i|^\alpha)+(\sum_1^{N}|\phi_i|^\alpha)
+        if scaling_factor == 2.0{
+            phi.iter_column(i).zip(occupation[0].iter()).for_each(|(ao, occ)|{
+                sum += occ * ao.powf(alpha) + scaling_factor * ao.powf(alpha);
+            });
+        }else{
+            phi.iter_column(i).zip(occupation[0].iter()).for_each(|(ao, occ)|{
+                sum += occ * ao.powf(alpha) + scaling_factor * ao.powf(alpha);
+            });
+            phi.iter_column(i).zip(occupation[1].iter()).for_each(|(ao, occ)|{
+                sum += occ * ao.powf(alpha) + scaling_factor * ao.powf(alpha);
+            });
+        }
+
+        //====================================================================
+
+        lambda_r[i] = sum;
+
+    }
+
+
+    let n_mu = k_mu * nao;
+    let mut lambda_r_for_isdf = vec![0.0; ngrids];
+    lambda_r_for_isdf.iter_mut().zip(lambda_r.iter()).for_each(|(x,y)|{
+        *x = y.abs();
+    });
+    let mut lambda_phi = phi.clone();
+
+    let (ip, ip_weights) = cvt_isdf_v2(&rgrids, &lambda_r_for_isdf, n_mu);
+    let mut varphi = tabulated_ao(&mol, &ip);
+    let mut lambda_varphi = MatrixFull::new([nao,n_mu],0.0);
+    lambda_varphi.iter_columns_full_mut().zip(ip_weights.iter().zip(varphi.iter_columns_full()))
+    .for_each(|(x, (weight,aos))|{
+        x.iter_mut().zip(aos.iter()).for_each(|(y,ao)|{
+            *y = weight * ao;
+        });
+    });
+
+    let mut c21 = MatrixFull::new([n_mu, n_mu], 0.0);
+    let mut lambda_varphi_mid = lambda_varphi.clone();
+    c21.lapack_dgemm(&mut lambda_varphi, &mut lambda_varphi_mid, 'T', 'N', 1.0, 0.0);
+    let mut c22 = MatrixFull::new([n_mu, n_mu], 0.0);
+    let mut varphi_mid = varphi.clone();
+    c22.lapack_dgemm(&mut varphi, &mut varphi_mid, 'T', 'N', 1.0, 0.0);
+    let mut c2 = MatrixFull::new([n_mu, n_mu], 0.0);
+    c2.iter_columns_full_mut().zip(c21.iter_columns_full()).zip(c22.iter_columns_full())
+        .for_each(|((x,a),b)|{
+            x.iter_mut().zip(a.iter()).zip(b.iter()).for_each(|((x1,a1),b1)|{
+                *x1 = a1 * b1;
+            });
+        });
+
+    let mut cint_data = mol.initialize_cint(true);
+    let n_basis_shell = mol.cint_bas.len();
+    let n_auxbas_shell = mol.cint_aux_bas.len();
+    let mut ri3fn = RIFull::new([nao,nao,nri],0.0);
+    cint_data.cint2c2e_optimizer_rust();
+    let mut ri_v_ri = MatrixFull::new([nri,nri],0.0);
+    for l in 0..n_auxbas_shell {
+        let basis_start_l = mol.cint_aux_fdqc[l][0];
+        let basis_len_l = mol.cint_aux_fdqc[l][1];
+        let gl  = l + n_basis_shell;
+        for k in 0..n_auxbas_shell {
+            let basis_start_k = mol.cint_aux_fdqc[k][0];
+            let basis_len_k = mol.cint_aux_fdqc[k][1];
+            let gk  = k + n_basis_shell;
+            let buf = cint_data.cint_2c2e(gk as i32, gl as i32);
+            
+            let mut tmp_slices = ri_v_ri.iter_submatrix_mut(
+                basis_start_k..basis_start_k+basis_len_k,
+                basis_start_l..basis_start_l+basis_len_l);
+            tmp_slices.zip(buf.iter()).for_each(|value| {*value.0 = *value.1});
+
+        }
+    }
+    cint_data.cint3c2e_optimizer_rust();
+    for k in 0..n_auxbas_shell {
+        let basis_start_k = mol.cint_aux_fdqc[k][0];
+        let basis_len_k = mol.cint_aux_fdqc[k][1];
+        let gk  = k + n_basis_shell;
+        for j in 0..n_basis_shell {
+            let basis_start_j = mol.cint_fdqc[j][0];
+            let basis_len_j = mol.cint_fdqc[j][1];
+            for i in 0..n_basis_shell {
+                let basis_start_i = mol.cint_fdqc[i][0];
+                let basis_len_i = mol.cint_fdqc[i][1];
+                let buf = RIFull::from_vec([basis_len_i, basis_len_j,basis_len_k], 
+                    cint_data.cint_3c2e(i as i32, j as i32, gk as i32)).unwrap();
+                ri3fn.copy_from_ri(
+                    basis_start_i..basis_start_i+basis_len_i,
+                    basis_start_j..basis_start_j+basis_len_j,
+                    basis_start_k..basis_start_k+basis_len_k,
+                    & buf, 
+                    0..basis_len_i, 
+                    0..basis_len_j, 
+                    0..basis_len_k);
+            }
+        }
+    }
+        cint_data.final_c2r();
+
+    let mut ri_v_ao_t = MatrixFull::from_vec([nao*nao, nri],ri3fn.data).unwrap();
+
+    let mut c = prod_states_gw(&lambda_varphi.transpose(), &varphi.transpose());
+    let mut tmp1 = MatrixFull::new([nri, n_mu],0.0);
+    tmp1.lapack_dgemm(&mut ri_v_ao_t, &mut c, 'T', 'T', 1.0, 0.0);
+
+    let mut tmp0 = MatrixFull::new([nri,n_mu],0.0);
+
+    //=====================test_pinv_time==========================
+    let mut time_mark = utilities::TimeRecords::new();
+    time_mark.new_item("test pinv", "pseudo inverse of c2");
+    time_mark.count_start("test pinv");
+    let mut inv_cctrans = c2.pinv(1.0e-12);
+    time_mark.count("test pinv");
+    time_mark.report_all();
+    //=============================================================
+
+    tmp0.lapack_dgemm(&mut tmp1, &mut inv_cctrans, 'N', 'N', 1.0, 0.0);
+
+    let mut tmp01 = tmp0.clone();
+    let mut tmp = ri_v_ri.lapack_dgesv(&mut tmp01, nri as i32);
+    let mut kernel_part = MatrixFull::new([n_mu,n_mu], 0.0);
+    kernel_part.lapack_dgemm(&mut tmp0, &mut tmp, 'T', 'N', 1.0, 0.0);
+    (varphi, kernel_part)
+}
+
+pub fn ip_from_dm_dense(tab_ao: &MatrixFull<f64>, coordinates: &Vec<[f64;3]>, lambda_r: &Vec<f64>, mol: &Molecule, dm:&Vec<MatrixFull<f64>>, k_mu: usize, batch_size: Option<usize>) -> (Vec<[f64;3]>, Vec<f64>, usize){
+    /// for dense tabulated_ao, which is saved as MatrixFull<f64>
+    let spin_channel = mol.spin_channel;
+    let mut varrho = tabulated_density_batch(coordinates, &tab_ao, dm, spin_channel, batch_size);
+    let n_mu = k_mu * mol.num_auxbas;
+    let ngrids_ori = coordinates.len();
+
+    if spin_channel == 2 {
+        for i in 0..ngrids_ori{
+            varrho.data[i] = varrho.data[i] + varrho.data[ngrids_ori + i];
+        }
+        varrho.data.truncate(ngrids_ori);
+        varrho.size = [ngrids_ori,1];
+    }
+
+    let threshold = 1.0e-3 / ngrids_ori.to_f64().unwrap();
+    let index: Vec<usize> = varrho.data.iter().enumerate()
+    .filter(|&(_, &value)| value >= threshold)
+    .sorted_by(|a, b| b.1.partial_cmp(&a.1).unwrap())
+    .map(|(index, _)| index)
+    .collect();
+    drop(varrho);
+
+    let index_len = index.len();
+    let interval = (index_len-1) / (n_mu - 1);
+    let mut ip = vec![[0.0;3]; n_mu];
+    let mut weight = vec![0.0; n_mu];
+
+    for i in 0..n_mu{
+        let i_grid = index[i * interval];
+        ip[i] = coordinates[i_grid];
+        weight[i] = lambda_r[i_grid]
+    }
+
+    (ip, weight, n_mu)
+}
+
+pub fn ip_from_dm_compressed(grids: &dftgrids, mol: &Molecule, dm: &Vec<MatrixFull<f64>>, k_mu: usize) -> (Vec<[f64; 3]>, Vec<f64>, usize) {
+    /// for compressed tabulated_ao, which is saved as CompressedAO
+    let ao_c = match &grids.ao_compressed {
+        Some(c) => c,
+        None => panic!("This function should be used if AO is compressed. This must be a bug!"),
+    };
+    let spin_channel = dm.len();
+    let n_mu = k_mu * mol.num_auxbas;
+
+    let mut density_list: Vec<(usize, f64)> = Vec::new();
+    for ibatch in 0..ao_c.batches.len() {
+        let grid_range = ao_c.batch_grid_ranges[ibatch].clone();
+        let rho_batch = grids.prepare_tabulated_density_compressed(dm,spin_channel,grid_range.clone());
+        for g_local in 0..rho_batch.size[0] {
+            let total_rho = if spin_channel == 1 {
+                rho_batch[[g_local, 0]]
+            } else {
+                rho_batch[[g_local, 0]] + rho_batch[[g_local, 1]]
+            };
+            density_list.push((grid_range.start + g_local, total_rho));
+        }
+    }
+
+    density_list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    let total = density_list.len();
+    let mut coords = Vec::with_capacity(n_mu);
+    let mut weights = Vec::with_capacity(n_mu);
+
+    for i in 0..n_mu {
+        let idx = if n_mu == 1 {
+            0
+        } else {
+            ((i as f64 * (total - 1) as f64) / (n_mu - 1) as f64).round() as usize
+        };
+        let global_idx = density_list[idx].0;
+        coords.push(grids.coordinates[global_idx]);
+        weights.push(grids.weights[global_idx]);
+    }
+
+    (coords, weights, n_mu)
+}
+
+pub fn tabulated_density(coordinates: &Vec<[f64;3]>, ao:&MatrixFull<f64>, dm: &Vec<MatrixFull<f64>>, spin_channel: usize) -> MatrixFull<f64> {
+    let num_grids = coordinates.len();
+    let mut cur_rho = MatrixFull::new([num_grids,spin_channel],0.0);
+    for i_spin in 0..spin_channel {
+        let dt0 = utilities::init_timing();
+        let dm_s = dm.get(i_spin).unwrap();
+        let mut wao = MatrixFull::new(ao.size.clone(),0.0);
+        _dgemm_full(dm_s,'N',ao,'N',&mut wao, 1.0, 0.0);
+        let dt1 = utilities::timing(&dt0, Some("Evalute weighted ao (wao)"));
+        ao.par_iter_columns_full().zip(wao.par_iter_columns_full()).map(|(ao_r,wao_r)| (ao_r,wao_r))
+        .zip(cur_rho.par_iter_column_mut(i_spin))
+        .for_each(|((ao_r,wao_r),cur_rho_s)| {
+            *cur_rho_s = wao_r.iter().zip(ao_r.iter()).fold(0.0, |acc, (a,b)| {
+                acc + a*b
+            })
+        });
+        let dt2 = utilities::timing(&dt1, Some("Contracting ao*wao"));
+        
+    };
+    cur_rho
+}
+
+pub fn tabulated_density_batch(coordinates: &Vec<[f64;3]>, ao: &MatrixFull<f64>, dm: &Vec<MatrixFull<f64>>, spin_channel: usize, batch_size: Option<usize>) -> MatrixFull<f64> {
+    // apply tabulated_density with batch
+    // i.e. generate wao and rho by batch
+    if batch_size.is_none() {
+        // use origin version
+        tabulated_density(coordinates, ao, dm, spin_channel)
+    } else {
+        let block_size = batch_size.unwrap();
+        let num_grids = coordinates.len();
+        let mut cur_rho = MatrixFull::new([num_grids, spin_channel], 0.0);
+        let nao = ao.size[0];
+
+        let trans_n = b'N' as c_char;
+        let alpha: f64 = 1.0;
+        let beta: f64 = 0.0;
+        let m = nao as i32;
+        let k = nao as i32;
+        let lda = nao as i32;
+        let ldb = nao as i32;
+        let ldc = nao as i32;
+
+        for i_spin in 0..spin_channel {
+            let dm_s = &dm[i_spin];
+            let dm_vec = &dm_s.data;
+
+            let mut start = 0;
+            while start < num_grids {
+                let end = (start + block_size).min(num_grids);
+                let block_len = end - start;
+                let n = block_len as i32;
+
+                let ao_chunk = &ao.data[start * nao..end * nao];
+
+                let mut wao_chunk: Vec<f64> = vec![0.0; nao * block_len];
+
+                dgemm_ffi(
+                    dm_vec,
+                    &ao_chunk,
+                    &mut wao_chunk,
+                    &trans_n,
+                    &trans_n,
+                    &m,
+                    &n,
+                    &k,
+                    &alpha,
+                    &lda,
+                    &ldb,
+                    &beta,
+                    &ldc,
+                );
+
+                let rho_col = &mut cur_rho.data[i_spin * num_grids..(i_spin + 1) * num_grids];
+                let rho_slice = &mut rho_col[start..end];
+
+                let ao_cols: Vec<&[f64]> = (0..block_len)
+                    .map(|j| &ao_chunk[j * nao..(j + 1) * nao])
+                    .collect();
+                let wao_cols: Vec<&[f64]> = (0..block_len)
+                    .map(|j| &wao_chunk[j * nao..(j + 1) * nao])
+                    .collect();
+
+                rho_slice
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(idx, rho_val)| {
+                        let ao_col = ao_cols[idx];
+                        let wao_col = wao_cols[idx];
+                        *rho_val = wao_col
+                            .iter()
+                            .zip(ao_col.iter())
+                            .map(|(w, a)| w * a)
+                            .sum();
+                    });
+
+                start = end;
+            }
+        }
+        cur_rho
+    }
+}
+
+// CURRENT VERSION
+pub fn prepare_m_isdf_dm_v2(k_mu: usize, mol: &mut Molecule, grids: &mut Option<dft::Grids>, dm:&Vec<MatrixFull<f64>>, batch_size: Option<usize>) -> (MatrixFull<f64>, MatrixFull<f64>) {
+    let nao = mol.num_basis;
+    let nri = mol.num_auxbas;
+
+    let (ip, ip_weights, n_mu) = if let Some(grids_ref) = grids.as_ref() {
+        ip_from_dm_dense(
+            &grids_ref.ao.as_ref().unwrap(), 
+            &grids_ref.coordinates, 
+            &grids_ref.weights, 
+            &mol, 
+            &dm, 
+            k_mu,
+            batch_size)
+    } else {
+        panic!("This is a bug.");
+        (vec![], vec![], 0)
+    };
+    // delete ao and generate them (and aop if needed) after isdf procedure
+    let dftgrids = grids.as_mut().unwrap();
+    dftgrids.ao = None;
+    dftgrids.aop = None;
+    dftgrids.ao_compressed = None;
+    dftgrids.aop_compressed = None;
+    // check, and test
+    assert!(grids.as_ref().unwrap().ao.is_none());
+    assert!(grids.as_ref().unwrap().aop.is_none());
+    assert!(grids.as_ref().unwrap().ao_compressed.is_none());
+    assert!(grids.as_ref().unwrap().aop_compressed.is_none());
+
+    let mut varphi = tabulated_ao(&mol, &ip);
+    let mut lambda_varphi = MatrixFull::new([nao,n_mu],0.0);
+    lambda_varphi.iter_columns_full_mut().zip(ip_weights.iter().zip(varphi.iter_columns_full()))
+    .for_each(|(x, (weight,aos))|{
+        x.iter_mut().zip(aos.iter()).for_each(|(y,ao)|{
+            *y = weight * ao;
+        });
+    });
+    // format S and S^-1 first
+    // use dgemm_ffi to aviod clone
+    // work1 for lambda_varphi.T @ lambda_varphi and s
+    // work2 for varphi.T @ varphi
+    // necessary parameters
+    let transn = b'N' as c_char;
+    let transt = b'T' as c_char;
+    let nip = n_mu.clone() as i32;
+    let nbasis = nao.clone() as i32;
+    let mut work1 = vec![0.0;n_mu*n_mu];
+    let mut work2 = vec![0.0;n_mu*n_mu];
+    dgemm_ffi(&lambda_varphi.data, &lambda_varphi.data, &mut work1, &transt, &transn, &nip, &nip, &nbasis, &1.0, &nbasis, &nbasis, &0.0, &nip);
+    dgemm_ffi(&varphi.data, &varphi.data, &mut work2, &transt, &transn, &nip, &nip, &nbasis, &1.0, &nbasis, &nbasis, &0.0, &nip);
+    work1.par_iter_mut().zip(work2.par_iter()).for_each(|(dst,src)| {
+        *dst *= *src;
+    });
+    // let all elements in work2 be 0.0
+    work2.fill(0.0);
+    let mut work1 = MatrixFull::from_vec([n_mu, n_mu], work1).unwrap();
+
+    //=====================test_pinv_time==========================
+    let mut time_mark = utilities::TimeRecords::new();
+    time_mark.new_item("pinv", "pseudo inverse of S");
+    time_mark.count_start("pinv");
+    /// DGESDD
+//    println!("Apply pinv_sdd");
+//    let mut inv_cctrans = pinv_sdd(&mut mat_s, 1.0e-12);
+//    println!("pinv_sdd done");
+    /// DGESDD
+//    println!("Apply pinv_sdd_i64");
+//    drop(work2);
+//    let mut inv_cctrans = pinv_sdd_i64(&mut work1, 1.0e-12);
+//    println!("pinv_sdd_i64 done");
+    /// DGESVD
+//    println!("Apply svd pinv");
+//    drop(work2);
+//    let mut inv_cctrans = work1.pinv(1.0e-12);
+//    println!("svd pinv done");
+    /// DGEQP3
+//    println!("Apply qr pinv");
+    let mut inv_cctrans = _qrpinv(&mut work1, work2, Some(1e-10)).unwrap();
+//    println!("qr pinv done");
+    time_mark.count("pinv");
+    //=============================================================
+
+    time_mark.new_item("RI", "necessary RI calculation");
+    time_mark.count_start("RI");
+    let mut cint_data = mol.initialize_cint(true);
+    let n_basis_shell = mol.cint_bas.len();
+    let n_auxbas_shell = mol.cint_aux_bas.len();
+
+    let mut ri_v_ri = mol.int_ij_aux_columb();
+    let mut mat_a = MatrixFull::new([n_mu, nri], 0.0);
+    let mut tmp_a = MatrixFull::new([nao, n_mu], 0.0);
+    cint_data.cint3c2e_optimizer_rust();
+    for k in 0..n_auxbas_shell {
+        let basis_start_k = mol.cint_aux_fdqc[k][0];
+        let basis_len_k = mol.cint_aux_fdqc[k][1];
+        let mut tmp_part = RIFull::new([nao, nao, basis_len_k], 0.0);
+        let gk  = k + n_basis_shell;
+
+        for j in 0..n_basis_shell {
+            let basis_start_j = mol.cint_fdqc[j][0];
+            let basis_len_j = mol.cint_fdqc[j][1];
+            for i in 0..n_basis_shell {
+                let basis_start_i = mol.cint_fdqc[i][0];
+                let basis_len_i = mol.cint_fdqc[i][1];
+                let buf = RIFull::from_vec([basis_len_i, basis_len_j,basis_len_k], 
+                    cint_data.cint_3c2e(i as i32, j as i32, gk as i32)).unwrap();
+                tmp_part.copy_from_ri(
+                    basis_start_i..basis_start_i+basis_len_i,
+                    basis_start_j..basis_start_j+basis_len_j,
+                    0..basis_len_k,
+                    & buf, 
+                    0..basis_len_i, 
+                    0..basis_len_j, 
+                    0..basis_len_k);
+            }
+        }
+
+        mat_a.iter_columns_mut(basis_start_k..basis_start_k+basis_len_k).zip(tmp_part.iter_auxbas(0..basis_len_k).unwrap()).for_each(|(aux_k,part)|{
+            // change to dgemm_ffi to aviod clone
+            let transt = b'T' as c_char;
+            let transn = b'N' as c_char;
+            let n1 = nao.clone() as i32;
+            let n2 = n_mu.clone() as i32;
+            dgemm_ffi(part, &lambda_varphi.data, &mut tmp_a.data, &transt, &transn, &n1, &n2, &n1, &1.0, &n1, &n1, &0.0, &n1);
+            aux_k.par_iter_mut().zip(tmp_a.par_iter_columns_full()).zip(varphi.par_iter_columns_full()).for_each(|((x,t_i),phi_i)|{
+                t_i.iter().zip(phi_i.iter()).for_each(|(t_ij, phi_ij)|{
+                    *x += *t_ij * *phi_ij
+                });
+            });
+        });
+
+    }
+    
+    cint_data.final_c2r(); 
+    time_mark.count("RI");
+    time_mark.report_all();
+
+    let mut tmp0 = MatrixFull::new([nri,n_mu],0.0);
+    tmp0.lapack_dgemm(&mut mat_a, &mut inv_cctrans, 'T', 'N', 1.0, 0.0);
+    drop(mat_a);
+    drop(inv_cctrans);
+    let mut tmp01 = tmp0.clone();
+    let mut tmp = ri_v_ri.lapack_dgesv(&mut tmp01, nri as i32);
+    let mut kernel_part = MatrixFull::new([n_mu,n_mu], 0.0);
+    kernel_part.lapack_dgemm(&mut tmp0, &mut tmp, 'T', 'N', 1.0, 0.0);
+
+    kernel_part.data.par_chunks_mut(n_mu)
+        .enumerate()
+        .for_each(|(j, col)| {
+            let wj = ip_weights[j];
+            for i in 0..n_mu {
+                col[i] *= ip_weights[i] * wj;
+            }
+        });
+
+    // generate ao and aop again here (if needed)
+    // copy from prepare_density_grids
+    if mol.xc_data.is_dfa_scf() || mol.ctrl.initial_guess == "vsap" {
+        if let Some(dftgrids) = grids {
+            dftgrids.ao_cutoff = mol.ctrl.ao_cutoff;
+            if dftgrids.ao_cutoff > 0.0 {
+                // sparse path: two-pass batch scan → compressed directly, no dense allocation
+                dftgrids.prepare_tabulated_ao_sparse(&mol);
+            } else {
+                // dense path: allocate full AO/AOP, then optionally build non0tab + compressed
+                dftgrids.prepare_tabulated_ao(&mol);
+                dftgrids.build_non0tab(&mol);
+                dftgrids.build_compressed_storage();
+            }
+            if mol.ctrl.drop_dense_ao && dftgrids.ao_compressed.is_some() {
+                if mol.ctrl.print_level >= 1 {
+                    let (dense_bytes, comp_bytes, _) = dftgrids.memory_footprint();
+                    let ratio = if dense_bytes > 0 { comp_bytes as f64 / dense_bytes as f64 * 100.0 } else { 0.0 };
+                    println!(" [non0tab] dropping dense ao/aop, dense={:.1}GB, compressed={:.1}GB ({:.1}%)",
+                        dense_bytes as f64 / 1e9, comp_bytes as f64 / 1e9, ratio);
+                }
+                dftgrids.ao = None;
+                dftgrids.aop = None;
+            }
+        }
+    }
+
+    estimate_memory_for_isdf_new(mol);
+    (varphi, kernel_part)
+}
+
+pub fn call_isdf_k_generator(mol: &Molecule) -> usize {
+    let project_root = std::env!("CARGO_MANIFEST_DIR");
+    let file_path = std::path::Path::new(project_root).parent().unwrap().join(file!());
+    let current_dir = file_path.parent().unwrap();
+    let wrapper_path = current_dir.join("set_k_auto.py");
+    let python_command = find_current_python().unwrap();
+    let output = Command::new(python_command.as_str())
+        .arg(wrapper_path.to_str().unwrap())
+        .arg(current_dir.to_str().unwrap())
+        .arg(&mol.ctrl.ctrl_file.as_str())
+        .output().unwrap();
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("Python script failed: {}", stderr);
+    };
+
+    let stdout_str = str::from_utf8(&output.stdout).unwrap();
+    let result: usize = stdout_str.trim().parse().unwrap();
+    result
+}
+
+pub fn set_isdf_k(mol: &mut Molecule) {
+    if mol.ctrl.isdf_k.is_some() {
+        return
+    } else {
+        mol.ctrl.isdf_k = Some(call_isdf_k_generator(&mol));
+        println!("k_IP in ISDF has been set to {} by empirical rules", mol.ctrl.isdf_k.as_ref().unwrap());
+    }
+}
+
+pub fn estimate_memory_for_isdf_new(mol: &mut Molecule) {
+    use std::cmp::max;
+    // estimate memory costs for isdf
+    // and then set ctrl.max_memory for ri-j-on-the-fly in MB
+    assert!(&mol.ctrl.use_isdf);
+    // some essential parameters
+    let num_basis = mol.num_basis;
+    let isdf_k = mol.ctrl.isdf_k.unwrap();
+    let num_aux_basis = mol.num_auxbas;
+    let nip = isdf_k*num_aux_basis;
+    // It is a rough estimate!
+    let nocc = (mol.num_elec[0] / 2.0).floor() as usize;
+    let nvir = num_basis - nocc;
+    let mut est_mem = 0.0;
+    // for HF and hybrid DFT
+    est_mem = (((num_basis*num_basis + num_basis*nip + nip*nip) * 8) as f64) / 1024.0 / 1024.0;
+    mol.ctrl.max_memory_backup = mol.ctrl.max_memory.clone();
+    mol.ctrl.max_memory = Some(est_mem);
+}
+
+// a simple wrapper for dgemm
+pub fn dgemm_ffi(mat_a: &[f64], mat_b: &[f64], mat_c: &mut [f64], transa: &c_char, transb: &c_char, m: &i32, n: &i32, k: &i32, alpha: &f64, lda: &i32, ldb: &i32, beta: &f64, ldc: &i32) {
+    unsafe {
+        dgemm_(
+            transa as *const c_char,
+            transb as *const c_char,
+            m as *const i32,
+            n as *const i32,
+            k as *const i32,
+            alpha as *const f64,
+            mat_a.as_ptr(),
+            lda as *const i32,
+            mat_b.as_ptr(),
+            ldb as *const i32,
+            beta as *const f64,
+            mat_c.as_mut_ptr(),
+            ldc as *const i32,
+        );
+    }
+}
+
+// use ffi to perform pinv_sdd
+pub fn pinv_sdd_i64(mat: &mut MatrixFull<f64>, threshold: f64) -> MatrixFull<f64> {
+    let jobz = b'A' as c_char;
+    let m = mat.size[0];
+    //m = n = lda = ldu = ldvt
+    let mut s = vec![0.0; m];
+    let mut u = vec![0.0; (m * m)];
+    //use jobz = 'O', the mat itself will be u
+    let mut vt = vec![0.0;(m * m)];
+    let lwork = 5 * m * m + 10 * m;
+    let mut work = vec![0.0; lwork];
+    let mut iwork = vec![0; (8 * m)];
+    let mut info = 0;
+    let m = m as i32;
+    let lwork = lwork as i64;
+    //u -> mat, vt -> vt, sigma -> s
+    unsafe {
+        dgesdd_(
+            &jobz as *const c_char,
+            &m as *const i32,
+            &m as *const i32,
+            mat.data.as_mut_ptr(),
+            &m as *const i32,
+            s.as_mut_ptr(),
+            u.as_mut_ptr(),
+            &m as *const i32,
+            vt.as_mut_ptr(),
+            &m as *const i32,
+            work.as_mut_ptr(),
+            &lwork as *const i64,
+            iwork.as_mut_ptr(),
+            &mut info as *mut i32,
+            );
+    };
+    if info != 0 {
+        panic!("Lapack dgesdd failed");
+    };
+    //filter s and get s_inv
+    let cutoff = threshold * s[0];
+    s.par_iter_mut().for_each(|x| {
+        if *x < cutoff {
+            *x = 0.0;
+        } else {
+            *x = x.recip();
+        }
+    });
+    //Note u_mat = mat.data
+    let mut u_mat = MatrixFull::from_vec([m as usize,m as usize], u).unwrap();
+    for j in 0..(m as usize) {
+        u_mat.iter_column_mut(j).for_each(|x| {
+            *x *= s[j];
+        });
+    };
+    let mut inv_s = vec![0.0;(m as usize) * (m as usize)];
+    let transa = b'T' as c_char;
+    let transb = b'T' as c_char;
+    let alpha = 1.0;
+    let beta = 0.0;
+    unsafe {
+        dgemm_(
+            &transa as *const c_char,
+            &transb as *const c_char,
+            &m as *const i32,
+            &m as *const i32,
+            &m as *const i32,
+            &alpha as *const f64,
+            vt.as_ptr(),
+            &m as *const i32,
+            u_mat.data.as_ptr(),
+            &m as *const i32,
+            &beta as *const f64,
+            inv_s.as_mut_ptr(),
+            &m as *const i32,
+            );
+    };
+    let inv_s = MatrixFull::from_vec([m as usize,m as usize],inv_s).unwrap();
+    inv_s
+}
+
+#[link(name="lapack")]
+extern "C" {
+    fn dgesdd_(
+        jobz: *const c_char,
+        m: *const i32,
+        n: *const i32,
+        a: *mut c_double,
+        lda: *const i32,
+        s: *mut c_double,
+        u: *mut c_double,
+        ldu: *const i32,
+        vt: *mut c_double,
+        ldvt: *const i32,
+        work: *mut c_double,
+        lwork: *const i64,
+        iwork: *mut c_int,
+        info: *mut i32,
+        );
+}
+
+#[link(name="lapack")]
+extern "C" {
+    fn dgemm_(
+        transa: *const c_char,
+        transb: *const c_char,
+        m: *const i32,
+        n: *const i32,
+        k: *const i32,
+        alpha: *const f64,
+        a: *const c_double,
+        lda: *const i32,
+        b: *const c_double,
+        ldb: *const i32,
+        beta: *const f64,
+        c: *mut c_double,
+        ldc: *const i32,
+        );
 }

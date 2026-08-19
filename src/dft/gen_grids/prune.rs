@@ -5,12 +5,16 @@
 //! 
 //! [^1]: [P. M. W. Gill, B. G. Johnson, J. A. Pople. Chemical Physics Letters 209, 506-512 (1993)](https://doi.org/10.1016/0009-2614(93)80125-9).
 
+use rayon::prelude::*;
 use num_traits::{ToPrimitive};
+use rayon::iter::IntoParallelRefMutIterator;
 use tensors::MatrixFull;
 //use super::parameters::{SG1RADII, BRAGG0, LEBEDEV_NGRID};
 use crate::{dft::Grids, utilities::balancing};
 use crate::constants::BOHR;
 use super::{parameters::{SG1RADII, BRAGG0, LEBEDEV_NGRID}, atom::default_angular_num};
+use crate::{dft::RIFull, isdf::tabulated_density_batch};
+use crate::molecule_io::Molecule;
 
 /// Standard Grid 1 according to _P. M. W. Gill, B. G. Johnson, J. A. Pople. Chemical Physics Letters 209, 506-512 (1993)_.<br>
 /// Reference can be found [here](https://doi.org/10.1016/0009-2614(93)80125-9).
@@ -242,6 +246,136 @@ pub fn prune_by_rho(grids: &Grids, dm: &Vec<MatrixFull<f64>>, spin_channel: usiz
         aop_compressed: None,
     }
     
+}
+
+pub fn prune_by_rho_compressed(grids: &mut Grids, mol: &Molecule, dm: &Vec<MatrixFull<f64>>, spin_channel: usize) {
+    /// for the case that sparsity < 90%
+    /// the grids may keep sparse, or back to dense
+    let ao_c = grids.ao_compressed.as_ref().expect("Compressed AO must be built first. This must be a bug");
+    let ngrids_ori = grids.coordinates.len();
+    let threshold = 1.0e-3 / ngrids_ori.to_f64().unwrap();
+
+    let mut keep_indices = Vec::new();
+
+    for ibatch in 0..ao_c.batches.len() {
+        let grid_range = ao_c.batch_grid_ranges[ibatch].clone();
+
+        let rho_batch = grids.prepare_tabulated_density_compressed(dm, spin_channel, grid_range.clone());
+        for g_local in 0..rho_batch.size[0] {
+            let total_rho = if spin_channel == 1 {
+                rho_batch[[g_local, 0]]
+            } else {
+                rho_batch[[g_local, 0]] + rho_batch[[g_local, 1]]
+            };
+
+            if total_rho >= threshold {
+                keep_indices.push(grid_range.start + g_local);
+            }
+        }
+    }
+
+    if keep_indices.is_empty() {
+        panic!("No grids are kept, why?");
+    }
+
+    let old_coords = std::mem::take(&mut grids.coordinates);
+    let old_weights = std::mem::take(&mut grids.weights);
+
+    grids.coordinates = keep_indices.iter().map(|&g| old_coords[g]).collect();
+    grids.weights = keep_indices.iter().map(|&g| old_weights[g]).collect();
+
+    grids.non0tab = None;
+    grids.ao_compressed = None;
+    grids.aop_compressed = None;
+
+    grids.prepare_tabulated_ao_sparse(mol);
+}
+
+pub fn prune_by_rho_dense(grids: &mut Grids, dm: &Vec<MatrixFull<f64>>, spin_channel: usize, batch_size: Option<usize>) {
+    /// for the case that sparsity >= 90%, and back to dense
+    /// the grids kept dense
+    let mut new_rho = tabulated_density_batch(&grids.coordinates, &grids.ao.as_ref().unwrap(), dm, spin_channel, batch_size);
+    let ngrids_ori = new_rho.size[0];
+    if spin_channel == 2 {
+        for i in 0..ngrids_ori{
+            new_rho.data[i] += new_rho.data[ngrids_ori + i];
+        }
+        new_rho.data.truncate(ngrids_ori);
+        new_rho.size = [ngrids_ori,1];
+    }
+    
+    new_rho.data.par_iter_mut().zip(grids.weights.par_iter())
+        .for_each(|(x,w)|{
+            *x *= *w;
+        });
+
+    let threshold = 1.0e-3 / ngrids_ori.to_f64().unwrap();
+    let effective_ind = new_rho.data.iter()
+    .enumerate()
+    .filter(|(_, &r)| r.abs() >= threshold)
+    .map(|(index, _)| index)
+    .collect::<Vec<_>>();
+    drop(new_rho);
+
+    grids.parallel_balancing = balancing(effective_ind.len(), rayon::current_num_threads());
+
+    let mut rgrids = vec![[0.0;3]; effective_ind.len()];
+    rgrids.par_iter_mut().zip(effective_ind.par_iter()).for_each(|(new,index_new)|{
+        new.iter_mut().zip(grids.coordinates[*index_new].iter()).for_each(|(a,b)|{
+            *a = *b;
+        }) 
+    });
+    grids.coordinates = rgrids;
+
+    if let Some(mut ao_mat) = grids.ao.take() {
+        let [n_ao, _n] = ao_mat.size;
+        let data = &mut ao_mat.data;
+        let mut write = 0;
+        for &old_j in &effective_ind {
+            let src = old_j * n_ao;
+            if src != write {
+                let (left, right) = data.split_at_mut(src);
+                left[write..write + n_ao].copy_from_slice(&right[..n_ao]);
+            }
+            write += n_ao;
+        }
+        data.truncate(n_ao * effective_ind.len());
+        data.shrink_to_fit();
+        let new_ao = MatrixFull::from_vec([n_ao, effective_ind.len()], std::mem::take(data)).unwrap();
+        grids.ao = Some(new_ao);
+    }
+
+    if let Some(mut aop) = grids.aop.take() {
+        let [d1, d2, d3] = aop.size;
+        let c = effective_ind.len();
+        let data = &mut aop.data;
+    
+        for k in 0..d3 {
+            let block_start = k * d1 * d2;
+            let mut write = k * d1 * c;
+            for &old_j in &effective_ind {
+                let src_start = block_start + old_j * d1;
+                if src_start != write {
+                    let (left, right) = data.split_at_mut(src_start);
+                    left[write..write + d1].copy_from_slice(&right[..d1]);
+                }
+                write += d1;
+            }
+        }
+        data.truncate(d1 * c * d3);
+        data.shrink_to_fit();
+    
+        let new_aop = RIFull::from_vec([d1, c, d3], std::mem::take(data)).unwrap();
+        grids.aop = Some(new_aop);
+    }
+
+    let mut lambda_r = vec![0.0; effective_ind.len()];
+    lambda_r.iter_mut().zip(effective_ind.iter()).for_each(|(new,index_new)|{
+        *new = grids.weights[*index_new];
+    });
+    grids.weights = lambda_r;
+
+    println!("After prune_by_rho, grid size: {}", effective_ind.len());
 }
 
 pub fn none_prune(nuc: usize, n_rad: usize, level: usize) -> Vec<usize> { 

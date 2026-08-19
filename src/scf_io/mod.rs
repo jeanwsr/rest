@@ -2,7 +2,7 @@
 use crate::basis_io::ecp::ghost_effective_potential_matrix;
 use self::force_state_occupation::adapt_occupation_with_force_projection;
 use self::occupation::{generate_occupation_frac_occ, generate_occupation_integer, generate_occupation_sad, OCCType};
-use crate::dft::gen_grids::prune::prune_by_rho;
+use crate::dft::gen_grids::prune::{prune_by_rho_dense};
 use crate::dft::{DFTType, Grids};
 use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges};
 #[cfg(feature = "mpi")]
@@ -33,9 +33,10 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use crossbeam::{channel::{unbounded},thread::{scope}};
 use std::sync::mpsc::{channel};
-use crate::isdf::{prepare_for_ri_isdf, prepare_m_isdf};
+use crate::isdf::{prepare_m_isdf, prepare_m_isdf_dm_v2, set_isdf_k};
 use crate::molecule_io::{Molecule};
 use crate::initial_guess::{initial_guess, update_basis_from_hdf5chk};
+use crate::initial_guess::sad::initial_guess_from_sad;
 use crate::external_libs::dftd;
 use crate::constants::{SQRT_THRESHOLD};
 use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
@@ -543,87 +544,101 @@ impl SCF {
     }
 
     pub fn prepare_density_grids(&mut self) {
-
-        self.grids = if self.mol.xc_data.is_dfa_scf() || self.mol.ctrl.use_isdf || self.mol.ctrl.initial_guess == "vsap" {
-            let grids = Grids::build(&mut self.mol);
-            info!("Grid size: {:}", grids.coordinates.len());
-            Some(grids)
-        } else {None};
-
-        if let Some(grids) = &mut self.grids {
-            grids.ao_cutoff = self.mol.ctrl.ao_cutoff;
-            if grids.ao_cutoff > 0.0 {
-                // sparse path: two-pass batch scan → compressed directly, no dense allocation
-                grids.prepare_tabulated_ao_sparse(&self.mol);
-            } else {
-                // dense path: allocate full AO/AOP, then optionally build non0tab + compressed
-                grids.prepare_tabulated_ao(&self.mol);
-                grids.build_non0tab(&self.mol);
-                grids.build_compressed_storage();
-            }
-            if self.mol.ctrl.drop_dense_ao && grids.ao_compressed.is_some() {
-                if self.mol.ctrl.print_level >= 1 {
-                    let (dense_bytes, comp_bytes, _) = grids.memory_footprint();
-                    let ratio = if dense_bytes > 0 { comp_bytes as f64 / dense_bytes as f64 * 100.0 } else { 0.0 };
-                    info!(" [non0tab] dropping dense ao/aop, dense={:.1}GB, compressed={:.1}GB ({:.1}%)",
-                        dense_bytes as f64 / 1e9, comp_bytes as f64 / 1e9, ratio);
+        if self.mol.ctrl.use_isdf {
+            // make a single branch
+            // always generate dense grids first
+            // generate ao only
+            self.grids = {
+                let grids = Grids::build(&mut self.mol);
+                if self.mol.ctrl.print_level > 0 {
+                    println!("Grid size: {:}",grids.coordinates.len());
                 }
-                grids.ao = None;
+                Some(grids)
+            };
+            if let Some(grids) = &mut self.grids {
+                grids.prepare_tabulated_ao(&self.mol);
                 grids.aop = None;
+            }
+        } else {
+            self.grids = if self.mol.xc_data.is_dfa_scf() || self.mol.ctrl.initial_guess == "vsap" {
+                let grids = Grids::build(&mut self.mol);
+                info!("Grid size: {:}", grids.coordinates.len());
+                Some(grids)
+            } else {None};
+
+            if let Some(grids) = &mut self.grids {
+                grids.ao_cutoff = self.mol.ctrl.ao_cutoff;
+                if grids.ao_cutoff > 0.0 {
+                    // sparse path: two-pass batch scan → compressed directly, no dense allocation
+                    grids.prepare_tabulated_ao_sparse(&self.mol);
+                } else {
+                    // dense path: allocate full AO/AOP, then optionally build non0tab + compressed
+                    grids.prepare_tabulated_ao(&self.mol);
+                    grids.build_non0tab(&self.mol);
+                    grids.build_compressed_storage();
+                }
+                if self.mol.ctrl.drop_dense_ao && grids.ao_compressed.is_some() {
+                    if self.mol.ctrl.print_level >= 1 {
+                        let (dense_bytes, comp_bytes, _) = grids.memory_footprint();
+                        let ratio = if dense_bytes > 0 { comp_bytes as f64 / dense_bytes as f64 * 100.0 } else { 0.0 };
+                        info!(" [non0tab] dropping dense ao/aop, dense={:.1}GB, compressed={:.1}GB ({:.1}%)",
+                            dense_bytes as f64 / 1e9, comp_bytes as f64 / 1e9, ratio);
+                    }
+                    grids.ao = None;
+                    grids.aop = None;
+                }
             }
         }
     }
 
     pub fn prepare_isdf(&mut self, mpi_operator: &Option<MPIOperator>) {
 
-        let use_eri = self.mol.use_eri;
+        let use_eri = true;
         let isdf = if use_eri {self.mol.ctrl.eri_type.eq("ri_v") && self.mol.ctrl.use_isdf} else {false};
         let ri3fn_full = if use_eri {self.mol.ctrl.use_auxbas && !self.mol.ctrl.use_ri_symm} else {false};
         let ri3fn_symm = if use_eri {self.mol.ctrl.use_auxbas && self.mol.ctrl.use_ri_symm} else{false};
 
         if ! isdf {return}
-        if let Some(grids) = &self.grids {
+        if self.grids.is_none() {
+            panic!("SCF grids should be initialized before the preparation of ISDF");
+        } else {
             if self.mol.ctrl.use_isdf {
-                let init_fock = self.h_core.clone();
-                if self.mol.spin_channel==1 {
-                    self.hamiltonian = [init_fock,MatrixUpper::new(1,0.0)];
-                } else {
-                    let init_fock_beta = init_fock.clone();
-                    self.hamiltonian = [init_fock,init_fock_beta];
-                };
-                (self.eigenvectors,self.eigenvalues, self.mol.num_state) = diagonalize_hamiltonian_outside(&self, mpi_operator);
-                (self.occupation, self.homo, self.lumo) = generate_occupation_outside(&self);
-                self.density_matrix = generate_density_matrix_outside(&self);
-
-                self.grids = Some(prune_by_rho(grids, &self.density_matrix, self.mol.spin_channel));
-                
+                set_isdf_k(&mut self.mol);
+                // generate initial guess(sad) here
+                self.density_matrix = initial_guess_from_sad(&self.mol, mpi_operator);
+                // apply a low memory version
+                // assume the extra memory is same as 0.5*N_IP^2
+                let nip = self.mol.num_auxbas * self.mol.ctrl.isdf_k.unwrap();
+                let batch_size: usize = (nip * nip).div_ceil(self.mol.num_basis * 2);
+                prune_by_rho_dense(&mut self.grids.as_mut().unwrap(), &self.density_matrix, self.mol.spin_channel, Some(batch_size));
             };
-
-
-            self.ri3fn_isdf = if ri3fn_full && isdf && !self.mol.ctrl.isdf_new{
-                if let Some(grids) = &self.grids {
-                    Some(prepare_for_ri_isdf(self.mol.ctrl.isdf_k_mu, &self.mol, &grids))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            (self.tab_ao, self.m) = if isdf && self.mol.ctrl.isdf_new{
-                if let Some(grids) = &self.grids {
-                    let isdf = prepare_m_isdf(self.mol.ctrl.isdf_k_mu, &self.mol, &grids);
+            (self.tab_ao, self.m) = if isdf && self.mol.ctrl.isdf_new {
+                if self.grids.is_some() {
+                    let nip: usize = self.mol.num_auxbas * self.mol.ctrl.isdf_k.unwrap();
+                    // here assume the extra memory is same as N_IP^2
+                    // as the number of grids is much smaller
+                    let batch_size: usize = self.mol.num_auxbas * self.mol.ctrl.isdf_k.unwrap();
+                    let isdf = match self.mol.ctrl.isdf_type.as_str() {
+                        "udd" => {
+                            prepare_m_isdf_dm_v2(self.mol.ctrl.isdf_k.unwrap(), &mut self.mol, &mut self.grids, &self.density_matrix, Some(batch_size))
+                        }
+                        "cvt" => {
+                            panic!("CVT is not supported in this version. If you really need, please contact us.");
+                            prepare_m_isdf(self.mol.ctrl.isdf_k.unwrap(), &self.mol, &self.grids.as_ref().unwrap())
+                        }
+                        _ => {
+                            panic!("Unknown isdf_type: {}",self.mol.ctrl.isdf_type);
+                            (MatrixFull::empty(), MatrixFull::empty())
+                        }
+                    };
                     (Some(isdf.0), Some(isdf.1))
                 } else {
-                    (None,None)
+                    (None, None)
                 }
             } else {
-                (None,None)
+                (None, None)
             };
-        } else {
-            panic!("SCF.grids should be initialized before the preparation of ISDF");
         }
-
     }
 
     pub fn prepare_solvent_calculation(&mut self) {
@@ -1689,6 +1704,7 @@ impl SCF {
             1.0, 0.0);
             vk.push(vk_i.to_matrixupper());
         }
+	println!("vk end");
         vk
     }
 
@@ -2010,10 +2026,14 @@ impl SCF {
 
         // Coulomb J
         let dt1 = time::Local::now();
-        let vj = match self.algorithm_jk {
+        let vj = if self.mol.ctrl.isdf_new {
+            self.generate_vj_ri_direct(None)
+        } else {
+            match self.algorithm_jk {
             AlgorithmJK::RiIncore | AlgorithmJK::Separated(AlgorithmJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
             AlgorithmJK::RiDirect | AlgorithmJK::Separated(AlgorithmJ::RiDirect, _) => self.generate_vj_ri_direct(None),
             _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
+            }
         };
 
         for i_spin in (0..spin_channel) {
@@ -2081,10 +2101,16 @@ impl SCF {
             let scaling_factor = base_scaling * self.mol.xc_data.dfa_hybrid_scf;
             if ! scaling_factor.eq(&0.0) {
                 let use_dm_only = self.mol.ctrl.use_dm_only;
-                let vk = match self.algorithm_jk {
+                let vk = if self.mol.ctrl.use_isdf && !self.mol.ctrl.isdf_new {
+                    self.generate_vk_with_isdf(scaling_factor, use_dm_only)
+                } else if self.mol.ctrl.isdf_new {
+                    self.generate_vk_with_isdf_new(scaling_factor)
+                } else {
+                    match self.algorithm_jk {
                     AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
                     AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None, None),
                     _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
+                    }
                 };
                 for i_spin in (0..spin_channel) {
                     self.hamiltonian[i_spin].data.par_iter_mut()
@@ -2625,7 +2651,7 @@ impl SCF {
         let use_dm_only = self.mol.ctrl.use_dm_only;
         //let mut vk = self.generate_vk_with_ri_v(1.0, use_dm_only);
         let mut vk = if self.mol.ctrl.use_isdf{
-            self.generate_vk_with_isdf(1.0, use_dm_only)
+            self.generate_vk_with_isdf_new(1.0)
         }else{
             match self.algorithm_jk {
                 AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(1.0, use_dm_only, None, None),
@@ -2787,11 +2813,11 @@ impl SCF {
             vj_upper_with_rimatr_sync_mpi(&self.rimatr, dm, spin_channel, scaling_factor, mpi_operator)
         } else {
             //vj_upper_with_ri_v_sync(&self.ri3fn, dm, spin_channel, scaling_factor)
-            if self.mol.ctrl.use_isdf && !self.mol.ctrl.isdf_k_only && !self.mol.ctrl.isdf_new{
-                vj_upper_with_ri_v_sync(&self.ri3fn_isdf, dm, spin_channel, scaling_factor)
-            }else{
+            //if self.mol.ctrl.use_isdf && !self.mol.ctrl.isdf_k_only && !self.mol.ctrl.isdf_new{
+            //    vj_upper_with_ri_v_sync(&self.ri3fn_isdf, dm, spin_channel, scaling_factor)
+            //}else{
                 vj_upper_with_ri_v_sync(&self.ri3fn, dm, spin_channel, scaling_factor)
-            }
+            //}
         }
     }
 
@@ -3401,9 +3427,15 @@ impl SCF {
         let naux = self.mol.num_auxbas;
         let nset = self.mol.spin_channel;
         let sys_info = sysinfo::System::new_all();
-        let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
-            max_memory - detect_used_memory_mb("proc")
-        });
+        let mem_avail = if self.mol.ctrl.use_isdf {
+            self.mol.ctrl.max_memory.map(|max_memory| {
+                max_memory
+            })
+        } else {
+            self.mol.ctrl.max_memory.map(|max_memory| {
+                max_memory - detect_used_memory_mb("proc")
+            })
+        };
         let mem_est = ri_jk::mem_estimate_vj_ri_direct(nao, naux, nset);
         let mut batch_size_estimate = calc_batch_size_from_mem_estimate::<f64>(&mem_est, mem_avail, None, true);
 

@@ -70,7 +70,8 @@ pub fn main_driver() -> anyhow::Result<()> {
     if ! PathBuf::from(ctrl_file.clone()).is_file() {
         panic!("Input file ({:}) does not exist", ctrl_file);
     }
-    let mut mol = Molecule::build(ctrl_file, mpi_data)?;
+    let mut mol = Molecule::build(ctrl_file.clone(), mpi_data)?;
+    mol.ctrl.ctrl_file = ctrl_file;
     if mol.ctrl.print_level>0 {println!("Molecule_name: {}", &mol.geom.name)};
     if mol.ctrl.print_level>=2 {
         println!("{}", mol.ctrl.formated_output_in_toml());
@@ -528,6 +529,9 @@ pub fn performance_essential_calculations(scf_data: &mut SCF, time_mark: &mut ut
     scf_without_build(scf_data, mpi_operator);
     //println!("debug time mark SCF turn off");
     time_mark.count("SCF");
+    if scf_data.mol.ctrl.max_memory_backup.is_some() {
+        scf_data.mol.ctrl.max_memory = scf_data.mol.ctrl.max_memory_backup.clone();
+    }
 
     //==================================================================
     // Save the converged SCF results to the chkfile

@@ -4642,6 +4642,62 @@ impl Grids {
         cur_rho
     }
 
+    pub fn prepare_tabulated_density_compressed(&self, dm: &Vec<MatrixFull<f64>>, spin_channel: usize, range_grids: Range<usize>) -> MatrixFull<f64> {
+        /// copy from prepare_tabulated_density_slots_dm_only_compressed, but generate rho only
+        let ao_c = self.ao_compressed.as_ref()
+            .expect("compressed AO must be built before calling compressed density");
+
+        let nao = dm[0].size[0];
+        let n_grids_total = range_grids.len();
+
+        let ibatch_start = range_grids.start / ao_c.blksize;
+        let ibatch_end = ((range_grids.end + ao_c.blksize - 1) / ao_c.blksize).min(ao_c.batches.len());
+
+        // ---- rho ----
+        let mut cur_rho = MatrixFull::new([n_grids_total, spin_channel], 0.0);
+        for ibatch in ibatch_start..ibatch_end {
+            let batch_ao = &ao_c.batches[ibatch];
+            let indices = &ao_c.batch_ao_map[ibatch];
+            let n_active = indices.len();
+            if n_active == 0 { continue; }
+            let g_range = &ao_c.batch_grid_ranges[ibatch];
+            let g_local_start = (range_grids.start.saturating_sub(g_range.start));
+            let g_local_end = (range_grids.end.min(g_range.end) - g_range.start).min(batch_ao.size[1]);
+            if g_local_end <= g_local_start { continue; }
+            let n_batch = g_local_end - g_local_start;
+            let g_out_start = g_range.start + g_local_start - range_grids.start;
+
+            let mut dm_sub = vec![MatrixFull::new([nao, n_active], 0.0); spin_channel];
+            for i_spin in 0..spin_channel {
+                let dm_s = &dm[i_spin];
+                let dm_sub_s = &mut dm_sub[i_spin];
+                for mu in 0..nao {
+                    for (i_local, &nu_global) in indices.iter().enumerate() {
+                        dm_sub_s[[mu, i_local]] = dm_s[[mu, nu_global]];
+                    }
+                }
+            }
+
+            for i_spin in 0..spin_channel {
+                let mut wao = MatrixFull::new([nao, n_batch], 0.0);
+                _dgemm(
+                    &dm_sub[i_spin], (0..nao, 0..n_active), 'N',
+                    batch_ao, (0..n_active, g_local_start..g_local_end), 'N',
+                    &mut wao, (0..nao, 0..n_batch), 1.0, 0.0,
+                );
+
+                for g in 0..n_batch {
+                    let mut rho_val = 0.0;
+                    for (i_local, &mu_global) in indices.iter().enumerate() {
+                        rho_val += batch_ao[[i_local, g_local_start + g]] * wao[[mu_global, g]];
+                    }
+                    cur_rho[[g_out_start + g, i_spin]] = rho_val;
+                }
+            }
+        }
+        cur_rho
+    }
+
     pub fn prepare_tabulated_density(&self, dm: &Vec<MatrixFull<f64>>, spin_channel: usize) -> MatrixFull<f64> {
         //let default_omp_num_threads = omp_get_num_threads_wrapper();
         //omp_set_num_threads_wrapper(1);
