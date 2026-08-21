@@ -79,6 +79,6 @@ Consequences:
 
 ---
 
-## Note: pre-existing scftype detection ordering
+## Note: scftype detection now uses spin multiplicity — **FIXED** (2026-08-21)
 
-`scftype` detection (`scf_io/mod.rs:175`) runs in `init_scf` *before* `initialize_scf` (which calls `update_basis_from_hdf5chk`). So a UHF/ROHF `basis_path='chkfile'` run would still misdetect `scftype=RHF` unless `spin_polarization` is set. This was already the case in master — same ordering. Out of scope for the `num_elec` fix but worth noting as a separate issue.
+`scftype` detection (`scf_io/mod.rs:175`) previously used `num_elec[1]/[2]`, which is `[0,0,0]` at `init_scf` time for `basis_path='chkfile'` (basis not yet loaded), silently misdetecting UHF/ROHF as RHF unless `spin_polarization` was set. Since `num_elec[1] != num_elec[2] <=> ctrl.spin > 1.0`, detection now uses the spin multiplicity `ctrl.spin` (always available from input) — mathematically equivalent for all jobs, and correct for chkbasis. No other behavior change.
