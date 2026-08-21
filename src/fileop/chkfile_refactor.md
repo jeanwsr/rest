@@ -202,22 +202,45 @@ No derived `cint_env` is stored. `build_cint` is the canonical reconstruction pa
 
 ---
 
-## TODO: Projection for `inherit` initial guess on geometry change
+## Fixed / Resolved Issues
+
+**`num_elec` regression in `basis_path='chkfile'`** — FIXED
+- Problem: `build_native` skips `collect_basis` for `chkbasis=true`, so `mol.num_elec` stayed `[0.0;3]`. The removed `update_from_cint` used to recompute it; the new `set_cint_data` does not. Consequences: electron-count Refuse always fired (`|0 − N| > 0.5`), `scftype` detection read `[0,0,0]` → RHF, and `basis_path='chkfile'` was completely broken.
+- Fix: added `Molecule::update_num_elec()` (recomputes from `cint_atm` nuclear charges + ECP + charge + spin); `collect_basis` no longer returns `num_elec`; `build_native` and `update_basis_from_hdf5chk` call `update_num_elec()` after `set_cint_data`. `grad/rhf.rs:686` uses only `.0` from `collect_basis` — unaffected.
+
+**Ghost basis atoms lost in chkfile round-trip** — FIXED
+- Problem: geom JSON had only `name/elem/unit/position`; `load_geom` hard-coded `ghost_bs_elem: vec![]`. `reconstruct_cint_data` → `build_cint(basis4elem, ghostless_geom)` built `atm` without ghost atoms while `bas` still referenced their indices → corrupted cint for ghost-basis molecules (QM/MM, CP correction).
+- Fix: `save_chkfile` writes `ghost_bs_elem` + `ghost_bs_pos` in the geom JSON; `load_geom` restores them (old-format chkfiles default to no ghosts). Serialization extracted into `geom_to_json`/`geom_from_json`. Basis projection now reconstructs correct cint for ghost-basis sources; basis-from-chk is unaffected (uses the live geometry override). Verified by `test_geom_roundtrip_preserves_ghost_atoms` + `test_geom_from_json_defaults_to_no_ghosts_for_old_format`.
+
+**`proj_mo` `mo_range` panic when nocc > source num_state** — FIXED
+- ROHF/UKS `nocc` derived from *target* `num_elec` can exceed source `num_state` when input spin/charge differ from the chkfile's. `if end > src_nmo { panic! }` → now `warn!` + clamp `end = min(end, src_nmo)`, matching the target-side clamp. Verified by clean build + `test_initguess`.
+
+**scftype detection ordering** — FIXED
+- `scftype` detection used `num_elec[1]/[2]`, which is `[0,0,0]` at `init_scf` time for `basis_path='chkfile'` (basis not yet loaded), silently misdetecting UHF/ROHF as RHF unless `spin_polarization` was set. Since `num_elec[1] != num_elec[2] <=> ctrl.spin > 1.0`, detection now uses the spin multiplicity `ctrl.spin` (always available from input) — mathematically equivalent for all jobs, and correct for chkbasis.
+
+**`import_guess_from_hdf5chkfile` reads only `mo_occ`** — resolved (not applicable). `mo_occupation` is deprecated; `mo_occ` is the canonical dataset.
+
+**`load_geom` drops pbc/lattice/ghost_pc_chrg/ghost_ep_path** — resolved (not applicable to basisproj / basis-from-chk).
+- PBC (`pbc`/`lattice`): out of scope.
+- `ghost_pc_chrg`/`ghost_ep_path` (and positions): consumed only from the **live** `mol.geom` during Fock/energy/gradient builds (`scf_io/mod.rs:2180`, `grad/rhf.rs:505`, `grad/uhf.rs:116`, `molecule_io/mod.rs:1169`); they never enter `build_cint`, `int_cross`, S21/S22, or `proj_mo`. Basis-from-chk keeps the live geom; basis-projection's `mol_source` only needs basis + real-atom geometry. So dropping them from `load_geom` does not affect either feature.
+
+---
+
+## TODO
+
+### `inherit` initial-guess projection on geometry change
 
 When `initial_guess = "inherit"` and geometry has changed (geom opt), project old eigenvectors to the new geometry via `proj_mo` instead of using them directly. Relies on the chkfile saved after each SCF convergence (chkfile contains `molecule/geom` with the geometry the eigenvectors were computed at).
 
-### Planned steps
-
+Planned steps:
 1. In `initial_guess/mod.rs` `inherit` branch: check if chkfile exists and `load_geom` returns a `GeomCell`.
 2. Compare `prev_geom.positions` with current `mol.geom.positions` (tol 1e-6).
 3. If geometry changed: `build_cint(&mol.basis4elem, &prev_geom, &mol.cint_type)` → build `mol_source`, call `proj::proj_mo`, replace eigenvectors.
 4. Proceed with `generate_occupation()` + `generate_density_matrix()` as before.
 
-### Needed imports
+Needed imports: `std::path::Path`, `crate::molecule_io::build_cint`, `crate::molecule_io::Molecule`, `crate::fileop::chkfile::load_geom`.
 
-`std::path::Path`, `crate::molecule_io::build_cint`, `crate::molecule_io::Molecule`, `crate::fileop::chkfile::load_geom`.
-
-### Behavior
+Behavior:
 
 | Scenario | Result |
 |---|---|
@@ -228,3 +251,8 @@ When `initial_guess = "inherit"` and geometry has changed (geom opt), project ol
 | Old chkfile (no `molecule/geom`) | Skip (`load_geom` returns None) |
 
 No new struct fields, no API changes.
+
+### DirectReuse S21-vs-S22 gate threshold
+
+- Threshold `1e-5` at `proj.rs:283` is a heuristic. Untested for float noise in large or periodic systems.
+- Suggested: add test coverage or document the heuristic's limitations.
