@@ -25,7 +25,7 @@ Shared helpers in `molecule_io/basis.rs`:
 | `shell_nao` | Count AO basis functions from shell descriptors |
 | `build_fdqc` | Build `fdqc_bas` + `cint_fdqc` from `cint_bas` + `cint_type` (used by `build_cint` and `set_cint_data` fallback) |
 
-`num_elec` is computed by `collect_basis` after `build_cint` returns (from the final `cint_atm` nuclear charges, accounting for ECP, charge, and spin). `num_state` is set to `num_basis` in `collect_basis`.
+`num_elec` is computed by `Molecule::update_num_elec()` (reads `cint_atm` nuclear charges, accounts for ECP, charge, and spin). Called in `build_native` after `collect_basis` + field assignment, and in `update_basis_from_hdf5chk` after `set_cint_data`. `num_state` is set to `num_basis` in `collect_basis`.
 
 ---
 
@@ -58,7 +58,7 @@ Shared helpers in `molecule_io/basis.rs`:
   | **New** | `molecule/basis4elem` + `molecule/cinttype` exist | Reads `basis4elem` + `geom` (or `geom_override`) + `cint_type` → calls `build_cint` to reconstruct `cint_env`, `fdqc_bas`, `cint_fdqc`. No stale coords. |
   | **Old** | No `molecule/basis4elem` | Falls back to `load_cint_data` (reads legacy `"mol"` JSON). Backward compatible. |
 
-- **`set_cint_data`** (on `Molecule`, `molecule_io/mod.rs`) — replaces `update_from_cint`. Pure field assignment (`cint_atm/bas/env/ecpbas`, optionally `fdqc_bas`/`cint_fdqc`/`basis4elem`/`cint_type`, `natm_real`/`natm_all`, `num_state=num_basis`). When `basis4elem` is set, also recomputes `ecp_electrons`. If `fdqc_bas` is not passed, recomputes it via `build_fdqc` fallback. No `num_elec`/`start_mo` computation.
+- **`set_cint_data`** (on `Molecule`, `molecule_io/mod.rs`) — replaces `update_from_cint`. Pure field assignment (`cint_atm/bas/env/ecpbas`, optionally `fdqc_bas`/`cint_fdqc`/`basis4elem`/`cint_type`, `natm_real`/`natm_all`, `num_state=num_basis`). When `basis4elem` is set, also recomputes `ecp_electrons`. If `fdqc_bas` is not passed, recomputes it via `build_fdqc` fallback. No `num_elec`/`start_mo` computation — use `update_num_elec()` for the former; `generate_start_mo` for the latter.
 
 ### `load_cint_data`
 

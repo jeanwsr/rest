@@ -220,6 +220,7 @@ pub fn decide_guess(chkfile: &String, mol_target: &Molecule) -> GuessAction {
     let src_spin = loaded_spin.unwrap_or(1.0);
     let src_ne = load_num_elec(chkfile, src_spin)
         .expect("chkfile missing electron count (molecule/num_elec or scf/mo_occ)");
+    log::debug!("src ne {} tgt ne {}", src_ne[0], mol_target.num_elec[0]);
     if (src_ne[0] - mol_target.num_elec[0]).abs() > 0.5 {
             return GuessAction::Refuse(format!(
                 "electron count mismatch: chkfile has {}, target has {}",

@@ -191,7 +191,7 @@ impl Molecule {
         let chkbasis = ctrl.basis_path == "chkfile";
         if !chkbasis {
             let (mut basis4elem,mut cint_atm,mut cint_bas,cint_env,
-                fdqc_bas,cint_fdqc,num_elec,num_basis,num_state, cint_ecpbas) 
+                fdqc_bas,cint_fdqc,num_basis,num_state, cint_ecpbas) 
                 = Molecule::collect_basis(&mut ctrl, &mut geom);
 
             let bas = &basis4elem;
@@ -205,7 +205,7 @@ impl Molecule {
             mol.cint_env = cint_env;
             mol.fdqc_bas = fdqc_bas;
             mol.cint_fdqc = cint_fdqc;
-            mol.num_elec = num_elec;
+            mol.update_num_elec();
             mol.num_basis = num_basis;
             mol.num_state = num_state;
             mol.cint_ecpbas = cint_ecpbas;
@@ -344,6 +344,21 @@ impl Molecule {
         self.natm_real = self.geom.elem.len();
         self.natm_all = self.cint_atm.len();
         self.num_state = self.num_basis;
+    }
+
+    pub fn update_num_elec(&mut self) {
+        let mut num_elec = [0.0; 3];
+        self.cint_atm.iter().for_each(|atm| {
+            num_elec[0] += atm[ATM_NUC] as f64;
+        });
+        num_elec[0] -= self.ctrl.charge;
+        if self.ctrl.use_int_nelec {
+            sanity_check_nelec(num_elec[0], self.ctrl.spin);
+        }
+        let unpair_elec = self.ctrl.spin - 1.0_f64;
+        num_elec[1] = (num_elec[0] - unpair_elec) / 2.0 + unpair_elec;
+        num_elec[2] = (num_elec[0] - unpair_elec) / 2.0;
+        self.num_elec = num_elec;
     }
 
     pub fn initialize_auxbas(&mut self) {
@@ -840,7 +855,7 @@ pub fn build_cint(
 
 impl Molecule {
     pub fn collect_basis(ctrl: &InputKeywords,geom: &GeomCell) -> 
-            (Vec<Basis4Elem>, Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>, Vec<BasInfo>, Vec<Vec<usize>>, [f64;3],usize, usize, Option<Vec<Vec<i32>>>) {
+            (Vec<Basis4Elem>, Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>, Vec<BasInfo>, Vec<Vec<usize>>, usize, usize, Option<Vec<Vec<i32>>>) {
 
         let cint_type = if ctrl.basis_type.to_lowercase()==String::from("spheric") {
             CintType::Spheric
@@ -886,19 +901,7 @@ impl Molecule {
 
         let num_state = num_basis;
 
-        let mut num_elec = [0.0;3];
-        for a in &atm {
-            num_elec[0] += a[ATM_NUC] as f64;
-        }
-        num_elec[0] -= ctrl.charge;
-        if ctrl.use_int_nelec {
-            sanity_check_nelec(num_elec[0], ctrl.spin);
-        }
-        let unpair = ctrl.spin - 1.0;
-        num_elec[1] = (num_elec[0] - unpair) / 2.0 + unpair;
-        num_elec[2] = (num_elec[0] - unpair) / 2.0;
-
-        (basis_total, atm, bas, env, bas_info, cint_fdqc, num_elec, num_basis, num_state, ecpbas)
+        (basis_total, atm, bas, env, bas_info, cint_fdqc, num_basis, num_state, ecpbas)
     }
 
     pub fn int_ij_matrixuppers(&self,op_name: String, comp: usize) -> Vec<MatrixUpper<f64>> {
