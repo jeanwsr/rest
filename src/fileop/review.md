@@ -42,13 +42,12 @@ Consequences:
 
 ### High priority
 
-**Ghost basis atoms lost in chkfile round-trip**
-- `save_chkfile` writes geom JSON with only `name/elem/unit/position`.
-- `load_geom` hard-codes `ghost_bs_elem: vec![]`.
-- `reconstruct_cint_data` → `build_cint(basis4elem, ghostless_geom)` builds `atm` without ghost atoms, but `bas` references `atm_index` beyond `atm` for ghost entries in `basis4elem`.
-- Ghost-basis chkfiles (QM/MM, CP correction) produce corrupted cint data.
-- Old format preserved ghosts via raw `_atm/_bas/_env` JSON.
-- **Fix needed**: save ghost fields in geom JSON, or handle `ghost_bs_elem` in `load_geom`.
+**Ghost basis atoms lost in chkfile round-trip** — **FIXED** (2026-08-21)
+- ~~`save_chkfile` writes geom JSON with only `name/elem/unit/position`.~~
+- ~~`load_geom` hard-codes `ghost_bs_elem: vec![]`.~~
+- ~~`reconstruct_cint_data` → `build_cint(basis4elem, ghostless_geom)` builds `atm` without ghost atoms, but `bas` references `atm_index` beyond `atm` for ghost entries in `basis4elem`.~~
+- ~~Ghost-basis chkfiles (QM/MM, CP correction) produce corrupted cint data.~~
+- **Fixed**: `save_chkfile` now writes `ghost_bs_elem` + `ghost_bs_pos` in the geom JSON; `load_geom` restores them (old-format chkfiles default to no ghosts). Serialization extracted into `geom_to_json`/`geom_from_json` for reuse. Basis projection now reconstructs correct cint for ghost-basis sources; basis-from-chk is unaffected (uses the live geometry override). Verified by `test_geom_roundtrip_preserves_ghost_atoms` + `test_geom_from_json_defaults_to_no_ghosts_for_old_format`.
 
 ### Medium priority
 
@@ -57,15 +56,14 @@ Consequences:
 - Affects `decide_guess` geometry comparison and `reconstruct_cint_data` for PBC systems.
 
 **`import_guess_from_hdf5chkfile` reads only `mo_occ`**
-- `initial_guess/mod.rs:368` reads `scf.dataset("mo_occ")` only.
-- Old save wrote both `mo_occupation` and `mo_occ`.
-- External tools writing only `mo_occupation` would cause `.unwrap()` panic.
-- **Fix needed**: fallback to `mo_occupation` if `mo_occ` absent.
+- ~~`initial_guess/mod.rs:368` reads `scf.dataset("mo_occ")` only.~~
+- ~~Old save wrote both `mo_occupation` and `mo_occ`.~~
+- ~~External tools writing only `mo_occupation` would cause `.unwrap()` panic.~~
+- **Resolved**: not applicable — `mo_occupation` is deprecated; `mo_occ` is the canonical dataset.
 
-**`proj_mo` `mo_range` panic when nocc > source num_state**
+**`proj_mo` `mo_range` panic when nocc > source num_state** — **FIXED** (2026-08-21)
 - ROHF/UKS `nocc` derived from *target* `num_elec` can exceed source `num_state` when input spin/charge differ from chkfile's.
-- `proj.rs:91-92`: `if end > src_nmo { panic! }`.
-- **Fix needed**: clamp `end` to `min(end, src_nmo)` with warning, similar to target-side clamp.
+- `proj.rs`: `if end > src_nmo { panic! }` → now `warn!` + clamp `end = min(end, src_nmo)`, matching the target-side clamp. Verified by clean build + `test_initguess` (5 pass).
 
 ### Low priority
 
@@ -73,6 +71,11 @@ Consequences:
 - Threshold `1e-5` at `proj.rs:283` is a heuristic.
 - Untested for float noise in large or periodic systems.
 - **Suggested**: add test coverage or document the heuristic's limitations.
+
+**`inherit` initial-guess projection (geometries changed)**
+- `initial_guess = "inherit"` (used by geom opt) regenerates density from existing eigenvectors without projection — a poor guess after a geometry change.
+- **Plan** (recorded in `fileop/chkfile_refactor.md`): in the `inherit` branch of `initial_guess`, read the previously-saved chkfile's `molecule/geom` via `load_geom`, compare with the current `mol.geom`; if different, build a `mol_source` at the old geometry via `build_cint` and `proj_mo` the existing eigenvectors.
+- The chkfile is already saved after every SCF run, so no new `eigenvector_geom` field is needed.
 
 ---
 

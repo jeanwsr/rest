@@ -107,13 +107,7 @@ pub fn save_chkfile(scf_data: &SCF) {
     let cinttype = cint_type_as_str(&scf_data.mol.cint_type);
     write_string_scalar(&file, "molecule/cinttype", &cinttype);
 
-    let geom = &scf_data.mol.geom;
-    let geom_json = serde_json::to_string(&serde_json::json!({
-        "name":     geom.name.clone(),
-        "elem":     geom.elem.clone(),
-        "unit":     geom.unit,
-        "position": geom.position.iter().copied().collect::<Vec<f64>>(),
-    })).unwrap();
+    let geom_json = geom_to_json(&scf_data.mol.geom);
     write_string_scalar(&file, "molecule/geom", &geom_json);
 
     let num_elec_json = serde_json::to_string(&scf_data.mol.num_elec[0]).unwrap();
@@ -281,7 +275,22 @@ pub fn load_geom(chkfile: &String) -> Option<GeomCell> {
     let file = hdf5::File::open(chkfile).unwrap();
     let ds = file.dataset("molecule/geom").ok()?;
     let json_str = ds.read_scalar::<VarLenUnicode>().ok()?;
-    let json: HashMap<String, serde_json::Value> = serde_json::from_str(json_str.as_str()).ok()?;
+    geom_from_json(json_str.as_str())
+}
+
+pub fn geom_to_json(geom: &GeomCell) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "name":           geom.name.clone(),
+        "elem":           geom.elem.clone(),
+        "unit":           geom.unit,
+        "position":       geom.position.iter().copied().collect::<Vec<f64>>(),
+        "ghost_bs_elem":  geom.ghost_bs_elem.clone(),
+        "ghost_bs_pos":   geom.ghost_bs_pos.iter().copied().collect::<Vec<f64>>(),
+    })).unwrap()
+}
+
+pub fn geom_from_json(json_str: &str) -> Option<GeomCell> {
+    let json: HashMap<String, serde_json::Value> = serde_json::from_str(json_str).ok()?;
 
     let name = json.get("name").and_then(|v| v.as_str()).unwrap_or("a molecule").to_string();
     let elem: Vec<String> = serde_json::from_value(json.get("elem")?.clone()).ok()?;
@@ -290,6 +299,19 @@ pub fn load_geom(chkfile: &String) -> Option<GeomCell> {
     let position = if natoms > 0 {
         let position_data: Vec<f64> = serde_json::from_value(json.get("position")?.clone()).ok()?;
         MatrixFull::from_vec([3, natoms], position_data).unwrap()
+    } else {
+        MatrixFull::empty()
+    };
+
+    let ghost_bs_elem: Vec<String> = json.get("ghost_bs_elem")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let n_ghost = ghost_bs_elem.len();
+    let ghost_bs_pos = if n_ghost > 0 {
+        let pos_data: Vec<f64> = json.get("ghost_bs_pos")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        MatrixFull::from_vec([3, n_ghost], pos_data).unwrap()
     } else {
         MatrixFull::empty()
     };
@@ -303,8 +325,8 @@ pub fn load_geom(chkfile: &String) -> Option<GeomCell> {
         nfree: 0,
         lattice: MatrixFull::empty(),
         pbc: MOrC::Molecule,
-        ghost_bs_elem: vec![],
-        ghost_bs_pos: MatrixFull::empty(),
+        ghost_bs_elem,
+        ghost_bs_pos,
         ghost_pc_chrg: vec![],
         ghost_pc_pos: MatrixFull::empty(),
         ghost_ep_path: vec![],

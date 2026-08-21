@@ -1,4 +1,5 @@
 use pyrest::basis_io::{BasCell, Basis4Elem};
+use pyrest::fileop::chkfile::{geom_from_json, geom_to_json};
 use pyrest::geom_io::{GeomCell, GeomUnit};
 use pyrest::initial_guess::proj::proj_mo;
 use pyrest::molecule_io::{build_cint, Molecule};
@@ -133,4 +134,40 @@ fn test_proj_range_exceeds_target_clamped() {
     let mo_tgt = proj_mo(&tgt, &src, mo_src.clone(), [0..3, 0..0]);
     assert_eq!(mo_tgt[0].size, [tgt.num_basis, tgt.num_state],
         "range [0..3] clamped to target ns=2");
+}
+
+// Geom JSON round-trips ghost atoms (regression: ghosts were dropped, corrupting build_cint).
+#[test]
+fn test_geom_roundtrip_preserves_ghost_atoms() {
+    let geom = GeomCell {
+        name: "H+He".into(), elem: vec!["H".into()], fix: vec![false],
+        unit: GeomUnit::Bohr,
+        position: MatrixFull::from_vec([3, 1], vec![0.0, 0.0, 0.0]).unwrap(),
+        nfree: 1,
+        ghost_bs_elem: vec!["He".into()],
+        ghost_bs_pos: MatrixFull::from_vec([3, 1], vec![0.0, 0.0, 2.0]).unwrap(),
+        ..GeomCell::init_geom()
+    };
+
+    let json = geom_to_json(&geom);
+    let loaded = geom_from_json(&json).unwrap();
+    assert_eq!(loaded.elem, geom.elem);
+    assert_eq!(loaded.ghost_bs_elem, geom.ghost_bs_elem);
+    let pos: Vec<f64> = loaded.ghost_bs_pos.iter().copied().collect();
+    let ghost_pos: Vec<f64> = geom.ghost_bs_pos.iter().copied().collect();
+    assert_eq!(pos, ghost_pos, "ghost_bs_pos must round-trip");
+}
+
+// Old-format chkfile JSON (no ghost keys) still parses, defaulting to no ghosts.
+#[test]
+fn test_geom_from_json_defaults_to_no_ghosts_for_old_format() {
+    let json = serde_json::to_string(&serde_json::json!({
+        "name": "H2",
+        "elem": ["H", "H"],
+        "unit": "angstrom",
+        "position": [0.0, 0.0, 0.0, 0.0, 0.0, 1.4],
+    })).unwrap();
+    let loaded = geom_from_json(&json).unwrap();
+    assert!(loaded.ghost_bs_elem.is_empty(), "old-format chkfile => no ghosts");
+    assert_eq!(loaded.elem, vec!["H".to_string(), "H".to_string()]);
 }

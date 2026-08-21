@@ -43,13 +43,13 @@ Shared helpers in `molecule_io/basis.rs`:
 |---|---|---|
 | `scf/` | e_tot, mo_coeff, mo_energy, mo_occ, num_basis, num_states, spin_channel, spin, charge | SCF results |
 | `molecule/basis4elem` | `Vec<Basis4Elem>` (JSON) | Basis reconstruction |
-| `molecule/geom` | GeomCell (JSON: name, elem, unit, position) | Coord reconstruction + element checks |
+| `molecule/geom` | GeomCell (JSON: name, elem, unit, position, ghost_bs_elem, ghost_bs_pos) | Coord reconstruction + element checks |
 | `molecule/cinttype` | "spheric" / "cartesian" | Basis reconstruction |
 | `molecule/num_elec` | Total electron count (`f64`, JSON) | Electron-count Refuse check |
 
 ### What was added
 
-- **`molecule/geom`** — GeomCell serialized as JSON, saved by `save_chkfile`. Used by `load_geom` for element-name checks, and by `reconstruct_cint_data` as the coordinate source when rebuilding `cint_env`.
+- **`molecule/geom`** — GeomCell serialized as JSON by `geom_to_json` (`name`, `elem`, `unit`, `position`, plus `ghost_bs_elem`/`ghost_bs_pos`), saved by `save_chkfile`. Used by `load_geom` (via `geom_from_json`) for element-name checks, and by `reconstruct_cint_data` as the coordinate source when rebuilding `cint_env`. Old-format chkfiles without ghost keys default to no ghosts.
 
 - **`reconstruct_cint_data(chkfile, geom_override)`** — replaces `load_cint_data` for all callers. Two code paths:
 

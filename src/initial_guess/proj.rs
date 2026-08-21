@@ -86,7 +86,10 @@ pub fn proj_mo(mol_target: &Molecule, mol_source: &Molecule, mo_source: [MatrixF
         let mut end = mo_range[spin].end;
         assert!(start <= end, "proj_mo: mo_range[{spin}] start={start} > end={end}");
         if end > src_nmo {
-            panic!("proj_mo: mo_range[{spin}] end={end} exceeds source MOs={src_nmo}");
+            warn!(
+                "proj_mo: mo_range[{spin}] end={end} exceeds source MOs={src_nmo}, clamping to source"
+            );
+            end = src_nmo;
         }
         if end > mol_target.num_state {
             warn!(
