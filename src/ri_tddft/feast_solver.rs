@@ -143,7 +143,13 @@ pub fn feast_solve_tddft_lr(
             let b = matvec::b_matvec(scf, fxc_data, ri_ov, ri_ov_exch, p, xlet, alpha_hybrid);
             a.into_iter().zip(b.into_iter()).map(|(a, b)| a + b).collect()
         };
-        crate::ri_bse::feast_solver::cg(&apb_matvec, z, cg_max_iter, cg_tol)
+        crate::ri_bse::feast_solver::cg(
+            &apb_matvec,
+            z,
+            cg_max_iter,
+            cg_tol,
+            Some(hdiag),
+        )
     };
 
     // GMRES operator: (A+B)*(A-B) — this is the full operator that the

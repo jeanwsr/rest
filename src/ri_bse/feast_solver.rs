@@ -122,28 +122,51 @@ fn gauss_legendre_nodes(n: usize) -> Vec<(f64, f64)> {
 // Section 1: CG Solver — standard Conjugate Gradient
 // ============================================================================
 
-/// Solve A * x = b using CG, where A is an SPD matrix accessed
-/// through the closure `a_mul`.  Returns the solution vector x.
+/// Solve A * x = b using preconditioned CG, where A is an SPD matrix
+/// accessed through the closure `a_mul`.  Returns the solution vector x.
+///
+/// If `precond_diag` is provided, a diagonal (Jacobi) preconditioner
+/// `M = diag(precond_diag)` is applied to the residual.  The diagonal
+/// entries must be positive for the preconditioner to be SPD; non-positive
+/// entries fall back to 1.0 (no preconditioning for that component).
 pub fn cg(
     a_mul: impl Fn(&Vec<f64>) -> Vec<f64>,
     b: &Vec<f64>,
     max_iter: usize,
     tol: f64,
+    precond_diag: Option<&Vec<f64>>,
 ) -> Vec<f64> {
     let n = b.len();
+
+    // Precompute the inverse diagonal once per solve.
+    let inv_diag: Option<Vec<f64>> = precond_diag.map(|diag| {
+        diag.iter()
+            .map(|&d| if d > 1e-30 { 1.0 / d } else { 1.0 })
+            .collect()
+    });
+
+    // Apply M^{-1} to a residual vector.
+    let precond = |r: &Vec<f64>| -> Vec<f64> {
+        match &inv_diag {
+            Some(inv) => r.iter().zip(inv).map(|(&ri, &idi)| ri * idi).collect(),
+            None => r.clone(),
+        }
+    };
+
     let mut x = vec![0.0; n];
     let ax = a_mul(&x);
     let mut r: Vec<f64> = b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect();
-    let mut p = r.clone();
-    let mut r_dot_r: f64 = r.iter().map(|ri| ri * ri).sum();
+    let z = precond(&r);
+    let mut p = z;
+    let mut r_dot_z: f64 = r.iter().zip(&p).map(|(ri, zi)| ri * zi).sum();
 
-    for iter in 0..max_iter {
+    for _iter in 0..max_iter {
         let ap = a_mul(&p);
         let p_dot_ap: f64 = p.iter().zip(&ap).map(|(pi, api)| pi * api).sum();
-        if p_dot_ap.abs() < 1e-30 {
+        if p_dot_ap.abs() < 1e-30 || r_dot_z.abs() < 1e-30 {
             break;
         }
-        let alpha = r_dot_r / p_dot_ap;
+        let alpha = r_dot_z / p_dot_ap;
         for i in 0..n {
             x[i] += alpha * p[i];
         }
@@ -152,13 +175,14 @@ pub fn cg(
         if residual < tol {
             break;
         }
-        let r_new_dot_r_new: f64 = r_new.iter().map(|ri| ri * ri).sum();
-        let beta = r_new_dot_r_new / r_dot_r;
+        let z_new = precond(&r_new);
+        let r_new_dot_z_new: f64 = r_new.iter().zip(&z_new).map(|(ri, zi)| ri * zi).sum();
+        let beta = r_new_dot_z_new / r_dot_z;
         for i in 0..n {
-            p[i] = r_new[i] + beta * p[i];
+            p[i] = z_new[i] + beta * p[i];
         }
         r = r_new;
-        r_dot_r = r_new_dot_r_new;
+        r_dot_z = r_new_dot_z_new;
     }
     x
 }
@@ -2033,13 +2057,26 @@ fn feast_solve_bse_nontda(
         let b = matvec::b_block_matvec(scf_data,qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,z);
         a.into_iter().zip(b.into_iter()).map(|(a,b)|a-b).collect()
     };
+    // ── Diagonal preconditioner data for non-TDA ──
+    // D_j = ε_a − ε_i are the diagonal QP energy gaps.  They are used:
+    //   1. as the diagonal preconditioner for CG solves of (A+B);
+    //   2. squared, as the diagonal preconditioner for the contour GMRES
+    //      system z·I − (A+B)(A−B).
+    let energies: Vec<f64> = if qp_ctrl.bse_qp_polarization {
+        scf_data.gwqp.0.clone()
+    } else {
+        scf_data.eigenvalues[0].clone()
+    };
+    let diag = construct_energy_diag_for_a(&energies, occ_size, vir_size);
+    let diag_sq: Vec<f64> = diag.iter().map(|&d| d * d).collect();
+
     let feast_b_matvec=|z:&Vec<f64>|->Vec<f64>{
         let apb_matvec=|p:&Vec<f64>|->Vec<f64>{
             let a = matvec::a_block_matvec(scf_data,qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,p);
             let b = matvec::b_block_matvec(scf_data,qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,p);
             a.into_iter().zip(b.into_iter()).map(|(a,b)|a+b).collect()
         };
-        cg(&apb_matvec,z,qp_ctrl.bse_feast_cg_max_iter,qp_ctrl.bse_feast_cg_tol)
+        cg(&apb_matvec,z,qp_ctrl.bse_feast_cg_max_iter,qp_ctrl.bse_feast_cg_tol,Some(&diag))
     };
 
     let gmres_restart = qp_ctrl.bse_feast_gmres_restart;
@@ -2054,18 +2091,6 @@ fn feast_solve_bse_nontda(
     let gmres_b_mul=|z:&Vec<f64>|{
         z.clone()
     };
-
-    // ── GMRES diagonal preconditioner for non-TDA ──
-    // The transformed GMRES matrix is (z·I − (A−B)(A+B)).
-    // Approximating A_diag ≈ D_j (QP energy gaps) and B_diag ≈ 0 gives
-    // (A−B)(A+B)_diag ≈ D_j².  So M₂_diag ≈ z − D_j².
-    let energies: Vec<f64> = if qp_ctrl.bse_qp_polarization {
-        scf_data.gwqp.0.clone()
-    } else {
-        scf_data.eigenvalues[0].clone()
-    };
-    let diag = construct_energy_diag_for_a(&energies, occ_size, vir_size);
-    let diag_sq: Vec<f64> = diag.iter().map(|&d| d * d).collect();
 
     let eigenpairs_xpy=feast(occ_size*vir_size,&feast_a_matvec,&feast_b_matvec,Some(&gmres_a_mul),Some(&gmres_b_mul),
                              eigenrange_min,eigenrange_max,m_expected,max_feast_iter,tol_feast,
