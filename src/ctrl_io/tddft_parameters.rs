@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct TDDFTParameters {
     pub tddft_method: String,       // "tda" or "lr" (full linear response)
     pub tddft_spin: String,         // "singlet" or "triplet"
+    pub tddft_mode: String,         // "mo" (MO-basis RI tensors) or "ao" (AO transition-density kernel)
     pub nroots: usize,              // number of excitation energies to compute
     pub davidson_tol: f64,          // Davidson convergence: ||r|| < sqrt(tol), |de| < tol
     pub davidson_max_iter: usize,   // maximum Davidson iterations
@@ -52,6 +53,7 @@ impl Default for TDDFTParameters {
         TDDFTParameters {
             tddft_method: String::from("lr"),
             tddft_spin: String::from("singlet"),
+            tddft_mode: String::from("mo"),
             nroots: 6,
             davidson_tol: 1.0e-10,
             davidson_max_iter: 50,
@@ -101,6 +103,10 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
             p.tddft_spin = match tmp_ctrl.get("tddft_spin").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.to_lowercase(),
                 _ => String::from("singlet"),
+            };
+            p.tddft_mode = match tmp_ctrl.get("tddft_mode").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase(),
+                _ => String::from("mo"),
             };
             p.nroots = match tmp_ctrl.get("nroots").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(6) as usize,

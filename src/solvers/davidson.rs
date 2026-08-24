@@ -168,15 +168,15 @@ fn orth_ss(x: &mut Vec<f64>, ss: &MatrixFull<f64>, use_mgs: bool) {
     }
 }
 
-pub fn davidson_solver<F1>(
-    mut a_matvec: F1,
+pub fn davidson_solver_block<F1>(
+    mut a_matvec_block: F1,
     nroots: usize,
     diag: &Vec<f64>,
     initial_guess: MatrixFull<f64>,
     config: &DavidsonConfig,
 ) -> Vec<(f64, Vec<f64>)>
 where
-    F1: FnMut(&Vec<f64>) -> Vec<f64>,
+    F1: FnMut(&MatrixFull<f64>) -> MatrixFull<f64>,
 {
     let mut ss = initial_guess;
     let xlen = diag.len();
@@ -203,19 +203,8 @@ where
         };
         iter_num += 1;
         let m = ss.size[1];
-        let mut a_ss = MatrixFull::new([xlen, 0], 0.0);
-        let mut results: Vec<(usize, Vec<f64>)> = ss
-            .iter_columns_full()
-            .enumerate()
-            .map(|(i, ss_i)| {
-                let z = ss_i.to_vec();
-                (i, a_matvec(&z))
-            })
-            .collect();
-        results.sort_by_key(|(i, _)| *i);
-        for result in results {
-            a_ss.push_column(&result.1);
-        }
+        // Batched application of A to the whole subspace block.
+        let a_ss = a_matvec_block(&ss);
         // debug!("m={}", m);
         let mut ss_t_a_ss = MatrixFull::new([m, m], 0.0);
         _dgemm_full(&ss, 'T', &a_ss, 'N', &mut ss_t_a_ss, 1.0, 0.0);
@@ -255,19 +244,8 @@ where
 
         let mut x_full = MatrixFull::new([xlen, collect_sol_num], 0.0);
         _dgemm_full(&ss, 'N', &x_proj_nroots, 'N', &mut x_full, 1.0, 0.0);
-        let mut ax_full = MatrixFull::new([xlen, 0], 0.0);
-        let mut results: Vec<(usize, Vec<f64>)> = x_full
-            .iter_columns_full()
-            .enumerate()
-            .map(|(i, x_i)| {
-                let z = x_i.to_vec();
-                (i, a_matvec(&z))
-            })
-            .collect();
-        results.sort_by_key(|(i, _)| *i);
-        for result in results {
-            ax_full.push_column(&result.1);
-        }
+        // Batched application of A to the collected solutions.
+        let ax_full = a_matvec_block(&x_full);
         let mut residues = ax_full;
         let mut eigenvalue_matrix = MatrixFull::new([collect_sol_num, collect_sol_num], 0.0);
         (0..collect_sol_num).for_each(|i| eigenvalue_matrix[[i, i]] = omega[i]);
@@ -427,12 +405,12 @@ where
     eigenpairs
 }
 
-/// Backward-compatible alias.
-pub use davidson_solver as tda_davidson_solver;
-
-pub fn lr_davidson_solver<F1, F2>(
+/// Backward-compatible per-vector wrapper around [`davidson_solver_block`].
+///
+/// Adapters the batched closure interface to the legacy single-vector API by
+/// applying the matvec column-by-column.
+pub fn davidson_solver<F1>(
     mut a_matvec: F1,
-    mut b_matvec: F2,
     nroots: usize,
     diag: &Vec<f64>,
     initial_guess: MatrixFull<f64>,
@@ -440,7 +418,41 @@ pub fn lr_davidson_solver<F1, F2>(
 ) -> Vec<(f64, Vec<f64>)>
 where
     F1: FnMut(&Vec<f64>) -> Vec<f64>,
-    F2: FnMut(&Vec<f64>) -> Vec<f64>,
+{
+    davidson_solver_block(
+        |block: &MatrixFull<f64>| -> MatrixFull<f64> {
+            let mut out = MatrixFull::new([block.size[0], 0], 0.0);
+            block.iter_columns_full().for_each(|col| {
+                let z = col.to_vec();
+                let r = a_matvec(&z);
+                out.push_column(&r);
+            });
+            out
+        },
+        nroots,
+        diag,
+        initial_guess,
+        config,
+    )
+}
+
+/// Backward-compatible alias.
+pub use davidson_solver as tda_davidson_solver;
+
+/// Batched-interface alias: A applied to a whole block of trial vectors at once.
+pub use davidson_solver_block as tda_davidson_solver_batched;
+
+pub fn lr_davidson_solver_block<F1, F2>(
+    mut a_matvec_block: F1,
+    mut b_matvec_block: F2,
+    nroots: usize,
+    diag: &Vec<f64>,
+    initial_guess: MatrixFull<f64>,
+    config: &DavidsonConfig,
+) -> Vec<(f64, Vec<f64>)>
+where
+    F1: FnMut(&MatrixFull<f64>) -> MatrixFull<f64>,
+    F2: FnMut(&MatrixFull<f64>) -> MatrixFull<f64>,
 {
     let mut ss = initial_guess;
     let xlen = diag.len();
@@ -460,38 +472,16 @@ where
         let start = Instant::now();
         iter_num += 1;
         let m = ss.size[1];
-        let mut a_ss = MatrixFull::new([xlen, 0], 0.0);
-        let mut results: Vec<(usize, Vec<f64>)> = ss
-            .iter_columns_full()
-            .enumerate()
-            .map(|(i, ss_i)| {
-                let z = ss_i.to_vec();
-                (i, a_matvec(&z))
-            })
-            .collect();
-        results.sort_by_key(|(i, _)| *i);
-        for result in results {
-            a_ss.push_column(&result.1);
-        }
+        // Batched application of A to the whole subspace block.
+        let a_ss = a_matvec_block(&ss);
         debug!("m={}", m);
         let mut ss_t_a_ss = MatrixFull::new([m, m], 0.0);
         _dgemm_full(&ss, 'T', &a_ss, 'N', &mut ss_t_a_ss, 1.0, 0.0);
         // debug!("A projection:");
         // ss_t_a_ss.formated_output(1000,"full");
         drop(a_ss);
-        let mut b_ss = MatrixFull::new([xlen, 0], 0.0);
-        let mut results: Vec<(usize, Vec<f64>)> = ss
-            .iter_columns_full()
-            .enumerate()
-            .map(|(i, ss_i)| {
-                let z = ss_i.to_vec();
-                (i, b_matvec(&z))
-            })
-            .collect();
-        results.sort_by_key(|(i, _)| *i);
-        for result in results {
-            b_ss.push_column(&result.1);
-        }
+        // Batched application of B to the whole subspace block.
+        let b_ss = b_matvec_block(&ss);
         let mut ss_t_b_ss = MatrixFull::new([m, m], 0.0);
         _dgemm_full(&ss, 'T', &b_ss, 'N', &mut ss_t_b_ss, 1.0, 0.0);
         // debug!("B projection:");
@@ -643,37 +633,11 @@ where
         let mut xpy_full = MatrixFull::new([xlen, n_omega], 0.0);
         _dgemm_full(&ss, 'N', &xmy, 'N', &mut xmy_full, 1.0, 0.0);
         _dgemm_full(&ss, 'N', &xpy, 'N', &mut xpy_full, 1.0, 0.0);
-        let mut axmy = MatrixFull::new([xlen, 0], 0.0);
-        let mut bxmy = MatrixFull::new([xlen, 0], 0.0);
-        let mut results: Vec<(usize, Vec<f64>, Vec<f64>)> = xmy_full
-            .iter_columns_full()
-            .enumerate()
-            .map(|(i, xmy_i)| {
-                let z = xmy_i.to_vec();
-                (i, a_matvec(&z), b_matvec(&z))
-            })
-            .collect();
-        results.sort_by_key(|(i, _, _)| *i);
-        for result in results {
-            axmy.push_column(&result.1);
-            bxmy.push_column(&result.2);
-        }
+        let axmy = a_matvec_block(&xmy_full);
+        let bxmy = b_matvec_block(&xmy_full);
         let ambxmy = axmy.scaled_add(&bxmy, -1.0).unwrap();
-        let mut axpy = MatrixFull::new([xlen, 0], 0.0);
-        let mut bxpy = MatrixFull::new([xlen, 0], 0.0);
-        let mut results: Vec<(usize, Vec<f64>, Vec<f64>)> = xpy_full
-            .iter_columns_full()
-            .enumerate()
-            .map(|(i, xpy_i)| {
-                let z = xpy_i.to_vec();
-                (i, a_matvec(&z), b_matvec(&z))
-            })
-            .collect();
-        results.sort_by_key(|(i, _, _)| *i);
-        for result in results {
-            axpy.push_column(&result.1);
-            bxpy.push_column(&result.2);
-        }
+        let axpy = a_matvec_block(&xpy_full);
+        let bxpy = b_matvec_block(&xpy_full);
         let apbxpy = axpy.scaled_add(&bxpy, 1.0).unwrap();
         // R_left  = (A-B)(X-Y) - Omega(X+Y)
         // R_right = (A+B)(X+Y) - Omega(X-Y)
@@ -827,6 +791,46 @@ where
     eigenpairs
 }
 
+/// Backward-compatible per-vector wrapper around [`lr_davidson_solver_block`].
+///
+/// Adapters the batched closure interface to the legacy single-vector API by
+/// applying the matvecs column-by-column.
+pub fn lr_davidson_solver<F1, F2>(
+    mut a_matvec: F1,
+    mut b_matvec: F2,
+    nroots: usize,
+    diag: &Vec<f64>,
+    initial_guess: MatrixFull<f64>,
+    config: &DavidsonConfig,
+) -> Vec<(f64, Vec<f64>)>
+where
+    F1: FnMut(&Vec<f64>) -> Vec<f64>,
+    F2: FnMut(&Vec<f64>) -> Vec<f64>,
+{
+    let a_apply = |block: &MatrixFull<f64>| -> MatrixFull<f64> {
+        let mut out = MatrixFull::new([block.size[0], 0], 0.0);
+        block.iter_columns_full().for_each(|col| {
+            let z = col.to_vec();
+            let r = a_matvec(&z);
+            out.push_column(&r);
+        });
+        out
+    };
+    let b_apply = |block: &MatrixFull<f64>| -> MatrixFull<f64> {
+        let mut out = MatrixFull::new([block.size[0], 0], 0.0);
+        block.iter_columns_full().for_each(|col| {
+            let z = col.to_vec();
+            let r = b_matvec(&z);
+            out.push_column(&r);
+        });
+        out
+    };
+    lr_davidson_solver_block(a_apply, b_apply, nroots, diag, initial_guess, config)
+}
+
+/// Batched-interface alias: A and B applied to a whole block of trial vectors at once.
+pub use lr_davidson_solver_block as lr_davidson_solver_batched;
+
 pub fn dot_product(vec1: &Vec<f64>, vec2: &Vec<f64>) -> f64 {
     vec1.iter().zip(vec2.iter()).fold(0.0, |acc, (x1, x2)| acc + x1 * x2)
 }
@@ -838,4 +842,121 @@ pub fn vector_scaled_add(vec1: &Vec<f64>, scale1: f64, vec2: &Vec<f64>, scale2: 
         .zip(vec2.iter())
         .map(|(x1, x2)| x1 * scale1 + x2 * scale2)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a symmetric, diagonally-dominated matrix `[n, n]` from a
+    /// deterministic pseudo-random pattern plus a strong diagonal, so that the
+    /// Davidson subspace iteration converges cleanly for a few roots.
+    fn synthetic_symmetric(n: usize, seed: f64) -> MatrixFull<f64> {
+        let mut a = MatrixFull::new([n, n], 0.0);
+        for i in 0..n {
+            a[[i, i]] = 1.0 + (i as f64 + seed) * 0.5;
+        }
+        for i in 0..n {
+            for j in 0..i {
+                let v = ((i as f64 + seed) * (j as f64 + 0.3)).sin() * 0.05;
+                a[[i, j]] = v;
+                a[[j, i]] = v;
+            }
+        }
+        a
+    }
+
+    fn per_vector_a(a: &MatrixFull<f64>) -> impl FnMut(&Vec<f64>) -> Vec<f64> + '_ {
+        move |z: &Vec<f64>| -> Vec<f64> {
+            let mut out = vec![0.0; a.size[0]];
+            for i in 0..a.size[0] {
+                for j in 0..a.size[1] {
+                    out[i] += a[[i, j]] * z[j];
+                }
+            }
+            out
+        }
+    }
+
+    fn batched_a(a: &MatrixFull<f64>) -> impl FnMut(&MatrixFull<f64>) -> MatrixFull<f64> + '_ {
+        move |block: &MatrixFull<f64>| -> MatrixFull<f64> {
+            let mut out = MatrixFull::new([block.size[0], block.size[1]], 0.0);
+            for s in 0..block.size[1] {
+                for i in 0..a.size[0] {
+                    let mut acc = 0.0;
+                    for j in 0..a.size[1] {
+                        acc += a[[i, j]] * block[[j, s]];
+                    }
+                    out[[i, s]] = acc;
+                }
+            }
+            out
+        }
+    }
+
+    #[test]
+    fn test_batched_tda_matches_per_vector() {
+        let n = 40;
+        let a = synthetic_symmetric(n, 2.0);
+        let hdiag: Vec<f64> = (0..n).map(|i| a[[i, i]]).collect();
+        let nroots = 3;
+        let config = DavidsonConfig {
+            max_subspace: 12,
+            add_dim: 3,
+            restart_dim: 3,
+            max_iter: 30,
+            tol: 1e-10,
+            ..Default::default()
+        };
+        let guess = generate_initial_guess(&hdiag, nroots);
+
+        let per_vec = davidson_solver(per_vector_a(&a), nroots, &hdiag, guess.clone(), &config);
+        let batched = davidson_solver_block(batched_a(&a), nroots, &hdiag, guess.clone(), &config);
+
+        assert_eq!(per_vec.len(), batched.len(), "same number of converged roots");
+        for (e1, e2) in per_vec.iter().zip(batched.iter()) {
+            assert!((e1.0 - e2.0).abs() < 1e-8,
+                "eigenvalue mismatch: per-vector {} vs batched {}", e1.0, e2.0);
+        }
+    }
+
+    #[test]
+    fn test_batched_lr_matches_per_vector() {
+        let n = 40;
+        // LR path: keep both A and B strictly diagonal so A-B and A+B are
+        // trivially positive definite (guarantees the Cholesky path finds
+        // positive roots). B proportional to A gives clean ±sqrt(a²-b²) roots.
+        let mut a = MatrixFull::new([n, n], 0.0);
+        for i in 0..n {
+            a[[i, i]] = 1.0 + i as f64 * 0.5;
+        }
+        let mut b = MatrixFull::new([n, n], 0.0);
+        for i in 0..n {
+            b[[i, i]] = 0.3 * a[[i, i]];
+        }
+        let hdiag: Vec<f64> = (0..n).map(|i| a[[i, i]]).collect();
+        let nroots = 3;
+        let config = DavidsonConfig {
+            max_subspace: 12,
+            add_dim: 3,
+            restart_dim: 3,
+            max_iter: 30,
+            tol: 1e-10,
+            ..Default::default()
+        };
+        let guess = generate_initial_guess(&hdiag, nroots);
+
+        let per_vec = lr_davidson_solver(
+            per_vector_a(&a), per_vector_a(&b),
+            nroots, &hdiag, guess.clone(), &config);
+        let batched = lr_davidson_solver_block(
+            batched_a(&a), batched_a(&b),
+            nroots, &hdiag, guess.clone(), &config);
+
+        assert_eq!(per_vec.len(), batched.len(), "same number of converged roots");
+        for (e1, e2) in per_vec.iter().zip(batched.iter()) {
+            assert!((e1.0 - e2.0).abs() < 1e-8,
+                "eigenvalue mismatch: per-vector {} vs batched {}", e1.0, e2.0);
+        }
+    }
 }

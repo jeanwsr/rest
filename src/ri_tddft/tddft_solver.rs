@@ -16,6 +16,7 @@ use crate::solvers::davidson as davidson_solver;
 use crate::solvers::davidson::DavidsonConfig;
 use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data, set_fxc_use_optimized};
 use crate::ri_tddft::matvec::{self, a_matvec, b_matvec};
+use crate::ri_tddft::matvec_ao;
 use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_get_submatrix, compute_tddft_dipole_matrix};
 use crate::ri_tddft::feast_solver;
 
@@ -38,12 +39,14 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     let tddft_spin = tddft_ctrl.tddft_spin.clone();
     let xlet = if tddft_spin == "singlet" { 'S' } else if tddft_spin == "triplet" { 'T' } else { 'R' };
     let is_tda = tddft_method == "tda" || tddft_method == "TDA";
+    let is_ao = tddft_ctrl.tddft_mode == "ao";
 
     // Enable optimised (rayon-parallel) fxc kernel if requested
     set_fxc_use_optimized(tddft_ctrl.tddft_use_optimized_fxc);
 
     println!("\n=== TDDFT Calculation ===");
     println!("Method: {}", if is_tda { "TDA" } else { "Full LR" });
+    println!("Basis: {}", if is_ao { "AO transition-density (tddft_mode=ao)" } else { "MO (tddft_mode=mo)" });
     println!("Spin: {}", if xlet == 'S' { "Singlet" } else { "Triplet" });
     println!("Number of roots: {}", nroots);
 
@@ -66,31 +69,57 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     }
     println!("occ_size={}, vir_size={}, dim={}", occ_size, vir_size, dim);
 
-    // ═══ Step 3: Prepare fxc data ═══
-    let fxc_data = prepare_fxc_data(scf);
-    let alpha_hybrid = fxc_data.alpha_hybrid;
+    // ═══ Step 3: Prepare fxc data (MO mode) ═══
+    // AO mode builds the kernel table inside matvec_ao::prepare_ao_data (Step 4).
+    let fxc_data: Option<FXCMatvecData> = if is_ao { None } else { Some(prepare_fxc_data(scf)) };
 
-    // ═══ Step 4: Obtain and reshape RI integrals ═══
-    println!("Obtaining RI integrals...");
-    let ri_ov = tddft_get_submatrix(scf, 'O', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
-    let ri_oo = tddft_get_submatrix(scf, 'O', 'O', start_mo, occ_size, vir_size, homo, lumo, num_state);
-    let ri_vv = tddft_get_submatrix(scf, 'V', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
-    let num_auxbas = ri_ov.size[0];
-    println!("num_auxbas = {}", num_auxbas);
+    // ═══ Step 4: Obtain and reshape RI integrals (MO mode) ═══
+    // In AO mode these are not needed: kernels act on the AO transition
+    // density using the AO RI tensor already stored in scf.rimatr.
+    // RefCell: shared mutable state needed by the batched (Option B) Davidson
+    // closures, each of which requires `&mut TddftAoData` (NIMatmul cache).
+    let ao_data: std::cell::RefCell<Option<matvec_ao::TddftAoData>> = std::cell::RefCell::new(None);
+    let (ri_ov, ri_oo_exch, ri_vv_exch, ri_ov_exch) = if is_ao {
+        println!("AO mode: using AO transition-density kernels (no MO-basis RI tensors)");
+        // FEAST and response TDDFT are MO-only implementations.
+        if tddft_ctrl.tddft_feast_solver {
+            return Err("FEAST solver is not supported with tddft_mode=\"ao\"".to_string());
+        }
+        if tddft_ctrl.response_tddft {
+            return Err("response TDDFT is not supported with tddft_mode=\"ao\"".to_string());
+        }
+        *ao_data.borrow_mut() = Some(matvec_ao::prepare_ao_data(scf));
+        (None, None, None, None)
+    } else {
+        println!("Obtaining RI integrals...");
+        let ri_ov = tddft_get_submatrix(scf, 'O', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
+        let ri_oo = tddft_get_submatrix(scf, 'O', 'O', start_mo, occ_size, vir_size, homo, lumo, num_state);
+        let ri_vv = tddft_get_submatrix(scf, 'V', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
+        let num_auxbas = ri_ov.size[0];
+        println!("num_auxbas = {}", num_auxbas);
 
-    // Reshape RI_OO for A-block exchange: [naux, occ*occ] → [occ*naux, occ]
-    let mut ri_oo_exch = ri_oo.clone();
-    ri_oo_exch.reshape([num_auxbas * occ_size, occ_size]);
-    ri_oo_exch = ri_oo_exch.transpose_and_drop();
-    ri_oo_exch.reshape([occ_size * num_auxbas, occ_size]);
+        // Reshape RI_OO for A-block exchange: [naux, occ*occ] → [occ*naux, occ]
+        let mut ri_oo_exch = ri_oo.clone();
+        ri_oo_exch.reshape([num_auxbas * occ_size, occ_size]);
+        ri_oo_exch = ri_oo_exch.transpose_and_drop();
+        ri_oo_exch.reshape([occ_size * num_auxbas, occ_size]);
 
-    // Reshape RI_VV for A-block exchange: [naux, vir*vir] → [naux*vir, vir]
-    let mut ri_vv_exch = ri_vv.clone();
-    ri_vv_exch.reshape([num_auxbas * vir_size, vir_size]);
+        // Reshape RI_VV for A-block exchange: [naux, vir*vir] → [naux*vir, vir]
+        let mut ri_vv_exch = ri_vv.clone();
+        ri_vv_exch.reshape([num_auxbas * vir_size, vir_size]);
 
-    // Reshape RI_OV for B-block exchange: [naux, occ*vir] → [naux*occ, vir]
-    let mut ri_ov_exch = ri_ov.clone();
-    ri_ov_exch.reshape([num_auxbas * occ_size, vir_size]);
+        // Reshape RI_OV for B-block exchange: [naux, occ*vir] → [naux*occ, vir]
+        let mut ri_ov_exch = ri_ov.clone();
+        ri_ov_exch.reshape([num_auxbas * occ_size, vir_size]);
+
+        (Some(ri_ov), Some(ri_oo_exch), Some(ri_vv_exch), Some(ri_ov_exch))
+    };
+
+    // Hybrid coefficient: identical for both modes (from the kernel data).
+    let alpha_hybrid = match &*ao_data.borrow() {
+        Some(ad) => ad.fxc_base.alpha_hybrid,
+        None => fxc_data.as_ref().expect("MO mode must have fxc_data").alpha_hybrid,
+    };
 
     // ═══ Step 5: Build diagonal preconditioner ═══
     let hdiag = matvec::build_hdiag(scf);
@@ -122,14 +151,41 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     };
 
     // ═══ Step 8: Diagnostic: check A matrix symmetry for first few columns ═══
+    // Mode-dispatching matvec closures (used by diagnostic + solver dispatch).
+    let scf_ref: &SCF = scf;
+    let a_apply = |z: &Vec<f64>| -> Vec<f64> {
+        match &*ao_data.borrow() {
+            Some(ad) => matvec_ao::a_matvec_ao(scf_ref, ad, z, xlet, alpha_hybrid),
+            None => a_matvec(scf_ref, fxc_data.as_ref().unwrap(),
+                ri_ov.as_ref().unwrap(), ri_oo_exch.as_ref().unwrap(), ri_vv_exch.as_ref().unwrap(),
+                z, xlet, alpha_hybrid),
+        }
+    };
+    let b_apply = |z: &Vec<f64>| -> Vec<f64> {
+        match &*ao_data.borrow() {
+            Some(ad) => matvec_ao::b_matvec_ao(scf_ref, ad, z, xlet, alpha_hybrid),
+            None => b_matvec(scf_ref, fxc_data.as_ref().unwrap(),
+                ri_ov.as_ref().unwrap(), ri_ov_exch.as_ref().unwrap(),
+                z, xlet, alpha_hybrid),
+        }
+    };
+
+    // fxc kernel table (mode-agnostic view for diagnostics).
+    // Scoped to the diagnostic block below so the immutable RefCell guard is
+    // dropped before the solver dispatch (which borrows `ao_data` mutably).
     {
-        let ndiag = dim.min(6);
+    let kernel_guard = ao_data.borrow();
+    let kernel = match &*kernel_guard {
+        Some(ad) => &ad.fxc_base,
+        None => fxc_data.as_ref().unwrap(),
+    };
+    let ndiag = dim.min(6);
         // Test A[i,j] vs A[j,i] for first ndiag columns
         let mut a_probe = vec![0.0; ndiag * ndiag * 2]; // *2 for two sets
         let mut e_col = vec![0.0; dim];
         for col in 0..ndiag {
             e_col[col] = 1.0;
-            let a_col = a_matvec(scf, &fxc_data, &ri_ov, &ri_oo_exch, &ri_vv_exch, &e_col, xlet, alpha_hybrid);
+            let a_col = a_apply(&e_col);
             e_col[col] = 0.0;
             for row in 0..ndiag {
                 a_probe[row + col * ndiag] = a_col[row];
@@ -148,15 +204,15 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
             }
         }
         // Also check fxc tensor symmetry for GGA
-        if fxc_data.nvar == 4 {
+        if kernel.nvar == 4 {
             let nv2 = 16;
             let mut max_fxc_asym = 0.0;
-            for g in (0..fxc_data.ngrids).step_by(fxc_data.ngrids.max(1) / 10) {
+            for g in (0..kernel.ngrids).step_by(kernel.ngrids.max(1) / 10) {
                 for alpha in 0..4 {
                     for beta in 0..4 {
-                        let idx_ab = g + alpha * fxc_data.ngrids + beta * 4 * fxc_data.ngrids;
-                        let idx_ba = g + beta * fxc_data.ngrids + alpha * 4 * fxc_data.ngrids;
-                        let diff = (fxc_data.wfxc[idx_ab] - fxc_data.wfxc[idx_ba]).abs();
+                        let idx_ab = g + alpha * kernel.ngrids + beta * 4 * kernel.ngrids;
+                        let idx_ba = g + beta * kernel.ngrids + alpha * 4 * kernel.ngrids;
+                        let diff = (kernel.wfxc[idx_ab] - kernel.wfxc[idx_ba]).abs();
                         if diff > max_fxc_asym { max_fxc_asym = diff; }
                     }
                 }
@@ -191,8 +247,8 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
 
         if is_tda {
             feast_solver::feast_solve_tddft_tda(
-                scf, &fxc_data,
-                &ri_ov, &ri_oo_exch, &ri_vv_exch,
+                scf, fxc_data.as_ref().unwrap(),
+                ri_ov.as_ref().unwrap(), ri_oo_exch.as_ref().unwrap(), ri_vv_exch.as_ref().unwrap(),
                 &hdiag, xlet, alpha_hybrid,
                 eigenrange_min, eigenrange_max,
                 m_expected, max_feast_iter, tol_feast,
@@ -201,8 +257,9 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
             )
         } else {
             feast_solver::feast_solve_tddft_lr(
-                scf, &fxc_data,
-                &ri_ov, &ri_oo_exch, &ri_vv_exch, &ri_ov_exch,
+                scf, fxc_data.as_ref().unwrap(),
+                ri_ov.as_ref().unwrap(), ri_oo_exch.as_ref().unwrap(), ri_vv_exch.as_ref().unwrap(),
+                ri_ov_exch.as_ref().unwrap(),
                 &hdiag, xlet, alpha_hybrid,
                 eigenrange_min, eigenrange_max,
                 m_expected, max_feast_iter, tol_feast,
@@ -217,7 +274,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
         for col in 0..dim {
             let mut e_col = vec![0.0; dim];
             e_col[col] = 1.0;
-            let a_col = a_matvec(scf, &fxc_data, &ri_ov, &ri_oo_exch, &ri_vv_exch, &e_col, xlet, alpha_hybrid);
+            let a_col = a_apply(&e_col);
             for row in 0..dim {
                 a_mat[row + col * dim] = a_col[row];
             }
@@ -237,10 +294,35 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
         pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         pairs.truncate(nroots.min(dim));
         pairs
+    } else if is_tda && ao_data.borrow().is_some() {
+        println!("Solving TDA eigenvalue problem (AO-mode batched matvec)...");
+        davidson_solver::tda_davidson_solver_batched(
+            |z_block: &MatrixFull<f64>| {
+                matvec_ao::a_matvec_ao_batched(scf_ref, ao_data.borrow_mut().as_mut().unwrap(), z_block, xlet, alpha_hybrid)
+            },
+            nroots,
+            &hdiag,
+            initial_guess,
+            &davidson_cfg,
+        )
     } else if is_tda {
         println!("Solving TDA eigenvalue problem...");
         davidson_solver::tda_davidson_solver(
-            |z: &Vec<f64>| a_matvec(scf, &fxc_data, &ri_ov, &ri_oo_exch, &ri_vv_exch, z, xlet, alpha_hybrid),
+            |z: &Vec<f64>| a_apply(z),
+            nroots,
+            &hdiag,
+            initial_guess,
+            &davidson_cfg,
+        )
+    } else if ao_data.borrow().is_some() {
+        println!("Solving full linear response eigenvalue problem (AO-mode batched matvec)...");
+        davidson_solver::lr_davidson_solver_batched(
+            |z_block: &MatrixFull<f64>| {
+                matvec_ao::a_matvec_ao_batched(scf_ref, ao_data.borrow_mut().as_mut().unwrap(), z_block, xlet, alpha_hybrid)
+            },
+            |z_block: &MatrixFull<f64>| {
+                matvec_ao::b_matvec_ao_batched(scf_ref, ao_data.borrow_mut().as_mut().unwrap(), z_block, xlet, alpha_hybrid)
+            },
             nroots,
             &hdiag,
             initial_guess,
@@ -248,8 +330,8 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
         )
     } else {
         println!("Solving full linear response eigenvalue problem...");
-        davidson_solver::lr_davidson_solver(|z: &Vec<f64>| a_matvec(scf, &fxc_data, &ri_ov, &ri_oo_exch, &ri_vv_exch, z, xlet, alpha_hybrid),
-            |z: &Vec<f64>| b_matvec(scf, &fxc_data, &ri_ov, &ri_ov_exch, z, xlet, alpha_hybrid),
+        davidson_solver::lr_davidson_solver(|z: &Vec<f64>| a_apply(z),
+            |z: &Vec<f64>| b_apply(z),
             nroots,
             &hdiag,
             initial_guess,
