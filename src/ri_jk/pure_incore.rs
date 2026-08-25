@@ -1,5 +1,5 @@
 use super::prelude_dev::*;
-use log::warn;
+use log::{debug, warn};
 
 /* #region ri-vj incore */
 
@@ -51,6 +51,61 @@ pub fn get_vj_ri_incore(cderi: TsrView<f64>, dms: TsrView<f64>) -> Tsr<f64> {
         let mut dm = 2.0_f64 * &dm;
         dm.diagonal_mut(None).assign(&dm_diag);
         let dm_tp = dm.pack_triu();
+        dms_tp.i_mut((.., iset)).assign(dm_tp);
+    }
+
+    // generate j contribution
+    // -- (eq.2) -- //
+    let scr_j = cderi.t() % &dms_tp;
+    // -- (eq.3) -- //
+    let js_tp = &cderi % &scr_j;
+
+    // returns symmetrized part
+    // -- (eq.4) -- //
+    js_tp.unpack_tri(Upper, FlagSymm::Sy)
+}
+
+/// Generate **Coulomb (J) matrix** using the RI incore method for a
+/// **non-symmetric** density matrix (e.g. a TDDFT transition density
+/// `P = C_occ·z·C_virᵀ`).
+///
+/// The Coulomb kernel `(μν|λσ)` is symmetric in λ↔σ, so `J[P]` depends only on
+/// the symmetric part of `P`. This function symmetrizes internally by folding
+/// `P + Pᵀ` with the diagonal restored to `P_ii` before the packed contraction,
+/// which is exact for non-symmetric densities (no caller-side symmetrization
+/// needed).
+///
+/// # Parameters
+///
+/// - `cderi`: [`TsrView<f64>`] — Cholesky decomposed 3c-2e ERI `(nao_tp, naux)`.
+/// - `dms`: [`TsrView<f64>`] — density matrices `(nao, nao, nset)` (may be
+///   non-symmetric).
+///
+/// # Returns
+///
+/// - [`Tsr<f64>`] — Coulomb (J) matrices `(nao, nao, nset)`, symmetric.
+pub fn get_vj_ri_incore_nonsym(cderi: TsrView<f64>, dms: TsrView<f64>) -> Tsr<f64> {
+    assert_eq!(dms.ndim(), 3, "DM must have 3 dimensions");
+    assert_eq!(cderi.ndim(), 2, "Cholesky ERI must have 2 dimensions");
+
+    // get shapes
+    let nset = dms.shape()[2];
+    let nao = dms.shape()[0];
+    let nao_tp = (nao + 1) * nao / 2;
+
+    // shape check
+    assert_eq!(cderi.shape()[0], nao_tp, "Cholesky ERI must have shape (nao_tp, naux)");
+
+    // pack (P + Pᵀ) with the diagonal restored to P_ii. For a non-symmetric P
+    // this folds off-diagonal pairs as (P_ij + P_ji), matching Σ_λσ P_λσ B_λσ.
+    // -- (eq.1) -- //
+    let mut dms_tp: Tsr<f64> = rt::zeros(([nao_tp, nset].f(), dms.device()));
+    for iset in 0..nset {
+        let dm = dms.i((.., .., iset));
+        let dm_diag = dm.diagonal(None);
+        let mut dm_sym = &dm + dm.t();
+        dm_sym.diagonal_mut(None).assign(&dm_diag);
+        let dm_tp = dm_sym.pack_triu();
         dms_tp.i_mut((.., iset)).assign(dm_tp);
     }
 
@@ -263,3 +318,178 @@ pub fn get_vk_ri_incore_dm(cderi: TsrView<f64>, dms: TsrView<f64>, batch_size: u
 }
 
 /* #endregion ri-vk incore dm */
+
+/* #region ri-vk incore low-rank (SVD) dm */
+
+/// Default relative singular-value threshold for the low-rank exchange
+/// [`get_vk_ri_incore_dm_lowrank`]. Singular values with `σ_i < tol·σ_max` are
+/// dropped.
+
+/// Generate a **low-rank (SVD-truncated) Exchange (K) matrix** using the RI
+/// incore method, contracting the transition density `P = C_occ · z · C_virᵀ`
+/// without ever forming the full `[nao, nao]` density matrix.
+///
+/// The amplitude matrix `z` (`[occ, vir]`) is decomposed by SVD:
+/// `z = U · diag(σ) · Vᵀ`. Keeping only the `k` singular values above a
+/// relative tolerance `σ_i ≥ svd_tol · σ_max` gives the rank-k factors
+/// `C_left = C_occ·U_k` and `C_right = C_vir·V_k`, and the exchange becomes
+///
+///   K = Σ_Q M_Q·P·M_Q = Σ_Q (M_Q·C_left)·diag(σ_k)·(M_Q·C_right)ᵀ
+///
+/// with cost `O(naux·nao²·k)` instead of the exact `O(naux·nao³)`. Handles
+/// non-symmetric transition densities exactly; the B-block exchange is obtained
+/// by transposing `z` (or swapping the `C_occ`/`C_vir` roles).
+///
+/// # Parameters
+///
+/// - `cderi`: Cholesky decomposed 3c-2e ERI, shape `(nao_tp, naux)`, f-contiguous.
+/// - `c_occ`: Occupied MO coefficients, shape `(nao, occ)`.
+/// - `c_vir`: Virtual MO coefficients, shape `(nao, vir)`.
+/// - `z`: Amplitude (excitation) matrix, shape `(occ, vir)`.
+/// - `svd_tol`: Relative singular-value threshold; `σ_i ≥ svd_tol·σ_max` are
+///   kept. `svd_tol <= 0` keeps all singular values (exact, up to SVD roundoff).
+/// - `batch_size`: Auxiliary-basis batch size for memory control.
+///
+/// # Returns
+///
+/// - [`Tsr<f64>`]: Exchange matrix, shape `(nao, nao)`.
+pub fn get_vk_ri_incore_dm_lowrank(
+    cderi: TsrView<f64>,
+    c_occ: TsrView<f64>,
+    c_vir: TsrView<f64>,
+    z: TsrView<f64>,
+    svd_tol: f64,
+    batch_size: usize,
+) -> Tsr<f64> {
+    let nao = c_occ.shape()[0];
+    let occ = c_occ.shape()[1];
+    let vir = c_vir.shape()[1];
+    let naux = cderi.shape()[1];
+    let nao_tp = (nao + 1) * nao / 2;
+    let device = cderi.device().clone();
+
+    assert_eq!(cderi.shape(), &[nao_tp, naux], "Cholesky ERI must have shape (nao_tp, naux)");
+    assert_eq!(c_occ.shape(), &[nao, occ], "c_occ must have shape (nao, occ)");
+    assert_eq!(c_vir.shape(), &[nao, vir], "c_vir must have shape (nao, vir)");
+    assert_eq!(z.shape(), &[occ, vir], "z must have shape (occ, vir)");
+
+    // ── Step 1: SVD of the amplitude matrix: z = U·Σ·Vᵀ ──
+    let (u, s, vt) = rt::linalg::svd(z).into();
+    let nsv = s.shape()[0];
+
+    // ── Step 2: truncate to the singular values above svd_tol·σ_max ──
+    let s_data: Vec<f64> = s.iter().copied().collect();
+    let s_max = s_data.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+    let k = if svd_tol <= 0.0 || s_max <= 0.0 {
+        nsv
+    } else {
+        s_data.iter().take_while(|&&s_i| s_i >= svd_tol * s_max).count()
+    }.max(1);
+    debug!("lowrank exchange: z [{occ}x{vir}] nsv={nsv} k={k} svd_tol={svd_tol} s1={:.3e} smax={:.3e}", s_data.first().copied().unwrap_or(0.0), s_max);
+
+    // ── Step 3: rank-k factors C_left = C_occ·U_k, C_right = C_vir·V_kᵀ ──
+    let u_k = u.i((.., ..k));
+    let vt_k = vt.i((..k, ..));
+    let s_k = rt::diag(&s.i(..k));
+    let c_left = rt::matmul(c_occ, &u_k);          // [nao, k]
+    let c_right = rt::matmul(c_vir, &vt_k.t());    // [nao, k]
+
+    // ── Step 4: per-aux-batch exchange accumulation ──
+    // K = Σ_Q M_Q·P·M_Q = Σ_Q (M_Q·C_left)·Σ_k·(M_Q·C_right)ᵀ
+    let mut ks = rt::zeros(([nao, nao].f(), &device));
+    (0..naux).step_by(batch_size).for_each(|iaux| {
+        let nbatch = if iaux + batch_size <= naux { batch_size } else { naux - iaux };
+
+        // unpack cderi for this batch: (nao, nao, nbatch)
+        let cderi_batch: Tsr<f64> = unsafe { rt::empty(([nao, nao, nbatch].f(), &device)) };
+        (0..nbatch).into_par_iter().for_each(|p| {
+            let cderi_iaux = cderi.i((.., iaux + p)).unpack_tri(Upper, FlagSymm::Sy);
+            let cderi_iaux_mut = cderi_batch.i((.., .., p));
+            let mut cderi_iaux_mut = unsafe { cderi_iaux_mut.force_mut() };
+            cderi_iaux_mut.assign(&cderi_iaux);
+        });
+
+        // per aux (parallel): K_p = (M_Q·C_left)·Σ_k·(M_Q·C_right)ᵀ, [nao, nao]
+        let k_batch: Tsr<f64> = unsafe { rt::empty(([nao, nao, nbatch].f(), &device)) };
+        (0..nbatch).into_par_iter().for_each(|p| {
+            let m_q = cderi_batch.i((.., .., p));
+            let x_q = rt::matmul(&m_q, &c_left);       // [nao, k]
+            let y_q = rt::matmul(&m_q, &c_right);      // [nao, k]
+            let k_q = rt::matmul(&rt::matmul(&x_q, &s_k), &y_q.t()); // [nao, nao]
+            let k_q_view = k_batch.i((.., .., p));
+            let mut k_q_mut = unsafe { k_q_view.force_mut() };
+            k_q_mut.assign(&k_q);
+        });
+
+        // accumulate batch into K (serial, cheap)
+        for p in 0..nbatch {
+            let k_q = k_batch.i((.., .., p));
+            *&mut ks.i_mut((.., ..)) += &k_q;
+        }
+    });
+    ks
+}
+
+/* #endregion ri-vk incore low-rank (SVD) dm */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic pseudo-random fill.
+    fn pseudo(n: usize, seed: f64) -> Vec<f64> {
+        (0..n).map(|i| ((i as f64 + seed) * 0.37).sin() * 0.5 + 0.25).collect()
+    }
+
+    /// Build a synthetic (nao_tp, naux) folded cderi + MO coeffs.
+    fn synthetic_set(nao: usize, occ: usize, vir: usize, naux: usize) -> (Tsr<f64>, Tsr<f64>, Tsr<f64>, Tsr<f64>, usize) {
+        let device = DeviceBLAS::default();
+        let nao_tp = nao * (nao + 1) / 2;
+        let cderi = rt::asarray((pseudo(nao_tp * naux, 1.7), [nao_tp, naux].f(), &device));
+        let c_occ = rt::asarray((pseudo(nao * occ, 2.1), [nao, occ].f(), &device));
+        let c_vir = rt::asarray((pseudo(nao * vir, 3.3), [nao, vir].f(), &device));
+        // low-rank z: z = A·Bᵀ with A [occ,r], B [vir,r]
+        let r = 2;
+        let a = rt::asarray((pseudo(occ * r, 4.1), [occ, r].f(), &device));
+        let b = rt::asarray((pseudo(vir * r, 5.2), [vir, r].f(), &device));
+        let z = rt::matmul(&a, &b.t());
+        (cderi, c_occ, c_vir, z, nao_tp)
+    }
+
+    #[test]
+    fn test_vk_ri_incore_dm_lowrank_matches_exact() {
+        let nao = 6; let occ = 3; let vir = 4; let naux = 5;
+        let (cderi, c_occ, c_vir, z, nao_tp) = synthetic_set(nao, occ, vir, naux);
+        let device = cderi.device().clone();
+
+        // exact reference: P = C_occ·z·C_virᵀ, K = get_vk_ri_incore_dm(cderi, [P])
+        let p = rt::matmul(&rt::matmul(&c_occ, &z), &c_vir.t()); // [nao, nao]
+        let p3 = rt::asarray((p.iter().copied().collect::<Vec<f64>>(), [nao, nao, 1].f(), &device));
+        let k_exact = get_vk_ri_incore_dm(cderi.view(), p3.view(), 64);
+        let k_exact = k_exact.i((.., .., 0));
+
+        // low-rank with svd_tol=0 must reproduce the exact K (full SVD rank)
+        let k_lr = get_vk_ri_incore_dm_lowrank(cderi.view(), c_occ.view(), c_vir.view(), z.view(), 0.0, 64);
+        assert!(rt::allclose(k_lr.view(), k_exact, None), "low-rank (tol=0) != exact");
+
+        // sanity: cderi shape check used internally
+        assert_eq!(cderi.shape(), &[nao_tp, naux]);
+    }
+
+    #[test]
+    fn test_vk_ri_incore_dm_lowrank_truncation() {
+        // A truncated (small svd_tol > 0) result must not be far from exact for a
+        // genuinely low-rank z (rank 2), since only negligible σ are dropped.
+        let nao = 6; let occ = 3; let vir = 4; let naux = 5;
+        let (cderi, c_occ, c_vir, z, _) = synthetic_set(nao, occ, vir, naux);
+        let device = cderi.device().clone();
+        let p = rt::matmul(&rt::matmul(&c_occ, &z), &c_vir.t());
+        let p3 = rt::asarray((p.iter().copied().collect::<Vec<f64>>(), [nao, nao, 1].f(), &device));
+        let k_exact_full = get_vk_ri_incore_dm(cderi.view(), p3.view(), 64);
+        let k_exact = k_exact_full.i((.., .., 0));
+
+        // Drop σ < 1e-4·σ_max. For rank-2 z, σ3/σ1 is tiny, so this keeps rank 2.
+        let k_lr = get_vk_ri_incore_dm_lowrank(cderi.view(), c_occ.view(), c_vir.view(), z.view(), 1.0e-4, 64);
+        assert!(rt::allclose(k_lr.view(), k_exact, None), "truncated low-rank != exact");
+    }
+}

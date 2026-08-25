@@ -20,6 +20,7 @@ use crate::scf_io::SCF;
 use crate::ri_bse;
 use crate::dft::num_int::{FXCMatvecData, fxc_matvec};
 use crate::ri_tddft::utils::tddft_occupation_parameters;
+use crate::ri_tddft::TDDFTData;
 
 /// Build the diagonal preconditioner from KS orbital energy differences
 ///
@@ -143,14 +144,15 @@ pub fn exchange_b_matvec(
 /// triplet (xlet='T'): Coulomb factor = 0
 pub fn a_matvec(
     scf: &SCF,
-    fxc_data: &FXCMatvecData,
-    ri_ov: &MatrixFull<f64>,          // [naux, occ*vir], for Coulomb
-    ri_oo_exch: &MatrixFull<f64>,     // [occ*naux, occ], for A exchange
-    ri_vv_exch: &MatrixFull<f64>,     // [naux*vir, vir], for A exchange
+    data: &crate::ri_tddft::TDDFTData,
     z: &Vec<f64>,
     xlet: char,
-    alpha_hybrid: f64,
 ) -> Vec<f64> {
+    let fxc_data = &data.fxc;
+    let ri_ov = data.ri_ov.as_ref().expect("MO mode requires ri_ov");
+    let ri_oo_exch = data.ri_oo_exch.as_ref().expect("MO mode requires ri_oo_exch");
+    let ri_vv_exch = data.ri_vv_exch.as_ref().expect("MO mode requires ri_vv_exch");
+    let alpha_hybrid = fxc_data.alpha_hybrid;
     let occ_size = fxc_data.nocc;
     let vir_size = fxc_data.nvir;
     let dim = occ_size * vir_size;
@@ -204,13 +206,14 @@ pub fn a_matvec(
 /// triplet (xlet='T'): Coulomb factor = 0
 pub fn b_matvec(
     scf: &SCF,
-    fxc_data: &FXCMatvecData,
-    ri_ov: &MatrixFull<f64>,          // [naux, occ*vir], for Coulomb
-    ri_ov_exch: &MatrixFull<f64>,     // [naux*occ, vir], for B exchange
+    data: &crate::ri_tddft::TDDFTData,
     z: &Vec<f64>,
     xlet: char,
-    alpha_hybrid: f64,
 ) -> Vec<f64> {
+    let fxc_data = &data.fxc;
+    let ri_ov = data.ri_ov.as_ref().expect("MO mode requires ri_ov");
+    let ri_ov_exch = data.ri_ov_exch.as_ref().expect("MO mode requires ri_ov_exch");
+    let alpha_hybrid = fxc_data.alpha_hybrid;
     let occ_size = fxc_data.nocc;
     let vir_size = fxc_data.nvir;
     let dim = occ_size * vir_size;

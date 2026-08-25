@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 pub struct TDDFTParameters {
     pub tddft_method: String,       // "tda" or "lr" (full linear response)
     pub tddft_spin: String,         // "singlet" or "triplet"
-    pub tddft_mode: String,         // "mo" (MO-basis RI tensors) or "ao" (AO transition-density kernel)
+    pub tddft_mode: String,         // "mo" (default; MO-basis RI tensors) or "ao" (AO transition-density kernel)
+    pub grid_batch: bool,           // AO mode only: batch the fxc AO evaluation over grid batches (memory-bounded)
+    pub tddft_lowrank_k: bool,      // AO mode only: use SVD rank-reduced (low-rank) exchange K in ri_jk
+    pub tddft_svd_tol: f64,         // AO mode only: relative SVD threshold for low-rank K (σ_i ≥ tol·σ_max kept)
     pub nroots: usize,              // number of excitation energies to compute
     pub davidson_tol: f64,          // Davidson convergence: ||r|| < sqrt(tol), |de| < tol
     pub davidson_max_iter: usize,   // maximum Davidson iterations
@@ -54,6 +57,9 @@ impl Default for TDDFTParameters {
             tddft_method: String::from("lr"),
             tddft_spin: String::from("singlet"),
             tddft_mode: String::from("mo"),
+            grid_batch: true,
+            tddft_lowrank_k: false,
+            tddft_svd_tol: 1.0e-6,
             nroots: 6,
             davidson_tol: 1.0e-10,
             davidson_max_iter: 50,
@@ -107,6 +113,18 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
             p.tddft_mode = match tmp_ctrl.get("tddft_mode").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.to_lowercase(),
                 _ => String::from("mo"),
+            };
+            p.grid_batch = match tmp_ctrl.get("grid_batch").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => true,
+            };
+            p.tddft_lowrank_k = match tmp_ctrl.get("tddft_lowrank_k").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
+            };
+            p.tddft_svd_tol = match tmp_ctrl.get("tddft_svd_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-6),
+                _ => 1.0e-6,
             };
             p.nroots = match tmp_ctrl.get("nroots").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(6) as usize,
