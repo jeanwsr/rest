@@ -2233,6 +2233,31 @@ impl SCF {
 
     }
 
+    /// Recompute PcmScf (veff, q_sym, solvent energy) from the current density matrix.
+    /// Called both before the first Fock build (solvent-consistent initial guess /
+    /// chkfile restart) and once per SCF iteration.
+    pub fn refresh_solvent(&mut self) {
+        if let Some(solvent_static) = self.solvent_static_obj.as_ref() {
+            let s_static = PcmScf::get_pcm_refresh(
+                &solvent_static.surface,
+                &self.mol,
+                &self.density_matrix,
+                &solvent_static.pstatic.K,
+                &solvent_static.pstatic.K_ipiv,
+                &solvent_static.pstatic.R,
+                &solvent_static.pstatic.v_grids_n,
+                &self.mol.spin_channel,
+                &self.mol.ctrl.max_memory,
+                &self.mol.ctrl.solv_chunk,
+                self.mol.ctrl.solvent_ri
+            );
+            // SMD: CDS energy from PcmStatic (computed once in solvent_prepare)
+            let e_cds = solvent_static.pstatic.e_cds.unwrap_or(0.0);
+            self.energies.insert(String::from("solvent_energy"), vec![s_static.eng + e_cds]);
+            self.solvent_scf = Some(s_static);
+        }
+    }
+
     pub fn compute_ghost_charge_forces(&self) -> Option<MatrixFull<f64>> {
         let geom = &self.mol.geom;
         if geom.ghost_pc_chrg.is_empty() {
@@ -5862,6 +5887,12 @@ pub fn initialize_scf(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
 }
 
 pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
+    // refresh solvent with the initial-guess density, so that the first Fock
+    // build below is already solvent-consistent (chkfile restart converges in
+    // few iterations; also fixes the noiter path where solvent_scf stayed None)
+    if scf_data.mol.ctrl.solvent_enabled {
+        scf_data.refresh_solvent();
+    }
     scf_data.generate_hf_hamiltonian(mpi_operator);
 
     let mut scf_records=ScfTraceRecord::initialize(&scf_data);
@@ -5943,25 +5974,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
 
         let dt_solv0 = time::Local::now();
         if scf_data.mol.ctrl.solvent_enabled {
-            if let Some(solvent_static) = scf_data.solvent_static_obj.as_ref() {
-                let s_static = PcmScf::get_pcm_refresh(
-                    &solvent_static.surface,
-                    &scf_data.mol,
-                    &scf_data.density_matrix,
-                    &solvent_static.pstatic.K,
-                    &solvent_static.pstatic.K_ipiv,
-                    &solvent_static.pstatic.R,
-                    &solvent_static.pstatic.v_grids_n,
-                    &scf_data.mol.spin_channel,
-                    &scf_data.mol.ctrl.max_memory,
-                    &scf_data.mol.ctrl.solv_chunk,
-                    scf_data.mol.ctrl.solvent_ri
-                );
-                // SMD: CDS energy from PcmStatic (computed once in solvent_prepare)
-                let e_cds = solvent_static.pstatic.e_cds.unwrap_or(0.0);
-                scf_data.energies.insert(String::from("solvent_energy"), vec![s_static.eng + e_cds]);
-                scf_data.solvent_scf = Some(s_static);
-            }
+            scf_data.refresh_solvent();
         }
         let dt_solv1 = time::Local::now();
 
