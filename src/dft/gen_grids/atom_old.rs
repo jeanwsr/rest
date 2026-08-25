@@ -91,7 +91,7 @@ pub fn atom_grid(
     //println!("radial num = {}", default_radial_num(proton_charges[center_index] as usize));
     // factors match DIRAC code
     //println!("rs = {:?}, w = {:?}", rs, weights_radial);
-    let rb = bragg::get_bragg_angstrom(proton_charges[center_index]) / (5.0 * 0.529177249);
+    let rb = bragg::get_bragg_angstrom(proton_charges[center_index]) / (5.0 * crate::constants::BOHR);
 
     let mut coordinates = Vec::new();
     let mut weights = Vec::new();

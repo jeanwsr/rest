@@ -1,5 +1,5 @@
 //use std::simd::num;
-use crate::constants::PI;
+use crate::constants::{EV, PI};
 use itertools::Itertools;
 use std::ops::Range;
 use crate::utilities;
@@ -78,7 +78,7 @@ pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperat
     if gw_scheme !="no gw"{
         println!("One round of GW by {} scheme has finished.",gw_scheme);
     }
-    if qp_ctrl.save_qp_path.len()>0{
+    if qp_ctrl.save_qp {
         let save_path=qp_ctrl.save_qp_path.clone();
         let mut file = OpenOptions::new().append(true).create(true).open(save_path);
         scf_data.gwqp.0.iter().for_each(|qp|{
@@ -141,7 +141,6 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     let v_matrix=v_matrix(&scf_data,&ri_mat);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let (start_mo,num_state_cutoff,occ_size,vir_size_cutoff,homo,lumo)=get_occupation_parameters(scf_data,'N');
-    let hatree=27.2113863;
     let spin_channel=scf_data.mol.ctrl.spin_channel;
     let mut quasiparticle_energies_g:Vec<f64>=Vec::new();
     let mut quasiparticle_energies_w:Vec<f64>=Vec::new();
@@ -1483,7 +1482,7 @@ pub fn generate_real_axis_vchiv(
 
     let grid_label = if grid_type == 1 { "quadratic (power-law)" } else { "linear" };
     println!("Low-rank contour: Maximum real frequency needed for v*chi*v = {:.6} Ha = {:.6} eV",
-             de_max, de_max * 27.2113863);
+             de_max, de_max * EV);
     println!("Low-rank contour: Computing sqrt(v)*chi*sqrt(v) at {} real-axis grid points ({})",
              nomega_chi_real, grid_label);
     if print_level > 2 {
@@ -1508,7 +1507,7 @@ pub fn generate_real_axis_vchiv(
         };
         if print_level > 2 {
             println!("[DEBUG] Real-axis freq {} / {} : omega = {:.10} Ha = {:.6} eV  (t={:.6})",
-                     i_omega + 1, nomega_chi_real, omega_real, omega_real * 27.2113863,
+                     i_omega + 1, nomega_chi_real, omega_real, omega_real * EV,
                      (i_omega as f64) / ((nomega_chi_real - 1) as f64));
         }
         let lr = low_rank_vchi_vsqrt(

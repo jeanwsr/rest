@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use num_complex::ComplexFloat;
+//use num_complex::ComplexFloat;
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use tensors::{matrix_blas_lapack::_dgemv, BasicMatrix, MatrixFull, MatrixUpper};
 
-use crate::{molecule_io::Molecule, scf_io::{SCFType, SCF}};
+use crate::scf_io::SCFType;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ForceStateOccupation {
@@ -43,13 +43,13 @@ impl ForceStateOccupation {
         }
     }
 
-    //pub fn set_ref_index(&mut self, global_start: usize, num_basis: usize, num_state: usize, spin_channel: usize) {
-    //    self.ref_index.1[0] = global_start;
-    //    self.ref_index.1[1] = num_basis;
-    //    self.ref_index.1[2] = num_state;
-    //    self.ref_index.1[3] = spin_channel;
-
-    //}
+    /// Fill in ref_index if it was left empty at parse time (no explicit reference given).
+    /// When empty, the reference defaults to the file that provides the initial guess.
+    pub fn normalize_ref_index(&mut self, default_ref: &str) {
+        if self.ref_index.is_empty() {
+            self.ref_index = default_ref.to_string();
+        }
+    }
 
     pub fn get_force_occ(&self) -> f64 {
         self.force_occ

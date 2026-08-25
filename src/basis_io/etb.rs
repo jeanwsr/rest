@@ -7,7 +7,6 @@ use rest_tensors::MatrixFull;
 use itertools::Itertools;
 use libm::log;
 use rest_libcint::CINTR2CDATA;
-use statrs::statistics::{Statistics, Min};
 use std::fmt::format;
 use std::cmp::{max, max_by};
 use std::vec;
@@ -121,7 +120,7 @@ pub fn etb_gen_for_atom_list_contracted(mol: &Molecule, beta: &f64, required_ele
                 //println!("test4, row_num = {}", row_num);
                 //tmp = cs[row_num].iter().map(|v| v.abs()).collect_vec().max();
                 let mut tmp = cs.iter().map(|col| col[row_num].abs()).collect_vec();
-                let tmp_max = tmp.clone().max();
+                let tmp_max = tmp.iter().copied().reduce(f64::max).unwrap();
                 //println!("test4.5, tmp = {:?}", tmp);
                 if tmp_max > 1.0e-3*CINTR2CDATA::gto_norm(l as std::os::raw::c_int, es[row_num]) {
                     es_new.push(es[row_num]);
@@ -130,8 +129,8 @@ pub fn etb_gen_for_atom_list_contracted(mol: &Molecule, beta: &f64, required_ele
 
             }
 
-            emax_by_l[l] = emax_by_l[l].max(es_new.clone().max());
-            emin_by_l[l] = emin_by_l[l].min(es_new.min());
+            emax_by_l[l] = emax_by_l[l].max(es_new.iter().copied().reduce(f64::max).unwrap());
+            emin_by_l[l] = emin_by_l[l].min(es_new.iter().copied().reduce(f64::min).unwrap());
             //println!("test6, emax_by_l = {:?}, emin_by_l = {:?}", emax_by_l, emin_by_l);
 
         }
@@ -159,8 +158,8 @@ pub fn etb_gen_for_atom_list_contracted(mol: &Molecule, beta: &f64, required_ele
         let mut emin_by_l_new = vec![];
         for i in 0..(l_max1*2-1) {
             //println!("test10, i = {}", i);
-            emax_by_l_new.push(emax.get_sub_antidiag_terms(i).unwrap().max());
-            emin_by_l_new.push(emin.get_sub_antidiag_terms(i).unwrap().min());
+            emax_by_l_new.push(emax.get_sub_antidiag_terms(i).unwrap().into_iter().reduce(f64::max).unwrap());
+            emin_by_l_new.push(emin.get_sub_antidiag_terms(i).unwrap().into_iter().reduce(f64::min).unwrap());
             //println!("test11, emax_by_l_new = {:?}, emin_by_l_new = {:?}", emax_by_l_new, emin_by_l_new);
             //println!("test10, i = {}", i);
         }
@@ -169,10 +168,10 @@ pub fn etb_gen_for_atom_list_contracted(mol: &Molecule, beta: &f64, required_ele
         emax_by_l_new = emax_by_l_new.into_iter().map(|v| 2.0*v).collect(); //*2 for alpha+alpha on same center
         emin_by_l_new = emin_by_l_new.into_iter().map(|v| 2.0*v).collect(); // (numpy.arange(l_max1*2-1)*.5+1)
         
-        let mut ns: Vec<f64> = emax_by_l_new.iter().zip(&emin_by_l_new).map(|(max,min)| ((max+min)/min).log(E)/beta.log(E)).collect();
+        let mut ns: Vec<f64> = emax_by_l_new.iter().zip(&emin_by_l_new).map(|(max, min): (&f64, &f64)| ((max + min) / min).log(E) / beta.log(E)).collect();
 
         //let etb = ns.iter().enumerate().map(|(i, n)|(i, n, emin_by_l_new[i], beta)).collect()
-        ns = ns.iter().map(|v| v.ceil()).filter(|v| *v > 0.0).collect();
+        ns = ns.iter().map(|v: &f64| v.ceil()).filter(|v| *v > 0.0).collect();
 
         let etb_para: Vec<(usize, usize, f64, f64)> = ns.iter().zip(emin_by_l_new).enumerate().map(|(l, (n, min))|(l, *n as usize, min, *beta)).collect();
         let etb_result = etbs_gen_contracted(etb_para);
@@ -258,7 +257,7 @@ pub fn etb_gen_for_atom_list_primitive(mol: &Molecule, beta: &f64, required_elem
                 //println!("test4, row_num = {}", row_num);
                 //tmp = cs[row_num].iter().map(|v| v.abs()).collect_vec().max();
                 let mut tmp = cs.iter().map(|col| col[row_num].abs()).collect_vec();
-                let tmp_max = tmp.clone().max();
+                let tmp_max = tmp.iter().copied().reduce(f64::max).unwrap();
                 //println!("test4.5, tmp = {:?}", tmp);
                 if tmp_max > 1.0e-3*CINTR2CDATA::gto_norm(l as std::os::raw::c_int, es[row_num]) {
                     es_new.push(es[row_num]);
@@ -267,8 +266,8 @@ pub fn etb_gen_for_atom_list_primitive(mol: &Molecule, beta: &f64, required_elem
 
             }
 
-            emax_by_l[l] = emax_by_l[l].max(es_new.clone().max());
-            emin_by_l[l] = emin_by_l[l].min(es_new.min());
+            emax_by_l[l] = emax_by_l[l].max(es_new.iter().copied().reduce(f64::max).unwrap());
+            emin_by_l[l] = emin_by_l[l].min(es_new.iter().copied().reduce(f64::min).unwrap());
             //println!("test6, emax_by_l = {:?}, emin_by_l = {:?}", emax_by_l, emin_by_l);
 
         }
@@ -296,8 +295,8 @@ pub fn etb_gen_for_atom_list_primitive(mol: &Molecule, beta: &f64, required_elem
         let mut emin_by_l_new = vec![];
         for i in 0..(l_max1*2-1) {
             //println!("test10, i = {}", i);
-            emax_by_l_new.push(emax.get_sub_antidiag_terms(i).unwrap().max());
-            emin_by_l_new.push(emin.get_sub_antidiag_terms(i).unwrap().min());
+            emax_by_l_new.push(emax.get_sub_antidiag_terms(i).unwrap().into_iter().reduce(f64::max).unwrap());
+            emin_by_l_new.push(emin.get_sub_antidiag_terms(i).unwrap().into_iter().reduce(f64::min).unwrap());
             //println!("test11, emax_by_l_new = {:?}, emin_by_l_new = {:?}", emax_by_l_new, emin_by_l_new);
             //println!("test10, i = {}", i);
         }
@@ -306,10 +305,10 @@ pub fn etb_gen_for_atom_list_primitive(mol: &Molecule, beta: &f64, required_elem
         emax_by_l_new = emax_by_l_new.into_iter().map(|v| 2.0*v).collect(); //*2 for alpha+alpha on same center
         emin_by_l_new = emin_by_l_new.into_iter().map(|v| 2.0*v).collect(); // (numpy.arange(l_max1*2-1)*.5+1)
         
-        let mut ns: Vec<f64> = emax_by_l_new.iter().zip(&emin_by_l_new).map(|(max,min)| ((max+min)/min).log(E)/beta.log(E)).collect();
+        let mut ns: Vec<f64> = emax_by_l_new.iter().zip(&emin_by_l_new).map(|(max, min): (&f64, &f64)| ((max + min) / min).log(E) / beta.log(E)).collect();
 
         //let etb = ns.iter().enumerate().map(|(i, n)|(i, n, emin_by_l_new[i], beta)).collect()
-        ns = ns.iter().map(|v| v.ceil()).filter(|v| *v > 0.0).collect();
+        ns = ns.iter().map(|v: &f64| v.ceil()).filter(|v| *v > 0.0).collect();
 
         let etb_para: Vec<(usize, usize, f64, f64)> = ns.iter().zip(emin_by_l_new).enumerate().map(|(l, (n, min))|(l, *n as usize, min, *beta)).collect();
         let etb_result = etbs_gen_primitive(etb_para);

@@ -6,9 +6,9 @@ use crate::mpi_io::mpi_broadcast_matrixfull;
 use crate::mpi_io::MPIOperator;
 use crate::scf_io::{SCFType};
 use crate::{molecule_io::Molecule, scf_io::SCF, dft::Grids};
-
 use crate::initial_guess::sap::get_vsap;
 use self::sad::initial_guess_from_sad;
+use log::{self, LevelFilter};
 
 pub mod sap;
 pub mod sad;
@@ -37,6 +37,7 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
                 scf_data.density_matrix = initial_guess_from_hdf5guess(&scf_data.mol);
                 // for DFT methods, it needs the eigenvectors to generate the hamiltonian. In consequence, we use the hf method to prepare the eigenvectors from the guess dm
                 scf_data.generate_hf_hamiltonian_for_guess();
+                scf_data.grad_dm = scf_data.get_grad_dm();
                 //scf_data.generate_hf_hamiltonian();
                 if scf_data.mol.ctrl.print_level>0 {println!("Initial guess energy: {:16.8}", scf_data.evaluate_hf_total_energy())};
                 scf_data.diagonalize_hamiltonian(mpi_operator);
@@ -86,7 +87,9 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
     // generate the VSAP initial guess
     } else if scf_data.mol.ctrl.initial_guess.eq(&"vsap") {
         let init_fock = initial_guess_from_vsap(&scf_data.mol,&scf_data.grids);
-        if scf_data.mol.spin_channel==1 {
+        if let SCFType::ROHF = scf_data.scftype {
+            scf_data.roothaan_hamiltonian = Some(init_fock);
+        } else if scf_data.mol.spin_channel==1 {
             scf_data.hamiltonian = [init_fock,MatrixUpper::new(1,0.0)];
         } else {
             let init_fock_beta = init_fock.clone();
@@ -97,7 +100,10 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
         scf_data.generate_density_matrix();
         //scf_data.generate_hf_hamiltonian();
     } else if scf_data.mol.ctrl.initial_guess.eq(&"sad") {
+        let cur_log_level = log::max_level();
+        log::set_max_level(LevelFilter::Info);
         scf_data.density_matrix = initial_guess_from_sad(&scf_data.mol, mpi_operator);
+        log::set_max_level(cur_log_level);
         //for DFT methods, it needs the eigenvectors to generate the hamiltoniam. In consequence, we use the hf method to prepare the eigenvectors from the guess dm
         //scf_data.generate_hf_hamiltonian_for_guess();
         //if scf_data.mol.ctrl.print_level>0 {println!("Initial guess HF energy: {:16.8}", scf_data.evaluate_hf_total_energy())};
@@ -189,7 +195,7 @@ pub fn update_scf_from_hdf5chk(scf_data: &mut SCF, chkfile: String) {
                 //let is_exist = scf_data.ref_eigenvectors.contains_key(&restart);
                 //if ! is_exist {
                 scf_data.ref_eigenvectors.insert(
-                    restart, 
+                    restart,
                     (eigenvectors.clone(),[0,scf_data.mol.num_basis,scf_data.mol.num_state,scf_data.mol.spin_channel])
                 );
                 //};
@@ -370,7 +376,11 @@ pub fn import_guess_from_hdf5chkfile(chkname: &str, spin_channel: usize, print_l
     let buf02 = scf.dataset("mo_energy").unwrap().read_raw::<f64>().unwrap();
     // importing MO occupation
     // let is_exist = scf.member_names().unwrap().iter().fold(false, |is_exist, x| x.eq("mo_occupation"));
-    let buf03 = Some(scf.dataset("mo_occupation").unwrap().read_raw::<f64>().unwrap());
+    let buf03 = if scf.dataset("mo_occ").is_ok() {
+        Some(scf.dataset("mo_occ").unwrap().read_raw::<f64>().unwrap())
+    } else {
+        None
+    };
     (buf01, buf02, buf03)
 }
 
@@ -418,9 +428,17 @@ pub fn initial_guess_from_raw(
             println!("eigenval {:?}", &tmp_eigenvalues[i]);
         });
     }            
-    (0..spin_channel).into_iter().for_each(|i_spin| {
+    // occupation may span more channels than spin_channel suggests
+    // (e.g. ROHF chkfile stores both alpha+beta occupation, but spin_channel=1 for eigenvectors)
+    assert!(
+        loaded_occupation.len() == num_state || loaded_occupation.len() == 2 * num_state,
+        "Unexpected occupation size in chkfile: {} (expected {} or {} for num_state={})",
+        loaded_occupation.len(), num_state, 2 * num_state, num_state
+    );
+    let occ_channels = loaded_occupation.len() / num_state;
+    (0..occ_channels).into_iter().for_each(|i_spin| {
                 tmp_occupation[i_spin]=loaded_occupation[ (0+i_spin)*num_state..(1+i_spin)*num_state].to_vec();
-            });        
+            });
             // println!("tmp_eigenvectors {:?}, tmp_eigenvalues {:?}, tmp_occupation {:?}", &tmp_eigenvectors, &tmp_eigenvalues, &tmp_occupation);
         },
         "r2u" => {
@@ -434,9 +452,21 @@ pub fn initial_guess_from_raw(
 
                 tmp_eigenvalues[i]=loaded_eigenvalues[ 0..num_state].to_vec();
             });
-            (0..spin_channel).into_iter().for_each(|i_spin| {
-                tmp_occupation[i_spin]=loaded_occupation[ 0..num_state].to_vec();
-            });
+            if loaded_occupation.len() == 2 * num_state {
+                // ROHF source: alpha and beta occupation stored separately
+                tmp_occupation[0] = loaded_occupation[0..num_state].to_vec();
+                tmp_occupation[1] = loaded_occupation[num_state..2*num_state].to_vec();
+            } else {
+                // RHF/RKS source: occupation is total (e.g. [2,2,0]), divide by 2 for per-spin
+                assert!(loaded_occupation.len() == num_state,
+                    "r2u: unexpected occupation length {} (expected {} or {})",
+                    loaded_occupation.len(), num_state, 2*num_state);
+                (0..spin_channel).into_iter().for_each(|i_spin| {
+                    tmp_occupation[i_spin] = loaded_occupation[0..num_state].iter()
+                        .map(|x| x * 0.5)
+                        .collect();
+                });
+            }
         },
         "u2r" => {},
         _ => {

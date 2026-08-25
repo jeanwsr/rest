@@ -13,7 +13,7 @@ use num_traits::Pow;
 use pyo3::prelude::*;
 //use autocxx::prelude::*;
 use crate::ctrl_io::JobType;
-use crate::constants::{ANG, AU2DEBYE};
+use crate::constants::{BOHR, AU2DEBYE};
 use crate::scf_io::{scf_without_build, SCFType, SCF};
 use tensors::{MathMatrix, MatrixFull};
 use tensors::matrix_blas_lapack::_dsyevd;
@@ -42,6 +42,7 @@ use crate::post_scf_analysis::{post_scf_correlation, print_out_dfa, save_chkfile
 use liblbfgs::{lbfgs,Progress};
 use crate::mpi_io::{MPIOperator,MPIData};
 use std::collections::HashMap;
+use serde_json::json;
 
 //use crate::mpi_io::initialization;
 
@@ -138,6 +139,8 @@ pub fn main_driver() -> anyhow::Result<()> {
     // perform the SCF and post SCF evaluation for the specified xc method
     performance_essential_calculations(&mut scf_data, &mut time_mark, &mpi_operator);
 
+    let mut json_extra: HashMap<String, serde_json::Value> = HashMap::new();
+
     let spin_correction_scheme: Option<String> = scf_data.mol.ctrl.spin_correction_scheme.clone();
     match spin_correction_scheme.as_deref() {
         Some("yamaguchi") => {
@@ -157,7 +160,8 @@ pub fn main_driver() -> anyhow::Result<()> {
     let jobtype = scf_data.mol.ctrl.job_type.clone();
     match jobtype {
         JobType::Force => {
-            eval_force(&mut scf_data, &mut time_mark, &mpi_operator);
+            let (_, gradient) = eval_force(&mut scf_data, &mut time_mark, &mpi_operator);
+            json_extra.insert("gradient".to_string(), json!(gradient.data));
         },
         JobType::NumDipole => {
             time_mark.count_start("numerical dipole");
@@ -180,7 +184,7 @@ pub fn main_driver() -> anyhow::Result<()> {
                 if scf_data.mol.ctrl.print_level>0 {
                     println!("Geometry optimization invoked");
                 }
-                let displace = scf_data.mol.ctrl.nforce_displacement/ANG;
+                let displace = scf_data.mol.ctrl.nforce_displacement/BOHR;
 
                 let mut position = scf_data.mol.geom.position.iter().map(|x| *x).collect::<Vec<f64>>();
                 lbfgs().minimize(
@@ -248,18 +252,6 @@ pub fn main_driver() -> anyhow::Result<()> {
         // ------------
         _ => {}
     }
-
-    if scf_data.mol.ctrl.has_chkfile {
-        if let Some(mp_op) = &mpi_operator {
-            if mp_op.rank == 0 {
-                println!("Rank 0: now save the converged SCF results");
-                save_chkfile(&scf_data)
-            }
-        } else {
-            println!("now save the converged SCF results");
-            save_chkfile(&scf_data)
-        }
-    };
 
     if scf_data.mol.ctrl.check_stab {
         time_mark.new_item("Stability", "the scf stability check");
@@ -347,49 +339,77 @@ pub fn main_driver() -> anyhow::Result<()> {
     }    
     if let Some(qp_ctrl)=scf_data.mol.ctrl.quasiparticle_methods.clone(){
         print!("Now starts quasiparticle method computation!\n");
-        quasiparticle_methods(&mut scf_data,&mpi_operator);
+        let qp_output = quasiparticle_methods(&mut scf_data,&mpi_operator);
+        if let Some(e1) = qp_output.first_excitation {
+            json_extra.insert("bse".to_string(), json!({ "first_excitation": e1 }));
+        }
     }
 
     //===================================
     // Now for TDDFT calculations
     //===================================
-    if let Some(tddft_ctrl) = &scf_data.mol.ctrl.tddft {
-        if !tddft_ctrl.damped_tddft {
+            if let Some(tddft_ctrl) = &scf_data.mol.ctrl.tddft {
+        if !tddft_ctrl.response_tddft {
             time_mark.new_item("TDDFT", "the TDDFT eigenvalue calculation");
             time_mark.count_start("TDDFT");
-            if let Err(e) = crate::ri_tddft::tddft_main(&mut scf_data) {
-                eprintln!("Error in TDDFT calculation: {}", e);
+            match crate::ri_tddft::tddft_main(&mut scf_data) {
+                Ok(output) => {
+                    json_extra.insert("tddft".to_string(), json!({
+                        "energies": output.energies,
+                        "osc": output.osc,
+                    }));
+                }
+                Err(e) => eprintln!("Error in TDDFT calculation: {}", e),
             }
             time_mark.count("TDDFT");
         }
     }
 
     //===================================
-    // Now for damped TDDFT calculations
+    // Now for response TDDFT calculations
     //===================================
     if let Some(tddft_ctrl) = &scf_data.mol.ctrl.tddft {
-        if tddft_ctrl.damped_tddft {
-            time_mark.new_item("DampedTDDFT", "the damped TDDFT calculation");
-            time_mark.count_start("DampedTDDFT");
-            if let Err(e) = crate::ri_tddft::damped_tddft(&mut scf_data) {
-                eprintln!("Error in damped TDDFT calculation: {}", e);
+        if tddft_ctrl.response_tddft {
+            time_mark.new_item("ResponseTDDFT", "the response TDDFT calculation");
+            time_mark.count_start("ResponseTDDFT");
+            if let Err(e) = crate::ri_tddft::response_tddft(&mut scf_data) {
+                eprintln!("Error in response TDDFT calculation: {}", e);
             }
-            time_mark.count("DampedTDDFT");
+            time_mark.count("ResponseTDDFT");
         }
     }
 
     //===================================
-    // Now for CP-HF calculations
+    // CP-HF / Hessian / Frequency calculations
     //===================================
-    if let Some(cphf_ctrl) = &scf_data.mol.ctrl.cphf {
-        let label = if cphf_ctrl.solver == "dense" { "dense" } else { "krylov" };
-        println!("\n=== CP-HF Calculation (solver={}) ===", label);
-        time_mark.new_item("CPHF", &format!("the CP-HF {} solver test", label));
-        time_mark.count_start("CPHF");
-        if let Err(e) = crate::ri_cphf::test_cphf_dense(&scf_data) {
-            eprintln!("Error in CP-HF calculation: {}", e);
+    if let Some(ref hess_ctrl) = scf_data.mol.ctrl.hessian {
+        let ho = crate::hessian::rhf_hessian_main(&scf_data, hess_ctrl, &mut time_mark);
+        let mut hessian = json!({
+            "total_max_abs": ho.total_max_abs,
+            "h_partial_max_abs": ho.h_partial_max_abs,
+            "cphf_contrib_max_abs": ho.cphf_contrib_max_abs,
+        });
+        if !ho.frequencies_cm.is_empty() {
+            hessian["frequencies_cm"] = json!(ho.frequencies_cm);
         }
-        time_mark.count("CPHF");
+        json_extra.insert("hessian".to_string(), hessian);
+    }
+    
+    //===================================
+    // Analytical derivative module calculations
+    //===================================
+    if !scf_data.mol.ctrl.analdrv_tasks.is_empty() {
+        time_mark.new_item("AnalDrv", "analytical derivative module");
+        time_mark.count_start("AnalDrv");
+        use crate::analdrv::interface::analdrv_interface;
+        let tasks = &scf_data.mol.ctrl.analdrv_tasks;
+        let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
+        if let Some(ao) = analdrv_interface(&scf_data, tasks, &config) {
+            json_extra.insert("analdrv".to_string(), json!({
+                "frequencies_cm": ao.frequencies_cm,
+            }));
+        }
+        time_mark.count("AnalDrv");
     }
 
     time_mark.count("Overall");
@@ -401,6 +421,14 @@ pub fn main_driver() -> anyhow::Result<()> {
         println!("====================================================");
         output_result(&scf_data);
         time_mark.report_all();
+    }
+
+    if let Some(mpi_op) = &mpi_operator {
+        if mpi_op.rank == 0 {
+            crate::fileop::json_dump::dump_json(&scf_data, &json_extra);
+        }
+    } else {
+        crate::fileop::json_dump::dump_json(&scf_data, &json_extra);
     }
 
     //if let Some(mpi_op) = &mpi_operator {
@@ -502,6 +530,21 @@ pub fn performance_essential_calculations(scf_data: &mut SCF, time_mark: &mut ut
     time_mark.count("SCF");
 
     //==================================================================
+    // Save the converged SCF results to the chkfile
+    //==================================================================
+    if scf_data.mol.ctrl.has_chkfile {
+        if let Some(mp_op) = mpi_operator {
+            if mp_op.rank == 0 {
+                println!("Rank 0: now save the converged SCF results");
+                save_chkfile(scf_data)
+            }
+        } else {
+            println!("now save the converged SCF results");
+            save_chkfile(scf_data)
+        }
+    }
+
+    //==================================================================
     // Now evaluate the advanced correction energy for the given method
     //==================================================================
     //let mut time_mark = utilities::TimeRecords::new();
@@ -535,7 +578,9 @@ pub fn performance_essential_calculations(scf_data: &mut SCF, time_mark: &mut ut
         scf_data.energies.insert("ai_correction".to_string(), scc);
     }
 
-    collect_total_energy(scf_data)
+    let total_energy = collect_total_energy(scf_data);
+    scf_data.energies.insert("total_energy".to_string(), vec![total_energy]);
+    total_energy
 
 }
 
@@ -545,35 +590,6 @@ pub fn collect_total_energy(scf_data: &SCF) -> f64 {
     //====================================
     let mut total_energy = scf_data.scf_energy;
     
-    // let xc_name = scf_data.mol.ctrl.xc.to_lowercase();
-
-
-    // total_energy = match xc_name.as_str() {
-    //     "mp2" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "scs-mp2" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "b2plyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "b2gpplyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "pbe-qidh" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "pbe0dh" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "dsdpbep86-nodisp" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "dsdpbep86" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "dsdpbeb95" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "dsdblyp" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "xyg7" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "xyg2" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "r-xyg3" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "r-xygjos" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "r-xyg7" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "r-xyg2" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "xdh-pbe0" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "r-xdh7" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "zrps" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "scsrpa" => scf_data.energies.get("xdh_energy").unwrap()[0],
-    //     "rpa@pbe" => scf_data.energies.get("rpa_energy").unwrap()[0],
-    //     _ => scf_data.scf_energy,
-    // };
     if scf_data.mol.xc_data.is_rpa() {
         total_energy = scf_data.energies.get("rpa_energy").unwrap()[0];
     } else if scf_data.mol.xc_data.is_fifth_dfa() {
@@ -644,7 +660,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         if scf_data.mol.ctrl.print_level > 1 {
             println!("Gradient evaluation using numerical differentiation");
         }
-        let displace = scf_data.mol.ctrl.nforce_displacement / ANG;
+        let displace = scf_data.mol.ctrl.nforce_displacement / BOHR;
         let (energy, nforce) = numerical_force(&scf_data, displace, &mpi_operator);
         println!("------ Output gradient [a.u.] ------");
         println!("{}", formated_force(&nforce, &scf_data.mol.geom.elem));
@@ -742,6 +758,7 @@ fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeR
         println!("Input geometry in this round is:");
         println!("{}", scf_data.mol.geom.formated_geometry());
     }
+    scf_data.free_large_tensors();
     scf_data.mol.ctrl.initial_guess = String::from("inherit");
     initialize_scf(scf_data, mpi_operator);
     performance_essential_calculations(scf_data, time_mark, mpi_operator);
@@ -762,7 +779,7 @@ fn eval_normal_modes(
     let num_atoms = scf_data.mol.geom.nfree;
     let dim = num_atoms * 3;
     let displace_ang = scf_data.mol.ctrl.nhessian_displacement;
-    let displace = displace_ang / ANG; // convert Angstrom to Bohr
+    let displace = displace_ang / BOHR; // convert Angstrom to Bohr
 
     if scf_data.mol.ctrl.print_level > 0 {
         println!("");
@@ -932,7 +949,6 @@ fn eval_normal_modes(
 mod geometric_pyo3_impl {
     use super::*;
     use geometric_pyo3::prelude::*;
-    use geometric_pyo3::engine::molecule_build_topology;
     use pyo3::prelude::*;
 
     pub(crate) struct GeometricOptDriver<'a> {
@@ -961,12 +977,33 @@ mod geometric_pyo3_impl {
         pyo3::prepare_freethreaded_python();
         
         let elem = scf_data.mol.geom.elem.iter().map(|x| x.as_str()).collect::<Vec<&str>>();
-        const BOHR: f64 = crate::constants::BOHR;
         let xyz = scf_data.mol.geom.position.data.iter().map(|x| x * BOHR).collect::<Vec<f64>>();
         //let xyz = scf_data.mol.geom.position.iter().map(|x| *x).collect::<Vec<f64>>();
         let xyzs = vec![xyz];
         let molecule = init_pyo3_molecule(&elem, &xyzs).unwrap();
-        molecule_build_topology(&molecule, None).unwrap();
+        // Build topology. Fac / radii control bond detection and must be written into
+        // molecule.top_settings (read by build_bonds), not passed as kwargs, so they also
+        // apply to the rebuild that geomeTRIC does inside makePrimitives.
+        //   fac   : multiplicative factor to covalent radii (default 1.2).
+        //   radii : per-element radius overrides, e.g. [("Sr", 0.0)] to make Sr non-bonding.
+        let geo_params = scf_data.mol.ctrl.geometric_pyo3.as_ref();
+        let fac = geo_params.and_then(|g| g.fac);
+        let radii = geo_params.and_then(|g| g.radii.as_ref());
+        Python::with_gil(|py| -> PyResult<()> {
+            let ts = molecule.getattr(py, "top_settings")?;
+            if let Some(f) = fac {
+                ts.call_method1(py, "__setitem__", ("Fac", f))?;
+            }
+            if let Some(ref pairs) = radii {
+                let radii_dict = pyo3::types::PyDict::new(py);
+                for (elem, r) in pairs.iter() {
+                    radii_dict.set_item(elem, r)?;
+                }
+                ts.call_method1(py, "__setitem__", ("radii", radii_dict))?;
+            }
+            molecule.call_method(py, "build_topology", (), None)?;
+            Ok(())
+        }).unwrap();
         
         //let optimizer_params = r#"
         //    convergence_energy   = 1.0e-6  # Eh
@@ -977,12 +1014,61 @@ mod geometric_pyo3_impl {
         //"#;
         //let mut params = tomlstr2py(optimizer_params)?;
 
-        let mut params = if let Some(params) = &scf_data.mol.ctrl.geometric_pyo3 {
-            let params = toml2py(&params.to_toml())?;
-            params
-        } else {
-            panic!("For geometric_pyo3, you must specify the parameters in the control file.")
-        };
+        let rust_params = scf_data.mol.ctrl.geometric_pyo3.as_ref().expect("For geometric_pyo3, you must specify the parameters in the control file.");
+        let params = toml2py(&rust_params.to_toml())?;
+
+        // ── Compute analytical Hessian before optimization (if requested) ──
+        let hessian_analytic_path: Option<std::path::PathBuf> =
+            if rust_params.analytic_hessian {
+                let pl = scf_data.mol.ctrl.print_level;
+                if pl > 0 {
+                    println!("  Computing analytical Hessian for geomeTRIC initial guess...");
+                }
+                let is_hessian_enabled = scf_data.mol.ctrl.hessian.is_some();
+                let use_analdrv = scf_data.mol.ctrl.geometric_pyo3.as_ref().map_or(None, |g| g.use_analdrv);
+                // if `[hessian]` is specified in the control file, then we will use it to compute the Hessian.
+                // otherwise, use `analdrv`.
+                let use_analdrv = use_analdrv.unwrap_or(!is_hessian_enabled);
+                let hess_total = if !use_analdrv {
+                    crate::hessian::compute_hessian(&*scf_data)
+                        .expect("Analytical Hessian computation failed for geometry optimization")
+                } else {
+                    use crate::analdrv::interface::hess_interface;
+                    use rstsr::prelude::*;
+                    
+                    let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
+                    let (hess_raw, _, _) = hess_interface(&scf_data, &config);
+                    let natm = (hess_raw.len() / 9).isqrt();
+                    assert!(natm * natm * 9 == hess_raw.len(), "Hessian raw data length does not match expected size for {} atoms", natm);
+                    let device = DeviceBLAS::default();
+                    let hess_rt = rt::asarray((&hess_raw, [3, 3, natm, natm].f(), &device));
+                    let hess_rt = hess_rt.transpose([0, 2, 1, 3]).into_shape((3 * natm, 3 * natm));
+                    let hess_vec = hess_rt.into_shape(-1).into_vec();
+                    MatrixFull::from_vec([3 * natm, 3 * natm], hess_vec).unwrap()
+                };
+                let natm = scf_data.mol.geom.nfree;
+                let n3 = natm * 3;
+                let mut out = String::new();
+                for i in 0..n3 {
+                    let mut row = String::new();
+                    for j in 0..n3 {
+                        use std::fmt::Write;
+                        let _ = write!(&mut row, " {:17.10e}", hess_total[[i, j]]);
+                    }
+                    out.push_str(row.trim_start());
+                    out.push('\n');
+                }
+                let hess_path = std::env::temp_dir()
+                    .join(format!("rest_hess_analytic_{}.txt", std::process::id()));
+                std::fs::write(&hess_path, &out)
+                    .expect("Failed to write analytical Hessian file");
+                if pl > 0 {
+                    println!("  Analytical Hessian saved to {}", hess_path.display());
+                }
+                Some(hess_path)
+            } else {
+                None
+            };
 
         let constraint_path = if let Some(constraint_str) = scf_data.mol.geom.to_geometric_freeze_str() {
             if scf_data.mol.ctrl.print_level > 0 {
@@ -1014,6 +1100,11 @@ mod geometric_pyo3_impl {
                 params.bind(py).set_item("constraints", cst_path.to_str().unwrap())?;
             }
 
+            // Inject analytical Hessian file path into geomeTRIC params
+            if let Some(ref hess_path) = hessian_analytic_path {
+                params.bind(py).set_item("hessian", format!("file:{}", hess_path.display()))?;
+            }
+
             let res = run_optimization(custom_engine, &params, input)?;
 
             let last_energy = res
@@ -1032,6 +1123,9 @@ mod geometric_pyo3_impl {
         })?;
 
         if let Some(ref path) = constraint_path {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(ref path) = hessian_analytic_path {
             let _ = std::fs::remove_file(path);
         }
 

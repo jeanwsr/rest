@@ -7,6 +7,8 @@ pub mod xc_deriv;
 pub mod num_int;
 pub mod parse_xc;
 pub mod response;
+pub mod numint_matmul;
+pub mod xceff;
 
 #[cfg(feature = "mpi")]
 use mpi::collective::SystemOperation;
@@ -3502,6 +3504,65 @@ impl Grids {
 
         } else {
             return global_grid
+        }
+    }
+
+    /// Build a grid using the same atom-grid machinery as [`Grids::build`], but with an explicit
+    /// `level` override (instead of `mol.ctrl.grid_gen_level`).
+    ///
+    /// This is used by the `analdrv` module to generate skeleton / cphf grids at levels
+    /// that may differ from the SCF DFT grid. Unlike [`Grids::build`], this skips the
+    /// `external_grids` path and MPI distribution, and does not apply the round-robin permutation.
+    pub fn build_with_level(mol: &Molecule, level: usize) -> Grids {
+        let radial_precision = mol.ctrl.radial_precision;
+        let min_num_angular_points: usize = mol.ctrl.min_num_angular_points;
+        let max_num_angular_points: usize = mol.ctrl.max_num_angular_points;
+        let hardness: usize = mol.ctrl.hardness;
+        let pruning: String = mol.ctrl.pruning.clone();
+        let rad_grid_method: String = mol.ctrl.rad_grid_method.clone();
+
+        let mass_charge = get_mass_charge(&mol.geom.rg_elem);
+        let proton_charges: Vec<i32> = mass_charge.iter().map(|value| value.1 as i32).collect();
+        let center_coordinates_bohr = mol.geom.to_numgrid_io();
+        let mut alpha_max: Vec<f64> = vec![];
+        let mut alpha_min: Vec<HashMap<usize, f64>> = vec![];
+        mol.basis4elem.iter().for_each(|value| {
+            let (tmp_alpha_min, tmp_alpha_max) = value.to_numgrid_io();
+            alpha_max.push(tmp_alpha_max);
+            alpha_min.push(tmp_alpha_min);
+        });
+
+        let mut coordinates: Vec<[f64; 3]> = vec![];
+        let mut weights: Vec<f64> = vec![];
+        alpha_min.iter().zip(alpha_max.iter()).enumerate().for_each(|(center_index, value)| {
+            let (rs_atom, ws_atom) = gen_grids::atom_grid(
+                value.0.clone(),
+                value.1.clone(),
+                radial_precision,
+                min_num_angular_points,
+                max_num_angular_points,
+                proton_charges.clone(),
+                center_index,
+                center_coordinates_bohr.clone(),
+                hardness,
+                pruning.clone(),
+                rad_grid_method.clone(),
+                level,
+            );
+            coordinates.extend(rs_atom.iter().map(|value| [value.0, value.1, value.2]));
+            weights.extend(ws_atom);
+        });
+
+        Grids {
+            weights,
+            coordinates,
+            ao: None,
+            aop: None,
+            parallel_balancing: Vec::new(),
+            non0tab: None,
+            ao_cutoff: 0.0,
+            ao_compressed: None,
+            aop_compressed: None,
         }
     }
 

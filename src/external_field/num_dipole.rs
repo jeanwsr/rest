@@ -71,8 +71,8 @@ mod debug {
      print_level =          2
      job_type =             "numerical dipole"
      xc =                   "hf"
-     basis_path =           "basis-set-pool/def2-TZVP"
-     auxbas_path =          "basis-set-pool/def2-SVP-JKFIT"
+     basis_path =           "def2-TZVP"
+     auxbas_path =          "def2-universal-JKFIT"
      guessfile =            "none"
      charge =               0.0
      spin =                 1.0
@@ -102,8 +102,8 @@ mod debug {
 [ctrl]
      print_level =          2
      xc =                   "hf"
-     basis_path =           "basis-set-pool/def2-TZVP"
-     auxbas_path =          "basis-set-pool/def2-SV(P)-JKFIT"
+     basis_path =           "def2-TZVP"
+     auxbas_path =          "def2-SV(P)-JKFIT"
      guessfile =            "none"
      charge =               0.0
      spin =                 1.0

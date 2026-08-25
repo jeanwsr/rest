@@ -48,6 +48,8 @@
 //! 
 #![allow(unused)]
 #![allow(non_snake_case)]
+#![allow(mixed_script_confusables)]
+#![allow(confusable_idents)]
 extern crate rest_tensors as tensors;
 extern crate hdf5_metno as hdf5;
 extern crate chrono as time;
@@ -55,7 +57,7 @@ extern crate anyhow;
 extern crate lazy_static;
 pub mod basis_io;
 pub mod constants;
-pub mod check_norm;
+pub mod solvers;
 pub mod ctrl_io;
 pub mod dft;
 pub mod geom_io;
@@ -69,6 +71,8 @@ pub mod external_field;
 pub mod mpi_io;
 pub mod grad;
 pub mod hessian;
+pub mod symmetry;
+pub mod thermo;
 pub mod post_scf_analysis;
 pub mod main_driver;
 pub mod ri_jk;
@@ -81,6 +85,8 @@ pub mod ri_tddft;
 pub mod fileop;
 pub mod ri_cphf;
 pub mod lib_rint;
+pub mod x2c;
+pub mod analdrv;
 
 //extern crate rest;
 

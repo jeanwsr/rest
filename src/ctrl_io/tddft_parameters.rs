@@ -5,27 +5,27 @@ pub struct TDDFTParameters {
     pub tddft_method: String,       // "tda" or "lr" (full linear response)
     pub tddft_spin: String,         // "singlet" or "triplet"
     pub nroots: usize,              // number of excitation energies to compute
-    pub davidson_tol: f64,          // Davidson convergence threshold
+    pub davidson_tol: f64,          // Davidson convergence: ||r|| < sqrt(tol), |de| < tol
     pub davidson_max_iter: usize,   // maximum Davidson iterations
     pub davidson_max_subspace: usize, // maximum subspace dimension multiplier
-    // Damped (frequency-domain) TDDFT controls
-    pub damped_tddft: bool,         // enable damped TDDFT response calculation
-    pub damped_tddft_solver: String, // "pople", "gmres", "klopper", or "dense"
-    pub damped_tddft_tol: f64,      // iterative solver convergence tolerance
-    pub damped_tddft_max_iter: usize, // maximum iterations for iterative solver
+    // Response (frequency-domain) TDDFT controls
+    pub response_tddft: bool,         // enable response TDDFT calculation
+    pub response_tddft_solver: String, // "pople", "gmres", "klopper", or "dense"
+    pub response_tddft_tol: f64,      // iterative solver convergence tolerance
+    pub response_tddft_max_iter: usize, // maximum iterations for iterative solver
     pub external_field_freq: f64,   // external field frequency ω (Hartree)
     pub lifetime_gamma: f64,        // lifetime broadening γ (Hartree)
-    // Damped TDDFT grid sampling parameters (for Polarized_Density_Grids.txt export)
-    pub damped_tddft_x_start: f64,
-    pub damped_tddft_x_end: f64,
-    pub damped_tddft_x_points: usize,
-    pub damped_tddft_y_start: f64,
-    pub damped_tddft_y_end: f64,
-    pub damped_tddft_y_points: usize,
-    pub damped_tddft_z_start: f64,
-    pub damped_tddft_z_end: f64,
-    pub damped_tddft_z_points: usize,
-    pub damped_tddft_grids: Vec<[f64; 3]>,
+    // Response TDDFT grid sampling parameters (for Polarized_Density_Grids.txt export)
+    pub response_tddft_x_start: f64,
+    pub response_tddft_x_end: f64,
+    pub response_tddft_x_points: usize,
+    pub response_tddft_y_start: f64,
+    pub response_tddft_y_end: f64,
+    pub response_tddft_y_points: usize,
+    pub response_tddft_z_start: f64,
+    pub response_tddft_z_end: f64,
+    pub response_tddft_z_points: usize,
+    pub response_tddft_grids: Vec<[f64; 3]>,
     // FEAST solver controls
     pub tddft_feast_solver: bool,
     pub tddft_feast_eigenrange_min: f64,
@@ -41,6 +41,10 @@ pub struct TDDFTParameters {
     pub tddft_feast_gaussian_width_factor: f64,
     // Use optimized (rayon-parallel) fxc_matvec kernel
     pub tddft_use_optimized_fxc: bool,
+    // Virtual orbital energy cutoff (Hartree); orbitals with KS eigenvalue
+    // above this are excluded from the TDDFT excitation space. Default 1e6
+    // (effectively no cutoff).
+    pub tddft_cutoff_energy: f64,
 }
 
 impl Default for TDDFTParameters {
@@ -49,25 +53,25 @@ impl Default for TDDFTParameters {
             tddft_method: String::from("lr"),
             tddft_spin: String::from("singlet"),
             nroots: 6,
-            davidson_tol: 1.0e-6,
+            davidson_tol: 1.0e-10,
             davidson_max_iter: 50,
             davidson_max_subspace: 8,
-            damped_tddft: false,
-            damped_tddft_solver: String::from("klopper"),
-            damped_tddft_tol: 1.0e-6,
-            damped_tddft_max_iter: 200,
+            response_tddft: false,
+            response_tddft_solver: String::from("klopper"),
+            response_tddft_tol: 1.0e-6,
+            response_tddft_max_iter: 200,
             external_field_freq: 0.5,
             lifetime_gamma: 0.001,
-            damped_tddft_x_start: 0.0,
-            damped_tddft_x_end: 1.0,
-            damped_tddft_x_points: 2,
-            damped_tddft_y_start: 0.0,
-            damped_tddft_y_end: 1.0,
-            damped_tddft_y_points: 2,
-            damped_tddft_z_start: 0.0,
-            damped_tddft_z_end: 1.0,
-            damped_tddft_z_points: 2,
-            damped_tddft_grids: Vec::new(),
+            response_tddft_x_start: 0.0,
+            response_tddft_x_end: 1.0,
+            response_tddft_x_points: 2,
+            response_tddft_y_start: 0.0,
+            response_tddft_y_end: 1.0,
+            response_tddft_y_points: 2,
+            response_tddft_z_start: 0.0,
+            response_tddft_z_end: 1.0,
+            response_tddft_z_points: 2,
+            response_tddft_grids: Vec::new(),
             tddft_feast_solver: false,
             tddft_feast_eigenrange_min: 0.0,
             tddft_feast_eigenrange_max: 0.5,
@@ -81,6 +85,7 @@ impl Default for TDDFTParameters {
             tddft_feast_init_guess_type: String::from("random"),
             tddft_feast_gaussian_width_factor: 0.5,
             tddft_use_optimized_fxc: true,
+            tddft_cutoff_energy: 1.0e6,
         }
     }
 }
@@ -102,8 +107,8 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
                 _ => 6,
             };
             p.davidson_tol = match tmp_ctrl.get("davidson_tol").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-6),
-                _ => 1.0e-6,
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-10),
+                _ => 1.0e-10,
             };
             p.davidson_max_iter = match tmp_ctrl.get("davidson_max_iter").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(50) as usize,
@@ -113,20 +118,20 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(8) as usize,
                 _ => 8,
             };
-            // Damped TDDFT parameters
-            p.damped_tddft = match tmp_ctrl.get("damped_tddft").unwrap_or(&serde_json::Value::Null) {
+            // Response TDDFT parameters
+            p.response_tddft = match tmp_ctrl.get("response_tddft").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(b) => *b,
                 _ => false,
             };
-            p.damped_tddft_solver = match tmp_ctrl.get("damped_tddft_solver").unwrap_or(&serde_json::Value::Null) {
+            p.response_tddft_solver = match tmp_ctrl.get("response_tddft_solver").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.to_lowercase(),
                 _ => String::from("klopper"),
             };
-            p.damped_tddft_tol = match tmp_ctrl.get("damped_tddft_tol").unwrap_or(&serde_json::Value::Null) {
+            p.response_tddft_tol = match tmp_ctrl.get("response_tddft_tol").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-6),
                 _ => 1.0e-6,
             };
-            p.damped_tddft_max_iter = match tmp_ctrl.get("damped_tddft_max_iter").unwrap_or(&serde_json::Value::Null) {
+            p.response_tddft_max_iter = match tmp_ctrl.get("response_tddft_max_iter").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(200) as usize,
                 _ => 200,
             };
@@ -138,65 +143,65 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),
                 _ => 0.001,
             };
-            // Damped TDDFT grid sampling parameters
-            p.damped_tddft_x_start = match tmp_ctrl.get("damped_tddft_x_start").unwrap_or(&serde_json::Value::Null) {
+            // Response TDDFT grid sampling parameters
+            p.response_tddft_x_start = match tmp_ctrl.get("response_tddft_x_start").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
                 _ => 0.0,
             };
-            p.damped_tddft_x_end = match tmp_ctrl.get("damped_tddft_x_end").unwrap_or(&serde_json::Value::Null) {
+            p.response_tddft_x_end = match tmp_ctrl.get("response_tddft_x_end").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0),
                 _ => 1.0,
             };
-            p.damped_tddft_x_points = match tmp_ctrl.get("damped_tddft_x_points").unwrap_or(&serde_json::Value::Null) {
+            p.response_tddft_x_points = match tmp_ctrl.get("response_tddft_x_points").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(2) as usize,
                 _ => 2,
             };
-            p.damped_tddft_y_start = match tmp_ctrl.get("damped_tddft_y_start").unwrap_or(&serde_json::Value::Null) {
+            p.response_tddft_y_start = match tmp_ctrl.get("response_tddft_y_start").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
                 _ => 0.0,
             };
-            p.damped_tddft_y_end = match tmp_ctrl.get("damped_tddft_y_end").unwrap_or(&serde_json::Value::Null) {
+            p.response_tddft_y_end = match tmp_ctrl.get("response_tddft_y_end").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0),
                 _ => 1.0,
             };
-            p.damped_tddft_y_points = match tmp_ctrl.get("damped_tddft_y_points").unwrap_or(&serde_json::Value::Null) {
+            p.response_tddft_y_points = match tmp_ctrl.get("response_tddft_y_points").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(2) as usize,
                 _ => 2,
             };
-            p.damped_tddft_z_start = match tmp_ctrl.get("damped_tddft_z_start").unwrap_or(&serde_json::Value::Null) {
+            p.response_tddft_z_start = match tmp_ctrl.get("response_tddft_z_start").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
                 _ => 0.0,
             };
-            p.damped_tddft_z_end = match tmp_ctrl.get("damped_tddft_z_end").unwrap_or(&serde_json::Value::Null) {
+            p.response_tddft_z_end = match tmp_ctrl.get("response_tddft_z_end").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0),
                 _ => 1.0,
             };
-            p.damped_tddft_z_points = match tmp_ctrl.get("damped_tddft_z_points").unwrap_or(&serde_json::Value::Null) {
+            p.response_tddft_z_points = match tmp_ctrl.get("response_tddft_z_points").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(2) as usize,
                 _ => 2,
             };
             // Generate grids: OUTER LOOP X, MIDDLE LOOP Y, INNER LOOP Z
-            let x_step = if p.damped_tddft_x_points > 1 {
-                (p.damped_tddft_x_end - p.damped_tddft_x_start) / (p.damped_tddft_x_points - 1) as f64
+            let x_step = if p.response_tddft_x_points > 1 {
+                (p.response_tddft_x_end - p.response_tddft_x_start) / (p.response_tddft_x_points - 1) as f64
             } else { 0.0 };
-            let y_step = if p.damped_tddft_y_points > 1 {
-                (p.damped_tddft_y_end - p.damped_tddft_y_start) / (p.damped_tddft_y_points - 1) as f64
+            let y_step = if p.response_tddft_y_points > 1 {
+                (p.response_tddft_y_end - p.response_tddft_y_start) / (p.response_tddft_y_points - 1) as f64
             } else { 0.0 };
-            let z_step = if p.damped_tddft_z_points > 1 {
-                (p.damped_tddft_z_end - p.damped_tddft_z_start) / (p.damped_tddft_z_points - 1) as f64
+            let z_step = if p.response_tddft_z_points > 1 {
+                (p.response_tddft_z_end - p.response_tddft_z_start) / (p.response_tddft_z_points - 1) as f64
             } else { 0.0 };
-            let mut grids = Vec::with_capacity(p.damped_tddft_x_points * p.damped_tddft_y_points * p.damped_tddft_z_points);
-            for ix in 0..p.damped_tddft_x_points {
-                let x = p.damped_tddft_x_start + ix as f64 * x_step;
-                for iy in 0..p.damped_tddft_y_points {
-                    let y = p.damped_tddft_y_start + iy as f64 * y_step;
-                    for iz in 0..p.damped_tddft_z_points {
-                        let z = p.damped_tddft_z_start + iz as f64 * z_step;
+            let mut grids = Vec::with_capacity(p.response_tddft_x_points * p.response_tddft_y_points * p.response_tddft_z_points);
+            for ix in 0..p.response_tddft_x_points {
+                let x = p.response_tddft_x_start + ix as f64 * x_step;
+                for iy in 0..p.response_tddft_y_points {
+                    let y = p.response_tddft_y_start + iy as f64 * y_step;
+                    for iz in 0..p.response_tddft_z_points {
+                        let z = p.response_tddft_z_start + iz as f64 * z_step;
                         grids.push([x, y, z]);
                     }
                 }
             }
-            p.damped_tddft_grids = grids;
+            p.response_tddft_grids = grids;
             // FEAST solver parameters
             p.tddft_feast_solver = match tmp_ctrl.get("tddft_feast_solver").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(b) => *b,
@@ -250,6 +255,11 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
             p.tddft_use_optimized_fxc = match tmp_ctrl.get("tddft_use_optimized_fxc").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(b) => *b,
                 _ => true,
+            };
+            // Virtual orbital energy cutoff
+            p.tddft_cutoff_energy = match tmp_ctrl.get("tddft_cutoff_energy").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e6),
+                _ => 1.0e6,
             };
             Ok(Some(p))
         },

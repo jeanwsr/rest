@@ -7,9 +7,10 @@
 
 use num_traits::{ToPrimitive};
 use tensors::MatrixFull;
-//use super::parameters::{SG1RADII, BOHR, BRAGG0, LEBEDEV_NGRID};
+//use super::parameters::{SG1RADII, BRAGG0, LEBEDEV_NGRID};
 use crate::{dft::Grids, utilities::balancing};
-use super::{parameters::{SG1RADII, BOHR, BRAGG0, LEBEDEV_NGRID}, atom::default_angular_num};
+use crate::constants::BOHR;
+use super::{parameters::{SG1RADII, BRAGG0, LEBEDEV_NGRID}, atom::default_angular_num};
 
 /// Standard Grid 1 according to _P. M. W. Gill, B. G. Johnson, J. A. Pople. Chemical Physics Letters 209, 506-512 (1993)_.<br>
 /// Reference can be found [here](https://doi.org/10.1016/0009-2614(93)80125-9).

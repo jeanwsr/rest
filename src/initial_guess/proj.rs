@@ -95,13 +95,13 @@ pub fn check_proj_sanity(mol_target: &Molecule, mol_source: &Molecule) -> bool {
         println!("CintType mismatch between target and source molecule (target: {:?}, source: {:?})", mol_target.cint_type, mol_source.cint_type);
         san = false;
     }
-    if mol_target.start_mo != mol_source.start_mo {
-        println!("start_mo mismatch between target and source molecule (target: {}, source: {})", mol_target.start_mo, mol_source.start_mo);
+    if mol_target.ecp_electrons != mol_source.ecp_electrons {
+        println!("ecp_electrons mismatch between target and source molecule (target: {}, source: {})", mol_target.ecp_electrons, mol_source.ecp_electrons);
         san = false;
     }
-    if mol_target.has_ecp() != mol_source.has_ecp() {
-        println!("ECP presence mismatch between target and source molecule (target has ECP: {}, source has ECP: {})", mol_target.has_ecp(), mol_source.has_ecp());
-        san = false;
-    }
+    // if mol_target.has_ecp() != mol_source.has_ecp() {
+    //     println!("ECP presence mismatch between target and source molecule (target has ECP: {}, source has ECP: {})", mol_target.has_ecp(), mol_source.has_ecp());
+    //     san = false;
+    // }
     san
 }

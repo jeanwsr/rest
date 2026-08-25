@@ -3,13 +3,13 @@ use crate::mpi_io::MPIOperator;
 use std::path::Path;
 use rest_libcint::rest_libcint_wrapper::int1e_r;
 use tensors::{MathMatrix, MatrixFull, RIFull,MatrixFullSlice};
-use crate::constants::{ANG, AU2DEBYE, SPECIES_INFO};
+use crate::constants::{AU2DEBYE, SPECIES_INFO};
 use itertools::Itertools;
 use crate::ri_gw::get_occupation_parameters;
 use std::f64::consts::SQRT_2;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgeev, _dgemv,_dgemm_full,_dsolve};
 use crate::ri_bse;
-use crate::ri_bse::davidson_solver::{dot_product,num_product,vector_scaled_add};
+use crate::solvers::davidson::{dot_product,num_product,vector_scaled_add};
 use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
 use rayon::prelude::*;
 use std::time::Instant;
@@ -275,22 +275,22 @@ pub fn calculate_residue(u_vecs:&Vec<(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)>,w_ve
     });
     fourvec_dot_product(&residue,&residue).sqrt()
 }
-pub fn damped_bse(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
+pub fn response_bse(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    match qp_ctrl.damped_bse_solver.as_str() {
-        "pople" => damped_bse_pople(scf_data),
-        "gmres" => damped_bse_gmres(scf_data),
-        "klopper" => damped_bse_klopper(scf_data),
-        "dense" => damped_bse_dense(scf_data),
-        other => panic!("Invalid damped_bse_solver: \"{}\". Expected \"pople\", \"gmres\", \"dense\", or \"klopper\".", other),
+    match qp_ctrl.response_bse_solver.as_str() {
+        "pople" => response_bse_pople(scf_data),
+        "gmres" => response_bse_gmres(scf_data),
+        "klopper" => response_bse_klopper(scf_data),
+        "dense" => response_bse_dense(scf_data),
+        other => panic!("Invalid response_bse_solver: \"{}\". Expected \"pople\", \"gmres\", \"dense\", or \"klopper\".", other),
     }
 }
 
-pub fn damped_bse_pople(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
+pub fn response_bse_pople(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let inverse_dielectric=ri_bse::construct_inverse_dielectric(scf_data,&scf_data.eigenvalues[0]);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    println!("Now begins damped BSE calculation (Pople). Parameters:\nOcc Size={},Vir Size={},External Field Freq={},Lifetime Gamma={}",occ_size,vir_size,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma);
+    println!("Now begins response BSE calculation (Pople). Parameters:\nOcc Size={},Vir Size={},External Field Freq={},Lifetime Gamma={}",occ_size,vir_size,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma);
     let mu_z_vec=compute_mu_z_vec(scf_data);
     let ri_oo=ri_bse::get_submatrix(scf_data,'O','O','N');
     println!("num_auxbas={}",ri_oo.size[0]);
@@ -335,7 +335,7 @@ pub fn damped_bse_pople(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
         (apply_inv(&z.0,&diag_13),apply_inv(&z.1,&diag_24),
          apply_inv(&z.2,&diag_13),apply_inv(&z.3,&diag_24))
     };
-    let result=poples_numerical_trick(&p0,|z|wrapped_update_w(&z),|z|precond(&z),qp_ctrl.damped_bse_tol,qp_ctrl.damped_bse_max_iter);
+    let result=poples_numerical_trick(&p0,|z|wrapped_update_w(&z),|z|precond(&z),qp_ctrl.response_bse_tol,qp_ctrl.response_bse_max_iter);
     let density_real:Vec<f64>=(0..occ_size*vir_size).map(|ia|result.0[ia]-result.1[ia]).collect();
     let polarized_density_matrix=MatrixFull::from_vec([occ_size,vir_size],density_real).unwrap();
     export_density(scf_data,&polarized_density_matrix,&qp_ctrl);
@@ -351,7 +351,7 @@ fn export_density(scf_data:&SCF,polarized_density_matrix:&MatrixFull<f64>,qp_ctr
     _dgemm_full(&first_prod,'N',&vir_eigenvecs,'T',&mut ao_polarized_density_matrix,1.0,0.0);
     let mut file = OpenOptions::new().write(true).create(true).truncate(true).open("AO_Polarized_Density_Matrix.txt").expect("open failure");
     writeln!(file, "AO Basis Polarized Density Matrix:\nSize:{:?}\nData(Column Major){:#?}",ao_polarized_density_matrix.size,ao_polarized_density_matrix.data).expect("write failure");
-    let grids = &qp_ctrl.damped_bse_grids;
+    let grids = &qp_ctrl.response_bse_grids;
     let grid_val=eval_ao_on_grids(&scf_data.mol,&grids);
     //grid_val.formated_output(1000,"full");
     let mut first_prod=MatrixFull::new([num_state,grids.len()],0.0);
@@ -367,7 +367,7 @@ fn export_density(scf_data:&SCF,polarized_density_matrix:&MatrixFull<f64>,qp_ctr
 
     // Header
     writeln!(file, "{}", "=".repeat(70)).expect("write failure");
-    writeln!(file, "POLARIZED DENSITY ON SPATIAL GRIDS (damped BSE result)").expect("write failure");
+    writeln!(file, "POLARIZED DENSITY ON SPATIAL GRIDS (response BSE result)").expect("write failure");
     writeln!(file, "{}", "=".repeat(70)).expect("write failure");
 
     // Molecular geometry information
@@ -389,12 +389,12 @@ fn export_density(scf_data:&SCF,polarized_density_matrix:&MatrixFull<f64>,qp_ctr
     writeln!(file, "GRID SAMPLING INFORMATION").expect("write failure");
     writeln!(file, "{}", "-".repeat(70)).expect("write failure");
     writeln!(file, "{}", "=".repeat(70)).expect("write failure");
-    writeln!(file, "X start: {:.8e}  X end: {:.8e}  X points: {:>6}", qp_ctrl.damped_bse_x_start, qp_ctrl.damped_bse_x_end, qp_ctrl.damped_bse_x_points).expect("write failure");
-    writeln!(file, "Y start: {:.8e}  Y end: {:.8e}  Y points: {:>6}", qp_ctrl.damped_bse_y_start, qp_ctrl.damped_bse_y_end, qp_ctrl.damped_bse_y_points).expect("write failure");
-    writeln!(file, "Z start: {:.8e}  Z end: {:.8e}  Z points: {:>6}", qp_ctrl.damped_bse_z_start, qp_ctrl.damped_bse_z_end, qp_ctrl.damped_bse_z_points).expect("write failure");
-    let x_step = if qp_ctrl.damped_bse_x_points > 1 { (qp_ctrl.damped_bse_x_end - qp_ctrl.damped_bse_x_start) / (qp_ctrl.damped_bse_x_points - 1) as f64 } else { 0.0 };
-    let y_step = if qp_ctrl.damped_bse_y_points > 1 { (qp_ctrl.damped_bse_y_end - qp_ctrl.damped_bse_y_start) / (qp_ctrl.damped_bse_y_points - 1) as f64 } else { 0.0 };
-    let z_step = if qp_ctrl.damped_bse_z_points > 1 { (qp_ctrl.damped_bse_z_end - qp_ctrl.damped_bse_z_start) / (qp_ctrl.damped_bse_z_points - 1) as f64 } else { 0.0 };
+    writeln!(file, "X start: {:.8e}  X end: {:.8e}  X points: {:>6}", qp_ctrl.response_bse_x_start, qp_ctrl.response_bse_x_end, qp_ctrl.response_bse_x_points).expect("write failure");
+    writeln!(file, "Y start: {:.8e}  Y end: {:.8e}  Y points: {:>6}", qp_ctrl.response_bse_y_start, qp_ctrl.response_bse_y_end, qp_ctrl.response_bse_y_points).expect("write failure");
+    writeln!(file, "Z start: {:.8e}  Z end: {:.8e}  Z points: {:>6}", qp_ctrl.response_bse_z_start, qp_ctrl.response_bse_z_end, qp_ctrl.response_bse_z_points).expect("write failure");
+    let x_step = if qp_ctrl.response_bse_x_points > 1 { (qp_ctrl.response_bse_x_end - qp_ctrl.response_bse_x_start) / (qp_ctrl.response_bse_x_points - 1) as f64 } else { 0.0 };
+    let y_step = if qp_ctrl.response_bse_y_points > 1 { (qp_ctrl.response_bse_y_end - qp_ctrl.response_bse_y_start) / (qp_ctrl.response_bse_y_points - 1) as f64 } else { 0.0 };
+    let z_step = if qp_ctrl.response_bse_z_points > 1 { (qp_ctrl.response_bse_z_end - qp_ctrl.response_bse_z_start) / (qp_ctrl.response_bse_z_points - 1) as f64 } else { 0.0 };
     writeln!(file, "X step: {:.8e}  Y step: {:.8e}  Z step: {:.8e}", x_step, y_step, z_step).expect("write failure");
     writeln!(file, "Total grid points: {}", grids.len()).expect("write failure");
 
@@ -417,11 +417,11 @@ fn export_density(scf_data:&SCF,polarized_density_matrix:&MatrixFull<f64>,qp_ctr
     writeln!(file, "END OF FILE").expect("write failure");
     writeln!(file, "{}", "=".repeat(70)).expect("write failure");
 }
-pub fn damped_bse_dense(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
+pub fn response_bse_dense(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let inverse_dielectric=ri_bse::construct_inverse_dielectric(scf_data,&scf_data.eigenvalues[0]);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    println!("Now begins damped BSE calculation. Parameters:\nOcc Size={},Vir Size={},External Field Freq={},Lifetime Gamma={}",occ_size,vir_size,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma);
+    println!("Now begins response BSE calculation. Parameters:\nOcc Size={},Vir Size={},External Field Freq={},Lifetime Gamma={}",occ_size,vir_size,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma);
     let mu_z_vec=compute_mu_z_vec(scf_data);
     let a=ri_bse::construct_submat_a(scf_data,&inverse_dielectric,&scf_data.gwqp.0, 'R');
     let b=ri_bse::construct_submat_b(scf_data,'R',&inverse_dielectric);
@@ -471,11 +471,11 @@ pub fn damped_bse_dense(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     writeln!(file, "Polarized Density Matrix(X):\n{:#?}\n(Y):{:#?}", solution.0,solution.1).expect("write failure");
     solution
 }
-pub fn damped_bse_gmres(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
+pub fn response_bse_gmres(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let inverse_dielectric=ri_bse::construct_inverse_dielectric(scf_data,&scf_data.eigenvalues[0]);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    println!("Now begins damped BSE calculation. Parameters:\nOcc Size={},Vir Size={},External Field Freq={},Lifetime Gamma={}",occ_size,vir_size,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma);
+    println!("Now begins response BSE calculation. Parameters:\nOcc Size={},Vir Size={},External Field Freq={},Lifetime Gamma={}",occ_size,vir_size,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma);
     let mu_z_vec=compute_mu_z_vec(scf_data);
     let ri_oo=ri_bse::get_submatrix(scf_data,'O','O','N');
     println!("num_auxbas={}",ri_oo.size[0]);
@@ -539,7 +539,7 @@ pub fn damped_bse_gmres(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     };
     let mu_z_vec=compute_mu_z_vec(scf_data);
     let rhs_p=(mu_z_vec.clone(),mu_z_vec.clone(),vec![0.0;occ_size*vir_size],vec![0.0;occ_size*vir_size]);
-    let solution=fourvec_gmres(&gmres_matvec,&precond,&rhs_p,qp_ctrl.damped_bse_tol,qp_ctrl.damped_bse_max_iter);
+    let solution=fourvec_gmres(&gmres_matvec,&precond,&rhs_p,qp_ctrl.response_bse_tol,qp_ctrl.response_bse_max_iter);
     let density_real:Vec<f64>=(0..occ_size*vir_size).map(|ia|solution.0[ia]+solution.1[ia]).collect();
     let polarized_density_matrix=MatrixFull::from_vec([occ_size,vir_size],density_real).unwrap();
     export_density(scf_data,&polarized_density_matrix,&qp_ctrl);
@@ -714,11 +714,11 @@ pub fn klopper_subspace_solver(
     (vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n])
 }
 
-pub fn damped_bse_klopper(scf_data: &SCF) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+pub fn response_bse_klopper(scf_data: &SCF) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) = get_occupation_parameters(scf_data, 'N');
     let inverse_dielectric = ri_bse::construct_inverse_dielectric(scf_data, &scf_data.eigenvalues[0]);
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    println!("Now begins damped BSE calculation (Klopper Subspace Solver). Parameters:\nOcc Size={}, Vir Size={}, External Field Freq={}, Lifetime Gamma={}",
+    println!("Now begins response BSE calculation (Klopper Subspace Solver). Parameters:\nOcc Size={}, Vir Size={}, External Field Freq={}, Lifetime Gamma={}",
              occ_size, vir_size, qp_ctrl.external_field_freq, qp_ctrl.lifetime_gamma);
     let mu_z_vec = compute_mu_z_vec(scf_data);
     let ri_oo = ri_bse::get_submatrix(scf_data, 'O', 'O', 'N');
@@ -795,7 +795,7 @@ pub fn damped_bse_klopper(scf_data: &SCF) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<
 
     // Run the subspace solver
     let solution = klopper_subspace_solver(&gmres_matvec, &precond, &rhs, &p0,
-                                           qp_ctrl.damped_bse_tol, qp_ctrl.damped_bse_max_iter);
+                                           qp_ctrl.response_bse_tol, qp_ctrl.response_bse_max_iter);
 
     let density_real: Vec<f64> = (0..occ_size * vir_size).map(|ia| solution.0[ia] + solution.1[ia]).collect();
     let polarized_density_matrix = MatrixFull::from_vec([occ_size, vir_size], density_real).unwrap();

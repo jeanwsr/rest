@@ -1,7 +1,7 @@
 #![warn(unused_imports)]
 use crate::basis_io::ecp::ghost_effective_potential_matrix;
-use crate::check_norm::force_state_occupation::adapt_occupation_with_force_projection;
-use crate::check_norm::{self, generate_occupation_frac_occ, generate_occupation_integer, generate_occupation_sad, OCCType};
+use self::force_state_occupation::adapt_occupation_with_force_projection;
+use self::occupation::{generate_occupation_frac_occ, generate_occupation_integer, generate_occupation_sad, OCCType};
 use crate::dft::gen_grids::prune::prune_by_rho;
 use crate::dft::{DFTType, Grids};
 use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges};
@@ -14,16 +14,20 @@ use crate::ctrl_io::ri_jk_io::*;
 
 mod addons;
 mod fchk;
+pub mod print;
 mod pyrest_scf_io;
+pub mod scfrecord;
 pub mod smear;
 pub mod util;
+pub mod occupation;
+pub mod force_state_occupation;
 
 #[cfg(feature = "mpi")]
 use mpi::collective::SystemOperation;
 use pyo3::{pyclass};
-use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemv, _dspgvx, _dsymm, _dsyrk, _hamiltonian_fast_solver, _power_rayon_for_symmetric_matrix, _dsyevd, _pinv, _get_sqrt_and_inv_sqrt};
-use tensors::{map_upper_to_full, BasicMatUp, BasicMatrix, ERIFold4, MathMatrix, MatrixFull, MatrixFullSlice, MatrixUpper, MatrixUpperSlice, RIFull, TensorSliceMut};
-use tensors::{TensorOpt,TensorOptMut,TensorSlice};
+use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemv, _dspgvx, _dsymm, _dsyrk, _hamiltonian_fast_solver, _power_rayon_for_symmetric_matrix, _dsyevd};
+use tensors::{map_upper_to_full, BasicMatrix, ERIFold4, MathMatrix, MatrixFull, MatrixFullSlice, MatrixUpper, MatrixUpperSlice, RIFull, TensorSliceMut};
+use tensors::{TensorOpt, TensorSlice};
 use itertools::{Itertools};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -35,11 +39,18 @@ use crate::initial_guess::{initial_guess, update_basis_from_hdf5chk};
 use crate::external_libs::dftd;
 use crate::constants::{SQRT_THRESHOLD};
 use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
+use crate::x2c::RelativisticMethod;
 use crate::ri_jk;
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
-use self::util::{occupied_orbital_count, integer_homo_lumo};
+use log::{debug, info, trace, warn};
+use scfrecord::ScfTraceRecord;
+use self::util::occupied_orbital_count;
+use self::util::norm;
 use smear::apply_smearing;
 use smear::annealed_sigma;
+
+#[allow(unused_imports)]
+use tensors::BasicMatUp;
 
 #[pyclass]
 #[derive(Clone)]
@@ -88,6 +99,7 @@ pub struct SCF {
     pub scf_energy: f64,
     pub smearing_entropy: f64,
     pub current_smear_sigma: f64,
+    pub grad_dm: [MatrixFull<f64>; 2],
     pub grids: Option<Grids>,
     pub empirical_dispersion_energy: f64,
     pub energies: HashMap<String,Vec<f64>>,
@@ -148,6 +160,7 @@ impl SCF {
             scf_energy: 0.0,
             smearing_entropy: 0.0,
             current_smear_sigma: 0.0,
+            grad_dm: [MatrixFull::empty(), MatrixFull::empty()],
             empirical_dispersion_energy: 0.0,
             grids: None,
             energies: HashMap::new(),
@@ -168,9 +181,9 @@ impl SCF {
         };
         match &scf_data.scftype {
             SCFType::RHF => {
-                if mol.ctrl.print_level>0 {println!("Restricted Hartree-Fock (or Kohn-Sham) algorithm is invoked.")}},
+                info!("Restricted Hartree-Fock (or Kohn-Sham) algorithm is invoked.")},
             SCFType::ROHF => {
-                if mol.ctrl.print_level>0 {println!("Restricted open shell Hartree-Fock (or Kohn-Sham) algorithm is invoked.")};
+                info!("Restricted open shell Hartree-Fock (or Kohn-Sham) algorithm is invoked.");
                 // In ROHF, although the Roothaan Fock matrix is not separated into alpha and beta spin channels, 
                 // it is derived based on the density matrices of the alpha and beta spin channels. 
                 // Therefore, even though "spin_polarization=False" is specified as input, we handle it as "spin_channel=2".
@@ -179,7 +192,7 @@ impl SCF {
                 scf_data.mol.xc_data.spin_channel=2;
             },
             SCFType::UHF => {
-                if mol.ctrl.print_level>0 {println!("Unrestricted Hartree-Fock (or Kohn-Sham) algorithm is invoked.")}
+                info!("Unrestricted Hartree-Fock (or Kohn-Sham) algorithm is invoked.")
             },
         };
 
@@ -218,7 +231,7 @@ impl SCF {
             _ => false,
         };
         let algorithm_jk = if has_ri_non_specified {
-            println!("Checking memory requirement for RI J/K algorithms...");
+            info!("Checking memory requirement for RI J/K algorithms...");
             let nao = mol.num_basis;
             let naux = mol.num_auxbas;
             // range-separate hybrid functionals requires double memory for RI integrals due to the need of both standard RI and short-range RI integrals.
@@ -229,8 +242,8 @@ impl SCF {
                 max_memory - detect_used_memory_mb("proc")
             }).unwrap_or_else(detect_available_memory_mb);
             let algorithm_jk = if mem_avail_mb  < mem_cderi_mb {
-                println!("Memory available for 1.5 times of RI integrals ({:.2} MB) is less than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
-                println!("Switch to direct RI-J/K algorithms.");
+                info!("Memory available for 1.5 times of RI integrals ({:.2} MB) is less than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
+                info!("Switch to direct RI-J/K algorithms.");
                 if algorithm_jk == AlgorithmJK::Ri {
                     AlgorithmJK::RiDirect
                 } else if let AlgorithmJK::Separated(algorithm_j, algorithm_k) = algorithm_jk {
@@ -241,8 +254,8 @@ impl SCF {
                     algorithm_jk
                 }
             } else {
-                println!("Memory available for 1.5 times of RI integrals ({:.2} MB) is more than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
-                println!("Using standard incore RI-J/K algorithms.");
+                info!("Memory available for 1.5 times of RI integrals ({:.2} MB) is more than required ({:.2} MB).", mem_avail_mb, mem_cderi_mb);
+                info!("Using standard incore RI-J/K algorithms.");
                 if algorithm_jk == AlgorithmJK::Ri {
                     AlgorithmJK::RiIncore
                 } else if let AlgorithmJK::Separated(algorithm_j, algorithm_k) = algorithm_jk {
@@ -278,14 +291,12 @@ impl SCF {
         self.nuc_energy += nuc_energy_pc;
         self.nuc_energy += nuc_energy_ext_field;
 
-        if print_level>0 {
-            println!("Nuc_energy: {:16.8} Hartree",self.nuc_energy);
-            if nuc_energy_pc.abs() > 1.0e-4 {
-                println!("External potential due to point charges exists: {:16.8} Hartree", &nuc_energy_pc);
-            }
-            if nuc_energy_ext_field.abs() > 1.0e-10 {
-                println!("External dipole field contribution to nuc energy exists: {:16.8} Hartree", &nuc_energy_ext_field);
-            }
+        info!("Nuc_energy: {:16.8} Hartree",self.nuc_energy);
+        if nuc_energy_pc.abs() > 1.0e-4 {
+            info!("External potential due to point charges exists: {:16.8} Hartree", &nuc_energy_pc);
+        }
+        if nuc_energy_ext_field.abs() > 1.0e-10 {
+            info!("External dipole field contribution to nuc energy exists: {:16.8} Hartree", &nuc_energy_ext_field);
         }
         //========================================
         // For emperial dispersion correction
@@ -306,26 +317,27 @@ impl SCF {
             } else {
                 self.mol.ctrl.empirical_dispersion.clone().unwrap()
             };
-            if self.mol.ctrl.print_level>1 { 
-                println!("The empirical dispersion energy of {} is {}.", disp_name.to_uppercase(), engy_disp)
-            };
-            if self.mol.ctrl.print_level>3 { 
-                println!("{:?}, {:?}", &grad_disp, &sigma_disp);
-            };
+            debug!("The empirical dispersion energy of {} is {}.", disp_name.to_uppercase(), engy_disp);
+            trace!("{:?}, {:?}", &grad_disp, &sigma_disp);
             self.empirical_dispersion_energy = engy_disp;
             
             // empirical dispersion energy added to the nuc_energy
             self.nuc_energy += engy_disp;
         }
         if !disp_from_ctrl && !disp_from_parse_xc {
-            if self.mol.ctrl.print_level>1 { 
-                println!("no empirical dispersion correction is employed");
-            }
+            debug!("no empirical dispersion correction is employed");
         }
         //========================================
         // For two-center integrals
         self.ovlp = self.mol.int_ij_matrixupper(String::from("ovlp"));
-        self.h_core = self.mol.int_ij_matrixupper(String::from("hcore"));
+        match self.mol.ctrl.rel {
+            RelativisticMethod::SFX2C => {
+                self.h_core = self.mol.generate_sfx2c_hamiltonian();
+            }
+            _ => {
+                self.h_core = self.mol.int_ij_matrixupper(String::from("hcore"));
+            }
+        }
         //========================================
         // For ghost effective potential
         if self.mol.geom.ghost_ep_path.len() > 0 {
@@ -335,9 +347,7 @@ impl SCF {
             );
             self.h_core.iter_mut().zip(tmp_matr.iter()).for_each(|(a,b)| *a += *b);
         } else {
-            if self.mol.ctrl.print_level > 0 {
-                println!("No ghost effective potential");
-            }
+            info!("No ghost effective potential");
         }
 
         // ========================================
@@ -353,15 +363,11 @@ impl SCF {
 
         // For the ghost point charge term
         if self.mol.geom.ghost_pc_chrg.len() > 0 {
-            if self.mol.ctrl.print_level > 0 {
-                println!("There are {} point charges specified", self.mol.geom.ghost_pc_chrg.len());
-            }
+            info!("There are {} point charges specified", self.mol.geom.ghost_pc_chrg.len());
             let tmp_matr = self.mol.int_ij_matrixupper(String::from("point charge"));
             self.h_core.iter_mut().zip(tmp_matr.iter()).for_each(|(a,b)| *a += *b);
         } else {
-            if self.mol.ctrl.print_level > 0 {
-                println!("No ghost point charges");
-            }
+            info!("No ghost point charges");
         }
 
         //========================================
@@ -462,35 +468,27 @@ impl SCF {
         // build short-range 3c RI integrals for range-separated hybrid (RSH) functionals
         if is_rsh && use_eri_jk {
             let omega = self.mol.xc_data.omega().unwrap();
-            if self.mol.ctrl.print_level > 0 {
-                println!("Building short-range 3c RI integrals for RSH (omega = {:.4})", omega);
-            }
+            info!("Building short-range 3c RI integrals for RSH (omega = {:.4})", omega);
             if ri3fn_symm {
                 // Note: SR RI omega is negative in libcint's convention.
                 self.rimatr_sr = Some(self.mol.prepare_rimatr_for_ri_v_mpi_rayon(Some(-omega), mpi_operator));
             } else {
                 self.ri3fn_sr = Some(self.mol.prepare_ri3fn_sr_rayon(omega));
             }
-            if self.mol.ctrl.print_level > 0 {
-                println!("  SR 3c integrals built.");
-            }
+            info!("  SR 3c integrals built.");
         }
 
         // initial eigenvectors and eigenvalues
         let (eigenvectors, eigenvalues,n_found)=self.ovlp.to_matrixupperslicemut().lapack_dspevx().unwrap();
 
         if (n_found as usize) < self.mol.fdqc_bas.len() {
-            if self.mol.ctrl.print_level>0 {
-                println!("Overlap matrix is singular:");
-                println!("  Using {} out of a possible {} specified basis functions",n_found, self.mol.fdqc_bas.len());
-                println!("  Lowest remaining eigenvalue: {:16.8}",eigenvalues[0]);
-            }
+            info!("Overlap matrix is singular:");
+            info!("  Using {} out of a possible {} specified basis functions",n_found, self.mol.fdqc_bas.len());
+            info!("  Lowest remaining eigenvalue: {:16.8}",eigenvalues[0]);
             self.mol.num_state = n_found as usize;
         } else {
-            if self.mol.ctrl.print_level>0 {
-                println!("Overlap matrix is nonsigular:");
-                println!("  Lowest eigenvalue: {:16.8} with the total number of basis functions: {:6}",eigenvalues[0],self.mol.num_state);
-            }
+            info!("Overlap matrix is nonsigular:");
+            info!("  Lowest eigenvalue: {:16.8} with the total number of basis functions: {:6}",eigenvalues[0],self.mol.num_state);
         };
 
 
@@ -509,9 +507,7 @@ impl SCF {
             return;
         };
 
-        if self.mol.ctrl.print_level > 0 {
-            println!("Preparing BSE-specific RI integrals with auxiliary basis: {}", bse_auxbas_path);
-        }
+        info!("Preparing BSE-specific RI integrals with auxiliary basis: {}", bse_auxbas_path);
 
         // Save original auxiliary basis information
         let original_auxbas_path = self.mol.ctrl.auxbas_path.clone();
@@ -541,20 +537,16 @@ impl SCF {
         // Restore original auxiliary basis
         self.mol.reload_auxbas(original_auxbas_path);
 
-        if self.mol.ctrl.print_level > 0 {
-            println!("BSE-specific RI integrals prepared successfully");
-            println!("BSE auxiliary basis size: {}, Regular auxiliary basis size: {}",
-                     self.num_auxbas_bse.unwrap(), original_num_auxbas);
-        }
+        info!("BSE-specific RI integrals prepared successfully");
+        info!("BSE auxiliary basis size: {}, Regular auxiliary basis size: {}",
+                 self.num_auxbas_bse.unwrap(), original_num_auxbas);
     }
 
     pub fn prepare_density_grids(&mut self) {
 
         self.grids = if self.mol.xc_data.is_dfa_scf() || self.mol.ctrl.use_isdf || self.mol.ctrl.initial_guess == "vsap" {
             let grids = Grids::build(&mut self.mol);
-            if self.mol.ctrl.print_level>0 {
-                println!("Grid size: {:}", grids.coordinates.len());
-            }
+            info!("Grid size: {:}", grids.coordinates.len());
             Some(grids)
         } else {None};
 
@@ -573,7 +565,7 @@ impl SCF {
                 if self.mol.ctrl.print_level >= 1 {
                     let (dense_bytes, comp_bytes, _) = grids.memory_footprint();
                     let ratio = if dense_bytes > 0 { comp_bytes as f64 / dense_bytes as f64 * 100.0 } else { 0.0 };
-                    println!(" [non0tab] dropping dense ao/aop, dense={:.1}GB, compressed={:.1}GB ({:.1}%)",
+                    info!(" [non0tab] dropping dense ao/aop, dense={:.1}GB, compressed={:.1}GB ({:.1}%)",
                         dense_bytes as f64 / 1e9, comp_bytes as f64 / 1e9, ratio);
                 }
                 grids.ao = None;
@@ -657,60 +649,6 @@ impl SCF {
         (self.occupation, self.homo, self.lumo) = generate_occupation_outside(&self);
     }
     
-    pub fn print_homo_lumo_gap(&self) {
-        let has_smear = self.mol.ctrl.smear.is_some();
-        let (homo_idx, lumo_idx) = if has_smear {
-            integer_homo_lumo(&self.mol.num_elec, self.mol.spin_channel)
-        } else {
-            (self.homo, self.lumo)
-        };
-        let is_rohf = match self.scftype {
-            SCFType::ROHF => true,
-            _ => false,
-        };
-        if self.mol.ctrl.print_level>0 {
-            if self.mol.spin_channel==1 {
-                let i_homo = homo_idx[0];
-                let i_lumo = lumo_idx[0];
-                let homo = self.eigenvalues[0][i_homo];
-                if i_lumo < self.eigenvalues[0].len()  {
-                    let lumo = self.eigenvalues[0][i_lumo];
-                    if has_smear {
-                        print!("(integer-occupation pure-state gap) ");
-                    }
-                    println!("HOMO ({:3}): {:16.8}, LUMO ({:3}): {:14.6}, H-L Gap: {:16.8}", i_homo, homo, i_lumo, lumo, lumo-homo);
-                } else {
-                    println!("{:?}", &self.eigenvalues[0]);
-                    println!("HOMO: {:16.8} (No virtual orbtials available)", homo);
-                }
-            } else {
-                for i_spin in (0..self.mol.spin_channel) {
-                    if (self.mol.num_elec[i_spin+1] > 1.0E-5) {
-                        let i_homo = homo_idx[i_spin];
-                        let i_lumo = lumo_idx[i_spin];
-                        if ! is_rohf {
-                            let homo = self.eigenvalues[i_spin][i_homo];
-                            let lumo = self.eigenvalues[i_spin][i_lumo];
-                            if has_smear {
-                                print!("(integer-occupation pure-state gap) ");
-                            }
-                            println!("Spin {:2}: HOMO ({:3}): {:14.6}, LUMO ({:3}): {:14.6}, H-L Gap: {:16.8}", i_spin, i_homo, homo, i_lumo, lumo, lumo-homo);
-                        } else {
-                            let homo = self.eigenvalues[0][i_homo];
-                            let lumo = self.eigenvalues[0][i_lumo];
-                            if has_smear {
-                                print!("(integer-occupation pure-state gap) ");
-                            }
-                            println!("Spin {:2}: HOMO ({:3}): {:14.6}, LUMO ({:3}): {:14.6}, H-L Gap: {:16.8}", i_spin, i_homo, homo, i_lumo, lumo, lumo-homo);
-                        }
-                    } else {
-                        println!("No electron with spin {:2}", i_spin);
-                    }
-                }
-            }
-        }
-    }
-
     pub fn generate_density_matrix(&mut self) {
         self.density_matrix = generate_density_matrix_outside(&self);
     }
@@ -2543,9 +2481,7 @@ impl SCF {
                 }
             }
         }
-        if self.mol.ctrl.print_level>1 {
-            println!("Exc: {:16.8}, Vxc: {:16.8}", exc_total, vxc_total)
-        };
+        debug!("Exc: {:16.8}, Vxc: {:16.8}", exc_total, vxc_total);
         match self.scftype {
             SCFType::RHF => {
                 // D*(H^{core}+F)
@@ -2766,19 +2702,15 @@ impl SCF {
     }
 
     pub fn check_scf_convergence(&self, scftracerecode: &ScfTraceRecord) -> [bool;2] {
-        if scftracerecode.num_iter<2 {
-            return [false,false]
-        }
         let spin_channel = self.mol.spin_channel;
         let num_basis = self.mol.num_basis as f64;
         let max_scf_cycle = self.mol.ctrl.max_scf_cycle;
         let scf_acc_rho   = self.mol.ctrl.scf_acc_rho;   
         let scf_acc_eev   = self.mol.ctrl.scf_acc_eev;  
-        let scf_acc_etot  = self.mol.ctrl.scf_acc_etot; 
-        let mut flag   = [true,true];
+        let scf_acc_etot  = self.mol.ctrl.scf_acc_etot;
+        let scf_acc_g     = self.mol.ctrl.scf_acc_g;
+        let scf_conv_criteria = self.mol.ctrl.scf_conv_criteria.as_str(); 
 
-        let cur_index = 1;
-        let pre_index = 0;
         let (cur_energy, pre_energy) = if self.mol.ctrl.smear.is_some() {
             let sigma = self.current_smear_sigma;
             (self.scf_energy - sigma * self.smearing_entropy,
@@ -2787,155 +2719,79 @@ impl SCF {
             (self.scf_energy, scftracerecode.scf_energy)
         };
         let diff_energy = cur_energy-pre_energy;
-        let etot_converge = diff_energy.abs()<=scf_acc_etot;
-        //scftracerecode.energy_change.push(diff_energy);
 
         let cur_energy = &self.eigenvalues;
         let pre_energy = &scftracerecode.eigenvalues;
-        //let eev_converge = true
         let mut eev_err = 0.0;
         for i_spin in 0..spin_channel {
-            //eev_err += cur_energy[i_spin].iter()
-            //    .zip(pre_energy[i_spin].iter())
-            //    .fold(0.0,|acc,(c,p)| acc + (c-p).powf(2.0));
-            // rayon parallel version
             if self.mol.num_elec[i_spin+1] > 1.0E-5 {
                 eev_err += cur_energy[i_spin].par_iter()
                     .zip(pre_energy[i_spin].par_iter())
                     .map(|(c,p)| (c-p).powf(2.0)).sum::<f64>();
-                // println!("DEBUG: eev[{}]\n pre: {:?},\n cur: {:?}", i_spin, pre_energy[i_spin], cur_energy[i_spin]);
             } else {
-                // See https://gitee.com/restgroup/rest/issues/ICSQ9O
                 eev_err += 0.0;
-                // println!("DEBUG: eev[{}] is not considered due to the negligible electron number in this spin channel.", i_spin);
             }
         }
         eev_err = eev_err.sqrt();
 
         let mut dm_err = [0.0;2];
-        //let cur_index = &scftracerecode.residual_density.len()-1;
-        //let cur_residual_density = &scftracerecode.residual_density[cur_index];
         let cur_dm = &self.density_matrix;
         let pre_dm = &scftracerecode.density_matrix[1];
 
         for i_spin in 0..spin_channel {
-            //dm_err[i_spin] = cur_dm[i_spin].data.iter()
-            //    .zip(pre_dm[i_spin].data.iter())
-            //    .fold(0.0,|acc,(c,p)| acc + (c-p).powf(2.0)).sqrt()/num_basis;
-            // rayon parallel version
             dm_err[i_spin] = cur_dm[i_spin].data.par_iter()
                 .zip(pre_dm[i_spin].data.par_iter())
                 .map(|(c,p)| (c-p).powf(2.0)).sum::<f64>().sqrt()/num_basis;
-            //dm_err[i_spin] = cur_residual_density[i_spin].data.par_iter()
-            //    .map(|c| c.powf(2.0)).sum::<f64>().sqrt()/num_basis;
         }
 
-        if spin_channel==1 {
-            if self.mol.ctrl.print_level>0 {
-                println!("SCF Change: DM {:10.5e}; eev {:10.5e} Ha; etot {:10.5e} Ha",dm_err[0],eev_err,diff_energy)
-            };
-            flag[0] = diff_energy.abs()<=scf_acc_etot &&
-                      dm_err[0] <=scf_acc_rho &&
-                      eev_err <= scf_acc_eev
-        } else {
-            if self.mol.ctrl.print_level>0 {
-                println!("SCF Change: DM ({:10.5e},{:10.5e}); eev {:10.5e} Ha; etot {:10.5e} Ha",dm_err[0],dm_err[1],eev_err,diff_energy)
-            };
-            flag[0] = diff_energy.abs()<=scf_acc_etot &&
-                      dm_err[0] <=scf_acc_rho &&
-                      dm_err[1] <=scf_acc_rho &&
-                      eev_err <= scf_acc_eev
+        let mut g_err = [0.0;2];
+        for i_spin in 0..spin_channel {
+            g_err[i_spin] = norm(&self.grad_dm[i_spin], "l2");
         }
 
-                  
+        match self.scftype {
+            SCFType::RHF => {
+                info!("SCF Change: DM {:10.5e}; eev {:10.5e} Ha; etot {:10.5e} Ha; grad {:10.5e} Ha",
+                    dm_err[0], eev_err, diff_energy, g_err[0])
+            }
+            SCFType::ROHF => {
+                info!("SCF Change: DM ({:10.5e},{:10.5e}); eev {:10.5e} Ha; etot {:10.5e} Ha; grad {:10.5e} Ha",
+                    dm_err[0], dm_err[1], eev_err, diff_energy, g_err[0])
+            }
+            SCFType::UHF => {
+                info!("SCF Change: DM ({:10.5e},{:10.5e}); eev {:10.5e} Ha; etot {:10.5e} Ha; grad ({:10.5e},{:10.5e}) Ha",
+                    dm_err[0], dm_err[1], eev_err, diff_energy, g_err[0], g_err[1])
+            }
+        };
+
+        if scftracerecode.num_iter<2 {
+            return [false,false]
+        }
+
+        let mut flag = [true,true];
+        flag[0] = diff_energy.abs()<=scf_acc_etot;
+        match scf_conv_criteria {
+            "g" => {
+                flag[0] = flag[0] && g_err[0] <= scf_acc_g;
+                if spin_channel==2 { flag[0] = flag[0] && g_err[1] <= scf_acc_g; }
+            }
+            "dm" => {
+                flag[0] = flag[0] && dm_err[0] <= scf_acc_rho;
+                if spin_channel==2 { flag[0] = flag[0] && dm_err[1] <= scf_acc_rho; }
+            }
+            "dm,eev" => {
+                flag[0] = flag[0] && dm_err[0] <= scf_acc_rho && eev_err <= scf_acc_eev;
+                if spin_channel==2 { flag[0] = flag[0] && dm_err[1] <= scf_acc_rho; }
+            }
+            _ => {
+                panic!("unknown scf_conv_criteria '{}', must be one of: dm,eev | dm | g", scf_conv_criteria);
+            }
+        }
+
         // Now check if max_scf_cycle is reached or not
         flag[1] = scftracerecode.num_iter >= max_scf_cycle;
 
         flag
-    }
-
-    pub fn formated_eigenvalues(&self,num_state_to_print:usize) {
-        let mut cur_num_state_to_print = 0;
-        let spin_channel = self.mol.spin_channel;
-        match self.scftype {
-            SCFType::RHF => {
-                println!("Eigenvalues in Restricted HF (or KS) calculation:");
-                println!("{:>8}{:>14}{:>18}",String::from("State"),
-                                        String::from("Occupation"),
-                                        String::from("Eigenvalue"));
-                if self.occupation[0].len() < num_state_to_print {
-                    cur_num_state_to_print = self.eigenvalues[0].len();
-                } else {
-                    cur_num_state_to_print = num_state_to_print;
-                }
-                for i_state in (0..cur_num_state_to_print) {
-                    println!("{:>8}{:>14.5}{:>18.6}",i_state,self.occupation[0][i_state],self.eigenvalues[0][i_state]);
-                }
-            },
-            SCFType::UHF => {
-                println!("Eigenvalues in Unrestricted HF (or KS) calculation:");
-                for i_spin in (0..spin_channel) {
-                    if i_spin == 0 {
-                        println!("Spin-up eigenvalues");
-                        println!(" ");
-                    } else {
-                        println!(" ");
-                        println!("Spin-down eigenvalues");
-                        println!(" ");
-                    }
-                    println!("{:>8}{:>14}{:>18}",String::from("State"),
-                                                String::from("Occupation"),
-                                                String::from("Eigenvalue"));
-                    if self.occupation[i_spin].len() < num_state_to_print {
-                        cur_num_state_to_print = self.eigenvalues[i_spin].len();
-                        println!("the number of eigenvalues in {} spin channel is {}", i_spin, self.occupation[i_spin].len());
-                    } else {
-                        cur_num_state_to_print = num_state_to_print;
-                        for i_state in (0..cur_num_state_to_print) {
-                            println!("{:>8}{:>14.5}{:>18.6}",i_state,self.occupation[i_spin][i_state],self.eigenvalues[i_spin][i_state]);
-                        }
-                    }
-                }
-            },
-            SCFType::ROHF => {
-                println!("Eigenvalues in Rrestricted Openshell HF (or KS) calculation:");
-                println!("{:>8}{:>14}{:>18}",String::from("State"),
-                                        String::from("Occupation"),
-                                        String::from("Eigenvalue"));
-                // combine the occ numbers of alpha and beta channel
-                let combined_occupation: Vec<f64> =  self.occupation[0]
-                                                        .iter()
-                                                        .zip(self.occupation[1].iter())
-                                                        .map(|(a, b)| a + b)
-                                                        .collect();
-                if combined_occupation.len() < num_state_to_print {
-                    cur_num_state_to_print = combined_occupation.len();
-                } else {
-                    cur_num_state_to_print = num_state_to_print;
-                }
-                for i_state in (0..cur_num_state_to_print) {
-                    println!("{:>8}{:>14.5}{:>18.6}",i_state,combined_occupation[i_state],self.eigenvalues[0][i_state]);
-                }
-            }
-        }
-    }
-    pub fn formated_eigenvectors(&self) {
-        let spin_channel = self.mol.spin_channel;
-        if spin_channel==1 || matches!(&self.scftype, SCFType::ROHF){
-            self.eigenvectors[0].formated_output(5, "full");
-        } else {
-            (0..spin_channel).into_iter().for_each(|i_spin|{
-                if i_spin == 0 {
-                    println!("Spin-up eigenvalues");
-                    println!(" ");
-                } else {
-                    println!(" ");
-                    println!("Spin-down eigenvalues");
-                    println!(" ");
-                }
-                self.eigenvectors[i_spin].formated_output(5, "full");
-            });
-        }
     }
 
     // relevant to RI-V
@@ -3227,13 +3083,11 @@ impl SCF {
         #[cfg(not(feature = "mpi"))]
         let (total_elec, tot_exc, tot_xc) = self.generate_vxc_rayon_dm_only(scaling_factor);
 
-        if self.mol.ctrl.print_level>1 {
-            if self.mol.spin_channel==1 {
-                println!("total electron number: {:16.8}", total_elec[0]);
-            } else {
-                println!("electron number in alpha-channel: {:12.8}", total_elec[0]);
-                println!("electron number in beta-channel:  {:12.8}", total_elec[1]);
-            }
+        if self.mol.spin_channel==1 {
+            debug!("total electron number: {:16.8}", total_elec[0]);
+        } else {
+            debug!("electron number in alpha-channel: {:12.8}", total_elec[0]);
+            debug!("electron number in beta-channel:  {:12.8}", total_elec[1]);
         }
 
         (total_elec, tot_exc, tot_xc)
@@ -3277,13 +3131,11 @@ impl SCF {
         #[cfg(not(feature = "mpi"))]
         let (total_elec, tot_exc, tot_xc) = self.generate_vxc_rayon(scaling_factor);
 
-        if self.mol.ctrl.print_level>1 {
-            if self.mol.spin_channel==1 {
-                println!("total electron number: {:16.8}", total_elec[0]);
-            } else {
-                println!("electron number in alpha-channel: {:12.8}", total_elec[0]);
-                println!("electron number in beta-channel:  {:12.8}", total_elec[1]);
-            }
+        if self.mol.spin_channel==1 {
+            debug!("total electron number: {:16.8}", total_elec[0]);
+        } else {
+            debug!("electron number in alpha-channel: {:12.8}", total_elec[0]);
+            debug!("electron number in beta-channel:  {:12.8}", total_elec[1]);
         }
 
         (total_elec, tot_exc, tot_xc)
@@ -3582,16 +3434,16 @@ impl SCF {
 
         // if estimated batch size is smaller than minimum, warn and set to minimum
         if batch_size_estimate < min_batch_size {
-            eprintln!("[WARN] in generate_vj_ri_direct, the estimated batch size ({batch_size_estimate}) is smaller than the minimum batch size ({min_batch_size}).");
-            eprintln!("[WARN] Setting batch size to {min_batch_size}. Memory could be insufficient.");
+            warn!("in generate_vj_ri_direct, the estimated batch size ({batch_size_estimate}) is smaller than the minimum batch size ({min_batch_size}).");
+            warn!("Setting batch size to {min_batch_size}. Memory could be insufficient.");
             batch_size_estimate = min_batch_size;
         }
 
         // if user specified batch size is smaller than minimum, warn and set to minimum
         let batch_size = if let Some(user_batch_size) = batch_size {
             if user_batch_size < min_batch_size {
-                eprintln!("[WARN] in generate_vj_ri_direct, the specified batch size ({user_batch_size}) is smaller than the minimum batch size ({min_batch_size}).");
-                eprintln!("[WARN] Setting batch size to {min_batch_size}.");
+                warn!("in generate_vj_ri_direct, the specified batch size ({user_batch_size}) is smaller than the minimum batch size ({min_batch_size}).");
+                warn!("Setting batch size to {min_batch_size}.");
             }
             user_batch_size.max(min_batch_size)
         } else {
@@ -3600,10 +3452,10 @@ impl SCF {
         handle_memory_exceed(mem_est.estimate_mem::<f64>(batch_size), mem_avail, self.mol.ctrl.abort_on_mem_exceed);
 
         // batch size info output
+        info!("in generate_vj_ri_direct, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
+        info!("in generate_vj_ri_direct, batch size      : {batch_size}");
+        info!("in generate_vj_ri_direct, memory estimation");
         if print_level > 0 {
-            println!("[INFO] in generate_vj_ri_direct, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
-            println!("[INFO] in generate_vj_ri_direct, batch size      : {batch_size}");
-            println!("[INFO] in generate_vj_ri_direct, memory estimation");
             mem_est.print_with_dtype::<f64>();
         }
 
@@ -3642,29 +3494,25 @@ impl SCF {
 
         // prefer semi-direct if possible
         let (alg_semi, mut batch_size_estimate) = if !use_dm_only && batch_size_estimate_semi >= min_batch_size {
-            if print_level > 1 {
-                println!("[INFO] in generate_vk_ri_direct_dm, using semi-direct algorithm for vk computation.");
-            }
+            debug!("in generate_vk_ri_direct_dm, using semi-direct algorithm for vk computation.");
             (true, batch_size_estimate_semi)
         } else {
-            if print_level > 1 {
-                println!("[INFO] in generate_vk_ri_direct_dm, using direct algorithm for vk computation.");
-            }
+            debug!("in generate_vk_ri_direct_dm, using direct algorithm for vk computation.");
             (false, batch_size_estimate_direct)
         };
 
         // if estimated batch size is smaller than minimum, warn and set to minimum
         if batch_size_estimate < min_batch_size {
-            eprintln!("[WARN] in generate_vk_ri_direct_dm, the estimated batch size ({batch_size_estimate}) is smaller than the minimum batch size ({min_batch_size}).");
-            eprintln!("[WARN] Setting batch size to {min_batch_size}. Memory could be insufficient.");
+            warn!("in generate_vk_ri_direct_dm, the estimated batch size ({batch_size_estimate}) is smaller than the minimum batch size ({min_batch_size}).");
+            warn!("Setting batch size to {min_batch_size}. Memory could be insufficient.");
             batch_size_estimate = min_batch_size
         }
 
         // if user specified batch size is smaller than minimum, warn and set to minimum
         let batch_size = if let Some(user_batch_size) = batch_size {
             if user_batch_size < min_batch_size {
-                eprintln!("[WARN] in generate_vk_ri_direct_dm, the specified batch size ({user_batch_size}) is smaller than the minimum batch size ({min_batch_size}).");
-                eprintln!("[WARN] Setting batch size to {min_batch_size}.");
+                warn!("in generate_vk_ri_direct_dm, the specified batch size ({user_batch_size}) is smaller than the minimum batch size ({min_batch_size}).");
+                warn!("Setting batch size to {min_batch_size}.");
             }
             user_batch_size.max(min_batch_size)
         } else {
@@ -3674,18 +3522,25 @@ impl SCF {
         handle_memory_exceed(mem_est.estimate_mem::<f64>(batch_size), mem_avail, self.mol.ctrl.abort_on_mem_exceed);
 
         // info output
+        debug!("in generate_vk_ri_direct_dm, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
+        debug!("in generate_vk_ri_direct_dm, batch size      : {batch_size}");
+        debug!("in generate_vk_ri_direct_dm, memory estimation");
         if print_level > 1 {
-            println!("[INFO] in generate_vk_ri_direct_dm, available memory: {:.2} MB", mem_avail.unwrap_or(f64::INFINITY));
-            println!("[INFO] in generate_vk_ri_direct_dm, batch size      : {batch_size}");
-            println!("[INFO] in generate_vk_ri_direct_dm, memory estimation");
             mem_est.print_with_dtype::<f64>();
         }
 
         // compute vk only for specified spin channels
         let mut vks = if alg_semi {
-            let mo_coeff = &self.eigenvectors[0..self.mol.spin_channel];
+            // we assume copying molecular coefficients is cheap operation, to avoid lifetime issues
+            let mut mo_coeff = self.eigenvectors[0..self.mol.spin_channel].iter().cloned().collect::<Vec<_>>();
             let mo_occ = &self.occupation[0..self.mol.spin_channel];
             let mol_obj = &self.mol;
+            // special case for ROHF: copy alpha mo_coeff to beta (ROHF only store the alpha channel)
+            match self.scftype {
+                SCFType::ROHF => mo_coeff[1] = self.eigenvectors[0].clone(),
+                _ => {}
+            };
+            let mo_coeff = &mo_coeff;
             ri_jk::generate_vk_ri_semi_direct_coeff(scaling_factor, mo_coeff, mo_occ, mol_obj, omega, batch_size)
         } else {
             let dms = &self.density_matrix[0..self.mol.spin_channel];
@@ -3801,18 +3656,16 @@ pub fn generate_ri3mo_rayon_for_pt2_and_rpa(scf_data: &mut SCF) {
         //println!("generate RI3MO only for occ_range:{:?}, vir_range:{:?}", &occ_range, &vir_range);
         let spin_orb_indices = split_indices_by_spin_occ(&scf_data.occupation, 0.5);
         let (alpha_occ, alpha_vir) = &spin_orb_indices[0];
-        println!("Occupied orbitals (alpha): {}", format_indices(alpha_occ));
-        println!("Virtual orbitals (alpha): {}", format_indices(alpha_vir));
+        debug!("Occupied orbitals (alpha): {}", format_indices(alpha_occ));
+        debug!("Virtual orbitals (alpha): {}", format_indices(alpha_vir));
         if matches!(scf_data.scftype, SCFType::UHF | SCFType::ROHF) {
             let (beta_occ,  beta_vir)  = &spin_orb_indices[1];
-            println!("Occupied orbitals (beta): {}", format_indices(beta_occ));
-            println!("Virtual orbitals (beta): {}", format_indices(beta_vir));
+            debug!("Occupied orbitals (beta): {}", format_indices(beta_occ));
+            debug!("Virtual orbitals (beta): {}", format_indices(beta_vir));
         }
     };
     scf_data.generate_ri3mo_rayon(vir_range, occ_range);
-    if scf_data.mol.ctrl.print_level>1 {
-        println!("Finish the RI3MO generation")
-    };
+    debug!("Finish the RI3MO generation");
 }
 
 
@@ -4706,711 +4559,6 @@ pub fn vk_upper_with_ri_v_sync(
 
     vk
 }
-//=============================================================================
-
-#[derive(Clone)]
-pub struct ScfTraceRecord {
-    pub num_iter: usize,
-    pub mixer: String,
-    // the maximum number of stored residual densities
-    pub num_max_records: usize,
-    pub mix_param: f64,
-    pub start_diis_cycle: usize,
-    //pub scf_energy : Vec<f64>,
-    //pub density_matrix: Vec<[MatrixFull<f64>;2]>,
-    //pub eigenvectors: Vec<[MatrixFull<f64>;2]>,
-    //pub eigenvalues: Vec<[Vec<f64>;2]>,
-    pub scf_energy : f64,
-    pub smearing_entropy: f64,
-    pub energy_records: Vec<f64>,
-    pub prev_hamiltonian: Vec<[MatrixUpper<f64>;2]>,
-    pub eigenvectors: [MatrixFull<f64>;2],
-    pub eigenvalues: [Vec<f64>;2],
-    pub density_matrix: [Vec<MatrixFull<f64>>;2],
-    pub target_vector: Vec<[MatrixFull<f64>;2]>,
-    pub error_vector: Vec<Vec<f64>>,
-    pub sqrt_inv_ovlp: Option<MatrixFull<f64>>,
-    pub ediis_density: Vec<[MatrixFull<f64>;2]>,
-    pub ediis_energy: Vec<f64>,
-}
-
-impl ScfTraceRecord {
-    pub fn new(num_max_records: usize, mix_param: f64, mixer: String,start_diis_cycle: usize) -> ScfTraceRecord {
-        if num_max_records==0 {
-            println!("Error: num_max_records cannot be 0");
-        }
-        ScfTraceRecord {
-            num_iter: 0,
-            mixer,
-            mix_param,
-            num_max_records,
-            start_diis_cycle,
-            scf_energy : 0.0,
-            smearing_entropy: 0.0,
-            energy_records: vec![],
-            prev_hamiltonian: vec![[MatrixUpper::empty(),MatrixUpper::empty()]],
-            eigenvectors: [MatrixFull::new([1,1],0.0),
-                              MatrixFull::new([1,1],0.0)],
-            eigenvalues: [Vec::<f64>::new(),Vec::<f64>::new()],
-            density_matrix: [vec![MatrixFull::new([1,1],0.0),
-                              MatrixFull::new([1,1],0.0)],
-                             vec![MatrixFull::new([1,1],0.0),
-                              MatrixFull::new([1,1],0.0)]],
-            target_vector: Vec::<[MatrixFull<f64>;2]>::new(),
-            error_vector: Vec::<Vec::<f64>>::new(),
-            sqrt_inv_ovlp: None,
-            ediis_density: Vec::<[MatrixFull<f64>;2]>::new(),
-            ediis_energy: Vec::<f64>::new(),
-        }
-    }
-    pub fn initialize(scf: &SCF) -> ScfTraceRecord {
-        /// 
-        /// Initialize the scf records which should be involked after the initial guess 
-        /// 
-        let mut tmp_records = ScfTraceRecord::new(
-            scf.mol.ctrl.num_max_diis, 
-            scf.mol.ctrl.mix_param.clone(), 
-            scf.mol.ctrl.mixer.clone(),
-            scf.mol.ctrl.start_diis_cycle.clone()
-        );
-        tmp_records.scf_energy=scf.scf_energy;
-        tmp_records.eigenvectors=scf.eigenvectors.clone();
-        tmp_records.eigenvalues=scf.eigenvalues.clone();
-        tmp_records.density_matrix=[scf.density_matrix.clone(),scf.density_matrix.clone()];
-        let ovlp_full = scf.ovlp.to_matrixfull().unwrap();
-        if let Some((_sqrt_a, sqrt_inv_a, _rank)) = _get_sqrt_and_inv_sqrt(&ovlp_full, SQRT_THRESHOLD) {
-            tmp_records.sqrt_inv_ovlp = Some(sqrt_inv_a);
-        }
-        if tmp_records.mixer.eq(&"ediis") || tmp_records.mixer.eq(&"ediis+diis") || tmp_records.mixer.eq(&"adiis+diis") {
-            tmp_records.ediis_density.push([scf.density_matrix[0].clone(),
-                if scf.mol.spin_channel>1 { scf.density_matrix[1].clone() }
-                else { MatrixFull::empty() }]);
-            tmp_records.ediis_energy.push(ediis_e0(scf.scf_energy,
-                scf.smearing_entropy, Some(scf.current_smear_sigma)));
-            tmp_records.target_vector.push([scf.hamiltonian[0].to_matrixfull().unwrap(),
-                if scf.mol.spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() }
-                else { MatrixFull::empty() }]);
-        }
-        tmp_records
-    }
-    /// This subroutine updates:  
-    ///     scf_energy:         from previous to the current value  
-    ///     scf_eigenvalues:    from previous to the current value  
-    ///     scf_eigenvectors:   from previous to the current value  
-    ///     scf_density_matrix: [pre, cur]  
-    ///     num_iter  
-    /// This subroutine should be called after [`scf.check_scf_convergence`] and before [`self.prepare_next_input`]"
-    pub fn update(&mut self, scf: &SCF) {
-
-        let spin_channel = scf.mol.spin_channel;
-
-        // now store the scf energy, eigenvectors and eigenvalues of the last two steps
-        //let tmp_data =  self.scf_energy[1].clone();
-        self.scf_energy=scf.scf_energy;
-        self.smearing_entropy=scf.smearing_entropy;
-        //let tmp_data =  self.eigenvectors[1].clone();
-        self.eigenvectors=scf.eigenvectors.clone();
-        //let tmp_data =  self.eigenvalues[1].clone();
-        self.eigenvalues=scf.eigenvalues.clone();
-        let tmp_data =  self.density_matrix[1].clone();
-        self.density_matrix=[tmp_data,scf.density_matrix.clone()];
-
-        self.num_iter +=1;
-    }
-    /// This subroutine prepares the fock matrix for the next step according different mixing algorithm  
-    ///
-    /// self.mixer =  
-    /// * "direct": the output density matrix in the current step `n0[out]` will be used directly 
-    ///             to generate the the input fock matrix of the next step
-    /// * "linear": the density matrix used in the next step `n1[in]` is a mix between
-    ///             the input density matrix in the current step `n0[in]` and `n0[out]`  
-    ///             <span style="text-align:right">`n1[in] = alpha*n0[out] + (1-alpha)*n0[in]`</span>  
-    ///             <span style="text-align:right">`       = n0[in] + alpha * Rn0            ` </span>  
-    ///             where alpha the mixing parameter obtained from self.mix_param
-    ///              and `Rn0 = n0[out]-n0[in]` is the density matrix change in the current step.
-    ///             `n1[in]` is then be used to generate the input fock matrix of the next step
-    /// * "diis":   the input fock matrix of the next step `f1[in] = sum_{i} c_i*f_i[in]`,
-    ///            where `f_i[in]` is the input fock matrix of the ith step and 
-    ///            c_i is obtained by the diis altogirhm against the error vector
-    ///            of the commutator `(f_i[out]*d_i[out]*s-s*d_i[out]*f_i[out])`, where  
-    ///            - `f_i[out]` is the ith output fock matrix,   
-    ///            - `d_i[out]` is the ith output density matrix,  
-    ///            - `s` is the overlap matrix  
-    /// * **Ref**: P. Pulay, Improved SCF Convergence Acceleration, JCC, 1982, 3:556-560.
-    ///
-    pub fn prepare_next_input(&mut self, scf: &mut SCF, mpi_operator: &Option<MPIOperator>) {
-        let spin_channel = scf.mol.spin_channel;
-        let start_pulay = self.start_diis_cycle;
-        //if self.residual_density.len()>=2 {
-        let alpha = self.mix_param;
-        let beta = 1.0-self.mix_param;
-        let mut level_shift_applied = false;
-        if self.mixer.eq(&"direct") {
-            scf.generate_hf_hamiltonian(mpi_operator);
-        }
-        else if self.mixer.eq(&"linear") 
-            || (self.mixer.eq(&"diis") && self.num_iter<start_pulay) 
-        {
-            let mut alpha = self.mix_param;
-            let mut beta = 1.0-alpha;
-            // n1[in] = a*n0[out] + (1-a)*n0[in] = n0[out]-(1-a)*Rn0 = n0[in] + a*Rn0
-            // Rn0 = n0[out]-n0[in]; the residual density in the current iteration
-            // n1[in] is the input density for the next iteration
-            for i_spin in (0..spin_channel) {
-                let residual_dm = self.density_matrix[1][i_spin].sub(&self.density_matrix[0][i_spin]).unwrap();
-                scf.density_matrix[i_spin] = self.density_matrix[0][i_spin]
-                    .scaled_add(&residual_dm, alpha)
-                    .unwrap();
-            }
-            scf.generate_hf_hamiltonian(mpi_operator);
-        } else if self.mixer.eq(&"diis") && self.num_iter>=start_pulay {
-            // 
-            // Reference: P. Pulay, Improved SCF Convergence Acceleration, JCC, 1982, 3:556-560.
-            // 
-            let start_dim = 0usize;
-            let mut start_check_oscillation = scf.mol.ctrl.start_check_oscillation;
-            //
-            // prepare the fock matrix according to the output density matrix of the previous step
-            //
-            let dt1 = time::Local::now();
-
-            scf.generate_hf_hamiltonian(mpi_operator);
-
-            // Apply level_shift to the output fock matrix BEFORE DIIS target storage.
-            // This ensures DIIS operates in the level-shifted subspace, so the DIIS
-            // extrapolated Fock matrix is already level-shifted (no post-hoc correction).
-            if let Some(level_shift_val) = scf.mol.ctrl.level_shift {
-                let ovlp = &scf.ovlp;
-                let dm_scaling_factor = match scf.scftype {
-                    SCFType::RHF | SCFType::ROHF => 0.5,
-                    SCFType::UHF => 1.0,
-                };
-                match scf.scftype {
-                    SCFType::RHF => {
-                        let mut fock = scf.hamiltonian.get_mut(0).unwrap();
-                        let dm = scf.density_matrix.get(0).unwrap();
-                        level_shift_fock(fock, ovlp, level_shift_val, dm, dm_scaling_factor);
-                    },
-                    SCFType::UHF => {
-                        for i_spin in 0..scf.mol.spin_channel {
-                            let mut fock = scf.hamiltonian.get_mut(i_spin).unwrap();
-                            let dm = scf.density_matrix.get(i_spin).unwrap();
-                            level_shift_fock(fock, ovlp, level_shift_val, dm, dm_scaling_factor);
-                        }
-                    },
-                    SCFType::ROHF => {
-                        let fock = scf.roothaan_hamiltonian.as_mut().unwrap();
-                        let dm = scf.density_matrix[0].clone() + scf.density_matrix[1].clone();
-                        level_shift_fock(fock, ovlp, level_shift_val, &dm, dm_scaling_factor);
-                    }
-                }
-                level_shift_applied = true;
-            }
-
-
-            // update the energy records and check the oscillation
-            let e_free = if scf.mol.ctrl.smear.is_some() {
-                let sigma = scf.current_smear_sigma;
-                scf.scf_energy - sigma * scf.smearing_entropy
-            } else {
-                scf.scf_energy
-            };
-            self.energy_records.push(e_free);
-            let num_step = self.energy_records.len();
-            let oscillation_flag = if num_step >=2 {
-                let change_1 = self.energy_records[num_step-1] - self.energy_records[num_step-2];
-                num_step > start_check_oscillation && change_1 > 0.0
-                //false
-            }else {
-                false
-            };
-
-            let dt2 = time::Local::now();
-
-
-            // check if the storage of fock matrix reaches the maximum setting
-            if self.target_vector.len() == self.num_max_records {
-                self.target_vector.remove(0);
-                self.error_vector.remove(0);
-            };
-
-            //
-            // prepare and store the fock matrix in full formate and the error vector in the current step
-            //
-            //for i_spin in (0..spin_channel) {
-            //    //self.target_vector.push([scf.hamiltonian[i_spin].clone(), scf.hamiltonian[i_spin].clone()]);
-            //    scf.hamiltonian[i_spin].formated_output(5, "upper");
-            //}
-            let (cur_error_vec, cur_target) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel, &self.sqrt_inv_ovlp);
-            self.error_vector.push(cur_error_vec);
-            self.target_vector.push(cur_target);
-
-
-            // solve the DIIS against the error vector
-            if let Some(coeff) = diis_solver(&self.error_vector, &self.error_vector.len()) {
-                // now extrapolate the fock matrix for the next step
-                (0..spin_channel).into_iter().for_each(|i_spin| {
-                    let mut next_hamiltonian = MatrixFull::new(self.target_vector[0][i_spin].size.clone(),0.0);
-                    coeff.iter().enumerate().for_each(|(i,value)| {
-                        next_hamiltonian.self_scaled_add(&self.target_vector[i+start_dim][i_spin], *value);
-                    });
-                    let next_hamiltonian = next_hamiltonian.to_matrixupper();
-
-                    if oscillation_flag {
-                        if scf.mol.ctrl.print_level>0 {
-                            println!("Energy increase is detected. Turn on the linear mixing algorithm with (H[DIIS, i-1] + H[DIIS, i+1]).");
-                            let length = self.energy_records.len();
-                            println!("Prev_Energies: ({:16.8}, {:16.8})", self.energy_records[length-2], self.energy_records[length-1]);
-                        }
-                        let mut alpha: f64 = self.mix_param;
-                        let mut beta = 1.0-alpha;
-                        scf.hamiltonian[i_spin].data.par_iter_mut().zip(self.prev_hamiltonian[0][i_spin].data.par_iter()).zip(next_hamiltonian.data.par_iter())
-                        .for_each(|((to, prev), new)| {
-                            *to = prev*beta + new*alpha;
-                        });
-                    } else {
-                        scf.hamiltonian[i_spin] = next_hamiltonian;
-                    }
-                });
-
-                // update the previous hamiltonian list to make sure the first item is H[DIIS, i-1]
-                // and the second term is H[DIIS, i]
-                if self.prev_hamiltonian.len() == 2 {self.prev_hamiltonian.remove(0);};
-                self.prev_hamiltonian.push(scf.hamiltonian.clone());
-
-
-
-            } else {
-                let mut alpha = self.mix_param;
-                let mut beta = 1.0-alpha;
-                if scf.mol.ctrl.print_level>0 {
-                    println!("WARNING: fail to obtain the DIIS coefficients. Turn to use the linear mixing algorithm, and re-invoke DIIS  8 steps later");
-                }
-                for i_spin in (0..spin_channel) {
-                    let residual_dm = self.density_matrix[1][i_spin].sub(&self.density_matrix[0][i_spin]).unwrap();
-                    scf.density_matrix[i_spin] = self.density_matrix[0][i_spin]
-                        .scaled_add(&residual_dm, alpha)
-                        .unwrap();
-                }
-                scf.generate_hf_hamiltonian(mpi_operator);
-                level_shift_applied = false;
-                self.start_diis_cycle = self.num_iter + 8;
-                self.target_vector =  Vec::<[MatrixFull<f64>;2]>::new();
-                self.error_vector =  Vec::<Vec::<f64>>::new();
-            }
-            let dt3 = time::Local::now();
-            let timecost1 = (dt2.timestamp_millis()-dt1.timestamp_millis()) as f64 /1000.0;
-            let timecost2 = (dt3.timestamp_millis()-dt2.timestamp_millis()) as f64 /1000.0;
-            if scf.mol.ctrl.print_level>2 {
-                println!("Hamiltonian: generation by {:10.2}s and DIIS extrapolation by {:10.2}s", timecost1,timecost2);
-            }
-            
-        } else if self.mixer.eq(&"ediis") && self.num_iter>=start_pulay {
-            scf.generate_hf_hamiltonian(mpi_operator);
-            let cur_density = [scf.density_matrix[0].clone(),
-                if spin_channel>1 { scf.density_matrix[1].clone() } else { MatrixFull::empty() }];
-            let cur_fock = [scf.hamiltonian[0].to_matrixfull().unwrap(),
-                if spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() } else { MatrixFull::empty() }];
-            if self.ediis_density.len() == self.num_max_records {
-                self.ediis_density.remove(0); self.ediis_energy.remove(0); self.target_vector.remove(0);
-            }
-            self.ediis_density.push(cur_density); self.ediis_energy.push(ediis_e0(self.scf_energy,
-                self.smearing_entropy, Some(scf.current_smear_sigma)));
-            self.target_vector.push(cur_fock);
-            let nhist = self.ediis_density.len();
-            if nhist >= 2 {
-                let bmat = generate_ediis_penalty(&self.target_vector, &self.ediis_density, spin_channel);
-                let eta = scf.mol.ctrl.ediis_penalty.unwrap_or(0.5);
-                let n = bmat.size()[0]; let mut qmat = MatrixFull::new([n, n], 0.0);
-                for i in 0..n { for j in 0..n { let bij = bmat.get2d([i, j]).unwrap_or(&0.0); qmat.set2d([i, j], -2.0*eta*bij); } }
-                let coeff = ediis_qp_solver(&qmat, &self.ediis_energy, eta);
-                for i_spin in 0..spin_channel {
-                    let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
-                    for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
-                    scf.hamiltonian[i_spin] = next_h.to_matrixupper();
-                }
-                if scf.mol.ctrl.print_level > 1 {
-                    print!("EDIIS coeff: ["); for ck in &coeff { print!(" {:.4}", ck); } println!(" ]");
-                }
-            }
-            level_shift_applied = false;
-        } else if self.mixer.eq(&"ediis+diis") && self.num_iter>=start_pulay {
-            scf.generate_hf_hamiltonian(mpi_operator);
-            if let Some(ls_val) = scf.mol.ctrl.level_shift {
-                let dsf = match scf.scftype { SCFType::RHF|SCFType::ROHF => 0.5, SCFType::UHF => 1.0 };
-                match scf.scftype {
-                    SCFType::RHF => level_shift_fock(scf.hamiltonian.get_mut(0).unwrap(), &scf.ovlp, ls_val, scf.density_matrix.get(0).unwrap(), dsf),
-                    SCFType::UHF => for s in 0..spin_channel { level_shift_fock(scf.hamiltonian.get_mut(s).unwrap(), &scf.ovlp, ls_val, scf.density_matrix.get(s).unwrap(), dsf) },
-                    SCFType::ROHF => { let dm = scf.density_matrix[0].clone()+scf.density_matrix[1].clone(); level_shift_fock(scf.roothaan_hamiltonian.as_mut().unwrap(), &scf.ovlp, ls_val, &dm, dsf) }
-                }
-                level_shift_applied = true;
-            }
-            let cur_dens = [scf.density_matrix[0].clone(), if spin_channel>1 { scf.density_matrix[1].clone() } else { MatrixFull::empty() }];
-            let cur_fock = [scf.hamiltonian[0].to_matrixfull().unwrap(), if spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() } else { MatrixFull::empty() }];
-            let max_rec = self.num_max_records;
-            if self.target_vector.len() == max_rec { self.target_vector.remove(0); self.error_vector.remove(0); }
-            if self.ediis_density.len() == max_rec { self.ediis_density.remove(0); self.ediis_energy.remove(0); }
-            let (cur_err, cur_tgt) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel, &self.sqrt_inv_ovlp);
-            self.error_vector.push(cur_err); self.target_vector.push(cur_tgt);
-            self.ediis_density.push(cur_dens); self.ediis_energy.push(ediis_e0(self.scf_energy,
-                self.smearing_entropy, Some(scf.current_smear_sigma)));
-            let num_diis = self.error_vector.len(); let num_ediis = self.ediis_density.len();
-            let diis_norm = self.error_vector.last().map(|v| v.iter().map(|x| x*x).sum::<f64>().sqrt()).unwrap_or(1.0);
-            let use_ediis = num_ediis >= 2 && (num_diis < 2 || diis_norm > 1e-3);
-            let mut ediis_used = false;
-            if use_ediis && num_ediis >= 2 {
-                let bmat = generate_ediis_penalty(&self.target_vector, &self.ediis_density, spin_channel);
-                let eta = scf.mol.ctrl.ediis_penalty.unwrap_or(0.5);
-                let n = bmat.size()[0]; let mut qmat = MatrixFull::new([n, n], 0.0);
-                for i in 0..n { for j in 0..n { let bij = bmat.get2d([i, j]).unwrap_or(&0.0); qmat.set2d([i, j], -2.0*eta*bij); } }
-                let coeff = ediis_qp_solver(&qmat, &self.ediis_energy, eta);
-                let mut e_pred = 0.0f64;
-                for i in 0..n { e_pred += coeff[i] * self.ediis_energy[i]; }
-                for i in 0..n { for j in 0..n {
-                    let bij = bmat.get2d([i, j]).unwrap_or(&0.0);
-                    e_pred -= eta * coeff[i] * coeff[j] * bij;
-                }}
-                let e0_cur = ediis_e0(self.scf_energy, self.smearing_entropy, Some(scf.current_smear_sigma));
-                let ediis_ok = e_pred <= e0_cur + 1e-10;
-                if !ediis_ok && scf.mol.ctrl.print_level > 1 {
-                    println!("[EDIIS] rejected: E_pred={:14.8} > E0_cur={:14.8}", e_pred, e0_cur);
-                }
-                if ediis_ok {
-                    for i_spin in 0..spin_channel {
-                        let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
-                        scf.hamiltonian[i_spin] = next_h.to_matrixupper();
-                    }
-                    if scf.mol.ctrl.print_level > 1 { print!("[EDIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
-                    ediis_used = true;
-                }
-            }
-            if !ediis_used && num_diis >= 2 {
-                if let Some(coeff) = diis_solver(&self.error_vector, &num_diis) {
-                    for i_spin in 0..spin_channel {
-                        let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
-                        scf.hamiltonian[i_spin] = next_h.to_matrixupper();
-                    }
-                    if scf.mol.ctrl.print_level > 1 { print!("[DIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
-                } else {
-                    for i_spin in 0..spin_channel {
-                        let rd = self.density_matrix[1][i_spin].sub(&self.density_matrix[0][i_spin]).unwrap();
-                        scf.density_matrix[i_spin] = self.density_matrix[0][i_spin].scaled_add(&rd, alpha).unwrap();
-                    }
-                    scf.generate_hf_hamiltonian(mpi_operator);
-                    level_shift_applied = false;
-                    self.target_vector.clear(); self.error_vector.clear();
-                    self.ediis_density.clear(); self.ediis_energy.clear();
-                }
-            }
-        } else if self.mixer.eq(&"adiis+diis") && self.num_iter>=start_pulay {
-            scf.generate_hf_hamiltonian(mpi_operator);
-            if let Some(ls_val) = scf.mol.ctrl.level_shift {
-                let dsf = match scf.scftype { SCFType::RHF|SCFType::ROHF => 0.5, SCFType::UHF => 1.0 };
-                match scf.scftype {
-                    SCFType::RHF => level_shift_fock(scf.hamiltonian.get_mut(0).unwrap(), &scf.ovlp, ls_val, scf.density_matrix.get(0).unwrap(), dsf),
-                    SCFType::UHF => for s in 0..spin_channel { level_shift_fock(scf.hamiltonian.get_mut(s).unwrap(), &scf.ovlp, ls_val, scf.density_matrix.get(s).unwrap(), dsf) },
-                    SCFType::ROHF => { let dm = scf.density_matrix[0].clone()+scf.density_matrix[1].clone(); level_shift_fock(scf.roothaan_hamiltonian.as_mut().unwrap(), &scf.ovlp, ls_val, &dm, dsf) }
-                }
-                level_shift_applied = true;
-            }
-            let cur_dens = [scf.density_matrix[0].clone(), if spin_channel>1 { scf.density_matrix[1].clone() } else { MatrixFull::empty() }];
-            let cur_fock = [scf.hamiltonian[0].to_matrixfull().unwrap(), if spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() } else { MatrixFull::empty() }];
-            let max_rec = self.num_max_records;
-            if self.target_vector.len() == max_rec { self.target_vector.remove(0); self.error_vector.remove(0); }
-            if self.ediis_density.len() == max_rec { self.ediis_density.remove(0); self.ediis_energy.remove(0); }
-            let (cur_err, cur_tgt) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel, &self.sqrt_inv_ovlp);
-            self.error_vector.push(cur_err); self.target_vector.push(cur_tgt);
-            self.ediis_density.push(cur_dens.clone()); self.ediis_energy.push(ediis_e0(self.scf_energy,
-                self.smearing_entropy, Some(scf.current_smear_sigma)));
-            let num_diis = self.error_vector.len(); let num_ediis = self.ediis_density.len();
-            let diis_norm = self.error_vector.last().map(|v| v.iter().map(|x| x*x).sum::<f64>().sqrt()).unwrap_or(1.0);
-            let use_adiis = num_ediis >= 2 && (num_diis < 2 || diis_norm > 1e-3);
-            let mut adiis_used = false;
-            if use_adiis && num_ediis >= 2 {
-                let bmat = generate_adiis_penalty(&self.ediis_density, &self.target_vector, spin_channel);
-                let mu = scf.mol.ctrl.adiis_penalty.unwrap_or(0.5);
-                let bmax = bmat.data.iter().fold(0.0f64, |m, &x| m.max(x.abs()));
-                let mu_eff = if bmax > 1e-10 { mu / bmax } else { mu };
-                let n = bmat.size()[0]; let mut qmat = MatrixFull::new([n, n], 0.0);
-                for i in 0..n { for j in 0..n { let bij = bmat.get2d([i, j]).unwrap_or(&0.0); qmat.set2d([i, j], mu_eff*bij); } }
-                let coeff = ediis_qp_solver(&qmat, &self.ediis_energy, mu_eff);
-                let mut e_pred = 0.0f64;
-                for i in 0..n { e_pred += coeff[i] * self.ediis_energy[i]; }
-                for i in 0..n { for j in 0..n {
-                    let bij = bmat.get2d([i, j]).unwrap_or(&0.0);
-                    e_pred += 0.5 * mu_eff * coeff[i] * coeff[j] * bij;
-                }}
-                let e0_cur = ediis_e0(self.scf_energy, self.smearing_entropy, Some(scf.current_smear_sigma));
-                let adiis_ok = e_pred <= e0_cur + 1e-8;
-                if !adiis_ok && scf.mol.ctrl.print_level > 1 {
-                    println!("[ADIIS] rejected: E_pred={:14.8} > E0_cur={:14.8}", e_pred, e0_cur);
-                }
-                if adiis_ok {
-                    for i_spin in 0..spin_channel {
-                        let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
-                        scf.hamiltonian[i_spin] = next_h.to_matrixupper();
-                    }
-                    if scf.mol.ctrl.print_level > 1 { print!("[ADIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
-                    adiis_used = true;
-                }
-            }
-            if !adiis_used && num_diis >= 2 {
-                if let Some(coeff) = diis_solver(&self.error_vector, &num_diis) {
-                    for i_spin in 0..spin_channel {
-                        let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
-                        scf.hamiltonian[i_spin] = next_h.to_matrixupper();
-                    }
-                    if scf.mol.ctrl.print_level > 1 { print!("[DIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
-                } else {
-                    for i_spin in 0..spin_channel {
-                        let rd = self.density_matrix[1][i_spin].sub(&self.density_matrix[0][i_spin]).unwrap();
-                        scf.density_matrix[i_spin] = self.density_matrix[0][i_spin].scaled_add(&rd, alpha).unwrap();
-                    }
-                    scf.generate_hf_hamiltonian(mpi_operator);
-                    level_shift_applied = false;
-                    self.target_vector.clear(); self.error_vector.clear();
-                    self.ediis_density.clear(); self.ediis_energy.clear();
-                }
-            }
-        };
-
-        // now consider if level_shift is applied
-        // at present only a constant level shift is implemented for both spin channels and for the whole SCF procedure
-        // For the DIIS path, level_shift is applied inside the DIIS block (before target storage)
-        // to ensure the DIIS subspace contains level-shifted Fock matrices.
-        if scf.mol.ctrl.level_shift.is_some() && !level_shift_applied {
-            let level_shift = scf.mol.ctrl.level_shift.unwrap();
-            let ovlp = &scf.ovlp;
-            let dm_scaling_factor = match scf.scftype {
-                SCFType::RHF | SCFType::ROHF=> 0.5,
-                SCFType::UHF => 1.0,
-                };
-                match scf.scftype {
-                    SCFType::RHF => {
-                        let mut fock = scf.hamiltonian.get_mut(0).unwrap();
-                        let dm = scf.density_matrix.get(0).unwrap();
-                        level_shift_fock(fock, ovlp, level_shift, dm, dm_scaling_factor);
-                    },
-                    SCFType::UHF => {
-                        for i_spin in 0..scf.mol.spin_channel {
-                            let mut fock = scf.hamiltonian.get_mut(i_spin).unwrap();
-                            let dm = scf.density_matrix.get(i_spin).unwrap();
-                            level_shift_fock(fock, ovlp, level_shift, dm, dm_scaling_factor);
-                        }
-                    },
-                    SCFType::ROHF => {
-                        let fock = scf.roothaan_hamiltonian.as_mut().unwrap();
-                        let dm = scf.density_matrix[0].clone() + scf.density_matrix[1].clone();
-                        level_shift_fock(fock, ovlp, level_shift, &dm, dm_scaling_factor);
-                    }
-                }
-        }
-    }
-
-    pub fn refresh(&mut self) {
-        self.energy_records.clear();
-        self.prev_hamiltonian = vec![[MatrixUpper::empty(), MatrixUpper::empty()]];
-        self.eigenvectors = [MatrixFull::new([1, 1], 0.0), MatrixFull::new([1, 1], 0.0)];
-        self.eigenvalues = [Vec::<f64>::new(), Vec::<f64>::new()];
-        self.density_matrix = [
-            vec![MatrixFull::new([1, 1], 0.0), MatrixFull::new([1, 1], 0.0)],
-            vec![MatrixFull::new([1, 1], 0.0), MatrixFull::new([1, 1], 0.0)],
-        ];
-        self.target_vector = Vec::<[MatrixFull<f64>; 2]>::new();
-        self.error_vector = Vec::<Vec::<f64>>::new();
-    }
-}
-
-pub fn generate_diis_error_vector(hamiltonian: &[MatrixUpper<f64>;2], 
-                                ovlp: &MatrixUpper<f64>, 
-                                density_matrix: &mut [Vec<MatrixFull<f64>>;2],
-                                spin_channel: usize,
-                                sqrt_inv_ovlp: &Option<MatrixFull<f64>>) -> (Vec<f64>, [MatrixFull<f64>;2]) {
-            let mut cur_error = [
-                MatrixFull::new([1,1],0.0),
-                MatrixFull::new([1,1],0.0)
-            ];
-            let mut cur_target = [hamiltonian[0].to_matrixfull().unwrap(),
-                 hamiltonian[1].to_matrixfull().unwrap()];
-
-            let mut full_ovlp = ovlp.to_matrixfull().unwrap();
-
-            // now generte the error as the commutator of [fds-sdf]
-            (0..spin_channel).into_iter().for_each(|i_spin| {
-                cur_error[i_spin] = cur_target[i_spin]
-                    .ddot(&mut density_matrix[1][i_spin]).unwrap();
-                cur_error[i_spin] = cur_error[i_spin].ddot(&mut full_ovlp).unwrap();
-                let mut dsf = full_ovlp.ddot(&mut density_matrix[1][i_spin]).unwrap();
-                dsf = dsf.ddot(&mut cur_target[i_spin]).unwrap();
-                cur_error[i_spin].self_sub(&dsf);
-
-                // transfer to an orthogonal basis to improve numerical conditioning
-                if let Some(sinv) = sqrt_inv_ovlp {
-                    let n = cur_error[i_spin].size()[0];
-                    let mut tmp = MatrixFull::new([n, n], 0.0);
-                    _dgemm_full(&cur_error[i_spin], 'N', sinv, 'N', &mut tmp, 1.0, 0.0);
-                    let mut e_orth = MatrixFull::new([n, n], 0.0);
-                    _dgemm_full(sinv, 'N', &tmp, 'N', &mut e_orth, 1.0, 0.0);
-                    cur_error[i_spin] = e_orth;
-                }
-            });
-
-            let mut norm = 0.0;
-            (0..spin_channel).for_each(|i_spin| {
-                let dd = cur_error[i_spin].data.par_iter().fold(|| 0.0, |acc, x| {
-                    acc + x*x
-                }).sum::<f64>();
-                norm += dd
-            });
-            //println!("diis-norm : {:16.8}",norm.sqrt());
-
-            ([cur_error[0].data.clone(),cur_error[1].data.clone()].concat(),
-            cur_target)
-
-}
-
-/// Compute zero-temperature extrapolated energy for EDIIS.
-/// E₀ = E(T) − ½·σ·S  eliminates smearing-entropy bias in energy comparison.
-pub fn ediis_e0(e_total: f64, smearing_entropy: f64, sigma: Option<f64>) -> f64 {
-    match sigma {
-        Some(s) if s > 0.0 => e_total - 0.5 * s * smearing_entropy,
-        _ => e_total,
-    }
-}
-
-/// Build the EDIIS penalty matrix B_{ij} = Tr[(D_i−D_j)(F_i−F_j)].
-fn generate_ediis_penalty(
-    target_vector: &[[MatrixFull<f64>; 2]],
-    ediis_density: &[[MatrixFull<f64>; 2]],
-    spin_channel: usize,
-) -> MatrixFull<f64> {
-    let n = target_vector.len();
-    let mut bmat = MatrixFull::new([n, n], 0.0);
-    for i in 0..n {
-        for j in i..n {
-            let mut tr = 0.0f64;
-            for i_spin in 0..spin_channel {
-                let dd = ediis_density[i][i_spin].sub(&ediis_density[j][i_spin]).unwrap();
-                let df = target_vector[i][i_spin].sub(&target_vector[j][i_spin]).unwrap();
-                tr += dd.data.iter().zip(df.data.iter()).map(|(a, b)| a * b).sum::<f64>();
-            }
-            bmat.set2d([i, j], tr);
-            bmat.set2d([j, i], tr);
-        }
-    }
-    bmat
-}
-
-/// Solve the EDIIS QP:  min ½cᵀQc + pᵀc  s.t. Σc=1, c≥0.
-fn ediis_qp_solver(q: &MatrixFull<f64>, p: &[f64], _eta: f64) -> Vec<f64> {
-    let n = p.len();
-    if n <= 1 { return vec![1.0f64; n]; }
-    let mut c = vec![1.0 / n as f64; n];
-    for _iter in 0..200 {
-        let mut g = p.to_vec();
-        for i in 0..n {
-            let row = q.get2d_slice([i, 0], n).unwrap();
-            for j in 0..n { g[i] += row[j] * c[j]; }
-        }
-        let g_mean = g.iter().sum::<f64>() / n as f64;
-        let g_proj: Vec<f64> = g.iter().map(|gi| gi - g_mean).collect();
-        if g_proj.iter().map(|x| x*x).sum::<f64>().sqrt() < 1e-14 { break; }
-        let d: Vec<f64> = g_proj.iter().map(|gi| -gi).collect();
-        let mut amax = f64::INFINITY;
-        for i in 0..n { if d[i] < -1e-14 { let am = -c[i]/d[i]; if am < amax { amax = am; } } }
-        let mut dqd = 0.0f64; let mut gd = 0.0f64;
-        for i in 0..n {
-            let row = q.get2d_slice([i, 0], n).unwrap();
-            let mut qd_i = 0.0f64;
-            for j in 0..n { qd_i += row[j] * d[j]; }
-            dqd += d[i] * qd_i; gd += d[i] * g[i];
-        }
-        let alpha = if dqd <= 0.0 { amax } else { (-gd/dqd).min(amax) };
-        if alpha < 1e-14 { break; }
-        for i in 0..n { c[i] += alpha * d[i]; }
-    }
-    for ci in c.iter_mut() { *ci = ci.max(0.0); }
-    let sum: f64 = c.iter().sum();
-    if sum > 0.0 { for ci in c.iter_mut() { *ci /= sum; } } else { c.fill(1.0/n as f64); }
-    c
-}
-
-/// Build ADIIS penalty: B_{ij} = Tr[(D_i−D_ref)(F_j−F_ref)] using newest point as ref.
-/// Positive-semidefinite → convex QP → smooth coefficients. Ref: Hu & Yang JCP 132, 054109 (2010).
-fn generate_adiis_penalty(
-    densities: &[[MatrixFull<f64>; 2]],
-    focks: &[[MatrixFull<f64>; 2]],
-    spin_channel: usize,
-) -> MatrixFull<f64> {
-    let n = densities.len();
-    if n == 0 { return MatrixFull::new([0, 0], 0.0); }
-    let iref = n - 1;  // newest point
-    let mut bmat = MatrixFull::new([n, n], 0.0);
-    for i in 0..n {
-        for j in i..n {
-            let mut tr = 0.0f64;
-            for i_spin in 0..spin_channel {
-                let dd_i = densities[i][i_spin].sub(&densities[iref][i_spin]).unwrap();
-                let df_j = focks[j][i_spin].sub(&focks[iref][i_spin]).unwrap();
-                tr += dd_i.data.iter().zip(df_j.data.iter()).map(|(a, b)| a * b).sum::<f64>();
-            }
-            bmat.set2d([i, j], tr);
-            bmat.set2d([j, i], tr);
-        }
-    }
-    bmat
-}
-
-pub fn diis_solver(em: &Vec<Vec<f64>>,
-                   num_vec:&usize) -> Option<Vec<f64>> {
-
-    let dim_vec = em.len();
-    let start_dim = if (em.len()>=*num_vec) {em.len()-*num_vec} else {0};
-    let dim = if (em.len()>=*num_vec) {*num_vec} else {em.len()};
-    let mut coeff = Vec::<f64>::new();
-    //let mut norm_rdm = [Vec::<f64>::new(),Vec::<f64>::new()];
-    let mut odm = MatrixFull::new([1,1],0.0);
-    //let mut inv_opta = MatrixFull::new([dim,dim],0.0);
-    //let mut sum_inv_norm_rdm = [0.0,0.0];
-    let mut sum_inv_norm_rdm = 0.0_f64;
-
-    // now prepare the norm matrix of the residual density matrix
-    let mut opta = MatrixFull::new([dim,dim],0.0);
-    (start_dim..dim_vec).into_iter().for_each(|i| {
-        (start_dim..dim_vec).into_iter().for_each(|j| {
-            let mut inv_norm_rdm = em[i].iter()
-                .zip(em[j].iter())
-                .fold(0.0,|c,(d,e)| {c + d*e});
-            opta.set2d([i-start_dim,j-start_dim],inv_norm_rdm);
-            //sum_inv_norm_rdm += inv_norm_rdm;
-        })
-    });
-    let inv_opta = _pinv(&opta, Some(1.0e-12f64)).unwrap();
-    let sum_inv = inv_opta.data.iter().sum::<f64>();
-    if sum_inv.abs() < 1.0e-6 {
-        return None;
-    }
-    sum_inv_norm_rdm = sum_inv.powf(-1.0f64);
-    sum_inv_norm_rdm = inv_opta.data.iter().sum::<f64>().powf(-1.0f64);
-
-    // now prepare the coefficients for the pulay mixing
-    coeff = vec![sum_inv_norm_rdm;dim];
-    //coeff.iter().for_each(|i| {println!("coeff: {}",i)});
-    (0..dim).zip(coeff.iter_mut()).for_each(|(i,value)| {
-        //println!("{:?}",*value);
-        *value *= inv_opta.get2d_slice([0,i], dim)
-                 .unwrap()
-                 .iter()
-                 .sum::<f64>();
-    });
-
-    Some(coeff)
-
-}
 
 pub fn scf(mol:Molecule, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<SCF> {
     let dt0 = time::Local::now();
@@ -5537,20 +4685,81 @@ fn ao2mo_rayon_v02<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
     Ok((rimo, row_dim, column_dim))
 }
 
-pub fn level_shift_fock(fock: &mut MatrixUpper<f64>, ovlp: &MatrixUpper<f64>, level_shift: f64,  dm: &MatrixFull<f64>, dm_scaling_factor: f64) {
-    // FC = SCE
-    // F' = F + SC \Lambda C^\dagger S
-    // F' = F + LF * (S - SDS) 
+/// M1-optimized AO→MO transformation for a block of occupied (or virtual) orbitals.
+///
+/// Compared to `ao2mo_rayon_v02`, this routine contracts the *smaller* side
+/// first in the dsymm step: instead of computing `tmp_mat = reduced_ri × eigenvector`
+/// over the full eigenvector `[nao, nmo]` and then slicing, we pre-slice
+/// `eigenvector[:, column_dim]` once (one-time copy of `[nao, |column_dim|]`)
+/// and run dsymm on the smaller RHS. This saves a factor `nmo / |column_dim|`
+/// in dsymm FLOPs.
+///
+/// Used by streaming PT2 (`*_pt2_rayon_streaming` in `ri_pt2/mod.rs`), where
+/// `column_dim` is a small block of occupied orbitals (typical |column_dim| ≤ 64)
+/// rather than the full `nocc`. The full `ri3mo` tensor is never materialized.
+pub(crate) fn ao2mo_rayon_m1<'a, T, P>(
+    eigenvector: &T,
+    rimatr_chunk: &P,
+    row_dim: std::ops::Range<usize>,
+    column_dim: std::ops::Range<usize>,
+) -> anyhow::Result<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)>
+where T: BasicMatrix<'a, f64> + std::marker::Sync,
+      P: BasicMatrix<'a, f64>
+{
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
 
-    let num_basis = dm.size()[0];
+    let num_basis = eigenvector.size()[0];
+    //let num_state = eigenvector.size()[1];
+    let num_bpair = rimatr_chunk.size()[0];
+    let num_auxbs = rimatr_chunk.size()[1];
+    let num_loc_row = row_dim.len();
+    let num_loc_col = column_dim.len();
 
-    let mut tmp_s = MatrixFull::new([num_basis, num_basis], 0.0);
-    tmp_s.iter_matrixupper_mut().unwrap().zip(ovlp.data.iter()).for_each(|(to, from)| {*to = *from});
-    let mut tmp_s2 = tmp_s.clone();
-    let mut tmp_s3 = tmp_s.clone();
-    _dsymm(&tmp_s, dm, &mut tmp_s2, 'L', 'U', -dm_scaling_factor, 0.0);
-    _dsymm(&tmp_s, &mut tmp_s2, &mut tmp_s3, 'R', 'U', 1.0, 1.0);
-    fock.data.iter_mut().zip(tmp_s3.iter_matrixupper().unwrap()).for_each(|(to, from)| {*to += *from*level_shift});
+    // M1 optimization: pre-slice eigenvector to the occ block.
+    // Cost: one-time copy of [nao, |column_dim|] = num_basis * num_loc_col * 8 bytes.
+    // For num_loc_col=64, num_basis=3035: ~1.5 MB. Negligible.
+    let mut eigvec_occ_data = vec![0.0_f64; num_basis * num_loc_col];
+    let eigvec_src = eigenvector.data_ref().expect("eigenvector must be contiguous");
+    for j in 0..num_loc_col {
+        let src_off = (column_dim.start + j) * num_basis;
+        let dst_off = j * num_basis;
+        eigvec_occ_data[dst_off..dst_off + num_basis]
+            .copy_from_slice(&eigvec_src[src_off..src_off + num_basis]);
+    }
+    let eigvec_occ = MatrixFull::from_vec([num_basis, num_loc_col], eigvec_occ_data).unwrap();
+
+    let mut rimo = RIFull::new([num_auxbs, num_loc_row, num_loc_col], 0.0);
+    let (sender, receiver) = channel();
+
+    rimatr_chunk.data_ref().unwrap().par_chunks_exact(num_bpair).enumerate().for_each_with(sender, |s, (i_auxbs, m)| {
+
+        omp_set_num_threads_wrapper(1);
+
+        let mut reduced_ri = MatrixFull::new([num_basis, num_basis], 0.0_f64);
+        reduced_ri.iter_matrixupper_mut().unwrap().zip(m.iter()).for_each(|(to, from)| {*to = *from});
+
+        // M1: dsymm with sliced eigenvector [nao, |column_dim|] (NOT full [nao, nmo])
+        let mut tmp_mat = MatrixFull::new([num_basis, num_loc_col], 0.0_f64);
+        _dsymm(&reduced_ri, &eigvec_occ, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
+
+        // dgemm: eigenvector[:, row_dim].T × tmp_mat -> [num_loc_row, num_loc_col]
+        // loc_ri3mo[a, i] = sum_u eigenvector[u, a] * tmp_mat[u, i]
+        let mut loc_ri3mo = MatrixFull::new([num_loc_row, num_loc_col], 0.0_f64);
+        _dgemm(
+            eigenvector, ((0..num_basis), row_dim.clone()), 'T',
+            &tmp_mat, ((0..num_basis), (0..num_loc_col)), 'N',
+            &mut loc_ri3mo, ((0..num_loc_row), (0..num_loc_col)),
+            1.0, 0.0
+        );
+        s.send((loc_ri3mo, i_auxbs)).unwrap()
+    });
+    receiver.into_iter().for_each(|(loc_ri3mo, i_auxbs)| {
+        rimo.copy_from_matr(0..num_loc_row, 0..num_loc_col, i_auxbs, 2, &loc_ri3mo, 0..num_loc_row, 0..num_loc_col)
+    });
+
+    omp_set_num_threads_wrapper(default_omp_num_threads);
+
+    Ok((rimo, row_dim, column_dim))
 }
 
 pub fn diagonalize_hamiltonian_outside(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> ([MatrixFull<f64>;2], [Vec<f64>;2], usize) {
@@ -5894,10 +5103,22 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         scf_data.refresh_solvent();
     }
     scf_data.generate_hf_hamiltonian(mpi_operator);
+    scf_data.grad_dm = scf_data.get_grad_dm();
 
     let mut scf_records=ScfTraceRecord::initialize(&scf_data);
 
-    if scf_data.mol.ctrl.print_level>0 {println!("The total energy: {:20.10} Ha by the initial guess",scf_data.scf_energy)};
+    if scf_data.mol.ctrl.print_level>0 {
+        info!("The total energy: {:20.10} Ha by the initial guess",scf_data.scf_energy);
+        match scf_data.scftype {
+            SCFType::RHF | SCFType::ROHF => {
+                info!("Initial grad_dm l2: {:10.5e} Ha", norm(&scf_data.grad_dm[0], "l2"))
+            }
+            SCFType::UHF => {
+                info!("Initial grad_dm l2: ({:10.5e},{:10.5e}) Ha",
+                    norm(&scf_data.grad_dm[0], "l2"), norm(&scf_data.grad_dm[1], "l2"))
+            }
+        }
+    }
     //let mut scf_continue = true;
     if scf_data.mol.ctrl.noiter {
         println!("Warning: the SCF iteration is skipped!");
@@ -5941,6 +5162,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         let dt1 = time::Local::now();
 
         scf_records.prepare_next_input(scf_data, mpi_operator);
+        // scf_data.grad_dm = scf_data.get_grad_dm();
 
         let dt1_1 = time::Local::now();
 
@@ -6002,6 +5224,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             // rebuild dependent quantities so subsequent SCF iterations are consistent
             scf_data.generate_density_matrix();
             scf_data.generate_hf_hamiltonian(mpi_operator);
+            scf_data.grad_dm = scf_data.get_grad_dm();
             scf_data.diagonalize_hamiltonian(mpi_operator);
             scf_data.generate_occupation();
 
@@ -6062,7 +5285,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         }
     }
     if scf_converge[0] {
-        if scf_data.mol.ctrl.print_level>0 {println!("SCF is converged after {:4} iterations.", scf_records.num_iter-1)};
+        info!("SCF is converged after {:4} iterations.", scf_records.num_iter-1);
         // Level shift is disabled before the final diagonalization to ensure accurate eigenvalues.
         // Formatted printing of eigenvalues and eigenvectors is now performed after re-diagonalizing the HF Hamiltonian.
     } else {
@@ -6071,20 +5294,29 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     }
     match scf_data.mol.ctrl.occupation_type {
         OCCType::FRAC => {
-            let (occupation, homo, lumo) = check_norm::generate_occupation_integer(&scf_data.mol, &scf_data.scftype);
+            let (occupation, homo, lumo) = occupation::generate_occupation_integer(&scf_data.mol, &scf_data.scftype);
             scf_data.occupation = occupation;
             scf_data.homo = homo;
             scf_data.lumo = lumo;
             scf_data.generate_density_matrix();
             scf_data.generate_hf_hamiltonian(mpi_operator);
+            scf_data.grad_dm = scf_data.get_grad_dm();
             scf_data.diagonalize_hamiltonian(mpi_operator);
             scf_data.generate_occupation();
 
         }
         _ => {
             scf_data.generate_hf_hamiltonian(mpi_operator); 
+            scf_data.grad_dm = scf_data.get_grad_dm();
+            info!("Energy: {:20.10} Ha", scf_data.scf_energy);
+            info!("grad_dm l2: {:10.5e} Ha", norm(&scf_data.grad_dm[0], "l2"));
             scf_data.diagonalize_hamiltonian(mpi_operator);
-            scf_data.generate_occupation(); 
+            scf_data.generate_occupation();
+            // scf_data.generate_density_matrix();
+            // scf_data.generate_hf_hamiltonian(mpi_operator);
+            // scf_data.grad_dm = scf_data.get_grad_dm();
+            // info!("Energy: {:20.10} Ha", scf_data.scf_energy);
+            // info!("grad_dm l2: {:10.5e} Ha", norm(&scf_data.grad_dm[0], "l2"));
         }
     }
 
@@ -6414,7 +5646,9 @@ pub fn evaluate_spin_angular_momentum_wrong(dm: &Vec<MatrixFull<f64>>, ovlp: &Ma
         [0.75*(tr_spin_angular_momentum[0]+tr_spin_angular_momentum[1]),
          0.50*(tr_spin_angular_momentum[0]-tr_spin_angular_momentum[1])]
     }
-} 
+}
+
+
 
 
 pub fn evaluate_spin_angular_momentum(dm: &Vec<MatrixFull<f64>>, ovlp: &MatrixUpper<f64>, spin_channel: usize, num_elec: &[f64;3]) -> [f64;2] {
@@ -6447,35 +5681,63 @@ pub fn evaluate_spin_angular_momentum(dm: &Vec<MatrixFull<f64>>, ovlp: &MatrixUp
 
 }
 
-pub fn print_force_for_ghost_point_charges(scf_data: &SCF) {
-    if let Some(ghost_forces) = scf_data.compute_ghost_charge_forces() {
-        if scf_data.mol.ctrl.print_level > 0 {
-            println!("Calculating forces on ghost point charges");
-        }
-    
-        
-        println!("------ Forces on point charges [a.u.] ------");
-        let geom = &scf_data.mol.geom;
+/// Compute the DIIS error matrix for one spin channel:  e = F·D·S − S·D·F
+pub fn get_grad_dm(
+    fock: &MatrixFull<f64>,
+    ovlp: &MatrixFull<f64>,
+    density: &MatrixFull<f64>,
+) -> MatrixFull<f64> {
+    // FDS = F * D * S
+    let mut error = fock.clone().ddot(&mut density.clone()).unwrap();
+    error = error.ddot(&mut ovlp.clone()).unwrap();
 
-        ghost_forces.iter_columns_full().enumerate()
-            .zip(geom.ghost_pc_pos.iter_columns_full())
-            .zip(geom.ghost_pc_chrg.iter())
-            .for_each(|(((i,force),position),charge)| {
-            let elem_str = format!("Q{:04}", i+1);  
-            let force_str = format!("{:15.8}{:15.8}{:15.8}", 
-                                force[0], force[1], force[2]);
-            println!("    {:<8} {}", elem_str, force_str);
-            if scf_data.mol.ctrl.print_level > 1 {
-                println!("      Charge: {:.6}, Position: [{:.6}, {:.6}, {:.6}]", 
-                        charge, position[0], position[1], position[2]);
-            }
-        });
-        println!("--------------------------------------------");
-    } else {
-        if scf_data.mol.ctrl.print_level > 0 {
-            println!("No ghost point charges found");
-        }
-    }
+    // SDF = S * D * F
+    let mut sdf = ovlp.clone().ddot(&mut density.clone()).unwrap();
+    sdf = sdf.ddot(&mut fock.clone()).unwrap();
+
+    error.self_sub(&sdf);
+    error
 }
 
+impl SCF {
+    pub fn get_grad_dm(&self) -> [MatrixFull<f64>; 2] {
+        let ovlp_full = self.ovlp.to_matrixfull().unwrap();
+        let mut e = [MatrixFull::empty(), MatrixFull::empty()];
+        if let SCFType::ROHF = self.scftype {
+            let dm_tot = self.density_matrix[0].clone() + self.density_matrix[1].clone();
+            let fock = self.roothaan_hamiltonian.as_ref().unwrap().to_matrixfull().unwrap();
+            let grad = get_grad_dm(&fock, &ovlp_full, &dm_tot);
+            return [grad, MatrixFull::empty()];
+        }
+        for i_spin in 0..self.mol.spin_channel {
+            let f = self.hamiltonian[i_spin].to_matrixfull().unwrap();
+            e[i_spin] = get_grad_dm(&f, &ovlp_full, &self.density_matrix[i_spin]);
+        }
+        e
+    }
 
+}
+
+impl SCF {
+    /// Free the large tensors in SCF struct to save memory after SCF calculation is done.
+    /// 
+    /// This function is initially written for geometric optimization, in order to give
+    /// approximately correct memory estimation for next step.
+    pub fn free_large_tensors(&mut self) {
+        self.ijkl = None;
+        self.ri3fn = None;
+        self.ri3fn_sr = None;
+        self.ri3fn_isdf = None;
+        self.tab_ao = None;
+        self.m = None;
+        self.rimatr = None;
+        self.rimatr_sr = None;
+        self.ri3mo = None;
+        self.ri3mo_full = None;
+        self.ri3fn_bse = None;
+        self.rimatr_bse = None;
+        self.grids = None;
+        self.solvent_static_obj = None;
+        self.solvent_scf = None;
+    }
+}

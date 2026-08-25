@@ -7,9 +7,6 @@ pub static SG1RADII: [f64; 19] = [0.0, 1.0000, 0.5882,   //H, He
 3.0769, 2.0513, 1.5385, 1.2308, 1.0256, 0.8791, 0.7692, 0.6838,  //2nd Period
 4.0909, 3.1579, 2.5714, 2.1687, 1.8750, 1.6514, 1.4754, 1.3333];  //3rd Period
 
-/// Bohr radius.
-pub const BOHR: f64 = 0.52917721092;
-
 /// Bragg radii for elements.
 pub static BRAGG0: [f64; 131] = [0.0,  // Ghost atom
 0.35,                                     1.40,             // 1s

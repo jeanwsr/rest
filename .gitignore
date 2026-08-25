@@ -19,3 +19,9 @@ src/dft/libxc/names_and_values.rs
 src/solvent/grad_solver_derivation.md
 *.bak
 *.rs.*
+/docs/
+# GeomeTRIC optimization artifacts
+GeomeTRIC*
+# Hessian output files
+HessianMatrix.txt
+EigenModes.txt

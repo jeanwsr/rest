@@ -8,9 +8,9 @@ build = "build.rs"
 [dependencies]
 anyhow = "1"
 time = "0.1.12"
-clap = "3.0.0-beta.2"
+clap = "3.*"
 regex = "1.*"
-itertools = "0.8"
+itertools = "0.15"
 serde_json = "1.0"
 serde = {version="1.0",features=["derive"]}
 serde-inline-default = "1.0"
@@ -31,8 +31,7 @@ lazy_static = "1.4"
 toml = "0.8"
 #tuple-conv = "1.0.1"
 num-traits = "0.2.15"
-statrs = "0.13"
-rand = "0.3"
+rand = "0.9"
 array_tool = "1.0.3"
 fuzzy-matcher = "0.3.7"
 #ndarray = "0.15.6"
@@ -44,7 +43,7 @@ fuzzy-matcher = "0.3.7"
 #rust_libecpint = {path="../rust_libecpint"}
 # seems to pull in libssl and libcrypto which is rejected by manylinux
 reqwest = { version = "0.10", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-mpi = {version = "0.8.0", features = ["user-operations", "derive"], optional = true}
+mpi = {version = "0.8", features = ["user-operations", "derive"], optional = true}
 # for cuda
 #cudarc = "0.10.0"
 rest_tensors = {path="../rest_tensors"}
@@ -57,6 +56,7 @@ rstsr-core = { version = "0.7", default-features = false }
 rstsr-openblas = { version = "0.7", features = ["openmp"] }
 tblis = { version = "0.2", features = ["dynamic_loading"] }
 derive_builder = { version = "0.20" }
+indexmap = { version = "2.14" }
 
 dftd3 = { version = "0.2", optional = true }
 dftd4 = { version = "0.2", optional = true }
@@ -64,6 +64,8 @@ libxc = { version = "0.1", features = ["api-v7_0", "dynamic_loading"] }
 geometric-pyo3 = { version = "0.1.1", optional = true }
 
 approx = "0.5"
+log = "0.4"
+env_logger = "0.11"
 
 [build-dependencies]
 dunce = "1.0"

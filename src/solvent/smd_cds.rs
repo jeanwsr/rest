@@ -62,8 +62,8 @@
 //!
 //! ## Unit Conversions
 //!
-//! - `TO_ANGS = 0.529177` Bohr → Å
-//! - `TO_KCAL = 627.509` Hartree → kcal/mol
+//! - `TO_ANGS = BOHR` Bohr → Å
+//! - `TO_KCAL = HARTREE2KCAL` Hartree → kcal/mol
 //! - Internal computation in Å and kcal/mol; public API input/output in Bohr and Hartree.
 //!
 //! ## References
@@ -74,6 +74,7 @@
 
 use std::f64::consts::PI;
 use tensors::MatrixFull;
+use crate::constants::{BOHR, HARTREE2KCAL};
 
 // ============================================================================
 //  Debug printing helper (controlled by env var REST_CDS_DEBUG=1)
@@ -1880,8 +1881,8 @@ fn cds_eg(
     coords: &[[f64; 3]], atomic_numbers: &[usize],
     sigma: &[f64; 151], hsigma: &[f64; 151], rad: &[f64],
 ) -> (f64, f64, Vec<[f64; 3]>) {
-    const TO_ANGS: f64 = 0.52917724924;    // Bohr → Å
-    const TO_KCAL: f64 = 627.509451;       // Hartree → kcal/mol
+    const TO_ANGS: f64 = BOHR;    // Bohr → Å
+    const TO_KCAL: f64 = HARTREE2KCAL;       // Hartree → kcal/mol
 
     // ---- Build rlio (pairwise distances, Å) and urlio (unit vectors) ----
     let ncot = nat * (nat + 1) / 2;
@@ -2135,12 +2136,12 @@ pub fn compute_cds(
         cds_print_scalar("gcds_kcal (CDS energy, kcal/mol)", gcds_kcal);
         cds_print_scalar("tarea (total SASA, A^2)", tarea);
         cds_print_grad("dcds (CDS gradient, Hartree/Bohr)", &dcds);
-        const TO_KCAL: f64 = 627.509451;
+        const TO_KCAL: f64 = HARTREE2KCAL;
         cds_print_scalar("gcds_hartree (CDS energy, Hartree)", gcds_kcal / TO_KCAL);
     }
 
     // kcal/mol → Hartree (gradient already in Hartree/Bohr from cds_eg)
-    const TO_KCAL: f64 = 627.509451;
+    const TO_KCAL: f64 = HARTREE2KCAL;
     let gcds = gcds_kcal / TO_KCAL;
 
     (gcds, tarea, dcds)

@@ -12,6 +12,6 @@
 ///   - Pople-type subspace iteration
 ///   - Handles large systems efficiently
 
-pub mod cphf_solver;
+pub mod cphf_solver_pyscf;
 
-pub use cphf_solver::{CPHFSolver, build_dipole_h1, build_dipole_h1_comp, test_cphf_dense};
+pub use cphf_solver_pyscf::{CPHFSolverPySCF, build_dipole_h1_comp, transform_h1ao_ao2mo, build_s1ao_deriv, transform_s1ao_ao2mo};

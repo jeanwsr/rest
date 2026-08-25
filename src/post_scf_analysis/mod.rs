@@ -1,6 +1,7 @@
 #![warn(unused_imports)]
 pub mod rand_wf_real_space;
 pub mod cube_build;
+pub mod hirshfeld;
 pub mod molden_build;
 pub mod mulliken;
 pub mod strong_correlation_correction;
@@ -10,7 +11,7 @@ pub mod spin_correction;
 use rest_libcint::prelude::rest_libcint_wrapper::int1e_r;
 use tensors::{MathMatrix, RIFull};
 
-use crate::constants::{ANG, AU2DEBYE};
+use crate::constants::{BOHR, AU2DEBYE};
 use crate::grad::{formated_force, formated_force_ev, numerical_force};
 use crate::mpi_io::MPIOperator;
 use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon, open_shell_sbge2_rayon};
@@ -18,7 +19,8 @@ use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon};
 use crate::ri_rpa::{evaluate_rpa_correlation_rayon};
 use crate::ri_gw;
 use crate::ri_bse;
-use crate::scf_io::{SCF, SCFType, print_force_for_ghost_point_charges};
+use crate::scf_io::{SCF, SCFType};
+use crate::scf_io::print::print_force_for_ghost_point_charges;
 use crate::ri_pt2::{close_shell_pt2_rayon, open_shell_pt2_rayon};
 use crate::utilities::TimeRecords;
 
@@ -127,9 +129,14 @@ pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
                 let dp = evaluate_dipole_moment(scf_data, None);
                 println!("Dipole Moment in DEBYE: {:16.8}, {:16.8}, {:16.8}", dp[0], dp[1], dp[2]);
             }
+        } else if output_type.eq("hirshfeld") || output_type.eq("hirshfeld_charge") {
+            if mpi_operator.is_some() {
+                panic!("The MPI version is not yet implemented for Hirshfeld charge analysis");
+            }
+            hirshfeld::print_hirshfeld_analysis(scf_data);
         } else if output_type.eq("num_force") {
             let displace = match scf_data.mol.geom.unit {
-                crate::geom_io::GeomUnit::Angstrom => scf_data.mol.ctrl.nforce_displacement/ANG,
+                crate::geom_io::GeomUnit::Angstrom => scf_data.mol.ctrl.nforce_displacement/BOHR,
                 crate::geom_io::GeomUnit::Bohr => scf_data.mol.ctrl.nforce_displacement,
             };
             let (energy, num_force) = numerical_force(scf_data, displace, mpi_operator);
@@ -289,9 +296,10 @@ pub fn post_scf_correlation(scf_data: &mut SCF) {
     }
 }
 
-pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>){
+pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>) -> crate::ri_bse::BseOutput {
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let output_type=qp_ctrl.gw_or_bse.clone();
+    let mut bse_output = crate::ri_bse::BseOutput { first_excitation: None };
     if output_type.eq("gw"){
         let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
         let xc_data=scf_data.mol.xc_data.clone();
@@ -322,8 +330,8 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
         }
-        ri_bse::bse_main(scf_data);
-    }else if output_type.eq("damped_bse"){
+        bse_output = ri_bse::bse_main(scf_data);
+    }else if output_type.eq("response_bse"){
         if qp_ctrl.gw_scheme=="parse from file"{
             let parse_qp_path=qp_ctrl.parse_qp_path.clone();
             scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
@@ -331,7 +339,7 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
         }
-        let p_induced=ri_bse::damped::damped_bse(scf_data);
+        let p_induced=ri_bse::response::response_bse(scf_data);
         // println!("Induced Density Matrix:");
         // println!("P Real (Plus Half):\n{:#?}",p_induced.0);
         // println!("P Real (Minus Half):\n{:#?}",p_induced.1);
@@ -361,6 +369,7 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
     }else{
         print!("Warning: You entered an invalid quasiparticle method. No quasiparticle methods Were triggered.")
     }
+    bse_output
 }
 
 fn fciqmc_dump(scf_data: &SCF) {
@@ -436,6 +445,7 @@ pub fn evaluate_dipole_moment(scf_data: &SCF, orig: Option<[f64;3]>) -> [f64;3] 
             let acc_r = dm_col.iter().zip(ao_dip_col.iter()).fold(0.0, |acc_r, (dm_val, ao_dip_val)| {acc_r + dm_val*ao_dip_val});
             acc_c + acc_r
         });
+
     }
 
     cint_data.set_common_origin(p_orig);

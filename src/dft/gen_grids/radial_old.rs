@@ -8,7 +8,7 @@ use std::f64::consts::PI;
 use super::bragg;
 use super::bse;
 use super::parameters;
-use statrs::function::gamma;
+use libm::tgamma;
 
 #[cfg(test)]
 use super::comparison;
@@ -239,7 +239,7 @@ fn get_r_outer(max_error: f64, alpha_outer: f64, l: usize, guess: f64) -> f64 {
     let mut r = guess;
 
     while (r_old - r).abs() > parameters::SMALL {
-        let c = gamma::gamma((m + 3.0) / 2.0);
+        let c = tgamma((m + 3.0) / 2.0);
         let a = (alpha_outer * r * r).powf((m + 1.0) / 2.0);
         let e = (-alpha_outer * r * r).exp();
         let f = c * a * e;
@@ -311,7 +311,7 @@ fn get_h(max_error: f64, l: usize, guess: f64) -> f64 {
 
     while (h_old - h).abs() > parameters::SMALL {
         let c0 = 4.0 * (2.0 as f64).sqrt() * pi;
-        let cm = gamma::gamma(3.0 / 2.0) / gamma::gamma((m + 3.0) / 2.0);
+        let cm = tgamma(3.0 / 2.0) / tgamma((m + 3.0) / 2.0);
         let p0 = 1.0 / h;
         let e0 = (-pi * pi / (2.0 * h)).exp();
         let pm = (pi / h).powf(m / 2.0);

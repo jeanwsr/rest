@@ -8,7 +8,7 @@ use mpi::collective::SystemOperation;
 use crate::mpi_io::{mpi_allreduce, mpi_broadcast, mpi_broadcast_vector};
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, IntoParallelRefIterator};
 use rayon::slice::ParallelSlice;
-use rest_tensors::{TensorOpt,RIFull, MatrixFull};
+use rest_tensors::{TensorOpt,RIFull, MatrixFull, MatrixFullSlice};
 use rest_tensors::matrix_blas_lapack::{_dgemm_nn,_dgemm_tn};
 use sbge2::{close_shell_sbge2_rayon_mpi, open_shell_sbge2_rayon_mpi};
 use serde::{Deserialize, Serialize};
@@ -94,12 +94,48 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     let xc_energy_xdh = scf_data.evaluate_xc_energy(1, mpi_operator);
     scf_data.energies.insert(String::from("x_hf"), vec![x_energy]);
     timerecords.count("xc_energy");
+
+    // If post_ai_correction (e.g. SCC15) will run after xdh_calculations,
+    // pre-compute the PBE exchange energy it needs, since we are about to
+    // free the DFT grids.  SCC15 uses x_pbe to compute dxpbe = (x_pbe - x_hf)/x_hf.
+    if !scf_data.mol.ctrl.post_ai_correction.to_lowercase().eq("none") {
+        if let Some(grids) = &scf_data.grids {
+            let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);
+            let post_xc_energy = dfa.post_xc_exc(
+                &vec![String::from("gga_x_pbe")], grids,
+                &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation,
+            );
+            let x_pbe = post_xc_energy[0][0] + post_xc_energy[0][1];
+            scf_data.energies.insert(String::from("x_pbe"), vec![x_pbe]);
+        }
+    }
+
+    // Free DFT grid data before entering PT2/post-SCF correlation.
+    // The grids (ao, aop, compressed variants) can consume 40-100+ GB for
+    // large systems.  After the XC energy evaluation (and the optional PBE
+    // pre-computation above), grids are no longer needed.
+    scf_data.grids = None;
+
     let dfa_family_pos = scf_data.mol.xc_data.dfa_family_pos.clone().unwrap();
 
-    let use_new_driver = mpi_operator.is_none()
+    let use_new_driver = scf_data.mol.ctrl.ri_pt2.new_driver
+        && mpi_operator.is_none()
         && dfa_family_pos == crate::dft::DFAFamily::PT2
         && matches!(scf_data.scftype, SCFType::RHF | SCFType::UHF);
     
+    // Streaming PT2 is enabled when all of:
+    //   - ri_pt2.streaming = true
+    //   - rimatr is materialized (use_ri_symm = true, not isdf)
+    //   - PT2 family (not SBGE2/SCSRPA, which use their own drivers)
+    //   - new_driver is not also requested (precedence: new_driver > streaming)
+    //   - MPI not active (single-node only for now)
+    let use_streaming = !use_new_driver
+        && scf_data.mol.ctrl.ri_pt2.streaming
+        && mpi_operator.is_none()
+        && scf_data.mol.ctrl.use_ri_symm
+        && scf_data.rimatr.is_some()
+        && dfa_family_pos == crate::dft::DFAFamily::PT2;
+
     if use_new_driver {
         // we have already checked dfa_family_pos = PT2
         let spin_orb_indices = split_indices_by_spin_occ(&scf_data.occupation, 0.5);
@@ -139,6 +175,26 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
             },
             SCFType::ROHF => unreachable!("currently not implemented, and should not go here due to `use_new_driver` condition"),
         };
+    } else if use_streaming {
+        // Streaming PT2: process occ orbitals in blocks, never materialize full ri3mo.
+        // See `*_pt2_rayon_streaming` docstrings for memory and FLOPs analysis.
+        // ROHF needs semi-canonical orbitals/eigenvalues/Fock; mirror what
+        // generate_ri3mo_rayon does at scf_io/mod.rs:3245-3247.
+        if let SCFType::ROHF = scf_data.scftype {
+            scf_data.semi_diagonalize_hamiltonian();
+        }
+        let block_size = scf_data.mol.ctrl.ri_pt2.stream_block_size;
+        timerecords.count_start("ao2mo");
+        // (ao2mo is interleaved with PT2 contraction inside the streaming drivers;
+        // we keep the timer label for parity with the legacy driver.)
+        timerecords.count("ao2mo");
+        timerecords.count_start("c_r5dft");
+        pt2_c = match scf_data.scftype {
+            SCFType::RHF => close_shell_pt2_rayon_streaming(scf_data, block_size).unwrap(),
+            SCFType::UHF => open_shell_pt2_rayon_streaming(scf_data, block_size).unwrap(),
+            SCFType::ROHF => restricted_open_shell_pt2_rayon_streaming(scf_data, block_size).unwrap(),
+        };
+        timerecords.count("c_r5dft");
     } else if scf_data.mol.ctrl.use_ri_symm {
         timerecords.count_start("ao2mo");
         crate::scf_io::generate_ri3mo_rayon_for_pt2_and_rpa(scf_data);
@@ -1713,4 +1769,814 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
     }
     #[cfg(not(feature = "mpi"))]
     { restricted_open_shell_pt2_rayon(scf_data) }
+}
+
+// ============================================================================
+// Streaming PT2 main loop with M1-optimized ao2mo.
+//
+// These routines are an algorithmic alternative to the legacy
+// `*_pt2_rayon[_mpi]` functions. Instead of materializing the full
+// `ri3mo[naux, nvir, nocc]` tensor via `generate_ri3mo_rayon` and then doing
+// the pair-contraction loop, they process occupied orbitals in blocks of
+// `block_size`. For each (block_i, block_j) pair, only the corresponding
+// columns of `ri3mo` are produced (via `ao2mo_rayon_m1`, which contracts the
+// smaller occ side first); the full tensor is never stored.
+//
+// Memory model at peak:
+//   rimatr (constant) + 2 * [naux, nvir, B] + per-thread scratch
+//
+// Total FLOPs are essentially identical to the non-streaming M1 path
+// (i.e. ~40% lower than `ao2mo_rayon_v02` for the ao2mo stage). The only
+// extra cost is `nocc / B` re-reads of `rimatr` columns, which adds < 1%
+// overhead for typical B = 32..64.
+// ============================================================================
+
+/// Resolve the streaming block size: explicit override if given, otherwise
+/// pick the smallest power of two such that `B^2 >= 4 * nthreads` (so each
+/// block-pair has at least 4× more (i, j) pairs than threads for rayon to
+/// balance). Clamped to [16, 128].
+fn resolve_block_size(override_b: Option<usize>, nocc: usize) -> usize {
+    if let Some(b) = override_b {
+        return b.max(1).min(nocc.max(1));
+    }
+    let nthreads = rayon::current_num_threads();
+    let lower = ((4 * nthreads) as f64).sqrt().ceil() as usize;
+    let mut b = 16.max(lower);
+    while b < 64 && b * b < (4 * nthreads) { b *= 2; }
+    b = b.min(128).min(nocc.max(1));
+    b.max(1)
+}
+
+/// Per-pair PT2 contribution for closed-shell.
+///
+/// Returns `(e_ss, e_os)` for one (i_state, j_state) pair. The caller is
+/// responsible for the i ≠ j symmetry factor (multiply by 2).
+///
+/// Reuses the same accumulation pattern as `close_shell_pt2_rayon` but
+/// parameterized by the two RI slices so it can be called from both the
+/// legacy and the streaming drivers.
+fn pt2_pair_contrib_closed(
+    ri_i: &MatrixFullSlice<'_, f64>,
+    ri_j: &MatrixFullSlice<'_, f64>,
+    num_auxbas: usize,
+    vir_range: &std::ops::Range<usize>,
+    eigenvalues: &[f64],
+    occupation: &[f64],
+    num_state: usize,
+    lumo: usize,
+    i_state: usize,
+    j_state: usize,
+) -> (f64, f64) {
+    let i_state_eigen = eigenvalues.get(i_state).unwrap();
+    let j_state_eigen = eigenvalues.get(j_state).unwrap();
+    let ij_state_eigen = i_state_eigen + j_state_eigen;
+    let i_state_occ = occupation.get(i_state).unwrap() / 2.0;
+    let j_state_occ = occupation.get(j_state).unwrap() / 2.0;
+
+    let mut e_ss = 0.0_f64;
+    let mut e_os = 0.0_f64;
+
+    if i_state_occ.abs() > 1.0e-6 && j_state_occ.abs() > 1.0e-6 {
+        let nvir = vir_range.len();
+        let mut eri_virt = MatrixFull::new([nvir, nvir], 0.0_f64);
+        _dgemm(
+            ri_i, (0..num_auxbas, 0..nvir), 'T',
+            ri_j, (0..num_auxbas, 0..nvir), 'N',
+            &mut eri_virt, (0..nvir, 0..nvir),
+            1.0, 0.0,
+        );
+
+        for i_virt in lumo..num_state {
+            let i_virt_eigen = eigenvalues.get(i_virt).unwrap();
+            let i_virt_occ = occupation.get(i_virt).unwrap() / 2.0;
+            if (1.0 - i_virt_occ).abs() <= 1.0e-6 { continue; }
+            let i_loc_virt = i_virt - vir_range.start;
+            for j_virt in lumo..num_state {
+                let j_virt_occ = occupation.get(j_virt).unwrap() / 2.0;
+                if (1.0 - j_virt_occ).abs() <= 1.0e-6 { continue; }
+                let j_virt_eigen = eigenvalues.get(j_virt).unwrap();
+                let ij_virt_eigen = i_virt_eigen + j_virt_eigen;
+
+                let mut double_gap = ij_virt_eigen - ij_state_eigen;
+                if double_gap.abs() <= 1.0e-6 {
+                    double_gap = 1.0e-6;
+                }
+                double_gap /= (i_state_occ * j_state_occ * (1.0 - i_virt_occ) * (1.0 - j_virt_occ));
+
+                let j_loc_virt = j_virt - vir_range.start;
+                let e_mp2_a = eri_virt.get2d([i_loc_virt, j_loc_virt]).unwrap();
+                let e_mp2_b = eri_virt.get2d([j_loc_virt, i_loc_virt]).unwrap();
+                e_ss += (e_mp2_a - e_mp2_b) * e_mp2_a / double_gap;
+                e_os += e_mp2_a * e_mp2_a / double_gap;
+            }
+        }
+    }
+    (e_ss, e_os)
+}
+/// Streaming closed-shell PT2 driver with Fix B pipelining.
+///
+/// Pipelining strategy: for each (block_i, block_j) pair, the ao2mo for the
+/// NEXT needed block is spawned as a scoped thread during the current PT2
+/// contraction. The pre-fetch and PT2 share the global rayon pool via
+/// work-stealing. Since PT2 is heavily compute-bound (~50 s/block-pair,
+/// 190 FLOP/byte) and ao2mo is moderately memory-bound (~5 s/block,
+/// 48 FLOP/byte), they complement each other: PT2 saturates FMA units
+/// while ao2mo uses spare memory bandwidth.
+///
+/// Memory: block_i + block_j + pre-fetch-in-progress ≤ 3 × [naux, nvir, B].
+/// For B=64, naux=7619, nvir=1517: 3 × 5.9 GB ≈ 18 GB.
+pub fn close_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>) -> anyhow::Result<[f64;3]> {
+    let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
+    let print_level = scf_data.mol.ctrl.print_level;
+
+    let mut e_mp2_ss = 0.0_f64;
+    let mut e_mp2_os = 0.0_f64;
+
+    let (ri3ao, _basbas2baspar, _baspar2basbas) = match &scf_data.rimatr {
+        Some(tuple) => (&tuple.0, &tuple.1, &tuple.2),
+        None => panic!("close_shell_pt2_rayon_streaming: scf_data.rimatr is None; streaming requires rimatr to be materialized (set use_ri_symm = true and use_isdf = false)"),
+    };
+
+    let eigenvector = scf_data.eigenvectors.get(0).unwrap();
+    let eigenvalues = scf_data.eigenvalues.get(0).unwrap();
+    let occupation = scf_data.occupation.get(0).unwrap();
+
+    let homo = scf_data.homo.get(0).unwrap().clone();
+    let lumo = scf_data.lumo.get(0).unwrap().clone();
+    let num_state = eigenvector.size.get(1).unwrap().clone();
+    let start_mo: usize = scf_data.mol.start_mo;
+    let num_occu = if scf_data.mol.num_elec[0] <= 1.0e-6 {0} else {homo + 1};
+
+    let occ_range = start_mo..num_occu;
+    let vir_range = lumo..num_state;
+    let nocc = occ_range.len();
+    let num_auxbas = scf_data.mol.num_auxbas;
+
+    let b = resolve_block_size(block_size, nocc);
+    if print_level > 1 {
+        println!("[streaming-PT2] close_shell: nocc={}, nvir={}, naux={}, block_size={}",
+                 nocc, vir_range.len(), num_auxbas, b);
+    }
+
+    let blocks: Vec<std::ops::Range<usize>> = (0..nocc)
+        .step_by(b)
+        .map(|s| {
+            let start = occ_range.start + s;
+            let end = (start + b).min(occ_range.end);
+            start..end
+        })
+        .collect();
+    let nblocks = blocks.len();
+    if nblocks == 0 {
+        return Ok([0.0, 0.0, 0.0]);
+    }
+
+    // ── Fix B: pipelined block-pair loop ─────────────────────────────────
+    //
+    // Block pair visitation order (upper triangular):
+    //   (0,0) (0,1) ... (0,N-1)  (1,1) (1,2) ... (1,N-1)  ...  (N-1,N-1)
+    //
+    // Pre-fetch logic: during PT2(bi,bj), spawn ao2mo for the NEXT needed block:
+    //   - If bj+1 < N:      next inner iter needs block_(bj+1)  → prefetch it
+    //   - elif bi+1 < N:    next outer iter needs block_(bi+1)  → prefetch it
+    //   - else:             no more blocks
+    //
+    // The pre-fetch scoped thread runs ao2mo_rayon_m1, which uses the global
+    // rayon pool. The main thread's PT2 par_iter also uses the global pool.
+    // Rayon's work-stealing naturally shares the 96 workers between both.
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        // block_i for current outer iteration.
+        // For bi=0: compute synchronously. For bi>0: from pre-fetch of previous outer.
+        let mut ri3mo_i = {
+            let (r, _, _) = crate::scf_io::ao2mo_rayon_m1(
+                eigenvector, ri3ao, vir_range.clone(), blocks[0].clone(),
+            )?;
+            r
+        };
+        // Pre-fetch handle for the NEXT block to be consumed.
+        let mut prefetched: Option<std::thread::ScopedJoinHandle<RIFull<f64>>> = None;
+
+        for bi_idx in 0..nblocks {
+            // At outer-iter boundary (bi_idx > 0): consume pre-fetched block_i.
+            if bi_idx > 0 {
+                ri3mo_i = match prefetched.take() {
+                    Some(handle) => handle.join().unwrap(),
+                    None => {
+                        let (r, _, _) = crate::scf_io::ao2mo_rayon_m1(
+                            eigenvector, ri3ao, vir_range.clone(), blocks[bi_idx].clone(),
+                        )?;
+                        r
+                    }
+                };
+            }
+
+            for bj_idx in bi_idx..nblocks {
+                let same_block = bi_idx == bj_idx;
+
+                // Resolve block_j: alias (diagonal) or pre-fetched or synchronous.
+                let ri3mo_j_owned: Option<RIFull<f64>> = if same_block {
+                    None
+                } else {
+                    match prefetched.take() {
+                        Some(handle) => Some(handle.join().unwrap()),
+                        None => {
+                            let (r, _, _) = crate::scf_io::ao2mo_rayon_m1(
+                                eigenvector, ri3ao, vir_range.clone(), blocks[bj_idx].clone(),
+                            )?;
+                            Some(r)
+                        }
+                    }
+                };
+                let ri3mo_j: &RIFull<f64> = ri3mo_j_owned.as_ref().unwrap_or(&ri3mo_i);
+
+                // Determine which block to pre-fetch during this PT2.
+                let next_block_range: Option<std::ops::Range<usize>> = if bj_idx + 1 < nblocks {
+                    // Same outer iter, next inner: pre-fetch block_(bj_idx+1).
+                    Some(blocks[bj_idx + 1].clone())
+                } else if bi_idx + 1 < nblocks {
+                    // Last inner of this outer: pre-fetch block_(bi_idx+1) for next outer's block_i.
+                    Some(blocks[bi_idx + 1].clone())
+                } else {
+                    None
+                };
+
+                // Spawn pre-fetch (background scoped thread shares rayon pool with PT2).
+                prefetched = next_block_range.map(|occ_range| {
+                    let eigvec = eigenvector;
+                    let ri3ao_ref = ri3ao;
+                    let vir = vir_range.clone();
+                    scope.spawn(move || {
+                        let (r, _, _) = crate::scf_io::ao2mo_rayon_m1(eigvec, ri3ao_ref, vir, occ_range).unwrap();
+                        r
+                    })
+                });
+
+                // ── PT2 contraction for (bi_idx, bj_idx) ────────────────────
+                // This par_iter blocks the main thread; the pre-fetch scoped thread
+                // runs concurrently, sharing the rayon pool via work-stealing.
+                let occ_range_i = &blocks[bi_idx];
+                let occ_range_j = &blocks[bj_idx];
+
+                let mut pairs: Vec<(usize, usize, usize, usize)> = Vec::new();
+                for (i_local, i_global) in occ_range_i.clone().enumerate() {
+                    let j_local_start = if same_block { i_local } else { 0 };
+                    for (j_local, j_global) in occ_range_j.clone().enumerate().skip(j_local_start) {
+                        pairs.push((i_local, j_local, i_global, j_global));
+                    }
+                }
+
+                let ri3mo_i_ref = &ri3mo_i;
+                let (sender, receiver) = channel();
+                pairs.par_iter().for_each_with(sender, |s, &(i_local, j_local, i_global, j_global)| {
+                    omp_set_num_threads_wrapper(1);
+                    let ri_i = ri3mo_i_ref.get_reducing_matrix(i_local).unwrap();
+                    let ri_j = ri3mo_j.get_reducing_matrix(j_local).unwrap();
+                    let (e_ss_pair, e_os_pair) = pt2_pair_contrib_closed(
+                        &ri_i, &ri_j, num_auxbas, &vir_range,
+                        eigenvalues, occupation, num_state, lumo,
+                        i_global, j_global,
+                    );
+                    let (mut e_ss_pair, mut e_os_pair) = (e_ss_pair, e_os_pair);
+                    if i_global != j_global {
+                        e_ss_pair *= 2.0;
+                        e_os_pair *= 2.0;
+                    }
+                    s.send((e_ss_pair, e_os_pair)).unwrap();
+                });
+
+                for (e_ss_pair, e_os_pair) in receiver.into_iter() {
+                    e_mp2_ss -= e_ss_pair;
+                    e_mp2_os -= e_os_pair;
+                }
+
+                // block_j no longer needed; drop before next iteration.
+                drop(ri3mo_j_owned);
+            }
+            // End of outer iter: prefetched holds block_(bi_idx+1) for next outer's block_i.
+        }
+
+        // Drain any remaining pre-fetch (defensive; should be None at this point).
+        if let Some(handle) = prefetched {
+            let _ = handle.join();
+        }
+
+        Ok(())
+    })?;
+
+    omp_set_num_threads_wrapper(default_omp_num_threads);
+    Ok([e_mp2_ss + e_mp2_os, e_mp2_os, e_mp2_ss])
+}
+
+/// Per-pair PT2 contribution for one spin channel (used in open-shell and ROHF).
+///
+/// Computes the SS or OS contribution for the spin pair (i_spin_1, i_spin_2)
+/// at occupied pair (i_state, j_state). The `i_spin_1 == i_spin_2` case is
+/// same-spin (SS); otherwise opposite-spin (OS).
+///
+/// Returns `(e_ss, e_os)` where the unused component is 0.
+fn pt2_pair_contrib_spin(
+    ri_i: &MatrixFullSlice<'_, f64>,
+    ri_j: &MatrixFullSlice<'_, f64>,
+    num_auxbas: usize,
+    vir_range: &std::ops::Range<usize>,
+    eigenvalues: &[f64],
+    occupation: &[f64],
+    num_state: usize,
+    lumo: usize,
+    i_state: usize,
+    j_state: usize,
+    same_spin: bool,
+) -> (f64, f64) {
+    let i_state_eigen = eigenvalues.get(i_state).unwrap();
+    let j_state_eigen = eigenvalues.get(j_state).unwrap();
+    let ij_state_eigen = i_state_eigen + j_state_eigen;
+    let i_state_occ = occupation.get(i_state).unwrap();
+    let j_state_occ = occupation.get(j_state).unwrap();
+
+    let mut e_ss = 0.0_f64;
+    let mut e_os = 0.0_f64;
+
+    if i_state_occ.abs() > 1.0e-6 && j_state_occ.abs() > 1.0e-6 {
+        let nvir = vir_range.len();
+        let mut eri_virt = MatrixFull::new([nvir, nvir], 0.0_f64);
+        _dgemm(
+            ri_i, (0..num_auxbas, 0..nvir), 'T',
+            ri_j, (0..num_auxbas, 0..nvir), 'N',
+            &mut eri_virt, (0..nvir, 0..nvir),
+            1.0, 0.0,
+        );
+
+        for i_virt in lumo..num_state {
+            let i_virt_eigen = eigenvalues.get(i_virt).unwrap();
+            let i_virt_occ = occupation.get(i_virt).unwrap();
+            if (1.0 - i_virt_occ).abs() <= 1.0e-6 { continue; }
+            let i_loc_virt = i_virt - vir_range.start;
+            for j_virt in lumo..num_state {
+                let j_virt_occ = occupation.get(j_virt).unwrap();
+                if (1.0 - j_virt_occ).abs() <= 1.0e-6 { continue; }
+                let j_virt_eigen = eigenvalues.get(j_virt).unwrap();
+                let ij_virt_eigen = i_virt_eigen + j_virt_eigen;
+
+                let mut double_gap = ij_virt_eigen - ij_state_eigen;
+                if double_gap.abs() <= 1.0e-6 {
+                    double_gap = 1.0e-6;
+                }
+                double_gap /= (i_state_occ * j_state_occ * (1.0 - i_virt_occ) * (1.0 - j_virt_occ));
+
+                let j_loc_virt = j_virt - vir_range.start;
+                let e_mp2_a = eri_virt.get2d([i_loc_virt, j_loc_virt]).unwrap();
+                if same_spin {
+                    let e_mp2_b = eri_virt.get2d([j_loc_virt, i_loc_virt]).unwrap();
+                    e_ss += (e_mp2_a - e_mp2_b) * e_mp2_a / double_gap;
+                } else {
+                    e_os += e_mp2_a * e_mp2_a / double_gap;
+                }
+            }
+        }
+    }
+    (e_ss, e_os)
+}
+
+/// Helper: process one spin-pair (i_spin_1, i_spin_2) for one (block_i, block_j)
+/// combination in the open-shell streaming driver.
+///
+/// Returns (e_ss_total, e_os_total) accumulated for this block pair.
+fn open_shell_pt2_streaming_block_pair(
+    scf_data: &SCF,
+    ri3ao: &MatrixFull<f64>,
+    i_spin_1: usize,
+    i_spin_2: usize,
+    occ_range_i: &std::ops::Range<usize>,
+    occ_range_j: &std::ops::Range<usize>,
+    vir_range: &std::ops::Range<usize>,
+    same_block: bool,
+    ri3mo_i: &RIFull<f64>,
+    ri3mo_j_owned: &Option<RIFull<f64>>,
+) -> (f64, f64) {
+    let ri3mo_j: &RIFull<f64> = ri3mo_j_owned.as_ref().unwrap_or(ri3mo_i);
+
+    let eigenvector_1 = &scf_data.eigenvectors[i_spin_1];
+    let eigenvector_2 = &scf_data.eigenvectors[i_spin_2];
+    let _ = eigenvector_2;
+    let eigenvalues_1 = &scf_data.eigenvalues[i_spin_1];
+    let eigenvalues_2 = &scf_data.eigenvalues[i_spin_2];
+    let occupation_1 = &scf_data.occupation[i_spin_1];
+    let occupation_2 = &scf_data.occupation[i_spin_2];
+    let lumo_1 = scf_data.lumo[i_spin_1];
+    let lumo_2 = scf_data.lumo[i_spin_2];
+    let num_state = scf_data.mol.num_state;
+    let num_auxbas = scf_data.mol.num_auxbas;
+    let _ = eigenvector_1;
+
+    // Same spin pair (αα or ββ): SS only.
+    // Cross spin pair (αβ): OS only.
+    let same_spin = i_spin_1 == i_spin_2;
+    let eigenvalues_j = if same_spin { eigenvalues_1 } else { eigenvalues_2 };
+    let occupation_j = if same_spin { occupation_1 } else { occupation_2 };
+    let lumo_j = if same_spin { lumo_1 } else { lumo_2 };
+    let vir_range_j = if same_spin { vir_range.clone() } else { lumo_j..num_state };
+
+    let _ = eigenvalues_j;
+    let _ = occupation_j;
+
+    // Build (i_local, j_local, i_global, j_global) pair list.
+    let mut pairs: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for (i_local, i_global) in occ_range_i.clone().enumerate() {
+        let j_local_start = if same_block { i_local } else { 0 };
+        for (j_local, j_global) in occ_range_j.clone().enumerate().skip(j_local_start) {
+            pairs.push((i_local, j_local, i_global, j_global));
+        }
+    }
+
+    let (sender, receiver) = channel();
+    pairs.par_iter().for_each_with(sender, |s, &(i_local, j_local, i_global, j_global)| {
+        omp_set_num_threads_wrapper(1);
+        let ri_i = ri3mo_i.get_reducing_matrix(i_local).unwrap();
+        let ri_j = ri3mo_j.get_reducing_matrix(j_local).unwrap();
+
+        // For same_spin, both spins use eigenvalues_1/occupation_1/vir_range.
+        // For cross spin, i uses spin_1, j uses spin_2.
+        let (e_ss_pair, e_os_pair);
+        if same_spin {
+            let (ss, _os) = pt2_pair_contrib_spin(
+                &ri_i, &ri_j, num_auxbas, vir_range,
+                eigenvalues_1, occupation_1, num_state, lumo_1,
+                i_global, j_global, true,
+            );
+            e_ss_pair = ss; e_os_pair = 0.0;
+        } else {
+            // Cross-spin: i in spin_1, j in spin_2; uses different eigenvalues/occupation/vir_range.
+            // pt2_pair_contrib_spin assumes same eigenvalues/occ for both i and j; for cross-spin
+            // we need a custom accumulation. Fall back to manual computation here.
+            let i_state_eigen = eigenvalues_1.get(i_global).unwrap();
+            let j_state_eigen = eigenvalues_2.get(j_global).unwrap();
+            let ij_state_eigen = i_state_eigen + j_state_eigen;
+            let i_state_occ = occupation_1.get(i_global).unwrap();
+            let j_state_occ = occupation_2.get(j_global).unwrap();
+
+            let mut e_os_local = 0.0_f64;
+            if i_state_occ.abs() > 1.0e-6 && j_state_occ.abs() > 1.0e-6 {
+                let nvir_1 = vir_range.len();
+                let nvir_2 = vir_range_j.len();
+                let mut eri_virt = MatrixFull::new([nvir_1, nvir_2], 0.0_f64);
+                _dgemm(
+                    &ri_i, (0..num_auxbas, 0..nvir_1), 'T',
+                    &ri_j, (0..num_auxbas, 0..nvir_2), 'N',
+                    &mut eri_virt, (0..nvir_1, 0..nvir_2),
+                    1.0, 0.0,
+                );
+                for i_virt in lumo_1..num_state {
+                    let i_virt_eigen = eigenvalues_1.get(i_virt).unwrap();
+                    let i_virt_occ = occupation_1.get(i_virt).unwrap();
+                    if (1.0 - i_virt_occ).abs() <= 1.0e-6 { continue; }
+                    let i_loc_virt = i_virt - vir_range.start;
+                    for j_virt in lumo_2..num_state {
+                        let j_virt_occ = occupation_2.get(j_virt).unwrap();
+                        if (1.0 - j_virt_occ).abs() <= 1.0e-6 { continue; }
+                        let j_virt_eigen = eigenvalues_2.get(j_virt).unwrap();
+                        let ij_virt_eigen = i_virt_eigen + j_virt_eigen;
+
+                        let mut double_gap = ij_virt_eigen - ij_state_eigen;
+                        if double_gap.abs() <= 1.0e-6 { double_gap = 1.0e-6; }
+                        double_gap /= (i_state_occ * j_state_occ * (1.0 - i_virt_occ) * (1.0 - j_virt_occ));
+
+                        let j_loc_virt = j_virt - vir_range_j.start;
+                        let e_mp2_a = eri_virt.get2d([i_loc_virt, j_loc_virt]).unwrap();
+                        e_os_local += e_mp2_a * e_mp2_a / double_gap;
+                    }
+                }
+            }
+            e_ss_pair = 0.0; e_os_pair = e_os_local;
+        }
+
+        s.send((e_ss_pair, e_os_pair)).unwrap();
+    });
+
+    let mut e_ss = 0.0_f64;
+    let mut e_os = 0.0_f64;
+    for (e_ss_pair, e_os_pair) in receiver.into_iter() {
+        e_ss -= e_ss_pair;
+        e_os -= e_os_pair;
+    }
+    (e_ss, e_os)
+}
+
+/// Streaming open-shell (UKS) PT2 driver.
+///
+/// Loops over the three spin-pair types (αα, αβ, ββ). For each, runs the
+/// closed-shell-style block streaming over occ blocks of the two spin channels.
+pub fn open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>) -> anyhow::Result<[f64;3]> {
+    let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
+    let print_level = scf_data.mol.ctrl.print_level;
+
+    let mut e_mp2_ss = 0.0_f64;
+    let mut e_mp2_os = 0.0_f64;
+
+    let (ri3ao, _basbas2baspar, _baspar2basbas) = match &scf_data.rimatr {
+        Some(tuple) => (&tuple.0, &tuple.1, &tuple.2),
+        None => panic!("open_shell_pt2_rayon_streaming: scf_data.rimatr is None; streaming requires rimatr to be materialized"),
+    };
+
+    let num_state = scf_data.mol.num_state;
+    let start_mo: usize = scf_data.mol.start_mo;
+    let num_auxbas = scf_data.mol.num_auxbas;
+    let _ = num_auxbas;
+
+    let i_spin_pair: [(usize, usize); 3] = [(0, 0), (0, 1), (1, 1)];
+
+    for (i_spin_1, i_spin_2) in i_spin_pair {
+        let eigenvector_1 = &scf_data.eigenvectors[i_spin_1];
+        let homo_1 = scf_data.homo[i_spin_1];
+        let lumo_1 = scf_data.lumo[i_spin_1];
+        let num_occu_1 = if scf_data.mol.num_elec[i_spin_1 + 1] <= 1.0e-6 { 0 } else { homo_1 + 1 };
+        let occ_range_1 = start_mo..num_occu_1;
+        let vir_range_1 = lumo_1..num_state;
+
+        let eigenvector_2 = &scf_data.eigenvectors[i_spin_2];
+        let homo_2 = scf_data.homo[i_spin_2];
+        let lumo_2 = scf_data.lumo[i_spin_2];
+        let num_occu_2 = if scf_data.mol.num_elec[i_spin_2 + 1] <= 1.0e-6 { 0 } else { homo_2 + 1 };
+        let occ_range_2 = start_mo..num_occu_2;
+        let vir_range_2 = lumo_2..num_state;
+
+        let nocc_1 = occ_range_1.len();
+        let nocc_2 = occ_range_2.len();
+        if nocc_1 == 0 || nocc_2 == 0 { continue; }
+
+        let b1 = resolve_block_size(block_size, nocc_1);
+        let b2 = resolve_block_size(block_size, nocc_2);
+        if print_level > 1 {
+            println!("[streaming-PT2] open_shell spin-pair ({}, {}): nocc=({}, {}), block_size=({}, {})",
+                     i_spin_1, i_spin_2, nocc_1, nocc_2, b1, b2);
+        }
+
+        let blocks_1: Vec<std::ops::Range<usize>> = (0..nocc_1)
+            .step_by(b1)
+            .map(|s| {
+                let start = occ_range_1.start + s;
+                let end = (start + b1).min(occ_range_1.end);
+                start..end
+            })
+            .collect();
+        let blocks_2: Vec<std::ops::Range<usize>> = (0..nocc_2)
+            .step_by(b2)
+            .map(|s| {
+                let start = occ_range_2.start + s;
+                let end = (start + b2).min(occ_range_2.end);
+                start..end
+            })
+            .collect();
+
+        for (bi_idx, occ_range_i) in blocks_1.iter().enumerate() {
+            let (ri3mo_i, _, _) = crate::scf_io::ao2mo_rayon_m1(
+                eigenvector_1, ri3ao,
+                vir_range_1.clone(), occ_range_i.clone(),
+            )?;
+
+            for (bj_idx, occ_range_j) in blocks_2.iter().enumerate() {
+                // For (αα) and (ββ), enforce upper triangular block iteration.
+                // For (αβ), iterate all (bi, bj) combinations.
+                if i_spin_1 == i_spin_2 && bj_idx < bi_idx { continue; }
+                let same_block = i_spin_1 == i_spin_2 && bi_idx == bj_idx;
+
+                let ri3mo_j_owned: Option<RIFull<f64>> = if same_block {
+                    None
+                } else {
+                    let (rj, _, _) = crate::scf_io::ao2mo_rayon_m1(
+                        eigenvector_2, ri3ao,
+                        vir_range_2.clone(), occ_range_j.clone(),
+                    )?;
+                    Some(rj)
+                };
+
+                let (e_ss, e_os) = open_shell_pt2_streaming_block_pair(
+                    scf_data, ri3ao, i_spin_1, i_spin_2,
+                    occ_range_i, occ_range_j, &vir_range_1,
+                    same_block, &ri3mo_i, &ri3mo_j_owned,
+                );
+                e_mp2_ss += e_ss;
+                e_mp2_os += e_os;
+            }
+        }
+    }
+
+    omp_set_num_threads_wrapper(default_omp_num_threads);
+    Ok([e_mp2_ss + e_mp2_os, e_mp2_os, e_mp2_ss])
+}
+
+/// Streaming ROHF PT2 driver.
+///
+/// ROHF uses semi-canonical orbitals; the PT2 calculation treats α and β
+/// channels as separate spin channels with the same spatial orbitals but
+/// different occupation/eigenvalue vectors. The single-excitation correction
+/// (CIS-like contribution from singly-occupied orbitals) is computed using
+/// the same logic as `restricted_open_shell_pt2_rayon`.
+pub fn restricted_open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>) -> anyhow::Result<[f64;3]> {
+    let print_level = scf_data.mol.ctrl.print_level;
+
+    // Single-excitation contribution (no ao2mo or rimatr needed; uses semi Fock).
+    let mut e_mp2_single_list = [0.0_f64, 0.0_f64];
+    for i_spin in 0..2 {
+        let eigenvalues_spin = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin];
+        let fock_spin = &scf_data.semi_fock.as_ref().unwrap()[i_spin];
+        for i_occ in 0..scf_data.lumo[i_spin] {
+            for i_virt in scf_data.lumo[i_spin]..scf_data.mol.num_state {
+                let single_gap = eigenvalues_spin[i_virt] - eigenvalues_spin[i_occ];
+                e_mp2_single_list[i_spin] += -fock_spin[(i_virt, i_occ)].powf(2.0) / single_gap;
+            }
+        }
+    }
+
+    let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
+
+    // Double-excitation part: treat as open-shell using semi-canonical orbitals.
+    // semi_eigenvectors[0] = α, semi_eigenvectors[1] = β
+    // For ROHF: occupation/semi_eigenvalues differ between α and β.
+    // We reuse the open-shell streaming driver, but feed semi_eigenvectors.
+    // For now, call open_shell streaming logic with a temporary SCF view.
+    // Since the open-shell driver uses scf_data.eigenvectors/eigenvalues/occupation directly,
+    // and ROHF stores semi quantities in separate fields, we need to dispatch manually.
+
+    let mut e_mp2_ss = 0.0_f64;
+    let mut e_mp2_os = 0.0_f64;
+
+    let (ri3ao, _basbas2baspar, _baspar2basbas) = match &scf_data.rimatr {
+        Some(tuple) => (&tuple.0, &tuple.1, &tuple.2),
+        None => panic!("restricted_open_shell_pt2_rayon_streaming: scf_data.rimatr is None; streaming requires rimatr to be materialized"),
+    };
+
+    let num_state = scf_data.mol.num_state;
+    let start_mo: usize = scf_data.mol.start_mo;
+    let semi_eigenvectors = scf_data.semi_eigenvectors.as_ref().unwrap();
+    let semi_eigenvalues = scf_data.semi_eigenvalues.as_ref().unwrap();
+    // Use occupation from the semi-canonical alpha/beta channels.
+    // For ROHF, occupation[0] = α occupation, occupation[1] = β occupation.
+    let occupation = &scf_data.occupation;
+    let num_auxbas = scf_data.mol.num_auxbas;
+    let _ = num_auxbas;
+
+    let i_spin_pair: [(usize, usize); 3] = [(0, 0), (0, 1), (1, 1)];
+
+    for (i_spin_1, i_spin_2) in i_spin_pair {
+        let eigenvector_1 = &semi_eigenvectors[i_spin_1];
+        let eigenvalues_1 = &semi_eigenvalues[i_spin_1];
+        let occupation_1 = &occupation[i_spin_1];
+        let lumo_1 = scf_data.lumo[i_spin_1];
+        let num_occu_1 = if scf_data.mol.num_elec[i_spin_1 + 1] <= 1.0e-6 { 0 } else { lumo_1 };
+        let occ_range_1 = start_mo..num_occu_1;
+        let vir_range_1 = lumo_1..num_state;
+
+        let eigenvector_2 = &semi_eigenvectors[i_spin_2];
+        let eigenvalues_2 = &semi_eigenvalues[i_spin_2];
+        let occupation_2 = &occupation[i_spin_2];
+        let lumo_2 = scf_data.lumo[i_spin_2];
+        let num_occu_2 = if scf_data.mol.num_elec[i_spin_2 + 1] <= 1.0e-6 { 0 } else { lumo_2 };
+        let occ_range_2 = start_mo..num_occu_2;
+        let vir_range_2 = lumo_2..num_state;
+
+        let nocc_1 = occ_range_1.len();
+        let nocc_2 = occ_range_2.len();
+        if nocc_1 == 0 || nocc_2 == 0 { continue; }
+
+        let b1 = resolve_block_size(block_size, nocc_1);
+        let b2 = resolve_block_size(block_size, nocc_2);
+        if print_level > 1 {
+            println!("[streaming-PT2] ROHF spin-pair ({}, {}): nocc=({}, {}), block_size=({}, {})",
+                     i_spin_1, i_spin_2, nocc_1, nocc_2, b1, b2);
+        }
+
+        let same_spin = i_spin_1 == i_spin_2;
+
+        let blocks_1: Vec<std::ops::Range<usize>> = (0..nocc_1)
+            .step_by(b1)
+            .map(|s| {
+                let start = occ_range_1.start + s;
+                let end = (start + b1).min(occ_range_1.end);
+                start..end
+            })
+            .collect();
+        let blocks_2: Vec<std::ops::Range<usize>> = (0..nocc_2)
+            .step_by(b2)
+            .map(|s| {
+                let start = occ_range_2.start + s;
+                let end = (start + b2).min(occ_range_2.end);
+                start..end
+            })
+            .collect();
+
+        for (bi_idx, occ_range_i) in blocks_1.iter().enumerate() {
+            let (ri3mo_i, _, _) = crate::scf_io::ao2mo_rayon_m1(
+                eigenvector_1, ri3ao,
+                vir_range_1.clone(), occ_range_i.clone(),
+            )?;
+
+            for (bj_idx, occ_range_j) in blocks_2.iter().enumerate() {
+                if same_spin && bj_idx < bi_idx { continue; }
+                let same_block = same_spin && bi_idx == bj_idx;
+
+                let ri3mo_j_owned: Option<RIFull<f64>> = if same_block {
+                    None
+                } else {
+                    let (rj, _, _) = crate::scf_io::ao2mo_rayon_m1(
+                        eigenvector_2, ri3ao,
+                        vir_range_2.clone(), occ_range_j.clone(),
+                    )?;
+                    Some(rj)
+                };
+                let ri3mo_j: &RIFull<f64> = ri3mo_j_owned.as_ref().unwrap_or(&ri3mo_i);
+
+                // Build pair list.
+                let mut pairs: Vec<(usize, usize, usize, usize)> = Vec::new();
+                for (i_local, i_global) in occ_range_i.clone().enumerate() {
+                    let j_local_start = if same_block { i_local } else { 0 };
+                    for (j_local, j_global) in occ_range_j.clone().enumerate().skip(j_local_start) {
+                        pairs.push((i_local, j_local, i_global, j_global));
+                    }
+                }
+
+                let (sender, receiver) = channel();
+                pairs.par_iter().for_each_with(sender, |s, &(i_local, j_local, i_global, j_global)| {
+                    omp_set_num_threads_wrapper(1);
+                    let ri_i = ri3mo_i.get_reducing_matrix(i_local).unwrap();
+                    let ri_j = ri3mo_j.get_reducing_matrix(j_local).unwrap();
+
+                    let i_state_eigen = eigenvalues_1.get(i_global).unwrap();
+                    let j_state_eigen = eigenvalues_2.get(j_global).unwrap();
+                    let ij_state_eigen = i_state_eigen + j_state_eigen;
+                    let i_state_occ = occupation_1.get(i_global).unwrap();
+                    let j_state_occ = occupation_2.get(j_global).unwrap();
+
+                    let mut e_ss_local = 0.0_f64;
+                    let mut e_os_local = 0.0_f64;
+                    if i_state_occ.abs() > 1.0e-6 && j_state_occ.abs() > 1.0e-6 {
+                        let nvir_1 = vir_range_1.len();
+                        let nvir_2 = vir_range_2.len();
+                        let mut eri_virt = MatrixFull::new([nvir_1, nvir_2], 0.0_f64);
+                        _dgemm(
+                            &ri_i, (0..scf_data.mol.num_auxbas, 0..nvir_1), 'T',
+                            &ri_j, (0..scf_data.mol.num_auxbas, 0..nvir_2), 'N',
+                            &mut eri_virt, (0..nvir_1, 0..nvir_2),
+                            1.0, 0.0,
+                        );
+                        for i_virt in lumo_1..num_state {
+                            let i_virt_eigen = eigenvalues_1.get(i_virt).unwrap();
+                            let i_virt_occ = occupation_1.get(i_virt).unwrap();
+                            if (1.0 - i_virt_occ).abs() <= 1.0e-6 { continue; }
+                            let i_loc_virt = i_virt - vir_range_1.start;
+                            // Same-spin case mirrors `restricted_open_shell_pt2_rayon`:
+                            // inner virtual loop is strict upper triangular (j_virt > i_virt),
+                            // and the antisymmetrized integrand is squared:
+                            //   (e_mp2_a - e_mp2_b)^2 / gap
+                            // No factor 2 is applied at the occ-pair level (the upper
+                            // triangular occ iteration already avoids double-counting).
+                            // The OS (cross-spin) case iterates all (i_virt, j_virt).
+                            let j_virt_range: Box<dyn Iterator<Item=usize> + Send> = if same_spin {
+                                Box::new((i_virt + 1)..num_state)
+                            } else {
+                                Box::new(lumo_2..num_state)
+                            };
+                            for j_virt in j_virt_range {
+                                let j_virt_occ = occupation_2.get(j_virt).unwrap();
+                                if (1.0 - j_virt_occ).abs() <= 1.0e-6 { continue; }
+                                let j_virt_eigen = eigenvalues_2.get(j_virt).unwrap();
+                                let ij_virt_eigen = i_virt_eigen + j_virt_eigen;
+
+                                let mut double_gap = ij_virt_eigen - ij_state_eigen;
+                                if double_gap.abs() <= 1.0e-6 { double_gap = 1.0e-6; }
+                                double_gap /= (i_state_occ * j_state_occ * (1.0 - i_virt_occ) * (1.0 - j_virt_occ));
+
+                                let j_loc_virt = j_virt - vir_range_2.start;
+                                let e_mp2_a = eri_virt.get2d([i_loc_virt, j_loc_virt]).unwrap();
+                                if same_spin {
+                                    let e_mp2_b = eri_virt.get2d([j_loc_virt, i_loc_virt]).unwrap();
+                                    e_ss_local += (e_mp2_a - e_mp2_b).powf(2.0) / double_gap;
+                                } else {
+                                    e_os_local += e_mp2_a * e_mp2_a / double_gap;
+                                }
+                            }
+                        }
+                    }
+
+                    // No occ-pair factor 2 for ROHF same-spin: the upper-triangular
+                    // occ block iteration combined with strict upper-triangular virt
+                    // iteration already accounts for unique (i, j, a, b) tuples.
+                    let _ = i_global; // (no factor 2 applied)
+                    s.send((e_ss_local, e_os_local)).unwrap();
+                });
+
+                for (e_ss_pair, e_os_pair) in receiver.into_iter() {
+                    e_mp2_ss -= e_ss_pair;
+                    e_mp2_os -= e_os_pair;
+                }
+            }
+        }
+    }
+
+    // Single-excitation contribution: added to the total only (not to os or ss).
+    // Mirrors `restricted_open_shell_pt2_rayon` at mod.rs:1464:
+    //   Ok([ss + os + single, os, ss])
+    let e_single = e_mp2_single_list[0] + e_mp2_single_list[1];
+
+    omp_set_num_threads_wrapper(default_omp_num_threads);
+    Ok([e_mp2_ss + e_mp2_os + e_single, e_mp2_os, e_mp2_ss])
 }

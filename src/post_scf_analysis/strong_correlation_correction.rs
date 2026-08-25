@@ -69,13 +69,17 @@ pub fn scc15_for_rxdh7(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -
         scf_data.evaluate_exact_exchange_ri_v(mpi_operator)
     };
     // collect the pbe exchange
-    let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);
-    let post_xc_energy = if let Some(grids) = &scf_data.grids {
-        dfa.post_xc_exc(&vec![String::from("gga_x_pbe")], grids, &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation)
+    // Prefer pre-computed value from xdh_calculations (stored before grids were freed);
+    // fall back to on-the-fly evaluation if grids are still available.
+    let x_pbe = if let Some(x_pbe_vec) = scf_data.energies.get("x_pbe") {
+        x_pbe_vec[0]
+    } else if let Some(grids) = &scf_data.grids {
+        let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);
+        let post_xc_energy = dfa.post_xc_exc(&vec![String::from("gga_x_pbe")], grids, &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation);
+        post_xc_energy[0][0]+post_xc_energy[0][1]
     } else {
-        vec![[0.0,0.0]]
+        panic!("scc15_for_rxdh7: PBE exchange energy is required but neither a pre-computed value (energies[\"x_pbe\"]) nor DFT grids are available. This should not happen if xdh_calculations was called correctly.")
     };
-    let x_pbe = post_xc_energy[0][0]+post_xc_energy[0][1];
 
     let dxpbe = (x_pbe-x_hf)/x_hf*100.0f64;
 
