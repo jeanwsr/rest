@@ -34,11 +34,14 @@ pub enum TDDFTMode {
 
 /// Shared TDDFT data. Mode-specific members are `Option`; see module docs.
 pub struct TDDFTData {
-    /// fxc kernel data. MO mode: full (with `mo_occ`/`mo_vir`/gradients);
-    /// AO mode: kernel-only (the MO projections are never allocated).
-    pub fxc: FXCMatvecData,
     /// The mode this data was prepared for (MO or AO).
     pub mode: TDDFTMode,
+    /// Hybrid exchange coefficient c_x from the functional (shared).
+    pub alpha_hybrid: f64,
+    /// fxc kernel data, MO mode only (`None` in AO mode). Contains the
+    /// MO-on-grid projections + weighted `wfxc` table. AO mode carries the
+    /// raw kernel in `fxc_eff` and uses NIMatmul instead.
+    pub fxc: Option<FXCMatvecData>,
     // ── AO mode only ──
     /// Occupied MO coefficients [nao, occ_size] (AO mode).
     pub c_occ: Option<MatrixFull<f64>>,
@@ -97,8 +100,9 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
     ri_ov_exch.reshape([num_auxbas * occ_size, vir_size]);
 
     TDDFTData {
-        fxc,
         mode: TDDFTMode::MO,
+        alpha_hybrid: fxc.alpha_hybrid,
+        fxc: Some(fxc),
         c_occ: None,
         c_vir: None,
         ao: None,
@@ -121,7 +125,8 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
 /// so the values match the MO path bit-identically. The **raw** kernel
 /// `[ngrids, nvar, nvar]` is stored as `fxc_eff` (×2 singlet factor) for the
 /// batched `NIMatmul` path, which applies the real grid weights internally.
-/// The per-vector path keeps the weighted `wfxc` table.
+/// AO mode carries no `FXCMatvecData` (`fxc: None`): the MO-on-grid
+/// projections and weighted `wfxc` table are MO-only.
 pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
     let (start_mo, _num_state, occ_size, vir_size, _homo, lumo) =
         tddft_occupation_parameters(scf);
@@ -230,32 +235,9 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
         }
     };
 
-    // ── Weighted `wfxc` table for the per-vector path (f-contiguous `[g,α,β]`) ──
-    let mut wfxc = vec![0.0; ngrids * nvar * nvar];
-    for alpha in 0..nvar {
-        for beta in 0..nvar {
-            let slice = fxc_eff.i((.., alpha, beta)); // [ngrids] view
-            let base = alpha * ngrids + beta * nvar * ngrids;
-            for (g, v) in slice.iter().enumerate() {
-                wfxc[base + g] = weights[g] * *v;
-            }
-        }
-    }
-
-    let fxc = FXCMatvecData {
-        nvar,
-        ngrids,
-        nocc: occ_size,
-        nvir: vir_size,
-        start_mo,
-        alpha_hybrid,
-        mo_occ: MatrixFull::new([0, 0], 0.0),
-        mo_vir: MatrixFull::new([0, 0], 0.0),
-        mo_occ_grad: None,
-        mo_vir_grad: None,
-        wfxc,
-        use_opt: scf.mol.ctrl.use_fxc_opt,
-    };
+    // AO mode carries the raw `fxc_eff` kernel + NIMatmul; the weighted
+    // `wfxc`/MO-projection table (FXCMatvecData) is MO-only, so `fxc: None`.
+    let fxc: Option<FXCMatvecData> = None;
 
     // ── Dense AO on grids, only for the per-vector path (dim ≤ 15) ──
     let dim = occ_size * vir_size;
@@ -312,8 +294,9 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
     }
 
     TDDFTData {
-        fxc,
         mode: TDDFTMode::AO,
+        alpha_hybrid,
+        fxc,
         c_occ: Some(c_occ),
         c_vir: Some(c_vir),
         ao,

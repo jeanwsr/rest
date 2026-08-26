@@ -205,7 +205,8 @@ fn fxc_matvec_ao_batched(
     use crate::dft::xceff::prelude::XCSpin;
     let nao = p_block[0].size[0];
     let m = p_block.len();
-    let ngrids = ao_data.fxc.ngrids;
+    let ni = ao_data.ni.as_mut().expect("AO-mode fxc requires NIMatmul");
+    let ngrids = ni.coords.len();
     let den_type = ao_data.den_type.expect("AO-mode fxc requires den_type");
 
     let mut out = MatrixFull::new([nao, nao * m], 0.0);
@@ -217,7 +218,6 @@ fn fxc_matvec_ao_batched(
     let dms = dms_slice.to_rstsr(device); // [nao, nao, m]
     let fxc_eff_view = ao_data.fxc_eff.as_ref().unwrap().view();
 
-    let ni = ao_data.ni.as_mut().expect("AO-mode fxc requires NIMatmul");
     if !ao_data.grid_batch {
         // Full-grid path: one batched call over all sets.
         let dm_views: Vec<TsrView> = (0..m).map(|s| dms.i((.., .., s))).collect();
@@ -256,7 +256,7 @@ fn ao_a_kernel_block(
     z_block: &MatrixFull<f64>,
     xlet: char,
 ) -> MatrixFull<f64> {
-    let alpha_hybrid = ao_data.fxc.alpha_hybrid;
+    let alpha_hybrid = ao_data.alpha_hybrid;
     let (_start_mo, _, occ_size, vir_size, _homo, _lumo) = tddft_occupation_parameters(scf);
     let dim = occ_size * vir_size;
     let m = z_block.size[1];
@@ -376,7 +376,7 @@ fn ao_b_kernel_block(
     z_block: &MatrixFull<f64>,
     xlet: char,
 ) -> MatrixFull<f64> {
-    let alpha_hybrid = ao_data.fxc.alpha_hybrid;
+    let alpha_hybrid = ao_data.alpha_hybrid;
     let (_start_mo, _, occ_size, vir_size, _homo, _lumo) = tddft_occupation_parameters(scf);
     let dim = occ_size * vir_size;
     let m = z_block.size[1];
@@ -497,17 +497,17 @@ mod tests {
     ///
     /// ρ_z(g) built from the transition density P via AO values on grids,
     /// kernel applied through wfxc (weights included), then contracted back.
-    pub fn fxc_matvec_ao(ao_data: &TDDFTData, p: &MatrixFull<f64>) -> MatrixFull<f64> {
-        match ao_data.fxc.nvar {
-            1 => fxc_ao_lda(ao_data, p),
-            4 => fxc_ao_gga(ao_data, p),
+    pub fn fxc_matvec_ao(ao_data: &TDDFTData, fxc: &FXCMatvecData, p: &MatrixFull<f64>) -> MatrixFull<f64> {
+        match fxc.nvar {
+            1 => fxc_ao_lda(ao_data, fxc, p),
+            4 => fxc_ao_gga(ao_data, fxc, p),
             n => panic!("fxc_matvec_ao only supports LDA (nvar=1) and GGA (nvar=4); got {}", n),
         }
     }
 
     /// LDA (nvar=1): ρ_z[g] = Σ_μν P_μν φ_μ(g)φ_ν(g); F = Σ_g v[g] φ⊗φ.
-    fn fxc_ao_lda(ao_data: &TDDFTData, p: &MatrixFull<f64>) -> MatrixFull<f64> {
-        let ng = ao_data.fxc.ngrids;
+    fn fxc_ao_lda(ao_data: &TDDFTData, fxc: &FXCMatvecData, p: &MatrixFull<f64>) -> MatrixFull<f64> {
+        let ng = fxc.ngrids;
         let ao = ao_data.ao.as_ref().expect("AO on grids required for the per-vector fxc path");
 
         // X = P · AO  →  ρ_z[g] = column_dot(AO[:,g], X[:,g])
@@ -515,7 +515,7 @@ mod tests {
         _dgemm_full(p, 'N', ao, 'N', &mut x, 1.0, 0.0);
         let rho_z = column_dots(ao, &x);
 
-        let v: Vec<f64> = rho_z.iter().zip(ao_data.fxc.wfxc.iter())
+        let v: Vec<f64> = rho_z.iter().zip(fxc.wfxc.iter())
             .map(|(r, w)| r * w).collect();
 
         // F = (AO scaled by v) · AOᵀ
@@ -528,8 +528,8 @@ mod tests {
     /// GGA (nvar=4): perturbed density has components
     /// ρ⁰ = ΣP φφ,  ρ^{d+1} = ΣP (∂_dφ_μ·φ_ν + φ_μ·∂_dφ_ν);
     /// kernel applied through wfxc[g, α, β], then contracted back per component.
-    fn fxc_ao_gga(ao_data: &TDDFTData, p: &MatrixFull<f64>) -> MatrixFull<f64> {
-        let ng = ao_data.fxc.ngrids;
+    fn fxc_ao_gga(ao_data: &TDDFTData, fxc: &FXCMatvecData, p: &MatrixFull<f64>) -> MatrixFull<f64> {
+        let ng = fxc.ngrids;
         let nao = p.size[0];
         let ao = ao_data.ao.as_ref().expect("AO on grids required for the per-vector fxc path");
         let grads = ao_data.ao_grad.as_ref().expect("GGA requires AO gradients on grids");
@@ -558,7 +558,7 @@ mod tests {
         }
 
         // Kernel application: feff[α][g] = Σ_β wfxc[g + α·ng + β·4ng] · ρ^β[g]
-        let wfxc = &ao_data.fxc.wfxc;
+        let wfxc = &fxc.wfxc;
         let mut feff: [Vec<f64>; 4] = Default::default();
         for alpha in 0..4 {
             let mut col = vec![0.0_f64; ng];
@@ -697,8 +697,8 @@ mod tests {
 
     /// Reference LDA fxc from the textbook MO formula:
     /// ρ_z[g] = Σ_ia z_ia φ_i φ_a; result[i,a] = Σ_g wfxc ρ_z φ_i φ_a.
-    fn fxc_lda_reference(data: &TDDFTData, p: &MatrixFull<f64>, z: &[f64]) -> Vec<f64> {
-        let ng = data.fxc.ngrids;
+    fn fxc_lda_reference(data: &TDDFTData, fxc: &FXCMatvecData, p: &MatrixFull<f64>, z: &[f64]) -> Vec<f64> {
+        let ng = fxc.ngrids;
         let c_occ = data.c_occ.as_ref().unwrap();
         let c_vir = data.c_vir.as_ref().unwrap();
         let occ = c_occ.size[1];
@@ -719,7 +719,7 @@ mod tests {
         }
         let mut result = vec![0.0; occ * vir];
         for g in 0..ng {
-            let v = data.fxc.wfxc[g] * rho[g];
+            let v = fxc.wfxc[g] * rho[g];
             for i in 0..occ { for a in 0..vir {
                 result[i + a * occ] += v * mo_occ[[i, g]] * mo_vir[[a, g]];
             }}
@@ -728,8 +728,8 @@ mod tests {
     }
 
     /// Reference GGA fxc from the textbook MO formula (perturbed gradients).
-    fn fxc_gga_reference(data: &TDDFTData, p: &MatrixFull<f64>, z: &[f64]) -> Vec<f64> {
-        let ng = data.fxc.ngrids;
+    fn fxc_gga_reference(data: &TDDFTData, fxc: &FXCMatvecData, p: &MatrixFull<f64>, z: &[f64]) -> Vec<f64> {
+        let ng = fxc.ngrids;
         let c_occ = data.c_occ.as_ref().unwrap();
         let c_vir = data.c_vir.as_ref().unwrap();
         let occ = c_occ.size[1];
@@ -779,7 +779,7 @@ mod tests {
             }
         }
         // kernel
-        let wfxc = &data.fxc.wfxc;
+        let wfxc = &fxc.wfxc;
         let mut feff: [Vec<f64>; 4] = Default::default();
         for alpha in 0..4 {
             let mut col = vec![0.0; ng];
@@ -806,7 +806,7 @@ mod tests {
         result
     }
 
-    fn build_ao_data(nvar: usize) -> TDDFTData {
+    fn build_ao_data(nvar: usize) -> (TDDFTData, FXCMatvecData) {
         let nao = 6; let occ = 3; let vir = 4; let ng = 17;
         let ao = MatrixFull::from_vec([nao, ng], pseudo(nao * ng, 7.7)).unwrap();
         let ao_grad = if nvar == 4 {
@@ -838,9 +838,10 @@ mod tests {
             use_opt: false,
         };
         let den_type = if nvar == 4 { XCDenType::SIGMA } else { XCDenType::RHO };
-        TDDFTData {
-            fxc,
+        let data = TDDFTData {
             mode: TDDFTMode::AO,
+            alpha_hybrid: 0.0,
+            fxc: None,
             c_occ: Some(c_occ),
             c_vir: Some(c_vir),
             ao: Some(ao),
@@ -853,17 +854,18 @@ mod tests {
             ri_oo_exch: None,
             ri_vv_exch: None,
             ri_ov_exch: None,
-        }
+        };
+        (data, fxc)
     }
 
     #[test]
     fn test_fxc_ao_lda_matches_mo_reference() {
-        let data = build_ao_data(1);
+        let (data, fxc) = build_ao_data(1);
         let z: Vec<f64> = pseudo(data.c_occ.as_ref().unwrap().size[1] * data.c_vir.as_ref().unwrap().size[1], 14.5);
         let p = transition_density(data.c_occ.as_ref().unwrap(), data.c_vir.as_ref().unwrap(), &z, data.ao.as_ref().unwrap().size[0], data.c_occ.as_ref().unwrap().size[1], data.c_vir.as_ref().unwrap().size[1]);
-        let f_full = fxc_matvec_ao(&data, &p);
+        let f_full = fxc_matvec_ao(&data, &fxc, &p);
         let result = contract_back(&f_full, data.c_occ.as_ref().unwrap(), data.c_vir.as_ref().unwrap(), data.c_occ.as_ref().unwrap().size[1], data.c_vir.as_ref().unwrap().size[1]);
-        let reference = fxc_lda_reference(&data, &p, &z);
+        let reference = fxc_lda_reference(&data, &fxc, &p, &z);
         for idx in 0..result.len() {
             assert!((result[idx] - reference[idx]).abs() < 1e-10,
                 "LDA fxc[{}] = {} vs {}", idx, result[idx], reference[idx]);
@@ -872,12 +874,12 @@ mod tests {
 
     #[test]
     fn test_fxc_ao_gga_matches_mo_reference() {
-        let data = build_ao_data(4);
+        let (data, fxc) = build_ao_data(4);
         let z: Vec<f64> = pseudo(data.c_occ.as_ref().unwrap().size[1] * data.c_vir.as_ref().unwrap().size[1], 15.6);
         let p = transition_density(data.c_occ.as_ref().unwrap(), data.c_vir.as_ref().unwrap(), &z, data.ao.as_ref().unwrap().size[0], data.c_occ.as_ref().unwrap().size[1], data.c_vir.as_ref().unwrap().size[1]);
-        let f_full = fxc_matvec_ao(&data, &p);
+        let f_full = fxc_matvec_ao(&data, &fxc, &p);
         let result = contract_back(&f_full, data.c_occ.as_ref().unwrap(), data.c_vir.as_ref().unwrap(), data.c_occ.as_ref().unwrap().size[1], data.c_vir.as_ref().unwrap().size[1]);
-        let reference = fxc_gga_reference(&data, &p, &z);
+        let reference = fxc_gga_reference(&data, &fxc, &p, &z);
         for idx in 0..result.len() {
             assert!((result[idx] - reference[idx]).abs() < 1e-10,
                 "GGA fxc[{}] = {} vs {}", idx, result[idx], reference[idx]);
@@ -891,7 +893,7 @@ mod tests {
         let nao = 6; let naux = 4;
         let rimatr = synthetic_rimatr(nao, naux);
         let eri = four_index_integrals(&rimatr);
-        let data = build_ao_data(1); // nvar irrelevant for exchange
+        let (data, _fxc) = build_ao_data(1); // nvar irrelevant for exchange
         let c_occ = data.c_occ.as_ref().unwrap();
         let c_vir = data.c_vir.as_ref().unwrap();
         let occ = c_occ.size[1];

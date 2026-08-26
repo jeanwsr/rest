@@ -111,7 +111,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     );
 
     // Hybrid coefficient: identical for both modes (from the kernel data).
-    let alpha_hybrid = data.borrow().fxc.alpha_hybrid;
+    let alpha_hybrid = data.borrow().alpha_hybrid;
 
     // ═══ Step 5: Build diagonal preconditioner ═══
     let hdiag = matvec::build_hdiag(scf);
@@ -159,23 +159,26 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     // Scoped to the diagnostic block below so the immutable RefCell guard is
     // dropped before the solver dispatch (which borrows `data` mutably).
     {
-    // fxc tensor symmetry check for GGA (uses the kernel table)
+    // fxc tensor symmetry check for GGA (uses the MO-mode kernel table `wfxc`,
+    // which carries the `[g,α,β]` weighted layout; AO mode stores the raw
+    // kernel in `fxc_eff`/NIMatmul instead, so the check is MO-only).
     let kernel_guard = data.borrow();
-    let kernel = &kernel_guard.fxc;
-    if kernel.nvar == 4 {
-        let nv2 = 16;
-        let mut max_fxc_asym = 0.0;
-        for g in (0..kernel.ngrids).step_by(kernel.ngrids.max(1) / 10) {
-            for alpha in 0..4 {
-                for beta in 0..4 {
-                    let idx_ab = g + alpha * kernel.ngrids + beta * 4 * kernel.ngrids;
-                    let idx_ba = g + beta * kernel.ngrids + alpha * 4 * kernel.ngrids;
-                    let diff = (kernel.wfxc[idx_ab] - kernel.wfxc[idx_ba]).abs();
-                    if diff > max_fxc_asym { max_fxc_asym = diff; }
+    if let Some(kernel) = &kernel_guard.fxc {
+        if kernel.nvar == 4 {
+            let nv2 = 16;
+            let mut max_fxc_asym = 0.0;
+            for g in (0..kernel.ngrids).step_by(kernel.ngrids.max(1) / 10) {
+                for alpha in 0..4 {
+                    for beta in 0..4 {
+                        let idx_ab = g + alpha * kernel.ngrids + beta * 4 * kernel.ngrids;
+                        let idx_ba = g + beta * kernel.ngrids + alpha * 4 * kernel.ngrids;
+                        let diff = (kernel.wfxc[idx_ab] - kernel.wfxc[idx_ba]).abs();
+                        if diff > max_fxc_asym { max_fxc_asym = diff; }
+                    }
                 }
             }
+            println!("    GGA fxc tensor max asymmetry = {:.2e}", max_fxc_asym);
         }
-        println!("    GGA fxc tensor max asymmetry = {:.2e}", max_fxc_asym);
     }
     drop(kernel_guard);
 

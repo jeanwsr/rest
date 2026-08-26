@@ -148,7 +148,7 @@ pub fn a_matvec(
     z: &Vec<f64>,
     xlet: char,
 ) -> Vec<f64> {
-    let fxc_data = &data.fxc;
+    let fxc_data = data.fxc.as_ref().expect("MO mode requires fxc data");
     let ri_ov = data.ri_ov.as_ref().expect("MO mode requires ri_ov");
     let ri_oo_exch = data.ri_oo_exch.as_ref().expect("MO mode requires ri_oo_exch");
     let ri_vv_exch = data.ri_vv_exch.as_ref().expect("MO mode requires ri_vv_exch");
@@ -210,7 +210,7 @@ pub fn b_matvec(
     z: &Vec<f64>,
     xlet: char,
 ) -> Vec<f64> {
-    let fxc_data = &data.fxc;
+    let fxc_data = data.fxc.as_ref().expect("MO mode requires fxc data");
     let ri_ov = data.ri_ov.as_ref().expect("MO mode requires ri_ov");
     let ri_ov_exch = data.ri_ov_exch.as_ref().expect("MO mode requires ri_ov_exch");
     let alpha_hybrid = fxc_data.alpha_hybrid;
