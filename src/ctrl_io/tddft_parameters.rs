@@ -46,7 +46,9 @@ pub struct TDDFTParameters {
     // (effectively no cutoff).
     pub tddft_cutoff_energy: f64,
     /// If true, export TDDFT results to rest_pysoc_export.json for PySOC.
-    /// Requires tddft_spin = "both" and basis_type = "cartesian".
+    /// Requires tddft_spin = "both". Both Cartesian and spheric orbital
+    /// basis sets are supported (the PySOC export is always written in
+    /// Cartesian format; REST transforms spheric MOs when necessary).
     pub pysoc: bool,
 }
 

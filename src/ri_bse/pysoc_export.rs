@@ -4,16 +4,21 @@
 //! and CI coefficients (X+Y / X-Y) in alpha/beta spin format compatible with soc_td.
 //!
 //! Requirements:
-//! - Cartesian basis (basis_type = "cartesian") — molsoc only computes Cartesian integrals
+//! - Molsoc only computes Cartesian integrals, so the exported basis is always
+//!   Cartesian. REST calculations may use either `basis_type = "cartesian"` or
+//!   `basis_type = "spheric"`; in the latter case MO coefficients are transformed
+//!   from REST's spherical AOs to the exported Cartesian AOs here.
 //! - BSE with bse_spin = "both" (singlet + triplet excitations)
 //! - No frozen core (REST BSE doesn't freeze core)
 
+use crate::constants::c2s_matrix_const;
 use crate::scf_io::SCF;
-use rest_libcint::CINTR2CDATA;
 use rest_libcint::prelude::CintType;
+use rest_libcint::CINTR2CDATA;
 use serde::Serialize;
 use std::fs::File;
 use std::io::Write;
+use tensors::TensorOpt;
 
 /// Hartree → eV conversion factor.
 const HARTREE_TO_EV: f64 = 27.21138505;
@@ -65,34 +70,39 @@ pub fn export_pysoc_json(
     occ_size: usize,
     vir_size: usize,
 ) {
-    // 1. Enforce Cartesian basis (molsoc only computes Cartesian SOC integrals)
-    if !matches!(scf.mol.cint_type, CintType::Cartesian) {
-        panic!(
-            "PySOC export requires Cartesian basis. Please set basis_type = \"cartesian\" in the input."
-        );
+    if matches!(scf.mol.cint_type, CintType::Spinor) {
+        panic!("PySOC export does not support spinor basis sets.");
     }
 
-    let nao = scf.mol.num_basis;
     let n_active = occ_size + vir_size; // number of active MOs to export
 
-    // 2. Geometry: REST stores in Bohr, convert to Angstrom for molsoc (ANG keyword)
+    // 1. Geometry: REST stores in Bohr, convert to Angstrom for molsoc (ANG keyword)
     let geometry = export_geometry(scf);
 
-    // 3. Basis set in Gaussian GFInput format + shell sizes
+    // 2. Basis set in Gaussian GFInput format + Cartesian shell sizes.
+    //    Molsoc only computes Cartesian integrals, so the JSON is always
+    //    written in Cartesian format regardless of REST's internal basis type.
     let (basis_set_gaussian, ao_basis) = export_basis_gaussian(scf);
+    let nao = ao_basis.iter().sum::<usize>();
+    let nao_cart = count_cartesian_aos(scf);
+    assert_eq!(
+        nao, nao_cart,
+        "PySOC export: Cartesian shell-size count mismatch: {} vs {}",
+        nao, nao_cart
+    );
 
-    // 4. MO coefficients: active orbitals only, column-major flat
-    //    Scale Cartesian D/F mixed components to match molsoc's individual normalization.
-    //    libcint uses uniform normalization (all components share gto_norm(l,alpha)),
-    //    so <d_xy|d_xy> = 1/3 while molsoc normalizes each component to 1.
-    //    Scale factor for component (a,b,c) with a+b+c=l:
-    //      sqrt((2a-1)!!*(2b-1)!!*(2c-1)!! / (2l-1)!!)
+    // 3. MO coefficients: active orbitals only, column-major flat.
+    //    For a spheric REST calculation, expand each spherical MO into the
+    //    Cartesian AO basis first (C_cart = C2S * C_sph). For a Cartesian REST
+    //    calculation, scale D/F mixed components to match molsoc's individual
+    //    normalization (the C2S expansion already produces molsoc-normalized
+    //    Cartesian components for the spheric case).
     let mo_coefficients = export_mo_coefficients(scf, start_mo, n_active, nao);
 
-    // 5. MO energies: Hartree, active orbitals only (soc_td converts to eV internally)
+    // 4. MO energies: Hartree, active orbitals only (soc_td converts to eV internally)
     let mo_energies_hartree = export_mo_energies(scf, start_mo, n_active, method);
 
-    // 6. Excitation energies: convert Hartree → eV
+    // 5. Excitation energies: convert Hartree → eV
     let singlet_states: Vec<(usize, f64)> = singlet_excitations
         .iter()
         .enumerate()
@@ -104,7 +114,7 @@ pub fn export_pysoc_json(
         .map(|(i, (e, _))| (i + 1, e * HARTREE_TO_EV))
         .collect();
 
-    // 7. CI coefficients: normalize + transpose + alpha/beta conversion
+    // 6. CI coefficients: normalize + transpose + alpha/beta conversion
     let (ci_singlet_xpy, ci_singlet_xmy) =
         convert_ci_set(singlet_excitations, tda, occ_size, vir_size, true);
     let (ci_triplet_xpy, ci_triplet_xmy) =
@@ -153,6 +163,23 @@ fn export_geometry(scf: &SCF) -> Vec<(String, f64, f64, f64)> {
             )
         })
         .collect()
+}
+
+/// Number of Cartesian AOs corresponding to `scf.mol.basis4elem`.
+///
+/// This equals `scf.mol.num_basis` for a Cartesian REST calculation; for a
+/// spheric calculation it is the size of the Cartesian basis exported to PySOC.
+fn count_cartesian_aos(scf: &SCF) -> usize {
+    scf.mol
+        .basis4elem
+        .iter()
+        .flat_map(|bas4elem| bas4elem.electron_shells.iter())
+        .map(|shell| {
+            let l = shell.angular_momentum[0] as usize;
+            let n_cart = ((l + 1) * (l + 2) / 2) as usize;
+            n_cart * shell.native_coefficients.len()
+        })
+        .sum()
 }
 
 /// Export basis set in Gaussian GFInput format and compute shell sizes.
@@ -208,8 +235,13 @@ fn export_basis_gaussian(scf: &SCF) -> (String, Vec<usize>) {
 
 /// Extract active MO coefficients as a flat column-major array.
 ///
-/// Returns `nao * num_state` values. Column `j` (0-based) corresponds to MO `start_mo + j`.
-/// Layout matches soc_td's `mo_coeff.dat`: [MO1_AO1, MO1_AO2, ..., MO1_AOnao, MO2_AO1, ...].
+/// Returns `nao * num_state` values where `nao` is the number of exported
+/// Cartesian AOs. Column `j` (0-based) corresponds to MO `start_mo + j`.
+/// Layout matches soc_td's `mo_coeff.dat`:
+/// [MO1_AO1, MO1_AO2, ..., MO1_AOnao, MO2_AO1, ...].
+///
+/// For `basis_type = "spheric"` the spherical MO column is first expanded to
+/// the Cartesian basis (see `expand_spheric_mo_to_cartesian`).
 ///
 /// **Cartesian normalization scaling**: libcint uses uniform normalization where all Cartesian
 /// components of a shell share the same `gto_norm(l, alpha)`. This makes mixed components
@@ -218,25 +250,91 @@ fn export_basis_gaussian(scf: &SCF) -> (String, Vec<usize>) {
 /// this difference.
 fn export_mo_coefficients(scf: &SCF, start_mo: usize, num_state: usize, nao: usize) -> Vec<f64> {
     let eigenvectors = &scf.eigenvectors[0];
+    let nao_internal = scf.mol.num_basis;
 
     // Build per-AO scaling factors for Cartesian normalization conversion.
-    let scales = build_ao_scales(scf);
+    let scales = build_ao_scales(scf, nao);
 
     let mut mo_coefficients = Vec::with_capacity(nao * num_state);
 
     for j in start_mo..start_mo + num_state {
-        let col_start = j * nao;
-        let col_end = (j + 1) * nao;
-        for (i, (&coeff, &scale)) in eigenvectors.data[col_start..col_end]
-            .iter()
-            .zip(scales.iter())
-            .enumerate()
-        {
-            mo_coefficients.push(coeff * scale);
+        let col_start = j * nao_internal;
+        let col_end = (j + 1) * nao_internal;
+        let mo_column = match scf.mol.cint_type {
+            CintType::Cartesian => eigenvectors.data[col_start..col_end].to_vec(),
+            CintType::Spheric => {
+                expand_spheric_mo_to_cartesian(scf, &eigenvectors.data[col_start..col_end], nao)
+            }
+            CintType::Spinor => {
+                panic!("PySOC export does not support spinor basis sets.")
+            }
+        };
+        assert_eq!(mo_column.len(), nao);
+        if matches!(scf.mol.cint_type, CintType::Cartesian) {
+            // libcint's Cartesian D/F components use one uniform gto_norm
+            // per shell, whereas molsoc normalizes every Cartesian component
+            // individually. The C2S expansion for a spheric calculation
+            // already yields molsoc's individually-normalized Cartesian
+            // components, so no extra scaling is applied in that case.
+            mo_coefficients.extend(
+                mo_column
+                    .iter()
+                    .zip(scales.iter())
+                    .map(|(&coeff, &scale)| coeff * scale),
+            );
+        } else {
+            mo_coefficients.extend(mo_column);
         }
     }
 
     mo_coefficients
+}
+
+/// Expand one spherical MO coefficient column into the Cartesian AO basis.
+///
+/// The block-diagonal transformation matrix has one C2S block per contracted
+/// shell; the blocks follow the same shell order and Cartesian component order
+/// as `export_basis_gaussian` and molsoc.
+fn expand_spheric_mo_to_cartesian(scf: &SCF, sph_mo: &[f64], nao_cart: usize) -> Vec<f64> {
+    assert_eq!(sph_mo.len(), scf.mol.num_basis);
+    let mut cart_mo = vec![0.0; nao_cart];
+    let mut sph_offset = 0usize;
+    let mut cart_offset = 0usize;
+
+    for bas4elem in &scf.mol.basis4elem {
+        for shell in &bas4elem.electron_shells {
+            let l = shell.angular_momentum[0] as usize;
+            let sph_dim = 2 * l + 1;
+            let cart_dim = (l + 1) * (l + 2) / 2;
+            let c2s_owned = c2s_matrix_const(l);
+            let c2s = c2s_owned.to_matrixfullslice();
+
+            for _ in 0..shell.native_coefficients.len() {
+                for cart in 0..cart_dim {
+                    let mut value = 0.0;
+                    for sph in 0..sph_dim {
+                        value += *c2s
+                            .get2d([cart, sph])
+                            .expect("PySOC export: invalid C2S index")
+                            * sph_mo[sph_offset + sph];
+                    }
+                    cart_mo[cart_offset + cart] = value;
+                }
+                sph_offset += sph_dim;
+                cart_offset += cart_dim;
+            }
+        }
+    }
+
+    assert_eq!(
+        sph_offset, scf.mol.num_basis,
+        "PySOC export: spherical AO count mismatch during C2S expansion"
+    );
+    assert_eq!(
+        cart_offset, nao_cart,
+        "PySOC export: Cartesian AO count mismatch during C2S expansion"
+    );
+    cart_mo
 }
 
 /// Build per-AO scaling factors to convert from libcint's uniform Cartesian normalization
@@ -246,13 +344,13 @@ fn export_mo_coefficients(scf: &SCF, start_mo: usize, num_state: usize, nao: usi
 ///   sqrt((2a-1)!! * (2b-1)!! * (2c-1)!! / (2l-1)!!)
 ///
 /// This is 1 for pure components (l,0,0) and <1 for mixed components.
-fn build_ao_scales(scf: &SCF) -> Vec<f64> {
+fn build_ao_scales(scf: &SCF, nao_cart: usize) -> Vec<f64> {
     let mut scales = Vec::new();
 
     for bas4elem in &scf.mol.basis4elem {
         for shell in &bas4elem.electron_shells {
             let l = shell.angular_momentum[0] as usize;
-            for _ in &shell.coefficients {
+            for _ in &shell.native_coefficients {
                 // Cartesian component ordering: (lx, ly, lz) with lx descending,
                 // then ly descending within each lx.
                 // This matches REST's cartesian_gto_std and molsoc's genop.f.
@@ -269,10 +367,10 @@ fn build_ao_scales(scf: &SCF) -> Vec<f64> {
 
     assert_eq!(
         scales.len(),
-        scf.mol.num_basis,
-        "AO scale count mismatch: {} vs nao {}",
+        nao_cart,
+        "AO scale count mismatch: {} vs exported Cartesian nao {}",
         scales.len(),
-        scf.mol.num_basis
+        nao_cart
     );
 
     scales
@@ -405,4 +503,69 @@ fn convert_ci_set(
     }
 
     (xpy_all, xmy_all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::basis_io::{BasCell, Basis4Elem};
+    use crate::molecule_io::Molecule;
+    use tensors::MatrixFull;
+
+    fn scf_with_shell(cint_type: CintType, l: usize, sph_mo: Vec<f64>) -> SCF {
+        let n_sph = 2 * l + 1;
+        let shell = BasCell {
+            function_type: None,
+            region: None,
+            angular_momentum: vec![l as i32],
+            exponents: vec![1.0],
+            coefficients: vec![vec![1.0]],
+            native_coefficients: vec![vec![1.0]],
+        };
+        let mut mol = Molecule::init_mol();
+        mol.cint_type = cint_type;
+        mol.num_basis = if matches!(cint_type, CintType::Spheric) {
+            n_sph
+        } else {
+            (l + 1) * (l + 2) / 2
+        };
+        mol.num_state = mol.num_basis;
+        mol.basis4elem = vec![Basis4Elem {
+            electron_shells: vec![shell],
+            references: None,
+            ecp_potentials: None,
+            ecp_electrons: None,
+            global_index: (0, 0),
+        }];
+        let mut scf = SCF::init_scf(&mol);
+        scf.eigenvectors[0] = MatrixFull::from_vec([mol.num_basis, 1], sph_mo).unwrap();
+        scf
+    }
+
+    #[test]
+    fn spheric_d_shell_is_expanded_to_molsoc_cartesian_order() {
+        let scf = scf_with_shell(CintType::Spheric, 2, vec![1.0, 0.0, 0.0, 0.0, 0.0]);
+        let cart = expand_spheric_mo_to_cartesian(&scf, &scf.eigenvectors[0].data, 6);
+        // REST's d(-2) component corresponds to the Cartesian xy component.
+        let expected = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        for (got, want) in cart.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1.0e-12, "{} != {}", got, want);
+        }
+
+        // Spheric MOs are already in molsoc's individual Cartesian
+        // normalization after C2S expansion, so no further scaling occurs.
+        let exported = export_mo_coefficients(&scf, 0, 1, 6);
+        assert_eq!(exported, cart);
+    }
+
+    #[test]
+    fn cartesian_d_mixed_component_is_scaled_for_molsoc() {
+        let scf = scf_with_shell(CintType::Cartesian, 2, vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+        let exported = export_mo_coefficients(&scf, 0, 1, 6);
+        let scale = 1.0_f64 / 3.0_f64.sqrt();
+        let expected = [0.0, scale, 0.0, 0.0, 0.0, 0.0];
+        for (got, want) in exported.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1.0e-12, "{} != {}", got, want);
+        }
+    }
 }
