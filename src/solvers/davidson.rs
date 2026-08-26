@@ -168,7 +168,13 @@ fn orth_ss(x: &mut Vec<f64>, ss: &MatrixFull<f64>, use_mgs: bool) {
     }
 }
 
-pub fn davidson_solver_block<F1>(
+/// TDA Davidson eigensolver with a **batched** matvec interface.
+///
+/// Applies the operator to a whole block of trial vectors at once
+/// (`FnMut(&MatrixFull) -> MatrixFull`), so callers can amortize work across
+/// the subspace (e.g. batch the fxc/RI-J/K evaluation in AO-mode TDDFT).
+/// Also available as the `tda_davidson_solver_batched` alias.
+pub fn davidson_solver_batched<F1>(
     mut a_matvec_block: F1,
     nroots: usize,
     diag: &Vec<f64>,
@@ -405,7 +411,7 @@ where
     eigenpairs
 }
 
-/// Backward-compatible per-vector wrapper around [`davidson_solver_block`].
+/// Backward-compatible per-vector wrapper around [`davidson_solver_batched`].
 ///
 /// Adapters the batched closure interface to the legacy single-vector API by
 /// applying the matvec column-by-column.
@@ -419,7 +425,7 @@ pub fn davidson_solver<F1>(
 where
     F1: FnMut(&Vec<f64>) -> Vec<f64>,
 {
-    davidson_solver_block(
+    davidson_solver_batched(
         |block: &MatrixFull<f64>| -> MatrixFull<f64> {
             let mut out = MatrixFull::new([block.size[0], 0], 0.0);
             block.iter_columns_full().for_each(|col| {
@@ -440,9 +446,14 @@ where
 pub use davidson_solver as tda_davidson_solver;
 
 /// Batched-interface alias: A applied to a whole block of trial vectors at once.
-pub use davidson_solver_block as tda_davidson_solver_batched;
+pub use davidson_solver_batched as tda_davidson_solver_batched;
 
-pub fn lr_davidson_solver_block<F1, F2>(
+/// Linear-response Davidson eigensolver with a **batched** matvec interface.
+///
+/// Applies A and B to a whole block of trial vectors at once
+/// (`FnMut(&MatrixFull) -> MatrixFull` each), solving the symmetricized Casida
+/// equation `(A−B)^(1/2)(A+B)(A−B)^(1/2) z = ω² z`.
+pub fn lr_davidson_solver_batched<F1, F2>(
     mut a_matvec_block: F1,
     mut b_matvec_block: F2,
     nroots: usize,
@@ -791,7 +802,7 @@ where
     eigenpairs
 }
 
-/// Backward-compatible per-vector wrapper around [`lr_davidson_solver_block`].
+/// Backward-compatible per-vector wrapper around [`lr_davidson_solver_batched`].
 ///
 /// Adapters the batched closure interface to the legacy single-vector API by
 /// applying the matvecs column-by-column.
@@ -825,11 +836,8 @@ where
         });
         out
     };
-    lr_davidson_solver_block(a_apply, b_apply, nroots, diag, initial_guess, config)
+    lr_davidson_solver_batched(a_apply, b_apply, nroots, diag, initial_guess, config)
 }
-
-/// Batched-interface alias: A and B applied to a whole block of trial vectors at once.
-pub use lr_davidson_solver_block as lr_davidson_solver_batched;
 
 pub fn dot_product(vec1: &Vec<f64>, vec2: &Vec<f64>) -> f64 {
     vec1.iter().zip(vec2.iter()).fold(0.0, |acc, (x1, x2)| acc + x1 * x2)
@@ -911,7 +919,7 @@ mod tests {
         let guess = generate_initial_guess(&hdiag, nroots);
 
         let per_vec = davidson_solver(per_vector_a(&a), nroots, &hdiag, guess.clone(), &config);
-        let batched = davidson_solver_block(batched_a(&a), nroots, &hdiag, guess.clone(), &config);
+        let batched = davidson_solver_batched(batched_a(&a), nroots, &hdiag, guess.clone(), &config);
 
         assert_eq!(per_vec.len(), batched.len(), "same number of converged roots");
         for (e1, e2) in per_vec.iter().zip(batched.iter()) {
@@ -949,7 +957,7 @@ mod tests {
         let per_vec = lr_davidson_solver(
             per_vector_a(&a), per_vector_a(&b),
             nroots, &hdiag, guess.clone(), &config);
-        let batched = lr_davidson_solver_block(
+        let batched = lr_davidson_solver_batched(
             batched_a(&a), batched_a(&b),
             nroots, &hdiag, guess.clone(), &config);
 
