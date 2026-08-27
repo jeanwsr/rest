@@ -16,6 +16,9 @@ use num_traits::{One, Zero};
 use tensors::{BasicMatrix, MatrixFull};
 use std::fmt::Debug;
 
+#[cfg(feature = "scalapack")]
+use tensors::matrix_scalapack::CblacsGrid;
+
 use crate::dft::Grids;
 use crate::constants::MPI_CHUNK;
 use crate::molecule_io::Molecule;
@@ -51,6 +54,8 @@ use crate::utilities::balancing;
 
 #[cfg(feature = "mpi")]
 pub struct MPIOperator {
+    #[cfg(feature = "scalapack")]
+    pub cblacsgrid: CblacsGrid,
     pub universe: Universe,
     pub world: SimpleCommunicator,
     pub size: usize,
@@ -139,6 +144,8 @@ impl MPIData {
         let world = universe.world();
         let size = world.size() as usize;
         let rank = world.rank() as usize;
+        #[cfg(feature = "scalapack")]
+        let cgrid = CblacsGrid::new(size, "R");
 
         if size >= 2 {
             (
@@ -146,10 +153,12 @@ impl MPIData {
                 universe,
                 world,
                 size,
-                rank
+                rank,
+                #[cfg(feature = "scalapack")]
+                cblacsgrid: cgrid,
                 }),
                 Some(MPIData{
-                    size, 
+                    size,
                     rank,
                     grids: None,
                     auxbas: None,
