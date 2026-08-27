@@ -49,6 +49,8 @@ use self::util::norm;
 use smear::apply_smearing;
 use smear::annealed_sigma;
 
+#[cfg(feature = "scalapack")]
+use tensors::distributedmatrixfull::_hamiltonian_distributed_solver;
 #[allow(unused_imports)]
 use tensors::BasicMatUp;
 
@@ -2666,10 +2668,19 @@ impl SCF {
     }
 
     //pub fn evaluate_xc_energy
-       
+
 
     pub fn diagonalize_hamiltonian(&mut self, mpi_operator: &Option<MPIOperator>) {
+        #[cfg(feature = "scalapack")]
+        {
+            if diagonalize_hamiltonian_distributed_check(&self, mpi_operator) {
+                (self.eigenvectors, self.eigenvalues, self.mol.num_state) = diagonalize_hamiltonian_distributed(&self, mpi_operator);
+                return;
+            }
+        }
+
         (self.eigenvectors, self.eigenvalues, self.mol.num_state) = diagonalize_hamiltonian_outside(&self, mpi_operator);
+
     }
 
     pub fn semi_diagonalize_hamiltonian(&mut self) {
@@ -4765,6 +4776,70 @@ pub fn diagonalize_hamiltonian_outside(scf_data: &SCF, mpi_operator: &Option<MPI
 
 
     (eigenvectors, eigenvalues, scf_data.mol.num_state)
+}
+
+#[cfg(feature = "scalapack")]
+pub fn diagonalize_hamiltonian_distributed_check(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> bool {
+    if let Some(mpi_io) = mpi_operator {
+        let size = mpi_io.size;
+        assert!(size >= 2);
+        let (num_grid_row, num_grid_col) = (mpi_io.cblacsgrid.nprow, mpi_io.cblacsgrid.npcol);
+        let problem_size = scf_data.hamiltonian[0].size()[0];
+        if (256 * num_grid_row as usize > problem_size) && (256 * num_grid_col as usize > problem_size) {
+            //println!("matrix too small, return to serial solver.");
+            return false;
+        }
+    }
+    else {
+        //println!("use solver for smaller problems, return to serial solver.");
+        return false;
+    }
+    //println!("use distributed solver.");
+    return true;
+}
+
+#[cfg(feature = "scalapack")]
+pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> ([MatrixFull<f64>;2], [Vec<f64>;2], usize) {
+
+    #[cfg(not(feature = "mpi"))]
+    { panic!("try to call distributed solver without mpi. this should not happen."); }
+
+    #[cfg(feature = "mpi")]
+    if let Some(mpi_io) = mpi_operator {
+        let spin_channel = scf_data.mol.spin_channel;
+        let mut num_state = scf_data.mol.num_state;
+        let mut eigenvectors = [MatrixFull::empty(),MatrixFull::empty()];
+        let mut eigenvalues = [Vec::new(),Vec::new()];
+
+        let grid = &mpi_io.cblacsgrid;
+        let world = &mpi_io.world;
+
+        match scf_data.scftype {
+            SCFType::RHF | SCFType::UHF => {
+                for i_spin in (0..spin_channel) {
+                    let (eigenvector_spin, eigenvalue_spin)=
+                        _hamiltonian_distributed_solver(&scf_data.hamiltonian[i_spin], &scf_data.ovlp, &mut num_state, grid, world).unwrap();
+                        //self.hamiltonian[i_spin].to_matrixupperslicemut()
+                        //.lapack_dspgvx(self.ovlp.to_matrixupperslicemut(),num_state).unwrap();
+                    eigenvectors[i_spin] = eigenvector_spin;
+                    eigenvalues[i_spin] = eigenvalue_spin;
+                }
+            },
+            SCFType::ROHF => {
+                // diagonalize Roothaan Fock matrix
+                let (eigenvector, eigenvalue)=
+                    _hamiltonian_distributed_solver(scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp, &mut num_state, grid, world).unwrap();
+                eigenvectors[0] = eigenvector;
+                eigenvalues[0] = eigenvalue;
+            }
+        };
+        (eigenvectors, eigenvalues, num_state)
+
+    } else
+    {
+        panic!("try to call distributed solver with null mpi operator. this should not happen.");
+    }
+
 }
 
 pub fn diagonalize_hamiltonian_outside_fast(scf_data: &SCF)  -> ([MatrixFull<f64>;2], [Vec<f64>;2], usize) {
