@@ -174,9 +174,13 @@ impl SCF {
         };
 
         // at first check the scf type: RHF, ROHF or UHF
-        scf_data.scftype = if mol.num_elec[1]==mol.num_elec[2] && ! mol.ctrl.spin_polarization {
+        // Use the spin multiplicity (ctrl.spin) rather than num_elec[1]/[2] so the
+        // detection is valid even when the basis is loaded from a chkfile
+        // (basis_path='chkfile'), where num_elec is [0,0,0] until update_basis_from_hdf5chk.
+        // num_elec[1] != num_elec[2]  <=>  ctrl.spin > 1.0, so this is equivalent.
+        scf_data.scftype = if mol.ctrl.spin <= 1.0 && ! mol.ctrl.spin_polarization {
             SCFType::RHF
-        } else if mol.num_elec[1]!=mol.num_elec[2] && ! mol.ctrl.spin_polarization {
+        } else if mol.ctrl.spin > 1.0 && ! mol.ctrl.spin_polarization {
             SCFType::ROHF
         } else {      
             SCFType::UHF

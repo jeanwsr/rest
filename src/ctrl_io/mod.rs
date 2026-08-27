@@ -288,6 +288,8 @@ pub struct InputKeywords {
     // There are three kinds of available initital guesses: 1) sad (default), 2) hcore, 3) vsap
     pub initial_guess: String,
     #[pyo3(get, set)]
+    pub basis_projection: String,
+    #[pyo3(get, set)]
     pub noiter: bool,
     #[pyo3(get, set)]
     pub check_stab: bool,
@@ -482,6 +484,7 @@ impl InputKeywords {
             has_chkfile: false, // not directly set by input
             external_init_guess: None, // not directly set by input
             initial_guess: String::from("sad"),
+            basis_projection: String::from("occupied"),
             noiter: false,
             check_stab: false,
             // Kyewords for the manner to evaluate the Vk (and also Vxc) potentials
@@ -1486,6 +1489,11 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.initial_guess = match tmp_ctrl.get("initial_guess").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
                 other => {String::from("sad")},
+            };
+
+            tmp_input.basis_projection = match tmp_ctrl.get("basis_projection").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
+                other => {String::from("occupied")},
             };
 
             tmp_input.noiter = match tmp_ctrl.get("noiter").unwrap_or(&serde_json::Value::Null) {
