@@ -140,12 +140,27 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         // we have already checked dfa_family_pos = PT2
         let spin_orb_indices = split_indices_by_spin_occ(&scf_data.occupation, 0.5);
         let spin_channel = scf_data.mol.spin_channel;
+        // frozen-core approximation: the occupied space starts at mol.start_mo,
+        // so orbitals below idx_core must be excluded from the PT2 pair sums
+        let idx_core = scf_data.mol.start_mo;
+        let occ_filtered: Vec<Vec<usize>> = (0..spin_channel)
+            .map(|i_spin| {
+                spin_orb_indices[i_spin]
+                    .0
+                    .iter()
+                    .copied()
+                    .filter(|&i| i >= idx_core)
+                    .collect()
+            })
+            .collect();
+        let vir_filtered: Vec<Vec<usize>> = (0..spin_channel)
+            .map(|i_spin| spin_orb_indices[i_spin].1.clone())
+            .collect();
         let mut occidx: [Option<&[usize]>; 2] = [None, None];
         let mut viridx: [Option<&[usize]>; 2] = [None, None];
         for i_spin in 0..spin_channel {
-            let (occidx_spin, viridx_spin) = &spin_orb_indices[i_spin];
-            occidx[i_spin] = Some(occidx_spin.as_slice());
-            viridx[i_spin] = Some(viridx_spin.as_slice());
+            occidx[i_spin] = Some(occ_filtered[i_spin].as_slice());
+            viridx[i_spin] = Some(vir_filtered[i_spin].as_slice());
         }
         
         let pt2_fp_mode = scf_data.mol.ctrl.ri_pt2.fp_mode;
