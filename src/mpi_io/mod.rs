@@ -7,7 +7,9 @@ use mpi::environment::Universe;
 #[cfg(feature = "mpi")]
 use mpi::request::WaitGuard;
 #[cfg(feature = "mpi")]
-use mpi::topology::{SimpleCommunicator, Rank};
+use mpi::topology::{SimpleCommunicator, CartesianCommunicator, Rank, Color, Key};
+#[cfg(feature = "mpi")]
+use mpi::datatype::{Partitioned, PartitionMut};
 #[cfg(feature = "mpi")]
 use mpi::traits::*;
 use num_traits::{One, Zero};
@@ -64,6 +66,66 @@ pub struct MPIOperator {
 pub struct MPIOperator {
     pub size: usize,
     pub rank: usize,
+}
+
+#[cfg(feature = "mpi")]
+pub struct MPIGrid {
+    pub cart_comm: CartesianCommunicator,
+    pub row_comm: SimpleCommunicator,
+    pub col_comm: SimpleCommunicator,
+    pub dims: (i32, i32),          // (r, c)
+    pub my_coords: (i32, i32),     // (my_row, my_col)
+    pub rank: i32,                   // rank in grid communicator
+}
+
+#[cfg(feature = "mpi")]
+impl MPIOperator {
+
+    pub fn initialize_grid(&self) -> MPIGrid {
+        let size = self.size as i32;
+        let (r, c) = {
+            let mut r = (size as f64).sqrt() as i32;
+            while size % r != 0 {
+                r -= 1;
+            }
+            (r, size / r)
+        };
+
+        let dims = [r, c];
+        let periods = [false, false];
+        let cart_comm = self.world.create_cartesian_communicator(&dims, &periods, false)
+                                 .expect("Failed to create Cartesian grid");
+
+        let rank = cart_comm.rank();
+        let coords = cart_comm.rank_to_coordinates(rank);
+
+        let my_row = coords[0];
+        let my_col = coords[1];
+
+        let row_color = Color::with_value(my_row);
+        let row_key: Key = my_col;
+        let col_color = Color::with_value(my_col);
+        let col_key: Key = my_row;
+
+        let row_comm = cart_comm
+                .split_by_color_with_key(row_color, row_key)
+                .expect("Failed to split row communicator");
+
+        let col_comm = cart_comm
+               .split_by_color_with_key(col_color, col_key)
+               .expect("Failed to split column communicator");
+
+        MPIGrid {
+            cart_comm,
+            row_comm,
+            col_comm,
+            dims: (r, c),
+            my_coords: (my_row, my_col),
+            rank,
+        }
+
+    }
+
 }
 
 #[derive(Clone)]

@@ -6,6 +6,8 @@ use std::sync::mpsc::channel;
 use mpi::collective::SystemOperation;
 #[cfg(feature = "mpi")]
 use crate::mpi_io::{mpi_allreduce, mpi_broadcast, mpi_broadcast_vector};
+#[cfg(feature = "mpi")]
+use mpi::traits::*;
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, IntoParallelRefIterator};
 use rayon::slice::ParallelSlice;
 use rest_tensors::{TensorOpt,RIFull, MatrixFull, MatrixFullSlice};
@@ -14,6 +16,9 @@ use sbge2::{close_shell_sbge2_rayon_mpi, open_shell_sbge2_rayon_mpi};
 use serde::{Deserialize, Serialize};
 use tensors::BasicMatrix;
 use tensors::matrix_blas_lapack::{_dsymm, _dgemm};
+
+#[cfg(feature = "mpi")]
+use crate::ri_pt2::pt2_25d::{initialize_metadata, check_memory_25d, swap_ownership, local_computation_close_shell_batch, local_computation_ss_batch, local_computation_os_batch};
 
 use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon,open_shell_sbge2_rayon};
 use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon, evaluate_osrpa_correlation_rayon_mpi};
@@ -27,6 +32,9 @@ use crate::mpi_io::{self, mpi_reduce};
 use crate::post_scf_analysis::{split_indices_by_spin_occ, format_indices};
 
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
+
+#[cfg(feature = "mpi")]
+pub mod pt2_25d;
 
 pub mod sbge2;
 pub mod pure_pt2_pair_eng;
@@ -86,7 +94,6 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     timerecords.new_item("xc_energy", "for x_hf, xc_scf, xc_xdh");
     timerecords.new_item("c_r5dft", "for advanced correlations");
     timerecords.new_item("ao2mo", "for the generation of RI3MO");
-
 
     timerecords.count_start("xc_energy");
     let x_energy = scf_data.evaluate_exact_exchange_ri_v(mpi_operator);
@@ -200,26 +207,53 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         crate::scf_io::generate_ri3mo_rayon_for_pt2_and_rpa(scf_data);
         timerecords.count("ao2mo");
         timerecords.count_start("c_r5dft");
-        pt2_c = match scf_data.scftype {
-            SCFType::RHF => match  dfa_family_pos {
-                crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi(&scf_data,mpi_operator).unwrap(),
-                crate::dft::DFAFamily::SBGE2 => close_shell_sbge2_rayon_mpi(scf_data,mpi_operator).unwrap(),
-                crate::dft::DFAFamily::SCSRPA => evaluate_osrpa_correlation_rayon_mpi(scf_data, mpi_operator).unwrap(),
-                _ => [0.0,0.0,0.0]
-            },
-            SCFType::UHF => match  dfa_family_pos {
-                crate::dft::DFAFamily::PT2 => open_shell_pt2_rayon_mpi(&scf_data, mpi_operator).unwrap(),
-                crate::dft::DFAFamily::SBGE2 => open_shell_sbge2_rayon_mpi(scf_data, mpi_operator).unwrap(),
-                crate::dft::DFAFamily::SCSRPA => evaluate_osrpa_correlation_rayon_mpi(scf_data, mpi_operator).unwrap(),
-                _ => [0.0,0.0,0.0]
-            },
-            SCFType::ROHF => match dfa_family_pos {
-                crate::dft::DFAFamily::PT2 => restricted_open_shell_pt2_rayon_mpi(&scf_data, mpi_operator).unwrap(),
-                crate::dft::DFAFamily::SBGE2 => open_shell_sbge2_rayon_mpi(scf_data, mpi_operator).unwrap(),
-                crate::dft::DFAFamily::SCSRPA => evaluate_osrpa_correlation_rayon_mpi(scf_data, mpi_operator).unwrap(),
-                _ => [0.0,0.0,0.0]
-            }
-        };
+
+        let use_25d = check_conditions_25d(&scf_data, mpi_operator);
+        if use_25d {
+            pt2_c = match scf_data.scftype {
+                SCFType::RHF => match  dfa_family_pos {
+                    crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi_25d(&scf_data,mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SBGE2 => unreachable!("2.5d not implemented for SBGE2"),
+                    crate::dft::DFAFamily::SCSRPA => unreachable!("2.5d not implemented for SCSRPA"),
+                    _ => [0.0,0.0,0.0]
+                },
+                SCFType::UHF => match  dfa_family_pos {
+                    crate::dft::DFAFamily::PT2 => open_shell_pt2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SBGE2 => unreachable!("2.5d not implemented for SBGE2"),
+                    crate::dft::DFAFamily::SCSRPA => unreachable!("2.5d not implemented for SCSRPA"),
+                    _ => [0.0,0.0,0.0]
+                },
+                SCFType::ROHF => match dfa_family_pos {
+                    crate::dft::DFAFamily::PT2 => restricted_open_shell_pt2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SBGE2 => unreachable!("2.5d not implemented for SBGE2"),
+                    crate::dft::DFAFamily::SCSRPA => unreachable!("2.5d not implemented for SCSRPA"),
+                    _ => [0.0,0.0,0.0]
+                }
+            };
+        }
+        else {
+            pt2_c = match scf_data.scftype {
+                SCFType::RHF => match  dfa_family_pos {
+                    crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi(&scf_data,mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SBGE2 => close_shell_sbge2_rayon_mpi(scf_data,mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SCSRPA => evaluate_osrpa_correlation_rayon_mpi(scf_data, mpi_operator).unwrap(),
+                    _ => [0.0,0.0,0.0]
+                },
+                SCFType::UHF => match  dfa_family_pos {
+                    crate::dft::DFAFamily::PT2 => open_shell_pt2_rayon_mpi(&scf_data, mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SBGE2 => open_shell_sbge2_rayon_mpi(scf_data, mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SCSRPA => evaluate_osrpa_correlation_rayon_mpi(scf_data, mpi_operator).unwrap(),
+                    _ => [0.0,0.0,0.0]
+                },
+                SCFType::ROHF => match dfa_family_pos {
+                    crate::dft::DFAFamily::PT2 => restricted_open_shell_pt2_rayon_mpi(&scf_data, mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SBGE2 => open_shell_sbge2_rayon_mpi(scf_data, mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SCSRPA => evaluate_osrpa_correlation_rayon_mpi(scf_data, mpi_operator).unwrap(),
+                    _ => [0.0,0.0,0.0]
+                }
+            };
+        }
+
         timerecords.count("c_r5dft");
     } else {
         pt2_c = if scf_data.mol.spin_channel == 1 {
@@ -1251,12 +1285,266 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
     }
     #[cfg(not(feature = "mpi"))]
     { close_shell_pt2_rayon(scf_data) }
-        
+
+}
+
+fn check_conditions_25d(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> bool {
+    let mut use_25d = true;
+
+    let (mpi_op, mpi_ix) = match (&mpi_operator, &scf_data.mol.mpi_data) {
+        (Some(op), Some(ix)) => (op, ix),
+        _ => return false,
+    };
+
+    let my_rank = mpi_ix.rank;
+
+    let local_n0_range = match &mpi_ix.auxbas {
+        Some(loc_auxbas) => loc_auxbas[my_rank].clone(),
+        None => {
+            eprintln!("Auxiliary basis distribution not initialized");
+            return false;
+        }
+    };
+
+    let grid = mpi_op.initialize_grid();
+
+    let ri3mo_vec = match &scf_data.ri3mo {
+        Some(vec) => vec,
+        None => {
+            eprintln!("RI3MO not initialized, fallback to primitive PT2");
+            return false;
+        }
+    };
+
+    let (rimo, vir_range, occ_range) = &ri3mo_vec[0];
+    let n0_local = rimo.size[0];
+    let n1_global = rimo.size[1];
+    let n2_global = rimo.size[2];
+
+    if n0_local != local_n0_range.len()
+        || n1_global != vir_range.len()
+        || n2_global != occ_range.len()
+    {
+        eprintln!("Inconsistent RI3MO dimensions, fallback to primitive PT2");
+        return false;
+    }
+
+    if n2_global < 20 {
+        eprintln!("num_occ smaller than 20, fallback to primitive PT2");
+        use_25d = false;
+    }
+
+    if use_25d {
+        let ctx = initialize_metadata(&grid, n2_global);
+        let mut n0_global_tmp: u64 = 0;
+        grid.cart_comm.all_reduce_into( &(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
+        let n0_global = n0_global_tmp as usize;
+
+        let memory_flag = check_memory_25d(&grid, &ctx, n0_global * n1_global, n2_global);
+        if !memory_flag {
+            eprintln!("Not enough memory for 2.5D, fallback to primitive PT2");
+            use_25d = false;
+        }
+    }
+
+    let mut global_use_25d = false;
+    grid.cart_comm.all_reduce_into(
+        &use_25d,
+        &mut global_use_25d,
+        &SystemOperation::logical_and(),
+    );
+
+    global_use_25d
+}
+
+pub fn open_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
+    if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
+
+        let my_rank = mpi_ix.rank;
+        let size = mpi_ix.size;
+        let local_n0_range = if let Some(loc_auxbas) = &mpi_ix.auxbas {
+            loc_auxbas[my_rank].clone()
+        } else {
+            panic!("Memory distrubtion should be initalized for the auxiliary basis sets before post-SCF calculations")
+        };
+
+        let grid = mpi_op.initialize_grid();
+        let mut global_term_os:f64 = 0.0_f64;
+        let mut global_term_ss:f64 = 0.0_f64;
+
+        let start_mo: usize = scf_data.mol.start_mo;
+        let num_basis = scf_data.mol.num_basis;
+        let num_state = scf_data.mol.num_state;
+
+        if let Some(ri3mo_vec) = &scf_data.ri3mo {
+
+            let alpha_eigenvalues = scf_data.eigenvalues.get(0).unwrap();
+            let alpha_occupation = scf_data.occupation.get(0).unwrap();
+
+            let alpha_homo = scf_data.homo.get(0).unwrap().clone();
+            let alpha_lumo = scf_data.lumo.get(0).unwrap().clone();
+            let alpha_num_occu = if scf_data.mol.num_elec[0 + 1] <= 1.0e-6 {0} else {alpha_homo + 1};
+
+            let beta_eigenvalues = scf_data.eigenvalues.get(1).unwrap();
+            let beta_occupation = scf_data.occupation.get(1).unwrap();
+
+            let beta_homo = scf_data.homo.get(1).unwrap().clone();
+            let beta_lumo = scf_data.lumo.get(1).unwrap().clone();
+            let beta_num_occu = if scf_data.mol.num_elec[1 + 1] <= 1.0e-6 {0} else {beta_homo + 1};
+
+            let (alpha_rimo, vir_range, occ_range) = &ri3mo_vec[0];
+            let (beta_rimo, _, _) = &ri3mo_vec[1];
+
+            let n0_local = alpha_rimo.size[0];
+            let n1_global = alpha_rimo.size[1];
+            let n2_global = alpha_rimo.size[2];
+
+            let ctx = initialize_metadata(&grid, n2_global);
+            let mut n0_global_tmp: u64 = 0;
+            grid.cart_comm.all_reduce_into(&(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
+            let n0_global = n0_global_tmp as usize;
+
+            let redistributed_alpha_rimo = swap_ownership(&grid, &ctx, &alpha_rimo, n0_global, n1_global, n2_global, &local_n0_range);
+            let redistributed_beta_rimo = swap_ownership(&grid, &ctx, &beta_rimo, n0_global, n1_global, n2_global, &local_n0_range);
+            let term_aa = local_computation_ss_batch(&redistributed_alpha_rimo, &ctx, n2_global, alpha_eigenvalues, alpha_occupation, occ_range.start, vir_range.start, alpha_num_occu);
+            let term_bb = local_computation_ss_batch(&redistributed_beta_rimo, &ctx, n2_global, beta_eigenvalues, beta_occupation, occ_range.start, vir_range.start, beta_num_occu);
+            let local_term_ss = term_aa + term_bb;
+            let local_term_os = local_computation_os_batch(&redistributed_alpha_rimo, &redistributed_beta_rimo, &ctx, n2_global,
+                alpha_eigenvalues, beta_eigenvalues, alpha_occupation, beta_occupation, occ_range.start, vir_range.start, alpha_num_occu, beta_num_occu);
+
+            grid.cart_comm.all_reduce_into(&local_term_ss, &mut global_term_ss, &SystemOperation::sum());
+            grid.cart_comm.all_reduce_into(&local_term_os, &mut global_term_os, &SystemOperation::sum());
+
+        }
+        Ok([global_term_os + global_term_ss, global_term_os, global_term_ss])
+    }
+    else {
+        panic!("MPI not initialized for 2.5d");
+    }
+}
+
+pub fn restricted_open_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
+    if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
+
+        let my_rank = mpi_ix.rank;
+        let size = mpi_ix.size;
+        let local_n0_range = if let Some(loc_auxbas) = &mpi_ix.auxbas {
+            loc_auxbas[my_rank].clone()
+        } else {
+            panic!("Memory distrubtion should be initalized for the auxiliary basis sets before post-SCF calculations")
+        };
+
+        let grid = mpi_op.initialize_grid();
+        let mut global_term_os:f64 = 0.0_f64;
+        let mut global_term_ss:f64 = 0.0_f64;
+
+        let start_mo: usize = scf_data.mol.start_mo;
+        let num_basis = scf_data.mol.num_basis;
+        let num_state = scf_data.mol.num_state;
+
+        if let Some(ri3mo_vec) = &scf_data.ri3mo {
+
+            let alpha_eigenvalues = &scf_data.semi_eigenvalues.as_ref().unwrap()[0];
+            let alpha_occupation = scf_data.occupation.get(0).unwrap();
+
+            let alpha_homo = scf_data.homo.get(0).unwrap().clone();
+            let alpha_lumo = scf_data.lumo.get(0).unwrap().clone();
+            let alpha_num_occu = if scf_data.mol.num_elec[0 + 1] <= 1.0e-6 {0} else {alpha_homo + 1};
+
+            let beta_eigenvalues = &scf_data.semi_eigenvalues.as_ref().unwrap()[1];
+            let beta_occupation = scf_data.occupation.get(1).unwrap();
+
+            let beta_homo = scf_data.homo.get(1).unwrap().clone();
+            let beta_lumo = scf_data.lumo.get(1).unwrap().clone();
+            let beta_num_occu = if scf_data.mol.num_elec[1 + 1] <= 1.0e-6 {0} else {beta_homo + 1};
+
+            let (alpha_rimo, vir_range, occ_range) = &ri3mo_vec[0];
+            let (beta_rimo, _, _) = &ri3mo_vec[1];
+
+            let n0_local = alpha_rimo.size[0];
+            let n1_global = alpha_rimo.size[1];
+            let n2_global = alpha_rimo.size[2];
+
+            let ctx = initialize_metadata(&grid, n2_global);
+            let mut n0_global_tmp: u64 = 0;
+            grid.cart_comm.all_reduce_into(&(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
+            let n0_global = n0_global_tmp as usize;
+
+            let redistributed_alpha_rimo = swap_ownership(&grid, &ctx, &alpha_rimo, n0_global, n1_global, n2_global, &local_n0_range);
+            let redistributed_beta_rimo = swap_ownership(&grid, &ctx, &beta_rimo, n0_global, n1_global, n2_global, &local_n0_range);
+            let term_aa = local_computation_ss_batch(&redistributed_alpha_rimo, &ctx, n2_global, alpha_eigenvalues, alpha_occupation, occ_range.start, vir_range.start, alpha_num_occu);
+            let term_bb = local_computation_ss_batch(&redistributed_beta_rimo, &ctx, n2_global, beta_eigenvalues, beta_occupation, occ_range.start, vir_range.start, beta_num_occu);
+            let local_term_ss = term_aa + term_bb;
+            let local_term_os = local_computation_os_batch(&redistributed_alpha_rimo, &redistributed_beta_rimo, &ctx, n2_global,
+                alpha_eigenvalues, beta_eigenvalues, alpha_occupation, beta_occupation, occ_range.start, vir_range.start, alpha_num_occu, beta_num_occu);
+
+            grid.cart_comm.all_reduce_into(&local_term_ss, &mut global_term_ss, &SystemOperation::sum());
+            grid.cart_comm.all_reduce_into(&local_term_os, &mut global_term_os, &SystemOperation::sum());
+
+        }
+        Ok([global_term_os + global_term_ss, global_term_os, global_term_ss])
+    }
+    else {
+        panic!("MPI not initialized for 2.5d");
+    }
+}
+
+pub fn close_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
+    if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
+
+        let my_rank = mpi_ix.rank;
+        let size = mpi_ix.size;
+        let local_n0_range = if let Some(loc_auxbas) = &mpi_ix.auxbas {
+            loc_auxbas[my_rank].clone()
+        } else {
+            panic!("Memory distrubtion should be initalized for the auxiliary basis sets before post-SCF calculations")
+        };
+
+        let grid = mpi_op.initialize_grid();
+        let mut global_term_os:f64 = 0.0_f64;
+        let mut global_term_ss:f64 = 0.0_f64;
+        if let Some(ri3mo_vec) = &scf_data.ri3mo {
+
+            let eigenvector = scf_data.eigenvectors.get(0).unwrap();
+            let eigenvalues = scf_data.eigenvalues.get(0).unwrap();
+            let occupation = scf_data.occupation.get(0).unwrap();
+
+            let homo = scf_data.homo.get(0).unwrap().clone();
+            let lumo = scf_data.lumo.get(0).unwrap().clone();
+            let num_basis = eigenvector.size.get(0).unwrap().clone();
+
+            let num_state = eigenvector.size.get(1).unwrap().clone();
+            let start_mo: usize = scf_data.mol.start_mo;
+
+            let num_occu = if scf_data.mol.num_elec[0] <= 1.0e-6 {0} else {homo + 1};
+            let (rimo, vir_range, occ_range) = &ri3mo_vec[0];
+            let n0_local = rimo.size[0];
+            let n1_global = rimo.size[1];
+            let n2_global = rimo.size[2];
+
+            //println!("rank:{}, cart_rank:{}, tensor_size=({},{},{}), local_n0_range:{:?})",
+                //my_rank, grid.rank, n0_local, n1_global, n2_global, local_n0_range);
+
+            let ctx = initialize_metadata(&grid, n2_global);
+            let mut n0_global_tmp: u64 = 0;
+            grid.cart_comm.all_reduce_into(&(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
+            let n0_global = n0_global_tmp as usize;
+
+            let redistributed_rimo = swap_ownership(&grid, &ctx, &rimo, n0_global, n1_global, n2_global, &local_n0_range);
+            let (local_term_os, local_term_ss) = local_computation_close_shell_batch(&redistributed_rimo, &ctx, n2_global, eigenvalues, occupation, occ_range.start, vir_range.start);
+            grid.cart_comm.all_reduce_into(&local_term_os, &mut global_term_os, &SystemOperation::sum());
+            grid.cart_comm.all_reduce_into(&local_term_ss, &mut global_term_ss, &SystemOperation::sum());
+        }
+        Ok([global_term_os + global_term_ss, global_term_os, global_term_ss])
+    }
+    else {
+        panic!("MPI not initialized for 2.5d");
+    }
 }
 
 pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
     let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
-    
+
     // Calculate the contribution of singly excited states.
     let mut e_mp2_single_list = [0.0_f64, 0.0_f64];
 

@@ -25,4 +25,4 @@ GeomeTRIC*
 # Hessian output files
 HessianMatrix.txt
 EigenModes.txt
-.DS_Store
+**/.DS_Store
