@@ -59,6 +59,21 @@ pub struct TDDFTData {
     pub den_type: Option<XCDenType>,
     /// Batch the fxc AO evaluation over grid batches (AO mode, memory-bounded).
     pub grid_batch: bool,
+    /// fxc driver: `false` = "dm" (assembled-density NIMatmul path, default),
+    /// `true` = "bra_trans" (cached occ/vir grid projections below).
+    pub fxc_bra_trans: bool,
+    /// Cached occ-MO projections on the grid (bra_trans driver):
+    /// ψ_i(g) = Σ_μ C_μi φ_μ(g), layout [ngrids, nocc].
+    pub psi_occ: Option<Tsr>,
+    /// Cached vir-MO projections on the grid (bra_trans driver):
+    /// ψ_a(g) = Σ_μ C_μa φ_μ(g), layout [ngrids, nvir].
+    pub psi_vir: Option<Tsr>,
+    /// Cached occ-MO gradient projections (GGA, bra_trans driver): ∂_d ψ_i(g),
+    /// layout [3, ngrids, nocc] with d ∈ {x, y, z}.
+    pub psi_occ_grad: Option<Tsr>,
+    /// Cached vir-MO gradient projections (GGA, bra_trans driver): ∂_d ψ_a(g),
+    /// layout [3, ngrids, nvir].
+    pub psi_vir_grad: Option<Tsr>,
     // ── MO mode only ──
     /// [naux, occ*vir] RI tensor, Coulomb.
     pub ri_ov: Option<MatrixFull<f64>>,
@@ -111,6 +126,11 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
         fxc_eff: None,
         den_type: None,
         grid_batch: false,
+        fxc_bra_trans: false,
+        psi_occ: None,
+        psi_vir: None,
+        psi_occ_grad: None,
+        psi_vir_grad: None,
         ri_ov: Some(ri_ov),
         ri_oo_exch: Some(ri_oo_exch),
         ri_vv_exch: Some(ri_vv_exch),
@@ -293,6 +313,49 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
         }
     }
 
+    // ── bra_trans driver: cache occ/vir MO projections on the grid ──
+    // Built grid-batch-wise (split_batch) so the full [ngrids, nao, ncomp] AO
+    // cache is never materialized; the small occ/vir tables are then reused by
+    // every fxc matvec, making the per-call fxc cost occ/vir-reduced.
+    // Layouts (t-ready, contiguous for the matvec GEMMs):
+    // psi_occ [ngrids, nocc]; psi_vir [ngrids, nvir];
+    // psi_occ_grad [3, ngrids, nocc]; psi_vir_grad [3, ngrids, nvir]
+    // (leading d-axis so the (d, chunk, ·) slices are contiguous).
+    let fxc_bra_trans = scf.mol.ctrl.tddft.as_ref()
+        .map_or(false, |t| t.tddft_fxc_driver == "bra_trans");
+    let (psi_occ, psi_vir, psi_occ_grad, psi_vir_grad) = if fxc_bra_trans {
+        let c_occ_view = c_occ.to_rstsr_view(&device);
+        let c_vir_view = c_vir.to_rstsr_view(&device);
+        let deriv = if nvar == 4 { 1 } else { 0 };
+        let mut po = rt::zeros(([ngrids, occ_size].f(), &device));
+        let mut pv = rt::zeros(([ngrids, vir_size].f(), &device));
+        let (mut pog, mut pvg) = if nvar == 4 {
+            (Some(rt::zeros(([3, ngrids, occ_size].f(), &device))),
+             Some(rt::zeros(([3, ngrids, vir_size].f(), &device))))
+        } else {
+            (None, None)
+        };
+        for start in (0..ngrids).step_by(ngrids.max(1)) { // TEMP: single-batch experiment
+            let end = (start + ngrids.max(1)).min(ngrids);
+            let mut ni_batch = ni.split_batch(start, end);
+            let ao = ni_batch.get_cached_ao(deriv); // [nb, nao, ncomp]
+            let ao0 = ao.i((.., .., 0)); // [nb, nao]
+            // ψ[g, i] = Σ_μ ao[g, μ] C[μ, i]  (project onto occ/vir coefficients)
+            po.i_mut((start..end, ..)).matmul_from(&ao0, &c_occ_view, 1.0, 0.0);
+            pv.i_mut((start..end, ..)).matmul_from(&ao0, &c_vir_view, 1.0, 0.0);
+            if let (Some(pog), Some(pvg)) = (&mut pog, &mut pvg) {
+                for d in 0..3 {
+                    let aod = ao.i((.., .., 1 + d)); // ∂_d φ
+                    pog.i_mut((d, start..end, ..)).matmul_from(&aod, &c_occ_view, 1.0, 0.0);
+                    pvg.i_mut((d, start..end, ..)).matmul_from(&aod, &c_vir_view, 1.0, 0.0);
+                }
+            }
+        }
+        (Some(po), Some(pv), pog, pvg)
+    } else {
+        (None, None, None, None)
+    };
+
     TDDFTData {
         mode: TDDFTMode::AO,
         alpha_hybrid,
@@ -305,6 +368,11 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
         fxc_eff: Some(fxc_eff),
         den_type: Some(den_type),
         grid_batch,
+        fxc_bra_trans,
+        psi_occ,
+        psi_vir,
+        psi_occ_grad,
+        psi_vir_grad,
         ri_ov: None,
         ri_oo_exch: None,
         ri_vv_exch: None,

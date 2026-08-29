@@ -319,6 +319,121 @@ pub fn get_vk_ri_incore_dm(cderi: TsrView<f64>, dms: TsrView<f64>, batch_size: u
 
 /* #endregion ri-vk incore dm */
 
+/* #region ri-vk incore coeff pair */
+
+/// Generate Exchange (K) matrix using RI incore method from a pair of
+/// "occupied-side" MO coefficient blocks.
+///
+/// Computes (per set $\mathbb{A}$)
+///
+/// $$ K^{\mathbb{A}}_{\mu\nu} = \sum_{P,\,i\le k} (M_P\, c_{\mathrm{left},\mathbb{A}})_{\mu i}\,(M_P\, c_{\mathrm{right}})_{\nu i} $$
+///
+/// i.e. the exchange of the factorized density $P^{\mathbb{A}} = c_{\mathrm{left},\mathbb{A}}\, c_{\mathrm{right}}^{\mathrm{T}}$
+/// without materializing it. This generalizes [`get_vk_ri_incore_coeff`]
+/// (the $c_{\mathrm{left}} = c_{\mathrm{right}}$ case) to two distinct coefficient
+/// matrices. The primary use case is AO-mode TDDFT, where the transition
+/// density factorizes exactly as $P^{\mathbb{A}} = (C_{vir} X_{\mathbb{A}}^{\mathrm{T}})\, C_{occ}^{\mathrm{T}}$
+/// (rank $\le n_\mathrm{occ}$), so the exchange costs $O(n_\mathrm{aux} n_\mathrm{ao}^2 n_\mathrm{occ})$
+/// instead of $O(n_\mathrm{aux} n_\mathrm{ao}^3)$.
+///
+/// # Parameters
+///
+/// - `cderi`: [`TsrView<f64>`]
+///
+///   - Cholesky decomposed 3c-2e ERI in shape (nao_tp, naux), f-contiguous, AO basis.
+///
+/// - `c_left`: [`TsrView<f64>`]
+///
+///   - Batch of left coefficient blocks, shape (nao, k, nset), f-contiguous, AO basis.
+///
+/// - `c_right`: [`TsrView<f64>`]
+///
+///   - Single right coefficient block, shape (nao, k), f-contiguous, AO basis.
+///   - Held fixed across the set index, so its half-transform is computed once
+///     per auxiliary batch and reused for all sets.
+///
+/// - `batch_size`: `usize`
+///
+///   - Batch size for auxiliary basis partitioning. This value controls memory usage.
+///
+/// # Returns
+///
+/// - [`Tsr<f64>`]
+///
+///   - Exchange (K) matrices in shape (nao, nao, nset), f-contiguous.
+///   - Not symmetric in general ($c_{\mathrm{left}} \ne c_{\mathrm{right}}$).
+pub fn get_vk_ri_incore_coeff_pair(
+    cderi: TsrView<f64>,
+    c_left: TsrView<f64>,
+    c_right: TsrView<f64>,
+    batch_size: usize,
+) -> Tsr<f64> {
+    assert_eq!(cderi.ndim(), 2, "Cholesky ERI must have 2 dimensions");
+    assert_eq!(c_left.ndim(), 3, "c_left must have 3 dimensions (nao, k, nset)");
+    assert_eq!(c_right.ndim(), 2, "c_right must have 2 dimensions (nao, k)");
+
+    // get shapes
+    let nao = c_right.shape()[0];
+    let k = c_right.shape()[1];
+    let nset = c_left.shape()[2];
+    let naux = cderi.shape()[1];
+    let nao_tp = (nao + 1) * nao / 2;
+    let device = cderi.device().clone();
+
+    // shape check
+    assert_eq!(cderi.shape(), &[nao_tp, naux], "Cholesky ERI must have shape (nao_tp, naux)");
+    assert_eq!(c_left.shape()[0], nao, "c_left rows must match nao");
+    assert_eq!(c_left.shape()[1], k, "c_left column count must match c_right");
+    assert_eq!(c_right.shape(), &[nao, k]);
+
+    // initialize vk as result
+    let mut ks = rt::zeros(([nao, nao, nset].f(), &device));
+
+    // process each auxiliary batch
+    (0..naux).step_by(batch_size).for_each(|iaux| {
+        let nbatch = if iaux + batch_size <= naux { batch_size } else { naux - iaux };
+
+        // unpack cderi once for this batch: cderi_batch (nao, nao, nbatch)
+        let cderi_batch: Tsr<f64> = unsafe { rt::empty(([nao, nao, nbatch].f(), &device)) };
+        (0..nbatch).into_par_iter().for_each(|p| {
+            let cderi_iaux = cderi.i((.., iaux + p)).unpack_tri(Upper, FlagSymm::Sy);
+            let dst = cderi_batch.i((.., .., p));
+            let mut dst = unsafe { dst.force_mut() };
+            dst.assign(&cderi_iaux);
+        });
+
+        // right half-transform, once per batch: yl (nao, k, nbatch)
+        // -- (eq.1) -- //
+        let yl = unsafe { rt::empty(([nao, k, nbatch].f(), &device)) };
+        (0..nbatch).into_par_iter().for_each(|p| {
+            let m_p = cderi_batch.i((.., .., p));
+            let yl_p = yl.i((.., .., p));
+            let mut yl_p = unsafe { yl_p.force_mut() };
+            yl_p.matmul_from(&m_p, &c_right, 1.0, 0.0);
+        });
+        let yl = yl.into_shape([nao, k * nbatch]);
+
+        // left half-transform per set, then accumulate the outer product
+        for iset in 0..nset {
+            // -- (eq.2) -- //
+            let yx = unsafe { rt::empty(([nao, k, nbatch].f(), &device)) };
+            (0..nbatch).into_par_iter().for_each(|p| {
+                let m_p = cderi_batch.i((.., .., p));
+                let yx_p = yx.i((.., .., p));
+                let mut yx_p = unsafe { yx_p.force_mut() };
+                yx_p.matmul_from(&m_p, &c_left.i((.., .., iset)), 1.0, 0.0);
+            });
+            // build vk contribution
+            // -- (eq.3) -- //
+            let yx = yx.into_shape([nao, k * nbatch]);
+            ks.i_mut((.., .., iset)).matmul_from(&yx, &yl.t(), 1.0, 1.0);
+        }
+    });
+    ks
+}
+
+/* #endregion ri-vk incore coeff pair */
+
 /* #region ri-vk incore low-rank (SVD) dm */
 
 /// Default relative singular-value threshold for the low-rank exchange
@@ -491,5 +606,31 @@ mod tests {
         // Drop σ < 1e-4·σ_max. For rank-2 z, σ3/σ1 is tiny, so this keeps rank 2.
         let k_lr = get_vk_ri_incore_dm_lowrank(cderi.view(), c_occ.view(), c_vir.view(), z.view(), 1.0e-4, 64);
         assert!(rt::allclose(k_lr.view(), k_exact, None), "truncated low-rank != exact");
+    }
+
+    #[test]
+    fn test_vk_ri_incore_coeff_pair_matches_exact() {
+        let nao = 6; let k_dim = 3; let naux = 5; let nset = 2;
+        let device = DeviceBLAS::default();
+        let nao_tp = nao * (nao + 1) / 2;
+        let cderi = rt::asarray((pseudo(nao_tp * naux, 1.7), [nao_tp, naux].f(), &device));
+        // c_left differs per set; c_right shared (the multi-root TDDFT pattern)
+        let c_left = rt::asarray((pseudo(nao * k_dim * nset, 6.3), [nao, k_dim, nset].f(), &device));
+        let c_right = rt::asarray((pseudo(nao * k_dim, 7.9), [nao, k_dim].f(), &device));
+
+        let k_pair = get_vk_ri_incore_coeff_pair(cderi.view(), c_left.view(), c_right.view(), 64);
+
+        // exact reference: P_s = c_left_s · c_rightᵀ, K_s = get_vk_ri_incore_dm([P_s])
+        for s in 0..nset {
+            let cl = c_left.i((.., .., s));
+            let p = rt::matmul(&cl, &c_right.t()); // [nao, nao]
+            let p3 = rt::asarray((p.iter().copied().collect::<Vec<f64>>(), [nao, nao, 1].f(), &device));
+            let k_exact_full = get_vk_ri_incore_dm(cderi.view(), p3.view(), 64);
+            let k_exact = k_exact_full.i((.., .., 0));
+            assert!(
+                rt::allclose(k_pair.i((.., .., s)), k_exact, None),
+                "coeff_pair set {s} != exact density-driven K"
+            );
+        }
     }
 }

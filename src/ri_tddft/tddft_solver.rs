@@ -323,6 +323,10 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     };
 
     // ═══ Step 9: Compute and print results (BSE-compatible format) ═══
+    // AO mode: report the kernel-step timing attribution (debug level).
+    if matches!(data.borrow().mode, TDDFTMode::AO) {
+        crate::ri_tddft::matvec_ao::ao_timing_report();
+    }
     let n_found = eigenpairs.len();
     let tda_flag = is_tda;
     let n_print = n_found.min(30);

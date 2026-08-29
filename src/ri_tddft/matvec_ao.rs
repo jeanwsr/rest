@@ -43,6 +43,67 @@ pub type RimatrTuple = Option<(MatrixFull<f64>, MatrixFull<usize>, Vec<[usize; 2
 
 
 // ══════════════════════════════════════════════════════════════════
+// Timing instrumentation (debug-gated; see `ao_timing_report`)
+// ══════════════════════════════════════════════════════════════════
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+/// Cumulative nanoseconds: transition-density build + symmetrization.
+pub static T_TDEN: AtomicU64 = AtomicU64::new(0);
+/// Cumulative nanoseconds: batched RI-J (Coulomb).
+pub static T_J: AtomicU64 = AtomicU64::new(0);
+/// Cumulative nanoseconds: batched RI-K (exchange, all drivers).
+pub static T_K: AtomicU64 = AtomicU64::new(0);
+/// Cumulative nanoseconds: batched fxc (total).
+pub static T_FXC: AtomicU64 = AtomicU64::new(0);
+/// Cumulative nanoseconds: fxc `make_rho_from_dm` part.
+pub static T_FXC_RHO: AtomicU64 = AtomicU64::new(0);
+/// Cumulative nanoseconds: fxc `make_fxc_pot_with_eff` part.
+pub static T_FXC_POT: AtomicU64 = AtomicU64::new(0);
+/// Cumulative nanoseconds: per-column assembly + `contract_back`.
+pub static T_CONT: AtomicU64 = AtomicU64::new(0);
+/// Cumulative nanoseconds: whole batched A/B matvec closures (diagonal + kernel).
+pub static T_CLOS: AtomicU64 = AtomicU64::new(0);
+/// Number of batched A/B matvec closure calls.
+pub static N_AO_CLOS: AtomicU64 = AtomicU64::new(0);
+
+fn add_ns(counter: &AtomicU64, started: Instant) {
+    counter.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+fn s_of(counter: &AtomicU64) -> f64 {
+    counter.load(Ordering::Relaxed) as f64 / 1.0e9
+}
+
+/// Print the accumulated AO-kernel timing table (debug level, visible with
+/// `print_level = 2`). Percentages are relative to the total closure time
+/// (batched A/B matvecs, diagonal included).
+pub fn ao_timing_report() {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    let n = N_AO_CLOS.load(Ordering::Relaxed);
+    let clos = s_of(&T_CLOS);
+    log::debug!("AO matvec timing ({} batched A/B calls, total {:.3} s):", n, clos);
+    let rows = [
+        ("tden build", &T_TDEN),
+        ("J (Coulomb)", &T_J),
+        ("K (exchange)", &T_K),
+        ("fxc total", &T_FXC),
+        ("  fxc rho", &T_FXC_RHO),
+        ("  fxc pot", &T_FXC_POT),
+        ("assemble+contract", &T_CONT),
+    ];
+    for (name, counter) in rows {
+        let t = s_of(counter);
+        let pct = if clos > 0.0 { 100.0 * t / clos } else { 0.0 };
+        log::debug!("  {:<18} {:>10.3} s  ({:>5.1}% of closure)", name, t, pct);
+    }
+}
+
+
+// ══════════════════════════════════════════════════════════════════
 // Core contractions
 // ══════════════════════════════════════════════════════════════════
 
@@ -104,7 +165,7 @@ fn get_k_ao_batched(
     swap: bool,
 ) -> MatrixFull<f64> {
     let tddft_ctrl = scf.mol.ctrl.tddft.as_ref();
-    let lowrank_k = tddft_ctrl.map_or(false, |t| t.tddft_lowrank_k);
+    let driver = tddft_ctrl.map_or("dm", |t| t.tddft_ao_rik_driver.as_str());
     let svd_tol = tddft_ctrl.map_or(1.0e-6, |t| t.tddft_svd_tol);
     let nao = scf.mol.num_basis;
     let m = p_block.len();
@@ -113,39 +174,93 @@ fn get_k_ao_batched(
         .expect("rimatr must be initialized for AO-mode TDDFT");
     let cderi = ri3fn.to_rstsr_view(&device);
     let naux = ri3fn.size[1];
+    let occ_size = ao_data.c_occ.as_ref().unwrap().size[1];
+    let vir_size = ao_data.c_vir.as_ref().unwrap().size[1];
 
     let mut out = MatrixFull::new([nao * nao, m], 0.0);
-    if !lowrank_k {
-        // Exact: one batched K over all trial vectors.
-        let dms_slice: &[MatrixFull<f64>] = p_block;
-        let dms = dms_slice.to_rstsr(&device);            // [nao,nao,m]
-        let ks = crate::ri_jk::pure_incore::get_vk_ri_incore_dm(cderi, dms.view(), naux);
-        for s in 0..m {
-            for (r, v) in ks.i((.., .., s)).iter().enumerate() {
-                out.data[s * nao * nao + r] = *v;
+    match driver {
+        "semitrans" => {
+            // Semi-transformation driver: fold the amplitudes into occ-side
+            // coefficients first:
+            //   CX_s = C_vir · X_sᵀ  (nao × occ), so that P_s = CX_s · C_occᵀ holds
+            //   exactly (rank ≤ nocc, no SVD needed), and
+            //   K_s = Σ_Q (M_Q CX_s)(M_Q C_occ)ᵀ  via ri_jk::get_vk_ri_incore_coeff_pair.
+            // B block (swap): since every M_Q is symmetric, K[Pᵀ] = K[P]ᵀ — fold the
+            // A-side amplitudes and transpose the result (never refold at k = nvir).
+            let c_vir_v = ao_data.c_vir.as_ref().unwrap().to_rstsr_view(&device);
+            let c_occ_v = ao_data.c_occ.as_ref().unwrap().to_rstsr_view(&device);
+            // x_t [vir, occ, m]: per-set Xᵀ (un-transposing the swapped amplitudes)
+            let dim_z = if swap { vir_size * occ_size } else { occ_size * vir_size };
+            let mut x_t = vec![0.0_f64; vir_size * occ_size * m];
+            for s in 0..m {
+                for a in 0..vir_size {
+                    for i in 0..occ_size {
+                        let v = if swap {
+                            z_block.data[a + i * vir_size + s * dim_z]
+                        } else {
+                            z_block.data[i + a * occ_size + s * dim_z]
+                        };
+                        x_t[a + i * vir_size + s * vir_size * occ_size] = v;
+                    }
+                }
+            }
+            let x_tsr = rt::asarray((x_t, [vir_size, occ_size, m].f(), &device));
+            // CX block [nao, occ, m]
+            let mut cx = rt::zeros(([nao, occ_size, m].f(), &device));
+            for s in 0..m {
+                cx.i_mut((.., .., s)).matmul_from(&c_vir_v, &x_tsr.i((.., .., s)), 1.0, 0.0);
+            }
+            let ks = crate::ri_jk::pure_incore::get_vk_ri_incore_coeff_pair(
+                cderi, cx.view(), c_occ_v.view(), naux,
+            );
+            // The fold always produces K[Pᵀ] (= K[C_vir Xᵀ C_occᵀ]). The A block
+            // expects K[P] → transpose; the B block expects K[Pᵀ] → as-is.
+            for s in 0..m {
+                if !swap {
+                    // out[c + r·nao] = K[r + c·nao]  (transpose)
+                    for r in 0..nao {
+                        for c in 0..nao {
+                            out.data[s * nao * nao + c + r * nao] = ks[[r, c, s]];
+                        }
+                    }
+                } else {
+                    for (r, v) in ks.i((.., .., s)).iter().enumerate() {
+                        out.data[s * nao * nao + r] = *v;
+                    }
+                }
             }
         }
-    } else {
-        // Low-rank: per-vector SVD (cannot batch the SVD truncation).
-        let occ_size = ao_data.c_occ.as_ref().unwrap().size[1];
-        let vir_size = ao_data.c_vir.as_ref().unwrap().size[1];
-        let c_occ_v = ao_data.c_occ.as_ref().unwrap().to_rstsr_view(&device);
-        let c_vir_v = ao_data.c_vir.as_ref().unwrap().to_rstsr_view(&device);
-        for s in 0..m {
-            let z_col: Vec<f64> = (0..z_block.size[0]).map(|r| z_block[[r, s]]).collect();
-            let (n1, n2) = if swap { (vir_size, occ_size) } else { (occ_size, vir_size) };
-            let z_mat = MatrixFull::from_vec([n1, n2], z_col).unwrap();
-            let (c_left, c_right) = if swap { (c_vir_v.view(), c_occ_v.view()) } else { (c_occ_v.view(), c_vir_v.view()) };
-            let k2 = crate::ri_jk::pure_incore::get_vk_ri_incore_dm_lowrank(
-                cderi.view(),
-                c_left,
-                c_right,
-                z_mat.to_rstsr_view(&device),
-                svd_tol,
-                naux,
-            );
-            for (r, v) in k2.iter().enumerate() {
-                out.data[s * nao * nao + r] = *v;
+        "lowrank" => {
+            // Low-rank: per-vector SVD (cannot batch the SVD truncation).
+            let c_occ_v = ao_data.c_occ.as_ref().unwrap().to_rstsr_view(&device);
+            let c_vir_v = ao_data.c_vir.as_ref().unwrap().to_rstsr_view(&device);
+            for s in 0..m {
+                let z_col: Vec<f64> = (0..z_block.size[0]).map(|r| z_block[[r, s]]).collect();
+                let (n1, n2) = if swap { (vir_size, occ_size) } else { (occ_size, vir_size) };
+                let z_mat = MatrixFull::from_vec([n1, n2], z_col).unwrap();
+                let (c_left, c_right) = if swap { (c_vir_v.view(), c_occ_v.view()) } else { (c_occ_v.view(), c_vir_v.view()) };
+                let k2 = crate::ri_jk::pure_incore::get_vk_ri_incore_dm_lowrank(
+                    cderi.view(),
+                    c_left,
+                    c_right,
+                    z_mat.to_rstsr_view(&device),
+                    svd_tol,
+                    naux,
+                );
+                for (r, v) in k2.iter().enumerate() {
+                    out.data[s * nao * nao + r] = *v;
+                }
+            }
+        }
+        _ => {
+            // Exact: one batched K over all trial vectors.
+            let dms_slice: &[MatrixFull<f64>] = p_block;
+            let dms = dms_slice.to_rstsr(&device);            // [nao,nao,m]
+            let ks = crate::ri_jk::pure_incore::get_vk_ri_incore_dm(cderi, dms.view(), naux);
+            for s in 0..m {
+                for (r, v) in ks.i((.., .., s)).iter().enumerate() {
+                    out.data[s * nao * nao + r] = *v;
+                }
             }
         }
     }
@@ -221,8 +336,12 @@ fn fxc_matvec_ao_batched(
     if !ao_data.grid_batch {
         // Full-grid path: one batched call over all sets.
         let dm_views: Vec<TsrView> = (0..m).map(|s| dms.i((.., .., s))).collect();
+        let t0 = Instant::now();
         let rho1 = ni.make_rho_from_dm(&dm_views, den_type); // [ngrids, nvar, m]
+        add_ns(&T_FXC_RHO, t0);
+        let t0 = Instant::now();
         let f_fxc = ni.make_fxc_pot_with_eff(fxc_eff_view, rho1.view(), den_type, XCSpin::Unpolarized);
+        add_ns(&T_FXC_POT, t0);
         for s in 0..m {
             for (r, v) in f_fxc.i((.., .., s)).iter().enumerate() {
                 out.data[s * nao * nao + r] = *v;
@@ -235,9 +354,13 @@ fn fxc_matvec_ao_batched(
             let end = (start + nbatch).min(ngrids);
             let mut ni_batch = ni.split_batch(start, end);
             let dm_views: Vec<TsrView> = (0..m).map(|s| dms.i((.., .., s))).collect();
+            let t0 = Instant::now();
             let rho1_b = ni_batch.make_rho_from_dm(&dm_views, den_type); // [nb, nvar, m]
+            add_ns(&T_FXC_RHO, t0);
             let fxc_eff_b = fxc_eff_view.i((start..end));
+            let t0 = Instant::now();
             let f_b = ni_batch.make_fxc_pot_with_eff(fxc_eff_b, rho1_b.view(), den_type, XCSpin::Unpolarized);
+            add_ns(&T_FXC_POT, t0);
             for s in 0..m {
                 for (r, v) in f_b.i((.., .., s)).iter().enumerate() {
                     out.data[s * nao * nao + r] += *v;
@@ -246,6 +369,169 @@ fn fxc_matvec_ao_batched(
         }
     }
     out
+}
+
+/// bra_trans fxc driver: occ/vir-reduced kernel application using the cached
+/// MO-on-grid projection tables (`psi_occ`/`psi_vir`/grads).
+///
+/// Per trial vector $z_{ia}$, with $\psi_i(g)=\sum_\mu C_{\mu i}\varphi_\mu(g)$:
+///
+/// $$\rho_0(g) = \sum_{ia} z_{ia}\,\psi_i(g)\psi_a(g), \qquad
+///   \rho_{d+1}(g) = \sum_{ia} z_{ia}\,(\partial_d\psi_i\,\psi_a + \psi_i\,\partial_d\psi_a)(g)$$
+///
+/// $$v_{1,\alpha}(g) = w(g)\sum_\beta f^{\rm xc}_{\alpha\beta}(g)\,\rho_\beta(g), \qquad
+///   E_{ia} = \sum_g \Lambda^\alpha_{ia}(g)\,v_{1,\alpha}(g)$$
+///
+/// with $\Lambda^0_{ia} = \psi_i\psi_a$ and $\Lambda^{d+1}_{ia} = \partial_d\psi_i\,\psi_a + \psi_i\,\partial_d\psi_a$.
+/// Every contraction runs in the $(n_\mathrm{occ}, n_\mathrm{vir}, n_\mathrm{grid})$ space —
+/// no $[n_\mathrm{ao}, n_\mathrm{ao}, m]$ intermediates, no `contract_back`.
+///
+/// Returns MO amplitudes `[dim, m]` (added directly to the matvec result).
+fn fxc_bra_trans_matvec(
+    scf: &SCF,
+    ao_data: &TDDFTData,
+    z_block: &MatrixFull<f64>,
+    device: &DeviceBLAS,
+) -> MatrixFull<f64> {
+    let psi_occ = ao_data.psi_occ.as_ref().expect("bra_trans fxc requires psi_occ"); // [ng, occ]
+    let psi_vir = ao_data.psi_vir.as_ref().expect("bra_trans fxc requires psi_vir"); // [ng, vir]
+    let fxc_eff = ao_data.fxc_eff.as_ref().unwrap().view(); // [ng, nvar, nvar]
+    let gga = ao_data.psi_occ_grad.is_some();
+    let nvar = if gga { 4 } else { 1 };
+    let dim = z_block.size[0];
+    let m = z_block.size[1];
+    let occ_size = psi_occ.shape()[1];
+    let vir_size = psi_vir.shape()[1];
+    let ng = psi_occ.shape()[0];
+    let weights = &scf.grids.as_ref().expect("DFT grids required for bra_trans fxc").weights;
+    let fxc_raw = fxc_eff.raw();
+    let fxc_off = fxc_eff.offset();
+
+    // Chunked streaming over grid chunks: per-chunk [cg, ·] buffers stay cache-resident
+    // (no full-grid [ng, vir] intermediates), and the psi tables are read once per
+    // (chunk, set) instead of round-tripping large temporaries. The per-(chunk, set)
+    // MO-amplitude contributions are reduced across chunks at the end.
+    let nchunk = 1536usize;
+    let ntask = ng.div_ceil(nchunk);
+
+    let chunk_results: Vec<Vec<f64>> = (0..ntask).into_par_iter().map(|ic| {
+        let g0 = ic * nchunk;
+        let g1 = (g0 + nchunk).min(ng);
+        let cg = g1 - g0;
+        let mut e_out = vec![0.0_f64; m * occ_size * vir_size]; // [m, occ, vir], f-order
+
+        let po_c = psi_occ.i((g0..g1, ..)); // [cg, occ]
+        let pv_c = psi_vir.i((g0..g1, ..)); // [cg, vir]
+        let mut t0_buf = rt::zeros(([cg, vir_size].f(), device));
+        let mut td_buf = rt::zeros(([cg, vir_size].f(), device));
+        let mut s_buf = vec![0.0_f64; cg * occ_size];
+        let mut rho_bufs: Vec<Vec<f64>> = vec![vec![0.0; cg]; 4];
+        let mut v1_bufs: Vec<Vec<f64>> = vec![vec![0.0; cg]; 4];
+        let mut e_total = rt::zeros(([occ_size, vir_size].f(), device));
+
+        for s in 0..m {
+            // ── response densities ρ_β(g) over this chunk ──
+            let t_rho = Instant::now();
+            let z_vec: Vec<f64> = (0..dim).map(|r| z_block[[r, s]]).collect();
+            let z_tsr = rt::asarray((z_vec, [occ_size, vir_size].f(), device));
+
+            t0_buf.matmul_from(&po_c, &z_tsr.view(), 1.0, 0.0);
+            let mut rho0 = rt::zeros(([cg], device));
+            rho0.i_mut((..)).vecdot_from(&t0_buf.view(), &pv_c, 1);
+            for g in 0..cg {
+                rho_bufs[0][g] = rho0[[g]];
+            }
+            if gga {
+                let pog = ao_data.psi_occ_grad.as_ref().unwrap(); // [3, ng, occ]
+                let pvg = ao_data.psi_vir_grad.as_ref().unwrap(); // [3, ng, vir]
+                for d in 0..3 {
+                    td_buf.matmul_from(&pog.i((d, g0..g1, ..)), &z_tsr.view(), 1.0, 0.0);
+                    let mut r_d = rt::zeros(([cg], device));
+                    r_d.i_mut((..)).vecdot_from(&td_buf.view(), &pv_c, 1);
+                    let mut r_t = rt::zeros(([cg], device));
+                    r_t.i_mut((..)).vecdot_from(&t0_buf.view(), &pvg.i((d, g0..g1, ..)), 1);
+                    for g in 0..cg {
+                        rho_bufs[1 + d][g] = r_d[[g]] + r_t[[g]];
+                    }
+                }
+            }
+            // weighted kernel contraction v1_α(g) = w(g) Σ_β fxc_eff[g,α,β] ρ_β(g)
+            for alpha in 0..nvar {
+                v1_bufs[alpha].fill(0.0);
+            }
+            for alpha in 0..nvar {
+                for beta in 0..nvar {
+                    let base = fxc_off + alpha * ng + beta * nvar * ng + g0;
+                    let r = &rho_bufs[beta];
+                    let v = &mut v1_bufs[alpha];
+                    for g in 0..cg {
+                        v[g] += fxc_raw[base + g] * r[g];
+                    }
+                }
+                for g in 0..cg {
+                    v1_bufs[alpha][g] *= weights[g0 + g];
+                }
+            }
+            add_ns(&T_FXC_RHO, t_rho);
+
+            // ── back-projection over this chunk: E = Σ_α diag-scaled ψ^α · Ψ^α ──
+            let t_pot = Instant::now();
+            for g in 0..cg {
+                let w = v1_bufs[0][g];
+                for i in 0..occ_size {
+                    s_buf[g + i * cg] = po_c[[g, i]] * w;
+                }
+            }
+            let s0 = rt::asarray((&s_buf, [cg, occ_size].f(), device));
+            e_total.matmul_from(&s0.t(), &pv_c, 1.0, 0.0); // reset accumulator
+            if gga {
+                let pog = ao_data.psi_occ_grad.as_ref().unwrap(); // [3, ng, occ]
+                let pvg = ao_data.psi_vir_grad.as_ref().unwrap(); // [3, ng, vir]
+                for d in 0..3 {
+                    // term 1: (diag(v1_{d+1})·∂_dψ_occ_c)ᵀ · psi_vir_c
+                    for g in 0..cg {
+                        let w = v1_bufs[1 + d][g];
+                        for i in 0..occ_size {
+                            s_buf[g + i * cg] = pog[[d, g0 + g, i]] * w;
+                        }
+                    }
+                    let s1 = rt::asarray((&s_buf, [cg, occ_size].f(), device));
+                    e_total.matmul_from(&s1.t(), &pv_c, 1.0, 1.0);
+                    // term 2: (diag(v1_{d+1})·psi_occ_c)ᵀ · ∂_dψ_vir_c
+                    for g in 0..cg {
+                        let w = v1_bufs[1 + d][g];
+                        for i in 0..occ_size {
+                            s_buf[g + i * cg] = po_c[[g, i]] * w;
+                        }
+                    }
+                    let s2 = rt::asarray((&s_buf, [cg, occ_size].f(), device));
+                    e_total.matmul_from(&s2.t(), &pvg.i((d, g0..g1, ..)), 1.0, 1.0);
+                }
+            }
+            add_ns(&T_FXC_POT, t_pot);
+
+            let obase = s * occ_size * vir_size;
+            for a in 0..vir_size {
+                for i in 0..occ_size {
+                    e_out[obase + i * vir_size + a] += e_total[[i, a]];
+                }
+            }
+        }
+        e_out
+    }).collect::<Vec<_>>();
+
+    let mut result = MatrixFull::new([dim, m], 0.0);
+    for e_out in chunk_results.iter() {
+        for s in 0..m {
+            let obase = s * occ_size * vir_size;
+            for a in 0..vir_size {
+                for i in 0..occ_size {
+                    result[[i + a * occ_size, s]] += e_out[obase + i * vir_size + a];
+                }
+            }
+        }
+    }
+    result
 }
 
 /// Kernel part of the A-block matvec (everything except the diagonal):
@@ -267,26 +553,48 @@ fn ao_a_kernel_block(
 
     // Build P for each column, and batch the fxc over all columns.
     let device = DeviceBLAS::default();
+    let t0 = Instant::now();
     let mut p_block: Vec<MatrixFull<f64>> = Vec::with_capacity(m);
     for s in 0..m {
         let z: Vec<f64> = (0..dim).map(|r| z_block[[r, s]]).collect();
         p_block.push(transition_density(ao_data.c_occ.as_ref().unwrap(), ao_data.c_vir.as_ref().unwrap(), &z, nao, occ_size, vir_size));
     }
-    let f_fxc_block = fxc_matvec_ao_batched(ao_data, &p_block, &device);
+    add_ns(&T_TDEN, t0);
+
+    // fxc: "dm" (assembled-density NIMatmul, AO-basis block) or "bra_trans"
+    // (occ/vir-reduced, direct MO-amplitude output).
+    let t0 = Instant::now();
+    let f_fxc_block = if ao_data.fxc_bra_trans {
+        None
+    } else {
+        Some(fxc_matvec_ao_batched(ao_data, &p_block, &device))
+    };
+    let fxc_mo_block = if ao_data.fxc_bra_trans {
+        Some(fxc_bra_trans_matvec(scf, ao_data, z_block, &device))
+    } else {
+        None
+    };
+    add_ns(&T_FXC, t0);
 
     // Batched RI-J/K over all trial vectors (single ri_jk call).
+    let t0 = Instant::now();
     let j_block = if coulomb_factor != 0.0 {
         Some(get_j_ao_batched(scf, &p_block))
     } else {
         None
     };
+    add_ns(&T_J, t0);
+
+    let t0 = Instant::now();
     let k_block = if alpha_hybrid.abs() > 1e-15 {
         Some(get_k_ao_batched(scf, ao_data, z_block, &p_block, false))
     } else {
         None
     };
+    add_ns(&T_K, t0);
 
     // Per-column assembly + contract back
+    let t0 = Instant::now();
     for s in 0..m {
         let base = s * nao * nao;
         let mut f_total = MatrixFull::new([nao, nao], 0.0);
@@ -300,15 +608,24 @@ fn ao_a_kernel_block(
                 f_total.data[idx] -= alpha_hybrid * kb.data[base + idx];
             }
         }
-        // fxc contribution for this vector (column s of the batched fxc block)
-        for idx in 0..nao * nao {
-            f_total.data[idx] += f_fxc_block.data[base + idx];
+        if let Some(fb) = &f_fxc_block {
+            // fxc contribution for this vector (column s of the batched fxc block)
+            for idx in 0..nao * nao {
+                f_total.data[idx] += fb.data[base + idx];
+            }
         }
         let kernel_mo = contract_back(&f_total, ao_data.c_occ.as_ref().unwrap(), ao_data.c_vir.as_ref().unwrap(), occ_size, vir_size);
         for r in 0..dim {
             result[[r, s]] += kernel_mo[r];
         }
+        if let Some(fm) = &fxc_mo_block {
+            // bra_trans fxc is already in MO amplitudes
+            for r in 0..dim {
+                result[[r, s]] += fm[[r, s]];
+            }
+        }
     }
+    add_ns(&T_CONT, t0);
     result
 }
 
@@ -318,6 +635,7 @@ pub fn a_matvec_ao_batched(
     z_block: &MatrixFull<f64>,
     xlet: char,
 ) -> MatrixFull<f64> {
+    let t_clos = Instant::now();
     let (start_mo, _, occ_size, vir_size, _homo, lumo) = tddft_occupation_parameters(scf);
     let dim = occ_size * vir_size;
     let m = z_block.size[1];
@@ -334,6 +652,8 @@ pub fn a_matvec_ao_batched(
             }
         }
     }
+    add_ns(&T_CLOS, t_clos);
+    N_AO_CLOS.fetch_add(1, Ordering::Relaxed);
     result
 }
 
@@ -386,20 +706,38 @@ fn ao_b_kernel_block(
     let mut result = MatrixFull::new([dim, m], 0.0);
 
     let device = DeviceBLAS::default();
+    let t0 = Instant::now();
     let mut p_block: Vec<MatrixFull<f64>> = Vec::with_capacity(m);
     for s in 0..m {
         let z: Vec<f64> = (0..dim).map(|r| z_block[[r, s]]).collect();
         p_block.push(transition_density(ao_data.c_occ.as_ref().unwrap(), ao_data.c_vir.as_ref().unwrap(), &z, nao, occ_size, vir_size));
     }
-    let f_fxc_block = fxc_matvec_ao_batched(ao_data, &p_block, &device);
+    add_ns(&T_TDEN, t0);
+
+    let t0 = Instant::now();
+    let f_fxc_block = if ao_data.fxc_bra_trans {
+        None
+    } else {
+        Some(fxc_matvec_ao_batched(ao_data, &p_block, &device))
+    };
+    let fxc_mo_block = if ao_data.fxc_bra_trans {
+        Some(fxc_bra_trans_matvec(scf, ao_data, z_block, &device))
+    } else {
+        None
+    };
+    add_ns(&T_FXC, t0);
 
     // Batched RI-J (J uses D; symmetric in μν after unfold so no transpose
     // needed) and exchange (B-block uses Pᵀ, so a transposed block is passed).
+    let t0 = Instant::now();
     let j_block = if coulomb_factor != 0.0 {
         Some(get_j_ao_batched(scf, &p_block))
     } else {
         None
     };
+    add_ns(&T_J, t0);
+
+    let t0 = Instant::now();
     let k_block = if alpha_hybrid.abs() > 1e-15 {
         // B-block: K[Pᵀ] with the transposed amplitude matrix zᵀ.
         let p_block_t: Vec<MatrixFull<f64>> =
@@ -416,7 +754,9 @@ fn ao_b_kernel_block(
     } else {
         None
     };
+    add_ns(&T_K, t0);
 
+    let t0 = Instant::now();
     for s in 0..m {
         let base = s * nao * nao;
         let mut f_total = MatrixFull::new([nao, nao], 0.0);
@@ -430,14 +770,22 @@ fn ao_b_kernel_block(
                 f_total.data[idx] -= alpha_hybrid * kb.data[base + idx];
             }
         }
-        for idx in 0..nao * nao {
-            f_total.data[idx] += f_fxc_block.data[base + idx];
+        if let Some(fb) = &f_fxc_block {
+            for idx in 0..nao * nao {
+                f_total.data[idx] += fb.data[base + idx];
+            }
         }
         let kernel_mo = contract_back(&f_total, ao_data.c_occ.as_ref().unwrap(), ao_data.c_vir.as_ref().unwrap(), occ_size, vir_size);
         for r in 0..dim {
             result[[r, s]] += kernel_mo[r];
         }
+        if let Some(fm) = &fxc_mo_block {
+            for r in 0..dim {
+                result[[r, s]] += fm[[r, s]];
+            }
+        }
     }
+    add_ns(&T_CONT, t0);
     result
 }
 
@@ -447,7 +795,11 @@ pub fn b_matvec_ao_batched(
     z_block: &MatrixFull<f64>,
     xlet: char,
 ) -> MatrixFull<f64> {
-    ao_b_kernel_block(scf, ao_data, z_block, xlet)
+    let t_clos = Instant::now();
+    let result = ao_b_kernel_block(scf, ao_data, z_block, xlet);
+    add_ns(&T_CLOS, t_clos);
+    N_AO_CLOS.fetch_add(1, Ordering::Relaxed);
+    result
 }
 
 /// Build the full B matrix `[dim, dim]` directly (dense small-system path),
@@ -850,6 +1202,11 @@ mod tests {
             fxc_eff: None,
             den_type: Some(den_type),
             grid_batch: false,
+            fxc_bra_trans: false,
+            psi_occ: None,
+            psi_vir: None,
+            psi_occ_grad: None,
+            psi_vir_grad: None,
             ri_ov: None,
             ri_oo_exch: None,
             ri_vv_exch: None,
@@ -923,5 +1280,59 @@ mod tests {
             assert!((result[i + a * occ] - s).abs() < 1e-10,
                 "K_B[{},{}] = {} vs {}", i, a, result[i + a * occ], s);
         }}
+    }
+
+    #[test]
+    fn test_exchange_coeff_route_matches_dm() {
+        // The "semitrans" driver folds the amplitudes first: CX = C_vir·Xᵀ (nao×occ),
+        // then K[CX·C_occᵀ] = K[Pᵀ] via ri_jk::get_vk_ri_incore_coeff_pair.
+        // Checks: (a) K[Pᵀ] from the coeff route == exact dm route on Pᵀ (B block);
+        //         (b) its transpose == exact dm route on P (A block, k = occ side).
+        let nao = 6; let naux = 4;
+        let rimatr = synthetic_rimatr(nao, naux);
+        let (data, _fxc) = build_ao_data(1);
+        let c_occ = data.c_occ.as_ref().unwrap();
+        let c_vir = data.c_vir.as_ref().unwrap();
+        let occ = c_occ.size[1];
+        let vir = c_vir.size[1];
+        let z: Vec<f64> = pseudo(occ * vir, 18.9);
+        let device = DeviceBLAS::default();
+        let (ri3fn, _, _) = rimatr.as_ref().unwrap();
+        let cderi = ri3fn.to_rstsr_view(&device);
+
+        let p = transition_density(c_occ, c_vir, &z, nao, occ, vir);
+        let p_t = p.clone().transpose_and_drop();
+        let dms = vec![p, p_t.clone()].as_slice().to_rstsr(&device);
+        let ks_exact = crate::ri_jk::pure_incore::get_vk_ri_incore_dm(cderi.view(), dms.view(), naux);
+
+        // fold: x_t [vir, occ, 1] = Xᵀ; CX = C_vir·Xᵀ [nao, occ, 1]
+        let mut x_t = vec![0.0_f64; vir * occ];
+        for a in 0..vir { for i in 0..occ {
+            x_t[a + i * vir] = z[i + a * occ];
+        }}
+        let x_tsr = rt::asarray((x_t, [vir, occ, 1].f(), &device));
+        let c_vir_v = c_vir.to_rstsr_view(&device);
+        let c_occ_v = c_occ.to_rstsr_view(&device);
+        let mut cx = rt::zeros(([nao, occ, 1].f(), &device));
+        cx.i_mut((.., .., 0)).matmul_from(&c_vir_v, &x_tsr.i((.., .., 0)), 1.0, 0.0);
+        let k_coeff = crate::ri_jk::pure_incore::get_vk_ri_incore_coeff_pair(
+            cderi, cx.view(), c_occ_v.view(), naux,
+        );
+
+        // (a) B block: coeff output == K[Pᵀ]
+        for (s, v) in ks_exact.i((.., .., 1)).iter().enumerate() {
+            let w = k_coeff.i((.., .., 0)).iter().nth(s).unwrap();
+            assert!((w - v).abs() < 1e-10,
+                "coeff K[Pᵀ][{}] = {} vs exact {}", s, w, v);
+        }
+        // (b) A block: transpose of coeff output == K[P]
+        let k_exact0 = ks_exact.i((.., .., 0));
+        let nao2 = nao * nao;
+        for r in 0..nao { for c in 0..nao {
+            assert!((k_coeff[[r, c, 0]] - k_exact0[[c, r]]).abs() < 1e-10,
+                "K[P][{},{}] via transpose = {} vs exact {}",
+                c, r, k_coeff[[r, c, 0]], k_exact0[[c, r]]);
+        }}
+        let _ = nao2;
     }
 }

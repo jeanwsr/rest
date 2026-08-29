@@ -6,7 +6,8 @@ pub struct TDDFTParameters {
     pub tddft_spin: String,         // "singlet" or "triplet"
     pub tddft_mode: String,         // "mo" (default; MO-basis RI tensors) or "ao" (AO transition-density kernel)
     pub grid_batch: bool,           // AO mode only: batch the fxc AO evaluation over grid batches (memory-bounded)
-    pub tddft_lowrank_k: bool,      // AO mode only: use SVD rank-reduced (low-rank) exchange K in ri_jk
+    pub tddft_ao_rik_driver: String, // AO mode only: exchange-K driver, "semitrans" (default; exact occ-side semi-transformation), "dm" (exact batched density-driven), or "lowrank" (per-vector SVD)
+    pub tddft_fxc_driver: String,   // AO mode only: fxc driver, "dm" (default; assembled-density NIMatmul path) or "bra_trans" (cached occ/vir grid projections, occ/vir-reduced contractions)
     pub tddft_svd_tol: f64,         // AO mode only: relative SVD threshold for low-rank K (σ_i ≥ tol·σ_max kept)
     pub nroots: usize,              // number of excitation energies to compute
     pub davidson_tol: f64,          // Davidson convergence: ||r|| < sqrt(tol), |de| < tol
@@ -58,7 +59,8 @@ impl Default for TDDFTParameters {
             tddft_spin: String::from("singlet"),
             tddft_mode: String::from("mo"),
             grid_batch: true,
-            tddft_lowrank_k: false,
+            tddft_ao_rik_driver: String::from("semitrans"),
+            tddft_fxc_driver: String::from("dm"),
             tddft_svd_tol: 1.0e-6,
             nroots: 6,
             davidson_tol: 1.0e-10,
@@ -118,9 +120,13 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
                 serde_json::Value::Bool(b) => *b,
                 _ => true,
             };
-            p.tddft_lowrank_k = match tmp_ctrl.get("tddft_lowrank_k").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Bool(b) => *b,
-                _ => false,
+            p.tddft_ao_rik_driver = match tmp_ctrl.get("tddft_ao_rik_driver").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase(),
+                _ => String::from("semitrans"),
+            };
+            p.tddft_fxc_driver = match tmp_ctrl.get("tddft_fxc_driver").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase(),
+                _ => String::from("dm"),
             };
             p.tddft_svd_tol = match tmp_ctrl.get("tddft_svd_tol").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-6),
