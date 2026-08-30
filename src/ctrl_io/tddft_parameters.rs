@@ -7,7 +7,7 @@ pub struct TDDFTParameters {
     pub tddft_mode: String,         // "mo" (default; MO-basis RI tensors) or "ao" (AO transition-density kernel)
     pub grid_batch: bool,           // AO mode only: batch the fxc AO evaluation over grid batches (memory-bounded)
     pub tddft_ao_rik_driver: String, // AO mode only: exchange-K driver, "semitrans" (default; exact occ-side semi-transformation), "dm" (exact batched density-driven), or "lowrank" (per-vector SVD)
-    pub tddft_fxc_driver: String,   // AO mode only: fxc driver, "dm" (default; assembled-density NIMatmul path) or "mo" (MO-style occ/vir grid projections, occ/vir-reduced contractions)
+    pub tddft_fxc_driver: String,   // AO mode only: fxc driver, "mo" (default; MO-style occ/vir grid projections, occ/vir-reduced contractions) or "dm" (assembled-density NIMatmul fallback)
     pub tddft_svd_tol: f64,         // AO mode only: relative SVD threshold for low-rank K (σ_i ≥ tol·σ_max kept)
     pub nroots: usize,              // number of excitation energies to compute
     pub davidson_tol: f64,          // Davidson convergence: ||r|| < sqrt(tol), |de| < tol
@@ -60,7 +60,7 @@ impl Default for TDDFTParameters {
             tddft_mode: String::from("mo"),
             grid_batch: true,
             tddft_ao_rik_driver: String::from("semitrans"),
-            tddft_fxc_driver: String::from("dm"),
+            tddft_fxc_driver: String::from("mo"),
             tddft_svd_tol: 1.0e-6,
             nroots: 6,
             davidson_tol: 1.0e-10,
@@ -126,7 +126,7 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
             };
             p.tddft_fxc_driver = match tmp_ctrl.get("tddft_fxc_driver").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.to_lowercase(),
-                _ => String::from("dm"),
+                _ => String::from("mo"),
             };
             p.tddft_svd_tol = match tmp_ctrl.get("tddft_svd_tol").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-6),

@@ -59,8 +59,8 @@ pub struct TDDFTData {
     pub den_type: Option<XCDenType>,
     /// Batch the fxc AO evaluation over grid batches (AO mode, memory-bounded).
     pub grid_batch: bool,
-    /// fxc driver: `false` = "dm" (assembled-density NIMatmul path, default),
-    /// `true` = "mo" (cached occ/vir grid projections below).
+    /// fxc driver: `true` = "mo" (default; cached occ-side grid projections
+    /// below, streamed vir side), `false` = "dm" (assembled-density fallback).
     pub fxc_mo: bool,
     /// Cached occ-MO projections on the grid (MO-style fxc driver):
     /// ψ_i(g) = Σ_μ C_μi φ_μ(g), layout [ngrids, nocc].

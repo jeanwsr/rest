@@ -561,6 +561,9 @@ fn fxc_mo_matvec(
                 let mut s_stack = vec![0.0_f64; m * occ_size * cg]; // reused build buffer
                 let mut e_stack = rt::zeros(([m * occ_size, vir_size].f(), device));
                 // alpha = 0: S[(s*nocc+i), g] = v1_0^s(g) * psi_occ[g,i]
+                // (measured: the (g,i) order below beats the tilted (i,g-block) order —
+                // the scattered po_c reads are L2-resident hits, cheaper than the
+                // reordered write pattern)
                 for s in 0..m {
                     let v = &v1_bufs[s][0];
                     let rbase = s * occ_size;
