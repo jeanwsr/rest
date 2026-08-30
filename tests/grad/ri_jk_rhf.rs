@@ -109,7 +109,7 @@ fn test_c12h26() {
 }
 
 fn test_with_scf(scf_data: &'_ SCF) -> RIRHFGradient<'_> {
-    let mut scf_grad = RIRHFGradient::new(scf_data);
+    let mut scf_grad = RIRHFGradient::new(scf_data, &None);
     scf_grad.calc();
 
     println!("=== de ===");

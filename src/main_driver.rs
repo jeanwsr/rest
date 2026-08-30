@@ -680,6 +680,29 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
             println!("Gradient evaluation using Analytical differentiation");
         }
 
+        // In MPI-parallel runs, `scf_data.rimatr` (decomposed ERI / cderi) is distributed
+        // along the auxiliary-basis dimension: each rank stores only its column block
+        // `[n_baspar, naux_local]` (the SCF J/K build reduces partial contractions over
+        // ranks). The analytical gradient routines require the complete `[n_baspar, naux]`
+        // matrix on every rank, so gather it in place before entering the gradient code.
+        // The same applies to `rimatr_sr` for range-separated hybrid (RSH) functionals.
+        // This is collective and must be executed by all ranks symmetrically.
+        let naux_total = scf_data.mol.num_auxbas;
+        if scf_data.rimatr.is_some() {
+            let (rimatr, basbas2baspar, baspar2basbas) = scf_data.rimatr.take().unwrap();
+            let full_rimatr =
+                crate::mpi_io::gather_full_rimatr(&rimatr, naux_total, mpi_operator)
+                    .unwrap_or(rimatr);
+            scf_data.rimatr = Some((full_rimatr, basbas2baspar, baspar2basbas));
+        }
+        if scf_data.rimatr_sr.is_some() {
+            let (rimatr_sr, basbas2baspar, baspar2basbas) = scf_data.rimatr_sr.take().unwrap();
+            let full_rimatr_sr =
+                crate::mpi_io::gather_full_rimatr(&rimatr_sr, naux_total, mpi_operator)
+                    .unwrap_or(rimatr_sr);
+            scf_data.rimatr_sr = Some((full_rimatr_sr, basbas2baspar, baspar2basbas));
+        }
+
         let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
 
         // Please note that this is only a temporary workaround implemented gradients.
@@ -694,7 +717,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         // 1. self-consistent gradient data
         let grad_data_scf: Box<dyn crate::grad::traits::GradAPI> = {
             if !scf_data.mol.ctrl.spin_polarization {
-                let mut grad_data_scf = crate::grad::rhf::RIRHFGradient::new(&scf_data);
+                let mut grad_data_scf = crate::grad::rhf::RIRHFGradient::new(&scf_data, mpi_operator);
 
                 if is_hf {
                     grad_data_scf.calc();
@@ -704,7 +727,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
 
                 Box::new(grad_data_scf)
             } else {
-                let mut grad_data_scf = crate::grad::uhf::RIUHFGradient::new(&scf_data);
+                let mut grad_data_scf = crate::grad::uhf::RIUHFGradient::new(&scf_data, mpi_operator);
 
                 if is_hf {
                     grad_data_scf.calc();
