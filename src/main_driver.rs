@@ -66,6 +66,25 @@ pub fn main_driver() -> anyhow::Result<()> {
     // VERY IMPORTANCE: introduce mpi_operator:
     let (mpi_operator , mut mpi_data)= MPIData::initialization();
 
+    // Under MPI, every rank executes the same code, so an ungated print would appear once
+    // per process in the merged output. The `print_level` gating in `Molecule::build`
+    // already suppresses rank-gated prints on non-root ranks, but many prints (and the
+    // `log` macros, whose stdout target is not print_level-gated) are unconditional.
+    // As a blanket fix, redirect the standard output of all non-root ranks to /dev/null;
+    // stderr is intentionally kept so that warnings and MPI runtime errors remain visible.
+    if let Some(mpi_op) = &mpi_operator {
+        if mpi_op.rank != 0 {
+            use std::os::unix::io::AsRawFd;
+            let devnull = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .expect("Failed to open /dev/null for redirecting the standard output of non-root MPI ranks");
+            unsafe {
+                libc::dup2(devnull.as_raw_fd(), libc::STDOUT_FILENO);
+            }
+        }
+    }
+
     let ctrl_file = utilities::parse_input().value_of("input_file").unwrap_or("ctrl.in").to_string();
     if ! PathBuf::from(ctrl_file.clone()).is_file() {
         panic!("Input file ({:}) does not exist", ctrl_file);
