@@ -94,6 +94,18 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     // `prepare_mo_data` (MO-basis RI tensors). Both return the same `TDDFTData`.
     // RefCell: shared mutable state needed by the batched Davidson closures,
     // each of which requires `&mut TDDFTData` (NIMatmul cache).
+    //
+    // Free the SCF-tabulated dense AO tables (grids.ao / grids.aop, ~1 GB at
+    // TZ-GGA) before preparing AO-mode data: the AO paths never read them, and
+    // no other consumer reads them afterwards (Hirshfeld decompresses on
+    // demand). Only dropped when the dense per-vector path (dim ≤ 15) is not
+    // used — that path still reads the tabulated AO values.
+    if is_ao && dim > 15 {
+        if let Some(g) = scf.grids.as_mut() {
+            g.ao = None;
+            g.aop = None;
+        }
+    }
     let data: std::cell::RefCell<TDDFTData> = std::cell::RefCell::new(
         if is_ao {
             println!("AO mode: using AO transition-density kernels (no MO-basis RI tensors)");

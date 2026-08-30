@@ -7,7 +7,7 @@ pub struct TDDFTParameters {
     pub tddft_mode: String,         // "mo" (default; MO-basis RI tensors) or "ao" (AO transition-density kernel)
     pub grid_batch: bool,           // AO mode only: batch the fxc AO evaluation over grid batches (memory-bounded)
     pub tddft_ao_rik_driver: String, // AO mode only: exchange-K driver, "semitrans" (default; exact occ-side semi-transformation), "dm" (exact batched density-driven), or "lowrank" (per-vector SVD)
-    pub tddft_fxc_driver: String,   // AO mode only: fxc driver, "dm" (default; assembled-density NIMatmul path) or "bra_trans" (cached occ/vir grid projections, occ/vir-reduced contractions)
+    pub tddft_fxc_driver: String,   // AO mode only: fxc driver, "dm" (default; assembled-density NIMatmul path) or "mo" (MO-style occ/vir grid projections, occ/vir-reduced contractions)
     pub tddft_svd_tol: f64,         // AO mode only: relative SVD threshold for low-rank K (σ_i ≥ tol·σ_max kept)
     pub nroots: usize,              // number of excitation energies to compute
     pub davidson_tol: f64,          // Davidson convergence: ||r|| < sqrt(tol), |de| < tol
