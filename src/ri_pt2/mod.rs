@@ -1796,6 +1796,21 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
         let mut e_mp2_ss = 0.0_f64;
         let mut e_mp2_os = 0.0_f64;
 
+        // Contribution of singly excited states, identical to the serial
+        // `restricted_open_shell_pt2_rayon`: -Σ_{i∈occ, a∈vir} F_{ai}^2 / (ε_a - ε_i).
+        // The semi-canonical quantities are identical on all ranks.
+        let mut e_mp2_single_list = [0.0_f64, 0.0_f64];
+        for i_spin in (0..2) {
+            let eigenvalues_spin = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin];
+            let fock_spin = &scf_data.semi_fock.as_ref().unwrap()[i_spin];
+            for i_occ in (0..scf_data.lumo[i_spin]) {
+                for i_virt in (scf_data.lumo[i_spin]..scf_data.mol.num_state) {
+                    let single_gap = eigenvalues_spin[i_virt] - eigenvalues_spin[i_occ];
+                    e_mp2_single_list[i_spin] += -fock_spin[(i_virt, i_occ)].powf(2.0) / single_gap;
+                }
+            }
+        }
+
         let my_rank = mpi_ix.rank;
         let size = mpi_ix.size;
         let ran_auxbas_loc = if let Some(loc_auxbas) = &mpi_ix.auxbas {
@@ -2050,7 +2065,7 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
         mpi_broadcast(&mpi_op.world, &mut e_mp2_ss, 0);
         let mut e_mp2_os = mpi_reduce(&mpi_op.world, &mut [e_mp2_os], 0, &SystemOperation::sum())[0];
         mpi_broadcast(&mpi_op.world, &mut e_mp2_os, 0);
-        Ok([e_mp2_ss+e_mp2_os,e_mp2_os,e_mp2_ss])
+        Ok([e_mp2_ss+e_mp2_os+e_mp2_single_list[0]+e_mp2_single_list[1], e_mp2_os, e_mp2_ss])
     } else {
         restricted_open_shell_pt2_rayon(scf_data)
     }

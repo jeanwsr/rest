@@ -1,5 +1,10 @@
 use std::iter::zip;
 use std::ops::{Range, Add, Sub, Mul, Div, AddAssign, SubAssign, MulAssign, DivAssign};
+
+/// MPI construction of the short-range (RSH) decomposed 3-center RI integrals (`rimatr_sr`).
+#[cfg(feature = "mpi")]
+pub mod rimatr_sr;
+
 #[cfg(feature = "mpi")]
 use mpi::collective::SystemOperation;
 #[cfg(feature = "mpi")]
@@ -456,6 +461,89 @@ where Q: Zero + Send + Sync + Copy + Buffer + Equivalence + Debug + 'static,
         }
         mpi_broadcast(world, &mut data.data, root_rank);
     }
+}
+
+/// All-gather a matrix whose column dimension is distributed across MPI ranks.
+///
+/// Each rank holds the contiguous column block `[n_row, loc_naux]` of the global
+/// `[n_row, naux_total]` matrix, where its local columns are the block assigned by
+/// [`average_distribution`]. Since `MatrixFull` is stored column-major, the raw data of
+/// each rank is exactly the contiguous global column block, so a variable-count
+/// all-gather of the local raw data (concatenated in rank order) reproduces the full
+/// global matrix on every rank.
+#[cfg(feature = "mpi")]
+pub fn mpi_allgather_matrixfull_columns(
+    world: &SimpleCommunicator,
+    local: &MatrixFull<f64>,
+    naux_total: usize,
+) -> MatrixFull<f64> {
+    let size = world.size() as usize;
+    let n_row = local.size[0];
+    let loc_naux = local.size[1];
+
+    // exchange the number of columns held by each rank
+    let mut loc_naux_vec = vec![0_usize; size];
+    world.all_gather_into(&loc_naux, &mut loc_naux_vec[..]);
+
+    // the distribution must be the contiguous ascending one from `average_distribution`,
+    // so that concatenating the rank-ordered column blocks reproduces the global column order
+    let expected = average_distribution(naux_total, size);
+    assert!(
+        loc_naux_vec.iter().zip(expected.iter()).all(|(n, r)| *n == r.len()),
+        "The column distribution of the matrix does not match average_distribution; \
+         cannot safely all-gather the full matrix."
+    );
+
+    // counts/displacements in units of f64 elements (one column holds n_row elements)
+    let counts: Vec<i32> = loc_naux_vec
+        .iter()
+        .map(|&n| {
+            i32::try_from(n * n_row)
+                .expect("The column block of the matrix exceeds the MPI count limit (i32).")
+        })
+        .collect();
+    let mut displs: Vec<i32> = Vec::with_capacity(size);
+    let mut acc: i32 = 0;
+    for &count in counts.iter() {
+        displs.push(acc);
+        acc += count;
+    }
+
+    let mut gathered = vec![0.0_f64; n_row * naux_total];
+    {
+        let mut partition = PartitionMut::new(&mut gathered[..], &counts[..], &displs[..]);
+        world.all_gather_varcount_into(&local.data[..], &mut partition);
+    }
+    MatrixFull::from_vec([n_row, naux_total], gathered).unwrap()
+}
+
+/// Reconstruct the complete auxiliary-basis dimension of `rimatr` (the decomposed 3c ERI,
+/// i.e. `cderi`) on every MPI rank, for consumers that require the full matrix.
+///
+/// In MPI-parallel SCF, `rimatr` is distributed along the auxiliary-basis (column)
+/// dimension: rank `r` stores only `[n_baspar, auxbas_distribution[r].len()]` (see
+/// [`MPIData::distribute_rimatr_tasks`] and
+/// `Molecule::prepare_rimatr_for_ri_v_mpi_rayon`); the SCF J/K build then reduces the
+/// partial contractions over ranks (`vj/vk_upper_with_rimatr_sync_mpi`). The analytical
+/// gradient, in contrast, needs the complete `[n_baspar, naux]` matrix on every rank.
+///
+/// - Returns `Some(full_matrix)` if the input was distributed and has been gathered.
+/// - Returns `None` if the input already contains all auxiliary functions (serial runs,
+///   or MPI runs where the distribution is inactive), leaving the input untouched.
+///
+/// This is a collective operation: all ranks must call it with consistent arguments.
+pub fn gather_full_rimatr(
+    local_rimatr: &MatrixFull<f64>,
+    naux_total: usize,
+    mpi_operator: &Option<MPIOperator>,
+) -> Option<MatrixFull<f64>> {
+    #[cfg(feature = "mpi")]
+    if let Some(mpi_op) = mpi_operator {
+        if local_rimatr.size[1] != naux_total {
+            return Some(mpi_allgather_matrixfull_columns(&mpi_op.world, local_rimatr, naux_total));
+        }
+    }
+    None
 }
 
 #[cfg(feature = "mpi")]

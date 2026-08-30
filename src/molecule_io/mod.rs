@@ -2927,8 +2927,15 @@ impl Molecule {
         #[cfg(feature = "mpi")]
         if let (Some(mpi_op), Some(loc_mpi_data)) = (&mpi_operator, &self.mpi_data) {
 
-            if omega.is_some() {
-                unimplemented!("The range-separated RI with MPI parallelization is not implemented yet.")
+            if let Some(omega_libcint) = omega {
+                // range-separated (RSH) case: delegated to the dedicated MPI module,
+                // implemented with rest_tensors (see `mpi_io::rimatr_sr` for details)
+                return crate::mpi_io::rimatr_sr::prepare_rimatr_sr_distributed(
+                    self,
+                    omega_libcint,
+                    mpi_op,
+                    loc_mpi_data,
+                );
             }
 
             let my_rank = mpi_op.rank;

@@ -2067,7 +2067,15 @@ impl SCF {
                     _ => {
                         if self.rimatr_sr.is_some() {
                             let dm = &self.density_matrix;
-                            vk_upper_with_rimatr_use_dm_only_sync(&self.rimatr_sr, dm, spin_channel, scaling_ksr)
+                            // rimatr_sr is aux-column-distributed under MPI: use the
+                            // MPI-aware kernel (per-rank partial contraction + reduce)
+                            vk_upper_with_rimatr_use_dm_only_sync_mpi(
+                                &self.rimatr_sr,
+                                dm,
+                                spin_channel,
+                                scaling_ksr,
+                                mpi_operator,
+                            )
                         } else if self.ri3fn_sr.is_some() {
                             let dm = &self.density_matrix;
                             vk_upper_with_ri_v_use_dm_only_sync(&self.ri3fn_sr, dm, spin_channel, scaling_ksr)
@@ -3074,20 +3082,21 @@ impl SCF {
             let (mut total_elec, exc, mut vxc) = self.generate_vxc_rayon_dm_only(scaling_factor);
 
             let mut tot_exc = mpi_reduce(world, &[exc], 0, &SystemOperation::sum())[0];
-            //mpi_broadcast(&world, &mut tot_exc, 0);
+            mpi_broadcast(&world, &mut tot_exc, 0);
 
             let mut tot_elec = mpi_reduce(world, &total_elec, 0, &SystemOperation::sum());
             total_elec.iter_mut().zip(tot_elec.iter()).for_each(|(to, from)| *to = *from);
-            //mpi_broadcast(&world, &mut total_elec, 0);
+            mpi_broadcast(&world, &mut total_elec, 0);
 
             //let mut tot_xc: Vec<MatrixUpper<f64>> = vec![MatrixUpper::empty(), MatrixUpper::empty()];
             for i_spin in 0..self.mol.spin_channel {
                 let mut result= mpi_reduce(world, vxc[i_spin].data_ref().unwrap(), 0, &SystemOperation::sum());
+                mpi_broadcast_vector(&world, &mut result, 0);
+
                 let mut xc_spin = vxc.get_mut(i_spin).unwrap();
-                //mpi_broadcast_vector(&world, &mut result, 0);
                 //if mpi_world.rank==0 {
                     xc_spin.data = result;
-                //}
+                //} 
             } 
 
             (total_elec, tot_exc, vxc)
@@ -3130,12 +3139,13 @@ impl SCF {
             //let mut tot_xc: Vec<MatrixUpper<f64>> = vec![MatrixUpper::empty(), MatrixUpper::empty()];
             for i_spin in 0..self.mol.spin_channel {
                 let mut result= mpi_reduce(world, vxc[i_spin].data_ref().unwrap(), 0, &SystemOperation::sum());
+                // the vxc matrix must be identical on all ranks: reduce to root,
+                // then broadcast back (otherwise non-root ranks keep only their
+                // local-grid partial vxc and the Fock/semi-canonical quantities diverge)
+                mpi_broadcast_vector(&world, &mut result, 0);
 
                 let mut xc_spin = vxc.get_mut(i_spin).unwrap();
-                //mpi_broadcast_vector(&world, &mut result, 0);
-                if mpi_world.rank==0 {
-                    xc_spin.data = result;
-                } 
+                xc_spin.data = result;
             } 
 
             (total_elec, tot_exc, vxc)
