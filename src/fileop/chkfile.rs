@@ -46,6 +46,14 @@ pub fn write_string_scalar(file: &hdf5::File, dataset_name: &str, value: &str) {
 }
 
 pub fn save_chkfile(scf_data: &SCF) {
+    // Under MPI, only the root rank writes the checkpoint file; otherwise every
+    // process would open the same path concurrently (racing writes and duplicate
+    // "write chkfile" prints).
+    if let Some(mpi_data) = &scf_data.mol.mpi_data {
+        if mpi_data.rank != 0 {
+            return;
+        }
+    }
     let chkfile= &scf_data.mol.ctrl.chkfile;
     let path = Path::new(chkfile);
     //if path.exists() {std::fs::remove_file(chkfile).unwrap()};
