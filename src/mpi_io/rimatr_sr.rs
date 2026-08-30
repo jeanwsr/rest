@@ -27,12 +27,9 @@
 use std::sync::mpsc::channel;
 
 use rayon::prelude::*;
-use tensors::matrix_blas_lapack::{
-    _dgemm_full, _power_rayon_for_symmetric_matrix, omp_set_num_threads_wrapper,
-};
+use tensors::matrix_blas_lapack::{_dgemm_full, _dtrtrs, omp_set_num_threads_wrapper};
 use tensors::{BasicMatrix, MatrixFull};
 
-use crate::constants::AUXBAS_THRESHOLD;
 use crate::molecule_io::Molecule;
 
 use super::{mpi_isend_irecv_wrt_distribution_v03, MPIData, MPIOperator};
@@ -50,11 +47,20 @@ pub fn prepare_rimatr_sr_distributed(
     mpi_operator: &MPIOperator,
     mpi_data: &MPIData,
 ) -> (MatrixFull<f64>, MatrixFull<usize>, Vec<[usize; 2]>) {
-    // SR 2c-2e Coulomb metric (P|erfc(ωr12)/r12|Q), followed by its -1/2 power.
+    // SR 2c-2e Coulomb metric (P|erfc(ωr12)/r12|Q), followed by the factor built
+    // according to the `j2c_decomp` policy (eigen `J^{-1/2}` or the upper Cholesky
+    // factor U), so that the distributed SR rimatr is mathematically identical to the
+    // serial one. The SR integral (O(naux^2)) and the factorization (O(naux^3)) are
+    // computed only on rank 0 and broadcast, mirroring `diagonalize_hamiltonian_outside`.
     // Note `Molecule::int_ij_aux_columb_with_omega` expects the (positive) functional
     // omega, i.e. the negation of the libcint convention used here.
-    let aux_v = mol.int_ij_aux_columb_with_omega(-omega_libcint);
-    let aux_v = _power_rayon_for_symmetric_matrix(&aux_v, -0.5, AUXBAS_THRESHOLD).unwrap();
+    let n_auxbas = mol.num_auxbas;
+    let mut aux_v = MatrixFull::new([n_auxbas, n_auxbas], 0.0);
+    if mpi_operator.rank == 0 {
+        let j2c_sr = mol.int_ij_aux_columb_with_omega(-omega_libcint);
+        aux_v = super::prepare_j2c_solve_factor(&j2c_sr, &mol.ctrl.j2c_decomp);
+    }
+    super::mpi_broadcast_matrixfull(&mpi_operator.world, &mut aux_v, 0);
 
     let (basbas2baspar, baspar2basbas) = mol.prepare_baspair_map();
 
@@ -206,7 +212,23 @@ fn rimatr_sr_slot(
     // solve against the SR J^(-1/2): ri3fn[basis pair, aux] = Σ_P tmp[P, pair] * aux_v[P, aux]
     let mut ri3fn = MatrixFull::new([loc_n_baspar, n_auxbas], 0.0);
     omp_set_num_threads_wrapper(mol.ctrl.num_threads.unwrap());
-    _dgemm_full(&tmp_ri3fn, 'T', aux_v, 'N', &mut ri3fn, 1.0, 0.0);
+    // Solve against the metric factor following the `j2c_decomp` policy:
+    // - Cd:   cderi = j3c · L^{-T}  ⟺  U^T · X = tmp_ri3fn  (in-place triangular
+    //         solve with the upper Cholesky factor U, then ri3fn = X^T)
+    // - Eig:  cderi = j3c · J^{-1/2} via the dense matrix multiplication
+    let mut tmp_ri3fn = tmp_ri3fn;
+    match mol.ctrl.j2c_decomp.policy {
+        crate::ri_jk::J2CDecompPolicy::Cd => {
+            assert!(
+                _dtrtrs(aux_v, &mut tmp_ri3fn, 'U', 'T', 'N'),
+                "The triangular solve against the Cholesky factor of the SR 2c-2e metric failed."
+            );
+            ri3fn = tmp_ri3fn.transpose();
+        },
+        _ => {
+            _dgemm_full(&tmp_ri3fn, 'T', aux_v, 'N', &mut ri3fn, 1.0, 0.0);
+        },
+    }
 
     ri3fn
 }

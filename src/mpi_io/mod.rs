@@ -18,6 +18,7 @@ use mpi::datatype::{Partitioned, PartitionMut};
 #[cfg(feature = "mpi")]
 use mpi::traits::*;
 use num_traits::{One, Zero};
+use tensors::matrix_blas_lapack::{_dgemm_full, _dsyevd, _power_rayon_for_symmetric_matrix};
 use tensors::{BasicMatrix, MatrixFull};
 use std::fmt::Debug;
 
@@ -544,6 +545,76 @@ pub fn gather_full_rimatr(
         }
     }
     None
+}
+
+/// Build the factor of the 2c-2e Coulomb metric used by the MPI-parallel rimatr
+/// construction, following the `j2c_decomp` policy so that the result reproduces the
+/// serial one (`ri_jk::generate_rimatr_bare` + `ri_jk::get_solved_j3c`):
+///
+/// - `Eig`: returns the dense `J^{-1/2}` (eigen-based matrix power); the serial
+///   counterpart computes `cderi = j3c · J^{-1/2}` with a matrix multiplication.
+/// - `Cd`:   returns the upper Cholesky factor `U` (`J = U^T U`, `L = U^T`); the serial
+///   counterpart computes `cderi = j3c · L^{-T}`, which the solver reproduces with the
+///   triangular solve `U^T · X = B` (`_dtrtrs`) instead of an explicit inverse.
+///   When the Cholesky factor has diagonal elements not larger than the threshold (or
+///   the factorization is not positive-definite), the same eigen-corrected fallback as
+///   `ri_jk::decomp_j2c_cd` is applied.
+pub fn prepare_j2c_solve_factor(
+    j2c: &MatrixFull<f64>,
+    option: &crate::ri_jk::J2CDecompOption,
+) -> MatrixFull<f64> {
+    use crate::ri_jk::{J2CDecompPolicy, J2C_THRESH};
+
+    let threshold = option.threshold.unwrap_or(J2C_THRESH);
+    match option.policy {
+        J2CDecompPolicy::Eig => {
+            _power_rayon_for_symmetric_matrix(j2c, -0.5, threshold).unwrap()
+        },
+        J2CDecompPolicy::Cd => {
+            let n = j2c.size[0];
+            debug_assert_eq!(j2c.size[1], n);
+            // direct Cholesky attempt on a clone (the helpers panic on failure, so
+            // guard with the eigen decomposition check below when needed)
+            let mut j2c_u = j2c.clone();
+            j2c_u.to_matrixfullslicemut().lapack_dpotrf(b'U');
+            // dpotrf only touches the upper triangle; zero out the lower part so
+            // that the factor can be used as a full matrix in the subsequent solve
+            for j in 0..n {
+                for i in j + 1..n {
+                    j2c_u.data[i + j * n] = 0.0;
+                }
+            }
+            let diag_ok = j2c_u
+                .iter_diagonal()
+                .unwrap()
+                .fold(true, |acc, &d| acc && d > threshold);
+            if diag_ok {
+                // return the upper Cholesky factor U (J = U^T U); the solve step
+                // (`U^T · X = B` via dtrtrs) replaces the explicit `U^{-1}` + dgemm
+                return j2c_u;
+            }
+            // eigen-corrected fallback (mirrors `decomp_j2c_cd`): make the matrix
+            // sufficiently positive-definite with the threshold, then Cholesky again
+            let (eigvec, eigval, _) = _dsyevd(j2c, 'V');
+            let eigvec = eigvec.expect("Failed to diagonalize the 2c-2e Coulomb matrix for the Cholesky fallback");
+            // j2c_corr = V · diag(max(e, threshold)) · V^T
+            let mut e_corr = MatrixFull::new([n, n], 0.0_f64);
+            eigval.iter().enumerate().for_each(|(i, &e)| {
+                *&mut e_corr.data[i * n + i] = e.max(threshold);
+            });
+            let mut j2c_corr = MatrixFull::new([n, n], 0.0_f64);
+            _dgemm_full(&eigvec, 'N', &e_corr, 'N', &mut j2c_corr, 1.0, 0.0);
+            let mut tmp = MatrixFull::new([n, n], 0.0_f64);
+            _dgemm_full(&j2c_corr, 'N', &eigvec, 'T', &mut tmp, 1.0, 0.0);
+            tmp.to_matrixfullslicemut().lapack_dpotrf(b'U');
+            for j in 0..n {
+                for i in j + 1..n {
+                    tmp.data[i + j * n] = 0.0;
+                }
+            }
+            tmp
+        },
+    }
 }
 
 #[cfg(feature = "mpi")]
