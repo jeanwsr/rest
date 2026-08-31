@@ -42,8 +42,8 @@ pub fn get_vj_ri_incore(cderi: TsrView<f64>, dms: TsrView<f64>) -> Tsr<f64> {
     // shape check
     assert_eq!(cderi.shape()[0], nao_tp, "Cholesky ERI must have shape (nao_tp, naux)");
 
-    // pack density matrix with upper-triangular, diagonal doubled
-    // -- (eq.1) -- //
+    // pack density matrix into the triangle (off-diagonals doubled via 2D, diagonal kept)
+    // -- pack -- //
     let mut dms_tp: Tsr<f64> = rt::zeros(([nao_tp, nset].f(), dms.device()));
     for iset in 0..nset {
         let dm = dms.i((.., .., iset));
@@ -54,14 +54,15 @@ pub fn get_vj_ri_incore(cderi: TsrView<f64>, dms: TsrView<f64>) -> Tsr<f64> {
         dms_tp.i_mut((.., iset)).assign(dm_tp);
     }
 
-    // generate j contribution
-    // -- (eq.2) -- //
+    // first contraction: scr_P = sum_tp dms_tp[tp] * cderi[tp, P]
+    // -- contract-dm -- //
     let scr_j = cderi.t() % &dms_tp;
-    // -- (eq.3) -- //
+    // second contraction: J_tp = sum_P scr_P * cderi[tp, P]
+    // -- build-j -- //
     let js_tp = &cderi % &scr_j;
 
-    // returns symmetrized part
-    // -- (eq.4) -- //
+    // unpack the packed triangle to the full symmetric J
+    // -- unpack -- //
     js_tp.unpack_tri(Upper, FlagSymm::Sy)
 }
 
@@ -96,9 +97,10 @@ pub fn get_vj_ri_incore_nonsym(cderi: TsrView<f64>, dms: TsrView<f64>) -> Tsr<f6
     // shape check
     assert_eq!(cderi.shape()[0], nao_tp, "Cholesky ERI must have shape (nao_tp, naux)");
 
-    // pack (P + Pᵀ) with the diagonal restored to P_ii. For a non-symmetric P
-    // this folds off-diagonal pairs as (P_ij + P_ji), matching Σ_λσ P_λσ B_λσ.
-    // -- (eq.1) -- //
+    // fold the non-symmetric density: pack (P + Pᵀ) with the diagonal restored
+    // to P_ii, so off-diagonal pairs contribute (P_ij + P_ji) — exactly
+    // sum_lsigma P_lsigma B_lsigma for the lambda<->sigma-symmetric Coulomb kernel.
+    // -- fold-and-pack -- //
     let mut dms_tp: Tsr<f64> = rt::zeros(([nao_tp, nset].f(), dms.device()));
     for iset in 0..nset {
         let dm = dms.i((.., .., iset));
@@ -109,14 +111,15 @@ pub fn get_vj_ri_incore_nonsym(cderi: TsrView<f64>, dms: TsrView<f64>) -> Tsr<f6
         dms_tp.i_mut((.., iset)).assign(dm_tp);
     }
 
-    // generate j contribution
-    // -- (eq.2) -- //
+    // first contraction: scr_P = sum_tp dms_tp[tp] * cderi[tp, P]
+    // -- contract-dm -- //
     let scr_j = cderi.t() % &dms_tp;
-    // -- (eq.3) -- //
+    // second contraction: J_tp = sum_P scr_P * cderi[tp, P]
+    // -- build-j -- //
     let js_tp = &cderi % &scr_j;
 
-    // returns symmetrized part
-    // -- (eq.4) -- //
+    // unpack the packed triangle to the full symmetric J
+    // -- unpack -- //
     js_tp.unpack_tri(Upper, FlagSymm::Sy)
 }
 
@@ -186,8 +189,8 @@ pub fn get_vk_ri_incore_coeff(
         warn!("in generate_vk_ri_incore_coeff_with_rstsr, negative occupation found: {occ_neg} elements < 0");
     }
 
-    // compress mo_coeff with occupation
-    // -- (eq.1) -- //
+    // compress mo_coeff with occupation: keep occupied columns, scale by sqrt(n_i)
+    // -- occ-scaled-coeff -- //
     let mut occ_coeff_list = vec![];
     for iset in 0..nset {
         // generate occ_coeff by sqrt(occupation) * coefficient
@@ -212,15 +215,16 @@ pub fn get_vk_ri_incore_coeff(
             let nocc = occ_coeff.shape()[1];
             let cderi_half = unsafe { rt::empty(([nao, nocc, nbatch].f(), &device)) };
             (0..nbatch).into_par_iter().for_each(|p| {
-                // -- (eq.2) -- //
+                // unpack one packed cderi column to the full (nao, nao) M_P
                 let cderi_iaux = cderi.i((.., iaux + p)).unpack_tri(Upper, FlagSymm::Sy);
                 let cderi_half_iaux = cderi_half.i((.., .., p));
                 let mut cderi_half_iaux = unsafe { cderi_half_iaux.force_mut() };
-                // -- (eq.3) -- //
+                // left half-transform: (mu i, P) = sum_nu M_P[mu, nu] * C[nu, i]
+                // -- half-transform -- //
                 cderi_half_iaux.matmul_from(&cderi_iaux, occ_coeff, 1.0, 0.0);
             });
-            // build vk contribution
-            // -- (eq.4) -- //
+            // accumulate K_s += (M_P C) * (M_P C)^T over this batch
+            // -- accumulate-k -- //
             let cderi_half = cderi_half.into_shape([nao, nocc * nbatch]);
             ks.i_mut((.., .., iset)).matmul_from(&cderi_half, &cderi_half.t(), 1.0, 1.0);
         }
@@ -286,8 +290,8 @@ pub fn get_vk_ri_incore_dm(cderi: TsrView<f64>, dms: TsrView<f64>, batch_size: u
         // cderi_iaux: (nao, nao, nbatch)
         let nbatch = if iaux + batch_size <= naux { batch_size } else { naux - iaux };
 
-        // unpack cderi for this batch
-        // -- (eq.1) -- //
+        // unpack one batch of packed cderi columns to full (nao, nao) M_P
+        // -- unpack-batch -- //
         let cderi_batch: Tsr<f64> = unsafe { rt::empty(([nao, nao, nbatch].f(), &device)) };
         (0..nbatch).into_par_iter().for_each(|p| {
             let cderi_iaux = cderi.i((.., iaux + p)).unpack_tri(Upper, FlagSymm::Sy);
@@ -297,8 +301,8 @@ pub fn get_vk_ri_incore_dm(cderi: TsrView<f64>, dms: TsrView<f64>, batch_size: u
         });
 
         for iset in 0..nset {
-            // half-transformed integrals: (nao, nao, nbatch)
-            // -- (eq.2) -- //
+            // half-transformed integrals: (M_P dm)[mu, nu] for this batch
+            // -- half-transform -- //
             let dm = dms.i((.., .., iset));
             let cderi_half = unsafe { rt::empty(([nao, nao, nbatch].f(), &device)) };
             (0..nbatch).into_par_iter().for_each(|p| {
@@ -307,8 +311,8 @@ pub fn get_vk_ri_incore_dm(cderi: TsrView<f64>, dms: TsrView<f64>, batch_size: u
                 let mut cderi_half_iaux = unsafe { cderi_half_iaux.force_mut() };
                 cderi_half_iaux.matmul_from(&cderi_iaux, &dm, 1.0, 0.0);
             });
-            // build vk contribution
-            // -- (eq.3) -- //
+            // accumulate K_s += (M_P dm) * M_P^T over this batch
+            // -- accumulate-k -- //
             let cderi_half = cderi_half.into_shape([nao, nao * nbatch]);
             let cderi_batch = cderi_batch.reshape([nao, nao * nbatch]);
             ks.i_mut((.., .., iset)).matmul_from(&cderi_half, &cderi_batch.t(), 1.0, 1.0);
@@ -402,8 +406,8 @@ pub fn get_vk_ri_incore_coeff_pair(
             dst.assign(&cderi_iaux);
         });
 
-        // right half-transform, once per batch: yl (nao, k, nbatch)
-        // -- (eq.1) -- //
+        // right half-transform, once per batch: yl = M_P * c_right (amortized over sets)
+        // -- right-half-transform -- //
         let yl = unsafe { rt::empty(([nao, k, nbatch].f(), &device)) };
         (0..nbatch).into_par_iter().for_each(|p| {
             let m_p = cderi_batch.i((.., .., p));
@@ -415,7 +419,8 @@ pub fn get_vk_ri_incore_coeff_pair(
 
         // left half-transform per set, then accumulate the outer product
         for iset in 0..nset {
-            // -- (eq.2) -- //
+            // left half-transform: yx = M_P * c_left[iset]
+            // -- left-half-transform -- //
             let yx = unsafe { rt::empty(([nao, k, nbatch].f(), &device)) };
             (0..nbatch).into_par_iter().for_each(|p| {
                 let m_p = cderi_batch.i((.., .., p));
@@ -423,8 +428,8 @@ pub fn get_vk_ri_incore_coeff_pair(
                 let mut yx_p = unsafe { yx_p.force_mut() };
                 yx_p.matmul_from(&m_p, &c_left.i((.., .., iset)), 1.0, 0.0);
             });
-            // build vk contribution
-            // -- (eq.3) -- //
+            // accumulate K_s += yx * yl^T over this batch
+            // -- accumulate-k -- //
             let yx = yx.into_shape([nao, k * nbatch]);
             ks.i_mut((.., .., iset)).matmul_from(&yx, &yl.t(), 1.0, 1.0);
         }

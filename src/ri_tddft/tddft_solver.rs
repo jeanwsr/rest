@@ -168,9 +168,12 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     };
 
     // fxc kernel table (mode-agnostic view for diagnostics).
-    // Scoped to the diagnostic block below so the immutable RefCell guard is
-    // dropped before the solver dispatch (which borrows `data` mutably).
-    {
+    // Gated behind print_level > 1: the A-matrix probe costs min(6, dim) extra
+    // single-column matvec applications (no set amortization), and both
+    // diagnostics are only watched in verbose runs. The scope also ensures the
+    // immutable RefCell guard is dropped before the solver dispatch (which
+    // borrows `data` mutably).
+    if scf.mol.ctrl.print_level > 1 {
     // fxc tensor symmetry check for GGA (uses the MO-mode kernel table `wfxc`,
     // which carries the `[g,α,β]` weighted layout; AO mode stores the raw
     // kernel in `fxc_eff`/NIMatmul instead, so the check is MO-only).
