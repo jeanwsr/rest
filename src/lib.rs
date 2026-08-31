@@ -39,12 +39,12 @@
 //! 
 //! 
 //! ### Presentation
-//! ![image](/home/igor/Documents/Package-Pool/rest_workspace/rest/figures/REST电子结构程序1.png) 
-//! ![image](/home/igor/Documents/Package-Pool/rest_workspace/rest/figures/REST电子结构程序2.png) 
-//! ![image](/home/igor/Documents/Package-Pool/rest_workspace/rest/figures/REST电子结构程序3.png) 
-//! ![image](/home/igor/Documents/Package-Pool/rest_workspace/rest/figures/REST电子结构程序4.png) 
-//! ![image](/home/igor/Documents/Package-Pool/rest_workspace/rest/figures/REST电子结构程序5-2.png) 
-//! ![image](/home/igor/Documents/Package-Pool/rest_workspace/rest/figures/REST电子结构程序6-2.png) 
+//! ![image](figures/REST电子结构程序1.png) 
+//! ![image](figures/REST电子结构程序2.png) 
+//! ![image](figures/REST电子结构程序3.png) 
+//! ![image](figures/REST电子结构程序4.png) 
+//! ![image](figures/REST电子结构程序5-2.png) 
+//! ![image](figures/REST电子结构程序6-2.png) 
 //! 
 #![allow(unused)]
 #![allow(non_snake_case)]

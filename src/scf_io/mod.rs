@@ -4819,6 +4819,23 @@ pub fn diagonalize_hamiltonian_outside(scf_data: &SCF, mpi_operator: &Option<MPI
 
 #[cfg(feature = "scalapack")]
 pub fn diagonalize_hamiltonian_distributed_check(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> bool {
+    // The `[ctrl] hamiltonian_distributed` keyword forces the decision:
+    //   "on"  -> always use the distributed (ScaLAPACK) solver,
+    //   "off" -> never use it,
+    //   "auto" (default) -> decide by problem size below.
+    match scf_data.mol.ctrl.hamiltonian_distributed {
+        crate::ctrl_io::HamiltonianDistributedMode::Off => return false,
+        crate::ctrl_io::HamiltonianDistributedMode::On => {
+            if let Some(mpi_io) = mpi_operator {
+                assert!(mpi_io.size >= 2);
+                // ScaLAPACK needs a block size strictly smaller than the global
+                // dimension; a 1x1 problem has no distributed representation.
+                return scf_data.hamiltonian[0].size()[0] >= 2;
+            }
+            return false;
+        }
+        crate::ctrl_io::HamiltonianDistributedMode::Auto => {}
+    }
     if let Some(mpi_io) = mpi_operator {
         let size = mpi_io.size;
         assert!(size >= 2);
@@ -4856,20 +4873,34 @@ pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option
         match scf_data.scftype {
             SCFType::RHF | SCFType::UHF => {
                 for i_spin in (0..spin_channel) {
-                    let (eigenvector_spin, eigenvalue_spin)=
-                        _hamiltonian_distributed_solver(&scf_data.hamiltonian[i_spin], &scf_data.ovlp, &mut num_state, grid, world).unwrap();
-                        //self.hamiltonian[i_spin].to_matrixupperslicemut()
-                        //.lapack_dspgvx(self.ovlp.to_matrixupperslicemut(),num_state).unwrap();
-                    eigenvectors[i_spin] = eigenvector_spin;
-                    eigenvalues[i_spin] = eigenvalue_spin;
+                    match _hamiltonian_distributed_solver(&scf_data.hamiltonian[i_spin], &scf_data.ovlp, &mut num_state, grid, world) {
+                        Some((eigenvector_spin, eigenvalue_spin)) => {
+                            eigenvectors[i_spin] = eigenvector_spin;
+                            eigenvalues[i_spin] = eigenvalue_spin;
+                        }
+                        None => {
+                            // distributed solve failed (e.g. non-convergence for small
+                            // / ill-conditioned systems); fall back to the serial solver.
+                            println!("WARNING: distributed (ScaLAPACK) Hamiltonian solver failed; falling back to the serial solver.");
+                            (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
+                            return (eigenvectors, eigenvalues, num_state);
+                        }
+                    }
                 }
             },
             SCFType::ROHF => {
                 // diagonalize Roothaan Fock matrix
-                let (eigenvector, eigenvalue)=
-                    _hamiltonian_distributed_solver(scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp, &mut num_state, grid, world).unwrap();
-                eigenvectors[0] = eigenvector;
-                eigenvalues[0] = eigenvalue;
+                match _hamiltonian_distributed_solver(scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp, &mut num_state, grid, world) {
+                    Some((eigenvector, eigenvalue)) => {
+                        eigenvectors[0] = eigenvector;
+                        eigenvalues[0] = eigenvalue;
+                    }
+                    None => {
+                        println!("WARNING: distributed (ScaLAPACK) Hamiltonian solver failed; falling back to the serial solver.");
+                        (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
+                        return (eigenvectors, eigenvalues, num_state);
+                    }
+                }
             }
         };
         (eigenvectors, eigenvalues, num_state)

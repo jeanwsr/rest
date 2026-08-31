@@ -2941,18 +2941,17 @@ impl Molecule {
             let my_rank = mpi_op.rank;
 
             if my_rank == 0 {println!("debug: enter the generation of inv_aux_matr")};
-            // Build the J factor following the `j2c_decomp` policy, so that the
+            // Build the full 2c-2e metric J following the `j2c_decomp` policy, so that the
             // distributed rimatr is mathematically identical to the serial one
             // (`generate_rimatr_bare`); a fixed eigen power here would mismatch the
             // Cholesky branch of the analytical gradient when `policy = "cholesky"`.
-            // The factorization (O(naux^3) and the full J integral) is computed only
-            // on rank 0 and broadcast, mirroring `diagonalize_hamiltonian_outside`.
-            let mut aux_v = MatrixFull::new([n_auxbas, n_auxbas], 0.0);
+            // The integral (O(naux^2)) is computed only on rank 0 and broadcast,
+            // mirroring `diagonalize_hamiltonian_outside`.
+            let mut j2c_full = MatrixFull::new([n_auxbas, n_auxbas], 0.0);
             if my_rank == 0 {
-                let j2c = self.int_ij_aux_columb();
-                aux_v = crate::mpi_io::prepare_j2c_solve_factor(&j2c, &self.ctrl.j2c_decomp);
+                j2c_full = self.int_ij_aux_columb();
             }
-            crate::mpi_io::mpi_broadcast_matrixfull(&mpi_op.world, &mut aux_v, 0);
+            crate::mpi_io::mpi_broadcast_matrixfull(&mpi_op.world, &mut j2c_full, 0);
             if my_rank == 0 {println!("debug: leave the generation of inv_aux_matr")};
             let (basbas2baspar, baspar2basbas) = self.prepare_baspair_map();
             if let (Some(auxbas_distribution), Some(baspar_distribution)) = 
@@ -2960,9 +2959,62 @@ impl Molecule {
 
                 let mut ri3fn = MatrixFull::new([n_baspar, auxbas_distribution[my_rank].len()], 0.0);
 
+                // metric factor for the non-distributed path, and the distributed
+                // (ScaLAPACK) Cholesky context when the sandbox mode selects it
+                let mut aux_v = MatrixFull::new([n_auxbas, n_auxbas], 0.0);
+                #[cfg(all(feature = "mpi", feature = "scalapack"))]
+                let dist_ctx: Option<(
+                    tensors::matrix::distributedmatrixfull::DistributedMatrixFull<f64>,
+                    i32,
+                    Vec<std::ops::Range<usize>>,
+                )> = {
+                    if crate::mpi_io::j2c_distributed::use_distributed_j2c(
+                        &self.ctrl.j2c_decomp,
+                        n_auxbas,
+                        mpi_op.size,
+                    ) {
+                        let grid = &mpi_op.cblacsgrid;
+                        let u_dist = crate::mpi_io::j2c_distributed::distributed_cholesky(grid, &j2c_full);
+                        let nb = u_dist.desc[5];
+                        let col_ranges: Vec<std::ops::Range<usize>> = baspar_distribution
+                            .iter()
+                            .map(|(r, _, _)| r.clone())
+                            .collect();
+                        Some((u_dist, nb, col_ranges))
+                    } else {
+                        aux_v = crate::mpi_io::prepare_j2c_solve_factor(&j2c_full, &self.ctrl.j2c_decomp);
+                        None
+                    }
+                };
+                #[cfg(not(all(feature = "mpi", feature = "scalapack")))]
+                let dist_ctx: Option<()> = {
+                    aux_v = crate::mpi_io::prepare_j2c_solve_factor(&j2c_full, &self.ctrl.j2c_decomp);
+                    None
+                };
+
                 let (baspar, sbsh, ebsh) = &baspar_distribution[my_rank];
                 let loc_ri3fn = if baspar.len() > 0 {
-                    self.prepare_rimatr_for_ri_v_mpi_slot(&aux_v, *sbsh, *ebsh)
+                    let tmp = self.prepare_rimatr_for_ri_v_mpi_slot(*sbsh, *ebsh);
+                    #[cfg(all(feature = "mpi", feature = "scalapack"))]
+                    {
+                        if let Some((u_dist, nb, col_ranges)) = &dist_ctx {
+                            let b_dist = crate::mpi_io::j2c_distributed::scatter_to_blockcyclic(
+                                &mpi_op.world, &mpi_op.cblacsgrid, *nb, col_ranges, &tmp,
+                            );
+                            let mut x_dist = b_dist;
+                            crate::mpi_io::j2c_distributed::distributed_triangular_solve(
+                                &mpi_op.cblacsgrid, u_dist, &mut x_dist,
+                            );
+                            let x_contig = crate::mpi_io::j2c_distributed::gather_from_blockcyclic(
+                                &mpi_op.world, &mpi_op.cblacsgrid, *nb, col_ranges, &x_dist,
+                            );
+                            x_contig.transpose()
+                        } else {
+                            self.solve_tmp_to_ri3fn(&aux_v, tmp)
+                        }
+                    }
+                    #[cfg(not(all(feature = "mpi", feature = "scalapack")))]
+                    { self.solve_tmp_to_ri3fn(&aux_v, tmp) }
                 } else {
                     MatrixFull::empty()
                 };
@@ -2998,7 +3050,7 @@ impl Molecule {
 
     }
 
-    pub fn prepare_rimatr_for_ri_v_mpi_slot(&self, aux_v: &MatrixFull<f64>, sbsh: usize, ebsh: usize) -> MatrixFull<f64> {
+    pub fn prepare_rimatr_for_ri_v_mpi_slot(&self, sbsh: usize, ebsh: usize) -> MatrixFull<f64> {
         //let n_basis_shell = self.cint_bas.len() as i32;
         //let n_auxbas_shell = self.cint_aux_bas.len() as i32;
 
@@ -3127,13 +3179,23 @@ impl Molecule {
             })
         });
 
+        // return the raw 3c2e block [naux, loc_n_baspar]; the metric solve is performed
+        // by the caller (`solve_tmp_to_ri3fn` or the distributed path)
+        tmp_ri3fn
 
-        let mut ri3fn = MatrixFull::new([loc_n_baspar, n_auxbas],0.0);
+    }
+
+    /// Solve the raw 3c2e block `tmp_ri3fn` (`[naux, loc_n_baspar]`) against the metric
+    /// factor `aux_v` following the `j2c_decomp` policy, returning
+    /// `ri3fn` (`[loc_n_baspar, naux]`):
+    /// - `Cd`: `cderi = j3c · L^{-T}`  ⟺  `U^T · X = tmp_ri3fn` (in-place triangular
+    ///   solve with the upper Cholesky factor `U`, then `ri3fn = X^T`),
+    /// - `Eig`: `cderi = j3c · J^{-1/2}` via the dense matrix multiplication.
+    fn solve_tmp_to_ri3fn(&self, aux_v: &MatrixFull<f64>, tmp_ri3fn: MatrixFull<f64>) -> MatrixFull<f64> {
+        let n_auxbas = tmp_ri3fn.size()[0];
+        let loc_n_baspar = tmp_ri3fn.size()[1];
+        let mut ri3fn = MatrixFull::new([loc_n_baspar, n_auxbas], 0.0);
         omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
-        // Solve against the metric factor following the `j2c_decomp` policy:
-        // - Cd:   cderi = j3c · L^{-T}  ⟺  U^T · X = tmp_ri3fn  (in-place triangular
-        //         solve with the upper Cholesky factor U, then ri3fn = X^T)
-        // - Eig:  cderi = j3c · J^{-1/2} via the dense matrix multiplication
         let mut tmp_ri3fn = tmp_ri3fn;
         match self.ctrl.j2c_decomp.policy {
             crate::ri_jk::J2CDecompPolicy::Cd => {
@@ -3147,9 +3209,7 @@ impl Molecule {
                 _dgemm_full(&tmp_ri3fn, 'T', aux_v, 'N', &mut ri3fn, 1.0, 0.0);
             },
         }
-
         ri3fn
-
     }
 
 

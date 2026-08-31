@@ -48,7 +48,7 @@ pub struct UHessRIJK<'a> {
 
 impl<'a> UHessRIJK<'a> {
     pub fn new_without_cderi(mol: &CInt, aux: &CInt, factor_j: f64, factor_k: f64) -> Self {
-        let j2c_decomp_option = J2CDecompOption { policy: J2CDecompPolicy::Cd, threshold: Some(1e-14), uplo: Upper };
+        let j2c_decomp_option = J2CDecompOption { policy: J2CDecompPolicy::Cd, threshold: Some(1e-14), uplo: Upper, distributed: J2CDistributedMode::Off };
         let device = DeviceBLAS::default();
         let (cderi, j2c_decomp) = generate_cderi_with_decomp(mol, aux, j2c_decomp_option, &device);
         Self {

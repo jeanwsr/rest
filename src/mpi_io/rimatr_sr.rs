@@ -47,20 +47,19 @@ pub fn prepare_rimatr_sr_distributed(
     mpi_operator: &MPIOperator,
     mpi_data: &MPIData,
 ) -> (MatrixFull<f64>, MatrixFull<usize>, Vec<[usize; 2]>) {
-    // SR 2c-2e Coulomb metric (P|erfc(ωr12)/r12|Q), followed by the factor built
-    // according to the `j2c_decomp` policy (eigen `J^{-1/2}` or the upper Cholesky
-    // factor U), so that the distributed SR rimatr is mathematically identical to the
-    // serial one. The SR integral (O(naux^2)) and the factorization (O(naux^3)) are
+    // SR 2c-2e Coulomb metric (P|erfc(ωr12)/r12|Q); the SR integral (O(naux^2)) is
     // computed only on rank 0 and broadcast, mirroring `diagonalize_hamiltonian_outside`.
+    // The factorization is then performed per the `j2c_decomp` policy — either the
+    // serial/rank-0 factor (`prepare_j2c_solve_factor`) or the distributed (ScaLAPACK)
+    // Cholesky solve when the sandbox mode `j2c_decomp.distributed` selects it.
     // Note `Molecule::int_ij_aux_columb_with_omega` expects the (positive) functional
     // omega, i.e. the negation of the libcint convention used here.
     let n_auxbas = mol.num_auxbas;
-    let mut aux_v = MatrixFull::new([n_auxbas, n_auxbas], 0.0);
+    let mut j2c_sr_full = MatrixFull::new([n_auxbas, n_auxbas], 0.0);
     if mpi_operator.rank == 0 {
-        let j2c_sr = mol.int_ij_aux_columb_with_omega(-omega_libcint);
-        aux_v = super::prepare_j2c_solve_factor(&j2c_sr, &mol.ctrl.j2c_decomp);
+        j2c_sr_full = mol.int_ij_aux_columb_with_omega(-omega_libcint);
     }
-    super::mpi_broadcast_matrixfull(&mpi_operator.world, &mut aux_v, 0);
+    super::mpi_broadcast_matrixfull(&mpi_operator.world, &mut j2c_sr_full, 0);
 
     let (basbas2baspar, baspar2basbas) = mol.prepare_baspair_map();
 
@@ -76,9 +75,58 @@ pub fn prepare_rimatr_sr_distributed(
     let my_rank = mpi_operator.rank;
     let mut ri3fn = MatrixFull::new([n_baspar, auxbas_distribution[my_rank].len()], 0.0);
 
+    // metric factor for the non-distributed path, and the distributed (ScaLAPACK)
+    // Cholesky context when the sandbox mode selects it
+    let mut aux_v = MatrixFull::new([n_auxbas, n_auxbas], 0.0);
+    #[cfg(all(feature = "mpi", feature = "scalapack"))]
+    let dist_ctx: Option<(
+        tensors::matrix::distributedmatrixfull::DistributedMatrixFull<f64>,
+        i32,
+        Vec<std::ops::Range<usize>>,
+    )> = {
+        if super::j2c_distributed::use_distributed_j2c(&mol.ctrl.j2c_decomp, n_auxbas, mpi_operator.size) {
+            let grid = &mpi_operator.cblacsgrid;
+            let u_dist = super::j2c_distributed::distributed_cholesky(grid, &j2c_sr_full);
+            let nb = u_dist.desc[5];
+            let col_ranges: Vec<std::ops::Range<usize>> = baspar_distribution
+                .iter()
+                .map(|(r, _, _)| r.clone())
+                .collect();
+            Some((u_dist, nb, col_ranges))
+        } else {
+            aux_v = super::prepare_j2c_solve_factor(&j2c_sr_full, &mol.ctrl.j2c_decomp);
+            None
+        }
+    };
+    #[cfg(not(all(feature = "mpi", feature = "scalapack")))]
+    let dist_ctx: Option<()> = {
+        aux_v = super::prepare_j2c_solve_factor(&j2c_sr_full, &mol.ctrl.j2c_decomp);
+        None
+    };
+
     let (baspar, sbsh, ebsh) = &baspar_distribution[my_rank];
     let loc_ri3fn = if baspar.len() > 0 {
-        rimatr_sr_slot(mol, &aux_v, omega_libcint, *sbsh, *ebsh)
+        let tmp = rimatr_sr_slot(mol, omega_libcint, *sbsh, *ebsh);
+        #[cfg(all(feature = "mpi", feature = "scalapack"))]
+        {
+            if let Some((u_dist, nb, col_ranges)) = &dist_ctx {
+                let b_dist = super::j2c_distributed::scatter_to_blockcyclic(
+                    &mpi_operator.world, &mpi_operator.cblacsgrid, *nb, col_ranges, &tmp,
+                );
+                let mut x_dist = b_dist;
+                super::j2c_distributed::distributed_triangular_solve(
+                    &mpi_operator.cblacsgrid, u_dist, &mut x_dist,
+                );
+                super::j2c_distributed::gather_from_blockcyclic(
+                    &mpi_operator.world, &mpi_operator.cblacsgrid, *nb, col_ranges, &x_dist,
+                )
+                .transpose()
+            } else {
+                solve_sr_tmp_to_ri3fn(mol, &aux_v, tmp)
+            }
+        }
+        #[cfg(not(all(feature = "mpi", feature = "scalapack")))]
+        { solve_sr_tmp_to_ri3fn(mol, &aux_v, tmp) }
     } else {
         MatrixFull::empty()
     };
@@ -105,7 +153,6 @@ pub fn prepare_rimatr_sr_distributed(
 /// range-separated Coulomb kernel switched on in every (thread-local) libcint instance.
 fn rimatr_sr_slot(
     mol: &Molecule,
-    aux_v: &MatrixFull<f64>,
     omega_libcint: f64,
     sbsh: usize,
     ebsh: usize,
@@ -209,13 +256,26 @@ fn rimatr_sr_slot(
             .for_each(|(to, from)| to.copy_from_slice(from))
     });
 
-    // solve against the SR J^(-1/2): ri3fn[basis pair, aux] = Σ_P tmp[P, pair] * aux_v[P, aux]
+    // return the raw SR 3c2e block [naux, loc_n_baspar]; the metric solve is performed
+    // by the caller (`solve_sr_tmp_to_ri3fn` or the distributed path)
+    tmp_ri3fn
+}
+
+/// Solve the raw SR 3c2e block `tmp_ri3fn` (`[naux, loc_n_baspar]`) against the metric
+/// factor `aux_v` following the `j2c_decomp` policy, returning
+/// `ri3fn` (`[loc_n_baspar, naux]`):
+/// - `Cd`: `cderi = j3c · L^{-T}`  ⟺  `U^T · X = tmp_ri3fn` (in-place triangular
+///   solve with the upper Cholesky factor `U`, then `ri3fn = X^T`),
+/// - `Eig`: `cderi = j3c · J^{-1/2}` via the dense matrix multiplication.
+fn solve_sr_tmp_to_ri3fn(
+    mol: &Molecule,
+    aux_v: &MatrixFull<f64>,
+    tmp_ri3fn: MatrixFull<f64>,
+) -> MatrixFull<f64> {
+    let n_auxbas = tmp_ri3fn.size()[0];
+    let loc_n_baspar = tmp_ri3fn.size()[1];
     let mut ri3fn = MatrixFull::new([loc_n_baspar, n_auxbas], 0.0);
     omp_set_num_threads_wrapper(mol.ctrl.num_threads.unwrap());
-    // Solve against the metric factor following the `j2c_decomp` policy:
-    // - Cd:   cderi = j3c · L^{-T}  ⟺  U^T · X = tmp_ri3fn  (in-place triangular
-    //         solve with the upper Cholesky factor U, then ri3fn = X^T)
-    // - Eig:  cderi = j3c · J^{-1/2} via the dense matrix multiplication
     let mut tmp_ri3fn = tmp_ri3fn;
     match mol.ctrl.j2c_decomp.policy {
         crate::ri_jk::J2CDecompPolicy::Cd => {
@@ -229,6 +289,5 @@ fn rimatr_sr_slot(
             _dgemm_full(&tmp_ri3fn, 'T', aux_v, 'N', &mut ri3fn, 1.0, 0.0);
         },
     }
-
     ri3fn
 }
