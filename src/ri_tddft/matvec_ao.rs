@@ -31,6 +31,7 @@ use crate::dft::numint_matmul::nimatmul::NIMatmul;
 use crate::dft::numint_matmul::hess_rks::eval_vxc_fxc_from_rho;
 use crate::dft::xceff::prelude::{XCDenType, XCSpin};
 use crate::ri_jk::util::get_cint_mol;
+use crate::ri_tddft::tddft::FxcDriver;
 use crate::ri_tddft::utils::tddft_occupation_parameters;
 use crate::ri_tddft::{TDDFTData, TDDFTMode};
 use crate::utilities::rstsr_util::{RestTensorToRstsrTsrAPI, RestTensorToRstsrViewAPI, Tsr, TsrView};
@@ -68,11 +69,11 @@ pub static T_CLOS: AtomicU64 = AtomicU64::new(0);
 /// Number of batched A/B matvec closure calls.
 pub static N_AO_CLOS: AtomicU64 = AtomicU64::new(0);
 
-fn add_ns(counter: &AtomicU64, started: Instant) {
+pub(crate) fn add_ns(counter: &AtomicU64, started: Instant) {
     counter.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
-fn s_of(counter: &AtomicU64) -> f64 {
+pub(crate) fn s_of(counter: &AtomicU64) -> f64 {
     counter.load(Ordering::Relaxed) as f64 / 1.0e9
 }
 
@@ -400,6 +401,24 @@ fn fxc_mo_matvec(
     z_block: &MatrixFull<f64>,
     device: &DeviceBLAS,
 ) -> MatrixFull<f64> {
+    // fxc matvec for the occ/vir-reduced drivers (`"mo"` and `"semitrans"`).
+    // Both cache the small occ-side tables (psi_occ [+grads]); they differ only
+    // in how the vir side is provided, branching at four points:
+    //   * `"mo"`: psi_vir(+grads) is projected per grid batch into reusable
+    //     buffers and consumed by every GEMM (batch buffers freed per batch).
+    //   * `"semitrans"`: C_vir is folded into the amplitudes
+    //     (Z_st = Z_stack * C_vir^T, one GEMM per call) and the vir side stays
+    //     in the RAW AO basis — the batch AO slab is kept alive through the
+    //     chunk loop and no psi_vir is ever formed.
+    // Per chunk (all m sets stacked; shapes use the driver's "left operand",
+    // psi_vir_c [cg,nvir] or phi_c [cg,nao]):
+    //   Q^b[g, s*nocc+i] = sum_b left^b[g,b] * Z^right[s*nocc+i, b]
+    //   rho_0[g]         = sum_i psi_occ[g,i] * Q_0[g, i-block]
+    //   rho_{d+1}[g]     = vecdot(d_d psi_occ, Q_0) + vecdot(psi_occ, Q_{d+1})
+    //   v1_a(g)          = w(g) sum_b fxc_eff[g,a,b] rho_b(g)
+    //   S^a[(s*nocc+i), g] = v1_a^s(g) * psi^a_i(g)
+    //   "mo":        E_stack += S^a * left^a_c
+    //   "semitrans": E_stack += (S^a * phi_c) * C_vir^T
     let psi_occ = ao_data.psi_occ.as_ref().expect("mo fxc requires psi_occ"); // [ng, occ] cached
     let pog_cached = ao_data.psi_occ_grad.as_ref(); // [3, ng, occ] cached (GGA only)
     let gga = pog_cached.is_some();
@@ -415,12 +434,7 @@ fn fxc_mo_matvec(
     let fxc_raw = fxc_eff.raw();
     let fxc_off = fxc_eff.offset();
     let deriv = if gga { 1 } else { 0 };
-
-    // The vir-side projections (psi_vir and its gradients) are STREAMED per grid batch,
-    // not cached: each batch evaluates the AO once through the NIMatmul/libcint path
-    // and projects it through C_vir into batch-local buffers (freed after the batch).
-    // This keeps the ~1.1 GB (TZ-GGA) vir tables out of memory at the cost of one AO
-    // evaluation + projection pass per call. The occ-side tables (17+52 MB) stay cached.
+    let st = ao_data.fxc_driver == Some(FxcDriver::SEMITRANS);
 
     // Set-stacked amplitudes: Z_stack[(s*nocc+i), b] = z_s[i,b] — built ONCE per call,
     // so the per-(chunk, set) z re-assembly disappears and every GEMM below runs with
@@ -435,22 +449,35 @@ fn fxc_mo_matvec(
         }
     }
     let z_stack = rt::asarray((z_stack_vec, [m * occ_size, vir_size].f(), device));
+    // semitrans: fold C_vir into the amplitude side.
+    let ztilde_stack = if st {
+        let c_vir_v = c_vir.to_rstsr_view(device);
+        let mut zt = rt::zeros(([m * occ_size, c_vir.size[0]].f(), device));
+        zt.matmul_from(&z_stack, &c_vir_v.t(), 1.0, 0.0);
+        Some(zt)
+    } else {
+        None
+    };
 
     let ni = ao_data.ni.as_ref().expect("mo fxc requires NIMatmul");
     let c_vir_v = c_vir.to_rstsr_view(device);
     let nbatch = ni.nbatch;
     let nchunk = 1536usize;
     let nb_max = nbatch.min(ng);
-    // Reusable vir-side batch buffers (allocated once per call, refilled per batch).
-    let mut pv_all = rt::zeros(([nb_max, vir_size].f(), device));
-    let mut pvg_all = if gga {
+    // "mo": reusable vir-side batch buffers (allocated once per call, refilled per batch).
+    let mut pv_all = if st {
+        None
+    } else {
+        Some(rt::zeros(([nb_max, vir_size].f(), device)))
+    };
+    let mut pvg_all = if st || !gga {
+        None
+    } else {
         Some(
             (0..3)
                 .map(|_| rt::zeros(([nb_max, vir_size].f(), device)))
                 .collect::<Vec<_>>(),
         )
-    } else {
-        None
     };
 
     let mut result = MatrixFull::new([dim, m], 0.0);
@@ -458,23 +485,23 @@ fn fxc_mo_matvec(
     while g0 < ng {
         let g1 = (g0 + nbatch).min(ng);
         let nb = g1 - g0;
-        // ── serial: evaluate AO for this batch, project the vir side ──
+        // ── serial: evaluate AO for this batch; "mo" also projects the vir side ──
         let t_proj = Instant::now();
         let mut ni_b = ni.split_batch(g0, g1);
-        let ao_b = ni_b.get_cached_ao(deriv); // [nb, nao, ncomp]
-        pv_all
-            .i_mut((..nb, ..))
-            .matmul_from(&ao_b.i((.., .., 0)), &c_vir_v, 1.0, 0.0);
-        if gga {
-            let pvg = pvg_all.as_mut().unwrap();
-            for d in 0..3 {
-                pvg[d]
-                    .i_mut((..nb, ..))
-                    .matmul_from(&ao_b.i((.., .., 1 + d)), &c_vir_v, 1.0, 0.0);
+        let ao_b = ni_b.get_cached_ao(deriv); // [nb, nao, ncomp]; alive through the chunk loop
+        if !st {
+            let pv = pv_all.as_mut().unwrap();
+            pv.i_mut((..nb, ..))
+                .matmul_from(&ao_b.i((.., .., 0)), &c_vir_v, 1.0, 0.0);
+            if gga {
+                let pvg = pvg_all.as_mut().unwrap();
+                for d in 0..3 {
+                    pvg[d]
+                        .i_mut((..nb, ..))
+                        .matmul_from(&ao_b.i((.., .., 1 + d)), &c_vir_v, 1.0, 0.0);
+                }
             }
         }
-        drop(ao_b);
-        drop(ni_b);
         add_ns(&T_FXC_RHO, t_proj);
 
         // ── parallel chunks within this batch (set-stacked kernels) ──
@@ -490,14 +517,26 @@ fn fxc_mo_matvec(
                 let mut e_out = vec![0.0_f64; m * occ_size * vir_size];
 
                 let po_c = psi_occ.i((cg0..cg1, ..)); // [cg, occ]
-                let pv_c = pv_all.i((lg0..lg1, ..)); // [cg, vir]
+                // driver-dependent GEMM operands:
+                //   "mo":        left = psi_vir_c  [cg, nvir], right = Z_stack
+                //   "semitrans": left = phi_c       [cg, nao],  right = Z_st
+                let left_c = if st {
+                    ao_b.i((lg0..lg1, .., 0))
+                } else {
+                    pv_all.as_ref().unwrap().i((lg0..lg1, ..))
+                };
+                let right = if st {
+                    ztilde_stack.as_ref().unwrap()
+                } else {
+                    &z_stack
+                };
 
                 // ── rho build: ONE stacked GEMM per component (all m sets at once) ──
-                // t1_stack[g, s*nocc+i] = sum_b psi_vir[g,b] * Z_stack[s*nocc+i, b]
-                // (GEMM [cg,nvir]-[nvir, m*nocc], K = nvir, N = m*nocc — fat on both axes)
-                let mut t1_stack = rt::zeros(([cg, m * occ_size].f(), device));
-                t1_stack.matmul_from(&pv_c, &z_stack.t(), 1.0, 0.0);
-                let mut t1d_stack = if gga {
+                // q[g, s*nocc+i] = sum_b left[g,b] * right[s*nocc+i, b]
+                // (GEMM [cg,nao|nvir]-[nao|nvir, m*nocc], K = nvir|nao, N = m*nocc)
+                let mut q_stack = rt::zeros(([cg, m * occ_size].f(), device));
+                q_stack.matmul_from(&left_c, &right.t(), 1.0, 0.0);
+                let mut qd_stack = if gga {
                     Some(rt::zeros(([cg, m * occ_size].f(), device)))
                 } else {
                     None
@@ -506,31 +545,39 @@ fn fxc_mo_matvec(
                 let mut rho_bufs: Vec<Vec<Vec<f64>>> =
                     vec![vec![vec![0.0; cg]; 4]; m];
                 for s in 0..m {
-                    let t1_s = t1_stack.i((.., s * occ_size..(s + 1) * occ_size));
+                    let q_s = q_stack.i((.., s * occ_size..(s + 1) * occ_size));
                     let mut rho0 = rt::zeros(([cg], device));
-                    rho0.i_mut((..)).vecdot_from(&t1_s, &po_c, 1);
+                    rho0.i_mut((..)).vecdot_from(&q_s, &po_c, 1);
                     for g in 0..cg {
                         rho_bufs[s][0][g] = rho0[[g]];
                     }
                 }
                 if gga {
                     let pog = pog_cached.unwrap(); // [3, ng, occ]
-                    let pvg = pvg_all.as_ref().unwrap();
                     for d in 0..3 {
-                        // t1d_stack[g, s*nocc+i] = sum_b (d_d psi_vir)[g,b] * Z_stack[...]
-                        t1d_stack
+                        // "mo": grad left operand from the projected batch buffer;
+                        // "semitrans": raw AO gradient slab of this batch.
+                        let grad_c = if st {
+                            ao_b.i((lg0..lg1, .., 1 + d))
+                        } else {
+                            pvg_all.as_ref().unwrap()[d].i((lg0..lg1, ..))
+                        };
+                        qd_stack
                             .as_mut()
                             .unwrap()
-                            .matmul_from(&pvg[d].i((lg0..lg1, ..)), &z_stack.t(), 1.0, 0.0);
+                            .matmul_from(&grad_c, &right.t(), 1.0, 0.0);
                         for s in 0..m {
-                            let t1_s = t1_stack.i((.., s * occ_size..(s + 1) * occ_size));
-                            let t1d_s = t1d_stack.as_ref().unwrap().i((.., s * occ_size..(s + 1) * occ_size));
-                            // term 1: rho1_d[g] = sum_i (d_d psi_occ)[g,i] * t1[g,i]
+                            let q_s = q_stack.i((.., s * occ_size..(s + 1) * occ_size));
+                            let qd_s = qd_stack
+                                .as_ref()
+                                .unwrap()
+                                .i((.., s * occ_size..(s + 1) * occ_size));
+                            // term 1: rho1_d[g] = sum_i (d_d psi_occ)[g,i] * q[g,i]
                             let mut r_d = rt::zeros(([cg], device));
-                            r_d.i_mut((..)).vecdot_from(&pog.i((d, cg0..cg1, ..)), &t1_s, 1);
-                            // term 2: rho2_d[g] = sum_i psi_occ[g,i] * t1d[g,i]
+                            r_d.i_mut((..)).vecdot_from(&pog.i((d, cg0..cg1, ..)), &q_s, 1);
+                            // term 2: rho2_d[g] = sum_i psi_occ[g,i] * qd[g,i]
                             let mut r_t = rt::zeros(([cg], device));
-                            r_t.i_mut((..)).vecdot_from(&po_c, &t1d_s, 1);
+                            r_t.i_mut((..)).vecdot_from(&po_c, &qd_s, 1);
                             for g in 0..cg {
                                 rho_bufs[s][1 + d][g] = r_d[[g]] + r_t[[g]];
                             }
@@ -556,10 +603,18 @@ fn fxc_mo_matvec(
                     }
                 }
 
-                // ── back-projection: stacked scalings + ONE GEMM per term (all sets) ──
+                // ── back-projection: stacked scalings + GEMM per term (all sets) ──
+                //   "mo":        E_stack += S^a * left^a_c              (one GEMM)
+                //   "semitrans": G = S^a * phi_c; E_stack += G * C_vir   (two GEMMs;
+                //                g_stack must be REWRITTEN (beta = 0) per term)
                 let t_pot = Instant::now();
                 let mut s_stack = vec![0.0_f64; m * occ_size * cg]; // reused build buffer
                 let mut e_stack = rt::zeros(([m * occ_size, vir_size].f(), device));
+                let mut g_stack = if st {
+                    Some(rt::zeros(([m * occ_size, c_vir.size[0]].f(), device)))
+                } else {
+                    None
+                };
                 // alpha = 0: S[(s*nocc+i), g] = v1_0^s(g) * psi_occ[g,i]
                 // (measured: the (g,i) order below beats the tilted (i,g-block) order —
                 // the scattered po_c reads are L2-resident hits, cheaper than the
@@ -576,12 +631,22 @@ fn fxc_mo_matvec(
                     }
                 }
                 let s0 = rt::asarray((&s_stack, [m * occ_size, cg].f(), device));
-                e_stack.matmul_from(&s0, &pv_c, 1.0, 0.0);
+                if st {
+                    let g_s = g_stack.as_mut().unwrap();
+                    g_s.matmul_from(&s0, &left_c, 1.0, 0.0);
+                    e_stack.matmul_from(g_s, &c_vir_v, 1.0, 0.0);
+                } else {
+                    e_stack.matmul_from(&s0, &left_c, 1.0, 0.0);
+                }
                 if gga {
                     let pog = pog_cached.unwrap(); // [3, ng, occ]
                     for d in 0..3 {
-                        let pvg_c = pvg_all.as_ref().unwrap()[d].i((lg0..lg1, ..));
-                        // term 1: S = v1_{d+1}^s(g) * (d_d psi_occ)[g,i]; E += S^T * psi_vir_c
+                        let grad_c = if st {
+                            ao_b.i((lg0..lg1, .., 1 + d))
+                        } else {
+                            pvg_all.as_ref().unwrap()[d].i((lg0..lg1, ..))
+                        };
+                        // term 1: S = v1_{d+1}^s(g) * (d_d psi_occ)[g,i]
                         for s in 0..m {
                             let v = &v1_bufs[s][1 + d];
                             let rbase = s * occ_size;
@@ -593,8 +658,14 @@ fn fxc_mo_matvec(
                             }
                         }
                         let s1 = rt::asarray((&s_stack, [m * occ_size, cg].f(), device));
-                        e_stack.matmul_from(&s1, &pv_c, 1.0, 1.0);
-                        // term 2: S = v1_{d+1}^s(g) * psi_occ[g,i]; E += S^T * (d_d psi_vir)_c
+                        if st {
+                            let g_s = g_stack.as_mut().unwrap();
+                            g_s.matmul_from(&s1, &left_c, 1.0, 0.0);
+                            e_stack.matmul_from(g_s, &c_vir_v, 1.0, 1.0);
+                        } else {
+                            e_stack.matmul_from(&s1, &left_c, 1.0, 1.0);
+                        }
+                        // term 2: S = v1_{d+1}^s(g) * psi_occ[g,i]
                         for s in 0..m {
                             let v = &v1_bufs[s][1 + d];
                             let rbase = s * occ_size;
@@ -606,7 +677,13 @@ fn fxc_mo_matvec(
                             }
                         }
                         let s2 = rt::asarray((&s_stack, [m * occ_size, cg].f(), device));
-                        e_stack.matmul_from(&s2, &pvg_c, 1.0, 1.0);
+                        if st {
+                            let g_s = g_stack.as_mut().unwrap();
+                            g_s.matmul_from(&s2, &grad_c, 1.0, 0.0);
+                            e_stack.matmul_from(g_s, &c_vir_v, 1.0, 1.0);
+                        } else {
+                            e_stack.matmul_from(&s2, &grad_c, 1.0, 1.0);
+                        }
                     }
                 }
 
@@ -639,8 +716,6 @@ fn fxc_mo_matvec(
 }
 
 
-/// Kernel part of the A-block matvec (everything except the diagonal):
-/// transition densities → batched RI-J/K + fxc → contract back to MO.
 fn ao_a_kernel_block(
     scf: &SCF,
     ao_data: &mut TDDFTData,
@@ -669,15 +744,15 @@ fn ao_a_kernel_block(
     // fxc: "dm" (assembled-density NIMatmul, AO-basis block) or "mo"
     // (occ/vir-reduced, direct MO-amplitude output).
     let t0 = Instant::now();
-    let f_fxc_block = if ao_data.fxc_mo {
-        None
-    } else {
-        Some(fxc_matvec_ao_batched(ao_data, &p_block, &device))
+    let f_fxc_block = match ao_data.fxc_driver {
+        Some(FxcDriver::DM) => Some(fxc_matvec_ao_batched(ao_data, &p_block, &device)),
+        _ => None,
     };
-    let fxc_mo_block = if ao_data.fxc_mo {
-        Some(fxc_mo_matvec(scf, ao_data, z_block, &device))
-    } else {
-        None
+    let fxc_mo_block = match ao_data.fxc_driver {
+        Some(FxcDriver::MO | FxcDriver::SEMITRANS) => {
+            Some(fxc_mo_matvec(scf, ao_data, z_block, &device))
+        }
+        _ => None,
     };
     add_ns(&T_FXC, t0);
 
@@ -820,15 +895,15 @@ fn ao_b_kernel_block(
     add_ns(&T_TDEN, t0);
 
     let t0 = Instant::now();
-    let f_fxc_block = if ao_data.fxc_mo {
-        None
-    } else {
-        Some(fxc_matvec_ao_batched(ao_data, &p_block, &device))
+    let f_fxc_block = match ao_data.fxc_driver {
+        Some(FxcDriver::DM) => Some(fxc_matvec_ao_batched(ao_data, &p_block, &device)),
+        _ => None,
     };
-    let fxc_mo_block = if ao_data.fxc_mo {
-        Some(fxc_mo_matvec(scf, ao_data, z_block, &device))
-    } else {
-        None
+    let fxc_mo_block = match ao_data.fxc_driver {
+        Some(FxcDriver::MO | FxcDriver::SEMITRANS) => {
+            Some(fxc_mo_matvec(scf, ao_data, z_block, &device))
+        }
+        _ => None,
     };
     add_ns(&T_FXC, t0);
 
@@ -1307,7 +1382,7 @@ mod tests {
             fxc_eff: None,
             den_type: Some(den_type),
             grid_batch: false,
-            fxc_mo: false,
+            fxc_driver: Some(FxcDriver::MO),
             psi_occ: None,
             psi_occ_grad: None,
             ri_ov: None,

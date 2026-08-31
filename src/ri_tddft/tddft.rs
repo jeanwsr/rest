@@ -59,9 +59,9 @@ pub struct TDDFTData {
     pub den_type: Option<XCDenType>,
     /// Batch the fxc AO evaluation over grid batches (AO mode, memory-bounded).
     pub grid_batch: bool,
-    /// fxc driver: `true` = "mo" (default; cached occ-side grid projections
-    /// below, streamed vir side), `false` = "dm" (assembled-density fallback).
-    pub fxc_mo: bool,
+    /// Resolved `tddft_fxc_driver` (AO mode); `None` for MO data — the fxc
+    /// driver only applies in AO mode.
+    pub fxc_driver: Option<FxcDriver>,
     /// Cached occ-MO projections on the grid (MO-style fxc driver):
     /// ψ_i(g) = Σ_μ C_μi φ_μ(g), layout [ngrids, nocc].
     pub psi_occ: Option<Tsr>,
@@ -81,6 +81,21 @@ pub struct TDDFTData {
 
 /// Prepare the shared TDDFT data for **MO mode**: the fxc kernel table
 /// (`prepare_fxc_data`) plus the four MO-basis RI tensors.
+/// Resolved `tddft_fxc_driver` for AO mode. Variants are spelled in the
+/// established all-caps abbreviation form (cf. `TDDFTMode::MO`).
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FxcDriver {
+    /// `"mo"`: occ/vir-reduced fxc; the vir side is streamed as C_vir-projected
+    /// grid tables (the MO-mode fxc algorithm).
+    MO,
+    /// `"semitrans"`: C_vir folded into the amplitudes; the vir side contracts
+    /// against the raw AO on grid, so no psi_vir is ever formed.
+    SEMITRANS,
+    /// `"dm"`: assembled-density NIMatmul fallback.
+    DM,
+}
+
 pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
     println!("Obtaining RI integrals...");
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
@@ -120,7 +135,7 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
         fxc_eff: None,
         den_type: None,
         grid_batch: false,
-        fxc_mo: false,
+        fxc_driver: None,
         psi_occ: None,
         psi_occ_grad: None,
         ri_ov: Some(ri_ov),
@@ -312,27 +327,22 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
     // Layouts (t-ready, contiguous for the matvec GEMMs):
     // psi_occ [ngrids, nocc]; psi_occ_grad [3, ngrids, nocc]
     // (leading d-axis so the (d, chunk, ·) slices are contiguous).
-    let fxc_mo = scf.mol.ctrl.tddft.as_ref()
-        .map_or(false, |t| {
-            let driver = t.tddft_fxc_driver.as_str();
-            if driver != "dm" && driver != "mo" {
-                log::warn!("Unknown tddft_fxc_driver = \"{}\"; falling back to \"dm\"", driver);
-            }
-            driver == "mo"
-        });
     // psi_occ [ngrids, nocc]; psi_occ_grad [3, ngrids, nocc] — the ONLY cached
     // tables (small). The vir side (ψ_vir + grads, the ~1.1 GB whale at TZ-GGA)
     // is NOT cached: fxc_mo_matvec streams it per grid batch (AO eval + C_vir
     // projection per batch) to keep the memory footprint down.
-    let fxc_mo = scf.mol.ctrl.tddft.as_ref()
-        .map_or(false, |t| {
-            let driver = t.tddft_fxc_driver.as_str();
-            if driver != "dm" && driver != "mo" {
-                log::warn!("Unknown tddft_fxc_driver = \"{}\"; falling back to \"dm\"", driver);
+    let fxc_driver = scf.mol.ctrl.tddft.as_ref().map_or(FxcDriver::SEMITRANS, |t| {
+        match t.tddft_fxc_driver.as_str() {
+            "mo" => FxcDriver::MO,
+            "semitrans" => FxcDriver::SEMITRANS,
+            "dm" => FxcDriver::DM,
+            other => {
+                log::warn!("Unknown tddft_fxc_driver = \"{}\"; falling back to \"dm\"", other);
+                FxcDriver::DM
             }
-            driver == "mo"
-        });
-    let (psi_occ, psi_occ_grad) = if fxc_mo {
+        }
+    });
+    let (psi_occ, psi_occ_grad) = if matches!(fxc_driver, FxcDriver::MO | FxcDriver::SEMITRANS) {
         let c_occ_view = c_occ.to_rstsr_view(&device);
         let deriv = if nvar == 4 { 1 } else { 0 };
         let mut po = rt::zeros(([ngrids, occ_size].f(), &device));
@@ -372,7 +382,7 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
         fxc_eff: Some(fxc_eff),
         den_type: Some(den_type),
         grid_batch,
-        fxc_mo,
+        fxc_driver: Some(fxc_driver),
         psi_occ,
         psi_occ_grad,
         ri_ov: None,
