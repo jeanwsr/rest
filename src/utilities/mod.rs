@@ -175,8 +175,14 @@ pub fn balancing(num_tasks:usize, num_threads: usize) -> Vec<Range<usize>> {
 
 /// Apply round-robin permutation to grid data, so that contiguous ranges
 /// in `parallel_balancing` give each thread a uniform mix of grid points
-/// from all spatial regions. Call before ao/aop tabulation.
-pub fn apply_round_robin_permutation(coordinates: &mut Vec<[f64; 3]>, weights: &mut Vec<f64>) {
+/// from all spatial regions. All per-grid arrays must be permuted together.
+/// Call before ao/aop tabulation.
+pub fn apply_round_robin_permutation(
+    coordinates: &mut Vec<[f64; 3]>,
+    weights: &mut Vec<f64>,
+    atm_idx: &mut Vec<usize>,
+    quadrature_weights: &mut Vec<f64>,
+) {
     let n = coordinates.len();
     let num_threads = rayon::current_num_threads();
     if num_threads <= 1 {
@@ -206,11 +212,16 @@ pub fn apply_round_robin_permutation(coordinates: &mut Vec<[f64; 3]>, weights: &
         perm[new] = old;
     }
 
-    let old_coords = coordinates.clone();
-    let old_weights = weights.clone();
+    apply_permutation(coordinates, &perm);
+    apply_permutation(weights, &perm);
+    apply_permutation(atm_idx, &perm);
+    apply_permutation(quadrature_weights, &perm);
+}
+
+fn apply_permutation<T: Clone>(data: &mut Vec<T>, perm: &[usize]) {
+    let old_data = data.clone();
     for (new_idx, &old_idx) in perm.iter().enumerate() {
-        coordinates[new_idx] = old_coords[old_idx];
-        weights[new_idx] = old_weights[old_idx];
+        data[new_idx] = old_data[old_idx].clone();
     }
 }
 

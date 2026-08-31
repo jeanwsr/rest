@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use rest_tensors::{MatrixFull, ParMathMatrix};
-use pyrest::basis_io::{BasCell, Basis4Elem, cint_norm_factor, gto_value, };
+use pyrest::basis_io::{BasCell, Basis4Elem, cint_norm_factor, gto_value};
 use pyrest::dft::{DFA4REST, Grids};
 use pyrest::dft::libxc_helper::{xc_func_init, lda_exc_vxc};
 use pyrest::utilities;
@@ -382,4 +382,106 @@ fn test_all_rsh_via_auto_resolver() {
     assert!(dfa2.is_rsh());
     assert!((dfa2.omega().unwrap() - 0.11).abs() < 1e-9);
     assert_eq!(dfa2.dfa_compnt_scf, vec![428]);
+}
+
+/// `becke_partitioning_deriv.rs` is a standalone transplant providing Becke partitioning
+/// with weight derivatives (up to 2nd order), while grid generation keeps using the
+/// long-standing scalar routine in `becke_partitioning.rs`.  Before any derivative
+/// machinery is built on top of the transplant, this test pins down that at deriv 0 it
+/// reproduces exactly the partition weights of the existing routine — the ones folded
+/// into `Grids` as `weights / quadrature_weights` — for both attribution modes:
+/// per-grid (`AtmIndices::ByGrid` from `Grids::atm_idx`) and per-atom-interval
+/// (`AtmIndices::ByAtom` from the monotonic split of the same array).
+#[test]
+fn test_becke_partition_deriv_weights() {
+    use pyrest::dft::gen_grids::becke_partitioning_deriv::{
+        becke_partition, gen_adjustment_factor, try_atm_quad_split, AtmIndices,
+    };
+
+    // water-like geometry in bohr, heterogeneous so the radii adjustment is active
+    let center_coordinates_bohr = vec![(0.0, 0.0, 0.0), (1.717, 0.0, -0.55), (-1.717, 0.0, -0.55)];
+    let proton_charges = vec![8, 1, 1];
+
+    // dummy basis parameters: only consumed by the "lmg" radial method, while
+    // build_nonstd generates radial grids by "treutler"
+    let alpha_min = center_coordinates_bohr
+        .iter()
+        .map(|_| {
+            let mut m: HashMap<usize, f64> = HashMap::new();
+            m.insert(0, 0.122);
+            m
+        })
+        .collect();
+    let alpha_max = vec![0.122; center_coordinates_bohr.len()];
+
+    let grids = Grids::build_nonstd(
+        center_coordinates_bohr.clone(),
+        proton_charges.clone(),
+        alpha_min,
+        alpha_max,
+        &mut None,
+    );
+    let ngrids = grids.coordinates.len();
+    assert!(ngrids > 0);
+
+    // reference: the partitioning weight of the current becke_partitioning.rs, folded
+    // into Grids as weights = quadrature_weights * becke weight (hardness 3)
+    let w_ref: Vec<f64> = grids
+        .weights
+        .iter()
+        .zip(grids.quadrature_weights.iter())
+        .map(|(w, wq)| w / wq)
+        .collect();
+
+    // new implementation: unit quadrature weights, so w is the bare partition weight
+    let atm_coords: Vec<[f64; 3]> =
+        center_coordinates_bohr.iter().map(|c| [c.0, c.1, c.2]).collect();
+    let adjustment_factor = gen_adjustment_factor(&proton_charges);
+    let output = becke_partition(
+        &grids.coordinates,
+        &atm_coords,
+        AtmIndices::ByGrid(&grids.atm_idx),
+        &vec![1.0; ngrids],
+        &adjustment_factor,
+        3,
+        64,
+        0,
+        None,
+    );
+    let w_new = output.w.unwrap();
+    assert_eq!(w_new.len(), ngrids);
+
+    let mut max_diff = 0.0f64;
+    for g in 0..ngrids {
+        let diff = (w_ref[g] - w_new[g]).abs();
+        assert!(diff < 1.0e-10, "grid {}: ref {:16.8e}, new {:16.8e}, diff {:16.8e}", g, w_ref[g], w_new[g], diff);
+        max_diff = max_diff.max(diff);
+    }
+    println!("by-grid becke weights agree on {} grids, max diff = {:.3e}", ngrids, max_diff);
+
+    // same check through the ByAtom attribution: build_nonstd grids are generated and
+    // concatenated atom by atom, so atm_idx is monotonically increasing
+    let natm = atm_coords.len();
+    let split = try_atm_quad_split(&grids.atm_idx, natm).expect("build_nonstd grids should be grouped by atom");
+    assert_eq!(split.len(), natm + 1);
+    assert_eq!(split[natm], ngrids);
+    let output_by_atom = becke_partition(
+        &grids.coordinates,
+        &atm_coords,
+        AtmIndices::ByAtom(&split),
+        &vec![1.0; ngrids],
+        &adjustment_factor,
+        3,
+        64,
+        0,
+        None,
+    );
+    let w_new_by_atom = output_by_atom.w.unwrap();
+    let mut max_diff_by_atom = 0.0f64;
+    for g in 0..ngrids {
+        let diff = (w_ref[g] - w_new_by_atom[g]).abs();
+        assert!(diff < 1.0e-10, "grid {}: ref {:16.8e}, new {:16.8e}, diff {:16.8e}", g, w_ref[g], w_new_by_atom[g], diff);
+        max_diff_by_atom = max_diff_by_atom.max(diff);
+    }
+    println!("by-atom becke weights agree on {} grids, max diff = {:.3e}", ngrids, max_diff_by_atom);
 }

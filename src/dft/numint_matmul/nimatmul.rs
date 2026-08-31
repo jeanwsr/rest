@@ -1,5 +1,5 @@
 // Note on linkage:
-// 
+//
 // This algorithm implementation strictly requires linkage of openblas.
 // If mkl is also linked and precedence is given to mkl, the algorithm will be very slow due to
 // threading conflict. Use `patchelf` to remove mkl linkage from the binary if necessary.
@@ -15,6 +15,16 @@ pub struct NIMatmul<'a> {
     pub cint: CInt,
     pub coords: Vec<[f64; 3]>,
     pub weights: Vec<f64>,
+    /// Atom index of the center each grid point was generated on (`usize::MAX` for grids
+    /// attached to no atom, e.g. external grids); the same convention as `Grids::atm_idx`.
+    ///
+    /// The Becke grid-shift terms consume this attribution; see
+    /// `crate::dft::gen_grids::becke_partitioning_deriv` for the ByAtom scheme that requires
+    /// it to be non-decreasing (atom-grouped grids).
+    pub atm_idx: Vec<usize>,
+    /// Pre-partition (radial × angular) quadrature weight of each grid point, before the Becke
+    /// partitioning factor; the same convention as `Grids::quadrature_weights`.
+    pub quadrature_weights: Vec<f64>,
 
     /// Cache for computed AO values, keyed by derivative order (e.g., "deriv0", "deriv1", etc.).
     ///
@@ -42,16 +52,77 @@ pub struct NIMatmul<'a> {
     pub nbatch: usize,
 }
 
+/// Reorder the grid arrays into atom-grouped order: `atm_idx` non-decreasing, atoms in ascending
+/// order, grids of one atom consecutive (a stable counting sort on `atm_idx`).
+///
+/// This is the order the ByAtom attribution of the Becke grid-shift requires.  Grids attached to
+/// no atom (`atm_idx >= natm`, e.g. external grids) keep their relative order at the tail.  The
+/// values are only permuted, never changed.
+///
+/// If `atm_idx` is already non-decreasing — the common case, grids as generated atom-by-atom are
+/// exactly in this order — the arrays are returned unchanged, at no extra cost.
+pub fn regroup_grids_by_atom(
+    coordinates: Vec<[f64; 3]>,
+    weights: Vec<f64>,
+    atm_idx: Vec<usize>,
+    quadrature_weights: Vec<f64>,
+    natm: usize,
+) -> (Vec<[f64; 3]>, Vec<f64>, Vec<usize>, Vec<f64>) {
+    // the common case: grids as generated (atom by atom) are already grouped
+    if !atm_idx.windows(2).any(|w| w[1] < w[0]) {
+        return (coordinates, weights, atm_idx, quadrature_weights);
+    }
+    let ngrids = coordinates.len();
+    // counting sort with natm + 1 buckets; the last bucket collects unattributed grids
+    let mut counts = vec![0usize; natm + 1];
+    for &a in &atm_idx {
+        counts[a.min(natm)] += 1;
+    }
+    let mut cursor = vec![0usize; natm + 2];
+    for i in 0..=natm {
+        cursor[i + 1] = cursor[i] + counts[i];
+    }
+    let mut write = cursor.clone();
+    let mut coordinates_new = vec![[0.0f64; 3]; ngrids];
+    let mut weights_new = vec![0.0f64; ngrids];
+    let mut atm_idx_new = vec![0usize; ngrids];
+    let mut quadrature_weights_new = vec![0.0f64; ngrids];
+    for g in 0..ngrids {
+        let bucket = atm_idx[g].min(natm);
+        let p = write[bucket];
+        write[bucket] += 1;
+        coordinates_new[p] = coordinates[g];
+        weights_new[p] = weights[g];
+        atm_idx_new[p] = atm_idx[g];
+        quadrature_weights_new[p] = quadrature_weights[g];
+    }
+    (coordinates_new, weights_new, atm_idx_new, quadrature_weights_new)
+}
+
 impl<'a> NIMatmul<'a> {
-    /// Creates a new instance with the given integral engine, grid coordinates, and weights.
-    pub fn new(cint: &CInt, coords: &[[f64; 3]], weights: &[f64]) -> Self {
+    /// Creates a new instance with the given integral engine, grid coordinates/weights and the
+    /// per-grid atom attribution and pre-partition quadrature weights (see the struct fields).
+    pub fn new(
+        cint: &CInt,
+        coords: &[[f64; 3]],
+        weights: &[f64],
+        atm_idx: &[usize],
+        quadrature_weights: &[f64],
+    ) -> Self {
         assert!(coords.len() == weights.len(), "Number of coordinates must match number of weights");
+        assert!(coords.len() == atm_idx.len(), "Number of coordinates must match length of atm_idx");
+        assert!(
+            coords.len() == quadrature_weights.len(),
+            "Number of coordinates must match number of quadrature weights"
+        );
         let nchunk = 1536;
         let nbatch = nchunk * 1 * rayon::current_num_threads();
         Self {
             cint: cint.clone(),
             coords: coords.to_vec(),
             weights: weights.to_vec(),
+            atm_idx: atm_idx.to_vec(),
+            quadrature_weights: quadrature_weights.to_vec(),
             cache_tensor: HashMap::new(),
             nchunk,
             nbatch,
@@ -64,6 +135,8 @@ impl<'a> NIMatmul<'a> {
             cint: self.cint.clone(),
             coords: self.coords.clone(),
             weights: self.weights.clone(),
+            atm_idx: self.atm_idx.clone(),
+            quadrature_weights: self.quadrature_weights.clone(),
             cache_tensor: HashMap::new(),
             nchunk: self.nchunk,
             nbatch: self.nbatch,
@@ -81,6 +154,8 @@ impl<'a> NIMatmul<'a> {
         let mut new = self.duplicate();
         new.coords = self.coords[start..end].to_vec();
         new.weights = self.weights[start..end].to_vec();
+        new.atm_idx = self.atm_idx[start..end].to_vec();
+        new.quadrature_weights = self.quadrature_weights[start..end].to_vec();
         // if AO cached for the full grid exists, slice and cache the AO for the batch
         let mut cached_tensors = HashMap::new();
         for keys in self.cache_tensor.keys() {
