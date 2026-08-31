@@ -250,3 +250,49 @@ fn test_exchange_coeff_route_matches_dm() {
     }}
     let _ = nao2;
 }
+
+/// B-block exchange derivation (ao_kernel_block `is_b` branch):
+///   C_occᵀ·K[Pᵀ]·C_vir  ==  (C_virᵀ·K[P]·C_occ)ᵀ
+/// i.e. the transpose-identity formula vs the literal transposed-density route.
+/// Holds because each M_Q is symmetric (K[Pᵀ] = K[P]ᵀ).
+#[test]
+fn test_b_exchange_transpose_identity() {
+    let nao = 6; let occ = 3; let vir = 4; let naux = 4;
+    let rimatr = synthetic_rimatr(nao, naux);
+    let (ri3fn, _, _) = rimatr.as_ref().unwrap();
+    let device = DeviceBLAS::default();
+    let cderi = ri3fn.to_rstsr_view(&device);
+    let c_occ = MatrixFull::from_vec([nao, occ], pseudo(nao * occ, 21.0)).unwrap();
+    let c_vir = MatrixFull::from_vec([nao, vir], pseudo(nao * vir, 22.0)).unwrap();
+    let p = MatrixFull::from_vec([nao, nao], pseudo(nao * nao, 23.0)).unwrap();
+    let p_t = p.clone().transpose_and_drop();
+
+    // literal route: K[Pᵀ] contracted as C_occᵀ K C_vir
+    let k_pt = get_vk_ri_incore_dm(
+        cderi.view(),
+        vec![p_t].as_slice().to_rstsr(&device).view(),
+        naux,
+    );
+    let k_pt_m = MatrixFull::from_vec([nao, nao], k_pt.raw()[..nao * nao].to_vec()).unwrap();
+    let ref_b = contract_back(&k_pt_m, &c_occ, &c_vir, occ, vir);
+
+    // new derivation: K[P], then (C_virᵀ K C_occ)ᵀ with the swapped-role contraction
+    let k_p = get_vk_ri_incore_dm(
+        cderi.view(),
+        vec![p].as_slice().to_rstsr(&device).view(),
+        naux,
+    );
+    let k_p_m = MatrixFull::from_vec([nao, nao], k_p.raw()[..nao * nao].to_vec()).unwrap();
+    let cv = contract_back(&k_p_m, &c_vir, &c_occ, vir, occ); // flat a + i*vir
+
+    let mut max_d = 0.0_f64;
+    for i in 0..occ {
+        for a in 0..vir {
+            let d = (cv[a + i * vir] - ref_b[i + a * occ]).abs();
+            if d > max_d {
+                max_d = d;
+            }
+        }
+    }
+    assert!(max_d < 1e-10, "B-block exchange identity violated: max|D| = {max_d:e}");
+}

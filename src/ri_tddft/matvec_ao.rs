@@ -154,16 +154,14 @@ fn get_j_ao_batched(scf: &SCF, p_block: &[MatrixFull<f64>]) -> MatrixFull<f64> {
 /// (SVD is per-vector, so it cannot be batched): loops per vector and stacks.
 ///
 /// Returns `[nao*nao, m]` (column $\mathbb{A}$ = flattened K, matching
-/// `f_fxc_block`). `swap` selects the B-block form $K[D^{\mathbb{A}\top}]$: the
-/// exact route uses the transposed `p_block` directly, and the low-rank route
-/// swaps occ/vir coefficients and takes the transposed amplitude (since
-/// $D^{\mathrm{T}} = C^{\mathrm{vir}} z^{\mathrm{T}} (C^{\mathrm{occ}})^{\mathrm{T}}$).
+/// `f_fxc_block`). Always evaluates $K[D^{\mathbb{A}}]$ with the untransposed
+/// density; the B-block exchange is derived by the caller from the identity
+/// $K[D^{\mathrm{T}}] = K[D]^{\mathrm{T}}$ (each $M_Q$ is symmetric).
 fn get_k_ao_batched(
     scf: &SCF,
     ao_data: &TDDFTData,
     z_block: &MatrixFull<f64>,
     p_block: &[MatrixFull<f64>],
-    swap: bool,
 ) -> MatrixFull<f64> {
     let tddft_ctrl = scf.mol.ctrl.tddft.as_ref();
     let driver = tddft_ctrl.map_or("dm", |t| {
@@ -192,26 +190,15 @@ fn get_k_ao_batched(
             //   CX_s = C_vir · X_sᵀ  (nao × occ), so that P_s = CX_s · C_occᵀ holds
             //   exactly (rank ≤ nocc, no SVD needed), and
             //   K_s = Σ_Q (M_Q CX_s)(M_Q C_occ)ᵀ  via ri_jk::get_vk_ri_incore_coeff_pair.
-            // B block (swap): since every M_Q is symmetric, K[Pᵀ] = K[P]ᵀ — fold the
-            // A-side amplitudes and transpose the result (never refold at k = nvir).
+            // The fold always uses the A-side amplitude (never refolds at k = nvir);
+            // K[Pᵀ] = K[P]ᵀ is exploited by transposing the output below.
             let c_vir_v = ao_data.c_vir.as_ref().unwrap().to_rstsr_view(&device);
             let c_occ_v = ao_data.c_occ.as_ref().unwrap().to_rstsr_view(&device);
-            // x_t [vir, occ, m]: per-set Xᵀ (un-transposing the swapped amplitudes)
-            let dim_z = if swap { vir_size * occ_size } else { occ_size * vir_size };
-            let mut x_t = vec![0.0_f64; vir_size * occ_size * m];
-            for s in 0..m {
-                for a in 0..vir_size {
-                    for i in 0..occ_size {
-                        let v = if swap {
-                            z_block.data[a + i * vir_size + s * dim_z]
-                        } else {
-                            z_block.data[i + a * occ_size + s * dim_z]
-                        };
-                        x_t[a + i * vir_size + s * vir_size * occ_size] = v;
-                    }
-                }
-            }
-            let x_tsr = rt::asarray((x_t, [vir_size, occ_size, m].f(), &device));
+            // x_t [vir, occ, m]: the amplitudes in [vir, occ] order per set
+            // (per-set transpose of the [occ, vir] columns).
+            let x_tsr = rt::asarray((&z_block.data, [occ_size, vir_size, m].f(), &device))
+                .swapaxes(0, 1)
+                .into_contig(FlagOrder::F);
             // CX block [nao, occ, m]
             let mut cx = rt::zeros(([nao, occ_size, m].f(), &device));
             for s in 0..m {
@@ -220,20 +207,12 @@ fn get_k_ao_batched(
             let ks = crate::ri_jk::pure_incore::get_vk_ri_incore_coeff_pair(
                 cderi, cx.view(), c_occ_v.view(), naux,
             );
-            // The fold always produces K[Pᵀ] (= K[C_vir Xᵀ C_occᵀ]). The A block
-            // expects K[P] → transpose; the B block expects K[Pᵀ] → as-is.
+            // The fold always produces K[Pᵀ] (= K[C_vir Xᵀ C_occᵀ]); transpose
+            // each set (axis swap (mu,nu)->(nu,mu)) to return K[P].
+            let ks_out = ks.swapaxes(0, 1).into_contig(FlagOrder::F);
             for s in 0..m {
-                if !swap {
-                    // out[c + r·nao] = K[r + c·nao]  (transpose)
-                    for r in 0..nao {
-                        for c in 0..nao {
-                            out.data[s * nao * nao + c + r * nao] = ks[[r, c, s]];
-                        }
-                    }
-                } else {
-                    for (r, v) in ks.i((.., .., s)).iter().enumerate() {
-                        out.data[s * nao * nao + r] = *v;
-                    }
+                for (r, v) in ks_out.i((.., .., s)).iter().enumerate() {
+                    out.data[s * nao * nao + r] = *v;
                 }
             }
         }
@@ -243,9 +222,8 @@ fn get_k_ao_batched(
             let c_vir_v = ao_data.c_vir.as_ref().unwrap().to_rstsr_view(&device);
             for s in 0..m {
                 let z_col: Vec<f64> = (0..z_block.size[0]).map(|r| z_block[[r, s]]).collect();
-                let (n1, n2) = if swap { (vir_size, occ_size) } else { (occ_size, vir_size) };
-                let z_mat = MatrixFull::from_vec([n1, n2], z_col).unwrap();
-                let (c_left, c_right) = if swap { (c_vir_v.view(), c_occ_v.view()) } else { (c_occ_v.view(), c_vir_v.view()) };
+                let z_mat = MatrixFull::from_vec([occ_size, vir_size], z_col).unwrap();
+                let (c_left, c_right) = (c_occ_v.view(), c_vir_v.view());
                 let k2 = crate::ri_jk::pure_incore::get_vk_ri_incore_dm_lowrank(
                     cderi.view(),
                     c_left,
@@ -439,16 +417,10 @@ fn fxc_mo_matvec(
     // Set-stacked amplitudes: Z_stack[(s*nocc+i), b] = z_s[i,b] — built ONCE per call,
     // so the per-(chunk, set) z re-assembly disappears and every GEMM below runs with
     // N = m*nocc (fat on both axes).
-    let mut z_stack_vec = vec![0.0_f64; m * occ_size * vir_size];
-    for s in 0..m {
-        for b in 0..vir_size {
-            for i in 0..occ_size {
-                // f-order [m*nocc, nvir]: idx = row + col*nrow
-                z_stack_vec[s * occ_size + i + b * (m * occ_size)] = z_block[[i + b * occ_size, s]];
-            }
-        }
-    }
-    let z_stack = rt::asarray((z_stack_vec, [m * occ_size, vir_size].f(), device));
+    let z_stack = rt::asarray((&z_block.data, [occ_size, vir_size, m].f(), device))
+        .swapaxes(1, 2)
+        .into_contig(FlagOrder::F)
+        .into_shape([m * occ_size, vir_size]);
     // semitrans: fold C_vir into the amplitude side.
     let ztilde_stack = if st {
         let c_vir_v = c_vir.to_rstsr_view(device);
@@ -767,24 +739,10 @@ fn ao_kernel_block(
     add_ns(&T_J, t0);
 
     let t0 = Instant::now();
+    // K[P] with the untransposed density for BOTH blocks; the B-block exchange
+    // is derived below via K[Pᵀ] = K[P]ᵀ (each M_Q symmetric).
     let k_block = if alpha_hybrid.abs() > 1e-15 {
-        if is_b {
-            // B block: K[Pᵀ] via the transposed density and amplitude matrix
-            // (implements the (ib|aj) index ordering of B).
-            let p_block_t: Vec<MatrixFull<f64>> =
-                p_block.iter().map(|p| p.clone().transpose_and_drop()).collect();
-            let mut z_block_t = MatrixFull::new([dim, m], 0.0);
-            for s in 0..m {
-                for i in 0..occ_size {
-                    for a in 0..vir_size {
-                        z_block_t[[a + i * vir_size, s]] = z_block[[i + a * occ_size, s]];
-                    }
-                }
-            }
-            Some(get_k_ao_batched(scf, ao_data, &z_block_t, &p_block_t, true))
-        } else {
-            Some(get_k_ao_batched(scf, ao_data, z_block, &p_block, false))
-        }
+        Some(get_k_ao_batched(scf, ao_data, z_block, &p_block))
     } else {
         None
     };
@@ -800,9 +758,11 @@ fn ao_kernel_block(
                 f_total.data[idx] += coulomb_factor * jb.data[base + idx];
             }
         }
-        if let Some(kb) = &k_block {
-            for idx in 0..nao * nao {
-                f_total.data[idx] -= alpha_hybrid * kb.data[base + idx];
+        if !is_b {
+            if let Some(kb) = &k_block {
+                for idx in 0..nao * nao {
+                    f_total.data[idx] -= alpha_hybrid * kb.data[base + idx];
+                }
             }
         }
         if let Some(fb) = &f_fxc_block {
@@ -814,6 +774,30 @@ fn ao_kernel_block(
         let kernel_mo = contract_back(&f_total, ao_data.c_occ.as_ref().unwrap(), ao_data.c_vir.as_ref().unwrap(), occ_size, vir_size);
         for r in 0..dim {
             result[[r, s]] += kernel_mo[r];
+        }
+        if is_b {
+            // B-block exchange: -alpha (C_virᵀ K C_occ)ᵀ  (from K[Pᵀ] = K[P]ᵀ,
+            // M_Q symmetric). contract_back with swapped roles gives C_virᵀ K C_occ
+            // at flat index a + i*vir; the transpose to [i + a*occ] is the loop.
+            if let Some(kb) = &k_block {
+                let k_col = MatrixFull::from_vec(
+                    [nao, nao],
+                    kb.data[base..base + nao * nao].to_vec(),
+                )
+                .unwrap();
+                let k_mo_v = contract_back(
+                    &k_col,
+                    ao_data.c_vir.as_ref().unwrap(),
+                    ao_data.c_occ.as_ref().unwrap(),
+                    vir_size,
+                    occ_size,
+                );
+                for a in 0..vir_size {
+                    for i in 0..occ_size {
+                        result[[i + a * occ_size, s]] -= alpha_hybrid * k_mo_v[a + i * vir_size];
+                    }
+                }
+            }
         }
         if let Some(fm) = &fxc_mo_block {
             // "mo" fxc is already in MO amplitudes
