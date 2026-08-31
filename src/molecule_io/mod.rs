@@ -15,7 +15,7 @@ use rest_libcint::{CINTR2CDATA, CintType};
 use rest_tensors::{ERIFull,RIFull,ERIFold4,TensorSlice,TensorSliceMut,TensorOpt, MatrixUpper, MatrixFull};
 use tensors::{BasicMatrix, SubMatrixUpper};
 use tensors::external_libs::{matr_copy_from_ri};
-use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _power_rayon_for_symmetric_matrix};
+use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dtrtrs, _power_rayon_for_symmetric_matrix};
 use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -2941,7 +2941,18 @@ impl Molecule {
             let my_rank = mpi_op.rank;
 
             if my_rank == 0 {println!("debug: enter the generation of inv_aux_matr")};
-            let aux_v = self.prepare_inv_aux_matr();
+            // Build the J factor following the `j2c_decomp` policy, so that the
+            // distributed rimatr is mathematically identical to the serial one
+            // (`generate_rimatr_bare`); a fixed eigen power here would mismatch the
+            // Cholesky branch of the analytical gradient when `policy = "cholesky"`.
+            // The factorization (O(naux^3) and the full J integral) is computed only
+            // on rank 0 and broadcast, mirroring `diagonalize_hamiltonian_outside`.
+            let mut aux_v = MatrixFull::new([n_auxbas, n_auxbas], 0.0);
+            if my_rank == 0 {
+                let j2c = self.int_ij_aux_columb();
+                aux_v = crate::mpi_io::prepare_j2c_solve_factor(&j2c, &self.ctrl.j2c_decomp);
+            }
+            crate::mpi_io::mpi_broadcast_matrixfull(&mpi_op.world, &mut aux_v, 0);
             if my_rank == 0 {println!("debug: leave the generation of inv_aux_matr")};
             let (basbas2baspar, baspar2basbas) = self.prepare_baspair_map();
             if let (Some(auxbas_distribution), Some(baspar_distribution)) = 
@@ -3119,7 +3130,23 @@ impl Molecule {
 
         let mut ri3fn = MatrixFull::new([loc_n_baspar, n_auxbas],0.0);
         omp_set_num_threads_wrapper(self.ctrl.num_threads.unwrap());
-        _dgemm_full(&tmp_ri3fn, 'T', aux_v, 'N', &mut ri3fn, 1.0, 0.0);
+        // Solve against the metric factor following the `j2c_decomp` policy:
+        // - Cd:   cderi = j3c · L^{-T}  ⟺  U^T · X = tmp_ri3fn  (in-place triangular
+        //         solve with the upper Cholesky factor U, then ri3fn = X^T)
+        // - Eig:  cderi = j3c · J^{-1/2} via the dense matrix multiplication
+        let mut tmp_ri3fn = tmp_ri3fn;
+        match self.ctrl.j2c_decomp.policy {
+            crate::ri_jk::J2CDecompPolicy::Cd => {
+                assert!(
+                    _dtrtrs(aux_v, &mut tmp_ri3fn, 'U', 'T', 'N'),
+                    "The triangular solve against the Cholesky factor of the 2c-2e metric failed."
+                );
+                ri3fn = tmp_ri3fn.transpose();
+            },
+            _ => {
+                _dgemm_full(&tmp_ri3fn, 'T', aux_v, 'N', &mut ri3fn, 1.0, 0.0);
+            },
+        }
 
         ri3fn
 
