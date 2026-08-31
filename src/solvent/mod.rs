@@ -98,7 +98,7 @@ pub struct PcmObjectCfg {
     pub solvent_descriptors: [f64; 8],
     /// SMD solvent type: 1 = water (ICDS=1, pre-tabulated sigma), 2 = non-aqueous (ICDS=2).
     pub icds: i32,
-    /// SMD 腔体/CDS 半径方案（bondi 默认 / uff_mixed，见 `SmdCavityRadii`）。
+    /// SMD cavity/CDS radii scheme (bondi default / uff_mixed, see `SmdCavityRadii`).
     pub smd_cavity_radii: SmdCavityRadii,
 }
 

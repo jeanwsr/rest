@@ -2086,10 +2086,11 @@ fn cds_eg(
 /// - `coords`: Cartesian coordinates `[nat][3]` in **Bohr**
 /// - `icds`: solvent type — 1 = water, 2 = non-aqueous
 /// - `solvent_descriptors`: `[n, n25, α, β, γ, ε, φ, ψ]` (only used when icds=2)
-/// - `smd_cavity_radii`: SMD 半径方案：
-///   - `Bondi`（默认）：全部元素 `BONDI[z] + 0.4`（mnsol.F `VDWRAD`，对齐 PySCF）
-/// - `BondiUff`：eq.16 11 元素仍用 `BONDI[z]`；其余元素用
-///     `BONDI_UFF_RADII[z]*BOHR`（G16 实测表，bohr→Å），表中 0（Z≥87 未实测）回退 `BONDI[z]`
+/// - `smd_cavity_radii`: SMD radii scheme:
+///   - `Bondi` (default): all elements use `BONDI[z] + 0.4` (mnsol.F `VDWRAD`, aligned with PySCF)
+///   - `BondiUff`: the 11 eq.16 elements keep `BONDI[z]`; other elements use
+///     `BONDI_UFF_RADII[z]*BOHR` (measured table, bohr→Å); zero entries (Z≥87 unmeasured)
+///     fall back to `BONDI[z]`
 ///
 /// # Returns
 /// - `gcds`: CDS free energy (Hartree)
@@ -2120,9 +2121,10 @@ pub fn compute_cds(
         )
     };
 
-    // Effective radius: Bondi 方案全部元素 BONDI[z]+0.4（现状）；
-    // BondiUff 方案 eq.16 元素仍用 BONDI，其余用 BONDI_UFF_RADII（bohr→Å，×BOHR），0 值回退 BONDI。
-    // 注意: REST 的 BOHR = 0.529177 Å/bohr, bohr→Å 用乘法。
+    // Effective SASA sphere radius per atom: `rad[k] = R_base(Z_k) + 0.4 Å` (solvent probe).
+    // Bondi scheme: R_base = BONDI[Z] (mnsol.F VDWRAD, legacy).
+    // BondiUff scheme: eq.16 elements keep BONDI[Z]; others use BONDI_UFF_RADII[Z]*BOHR
+    // (bohr→Å via REST BOHR = 0.529177 Å/bohr, multiplication); 0 entry falls back to BONDI[Z].
     let rad: Vec<f64> = atomic_numbers.iter()
         .map(|&z| {
             let base = match smd_cavity_radii {

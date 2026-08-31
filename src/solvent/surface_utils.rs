@@ -86,15 +86,16 @@ impl<'d> Deserialize<'d> for RadiusScheme {
 //  SMD-specific cavity radii (eq. 16, Marenich et al. JPCB 2009)
 // =============================================================================
 
-/// SMD 腔体/CDS 半径方案（`smd_cavity_radii` 关键词，默认 bondi）。
+/// SMD cavity/CDS radii scheme, selected by the `smd_cavity_radii` keyword (default `Bondi`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub enum SmdCavityRadii {
-    /// 现状（默认）：静电腔体回退 `VDW_RADII`（PySCF 混合表），CDS 用 `BONDI` 全表——
-    /// 与 PySCF / NWChem mnsol.F 对齐。
+    /// Legacy behavior (default): electrostatic fallback uses `VDW_RADII` (PySCF mixed table),
+    /// CDS uses the full `BONDI` table — aligned with PySCF / NWChem mnsol.F.
     #[default]
     Bondi,
-    /// 非 eq.16 元素改用 `constants::solvent::BONDI_UFF_RADII`（Bondi 1964 ∪ 独立取值 ∪ UFF
-    /// 补缺，实测自 G16 B.01 SMD 输出）；eq.16 11 元素仍走各自原路径。
+    /// Non-eq.16 elements use `constants::solvent::BONDI_UFF_RADII`
+    /// (Bondi 1964 values ∪ unclassified values ∪ UFF fill-in, measured 2026-08);
+    /// the 11 eq.16 elements keep their original paths (eq.16 intrinsic / `BONDI`).
     BondiUff,
 }
 
@@ -138,8 +139,8 @@ const SMD_RADII_ANG: [f64; 104] = {
 /// ```
 /// All other specialized elements (H, C, N, F, Si, P, S, Cl, Br, I) use
 /// fixed SMD values. Unparameterized elements fall back per `scheme`:
-/// - `Bondi`: `VDW_RADII`（PySCF 混合表，现状）
-/// - `BondiUff`: `BONDI_UFF_RADII`（G16 实测表；表中 0 值回退 `VDW_RADII`，Z≥55 未实测）
+/// - `Bondi`: `VDW_RADII` (PySCF mixed table, legacy)
+/// - `BondiUff`: `BONDI_UFF_RADII` (measured table; zero entries, e.g. Z≥87, fall back to `VDW_RADII`)
 ///
 /// Returns radii in **Bohr**.
 pub fn smd_radii(
@@ -161,7 +162,7 @@ pub fn smd_radii(
             match scheme {
                 SmdCavityRadii::Bondi => data::VDW_RADII[z], // fallback to PySCF mixed table (Bohr)
                 SmdCavityRadii::BondiUff => {
-                    // G16 实测表; 表中 0 (Z≥87 未实测或异常) 回退 VDW_RADII 保底
+                    // measured table in bohr; 0 entry (Z≥87 unmeasured or invalid) → fall back
                     if z < data::BONDI_UFF_RADII.len() && data::BONDI_UFF_RADII[z] > 0.0 {
                         data::BONDI_UFF_RADII[z]
                     } else {

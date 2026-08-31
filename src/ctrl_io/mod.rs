@@ -266,8 +266,8 @@ pub struct InputKeywords {
     pub solvent_model: PcmMethod,
     pub solv_chunk: usize,
     pub pcm_cavity_radii: RadiusScheme,
-    /// SMD 腔体/CDS 半径方案: "bondi" (默认, 对齐 PySCF/mnsol.F) | "uff_mixed"
-    /// (非 eq.16 元素用 BONDI_UFF_RADII 混合表, 对齐 G16 SMD 实测行为)。
+    /// SMD cavity/CDS radii scheme: "bondi" (default, aligned with PySCF/mnsol.F) | "uff_mixed"
+    /// (non-eq.16 elements use the BONDI_UFF_RADII mixed table).
     pub smd_cavity_radii: SmdCavityRadii,
     /// SMD solvent name (e.g. "water", "acetone"). Looked up in solvent_db.
     /// When non-empty and method==SMD, auto-populates solvent_descriptors and solv_epsilon.

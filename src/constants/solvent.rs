@@ -253,27 +253,28 @@ pub static UFF_RADII: [f64; 104] = [
     3.05757665,
 ];
 
-/// Gaussian 16 SMD 默认回退半径表 (bohr, 1-indexed: BONDI_UFF_RADII[Z] = radius for element Z,
-/// 索引 0 未使用), 供 `SmdCavityRadii::BondiUff` 模式使用。
+
+/// SMD default fallback radii for non-eq.16 elements, in **bohr** (1-indexed: `BONDI_UFF_RADII[Z]`
+/// = radius of element Z; index 0 unused). Consumed by `SmdCavityRadii::BondiUff`.
 ///
-/// 来源: 2026-08-30 对 54 个单原子 (B3LYP/def2TZVPP, SCRF=(SMD,Solvent=ethanol), G16 B.01)
-/// 的实测反推 (输出在 test/gau-test/result/zXX_*.out), 即 Gaussian SMD 静电腔体 (SMD-Coulomb)
-/// 与 CDS 对 **非 eq.16 元素** 的默认回退半径。
+/// Role in the SMD model (radii scheme `uff_mixed`):
+/// ```text
+/// R_sasa[Z] = BONDI_UFF_RADII[Z] × BOHR + 0.4 Å     (CDS accessible-sphere radius)
+/// R_cav[Z]  = BONDI_UFF_RADII[Z]                     (electrostatic cavity radius, bohr)
+/// ```
+/// where `BOHR = 0.529177 Å/bohr` converts bohr → Å (multiplication).
 ///
-/// 构成: **Bondi 1964 值 (Table I/XIV) ∪ 独立取值 (Be/B/Al/Ge/K, 非 Bondi 非 UFF) ∪ UFF 补缺**
-/// (详见 read_md/smd_cds_parameters.md §6.3)。
+/// Composition (measured 2026-08, single-atom SMD scans, see read_md/smd_cds_parameters.md §6.3):
+/// Bondi 1964 values (Table I/XIV) ∪ unclassified values (Be/B/Al/Ge/K, of textbook origin)
+/// ∪ UFF fill-in. **Not** the UFF table itself; identical to `UFF_RADII` only for 31 elements.
 ///
-/// 约定:
-/// - **eq.16 11 元素 (H,C,N,O,F,Si,P,S,Cl,Br,I) 位置填 0** —— 特殊原子不查此表
-///   (静电腔体走 eq.16 特化值, CDS 走 mnsol.F `BONDI` 表)。
-/// - **Z = 55–86 已实测** (2026-08-31, 18 个元素): Cs Ba La Hf Ta W Re Os Ir Pt Au Hg Tl Pb
-///   Bi Po At Rn。其中 13 个 = REST `UFF_RADII` (Cs Ba La Hf Ta W Re Os Ir Bi Po At Rn),
-///   **Pt/Au/Hg/Tl/Pb = Bondi 1964 Table XIV 原文值** (Pt 1.75/1.72d, Au 1.66, Hg 1.55,
-///   Tl 1.96, Pb 2.02, 非 UFF 但非独立取值), 输出在 test/gau-test/z55_104/。
-/// - **Z ≥ 87 填 0 (未实测)** —— Gaussian 内置 def2-TZVPP 无基组 (Ce–Lu 除 La、Fr 及以后
-///   均报 Atomic number out of range in Df2TZV), REST 基组池亦无镧系/锕系基组;
-///   调用方应回退到原 bondi 路径 (VDW_RADII / BONDI)。
-/// - CDS 使用时 SASA 半径 = 表值 + 0.4 Å 探针 (换算系数在调用处处理)。
+/// Conventions:
+/// - **eq.16 elements (H,C,N,O,F,Si,P,S,Cl,Br,I) are 0**: special atoms never look up this table
+///   (electrostatic cavity uses eq.16 intrinsic radii; CDS uses the mnsol.F `BONDI` table).
+/// - **Z = 55–86 measured** (18 elements: Cs Ba La Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn);
+///   Pt/Au/Hg/Tl/Pb equal Bondi 1964 Table XIV values.
+/// - **Z ≥ 87 are 0 (unmeasured)**: no basis set available in the built-in pool; callers must
+///   fall back to the original bondi path (`VDW_RADII` / `BONDI`).
 pub static BONDI_UFF_RADII: [f64; 104] = [
     0.0000000000e+00, 0.0000000000e+00, 2.6456165745e+00, 3.4393015468e+00, 2.7401028807e+00, 3.4015070243e+00, 0.0000000000e+00, 0.0000000000e+00,
     0.0000000000e+00, 0.0000000000e+00, 2.9101782319e+00, 4.2896783029e+00, 3.2692261956e+00, 4.3463700866e+00, 0.0000000000e+00, 0.0000000000e+00,
