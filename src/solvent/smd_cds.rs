@@ -74,7 +74,9 @@
 
 use std::f64::consts::PI;
 use tensors::MatrixFull;
+use crate::constants::solvent as data;
 use crate::constants::{BOHR, HARTREE2KCAL};
+use super::surface_utils::SmdCavityRadii;
 
 // ============================================================================
 //  Debug printing helper (controlled by env var REST_CDS_DEBUG=1)
@@ -2084,6 +2086,10 @@ fn cds_eg(
 /// - `coords`: Cartesian coordinates `[nat][3]` in **Bohr**
 /// - `icds`: solvent type — 1 = water, 2 = non-aqueous
 /// - `solvent_descriptors`: `[n, n25, α, β, γ, ε, φ, ψ]` (only used when icds=2)
+/// - `smd_cavity_radii`: SMD 半径方案：
+///   - `Bondi`（默认）：全部元素 `BONDI[z] + 0.4`（mnsol.F `VDWRAD`，对齐 PySCF）
+/// - `BondiUff`：eq.16 11 元素仍用 `BONDI[z]`；其余元素用
+///     `BONDI_UFF_RADII[z]*BOHR`（G16 实测表，bohr→Å），表中 0（Z≥87 未实测）回退 `BONDI[z]`
 ///
 /// # Returns
 /// - `gcds`: CDS free energy (Hartree)
@@ -2094,6 +2100,7 @@ pub fn compute_cds(
     coords: &[[f64; 3]],
     icds: i32,
     solvent_descriptors: &[f64; 8],
+    smd_cavity_radii: SmdCavityRadii,
 ) -> (f64, f64, Vec<[f64; 3]>) {
     let nat = atomic_numbers.len();
     let mut sigma = [0.0f64; 151];
@@ -2113,9 +2120,25 @@ pub fn compute_cds(
         )
     };
 
-    // Effective radius = Bondi vdW + 0.4 Å solvent probe
+    // Effective radius: Bondi 方案全部元素 BONDI[z]+0.4（现状）；
+    // BondiUff 方案 eq.16 元素仍用 BONDI，其余用 BONDI_UFF_RADII（bohr→Å，×BOHR），0 值回退 BONDI。
+    // 注意: REST 的 BOHR = 0.529177 Å/bohr, bohr→Å 用乘法。
     let rad: Vec<f64> = atomic_numbers.iter()
-        .map(|&z| if z < 103 { BONDI[z] } else { 0.0 } + 0.4)
+        .map(|&z| {
+            let base = match smd_cavity_radii {
+                SmdCavityRadii::Bondi => BONDI[z.min(102)],
+                SmdCavityRadii::BondiUff => {
+                    if natcnv(z) != 0 {
+                        BONDI[z.min(102)]
+                    } else if z < data::BONDI_UFF_RADII.len() && data::BONDI_UFF_RADII[z] > 0.0 {
+                        data::BONDI_UFF_RADII[z] * BOHR
+                    } else {
+                        BONDI[z.min(102)]
+                    }
+                }
+            };
+            base + 0.4
+        })
         .collect();
 
     let (gcds_kcal, tarea, dcds) = cds_eg(

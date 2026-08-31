@@ -19,6 +19,7 @@ use crate::utilities;
 // use rayon::ThreadPoolBuilder;
 use crate::scf_io::occupation::OCCType;
 use tensors::matrix_blas_lapack::omp_set_num_threads_global_wrapper;
+use crate::solvent::surface_utils::SmdCavityRadii;
 use crate::solvent::{PcmMethod, RadiusScheme};
 use crate::x2c::RelativisticMethod;
 use serde_json;
@@ -265,6 +266,9 @@ pub struct InputKeywords {
     pub solvent_model: PcmMethod,
     pub solv_chunk: usize,
     pub pcm_cavity_radii: RadiusScheme,
+    /// SMD 腔体/CDS 半径方案: "bondi" (默认, 对齐 PySCF/mnsol.F) | "uff_mixed"
+    /// (非 eq.16 元素用 BONDI_UFF_RADII 混合表, 对齐 G16 SMD 实测行为)。
+    pub smd_cavity_radii: SmdCavityRadii,
     /// SMD solvent name (e.g. "water", "acetone"). Looked up in solvent_db.
     /// When non-empty and method==SMD, auto-populates solvent_descriptors and solv_epsilon.
     pub solvent_name: String,
@@ -546,6 +550,7 @@ impl InputKeywords {
             solvent_model: PcmMethod::CPCM,
             solv_chunk: 8,
             pcm_cavity_radii: RadiusScheme::UFF,
+            smd_cavity_radii: SmdCavityRadii::Bondi,
             solvent_name: String::new(),
             solvent_descriptors: None, 
             stop_at: None,
@@ -1313,6 +1318,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     serde_json::from_value(value.clone())?
                 },
                 None => RadiusScheme::UFF,
+            };
+            tmp_input.smd_cavity_radii = match tmp_ctrl.get("smd_cavity_radii") {
+                Some(value) => {
+                    serde_json::from_value(value.clone())?
+                },
+                None => SmdCavityRadii::Bondi,
             };
             let has_explicit_eps = matches!(
                 tmp_ctrl.get("solv_epsilon").unwrap_or(&serde_json::Value::Null),

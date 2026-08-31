@@ -86,6 +86,31 @@ impl<'d> Deserialize<'d> for RadiusScheme {
 //  SMD-specific cavity radii (eq. 16, Marenich et al. JPCB 2009)
 // =============================================================================
 
+/// SMD 腔体/CDS 半径方案（`smd_cavity_radii` 关键词，默认 bondi）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum SmdCavityRadii {
+    /// 现状（默认）：静电腔体回退 `VDW_RADII`（PySCF 混合表），CDS 用 `BONDI` 全表——
+    /// 与 PySCF / NWChem mnsol.F 对齐。
+    #[default]
+    Bondi,
+    /// 非 eq.16 元素改用 `constants::solvent::BONDI_UFF_RADII`（Bondi 1964 ∪ 独立取值 ∪ UFF
+    /// 补缺，实测自 G16 B.01 SMD 输出）；eq.16 11 元素仍走各自原路径。
+    BondiUff,
+}
+
+impl<'d> Deserialize<'d> for SmdCavityRadii {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'d>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_uppercase().as_str() {
+            "BONDI" => Ok(SmdCavityRadii::Bondi),
+            "UFF_MIXED" => Ok(SmdCavityRadii::BondiUff),
+            _ => Err(serde::de::Error::custom(format!("Unknown SmdCavityRadii: {}", s))),
+        }
+    }
+}
 
 /// SMD intrinsic atomic Coulomb radii (Å), indexed by atomic number Z.
 /// Unlisted elements fall back to Bondi vdW radii.
@@ -112,10 +137,16 @@ const SMD_RADII_ANG: [f64; 104] = {
 ///       1.52 + 1.8×(0.43−α)   otherwise
 /// ```
 /// All other specialized elements (H, C, N, F, Si, P, S, Cl, Br, I) use
-/// fixed SMD values. Unparameterized elements fall back to Bondi radii.
+/// fixed SMD values. Unparameterized elements fall back per `scheme`:
+/// - `Bondi`: `VDW_RADII`（PySCF 混合表，现状）
+/// - `BondiUff`: `BONDI_UFF_RADII`（G16 实测表；表中 0 值回退 `VDW_RADII`，Z≥55 未实测）
 ///
 /// Returns radii in **Bohr**.
-pub fn smd_radii(alpha: f64, atomic_numbers: &[usize]) -> Vec<f64> {
+pub fn smd_radii(
+    alpha: f64,
+    atomic_numbers: &[usize],
+    scheme: SmdCavityRadii,
+) -> Vec<f64> {
     let r_o_ang = if alpha >= 0.43 {
         1.52
     } else {
@@ -127,7 +158,17 @@ pub fn smd_radii(alpha: f64, atomic_numbers: &[usize]) -> Vec<f64> {
         } else if z < SMD_RADII_ANG.len() && SMD_RADII_ANG[z] > 0.0 {
             SMD_RADII_ANG[z] / BOHR
         } else {
-            data::VDW_RADII[z]  // fallback to Bondi (Bohr)
+            match scheme {
+                SmdCavityRadii::Bondi => data::VDW_RADII[z], // fallback to PySCF mixed table (Bohr)
+                SmdCavityRadii::BondiUff => {
+                    // G16 实测表; 表中 0 (Z≥87 未实测或异常) 回退 VDW_RADII 保底
+                    if z < data::BONDI_UFF_RADII.len() && data::BONDI_UFF_RADII[z] > 0.0 {
+                        data::BONDI_UFF_RADII[z]
+                    } else {
+                        data::VDW_RADII[z]
+                    }
+                }
+            }
         }
     }).collect()
 }

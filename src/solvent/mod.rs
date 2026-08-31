@@ -98,11 +98,19 @@ pub struct PcmObjectCfg {
     pub solvent_descriptors: [f64; 8],
     /// SMD solvent type: 1 = water (ICDS=1, pre-tabulated sigma), 2 = non-aqueous (ICDS=2).
     pub icds: i32,
+    /// SMD 腔体/CDS 半径方案（bondi 默认 / uff_mixed，见 `SmdCavityRadii`）。
+    pub smd_cavity_radii: SmdCavityRadii,
 }
 
 impl PcmObjectCfg {
-    pub fn build(method: PcmMethod, epsilon: f64, solvent_descriptors: [f64; 8], icds: i32) -> Self {
-        PcmObjectCfg { method, epsilon, solvent_descriptors, icds }
+    pub fn build(
+        method: PcmMethod,
+        epsilon: f64,
+        solvent_descriptors: [f64; 8],
+        icds: i32,
+        smd_cavity_radii: SmdCavityRadii,
+    ) -> Self {
+        PcmObjectCfg { method, epsilon, solvent_descriptors, icds, smd_cavity_radii }
     }
 }
 
@@ -113,6 +121,7 @@ impl Default for PcmObjectCfg {
             epsilon: 78.3553,
             solvent_descriptors: SMD_ERROR_DESCRIPTORS,
             icds: 0,
+            smd_cavity_radii: SmdCavityRadii::Bondi,
         }
     }
 }
@@ -1041,7 +1050,7 @@ pub fn solvent_prepare(mol: &Molecule) -> PcmObject {
                    Check solvent_descriptors or solvent_name in the control file.");
         }
     }
-    let pcmcfg = PcmObjectCfg::build(method, epsilon, descriptors, icds);
+    let pcmcfg = PcmObjectCfg::build(method, epsilon, descriptors, icds, mol.ctrl.smd_cavity_radii);
 
     // Build cavity surface
     let mut surface = SurfaceVdwGaussian::new(mol.ctrl.pcm_cavity_radii, &mol.geom);
@@ -1049,7 +1058,7 @@ pub fn solvent_prepare(mol: &Molecule) -> PcmObject {
         // SMD uses intrinsic atomic Coulomb radii (eq. 16, Marenich 2009),
         // no vdW scaling (scale = 1.0)
         let alpha = descriptors[2]; // H-bond acidity
-        surface.cfg.atom_radii = Some(smd_radii(alpha, &surface.atomic_num));
+        surface.cfg.atom_radii = Some(smd_radii(alpha, &surface.atomic_num, mol.ctrl.smd_cavity_radii));
         surface.cfg.vdw_scale = Some(1.0);
     }
     surface.build();
@@ -1075,7 +1084,13 @@ pub fn compute_cds_from_surface(
             surface.atom_coords[[2, i]],
         ];
     }
-    smd_cds::compute_cds(&atomic_numbers, &coords, cfg.icds, &cfg.solvent_descriptors)
+    smd_cds::compute_cds(
+        &atomic_numbers,
+        &coords,
+        cfg.icds,
+        &cfg.solvent_descriptors,
+        cfg.smd_cavity_radii,
+    )
 }
 
 
