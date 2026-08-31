@@ -188,6 +188,8 @@ impl MPIData {
         let local_range = &distribute_vec[self.rank];
         let local_coordinates = grids.coordinates[local_range.clone()].to_vec();
         let local_weights = grids.weights[local_range.clone()].to_vec();
+        let local_atm_idx = grids.atm_idx[local_range.clone()].to_vec();
+        let local_quadrature_weights = grids.quadrature_weights[local_range.clone()].to_vec();
         self.grids = Some(distribute_vec);
 
         let parallel_balancing = balancing(local_coordinates.len(), rayon::current_num_threads());
@@ -201,6 +203,8 @@ impl MPIData {
             ao_cutoff: grids.ao_cutoff,
             ao_compressed: None,
             aop_compressed: None,
+            atm_idx: local_atm_idx,
+            quadrature_weights: local_quadrature_weights,
         }
         
     }
