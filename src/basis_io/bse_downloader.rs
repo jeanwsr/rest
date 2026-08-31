@@ -487,8 +487,10 @@ pub fn ctrl_element_checker(cell: &GeomCell) -> Vec<String> {
 
 #[test]
 fn local_test() {
-    let rest_home = std::env::var("REST_HOME").expect("The environment variable REST_HOME is not set.");
-    let mut file_path = path::PathBuf::from(rest_home).join("rest/basis-set-pool/cc-pVTZ");
+    // resolve relative to the crate root (CARGO_MANIFEST_DIR) so the test does
+    // not depend on any machine-specific location or environment variable
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let file_path = path::PathBuf::from(manifest_dir).join("basis-set-pool/cc-pVTZ");
     local_element_checker(&file_path.to_string_lossy().to_string());
 }    
 //passed
@@ -497,7 +499,8 @@ fn local_test() {
 /* 
 #[test]
 fn modifier() {
-    let basis_path = String::from("/share/home/tygao/REST/BasisSets/cc-pVTZ/Cl.json");
+    // example only; update the path to a local basis-set file before use
+    let basis_path = String::from("basis-set-pool/cc-pVTZ/Cl.json");
     basis_modifier(&basis_path);
 }
  */
@@ -515,8 +518,10 @@ fn identifier() {
 
 #[test]
 fn final_test1() {
-    //let tmp_path = String::from("/share/home/tygao/REST/BasisSets/cc-pVTZ");
-    let tmp_path = String::from("/home/igor/Documents/Package-Pool/rest_workspace/rest/basis-set-pool/def2-TZVP");
+    // path is resolved relative to the crate root (CARGO_MANIFEST_DIR) so the
+    // test does not depend on any machine-specific location
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let tmp_path = format!("{}/basis-set-pool/def2-TZVP", manifest_dir);
     let cint_type = CintType::Spheric;
     let atm_elem = String::from("Au");
     let re = Regex::new(r"/{1}[^/]*$").unwrap();

@@ -46,7 +46,7 @@ reqwest = { version = "0.10", default-features = false, features = ["blocking", 
 mpi = {version = "0.8", features = ["user-operations", "derive"], optional = true}
 # for cuda
 #cudarc = "0.10.0"
-rest_tensors = {path="../rest_tensors", default = false, features = []}
+rest_tensors = {path="../rest_tensors", default-features = false}
 rest_libcint = {path="../rest_libcint"}
 #liblbfgs = {path="../rust-lbfgs"}
 liblbfgs = "0.1.0"
@@ -78,7 +78,7 @@ features = ["generate-import-lib"]
 #rustdoc-args = [
 #    "--html-in-header",
 #    #".cargo/registry/src/github.com-1ecc6299db9ec823/katex-doc-0.1.0/katex.html",
-#    "/share/home/tygao/REST3.0/rest/katex.html",
+#    (example) "/path/to/rest/katex.html",
 #]
 
 [dev-dependencies]
@@ -92,7 +92,7 @@ dftd4 = ["dep:dftd4"]
 geometric-pyo3 = ["dep:geometric-pyo3"]
 openblas = []
 intel-mkl = []
-scalapack = ["rest_tensors/scalapack"]
+scalapack = ["rest_tensors/scalapack", "rest_tensors/mpi"]
 
 #[[bench]]
 #name = "bench_tensors"

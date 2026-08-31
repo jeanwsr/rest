@@ -5,6 +5,11 @@ use std::ops::{Range, Add, Sub, Mul, Div, AddAssign, SubAssign, MulAssign, DivAs
 #[cfg(feature = "mpi")]
 pub mod rimatr_sr;
 
+/// Sandbox: distributed (ScaLAPACK) Cholesky factorization and triangular solve of the
+/// 2c-2e metric for MPI-parallel rimatr builds (only with `mpi` + `scalapack` features).
+#[cfg(all(feature = "mpi", feature = "scalapack"))]
+pub mod j2c_distributed;
+
 #[cfg(feature = "mpi")]
 use mpi::collective::SystemOperation;
 #[cfg(feature = "mpi")]
