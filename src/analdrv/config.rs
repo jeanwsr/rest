@@ -42,18 +42,18 @@ pub struct AnalDrvConfig {
     pub grid_level_cphf: Option<usize>,
     /// Grid level for the skeleton grid used to evaluate the XC potential and kernel.
     ///
-    /// By default, the skeleton grid level is set to
-    /// - `grid_gen_level` for LDA/GGA functionals
-    /// - `grid_gen_level + 2` for MGGA (TAU) functionals.
+    /// By default, the skeleton grid level is set to `grid_gen_level` (the SCF grid), except for
+    /// MGGA (TAU) functionals with `grid_shift_deriv = false`, which add 2 levels.
     #[serde_inline_default(None)]
     pub grid_level_skeleton: Option<usize>,
     /// Include the Becke grid-shift derivatives (the nuclear-coordinate derivatives of the
     /// grid weights) in the DFT skeleton Hessian and the f1ao skeleton Fock derivatives.
     ///
     /// With it on (default), `de_xc_skeleton` and `vmat_deriv1_grid` are translationally
-    /// invariant; with it off, the results equal the grid-fixed formulation.  Requires the
-    /// standard atom-generated grids (external grids carry no atom attribution; disable it
-    /// there).
+    /// invariant, and the skeleton grid defaults to the SCF grid for every functional family
+    /// (including MGGA); with it off, the results equal the grid-fixed formulation, for which
+    /// MGGA defaults the skeleton grid to `grid_gen_level + 2`.  Requires the standard
+    /// atom-generated grids (external grids carry no atom attribution; disable it there).
     #[serde_inline_default(true)]
     pub grid_shift_deriv: bool,
     /// Tolerance for point group detection in vibrational analysis. Default to 1e-5 Bohr.

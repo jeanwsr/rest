@@ -122,7 +122,8 @@ fn test_b3lyp_grid_shift_magnitude_and_invariance() {
 
 #[test]
 fn test_tpssh_invariance() {
-    // MGGA: the skeleton grid is regenerated at grid_gen_level + 2 by default
+    // MGGA: with the grid-shift on (default) the skeleton grid stays at the SCF level;
+    // grid_gen_level + 2 is only the default when grid_shift_deriv = false.
     let scf_data = run_scf(INPUT_NH3_TPSSH);
     let de_on = run_hessian(&scf_data, &AnalDrvConfig::default());
 

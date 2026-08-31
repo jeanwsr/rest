@@ -87,19 +87,24 @@ pub fn uscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
         let verbose = scf_data.mol.ctrl.print_level > 2;
 
         // Determine skeleton / cphf grid levels.
-        // - skeleton: LDA/GGA use the SCF DFT grid; MGGA (TAU) adds 2 levels.
+        // - skeleton: the SCF DFT grid; only MGGA (TAU) without the grid-shift adds 2 levels
+        //   (the grid-shift terms restore the grid-related accuracy the finer grid compensated).
         // - cphf:     grid_gen_level.max(3) - 2 (coarser, for the iterative CP-KS response).
         let xc_type = determine_den_type_from_list(&xc_func_list.iter().map(|(_, f)| f).collect_vec());
         let is_mgga = matches!(xc_type, XCDenType::TAU);
         let grid_gen_level = scf_data.mol.ctrl.grid_gen_level;
-        let sk_level = config.grid_level_skeleton.unwrap_or(if is_mgga { grid_gen_level + 2 } else { grid_gen_level });
+        let grid_shift = config.grid_shift_deriv;
+        let sk_level = config.grid_level_skeleton.unwrap_or(if is_mgga && !grid_shift {
+            grid_gen_level + 2
+        } else {
+            grid_gen_level
+        });
         let cphf_level = config.grid_level_cphf.unwrap_or(grid_gen_level.max(3) - 2);
 
         // skeleton grid: reuse the SCF grid when the level matches, else regenerate.  Either
         // way, regroup to atom-grouped order (non-decreasing atm_idx): the SCF grid is
         // round-robin permuted for load balancing, while the Becke grid-shift attribution
         // requires the ByAtom grouping.  The regrouping only permutes, never changes values.
-        let grid_shift = config.grid_shift_deriv;
         let ni = {
             use crate::dft::numint_matmul::nimatmul::regroup_grids_by_atom;
 
