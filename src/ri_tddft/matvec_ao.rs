@@ -141,11 +141,7 @@ fn get_j_ao_batched(scf: &SCF, p_block: &[MatrixFull<f64>]) -> MatrixFull<f64> {
     let nao = scf.mol.num_basis;
     let js = crate::ri_jk::pure_incore::get_vj_ri_incore_nonsym(cderi, dms.view()); // [nao,nao,m]
     let mut out = MatrixFull::new([nao * nao, p_block.len()], 0.0);
-    for s in 0..p_block.len() {
-        for (r, v) in js.i((.., .., s)).iter().enumerate() {
-            out.data[s * nao * nao + r] = *v;
-        }
-    }
+    out.data.copy_from_slice(js.raw());
     out
 }
 
@@ -210,11 +206,7 @@ fn get_k_ao_batched(
             // The fold always produces K[Pᵀ] (= K[C_vir Xᵀ C_occᵀ]); transpose
             // each set (axis swap (mu,nu)->(nu,mu)) to return K[P].
             let ks_out = ks.swapaxes(0, 1).into_contig(FlagOrder::F);
-            for s in 0..m {
-                for (r, v) in ks_out.i((.., .., s)).iter().enumerate() {
-                    out.data[s * nao * nao + r] = *v;
-                }
-            }
+            out.data.copy_from_slice(ks_out.raw());
         }
         "lowrank" => {
             // Low-rank: per-vector SVD (cannot batch the SVD truncation).
@@ -232,9 +224,7 @@ fn get_k_ao_batched(
                     svd_tol,
                     naux,
                 );
-                for (r, v) in k2.iter().enumerate() {
-                    out.data[s * nao * nao + r] = *v;
-                }
+                out.data[s * nao * nao..(s + 1) * nao * nao].copy_from_slice(k2.raw());
             }
         }
         _ => {
@@ -242,11 +232,7 @@ fn get_k_ao_batched(
             let dms_slice: &[MatrixFull<f64>] = p_block;
             let dms = dms_slice.to_rstsr(&device);            // [nao,nao,m]
             let ks = crate::ri_jk::pure_incore::get_vk_ri_incore_dm(cderi, dms.view(), naux);
-            for s in 0..m {
-                for (r, v) in ks.i((.., .., s)).iter().enumerate() {
-                    out.data[s * nao * nao + r] = *v;
-                }
-            }
+            out.data.copy_from_slice(ks.raw());
         }
     }
     out
