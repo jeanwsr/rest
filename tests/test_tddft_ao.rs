@@ -124,14 +124,7 @@ fn test_ri_exchange_ao_vs_naive() {
 
 fn build_ao_data(nvar: usize) -> TDDFTData {
     let nao = 6; let occ = 3; let vir = 4; let ng = 17;
-    let ao = MatrixFull::from_vec([nao, ng], pseudo(nao * ng, 7.7)).unwrap();
-    let ao_grad = if nvar == 4 {
-        Some([
-            MatrixFull::from_vec([nao, ng], pseudo(nao * ng, 8.8)).unwrap(),
-            MatrixFull::from_vec([nao, ng], pseudo(nao * ng, 9.9)).unwrap(),
-            MatrixFull::from_vec([nao, ng], pseudo(nao * ng, 10.1)).unwrap(),
-        ])
-    } else { None };
+
     let c_occ = MatrixFull::from_vec([nao, occ], pseudo(nao * occ, 11.2)).unwrap();
     let c_vir = MatrixFull::from_vec([nao, vir], pseudo(nao * vir, 12.3)).unwrap();
     let den_type = if nvar == 4 { XCDenType::SIGMA } else { XCDenType::RHO };
@@ -141,8 +134,6 @@ fn build_ao_data(nvar: usize) -> TDDFTData {
         fxc: None,
         c_occ: Some(c_occ),
         c_vir: Some(c_vir),
-        ao: Some(ao),
-        ao_grad,
         ni: None,
         fxc_eff: None,
         den_type: Some(den_type),

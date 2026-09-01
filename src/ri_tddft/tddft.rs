@@ -7,9 +7,9 @@
 //!   MO-basis RI tensors (`ri_ov`, `ri_oo_exch`, `ri_vv_exch`, `ri_ov_exch`).
 //! - **AO mode**: `fxc` (kernel-only, no MO projections) + `c_occ`/`c_vir`,
 //!   the NIMatmul integrator (`ni`), the raw kernel (`fxc_eff`), `den_type`,
-//!   `grid_batch`, and (for the dim ≤ 15 per-vector path) `ao`/`ao_grad`.
+//!   `grid_batch`.
 
-use rest_tensors::{MatrixFull, RIFull};
+use rest_tensors::MatrixFull;
 
 use crate::scf_io::SCF;
 use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data};
@@ -47,10 +47,6 @@ pub struct TDDFTData {
     pub c_occ: Option<MatrixFull<f64>>,
     /// Virtual MO coefficients [nao, vir_size] (AO mode).
     pub c_vir: Option<MatrixFull<f64>>,
-    /// AO values on grids [nao, ngrids]. AO mode, per-vector path (dim ≤ 15).
-    pub ao: Option<MatrixFull<f64>>,
-    /// For GGA: AO gradients on grids, each [nao, ngrids] (AO per-vector path).
-    pub ao_grad: Option<[MatrixFull<f64>; 3]>,
     /// Numerical integrator for the batched fxc kernel (AO mode).
     pub ni: Option<NIMatmul<'static>>,
     /// Raw (unweighted) fxc kernel `[ngrids, nvar, nvar]` (AO mode).
@@ -129,8 +125,6 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
         fxc: Some(fxc),
         c_occ: None,
         c_vir: None,
-        ao: None,
-        ao_grad: None,
         ni: None,
         fxc_eff: None,
         den_type: None,
@@ -272,45 +266,6 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
     // `wfxc`/MO-projection table (FXCMatvecData) is MO-only, so `fxc: None`.
     let fxc: Option<FXCMatvecData> = None;
 
-    // ── Dense AO on grids, only for the per-vector path (dim ≤ 15) ──
-    let dim = occ_size * vir_size;
-    let (ao, ao_grad) = if dim <= 15 {
-        // ── Dense AO values on grids ──
-        let ao: MatrixFull<f64> = match &grids.ao {
-            Some(a) => a.clone(),
-            None => match &grids.ao_compressed {
-                Some(c) => Grids::decompress_ao(c),
-                None => panic!("AO on grids must be tabulated (dense or compressed)"),
-            },
-        };
-
-        // ── GGA: dense AO gradients on grids ──
-        let ao_grad: Option<[MatrixFull<f64>; 3]> = if nvar == 4 {
-            let aop_owned: Option<RIFull<f64>>;
-            let aop: &RIFull<f64> = match &grids.aop {
-                Some(a) => { aop_owned = None; a }
-                None => match &grids.aop_compressed {
-                    Some(c) => { aop_owned = Some(Grids::decompress_aop(c)); aop_owned.as_ref().unwrap() }
-                    None => panic!("AO gradients needed for GGA fxc (dense or compressed)"),
-                },
-            };
-            let mut grads: [Option<MatrixFull<f64>>; 3] = [None, None, None];
-            for d in 0..3 {
-                let slice = aop.get_reducing_matrix(d).unwrap();
-                grads[d] = MatrixFull::from_vec(
-                    [num_basis, ngrids],
-                    slice.iter().cloned().collect(),
-                );
-            }
-            Some([grads[0].take().unwrap(), grads[1].take().unwrap(), grads[2].take().unwrap()])
-        } else {
-            None
-        };
-        (Some(ao), ao_grad)
-    } else {
-        (None, None)
-    };
-
     // ── Extract occupied/virtual MO coefficients ──
     let eigvec = &scf.eigenvectors[0];
     let mut c_occ = MatrixFull::new([num_basis, occ_size], 0.0);
@@ -382,8 +337,6 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
         fxc,
         c_occ: Some(c_occ),
         c_vir: Some(c_vir),
-        ao,
-        ao_grad,
         ni: Some(ni),
         fxc_eff: Some(fxc_eff),
         den_type: Some(den_type),

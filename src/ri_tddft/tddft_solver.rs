@@ -19,7 +19,7 @@ use crate::ri_tddft::matvec::{self, a_matvec, b_matvec};
 use crate::ri_tddft::matvec_ao;
 use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_get_submatrix, compute_tddft_dipole_matrix};
 use crate::ri_tddft::feast_solver;
-use crate::ri_tddft::tddft::{build_a, prepare_ao_data, prepare_mo_data};
+use crate::ri_tddft::tddft::{build_a, build_b, prepare_ao_data, prepare_mo_data};
 use crate::ri_tddft::{TDDFTData, TDDFTMode};
 
 /// Main TDDFT entry point
@@ -30,6 +30,93 @@ use crate::ri_tddft::{TDDFTData, TDDFTMode};
 pub struct TddftOutput {
     pub energies: Vec<f64>,
     pub osc: Vec<f64>,
+}
+
+/// Dense full-LR eigenpairs via the symmetrized Casida reduction (mirrors the
+/// LR Davidson's preferred Cholesky route, solvers/davidson.rs):
+///
+///   A±B;  A−B = G Gᵀ (Cholesky);  Gᵀ(A+B)G Z' = ω² Z';
+///   Z = X+Y = G Z';  W = X−Y = ω G⁻ᵀ Z';  X = (Z+W)/2, Y = (Z−W)/2.
+///
+/// Each returned pair is `(ω, [X; Y])` — the same format as the batched LR
+/// Davidson (length 2·dim), so the Step-9 post-processing is identical.
+/// Returns `None` when A−B is not positive-definite (the Davidson's fallback
+/// convention: warn and degrade to the TDA approximation).
+fn dense_lr_eigenpairs(
+    a_full: &MatrixFull<f64>,
+    b_full: &MatrixFull<f64>,
+    nroots: usize,
+) -> Option<Vec<(f64, Vec<f64>)>> {
+    use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, _dinverse, _dpotrf, _dsyev};
+    let dim = a_full.size[0];
+    let mut apb = MatrixFull::new([dim, dim], 0.0);
+    let mut amb = MatrixFull::new([dim, dim], 0.0);
+    for i in 0..dim {
+        for j in 0..dim {
+            apb[[i, j]] = a_full[[i, j]] + b_full[[i, j]];
+            amb[[i, j]] = a_full[[i, j]] - b_full[[i, j]];
+        }
+    }
+    // Cholesky A−B = G Gᵀ; `_dpotrf` panics when A−B is not positive-definite.
+    let mut g = amb;
+    let chol_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        _dpotrf(&mut g, 'L');
+    }));
+    if chol_ok.is_err() {
+        log::warn!(
+            "  Dense LR: Cholesky of (A-B) failed (not positive-definite); \
+             falling back to TDA approximation."
+        );
+        return None;
+    }
+    for i in 0..dim {
+        for j in 0..dim {
+            if j > i {
+                g[[i, j]] = 0.0;
+            }
+        }
+    }
+    // Symmetric problem: Gᵀ(A+B)G Z' = ω² Z'
+    let mut apb_g = MatrixFull::new([dim, dim], 0.0);
+    _dgemm_full(&apb, 'N', &g, 'N', &mut apb_g, 1.0, 0.0);
+    let mut gt_apb_g = MatrixFull::new([dim, dim], 0.0);
+    _dgemm_full(&g, 'T', &apb_g, 'N', &mut gt_apb_g, 1.0, 0.0);
+    let (eigvecs_opt, omega2, _info) = _dsyev(&gt_apb_g, 'V');
+    let eigvecs = eigvecs_opt?;
+    let ginv = _dinverse(&g)?;
+    let mut pairs: Vec<(f64, Vec<f64>)> = Vec::new();
+    for (w2, v) in omega2.iter().zip(eigvecs.iter_columns_full()) {
+        if *w2 <= 1e-12 {
+            continue;
+        }
+        let omega = w2.sqrt();
+        // Z = X+Y = G z'; W = X−Y = ω G⁻ᵀ z'
+        let z_col = MatrixFull::from_vec([dim, 1], v.to_vec()).unwrap();
+        let mut xpy = MatrixFull::new([dim, 1], 0.0);
+        _dgemm_full(&g, 'N', &z_col, 'N', &mut xpy, 1.0, 0.0);
+        let mut gtz = MatrixFull::new([dim, 1], 0.0);
+        _dgemm_full(&ginv, 'T', &z_col, 'N', &mut gtz, 1.0, 0.0);
+        let mut vec = Vec::with_capacity(2 * dim);
+        for i in 0..dim {
+            let z_i = xpy[[i, 0]];
+            let w_i = omega * gtz[[i, 0]];
+            vec.push(0.5 * (z_i + w_i)); // X
+        }
+        for i in 0..dim {
+            let z_i = xpy[[i, 0]];
+            let w_i = omega * gtz[[i, 0]];
+            vec.push(0.5 * (z_i - w_i)); // Y
+        }
+        pairs.push((omega, vec));
+        if pairs.len() >= nroots {
+            break;
+        }
+    }
+    if pairs.is_empty() {
+        None
+    } else {
+        Some(pairs)
+    }
 }
 
 pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
@@ -98,9 +185,8 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     // Free the SCF-tabulated dense AO tables (grids.ao / grids.aop, ~1 GB at
     // TZ-GGA) before preparing AO-mode data: the AO paths never read them, and
     // no other consumer reads them afterwards (Hirshfeld decompresses on
-    // demand). Only dropped when the dense per-vector path (dim ≤ 15) is not
-    // used — that path still reads the tabulated AO values.
-    if is_ao && dim > 15 {
+    // demand).
+    if is_ao {
         if let Some(g) = scf.grids.as_mut() {
             g.ao = None;
             g.aop = None;
@@ -281,17 +367,29 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
             println!("  A·e0 [0] = {:.10} (gap={:.10}, kernel={:.10})",
                 a_full[[0, 0]], hdiag[0], a_full[[0, 0]] - hdiag[0]);
         }
-        // Diagonalize
-        let mut a = a_full;
-        let (eigvecs_opt, eigvals, _info) = rest_tensors::matrix::matrix_blas_lapack::_dsyev(&a, 'V');
-        let eigvecs = eigvecs_opt.expect("dsyev failed");
-        let mut pairs: Vec<(f64, Vec<f64>)> = eigvals.iter()
-            .zip(eigvecs.iter_columns_full())
-            .map(|(e, v)| (*e, v.to_vec()))
-            .collect();
-        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        pairs.truncate(nroots.min(dim));
-        pairs
+        // Full LR: build B too and solve the symmetrized Casida reduction
+        // (fall back to the TDA approximation if A−B is not positive-definite).
+        let lr_pairs = if is_tda {
+            None
+        } else {
+            let b_full = build_b(scf_ref, &mut *data.borrow_mut(), xlet);
+            dense_lr_eigenpairs(&a_full, &b_full, nroots)
+        };
+        if let Some(pairs) = lr_pairs {
+            pairs
+        } else {
+            // TDA (or LR with A−B not positive-definite): diagonalize A only.
+            let mut a = a_full;
+            let (eigvecs_opt, eigvals, _info) = rest_tensors::matrix::matrix_blas_lapack::_dsyev(&a, 'V');
+            let eigvecs = eigvecs_opt.expect("dsyev failed");
+            let mut pairs: Vec<(f64, Vec<f64>)> = eigvals.iter()
+                .zip(eigvecs.iter_columns_full())
+                .map(|(e, v)| (*e, v.to_vec()))
+                .collect();
+            pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            pairs.truncate(nroots.min(dim));
+            pairs
+        }
     } else if is_tda && matches!(data.borrow().mode, TDDFTMode::AO) {
         println!("Solving TDA eigenvalue problem (AO-mode batched matvec)...");
         davidson_solver::tda_davidson_solver_batched(
