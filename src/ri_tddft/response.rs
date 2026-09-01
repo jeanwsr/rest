@@ -28,7 +28,7 @@ use crate::ri_bse::response::{
     klopper_subspace_solver, fourvec_gmres, poples_numerical_trick,
     obtain_mu_ia_z, eval_ao_on_grids,
 };
-use crate::ri_bse::davidson_solver::vector_scaled_add;
+use crate::solvers::davidson::vector_scaled_add;
 use crate::ri_bse::dipoles;
 use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data, set_fxc_use_optimized};
 use crate::ri_tddft::matvec::{self, a_matvec, b_matvec};
@@ -675,6 +675,16 @@ pub fn response_tddft(scf: &mut SCF) -> Result<(), String> {
     set_fxc_use_optimized(tddft_ctrl.tddft_use_optimized_fxc);
 
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) = tddft_occupation_parameters(scf);
+    if scf.mol.ctrl.print_level > 1 {
+        let cutoff = scf.mol.ctrl.tddft.as_ref().map(|c| c.tddft_cutoff_energy).unwrap_or(1.0e6);
+        if cutoff < 1.0e5 {
+            println!("  TDDFT virtual cutoff: {:.4} Ha, {} states retained", cutoff, num_state);
+        }
+        if start_mo > scf.mol.start_mo {
+            println!("  TDDFT frozen core: -2.00 Ha threshold, {} orbitals frozen (MO 0..{})",
+                start_mo - scf.mol.start_mo, start_mo);
+        }
+    }
     let dim = occ_size * vir_size;
     if dim == 0 {
         return Err("No occupied-virtual excitation space for response TDDFT".to_string());

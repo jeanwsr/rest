@@ -7,7 +7,7 @@ use pyrest::analdrv::config::AnalDrvConfig;
 use pyrest::analdrv::rscf_interface::rscf_hess_interface;
 
 use pyrest::ctrl_io;
-use pyrest::dft::numint_matmul::hess_rks::{get_hess_ncomp_ao_dm0, get_rho_vxc_fxc, make_cpks_vxc_fxc};
+use pyrest::dft::numint_matmul::hess_rks::{get_hess_ncomp_ao_dm0, get_rho_exc_vxc_fxc, make_cpks_vxc_fxc};
 use pyrest::dft::numint_matmul::nimatmul::NIMatmul;
 use pyrest::dft::xceff::prelude::determine_den_type_from_list;
 use pyrest::molecule_io::Molecule;
@@ -94,7 +94,7 @@ fn test_nh3_cphf_equals_skeleton() {
 
 /// Numerical-equivalence check: the lean braket-based [`make_cpks_vxc_fxc`] (which forms rho from
 /// occupied MOs via `make_rho_from_homogeneous_braket`) must produce the same `vxc` / `fxc` as the
-/// dm0-based [`get_rho_vxc_fxc`] on the same grid.
+/// dm0-based [`get_rho_exc_vxc_fxc`] on the same grid.
 #[test]
 fn test_cpks_vxc_fxc_matches_dm0_path() {
     use itertools::Itertools;
@@ -114,9 +114,9 @@ fn test_cpks_vxc_fxc_matches_dm0_path() {
 
     let mol_obj = &scf_data.mol;
     let cint_mol = pyrest::ri_jk::util::get_cint_mol(mol_obj);
-    let grid_coords = &scf_data.grids.as_ref().unwrap().coordinates;
-    let grid_weights = &scf_data.grids.as_ref().unwrap().weights;
-    let mut ni = NIMatmul::new(&cint_mol, grid_coords, grid_weights);
+    let grids = scf_data.grids.as_ref().unwrap();
+    let mut ni =
+        NIMatmul::new(&cint_mol, &grids.coordinates, &grids.weights, &grids.atm_idx, &grids.quadrature_weights);
 
     let xc_func_list: Vec<(f64, LibXCFunctional)> = scf_data
         .mol
@@ -127,13 +127,13 @@ fn test_cpks_vxc_fxc_matches_dm0_path() {
         .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Unpolarized)))
         .collect();
 
-    // reference: dm0 -> ao_dm0 -> get_rho_vxc_fxc
+    // reference: dm0 -> ao_dm0 -> get_rho_exc_vxc_fxc
     let xc_type = determine_den_type_from_list(&xc_func_list.iter().map(|(_, f)| f).collect_vec());
     let ncomp_ao_dm0 = get_hess_ncomp_ao_dm0(xc_type);
     let dm0 = get_dm0_restricted(mo_coeff.view(), mo_occ.view());
     let ao = ni.get_cached_ao(xc_type.num_ao_deriv());
     let ao_dm0 = ao.i((Ellipsis, ..ncomp_ao_dm0)) % &dm0;
-    let (_rho_ref, vxc_ref, fxc_ref) = get_rho_vxc_fxc(&xc_func_list, ao.view(), ao_dm0.view());
+    let (_rho_ref, _exc_ref, vxc_ref, fxc_ref) = get_rho_exc_vxc_fxc(&xc_func_list, ao.view(), ao_dm0.view());
 
     // lean: braket from mo_coeff/mo_occ (clear AO cache so the braket path re-evaluates freshly)
     ni.cache_tensor.clear();

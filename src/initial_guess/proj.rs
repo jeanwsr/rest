@@ -1,6 +1,11 @@
+use log::warn;
+use std::ops::Range;
 use rstsr::prelude::*;
 use tensors::matrix::MatrixFull;
 use tensors::BasicMatrix;
+use crate::basis_io::Basis4Elem;
+use crate::constants::{ATM_ENV, ATM_NUC};
+use crate::fileop::chkfile;
 use crate::molecule_io::Molecule;
 use crate::utilities::rstsr_util::{RestTensorToRstsrTsrAPI, RestTensorToRstsrViewAPI};
 
@@ -19,7 +24,7 @@ fn cho_solve(s22: &MatrixFull<f64>, b: &MatrixFull<f64>, device: &DeviceBLAS) ->
             MatrixFull::from_vec(shape, x.into_shape(-1).into_vec()).unwrap()
         },
         Err(_) => {
-            println!("Cholesky decomposition failed, falling back to general solve.");
+            warn!("Cholesky decomposition failed, falling back to general solve.");
             let x = rt::linalg::solve_general((&s22_tsr, &b_tsr));
             let shape: [usize; 2] = x.shape().to_vec().try_into().unwrap();
             MatrixFull::from_vec(shape, x.into_shape(-1).into_vec()).unwrap()
@@ -56,26 +61,50 @@ fn normalize_mo(mo: &mut MatrixFull<f64>, s: &MatrixFull<f64>, device: &DeviceBL
 /// - `mol_target`: the target molecule (basis set 2)
 /// - `mol_source`: the source molecule (basis set 1)
 /// - `mo_source`: MO coefficients in the source basis
+/// - `mo_range`: column ranges to project per spin channel (e.g. [0..nocc_alpha, 0..nocc_beta]).
+///   Columns outside each range are not projected.
 ///
 /// # Returns
-/// - MO coefficients projected to the target basis (C2), normalized so that C2^T S22 C2 = I
-pub fn proj_mo(mol_target: &Molecule, mol_source: &Molecule, mo_source: [MatrixFull<f64>;2]) -> [MatrixFull<f64>;2] {
-    // S22 = target self-overlap
+/// - MO coefficients projected to the target basis, zero-padded to `mol_target.num_state` columns,
+///   normalized so that C2^T S22 C2 = I
+pub fn proj_mo(mol_target: &Molecule, mol_source: &Molecule, mo_source: [MatrixFull<f64>;2], mo_range: [Range<usize>; 2]) -> [MatrixFull<f64>;2] {
     let s22_full = mol_target.int_ij_matrixupper("ovlp".to_string()).to_matrixfull().unwrap();
 
-    // S21 = <AO_target|AO_source>
     let s21 = mol_target.int_cross(mol_source, "ovlp".to_string());
 
     let device = DeviceBLAS::default();
     let s21_tsr = s21.to_rstsr(&device);
 
+    let tgt_nmo = mol_target.num_state;
     let mut mo_target: [MatrixFull<f64>; 2] = [MatrixFull::empty(), MatrixFull::empty()];
     for spin in 0..2 {
         if mo_source[spin].size()[0] == 0 {
             continue;
         }
+        let src_nmo = mo_source[spin].size()[1];
+        let start = mo_range[spin].start;
+        let mut end = mo_range[spin].end;
+        assert!(start <= end, "proj_mo: mo_range[{spin}] start={start} > end={end}");
+        if end > src_nmo {
+            warn!(
+                "proj_mo: mo_range[{spin}] end={end} exceeds source MOs={src_nmo}, clamping to source"
+            );
+            end = src_nmo;
+        }
+        if end > mol_target.num_state {
+            warn!(
+                "proj_mo: mo_range[{spin}] end={end} exceeds target num_state={}, clamping to target",
+                mol_target.num_state
+            );
+            end = mol_target.num_state;
+        }
+        if start == end {
+            continue;
+        }
+        let n_mo = end - start;
         let mo_source_tsr = mo_source[spin].to_rstsr_view(&device);
-        let temp_tsr = &s21_tsr % &mo_source_tsr;
+        let mo_slice = mo_source_tsr.slice((.., start..end));
+        let temp_tsr = &s21_tsr % &mo_slice;
         let temp = MatrixFull::from_vec(
             temp_tsr.shape().to_vec().try_into().unwrap(),
             temp_tsr.into_shape(-1).into_vec(),
@@ -83,25 +112,176 @@ pub fn proj_mo(mol_target: &Molecule, mol_source: &Molecule, mo_source: [MatrixF
 
         mo_target[spin] = cho_solve(&s22_full, &temp, &device);
         normalize_mo(&mut mo_target[spin], &s22_full, &device);
+
+        let proj_nmo = end - start;
+        if proj_nmo < tgt_nmo && mo_target[spin].size()[0] > 0 {
+            let nrows = mol_target.num_basis;
+            let src_data: Vec<f64> = mo_target[spin].iter().copied().collect();
+            let mut dst_data = vec![0.0; nrows * tgt_nmo];
+            let copy_len = (proj_nmo * nrows).min(src_data.len());
+            dst_data[..copy_len].copy_from_slice(&src_data[..copy_len]);
+            mo_target[spin] = MatrixFull::from_vec([nrows, tgt_nmo], dst_data).unwrap();
+        }
     }
-    // mo_target[0].formated_output(5, "full");
 
     mo_target
 }
 
-pub fn check_proj_sanity(mol_target: &Molecule, mol_source: &Molecule) -> bool {
-    let mut san = true;
-    if mol_target.cint_type != mol_source.cint_type {
-        println!("CintType mismatch between target and source molecule (target: {:?}, source: {:?})", mol_target.cint_type, mol_source.cint_type);
-        san = false;
+pub enum GuessAction {
+    DirectReuse,
+    Project(Molecule),
+    Refuse(String),
+}
+
+const GEOM_TOL: f64 = 1e-6;
+
+fn ecp_electrons_from_basis(basis4elem: &Option<Vec<Basis4Elem>>) -> usize {
+    match basis4elem {
+        Some(v) => v.iter().fold(0, |acc, i| acc + i.ecp_electrons.unwrap_or(0)),
+        None => 0,
     }
-    if mol_target.start_mo != mol_source.start_mo {
-        println!("start_mo mismatch between target and source molecule (target: {}, source: {})", mol_target.start_mo, mol_source.start_mo);
-        san = false;
+}
+
+fn load_num_elec(chkfile: &str, spin: f64) -> Option<[f64; 3]> {
+    use hdf5::types::VarLenUnicode;
+    let file = hdf5::File::open(chkfile).unwrap();
+    let total: f64 = if let Ok(ds) = file.dataset("molecule/num_elec") {
+        if let Ok(s) = ds.read_scalar::<VarLenUnicode>() {
+            serde_json::from_str(s.as_str()).ok()?
+        } else {
+            return None;
+        }
+    } else {
+        let scf = file.group("scf").unwrap();
+        let occ = scf.dataset("mo_occ").or_else(|_| scf.dataset("mo_occupation")).ok()?;
+        occ.read_raw::<f64>().unwrap().iter().sum()
+    };
+    let unpair = (spin - 1.0).min(total);
+    Some([total, (total - unpair) / 2.0 + unpair, (total - unpair) / 2.0])
+}
+
+pub fn decide_guess(chkfile: &String, mol_target: &Molecule) -> GuessAction {
+    let (nbasis, nmo, spin_channel, loaded_spin, loaded_charge) = chkfile::load_basic(chkfile);
+    let loaded_nbasis = nbasis.expect("chkfile missing scf/num_basis");
+    let loaded_nmo = nmo.expect("chkfile missing scf/num_states");
+    let loaded_spin_channel = spin_channel;
+
+    let (cint_raw_data, ecp_raw, basis4elem, cint_type, _, _) = chkfile::reconstruct_cint_data(chkfile, None);
+    let (source_atm, source_bas, source_env) = cint_raw_data.unwrap();
+
+    let source_geom = chkfile::load_geom(chkfile);
+
+    let source_natm = source_geom.as_ref()
+        .map(|g| g.elem.len())
+        .unwrap_or(source_atm.len());
+    let target_natm = mol_target.geom.elem.len();
+    if source_natm != target_natm {
+        return GuessAction::Refuse(format!(
+            "atom count mismatch: chkfile has {}, target has {}",
+            source_natm, target_natm
+        ));
     }
-    if mol_target.has_ecp() != mol_source.has_ecp() {
-        println!("ECP presence mismatch between target and source molecule (target has ECP: {}, source has ECP: {})", mol_target.has_ecp(), mol_source.has_ecp());
-        san = false;
+
+    if let Some(ref sgeom) = source_geom {
+        for i in 0..source_natm {
+            if sgeom.elem[i] != mol_target.geom.elem[i] {
+                return GuessAction::Refuse(format!(
+                    "element mismatch at atom {}: chkfile element={}, target element={}",
+                    i, sgeom.elem[i], mol_target.geom.elem[i]
+                ));
+            }
+        }
+    } else {
+        for i in 0..source_natm {
+            let s_z = source_atm[i][ATM_NUC] as f64;
+            let t_z = mol_target.cint_atm[i][ATM_NUC] as f64;
+            if (s_z - t_z).abs() > 1e-12 {
+                return GuessAction::Refuse(format!(
+                    "element mismatch at atom {}: chkfile Z={}, target Z={}",
+                    i, s_z, t_z
+                ));
+            }
+        }
     }
-    san
+
+    let s_cint_type = cint_type.unwrap_or(mol_target.cint_type);
+    if mol_target.cint_type != s_cint_type {
+        return GuessAction::Refuse(format!(
+            "CintType mismatch: target {:?}, source {:?}",
+            mol_target.cint_type, s_cint_type
+        ));
+    }
+
+    let source_ecp_electrons = ecp_electrons_from_basis(&basis4elem);
+    if mol_target.ecp_electrons != source_ecp_electrons {
+        return GuessAction::Refuse(format!(
+            "ECP electron count mismatch: target {}, source {}",
+            mol_target.ecp_electrons, source_ecp_electrons
+        ));
+    }
+
+    let src_spin = loaded_spin.unwrap_or(1.0);
+    let src_ne = load_num_elec(chkfile, src_spin)
+        .expect("chkfile missing electron count (molecule/num_elec or scf/mo_occ)");
+    log::debug!("src ne {} tgt ne {}", src_ne[0], mol_target.num_elec[0]);
+    if (src_ne[0] - mol_target.num_elec[0]).abs() > 0.5 {
+            return GuessAction::Refuse(format!(
+                "electron count mismatch: chkfile has {}, target has {}",
+                src_ne[0], mol_target.num_elec[0]
+            ));
+        }
+
+    let mut geom_diff = true;
+    if let Some(ref sgeom) = source_geom {
+        if sgeom.unit == mol_target.geom.unit
+            && sgeom.position.size() == mol_target.geom.position.size()
+        {
+            geom_diff = sgeom.position.iter()
+                .zip(mol_target.geom.position.iter())
+                .any(|(s, t)| (s - t).abs() > GEOM_TOL);
+        }
+    } else {
+        geom_diff = false;
+        for i in 0..source_atm.len() {
+            let s_ptr = source_atm[i][ATM_ENV] as usize;
+            let t_ptr = mol_target.cint_atm[i][ATM_ENV] as usize;
+            for d in 0..3 {
+                if (source_env[s_ptr + d] - mol_target.cint_env[t_ptr + d]).abs() > GEOM_TOL {
+                    geom_diff = true;
+                    break;
+                }
+            }
+            if geom_diff { break; }
+        }
+    }
+
+    let mut mol_source = Molecule::init_mol();
+    mol_source.cint_type = cint_type.unwrap_or(mol_target.cint_type);
+    mol_source.ctrl.spin = loaded_spin.unwrap_or(mol_target.ctrl.spin);
+    mol_source.ctrl.charge = loaded_charge.unwrap_or(mol_target.ctrl.charge);
+    mol_source.ctrl.print_level = mol_target.ctrl.print_level;
+    mol_source.cint_atm = source_atm;
+    mol_source.cint_bas = source_bas;
+    mol_source.cint_env = source_env;
+    mol_source.cint_ecpbas = ecp_raw;
+    mol_source.num_state = loaded_nmo;
+    mol_source.num_basis = loaded_nbasis;
+    mol_source.spin_channel = loaded_spin_channel.unwrap_or(mol_target.spin_channel);
+    mol_source.num_elec = src_ne;
+
+    let basis_diff = loaded_nbasis != mol_target.num_basis || loaded_nmo != mol_target.num_state;
+
+    if basis_diff || geom_diff {
+        return GuessAction::Project(mol_source);
+    }
+
+    let s22 = mol_target.int_ij_matrixupper("ovlp".to_string()).to_matrixfull().unwrap();
+    let s21 = mol_target.int_cross(&mol_source, "ovlp".to_string());
+    let s22_norm2: f64 = s22.iter().map(|a| a.powi(2)).sum();
+    let diff_norm2: f64 = s22.iter().zip(s21.iter()).map(|(a, b)| (a - b).powi(2)).sum();
+    let rel = (diff_norm2 / s22_norm2).sqrt();
+    if rel > 1e-5 {
+        return GuessAction::Project(mol_source);
+    }
+    GuessAction::DirectReuse
 }

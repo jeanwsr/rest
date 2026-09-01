@@ -1,6 +1,9 @@
 pub mod rhf;
 pub mod rks_b3lyp;
 pub mod rks_b3lyp_grid_levels;
+pub mod rks_b3lyp_qr_collapse;
+pub mod rks_grid_shift;
 pub mod uhf;
+pub mod uks_grid_shift;
 pub mod uks_tpss0_grid_levels;
 pub mod uks_tpssh;

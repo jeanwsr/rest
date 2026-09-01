@@ -285,6 +285,7 @@ impl<'a> UHessSCF<'a> {
         let max_cycle = self.config.cphf_max_cycle;
         let max_space = self.config.cphf_max_space;
         let lindep = self.config.cphf_lindep;
+        let tol_inflation = self.config.cphf_tol_inflation;
 
         let pack_flattened = |x: &[TsrView; 2]| -> Tsr {
             // original: [nmo_α, nocc_α, nprop] and [nmo_β, nocc_β, nprop]
@@ -328,7 +329,7 @@ impl<'a> UHessSCF<'a> {
         let rhs_view = rhs.iter().map(|r| r.view()).collect_array().unwrap();
         let rhs_packed = pack_flattened(&rhs_view);
         let mo1_flattened =
-            krylov_block(response_cphf_flattened, rhs_packed.view(), None, tol, max_cycle, max_space, lindep);
+            krylov_block(response_cphf_flattened, rhs_packed.view(), None, tol, max_cycle, max_space, lindep, tol_inflation);
         let [mo1_α, mo1_β] = unpack_flattened(mo1_flattened.view());
         let mo1_α = mo1_α.into_shape(rhs_shape[α].to_vec());
         let mo1_β = mo1_β.into_shape(rhs_shape[β].to_vec());

@@ -11,14 +11,14 @@ use crate::analdrv::config::{AnalDrvConfig, AnalDrvTask};
 use crate::ctrl_io::tddft_parameters::parse_tddft_keywords;
 use crate::ctrl_io::hessian_parameters::parse_hessian_keywords;
 use crate::ctrl_io::thermo_parameters::parse_thermo_keywords;
-use crate::{check_norm::force_state_occupation::ForceStateOccupation};
+use crate::{scf_io::force_state_occupation::ForceStateOccupation};
 use crate::scf_io::smear::SmearingType;
 use crate::dft::{DFAFamily, DFTType};
 use crate::geom_io::{GeomCell, MOrC, parse_geom_keywords};
 use crate::utilities;
 // use rayon::ThreadPoolBuilder;
-use crate::check_norm::OCCType;
-use tensors::matrix_blas_lapack::{omp_set_num_threads_wrapper};
+use crate::scf_io::occupation::OCCType;
+use tensors::matrix_blas_lapack::omp_set_num_threads_global_wrapper;
 use crate::solvent::{PcmMethod, RadiusScheme};
 use crate::x2c::RelativisticMethod;
 use serde_json;
@@ -121,6 +121,24 @@ pub enum JobType {
     NumDipole,
     GeomOpt,
     NormalModes,
+}
+
+/// Whether to use the distributed (ScaLAPACK) solver for diagonalizing the
+/// Hamiltonian in MPI runs.
+///
+/// - `Auto`: use the distributed solver only when the problem is large enough
+///   (see `diagonalize_hamiltonian_distributed_check`).
+/// - `On`: always use the distributed solver (mainly for testing small systems).
+/// - `Off`: never use the distributed solver.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum HamiltonianDistributedMode {
+    #[default]
+    Auto,
+    #[serde(alias = "true", alias = "yes")]
+    On,
+    #[serde(alias = "false", alias = "no")]
+    Off,
 }
 
 /// **InputKeywords** for a specific calculation
@@ -288,6 +306,8 @@ pub struct InputKeywords {
     // There are three kinds of available initital guesses: 1) sad (default), 2) hcore, 3) vsap
     pub initial_guess: String,
     #[pyo3(get, set)]
+    pub basis_projection: String,
+    #[pyo3(get, set)]
     pub noiter: bool,
     #[pyo3(get, set)]
     pub check_stab: bool,
@@ -309,6 +329,7 @@ pub struct InputKeywords {
     pub fciqmc_dump: bool,
     // Kyewords for post scf analysis
     pub outputs: Vec<String>,
+    pub outname: Option<String>,
     pub cube_orb_setting: [f64;2],
     pub cube_orb_indices: Vec<[usize;3]>,
     pub cube_orb_type: String,
@@ -379,6 +400,10 @@ pub struct InputKeywords {
     pub xc_parser: String,
     pub tddft: Option<TDDFTParameters>,
     pub j2c_decomp: J2CDecompOption,
+    /// Whether to use the distributed (ScaLAPACK) Hamiltonian diagonalization
+    /// in MPI runs. `Auto` (default) decides by problem size; `On` forces the
+    /// distributed solver; `Off` forces the serial one.
+    pub hamiltonian_distributed: HamiltonianDistributedMode,
     pub ri_pt2: RiPt2Option,
     pub hessian: Option<HessianParameters>,
     pub thermo: Option<ThermoParameters>,
@@ -481,6 +506,7 @@ impl InputKeywords {
             has_chkfile: false, // not directly set by input
             external_init_guess: None, // not directly set by input
             initial_guess: String::from("sad"),
+            basis_projection: String::from("occupied"),
             noiter: false,
             check_stab: false,
             // Kyewords for the manner to evaluate the Vk (and also Vxc) potentials
@@ -498,6 +524,7 @@ impl InputKeywords {
             fciqmc_dump: false,
             // Keywords for post scf
             outputs: vec![],
+            outname: None,
             cube_orb_setting: [3.0,80.0],
             cube_orb_indices: Vec::new(),
             cube_orb_type: String::from("wavefunction"),
@@ -549,6 +576,7 @@ impl InputKeywords {
             stop_at: None,
             xc_parser: String::from("legacy"),
             j2c_decomp: J2CDecompOption::default(),
+            hamiltonian_distributed: HamiltonianDistributedMode::default(),
             ri_pt2: RiPt2Option::default(),
             tddft: None,
             hessian: None,
@@ -842,9 +870,9 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 // Now move the setting of rayon thread numbers to the main.rs
                 //rayon::ThreadPoolBuilder::new().num_threads(num_threads);
                 rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global().unwrap_or_else(|x| {println!("{:?}", &x)});
-                omp_set_num_threads_wrapper(num_threads);
+                omp_set_num_threads_global_wrapper(num_threads);
             } else {
-                omp_set_num_threads_wrapper(rayon::current_num_threads());
+                omp_set_num_threads_global_wrapper(rayon::current_num_threads());
                 //if tmp_input.print_level>0 {println!("The default rayon num_threads value is used:      {}", rayon::current_num_threads())};
             };
             //println!("max_num_threads: {}, current_num_threads: {}", rayon::max_num_threads(), rayon::current_num_threads());
@@ -1486,6 +1514,11 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => {String::from("sad")},
             };
 
+            tmp_input.basis_projection = match tmp_ctrl.get("basis_projection").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
+                other => {String::from("occupied")},
+            };
+
             tmp_input.noiter = match tmp_ctrl.get("noiter").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
                 serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
@@ -1526,6 +1559,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.algorithm_j = tmp_ctrl.get("algorithm_j").map(serde_from_value).unwrap_or_default();
             tmp_input.algorithm_k = tmp_ctrl.get("algorithm_k").map(serde_from_value).unwrap_or_default();
             tmp_input.j2c_decomp = tmp_ctrl.get("j2c_decomp").map(serde_from_value).unwrap_or_default();
+            tmp_input.hamiltonian_distributed = tmp_ctrl.get("hamiltonian_distributed").map(serde_from_value).unwrap_or_default();
             if (tmp_input.algorithm_j != AlgorithmJ::Default || tmp_input.algorithm_k != AlgorithmK::Default) {
                 if tmp_input.algorithm_jk != AlgorithmJK::Default {
                     warn!("algorithm_j or algorithm_k are specified, the setting in algorithm_jk will be ignored.");
@@ -1718,6 +1752,10 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     tmp_vec
                 },
                 other => {vec![]},
+            };
+            tmp_input.outname = match tmp_ctrl.get("outname").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp) => Some(tmp.to_string()),
+                _ => None
             };
             tmp_input.cube_orb_type = match tmp_ctrl.get("cube_orb_type").unwrap_or(&serde_json::Value::Null) {
                serde_json::Value::String(tmp_type) => {

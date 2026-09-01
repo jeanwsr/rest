@@ -1,7 +1,7 @@
 #![warn(unused_imports)]
 use crate::basis_io::ecp::ghost_effective_potential_matrix;
-use crate::check_norm::force_state_occupation::adapt_occupation_with_force_projection;
-use crate::check_norm::{self, generate_occupation_frac_occ, generate_occupation_integer, generate_occupation_sad, OCCType};
+use self::force_state_occupation::adapt_occupation_with_force_projection;
+use self::occupation::{generate_occupation_frac_occ, generate_occupation_integer, generate_occupation_sad, OCCType};
 use crate::dft::gen_grids::prune::prune_by_rho;
 use crate::dft::{DFTType, Grids};
 use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges};
@@ -19,6 +19,8 @@ mod pyrest_scf_io;
 pub mod scfrecord;
 pub mod smear;
 pub mod util;
+pub mod occupation;
+pub mod force_state_occupation;
 
 #[cfg(feature = "mpi")]
 use mpi::collective::SystemOperation;
@@ -47,6 +49,8 @@ use self::util::norm;
 use smear::apply_smearing;
 use smear::annealed_sigma;
 
+#[cfg(feature = "scalapack")]
+use tensors::distributedmatrixfull::_hamiltonian_distributed_solver;
 #[allow(unused_imports)]
 use tensors::BasicMatUp;
 
@@ -173,9 +177,13 @@ impl SCF {
         };
 
         // at first check the scf type: RHF, ROHF or UHF
-        scf_data.scftype = if mol.num_elec[1]==mol.num_elec[2] && ! mol.ctrl.spin_polarization {
+        // Use the spin multiplicity (ctrl.spin) rather than num_elec[1]/[2] so the
+        // detection is valid even when the basis is loaded from a chkfile
+        // (basis_path='chkfile'), where num_elec is [0,0,0] until update_basis_from_hdf5chk.
+        // num_elec[1] != num_elec[2]  <=>  ctrl.spin > 1.0, so this is equivalent.
+        scf_data.scftype = if mol.ctrl.spin <= 1.0 && ! mol.ctrl.spin_polarization {
             SCFType::RHF
-        } else if mol.num_elec[1]!=mol.num_elec[2] && ! mol.ctrl.spin_polarization {
+        } else if mol.ctrl.spin > 1.0 && ! mol.ctrl.spin_polarization {
             SCFType::ROHF
         } else {      
             SCFType::UHF
@@ -2062,7 +2070,15 @@ impl SCF {
                     _ => {
                         if self.rimatr_sr.is_some() {
                             let dm = &self.density_matrix;
-                            vk_upper_with_rimatr_use_dm_only_sync(&self.rimatr_sr, dm, spin_channel, scaling_ksr)
+                            // rimatr_sr is aux-column-distributed under MPI: use the
+                            // MPI-aware kernel (per-rank partial contraction + reduce)
+                            vk_upper_with_rimatr_use_dm_only_sync_mpi(
+                                &self.rimatr_sr,
+                                dm,
+                                spin_channel,
+                                scaling_ksr,
+                                mpi_operator,
+                            )
                         } else if self.ri3fn_sr.is_some() {
                             let dm = &self.density_matrix;
                             vk_upper_with_ri_v_use_dm_only_sync(&self.ri3fn_sr, dm, spin_channel, scaling_ksr)
@@ -2170,6 +2186,31 @@ impl SCF {
         };
         (exc_total, vxc_total)
 
+    }
+
+    /// Recompute PcmScf (veff, q_sym, solvent energy) from the current density matrix.
+    /// Called both before the first Fock build (solvent-consistent initial guess /
+    /// chkfile restart) and once per SCF iteration.
+    pub fn refresh_solvent(&mut self) {
+        if let Some(solvent_static) = self.solvent_static_obj.as_ref() {
+            let s_static = PcmScf::get_pcm_refresh(
+                &solvent_static.surface,
+                &self.mol,
+                &self.density_matrix,
+                &solvent_static.pstatic.K,
+                &solvent_static.pstatic.K_ipiv,
+                &solvent_static.pstatic.R,
+                &solvent_static.pstatic.v_grids_n,
+                &self.mol.spin_channel,
+                &self.mol.ctrl.max_memory,
+                &self.mol.ctrl.solv_chunk,
+                self.mol.ctrl.solvent_ri
+            );
+            // SMD: CDS energy from PcmStatic (computed once in solvent_prepare)
+            let e_cds = solvent_static.pstatic.e_cds.unwrap_or(0.0);
+            self.energies.insert(String::from("solvent_energy"), vec![s_static.eng + e_cds]);
+            self.solvent_scf = Some(s_static);
+        }
     }
 
     pub fn compute_ghost_charge_forces(&self) -> Option<MatrixFull<f64>> {
@@ -2667,10 +2708,19 @@ impl SCF {
     }
 
     //pub fn evaluate_xc_energy
-       
+
 
     pub fn diagonalize_hamiltonian(&mut self, mpi_operator: &Option<MPIOperator>) {
+        #[cfg(feature = "scalapack")]
+        {
+            if diagonalize_hamiltonian_distributed_check(&self, mpi_operator) {
+                (self.eigenvectors, self.eigenvalues, self.mol.num_state) = diagonalize_hamiltonian_distributed(&self, mpi_operator);
+                return;
+            }
+        }
+
         (self.eigenvectors, self.eigenvalues, self.mol.num_state) = diagonalize_hamiltonian_outside(&self, mpi_operator);
+
     }
 
     pub fn semi_diagonalize_hamiltonian(&mut self) {
@@ -2725,12 +2775,19 @@ impl SCF {
             g_err[i_spin] = norm(&self.grad_dm[i_spin], "l2");
         }
 
-        if spin_channel==1 {
-            info!("SCF Change: DM {:10.5e}; eev {:10.5e} Ha; etot {:10.5e} Ha; grad {:10.5e} Ha",
-                dm_err[0], eev_err, diff_energy, g_err[0])
-        } else {
-            info!("SCF Change: DM ({:10.5e},{:10.5e}); eev {:10.5e} Ha; etot {:10.5e} Ha; grad ({:10.5e},{:10.5e}) Ha",
-                dm_err[0], dm_err[1], eev_err, diff_energy, g_err[0], g_err[1])
+        match self.scftype {
+            SCFType::RHF => {
+                info!("SCF Change: DM {:10.5e}; eev {:10.5e} Ha; etot {:10.5e} Ha; grad {:10.5e} Ha",
+                    dm_err[0], eev_err, diff_energy, g_err[0])
+            }
+            SCFType::ROHF => {
+                info!("SCF Change: DM ({:10.5e},{:10.5e}); eev {:10.5e} Ha; etot {:10.5e} Ha; grad {:10.5e} Ha",
+                    dm_err[0], dm_err[1], eev_err, diff_energy, g_err[0])
+            }
+            SCFType::UHF => {
+                info!("SCF Change: DM ({:10.5e},{:10.5e}); eev {:10.5e} Ha; etot {:10.5e} Ha; grad ({:10.5e},{:10.5e}) Ha",
+                    dm_err[0], dm_err[1], eev_err, diff_energy, g_err[0], g_err[1])
+            }
         };
 
         if scftracerecode.num_iter<2 {
@@ -3028,20 +3085,21 @@ impl SCF {
             let (mut total_elec, exc, mut vxc) = self.generate_vxc_rayon_dm_only(scaling_factor);
 
             let mut tot_exc = mpi_reduce(world, &[exc], 0, &SystemOperation::sum())[0];
-            //mpi_broadcast(&world, &mut tot_exc, 0);
+            mpi_broadcast(&world, &mut tot_exc, 0);
 
             let mut tot_elec = mpi_reduce(world, &total_elec, 0, &SystemOperation::sum());
             total_elec.iter_mut().zip(tot_elec.iter()).for_each(|(to, from)| *to = *from);
-            //mpi_broadcast(&world, &mut total_elec, 0);
+            mpi_broadcast(&world, &mut total_elec, 0);
 
             //let mut tot_xc: Vec<MatrixUpper<f64>> = vec![MatrixUpper::empty(), MatrixUpper::empty()];
             for i_spin in 0..self.mol.spin_channel {
                 let mut result= mpi_reduce(world, vxc[i_spin].data_ref().unwrap(), 0, &SystemOperation::sum());
+                mpi_broadcast_vector(&world, &mut result, 0);
+
                 let mut xc_spin = vxc.get_mut(i_spin).unwrap();
-                //mpi_broadcast_vector(&world, &mut result, 0);
                 //if mpi_world.rank==0 {
                     xc_spin.data = result;
-                //}
+                //} 
             } 
 
             (total_elec, tot_exc, vxc)
@@ -3084,12 +3142,13 @@ impl SCF {
             //let mut tot_xc: Vec<MatrixUpper<f64>> = vec![MatrixUpper::empty(), MatrixUpper::empty()];
             for i_spin in 0..self.mol.spin_channel {
                 let mut result= mpi_reduce(world, vxc[i_spin].data_ref().unwrap(), 0, &SystemOperation::sum());
+                // the vxc matrix must be identical on all ranks: reduce to root,
+                // then broadcast back (otherwise non-root ranks keep only their
+                // local-grid partial vxc and the Fock/semi-canonical quantities diverge)
+                mpi_broadcast_vector(&world, &mut result, 0);
 
                 let mut xc_spin = vxc.get_mut(i_spin).unwrap();
-                //mpi_broadcast_vector(&world, &mut result, 0);
-                if mpi_world.rank==0 {
-                    xc_spin.data = result;
-                } 
+                xc_spin.data = result;
             } 
 
             (total_elec, tot_exc, vxc)
@@ -4780,6 +4839,101 @@ pub fn diagonalize_hamiltonian_outside(scf_data: &SCF, mpi_operator: &Option<MPI
     (eigenvectors, eigenvalues, scf_data.mol.num_state)
 }
 
+#[cfg(feature = "scalapack")]
+pub fn diagonalize_hamiltonian_distributed_check(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> bool {
+    // The `[ctrl] hamiltonian_distributed` keyword forces the decision:
+    //   "on"  -> always use the distributed (ScaLAPACK) solver,
+    //   "off" -> never use it,
+    //   "auto" (default) -> decide by problem size below.
+    match scf_data.mol.ctrl.hamiltonian_distributed {
+        crate::ctrl_io::HamiltonianDistributedMode::Off => return false,
+        crate::ctrl_io::HamiltonianDistributedMode::On => {
+            if let Some(mpi_io) = mpi_operator {
+                assert!(mpi_io.size >= 2);
+                // ScaLAPACK needs a block size strictly smaller than the global
+                // dimension; a 1x1 problem has no distributed representation.
+                return scf_data.hamiltonian[0].size()[0] >= 2;
+            }
+            return false;
+        }
+        crate::ctrl_io::HamiltonianDistributedMode::Auto => {}
+    }
+    if let Some(mpi_io) = mpi_operator {
+        let size = mpi_io.size;
+        assert!(size >= 2);
+        let (num_grid_row, num_grid_col) = (mpi_io.cblacsgrid.nprow, mpi_io.cblacsgrid.npcol);
+        let problem_size = scf_data.hamiltonian[0].size()[0];
+        if (256 * num_grid_row as usize > problem_size) && (256 * num_grid_col as usize > problem_size) {
+            //println!("matrix too small, return to serial solver.");
+            return false;
+        }
+    }
+    else {
+        //println!("use solver for smaller problems, return to serial solver.");
+        return false;
+    }
+    //println!("use distributed solver.");
+    return true;
+}
+
+#[cfg(feature = "scalapack")]
+pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> ([MatrixFull<f64>;2], [Vec<f64>;2], usize) {
+
+    #[cfg(not(feature = "mpi"))]
+    { panic!("try to call distributed solver without mpi. this should not happen."); }
+
+    #[cfg(feature = "mpi")]
+    if let Some(mpi_io) = mpi_operator {
+        let spin_channel = scf_data.mol.spin_channel;
+        let mut num_state = scf_data.mol.num_state;
+        let mut eigenvectors = [MatrixFull::empty(),MatrixFull::empty()];
+        let mut eigenvalues = [Vec::new(),Vec::new()];
+
+        let grid = &mpi_io.cblacsgrid;
+        let world = &mpi_io.world;
+
+        match scf_data.scftype {
+            SCFType::RHF | SCFType::UHF => {
+                for i_spin in (0..spin_channel) {
+                    match _hamiltonian_distributed_solver(&scf_data.hamiltonian[i_spin], &scf_data.ovlp, &mut num_state, grid, world) {
+                        Some((eigenvector_spin, eigenvalue_spin)) => {
+                            eigenvectors[i_spin] = eigenvector_spin;
+                            eigenvalues[i_spin] = eigenvalue_spin;
+                        }
+                        None => {
+                            // distributed solve failed (e.g. non-convergence for small
+                            // / ill-conditioned systems); fall back to the serial solver.
+                            println!("WARNING: distributed (ScaLAPACK) Hamiltonian solver failed; falling back to the serial solver.");
+                            (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
+                            return (eigenvectors, eigenvalues, num_state);
+                        }
+                    }
+                }
+            },
+            SCFType::ROHF => {
+                // diagonalize Roothaan Fock matrix
+                match _hamiltonian_distributed_solver(scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp, &mut num_state, grid, world) {
+                    Some((eigenvector, eigenvalue)) => {
+                        eigenvectors[0] = eigenvector;
+                        eigenvalues[0] = eigenvalue;
+                    }
+                    None => {
+                        println!("WARNING: distributed (ScaLAPACK) Hamiltonian solver failed; falling back to the serial solver.");
+                        (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
+                        return (eigenvectors, eigenvalues, num_state);
+                    }
+                }
+            }
+        };
+        (eigenvectors, eigenvalues, num_state)
+
+    } else
+    {
+        panic!("try to call distributed solver with null mpi operator. this should not happen.");
+    }
+
+}
+
 pub fn diagonalize_hamiltonian_outside_fast(scf_data: &SCF)  -> ([MatrixFull<f64>;2], [Vec<f64>;2], usize) {
     let spin_channel = scf_data.mol.spin_channel;
     let mut num_state = scf_data.mol.num_state;
@@ -5084,6 +5238,12 @@ pub fn initialize_scf(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
 }
 
 pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
+    // refresh solvent with the initial-guess density, so that the first Fock
+    // build below is already solvent-consistent (chkfile restart converges in
+    // few iterations; also fixes the noiter path where solvent_scf stayed None)
+    if scf_data.mol.ctrl.solvent_enabled {
+        scf_data.refresh_solvent();
+    }
     scf_data.generate_hf_hamiltonian(mpi_operator);
     scf_data.grad_dm = scf_data.get_grad_dm();
 
@@ -5091,11 +5251,14 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
 
     if scf_data.mol.ctrl.print_level>0 {
         info!("The total energy: {:20.10} Ha by the initial guess",scf_data.scf_energy);
-        if scf_data.mol.spin_channel==1 {
-            info!("Initial grad_dm l2: {:10.5e} Ha", norm(&scf_data.grad_dm[0], "l2"));
-        } else {
-            info!("Initial grad_dm l2: ({:10.5e},{:10.5e}) Ha",
-                norm(&scf_data.grad_dm[0], "l2"), norm(&scf_data.grad_dm[1], "l2"));
+        match scf_data.scftype {
+            SCFType::RHF | SCFType::ROHF => {
+                info!("Initial grad_dm l2: {:10.5e} Ha", norm(&scf_data.grad_dm[0], "l2"))
+            }
+            SCFType::UHF => {
+                info!("Initial grad_dm l2: ({:10.5e},{:10.5e}) Ha",
+                    norm(&scf_data.grad_dm[0], "l2"), norm(&scf_data.grad_dm[1], "l2"))
+            }
         }
     }
     //let mut scf_continue = true;
@@ -5175,25 +5338,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
 
         let dt_solv0 = time::Local::now();
         if scf_data.mol.ctrl.solvent_enabled {
-            if let Some(solvent_static) = scf_data.solvent_static_obj.as_ref() {
-                let s_static = PcmScf::get_pcm_refresh(
-                    &solvent_static.surface,
-                    &scf_data.mol,
-                    &scf_data.density_matrix,
-                    &solvent_static.pstatic.K,
-                    &solvent_static.pstatic.K_ipiv,
-                    &solvent_static.pstatic.R,
-                    &solvent_static.pstatic.v_grids_n,
-                    &scf_data.mol.spin_channel,
-                    &scf_data.mol.ctrl.max_memory,
-                    &scf_data.mol.ctrl.solv_chunk,
-                    scf_data.mol.ctrl.solvent_ri
-                );
-                // SMD: CDS energy from PcmStatic (computed once in solvent_prepare)
-                let e_cds = solvent_static.pstatic.e_cds.unwrap_or(0.0);
-                scf_data.energies.insert(String::from("solvent_energy"), vec![s_static.eng + e_cds]);
-                scf_data.solvent_scf = Some(s_static);
-            }
+            scf_data.refresh_solvent();
         }
         let dt_solv1 = time::Local::now();
 
@@ -5291,7 +5436,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     }
     match scf_data.mol.ctrl.occupation_type {
         OCCType::FRAC => {
-            let (occupation, homo, lumo) = check_norm::generate_occupation_integer(&scf_data.mol, &scf_data.scftype);
+            let (occupation, homo, lumo) = occupation::generate_occupation_integer(&scf_data.mol, &scf_data.scftype);
             scf_data.occupation = occupation;
             scf_data.homo = homo;
             scf_data.lumo = lumo;
@@ -5700,12 +5845,19 @@ impl SCF {
     pub fn get_grad_dm(&self) -> [MatrixFull<f64>; 2] {
         let ovlp_full = self.ovlp.to_matrixfull().unwrap();
         let mut e = [MatrixFull::empty(), MatrixFull::empty()];
+        if let SCFType::ROHF = self.scftype {
+            let dm_tot = self.density_matrix[0].clone() + self.density_matrix[1].clone();
+            let fock = self.roothaan_hamiltonian.as_ref().unwrap().to_matrixfull().unwrap();
+            let grad = get_grad_dm(&fock, &ovlp_full, &dm_tot);
+            return [grad, MatrixFull::empty()];
+        }
         for i_spin in 0..self.mol.spin_channel {
             let f = self.hamiltonian[i_spin].to_matrixfull().unwrap();
             e[i_spin] = get_grad_dm(&f, &ovlp_full, &self.density_matrix[i_spin]);
         }
         e
     }
+
 }
 
 impl SCF {

@@ -72,7 +72,7 @@ fn build_pade_and_qp_func(
         .iter()
         .map(|&lambda| {
             let sigma_c = pyrest::ri_gw::calculate_sigma_c_imag_freq(
-                w_c_at_freqs, n, lambda, gwqp_g,
+                w_c_at_freqs, n, lambda, 0.0, gwqp_g,
             );
             ImaginaryAxisSample::new(lambda, sigma_c)
         })
@@ -101,7 +101,6 @@ fn ac_gw_h2_sto3g_produces_finite_qp_energies() {
         ac_num_samples: 8,
         ac_omega_max: 2.0,
         ac_eta: 0.005,
-        threshold: 5.0,
         gw_imag_rayon: false,
         gw_search_grid: 21,
         gw_span_energy: 0.1,
@@ -200,7 +199,6 @@ fn ac_gw_h2_sto3g_produces_finite_qp_energies() {
         gw_variant: GwVariant::Cd,
         gw_scheme: "extrapolated".to_string(),
         gw_rootfinder: "interpolation".to_string(), // CD standard solver
-        threshold: 5.0,
         gw_imag_rayon: false,
         gw_search_grid: 21,
         gw_span_energy: 0.1,
@@ -209,7 +207,7 @@ fn ac_gw_h2_sto3g_produces_finite_qp_energies() {
     pyrest::ri_gw::initialize_qp_g_w(&mut scf_data_cd);
     let vxc_nn_cd = pyrest::ri_gw::vxc_ao2mo(&scf_data_cd);
     let gwqp_cd = pyrest::ri_gw::scgw::gw_near_fermi_surface(
-        &mut scf_data_cd, 16, &vxc_nn_cd, 5.0,
+        &mut scf_data_cd, 16, &vxc_nn_cd, 5.0, 5.0,
     );
 
     println!("{:>4}  {:>12}  {:>12}  {:>12}",

@@ -3295,6 +3295,11 @@ pub struct Grids {
     pub ao_compressed: Option<CompressedGridAO>,
     /// Compressed AOP storage
     pub aop_compressed: Option<CompressedGridAOP>,
+    /// Atomic index of the center each grid point was generated on;
+    /// `usize::MAX` if the point is not associated with any atom (e.g. external grids)
+    pub atm_idx: Vec<usize>,
+    /// Quadrature weight (radial * angular) of each grid point, before Becke partitioning
+    pub quadrature_weights: Vec<f64>,
 }
 
 impl Grids {
@@ -3310,6 +3315,8 @@ impl Grids {
             ao_cutoff: 0.0,
             ao_compressed: None,
             aop_compressed: None,
+            atm_idx: Vec::new(),
+            quadrature_weights: Vec::new(),
         };
 
         if ! &mol.ctrl.external_grids.to_lowercase().eq("none") &&
@@ -3351,20 +3358,27 @@ impl Grids {
 
             utilities::timing(&dt0, Some("Importing the grids"));
 
+            // external grids carry no per-atom information, and their weights are used
+            // as they are (no Becke partitioning is applied)
+            let mut atm_idx = vec![usize::MAX; weights.len()];
+            let mut quadrature_weights = weights.clone();
+
             let num_threads = rayon::current_num_threads();
-            utilities::apply_round_robin_permutation(&mut coordinates, &mut weights);
+            utilities::apply_round_robin_permutation(&mut coordinates, &mut weights, &mut atm_idx, &mut quadrature_weights);
             let parallel_balancing = balancing(coordinates.len(), num_threads);
 
             global_grid = Grids {
                 weights,
                 coordinates,
                 ao: None,
-                aop: None, 
+                aop: None,
                 parallel_balancing,
                 non0tab: None,
                 ao_cutoff: 0.0,
                 ao_compressed: None,
                 aop_compressed: None,
+                atm_idx,
+                quadrature_weights,
             };
             return global_grid;
 
@@ -3402,17 +3416,19 @@ impl Grids {
         let mut num_points: usize = 0;
         let mut coordinates: Vec<[f64;3]> =vec![];
         let mut weights:Vec<f64> = vec![];
+        let mut atm_idx: Vec<usize> = vec![];
+        let mut quadrature_weights: Vec<f64> = vec![];
 
         alpha_min.iter().zip(alpha_max.iter()).enumerate().for_each(|(center_index,value)| {
-            let (rs_atom, ws_atom) = gen_grids::atom_grid(
-                value.0.clone(), 
-                value.1.clone(), 
-                radial_precision, 
-                min_num_angular_points, 
-                max_num_angular_points, 
-                proton_charges.clone(), 
-                center_index, 
-                center_coordinates_bohr.clone(), 
+            let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid(
+                value.0.clone(),
+                value.1.clone(),
+                radial_precision,
+                min_num_angular_points,
+                max_num_angular_points,
+                proton_charges.clone(),
+                center_index,
+                center_coordinates_bohr.clone(),
                 hardness,
                 pruning.clone(),
                 rad_grid_method.clone(),
@@ -3423,22 +3439,26 @@ impl Grids {
             num_points += rs_atom.len();
             coordinates.extend(rs_atom.iter().map(|value| [value.0,value.1,value.2]));
             weights.extend(ws_atom);
+            atm_idx.extend(vec![center_index; rs_atom.len()]);
+            quadrature_weights.extend(ws_quad_atom);
         });
 
         utilities::timing(&dt0, Some("Generating the grids"));
         let num_threads = rayon::current_num_threads();
-        utilities::apply_round_robin_permutation(&mut coordinates, &mut weights);
+        utilities::apply_round_robin_permutation(&mut coordinates, &mut weights, &mut atm_idx, &mut quadrature_weights);
         let parallel_balancing = balancing(coordinates.len(), num_threads);
         global_grid = Grids {
             weights,
             coordinates,
             ao: None,
-            aop: None, 
+            aop: None,
             parallel_balancing,
             non0tab: None,
             ao_cutoff: 0.0,
             ao_compressed: None,
             aop_compressed: None,
+            atm_idx,
+            quadrature_weights,
         };
 
         if let Some(mpi_data) = &mut mol.mpi_data {
@@ -3461,19 +3481,21 @@ impl Grids {
 
         let mut coordinates: Vec<[f64;3]> =vec![];
         let mut weights:Vec<f64> = vec![];
+        let mut atm_idx: Vec<usize> = vec![];
+        let mut quadrature_weights: Vec<f64> = vec![];
         let mut num_points:usize = 0;
         //println!("{:?}, {:?}",&alpha_min, &alpha_max);
 
         alpha_min.iter().zip(alpha_max.iter()).enumerate().for_each(|(center_index,value)| {
-            let (rs_atom, ws_atom) = gen_grids::atom_grid(
-                value.0.clone(), 
-                value.1.clone(), 
-                radial_precision, 
-                min_num_angular_points, 
-                max_num_angular_points, 
-                proton_charges.clone(), 
-                center_index, 
-                center_coordinates_bohr.clone(), 
+            let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid(
+                value.0.clone(),
+                value.1.clone(),
+                radial_precision,
+                min_num_angular_points,
+                max_num_angular_points,
+                proton_charges.clone(),
+                center_index,
+                center_coordinates_bohr.clone(),
                 hardness,
                 pruning.clone(),
                 rad_grid_method.clone(),
@@ -3485,6 +3507,8 @@ impl Grids {
             num_points += rs_atom.len();
             coordinates.extend(rs_atom.iter().map(|value| [value.0,value.1,value.2]));
             weights.extend(ws_atom);
+            atm_idx.extend(vec![center_index; rs_atom.len()]);
+            quadrature_weights.extend(ws_quad_atom);
         });
 
 
@@ -3498,6 +3522,8 @@ impl Grids {
             ao_cutoff: 0.0,
             ao_compressed: None,
             aop_compressed: None,
+            atm_idx,
+            quadrature_weights,
         };
         if let Some(local_mpi_data) = mpi_data {
             return local_mpi_data.distribute_grids_tasks(&global_grid);
@@ -3534,8 +3560,10 @@ impl Grids {
 
         let mut coordinates: Vec<[f64; 3]> = vec![];
         let mut weights: Vec<f64> = vec![];
+        let mut atm_idx: Vec<usize> = vec![];
+        let mut quadrature_weights: Vec<f64> = vec![];
         alpha_min.iter().zip(alpha_max.iter()).enumerate().for_each(|(center_index, value)| {
-            let (rs_atom, ws_atom) = gen_grids::atom_grid(
+            let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid(
                 value.0.clone(),
                 value.1.clone(),
                 radial_precision,
@@ -3551,6 +3579,8 @@ impl Grids {
             );
             coordinates.extend(rs_atom.iter().map(|value| [value.0, value.1, value.2]));
             weights.extend(ws_atom);
+            atm_idx.extend(vec![center_index; rs_atom.len()]);
+            quadrature_weights.extend(ws_quad_atom);
         });
 
         Grids {
@@ -3563,6 +3593,8 @@ impl Grids {
             ao_cutoff: 0.0,
             ao_compressed: None,
             aop_compressed: None,
+            atm_idx,
+            quadrature_weights,
         }
     }
 
@@ -6076,6 +6108,8 @@ fn test_non0tab_build() {
         ao_cutoff: 1e-10,
         ao_compressed: None,
         aop_compressed: None,
+        atm_idx: vec![0; 100],
+        quadrature_weights: vec![1.0; 100],
     };
     assert!(grids.non0tab.is_some());
     assert_eq!(grids.ao_cutoff, 1e-10);
@@ -6091,6 +6125,8 @@ fn test_non0tab_build() {
         ao_cutoff: 0.0,
         ao_compressed: None,
         aop_compressed: None,
+        atm_idx: vec![0; 100],
+        quadrature_weights: vec![1.0; 100],
     };
     assert!(grids2.non0tab.is_none());
     assert_eq!(grids2.ao_cutoff, 0.0);
@@ -6311,6 +6347,8 @@ fn test_non0tab_contract_response_offset() {
         ao_cutoff: 1e-10,
         ao_compressed: Some(compressed),
         aop_compressed: Some(aop_compressed),
+        atm_idx: vec![0; ngrids],
+        quadrature_weights: vec![1.0; ngrids],
     };
 
     // Build global vrho: 1.0 for grids 0..8, 2.0 for grids 8..16

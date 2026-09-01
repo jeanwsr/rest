@@ -185,7 +185,7 @@ impl Default for QuasiParticle {
             save_qp:false,
             bse_davidson_solver:false,
             davidson_target_excitations:6,
-            davidson_converge_threshold:1e-6,
+            davidson_converge_threshold:1e-10,
             davidson_maximum_subspace_size:2,
             davidson_restart_dimensions:5,
             davidson_add_dimensions:4,
@@ -530,8 +530,8 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 other => {0.001},
             };
             tmp_input.davidson_converge_threshold = match tmp_ctrl.get("davidson_converge_threshold").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-6_f64)},
-                other => {1e-6},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-10_f64)},
+                other => {1e-10},
             };
             tmp_input.davidson_target_excitations = match tmp_ctrl.get("davidson_target_excitations").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(6_usize)},

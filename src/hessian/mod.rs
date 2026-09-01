@@ -5,5 +5,5 @@ pub mod rks;
 pub mod xc_hessian;
 pub use rhf::{
     compute_hessian, compute_frequencies, compute_frequencies_from_hessian,
-    rhf_hessian_main,
+    rhf_hessian_main, HessianOutput,
 };

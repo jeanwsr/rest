@@ -519,7 +519,7 @@ BSE计算在 `gw_or_bse = “bse”` 时进行，在GW准粒子能量（或从�
 - `bse_cutoff_energy`: 取值f64，单位Hartree。KS能级高于此能量的虚轨道将被排除在BSE激发空间之外，缩减BSE kernel维度。建议根据体系设置为合理值（含几百条虚轨道即可），缺省为1e6（几乎不截断）。
 - `davidson_target_excitations`: 取值usize，需要计算的激发态数目。缺省为6。
 - `bse_davidson_solver`: 取值bool，设置为 `true` 使用Davidson迭代对角化（推荐用于仅需少数低能激发态的体系），设置为 `false`（缺省）使用完整矩阵对角化（适合小体系或需要全部激发态的情况）。
-- `davidson_converge_threshold`: 取值f64，Davidson求解器的收敛阈值。缺省为1e-6。
+- `davidson_converge_threshold`: 取值f64，Davidson求解器的收敛阈值。缺省为1e-10。收敛判据：`||r|| < sqrt(tol)` 且 `|de| < tol`。
 - `davidson_max_iter`: 取值usize，Davidson最大迭代次数。缺省为20。
 - `davidson_maximum_subspace_size`: 取值usize，Davidson最大子空间维度倍数。实际最大子空间 = max(目标激发数 × 此值, 最小维度)。缺省为2。
 - `davidson_restart_dimensions`: 取值usize，Davidson重启动维度。当子空间达到上限后，收缩至此数量的近似特征向量后再继续扩张。缺省为5。
@@ -612,10 +612,12 @@ bse_davidson_solver = true
 ```
 ## 溶剂化计算相关设置
 - `solvent_model`: 取值String, 用于指定用于计算的溶剂模型。目前支持CPCM, COSMO, IEFPCM, SS(V)PE,SMD。缺省为CPCM。SMD及其梯度为实验性功能。
-- `solvent`: 取值String。支持溶剂见用户手册。进行CPCM, COSMO, IEFPCM, SS(V)PE计算请设置此项(推荐)或`solv_epsilon`(进阶, 自定义用)。使用SMD进行计算请设置此项(推荐)或`solvent_descriptors`(进阶, 自定义用)。
-- `solv_epsilon`: 取值f64, 为溶质的介电常数。缺省为1.0 (真空)。介电常数表可以参考用户手册或 <http://sobereva.com/g09/k_scrf.htm> 的最后。
-- `solvent_descriptors`: 取值[f64, 8]。各项含义见<https://comp.chem.umn.edu/solvation/mnsddb.pdf>。第二项25度折射率为非必须项，可以设为-1.0。
+- `solvent`: 取值String。支持溶剂见[用户手册](https://gitee.com/restgroup/rest_doc/blob/master/source_zh/user/solvent.md)。
+
+溶剂化计算进阶自定义设置
 - `solvent_ri`: 取值bool, 设置为true为溶剂化能计算开启辅助基，设置为false溶剂化计算不开启辅助基。缺省为true。目前溶剂化梯度(job_type = "opt"/"force")计算没有用辅助基。
+- `solv_epsilon`: 取值f64, 为溶质的介电常数。缺省为1.0 (真空)。介电常数表可以参考用户手册或 <http://sobereva.com/g09/k_scrf.htm> 的最后。此项为进行PCM(包括CPCM, COSMO, IEFPCM, SS(V)PE)计算的参数，设置后可以不用设置`solvent`参数。
+- `solvent_descriptors`: 取值[f64, 8]。各项含义见[用户手册](https://gitee.com/restgroup/rest_doc/blob/master/source_zh/user/solvent.md)。第二项25度折射率为非必须项，可以设为-1.0。此项为进行SMD计算的参数，设置后可以不用设置`solvent`参数。
 - `pcm_cavity_radii`: 取值String, 用于指定空腔的半径使用类型。目前支持Bondi, UFF。缺省为UFF。当方法为SMD时将使用特定半径设置，此项不生效。
 - `solvent_enabled`: 取值bool，设置为true则启用溶剂化计算。如果没有`solvent_enabled`字段但有`solvent_model`/`solvent`/`solvent_descriptors`的设置且内容非空的时候，同样启用溶剂化计算。其他情况缺省为false。
 
@@ -641,7 +643,7 @@ TD-DFT方法相关的设置在 `[tddft]` 区块中进行。REST支持基于RI积
 
 REST默认使用Davidson迭代对角化算法求解TD-DFT本征值问题。
 
-- `davidson_tol`: 取值f64，Davidson求解器的收敛阈值。缺省为1e-6。
+- `davidson_tol`: 取值f64，Davidson求解器的收敛阈值。缺省为1e-10。收敛判据：`||r|| < sqrt(tol)` 且 `|de| < tol`。
 - `davidson_max_iter`: 取值usize，Davidson最大迭代次数。缺省为50。
 - `davidson_max_subspace`: 取值usize，最大子空间维度倍数。实际最大子空间 = min(nroots × 此值, 激发空间总维度)。缺省为8。
 
@@ -682,7 +684,7 @@ TD-DFT单重态完整线性响应计算（10个激发态）：
 tddft_method = "lr"
 tddft_spin = "singlet"
 nroots = 10
-davidson_tol = 1.0e-5
+davidson_tol = 1.0e-10
 tddft_cutoff_energy = 50.0
 ```
 
@@ -703,6 +705,11 @@ nroots = 5
 `hessian` 子表位于 `[ctrl]` 区块中，若存在则触发解析Hessian计算；若不存在（缺省），则不进行Hessian计算。子表内的关键词包括：
 
 - `frequencies`: 取值bool，设置为 `true` 在Hessian矩阵计算完成后对角化质量加权Hessian，计算振动频率（cm⁻¹）和简正模式并保存到文件。缺省为false。
+- `solver`: 取值String，CP-HF求解器，可选 `"krylov"`（缺省）或 `"dense"`。
+- `krylov_max_cycle`: 取值usize，Krylov求解器的最大迭代次数。对于绝大多数体系，50轮已足以收敛到机器精度。缺省为50。
+- `krylov_tol`: 取值f64，Krylov求解器的残差范数收敛阈值。缺省为1e-9。实际收敛还受 `krylov_lindep` 约束。
+- `krylov_lindep`: 取值f64，Krylov求解器的线性相关阈值。缺省为1e-15。
+- `krylov_tol_inflation`: 取值f64，容忍系数。若真残差 `||r|| < factor * tol`，接受该解而不触发 per-root 求解。缺省为1000.0。
 - `verbose`: 取值usize，Hessian计算的信息输出等级：
     - `0`：静默模式，仅输出最终结果。
     - `1`（缺省）：正常输出，打印各阶段耗时和Hessian矩阵摘要。
@@ -788,16 +795,18 @@ analdrv_tasks = "freq"
 
 在设置任务后，用户可以在 `[analdrv]` 区块中设置对应的计算选项。该区块的关键词包括：
 - `cphf_level_shift`：CPHF 求解时对 $\varepsilon_i - \varepsilon_a$ 的求解偏移。默认为 0，单位 Hartree。
-- `cphf_tol`：CPHF 中的 Krylov 求解阈值。默认 1e-8，无量纲。实际求解阈值也受制于 `cphf_lindep`，且 `cphf_lindep` 经常是更宽松的阈值。
+- `cphf_tol`：CPHF 中的 Krylov 求解阈值。默认 1e-9，无量纲。实际求解阈值也受制于 `cphf_lindep`。
 - `cphf_max_cycle`：CPHF 最大迭代步数。默认为 42 步。CPHF 与 SCF 不同，一般 6-10 步能收敛。这里的最大步数一般不需要设得很大。
 - `cphf_max_space`：CPHF 中 Krylov 空间的数量。默认为 14。该数值不宜设太小，因为超过该数值时，Krylov 求解器会代入最后一次迭代重新作为初猜，重置求解过程。但该数值设太大会对内存产生压力。
-- `cphf_lindep`：CPHF 中一些数值过程的数值精度阈值。默认 1e-14，无量纲。
+- `cphf_lindep`：CPHF 中一些数值过程的数值精度阈值。默认 1e-15，无量纲。
+- `cphf_tol_inflation`：容忍系数。若 Krylov 真残差 `||r|| < factor * tol`，接受该解而不触发 per-root 求解。缺省为1000.0。
 - `verbose`：打印强度。默认为 None，使用输入卡 `[ctrl]` 区块的 verbose。
 - `atm_list`：选择一部分原子进行 Hessian 计算。默认为 None，即所有原子参与 Hessian 计算。
 - `grid_level_cphf`：CPHF 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None，是 `[ctrl]` 中 grid_generation_level 关键词设定值减 2 (SCF 默认格点级别是 3，对应 Hessian 的级别是 1)；最低级别是 1。
 - `grid_level_skeleton`：Skeleton 导数 (包括 2 阶 Hessian 贡献、1 阶 Fock 贡献) 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None：
   - LDA/GGA 使用与 SCF 同样的格点；
-  - mGGA 将比 `grid_generation_level` 增加 2 级别。
+  - mGGA 分为两种情况：若 `grid_shift_deriv` 为 true 则保持 SCF 格点；若为 false 则将比 `grid_generation_level` 增加 2 级别。
+- `grid_shift_deriv`：是否在 DFT skeleton 导数中引入格点偏移导数 (格点权重对原子核坐标的导数、以及格点坐标偏移产生的导数)。取值 bool，默认为 `true`：引入后 skeleton 导数恢复平移不变性。设为 `false` 时退化为不含格点偏移导数。仅影响 numint_matmul 后端实现；要求标准原子生成的 DFT 格点，若使用外部格点 (`external_grids`)，因格点无原子归属，应设为 `false`。
 - `tol_point_group`：振动分析中的点群对称性判断阈值 (用于计算转动对称性，对熵矫正有贡献)。默认 1e-5，单位 Bohr / sqrt(atom)。
 - `gau_thermo`：是否使用 Gaussian 类型的热力学能矫正。默认 false。该选项仅作参考；目前 REST 的热力学矫正通常是定义 `[thermo]` 区块以进行计算。Gaussian 类型热力学能矫正接受输入卡中 `[thermo]` 区块的关键词 `temperature`, `pressure`, `symmetry_number` 与 `electronic_energy`。
 
@@ -926,7 +935,12 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 
 只要输入卡中存在 `[hessian]` 区块（可位于顶层或嵌套于 `[ctrl]` 下），SCF 收敛后即**无条件**触发解析 Hessian 计算（与 `job_type` 无关）。关键词包括：
 
+- `solver`: 取值 String。CP-HF 求解器，可选 `"krylov"`（缺省）或 `"dense"`。
 - `frequencies`: 取值 bool。是否在 Hessian 计算后顺带做振动频率与简正模分析并输出 `EigenModes.txt`。缺省 false。注意：若同时设置了 `[thermo]` 区块，频率会被自动计算，无需手动开启此项。
+- `krylov_max_cycle`: 取值 usize。Krylov 求解器最大迭代次数，缺省 50。
+- `krylov_tol`: 取值 f64。Krylov 收敛阈值，缺省 1e-9。
+- `krylov_lindep`: 取值 f64。Krylov 线性相关阈值，缺省 1e-15。
+- `krylov_tol_inflation`: 取值 f64。真残差容忍系数，缺省 1000.0。
 - `verbose`: 取值 usize。输出详细程度（0=静默，1=正常，2=调试；调试时额外输出各分量 .npy 文件）。缺省 1。
 - `hessian_matrix_path`: 取值 String。Hessian 矩阵输出路径。缺省 `"./HessianMatrix.txt"`。
 - `eigenmodes_path`: 取值 String。简正模输出路径。缺省 `"./EigenModes.txt"`。
@@ -1029,6 +1043,17 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 - `converge_drms`：取值f64。构型优化中上下两步构型变化的收敛阈值。缺省值：1.2e-3
 - `converge_dmax`：取值f64。最大构型变化的收敛阈值。缺省值：1.8e-3
 - `coordsys`：取值String。坐标系统设置。缺省值："tric"。如果有其他需求见geomeTRIC的官方说明：https://geometric.readthedocs.io/en/latest/
+    - 可选项：`"tric"`（缺省，平动-转动内坐标，适合弱键复合物/团簇）、`"dlc"`（标准离域内坐标，按共价键连接性生成）、`"hdlc"`（混合 DLC，每原子补 Cartesian）、`"cart"`（纯笛卡尔）、`"prim"`/`"tric-p"`（不离域的原始内坐标）
+    - **约束优化（固定原子）仅支持 DLC 类坐标**（`tric`/`dlc`/`hdlc`）；`cart`/`prim`/`tric-p` 用约束时 geomeTRIC 会报错
+- `fac`：取值f64（可选）。geomeTRIC 成键判据中共价半径的乘性因子（`build_topology` 的 `Fac` 参数）。原子间距离 < `fac` ×（共价半径和）时判为成键，键图决定后续生成的内坐标（键长/键角/二面）数目。缺省值：不设置时沿用 geomeTRIC 缺省 1.2。
+    - 对密堆积或含大阳离子的体系（如 SrTiO₃ 团簇、金属有机框架），缺省 1.2 可能将离子接触（如 Sr–O）误判为共价键，生成过多冗余内坐标；此时可降到 **0.9–1.0** 以减少内坐标数目
+    - 取值过小（如 0.8）会漏掉真实共价键，需根据体系经验性调整；普通有机/小分子体系一般无需设置
+- `radii`：取值为内联表（可选），形如 `radii = {"Sr" = 1.0, "Na" = 0.0}`。逐元素覆盖共价半径（geomeTRIC `--radii` 选项），用于精细控制成键拓扑。
+    - 设某元素半径为 `0.0` 可使该元素不与任何原子成键（例如把离子型阳离子 Sr、Na 从内坐标体系中排除），比全局 `fac` 更精准
+    - geomeTRIC 内部有 `mindist = 1.0` Å 的键长阈值下限，因此将短键（< 1.0 Å，如 O–H）的半径调小无效；本选项主要影响长键/离子接触（> 1.0 Å）
+- `check`：取值i32（可选）。每隔指定步数重建内坐标体系（geomeTRIC `--check` 选项）。缺省值：不设置时为 0（关闭）。
+    - 随着优化进行、原子移动，DLC 离域基会逐渐与当前几何失配，导致 geomeTRIC 报告的 `Grad_T` 与真实力偏差越来越大。设置 `check`（如 `10`）可定期刷新内坐标体系，保持 `Grad_T` 的可靠性
+    - 代价是每次重建会损失部分 BFGS Hessian 历史，可能略微增加收敛步数
 - `transition`：取值bool，设置为true则开启过渡态搜索。缺省值为：false（对应于稳态搜索）
 - `hessian`：取值String。决定是否以及何时进行Hessian矩阵计算。**数值 Hessian**（由 geomeTRIC 通过有限差分梯度计算）和 **REST 解析 Hessian**（由 `analytic_hessian` 开关控制）二选一。
     - "never"：不做Hessian矩阵计算（缺省：稳态搜索）
@@ -1091,3 +1116,14 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 		analytic_hessian = true
 	```
     - 启用后，REST 在初始结构上计算解析 Hessian（含 CP-HF 轨道弛豫），写入临时文件并注入 geomeTRIC。geomeTRIC 读取后用于第一步优化方向，后续所有步正常走 BFGS 更新，整个过程不产生任何数值有限差分计算。
+- 例子五：密堆积体系（如 SrTiO₃ 表面团簇）的约束优化——收紧成键判据并定期刷新内坐标
+    ```toml
+	[geometric_pyo3]
+	    coordsys = "tric"
+	    fac = 0.9
+	    radii = {"Sr" = 1.0}
+	    check = 10
+	    maxiter = 300
+	```
+    - `fac = 0.9` 全局收紧成键判据；`radii = {"Sr" = 1.0}` 进一步把 Sr 的共价半径从 1.95 降到 1.0，精确去除 Sr–O 离子接触（两者可单独或组合使用）
+    - `check = 10` 每 10 步重建内坐标体系，防止 DLC 离域基随几何变化而陈旧化

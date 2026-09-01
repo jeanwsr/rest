@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use statrs::function::erf::erfc;
+use libm::erfc;
 use std::f64::consts::PI;
 
 use super::{SCF, SCFType};

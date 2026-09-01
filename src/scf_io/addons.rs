@@ -1,3 +1,4 @@
+use anyhow::Error;
 use crate::scf_io::SCF;
 use crate::scf_io::{vj_upper_with_ri_v, vj_full_with_ri_v,
                     vk_full_fromdm_with_ri_v};
@@ -8,14 +9,13 @@ use rest_tensors::{
     MatrixUpper, 
     //TensorSliceMut, RIFull, MatrixFullSlice, MatrixFullSliceMut
     };
-use rest_tensors::{davidson_solve, DavidsonParams};
 use itertools::{//Itertools, 
                 iproduct, 
                 //izip
                 };
 use tensors::MathMatrix;
 use crate::scf_io::util;
-use anyhow::{Error};
+use crate::solvers::davidson::{tda_davidson_solver, DavidsonConfig};
 
 impl SCF {
 
@@ -28,8 +28,7 @@ impl SCF {
         // See JCP 66, 3045 (1977); DOI:10.1063/1.434318
         //
         let spin_channel = self.mol.ctrl.spin_channel;
-        let print_level = self.mol.ctrl.print_level;
-        let params = DavidsonParams{tol:1e-4, maxspace:15, ..DavidsonParams::default()};
+        let config = DavidsonConfig{tol:1e-5, max_subspace:15, ..DavidsonConfig::default()};
         let mut conv:Vec<bool> = vec![];
         let mut e:Vec<f64> = vec![];
         let mut v_i:Vec<Vec<f64>> = vec![];
@@ -52,10 +51,11 @@ impl SCF {
                                                                {*x += 1.0 / hd});
             //println!("hdiag {:?}", hdiag);
             //println!("x0 {:?}", x0);
-            (conv, e, v_i) = davidson_solve(h_op, &mut x0, &mut hdiag, 
-                                              &params,
-                                              print_level
-                           ); 
+            let initial_guess = MatrixFull::from_vec([ov, 1], x0).unwrap();
+            let eigenpairs = tda_davidson_solver(h_op, 1, &hdiag, initial_guess, &config);
+            conv = vec![true; 1];
+            e = vec![eigenpairs[0].0];
+            v_i = vec![eigenpairs[0].1.clone()];
             stable_i = e[0] > -1e-5;
             println!("RHF internal : {:?}", stable_str[stable_i as usize]);
             stable.push(stable_i);
@@ -70,10 +70,11 @@ impl SCF {
                                                                {*x += 1.0 / hd});
             //println!("{:?}", g);
             //println!("x0 {:?}", x0);
-            (conv, e, v_e) = davidson_solve(h_op2, &mut x0, &mut hdiag2, 
-                                              &params,
-                                              print_level
-                           ); 
+            let initial_guess = MatrixFull::from_vec([ov, 1], x0).unwrap();
+            let eigenpairs = tda_davidson_solver(h_op2, 1, &hdiag2, initial_guess, &config);
+            conv = vec![true; 1];
+            e = vec![eigenpairs[0].0];
+            v_e = vec![eigenpairs[0].1.clone()];
             stable_e = e[0] > -1e-5;
             println!("RHF -> UHF : {:?}", stable_str[stable_e as usize]);
             stable.push(stable_e);
@@ -91,10 +92,11 @@ impl SCF {
             x0[0] += 0.2; // break symmetry of init guess
             //println!("hdiag {:?}", hdiag);
             //println!("x0 {:?}", x0);
-            (conv, e, v_i) = davidson_solve(h_op, &mut x0, &mut hdiag, 
-                                              &params,
-                                              print_level
-                           ); 
+            let initial_guess = MatrixFull::from_vec([ov, 1], x0).unwrap();
+            let eigenpairs = tda_davidson_solver(h_op, 1, &hdiag, initial_guess, &config);
+            conv = vec![true; 1];
+            e = vec![eigenpairs[0].0];
+            v_i = vec![eigenpairs[0].1.clone()];
             stable_i = e[0] > -1e-5;
             println!("UHF internal : {:?}", stable_str[stable_i as usize]);
             stable.push(stable_i);
@@ -221,7 +223,7 @@ impl SCF {
 
     }
     pub fn generate_g_hop(&mut self, external: bool) -> Result<(Vec<f64>, Vec<f64>, 
-                                                                    Box<dyn FnMut(&Vec<f64>) -> Vec<f64> + '_>),
+                                                                    impl FnMut(&Vec<f64>) -> Vec<f64> + '_),
                                                                     Error
                                                                   > {
         let num_basis = self.mol.num_basis;
@@ -336,7 +338,7 @@ impl SCF {
 
             sigma_all
         };
-        Ok((g_all, hdiag_all, Box::new(h_op)))
+        Ok((g_all, hdiag_all, h_op))
     }
 
     //pub fn generate_g_hop_uhf(&mut self, external: bool) -> Result<(Vec<f64>, Vec<f64>, 

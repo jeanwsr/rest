@@ -8,7 +8,7 @@ build = "build.rs"
 [dependencies]
 anyhow = "1"
 time = "0.1.12"
-clap = "3.0.0-beta.2"
+clap = "3.*"
 regex = "1.*"
 itertools = "0.15"
 serde_json = "1.0"
@@ -31,8 +31,7 @@ lazy_static = "1.4"
 toml = "0.8"
 #tuple-conv = "1.0.1"
 num-traits = "0.2.15"
-statrs = "0.13"
-rand = "0.3"
+rand = "0.9"
 array_tool = "1.0.3"
 fuzzy-matcher = "0.3.7"
 #ndarray = "0.15.6"
@@ -47,7 +46,7 @@ reqwest = { version = "0.10", default-features = false, features = ["blocking", 
 mpi = {version = "0.8", features = ["user-operations", "derive"], optional = true}
 # for cuda
 #cudarc = "0.10.0"
-rest_tensors = {path="../rest_tensors"}
+rest_tensors = {path="../rest_tensors", default-features = false}
 rest_libcint = {path="../rest_libcint"}
 #liblbfgs = {path="../rust-lbfgs"}
 liblbfgs = "0.1.0"
@@ -79,7 +78,7 @@ features = ["generate-import-lib"]
 #rustdoc-args = [
 #    "--html-in-header",
 #    #".cargo/registry/src/github.com-1ecc6299db9ec823/katex-doc-0.1.0/katex.html",
-#    "/share/home/tygao/REST3.0/rest/katex.html",
+#    (example) "/path/to/rest/katex.html",
 #]
 
 [dev-dependencies]
@@ -93,6 +92,7 @@ dftd4 = ["dep:dftd4"]
 geometric-pyo3 = ["dep:geometric-pyo3"]
 openblas = []
 intel-mkl = []
+scalapack = ["rest_tensors/scalapack", "rest_tensors/mpi"]
 
 #[[bench]]
 #name = "bench_tensors"

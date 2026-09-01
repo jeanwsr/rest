@@ -18,6 +18,7 @@ bse_pool
 src/dft/libxc/names_and_values.rs
 src/solvent/grad_solver_derivation.md
 *.bak
+*.rs.*
 /docs/
 # GeomeTRIC optimization artifacts
 GeomeTRIC*
@@ -32,3 +33,4 @@ _tmp*
 
 # local cargo target used for this task
 /target_u/
+**/.DS_Store

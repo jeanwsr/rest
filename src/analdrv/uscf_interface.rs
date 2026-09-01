@@ -84,35 +84,61 @@ pub fn uscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
                 .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Polarized)))
                 .collect_vec()
         };
-        let verbose = scf_data.mol.ctrl.print_level >= 2;
+        let verbose = scf_data.mol.ctrl.print_level > 2;
 
         // Determine skeleton / cphf grid levels.
-        // - skeleton: LDA/GGA use the SCF DFT grid; MGGA (TAU) adds 2 levels.
+        // - skeleton: the SCF DFT grid; only MGGA (TAU) without the grid-shift adds 2 levels
+        //   (the grid-shift terms restore the grid-related accuracy the finer grid compensated).
         // - cphf:     grid_gen_level.max(3) - 2 (coarser, for the iterative CP-KS response).
         let xc_type = determine_den_type_from_list(&xc_func_list.iter().map(|(_, f)| f).collect_vec());
         let is_mgga = matches!(xc_type, XCDenType::TAU);
         let grid_gen_level = scf_data.mol.ctrl.grid_gen_level;
-        let sk_level = config.grid_level_skeleton.unwrap_or(if is_mgga { grid_gen_level + 2 } else { grid_gen_level });
+        let grid_shift = config.grid_shift_deriv;
+        let sk_level = config.grid_level_skeleton.unwrap_or(if is_mgga && !grid_shift {
+            grid_gen_level + 2
+        } else {
+            grid_gen_level
+        });
         let cphf_level = config.grid_level_cphf.unwrap_or(grid_gen_level.max(3) - 2);
 
-        // skeleton grid: reuse the SCF grid when the level matches, else regenerate.
-        let ni = if sk_level == grid_gen_level {
-            let grid_coords = &scf_data.grids.as_ref().unwrap().coordinates;
-            let grid_weights = &scf_data.grids.as_ref().unwrap().weights;
-            NIMatmul::new(&mol, grid_coords, grid_weights)
-        } else {
-            let sk_grid = Grids::build_with_level(mol_obj, sk_level);
-            NIMatmul::new(&mol, &sk_grid.coordinates, &sk_grid.weights)
+        // skeleton grid: reuse the SCF grid when the level matches, else regenerate.  Either
+        // way, regroup to atom-grouped order (non-decreasing atm_idx): the SCF grid is
+        // round-robin permuted for load balancing, while the Becke grid-shift attribution
+        // requires the ByAtom grouping.  The regrouping only permutes, never changes values.
+        let ni = {
+            use crate::dft::numint_matmul::nimatmul::regroup_grids_by_atom;
+
+            let (coordinates, weights, atm_idx, quadrature_weights) = if sk_level == grid_gen_level {
+                let grids = scf_data.grids.as_ref().unwrap();
+                (
+                    grids.coordinates.clone(),
+                    grids.weights.clone(),
+                    grids.atm_idx.clone(),
+                    grids.quadrature_weights.clone(),
+                )
+            } else {
+                let sk_grid = Grids::build_with_level(mol_obj, sk_level);
+                (sk_grid.coordinates, sk_grid.weights, sk_grid.atm_idx, sk_grid.quadrature_weights)
+            };
+            let (coordinates, weights, atm_idx, quadrature_weights) =
+                regroup_grids_by_atom(coordinates, weights, atm_idx, quadrature_weights, mol.natm());
+            NIMatmul::new(&mol, &coordinates, &weights, &atm_idx, &quadrature_weights)
         };
 
         // cphf grid: when it coincides with the skeleton grid, leave `ni_cpks = None` so the
         // skeleton's vxc/fxc are reused; otherwise build a dedicated (coarser) grid.
         let hess_nimatmul_obj = if cphf_level == sk_level {
-            UHessKSNIMatmul::new(&mol, xc_func_list, ni, verbose)
+            UHessKSNIMatmul::new(&mol, xc_func_list, ni, grid_shift, verbose)
         } else {
             let cphf_grid = Grids::build_with_level(mol_obj, cphf_level);
-            let ni_cpks = NIMatmul::new(&mol, &cphf_grid.coordinates, &cphf_grid.weights);
-            UHessKSNIMatmul::new(&mol, xc_func_list, ni, verbose).set_ni_cpks(ni_cpks)
+            let ni_cpks = NIMatmul::new(
+                &mol,
+                &cphf_grid.coordinates,
+                &cphf_grid.weights,
+                &cphf_grid.atm_idx,
+                &cphf_grid.quadrature_weights,
+            );
+            UHessKSNIMatmul::new(&mol, xc_func_list, ni, grid_shift, verbose).set_ni_cpks(ni_cpks)
         };
         hess_nimatmul_obj
     });

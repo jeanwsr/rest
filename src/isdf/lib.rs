@@ -770,18 +770,18 @@ mod tests {
     });
     }
 
-    use rand::{Rng, SeedableRng, StdRng};
+    use rand::{Rng, SeedableRng};
+    use rand::rngs::StdRng;
     #[test]
     fn test_rnd(){
-        let seed: [usize; 32] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32];
-        let mut rng: StdRng = SeedableRng::from_seed(&seed[..]);
+        let mut rng: StdRng = StdRng::seed_from_u64(12345);
     
         // Generate some random numbers
-        let random_number1: u32 = rng.gen_range(0, 1000);
-        let random_number2: u32 = rng.gen_range(0, 1000);
+        let random_number1: u32 = rng.random_range(0u32..1000);
+        let random_number2: u32 = rng.random_range(0u32..1000);
 
         for _ in 0..32 {
-            let random_number: u32 = rng.gen_range(0, 1001);
+            let random_number: u32 = rng.random_range(0u32..1001);
             println!("Random Number: {}", random_number);
         }
     }

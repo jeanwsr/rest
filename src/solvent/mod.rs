@@ -35,7 +35,7 @@ type TsrView<'a, T> = TensorView<'a, T, DeviceBLAS, IxD>;
 type Tsr<T> = Tensor<T, DeviceBLAS, IxD>;
 fn shuffle<T>(slice: &mut [T], rng: &mut impl Rng) {
     for i in (1..slice.len()).rev() {
-        let j = rng.gen_range(0, i + 1);
+        let j = rng.random_range(0..(i + 1));
         slice.swap(i, j);
     }
 }

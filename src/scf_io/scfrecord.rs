@@ -4,7 +4,7 @@ use crate::mpi_io::MPIOperator;
 use rayon::prelude::*;
 use tensors::matrix_blas_lapack::{_dgemm_full, _dsymm, _pinv, _get_sqrt_and_inv_sqrt};
 use tensors::{BasicMatrix, MathMatrix, MatrixFull, MatrixUpper, TensorOpt, TensorOptMut, TensorSlice};
-use log::{debug};
+use log::{debug, warn};
 
 
 #[derive(Clone)]
@@ -262,13 +262,27 @@ impl ScfTraceRecord {
             //    //self.target_vector.push([scf.hamiltonian[i_spin].clone(), scf.hamiltonian[i_spin].clone()]);
             //    scf.hamiltonian[i_spin].formated_output(5, "upper");
             //}
-            let (cur_error_vec, cur_target) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel, &self.sqrt_inv_ovlp);
+        let (cur_error_vec, cur_target) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel, &self.sqrt_inv_ovlp, &scf.scftype, &scf.roothaan_hamiltonian);
             self.error_vector.push(cur_error_vec);
             self.target_vector.push(cur_target);
 
 
             // solve the DIIS against the error vector
             if let Some(coeff) = diis_solver(&self.error_vector, &self.error_vector.len()) {
+                if let SCFType::ROHF = scf.scftype {
+                    let mut next_roothaan = MatrixFull::new(self.target_vector[0][0].size.clone(), 0.0);
+                    coeff.iter().enumerate().for_each(|(i, value)| {
+                        next_roothaan.self_scaled_add(&self.target_vector[i + start_dim][0], *value);
+                    });
+                    let next_roothaan = next_roothaan.to_matrixupper();
+
+                    if oscillation_flag {
+                        warn_oscillation(&self.energy_records);
+                        scf.roothaan_hamiltonian = Some(damped_mix(&self.prev_hamiltonian[0][0], &next_roothaan, self.mix_param));
+                    } else {
+                        scf.roothaan_hamiltonian = Some(next_roothaan);
+                    }
+                } else {
                 // now extrapolate the fock matrix for the next step
                 (0..spin_channel).into_iter().for_each(|i_spin| {
                     let mut next_hamiltonian = MatrixFull::new(self.target_vector[0][i_spin].size.clone(),0.0);
@@ -278,28 +292,23 @@ impl ScfTraceRecord {
                     let next_hamiltonian = next_hamiltonian.to_matrixupper();
 
                     if oscillation_flag {
-                        if scf.mol.ctrl.print_level>0 {
-                            println!("Energy increase is detected. Turn on the linear mixing algorithm with (H[DIIS, i-1] + H[DIIS, i+1]).");
-                            let length = self.energy_records.len();
-                            println!("Prev_Energies: ({:16.8}, {:16.8})", self.energy_records[length-2], self.energy_records[length-1]);
-                        }
-                        let mut alpha: f64 = self.mix_param;
-                        let mut beta = 1.0-alpha;
-                        scf.hamiltonian[i_spin].data.par_iter_mut().zip(self.prev_hamiltonian[0][i_spin].data.par_iter()).zip(next_hamiltonian.data.par_iter())
-                        .for_each(|((to, prev), new)| {
-                            *to = prev*beta + new*alpha;
-                        });
+                        warn_oscillation(&self.energy_records);
+                        scf.hamiltonian[i_spin] = damped_mix(&self.prev_hamiltonian[0][i_spin], &next_hamiltonian, self.mix_param);
                     } else {
                         scf.hamiltonian[i_spin] = next_hamiltonian;
                     }
                 });
 
+                }
                 // update the previous hamiltonian list to make sure the first item is H[DIIS, i-1]
                 // and the second term is H[DIIS, i]
-                if self.prev_hamiltonian.len() == 2 {self.prev_hamiltonian.remove(0);};
-                self.prev_hamiltonian.push(scf.hamiltonian.clone());
-
-
+                if self.prev_hamiltonian.len() == 2 { self.prev_hamiltonian.remove(0); };
+                if let SCFType::ROHF = scf.scftype {
+                    let fr = scf.roothaan_hamiltonian.clone().unwrap();
+                    self.prev_hamiltonian.push([fr.clone(), fr]);
+                } else {
+                    self.prev_hamiltonian.push(scf.hamiltonian.clone());
+                }
 
             } else {
                 let mut alpha = self.mix_param;
@@ -334,8 +343,13 @@ impl ScfTraceRecord {
             scf.grad_dm = scf.get_grad_dm();
             let cur_density = [scf.density_matrix[0].clone(),
                 if spin_channel>1 { scf.density_matrix[1].clone() } else { MatrixFull::empty() }];
-            let cur_fock = [scf.hamiltonian[0].to_matrixfull().unwrap(),
-                if spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() } else { MatrixFull::empty() }];
+            let cur_fock = if let SCFType::ROHF = scf.scftype {
+                let fr = scf.roothaan_hamiltonian.as_ref().unwrap().to_matrixfull().unwrap();
+                [fr.clone(), fr]
+            } else {
+                [scf.hamiltonian[0].to_matrixfull().unwrap(),
+                 if spin_channel > 1 { scf.hamiltonian[1].to_matrixfull().unwrap() } else { MatrixFull::empty() }]
+            };
             if self.ediis_density.len() == self.num_max_records {
                 self.ediis_density.remove(0); self.ediis_energy.remove(0); self.ediis_fock.remove(0);
             }
@@ -351,12 +365,16 @@ impl ScfTraceRecord {
                 let coeff = ediis_qp_solver(&qmat, &self.ediis_energy, eta);
                 // Fock mixing: F̃ = ΣcᵢFᵢ (paper Eq. 10).
                 // The SCF loop diagonalizes F̃ → idempotent D_next.
-                for i_spin in 0..spin_channel {
-                    let mut next_h = MatrixFull::new(self.ediis_fock[0][i_spin].size.clone(), 0.0);
-                    for (k, ck) in coeff.iter().enumerate() { 
-                        next_h.self_scaled_add(&self.ediis_fock[k][i_spin], *ck); 
+                if let SCFType::ROHF = scf.scftype {
+                    let mut next_r = MatrixFull::new(self.ediis_fock[0][0].size.clone(), 0.0);
+                    for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.ediis_fock[k][0], *ck); }
+                    scf.roothaan_hamiltonian = Some(next_r.to_matrixupper());
+                } else {
+                    for i_spin in 0..spin_channel {
+                        let mut next_h = MatrixFull::new(self.ediis_fock[0][i_spin].size.clone(), 0.0);
+                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
+                        scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                     }
-                    scf.hamiltonian[i_spin] = next_h.to_matrixupper();
                 }
                 if scf.mol.ctrl.print_level > 1 {
                     print!("EDIIS coeff: ["); for ck in &coeff { print!(" {:.4}", ck); } println!(" ]");
@@ -376,13 +394,13 @@ impl ScfTraceRecord {
                 level_shift_applied = true;
             }
             let cur_dens = [scf.density_matrix[0].clone(), if spin_channel>1 { scf.density_matrix[1].clone() } else { MatrixFull::empty() }];
-            let cur_fock = [scf.hamiltonian[0].to_matrixfull().unwrap(), if spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() } else { MatrixFull::empty() }];
+            let cur_fock = if let SCFType::ROHF = scf.scftype { let fr = scf.roothaan_hamiltonian.as_ref().unwrap().to_matrixfull().unwrap(); [fr.clone(), fr] } else { [scf.hamiltonian[0].to_matrixfull().unwrap(), if spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() } else { MatrixFull::empty() }] };
             let max_rec = self.num_max_records;
             if self.target_vector.len() == max_rec { self.target_vector.remove(0); self.error_vector.remove(0); }
             if self.ediis_density.len() == max_rec { 
                 self.ediis_density.remove(0); self.ediis_energy.remove(0); self.ediis_fock.remove(0); 
             }
-            let (cur_err, cur_tgt) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel, &self.sqrt_inv_ovlp);
+            let (cur_err, cur_tgt) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel, &self.sqrt_inv_ovlp, &scf.scftype, &scf.roothaan_hamiltonian);
             self.error_vector.push(cur_err); self.target_vector.push(cur_tgt);
             self.ediis_density.push(cur_dens); self.ediis_energy.push(ediis_e0(scf.scf_energy,
                 scf.smearing_entropy, Some(scf.current_smear_sigma)));
@@ -409,10 +427,16 @@ impl ScfTraceRecord {
                     println!("[EDIIS] rejected: E_pred={:14.8} > E0_cur={:14.8}", e_pred, e0_cur);
                 }
                 if ediis_ok {
-                    for i_spin in 0..spin_channel {
-                        let mut next_h = MatrixFull::new(self.ediis_fock[0][i_spin].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
-                        scf.hamiltonian[i_spin] = next_h.to_matrixupper();
+                    if let SCFType::ROHF = scf.scftype {
+                        let mut next_r = MatrixFull::new(self.ediis_fock[0][0].size.clone(), 0.0);
+                        for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.ediis_fock[k][0], *ck); }
+                        scf.roothaan_hamiltonian = Some(next_r.to_matrixupper());
+                    } else {
+                        for i_spin in 0..spin_channel {
+                            let mut next_h = MatrixFull::new(self.ediis_fock[0][i_spin].size.clone(), 0.0);
+                            for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
+                            scf.hamiltonian[i_spin] = next_h.to_matrixupper();
+                        }
                     }
                     if scf.mol.ctrl.print_level > 1 { print!("[EDIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
                     ediis_used = true;
@@ -420,10 +444,16 @@ impl ScfTraceRecord {
             }
             if !ediis_used && num_diis >= 2 {
                 if let Some(coeff) = diis_solver(&self.error_vector, &num_diis) {
-                    for i_spin in 0..spin_channel {
-                        let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
-                        scf.hamiltonian[i_spin] = next_h.to_matrixupper();
+                    if let SCFType::ROHF = scf.scftype {
+                        let mut next_r = MatrixFull::new(self.target_vector[0][0].size.clone(), 0.0);
+                        for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.target_vector[k][0], *ck); }
+                        scf.roothaan_hamiltonian = Some(next_r.to_matrixupper());
+                    } else {
+                        for i_spin in 0..spin_channel {
+                            let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
+                            for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
+                            scf.hamiltonian[i_spin] = next_h.to_matrixupper();
+                        }
                     }
                     if scf.mol.ctrl.print_level > 1 { print!("[DIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
                 } else {
@@ -450,11 +480,11 @@ impl ScfTraceRecord {
                 level_shift_applied = true;
             }
             let cur_dens = [scf.density_matrix[0].clone(), if spin_channel>1 { scf.density_matrix[1].clone() } else { MatrixFull::empty() }];
-            let cur_fock = [scf.hamiltonian[0].to_matrixfull().unwrap(), if spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() } else { MatrixFull::empty() }];
+            let cur_fock = if let SCFType::ROHF = scf.scftype { let fr = scf.roothaan_hamiltonian.as_ref().unwrap().to_matrixfull().unwrap(); [fr.clone(), fr] } else { [scf.hamiltonian[0].to_matrixfull().unwrap(), if spin_channel>1 { scf.hamiltonian[1].to_matrixfull().unwrap() } else { MatrixFull::empty() }] };
             let max_rec = self.num_max_records;
             if self.target_vector.len() == max_rec { self.target_vector.remove(0); self.error_vector.remove(0); }
             if self.ediis_density.len() == max_rec { self.ediis_density.remove(0); self.ediis_energy.remove(0); self.ediis_fock.remove(0); }
-            let (cur_err, cur_tgt) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel, &self.sqrt_inv_ovlp);
+            let (cur_err, cur_tgt) = generate_diis_error_vector(&scf.hamiltonian, &scf.ovlp, &mut self.density_matrix, spin_channel, &self.sqrt_inv_ovlp, &scf.scftype, &scf.roothaan_hamiltonian);
             self.error_vector.push(cur_err); self.target_vector.push(cur_tgt);
             self.ediis_density.push(cur_dens.clone()); self.ediis_energy.push(ediis_e0(scf.scf_energy,
                 scf.smearing_entropy, Some(scf.current_smear_sigma)));
@@ -483,10 +513,16 @@ impl ScfTraceRecord {
                     println!("[ADIIS] rejected: E_pred={:14.8} > E0_cur={:14.8}", e_pred, e0_cur);
                 }
                 if adiis_ok {
-                    for i_spin in 0..spin_channel {
-                        let mut next_h = MatrixFull::new(self.ediis_fock[0][i_spin].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
-                        scf.hamiltonian[i_spin] = next_h.to_matrixupper();
+                    if let SCFType::ROHF = scf.scftype {
+                        let mut next_r = MatrixFull::new(self.ediis_fock[0][0].size.clone(), 0.0);
+                        for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.ediis_fock[k][0], *ck); }
+                        scf.roothaan_hamiltonian = Some(next_r.to_matrixupper());
+                    } else {
+                        for i_spin in 0..spin_channel {
+                            let mut next_h = MatrixFull::new(self.ediis_fock[0][i_spin].size.clone(), 0.0);
+                            for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.ediis_fock[k][i_spin], *ck); }
+                            scf.hamiltonian[i_spin] = next_h.to_matrixupper();
+                        }
                     }
                     if scf.mol.ctrl.print_level > 1 { print!("[ADIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
                     adiis_used = true;
@@ -494,10 +530,16 @@ impl ScfTraceRecord {
             }
             if !adiis_used && num_diis >= 2 {
                 if let Some(coeff) = diis_solver(&self.error_vector, &num_diis) {
-                    for i_spin in 0..spin_channel {
-                        let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
-                        for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
-                        scf.hamiltonian[i_spin] = next_h.to_matrixupper();
+                    if let SCFType::ROHF = scf.scftype {
+                        let mut next_r = MatrixFull::new(self.target_vector[0][0].size.clone(), 0.0);
+                        for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.target_vector[k][0], *ck); }
+                        scf.roothaan_hamiltonian = Some(next_r.to_matrixupper());
+                    } else {
+                        for i_spin in 0..spin_channel {
+                            let mut next_h = MatrixFull::new(self.target_vector[0][i_spin].size.clone(), 0.0);
+                            for (k, ck) in coeff.iter().enumerate() { next_h.self_scaled_add(&self.target_vector[k][i_spin], *ck); }
+                            scf.hamiltonian[i_spin] = next_h.to_matrixupper();
+                        }
                     }
                     if scf.mol.ctrl.print_level > 1 { print!("[DIIS] coeff:"); for ck in &coeff { print!(" {:.4}", ck); } println!(); }
                 } else {
@@ -570,42 +612,70 @@ pub fn generate_diis_error_vector(hamiltonian: &[MatrixUpper<f64>;2],
                                 ovlp: &MatrixUpper<f64>, 
                                 density_matrix: &mut [Vec<MatrixFull<f64>>;2],
                                 spin_channel: usize,
-                                sqrt_inv_ovlp: &Option<MatrixFull<f64>>) -> (Vec<f64>, [MatrixFull<f64>;2]) {
+                                sqrt_inv_ovlp: &Option<MatrixFull<f64>>,
+                                scftype: &SCFType,
+                                roothaan_hamiltonian: &Option<MatrixUpper<f64>>) -> (Vec<f64>, [MatrixFull<f64>;2]) {
             let mut cur_error = [
                 MatrixFull::new([1,1],0.0),
                 MatrixFull::new([1,1],0.0)
             ];
-            let mut cur_target = [hamiltonian[0].to_matrixfull().unwrap(),
-                 hamiltonian[1].to_matrixfull().unwrap()];
+            let cur_target;
+            let full_ovlp = ovlp.to_matrixfull().unwrap();
 
-            let mut full_ovlp = ovlp.to_matrixfull().unwrap();
-
-            // now generte the error as the commutator of [fds-sdf]
-            (0..spin_channel).into_iter().for_each(|i_spin| {
-                cur_error[i_spin] = super::get_grad_dm(&cur_target[i_spin], &full_ovlp, &density_matrix[1][i_spin]);
-
-                // transfer to an orthogonal basis to improve numerical conditioning
+            match scftype {
+                SCFType::ROHF => {
+                let fock_r = roothaan_hamiltonian.as_ref().unwrap().to_matrixfull().unwrap();
+                cur_target = [fock_r.clone(), MatrixFull::empty()];
+                let dm_tot = density_matrix[1][0].clone() + density_matrix[1][1].clone();
+                let mut e = super::get_grad_dm(&fock_r, &full_ovlp, &dm_tot);
                 if let Some(sinv) = sqrt_inv_ovlp {
-                    let n = cur_error[i_spin].size()[0];
+                    let n = e.size()[0];
                     let mut tmp = MatrixFull::new([n, n], 0.0);
-                    _dgemm_full(&cur_error[i_spin], 'N', sinv, 'N', &mut tmp, 1.0, 0.0);
+                    _dgemm_full(&e, 'N', sinv, 'N', &mut tmp, 1.0, 0.0);
                     let mut e_orth = MatrixFull::new([n, n], 0.0);
                     _dgemm_full(sinv, 'N', &tmp, 'N', &mut e_orth, 1.0, 0.0);
-                    cur_error[i_spin] = e_orth;
+                    e = e_orth;
                 }
-            });
-
-            let mut norm = 0.0;
-            (0..spin_channel).for_each(|i_spin| {
-                let dd = cur_error[i_spin].data.par_iter().fold(|| 0.0, |acc, x| {
-                    acc + x*x
-                }).sum::<f64>();
-                norm += dd
-            });
+                cur_error = [e, MatrixFull::empty()];
+                }
+                _ => {
+                cur_target = [hamiltonian[0].to_matrixfull().unwrap(),
+                              hamiltonian[1].to_matrixfull().unwrap()];
+                (0..spin_channel).into_iter().for_each(|i_spin| {
+                    cur_error[i_spin] = super::get_grad_dm(&cur_target[i_spin], &full_ovlp, &density_matrix[1][i_spin]);
+                    if let Some(sinv) = sqrt_inv_ovlp {
+                        let n = cur_error[i_spin].size()[0];
+                        let mut tmp = MatrixFull::new([n, n], 0.0);
+                        _dgemm_full(&cur_error[i_spin], 'N', sinv, 'N', &mut tmp, 1.0, 0.0);
+                        let mut e_orth = MatrixFull::new([n, n], 0.0);
+                        _dgemm_full(sinv, 'N', &tmp, 'N', &mut e_orth, 1.0, 0.0);
+                        cur_error[i_spin] = e_orth;
+                    }
+                });
+            }
+            }
 
             ([cur_error[0].data.clone(),cur_error[1].data.clone()].concat(),
             cur_target)
 
+}
+
+fn warn_oscillation(energy_records: &[f64]) {
+    warn!("Energy increase is detected. Turn on the linear mixing algorithm with (H[DIIS, i-1] + H[DIIS, i+1]).");
+    let length = energy_records.len();
+    debug!("Prev_Energies: ({:16.8}, {:16.8})", energy_records[length-2], energy_records[length-1]);
+}
+
+fn damped_mix(prev: &MatrixUpper<f64>, new: &MatrixUpper<f64>, alpha: f64) -> MatrixUpper<f64> {
+    let beta = 1.0 - alpha;
+    let mut out = prev.clone();
+    out.data.par_iter_mut()
+        .zip(prev.data.par_iter())
+        .zip(new.data.par_iter())
+        .for_each(|((to, a), b)| {
+            *to = a * beta + b * alpha;
+        });
+    out
 }
 
 /// Compute zero-temperature extrapolated energy for EDIIS.

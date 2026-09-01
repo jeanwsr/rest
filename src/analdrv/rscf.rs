@@ -268,13 +268,14 @@ impl<'a> RHessSCF<'a> {
         let max_cycle = self.config.cphf_max_cycle;
         let max_space = self.config.cphf_max_space;
         let lindep = self.config.cphf_lindep;
+        let tol_inflation = self.config.cphf_tol_inflation;
 
         let response_cphf_flattened = |x: TsrView| -> Tsr {
             let x = x.reshape((nmo, nocc, -1));
             let y = self.response_dimless_cphf(x.view());
             y.into_shape((nmo * nocc, -1))
         };
-        let mo1 = krylov_block(response_cphf_flattened, rhs.view(), None, tol, max_cycle, max_space, lindep);
+        let mo1 = krylov_block(response_cphf_flattened, rhs.view(), None, tol, max_cycle, max_space, lindep, tol_inflation);
         let mo1 = mo1.into_shape(rhs_shape);
 
         self.timing.push(("solve_dimless_cphf".to_string(), t0.elapsed().as_secs_f64()));

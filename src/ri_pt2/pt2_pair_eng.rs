@@ -38,6 +38,10 @@ where
         .map(|x| x.to_vec())
         .unwrap_or_else(|| (idx_lumo..num_mo).collect());
 
+    if occ_list.is_empty() || vir_list.is_empty() {
+        return [0.0, 0.0, 0.0];
+    }
+
     let occ_energy = mo_energy.index_select(-1, &occ_list);
     let vir_energy = mo_energy.index_select(-1, &vir_list);
     let occ_occupation = mo_occupation.index_select(-1, &occ_list) / 2;
@@ -102,6 +106,12 @@ where
             .map(|x| x.to_vec())
             .unwrap_or_else(|| (idx_lumo[spin]..num_mo).collect())
     });
+
+    if occ_lists[A].is_empty() || occ_lists[B].is_empty()
+        || vir_lists[A].is_empty() || vir_lists[B].is_empty()
+    {
+        return [0.0, 0.0, 0.0];
+    }
 
     // slice each spin channel to 1D then index_select
     let occ_energy = [

@@ -4,19 +4,23 @@ use crate::basis_io;
 use crate::basis_io::basic_math::factorial;
 use crate::scf_io::SCF;
 use rest_tensors::{MatrixFull};
-use rand::distributions::normal::StandardNormal;
+use rand::Rng;
+
 use itertools::Itertools;
 use rayon::iter::{IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator, IntoParallelRefMutIterator};
 //mod lib;
 
 //checked
 pub fn generate_random_points (n_p: usize) -> Vec<[f64; 3]> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut random_points: Vec<[f64;3]> = vec![[0.0,0.0,0.0];n_p];
     random_points.iter_mut().for_each(|x|{
         x.iter_mut().for_each(|y|{
-            let StandardNormal(a) = rand::random();
-            *y =a;
+            // Box–Muller transform: generate N(0,1) from two uniform (0,1] variates.
+            // Replaces rand 0.3's StandardNormal (removed in rand 0.8+; rand_distr not pulled in).
+            let u = rng.random::<f64>().max(f64::MIN_POSITIVE);
+            let v = rng.random::<f64>();
+            *y = (-2.0f64 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos();
         })
     });
     //println!("{:?}",random_points);

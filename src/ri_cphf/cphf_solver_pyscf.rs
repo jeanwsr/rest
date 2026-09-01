@@ -1,7 +1,6 @@
 /// PySCF-style CP-HF solver using (nmo, nocc) space.
 ///
-/// Differences from CPHFSolver:
-///   - Operates in full (nmo, nocc) space, not only (nvir, nocc)
+/// Operates in full (nmo, nocc) space, not only (nvir, nocc).
 ///   - Supports s1 (overlap derivative) for field-dependent basis
 ///   - Wraps gen_vind_opt from dft/response.rs with zero-padding
 ///   - Batch RHS for multiple atom-displacement perturbations
@@ -13,6 +12,7 @@ use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, _dsolve};
 use crate::scf_io::SCF;
 use crate::ri_tddft::utils::tddft_occupation_parameters;
 use crate::dft::response::{gen_vind_opt, gen_vind_opt_batched, VindWorkspace, FxcHessianCache, KLowRankPrecompute};
+use crate::solvers::krylov::{self, KrylovConfig};
 
 /// Solves (I + G̃)U = -(h1 - s1·e_i)·e_ai  in (nmo, nocc) space.
 ///
@@ -34,7 +34,7 @@ pub struct CPHFSolverPySCF {
     pub ws: VindWorkspace,
 
     /// Energy denominators e_ai[a + i*nvir] = 1/(e_vir[a] - e_occ[i])
-    /// flat index: i + a*nocc (same as CPHFSolver)
+    /// flat index: i + a*nocc
     pub e_ai: Vec<f64>,
 
     /// MO eigenvalues [nmo]
@@ -46,8 +46,18 @@ pub struct CPHFSolverPySCF {
 
 impl CPHFSolverPySCF {
     pub fn new(scf: &SCF) -> Self {
-        let (start_mo, _num_state, occ_size, vir_size, _homo, lumo) =
+        let (start_mo, num_state, occ_size, vir_size, _homo, lumo) =
             tddft_occupation_parameters(scf);
+        if scf.mol.ctrl.print_level > 1 {
+            let cutoff = scf.mol.ctrl.tddft.as_ref().map(|c| c.tddft_cutoff_energy).unwrap_or(1.0e6);
+            if cutoff < 1.0e5 {
+                println!("  TDDFT virtual cutoff: {:.4} Ha, {} states retained", cutoff, num_state);
+            }
+            if start_mo > scf.mol.start_mo {
+                println!("  TDDFT frozen core: -2.00 Ha threshold, {} orbitals frozen (MO 0..{})",
+                    start_mo - scf.mol.start_mo, start_mo);
+            }
+        }
 
         let dim = occ_size * vir_size;
         if dim == 0 { panic!("CP-HF: empty OV space"); }
@@ -368,155 +378,7 @@ impl CPHFSolverPySCF {
         Some(self.assemble_full_solution_with_frozen(&u_vo, &u_oo, &u_frozen))
     }
 
-    // ── Krylov solver (Pople-style) ────────────────────────────────────
-
-    /// Krylov subspace solver in (nmo, nocc) space.
-    ///
-    /// Iterates over the VO subspace only. Occ-occ block filled from s1.
-    /// Returns solution in (nmo, nocc) flat format.
-    pub fn solve_krylov(&self, scf: &SCF, fxc_cache: Option<&FxcHessianCache>,
-                         h1_nmc: &[f64], s1_nmc: &[f64],
-                         max_cycle: usize, tol: f64) -> Vec<f64> {
-        let dim = self.dim;
-        let debug = std::env::var("REST_CPHF_KRYLOV_DEBUG").is_ok()
-            || scf.mol.ctrl.print_level >= 1;
-
-        // Build RHS
-        let mut b = self.build_rhs_with_s1(h1_nmc, s1_nmc);
-
-        // OO correction: subtract fvind(mo1_oo) * e_ai from RHS.
-        // The occ-occ block is fixed at mo1_oo[i,j] = -0.5 * s1[i,j]. Since the
-        // Krylov matvec only operates on the VO block (z_full OO = 0), the
-        // response of the OO block must be moved to the RHS, matching
-        // solve_dense (cphf_solver_pyscf.rs lines 357-379) and PySCF's
-        // solve_withs1 convention.
-        {
-            let mut z_oo_full = vec![0.0; self.nmo * self.nocc];
-            for j in 0..self.nocc {
-                for i in 0..self.nocc {
-                    let nmc_idx = (self.start_mo + i) + j * self.nmo;
-                    z_oo_full[nmc_idx] = -0.5 * s1_nmc[nmc_idx];
-                }
-            }
-            let oo_resp_full = self.fvind_nmo_nocc(scf, fxc_cache, &z_oo_full);
-            for ia in 0..dim {
-                let ia_col = ia / self.nocc;  // virtual index
-                let ia_row = ia % self.nocc;  // occupied index
-                let r = self.lumo + ia_col;
-                let g_oo = oo_resp_full[r + ia_row * self.nmo];
-                b[ia] -= g_oo * self.e_ai[ia];
-            }
-        }
-
-        let b_norm2: f64 = b.iter().map(|x| x * x).sum();
-        if b_norm2 < 1e-30 {
-            return self.assemble_full_solution(
-                &vec![0.0; dim],
-                &self.solve_occ_occ_from_s1(s1_nmc));
-        }
-
-        // Matvec for VO subspace: z_vo → G̃(z_vo)
-        let matvec = |z_vo: &[f64]| -> Vec<f64> {
-            let mut z_full = vec![0.0; self.nmo * self.nocc];
-            for i in 0..dim {
-                let a = i / self.nocc;     // virtual index
-                let occ = i % self.nocc;    // occupied index
-                let r = self.lumo + a;
-                z_full[r + occ * self.nmo] = z_vo[i];
-            }
-            let resp_full = self.fvind_nmo_nocc(scf, fxc_cache, &z_full);
-            let mut g_vo = vec![0.0; dim];
-            for i in 0..dim {
-                let col = i / self.nocc;
-                let row = i % self.nocc;
-                let r = self.lumo + col;
-                let c = row; // 0-indexed column
-                g_vo[i] = resp_full[r + c * self.nmo] * self.e_ai[i];
-            }
-            g_vo
-        };
-
-        // Initial vector
-        let mut x1 = b.clone();
-
-        // Krylov subspace
-        let mut xs: Vec<Vec<f64>> = Vec::new();
-        let mut axs: Vec<Vec<f64>> = Vec::new();
-        let mut innerprod: Vec<f64> = Vec::new();
-        innerprod.push(b_norm2);
-
-        for cycle in 0..max_cycle {
-            let axt = matvec(&x1);
-            xs.push(x1.clone());
-            axs.push(axt.clone());
-
-            // Orthogonalize new trial against all previous xs (CGS)
-            let mut x_new = axt;
-            for (i, xi) in xs.iter().enumerate() {
-                let dot_ax: f64 = x_new.iter().zip(xi.iter()).map(|(a, x)| a * x).sum();
-                let w = dot_ax / innerprod[i];
-                for j in 0..dim { x_new[j] -= w * xi[j]; }
-            }
-
-            let norm2: f64 = x_new.iter().map(|x| x * x).sum();
-            innerprod.push(norm2);
-            if debug {
-                println!("    CP-HF iteration {}: residual={:.4e}", cycle, norm2.sqrt());
-            }
-            if norm2 < tol * tol { break; }
-            x1 = x_new;
-        }
-
-        // Build subspace matrix H and RHS g
-        let nd = xs.len();
-        if debug {
-            println!("    krylov: dim={}, nd={}, b_norm={:.4e}", dim, nd, b_norm2.sqrt());
-        }
-        let mut h_mat = vec![0.0; nd * nd];
-        for i in 0..nd {
-            for j in 0..nd {
-                h_mat[j * nd + i] = xs[i].iter().zip(axs[j].iter())
-                    .map(|(x, a)| x * a).sum();
-            }
-            h_mat[i * nd + i] += innerprod[i]; // I + G̃
-        }
-
-        let mut g_vec = vec![0.0; nd];
-        for i in 0..nd {
-            g_vec[i] = b.iter().zip(xs[i].iter()).map(|(x, y)| x * y).sum();
-        }
-
-        // Solve H·c = g
-        let mut h_full = MatrixFull::new([nd, nd], 0.0);
-        for i in 0..nd { for j in 0..nd {
-            h_full[[i, j]] = h_mat[j * nd + i];
-        }}
-        let c = _dsolve(&h_full, &g_vec).unwrap_or_else(|| {
-            let mut c0 = vec![0.0; nd]; c0[0] = 1.0; c0
-        });
-
-        // Build VO solution x = Σ c[i] * xs[i]
-        let mut u_vo = vec![0.0; dim];
-        for i in 0..nd {
-            let ci = c[i];
-            for j in 0..dim { u_vo[j] += ci * xs[i][j]; }
-        }
-
-        // Diagnostic: compute residual ||(I + G̃)x - b||
-        if debug {
-            let gx = matvec(&u_vo);
-            let mut res2 = 0.0;
-            for i in 0..dim {
-                let r = u_vo[i] + gx[i] - b[i];
-                res2 += r * r;
-            }
-            println!("    krylov residual ||(I+G)x - b|| = {:.4e}", res2.sqrt());
-        }
-
-        // Assemble full solution
-        let u_oo = self.solve_occ_occ_from_s1(s1_nmc);
-        self.assemble_full_solution(&u_vo, &u_oo)
-    }
+    // ── Batched Krylov solver ───────────────────────────────────────
 
     // ─────────────────────────────────────────────────────────────────────
     // Phase A: Batched interleaved Krylov solver for the CP-HF Hessian.
@@ -627,43 +489,13 @@ impl CPHFSolverPySCF {
         rhs_all: &[Vec<f64>],
         max_cycle: usize,
         tol: f64,
+        tol_inflation: f64,
+        lindep: f64,
     ) -> Vec<Vec<f64>> {
-        let n_rhs = rhs_all.len();
-        let dim = self.dim;
-        let debug = std::env::var("REST_CPHF_KRYLOV_DEBUG").is_ok()
+        let profile = std::env::var("REST_CPHF_PROFILE").is_ok()
+            || std::env::var("REST_CPHF_KRYLOV_DEBUG").is_ok()
             || scf.mol.ctrl.print_level >= 1;
-        let profile = std::env::var("REST_CPHF_PROFILE").is_ok() || debug;
-        // Match PySCF krylov's lindep threshold (DSOLVE_LINDEP default = 1e-13).
-        let lindep: f64 = 1e-13;
-        let tol2 = tol * tol;
 
-        // ══ Shared Krylov subspace (single basis for ALL RHS) ════════════
-        let mut xs: Vec<Vec<f64>> = Vec::new();     // basis vectors
-        let mut axs: Vec<Vec<f64>> = Vec::new();    // A·basis vectors
-        let mut innerprod: Vec<f64> = Vec::new();   // ||xs[i]||²
-
-        // ══ Initial QR: orthogonalize RHS into shared basis ══════════════
-        // Matches PySCF: x1, rmat = _qr(rhs); x1 *= rmat.diagonal()[:,None];
-        //                innerprod = rmat.diagonal()**2
-        let _t_qr0 = std::time::Instant::now();
-        let (mut x1, init_innerprod) = krylov_qr(rhs_all, lindep);
-        innerprod.extend(init_innerprod);
-        if std::env::var("REST_CPHF_PROFILE").is_ok() {
-            eprintln!("CPHF-PROF init-qr {:.3}s", _t_qr0.elapsed().as_secs_f64());
-        }
-
-        // PySCF termination: if initial RHS are essentially zero, return zeros.
-        let max_init = innerprod.iter().fold(0.0f64, |a, &b| a.max(b));
-        if max_init < lindep || max_init < tol2 {
-            return (0..n_rhs).map(|_| vec![0.0; dim]).collect();
-        }
-
-        let mut total_matvecs: usize = 0;
-        let mut cycles_done: usize = 0;
-
-        if std::env::var("REST_MEM_TRACE").is_ok() {
-            eprintln!("MEMTRACE cphf-solve-start  RSS = {:.1} MiB", crate::hessian::memory_monitor::current_rss_mb());
-        }
         // Low-rank exchange-response precomputation (ground-state, built once
         // per solve; None if no RI tensor or not applicable).
         let _t_kl = std::time::Instant::now();
@@ -671,158 +503,29 @@ impl CPHFSolverPySCF {
         if std::env::var("REST_MEM_TRACE").is_ok() {
             eprintln!("MEMTRACE cphf-lowrank-built RSS = {:.1} MiB", crate::hessian::memory_monitor::current_rss_mb());
         }
-        if std::env::var("REST_CPHF_PROFILE").is_ok() {
+        if profile {
             eprintln!("CPHF-PROF lowrank-build {:.3}s", _t_kl.elapsed().as_secs_f64());
         }
 
-        for cycle in 0..max_cycle {
-            if x1.is_empty() { break; }
-            let n_active = x1.len();
-            total_matvecs += n_active;
-            cycles_done = cycle + 1;
+        let mut matvec = |zs: &[&[f64]]| -> Vec<Vec<f64>> {
+            self.matvec_vo_batched(scf, fxc_cache, zs, k_lowrank.as_ref())
+        };
 
-            // ── Block matvec on active vectors ───────────────────────────
-            let x1_refs: Vec<&[f64]> = x1.iter().map(|v| &v[..]).collect();
-            let _t_mv = std::time::Instant::now();
-            let axt_batch = self.matvec_vo_batched(scf, fxc_cache, &x1_refs, k_lowrank.as_ref());
-            let t_mv = _t_mv.elapsed().as_secs_f64();
+        let config = KrylovConfig {
+            tol,
+            max_cycle,
+            max_space: None,
+            max_residual_factor: tol_inflation,
+            lindep,
+        };
 
-            // ── Extend shared subspace with current active vectors ───────
-            for k in 0..n_active {
-                xs.push(x1[k].clone());
-                axs.push(axt_batch[k].clone());
-            }
-
-            let _t_cgs = std::time::Instant::now();
-            // ── CGS against full shared history ──────────────────────────
-            // PySCF uses `axt` (original matvec output) for projection
-            // coefficients, making this classical GS (numerically adequate
-            // because xs are mutually orthogonal with known ||xs[i]||²).
-            let mut x_new: Vec<Vec<f64>> = axt_batch.clone();
-            for k in 0..x_new.len() {
-                for (i, xsi) in xs.iter().enumerate() {
-                    let dot_ax: f64 = axt_batch[k].iter().zip(xsi.iter()).map(|(a, b)| a * b).sum();
-                    let w = dot_ax / innerprod[i];
-                    for j in 0..dim { x_new[k][j] -= w * xsi[j]; }
-                }
-            }
-
-            let t_cgs = _t_cgs.elapsed().as_secs_f64();
-            let _t_qr = std::time::Instant::now();
-            // ── QR + threshold → new active set ──────────────────────────
-            let (x_new_orth, innerprod_new) = krylov_qr(&x_new, lindep);
-            let max_innerprod = innerprod_new.iter().fold(0.0f64, |a, &b| a.max(b));
-
-            if debug || profile {
-                println!("    CP-HF iteration {}: residual={:.4e} (n_active={}/{})",
-                    cycle, max_innerprod.sqrt(), n_active, x_new_orth.len());
-                eprintln!("CPHF-PROF cycle {} mv {:.3}s cgs {:.3}s qr {:.3}s rest {:.3}s",
-                    cycle, t_mv, t_cgs, _t_qr.elapsed().as_secs_f64(),
-                    _t_mv.elapsed().as_secs_f64() - t_mv - t_cgs - _t_qr.elapsed().as_secs_f64());
-            }
-
-            if max_innerprod < lindep || max_innerprod < tol2 {
-                break;
-            }
-
-            // Keep only directions above threshold (PySCF mask).
-            let mut kept: Vec<Vec<f64>> = Vec::with_capacity(x_new_orth.len());
-            let mut kept_innerprod: Vec<f64> = Vec::with_capacity(x_new_orth.len());
-            for i in 0..x_new_orth.len() {
-                if innerprod_new[i] > lindep && innerprod_new[i] > tol2 {
-                    kept.push(x_new_orth[i].clone());
-                    kept_innerprod.push(innerprod_new[i]);
-                }
-            }
-            x1 = kept;
-            innerprod.extend(kept_innerprod);
-        }
+        let u_vo = krylov::krylov(&mut matvec, rhs_all, &config);
 
         if profile {
-            println!("    krylov_batched: n_rhs={}, cycles={}, shared subspace size={}, total matvecs={}",
-                n_rhs, cycles_done, xs.len(), total_matvecs);
-        }
-
-        // ══ Single projected solve: H·C = G (one H, multiple RHS) ═══════
-        let _t_fh = std::time::Instant::now();
-        let nd = xs.len();
-        let mut u_vo: Vec<Vec<f64>> = (0..n_rhs).map(|_| vec![0.0; dim]).collect();
-        if nd == 0 { return u_vo; }
-
-        // Build H[nd,nd]: H[i,j] = xs[i]·axs[j]; H[i,i] += innerprod[i] (+I).
-        let mut h = MatrixFull::new([nd, nd], 0.0);
-        for i in 0..nd {
-            for j in 0..nd {
-                let v: f64 = xs[i].iter().zip(axs[j].iter()).map(|(a, b)| a * b).sum();
-                h[[i, j]] = v;
-            }
-            h[[i, i]] += innerprod[i];
-        }
-
-        // For each RHS: g[i] = rhs[k]·xs[i]; solve H·c = g; reconstruct.
-        // Note: H is identical for all RHS; we trade 36 small factorizations
-        // for one shared H build. The total cost is negligible vs matvec time.
-        for k in 0..n_rhs {
-            let mut g = vec![0.0; nd];
-            for i in 0..nd {
-                g[i] = xs[i].iter().zip(rhs_all[k].iter()).map(|(a, b)| a * b).sum();
-            }
-            let c = _dsolve(&h, &g).unwrap_or_else(|| {
-                let mut c0 = vec![0.0; nd]; c0[0] = 1.0; c0
-            });
-            for i in 0..nd {
-                let ci = c[i];
-                for j in 0..dim { u_vo[k][j] += ci * xs[i][j]; }
-            }
-        }
-
-        if std::env::var("REST_CPHF_PROFILE").is_ok() {
-            eprintln!("CPHF-PROF final-H {:.3}s", _t_fh.elapsed().as_secs_f64());
+            println!("    krylov_batched: n_rhs={}", rhs_all.len());
         }
         u_vo
     }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// PySCF-style QR for Krylov basis orthogonalization.
-// Mirrors `pyscf.lib.linalg_helper._qr` (MGS against existing orthonormal
-// vectors). Returns scaled (non-normalized) orthogonal vectors and their
-// squared norms, matching PySCF's `x1 *= rmat.diagonal()[:,None]`;
-// `innerprod = rmat.diagonal()**2` convention.
-// ═══════════════════════════════════════════════════════════════════════
-fn krylov_qr(vecs: &[Vec<f64>], lindep: f64) -> (Vec<Vec<f64>>, Vec<f64>) {
-    let nvec = vecs.len();
-    if nvec == 0 { return (vec![], vec![]); }
-    let dim = vecs[0].len();
-
-    let mut qs: Vec<Vec<f64>> = Vec::with_capacity(nvec);  // orthonormal unit vectors
-    let mut norms: Vec<f64> = Vec::with_capacity(nvec);    // ||v_i|| before normalization
-
-    for i in 0..nvec {
-        let mut xi = vecs[i].clone();
-        // MGS: xi is updated in-place by each projection (matches PySCF _qr).
-        for j in 0..qs.len() {
-            let prod: f64 = xi.iter().zip(qs[j].iter()).map(|(a, b)| a * b).sum();
-            for k in 0..dim { xi[k] -= qs[j][k] * prod; }
-        }
-        let innerprod: f64 = xi.iter().map(|v| v * v).sum();
-        if innerprod > lindep {
-            let norm = innerprod.sqrt();
-            for k in 0..dim { xi[k] /= norm; }
-            qs.push(xi);
-            norms.push(norm);
-        }
-        // else: linearly dependent direction, drop.
-    }
-
-    // Scale qs by norm → orthogonal-but-not-normalized vectors, matching
-    // PySCF's `x1 *= rmat.diagonal()[:,None]`.
-    let x1: Vec<Vec<f64>> = qs.iter().enumerate()
-        .map(|(i, q)| q.iter().map(|v| v * norms[i]).collect())
-        .collect();
-    let innerprod_out: Vec<f64> = norms.iter().map(|d| d * d).collect();
-
-    (x1, innerprod_out)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -964,4 +667,26 @@ pub fn transform_s1ao_ao2mo(
         results.push(flat);
     }
     results
+}
+
+/// Build dipole h1 for component comp (0=x,1=y,2=z) in MO VO-block.
+pub fn build_dipole_h1_comp(scf: &SCF, comp: usize) -> Vec<f64> {
+    let (start_mo, _num_state, occ_size, vir_size, _homo, lumo) =
+        tddft_occupation_parameters(scf);
+    let ao_dip = crate::ri_bse::dipoles::obtain_ao_dips(scf, None);
+    let eigvec = &scf.eigenvectors[0];
+    let nao = eigvec.size[0];
+    let dim = occ_size * vir_size;
+
+    let ao_dip_comp = ao_dip.get_reducing_matrix(comp).unwrap();
+    let mut mu_mo_tmp = MatrixFull::new([nao, nao], 0.0);
+    _dgemm_full(eigvec, 'T', &ao_dip_comp, 'N', &mut mu_mo_tmp, 1.0, 0.0);
+    let mut mu_mo = MatrixFull::new([nao, nao], 0.0);
+    _dgemm_full(&mu_mo_tmp, 'N', eigvec, 'N', &mut mu_mo, 1.0, 0.0);
+
+    let mut h1 = vec![0.0; dim];
+    for a in 0..vir_size { for i in 0..occ_size {
+        h1[i + a * occ_size] = mu_mo[[lumo + a, start_mo + i]];
+    }}
+    h1
 }

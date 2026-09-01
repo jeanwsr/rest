@@ -673,7 +673,7 @@ where
         .collect();
 
     // ---- Step 1: initial subspace ---------------------------------------------
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut y = MatrixFull::new([n, m0], 0.0);
 
     if let Some(custom_vecs) = custom_init_vectors {
@@ -688,7 +688,7 @@ where
         // Pad remaining columns with random vectors
         for j in n_use..m0 {
             for i in 0..n {
-                y[[i, j]] = rng.gen::<f64>() * 2.0 - 1.0;
+                y[[i, j]] = rng.random::<f64>() * 2.0 - 1.0;
             }
         }
     } else if init_guess_type == "gaussian" {
@@ -728,13 +728,13 @@ where
                 let norm: f64 = raw_w.iter().map(|&wi| wi * wi).sum::<f64>().sqrt();
                 if norm > 1e-30 {
                     for i in 0..n {
-                        let sign = if rng.gen::<f64>() > 0.5 { 1.0 } else { -1.0 };
+                        let sign = if rng.random::<f64>() > 0.5 { 1.0 } else { -1.0 };
                         y[[i, j]] = sign * raw_w[i] / norm;
                     }
                 } else {
                     // Fallback to random if all weights vanish
                     for i in 0..n {
-                        y[[i, j]] = rng.gen::<f64>() * 2.0 - 1.0;
+                        y[[i, j]] = rng.random::<f64>() * 2.0 - 1.0;
                     }
                 }
             }
@@ -742,7 +742,7 @@ where
             // Fallback to random if no diag available
             for j in 0..m0 {
                 for i in 0..n {
-                    y[[i, j]] = rng.gen::<f64>() * 2.0 - 1.0;
+                    y[[i, j]] = rng.random::<f64>() * 2.0 - 1.0;
                 }
             }
         }
@@ -750,7 +750,7 @@ where
         // Default random strategy
         for j in 0..m0 {
             for i in 0..n {
-                y[[i, j]] = rng.gen::<f64>() * 2.0 - 1.0; // uniform in [-1, 1]
+                y[[i, j]] = rng.random::<f64>() * 2.0 - 1.0; // uniform in [-1, 1]
             }
         }
     }
