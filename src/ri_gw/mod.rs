@@ -312,6 +312,75 @@ pub fn v_mn_matrix_element(scf_data:&SCF,m:usize,n:usize,ri_mat:&MatrixFull<f64>
     }
     v_mn_matrix_element
 }
+pub fn vxc_ao2mo_spin(scf_data:&SCF)->[Vec<f64>;2]{
+    let vxc_ao_all = scf_data.generate_vxc_rayon(1.0).2;
+    let mut out = [vec![], vec![]];
+    let nspin = scf_data.mol.spin_channel;
+    for spin in 0..nspin {
+        let eigenvecs = scf_data.eigenvectors[spin].clone();
+        let vxc_ao = vxc_ao_all[spin].to_matrixfull().unwrap().clone();
+        let dimensions = vxc_ao.size[0];
+        let mut vxc_nn = vec![0.0; dimensions];
+        for (n, vec) in eigenvecs.iter_columns_full().enumerate() {
+            let ev = vec.to_vec();
+            let mut fv = vec![0.0; dimensions];
+            _dgemv(&vxc_ao, &ev, &mut fv, 'N', 1.0, 0.0, 1, 1);
+            vxc_nn[n] = ev.iter().zip(fv.iter()).map(|(a,b)| a*b).sum();
+        }
+        out[spin] = vxc_nn;
+    }
+    if nspin == 1 { out[1] = out[0].clone(); }
+    out
+}
+
+pub fn initialize_qp_g_w_spin(scf_data:&mut SCF){
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    if qp_ctrl.renormalized_singles {
+        panic!("Unrestricted GW with renormalized_singles is not implemented yet");
+    }
+    let nspin = scf_data.mol.spin_channel;
+    for spin in 0..nspin {
+        let eigenenergies = scf_data.eigenvalues[spin].clone();
+        scf_data.gwqp_spin.0[spin] = eigenenergies.clone();
+        scf_data.gwqp_spin.1[spin] = eigenenergies;
+    }
+    if nspin == 1 {
+        scf_data.gwqp_spin.0[1] = scf_data.gwqp_spin.0[0].clone();
+        scf_data.gwqp_spin.1[1] = scf_data.gwqp_spin.1[0].clone();
+    }
+}
+
+pub fn gw_main_spin(scf_data:&mut SCF, vxc_nn:&[Vec<f64>;2], mpi_operator:&Option<MPIOperator>){
+    let printlevel = scf_data.mol.ctrl.print_level;
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    initialize_qp_g_w_spin(scf_data);
+    let scgw = qp_ctrl.scgw.clone();
+    if scgw == "g0w0" {
+        println!("You are doing spin-resolved G0W0 calculations");
+        scgw::g0w0_spin(scf_data, 20, vxc_nn, true);
+    } else {
+        panic!("gw_main_spin: only scgw=g0w0 is currently supported in the unrestricted path");
+    }
+    if printlevel > 0 {
+        for spin in 0..scf_data.mol.spin_channel {
+            println!("Spin channel {} QP energies:", spin);
+            for (n,e) in scf_data.gwqp_spin.0[spin].iter().enumerate() {
+                println!("  MO {} : {:.12}", n, e);
+            }
+        }
+    }
+    if qp_ctrl.save_qp {
+        let save_path = qp_ctrl.save_qp_path.clone();
+        if let Ok(mut file) = OpenOptions::new().append(true).create(true).open(save_path) {
+            for spin in 0..scf_data.mol.spin_channel {
+                for e in scf_data.gwqp_spin.0[spin].iter() {
+                    writeln!(file, "{}", e).unwrap();
+                }
+            }
+        }
+    }
+}
+
 pub fn v_matrix(
     scf_data: &SCF,
     ri_mat: &MatrixFull<f64>
@@ -495,6 +564,65 @@ pub fn generate_w_c_serial(scf_data:&SCF,ri_ov:&MatrixFull<f64>,quasiparticle_en
         (*omega_1,*weight,w_c)
     }).collect()
 }
+pub struct WcAtFreq {
+    pub omega: f64,
+    pub weight: f64,
+    pub w_c: [MatrixFull<f64>; 2],
+}
+
+pub fn generate_w_c_spin(
+    scf_data: &SCF,
+    ri_ov: &[MatrixFull<f64>;2],
+    quasiparticle_energies_w: &[Vec<f64>;2],
+    occ_params: &[OccParams;2],
+    num_freq: usize,
+) -> Vec<WcAtFreq> {
+    let freq_grid_type = scf_data.mol.ctrl.freq_grid_type;
+    let max_freq = scf_data.mol.ctrl.freq_cut_off;
+    let (omega_1, weight) = if freq_grid_type==0 {
+        ri_rpa::trans_gauss_legendre_grids(1.0, num_freq)
+    } else if freq_grid_type==1 {
+        ri_rpa::gauss_legendre_grids([0.0,max_freq], num_freq)
+    } else if freq_grid_type==2 {
+        ri_rpa::logarithmic_grid([0.0,max_freq], num_freq)
+    } else {
+        ri_rpa::trans_gauss_legendre_grids(1.0, num_freq)
+    };
+    let nspin = scf_data.mol.spin_channel;
+    omega_1.into_iter().zip(weight.into_iter()).map(|(omega, weight)| {
+        let response = response_matrix_total(scf_data, quasiparticle_energies_w, occ_params, ri_ov, omega, 'I', 0.0);
+        let inverse_dielectric = inverse_dielectric_matrix(response, 'I');
+        let w_c_0 = w_c_matrix_from_scf_spin(&inverse_dielectric, occ_params[0].num_state, scf_data, 0);
+        let w_c_1 = if nspin == 2 {
+            w_c_matrix_from_scf_spin(&inverse_dielectric, occ_params[1].num_state, scf_data, 1)
+        } else {
+            w_c_0.clone()
+        };
+        WcAtFreq{ omega, weight, w_c:[w_c_0, w_c_1] }
+    }).collect()
+}
+
+pub fn calculate_imag_spin(
+    w_c_at_freqs: &Vec<WcAtFreq>,
+    num_state: usize,
+    n: usize,
+    omega: f64,
+    quasiparticle_energies_g: &Vec<f64>,
+    spin: usize,
+) -> f64 {
+    w_c_at_freqs.par_iter().map(|freq| {
+        let omega_1 = freq.omega;
+        let weight = freq.weight;
+        let w_c = &freq.w_c[spin];
+        let imag_n_omega = (quasiparticle_energies_g.iter().enumerate().map(|(m,qp_m)|{
+            let rpod=omega-qp_m;
+            let gfc=rpod/(rpod.powf(2.0)+omega_1.powf(2.0));
+            2.0*gfc*(w_c[[n,m]])/(2.0*PI)
+        }).sum::<f64>())*weight;
+        imag_n_omega
+    }).sum()
+}
+
 pub fn calculate_imag(w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,num_state:usize,n:usize,omega:f64,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>)->f64{
     omp_get_num_threads_wrapper();
     let (sender,receiver)=channel();
@@ -606,6 +734,89 @@ pub fn get_occupation_parameters(scf_data:&SCF,response_or_not:char)->(usize,usi
     }
     (start_mo,num_state,occ_size,vir_size,homo,lumo)
 }
+
+/// Per-spin occupation window.  For restricted calculations both entries are identical.
+#[derive(Clone, Copy, Debug)]
+pub struct OccParams {
+    pub start_mo: usize,
+    pub num_state: usize,
+    pub occ_size: usize,
+    pub vir_size: usize,
+    pub homo: usize,
+    pub lumo: usize,
+}
+
+pub fn get_occ_params_per_spin(scf_data:&SCF,response_or_not:char)->[OccParams;2]{
+    let cutoff=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().bse_cutoff_energy;
+    let start_mo = scf_data.mol.start_mo;
+    let nspin = scf_data.mol.spin_channel.max(1);
+    let mut out = [OccParams{start_mo, num_state:scf_data.mol.num_state, occ_size:0, vir_size:0, homo:0, lumo:scf_data.mol.num_state};2];
+    for spin in 0..nspin {
+        let homo = scf_data.homo[spin];
+        let lumo = scf_data.lumo[spin];
+        let occ_size = homo.saturating_sub(start_mo) + 1;
+        let mut num_state = scf_data.mol.num_state;
+        if response_or_not=='N'{
+            num_state = scf_data.eigenvalues[spin].iter().filter(|x|**x<cutoff).count();
+        }
+        let lumo_eff = if response_or_not=='Y' { lumo } else { lumo.min(num_state) };
+        let vir_size = num_state.saturating_sub(lumo_eff);
+        out[spin] = OccParams{start_mo, num_state, occ_size, vir_size, homo, lumo};
+    }
+    if scf_data.mol.spin_channel==1 {
+        out[1] = out[0];
+    }
+    out
+}
+
+/// Select the sigma spin block from the RI-3c MO generator.
+/// The generator already returns one RIFull per spin channel.
+/// MOLGW-compatible global occupied/empty boundaries used by its contour-deformation residue loops.
+/// occupied: the last orbital occupied in *all* spin channels.
+/// empty:    the first orbital empty in *all* spin channels.
+pub fn molgw_global_homo_lumo(scf_data: &SCF) -> (usize, usize) {
+    let nspin = scf_data.mol.spin_channel.max(1);
+    let nstate = scf_data.mol.num_state;
+    let empty_thr = 1.0e-5_f64;
+    let mut nhomo = 0_usize;
+    let mut nlumo = nstate;
+    for p in 0..nstate {
+        let all_occ = (0..nspin).all(|s| scf_data.occupation[s][p] > empty_thr);
+        if all_occ { nhomo = nhomo.max(p); }
+        let all_empty = (0..nspin).all(|s| scf_data.occupation[s][p] <= empty_thr);
+        if all_empty { nlumo = nlumo.min(p); }
+    }
+    (nhomo, nlumo)
+}
+
+pub fn select_ri3mo_spin(
+    mut vector: Vec<(RIFull<f64>,std::ops::Range<usize>,std::ops::Range<usize>)>,
+    spin: usize,
+) -> MatrixFull<f64> {
+    if spin >= vector.len() { panic!("select_ri3mo_spin: spin {} requested but only {} channels available", spin, vector.len()); }
+    vector.remove(spin).0.into_matfull_i_jk()
+}
+
+/// Total non-interacting response = sum_sigma Pi^{0,sigma}.
+/// Restricted calculations store only one spatial channel, so it enters with weight 2.
+pub fn response_matrix_total(
+    scf_data: &SCF,
+    quasiparticle_energies_w: &[Vec<f64>;2],
+    occ_params: &[OccParams;2],
+    ri_ov: &[MatrixFull<f64>;2],
+    omega: f64,
+    part: char,
+    eta: f64,
+) -> MatrixFull<f64> {
+    let mut response = response_matrix_per_spin(&quasiparticle_energies_w[0], occ_params[0].occ_size, occ_params[0].vir_size, &ri_ov[0], omega, part, eta);
+    if scf_data.mol.spin_channel == 1 {
+        response.self_multiple(2.0);
+    } else {
+        let response_b = response_matrix_per_spin(&quasiparticle_energies_w[1], occ_params[1].occ_size, occ_params[1].vir_size, &ri_ov[1], omega, part, eta);
+        response.self_add(&response_b);
+    }
+    response
+}
 pub fn display_and_save_quasiparticles(scf_data:&mut SCF,quasiparticle_energies_g:&Vec<f64>,round:usize){
     for i in 0..quasiparticle_energies_g.len(){
         println!("quasiparticles:{:#?}",quasiparticle_energies_g[i]);
@@ -626,6 +837,16 @@ pub fn compute_ri3mo_row(scf_data: &SCF, n: usize) -> MatrixFull<f64> {
     );
     // Zero-copy: reuse the RIFull data buffer (identical column-major layout).
     vector.into_iter().next().unwrap().0.into_matfull_i_jk()
+}
+
+pub fn compute_ri3mo_row_spin(scf_data: &SCF, n: usize, spin: usize) -> MatrixFull<f64> {
+    let num_state = scf_data.mol.num_state;
+    let start_mo = scf_data.mol.start_mo;
+    let vector = scf_data.generate_ri3mo_rayon_for_multiple_times(
+        start_mo + n..start_mo + n + 1,
+        start_mo..num_state,
+    );
+    select_ri3mo_spin(vector, spin)
 }
 
 /// Compute V[n,m] = Σ_Q (Q|nm)² directly from scf_data via blocked MO transformation.
@@ -669,6 +890,44 @@ pub fn v_matrix_from_scf(scf_data: &SCF) -> MatrixFull<f64> {
     }
 
     // Symmetrize: fill lower triangle from upper
+    for i in 0..num_state {
+        for j in 0..i {
+            v_matrix[[i, j]] = v_matrix[[j, i]];
+        }
+    }
+    v_matrix
+}
+
+pub fn v_matrix_from_scf_spin(scf_data: &SCF, spin: usize) -> MatrixFull<f64> {
+    let op = get_occ_params_per_spin(scf_data, 'Y')[spin];
+    let num_state = op.num_state;
+    let start_mo = op.start_mo;
+    let nmo = num_state - start_mo;
+    let mut v_matrix = MatrixFull::new([num_state, num_state], 0.0);
+
+    let block_size = 50_usize.min(nmo).max(1);
+    let mut n_start = 0_usize;
+    while n_start < nmo {
+        let n_end = (n_start + block_size).min(nmo);
+        let ri_block_vec = scf_data.generate_ri3mo_rayon_for_multiple_times(
+            start_mo + n_start..start_mo + n_end,
+            start_mo..num_state,
+        );
+        let ri_block = select_ri3mo_spin(ri_block_vec, spin);
+        let naux = ri_block.size[0];
+        let block_n = n_end - n_start;
+        for local_n in 0..block_n {
+            for local_m in 0..nmo {
+                let global_n = n_start + local_n;
+                let global_m = local_m;
+                let col = local_n + local_m * block_n;
+                let start = col * naux;
+                let sum: f64 = ri_block.data[start..start + naux].iter().map(|x| x * x).sum();
+                v_matrix[[global_n, global_m]] = sum;
+            }
+        }
+        n_start = n_end;
+    }
     for i in 0..num_state {
         for j in 0..i {
             v_matrix[[i, j]] = v_matrix[[j, i]];
@@ -746,6 +1005,54 @@ pub fn w_c_matrix_from_scf(
     }
     w_c
 }
+
+pub fn w_c_matrix_from_scf_spin(
+    inverse_dielectric: &MatrixFull<f64>,
+    num_state: usize,
+    scf_data: &SCF,
+    spin: usize,
+) -> MatrixFull<f64> {
+    let num_auxbas = inverse_dielectric.size[0];
+    let start_mo = scf_data.mol.start_mo;
+    let nmo = num_state - start_mo;
+    let mut w_c = MatrixFull::new([num_state, num_state], 0.0);
+
+    let block = 25_usize.min(nmo).max(1);
+    let mut row_start = 0_usize;
+    while row_start < nmo {
+        let row_end = (row_start + block).min(nmo);
+        let block_n = row_end - row_start;
+        let ri_block = select_ri3mo_spin(
+            scf_data.generate_ri3mo_rayon_for_multiple_times(
+                start_mo + row_start..start_mo + row_end,
+                start_mo..num_state,
+            ),
+            spin,
+        );
+        let mut ri_row_n = MatrixFull::new([num_auxbas, nmo], 0.0);
+        let mut tmp = MatrixFull::new([num_auxbas, nmo], 0.0);
+        for local_n in 0..block_n {
+            let global_n = row_start + local_n;
+            for local_m in 0..nmo {
+                let src = (local_n + local_m * block_n) * num_auxbas;
+                let dst = local_m * num_auxbas;
+                ri_row_n.data[dst..dst + num_auxbas].copy_from_slice(&ri_block.data[src..src + num_auxbas]);
+            }
+            tmp.data.iter_mut().for_each(|x| *x = 0.0);
+            _dgemm_full(inverse_dielectric, 'N', &ri_row_n, 'N', &mut tmp, 1.0, 0.0);
+            for local_m in 0..nmo {
+                let col_start = local_m * num_auxbas;
+                let dot: f64 = ri_row_n.data[col_start..col_start + num_auxbas]
+                    .iter().zip(tmp.data[col_start..col_start + num_auxbas].iter())
+                    .map(|(a, b)| a * b).sum();
+                w_c[[global_n, local_m]] = dot;
+                w_c[[local_m, global_n]] = dot;
+            }
+        }
+        row_start = row_end;
+    }
+    w_c
+}
 pub fn response_matrix_legacy(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,omega:f64,part:char)->MatrixFull<f64>{
     let mut diag=vec![0.0;occ_size*vir_size];
     let num_auxbas=ri_ov.size[1];
@@ -772,7 +1079,7 @@ pub fn response_matrix_legacy(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,
     //println!("a response has been collected, its size is:{},{}",response.size[0],response.size[1]);
     response
 }
-pub fn response_matrix(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,omega:f64,part:char,eta:f64)->MatrixFull<f64>{
+pub fn response_matrix_per_spin(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,omega:f64,part:char,eta:f64)->MatrixFull<f64>{
     // Blocked column-scaling + DGEMM approach.
     // Instead of materializing the full scaled copy of ri_ov (occ_size*vir_size columns),
     // we process columns in blocks: copy+scale a block, then accumulate the DGEMM
@@ -832,9 +1139,16 @@ pub fn response_matrix(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_siz
         col_start = col_end;
     }
 
+    response
+}
+
+/// Restricted compatibility wrapper: one spatial channel times two physical spins.
+pub fn response_matrix(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,omega:f64,part:char,eta:f64)->MatrixFull<f64>{
+    let mut response = response_matrix_per_spin(quasiparticle_energies_w, occ_size, vir_size, ri_ov, omega, part, eta);
     response.self_multiple(2.0);
     response
 }
+
 pub fn inverse_dielectric_matrix(mut response: MatrixFull<f64>, part: char) -> MatrixFull<f64> {
     let num_auxbas = response.size[0];
     // Negate in place: dielectric = -response
@@ -1024,6 +1338,79 @@ pub fn quasiparticle_equation(omega:f64,n:usize,consts:f64,ri_ov:&MatrixFull<f64
     let imag=calculate_imag(&w_c_at_freqs,num_state,n,omega,quasiparticle_energies_g,quasiparticle_energies_w);
     //println!("quasiparticle equation residue now:={}",consts+contour-imag-omega);
     consts+contour-imag-omega
+}
+
+pub fn contour_rayon_spin(
+    scf_data: &SCF,
+    omega: f64,
+    n: usize,
+    spin: usize,
+    quasiparticle_energies_g: &Vec<f64>,
+    quasiparticle_energies_w_all: &[Vec<f64>;2],
+    occ_params: &[OccParams;2],
+    ri_ov: &[MatrixFull<f64>;2],
+    ri_row_n: &MatrixFull<f64>,
+    res_tol: f64,
+    eta: f64,
+) -> f64 {
+    let op = occ_params[spin];
+    let fermi_energy = (quasiparticle_energies_g[op.homo] + quasiparticle_energies_g[op.lumo]) / 2.0;
+    let sign = if omega > fermi_energy { 1.0_f64 } else { -1.0_f64 };
+    let num_auxbas = ri_ov[0].size[0];
+    let (global_homo, global_lumo) = molgw_global_homo_lumo(scf_data);
+    if sign > 0.0 {
+        ((global_homo + 1)..occ_params[spin].num_state).into_par_iter().map(|a_global|{
+            let a_col = a_global - op.start_mo;
+            let mut residue = 0.0;
+            let de = omega - quasiparticle_energies_g[a_global];
+            if de > -res_tol {
+                let pole_factor = if de.abs() < res_tol { 0.5 } else { 1.0 };
+                let response = response_matrix_total(scf_data, quasiparticle_energies_w_all, occ_params, ri_ov, de, 'C', 0.0);
+                let inverse_dielectric = inverse_dielectric_matrix(response, 'C');
+                let vec: Vec<f64> = ri_row_n.iter_column(a_col).copied().collect::<Vec<f64>>();
+                let mut first_product = vec![0.0; num_auxbas];
+                _dgemv(&inverse_dielectric, &vec, &mut first_product, 'N', 1.0, 0.0, 1, 1);
+                residue = first_product.iter().zip(vec.iter()).map(|(a,b)| a*b).sum::<f64>() * pole_factor;
+            }
+            residue * sign
+        }).sum()
+    } else {
+        (op.start_mo..global_lumo).into_par_iter().map(|i_global|{
+            let i_col = i_global - op.start_mo;
+            let mut residue = 0.0;
+            let de = quasiparticle_energies_g[i_global] - omega;
+            if de > -res_tol {
+                let pole_factor = if de.abs() < res_tol { 0.5 } else { 1.0 };
+                let response = response_matrix_total(scf_data, quasiparticle_energies_w_all, occ_params, ri_ov, de, 'C', 0.0);
+                let inverse_dielectric = inverse_dielectric_matrix(response, 'C');
+                let vec: Vec<f64> = ri_row_n.iter_column(i_col).copied().collect::<Vec<f64>>();
+                let mut first_product = vec![0.0; num_auxbas];
+                _dgemv(&inverse_dielectric, &vec, &mut first_product, 'N', 1.0, 0.0, 1, 1);
+                residue = first_product.iter().zip(vec.iter()).map(|(a,b)| a*b).sum::<f64>() * pole_factor;
+            }
+            residue * sign
+        }).sum()
+    }
+}
+
+pub fn quasiparticle_equation_spin(
+    scf_data: &SCF,
+    omega: f64,
+    n: usize,
+    spin: usize,
+    consts: f64,
+    quasiparticle_energies_g: &Vec<f64>,
+    quasiparticle_energies_w_all: &[Vec<f64>;2],
+    occ_params: &[OccParams;2],
+    ri_ov: &[MatrixFull<f64>;2],
+    ri_row_n: &MatrixFull<f64>,
+    w_c_at_freqs: &Vec<WcAtFreq>,
+    res_tol: f64,
+    eta: f64,
+) -> f64 {
+    let contour = contour_rayon_spin(scf_data, omega, n, spin, quasiparticle_energies_g, quasiparticle_energies_w_all, occ_params, ri_ov, ri_row_n, res_tol, eta);
+    let imag = calculate_imag_spin(w_c_at_freqs, occ_params[spin].num_state, n, omega, quasiparticle_energies_g, spin);
+    consts + contour - imag - omega
 }
 
 pub fn spectrum_test(scf_data:&SCF,num_freq:usize){

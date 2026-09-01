@@ -104,6 +104,8 @@ pub struct SCF {
     pub ref_eigenvectors: HashMap<String, ([MatrixFull<f64>;2], [usize;4])>,
     pub renormalized_singles_particles:Vec<f64>,
     pub gwqp:(Vec<f64>,Vec<f64>),
+    /// Spin-resolved quasiparticle energies: (G energies, W energies), indexed [spin].
+    pub gwqp_spin:([Vec<f64>;2],[Vec<f64>;2]),
     pub algorithm_jk: AlgorithmJK,
     pub solvent_static_obj: Option<PcmObject>,
     pub solvent_scf: Option<PcmScf>,
@@ -164,6 +166,7 @@ impl SCF {
             energies: HashMap::new(),
             renormalized_singles_particles:Vec::new(),
             gwqp:(Vec::new(),Vec::new()),
+            gwqp_spin:([Vec::new(),Vec::new()],[Vec::new(),Vec::new()]),
             algorithm_jk: AlgorithmJK::Default,
             solvent_static_obj: None,
             solvent_scf: None,

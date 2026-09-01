@@ -63,6 +63,149 @@ pub fn g0w0(
         panic!("invalid expression for gw scheme!")
     }
 }
+pub fn g0w0_spin(
+    scf_data: &mut SCF,
+    num_freq: usize,
+    vxc_nn: &[Vec<f64>;2],
+    cancel_dfa_xc: bool,
+) -> [Vec<f64>;2] {
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let gw_scheme = qp_ctrl.gw_scheme.clone();
+    if gw_scheme == "extrapolated" {
+        match qp_ctrl.gw_variant {
+            GwVariant::Cd => gw_near_fermi_surface_spin(
+                scf_data,
+                num_freq,
+                vxc_nn,
+                qp_ctrl.gw_extrapolate_occ_threshold,
+                qp_ctrl.gw_extrapolate_vir_threshold,
+                cancel_dfa_xc,
+            ),
+            _ => panic!("g0w0_spin: only CD variant is currently supported in the unrestricted path"),
+        }
+    } else {
+        panic!("g0w0_spin: only gw_scheme=extrapolated is currently supported in the unrestricted path");
+    }
+}
+
+pub fn single_orbital_gw_spin(
+    scf_data: &SCF,
+    v_matrix: &MatrixFull<f64>,
+    ri_ov: &[MatrixFull<f64>;2],
+    ri_row_n: &MatrixFull<f64>,
+    w_c_at_freqs: &Vec<ri_gw::WcAtFreq>,
+    n: usize,
+    spin: usize,
+    vxc_nn: f64,
+) -> f64 {
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let gwqp_g_all = scf_data.gwqp_spin.0.clone();
+    let gwqp_w_all = scf_data.gwqp_spin.1.clone();
+    let gwqp_g = &gwqp_g_all[spin];
+    let ops = ri_gw::get_occ_params_per_spin(scf_data, 'Y');
+    let op = ops[spin];
+    let e_ks_n = scf_data.eigenvalues[spin][n];
+    let mut exchange = 0.0;
+    for i_local in 0..op.occ_size {
+        exchange -= v_matrix[[n, op.start_mo + i_local]];
+    }
+    let hybrid_param = scf_data.mol.xc_data.dfa_hybrid_scf;
+    let side = if n > op.homo { 1.0 } else { -1.0 };
+    let consts = scf_data.eigenvalues[spin][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
+    let cdgw_eta = qp_ctrl.cdgw_eta;
+    let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
+    if qp_ctrl.fourier_self_energy || qp_ctrl.hermite_self_energy {
+        panic!("Unrestricted GW with Fourier/Hermite self-energy is not implemented yet");
+    }
+
+    let qp_eq_func = |omega: f64| {
+        ri_gw::quasiparticle_equation_spin(
+            scf_data, omega, n, spin, consts,
+            gwqp_g, &gwqp_w_all, &ops, ri_ov, ri_row_n,
+            w_c_at_freqs, cdgw_res_tol, cdgw_eta,
+        )
+    };
+
+    if qp_ctrl.gw_rootfinder == "newton" {
+        let mut x = ri_gw::single_newton_step(&qp_eq_func, e_ks_n, side, 0.2);
+        for _ in 0..20 {
+            let xnew = ri_gw::single_newton_step(&qp_eq_func, x, side, 0.2);
+            if (xnew - x).abs() < 1.0e-8 { x = xnew; break; }
+            x = xnew;
+        }
+        println!("Spin {} orbital #{}: QP energy = {}", spin, n, x);
+        x
+    } else {
+        let (have_crossing, mut qp) = ri_gw::linear_interpolation_solver(
+            qp_eq_func, e_ks_n, side, qp_ctrl.gw_search_grid, qp_ctrl.gw_span_energy,
+        );
+        if !have_crossing {
+            qp = ri_gw::single_newton_step(&qp_eq_func, e_ks_n, side, 0.2);
+        }
+        println!("Spin {} orbital #{}: QP energy = {}", spin, n, qp);
+        qp
+    }
+}
+
+pub fn gw_near_fermi_surface_spin(
+    scf_data: &mut SCF,
+    num_freq: usize,
+    vxc_nn: &[Vec<f64>;2],
+    occ_threshold: f64,
+    vir_threshold: f64,
+    _cancel_dfa_xc: bool,
+) -> [Vec<f64>;2] {
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let nspin = scf_data.mol.spin_channel;
+    if qp_ctrl.use_low_rank_contour {
+        panic!("Unrestricted low-rank contour GW is not implemented yet; set use_low_rank_contour=false");
+    }
+    let ops = ri_gw::get_occ_params_per_spin(scf_data, 'Y');
+    let ri_ov0 = ri_bse::get_submatrix_spin(scf_data, 'O', 'V', 'Y', 0);
+    let ri_ov1 = if nspin == 2 { ri_bse::get_submatrix_spin(scf_data, 'O', 'V', 'Y', 1) } else { ri_ov0.clone() };
+    let ri_ov = [ri_ov0, ri_ov1];
+    let gwqp_w_all = scf_data.gwqp_spin.1.clone();
+    let w_c_at_freqs = ri_gw::generate_w_c_spin(scf_data, &ri_ov, &gwqp_w_all, &ops, num_freq);
+
+    let mut out = [vec![], vec![]];
+    for spin in 0..nspin {
+        let op = ops[spin];
+        let v_matrix = ri_gw::v_matrix_from_scf_spin(scf_data, spin);
+        let ks_energies = scf_data.eigenvalues[spin].clone();
+        let e_homo = ks_energies[op.homo];
+        let e_lumo = ks_energies[op.lumo];
+        let calc_orbs_indices: Vec<usize> = ks_energies.iter().enumerate()
+            .filter(|(_, e_n)| **e_n > e_homo - occ_threshold && **e_n < e_lumo + vir_threshold)
+            .map(|(n, _)| n).collect();
+        let calc_orbs: Vec<(usize, f64)> = calc_orbs_indices.iter().map(|&n| {
+            let ri_row_n = ri_gw::compute_ri3mo_row_spin(scf_data, n, spin);
+            (n, single_orbital_gw_spin(scf_data, &v_matrix, &ri_ov, &ri_row_n, &w_c_at_freqs, n, spin, vxc_nn[spin][n]))
+        }).collect();
+
+        let occ_shift = calc_orbs[0].1 - scf_data.eigenvalues[spin][calc_orbs[0].0];
+        let vir_shift = calc_orbs[calc_orbs.len() - 1].1 - scf_data.eigenvalues[spin][calc_orbs[calc_orbs.len() - 1].0];
+        let mut gwqp: Vec<f64> = Vec::new();
+        for i in 0..calc_orbs[0].0 {
+            gwqp.push(scf_data.eigenvalues[spin][i] + occ_shift)
+        }
+        for (_, e) in calc_orbs.iter() { gwqp.push(*e); }
+        for i in calc_orbs[calc_orbs.len() - 1].0 + 1..op.num_state {
+            gwqp.push(scf_data.eigenvalues[spin][i] + vir_shift)
+        }
+        out[spin] = gwqp;
+    }
+    for spin in 0..nspin {
+        scf_data.gwqp_spin.0[spin] = out[spin].clone();
+        scf_data.gwqp_spin.1[spin] = out[spin].clone();
+    }
+    if nspin == 1 {
+        scf_data.gwqp_spin.0[1] = scf_data.gwqp_spin.0[0].clone();
+        scf_data.gwqp_spin.1[1] = scf_data.gwqp_spin.1[0].clone();
+        out[1] = out[0].clone();
+    }
+    out
+}
+
 pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)->Vec<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
     for i in 0..iter_rounds{

@@ -25,3 +25,10 @@ GeomeTRIC*
 HessianMatrix.txt
 EigenModes.txt
 _tmp*
+
+# Local modified MOLGW build used only for cross-validation against REST.
+# Never commit it into rest.git.
+/molgw_mod/
+
+# local cargo target used for this task
+/target_u/

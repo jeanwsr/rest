@@ -6,7 +6,7 @@ use rest_tensors::{RIFull};
 use std::ops::Index;
 use std::cmp;
 use tensors::{matrix_blas_lapack::_dinverse, MathMatrix, MatrixFull};
-use crate::ri_gw::get_occupation_parameters;
+use crate::ri_gw::{get_occupation_parameters, get_occ_params_per_spin, select_ri3mo_spin};
 //use libc::select;
 //use rest::molecule_io::Molecule;
 use crate::ri_gw;
@@ -32,6 +32,9 @@ pub mod pysoc_export;
 use libc::seccomp_notif;
 
 pub fn bse_main(scf_data:&mut SCF){
+    if scf_data.mol.spin_channel == 2 {
+        return bse_main_unrestricted(scf_data);
+    }
     let start=Instant::now();
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let quasiparticle_energies=scf_data.gwqp.0.clone();
@@ -235,6 +238,39 @@ pub fn get_submatrix(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:c
     let matrix:MatrixFull<f64>=vector.into_iter().next().unwrap().0.into_matfull_i_jk();
     matrix
 }
+pub fn get_submatrix_spin(scf_data:&SCF,choice_a:char,choice_b:char,response_or_not:char,spin:usize)->MatrixFull<f64>{
+    let op = get_occ_params_per_spin(scf_data, response_or_not)[spin];
+    let (start_mo, num_state, _occ_size, _vir_size, homo, lumo) = (op.start_mo, op.num_state, op.occ_size, op.vir_size, op.homo, op.lumo);
+    let range_oo=(start_mo..homo+1, start_mo..homo+1);
+    let range_vv=(lumo..num_state, lumo..num_state);
+    let range_ov=(start_mo..homo+1, lumo..num_state);
+    let range_ff=(start_mo..num_state,start_mo..num_state);
+
+    let use_bse_integrals = scf_data.ri3fn_bse.is_some() || scf_data.rimatr_bse.is_some();
+    let vector:Vec<(RIFull<f64>,Range<usize>,Range<usize>)> = if choice_a=='F'&&choice_b=='F'{
+        scf_data.generate_ri3mo_rayon_for_multiple_times(range_ff.0,range_ff.1)
+    }else if choice_a=='O'&&choice_b=='O'{
+        if use_bse_integrals { scf_data.generate_ri3mo_bse(range_oo.0, range_oo.1) } else { scf_data.generate_ri3mo_rayon_for_multiple_times(range_oo.0, range_oo.1) }
+    }else if choice_a=='V'&&choice_b=='V'{
+        if use_bse_integrals { scf_data.generate_ri3mo_bse(range_vv.0, range_vv.1) } else { scf_data.generate_ri3mo_rayon_for_multiple_times(range_vv.0, range_vv.1) }
+    }else if choice_a=='O'&&choice_b=='V'{
+        if use_bse_integrals { scf_data.generate_ri3mo_bse(range_ov.0, range_ov.1) } else { scf_data.generate_ri3mo_rayon_for_multiple_times(range_ov.0, range_ov.1) }
+    }else {
+        panic!("invalid choice of ri subspace!")
+    };
+    select_ri3mo_spin(vector, spin)
+}
+
+pub fn construct_inverse_dielectric_spin(scf_data:&SCF, epsilon:&[Vec<f64>;2])->MatrixFull<f64>{
+    let occ_params = get_occ_params_per_spin(scf_data,'Y');
+    let ri_ov = [
+        get_submatrix_spin(scf_data,'O','V','Y',0),
+        get_submatrix_spin(scf_data,'O','V','Y',1),
+    ];
+    let response = ri_gw::response_matrix_total(scf_data, epsilon, &occ_params, &ri_ov, 0.0, 'R', 0.0);
+    ri_gw::inverse_dielectric_matrix(response, 'R')
+}
+
 pub fn construct_raw_w(ri_left:&MatrixFull<f64>,ri_right:&MatrixFull<f64>,inverse_dielectric:&MatrixFull<f64>)->MatrixFull<f64>{
     let mut first_product:MatrixFull<f64>=MatrixFull::new([ri_left.size[1],ri_left.size[0]],0.0);
     let mut w:MatrixFull<f64>=MatrixFull::new([ri_left.size[1],ri_right.size[1]],0.0);
@@ -729,6 +765,175 @@ pub fn bse_both_spins(scf_data:&mut SCF,quasiparticle_energies:&Vec<f64>)->(Vec<
     }
     (eigenpairs_singlet,eigenpairs_triplet)
 }
+fn place_block(dst:&mut MatrixFull<f64>, src:&MatrixFull<f64>, row0:usize, col0:usize){
+    for j in 0..src.size[1] {
+        for i in 0..src.size[0] {
+            dst[[row0+i, col0+j]] = src[[i,j]];
+        }
+    }
+}
+
+fn construct_u_submat_a(
+    scf_data:&SCF,
+    inverse_dielectric:&MatrixFull<f64>,
+    quasiparticle_energies:&[Vec<f64>;2],
+    with_hartree:bool,
+)->MatrixFull<f64>{
+    let ops = get_occ_params_per_spin(scf_data,'N');
+    let nspin = scf_data.mol.spin_channel;
+    let ntot:usize = (0..nspin).map(|s| ops[s].occ_size*ops[s].vir_size).sum();
+    let mut a = MatrixFull::new([ntot, ntot], 0.0);
+    let mut offsets = [0usize;2];
+    for s in 0..nspin {
+        offsets[s] = if s==0 {0} else {offsets[s-1] + ops[s-1].occ_size*ops[s-1].vir_size};
+    }
+    for s in 0..nspin {
+        let ri_ov_s = get_submatrix_spin(scf_data,'O','V','N',s);
+        let ri_oo_s = get_submatrix_spin(scf_data,'O','O','N',s);
+        let ri_vv_s = get_submatrix_spin(scf_data,'V','V','N',s);
+        let v_ss = construct_coulomb(&ri_ov_s, &ri_ov_s);
+        let raw_w = construct_raw_w(&ri_oo_s, &ri_vv_s, inverse_dielectric);
+        let mut w_a = reorganize_w(raw_w, 'A', ops[s].occ_size, ops[s].vir_size);
+        w_a.self_multiple(-1.0);
+        let mut diag = construct_energy_diag_for_a(&quasiparticle_energies[s], ops[s].occ_size, ops[s].vir_size);
+        let mut block = w_a;
+        block.iter_diagonal_mut().unwrap().zip(diag.iter_mut()).for_each(|(x,e)|{*x += *e;});
+        if with_hartree {
+            block = MatrixFull::add(&v_ss, &block).unwrap();
+        }
+        place_block(&mut a, &block, offsets[s], offsets[s]);
+        for t in 0..nspin {
+            if s == t { continue; }
+            if !with_hartree { continue; }
+            let ri_ov_t = get_submatrix_spin(scf_data,'O','V','N',t);
+            let v_st = construct_coulomb(&ri_ov_s, &ri_ov_t);
+            place_block(&mut a, &v_st, offsets[s], offsets[t]);
+        }
+    }
+    a
+}
+
+fn construct_u_submat_b(
+    scf_data:&SCF,
+    inverse_dielectric:&MatrixFull<f64>,
+    with_hartree:bool,
+)->MatrixFull<f64>{
+    let ops = get_occ_params_per_spin(scf_data,'N');
+    let nspin = scf_data.mol.spin_channel;
+    let ntot:usize = (0..nspin).map(|s| ops[s].occ_size*ops[s].vir_size).sum();
+    let mut b = MatrixFull::new([ntot, ntot], 0.0);
+    let mut offsets = [0usize;2];
+    for s in 0..nspin {
+        offsets[s] = if s==0 {0} else {offsets[s-1] + ops[s-1].occ_size*ops[s-1].vir_size};
+    }
+    for s in 0..nspin {
+        let ri_ov_s = get_submatrix_spin(scf_data,'O','V','N',s);
+        let raw_w = construct_raw_w(&ri_ov_s, &ri_ov_s, inverse_dielectric);
+        let mut w_b = reorganize_w(raw_w, 'B', ops[s].occ_size, ops[s].vir_size);
+        w_b.self_multiple(-1.0);
+        let mut block = w_b;
+        if with_hartree {
+            let v_ss = construct_coulomb(&ri_ov_s, &ri_ov_s);
+            block = MatrixFull::add(&v_ss, &block).unwrap();
+        }
+        place_block(&mut b, &block, offsets[s], offsets[s]);
+        for t in 0..nspin {
+            if s == t || !with_hartree { continue; }
+            let ri_ov_t = get_submatrix_spin(scf_data,'O','V','N',t);
+            let v_st = construct_coulomb(&ri_ov_s, &ri_ov_t);
+            place_block(&mut b, &v_st, offsets[s], offsets[t]);
+        }
+    }
+    b
+}
+
+fn construct_u_full_bse_hamiltonian(
+    scf_data:&SCF,
+    inverse_dielectric:&MatrixFull<f64>,
+    quasiparticle_energies:&[Vec<f64>;2],
+    with_hartree:bool,
+)->MatrixFull<f64>{
+    let a = construct_u_submat_a(scf_data, inverse_dielectric, quasiparticle_energies, with_hartree);
+    let b = construct_u_submat_b(scf_data, inverse_dielectric, with_hartree);
+    let n = a.size[0];
+    let mut h = MatrixFull::new([2*n,2*n], 0.0);
+    let mut minus_a = a.transpose();
+    let b_t = b.transpose();
+    let mut minus_b = b.clone();
+    minus_a.self_multiple(-1.0);
+    minus_b.self_multiple(-1.0);
+    for j in 0..n {
+        for i in 0..n {
+            h[[i,j]] = a[[i,j]];
+            h[[n+i,j]] = minus_b[[i,j]];
+            h[[i,n+j]] = b_t[[i,j]];
+            h[[n+i,n+j]] = minus_a[[i,j]];
+        }
+    }
+    h
+}
+
+fn solve_dense_eigenpairs(mat:&MatrixFull<f64>, qp_ctrl:&crate::ctrl_io::quasiparticle_methods::QuasiParticle)->Vec<(f64,Vec<f64>)>{
+    let (_, wr, _wi, _vl, vr, _info) = _dgeev(mat, 'N', 'V');
+    let mut pairs = zip_and_sort(&wr, &vr);
+    pairs = pairs.into_iter().filter(|(val,_)| *val >= qp_ctrl.bse_eigenrange_min && *val <= qp_ctrl.bse_eigenrange_max).collect();
+    pairs
+}
+
+pub fn bse_main_unrestricted(scf_data:&mut SCF){
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    if qp_ctrl.bse_spin == "none" {
+        println!("No BSE Calculations are triggered");
+        return;
+    }
+    let (start_mo, num_state, occ_size, vir_size, _homo, _lumo) = get_occupation_parameters(scf_data, 'N');
+    let _ = (start_mo, num_state, occ_size, vir_size);
+
+    let qp_energies = scf_data.gwqp_spin.0.clone();
+    let ks_energies = [scf_data.eigenvalues[0].clone(), scf_data.eigenvalues[1].clone()];
+    let epsilon = if qp_ctrl.bse_qp_polarization { qp_energies.clone() } else { ks_energies };
+    let inverse_dielectric = construct_inverse_dielectric_spin(scf_data, &epsilon);
+
+    let modes: Vec<(&str,bool)> = if qp_ctrl.bse_spin == "both" {
+        vec![("singlet", true), ("triplet", false)]
+    } else if qp_ctrl.bse_spin == "singlet" {
+        vec![("singlet", true)]
+    } else if qp_ctrl.bse_spin == "triplet" {
+        vec![("triplet", false)]
+    } else {
+        vec![("unrestricted", true)]
+    };
+
+    for (mode, with_hartree) in modes {
+        let eigenpairs = if qp_ctrl.bse_tda {
+            let a = construct_u_submat_a(scf_data, &inverse_dielectric, &qp_energies, with_hartree);
+            solve_dense_eigenpairs(&a, &qp_ctrl)
+        } else {
+            let h = construct_u_full_bse_hamiltonian(scf_data, &inverse_dielectric, &qp_energies, with_hartree);
+            solve_dense_eigenpairs(&h, &qp_ctrl)
+        };
+        println!("\nUnrestricted BSE ({}, TDA={}) eigenvalues in [{:.6}, {:.6}] Ha: {}",
+            mode, qp_ctrl.bse_tda, qp_ctrl.bse_eigenrange_min, qp_ctrl.bse_eigenrange_max, eigenpairs.len());
+        for (n,(e,_v)) in eigenpairs.iter().enumerate() {
+            println!("#{} Excitation energy={} Ha = {:.6} eV", n, e, e*crate::constants::EV);
+        }
+        if let Some((first,_)) = eigenpairs.first() {
+            println!("The first unrestricted BSE ({}) excitation is {} Ha ({:.6} eV)", mode, first, first*crate::constants::EV);
+            if qp_ctrl.save_first_excitation {
+                if let Ok(mut file) = OpenOptions::new().append(true).create(true).open(qp_ctrl.save_first_excitation_path.clone()) {
+                    writeln!(file, "{}", first).unwrap();
+                }
+            }
+        }
+        if qp_ctrl.save_bse_excitations {
+            let line = eigenpairs.iter().map(|(e,_)| e.to_string()).collect::<Vec<_>>().join(",");
+            if let Ok(mut file) = OpenOptions::new().append(true).create(true).open("bse_excitations.txt") {
+                writeln!(file, "{}", line).unwrap();
+            }
+        }
+    }
+}
+
 pub fn zip_and_sort(
     eigenvalues: &Vec<f64>,
     eigenvectors: &MatrixFull<f64>
