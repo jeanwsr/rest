@@ -21,6 +21,7 @@ use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_get_submatrix, c
 use crate::ri_tddft::feast_solver;
 use crate::ri_tddft::tddft::{build_a, build_b, prepare_ao_data, prepare_mo_data};
 use crate::ri_tddft::{TDDFTData, TDDFTMode};
+use log::{warn, debug};
 
 /// Main TDDFT entry point
 ///
@@ -63,7 +64,7 @@ fn dense_lr_eigenpairs(
         _dpotrf(&mut g, 'L');
     }));
     if chol_ok.is_err() {
-        log::warn!(
+        warn!(
             "  Dense LR: Cholesky of (A-B) failed (not positive-definite); \
              falling back to TDA approximation."
         );
@@ -134,7 +135,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     // MO mode does not use the grid-batched kernel, so the flag is silently
     // ignored there (visible at debug level).
     if tddft_ctrl.grid_batch && !is_ao {
-        log::debug!("grid_batch is only applicable in AO mode; ignoring it in MO mode.");
+        warn!("grid_batch is only applicable in AO mode; ignoring it in MO mode.");
     }
 
     // Triplet TDDFT is only supported in AO mode: the MO-mode fxc kernel
@@ -152,7 +153,11 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
 
     println!("\n=== TDDFT Calculation ===");
     println!("Method: {}", if is_tda { "TDA" } else { "Full LR" });
-    println!("Basis: {}", if is_ao { "AO transition-density (tddft_mode=ao)" } else { "MO (tddft_mode=mo)" });
+    println!("Mode: {}", tddft_ctrl.tddft_mode);
+    if is_ao {
+        println!("  RI-K driver: {}", tddft_ctrl.tddft_ao_rik_driver);
+        println!("  fxc driver: {}", tddft_ctrl.tddft_fxc_driver);
+    }
     println!("Spin: {}", if xlet == 'S' { "Singlet" } else { "Triplet" });
     println!("Number of roots: {}", nroots);
 
@@ -182,10 +187,10 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     // RefCell: shared mutable state needed by the batched Davidson closures,
     // each of which requires `&mut TDDFTData` (NIMatmul cache).
     //
-    // Free the SCF-tabulated dense AO tables (grids.ao / grids.aop, ~1 GB at
-    // TZ-GGA) before preparing AO-mode data: the AO paths never read them, and
-    // no other consumer reads them afterwards (Hirshfeld decompresses on
-    // demand).
+    // Free the SCF-tabulated dense AO tables (grids.ao / grids.aop — the
+    // largest scratch tables of an AO-mode run) before preparing AO-mode
+    // data: the AO paths never read them, and no other consumer reads them
+    // afterwards (Hirshfeld decompresses on demand).
     if is_ao {
         if let Some(g) = scf.grids.as_mut() {
             g.ao = None;

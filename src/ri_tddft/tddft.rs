@@ -288,10 +288,10 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
     // Layouts (t-ready, contiguous for the matvec GEMMs):
     // psi_occ [ngrids, nocc]; psi_occ_grad [3, ngrids, nocc]
     // (leading d-axis so the (d, chunk, ·) slices are contiguous).
-    // psi_occ [ngrids, nocc]; psi_occ_grad [3, ngrids, nocc] — the ONLY cached
-    // tables (small). The vir side (ψ_vir + grads, the ~1.1 GB whale at TZ-GGA)
-    // is NOT cached: fxc_mo_matvec streams it per grid batch (AO eval + C_vir
-    // projection per batch) to keep the memory footprint down.
+    // These are the ONLY cached tables (small). The vir side (ψ_vir + its
+    // gradients, which scale as nvir·ngrids) is NOT cached: fxc_mo_matvec
+    // streams it per grid batch (AO eval + C_vir projection per batch) to
+    // keep the memory footprint down.
     let fxc_driver = scf.mol.ctrl.tddft.as_ref().map_or(FxcDriver::SEMITRANS, |t| {
         match t.tddft_fxc_driver.as_str() {
             "mo" => FxcDriver::MO,

@@ -114,7 +114,7 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
             };
             p.tddft_mode = match tmp_ctrl.get("tddft_mode").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.to_lowercase(),
-                _ => String::from("semitrans"),
+                _ => String::from("mo"),
             };
             p.grid_batch = match tmp_ctrl.get("grid_batch").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(b) => *b,
