@@ -398,7 +398,8 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     } else {
         // Layered by mode, then by method: AO/MO owns the matvec family,
         // TDA/LR is the inner branch. (FEAST and dim<=15 are outer special cases.)
-        match data.borrow().mode {
+        let mode = data.borrow().mode;
+        match mode {
             TDDFTMode::AO => {
                 if is_tda {
                     println!("Solving TDA eigenvalue problem (AO-mode batched matvec)...");
