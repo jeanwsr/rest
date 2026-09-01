@@ -27,7 +27,7 @@ pub fn atom_grid_bse(
     pruning: String,
     rad_grid_method: String,
     level: usize,
-) -> (Vec<(f64, f64, f64)>, Vec<f64>) {
+) -> (Vec<(f64, f64, f64)>, Vec<f64>, Vec<f64>) {
     let (alpha_min, alpha_max) =
         bse::ang_min_and_max(basis_set, proton_charges[center_index] as usize);
 
@@ -60,9 +60,11 @@ pub fn atom_grid_bse(
 /// **pruning**: Pruning method.<br>
 /// **rad_grid_method**: Radial grid generation method.<br>
 /// **level**: Size of generated grids. Higher level refers to larger grids.
-/// 
-/// # Returns: 
-/// A tuple of two vectors of grid coordinates and weights respectively.
+///
+/// # Returns:
+/// A tuple of three vectors: grid coordinates, integration weights (scaled by the Becke
+/// partitioning weight for multi-center systems), and quadrature weights (before the Becke
+/// partitioning) respectively.
 pub fn atom_grid(
     alpha_min: HashMap<usize, f64>,
     alpha_max: f64,
@@ -76,7 +78,7 @@ pub fn atom_grid(
     pruning: String,
     rad_grid_method: String,
     level: usize,
-) -> (Vec<(f64, f64, f64)>, Vec<f64>) {
+) -> (Vec<(f64, f64, f64)>, Vec<f64>, Vec<f64>) {
 
 
 /*
@@ -207,6 +209,7 @@ pub fn atom_grid(
         }
     }
 
+    let quadrature_weights = weights.clone();
     if center_coordinates_bohr.len() > 1 {
         let w_partitioning: Vec<f64> = coordinates
             .par_iter()
@@ -226,7 +229,7 @@ pub fn atom_grid(
         }
     }
 
-    (coordinates, weights)
+    (coordinates, weights, quadrature_weights)
 }
 
 /// Determine the number of radial grids according to level.

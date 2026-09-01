@@ -67,6 +67,7 @@ pub struct RIHFGradientFlags {
 pub struct RIRHFGradient<'a> {
     pub scf_data: &'a SCF,
     pub flags: RIHFGradientFlags,
+    pub mpi_operator: &'a Option<crate::mpi_io::MPIOperator>,
     pub result: HashMap<String, MatrixFull<f64>>,
 }
 
@@ -112,7 +113,7 @@ pub fn build_ri_jk_grad_flags(scf_data: &SCF) -> RIHFGradientFlags {
 }
 
 impl RIRHFGradient<'_> {
-    pub fn new(scf_data: &SCF) -> RIRHFGradient<'_> {
+    pub fn new<'a>(scf_data: &'a SCF, mpi_operator: &'a Option<crate::mpi_io::MPIOperator>) -> RIRHFGradient<'a> {
         // check SCF type
         match scf_data.scftype {
             scf_io::SCFType::RHF => {},
@@ -121,7 +122,7 @@ impl RIRHFGradient<'_> {
 
         // flags
         let flags = build_ri_jk_grad_flags(scf_data);
-        RIRHFGradient { scf_data, flags, result: HashMap::new() }
+        RIRHFGradient { scf_data, flags, mpi_operator, result: HashMap::new() }
     }
 
     /// Derivatives of nuclear repulsion energy with reference to nuclear coordinates

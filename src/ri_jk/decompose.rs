@@ -16,6 +16,35 @@ pub enum J2CDecompPolicy {
     Eig,
 }
 
+/// Mode controlling whether the (ScaLAPACK-based) distributed Cholesky factorization
+/// and triangular solve are used for the 2c-2e metric in MPI-parallel rimatr builds.
+///
+/// This is a sandbox option: it only takes effect when
+/// - the `scalapack` (and `mpi`) feature is compiled in,
+/// - the run is MPI-parallel (≥ 2 processes),
+/// - `policy = Cd` (the distributed path is Cholesky-only).
+///
+/// All other combinations fall back to the serial/rank-0 path unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum J2CDistributedMode {
+    /// Use the distributed solver only when it pays off: auxiliary basis size
+    /// `naux >= J2C_DISTRIBUTED_NAUX_MIN` and process count `nproc >= J2C_DISTRIBUTED_NPROC_MIN`.
+    #[default]
+    Auto,
+    /// Always use the distributed solver (mainly for testing small systems, where the
+    /// automatic threshold would not trigger).
+    #[serde(alias = "true", alias = "yes")]
+    On,
+    /// Never use the distributed solver.
+    #[serde(alias = "false", alias = "no")]
+    Off,
+}
+
+/// Thresholds for [`J2CDistributedMode::Auto`].
+pub const J2C_DISTRIBUTED_NAUX_MIN: usize = 8192;
+pub const J2C_DISTRIBUTED_NPROC_MIN: usize = 32;
+
 /// Policy for 2c-2e ERI (j2c) decomposition.
 ///
 /// - `Cd`: Cholesky decomposition
@@ -43,11 +72,21 @@ pub struct J2CDecompOption {
     /// This field is only used for Cholesky decomposition, and will be ignored for eigen decomposition.
     #[serde_inline_default(Upper)]
     pub uplo: FlagUpLo,
+    /// Whether to use the distributed (ScaLAPACK) Cholesky solve for the 2c-2e metric
+    /// in MPI-parallel rimatr builds. Default to `Auto` (never triggers for typical
+    /// systems; use `On` to force for testing). Only meaningful for `policy = Cd`.
+    #[serde_inline_default(J2CDistributedMode::Auto)]
+    pub distributed: J2CDistributedMode,
 }
 
 impl Default for J2CDecompOption {
     fn default() -> Self {
-        J2CDecompOption { policy: J2CDecompPolicy::Eig, threshold: Some(J2C_THRESH), uplo: Upper }
+        J2CDecompOption {
+            policy: J2CDecompPolicy::Eig,
+            threshold: Some(J2C_THRESH),
+            uplo: Upper,
+            distributed: J2CDistributedMode::Auto,
+        }
     }
 }
 

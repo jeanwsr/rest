@@ -82,7 +82,7 @@ fn test_nh3_cd_upper() {
 }
 
 fn test_with_scf(scf_data: &'_ SCF) -> RIRHFGradient<'_> {
-    let mut scf_grad = RIRHFGradient::new(scf_data);
+    let mut scf_grad = RIRHFGradient::new(scf_data, &None);
     scf_grad.calc_rks();
 
     for grad_key in

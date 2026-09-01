@@ -760,7 +760,8 @@ analdrv_tasks = "freq"
 - `grid_level_cphf`：CPHF 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None，是 `[ctrl]` 中 grid_generation_level 关键词设定值减 2 (SCF 默认格点级别是 3，对应 Hessian 的级别是 1)；最低级别是 1。
 - `grid_level_skeleton`：Skeleton 导数 (包括 2 阶 Hessian 贡献、1 阶 Fock 贡献) 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None：
   - LDA/GGA 使用与 SCF 同样的格点；
-  - mGGA 将比 `grid_generation_level` 增加 2 级别。
+  - mGGA 分为两种情况：若 `grid_shift_deriv` 为 true 则保持 SCF 格点；若为 false 则将比 `grid_generation_level` 增加 2 级别。
+- `grid_shift_deriv`：是否在 DFT skeleton 导数中引入格点偏移导数 (格点权重对原子核坐标的导数、以及格点坐标偏移产生的导数)。取值 bool，默认为 `true`：引入后 skeleton 导数恢复平移不变性。设为 `false` 时退化为不含格点偏移导数。仅影响 numint_matmul 后端实现；要求标准原子生成的 DFT 格点，若使用外部格点 (`external_grids`)，因格点无原子归属，应设为 `false`。
 - `tol_point_group`：振动分析中的点群对称性判断阈值 (用于计算转动对称性，对熵矫正有贡献)。默认 1e-5，单位 Bohr / sqrt(atom)。
 - `gau_thermo`：是否使用 Gaussian 类型的热力学能矫正。默认 false。该选项仅作参考；目前 REST 的热力学矫正通常是定义 `[thermo]` 区块以进行计算。Gaussian 类型热力学能矫正接受输入卡中 `[thermo]` 区块的关键词 `temperature`, `pressure`, `symmetry_number` 与 `electronic_energy`。
 

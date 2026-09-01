@@ -16,6 +16,7 @@ type Tsr<T> = Tensor<T, DeviceBLAS, IxD>;
 pub struct RIUHFGradient<'a> {
     pub scf_data: &'a SCF,
     pub flags: RIHFGradientFlags,
+    pub mpi_operator: &'a Option<crate::mpi_io::MPIOperator>,
     pub result: HashMap<String, MatrixFull<f64>>,
 }
 
@@ -30,7 +31,7 @@ impl GradAPI for RIUHFGradient<'_> {
 }
 
 impl RIUHFGradient<'_> {
-    pub fn new(scf_data: &SCF) -> RIUHFGradient<'_> {
+    pub fn new<'a>(scf_data: &'a SCF, mpi_operator: &'a Option<crate::mpi_io::MPIOperator>) -> RIUHFGradient<'a> {
         // check SCF type
         match scf_data.scftype {
             scf_io::SCFType::UHF => {},
@@ -38,7 +39,7 @@ impl RIUHFGradient<'_> {
         };
 
         let flags = build_ri_jk_grad_flags(scf_data);
-        RIUHFGradient { scf_data, flags, result: HashMap::new() }
+        RIUHFGradient { scf_data, flags, mpi_operator, result: HashMap::new() }
     }
 
     /// Derivatives of nuclear repulsion energy with reference to nuclear coordinates

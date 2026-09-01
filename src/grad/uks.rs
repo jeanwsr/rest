@@ -115,7 +115,20 @@ impl RIUHFGradient<'_> {
         }
 
         // return to REST, note f-contiguous transpose
-        let de_xc_raw = de_xc.into_raw_parts().0.into_cpu_vec().unwrap();
+        let mut de_xc_raw = de_xc.into_raw_parts().0.into_cpu_vec().unwrap();
+        // MPI: the numerical grids are distributed across ranks (`Grids::build`), so each rank
+        // only integrates its local grid portion; sum the XC gradient contribution over ranks.
+        #[cfg(feature = "mpi")]
+        if let Some(mpi_op) = self.mpi_operator {
+            let mut reduced = vec![0.0_f64; de_xc_raw.len()];
+            crate::mpi_io::mpi_allreduce(
+                &mpi_op.world,
+                &de_xc_raw,
+                &mut reduced,
+                &mpi::collective::SystemOperation::sum(),
+            );
+            de_xc_raw.copy_from_slice(&reduced);
+        }
         let de_xc = MatrixFull::from_vec([3, natm], de_xc_raw).unwrap();
         self.result.insert("de_xc".into(), de_xc);
         
