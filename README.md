@@ -583,6 +583,10 @@ TD-DFT方法相关的设置在 `[tddft]` 区块中进行。REST支持基于RI积
     - `"triplet"`：三重态激发，库仑耦合因子为0。
 - `nroots`: 取值usize，需要计算的激发态数目（根的数目）。缺省为6。
 - `tddft_cutoff_energy`: 取值f64，单位Hartree。KS轨道能量高于此值的虚轨道将被排除在TD-DFT激发空间之外。设置合理值（如20.0-100.0）可显著缩减激发空间维度，加速计算。缺省为1e6（几乎不截断）。
+- `tddft_mode`: 取值String，选择TD-DFT计算模式：`"mo"`（缺省，MO-basis RI）/ `"ao"`（AO-basis）。
+- `grid_batch`: 取值bool，仅AO模式生效，缺省为`true`。
+- `tddft_ao_rik_driver`: 取值String，仅AO模式生效，`"semitrans"`（缺省）/ `"dm"` / `"lowrank"`。
+- `tddft_fxc_driver`: 取值String，仅AO模式生效，`"semitrans"`（缺省）/ `"mo"` / `"dm"`。
 
 ### Davidson求解器参数
 
