@@ -169,7 +169,13 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
 
     // ── Numerical integrator with the real grid weights (AO cached via libcint) ──
     let cint = get_cint_mol(&scf.mol);
-    let mut ni = NIMatmul::new(&cint, &grids.coordinates, weights);
+    let mut ni = NIMatmul::new(
+        &cint,
+        &grids.coordinates,
+        weights,
+        &grids.atm_idx,
+        &grids.quadrature_weights,
+    );
     let grid_batch = scf.mol.ctrl.tddft.as_ref().map_or(false, |t| t.grid_batch);
 
     // ── Ground-state density on grids, then the raw fxc kernel ──
