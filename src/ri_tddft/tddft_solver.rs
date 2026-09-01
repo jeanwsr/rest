@@ -395,49 +395,60 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
             pairs.truncate(nroots.min(dim));
             pairs
         }
-    } else if is_tda && matches!(data.borrow().mode, TDDFTMode::AO) {
-        println!("Solving TDA eigenvalue problem (AO-mode batched matvec)...");
-        davidson_solver::tda_davidson_solver_batched(
-            |z_block: &MatrixFull<f64>| {
-                matvec_ao::a_matvec_ao_batched(scf_ref, &mut *data.borrow_mut(), z_block, xlet)
-            },
-            nroots,
-            &hdiag,
-            initial_guess,
-            &davidson_cfg,
-        )
-    } else if is_tda {
-        println!("Solving TDA eigenvalue problem...");
-        davidson_solver::tda_davidson_solver(
-            |z: &Vec<f64>| a_apply(z),
-            nroots,
-            &hdiag,
-            initial_guess,
-            &davidson_cfg,
-        )
-    } else if matches!(data.borrow().mode, TDDFTMode::AO) {
-        println!("Solving full linear response eigenvalue problem (AO-mode batched matvec)...");
-        davidson_solver::lr_davidson_solver_batched(
-            |z_block: &MatrixFull<f64>| {
-                matvec_ao::a_matvec_ao_batched(scf_ref, &mut *data.borrow_mut(), z_block, xlet)
-            },
-            |z_block: &MatrixFull<f64>| {
-                matvec_ao::b_matvec_ao_batched(scf_ref, &mut *data.borrow_mut(), z_block, xlet)
-            },
-            nroots,
-            &hdiag,
-            initial_guess,
-            &davidson_cfg,
-        )
     } else {
-        println!("Solving full linear response eigenvalue problem...");
-        davidson_solver::lr_davidson_solver(|z: &Vec<f64>| a_apply(z),
-            |z: &Vec<f64>| b_apply(z),
-            nroots,
-            &hdiag,
-            initial_guess,
-            &davidson_cfg,
-        )
+        // Layered by mode, then by method: AO/MO owns the matvec family,
+        // TDA/LR is the inner branch. (FEAST and dim<=15 are outer special cases.)
+        match data.borrow().mode {
+            TDDFTMode::AO => {
+                if is_tda {
+                    println!("Solving TDA eigenvalue problem (AO-mode batched matvec)...");
+                    davidson_solver::tda_davidson_solver_batched(
+                        |z_block: &MatrixFull<f64>| {
+                            matvec_ao::a_matvec_ao_batched(scf_ref, &mut *data.borrow_mut(), z_block, xlet)
+                        },
+                        nroots,
+                        &hdiag,
+                        initial_guess,
+                        &davidson_cfg,
+                    )
+                } else {
+                    println!("Solving full linear response eigenvalue problem (AO-mode batched matvec)...");
+                    davidson_solver::lr_davidson_solver_batched(
+                        |z_block: &MatrixFull<f64>| {
+                            matvec_ao::a_matvec_ao_batched(scf_ref, &mut *data.borrow_mut(), z_block, xlet)
+                        },
+                        |z_block: &MatrixFull<f64>| {
+                            matvec_ao::b_matvec_ao_batched(scf_ref, &mut *data.borrow_mut(), z_block, xlet)
+                        },
+                        nroots,
+                        &hdiag,
+                        initial_guess,
+                        &davidson_cfg,
+                    )
+                }
+            }
+            TDDFTMode::MO => {
+                if is_tda {
+                    println!("Solving TDA eigenvalue problem...");
+                    davidson_solver::tda_davidson_solver(
+                        |z: &Vec<f64>| a_apply(z),
+                        nroots,
+                        &hdiag,
+                        initial_guess,
+                        &davidson_cfg,
+                    )
+                } else {
+                    println!("Solving full linear response eigenvalue problem...");
+                    davidson_solver::lr_davidson_solver(|z: &Vec<f64>| a_apply(z),
+                        |z: &Vec<f64>| b_apply(z),
+                        nroots,
+                        &hdiag,
+                        initial_guess,
+                        &davidson_cfg,
+                    )
+                }
+            }
+        }
     };
 
     // ═══ Step 9: Compute and print results (BSE-compatible format) ═══
