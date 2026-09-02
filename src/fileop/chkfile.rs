@@ -4,8 +4,11 @@ use hdf5;
 use hdf5::types::VarLenUnicode;
 // use hdf5::types::TypeDescriptor;
 use crate::scf_io::{SCF, SCFType};
-use crate::geom_io::get_mass_charge;
-use crate::basis_io::Basis4Elem;
+use tensors::matrix::MatrixFull;
+use crate::geom_io::{GeomCell, GeomUnit, MOrC, get_mass_charge};
+use crate::external_field::extfield::ExtField;
+use crate::basis_io::{BasInfo, Basis4Elem};
+use crate::molecule_io::build_cint;
 use rest_libcint::CintType;
 use crate::constants::BOHR;
 
@@ -43,6 +46,14 @@ pub fn write_string_scalar(file: &hdf5::File, dataset_name: &str, value: &str) {
 }
 
 pub fn save_chkfile(scf_data: &SCF) {
+    // Under MPI, only the root rank writes the checkpoint file; otherwise every
+    // process would open the same path concurrently (racing writes and duplicate
+    // "write chkfile" prints).
+    if let Some(mpi_data) = &scf_data.mol.mpi_data {
+        if mpi_data.rank != 0 {
+            return;
+        }
+    }
     let chkfile= &scf_data.mol.ctrl.chkfile;
     let path = Path::new(chkfile);
     //if path.exists() {std::fs::remove_file(chkfile).unwrap()};
@@ -99,20 +110,16 @@ pub fn save_chkfile(scf_data: &SCF) {
     // for compatibility with pyscf
     write_scf_attribute(&scf, "mo_occ", &occ);
 
-    let mol = &scf_data.mol;
-    // let (atm, bas, env) = (mol.cint_atm.clone(), mol.cint_bas.clone(), mol.cint_env.clone());
-    // convert hashmap of atm, bas, env to one json string
-    let mol_info = serde_json::to_string(&serde_json::json!({
-        "_atm": mol.cint_atm.clone(),
-        "_bas": mol.cint_bas.clone(),
-        "_ecpbas": mol.cint_ecpbas.clone(),
-        "_env": mol.cint_env.clone(),
-    })).unwrap();
-    write_string_scalar(&file, "mol", &mol_info);
-    let basis4elem = serde_json::to_string(&mol.basis4elem).unwrap();
+    let basis4elem = serde_json::to_string(&scf_data.mol.basis4elem).unwrap();
     write_string_scalar(&file, "molecule/basis4elem", &basis4elem);
-    let cinttype = cint_type_as_str(&mol.cint_type);
+    let cinttype = cint_type_as_str(&scf_data.mol.cint_type);
     write_string_scalar(&file, "molecule/cinttype", &cinttype);
+
+    let geom_json = geom_to_json(&scf_data.mol.geom);
+    write_string_scalar(&file, "molecule/geom", &geom_json);
+
+    let num_elec_json = serde_json::to_string(&scf_data.mol.num_elec[0]).unwrap();
+    write_string_scalar(&file, "molecule/num_elec", &num_elec_json);
 
     file.close();
 }
@@ -236,6 +243,7 @@ pub fn has_mo_coeff(file: &hdf5::File) -> bool {
 }
 
 pub fn load_cint_data(chkfile: &String) -> (Option<(Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>)>, Option<Vec<Vec<i32>>>, Option<Vec<Basis4Elem>>, Option<CintType>) {
+    // Load legacy "mol" JSON path only. For new-format chkfiles, use reconstruct_cint_data.
     let file = hdf5::File::open(chkfile).unwrap();
     let mol_info = file.dataset("mol").unwrap().read_scalar::<VarLenUnicode>().unwrap();
     let json_string = mol_info.as_str();
@@ -271,7 +279,126 @@ pub fn load_cint_data(chkfile: &String) -> (Option<(Vec<Vec<i32>>, Vec<Vec<i32>>
     (Some((atm, bas, env)), ecpbas, basis4elem, cinttype)
 }
 
-pub fn load_basic(chkfile: &String) -> Option<(usize, usize, usize, Option<f64>, Option<f64>)> {
+pub fn load_geom(chkfile: &String) -> Option<GeomCell> {
+    let file = hdf5::File::open(chkfile).unwrap();
+    let ds = file.dataset("molecule/geom").ok()?;
+    let json_str = ds.read_scalar::<VarLenUnicode>().ok()?;
+    geom_from_json(json_str.as_str())
+}
+
+pub fn geom_to_json(geom: &GeomCell) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "name":           geom.name.clone(),
+        "elem":           geom.elem.clone(),
+        "unit":           geom.unit,
+        "position":       geom.position.iter().copied().collect::<Vec<f64>>(),
+        "ghost_bs_elem":  geom.ghost_bs_elem.clone(),
+        "ghost_bs_pos":   geom.ghost_bs_pos.iter().copied().collect::<Vec<f64>>(),
+    })).unwrap()
+}
+
+pub fn geom_from_json(json_str: &str) -> Option<GeomCell> {
+    let json: HashMap<String, serde_json::Value> = serde_json::from_str(json_str).ok()?;
+
+    let name = json.get("name").and_then(|v| v.as_str()).unwrap_or("a molecule").to_string();
+    let elem: Vec<String> = serde_json::from_value(json.get("elem")?.clone()).ok()?;
+    let unit: GeomUnit = serde_json::from_value(json.get("unit")?.clone()).ok()?;
+    let natoms = elem.len();
+    let position = if natoms > 0 {
+        let position_data: Vec<f64> = serde_json::from_value(json.get("position")?.clone()).ok()?;
+        MatrixFull::from_vec([3, natoms], position_data).unwrap()
+    } else {
+        MatrixFull::empty()
+    };
+
+    let ghost_bs_elem: Vec<String> = json.get("ghost_bs_elem")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let n_ghost = ghost_bs_elem.len();
+    let ghost_bs_pos = if n_ghost > 0 {
+        let pos_data: Vec<f64> = json.get("ghost_bs_pos")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        MatrixFull::from_vec([3, n_ghost], pos_data).unwrap()
+    } else {
+        MatrixFull::empty()
+    };
+
+    Some(GeomCell {
+        name,
+        elem,
+        fix: vec![],
+        unit,
+        position,
+        nfree: 0,
+        lattice: MatrixFull::empty(),
+        pbc: MOrC::Molecule,
+        ghost_bs_elem,
+        ghost_bs_pos,
+        ghost_pc_chrg: vec![],
+        ghost_pc_pos: MatrixFull::empty(),
+        ghost_ep_path: vec![],
+        ghost_ep_pos: MatrixFull::empty(),
+        rest: vec![],
+        ext_field: ExtField::empty(),
+        rg_position: MatrixFull::empty(),
+        rg_elem: vec![],
+        rrs_pbc: false,
+        unit_cell_index: vec![],
+        pbc_dim: 1,
+        rrs_pbc_vec: MatrixFull::empty(),
+        max_step: vec![],
+        k_points: vec![],
+    })
+}
+
+pub fn reconstruct_cint_data(
+    chkfile: &String,
+    geom_override: Option<&GeomCell>,
+) -> (Option<(Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<f64>)>, Option<Vec<Vec<i32>>>, Option<Vec<Basis4Elem>>, Option<CintType>, Option<Vec<BasInfo>>, Option<Vec<Vec<usize>>>) {
+    let file = hdf5::File::open(chkfile).unwrap();
+
+    let has_basis4elem = file.dataset("molecule/basis4elem").is_ok();
+    let has_cinttype = file.dataset("molecule/cinttype").is_ok();
+
+    if !has_basis4elem || !has_cinttype {
+        let (a, b, c, d) = load_cint_data(chkfile);
+        return (a, b, c, d, None, None);
+    }
+
+    let basis4elem: Option<Vec<Basis4Elem>> = if let Ok(ds) = file.dataset("molecule/basis4elem") {
+        ds.read_scalar::<VarLenUnicode>().ok()
+            .and_then(|s| serde_json::from_str(s.as_str()).ok())
+    } else {
+        None
+    };
+
+    let cint_type: Option<CintType> = if let Ok(ds) = file.dataset("molecule/cinttype") {
+        ds.read_scalar::<VarLenUnicode>().ok()
+            .map(|s| s.as_str().into())
+    } else {
+        None
+    };
+
+    let geom = geom_override.cloned().or_else(|| load_geom(chkfile));
+    let (basis4elem, cint_type, geom) = match (basis4elem, cint_type, geom) {
+        (Some(b), Some(ct), Some(g)) => (b, ct, g),
+        _ => {
+            let (a, b, c, d) = load_cint_data(chkfile);
+            return (a, b, c, d, None, None);
+        }
+    };
+
+    let (atm, bas, env, bas_info, cint_fdqc, _nbasis, ecpbas) =
+        build_cint(&basis4elem, &geom, &cint_type);
+
+    let basis4elem = Some(basis4elem);
+    let cint_type = Some(cint_type);
+
+    (Some((atm, bas, env)), ecpbas, basis4elem, cint_type, Some(bas_info), Some(cint_fdqc))
+}
+
+pub fn load_basic(chkfile: &String) -> (Option<usize>, Option<usize>, Option<usize>, Option<f64>, Option<f64>) {
     let file = hdf5::File::open(chkfile).unwrap();
     let scf = file.group("scf").unwrap();
     let mut num_basis = None;
@@ -321,9 +448,5 @@ pub fn load_basic(chkfile: &String) -> Option<(usize, usize, usize, Option<f64>,
         charge = Some(c.read_raw::<f64>().unwrap()[0]);
     }
 
-    if num_basis.is_some() && num_states.is_some() && spin_channel.is_some() {
-        Some((num_basis.unwrap(), num_states.unwrap(), spin_channel.unwrap(), spin, charge))
-    } else {
-        None
-    }
+    (num_basis, num_states, spin_channel, spin, charge)
 }
