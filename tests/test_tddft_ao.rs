@@ -65,7 +65,7 @@ fn test_transition_density() {
     let c_occ = MatrixFull::from_vec([nao, occ], pseudo(nao * occ, 2.1)).unwrap();
     let c_vir = MatrixFull::from_vec([nao, vir], pseudo(nao * vir, 3.3)).unwrap();
     let z: Vec<f64> = pseudo(occ * vir, 4.4);
-    let p = transition_density(&c_occ, &c_vir, &z, nao, occ, vir);
+    let p = transition_density(&c_occ, &c_vir, &z);
     // naive reference
     for mu in 0..nao { for nu in 0..nao {
         let mut s = 0.0;
@@ -162,7 +162,7 @@ fn test_b_exchange_uses_transposed_density() {
     let occ = c_occ.size[1];
     let vir = c_vir.size[1];
     let z: Vec<f64> = pseudo(occ * vir, 16.7);
-    let p = transition_density(c_occ, c_vir, &z, nao, occ, vir);
+    let p = transition_density(c_occ, c_vir, &z);
     let p_t = p.transpose_and_drop();
     let device = DeviceBLAS::default();
     let (ri3fn, _, _) = rimatr.as_ref().unwrap();
@@ -170,7 +170,7 @@ fn test_b_exchange_uses_transposed_density() {
     let dms = vec![p_t.clone()].as_slice().to_rstsr(&device);
     let ks = pyrest::ri_jk::pure_incore::get_vk_ri_incore_dm(cderi, dms.view(), 2);
     let k = MatrixFull::from_vec([nao, nao], ks.i((.., .., 0)).iter().copied().collect()).unwrap();
-    let result = contract_back(&k, c_occ, c_vir, occ, vir);
+    let result = contract_back(&k, c_occ, c_vir);
     // naive MO reference: Σ_jb (ib|aj) z_jb with MO integrals via 4-center
     for i in 0..occ { for a in 0..vir {
         let mut s = 0.0;
@@ -206,7 +206,7 @@ fn test_exchange_coeff_route_matches_dm() {
     let (ri3fn, _, _) = rimatr.as_ref().unwrap();
     let cderi = ri3fn.to_rstsr_view(&device);
 
-    let p = transition_density(c_occ, c_vir, &z, nao, occ, vir);
+    let p = transition_density(c_occ, c_vir, &z);
     let p_t = p.clone().transpose_and_drop();
     let dms = vec![p, p_t.clone()].as_slice().to_rstsr(&device);
     let ks_exact = pyrest::ri_jk::pure_incore::get_vk_ri_incore_dm(cderi.view(), dms.view(), naux);
@@ -265,7 +265,7 @@ fn test_b_exchange_transpose_identity() {
         naux,
     );
     let k_pt_m = MatrixFull::from_vec([nao, nao], k_pt.raw()[..nao * nao].to_vec()).unwrap();
-    let ref_b = contract_back(&k_pt_m, &c_occ, &c_vir, occ, vir);
+    let ref_b = contract_back(&k_pt_m, &c_occ, &c_vir);
 
     // new derivation: K[P], then (C_virᵀ K C_occ)ᵀ with the swapped-role contraction
     let k_p = get_vk_ri_incore_dm(
@@ -274,7 +274,7 @@ fn test_b_exchange_transpose_identity() {
         naux,
     );
     let k_p_m = MatrixFull::from_vec([nao, nao], k_p.raw()[..nao * nao].to_vec()).unwrap();
-    let cv = contract_back(&k_p_m, &c_vir, &c_occ, vir, occ); // flat a + i*vir
+    let cv = contract_back(&k_p_m, &c_vir, &c_occ); // flat a + i*vir
 
     let mut max_d = 0.0_f64;
     for i in 0..occ {
