@@ -86,7 +86,8 @@ pub enum MOrC {
     Crystal,
 }
 
-#[derive(Clone,Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum GeomUnit {
     Angstrom,
     Bohr,

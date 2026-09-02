@@ -42,19 +42,28 @@ pub struct AnalDrvConfig {
     pub grid_level_cphf: Option<usize>,
     /// Grid level for the skeleton grid used to evaluate the XC potential and kernel.
     ///
-    /// By default, the skeleton grid level is set to
-    /// - `grid_gen_level` for LDA/GGA functionals
-    /// - `grid_gen_level + 2` for MGGA (TAU) functionals.
+    /// By default, the skeleton grid level is set to `grid_gen_level` (the SCF grid), except for
+    /// MGGA (TAU) functionals with `grid_shift_deriv = false`, which add 2 levels.
     #[serde_inline_default(None)]
     pub grid_level_skeleton: Option<usize>,
+    /// Include the Becke grid-shift derivatives (the nuclear-coordinate derivatives of the
+    /// grid weights) in the DFT skeleton Hessian and the f1ao skeleton Fock derivatives.
+    ///
+    /// With it on (default), `de_xc_skeleton` and `vmat_deriv1_grid` are translationally
+    /// invariant, and the skeleton grid defaults to the SCF grid for every functional family
+    /// (including MGGA); with it off, the results equal the grid-fixed formulation, for which
+    /// MGGA defaults the skeleton grid to `grid_gen_level + 2`.  Requires the standard
+    /// atom-generated grids (external grids carry no atom attribution; disable it there).
+    #[serde_inline_default(true)]
+    pub grid_shift_deriv: bool,
     /// Tolerance for point group detection in vibrational analysis. Default to 1e-5 Bohr.
     ///
     /// Note that this tolerance will be divided by sqrt(1 + natm).
     #[serde_inline_default(1.0e-5)]
     pub tol_point_group: f64,
-    
+
     /// Option to print gaussian-like thermo analysis (c.f. Psi4 vibration code). Default to false.
-    /// 
+    ///
     /// The canonical way of current REST of thermo analysis, is adding `[thermo]` section in control input,
     /// which will perform shermo-like thermo analysis.
     /// This gaussian-like thermo analysis is only for comparison purpose.
@@ -75,6 +84,7 @@ impl Default for AnalDrvConfig {
             atm_list: None,
             grid_level_cphf: None,
             grid_level_skeleton: None,
+            grid_shift_deriv: true,
             tol_point_group: 1.0e-5,
             gau_thermo: false,
         }

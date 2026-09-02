@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::mpsc::channel;
+use itertools::izip;
 use crate::basis_io::{spheric_gto_value_serial, spheric_gto_1st_value_serial};
 use crate::scf_io::SCF;
 use crate::scf_io::SCFType;
@@ -696,27 +697,20 @@ pub fn gen_atom_grids_for_isdf(mol:&Molecule) -> Vec<dftgrids>{
     let mut atom_grids: Vec<dftgrids> = vec![];
 
     alpha_min.iter().zip(alpha_max.iter()).enumerate().for_each(|(center_index,value)| {
-        let (rs_atom, ws_atom) = gen_grids::atom_grid(
-            value.0.clone(), 
-            value.1.clone(), 
-            radial_precision, 
-            min_num_angular_points, 
-            max_num_angular_points, 
-            proton_charges.clone(), 
-            center_index, 
-            center_coordinates_bohr.clone(), 
+        let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid(
+            value.0.clone(),
+            value.1.clone(),
+            radial_precision,
+            min_num_angular_points,
+            max_num_angular_points,
+            proton_charges.clone(),
+            center_index,
+            center_coordinates_bohr.clone(),
             hardness,
             pruning.clone(),
             rad_grid_method.clone(),
             grid_gen_level,
         );
-
-        let mut coor = vec![[0.0;3]; rs_atom.len()];
-        coor.iter_mut().zip(rs_atom.iter()).for_each(|(x,y)|{
-            x[0] = y.0;
-            x[1] = y.1;
-            x[2] = y.2;
-        });
 
         let threshold = 1.0e-15;
         let effective_ind = &ws_atom.iter()
@@ -726,16 +720,19 @@ pub fn gen_atom_grids_for_isdf(mol:&Molecule) -> Vec<dftgrids>{
         .collect::<Vec<_>>();
         println!("effective index: {}", effective_ind.len());
         let ngrids = effective_ind.len();
-        let mut lambda_r = vec![0.0; effective_ind.len()];
-        lambda_r.iter_mut().zip(effective_ind.iter()).for_each(|(new,index_new)|{
-            *new = ws_atom[*index_new];
-        });
-
         let mut rgrids = vec![[0.0;3]; effective_ind.len()];
-        rgrids.iter_mut().zip(effective_ind.iter()).for_each(|(new,index_new)|{
-            new.iter_mut().zip(coor[*index_new].iter()).for_each(|(a,b)|{
-                *a = *b;
-            }) 
+        let mut lambda_r = vec![0.0; effective_ind.len()];
+        let mut quad_r = vec![0.0; effective_ind.len()];
+        izip!(
+            rgrids.iter_mut(),
+            lambda_r.iter_mut(),
+            quad_r.iter_mut(),
+            effective_ind.iter(),
+        )
+        .for_each(|(rgrid, w, quad, &index)| {
+            *rgrid = [rs_atom[index].0, rs_atom[index].1, rs_atom[index].2];
+            *w = ws_atom[index];
+            *quad = ws_quad_atom[index];
         });
 
         let parallel_balancing = balancing(coordinates.len(), rayon::current_num_threads());
@@ -743,12 +740,14 @@ pub fn gen_atom_grids_for_isdf(mol:&Molecule) -> Vec<dftgrids>{
             weights: lambda_r,
             coordinates: rgrids,
             ao: None,
-            aop: None, 
+            aop: None,
             parallel_balancing,
             non0tab: None,
             ao_cutoff: 0.0,
             ao_compressed: None,
             aop_compressed: None,
+            atm_idx: vec![center_index; ngrids],
+            quadrature_weights: quad_r,
         };
         atom_grids.push(ao_grid)
             

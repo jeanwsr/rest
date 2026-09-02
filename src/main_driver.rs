@@ -66,6 +66,25 @@ pub fn main_driver() -> anyhow::Result<()> {
     // VERY IMPORTANCE: introduce mpi_operator:
     let (mpi_operator , mut mpi_data)= MPIData::initialization();
 
+    // Under MPI, every rank executes the same code, so an ungated print would appear once
+    // per process in the merged output. The `print_level` gating in `Molecule::build`
+    // already suppresses rank-gated prints on non-root ranks, but many prints (and the
+    // `log` macros, whose stdout target is not print_level-gated) are unconditional.
+    // As a blanket fix, redirect the standard output of all non-root ranks to /dev/null;
+    // stderr is intentionally kept so that warnings and MPI runtime errors remain visible.
+    if let Some(mpi_op) = &mpi_operator {
+        if mpi_op.rank != 0 {
+            use std::os::unix::io::AsRawFd;
+            let devnull = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .expect("Failed to open /dev/null for redirecting the standard output of non-root MPI ranks");
+            unsafe {
+                libc::dup2(devnull.as_raw_fd(), libc::STDOUT_FILENO);
+            }
+        }
+    }
+
     let ctrl_file = utilities::parse_input().value_of("input_file").unwrap_or("ctrl.in").to_string();
     if ! PathBuf::from(ctrl_file.clone()).is_file() {
         panic!("Input file ({:}) does not exist", ctrl_file);
@@ -234,7 +253,8 @@ pub fn main_driver() -> anyhow::Result<()> {
                     if scf_data.mol.ctrl.print_level>0 {
                         println!("Geometry optimization invoked using the optimization engine of geometric_pyo3");
                     }
-                    geometric_pyo3_impl::optimize_geometric_pyo3(&mut scf_data, &mut time_mark);
+                    geometric_pyo3_impl::optimize_geometric_pyo3(&mut scf_data, &mut time_mark, &mpi_operator)
+                        .map_err(|e| anyhow::anyhow!("Geometry optimization (geometric_pyo3 engine) failed: {}", e))?;
                     println!("Geometry after relaxation [Ang]:");
                     println!("{}", scf_data.mol.geom.formated_geometry());
                     time_mark.count("geom_opt");
@@ -405,10 +425,14 @@ pub fn main_driver() -> anyhow::Result<()> {
         use crate::analdrv::interface::analdrv_interface;
         let tasks = &scf_data.mol.ctrl.analdrv_tasks;
         let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
-        if let Some(ao) = analdrv_interface(&scf_data, tasks, &config) {
+        if let Some(anal_output) = analdrv_interface(&scf_data, tasks, &config) {
             json_extra.insert("analdrv".to_string(), json!({
-                "frequencies_cm": ao.frequencies_cm,
+                "frequencies_cm": anal_output.frequencies_cm,
+                "modes_trv": anal_output.modes_trv,
             }));
+            if let Some(th) = anal_output.thermo {
+                json_extra.insert("thermo".to_string(), json!(th));
+            }
         }
         time_mark.count("AnalDrv");
     }
@@ -684,6 +708,29 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
             println!("Gradient evaluation using Analytical differentiation");
         }
 
+        // In MPI-parallel runs, `scf_data.rimatr` (decomposed ERI / cderi) is distributed
+        // along the auxiliary-basis dimension: each rank stores only its column block
+        // `[n_baspar, naux_local]` (the SCF J/K build reduces partial contractions over
+        // ranks). The analytical gradient routines require the complete `[n_baspar, naux]`
+        // matrix on every rank, so gather it in place before entering the gradient code.
+        // The same applies to `rimatr_sr` for range-separated hybrid (RSH) functionals.
+        // This is collective and must be executed by all ranks symmetrically.
+        let naux_total = scf_data.mol.num_auxbas;
+        if scf_data.rimatr.is_some() {
+            let (rimatr, basbas2baspar, baspar2basbas) = scf_data.rimatr.take().unwrap();
+            let full_rimatr =
+                crate::mpi_io::gather_full_rimatr(&rimatr, naux_total, mpi_operator)
+                    .unwrap_or(rimatr);
+            scf_data.rimatr = Some((full_rimatr, basbas2baspar, baspar2basbas));
+        }
+        if scf_data.rimatr_sr.is_some() {
+            let (rimatr_sr, basbas2baspar, baspar2basbas) = scf_data.rimatr_sr.take().unwrap();
+            let full_rimatr_sr =
+                crate::mpi_io::gather_full_rimatr(&rimatr_sr, naux_total, mpi_operator)
+                    .unwrap_or(rimatr_sr);
+            scf_data.rimatr_sr = Some((full_rimatr_sr, basbas2baspar, baspar2basbas));
+        }
+
         let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
 
         // Please note that this is only a temporary workaround implemented gradients.
@@ -698,7 +745,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         // 1. self-consistent gradient data
         let grad_data_scf: Box<dyn crate::grad::traits::GradAPI> = {
             if !scf_data.mol.ctrl.spin_polarization {
-                let mut grad_data_scf = crate::grad::rhf::RIRHFGradient::new(&scf_data);
+                let mut grad_data_scf = crate::grad::rhf::RIRHFGradient::new(&scf_data, mpi_operator);
 
                 if is_hf {
                     grad_data_scf.calc();
@@ -708,7 +755,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
 
                 Box::new(grad_data_scf)
             } else {
-                let mut grad_data_scf = crate::grad::uhf::RIUHFGradient::new(&scf_data);
+                let mut grad_data_scf = crate::grad::uhf::RIUHFGradient::new(&scf_data, mpi_operator);
 
                 if is_hf {
                     grad_data_scf.calc();
@@ -955,18 +1002,45 @@ mod geometric_pyo3_impl {
     use geometric_pyo3::prelude::*;
     use pyo3::prelude::*;
 
+    /// `MPIOperator` is not `Sync` (the `mpi` crate's `SimpleCommunicator`
+    /// wraps a raw `MPI_Comm` pointer), so a plain `&Option<MPIOperator>` can
+    /// not satisfy the `Send` bound required by `GeomDriverAPI`. The reference
+    /// is only ever dereferenced inside `GeometricOptDriver::calc_new`, which
+    /// geomeTRIC invokes single-threaded on the master rank while
+    /// `optimize_geometric_pyo3` is still on the stack, so the pointee always
+    /// outlives every use. This makes the `unsafe impl Send` sound. (Without
+    /// the `mpi` feature, `MPIOperator` is a plain-data stub that is `Sync`,
+    /// so the `unsafe impl` is not needed.)
+    struct MpiOptRef<'a>(&'a Option<MPIOperator>);
+    #[cfg(feature = "mpi")]
+    unsafe impl Send for MpiOptRef<'_> {}
+
     pub(crate) struct GeometricOptDriver<'a> {
         scf_data: &'a mut SCF,
         time_mark: &'a mut utilities::TimeRecords,
+        mpi_operator: MpiOptRef<'a>,
     }
 
     impl GeomDriverAPI for GeometricOptDriver<'_> {
         fn calc_new(&mut self, coords: &[f64], _dirname: &str) -> GradOutput {
             let coords = coords.to_vec();
+
+            // Under MPI, the master rank (rank 0) first broadcasts the new
+            // coordinates to every other rank, which are blocked in
+            // `mpi_opt_slave_loop` waiting for them. Then ALL ranks (master
+            // included) enter the collective energy/gradient evaluation, so
+            // that each optimization step is MPI-parallelized and every rank
+            // keeps an identical SCF state.
+            #[cfg(feature = "mpi")]
+            if let Some(mpi_op) = &*self.mpi_operator.0 {
+                let mut coords_buf = coords.clone();
+                crate::mpi_io::mpi_broadcast_vector(&mpi_op.world, &mut coords_buf, 0);
+            }
+
             let coords = MatrixFull::from_vec([3, coords.len()/3], coords).unwrap();
-            let mpi_operator = None;
+            let mpi_operator = self.mpi_operator.0;
             let (scf_data, time_mark) = (&mut self.scf_data, &mut self.time_mark);
-            let (energy, gradient) = eval_force_with_position(scf_data, time_mark, &mpi_operator, &coords);
+            let (energy, gradient) = eval_force_with_position(scf_data, time_mark, mpi_operator, &coords);
             //gradient.formated_output(3, "full");
             //gradient *= -1.0;
             let gradient = gradient.data();
@@ -977,7 +1051,47 @@ mod geometric_pyo3_impl {
         }
     }
 
-    pub(crate) fn optimize_geometric_pyo3(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords) -> PyResult<(f64, MatrixFull<f64>)> {
+    /// Non-root ranks: wait for the master's per-step coordinates, evaluate the
+    /// energy and the gradient collectively (the very same code path as
+    /// `GeometricOptDriver::calc_new` on the master), and loop until the master
+    /// signals the end of the optimization with an empty coordinate vector.
+    #[cfg(feature = "mpi")]
+    fn mpi_opt_slave_loop(
+        scf_data: &mut SCF,
+        time_mark: &mut utilities::TimeRecords,
+        mpi_operator: &Option<MPIOperator>,
+    ) {
+        let mpi_op = mpi_operator.as_ref().expect("mpi_opt_slave_loop requires an MPI operator");
+        let world = &mpi_op.world;
+        loop {
+            let mut coords_buf: Vec<f64> = Vec::new();
+            crate::mpi_io::mpi_broadcast_vector(world, &mut coords_buf, 0);
+            if coords_buf.is_empty() {
+                // The master has finished (or aborted) the optimization.
+                break;
+            }
+            let coords = MatrixFull::from_vec([3, coords_buf.len() / 3], coords_buf).unwrap();
+            let _ = eval_force_with_position(scf_data, time_mark, mpi_operator, &coords);
+        }
+    }
+
+    pub(crate) fn optimize_geometric_pyo3(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_operator: &Option<MPIOperator>) -> PyResult<(f64, MatrixFull<f64>)> {
+        // Under MPI, only the master rank (rank 0) drives the geomeTRIC Python
+        // optimization loop; every other rank joins each energy/gradient
+        // evaluation through MPI (see `mpi_opt_slave_loop` and
+        // `GeometricOptDriver::calc_new`). Without this split, every rank would
+        // run its own full geomeTRIC instance, redundantly redo all the SCF
+        // work, and write its own GeomeTRIC_<n>.log / GeomeTRIC.tmp /
+        // GeomeTRIC_optim.xyz files (racing on the shared ones).
+        #[cfg(feature = "mpi")]
+        if let Some(mpi_op) = mpi_operator {
+            if mpi_op.rank != 0 {
+                mpi_opt_slave_loop(scf_data, time_mark, mpi_operator);
+                let coords = scf_data.mol.geom.position.clone();
+                return Ok((scf_data.scf_energy, coords));
+            }
+        }
+
         pyo3::prepare_freethreaded_python();
         
         let elem = scf_data.mol.geom.elem.iter().map(|x| x.as_str()).collect::<Vec<&str>>();
@@ -1092,11 +1206,12 @@ mod geometric_pyo3_impl {
         let geometric_opt_driver = GeometricOptDriver {
             scf_data,
             time_mark,
+            mpi_operator: MpiOptRef(mpi_operator),
         };
         let driver: PyGeomDriver = geometric_opt_driver.into();
 
         
-        let (last_energy, last_coords) = Python::with_gil(|py| -> PyResult<(f64, Vec<f64>)> {
+        let py_result = Python::with_gil(|py| -> PyResult<(f64, Vec<f64>)> {
             let custom_engine = pyo3_engine_cls.call1(py, (molecule,))?;
             custom_engine.call_method1(py, "set_driver", (driver,))?;
 
@@ -1124,7 +1239,18 @@ mod geometric_pyo3_impl {
                 .extract::<Vec<f64>>(py)?;
 
             Ok((last_energy, last_coords))
-        })?;
+        });
+
+        // Signal the slave ranks that the optimization has finished, so that
+        // they leave `mpi_opt_slave_loop`. This must also be sent when the
+        // optimization failed, otherwise the slaves would block forever.
+        #[cfg(feature = "mpi")]
+        if let Some(mpi_op) = mpi_operator {
+            if mpi_op.rank == 0 {
+                let mut done: Vec<f64> = Vec::new();
+                crate::mpi_io::mpi_broadcast_vector(&mpi_op.world, &mut done, 0);
+            }
+        }
 
         if let Some(ref path) = constraint_path {
             let _ = std::fs::remove_file(path);
@@ -1132,6 +1258,8 @@ mod geometric_pyo3_impl {
         if let Some(ref path) = hessian_analytic_path {
             let _ = std::fs::remove_file(path);
         }
+
+        let (last_energy, last_coords) = py_result?;
 
         let last_coords = MatrixFull::from_vec([3, last_coords.len()/3], last_coords).unwrap();
 

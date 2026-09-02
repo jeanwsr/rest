@@ -1,5 +1,15 @@
 use std::iter::zip;
 use std::ops::{Range, Add, Sub, Mul, Div, AddAssign, SubAssign, MulAssign, DivAssign};
+
+/// MPI construction of the short-range (RSH) decomposed 3-center RI integrals (`rimatr_sr`).
+#[cfg(feature = "mpi")]
+pub mod rimatr_sr;
+
+/// Sandbox: distributed (ScaLAPACK) Cholesky factorization and triangular solve of the
+/// 2c-2e metric for MPI-parallel rimatr builds (only with `mpi` + `scalapack` features).
+#[cfg(all(feature = "mpi", feature = "scalapack"))]
+pub mod j2c_distributed;
+
 #[cfg(feature = "mpi")]
 use mpi::collective::SystemOperation;
 #[cfg(feature = "mpi")]
@@ -7,12 +17,18 @@ use mpi::environment::Universe;
 #[cfg(feature = "mpi")]
 use mpi::request::WaitGuard;
 #[cfg(feature = "mpi")]
-use mpi::topology::{SimpleCommunicator, Rank};
+use mpi::topology::{SimpleCommunicator, CartesianCommunicator, Rank, Color, Key};
+#[cfg(feature = "mpi")]
+use mpi::datatype::{Partitioned, PartitionMut};
 #[cfg(feature = "mpi")]
 use mpi::traits::*;
 use num_traits::{One, Zero};
+use tensors::matrix_blas_lapack::{_dgemm_full, _dsyevd, _power_rayon_for_symmetric_matrix};
 use tensors::{BasicMatrix, MatrixFull};
 use std::fmt::Debug;
+
+#[cfg(feature = "scalapack")]
+use tensors::matrix_scalapack::CblacsGrid;
 
 use crate::dft::Grids;
 use crate::constants::MPI_CHUNK;
@@ -49,6 +65,8 @@ use crate::utilities::balancing;
 
 #[cfg(feature = "mpi")]
 pub struct MPIOperator {
+    #[cfg(feature = "scalapack")]
+    pub cblacsgrid: CblacsGrid,
     pub universe: Universe,
     pub world: SimpleCommunicator,
     pub size: usize,
@@ -59,6 +77,66 @@ pub struct MPIOperator {
 pub struct MPIOperator {
     pub size: usize,
     pub rank: usize,
+}
+
+#[cfg(feature = "mpi")]
+pub struct MPIGrid {
+    pub cart_comm: CartesianCommunicator,
+    pub row_comm: SimpleCommunicator,
+    pub col_comm: SimpleCommunicator,
+    pub dims: (i32, i32),          // (r, c)
+    pub my_coords: (i32, i32),     // (my_row, my_col)
+    pub rank: i32,                   // rank in grid communicator
+}
+
+#[cfg(feature = "mpi")]
+impl MPIOperator {
+
+    pub fn initialize_grid(&self) -> MPIGrid {
+        let size = self.size as i32;
+        let (r, c) = {
+            let mut r = (size as f64).sqrt() as i32;
+            while size % r != 0 {
+                r -= 1;
+            }
+            (r, size / r)
+        };
+
+        let dims = [r, c];
+        let periods = [false, false];
+        let cart_comm = self.world.create_cartesian_communicator(&dims, &periods, false)
+                                 .expect("Failed to create Cartesian grid");
+
+        let rank = cart_comm.rank();
+        let coords = cart_comm.rank_to_coordinates(rank);
+
+        let my_row = coords[0];
+        let my_col = coords[1];
+
+        let row_color = Color::with_value(my_row);
+        let row_key: Key = my_col;
+        let col_color = Color::with_value(my_col);
+        let col_key: Key = my_row;
+
+        let row_comm = cart_comm
+                .split_by_color_with_key(row_color, row_key)
+                .expect("Failed to split row communicator");
+
+        let col_comm = cart_comm
+               .split_by_color_with_key(col_color, col_key)
+               .expect("Failed to split column communicator");
+
+        MPIGrid {
+            cart_comm,
+            row_comm,
+            col_comm,
+            dims: (r, c),
+            my_coords: (my_row, my_col),
+            rank,
+        }
+
+    }
+
 }
 
 #[derive(Clone)]
@@ -77,6 +155,8 @@ impl MPIData {
         let world = universe.world();
         let size = world.size() as usize;
         let rank = world.rank() as usize;
+        #[cfg(feature = "scalapack")]
+        let cgrid = CblacsGrid::new(size, "R");
 
         if size >= 2 {
             (
@@ -84,10 +164,12 @@ impl MPIData {
                 universe,
                 world,
                 size,
-                rank
+                rank,
+                #[cfg(feature = "scalapack")]
+                cblacsgrid: cgrid,
                 }),
                 Some(MPIData{
-                    size, 
+                    size,
                     rank,
                     grids: None,
                     auxbas: None,
@@ -112,6 +194,8 @@ impl MPIData {
         let local_range = &distribute_vec[self.rank];
         let local_coordinates = grids.coordinates[local_range.clone()].to_vec();
         let local_weights = grids.weights[local_range.clone()].to_vec();
+        let local_atm_idx = grids.atm_idx[local_range.clone()].to_vec();
+        let local_quadrature_weights = grids.quadrature_weights[local_range.clone()].to_vec();
         self.grids = Some(distribute_vec);
 
         let parallel_balancing = balancing(local_coordinates.len(), rayon::current_num_threads());
@@ -125,6 +209,8 @@ impl MPIData {
             ao_cutoff: grids.ao_cutoff,
             ao_compressed: None,
             aop_compressed: None,
+            atm_idx: local_atm_idx,
+            quadrature_weights: local_quadrature_weights,
         }
         
     }
@@ -384,6 +470,159 @@ where Q: Zero + Send + Sync + Copy + Buffer + Equivalence + Debug + 'static,
             *data = MatrixFull::new(data_size, Q::zero());
         }
         mpi_broadcast(world, &mut data.data, root_rank);
+    }
+}
+
+/// All-gather a matrix whose column dimension is distributed across MPI ranks.
+///
+/// Each rank holds the contiguous column block `[n_row, loc_naux]` of the global
+/// `[n_row, naux_total]` matrix, where its local columns are the block assigned by
+/// [`average_distribution`]. Since `MatrixFull` is stored column-major, the raw data of
+/// each rank is exactly the contiguous global column block, so a variable-count
+/// all-gather of the local raw data (concatenated in rank order) reproduces the full
+/// global matrix on every rank.
+#[cfg(feature = "mpi")]
+pub fn mpi_allgather_matrixfull_columns(
+    world: &SimpleCommunicator,
+    local: &MatrixFull<f64>,
+    naux_total: usize,
+) -> MatrixFull<f64> {
+    let size = world.size() as usize;
+    let n_row = local.size[0];
+    let loc_naux = local.size[1];
+
+    // exchange the number of columns held by each rank
+    let mut loc_naux_vec = vec![0_usize; size];
+    world.all_gather_into(&loc_naux, &mut loc_naux_vec[..]);
+
+    // the distribution must be the contiguous ascending one from `average_distribution`,
+    // so that concatenating the rank-ordered column blocks reproduces the global column order
+    let expected = average_distribution(naux_total, size);
+    assert!(
+        loc_naux_vec.iter().zip(expected.iter()).all(|(n, r)| *n == r.len()),
+        "The column distribution of the matrix does not match average_distribution; \
+         cannot safely all-gather the full matrix."
+    );
+
+    // counts/displacements in units of f64 elements (one column holds n_row elements)
+    let counts: Vec<i32> = loc_naux_vec
+        .iter()
+        .map(|&n| {
+            i32::try_from(n * n_row)
+                .expect("The column block of the matrix exceeds the MPI count limit (i32).")
+        })
+        .collect();
+    let mut displs: Vec<i32> = Vec::with_capacity(size);
+    let mut acc: i32 = 0;
+    for &count in counts.iter() {
+        displs.push(acc);
+        acc += count;
+    }
+
+    let mut gathered = vec![0.0_f64; n_row * naux_total];
+    {
+        let mut partition = PartitionMut::new(&mut gathered[..], &counts[..], &displs[..]);
+        world.all_gather_varcount_into(&local.data[..], &mut partition);
+    }
+    MatrixFull::from_vec([n_row, naux_total], gathered).unwrap()
+}
+
+/// Reconstruct the complete auxiliary-basis dimension of `rimatr` (the decomposed 3c ERI,
+/// i.e. `cderi`) on every MPI rank, for consumers that require the full matrix.
+///
+/// In MPI-parallel SCF, `rimatr` is distributed along the auxiliary-basis (column)
+/// dimension: rank `r` stores only `[n_baspar, auxbas_distribution[r].len()]` (see
+/// [`MPIData::distribute_rimatr_tasks`] and
+/// `Molecule::prepare_rimatr_for_ri_v_mpi_rayon`); the SCF J/K build then reduces the
+/// partial contractions over ranks (`vj/vk_upper_with_rimatr_sync_mpi`). The analytical
+/// gradient, in contrast, needs the complete `[n_baspar, naux]` matrix on every rank.
+///
+/// - Returns `Some(full_matrix)` if the input was distributed and has been gathered.
+/// - Returns `None` if the input already contains all auxiliary functions (serial runs,
+///   or MPI runs where the distribution is inactive), leaving the input untouched.
+///
+/// This is a collective operation: all ranks must call it with consistent arguments.
+pub fn gather_full_rimatr(
+    local_rimatr: &MatrixFull<f64>,
+    naux_total: usize,
+    mpi_operator: &Option<MPIOperator>,
+) -> Option<MatrixFull<f64>> {
+    #[cfg(feature = "mpi")]
+    if let Some(mpi_op) = mpi_operator {
+        if local_rimatr.size[1] != naux_total {
+            return Some(mpi_allgather_matrixfull_columns(&mpi_op.world, local_rimatr, naux_total));
+        }
+    }
+    None
+}
+
+/// Build the factor of the 2c-2e Coulomb metric used by the MPI-parallel rimatr
+/// construction, following the `j2c_decomp` policy so that the result reproduces the
+/// serial one (`ri_jk::generate_rimatr_bare` + `ri_jk::get_solved_j3c`):
+///
+/// - `Eig`: returns the dense `J^{-1/2}` (eigen-based matrix power); the serial
+///   counterpart computes `cderi = j3c · J^{-1/2}` with a matrix multiplication.
+/// - `Cd`:   returns the upper Cholesky factor `U` (`J = U^T U`, `L = U^T`); the serial
+///   counterpart computes `cderi = j3c · L^{-T}`, which the solver reproduces with the
+///   triangular solve `U^T · X = B` (`_dtrtrs`) instead of an explicit inverse.
+///   When the Cholesky factor has diagonal elements not larger than the threshold (or
+///   the factorization is not positive-definite), the same eigen-corrected fallback as
+///   `ri_jk::decomp_j2c_cd` is applied.
+pub fn prepare_j2c_solve_factor(
+    j2c: &MatrixFull<f64>,
+    option: &crate::ri_jk::J2CDecompOption,
+) -> MatrixFull<f64> {
+    use crate::ri_jk::{J2CDecompPolicy, J2C_THRESH};
+
+    let threshold = option.threshold.unwrap_or(J2C_THRESH);
+    match option.policy {
+        J2CDecompPolicy::Eig => {
+            _power_rayon_for_symmetric_matrix(j2c, -0.5, threshold).unwrap()
+        },
+        J2CDecompPolicy::Cd => {
+            let n = j2c.size[0];
+            debug_assert_eq!(j2c.size[1], n);
+            // direct Cholesky attempt on a clone (the helpers panic on failure, so
+            // guard with the eigen decomposition check below when needed)
+            let mut j2c_u = j2c.clone();
+            j2c_u.to_matrixfullslicemut().lapack_dpotrf(b'U');
+            // dpotrf only touches the upper triangle; zero out the lower part so
+            // that the factor can be used as a full matrix in the subsequent solve
+            for j in 0..n {
+                for i in j + 1..n {
+                    j2c_u.data[i + j * n] = 0.0;
+                }
+            }
+            let diag_ok = j2c_u
+                .iter_diagonal()
+                .unwrap()
+                .fold(true, |acc, &d| acc && d > threshold);
+            if diag_ok {
+                // return the upper Cholesky factor U (J = U^T U); the solve step
+                // (`U^T · X = B` via dtrtrs) replaces the explicit `U^{-1}` + dgemm
+                return j2c_u;
+            }
+            // eigen-corrected fallback (mirrors `decomp_j2c_cd`): make the matrix
+            // sufficiently positive-definite with the threshold, then Cholesky again
+            let (eigvec, eigval, _) = _dsyevd(j2c, 'V');
+            let eigvec = eigvec.expect("Failed to diagonalize the 2c-2e Coulomb matrix for the Cholesky fallback");
+            // j2c_corr = V · diag(max(e, threshold)) · V^T
+            let mut e_corr = MatrixFull::new([n, n], 0.0_f64);
+            eigval.iter().enumerate().for_each(|(i, &e)| {
+                *&mut e_corr.data[i * n + i] = e.max(threshold);
+            });
+            let mut j2c_corr = MatrixFull::new([n, n], 0.0_f64);
+            _dgemm_full(&eigvec, 'N', &e_corr, 'N', &mut j2c_corr, 1.0, 0.0);
+            let mut tmp = MatrixFull::new([n, n], 0.0_f64);
+            _dgemm_full(&j2c_corr, 'N', &eigvec, 'T', &mut tmp, 1.0, 0.0);
+            tmp.to_matrixfullslicemut().lapack_dpotrf(b'U');
+            for j in 0..n {
+                for i in j + 1..n {
+                    tmp.data[i + j * n] = 0.0;
+                }
+            }
+            tmp
+        },
     }
 }
 

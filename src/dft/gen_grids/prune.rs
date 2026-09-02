@@ -6,6 +6,7 @@
 //! [^1]: [P. M. W. Gill, B. G. Johnson, J. A. Pople. Chemical Physics Letters 209, 506-512 (1993)](https://doi.org/10.1016/0009-2614(93)80125-9).
 
 use rayon::prelude::*;
+use itertools::izip;
 use num_traits::{ToPrimitive};
 use rayon::iter::IntoParallelRefMutIterator;
 use tensors::MatrixFull;
@@ -199,16 +200,21 @@ pub fn prune_by_rho(grids: &Grids, dm: &Vec<MatrixFull<f64>>, spin_channel: usiz
     .collect::<Vec<_>>();
 
     let mut rgrids = vec![[0.0;3]; effective_ind.len()];
-    rgrids.iter_mut().zip(effective_ind.iter()).for_each(|(new,index_new)|{
-        new.iter_mut().zip(grids.coordinates[*index_new].iter()).for_each(|(a,b)|{
-            *a = *b;
-        }) 
-    });
-
-
     let mut lambda_r = vec![0.0; effective_ind.len()];
-    lambda_r.iter_mut().zip(effective_ind.iter()).for_each(|(new,index_new)|{
-        *new = grids.weights[*index_new];
+    let mut atm_idx_r = vec![usize::MAX; effective_ind.len()];
+    let mut quad_r = vec![0.0; effective_ind.len()];
+    izip!(
+        rgrids.iter_mut(),
+        lambda_r.iter_mut(),
+        atm_idx_r.iter_mut(),
+        quad_r.iter_mut(),
+        effective_ind.iter(),
+    )
+    .for_each(|(rgrid, w, atm, quad, &index)| {
+        *rgrid = grids.coordinates[index];
+        *w = grids.weights[index];
+        *atm = grids.atm_idx[index];
+        *quad = grids.quadrature_weights[index];
     });
 
     /* let mut new_grids = vec![[0.0;3]; effective_ind.len()];
@@ -244,6 +250,8 @@ pub fn prune_by_rho(grids: &Grids, dm: &Vec<MatrixFull<f64>>, spin_channel: usiz
         ao_cutoff: 0.0,
         ao_compressed: None,
         aop_compressed: None,
+        atm_idx: atm_idx_r,
+        quadrature_weights: quad_r,
     }
     
 }

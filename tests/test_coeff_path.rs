@@ -54,7 +54,7 @@ fn test_all_paths_with_sparsity() {
     ] {
         println!("\n══════ {}  cutoff={:.0e}  blksize={} ══════", sys, cutoff, blk);
 
-        let (e_d, act_d, s_d) = run_with_stats(sys, 0.0, 0, true);
+        let (e_d, _act_d, s_d) = run_with_stats(sys, 0.0, 0, true);
         println!("  dense(dm_only) {:14.8}  | {}", e_d, s_d);
 
         let (e_s_dm, act_s_dm, s_s_dm) = run_with_stats(sys, cutoff, blk, true);
