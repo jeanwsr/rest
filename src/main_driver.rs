@@ -252,7 +252,8 @@ pub fn main_driver() -> anyhow::Result<()> {
                     if scf_data.mol.ctrl.print_level>0 {
                         println!("Geometry optimization invoked using the optimization engine of geometric_pyo3");
                     }
-                    geometric_pyo3_impl::optimize_geometric_pyo3(&mut scf_data, &mut time_mark);
+                    geometric_pyo3_impl::optimize_geometric_pyo3(&mut scf_data, &mut time_mark, &mpi_operator)
+                        .map_err(|e| anyhow::anyhow!("Geometry optimization (geometric_pyo3 engine) failed: {}", e))?;
                     println!("Geometry after relaxation [Ang]:");
                     println!("{}", scf_data.mol.geom.formated_geometry());
                     time_mark.count("geom_opt");
@@ -993,18 +994,45 @@ mod geometric_pyo3_impl {
     use geometric_pyo3::prelude::*;
     use pyo3::prelude::*;
 
+    /// `MPIOperator` is not `Sync` (the `mpi` crate's `SimpleCommunicator`
+    /// wraps a raw `MPI_Comm` pointer), so a plain `&Option<MPIOperator>` can
+    /// not satisfy the `Send` bound required by `GeomDriverAPI`. The reference
+    /// is only ever dereferenced inside `GeometricOptDriver::calc_new`, which
+    /// geomeTRIC invokes single-threaded on the master rank while
+    /// `optimize_geometric_pyo3` is still on the stack, so the pointee always
+    /// outlives every use. This makes the `unsafe impl Send` sound. (Without
+    /// the `mpi` feature, `MPIOperator` is a plain-data stub that is `Sync`,
+    /// so the `unsafe impl` is not needed.)
+    struct MpiOptRef<'a>(&'a Option<MPIOperator>);
+    #[cfg(feature = "mpi")]
+    unsafe impl Send for MpiOptRef<'_> {}
+
     pub(crate) struct GeometricOptDriver<'a> {
         scf_data: &'a mut SCF,
         time_mark: &'a mut utilities::TimeRecords,
+        mpi_operator: MpiOptRef<'a>,
     }
 
     impl GeomDriverAPI for GeometricOptDriver<'_> {
         fn calc_new(&mut self, coords: &[f64], _dirname: &str) -> GradOutput {
             let coords = coords.to_vec();
+
+            // Under MPI, the master rank (rank 0) first broadcasts the new
+            // coordinates to every other rank, which are blocked in
+            // `mpi_opt_slave_loop` waiting for them. Then ALL ranks (master
+            // included) enter the collective energy/gradient evaluation, so
+            // that each optimization step is MPI-parallelized and every rank
+            // keeps an identical SCF state.
+            #[cfg(feature = "mpi")]
+            if let Some(mpi_op) = &*self.mpi_operator.0 {
+                let mut coords_buf = coords.clone();
+                crate::mpi_io::mpi_broadcast_vector(&mpi_op.world, &mut coords_buf, 0);
+            }
+
             let coords = MatrixFull::from_vec([3, coords.len()/3], coords).unwrap();
-            let mpi_operator = None;
+            let mpi_operator = self.mpi_operator.0;
             let (scf_data, time_mark) = (&mut self.scf_data, &mut self.time_mark);
-            let (energy, gradient) = eval_force_with_position(scf_data, time_mark, &mpi_operator, &coords);
+            let (energy, gradient) = eval_force_with_position(scf_data, time_mark, mpi_operator, &coords);
             //gradient.formated_output(3, "full");
             //gradient *= -1.0;
             let gradient = gradient.data();
@@ -1015,7 +1043,47 @@ mod geometric_pyo3_impl {
         }
     }
 
-    pub(crate) fn optimize_geometric_pyo3(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords) -> PyResult<(f64, MatrixFull<f64>)> {
+    /// Non-root ranks: wait for the master's per-step coordinates, evaluate the
+    /// energy and the gradient collectively (the very same code path as
+    /// `GeometricOptDriver::calc_new` on the master), and loop until the master
+    /// signals the end of the optimization with an empty coordinate vector.
+    #[cfg(feature = "mpi")]
+    fn mpi_opt_slave_loop(
+        scf_data: &mut SCF,
+        time_mark: &mut utilities::TimeRecords,
+        mpi_operator: &Option<MPIOperator>,
+    ) {
+        let mpi_op = mpi_operator.as_ref().expect("mpi_opt_slave_loop requires an MPI operator");
+        let world = &mpi_op.world;
+        loop {
+            let mut coords_buf: Vec<f64> = Vec::new();
+            crate::mpi_io::mpi_broadcast_vector(world, &mut coords_buf, 0);
+            if coords_buf.is_empty() {
+                // The master has finished (or aborted) the optimization.
+                break;
+            }
+            let coords = MatrixFull::from_vec([3, coords_buf.len() / 3], coords_buf).unwrap();
+            let _ = eval_force_with_position(scf_data, time_mark, mpi_operator, &coords);
+        }
+    }
+
+    pub(crate) fn optimize_geometric_pyo3(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_operator: &Option<MPIOperator>) -> PyResult<(f64, MatrixFull<f64>)> {
+        // Under MPI, only the master rank (rank 0) drives the geomeTRIC Python
+        // optimization loop; every other rank joins each energy/gradient
+        // evaluation through MPI (see `mpi_opt_slave_loop` and
+        // `GeometricOptDriver::calc_new`). Without this split, every rank would
+        // run its own full geomeTRIC instance, redundantly redo all the SCF
+        // work, and write its own GeomeTRIC_<n>.log / GeomeTRIC.tmp /
+        // GeomeTRIC_optim.xyz files (racing on the shared ones).
+        #[cfg(feature = "mpi")]
+        if let Some(mpi_op) = mpi_operator {
+            if mpi_op.rank != 0 {
+                mpi_opt_slave_loop(scf_data, time_mark, mpi_operator);
+                let coords = scf_data.mol.geom.position.clone();
+                return Ok((scf_data.scf_energy, coords));
+            }
+        }
+
         pyo3::prepare_freethreaded_python();
         
         let elem = scf_data.mol.geom.elem.iter().map(|x| x.as_str()).collect::<Vec<&str>>();
@@ -1130,11 +1198,12 @@ mod geometric_pyo3_impl {
         let geometric_opt_driver = GeometricOptDriver {
             scf_data,
             time_mark,
+            mpi_operator: MpiOptRef(mpi_operator),
         };
         let driver: PyGeomDriver = geometric_opt_driver.into();
 
         
-        let (last_energy, last_coords) = Python::with_gil(|py| -> PyResult<(f64, Vec<f64>)> {
+        let py_result = Python::with_gil(|py| -> PyResult<(f64, Vec<f64>)> {
             let custom_engine = pyo3_engine_cls.call1(py, (molecule,))?;
             custom_engine.call_method1(py, "set_driver", (driver,))?;
 
@@ -1162,7 +1231,18 @@ mod geometric_pyo3_impl {
                 .extract::<Vec<f64>>(py)?;
 
             Ok((last_energy, last_coords))
-        })?;
+        });
+
+        // Signal the slave ranks that the optimization has finished, so that
+        // they leave `mpi_opt_slave_loop`. This must also be sent when the
+        // optimization failed, otherwise the slaves would block forever.
+        #[cfg(feature = "mpi")]
+        if let Some(mpi_op) = mpi_operator {
+            if mpi_op.rank == 0 {
+                let mut done: Vec<f64> = Vec::new();
+                crate::mpi_io::mpi_broadcast_vector(&mpi_op.world, &mut done, 0);
+            }
+        }
 
         if let Some(ref path) = constraint_path {
             let _ = std::fs::remove_file(path);
@@ -1170,6 +1250,8 @@ mod geometric_pyo3_impl {
         if let Some(ref path) = hessian_analytic_path {
             let _ = std::fs::remove_file(path);
         }
+
+        let (last_energy, last_coords) = py_result?;
 
         let last_coords = MatrixFull::from_vec([3, last_coords.len()/3], last_coords).unwrap();
 
