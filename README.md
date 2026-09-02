@@ -734,7 +734,7 @@ hessian = { solver = "krylov", frequencies = true, verbose = 2 }
 ## 解析梯度性质模块 `analdrv` 计算相关设置
 
 解析梯度模块 `analdrv` 模块是实验性质模块。目前实现了 Hessian (原子核坐标二阶梯度) 功能。
-它实现了不同于 `hessian` 模块的解析 Hessian 计算。目前该模块的 Hessian 功能支持 RHF/RKS/UHF/UKS 方法。对于 DFT，支持 LDA/GGA/mGGA 以及其对应的杂化泛函。该模块的程序有性能优化，与目前顶级的量化程序 (ORCA 等) 有相当或更好的性能。
+它实现了不同于 `hessian` 模块的解析 Hessian 计算。目前该模块的 Hessian 功能支持 RHF/RKS/UHF/UKS 方法。对于 DFT，支持 LDA/GGA/mGGA 以及其对应的杂化泛函，包括范围分离杂化泛函 (RSH)。该模块的程序有性能优化，与目前顶级的量化程序 (ORCA 等) 有相当或更好的性能。
 
 ### 设置待计算性质的任务
 
