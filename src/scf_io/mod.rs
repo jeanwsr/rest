@@ -36,7 +36,7 @@ use std::sync::mpsc::{channel};
 use crate::isdf::{prepare_for_ri_isdf, prepare_m_isdf};
 use crate::molecule_io::{Molecule};
 use crate::initial_guess::{initial_guess, update_basis_from_hdf5chk};
-use crate::external_libs::dftd;
+use crate::dftd::energy::dftd;
 use crate::constants::{SQRT_THRESHOLD};
 use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
 use crate::x2c::RelativisticMethod;

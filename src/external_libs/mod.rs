@@ -1,8 +1,6 @@
 #![warn(unused)]
 
 mod ffi_mokit;
-pub mod dftd;
-pub use dftd::*;
 
 use std::ffi::{c_char};
 use crate::external_libs::ffi_mokit::*;

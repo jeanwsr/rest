@@ -1,4 +1,4 @@
-use crate::external_libs::dftd::dftd;
+use crate::dftd::energy::dftd;
 use crate::scf_io::SCF;
 
 use crate::grad::traits::GradAPI;
