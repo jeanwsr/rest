@@ -2062,6 +2062,81 @@ pub fn low_rank_vchi_vsqrt(
     }
 }
 
+/// Total-spin low-rank sqrt(v)*chi0(omega)*sqrt(v) for unrestricted GW.
+///
+/// Builds the total non-interacting response by summing the two spin-channel
+/// responses (each with the same REST spin-response convention as
+/// `response_matrix_total`), then diagonalizes the resulting naux×naux matrix
+/// and returns the RPA low-rank form used by the contour-deformation residue
+/// and imaginary-axis W_c machinery.
+pub fn low_rank_vchi_vsqrt_total(
+    quasiparticle_energies_w: &[Vec<f64>; 2],
+    occ_params: &[OccParams; 2],
+    ri_ov: &[MatrixFull<f64>; 2],
+    omega: f64,
+    tolerance: f64,
+    part: char,
+    eta: f64,
+    print_level: usize,
+) -> LowRankVChiV {
+    let n_aux = ri_ov[0].size[0];
+    let nspin = if occ_params[1].occ_size > 0 && ri_ov[1].size[1] > 0 { 2 } else { 1 };
+
+    let mut chi0 = MatrixFull::new([n_aux, n_aux], 0.0);
+    for s in 0..nspin {
+        let resp = response_matrix_per_spin(
+            &quasiparticle_energies_w[s],
+            occ_params[s].occ_size,
+            occ_params[s].vir_size,
+            &ri_ov[s],
+            omega,
+            part,
+            eta,
+        );
+        chi0.self_add(&resp);
+    }
+    // Keep restricted-compatible scaling if this helper is ever used with nspin=1.
+    if nspin == 1 {
+        chi0.self_multiple(2.0);
+    }
+
+    // Diagonalize chi0 in place and form the RPA low-rank representation.
+    let (eigvecs_opt, eigvals_raw, _info) = _dsyev_inplace(chi0, 'V');
+    let eigvecs = eigvecs_opt.expect("low_rank_vchi_vsqrt_total: dsyev failed");
+
+    let mut idx_eig: Vec<(usize, f64)> = eigvals_raw.iter().enumerate()
+        .map(|(v, &lam0)| (v, lam0 / (1.0 - lam0)))
+        .collect();
+    idx_eig.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+
+    let n_keep = idx_eig.iter().take_while(|(_, lam)| lam.abs() > tolerance).count();
+    if print_level >= 2 {
+        let max_lam = idx_eig.first().map(|x| x.1.abs()).unwrap_or(0.0);
+        let min_gap = idx_eig.iter()
+            .map(|(v, _)| (1.0 - eigvals_raw[*v]).abs())
+            .fold(f64::MAX, f64::min);
+        println!("[DBG LR total] part={} omega={:.6e} n_keep={} max|lam|={:.6e} min|1-lam0|={:.6e}",
+                 part, omega, n_keep, max_lam, min_gap);
+    }
+
+    let mut eigvec_mat = MatrixFull::new([n_aux, n_keep], 0.0);
+    let mut eigval_vec = Vec::with_capacity(n_keep);
+    for (j, &(v, lam)) in idx_eig.iter().take(n_keep).enumerate() {
+        eigval_vec.push(lam);
+        for aux in 0..n_aux {
+            eigvec_mat[[aux, j]] = eigvecs[[aux, v]];
+        }
+    }
+
+    LowRankVChiV {
+        omega,
+        eigvec: eigvec_mat,
+        eigval: eigval_vec,
+        n_keep,
+    }
+}
+
+
 /// Precompute low-rank sqrt(v)*chi*sqrt(v) on a real-axis grid [0, de_max].
 ///
 /// First scans all (mstate, pstate, omega_sigma) combinations to find the maximum
@@ -2204,6 +2279,112 @@ pub fn generate_real_axis_vchiv(
         grid_type: grid_type,
     }
 }
+
+/// Unrestricted analogue of `generate_real_axis_vchiv`.
+///
+/// The real-axis low-rank representation is built from the *total* response
+/// (α + β), because the screened interaction W is spin-independent in the
+/// collinear unrestricted GW implementation. The de_max scan, however, must
+/// consider both spin channels so that the real-axis grid covers all poles
+/// encountered by either spin.
+pub fn generate_real_axis_vchiv_spin(
+    quasiparticle_energies_g: &[Vec<f64>; 2],
+    quasiparticle_energies_w: &[Vec<f64>; 2],
+    occ_params: &[OccParams; 2],
+    ri_ov: &[MatrixFull<f64>; 2],
+    nomega_chi_real: usize,
+    nsemin: [usize; 2],
+    nsemax: [usize; 2],
+    nomega_sigma: usize,
+    step_sigma: f64,
+    tolerance: f64,
+    grid_type: usize,
+    omega_chi_max: f64,
+    print_level: usize,
+    eta: f64,
+    res_tol: f64,
+) -> RealAxisVChiV {
+    let nspin = if occ_params[1].occ_size > 0 && ri_ov[1].size[1] > 0 { 2 } else { 1 };
+
+    // Step 1: Find de_max over both spin channels.
+    let mut de_max = 0.0_f64;
+    for s in 0..nspin {
+        if nsemin[s] > nsemax[s] {
+            continue;
+        }
+        let num_state = occ_params[s].num_state;
+        let occ_size = occ_params[s].occ_size;
+        for mstate in nsemin[s]..=nsemax[s] {
+            let energy0 = quasiparticle_energies_g[s][mstate];
+            for iomega_sigma in -(nomega_sigma as isize)..=(nomega_sigma as isize) {
+                let omega = energy0 + (iomega_sigma as f64) * step_sigma;
+                for p in 0..occ_size {
+                    let de = quasiparticle_energies_g[s][p] - omega;
+                    if de > res_tol {
+                        de_max = de_max.max(de);
+                    }
+                }
+                for a in occ_size..num_state {
+                    let de = omega - quasiparticle_energies_g[s][a];
+                    if de > res_tol {
+                        de_max = de_max.max(de);
+                    }
+                }
+            }
+        }
+    }
+
+    de_max = de_max * 1.05 + 0.1;
+    let grid_scale = if omega_chi_max > 0.0 {
+        if omega_chi_max < de_max && print_level > 0 {
+            println!("[omega_chi_max={:.6} Ha < de_max={:.6} Ha] Grid clamped at user-specified max;",
+                     omega_chi_max, de_max);
+            println!("  frequencies > omega_chi_max will use boundary v*chi*v value.");
+        }
+        omega_chi_max
+    } else {
+        de_max
+    };
+
+    println!("Low-rank contour (unrestricted): Maximum real frequency needed for v*chi*v = {:.6} Ha = {:.6} eV",
+             de_max, de_max * EV);
+    println!("Low-rank contour (unrestricted): Computing total sqrt(v)*chi*sqrt(v) at {} real-axis grid points",
+             nomega_chi_real);
+
+    let mut grid: Vec<LowRankVChiV> = Vec::with_capacity(nomega_chi_real);
+    for i_omega in 0..nomega_chi_real {
+        let omega_real = if nomega_chi_real > 1 {
+            let t = (i_omega as f64) / ((nomega_chi_real - 1) as f64);
+            if grid_type == 1 {
+                grid_scale * t * t
+            } else {
+                grid_scale * t
+            }
+        } else {
+            grid_scale
+        };
+        let lr = low_rank_vchi_vsqrt_total(
+            quasiparticle_energies_w,
+            occ_params,
+            ri_ov,
+            omega_real,
+            tolerance,
+            'R',
+            eta,
+            print_level,
+        );
+        grid.push(lr);
+    }
+
+    RealAxisVChiV {
+        grid,
+        omega_min: 0.0,
+        omega_max: de_max,
+        n_points: nomega_chi_real,
+        grid_type,
+    }
+}
+
 
 /// Nearest-neighbor interpolation to obtain the low-rank vchi_v at |de|
 /// Uses binary search for non-uniform grids, or direct index for uniform grids.
@@ -2365,6 +2546,75 @@ pub fn generate_w_c_lowrank(
     omp_set_num_threads_wrapper(saved_omp);
     w_c_lr
 }
+
+/// Unrestricted analogue of `generate_w_c_lowrank`.
+///
+/// Uses the *total* response (α + β) at each imaginary frequency to form the
+/// low-rank representation of sqrt(v)*chi(iω)*sqrt(v). The returned objects
+/// are then contracted separately with each spin's `ri_row_n` by
+/// `precompute_wc_rows_lowrank`, giving spin-dependent W_c rows.
+pub fn generate_w_c_lowrank_spin(
+    scf_data: &SCF,
+    quasiparticle_energies_w: &[Vec<f64>; 2],
+    occ_params: &[OccParams; 2],
+    ri_ov: &[MatrixFull<f64>; 2],
+    num_freq: usize,
+    tolerance: f64,
+) -> Vec<(f64, f64, LowRankVChiV)> {
+    omp_get_num_threads_wrapper();
+    let freq_grid_type = scf_data.mol.ctrl.freq_grid_type;
+    let max_freq = scf_data.mol.ctrl.freq_cut_off;
+    let (omega_1, weight) = if freq_grid_type == 0 {
+        ri_rpa::trans_gauss_legendre_grids(1.0, num_freq)
+    } else if freq_grid_type == 1 {
+        ri_rpa::gauss_legendre_grids([0.0, max_freq], num_freq)
+    } else if freq_grid_type == 2 {
+        ri_rpa::logarithmic_grid([0.0, max_freq], num_freq)
+    } else {
+        ri_rpa::trans_gauss_legendre_grids(1.0, num_freq)
+    };
+
+    let max_workers = std::env::var("REST_GW_MAX_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+    let n_threads = max_workers.min(omega_1.len()).max(1);
+    let saved_omp = omp_get_num_threads_wrapper();
+
+    let (sender, receiver) = channel();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        rayon::prelude::IndexedParallelIterator::zip(omega_1.par_iter(), weight.par_iter())
+            .for_each_with(sender, |s, (omega_1, weight)| {
+                omp_set_num_threads_wrapper(1);
+                let start = Instant::now();
+                let lr = low_rank_vchi_vsqrt_total(
+                    quasiparticle_energies_w,
+                    occ_params,
+                    ri_ov,
+                    *omega_1,
+                    tolerance,
+                    'I',
+                    0.0,
+                    scf_data.mol.ctrl.print_level,
+                );
+                println!(
+                    "Evaluation of W_c (lowrank, unrestricted) for omega={} has finished. This step took {:?}",
+                    omega_1,
+                    start.elapsed()
+                );
+                s.send((*omega_1, *weight, lr))
+                    .expect("unsuccessful collection of w_c_lowrank_spin");
+            });
+    });
+    let w_c_lr: Vec<(f64, f64, LowRankVChiV)> = receiver.into_iter().collect();
+    omp_set_num_threads_wrapper(saved_omp);
+    w_c_lr
+}
+
 
 /// Pre-contract low-rank eigenvectors with ri_row_n for ONE QP state n,
 /// producing explicit W_c rows at every imaginary frequency point.
@@ -2673,6 +2923,88 @@ pub fn contour_rayon_lowrank(
         }).sum()
     }
 }
+
+/// Unrestricted low-rank contour residue term.
+///
+/// This is the low-rank counterpart of `contour_rayon_spin`. It uses the
+/// precomputed *total* real-axis low-rank representation for the screened
+/// interaction, but contracts with the requested spin's `ri_row_n` and uses
+/// that spin's occupied/virtual pole ranges (with MolGW global occupied/empty
+/// boundaries, exactly as the dense unrestricted contour path).
+pub fn contour_rayon_lowrank_spin(
+    scf_data: &SCF,
+    omega: f64,
+    n: usize,
+    spin: usize,
+    quasiparticle_energies_g: &Vec<f64>,
+    occ_params: &[OccParams; 2],
+    ri_row_n: &MatrixFull<f64>,
+    real_axis_vchiv: &RealAxisVChiV,
+    res_tol: f64,
+) -> f64 {
+    let op = occ_params[spin];
+    let fermi_energy = (quasiparticle_energies_g[op.homo] + quasiparticle_energies_g[op.lumo]) / 2.0;
+    let sign = if omega > fermi_energy { 1.0_f64 } else { -1.0_f64 };
+    let (global_homo, global_lumo) = molgw_global_homo_lumo(scf_data);
+
+    if sign > 0.0 {
+        ((global_homo + 1)..op.num_state).into_par_iter().map(|a_global| {
+            let a_col = a_global - op.start_mo;
+            let mut residue = 0.0_f64;
+            let de = omega - quasiparticle_energies_g[a_global];
+            if de >= -res_tol {
+                let lr = interpolate_vchiv_nearest(real_axis_vchiv, de);
+                let ri_vec: Vec<f64> = ri_row_n.iter_column(a_col).copied().collect();
+                let pole_factor = if de.abs() < res_tol { 0.5 } else { 1.0 };
+                residue = compute_single_residue_lowrank(lr, &ri_vec) * pole_factor;
+            }
+            residue * sign
+        }).sum()
+    } else {
+        (op.start_mo..global_lumo).into_par_iter().map(|i_global| {
+            let i_col = i_global - op.start_mo;
+            let mut residue = 0.0_f64;
+            let de = quasiparticle_energies_g[i_global] - omega;
+            if de >= -res_tol {
+                let lr = interpolate_vchiv_nearest(real_axis_vchiv, de);
+                let ri_vec: Vec<f64> = ri_row_n.iter_column(i_col).copied().collect();
+                let pole_factor = if de.abs() < res_tol { 0.5 } else { 1.0 };
+                residue = compute_single_residue_lowrank(lr, &ri_vec) * pole_factor;
+            }
+            residue * sign
+        }).sum()
+    }
+}
+
+/// Unrestricted low-rank QP equation (v2, precomputed W_c rows).
+pub fn quasiparticle_equation_lowrank_spin_v2(
+    scf_data: &SCF,
+    omega: f64,
+    n: usize,
+    spin: usize,
+    consts: f64,
+    quasiparticle_energies_g: &Vec<f64>,
+    occ_params: &[OccParams; 2],
+    ri_row_n: &MatrixFull<f64>,
+    wc_rows: &Vec<(f64, f64, Vec<f64>)>,
+    real_axis_vchiv: &RealAxisVChiV,
+    res_tol: f64,
+) -> f64 {
+    let contour = contour_rayon_lowrank_spin(
+        scf_data,
+        omega,
+        n,
+        spin,
+        quasiparticle_energies_g,
+        occ_params,
+        ri_row_n,
+        real_axis_vchiv,
+        res_tol,
+    );
+    let imag = calculate_imag_from_rows(wc_rows, omega, quasiparticle_energies_g);
+    consts + contour - imag - omega
+}
+
 
 /// Low-rank version of quasiparticle_equation: uses pre-computed imaginary-axis W_c
 /// and pre-computed real-axis low-rank v*chi*v for contour (residue) contributions.

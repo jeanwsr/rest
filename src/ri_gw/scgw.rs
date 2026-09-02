@@ -147,6 +147,97 @@ pub fn single_orbital_gw_spin(
     }
 }
 
+fn single_orbital_gw_lowrank_spin(
+    scf_data: &SCF,
+    v_matrix: &MatrixFull<f64>,
+    ri_row_n: &MatrixFull<f64>,
+    wc_rows: &Vec<(f64, f64, Vec<f64>)>,
+    real_axis_vchiv: &ri_gw::RealAxisVChiV,
+    n: usize,
+    spin: usize,
+    vxc_nn: f64,
+) -> f64 {
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let ops = ri_gw::get_occ_params_per_spin(scf_data, 'Y');
+    let op = ops[spin];
+    let gwqp_g = &scf_data.gwqp_spin.0[spin];
+    let e_ks_n = scf_data.eigenvalues[spin][n];
+    let mut exchange = 0.0;
+    for i_local in 0..op.occ_size {
+        exchange -= v_matrix[[n, op.start_mo + i_local]];
+    }
+    let hybrid_param = scf_data.mol.xc_data.dfa_hybrid_scf;
+    let side = if n > op.homo { 1.0 } else { -1.0 };
+    let consts = scf_data.eigenvalues[spin][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
+    let res_tol = qp_ctrl.cdgw_res_tol;
+
+    let qp_eq_func = |omega: f64| {
+        ri_gw::quasiparticle_equation_lowrank_spin_v2(
+            scf_data,
+            omega,
+            n,
+            spin,
+            consts,
+            gwqp_g,
+            &ops,
+            ri_row_n,
+            wc_rows,
+            real_axis_vchiv,
+            res_tol,
+        )
+    };
+
+    // A small Newton solver that mirrors `newton_solver_lowrank_v2` but uses
+    // the spin-resolved low-rank QP equation. This is more robust for deep/high
+    // orbitals than a fixed number of single Newton steps.
+    let h = 1.0e-6;
+    let delta = 0.02;
+    let mut solve_newton = |start: f64| -> f64 {
+        let mut x = start + side * delta;
+        let mut y_curr = qp_eq_func(x);
+        let mut y_plus = qp_eq_func(x + h);
+        let mut y_minus = qp_eq_func(x - h);
+        let mut converge = 0;
+        for _iter in 0..50 {
+            let derivative = (y_plus - y_minus) / (2.0 * h);
+            let shift = -y_curr / derivative;
+            x += shift;
+            y_curr = qp_eq_func(x);
+            if shift.abs() < 1.0e-8 {
+                converge += 1;
+            }
+            y_plus = qp_eq_func(x + h);
+            y_minus = qp_eq_func(x - h);
+            if converge == 1 {
+                break;
+            }
+        }
+        if converge == 0 {
+            println!("warning!!! low-rank spin Newton did not converge for spin {} orbital {}", spin, n);
+        }
+        x
+    };
+
+    let qp = if qp_ctrl.gw_rootfinder == "newton" {
+        solve_newton(e_ks_n)
+    } else {
+        let (have_crossing, mut qp) = ri_gw::linear_interpolation_solver(
+            &qp_eq_func,
+            e_ks_n,
+            side,
+            qp_ctrl.gw_search_grid,
+            qp_ctrl.gw_span_energy,
+        );
+        if !have_crossing {
+            qp = solve_newton(e_ks_n);
+        }
+        qp
+    };
+    println!("Spin {} orbital #{}: QP energy (low-rank) = {}", spin, n, qp);
+    qp
+}
+
+
 pub fn gw_near_fermi_surface_spin(
     scf_data: &mut SCF,
     num_freq: usize,
@@ -158,7 +249,13 @@ pub fn gw_near_fermi_surface_spin(
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let nspin = scf_data.mol.spin_channel;
     if qp_ctrl.use_low_rank_contour {
-        panic!("Unrestricted low-rank contour GW is not implemented yet; set use_low_rank_contour=false");
+        return gw_near_fermi_surface_spin_lowrank(
+            scf_data,
+            num_freq,
+            vxc_nn,
+            occ_threshold,
+            vir_threshold,
+        );
     }
     let ops = ri_gw::get_occ_params_per_spin(scf_data, 'Y');
     let ri_ov0 = ri_bse::get_submatrix_spin(scf_data, 'O', 'V', 'Y', 0);
@@ -205,6 +302,119 @@ pub fn gw_near_fermi_surface_spin(
     }
     out
 }
+
+fn gw_near_fermi_surface_spin_lowrank(
+    scf_data: &mut SCF,
+    num_freq: usize,
+    vxc_nn: &[Vec<f64>;2],
+    occ_threshold: f64,
+    vir_threshold: f64,
+) -> [Vec<f64>;2] {
+    let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let nspin = scf_data.mol.spin_channel;
+    let ops = ri_gw::get_occ_params_per_spin(scf_data, 'Y');
+    let ri_ov0 = ri_bse::get_submatrix_spin(scf_data, 'O', 'V', 'Y', 0);
+    let ri_ov1 = if nspin == 2 { ri_bse::get_submatrix_spin(scf_data, 'O', 'V', 'Y', 1) } else { ri_ov0.clone() };
+    let ri_ov = [ri_ov0, ri_ov1];
+    let gwqp_g_all = scf_data.gwqp_spin.0.clone();
+    let gwqp_w_all = scf_data.gwqp_spin.1.clone();
+
+    println!("Unrestricted low-rank contour GW is enabled.");
+    println!("Low-rank contour (unrestricted): Generating imaginary-axis total sqrt(v)*chi*sqrt(v)...");
+    let w_c_lr = ri_gw::generate_w_c_lowrank_spin(
+        scf_data,
+        &gwqp_w_all,
+        &ops,
+        &ri_ov,
+        num_freq,
+        qp_ctrl.low_rank_tolerance,
+    );
+
+    println!("Low-rank contour (unrestricted): Precomputing real-axis total sqrt(v)*chi*sqrt(v)...");
+    let mut nsemin = [0usize; 2];
+    let mut nsemax = [0usize; 2];
+    for s in 0..nspin {
+        let op = ops[s];
+        let start = op.start_mo;
+        let range = qp_ctrl.selfenergy_state_range;
+        nsemin[s] = start.saturating_add(op.homo.saturating_sub(start).saturating_sub(range));
+        nsemax[s] = op.homo.saturating_add(range).min(op.num_state.saturating_sub(1));
+    }
+    let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
+    let real_axis_vchiv = ri_gw::generate_real_axis_vchiv_spin(
+        &gwqp_g_all,
+        &gwqp_w_all,
+        &ops,
+        &ri_ov,
+        qp_ctrl.nomega_chi_real,
+        nsemin,
+        nsemax,
+        qp_ctrl.nomega_sigma,
+        qp_ctrl.step_sigma,
+        qp_ctrl.low_rank_tolerance,
+        grid_type,
+        qp_ctrl.omega_chi_max,
+        scf_data.mol.ctrl.print_level,
+        qp_ctrl.cdgw_eta,
+        qp_ctrl.cdgw_res_tol,
+    );
+
+    let mut out = [vec![], vec![]];
+    for spin in 0..nspin {
+        let op = ops[spin];
+        let v_matrix = ri_gw::v_matrix_from_scf_spin(scf_data, spin);
+        let ks_energies = scf_data.eigenvalues[spin].clone();
+        let e_homo = ks_energies[op.homo];
+        let e_lumo = ks_energies[op.lumo];
+        let calc_orbs_indices: Vec<usize> = ks_energies.iter().enumerate()
+            .filter(|(_, e_n)| **e_n > e_homo - occ_threshold && **e_n < e_lumo + vir_threshold)
+            .map(|(n, _)| n).collect();
+
+        let calc_orbs: Vec<(usize, f64)> = calc_orbs_indices.iter().map(|&n| {
+            let ri_row_n = ri_gw::compute_ri3mo_row_spin(scf_data, n, spin);
+            let wc_rows = ri_gw::precompute_wc_rows_lowrank(&w_c_lr, &ri_row_n, op.num_state);
+            (
+                n,
+                single_orbital_gw_lowrank_spin(
+                    scf_data,
+                    &v_matrix,
+                    &ri_row_n,
+                    &wc_rows,
+                    &real_axis_vchiv,
+                    n,
+                    spin,
+                    vxc_nn[spin][n],
+                ),
+            )
+        }).collect();
+
+        let occ_shift = calc_orbs[0].1 - scf_data.eigenvalues[spin][calc_orbs[0].0];
+        let vir_shift = calc_orbs[calc_orbs.len() - 1].1 - scf_data.eigenvalues[spin][calc_orbs[calc_orbs.len() - 1].0];
+        let mut gwqp: Vec<f64> = Vec::new();
+        for i in 0..calc_orbs[0].0 {
+            gwqp.push(scf_data.eigenvalues[spin][i] + occ_shift)
+        }
+        for (_, e) in calc_orbs.iter() {
+            gwqp.push(*e);
+        }
+        for i in calc_orbs[calc_orbs.len() - 1].0 + 1..op.num_state {
+            gwqp.push(scf_data.eigenvalues[spin][i] + vir_shift)
+        }
+        out[spin] = gwqp;
+    }
+
+    for spin in 0..nspin {
+        scf_data.gwqp_spin.0[spin] = out[spin].clone();
+        scf_data.gwqp_spin.1[spin] = out[spin].clone();
+    }
+    if nspin == 1 {
+        scf_data.gwqp_spin.0[1] = scf_data.gwqp_spin.0[0].clone();
+        scf_data.gwqp_spin.1[1] = scf_data.gwqp_spin.1[0].clone();
+        out[1] = out[0].clone();
+    }
+    out
+}
+
 
 pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)->Vec<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');

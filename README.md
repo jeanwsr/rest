@@ -439,6 +439,8 @@ Renormalized Singles方法通过投影DFT密度矩阵构造单激发HF哈密顿�
 - `nomega_sigma`: 取值usize，自能Sigma实轴扫描点数（每侧），在de_max扫描中使用。缺省为10。
 - `step_sigma`: 取值f64，自能Sigma实轴扫描步长，单位Hartree。缺省为0.05。
 
+> **精度提示**：如果 GW 计算窗口包含深占据轨道或高虚轨道，低秩实轴插值需要更密的频率格点。此时应增大 `nomega_chi_real`（例如提高到 1000–5000 或更高），否则这些轨道的 QP 能量以及后续 BSE 激发能可能不够准确。对于仅关心 HOMO/LUMO 附近或低激发态的情况，可以使用较小的 `nomega_chi_real` 以节省计算时间。
+
 ### GW求解器通用参数
 
 - `gw_rootfinder`: 取值String，准粒子方程求根方法。`”newton”`（缺省）为Newton法求根；`”interpolation”` 为插值求根。
@@ -610,6 +612,146 @@ bse_tda = true
 davidson_target_excitations = 10
 bse_davidson_solver = true
 ```
+### Unrestricted GW-BSE（UGW/UBSE）设置
+
+当体系为开壳层并启用自旋极化时，REST 会自动进入共线 Unrestricted GW-BSE 路径（UGW/UBSE）。该路径对 α、β 自旋分别计算 GW 准粒子能量，并使用自旋守恒的双块 BSE 结构求解激发能。
+
+**触发方式**：在 `[ctrl]` 中设置：
+```toml
+[ctrl]
+charge = 0.0
+spin = 2.0          # 例如 NH2 双自由基/双基态，2S = 2
+spin_polarization = true
+```
+
+**常用参数**（`[quasiparticle_methods]` 区块）：
+
+- `gw_or_bse`: 设置为 `"gw"` 只做 UGW；设置为 `"bse"` 则先做 UGW 再自动做 UBSE。
+- `gw_scheme`: UGW 推荐使用 `"extrapolated"`。
+- `scgw`: 目前 UGW 推荐使用 `"g0w0"`。
+- `gw_variant`: 目前 UGW 支持 `"cd"`（contour deformation）路径；`"ac"` 暂不支持。
+- `use_low_rank_contour`: 取值bool，设置为 `true` 开启 unrestricted low-rank contour GW 加速。该路径会使用 α+β 总响应构造低秩 $\sqrt{v}\chi\sqrt{v}$，并分别与两个自旋通道收缩。
+- `nomega_chi_real`: 取值usize，实轴低秩插值点数。缺省为6。**当计算窗口包含深轨道/高虚轨道时，需要显著增大该值**，例如 1000–5000 或更高，才能获得与 dense UGW 接近的精度。
+- `save_qp` / `save_qp_path`: 保存 α/β 自旋的准粒子能量。
+
+开启 unrestricted low-rank contour GW 的示例（可在 UGW 或 UGW+UBSE 中使用）：
+```toml
+[quasiparticle_methods]
+gw_or_bse = "bse"
+gw_scheme = "extrapolated"
+scgw = "g0w0"
+gw_variant = "cd"
+use_low_rank_contour = true
+low_rank_grid_type = "linear"
+nomega_chi_real = 5000
+low_rank_tolerance = 1e-3
+nomega_sigma = 10
+step_sigma = 0.05
+gw_rootfinder = "newton"
+```
+
+> 注意：上例中 `nomega_chi_real = 5000` 是针对包含深/高轨道窗口的较高精度设置。若只计算 HOMO/LUMO 附近，可适当降低；若包含很深的核轨道或很高虚轨道，请继续增大该值并检查收敛。
+
+UBSE 的 `bse_spin` 含义与 Restricted 略有不同：
+
+- `bse_spin = "singlet"`：自旋守恒、含 Hartree 项的 BSE 通道。
+- `bse_spin = "triplet"`：自旋守恒、不含 Hartree 项的 BSE 通道（对应 MolGW 的 `triplet=yes`）。
+- `bse_spin = "both"`：同时计算上述两个通道。
+
+UBSE 支持 dense、Davidson、FEAST 三种对角化/迭代求解方式：
+
+```toml
+[quasiparticle_methods]
+gw_or_bse = "bse"
+gw_scheme = "extrapolated"
+scgw = "g0w0"
+gw_variant = "cd"
+
+bse_spin = "singlet"
+bse_tda = false
+
+# 方式一：dense 全对角化（默认）
+# bse_davidson_solver = false
+# bse_feast_solver = false
+
+# 方式二：Davidson 迭代求解少数低能激发态
+bse_davidson_solver = true
+davidson_target_excitations = 6
+davidson_maximum_subspace_size = 120
+davidson_restart_dimensions = 9
+davidson_max_iter = 100
+davidson_converge_threshold = 1e-8
+
+# 方式三：FEAST 求解给定能量窗口内的所有激发态
+# bse_feast_solver = true
+# bse_eigenrange_min = 0.0
+# bse_eigenrange_max = 0.5
+# bse_m_expected = 20
+# bse_max_feast_iter = 30
+# bse_tol_feast = 1e-8
+```
+
+一个完整的 UGW+UBSE 输入示例（NH₂ 双基态，PBE0/cc-pVDZ，Davidson full BSE）：
+
+```toml
+[ctrl]
+print_level = 1
+num_threads = 4
+xc = "pbe0"
+basis_path = "/path/to/cc-pvdz"
+auxbas_path = "/path/to/cc-pvdz-rifit"
+basis_type = "spheric"
+auxbas_type = "spheric"
+eri_type = "ri-v"
+charge = 0.0
+spin = 2.0
+spin_polarization = true
+initial_guess = "sad"
+mixer = "diis"
+max_scf_cycle = 100
+scf_acc_rho = 1.0e-8
+scf_acc_eev = 1.0e-7
+scf_acc_etot = 1.0e-10
+
+[geom]
+name = "NH2"
+unit = "angstrom"
+position = """
+N  0.0000000000   0.0000000000   0.0000000000
+H  0.0000000000   0.8030000000  -0.6350000000
+H  0.0000000000  -0.8030000000  -0.6350000000
+"""
+
+[quasiparticle_methods]
+gw_or_bse = "bse"
+gw_scheme = "extrapolated"
+scgw = "g0w0"
+gw_variant = "cd"
+save_qp = true
+save_qp_path = "qp_rest.txt"
+bse_spin = "singlet"
+bse_tda = false
+bse_davidson_solver = true
+davidson_target_excitations = 6
+davidson_maximum_subspace_size = 120
+davidson_restart_dimensions = 9
+davidson_max_iter = 100
+davidson_converge_threshold = 1e-8
+```
+
+如果改用 FEAST，只需把上述 Davidson 开关替换为：
+
+```toml
+bse_feast_solver = true
+bse_eigenrange_min = 0.0
+bse_eigenrange_max = 0.5
+bse_m_expected = 20
+bse_max_feast_iter = 30
+bse_tol_feast = 1e-8
+```
+
+> 注意：UGW/UBSE 目前主要用于共线开壳层体系。Restricted 与 Unrestricted 路径的 `bse_spin` 语义不完全相同，使用时请根据实际自旋通道选择。
+
 ## 溶剂化计算相关设置
 - `solvent_model`: 取值String, 用于指定用于计算的溶剂模型。目前支持CPCM, COSMO, IEFPCM, SS(V)PE,SMD。缺省为CPCM。SMD及其梯度为实验性功能。
 - `solvent`: 取值String。支持溶剂见[用户手册](https://gitee.com/restgroup/rest_doc/blob/master/source_zh/user/solvent.md)。
