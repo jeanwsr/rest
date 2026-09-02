@@ -219,9 +219,10 @@ mod test {
         let input_token = r##"
 [ctrl]
      xc =                   "hf"
-     basis_path =           "basis-set-pool/def2-TZVP"
-     auxbas_path =          "basis-set-pool/def2-SVP-JKFIT"
-     num_threads =          16
+     basis_path =           "def2-TZVP"
+     auxbas_path =          "def2-universal-JKFIT"
+     num_threads =          4
+     spin =                 1
 
 [geom]
     name = "NH3"
