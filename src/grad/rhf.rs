@@ -16,6 +16,34 @@ type Tsr<T> = Tensor<T, DeviceBLAS, IxD>;
 type TsrView<'a, T> = TensorView<'a, T, DeviceBLAS, IxD>;
 type TsrMut<'a, T> = TensorMut<'a, T, DeviceBLAS, IxD>;
 
+/// Auxiliary-function range `[f0, f1)` owned by this rank, using the same
+/// deterministic distribution as the MPI rimatr build
+/// (`MPIData::distribute_rimatr_tasks` / `average_distribution`). Serial runs
+/// (and single-rank MPI runs, where `mpi_operator` is `None`) own the whole
+/// auxiliary basis.
+pub fn local_aux_function_range(
+    naux: usize,
+    mpi_operator: &Option<crate::mpi_io::MPIOperator>,
+) -> (usize, usize) {
+    #[cfg(feature = "mpi")]
+    if let Some(mpi_op) = mpi_operator {
+        let dist = crate::mpi_io::average_distribution(naux, mpi_op.size);
+        return (dist[mpi_op.rank].start, dist[mpi_op.rank].end);
+    }
+    (0, naux)
+}
+
+/// Map an auxiliary-function range `[f0, f1)` to the shell range `[shl0, shl1)`
+/// of the shells owned by it: a shell belongs to the owner of its first
+/// function (`aux_loc[s]` is the first function index of shell `s`), so every
+/// shell is assigned to exactly one rank and the shell ranges of all ranks
+/// partition the auxiliary basis without overlap or gap.
+pub fn aux_function_range_to_shell_range(aux_loc: &[usize], f0: usize, f1: usize) -> (usize, usize) {
+    let shl0 = aux_loc.partition_point(|&f| f < f0);
+    let shl1 = aux_loc.partition_point(|&f| f < f1);
+    (shl0, shl1)
+}
+
 #[non_exhaustive]
 #[derive(derive_builder::Builder)]
 pub struct RIHFGradientFlags {
@@ -248,7 +276,36 @@ impl RIRHFGradient<'_> {
         let mem_avail = self.flags.max_memory.map(|max_memory| max_memory - detect_used_memory_mb("proc"));
         let aux_batch_size = calc_batch_size::<f64>(8 * nao * nao, mem_avail, None, Some(naux * nocc * nocc));
         let aux_batch_size = aux_batch_size.min(216);
-        let aux_partition = blocksize_partition(&aux_loc, aux_batch_size);
+
+        // ── MPI: restrict the 3c-2e integral batches to this rank's local
+        // slice of the auxiliary basis (same deterministic distribution as
+        // the SCF rimatr build). The integral evaluation and the per-batch
+        // contractions are the dominant cost of `calc_de_jk`; without this
+        // restriction every rank would redundantly redo the full auxiliary
+        // loop, so the force calculation gets *slower* as the number of MPI
+        // processes grows. The prepr quantities (j2c decomposition, `itm_j`,
+        // `itm_k_occtp`, the full 2c-2e `daux_*` seeds) still work on the
+        // complete matrix gathered by `eval_force`; the per-rank local
+        // contributions are combined afterwards with MPI reductions.
+        let (aux_fn0, aux_fn1) = local_aux_function_range(naux, self.mpi_operator);
+        let (aux_shl0, aux_shl1) = aux_function_range_to_shell_range(&aux_loc, aux_fn0, aux_fn1);
+        let local_aux_partition = if aux_shl0 < aux_shl1 {
+            blocksize_partition(&aux_loc[aux_shl0..=aux_shl1], aux_batch_size)
+                .into_iter()
+                .map(|[s0, s1]| [s0 + aux_shl0, s1 + aux_shl0])
+                .collect::<Vec<[usize; 2]>>()
+        } else {
+            vec![]
+        };
+
+        // The function span actually covered by this rank's shells: a shell is
+        // owned by the rank of its first function, so the last shell may
+        // extend past `aux_fn1` (and the first shell of the next rank starts
+        // at or beyond `aux_fn1`). All rows written by the batch loops below
+        // (the int3c2e_ip2 contributions to daux_*) live in this span, and the
+        // aux-atom summation must use the span (not the function range) so
+        // that every auxiliary function is counted by exactly one rank.
+        let (aux_span0, aux_span1) = (aux_loc[aux_shl0], aux_loc[aux_shl1]);
 
         time_records.count("de-jk prepr 1");
 
@@ -283,11 +340,9 @@ impl RIRHFGradient<'_> {
 
         time_records.count("de-jk prepr 2");
 
-        let mut idx_aux_start = 0;
-        for [shl0, shl1] in aux_partition.clone() {
-            let shl_naux = aux_loc[shl1] - aux_loc[shl0];
+        for [shl0, shl1] in local_aux_partition.clone() {
             let shl_slices = [[0, mol.nbas()], [0, mol.nbas()], [shl0, shl1]];
-            let (p0, p1) = (idx_aux_start, idx_aux_start + shl_naux);
+            let (p0, p1) = (aux_loc[shl0], aux_loc[shl1]);
 
             time_records.count_start("de-jk batch int");
             // int3c2e_ip1
@@ -336,7 +391,30 @@ impl RIRHFGradient<'_> {
                 }
             }
 
-            idx_aux_start += shl_naux;
+        }
+
+        // MPI: every rank accumulated only its local auxiliary-slice
+        // contribution to dao_j / dao_k; sum over ranks so that all ranks hold
+        // the complete derivative of the (hybrid) Coulomb / exchange term.
+        #[cfg(feature = "mpi")]
+        if let Some(mpi_op) = self.mpi_operator {
+            for (dao, enabled) in [
+                (&mut dao_j, self.flags.factor_j.is_some()),
+                (&mut dao_k, self.flags.factor_k.is_some()),
+            ] {
+                if !enabled {
+                    continue;
+                }
+                let dao_raw = dao.clone().into_shape(-1).into_raw();
+                let mut tot = crate::mpi_io::mpi_reduce(
+                    &mpi_op.world,
+                    &dao_raw,
+                    0,
+                    &mpi::collective::SystemOperation::sum(),
+                );
+                crate::mpi_io::mpi_broadcast_vector(&mpi_op.world, &mut tot, 0);
+                *dao = rt::asarray((tot, [nao, 3], &device));
+            }
         }
 
         // begin rsh computation (evaluate short-range part of K, so negative omega for libcint)
@@ -376,11 +454,9 @@ impl RIRHFGradient<'_> {
 
             time_records.count("de-jk prepr 3");
 
-            let mut idx_aux_start = 0;
-            for [shl0, shl1] in aux_partition.clone() {
-                let shl_naux = aux_loc[shl1] - aux_loc[shl0];
+            for [shl0, shl1] in local_aux_partition.clone() {
                 let shl_slices = [[0, mol.nbas()], [0, mol.nbas()], [shl0, shl1]];
-                let (p0, p1) = (idx_aux_start, idx_aux_start + shl_naux);
+                let (p0, p1) = (aux_loc[shl0], aux_loc[shl1]);
 
                 time_records.count_start("de-jk batch int 2");
                 // int3c2e_ip1
@@ -415,7 +491,21 @@ impl RIRHFGradient<'_> {
                     time_records.count("de-jk batch 8");
                 }
 
-                idx_aux_start += shl_naux;
+            }
+
+            // MPI: sum the local auxiliary-slice contributions of the
+            // short-range exchange derivative over ranks.
+            #[cfg(feature = "mpi")]
+            if let Some(mpi_op) = self.mpi_operator {
+                let dao_sr_raw = dao_sr.clone().into_shape(-1).into_raw();
+                let mut tot = crate::mpi_io::mpi_reduce(
+                    &mpi_op.world,
+                    &dao_sr_raw,
+                    0,
+                    &mpi::collective::SystemOperation::sum(),
+                );
+                crate::mpi_io::mpi_broadcast_vector(&mpi_op.world, &mut tot, 0);
+                dao_sr = rt::asarray((tot, [nao, 3], &device));
             }
         }
 
@@ -445,15 +535,55 @@ impl RIRHFGradient<'_> {
                 *&mut de_sr.i_mut((.., atm)).assign(dao_sr.i(p0..p1).sum_axes(0));
             }
 
+            // Under MPI, the int3c2e_ip2 contribution to daux_* exists only on
+            // the rank that owns the corresponding auxiliary rows, so every
+            // rank must restrict its aux-atom summation to its local rows; the
+            // partial [3, natm] results are summed over ranks below.
             let [_, _, p0, p1] = aux_slice[atm].clone().try_into().unwrap();
+            let (q0, q1) = (p0.max(aux_span0), p1.min(aux_span1));
             if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
-                *&mut de_jaux.i_mut((.., atm)).assign(daux_j.i(p0..p1).sum_axes(0));
+                if q0 < q1 {
+                    *&mut de_jaux.i_mut((.., atm)).assign(daux_j.i(q0..q1).sum_axes(0));
+                } else {
+                    *&mut de_jaux.i_mut((.., atm)).assign(rt::full(([3], 0.0_f64, &device)));
+                }
             }
             if self.flags.factor_k.is_some() && self.flags.auxbasis_response {
-                *&mut de_kaux.i_mut((.., atm)).assign(daux_k.i(p0..p1).sum_axes(0));
+                if q0 < q1 {
+                    *&mut de_kaux.i_mut((.., atm)).assign(daux_k.i(q0..q1).sum_axes(0));
+                } else {
+                    *&mut de_kaux.i_mut((.., atm)).assign(rt::full(([3], 0.0_f64, &device)));
+                }
             }
             if self.flags.omega.is_some() && self.flags.auxbasis_response {
-                *&mut de_sraux.i_mut((.., atm)).assign(daux_sr.i(p0..p1).sum_axes(0));
+                if q0 < q1 {
+                    *&mut de_sraux.i_mut((.., atm)).assign(daux_sr.i(q0..q1).sum_axes(0));
+                } else {
+                    *&mut de_sraux.i_mut((.., atm)).assign(rt::full(([3], 0.0_f64, &device)));
+                }
+            }
+        }
+
+        // MPI: sum the per-rank partial auxiliary-basis-response gradients.
+        #[cfg(feature = "mpi")]
+        if let Some(mpi_op) = self.mpi_operator {
+            for (de_part, enabled) in [
+                (&mut de_jaux, self.flags.factor_j.is_some() && self.flags.auxbasis_response),
+                (&mut de_kaux, self.flags.factor_k.is_some() && self.flags.auxbasis_response),
+                (&mut de_sraux, self.flags.omega.is_some() && self.flags.auxbasis_response),
+            ] {
+                if !enabled {
+                    continue;
+                }
+                let de_raw = de_part.clone().into_shape(-1).into_raw();
+                let mut tot = crate::mpi_io::mpi_reduce(
+                    &mpi_op.world,
+                    &de_raw,
+                    0,
+                    &mpi::collective::SystemOperation::sum(),
+                );
+                crate::mpi_io::mpi_broadcast_vector(&mpi_op.world, &mut tot, 0);
+                *de_part = rt::asarray((tot, [3, natm], &device));
             }
         }
 

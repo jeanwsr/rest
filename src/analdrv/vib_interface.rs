@@ -3,7 +3,6 @@ use crate::geom_io::get_mass_charge;
 use crate::analdrv::vib::*;
 use crate::ri_jk::util::get_cint_mol;
 use crate::SCF;
-use crate::thermo as shermo;
 
 /// Vibrational analysis interface for REST.
 ///
@@ -98,18 +97,6 @@ pub fn vibration_analysis_interface(
 
         println!("=============== End of Thermo Analysis (Usual Style in analdrv) ===============");
         th
-    });
-
-    // --- thermo analysis (shermo-style) --- //
-
-    // this is activated by using `[thermo]` section in control input.
-
-    scf_data.mol.ctrl.thermo.as_ref().map(|thermo_cfg| {
-        // output all frequencies in cm^-1, imaginary frequencies to be negative
-        use itertools::izip;
-        let freqs = izip!(vib.imag.iter(), vib.omega.iter()).map(|(&imag, &omega)| if imag { -omega } else { omega }).collect_vec();
-        let mut time_mark = crate::utilities::TimeRecords::new();
-        shermo::run_thermochemistry(scf_data, &freqs, thermo_cfg, &mut time_mark)
     });
 
     (de_hess.into_shape(-1).into_vec(), vib, gau_th)
