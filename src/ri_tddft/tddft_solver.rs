@@ -10,14 +10,16 @@
 /// 7. Print excitation energies and properties
 
 use rest_tensors::MatrixFull;
-use crate::scf_io::SCF;
+use crate::scf_io::{SCF, SCFType};
 use crate::ri_bse::dipoles;
 use crate::solvers::davidson as davidson_solver;
 use crate::solvers::davidson::DavidsonConfig;
 use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data, set_fxc_use_optimized};
 use crate::ri_tddft::matvec::{self, a_matvec, b_matvec};
 use crate::ri_tddft::matvec_ao;
-use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_get_submatrix, compute_tddft_dipole_matrix};
+use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_occupation_parameters_u,
+    compute_tddft_dipole_matrix, compute_tddft_dipole_matrix_u, normalize_u,
+    transition_dipole_square_u, tddft_get_submatrix};
 use crate::ri_tddft::feast_solver;
 use crate::ri_tddft::tddft::{build_a, build_b, prepare_ao_data, prepare_mo_data};
 use crate::ri_tddft::{TDDFTData, TDDFTMode};
@@ -131,6 +133,41 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     let is_tda = tddft_method == "tda" || tddft_method == "TDA";
     let is_ao = tddft_ctrl.tddft_mode == "ao";
 
+    // ═══ Unrestricted (UKS/UHF) reference: collinear uTDDFT ═══
+    // The amplitude space is the concatenation [z_alpha; z_beta] (PySCF
+    // tdscf/uhf.py layout); the response is not spin-resolved (no
+    // singlet/triplet). Phase 1 supports AO mode only.
+    // Gate on the SCF REFERENCE TYPE, not spin_channel: ROHF also carries
+    // spin_channel == 2 (scf_io sets it for the two-spin Roothaan density),
+    // but its eigenvectors are not the semicanonical orbitals the RI/UKS
+    // machinery needs — ROHF-TDDFT is rejected explicitly until implemented
+    // (it would require semi_eigenvectors + a polarized kernel).
+    let is_u = scf.scftype == SCFType::UHF;
+    if scf.scftype == SCFType::ROHF {
+        return Err("ROHF-TDDFT is not yet supported. Use spin_polarization=true \
+                    (UKS) for open-shell excited states."
+            .to_string());
+    }
+    if is_u {
+        if !is_ao {
+            return Err("Unrestricted (UKS) TDDFT currently requires tddft_mode=\"ao\" \
+                        (the MO-mode kernels are still restricted-only).".to_string());
+        }
+        if tddft_ctrl.tddft_feast_solver {
+            return Err("FEAST solver is not supported for unrestricted (UKS) TDDFT.".to_string());
+        }
+        if tddft_ctrl.tddft_fxc_driver == "mo" {
+            return Err("tddft_fxc_driver=\"mo\" is not supported for unrestricted (UKS) TDDFT; \
+                        use \"semitrans\" or \"dm\".".to_string());
+        }
+        if tddft_spin != "singlet" {
+            // The default is "singlet", so an explicit triplet/nonscf setting
+            // cannot be distinguished — unrestricted response ignores the
+            // keyword either way (debug-level note only).
+            log::debug!("tddft_spin=\"{}\" is ignored for an unrestricted reference", tddft_spin);
+        }
+    }
+
     // `grid_batch` is an AO-mode-only memory-bounded fxc option (default true).
     // MO mode does not use the grid-batched kernel, so the flag is silently
     // ignored there (visible at debug level).
@@ -158,13 +195,27 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
         println!("  RI-K driver: {}", tddft_ctrl.tddft_ao_rik_driver);
         println!("  fxc driver: {}", tddft_ctrl.tddft_fxc_driver);
     }
-    println!("Spin: {}", if xlet == 'S' { "Singlet" } else { "Triplet" });
+    if is_u {
+        println!("Spin: Unrestricted (alpha + beta excitation sectors)");
+    } else {
+        println!("Spin: {}", if xlet == 'S' { "Singlet" } else { "Triplet" });
+    }
     println!("Number of roots: {}", nroots);
 
     // ═══ Step 2: Get orbital dimensions ═══
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
         tddft_occupation_parameters(scf);
+    // Unrestricted: per-spin occupied/virtual windows (frozen core + virtual
+    // cutoff resolved independently on each spin channel).
+    let sectors_u = if is_u { Some(tddft_occupation_parameters_u(scf)) } else { None };
         if scf.mol.ctrl.print_level > 1 {
+        if let Some(sec) = &sectors_u {
+            for (i_spin, s) in sec.iter().enumerate() {
+                let tag = if i_spin == 0 { "alpha" } else { "beta" };
+                println!("  TDDFT {} sector: occ={} [MO {}..{}], vir={} [MO {}..{}], dim={}",
+                    tag, s.occ_size, s.start_mo, s.homo, s.vir_size, s.lumo, s.num_state - 1, s.dim());
+            }
+        } else {
             let cutoff = scf.mol.ctrl.tddft.as_ref().map(|c| c.tddft_cutoff_energy).unwrap_or(1.0e6);
             if cutoff < 1.0e5 {
                 println!("  TDDFT virtual cutoff: {:.4} Ha, {} states retained", cutoff, num_state);
@@ -174,11 +225,21 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
                     start_mo - scf.mol.start_mo, start_mo);
             }
         }
-        let dim = occ_size * vir_size;
+        }
+    let dim = match &sectors_u {
+        Some(sec) => sec[0].dim() + sec[1].dim(),
+        None => occ_size * vir_size,
+    };
     if dim == 0 {
         return Err("No occupied-virtual excitation space (all orbitals frozen)".to_string());
     }
-    println!("occ_size={}, vir_size={}, dim={}", occ_size, vir_size, dim);
+    if let Some(sec) = &sectors_u {
+        println!("occ_a={}, vir_a={}, dim_a={}; occ_b={}, vir_b={}, dim_b={}; dim={}",
+            sec[0].occ_size, sec[0].vir_size, sec[0].dim(),
+            sec[1].occ_size, sec[1].vir_size, sec[1].dim(), dim);
+    } else {
+        println!("occ_size={}, vir_size={}, dim={}", occ_size, vir_size, dim);
+    }
 
     // ═══ Step 3+4: Prepare the shared TDDFT data (fxc kernel + mode-specific tensors) ═══
     // AO mode is prepared by `prepare_ao_data` (fxc kernel via numint_matmul,
@@ -199,7 +260,12 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     }
     let data: std::cell::RefCell<TDDFTData> = std::cell::RefCell::new(
         if is_ao {
-            println!("AO mode: using AO transition-density kernels (no MO-basis RI tensors)");
+            if is_u {
+                println!("Unrestricted (UKS) AO mode: spin-polarized kernels over the concatenated \
+                          [alpha; beta] amplitude space");
+            } else {
+                println!("AO mode: using AO transition-density kernels (no MO-basis RI tensors)");
+            }
             // FEAST is not implemented for the AO path.
             // Note: `response_tddft` bypasses this function entirely (dispatched
             // separately in main_driver) and always uses MO-basis machinery
@@ -207,6 +273,8 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
             if tddft_ctrl.tddft_feast_solver {
                 return Err("FEAST solver is not supported with tddft_mode=\"ao\"".to_string());
             }
+            // `prepare_ao_data` handles both reference types (RHF one-sector /
+            // UHF two-sector kernels and coefficients).
             prepare_ao_data(scf)
         } else {
             prepare_mo_data(scf)
@@ -217,7 +285,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     let alpha_hybrid = data.borrow().alpha_hybrid;
 
     // ═══ Step 5: Build diagonal preconditioner ═══
-    let hdiag = matvec::build_hdiag(scf);
+    let hdiag = if is_u { matvec::build_hdiag_u(scf) } else { matvec::build_hdiag(scf) };
     println!("Diagonal preconditioner built, min gap = {:.6}",
         hdiag.iter().fold(f64::INFINITY, |a, &b| a.min(b)));
 
@@ -461,8 +529,18 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     let n_found = eigenpairs.len();
     let tda_flag = is_tda;
     let n_print = n_found.min(30);
-    let dipole_matrix = compute_tddft_dipole_matrix(scf, start_mo, occ_size, vir_size, homo, lumo);
-    let singlet_triplet = if xlet == 'S' { "Singlet" } else if xlet == 'T' { "Triplet" } else { "" };
+    let dipole_matrix = if let Some(sec) = &sectors_u {
+        compute_tddft_dipole_matrix_u(scf, sec)
+    } else {
+        compute_tddft_dipole_matrix(scf, start_mo, occ_size, vir_size, homo, lumo)
+    };
+    let singlet_triplet = if is_u {
+        "Unrestricted"
+    } else if xlet == 'S' {
+        "Singlet"
+    } else {
+        "Triplet"
+    };
     println!("\nFirst {} {} Excitations:", n_found.min(n_print), singlet_triplet);
 
     let mut td_energies: Vec<f64> = Vec::new();
@@ -474,8 +552,17 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
 
         // Normalize and compute transition dipole (BSE-compatible order:
         // transition_dipole_square prints "Dipole Moment Components" as a side effect)
-        let norm_vec = dipoles::normalize(vector, tda_flag);
-        let dipole_sq = dipoles::transition_dipole_square(&dipole_matrix, &norm_vec, tda_flag);
+        // Unrestricted: PySCF uhf.py convention (no closed-shell 2/sqrt(2) factors).
+        let norm_vec = if is_u {
+            normalize_u(vector, tda_flag)
+        } else {
+            dipoles::normalize(vector, tda_flag)
+        };
+        let dipole_sq = if is_u {
+            transition_dipole_square_u(&dipole_matrix, &norm_vec, tda_flag)
+        } else {
+            dipoles::transition_dipole_square(&dipole_matrix, &norm_vec, tda_flag)
+        };
         let osc_strength = dipole_sq * energy * 2.0 / 3.0;
         td_energies.push(*energy);
         td_osc.push(osc_strength);
@@ -483,18 +570,38 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
             dipole_sq, osc_strength);
 
         // Print leading components
-        let mut components: Vec<(usize, usize, f64)> = norm_vec.iter()
-            .enumerate()
-            .map(|(idx, &val)| {
-                let i = idx % occ_size;
-                let a = idx / occ_size;
-                (i, a, val)
-            })
-            .collect();
-        components.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap());
-        for (k, (i, a, val)) in components.iter().enumerate() {
-            if k < 5 {
-                println!("      #{}->#{},amplitude={}", start_mo + i, lumo + a, val);
+        if let Some(sec) = &sectors_u {
+            // Unrestricted: decode (spin sector, occ, vir) from the concatenated index.
+            let dim_a = sec[0].dim();
+            let mut components: Vec<(usize, usize, usize, f64)> = norm_vec.iter()
+                .enumerate()
+                .map(|(idx, &val)| {
+                    let (s_i, local) = if idx < dim_a { (0usize, idx) } else { (1usize, idx - dim_a) };
+                    (s_i, local % sec[s_i].occ_size, local / sec[s_i].occ_size, val)
+                })
+                .collect();
+            components.sort_by(|a, b| b.3.abs().partial_cmp(&a.3.abs()).unwrap());
+            for (k, (s_i, i, a, val)) in components.iter().enumerate() {
+                if k < 5 {
+                    let spin_char = if *s_i == 0 { 'a' } else { 'b' };
+                    println!("      #{}{}->{}{},amplitude={}",
+                        sec[*s_i].start_mo + i, spin_char, sec[*s_i].lumo + a, spin_char, val);
+                }
+            }
+        } else {
+            let mut components: Vec<(usize, usize, f64)> = norm_vec.iter()
+                .enumerate()
+                .map(|(idx, &val)| {
+                    let i = idx % occ_size;
+                    let a = idx / occ_size;
+                    (i, a, val)
+                })
+                .collect();
+            components.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap());
+            for (k, (i, a, val)) in components.iter().enumerate() {
+                if k < 5 {
+                    println!("      #{}->#{},amplitude={}", start_mo + i, lumo + a, val);
+                }
             }
         }
     }

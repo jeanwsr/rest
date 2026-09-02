@@ -113,7 +113,7 @@ pub struct SCF {
     pub solvent_scf: Option<PcmScf>,
 }
 
-#[derive(Clone,Copy)]
+#[derive(Clone,Copy,PartialEq)]
 pub enum SCFType {
     RHF,
     ROHF,

@@ -8,10 +8,13 @@
 //! - **AO mode**: `fxc` (kernel-only, no MO projections) + `c_occ`/`c_vir`,
 //!   the NIMatmul integrator (`ni`), the raw kernel (`fxc_eff`), `den_type`,
 //!   `grid_batch`.
+//! - **AO mode, unrestricted (`prepare_ao_data_u`)**: the same AO members with
+//!   per-spin `c_occ`/`c_vir` (+`_b` beta twins), the spin-polarized kernel
+//!   `fxc_eff: [ngrids, nvar, 2, nvar, 2]`, and `unrestricted = true`.
 
 use rest_tensors::MatrixFull;
 
-use crate::scf_io::SCF;
+use crate::scf_io::{SCF, SCFType};
 use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data};
 use crate::dft::Grids;
 use crate::dft::numint_matmul::nimatmul::NIMatmul;
@@ -42,14 +45,15 @@ pub struct TDDFTData {
     /// MO-on-grid projections + weighted `wfxc` table. AO mode carries the
     /// raw kernel in `fxc_eff` and uses NIMatmul instead.
     pub fxc: Option<FXCMatvecData>,
-    // ── AO mode only ──
-    /// Occupied MO coefficients [nao, occ_size] (AO mode).
-    pub c_occ: Option<MatrixFull<f64>>,
-    /// Virtual MO coefficients [nao, vir_size] (AO mode).
-    pub c_vir: Option<MatrixFull<f64>>,
+    // ── AO mode only (per spin sector: 1 entry for RHF, 2 for UHF) ──
+    /// Per-sector occupied MO coefficients [nao, occ_s] (AO mode).
+    pub c_occ: Vec<MatrixFull<f64>>,
+    /// Per-sector virtual MO coefficients [nao, vir_s] (AO mode).
+    pub c_vir: Vec<MatrixFull<f64>>,
     /// Numerical integrator for the batched fxc kernel (AO mode).
     pub ni: Option<NIMatmul<'static>>,
-    /// Raw (unweighted) fxc kernel `[ngrids, nvar, nvar]` (AO mode).
+    /// Raw (unweighted) fxc kernel (AO mode). Restricted: `[ngrids, nvar, nvar]`;
+    /// unrestricted: spin-polarized `[ngrids, nvar, 2, nvar, 2]`.
     pub fxc_eff: Option<Tsr>,
     /// Density type (RHO/SIGMA) for AO mode.
     pub den_type: Option<XCDenType>,
@@ -58,12 +62,11 @@ pub struct TDDFTData {
     /// Resolved `tddft_fxc_driver` (AO mode); `None` for MO data — the fxc
     /// driver only applies in AO mode.
     pub fxc_driver: Option<FxcDriver>,
-    /// Cached occ-MO projections on the grid (MO-style fxc driver):
-    /// ψ_i(g) = Σ_μ C_μi φ_μ(g), layout [ngrids, nocc].
-    pub psi_occ: Option<Tsr>,
-    /// Cached occ-MO gradient projections (GGA, MO-style fxc driver): ∂_d ψ_i(g),
-    /// layout [3, ngrids, nocc] with d ∈ {x, y, z}.
-    pub psi_occ_grad: Option<Tsr>,
+    /// Per-sector occ-MO projections on the grid [ngrids, nocc_s]
+    /// (MO/SEMITRANS fxc driver); `None` when the active driver does not need them.
+    pub psi_occ: Option<Vec<Tsr>>,
+    /// Per-sector occ-MO gradient projections [3, ngrids, nocc_s] (GGA only).
+    pub psi_occ_grad: Option<Vec<Tsr>>,
     // ── MO mode only ──
     /// [naux, occ*vir] RI tensor, Coulomb.
     pub ri_ov: Option<MatrixFull<f64>>,
@@ -73,6 +76,24 @@ pub struct TDDFTData {
     pub ri_vv_exch: Option<MatrixFull<f64>>,
     /// [naux*occ, vir] RI tensor, B-block exchange.
     pub ri_ov_exch: Option<MatrixFull<f64>>,
+    // ── Unrestricted (UKS) reference ──
+    /// The SCF reference type this data was prepared for (RHF/ROHF/UHF).
+    /// The concatenated `[z_alpha; z_beta]` amplitude space and the
+    /// spin-polarized kernel `fxc_eff: [ngrids, nvar, 2, nvar, 2]` apply iff
+    /// `reftype == SCFType::UHF`. (Note: `mol.spin_channel == 2` is NOT a UHF
+    /// discriminator — ROHF also carries two spin channels.)
+    pub reftype: SCFType,
+}
+
+impl TDDFTData {
+    /// Number of spin sectors the data was prepared for (1 = RHF, 2 = UHF).
+    pub fn n_sectors(&self) -> usize {
+        if self.reftype == SCFType::UHF { 2 } else { 1 }
+    }
+    /// Whether the reference is unrestricted (UKS/UHF).
+    pub fn is_uhf(&self) -> bool {
+        self.reftype == SCFType::UHF
+    }
 }
 
 /// Prepare the shared TDDFT data for **MO mode**: the fxc kernel table
@@ -123,8 +144,8 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
         mode: TDDFTMode::MO,
         alpha_hybrid: fxc.alpha_hybrid,
         fxc: Some(fxc),
-        c_occ: None,
-        c_vir: None,
+        c_occ: vec![],
+        c_vir: vec![],
         ni: None,
         fxc_eff: None,
         den_type: None,
@@ -136,6 +157,7 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
         ri_oo_exch: Some(ri_oo_exch),
         ri_vv_exch: Some(ri_vv_exch),
         ri_ov_exch: Some(ri_ov_exch),
+        reftype: scf.scftype,
     }
 }
 
@@ -149,8 +171,9 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
 /// AO mode carries no `FXCMatvecData` (`fxc: None`): the MO-on-grid
 /// projections and weighted `wfxc` table are MO-only.
 pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
-    let (start_mo, _num_state, occ_size, vir_size, _homo, lumo) =
-        tddft_occupation_parameters(scf);
+    let is_uhf = scf.scftype == SCFType::UHF;
+    let sector_list = crate::ri_tddft::utils::tddft_sector_params(scf);
+    let n_sec = sector_list.len();
 
     let grids = scf.grids.as_ref().expect("DFT grids must be initialized for AO-mode fxc");
     let ngrids = grids.weights.len();
@@ -173,112 +196,149 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
     let grid_batch = scf.mol.ctrl.tddft.as_ref().map_or(false, |t| t.grid_batch);
 
     // ── Ground-state density on grids, then the raw fxc kernel ──
-    // rho0 is built from the occ-weighted density matrix (matches the MO path's
-    // `eval_rho5_batch` ground-state rho), then libxc deriv=2 gives the raw
-    // kernel `[ngrids, nvar, nvar]` — bit-identical to `prepare_fxc_data`.
-    // When `grid_batch` is set, rho0 is assembled batch-by-batch via
-    // `split_batch` so the full `[ngrids, nao, ncomp]` AO tensor is never cached.
+    // Unrestricted: spin densities [ngrids, nvar, 2] from BOTH SCF density
+    // matrices and the spin-polarized kernel [ngrids, nvar, 2, nvar, 2]
+    // evaluated at the real (rho_alpha0, rho_beta0) — no singlet factor, no
+    // triplet combination (the unrestricted response is not spin-resolved).
+    // Restricted: rho0 from the occ-weighted density matrix (matches the MO
+    // path's `eval_rho5_batch`), then libxc deriv=2 — bit-identical to
+    // `prepare_fxc_data`; grid_batch assembles batch-by-batch so the full
+    // [ngrids, nao, ncomp] AO tensor is never cached.
     let device = DeviceBLAS::default();
-    let dm0 = &scf.density_matrix[0];
-    let rho0 = if grid_batch {
-        let mut rho0 = rt::zeros(([ngrids, nvar, 1], &device));
-        for start in (0..ngrids).step_by(ni.nbatch) {
-            let end = (start + ni.nbatch).min(ngrids);
-            let mut ni_batch = ni.split_batch(start, end);
-            let dm0_view = dm0.to_rstsr_view(&device);
-            let rho0_batch = ni_batch.make_rho_from_dm(&[dm0_view], den_type);
-            rho0.i_mut((start..end, .., ..)).assign(&rho0_batch);
-        }
-        rho0
+    let (rho0, fxc_eff) = if is_uhf {
+        let dm_a = &scf.density_matrix[0];
+        let dm_b = &scf.density_matrix[1];
+        let rho0_u = if grid_batch {
+            let mut rho0_u = rt::zeros(([ngrids, nvar, 2], &device));
+            for start in (0..ngrids).step_by(ni.nbatch) {
+                let end = (start + ni.nbatch).min(ngrids);
+                let mut ni_batch = ni.split_batch(start, end);
+                let dm_views = [dm_a.to_rstsr_view(&device), dm_b.to_rstsr_view(&device)];
+                let rho0_batch = ni_batch.make_rho_from_dm(&dm_views, den_type); // [nb, nvar, 2]
+                rho0_u.i_mut((start..end, .., ..)).assign(&rho0_batch);
+            }
+            rho0_u
+        } else {
+            let dm_views = [dm_a.to_rstsr_view(&device), dm_b.to_rstsr_view(&device)];
+            ni.make_rho_from_dm(&dm_views, den_type) // [ngrids, nvar, 2]
+        };
+        let xc_func_list_pol: Vec<(f64, LibXCFunctional)> = xc_data.dfa_compnt_scf
+            .iter()
+            .zip(xc_data.dfa_paramr_scf.iter())
+            .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Polarized)))
+            .collect();
+        let (_vxc0, fxc_eff_u) = crate::dft::numint_matmul::hess_uks::eval_vxc_fxc_uks_from_rho(
+            &xc_func_list_pol, rho0_u.view());
+        (rho0_u, fxc_eff_u)
     } else {
-        let dm0_view = dm0.to_rstsr_view(&device);
-        ni.make_rho_from_dm(&[dm0_view], den_type) // [ngrids, nvar, 1]
-    };
+        let dm0 = &scf.density_matrix[0];
+        let rho0_r = if grid_batch {
+            let mut rho0_r = rt::zeros(([ngrids, nvar, 1], &device));
+            for start in (0..ngrids).step_by(ni.nbatch) {
+                let end = (start + ni.nbatch).min(ngrids);
+                let mut ni_batch = ni.split_batch(start, end);
+                let dm0_view = dm0.to_rstsr_view(&device);
+                let rho0_batch = ni_batch.make_rho_from_dm(&[dm0_view], den_type);
+                rho0_r.i_mut((start..end, .., ..)).assign(&rho0_batch);
+            }
+            rho0_r
+        } else {
+            let dm0_view = dm0.to_rstsr_view(&device);
+            ni.make_rho_from_dm(&[dm0_view], den_type) // [ngrids, nvar, 1]
+        };
 
-    let xc_func_list: Vec<(f64, LibXCFunctional)> = xc_data.dfa_compnt_scf
-        .iter()
-        .zip(xc_data.dfa_paramr_scf.iter())
-        .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Unpolarized)))
-        .collect();
+        let xc_func_list: Vec<(f64, LibXCFunctional)> = xc_data.dfa_compnt_scf
+            .iter()
+            .zip(xc_data.dfa_paramr_scf.iter())
+            .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Unpolarized)))
+            .collect();
 
-    // ── Spin-channel-aware fxc kernel (CPL, 256, 454; PySCF `nr_rks_fxc_st`) ──
-    // Singlet:   f_s = f↑↑ + f↑↓ = 2 × (unpolarized kernel at the total density).
-    // Unpolarized ('R'): the bare unpolarized kernel (factor 1).
-    // Triplet:   f_t = f↑↑ − f↑↓ cannot be obtained from an unpolarized
-    //            evaluation; it requires a spin-polarized evaluation at
-    //            (ρ/2, ∇ρ/2) per spin, combined along the antisymmetric direction.
-    let tddft_spin = scf.mol.ctrl.tddft.as_ref().map_or("singlet", |t| t.tddft_spin.as_str());
-    let rho0_g = rho0.i((.., .., 0)); // [ngrids, nvar] ground density + gradients
-    let fxc_eff = match tddft_spin {
-        "triplet" => {
-            let xc_func_list_pol: Vec<(f64, LibXCFunctional)> = xc_data.dfa_compnt_scf
-                .iter()
-                .zip(xc_data.dfa_paramr_scf.iter())
-                .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Polarized)))
-                .collect();
-            // Polarized closed-shell ground density (ρ/2, ∇ρ/2) per spin,
-            // layout [ngrids, ncomp_in, 2] (GGA input: ncomp_in = 5, LDA: 1).
-            let ncomp_in = if nvar == 4 { 5 } else { 1 };
-            let mut rho_pol = rt::zeros(([ngrids, ncomp_in, 2], &device));
-            for s in 0..2 {
-                *&mut rho_pol.i_mut((.., 0, s)) += &(rho0_g.i((.., 0)) * 0.5);
-                if ncomp_in == 5 {
-                    for d in 0..3 {
-                        *&mut rho_pol.i_mut((.., 1 + d, s)) += &(rho0_g.i((.., 1 + d)) * 0.5);
+        // ── Spin-channel-aware fxc kernel (CPL, 256, 454; PySCF `nr_rks_fxc_st`) ──
+        // Singlet:   f_s = f↑↑ + f↑↓ = 2 × (unpolarized kernel at the total density).
+        // Unpolarized ('R'): the bare unpolarized kernel (factor 1).
+        // Triplet:   f_t = f↑↑ − f↑↓ cannot be obtained from an unpolarized
+        //            evaluation; it requires a spin-polarized evaluation at
+        //            (ρ/2, ∇ρ/2) per spin, combined along the antisymmetric direction.
+        let tddft_spin = scf.mol.ctrl.tddft.as_ref().map_or("singlet", |t| t.tddft_spin.as_str());
+        let rho0_g = rho0_r.i((.., .., 0)); // [ngrids, nvar] ground density + gradients
+        let fxc_eff_r = match tddft_spin {
+            "triplet" => {
+                let xc_func_list_pol: Vec<(f64, LibXCFunctional)> = xc_data.dfa_compnt_scf
+                    .iter()
+                    .zip(xc_data.dfa_paramr_scf.iter())
+                    .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Polarized)))
+                    .collect();
+                // Polarized closed-shell ground density (ρ/2, ∇ρ/2) per spin,
+                // layout [ngrids, ncomp_in, 2] (GGA input: ncomp_in = 5, LDA: 1).
+                let ncomp_in = if nvar == 4 { 5 } else { 1 };
+                let mut rho_pol = rt::zeros(([ngrids, ncomp_in, 2], &device));
+                for s in 0..2 {
+                    *&mut rho_pol.i_mut((.., 0, s)) += &(rho0_g.i((.., 0)) * 0.5);
+                    if ncomp_in == 5 {
+                        for d in 0..3 {
+                            *&mut rho_pol.i_mut((.., 1 + d, s)) += &(rho0_g.i((.., 1 + d)) * 0.5);
+                        }
                     }
                 }
+                // Spin-resolved second derivatives K[g, c1, s1, c2, s2], chain-ruled by
+                // `transform_xc_inner` to per-spin (ρ_s, ∇ρ_s,x/y/z) variables. The
+                // total-density response variable y ∈ {ρ, ∇ρ_x, ∇ρ_y, ∇ρ_z} maps onto
+                // the same component index c = y of each spin channel.
+                let nmax = if ncomp_in == 5 { 5 } else { 1 };
+                let mut fxc_pol: Tsr = rt::zeros(([ngrids, nmax, 2, nmax, 2].f(), &device));
+                for (scale, func) in &xc_func_list_pol {
+                    let ni_i = determine_den_type(func).num_nvar();
+                    let rho_i = rho_pol.i((.., ..ni_i, ..));
+                    let xc_eff = libxc_eval_eff(func, rho_i.view(), 2, None);
+                    *&mut fxc_pol.i_mut((.., ..ni_i, .., ..ni_i)) += *scale * xc_eff[2].view();
+                }
+                // Combine along the antisymmetric spin direction:
+                // f_t[y1,y2] = ½ Σ_{s1,s2} (+1/−1) K[(y1,s1),(y2,s2)] = f↑↑ − f↑↓.
+                let dir = [1.0_f64, -1.0_f64];
+                let mut table: Tsr = rt::zeros(([ngrids, nvar, nvar].f(), &device));
+                for s1 in 0..2 {
+                    for s2 in 0..2 {
+                        let w = 0.5 * dir[s1] * dir[s2];
+                        *&mut table += &(w * fxc_pol.i((.., ..nvar, s1, ..nvar, s2)));
+                    }
+                }
+                table
             }
-            // Spin-resolved second derivatives K[g, c1, s1, c2, s2], chain-ruled by
-            // `transform_xc_inner` to per-spin (ρ_s, ∇ρ_s,x/y/z) variables. The
-            // total-density response variable y ∈ {ρ, ∇ρ_x, ∇ρ_y, ∇ρ_z} maps onto
-            // the same component index c = y of each spin channel.
-            let nmax = if ncomp_in == 5 { 5 } else { 1 };
-            let mut fxc_pol: Tsr = rt::zeros(([ngrids, nmax, 2, nmax, 2].f(), &device));
-            for (scale, func) in &xc_func_list_pol {
-                let ni_i = determine_den_type(func).num_nvar();
-                let rho_i = rho_pol.i((.., ..ni_i, ..));
-                let xc_eff = libxc_eval_eff(func, rho_i.view(), 2, None);
-                *&mut fxc_pol.i_mut((.., ..ni_i, .., ..ni_i)) += *scale * xc_eff[2].view();
-            }
-            // Combine along the antisymmetric spin direction:
-            // f_t[y1,y2] = ½ Σ_{s1,s2} (+1/−1) K[(y1,s1),(y2,s2)] = f↑↑ − f↑↓.
-            let dir = [1.0_f64, -1.0_f64];
-            let mut table: Tsr = rt::zeros(([ngrids, nvar, nvar].f(), &device));
-            for s1 in 0..2 {
-                for s2 in 0..2 {
-                    let w = 0.5 * dir[s1] * dir[s2];
-                    *&mut table += &(w * fxc_pol.i((.., ..nvar, s1, ..nvar, s2)));
+            _ => {
+                let (_, fxc_raw) = eval_vxc_fxc_from_rho(&xc_func_list, rho0_g); // [ngrids, nvar, nvar]
+                const SINGLET_FXC_FACTOR: f64 = 2.0;
+                match tddft_spin {
+                    "singlet" => SINGLET_FXC_FACTOR * fxc_raw,
+                    _ => fxc_raw, // 'R'/unpolarized response: bare kernel (factor 1)
                 }
             }
-            table
-        }
-        _ => {
-            let (_, fxc_raw) = eval_vxc_fxc_from_rho(&xc_func_list, rho0_g); // [ngrids, nvar, nvar]
-            const SINGLET_FXC_FACTOR: f64 = 2.0;
-            match tddft_spin {
-                "singlet" => SINGLET_FXC_FACTOR * fxc_raw,
-                _ => fxc_raw, // 'R'/unpolarized response: bare kernel (factor 1)
-            }
-        }
+        };
+        (rho0_r, fxc_eff_r)
     };
 
     // AO mode carries the raw `fxc_eff` kernel + NIMatmul; the weighted
     // `wfxc`/MO-projection table (FXCMatvecData) is MO-only, so `fxc: None`.
     let fxc: Option<FXCMatvecData> = None;
 
-    // ── Extract occupied/virtual MO coefficients ──
-    let eigvec = &scf.eigenvectors[0];
-    let mut c_occ = MatrixFull::new([num_basis, occ_size], 0.0);
-    for j in 0..occ_size {
-        for i in 0..num_basis {
-            c_occ[[i, j]] = eigvec[[i, start_mo + j]];
+    // ── Per-sector occupied/virtual MO coefficients ──
+    let mut c_occ_all: Vec<MatrixFull<f64>> = Vec::with_capacity(n_sec);
+    let mut c_vir_all: Vec<MatrixFull<f64>> = Vec::with_capacity(n_sec);
+    for (i_spin, sec) in sector_list.iter().enumerate() {
+        let eigvec = &scf.eigenvectors[i_spin];
+        let mut c_occ = MatrixFull::new([num_basis, sec.occ_size], 0.0);
+        for j in 0..sec.occ_size {
+            for i in 0..num_basis {
+                c_occ[[i, j]] = eigvec[[i, sec.start_mo + j]];
+            }
         }
-    }
-    let mut c_vir = MatrixFull::new([num_basis, vir_size], 0.0);
-    for j in 0..vir_size {
-        for i in 0..num_basis {
-            c_vir[[i, j]] = eigvec[[i, lumo + j]];
+        let mut c_vir = MatrixFull::new([num_basis, sec.vir_size], 0.0);
+        for j in 0..sec.vir_size {
+            for i in 0..num_basis {
+                c_vir[[i, j]] = eigvec[[i, sec.lumo + j]];
+            }
         }
+        c_occ_all.push(c_occ);
+        c_vir_all.push(c_vir);
     }
 
     // ── MO-style fxc driver: cache occ/vir MO projections on the grid ──
@@ -304,29 +364,37 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
         }
     });
     let (psi_occ, psi_occ_grad) = if matches!(fxc_driver, FxcDriver::MO | FxcDriver::SEMITRANS) {
-        let c_occ_view = c_occ.to_rstsr_view(&device);
         let deriv = if nvar == 4 { 1 } else { 0 };
-        let mut po = rt::zeros(([ngrids, occ_size].f(), &device));
-        let mut pog = if nvar == 4 {
-            Some(rt::zeros(([3, ngrids, occ_size].f(), &device)))
+        let mut po_all: Vec<Tsr> = sector_list.iter()
+            .map(|sec| rt::zeros(([ngrids, sec.occ_size].f(), &device)))
+            .collect();
+        let mut pog_all = if nvar == 4 {
+            Some(sector_list.iter()
+                .map(|sec| rt::zeros(([3, ngrids, sec.occ_size].f(), &device)))
+                .collect::<Vec<_>>())
         } else {
             None
         };
+        let c_occ_views: Vec<_> = c_occ_all.iter().map(|c| c.to_rstsr_view(&device)).collect();
         for start in (0..ngrids).step_by(ni.nbatch) {
             let end = (start + ni.nbatch).min(ngrids);
             let mut ni_batch = ni.split_batch(start, end);
             let ao = ni_batch.get_cached_ao(deriv); // [nb, nao, ncomp]
             let ao0 = ao.i((.., .., 0)); // [nb, nao]
-            // ψ[g, i] = Σ_μ ao[g, μ] C[μ, i]  (project onto occ coefficients)
-            po.i_mut((start..end, ..)).matmul_from(&ao0, &c_occ_view, 1.0, 0.0);
-            if let Some(pog) = (&mut pog) {
+            // ψ_s[g, i] = Σ_μ ao[g, μ] C_s[μ, i]  (project onto occ coefficients)
+            for (s, po) in po_all.iter_mut().enumerate() {
+                po.i_mut((start..end, ..)).matmul_from(&ao0, &c_occ_views[s], 1.0, 0.0);
+            }
+            if let Some(pog_all) = pog_all.as_mut() {
                 for d in 0..3 {
                     let aod = ao.i((.., .., 1 + d)); // ∂_d φ
-                    pog.i_mut((d, start..end, ..)).matmul_from(&aod, &c_occ_view, 1.0, 0.0);
+                    for (s, pog) in pog_all.iter_mut().enumerate() {
+                        pog.i_mut((d, start..end, ..)).matmul_from(&aod, &c_occ_views[s], 1.0, 0.0);
+                    }
                 }
             }
         }
-        (Some(po), pog)
+        (Some(po_all), pog_all)
     } else {
         (None, None)
     };
@@ -335,8 +403,8 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
         mode: TDDFTMode::AO,
         alpha_hybrid,
         fxc,
-        c_occ: Some(c_occ),
-        c_vir: Some(c_vir),
+        c_occ: c_occ_all,
+        c_vir: c_vir_all,
         ni: Some(ni),
         fxc_eff: Some(fxc_eff),
         den_type: Some(den_type),
@@ -348,13 +416,15 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
         ri_oo_exch: None,
         ri_vv_exch: None,
         ri_ov_exch: None,
+        reftype: scf.scftype,
     }
 }
 
 /// Build the full A matrix `[dim, dim]` directly (dense small-system path).
 ///
 /// Mode-dispatching: AO mode applies the kernel block to the identity (one
-/// batched J/K/fxc call); MO mode loops unit vectors through `a_matvec`.
+/// batched J/K/fxc call; the concatenated `[dim_a + dim_b]` space for UHF);
+/// MO mode loops unit vectors through `a_matvec`.
 pub fn build_a(scf: &SCF, data: &mut TDDFTData, xlet: char) -> MatrixFull<f64> {
     let (_start_mo, _, occ_size, vir_size, _homo, _lumo) = tddft_occupation_parameters(scf);
     let dim = occ_size * vir_size;

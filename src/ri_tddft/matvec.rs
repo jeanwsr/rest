@@ -72,6 +72,24 @@ pub fn build_hdiag(scf: &SCF) -> Vec<f64> {
     hdiag
 }
 
+/// Unrestricted counterpart of [`build_hdiag`]: per-spin gaps concatenated as
+/// `[hdiag_alpha (dim_a); hdiag_beta (dim_b)]`, matching the concatenated
+/// amplitude layout.
+pub fn build_hdiag_u(scf: &SCF) -> Vec<f64> {
+    let sectors = crate::ri_tddft::utils::tddft_occupation_parameters_u(scf);
+    let mut hdiag = Vec::new();
+    for i_spin in 0..2 {
+        let sec = &sectors[i_spin];
+        let ks = &scf.eigenvalues[i_spin];
+        for a in 0..sec.vir_size {
+            for i in 0..sec.occ_size {
+                hdiag.push(ks[sec.lumo + a] - ks[sec.start_mo + i]);
+            }
+        }
+    }
+    hdiag
+}
+
 /// A-block exchange kernel: K_A = -alpha * RI_OO^T · (RI_VV · z^T)^T
 ///
 /// Follows the same DGEMM pattern as ri_bse::matvec::w_contribution_a_block_dgemm
