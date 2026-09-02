@@ -111,14 +111,17 @@ pub fn ao_timing_report() {
 // ══════════════════════════════════════════════════════════════════
 
 /// Transition density P = C_occ · z_mat · C_virᵀ with z[i + a*occ].
+/// Dimensions are inferred from `c_occ`/`c_vir` (`nao = c_occ.rows`, `occ = c_occ.cols`, `vir = c_vir.cols`).
 pub fn transition_density(
     c_occ: &MatrixFull<f64>,
     c_vir: &MatrixFull<f64>,
     z: &[f64],
-    nao: usize,
-    occ_size: usize,
-    vir_size: usize,
 ) -> MatrixFull<f64> {
+    let nao = c_occ.size[0];
+    let occ_size = c_occ.size[1];
+    let vir_size = c_vir.size[1];
+    assert_eq!(c_vir.size[0], nao, "c_occ and c_vir must share nao");
+    assert_eq!(z.len(), occ_size * vir_size, "z length must be occ*vir");
     let z_mat = MatrixFull::from_vec([occ_size, vir_size], z.to_vec()).unwrap();
     let mut t1 = MatrixFull::new([nao, vir_size], 0.0);
     _dgemm_full(c_occ, 'N', &z_mat, 'N', &mut t1, 1.0, 0.0);
@@ -246,14 +249,17 @@ fn get_k_ao_batched(
 }
 
 /// Project an AO-basis matrix back to MO amplitudes: r[i,a] = C_occᵀ·F·C_vir.
+/// Dimensions are inferred from `c_occ`/`c_vir` (`occ = c_occ.cols`, `vir = c_vir.cols`).
 pub fn contract_back(
     f_full: &MatrixFull<f64>,
     c_occ: &MatrixFull<f64>,
     c_vir: &MatrixFull<f64>,
-    occ_size: usize,
-    vir_size: usize,
 ) -> Vec<f64> {
+    let occ_size = c_occ.size[1];
+    let vir_size = c_vir.size[1];
     let nao = f_full.size[0];
+    assert_eq!(c_occ.size[0], nao, "c_occ rows must match F rows");
+    assert_eq!(c_vir.size[0], nao, "c_vir rows must match F rows");
     let mut tmp = MatrixFull::new([occ_size, nao], 0.0);
     _dgemm_full(c_occ, 'T', f_full, 'N', &mut tmp, 1.0, 0.0);
     let mut r = MatrixFull::new([occ_size, vir_size], 0.0);
@@ -858,7 +864,7 @@ fn ao_kernel_block(
                     return MatrixFull::new([nao, nao], 0.0);
                 }
                 let z: Vec<f64> = (0..occ * vir).map(|r| z_sec[[r, s]]).collect();
-                transition_density(c_o, c_v, &z, nao, occ, vir)
+                transition_density(c_o, c_v, &z)
             })
             .collect()
     };
@@ -967,7 +973,7 @@ fn ao_kernel_block(
                     f_total.data[idx] += fb.data[base + idx];
                 }
             }
-            let kernel_mo = contract_back(&f_total, &ao_data.c_occ[i_sec], &ao_data.c_vir[i_sec], occ, vir);
+            let kernel_mo = contract_back(&f_total, &ao_data.c_occ[i_sec], &ao_data.c_vir[i_sec]);
             for r in 0..dim {
                 result[[row0 + r, s]] += kernel_mo[r];
             }
@@ -985,8 +991,6 @@ fn ao_kernel_block(
                         &k_col,
                         &ao_data.c_vir[i_sec],
                         &ao_data.c_occ[i_sec],
-                        vir,
-                        occ,
                     );
                     for a in 0..vir {
                         for i in 0..occ {

@@ -498,14 +498,15 @@ pub fn get_vk_ri_incore_dm_lowrank(
     let nsv = s.shape()[0];
 
     // ── Step 2: truncate to the singular values above svd_tol·σ_max ──
-    let s_data: Vec<f64> = s.iter().copied().collect();
-    let s_max = s_data.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+    let s_max: f64 = s.view().abs().max_all();
     let k = if svd_tol <= 0.0 || s_max <= 0.0 {
         nsv
     } else {
-        s_data.iter().take_while(|&&s_i| s_i >= svd_tol * s_max).count()
+        let thr = svd_tol * s_max;
+        // s is sorted descending from svd, so count of s_i >= thr equals k
+        s.view().greater_equal(thr).sum_all() as usize
     }.max(1);
-    debug!("lowrank exchange: z [{occ}x{vir}] nsv={nsv} k={k} svd_tol={svd_tol} s1={:.3e} smax={:.3e}", s_data.first().copied().unwrap_or(0.0), s_max);
+    debug!("lowrank exchange: z [{occ}x{vir}] nsv={nsv} k={k} svd_tol={svd_tol} s1={:.3e} smax={:.3e}", s[[0]], s_max);
 
     // ── Step 3: rank-k factors C_left = C_occ·U_k, C_right = C_vir·V_kᵀ ──
     let u_k = u.i((.., ..k));
@@ -541,11 +542,8 @@ pub fn get_vk_ri_incore_dm_lowrank(
             k_q_mut.assign(&k_q);
         });
 
-        // accumulate batch into K (serial, cheap)
-        for p in 0..nbatch {
-            let k_q = k_batch.i((.., .., p));
-            *&mut ks.i_mut((.., ..)) += &k_q;
-        }
+        // accumulate batch into K: sum over aux-batch axis
+        *&mut ks.i_mut((.., ..)) += &k_batch.sum_axes(-1);
     });
     ks
 }
