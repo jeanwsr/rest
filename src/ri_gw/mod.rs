@@ -1064,13 +1064,18 @@ pub fn response_matrix_legacy(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,
         diag[n]=if part=='I'{-2.0*energy_gap/(energy_gap.powf(2.0)+omega.powf(2.0))}
             else{-2.0*energy_gap/(energy_gap.powf(2.0)-omega.powf(2.0))};
     });
+    // The closure runs under Rayon and calls BLAS (_dgemv). Pin OpenMP to 1
+    // inside each Rayon task so threaded BLAS does not oversubscribe the CPU.
+    let saved_omp = omp_get_num_threads_wrapper();
     let mut chi_as_vecs:Vec<(usize,Vec<f64>)>=ri_ov.iter_columns_full().enumerate().par_bridge().map(|(p,ri_p)|{
+        omp_set_num_threads_wrapper(1);
         let mut work_vec=vec![0.0;occ_size*vir_size];
         (0..occ_size*vir_size).for_each(|ia|work_vec[ia]=ri_p[ia]*diag[ia]);
         let mut chi_p=vec![0.0;num_auxbas];
         _dgemv(ri_ov,&work_vec,&mut chi_p,'T', 1.0, 0.0, 1, 1);
         (p,chi_p.clone())
     }).collect();
+    omp_set_num_threads_wrapper(saved_omp);
     chi_as_vecs.sort_by_key(|(i, _)| *i);
     for chi_p in chi_as_vecs {
         response.push_column(&chi_p.1);
@@ -1193,8 +1198,13 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
     let fermi_energy=(quasiparticle_energies_g[occ_size-1]+quasiparticle_energies_g[occ_size])/2.0;
     let sign=if omega>fermi_energy{1}else{-1};
     let num_auxbas=ri_ov.size[0];
-    if sign==1{
+    // This function uses Rayon over poles and each task calls response_matrix /
+    // inverse_dielectric_matrix / _dgemv, all of which can enter BLAS/LAPACK.
+    // Keep OpenMP at 1 inside every Rayon task to avoid nested BLAS threading.
+    let saved_omp = omp_get_num_threads_wrapper();
+    let result = if sign==1{
         (0..vir_size).into_par_iter().map(|a|{
+            omp_set_num_threads_wrapper(1);
             let mut residue=0.0;
             let de=omega-quasiparticle_energies_g[occ_size+a];
             if de>-res_tol{
@@ -1211,6 +1221,7 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
         }).sum()
     }else{
         (0..occ_size).into_par_iter().map(|i|{
+            omp_set_num_threads_wrapper(1);
             let mut residue=0.0;
             let de=quasiparticle_energies_g[i]-omega;
             if de>-res_tol{
@@ -1225,7 +1236,9 @@ pub fn contour_rayon(omega:f64,n:usize,quasiparticle_energies_g:&Vec<f64>,quasip
             residue*=(sign as f64);
             residue
         }).sum()
-    }
+    };
+    omp_set_num_threads_wrapper(saved_omp);
+    result
 }
 pub fn newton_solver<F>(mut f:F,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_row_n:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,num_state:usize,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,starting_point:f64,tol:f64,max_iter:usize,side:f64,printlevel:usize)->f64 where F:Fn(f64,usize,f64,&MatrixFull<f64>,&MatrixFull<f64>,&Vec<f64>,&Vec<f64>,usize,usize,usize,&Vec<(f64,f64,MatrixFull<f64>)>)->f64,{
     let h =0.000001;
@@ -1358,8 +1371,12 @@ pub fn contour_rayon_spin(
     let sign = if omega > fermi_energy { 1.0_f64 } else { -1.0_f64 };
     let num_auxbas = ri_ov[0].size[0];
     let (global_homo, global_lumo) = molgw_global_homo_lumo(scf_data);
-    if sign > 0.0 {
+    // Rayon tasks below call BLAS/LAPACK through response_matrix_total and
+    // _dgemv; pin OpenMP to 1 inside each task to prevent thread oversubscription.
+    let saved_omp = omp_get_num_threads_wrapper();
+    let result = if sign > 0.0 {
         ((global_homo + 1)..occ_params[spin].num_state).into_par_iter().map(|a_global|{
+            omp_set_num_threads_wrapper(1);
             let a_col = a_global - op.start_mo;
             let mut residue = 0.0;
             let de = omega - quasiparticle_energies_g[a_global];
@@ -1376,6 +1393,7 @@ pub fn contour_rayon_spin(
         }).sum()
     } else {
         (op.start_mo..global_lumo).into_par_iter().map(|i_global|{
+            omp_set_num_threads_wrapper(1);
             let i_col = i_global - op.start_mo;
             let mut residue = 0.0;
             let de = quasiparticle_energies_g[i_global] - omega;
@@ -1390,7 +1408,9 @@ pub fn contour_rayon_spin(
             }
             residue * sign
         }).sum()
-    }
+    };
+    omp_set_num_threads_wrapper(saved_omp);
+    result
 }
 
 pub fn quasiparticle_equation_spin(

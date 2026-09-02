@@ -255,14 +255,21 @@ pub fn compute_fxc_response_ao_cached(
     let _t_fxc = std::time::Instant::now();
     let nao = cache.nao;
     let nvar = cache.nvar;
+    let saved_omp = omp_get_num_threads_wrapper();
 
     let vmat = cache.blocks.par_iter()
-        .map(|block| compute_fxc_response_block(block, dm1, nao, nvar))
+        .map(|block| {
+            // The per-block helper also sets OMP=1; doing it at the closure
+            // boundary makes the Rayon+BLAS contract explicit and local.
+            omp_set_num_threads_wrapper(1);
+            compute_fxc_response_block(block, dm1, nao, nvar)
+        })
         .reduce(|| MatrixFull::new([nao, nao], 0.0), |mut a, b| {
             a += b.clone();
             a
         });
 
+    omp_set_num_threads_wrapper(saved_omp);
     FXC_TIMING_NS.fetch_add(_t_fxc.elapsed().as_nanos() as u64, AOrdering::Relaxed);
     vmat
 }
@@ -292,9 +299,13 @@ pub fn compute_fxc_response_ao_cached_batched(
     // Each parallel task processes one block, returning a flat Vec<f64> of
     // length n_rhs*nao*nao (one partial response per RHS, concatenated).
     // Reduce sums across blocks element-wise.
+    let saved_omp = omp_get_num_threads_wrapper();
     let summed: Vec<f64> = cache.blocks
         .par_iter()
         .map(|block| {
+            // The per-block helper also sets OMP=1; doing it at the closure
+            // boundary makes the Rayon+BLAS contract explicit and local.
+            omp_set_num_threads_wrapper(1);
             let mut flat = vec![0.0; n_rhs * nao * nao];
             for i in 0..n_rhs {
                 let v_partial = compute_fxc_response_block(block, &dms[i], nao, nvar);
@@ -310,6 +321,7 @@ pub fn compute_fxc_response_ao_cached_batched(
                 acc
             },
         );
+    omp_set_num_threads_wrapper(saved_omp);
 
     // Unflatten into Vec<MatrixFull>.
     let mut results = Vec::with_capacity(n_rhs);
@@ -515,11 +527,13 @@ impl KLowRankPrecompute {
         // final batched buffers — peak build RSS ≈ k_p+n_p+m_p+l_p (0.9 GB)
         // + one chunk (0.13 GB) instead of 1.8 GB.
         const CHUNK: usize = 128;
+        let saved_omp = omp_get_num_threads_wrapper();
         for p_lo in (0..naux).step_by(CHUNK) {
             let p_hi = (p_lo + CHUNK).min(naux);
             let cols_chunk: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> = (p_lo..p_hi)
                 .into_par_iter()
                 .map(|p| {
+                    omp_set_num_threads_wrapper(1);
                     let mut b = vec![0.0; nao * nao];
                     match &src {
                         Src::Rim(ri, num_baspair) => {
@@ -579,6 +593,7 @@ impl KLowRankPrecompute {
             }
             drop(cols_chunk);
         }
+        omp_set_num_threads_wrapper(saved_omp);
         Some(KLowRankPrecompute {
             nocc, nvir, naux,
             k_batch: MatrixFull::from_vec([nocc * naux, nvir], k_p).unwrap(),
