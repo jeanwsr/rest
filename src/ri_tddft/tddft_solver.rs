@@ -14,9 +14,9 @@ use crate::scf_io::SCF;
 use crate::ri_bse::{dipoles, pysoc_export};
 use crate::solvers::davidson as davidson_solver;
 use crate::solvers::davidson::DavidsonConfig;
-use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data, set_fxc_use_optimized};
-use crate::ri_tddft::matvec::{self, a_matvec, b_matvec};
-use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_get_submatrix, compute_tddft_dipole_matrix};
+use crate::dft::num_int::{FXCMatvecData, FXCMatvecDataUnrestricted, prepare_fxc_data, prepare_fxc_data_unrestricted, set_fxc_use_optimized};
+use crate::ri_tddft::matvec::{self, a_matvec, a_matvec_unrestricted, b_matvec, b_matvec_unrestricted};
+use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_occupation_parameters_spin, tddft_get_submatrix, tddft_get_submatrix_spin, compute_tddft_dipole_matrix, compute_tddft_dipole_matrix_unrestricted};
 use crate::ri_tddft::feast_solver;
 
 /// Main TDDFT entry point
@@ -40,6 +40,11 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
 
     // Enable optimised (rayon-parallel) fxc kernel if requested
     set_fxc_use_optimized(tddft_ctrl.tddft_use_optimized_fxc);
+
+    // Unrestricted (spin-polarised) reference: route to the spin-resolved solver.
+    if scf.mol.spin_channel == 2 {
+        return tddft_main_unrestricted(scf, &tddft_ctrl, is_tda);
+    }
 
     // ═══ Step 2: Get orbital dimensions ═══
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
@@ -176,6 +181,365 @@ TDDFT (both spins) calculation completed successfully.");
         Ok(TddftOutput { energies, osc })
     }
 }
+
+/// Unrestricted TDDFT main solver.
+///
+/// Uses the spin-resolved α/β occupied-virtual spaces and the unrestricted
+/// A/B matrix-vector products.  When `tddft_spin == "both"`, it first solves
+/// the “singlet-like” (Coulomb included) mode, then the “triplet-like”
+/// (Coulomb omitted) mode, mirroring the existing unrestricted BSE path.
+fn tddft_main_unrestricted(
+    scf: &mut SCF,
+    tddft_ctrl: &crate::ctrl_io::tddft_parameters::TDDFTParameters,
+    is_tda: bool,
+) -> Result<TddftOutput, String> {
+    let nroots = tddft_ctrl.nroots.max(1);
+    let tddft_spin = tddft_ctrl.tddft_spin.clone();
+
+    // ── Per-spin orbital windows ──
+    let p0 = tddft_occupation_parameters_spin(scf, 0);
+    let p1 = tddft_occupation_parameters_spin(scf, 1);
+    let params = [p0, p1];
+    let occ_sizes = [params[0].2, params[1].2];
+    let vir_sizes = [params[0].3, params[1].3];
+    let n0 = occ_sizes[0] * vir_sizes[0];
+    let n1 = occ_sizes[1] * vir_sizes[1];
+    let total_dim = n0 + n1;
+    if total_dim == 0 {
+        return Err("No occupied-virtual excitation space for unrestricted TDDFT".to_string());
+    }
+
+    if scf.mol.ctrl.print_level > 1 {
+        println!(
+            "  TDDFT unrestricted windows: alpha occ={} vir={}, beta occ={} vir={}",
+            occ_sizes[0], vir_sizes[0], occ_sizes[1], vir_sizes[1]
+        );
+    }
+
+    // ── fxc / RI data ──
+    let fxc_data = prepare_fxc_data_unrestricted(scf);
+    let alpha_hybrid = fxc_data.alpha_hybrid;
+
+    println!("Obtaining unrestricted RI integrals...");
+    let mut ri_ov: [MatrixFull<f64>; 2] = [
+        MatrixFull::new([0, 0], 0.0),
+        MatrixFull::new([0, 0], 0.0),
+    ];
+    let mut ri_oo_exch: [MatrixFull<f64>; 2] = [
+        MatrixFull::new([0, 0], 0.0),
+        MatrixFull::new([0, 0], 0.0),
+    ];
+    let mut ri_vv_exch: [MatrixFull<f64>; 2] = [
+        MatrixFull::new([0, 0], 0.0),
+        MatrixFull::new([0, 0], 0.0),
+    ];
+    let mut ri_ov_exch: [MatrixFull<f64>; 2] = [
+        MatrixFull::new([0, 0], 0.0),
+        MatrixFull::new([0, 0], 0.0),
+    ];
+
+    for s in 0..2 {
+        if occ_sizes[s] == 0 || vir_sizes[s] == 0 {
+            continue;
+        }
+        let (start_mo, num_state, occ_size, vir_size, homo, lumo) = params[s];
+        let ov = tddft_get_submatrix_spin(
+            scf, 'O', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state, s,
+        );
+        let oo = tddft_get_submatrix_spin(
+            scf, 'O', 'O', start_mo, occ_size, vir_size, homo, lumo, num_state, s,
+        );
+        let vv = tddft_get_submatrix_spin(
+            scf, 'V', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state, s,
+        );
+        let num_auxbas = ov.size[0];
+
+        let mut oo_exch = oo.clone();
+        oo_exch.reshape([num_auxbas * occ_size, occ_size]);
+        oo_exch = oo_exch.transpose_and_drop();
+        oo_exch.reshape([occ_size * num_auxbas, occ_size]);
+
+        let mut vv_exch = vv.clone();
+        vv_exch.reshape([num_auxbas * vir_size, vir_size]);
+
+        let mut ov_exch = ov.clone();
+        ov_exch.reshape([num_auxbas * occ_size, vir_size]);
+
+        ri_ov[s] = ov;
+        ri_oo_exch[s] = oo_exch;
+        ri_vv_exch[s] = vv_exch;
+        ri_ov_exch[s] = ov_exch;
+    }
+
+    // ── Diagonal preconditioner (concatenated α;β) ──
+    let mut hdiag = Vec::with_capacity(total_dim);
+    for s in 0..2 {
+        let (start_mo, _num_state, occ_size, vir_size, _homo, lumo) = params[s];
+        let ks = &scf.eigenvalues[s];
+        for a in 0..vir_sizes[s] {
+            for i in 0..occ_sizes[s] {
+                hdiag.push(ks[lumo + a] - ks[start_mo + i]);
+            }
+        }
+    }
+    println!("Diagonal preconditioner built, total dim = {}", total_dim);
+
+    // ── Davidson config ──
+    let init_nroots = nroots.min(total_dim);
+    let initial_guess = davidson_solver::generate_initial_guess(&hdiag, init_nroots);
+    let max_iter = tddft_ctrl.davidson_max_iter.max(10);
+    let mut max_subspace = (nroots * 4).max(tddft_ctrl.davidson_max_subspace).min(total_dim);
+    let add_dim = nroots.min(tddft_ctrl.davidson_max_subspace).max(2)
+        .min((total_dim / 2).max(nroots));
+    max_subspace = max_subspace.max(add_dim + 1).min(total_dim);
+    let davidson_cfg = DavidsonConfig {
+        max_subspace,
+        add_dim,
+        restart_dim: nroots.max(2),
+        max_iter,
+        tol: tddft_ctrl.davidson_tol.max(1e-12),
+        ..Default::default()
+    };
+
+    // ── Decide modes ──
+    let modes: Vec<(&str, bool)> = if tddft_spin == "both" {
+        vec![("singlet", true), ("triplet", false)]
+    } else if tddft_spin == "triplet" {
+        vec![("triplet", false)]
+    } else {
+        // "singlet", "unrestricted", or any non-triplet label uses the full
+        // Coulomb-coupled unrestricted TDDFT matrix, which is what PySCF's
+        // UKS TDDFT computes.
+        vec![("unrestricted", true)]
+    };
+
+    let mut energies_all: Vec<f64> = Vec::new();
+    let mut osc_all: Vec<f64> = Vec::new();
+    let mut eigenpairs_all: Vec<(f64, Vec<f64>)> = Vec::new();
+
+    for (mode, with_hartree) in modes {
+        println!(
+            "\n=== Unrestricted TDDFT Calculation ({}, TDA={}) ===",
+            mode, is_tda
+        );
+        let (eigenpairs, energies, osc) = solve_tddft_single_spin_unrestricted(
+            scf,
+            &fxc_data,
+            &ri_ov,
+            &ri_oo_exch,
+            &ri_vv_exch,
+            &ri_ov_exch,
+            &hdiag,
+            &initial_guess,
+            &davidson_cfg,
+            nroots,
+            total_dim,
+            is_tda,
+            with_hartree,
+            alpha_hybrid,
+            tddft_ctrl,
+            params,
+        );
+        eigenpairs_all.extend(eigenpairs);
+        energies_all.extend(energies);
+        osc_all.extend(osc);
+    }
+
+    // For a single mode return that mode's first energy; for "both", the first
+    // singlet-like root is the first element.
+    if let Some(first) = energies_all.first() {
+        println!("The first unrestricted TDDFT excitation is {}", first);
+    }
+
+    Ok(TddftOutput {
+        energies: energies_all,
+        osc: osc_all,
+    })
+}
+
+/// Solve an unrestricted TDDFT spin mode (Coulomb included or omitted).
+#[allow(clippy::too_many_arguments)]
+fn solve_tddft_single_spin_unrestricted(
+    scf: &SCF,
+    fxc_data: &FXCMatvecDataUnrestricted,
+    ri_ov: &[MatrixFull<f64>; 2],
+    ri_oo_exch: &[MatrixFull<f64>; 2],
+    ri_vv_exch: &[MatrixFull<f64>; 2],
+    ri_ov_exch: &[MatrixFull<f64>; 2],
+    hdiag: &Vec<f64>,
+    initial_guess: &MatrixFull<f64>,
+    davidson_cfg: &DavidsonConfig,
+    nroots: usize,
+    dim: usize,
+    is_tda: bool,
+    with_hartree: bool,
+    alpha_hybrid: f64,
+    tddft_ctrl: &crate::ctrl_io::tddft_parameters::TDDFTParameters,
+    params: [(usize, usize, usize, usize, usize, usize); 2],
+) -> (Vec<(f64, Vec<f64>)>, Vec<f64>, Vec<f64>) {
+    // For simplicity, unrestricted TDDFT uses the iterative Davidson solver.
+    // TDA and full LR both operate on the concatenated α/β vector.
+    let eigenpairs = if tddft_ctrl.tddft_feast_solver {
+        // FEAST for unrestricted TDDFT is not implemented yet; fall back to
+        // Davidson with a warning instead of silently producing wrong results.
+        eprintln!("Warning: FEAST solver for unrestricted TDDFT is not implemented; using Davidson.");
+        if is_tda {
+            davidson_solver::tda_davidson_solver(
+                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, z, with_hartree, alpha_hybrid),
+                nroots,
+                hdiag,
+                initial_guess.clone(),
+                davidson_cfg,
+            )
+        } else {
+            davidson_solver::lr_davidson_solver(
+                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, z, with_hartree, alpha_hybrid),
+                |z: &Vec<f64>| b_matvec_unrestricted(scf, fxc_data, ri_ov, ri_ov_exch, z, with_hartree, alpha_hybrid),
+                nroots,
+                hdiag,
+                initial_guess.clone(),
+                davidson_cfg,
+            )
+        }
+    } else if dim <= 15 && is_tda {
+        // Small TDA: exact dense diagonalisation is robust.
+        let mut a_mat = vec![0.0; dim * dim];
+        for col in 0..dim {
+            let mut e_col = vec![0.0; dim];
+            e_col[col] = 1.0;
+            let a_col = a_matvec_unrestricted(
+                scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, &e_col, with_hartree, alpha_hybrid,
+            );
+            for row in 0..dim {
+                a_mat[row + col * dim] = a_col[row];
+            }
+        }
+        let a = MatrixFull::from_vec([dim, dim], a_mat).unwrap();
+        let (eigvecs_opt, eigvals, _info) = rest_tensors::matrix::matrix_blas_lapack::_dsyev(&a, 'V');
+        let eigvecs = eigvecs_opt.expect("dsyev failed");
+        let mut pairs: Vec<(f64, Vec<f64>)> = eigvals.iter()
+            .zip(eigvecs.iter_columns_full())
+            .map(|(e, v)| (*e, v.to_vec()))
+            .collect();
+        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        pairs.truncate(nroots.min(dim));
+        pairs
+    } else if !is_tda && dim <= 80 {
+        // Small/medium full LR: build the explicit non-Hermitian matrix
+        // [A  B; -B -A] and diagonalise it.  This avoids slow or oscillating
+        // Davidson iterations for small unrestricted systems.
+        println!("Building unrestricted full LR matrix ({} x {})...", 2 * dim, 2 * dim);
+        let mut a_mat = vec![0.0; dim * dim];
+        let mut b_mat = vec![0.0; dim * dim];
+        for col in 0..dim {
+            let mut e_col = vec![0.0; dim];
+            e_col[col] = 1.0;
+            let a_col = a_matvec_unrestricted(
+                scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, &e_col, with_hartree, alpha_hybrid,
+            );
+            let b_col = b_matvec_unrestricted(
+                scf, fxc_data, ri_ov, ri_ov_exch, &e_col, with_hartree, alpha_hybrid,
+            );
+            for row in 0..dim {
+                a_mat[row + col * dim] = a_col[row];
+                b_mat[row + col * dim] = b_col[row];
+            }
+        }
+        let n2 = 2 * dim;
+        let mut h = MatrixFull::new([n2, n2], 0.0);
+        for j in 0..dim {
+            for i in 0..dim {
+                let av = a_mat[i + j * dim];
+                let bv = b_mat[i + j * dim];
+                h[[i, j]] = av;
+                h[[dim + i, j]] = -bv;
+                h[[i, dim + j]] = bv;
+                h[[dim + i, dim + j]] = -av;
+            }
+        }
+        let (_, wr, wi, _vl, vr, _info) =
+            rest_tensors::matrix::matrix_blas_lapack::_dgeev(&h, 'N', 'V');
+        let mut pairs: Vec<(f64, Vec<f64>)> = wr.iter()
+            .zip(wi.iter().zip(vr.iter_columns_full()))
+            .filter(|(wr_i, (wi_i, _))| **wr_i > 1e-8 && wi_i.abs() < 1e-6)
+            .map(|(wr_i, (_, v))| (*wr_i, v.to_vec()))
+            .collect();
+        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        pairs.truncate(nroots.min(dim));
+        pairs
+    } else {
+        if is_tda {
+            println!("Solving unrestricted TDA eigenvalue problem...");
+            davidson_solver::tda_davidson_solver(
+                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, z, with_hartree, alpha_hybrid),
+                nroots,
+                hdiag,
+                initial_guess.clone(),
+                davidson_cfg,
+            )
+        } else {
+            println!("Solving unrestricted full linear response eigenvalue problem...");
+            davidson_solver::lr_davidson_solver(
+                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, z, with_hartree, alpha_hybrid),
+                |z: &Vec<f64>| b_matvec_unrestricted(scf, fxc_data, ri_ov, ri_ov_exch, z, with_hartree, alpha_hybrid),
+                nroots,
+                hdiag,
+                initial_guess.clone(),
+                davidson_cfg,
+            )
+        }
+    };
+
+    // Print results.
+    let n_print = eigenpairs.len().min(30);
+    let start_mo = [params[0].0, params[1].0];
+    let occ_size = [params[0].2, params[1].2];
+    let vir_size = [params[0].3, params[1].3];
+    let lumo = [params[0].5, params[1].5];
+    let dipole_matrix = compute_tddft_dipole_matrix_unrestricted(scf, start_mo, occ_size, vir_size, lumo);
+    let spin_label = if with_hartree { "unrestricted/singlet-like" } else { "triplet-like" };
+    println!("\nFirst {} {} Excitations:", n_print.min(eigenpairs.len()), spin_label);
+
+    let mut td_energies: Vec<f64> = Vec::new();
+    let mut td_osc: Vec<f64> = Vec::new();
+    for (n, (energy, vector)) in eigenpairs[..n_print].iter().enumerate() {
+        let vec_norm: f64 = vector.iter().map(|x| x * x).sum::<f64>().sqrt();
+        println!("#{} Excitation energy={}, norm={:.6}", n, energy, vec_norm);
+
+        let norm_vec = dipoles::normalize(vector, is_tda);
+        let dipole_sq = dipoles::transition_dipole_square(&dipole_matrix, &norm_vec, is_tda);
+        let osc_strength = dipole_sq * energy * 2.0 / 3.0;
+        td_energies.push(*energy);
+        td_osc.push(osc_strength);
+        println!("\tTransition Dipole Square:{}; Oscillator Strength:{}", dipole_sq, osc_strength);
+
+        let mut components: Vec<(usize, usize, usize, f64)> = norm_vec.iter()
+            .enumerate()
+            .map(|(idx, &val)| {
+                if idx < params[0].2 * params[0].3 {
+                    let i = idx % params[0].2;
+                    let a = idx / params[0].2;
+                    (0, i, a, val)
+                } else {
+                    let j = idx - params[0].2 * params[0].3;
+                    let i = j % params[1].2;
+                    let a = j / params[1].2;
+                    (1, i, a, val)
+                }
+            })
+            .collect();
+        components.sort_by(|a, b| b.3.abs().partial_cmp(&a.3.abs()).unwrap());
+        for (k, (spin, i, a, val)) in components.iter().enumerate() {
+            if k < 5 {
+                let spin_name = if *spin == 0 { "α" } else { "β" };
+                println!("      spin {} #{}->#{}, amplitude={}", spin_name, start_mo[*spin] + i, lumo[*spin] + a, val);
+            }
+        }
+    }
+
+    (eigenpairs, td_energies, td_osc)
+}
+
 /// Solve TDDFT eigenvalue problem for a single spin channel.
 ///
 /// Encapsulates the full-diag / Davidson / FEAST dispatch and result printing.

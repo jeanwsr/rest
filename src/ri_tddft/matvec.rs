@@ -18,7 +18,7 @@ use rest_tensors::MatrixFull;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, _dgemv};
 use crate::scf_io::SCF;
 use crate::ri_bse;
-use crate::dft::num_int::{FXCMatvecData, fxc_matvec};
+use crate::dft::num_int::{FXCMatvecData, FXCMatvecDataUnrestricted, fxc_matvec, fxc_matvec_unrestricted};
 use crate::ri_tddft::utils::tddft_occupation_parameters;
 
 /// Build the diagonal preconditioner from KS orbital energy differences
@@ -246,6 +246,178 @@ pub fn b_matvec(
     let fxc = fxc_matvec(fxc_data, z);
     for idx in 0..dim {
         result[idx] += fxc[idx];
+    }
+
+    result
+}
+
+
+// ============================================================================
+// Unrestricted TDDFT matrix-vector products
+// ============================================================================
+
+/// Coulomb contribution for unrestricted TDDFT from every spin channel.
+///
+/// For output spin `s`:
+///   V_s(z) = Σ_t ri_ov[s]^T (ri_ov[t] z_t)
+/// with no extra spin-degeneracy factor.
+fn unrestricted_coulomb_sum(
+    ri_ov: &[MatrixFull<f64>; 2],
+    n0: usize,
+    n1: usize,
+    occ_sizes: [usize; 2],
+    vir_sizes: [usize; 2],
+    z: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    let ns = [occ_sizes[0] * vir_sizes[0], occ_sizes[1] * vir_sizes[1]];
+    debug_assert_eq!(z.len(), n0 + n1);
+    let mut va = vec![0.0; ns[0]];
+    let mut vb = vec![0.0; ns[1]];
+
+    if ns[0] > 0 {
+        let z0 = z[..n0].to_vec();
+        let z1 = z[n0..].to_vec();
+        let v00 = ri_bse::matvec::coulomb_contribution(&ri_ov[0], &z0);
+        va.iter_mut().zip(v00).for_each(|(a, b)| *a += b);
+        if ns[1] > 0 {
+            let v01 = ri_bse::matvec::coulomb_cross_contribution(&ri_ov[0], &ri_ov[1], &z1);
+            va.iter_mut().zip(v01).for_each(|(a, b)| *a += b);
+        }
+    }
+    if ns[1] > 0 {
+        let z0 = z[..n0].to_vec();
+        let z1 = z[n0..].to_vec();
+        let v10 = ri_bse::matvec::coulomb_cross_contribution(&ri_ov[1], &ri_ov[0], &z0);
+        vb.iter_mut().zip(v10).for_each(|(a, b)| *a += b);
+        let v11 = ri_bse::matvec::coulomb_contribution(&ri_ov[1], &z1);
+        vb.iter_mut().zip(v11).for_each(|(a, b)| *a += b);
+    }
+    (va, vb)
+}
+
+/// Full unrestricted TDDFT A-block matrix-vector product.
+///
+/// The vector is the concatenation `[alpha; beta]`.  `with_hartree` controls
+/// whether the Coulomb coupling is included (the “singlet-like” unrestricted
+/// mode).  The same-spin bare exchange and the spin-resolved fxc kernel are
+/// always included.
+pub fn a_matvec_unrestricted(
+    scf: &SCF,
+    fxc_data: &FXCMatvecDataUnrestricted,
+    ri_ov: &[MatrixFull<f64>; 2],
+    ri_oo_exch: &[MatrixFull<f64>; 2],
+    ri_vv_exch: &[MatrixFull<f64>; 2],
+    z: &[f64],
+    with_hartree: bool,
+    alpha_hybrid: f64,
+) -> Vec<f64> {
+    let n0 = fxc_data.nocc[0] * fxc_data.nvir[0];
+    let n1 = fxc_data.nocc[1] * fxc_data.nvir[1];
+    assert_eq!(z.len(), n0 + n1);
+    let mut result = vec![0.0; n0 + n1];
+
+    // Per-spin diagonal, exchange and fxc.
+    let (fa, fb) = fxc_matvec_unrestricted(fxc_data, z);
+    for s in 0..2 {
+        let occ_s = fxc_data.nocc[s];
+        let vir_s = fxc_data.nvir[s];
+        let ns = occ_s * vir_s;
+        if ns == 0 { continue; }
+        let offset = if s == 0 { 0 } else { n0 };
+        let zs = &z[offset..offset + ns];
+        let mut rs = vec![0.0; ns];
+
+        let (start_mo, _num_state, _occ, _vir, _homo, lumo) =
+            crate::ri_tddft::utils::tddft_occupation_parameters_spin(scf, s);
+        let ks = &scf.eigenvalues[s];
+        for a in 0..vir_s {
+            for i in 0..occ_s {
+                let idx = i + a * occ_s;
+                rs[idx] = (ks[lumo + a] - ks[start_mo + i]) * zs[idx];
+            }
+        }
+
+        if alpha_hybrid.abs() > 1e-15 {
+            let kz = exchange_a_matvec(
+                &ri_oo_exch[s],
+                &ri_vv_exch[s],
+                zs,
+                occ_s,
+                vir_s,
+                alpha_hybrid,
+            );
+            for idx in 0..ns {
+                rs[idx] += kz[idx];
+            }
+        }
+
+        if s == 0 {
+            for idx in 0..ns { rs[idx] += fa[idx]; }
+        } else {
+            for idx in 0..ns { rs[idx] += fb[idx]; }
+        }
+        result[offset..offset + ns].copy_from_slice(&rs);
+    }
+
+    if with_hartree {
+        let (va, vb) = unrestricted_coulomb_sum(ri_ov, n0, n1, fxc_data.nocc, fxc_data.nvir, z);
+        for idx in 0..n0 { result[idx] += va[idx]; }
+        for idx in 0..n1 { result[n0 + idx] += vb[idx]; }
+    }
+
+    result
+}
+
+/// Full unrestricted TDDFT B-block matrix-vector product.
+pub fn b_matvec_unrestricted(
+    scf: &SCF,
+    fxc_data: &FXCMatvecDataUnrestricted,
+    ri_ov: &[MatrixFull<f64>; 2],
+    ri_ov_exch: &[MatrixFull<f64>; 2],
+    z: &[f64],
+    with_hartree: bool,
+    alpha_hybrid: f64,
+) -> Vec<f64> {
+    let n0 = fxc_data.nocc[0] * fxc_data.nvir[0];
+    let n1 = fxc_data.nocc[1] * fxc_data.nvir[1];
+    assert_eq!(z.len(), n0 + n1);
+    let mut result = vec![0.0; n0 + n1];
+
+    let (fa, fb) = fxc_matvec_unrestricted(fxc_data, z);
+    for s in 0..2 {
+        let occ_s = fxc_data.nocc[s];
+        let vir_s = fxc_data.nvir[s];
+        let ns = occ_s * vir_s;
+        if ns == 0 { continue; }
+        let offset = if s == 0 { 0 } else { n0 };
+        let zs = &z[offset..offset + ns];
+        let mut rs = vec![0.0; ns];
+
+        if alpha_hybrid.abs() > 1e-15 {
+            let kz = exchange_b_matvec(
+                &ri_ov_exch[s],
+                zs,
+                occ_s,
+                vir_s,
+                alpha_hybrid,
+            );
+            for idx in 0..ns {
+                rs[idx] += kz[idx];
+            }
+        }
+
+        if s == 0 {
+            for idx in 0..ns { rs[idx] += fa[idx]; }
+        } else {
+            for idx in 0..ns { rs[idx] += fb[idx]; }
+        }
+        result[offset..offset + ns].copy_from_slice(&rs);
+    }
+
+    if with_hartree {
+        let (va, vb) = unrestricted_coulomb_sum(ri_ov, n0, n1, fxc_data.nocc, fxc_data.nvir, z);
+        for idx in 0..n0 { result[idx] += va[idx]; }
+        for idx in 0..n1 { result[n0 + idx] += vb[idx]; }
     }
 
     result

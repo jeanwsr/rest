@@ -28,17 +28,11 @@ pub fn tddft_occupation_parameters(scf: &SCF) -> (usize, usize, usize, usize, us
         homo = homo.max(i_homo);
         lumo = lumo.min(i_lumo);
     }
-    // Auto-detect frozen core: freeze orbitals with very negative eigenvalues
-    // (deep core 1s, 2s of heavy atoms) which should not participate in
-    // low-energy TDDFT excitations.
-    let ks = &scf.eigenvalues[0];
-    const FROZEN_CORE_THRESHOLD: f64 = -2.0; // Ha — well below valence orbitals
-    let start_mo = (scf.mol.start_mo..=homo)
-        .take_while(|&i| ks[i] < FROZEN_CORE_THRESHOLD)
-        .last()
-        .map(|i| i + 1)
-        .unwrap_or(scf.mol.start_mo);
+    // Do not freeze core orbitals automatically.  PySCF's TDDFT also uses all
+    // occupied orbitals by default, so this keeps the active spaces identical.
+    let start_mo = scf.mol.start_mo;
     let occ_size = homo - start_mo + 1;
+    let ks = &scf.eigenvalues[0];
     // Apply virtual orbital energy cutoff (mirrors BSE's get_occupation_parameters)
     if cutoff < 1.0e5 {
         num_state = ks.iter().filter(|x| **x < cutoff).count();
@@ -50,6 +44,41 @@ pub fn tddft_occupation_parameters(scf: &SCF) -> (usize, usize, usize, usize, us
     (start_mo, num_state, occ_size, vir_size, homo, lumo)
 }
 
+
+/// Get TDDFT orbital parameters for one spin channel (unrestricted).
+///
+/// Same meaning as [`tddft_occupation_parameters`], but uses the spin-resolved
+/// eigenvalues, occupation windows and cutoff.
+pub fn tddft_occupation_parameters_spin(
+    scf: &SCF,
+    spin: usize,
+) -> (usize, usize, usize, usize, usize, usize) {
+    let cutoff = scf.mol.ctrl.tddft.as_ref()
+        .map(|c| c.tddft_cutoff_energy)
+        .unwrap_or(1.0e6);
+    let mut num_state = scf.mol.num_state;
+    let homo = scf.homo[spin];
+    let lumo = scf.lumo[spin].min(num_state);
+    let ks = &scf.eigenvalues[spin];
+
+    // Do not freeze core orbitals automatically; keep all occupied orbitals to
+    // match PySCF's default no-frozen TDDFT.
+    let start_mo = scf.mol.start_mo;
+
+    // If there are no occupied orbitals in this spin channel, occ_size is zero.
+    let occ_size = (start_mo..=homo)
+        .filter(|&i| scf.occupation[spin].get(i).map(|&x| x > 1.0e-6).unwrap_or(false))
+        .count();
+
+    if cutoff < 1.0e5 {
+        num_state = ks.iter().filter(|x| **x < cutoff).count();
+        if num_state < homo + 1 {
+            num_state = homo + 1;
+        }
+    }
+    let vir_size = num_state.saturating_sub(lumo);
+    (start_mo, num_state, occ_size, vir_size, homo, lumo)
+}
 /// Get RI submatrix for TDDFT (no quasiparticle_methods dependency)
 ///
 /// Directly calls generate_ri3mo_rayon_for_multiple_times with the appropriate
@@ -88,6 +117,54 @@ pub fn tddft_get_submatrix(
     matrix
 }
 
+
+/// Get a spin-resolved RI submatrix for unrestricted TDDFT.
+///
+/// The MO range arguments belong to one spin channel.  For an unrestricted
+/// SCF, `generate_ri3mo_rayon_for_multiple_times` returns one RI block per
+/// spin; this helper picks the requested one.
+pub fn tddft_get_submatrix_spin(
+    scf: &SCF,
+    choice_a: char,
+    choice_b: char,
+    start_mo: usize,
+    occ_size: usize,
+    vir_size: usize,
+    homo: usize,
+    lumo: usize,
+    num_state: usize,
+    spin: usize,
+) -> MatrixFull<f64> {
+    let range_oo = (start_mo..homo + 1, start_mo..homo + 1);
+    let range_vv = (lumo..num_state, lumo..num_state);
+    let range_ov = (start_mo..homo + 1, lumo..num_state);
+
+    let ranges = if choice_a == 'O' && choice_b == 'O' {
+        range_oo
+    } else if choice_a == 'V' && choice_b == 'V' {
+        range_vv
+    } else if choice_a == 'O' && choice_b == 'V' {
+        range_ov
+    } else {
+        panic!("tddft_get_submatrix_spin: invalid choice {}/{}", choice_a, choice_b);
+    };
+
+    let vector = scf.generate_ri3mo_rayon_for_multiple_times(ranges.0, ranges.1);
+    if spin >= vector.len() {
+        panic!(
+            "tddft_get_submatrix_spin: spin {} requested but only {} RI channels are available",
+            spin,
+            vector.len()
+        );
+    }
+    let matrix: MatrixFull<f64> = vector[spin].0.rifull_to_matfull_i_jk();
+    println!(
+        "TDDFT RI Tensor (spin {}): {}-{}, Size={:?}, naux={}",
+        spin, choice_a, choice_b, matrix.size, matrix.size[0]
+    );
+    matrix
+}
+
 /// Compute dipole moment integrals in MO basis for TDDFT
 ///
 /// Returns a matrix of shape [3, occ_size * vir_size] containing
@@ -119,5 +196,40 @@ pub fn compute_tddft_dipole_matrix(
         }
     }
 
+    dipole_matrix
+}
+
+/// Compute MO-basis transition dipoles for unrestricted TDDFT.
+///
+/// The returned matrix has shape [3, n0+n1], where n0/n1 are the alpha/beta
+/// occupied-virtual dimensions.  The column order is the same as the
+/// concatenated unrestricted TDDFT vector: all alpha pairs first, then all
+/// beta pairs.
+pub fn compute_tddft_dipole_matrix_unrestricted(
+    scf: &SCF,
+    start_mo: [usize; 2],
+    occ_size: [usize; 2],
+    vir_size: [usize; 2],
+    lumo: [usize; 2],
+) -> MatrixFull<f64> {
+    let ao_dip = crate::ri_bse::dipoles::obtain_ao_dips(scf, None);
+    let n0 = occ_size[0] * vir_size[0];
+    let n1 = occ_size[1] * vir_size[1];
+    let mut dipole_matrix = MatrixFull::new([3, n0 + n1], 0.0);
+
+    for spin in 0..2 {
+        let eigvec = &scf.eigenvectors[spin];
+        let offset = if spin == 0 { 0 } else { n0 };
+        for i in 0..occ_size[spin] {
+            for a in 0..vir_size[spin] {
+                let idx = offset + i + a * occ_size[spin];
+                let mu = crate::ri_bse::dipoles::obtain_mu_ia(
+                    eigvec, &ao_dip, start_mo[spin] + i, lumo[spin] + a);
+                for d in 0..3 {
+                    dipole_matrix[[d, idx]] = mu[d];
+                }
+            }
+        }
+    }
     dipole_matrix
 }

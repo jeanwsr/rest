@@ -818,6 +818,717 @@ fn prepare_fxc_data_impl(
     }
 }
 
+
+// ============================================================================
+// Unrestricted (spin-polarised) TDDFT fxc kernel data
+// ============================================================================
+
+/// Precomputed spin-resolved fxc kernel data for unrestricted TDDFT.
+///
+/// For each spin pair (σ,τ) we store the same per-grid layout as the
+/// restricted `FXCMatvecData.wfxc`, but **without** the restricted singlet
+/// factor 2:
+///
+/// - LDA: `wfxc_xy[g]`
+/// - GGA: `wfxc_xy[g + α*ngrids + β*nvar*ngrids]`
+///
+/// The MO data are stored separately for α and β, because unrestricted
+/// α/β occupied/virtual orbitals are different.
+pub struct FXCMatvecDataUnrestricted {
+    pub nvar: usize,
+    pub ngrids: usize,
+    pub nocc: [usize; 2],
+    pub nvir: [usize; 2],
+    pub start_mo: [usize; 2],
+    pub alpha_hybrid: f64,
+    pub mo_occ: [MatrixFull<f64>; 2],
+    pub mo_vir: [MatrixFull<f64>; 2],
+    /// GGA occupied MO gradients on grids, one [3] array per spin.
+    pub mo_occ_grad: Option<[[MatrixFull<f64>; 3]; 2]>,
+    /// GGA virtual MO gradients on grids, one [3] array per spin.
+    pub mo_vir_grad: Option<[[MatrixFull<f64>; 3]; 2]>,
+    pub wfxc_aa: Vec<f64>,
+    pub wfxc_ab: Vec<f64>,
+    pub wfxc_ba: Vec<f64>,
+    pub wfxc_bb: Vec<f64>,
+}
+
+fn extract_fxc_spin_component(
+    fxc_tensor: &Tensor<f64, DeviceBLAS>,
+    nvar: usize,
+    ngrids: usize,
+    spin_left: usize,
+    spin_right: usize,
+) -> Vec<f64> {
+    let nv2 = nvar * nvar;
+    let mut out = vec![0.0; ngrids * nv2];
+    if nvar == 1 {
+        let v = fxc_tensor.i((.., 0, spin_left, 0, spin_right)).to_vec();
+        out[..ngrids].copy_from_slice(&v);
+    } else {
+        for a in 0..nvar {
+            for b in 0..nvar {
+                let v = fxc_tensor.i((.., a, spin_left, b, spin_right)).to_vec();
+                for (g, val) in v.iter().enumerate() {
+                    out[g + a * ngrids + b * nvar * ngrids] = *val;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Prepare unrestricted fxc data from a converged UKS SCF object.
+///
+/// This is the spin-polarised counterpart of `prepare_fxc_data`.  It evaluates
+/// the full 2×2 spin kernel and stores each component separately.
+pub fn prepare_fxc_data_unrestricted(scf: &SCF) -> FXCMatvecDataUnrestricted {
+    let p0 = crate::ri_tddft::utils::tddft_occupation_parameters_spin(scf, 0);
+    let p1 = crate::ri_tddft::utils::tddft_occupation_parameters_spin(scf, 1);
+    let start_mo = [p0.0, p1.0];
+    let nocc = [p0.2, p1.2];
+    let nvir = [p0.3, p1.3];
+    let lumo = [p0.5, p1.5];
+
+    let xc_data = &scf.mol.xc_data;
+    let xc_type = if xc_data.use_density_gradient() {
+        XCType::GGA
+    } else {
+        XCType::LDA
+    };
+    let nvar = match xc_type {
+        XCType::LDA => 1,
+        XCType::GGA => 4,
+        _ => panic!("fxc only supports LDA and GGA"),
+    };
+    let alpha_hybrid = xc_data.dfa_hybrid_scf;
+
+    let grids = scf.grids.as_ref().expect("DFT grids must be initialized for fxc");
+    let ngrids = grids.weights.len();
+    let num_basis = scf.mol.num_basis;
+    let weights = &grids.weights;
+
+    let ao_owned: Option<MatrixFull<f64>>;
+    let ao: &MatrixFull<f64> = match &grids.ao {
+        Some(a) => { ao_owned = None; a }
+        None => match &grids.ao_compressed {
+            Some(c) => { ao_owned = Some(Grids::decompress_ao(c)); ao_owned.as_ref().unwrap() }
+            None => panic!("AO on grids must be tabulated (dense or compressed)"),
+        }
+    };
+
+    // MO projections for each spin.
+    let mut mo_occ = [
+        MatrixFull::new([nocc[0], ngrids], 0.0),
+        MatrixFull::new([nocc[1], ngrids], 0.0),
+    ];
+    let mut mo_vir = [
+        MatrixFull::new([nvir[0], ngrids], 0.0),
+        MatrixFull::new([nvir[1], ngrids], 0.0),
+    ];
+    let mut mo_occ_grad: Option<[[MatrixFull<f64>; 3]; 2]> = None;
+    let mut mo_vir_grad: Option<[[MatrixFull<f64>; 3]; 2]> = None;
+
+    for spin in 0..2 {
+        if nocc[spin] == 0 || nvir[spin] == 0 {
+            continue;
+        }
+        let eigvec = &scf.eigenvectors[spin];
+        let mut c_occ = MatrixFull::new([num_basis, nocc[spin]], 0.0);
+        for j in 0..nocc[spin] {
+            for i in 0..num_basis {
+                c_occ[[i, j]] = eigvec[[i, start_mo[spin] + j]];
+            }
+        }
+        let mut c_vir = MatrixFull::new([num_basis, nvir[spin]], 0.0);
+        for j in 0..nvir[spin] {
+            for i in 0..num_basis {
+                c_vir[[i, j]] = eigvec[[i, lumo[spin] + j]];
+            }
+        }
+        _dgemm_full(&c_occ, 'T', ao, 'N', &mut mo_occ[spin], 1.0, 0.0);
+        _dgemm_full(&c_vir, 'T', ao, 'N', &mut mo_vir[spin], 1.0, 0.0);
+    }
+
+    // GGA gradients.
+    if xc_type == XCType::GGA {
+        let aop_owned: Option<RIFull<f64>>;
+        let aop: &RIFull<f64> = match &grids.aop {
+            Some(a) => { aop_owned = None; a }
+            None => match &grids.aop_compressed {
+                Some(c) => { aop_owned = Some(Grids::decompress_aop(c)); aop_owned.as_ref().unwrap() }
+                None => panic!("AO gradients needed for GGA fxc (dense or compressed)"),
+            }
+        };
+        let mut og_all = [
+            [
+                MatrixFull::new([nocc[0], ngrids], 0.0),
+                MatrixFull::new([nocc[0], ngrids], 0.0),
+                MatrixFull::new([nocc[0], ngrids], 0.0),
+            ],
+            [
+                MatrixFull::new([nocc[1], ngrids], 0.0),
+                MatrixFull::new([nocc[1], ngrids], 0.0),
+                MatrixFull::new([nocc[1], ngrids], 0.0),
+            ],
+        ];
+        let mut vg_all = [
+            [
+                MatrixFull::new([nvir[0], ngrids], 0.0),
+                MatrixFull::new([nvir[0], ngrids], 0.0),
+                MatrixFull::new([nvir[0], ngrids], 0.0),
+            ],
+            [
+                MatrixFull::new([nvir[1], ngrids], 0.0),
+                MatrixFull::new([nvir[1], ngrids], 0.0),
+                MatrixFull::new([nvir[1], ngrids], 0.0),
+            ],
+        ];
+        for spin in 0..2 {
+            if nocc[spin] == 0 || nvir[spin] == 0 {
+                continue;
+            }
+            let eigvec = &scf.eigenvectors[spin];
+            let mut c_occ = MatrixFull::new([num_basis, nocc[spin]], 0.0);
+            for j in 0..nocc[spin] {
+                for i in 0..num_basis { c_occ[[i, j]] = eigvec[[i, start_mo[spin] + j]]; }
+            }
+            let mut c_vir = MatrixFull::new([num_basis, nvir[spin]], 0.0);
+            for j in 0..nvir[spin] {
+                for i in 0..num_basis { c_vir[[i, j]] = eigvec[[i, lumo[spin] + j]]; }
+            }
+            for d in 0..3 {
+                let aop_d_slice = aop.get_reducing_matrix(d).unwrap();
+                let aop_d = MatrixFull::from_vec(
+                    [num_basis, ngrids],
+                    aop_d_slice.iter().cloned().collect(),
+                ).unwrap();
+                _dgemm_full(&c_occ, 'T', &aop_d, 'N', &mut og_all[spin][d], 1.0, 0.0);
+                _dgemm_full(&c_vir, 'T', &aop_d, 'N', &mut vg_all[spin][d], 1.0, 0.0);
+            }
+        }
+        mo_occ_grad = Some(og_all);
+        mo_vir_grad = Some(vg_all);
+    }
+
+    // Ground-state alpha+beta density for fxc evaluation.
+    let ao_deriv = if xc_type == XCType::GGA { 1 } else { 0 };
+    let ao_rifull = eval_ao_batch(&scf.mol, &grids.coordinates, ao_deriv, ngrids);
+    let mo_coeffs = vec![scf.eigenvectors[0].clone(), scf.eigenvectors[1].clone()];
+    let occ = vec![scf.occupation[0].clone(), scf.occupation[1].clone()];
+    let rho_tensor = eval_rho5_batch(&ao_rifull, xc_type, &mo_coeffs, &occ, 2, ngrids);
+    let rho_array: Vec<f64> = {
+        let raw = rho_tensor.raw();
+        let offset = rho_tensor.offset();
+        raw[offset..offset + ngrids * nvar * 2].to_vec()
+    };
+
+    let func_ids = &xc_data.dfa_compnt_scf;
+    let func_factors = &xc_data.dfa_paramr_scf;
+    let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 1, &rho_array, ngrids, 2);
+    let fxc_tensor = xc_tensors[2].as_ref()
+        .expect("fxc (deriv=2) should be available for unrestricted TDDFT");
+
+    let raw_aa = extract_fxc_spin_component(fxc_tensor, nvar, ngrids, 0, 0);
+    let raw_ab = extract_fxc_spin_component(fxc_tensor, nvar, ngrids, 0, 1);
+    let raw_ba = extract_fxc_spin_component(fxc_tensor, nvar, ngrids, 1, 0);
+    let raw_bb = extract_fxc_spin_component(fxc_tensor, nvar, ngrids, 1, 1);
+
+    let multiply_weight = |raw: &[f64]| -> Vec<f64> {
+        if nvar == 1 {
+            (0..ngrids).map(|g| raw[g] * weights[g]).collect()
+        } else {
+            let nv2 = nvar * nvar;
+            let mut out = vec![0.0; ngrids * nv2];
+            for g in 0..ngrids {
+                let w = weights[g];
+                for k in 0..nv2 {
+                    out[g + k * ngrids] = raw[g + k * ngrids] * w;
+                }
+            }
+            out
+        }
+    };
+
+    let wfxc_aa = multiply_weight(&raw_aa);
+    let wfxc_ab = multiply_weight(&raw_ab);
+    let wfxc_ba = multiply_weight(&raw_ba);
+    let wfxc_bb = multiply_weight(&raw_bb);
+
+    println!(
+        "Unrestricted FXCMatvecData prepared: nocc=[{},{}], nvir=[{},{}], ngrids={}, nvar={}, alpha_hybrid={}",
+        nocc[0], nocc[1], nvir[0], nvir[1], ngrids, nvar, alpha_hybrid
+    );
+
+    FXCMatvecDataUnrestricted {
+        nvar,
+        ngrids,
+        nocc,
+        nvir,
+        start_mo,
+        alpha_hybrid,
+        mo_occ,
+        mo_vir,
+        mo_occ_grad,
+        mo_vir_grad,
+        wfxc_aa,
+        wfxc_ab,
+        wfxc_ba,
+        wfxc_bb,
+    }
+}
+
+/// Compute the spin-resolved fxc matrix-vector products.
+///
+/// `z` is the concatenated [alpha; beta] transition vector.  The returned
+/// tuple is `(fxc_alpha, fxc_beta)`, each of length `nocc_s*nvir_s`.
+pub fn fxc_matvec_unrestricted(
+    data: &FXCMatvecDataUnrestricted,
+    z: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    let n0 = data.nocc[0] * data.nvir[0];
+    let n1 = data.nocc[1] * data.nvir[1];
+    assert_eq!(z.len(), n0 + n1, "unrestricted fxc vector length mismatch");
+    let za = &z[..n0];
+    let zb = &z[n0..];
+
+    let mut fa = vec![0.0; n0];
+    let mut fb = vec![0.0; n1];
+    if n0 > 0 {
+        let tmp = fxc_matvec_with_kernel_unrestricted(
+            data.nvar,
+            data.ngrids,
+            data.nocc[0],
+            data.nvir[0],
+            &data.mo_occ[0],
+            &data.mo_vir[0],
+            data.mo_occ_grad.as_ref().map(|g| &g[0]),
+            data.mo_vir_grad.as_ref().map(|g| &g[0]),
+            &data.wfxc_aa,
+            za,
+        );
+        fa.iter_mut().zip(tmp).for_each(|(a, b)| *a += b);
+        if n1 > 0 {
+            let tmp = fxc_matvec_with_kernel_cross_unrestricted(
+                data.nvar,
+                data.ngrids,
+                data.nocc[0],
+                data.nvir[0],
+                &data.mo_occ[0],
+                &data.mo_vir[0],
+                data.mo_occ_grad.as_ref().map(|g| &g[0]),
+                data.mo_vir_grad.as_ref().map(|g| &g[0]),
+                data.nocc[1],
+                data.nvir[1],
+                &data.mo_occ[1],
+                &data.mo_vir[1],
+                data.mo_occ_grad.as_ref().map(|g| &g[1]),
+                data.mo_vir_grad.as_ref().map(|g| &g[1]),
+                &data.wfxc_ab,
+                zb,
+            );
+            fa.iter_mut().zip(tmp).for_each(|(a, b)| *a += b);
+        }
+    }
+    if n1 > 0 {
+        let tmp = fxc_matvec_with_kernel_unrestricted(
+            data.nvar,
+            data.ngrids,
+            data.nocc[1],
+            data.nvir[1],
+            &data.mo_occ[1],
+            &data.mo_vir[1],
+            data.mo_occ_grad.as_ref().map(|g| &g[1]),
+            data.mo_vir_grad.as_ref().map(|g| &g[1]),
+            &data.wfxc_bb,
+            zb,
+        );
+        fb.iter_mut().zip(tmp).for_each(|(a, b)| *a += b);
+        if n0 > 0 {
+            let tmp = fxc_matvec_with_kernel_cross_unrestricted(
+                data.nvar,
+                data.ngrids,
+                data.nocc[1],
+                data.nvir[1],
+                &data.mo_occ[1],
+                &data.mo_vir[1],
+                data.mo_occ_grad.as_ref().map(|g| &g[1]),
+                data.mo_vir_grad.as_ref().map(|g| &g[1]),
+                data.nocc[0],
+                data.nvir[0],
+                &data.mo_occ[0],
+                &data.mo_vir[0],
+                data.mo_occ_grad.as_ref().map(|g| &g[0]),
+                data.mo_vir_grad.as_ref().map(|g| &g[0]),
+                &data.wfxc_ba,
+                za,
+            );
+            fb.iter_mut().zip(tmp).for_each(|(a, b)| *a += b);
+        }
+    }
+    (fa, fb)
+}
+
+/// Restricted-like fxc matvec using an explicit spin-pair kernel array.
+#[allow(clippy::too_many_arguments)]
+fn fxc_matvec_with_kernel_unrestricted(
+    nvar: usize,
+    ngrids: usize,
+    nocc: usize,
+    nvir: usize,
+    mo_occ: &MatrixFull<f64>,
+    mo_vir: &MatrixFull<f64>,
+    mo_occ_grad: Option<&[MatrixFull<f64>; 3]>,
+    mo_vir_grad: Option<&[MatrixFull<f64>; 3]>,
+    wfxc: &[f64],
+    z: &[f64],
+) -> Vec<f64> {
+    if nocc == 0 || nvir == 0 || z.is_empty() {
+        return vec![0.0; nocc * nvir];
+    }
+    if nvar == 1 {
+        fxc_matvec_lda_with_kernel(nocc, nvir, ngrids, mo_occ, mo_vir, wfxc, z)
+    } else {
+        fxc_matvec_gga_with_kernel(
+            nocc,
+            nvir,
+            ngrids,
+            mo_occ,
+            mo_vir,
+            mo_occ_grad.expect("GGA unrestricted fxc requires mo_occ_grad"),
+            mo_vir_grad.expect("GGA unrestricted fxc requires mo_vir_grad"),
+            wfxc,
+            z,
+        )
+    }
+}
+
+
+/// fxc matvec for a cross-spin pair (left output spin, right perturbing spin).
+#[allow(clippy::too_many_arguments)]
+fn fxc_matvec_with_kernel_cross_unrestricted(
+    nvar: usize,
+    ngrids: usize,
+    nocc_l: usize,
+    nvir_l: usize,
+    mo_occ_l: &MatrixFull<f64>,
+    mo_vir_l: &MatrixFull<f64>,
+    mo_occ_grad_l: Option<&[MatrixFull<f64>; 3]>,
+    mo_vir_grad_l: Option<&[MatrixFull<f64>; 3]>,
+    nocc_r: usize,
+    nvir_r: usize,
+    mo_occ_r: &MatrixFull<f64>,
+    mo_vir_r: &MatrixFull<f64>,
+    mo_occ_grad_r: Option<&[MatrixFull<f64>; 3]>,
+    mo_vir_grad_r: Option<&[MatrixFull<f64>; 3]>,
+    wfxc: &[f64],
+    z_r: &[f64],
+) -> Vec<f64> {
+    if nocc_l == 0 || nvir_l == 0 || nocc_r == 0 || nvir_r == 0 || z_r.is_empty() {
+        return vec![0.0; nocc_l * nvir_l];
+    }
+    if nvar == 1 {
+        fxc_matvec_lda_cross_with_kernel(
+            nocc_l, nvir_l, nocc_r, nvir_r, ngrids,
+            mo_occ_l, mo_vir_l, mo_occ_r, mo_vir_r, wfxc, z_r,
+        )
+    } else {
+        fxc_matvec_gga_cross_with_kernel(
+            nocc_l, nvir_l, nocc_r, nvir_r, ngrids,
+            mo_occ_l, mo_vir_l,
+            mo_occ_grad_l.expect("GGA unrestricted fxc requires mo_occ_grad_l"),
+            mo_vir_grad_l.expect("GGA unrestricted fxc requires mo_vir_grad_l"),
+            mo_occ_r, mo_vir_r,
+            mo_occ_grad_r.expect("GGA unrestricted fxc requires mo_occ_grad_r"),
+            mo_vir_grad_r.expect("GGA unrestricted fxc requires mo_vir_grad_r"),
+            wfxc, z_r,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fxc_matvec_lda_cross_with_kernel(
+    nocc_l: usize,
+    nvir_l: usize,
+    nocc_r: usize,
+    nvir_r: usize,
+    ngrids: usize,
+    mo_occ_l: &MatrixFull<f64>,
+    mo_vir_l: &MatrixFull<f64>,
+    mo_occ_r: &MatrixFull<f64>,
+    mo_vir_r: &MatrixFull<f64>,
+    wfxc: &[f64],
+    z_r: &[f64],
+) -> Vec<f64> {
+    let z_mat = MatrixFull::from_vec([nocc_r, nvir_r], z_r.to_vec()).unwrap();
+    let mut t = MatrixFull::new([nocc_r, ngrids], 0.0);
+    _dgemm_full(&z_mat, 'N', mo_vir_r, 'N', &mut t, 1.0, 0.0);
+    let mut rho_z = vec![0.0; ngrids];
+    for g in 0..ngrids {
+        let mut sum = 0.0;
+        for i in 0..nocc_r {
+            sum += mo_occ_r[[i, g]] * t[[i, g]];
+        }
+        rho_z[g] = sum;
+    }
+    let mut v = vec![0.0; ngrids];
+    for g in 0..ngrids {
+        v[g] = wfxc[g] * rho_z[g];
+    }
+    let mut mo_vir_scaled = MatrixFull::new([nvir_l, ngrids], 0.0);
+    for g in 0..ngrids {
+        for a in 0..nvir_l {
+            mo_vir_scaled[[a, g]] = mo_vir_l[[a, g]] * v[g];
+        }
+    }
+    let mut result = MatrixFull::new([nocc_l, nvir_l], 0.0);
+    _dgemm_full(mo_occ_l, 'N', &mo_vir_scaled, 'T', &mut result, 1.0, 0.0);
+    result.data
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fxc_matvec_gga_cross_with_kernel(
+    nocc_l: usize,
+    nvir_l: usize,
+    nocc_r: usize,
+    nvir_r: usize,
+    ngrids: usize,
+    mo_occ_l: &MatrixFull<f64>,
+    mo_vir_l: &MatrixFull<f64>,
+    mo_occ_grad_l: &[MatrixFull<f64>; 3],
+    mo_vir_grad_l: &[MatrixFull<f64>; 3],
+    mo_occ_r: &MatrixFull<f64>,
+    mo_vir_r: &MatrixFull<f64>,
+    mo_occ_grad_r: &[MatrixFull<f64>; 3],
+    mo_vir_grad_r: &[MatrixFull<f64>; 3],
+    wfxc: &[f64],
+    z_r: &[f64],
+) -> Vec<f64> {
+    let z_mat = MatrixFull::from_vec([nocc_r, nvir_r], z_r.to_vec()).unwrap();
+    let mut t0 = MatrixFull::new([nocc_r, ngrids], 0.0);
+    _dgemm_full(&z_mat, 'N', mo_vir_r, 'N', &mut t0, 1.0, 0.0);
+    let mut t_grad: [MatrixFull<f64>; 3] = [
+        MatrixFull::new([nocc_r, ngrids], 0.0),
+        MatrixFull::new([nocc_r, ngrids], 0.0),
+        MatrixFull::new([nocc_r, ngrids], 0.0),
+    ];
+    for d in 0..3 {
+        _dgemm_full(&z_mat, 'N', &mo_vir_grad_r[d], 'N', &mut t_grad[d], 1.0, 0.0);
+    }
+
+    let mut rho_z = vec![0.0; ngrids * 4];
+    for g in 0..ngrids {
+        let mut sum = 0.0;
+        for i in 0..nocc_r {
+            sum += mo_occ_r[[i, g]] * t0[[i, g]];
+        }
+        rho_z[g] = sum;
+        for d in 0..3 {
+            let mut sum1 = 0.0;
+            let mut sum2 = 0.0;
+            for i in 0..nocc_r {
+                sum1 += mo_occ_grad_r[d][[i, g]] * t0[[i, g]];
+                sum2 += mo_occ_r[[i, g]] * t_grad[d][[i, g]];
+            }
+            rho_z[g + (d + 1) * ngrids] = sum1 + sum2;
+        }
+    }
+
+    let mut fxc_eff_grid = vec![0.0; ngrids * 4];
+    for g in 0..ngrids {
+        for alpha in 0..4 {
+            let mut sum = 0.0;
+            for beta in 0..4 {
+                let w_idx = g + alpha * ngrids + beta * 4 * ngrids;
+                sum += wfxc[w_idx] * rho_z[g + beta * ngrids];
+            }
+            fxc_eff_grid[g + alpha * ngrids] = sum;
+        }
+    }
+
+    let mut result = vec![0.0; nocc_l * nvir_l];
+    for alpha in 0..4 {
+        let fxc_a = &fxc_eff_grid[alpha * ngrids..(alpha + 1) * ngrids];
+        if alpha == 0 {
+            let mut right_scaled = MatrixFull::new([nvir_l, ngrids], 0.0);
+            for g in 0..ngrids {
+                let fv = fxc_a[g];
+                for a in 0..nvir_l {
+                    right_scaled[[a, g]] = mo_vir_l[[a, g]] * fv;
+                }
+            }
+            let mut contrib = MatrixFull::new([nocc_l, nvir_l], 0.0);
+            _dgemm_full(mo_occ_l, 'N', &right_scaled, 'T', &mut contrib, 1.0, 0.0);
+            for idx in 0..result.len() {
+                result[idx] += contrib.data[idx];
+            }
+        } else {
+            let d = alpha - 1;
+            let mut right_scaled = MatrixFull::new([nvir_l, ngrids], 0.0);
+            for g in 0..ngrids {
+                let fv = fxc_a[g];
+                for a in 0..nvir_l {
+                    right_scaled[[a, g]] = mo_vir_l[[a, g]] * fv;
+                }
+            }
+            let mut contrib_a = MatrixFull::new([nocc_l, nvir_l], 0.0);
+            _dgemm_full(&mo_occ_grad_l[d], 'N', &right_scaled, 'T', &mut contrib_a, 1.0, 0.0);
+            for idx in 0..result.len() {
+                result[idx] += contrib_a.data[idx];
+            }
+            let mut right_grad_scaled = MatrixFull::new([nvir_l, ngrids], 0.0);
+            for g in 0..ngrids {
+                let fv = fxc_a[g];
+                for a in 0..nvir_l {
+                    right_grad_scaled[[a, g]] = mo_vir_grad_l[d][[a, g]] * fv;
+                }
+            }
+            let mut contrib_b = MatrixFull::new([nocc_l, nvir_l], 0.0);
+            _dgemm_full(mo_occ_l, 'N', &right_grad_scaled, 'T', &mut contrib_b, 1.0, 0.0);
+            for idx in 0..result.len() {
+                result[idx] += contrib_b.data[idx];
+            }
+        }
+    }
+    result
+}
+
+fn fxc_matvec_lda_with_kernel(
+    nocc: usize,
+    nvir: usize,
+    ngrids: usize,
+    mo_occ: &MatrixFull<f64>,
+    mo_vir: &MatrixFull<f64>,
+    wfxc: &[f64],
+    z: &[f64],
+) -> Vec<f64> {
+    let z_mat = MatrixFull::from_vec([nocc, nvir], z.to_vec()).unwrap();
+    let mut t = MatrixFull::new([nocc, ngrids], 0.0);
+    _dgemm_full(&z_mat, 'N', mo_vir, 'N', &mut t, 1.0, 0.0);
+    let mut rho_z = vec![0.0; ngrids];
+    for g in 0..ngrids {
+        let mut sum = 0.0;
+        for i in 0..nocc {
+            sum += mo_occ[[i, g]] * t[[i, g]];
+        }
+        rho_z[g] = sum;
+    }
+    let mut v = vec![0.0; ngrids];
+    for g in 0..ngrids {
+        v[g] = wfxc[g] * rho_z[g];
+    }
+    let mut mo_vir_scaled = MatrixFull::new([nvir, ngrids], 0.0);
+    for g in 0..ngrids {
+        for a in 0..nvir {
+            mo_vir_scaled[[a, g]] = mo_vir[[a, g]] * v[g];
+        }
+    }
+    let mut result = MatrixFull::new([nocc, nvir], 0.0);
+    _dgemm_full(mo_occ, 'N', &mo_vir_scaled, 'T', &mut result, 1.0, 0.0);
+    result.data
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fxc_matvec_gga_with_kernel(
+    nocc: usize,
+    nvir: usize,
+    ngrids: usize,
+    mo_occ: &MatrixFull<f64>,
+    mo_vir: &MatrixFull<f64>,
+    mo_occ_grad: &[MatrixFull<f64>; 3],
+    mo_vir_grad: &[MatrixFull<f64>; 3],
+    wfxc: &[f64],
+    z: &[f64],
+) -> Vec<f64> {
+    let z_mat = MatrixFull::from_vec([nocc, nvir], z.to_vec()).unwrap();
+    let mut t0 = MatrixFull::new([nocc, ngrids], 0.0);
+    _dgemm_full(&z_mat, 'N', mo_vir, 'N', &mut t0, 1.0, 0.0);
+    let mut t_grad: [MatrixFull<f64>; 3] = [
+        MatrixFull::new([nocc, ngrids], 0.0),
+        MatrixFull::new([nocc, ngrids], 0.0),
+        MatrixFull::new([nocc, ngrids], 0.0),
+    ];
+    for d in 0..3 {
+        _dgemm_full(&z_mat, 'N', &mo_vir_grad[d], 'N', &mut t_grad[d], 1.0, 0.0);
+    }
+
+    let mut rho_z = vec![0.0; ngrids * 4];
+    for g in 0..ngrids {
+        let mut sum = 0.0;
+        for i in 0..nocc {
+            sum += mo_occ[[i, g]] * t0[[i, g]];
+        }
+        rho_z[g] = sum;
+        for d in 0..3 {
+            let mut sum1 = 0.0;
+            let mut sum2 = 0.0;
+            for i in 0..nocc {
+                sum1 += mo_occ_grad[d][[i, g]] * t0[[i, g]];
+                sum2 += mo_occ[[i, g]] * t_grad[d][[i, g]];
+            }
+            rho_z[g + (d + 1) * ngrids] = sum1 + sum2;
+        }
+    }
+
+    let mut fxc_eff_grid = vec![0.0; ngrids * 4];
+    for g in 0..ngrids {
+        for alpha in 0..4 {
+            let mut sum = 0.0;
+            for beta in 0..4 {
+                let w_idx = g + alpha * ngrids + beta * 4 * ngrids;
+                sum += wfxc[w_idx] * rho_z[g + beta * ngrids];
+            }
+            fxc_eff_grid[g + alpha * ngrids] = sum;
+        }
+    }
+
+    let mut result = vec![0.0; nocc * nvir];
+    for alpha in 0..4 {
+        let fxc_a = &fxc_eff_grid[alpha * ngrids..(alpha + 1) * ngrids];
+        if alpha == 0 {
+            let mut right_scaled = MatrixFull::new([nvir, ngrids], 0.0);
+            for g in 0..ngrids {
+                let fv = fxc_a[g];
+                for a in 0..nvir {
+                    right_scaled[[a, g]] = mo_vir[[a, g]] * fv;
+                }
+            }
+            let mut contrib = MatrixFull::new([nocc, nvir], 0.0);
+            _dgemm_full(mo_occ, 'N', &right_scaled, 'T', &mut contrib, 1.0, 0.0);
+            for idx in 0..result.len() {
+                result[idx] += contrib.data[idx];
+            }
+        } else {
+            let d = alpha - 1;
+            let mut right_scaled = MatrixFull::new([nvir, ngrids], 0.0);
+            for g in 0..ngrids {
+                let fv = fxc_a[g];
+                for a in 0..nvir {
+                    right_scaled[[a, g]] = mo_vir[[a, g]] * fv;
+                }
+            }
+            let mut contrib_a = MatrixFull::new([nocc, nvir], 0.0);
+            _dgemm_full(&mo_occ_grad[d], 'N', &right_scaled, 'T', &mut contrib_a, 1.0, 0.0);
+            for idx in 0..result.len() {
+                result[idx] += contrib_a.data[idx];
+            }
+            let mut right_grad_scaled = MatrixFull::new([nvir, ngrids], 0.0);
+            for g in 0..ngrids {
+                let fv = fxc_a[g];
+                for a in 0..nvir {
+                    right_grad_scaled[[a, g]] = mo_vir_grad[d][[a, g]] * fv;
+                }
+            }
+            let mut contrib_b = MatrixFull::new([nocc, nvir], 0.0);
+            _dgemm_full(mo_occ, 'N', &right_grad_scaled, 'T', &mut contrib_b, 1.0, 0.0);
+            for idx in 0..result.len() {
+                result[idx] += contrib_b.data[idx];
+            }
+        }
+    }
+    result
+}
+
 // ── Global flag to enable the optimised (rayon-parallel) kernel ──
 static USE_OPTIMIZED_FXC: AtomicBool = AtomicBool::new(true);
 
