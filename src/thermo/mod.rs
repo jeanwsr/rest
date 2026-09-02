@@ -12,6 +12,8 @@
 
 use std::io::Write;
 
+use serde::Serialize;
+
 use crate::constants::{self, AVOGADRO, BOLTZMANN, CLIGHT_CMS, PLANCK, R_GAS};
 use crate::geom_io::get_mass_charge;
 use crate::scf_io::SCF;
@@ -81,7 +83,7 @@ struct MolInfo {
 
 /// Full thermochemistry result at a single (T, P). Energies in J/mol,
 /// entropies/heat capacities in J/(mol*K), partition functions dimensionless.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ThermoResult {
     pub natom: usize,
     pub total_mass_amu: f64,
@@ -643,12 +645,16 @@ fn run_scan(
 /// Run a thermochemistry calculation from SCF data + harmonic frequencies.
 /// Dispatches to single-point (with optional concentration correction) or
 /// temperature/pressure scanning depending on the input parameters.
+///
+/// Returns `Some(ThermoResult)` for a single-point run, and `None` for scan
+/// runs (whose tables are written to `scan_SCq.txt` / `scan_UHG.txt`) or when
+/// the preparation of molecular info fails.
 pub fn run_thermochemistry(
     scf: &SCF,
     freqs_cm1: &[f64],
     params: &crate::ctrl_io::thermo_parameters::ThermoParameters,
     time_mark: &mut TimeRecords,
-) {
+) -> Option<ThermoResult> {
     let pl = scf.mol.ctrl.print_level;
     let mol = &scf.mol;
     let e_au = if params.electronic_energy != 0.0 { params.electronic_energy } else { scf.scf_energy };
@@ -690,7 +696,7 @@ pub fn run_thermochemistry(
         freqs_cm1, &mol.geom.elem, &mol.geom.position, mol.ctrl.spin, &input,
     ) {
         Ok(m) => m,
-        Err(e) => { eprintln!("Error in thermochemistry: {}", e); return; }
+        Err(e) => { eprintln!("Error in thermochemistry: {}", e); return None; }
     };
 
     let ts: Vec<f64> = if !params.temperature_list.is_empty() { params.temperature_list.clone() }
@@ -703,7 +709,7 @@ pub fn run_thermochemistry(
         println!("\n=== Thermochemistry Calculation [{}] ===", model_name(params.ilowfreq));
     }
 
-    if scan {
+    let out = if scan {
         // scan mode: write scan_SCq.txt and scan_UHG.txt (no concentration term)
         let scq_path = "scan_SCq.txt";
         let uhg_path = "scan_UHG.txt";
@@ -714,6 +720,7 @@ pub fn run_thermochemistry(
             println!("  S/CV/CP + q written to {}", scq_path);
             println!("  U/H/G corrections written to {}", uhg_path);
         }
+        None
     } else {
         // single-point evaluation
         let t = ts[0];
@@ -731,12 +738,15 @@ pub fn run_thermochemistry(
         }
         print_thermo(&res, pl);
         write_single_report(&res, &params.output_path, e_au);
-    }
+        Some(res)
+    };
 
     time_mark.count("Thermochemistry");
     if pl > 0 {
         println!("  Thermochemistry elapsed: {:.3} s", t0.elapsed().as_secs_f64());
     }
+
+    out
 }
 
 #[cfg(test)]

@@ -423,10 +423,14 @@ pub fn main_driver() -> anyhow::Result<()> {
         use crate::analdrv::interface::analdrv_interface;
         let tasks = &scf_data.mol.ctrl.analdrv_tasks;
         let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
-        if let Some(ao) = analdrv_interface(&scf_data, tasks, &config) {
+        if let Some(anal_output) = analdrv_interface(&scf_data, tasks, &config) {
             json_extra.insert("analdrv".to_string(), json!({
-                "frequencies_cm": ao.frequencies_cm,
+                "frequencies_cm": anal_output.frequencies_cm,
+                "modes_trv": anal_output.modes_trv,
             }));
+            if let Some(th) = anal_output.thermo {
+                json_extra.insert("thermo".to_string(), json!(th));
+            }
         }
         time_mark.count("AnalDrv");
     }
