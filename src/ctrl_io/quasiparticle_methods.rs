@@ -186,10 +186,10 @@ impl Default for QuasiParticle {
             bse_davidson_solver:false,
             davidson_target_excitations:6,
             davidson_converge_threshold:1e-10,
-            davidson_maximum_subspace_size:2,
-            davidson_restart_dimensions:5,
-            davidson_add_dimensions:4,
-            davidson_max_iter:20,
+            davidson_maximum_subspace_size:60,
+            davidson_restart_dimensions:6,
+            davidson_add_dimensions:6,
+            davidson_max_iter:100,
             bse_tda:false,
             print_nto:false,
             bse_spin:String::from("none"),
@@ -539,18 +539,17 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 other => {6}
             };
             tmp_input.davidson_max_iter = match tmp_ctrl.get("davidson_max_iter").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(6_usize)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(6) as usize},
-                other => {20}
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(100_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(100) as usize},
+                other => {100}
             };
-            let maximum_subspace_size=(((tmp_input.davidson_target_excitations as f64)*3.0).ceil() as usize);
+            let maximum_subspace_size = 100usize.max((tmp_input.davidson_target_excitations as f64 * 20.0).ceil() as usize);
             tmp_input.davidson_maximum_subspace_size = match tmp_ctrl.get("davidson_maximum_subspace_size").unwrap_or(&serde_json::Value::Null) {
-        
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(maximum_subspace_size) as usize},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(maximum_subspace_size as i64) as usize},
                 other => {maximum_subspace_size}
             };
-            let restart_size=(((tmp_input.davidson_target_excitations as f64)*1.5).ceil() as usize);
+            let restart_size = 6usize.max((tmp_input.davidson_target_excitations as f64 * 1.5).ceil() as usize);
             tmp_input.davidson_restart_dimensions = match tmp_ctrl.get("davidson_restart_dimensions").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(restart_size) as usize},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(restart_size as i64) as usize},

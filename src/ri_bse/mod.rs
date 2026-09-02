@@ -898,6 +898,251 @@ fn solve_dense_eigenpairs(mat:&MatrixFull<f64>, qp_ctrl:&crate::ctrl_io::quasipa
     pairs
 }
 
+struct UnrestrictedBseData {
+    ri_vv: [MatrixFull<f64>; 2],
+    ri_ov: [MatrixFull<f64>; 2],
+    ri_oo_tilde: [MatrixFull<f64>; 2],
+    ri_ov_b: [MatrixFull<f64>; 2],
+    ri_ov_tilde: [MatrixFull<f64>; 2],
+    energy_diag: Vec<f64>,
+}
+
+fn prepare_unrestricted_matvec_data(
+    scf_data: &SCF,
+    inverse_dielectric: &MatrixFull<f64>,
+    energies: &[Vec<f64>; 2],
+) -> UnrestrictedBseData {
+    let ops = get_occ_params_per_spin(scf_data, 'N');
+    let num_auxbas = inverse_dielectric.size[0];
+    let mut ri_vv: [MatrixFull<f64>; 2] = [MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0)];
+    let mut ri_ov: [MatrixFull<f64>; 2] = [MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0)];
+    let mut ri_oo_tilde: [MatrixFull<f64>; 2] = [MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0)];
+    let mut ri_ov_b: [MatrixFull<f64>; 2] = [MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0)];
+    let mut ri_ov_tilde: [MatrixFull<f64>; 2] = [MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0)];
+    let mut energy_diag = Vec::new();
+
+    for s in 0..2 {
+        let occ_s = ops[s].occ_size;
+        let vir_s = ops[s].vir_size;
+
+        ri_ov[s] = get_submatrix_spin(scf_data, 'O', 'V', 'N', s);
+
+        let ri_oo_s = get_submatrix_spin(scf_data, 'O', 'O', 'N', s);
+        let mut oo_tilde = MatrixFull::new(ri_oo_s.size, 0.0);
+        _dgemm_full(inverse_dielectric, 'N', &ri_oo_s, 'N', &mut oo_tilde, 1.0, 0.0);
+        oo_tilde.reshape([num_auxbas * occ_s, occ_s]);
+        oo_tilde = oo_tilde.transpose_and_drop();
+        oo_tilde.reshape([occ_s * num_auxbas, occ_s]);
+        ri_oo_tilde[s] = oo_tilde;
+
+        let ri_vv_s = get_submatrix_spin(scf_data, 'V', 'V', 'N', s);
+        let mut vv = ri_vv_s;
+        vv.reshape([num_auxbas * vir_s, vir_s]);
+        ri_vv[s] = vv;
+
+        let mut ov_tilde = MatrixFull::new(ri_ov[s].size, 0.0);
+        _dgemm_full(inverse_dielectric, 'N', &ri_ov[s], 'N', &mut ov_tilde, 1.0, 0.0);
+        ov_tilde.reshape([num_auxbas * occ_s, vir_s]);
+        ri_ov_tilde[s] = ov_tilde;
+
+        let mut ov_b = ri_ov[s].clone();
+        ov_b.reshape([num_auxbas * occ_s, vir_s]);
+        ri_ov_b[s] = ov_b;
+
+        energy_diag.extend(construct_energy_diag_for_a(&energies[s], occ_s, vir_s));
+    }
+
+    UnrestrictedBseData {
+        ri_vv,
+        ri_ov,
+        ri_oo_tilde,
+        ri_ov_b,
+        ri_ov_tilde,
+        energy_diag,
+    }
+}
+
+fn davidson_config_from_qp(qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle) -> DavidsonConfig {
+    DavidsonConfig {
+        max_subspace: qp_ctrl.davidson_maximum_subspace_size,
+        add_dim: qp_ctrl.davidson_add_dimensions,
+        restart_dim: qp_ctrl.davidson_restart_dimensions,
+        max_iter: qp_ctrl.davidson_max_iter,
+        tol: qp_ctrl.davidson_converge_threshold,
+        ..Default::default()
+    }
+}
+
+fn filter_eigenpairs_range(
+    eigenpairs: Vec<(f64, Vec<f64>)>,
+    qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
+) -> Vec<(f64, Vec<f64>)> {
+    eigenpairs
+        .into_iter()
+        .filter(|(val, _)| *val >= qp_ctrl.bse_eigenrange_min && *val <= qp_ctrl.bse_eigenrange_max)
+        .collect()
+}
+
+
+fn unrestricted_a_matvec(
+    scf_data: &SCF,
+    qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
+    energies: &[Vec<f64>; 2],
+    with_hartree: bool,
+    data: &UnrestrictedBseData,
+    z: &Vec<f64>,
+) -> Vec<f64> {
+    matvec::a_block_matvec_unrestricted(
+        scf_data, qp_ctrl, energies, with_hartree,
+        &data.ri_vv, &data.ri_ov, &data.ri_oo_tilde, z)
+}
+
+fn unrestricted_b_matvec(
+    scf_data: &SCF,
+    qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
+    with_hartree: bool,
+    data: &UnrestrictedBseData,
+    z: &Vec<f64>,
+) -> Vec<f64> {
+    matvec::b_block_matvec_unrestricted(
+        scf_data, qp_ctrl, with_hartree,
+        &data.ri_ov, &data.ri_ov_b, &data.ri_ov_tilde, z)
+}
+
+fn unrestricted_amb_matvec(
+    scf_data: &SCF,
+    qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
+    energies: &[Vec<f64>; 2],
+    with_hartree: bool,
+    data: &UnrestrictedBseData,
+    z: &Vec<f64>,
+) -> Vec<f64> {
+    let a = unrestricted_a_matvec(scf_data, qp_ctrl, energies, with_hartree, data, z);
+    let b = unrestricted_b_matvec(scf_data, qp_ctrl, with_hartree, data, z);
+    a.into_iter().zip(b).map(|(ai, bi)| ai - bi).collect()
+}
+
+fn unrestricted_apb_matvec(
+    scf_data: &SCF,
+    qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
+    energies: &[Vec<f64>; 2],
+    with_hartree: bool,
+    data: &UnrestrictedBseData,
+    z: &Vec<f64>,
+) -> Vec<f64> {
+    let a = unrestricted_a_matvec(scf_data, qp_ctrl, energies, with_hartree, data, z);
+    let b = unrestricted_b_matvec(scf_data, qp_ctrl, with_hartree, data, z);
+    a.into_iter().zip(b).map(|(ai, bi)| ai + bi).collect()
+}
+
+fn feast_solve_bse_unrestricted_mode(
+    scf_data: &SCF,
+    qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
+    energies: &[Vec<f64>; 2],
+    data: &UnrestrictedBseData,
+    with_hartree: bool,
+) -> Vec<(f64, Vec<f64>)> {
+    let n = data.energy_diag.len();
+    let (emin, emax) = if qp_ctrl.bse_tda {
+        (qp_ctrl.bse_eigenrange_min, qp_ctrl.bse_eigenrange_max)
+    } else {
+        (qp_ctrl.bse_eigenrange_min * qp_ctrl.bse_eigenrange_min,
+         qp_ctrl.bse_eigenrange_max * qp_ctrl.bse_eigenrange_max)
+    };
+
+    if qp_ctrl.bse_tda {
+        let a_mul = |z: &Vec<f64>| {
+            unrestricted_a_matvec(scf_data, qp_ctrl, energies, with_hartree, data, z)
+        };
+        let b_mul = |z: &Vec<f64>| z.clone();
+        feast_solver::feast(
+            n,
+            &a_mul,
+            &b_mul,
+            None,
+            None,
+            emin,
+            emax,
+            qp_ctrl.bse_m_expected,
+            qp_ctrl.bse_max_feast_iter,
+            qp_ctrl.bse_tol_feast,
+            qp_ctrl.bse_feast_gmres_restart,
+            qp_ctrl.bse_feast_gmres_max_iter,
+            qp_ctrl.bse_feast_cg_tol,
+            Some(&data.energy_diag),
+            &qp_ctrl.bse_feast_init_guess_type,
+            Some(&data.energy_diag),
+            qp_ctrl.bse_feast_gaussian_width_factor,
+            qp_ctrl.bse_feast_contour_rayon,
+            None,
+            None,
+            None,
+            "diagonal",
+            None,
+            0.0001,
+            0,
+            0,
+        )
+    } else {
+        let a_mul = |z: &Vec<f64>| {
+            unrestricted_amb_matvec(scf_data, qp_ctrl, energies, with_hartree, data, z)
+        };
+        let b_mul = |z: &Vec<f64>| {
+            let apb = |p: &Vec<f64>| {
+                unrestricted_apb_matvec(scf_data, qp_ctrl, energies, with_hartree, data, p)
+            };
+            feast_solver::cg(
+                &apb,
+                z,
+                qp_ctrl.bse_feast_cg_max_iter,
+                qp_ctrl.bse_feast_cg_tol,
+                Some(&data.energy_diag),
+            )
+        };
+        let diag_sq: Vec<f64> = data.energy_diag.iter().map(|&d| d * d).collect();
+        let gmres_a_mul = |z: &Vec<f64>| {
+            let amb_z = unrestricted_amb_matvec(scf_data, qp_ctrl, energies, with_hartree, data, z);
+            unrestricted_apb_matvec(scf_data, qp_ctrl, energies, with_hartree, data, &amb_z)
+        };
+        let gmres_b_mul = |z: &Vec<f64>| z.clone();
+        let raw = feast_solver::feast(
+            n,
+            &a_mul,
+            &b_mul,
+            Some(&gmres_a_mul),
+            Some(&gmres_b_mul),
+            emin,
+            emax,
+            qp_ctrl.bse_m_expected,
+            qp_ctrl.bse_max_feast_iter,
+            qp_ctrl.bse_tol_feast,
+            qp_ctrl.bse_feast_gmres_restart,
+            qp_ctrl.bse_feast_gmres_max_iter,
+            qp_ctrl.bse_feast_cg_tol,
+            Some(&diag_sq),
+            &qp_ctrl.bse_feast_init_guess_type,
+            Some(&data.energy_diag),
+            qp_ctrl.bse_feast_gaussian_width_factor,
+            qp_ctrl.bse_feast_contour_rayon,
+            None,
+            None,
+            None,
+            "diagonal",
+            None,
+            0.0001,
+            0,
+            0,
+        );
+        raw.into_iter()
+            .map(|(omega2, xpy)| {
+                let xmy = unrestricted_amb_matvec(scf_data, qp_ctrl, energies, with_hartree, data, &xpy);
+                (omega2.sqrt(), xmy.iter().zip(xpy.iter()).map(|(xmy_k, xpy_k)| xmy_k / omega2.sqrt() + xpy_k).collect())
+            })
+            .collect()
+    }
+}
+
+
 pub fn bse_main_unrestricted(scf_data:&mut SCF) -> BseOutput {
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     if qp_ctrl.bse_spin == "none" {
@@ -923,32 +1168,121 @@ pub fn bse_main_unrestricted(scf_data:&mut SCF) -> BseOutput {
     };
 
     let mut all_excitations: Vec<f64> = Vec::new();
-    for (mode, with_hartree) in modes {
-        let eigenpairs = if qp_ctrl.bse_tda {
-            let a = construct_u_submat_a(scf_data, &inverse_dielectric, &qp_energies, with_hartree);
-            solve_dense_eigenpairs(&a, &qp_ctrl)
-        } else {
-            let h = construct_u_full_bse_hamiltonian(scf_data, &inverse_dielectric, &qp_energies, with_hartree);
-            solve_dense_eigenpairs(&h, &qp_ctrl)
-        };
-        println!("\nUnrestricted BSE ({}, TDA={}) eigenvalues in [{:.6}, {:.6}] Ha: {}",
-            mode, qp_ctrl.bse_tda, qp_ctrl.bse_eigenrange_min, qp_ctrl.bse_eigenrange_max, eigenpairs.len());
-        for (n,(e,_v)) in eigenpairs.iter().enumerate() {
-            println!("#{} Excitation energy={} Ha = {:.6} eV", n, e, e*crate::constants::EV);
-        }
-        all_excitations.extend(eigenpairs.iter().map(|(e, _)| *e));
-        if let Some((first,_)) = eigenpairs.first() {
-            println!("The first unrestricted BSE ({}) excitation is {} Ha ({:.6} eV)", mode, first, first*crate::constants::EV);
-            if qp_ctrl.save_first_excitation {
-                if let Ok(mut file) = OpenOptions::new().append(true).create(true).open(qp_ctrl.save_first_excitation_path.clone()) {
-                    writeln!(file, "{}", first).unwrap();
+
+    if qp_ctrl.bse_davidson_solver {
+        let data = prepare_unrestricted_matvec_data(scf_data, &inverse_dielectric, &qp_energies);
+        for (mode, with_hartree) in modes {
+            let cfg = davidson_config_from_qp(&qp_ctrl);
+            let initial_guess = generate_initial_guess(&data.energy_diag, qp_ctrl.davidson_target_excitations);
+            let eigenpairs = if qp_ctrl.bse_tda {
+                let a_matvec = |z: &Vec<f64>| {
+                    matvec::a_block_matvec_unrestricted(
+                        scf_data, &qp_ctrl, &qp_energies, with_hartree,
+                        &data.ri_vv, &data.ri_ov, &data.ri_oo_tilde, z)
+                };
+                tda_davidson_solver(
+                    a_matvec,
+                    qp_ctrl.davidson_target_excitations,
+                    &data.energy_diag,
+                    initial_guess,
+                    &cfg,
+                )
+            } else {
+                let a_matvec = |z: &Vec<f64>| {
+                    matvec::a_block_matvec_unrestricted(
+                        scf_data, &qp_ctrl, &qp_energies, with_hartree,
+                        &data.ri_vv, &data.ri_ov, &data.ri_oo_tilde, z)
+                };
+                let b_matvec = |z: &Vec<f64>| {
+                    matvec::b_block_matvec_unrestricted(
+                        scf_data, &qp_ctrl, with_hartree,
+                        &data.ri_ov, &data.ri_ov_b, &data.ri_ov_tilde, z)
+                };
+                lr_davidson_solver(
+                    a_matvec,
+                    b_matvec,
+                    qp_ctrl.davidson_target_excitations,
+                    &data.energy_diag,
+                    initial_guess,
+                    &cfg,
+                )
+            };
+            let eigenpairs = filter_eigenpairs_range(eigenpairs, &qp_ctrl);
+            println!("\nUnrestricted BSE ({}, TDA={}) Davidson eigenvalues in [{:.6}, {:.6}] Ha: {}",
+                mode, qp_ctrl.bse_tda, qp_ctrl.bse_eigenrange_min, qp_ctrl.bse_eigenrange_max, eigenpairs.len());
+            for (n,(e,_v)) in eigenpairs.iter().enumerate() {
+                println!("#{} Excitation energy={} Ha = {:.6} eV", n, e, e*crate::constants::EV);
+            }
+            all_excitations.extend(eigenpairs.iter().map(|(e, _)| *e));
+            if let Some((first,_)) = eigenpairs.first() {
+                println!("The first unrestricted BSE ({}) excitation is {} Ha ({:.6} eV)", mode, first, first*crate::constants::EV);
+                if qp_ctrl.save_first_excitation {
+                    if let Ok(mut file) = OpenOptions::new().append(true).create(true).open(qp_ctrl.save_first_excitation_path.clone()) {
+                        writeln!(file, "{}", first).unwrap();
+                    }
+                }
+            }
+            if qp_ctrl.save_bse_excitations {
+                let line = eigenpairs.iter().map(|(e,_)| e.to_string()).collect::<Vec<_>>().join(",");
+                if let Ok(mut file) = OpenOptions::new().append(true).create(true).open("bse_excitations.txt") {
+                    writeln!(file, "{}", line).unwrap();
                 }
             }
         }
-        if qp_ctrl.save_bse_excitations {
-            let line = eigenpairs.iter().map(|(e,_)| e.to_string()).collect::<Vec<_>>().join(",");
-            if let Ok(mut file) = OpenOptions::new().append(true).create(true).open("bse_excitations.txt") {
-                writeln!(file, "{}", line).unwrap();
+    } else if qp_ctrl.bse_feast_solver {
+        let data = prepare_unrestricted_matvec_data(scf_data, &inverse_dielectric, &qp_energies);
+        for (mode, with_hartree) in modes {
+            let eigenpairs = feast_solve_bse_unrestricted_mode(scf_data, &qp_ctrl, &qp_energies, &data, with_hartree);
+            let eigenpairs = filter_eigenpairs_range(eigenpairs, &qp_ctrl);
+            println!("\nUnrestricted BSE ({}, TDA={}) FEAST eigenvalues in [{:.6}, {:.6}] Ha: {}",
+                mode, qp_ctrl.bse_tda, qp_ctrl.bse_eigenrange_min, qp_ctrl.bse_eigenrange_max, eigenpairs.len());
+            for (n,(e,_v)) in eigenpairs.iter().enumerate() {
+                println!("#{} Excitation energy={} Ha = {:.6} eV", n, e, e*crate::constants::EV);
+            }
+            all_excitations.extend(eigenpairs.iter().map(|(e, _)| *e));
+            if let Some((first,_)) = eigenpairs.first() {
+                println!("The first unrestricted BSE ({}) excitation is {} Ha ({:.6} eV)", mode, first, first*crate::constants::EV);
+                if qp_ctrl.save_first_excitation {
+                    if let Ok(mut file) = OpenOptions::new().append(true).create(true).open(qp_ctrl.save_first_excitation_path.clone()) {
+                        writeln!(file, "{}", first).unwrap();
+                    }
+                }
+            }
+            if qp_ctrl.save_bse_excitations {
+                let line = eigenpairs.iter().map(|(e,_)| e.to_string()).collect::<Vec<_>>().join(",");
+                if let Ok(mut file) = OpenOptions::new().append(true).create(true).open("bse_excitations.txt") {
+                    writeln!(file, "{}", line).unwrap();
+                }
+            }
+        }
+    } else {
+        for (mode, with_hartree) in modes {
+            let eigenpairs = if qp_ctrl.bse_tda {
+                let a = construct_u_submat_a(scf_data, &inverse_dielectric, &qp_energies, with_hartree);
+                solve_dense_eigenpairs(&a, &qp_ctrl)
+            } else {
+                let h = construct_u_full_bse_hamiltonian(scf_data, &inverse_dielectric, &qp_energies, with_hartree);
+                solve_dense_eigenpairs(&h, &qp_ctrl)
+            };
+            println!("\nUnrestricted BSE ({}, TDA={}) eigenvalues in [{:.6}, {:.6}] Ha: {}",
+                mode, qp_ctrl.bse_tda, qp_ctrl.bse_eigenrange_min, qp_ctrl.bse_eigenrange_max, eigenpairs.len());
+            for (n,(e,_v)) in eigenpairs.iter().enumerate() {
+                println!("#{} Excitation energy={} Ha = {:.6} eV", n, e, e*crate::constants::EV);
+            }
+            all_excitations.extend(eigenpairs.iter().map(|(e, _)| *e));
+            if let Some((first,_)) = eigenpairs.first() {
+                println!("The first unrestricted BSE ({}) excitation is {} Ha ({:.6} eV)", mode, first, first*crate::constants::EV);
+                if qp_ctrl.save_first_excitation {
+                    if let Ok(mut file) = OpenOptions::new().append(true).create(true).open(qp_ctrl.save_first_excitation_path.clone()) {
+                        writeln!(file, "{}", first).unwrap();
+                    }
+                }
+            }
+            if qp_ctrl.save_bse_excitations {
+                let line = eigenpairs.iter().map(|(e,_)| e.to_string()).collect::<Vec<_>>().join(",");
+                if let Ok(mut file) = OpenOptions::new().append(true).create(true).open("bse_excitations.txt") {
+                    writeln!(file, "{}", line).unwrap();
+                }
             }
         }
     }

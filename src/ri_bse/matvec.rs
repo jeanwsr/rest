@@ -1,7 +1,7 @@
 use super::matvec_trace;
 use crate::scf_io::{SCF, SCFType};
 use tensors::{MathMatrix, MatrixFull, RIFull,MatrixFullSlice};
-use crate::ri_gw::get_occupation_parameters;
+use crate::ri_gw::{get_occupation_parameters, get_occ_params_per_spin};
 use itertools::Itertools;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgeev, _dgemv,_dgemm_full};
 use crate::ri_bse;
@@ -20,7 +20,7 @@ pub fn diagonal_elements_contribution(scf_data:&SCF,vec:&Vec<f64>)->Vec<f64>{
 }
 
 /// Standalone version of diagonal_elements_contribution (no SCF needed).
-pub fn diagonal_contribution_standalone(vec: &Vec<f64>, qp_energies: &Vec<f64>,
+pub fn diagonal_contribution_standalone(vec: &[f64], qp_energies: &Vec<f64>,
     occ_size: usize, vir_size: usize) -> Vec<f64> {
     let mut prod_vec = vec![0.0; occ_size * vir_size];
     (0..occ_size).cartesian_product(0..vir_size).for_each(|(i, a)| {
@@ -31,12 +31,12 @@ pub fn diagonal_contribution_standalone(vec: &Vec<f64>, qp_energies: &Vec<f64>,
 
 /// Standalone w_contribution_a_block_dgemm — takes explicit occ/vir sizes instead of SCF.
 pub fn w_contribution_a_block_dgemm_standalone(
-    ri_vv: &MatrixFull<f64>, z_vec: &Vec<f64>,
+    ri_vv: &MatrixFull<f64>, z_vec: &[f64],
     ri_oo_tilde: &MatrixFull<f64>, qp_ctrl: &QuasiParticle,
     occ_size: usize, vir_size: usize) -> Vec<f64> {
     let num_auxbas = ri_vv.size[0] / ri_vv.size[1];
     let mut t_tensor = MatrixFull::new([num_auxbas * vir_size, occ_size], 0.0);
-    let z_mat = MatrixFull::from_vec([occ_size, vir_size], z_vec.clone()).unwrap();
+    let z_mat = MatrixFull::from_vec([occ_size, vir_size], z_vec.to_vec()).unwrap();
     _dgemm_full(ri_vv, 'N', &z_mat, 'T', &mut t_tensor, 1.0, 0.0);
     t_tensor = t_tensor.transpose_and_drop();
     t_tensor.reshape([num_auxbas * occ_size, vir_size]);
@@ -113,11 +113,11 @@ pub fn w_contribution_rayon_a_block(scf_data:&SCF,ri_vv:&MatrixFull<f64>,z_vec:&
     println!("W第三个操作耗时: {:?}", duration3-duration2);
     result
 }
-pub fn w_contribution_a_block_dgemm(scf_data:&SCF,ri_vv:&MatrixFull<f64>,z_vec:&Vec<f64>,ri_oo_tilde:&MatrixFull<f64>,qp_ctrl:&QuasiParticle)->Vec<f64>{
+pub fn w_contribution_a_block_dgemm(scf_data:&SCF,ri_vv:&MatrixFull<f64>,z_vec:&[f64],ri_oo_tilde:&MatrixFull<f64>,qp_ctrl:&QuasiParticle)->Vec<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let num_auxbas=ri_vv.size[0]/ri_vv.size[1];
     let mut t_tensor=MatrixFull::new([num_auxbas*vir_size,occ_size],0.0);
-    let z_mat=MatrixFull::from_vec([occ_size,vir_size],z_vec.clone()).unwrap();
+    let z_mat=MatrixFull::from_vec([occ_size,vir_size],z_vec.to_vec()).unwrap();
     _dgemm_full(ri_vv,'N',&z_mat,'T',&mut t_tensor,1.0,0.0);
     t_tensor=t_tensor.transpose_and_drop();
     t_tensor.reshape([num_auxbas*occ_size,vir_size]);
@@ -125,30 +125,35 @@ pub fn w_contribution_a_block_dgemm(scf_data:&SCF,ri_vv:&MatrixFull<f64>,z_vec:&
     _dgemm_full(ri_oo_tilde,'T',&t_tensor,'N',&mut result_tensor,1.0,0.0);
     result_tensor.data.iter().map(|x|x*qp_ctrl.bse_exchange_rescaling).collect()
 }
-pub fn w_contribution_b_block_dgemm(scf_data:&SCF,ri_ov:&MatrixFull<f64>,z_vec:&Vec<f64>,ri_ov_tilde:&MatrixFull<f64>)->Vec<f64>{
-    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
-    let num_auxbas=ri_ov.size[0]/occ_size;
-    let mut t_tensor=MatrixFull::new([num_auxbas*occ_size,occ_size],0.0);
-    let z_mat=MatrixFull::from_vec([occ_size,vir_size],z_vec.clone()).unwrap();
-    _dgemm_full(ri_ov,'N',&z_mat,'T',&mut t_tensor,1.0,0.0);
+pub fn w_contribution_b_block_dgemm_standalone(
+    ri_ov: &MatrixFull<f64>,
+    z_vec: &[f64],
+    ri_ov_tilde: &MatrixFull<f64>,
+    occ_size: usize,
+    vir_size: usize,
+) -> Vec<f64> {
+    let num_auxbas = ri_ov.size[0] / occ_size;
+    let mut t_tensor = MatrixFull::new([num_auxbas * occ_size, occ_size], 0.0);
+    let z_mat = MatrixFull::from_vec([occ_size, vir_size], z_vec.to_vec()).unwrap();
+    _dgemm_full(ri_ov, 'N', &z_mat, 'T', &mut t_tensor, 1.0, 0.0);
     let mut result = vec![0.0; t_tensor.data.len()];
-    // 并行处理每个目标块
-    let reshape_t_time=Instant::now();
     result.par_chunks_exact_mut(num_auxbas).enumerate().for_each(|(new_idx, target_chunk)| {
-        // 计算对应的原块索引
-        let n2 = new_idx / occ_size;  // 新的行索引（原列索引）
-        let n1 = new_idx % occ_size;  // 新的列索引（原行索引）
-        let orig_idx = n1 * occ_size + n2;  // 原块索引
-        
-        // 复制数据
+        let n2 = new_idx / occ_size;
+        let n1 = new_idx % occ_size;
+        let orig_idx = n1 * occ_size + n2;
         let source_start = orig_idx * num_auxbas;
         let source_end = source_start + num_auxbas;
         target_chunk.copy_from_slice(&t_tensor.data[source_start..source_end]);
     });
-    t_tensor=MatrixFull::from_vec([num_auxbas*occ_size,occ_size],result).unwrap();
-    let mut result_tensor=MatrixFull::new([occ_size,vir_size],0.0);
-    _dgemm_full(&t_tensor,'T',ri_ov_tilde,'N',&mut result_tensor,1.0,0.0);
+    t_tensor = MatrixFull::from_vec([num_auxbas * occ_size, occ_size], result).unwrap();
+    let mut result_tensor = MatrixFull::new([occ_size, vir_size], 0.0);
+    _dgemm_full(&t_tensor, 'T', ri_ov_tilde, 'N', &mut result_tensor, 1.0, 0.0);
     result_tensor.data
+}
+
+pub fn w_contribution_b_block_dgemm(scf_data:&SCF,ri_ov:&MatrixFull<f64>,z_vec:&[f64],ri_ov_tilde:&MatrixFull<f64>)->Vec<f64>{
+    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
+    w_contribution_b_block_dgemm_standalone(ri_ov, z_vec, ri_ov_tilde, occ_size, vir_size)
 }
 pub fn w_contribution_rayon_b_block(scf_data:&SCF,ri_ov:&MatrixFull<f64>,z_vec:&Vec<f64>,ri_ov_tilde:&MatrixFull<f64>)->Vec<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
@@ -281,6 +286,119 @@ pub fn test_v_w_contribution_v01(scf_data:&SCF){
     _dgemv(&bse_hamiltonian,&full_vec , &mut result, 'N', 1.0, 0.0, 1, 1);
     println!("Full matvec explicit{},{}",result[0],result[occ_size*vir_size+3])*/
 }
+/// Cross-spin Coulomb contribution: V_{left,right} * z_right = B_left^T (B_right z_right).
+pub fn coulomb_cross_contribution(
+    ri_left: &MatrixFull<f64>,
+    ri_right: &MatrixFull<f64>,
+    z_right: &[f64],
+) -> Vec<f64> {
+    let mut inter = vec![0.0; ri_right.size[0]];
+    _dgemv(ri_right, z_right, &mut inter, 'N', 1.0, 0.0, 1, 1);
+    let mut result = vec![0.0; ri_left.size[1]];
+    _dgemv(ri_left, &inter, &mut result, 'T', 1.0, 0.0, 1, 1);
+    result
+}
+
+/// Unrestricted A-block matvec on the concatenated [alpha; beta] transition vector.
+///
+/// The vector layout follows `construct_energy_diag_for_a` per spin block:
+/// for each spin s, the s-block has length `occ_s * vir_s` and is indexed as
+/// `i + a * occ_s` (the same order used by the dense unrestricted matrices).
+pub fn a_block_matvec_unrestricted(
+    scf_data: &SCF,
+    qp_ctrl: &QuasiParticle,
+    energies: &[Vec<f64>; 2],
+    with_hartree: bool,
+    ri_vv: &[MatrixFull<f64>; 2],
+    ri_ov: &[MatrixFull<f64>; 2],
+    ri_oo_tilde: &[MatrixFull<f64>; 2],
+    z_vec: &Vec<f64>,
+) -> Vec<f64> {
+    let ops = get_occ_params_per_spin(scf_data, 'N');
+    let n0 = ops[0].occ_size * ops[0].vir_size;
+    let n1 = ops[1].occ_size * ops[1].vir_size;
+    debug_assert_eq!(z_vec.len(), n0 + n1);
+    let mut result = vec![0.0; n0 + n1];
+
+    for s in 0..2 {
+        let occ_s = ops[s].occ_size;
+        let vir_s = ops[s].vir_size;
+        let ns = occ_s * vir_s;
+        let offset = if s == 0 { 0 } else { n0 };
+        let zs = &z_vec[offset..offset + ns];
+
+        let mut rs = diagonal_contribution_standalone(zs, &energies[s], occ_s, vir_s);
+        let w = w_contribution_a_block_dgemm_standalone(&ri_vv[s], zs, &ri_oo_tilde[s], qp_ctrl, occ_s, vir_s);
+        for k in 0..ns {
+            rs[k] -= w[k];
+        }
+
+        if with_hartree {
+            let mut v = vec![0.0; ns];
+            for t in 0..2 {
+                let zt = &z_vec[if t == 0 { 0 } else { n0 }..if t == 0 { n0 } else { n0 + n1 }];
+                let vt = coulomb_cross_contribution(&ri_ov[s], &ri_ov[t], zt);
+                for k in 0..ns {
+                    v[k] += vt[k];
+                }
+            }
+            for k in 0..ns {
+                rs[k] += v[k];
+            }
+        }
+
+        result[offset..offset + ns].copy_from_slice(&rs);
+    }
+    result
+}
+
+/// Unrestricted B-block matvec on the concatenated [alpha; beta] transition vector.
+pub fn b_block_matvec_unrestricted(
+    scf_data: &SCF,
+    _qp_ctrl: &QuasiParticle,
+    with_hartree: bool,
+    ri_ov: &[MatrixFull<f64>; 2],
+    ri_ov_b: &[MatrixFull<f64>; 2],
+    ri_ov_tilde: &[MatrixFull<f64>; 2],
+    z_vec: &Vec<f64>,
+) -> Vec<f64> {
+    let ops = get_occ_params_per_spin(scf_data, 'N');
+    let n0 = ops[0].occ_size * ops[0].vir_size;
+    let n1 = ops[1].occ_size * ops[1].vir_size;
+    debug_assert_eq!(z_vec.len(), n0 + n1);
+    let mut result = vec![0.0; n0 + n1];
+
+    for s in 0..2 {
+        let occ_s = ops[s].occ_size;
+        let vir_s = ops[s].vir_size;
+        let ns = occ_s * vir_s;
+        let offset = if s == 0 { 0 } else { n0 };
+        let zs = &z_vec[offset..offset + ns];
+
+        let mut rs = w_contribution_b_block_dgemm_standalone(&ri_ov_b[s], zs, &ri_ov_tilde[s], occ_s, vir_s);
+        for k in 0..ns {
+            rs[k] = -rs[k];
+        }
+
+        if with_hartree {
+            let mut v = vec![0.0; ns];
+            for t in 0..2 {
+                let zt = &z_vec[if t == 0 { 0 } else { n0 }..if t == 0 { n0 } else { n0 + n1 }];
+                let vt = coulomb_cross_contribution(&ri_ov[s], &ri_ov[t], zt);
+                for k in 0..ns {
+                    v[k] += vt[k];
+                }
+            }
+            for k in 0..ns {
+                rs[k] += v[k];
+            }
+        }
+
+        result[offset..offset + ns].copy_from_slice(&rs);
+    }
+    result
+}
+
 pub fn a_block_matvec(scf_data:&SCF,qp_ctrl:&QuasiParticle,ri_vv:&MatrixFull<f64>,ri_ov:&MatrixFull<f64>,ri_oo_tilde:&MatrixFull<f64>,z_vec:&Vec<f64>)->Vec<f64>{
     matvec_trace::trace("a_block_matvec");
     let start=Instant::now();
