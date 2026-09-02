@@ -2089,8 +2089,8 @@ fn cds_eg(
 /// - `smd_cavity_radii`: SMD radii scheme:
 ///   - `Bondi` (default): all elements use `BONDI[z] + 0.4` (mnsol.F `VDWRAD`, aligned with PySCF)
 ///   - `BondiUff`: the 11 eq.16 elements keep `BONDI[z]`; other elements use
-///     `BONDI_UFF_RADII[z]*BOHR` (measured table, bohr→Å); zero entries (Z≥87 unmeasured)
-///     fall back to `BONDI[z]`
+///     `BONDI_UFF_RADII[z]*BOHR` (reference snapshot table, bohr→Å); zero entries are
+///     defensive only (table covers Z=1..103) and fall back to `BONDI[z]`
 ///
 /// # Returns
 /// - `gcds`: CDS free energy (Hartree)
@@ -2124,7 +2124,7 @@ pub fn compute_cds(
     // Effective SASA sphere radius per atom: `rad[k] = R_base(Z_k) + 0.4 Å` (solvent probe).
     // Bondi scheme: R_base = BONDI[Z] (mnsol.F VDWRAD, legacy).
     // BondiUff scheme: eq.16 elements keep BONDI[Z]; others use BONDI_UFF_RADII[Z]*BOHR
-    // (bohr→Å via REST BOHR = 0.529177 Å/bohr, multiplication); 0 entry falls back to BONDI[Z].
+    // (bohr→Å via REST BOHR = 0.529177 Å/bohr, multiplication); zero entry is defensive only.
     let rad: Vec<f64> = atomic_numbers.iter()
         .map(|&z| {
             let base = match smd_cavity_radii {

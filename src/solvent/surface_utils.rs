@@ -140,7 +140,8 @@ const SMD_RADII_ANG: [f64; 104] = {
 /// All other specialized elements (H, C, N, F, Si, P, S, Cl, Br, I) use
 /// fixed SMD values. Unparameterized elements fall back per `scheme`:
 /// - `Bondi`: `VDW_RADII` (PySCF mixed table, legacy)
-/// - `BondiUff`: `BONDI_UFF_RADII` (measured table; zero entries, e.g. Z≥87, fall back to `VDW_RADII`)
+/// - `BondiUff`: `BONDI_UFF_RADII` (reference snapshot table; zero entries are defensive only
+///   — the table covers Z=1..103 — and fall back to `VDW_RADII`)
 ///
 /// Returns radii in **Bohr**.
 pub fn smd_radii(
@@ -162,7 +163,7 @@ pub fn smd_radii(
             match scheme {
                 SmdCavityRadii::Bondi => data::VDW_RADII[z], // fallback to PySCF mixed table (Bohr)
                 SmdCavityRadii::BondiUff => {
-                    // measured table in bohr; 0 entry (Z≥87 unmeasured or invalid) → fall back
+                    // reference snapshot table in bohr; 0 entry is defensive only → fall back
                     if z < data::BONDI_UFF_RADII.len() && data::BONDI_UFF_RADII[z] > 0.0 {
                         data::BONDI_UFF_RADII[z]
                     } else {

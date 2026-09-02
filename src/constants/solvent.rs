@@ -257,24 +257,28 @@ pub static UFF_RADII: [f64; 104] = [
 /// SMD default fallback radii for non-eq.16 elements, in **bohr** (1-indexed: `BONDI_UFF_RADII[Z]`
 /// = radius of element Z; index 0 unused). Consumed by `SmdCavityRadii::BondiUff`.
 ///
-/// Role in the SMD model (radii scheme `uff_mixed`):
+/// This table is a **complete snapshot** of the reference SMD implementation's per-element radii
+/// (see read_md/smd_cds_parameters.md §6.3-§6.4). Role in the SMD model (scheme `uff_mixed`):
 /// ```text
 /// R_sasa[Z] = BONDI_UFF_RADII[Z] × BOHR + 0.4 Å     (CDS accessible-sphere radius)
 /// R_cav[Z]  = BONDI_UFF_RADII[Z]                     (electrostatic cavity radius, bohr)
 /// ```
 /// where `BOHR = 0.529177 Å/bohr` converts bohr → Å (multiplication).
 ///
-/// Composition (measured 2026-08, single-atom SMD scans, see read_md/smd_cds_parameters.md §6.3):
-/// Bondi 1964 values (Table I/XIV) ∪ unclassified values (Be/B/Al/Ge/K, of textbook origin)
-/// ∪ UFF fill-in. **Not** the UFF table itself; identical to `UFF_RADII` only for 31 elements.
+/// Composition — reproduces the reference source's fallback chain
+/// `SMDRad → RVdWB → RVdW97` (g09 utilnz.F, verified against single-atom scans 2026-08/09):
+/// Bondi 1964 values (Table I/XIV) ∪ supplemental values (Be/B/Al/Ge/K from the reference's
+/// "Bondi unless otherwise noted" table: B = Williams, Al = estimated) ∪ UFF fill-in
+/// (`RVdW97`, identical to this crate's `UFF_RADII`, 103/103 elements verified).
 ///
 /// Conventions:
 /// - **eq.16 elements (H,C,N,O,F,Si,P,S,Cl,Br,I) are 0**: special atoms never look up this table
 ///   (electrostatic cavity uses eq.16 intrinsic radii; CDS uses the mnsol.F `BONDI` table).
-/// - **Z = 55–86 measured** (18 elements: Cs Ba La Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn);
-///   Pt/Au/Hg/Tl/Pb equal Bondi 1964 Table XIV values.
-/// - **Z ≥ 87 are 0 (unmeasured)**: no basis set available in the built-in pool; callers must
-///   fall back to the original bondi path (`VDW_RADII` / `BONDI`).
+/// - **Z = 55–86 measured** (18 elements, 2026-08-31): Cs Ba La Hf Ta W Re Os Ir Pt Au Hg Tl Pb
+///   Bi Po At Rn; Pt/Au/Hg/Tl/Pb equal Bondi 1964 Table XIV values.
+/// - **Z = 87–103 from reference source** (2026-09-01, `RVdW97/2`; not measured — the single-atom
+///   scans failed only for lack of basis sets, the radii themselves are source-verified):
+///   Fr 2.450 … Lr 1.618 Å. Runtime zero-fallback below is now defensive only.
 pub static BONDI_UFF_RADII: [f64; 104] = [
     0.0000000000e+00, 0.0000000000e+00, 2.6456165745e+00, 3.4393015468e+00, 2.7401028807e+00, 3.4015070243e+00, 0.0000000000e+00, 0.0000000000e+00,
     0.0000000000e+00, 0.0000000000e+00, 2.9101782319e+00, 4.2896783029e+00, 3.2692261956e+00, 4.3463700866e+00, 0.0000000000e+00, 0.0000000000e+00,
@@ -286,9 +290,9 @@ pub static BONDI_UFF_RADII: [f64; 104] = [
     3.4988279197e+00, 3.3278077055e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00,
     0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00,
     2.9678148787e+00, 2.9952159075e+00, 2.8997847382e+00, 2.7911254861e+00, 2.9479727544e+00, 2.6834110970e+00, 3.3070207181e+00, 3.1369453669e+00,
-    2.9290754932e+00, 3.7038632043e+00, 3.8172467717e+00, 4.1290515823e+00, 4.4493601604e+00, 4.4880995460e+00, 4.5022724919e+00, 0.0000000000e+00,
-    0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00,
-    0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00, 0.0000000000e+00,
+    2.9290754932e+00, 3.7038632043e+00, 3.8172467717e+00, 4.1290515823e+00, 4.4493601604e+00, 4.4880995460e+00, 4.5022724919e+00, 4.6298286720e+00,
+    3.4742612300e+00, 3.2862334940e+00, 3.2087547290e+00, 3.2352108920e+00, 3.2078098660e+00, 3.2352108920e+00, 3.2352108920e+00, 3.1945817840e+00,
+    3.1426143190e+00, 3.1548975380e+00, 3.1303311000e+00, 3.1171030180e+00, 3.1048197990e+00, 3.0934814430e+00, 3.0689150050e+00, 3.0575766500e+00,
 ];
 
 // ============================================================================
