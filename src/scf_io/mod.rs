@@ -36,7 +36,7 @@ use std::sync::mpsc::{channel};
 use crate::isdf::{prepare_for_ri_isdf, prepare_m_isdf};
 use crate::molecule_io::{Molecule};
 use crate::initial_guess::{initial_guess, update_basis_from_hdf5chk};
-use crate::external_libs::dftd;
+use crate::dftd::energy::dftd;
 use crate::constants::{SQRT_THRESHOLD};
 use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
 use crate::x2c::RelativisticMethod;
@@ -316,7 +316,7 @@ impl SCF {
         if disp_from_ctrl || disp_from_parse_xc {
             // (energy, grad, sigma); fallback to this default value if dftd evaluation fails
             let default_disp = (0.0, None, None);
-            let (engy_disp, grad_disp, sigma_disp) = dftd(self).unwrap_or(default_disp);
+            let (engy_disp, grad_disp, sigma_disp) = dftd(&self.mol).unwrap_or(default_disp);
 
             let disp_name = if disp_from_parse_xc {
                 self.mol.dfadef.as_ref().unwrap().get_dispersion().unwrap().func.clone()

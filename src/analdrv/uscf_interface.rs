@@ -1,6 +1,7 @@
 use super::prelude::*;
 use crate::analdrv::vib::*;
 use crate::analdrv::vib_interface::*;
+use crate::dftd::hess::HessDFTD;
 use crate::ri_jk::util::{get_cint_aux, get_cint_mol};
 use crate::SCF;
 
@@ -38,7 +39,17 @@ pub fn uscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
     let mut hess_nuc_repl_obj = HessNucRepl::new(&mol, &device);
     let mut hess_hcore_obj = UHessHcore::new(&mol, &device);
 
-    let hess_nuc_list: Vec<&mut dyn HessNucAPI> = vec![&mut hess_nuc_repl_obj];
+    let mut hess_nuc_list: Vec<&mut dyn HessNucAPI> = vec![&mut hess_nuc_repl_obj];
+
+    // --- empirical dispersion (DFTD3/DFTD4) --- //
+
+    // The dispersion energy is independent of the density matrix (nuclear-like term). Its
+    // Hessian is evaluated numerically from the analytic dispersion gradient, and is only
+    // added if empirical dispersion is specified in the input.
+    let mut hess_dftd_obj = HessDFTD::new(mol_obj, config.dftd_hess_step);
+    if let Some(ref mut hess_dftd_obj) = hess_dftd_obj {
+        hess_nuc_list.push(hess_dftd_obj);
+    }
     let hess_hcore_list: Vec<&mut dyn UHessCoreAPI> = vec![&mut hess_hcore_obj];
     let mut hess_el_list: Vec<&mut dyn UHessElecInteractAPI> = Vec::new();
 

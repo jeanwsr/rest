@@ -1,4 +1,4 @@
-use crate::external_libs::dftd::dftd;
+use crate::dftd::energy::dftd;
 use crate::scf_io::SCF;
 
 use crate::grad::traits::GradAPI;
@@ -19,7 +19,7 @@ impl<'a> DFTDGrad<'a> {
         if self.evaluated {
             println!("[WARN] DFTD gradient is already evaluated. Will use the last result.");
         } else {
-            self.result = dftd(&self.scf_data);
+            self.result = dftd(&self.scf_data.mol);
             self.evaluated = true;
         }
     }

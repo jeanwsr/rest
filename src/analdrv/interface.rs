@@ -45,7 +45,7 @@ pub fn hess_interface(scf_data: &SCF, analdrv_ctrl: &AnalDrvConfig) -> (Vec<f64>
     eprintln!("[WARN] You are using analdrv module, which is still under development.");
     eprintln!("[WARN] Keywords of analdrv will be updated in future versions.");
 
-    // simple guard, but currently many methods (solvent, range-separate, dftd are not supported)
+    // simple guard, but currently many methods (solvent, range-separate are not supported)
     if scf_data.mol.xc_data.is_fifth_dfa() {
         panic!("Normal modes calculation is currently not available for post-SCF methods.");
     }
