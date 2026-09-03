@@ -260,12 +260,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     }
     let data: std::cell::RefCell<TDDFTData> = std::cell::RefCell::new(
         if is_ao {
-            if is_u {
-                println!("Unrestricted (UKS) AO mode: spin-polarized kernels over the concatenated \
-                          [alpha; beta] amplitude space");
-            } else {
-                println!("AO mode: using AO transition-density kernels (no MO-basis RI tensors)");
-            }
+            println!("Reftype: {}", if is_u { "UKS" } else { "RKS" });
             // FEAST is not implemented for the AO path.
             // Note: `response_tddft` bypasses this function entirely (dispatched
             // separately in main_driver) and always uses MO-basis machinery

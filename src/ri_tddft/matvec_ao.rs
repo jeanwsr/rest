@@ -1107,5 +1107,3 @@ pub fn build_b_ao(scf: &SCF, ao_data: &mut TDDFTData, xlet: char) -> MatrixFull<
     ao_kernel_block(scf, ao_data, &identity, xlet, true)
 }
 
-// ══════════════════════════════════════════════════════════════════
-// Tests: validate AO contractions
