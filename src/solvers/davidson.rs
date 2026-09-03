@@ -980,6 +980,7 @@ mod tests {
         }
     }
 
+
     /// Dense Casida reference for the full LR problem (same reduction as the
     /// solver's preferred route): A−B = GGᵀ (Cholesky), symmetric eigh of
     /// Gᵀ(A+B)G, X±Y assembled from Z and ω. Returns (ω, [X; Y]) pairs.

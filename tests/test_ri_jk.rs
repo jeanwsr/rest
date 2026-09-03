@@ -121,7 +121,8 @@ fn test_solved_j3c() {
     // cholesky way, upper
     let j3c_ = j3c.clone();
     let ptr_j3c = j3c_.as_ptr();
-    let j2c_decomp_option = J2CDecompOption { policy: J2CDecompPolicy::Cd, threshold: None, uplo: Upper };
+    let j2c_decomp_option =
+        J2CDecompOption { policy: J2CDecompPolicy::Cd, threshold: None, uplo: Upper, ..Default::default() };
     let j2c_decomp = get_j2c_decomp(&aux, &device, j2c_decomp_option);
     let j3c_solved = get_solved_j3c(j3c_, &j2c_decomp, false);
     let ptr_j3c_solved = j3c_solved.as_ptr();
@@ -133,7 +134,8 @@ fn test_solved_j3c() {
     // cholesky way, lower
     let j3c_ = j3c.clone();
     let ptr_j3c = j3c_.as_ptr();
-    let j2c_decomp_option = J2CDecompOption { policy: J2CDecompPolicy::Cd, threshold: None, uplo: Upper };
+    let j2c_decomp_option =
+        J2CDecompOption { policy: J2CDecompPolicy::Cd, threshold: None, uplo: Upper, ..Default::default() };
     let j2c_decomp = get_j2c_decomp(&aux, &device, j2c_decomp_option);
     let j3c_solved = get_solved_j3c(j3c_, &j2c_decomp, false);
     let ptr_j3c_solved = j3c_solved.as_ptr();
@@ -148,7 +150,7 @@ fn test_solved_j3c() {
     let j2c_decomp = get_j2c_decomp(
         &aux,
         &device,
-        J2CDecompOption { policy: J2CDecompPolicy::Eig, threshold: Some(1e-13), uplo: Upper },
+        J2CDecompOption { policy: J2CDecompPolicy::Eig, threshold: Some(1e-13), uplo: Upper, ..Default::default() },
     );
     let j3c_solved = get_solved_j3c(j3c_, &j2c_decomp, false);
     let ptr_j3c_solved = j3c_solved.as_ptr();
@@ -160,7 +162,8 @@ fn test_solved_j3c() {
     // cholesky way, non f-contiguous j3c should still work
     // (in this case, for 2-dim j3c, c-contiguous will still not perform copy)
     let j3c_ = j3c.to_contig(RowMajor).to_owned();
-    let j2c_decomp_option = J2CDecompOption { policy: J2CDecompPolicy::Cd, threshold: None, uplo: Upper };
+    let j2c_decomp_option =
+        J2CDecompOption { policy: J2CDecompPolicy::Cd, threshold: None, uplo: Upper, ..Default::default() };
     let j2c_decomp = get_j2c_decomp(&aux, &device, j2c_decomp_option);
     let j3c_solved = get_solved_j3c(j3c_, &j2c_decomp, false);
     let j4c_recon = j3c_solved.view() % j3c_solved.t();
