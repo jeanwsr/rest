@@ -23,6 +23,7 @@ use rest_tensors::{MatrixFull, RIFull};
 use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
 use rest_tensors::matrixupper::map_upper_to_full;
 use rayon::prelude::*;
+use std::cell::RefCell;
 
 use crate::scf_io::{SCF, SCFType};
 use crate::dft::num_int::FXCMatvecData;
@@ -140,10 +141,19 @@ fn get_j_ao_batched(scf: &SCF, p_block: &[MatrixFull<f64>]) -> MatrixFull<f64> {
     let device = DeviceBLAS::default();
     let (ri3fn, _, _) = scf.rimatr.as_ref()
         .expect("rimatr must be initialized for AO-mode TDDFT");
+    let nao = scf.mol.num_basis;
+    get_j_from_rimatr(&scf.rimatr, p_block, nao)
+}
+
+/// J over a density block from an explicit rimatr handle (the SCF-free core
+/// used by [`response_potential_batched`]).
+fn get_j_from_rimatr(rimatr: &RimatrTuple, p_block: &[MatrixFull<f64>], nao: usize) -> MatrixFull<f64> {
+    let device = DeviceBLAS::default();
+    let (ri3fn, _, _) = rimatr.as_ref()
+        .expect("rimatr must be initialized for AO-mode TDDFT");
     let cderi = ri3fn.to_rstsr_view(&device);
     let dms_slice: &[MatrixFull<f64>] = p_block;
     let dms = dms_slice.to_rstsr(&device);               // [nao, nao, m]
-    let nao = scf.mol.num_basis;
     let js = crate::ri_jk::pure_incore::get_vj_ri_incore_nonsym(cderi, dms.view()); // [nao,nao,m]
     let mut out = MatrixFull::new([nao * nao, p_block.len()], 0.0);
     out.data.copy_from_slice(js.raw());
@@ -341,9 +351,10 @@ fn fxc_matvec_ao_batched(
         add_ns(&T_FXC_RHO, t0);
         let t0 = Instant::now();
         let f_fxc = if is_uhf {
-            // set = σ*m + s: a pure f-order reinterpretation
-            // [g,nvar,n_tot] → [g,nvar,n_sec,m]
-            let rho1_u = rho1.into_shape([ngrids, nvar, n_sec, m]);
+            // set = σ*m + s (sector-major): reshape with the SET axis split as
+            // [m, n_sec] (so t = s + σ·m) and swap to [g,nvar,n_sec,m] — a
+            // direct [n_sec, m] reinterpret would scramble (σ,s) for m > 1.
+            let rho1_u = rho1.into_shape([ngrids, nvar, m, n_sec]).swapaxes(2, 3).into_contig(FlagOrder::F);
             ni.make_fxc_pot_with_eff(fxc_eff_view, rho1_u.view(), den_type, XCSpin::Polarized)
         } else {
             ni.make_fxc_pot_with_eff(fxc_eff_view, rho1.view(), den_type, XCSpin::Unpolarized)
@@ -379,7 +390,7 @@ fn fxc_matvec_ao_batched(
             let fxc_eff_b = fxc_eff_view.i((start..end));
             let t0 = Instant::now();
             let f_b = if is_uhf {
-                let rho1_bu = rho1_b.into_shape([nb, nvar, n_sec, m]);
+                let rho1_bu = rho1_b.into_shape([nb, nvar, m, n_sec]).swapaxes(2, 3).into_contig(FlagOrder::F);
                 ni_batch.make_fxc_pot_with_eff(fxc_eff_b, rho1_bu.view(), den_type, XCSpin::Polarized)
             } else {
                 ni_batch.make_fxc_pot_with_eff(fxc_eff_b, rho1_b.view(), den_type, XCSpin::Unpolarized)
@@ -1096,7 +1107,6 @@ pub fn b_matvec_ao_batched(
     result
 }
 
-/// Full A-block matvec, unrestricted (UKS) AO mode: kernel block + per-sector
 pub fn build_b_ao(scf: &SCF, ao_data: &mut TDDFTData, xlet: char) -> MatrixFull<f64> {
     let sectors = crate::ri_tddft::utils::tddft_sector_params(scf);
     let dim_total: usize = sectors.iter().map(|sec| sec.dim()).sum();
@@ -1105,6 +1115,205 @@ pub fn build_b_ao(scf: &SCF, ao_data: &mut TDDFTData, xlet: char) -> MatrixFull<
         identity[[idx, idx]] = 1.0;
     }
     ao_kernel_block(scf, ao_data, &identity, xlet, true)
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Public density-space response operator (PySCF `gen_response`/`vresp` style)
+// ══════════════════════════════════════════════════════════════════
+
+/// PySCF `gen_response`-style density-space linear-response operator for AO
+/// mode: apply the response KS potential (Coulomb + hybrid exchange + fxc) to
+/// a batch of (transition) density matrices and return the response potentials
+/// in the AO basis.
+///
+/// Unlike [`a_matvec_ao_batched`]/[`b_matvec_ao_batched`] (amplitude space),
+/// this operator takes DENSITIES only, so the exchange term uses the exact
+/// density-driven `get_vk_ri_incore_dm` route (equal to the semitrans
+/// amplitude route to machine precision — see
+/// `test_exchange_coeff_route_matches_dm`). Per sector σ (RHF: one sector;
+/// UKS: alpha/beta) and trial density s:
+///
+/// - RHF: `v1_s = w_J·J[P_s] − c_x·K[P_s] + fxc[P_s]`, with the Coulomb
+///   weight `w_J` from `xlet` (`'S'`→2 singlet / `'R'`→1 / `'T'`→0) and the
+///   unpolarized fxc kernel;
+/// - UKS: `v1^σ_s = Σ_τ J[P^τ_s] − c_x·K[P^σ_s] + fxc^σ[P^α_s,P^β_s]` —
+///   Coulomb is spin-blind (unit weights, no singlet factor), exchange acts
+///   within a spin sector only, and fxc couples both spin densities through
+///   the polarized kernel blocks f^{στ}.
+///
+/// Densities need not be symmetric (J/K accept non-symmetric densities; fxc
+/// symmetrizes internally). With a single K convention (K[P], untransposed —
+/// the B-block transpose identity `K[Pᵀ] = K[P]ᵀ` is the caller's tool),
+/// each returned matrix equals the per-(σ,s) `f_total` potential assembled
+/// inside [`ao_kernel_block`] for the A block.
+// --- Response API: commented out ---
+#[cfg(any())]
+pub fn response_potential_batched(
+    ao_data: &mut TDDFTData,
+    rimatr: &RimatrTuple,
+    p_sectors: &[Vec<MatrixFull<f64>>],
+    xlet: char,
+) -> Vec<MatrixFull<f64>> {
+    assert!(!p_sectors.is_empty(), "p_sectors must contain at least one sector");
+    let n_sec = p_sectors.len();
+    assert_eq!(n_sec, ao_data.n_sectors(),
+        "p_sectors count must match the prepared TDDFTData ({} sectors)", ao_data.n_sectors());
+    let m = p_sectors[0].len();
+    let nao = p_sectors[0][0].size[0];
+    let is_uhf = ao_data.is_uhf();
+    let alpha_hybrid = ao_data.alpha_hybrid;
+    let coulomb_factor = if xlet == 'S' { 2.0 } else if xlet == 'R' { 1.0 } else { 0.0 };
+    let device = DeviceBLAS::default();
+    if m == 0 {
+        return Vec::new();
+    }
+
+    // ── J: one batched call over ALL sectors' densities; columns
+    //      [σ·m .. (σ+1)·m) = J[P^σ_s] ──
+    let t0 = Instant::now();
+    let need_j = is_uhf || coulomb_factor != 0.0;
+    let j_block = if need_j {
+        let mut p_all: Vec<MatrixFull<f64>> = Vec::with_capacity(n_sec * m);
+        for p_sec in p_sectors {
+            p_all.extend(p_sec.iter().cloned());
+        }
+        Some(get_j_from_rimatr(rimatr, &p_all, nao)) // [nao*nao, n_sec*m]
+    } else {
+        None
+    };
+    add_ns(&T_J, t0);
+
+    // ── K per spin sector: exact density-driven route (no amplitudes needed) ──
+    let t0 = Instant::now();
+    let k_sectors: Vec<Option<MatrixFull<f64>>> = if alpha_hybrid.abs() > 1e-15 {
+        let (ri3fn, _, _) = rimatr.as_ref()
+            .expect("rimatr must be initialized for AO-mode TDDFT");
+        let cderi = ri3fn.to_rstsr_view(&device);
+        let naux = ri3fn.size[1];
+        p_sectors.iter()
+            .map(|p_sec| {
+                let dms = p_sec.as_slice().to_rstsr(&device); // [nao,nao,m]
+                let ks = crate::ri_jk::pure_incore::get_vk_ri_incore_dm(cderi.view(), dms.view(), naux);
+                let mut out = MatrixFull::new([nao * nao, m], 0.0);
+                out.data.copy_from_slice(ks.raw());
+                Some(out)
+            })
+            .collect()
+    } else {
+        (0..n_sec).map(|_| None).collect()
+    };
+    add_ns(&T_K, t0);
+
+    // ── fxc: batched DM route, per-(σ,s) potential blocks. Skipped when the
+    //      data carries no kernel tables (HF-only response). ──
+    let t0 = Instant::now();
+    let has_fxc = ao_data.fxc_driver.is_some() && ao_data.fxc_eff.is_some();
+    let f_fxc_block = if has_fxc {
+        fxc_matvec_ao_batched(ao_data, p_sectors, &device) // [nao, nao*n_sec*m]
+    } else {
+        MatrixFull::new([nao, nao * n_sec * m], 0.0)
+    };
+    add_ns(&T_FXC, t0);
+
+    // ── assemble the per-(σ,s) potentials ──
+    let t0 = Instant::now();
+    let mut out: Vec<MatrixFull<f64>> = Vec::with_capacity(n_sec * m);
+    for i_sec in 0..n_sec {
+        for s in 0..m {
+            let mut f_total = MatrixFull::new([nao, nao], 0.0);
+            if let Some(jb) = &j_block {
+                if is_uhf {
+                    for tau in 0..n_sec {
+                        let base = (tau * m + s) * nao * nao;
+                        for idx in 0..nao * nao {
+                            f_total.data[idx] += jb.data[base + idx];
+                        }
+                    }
+                } else {
+                    let base = s * nao * nao;
+                    for idx in 0..nao * nao {
+                        f_total.data[idx] += coulomb_factor * jb.data[base + idx];
+                    }
+                }
+            }
+            if let Some(kb) = &k_sectors[i_sec] {
+                let base = s * nao * nao;
+                for idx in 0..nao * nao {
+                    f_total.data[idx] -= alpha_hybrid * kb.data[base + idx];
+                }
+            }
+            let base = (i_sec * m + s) * nao * nao;
+            for idx in 0..nao * nao {
+                f_total.data[idx] += f_fxc_block.data[base + idx];
+            }
+            out.push(f_total);
+        }
+    }
+    add_ns(&T_CONT, t0);
+    out
+}
+
+/// PySCF `gen_response`-style handle for AO-mode density-space response
+/// calculations (RHF or UKS reference). Owns the prepared [`TDDFTData`] (AO
+/// kernel tables, per-sector MO coefficients, cached `NIMatmul`) behind a
+/// `RefCell` — mirroring how `tddft_solver` shares the data between matvec
+/// closures — so the operator can be applied repeatedly:
+///
+/// ```text
+/// let vresp = SCFResponse::new(&scf, 'R');
+/// let v1 = vresp.response(&[dms]);   // Vec<[nao,nao]> per (σ,s)
+/// ```
+// --- Response API: commented out (see plan: unified via hessian core) ---
+#[cfg(any())]
+pub struct SCFResponse<'a> {
+    scf: &'a SCF,
+    data: RefCell<TDDFTData>,
+    xlet: char,
+}
+
+#[cfg(any())]
+impl<'a> SCFResponse<'a> {
+    /// Prepare the AO-mode response operator for `scf`. `xlet` selects the
+    /// restricted singlet/triplet Coulomb convention (`'S'`/`'R'`/`'T'`);
+    /// it is ignored for a UKS reference (unit Coulomb weights).
+    pub fn new(scf: &'a SCF, xlet: char) -> Self {
+        let data = RefCell::new(crate::ri_tddft::tddft::prepare_ao_data(scf));
+        Self { scf, data, xlet }
+    }
+
+    /// Number of spin sectors (1 = RHF, 2 = UKS/UHF).
+    pub fn n_sectors(&self) -> usize {
+        self.data.borrow().n_sectors()
+    }
+
+    /// The amplitude-space diagonal (ε_a − ε_i), concatenated
+    /// `[dim_alpha + dim_beta]` for UKS.
+    pub fn hdiag(&self) -> Vec<f64> {
+        if self.data.borrow().is_uhf() {
+            crate::ri_tddft::matvec::build_hdiag_u(self.scf)
+        } else {
+            crate::ri_tddft::matvec::build_hdiag(self.scf)
+        }
+    }
+
+    /// Shared access to the prepared data (for amplitude-space matvecs and
+    /// advanced use).
+    pub fn data(&self) -> &RefCell<TDDFTData> {
+        &self.data
+    }
+
+    /// Restricted singlet/triplet Coulomb convention (`'S'`/`'R'`/`'T'`).
+    pub fn set_xlet(&mut self, xlet: char) {
+        self.xlet = xlet;
+    }
+
+    /// Apply the density-space response operator: `p_sectors[σ]` holds the m
+    /// (transition) densities `[nao,nao]` of spin sector σ (1 sector RHF /
+    /// 2 sectors UKS); returns one response potential `[nao,nao]` per (σ,s),
+    /// ordered (σ·m + s). See [`response_potential_batched`].
+    pub fn response(&self, p_sectors: &[Vec<MatrixFull<f64>>]) -> Vec<MatrixFull<f64>> {
+        response_potential_batched(&mut self.data.borrow_mut(), &self.scf.rimatr, p_sectors, self.xlet)
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════

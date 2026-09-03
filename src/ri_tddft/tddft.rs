@@ -171,6 +171,14 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
 /// AO mode carries no `FXCMatvecData` (`fxc: None`): the MO-on-grid
 /// projections and weighted `wfxc` table are MO-only.
 pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
+    prepare_ao_data_with_spin(scf, None)
+}
+
+/// [`prepare_ao_data`] with an explicit singlet/triplet override for the
+/// restricted kernel (tddft.rs reads `tddft_spin` from the ctrl keyword
+/// otherwise). Used by the stability module: internal = "singlet",
+/// external RHF→UHF = "triplet" — independent of the deck's `tddft_spin`.
+pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTData {
     let is_uhf = scf.scftype == SCFType::UHF;
     let sector_list = crate::ri_tddft::utils::tddft_sector_params(scf);
     let n_sec = sector_list.len();
@@ -259,7 +267,9 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
         // Triplet:   f_t = f↑↑ − f↑↓ cannot be obtained from an unpolarized
         //            evaluation; it requires a spin-polarized evaluation at
         //            (ρ/2, ∇ρ/2) per spin, combined along the antisymmetric direction.
-        let tddft_spin = scf.mol.ctrl.tddft.as_ref().map_or("singlet", |t| t.tddft_spin.as_str());
+        let tddft_spin = tddft_spin.unwrap_or_else(|| {
+            scf.mol.ctrl.tddft.as_ref().map_or("singlet", |t| t.tddft_spin.as_str())
+        });
         let rho0_g = rho0_r.i((.., .., 0)); // [ngrids, nvar] ground density + gradients
         let fxc_eff_r = match tddft_spin {
             "triplet" => {

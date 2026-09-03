@@ -50,6 +50,13 @@ pub struct TDDFTParameters {
     // above this are excluded from the TDDFT excitation space. Default 1e6
     // (effectively no cutoff).
     pub tddft_cutoff_energy: f64,
+    // SCF stability analysis (replaces the former top-level `check_stab`):
+    // "off" (default) | "internal" | "external" | "full".
+    // internal: RHF/RKS singlet or UHF/UKS orbital Hessian; external:
+    // RHF→UHF (triplet) check. Real→complex and UHF→GHF not implemented.
+    pub stability: String,
+    pub stability_nroots: usize, // Davidson roots for the Hessian (lowest eigenvalues)
+    pub stability_tol: f64,      // Davidson convergence tolerance for the Hessian
 }
 
 impl Default for TDDFTParameters {
@@ -96,6 +103,9 @@ impl Default for TDDFTParameters {
             tddft_feast_gaussian_width_factor: 0.5,
             tddft_use_optimized_fxc: true,
             tddft_cutoff_energy: 1.0e6,
+            stability: String::from("off"),
+            stability_nroots: 3,
+            stability_tol: 1.0e-4,
         }
     }
 }
@@ -290,6 +300,20 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
             p.tddft_cutoff_energy = match tmp_ctrl.get("tddft_cutoff_energy").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e6),
                 _ => 1.0e6,
+            };
+            // SCF stability analysis
+            p.stability = match tmp_ctrl.get("stability").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase(),
+                serde_json::Value::Bool(true) => String::from("internal"),
+                _ => String::from("off"),
+            };
+            p.stability_nroots = match tmp_ctrl.get("stability_nroots").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(3) as usize,
+                _ => 3,
+            };
+            p.stability_tol = match tmp_ctrl.get("stability_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-4),
+                _ => 1.0e-4,
             };
             Ok(Some(p))
         },

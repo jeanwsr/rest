@@ -289,3 +289,128 @@ fn test_b_exchange_transpose_identity() {
     }
     assert!(max_d < 1e-10, "B-block exchange identity violated: max|D| = {max_d:e}");
 }
+
+// --- Response API tests: commented out (API disabled) ---
+#[cfg(any())]
+// ══════════════════════════════════════════════════════════════════
+// Density-space response operator (response_potential_batched / SCFResponse)
+// fxc is skipped in these synthetic tests (no kernel tables → HF-only
+// response); the full J+K+fxc stack is validated against a_matvec_ao_batched
+// with real decks at runtime.
+// ══════════════════════════════════════════════════════════════════
+
+/// RHF: v1 = w_J·J[P] − c_x·K[P] with w_J = 1 ('R'), checked against the
+/// explicit ri_jk primitives.
+#[cfg(any())]
+#[test]
+fn test_response_potential_rhf() {
+    let nao = 6; let naux = 4; let m = 3;
+    let rimatr = synthetic_rimatr(nao, naux);
+    let (ri3fn, _, _) = rimatr.as_ref().unwrap();
+    let device = DeviceBLAS::default();
+    let cderi = ri3fn.to_rstsr_view(&device);
+
+    let mut data = build_ao_data(1);
+    data.alpha_hybrid = 0.3;
+    assert_eq!(data.n_sectors(), 1);
+
+    let ps: Vec<MatrixFull<f64>> = (0..m)
+        .map(|s| MatrixFull::from_vec([nao, nao], pseudo(nao * nao, 30.0 + s as f64)).unwrap())
+        .collect();
+
+    let v1 = response_potential_batched(&mut data, &rimatr, &[ps.clone()], 'R');
+    assert_eq!(v1.len(), m);
+
+    let dms = ps.as_slice().to_rstsr(&device);
+    let js = get_vj_ri_incore_nonsym(cderi.view(), dms.view());
+    let ks = get_vk_ri_incore_dm(cderi.view(), dms.view(), naux);
+    for s in 0..m {
+        for (idx, (j, k)) in js.i((.., .., s)).iter().zip(ks.i((.., .., s)).iter()).enumerate() {
+            let expect = j - 0.3 * k;
+            assert!((v1[s].data[idx] - expect).abs() < 1e-12,
+                "v1[{}][{}] = {} vs {}", s, idx, v1[s].data[idx], expect);
+        }
+    }
+}
+
+/// Restricted Coulomb conventions: 'S' doubles J, 'T' removes it (c_x = 0).
+#[cfg(any())]
+#[test]
+fn test_response_potential_xlet_factors() {
+    let nao = 6; let naux = 4; let m = 2;
+    let rimatr = synthetic_rimatr(nao, naux);
+    let mut data = build_ao_data(1);
+    data.alpha_hybrid = 0.0;
+
+    let ps: Vec<MatrixFull<f64>> = (0..m)
+        .map(|s| MatrixFull::from_vec([nao, nao], pseudo(nao * nao, 40.0 + s as f64)).unwrap())
+        .collect();
+
+    let v_s = response_potential_batched(&mut data, &rimatr, &[ps.clone()], 'S');
+    let v_r = response_potential_batched(&mut data, &rimatr, &[ps.clone()], 'R');
+    let v_t = response_potential_batched(&mut data, &rimatr, &[ps.clone()], 'T');
+    for s in 0..m {
+        for idx in 0..nao * nao {
+            assert!((v_s[s].data[idx] - 2.0 * v_r[s].data[idx]).abs() < 1e-12,
+                "S vs 2R [{}][{}]", s, idx);
+            assert!(v_t[s].data[idx].abs() < 1e-14, "T triplet must be zero [{}][{}]", s, idx);
+        }
+    }
+}
+
+/// UKS: J spin-blind (both sectors' densities), K same-spin only.
+#[cfg(any())]
+#[test]
+fn test_response_potential_uks() {
+    let nao = 6; let naux = 4; let m = 2;
+    let rimatr = synthetic_rimatr(nao, naux);
+    let (ri3fn, _, _) = rimatr.as_ref().unwrap();
+    let device = DeviceBLAS::default();
+    let cderi = ri3fn.to_rstsr_view(&device);
+
+    let mut data = build_ao_data(1);
+    data.alpha_hybrid = 0.25;
+    data.reftype = pyrest::scf_io::SCFType::UHF;
+    let c2_occ = MatrixFull::from_vec([nao, 3], pseudo(nao * 3, 50.5)).unwrap();
+    let c2_vir = MatrixFull::from_vec([nao, 4], pseudo(nao * 4, 51.5)).unwrap();
+    data.c_occ.push(c2_occ);
+    data.c_vir.push(c2_vir);
+    assert_eq!(data.n_sectors(), 2);
+
+    let ps_a: Vec<MatrixFull<f64>> = (0..m)
+        .map(|s| MatrixFull::from_vec([nao, nao], pseudo(nao * nao, 60.0 + s as f64)).unwrap())
+        .collect();
+    let ps_b: Vec<MatrixFull<f64>> = (0..m)
+        .map(|s| MatrixFull::from_vec([nao, nao], pseudo(nao * nao, 70.0 + s as f64)).unwrap())
+        .collect();
+
+    let v1 = response_potential_batched(&mut data, &rimatr, &[ps_a.clone(), ps_b.clone()], 'R');
+    assert_eq!(v1.len(), 2 * m);
+
+    // references
+    let dms_a = ps_a.as_slice().to_rstsr(&device);
+    let dms_b = ps_b.as_slice().to_rstsr(&device);
+    let j_a = get_vj_ri_incore_nonsym(cderi.view(), dms_a.view());
+    let j_b = get_vj_ri_incore_nonsym(cderi.view(), dms_b.view());
+    let k_a = get_vk_ri_incore_dm(cderi.view(), dms_a.view(), naux);
+    let k_b = get_vk_ri_incore_dm(cderi.view(), dms_b.view(), naux);
+
+    for s in 0..m {
+        let j_sum: Vec<f64> = j_a.i((.., .., s)).iter()
+            .zip(j_b.i((.., .., s)).iter())
+            .map(|(ja, jb)| ja + jb)
+            .collect();
+        // alpha sector: J[Pa] + J[Pb] − 0.25 K[Pa]
+        for (idx, ka) in k_a.i((.., .., s)).iter().enumerate() {
+            let expect = j_sum[idx] - 0.25 * ka;
+            assert!((v1[s].data[idx] - expect).abs() < 1e-12,
+                "UKS v1_a[{}][{}] = {} vs {}", s, idx, v1[s].data[idx], expect);
+        }
+        // beta sector (block offset m): J sum − 0.25 K[Pb]
+        for (idx, kb) in k_b.i((.., .., s)).iter().enumerate() {
+            let expect = j_sum[idx] - 0.25 * kb;
+            assert!((v1[m + s].data[idx] - expect).abs() < 1e-12,
+                "UKS v1_b[{}][{}] = {} vs {}", s, idx, v1[m + s].data[idx], expect);
+        }
+    }
+}

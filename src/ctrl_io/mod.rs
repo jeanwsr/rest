@@ -310,8 +310,6 @@ pub struct InputKeywords {
     #[pyo3(get, set)]
     pub noiter: bool,
     #[pyo3(get, set)]
-    pub check_stab: bool,
-    #[pyo3(get, set)]
     pub use_dm_only: bool,
     #[pyo3(get, set)]
     pub vxc_screen_threshold: f64,
@@ -508,7 +506,6 @@ impl InputKeywords {
             initial_guess: String::from("sad"),
             basis_projection: String::from("occupied"),
             noiter: false,
-            check_stab: false,
             // Kyewords for the manner to evaluate the Vk (and also Vxc) potentials
             // True:  using only density matrix in the evaluation
             // False: use coefficients as well with higher efficiency
@@ -1520,11 +1517,6 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
 
             tmp_input.noiter = match tmp_ctrl.get("noiter").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
-                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
-                other => false,
-            };
-            tmp_input.check_stab = match tmp_ctrl.get("check_stab").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
                 serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
                 other => false,

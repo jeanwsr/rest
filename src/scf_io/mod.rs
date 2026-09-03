@@ -12,7 +12,6 @@ use crate::utilities::{self, TimeRecords};
 use crate::utilities::memory_batch::*;
 use crate::ctrl_io::ri_jk_io::*;
 
-mod addons;
 mod fchk;
 pub mod print;
 mod pyrest_scf_io;

@@ -272,11 +272,19 @@ pub fn main_driver() -> anyhow::Result<()> {
         _ => {}
     }
 
-    if scf_data.mol.ctrl.check_stab {
-        time_mark.new_item("Stability", "the scf stability check");
+    let stab_mode = scf_data
+        .mol
+        .ctrl
+        .tddft
+        .as_ref()
+        .map_or(String::from("off"), |t| t.stability.clone());
+    if stab_mode != "off" {
+        time_mark.new_item("Stability", "the SCF stability analysis (TDDFT Hessian)");
         time_mark.count_start("Stability");
 
-        scf_data.stability();
+        if let Err(e) = crate::ri_tddft::stability::stability(&scf_data) {
+            panic!("stability analysis failed: {e}");
+        }
 
         time_mark.count("Stability");
     }
@@ -368,7 +376,11 @@ pub fn main_driver() -> anyhow::Result<()> {
     // Now for TDDFT calculations
     //===================================
             if let Some(tddft_ctrl) = &scf_data.mol.ctrl.tddft {
-        if !tddft_ctrl.response_tddft {
+        // A stability analysis (`[tddft] stability != "off"`, run above) is
+        // mutually exclusive with the excitation-energy run: a stability-only
+        // deck carries the [tddft] section for the stability keywords alone.
+        let stability_requested = tddft_ctrl.stability != "off";
+        if !tddft_ctrl.response_tddft && !stability_requested {
             time_mark.new_item("TDDFT", "the TDDFT eigenvalue calculation");
             time_mark.count_start("TDDFT");
             match crate::ri_tddft::tddft_main(&mut scf_data) {
