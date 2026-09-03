@@ -74,7 +74,9 @@
 
 use std::f64::consts::PI;
 use tensors::MatrixFull;
+use crate::constants::solvent as data;
 use crate::constants::{BOHR, HARTREE2KCAL};
+use super::surface_utils::SmdCavityRadii;
 
 // ============================================================================
 //  Debug printing helper (controlled by env var REST_CDS_DEBUG=1)
@@ -2084,6 +2086,11 @@ fn cds_eg(
 /// - `coords`: Cartesian coordinates `[nat][3]` in **Bohr**
 /// - `icds`: solvent type — 1 = water, 2 = non-aqueous
 /// - `solvent_descriptors`: `[n, n25, α, β, γ, ε, φ, ψ]` (only used when icds=2)
+/// - `smd_cavity_radii`: SMD radii scheme:
+///   - `Bondi` (default): all elements use `BONDI[z] + 0.4` (mnsol.F `VDWRAD`, aligned with PySCF)
+///   - `BondiUff`: the 11 eq.16 elements keep `BONDI[z]`; other elements use
+///     `BONDI_UFF_RADII[z]*BOHR` (reference snapshot table, bohr→Å); zero entries are
+///     defensive only (table covers Z=1..103) and fall back to `BONDI[z]`
 ///
 /// # Returns
 /// - `gcds`: CDS free energy (Hartree)
@@ -2094,6 +2101,7 @@ pub fn compute_cds(
     coords: &[[f64; 3]],
     icds: i32,
     solvent_descriptors: &[f64; 8],
+    smd_cavity_radii: SmdCavityRadii,
 ) -> (f64, f64, Vec<[f64; 3]>) {
     let nat = atomic_numbers.len();
     let mut sigma = [0.0f64; 151];
@@ -2113,9 +2121,26 @@ pub fn compute_cds(
         )
     };
 
-    // Effective radius = Bondi vdW + 0.4 Å solvent probe
+    // Effective SASA sphere radius per atom: `rad[k] = R_base(Z_k) + 0.4 Å` (solvent probe).
+    // Bondi scheme: R_base = BONDI[Z] (mnsol.F VDWRAD, legacy).
+    // BondiUff scheme: eq.16 elements keep BONDI[Z]; others use BONDI_UFF_RADII[Z]*BOHR
+    // (bohr→Å via REST BOHR = 0.529177 Å/bohr, multiplication); zero entry is defensive only.
     let rad: Vec<f64> = atomic_numbers.iter()
-        .map(|&z| if z < 103 { BONDI[z] } else { 0.0 } + 0.4)
+        .map(|&z| {
+            let base = match smd_cavity_radii {
+                SmdCavityRadii::Bondi => BONDI[z.min(102)],
+                SmdCavityRadii::BondiUff => {
+                    if natcnv(z) != 0 {
+                        BONDI[z.min(102)]
+                    } else if z < data::BONDI_UFF_RADII.len() && data::BONDI_UFF_RADII[z] > 0.0 {
+                        data::BONDI_UFF_RADII[z] * BOHR
+                    } else {
+                        BONDI[z.min(102)]
+                    }
+                }
+            };
+            base + 0.4
+        })
         .collect();
 
     let (gcds_kcal, tarea, dcds) = cds_eg(
