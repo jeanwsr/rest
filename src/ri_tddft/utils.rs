@@ -94,20 +94,7 @@ pub fn tddft_get_submatrix(
     lumo: usize,
     num_state: usize,
 ) -> MatrixFull<f64> {
-    let range_oo = (start_mo..homo + 1, start_mo..homo + 1);
-    let range_vv = (lumo..num_state, lumo..num_state);
-    let range_ov = (start_mo..homo + 1, lumo..num_state);
-
-    let ranges = if choice_a == 'O' && choice_b == 'O' {
-        range_oo
-    } else if choice_a == 'V' && choice_b == 'V' {
-        range_vv
-    } else if choice_a == 'O' && choice_b == 'V' {
-        range_ov
-    } else {
-        panic!("tddft_get_submatrix: invalid choice {}/{}", choice_a, choice_b);
-    };
-
+    let ranges = tddft_submatrix_ranges(choice_a, choice_b, start_mo, homo, lumo, num_state);
     let vector = scf.generate_ri3mo_rayon_for_multiple_times(ranges.0, ranges.1);
     let matrix: MatrixFull<f64> = vector[0].0.rifull_to_matfull_i_jk();
     println!(
@@ -117,6 +104,30 @@ pub fn tddft_get_submatrix(
     matrix
 }
 
+/// Get the short-range (RSH, erfc operator) RI submatrix for TDDFT.
+///
+/// Same construction as [`tddft_get_submatrix`] but built from the
+/// short-range 3-center integrals (`rimatr_sr`).
+pub fn tddft_get_submatrix_sr(
+    scf: &SCF,
+    choice_a: char,
+    choice_b: char,
+    start_mo: usize,
+    occ_size: usize,
+    vir_size: usize,
+    homo: usize,
+    lumo: usize,
+    num_state: usize,
+) -> MatrixFull<f64> {
+    let ranges = tddft_submatrix_ranges(choice_a, choice_b, start_mo, homo, lumo, num_state);
+    let vector = scf.generate_ri3mo_sr_rayon_for_multiple_times(ranges.0, ranges.1);
+    let matrix: MatrixFull<f64> = vector[0].0.rifull_to_matfull_i_jk();
+    println!(
+        "TDDFT RI Tensor (SR): {}-{}, Size={:?}, naux={}",
+        choice_a, choice_b, matrix.size, matrix.size[0]
+    );
+    matrix
+}
 
 /// Get a spin-resolved RI submatrix for unrestricted TDDFT.
 ///
@@ -135,20 +146,7 @@ pub fn tddft_get_submatrix_spin(
     num_state: usize,
     spin: usize,
 ) -> MatrixFull<f64> {
-    let range_oo = (start_mo..homo + 1, start_mo..homo + 1);
-    let range_vv = (lumo..num_state, lumo..num_state);
-    let range_ov = (start_mo..homo + 1, lumo..num_state);
-
-    let ranges = if choice_a == 'O' && choice_b == 'O' {
-        range_oo
-    } else if choice_a == 'V' && choice_b == 'V' {
-        range_vv
-    } else if choice_a == 'O' && choice_b == 'V' {
-        range_ov
-    } else {
-        panic!("tddft_get_submatrix_spin: invalid choice {}/{}", choice_a, choice_b);
-    };
-
+    let ranges = tddft_submatrix_ranges(choice_a, choice_b, start_mo, homo, lumo, num_state);
     let vector = scf.generate_ri3mo_rayon_for_multiple_times(ranges.0, ranges.1);
     if spin >= vector.len() {
         panic!(
@@ -164,6 +162,101 @@ pub fn tddft_get_submatrix_spin(
     );
     matrix
 }
+
+/// Get a spin-resolved short-range (RSH) RI submatrix for unrestricted TDDFT.
+pub fn tddft_get_submatrix_sr_spin(
+    scf: &SCF,
+    choice_a: char,
+    choice_b: char,
+    start_mo: usize,
+    occ_size: usize,
+    vir_size: usize,
+    homo: usize,
+    lumo: usize,
+    num_state: usize,
+    spin: usize,
+) -> MatrixFull<f64> {
+    let ranges = tddft_submatrix_ranges(choice_a, choice_b, start_mo, homo, lumo, num_state);
+    let vector = scf.generate_ri3mo_sr_rayon_for_multiple_times(ranges.0, ranges.1);
+    if spin >= vector.len() {
+        panic!(
+            "tddft_get_submatrix_sr_spin: spin {} requested but only {} RI channels are available",
+            spin,
+            vector.len()
+        );
+    }
+    let matrix: MatrixFull<f64> = vector[spin].0.rifull_to_matfull_i_jk();
+    println!(
+        "TDDFT RI Tensor (SR, spin {}): {}-{}, Size={:?}, naux={}",
+        spin, choice_a, choice_b, matrix.size, matrix.size[0]
+    );
+    matrix
+}
+
+/// MO ranges of the occ-occ / vir-vir / occ-vir RI blocks for TDDFT.
+fn tddft_submatrix_ranges(
+    choice_a: char,
+    choice_b: char,
+    start_mo: usize,
+    homo: usize,
+    lumo: usize,
+    num_state: usize,
+) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+    let range_oo = (start_mo..homo + 1, start_mo..homo + 1);
+    let range_vv = (lumo..num_state, lumo..num_state);
+    let range_ov = (start_mo..homo + 1, lumo..num_state);
+    if choice_a == 'O' && choice_b == 'O' {
+        range_oo
+    } else if choice_a == 'V' && choice_b == 'V' {
+        range_vv
+    } else if choice_a == 'O' && choice_b == 'V' {
+        range_ov
+    } else {
+        panic!("tddft_submatrix_ranges: invalid choice {}/{}", choice_a, choice_b);
+    }
+}
+
+/// Reshape the raw [naux, n*m] RI tensors into the layouts used by the
+/// exchange contractions in `matvec`:
+/// oo: [naux, occ*occ] -> [occ*naux, occ],
+/// vv: [naux, vir*vir] -> [naux*vir, vir],
+/// ov: [naux, occ*vir] -> [naux*occ, vir].
+pub fn reshape_exchange_tensors(
+    oo: &MatrixFull<f64>,
+    vv: &MatrixFull<f64>,
+    ov: &MatrixFull<f64>,
+    occ_size: usize,
+    vir_size: usize,
+) -> (MatrixFull<f64>, MatrixFull<f64>, MatrixFull<f64>) {
+    let num_auxbas = ov.size[0];
+
+    let mut oo_exch = oo.clone();
+    oo_exch.reshape([num_auxbas * occ_size, occ_size]);
+    let mut oo_exch = oo_exch.transpose_and_drop();
+    oo_exch.reshape([occ_size * num_auxbas, occ_size]);
+
+    let mut vv_exch = vv.clone();
+    vv_exch.reshape([num_auxbas * vir_size, vir_size]);
+
+    let mut ov_exch = ov.clone();
+    ov_exch.reshape([num_auxbas * occ_size, vir_size]);
+
+    (oo_exch, vv_exch, ov_exch)
+}
+
+/// HF-exchange coefficients of a range-separated hybrid for the TDDFT response.
+///
+/// Returns `None` unless the DFA is a range-separated hybrid. Otherwise
+/// returns `(omega, coeff_full, coeff_sr)` such that the HF exchange of the
+/// response reads `coeff_full*K_full + coeff_sr*K_SR` with
+/// `coeff_full = c_LR` and `coeff_sr = c_SR - c_LR`, mirroring the
+/// ground-state Fock build in `scf_io`.
+pub fn rsh_exchange_coeffs(scf: &SCF) -> Option<(f64, f64, f64)> {
+    let (omega, alpha_lr, _beta) = scf.mol.xc_data.rsh_params()?;
+    let c_sr = scf.mol.xc_data.dfa_hybrid_scf; // = c_SR = alpha + beta for RSH
+    Some((omega, alpha_lr, c_sr - alpha_lr))
+}
+
 
 /// Compute dipole moment integrals in MO basis for TDDFT
 ///
