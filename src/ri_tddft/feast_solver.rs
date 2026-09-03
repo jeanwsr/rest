@@ -19,13 +19,9 @@ use crate::ri_tddft::matvec;
 /// Returns eigenpairs: (eigenvalue, eigenvector) sorted by eigenvalue.
 pub fn feast_solve_tddft_tda(
     scf: &SCF,
-    fxc_data: &FXCMatvecData,
-    ri_ov: &MatrixFull<f64>,
-    ri_oo_exch: &MatrixFull<f64>,
-    ri_vv_exch: &MatrixFull<f64>,
+    data: &crate::ri_tddft::TDDFTData,
     hdiag: &Vec<f64>,
     xlet: char,
-    alpha_hybrid: f64,
     // FEAST parameters
     eigenrange_min: f64,
     eigenrange_max: f64,
@@ -50,7 +46,7 @@ pub fn feast_solve_tddft_tda(
 
     // A-block matvec: A(z) = Coulomb + exchange + fxc
     let feast_a_matvec = |z: &Vec<f64>| -> Vec<f64> {
-        matvec::a_matvec(scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, z, xlet, alpha_hybrid)
+        matvec::a_matvec(scf, data, z, xlet)
     };
 
     // B-matrix = I (standard eigenvalue problem)
@@ -92,14 +88,9 @@ pub fn feast_solve_tddft_tda(
 /// Returns eigenpairs: (excitation_energy, eigenvector_X) sorted by energy.
 pub fn feast_solve_tddft_lr(
     scf: &SCF,
-    fxc_data: &FXCMatvecData,
-    ri_ov: &MatrixFull<f64>,
-    ri_oo_exch: &MatrixFull<f64>,
-    ri_vv_exch: &MatrixFull<f64>,
-    ri_ov_exch: &MatrixFull<f64>,
+    data: &crate::ri_tddft::TDDFTData,
     hdiag: &Vec<f64>,
     xlet: char,
-    alpha_hybrid: f64,
     // FEAST parameters
     eigenrange_min: f64,
     eigenrange_max: f64,
@@ -129,8 +120,8 @@ pub fn feast_solve_tddft_lr(
 
     // (A-B) matvec: used as the "A" operator in the transformed EVP
     let feast_a_matvec = |z: &Vec<f64>| -> Vec<f64> {
-        let a = matvec::a_matvec(scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, z, xlet, alpha_hybrid);
-        let b = matvec::b_matvec(scf, fxc_data, ri_ov, ri_ov_exch, z, xlet, alpha_hybrid);
+        let a = matvec::a_matvec(scf, data, z, xlet);
+        let b = matvec::b_matvec(scf, data, z, xlet);
         a.into_iter().zip(b.into_iter()).map(|(a, b)| a - b).collect()
     };
 
@@ -139,8 +130,8 @@ pub fn feast_solve_tddft_lr(
     // (A+B) * y = z via CG.
     let feast_b_matvec = |z: &Vec<f64>| -> Vec<f64> {
         let apb_matvec = |p: &Vec<f64>| -> Vec<f64> {
-            let a = matvec::a_matvec(scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, p, xlet, alpha_hybrid);
-            let b = matvec::b_matvec(scf, fxc_data, ri_ov, ri_ov_exch, p, xlet, alpha_hybrid);
+            let a = matvec::a_matvec(scf, data, p, xlet);
+            let b = matvec::b_matvec(scf, data, p, xlet);
             a.into_iter().zip(b.into_iter()).map(|(a, b)| a + b).collect()
         };
         crate::ri_bse::feast_solver::cg(&apb_matvec, z, cg_max_iter, cg_tol)
@@ -151,13 +142,13 @@ pub fn feast_solve_tddft_lr(
     let gmres_a_mul = |z: &Vec<f64>| -> Vec<f64> {
         // (A-B)*z
         let amb = {
-            let a = matvec::a_matvec(scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, z, xlet, alpha_hybrid);
-            let b = matvec::b_matvec(scf, fxc_data, ri_ov, ri_ov_exch, z, xlet, alpha_hybrid);
+            let a = matvec::a_matvec(scf, data, z, xlet);
+            let b = matvec::b_matvec(scf, data, z, xlet);
             a.into_iter().zip(b.into_iter()).map(|(a, b)| a - b).collect::<Vec<f64>>()
         };
         // (A+B)*(A-B)*z = (A+B)*amb
-        let a_amb = matvec::a_matvec(scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, &amb, xlet, alpha_hybrid);
-        let b_amb = matvec::b_matvec(scf, fxc_data, ri_ov, ri_ov_exch, &amb, xlet, alpha_hybrid);
+        let a_amb = matvec::a_matvec(scf, data, &amb, xlet);
+        let b_amb = matvec::b_matvec(scf, data, &amb, xlet);
         a_amb.into_iter().zip(b_amb.into_iter()).map(|(a, b)| a + b).collect()
     };
 
