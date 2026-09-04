@@ -73,6 +73,18 @@ pub fn rpa_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         };
         scf_data.generate_ri3mo_rayon(vir_range, occ_range);
 
+        // Phase-0 guard (P0-3): the RPA response kernel (evaluate_response_serial)
+        // indexes the RI3MO tensor with global auxiliary-basis ranges (num_auxbas) and
+        // is incompatible with the MPI aux-distributed layout. Without this guard the
+        // run would dive into out-of-bounds reads deep inside the kernel.
+        if mpi_operator.is_some() || scf_data.mol.mpi_data.is_some() {
+            panic!(
+                "The MPI implementation is not yet available for the RPA correlation energy: \
+                 the response kernel indexes RI3MO with global auxiliary-basis ranges and is \
+                 incompatible with the MPI aux-distributed layout. Please run RPA without MPI \
+                 for now."
+            );
+        }
         rpa_c_energy = evaluate_rpa_correlation_rayon(scf_data).unwrap();
         //rpa_c_energy = evaluate_rpa_correlation(scf_data).unwrap();
 

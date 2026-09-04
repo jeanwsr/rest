@@ -262,7 +262,12 @@ pub fn evaluate_special_radius_only(scf_data: &SCF) -> anyhow::Result<[f64;2]>  
 
 pub fn evaluate_osrpa_correlation_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]>  {
     if let (Some(mpi_op), Some(mpi_ix)) = (mpi_operator, &scf_data.mol.mpi_data) {
-        panic!("The MPI implementation is not yet available for the SCSRPA evaluation")
+        panic!(
+            "The MPI implementation is not yet available for the SCSRPA evaluation (e.g. R-xDH7): \
+             the spin-response kernel indexes the RI3MO tensor with global auxiliary-basis ranges \
+             (num_auxbas) and is incompatible with the MPI aux-distributed layout; \
+             neither the 2.5D dispatch nor this 1D fallback can run this family under MPI"
+        )
         //let (rpa_c, _) = evaluate_osrpa_correlation_detailed_rayon_mpi(scf_data, mpi_op, mpi_ix).unwrap();
         //Ok(rpa_c)
     } else {
