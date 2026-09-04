@@ -215,19 +215,19 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
                 SCFType::RHF => match  dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi_25d(&scf_data,mpi_operator).unwrap(),
                     crate::dft::DFAFamily::SBGE2 => crate::ri_pt2::sbge2_25d::close_shell_sbge2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
-                    crate::dft::DFAFamily::SCSRPA => unreachable!("2.5d not implemented for SCSRPA"),
+                    crate::dft::DFAFamily::SCSRPA => panic!("2.5D MPI path is not implemented for SCSRPA (e.g. R-xDH7): its correlation kernel indexes the RI3MO tensor with global auxiliary-basis ranges and is incompatible with the MPI aux-distributed layout; no MPI path (2.5D or 1D) is currently available for this family"),
                     _ => [0.0,0.0,0.0]
                 },
                 SCFType::UHF => match  dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => open_shell_pt2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
                     crate::dft::DFAFamily::SBGE2 => crate::ri_pt2::sbge2_25d::open_shell_sbge2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
-                    crate::dft::DFAFamily::SCSRPA => unreachable!("2.5d not implemented for SCSRPA"),
+                    crate::dft::DFAFamily::SCSRPA => panic!("2.5D MPI path is not implemented for SCSRPA (e.g. R-xDH7): its correlation kernel indexes the RI3MO tensor with global auxiliary-basis ranges and is incompatible with the MPI aux-distributed layout; no MPI path (2.5D or 1D) is currently available for this family"),
                     _ => [0.0,0.0,0.0]
                 },
                 SCFType::ROHF => match dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => restricted_open_shell_pt2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
                     crate::dft::DFAFamily::SBGE2 => crate::ri_pt2::sbge2_25d::open_shell_sbge2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
-                    crate::dft::DFAFamily::SCSRPA => unreachable!("2.5d not implemented for SCSRPA"),
+                    crate::dft::DFAFamily::SCSRPA => panic!("2.5D MPI path is not implemented for SCSRPA (e.g. R-xDH7): its correlation kernel indexes the RI3MO tensor with global auxiliary-basis ranges and is incompatible with the MPI aux-distributed layout; no MPI path (2.5D or 1D) is currently available for this family"),
                     _ => [0.0,0.0,0.0]
                 }
             };
@@ -257,6 +257,19 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
 
         timerecords.count("c_r5dft");
     } else {
+        // Phase-0 guard (P0-1): the primitive path below implements ONLY the PT2 kernel.
+        // For the SCSRPA/RPA families it would silently compute an MP2-like correlation
+        // energy and store it under the "scsrpa"/"rpa" label — a wrong total energy with
+        // no warning. Hard-error instead of silent wrong physics.
+        match dfa_family_pos {
+            crate::dft::DFAFamily::SCSRPA | crate::dft::DFAFamily::RPA => panic!(
+                "xc = `{}` (post-SCF family {:?}): the non-RI-symm path (use_ri_symm = false) \
+                 only implements the PT2 kernel and would silently return a wrong correlation \
+                 energy for this family. Please set use_ri_symm = true.",
+                scf_data.mol.ctrl.xc, dfa_family_pos
+            ),
+            _ => {}
+        }
         pt2_c = if scf_data.mol.spin_channel == 1 {
             close_shell_pt2(&scf_data).unwrap()
         } else {
