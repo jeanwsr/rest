@@ -52,6 +52,15 @@ pub struct TDDFTParameters {
     pub pysoc: bool,
 }
 
+/// Default Davidson subspace size for the TDDFT eigen-solvers.
+///
+/// The full-LR Davidson needs a subspace large enough to converge before the
+/// first restart (each iteration adds ~nroots residual vectors); with the
+/// previous default of 8 (effective ~4*nroots) the subspace collapsed to an
+/// empty set and the LR solver failed for all functionals. 60 converges the
+/// full-LR Davidson in ~8 iterations for typical valence-excitation problems.
+pub const DEFAULT_DAVIDSON_MAX_SUBSPACE: usize = 60;
+
 impl Default for TDDFTParameters {
     fn default() -> Self {
         TDDFTParameters {
@@ -60,7 +69,11 @@ impl Default for TDDFTParameters {
             nroots: 6,
             davidson_tol: 1.0e-10,
             davidson_max_iter: 50,
-            davidson_max_subspace: 8,
+            // The full-LR Davidson needs a subspace large enough to converge
+            // before the first restart (each iteration adds ~nroots vectors);
+            // with the previous default of 8 (effective ~4*nroots) the solver
+            // collapsed to an empty subspace and failed for all functionals.
+            davidson_max_subspace: 60,
             response_tddft: false,
             response_tddft_solver: String::from("klopper"),
             response_tddft_tol: 1.0e-6,
@@ -121,8 +134,8 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
                 _ => 50,
             };
             p.davidson_max_subspace = match tmp_ctrl.get("davidson_max_subspace").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(n) => n.as_u64().unwrap_or(8) as usize,
-                _ => 8,
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(DEFAULT_DAVIDSON_MAX_SUBSPACE as u64) as usize,
+                _ => DEFAULT_DAVIDSON_MAX_SUBSPACE,
             };
             // Response TDDFT parameters
             p.response_tddft = match tmp_ctrl.get("response_tddft").unwrap_or(&serde_json::Value::Null) {
