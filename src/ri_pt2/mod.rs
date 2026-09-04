@@ -209,7 +209,12 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         timerecords.count("ao2mo");
         timerecords.count_start("c_r5dft");
 
+        #[cfg(feature = "mpi")]
         let use_25d = check_conditions_25d(&scf_data, mpi_operator);
+        #[cfg(not(feature = "mpi"))]
+        let use_25d = false;
+
+        #[cfg(feature = "mpi")]
         if use_25d {
             pt2_c = match scf_data.scftype {
                 SCFType::RHF => match  dfa_family_pos {
@@ -232,7 +237,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
                 }
             };
         }
-        else {
+        if !use_25d {
             pt2_c = match scf_data.scftype {
                 SCFType::RHF => match  dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi(&scf_data,mpi_operator).unwrap(),
@@ -1302,6 +1307,7 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
 
 }
 
+#[cfg(feature = "mpi")]
 fn check_conditions_25d(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> bool {
     let mut use_25d = true;
 
@@ -1371,6 +1377,7 @@ fn check_conditions_25d(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> b
     global_use_25d
 }
 
+#[cfg(feature = "mpi")]
 pub fn open_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
     if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
 
@@ -1437,6 +1444,7 @@ pub fn open_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Option<MPIOpe
     }
 }
 
+#[cfg(feature = "mpi")]
 pub fn restricted_open_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
     if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
 
@@ -1503,6 +1511,7 @@ pub fn restricted_open_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Op
     }
 }
 
+#[cfg(feature = "mpi")]
 pub fn close_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
     if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
 
