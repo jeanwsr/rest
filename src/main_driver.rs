@@ -769,7 +769,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
 
         // 2. dftd gradient data
         //    we will force to evaluate dftd gradient, since dftd3 is not bottleneck for small to medium molecules
-        use crate::grad::dftd::DFTDGrad;
+        use crate::dftd::grad::DFTDGrad;
         let mut grad_data_dftd = DFTDGrad::new(&scf_data);
         grad_data_dftd.make_grad();
         // only append the dftd gradient if dftd really exists

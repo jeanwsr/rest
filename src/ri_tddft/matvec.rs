@@ -20,6 +20,39 @@ use crate::scf_io::SCF;
 use crate::ri_bse;
 use crate::dft::num_int::{FXCMatvecData, FXCMatvecDataUnrestricted, fxc_matvec, fxc_matvec_unrestricted};
 use crate::ri_tddft::utils::tddft_occupation_parameters;
+use crate::ri_tddft::TDDFTData;
+
+// ── Timing instrumentation for the MO matvec (debug level; see `mo_timing_report`) ──
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+use crate::ri_tddft::matvec_ao::{add_ns, s_of};
+
+pub static T_MV_J: AtomicU64 = AtomicU64::new(0); // Coulomb (RI contraction)
+pub static T_MV_K: AtomicU64 = AtomicU64::new(0); // Exchange (RI tensor DGEMM chain)
+pub static T_MV_FXC: AtomicU64 = AtomicU64::new(0); // fxc kernel application
+pub static T_MV_ALL: AtomicU64 = AtomicU64::new(0); // whole matvec (incl. diagonal)
+pub static N_MO_MV: AtomicU64 = AtomicU64::new(0);
+
+/// Print the accumulated MO-matvec timing table (debug level, visible with
+/// print_level >= 2). Mirrors `matvec_ao::ao_timing_report`. Note: the MO
+/// Davidson applies the matvec per trial vector, so call counts are per vector.
+pub fn mo_timing_report() {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    let n = N_MO_MV.load(Ordering::Relaxed);
+    let mv = s_of(&T_MV_ALL);
+    log::debug!("MO matvec timing ({} per-vector calls, total {:.3} s):", n, mv);
+    for (name, t) in [
+        ("J (Coulomb)", &T_MV_J),
+        ("K (exchange)", &T_MV_K),
+        ("fxc total", &T_MV_FXC),
+    ] {
+        let v = s_of(t);
+        let pct = if mv > 0.0 { 100.0 * v / mv } else { 0.0 };
+        log::debug!("  {:<12} {:>10.3} s  ({:>5.1}% of matvec)", name, v, pct);
+    }
+}
 
 /// Build the diagonal preconditioner from KS orbital energy differences
 ///
@@ -151,14 +184,17 @@ pub fn exchange_b_matvec(
 /// triplet (xlet='T'): Coulomb factor = 0
 pub fn a_matvec(
     scf: &SCF,
-    fxc_data: &FXCMatvecData,
-    ri_ov: &MatrixFull<f64>,          // [naux, occ*vir], for Coulomb
-    ri_oo_exch: &MatrixFull<f64>,     // [occ*naux, occ], for A exchange
-    ri_vv_exch: &MatrixFull<f64>,     // [naux*vir, vir], for A exchange
+    data: &crate::ri_tddft::TDDFTData,
     z: &Vec<f64>,
     xlet: char,
-    alpha_hybrid: f64,
 ) -> Vec<f64> {
+    let t_mv = Instant::now();
+    N_MO_MV.fetch_add(1, Ordering::Relaxed);
+    let fxc_data = data.fxc.as_ref().expect("MO mode requires fxc data");
+    let ri_ov = data.ri_ov.as_ref().expect("MO mode requires ri_ov");
+    let ri_oo_exch = data.ri_oo_exch.as_ref().expect("MO mode requires ri_oo_exch");
+    let ri_vv_exch = data.ri_vv_exch.as_ref().expect("MO mode requires ri_vv_exch");
+    let alpha_hybrid = fxc_data.alpha_hybrid;
     let occ_size = fxc_data.nocc;
     let vir_size = fxc_data.nvir;
     let dim = occ_size * vir_size;
@@ -179,7 +215,9 @@ pub fn a_matvec(
     // Step 2: Coulomb contribution: 2 * J[z] (singlet only)
     let coulomb_factor = if xlet == 'S' { 2.0 } else if xlet == 'R' { 1.0 } else { 0.0 };
     if coulomb_factor != 0.0 {
+        let t0 = Instant::now();
         let jz = ri_bse::matvec::coulomb_contribution(ri_ov, z);
+        add_ns(&T_MV_J, t0);
         for idx in 0..dim {
             result[idx] += coulomb_factor * jz[idx];
         }
@@ -187,18 +225,23 @@ pub fn a_matvec(
 
     // Step 3: Exchange contribution: -c_x * K_A[z] (hybrid only)
     if alpha_hybrid.abs() > 1e-15 {
+        let t0 = Instant::now();
         let kz = exchange_a_matvec(ri_oo_exch, ri_vv_exch, z, occ_size, vir_size, alpha_hybrid);
+        add_ns(&T_MV_K, t0);
         for idx in 0..dim {
             result[idx] += kz[idx];
         }
     }
 
     // Step 4: XC kernel contribution: fxc[z]
+    let t0 = Instant::now();
     let fxc = fxc_matvec(fxc_data, z);
+    add_ns(&T_MV_FXC, t0);
     for idx in 0..dim {
         result[idx] += fxc[idx];
     }
 
+    add_ns(&T_MV_ALL, t_mv);
     result
 }
 
@@ -212,13 +255,16 @@ pub fn a_matvec(
 /// triplet (xlet='T'): Coulomb factor = 0
 pub fn b_matvec(
     scf: &SCF,
-    fxc_data: &FXCMatvecData,
-    ri_ov: &MatrixFull<f64>,          // [naux, occ*vir], for Coulomb
-    ri_ov_exch: &MatrixFull<f64>,     // [naux*occ, vir], for B exchange
+    data: &crate::ri_tddft::TDDFTData,
     z: &Vec<f64>,
     xlet: char,
-    alpha_hybrid: f64,
 ) -> Vec<f64> {
+    let t_mv = Instant::now();
+    N_MO_MV.fetch_add(1, Ordering::Relaxed);
+    let fxc_data = data.fxc.as_ref().expect("MO mode requires fxc data");
+    let ri_ov = data.ri_ov.as_ref().expect("MO mode requires ri_ov");
+    let ri_ov_exch = data.ri_ov_exch.as_ref().expect("MO mode requires ri_ov_exch");
+    let alpha_hybrid = fxc_data.alpha_hybrid;
     let occ_size = fxc_data.nocc;
     let vir_size = fxc_data.nvir;
     let dim = occ_size * vir_size;
@@ -228,7 +274,9 @@ pub fn b_matvec(
     // Step 1: Coulomb contribution: 2 * J[z] (singlet only)
     let coulomb_factor = if xlet == 'S' { 2.0 } else if xlet == 'R' { 1.0 } else { 0.0 };
     if coulomb_factor != 0.0 {
+        let t0 = Instant::now();
         let jz = ri_bse::matvec::coulomb_contribution(ri_ov, z);
+        add_ns(&T_MV_J, t0);
         for idx in 0..dim {
             result[idx] += coulomb_factor * jz[idx];
         }
@@ -236,18 +284,23 @@ pub fn b_matvec(
 
     // Step 2: Exchange contribution: -c_x * K_B[z]
     if alpha_hybrid.abs() > 1e-15 {
+        let t0 = Instant::now();
         let kz = exchange_b_matvec(ri_ov_exch, z, occ_size, vir_size, alpha_hybrid);
+        add_ns(&T_MV_K, t0);
         for idx in 0..dim {
             result[idx] += kz[idx];
         }
     }
 
     // Step 3: XC kernel contribution: fxc[z]
+    let t0 = Instant::now();
     let fxc = fxc_matvec(fxc_data, z);
+    add_ns(&T_MV_FXC, t0);
     for idx in 0..dim {
         result[idx] += fxc[idx];
     }
 
+    add_ns(&T_MV_ALL, t_mv);
     result
 }
 

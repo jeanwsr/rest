@@ -60,6 +60,7 @@ pub mod constants;
 pub mod solvers;
 pub mod ctrl_io;
 pub mod dft;
+pub mod dftd;
 pub mod geom_io;
 pub mod initial_guess;
 pub mod isdf;

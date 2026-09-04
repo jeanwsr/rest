@@ -37,6 +37,7 @@ use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_thread
 pub mod pt2_25d;
 
 pub mod sbge2;
+pub mod sbge2_25d;
 pub mod pure_pt2_pair_eng;
 pub mod pt2_pair_eng;
 
@@ -213,19 +214,19 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
             pt2_c = match scf_data.scftype {
                 SCFType::RHF => match  dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi_25d(&scf_data,mpi_operator).unwrap(),
-                    crate::dft::DFAFamily::SBGE2 => unreachable!("2.5d not implemented for SBGE2"),
+                    crate::dft::DFAFamily::SBGE2 => crate::ri_pt2::sbge2_25d::close_shell_sbge2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
                     crate::dft::DFAFamily::SCSRPA => unreachable!("2.5d not implemented for SCSRPA"),
                     _ => [0.0,0.0,0.0]
                 },
                 SCFType::UHF => match  dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => open_shell_pt2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
-                    crate::dft::DFAFamily::SBGE2 => unreachable!("2.5d not implemented for SBGE2"),
+                    crate::dft::DFAFamily::SBGE2 => crate::ri_pt2::sbge2_25d::open_shell_sbge2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
                     crate::dft::DFAFamily::SCSRPA => unreachable!("2.5d not implemented for SCSRPA"),
                     _ => [0.0,0.0,0.0]
                 },
                 SCFType::ROHF => match dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => restricted_open_shell_pt2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
-                    crate::dft::DFAFamily::SBGE2 => unreachable!("2.5d not implemented for SBGE2"),
+                    crate::dft::DFAFamily::SBGE2 => crate::ri_pt2::sbge2_25d::open_shell_sbge2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
                     crate::dft::DFAFamily::SCSRPA => unreachable!("2.5d not implemented for SCSRPA"),
                     _ => [0.0,0.0,0.0]
                 }

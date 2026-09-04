@@ -780,6 +780,10 @@ TD-DFT方法相关的设置在 `[tddft]` 区块中进行。REST支持基于RI积
     - `"triplet"`：三重态激发，库仑耦合因子为0。
 - `nroots`: 取值usize，需要计算的激发态数目（根的数目）。缺省为6。
 - `tddft_cutoff_energy`: 取值f64，单位Hartree。KS轨道能量高于此值的虚轨道将被排除在TD-DFT激发空间之外。设置合理值（如20.0-100.0）可显著缩减激发空间维度，加速计算。缺省为1e6（几乎不截断）。
+- `tddft_mode`: 取值String，选择TD-DFT计算模式：`"mo"`（缺省，MO-basis RI）/ `"ao"`（AO-basis）。
+- `grid_batch`: 取值bool，仅AO模式生效，缺省为`true`。
+- `tddft_ao_rik_driver`: 取值String，仅AO模式生效，`"semitrans"`（缺省）/ `"dm"` / `"lowrank"`。
+- `tddft_fxc_driver`: 取值String，仅AO模式生效，`"semitrans"`（缺省）/ `"mo"` / `"dm"`。
 
 ### Davidson求解器参数
 
@@ -921,7 +925,7 @@ hessian = { frequencies = true, verbose = 2 }
 ## 解析梯度性质模块 `analdrv` 计算相关设置
 
 解析梯度模块 `analdrv` 模块是实验性质模块。目前实现了 Hessian (原子核坐标二阶梯度) 功能。
-它实现了不同于 `hessian` 模块的解析 Hessian 计算。目前该模块的 Hessian 功能支持 RHF/RKS/UHF/UKS 方法。对于 DFT，支持 LDA/GGA/mGGA 以及其对应的杂化泛函。该模块的程序有性能优化，与目前顶级的量化程序 (ORCA 等) 有相当或更好的性能。
+它实现了不同于 `hessian` 模块的解析 Hessian 计算。目前该模块的 Hessian 功能支持 RHF/RKS/UHF/UKS 方法。对于 DFT，支持 LDA/GGA/mGGA 以及其对应的杂化泛函，包括范围分离杂化泛函 (RSH)。该模块的程序有性能优化，与目前顶级的量化程序 (ORCA 等) 有相当或更好的性能。
 
 ### 设置待计算性质的任务
 
@@ -950,6 +954,7 @@ analdrv_tasks = "freq"
   - mGGA 分为两种情况：若 `grid_shift_deriv` 为 true 则保持 SCF 格点；若为 false 则将比 `grid_generation_level` 增加 2 级别。
 - `grid_shift_deriv`：是否在 DFT skeleton 导数中引入格点偏移导数 (格点权重对原子核坐标的导数、以及格点坐标偏移产生的导数)。取值 bool，默认为 `true`：引入后 skeleton 导数恢复平移不变性。设为 `false` 时退化为不含格点偏移导数。仅影响 numint_matmul 后端实现；要求标准原子生成的 DFT 格点，若使用外部格点 (`external_grids`)，因格点无原子归属，应设为 `false`。
 - `tol_point_group`：振动分析中的点群对称性判断阈值 (用于计算转动对称性，对熵矫正有贡献)。默认 1e-5，单位 Bohr / sqrt(atom)。
+- `dftd_hess_step`：经验色散校正 (DFT-D3/DFT-D4) 对 Hessian 贡献的数值差分步长。默认为 3e-4，单位 Bohr。
 - `gau_thermo`：是否使用 Gaussian 类型的热力学能矫正。默认 false。该选项仅作参考；目前 REST 的热力学矫正通常是定义 `[thermo]` 区块以进行计算。Gaussian 类型热力学能矫正接受输入卡中 `[thermo]` 区块的关键词 `temperature`, `pressure`, `symmetry_number` 与 `electronic_energy`。
 
 作为例子，运行 Hessian 计算、增大 CP-HF Krylov 求解器空间到 20、强制 CP-HF 中 DFT 格点积分级别为 2，所需要引入的、相比于能量计算的额外设置如下：
