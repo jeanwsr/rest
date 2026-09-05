@@ -1,0 +1,151 @@
+name: Sync from Gitee PR to GitHub
+
+on:
+  # 定时触发：每60分钟检查一次
+  schedule:
+    - cron: '0 * * * *'
+  # 支持手动触发，方便调试
+  workflow_dispatch:
+
+# 防止定时任务与手动触发重叠执行
+concurrency:
+  group: gitee-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # 设置超时时间，防止任务卡住
+    timeout-minutes: 10
+
+    steps:
+      # 1. 检出 GitHub 仓库
+      - name: Checkout GitHub repository
+        uses: actions/checkout@v4
+        with:
+          # 使用 PAT 以便 push 可以触发其他 workflow (GITHUB_TOKEN 的 push 不会触发)
+          # checkout 会把 PAT 持久化到本地 git 配置，后续直接 git push origin 即可
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+
+      # 2. 同步：master 镜像 + 每个 open PR 两个分支
+      #    sync/pr-<n>        = PR head 的纯镜像 (CI 测 PR 本身)
+      #    sync/pr-<n>-merged = PR 与 base 合并后的预览 (CI 测合并结果)
+      - name: Sync
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}  # 格式: "用户名/仓库名"
+        run: |
+          set -euo pipefail
+
+          GITEE_URL="https://x-access-token:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
+          PRS_FILE="${RUNNER_TEMP}/open_prs.jsonl"
+          : > "$PRS_FILE"
+
+          # ---------- 1. 查询 Gitee 所有 open PR (分页, 校验应答) ----------
+          page=1
+          while :; do
+            resp=$(curl -fsS -H "Authorization: token ${GITEE_TOKEN}" \
+              "https://gitee.com/api/v5/repos/${GITEE_REPO}/pulls?state=open&per_page=100&page=${page}") \
+              || { echo "::error::Gitee API request failed (page ${page})"; exit 1; }
+            jq -e 'type == "array"' <<<"$resp" >/dev/null \
+              || { echo "::error::Unexpected Gitee API response (page ${page})"; exit 1; }
+            count=$(jq 'length' <<<"$resp")
+            [ "$count" -eq 0 ] && break
+            # 每行 TSV: number / head.ref / head.repo.full_name(可为空) / base.ref
+            jq -r '.[] | [.number, .head.ref, (.head.repo.full_name // ""), .base.ref] | @tsv' <<<"$resp" >> "$PRS_FILE"
+            [ "$count" -lt 100 ] && break
+            page=$((page + 1))
+          done
+          total=$(wc -l < "$PRS_FILE")
+          echo "Found ${total} open PR(s)"
+
+          # ---------- 2. master 镜像 (强制一致, 自愈 GitHub 侧误提交) ----------
+          git fetch "$GITEE_URL" +refs/heads/master:refs/remotes/gitee/master
+          git fetch origin +refs/heads/master:refs/remotes/origin/master || true
+          gitee_master=$(git rev-parse refs/remotes/gitee/master)
+          github_master=$(git rev-parse --verify -q refs/remotes/origin/master || true)
+          if [ "$gitee_master" != "$github_master" ]; then
+            echo "Mirroring master to GitHub (${github_master:-absent} -> ${gitee_master})"
+            git push origin +refs/remotes/gitee/master:refs/heads/master
+          fi
+
+          # 一次性取回 GitHub 上已有的 sync 分支，用于"无变化则不推送"比对
+          git fetch origin '+refs/heads/sync/pr-*:refs/remotes/origin/sync/pr-*' || true
+
+          # ---------- 3. 逐 PR 同步 ----------
+          conflicted=()
+          declare -A fetched_base=()
+
+          while IFS=$'\t' read -r pr_number head_ref head_repo base_ref; do
+            echo "=== PR #${pr_number}: ${head_ref} -> ${base_ref} ==="
+
+            # 3.1 获取 PR head (fork PR 从 fork 仓库获取)
+            if [ -n "$head_repo" ] && [ "$head_repo" != "$GITEE_REPO" ]; then
+              head_url="https://x-access-token:${GITEE_TOKEN}@gitee.com/${head_repo}.git"
+            else
+              head_url="$GITEE_URL"
+            fi
+            head_ref_name="refs/remotes/pr-${pr_number}-head"
+            if ! git fetch "$head_url" "+refs/heads/${head_ref}:${head_ref_name}"; then
+              echo "::warning::PR #${pr_number}: cannot fetch head '${head_ref}' (fork deleted? PR just closed?) - skipped"
+              continue
+            fi
+            head_sha=$(git rev-parse "$head_ref_name")
+
+            # 3.2 head 镜像: sync/pr-<n>
+            head_branch="sync/pr-${pr_number}"
+            origin_head=$(git rev-parse --verify -q "refs/remotes/origin/${head_branch}" || true)
+            if [ "$origin_head" != "$head_sha" ]; then
+              git push origin "+${head_sha}:refs/heads/${head_branch}"
+            fi
+
+            # 3.3 获取 base 分支 (按分支名缓存, 只取一次)
+            if [ -z "${fetched_base[${base_ref}]:-}" ]; then
+              if ! git fetch "$GITEE_URL" "+refs/heads/${base_ref}:refs/remotes/gitee/${base_ref}"; then
+                echo "::warning::PR #${pr_number}: cannot fetch base '${base_ref}' - skipped"
+                continue
+              fi
+              fetched_base[$base_ref]=1
+            fi
+            base_sha=$(git rev-parse "refs/remotes/gitee/${base_ref}")
+
+            # 3.4 无工作区合并测试 (git >= 2.38; 退出码 1 表示有冲突)
+            set +e
+            merge_out=$(git merge-tree --write-tree --name-only "$head_sha" "$base_sha" 2>/dev/null)
+            merge_rc=$?
+            set -e
+            if [ "$merge_rc" -eq 1 ]; then
+              echo "::warning::PR #${pr_number} conflicts with ${base_ref}:"
+              sed -n '2,$p' <<<"$merge_out" | sed 's/^/    /'
+              conflicted+=("${pr_number}")
+              continue
+            elif [ "$merge_rc" -ne 0 ]; then
+              echo "::error::PR #${pr_number}: git merge-tree failed (rc=${merge_rc})"
+              exit 1
+            fi
+            tree=$(sed -n '1p' <<<"$merge_out")
+
+            # 3.5 确定性 merge commit：相同输入 => 相同 SHA => 不重复推送、不重复触发 CI
+            merged_sha=$(GIT_AUTHOR_NAME="gitee-sync-bot" \
+              GIT_AUTHOR_EMAIL="github-actions[bot]@users.noreply.github.com" \
+              GIT_AUTHOR_DATE="2026-01-01T00:00:00Z" \
+              GIT_COMMITTER_NAME="gitee-sync-bot" \
+              GIT_COMMITTER_EMAIL="github-actions[bot]@users.noreply.github.com" \
+              GIT_COMMITTER_DATE="2026-01-01T00:00:00Z" \
+              git commit-tree "$tree" -p "$head_sha" -p "$base_sha" \
+              -m "Merge ${base_ref} into PR #${pr_number} (Gitee sync preview)")
+
+            merged_branch="sync/pr-${pr_number}-merged"
+            origin_merged=$(git rev-parse --verify -q "refs/remotes/origin/${merged_branch}" || true)
+            if [ "$origin_merged" != "$merged_sha" ]; then
+              git push origin "+${merged_sha}:refs/heads/${merged_branch}"
+            fi
+          done < "$PRS_FILE"
+
+          # ---------- 4. 冲突汇总: 明确失败 ----------
+          if [ "${#conflicted[@]}" -gt 0 ]; then
+            echo "::error::${#conflicted[@]} PR(s) conflict with their base branch: ${conflicted[*]}"
+            exit 1
+          fi
+          echo "All PR(s) synced."
