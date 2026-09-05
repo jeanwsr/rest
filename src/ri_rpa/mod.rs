@@ -1,4 +1,8 @@
 pub mod scsrpa;
+#[cfg(feature = "mpi")]
+pub mod scsrpa_25d;
+#[cfg(feature = "mpi")]
+pub mod rpa_25d;
 
 use std::num;
 use std::sync::mpsc::channel;
@@ -73,19 +77,22 @@ pub fn rpa_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         };
         scf_data.generate_ri3mo_rayon(vir_range, occ_range);
 
-        // Phase-0 guard (P0-3): the RPA response kernel (evaluate_response_serial)
-        // indexes the RI3MO tensor with global auxiliary-basis ranges (num_auxbas) and
-        // is incompatible with the MPI aux-distributed layout. Without this guard the
-        // run would dive into out-of-bounds reads deep inside the kernel.
+        // Phase 2: under MPI the correlation runs on the 2.5D path (ri_rpa/rpa_25d.rs).
+        // The serial response kernel (evaluate_response_serial) indexes the RI3MO
+        // tensor with global auxiliary-basis ranges and is incompatible with the
+        // MPI aux-distributed layout — never call it under MPI.
         if mpi_operator.is_some() || scf_data.mol.mpi_data.is_some() {
-            panic!(
-                "The MPI implementation is not yet available for the RPA correlation energy: \
-                 the response kernel indexes RI3MO with global auxiliary-basis ranges and is \
-                 incompatible with the MPI aux-distributed layout. Please run RPA without MPI \
-                 for now."
-            );
+            #[cfg(feature = "mpi")]
+            {
+                rpa_c_energy = rpa_25d::rpa_correlation_rayon_mpi_25d(scf_data, mpi_operator).unwrap();
+            }
+            #[cfg(not(feature = "mpi"))]
+            {
+                panic!("The RPA correlation under MPI requires the mpi feature");
+            }
+        } else {
+            rpa_c_energy = evaluate_rpa_correlation_rayon(scf_data).unwrap();
         }
-        rpa_c_energy = evaluate_rpa_correlation_rayon(scf_data).unwrap();
         //rpa_c_energy = evaluate_rpa_correlation(scf_data).unwrap();
 
     } else {
@@ -465,7 +472,7 @@ fn evaluate_response_serial(scf_data: &SCF, freq: f64) -> anyhow::Result<MatrixF
 
 }
 
-fn evaluate_rpa_integrand(polar_freq: &mut MatrixFull<f64>) -> f64 {
+pub(crate) fn evaluate_rpa_integrand(polar_freq: &mut MatrixFull<f64>) -> f64 {
     let mut rpa_c_integrand = 0.0;
     let num_auxbas = polar_freq.size.get(0).unwrap();
 

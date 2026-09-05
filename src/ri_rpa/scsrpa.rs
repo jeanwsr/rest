@@ -105,7 +105,7 @@ pub fn evaluate_spin_response_rayon(scf_data: &SCF, freq: f64) -> anyhow::Result
 
 }
 
-fn screening_de_excitation(dij: f64, freq: f64, a: f64, b: f64, sigma: f64, scale: f64) -> f64 {
+pub(crate) fn screening_de_excitation(dij: f64, freq: f64, a: f64, b: f64, sigma: f64, scale: f64) -> f64 {
     let r2 = sqrt(2.0);
     erfc(freq)*scale*0.25*(1.0+erf((dij-a)/sigma/r2))*(1.0+erf(b-dij)/sigma/r2)
 }
@@ -391,8 +391,8 @@ pub fn evaluate_osrpa_correlation_detailed_rayon(scf_data: &SCF) -> anyhow::Resu
     Ok(([rpa_c_energy, rpa_c_energy_os, rpa_c_energy_ss],special_radius))
 }
 
-fn evaluate_osrpa_integrand(
-    spin_polar_freq: &mut Vec<MatrixFull<f64>>, spin_channel: usize, 
+pub(crate) fn evaluate_osrpa_integrand(
+    spin_polar_freq: &mut Vec<MatrixFull<f64>>, spin_channel: usize,
     lambda_omega: &Vec<f64>, lambda_weight: &Vec<f64>,
     sc_check: &[bool;2]
 ) -> [f64;3] {
