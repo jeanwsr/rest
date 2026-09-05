@@ -430,12 +430,10 @@ Renormalized Singles方法通过投影DFT密度矩阵构造单激发HF哈密顿�
 
 ### Low-Rank Contour Deformation（推荐加速方法）
 
-低秩围道变形近似（Low-Rank Contour Deformation）通过自能解析延拓中频率相关极化的低秩分解，显著减少GW计算的频率采样点数和内存占用。**对于中大型体系，强烈推荐启用此近似方法。**
 
 - `use_low_rank_contour`: 取值bool，设置为 `true` 启用低秩等离面加速。缺省为false。
 - `low_rank_grid_type`: 取值String，实轴极化率Chi的采样格点分布方式。`”linear”`（缺省）为线性分布；`”quadratic”` 为二次幂律分布，在零能附近更密集。
 - `nomega_chi_real`: 取值usize，实轴极化率Chi的采样格点数。缺省为6。增大此值可提高精度但增加计算量。
-- `low_rank_tolerance`: 取值f64，低秩截断的本征值容差。数值越小精度越高。缺省为1e-3。
 - `nomega_sigma`: 取值usize，自能Sigma实轴扫描点数（每侧），在de_max扫描中使用。缺省为10。
 - `step_sigma`: 取值f64，自能Sigma实轴扫描步长，单位Hartree。缺省为0.05。
 
@@ -447,11 +445,8 @@ Renormalized Singles方法通过投影DFT密度矩阵构造单激发HF哈密顿�
 - `gw_search_grid`: 取值usize，插值求根法的搜索格点数。仅当 `gw_rootfinder = “interpolation”` 时生效。缺省为51。
 - `gw_span_energy`: 取值f64，单位Hartree，插值求根法的能量扫描范围。缺省为0.2。
 - `gw_linearize_shift`: 取值f64，线性化GW中的有限差分位移量，单位Hartree。缺省为0.01。
-- `homo_lumo_gw_qp`: 取值bool，设置为 `true` 仅计算HOMO和LUMO的准粒子能量（不计算其他轨道）。缺省为false。
 
 ### AC-GW（解析延拓 GW 变体）
-
-AC-GW 通过先在虚频轴计算相关自能 Σ_c(iλ)，再使用 Thiele 连分式 Padé 近似解析延拓到实轴，避免 CD 路径的实轴留数计算。适用于价层准粒子能量计算，与 CD-GW 精度相当。
 
 - `gw_variant`: 取值String，GW 变体类型：
     - `"cd"`（缺省）：轮廓变形（Contour Deformation）路径。
@@ -460,48 +455,6 @@ AC-GW 通过先在虚频轴计算相关自能 Σ_c(iλ)，再使用 Thiele 连�
 - `ac_eta`: 取值f64，Padé 求值的展宽参数 η（小正数）。缺省为 0.001。
 - `ac_pade_step_ratio`: 取值f64，PySCF 风格 Padé 采样的步长衰减比（< 1.0 时低频更密）。缺省为 2/3。
 - `gw_switch_fallback_threshold`: 取值f64。当 |E_KS| 超过此值时退化为静态近似。缺省为 1e6。
-
-### AC-GW 输入卡示例
-
-**最小 AC-GW 计算（默认参数）**：
-```toml
-[ctrl]
-xc = "pbe0"
-basis_path = "def2-TZVP"
-auxbas_path = "def2-universal-jkfit"
-charge = 0.0
-spin = 1
-
-[geom]
-name = "H2O"
-unit = "angstrom"
-position = """
-    O  0.0000000000      0.0000000000      0.0000000000
-    H  0.0000000000      0.7569500000      0.5858820000
-    H  0.0000000000     -0.7569500000      0.5858820000
-"""
-
-[quasiparticle_methods]
-gw_or_bse = "gw"
-gw_scheme = "extrapolated"
-gw_variant = "ac"
-gw_extrapolate_occ_threshold = 0.1
-gw_extrapolate_vir_threshold = 0.1
-```
-
-**高精度 AC-GW（32 采样点）**：
-```toml
-[quasiparticle_methods]
-gw_or_bse = "gw"
-gw_scheme = "extrapolated"
-gw_variant = "ac"
-ac_num_samples = 32
-ac_eta = 0.001
-ac_pade_step_ratio = 0.6667
-gw_rootfinder = "newton"
-gw_extrapolate_occ_threshold = 0.2
-gw_extrapolate_vir_threshold = 0.2
-```
 
 ### GW结果输出
 
@@ -525,9 +478,6 @@ BSE计算在 `gw_or_bse = “bse”` 时进行，在GW准粒子能量（或从�
 - `davidson_max_iter`: 取值usize，Davidson最大迭代次数。缺省为20。
 - `davidson_maximum_subspace_size`: 取值usize，Davidson最大子空间维度倍数。实际最大子空间 = max(目标激发数 × 此值, 最小维度)。缺省为2。
 - `davidson_restart_dimensions`: 取值usize，Davidson重启动维度。当子空间达到上限后，收缩至此数量的近似特征向量后再继续扩张。缺省为5。
-- `simplified_bse`: 取值bool，设置为 `true` 使用裸库仑相互作用的简化BSE（不含W屏蔽）。缺省为false。
-- `bse_exchange_rescaling`: 取值f64，BSE交换项（屏蔽库仑项）的重标因子，可用于手动调整静态屏蔽强度。缺省为1.0。
-- `bse_qp_polarization`: 取值bool，设置为 `true` 时使用准粒子能量（而非KS轨道能量）构造BSE的极化函数。缺省为false。
 
 ### GW输入卡示例
 
@@ -614,8 +564,6 @@ bse_davidson_solver = true
 ```
 ### Unrestricted GW-BSE（UGW/UBSE）设置
 
-当体系为开壳层并启用自旋极化时，REST 会自动进入共线 Unrestricted GW-BSE 路径（UGW/UBSE）。该路径对 α、β 自旋分别计算 GW 准粒子能量，并使用自旋守恒的双块 BSE 结构求解激发能。
-
 **触发方式**：在 `[ctrl]` 中设置：
 ```toml
 [ctrl]
@@ -624,72 +572,13 @@ spin = 2.0          # 例如 NH2 双自由基/双基态，2S = 2
 spin_polarization = true
 ```
 
-**常用参数**（`[quasiparticle_methods]` 区块）：
-
-- `gw_or_bse`: 设置为 `"gw"` 只做 UGW；设置为 `"bse"` 则先做 UGW 再自动做 UBSE。
-- `gw_scheme`: UGW 推荐使用 `"extrapolated"`。
-- `scgw`: 目前 UGW 推荐使用 `"g0w0"`。
-- `gw_variant`: 目前 UGW 支持 `"cd"`（contour deformation）路径；`"ac"` 暂不支持。
-- `use_low_rank_contour`: 取值bool，设置为 `true` 开启 unrestricted low-rank contour GW 加速。该路径会使用 α+β 总响应构造低秩 $\sqrt{v}\chi\sqrt{v}$，并分别与两个自旋通道收缩。
-- `nomega_chi_real`: 取值usize，实轴低秩插值点数。缺省为6。**当计算窗口包含深轨道/高虚轨道时，需要显著增大该值**，例如 1000–5000 或更高，才能获得与 dense UGW 接近的精度。
-- `save_qp` / `save_qp_path`: 保存 α/β 自旋的准粒子能量。
-
-开启 unrestricted low-rank contour GW 的示例（可在 UGW 或 UGW+UBSE 中使用）：
-```toml
-[quasiparticle_methods]
-gw_or_bse = "bse"
-gw_scheme = "extrapolated"
-scgw = "g0w0"
-gw_variant = "cd"
-use_low_rank_contour = true
-low_rank_grid_type = "linear"
-nomega_chi_real = 5000
-low_rank_tolerance = 1e-3
-nomega_sigma = 10
-step_sigma = 0.05
-gw_rootfinder = "newton"
-```
-
-> 注意：上例中 `nomega_chi_real = 5000` 是针对包含深/高轨道窗口的较高精度设置。若只计算 HOMO/LUMO 附近，可适当降低；若包含很深的核轨道或很高虚轨道，请继续增大该值并检查收敛。
-
 UBSE 的 `bse_spin` 含义与 Restricted 略有不同：
 
 - `bse_spin = "singlet"`：自旋守恒、含 Hartree 项的 BSE 通道。
 - `bse_spin = "triplet"`：自旋守恒、不含 Hartree 项的 BSE 通道（对应 MolGW 的 `triplet=yes`）。
 - `bse_spin = "both"`：同时计算上述两个通道。
 
-UBSE 支持 dense、Davidson、FEAST 三种对角化/迭代求解方式：
-
-```toml
-[quasiparticle_methods]
-gw_or_bse = "bse"
-gw_scheme = "extrapolated"
-scgw = "g0w0"
-gw_variant = "cd"
-
-bse_spin = "singlet"
-bse_tda = false
-
-# 方式一：dense 全对角化（默认）
-# bse_davidson_solver = false
-# bse_feast_solver = false
-
-# 方式二：Davidson 迭代求解少数低能激发态
-bse_davidson_solver = true
-davidson_target_excitations = 6
-davidson_maximum_subspace_size = 120
-davidson_restart_dimensions = 9
-davidson_max_iter = 100
-davidson_converge_threshold = 1e-8
-
-# 方式三：FEAST 求解给定能量窗口内的所有激发态
-# bse_feast_solver = true
-# bse_eigenrange_min = 0.0
-# bse_eigenrange_max = 0.5
-# bse_m_expected = 20
-# bse_max_feast_iter = 30
-# bse_tol_feast = 1e-8
-```
+UBSE 支持 dense、Davidson、FEAST 三种对角化方式。
 
 一个完整的 UGW+UBSE 输入示例（NH₂ 双基态，PBE0/cc-pVDZ，Davidson full BSE）：
 
@@ -737,17 +626,6 @@ davidson_maximum_subspace_size = 120
 davidson_restart_dimensions = 9
 davidson_max_iter = 100
 davidson_converge_threshold = 1e-8
-```
-
-如果改用 FEAST，只需把上述 Davidson 开关替换为：
-
-```toml
-bse_feast_solver = true
-bse_eigenrange_min = 0.0
-bse_eigenrange_max = 0.5
-bse_m_expected = 20
-bse_max_feast_iter = 30
-bse_tol_feast = 1e-8
 ```
 
 > 注意：UGW/UBSE 目前主要用于共线开壳层体系。Restricted 与 Unrestricted 路径的 `bse_spin` 语义不完全相同，使用时请根据实际自旋通道选择。
