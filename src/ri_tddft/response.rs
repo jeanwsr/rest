@@ -30,12 +30,9 @@ use crate::ri_bse::response::{
 };
 use crate::solvers::davidson::vector_scaled_add;
 use crate::ri_bse::dipoles;
-use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data, set_fxc_use_optimized};
-use crate::ri_tddft::matvec::{ExchangeTerms, a_matvec, b_matvec};
-use crate::ri_tddft::utils::{
-    tddft_occupation_parameters, tddft_get_submatrix, tddft_get_submatrix_sr,
-    rsh_exchange_coeffs, reshape_exchange_tensors,
-};
+use crate::dft::num_int::set_fxc_use_optimized;
+use crate::ri_tddft::matvec::{self, a_matvec, b_matvec};
+use crate::ri_tddft::utils::tddft_occupation_parameters;
 use crate::scf_io::SCF;
 
 // ========================================================================
@@ -126,19 +123,17 @@ pub fn prepare_p0_r_i_tddft(
 /// using TDDFT A and B blocks (with fxc kernel and exchange).
 fn pairvec_matvec_tddft(
     scf: &SCF,
-    fxc_data: &FXCMatvecData,
-    ri_ov: &MatrixFull<f64>,
-    exch: &ExchangeTerms,
+    data: &crate::ri_tddft::TDDFTData,
     p_vec: &[f64],
     m_vec: &[f64],
     xlet: char,
 ) -> (Vec<f64>, Vec<f64>) {
     let p_owned = p_vec.to_vec();
     let m_owned = m_vec.to_vec();
-    let ap = a_matvec(scf, fxc_data, ri_ov, exch, &p_owned, xlet);
-    let am = a_matvec(scf, fxc_data, ri_ov, exch, &m_owned, xlet);
-    let bp = b_matvec(scf, fxc_data, ri_ov, exch, &p_owned, xlet);
-    let bm = b_matvec(scf, fxc_data, ri_ov, exch, &m_owned, xlet);
+    let ap = a_matvec(scf, data, &p_owned, xlet);
+    let am = a_matvec(scf, data, &m_owned, xlet);
+    let bp = b_matvec(scf, data, &p_owned, xlet);
+    let bm = b_matvec(scf, data, &m_owned, xlet);
     (
         ap.iter().zip(bm.iter()).map(|(a, b)| a + b).collect(),
         bp.iter().zip(am.iter()).map(|(a, b)| a + b).collect(),
@@ -345,9 +340,7 @@ fn export_density_tddft(
 /// KS-energy-based diagonal correction.
 fn response_tddft_pople(
     scf: &SCF,
-    fxc_data: &FXCMatvecData,
-    ri_ov: &MatrixFull<f64>,
-    exch: &ExchangeTerms,
+    data: &crate::ri_tddft::TDDFTData,
     mu_z_vec: &[f64],
     ks_energies: &[f64],
     start_mo: usize,
@@ -367,7 +360,7 @@ fn response_tddft_pople(
     let p0 = prepare_p0_r_i_tddft(mu_z_vec, ks_energies, start_mo, lumo, omega, gamma, occ_size, vir_size);
 
     let wrapped_pair_matvec = |pairvec: &(Vec<f64>, Vec<f64>)| -> (Vec<f64>, Vec<f64>) {
-        pairvec_matvec_tddft(scf, fxc_data, ri_ov, exch,
+        pairvec_matvec_tddft(scf, data,
                              &pairvec.0, &pairvec.1, xlet)
     };
 
@@ -406,22 +399,20 @@ fn response_tddft_pople(
 /// with the full response TDDFT operator.
 fn build_fourvec_matvec_tddft<'a>(
     scf: &'a SCF,
-    fxc_data: &'a FXCMatvecData,
-    ri_ov: &'a MatrixFull<f64>,
-    exch: &'a ExchangeTerms,
+    data: &'a crate::ri_tddft::TDDFTData,
     xlet: char,
     omega: f64,
     gamma: f64,
 ) -> impl Fn(&(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) + 'a {
     move |z: &(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)| {
-        let a_z0 = a_matvec(scf, fxc_data, ri_ov, exch, &z.0, xlet);
-        let a_z1 = a_matvec(scf, fxc_data, ri_ov, exch, &z.1, xlet);
-        let a_z2 = a_matvec(scf, fxc_data, ri_ov, exch, &z.2, xlet);
-        let a_z3 = a_matvec(scf, fxc_data, ri_ov, exch, &z.3, xlet);
-        let b_z0 = b_matvec(scf, fxc_data, ri_ov, exch, &z.0, xlet);
-        let b_z1 = b_matvec(scf, fxc_data, ri_ov, exch, &z.1, xlet);
-        let b_z2 = b_matvec(scf, fxc_data, ri_ov, exch, &z.2, xlet);
-        let b_z3 = b_matvec(scf, fxc_data, ri_ov, exch, &z.3, xlet);
+        let a_z0 = a_matvec(scf, data, &z.0, xlet);
+        let a_z1 = a_matvec(scf, data, &z.1, xlet);
+        let a_z2 = a_matvec(scf, data, &z.2, xlet);
+        let a_z3 = a_matvec(scf, data, &z.3, xlet);
+        let b_z0 = b_matvec(scf, data, &z.0, xlet);
+        let b_z1 = b_matvec(scf, data, &z.1, xlet);
+        let b_z2 = b_matvec(scf, data, &z.2, xlet);
+        let b_z3 = b_matvec(scf, data, &z.3, xlet);
 
         let vec1 = vector_scaled_add(
             &vector_scaled_add(&a_z0, 1.0, &b_z1, 1.0), 1.0,
@@ -461,9 +452,7 @@ fn build_precond_tddft(
 /// GMRES solver for response TDDFT
 fn response_tddft_gmres(
     scf: &SCF,
-    fxc_data: &FXCMatvecData,
-    ri_ov: &MatrixFull<f64>,
-    exch: &ExchangeTerms,
+    data: &crate::ri_tddft::TDDFTData,
     mu_z_vec: &[f64],
     occ_size: usize,
     vir_size: usize,
@@ -477,7 +466,7 @@ fn response_tddft_gmres(
 
     let ks_diag = build_ks_energy_diag(scf, occ_size, vir_size);
     let fourvec_matvec = build_fourvec_matvec_tddft(
-        scf, fxc_data, ri_ov, exch,
+        scf, data,
         xlet, omega, gamma,
     );
     let precond = build_precond_tddft(&ks_diag, omega);
@@ -498,9 +487,7 @@ fn response_tddft_gmres(
 /// Klopper subspace solver for response TDDFT
 fn response_tddft_klopper(
     scf: &SCF,
-    fxc_data: &FXCMatvecData,
-    ri_ov: &MatrixFull<f64>,
-    exch: &ExchangeTerms,
+    data: &crate::ri_tddft::TDDFTData,
     mu_z_vec: &[f64],
     ks_energies: &[f64],
     start_mo: usize,
@@ -517,7 +504,7 @@ fn response_tddft_klopper(
 
     let ks_diag = build_ks_energy_diag(scf, occ_size, vir_size);
     let fourvec_matvec = build_fourvec_matvec_tddft(
-        scf, fxc_data, ri_ov, exch,
+        scf, data,
         xlet, omega, gamma,
     );
     let precond = build_precond_tddft(&ks_diag, omega);
@@ -539,9 +526,7 @@ fn response_tddft_klopper(
 /// Dense solver for response TDDFT (small systems only)
 fn response_tddft_dense(
     scf: &SCF,
-    fxc_data: &FXCMatvecData,
-    ri_ov: &MatrixFull<f64>,
-    exch: &ExchangeTerms,
+    data: &crate::ri_tddft::TDDFTData,
     mu_z_vec: &[f64],
     occ_size: usize,
     vir_size: usize,
@@ -561,8 +546,8 @@ fn response_tddft_dense(
     for col in 0..dim {
         let mut e_col = vec![0.0; dim];
         e_col[col] = 1.0;
-        let a_col = a_matvec(scf, fxc_data, ri_ov, exch, &e_col, xlet);
-        let b_col = b_matvec(scf, fxc_data, ri_ov, exch, &e_col, xlet);
+        let a_col = a_matvec(scf, data, &e_col, xlet);
+        let b_col = b_matvec(scf, data, &e_col, xlet);
         for row in 0..dim {
             a_mat[row + col * dim] = a_col[row];
             b_mat[row + col * dim] = b_col[row];
@@ -684,42 +669,8 @@ pub fn response_tddft(scf: &mut SCF) -> Result<(), String> {
     println!("  ω = {:.8} Ha ({:.4} eV)", omega, omega * EV);
     println!("  γ = {:.8} Ha", gamma);
 
-    // Prepare fxc data
-    let fxc_data = prepare_fxc_data(scf);
-    // HF-exchange coefficients (see ExchangeTerms for the RSH convention)
-    let (coeff_full, coeff_sr) = match rsh_exchange_coeffs(scf) {
-        Some((omega_rsh, c_full, c_sr)) => {
-            println!("  RSH functional: omega = {:.6}, c_LR (K_full coeff) = {:.6}, c_SR - c_LR (K_SR coeff) = {:.6}",
-                     omega_rsh, c_full, c_sr);
-            (c_full, c_sr)
-        }
-        None => (fxc_data.alpha_hybrid, 0.0),
-    };
-
-    // Obtain RI integrals
-    println!("  Obtaining RI integrals...");
-    let ri_ov = tddft_get_submatrix(scf, 'O', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
-    let ri_oo = tddft_get_submatrix(scf, 'O', 'O', start_mo, occ_size, vir_size, homo, lumo, num_state);
-    let ri_vv = tddft_get_submatrix(scf, 'V', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
-    let (ri_oo_exch, ri_vv_exch, ri_ov_exch) =
-        reshape_exchange_tensors(&ri_oo, &ri_vv, &ri_ov, occ_size, vir_size);
-
-    // Short-range exchange tensors for RSH (erfc(omega*r12)/r12 operator).
-    let (sr_oo, sr_vv, sr_ov) = if coeff_sr.abs() > 1e-12 {
-        let ov_sr = tddft_get_submatrix_sr(scf, 'O', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
-        let oo_sr = tddft_get_submatrix_sr(scf, 'O', 'O', start_mo, occ_size, vir_size, homo, lumo, num_state);
-        let vv_sr = tddft_get_submatrix_sr(scf, 'V', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
-        let (oo_sr, vv_sr, ov_sr) = reshape_exchange_tensors(&oo_sr, &vv_sr, &ov_sr, occ_size, vir_size);
-        (Some(oo_sr), Some(vv_sr), Some(ov_sr))
-    } else {
-        (None, None, None)
-    };
-    let exch = match (&sr_oo, &sr_vv, &sr_ov) {
-        (Some(oo_sr), Some(vv_sr), Some(ov_sr)) => {
-            ExchangeTerms::rsh(coeff_full, coeff_sr, &ri_oo_exch, &ri_vv_exch, &ri_ov_exch, oo_sr, vv_sr, ov_sr)
-        }
-        _ => ExchangeTerms::full_only(coeff_full, &ri_oo_exch, &ri_vv_exch, &ri_ov_exch),
-    };
+    // Prepare shared TDDFT data (fxc kernel + MO-basis RI tensors)
+    let data = crate::ri_tddft::tddft::prepare_mo_data(scf);
 
     // Compute dipole vector
     let mu_z_vec = compute_mu_z_vec_tddft(scf);
@@ -727,22 +678,22 @@ pub fn response_tddft(scf: &mut SCF) -> Result<(), String> {
     // Dispatch to solver
     let solution = match solver.as_str() {
         "pople" => response_tddft_pople(
-            scf, &fxc_data, &ri_ov, &exch,
+            scf, &data,
             &mu_z_vec, ks_energies, start_mo, lumo, occ_size, vir_size,
             omega, gamma, xlet, tol, max_iter,
         ),
         "gmres" => response_tddft_gmres(
-            scf, &fxc_data, &ri_ov, &exch,
+            scf, &data,
             &mu_z_vec, occ_size, vir_size,
             omega, gamma, xlet, tol, max_iter,
         ),
         "klopper" => response_tddft_klopper(
-            scf, &fxc_data, &ri_ov, &exch,
+            scf, &data,
             &mu_z_vec, ks_energies, start_mo, lumo, occ_size, vir_size,
             omega, gamma, xlet, tol, max_iter,
         ),
         "dense" => response_tddft_dense(
-            scf, &fxc_data, &ri_ov, &exch,
+            scf, &data,
             &mu_z_vec, occ_size, vir_size,
             omega, gamma, xlet,
         ),

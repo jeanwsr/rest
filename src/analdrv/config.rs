@@ -61,6 +61,12 @@ pub struct AnalDrvConfig {
     /// Note that this tolerance will be divided by sqrt(1 + natm).
     #[serde_inline_default(1.0e-5)]
     pub tol_point_group: f64,
+    /// Step size (Bohr) for the finite-difference Hessian of the empirical dispersion
+    /// (DFTD3/DFTD4) contribution, for which no analytical Hessian is available. The
+    /// dispersion Hessian is obtained by central differences of the analytic dispersion
+    /// gradient. Default to 3e-4 Bohr.
+    #[serde_inline_default(3.0e-4)]
+    pub dftd_hess_step: f64,
 
     /// Option to print gaussian-like thermo analysis (c.f. Psi4 vibration code). Default to false.
     ///
@@ -86,6 +92,7 @@ impl Default for AnalDrvConfig {
             grid_level_skeleton: None,
             grid_shift_deriv: true,
             tol_point_group: 1.0e-5,
+            dftd_hess_step: 3.0e-4,
             gau_thermo: false,
         }
     }
