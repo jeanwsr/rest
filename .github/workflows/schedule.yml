@@ -52,8 +52,8 @@ jobs:
               || { echo "::error::Unexpected Gitee API response (page ${page})"; exit 1; }
             count=$(jq 'length' <<<"$resp")
             [ "$count" -eq 0 ] && break
-            # 每行 TSV: number / head.ref / head.repo.full_name(可为空) / base.ref
-            jq -r '.[] | [.number, .head.ref, (.head.repo.full_name // ""), .base.ref] | @tsv' <<<"$resp" >> "$PRS_FILE"
+            # 跳过草稿 PR；每行 TSV: number / head.ref / head.repo.full_name(可为空) / base.ref
+            jq -r '.[] | select((.draft // false) | not) | [.number, .head.ref, (.head.repo.full_name // ""), .base.ref] | @tsv' <<<"$resp" >> "$PRS_FILE"
             [ "$count" -lt 100 ] && break
             page=$((page + 1))
           done
