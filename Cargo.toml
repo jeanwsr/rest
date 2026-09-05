@@ -86,7 +86,7 @@ criterion = "0.4"
 
 [features]
 default = ["dftd3", "dftd4", "geometric-pyo3", "mpi"]
-mpi = ["dep:mpi"]
+mpi = ["dep:mpi", "rest_tensors/mpi"]
 dftd3 = ["dep:dftd3"]
 dftd4 = ["dep:dftd4"]
 geometric-pyo3 = ["dep:geometric-pyo3"]
