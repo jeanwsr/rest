@@ -113,7 +113,17 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
                 &vec![String::from("gga_x_pbe")], grids,
                 &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation,
             );
-            let x_pbe = post_xc_energy[0][0] + post_xc_energy[0][1];
+            let mut x_pbe = post_xc_energy[0][0] + post_xc_energy[0][1];
+            // MPI: the DFT grid is rank-distributed, so post_xc_exc returns only the
+            // local contribution — sum over all ranks to recover the full value.
+            #[cfg(feature = "mpi")]
+            if let Some(mpi_op) = mpi_operator {
+                use mpi::collective::SystemOperation;
+                use mpi::traits::*;
+                let mut x_pbe_global = 0.0f64;
+                mpi_op.world.any_process().all_reduce_into(&x_pbe, &mut x_pbe_global, &SystemOperation::sum());
+                x_pbe = x_pbe_global;
+            }
             scf_data.energies.insert(String::from("x_pbe"), vec![x_pbe]);
         }
     }
@@ -209,25 +219,25 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         timerecords.count("ao2mo");
         timerecords.count_start("c_r5dft");
 
-        let use_25d = check_conditions_25d(&scf_data, mpi_operator);
+        let use_25d = check_conditions_25d(&scf_data, mpi_operator, &dfa_family_pos);
         if use_25d {
             pt2_c = match scf_data.scftype {
                 SCFType::RHF => match  dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi_25d(&scf_data,mpi_operator).unwrap(),
                     crate::dft::DFAFamily::SBGE2 => crate::ri_pt2::sbge2_25d::close_shell_sbge2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
-                    crate::dft::DFAFamily::SCSRPA => panic!("2.5D MPI path is not implemented for SCSRPA (e.g. R-xDH7): its correlation kernel indexes the RI3MO tensor with global auxiliary-basis ranges and is incompatible with the MPI aux-distributed layout; no MPI path (2.5D or 1D) is currently available for this family"),
+                    crate::dft::DFAFamily::SCSRPA => crate::ri_rpa::scsrpa_25d::close_shell_osrpa_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
                     _ => [0.0,0.0,0.0]
                 },
                 SCFType::UHF => match  dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => open_shell_pt2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
                     crate::dft::DFAFamily::SBGE2 => crate::ri_pt2::sbge2_25d::open_shell_sbge2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
-                    crate::dft::DFAFamily::SCSRPA => panic!("2.5D MPI path is not implemented for SCSRPA (e.g. R-xDH7): its correlation kernel indexes the RI3MO tensor with global auxiliary-basis ranges and is incompatible with the MPI aux-distributed layout; no MPI path (2.5D or 1D) is currently available for this family"),
+                    crate::dft::DFAFamily::SCSRPA => crate::ri_rpa::scsrpa_25d::open_shell_osrpa_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
                     _ => [0.0,0.0,0.0]
                 },
                 SCFType::ROHF => match dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => restricted_open_shell_pt2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
                     crate::dft::DFAFamily::SBGE2 => crate::ri_pt2::sbge2_25d::open_shell_sbge2_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
-                    crate::dft::DFAFamily::SCSRPA => panic!("2.5D MPI path is not implemented for SCSRPA (e.g. R-xDH7): its correlation kernel indexes the RI3MO tensor with global auxiliary-basis ranges and is incompatible with the MPI aux-distributed layout; no MPI path (2.5D or 1D) is currently available for this family"),
+                    crate::dft::DFAFamily::SCSRPA => crate::ri_rpa::scsrpa_25d::open_shell_osrpa_rayon_mpi_25d(&scf_data, mpi_operator).unwrap(),
                     _ => [0.0,0.0,0.0]
                 }
             };
@@ -1302,7 +1312,11 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
 
 }
 
-fn check_conditions_25d(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> bool {
+fn check_conditions_25d(
+    scf_data: &SCF,
+    mpi_operator: &Option<MPIOperator>,
+    dfa_family_pos: &crate::dft::DFAFamily,
+) -> bool {
     let mut use_25d = true;
 
     let (mpi_op, mpi_ix) = match (&mpi_operator, &scf_data.mol.mpi_data) {
@@ -1343,9 +1357,35 @@ fn check_conditions_25d(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> b
         return false;
     }
 
-    if n2_global < 20 {
+    // The n_occ >= 20 preference exists so that small systems take the cheaper
+    // 1D MPI path. Families WITHOUT a 1D MPI implementation (SCSRPA) must take
+    // the 2.5D path at any size — the 1D dispatch is a panic for them.
+    let has_1d_fallback = match dfa_family_pos {
+        crate::dft::DFAFamily::PT2 | crate::dft::DFAFamily::SBGE2 => true,
+        crate::dft::DFAFamily::SCSRPA => false,
+        _ => false,
+    };
+
+    if has_1d_fallback && n2_global < 20 {
         eprintln!("num_occ smaller than 20, fallback to primitive PT2");
         use_25d = false;
+    }
+
+    if !has_1d_fallback {
+        // Block-partition feasibility: num_block = k * grid_mult with k >= 2
+        // (initialize_metadata) must satisfy num_block <= n_occ. If violated,
+        // error clearly instead of tripping the assert deep inside.
+        let (r, c) = grid.dims;
+        let grid_mult = if r == c { r } else { r * c } as usize;
+        if n2_global < 2 * grid_mult {
+            panic!(
+                "The 2.5D MPI path is the only MPI path for this post-SCF family \
+                 (DFAFamily::{:?}), but the system is too small for the current rank \
+                 count: n_occ = {} cannot be split into {} blocks. Reduce the MPI \
+                 ranks or run without MPI.",
+                dfa_family_pos, n2_global, 2 * grid_mult
+            );
+        }
     }
 
     if use_25d {
