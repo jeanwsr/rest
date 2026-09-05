@@ -18,7 +18,10 @@ use crate::dft::numint_matmul::nimatmul::NIMatmul;
 use crate::dft::numint_matmul::hess_rks::eval_vxc_fxc_from_rho;
 use crate::dft::xceff::prelude::{determine_den_type, libxc_eval_eff, XCDenType, XCSpin};
 use crate::ri_jk::util::get_cint_mol;
-use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_get_submatrix};
+use crate::ri_tddft::utils::{
+    rsh_exchange_coeffs, reshape_exchange_tensors, tddft_get_submatrix,
+    tddft_get_submatrix_sr, tddft_occupation_parameters,
+};
 use crate::utilities::rstsr_util::{RestTensorToRstsrViewAPI, Tsr};
 use rstsr::prelude::*;
 use libxc::prelude::*;
@@ -73,6 +76,20 @@ pub struct TDDFTData {
     pub ri_vv_exch: Option<MatrixFull<f64>>,
     /// [naux*occ, vir] RI tensor, B-block exchange.
     pub ri_ov_exch: Option<MatrixFull<f64>>,
+    // ── HF exchange coefficients & RSH short-range tensors (MO mode) ──
+    /// Full-range exchange coefficient of the response: `c_LR` for a
+    /// range-separated hybrid, `c_x` for an ordinary hybrid, `0` for a pure
+    /// functional. The exchange term reads `-coeff_full*K_full - coeff_sr*K_SR`.
+    pub coeff_full: f64,
+    /// Short-range `K_SR` coefficient: `c_SR - c_LR` for an RSH functional,
+    /// `0.0` otherwise (mirrors the ground-state Fock build in `scf_io`).
+    pub coeff_sr: f64,
+    /// [occ*naux, occ] short-range RI tensor, A-block exchange (RSH only).
+    pub ri_oo_sr: Option<MatrixFull<f64>>,
+    /// [naux*vir, vir] short-range RI tensor, A-block exchange (RSH only).
+    pub ri_vv_sr: Option<MatrixFull<f64>>,
+    /// [naux*occ, vir] short-range RI tensor, B-block exchange (RSH only).
+    pub ri_ov_sr: Option<MatrixFull<f64>>,
 }
 
 /// Prepare the shared TDDFT data for **MO mode**: the fxc kernel table
@@ -119,6 +136,30 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
     let mut ri_ov_exch = ri_ov.clone();
     ri_ov_exch.reshape([num_auxbas * occ_size, vir_size]);
 
+    // HF-exchange coefficients: for a range-separated hybrid the response
+    // exchange reads coeff_full*K_full + coeff_sr*K_SR; otherwise the hybrid
+    // coefficient times K_full only.
+    let (coeff_full, coeff_sr) = match rsh_exchange_coeffs(scf) {
+        Some((omega, c_full, c_sr)) => {
+            println!("RSH functional: omega = {:.6}, c_LR (K_full coeff) = {:.6}, c_SR - c_LR (K_SR coeff) = {:.6}",
+                     omega, c_full, c_sr);
+            (c_full, c_sr)
+        }
+        None => (fxc.alpha_hybrid, 0.0),
+    };
+
+    // Short-range (erfc(omega*r12)/r12) exchange tensors for RSH.
+    let (ri_oo_sr, ri_vv_sr, ri_ov_sr) = if coeff_sr.abs() > 1e-12 {
+        let sr_ov = tddft_get_submatrix_sr(scf, 'O', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
+        let sr_oo = tddft_get_submatrix_sr(scf, 'O', 'O', start_mo, occ_size, vir_size, homo, lumo, num_state);
+        let sr_vv = tddft_get_submatrix_sr(scf, 'V', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
+        let (oo_exch, vv_exch, ov_exch) =
+            reshape_exchange_tensors(&sr_oo, &sr_vv, &sr_ov, occ_size, vir_size);
+        (Some(oo_exch), Some(vv_exch), Some(ov_exch))
+    } else {
+        (None, None, None)
+    };
+
     TDDFTData {
         mode: TDDFTMode::MO,
         alpha_hybrid: fxc.alpha_hybrid,
@@ -136,6 +177,11 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
         ri_oo_exch: Some(ri_oo_exch),
         ri_vv_exch: Some(ri_vv_exch),
         ri_ov_exch: Some(ri_ov_exch),
+        coeff_full,
+        coeff_sr,
+        ri_oo_sr,
+        ri_vv_sr,
+        ri_ov_sr,
     }
 }
 
@@ -348,6 +394,13 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
         ri_oo_exch: None,
         ri_vv_exch: None,
         ri_ov_exch: None,
+        // AO mode scales the full-range exchange by c_x only; the RSH
+        // short-range/long-range split is not implemented on this path yet.
+        coeff_full: alpha_hybrid,
+        coeff_sr: 0.0,
+        ri_oo_sr: None,
+        ri_vv_sr: None,
+        ri_ov_sr: None,
     }
 }
 

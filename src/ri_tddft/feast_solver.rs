@@ -6,9 +6,7 @@
 // algorithm in ri_bse::feast_solver.
 // ============================================================================
 
-use rest_tensors::MatrixFull;
 use crate::scf_io::SCF;
-use crate::dft::num_int::FXCMatvecData;
 use crate::ri_tddft::matvec;
 
 /// TDA branch: solve A*x = omega*x using FEAST.
@@ -17,6 +15,7 @@ use crate::ri_tddft::matvec;
 /// the caller (tddft_main) and passed by reference.
 ///
 /// Returns eigenpairs: (eigenvalue, eigenvector) sorted by eigenvalue.
+#[allow(clippy::too_many_arguments)]
 pub fn feast_solve_tddft_tda(
     scf: &SCF,
     data: &crate::ri_tddft::TDDFTData,
@@ -86,6 +85,7 @@ pub fn feast_solve_tddft_tda(
 /// All TDDFT data is pre-prepared by the caller and passed by reference.
 ///
 /// Returns eigenpairs: (excitation_energy, eigenvector_X) sorted by energy.
+#[allow(clippy::too_many_arguments)]
 pub fn feast_solve_tddft_lr(
     scf: &SCF,
     data: &crate::ri_tddft::TDDFTData,
@@ -185,21 +185,28 @@ pub fn feast_solve_tddft_lr(
         None, None, "diagonal", None, 0.0001, 0, 0, // precond params
     );
 
-    // Post-process: convert (omega^2, X+Y) -> (omega, X)
+    // Post-process: convert (omega^2, X+Y) -> (omega, X, Y)
     // Filter out spurious eigenvalues (from subspace padding) and NaN-prone entries.
+    // The returned vector is [X; Y] stacked (length 2*dim), matching the
+    // Davidson LR solver and the post-processing convention in
+    // ri_bse::dipoles::{normalize, transition_dipole_square}, which split the
+    // vector at dim for non-TDA amplitudes.
     eigenpairs_xpy
         .into_iter()
         .filter(|(omega2, _)| *omega2 > tol_feast)
         .map(|(omega2, xpy)| {
             let omega = omega2.sqrt();
             let xmy = feast_a_matvec(&xpy); // = omega * (X-Y)
-            // X = (X+Y) + (X-Y)  where X-Y = xmy/omega
-            let x: Vec<f64> = xmy
-                .into_iter()
-                .zip(xpy.into_iter())
-                .map(|(xmy_k, xpy_k)| (xmy_k / omega) + xpy_k)
-                .collect();
-            (omega, x)
+            // X = ((X+Y) + (X-Y))/2,  Y = ((X+Y) - (X-Y))/2,  with X-Y = xmy/omega
+            let half = xpy.len();
+            let mut v = Vec::with_capacity(2 * half);
+            for (xp, xm) in xpy.iter().zip(xmy.iter()) {
+                v.push(0.5 * (xp + xm / omega));
+            }
+            for (xp, xm) in xpy.iter().zip(xmy.iter()) {
+                v.push(0.5 * (xp - xm / omega));
+            }
+            (omega, v)
         })
         .collect()
 }

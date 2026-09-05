@@ -3367,6 +3367,25 @@ impl SCF {
         } else {
             panic!("rimatr should be initialized in the preparation of ri3mo");
         };
+        self.ao2mo_from_rimatr(ri3ao, row_range, col_range)
+    }
+
+    /// MO transformation of the short-range (RSH) 3-center RI integrals, i.e.
+    /// the same construction as `generate_ri3mo_rayon_for_multiple_times` but
+    /// built from `rimatr_sr` (erfc(omega*r12)/r12 operator). Used by the RSH
+    /// TDDFT response to assemble the short-range exchange contribution.
+    pub fn generate_ri3mo_sr_rayon_for_multiple_times(&self, row_range: std::ops::Range<usize>, col_range: std::ops::Range<usize>)->Vec<(RIFull<f64>,std::ops::Range<usize>,std::ops::Range<usize>)> {
+
+        let ri3ao = if let Some((riao, _basbas2baspair, _baspar2basbas))=&self.rimatr_sr {
+            riao
+        } else {
+            panic!("rimatr_sr should be initialized for RSH post-HF calculations; \
+                    it is built by prepare_necessary_integrals only for ri-symm in-core RI integrals");
+        };
+        self.ao2mo_from_rimatr(ri3ao, row_range, col_range)
+    }
+
+    fn ao2mo_from_rimatr(&self, ri3ao: &MatrixFull<f64>, row_range: std::ops::Range<usize>, col_range: std::ops::Range<usize>)->Vec<(RIFull<f64>,std::ops::Range<usize>,std::ops::Range<usize>)> {
         let mut ri3mo: Vec<(RIFull<f64>,std::ops::Range<usize>, std::ops::Range<usize>)> = vec![];
         for i_spin in 0..self.mol.spin_channel {
             let eigenvector = match self.scftype {
@@ -3375,8 +3394,8 @@ impl SCF {
             };
             ri3mo.push(
                 ao2mo_rayon(
-                    eigenvector, ri3ao, 
-                    row_range.clone(), 
+                    eigenvector, ri3ao,
+                    row_range.clone(),
                     col_range.clone()
                 ).unwrap()
             )

@@ -15,9 +15,13 @@ use crate::ri_bse::{dipoles, pysoc_export};
 use crate::solvers::davidson as davidson_solver;
 use crate::solvers::davidson::DavidsonConfig;
 use crate::dft::num_int::{FXCMatvecDataUnrestricted, prepare_fxc_data_unrestricted, set_fxc_use_optimized};
-use crate::ri_tddft::matvec::{self, a_matvec, a_matvec_unrestricted, b_matvec, b_matvec_unrestricted};
+use crate::ri_tddft::matvec::{self, ExchangeTerms, a_matvec, a_matvec_unrestricted, b_matvec, b_matvec_unrestricted};
 use crate::ri_tddft::matvec_ao;
-use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_occupation_parameters_spin, tddft_get_submatrix_spin, compute_tddft_dipole_matrix, compute_tddft_dipole_matrix_unrestricted};
+use crate::ri_tddft::utils::{
+    tddft_occupation_parameters, tddft_occupation_parameters_spin, tddft_get_submatrix_spin,
+    tddft_get_submatrix_sr_spin, rsh_exchange_coeffs, reshape_exchange_tensors,
+    compute_tddft_dipole_matrix, compute_tddft_dipole_matrix_unrestricted,
+};
 use crate::ri_tddft::feast_solver;
 use crate::ri_tddft::tddft::{build_a, build_b, prepare_ao_data, prepare_mo_data};
 use crate::ri_tddft::{TDDFTData, TDDFTMode};
@@ -599,7 +603,15 @@ fn tddft_main_unrestricted(
 
     // ── fxc / RI data ──
     let fxc_data = prepare_fxc_data_unrestricted(scf);
-    let alpha_hybrid = fxc_data.alpha_hybrid;
+    // HF-exchange coefficients (see the restricted path for the RSH convention)
+    let (coeff_full, coeff_sr) = match rsh_exchange_coeffs(scf) {
+        Some((omega, c_full, c_sr)) => {
+            println!("RSH functional: omega = {:.6}, c_LR (K_full coeff) = {:.6}, c_SR - c_LR (K_SR coeff) = {:.6}",
+                     omega, c_full, c_sr);
+            (c_full, c_sr)
+        }
+        None => (fxc_data.alpha_hybrid, 0.0),
+    };
 
     println!("Obtaining unrestricted RI integrals...");
     let mut ri_ov: [MatrixFull<f64>; 2] = [
@@ -618,6 +630,11 @@ fn tddft_main_unrestricted(
         MatrixFull::new([0, 0], 0.0),
         MatrixFull::new([0, 0], 0.0),
     ];
+    // Short-range exchange tensors for RSH (erfc(omega*r12)/r12 operator).
+    let mut sr_tensors: [(Option<MatrixFull<f64>>, Option<MatrixFull<f64>>, Option<MatrixFull<f64>>); 2] = [
+        (None, None, None),
+        (None, None, None),
+    ];
 
     for s in 0..2 {
         if occ_sizes[s] == 0 || vir_sizes[s] == 0 {
@@ -633,24 +650,28 @@ fn tddft_main_unrestricted(
         let vv = tddft_get_submatrix_spin(
             scf, 'V', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state, s,
         );
-        let num_auxbas = ov.size[0];
+        let (oo_exch, vv_exch, ov_exch) =
+            reshape_exchange_tensors(&oo, &vv, &ov, occ_size, vir_size);
 
-        let mut oo_exch = oo.clone();
-        oo_exch.reshape([num_auxbas * occ_size, occ_size]);
-        oo_exch = oo_exch.transpose_and_drop();
-        oo_exch.reshape([occ_size * num_auxbas, occ_size]);
-
-        let mut vv_exch = vv.clone();
-        vv_exch.reshape([num_auxbas * vir_size, vir_size]);
-
-        let mut ov_exch = ov.clone();
-        ov_exch.reshape([num_auxbas * occ_size, vir_size]);
+        sr_tensors[s] = tddft_prepare_sr_tensors_spin(
+            scf, start_mo, occ_size, vir_size, homo, lumo, num_state, s, coeff_sr,
+        );
 
         ri_ov[s] = ov;
         ri_oo_exch[s] = oo_exch;
         ri_vv_exch[s] = vv_exch;
         ri_ov_exch[s] = ov_exch;
     }
+
+    let exch: [ExchangeTerms; 2] = std::array::from_fn(|s| {
+        let (oo_sr, vv_sr, ov_sr) = &sr_tensors[s];
+        match (oo_sr, vv_sr, ov_sr) {
+            (Some(oo), Some(vv), Some(ov)) => {
+                ExchangeTerms::rsh(coeff_full, coeff_sr, &ri_oo_exch[s], &ri_vv_exch[s], &ri_ov_exch[s], oo, vv, ov)
+            }
+            _ => ExchangeTerms::full_only(coeff_full, &ri_oo_exch[s], &ri_vv_exch[s], &ri_ov_exch[s]),
+        }
+    });
 
     // ── Diagonal preconditioner (concatenated α;β) ──
     let mut hdiag = Vec::with_capacity(total_dim);
@@ -707,9 +728,7 @@ fn tddft_main_unrestricted(
             scf,
             &fxc_data,
             &ri_ov,
-            &ri_oo_exch,
-            &ri_vv_exch,
-            &ri_ov_exch,
+            &exch,
             &hdiag,
             &initial_guess,
             &davidson_cfg,
@@ -717,7 +736,6 @@ fn tddft_main_unrestricted(
             total_dim,
             is_tda,
             with_hartree,
-            alpha_hybrid,
             tddft_ctrl,
             params,
         );
@@ -744,9 +762,7 @@ fn solve_tddft_single_spin_unrestricted(
     scf: &SCF,
     fxc_data: &FXCMatvecDataUnrestricted,
     ri_ov: &[MatrixFull<f64>; 2],
-    ri_oo_exch: &[MatrixFull<f64>; 2],
-    ri_vv_exch: &[MatrixFull<f64>; 2],
-    ri_ov_exch: &[MatrixFull<f64>; 2],
+    exch: &[ExchangeTerms; 2],
     hdiag: &Vec<f64>,
     initial_guess: &MatrixFull<f64>,
     davidson_cfg: &DavidsonConfig,
@@ -754,7 +770,6 @@ fn solve_tddft_single_spin_unrestricted(
     dim: usize,
     is_tda: bool,
     with_hartree: bool,
-    alpha_hybrid: f64,
     tddft_ctrl: &crate::ctrl_io::tddft_parameters::TDDFTParameters,
     params: [(usize, usize, usize, usize, usize, usize); 2],
 ) -> (Vec<(f64, Vec<f64>)>, Vec<f64>, Vec<f64>) {
@@ -766,7 +781,7 @@ fn solve_tddft_single_spin_unrestricted(
         eprintln!("Warning: FEAST solver for unrestricted TDDFT is not implemented; using Davidson.");
         if is_tda {
             davidson_solver::tda_davidson_solver(
-                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, z, with_hartree, alpha_hybrid),
+                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z, with_hartree),
                 nroots,
                 hdiag,
                 initial_guess.clone(),
@@ -774,8 +789,8 @@ fn solve_tddft_single_spin_unrestricted(
             )
         } else {
             davidson_solver::lr_davidson_solver(
-                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, z, with_hartree, alpha_hybrid),
-                |z: &Vec<f64>| b_matvec_unrestricted(scf, fxc_data, ri_ov, ri_ov_exch, z, with_hartree, alpha_hybrid),
+                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z, with_hartree),
+                |z: &Vec<f64>| b_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z, with_hartree),
                 nroots,
                 hdiag,
                 initial_guess.clone(),
@@ -789,7 +804,7 @@ fn solve_tddft_single_spin_unrestricted(
             let mut e_col = vec![0.0; dim];
             e_col[col] = 1.0;
             let a_col = a_matvec_unrestricted(
-                scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, &e_col, with_hartree, alpha_hybrid,
+                scf, fxc_data, ri_ov, exch, &e_col, with_hartree,
             );
             for row in 0..dim {
                 a_mat[row + col * dim] = a_col[row];
@@ -816,10 +831,10 @@ fn solve_tddft_single_spin_unrestricted(
             let mut e_col = vec![0.0; dim];
             e_col[col] = 1.0;
             let a_col = a_matvec_unrestricted(
-                scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, &e_col, with_hartree, alpha_hybrid,
+                scf, fxc_data, ri_ov, exch, &e_col, with_hartree,
             );
             let b_col = b_matvec_unrestricted(
-                scf, fxc_data, ri_ov, ri_ov_exch, &e_col, with_hartree, alpha_hybrid,
+                scf, fxc_data, ri_ov, exch, &e_col, with_hartree,
             );
             for row in 0..dim {
                 a_mat[row + col * dim] = a_col[row];
@@ -852,7 +867,7 @@ fn solve_tddft_single_spin_unrestricted(
         if is_tda {
             println!("Solving unrestricted TDA eigenvalue problem...");
             davidson_solver::tda_davidson_solver(
-                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, z, with_hartree, alpha_hybrid),
+                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z, with_hartree),
                 nroots,
                 hdiag,
                 initial_guess.clone(),
@@ -861,8 +876,8 @@ fn solve_tddft_single_spin_unrestricted(
         } else {
             println!("Solving unrestricted full linear response eigenvalue problem...");
             davidson_solver::lr_davidson_solver(
-                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, ri_oo_exch, ri_vv_exch, z, with_hartree, alpha_hybrid),
-                |z: &Vec<f64>| b_matvec_unrestricted(scf, fxc_data, ri_ov, ri_ov_exch, z, with_hartree, alpha_hybrid),
+                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z, with_hartree),
+                |z: &Vec<f64>| b_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z, with_hartree),
                 nroots,
                 hdiag,
                 initial_guess.clone(),
@@ -919,4 +934,28 @@ fn solve_tddft_single_spin_unrestricted(
     }
 
     (eigenpairs, td_energies, td_osc)
+}
+
+/// Build the short-range (RSH) exchange tensors for one spin channel of an
+/// unrestricted calculation.
+#[allow(clippy::too_many_arguments)]
+fn tddft_prepare_sr_tensors_spin(
+    scf: &SCF,
+    start_mo: usize,
+    occ_size: usize,
+    vir_size: usize,
+    homo: usize,
+    lumo: usize,
+    num_state: usize,
+    spin: usize,
+    coeff_sr: f64,
+) -> (Option<MatrixFull<f64>>, Option<MatrixFull<f64>>, Option<MatrixFull<f64>>) {
+    if coeff_sr.abs() < 1e-12 {
+        return (None, None, None);
+    }
+    let ov = tddft_get_submatrix_sr_spin(scf, 'O', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state, spin);
+    let oo = tddft_get_submatrix_sr_spin(scf, 'O', 'O', start_mo, occ_size, vir_size, homo, lumo, num_state, spin);
+    let vv = tddft_get_submatrix_sr_spin(scf, 'V', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state, spin);
+    let (oo_exch, vv_exch, ov_exch) = reshape_exchange_tensors(&oo, &vv, &ov, occ_size, vir_size);
+    (Some(oo_exch), Some(vv_exch), Some(ov_exch))
 }
