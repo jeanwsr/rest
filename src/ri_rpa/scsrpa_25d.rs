@@ -5,8 +5,8 @@
 // 目的
 // ----
 // 让 DFAFamily::SCSRPA（R-xDH7、SCS-RPA）复用 ri_pt2/pt2_25d.rs 的 2.5D 重分布框架
-// （initialize_metadata + swap_ownership：ri3mo 从 aux 索引 1D
-// 分布重排为占据归属，每进程持完整 n_aux×n_vir 切片，持久内存
+// （线性归属 initialize_metadata_linear + redistribute_to_diag：ri3mo 从 aux 索引 1D
+// 分布重排为 blk%P 单归属，每进程持完整 n_aux×n_vir 切片 ≈ n_occ/P 个，持久内存
 // ≈ M_total/p；p=进程数），从而获得第一条可用的 MPI 路径（此前 2.5D 分派为
 // unreachable，1D 回退为 panic——因为串行自旋响应内核按全量张量索引编写，
 // 与 MPI 下 aux-分布 ri3mo 不兼容）。
@@ -209,12 +209,12 @@ pub(crate) fn build_freq_grids(scf_data: &SCF) -> FreqGrids {
 /// 未含 0.5/π 因子之外的任何缩放——调用方语义与串行一致）。
 #[cfg(feature = "mpi")]
 fn osrpa_rayon_mpi_25d_impl(
-    scf_data: &SCF,
+    scf_data: &mut SCF,
     mpi_operator: &Option<MPIOperator>,
 ) -> anyhow::Result<[f64; 3]> {
     use mpi::collective::SystemOperation;
     use mpi::traits::*;
-    use crate::ri_pt2::pt2_25d::{initialize_metadata, swap_ownership};
+    use crate::ri_pt2::pt2_25d::{initialize_metadata_linear, redistribute_to_diag};
 
     let (mpi_op, mpi_ix) = match (mpi_operator, &scf_data.mol.mpi_data) {
         (Some(op), Some(ix)) => (op, ix),
@@ -263,7 +263,7 @@ fn osrpa_rayon_mpi_25d_impl(
     let n1_global = alpha_rimo.size[1];
     let n2_global = alpha_rimo.size[2];
 
-    let ctx = initialize_metadata(&grid, n2_global);
+    let ctx = initialize_metadata_linear(&grid, n2_global);
     let mut n0_global_tmp: u64 = 0;
     grid.cart_comm
         .all_reduce_into(&(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
@@ -272,9 +272,9 @@ fn osrpa_rayon_mpi_25d_impl(
     // 2.5D 重分布（α，β）：每 rank 持 row∪col 块的完整 [n_aux×n_vir] 切片；
     // 本地核只用 ownership 块（对角唯一划分）。
     let redistributed_alpha =
-        swap_ownership(&grid, &ctx, alpha_rimo, n0_global, n1_global, n2_global, &local_n0_range);
+        redistribute_to_diag(&grid, &ctx, alpha_rimo, n0_global, &local_n0_range);
     let redistributed_beta = match beta_rimo {
-        Some(b) => Some(swap_ownership(&grid, &ctx, b, n0_global, n1_global, n2_global, &local_n0_range)),
+        Some(b) => Some(redistribute_to_diag(&grid, &ctx, b, n0_global, &local_n0_range)),
         None => None,
     };
 
@@ -332,6 +332,9 @@ fn osrpa_rayon_mpi_25d_impl(
                 special_radius[0], special_radius[1]
             );
         }
+        // 持久化 ω=0 谱半径：SCC15（scc15_for_rxdh7 MPI 分支）直接复用，
+        // 免去第二次完整重分布 + ω=0 响应重算（原每次 SCC15 MPI 运行重复一次）。
+        scf_data.energies.insert(String::from("special_radius"), vec![special_radius[0], special_radius[1]]);
     }
 
     // ---------------------------------------------------------------
@@ -390,7 +393,7 @@ fn osrpa_rayon_mpi_25d_impl(
 /// 闭壳层（RHF）入口：分派用。
 #[cfg(feature = "mpi")]
 pub fn close_shell_osrpa_rayon_mpi_25d(
-    scf_data: &SCF,
+    scf_data: &mut SCF,
     mpi_operator: &Option<MPIOperator>,
 ) -> anyhow::Result<[f64; 3]> {
     osrpa_rayon_mpi_25d_impl(scf_data, mpi_operator)
@@ -399,7 +402,7 @@ pub fn close_shell_osrpa_rayon_mpi_25d(
 /// 开壳层（UHF/ROHF）入口：分派用（ROHF 的 semi_eigenvalues 在 impl 内处理）。
 #[cfg(feature = "mpi")]
 pub fn open_shell_osrpa_rayon_mpi_25d(
-    scf_data: &SCF,
+    scf_data: &mut SCF,
     mpi_operator: &Option<MPIOperator>,
 ) -> anyhow::Result<[f64; 3]> {
     osrpa_rayon_mpi_25d_impl(scf_data, mpi_operator)
@@ -414,7 +417,7 @@ pub fn evaluate_special_radius_only_25d(
 ) -> [f64; 2] {
     use mpi::collective::SystemOperation;
     use mpi::traits::*;
-    use crate::ri_pt2::pt2_25d::{initialize_metadata, swap_ownership};
+    use crate::ri_pt2::pt2_25d::{initialize_metadata_linear, redistribute_to_diag};
 
     let (mpi_op, mpi_ix) = match (mpi_operator, &scf_data.mol.mpi_data) {
         (Some(op), Some(ix)) => (op, ix),
@@ -458,16 +461,16 @@ pub fn evaluate_special_radius_only_25d(
     let n1_global = alpha_rimo.size[1];
     let n2_global = alpha_rimo.size[2];
 
-    let ctx = initialize_metadata(&grid, n2_global);
+    let ctx = initialize_metadata_linear(&grid, n2_global);
     let mut n0_global_tmp: u64 = 0;
     grid.cart_comm
         .all_reduce_into(&(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
     let n0_global = n0_global_tmp as usize;
 
     let redistributed_alpha =
-        swap_ownership(&grid, &ctx, alpha_rimo, n0_global, n1_global, n2_global, &local_n0_range);
+        redistribute_to_diag(&grid, &ctx, alpha_rimo, n0_global, &local_n0_range);
     let redistributed_beta = match beta_rimo {
-        Some(b) => Some(swap_ownership(&grid, &ctx, b, n0_global, n1_global, n2_global, &local_n0_range)),
+        Some(b) => Some(redistribute_to_diag(&grid, &ctx, b, n0_global, &local_n0_range)),
         None => None,
     };
 

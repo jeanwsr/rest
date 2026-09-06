@@ -4855,6 +4855,47 @@ pub fn diagonalize_hamiltonian_distributed_check(scf_data: &SCF, mpi_operator: &
 }
 
 #[cfg(feature = "scalapack")]
+
+/// 广义本征问题 A·X = B·X·Λ 的相对残差 ‖A·X − B·X·Λ‖_F / (‖A‖_F·‖X‖_F 尺度)。
+/// 仅用上三角输入（按对称填充下三角后运算）；X 为列本征矢、w 为对角本征值。
+/// 用于分布式求解器的静默质量门：pdsygvx 对小/病态体系（ECP）可能 info=0 却给出
+/// 漂移的解（同输入多次运行能量/轨道不同），此检查在 rank 间数据一致时给出全局一致的
+/// 回退判据。
+#[cfg(feature = "scalapack")]
+fn generalized_residual_upper(
+    matr_a: &rest_tensors::MatrixUpper<f64>,
+    matr_b: &rest_tensors::MatrixUpper<f64>,
+    z: &rest_tensors::MatrixFull<f64>,
+    w: &Vec<f64>,
+) -> f64 {
+    use tensors::{MathMatrix, ParMathMatrix};
+    let n = z.size()[0];
+    let ncol = z.size()[1].min(w.len());
+    let mut a = rest_tensors::MatrixFull::new([n, n], 0.0);
+    a.iter_matrixupper_mut().unwrap().zip(matr_a.data_ref().unwrap()).for_each(|(to, from)| { *to = *from; });
+    a.fill_lower_part_from_upper_unsafe();
+    let mut b = rest_tensors::MatrixFull::new([n, n], 0.0);
+    b.iter_matrixupper_mut().unwrap().zip(matr_b.data_ref().unwrap()).for_each(|(to, from)| { *to = *from; });
+    b.fill_lower_part_from_upper_unsafe();
+    // az = A·Z ; bz = B·Z ; then subtract column k scaled by w[k]
+    let mut az = rest_tensors::MatrixFull::new([n, ncol], 0.0);
+    let mut bz = rest_tensors::MatrixFull::new([n, ncol], 0.0);
+    tensors::matrix_blas_lapack::_dgemm(&a, (0..n, 0..n), 'N', z, (0..n, 0..ncol), 'N', &mut az, (0..n, 0..ncol), 1.0, 0.0);
+    tensors::matrix_blas_lapack::_dgemm(&b, (0..n, 0..n), 'N', z, (0..n, 0..ncol), 'N', &mut bz, (0..n, 0..ncol), 1.0, 0.0);
+    let mut denom = 0.0_f64;
+    let mut num = 0.0_f64;
+    for k in 0..ncol {
+        let wk = w[k];
+        for i in 0..n {
+            let res = az.data[k * n + i] - wk * bz.data[k * n + i];
+            num += res * res;
+            denom += az.data[k * n + i] * az.data[k * n + i];
+        }
+    }
+    (num / denom.max(1e-300)).sqrt()
+}
+
+#[cfg(feature = "scalapack")]
 pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> ([MatrixFull<f64>;2], [Vec<f64>;2], usize) {
 
     #[cfg(not(feature = "mpi"))]
@@ -4875,6 +4916,25 @@ pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option
                 for i_spin in (0..spin_channel) {
                     match _hamiltonian_distributed_solver(&scf_data.hamiltonian[i_spin], &scf_data.ovlp, &mut num_state, grid, world) {
                         Some((eigenvector_spin, eigenvalue_spin)) => {
+                            // Quality gate: pdsygvx can return info=0 yet silently
+                            // degraded (run-to-run drifting) vectors for small /
+                            // ill-conditioned (ECP) systems. All ranks hold the same
+                            // replicated data, so the residual decision is global.
+                            let n_dim = eigenvector_spin.size()[0];
+                            // Serial dsygv residuals are ~1e-13; pdsygvx on well-behaved
+                            // matrices reaches ~1e-10, while the observed silent-failure
+                            // events sit at >= ~1e-8. Threshold 1e-10 therefore keeps the
+                            // distributed solver on clean solves and deterministically
+                            // falls back on anything degraded (small / ill-conditioned,
+                            // e.g. ECP systems, where pdsygvx info=0 yet drifts run-to-run).
+                            let res_ = if n_dim <= 4096 { generalized_residual_upper(
+                                    &scf_data.hamiltonian[i_spin], &scf_data.ovlp,
+                                    &eigenvector_spin, &eigenvalue_spin) } else { 0.0 };
+                            if n_dim <= 4096 && res_ > 1.0e-10 {
+                                println!("WARNING: distributed (ScaLAPACK) Hamiltonian solver quality gate failed (spin {}); falling back to the serial solver.", i_spin);
+                                (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
+                                return (eigenvectors, eigenvalues, num_state);
+                            }
                             eigenvectors[i_spin] = eigenvector_spin;
                             eigenvalues[i_spin] = eigenvalue_spin;
                         }
@@ -4892,6 +4952,14 @@ pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option
                 // diagonalize Roothaan Fock matrix
                 match _hamiltonian_distributed_solver(scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp, &mut num_state, grid, world) {
                     Some((eigenvector, eigenvalue)) => {
+                        let n_dim = eigenvector.size()[0];
+                        if n_dim <= 4096 && generalized_residual_upper(
+                                scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp,
+                                &eigenvector, &eigenvalue) > 1.0e-8 {
+                            println!("WARNING: distributed (ScaLAPACK) Hamiltonian solver quality gate failed (ROHF); falling back to the serial solver.");
+                            (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
+                            return (eigenvectors, eigenvalues, num_state);
+                        }
                         eigenvectors[0] = eigenvector;
                         eigenvalues[0] = eigenvalue;
                     }
