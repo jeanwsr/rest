@@ -43,7 +43,19 @@ jobs:
           echo "CONDA_PREFIX=$CONDA_DIR/envs/rest-dev" >> "$GITHUB_ENV"
           echo "$CONDA_DIR/envs/rest-dev/bin" >> "$GITHUB_PATH"
 
-      # 3. 搭建 $REST_HOME workspace 布局 (同 compile-guide 第 2 步)
+      # 3. Gitee SSH key: gitee 对 GitHub runner IP 的 HTTP 限流 (429) 不影响 SSH 通道
+      - name: Set up Gitee SSH
+        env:
+          GITEE_SSH_PRIVATE_KEY: ${{ secrets.GITEE_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "$GITEE_SSH_PRIVATE_KEY" > ~/.ssh/gitee_key
+          chmod 600 ~/.ssh/gitee_key
+          ssh-keyscan -t ed25519,rsa gitee.com >> ~/.ssh/known_hosts 2>/dev/null
+          printf 'Host gitee.com\n  IdentityFile ~/.ssh/gitee_key\n  IdentitiesOnly yes\n' >> ~/.ssh/config
+
+      # 4. 搭建 $REST_HOME workspace 布局 (同 compile-guide 第 2 步)
       #    gitee 会对 GitHub runner IP 间歇性限流, 因此带重试
       - name: Assemble $REST_HOME workspace
         run: |
@@ -59,15 +71,15 @@ jobs:
             return 1
           }
           cd "$REST_HOME"
-          clone_retry https://gitee.com/restgroup/rest_workspace.git
+          clone_retry git@gitee.com:restgroup/rest_workspace.git
           cp rest_workspace/Cargo.toml .
-          clone_retry https://gitee.com/restgroup/rest_tensors.git
-          clone_retry https://gitee.com/restgroup/rest_libcint.git
-          clone_retry https://gitee.com/restgroup/rest_regression.git
+          clone_retry git@gitee.com:restgroup/rest_tensors.git
+          clone_retry git@gitee.com:restgroup/rest_libcint.git
+          clone_retry git@gitee.com:restgroup/rest_regression.git
           mkdir -p deps
           echo "REST_EXT_DIR=$REST_HOME/deps" >> "$GITHUB_ENV"
 
-      # 4. 依赖库链接到 $REST_EXT_DIR (同 compile-guide 第 4 步)
+      # 5. 依赖库链接到 $REST_EXT_DIR (同 compile-guide 第 4 步)
       - name: Link libraries into $REST_EXT_DIR
         run: |
           set -euo pipefail
@@ -86,7 +98,7 @@ jobs:
           echo "REST_FORTRAN_COMPILER=gfortran" >> "$GITHUB_ENV"
           echo "LIBCLANG_PATH=$CONDA_PREFIX/lib" >> "$GITHUB_ENV"
 
-      # 5. cargo 缓存 (依赖编译占大头)
+      # 6. cargo 缓存 (依赖编译占大头)
       - name: Cache cargo artifacts
         uses: actions/cache@v4
         with:
@@ -98,7 +110,7 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
-      # 6. 编译 (debug 模式; rest_tensors 的 build.rs 会编译 restmatr.f90 -> librestmatr.so)
+      # 7. 编译 (debug 模式; rest_tensors 的 build.rs 会编译 restmatr.f90 -> librestmatr.so)
       - name: Build (debug)
         run: |
           set -euo pipefail
@@ -111,7 +123,7 @@ jobs:
             exit 1
           fi
 
-      # 7. 冒烟测试: 跑一个小规模 DFT 回归样例
+      # 8. 冒烟测试: 跑一个小规模 DFT 回归样例
       - name: Smoke test (NH3_X3LYP via rest_regression)
         run: |
           set -euo pipefail
