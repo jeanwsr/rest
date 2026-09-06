@@ -49,9 +49,10 @@ jobs:
         run: |
           set -euo pipefail
           clone_retry() {
-            local i
+            local i url="$1" dest
+            dest=$(basename "$url" .git)
             for i in 1 2 3; do
-              git clone --depth 1 "$1" "$2" && return 0
+              git clone --depth 1 "$url" "$dest" && return 0
               echo "::warning::git clone failed (attempt ${i}/3), retrying ..."
               if [ "$i" -lt 3 ]; then sleep $((i * 10)); fi
             done
