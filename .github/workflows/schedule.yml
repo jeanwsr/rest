@@ -42,10 +42,32 @@ jobs:
           PRS_FILE="${RUNNER_TEMP}/open_prs.jsonl"
           : > "$PRS_FILE"
 
+          # Gitee 会对 GitHub runner 的 IP 间歇性限流 (git fetch 报 HTTP 429)。
+          # fetch_retry: 仅对瞬时错误 (429/5xx/网络抖动) 重试；永久错误 (分支/仓库不存在) 立即返回。
+          fetch_retry() {
+            local url="$1"; shift
+            local attempt err
+            for attempt in 1 2 3; do
+              if err=$(git fetch "$url" "$@" 2>&1); then
+                [ -n "$err" ] && printf '%s\n' "$err"
+                return 0
+              fi
+              printf '%s\n' "$err" >&2
+              if ! grep -Eq 'RPC failed|HTTP 429|HTTP 5[0-9][0-9]|curl (18|22|28|35|56)|timed out|Connection reset|Could not resolve|expected flush' <<<"$err"; then
+                return 1
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "::warning::git fetch hit a transient error, retry ${attempt}/2 in $((attempt * ${RETRY_SLEEP_SEC:-15}))s"
+                sleep $((attempt * ${RETRY_SLEEP_SEC:-15}))
+              fi
+            done
+            return 1
+          }
+
           # ---------- 1. 查询 Gitee 所有 open PR (分页, 校验应答) ----------
           page=1
           while :; do
-            resp=$(curl -fsS -H "Authorization: token ${GITEE_TOKEN}" \
+            resp=$(curl -fsS --retry 3 --retry-delay 10 -H "Authorization: token ${GITEE_TOKEN}" \
               "https://gitee.com/api/v5/repos/${GITEE_REPO}/pulls?state=open&per_page=100&page=${page}") \
               || { echo "::error::Gitee API request failed (page ${page})"; exit 1; }
             jq -e 'type == "array"' <<<"$resp" >/dev/null \
@@ -61,7 +83,8 @@ jobs:
           echo "Found ${total} open PR(s)"
 
           # ---------- 2. master 镜像 (强制一致, 自愈 GitHub 侧误提交) ----------
-          git fetch "$GITEE_URL" +refs/heads/master:refs/remotes/gitee/master
+          fetch_retry "$GITEE_URL" +refs/heads/master:refs/remotes/gitee/master \
+            || { echo "::error::cannot fetch master from Gitee (retries exhausted)"; exit 1; }
           git fetch origin +refs/heads/master:refs/remotes/origin/master || true
           gitee_master=$(git rev-parse refs/remotes/gitee/master)
           github_master=$(git rev-parse --verify -q refs/remotes/origin/master || true)
@@ -87,7 +110,7 @@ jobs:
               head_url="$GITEE_URL"
             fi
             head_ref_name="refs/remotes/pr-${pr_number}-head"
-            if ! git fetch "$head_url" "+refs/heads/${head_ref}:${head_ref_name}"; then
+            if ! fetch_retry "$head_url" "+refs/heads/${head_ref}:${head_ref_name}"; then
               echo "::warning::PR #${pr_number}: cannot fetch head '${head_ref}' (fork deleted? PR just closed?) - skipped"
               continue
             fi
@@ -102,7 +125,7 @@ jobs:
 
             # 3.3 获取 base 分支 (按分支名缓存, 只取一次)
             if [ -z "${fetched_base[${base_ref}]:-}" ]; then
-              if ! git fetch "$GITEE_URL" "+refs/heads/${base_ref}:refs/remotes/gitee/${base_ref}"; then
+              if ! fetch_retry "$GITEE_URL" "+refs/heads/${base_ref}:refs/remotes/gitee/${base_ref}"; then
                 echo "::warning::PR #${pr_number}: cannot fetch base '${base_ref}' - skipped"
                 continue
               fi

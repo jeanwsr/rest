@@ -1,66 +1,118 @@
+name: CI
+
 on: [push, pull_request]
 
-jobs:
-  # 占位任务：仅用于验证 push 触发链路
-  # (schedule.yml 将 Gitee 分支同步到 GitHub 后，应触发本 workflow)
-  dummy-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Dummy test
-        run: |
-          echo "Dummy CI OK at $(date)"
+# 避免频繁 push 导致的排队堆积
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
-  # 原构建任务暂时禁用 (构建步骤已失效，待修复后恢复)
-  # linux-build:
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v3
-  #     - name: Install basic deps
-  #       run: |
-  #           cd ..
-  #           curl -o rustup-init https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
-  #           chmod +x rustup-init
-  #           ./rustup-init -y
-  #           sudo apt-get update -qy
-  #           sudo apt-get install libhdf5-dev libopenblas-dev gcc gfortran -qy
-  #           #ls /usr/lib/x86_64-linux-gnu
-  #           #ls -l deps/lib
-  #           #ls -l deps/lib64
-  #     - name: Install libcint, libxc, rest_tensors, etc
-  #       run: |
-  #           cd ..
-  #           pwd
-  #           #curl -L "https://github.com/pyscf/pyscf-build-deps/blob/master/pyscf-2.1-deps.tar.gz?raw=true" | tar xzf -
-  #           wget -O libcint-5.1.5.tar.gz https://github.com/sunqm/libcint/archive/refs/tags/v5.1.5.tar.gz
-  #           tar -zxf libcint-5.1.5.tar.gz
-  #           cd libcint-5.1.5
-  #           mkdir build && cd build
-  #           cmake -DWITH_F12=1 -DWITH_RANGE_COULOMB=1 -DWITH_COULOMB_ERF=1 -DMIN_EXPCUTOFF=20 -DKEEP_GOING=1 -DCMAKE_INSTALL_PREFIX:PATH=/home/runner/work/rest/deps -DCMAKE_INSTALL_LIBDIR:PATH=lib ..
-  #           make && make install
-  #           cd ../..
-  #           wget https://gitlab.com/libxc/libxc/-/archive/5.2.0/libxc-5.2.0.tar.gz
-  #           tar -zxf libxc-5.2.0.tar.gz
-  #           cd libxc-5.2.0
-  #           mkdir build && cd build
-  #           cmake -DCMAKE_BUILD_TYPE=RELEASE -DBUILD_SHARED_LIBS=1 -DCMAKE_INSTALL_PREFIX:PATH=/home/runner/work/rest/deps -DCMAKE_INSTALL_LIBDIR:PATH=lib ..
-  #           make -j2 && make install
-  #           cd ../..
-  #           git clone https://gitlab.com/jeanwsr/MOKIT -b for-rest
-  #           cd MOKIT/src
-  #           make rest2fch -f Makefile.gnu_openblas
-  #     - name: Build
-  #       run: |
-  #           cd ..
-  #           pwd
-  #           curl -o Cargo.toml -L "https://github.com/igor-1982/rest_workspace/blob/master/Cargo.toml?raw=true"
-  #           export REST_FORTRAN_COMPILER="gfortran"
-  #           export REST_CINT_DIR=`pwd`/deps/lib
-  #           export REST_EXT_DIR=`pwd`/deps/lib
-  #           export REST_BLAS_DIR=/usr/lib
-  #           export REST_HDF5_DIR=/usr/lib
-  #           export REST_XC_DIR=`pwd`/deps/lib
-  #           cp MOKIT/mokit/lib/librest2fch.so deps/lib
-  #           git clone https://github.com/igor-1982/rest_tensors.git
-  #           git clone https://github.com/igor-1982/rest_libcint.git
-  #           RUSTFLAGS="-l xc -l rest2fch -L$REST_XC_DIR" cargo build
+jobs:
+  linux-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      # $REST_HOME 是 cargo workspace 根目录 (checkout 位于 $REST_HOME/rest)
+      REST_HOME: /home/runner/work/rest
+
+    steps:
+      # 1. 检出 REST 主代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Miniforge 安装编译期依赖 (参考 rest_doc/source_zh/contributor/compile-guide.md)
+      #    注意: build.rs 链接 cint/restmatr/hdf5/rest2fch/openblas/gomp 全部来自 $REST_EXT_DIR;
+      #    libxc 在运行期动态加载, 编译期无需链接.
+      - name: Install Miniforge and build deps
+        run: |
+          set -euo pipefail
+          CONDA_DIR="$HOME/miniforge3"
+          curl -fsSL --retry 3 -o /tmp/miniforge.sh \
+            "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
+          bash /tmp/miniforge.sh -b -p "$CONDA_DIR"
+          CONDA="$CONDA_DIR/bin/conda"
+          # hdf5 提供 libhdf5.so 链接符号与头文件 (h5py 单独不够);
+          # trimmed: simple-dftd3/dftd4/geometric 为运行期 python 依赖, 编译不需要
+          $CONDA create -y -p "$CONDA_DIR/envs/rest-dev" \
+            python=3.11 numpy scipy h5py \
+            "libopenblas=*=*openmp*" \
+            libxc libcint hdf5 openmpi gfortran libclang \
+            mokit \
+            -c conda-forge -c mokit
+          echo "CONDA_PREFIX=$CONDA_DIR/envs/rest-dev" >> "$GITHUB_ENV"
+          echo "$CONDA_DIR/envs/rest-dev/bin" >> "$GITHUB_PATH"
+
+      # 3. 搭建 $REST_HOME workspace 布局 (同 compile-guide 第 2 步)
+      #    gitee 会对 GitHub runner IP 间歇性限流, 因此带重试
+      - name: Assemble $REST_HOME workspace
+        run: |
+          set -euo pipefail
+          clone_retry() {
+            local i
+            for i in 1 2 3; do
+              git clone --depth 1 "$1" "$2" && return 0
+              echo "::warning::git clone failed (attempt ${i}/3), retrying ..."
+              if [ "$i" -lt 3 ]; then sleep $((i * 10)); fi
+            done
+            return 1
+          }
+          cd "$REST_HOME"
+          clone_retry https://gitee.com/restgroup/rest_workspace.git
+          cp rest_workspace/Cargo.toml .
+          clone_retry https://gitee.com/restgroup/rest_tensors.git
+          clone_retry https://gitee.com/restgroup/rest_libcint.git
+          clone_retry https://gitee.com/restgroup/rest_regression.git
+          mkdir -p deps
+          echo "REST_EXT_DIR=$REST_HOME/deps" >> "$GITHUB_ENV"
+
+      # 4. 依赖库链接到 $REST_EXT_DIR (同 compile-guide 第 4 步)
+      - name: Link libraries into $REST_EXT_DIR
+        run: |
+          set -euo pipefail
+          cd "$REST_EXT_DIR"
+          for pattern in libcint libxc libmpi libhdf5 libopenblas libgomp libpython; do
+            for lib in "$CONDA_PREFIX"/lib/${pattern}*.so; do
+              if [ -e "$lib" ]; then ln -sf "$lib" .; fi
+            done
+          done
+          # librest2fch.so 由 mokit 包装在 python site-packages 下
+          ln -sf "$CONDA_PREFIX"/lib/python3.11/site-packages/mokit/lib/librest2fch.so .
+          # 某些 conda 发行版没有 libopenblas.so, 从 libopenblas.0.so 链接
+          [ -e libopenblas.so ] || ln -sf libopenblas.0.so libopenblas.so
+          echo "LD_LIBRARY_PATH=$REST_EXT_DIR:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          echo "HDF5_DIR=$CONDA_PREFIX" >> "$GITHUB_ENV"
+          echo "REST_FORTRAN_COMPILER=gfortran" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$CONDA_PREFIX/lib" >> "$GITHUB_ENV"
+
+      # 5. cargo 缓存 (依赖编译占大头)
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            /home/runner/work/rest/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      # 6. 编译 (debug 模式; rest_tensors 的 build.rs 会编译 restmatr.f90 -> librestmatr.so)
+      - name: Build (debug)
+        run: |
+          set -euo pipefail
+          cd "$REST_HOME"
+          cargo build -p rest
+          # 链接完整性检查: 不允许存在 unresolved 共享库
+          if ldd target/debug/rest | grep -q "not found"; then
+            echo "::error::unresolved shared libraries:"
+            ldd target/debug/rest | grep "not found"
+            exit 1
+          fi
+
+      # 7. 冒烟测试: 跑一个小规模 DFT 回归样例
+      - name: Smoke test (NH3_X3LYP via rest_regression)
+        run: |
+          set -euo pipefail
+          cd "$REST_HOME/rest_regression"
+          cargo run --quiet -- -c debug -f NH3_X3LYP
