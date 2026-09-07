@@ -2,7 +2,7 @@
 //! sibling of `rks_grid_shift`: magnitude of the correction (B3LYP) and translational
 //! invariance of the assembled Hessian (B3LYP/TPSSh) and of the per-spin skeleton terms.
 
-use pyrest::analdrv::config::AnalDrvConfig;
+use pyrest::analdrv::config::{AnalDrvConfig, AnalDrvNucgradCfg};
 use pyrest::analdrv::uscf_interface::uscf_hess_interface;
 use pyrest::ctrl_io;
 use pyrest::molecule_io::Molecule;
@@ -102,7 +102,10 @@ fn test_b3lyp_grid_shift_magnitude_and_invariance() {
     let mut scf_data = run_scf(INPUT_NH3_B3LYP);
 
     let de_on = run_hessian(&mut scf_data, &AnalDrvConfig::default());
-    let de_off = run_hessian(&mut scf_data, &AnalDrvConfig { grid_shift_deriv: false, ..Default::default() });
+    let de_off = run_hessian(
+        &mut scf_data,
+        &AnalDrvConfig { nucgrad: AnalDrvNucgradCfg { grid_shift_deriv: false, ..Default::default() }, ..Default::default() },
+    );
 
     // the grid-shift correction is small compared to the Hessian itself
     let max_diff = (&de_on - &de_off).abs().max();

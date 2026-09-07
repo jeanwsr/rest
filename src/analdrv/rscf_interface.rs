@@ -37,7 +37,7 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
     // The dispersion energy is independent of the density matrix (nuclear-like term). Its
     // Hessian is evaluated numerically from the analytic dispersion gradient, and is only
     // added if empirical dispersion is specified in the input.
-    let mut hess_dftd_obj = HessDFTD::new(mol_obj, config.dftd_hess_step);
+    let mut hess_dftd_obj = HessDFTD::new(mol_obj, config.nucgrad.dftd_hess_step);
     if let Some(ref mut hess_dftd_obj) = hess_dftd_obj {
         hess_nuc_list.push(hess_dftd_obj);
     }
@@ -127,13 +127,13 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
         let xc_type = determine_den_type_from_list(&xc_func_list.iter().map(|(_, f)| f).collect_vec());
         let is_mgga = matches!(xc_type, XCDenType::TAU);
         let grid_gen_level = scf_data.mol.ctrl.grid_gen_level;
-        let grid_shift = config.grid_shift_deriv;
-        let sk_level = config.grid_level_skeleton.unwrap_or(if is_mgga && !grid_shift {
+        let grid_shift = config.nucgrad.grid_shift_deriv;
+        let sk_level = config.nucgrad.grid_level_skeleton.unwrap_or(if is_mgga && !grid_shift {
             grid_gen_level + 2
         } else {
             grid_gen_level
         });
-        let cphf_level = config.grid_level_cphf.unwrap_or(grid_gen_level.max(3) - 2);
+        let cphf_level = config.cphf.grid_level.unwrap_or(grid_gen_level.max(3) - 2);
 
         // skeleton grid: reuse the SCF grid when the level matches, else regenerate.  Either
         // way, regroup to atom-grouped order (non-decreasing atm_idx): the SCF grid is

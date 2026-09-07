@@ -46,7 +46,7 @@ impl<'a> RHessSCF<'a> {
     /// Number of atoms over which the Hessian is computed. This is `atm_list.len()` if
     /// `atm_list` is `Some`, otherwise the total number of atoms in the molecule.
     pub fn natm(&self) -> usize {
-        match &self.config.atm_list {
+        match &self.config.nucgrad.atm_list {
             Some(list) => list.len(),
             None => self.ovlp_obj.natm(),
         }
@@ -55,7 +55,7 @@ impl<'a> RHessSCF<'a> {
     /// Return the list of (global) atom indices the Hessian is computed for, ordered the same
     /// way as the local indexing used in the returned Hessian.
     pub fn atm_indices(&self) -> Vec<usize> {
-        match &self.config.atm_list {
+        match &self.config.nucgrad.atm_list {
             Some(list) => list.clone(),
             None => (0..self.ovlp_obj.natm()).collect(),
         }
@@ -89,7 +89,7 @@ impl<'a> RHessSCF<'a> {
         let mo_coeff = &self.mo_coeff;
         let mo_occ = &self.mo_occ;
         let mo_energy = &self.mo_energy;
-        let level_shift = self.config.cphf_level_shift;
+        let level_shift = self.config.cphf.level_shift;
         let device = mo_coeff.device().clone();
 
         let [nao, nmo] = mo_coeff.shape().to_vec().try_into().unwrap();
@@ -101,7 +101,7 @@ impl<'a> RHessSCF<'a> {
         let nocc = occidx.iter().filter(|&&x| x).count();
         let natm = self.natm();
         let atm_indices = self.atm_indices();
-        let atm_list = self.config.atm_list.as_deref();
+        let atm_list = self.config.nucgrad.atm_list.as_deref();
 
         let e_ai = evir.i((.., None)) - eocc.i((None, ..));
         let e_ai_shift = &e_ai + level_shift;
@@ -220,7 +220,7 @@ impl<'a> RHessSCF<'a> {
         let t0 = std::time::Instant::now();
         let mo_occ = self.mo_occ.view();
         let mo_energy = self.mo_energy.view();
-        let level_shift = self.config.cphf_level_shift;
+        let level_shift = self.config.cphf.level_shift;
         let occidx = mo_occ.view().greater(0).into_vec();
         let viridx = occidx.iter().map(|&x| !x).collect_vec();
         let nocc = occidx.iter().filter(|&&x| x).count();
@@ -264,11 +264,11 @@ impl<'a> RHessSCF<'a> {
         let nocc = rhs.shape()[1];
         let rhs = rhs.reshape((nmo * nocc, -1));
 
-        let tol = self.config.cphf_tol;
-        let max_cycle = self.config.cphf_max_cycle;
-        let max_space = self.config.cphf_max_space;
-        let lindep = self.config.cphf_lindep;
-        let tol_inflation = self.config.cphf_tol_inflation;
+        let tol = self.config.cphf.tol;
+        let max_cycle = self.config.cphf.max_cycle;
+        let max_space = self.config.cphf.max_space;
+        let lindep = self.config.cphf.lindep;
+        let tol_inflation = self.config.cphf.tol_inflation;
 
         let response_cphf_flattened = |x: TsrView| -> Tsr {
             let x = x.reshape((nmo, nocc, -1));
@@ -425,7 +425,7 @@ impl<'a> RHessSCF<'a> {
         let natm = self.natm();
         let mo_coeff = self.mo_coeff.view();
         let mo_occ = self.mo_occ.view();
-        let atm_list = self.config.atm_list.as_deref();
+        let atm_list = self.config.nucgrad.atm_list.as_deref();
 
         let device = self.mo_coeff.device().clone();
         let mut de_skeleton = rt::zeros(([3, 3, natm, natm], &device));
@@ -467,7 +467,7 @@ impl<'a> RHessSCF<'a> {
         let mo_occ = self.mo_occ.view();
         let mo_energy = self.mo_energy.view();
         let dme0 = get_dme0_restricted(mo_coeff, mo_occ, mo_energy);
-        let atm_list = self.config.atm_list.clone();
+        let atm_list = self.config.nucgrad.atm_list.clone();
 
         let de_skeleton = self.make_skeleton_hess();
 

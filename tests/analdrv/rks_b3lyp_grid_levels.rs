@@ -3,7 +3,7 @@
 //! Exercises the dedicated CP-KS grid path (`ni_cpks = Some`) and the skeleton-grid
 //! regeneration path for a GGA functional.
 
-use pyrest::analdrv::config::AnalDrvConfig;
+use pyrest::analdrv::config::{AnalDrvCphfCfg, AnalDrvConfig, AnalDrvNucgradCfg};
 use pyrest::analdrv::rscf_interface::rscf_hess_interface;
 
 use pyrest::ctrl_io;
@@ -58,7 +58,11 @@ fn run_with_config(config: AnalDrvConfig) -> Vec<f64> {
 fn test_nh3_explicit_grid_levels() {
     // For GGA the default skeleton level equals grid_gen_level (3); force both grids to differ
     // from each other and from the SCF grid so the regeneration + ni_cpks paths are exercised.
-    let config = AnalDrvConfig { grid_level_skeleton: Some(4), grid_level_cphf: Some(2), ..Default::default() };
+    let config = AnalDrvConfig {
+        nucgrad: AnalDrvNucgradCfg { grid_level_skeleton: Some(4), ..Default::default() },
+        cphf: AnalDrvCphfCfg { grid_level: Some(2), ..Default::default() },
+        ..Default::default()
+    };
     let de = run_with_config(config);
 
     let natm = 4;
@@ -83,7 +87,11 @@ fn test_nh3_default_grid_levels() {
 #[test]
 fn test_nh3_cphf_equals_skeleton() {
     // cphf level == skeleton level (both 3) -> ni_cpks = None fast path (reuse skeleton vxc/fxc).
-    let config = AnalDrvConfig { grid_level_skeleton: Some(3), grid_level_cphf: Some(3), ..Default::default() };
+    let config = AnalDrvConfig {
+        nucgrad: AnalDrvNucgradCfg { grid_level_skeleton: Some(3), ..Default::default() },
+        cphf: AnalDrvCphfCfg { grid_level: Some(3), ..Default::default() },
+        ..Default::default()
+    };
     let de = run_with_config(config);
 
     let natm = 4;

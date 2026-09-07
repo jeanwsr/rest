@@ -7,7 +7,7 @@
 //!   derivatives) over the atom indices must vanish — the grid-shift terms are constructed to
 //!   restore exactly this invariance.
 
-use pyrest::analdrv::config::AnalDrvConfig;
+use pyrest::analdrv::config::{AnalDrvConfig, AnalDrvNucgradCfg};
 use pyrest::analdrv::rscf_interface::rscf_hess_interface;
 use pyrest::ctrl_io;
 use pyrest::molecule_io::Molecule;
@@ -107,7 +107,10 @@ fn test_b3lyp_grid_shift_magnitude_and_invariance() {
     let scf_data = run_scf(INPUT_NH3_B3LYP);
 
     let de_on = run_hessian(&scf_data, &AnalDrvConfig::default());
-    let de_off = run_hessian(&scf_data, &AnalDrvConfig { grid_shift_deriv: false, ..Default::default() });
+    let de_off = run_hessian(
+        &scf_data,
+        &AnalDrvConfig { nucgrad: AnalDrvNucgradCfg { grid_shift_deriv: false, ..Default::default() }, ..Default::default() },
+    );
 
     // the grid-shift correction is small compared to the Hessian itself
     let max_diff = (&de_on - &de_off).abs().max();

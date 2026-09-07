@@ -3,7 +3,7 @@
 //! Exercises the MGGA skeleton-grid regeneration (`grid_gen_level + 2` default) and the
 //! dedicated CP-KS grid path on the UKS side.
 
-use pyrest::analdrv::config::AnalDrvConfig;
+use pyrest::analdrv::config::{AnalDrvCphfCfg, AnalDrvConfig, AnalDrvNucgradCfg};
 use pyrest::analdrv::uscf_interface::uscf_hess_interface;
 
 use pyrest::ctrl_io;
@@ -67,8 +67,8 @@ fn test_nh3_mgga_default_skeleton() {
 #[test]
 fn test_nh3_mgga_explicit_grid_levels() {
     let config = AnalDrvConfig {
-        grid_level_skeleton: Some(5),
-        grid_level_cphf: Some(2),
+        nucgrad: AnalDrvNucgradCfg { grid_level_skeleton: Some(5), ..Default::default() },
+        cphf: AnalDrvCphfCfg { grid_level: Some(2), ..Default::default() },
         ..Default::default()
     };
     let de = run_with_config(config);

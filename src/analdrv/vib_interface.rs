@@ -23,7 +23,7 @@ pub fn vibration_analysis_interface(
     // first transpose hessian to [3*natm, 3*natm]
     let natm = de_hess.shape()[3];
     let hess = de_hess.transpose((0, 2, 1, 3)).into_shape((3 * natm, 3 * natm));
-    let atm_list = config.atm_list.clone().unwrap_or_else(|| (0..mol.natm()).collect_vec());
+    let atm_list = config.nucgrad.atm_list.clone().unwrap_or_else(|| (0..mol.natm()).collect_vec());
     let elems = atm_list.iter().map(|&i| scf_data.mol.geom.elem[i].clone()).collect_vec();
 
     let mass_charge = get_mass_charge(&elems);
@@ -46,7 +46,7 @@ pub fn vibration_analysis_interface(
 
     // this is activated by `gau_thermo = true` in control input, and not activated by default.
 
-    let gau_th = config.gau_thermo.then(|| {
+    let gau_th = config.nucgrad.gau_thermo.then(|| {
 
         println!("=============== Thermo Analysis (Usual Style in analdrv) ===============");
         println!("");
@@ -61,7 +61,7 @@ pub fn vibration_analysis_interface(
         let multiplicity = scf_data.mol.ctrl.spin;
 
         use super::point_group_detect::interface_to_rest::get_full_point_group_for_vib;
-        let tol_pg = config.tol_point_group / (1.0 + natm as f64).sqrt();
+        let tol_pg = config.nucgrad.tol_point_group / (1.0 + natm as f64).sqrt();
         let (pg_name, pg_sigma) = get_full_point_group_for_vib(&elems, &mass, &geom, tol_pg);
 
         let thermo_ctrl = scf_data.mol.ctrl.thermo.as_ref();
