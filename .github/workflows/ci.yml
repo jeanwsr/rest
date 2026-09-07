@@ -107,17 +107,15 @@ jobs:
           echo "REST_FORTRAN_COMPILER=gfortran" >> "$GITHUB_ENV"
           echo "LIBCLANG_PATH=$CONDA_PREFIX/lib" >> "$GITHUB_ENV"
 
-      # 6. Cache cargo artifacts (dependency compilation dominates build time)
+      # 6. Cache cargo artifacts
+      #    rust-cache restores target/ to the workspace root correctly (actions/cache
+      #    extracts relative to the checkout dir), prunes workspace-own + incremental
+      #    artifacts to stay small, and keys on the rustc version automatically
       - name: Cache cargo artifacts
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            /home/runner/work/rest/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-
+          workspaces: /home/runner/work/rest
+          cache-on-failure: true
 
       # 7. Build (release; rest_tensors' build.rs compiles restmatr.f90 -> librestmatr.so)
       - name: Build (release)
