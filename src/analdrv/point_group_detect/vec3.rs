@@ -45,11 +45,7 @@ pub fn normalize(v: &Vec3) -> Vec3 {
 
 #[inline]
 pub fn cross(v: &Vec3, u: &Vec3) -> Vec3 {
-    [
-        v[1] * u[2] - v[2] * u[1],
-        v[2] * u[0] - v[0] * u[2],
-        v[0] * u[1] - v[1] * u[0],
-    ]
+    [v[1] * u[2] - v[2] * u[1], v[2] * u[0] - v[0] * u[2], v[0] * u[1] - v[1] * u[0]]
 }
 
 /// Unit vector perpendicular to length-3 vectors `u` and `v`.
@@ -63,11 +59,7 @@ pub fn perp_unit(u: &Vec3, v: &Vec3) -> Vec3 {
 
     if rdotr < 1.0e-16 {
         // cross product too small to normalize: pick the larger of u, v
-        let (d, dotprodd) = if dot(u, u) < dot(v, v) {
-            (*v, dot(v, v))
-        } else {
-            (*u, dot(u, u))
-        };
+        let (d, dotprodd) = if dot(u, u) < dot(v, v) { (*v, dot(v, v)) } else { (*u, dot(u, u)) };
 
         if dotprodd < 1.0e-16 {
             // both tiny -> arbitrary

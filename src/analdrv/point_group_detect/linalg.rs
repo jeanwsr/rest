@@ -31,10 +31,7 @@ pub fn diagonalize3x3symmat(m: &Matrix3) -> ([f64; 3], Matrix3) {
         for p in 0..3 {
             for q in (p + 1)..3 {
                 let g = 100.0 * a[p][q].abs();
-                if n_iter > 4
-                    && (w[p].abs() + g == w[p].abs())
-                    && (w[q].abs() + g == w[q].abs())
-                {
+                if n_iter > 4 && (w[p].abs() + g == w[p].abs()) && (w[q].abs() + g == w[q].abs()) {
                     a[p][q] = 0.0;
                 } else if a[p][q].abs() > thresh {
                     let h = w[q] - w[p];
@@ -88,8 +85,8 @@ pub fn diagonalize3x3symmat(m: &Matrix3) -> ([f64; 3], Matrix3) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::matrix::matmul;
+    use super::*;
 
     #[test]
     fn diagonal_diag_matrix() {

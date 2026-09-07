@@ -51,12 +51,8 @@ pub fn hess_interface(scf_data: &SCF, analdrv_ctrl: &AnalDrvConfig) -> (Vec<f64>
     }
 
     match scf_data.scftype {
-        SCFType::RHF => {
-            rscf_hess_interface(&scf_data, analdrv_ctrl)
-        },
-        SCFType::UHF => {
-            uscf_hess_interface(&scf_data, analdrv_ctrl)
-        },
+        SCFType::RHF => rscf_hess_interface(&scf_data, analdrv_ctrl),
+        SCFType::UHF => uscf_hess_interface(&scf_data, analdrv_ctrl),
         _ => unimplemented!("Normal modes calculation is only implemented for RHF and UHF SCF types."),
     }
 }

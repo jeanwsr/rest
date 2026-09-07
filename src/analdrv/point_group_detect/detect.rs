@@ -15,9 +15,6 @@ impl SymmMolecule {
     /// Detect the point group and rotational symmetry number.
     pub fn detect(&self) -> PointGroup {
         let (template, n) = self.detect_inner();
-        PointGroup {
-            full_name: template.full_name(n),
-            sigma: template.sigma(n),
-        }
+        PointGroup { full_name: template.full_name(n), sigma: template.sigma(n) }
     }
 }

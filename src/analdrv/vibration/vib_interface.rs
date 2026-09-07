@@ -1,6 +1,6 @@
 use crate::analdrv::prelude::*;
-use crate::geom_io::get_mass_charge;
 use crate::analdrv::vibration::vib::*;
+use crate::geom_io::get_mass_charge;
 use crate::ri_jk::util::get_cint_mol;
 use crate::SCF;
 
@@ -47,7 +47,6 @@ pub fn vibration_analysis_interface(
     // this is activated by `gau_thermo = true` in control input, and not activated by default.
 
     let gau_th = config.nucgrad.gau_thermo.then(|| {
-
         println!("=============== Thermo Analysis (Usual Style in analdrv) ===============");
         println!("");
         println!("Note: This is gaussian-style thermo analysis.");
@@ -72,7 +71,7 @@ pub fn vibration_analysis_interface(
         if electronic_energy == 0.0 {
             electronic_energy = e0;
         }
-        
+
         // if control input has symmetry number, use it; otherwise, use point group detected sigma.
         let mut symmetry_number = thermo_ctrl.map(|t| t.symmetry_number as i64).unwrap_or(pg_sigma as i64);
         if symmetry_number <= 0 {

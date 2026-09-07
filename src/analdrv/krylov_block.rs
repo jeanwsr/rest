@@ -4,7 +4,7 @@
 //! the original call signature for `analdrv/hessian/rscf.rs` and `analdrv/hessian/uscf.rs`.
 
 use super::prelude::*;
-use crate::solvers::krylov::{KrylovConfig, krylov_tsr};
+use crate::solvers::krylov::{krylov_tsr, KrylovConfig};
 
 /// Solve `(I + aop) x = b` by a block Krylov subspace method with hard restarts.
 ///

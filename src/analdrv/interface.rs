@@ -19,20 +19,25 @@ pub fn analdrv_interface(scf_data: &SCF, tasks: &[AnalDrvTask], config: &AnalDrv
         match task {
             AnalDrvTask::Hessian => {
                 let (_, vib, _) = hess_interface(scf_data, config);
-                let freqs: Vec<f64> = vib.omega.iter().zip(vib.imag.iter())
-                    .map(|(&f, &imag)| if imag { -f } else { f })
-                    .collect();
+                let freqs: Vec<f64> =
+                    vib.omega.iter().zip(vib.imag.iter()).map(|(&f, &imag)| if imag { -f } else { f }).collect();
 
                 // --- thermo analysis (shermo-style) --- //
 
                 // this is activated by using `[thermo]` section in control input.
-                let thermo = scf_data.mol.ctrl.thermo.as_ref().map(|thermo_cfg| {
-                    let mut time_mark = crate::utilities::TimeRecords::new();
-                    crate::thermo::run_thermochemistry(scf_data, &freqs, thermo_cfg, &mut time_mark)
-                }).flatten();
+                let thermo = scf_data
+                    .mol
+                    .ctrl
+                    .thermo
+                    .as_ref()
+                    .map(|thermo_cfg| {
+                        let mut time_mark = crate::utilities::TimeRecords::new();
+                        crate::thermo::run_thermochemistry(scf_data, &freqs, thermo_cfg, &mut time_mark)
+                    })
+                    .flatten();
 
                 output = Some(AnaldrvOutput { frequencies_cm: freqs, modes_trv: vib.trv.clone(), thermo });
-            }
+            },
         };
     }
     output

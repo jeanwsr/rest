@@ -275,7 +275,8 @@ impl<'a> RHessSCF<'a> {
             let y = self.response_dimless_cpscf(x.view());
             y.into_shape((nmo * nocc, -1))
         };
-        let mo1 = krylov_block(response_cpscf_flattened, rhs.view(), None, tol, max_cycle, max_space, lindep, tol_inflation);
+        let mo1 =
+            krylov_block(response_cpscf_flattened, rhs.view(), None, tol, max_cycle, max_space, lindep, tol_inflation);
         let mo1 = mo1.into_shape(rhs_shape);
 
         self.timing.push(("solve_dimless_cpscf".to_string(), t0.elapsed().as_secs_f64()));
