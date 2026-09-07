@@ -752,16 +752,31 @@ analdrv_tasks = "freq"
 
 ### 解析梯度模块 `analdrv` 区块选项
 
-在设置任务后，用户可以在 `[analdrv]` 区块中设置对应的计算选项。该区块的关键词包括：
+在设置任务后，用户可以在 `[analdrv]` 区块中设置对应的计算选项。该区块的关键词分为三个部分：通用选项、CP-SCF 求解器选项、以及核坐标导数性质选项。
+
+#### 通用选项
+
+- `verbose`：打印强度。默认为 None，使用输入卡 `[ctrl]` 区块的 verbose。
+
+#### CP-SCF 求解器选项
+
+这类选项控制 CP-SCF 方程如何求解，但不控制传入求解的量 (如参与计算的原子范围)。
+
 - `cpscf_level_shift`：CP-SCF 求解时对 $\varepsilon_i - \varepsilon_a$ 的求解偏移。默认为 0，单位 Hartree。
 - `cpscf_tol`：CP-SCF 中的 Krylov 求解阈值。默认 1e-9，无量纲。实际求解阈值也受制于 `cpscf_lindep`。
 - `cpscf_max_cycle`：CP-SCF 最大迭代步数。默认为 42 步。CP-SCF 与 SCF 不同，一般 6-10 步能收敛。这里的最大步数一般不需要设得很大。
 - `cpscf_max_space`：CP-SCF 中 Krylov 空间的数量。默认为 14。该数值不宜设太小，因为超过该数值时，Krylov 求解器会代入最后一次迭代重新作为初猜，重置求解过程。但该数值设太大会对内存产生压力。
 - `cpscf_lindep`：CP-SCF 中一些数值过程的数值精度阈值。默认 1e-15，无量纲。
 - `cpscf_tol_inflation`：容忍系数。若 Krylov 真残差 `||r|| < factor * tol`，接受该解而不触发 per-root 求解。缺省为1000.0。
-- `verbose`：打印强度。默认为 None，使用输入卡 `[ctrl]` 区块的 verbose。
-- `atm_list`：选择一部分原子进行 Hessian 计算。默认为 None，即所有原子参与 Hessian 计算。
 - `grid_level_cpscf`：CP-SCF 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None，是 `[ctrl]` 中 grid_generation_level 关键词设定值减 2 (SCF 默认格点级别是 3，对应 Hessian 的级别是 1)；最低级别是 1。
+
+这些关键词在旧版本中使用 `cphf_*` 前缀 (`cphf_tol`、`grid_level_cphf` 等)；旧关键词目前仍然作为别名被接受。
+
+#### 核坐标导数性质选项
+
+这类选项控制对哪些原子坐标求导、以及梯度/Hessian 等导数性质 (及其衍生的振动、热力学分析) 如何计算，但不控制 CP-SCF 方程如何求解。
+
+- `atm_list`：选择一部分原子进行 Hessian 计算。默认为 None，即所有原子参与 Hessian 计算。
 - `grid_level_skeleton`：Skeleton 导数 (包括 2 阶 Hessian 贡献、1 阶 Fock 贡献) 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None：
   - LDA/GGA 使用与 SCF 同样的格点；
   - mGGA 分为两种情况：若 `grid_shift_deriv` 为 true 则保持 SCF 格点；若为 false 则将比 `grid_generation_level` 增加 2 级别。
@@ -769,8 +784,6 @@ analdrv_tasks = "freq"
 - `tol_point_group`：振动分析中的点群对称性判断阈值 (用于计算转动对称性，对熵矫正有贡献)。默认 1e-5，单位 Bohr / sqrt(atom)。
 - `dftd_hess_step`：经验色散校正 (DFT-D3/DFT-D4) 对 Hessian 贡献的数值差分步长。默认为 3e-4，单位 Bohr。
 - `gau_thermo`：是否使用 Gaussian 类型的热力学能矫正。默认 false。该选项仅作参考；目前 REST 的热力学矫正通常是定义 `[thermo]` 区块以进行计算。Gaussian 类型热力学能矫正接受输入卡中 `[thermo]` 区块的关键词 `temperature`, `pressure`, `symmetry_number` 与 `electronic_energy`。
-
-其中，CP-SCF 求解器相关的关键词 (`cpscf_*` 与 `grid_level_cpscf`) 在旧版本中使用 `cphf_*` 前缀 (`cphf_tol`、`grid_level_cphf` 等)；这些旧关键词目前仍然作为别名被接受。
 
 作为例子，运行 Hessian 计算、增大 CP-SCF Krylov 求解器空间到 20、强制 CP-SCF 中 DFT 格点积分级别为 2，所需要引入的、相比于能量计算的额外设置如下：
 ```toml
