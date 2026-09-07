@@ -39,11 +39,14 @@ jobs:
             "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
           bash /tmp/miniforge.sh -b -p "$CONDA_DIR"
           CONDA="$CONDA_DIR/bin/conda"
+          # simple-dftd3/dftd4/geometric are runtime Python deps required by the
+          # regression suite (dispersion / TRIC-optimizer cases import them via
+          # REST's Python bridge); the build itself does not link them
           $CONDA create -y -p "$CONDA_DIR/envs/rest-dev" \
             python=3.11 numpy scipy h5py \
             "libopenblas=*=*openmp*" \
             libxc libcint hdf5 openmpi gfortran libclang \
-            mokit \
+            simple-dftd3 dftd4 geometric mokit \
             -c conda-forge -c mokit
           echo "CONDA_PREFIX=$CONDA_DIR/envs/rest-dev" >> "$GITHUB_ENV"
           echo "$CONDA_DIR/envs/rest-dev/bin" >> "$GITHUB_PATH"
