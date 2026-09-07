@@ -1,5 +1,10 @@
 name: CI
 
+# Run title: "CI (branch) (commit message)" for sync-* branches,
+# default (commit message) for everything else
+run-name: >-
+  ${{ startsWith(github.ref_name, 'sync/') && format('CI ({0}) ({1})', github.ref_name, github.event.head_commit.message) || github.event.head_commit.message }}
+
 on: [push, pull_request]
 
 # Avoid queued-build pile-up from frequent pushes
@@ -124,9 +129,9 @@ jobs:
             exit 1
           fi
 
-      # 8. Smoke test: run a small DFT regression case
-      - name: Smoke test (NH3_X3LYP via rest_regression)
+      # 8. Test: run regression
+      - name: Test
         run: |
           set -euo pipefail
           cd "$REST_HOME/rest_regression"
-          cargo run -- -f scf
+          cargo run -- -t 4
