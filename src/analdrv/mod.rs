@@ -51,6 +51,9 @@ pub mod trait_util;
 // hessian property
 pub mod hessian;
 
+// energy response to orbitals and density matrix
+pub mod response;
+
 #[allow(unused_imports)]
 pub mod prelude {
     use super::*;
