@@ -46,6 +46,7 @@ pub mod vibration;
 // utilities
 pub mod krylov_block;
 pub mod point_group_detect;
+pub mod trait_util;
 
 // hessian property
 pub mod hessian;
@@ -61,8 +62,8 @@ pub mod prelude {
     pub use hessian::rscf::RHessSCF;
     pub use hessian::trait_rhess::{HessNucAPI, RHessCoreAPI, RHessElecInteractAPI};
     pub use hessian::trait_uhess::{UHessCoreAPI, UHessElecInteractAPI};
-    pub use hessian::trait_util::HessUtilAPI;
     pub use hessian::uscf::UHessSCF;
+    pub use trait_util::AnalDrvBaseAPI;
 
     pub(super) use crate::ri_jk::util::{get_dm0_restricted, get_dme0_restricted};
     pub(super) use crate::utilities::rstsr_util::*;

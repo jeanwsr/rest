@@ -1260,7 +1260,7 @@ impl<'a> UHessKSNIMatmul<'a> {
     }
 }
 
-impl<'a> HessUtilAPI for UHessKSNIMatmul<'a> {}
+impl<'a> AnalDrvBaseAPI for UHessKSNIMatmul<'a> {}
 
 impl<'a> UHessElecInteractAPI for UHessKSNIMatmul<'a> {
     fn make_skeleton_hess(

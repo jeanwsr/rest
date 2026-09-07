@@ -4,7 +4,7 @@ use crate::analdrv::prelude::*;
 ///
 /// Difference to [`RHessCoreAPI`] is that we may need different signature. Basic ideas are exactly
 /// the same.
-pub trait UHessCoreAPI: HessUtilAPI {
+pub trait UHessCoreAPI: AnalDrvBaseAPI {
     /// Generate the **skeleton** contribution of Hessian for current SCF component.
     ///
     /// # Parameters
@@ -54,7 +54,7 @@ pub trait UHessCoreAPI: HessUtilAPI {
 ///
 /// Difference to [`RHessElecInteractAPI`] is that we may need different signature. Basic ideas are
 /// exactly the same.
-pub trait UHessElecInteractAPI: HessUtilAPI {
+pub trait UHessElecInteractAPI: AnalDrvBaseAPI {
     /// Generate the **skeleton** contribution of Hessian for current SCF component.
     ///
     /// # Parameters

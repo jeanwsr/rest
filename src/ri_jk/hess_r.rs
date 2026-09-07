@@ -1828,7 +1828,7 @@ impl<'a> RHessRIJK<'a> {
     }
 }
 
-impl<'a> HessUtilAPI for RHessRIJK<'a> {}
+impl<'a> AnalDrvBaseAPI for RHessRIJK<'a> {}
 
 impl<'a> RHessElecInteractAPI for RHessRIJK<'a> {
     fn make_skeleton_hess(&mut self, mo_coeff: TsrView, mo_occ: TsrView, atm_list: Option<&[usize]>) -> Tsr {

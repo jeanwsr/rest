@@ -14,7 +14,6 @@
 // trait definitions
 pub mod trait_rhess;
 pub mod trait_uhess;
-pub mod trait_util;
 
 // core hess implementations
 pub mod hcore;

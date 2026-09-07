@@ -143,7 +143,7 @@ impl<'a> UHessRIJK<'a> {
     }
 }
 
-impl<'a> HessUtilAPI for UHessRIJK<'a> {}
+impl<'a> AnalDrvBaseAPI for UHessRIJK<'a> {}
 
 impl<'a> UHessElecInteractAPI for UHessRIJK<'a> {
     fn make_skeleton_hess(

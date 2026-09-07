@@ -9,7 +9,7 @@ use crate::analdrv::prelude::*;
 /// do not depend on density matrix (like DFT-D3).
 ///
 /// This hessian contribution is not related to density, so no RHF/UHF/GHF distinguishment required.
-pub trait HessNucAPI: HessUtilAPI {
+pub trait HessNucAPI: AnalDrvBaseAPI {
     fn make_skeleton_hess(&mut self, atm_list: Option<&[usize]>) -> Tsr;
 }
 
@@ -28,7 +28,7 @@ pub trait HessNucAPI: HessUtilAPI {
 /// We have function `make_skeleton_hess` here to count the **skeleton** contribution of the
 /// Hessian. We do not handle derivative of density matrix here, which is the responsibility of CP-SCF
 /// solver.
-pub trait RHessCoreAPI: HessUtilAPI {
+pub trait RHessCoreAPI: AnalDrvBaseAPI {
     /// Generate the **skeleton** contribution of Hessian for current SCF component.
     ///
     /// # Parameters
@@ -78,7 +78,7 @@ pub trait RHessCoreAPI: HessUtilAPI {
 /// In SCF iteration, introducing two-order (or higher-order) contribution requires the program to
 /// make some modification to Fock matrix construction. This kind of terms is substentially
 /// different from zero/one-order core components, and should be handled separately.
-pub trait RHessElecInteractAPI: HessUtilAPI {
+pub trait RHessElecInteractAPI: AnalDrvBaseAPI {
     /// Generate the **skeleton** contribution of Hessian for current SCF component.
     ///
     /// # Parameters

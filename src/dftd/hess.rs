@@ -1,5 +1,5 @@
 use crate::analdrv::hessian::trait_rhess::HessNucAPI;
-use crate::analdrv::hessian::trait_util::HessUtilAPI;
+use crate::analdrv::trait_util::AnalDrvBaseAPI;
 use crate::dftd::energy::DispSpec;
 use crate::molecule_io::Molecule;
 use crate::utilities::rstsr_util::Tsr;
@@ -38,7 +38,7 @@ impl HessDFTD {
     }
 }
 
-impl HessUtilAPI for HessDFTD {}
+impl AnalDrvBaseAPI for HessDFTD {}
 
 impl HessNucAPI for HessDFTD {
     fn make_skeleton_hess(&mut self, atm_list: Option<&[usize]>) -> Tsr {

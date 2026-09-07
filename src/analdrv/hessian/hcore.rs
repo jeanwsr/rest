@@ -185,7 +185,7 @@ impl RHessHcore {
     }
 }
 
-impl HessUtilAPI for RHessHcore {}
+impl AnalDrvBaseAPI for RHessHcore {}
 
 impl RHessCoreAPI for RHessHcore {
     fn make_skeleton_hess(&mut self, mo_coeff: TsrView, mo_occ: TsrView, atm_list: Option<&[usize]>) -> Tsr {
@@ -210,7 +210,7 @@ impl UHessHcore {
     }
 }
 
-impl HessUtilAPI for UHessHcore {}
+impl AnalDrvBaseAPI for UHessHcore {}
 
 impl UHessCoreAPI for UHessHcore {
     fn make_skeleton_hess(
