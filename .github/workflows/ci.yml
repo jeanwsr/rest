@@ -116,7 +116,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$REST_HOME"
-          cargo build -p rest
+          cargo build -p rest --release
           # Link integrity check: no unresolved shared libraries allowed
           if ldd target/debug/rest | grep -q "not found"; then
             echo "::error::unresolved shared libraries:"
@@ -129,4 +129,4 @@ jobs:
         run: |
           set -euo pipefail
           cd "$REST_HOME/rest_regression"
-          cargo run --quiet -- -c debug -f NH3_X3LYP
+          cargo run -- -f scf
