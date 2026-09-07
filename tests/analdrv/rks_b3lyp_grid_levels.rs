@@ -1,9 +1,9 @@
-//! RKS (B3LYP, GGA) Hessian with explicit `grid_level_cphf` / `grid_level_skeleton`.
+//! RKS (B3LYP, GGA) Hessian with explicit `grid_level_cpscf` / `grid_level_skeleton`.
 //!
-//! Exercises the dedicated CP-KS grid path (`ni_cpks = Some`) and the skeleton-grid
+//! Exercises the dedicated CP-SCF grid path (`ni_cpks = Some`) and the skeleton-grid
 //! regeneration path for a GGA functional.
 
-use pyrest::analdrv::config::{AnalDrvCphfCfg, AnalDrvConfig, AnalDrvNucgradCfg};
+use pyrest::analdrv::config::{AnalDrvCpscfCfg, AnalDrvConfig, AnalDrvNucgradCfg};
 use pyrest::analdrv::rscf_interface::rscf_hess_interface;
 
 use pyrest::ctrl_io;
@@ -60,7 +60,7 @@ fn test_nh3_explicit_grid_levels() {
     // from each other and from the SCF grid so the regeneration + ni_cpks paths are exercised.
     let config = AnalDrvConfig {
         nucgrad: AnalDrvNucgradCfg { grid_level_skeleton: Some(4), ..Default::default() },
-        cphf: AnalDrvCphfCfg { grid_level: Some(2), ..Default::default() },
+        cpscf: AnalDrvCpscfCfg { grid_level: Some(2), ..Default::default() },
         ..Default::default()
     };
     let de = run_with_config(config);
@@ -73,8 +73,8 @@ fn test_nh3_explicit_grid_levels() {
 
 #[test]
 fn test_nh3_default_grid_levels() {
-    // Default config: skeleton = grid_gen_level (3), cphf = grid_gen_level.max(3) - 2 = 1.
-    // This activates the ni_cpks path with a coarse cphf grid.
+    // Default config: skeleton = grid_gen_level (3), cpscf = grid_gen_level.max(3) - 2 = 1.
+    // This activates the ni_cpks path with a coarse cpscf grid.
     let config = AnalDrvConfig::default();
     let de = run_with_config(config);
 
@@ -85,18 +85,18 @@ fn test_nh3_default_grid_levels() {
 }
 
 #[test]
-fn test_nh3_cphf_equals_skeleton() {
-    // cphf level == skeleton level (both 3) -> ni_cpks = None fast path (reuse skeleton vxc/fxc).
+fn test_nh3_cpscf_equals_skeleton() {
+    // cpscf level == skeleton level (both 3) -> ni_cpks = None fast path (reuse skeleton vxc/fxc).
     let config = AnalDrvConfig {
         nucgrad: AnalDrvNucgradCfg { grid_level_skeleton: Some(3), ..Default::default() },
-        cphf: AnalDrvCphfCfg { grid_level: Some(3), ..Default::default() },
+        cpscf: AnalDrvCpscfCfg { grid_level: Some(3), ..Default::default() },
         ..Default::default()
     };
     let de = run_with_config(config);
 
     let natm = 4;
     let de = rt::asarray((&de, [3, 3, natm, natm]));
-    println!("Hessian (cphf == skeleton):\n{:12.6}", de.t());
+    println!("Hessian (cpscf == skeleton):\n{:12.6}", de.t());
     assert_eq!(de.shape().to_vec(), vec![3, 3, natm, natm]);
 }
 

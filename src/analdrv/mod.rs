@@ -28,7 +28,7 @@
 //!     to determine number of degrees of freedom (TR mode).
 //! - `point_group_detect`: Point group detection from Psi4, translated by AI, not reviewed by human but have been tested.
 //!   - Note some point group detection is minorly different (such as C3v).
-//! - `krylov_block.rs`: Krylov solver (used in CP-HF) from PySCF, translated with help by AI, reviewed
+//! - `krylov_block.rs`: Krylov solver (used in CP-SCF) from PySCF, translated with help by AI, reviewed
 //!   by extensive testing.
 
 #![warn(unused)]

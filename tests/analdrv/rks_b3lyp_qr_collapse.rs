@@ -21,6 +21,7 @@ static INPUT_H2O: &str = r##"
     max_scf_cycle =        100
 
 [analdrv]
+    # legacy cphf_* key names, to verify they keep working as aliases of cpscf_*
     cphf_tol = 1e-9
     cphf_tol_inflation = 1e3
     #cphf_lindep = 1e-15

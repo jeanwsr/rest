@@ -87,7 +87,7 @@ pub fn generator_ovlp_deriv1(mol: &CInt, device: &DeviceBLAS) -> impl FnMut(usiz
 /// Note that overlap is special to the SCF part, in that
 /// - The contribution of hessian from overlap is not skeleton, so we do not derive this class from
 ///   [`RHessCoreAPI`].
-/// - The CP-HF requires both first order derivative of hcore and ovlp, but their roles are
+/// - The CP-SCF requires both first order derivative of hcore and ovlp, but their roles are
 ///   different.
 ///
 /// Due to these reasons, although it has the similar interface to [`RHessCoreAPI`],

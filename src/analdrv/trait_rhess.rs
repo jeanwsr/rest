@@ -26,7 +26,7 @@ pub trait HessNucAPI: HessUtilAPI {
 ///   frameworks.
 ///
 /// We have function `make_skeleton_hess` here to count the **skeleton** contribution of the
-/// Hessian. We do not handle derivative of density matrix here, which is the responsibility of CPHF
+/// Hessian. We do not handle derivative of density matrix here, which is the responsibility of CP-SCF
 /// solver.
 pub trait RHessCoreAPI: HessUtilAPI {
     /// Generate the **skeleton** contribution of Hessian for current SCF component.
@@ -147,7 +147,7 @@ pub trait RHessElecInteractAPI: HessUtilAPI {
     /// Prepare the data for response calculation.
     ///
     /// Response (related to second order of density matrix derivative to energy) will be called
-    /// multiple-times in CP-HF solver and other places.
+    /// multiple-times in CP-SCF solver and other places.
     ///
     /// Some methods (especially DFT) may be helpful to prepare some data for response calculation,
     /// and store them in the object.
@@ -163,7 +163,7 @@ pub trait RHessElecInteractAPI: HessUtilAPI {
 
     /// Get the response contribution for current SCF component.
     ///
-    /// This function will be called multiple-times in CP-HF solver and other places.
+    /// This function will be called multiple-times in CP-SCF solver and other places.
     /// Call [`make_response_preparation`] before this function to make sure the data is ready.
     ///
     /// Also, this function will not pass in the MO coefficients and occupation numbers.
@@ -173,7 +173,7 @@ pub trait RHessElecInteractAPI: HessUtilAPI {
     /// # Parameters
     ///
     /// - `bra` : shape `[nao, nocc, ...]`. The bra part for response calculation. This is usually
-    ///   the derivative of MO coefficients (like $U_{\mu i}^\mathbb{A}$ given by CP-HF).
+    ///   the derivative of MO coefficients (like $U_{\mu i}^\mathbb{A}$ given by CP-SCF).
     ///
     /// # Returns
     ///

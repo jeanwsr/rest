@@ -120,10 +120,10 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
         };
         let verbose = scf_data.mol.ctrl.print_level > 2;
 
-        // Determine skeleton / cphf grid levels.
+        // Determine skeleton / cpscf grid levels.
         // - skeleton: the SCF DFT grid; only MGGA (TAU) without the grid-shift adds 2 levels
         //   (the grid-shift terms restore the grid-related accuracy the finer grid compensated).
-        // - cphf:     grid_gen_level.max(3) - 2 (coarser, for the iterative CP-KS response).
+        // - cpscf:     grid_gen_level.max(3) - 2 (coarser, for the iterative CP-SCF response).
         let xc_type = determine_den_type_from_list(&xc_func_list.iter().map(|(_, f)| f).collect_vec());
         let is_mgga = matches!(xc_type, XCDenType::TAU);
         let grid_gen_level = scf_data.mol.ctrl.grid_gen_level;
@@ -133,7 +133,7 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
         } else {
             grid_gen_level
         });
-        let cphf_level = config.cphf.grid_level.unwrap_or(grid_gen_level.max(3) - 2);
+        let cpscf_level = config.cpscf.grid_level.unwrap_or(grid_gen_level.max(3) - 2);
 
         // skeleton grid: reuse the SCF grid when the level matches, else regenerate.  Either
         // way, regroup to atom-grouped order (non-decreasing atm_idx): the SCF grid is
@@ -159,18 +159,18 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
             NIMatmul::new(&mol, &coordinates, &weights, &atm_idx, &quadrature_weights)
         };
 
-        // cphf grid: when it coincides with the skeleton grid, leave `ni_cpks = None` so the
+        // cpscf grid: when it coincides with the skeleton grid, leave `ni_cpks = None` so the
         // skeleton's vxc/fxc are reused; otherwise build a dedicated (coarser) grid.
-        let hess_nimatmul_obj = if cphf_level == sk_level {
+        let hess_nimatmul_obj = if cpscf_level == sk_level {
             RHessKSNIMatmul::new(&mol, xc_func_list, ni, grid_shift, verbose)
         } else {
-            let cphf_grid = Grids::build_with_level(mol_obj, cphf_level);
+            let cpscf_grid = Grids::build_with_level(mol_obj, cpscf_level);
             let ni_cpks = NIMatmul::new(
                 &mol,
-                &cphf_grid.coordinates,
-                &cphf_grid.weights,
-                &cphf_grid.atm_idx,
-                &cphf_grid.quadrature_weights,
+                &cpscf_grid.coordinates,
+                &cpscf_grid.weights,
+                &cpscf_grid.atm_idx,
+                &cpscf_grid.quadrature_weights,
             );
             RHessKSNIMatmul::new(&mol, xc_func_list, ni, grid_shift, verbose).set_ni_cpks(ni_cpks)
         };

@@ -60,26 +60,26 @@ impl<'a> UHessSCF<'a> {
         }
     }
 
-    /// Compute the dimensionless CPHF right-hand side, along with necessary intermediates for later
+    /// Compute the dimensionless CP-SCF right-hand side, along with necessary intermediates for later
     /// steps.
     ///
     /// # Returns
     ///     
     /// A dictionary containing:
-    /// - `rhs : shape `[nmo, nocc_α, 3, natm]` and `[nmo, nocc_β, 3, natm]`. The dimensionless CPHF
+    /// - `rhs : shape `[nmo, nocc_α, 3, natm]` and `[nmo, nocc_β, 3, natm]`. The dimensionless CP-SCF
     ///   right-hand side.
     /// - `f1mo` : shape `[nmo, nocc_α, 3, natm]` and `[nmo, nocc_β, 3, natm]`. The first-order
     ///   derivative of the Fock matrix in MO basis.
     /// - `s1mo` : shape `[nmo, nocc_α, 3, natm]` and `[nmo, nocc_β, 3, natm]`. The first-order
     ///   derivative of the overlap matrix in MO basis.
-    pub fn compute_dimless_cphf_rhs(&mut self) -> HashMap<&'static str, Tsr> {
+    pub fn compute_dimless_cpscf_rhs(&mut self) -> HashMap<&'static str, Tsr> {
         // setups
         let t0 = std::time::Instant::now();
         let [α, β] = [0, 1];
         let mo_coeff = [self.mo_coeff[α].view(), self.mo_coeff[β].view()];
         let mo_occ = [self.mo_occ[α].view(), self.mo_occ[β].view()];
         let mo_energy = [self.mo_energy[α].view(), self.mo_energy[β].view()];
-        let level_shift = self.config.cphf.level_shift;
+        let level_shift = self.config.cpscf.level_shift;
         let device = mo_coeff[α].device().clone();
 
         let nao = mo_coeff[α].shape()[0];
@@ -108,7 +108,7 @@ impl<'a> UHessSCF<'a> {
                 *&mut f1ao_core.i_mut((Ellipsis, A_loc)) += gen_core_deriv1(A_glob);
             }
             self.timing.push((
-                format!("in compute_dimless_cphf_rhs, f1ao_core_{}", core_obj.get_type_name()),
+                format!("in compute_dimless_cpscf_rhs, f1ao_core_{}", core_obj.get_type_name()),
                 t1.elapsed().as_secs_f64(),
             ));
         }
@@ -122,7 +122,7 @@ impl<'a> UHessSCF<'a> {
             f1bra_el[α] += &bra[α];
             f1bra_el[β] += &bra[β];
             self.timing.push((
-                format!("in compute_dimless_cphf_rhs, f1bra_el_{}", el_obj.get_type_name()),
+                format!("in compute_dimless_cpscf_rhs, f1bra_el_{}", el_obj.get_type_name()),
                 t1.elapsed().as_secs_f64(),
             ));
         }
@@ -143,7 +143,7 @@ impl<'a> UHessSCF<'a> {
         let s1mo_α = mo_coeff[α].t() % (&s1ao % &mocc[α]);
         let s1mo_β = mo_coeff[β].t() % (&s1ao % &mocc[β]);
 
-        self.timing.push(("in compute_dimless_cphf_rhs, s1mo".to_string(), t1.elapsed().as_secs_f64()));
+        self.timing.push(("in compute_dimless_cpscf_rhs, s1mo".to_string(), t1.elapsed().as_secs_f64()));
 
         // --- dimensionless rhs --- //
 
@@ -158,7 +158,7 @@ impl<'a> UHessSCF<'a> {
         *&mut rhs_α.i_mut(so[α]) += -0.5 * s1mo_α.i(so[α]);
         *&mut rhs_β.i_mut(so[β]) += -0.5 * s1mo_β.i(so[β]);
 
-        self.timing.push(("compute_dimless_cphf_rhs".to_string(), t0.elapsed().as_secs_f64()));
+        self.timing.push(("compute_dimless_cpscf_rhs".to_string(), t0.elapsed().as_secs_f64()));
         HashMap::from([
             ("f1mo_0", f1mo_α),
             ("f1mo_1", f1mo_β),
@@ -169,7 +169,7 @@ impl<'a> UHessSCF<'a> {
         ])
     }
 
-    /// Prepare the response for CPHF calculation.
+    /// Prepare the response for CP-SCF calculation.
     ///
     /// This involves all electron-interaction objects.
     pub fn make_response_preparation(&mut self) {
@@ -188,7 +188,7 @@ impl<'a> UHessSCF<'a> {
     }
 
     /// Compute the response of the system to a given perturbation in MO space (mo1), which is
-    /// needed for CPHF.
+    /// needed for CP-SCF.
     ///
     /// # Parameters
     ///
@@ -214,7 +214,7 @@ impl<'a> UHessSCF<'a> {
         [resp_α, resp_β]
     }
 
-    /// Compute the dimensionless response for CP-HF calculation.
+    /// Compute the dimensionless response for CP-SCF calculation.
     ///
     /// # Parameters
     ///
@@ -224,7 +224,7 @@ impl<'a> UHessSCF<'a> {
     ///
     /// - `resp` : shape `[nmo, nocc_α, ...]` and `[nmo, nocc_β, ...]`. The dimensionless response
     ///   in MO space.
-    pub fn response_dimless_cphf(&mut self, mo1: &[TsrView; 2]) -> [Tsr; 2] {
+    pub fn response_dimless_cpscf(&mut self, mo1: &[TsrView; 2]) -> [Tsr; 2] {
         let t0 = std::time::Instant::now();
         let [α, β] = [0, 1];
         let mo_occ = [self.mo_occ[α].view(), self.mo_occ[β].view()];
@@ -241,7 +241,7 @@ impl<'a> UHessSCF<'a> {
             self.mo_energy[β].view().bool_select(-1, &viridx[β]),
         ];
         let e_ai = [evir[α].i((.., None)) - eocc[α].i((None, ..)), evir[β].i((.., None)) - eocc[β].i((None, ..))];
-        let level_shift = self.config.cphf.level_shift;
+        let level_shift = self.config.cpscf.level_shift;
         let e_ai_shift = [&e_ai[0] + level_shift, &e_ai[1] + level_shift];
         let so = [rt::slice!(0, nocc[α]), rt::slice!(0, nocc[β])];
         let sv = [rt::slice!(nocc[α], nmo[α]), rt::slice!(nocc[β], nmo[β])];
@@ -257,11 +257,11 @@ impl<'a> UHessSCF<'a> {
         *&mut resp[β].i_mut(sv[β]) /= &e_ai_shift[β];
         resp[α].i_mut(so[α]).fill(0.0);
         resp[β].i_mut(so[β]).fill(0.0);
-        self.timing.push(("response_dimless_cphf".to_string(), t0.elapsed().as_secs_f64()));
+        self.timing.push(("response_dimless_cpscf".to_string(), t0.elapsed().as_secs_f64()));
         resp
     }
 
-    /// Solve the dimensionless CP-HF equation using a Krylov solver.
+    /// Solve the dimensionless CP-SCF equation using a Krylov solver.
     ///
     /// # Parameters
     ///
@@ -271,8 +271,8 @@ impl<'a> UHessSCF<'a> {
     /// # Returns
     ///
     /// - `mo1` : shape `[nmo, nocc_α, ...]` and `[nmo, nocc_β, ...]`. Perturbation in MO space that
-    ///   solves the dimensionless CP-HF equation.
-    pub fn solve_dimless_cphf(&mut self, rhs: &[TsrView; 2]) -> [Tsr; 2] {
+    ///   solves the dimensionless CP-SCF equation.
+    pub fn solve_dimless_cpscf(&mut self, rhs: &[TsrView; 2]) -> [Tsr; 2] {
         let t0 = std::time::Instant::now();
         let [α, β] = [0, 1];
         let rhs_shape = [rhs[α].shape().to_vec(), rhs[β].shape().to_vec()];
@@ -281,11 +281,11 @@ impl<'a> UHessSCF<'a> {
         let rhs = [rhs[α].reshape((nmo[α], nocc[α], -1)), rhs[β].reshape((nmo[β], nocc[β], -1))];
         let device = rhs[α].device().clone();
 
-        let tol = self.config.cphf.tol;
-        let max_cycle = self.config.cphf.max_cycle;
-        let max_space = self.config.cphf.max_space;
-        let lindep = self.config.cphf.lindep;
-        let tol_inflation = self.config.cphf.tol_inflation;
+        let tol = self.config.cpscf.tol;
+        let max_cycle = self.config.cpscf.max_cycle;
+        let max_space = self.config.cpscf.max_space;
+        let lindep = self.config.cpscf.lindep;
+        let tol_inflation = self.config.cpscf.tol_inflation;
 
         let pack_flattened = |x: &[TsrView; 2]| -> Tsr {
             // original: [nmo_α, nocc_α, nprop] and [nmo_β, nocc_β, nprop]
@@ -316,11 +316,11 @@ impl<'a> UHessSCF<'a> {
             [x_α, x_β]
         };
 
-        let response_cphf_flattened = |x: TsrView| -> Tsr {
+        let response_cpscf_flattened = |x: TsrView| -> Tsr {
             // split x by spin and reshape to original shape
             let [x_α, x_β] = unpack_flattened(x);
             // compute response by usual means
-            let resp = self.response_dimless_cphf(&[x_α.view(), x_β.view()]);
+            let resp = self.response_dimless_cpscf(&[x_α.view(), x_β.view()]);
             // flatten resp to shape (nmo*nocc, nprop)
             let resp_view = resp.iter().map(|r| r.view()).collect_array().unwrap();
             pack_flattened(&resp_view)
@@ -329,26 +329,26 @@ impl<'a> UHessSCF<'a> {
         let rhs_view = rhs.iter().map(|r| r.view()).collect_array().unwrap();
         let rhs_packed = pack_flattened(&rhs_view);
         let mo1_flattened =
-            krylov_block(response_cphf_flattened, rhs_packed.view(), None, tol, max_cycle, max_space, lindep, tol_inflation);
+            krylov_block(response_cpscf_flattened, rhs_packed.view(), None, tol, max_cycle, max_space, lindep, tol_inflation);
         let [mo1_α, mo1_β] = unpack_flattened(mo1_flattened.view());
         let mo1_α = mo1_α.into_shape(rhs_shape[α].to_vec());
         let mo1_β = mo1_β.into_shape(rhs_shape[β].to_vec());
 
-        self.timing.push(("solve_dimless_cphf".to_string(), t0.elapsed().as_secs_f64()));
+        self.timing.push(("solve_dimless_cpscf".to_string(), t0.elapsed().as_secs_f64()));
         [mo1_α, mo1_β]
     }
 
-    /// Finalize the CP-HF calculation by computing necessary intermediates for Hessian assembly.
+    /// Finalize the CP-SCF calculation by computing necessary intermediates for Hessian assembly.
     ///
     ///
     /// # Parameters
     ///
     /// - `f1mo` : shape `[nmo_α, nocc_α, 3, natm]` and `[nmo_β, nocc_β, 3, natm]`. The first-order
     ///   derivative of the Fock matrix in MO basis, obtained from
-    ///   [`Self::compute_dimless_cphf_rhs`].
+    ///   [`Self::compute_dimless_cpscf_rhs`].
     /// - `s1mo` : shape `[nmo_α, nocc_α, 3, natm]` and `[nmo_β, nocc_β, 3, natm]`. The first-order
     ///   derivative of the overlap matrix in MO basis, obtained from
-    ///   [`Self::compute_dimless_cphf_rhs`].
+    ///   [`Self::compute_dimless_cpscf_rhs`].
     /// - `mo1` : shape `[nmo_α, nocc_α, 3, natm]` and `[nmo_β, nocc_β, 3, natm]`. The perturbation
     ///   in MO space obtained from Krylov solver.
     ///
@@ -360,7 +360,7 @@ impl<'a> UHessSCF<'a> {
     ///   finalized perturbation in MO space.
     /// - `mo_e1_0`, `mo_e1_1` : shape `[nocc_α, nocc_α, 3, natm]` and `[nocc_β, nocc_β, 3, natm]`.
     ///   The derivative of occupied orbital energies (Fock matrix) with respect to perturbation.
-    pub fn finalize_cphf(
+    pub fn finalize_cpscf(
         &mut self,
         f1mo: &[TsrView; 2],
         s1mo: &[TsrView; 2],
@@ -399,11 +399,11 @@ impl<'a> UHessSCF<'a> {
         let mo_e1_α = b1mo_α.i(so[α]) + &mo1_α.i(so[α]) * &e_ij[α];
         let mo_e1_β = b1mo_β.i(so[β]) + &mo1_β.i(so[β]) * &e_ij[β];
 
-        self.timing.push(("finalize_cphf".to_string(), t0.elapsed().as_secs_f64()));
+        self.timing.push(("finalize_cpscf".to_string(), t0.elapsed().as_secs_f64()));
         HashMap::from([("mo1_0", mo1_α), ("mo1_1", mo1_β), ("mo_e1_0", mo_e1_α), ("mo_e1_1", mo_e1_β)])
     }
 
-    pub fn get_cphf_hess(
+    pub fn get_cpscf_hess(
         &self,
         f1mo: &[TsrView; 2],
         s1mo: &[TsrView; 2],
@@ -423,10 +423,10 @@ impl<'a> UHessSCF<'a> {
         let s1oo = [s1mo[α].i(so[α]), s1mo[β].i(so[β])];
         let device = f1mo[α].device().clone();
 
-        let mut de_cphf = rt::zeros(([3, 3, natm, natm], &device));
+        let mut de_cpscf = rt::zeros(([3, 3, natm, natm], &device));
         for A in 0..natm {
             for B in 0..=A {
-                let mut de_BA = de_cphf.i_mut((.., .., B, A));
+                let mut de_BA = de_cpscf.i_mut((.., .., B, A));
                 for σ in [α, β] {
                     de_BA += 2 * (f1mo[σ].i((.., .., None, .., A)) * mo1[σ].i((.., .., .., None, B))).sum_axes([0, 1]);
                     de_BA -= 2
@@ -436,27 +436,27 @@ impl<'a> UHessSCF<'a> {
                 }
             }
             for B in 0..A {
-                let de_to_copy = de_cphf.i((.., .., B, A)).t().to_owned();
-                *&mut de_cphf.i_mut((.., .., A, B)) += de_to_copy;
+                let de_to_copy = de_cpscf.i((.., .., B, A)).t().to_owned();
+                *&mut de_cpscf.i_mut((.., .., A, B)) += de_to_copy;
             }
         }
-        de_cphf
+        de_cpscf
     }
 
-    pub fn make_cphf_hess(&mut self) -> Tsr {
-        let pre_cphf_dict = self.compute_dimless_cphf_rhs();
-        let f1mo = [pre_cphf_dict.get("f1mo_0").unwrap().view(), pre_cphf_dict.get("f1mo_1").unwrap().view()];
-        let s1mo = [pre_cphf_dict.get("s1mo_0").unwrap().view(), pre_cphf_dict.get("s1mo_1").unwrap().view()];
-        let rhs = [pre_cphf_dict.get("rhs_0").unwrap().view(), pre_cphf_dict.get("rhs_1").unwrap().view()];
+    pub fn make_cpscf_hess(&mut self) -> Tsr {
+        let pre_cpscf_dict = self.compute_dimless_cpscf_rhs();
+        let f1mo = [pre_cpscf_dict.get("f1mo_0").unwrap().view(), pre_cpscf_dict.get("f1mo_1").unwrap().view()];
+        let s1mo = [pre_cpscf_dict.get("s1mo_0").unwrap().view(), pre_cpscf_dict.get("s1mo_1").unwrap().view()];
+        let rhs = [pre_cpscf_dict.get("rhs_0").unwrap().view(), pre_cpscf_dict.get("rhs_1").unwrap().view()];
 
         self.make_response_preparation();
-        let mo1 = self.solve_dimless_cphf(&rhs);
+        let mo1 = self.solve_dimless_cpscf(&rhs);
         let mo1_view = [mo1[0].view(), mo1[1].view()];
-        let finalize_dict = self.finalize_cphf(&f1mo, &s1mo, &mo1_view);
+        let finalize_dict = self.finalize_cpscf(&f1mo, &s1mo, &mo1_view);
         let mo1 = [finalize_dict.get("mo1_0").unwrap().view(), finalize_dict.get("mo1_1").unwrap().view()];
         let mo_e1 = [finalize_dict.get("mo_e1_0").unwrap().view(), finalize_dict.get("mo_e1_1").unwrap().view()];
 
-        self.get_cphf_hess(&f1mo, &s1mo, &mo1, &mo_e1)
+        self.get_cpscf_hess(&f1mo, &s1mo, &mo1, &mo_e1)
     }
 
     /// Compute the total skeleton contribution to the Hessian.
@@ -504,7 +504,7 @@ impl<'a> UHessSCF<'a> {
         de_skeleton
     }
 
-    /// Compute the total Hessian by summing over skeleton, overlap, and CP-HF contributions.
+    /// Compute the total Hessian by summing over skeleton, overlap, and CP-SCF contributions.
     ///
     /// # Returns
     ///
@@ -526,11 +526,11 @@ impl<'a> UHessSCF<'a> {
         self.timing.push(("de_ovlp".to_string(), t1.elapsed().as_secs_f64()));
 
         let t1 = std::time::Instant::now();
-        let de_cphf = self.make_cphf_hess();
-        self.result.insert("de_cphf".to_string(), de_cphf.to_owned());
-        self.timing.push(("de_cphf".to_string(), t1.elapsed().as_secs_f64()));
+        let de_cpscf = self.make_cpscf_hess();
+        self.result.insert("de_cpscf".to_string(), de_cpscf.to_owned());
+        self.timing.push(("de_cpscf".to_string(), t1.elapsed().as_secs_f64()));
 
-        let de_tot = de_skeleton + de_ovlp + de_cphf;
+        let de_tot = de_skeleton + de_ovlp + de_cpscf;
         self.result.insert("de_tot".to_string(), de_tot.to_owned());
         self.timing.push(("de_tot".to_string(), t0.elapsed().as_secs_f64()));
         de_tot

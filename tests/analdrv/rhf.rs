@@ -27,8 +27,8 @@ static INPUT_NH3: &str = r##"
 
 [analdrv]
 gau_thermo = true
-cphf_tol = 1e-9
-cphf_tol_inflation = 1000
+cpscf_tol = 1e-9
+cpscf_tol_inflation = 1000
 
 [geom]
     name = "NH3"
