@@ -4903,6 +4903,7 @@ pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option
 
     #[cfg(feature = "mpi")]
     if let Some(mpi_io) = mpi_operator {
+        use mpi::traits::*;
         let spin_channel = scf_data.mol.spin_channel;
         let mut num_state = scf_data.mol.num_state;
         let mut eigenvectors = [MatrixFull::empty(),MatrixFull::empty()];
@@ -4914,64 +4915,62 @@ pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option
         match scf_data.scftype {
             SCFType::RHF | SCFType::UHF => {
                 for i_spin in (0..spin_channel) {
-                    let mut solved = false;
                     // ---- 首选：pdsyevd 反变换求解器 ----
-                    // 该求解器通过 S^{-1/2} A S^{-1/2} 变换后用 pdsyevd（分治法）求
-                    // 解标准本征问题，数值质量（残差 ~1e-14~1e-15）远优于 pdsygvx
-                    // （~5e-10，小/病态体系偶发静默漂移 ≥1e-8），故作为首选。
-                    // 仅在返回 None 或残差超标时回退串行。
+                    // 通过 S^{-1/2} A S^{-1/2} 变换后用 pdsyevd（分治法）求标准本征
+                    // 问题，数值质量（残差 ~1e-14~1e-15）远优于 pdsygvx（~5e-10）。
+                    // ScaLAPACK 的 info 失败时只在属主进程非零，故"求解器失败"判定
+                    // 必须做**全局逻辑 AND**——否则部分 rank 回退、其余继续 → 下一次
+                    // 集体操作死锁（opt 任务多次 force 求值下间歇挂起的根因）。
                     let mut num_state_inv = scf_data.mol.num_state;
-                    match _hamiltonian_distributed_solver_inv(&scf_data.hamiltonian[i_spin], &scf_data.ovlp, &mut num_state_inv, grid, world) {
-                        Some((eigenvector_spin, eigenvalue_spin)) => {
-                            let n_dim = eigenvector_spin.size()[0];
-                            let res_inv = if n_dim <= 4096 { generalized_residual_upper(
-                                    &scf_data.hamiltonian[i_spin], &scf_data.ovlp,
-                                    &eigenvector_spin, &eigenvalue_spin) } else { 0.0 };
-                            if n_dim <= 4096 && res_inv > 1.0e-10 {
-                                println!("WARNING: pdsyevd inverse solver quality gate failed (spin {}, residual {:.3e}); falling back to serial.", i_spin, res_inv);
-                            } else {
-                                eigenvectors[i_spin] = eigenvector_spin;
-                                eigenvalues[i_spin] = eigenvalue_spin;
-                                solved = true;
-                            }
-                        }
-                        None => {
-                            println!("WARNING: pdsyevd inverse solver returned None (spin {}); falling back to serial.", i_spin);
-                        }
-                    }
-                    // ---- 兜底：串行 LAPACK ----
-                    if !solved {
+                    let solver_result = _hamiltonian_distributed_solver_inv(
+                        &scf_data.hamiltonian[i_spin], &scf_data.ovlp, &mut num_state_inv, grid, world);
+                    let ok_local = solver_result.is_some();
+                    let mut ok_global = false;
+                    world.any_process().all_reduce_into(&ok_local, &mut ok_global, &SystemOperation::logical_and());
+                    if !ok_global {
+                        println!("WARNING: pdsyevd inverse solver failed on some rank (spin {}); all ranks fall back to serial.", i_spin);
                         (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
                         return (eigenvectors, eigenvalues, num_state);
                     }
+                    let (eigenvector_spin, eigenvalue_spin) = solver_result.unwrap();
+                    let n_dim = eigenvector_spin.size()[0];
+                    let res_inv = if n_dim <= 4096 { generalized_residual_upper(
+                            &scf_data.hamiltonian[i_spin], &scf_data.ovlp,
+                            &eigenvector_spin, &eigenvalue_spin) } else { 0.0 };
+                    if n_dim <= 4096 && res_inv > 1.0e-10 {
+                        println!("WARNING: pdsyevd inverse solver quality gate failed (spin {}, residual {:.3e}); falling back to serial.", i_spin, res_inv);
+                        (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
+                        return (eigenvectors, eigenvalues, num_state);
+                    }
+                    eigenvectors[i_spin] = eigenvector_spin;
+                    eigenvalues[i_spin] = eigenvalue_spin;
                 }
             },
             SCFType::ROHF => {
-                let mut solved = false;
-                // ---- 首选：pdsyevd 反变换（同 RHF/UHF）----
+                // ---- 首选：pdsyevd 反变换（同 RHF/UHF；失败判定全局 AND 防分歧死锁）----
                 let mut num_state_inv = scf_data.mol.num_state;
-                match _hamiltonian_distributed_solver_inv(scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp, &mut num_state_inv, grid, world) {
-                    Some((eigenvector, eigenvalue)) => {
-                        let n_dim = eigenvector.size()[0];
-                        let res_inv = if n_dim <= 4096 { generalized_residual_upper(
-                                scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp,
-                                &eigenvector, &eigenvalue) } else { 0.0 };
-                        if n_dim <= 4096 && res_inv > 1.0e-10 {
-                            println!("WARNING: pdsyevd inverse solver quality gate failed (ROHF, residual {:.3e}); falling back to serial.", res_inv);
-                        } else {
-                            eigenvectors[0] = eigenvector;
-                            eigenvalues[0] = eigenvalue;
-                            solved = true;
-                        }
-                    }
-                    None => {
-                        println!("WARNING: pdsyevd inverse solver returned None (ROHF); falling back to serial.");
-                    }
-                }
-                if !solved {
+                let solver_result = _hamiltonian_distributed_solver_inv(
+                    scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp, &mut num_state_inv, grid, world);
+                let ok_local = solver_result.is_some();
+                let mut ok_global = false;
+                world.any_process().all_reduce_into(&ok_local, &mut ok_global, &SystemOperation::logical_and());
+                if !ok_global {
+                    println!("WARNING: pdsyevd inverse solver failed on some rank (ROHF); all ranks fall back to serial.");
                     (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
                     return (eigenvectors, eigenvalues, num_state);
                 }
+                let (eigenvector, eigenvalue) = solver_result.unwrap();
+                let n_dim = eigenvector.size()[0];
+                let res_inv = if n_dim <= 4096 { generalized_residual_upper(
+                        scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp,
+                        &eigenvector, &eigenvalue) } else { 0.0 };
+                if n_dim <= 4096 && res_inv > 1.0e-10 {
+                    println!("WARNING: pdsyevd inverse solver quality gate failed (ROHF, residual {:.3e}); falling back to serial.", res_inv);
+                    (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
+                    return (eigenvectors, eigenvalues, num_state);
+                }
+                eigenvectors[0] = eigenvector;
+                eigenvalues[0] = eigenvalue;
             }
         };
         (eigenvectors, eigenvalues, num_state)
