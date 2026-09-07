@@ -7,14 +7,15 @@
 //! This is a more modular and flexible design, and should be easier to maintain and extend.
 //! The API design document is not written at this time, but will be available in the future.
 //!
-//! Currently only hessian property is implemented. This module may be full refactored in future to
-//! support other types of derivatives and properties.
+//! This module will host drivers for all types of ground state analytical derivative properties.
+//! Currently only hessian property is implemented, grouped in the [`hessian`] submodule; other
+//! properties (such as gradient) may come in future, and this module may be further refactored then.
 //!
 //! This module should work in most cases, but still requires further testing and efficiency update.
 //!
-//! This module does not contain extensive detailed implementation. We defined traits,
-//! some common implementations (hcore, nuc, ovlp), total hessian, important utilities.
-//!
+//! This module does not contain extensive detailed implementation. Please refer to the [`hessian`]
+//! submodule for hessian traits, component implementations, total hessian drivers (including CP-SCF),
+//! and important utilities.
 //! - For optimized RI-JK implementation, please refer to [`crate::ri_jk`] module.
 //! - For DFT matmul implementation, please refer to [`crate::dft::numint_matmul`] module.
 //!
@@ -23,7 +24,7 @@
 //! This module currently does not handle post-SCF derivatives.
 //!
 //! Some important utilities comes from other programs, and we acknowledge them here.
-//! - `vib.rs`: Vibration analysis from Psi4, partially translated by AI, not fully reviewed by human.
+//! - `vibration/vib.rs`: Vibration analysis from Psi4, partially translated by AI, not fully reviewed by human.
 //!   - TR/V (translation-rotation and vibration classification) is different to Psi4. We will use rotor-type
 //!     to determine number of degrees of freedom (TR mode).
 //! - `point_group_detect`: Point group detection from Psi4, translated by AI, not reviewed by human but have been tested.
@@ -33,54 +34,39 @@
 
 #![warn(unused)]
 
-// trait definitions
-pub mod trait_rhess;
-pub mod trait_uhess;
-pub mod trait_util;
+// driver configuration and task
+pub mod config;
 
-// core hess implementations
-pub mod hcore;
-pub mod nuc_repl;
-
-// overlap hess implementations
-pub mod ovlp;
-
-// total hess implementations
-pub mod rscf;
-pub mod uscf;
-
-// total hess interface to REST
+// interface to REST other programs
 pub mod interface;
-pub mod rscf_interface;
-pub mod uscf_interface;
 
 // vibrational analysis
-pub mod vib;
-pub mod vib_interface;
+pub mod vibration;
 
 // utilities
-pub mod cint_handling;
-pub mod config;
 pub mod krylov_block;
 pub mod point_group_detect;
+
+// hessian property
+pub mod hessian;
 
 #[allow(unused_imports)]
 pub mod prelude {
     use super::*;
 
     pub use config::AnalDrvConfig;
-    pub use hcore::{RHessHcore, UHessHcore};
-    pub use nuc_repl::HessNucRepl;
-    pub use ovlp::{RHessOvlp, UHessOvlp};
-    pub use rscf::RHessSCF;
-    pub use trait_rhess::{HessNucAPI, RHessCoreAPI, RHessElecInteractAPI};
-    pub use trait_uhess::{UHessCoreAPI, UHessElecInteractAPI};
-    pub use trait_util::HessUtilAPI;
-    pub use uscf::UHessSCF;
+    pub use hessian::hcore::{RHessHcore, UHessHcore};
+    pub use hessian::nuc_repl::HessNucRepl;
+    pub use hessian::ovlp::{RHessOvlp, UHessOvlp};
+    pub use hessian::rscf::RHessSCF;
+    pub use hessian::trait_rhess::{HessNucAPI, RHessCoreAPI, RHessElecInteractAPI};
+    pub use hessian::trait_uhess::{UHessCoreAPI, UHessElecInteractAPI};
+    pub use hessian::trait_util::HessUtilAPI;
+    pub use hessian::uscf::UHessSCF;
 
     pub(super) use crate::ri_jk::util::{get_dm0_restricted, get_dme0_restricted};
     pub(super) use crate::utilities::rstsr_util::*;
-    pub(super) use cint_handling::*;
+    pub(super) use hessian::cint_handling::*;
     pub(super) use itertools::Itertools;
     pub(super) use krylov_block::krylov_block;
     pub(super) use rayon::prelude::*;

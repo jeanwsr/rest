@@ -1,4 +1,4 @@
-use super::prelude::*;
+use crate::analdrv::prelude::*;
 
 /// Abstract class for Hessian-related API for unrestricted SCF core components.
 ///

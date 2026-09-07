@@ -1,4 +1,4 @@
-use super::prelude::*;
+use crate::analdrv::prelude::*;
 
 /// Generator for second derivatives of the core Hamiltonian (skeleton derivative).
 ///

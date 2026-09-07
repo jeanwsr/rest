@@ -1147,7 +1147,7 @@ mod geometric_pyo3_impl {
                     crate::hessian::compute_hessian(&*scf_data)
                         .expect("Analytical Hessian computation failed for geometry optimization")
                 } else {
-                    use crate::analdrv::interface::hess_interface;
+                    use crate::analdrv::hessian::hess_interface;
                     use rstsr::prelude::*;
                     
                     let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();

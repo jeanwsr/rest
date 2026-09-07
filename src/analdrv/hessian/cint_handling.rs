@@ -1,4 +1,4 @@
-use super::prelude::*;
+use crate::analdrv::prelude::*;
 use rest_libcint::util::ShlsSlice;
 
 /// A wrapper around [`CInt::integrate`] that directly transform the output and shape to tensor.

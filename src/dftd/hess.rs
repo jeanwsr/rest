@@ -1,5 +1,5 @@
-use crate::analdrv::trait_rhess::HessNucAPI;
-use crate::analdrv::trait_util::HessUtilAPI;
+use crate::analdrv::hessian::trait_rhess::HessNucAPI;
+use crate::analdrv::hessian::trait_util::HessUtilAPI;
 use crate::dftd::energy::DispSpec;
 use crate::molecule_io::Molecule;
 use crate::utilities::rstsr_util::Tsr;

@@ -1,5 +1,5 @@
 use pyrest::analdrv::config::AnalDrvConfig;
-use pyrest::analdrv::uscf_interface::uscf_hess_interface;
+use pyrest::analdrv::hessian::uscf_interface::uscf_hess_interface;
 
 use pyrest::ctrl_io;
 use pyrest::molecule_io::Molecule;

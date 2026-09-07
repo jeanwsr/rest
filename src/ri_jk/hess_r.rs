@@ -17,7 +17,7 @@
 
 use super::prelude_dev::*;
 use crate::grad::rhf::pack_triu_tilde;
-use crate::analdrv::cint_handling::*;
+use crate::analdrv::hessian::cint_handling::*;
 use crate::analdrv::prelude::*;
 use crate::ri_jk::util::*;
 

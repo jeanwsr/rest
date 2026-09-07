@@ -8,7 +8,7 @@
 //!   restore exactly this invariance.
 
 use pyrest::analdrv::config::{AnalDrvConfig, AnalDrvNucgradCfg};
-use pyrest::analdrv::rscf_interface::rscf_hess_interface;
+use pyrest::analdrv::hessian::rscf_interface::rscf_hess_interface;
 use pyrest::ctrl_io;
 use pyrest::molecule_io::Molecule;
 use pyrest::scf_io::{self, scf_without_build};

@@ -1,4 +1,4 @@
-use pyrest::analdrv::uscf_interface::uscf_hess_interface;
+use pyrest::analdrv::hessian::uscf_interface::uscf_hess_interface;
 use pyrest::analdrv::config::AnalDrvConfig;
 
 use pyrest::ctrl_io;

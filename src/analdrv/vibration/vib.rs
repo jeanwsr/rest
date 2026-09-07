@@ -11,7 +11,7 @@
 //! Some modifications are from PySCF (pyscf/hessian/thermo.py).
 //! This file contains AI assisted code, and not fully reviewed by human.
 
-use super::prelude::*;
+use crate::analdrv::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Physical constants (CODATA2014, matching the Python implementation)

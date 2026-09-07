@@ -3,7 +3,7 @@
 //! invariance of the assembled Hessian (B3LYP/TPSSh) and of the per-spin skeleton terms.
 
 use pyrest::analdrv::config::{AnalDrvConfig, AnalDrvNucgradCfg};
-use pyrest::analdrv::uscf_interface::uscf_hess_interface;
+use pyrest::analdrv::hessian::uscf_interface::uscf_hess_interface;
 use pyrest::ctrl_io;
 use pyrest::molecule_io::Molecule;
 use pyrest::scf_io::{self, scf_without_build};

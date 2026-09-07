@@ -1,6 +1,6 @@
-use super::prelude::*;
+use crate::analdrv::prelude::*;
 use crate::geom_io::get_mass_charge;
-use crate::analdrv::vib::*;
+use crate::analdrv::vibration::vib::*;
 use crate::ri_jk::util::get_cint_mol;
 use crate::SCF;
 
@@ -60,7 +60,7 @@ pub fn vibration_analysis_interface(
         let e0 = scf_data.scf_energy;
         let multiplicity = scf_data.mol.ctrl.spin;
 
-        use super::point_group_detect::interface_to_rest::get_full_point_group_for_vib;
+        use crate::analdrv::point_group_detect::interface_to_rest::get_full_point_group_for_vib;
         let tol_pg = config.nucgrad.tol_point_group / (1.0 + natm as f64).sqrt();
         let (pg_name, pg_sigma) = get_full_point_group_for_vib(&elems, &mass, &geom, tol_pg);
 

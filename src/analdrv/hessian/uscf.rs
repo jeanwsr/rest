@@ -1,6 +1,6 @@
 //! Hessian implementations for unrestricted SCF.
 
-use super::prelude::*;
+use crate::analdrv::prelude::*;
 /// Working solver and maintainer of all hessian components for unrestricted SCF method.
 pub struct UHessSCF<'a> {
     pub mo_coeff: [Tsr; 2],

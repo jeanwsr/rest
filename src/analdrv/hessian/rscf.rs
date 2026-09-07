@@ -1,6 +1,6 @@
 //! Hessian implementations for restricted SCF.
 
-use super::prelude::*;
+use crate::analdrv::prelude::*;
 
 /// Working solver and maintainer of all hessian components for restricted SCF method.
 pub struct RHessSCF<'a> {

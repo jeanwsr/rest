@@ -1,4 +1,4 @@
-use super::prelude::*;
+use crate::analdrv::prelude::*;
 
 /// Abstract class for Hessian-related API for nuclear repulsion contribution.
 ///

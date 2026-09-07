@@ -1,7 +1,7 @@
 //! Block Krylov subspace solver for `(1 + A) x = b`.
 //!
 //! Thin wrapper around `crate::solvers::krylov::krylov_tsr`.  Preserves
-//! the original call signature for `analdrv/rscf.rs` and `analdrv/uscf.rs`.
+//! the original call signature for `analdrv/hessian/rscf.rs` and `analdrv/hessian/uscf.rs`.
 
 use super::prelude::*;
 use crate::solvers::krylov::{KrylovConfig, krylov_tsr};

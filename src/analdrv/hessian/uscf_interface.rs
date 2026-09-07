@@ -1,34 +1,43 @@
-use super::prelude::*;
-use crate::analdrv::vib::*;
-use crate::analdrv::vib_interface::*;
+use crate::analdrv::prelude::*;
+use crate::analdrv::vibration::vib::*;
+use crate::analdrv::vibration::vib_interface::*;
 use crate::dftd::hess::HessDFTD;
 use crate::ri_jk::util::{get_cint_aux, get_cint_mol};
 use crate::SCF;
 
-pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>, VibInfo, Option<GauThermoInfo>) {
+pub fn uscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>, VibInfo, Option<GauThermoInfo>) {
     let device = DeviceBLAS::default();
 
     // --- basic preparation --- //
     let mo_coeff = {
-        let mo_coeff = &scf_data.eigenvectors[0];
-        rt::asarray((&mo_coeff.data, mo_coeff.size, &device)).into_contig(ColMajor)
+        let mo_coeff_0 = &scf_data.eigenvectors[0];
+        let mo_coeff_1 = &scf_data.eigenvectors[1];
+        let mo_coeff_0 = rt::asarray((&mo_coeff_0.data, mo_coeff_0.size, &device)).into_contig(ColMajor);
+        let mo_coeff_1 = rt::asarray((&mo_coeff_1.data, mo_coeff_1.size, &device)).into_contig(ColMajor);
+        [mo_coeff_0, mo_coeff_1]
     };
     let mo_occ = {
-        let mo_occ = &scf_data.occupation[0];
-        rt::asarray((mo_occ, [mo_occ.len()], &device)).into_contig(ColMajor)
+        let mo_occ_0 = &scf_data.occupation[0];
+        let mo_occ_1 = &scf_data.occupation[1];
+        let mo_occ_0 = rt::asarray((mo_occ_0, [mo_occ_0.len()], &device)).into_contig(ColMajor);
+        let mo_occ_1 = rt::asarray((mo_occ_1, [mo_occ_1.len()], &device)).into_contig(ColMajor);
+        [mo_occ_0, mo_occ_1]
     };
     let mo_energy = {
-        let mo_energy = &scf_data.eigenvalues[0];
-        rt::asarray((mo_energy, [mo_energy.len()], &device)).into_contig(ColMajor)
+        let mo_energy_0 = &scf_data.eigenvalues[0];
+        let mo_energy_1 = &scf_data.eigenvalues[1];
+        let mo_energy_0 = rt::asarray((mo_energy_0, [mo_energy_0.len()], &device)).into_contig(ColMajor);
+        let mo_energy_1 = rt::asarray((mo_energy_1, [mo_energy_1.len()], &device)).into_contig(ColMajor);
+        [mo_energy_0, mo_energy_1]
     };
 
     let mol_obj = &scf_data.mol;
     let mol = get_cint_mol(mol_obj);
     let aux = get_cint_aux(mol_obj);
 
-    let mut hess_ovlp_obj = RHessOvlp::new(&mol, &device);
+    let mut hess_ovlp_obj = UHessOvlp::new(&mol, &device);
     let mut hess_nuc_repl_obj = HessNucRepl::new(&mol, &device);
-    let mut hess_hcore_obj = RHessHcore::new(&mol, &device);
+    let mut hess_hcore_obj = UHessHcore::new(&mol, &device);
 
     let mut hess_nuc_list: Vec<&mut dyn HessNucAPI> = vec![&mut hess_nuc_repl_obj];
 
@@ -41,12 +50,12 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
     if let Some(ref mut hess_dftd_obj) = hess_dftd_obj {
         hess_nuc_list.push(hess_dftd_obj);
     }
-    let hess_hcore_list: Vec<&mut dyn RHessCoreAPI> = vec![&mut hess_hcore_obj];
-    let mut hess_el_list: Vec<&mut dyn RHessElecInteractAPI> = Vec::new();
+    let hess_hcore_list: Vec<&mut dyn UHessCoreAPI> = vec![&mut hess_hcore_obj];
+    let mut hess_el_list: Vec<&mut dyn UHessElecInteractAPI> = Vec::new();
 
     // --- RI-JK --- //
 
-    use crate::ri_jk::hess_r::RHessRIJK;
+    use crate::ri_jk::hess_u::UHessRIJK;
 
     let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
     let scale_j = 1.0;
@@ -63,7 +72,7 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
 
     let mut hess_rijk_obj = if let Some((rimatr, _, _)) = &scf_data.rimatr {
         let cderi = rimatr.to_rstsr_view(&device).into_cow();
-        RHessRIJK::new_with_cderi(&mol, &aux, scale_j, scale_k, cderi, j2c_decomp)
+        UHessRIJK::new_with_cderi(&mol, &aux, scale_j, scale_k, cderi, j2c_decomp)
     } else {
         panic!(
             "This implementation requires cholesky decomposed ERI (or rimatr) to be available and stored in memory."
@@ -89,7 +98,7 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
         if let Some((rimatr_sr, _, _)) = &scf_data.rimatr_sr {
             let cderi_sr = rimatr_sr.to_rstsr_view(&device).into_cow();
             let j2c_decomp_sr = crate::ri_jk::get_j2c_decomp(&aux_sr, &device, *j2c_decomp_option);
-            RHessRIJK::new_with_cderi(&mol_sr, &aux_sr, 0.0, hyb - alpha, cderi_sr, j2c_decomp_sr)
+            UHessRIJK::new_with_cderi(&mol_sr, &aux_sr, 0.0, hyb - alpha, cderi_sr, j2c_decomp_sr)
         } else {
             panic!(
                 "The range-separated Hessian requires the short-range ERI (rimatr_sr) to be built and stored in memory."
@@ -103,7 +112,7 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
     // --- DFT --- //
 
     let mut hess_nimatmul_obj = (!is_hf).then(|| {
-        use crate::dft::numint_matmul::hess_rks::RHessKSNIMatmul;
+        use crate::dft::numint_matmul::hess_uks::UHessKSNIMatmul;
         use crate::dft::numint_matmul::nimatmul::NIMatmul;
         use crate::dft::xceff::prelude::{determine_den_type_from_list, XCDenType};
         use crate::dft::Grids;
@@ -115,7 +124,7 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
             xc_code
                 .iter()
                 .zip(xc_params.iter())
-                .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Unpolarized)))
+                .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Polarized)))
                 .collect_vec()
         };
         let verbose = scf_data.mol.ctrl.print_level > 2;
@@ -162,7 +171,7 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
         // cpscf grid: when it coincides with the skeleton grid, leave `ni_cpks = None` so the
         // skeleton's vxc/fxc are reused; otherwise build a dedicated (coarser) grid.
         let hess_nimatmul_obj = if cpscf_level == sk_level {
-            RHessKSNIMatmul::new(&mol, xc_func_list, ni, grid_shift, verbose)
+            UHessKSNIMatmul::new(&mol, xc_func_list, ni, grid_shift, verbose)
         } else {
             let cpscf_grid = Grids::build_with_level(mol_obj, cpscf_level);
             let ni_cpks = NIMatmul::new(
@@ -172,7 +181,7 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
                 &cpscf_grid.atm_idx,
                 &cpscf_grid.quadrature_weights,
             );
-            RHessKSNIMatmul::new(&mol, xc_func_list, ni, grid_shift, verbose).set_ni_cpks(ni_cpks)
+            UHessKSNIMatmul::new(&mol, xc_func_list, ni, grid_shift, verbose).set_ni_cpks(ni_cpks)
         };
         hess_nimatmul_obj
     });
@@ -182,7 +191,7 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
 
     // --- run hessian --- //
 
-    let mut hess_scf = RHessSCF::new(
+    let mut hess_scf = UHessSCF::new(
         mo_coeff,
         mo_occ,
         mo_energy,

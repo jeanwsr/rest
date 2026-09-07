@@ -4,7 +4,7 @@
 //! regeneration path for a GGA functional.
 
 use pyrest::analdrv::config::{AnalDrvCpscfCfg, AnalDrvConfig, AnalDrvNucgradCfg};
-use pyrest::analdrv::rscf_interface::rscf_hess_interface;
+use pyrest::analdrv::hessian::rscf_interface::rscf_hess_interface;
 
 use pyrest::ctrl_io;
 use pyrest::dft::numint_matmul::hess_rks::{get_hess_ncomp_ao_dm0, get_rho_exc_vxc_fxc, make_cpks_vxc_fxc};

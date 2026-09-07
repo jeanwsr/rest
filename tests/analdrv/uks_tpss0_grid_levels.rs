@@ -4,7 +4,7 @@
 //! dedicated CP-SCF grid path on the UKS side.
 
 use pyrest::analdrv::config::{AnalDrvCpscfCfg, AnalDrvConfig, AnalDrvNucgradCfg};
-use pyrest::analdrv::uscf_interface::uscf_hess_interface;
+use pyrest::analdrv::hessian::uscf_interface::uscf_hess_interface;
 
 use pyrest::ctrl_io;
 use pyrest::molecule_io::Molecule;
