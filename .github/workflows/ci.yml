@@ -2,7 +2,7 @@ name: CI
 
 on: [push, pull_request]
 
-# 避免频繁 push 导致的排队堆积
+# Avoid queued-build pile-up from frequent pushes
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -13,17 +13,19 @@ jobs:
     timeout-minutes: 60
 
     env:
-      # $REST_HOME 是 cargo workspace 根目录 (checkout 位于 $REST_HOME/rest)
+      # $REST_HOME is the cargo workspace root (the checkout lives at $REST_HOME/rest)
       REST_HOME: /home/runner/work/rest
 
     steps:
-      # 1. 检出 REST 主代码
+      # 1. Check out the REST main code
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2. Miniforge 安装编译期依赖 (参考 rest_doc/source_zh/contributor/compile-guide.md)
-      #    注意: build.rs 链接 cint/restmatr/hdf5/rest2fch/openblas/gomp 全部来自 $REST_EXT_DIR;
-      #    libxc 在运行期动态加载, 编译期无需链接.
+      # 2. Install build-time dependencies via Miniforge
+      #    (see rest_doc/source_zh/contributor/compile-guide.md)
+      #    Note: build.rs links cint/restmatr/hdf5/rest2fch/openblas/gomp
+      #    entirely from $REST_EXT_DIR; libxc is dynamically loaded at runtime
+      #    and not linked at build time.
       - name: Install Miniforge and build deps
         run: |
           set -euo pipefail
@@ -32,8 +34,6 @@ jobs:
             "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
           bash /tmp/miniforge.sh -b -p "$CONDA_DIR"
           CONDA="$CONDA_DIR/bin/conda"
-          # hdf5 提供 libhdf5.so 链接符号与头文件 (h5py 单独不够);
-          # trimmed: simple-dftd3/dftd4/geometric 为运行期 python 依赖, 编译不需要
           $CONDA create -y -p "$CONDA_DIR/envs/rest-dev" \
             python=3.11 numpy scipy h5py \
             "libopenblas=*=*openmp*" \
@@ -43,7 +43,8 @@ jobs:
           echo "CONDA_PREFIX=$CONDA_DIR/envs/rest-dev" >> "$GITHUB_ENV"
           echo "$CONDA_DIR/envs/rest-dev/bin" >> "$GITHUB_PATH"
 
-      # 3. Gitee SSH key: gitee 对 GitHub runner IP 的 HTTP 限流 (429) 不影响 SSH 通道
+      # 3. Gitee SSH key: Gitee's HTTP rate limiting (429) for GitHub runner IPs
+      #    does not affect the SSH transport
       - name: Set up Gitee SSH
         env:
           GITEE_SSH_PRIVATE_KEY: ${{ secrets.GITEE_SSH_PRIVATE_KEY }}
@@ -55,8 +56,8 @@ jobs:
           ssh-keyscan -t ed25519,rsa gitee.com >> ~/.ssh/known_hosts 2>/dev/null
           printf 'Host gitee.com\n  IdentityFile ~/.ssh/gitee_key\n  IdentitiesOnly yes\n' >> ~/.ssh/config
 
-      # 4. 搭建 $REST_HOME workspace 布局 (同 compile-guide 第 2 步)
-      #    gitee 会对 GitHub runner IP 间歇性限流, 因此带重试
+      # 4. Assemble the $REST_HOME workspace layout (compile-guide, step 2)
+      #    Gitee throttles GitHub runner IPs intermittently, hence the retries
       - name: Assemble $REST_HOME workspace
         run: |
           set -euo pipefail
@@ -79,7 +80,7 @@ jobs:
           mkdir -p deps
           echo "REST_EXT_DIR=$REST_HOME/deps" >> "$GITHUB_ENV"
 
-      # 5. 依赖库链接到 $REST_EXT_DIR (同 compile-guide 第 4 步)
+      # 5. Link libraries into $REST_EXT_DIR (compile-guide, step 4)
       - name: Link libraries into $REST_EXT_DIR
         run: |
           set -euo pipefail
@@ -89,16 +90,16 @@ jobs:
               if [ -e "$lib" ]; then ln -sf "$lib" .; fi
             done
           done
-          # librest2fch.so 由 mokit 包装在 python site-packages 下
+          # librest2fch.so ships with the mokit package under python site-packages
           ln -sf "$CONDA_PREFIX"/lib/python3.11/site-packages/mokit/lib/librest2fch.so .
-          # 某些 conda 发行版没有 libopenblas.so, 从 libopenblas.0.so 链接
+          # some conda distributions lack libopenblas.so; fall back to libopenblas.0.so
           [ -e libopenblas.so ] || ln -sf libopenblas.0.so libopenblas.so
           echo "LD_LIBRARY_PATH=$REST_EXT_DIR:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           echo "HDF5_DIR=$CONDA_PREFIX" >> "$GITHUB_ENV"
           echo "REST_FORTRAN_COMPILER=gfortran" >> "$GITHUB_ENV"
           echo "LIBCLANG_PATH=$CONDA_PREFIX/lib" >> "$GITHUB_ENV"
 
-      # 6. cargo 缓存 (依赖编译占大头)
+      # 6. Cache cargo artifacts (dependency compilation dominates build time)
       - name: Cache cargo artifacts
         uses: actions/cache@v4
         with:
@@ -110,20 +111,20 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
-      # 7. 编译 (debug 模式; rest_tensors 的 build.rs 会编译 restmatr.f90 -> librestmatr.so)
+      # 7. Build (debug; rest_tensors' build.rs compiles restmatr.f90 -> librestmatr.so)
       - name: Build (debug)
         run: |
           set -euo pipefail
           cd "$REST_HOME"
           cargo build -p rest
-          # 链接完整性检查: 不允许存在 unresolved 共享库
+          # Link integrity check: no unresolved shared libraries allowed
           if ldd target/debug/rest | grep -q "not found"; then
             echo "::error::unresolved shared libraries:"
             ldd target/debug/rest | grep "not found"
             exit 1
           fi
 
-      # 8. 冒烟测试: 跑一个小规模 DFT 回归样例
+      # 8. Smoke test: run a small DFT regression case
       - name: Smoke test (NH3_X3LYP via rest_regression)
         run: |
           set -euo pipefail

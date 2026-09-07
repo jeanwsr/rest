@@ -1,13 +1,13 @@
 name: Sync from Gitee PR to GitHub
 
 on:
-  # 定时触发：每60分钟检查一次
+  # Scheduled trigger: check every 60 minutes
   schedule:
     - cron: '14 * * * *'
-  # 支持手动触发，方便调试
+  # Manual trigger for debugging
   workflow_dispatch:
 
-# 防止定时任务与手动触发重叠执行
+# Prevent scheduled runs from overlapping with manual dispatches
 concurrency:
   group: gitee-sync
   cancel-in-progress: false
@@ -15,20 +15,21 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    # 设置超时时间，防止任务卡住
+    # Job-level timeout so a stuck run cannot hang forever
     timeout-minutes: 10
 
     steps:
-      # 1. 检出 GitHub 仓库
+      # 1. Check out the GitHub repository
       - name: Checkout GitHub repository
         uses: actions/checkout@v4
         with:
-          # 使用 PAT 以便 push 可以触发其他 workflow (GITHUB_TOKEN 的 push 不会触发)
-          # checkout 会把 PAT 持久化到本地 git 配置，后续直接 git push origin 即可
+          # Use a PAT so pushes trigger other workflows (GITHUB_TOKEN pushes do not)
+          # checkout persists the PAT in the local git config; later `git push origin` just works
           token: ${{ secrets.PAT_TOKEN }}
           fetch-depth: 0
 
-      # 2. Gitee SSH key: gitee 对 GitHub runner IP 的 HTTP 限流 (429) 不影响 SSH 通道
+      # 2. Gitee SSH key: Gitee's HTTP rate limiting (429) for GitHub runner IPs
+      #    does not affect the SSH transport
       - name: Set up Gitee SSH
         env:
           GITEE_SSH_PRIVATE_KEY: ${{ secrets.GITEE_SSH_PRIVATE_KEY }}
@@ -40,22 +41,24 @@ jobs:
           ssh-keyscan -t ed25519,rsa gitee.com >> ~/.ssh/known_hosts 2>/dev/null
           printf 'Host gitee.com\n  IdentityFile ~/.ssh/gitee_key\n  IdentitiesOnly yes\n' >> ~/.ssh/config
 
-      # 3. 同步：master 镜像 + 每个 open PR 两个分支
-      #    sync/pr-<n>        = PR head 的纯镜像 (CI 测 PR 本身)
-      #    sync/pr-<n>-merged = PR 与 base 合并后的预览 (CI 测合并结果)
+      # 3. Sync: mirror master + two branches per open PR
+      #    sync/pr-<n>        = pure mirror of the PR head (CI tests the PR itself)
+      #    sync/pr-<n>-merged = merge preview against base (CI tests the merged result)
       - name: Sync
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          GITEE_REPO: ${{ secrets.GITEE_REPO }}  # 格式: "用户名/仓库名"
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}  # format: "owner/repo"
         run: |
           set -euo pipefail
 
-          # git fetch 走 SSH 通道 (绕开 HTTP 429 限流); GITEE_TOKEN 仅用于 API 查询
+          # git fetch goes over the SSH channel (bypasses HTTP 429 throttling);
+          # GITEE_TOKEN is only used for the REST API query
           GITEE_URL="git@gitee.com:${GITEE_REPO}.git"
           PRS_FILE="${RUNNER_TEMP}/open_prs.jsonl"
           : > "$PRS_FILE"
 
-          # fetch_retry: 仅对瞬时错误 (网络抖动/限流) 重试；永久错误 (分支/仓库不存在, SSH key 未授权) 立即返回。
+          # fetch_retry: retries only transient errors (network flakiness / throttling);
+          # permanent errors (branch or repo missing, unauthorized SSH key) return immediately.
           fetch_retry() {
             local url="$1"; shift
             local attempt err
@@ -76,7 +79,7 @@ jobs:
             return 1
           }
 
-          # ---------- 1. 查询 Gitee 所有 open PR (分页, 校验应答) ----------
+          # ---------- 1. Query all open Gitee PRs (paginated, response validated) ----------
           page=1
           while :; do
             resp=$(curl -fsS --retry 3 --retry-delay 10 -H "Authorization: token ${GITEE_TOKEN}" \
@@ -86,7 +89,7 @@ jobs:
               || { echo "::error::Unexpected Gitee API response (page ${page})"; exit 1; }
             count=$(jq 'length' <<<"$resp")
             [ "$count" -eq 0 ] && break
-            # 跳过草稿 PR；每行 TSV: number / head.ref / head.repo.full_name(可为空) / base.ref
+            # Skip draft PRs; one TSV row per PR: number / head.ref / head.repo.full_name (may be empty) / base.ref
             jq -r '.[] | select((.draft // false) | not) | [.number, .head.ref, (.head.repo.full_name // ""), .base.ref] | @tsv' <<<"$resp" >> "$PRS_FILE"
             [ "$count" -lt 100 ] && break
             page=$((page + 1))
@@ -94,7 +97,7 @@ jobs:
           total=$(wc -l < "$PRS_FILE")
           echo "Found ${total} open PR(s)"
 
-          # ---------- 2. master 镜像 (强制一致, 自愈 GitHub 侧误提交) ----------
+          # ---------- 2. Mirror master (force-consistent; self-heals accidental GitHub-side commits) ----------
           fetch_retry "$GITEE_URL" +refs/heads/master:refs/remotes/gitee/master \
             || { echo "::error::cannot fetch master from Gitee (retries exhausted)"; exit 1; }
           git fetch origin +refs/heads/master:refs/remotes/origin/master || true
@@ -105,17 +108,17 @@ jobs:
             git push origin +refs/remotes/gitee/master:refs/heads/master
           fi
 
-          # 一次性取回 GitHub 上已有的 sync 分支，用于"无变化则不推送"比对
+          # Fetch all existing sync branches from GitHub once, for the "skip push when unchanged" comparison
           git fetch origin '+refs/heads/sync/pr-*:refs/remotes/origin/sync/pr-*' || true
 
-          # ---------- 3. 逐 PR 同步 ----------
+          # ---------- 3. Sync PR by PR ----------
           conflicted=()
           declare -A fetched_base=()
 
           while IFS=$'\t' read -r pr_number head_ref head_repo base_ref; do
             echo "=== PR #${pr_number}: ${head_ref} -> ${base_ref} ==="
 
-            # 3.1 获取 PR head (fork PR 从 fork 仓库获取)
+            # 3.1 Fetch the PR head (fork PRs are fetched from the fork repository)
             if [ -n "$head_repo" ] && [ "$head_repo" != "$GITEE_REPO" ]; then
               head_url="git@gitee.com:${head_repo}.git"
             else
@@ -128,14 +131,14 @@ jobs:
             fi
             head_sha=$(git rev-parse "$head_ref_name")
 
-            # 3.2 head 镜像: sync/pr-<n>
+            # 3.2 Head mirror: sync/pr-<n>
             head_branch="sync/pr-${pr_number}"
             origin_head=$(git rev-parse --verify -q "refs/remotes/origin/${head_branch}" || true)
             if [ "$origin_head" != "$head_sha" ]; then
               git push origin "+${head_sha}:refs/heads/${head_branch}"
             fi
 
-            # 3.3 获取 base 分支 (按分支名缓存, 只取一次)
+            # 3.3 Fetch the base branch (cached per branch name, fetched only once)
             if [ -z "${fetched_base[${base_ref}]:-}" ]; then
               if ! fetch_retry "$GITEE_URL" "+refs/heads/${base_ref}:refs/remotes/gitee/${base_ref}"; then
                 echo "::warning::PR #${pr_number}: cannot fetch base '${base_ref}' - skipped"
@@ -145,7 +148,7 @@ jobs:
             fi
             base_sha=$(git rev-parse "refs/remotes/gitee/${base_ref}")
 
-            # 3.4 无工作区合并测试 (git >= 2.38; 退出码 1 表示有冲突)
+            # 3.4 Worktree-free merge test (git >= 2.38; exit code 1 means conflicts)
             set +e
             merge_out=$(git merge-tree --write-tree --name-only "$head_sha" "$base_sha" 2>/dev/null)
             merge_rc=$?
@@ -161,7 +164,8 @@ jobs:
             fi
             tree=$(sed -n '1p' <<<"$merge_out")
 
-            # 3.5 确定性 merge commit：相同输入 => 相同 SHA => 不重复推送、不重复触发 CI
+            # 3.5 Deterministic merge commit: identical inputs => identical SHA
+            #     => no redundant pushes, no redundant CI triggers
             merged_sha=$(GIT_AUTHOR_NAME="gitee-sync-bot" \
               GIT_AUTHOR_EMAIL="github-actions[bot]@users.noreply.github.com" \
               GIT_AUTHOR_DATE="2026-01-01T00:00:00Z" \
@@ -178,7 +182,7 @@ jobs:
             fi
           done < "$PRS_FILE"
 
-          # ---------- 4. 冲突汇总: 明确失败 ----------
+          # ---------- 4. Conflict summary: fail explicitly ----------
           if [ "${#conflicted[@]}" -gt 0 ]; then
             echo "::error::${#conflicted[@]} PR(s) conflict with their base branch: ${conflicted[*]}"
             exit 1
