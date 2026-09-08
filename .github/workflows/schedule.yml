@@ -1,14 +1,11 @@
 name: Sync from Gitee PR to GitHub
 
 on:
-  # Scheduled trigger: check every 60 minutes
+  # Scheduled trigger: check every 30 minutes
   schedule:
-    # 北京时间 11:00-22:59，每30分钟一次
-    # UTC 03:00-14:59
-    - cron: '11,41 3-14 * * *'
-    # 北京时间 23:00-10:59，每小时一次
-    # UTC 15:00-02:59
-    - cron: '11 0-2,15-23 * * *'
+    - cron: '11,41 * * * *'
+    #- cron: '11,41 3-14 * * *'
+    #- cron: '11 0-2,15-23 * * *'
   # Manual trigger for debugging
   workflow_dispatch:
 
