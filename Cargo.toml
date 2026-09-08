@@ -57,6 +57,7 @@ rstsr-openblas = { version = "0.7", features = ["openmp"] }
 tblis = { version = "0.2", features = ["dynamic_loading"] }
 derive_builder = { version = "0.20" }
 indexmap = { version = "2.14" }
+enumflags2 = { version = "0.7" }
 
 dftd3 = { version = "0.2", optional = true }
 dftd4 = { version = "0.2", optional = true }
