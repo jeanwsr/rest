@@ -8,6 +8,7 @@ pub mod hess_uks;
 pub mod nimatmul;
 pub mod pure_eval_rho;
 pub mod pure_xcpot;
+pub mod resp_rks;
 
 #[allow(unused)]
 pub mod prelude {

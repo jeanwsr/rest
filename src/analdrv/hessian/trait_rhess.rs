@@ -78,7 +78,11 @@ pub trait RHessCoreAPI: AnalDrvBaseAPI {
 /// In SCF iteration, introducing two-order (or higher-order) contribution requires the program to
 /// make some modification to Fock matrix construction. This kind of terms is substentially
 /// different from zero/one-order core components, and should be handled separately.
-pub trait RHessElecInteractAPI: AnalDrvBaseAPI {
+///
+/// Response-related functionalities (fock generation, response preparation and contraction) are
+/// inherited from the supertrait [`RRespAPI`]; this trait only contains hessian-specific skeleton
+/// contractions.
+pub trait RHessElecInteractAPI: RRespAPI {
     /// Generate the **skeleton** contribution of Hessian for current SCF component.
     ///
     /// # Parameters
@@ -143,48 +147,4 @@ pub trait RHessElecInteractAPI: AnalDrvBaseAPI {
         let mocc = mo_coeff.bool_select(-1, &occidx);
         self.get_deriv1_ao(mo_coeff, mo_occ, atm_list) % mocc
     }
-
-    /// Prepare the data for response calculation.
-    ///
-    /// Response (related to second order of density matrix derivative to energy) will be called
-    /// multiple-times in CP-SCF solver and other places.
-    ///
-    /// Some methods (especially DFT) may be helpful to prepare some data for response calculation,
-    /// and store them in the object.
-    ///
-    /// For Hartree-Fock methods, they usually also need to store the `mo_coeff` and `mo_occ`, so to
-    /// make sure [`get_response_bra`](Self::get_response_bra) can be called with only bra as input.
-    ///
-    /// # Parameters
-    ///
-    /// - `mo_coeff` : shape `[nao, nmo]`. Molecular orbital coefficients.
-    /// - `mo_occ` : shape `[nmo]`. Molecular orbital occupation numbers.
-    fn make_response_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView);
-
-    /// Get the response contribution for current SCF component.
-    ///
-    /// This function will be called multiple-times in CP-SCF solver and other places.
-    /// Call [`make_response_preparation`] before this function to make sure the data is ready.
-    ///
-    /// Also, this function will not pass in the MO coefficients and occupation numbers.
-    /// If you need them, you should store them in the object by function
-    /// `make_response_preparation`.
-    ///
-    /// # Parameters
-    ///
-    /// - `bra` : shape `[nao, nocc, ...]`. The bra part for response calculation. This is usually
-    ///   the derivative of MO coefficients (like $U_{\mu i}^\mathbb{A}$ given by CP-SCF).
-    ///
-    /// # Returns
-    ///
-    /// - `resp_bra` : shape `[nao, nocc, ...]`. The response potential (related to second order of
-    ///   density matrix derivative to energy).
-    ///
-    /// # Notes
-    ///
-    /// This function may not work for fractional occupation.
-    /// We have not prepared to propose a good API for fractional occupation.
-    ///
-    /// [`make_response_preparation`]: Self::make_response_preparation
-    fn get_response_bra(&mut self, bra: TsrView) -> Tsr;
 }

@@ -32,7 +32,10 @@ use crate::dft::gen_grids::becke_partitioning_deriv::{
     becke_partition_with_tables, gen_adjustment_factor, try_atm_quad_split, AtmIndices, BeckeMolTables,
     BeckePartitionArg,
 };
+use crate::dft::numint_matmul::resp_rks::RRespKSNIMatmul;
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use XCDenType::*;
@@ -1545,21 +1548,17 @@ pub fn get_rks_response_bra_batched(
 pub struct RHessKSNIMatmul<'a> {
     /// Molecule.
     pub mol: CInt,
-    /// List of `(scale, functional)` pairs of the XC functional.
-    pub xc_func_list: Vec<(f64, LibXCFunctional)>,
-    /// Numerical-integration driver over the (atom-grouped) Hessian grid.
-    pub ni: NIMatmul<'a>,
-    /// Optional separate grid for the CP-KS response; `None` reuses `ni`.
-    pub ni_cpks: Option<NIMatmul<'a>>,
+    /// Shared response (fock/response) object, owning the XC functional list and both grids; the
+    /// [`RRespAPI`] methods of this hessian object delegate to it. Clone the `Rc` handle to share
+    /// the response object with other (future) molecular-property drivers.
+    pub resp: Rc<RefCell<RRespKSNIMatmul<'a>>>,
     /// Evaluate the Becke grid-shift terms; requires full atom attribution of
     /// the grids.
     pub grid_shift: bool,
     /// Print per-chunk progress of the Hessian setup.
     pub verbose: bool,
-    /// Intermediates of the Hessian setup: all keys of
-    /// [`make_hessian_setup_becke`] (with `fxc` renamed to `cpks_fxc` unless a
-    /// CP-KS-specific grid is given), plus `mo_coeff [nao, nmo]`, `mo_occ
-    /// [nmo]` from [`RHessElecInteractAPI::make_response_preparation`].
+    /// Skeleton-Hessian intermediates: all keys of [`make_hessian_setup_becke`] except `fxc`
+    /// (which is handed to the response object as `cpks_fxc` when the grids are shared).
     pub intmd: HashMap<String, Tsr>,
 }
 
@@ -1580,45 +1579,49 @@ impl<'a> RHessKSNIMatmul<'a> {
         grid_shift: bool,
         verbose: bool,
     ) -> Self {
-        Self { mol: mol.clone(), xc_func_list, ni, ni_cpks: None, grid_shift, verbose, intmd: HashMap::new() }
+        Self {
+            mol: mol.clone(),
+            resp: Rc::new(RefCell::new(RRespKSNIMatmul::new(xc_func_list, ni, verbose))),
+            grid_shift,
+            verbose,
+            intmd: HashMap::new(),
+        }
     }
 
-    /// Attach a dedicated CP-KS numerical-integration grid (`ni_cpks`).
-    ///
-    /// When set, the CP-KS response (`get_response_bra`) is evaluated on this grid instead of the
-    /// skeleton grid, and `cpks_vxc` / `cpks_fxc` are recomputed on it during
-    /// [`make_response_preparation`](Self::make_response_preparation).
-    pub fn set_ni_cpks(mut self, ni_cpks: NIMatmul<'a>) -> Self {
-        self.ni_cpks = Some(ni_cpks);
+    /// Build a hessian object around an existing (shared) response object.
+    pub fn new_with_resp(mol: &CInt, resp: Rc<RefCell<RRespKSNIMatmul<'a>>>, grid_shift: bool, verbose: bool) -> Self {
+        Self { mol: mol.clone(), resp, grid_shift, verbose, intmd: HashMap::new() }
+    }
+
+    /// Attach a dedicated small numerical-integration grid (`ni_resp`) for the response path;
+    /// see [`RRespKSNIMatmul::set_ni_resp`].
+    pub fn set_ni_resp(mut self, ni_resp: NIMatmul<'a>) -> Self {
+        self.resp.borrow_mut().ni_resp = Some(ni_resp);
         self
     }
 
     /// Perform the Hessian setup for RKS calculations.
     ///
-    /// `fxc` is stored as `cpks_fxc` (unless a CP-KS-specific grid is given)
-    /// for the response; `de_xc_skeleton` and `vmat_deriv1_grid` are the main
-    /// results.
+    /// `fxc` is stored as `cpks_fxc` in the response object (unless a
+    /// response-specific grid is given) for the response; `de_xc_skeleton` and
+    /// `vmat_deriv1_grid` are the main results.
     pub fn make_hessian_setup(&mut self, mo_coeff: TsrView, mo_occ: TsrView, atm_list: Option<&[usize]>) {
         // run RKS hessian setup
         let dm0 = get_dm0_restricted(mo_coeff, mo_occ);
-        let (result, _timing) = make_hessian_setup_becke(
-            &self.mol,
-            &self.xc_func_list,
-            &mut self.ni,
-            dm0.view(),
-            self.grid_shift,
-            atm_list,
-            self.verbose,
-        );
+        let (result, _timing) = {
+            let resp = &mut *self.resp.borrow_mut();
+            make_hessian_setup_becke(&self.mol, &resp.xc_func_list, &mut resp.ni, dm0.view(), self.grid_shift, atm_list, self.verbose)
+        };
 
         // handling intermediates and results
         for (key, val) in result.into_iter() {
             if key == "fxc" {
                 // fxc storage is actually for cp-ks.
-                // If `ni_cpks` is not specified, then we can use the fxc from the hessian setup
+                // If `ni_resp` is not specified, then we can use the fxc from the hessian setup
                 // for cp-ks as well.
-                if self.ni_cpks.is_none() {
-                    self.intmd.insert("cpks_fxc".to_string(), val);
+                let resp = &mut *self.resp.borrow_mut();
+                if resp.ni_resp.is_none() {
+                    resp.intmd.insert("cpks_fxc".to_string(), val);
                 }
             } else {
                 self.intmd.insert(key.to_string(), val);
@@ -1648,43 +1651,6 @@ impl<'a> RHessElecInteractAPI for RHessKSNIMatmul<'a> {
             self.make_hessian_setup(mo_coeff, mo_occ, atm_list);
         }
         self.intmd["vmat_deriv1_grid"].to_owned()
-    }
-
-    fn make_response_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView) {
-        self.intmd.insert("mo_coeff".to_string(), mo_coeff.into_contig(ColMajor));
-        self.intmd.insert("mo_occ".to_string(), mo_occ.into_contig(ColMajor));
-
-        // When a dedicated CP-KS grid is set, `cpks_vxc` / `cpks_fxc` were NOT stored during
-        // `make_hessian_setup` (the skeleton grid's vxc/fxc live on a different grid and must not
-        // be reused). Recompute them here on the CP-KS grid from the ground-state density, using
-        // the lean [`make_cpks_vxc_fxc`] (no skeleton intermediates, minimal AO derivative order,
-        // density formed from occupied MOs via a bra-ket contraction rather than a full dm0).
-        if let Some(ni_cpks) = self.ni_cpks.as_mut() {
-            let mo_coeff = self.intmd["mo_coeff"].view();
-            let mo_occ = self.intmd["mo_occ"].view();
-            let (vxc, fxc) = make_cpks_vxc_fxc(&self.xc_func_list, ni_cpks, mo_coeff, mo_occ);
-            self.intmd.insert("cpks_vxc".to_string(), vxc);
-            self.intmd.insert("cpks_fxc".to_string(), fxc);
-        }
-    }
-
-    fn get_response_bra(&mut self, bra: TsrView) -> Tsr {
-        let ni_cpks = self.ni_cpks.as_mut().unwrap_or(&mut self.ni);
-        let mo_coeff = self.intmd.get("mo_coeff").unwrap();
-        let mo_occ = self.intmd.get("mo_occ").unwrap();
-        let fxc_eff = self.intmd.get("cpks_fxc").unwrap();
-        let occidx = mo_occ.view().greater(0).into_vec();
-        let mocc = mo_coeff.bool_select(-1, &occidx);
-
-        let (resp, _timing) = get_rks_response_bra_batched(
-            ni_cpks,
-            determine_den_type_from_list(&self.xc_func_list.iter().map(|(_, f)| f).collect_vec()),
-            fxc_eff.view(),
-            bra,
-            mocc.view(),
-            self.verbose,
-        );
-        resp
     }
 }
 

@@ -159,20 +159,20 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
             NIMatmul::new(&mol, &coordinates, &weights, &atm_idx, &quadrature_weights)
         };
 
-        // cpscf grid: when it coincides with the skeleton grid, leave `ni_cpks = None` so the
+        // response grid: when it coincides with the skeleton grid, leave `ni_resp = None` so the
         // skeleton's vxc/fxc are reused; otherwise build a dedicated (coarser) grid.
         let hess_nimatmul_obj = if cpscf_level == sk_level {
             RHessKSNIMatmul::new(&mol, xc_func_list, ni, grid_shift, verbose)
         } else {
             let cpscf_grid = Grids::build_with_level(mol_obj, cpscf_level);
-            let ni_cpks = NIMatmul::new(
+            let ni_resp = NIMatmul::new(
                 &mol,
                 &cpscf_grid.coordinates,
                 &cpscf_grid.weights,
                 &cpscf_grid.atm_idx,
                 &cpscf_grid.quadrature_weights,
             );
-            RHessKSNIMatmul::new(&mol, xc_func_list, ni, grid_shift, verbose).set_ni_cpks(ni_cpks)
+            RHessKSNIMatmul::new(&mol, xc_func_list, ni, grid_shift, verbose).set_ni_resp(ni_resp)
         };
         hess_nimatmul_obj
     });

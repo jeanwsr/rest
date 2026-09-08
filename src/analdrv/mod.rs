@@ -66,6 +66,7 @@ pub mod prelude {
     pub use hessian::trait_rhess::{HessNucAPI, RHessCoreAPI, RHessElecInteractAPI};
     pub use hessian::trait_uhess::{UHessCoreAPI, UHessElecInteractAPI};
     pub use hessian::uscf::UHessSCF;
+    pub use response::trait_rresp::RRespAPI;
     pub use trait_util::AnalDrvBaseAPI;
 
     pub(super) use crate::ri_jk::util::{get_dm0_restricted, get_dme0_restricted};

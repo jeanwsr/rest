@@ -28,8 +28,7 @@ pub trait RRespAPI: AnalDrvBaseAPI {
     /// - `fock` : shape `[nao, nao]`. Fock matrix.
     fn get_fock_rdm(&mut self, rdm: TsrView) -> Tsr;
 
-    /// Generate the first-order derivative of Fock matrix with respect to molecular coefficients
-    /// (mo_coeff).
+    /// Generate Fock matrix from molecular coefficients and occupation numbers.
     ///
     /// Override this function to leverage the algorithmic advantage by occupation number over
     /// molecular orbital number.
@@ -44,7 +43,8 @@ pub trait RRespAPI: AnalDrvBaseAPI {
     ///
     /// # Returns
     ///
-    /// - `fock` : shape `[nao, nmo]`. Fock matrix.
+    /// - `fock` : shape `[nao, nao]`. Fock matrix (the operator in AO basis, not contracted by
+    ///   `mo_coeff`).
     fn get_fock_coeff(&mut self, mo_coeff: TsrView, mo_occ: TsrView) -> Tsr {
         let rdm = get_dm0_restricted(mo_coeff, mo_occ);
         self.get_fock_rdm(rdm.view())
@@ -69,7 +69,7 @@ pub trait RRespAPI: AnalDrvBaseAPI {
 
     /// Generate response matrix.
     ///
-    /// Refer to [`RRespAPI::get_resp_bra`] for better way to leverage the algorithmic advantage by
+    /// Refer to [`RRespAPI::get_response_bra`] for better way to leverage the algorithmic advantage by
     /// occupation number over molecular orbital number (but also notice the output is different in
     /// shape and meaning).
     /// Call [`make_response_preparation`] before this function to make sure the data is ready.
