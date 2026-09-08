@@ -76,13 +76,14 @@ pub trait RHessCoreAPI: AnalDrvBaseAPI {
 /// - Implicit-solvent/VV10 is probably categorized here.
 ///
 /// In SCF iteration, introducing two-order (or higher-order) contribution requires the program to
-/// make some modification to Fock matrix construction. This kind of terms is substentially
+/// make some modification to Fock matrix construction. This kind of terms is substitionally
 /// different from zero/one-order core components, and should be handled separately.
 ///
-/// Response-related functionalities (fock generation, response preparation and contraction) are
-/// inherited from the supertrait [`RRespAPI`]; this trait only contains hessian-specific skeleton
-/// contractions.
-pub trait RHessElecInteractAPI: RRespAPI {
+/// This trait contains only the hessian-specific skeleton contractions. Response-related
+/// functionalities (fock generation, response preparation and contraction) live in the separate
+/// [`RRespAPI`](crate::analdrv::response::trait_rresp::RRespAPI) and its own response objects;
+/// drivers that need both maintain separate lists of the two kinds of objects.
+pub trait RHessElecInteractAPI: AnalDrvBaseAPI {
     /// Generate the **skeleton** contribution of Hessian for current SCF component.
     ///
     /// # Parameters

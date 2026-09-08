@@ -1,10 +1,8 @@
 //! Response (Fock and response matrix) implementation for the RKS numint-matmul XC component.
 //!
-//! The response object [`RRespKSNIMatmul`] holds the minimal state for the fock/response
-//! functionality of the RKS numerical-integration XC contribution; the hessian object
-//! [`RHessKSNIMatmul`] composes it through `Rc<RefCell<...>>` and delegates its [`RRespAPI`]
-//! methods to it, so the same response object can be shared by the hessian driver and (future)
-//! other molecular-property drivers.
+//! The response object [`RRespKSNIMatmul`] is a standalone object for the fock/response
+//! functionality of the RKS numerical-integration XC contribution, independent of the hessian
+//! machinery of `RHessKSNIMatmul` (which owns its own grid, built from the same grid data).
 //!
 //! The two grids are separated by purpose: the fock path (`get_fock_rdm`/`get_fock_coeff`) always
 //! evaluates on the common (large) grid `ni`, while the response path
@@ -17,7 +15,7 @@
 use super::prelude::*;
 use crate::analdrv::prelude::*;
 
-use super::hess_rks::{eval_vxc_fxc_from_rho, get_rks_response_bra_batched, make_cpks_vxc_fxc, RHessKSNIMatmul};
+use super::hess_rks::{eval_vxc_fxc_from_rho, get_rks_response_bra_batched, make_cpks_vxc_fxc};
 
 /// Response (fock/response matrix) object for the RKS numint-matmul XC contribution.
 pub struct RRespKSNIMatmul<'a> {
@@ -31,8 +29,7 @@ pub struct RRespKSNIMatmul<'a> {
     pub verbose: bool,
     /// Response intermediates: `mo_coeff [nao, nmo]` and `mo_occ [nmo]` from
     /// [`RRespAPI::make_response_preparation`], plus `cpks_vxc [ngrids, nvar]` and
-    /// `cpks_fxc [ngrids, nvar, nvar]` on the response grid (injected by the hessian setup when
-    /// the grids are shared, else recomputed during preparation).
+    /// `cpks_fxc [ngrids, nvar, nvar]` on the selected response grid.
     pub intmd: HashMap<String, Tsr>,
 }
 
@@ -51,7 +48,7 @@ impl<'a> RRespKSNIMatmul<'a> {
     /// Attach a dedicated small numerical-integration grid (`ni_resp`) for the response path.
     ///
     /// When set, the response (`get_response_bra`) is evaluated on this grid instead of the common
-    /// (large) grid, and `cpks_vxc` / `cpks_fxc` are recomputed on it during
+    /// (large) grid, and `cpks_vxc` / `cpks_fxc` are computed on it during
     /// [`make_response_preparation`](RRespAPI::make_response_preparation).
     pub fn set_ni_resp(mut self, ni_resp: NIMatmul<'a>) -> Self {
         self.ni_resp = Some(ni_resp);
@@ -81,18 +78,16 @@ impl<'a> RRespAPI for RRespKSNIMatmul<'a> {
         self.intmd.insert("mo_coeff".to_string(), mo_coeff.into_contig(ColMajor));
         self.intmd.insert("mo_occ".to_string(), mo_occ.into_contig(ColMajor));
 
-        // When a dedicated response grid is set, `cpks_vxc` / `cpks_fxc` were NOT stored during
-        // `make_hessian_setup` (the fock grid's vxc/fxc live on a different grid and must not
-        // be reused). Recompute them here on the response grid from the ground-state density, using
-        // the lean [`make_cpks_vxc_fxc`] (no skeleton intermediates, minimal AO derivative order,
-        // density formed from occupied MOs via a bra-ket contraction rather than a full dm0).
-        if let Some(ni_resp) = self.ni_resp.as_mut() {
-            let mo_coeff = self.intmd["mo_coeff"].view();
-            let mo_occ = self.intmd["mo_occ"].view();
-            let (vxc, fxc) = make_cpks_vxc_fxc(&self.xc_func_list, ni_resp, mo_coeff, mo_occ);
-            self.intmd.insert("cpks_vxc".to_string(), vxc);
-            self.intmd.insert("cpks_fxc".to_string(), fxc);
-        }
+        // Compute `cpks_vxc` / `cpks_fxc` on the selected response grid (the small `ni_resp` when
+        // attached, else the common grid) from the ground-state density, using the lean
+        // [`make_cpks_vxc_fxc`] (no skeleton intermediates, minimal AO derivative order, density
+        // formed from occupied MOs via a bra-ket contraction rather than a full dm0).
+        let ni_resp = self.ni_resp.as_mut().unwrap_or(&mut self.ni);
+        let mo_coeff = self.intmd["mo_coeff"].view();
+        let mo_occ = self.intmd["mo_occ"].view();
+        let (vxc, fxc) = make_cpks_vxc_fxc(&self.xc_func_list, ni_resp, mo_coeff, mo_occ);
+        self.intmd.insert("cpks_vxc".to_string(), vxc);
+        self.intmd.insert("cpks_fxc".to_string(), fxc);
     }
 
     fn get_response_bra(&mut self, bra: TsrView) -> Tsr {
@@ -112,28 +107,5 @@ impl<'a> RRespAPI for RRespKSNIMatmul<'a> {
             self.verbose,
         );
         resp
-    }
-}
-
-/// Fock/response delegation from the hessian object to its shared inner response object.
-impl<'a> RRespAPI for RHessKSNIMatmul<'a> {
-    fn get_fock_rdm(&mut self, rdm: TsrView) -> Tsr {
-        self.resp.borrow_mut().get_fock_rdm(rdm)
-    }
-
-    fn get_fock_coeff(&mut self, mo_coeff: TsrView, mo_occ: TsrView) -> Tsr {
-        self.resp.borrow_mut().get_fock_coeff(mo_coeff, mo_occ)
-    }
-
-    fn get_response_rdm(&mut self, rdm: TsrView) -> Tsr {
-        self.resp.borrow_mut().get_response_rdm(rdm)
-    }
-
-    fn make_response_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView) {
-        self.resp.borrow_mut().make_response_preparation(mo_coeff, mo_occ)
-    }
-
-    fn get_response_bra(&mut self, bra: TsrView) -> Tsr {
-        self.resp.borrow_mut().get_response_bra(bra)
     }
 }

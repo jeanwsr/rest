@@ -1,26 +1,27 @@
 //! Response (Fock and response matrix) implementation for RI-JK, restricted.
 //!
-//! The response object [`RRespRIJK`] holds the minimal state for the fock/response functionality
-//! of the RI-JK electronic-interaction contribution; the hessian object [`RHessRIJK`] composes it
-//! through `Rc<RefCell<...>>` and delegates its [`RRespAPI`] methods to it, so the same response
-//! object can be shared by the hessian driver and (future) other molecular-property drivers.
+//! The response object [`RRespRIJK`] is a standalone object holding the minimal state for the
+//! fock/response functionality of the RI-JK electronic-interaction contribution; it is fully
+//! independent of the skeleton-hessian machinery of `RHessRIJK` (which owns its own copy of the
+//! factors and `cderi`).
 //!
 //! Fock generation routes through the pure in-core functions (`get_vj_ri_incore`,
 //! `get_vk_ri_incore_dm`/`get_vk_ri_incore_coeff`) on the stored `cderi`, instead of any SCF-level
 //! hamiltonian driver. The J/K factors are absorbed into the returned fock tensor, consistent with
-//! how `get_deriv1_bra` and `get_response_bra` apply the factors.
+//! how the hessian-side `get_deriv1_bra` applies the factors.
 
 use super::prelude_dev::*;
 use crate::analdrv::prelude::*;
-use crate::ri_jk::hess_r::{get_rijk_response_bra_separated, RHessRIJK};
+use crate::ri_jk::hess_r::get_rijk_response_bra_separated;
 use crate::ri_jk::pure_incore::{get_vj_ri_incore, get_vk_ri_incore_coeff, get_vk_ri_incore_dm};
 use crate::ri_jk::util::get_dm0_restricted;
 
 /// Response (fock/response matrix) object for RI-JK, restricted.
 ///
 /// This object deliberately holds only what the response contractions need: the Cholesky
-/// decomposed ERI, the J/K factors, and the response intermediates. It does **not** hold
-/// `mol`/`aux`/`j2c_decomp` — those belong to the skeleton-hessian machinery of [`RHessRIJK`].
+/// decomposed ERI, the J/K factors, and the response intermediates. It does **not** need
+/// `mol`/`aux`/`j2c_decomp` — those belong to the skeleton-hessian machinery of the hessian
+/// object.
 ///
 /// Main-thread only (not `Send`/`Sync`).
 pub struct RRespRIJK<'a> {
@@ -143,28 +144,5 @@ impl<'a> RRespAPI for RRespRIJK<'a> {
             resp += self.factor_k * k_bra.view().reshape((nao, nocc, nprop));
         }
         resp.into_shape(shape_bra)
-    }
-}
-
-/// Fock/response delegation from the hessian object to its shared inner response object.
-impl<'a> RRespAPI for RHessRIJK<'a> {
-    fn get_fock_rdm(&mut self, rdm: TsrView) -> Tsr {
-        self.resp.borrow_mut().get_fock_rdm(rdm)
-    }
-
-    fn get_fock_coeff(&mut self, mo_coeff: TsrView, mo_occ: TsrView) -> Tsr {
-        self.resp.borrow_mut().get_fock_coeff(mo_coeff, mo_occ)
-    }
-
-    fn get_response_rdm(&mut self, rdm: TsrView) -> Tsr {
-        self.resp.borrow_mut().get_response_rdm(rdm)
-    }
-
-    fn make_response_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView) {
-        self.resp.borrow_mut().make_response_preparation(mo_coeff, mo_occ)
-    }
-
-    fn get_response_bra(&mut self, bra: TsrView) -> Tsr {
-        self.resp.borrow_mut().get_response_bra(bra)
     }
 }

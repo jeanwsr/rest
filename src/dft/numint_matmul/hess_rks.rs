@@ -32,10 +32,7 @@ use crate::dft::gen_grids::becke_partitioning_deriv::{
     becke_partition_with_tables, gen_adjustment_factor, try_atm_quad_split, AtmIndices, BeckeMolTables,
     BeckePartitionArg,
 };
-use crate::dft::numint_matmul::resp_rks::RRespKSNIMatmul;
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use XCDenType::*;
@@ -1548,17 +1545,19 @@ pub fn get_rks_response_bra_batched(
 pub struct RHessKSNIMatmul<'a> {
     /// Molecule.
     pub mol: CInt,
-    /// Shared response (fock/response) object, owning the XC functional list and both grids; the
-    /// [`RRespAPI`] methods of this hessian object delegate to it. Clone the `Rc` handle to share
-    /// the response object with other (future) molecular-property drivers.
-    pub resp: Rc<RefCell<RRespKSNIMatmul<'a>>>,
+    /// List of `(scale, functional)` pairs of the XC functional.
+    pub xc_func_list: Vec<(f64, LibXCFunctional)>,
+    /// Numerical-integration driver over the (atom-grouped) Hessian grid, built from the same
+    /// grid data as the response object
+    /// [`RRespKSNIMatmul`](crate::dft::numint_matmul::resp_rks::RRespKSNIMatmul) but an
+    /// independent instance.
+    pub ni: NIMatmul<'a>,
     /// Evaluate the Becke grid-shift terms; requires full atom attribution of
     /// the grids.
     pub grid_shift: bool,
     /// Print per-chunk progress of the Hessian setup.
     pub verbose: bool,
-    /// Skeleton-Hessian intermediates: all keys of [`make_hessian_setup_becke`] except `fxc`
-    /// (which is handed to the response object as `cpks_fxc` when the grids are shared).
+    /// Skeleton-Hessian intermediates: all keys of [`make_hessian_setup_becke`].
     pub intmd: HashMap<String, Tsr>,
 }
 
@@ -1579,53 +1578,21 @@ impl<'a> RHessKSNIMatmul<'a> {
         grid_shift: bool,
         verbose: bool,
     ) -> Self {
-        Self {
-            mol: mol.clone(),
-            resp: Rc::new(RefCell::new(RRespKSNIMatmul::new(xc_func_list, ni, verbose))),
-            grid_shift,
-            verbose,
-            intmd: HashMap::new(),
-        }
-    }
-
-    /// Build a hessian object around an existing (shared) response object.
-    pub fn new_with_resp(mol: &CInt, resp: Rc<RefCell<RRespKSNIMatmul<'a>>>, grid_shift: bool, verbose: bool) -> Self {
-        Self { mol: mol.clone(), resp, grid_shift, verbose, intmd: HashMap::new() }
-    }
-
-    /// Attach a dedicated small numerical-integration grid (`ni_resp`) for the response path;
-    /// see [`RRespKSNIMatmul::set_ni_resp`].
-    pub fn set_ni_resp(mut self, ni_resp: NIMatmul<'a>) -> Self {
-        self.resp.borrow_mut().ni_resp = Some(ni_resp);
-        self
+        Self { mol: mol.clone(), xc_func_list, ni, grid_shift, verbose, intmd: HashMap::new() }
     }
 
     /// Perform the Hessian setup for RKS calculations.
     ///
-    /// `fxc` is stored as `cpks_fxc` in the response object (unless a
-    /// response-specific grid is given) for the response; `de_xc_skeleton` and
-    /// `vmat_deriv1_grid` are the main results.
+    /// `de_xc_skeleton` and `vmat_deriv1_grid` are the main results.
     pub fn make_hessian_setup(&mut self, mo_coeff: TsrView, mo_occ: TsrView, atm_list: Option<&[usize]>) {
         // run RKS hessian setup
         let dm0 = get_dm0_restricted(mo_coeff, mo_occ);
-        let (result, _timing) = {
-            let resp = &mut *self.resp.borrow_mut();
-            make_hessian_setup_becke(&self.mol, &resp.xc_func_list, &mut resp.ni, dm0.view(), self.grid_shift, atm_list, self.verbose)
-        };
+        let (result, _timing) =
+            make_hessian_setup_becke(&self.mol, &self.xc_func_list, &mut self.ni, dm0.view(), self.grid_shift, atm_list, self.verbose);
 
         // handling intermediates and results
         for (key, val) in result.into_iter() {
-            if key == "fxc" {
-                // fxc storage is actually for cp-ks.
-                // If `ni_resp` is not specified, then we can use the fxc from the hessian setup
-                // for cp-ks as well.
-                let resp = &mut *self.resp.borrow_mut();
-                if resp.ni_resp.is_none() {
-                    resp.intmd.insert("cpks_fxc".to_string(), val);
-                }
-            } else {
-                self.intmd.insert(key.to_string(), val);
-            }
+            self.intmd.insert(key.to_string(), val);
         }
     }
 

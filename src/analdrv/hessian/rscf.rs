@@ -11,6 +11,10 @@ pub struct RHessSCF<'a> {
     pub nuc_list: Vec<&'a mut dyn HessNucAPI>,
     pub core_list: Vec<&'a mut dyn RHessCoreAPI>,
     pub el_list: Vec<&'a mut dyn RHessElecInteractAPI>,
+    /// Response (fock/response) objects for the electron-interaction contributions; the CP-SCF
+    /// machinery (`make_response_preparation`/`response_mo`) iterates this list, separate from the
+    /// skeleton-hessian objects in `el_list`.
+    pub resp_list: Vec<&'a mut dyn RRespAPI>,
     pub config: AnalDrvConfig,
     pub result: HashMap<String, Tsr>,
     /// Timing information. Represented by wall time in second.
@@ -27,6 +31,7 @@ impl<'a> RHessSCF<'a> {
         nuc_list: Vec<&'a mut dyn HessNucAPI>,
         core_list: Vec<&'a mut dyn RHessCoreAPI>,
         el_list: Vec<&'a mut dyn RHessElecInteractAPI>,
+        resp_list: Vec<&'a mut dyn RRespAPI>,
         config: &AnalDrvConfig,
     ) -> Self {
         Self {
@@ -37,6 +42,7 @@ impl<'a> RHessSCF<'a> {
             nuc_list,
             core_list,
             el_list,
+            resp_list,
             config: config.clone(),
             result: HashMap::new(),
             timing: Vec::new(),
@@ -165,14 +171,14 @@ impl<'a> RHessSCF<'a> {
 
     /// Prepare the response for CP-SCF calculation.
     ///
-    /// This involves all electron-interaction objects.
+    /// This involves all response objects.
     pub fn make_response_preparation(&mut self) {
         let t0 = std::time::Instant::now();
-        for el_obj in self.el_list.iter_mut() {
+        for resp_obj in self.resp_list.iter_mut() {
             let t1 = std::time::Instant::now();
-            el_obj.make_response_preparation(self.mo_coeff.view(), self.mo_occ.view());
+            resp_obj.make_response_preparation(self.mo_coeff.view(), self.mo_occ.view());
             self.timing.push((
-                format!("in make_response_preparation, {}", el_obj.get_type_name()),
+                format!("in make_response_preparation, {}", resp_obj.get_type_name()),
                 t1.elapsed().as_secs_f64(),
             ));
         }
@@ -193,10 +199,10 @@ impl<'a> RHessSCF<'a> {
         let mo_coeff = self.mo_coeff.view();
         let ubra = &mo_coeff % &mo1;
         let mut resp = rt::zeros_like(&mo1);
-        for el_obj in self.el_list.iter_mut() {
+        for resp_obj in self.resp_list.iter_mut() {
             let t1 = std::time::Instant::now();
-            resp += mo_coeff.t() % el_obj.get_response_bra(ubra.view());
-            self.timing.push((format!("in response_mo, {}", el_obj.get_type_name()), t1.elapsed().as_secs_f64()));
+            resp += mo_coeff.t() % resp_obj.get_response_bra(ubra.view());
+            self.timing.push((format!("in response_mo, {}", resp_obj.get_type_name()), t1.elapsed().as_secs_f64()));
         }
         resp
     }

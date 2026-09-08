@@ -23,10 +23,6 @@ use crate::ri_jk::util::*;
 
 use crate::ri_jk::decompose::*;
 use crate::ri_jk::pure_decompose::{get_j2c_decomp, solve_by_j2c, solve_by_j2c_mut};
-use crate::ri_jk::resp_r::RRespRIJK;
-
-use std::cell::RefCell;
-use std::rc::Rc;
 
 /* #region skeleton derivative keys */
 
@@ -1741,12 +1737,11 @@ pub fn generate_cderi_with_decomp(
 pub struct RHessRIJK<'a> {
     pub mol: CInt,
     pub aux: CInt,
-    /// Shared response (fock/response) object; the [`RRespAPI`](crate::analdrv::prelude::RRespAPI)
-    /// methods of this hessian object delegate to it. Clone the `Rc` handle to share the response
-    /// object with other (future) molecular-property drivers.
-    pub resp: Rc<RefCell<RRespRIJK<'a>>>,
+    pub factor_j: f64,
+    pub factor_k: f64,
+    pub cderi: TsrCow<'a>,
     pub j2c_decomp: J2CDecompose,
-    pub intmd: HashMap<String, Tsr>, // skeleton intermediates
+    pub intmd: HashMap<String, Tsr>, // intermediates
     pub result: HashMap<&'static str, Tsr>,
     pub timing: Vec<(String, f64)>,
     pub is_skeleton_ready: bool,
@@ -1763,7 +1758,9 @@ impl<'a> RHessRIJK<'a> {
         Self {
             mol: mol.clone(),
             aux: aux.clone(),
-            resp: Rc::new(RefCell::new(RRespRIJK::new_with_cderi(factor_j, factor_k, cderi.into_cow()))),
+            factor_j,
+            factor_k,
+            cderi: cderi.into_cow(),
             j2c_decomp,
             intmd: HashMap::new(),
             result: HashMap::new(),
@@ -1783,21 +1780,9 @@ impl<'a> RHessRIJK<'a> {
         Self {
             mol: mol.clone(),
             aux: aux.clone(),
-            resp: Rc::new(RefCell::new(RRespRIJK::new_with_cderi(factor_j, factor_k, cderi))),
-            j2c_decomp,
-            intmd: HashMap::new(),
-            result: HashMap::new(),
-            timing: Vec::new(),
-            is_skeleton_ready: false,
-        }
-    }
-
-    /// Build a hessian object around an existing (shared) response object.
-    pub fn new_with_resp(mol: &CInt, aux: &CInt, resp: Rc<RefCell<RRespRIJK<'a>>>, j2c_decomp: J2CDecompose) -> Self {
-        Self {
-            mol: mol.clone(),
-            aux: aux.clone(),
-            resp,
+            factor_j,
+            factor_k,
+            cderi: cderi.into_cow(),
             j2c_decomp,
             intmd: HashMap::new(),
             result: HashMap::new(),
@@ -1810,22 +1795,19 @@ impl<'a> RHessRIJK<'a> {
         if self.is_skeleton_ready {
             return;
         }
-        let (j_out, k_outs, timing) = {
-            let resp = self.resp.borrow();
-            get_rijk_skeleton_decomposed_separated(
-                &self.mol,
-                &self.aux,
-                &[mo_coeff],
-                &[mo_occ],
-                resp.cderi.view(),
-                &self.j2c_decomp,
-                resp.factor_j != 0.0,
-                resp.factor_k != 0.0,
-                72, // TODO: batch size `72` should be tunable by max-memory.
-                atm_list,
-                None,
-            )
-        };
+        let (j_out, k_outs, timing) = get_rijk_skeleton_decomposed_separated(
+            &self.mol,
+            &self.aux,
+            &[mo_coeff],
+            &[mo_occ],
+            self.cderi.view(),
+            &self.j2c_decomp,
+            self.factor_j != 0.0,
+            self.factor_k != 0.0,
+            72, // TODO: batch size `72` should be tunable by max-memory.
+            atm_list,
+            None,
+        );
         self.timing.extend(timing);
 
         if let Some(j_out) = j_out {
@@ -1852,25 +1834,24 @@ impl<'a> RHessElecInteractAPI for RHessRIJK<'a> {
     fn make_skeleton_hess(&mut self, mo_coeff: TsrView, mo_occ: TsrView, atm_list: Option<&[usize]>) -> Tsr {
         self.ensure_skeleton(mo_coeff, mo_occ, atm_list);
         let intmd = &self.intmd;
-        let resp = self.resp.borrow();
 
-        let device = resp.cderi.device();
+        let device = self.cderi.device();
         let natm = atm_list.map_or_else(|| self.mol.natm(), |list| list.len());
         let hess_init = || -> Tsr { rt::zeros(([3, 3, natm, natm], device)) };
 
         let mut de = hess_init();
-        if resp.factor_j != 0.0 {
+        if self.factor_j != 0.0 {
             let de_J20 = KEYS_J20.iter().map(|&key| &intmd[key]).fold(hess_init(), |acc, x| acc + x);
             let de_J11 = KEYS_J11.iter().map(|&key| &intmd[key]).fold(hess_init(), |acc, x| acc + x);
             let de_J02 = KEYS_J02.iter().map(|&key| &intmd[key]).fold(hess_init(), |acc, x| acc + x);
             let de_J = &de_J20 + &de_J11 + &de_J02;
-            de += resp.factor_j * &de_J;
+            de += self.factor_j * &de_J;
             self.result.insert("de_J20", de_J20);
             self.result.insert("de_J11", de_J11);
             self.result.insert("de_J02", de_J02);
             self.result.insert("de_J", de_J);
         }
-        if resp.factor_k != 0.0 {
+        if self.factor_k != 0.0 {
             // rhf only have one spin
             let de_K20 =
                 KEYS_K20.iter().map(|&key| &intmd[&format!("{key}<spin_0>")]).fold(hess_init(), |acc, x| acc + x);
@@ -1879,7 +1860,7 @@ impl<'a> RHessElecInteractAPI for RHessRIJK<'a> {
             let de_K02 =
                 KEYS_K02.iter().map(|&key| &intmd[&format!("{key}<spin_0>")]).fold(hess_init(), |acc, x| acc + x);
             let de_K = &de_K20 + &de_K11 + &de_K02;
-            de -= 0.5 * resp.factor_k * &de_K;
+            de -= 0.5 * self.factor_k * &de_K;
             self.result.insert("de_K20", de_K20);
             self.result.insert("de_K11", de_K11);
             self.result.insert("de_K02", de_K02);
@@ -1896,9 +1877,8 @@ impl<'a> RHessElecInteractAPI for RHessRIJK<'a> {
     fn get_deriv1_bra(&mut self, mo_coeff: TsrView, mo_occ: TsrView, atm_list: Option<&[usize]>) -> Tsr {
         self.ensure_skeleton(mo_coeff.view(), mo_occ.view(), atm_list);
         let intmd = &self.intmd;
-        let resp = self.resp.borrow();
 
-        let device = resp.cderi.device();
+        let device = self.cderi.device();
         let natm = atm_list.map_or_else(|| self.mol.natm(), |list| list.len());
         let nao = mo_coeff.shape()[0];
         let occidx = mo_occ.greater(0.0).into_vec();
@@ -1909,17 +1889,17 @@ impl<'a> RHessElecInteractAPI for RHessRIJK<'a> {
         let deriv1_bra_init = || -> Tsr { rt::zeros(([nao, nocc, 3, natm], device)) };
 
         let mut deriv1_bra = deriv1_bra_init();
-        if resp.factor_j != 0.0 {
+        if self.factor_j != 0.0 {
             let j1ao = KEYS_J1AO.iter().map(|&key| &intmd[key]).fold(deriv1_ao_init(), |acc, x| acc + x);
-            deriv1_bra += resp.factor_j * (&j1ao % &mocc);
+            deriv1_bra += self.factor_j * (&j1ao % &mocc);
             self.result.insert("j1ao", j1ao);
         }
-        if resp.factor_k != 0.0 {
+        if self.factor_k != 0.0 {
             let k1bra = KEYS_K1BRA
                 .iter()
                 .map(|&key| &intmd[&format!("{key}<spin_0>")])
                 .fold(deriv1_bra_init(), |acc, x| acc + x);
-            deriv1_bra -= 0.5 * resp.factor_k * &k1bra;
+            deriv1_bra -= 0.5 * self.factor_k * &k1bra;
             self.result.insert("k1bra", k1bra);
         }
         self.result.insert("deriv1_bra", deriv1_bra.clone());
