@@ -1,7 +1,8 @@
 use pyrest::molecule_io::Molecule;
+use pyrest::ri_jk::get_ao2mo_s2ij_to_s1_notrans;
 use pyrest::ri_jk::util::get_cint_mol;
 use pyrest::scf_io::{self, scf_without_build};
-use pyrest::utilities::rstsr_util::RestTensorToRstsrTsrAPI;
+use pyrest::utilities::rstsr_util::{RestTensorToRstsrTsrAPI, RestTensorToRstsrViewAPI};
 use pyrest::{ctrl_io, ri_pt2};
 use rstsr::prelude::*;
 
@@ -57,7 +58,7 @@ fn test_nh3() {
     assert!(rt::allclose(&dip_nuc, &dip_nuc_ref, None));
 
     // 2. scf density contribution
-    let dm = scf_data.density_matrix[0].to_rstsr(&device);
+    let dm = scf_data.density_matrix[0].to_rstsr_view(&device);
     let mol = get_cint_mol(&scf_data.mol);
     let int1e_r = {
         let (out, shape) = mol.integrate("int1e_r", None, None).into();
@@ -67,6 +68,46 @@ fn test_nh3() {
     println!("Dipole from SCF density matrix: {:16.12}", dip_dm_scf);
     let dip_dm_scf_ref = rt::asarray((vec![-1.138682776261, -1.343280625287, -1.559934460339], &device));
     assert!(rt::allclose(&dip_dm_scf, &dip_dm_scf_ref, None));
+
+    // after 2. pt2 preparation
+    let j3c = scf_data.rimatr.as_ref().unwrap().0.to_rstsr_view(&device);
+    println!("j3c shape: {:?}", j3c.shape());
+    let mo_energy = (&scf_data.eigenvalues[0]).to_rstsr(&device);
+    let mo_coeff = (&scf_data.eigenvectors[0]).to_rstsr(&device);
+
+    let idx_core = scf_data.mol.start_mo;
+    let idx_lumo = scf_data.lumo[0];
+    let num_mo = mo_energy.size();
+    let occ_list: Vec<usize> = (idx_core..idx_lumo).collect();
+    let vir_list: Vec<usize> = (idx_lumo..num_mo).collect();
+
+    let occ_energy = mo_energy.index_select(-1, &occ_list).into_contig(ColMajor);
+    let vir_energy = mo_energy.index_select(-1, &vir_list).into_contig(ColMajor);
+    let occ_coeff = mo_coeff.index_select(-1, &occ_list).into_contig(ColMajor);
+    let vir_coeff = mo_coeff.index_select(-1, &vir_list).into_contig(ColMajor);
+    let cderi_vox = {
+        let mut cderi_vox_lst =
+            get_ao2mo_s2ij_to_s1_notrans(j3c.view(), Upper, &[vir_coeff.view()], &[occ_coeff.view()], |x| x);
+        cderi_vox_lst.remove(0)
+    };
+    println!("cderi_vox shape: {:?}", cderi_vox.shape());
+
+    use pyrest::ri_pt2::pure_pt2_r_elecderiv::*;
+    let input = RPT2ElecDerivIncoreInp {
+        cderi: j3c,
+        // cderi_vox: Some(cderi_vox.view()),
+        cderi_vox: None,
+        occ_coeff: occ_coeff.view(),
+        vir_coeff: vir_coeff.view(),
+        occ_energy: occ_energy.view(),
+        vir_energy: vir_energy.view(),
+        index_occ_outer_vec: &[0, 2, 5],
+    };
+    let arg = RPT2ElecDerivIncoreArg { c_os: 1.0, c_ss: 1.0 };
+    let output = get_rpt2_elec_deriv_incore(&input, &arg, |x| x);
+    println!("MP2 correlation energy: {}", output.e_corr);
+    let e_corr_ref = -0.245426806393;
+    assert!((output.e_corr - e_corr_ref).abs() < 1e-6, "MP2 correlation energy mismatch");
 }
 
 // --- following is utilities for developing dipole evaluation --- //

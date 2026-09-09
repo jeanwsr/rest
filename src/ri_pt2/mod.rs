@@ -41,7 +41,7 @@ pub mod sbge2_25d;
 pub mod pure_pt2_pair_eng;
 pub mod pt2_pair_eng;
 
-pub mod pure_pt2_rgfock;
+pub mod pure_pt2_r_elecderiv;
 pub mod pt2_rgfock;
 
 #[derive(Clone)]
