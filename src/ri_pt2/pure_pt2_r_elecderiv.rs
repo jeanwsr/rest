@@ -36,8 +36,12 @@ pub struct RPT2ElecDerivIncoreArg {
 }
 
 pub struct RPT2ElecDerivIncoreOut {
+    /// MP2 correlation energy. This is side product from property evaluation.
     pub e_corr: f64,
-    pub gfock: Tsr<f64>,
+    /// **Partial** generalized Fock matrix contribution. Shape `(nmo, nmo)`.
+    /// Note this lacks SCF response upon rdm1_corr contribution.
+    pub gfock_part: Tsr<f64>,
+    /// 1-RDM in MO basis (correlation contribution, unrelaxed). Shape `(nmo, nmo)`.
     pub rdm1_corr: Tsr<f64>,
 }
 
@@ -86,7 +90,7 @@ where
     // --- output --- //
 
     let eng_corr_double: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
-    let mut gfock = rt::zeros(([nmo, nmo].f(), &device));
+    let mut gfock_part = rt::zeros(([nmo, nmo].f(), &device));
     let mut rdm1_corr = rt::zeros(([nmo, nmo].f(), &device));
 
     // --- buffer allocation --- //
@@ -97,10 +101,12 @@ where
     let buf_t3_pool = BufferPool::new(init_buf_t);
 
     // 0th tensors
-    let mut t_vivo: Tsr<O, Ix4> = rt::zeros(([nvir, nstep_occ_max, nvir, nocc].f(), &device)).into_dim();
-    let mut T_vivo: Tsr<O, Ix4> = rt::zeros(([nvir, nstep_occ_max, nvir, nocc].f(), &device)).into_dim();
+    let mut t_vivo: Tsr<O> = rt::zeros(([nvir, nstep_occ_max, nvir, nocc].f(), &device));
+    let mut T_vivo: Tsr<O> = rt::zeros(([nvir, nstep_occ_max, nvir, nocc].f(), &device));
+    let mut G_vix: Tsr<O> = rt::zeros(([nvir, nstep_occ_max, naux].f(), &device));
 
     // --- initiate necessary tensors --- //
+
     let d_vv_outer = -vir_energy.i((.., None)) - vir_energy.i((None, ..));
     let d_vv_outer = d_vv_outer.into_dim::<Ix2>();
 
@@ -120,6 +126,7 @@ where
         let nstep_occ = io_slice[1] - io_slice[0];
         let mut t_vivo = rt::asarray((t_vivo.raw_mut(), [nvir, nstep_occ, nvir, nocc].f(), &device));
         let mut T_vivo = rt::asarray((T_vivo.raw_mut(), [nvir, nstep_occ, nvir, nocc].f(), &device));
+        let mut G_vix = rt::asarray((G_vix.raw_mut(), [nvir, nstep_occ, naux].f(), &device));
 
         // generate (i, j) pairs
         let mut pair_ij = Vec::new();
@@ -198,12 +205,22 @@ where
 
         // --- block-3 --- //
 
+        // D[oo] = t[viv,o]' % T[viv,o]
         let scr = t_vivo.reshape((-1, nocc)).t() % T_vivo.reshape((-1, nocc));
         *&mut rdm1_corr.i_mut((so, so)) -= 2.0 * scr.mapv(|x| x.to_f64().unwrap());
+        // D[vv] = t[v,ivo] % T[v,ivo]'
         let scr = t_vivo.reshape((nvir, -1)) % T_vivo.reshape((nvir, -1)).t();
         *&mut rdm1_corr.i_mut((sv, sv)) += 2.0 * scr.mapv(|x| x.to_f64().unwrap());
+        // G[vi,x] = T[vi,vo] % cderi[vo,x]
+        let mut scr_G_vix = rt::asarray((G_vix.raw_mut(), [nvir * nstep_occ, naux].f(), &device));
+        scr_G_vix.matmul_from(
+            T_vivo.reshape((nvir * nstep_occ, nvir * nocc)),
+            cderi_vox.reshape((nvir * nocc, naux)),
+            VAL_1,
+            VAL_0,
+        );
     }
 
     let e_corr = *eng_corr_double.lock().unwrap();
-    RPT2ElecDerivIncoreOut { e_corr, gfock, rdm1_corr }
+    RPT2ElecDerivIncoreOut { e_corr, gfock_part, rdm1_corr }
 }
