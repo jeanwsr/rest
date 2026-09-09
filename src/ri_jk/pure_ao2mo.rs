@@ -49,7 +49,7 @@ pub fn get_ao2mo_s2ij_to_s1_notrans_with_output<T, O>(
     // - output_flat: output mutables reshaped to (ni, na, np)
     // - ns: minimum of ni and na among all sets, used for scratch size
     let mut output_flat = vec![];
-    let mut ns = usize::MAX;
+    let mut ns = 1;
     for iset in 0..nset {
         let ni = bra[iset].shape()[1];
         let na = ket[iset].shape()[1];
@@ -75,7 +75,7 @@ pub fn get_ao2mo_s2ij_to_s1_notrans_with_output<T, O>(
     // check if type T is the same to O; if so, create a scratch buffer
     let scratch_out_pool = BufferPool::new(|| unsafe { uninitialized_vec(ns * ns).unwrap() });
 
-    (0..np).into_par_iter().for_each(|p| {
+    (0..np).into_iter().for_each(|p| {
         let j3c_p = j3c.i((.., p)).unpack_tri(uplo, FlagSymm::He);
         for iset in 0..nset {
             let ni = bra[iset].shape()[1];
