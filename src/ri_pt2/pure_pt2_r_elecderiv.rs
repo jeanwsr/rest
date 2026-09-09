@@ -50,8 +50,9 @@ where
     T: BlasFloat + ToPrimitive + FromPrimitive + 'static,
     O: BlasFloat + ToPrimitive + FromPrimitive + 'static,
 {
-    let VAL_1 = O::one();
-    let VAL_0 = O::zero();
+    let VAL_0 = O::from_f64(0.0).unwrap();
+    let VAL_1 = O::from_f64(1.0).unwrap();
+    let VAL_2 = O::from_f64(2.0).unwrap();
 
     // --- input --- //
 
@@ -78,12 +79,15 @@ where
     assert!(index_occ_outer_vec.is_sorted(), "index_occ_outer_vec must be sorted");
 
     let nstep_occ_max = index_occ_outer_vec.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+    let nmo = nocc + nvir;
+    let so = rt::slice!(0, nocc);
+    let sv = rt::slice!(nocc, nmo);
 
     // --- output --- //
 
     let eng_corr_double: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
-    let gfock = rt::zeros(([nao, nao].f(), &device));
-    let rdm1_corr = rt::zeros(([nao, nao].f(), &device));
+    let mut gfock = rt::zeros(([nmo, nmo].f(), &device));
+    let mut rdm1_corr = rt::zeros(([nmo, nmo].f(), &device));
 
     // --- buffer allocation --- //
 
@@ -93,8 +97,8 @@ where
     let buf_t3_pool = BufferPool::new(init_buf_t);
 
     // 0th tensors
-    let t_vivo: Tsr<O, Ix4> = rt::zeros(([nvir, nstep_occ_max, nvir, nocc].f(), &device)).into_dim();
-    let T_vivo: Tsr<O, Ix4> = rt::zeros(([nvir, nstep_occ_max, nvir, nocc].f(), &device)).into_dim();
+    let mut t_vivo: Tsr<O, Ix4> = rt::zeros(([nvir, nstep_occ_max, nvir, nocc].f(), &device)).into_dim();
+    let mut T_vivo: Tsr<O, Ix4> = rt::zeros(([nvir, nstep_occ_max, nvir, nocc].f(), &device)).into_dim();
 
     // --- initiate necessary tensors --- //
     let d_vv_outer = -vir_energy.i((.., None)) - vir_energy.i((None, ..));
@@ -114,6 +118,9 @@ where
 
     for io_slice in index_occ_outer_vec.windows(2) {
         let nstep_occ = io_slice[1] - io_slice[0];
+        let mut t_vivo = rt::asarray((t_vivo.raw_mut(), [nvir, nstep_occ, nvir, nocc].f(), &device));
+        let mut T_vivo = rt::asarray((T_vivo.raw_mut(), [nvir, nstep_occ, nvir, nocc].f(), &device));
+
         // generate (i, j) pairs
         let mut pair_ij = Vec::new();
 
@@ -140,7 +147,7 @@ where
             // t_vv /= d_vv
             // T_vv = (2 * c_os) * t_vv - c_ss * t_vv.t()
             let d_ij = occ_energy[[i]] + occ_energy[[j]];
-            t_vv.matmul_from(cderi_vox.i((.., j, ..)), cderi_vox.i((.., i, ..)).t(), VAL_1, VAL_0);
+            t_vv.matmul_from(cderi_vox.i((.., i, ..)), cderi_vox.i((.., j, ..)).t(), VAL_1, VAL_0);
             for a in 0..nvir {
                 // diagonal part
                 let d_aa_inv = cast(d_ij + d_vv_outer[[a, a]]).recip();
@@ -173,9 +180,28 @@ where
             let diag_scale = if i == j { 1.0 } else { 2.0 };
             *eng_corr_double.lock().unwrap() += diag_scale * eng_corr_ij;
 
+            // assign to t_vivo, T_vivo
+            let mut t_vivo = unsafe { t_vivo.force_mut() };
+            let mut T_vivo = unsafe { T_vivo.force_mut() };
+            let i_ = i - io_slice[0];
+            t_vivo.i_mut((.., i_, .., j)).assign(&t_vv);
+            T_vivo.i_mut((.., i_, .., j)).assign(&T_vv);
+            if (io_slice[0] <= j) && (j < i) {
+                let j_ = j - io_slice[0];
+                t_vivo.i_mut((.., j_, .., i)).assign(t_vv.t());
+                T_vivo.i_mut((.., j_, .., i)).assign(T_vv.t());
+            }
+
             buf_t1_pool.put(buf_t1);
             buf_t2_pool.put(buf_t2);
         });
+
+        // --- block-3 --- //
+
+        let scr = t_vivo.reshape((-1, nocc)).t() % T_vivo.reshape((-1, nocc));
+        *&mut rdm1_corr.i_mut((so, so)) -= 2.0 * scr.mapv(|x| x.to_f64().unwrap());
+        let scr = t_vivo.reshape((nvir, -1)) % T_vivo.reshape((nvir, -1)).t();
+        *&mut rdm1_corr.i_mut((sv, sv)) += 2.0 * scr.mapv(|x| x.to_f64().unwrap());
     }
 
     let e_corr = *eng_corr_double.lock().unwrap();

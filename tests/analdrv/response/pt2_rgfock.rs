@@ -64,7 +64,7 @@ fn test_nh3() {
         let (out, shape) = mol.integrate("int1e_r", None, None).into();
         rt::asarray((out, shape, &device))
     };
-    let dip_dm_scf = -(int1e_r * dm).sum_axes([0, 1]);
+    let dip_dm_scf = -(&int1e_r * &dm).sum_axes([0, 1]);
     println!("Dipole from SCF density matrix: {:16.12}", dip_dm_scf);
     let dip_dm_scf_ref = rt::asarray((vec![-1.138682776261, -1.343280625287, -1.559934460339], &device));
     assert!(rt::allclose(&dip_dm_scf, &dip_dm_scf_ref, None));
@@ -108,6 +108,12 @@ fn test_nh3() {
     println!("MP2 correlation energy: {}", output.e_corr);
     let e_corr_ref = -0.245426806393;
     assert!((output.e_corr - e_corr_ref).abs() < 1e-6, "MP2 correlation energy mismatch");
+
+    let rdm1_corr_ao = mo_coeff.view() % output.rdm1_corr.view() % mo_coeff.view().t();
+    let dip_rdm1_corr = -(&int1e_r * &rdm1_corr_ao).sum_axes([0, 1]);
+    println!("Dipole from PT2 density matrix: {:16.12}", dip_rdm1_corr);
+    let dip_rdm1_corr_ref = rt::asarray((vec![-0.002351686599, -0.003862564554, -0.005077785238], &device));
+    assert!(rt::allclose(&dip_rdm1_corr, &dip_rdm1_corr_ref, None));
 }
 
 // --- following is utilities for developing dipole evaluation --- //
