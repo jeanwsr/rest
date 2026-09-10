@@ -7,7 +7,8 @@ use pyrest::analdrv::config::{AnalDrvConfig, AnalDrvNucgradCfg, AnalDrvRespCfg};
 use pyrest::analdrv::hessian::rscf_interface::rscf_hess_interface;
 
 use pyrest::ctrl_io;
-use pyrest::dft::numint_matmul::hess_rks::{get_hess_ncomp_ao_dm0, get_rho_exc_vxc_fxc, make_cpks_vxc_fxc};
+use pyrest::dft::numint_matmul::hess_rks::{get_hess_ncomp_ao_dm0, get_rho_exc_vxc_fxc};
+use pyrest::dft::numint_matmul::resp_rks::make_cpks_vxc_fxc;
 use pyrest::dft::numint_matmul::nimatmul::NIMatmul;
 use pyrest::dft::xceff::prelude::determine_den_type_from_list;
 use pyrest::molecule_io::Molecule;

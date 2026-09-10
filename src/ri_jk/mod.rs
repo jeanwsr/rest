@@ -36,6 +36,9 @@ pub mod hess_u;
 // response implementations
 pub mod resp_r;
 
+// generalized fock implementations
+pub mod gfock_r;
+
 // exports
 pub use ao2mo::*;
 pub use decompose::*;

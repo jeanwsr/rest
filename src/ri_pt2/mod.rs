@@ -42,7 +42,7 @@ pub mod pure_pt2_pair_eng;
 pub mod pt2_pair_eng;
 
 pub mod pure_pt2_r_elecderiv;
-pub mod pt2_rgfock;
+pub mod rgfock_pt2;
 
 #[derive(Clone)]
 pub struct PT2 {

@@ -83,13 +83,17 @@ pub struct RRespSCF<'a> {
 }
 
 /// Orbital state cached by [`RRespSCF::make_cpscf_preparation`] for the inherent CP-SCF
-/// machinery.
-struct RCpscfState {
-    mo_coeff: Tsr,
+/// machinery, and reused by drivers upon it (e.g. the Z-vector solve of
+/// [`crate::analdrv::response::rgfock_interface::solve_z_vector`]).
+pub struct RCpscfState {
+    /// Molecular orbital coefficients, shape `[nao, nmo]`.
+    pub mo_coeff: Tsr,
     /// Level-shifted orbital-energy differences `e_a - e_i + shift`, shape `[nvir, nocc]`.
-    e_ai_shift: Tsr,
-    nocc: usize,
-    nmo: usize,
+    pub e_ai_shift: Tsr,
+    /// Number of occupied orbitals.
+    pub nocc: usize,
+    /// Total number of molecular orbitals.
+    pub nmo: usize,
 }
 
 impl<'a> AnalDrvBaseAPI for RRespSCF<'a> {}
@@ -171,6 +175,17 @@ impl<'a> RRespSCF<'a> {
             nocc: occidx.iter().filter(|&&x| x).count(),
             nmo: mo_occ.shape()[0],
         });
+    }
+
+    /// The CP-SCF orbital state cached by [`Self::make_cpscf_preparation`], for reuse by drivers
+    /// building on the CP-SCF machinery (e.g. Z-vector solves). Panics before the preparation.
+    ///
+    /// Note the inherent CP-SCF methods of this type access the state as a direct field, keeping
+    /// the borrow disjoint from `resp_list`; external callers use this accessor.
+    pub fn cpscf_state(&self) -> &RCpscfState {
+        self.cpscf_state
+            .as_ref()
+            .expect("Call `RRespSCF::make_cpscf_preparation` before the CP-SCF machinery.")
     }
 
     /// Compute the response in MO space to a perturbation in MO space.

@@ -17,7 +17,7 @@
 //!   ``0.5`` factor), again matching the naive UHF convention.
 //!
 //! The response (`get_response_bra`) reuses the separated J/K response core
-//! [`crate::ri_jk::hess_r::get_rijk_response_bra_separated`] shared with RHF: J is produced once
+//! [`crate::ri_jk::resp_r::get_rijk_response_bra_separated`] shared with RHF: J is produced once
 //! in AO form from the total density response and right half-transformed per spin; K is produced
 //! per spin in bra form (same-spin only).
 
@@ -27,9 +27,10 @@ use crate::ri_jk::util::*;
 
 use crate::ri_jk::decompose::*;
 use crate::ri_jk::hess_r::{
-    generate_cderi_with_decomp, get_rijk_response_bra_separated, get_rijk_skeleton_decomposed_separated, KEYS_J02,
-    KEYS_J11, KEYS_J1AO, KEYS_J20, KEYS_K02, KEYS_K11, KEYS_K1BRA, KEYS_K20,
+    generate_cderi_with_decomp, get_rijk_skeleton_decomposed_separated, KEYS_J02, KEYS_J11, KEYS_J1AO, KEYS_J20,
+    KEYS_K02, KEYS_K11, KEYS_K1BRA, KEYS_K20,
 };
+use crate::ri_jk::resp_r::get_rijk_response_bra_separated;
 
 /* #region impl */
 

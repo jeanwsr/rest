@@ -28,7 +28,7 @@ use crate::scf_io::SCF;
 use crate::dft::num_int::FXCMatvecData;
 use crate::dft::Grids;
 use crate::dft::numint_matmul::nimatmul::NIMatmul;
-use crate::dft::numint_matmul::hess_rks::eval_vxc_fxc_from_rho;
+use crate::dft::numint_matmul::resp_rks::eval_vxc_fxc_from_rho;
 use crate::dft::xceff::prelude::{XCDenType, XCSpin};
 use crate::ri_jk::util::get_cint_mol;
 use crate::ri_tddft::tddft::FxcDriver;

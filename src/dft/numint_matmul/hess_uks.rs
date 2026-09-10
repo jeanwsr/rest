@@ -168,7 +168,7 @@ pub fn eval_vxc_fxc_uks_from_rho(xc_func_list: &[(f64, LibXCFunctional)], rho: T
 
 /// Lean evaluation of only `vxc` and `fxc` on a given grid, for use as the CP-KS `cpks_vxc` /
 /// `cpks_fxc` when a dedicated (coarser) CP-KS grid is attached (UKS counterpart of
-/// [`make_cpks_vxc_fxc`](super::hess_rks::make_cpks_vxc_fxc)).
+/// [`make_cpks_vxc_fxc`](super::resp_rks::make_cpks_vxc_fxc)).
 ///
 /// Skips all skeleton-Hessian intermediates, evaluates AO at the minimum derivative order needed
 /// to form the spin densities (`xc_type.num_ao_deriv()`), and forms each spin density `rhoσ`

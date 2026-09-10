@@ -3,6 +3,7 @@
 //! Though saying "naive", it should be sufficiently good for dense GTO grids - basis pairs (small systems).
 //! For large molecules, we do not exploit sparsity here for code simplicity.
 
+pub mod gfock_rks;
 pub mod hess_rks;
 pub mod hess_uks;
 pub mod nimatmul;

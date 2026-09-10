@@ -57,6 +57,11 @@ pub enum GFockParts {
 /// We note that [`Self::make_gfock`] and [`Self::make_lagrangian`] may optionally requires a
 /// response object that implements `RRespAPI`. But for [`Self::make_rdm1`], we have not decided if
 /// it requires a response object (MP2 does not require this object).
+///
+/// The trait methods take the response object as `Option<&mut dyn RRespAPI>` (and the parts as
+/// concrete `BitFlags`), so that the trait is object-safe and contribution objects can be composed
+/// into drivers as `Box<dyn RGFockAPI>`; the mutable reference allows response contractions (which
+/// cache intermediates) through the trait.
 pub trait RGFockAPI: AnalDrvBaseAPI {
     /// Make generalized Fock matrix in molecular orbital basis.
     ///
@@ -69,18 +74,18 @@ pub trait RGFockAPI: AnalDrvBaseAPI {
     ///
     /// # Parameters
     ///
-    /// - `parts` : Bit-flags of `GFockParts` to specify which parts of the generalized Fock matrix
-    ///   to compute.
-    /// - `resp` : The response object that implements `RRespAPI`. The response object should
+    /// - `resp` : The response object that implements `RRespAPI`, mutably. The response object should
     ///   represent the SCF method that gives the molecular orbitals. This is optional depending on
     ///   the implementation of the generalized Fock matrix. For example, for MP2, the response
     ///   object is not needed when handling Fia (OV) and Fab (VV), but required for other cases.
+    /// - `parts` : Bit-flags of `GFockParts` to specify which parts of the generalized Fock matrix
+    ///   to compute.
     ///
     /// # Returns
     ///
     /// - `gfock` : shape (nmo, nmo). Generalized Fock matrix in molecular orbital basis. Depending
     ///   on the `parts` specified, some parts of the matrix may be zero.
-    fn make_gfock(&mut self, resp: Option<&impl RRespAPI>, parts: impl Into<BitFlags<GFockParts>>) -> Tsr;
+    fn make_gfock(&mut self, resp: Option<&mut dyn RRespAPI>, parts: BitFlags<GFockParts>) -> Tsr;
 
     /// Make reduced one-particle density matrix (rdm1) in molecular orbital basis.
     ///
@@ -103,7 +108,10 @@ pub trait RGFockAPI: AnalDrvBaseAPI {
     /// - `lagrangian` : shape (nvir, nocc). Lagrangian matrix in molecular orbital basis. Note the
     ///   `nvir` and `nocc` are the number of virtual and occupied orbitals: they are derived from
     ///   the struct internal data, not checked from the input parameters.
+    ///
+    /// # Parameters
+    ///
     /// - `resp` : The response object that implements `RRespAPI`. See [`Self::make_gfock`] for more
     ///   details.
-    fn make_lagrangian(&mut self, resp: Option<&impl RRespAPI>) -> Tsr;
+    fn make_lagrangian(&mut self, resp: Option<&mut dyn RRespAPI>) -> Tsr;
 }

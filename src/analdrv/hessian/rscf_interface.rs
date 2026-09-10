@@ -1,5 +1,5 @@
 use crate::analdrv::prelude::*;
-use crate::analdrv::response::rscf_interface::{rscf_resp_interface, scf_jk_factors, scf_xc_func_list};
+use crate::analdrv::response::rresp_interface::{rscf_resp_interface, scf_jk_factors, scf_xc_func_list};
 use crate::analdrv::vibration::vib::*;
 use crate::analdrv::vibration::vib_interface::*;
 use crate::dft::numint_matmul::nimatmul::{regroup_grids_by_atom, NIMatmul};

@@ -9,12 +9,153 @@
 //! `get_vk_ri_incore_dm`/`get_vk_ri_incore_coeff`) on the stored `cderi`, instead of any SCF-level
 //! hamiltonian driver. The J/K factors are absorbed into the returned fock tensor, consistent with
 //! how the hessian-side `get_deriv1_bra` applies the factors.
+//!
+//! The response-bra core [`get_rijk_response_bra_separated`] (shared by the RHF response object
+//! and the UHF hessian's response path) also lives in this module.
 
 use super::prelude_dev::*;
 use crate::analdrv::prelude::*;
-use crate::ri_jk::hess_r::get_rijk_response_bra_separated;
+use crate::grad::rhf::pack_triu_tilde;
 use crate::ri_jk::pure_incore::{get_vj_ri_incore, get_vk_ri_incore_coeff, get_vk_ri_incore_dm};
 use crate::ri_jk::util::get_dm0_restricted;
+
+/* #region response */
+
+/// Separated J/K response-bra core, shared by RHF and UHF.
+///
+/// # Shapes
+///
+/// - `cderi`: `[nao_tp, naux]`
+/// - `mo_coeff[s]`: `[nao, nmo_s]`, `mo_occ[s]`: `[nmo_s]`, `bra[s]`: `[nao, nocc_s, ...]` (the
+///   trailing dimensions, collectively `nprop`, must agree across spins)
+///
+/// # Returns
+///
+/// A tuple `(j_ao, k_bras)`:
+/// - `j_ao`: `Option<Tsr>` of shape `[nao, nao, nprop]` — the **spin-independent** Coulomb response
+///   operator in AO basis, built from the total density response `sum_s bra_s @ mocc_s.T` (already
+///   carrying the internal factor `2.0` from the symmetric cderi contraction; the consumer applies
+///   `factor_j` and the per-spin right half-transform `... @ mocc_s`). `None` if `do_j` is false.
+/// - `k_bras`: `Vec<Tsr>` (one entry per spin) of shape `[nao, nocc_s, nprop]` — the same-spin
+///   exchange response in bra form (already carrying its internal sign/scale; the consumer applies
+///   `factor_k`). Empty if `do_k` is false.
+///
+/// # Convention notes
+///
+/// - J sees the **total** density response, so a single AO operator is produced and shared across
+///   spins; this is why UHF can reuse the RHF J path verbatim.
+/// - K is strictly same-spin; each spin's bra form is produced independently.
+/// - The internal factors (`2.0` on J, the two-term symmetrized sum on K) match the existing RHF
+///   optimized response; the per-method `factor_j` / `factor_k` and the RHF `0.5` vs UHF `1.0`
+///   exchange prefactor are applied by the consumer, not here.
+#[allow(clippy::too_many_arguments)]
+pub fn get_rijk_response_bra_separated(
+    cderi: TsrView,
+    mo_coeff: &[TsrView],
+    mo_occ: &[TsrView],
+    bra: &[TsrView],
+    do_j: bool,
+    do_k: bool,
+    nbatch_aux: usize,
+) -> (Option<Tsr>, Vec<Tsr>) {
+    // notes on shape
+    // - cderi: [nao_tp, naux]
+    // - mo_coeff[s]: [nao, nmo_s]
+    // - mo_occ[s]: [nmo_s]
+    // - bra[s]: [nao, nocc_s, ...]  (trailing dims collectively `nprop`, same across spins)
+
+    let nset = mo_coeff.len();
+    assert_eq!(mo_occ.len(), nset);
+    assert_eq!(bra.len(), nset);
+    assert!(nset >= 1);
+
+    let nao = mo_coeff[0].shape()[0];
+    let naux = cderi.shape()[1];
+    let nao_tp = nao * (nao + 1) / 2;
+    assert_eq!(cderi.shape()[0], nao_tp);
+    let device = cderi.device().clone();
+
+    // per-spin occupied coefficients and reshaped bras
+    let mocc: Vec<Tsr> = (0..nset)
+        .map(|s| {
+            let occidx = mo_occ[s].view().greater(0).into_vec();
+            mo_coeff[s].view().bool_select(-1, &occidx)
+        })
+        .collect();
+    let nocc: Vec<usize> = mocc.iter().map(|m| m.shape()[1]).collect();
+    let bra_shape_orig: Vec<Vec<usize>> = bra.iter().map(|b| b.shape().to_vec()).collect();
+    let bra: Vec<Tsr> = (0..nset).map(|s| bra[s].view().reshape((nao, nocc[s], -1)).into_contig(ColMajor)).collect();
+    let nprop = bra[0].shape()[2];
+    for s in 0..nset {
+        assert_eq!(bra[s].shape()[2], nprop, "bra trailing dim (nprop) must agree across spins");
+    }
+
+    let mut j_ao: Option<Tsr> = None;
+    let mut k_bras: Vec<Tsr> = Vec::new();
+
+    // --- J contribution (spin-independent, AO form, from total density response) --- //
+
+    if do_j {
+        // dm1_total = sum_s (bra_s @ mocc_s.T), then symmetrize; pack with tilde; the symmetric
+        // cderi contraction carries the internal factor 2.0 (matches the RHF optimized response).
+        let mut dm1: Tsr = rt::zeros(([nao, nao, nprop], &device));
+        for s in 0..nset {
+            dm1 += &bra[s] % &mocc[s].t();
+        }
+        let dm1 = &dm1 + &dm1.swapaxes(0, 1);
+        let dm1_tp = pack_triu_tilde(dm1.view());
+        let itm_j_aux = cderi.t() % &dm1_tp;
+        let resp_tp_j: Tsr = 2.0 * &cderi % itm_j_aux;
+        j_ao = Some(resp_tp_j.unpack_tri(Upper, FlagSymm::Sy));
+    }
+
+    // --- K contribution (same-spin, bra form, two symmetrized terms) --- //
+
+    if do_k {
+        for s in 0..nset {
+            let mocc_s = &mocc[s];
+            let bra_s = &bra[s];
+            let mut resp_bra_k: Tsr = rt::zeros_like(bra_s);
+            for iaux_start in (0..naux).step_by(nbatch_aux) {
+                let iaux_end = (iaux_start + nbatch_aux).min(naux);
+                let slc = rt::slice!(iaux_start, iaux_end);
+                // note: the following `naux` is the batch size, shadowing the outer one for brevity
+                let naux = iaux_end - iaux_start;
+
+                // - cderi: [nao, nao, naux]
+                // - cderi_bxo: [nao, naux, nocc]
+                // - cderi_oxo: [nocc, naux, nocc]
+                // - cderi_box: [nao, nocc, naux]
+                let cderi = cderi.i((.., slc)).unpack_tri(Upper, FlagSymm::Sy);
+                let cderi_bxo = (cderi.reshape([nao, nao * naux]).t() % mocc_s).into_shape([nao, naux, nocc[s]]);
+                let cderi_oxo =
+                    (mocc_s.t() % cderi_bxo.reshape([nao, naux * nocc[s]])).into_shape([nocc[s], naux, nocc[s]]);
+
+                for a in 0..nprop {
+                    let bra_sa = bra_s.i((.., .., a));
+                    let mut respka = resp_bra_k.i_mut((.., .., a));
+                    // k contribution part 0: uPj, iPj -> ui
+                    let cderi_bxo_1 = (cderi.reshape([nao, nao * naux]).t() % &bra_sa).into_shape([nao, naux, nocc[s]]);
+                    respka -=
+                        cderi_bxo_1.reshape([nao, naux * nocc[s]]) % cderi_oxo.reshape([nocc[s], naux * nocc[s]]).t();
+                    // k contribution part 1: uPj, iPj -> ui (i from mocc, j from bra)
+                    let cderi_oxo_1 =
+                        (mocc_s.t() % cderi_bxo_1.reshape([nao, naux * nocc[s]])).into_shape([nocc[s], naux, nocc[s]]);
+                    respka -=
+                        cderi_bxo.reshape([nao, naux * nocc[s]]) % cderi_oxo_1.reshape([nocc[s], naux * nocc[s]]).t();
+                }
+            }
+            // restore original trailing shape for this spin's bra
+            let mut shape = bra_shape_orig[s].clone();
+            shape[0] = nao;
+            k_bras.push(resp_bra_k.into_shape(shape));
+        }
+    }
+
+    (j_ao, k_bras)
+}
+
+/* #endregion */
 
 /// Response (fock/response matrix) object for RI-JK, restricted.
 ///
