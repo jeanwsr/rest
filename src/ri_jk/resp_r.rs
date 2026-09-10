@@ -98,8 +98,26 @@ impl<'a> RRespAPI for RRespRIJK<'a> {
         fock
     }
 
-    fn get_response_rdm(&mut self, _rdm: TsrView) -> Tsr {
-        unimplemented!("Response matrix (rdm form) is not implemented for RI-JK yet.")
+    fn get_response_rdm(&mut self, rdm: TsrView) -> Tsr {
+        // assume rdm can be symmetrized, 4 * J - 2 * K
+        assert_eq!(rdm.ndim(), 2, "rdm must have 2 dimensions");
+        let [nao, nao2] = rdm.shape().to_vec().try_into().unwrap();
+        assert_eq!(nao, nao2, "rdm must be square");
+        let device = self.cderi.device();
+
+        let rdm_sym = ((&rdm + &rdm.t()) * 0.5).into_contig(ColMajor).into_shape((nao, nao, 1));
+
+        let mut resp = rt::zeros(([nao, nao], device));
+        if self.factor_j != 0.0 {
+            let vj = get_vj_ri_incore(self.cderi.view(), rdm_sym.view()).i((.., .., 0)).into_contig(ColMajor);
+            resp += 4.0 * self.factor_j * &vj;
+        }
+        // TODO: batch size `72` should be tunable by max-memory.
+        if self.factor_k != 0.0 {
+            let vk = get_vk_ri_incore_dm(self.cderi.view(), rdm_sym.view(), 72).i((.., .., 0)).into_contig(ColMajor);
+            resp -= 2.0 * self.factor_k * &vk;
+        }
+        resp
     }
 
     fn make_response_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView) {

@@ -1,16 +1,11 @@
 //! Pure functions for generalized Fock (restricted) and related methods for RI-PT2.
-use enumflags2::BitFlags;
-// #![warn(unused)]
-use itertools::{izip, Itertools};
+#![warn(unused)]
+use num::traits::NumAssignOps;
 use num::{FromPrimitive, ToPrimitive};
-use num_complex::ComplexFloat;
 use rayon::prelude::*;
 use rstsr::prelude::*;
 use rt::blas::BlasFloat;
 use std::sync::{Arc, Mutex};
-
-use crate::analdrv::response::trait_rgfock::{GFockParts, RGFockAPI};
-use crate::utilities::buffer_pool::BufferPool;
 
 type Tsr<T, D = IxD> = Tensor<T, DeviceBLAS, D>;
 type TsrView<'a, T, D = IxD> = TensorView<'a, T, DeviceBLAS, D>;
@@ -39,7 +34,10 @@ pub struct RPT2ElecDerivIncoreOut {
     /// MP2 correlation energy. This is side product from property evaluation.
     pub e_corr: f64,
     /// **Partial** generalized Fock matrix contribution. Shape `(nmo, nmo)`.
-    /// Note this lacks SCF response upon rdm1_corr contribution.
+    ///
+    /// Note this lacks SCF response upon rdm1_corr contribution (the
+    /// $A_{ai, pq} D_{pq}^{\mathrm{RDM}}$ term of the Lagrangian, which requires a response
+    /// object of the underlying SCF).
     pub gfock_part: Tsr<f64>,
     /// 1-RDM in MO basis (correlation contribution, unrelaxed). Shape `(nmo, nmo)`.
     pub rdm1_corr: Tsr<f64>,
@@ -51,12 +49,11 @@ pub fn get_rpt2_elec_deriv_incore<T, O>(
     cast: impl Fn(T) -> O + Send + Sync,
 ) -> RPT2ElecDerivIncoreOut
 where
-    T: BlasFloat + ToPrimitive + FromPrimitive + 'static,
-    O: BlasFloat + ToPrimitive + FromPrimitive + 'static,
+    T: BlasFloat + ToPrimitive + FromPrimitive + NumAssignOps + 'static,
+    O: BlasFloat + ToPrimitive + FromPrimitive + NumAssignOps + 'static,
 {
     let VAL_0 = O::from_f64(0.0).unwrap();
     let VAL_1 = O::from_f64(1.0).unwrap();
-    let VAL_2 = O::from_f64(2.0).unwrap();
 
     // --- input --- //
 
@@ -92,13 +89,10 @@ where
     let eng_corr_double: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
     let mut gfock_part = rt::zeros(([nmo, nmo].f(), &device));
     let mut rdm1_corr = rt::zeros(([nmo, nmo].f(), &device));
+    let w3: Arc<Mutex<Tsr<O>>> = Arc::new(Mutex::new(rt::zeros(([nocc, nvir].f(), &device))));
+    let w4: Arc<Mutex<Tsr<O>>> = Arc::new(Mutex::new(rt::zeros(([nvir, nocc].f(), &device))));
 
     // --- buffer allocation --- //
-
-    let init_buf_t = || -> Tsr<O, Ix2> { rt::zeros(([nao, nao].f(), &device)).into_dim() };
-    let buf_t1_pool = BufferPool::new(init_buf_t);
-    let buf_t2_pool = BufferPool::new(init_buf_t);
-    let buf_t3_pool = BufferPool::new(init_buf_t);
 
     // 0th tensors
     let mut t_vivo: Tsr<O> = rt::zeros(([nvir, nstep_occ_max, nvir, nocc].f(), &device));
@@ -112,20 +106,24 @@ where
 
     // --- block-1 --- //
 
+    use crate::ri_jk::pure_ao2mo::get_ao2mo_s2ij_to_s1_notrans;
     let cderi_vox: TsrCow<'_, O> = match cderi_vox {
         Some(cderi_vox) => cderi_vox.view().into_cow(),
         None => {
-            use crate::ri_jk::pure_ao2mo::get_ao2mo_s2ij_to_s1_notrans;
             let mut cderi_vox_lst =
                 get_ao2mo_s2ij_to_s1_notrans(cderi.view(), Upper, &[vir_coeff.view()], &[occ_coeff.view()], &cast);
             cderi_vox_lst.remove(0).into_cow()
         },
     };
 
+    // coefficient matrices in `O`, for the block-4 contractions upon `O`-typed intermediates
+    let occ_coeff: Tsr<O> = occ_coeff.mapv(|x| cast(x));
+    let vir_coeff: Tsr<O> = vir_coeff.mapv(|x| cast(x));
+
     for io_slice in index_occ_outer_vec.windows(2) {
         let nstep_occ = io_slice[1] - io_slice[0];
-        let mut t_vivo = rt::asarray((t_vivo.raw_mut(), [nvir, nstep_occ, nvir, nocc].f(), &device));
-        let mut T_vivo = rt::asarray((T_vivo.raw_mut(), [nvir, nstep_occ, nvir, nocc].f(), &device));
+        let t_vivo = rt::asarray((t_vivo.raw_mut(), [nvir, nstep_occ, nvir, nocc].f(), &device));
+        let T_vivo = rt::asarray((T_vivo.raw_mut(), [nvir, nstep_occ, nvir, nocc].f(), &device));
         let mut G_vix = rt::asarray((G_vix.raw_mut(), [nvir, nstep_occ, naux].f(), &device));
 
         // generate (i, j) pairs
@@ -142,50 +140,20 @@ where
         // --- block-2 --- //
 
         (0..npair_ij).into_par_iter().for_each(|idx| {
-            // temporary buffer
-            let mut buf_t1 = buf_t1_pool.get();
-            let mut buf_t2 = buf_t2_pool.get();
-            let mut t_vv = rt::asarray((buf_t1.raw_mut(), [nvir, nvir].f(), &device));
-            let mut T_vv = rt::asarray((buf_t2.raw_mut(), [nvir, nvir].f(), &device));
             let mut eng_corr_ij = 0.0;
             // index
             let [i, j] = pair_ij[idx];
             // t_vv, T_vv
-            // t_vv /= d_vv
-            // T_vv = (2 * c_os) * t_vv - c_ss * t_vv.t()
             let d_ij = occ_energy[[i]] + occ_energy[[j]];
-            t_vv.matmul_from(cderi_vox.i((.., i, ..)), cderi_vox.i((.., j, ..)).t(), VAL_1, VAL_0);
-            for a in 0..nvir {
-                // diagonal part
-                let d_aa_inv = cast(d_ij + d_vv_outer[[a, a]]).recip();
-                let g_aa = t_vv[[a, a]];
-                let t_aa = g_aa * d_aa_inv;
-                let T_aa = (bi1_scale - bi2_scale) * t_aa;
-                t_vv[[a, a]] = t_aa;
-                T_vv[[a, a]] = T_aa;
-                if j <= i {
-                    eng_corr_ij += (T_aa * g_aa).to_f64().unwrap();
-                }
-                // off-diagonal part
-                for b in 0..a {
-                    let d_ab_inv = cast(d_ij + d_vv_outer[[a, b]]).recip();
-                    let g_ab = t_vv[[a, b]];
-                    let g_ba = t_vv[[b, a]];
-                    let t_ab = g_ab * d_ab_inv;
-                    let t_ba = g_ba * d_ab_inv;
-                    let T_ab = bi1_scale * t_ab - bi2_scale * t_ba;
-                    let T_ba = bi1_scale * t_ba - bi2_scale * t_ab;
-                    t_vv[[a, b]] = t_ab;
-                    t_vv[[b, a]] = t_ba;
-                    T_vv[[a, b]] = T_ab;
-                    T_vv[[b, a]] = T_ba;
-                    if j <= i {
-                        eng_corr_ij += (T_ab * g_ab + T_ba * g_ba).to_f64().unwrap();
-                    }
-                }
+            let g_vv = cderi_vox.i((.., i, ..)) % cderi_vox.i((.., j, ..)).t();
+            let d_vv = (&d_vv_outer + d_ij).mapv(&cast);
+            let t_vv = &g_vv / &d_vv;
+            let T_vv = &t_vv * bi1_scale - t_vv.t() * bi2_scale;
+            if j <= i {
+                eng_corr_ij += (&T_vv * &g_vv).sum().to_f64().unwrap();
+                let diag_scale = if i == j { 1.0 } else { 2.0 };
+                *eng_corr_double.lock().unwrap() += diag_scale * eng_corr_ij;
             }
-            let diag_scale = if i == j { 1.0 } else { 2.0 };
-            *eng_corr_double.lock().unwrap() += diag_scale * eng_corr_ij;
 
             // assign to t_vivo, T_vivo
             let mut t_vivo = unsafe { t_vivo.force_mut() };
@@ -198,9 +166,6 @@ where
                 t_vivo.i_mut((.., j_, .., i)).assign(t_vv.t());
                 T_vivo.i_mut((.., j_, .., i)).assign(T_vv.t());
             }
-
-            buf_t1_pool.put(buf_t1);
-            buf_t2_pool.put(buf_t2);
         });
 
         // --- block-3 --- //
@@ -219,8 +184,40 @@ where
             VAL_1,
             VAL_0,
         );
+
+        // --- block-4 --- //
+
+        let mocc_batch = occ_coeff.i((.., io_slice[0]..io_slice[1]));
+        let w4_bi: Arc<Mutex<Tsr<O>>> = Arc::new(Mutex::new(rt::zeros(([nao, nstep_occ].f(), &device))));
+        (0..naux).into_par_iter().for_each(|p| {
+            // cderi[oix]: ao2mo
+            let cderi_sy = cderi.i((.., p)).unpack_tri(Upper, FlagSymm::Sy).mapv(&cast);
+            let cderi_bi = &cderi_sy % &mocc_batch;
+            let cderi_oi = occ_coeff.t() % &cderi_bi;
+            // w3[ov] = cderi[oi, x] % G[vi, x]'
+            let w3_part = cderi_oi % G_vix.i((.., .., p)).t();
+            {
+                let mut w3 = w3.lock().unwrap();
+                *w3 += &w3_part;
+            }
+
+            // w4[bi] = cderi[bb, x] % G[bi, x]
+            let G_bi = &vir_coeff % G_vix.i((.., .., p));
+            let w4_bi_part = &cderi_sy % &G_bi;
+            {
+                let mut w4_bi = w4_bi.lock().unwrap();
+                *w4_bi += &w4_bi_part;
+            }
+        });
+        let w4_bi = w4_bi.lock().unwrap();
+        w4.lock().unwrap().i_mut((.., io_slice[0]..io_slice[1])).assign(vir_coeff.t() % w4_bi.view());
     }
 
     let e_corr = *eng_corr_double.lock().unwrap();
+    let w3 = w3.lock().unwrap();
+    let w4 = w4.lock().unwrap();
+    gfock_part.i_mut((so, sv)).assign(w3.mapv(|x| 4.0 * x.to_f64().unwrap()));
+    gfock_part.i_mut((sv, so)).assign(w4.mapv(|x| 4.0 * x.to_f64().unwrap()));
+
     RPT2ElecDerivIncoreOut { e_corr, gfock_part, rdm1_corr }
 }
