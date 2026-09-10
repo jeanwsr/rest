@@ -1,9 +1,9 @@
-//! UKS (TPSS0, MGGA) Hessian with explicit `grid_level_cpscf` / `grid_level_skeleton`.
+//! UKS (TPSS0, MGGA) Hessian with explicit `grid_level_resp` / `grid_level_skeleton`.
 //!
 //! Exercises the MGGA skeleton-grid regeneration (`grid_gen_level + 2` default) and the
 //! dedicated CP-SCF grid path on the UKS side.
 
-use pyrest::analdrv::config::{AnalDrvCpscfCfg, AnalDrvConfig, AnalDrvNucgradCfg};
+use pyrest::analdrv::config::{AnalDrvConfig, AnalDrvNucgradCfg, AnalDrvRespCfg};
 use pyrest::analdrv::hessian::uscf_interface::uscf_hess_interface;
 
 use pyrest::ctrl_io;
@@ -68,7 +68,7 @@ fn test_nh3_mgga_default_skeleton() {
 fn test_nh3_mgga_explicit_grid_levels() {
     let config = AnalDrvConfig {
         nucgrad: AnalDrvNucgradCfg { grid_level_skeleton: Some(5), ..Default::default() },
-        cpscf: AnalDrvCpscfCfg { grid_level: Some(2), ..Default::default() },
+        resp: AnalDrvRespCfg { grid_level: Some(2), ..Default::default() },
         ..Default::default()
     };
     let de = run_with_config(config);

@@ -1,9 +1,9 @@
-//! RKS (B3LYP, GGA) Hessian with explicit `grid_level_cpscf` / `grid_level_skeleton`.
+//! RKS (B3LYP, GGA) Hessian with explicit `grid_level_resp` / `grid_level_skeleton`.
 //!
 //! Exercises the dedicated CP-SCF grid path (`ni_cpks = Some`) and the skeleton-grid
 //! regeneration path for a GGA functional.
 
-use pyrest::analdrv::config::{AnalDrvCpscfCfg, AnalDrvConfig, AnalDrvNucgradCfg};
+use pyrest::analdrv::config::{AnalDrvConfig, AnalDrvNucgradCfg, AnalDrvRespCfg};
 use pyrest::analdrv::hessian::rscf_interface::rscf_hess_interface;
 
 use pyrest::ctrl_io;
@@ -60,7 +60,7 @@ fn test_nh3_explicit_grid_levels() {
     // from each other and from the SCF grid so the regeneration + ni_cpks paths are exercised.
     let config = AnalDrvConfig {
         nucgrad: AnalDrvNucgradCfg { grid_level_skeleton: Some(4), ..Default::default() },
-        cpscf: AnalDrvCpscfCfg { grid_level: Some(2), ..Default::default() },
+        resp: AnalDrvRespCfg { grid_level: Some(2), ..Default::default() },
         ..Default::default()
     };
     let de = run_with_config(config);
@@ -89,7 +89,7 @@ fn test_nh3_cpscf_equals_skeleton() {
     // cpscf level == skeleton level (both 3) -> ni_cpks = None fast path (reuse skeleton vxc/fxc).
     let config = AnalDrvConfig {
         nucgrad: AnalDrvNucgradCfg { grid_level_skeleton: Some(3), ..Default::default() },
-        cpscf: AnalDrvCpscfCfg { grid_level: Some(3), ..Default::default() },
+        resp: AnalDrvRespCfg { grid_level: Some(3), ..Default::default() },
         ..Default::default()
     };
     let de = run_with_config(config);

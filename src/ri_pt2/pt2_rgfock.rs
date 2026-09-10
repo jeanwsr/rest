@@ -19,7 +19,6 @@
 //! `mp2_polar.py` (`get_rdm1_corr_resp`), and pyscf-forge `dh/resp.py` (`prepare_lagrangian`,
 //! `prepare_D_r`).
 
-use crate::analdrv::krylov_block::krylov_block;
 use crate::analdrv::prelude::*;
 use crate::analdrv::response::trait_rgfock::{GFockParts, RGFockAPI};
 use crate::ri_pt2::pure_pt2_r_elecderiv::{
@@ -97,10 +96,11 @@ impl<'a, 'b> RPT2GFock<'a, 'b> {
     }
 
     /// Prepare the response of the SCF response object (must be called before the Z-vector
-    /// solve or any response contraction).
+    /// solve or any response contraction). This also stores the orbital state in the response
+    /// object for its inherent CP-SCF machinery.
     pub fn make_response_preparation(&mut self) {
         let t0 = std::time::Instant::now();
-        self.resp.make_response_preparation(self.mo_coeff.view(), self.mo_occ.view());
+        self.resp.make_cpscf_preparation(self.mo_coeff.view(), self.mo_occ.view(), self.mo_energy.view());
         self.timing.push(("in RPT2GFock, make_response_preparation".to_string(), t0.elapsed().as_secs_f64()));
     }
 
@@ -185,9 +185,10 @@ impl<'a, 'b> RPT2GFock<'a, 'b> {
     /// The Z-vector equation (Handy-Schaefer) reads
     /// $-(\varepsilon_a - \varepsilon_i) Z_{ai} - A_{ai, bj} Z_{bj} = L_{ai}$, which is solved
     /// in the dimensionless form $Z + A(Z) / (\varepsilon_a - \varepsilon_i) = - L / (\varepsilon_a
-    /// - \varepsilon_i)$ by a block Krylov solver, where $A(Z)$ is evaluated by the SCF response
-    /// object in `resp` (the A-tensor action upon the perturbed density; cf.
-    /// [`RRespAPI::get_response_bra`] and pyscf's `eri_cpks` response kernel).
+    /// - \varepsilon_i)$ by the block Krylov solver of the response object
+    /// ([`RRespSCF::solve_dimless_cpscf`]), where $A(Z)$ is the A-tensor action upon the
+    /// perturbed density (cf. [`RRespAPI::get_response_bra`] and pyscf's `eri_cpks` response
+    /// kernel).
     ///
     /// # Parameters
     ///
@@ -202,63 +203,18 @@ impl<'a, 'b> RPT2GFock<'a, 'b> {
         let nocc = self.nocc();
         let nmo = self.nmo();
         let sv = rt::slice!(nocc, nmo);
-        let (e_ai, e_ai_shift) = self.e_ai();
+        let (_, e_ai_shift) = self.e_ai();
 
         // dimensionless rhs: `- L / (e_a - e_i)` on the vir-occ block, zero on the occ block
         let mut rhs = rt::zeros(([nmo, nocc].f(), &device));
         rhs.i_mut(sv).assign(&(-lag_vo / &e_ai_shift));
 
-        // solve `Z + A(Z)/(e_a - e_i) = rhs` by block Krylov; the response operator couples all
-        // elements, so the problem is flattened to a single right-hand side
-        let cpscf_cfg = self.config.cpscf.clone();
-        let mut response_dimless = |x: TsrView| -> Tsr { self.response_dimless_zvector(x) };
-        let rhs = rhs.reshape((nmo * nocc, 1));
-        let z = krylov_block(
-            move |x: TsrView| -> Tsr {
-                let x = x.reshape((nmo, nocc));
-                response_dimless(x.view()).into_shape((nmo * nocc, 1))
-            },
-            rhs.view(),
-            None,
-            cpscf_cfg.tol,
-            cpscf_cfg.max_cycle,
-            cpscf_cfg.max_space,
-            cpscf_cfg.lindep,
-            cpscf_cfg.tol_inflation,
-        );
-        let z = z.into_shape((nmo, nocc));
+        // solve `Z + A(Z)/(e_a - e_i) = rhs` by block Krylov on the response object
+        let z = self.resp.solve_dimless_cpscf(rhs.view());
+
         self.result.insert("z_vector".to_string(), z.to_owned());
         self.timing.push(("in RPT2GFock, solve_z_vector".to_string(), t0.elapsed().as_secs_f64()));
         self.result["z_vector"].to_owned()
-    }
-
-    /// Response of the SCF to a perturbation in MO space, in the dimensionless form used by the
-    /// Z-vector solve: $(A(Z) + \lambda Z) / (\varepsilon_a - \varepsilon_i + \lambda)$ with the
-    /// occupied rows zeroed.
-    ///
-    /// # Parameters
-    ///
-    /// - `mo1` : shape `[nmo, nocc]`. The perturbation in MO space.
-    ///
-    /// # Returns
-    ///
-    /// - `resp` : shape `[nmo, nocc]`. The dimensionless response in MO space.
-    pub fn response_dimless_zvector(&mut self, mo1: TsrView) -> Tsr {
-        let mo_coeff = self.mo_coeff.view();
-        let ubra = &mo_coeff % &mo1;
-        let mut resp = mo_coeff.t() % self.resp.get_response_bra(ubra.view());
-        let (_e_ai, e_ai_shift) = self.e_ai();
-        let level_shift = self.config.cpscf.level_shift;
-        if level_shift != 0.0 {
-            resp -= level_shift * mo1;
-        }
-        let nocc = self.nocc();
-        let nmo = self.nmo();
-        let so = rt::slice!(0, nocc);
-        let sv = rt::slice!(nocc, nmo);
-        *&mut resp.i_mut(sv) /= &e_ai_shift;
-        resp.i_mut(so).fill(0.0);
-        resp
     }
 
     /// Relaxed (response) 1-RDM of the PT2 contribution in MO basis, shape `[nmo, nmo]`.
@@ -300,7 +256,7 @@ impl<'a, 'b> RPT2GFock<'a, 'b> {
         let eocc = self.mo_energy.bool_select(-1, &occidx);
         let evir = self.mo_energy.bool_select(-1, &viridx);
         let e_ai = (&evir.i((.., None)) - &eocc.i((None, ..))).into_dim::<Ix2>();
-        let level_shift = self.config.cpscf.level_shift;
+        let level_shift = self.config.resp.level_shift;
         let e_ai_shift = if level_shift != 0.0 { &e_ai + level_shift } else { e_ai.view().to_owned() };
         (e_ai.into_dim::<IxD>(), e_ai_shift.into_dim::<IxD>())
     }

@@ -79,7 +79,7 @@ impl<'a> UHessSCF<'a> {
         let mo_coeff = [self.mo_coeff[α].view(), self.mo_coeff[β].view()];
         let mo_occ = [self.mo_occ[α].view(), self.mo_occ[β].view()];
         let mo_energy = [self.mo_energy[α].view(), self.mo_energy[β].view()];
-        let level_shift = self.config.cpscf.level_shift;
+        let level_shift = self.config.resp.level_shift;
         let device = mo_coeff[α].device().clone();
 
         let nao = mo_coeff[α].shape()[0];
@@ -241,7 +241,7 @@ impl<'a> UHessSCF<'a> {
             self.mo_energy[β].view().bool_select(-1, &viridx[β]),
         ];
         let e_ai = [evir[α].i((.., None)) - eocc[α].i((None, ..)), evir[β].i((.., None)) - eocc[β].i((None, ..))];
-        let level_shift = self.config.cpscf.level_shift;
+        let level_shift = self.config.resp.level_shift;
         let e_ai_shift = [&e_ai[0] + level_shift, &e_ai[1] + level_shift];
         let so = [rt::slice!(0, nocc[α]), rt::slice!(0, nocc[β])];
         let sv = [rt::slice!(nocc[α], nmo[α]), rt::slice!(nocc[β], nmo[β])];
@@ -281,11 +281,11 @@ impl<'a> UHessSCF<'a> {
         let rhs = [rhs[α].reshape((nmo[α], nocc[α], -1)), rhs[β].reshape((nmo[β], nocc[β], -1))];
         let device = rhs[α].device().clone();
 
-        let tol = self.config.cpscf.tol;
-        let max_cycle = self.config.cpscf.max_cycle;
-        let max_space = self.config.cpscf.max_space;
-        let lindep = self.config.cpscf.lindep;
-        let tol_inflation = self.config.cpscf.tol_inflation;
+        let tol = self.config.resp.tol;
+        let max_cycle = self.config.resp.max_cycle;
+        let max_space = self.config.resp.max_space;
+        let lindep = self.config.resp.lindep;
+        let tol_inflation = self.config.resp.tol_inflation;
 
         let pack_flattened = |x: &[TsrView; 2]| -> Tsr {
             // original: [nmo_α, nocc_α, nprop] and [nmo_β, nocc_β, nprop]

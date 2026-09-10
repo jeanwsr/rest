@@ -101,7 +101,7 @@ impl<'a, 'b> RHessSCF<'a, 'b> {
         let mo_coeff = &self.mo_coeff;
         let mo_occ = &self.mo_occ;
         let mo_energy = &self.mo_energy;
-        let level_shift = self.config.cpscf.level_shift;
+        let level_shift = self.config.resp.level_shift;
         let device = mo_coeff.device().clone();
 
         let [nao, nmo] = mo_coeff.shape().to_vec().try_into().unwrap();
@@ -177,117 +177,12 @@ impl<'a, 'b> RHessSCF<'a, 'b> {
 
     /// Prepare the response for CP-SCF calculation.
     ///
-    /// This involves all response objects.
+    /// This involves all response objects, and stores the orbital state in the response object
+    /// for its inherent CP-SCF machinery.
     pub fn make_response_preparation(&mut self) {
         let t0 = std::time::Instant::now();
-        let t1 = std::time::Instant::now();
-        self.resp.make_response_preparation(self.mo_coeff.view(), self.mo_occ.view());
-        self.timing.push((
-            format!("in make_response_preparation, {}", self.resp.get_type_name()),
-            t1.elapsed().as_secs_f64(),
-        ));
+        self.resp.make_cpscf_preparation(self.mo_coeff.view(), self.mo_occ.view(), self.mo_energy.view());
         self.timing.push(("make_response_preparation".to_string(), t0.elapsed().as_secs_f64()));
-    }
-
-    /// Compute the response of the system to a given perturbation in MO space (mo1), which is
-    /// needed for CP-SCF.
-    ///
-    /// # Parameters
-    ///
-    /// - `mo1` : shape `[nmo, nocc, ...]`. The perturbation in MO space.
-    ///
-    /// # Returns
-    ///
-    /// - `resp` : shape `[nmo, nocc, ...]`. The response in MO space.
-    pub fn response_mo(&mut self, mo1: TsrView) -> Tsr {
-        let mo_coeff = self.mo_coeff.view();
-        let ubra = &mo_coeff % &mo1;
-        let t1 = std::time::Instant::now();
-        let resp = mo_coeff.t() % self.resp.get_response_bra(ubra.view());
-        self.timing.push((format!("in response_mo, {}", self.resp.get_type_name()), t1.elapsed().as_secs_f64()));
-        resp
-    }
-
-    /// Compute the dimensionless response for CP-SCF calculation.
-    ///
-    /// Compared to usual CP-SCF response, this additionally handles
-    /// - the level shift in denominator
-    /// - the zeroing of occupied-part response (we use `mo1[occ, occ]` part for evaluating
-    ///   `resp[vir, occ]`, but we actually only want to solve the `mo1[vir, occ]` part and freeze
-    ///   `mo1[occ, occ]` part to always be 0.5 times of ovlp_deriv1).
-    ///
-    /// # Parameters
-    ///
-    /// - `mo1` : shape `[nmo, nocc, ...]`. The perturbation in MO space.
-    ///
-    /// # Returns
-    ///
-    /// - `resp` : shape `[nmo, nocc, ...]`. The dimensionless response in MO space.
-    pub fn response_dimless_cpscf(&mut self, mo1: TsrView) -> Tsr {
-        let t0 = std::time::Instant::now();
-        let mo_occ = self.mo_occ.view();
-        let mo_energy = self.mo_energy.view();
-        let level_shift = self.config.cpscf.level_shift;
-        let occidx = mo_occ.view().greater(0).into_vec();
-        let viridx = occidx.iter().map(|&x| !x).collect_vec();
-        let nocc = occidx.iter().filter(|&&x| x).count();
-        let nmo = mo_occ.shape()[0];
-        let eocc = mo_energy.bool_select(-1, &occidx);
-        let evir = mo_energy.bool_select(-1, &viridx);
-        let so = rt::slice!(0, nocc);
-        let sv = rt::slice!(nocc, nmo);
-        let e_ai = evir.i((.., None)) - eocc.i((None, ..));
-        let e_ai_shift = &e_ai + level_shift;
-
-        let mut resp = self.response_mo(mo1.view());
-
-        // handle dimensionless denominator and force handle virtual-part only
-        if level_shift != 0.0 {
-            resp -= level_shift * &mo1;
-        }
-        *&mut resp.i_mut(sv) /= &e_ai_shift;
-        resp.i_mut(so).fill(0.0);
-        self.timing.push(("response_dimless_cpscf".to_string(), t0.elapsed().as_secs_f64()));
-        resp
-    }
-
-    /// Solve the dimensionless CP-SCF equation using a Krylov solver.
-    ///
-    /// This should solves `U + resp(U) = rhs`. Note difference of standard CP-SCF equation as
-    /// mentioned in functions above.
-    ///
-    /// # Parameters
-    ///
-    /// - `rhs` : shape `[nmo, nocc, ...]`. Dimensionless right-hand side.
-    ///
-    /// # Returns
-    ///
-    /// - `mo1` : shape `[nmo, nocc, ...]`. Perturbation in MO space that solves the dimensionless
-    ///   CP-SCF equation.
-    pub fn solve_dimless_cpscf(&mut self, rhs: TsrView) -> Tsr {
-        let t0 = std::time::Instant::now();
-        let rhs_shape = rhs.shape().to_vec();
-        let nmo = rhs.shape()[0];
-        let nocc = rhs.shape()[1];
-        let rhs = rhs.reshape((nmo * nocc, -1));
-
-        let tol = self.config.cpscf.tol;
-        let max_cycle = self.config.cpscf.max_cycle;
-        let max_space = self.config.cpscf.max_space;
-        let lindep = self.config.cpscf.lindep;
-        let tol_inflation = self.config.cpscf.tol_inflation;
-
-        let response_cpscf_flattened = |x: TsrView| -> Tsr {
-            let x = x.reshape((nmo, nocc, -1));
-            let y = self.response_dimless_cpscf(x.view());
-            y.into_shape((nmo * nocc, -1))
-        };
-        let mo1 =
-            krylov_block(response_cpscf_flattened, rhs.view(), None, tol, max_cycle, max_space, lindep, tol_inflation);
-        let mo1 = mo1.into_shape(rhs_shape);
-
-        self.timing.push(("solve_dimless_cpscf".to_string(), t0.elapsed().as_secs_f64()));
-        mo1
     }
 
     /// Finalize the CP-SCF calculation by computing necessary intermediates for Hessian assembly.
@@ -332,7 +227,7 @@ impl<'a, 'b> RHessSCF<'a, 'b> {
         let e_ij = eocc.i((.., None)) - eocc.i((None, ..));
 
         // last-iter the cp-hf equation, and remove the level-shift
-        let b1mo = f1mo - s1mo * eocc.i((None, ..)) + self.response_mo(mo1.view());
+        let b1mo = f1mo - s1mo * eocc.i((None, ..)) + self.resp.response_mo(mo1.view());
         let mut mo1 = mo1.to_owned();
         mo1.i_mut(sv).assign(-b1mo.i(sv) / e_ai);
 
@@ -409,7 +304,7 @@ impl<'a, 'b> RHessSCF<'a, 'b> {
         let rhs = pre_cpscf_dict["rhs"].view();
 
         self.make_response_preparation();
-        let mo1 = self.solve_dimless_cpscf(rhs.view());
+        let mo1 = self.resp.solve_dimless_cpscf(rhs.view());
         let finalize_dict = self.finalize_cpscf(f1mo.view(), s1mo.view(), mo1.view());
         let mo1 = finalize_dict["mo1"].view();
         let mo_e1 = finalize_dict["mo_e1"].view();

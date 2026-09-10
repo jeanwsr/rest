@@ -142,7 +142,7 @@ pub fn uscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
         } else {
             grid_gen_level
         });
-        let cpscf_level = config.cpscf.grid_level.unwrap_or(grid_gen_level.max(3) - 2);
+        let cpscf_level = config.resp.grid_level.unwrap_or(grid_gen_level.max(3) - 2);
 
         // skeleton grid: reuse the SCF grid when the level matches, else regenerate.  Either
         // way, regroup to atom-grouped order (non-decreasing atm_idx): the SCF grid is

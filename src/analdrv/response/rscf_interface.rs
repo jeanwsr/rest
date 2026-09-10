@@ -12,6 +12,7 @@
 //! skeleton grid policy (including the MGGA level bump) lives in the hessian interface; no grid
 //! identity or grid data is shared between the hessian and response subsystems.
 
+use crate::analdrv::config::AnalDrvRespCfg;
 use crate::analdrv::prelude::*;
 use crate::dft::numint_matmul::nimatmul::NIMatmul;
 use crate::dft::numint_matmul::resp_rks::RRespKSNIMatmul;
@@ -62,6 +63,11 @@ pub fn scf_xc_func_list(scf_data: &SCF) -> Vec<(f64, LibXCFunctional)> {
 /// `get_response_bra`) summed over the contributions. Drivers therefore hold `&mut RRespSCF` as
 /// their single response object.
 ///
+/// On top of the trait, the type carries the CP-SCF machinery shared by the drivers
+/// ([`Self::response_mo`]/[`Self::response_dimless_cpscf`]/[`Self::solve_dimless_cpscf`]): the
+/// solver settings are captured at build time, and the orbital state is stored by
+/// [`Self::make_cpscf_preparation`].
+///
 /// The list is open-ended: further contributions can be appended to [`Self::resp_list`] without
 /// changing this type. Should a driver require the concrete type of an entry, manual downcast
 /// through utilities on `AnalDrvBaseAPI` is the escape hatch.
@@ -69,6 +75,21 @@ pub struct RRespSCF<'a> {
     /// Response objects of all electron-interaction contributions: for examples, RI-JK, RSH
     /// exchange, DFT XC NIMatmul.
     pub resp_list: Vec<Box<dyn RRespAPI + 'a>>,
+    /// CP-SCF solver settings, captured at build time by [`rscf_resp_interface`].
+    resp_cfg: AnalDrvRespCfg,
+    /// Orbital state stored by [`Self::make_cpscf_preparation`]; the CP-SCF machinery panics
+    /// until it is set.
+    cpscf_state: Option<RCpscfState>,
+}
+
+/// Orbital state cached by [`RRespSCF::make_cpscf_preparation`] for the inherent CP-SCF
+/// machinery.
+struct RCpscfState {
+    mo_coeff: Tsr,
+    /// Level-shifted orbital-energy differences `e_a - e_i + shift`, shape `[nvir, nocc]`.
+    e_ai_shift: Tsr,
+    nocc: usize,
+    nmo: usize,
 }
 
 impl<'a> AnalDrvBaseAPI for RRespSCF<'a> {}
@@ -119,6 +140,147 @@ impl<'a> RRespAPI for RRespSCF<'a> {
     }
 }
 
+impl<'a> RRespSCF<'a> {
+    /// Store the orbital state and prepare all response objects for the CP-SCF calculation.
+    ///
+    /// This wraps the trait-level [`RRespAPI::make_response_preparation`] fan-out, and
+    /// additionally caches the orbital coefficients and the level-shifted orbital-energy
+    /// differences, so that [`Self::response_mo`], [`Self::response_dimless_cpscf`] and
+    /// [`Self::solve_dimless_cpscf`] can be called with the perturbation only.
+    ///
+    /// # Parameters
+    ///
+    /// - `mo_coeff` : shape `[nao, nmo]`. Molecular orbital coefficients.
+    /// - `mo_occ` : shape `[nmo]`. Molecular orbital occupation numbers.
+    /// - `mo_energy` : shape `[nmo]`. Molecular orbital energies.
+    pub fn make_cpscf_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView, mo_energy: TsrView) {
+        for resp_obj in self.resp_list.iter_mut() {
+            resp_obj.make_response_preparation(mo_coeff.view(), mo_occ.view());
+        }
+
+        let occidx = mo_occ.view().greater(0).into_vec();
+        let viridx = occidx.iter().map(|&x| !x).collect_vec();
+        let eocc = mo_energy.bool_select(-1, &occidx);
+        let evir = mo_energy.bool_select(-1, &viridx);
+        let e_ai = evir.i((.., None)) - eocc.i((None, ..));
+        let e_ai_shift = &e_ai + self.resp_cfg.level_shift;
+
+        self.cpscf_state = Some(RCpscfState {
+            mo_coeff: mo_coeff.to_owned(),
+            e_ai_shift,
+            nocc: occidx.iter().filter(|&&x| x).count(),
+            nmo: mo_occ.shape()[0],
+        });
+    }
+
+    /// Compute the response in MO space to a perturbation in MO space.
+    ///
+    /// Half-transforms the perturbation to the AO bra, contracts the response of all
+    /// contributions, and transforms back to MO space.
+    /// Call [`Self::make_cpscf_preparation`] before this function to make sure the data is ready.
+    ///
+    /// # Parameters
+    ///
+    /// - `mo1` : shape `[nmo, nocc, ...]`. The perturbation in MO space.
+    ///
+    /// # Returns
+    ///
+    /// - `resp` : shape `[nmo, nocc, ...]`. The response in MO space.
+    pub fn response_mo(&mut self, mo1: TsrView) -> Tsr {
+        let state = self
+            .cpscf_state
+            .as_ref()
+            .expect("Call `RRespSCF::make_cpscf_preparation` before the CP-SCF machinery.");
+        let mo_coeff = state.mo_coeff.view();
+        let ubra = &mo_coeff % &mo1;
+        let mut resp = rt::zeros_like(&mo1);
+        for resp_obj in self.resp_list.iter_mut() {
+            resp += mo_coeff.t() % resp_obj.get_response_bra(ubra.view());
+        }
+        resp
+    }
+
+    /// Compute the response in the dimensionless form used by the CP-SCF solve.
+    ///
+    /// Compared to [`Self::response_mo`], this additionally handles
+    /// - the level shift in denominator
+    /// - the zeroing of occupied-part response (we use `mo1[occ, occ]` part for evaluating
+    ///   `resp[vir, occ]`, but we actually only want to solve the `mo1[vir, occ]` part and freeze
+    ///   `mo1[occ, occ]` part to always be 0.5 times of ovlp_deriv1).
+    /// Call [`Self::make_cpscf_preparation`] before this function to make sure the data is ready.
+    ///
+    /// # Parameters
+    ///
+    /// - `mo1` : shape `[nmo, nocc, ...]`. The perturbation in MO space.
+    ///
+    /// # Returns
+    ///
+    /// - `resp` : shape `[nmo, nocc, ...]`. The dimensionless response in MO space.
+    pub fn response_dimless_cpscf(&mut self, mo1: TsrView) -> Tsr {
+        let mut resp = self.response_mo(mo1.view());
+
+        let state = self
+            .cpscf_state
+            .as_ref()
+            .expect("Call `RRespSCF::make_cpscf_preparation` before the CP-SCF machinery.");
+        let level_shift = self.resp_cfg.level_shift;
+        let so = rt::slice!(0, state.nocc);
+        let sv = rt::slice!(state.nocc, state.nmo);
+
+        // handle dimensionless denominator and force handle virtual-part only
+        if level_shift != 0.0 {
+            resp -= level_shift * mo1;
+        }
+        *&mut resp.i_mut(sv) /= &state.e_ai_shift;
+        resp.i_mut(so).fill(0.0);
+        resp
+    }
+
+    /// Solve the dimensionless CP-SCF equation using a Krylov solver.
+    ///
+    /// This solves `U + resp(U) = rhs`. Note difference of standard CP-SCF equation as mentioned
+    /// in the hessian driver.
+    /// Call [`Self::make_cpscf_preparation`] before this function to make sure the data is ready.
+    ///
+    /// # Parameters
+    ///
+    /// - `rhs` : shape `[nmo, nocc, ...]`. Dimensionless right-hand side.
+    ///
+    /// # Returns
+    ///
+    /// - `mo1` : shape `[nmo, nocc, ...]`. Perturbation in MO space that solves the dimensionless
+    ///   CP-SCF equation.
+    pub fn solve_dimless_cpscf(&mut self, rhs: TsrView) -> Tsr {
+        let rhs_shape = rhs.shape().to_vec();
+        let nmo = rhs.shape()[0];
+        let nocc = rhs.shape()[1];
+        let rhs = rhs.reshape((nmo * nocc, -1));
+
+        let tol = self.resp_cfg.tol;
+        let max_cycle = self.resp_cfg.max_cycle;
+        let max_space = self.resp_cfg.max_space;
+        let lindep = self.resp_cfg.lindep;
+        let tol_inflation = self.resp_cfg.tol_inflation;
+
+        let response_cpscf_flattened = |x: TsrView| -> Tsr {
+            let x = x.reshape((nmo, nocc, -1));
+            let y = self.response_dimless_cpscf(x.view());
+            y.into_shape((nmo * nocc, -1))
+        };
+        let mo1 = krylov_block(
+            response_cpscf_flattened,
+            rhs.view(),
+            None,
+            tol,
+            max_cycle,
+            max_space,
+            lindep,
+            tol_inflation,
+        );
+        mo1.into_shape(rhs_shape)
+    }
+}
+
 /// Build the response (fock/response) objects for a converged restricted SCF.
 pub fn rscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> RRespSCF<'a> {
     let device = DeviceBLAS::default();
@@ -164,7 +326,7 @@ pub fn rscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> RRe
         // response then evaluates (and caches) on the common grid. Otherwise build a dedicated
         // (usually coarser) grid.
         let grid_gen_level = scf_data.mol.ctrl.grid_gen_level;
-        let grid_resp_level = config.cpscf.grid_level.unwrap_or(grid_gen_level.max(3) - 2);
+        let grid_resp_level = config.resp.grid_level.unwrap_or(grid_gen_level.max(3) - 2);
         let resp_obj = if grid_resp_level == grid_gen_level {
             RRespKSNIMatmul::new(xc_func_list, ni, verbose)
         } else {
@@ -181,5 +343,5 @@ pub fn rscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> RRe
         resp_list.push(Box::new(resp_obj));
     }
 
-    RRespSCF { resp_list }
+    RRespSCF { resp_list, resp_cfg: config.resp.clone(), cpscf_state: None }
 }
