@@ -225,7 +225,7 @@ fn get_available_memory_bytes() -> u64 {
     }
     page_size * available_pages
 }
-
+*/
 /// Redistribute an RI‑MO tensor from auxiliary‑index distribution
 /// (`dist_axis=0`) to diagonal ownership (`dist_axis=2`).
 ///
