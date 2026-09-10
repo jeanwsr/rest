@@ -27,11 +27,22 @@ use crate::ri_pt2::pure_pt2_r_elecderiv::{
 use crate::utilities::rstsr_util::{Tsr, TsrCow, TsrView};
 use enumflags2::BitFlags;
 use itertools::Itertools;
+use num::traits::NumAssignOps;
+use num::{FromPrimitive, ToPrimitive};
 use rstsr::prelude::*;
+use rt::blas::BlasFloat;
 use std::collections::HashMap;
 
 /// Working solver and maintainer of all generalized-Fock (and related) components for RI-PT2.
-pub struct RPT2GFock<'a, 'b> {
+///
+/// The type parameter `O` is the working (floating-point) type of the incore
+/// electronic-derivative kernel [`get_rpt2_elec_deriv_incore`] (`f64` or `f32`). The inputs in
+/// `T`-position (`cderi` and the MO coefficients/energies) stay `f64`, and all outputs
+/// (`e_corr`, `gfock_part`, `rdm1_corr`) are `f64` regardless of `O`.
+pub struct RPT2GFock<'a, 'b, O = f64>
+where
+    O: BlasFloat + 'static,
+{
     /// Molecular orbital coefficients, shape `[nao, nmo]`.
     pub mo_coeff: Tsr,
     /// Occupation numbers, shape `[nmo]`.
@@ -40,9 +51,11 @@ pub struct RPT2GFock<'a, 'b> {
     pub mo_energy: Tsr,
     /// Cholesky-decomposed 3c2e ERI of the RI-PT2 auxiliary basis, shape `[nao_tp, naux]`.
     pub cderi: TsrCow<'a>,
-    /// Optionally pre-transformed (vir, occ, aux) three-center integrals; generated on the fly
-    /// if not given.
-    pub cderi_vox: Option<TsrCow<'a>>,
+    /// Optionally pre-transformed (vir, occ, aux) three-center integrals **in the working type
+    /// `O`**; generated on the fly (transformed in f64, cast at the end) if not given. A caller
+    /// holding an f64 tensor should regenerate it in `O` rather than re-cast, to avoid the extra
+    /// allocation of a cast copy.
+    pub cderi_vox: Option<TsrCow<'a, O>>,
     /// Batching (outer slice) indices of occupied orbitals; must start with `0` and end with
     /// `nocc`. Degenerate occupied orbitals must stay within one batch.
     pub index_occ_outer_vec: Vec<usize>,
@@ -64,14 +77,17 @@ pub struct RPT2GFock<'a, 'b> {
     pub timing: Vec<(String, f64)>,
 }
 
-impl<'a, 'b> RPT2GFock<'a, 'b> {
+impl<'a, 'b, O> RPT2GFock<'a, 'b, O>
+where
+    O: BlasFloat + ToPrimitive + FromPrimitive + NumAssignOps + 'static,
+{
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mo_coeff: Tsr,
         mo_occ: Tsr,
         mo_energy: Tsr,
         cderi: TsrCow<'a>,
-        cderi_vox: Option<TsrCow<'a>>,
+        cderi_vox: Option<TsrCow<'a, O>>,
         index_occ_outer_vec: Vec<usize>,
         c_os: f64,
         c_ss: f64,
@@ -130,7 +146,7 @@ impl<'a, 'b> RPT2GFock<'a, 'b> {
             index_occ_outer_vec: &self.index_occ_outer_vec,
         };
         let arg = RPT2ElecDerivIncoreArg { c_os: self.c_os, c_ss: self.c_ss };
-        let out = get_rpt2_elec_deriv_incore(&input, &arg, |x| x);
+        let out = get_rpt2_elec_deriv_incore(&input, &arg, |x| O::from_f64(x).unwrap());
 
         self.e_corr = Some(out.e_corr);
         self.result.insert("gfock_part".to_string(), out.gfock_part);
@@ -262,9 +278,16 @@ impl<'a, 'b> RPT2GFock<'a, 'b> {
     }
 }
 
-impl AnalDrvBaseAPI for RPT2GFock<'_, '_> {}
+impl<O> AnalDrvBaseAPI for RPT2GFock<'_, '_, O>
+where
+    O: BlasFloat + 'static,
+{
+}
 
-impl RGFockAPI for RPT2GFock<'_, '_> {
+impl<O> RGFockAPI for RPT2GFock<'_, '_, O>
+where
+    O: BlasFloat + ToPrimitive + FromPrimitive + NumAssignOps + 'static,
+{
     fn make_gfock(&mut self, _resp: Option<&impl RRespAPI>, parts: impl Into<BitFlags<GFockParts>>) -> Tsr {
         // The response object is held internally (`resp`); the optional argument is not used by
         // this implementation.
