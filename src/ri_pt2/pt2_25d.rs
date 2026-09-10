@@ -164,6 +164,54 @@ pub fn initialize_metadata(grid: &MPIGrid, n2_global: usize) -> Ctx25dBlock {
     }
 }
 
+/// Linear-ownership block partition for single-index-sum kernels (dRPA / SCS-RPA).
+///
+/// Unlike `initialize_metadata` (diagonal ownership on the 2D grid + row/col broadcasts,
+/// memory ≈ 2·M_total/√p, degenerating to full replication when r == 1), this variant
+/// assigns each block `blk` to the single rank `blk % P` and is meant to be paired with
+/// `redistribute_to_diag` directly (no broadcasts): every rank owns ≈ n2/P slices and the
+/// persistent memory drops to ≈ M_total/P. Only valid for kernels that need a *single*
+/// occupied slice per term (single-index response sums); pair (i,j) kernels still require
+/// the row/col coverage of `initialize_metadata`.
+///
+/// The k floor is 1 (not 2) so that small systems remain feasible: with the caller's
+/// guard n2_global >= P, num_block = k·P <= n2_global always holds.
+pub fn initialize_metadata_linear(grid: &MPIGrid, n2_global: usize) -> Ctx25dBlock {
+    let P = grid.cart_comm.size() as usize;
+    let my_rank = grid.rank as usize;
+
+    let target_block_size: usize = 8;
+    let min_blocks = (n2_global + target_block_size - 1) / target_block_size;
+    let k = std::cmp::max(1, (min_blocks + P - 1) / P);
+    let num_block = k * P;
+    assert!(num_block <= n2_global, "N2 too small for the linear 2.5d method");
+
+    let block_size = n2_global / num_block;
+    let block_residue = n2_global % num_block;
+    let mut block_start_idx: Vec<usize> = vec![0; num_block];
+    for i in 1..num_block {
+        let cur_block_size = if i <= block_residue {block_size + 1} else {block_size};
+        block_start_idx[i] = block_start_idx[i - 1] + cur_block_size;
+    }
+
+    let mut ownership: Vec<Vec<usize>> = vec![Vec::new(); P];
+    for blk in 0..num_block {
+        ownership[blk % P].push(blk);
+    }
+    let local_block_idx = ownership[my_rank].clone();
+
+    Ctx25dBlock {
+        k,
+        block_start_idx,
+        ownership,
+        row_block_idx: Vec::new(),
+        col_block_idx: Vec::new(),
+        local_block_idx,
+        block_idx_sent_row: Vec::new(),
+        block_idx_sent_col: Vec::new(),
+    }
+}
+
 /// Given a block ID, compute its owner rank in the Cartesian grid using
 /// row‑major order (rank = i * c + j). This relies on `reorder = false`
 /// when the Cartesian communicator was created.
@@ -213,7 +261,9 @@ pub fn check_memory_25d(grid: &MPIGrid, ctx: &Ctx25dBlock, slice_size: usize, n2
     return global_mem_flag;
 }
 
-fn get_available_memory_bytes() -> u64 {
+/// Per-rank available physical memory (bytes); used by the memory gates.
+#[cfg(feature = "mpi")]
+pub(crate) fn get_available_memory_bytes() -> u64 {
     // _SC_AVPHYS_PAGES: number of available physical pages
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
     let available_pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) as u64 };
@@ -235,7 +285,7 @@ fn get_available_memory_bytes() -> u64 {
 ///    owns, respecting column‑major layout.
 ///
 /// Returns a new `RIFull` with `dist_axis=2` and `local_n2_idx` set.
-fn redistribute_to_diag(grid: &MPIGrid, ctx: &Ctx25dBlock, dten: &RIFull<f64>, n0_global: usize, n0_range: &Range<usize>) -> RIFull<f64> {
+pub fn redistribute_to_diag(grid: &MPIGrid, ctx: &Ctx25dBlock, dten: &RIFull<f64>, n0_global: usize, n0_range: &Range<usize>) -> RIFull<f64> {
     assert!(dten.dist_axis == 0);
     let P = grid.cart_comm.size() as usize;
     let my_rank = grid.rank as usize;
