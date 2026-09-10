@@ -51,9 +51,10 @@ pub struct RPT2GFock<'a, 'b> {
     pub c_os: f64,
     /// Same-spin correlation factor $c_\mathrm{SS}$.
     pub c_ss: f64,
-    /// Response (fock/response) objects of the underlying SCF method. Used for the A-tensor
-    /// contraction upon rdm1 (Lagrangian) and the Z-vector (CP-SCF) solve.
-    pub resp_list: Vec<&'b mut dyn RRespAPI>,
+    /// Response (fock/response) object of the underlying SCF method (the composite `RRespSCF`,
+    /// borrowing the same SCF data as `cderi`). Used for the A-tensor contraction upon rdm1
+    /// (Lagrangian) and the Z-vector (CP-SCF) solve.
+    pub resp: &'b mut RRespSCF<'a>,
     /// Analytical-derivative configuration (CP-SCF solver settings).
     pub config: AnalDrvConfig,
     /// Cached results, keyed by tensor name.
@@ -75,7 +76,7 @@ impl<'a, 'b> RPT2GFock<'a, 'b> {
         index_occ_outer_vec: Vec<usize>,
         c_os: f64,
         c_ss: f64,
-        resp_list: Vec<&'b mut dyn RRespAPI>,
+        resp: &'b mut RRespSCF<'a>,
         config: &AnalDrvConfig,
     ) -> Self {
         Self {
@@ -87,7 +88,7 @@ impl<'a, 'b> RPT2GFock<'a, 'b> {
             index_occ_outer_vec,
             c_os,
             c_ss,
-            resp_list,
+            resp,
             config: config.clone(),
             result: HashMap::new(),
             e_corr: None,
@@ -95,13 +96,11 @@ impl<'a, 'b> RPT2GFock<'a, 'b> {
         }
     }
 
-    /// Prepare the response of all SCF response objects (must be called before the Z-vector
+    /// Prepare the response of the SCF response object (must be called before the Z-vector
     /// solve or any response contraction).
     pub fn make_response_preparation(&mut self) {
         let t0 = std::time::Instant::now();
-        for resp_obj in self.resp_list.iter_mut() {
-            resp_obj.make_response_preparation(self.mo_coeff.view(), self.mo_occ.view());
-        }
+        self.resp.make_response_preparation(self.mo_coeff.view(), self.mo_occ.view());
         self.timing.push(("in RPT2GFock, make_response_preparation".to_string(), t0.elapsed().as_secs_f64()));
     }
 
@@ -147,11 +146,7 @@ impl<'a, 'b> RPT2GFock<'a, 'b> {
             self.make_elec_deriv();
             let rdm1 = self.result["rdm1"].view();
             let dm_ao = self.mo_coeff.view() % rdm1 % self.mo_coeff.view().t();
-            let [nao, _] = dm_ao.shape().to_vec().try_into().unwrap();
-            let mut resp_ao: Tsr = rt::zeros(([nao, nao].f(), dm_ao.device()));
-            for resp_obj in self.resp_list.iter_mut() {
-                resp_ao += resp_obj.get_response_rdm(dm_ao.view());
-            }
+            let resp_ao = self.resp.get_response_rdm(dm_ao.view());
             let axd_mo = self.mo_coeff.view().t() % resp_ao % self.mo_coeff.view();
             let nocc = self.nocc();
             let nmo = self.nmo();
@@ -167,8 +162,7 @@ impl<'a, 'b> RPT2GFock<'a, 'b> {
     ///
     /// This is the antisymmetrized partial generalized Fock
     /// ($\mathscr{F}_{ai} - \mathscr{F}_{ia} = W^\texttt{3}_{ai} + W^\texttt{4}_{ai}$) plus the
-    /// SCF response upon the correlation rdm1, $A_{ai, pq} D_{pq}^{\mathrm{RDM}}$; the last
-    /// (SCF-response) term requires non-empty `resp_list`.
+    /// SCF response upon the correlation rdm1, $A_{ai, pq} D_{pq}^{\mathrm{RDM}}$.
     pub fn make_lagrangian_vo(&mut self) -> Tsr {
         if !self.result.contains_key("lagrangian") {
             let t0 = std::time::Instant::now();
@@ -179,9 +173,7 @@ impl<'a, 'b> RPT2GFock<'a, 'b> {
             let sv = rt::slice!(nocc, nmo);
             let gfock_part = self.result["gfock_part"].view();
             let mut lag = gfock_part.i((sv, so)).to_owned() - gfock_part.i((so, sv)).t();
-            if !self.resp_list.is_empty() {
-                lag += self.make_axd_vo().view();
-            }
+            lag += self.make_axd_vo().view();
             self.result.insert("lagrangian".to_string(), lag);
             self.timing.push(("in RPT2GFock, make_lagrangian_vo".to_string(), t0.elapsed().as_secs_f64()));
         }
@@ -194,7 +186,7 @@ impl<'a, 'b> RPT2GFock<'a, 'b> {
     /// $-(\varepsilon_a - \varepsilon_i) Z_{ai} - A_{ai, bj} Z_{bj} = L_{ai}$, which is solved
     /// in the dimensionless form $Z + A(Z) / (\varepsilon_a - \varepsilon_i) = - L / (\varepsilon_a
     /// - \varepsilon_i)$ by a block Krylov solver, where $A(Z)$ is evaluated by the SCF response
-    /// objects in `resp_list` (the A-tensor action upon the perturbed density; cf.
+    /// object in `resp` (the A-tensor action upon the perturbed density; cf.
     /// [`RRespAPI::get_response_bra`] and pyscf's `eri_cpks` response kernel).
     ///
     /// # Parameters
@@ -254,10 +246,7 @@ impl<'a, 'b> RPT2GFock<'a, 'b> {
     pub fn response_dimless_zvector(&mut self, mo1: TsrView) -> Tsr {
         let mo_coeff = self.mo_coeff.view();
         let ubra = &mo_coeff % &mo1;
-        let mut resp = rt::zeros_like(&mo1);
-        for resp_obj in self.resp_list.iter_mut() {
-            resp += mo_coeff.t() % resp_obj.get_response_bra(ubra.view());
-        }
+        let mut resp = mo_coeff.t() % self.resp.get_response_bra(ubra.view());
         let (_e_ai, e_ai_shift) = self.e_ai();
         let level_shift = self.config.cpscf.level_shift;
         if level_shift != 0.0 {
@@ -321,8 +310,8 @@ impl AnalDrvBaseAPI for RPT2GFock<'_, '_> {}
 
 impl RGFockAPI for RPT2GFock<'_, '_> {
     fn make_gfock(&mut self, _resp: Option<&impl RRespAPI>, parts: impl Into<BitFlags<GFockParts>>) -> Tsr {
-        // The response objects are held internally (`resp_list`); the optional argument is not
-        // used by this implementation.
+        // The response object is held internally (`resp`); the optional argument is not used by
+        // this implementation.
         let parts: BitFlags<GFockParts> = parts.into();
         assert!(
             parts.contains(GFockParts::OV) && parts.contains(GFockParts::VO),
@@ -332,15 +321,13 @@ impl RGFockAPI for RPT2GFock<'_, '_> {
         let t0 = std::time::Instant::now();
         self.make_elec_deriv();
         let mut gfock = self.result["gfock_part"].to_owned();
-        if !self.resp_list.is_empty() {
-            // add SCF response upon rdm1_corr to the vir-occupied block
-            let nocc = self.nocc();
-            let nmo = self.nmo();
-            let so = rt::slice!(0, nocc);
-            let sv = rt::slice!(nocc, nmo);
-            let axd_vo = self.make_axd_vo();
-            *&mut gfock.i_mut((sv, so)) += &axd_vo;
-        }
+        // add SCF response upon rdm1_corr to the vir-occupied block
+        let nocc = self.nocc();
+        let nmo = self.nmo();
+        let so = rt::slice!(0, nocc);
+        let sv = rt::slice!(nocc, nmo);
+        let axd_vo = self.make_axd_vo();
+        *&mut gfock.i_mut((sv, so)) += &axd_vo;
         self.result.insert("gfock".to_string(), gfock.to_owned());
         self.timing.push(("in RPT2GFock, make_gfock".to_string(), t0.elapsed().as_secs_f64()));
         gfock

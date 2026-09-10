@@ -123,7 +123,7 @@ fn test_nh3() {
     // reference values (pyscf-forge DFDH): lag_vo fro = 0.18726125698236695,
     // Z_vo fro = 0.09429288418092462, dip_resp = [-0.009197291377 -0.004474412016 0.008052718901]
     let config = AnalDrvConfig::default();
-    let (mut resp_objs, _) = rscf_resp_interface(&scf_data, &config);
+    let mut resp_objs = rscf_resp_interface(&scf_data, &config);
 
     let nocc_full = occ_list.len();
     let mut mo_occ = rt::zeros(([num_mo].f(), &device));
@@ -138,7 +138,7 @@ fn test_nh3() {
         vec![0, 2, 5],
         1.0,
         1.0,
-        resp_objs.iter_mut(),
+        &mut resp_objs,
         &config,
     );
     rgfock.make_response_preparation();

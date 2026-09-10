@@ -3,7 +3,13 @@
 use crate::analdrv::prelude::*;
 
 /// Working solver and maintainer of all hessian components for restricted SCF method.
-pub struct RHessSCF<'a> {
+///
+/// The two lifetime parameters decouple the response object's borrow from its data: `'a` is the
+/// region of the SCF data the objects borrow, `'b` the (typically shorter) borrow of `resp`
+/// itself. Bundling them into one (`&'a mut RRespSCF<'a>`) is rejected by dropck: the borrow
+/// would have to end before the referent's destructor, while that destructor pins the pointee's
+/// lifetime until the referent's drop.
+pub struct RHessSCF<'a, 'b> {
     pub mo_coeff: Tsr,
     pub mo_occ: Tsr,
     pub mo_energy: Tsr,
@@ -11,17 +17,17 @@ pub struct RHessSCF<'a> {
     pub nuc_list: Vec<&'a mut dyn HessNucAPI>,
     pub core_list: Vec<&'a mut dyn RHessCoreAPI>,
     pub el_list: Vec<&'a mut dyn RHessElecInteractAPI>,
-    /// Response (fock/response) objects for the electron-interaction contributions; the CP-SCF
-    /// machinery (`make_response_preparation`/`response_mo`) iterates this list, separate from the
-    /// skeleton-hessian objects in `el_list`.
-    pub resp_list: Vec<&'a mut dyn RRespAPI>,
+    /// Response (fock/response) object for the electron-interaction contributions (the composite
+    /// `RRespSCF` of the SCF); the CP-SCF machinery (`make_response_preparation`/`response_mo`)
+    /// calls it, separate from the skeleton-hessian objects in `el_list`.
+    pub resp: &'b mut RRespSCF<'a>,
     pub config: AnalDrvConfig,
     pub result: HashMap<String, Tsr>,
     /// Timing information. Represented by wall time in second.
     pub timing: Vec<(String, f64)>,
 }
 
-impl<'a> RHessSCF<'a> {
+impl<'a, 'b> RHessSCF<'a, 'b> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mo_coeff: Tsr,
@@ -31,7 +37,7 @@ impl<'a> RHessSCF<'a> {
         nuc_list: Vec<&'a mut dyn HessNucAPI>,
         core_list: Vec<&'a mut dyn RHessCoreAPI>,
         el_list: Vec<&'a mut dyn RHessElecInteractAPI>,
-        resp_list: Vec<&'a mut dyn RRespAPI>,
+        resp: &'b mut RRespSCF<'a>,
         config: &AnalDrvConfig,
     ) -> Self {
         Self {
@@ -42,7 +48,7 @@ impl<'a> RHessSCF<'a> {
             nuc_list,
             core_list,
             el_list,
-            resp_list,
+            resp,
             config: config.clone(),
             result: HashMap::new(),
             timing: Vec::new(),
@@ -67,8 +73,8 @@ impl<'a> RHessSCF<'a> {
         }
     }
 
-    /// Compute the dimensionless CP-SCF right-hand side, along with necessary intermediates for later
-    /// steps.
+    /// Compute the dimensionless CP-SCF right-hand side, along with necessary intermediates for
+    /// later steps.
     ///
     /// Note there are some differences compared to usual CP-SCF:
     /// - Usual CP-SCF is `(ea - ei) U - AU = B`, where now we handle something like `U + (A / (ea -
@@ -174,14 +180,12 @@ impl<'a> RHessSCF<'a> {
     /// This involves all response objects.
     pub fn make_response_preparation(&mut self) {
         let t0 = std::time::Instant::now();
-        for resp_obj in self.resp_list.iter_mut() {
-            let t1 = std::time::Instant::now();
-            resp_obj.make_response_preparation(self.mo_coeff.view(), self.mo_occ.view());
-            self.timing.push((
-                format!("in make_response_preparation, {}", resp_obj.get_type_name()),
-                t1.elapsed().as_secs_f64(),
-            ));
-        }
+        let t1 = std::time::Instant::now();
+        self.resp.make_response_preparation(self.mo_coeff.view(), self.mo_occ.view());
+        self.timing.push((
+            format!("in make_response_preparation, {}", self.resp.get_type_name()),
+            t1.elapsed().as_secs_f64(),
+        ));
         self.timing.push(("make_response_preparation".to_string(), t0.elapsed().as_secs_f64()));
     }
 
@@ -198,12 +202,9 @@ impl<'a> RHessSCF<'a> {
     pub fn response_mo(&mut self, mo1: TsrView) -> Tsr {
         let mo_coeff = self.mo_coeff.view();
         let ubra = &mo_coeff % &mo1;
-        let mut resp = rt::zeros_like(&mo1);
-        for resp_obj in self.resp_list.iter_mut() {
-            let t1 = std::time::Instant::now();
-            resp += mo_coeff.t() % resp_obj.get_response_bra(ubra.view());
-            self.timing.push((format!("in response_mo, {}", resp_obj.get_type_name()), t1.elapsed().as_secs_f64()));
-        }
+        let t1 = std::time::Instant::now();
+        let resp = mo_coeff.t() % self.resp.get_response_bra(ubra.view());
+        self.timing.push((format!("in response_mo, {}", self.resp.get_type_name()), t1.elapsed().as_secs_f64()));
         resp
     }
 
@@ -335,7 +336,8 @@ impl<'a> RHessSCF<'a> {
         let mut mo1 = mo1.to_owned();
         mo1.i_mut(sv).assign(-b1mo.i(sv) / e_ai);
 
-        // get the derivative of fock matrix in occ-occ block (derivative of orbital energy with rotation)
+        // get the derivative of fock matrix in occ-occ block (derivative of orbital energy with
+        // rotation)
         let mo_e1 = b1mo.i(so) + mo1.i(so) * e_ij;
 
         self.timing.push(("finalize_cpscf".to_string(), t0.elapsed().as_secs_f64()));
@@ -388,7 +390,8 @@ impl<'a> RHessSCF<'a> {
         de_cpscf
     }
 
-    /// Compute the CP-SCF contribution to the Hessian by running through the entire CP-SCF workflow.
+    /// Compute the CP-SCF contribution to the Hessian by running through the entire CP-SCF
+    /// workflow.
     ///
     /// - Compute the dimensionless CP-SCF right-hand side and necessary intermediates.
     /// - Prepare the response for CP-SCF calculation.
