@@ -39,6 +39,7 @@ pub mod scgw;
 pub mod display;
 pub mod fourier_self_energy;
 pub mod qsgw;
+pub mod gw_grad;
 use crate::mpi_io::MPIOperator;
 
 #[cfg(target_os = "linux")]
@@ -2682,7 +2683,7 @@ pub fn precompute_wc_rows_lowrank(
 ///   imag_n(omega) = Σ_p w_p · Σ_m 2(ω-ε_m)/((ω-ε_m)²+ω_p²) · wc_row[m] / (2π)
 /// but reads wc_row[m] instead of w_c[[n, m]]. Note wc_rows only spans the
 /// active-state range [0..nmo), matching ri_row_n.size[1].
-fn calculate_imag_from_rows(
+pub fn calculate_imag_from_rows(
     wc_rows: &Vec<(f64, f64, Vec<f64>)>,
     omega: f64,
     quasiparticle_energies_g: &Vec<f64>,
