@@ -72,6 +72,7 @@ pub fn main_driver() -> anyhow::Result<()> {
     // `log` macros, whose stdout target is not print_level-gated) are unconditional.
     // As a blanket fix, redirect the standard output of all non-root ranks to /dev/null;
     // stderr is intentionally kept so that warnings and MPI runtime errors remain visible.
+    #[cfg(feature = "mpi")]
     if let Some(mpi_op) = &mpi_operator {
         if mpi_op.rank != 0 {
             use std::os::unix::io::AsRawFd;
