@@ -1074,12 +1074,12 @@ impl<'a> BseGradEngine<'a> {
         let zero_j = vec![0.0f64; naux * naux];
         let mut grads = vec![vec![0.0f64; self.gw.natm * 3]; nk];
         for atm in 0..self.gw.natm {
+            let blocks = self.gw.raw.d_atom_blocks(atm);
             for comp in 0..3 {
-                let di = self.gw.raw.d_i_atom(atm, comp);
                 let dj = self.gw.raw.d_j_atom(atm, comp);
                 let (u, eps1, b_x) = responses[atm * 3 + comp].clone();
                 let t0 = Instant::now();
-                let qx = self.gw.qx_from_u(&di, &u);
+                let qx = self.gw.qx_from_u_blocks(&blocks, comp, &u);
                 t_qx += t0.elapsed().as_secs_f64();
                 for k in 0..nk {
                     // QP part (with Z factors) + kernel part (direct covector)

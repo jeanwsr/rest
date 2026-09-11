@@ -40,6 +40,12 @@
 //!   block-Krylov over all perturbations, RI-JK response on `rimatr`), and
 //!   the remaining blocks are restored from the differentiated Roothaan
 //!   equation, exactly as `pyscf/gw/gw_cd_grad*.py::_cp_response_atom`.
+//!
+//! The module also provides [`GwCdGradEngine`], the port of the FULL
+//! (non-low-rank) CD-G0W0 gradients of `pyscf/gw/gw_cd_grad*.py`: the
+//! static-subtracted continuous self-energy with direct (naux x naux)
+//! factorisation of the screening matrix — no low-rank truncation — and
+//! exact moving residue frequencies.  See the section header below.
 
 use crate::ri_jk::util::{get_cint_aux, get_cint_mol};
 use crate::ri_rpa::{gauss_legendre_grids, logarithmic_grid, trans_gauss_legendre_grids};
@@ -49,7 +55,9 @@ use rest_tensors::matrix::matrix_blas_lapack::{
     _dgemm_full, _dpotrf, _dsolve, _dsyev_inplace, _dtrtrs,
 };
 use tensors::{MathMatrix, MatrixFull};
+use num_complex::Complex;
 
+use std::os::raw::c_char;
 use std::time::Instant;
 
 use crate::ri_bse::bse_grad::grad_timing;
@@ -110,6 +118,11 @@ pub struct GwGradConfig {
     /// the exact mode is the smooth continuous-CD limit (PySCF-like) and is
     /// better suited to finite-difference validation.
     pub exact_residue_z: bool,
+    /// Skip the low-rank machinery of the LR engine (`qt`, `qtia`, the
+    /// real-axis grid and the low-rank factors).  Only the full-CD engine
+    /// ([`GwCdGradEngine`]) sets this; the LR-only methods then find empty
+    /// caches and must not be called.
+    pub skip_lr_cache: bool,
 }
 
 impl Default for GwGradConfig {
@@ -130,6 +143,7 @@ impl Default for GwGradConfig {
             qpe_tol: 1.0e-11,
             qpe_max_iter: 100,
             exact_residue_z: false,
+            skip_lr_cache: false,
         }
     }
 }
@@ -165,19 +179,21 @@ impl GwGradConfig {
 // raw RI tensors and their nuclear derivatives
 // ---------------------------------------------------------------------------
 
-/// Geometry-fixed raw RI data: `(mu nu | P)`, `J = (P|Q)` and the electronic
-/// derivative tensors needed to assemble any nuclear derivative `dI`, `dJ`.
+/// Geometry-fixed raw RI data: `(mu nu | P)`, `J = (P|Q)` and the machinery
+/// needed to assemble any nuclear derivative `dI`, `dJ`.
+///
+/// The electronic derivative tensors `dI1`/`dI2` are NOT stored (they would
+/// cost 2 x 3 nao^2 naux doubles, several GB at naphthalene scale).
+/// Instead, [`RawRiTensors::d_atom_blocks`] evaluates the derivative
+/// integrals shell-sliced on the perturbed atom's centers on the fly —
+/// the total integral work is identical to one full `dI1`/`dI2` build, but
+/// only one atom's blocks (O(nao_A nao naux)) are resident at a time.
 pub struct RawRiTensors {
     pub nao: usize,
     pub naux: usize,
     pub natm: usize,
     /// I[mu + nu*nao + P*nao*nao], col-major [nao, nao, naux]
     pub i3: Vec<f64>,
-    /// electronic derivative on the first AO center,
-    /// [mu + nu*nao + P*nao2 + t*nao2*naux], col-major [nao, nao, naux, 3]
-    pub di1: Vec<f64>,
-    /// same layout, derivative on the auxiliary center
-    pub di2: Vec<f64>,
     /// J[P + Q*naux]
     pub j2: Vec<f64>,
     /// dJ1[P + Q*naux + t*naux*naux]
@@ -186,6 +202,39 @@ pub struct RawRiTensors {
     pub ao_atom: Vec<usize>,
     /// auxiliary AO index -> atom
     pub aux_atom: Vec<usize>,
+    /// integral engines for the on-the-fly derivative assembly
+    pub mol: CInt,
+    pub auxmol: CInt,
+    /// per-atom [shl0, shl1] of the orbital basis
+    pub ao_shl_range: Vec<[usize; 2]>,
+    /// per-atom [ao0, ao1] of the orbital basis
+    pub ao_range: Vec<[usize; 2]>,
+    /// per-atom [shl0, shl1] of the auxiliary basis
+    pub aux_shl_range: Vec<[usize; 2]>,
+    /// per-atom [aux0, aux1]
+    pub aux_range: Vec<[usize; 2]>,
+}
+
+/// Shell-sliced derivative integral blocks of ONE perturbed atom, shared by
+/// its three Cartesian components (PySCF `gw_cd_grad_optimized.
+/// _AtomThreeCenterDerivatives`).
+pub struct AtomDerivBlocks {
+    /// dI1 slice: [nrow, nao, naux, 3] col-major, derivative on the atom's
+    /// own (bra) centers
+    pub d1: Vec<f64>,
+    /// dI2 slice: [nao, nao, naux_a, 3] col-major, derivative on the atom's
+    /// auxiliary centers
+    pub d2: Vec<f64>,
+    /// atom index
+    pub atm: usize,
+    /// first AO of the atom
+    pub row0: usize,
+    /// number of AOs of the atom
+    pub nrow: usize,
+    /// number of auxiliary functions of the atom
+    pub naux_a: usize,
+    /// first auxiliary function of the atom
+    pub aux0: usize,
 }
 
 fn atom_map_from_slices(slices: &[[usize; 4]], nao: usize) -> Vec<usize> {
@@ -208,76 +257,158 @@ pub fn build_raw_ri_tensors(scf: &SCF) -> RawRiTensors {
 
     let (i3, shape3) = CInt::integrate_cross("int3c2e", [&mol, &mol, &aux], "s1", None).into();
     assert_eq!(shape3, vec![nao, nao, naux], "int3c2e s1 shape");
-    let (di1, shape1) =
-        CInt::integrate_cross("int3c2e_ip1", [&mol, &mol, &aux], "s1", None).into();
-    assert_eq!(shape1, vec![nao, nao, naux, 3], "int3c2e_ip1 s1 shape");
-    let (di2, shape2) =
-        CInt::integrate_cross("int3c2e_ip2", [&mol, &mol, &aux], "s1", None).into();
-    assert_eq!(shape2, vec![nao, nao, naux, 3], "int3c2e_ip2 s1 shape");
 
     let (j2, shapej) = aux.integrate("int2c2e", "s1", None).into();
     assert_eq!(shapej, vec![naux, naux], "int2c2e shape");
     let (dj1, shapedj) = aux.integrate("int2c2e_ip1", "s1", None).into();
     assert_eq!(shapedj, vec![naux, naux, 3], "int2c2e_ip1 shape");
 
-    let ao_atom = atom_map_from_slices(&scf.mol.aoslice_by_atom(), nao);
-    let aux_atom = atom_map_from_slices(&scf.mol.make_auxmol_fake().aoslice_by_atom(), naux);
+    let ao_slices = scf.mol.aoslice_by_atom();
+    let aux_slices = scf.mol.make_auxmol_fake().aoslice_by_atom();
+    let range = |s: &[[usize; 4]], k0: usize, k1: usize| -> Vec<[usize; 2]> {
+        s.iter().map(|r| [r[k0], r[k1]]).collect()
+    };
 
     RawRiTensors {
         nao,
         naux,
         natm,
         i3,
-        di1,
-        di2,
         j2,
         dj1,
-        ao_atom,
-        aux_atom,
+        ao_atom: atom_map_from_slices(&ao_slices, nao),
+        aux_atom: atom_map_from_slices(&aux_slices, naux),
+        mol,
+        auxmol: aux,
+        ao_shl_range: range(&ao_slices, 0, 1),
+        ao_range: range(&ao_slices, 2, 3),
+        aux_shl_range: range(&aux_slices, 0, 1),
+        aux_range: range(&aux_slices, 2, 3),
     }
 }
 
 impl RawRiTensors {
+    /// Shell-sliced derivative integral blocks of one perturbed atom,
+    /// shared by its three Cartesian components.  The total integral work
+    /// summed over atoms equals one full `dI1`/`dI2` build, but only one
+    /// atom's blocks are resident at a time.
+    pub fn d_atom_blocks(&self, atm: usize) -> AtomDerivBlocks {
+        let row = self.ao_range[atm];
+        let nrow = row[1] - row[0];
+        let aux_r = self.aux_range[atm];
+        let naux_a = aux_r[1] - aux_r[0];
+        let shls1 = [self.ao_shl_range[atm], [0, self.mol.nbas()], [0, self.auxmol.nbas()]];
+        let (d1, shape1) = CInt::integrate_cross(
+            "int3c2e_ip1",
+            [&self.mol, &self.mol, &self.auxmol],
+            "s1",
+            &shls1,
+        )
+        .into();
+        assert_eq!(
+            shape1,
+            vec![nrow, self.nao, self.naux, 3],
+            "sliced int3c2e_ip1 shape"
+        );
+        let shls2 = [[0, self.mol.nbas()], [0, self.mol.nbas()], self.aux_shl_range[atm]];
+        let (d2, shape2) = CInt::integrate_cross(
+            "int3c2e_ip2",
+            [&self.mol, &self.mol, &self.auxmol],
+            "s1",
+            &shls2,
+        )
+        .into();
+        assert_eq!(
+            shape2,
+            vec![self.nao, self.nao, naux_a, 3],
+            "sliced int3c2e_ip2 shape"
+        );
+        AtomDerivBlocks { d1, d2, atm, row0: row[0], nrow, naux_a, aux0: aux_r[0] }
+    }
+
     /// Total nuclear derivative `dI_{mu nu P}/dR_{atm,comp}` (PySCF
-    /// `gw_cd_grad._dI_atom`): the Gaussian nuclear derivative is minus the
-    /// electronic derivative on the corresponding center.
-    pub fn d_i_atom(&self, atm: usize, comp: usize) -> Vec<f64> {
+    /// `gw_cd_grad._dI_atom`) assembled from the atom's sliced blocks: the
+    /// Gaussian nuclear derivative is minus the electronic derivative on
+    /// the corresponding center.
+    pub fn d_i_from_blocks(&self, blocks: &AtomDerivBlocks, comp: usize) -> Vec<f64> {
         let nao = self.nao;
         let naux = self.naux;
         let nao2 = nao * nao;
-        let nao2naux = nao2 * naux;
-        let mut di = vec![0.0f64; nao2naux];
-        let d1c = &self.di1[comp * nao2naux..(comp + 1) * nao2naux];
-        let d2c = &self.di2[comp * nao2naux..(comp + 1) * nao2naux];
-        for mu in 0..nao {
-            if self.ao_atom[mu] != atm {
-                continue;
-            }
+        let nrow = blocks.nrow;
+        let stride1 = nrow * nao * naux;
+        let d1c = &blocks.d1[comp * stride1..(comp + 1) * stride1];
+        let stride2 = nao2 * blocks.naux_a;
+        let d2c = &blocks.d2[comp * stride2..(comp + 1) * stride2];
+        let mut di = vec![0.0f64; nao2 * naux];
+        for mu in blocks.row0..blocks.row0 + nrow {
             for nu in 0..nao {
                 for p in 0..naux {
-                    di[mu + nu * nao + p * nao2] -= d1c[mu + nu * nao + p * nao2];
+                    di[mu + nu * nao + p * nao2] -=
+                        d1c[(mu - blocks.row0) + nu * nrow + p * nrow * nao];
                 }
             }
         }
-        for nu in 0..nao {
-            if self.ao_atom[nu] != atm {
-                continue;
-            }
+        for nu in blocks.row0..blocks.row0 + nrow {
             for mu in 0..nao {
                 for p in 0..naux {
-                    di[mu + nu * nao + p * nao2] -= d1c[nu + mu * nao + p * nao2];
+                    di[mu + nu * nao + p * nao2] -=
+                        d1c[(nu - blocks.row0) + mu * nrow + p * nrow * nao];
                 }
             }
         }
-        for p in 0..naux {
-            if self.aux_atom[p] != atm {
-                continue;
-            }
+        for p_l in 0..blocks.naux_a {
+            let p = blocks.aux0 + p_l;
             for k in 0..nao2 {
-                di[p * nao2 + k] -= d2c[p * nao2 + k];
+                di[p * nao2 + k] -= d2c[p_l * nao2 + k];
             }
         }
         di
+    }
+
+    /// One-shot derivative of one perturbation (blocks are rebuilt; prefer
+    /// [`RawRiTensors::d_atom_blocks`] + [`RawRiTensors::d_i_from_blocks`]
+    /// inside the per-atom loop).
+    pub fn d_i_atom(&self, atm: usize, comp: usize) -> Vec<f64> {
+        let blocks = self.d_atom_blocks(atm);
+        self.d_i_from_blocks(&blocks, comp)
+    }
+
+    /// Assemble the `[nao, nao]` slice of `dI` for ONE auxiliary function
+    /// `p` into `out` (col-major, overwritten).  Streaming variant of
+    /// [`RawRiTensors::d_i_from_blocks`]: lets the qx U-part-gemm consume
+    /// `dI` block by block so the full `nao^2 naux` derivative never
+    /// coexists with the full `qx`.
+    pub fn d_i_block(
+        &self,
+        blocks: &AtomDerivBlocks,
+        comp: usize,
+        p: usize,
+        out: &mut [f64],
+    ) {
+        let nao = self.nao;
+        let nao2 = nao * nao;
+        let nrow = blocks.nrow;
+        let stride1 = nrow * nao * self.naux;
+        let d1c = &blocks.d1[comp * stride1..(comp + 1) * stride1];
+        let stride2 = nao2 * blocks.naux_a;
+        let d2c = &blocks.d2[comp * stride2..(comp + 1) * stride2];
+        out.fill(0.0);
+        for mu in blocks.row0..blocks.row0 + nrow {
+            for nu in 0..nao {
+                out[mu + nu * nao] -= d1c[(mu - blocks.row0) + nu * nrow + p * nrow * nao];
+            }
+        }
+        for nu in blocks.row0..blocks.row0 + nrow {
+            for mu in 0..nao {
+                out[mu + nu * nao] -= d1c[(nu - blocks.row0) + mu * nrow + p * nrow * nao];
+            }
+        }
+        if p >= blocks.aux0 && p < blocks.aux0 + blocks.naux_a {
+            let base = (p - blocks.aux0) * nao2;
+            for k in 0..nao2 {
+                out[k] -= d2c[base + k];
+            }
+        }
     }
 
     /// Total nuclear derivative `dJ_{PQ}/dR_{atm,comp}`.
@@ -634,8 +765,12 @@ impl<'a> GwGradEngine<'a> {
             }
         }
         symmetrise_pairs(&mut q, naux, nmo);
-        // pair-slowest repack (strided once, then contiguous for the gemms)
-        let q_pairmajor: Vec<f64> = {
+        // pair-slowest repack (strided once, then contiguous for the gemms).
+        // The full-CD engine (skip_lr_cache) repacks on the fly inside
+        // qx_from_u instead, saving nao^2 naux doubles of resident memory.
+        let q_pairmajor: Vec<f64> = if config.skip_lr_cache {
+            Vec::new()
+        } else {
             let npair = nmo * nmo;
             let mut v = vec![0.0f64; naux * npair];
             for pair in 0..npair {
@@ -664,20 +799,26 @@ impl<'a> GwGradEngine<'a> {
             }
         }
 
-        // ---- metric-transformed integrals ----
-        let q_mat = to_mat(&q, naux, nmo * nmo);
-        let qt = gemm_nn(&s_metric, naux, naux, &q_mat.data, naux, nmo * nmo);
+        // ---- metric-transformed integrals (LR-only) ----
+        let qt = if config.skip_lr_cache {
+            Vec::new()
+        } else {
+            let q_mat = to_mat(&q, naux, nmo * nmo);
+            gemm_nn(&s_metric, naux, naux, &q_mat.data, naux, nmo * nmo)
+        };
 
         // ---- occupied-virtual blocks ----
         let nov = nocc * (nmo - nocc);
         let mut qia = vec![0.0f64; naux * nov];
-        let mut qtia = vec![0.0f64; naux * nov];
+        let mut qtia = vec![0.0f64; if config.skip_lr_cache { 0 } else { naux * nov }];
         for a in nocc..nmo {
             for i in 0..nocc {
                 let src = (i + a * nmo) * naux;
                 let dst = (i + (a - nocc) * nocc) * naux;
                 qia[dst..dst + naux].copy_from_slice(&q[src..src + naux]);
-                qtia[dst..dst + naux].copy_from_slice(&qt[src..src + naux]);
+                if !config.skip_lr_cache {
+                    qtia[dst..dst + naux].copy_from_slice(&qt[src..src + naux]);
+                }
             }
         }
         let mut de_ia: Vec<f64> = Vec::with_capacity(nov);
@@ -705,74 +846,108 @@ impl<'a> GwGradEngine<'a> {
             }
         };
 
-        // ---- REST real-axis grid (de_max scan + linear/quadratic nodes) ----
-        let nsemin = (nocc - 1).saturating_sub(config.selfenergy_state_range);
-        let nsemax = (nocc + config.selfenergy_state_range).min(nmo - 1);
-        let z_grid = build_real_axis_grid(
-            &e,
-            nocc,
-            config.nomega_chi_real,
-            nsemin,
-            nsemax,
-            config.nomega_sigma,
-            config.step_sigma,
-            config.res_tol,
-            config.grid_type,
-            config.omega_chi_max,
-        );
+        // ---- REST real-axis grid (de_max scan + linear/quadratic nodes;
+        //      LR-only) ----
+        let z_grid = if config.skip_lr_cache {
+            Vec::new()
+        } else {
+            let nsemin = (nocc - 1).saturating_sub(config.selfenergy_state_range);
+            let nsemax = (nocc + config.selfenergy_state_range).min(nmo - 1);
+            build_real_axis_grid(
+                &e,
+                nocc,
+                config.nomega_chi_real,
+                nsemin,
+                nsemax,
+                config.nomega_sigma,
+                config.step_sigma,
+                config.res_tol,
+                config.grid_type,
+                config.omega_chi_max,
+            )
+        };
 
-        // ---- low-rank factors ----
-        if std::env::var("REST_GWGRAD_DBG").is_ok() {
-            println!("[new DBG] qtia max = {}", qtia.iter().fold(0.0f64, |a, &x| a.max(x.abs())));
-        }
-        let lr_imag: Vec<LrFactor> = quad
-            .iter()
-            .map(|&(u, _)| {
-                build_lr_factor(&qtia, naux, nov, &de_ia, u, 'I', 0.0, config.low_rank_tolerance)
-            })
-            .collect();
-        let lr_grid: Vec<LrFactor> = z_grid
-            .iter()
-            .map(|&z| {
-                build_lr_factor(&qtia, naux, nov, &de_ia, z, 'R', config.eta, config.low_rank_tolerance)
-            })
-            .collect();
-
-        if std::env::var("REST_GWGRAD_DBG").is_ok() {
-            println!("[new DBG] lr_imag nkeeps = {:?}", lr_imag.iter().map(|f| f.eigval.len()).collect::<Vec<_>>());
-            println!("[new DBG] lr_grid nkeeps = {:?}", lr_grid.iter().map(|f| f.eigval.len()).collect::<Vec<_>>());
-        }
+        // ---- reference static-term data and low-rank factors (LR-only) ----
         let hybrid = scf.mol.xc_data.dfa_hybrid_scf;
         let fock_hyb = if scf.mol.xc_data.dfa_compnt_scf.is_empty() { 1.0 } else { hybrid };
         let vxc_nn = crate::ri_gw::vxc_ao2mo(scf);
-
-        GwGradEngine {
-            scf,
-            config,
-            raw,
-            nao,
-            naux,
-            nmo,
-            nocc,
-            natm,
-            e,
-            c_mo,
-            q,
-            q_pairmajor,
-            j_mat,
-            j_chol,
-            s_metric,
-            qt,
-            qia,
-            de_ia,
-            quad,
-            z_grid,
-            lr_imag,
-            lr_grid,
-            qtia: qtia,
-            hybrid,
-            fock_hyb,
-            vxc_nn,
+        if config.skip_lr_cache {
+            GwGradEngine {
+                scf,
+                config,
+                raw,
+                nao,
+                naux,
+                nmo,
+                nocc,
+                natm,
+                e,
+                c_mo,
+                q,
+                q_pairmajor,
+                j_mat,
+                j_chol,
+                s_metric,
+                qt,
+                qia,
+                de_ia,
+                quad,
+                z_grid,
+                lr_imag: Vec::new(),
+                lr_grid: Vec::new(),
+                qtia,
+                hybrid,
+                fock_hyb,
+                vxc_nn,
+            }
+        } else {
+            if std::env::var("REST_GWGRAD_DBG").is_ok() {
+                println!("[new DBG] qtia max = {}", qtia.iter().fold(0.0f64, |a, &x| a.max(x.abs())));
+            }
+            let lr_imag: Vec<LrFactor> = quad
+                .iter()
+                .map(|&(u, _)| {
+                    build_lr_factor(&qtia, naux, nov, &de_ia, u, 'I', 0.0, config.low_rank_tolerance)
+                })
+                .collect();
+            let lr_grid: Vec<LrFactor> = z_grid
+                .iter()
+                .map(|&z| {
+                    build_lr_factor(&qtia, naux, nov, &de_ia, z, 'R', config.eta, config.low_rank_tolerance)
+                })
+                .collect();
+            if std::env::var("REST_GWGRAD_DBG").is_ok() {
+                println!("[new DBG] lr_imag nkeeps = {:?}", lr_imag.iter().map(|f| f.eigval.len()).collect::<Vec<_>>());
+                println!("[new DBG] lr_grid nkeeps = {:?}", lr_grid.iter().map(|f| f.eigval.len()).collect::<Vec<_>>());
+            }
+            GwGradEngine {
+                scf,
+                config,
+                raw,
+                nao,
+                naux,
+                nmo,
+                nocc,
+                natm,
+                e,
+                c_mo,
+                q,
+                q_pairmajor,
+                j_mat,
+                j_chol,
+                s_metric,
+                qt,
+                qia,
+                de_ia,
+                quad,
+                z_grid,
+                lr_imag,
+                lr_grid,
+                qtia,
+                hybrid,
+                fock_hyb,
+                vxc_nn,
+            }
         }
     }
 
@@ -1493,8 +1668,25 @@ impl<'a> GwGradEngine<'a> {
     }
 
     /// Derivative of the raw three-center MO integrals for one perturbation:
-    /// `qx = C^T dI C + U^T q + q U` (pair-symmetrised).
+    /// `qx = C^T dI C + U^T q + q U` (pair-symmetrised), with `dI` supplied
+    /// as a full [naux, nao*nao] buffer.
     pub fn qx_from_u(&self, di: &[f64], u: &[f64]) -> Vec<f64> {
+        let n2 = self.nao * self.nao;
+        self.qx_from_u_getter(&|p, out| out.copy_from_slice(&di[p * n2..(p + 1) * n2]), u)
+    }
+
+    /// Same contraction with `dI` assembled block-by-block from one atom's
+    /// sliced derivative integrals — the full `dI` never coexists with `qx`.
+    pub fn qx_from_u_blocks(
+        &self,
+        blocks: &AtomDerivBlocks,
+        comp: usize,
+        u: &[f64],
+    ) -> Vec<f64> {
+        self.qx_from_u_getter(&|p, out| self.raw.d_i_block(blocks, comp, p, out), u)
+    }
+
+    fn qx_from_u_getter(&self, di_getter: &dyn Fn(usize, &mut [f64]), u: &[f64]) -> Vec<f64> {
         let nao = self.nao;
         let naux = self.naux;
         let nmo = self.nmo;
@@ -1508,7 +1700,7 @@ impl<'a> GwGradEngine<'a> {
             let mut tmp = MatrixFull::new([nao, nmo], 0.0);
             let mut sl = MatrixFull::new([nmo, nmo], 0.0);
             for p in 0..naux {
-                ip.data.copy_from_slice(&di[p * n2..(p + 1) * n2]);
+                di_getter(p, &mut ip.data);
                 _dgemm_full(&ip, 'N', &self.c_mo, 'N', &mut tmp, 1.0, 0.0);
                 _dgemm_full(&self.c_mo, 'T', &tmp, 'N', &mut sl, 1.0, 0.0);
                 for col in 0..npair {
@@ -1517,30 +1709,57 @@ impl<'a> GwGradEngine<'a> {
             }
         }
         // ---- U part: U^T q + q U.  q is pair-symmetric, so
-        //      `(qU)[p,q] = (U^T q)[q,p]`; one large gemm of the pair-major
-        //      [nmo, nmo*naux] view of q with U^T and the transposed pair add.
-        //      t1 is [nmo, nmo*naux] col-major (pair blocks per P); qx stays
-        //      in its native [naux, nmo*nmo] col-major layout ----
+        //      `(qU)[p,q] = (U^T q)[q,p]`; the pair-major [nmo, nmo*naux]
+        //      view of q is contracted with U^T in auxiliary blocks (a
+        //      full-length t1 buffer would double the qx memory footprint)
+        //      and the transposed pair is added before symmetrising; qx
+        //      stays in its native [naux, nmo*nmo] col-major layout.  The
+        //      aux block p occupies the contiguous column range
+        //      [p*nmo, (p+1)*nmo) of the pair-major view. ----
         let um = to_mat(u, nmo, nmo);
-        let q2 = to_mat(&self.q_pairmajor, nmo, nmo * naux);
-        let mut t1 = MatrixFull::new([nmo, nmo * naux], 0.0);
-        _dgemm_full(&um, 'T', &q2, 'N', &mut t1, 1.0, 0.0);
-        for p in 0..naux {
-            let base = p * npair;
-            for pj in 0..npair {
-                let pj_swap = (pj % nmo) * nmo + pj / nmo;
-                qx[p + pj * naux] += t1.data[base + pj] + t1.data[base + pj_swap];
-            }
-            // symmetrise the pair block
-            for pi in 0..nmo {
-                for pj in (pi + 1)..nmo {
-                    let a = pi + pj * nmo;
-                    let b = pj + pi * nmo;
-                    let s = 0.5 * (qx[p + a * naux] + qx[p + b * naux]);
-                    qx[p + a * naux] = s;
-                    qx[p + b * naux] = s;
+        let chunk_aux = (4_194_304 / (nmo * nmo)).clamp(1, naux);
+        let resident_pairmajor = !self.q_pairmajor.is_empty();
+        let mut p0 = 0;
+        while p0 < naux {
+            let n_chunk = (naux - p0).min(chunk_aux);
+            let nc = n_chunk * nmo;
+            // build the [nmo, n_chunk*nmo] pair-major view of the aux block:
+            // element (pi, pj_m + p_l*nmo) = q[pair*naux + p0 + p_l]
+            let q2c: Vec<f64> = if resident_pairmajor {
+                self.q_pairmajor[p0 * npair..(p0 + n_chunk) * npair].to_vec()
+            } else {
+                let mut v = vec![0.0f64; nmo * nc];
+                for pair in 0..npair {
+                    let pi = pair % nmo;
+                    let pj_m = pair / nmo;
+                    let src = pair * naux + p0;
+                    for (p_l, &val) in self.q[src..src + n_chunk].iter().enumerate() {
+                        v[pi + (pj_m + p_l * nmo) * nmo] = val;
+                    }
+                }
+                v
+            };
+            let q2cm = to_mat(&q2c, nmo, nc);
+            let mut t1v = MatrixFull::new([nmo, nc], 0.0);
+            _dgemm_full(&um, 'T', &q2cm, 'N', &mut t1v, 1.0, 0.0);
+            for p in p0..p0 + n_chunk {
+                let base = (p - p0) * npair;
+                for pj in 0..npair {
+                    let pj_swap = (pj % nmo) * nmo + pj / nmo;
+                    qx[p + pj * naux] += t1v.data[base + pj] + t1v.data[base + pj_swap];
+                }
+                // symmetrise the pair block
+                for pi in 0..nmo {
+                    for pj in (pi + 1)..nmo {
+                        let a = pi + pj * nmo;
+                        let b = pj + pi * nmo;
+                        let s = 0.5 * (qx[p + a * naux] + qx[p + b * naux]);
+                        qx[p + a * naux] = s;
+                        qx[p + b * naux] = s;
+                    }
                 }
             }
+            p0 += n_chunk;
         }
         qx
     }
@@ -1804,10 +2023,13 @@ impl GwGradEngine<'_> {
             let h1r = crate::hessian::rhf::build_hcore_first_deriv(&self.scf.mol, atm);
             let s1r = crate::ri_cphf::cphf_solver_pyscf::build_s1ao_deriv(&self.scf.mol, atm);
             t_dij += t0.elapsed().as_secs_f64();
+            // shell-sliced derivative integral blocks of this atom, shared
+            // by the three Cartesian components
+            let blocks = self.raw.d_atom_blocks(atm);
             for comp in 0..3 {
                 let k_pert = atm * 3 + comp;
                 let t0 = Instant::now();
-                let di = self.raw.d_i_atom(atm, comp);
+                let di = self.raw.d_i_from_blocks(&blocks, comp);
                 let dj = self.raw.d_j_atom(atm, comp);
                 t_dij += t0.elapsed().as_secs_f64();
                 let t0 = Instant::now();
@@ -1994,15 +2216,17 @@ impl GwGradEngine<'_> {
     /// Hartree/Bohr (row-major over atoms and Cartesian components).
     pub fn analytic_gradient(&self, target: usize) -> (Vec<f64>, f64, f64) {
         let cache = self.build_target_cache(target);
-        let (bq, bj, be, bb) = self.qp_pullback(&[&cache], &[vec![1.0]]);
+        // responses before the pullback: see analytic_gradient_with_cache
+        // for the memory-peak rationale of this order
         let responses = self.canonical_response_batch();
+        let (bq, bj, be, bb) = self.qp_pullback(&[&cache], &[vec![1.0]]);
         let mut grad = vec![0.0f64; self.natm * 3];
         for atm in 0..self.natm {
+            let blocks = self.raw.d_atom_blocks(atm);
             for comp in 0..3 {
-                let di = self.raw.d_i_atom(atm, comp);
                 let dj = self.raw.d_j_atom(atm, comp);
                 let (u, eps1, b_x) = responses[atm * 3 + comp].clone();
-                let qx = self.qx_from_u(&di, &u);
+                let qx = self.qx_from_u_blocks(&blocks, comp, &u);
                 let g = self.contract_perturbation(&bq, &bj, &be, &bb, &qx, &dj, &eps1, &b_x);
                 grad[atm * 3 + comp] = g[0];
             }
@@ -2123,6 +2347,907 @@ fn symmetrise_square(v: &mut [f64], n: usize) {
             v[a] = s;
             v[b] = s;
         }
+    }
+}
+
+// ===========================================================================
+// Full (non-low-rank) CD-G0W0 analytic gradients: pyscf.gw.gw_cd_grad port
+// ===========================================================================
+//
+// [`GwCdGradEngine`] differentiates the *static-subtracted continuous*
+// CD-G0W0 quasiparticle energy of `pyscf/gw/gw_cd_grad*.py`
+//
+//     E_n = e_n + B_n + Re Sigma_sub_nn(E_n)
+//     Sigma_sub = sum_m [ -1/pi sum_k w_k K(t_m, u_k) (W_m(iu_k) - W_m(0))
+//                         + (1/2 - f_m) W_m(0)
+//                         + s_m (W_m(zeta_m) - W_m(0)) ]
+//     t_m = omega - e_m - 1j*eta*sign(ef - e_m),   zeta_m = |e_m - omega|,
+//     s_m = -1 (occupied m above omega), +1 (virtual m below omega), else 0,
+//
+// where every `W_m(z) = q_nm^T [(J - Q(z))^-1 - J^-1] q_nm` is evaluated by
+// DIRECT factorisation of the full (naux x naux) screening matrix — no
+// low-rank truncation — at the exact moving residue frequency zeta_m
+// (REST's res_tol softening window and near-threshold half weight included,
+// matching `gw_cd_grad_optimized.sigma_subtracted`).  The screening matrix
+// is real symmetric on the imaginary axis (Cholesky, factored once per
+// geometry) and complex symmetric for z > 0 (LU through zgetrf/zgetrs).
+// The gradient pullback ports `weighted_qp_vjp`: the J^-1 (metric)
+// contributions of all three terms carry the total coefficient (1/2 - f_m)
+// and are pulled back once per cache; the imaginary-axis buckets are
+// accumulated frequency-major; the moving residues are rank-one pullbacks.
+// Only exchange-only (HF) references are supported (B_n = 0), as for the
+// low-rank engine.
+
+extern "C" {
+    fn zgetrf_(
+        m: *const i32,
+        n: *const i32,
+        a: *mut Complex<f64>,
+        lda: *const i32,
+        ipiv: *mut i32,
+        info: *mut i32,
+    );
+    fn zgetrs_(
+        trans: *const c_char,
+        n: *const i32,
+        nrhs: *const i32,
+        a: *const Complex<f64>,
+        lda: *const i32,
+        ipiv: *const i32,
+        b: *mut Complex<f64>,
+        ldb: *const i32,
+        info: *mut i32,
+    );
+}
+
+#[inline]
+fn cinv(b: Complex<f64>) -> Complex<f64> {
+    let d = b.re * b.re + b.im * b.im;
+    Complex::new(b.re / d, -b.im / d)
+}
+
+/// PySCF-convention residue screening diagonal
+/// `2 [(z + delta + 2i eta)^-1 + (-z + delta)^-1]`, `delta = e_i - e_a`.
+fn residue_d(delta: f64, z: f64, eta: f64) -> Complex<f64> {
+    2.0 * (cinv(Complex::new(z + delta, 2.0 * eta)) + cinv(Complex::new(delta - z, 0.0)))
+}
+
+/// `d/dz` of the residue diagonal: `2 [-(z+delta+2i eta)^-2 + (z-delta)^-2]`.
+fn residue_dz(delta: f64, z: f64, eta: f64) -> Complex<f64> {
+    let t2 = Complex::new(z + delta, 2.0 * eta);
+    2.0 * (-cinv(t2 * t2) + cinv(Complex::new((z - delta) * (z - delta), 0.0)))
+}
+
+/// `d/ddelta` of the residue diagonal:
+/// `2 [-(z+delta+2i eta)^-2 - (z-delta)^-2]`.
+fn residue_de(delta: f64, z: f64, eta: f64) -> Complex<f64> {
+    let t2 = Complex::new(z + delta, 2.0 * eta);
+    2.0 * (-cinv(t2 * t2) - cinv(Complex::new((z - delta) * (z - delta), 0.0)))
+}
+
+/// Static (z = 0) screening diagonal `2 [(delta + 2i eta)^-1 + delta^-1]`.
+fn static_d0(delta: f64, eta: f64) -> Complex<f64> {
+    2.0 * (cinv(Complex::new(delta, 2.0 * eta)) + cinv(Complex::new(delta, 0.0)))
+}
+
+/// `d/ddelta` of [`static_d0`]: `2 [-(delta+2i eta)^-2 - delta^-2]`.
+fn static_d0e(delta: f64, eta: f64) -> Complex<f64> {
+    let t2 = Complex::new(delta, 2.0 * eta);
+    2.0 * (-cinv(t2 * t2) - cinv(Complex::new(delta * delta, 0.0)))
+}
+
+/// Gram matrix `sum_k w_k q_k q_k^T` of the [naux, ncol] col-major buffer.
+fn scaled_gram(qia: &[f64], naux: usize, ncol: usize, w: &[f64]) -> MatrixFull<f64> {
+    let mut scaled = vec![0.0f64; naux * ncol];
+    for col in 0..ncol {
+        let wc = w[col];
+        for r in 0..naux {
+            scaled[r + col * naux] = qia[r + col * naux] * wc;
+        }
+    }
+    let sm = to_mat(&scaled, naux, ncol);
+    let qm = to_mat(qia, naux, ncol);
+    let mut out = MatrixFull::new([naux, naux], 0.0);
+    _dgemm_full(&sm, 'N', &qm, 'T', &mut out, 1.0, 0.0);
+    out
+}
+
+/// Complex-symmetric LU factorisation (zgetrf/zgetrs) shared by all
+/// right-hand sides of one screening matrix.
+struct CdLuFactor {
+    n: usize,
+    lu: Vec<Complex<f64>>,
+    ipiv: Vec<i32>,
+}
+
+impl CdLuFactor {
+    fn factor(a_re: &[f64], a_im: &[f64], n: usize) -> Self {
+        let mut lu: Vec<Complex<f64>> = a_re
+            .iter()
+            .zip(a_im.iter())
+            .map(|(&r, &i)| Complex::new(r, i))
+            .collect();
+        let mut ipiv = vec![0i32; n];
+        let mut info = 0i32;
+        let nn = n as i32;
+        unsafe { zgetrf_(&nn, &nn, lu.as_mut_ptr(), &nn, ipiv.as_mut_ptr(), &mut info) };
+        assert!(
+            info == 0,
+            "cd_gw_grad: complex screening factorisation failed (info={info})"
+        );
+        Self { n, lu, ipiv }
+    }
+
+    /// Overwrite the [n, ncol] col-major right-hand sides with `A^-1 B`.
+    fn solve_in_place(&self, b: &mut [Complex<f64>], ncol: usize) {
+        let (nn, nc) = (self.n as i32, ncol as i32);
+        let mut info = 0i32;
+        let trans = b'N' as c_char;
+        unsafe {
+            zgetrs_(
+                &trans, &nn, &nc, self.lu.as_ptr(), &nn, self.ipiv.as_ptr(),
+                b.as_mut_ptr(), &nn, &mut info,
+            )
+        };
+        assert!(
+            info == 0,
+            "cd_gw_grad: complex screening solve failed (info={info})"
+        );
+    }
+}
+
+/// Geometry-fixed full-CD screening: Cholesky factors of the real symmetric
+/// `J - Q(iu)` at every quadrature point and the LU factor of the complex
+/// symmetric `J - Q(0)`.
+pub struct CdScreening {
+    chol_imag: Vec<MatrixFull<f64>>,
+    lu_static: CdLuFactor,
+}
+
+impl CdScreening {
+    fn new(base: &GwGradEngine) -> Self {
+        let naux = base.naux;
+        let nov = base.de_ia.len();
+        let eta = base.config.eta;
+        // imaginary-axis factors: d_I = 4 delta/(u^2 + delta^2) with
+        // delta = e_i - e_a = -de_ia  =>  -4 de_ia/(u^2 + de_ia^2) (real)
+        let mut chol_imag = Vec::with_capacity(base.quad.len());
+        for &(u, _) in &base.quad {
+            let w: Vec<f64> = base
+                .de_ia
+                .iter()
+                .map(|&x| -4.0 * x / (u * u + x * x))
+                .collect();
+            let g = scaled_gram(&base.qia, naux, nov, &w);
+            let mut a = base.j_mat.clone();
+            for (av, gv) in a.data.iter_mut().zip(g.data.iter()) {
+                *av -= gv;
+            }
+            _dpotrf(&mut a, 'L');
+            chol_imag.push(a);
+        }
+        // static factor (z = 0): d0 = 2 [(delta + 2i eta)^-1 + delta^-1]
+        let mut wre = vec![0.0f64; nov];
+        let mut wim = vec![0.0f64; nov];
+        for (col, &x) in base.de_ia.iter().enumerate() {
+            let d0 = static_d0(-x, eta);
+            wre[col] = d0.re;
+            wim[col] = d0.im;
+        }
+        let gr = scaled_gram(&base.qia, naux, nov, &wre);
+        let gi = scaled_gram(&base.qia, naux, nov, &wim);
+        let mut are = base.j_mat.data.clone();
+        let mut aim = vec![0.0f64; naux * naux];
+        for k in 0..naux * naux {
+            are[k] -= gr.data[k];
+            aim[k] -= gi.data[k];
+        }
+        let lu_static = CdLuFactor::factor(&are, &aim, naux);
+        Self { chol_imag, lu_static }
+    }
+
+    /// `A(iu)^-1 B` in place, `B` real [naux, ncol] col-major.
+    fn solve_imag(&self, wi: usize, naux: usize, b: &mut [f64], ncol: usize) {
+        let mut bm = to_mat(b, naux, ncol);
+        let ok1 = _dtrtrs(&self.chol_imag[wi], &mut bm, 'L', 'N', 'N');
+        let ok2 = _dtrtrs(&self.chol_imag[wi], &mut bm, 'L', 'T', 'N');
+        assert!(ok1 && ok2, "cd_gw_grad: imaginary-axis triangular solve failed");
+        b.copy_from_slice(&bm.data);
+    }
+
+    /// `A(0)^-1 B`, `B` real [naux, ncol]; returns complex columns.
+    fn solve_static(&self, b: &[f64], ncol: usize) -> Vec<Complex<f64>> {
+        let mut bc: Vec<Complex<f64>> =
+            b.iter().map(|&v| Complex::new(v, 0.0)).collect();
+        self.lu_static.solve_in_place(&mut bc, ncol);
+        bc
+    }
+
+    /// `A(zeta)^-1 rhs` with a transient LU factor (moving residue
+    /// frequency).
+    fn solve_residue(&self, base: &GwGradEngine, zeta: f64, rhs: &[f64]) -> Vec<Complex<f64>> {
+        let naux = base.naux;
+        let nov = base.de_ia.len();
+        let eta = base.config.eta;
+        let mut wre = vec![0.0f64; nov];
+        let mut wim = vec![0.0f64; nov];
+        for (col, &x) in base.de_ia.iter().enumerate() {
+            let d = residue_d(-x, zeta, eta);
+            wre[col] = d.re;
+            wim[col] = d.im;
+        }
+        let gr = scaled_gram(&base.qia, naux, nov, &wre);
+        let gi = scaled_gram(&base.qia, naux, nov, &wim);
+        let mut are = base.j_mat.data.clone();
+        let mut aim = vec![0.0f64; naux * naux];
+        for k in 0..naux * naux {
+            are[k] -= gr.data[k];
+            aim[k] -= gi.data[k];
+        }
+        let factor = CdLuFactor::factor(&are, &aim, naux);
+        let mut b: Vec<Complex<f64>> =
+            rhs.iter().map(|&v| Complex::new(v, 0.0)).collect();
+        factor.solve_in_place(&mut b, 1);
+        b
+    }
+}
+
+/// One active residue of the static-subtracted self-energy.
+pub struct CdResidue {
+    pub m: usize,
+    /// signed pole factor `s_m * pole_factor`
+    pub s: f64,
+    /// residue frequency `zeta_m = |e_m - omega|`
+    pub zeta: f64,
+    /// `A(zeta)^-1 q_ext[:, m]`, complex [naux]
+    pub y: Vec<Complex<f64>>,
+}
+
+/// One converged QP state of the full-CD gradient: energy, Z factor and the
+/// response data needed by the pullback (port of the saved fields of
+/// `gw_cd_grad_optimized._CDCache`).
+pub struct CdQpCache {
+    pub target: usize,
+    pub omega: f64,
+    pub z_factor: f64,
+    /// `W_c[n, m](iu)` at every quadrature point [n_freq][nmo]
+    pub w_imag: Vec<Vec<f64>>,
+    /// `A(iu)^-1 q_ext` per quadrature point, real [naux * nmo] (columns m)
+    pub y_imag: Vec<Vec<f64>>,
+    /// `W_c[n, m](0)`, complex [nmo]
+    pub w0: Vec<Complex<f64>>,
+    /// `A(0)^-1 q_ext`, complex [naux * nmo]
+    pub y0_static: Vec<Complex<f64>>,
+    /// `J^-1 q_ext`, real [naux * nmo]
+    pub y0_metric: Vec<f64>,
+    pub residues: Vec<CdResidue>,
+}
+
+/// Full (non-low-rank) CD-G0W0 analytic-gradient engine for one geometry,
+/// wrapping the shared raw-RI/CPHF machinery of [`GwGradEngine`].
+pub struct GwCdGradEngine<'a> {
+    pub base: GwGradEngine<'a>,
+    pub screening: CdScreening,
+}
+
+/// Pullback of `Tr[(V_re + i V_im) dQ]` with a complex screening diagonal
+/// (PySCF `weighted_qp_vjp::polar_pullback`): `bq[ov] += 2 Re(vq * d)`,
+/// `be[occ] += bg`, `be[vir] -= bg` with `bg = qia : (vq * dd)` (real part),
+/// and `bJ -= V_re`.
+#[allow(clippy::too_many_arguments)]
+fn cd_polar_pullback_complex(
+    qia: &[f64],
+    naux: usize,
+    nov: usize,
+    nocc: usize,
+    nmo: usize,
+    bq: &mut [f64],
+    be: &mut [f64],
+    bj: &mut [f64],
+    v_re: &[f64],
+    v_im: &[f64],
+    d_re: &[f64],
+    d_im: &[f64],
+    de_re: &[f64],
+    de_im: &[f64],
+) {
+    let vqm_r = to_mat(v_re, naux, naux);
+    let vqm_i = to_mat(v_im, naux, naux);
+    let qm = to_mat(qia, naux, nov);
+    let mut vqr = MatrixFull::new([naux, nov], 0.0);
+    let mut vqi = MatrixFull::new([naux, nov], 0.0);
+    _dgemm_full(&vqm_r, 'N', &qm, 'N', &mut vqr, 1.0, 0.0);
+    _dgemm_full(&vqm_i, 'N', &qm, 'N', &mut vqi, 1.0, 0.0);
+    for col in 0..nov {
+        let i = col % nocc;
+        let a_mo = nocc + col / nocc;
+        let colp = (i + a_mo * nmo) * naux;
+        for p in 0..naux {
+            bq[colp + p] += 2.0
+                * (vqr.data[p + col * naux] * d_re[col] - vqi.data[p + col * naux] * d_im[col]);
+        }
+        let mut bg = 0.0f64;
+        for p in 0..naux {
+            bg += qia[p + col * naux]
+                * (vqr.data[p + col * naux] * de_re[col]
+                    - vqi.data[p + col * naux] * de_im[col]);
+        }
+        be[i] += bg;
+        be[a_mo] -= bg;
+    }
+    for (bv, av) in bj.iter_mut().zip(v_re.iter()) {
+        *bv -= av;
+    }
+}
+
+impl<'a> GwCdGradEngine<'a> {
+    pub fn new(scf: &'a SCF, config: GwGradConfig) -> Self {
+        let raw = build_raw_ri_tensors(scf);
+        Self::new_with_raw(scf, config, raw)
+    }
+
+    /// Engine with externally supplied raw RI tensors (for validation).
+    pub fn new_with_raw(scf: &'a SCF, config: GwGradConfig, raw: RawRiTensors) -> Self {
+        // the full-CD path never touches the low-rank machinery
+        let mut config = config;
+        config.skip_lr_cache = true;
+        let base = GwGradEngine::new_with_raw(scf, config, raw);
+        let screening = CdScreening::new(&base);
+        Self { base, screening }
+    }
+
+    fn pair_col(&self, p: usize, q: usize) -> usize {
+        self.base.pair_col(p, q)
+    }
+
+    /// Static-subtracted CD self-energy `Re Sigma_sub(omega)`, its omega
+    /// derivative, and the full response cache at `omega`.  Port of
+    /// `gw_cd_grad_optimized.sigma_subtracted` +
+    /// `d_sigma_subtracted_domega` in one pass.
+    fn sigma_sub(&self, omega: f64, n: usize) -> (f64, f64, CdQpCache) {
+        let base = &self.base;
+        let naux = base.naux;
+        let nmo = base.nmo;
+        let nocc = base.nocc;
+        let e = &base.e;
+        let eta = base.config.eta;
+        let res_tol = base.config.res_tol;
+        let ef = 0.5 * (e[nocc - 1] + e[nocc]);
+        let qext = base.gather_row(&base.q, n);
+        let mut y0m = qext.clone();
+        base.solve_metric_batch(&mut y0m, nmo);
+
+        // imaginary-axis rows
+        let mut w_imag: Vec<Vec<f64>> = Vec::with_capacity(base.quad.len());
+        let mut y_imag: Vec<Vec<f64>> = Vec::with_capacity(base.quad.len());
+        for wi in 0..base.quad.len() {
+            let mut y = qext.clone();
+            self.screening.solve_imag(wi, naux, &mut y, nmo);
+            let mut w = vec![0.0f64; nmo];
+            for m in 0..nmo {
+                let off = m * naux;
+                let mut acc = 0.0f64;
+                for p in 0..naux {
+                    acc += qext[off + p] * (y[off + p] - y0m[off + p]);
+                }
+                w[m] = acc;
+            }
+            w_imag.push(w);
+            y_imag.push(y);
+        }
+        // static row W(0) for every m
+        let y0_static = self.screening.solve_static(&qext, nmo);
+        let mut w0 = vec![Complex::new(0.0, 0.0); nmo];
+        for m in 0..nmo {
+            let off = m * naux;
+            let mut acc = Complex::new(0.0, 0.0);
+            for p in 0..naux {
+                acc += qext[off + p] * (y0_static[off + p] - Complex::new(y0m[off + p], 0.0));
+            }
+            w0[m] = acc;
+        }
+
+        let mut residues: Vec<CdResidue> = Vec::new();
+        let mut sigma = Complex::new(0.0, 0.0);
+        let mut dsigma = 0.0f64;
+        for m in 0..nmo {
+            let occupied = m < nocc;
+            let f_m = if occupied { 1.0 } else { 0.0 };
+            let t = Complex::new(omega - e[m], -eta * (ef - e[m]).signum());
+            let t2 = t * t;
+            for (wi, &(u, wt)) in base.quad.iter().enumerate() {
+                let u2 = Complex::new(u * u, 0.0);
+                let kk = t / (t2 + u2);
+                let kt = (u2 - t2) / ((t2 + u2) * (t2 + u2));
+                let dw = Complex::new(w_imag[wi][m], 0.0) - w0[m];
+                sigma -= (wt * kk * dw) / std::f64::consts::PI;
+                dsigma -= wt * (kt * dw).re / std::f64::consts::PI;
+            }
+            sigma += (0.5 - f_m) * w0[m];
+            let zeta = (e[m] - omega).abs();
+            let s_m = if occupied && omega < e[m] + res_tol {
+                -1.0
+            } else if !occupied && omega > e[m] - res_tol {
+                1.0
+            } else {
+                0.0
+            };
+            if s_m == 0.0 {
+                continue;
+            }
+            let pole_factor = if zeta < res_tol { 0.5 } else { 1.0 };
+            let qcol = &qext[m * naux..(m + 1) * naux];
+            let y_res = self.screening.solve_residue(&self.base, zeta, qcol);
+            let mut w_res = Complex::new(0.0, 0.0);
+            for p in 0..naux {
+                w_res += qcol[p] * (y_res[p] - Complex::new(y0m[m * naux + p], 0.0));
+            }
+            sigma += s_m * (pole_factor * w_res - w0[m]);
+            // d Sigma/d omega through the moving zeta_m = |e_m - omega|
+            let nov = base.de_ia.len();
+            let mut wz = 0.0f64;
+            for col in 0..nov {
+                let base_col = col * naux;
+                let mut pr = 0.0f64;
+                let mut pim = 0.0f64;
+                for p in 0..naux {
+                    pr += y_res[p].re * base.qia[p + base_col];
+                    pim += y_res[p].im * base.qia[p + base_col];
+                }
+                let p2re = pr * pr - pim * pim;
+                let p2im = 2.0 * pr * pim;
+                let dz = residue_dz(-base.de_ia[col], zeta, eta);
+                wz += p2re * dz.re - p2im * dz.im;
+            }
+            let dzeta_domega = -(e[m] - omega).signum();
+            dsigma += s_m * pole_factor * wz * dzeta_domega;
+            residues.push(CdResidue { m, s: s_m * pole_factor, zeta, y: y_res });
+        }
+        let cache = CdQpCache {
+            target: n,
+            omega,
+            z_factor: 0.0,
+            w_imag,
+            y_imag,
+            w0,
+            y0_static,
+            y0_metric: y0m,
+            residues,
+        };
+        (sigma.re, dsigma, cache)
+    }
+
+    /// Solve the QP equation of the static-subtracted continuous energy
+    /// with the analytic-derivative Newton iteration and assemble the full
+    /// response cache at the converged root (PySCF `qp_energy_subtracted`).
+    pub fn build_target_cache(&self, n: usize) -> CdQpCache {
+        let e_n = self.base.e[n];
+        let side = if n < self.base.nocc { -1.0 } else { 1.0 };
+        let mut x = e_n + side * 1.0e-2;
+        let t0 = Instant::now();
+        let mut converged = false;
+        for iter in 0..self.base.config.qpe_max_iter {
+            let (sigma, dsigma, _) = self.sigma_sub(x, n);
+            let f = x - e_n - sigma;
+            let fp = 1.0 - dsigma;
+            let shift = -f / fp;
+            if std::env::var("REST_GWGRAD_NEWTON").is_ok() {
+                println!(
+                    "[cd newton DBG] n={} it={} x={:.10} f={:+.3e} shift={:+.3e}",
+                    n, iter, x, f, shift
+                );
+            }
+            x += shift;
+            if shift.abs() < self.base.config.qpe_tol {
+                converged = true;
+                break;
+            }
+        }
+        if !converged {
+            println!(
+                "warning!!! cd_gw_grad Newton solver did not converge for orbital {}!",
+                n
+            );
+        }
+        let (_sigma, dsigma, mut cache) = self.sigma_sub(x, n);
+        cache.omega = x;
+        cache.z_factor = 1.0 / (1.0 - dsigma);
+        if grad_timing() {
+            eprintln!(
+                "[cd_gw_grad timing]   target {} newton+cache {:8.2}s",
+                n,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        cache
+    }
+
+    /// Pull weighted QP energies back onto the raw `(q, J, e, B)` covectors.
+    /// Port of `gw_cd_grad_optimized.weighted_qp_vjp` (all returned
+    /// covectors are real; the complex symmetric screening is contracted
+    /// through its real/imaginary parts with the transpose, never the
+    /// conjugate transpose).
+    pub fn cd_qp_pullback(
+        &self,
+        caches: &[&CdQpCache],
+        weights: &[Vec<f64>],
+    ) -> (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>) {
+        let t_all = Instant::now();
+        let base = &self.base;
+        let naux = base.naux;
+        let nmo = base.nmo;
+        let nocc = base.nocc;
+        let nov = base.de_ia.len();
+        let eta = base.config.eta;
+        let nk = weights.len();
+        for w in weights {
+            assert_eq!(w.len(), caches.len(), "cd_qp_pullback: weight row length mismatch");
+        }
+        let mut bq = vec![vec![0.0f64; naux * nmo * nmo]; nk];
+        let mut bj = vec![vec![0.0f64; naux * naux]; nk];
+        let mut be = vec![vec![0.0f64; nmo]; nk];
+        let mut bb = vec![vec![0.0f64; nmo]; nk];
+
+        // per-cache coefficient tables (independent of the weight row k)
+        struct Coeffs {
+            /// imag[wi][m] = -wts[wi] K(t_m, u_wi) / pi
+            imag: Vec<Vec<Complex<f64>>>,
+            /// static_coeff[m] = (1/2 - f_m) - sum_wi imag[wi][m] - active[m]
+            staticc: Vec<Complex<f64>>,
+            /// explicit t_m -> eps1[m] term of the imaginary-axis integral
+            explicit: Vec<f64>,
+        }
+        let coeffs: Vec<Coeffs> = caches
+            .iter()
+            .map(|cache| {
+                let ef = 0.5 * (base.e[nocc - 1] + base.e[nocc]);
+                let mut active = vec![0.0f64; nmo];
+                for r in &cache.residues {
+                    active[r.m] += r.s;
+                }
+                let mut imag = vec![vec![Complex::new(0.0, 0.0); nmo]; base.quad.len()];
+                let mut staticc = vec![Complex::new(0.0, 0.0); nmo];
+                let mut explicit = vec![0.0f64; nmo];
+                for m in 0..nmo {
+                    let half_minus_f = if m < nocc { -0.5 } else { 0.5 };
+                    let t = Complex::new(
+                        cache.omega - base.e[m],
+                        -eta * (ef - base.e[m]).signum(),
+                    );
+                    let t2 = t * t;
+                    let mut sum_a = Complex::new(0.0, 0.0);
+                    for (wi, &(u, wt)) in base.quad.iter().enumerate() {
+                        let u2 = Complex::new(u * u, 0.0);
+                        let kk = t / (t2 + u2);
+                        let kt = (u2 - t2) / ((t2 + u2) * (t2 + u2));
+                        let a = -wt * kk / std::f64::consts::PI;
+                        imag[wi][m] = a;
+                        sum_a += a;
+                        let dw = Complex::new(cache.w_imag[wi][m], 0.0) - cache.w0[m];
+                        explicit[m] += wt * (kt * dw).re / std::f64::consts::PI;
+                    }
+                    staticc[m] = half_minus_f - sum_a - active[m];
+                }
+                Coeffs { imag, staticc, explicit }
+            })
+            .collect();
+
+        // ---- phase A: target be/bb, explicit be and the metric (J^-1)
+        //      pullback with the exact total coefficient (1/2 - f_m) ----
+        let t_a = Instant::now();
+        for (j, cache) in caches.iter().enumerate() {
+            let n = cache.target;
+            for k in 0..nk {
+                let c = weights[k][j] * cache.z_factor;
+                if c == 0.0 {
+                    continue;
+                }
+                be[k][n] += c;
+                bb[k][n] += c;
+                for m in 0..nmo {
+                    be[k][m] += c * coeffs[j].explicit[m];
+                }
+                let mut scaled = vec![0.0f64; naux * nmo];
+                for m in 0..nmo {
+                    let am = -c * (if m < nocc { -0.5 } else { 0.5 });
+                    let off = m * naux;
+                    let col = self.pair_col(n, m) * naux;
+                    for p in 0..naux {
+                        let v = am * cache.y0_metric[off + p];
+                        scaled[off + p] = v;
+                        bq[k][col + p] += 2.0 * v;
+                    }
+                }
+                let sm = to_mat(&scaled, naux, nmo);
+                let ym = to_mat(&cache.y0_metric, naux, nmo);
+                let mut acc = MatrixFull::new([naux, naux], 0.0);
+                _dgemm_full(&sm, 'N', &ym, 'T', &mut acc, 1.0, 0.0);
+                for (bv, av) in bj[k].iter_mut().zip(acc.data.iter()) {
+                    *bv -= av;
+                }
+            }
+        }
+        let t_a = t_a.elapsed().as_secs_f64();
+
+        // ---- phase B: frequency-major imaginary-axis buckets ----
+        let t_b = Instant::now();
+        let imag_factors: Vec<(Vec<f64>, Vec<f64>)> = base
+            .quad
+            .iter()
+            .map(|&(u, _)| {
+                let mut d = vec![0.0f64; nov];
+                let mut dd = vec![0.0f64; nov];
+                for (idx, &x) in base.de_ia.iter().enumerate() {
+                    d[idx] = -4.0 * x / (x * x + u * u);
+                    dd[idx] = -4.0 * (u * u - x * x) / ((x * x + u * u) * (x * x + u * u));
+                }
+                (d, dd)
+            })
+            .collect();
+        for wi in 0..base.quad.len() {
+            let (d, dd) = &imag_factors[wi];
+            for k in 0..nk {
+                let mut v = MatrixFull::new([naux, naux], 0.0);
+                for (j, cache) in caches.iter().enumerate() {
+                    let c = weights[k][j] * cache.z_factor;
+                    if c == 0.0 {
+                        continue;
+                    }
+                    let n = cache.target;
+                    let y = &cache.y_imag[wi];
+                    let mut scaled = vec![0.0f64; naux * nmo];
+                    for m in 0..nmo {
+                        let a = c * coeffs[j].imag[wi][m].re;
+                        let off = m * naux;
+                        let col = self.pair_col(n, m) * naux;
+                        for p in 0..naux {
+                            let val = a * y[off + p];
+                            scaled[off + p] = val;
+                            bq[k][col + p] += 2.0 * val;
+                        }
+                    }
+                    let sm = to_mat(&scaled, naux, nmo);
+                    let ym = to_mat(y, naux, nmo);
+                    _dgemm_full(&sm, 'N', &ym, 'T', &mut v, 1.0, 1.0);
+                }
+                // bJ -= V and the polarizability pullback of Tr[V dQ]
+                for (bv, av) in bj[k].iter_mut().zip(v.data.iter()) {
+                    *bv -= av;
+                }
+                base.polar_pullback(&mut bq, &mut be, k, &v.data, d, dd);
+            }
+        }
+        let t_b = t_b.elapsed().as_secs_f64();
+
+        // ---- phase C: static (z = 0) bucket ----
+        let t_c = Instant::now();
+        let (d0_re, d0_im, d0e_re, d0e_im): (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) = {
+            let mut dr = vec![0.0f64; nov];
+            let mut di = vec![0.0f64; nov];
+            let mut er = vec![0.0f64; nov];
+            let mut ei = vec![0.0f64; nov];
+            for (col, &x) in base.de_ia.iter().enumerate() {
+                let d0 = static_d0(-x, eta);
+                let d0e = static_d0e(-x, eta);
+                dr[col] = d0.re;
+                di[col] = d0.im;
+                er[col] = d0e.re;
+                ei[col] = d0e.im;
+            }
+            (dr, di, er, ei)
+        };
+        for (j, cache) in caches.iter().enumerate() {
+            let n = cache.target;
+            let yr: Vec<f64> = cache.y0_static.iter().map(|z| z.re).collect();
+            let yi: Vec<f64> = cache.y0_static.iter().map(|z| z.im).collect();
+            for k in 0..nk {
+                let c = weights[k][j] * cache.z_factor;
+                if c == 0.0 {
+                    continue;
+                }
+                // P = Re(c a_m y_m), Q = Im(c a_m y_m); V = (P + iQ)(yr + i yi)^T
+                let mut pre = vec![0.0f64; naux * nmo];
+                let mut pim = vec![0.0f64; naux * nmo];
+                for m in 0..nmo {
+                    let a = c * coeffs[j].staticc[m];
+                    let off = m * naux;
+                    let col = self.pair_col(n, m) * naux;
+                    for p in 0..naux {
+                        let vr = a.re * yr[off + p] - a.im * yi[off + p];
+                        let vi = a.im * yr[off + p] + a.re * yi[off + p];
+                        pre[off + p] = vr;
+                        pim[off + p] = vi;
+                        bq[k][col + p] += 2.0 * vr;
+                    }
+                }
+                let prm = to_mat(&pre, naux, nmo);
+                let pimm = to_mat(&pim, naux, nmo);
+                let yrm = to_mat(&yr, naux, nmo);
+                let yimm = to_mat(&yi, naux, nmo);
+                let mut vr = MatrixFull::new([naux, naux], 0.0);
+                let mut vi = MatrixFull::new([naux, naux], 0.0);
+                _dgemm_full(&prm, 'N', &yrm, 'T', &mut vr, 1.0, 0.0);
+                _dgemm_full(&pimm, 'N', &yimm, 'T', &mut vr, -1.0, 1.0);
+                _dgemm_full(&pimm, 'N', &yrm, 'T', &mut vi, 1.0, 0.0);
+                _dgemm_full(&prm, 'N', &yimm, 'T', &mut vi, 1.0, 1.0);
+                cd_polar_pullback_complex(
+                    &base.qia, naux, nov, nocc, nmo, &mut bq[k], &mut be[k], &mut bj[k],
+                    &vr.data, &vi.data, &d0_re, &d0_im, &d0e_re, &d0e_im,
+                );
+            }
+        }
+        let t_c = t_c.elapsed().as_secs_f64();
+
+        // ---- phase D: rank-one moving residues ----
+        let t_d = Instant::now();
+        for (j, cache) in caches.iter().enumerate() {
+            let n = cache.target;
+            if cache.residues.is_empty() {
+                continue;
+            }
+            let nres = cache.residues.len();
+            let mut yre = vec![0.0f64; naux * nres];
+            let mut yim = vec![0.0f64; naux * nres];
+            for (ri, r) in cache.residues.iter().enumerate() {
+                for p in 0..naux {
+                    yre[ri * naux + p] = r.y[p].re;
+                    yim[ri * naux + p] = r.y[p].im;
+                }
+            }
+            // proj[res, col] = y_res^T qia[:, col]
+            let proj_re = gemm_nt(&yre, naux, nres, &base.qia, naux, nov);
+            let proj_im = gemm_nt(&yim, naux, nres, &base.qia, naux, nov);
+            // per-residue diagonals (PySCF delta convention, delta = -de_ia)
+            let mut diag: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> =
+                Vec::with_capacity(nres);
+            for r in &cache.residues {
+                let mut dr = vec![0.0f64; nov];
+                let mut di = vec![0.0f64; nov];
+                let mut er = vec![0.0f64; nov];
+                let mut ei = vec![0.0f64; nov];
+                let mut zr = vec![0.0f64; nov];
+                let mut zi = vec![0.0f64; nov];
+                for (col, &x) in base.de_ia.iter().enumerate() {
+                    let dv = residue_d(-x, r.zeta, eta);
+                    let dev = residue_de(-x, r.zeta, eta);
+                    let dzv = residue_dz(-x, r.zeta, eta);
+                    dr[col] = dv.re;
+                    di[col] = dv.im;
+                    er[col] = dev.re;
+                    ei[col] = dev.im;
+                    zr[col] = dzv.re;
+                    zi[col] = dzv.im;
+                }
+                diag.push((dr, di, er, ei, zr, zi));
+            }
+            for (ri, r) in cache.residues.iter().enumerate() {
+                let (dr, di, er, ei, zr, zi) = &diag[ri];
+                // w_zeta = Re sum_ia proj^2 dz (k-independent)
+                let mut wz = 0.0f64;
+                for col in 0..nov {
+                    let pr = proj_re[ri * nov + col];
+                    let pi = proj_im[ri * nov + col];
+                    let p2re = pr * pr - pi * pi;
+                    let p2im = 2.0 * pr * pi;
+                    wz += p2re * zr[col] - p2im * zi[col];
+                }
+                let zsign = (base.e[r.m] - cache.omega).signum();
+                for k in 0..nk {
+                    let c = weights[k][j] * cache.z_factor;
+                    if c == 0.0 {
+                        continue;
+                    }
+                    let a = c * r.s;
+                    if a == 0.0 {
+                        continue;
+                    }
+                    // bq of the external pair (n, m)
+                    let coln = self.pair_col(n, r.m) * naux;
+                    for p in 0..naux {
+                        bq[k][coln + p] += 2.0 * a * yre[ri * naux + p];
+                    }
+                    // bJ -= a Re(y y^T) (rank one)
+                    for p in 0..naux {
+                        let yr = yre[ri * naux + p];
+                        let yi = yim[ri * naux + p];
+                        for q in 0..naux {
+                            let yr2 = yre[ri * naux + q];
+                            let yi2 = yim[ri * naux + q];
+                            bj[k][p + q * naux] -= a * (yr * yr2 - yi * yi2);
+                        }
+                    }
+                    // polarizability pullback of y^T dQ y and the explicit
+                    // zeta_m -> eps1[m] term
+                    for col in 0..nov {
+                        let pr = proj_re[ri * nov + col];
+                        let pi = proj_im[ri * nov + col];
+                        let p2re = pr * pr - pi * pi;
+                        let p2im = 2.0 * pr * pi;
+                        let pd_re = pr * dr[col] - pi * di[col];
+                        let pd_im = pi * dr[col] + pr * di[col];
+                        let i = col % nocc;
+                        let a_mo = nocc + col / nocc;
+                        let colp = self.pair_col(i, a_mo) * naux;
+                        for p in 0..naux {
+                            bq[k][colp + p] +=
+                                2.0 * a * (yre[ri * naux + p] * pd_re - yim[ri * naux + p] * pd_im);
+                        }
+                        let bg = a * (p2re * er[col] - p2im * ei[col]);
+                        be[k][i] += bg;
+                        be[k][a_mo] -= bg;
+                    }
+                    be[k][r.m] += a * wz * zsign;
+                }
+            }
+        }
+        let t_d = t_d.elapsed().as_secs_f64();
+
+        // symmetrise the covectors (minimum-norm symmetric representation)
+        for k in 0..nk {
+            symmetrise_pairs(&mut bq[k], naux, nmo);
+            symmetrise_square(&mut bj[k], naux);
+        }
+        if grad_timing() {
+            eprintln!(
+                "[cd_gw_grad timing]   pullback: coeffs+metric {:7.2}s  imag {:7.2}s  static {:7.2}s  residues {:7.2}s  (total {:7.2}s)",
+                t_a,
+                t_b,
+                t_c,
+                t_d,
+                t_all.elapsed().as_secs_f64()
+            );
+        }
+        (bq, bj, be, bb)
+    }
+
+    /// Analytic gradient of one full-CD G0W0 QP energy.
+    ///
+    /// Returns `(grad, omega, z_factor)` with `grad[atm*3 + comp]` in
+    /// Hartree/Bohr (row-major over atoms and Cartesian components).
+    pub fn analytic_gradient(&self, target: usize) -> (Vec<f64>, f64, f64) {
+        let cache = self.build_target_cache(target);
+        let grad = self.analytic_gradient_with_cache(&cache);
+        (grad, cache.omega, cache.z_factor)
+    }
+
+    /// Analytic gradient from an already-converged [`CdQpCache`].
+    ///
+    /// The CP-HF batch (`canonical_response_batch`) runs BEFORE the QP
+    /// pullback so that the analdrv workspaces and the `bq` covector (plus
+    /// the per-perturbation `di`/`qx` transients) never coexist — this keeps
+    /// the peak memory of the gradient phase close to PySCF's.
+    pub fn analytic_gradient_with_cache(&self, cache: &CdQpCache) -> Vec<f64> {
+        let responses = self.base.canonical_response_batch();
+        let (bq, bj, be, bb) = self.cd_qp_pullback(&[cache], &[vec![1.0]]);
+        let mut grad = vec![0.0f64; self.base.natm * 3];
+        for atm in 0..self.base.natm {
+            let blocks = self.base.raw.d_atom_blocks(atm);
+            for comp in 0..3 {
+                let dj = self.base.raw.d_j_atom(atm, comp);
+                let (u, eps1, b_x) = responses[atm * 3 + comp].clone();
+                let qx = self.base.qx_from_u_blocks(&blocks, comp, &u);
+                let g = self.base.contract_perturbation(&bq, &bj, &be, &bb, &qx, &dj, &eps1, &b_x);
+                grad[atm * 3 + comp] = g[0];
+            }
+        }
+        grad
+    }
+
+    /// Free the geometry-fixed screening factors.  They are only needed
+    /// while QP caches are built ([`GwCdGradEngine::build_target_cache`]);
+    /// calling this before the gradient phase (`analytic_gradient_with_cache`)
+    /// lowers the peak memory.  Any further cache build afterwards would
+    /// panic.
+    pub fn release_screening(&mut self) {
+        self.screening.chol_imag = Vec::new();
+        self.screening.lu_static.lu = Vec::new();
+        self.screening.lu_static.ipiv = Vec::new();
+    }
+
+    /// QP energy of one orbital (the scalar whose gradient is returned by
+    /// [`GwCdGradEngine::analytic_gradient`]).
+    pub fn qp_energy_of(&self, target: usize) -> f64 {
+        self.build_target_cache(target).omega
     }
 }
 
@@ -2295,25 +3420,33 @@ mod layout_tests {
             }
             v
         };
+        // chunked pair-major gemm, as in qx_from_u
         let um = to_mat(u, nmo, nmo);
-        let q2 = to_mat(&q_pm, nmo, nmo * naux);
-        let mut t1 = MatrixFull::new([nmo, nmo * naux], 0.0);
-        _dgemm_full(&um, 'T', &q2, 'N', &mut t1, 1.0, 0.0);
-        for p in 0..naux {
-            let base = p * npair;
-            for pj in 0..npair {
-                let pj_swap = (pj % nmo) * nmo + pj / nmo;
-                qx[p + pj * naux] += t1.data[base + pj] + t1.data[base + pj_swap];
-            }
-            for pi in 0..nmo {
-                for pj in (pi + 1)..nmo {
-                    let a = pi + pj * nmo;
-                    let b = pj + pi * nmo;
-                    let s = 0.5 * (qx[p + a * naux] + qx[p + b * naux]);
-                    qx[p + a * naux] = s;
-                    qx[p + b * naux] = s;
+        let chunk_aux = (4_194_304 / (nmo * nmo)).clamp(1, naux);
+        let mut p0 = 0;
+        while p0 < naux {
+            let n_chunk = (naux - p0).min(chunk_aux);
+            let nc = n_chunk * nmo;
+            let q2c = to_mat(&q_pm[p0 * npair..(p0 + n_chunk) * npair], nmo, nc);
+            let mut t1v = MatrixFull::new([nmo, nc], 0.0);
+            _dgemm_full(&um, 'T', &q2c, 'N', &mut t1v, 1.0, 0.0);
+            for p in p0..p0 + n_chunk {
+                let base = (p - p0) * npair;
+                for pj in 0..npair {
+                    let pj_swap = (pj % nmo) * nmo + pj / nmo;
+                    qx[p + pj * naux] += t1v.data[base + pj] + t1v.data[base + pj_swap];
+                }
+                for pi in 0..nmo {
+                    for pj in (pi + 1)..nmo {
+                        let a = pi + pj * nmo;
+                        let b = pj + pi * nmo;
+                        let s = 0.5 * (qx[p + a * naux] + qx[p + b * naux]);
+                        qx[p + a * naux] = s;
+                        qx[p + b * naux] = s;
+                    }
                 }
             }
+            p0 += n_chunk;
         }
         qx
     }
@@ -2409,5 +3542,56 @@ mod layout_tests {
         let qnew = new_qx(nao, naux, nmo, &cmo, &q, &di, &u);
         let eq = qn.iter().zip(qnew.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
         assert!(eq < 1.0e-12, "qx mismatch {eq}");
+    }
+
+    /// link + correctness smoke test of the complex symmetric LU solve used
+    /// by the full-CD screening (zgetrf/zgetrs)
+    #[test]
+    fn cd_complex_lu_solve_matches_reference() {
+        use num_complex::ComplexFloat;
+        let n = 9usize;
+        let mut seed = 7u64;
+        // complex symmetric A = B B^T with complex B (symmetric, indefinite ok)
+        let bmat: Vec<Complex<f64>> = (0..n * n).map(|_| Complex::new(rnd(&mut seed), rnd(&mut seed))).collect();
+        let mut a_re = vec![0.0f64; n * n];
+        let mut a_im = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut acc = Complex::new(0.0, 0.0);
+                for k in 0..n {
+                    acc += bmat[i + k * n] * bmat[j + k * n];
+                }
+                a_re[i + j * n] = acc.re;
+                a_im[i + j * n] = acc.im;
+            }
+        }
+        let factor = CdLuFactor::factor(&a_re, &a_im, n);
+        let ncol = 3usize;
+        let rhs: Vec<Complex<f64>> = (0..n * ncol).map(|_| Complex::new(rnd(&mut seed), rnd(&mut seed))).collect();
+        let mut x = rhs.clone();
+        factor.solve_in_place(&mut x, ncol);
+        // verify A X = B column by column
+        for c in 0..ncol {
+            for i in 0..n {
+                let mut acc = Complex::new(0.0, 0.0);
+                for j in 0..n {
+                    acc += Complex::new(a_re[i + j * n], a_im[i + j * n]) * x[j + c * n];
+                }
+                let err = (acc - rhs[i + c * n]).abs();
+                assert!(err < 1.0e-10, "complex LU solve mismatch {err}");
+            }
+        }
+        // residue_dz/de consistency: d/dz of residue_d == residue_dz
+        let (delta, z, eta) = (-0.7, 0.31, 1.0e-3);
+        let h = 1.0e-6;
+        let fd = (residue_d(delta, z + h, eta) - residue_d(delta, z - h, eta)) / (2.0 * h);
+        let an = residue_dz(delta, z, eta);
+        assert!((fd - an).abs() < 1.0e-8, "residue_dz mismatch {fd} vs {an}");
+        let fdd = (residue_d(delta + h, z, eta) - residue_d(delta - h, z, eta)) / (2.0 * h);
+        let and = residue_de(delta, z, eta);
+        assert!((fdd - and).abs() < 1.0e-8, "residue_de mismatch {fdd} vs {and}");
+        let fd0 = (static_d0(delta + h, eta) - static_d0(delta - h, eta)) / (2.0 * h);
+        let an0 = static_d0e(delta, eta);
+        assert!((fd0 - an0).abs() < 1.0e-8, "static_d0e mismatch {fd0} vs {an0}");
     }
 }
