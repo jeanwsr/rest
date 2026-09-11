@@ -58,10 +58,17 @@ pub enum GFockParts {
 /// response object that implements `RRespAPI`. But for [`Self::make_rdm1`], we have not decided if
 /// it requires a response object (MP2 does not require this object).
 ///
-/// The trait methods take the response object as `Option<&mut dyn RRespAPI>` (and the parts as
-/// concrete `BitFlags`), so that the trait is object-safe and contribution objects can be composed
-/// into drivers as `Box<dyn RGFockAPI>`; the mutable reference allows response contractions (which
-/// cache intermediates) through the trait.
+/// The trait methods take the response object as `Option<&mut (dyn RRespAPI + 'r)>` (and the parts
+/// as concrete `BitFlags`), so that the trait is object-safe and contribution objects can be
+/// composed into drivers as `Box<dyn RGFockAPI>`; the mutable reference allows response
+/// contractions (which cache intermediates) through the trait.
+///
+/// The trait object's own lifetime bound `'r` is deliberately decoupled from the (elided) lifetime
+/// of the reference itself. In the plain `&mut dyn RRespAPI` form the object bound defaults to the
+/// reference's lifetime; since `&mut T` is invariant in `T`, such an argument could not be
+/// re-borrowed to be passed to several trait-object calls (the contribution fan-out of a composite
+/// driver). With the decoupled form, the usual `Option::as_deref_mut` re-borrow matches the
+/// higher-ranked signature of the vtable entry.
 pub trait RGFockAPI: AnalDrvBaseAPI {
     /// Make generalized Fock matrix in molecular orbital basis.
     ///
@@ -85,7 +92,7 @@ pub trait RGFockAPI: AnalDrvBaseAPI {
     ///
     /// - `gfock` : shape (nmo, nmo). Generalized Fock matrix in molecular orbital basis. Depending
     ///   on the `parts` specified, some parts of the matrix may be zero.
-    fn make_gfock(&mut self, resp: Option<&mut dyn RRespAPI>, parts: BitFlags<GFockParts>) -> Tsr;
+    fn make_gfock<'r>(&mut self, resp: Option<&mut (dyn RRespAPI + 'r)>, parts: BitFlags<GFockParts>) -> Tsr;
 
     /// Make reduced one-particle density matrix (rdm1) in molecular orbital basis.
     ///
@@ -113,5 +120,5 @@ pub trait RGFockAPI: AnalDrvBaseAPI {
     ///
     /// - `resp` : The response object that implements `RRespAPI`. See [`Self::make_gfock`] for more
     ///   details.
-    fn make_lagrangian(&mut self, resp: Option<&mut dyn RRespAPI>) -> Tsr;
+    fn make_lagrangian<'r>(&mut self, resp: Option<&mut (dyn RRespAPI + 'r)>) -> Tsr;
 }

@@ -103,7 +103,7 @@ impl<'a> RGFockAPI for RGFockKSNIMatmul<'a> {
     ///
     /// The expensive AO-space fock is cached by [`Self::make_fock_ao`]; the MO transformation of
     /// the blocks is repeated per call, and is deterministic on the cached fock.
-    fn make_gfock(&mut self, _resp: Option<&mut dyn RRespAPI>, parts: BitFlags<GFockParts>) -> Tsr {
+    fn make_gfock<'r>(&mut self, _resp: Option<&mut (dyn RRespAPI + 'r)>, parts: BitFlags<GFockParts>) -> Tsr {
         let t0 = std::time::Instant::now();
         let nocc = self.nocc();
         let nmo = self.nmo();
@@ -136,7 +136,7 @@ impl<'a> RGFockAPI for RGFockKSNIMatmul<'a> {
 
     /// Lagrangian of the XC contribution: $L_{ai} = \mathscr{F}_{ai} - \mathscr{F}_{ia} =
     /// 4 C_v^T V_{xc} C_o$ (the OV block vanishes), shape `[nvir, nocc]`. Cached on first call.
-    fn make_lagrangian(&mut self, _resp: Option<&mut dyn RRespAPI>) -> Tsr {
+    fn make_lagrangian<'r>(&mut self, _resp: Option<&mut (dyn RRespAPI + 'r)>) -> Tsr {
         if !self.intmd.contains_key("lagrangian") {
             let t0 = std::time::Instant::now();
             let nocc = self.nocc();

@@ -18,9 +18,9 @@
 //!   by $Z_{ai}$.
 //!
 //! The object does **not** own the SCF response object: the response (and the CP-SCF state
-//! behind it) belongs to the assembling driver (e.g. [`RGFockDH`]
-//! (crate::analdrv::response::rgfock_interface::RGFockDH)), and is passed into the functions
-//! that need it.
+//! behind it) belongs to the caller, and is passed through the assembling driver (e.g.
+//! [`RGFockDH`] (crate::analdrv::response::rgfock_interface::RGFockDH), which likewise does not
+//! hold it) into the functions that need it.
 //!
 //! Reference implementations: `libincoreri` `src/ri_mp2.cpp` (W3/W4 terms), `pyincoseri`
 //! `mp2_polar.py` (`get_rdm1_corr_resp`), and pyscf-forge `dh/resp.py` (`prepare_lagrangian`,
@@ -154,7 +154,7 @@ where
     /// # Parameters
     ///
     /// - `resp` : response objects of the SCF-iteration functional.
-    pub fn make_axd_vo(&mut self, resp: &mut dyn RRespAPI) -> Tsr {
+    pub fn make_axd_vo<'r>(&mut self, resp: &mut (dyn RRespAPI + 'r)) -> Tsr {
         if !self.result.contains_key("axd_vo") {
             let t0 = std::time::Instant::now();
             self.make_elec_deriv();
@@ -181,7 +181,7 @@ where
     /// # Parameters
     ///
     /// - `resp` : response objects of the SCF-iteration functional.
-    pub fn make_lagrangian_vo(&mut self, resp: &mut dyn RRespAPI) -> Tsr {
+    pub fn make_lagrangian_vo<'r>(&mut self, resp: &mut (dyn RRespAPI + 'r)) -> Tsr {
         if !self.result.contains_key("lagrangian") {
             let t0 = std::time::Instant::now();
             self.make_elec_deriv();
@@ -247,7 +247,7 @@ impl<O> RGFockAPI for RGFockPT2<'_, O>
 where
     O: BlasFloat + ToPrimitive + FromPrimitive + NumAssignOps + 'static,
 {
-    fn make_gfock(&mut self, resp: Option<&mut dyn RRespAPI>, parts: BitFlags<GFockParts>) -> Tsr {
+    fn make_gfock<'r>(&mut self, resp: Option<&mut (dyn RRespAPI + 'r)>, parts: BitFlags<GFockParts>) -> Tsr {
         let resp = resp.expect(
             "RI-PT2 generalized Fock requires the response object (for the SCF response upon rdm1_corr)",
         );
@@ -276,7 +276,7 @@ where
         self.result["rdm1"].to_owned()
     }
 
-    fn make_lagrangian(&mut self, resp: Option<&mut dyn RRespAPI>) -> Tsr {
+    fn make_lagrangian<'r>(&mut self, resp: Option<&mut (dyn RRespAPI + 'r)>) -> Tsr {
         let resp = resp.expect("RI-PT2 Lagrangian requires the response object (for the SCF response upon rdm1_corr)");
         self.make_lagrangian_vo(resp)
     }

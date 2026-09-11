@@ -138,14 +138,14 @@ fn test_nh3() {
     println!("Lagrangian PT2 part (fro): {lag_pt2_fro} (ref 0.08654174685311)");
     assert!((lag_pt2_fro - 0.08654174685311).abs() < 1e-6, "PT2 Lagrangian fro mismatch");
 
-    let mut rgfock = rgfock_dh_interface::<f64>(&scf_data, &mut resp_objs);
-    rgfock.make_response_preparation();
+    let mut rgfock = rgfock_dh_interface::<f64>(&scf_data);
+    rgfock.make_response_preparation(&mut resp_objs);
 
     // the composite's summed unrelaxed rdm1 (only the PT2 element contributes) agrees with the
     // standalone PT2 evaluation
     assert!(rt::allclose(&rgfock.make_rdm1(), &rdm1_corr, None));
 
-    let lag_total = rgfock.make_lagrangian(None);
+    let lag_total = rgfock.make_lagrangian(Some(&mut resp_objs));
     let lag_total_fro = (&lag_total * &lag_total).sum().sqrt();
     println!("Lagrangian total (fro): {lag_total_fro} (ref 0.33338836293131)");
     assert!((lag_total_fro - 0.33338836293131).abs() < 1e-5, "total Lagrangian fro mismatch");
@@ -156,7 +156,10 @@ fn test_nh3() {
     assert!((lag_xc_n_fro - 0.40098670506446).abs() < 2e-5, "xc_n Lagrangian fro mismatch");
 
     // generalized Fock of the DH composite (blocks: PT2 OV/VO + final-functional OO/VO)
-    let gfock = rgfock.make_gfock(None, GFockParts::OO | GFockParts::OV | GFockParts::VO | GFockParts::VV);
+    let gfock = rgfock.make_gfock(
+        Some(&mut resp_objs),
+        GFockParts::OO | GFockParts::OV | GFockParts::VO | GFockParts::VV,
+    );
     let nocc = rgfock.nocc();
     let nmo = rgfock.nmo();
     let so = rt::slice!(0, nocc);
@@ -164,7 +167,7 @@ fn test_nh3() {
     println!("gfock (VO block): {:16.12}", gfock.i((sv, so)));
 
     // 4. response (Z-vector / CP-SCF) contribution through the relaxed density
-    let rdm1_resp = rgfock.make_rdm1_resp();
+    let rdm1_resp = rgfock.make_rdm1_resp(&mut resp_objs);
     let dz_mo = &rdm1_resp - &rdm1_corr;
     let dz_ao = mo_coeff.view() % dz_mo.view() % mo_coeff.view().t();
     let dip_resp = -(&int1e_r * &dz_ao).sum_axes([0, 1]);

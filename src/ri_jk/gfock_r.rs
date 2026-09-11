@@ -135,7 +135,7 @@ impl<'a> RGFockAPI for RGFockRIJK<'a> {
     /// The expensive AO→occupied contraction is cached by [`Self::make_fock_ao_occ`]; the MO
     /// transformation of the blocks is repeated per call, and is deterministic on the cached
     /// tensor.
-    fn make_gfock(&mut self, _resp: Option<&mut dyn RRespAPI>, parts: BitFlags<GFockParts>) -> Tsr {
+    fn make_gfock<'r>(&mut self, _resp: Option<&mut (dyn RRespAPI + 'r)>, parts: BitFlags<GFockParts>) -> Tsr {
         let t0 = std::time::Instant::now();
         let nocc = self.nocc();
         let nmo = self.nmo();
@@ -168,7 +168,7 @@ impl<'a> RGFockAPI for RGFockRIJK<'a> {
 
     /// Lagrangian of the RI-JK contribution: $L_{ai} = \mathscr{F}_{ai} - \mathscr{F}_{ia} =
     /// 4 C_v^T V C_o$ (the OV block vanishes), shape `[nvir, nocc]`. Cached on first call.
-    fn make_lagrangian(&mut self, _resp: Option<&mut dyn RRespAPI>) -> Tsr {
+    fn make_lagrangian<'r>(&mut self, _resp: Option<&mut (dyn RRespAPI + 'r)>) -> Tsr {
         if !self.intmd.contains_key("lagrangian") {
             let t0 = std::time::Instant::now();
             let nocc = self.nocc();

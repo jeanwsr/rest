@@ -17,7 +17,8 @@
 //!   (`W`-terms), the unrelaxed rdm1, and the SCF response upon that rdm1 — an element of the
 //!   contribution list like the others, not a special member.
 //!
-//! The driver owns the SCF-iteration functional's response object ([`RRespSCF`]) for the A-tensor
+//! The driver does not own the SCF-iteration functional's response object ([`RRespSCF`]): it is
+//! supplied by the caller as a mutable argument to the methods that need it — the A-tensor
 //! contractions and the Z-vector (CP-SCF) solve ([`solve_z_vector`], the DH-level Handy-Schaefer
 //! solve); the relaxed density is the unrelaxed rdm1 with its vir-occupied block replaced by the
 //! Z-vector.
@@ -124,22 +125,19 @@ pub fn solve_z_vector(lag_vo: TsrView, resp: &mut RRespSCF) -> Tsr {
 /// implementation sums the contributions; the relaxed (response) density is the unrelaxed rdm1
 /// with its vir-occupied block replaced by the Z-vector solved from the combined Lagrangian.
 ///
+/// The response object of the SCF-iteration functional is not stored (cf. [`RGFockPT2`], which
+/// follows the same convention): it is passed as a mutable argument to the methods that need it.
+///
 /// # Structure
 ///
 /// - `gfock_list` : the contribution objects (including the PT2 correlation one); open-ended for
 ///   further contributions.
-/// - `resp` : the response objects of the SCF-iteration functional (e.g. from
-///   [`rscf_resp_interface`](super::rresp_interface::rscf_resp_interface)), used for the A-tensor
-///   contractions and the Z-vector (CP-SCF) solve.
 ///
-pub struct RGFockDH<'a, 'b> {
+pub struct RGFockDH<'a> {
     /// Generalized-Fock contribution objects: the final-energy functional's density-only parts
     /// (core Hamiltonian, RI-JK Coulomb/exchange, DFT XC numint) and the RI-PT2 correlation
     /// contribution.
     pub gfock_list: Vec<Box<dyn RGFockAPI + 'a>>,
-    /// Response objects of the SCF-iteration functional, used for the A-tensor contractions and
-    /// the Z-vector (CP-SCF) solve.
-    pub resp: &'b mut RRespSCF<'a>,
     /// Molecular orbital coefficients, shape `[nao, nmo]`.
     pub mo_coeff: Tsr,
     /// Occupation numbers, shape `[nmo]`.
@@ -152,41 +150,48 @@ pub struct RGFockDH<'a, 'b> {
     pub timing: Vec<(String, f64)>,
 }
 
-impl<'a, 'b> RGFockDH<'a, 'b> {
-    /// Create the composite from the contribution objects and the response object.
+impl<'a> RGFockDH<'a> {
+    /// Create the composite from the contribution objects.
     ///
     /// # Parameters
     ///
     /// - `gfock_list` : the generalized-Fock contribution objects (density-only parts of the
     ///   final-energy functional plus the PT2 correlation contribution).
-    /// - `resp` : response objects of the SCF-iteration functional.
     /// - `mo_coeff` : shape `[nao, nmo]`. Molecular orbital coefficients.
     /// - `mo_occ` : shape `[nmo]`. Occupation numbers.
     /// - `mo_energy` : shape `[nmo]`. Molecular orbital energies.
     pub fn new(
         gfock_list: Vec<Box<dyn RGFockAPI + 'a>>,
-        resp: &'b mut RRespSCF<'a>,
         mo_coeff: Tsr,
         mo_occ: Tsr,
         mo_energy: Tsr,
     ) -> Self {
-        Self { gfock_list, resp, mo_coeff, mo_occ, mo_energy, result: HashMap::new(), timing: Vec::new() }
+        Self { gfock_list, mo_coeff, mo_occ, mo_energy, result: HashMap::new(), timing: Vec::new() }
     }
 
     /// Prepare the response object (must be called before the Z-vector solve or any response
     /// contraction). This also stores the orbital state in the response object for its inherent
-    /// CP-SCF machinery.
-    pub fn make_response_preparation(&mut self) {
+    /// CP-SCF machinery, using the orbitals of this driver.
+    ///
+    /// # Parameters
+    ///
+    /// - `resp` : response objects of the SCF-iteration functional, mutably.
+    pub fn make_response_preparation(&mut self, resp: &mut RRespSCF) {
         let t0 = std::time::Instant::now();
-        self.resp.make_cpscf_preparation(self.mo_coeff.view(), self.mo_occ.view(), self.mo_energy.view());
+        resp.make_cpscf_preparation(self.mo_coeff.view(), self.mo_occ.view(), self.mo_energy.view());
         self.timing.push(("in RGFockDH, make_response_preparation".to_string(), t0.elapsed().as_secs_f64()));
     }
 
     /// Solve the Z-vector equation for the given Lagrangian $L_{ai}$ through the response object,
     /// caching the result under `z_vector`. Shape `[nmo, nocc]`; see [`solve_z_vector`].
-    pub fn solve_z_vector(&mut self, lag_vo: TsrView) -> Tsr {
+    ///
+    /// # Parameters
+    ///
+    /// - `lag_vo` : shape `[nvir, nocc]`. The Lagrangian $L_{ai}$.
+    /// - `resp` : response objects of the SCF-iteration functional, mutably.
+    pub fn solve_z_vector(&mut self, lag_vo: TsrView, resp: &mut RRespSCF) -> Tsr {
         let t0 = std::time::Instant::now();
-        let z = solve_z_vector(lag_vo, self.resp);
+        let z = solve_z_vector(lag_vo, resp);
         self.result.insert("z_vector".to_string(), z.to_owned());
         self.timing.push(("in RGFockDH, solve_z_vector".to_string(), t0.elapsed().as_secs_f64()));
         self.result["z_vector"].to_owned()
@@ -197,11 +202,15 @@ impl<'a, 'b> RGFockDH<'a, 'b> {
     /// This is the unrelaxed rdm1 (of the PT2 contribution; the density-only parts contribute
     /// none) with its vir-occupied block replaced by the Z-vector solved from the combined
     /// Lagrangian of all contributions.
-    pub fn make_rdm1_resp(&mut self) -> Tsr {
+    ///
+    /// # Parameters
+    ///
+    /// - `resp` : response objects of the SCF-iteration functional, mutably.
+    pub fn make_rdm1_resp(&mut self, resp: &mut RRespSCF) -> Tsr {
         if !self.result.contains_key("rdm1_resp") {
             let t0 = std::time::Instant::now();
-            let lag = self.make_lagrangian(None);
-            let z = self.solve_z_vector(lag.view());
+            let lag = self.make_lagrangian(Some(resp));
+            let z = self.solve_z_vector(lag.view(), resp);
             let mut rdm1_resp = self.make_rdm1();
             let nocc = self.nocc();
             let nmo = self.nmo();
@@ -225,20 +234,20 @@ impl<'a, 'b> RGFockDH<'a, 'b> {
     }
 }
 
-impl AnalDrvBaseAPI for RGFockDH<'_, '_> {}
+impl AnalDrvBaseAPI for RGFockDH<'_> {}
 
-impl RGFockAPI for RGFockDH<'_, '_> {
+impl RGFockAPI for RGFockDH<'_> {
     /// Generalized Fock of the DH method: the sum of the contribution objects' generalized Fock
     /// matrices. Note the PT2 element requires both OV and VO parts to be requested (its W-terms
     /// fill exactly these blocks).
     ///
-    /// The response object is held internally (`resp`); the optional argument is not used by this
-    /// implementation.
-    fn make_gfock(&mut self, _resp: Option<&mut dyn RRespAPI>, parts: BitFlags<GFockParts>) -> Tsr {
+    /// The response object argument is passed through to the contribution objects; the PT2 element
+    /// requires it.
+    fn make_gfock<'r>(&mut self, mut resp: Option<&mut (dyn RRespAPI + 'r)>, parts: BitFlags<GFockParts>) -> Tsr {
         let t0 = std::time::Instant::now();
         let mut gfock: Option<Tsr> = None;
         for gfock_obj in self.gfock_list.iter_mut() {
-            let gfock_obj_part = gfock_obj.make_gfock(Some(&mut *self.resp), parts);
+            let gfock_obj_part = gfock_obj.make_gfock(resp.as_deref_mut(), parts);
             gfock = Some(match gfock {
                 Some(gfock) => gfock + gfock_obj_part,
                 None => gfock_obj_part,
@@ -267,13 +276,13 @@ impl RGFockAPI for RGFockDH<'_, '_> {
     /// $W^\texttt{3} + W^\texttt{4} + A_{ai, pq} D_{pq}^{\mathrm{RDM}}$, the density-only ones
     /// $4 C_v^T V C_o$ each). Shape `[nvir, nocc]`.
     ///
-    /// The response object is held internally (`resp`); the optional argument is not used by this
-    /// implementation.
-    fn make_lagrangian(&mut self, _resp: Option<&mut dyn RRespAPI>) -> Tsr {
+    /// The response object argument is passed through to the contribution objects; the PT2 element
+    /// requires it.
+    fn make_lagrangian<'r>(&mut self, mut resp: Option<&mut (dyn RRespAPI + 'r)>) -> Tsr {
         let t0 = std::time::Instant::now();
         let mut lagrangian: Option<Tsr> = None;
         for gfock_obj in self.gfock_list.iter_mut() {
-            let lag_obj = gfock_obj.make_lagrangian(Some(&mut *self.resp));
+            let lag_obj = gfock_obj.make_lagrangian(resp.as_deref_mut());
             lagrangian = Some(match lagrangian {
                 Some(lagrangian) => lagrangian + lag_obj,
                 None => lag_obj,
@@ -290,12 +299,14 @@ impl RGFockAPI for RGFockDH<'_, '_> {
 ///
 /// The returned [`RGFockDH`] holds the contribution objects of the final-energy functional (core
 /// Hamiltonian, RI-JK with `dfa_hybrid_pos`, DFT XC of `dfa_compnt_pos` on the common SCF grid)
-/// and the RI-PT2 correlation driver with the `dfa_paramr_adv` spin factors, built on the supplied
-/// response object `resp` (the SCF-iteration functional's response, e.g. from
-/// [`rscf_resp_interface`](super::rresp_interface::rscf_resp_interface)).
+/// and the RI-PT2 correlation driver with the `dfa_paramr_adv` spin factors. The response object
+/// of the SCF-iteration functional (e.g. from
+/// [`rscf_resp_interface`](super::rresp_interface::rscf_resp_interface)) is not held by the
+/// returned driver: pass it as a mutable argument to the driver methods that need one, after its
+/// preparation with the same orbitals ([`RGFockDH::make_response_preparation`]).
 ///
-/// The CP-SCF solver settings (including the Z-vector level shift) are those of the supplied
-/// response object, captured when it was built.
+/// The CP-SCF solver settings (including the Z-vector level shift) are those of the response
+/// object supplied by the caller, captured when it was built.
 ///
 /// # Parameters
 ///
@@ -303,11 +314,7 @@ impl RGFockAPI for RGFockDH<'_, '_> {
 ///   part additionally requires the SCF grids (`scf_data.grids`) to be present — note that
 ///   [`xdh_calculations`](crate::ri_pt2::xdh_calculations) frees the grids, so this interface
 ///   must be called before it, or the grids must be regenerated in between.
-/// - `resp` : the response objects of the SCF-iteration functional.
-pub fn rgfock_dh_interface<'a, 'b, O>(
-    scf_data: &'a SCF,
-    resp: &'b mut RRespSCF<'a>,
-) -> RGFockDH<'a, 'b>
+pub fn rgfock_dh_interface<'a, O>(scf_data: &'a SCF) -> RGFockDH<'a>
 where
     O: BlasFloat + ToPrimitive + FromPrimitive + NumAssignOps + 'static,
 {
@@ -399,5 +406,5 @@ where
         c_ss,
     )));
 
-    RGFockDH::new(gfock_list, resp, mo_coeff, mo_occ, mo_energy)
+    RGFockDH::new(gfock_list, mo_coeff, mo_occ, mo_energy)
 }

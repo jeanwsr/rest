@@ -64,7 +64,7 @@ impl AnalDrvBaseAPI for RGFockHcore {}
 impl RGFockAPI for RGFockHcore {
     /// Generalized Fock of the core Hamiltonian: only the OO and VO blocks are filled
     /// ($4 C_p^T h C_q$ with $q$ occupied); the OV and VV blocks are identically zero.
-    fn make_gfock(&mut self, _resp: Option<&mut dyn RRespAPI>, parts: BitFlags<GFockParts>) -> Tsr {
+    fn make_gfock<'r>(&mut self, _resp: Option<&mut (dyn RRespAPI + 'r)>, parts: BitFlags<GFockParts>) -> Tsr {
         let nocc = self.nocc();
         let nmo = self.nmo();
         let so = rt::slice!(0, nocc);
@@ -94,7 +94,7 @@ impl RGFockAPI for RGFockHcore {
 
     /// Lagrangian of the core Hamiltonian: $4 C_v^T h C_o$, shape `[nvir, nocc]`. Cached on first
     /// call.
-    fn make_lagrangian(&mut self, _resp: Option<&mut dyn RRespAPI>) -> Tsr {
+    fn make_lagrangian<'r>(&mut self, _resp: Option<&mut (dyn RRespAPI + 'r)>) -> Tsr {
         if !self.intmd.contains_key("lagrangian") {
             let nocc = self.nocc();
             let nmo = self.nmo();
