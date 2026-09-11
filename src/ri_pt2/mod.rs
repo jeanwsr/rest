@@ -20,6 +20,10 @@ use tensors::matrix_blas_lapack::{_dsymm, _dgemm};
 #[cfg(feature = "mpi")]
 use crate::ri_pt2::pt2_aslide::{initialize_metadata_ASlide, redistribute_batch_reverse_w_truncation};
 use crate::ri_pt2::pt2_25d::{initialize_metadata, initialize_metadata_linear, check_memory_25d, swap_ownership, local_computation_close_shell_batch, local_computation_ss_batch, local_computation_os_batch};
+use crate::ri_pt2::pt2_ASlide::{initialize_metadata_ASlide, redistribute_batch_reverse_w_truncation, computation_close_shell_aslide};
+
+#[cfg(feature = "mpi")]
+use serviceportal::ServicePortal;
 
 use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon,open_shell_sbge2_rayon};
 use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon, evaluate_osrpa_correlation_rayon_mpi};
@@ -37,7 +41,9 @@ use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_thread
 #[cfg(feature = "mpi")]
 pub mod pt2_25d;
 #[cfg(feature = "mpi")]
-pub mod pt2_aslide;
+pub mod serviceportal;
+#[cfg(feature = "mpi")]
+pub mod pt2_ASlide;
 
 pub mod sbge2;
 pub mod sbge2_25d;
@@ -249,6 +255,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
                     _ => [0.0,0.0,0.0]
                 }
             };
+            let pt2_tmp = close_shell_pt2_rayon_mpi_aslide(scf_data, mpi_operator).unwrap();
         }
         if !use_25d {
             pt2_c = match scf_data.scftype {
@@ -2991,8 +2998,8 @@ pub fn close_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Optio
             panic!("Memory distrubtion should be initalized for the auxiliary basis sets before post-SCF calculations")
         };
 
-        let mut global_term_os:f64 = 0.0_f64;
-        let mut global_term_ss:f64 = 0.0_f64;
+        let mut global_os:f64 = 0.0_f64;
+        let mut global_ss:f64 = 0.0_f64;
         if let Some(ri3mo_vec) = &mut scf_data.ri3mo {
 
             let eigenvector = scf_data.eigenvectors.get(0).unwrap();
@@ -3012,8 +3019,8 @@ pub fn close_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Optio
             let n1_global = rimo.size[1];
             let n2_global = rimo.size[2];
 
-            println!("rank:{}, tensor_size=({},{},{}), local_n0_range:{:?})",
-                my_rank, n0_local, n1_global, n2_global, local_n0_range);
+            //println!("rank:{}, tensor_size=({},{},{}), local_n0_range:{:?})",
+                //my_rank, n0_local, n1_global, n2_global, local_n0_range);
 
             let mut n0_global_tmp: u64 = 0;
             mpi_op.world.all_reduce_into(&(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
@@ -3021,10 +3028,15 @@ pub fn close_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Optio
             let ctx = initialize_metadata_ASlide(mpi_op, n0_global, n1_global, n2_global, true);
             let redistributed_rimo = redistribute_batch_reverse_w_truncation(mpi_op, &ctx, rimo, n0_global, &local_n0_range);
             assert_eq!(rimo.data.len(), 0);
-
-
+            let (local_os, local_ss) = computation_close_shell_aslide(mpi_op, &redistributed_rimo, &ctx, n0_global, n1_global, n2_global,
+                                                                    eigenvalues, occupation, occ_range.start, vir_range.start);
+            mpi_op.world.all_reduce_into(&local_os, &mut global_os, SystemOperation::sum());
+            mpi_op.world.all_reduce_into(&local_ss, &mut global_ss, SystemOperation::sum());
         }
-        Ok([global_term_os + global_term_ss, global_term_os, global_term_ss])
+        if my_rank == 0 {
+            println!("os + ss = {}, os = {}, ss = {}", global_os + global_ss, global_os, global_ss);
+        }
+        Ok([global_os + global_ss, global_os, global_ss])
     }
     else {
         panic!("MPI not initialized for aslide");
