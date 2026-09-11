@@ -8,8 +8,9 @@
 //! The API design document is not written at this time, but will be available in the future.
 //!
 //! This module will host drivers for all types of ground state analytical derivative properties.
-//! Currently only hessian property is implemented, grouped in the [`hessian`] submodule; other
-//! properties (such as gradient) may come in future, and this module may be further refactored then.
+//! Currently the hessian property is implemented, grouped in the [`hessian`] submodule, and the
+//! electric multipole moments in the [`multipole`] submodule; other properties (such as gradient)
+//! may come in future, and this module may be further refactored then.
 //!
 //! This module should work in most cases, but still requires further testing and efficiency update.
 //!
@@ -54,6 +55,9 @@ pub mod hessian;
 // energy response to orbitals and density matrix
 pub mod response;
 
+// electric multipole moment property
+pub mod multipole;
+
 #[allow(unused_imports)]
 pub mod prelude {
     use super::*;
@@ -66,6 +70,9 @@ pub mod prelude {
     pub use hessian::trait_rhess::{HessNucAPI, RHessCoreAPI, RHessElecInteractAPI};
     pub use hessian::trait_uhess::{UHessCoreAPI, UHessElecInteractAPI};
     pub use hessian::uscf::UHessSCF;
+    pub use multipole::nuc_charge::MultipoleNucCharge;
+    pub use multipole::rmultipole::RMultipoleDH;
+    pub use multipole::trait_multipole::MultipoleNucAPI;
     pub use response::rresp_interface::RRespSCF;
     pub use response::trait_rresp::RRespAPI;
     pub use trait_util::AnalDrvBaseAPI;
