@@ -28,7 +28,8 @@ pub struct RGFockHcore {
     /// The parts of `gfock` that have been evaluated. The OV and VV parts are zero by
     /// definition for this contribution, and are pre-marked as evaluated.
     pub gfock_flags: BitFlags<GFockFlags>,
-    /// Cached results, keyed by tensor name.
+    /// Cached results, keyed by tensor name (`fock_ao_occ` : the occupied columns of the
+    /// AO-space fock contribution).
     pub intmd: HashMap<String, Tsr>,
     /// Timing information. Represented by wall time in second.
     pub timing: Vec<(String, f64)>,
@@ -57,11 +58,15 @@ impl RGFockHcore {
     }
 
     /// The occupied columns of the core Hamiltonian contracted into MO coefficients,
-    /// `4 * h @ Co`, shape `[nao, nocc]`.
+    /// `4 * h @ Co`, shape `[nao, nocc]`. Cached on first call.
     fn make_fock_ao_occ(&mut self) -> Tsr {
-        let occidx = self.mo_occ.view().greater(0).into_vec();
-        let mocc = self.mo_coeff.bool_select(-1, &occidx).into_contig(ColMajor);
-        &self.hcore % mocc.view()
+        if !self.intmd.contains_key("fock_ao_occ") {
+            let occidx = self.mo_occ.view().greater(0).into_vec();
+            let mocc = self.mo_coeff.bool_select(-1, &occidx).into_contig(ColMajor);
+            let fock_ao_occ = &self.hcore % mocc.view();
+            self.intmd.insert("fock_ao_occ".to_string(), fock_ao_occ);
+        }
+        self.intmd["fock_ao_occ"].to_owned()
     }
 
     /// Number of occupied orbitals (occupation number greater than zero).

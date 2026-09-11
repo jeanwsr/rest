@@ -1287,7 +1287,19 @@ impl<'a> UHessElecInteractAPI for UHessKSNIMatmul<'a> {
         [self.intmd["vmat_deriv1_grid_a"].to_owned(), self.intmd["vmat_deriv1_grid_b"].to_owned()]
     }
 
+    /// Cached on first call for fixed inputs: the CP-KS `vxc`/`fxc` evaluation is skipped when
+    /// this object was already prepared with the same orbitals.
     fn make_response_preparation(&mut self, mo_coeff: &[TsrView; 2], mo_occ: &[TsrView; 2]) {
+        // cache check (before the orbital refresh): whether the expensive CP-KS-grid evaluation
+        // below was already performed with the same orbitals; `cpks_fxc` on the CP-KS grid is
+        // only written here (the `make_hessian_setup` one lives on the skeleton grid, and only
+        // when `ni_cpks` is absent), so with `ni_cpks` set the key coexists with the orbitals
+        let already_prepared = self.ni_cpks.is_some()
+            && self.intmd.contains_key("cpks_fxc")
+            && is_same_tensor(self.intmd["mo_coeff_0"].view(), mo_coeff[α].view())
+            && is_same_tensor(self.intmd["mo_coeff_1"].view(), mo_coeff[β].view())
+            && is_same_tensor(self.intmd["mo_occ_0"].view(), mo_occ[α].view())
+            && is_same_tensor(self.intmd["mo_occ_1"].view(), mo_occ[β].view());
         self.intmd.insert("mo_coeff_0".to_string(), mo_coeff[α].view().into_contig(ColMajor));
         self.intmd.insert("mo_coeff_1".to_string(), mo_coeff[β].view().into_contig(ColMajor));
         self.intmd.insert("mo_occ_0".to_string(), mo_occ[α].view().into_contig(ColMajor));
@@ -1300,6 +1312,9 @@ impl<'a> UHessElecInteractAPI for UHessKSNIMatmul<'a> {
         // derivative order, spin densities formed from occupied spin-orbitals via a bra-ket
         // contraction rather than full spin dm0 matrices).
         if let Some(ni_cpks) = self.ni_cpks.as_mut() {
+            if already_prepared {
+                return;
+            }
             let mo_coeff_α = self.intmd["mo_coeff_0"].view();
             let mo_coeff_β = self.intmd["mo_coeff_1"].view();
             let mo_occ_α = self.intmd["mo_occ_0"].view();

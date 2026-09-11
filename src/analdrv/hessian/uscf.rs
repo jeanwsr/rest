@@ -452,6 +452,10 @@ impl<'a> UHessSCF<'a> {
     }
 
     pub fn make_cpscf_hess(&mut self) -> Tsr {
+        // cached on first call; repeated calls directly return the stored result
+        if let Some(de_cpscf) = self.result.get("de_cpscf") {
+            return de_cpscf.to_owned();
+        }
         let pre_cpscf_dict = self.compute_dimless_cpscf_rhs();
         let f1mo = [pre_cpscf_dict.get("f1mo_0").unwrap().view(), pre_cpscf_dict.get("f1mo_1").unwrap().view()];
         let s1mo = [pre_cpscf_dict.get("s1mo_0").unwrap().view(), pre_cpscf_dict.get("s1mo_1").unwrap().view()];
@@ -464,7 +468,9 @@ impl<'a> UHessSCF<'a> {
         let mo1 = [finalize_dict.get("mo1_0").unwrap().view(), finalize_dict.get("mo1_1").unwrap().view()];
         let mo_e1 = [finalize_dict.get("mo_e1_0").unwrap().view(), finalize_dict.get("mo_e1_1").unwrap().view()];
 
-        self.get_cpscf_hess(&f1mo, &s1mo, &mo1, &mo_e1)
+        let de_cpscf = self.get_cpscf_hess(&f1mo, &s1mo, &mo1, &mo_e1);
+        self.result.insert("de_cpscf".to_string(), de_cpscf.to_owned());
+        de_cpscf
     }
 
     /// Compute the total skeleton contribution to the Hessian.
@@ -476,7 +482,13 @@ impl<'a> UHessSCF<'a> {
     ///
     /// - `de_skeleton` : shape `[3, 3, natm, natm]`. The total skeleton contribution to the
     ///   Hessian.
+    ///
+    /// Cached on first call (stored in `result` as `de_skeleton`); repeated calls directly return
+    /// the stored result.
     pub fn make_skeleton_hess(&mut self) -> Tsr {
+        if let Some(de_skeleton) = self.result.get("de_skeleton") {
+            return de_skeleton.to_owned();
+        }
         let [α, β] = [0, 1];
         let natm = self.natm();
         let mo_coeff = [self.mo_coeff[α].view(), self.mo_coeff[β].view()];
@@ -509,6 +521,7 @@ impl<'a> UHessSCF<'a> {
             self.timing.push((format!("de_skeleton_{}", el_obj_name,), t0.elapsed().as_secs_f64()));
             de_skeleton += de_el;
         }
+        self.result.insert("de_skeleton".to_string(), de_skeleton.clone());
         de_skeleton
     }
 
@@ -517,7 +530,13 @@ impl<'a> UHessSCF<'a> {
     /// # Returns
     ///
     /// - `de_hess` : shape `[3, 3, natm, natm]`. The total Hessian.
+    ///
+    /// Cached on first call (stored in `result` as `de_tot`); repeated calls directly return the
+    /// stored result.
     pub fn make_hess(&mut self) -> Tsr {
+        if let Some(de_tot) = self.result.get("de_tot") {
+            return de_tot.to_owned();
+        }
         let t0 = std::time::Instant::now();
         let [α, β] = [0, 1];
         let dme0 = [

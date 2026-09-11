@@ -157,11 +157,17 @@ impl<'a, 'b> RMultipoleDH<'a, 'b> {
     /// Generic evaluation core of the raw Cartesian moment of the given order (1 = dipole, 2 =
     /// quadrupole, 3 = octupole, 4 = hexadecapole): all contributions, stored in `result`.
     ///
+    /// Cached on first call per order (the origin and the orbitals are fixed at construction);
+    /// repeated evaluation of the same order directly returns the stored total.
+    ///
     /// The per-order public methods are thin wrappers of this function; the only order-specific
     /// extras beyond the shared structure are the traceless quadrupole (stored under
     /// `quad_tot_traceless` for order 2).
     fn make_multipole_core(&mut self, order: usize) -> Tsr {
         let (intor, prefix) = multipole_order_spec(order);
+        if let Some(tot) = self.result.get(&format!("{prefix}_tot")) {
+            return tot.to_owned();
+        }
         let device = self.mo_coeff.device().clone();
 
         // multipole integrals at the fixed origin: shape [nao, nao, 3, ..., 3] (`order` axes of 3)

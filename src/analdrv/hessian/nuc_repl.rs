@@ -63,11 +63,14 @@ pub fn get_nuc_repl_hess(mol: &CInt, device: &DeviceBLAS, atm_list: Option<&[usi
 pub struct HessNucRepl {
     pub mol: CInt,
     pub device: DeviceBLAS,
+    /// Cached skeleton Hessian with the `atm_list` it was evaluated with; repeated
+    /// [`HessNucAPI::make_skeleton_hess`] calls with the same `atm_list` directly return it.
+    cache: Option<(Option<Vec<usize>>, Tsr)>,
 }
 
 impl HessNucRepl {
     pub fn new(mol: &CInt, device: &DeviceBLAS) -> Self {
-        Self { mol: mol.clone(), device: device.clone() }
+        Self { mol: mol.clone(), device: device.clone(), cache: None }
     }
 }
 
@@ -75,6 +78,14 @@ impl AnalDrvBaseAPI for HessNucRepl {}
 
 impl HessNucAPI for HessNucRepl {
     fn make_skeleton_hess(&mut self, atm_list: Option<&[usize]>) -> Tsr {
-        get_nuc_repl_hess(&self.mol, &self.device, atm_list)
+        let atm_list = atm_list.map(|v| v.to_vec());
+        if let Some((atm_list_cached, de_nuc_cached)) = &self.cache {
+            if *atm_list_cached == atm_list {
+                return de_nuc_cached.to_owned();
+            }
+        }
+        let de_nuc = get_nuc_repl_hess(&self.mol, &self.device, atm_list.as_deref());
+        self.cache = Some((atm_list, de_nuc.clone()));
+        de_nuc
     }
 }

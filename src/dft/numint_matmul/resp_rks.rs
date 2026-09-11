@@ -266,9 +266,21 @@ impl<'a> RRespAPI for RRespKSNIMatmul<'a> {
         (resp * 4.0_f64).into_shape(rdm_shape)
     }
 
+    /// Cached on first call for fixed inputs: the CP-KS `vxc`/`fxc` evaluation is skipped when
+    /// this object was already prepared with the same orbitals (e.g. repeated calls from
+    /// multi-order property evaluations directly reuse the stored results).
     fn make_response_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView) {
+        // cache check (before the orbital refresh): whether the expensive evaluation below was
+        // already performed with the same orbitals (`mo_coeff`/`mo_occ` are always inserted
+        // together with `cpks_vxc`/`cpks_fxc`, so the keys coexist)
+        let already_prepared = self.intmd.contains_key("cpks_fxc")
+            && is_same_tensor(self.intmd["mo_coeff"].view(), mo_coeff.view())
+            && is_same_tensor(self.intmd["mo_occ"].view(), mo_occ.view());
         self.intmd.insert("mo_coeff".to_string(), mo_coeff.into_contig(ColMajor));
         self.intmd.insert("mo_occ".to_string(), mo_occ.into_contig(ColMajor));
+        if already_prepared {
+            return;
+        }
 
         // Compute `cpks_vxc` / `cpks_fxc` on the selected response grid (the small `ni_resp` when
         // attached, else the common grid) from the ground-state density, using the lean

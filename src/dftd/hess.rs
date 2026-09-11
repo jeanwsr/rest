@@ -21,13 +21,17 @@ pub struct HessDFTD {
     /// Finite-difference step in Bohr.
     pub step: f64,
     spec: DispSpec,
+    /// Cached skeleton Hessian with the `atm_list` it was evaluated with; repeated
+    /// [`HessNucAPI::make_skeleton_hess`] calls with the same `atm_list` directly return it
+    /// (the finite-difference gradient evaluations are then not repeated).
+    cache: Option<(Option<Vec<usize>>, Tsr)>,
 }
 
 impl HessDFTD {
     /// Create the object. Returns `None` if no empirical dispersion is specified.
     pub fn new(mol: &Molecule, step: f64) -> Option<Self> {
         let spec = DispSpec::resolve(mol)?;
-        Some(Self { mol: mol.clone(), step, spec })
+        Some(Self { mol: mol.clone(), step, spec, cache: None })
     }
 
     /// The dispersion gradient at the geometry currently held in `self.mol`.
@@ -42,10 +46,18 @@ impl AnalDrvBaseAPI for HessDFTD {}
 
 impl HessNucAPI for HessDFTD {
     fn make_skeleton_hess(&mut self, atm_list: Option<&[usize]>) -> Tsr {
+        // cached on first call per `atm_list` (the finite-difference evaluation is expensive)
+        let atm_list = atm_list.map(|v| v.to_vec());
+        if let Some((atm_list_cached, hess_cached)) = &self.cache {
+            if *atm_list_cached == atm_list {
+                return hess_cached.to_owned();
+            }
+        }
+
         // Note `natm_orig` is the number of atoms of the original molecule; the returned
         // Hessian is of the selected atoms only (`natm = atm_list.len()`).
         let natm_orig = self.mol.geom.elem.len();
-        let atm_list = atm_list.map(|v| v.to_vec()).unwrap_or_else(|| (0..natm_orig).collect_vec());
+        let atm_list = atm_list.unwrap_or_else(|| (0..natm_orig).collect_vec());
         let natm = atm_list.len();
 
         let device = DeviceBLAS::default();
@@ -76,6 +88,8 @@ impl HessNucAPI for HessDFTD {
         }
 
         // symmetrize: the finite-difference Hessian is symmetric only up to round-off
-        0.5 * (&hess + &hess.transpose([1, 0, 3, 2]))
+        let hess_sym: Tsr = 0.5 * (&hess + &hess.transpose([1, 0, 3, 2]));
+        self.cache = Some((Some(atm_list), hess_sym.clone()));
+        hess_sym
     }
 }

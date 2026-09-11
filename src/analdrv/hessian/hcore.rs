@@ -177,11 +177,15 @@ pub fn generator_hcore_deriv1(mol: &CInt, device: &DeviceBLAS) -> impl FnMut(usi
 pub struct RHessHcore {
     pub mol: CInt,
     pub device: DeviceBLAS,
+    /// Cached skeleton Hessian with the density matrix and `atm_list` it was evaluated with;
+    /// repeated [`RHessCoreAPI::make_skeleton_hess`] calls with the same inputs directly return
+    /// it (the expensive 2nd-derivative integrals are then not re-evaluated).
+    cache: Option<(Tsr, Option<Vec<usize>>, Tsr)>,
 }
 
 impl RHessHcore {
     pub fn new(mol: &CInt, device: &DeviceBLAS) -> Self {
-        Self { mol: mol.clone(), device: device.clone() }
+        Self { mol: mol.clone(), device: device.clone(), cache: None }
     }
 }
 
@@ -190,7 +194,15 @@ impl AnalDrvBaseAPI for RHessHcore {}
 impl RHessCoreAPI for RHessHcore {
     fn make_skeleton_hess(&mut self, mo_coeff: TsrView, mo_occ: TsrView, atm_list: Option<&[usize]>) -> Tsr {
         let dm0 = get_dm0_restricted(mo_coeff, mo_occ);
-        get_hess_hcore(&self.mol, dm0.view(), atm_list)
+        let atm_list = atm_list.map(|v| v.to_vec());
+        if let Some((dm0_cached, atm_list_cached, de_hcore_cached)) = &self.cache {
+            if is_same_tensor(dm0_cached.view(), dm0.view()) && *atm_list_cached == atm_list {
+                return de_hcore_cached.to_owned();
+            }
+        }
+        let de_hcore = get_hess_hcore(&self.mol, dm0.view(), atm_list.as_deref());
+        self.cache = Some((dm0, atm_list, de_hcore.clone()));
+        de_hcore
     }
 
     fn generator_deriv1(&self) -> Box<dyn FnMut(usize) -> Tsr> {
@@ -202,11 +214,15 @@ impl RHessCoreAPI for RHessHcore {
 pub struct UHessHcore {
     pub mol: CInt,
     pub device: DeviceBLAS,
+    /// Cached skeleton Hessian with the total (α+β) density matrix and `atm_list` it was
+    /// evaluated with; repeated [`UHessCoreAPI::make_skeleton_hess`] calls with the same inputs
+    /// directly return it (the expensive 2nd-derivative integrals are then not re-evaluated).
+    cache: Option<(Tsr, Option<Vec<usize>>, Tsr)>,
 }
 
 impl UHessHcore {
     pub fn new(mol: &CInt, device: &DeviceBLAS) -> Self {
-        Self { mol: mol.clone(), device: device.clone() }
+        Self { mol: mol.clone(), device: device.clone(), cache: None }
     }
 }
 
@@ -222,7 +238,15 @@ impl UHessCoreAPI for UHessHcore {
         let [α, β] = [0, 1];
         let dm0 = get_dm0_restricted(mo_coeff[α].view(), mo_occ[α].view())
             + get_dm0_restricted(mo_coeff[β].view(), mo_occ[β].view());
-        get_hess_hcore(&self.mol, dm0.view(), atm_list)
+        let atm_list = atm_list.map(|v| v.to_vec());
+        if let Some((dm0_cached, atm_list_cached, de_hcore_cached)) = &self.cache {
+            if is_same_tensor(dm0_cached.view(), dm0.view()) && *atm_list_cached == atm_list {
+                return de_hcore_cached.to_owned();
+            }
+        }
+        let de_hcore = get_hess_hcore(&self.mol, dm0.view(), atm_list.as_deref());
+        self.cache = Some((dm0, atm_list, de_hcore.clone()));
+        de_hcore
     }
 
     fn generator_deriv1(&self) -> Box<dyn FnMut(usize) -> Tsr> {
