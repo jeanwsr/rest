@@ -15,7 +15,7 @@
 use pyrest::analdrv::config::AnalDrvConfig;
 use pyrest::analdrv::response::rgfock_interface::rgfock_dh_interface;
 use pyrest::analdrv::response::rresp_interface::rscf_resp_interface;
-use pyrest::analdrv::response::trait_rgfock::{GFockParts, RGFockAPI};
+use pyrest::analdrv::response::trait_rgfock::{GFockFlags, RGFockAPI};
 use pyrest::dft::Grids;
 use pyrest::molecule_io::Molecule;
 use pyrest::ri_jk::util::get_cint_mol;
@@ -155,11 +155,9 @@ fn test_nh3() {
     println!("Lagrangian xc_n part (fro): {lag_xc_n_fro} (ref 0.40098670506446)");
     assert!((lag_xc_n_fro - 0.40098670506446).abs() < 2e-5, "xc_n Lagrangian fro mismatch");
 
-    // generalized Fock of the DH composite (blocks: PT2 OV/VO + final-functional OO/VO)
-    let gfock = rgfock.make_gfock(
-        Some(&mut resp_objs),
-        GFockParts::OO | GFockParts::OV | GFockParts::VO | GFockParts::VV,
-    );
+    // generalized Fock of the DH composite, restricted to the OV/VO parts (the PT2 element
+    // rejects OO/VV, which are not implemented)
+    let gfock = rgfock.make_gfock(Some(&mut resp_objs), GFockFlags::OV | GFockFlags::VO);
     let nocc = rgfock.nocc();
     let nmo = rgfock.nmo();
     let so = rt::slice!(0, nocc);

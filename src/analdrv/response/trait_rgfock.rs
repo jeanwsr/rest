@@ -3,7 +3,7 @@
 use crate::analdrv::prelude::*;
 use enumflags2::BitFlags;
 
-/// Enumeration of the parts of the generalized Fock matrix.
+/// Enumeration (as bit-flags) of the parts of the generalized Fock matrix.
 ///
 /// - OO: occupied-occupied block $\mathscr{F}_{ij}$.
 /// - OV: occupied-virtual block $\mathscr{F}_{ia}$.
@@ -12,7 +12,7 @@ use enumflags2::BitFlags;
 #[enumflags2::bitflags]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
 #[repr(u32)]
-pub enum GFockParts {
+pub enum GFockFlags {
     OO,
     OV,
     VO,
@@ -58,7 +58,7 @@ pub enum GFockParts {
 /// response object that implements `RRespAPI`. But for [`Self::make_rdm1`], we have not decided if
 /// it requires a response object (MP2 does not require this object).
 ///
-/// The trait methods take the response object as `Option<&mut (dyn RRespAPI + 'r)>` (and the parts
+/// The trait methods take the response object as `Option<&mut (dyn RRespAPI + 'r)>` (and the flags
 /// as concrete `BitFlags`), so that the trait is object-safe and contribution objects can be
 /// composed into drivers as `Box<dyn RGFockAPI>`; the mutable reference allows response
 /// contractions (which cache intermediates) through the trait.
@@ -72,11 +72,11 @@ pub enum GFockParts {
 pub trait RGFockAPI: AnalDrvBaseAPI {
     /// Make generalized Fock matrix in molecular orbital basis.
     ///
-    /// Note you can use `GFockParts` as bit-flags to specify which parts of the generalized Fock
+    /// Note you can use `GFockFlags` as bit-flags to specify which parts of the generalized Fock
     /// matrix to compute.
-    /// - For example, you can use `GFockParts::OO | GFockParts::OV` to compute both the
+    /// - For example, you can use `GFockFlags::OO | GFockFlags::OV` to compute both the
     ///   occupied-occupied and occupied-virtual blocks.
-    /// - For lagrangian computation, you can use `GFockParts::OV | GFockParts::VO` and then
+    /// - For lagrangian computation, you can use `GFockFlags::OV | GFockFlags::VO` and then
     ///   anti-symmetrize the result to get the lagrangian.
     ///
     /// # Parameters
@@ -85,14 +85,14 @@ pub trait RGFockAPI: AnalDrvBaseAPI {
     ///   represent the SCF method that gives the molecular orbitals. This is optional depending on
     ///   the implementation of the generalized Fock matrix. For example, for MP2, the response
     ///   object is not needed when handling Fia (OV) and Fab (VV), but required for other cases.
-    /// - `parts` : Bit-flags of `GFockParts` to specify which parts of the generalized Fock matrix
+    /// - `flags` : Bit-flags of `GFockFlags` to specify which parts of the generalized Fock matrix
     ///   to compute.
     ///
     /// # Returns
     ///
     /// - `gfock` : shape (nmo, nmo). Generalized Fock matrix in molecular orbital basis. Depending
-    ///   on the `parts` specified, some parts of the matrix may be zero.
-    fn make_gfock<'r>(&mut self, resp: Option<&mut (dyn RRespAPI + 'r)>, parts: BitFlags<GFockParts>) -> Tsr;
+    ///   on the `flags` specified, some parts of the matrix may be zero.
+    fn make_gfock<'r>(&mut self, resp: Option<&mut (dyn RRespAPI + 'r)>, flags: BitFlags<GFockFlags>) -> Tsr;
 
     /// Make reduced one-particle density matrix (rdm1) in molecular orbital basis.
     ///

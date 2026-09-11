@@ -1,7 +1,7 @@
 use pyrest::analdrv::config::AnalDrvConfig;
 use pyrest::analdrv::response::rgfock_interface::solve_z_vector;
 use pyrest::analdrv::response::rresp_interface::rscf_resp_interface;
-use pyrest::analdrv::response::trait_rgfock::{GFockParts, RGFockAPI};
+use pyrest::analdrv::response::trait_rgfock::{GFockFlags, RGFockAPI};
 use pyrest::molecule_io::Molecule;
 use pyrest::ri_jk::get_ao2mo_s2ij_to_s1_notrans;
 use pyrest::ri_jk::util::get_cint_mol;
@@ -148,7 +148,7 @@ fn test_nh3() {
     // trait-level access: unrelaxed rdm1 and generalized Fock (OV/VO blocks filled)
     let rdm1_trait = rgfock.make_rdm1();
     assert!(rt::allclose(&rdm1_trait, &output.rdm1_corr, None));
-    let gfock = rgfock.make_gfock(Some(&mut resp_objs), GFockParts::OV | GFockParts::VO);
+    let gfock = rgfock.make_gfock(Some(&mut resp_objs), GFockFlags::OV | GFockFlags::VO);
     println!("gfock (VO block): {:16.12}", gfock.i((sv_full, so_full)));
 
     let lag_vo = rgfock.make_lagrangian_vo(&mut resp_objs);
@@ -273,7 +273,7 @@ fn test_nh3_fp32() {
     // regeneration both transform in f64 and cast at the end, so they agree closely)
     let rdm1_trait = rgfock.make_rdm1();
     assert!(rt::allclose(&rdm1_trait, &output.rdm1_corr, (1e-5, 1e-6)));
-    let gfock = rgfock.make_gfock(Some(&mut resp_objs), GFockParts::OV | GFockParts::VO);
+    let gfock = rgfock.make_gfock(Some(&mut resp_objs), GFockFlags::OV | GFockFlags::VO);
     println!("gfock (VO block, f32): {:16.12}", gfock.i((sv_full, so_full)));
 
     // references (pyscf-forge DFDH, f64): lag_vo fro = 0.18726125698236695,

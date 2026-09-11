@@ -7,7 +7,7 @@
 //! the double-hybrid composite by [`rgfock_dh_interface`](super::rgfock_interface).
 
 use crate::analdrv::prelude::*;
-use crate::analdrv::response::trait_rgfock::{GFockParts, RGFockAPI};
+use crate::analdrv::response::trait_rgfock::{GFockFlags, RGFockAPI};
 use enumflags2::BitFlags;
 
 /// Generalized-Fock contribution of the core Hamiltonian, restricted.
@@ -22,6 +22,12 @@ pub struct RGFockHcore {
     pub mo_coeff: Tsr,
     /// Occupation numbers, shape `[nmo]`.
     pub mo_occ: Tsr,
+    /// Generalized Fock matrix in MO basis, accumulating the already-evaluated parts; a zero
+    /// matrix `[nmo, nmo]` at creation.
+    pub gfock: Tsr,
+    /// The parts of `gfock` that have been evaluated. The OV and VV parts are zero by
+    /// definition for this contribution, and are pre-marked as evaluated.
+    pub gfock_flags: BitFlags<GFockFlags>,
     /// Cached results, keyed by tensor name.
     pub intmd: HashMap<String, Tsr>,
     /// Timing information. Represented by wall time in second.
@@ -37,7 +43,17 @@ impl RGFockHcore {
     /// - `mo_coeff` : shape `[nao, nmo]`. Molecular orbital coefficients.
     /// - `mo_occ` : shape `[nmo]`. Occupation numbers.
     pub fn new(hcore: Tsr, mo_coeff: Tsr, mo_occ: Tsr) -> Self {
-        Self { hcore, mo_coeff, mo_occ, intmd: HashMap::new(), timing: Vec::new() }
+        let nmo = mo_occ.shape()[0];
+        let device = mo_coeff.device().clone();
+        Self {
+            hcore,
+            mo_coeff,
+            mo_occ,
+            gfock: rt::zeros(([nmo, nmo].f(), &device)),
+            gfock_flags: GFockFlags::OV | GFockFlags::VV,
+            intmd: HashMap::new(),
+            timing: Vec::new(),
+        }
     }
 
     /// The occupied columns of the core Hamiltonian contracted into MO coefficients,
@@ -62,34 +78,53 @@ impl RGFockHcore {
 impl AnalDrvBaseAPI for RGFockHcore {}
 
 impl RGFockAPI for RGFockHcore {
-    /// Generalized Fock of the core Hamiltonian: only the OO and VO blocks are filled
-    /// ($4 C_p^T h C_q$ with $q$ occupied); the OV and VV blocks are identically zero.
-    fn make_gfock<'r>(&mut self, _resp: Option<&mut (dyn RRespAPI + 'r)>, parts: BitFlags<GFockParts>) -> Tsr {
+    /// Generalized Fock of the core Hamiltonian: only the OO and VO blocks are nonzero
+    /// ($4 C_p^T h C_q$ with $q$ occupied); the OV and VV blocks are identically zero. Only
+    /// the parts requested in `flags` are computed; unrequested parts are left zero. Evaluated
+    /// parts are accumulated in `self.gfock` (tracked by `self.gfock_flags`) and directly reused
+    /// on later calls.
+    fn make_gfock<'r>(&mut self, _resp: Option<&mut (dyn RRespAPI + 'r)>, flags: BitFlags<GFockFlags>) -> Tsr {
         let nocc = self.nocc();
         let nmo = self.nmo();
         let so = rt::slice!(0, nocc);
         let sv = rt::slice!(nocc, nmo);
         let device = self.mo_coeff.device().clone();
 
-        let fock_ao_occ = self.make_fock_ao_occ();
-        let mo = self.mo_coeff.view();
-        let mut gfock: Tsr = rt::zeros(([nmo, nmo].f(), &device));
-        if parts.contains(GFockParts::OO) {
-            let block = 4.0 * (mo.i((.., so)).t() % fock_ao_occ.view());
-            *&mut gfock.i_mut((so, so)) += &block;
+        // evaluate the requested parts that are not yet in `self.gfock`
+        // (the OV and VV parts are zero by definition and never computed)
+        if flags.contains(GFockFlags::OO) && !self.gfock_flags.contains(GFockFlags::OO) {
+            let fock_ao_occ = self.make_fock_ao_occ();
+            let mo = self.mo_coeff.view();
+            *&mut self.gfock.i_mut((so, so)) += &(4.0 * (mo.i((.., so)).t() % fock_ao_occ.view()));
+            self.gfock_flags.insert(GFockFlags::OO);
         }
-        if parts.contains(GFockParts::VO) {
-            let block = 4.0 * (mo.i((.., sv)).t() % fock_ao_occ.view());
-            *&mut gfock.i_mut((sv, so)) += &block;
+        if flags.contains(GFockFlags::VO) && !self.gfock_flags.contains(GFockFlags::VO) {
+            let fock_ao_occ = self.make_fock_ao_occ();
+            let mo = self.mo_coeff.view();
+            *&mut self.gfock.i_mut((sv, so)) += &(4.0 * (mo.i((.., sv)).t() % fock_ao_occ.view()));
+            self.gfock_flags.insert(GFockFlags::VO);
+        }
+
+        // re-construct the matrix of the requested parts, not the accumulated `self.gfock`
+        let mut gfock: Tsr = rt::zeros(([nmo, nmo].f(), &device));
+        if flags.contains(GFockFlags::OO) {
+            gfock.i_mut((so, so)).assign(&self.gfock.i((so, so)));
+        }
+        if flags.contains(GFockFlags::VO) {
+            gfock.i_mut((sv, so)).assign(&self.gfock.i((sv, so)));
         }
         gfock
     }
 
-    /// Unrelaxed rdm1 of the core-Hamiltonian contribution: identically zero.
+    /// Unrelaxed rdm1 of the core-Hamiltonian contribution: identically zero. Cached on first
+    /// call.
     fn make_rdm1(&mut self) -> Tsr {
-        let nmo = self.nmo();
-        let device = self.mo_coeff.device().clone();
-        rt::zeros(([nmo, nmo].f(), &device))
+        if !self.intmd.contains_key("rdm1") {
+            let nmo = self.nmo();
+            let device = self.mo_coeff.device().clone();
+            self.intmd.insert("rdm1".to_string(), rt::zeros(([nmo, nmo].f(), &device)));
+        }
+        self.intmd["rdm1"].to_owned()
     }
 
     /// Lagrangian of the core Hamiltonian: $4 C_v^T h C_o$, shape `[nvir, nocc]`. Cached on first
@@ -98,11 +133,10 @@ impl RGFockAPI for RGFockHcore {
         if !self.intmd.contains_key("lagrangian") {
             let nocc = self.nocc();
             let nmo = self.nmo();
+            let so = rt::slice!(0, nocc);
             let sv = rt::slice!(nocc, nmo);
-            let fock_ao_occ = self.make_fock_ao_occ();
-            let mo = self.mo_coeff.view();
-            let block: Tsr = mo.i((.., sv)).t() % fock_ao_occ.view();
-            let lag: Tsr = (block * 4.0_f64).into_contig(ColMajor);
+            // the Lagrangian is the VO block of the generalized Fock (the OV block vanishes)
+            let lag = self.make_gfock(None, GFockFlags::VO.into()).i((sv, so)).into_contig(ColMajor);
             self.intmd.insert("lagrangian".to_string(), lag);
         }
         self.intmd["lagrangian"].to_owned()

@@ -21,7 +21,7 @@
 
 use super::prelude_dev::*;
 use crate::analdrv::prelude::*;
-use crate::analdrv::response::trait_rgfock::{GFockParts, RGFockAPI};
+use crate::analdrv::response::trait_rgfock::{GFockFlags, RGFockAPI};
 use crate::ri_jk::pure_incore::{get_vj_ri_incore, get_vk_ri_incore_coeff_bra};
 use crate::ri_jk::util::get_dm0_restricted;
 use enumflags2::BitFlags;
@@ -44,6 +44,12 @@ pub struct RGFockRIJK<'a> {
     pub mo_coeff: Tsr,
     /// Occupation numbers, shape `[nmo]`.
     pub mo_occ: Tsr,
+    /// Generalized Fock matrix in MO basis, accumulating the already-evaluated parts; a zero
+    /// matrix `[nmo, nmo]` at creation.
+    pub gfock: Tsr,
+    /// The parts of `gfock` that have been evaluated. The OV and VV parts are zero by
+    /// definition for this contribution, and are pre-marked as evaluated.
+    pub gfock_flags: BitFlags<GFockFlags>,
     /// Cached results, keyed by tensor name (`fock_ao_occ` : the occupied columns of the AO-space
     /// fock contribution).
     pub intmd: HashMap<String, Tsr>,
@@ -68,7 +74,19 @@ impl<'a> RGFockRIJK<'a> {
         mo_coeff: Tsr,
         mo_occ: Tsr,
     ) -> Self {
-        Self { factor_j, factor_k, cderi, mo_coeff, mo_occ, intmd: HashMap::new(), timing: Vec::new() }
+        let nmo = mo_occ.shape()[0];
+        let device = mo_coeff.device().clone();
+        Self {
+            factor_j,
+            factor_k,
+            cderi,
+            mo_coeff,
+            mo_occ,
+            gfock: rt::zeros(([nmo, nmo].f(), &device)),
+            gfock_flags: GFockFlags::OV | GFockFlags::VV,
+            intmd: HashMap::new(),
+            timing: Vec::new(),
+        }
     }
 
     /// The occupied columns of the AO-space fock contribution,
@@ -129,13 +147,15 @@ impl<'a> RGFockRIJK<'a> {
 impl<'a> AnalDrvBaseAPI for RGFockRIJK<'a> {}
 
 impl<'a> RGFockAPI for RGFockRIJK<'a> {
-    /// Generalized Fock of the RI-JK contribution: only the OO and VO blocks are filled
-    /// ($4 C_p^T V C_q$ with $q$ occupied); the OV and VV blocks are identically zero.
+    /// Generalized Fock of the RI-JK contribution: only the OO and VO blocks are nonzero
+    /// ($4 C_p^T V C_q$ with $q$ occupied); the OV and VV blocks are identically zero. Only
+    /// the parts requested in `flags` are computed; unrequested parts are left zero. Evaluated
+    /// parts are accumulated in `self.gfock` (tracked by `self.gfock_flags`) and directly reused
+    /// on later calls.
     ///
     /// The expensive AO→occupied contraction is cached by [`Self::make_fock_ao_occ`]; the MO
-    /// transformation of the blocks is repeated per call, and is deterministic on the cached
-    /// tensor.
-    fn make_gfock<'r>(&mut self, _resp: Option<&mut (dyn RRespAPI + 'r)>, parts: BitFlags<GFockParts>) -> Tsr {
+    /// transformation of each part is performed once, on the first call that requests it.
+    fn make_gfock<'r>(&mut self, _resp: Option<&mut (dyn RRespAPI + 'r)>, flags: BitFlags<GFockFlags>) -> Tsr {
         let t0 = std::time::Instant::now();
         let nocc = self.nocc();
         let nmo = self.nmo();
@@ -143,16 +163,28 @@ impl<'a> RGFockAPI for RGFockRIJK<'a> {
         let sv = rt::slice!(nocc, nmo);
         let device = self.mo_coeff.device().clone();
 
-        let fock_ao_occ = self.make_fock_ao_occ();
-        let mo = self.mo_coeff.view();
-        let mut gfock: Tsr = rt::zeros(([nmo, nmo].f(), &device));
-        if parts.contains(GFockParts::OO) {
-            let block = 4.0 * (mo.i((.., so)).t() % fock_ao_occ.view());
-            *&mut gfock.i_mut((so, so)) += &block;
+        // evaluate the requested parts that are not yet in `self.gfock`
+        // (the OV and VV parts are zero by definition and never computed)
+        if flags.contains(GFockFlags::OO) && !self.gfock_flags.contains(GFockFlags::OO) {
+            let fock_ao_occ = self.make_fock_ao_occ();
+            let mo = self.mo_coeff.view();
+            *&mut self.gfock.i_mut((so, so)) += &(4.0 * (mo.i((.., so)).t() % fock_ao_occ.view()));
+            self.gfock_flags.insert(GFockFlags::OO);
         }
-        if parts.contains(GFockParts::VO) {
-            let block = 4.0 * (mo.i((.., sv)).t() % fock_ao_occ.view());
-            *&mut gfock.i_mut((sv, so)) += &block;
+        if flags.contains(GFockFlags::VO) && !self.gfock_flags.contains(GFockFlags::VO) {
+            let fock_ao_occ = self.make_fock_ao_occ();
+            let mo = self.mo_coeff.view();
+            *&mut self.gfock.i_mut((sv, so)) += &(4.0 * (mo.i((.., sv)).t() % fock_ao_occ.view()));
+            self.gfock_flags.insert(GFockFlags::VO);
+        }
+
+        // re-construct the matrix of the requested parts, not the accumulated `self.gfock`
+        let mut gfock: Tsr = rt::zeros(([nmo, nmo].f(), &device));
+        if flags.contains(GFockFlags::OO) {
+            gfock.i_mut((so, so)).assign(&self.gfock.i((so, so)));
+        }
+        if flags.contains(GFockFlags::VO) {
+            gfock.i_mut((sv, so)).assign(&self.gfock.i((sv, so)));
         }
         self.timing.push(("in RGFockRIJK, make_gfock".to_string(), t0.elapsed().as_secs_f64()));
         gfock
@@ -160,10 +192,14 @@ impl<'a> RGFockAPI for RGFockRIJK<'a> {
 
     /// Unrelaxed rdm1 of the RI-JK contribution: identically zero (the density contribution of
     /// this functional part is carried by the SCF density itself, not by a correction density).
+    /// Cached on first call.
     fn make_rdm1(&mut self) -> Tsr {
-        let nmo = self.nmo();
-        let device = self.mo_coeff.device().clone();
-        rt::zeros(([nmo, nmo].f(), &device))
+        if !self.intmd.contains_key("rdm1") {
+            let nmo = self.nmo();
+            let device = self.mo_coeff.device().clone();
+            self.intmd.insert("rdm1".to_string(), rt::zeros(([nmo, nmo].f(), &device)));
+        }
+        self.intmd["rdm1"].to_owned()
     }
 
     /// Lagrangian of the RI-JK contribution: $L_{ai} = \mathscr{F}_{ai} - \mathscr{F}_{ia} =
@@ -173,11 +209,10 @@ impl<'a> RGFockAPI for RGFockRIJK<'a> {
             let t0 = std::time::Instant::now();
             let nocc = self.nocc();
             let nmo = self.nmo();
+            let so = rt::slice!(0, nocc);
             let sv = rt::slice!(nocc, nmo);
-            let fock_ao_occ = self.make_fock_ao_occ();
-            let mo = self.mo_coeff.view();
-            let block: Tsr = mo.i((.., sv)).t() % fock_ao_occ.view();
-            let lag: Tsr = (block * 4.0_f64).into_contig(ColMajor);
+            // the Lagrangian is the VO block of the generalized Fock (the OV block vanishes)
+            let lag = self.make_gfock(None, GFockFlags::VO.into()).i((sv, so)).into_contig(ColMajor);
             self.intmd.insert("lagrangian".to_string(), lag);
             self.timing.push(("in RGFockRIJK, make_lagrangian".to_string(), t0.elapsed().as_secs_f64()));
         }

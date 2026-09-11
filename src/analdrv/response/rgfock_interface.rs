@@ -28,7 +28,7 @@
 
 use crate::analdrv::prelude::*;
 use crate::analdrv::response::rgfock_hcore::RGFockHcore;
-use crate::analdrv::response::trait_rgfock::{GFockParts, RGFockAPI};
+use crate::analdrv::response::trait_rgfock::{GFockFlags, RGFockAPI};
 use crate::dft::numint_matmul::gfock_rks::RGFockKSNIMatmul;
 use crate::dft::numint_matmul::nimatmul::NIMatmul;
 use crate::dft::DFAFamily;
@@ -144,6 +144,11 @@ pub struct RGFockDH<'a> {
     pub mo_occ: Tsr,
     /// Molecular orbital energies, shape `[nmo]`.
     pub mo_energy: Tsr,
+    /// Generalized Fock matrix in MO basis, accumulating the already-evaluated parts; a zero
+    /// matrix `[nmo, nmo]` at creation.
+    pub gfock: Tsr,
+    /// The parts of `gfock` that have been evaluated.
+    pub gfock_flags: BitFlags<GFockFlags>,
     /// Cached results, keyed by tensor name.
     pub result: HashMap<String, Tsr>,
     /// Timing information. Represented by wall time in second.
@@ -166,7 +171,18 @@ impl<'a> RGFockDH<'a> {
         mo_occ: Tsr,
         mo_energy: Tsr,
     ) -> Self {
-        Self { gfock_list, mo_coeff, mo_occ, mo_energy, result: HashMap::new(), timing: Vec::new() }
+        let nmo = mo_occ.shape()[0];
+        let device = mo_coeff.device().clone();
+        Self {
+            gfock_list,
+            mo_coeff,
+            mo_occ,
+            mo_energy,
+            gfock: rt::zeros(([nmo, nmo].f(), &device)),
+            gfock_flags: BitFlags::empty(),
+            result: HashMap::new(),
+            timing: Vec::new(),
+        }
     }
 
     /// Prepare the response object (must be called before the Z-vector solve or any response
@@ -237,60 +253,105 @@ impl<'a> RGFockDH<'a> {
 impl AnalDrvBaseAPI for RGFockDH<'_> {}
 
 impl RGFockAPI for RGFockDH<'_> {
-    /// Generalized Fock of the DH method: the sum of the contribution objects' generalized Fock
-    /// matrices. Note the PT2 element requires both OV and VO parts to be requested (its W-terms
-    /// fill exactly these blocks).
+    /// Generalized Fock of the DH method: for every requested part not yet evaluated, the part's
+    /// block is computed as the sum of the contribution objects' blocks of that part (each
+    /// contribution is called with the single-part flags, and the PT2 element rejects its
+    /// unimplemented OO/VV parts), accumulated into `self.gfock`, and the matrix of exactly the
+    /// requested parts is re-constructed from the accumulated one. Parts not requested are left
+    /// zero in every contribution, even where computable (e.g. OO in RI-JK/DFT/hcore).
     ///
-    /// The response object argument is passed through to the contribution objects; the PT2 element
-    /// requires it.
-    fn make_gfock<'r>(&mut self, mut resp: Option<&mut (dyn RRespAPI + 'r)>, parts: BitFlags<GFockParts>) -> Tsr {
+    /// The response object argument is passed through to the contribution objects; the PT2
+    /// element requires it for its VO part.
+    fn make_gfock<'r>(&mut self, mut resp: Option<&mut (dyn RRespAPI + 'r)>, flags: BitFlags<GFockFlags>) -> Tsr {
         let t0 = std::time::Instant::now();
-        let mut gfock: Option<Tsr> = None;
-        for gfock_obj in self.gfock_list.iter_mut() {
-            let gfock_obj_part = gfock_obj.make_gfock(resp.as_deref_mut(), parts);
-            gfock = Some(match gfock {
-                Some(gfock) => gfock + gfock_obj_part,
-                None => gfock_obj_part,
-            });
+        let nocc = self.nocc();
+        let nmo = self.nmo();
+        let so = rt::slice!(0, nocc);
+        let sv = rt::slice!(nocc, nmo);
+        let device = self.mo_coeff.device().clone();
+
+        // evaluate the requested parts that are not yet in `self.gfock`
+        for (flag, rows, cols) in [
+            (GFockFlags::OO, so, so),
+            (GFockFlags::OV, rt::slice!(0, nocc), rt::slice!(nocc, nmo)),
+            (GFockFlags::VO, sv, rt::slice!(0, nocc)),
+            (GFockFlags::VV, rt::slice!(nocc, nmo), rt::slice!(nocc, nmo)),
+        ] {
+            if !flags.contains(flag) || self.gfock_flags.contains(flag) {
+                continue;
+            }
+            let mut block: Option<Tsr> = None;
+            for gfock_obj in self.gfock_list.iter_mut() {
+                let obj_gfock = gfock_obj.make_gfock(resp.as_deref_mut(), flag.into());
+                let obj_block = obj_gfock.i((rows, cols)).into_contig(ColMajor);
+                block = Some(match block {
+                    Some(block) => block + obj_block,
+                    None => obj_block,
+                });
+            }
+            let block = block.expect("RGFockDH must hold at least one contribution object.");
+            *&mut self.gfock.i_mut((rows, cols)) += &block;
+            self.gfock_flags.insert(flag);
         }
-        let gfock = gfock.expect("RGFockDH must hold at least one contribution object.");
+
+        // re-construct the matrix of the requested parts, not the accumulated `self.gfock`
+        let mut gfock: Tsr = rt::zeros(([nmo, nmo].f(), &device));
+        for (flag, rows, cols) in [
+            (GFockFlags::OO, so, so),
+            (GFockFlags::OV, rt::slice!(0, nocc), rt::slice!(nocc, nmo)),
+            (GFockFlags::VO, sv, rt::slice!(0, nocc)),
+            (GFockFlags::VV, rt::slice!(nocc, nmo), rt::slice!(nocc, nmo)),
+        ] {
+            if flags.contains(flag) {
+                gfock.i_mut((rows, cols)).assign(&self.gfock.i((rows, cols)));
+            }
+        }
         self.timing.push(("in RGFockDH, make_gfock".to_string(), t0.elapsed().as_secs_f64()));
         gfock
     }
 
     /// Unrelaxed rdm1 of the DH method: the sum of the contribution objects' rdm1s (the PT2
-    /// correlation rdm1; the density-only parts contribute zero).
+    /// correlation rdm1; the density-only parts contribute zero). Cached on first call.
     fn make_rdm1(&mut self) -> Tsr {
-        let mut rdm1: Option<Tsr> = None;
-        for gfock_obj in self.gfock_list.iter_mut() {
-            let rdm1_obj = gfock_obj.make_rdm1();
-            rdm1 = Some(match rdm1 {
-                Some(rdm1) => rdm1 + rdm1_obj,
-                None => rdm1_obj,
-            });
+        if !self.result.contains_key("rdm1") {
+            let mut rdm1: Option<Tsr> = None;
+            for gfock_obj in self.gfock_list.iter_mut() {
+                let rdm1_obj = gfock_obj.make_rdm1();
+                rdm1 = Some(match rdm1 {
+                    Some(rdm1) => rdm1 + rdm1_obj,
+                    None => rdm1_obj,
+                });
+            }
+            let rdm1 = rdm1.expect("RGFockDH must hold at least one contribution object.");
+            self.result.insert("rdm1".to_string(), rdm1);
         }
-        rdm1.expect("RGFockDH must hold at least one contribution object.")
+        self.result["rdm1"].to_owned()
     }
 
     /// Lagrangian of the DH method: the sum of the contribution objects' Lagrangians (the PT2 one
     /// $W^\texttt{3} + W^\texttt{4} + A_{ai, pq} D_{pq}^{\mathrm{RDM}}$, the density-only ones
-    /// $4 C_v^T V C_o$ each). Shape `[nvir, nocc]`.
+    /// $4 C_v^T V C_o$ each). Shape `[nvir, nocc]`. Cached on first call.
     ///
     /// The response object argument is passed through to the contribution objects; the PT2 element
     /// requires it.
     fn make_lagrangian<'r>(&mut self, mut resp: Option<&mut (dyn RRespAPI + 'r)>) -> Tsr {
-        let t0 = std::time::Instant::now();
-        let mut lagrangian: Option<Tsr> = None;
-        for gfock_obj in self.gfock_list.iter_mut() {
-            let lag_obj = gfock_obj.make_lagrangian(resp.as_deref_mut());
-            lagrangian = Some(match lagrangian {
-                Some(lagrangian) => lagrangian + lag_obj,
-                None => lag_obj,
-            });
+        if !self.result.contains_key("lagrangian") {
+            let t0 = std::time::Instant::now();
+            let mut lagrangian: Option<Tsr> = None;
+            for gfock_obj in self.gfock_list.iter_mut() {
+                let lag_obj = gfock_obj.make_lagrangian(resp.as_deref_mut());
+                lagrangian = Some(match lagrangian {
+                    Some(lagrangian) => lagrangian + lag_obj,
+                    None => lag_obj,
+                });
+            }
+            let lagrangian =
+                lagrangian.expect("RGFockDH must hold at least one contribution object.");
+            self.result.insert("lagrangian".to_string(), lagrangian);
+            self.timing
+                .push(("in RGFockDH, make_lagrangian".to_string(), t0.elapsed().as_secs_f64()));
         }
-        let lagrangian = lagrangian.expect("RGFockDH must hold at least one contribution object.");
-        self.timing.push(("in RGFockDH, make_lagrangian".to_string(), t0.elapsed().as_secs_f64()));
-        lagrangian
+        self.result["lagrangian"].to_owned()
     }
 }
 

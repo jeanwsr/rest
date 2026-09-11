@@ -28,7 +28,7 @@
 
 use crate::analdrv::prelude::*;
 use crate::analdrv::response::rgfock_interface::solve_z_vector;
-use crate::analdrv::response::trait_rgfock::{GFockParts, RGFockAPI};
+use crate::analdrv::response::trait_rgfock::{GFockFlags, RGFockAPI};
 use crate::ri_pt2::pure_pt2_r_elecderiv::{
     get_rpt2_elec_deriv_incore, RPT2ElecDerivIncoreArg, RPT2ElecDerivIncoreInp,
 };
@@ -76,6 +76,11 @@ where
     pub c_os: f64,
     /// Same-spin correlation factor $c_\mathrm{SS}$.
     pub c_ss: f64,
+    /// Generalized Fock matrix in MO basis, accumulating the already-evaluated parts (only OV
+    /// and VO are implemented); a zero matrix `[nmo, nmo]` at creation.
+    pub gfock: Tsr,
+    /// The parts of `gfock` that have been evaluated (only OV and VO can ever be set).
+    pub gfock_flags: BitFlags<GFockFlags>,
     /// Cached results, keyed by tensor name.
     pub result: HashMap<String, Tsr>,
     /// Correlation energy of the most recent electronic-derivative evaluation, if any.
@@ -99,6 +104,8 @@ where
         c_os: f64,
         c_ss: f64,
     ) -> Self {
+        let nmo = mo_occ.shape()[0];
+        let device = mo_coeff.device().clone();
         Self {
             mo_coeff,
             mo_occ,
@@ -108,6 +115,8 @@ where
             index_occ_outer_vec,
             c_os,
             c_ss,
+            gfock: rt::zeros(([nmo, nmo].f(), &device)),
+            gfock_flags: BitFlags::empty(),
             result: HashMap::new(),
             e_corr: None,
             timing: Vec::new(),
@@ -247,26 +256,52 @@ impl<O> RGFockAPI for RGFockPT2<'_, O>
 where
     O: BlasFloat + ToPrimitive + FromPrimitive + NumAssignOps + 'static,
 {
-    fn make_gfock<'r>(&mut self, resp: Option<&mut (dyn RRespAPI + 'r)>, parts: BitFlags<GFockParts>) -> Tsr {
-        let resp = resp.expect(
-            "RI-PT2 generalized Fock requires the response object (for the SCF response upon rdm1_corr)",
-        );
+    /// Generalized Fock of the PT2 contribution. Only the OV and VO parts are implemented
+    /// ($\mathscr{F}_{ia} = - (W^\texttt{3}_{ai})^\top$ and $\mathscr{F}_{ai} =
+    /// W^\texttt{4}_{ai}$, plus the SCF response upon the correlation rdm1
+    /// $A_{ai, pq} D_{pq}^{\mathrm{RDM}}$ in the VO block); requesting the OO or VV parts is
+    /// rejected. Parts that are not requested are left zero. Evaluated parts are accumulated in
+    /// `self.gfock` (tracked by `self.gfock_flags`) and directly reused on later calls. The
+    /// response object is required only when the VO part is actually evaluated.
+    fn make_gfock<'r>(&mut self, resp: Option<&mut (dyn RRespAPI + 'r)>, flags: BitFlags<GFockFlags>) -> Tsr {
         assert!(
-            parts.contains(GFockParts::OV) && parts.contains(GFockParts::VO),
-            "RI-PT2 generalized Fock currently requires both OV and VO parts"
+            !flags.contains(GFockFlags::OO) && !flags.contains(GFockFlags::VV),
+            "RI-PT2 generalized Fock has only the OV and VO parts implemented; OO and VV are rejected"
         );
 
         let t0 = std::time::Instant::now();
-        self.make_elec_deriv();
-        let mut gfock = self.result["gfock_part"].to_owned();
-        // add SCF response upon rdm1_corr to the vir-occupied block
         let nocc = self.nocc();
         let nmo = self.nmo();
         let so = rt::slice!(0, nocc);
         let sv = rt::slice!(nocc, nmo);
-        let axd_vo = self.make_axd_vo(resp);
-        *&mut gfock.i_mut((sv, so)) += &axd_vo;
-        self.result.insert("gfock".to_string(), gfock.to_owned());
+
+        // evaluate the requested parts that are not yet in `self.gfock`
+        if flags.contains(GFockFlags::OV) && !self.gfock_flags.contains(GFockFlags::OV) {
+            self.make_elec_deriv();
+            *&mut self.gfock.i_mut((so, sv)) += &self.result["gfock_part"].view().i((so, sv));
+            self.gfock_flags.insert(GFockFlags::OV);
+        }
+        if flags.contains(GFockFlags::VO) && !self.gfock_flags.contains(GFockFlags::VO) {
+            self.make_elec_deriv();
+            let resp = resp.expect(
+                "RI-PT2 generalized Fock VO part requires the response object (for the SCF response upon rdm1_corr)",
+            );
+            // W^4 term, plus the SCF response upon rdm1_corr, in the vir-occupied block
+            *&mut self.gfock.i_mut((sv, so)) += &self.result["gfock_part"].view().i((sv, so));
+            let axd_vo = self.make_axd_vo(resp);
+            *&mut self.gfock.i_mut((sv, so)) += &axd_vo;
+            self.gfock_flags.insert(GFockFlags::VO);
+        }
+
+        // re-construct the matrix of the requested parts, not the accumulated `self.gfock`
+        let device = self.mo_coeff.device().clone();
+        let mut gfock: Tsr = rt::zeros(([nmo, nmo].f(), &device));
+        if flags.contains(GFockFlags::OV) {
+            gfock.i_mut((so, sv)).assign(&self.gfock.i((so, sv)));
+        }
+        if flags.contains(GFockFlags::VO) {
+            gfock.i_mut((sv, so)).assign(&self.gfock.i((sv, so)));
+        }
         self.timing.push(("in RGFockPT2, make_gfock".to_string(), t0.elapsed().as_secs_f64()));
         gfock
     }
