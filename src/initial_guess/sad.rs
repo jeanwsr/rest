@@ -17,7 +17,7 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
     mol.geom.elem.iter().for_each(|ielem| {
         if let None = &mut atom_dms.get(&ielem.clone()) {
 
-            if mol.ctrl.print_level > 0 {
+            if mol.ctrl.print_level > 1 {
                 println!("\n=======================");
                 println!("Generating SAD for atom: {}", &ielem);
                 println!("=======================");
@@ -87,7 +87,7 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
             }
 
             atom_dms.insert(ielem.clone(),dms);
-            
+
             if mol.ctrl.print_level > 0 {
                 println!("SAD generation for {} complete.", &ielem);
             }
@@ -128,7 +128,7 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
         } else {
             vec![]
         }
-    }   
+    }
 }
 
 pub fn block_diag_specific(atom_dms: &HashMap<String,Vec<MatrixFull<f64>>>,elem: &Vec<String>) -> (MatrixFull<f64>, MatrixFull<f64>) {
@@ -194,4 +194,3 @@ pub fn ctrl_setting_atom_sad(elem: &String) -> (f64,usize,bool) {
         _ => (1.0,1,false)
     }
 }
-

@@ -55,7 +55,7 @@ fn print_r12inv2_export(observables: &lib_rint::RhfVeeObservables) {
 
 pub fn main_driver() -> anyhow::Result<()> {
 
-                                  
+
     //let mut time_mark = utilities::TimeRecords::new();
     //time_mark.new_item("Overall", "the whole job");
     //time_mark.new_item("SCF", "the scf procedure");
@@ -112,7 +112,7 @@ pub fn main_driver() -> anyhow::Result<()> {
         ecp.formated_output(5, "full");
         let acc_error = ecp.iter().fold(0.0, |acc, x| {acc + x.abs()});
         println!("acc_error: {}", acc_error);
-        
+
         return Ok(())
     }
 
@@ -120,7 +120,7 @@ pub fn main_driver() -> anyhow::Result<()> {
         let ecp = mol.int_ij_matrixupper(String::from("ecp"));
         let enxc = effective_nxc_matrix(&mut mol);
         let gep = ghost_effective_potential_matrix(
-            &mol.cint_env, &mol.cint_atm, &mol.cint_bas, &mol.cint_type, mol.num_basis, 
+            &mol.cint_env, &mol.cint_atm, &mol.cint_bas, &mol.cint_type, mol.num_basis,
             &mol.geom.ghost_ep_path, &mol.geom.ghost_ep_pos);
 
         let d12 = ecp.data.iter().zip(enxc.data.iter()).fold(0.0, |acc, dt| {acc + (dt.0 -dt.1).powf(2.0)});
@@ -128,7 +128,7 @@ pub fn main_driver() -> anyhow::Result<()> {
         let num_data = ecp.data.len() as f64;
         println!("Compare between ECP, ENXC and GEP with the matrix sizes of");
         println!(" {:?}, {:?}, and {:?}, respectively", ecp.size(), enxc.size(), gep.size());
-        println!("RMSDs between (ECP, ENXC) and (ECP, GEP): ({:16.8}, {:16.8})", 
+        println!("RMSDs between (ECP, ENXC) and (ECP, GEP): ({:16.8}, {:16.8})",
             (d12/num_data).powf(0.5), (d13/num_data).powf(0.5)
         );
 
@@ -157,7 +157,7 @@ pub fn main_driver() -> anyhow::Result<()> {
     time_mark.count("SCF");
     // perform the SCF and post SCF evaluation for the specified xc method
     performance_essential_calculations(&mut scf_data, &mut time_mark, &mpi_operator);
-
+/*
     let mut json_extra: HashMap<String, serde_json::Value> = HashMap::new();
 
     let spin_correction_scheme: Option<String> = scf_data.mol.ctrl.spin_correction_scheme.clone();
@@ -171,7 +171,7 @@ pub fn main_driver() -> anyhow::Result<()> {
             println!(
                 "Warning: Unrecognized spin correction scheme '{}'.\nOnly 'yamaguchi' is currently supported. Spin correction will be skipped.",
                 other
-            );            
+            );
         }
     }
 
@@ -207,7 +207,7 @@ pub fn main_driver() -> anyhow::Result<()> {
 
                 let mut position = scf_data.mol.geom.position.iter().map(|x| *x).collect::<Vec<f64>>();
                 lbfgs().minimize(
-                    &mut position, 
+                    &mut position,
                     |x: &[f64], gx: &mut [f64]| {
                         scf_data.mol.geom.geom_update(x, GeomUnit::Bohr);
                         if scf_data.mol.ctrl.print_level>0 {
@@ -218,7 +218,7 @@ pub fn main_driver() -> anyhow::Result<()> {
                         //initialize_scf(&mut scf_data, &mpi_operator);
                         //performance_essential_calculations(&mut scf_data, &mut time_mark, &mpi_operator);
                         //let (energy, nforce) = numerical_force(&scf_data, displace, &mpi_operator);
-                        
+
                         let coords = MatrixFull::from_vec([3, x.len()/3], x.to_vec()).unwrap();
                         let (energy, force) = eval_force_with_position(&mut scf_data, &mut time_mark, &mpi_operator, &coords);
 
@@ -339,7 +339,7 @@ pub fn main_driver() -> anyhow::Result<()> {
             };
         }
     }
-    
+
     post_scf_analysis::post_scf_output(&scf_data, &mpi_operator);
 
     //====================================
@@ -356,7 +356,7 @@ pub fn main_driver() -> anyhow::Result<()> {
         time_mark.count_start("RRS-PBC");
         rrs_pbc::rrs_pbc_output(&scf_data,unit_cell_elem,rrs_pbc_index_map);
         time_mark.count("RRS-PBC");
-    }    
+    }
     if let Some(qp_ctrl)=scf_data.mol.ctrl.quasiparticle_methods.clone(){
         print!("Now starts quasiparticle method computation!\n");
         let qp_output = quasiparticle_methods(&mut scf_data,&mpi_operator);
@@ -414,7 +414,7 @@ pub fn main_driver() -> anyhow::Result<()> {
         }
         json_extra.insert("hessian".to_string(), hessian);
     }
-    
+
     //===================================
     // Analytical derivative module calculations
     //===================================
@@ -435,7 +435,7 @@ pub fn main_driver() -> anyhow::Result<()> {
         }
         time_mark.count("AnalDrv");
     }
-
+*/
     time_mark.count("Overall");
 
     if scf_data.mol.ctrl.print_level > 0 {
@@ -446,7 +446,7 @@ pub fn main_driver() -> anyhow::Result<()> {
         output_result(&scf_data);
         time_mark.report_all();
     }
-
+/*
     if let Some(mpi_op) = &mpi_operator {
         if mpi_op.rank == 0 {
             crate::fileop::json_dump::dump_json(&scf_data, &json_extra);
@@ -458,13 +458,13 @@ pub fn main_driver() -> anyhow::Result<()> {
     //if let Some(mpi_op) = &mpi_operator {
     //    // I would like to finish the mpi world
     //}
-
+*/
 
     Ok(())
 }
 
 pub fn output_result(scf_data: &scf_io::SCF) {
-    
+
     //--------------------------
     // 0. Solvent energy
     //--------------------------
@@ -613,7 +613,7 @@ pub fn collect_total_energy(scf_data: &SCF) -> f64 {
     // Determine the total energy
     //====================================
     let mut total_energy = scf_data.scf_energy;
-    
+
     if scf_data.mol.xc_data.is_rpa() {
         total_energy = scf_data.energies.get("rpa_energy").unwrap()[0];
     } else if scf_data.mol.xc_data.is_fifth_dfa() {
@@ -694,7 +694,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         // current available analytical gradients methods:
         // 1) analytical RHF, UHF force
         // 2) dftd force
-        // 
+        //
         // disallow post-scf calculations for force
         if scf_data.mol.xc_data.is_fifth_dfa() {
             panic!("Analytic Gradient calculation is currently not available for post-SCF methods.");
@@ -758,7 +758,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
                 } else {
                     grad_data_scf.calc_uks();
                 }
-                
+
                 Box::new(grad_data_scf)
             }
         };
@@ -1089,7 +1089,7 @@ mod geometric_pyo3_impl {
         }
 
         pyo3::prepare_freethreaded_python();
-        
+
         let elem = scf_data.mol.geom.elem.iter().map(|x| x.as_str()).collect::<Vec<&str>>();
         let xyz = scf_data.mol.geom.position.data.iter().map(|x| x * BOHR).collect::<Vec<f64>>();
         //let xyz = scf_data.mol.geom.position.iter().map(|x| *x).collect::<Vec<f64>>();
@@ -1118,7 +1118,7 @@ mod geometric_pyo3_impl {
             molecule.call_method(py, "build_topology", (), None)?;
             Ok(())
         }).unwrap();
-        
+
         //let optimizer_params = r#"
         //    convergence_energy   = 1.0e-6  # Eh
         //    convergence_grms     = 3.0e-4  # Eh/Bohr
@@ -1149,7 +1149,7 @@ mod geometric_pyo3_impl {
                 } else {
                     use crate::analdrv::interface::hess_interface;
                     use rstsr::prelude::*;
-                    
+
                     let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
                     let (hess_raw, _, _) = hess_interface(&scf_data, &config);
                     let natm = (hess_raw.len() / 9).isqrt();
@@ -1206,7 +1206,7 @@ mod geometric_pyo3_impl {
         };
         let driver: PyGeomDriver = geometric_opt_driver.into();
 
-        
+
         let py_result = Python::with_gil(|py| -> PyResult<(f64, Vec<f64>)> {
             let custom_engine = pyo3_engine_cls.call1(py, (molecule,))?;
             custom_engine.call_method1(py, "set_driver", (driver,))?;
