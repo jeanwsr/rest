@@ -1,4 +1,5 @@
 use pyrest::analdrv::hessian::rscf_interface::rscf_hess_interface;
+use pyrest::analdrv::response::rresp_interface::rscf_resp_interface;
 use pyrest::analdrv::config::AnalDrvConfig;
 
 use pyrest::ctrl_io;
@@ -45,7 +46,8 @@ fn test_nh3() {
     scf_without_build(&mut scf_data, &None);
 
     let config = AnalDrvConfig::default();
-    let (de, _, _) = rscf_hess_interface(&mut scf_data, &config);
+    let mut resp_objs = rscf_resp_interface(&scf_data, &config);
+    let (de, _, _) = rscf_hess_interface(&scf_data, &config.nucgrad, &mut resp_objs);
     
     let natm = 4;
     let de = rt::asarray((&de, [3, 3, natm, natm]));

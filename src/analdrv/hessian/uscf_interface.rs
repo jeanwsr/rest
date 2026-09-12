@@ -5,7 +5,7 @@ use crate::dftd::hess::HessDFTD;
 use crate::ri_jk::util::{get_cint_aux, get_cint_mol};
 use crate::SCF;
 
-pub fn uscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>, VibInfo, Option<GauThermoInfo>) {
+pub fn uscf_hess_interface(scf_data: &SCF, cfg: &AnalDrvNucgradCfg, resp_cfg: &AnalDrvRespCfg) -> (Vec<f64>, VibInfo, Option<GauThermoInfo>) {
     let device = DeviceBLAS::default();
 
     // --- basic preparation --- //
@@ -46,7 +46,7 @@ pub fn uscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
     // The dispersion energy is independent of the density matrix (nuclear-like term). Its
     // Hessian is evaluated numerically from the analytic dispersion gradient, and is only
     // added if empirical dispersion is specified in the input.
-    let mut hess_dftd_obj = HessDFTD::new(mol_obj, config.nucgrad.dftd_hess_step);
+    let mut hess_dftd_obj = HessDFTD::new(mol_obj, cfg.dftd_hess_step);
     if let Some(ref mut hess_dftd_obj) = hess_dftd_obj {
         hess_nuc_list.push(hess_dftd_obj);
     }
@@ -136,13 +136,13 @@ pub fn uscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
         let xc_type = determine_den_type_from_list(&xc_func_list.iter().map(|(_, f)| f).collect_vec());
         let is_mgga = matches!(xc_type, XCDenType::TAU);
         let grid_gen_level = scf_data.mol.ctrl.grid_gen_level;
-        let grid_shift = config.nucgrad.grid_shift_deriv;
-        let sk_level = config.nucgrad.grid_level_skeleton.unwrap_or(if is_mgga && !grid_shift {
+        let grid_shift = cfg.grid_shift_deriv;
+        let sk_level = cfg.grid_level_skeleton.unwrap_or(if is_mgga && !grid_shift {
             grid_gen_level + 2
         } else {
             grid_gen_level
         });
-        let cpscf_level = config.resp.grid_level.unwrap_or(grid_gen_level.max(3) - 2);
+        let cpscf_level = resp_cfg.grid_level.unwrap_or(grid_gen_level.max(3) - 2);
 
         // skeleton grid: reuse the SCF grid when the level matches, else regenerate.  Either
         // way, regroup to atom-grouped order (non-decreasing atm_idx): the SCF grid is
@@ -199,7 +199,8 @@ pub fn uscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
         hess_nuc_list,
         hess_hcore_list,
         hess_el_list,
-        config,
+        cfg,
+        resp_cfg,
     );
 
     let de_hess = hess_scf.make_hess();
@@ -235,5 +236,5 @@ pub fn uscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
 
     // --- perform vibrational analysis --- //
 
-    vibration_analysis_interface(scf_data, config, de_hess.view())
+    vibration_analysis_interface(scf_data, cfg, de_hess.view())
 }

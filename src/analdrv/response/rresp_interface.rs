@@ -76,7 +76,7 @@ pub struct RRespSCF<'a> {
     /// exchange, DFT XC NIMatmul.
     pub resp_list: Vec<Box<dyn RRespAPI + 'a>>,
     /// CP-SCF solver settings, captured at build time by [`rscf_resp_interface`].
-    resp_cfg: AnalDrvRespCfg,
+    pub resp_cfg: AnalDrvRespCfg,
     /// Orbital state stored by [`Self::make_cpscf_preparation`]; the CP-SCF machinery panics
     /// until it is set.
     cpscf_state: Option<RCpscfState>,

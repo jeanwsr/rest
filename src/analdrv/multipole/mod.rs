@@ -41,6 +41,7 @@
 //!   `(3, 3)` with the first Cartesian index the slowest (`comp = 3 t1 + t2`); this ordering is
 //!   pinned numerically against PySCF in the module tests.
 
+pub mod interface;
 pub mod nuc_charge;
 pub mod rmultipole;
 pub mod trait_multipole;

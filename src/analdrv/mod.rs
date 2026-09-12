@@ -14,6 +14,10 @@
 //!
 //! This module should work in most cases, but still requires further testing and efficiency update.
 //!
+//! The nuclear-coordinate derivative properties (hessian) are currently SCF-level only; the
+//! electric multipole moments additionally support the PT2-family post-SCF (fifth-DFA) methods
+//! through the DH density increments.
+//!
 //! This module does not contain extensive detailed implementation. Please refer to the [`hessian`]
 //! submodule for hessian traits, component implementations, total hessian drivers (including CP-SCF),
 //! and important utilities.
@@ -21,8 +25,6 @@
 //! - For DFT matmul implementation, please refer to [`crate::dft::numint_matmul`] module.
 //!
 //! We will also handle interface to REST.
-//!
-//! This module currently does not handle post-SCF derivatives.
 //!
 //! Some important utilities comes from other programs, and we acknowledge them here.
 //! - `vibration/vib.rs`: Vibration analysis from Psi4, partially translated by AI, not fully reviewed by human.
@@ -62,7 +64,7 @@ pub mod multipole;
 pub mod prelude {
     use super::*;
 
-    pub use config::AnalDrvConfig;
+    pub use config::{AnalDrvConfig, AnalDrvNucgradCfg, AnalDrvRespCfg};
     pub use hessian::hcore::{RHessHcore, UHessHcore};
     pub use hessian::nuc_repl::HessNucRepl;
     pub use hessian::ovlp::{RHessOvlp, UHessOvlp};

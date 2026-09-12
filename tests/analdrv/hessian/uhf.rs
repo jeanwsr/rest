@@ -48,7 +48,7 @@ fn test_nh3() {
     scf_without_build(&mut scf_data, &None);
 
     let config = AnalDrvConfig::default();
-    let (de, _vib, _th) = uscf_hess_interface(&mut scf_data, &config);
+    let (de, _vib, _th) = uscf_hess_interface(&mut scf_data, &config.nucgrad, &config.resp);
 
     let natm = 3;
     let de = rt::asarray((&de, [3, 3, natm, natm]));

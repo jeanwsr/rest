@@ -10,7 +10,12 @@ pub struct UHessSCF<'a> {
     pub nuc_list: Vec<&'a mut dyn HessNucAPI>,
     pub core_list: Vec<&'a mut dyn UHessCoreAPI>,
     pub el_list: Vec<&'a mut dyn UHessElecInteractAPI>,
-    pub config: AnalDrvConfig,
+    /// The `AnalDrvNucgradCfg` sub-config (`atm_list` etc.).
+    pub cfg: AnalDrvNucgradCfg,
+    /// CP-SCF solver and response-grid settings; the U-side response machinery is built and
+    /// owned internally, so these are passed in explicitly instead of captured on a response
+    /// object (unlike the restricted side, where `RRespSCF.resp_cfg` is the source).
+    pub resp_cfg: AnalDrvRespCfg,
     pub result: HashMap<String, Tsr>,
     /// Timing information. Represented by wall time in second.
     pub timing: Vec<(String, f64)>,
@@ -26,7 +31,8 @@ impl<'a> UHessSCF<'a> {
         nuc_list: Vec<&'a mut dyn HessNucAPI>,
         core_list: Vec<&'a mut dyn UHessCoreAPI>,
         el_list: Vec<&'a mut dyn UHessElecInteractAPI>,
-        config: &AnalDrvConfig,
+        cfg: &AnalDrvNucgradCfg,
+        resp_cfg: &AnalDrvRespCfg,
     ) -> Self {
         Self {
             mo_coeff,
@@ -36,7 +42,8 @@ impl<'a> UHessSCF<'a> {
             nuc_list,
             core_list,
             el_list,
-            config: config.clone(),
+            cfg: cfg.clone(),
+            resp_cfg: resp_cfg.clone(),
             result: HashMap::new(),
             timing: Vec::new(),
         }
@@ -45,7 +52,7 @@ impl<'a> UHessSCF<'a> {
     /// Number of atoms over which the Hessian is computed. This is `atm_list.len()` if
     /// `atm_list` is `Some`, otherwise the total number of atoms in the molecule.
     pub fn natm(&self) -> usize {
-        match &self.config.nucgrad.atm_list {
+        match &self.cfg.atm_list {
             Some(list) => list.len(),
             None => self.ovlp_obj.natm(),
         }
@@ -54,7 +61,7 @@ impl<'a> UHessSCF<'a> {
     /// Return the list of (global) atom indices the Hessian is computed for, ordered the same
     /// way as the local indexing used in the returned Hessian.
     pub fn atm_indices(&self) -> Vec<usize> {
-        match &self.config.nucgrad.atm_list {
+        match &self.cfg.atm_list {
             Some(list) => list.clone(),
             None => (0..self.ovlp_obj.natm()).collect(),
         }
@@ -79,7 +86,7 @@ impl<'a> UHessSCF<'a> {
         let mo_coeff = [self.mo_coeff[α].view(), self.mo_coeff[β].view()];
         let mo_occ = [self.mo_occ[α].view(), self.mo_occ[β].view()];
         let mo_energy = [self.mo_energy[α].view(), self.mo_energy[β].view()];
-        let level_shift = self.config.resp.level_shift;
+        let level_shift = self.resp_cfg.level_shift;
         let device = mo_coeff[α].device().clone();
 
         let nao = mo_coeff[α].shape()[0];
@@ -92,7 +99,7 @@ impl<'a> UHessSCF<'a> {
         let nocc = [mocc[α].shape()[1], mocc[β].shape()[1]];
         let natm = self.natm();
         let atm_indices = self.atm_indices();
-        let atm_list = self.config.nucgrad.atm_list.as_deref();
+        let atm_list = self.cfg.atm_list.as_deref();
 
         let e_ai = [evir[α].i((.., None)) - eocc[α].i((None, ..)), evir[β].i((.., None)) - eocc[β].i((None, ..))];
         let e_ai_shift = [&e_ai[α] + level_shift, &e_ai[β] + level_shift];
@@ -241,7 +248,7 @@ impl<'a> UHessSCF<'a> {
             self.mo_energy[β].view().bool_select(-1, &viridx[β]),
         ];
         let e_ai = [evir[α].i((.., None)) - eocc[α].i((None, ..)), evir[β].i((.., None)) - eocc[β].i((None, ..))];
-        let level_shift = self.config.resp.level_shift;
+        let level_shift = self.resp_cfg.level_shift;
         let e_ai_shift = [&e_ai[0] + level_shift, &e_ai[1] + level_shift];
         let so = [rt::slice!(0, nocc[α]), rt::slice!(0, nocc[β])];
         let sv = [rt::slice!(nocc[α], nmo[α]), rt::slice!(nocc[β], nmo[β])];
@@ -281,11 +288,11 @@ impl<'a> UHessSCF<'a> {
         let rhs = [rhs[α].reshape((nmo[α], nocc[α], -1)), rhs[β].reshape((nmo[β], nocc[β], -1))];
         let device = rhs[α].device().clone();
 
-        let tol = self.config.resp.tol;
-        let max_cycle = self.config.resp.max_cycle;
-        let max_space = self.config.resp.max_space;
-        let lindep = self.config.resp.lindep;
-        let tol_inflation = self.config.resp.tol_inflation;
+        let tol = self.resp_cfg.tol;
+        let max_cycle = self.resp_cfg.max_cycle;
+        let max_space = self.resp_cfg.max_space;
+        let lindep = self.resp_cfg.lindep;
+        let tol_inflation = self.resp_cfg.tol_inflation;
 
         let pack_flattened = |x: &[TsrView; 2]| -> Tsr {
             // original: [nmo_α, nocc_α, nprop] and [nmo_β, nocc_β, nprop]
@@ -493,7 +500,7 @@ impl<'a> UHessSCF<'a> {
         let natm = self.natm();
         let mo_coeff = [self.mo_coeff[α].view(), self.mo_coeff[β].view()];
         let mo_occ = [self.mo_occ[α].view(), self.mo_occ[β].view()];
-        let atm_list = self.config.nucgrad.atm_list.as_deref();
+        let atm_list = self.cfg.atm_list.as_deref();
 
         let device = self.mo_coeff[α].device().clone();
         let mut de_skeleton = rt::zeros(([3, 3, natm, natm], &device));
@@ -543,7 +550,7 @@ impl<'a> UHessSCF<'a> {
             get_dme0_restricted(self.mo_coeff[α].view(), self.mo_occ[α].view(), self.mo_energy[α].view()),
             get_dme0_restricted(self.mo_coeff[β].view(), self.mo_occ[β].view(), self.mo_energy[β].view()),
         ];
-        let atm_list = self.config.nucgrad.atm_list.clone();
+        let atm_list = self.cfg.atm_list.clone();
 
         let de_skeleton = self.make_skeleton_hess();
 

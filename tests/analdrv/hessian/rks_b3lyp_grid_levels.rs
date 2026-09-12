@@ -5,6 +5,7 @@
 
 use pyrest::analdrv::config::{AnalDrvConfig, AnalDrvNucgradCfg, AnalDrvRespCfg};
 use pyrest::analdrv::hessian::rscf_interface::rscf_hess_interface;
+use pyrest::analdrv::response::rresp_interface::rscf_resp_interface;
 
 use pyrest::ctrl_io;
 use pyrest::dft::numint_matmul::hess_rks::{get_hess_ncomp_ao_dm0, get_rho_exc_vxc_fxc};
@@ -51,7 +52,8 @@ fn run_with_config(config: AnalDrvConfig) -> Vec<f64> {
     let mol = Molecule::build_native(ctrl, geom, None).unwrap();
     let mut scf_data = scf_io::SCF::build(mol, &None);
     scf_without_build(&mut scf_data, &None);
-    let (de, _, _) = rscf_hess_interface(&mut scf_data, &config);
+    let mut resp_objs = rscf_resp_interface(&scf_data, &config);
+    let (de, _, _) = rscf_hess_interface(&scf_data, &config.nucgrad, &mut resp_objs);
     de
 }
 

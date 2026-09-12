@@ -295,6 +295,17 @@ impl<'a, 'b> RMultipoleDH<'a, 'b> {
                     println!("    {:<24}: {:16.12}", label, v);
                 }
             }
+            // total dipole additionally in Debye (1 a.u. = 2.54174623 Debye)
+            if let Some(v) = self.result.get("dip_tot") {
+                let au2debye = crate::constants::AU2DEBYE;
+                println!(
+                    "    {:<24}: {:16.12} {:16.12} {:16.12}",
+                    "total, Debye (X Y Z)",
+                    v[[0]] * au2debye,
+                    v[[1]] * au2debye,
+                    v[[2]] * au2debye
+                );
+            }
         }
 
         self.print_moment_section("Electric quadrupole moment, raw second moments (a.u.)", "quad_tot", 2);

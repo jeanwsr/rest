@@ -3,7 +3,7 @@ use serde_inline_default::serde_inline_default;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AnalDrvTask {
-    /// Analytical Hessian matrix.
+    /// Analytical Hessian matrix (and the derived vibrational/thermochemical analysis).
     #[serde(
         alias = "hessian",
         alias = "hess",
@@ -14,6 +14,9 @@ pub enum AnalDrvTask {
         alias = "thermo"
     )]
     Hessian,
+    /// Electric multipole moments (dipole to hexadecapole; see [`AnalDrvMultipoleCfg`]).
+    #[serde(alias = "multipole", alias = "pole", alias = "dipole")]
+    Multipole,
 }
 
 /* #region AnalDrvGeneralCfg */
@@ -153,15 +156,71 @@ impl Default for AnalDrvNucgradCfg {
 
 /* #endregion AnalDrvNucgradCfg */
 
+/* #region AnalDrvMultipoleCfg */
+
+/// Relaxation treatment of the double-hybrid (DH) density increments for the multipole moments.
+///
+/// Only meaningful for PT2-family post-SCF (fifth-DFA) methods; silently ignored otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MultipoleRdm1Relax {
+    /// Relaxed density: solve the Z-vector (CP-SCF) and include the response increment.
+    #[serde(rename = "relaxed")]
+    Relaxed,
+    /// Unrelaxed density: the correlation rdm1 increment only, no CP-SCF solve.
+    #[serde(rename = "unrelaxed")]
+    Unrelaxed,
+}
+
+impl Default for MultipoleRdm1Relax {
+    fn default() -> Self {
+        Self::Relaxed
+    }
+}
+
+/// Settings of the electric multipole moment evaluation.
+///
+/// These keywords control what is evaluated in the [`Multipole`](AnalDrvTask::Multipole) task.
+/// All moments are evaluated in atomic units; the origin convention follows Gaussian (center of
+/// nuclear mass by default).
+#[serde_inline_default]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnalDrvMultipoleCfg {
+    /// Orders of the multipole moments to evaluate: 1 = dipole, 2 = quadrupole, 3 = octupole,
+    /// 4 = hexadecapole. Default to all `[1, 2, 3, 4]`.
+    #[serde(rename = "multipole_orders")]
+    #[serde_inline_default(vec![1, 2, 3, 4])]
+    pub orders: Vec<usize>,
+    /// Explicit origin (Bohr) of the multipole evaluation. By default `None`, meaning the
+    /// center of nuclear mass (computed from the IUPAC 2021 average atomic weights of REST's
+    /// element table; note Gaussian uses most-abundant-isotope masses, so tiny differences in
+    /// the default origin are expected when comparing higher moments).
+    #[serde(rename = "multipole_origin")]
+    #[serde_inline_default(None)]
+    pub origin: Option<[f64; 3]>,
+    /// Relaxation of the DH density increments, see [`MultipoleRdm1Relax`]. Default to relaxed.
+    #[serde(rename = "multipole_rdm1_relax")]
+    #[serde_inline_default(MultipoleRdm1Relax::Relaxed)]
+    pub rdm1_relax: MultipoleRdm1Relax,
+}
+
+impl Default for AnalDrvMultipoleCfg {
+    fn default() -> Self {
+        Self { orders: vec![1, 2, 3, 4], origin: None, rdm1_relax: MultipoleRdm1Relax::Relaxed }
+    }
+}
+
+/* #endregion AnalDrvMultipoleCfg */
+
 /* #region AnalDrvConfig */
 
 /// Configuration of the analytical derivative driver.
 ///
-/// This is a summary struct of the three sub-category configurations, which are flattened into the
+/// This is a summary struct of the four sub-category configurations, which are flattened into the
 /// same `[analdrv]` section of the control input:
 /// - [`AnalDrvGeneralCfg`]: general settings;
 /// - [`AnalDrvRespCfg`]: response (CP-SCF) solver settings;
-/// - [`AnalDrvNucgradCfg`]: nuclear-coordinate derivative property settings.
+/// - [`AnalDrvNucgradCfg`]: nuclear-coordinate derivative property settings;
+/// - [`AnalDrvMultipoleCfg`]: electric multipole moment settings.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct AnalDrvConfig {
     #[serde(flatten)]
@@ -170,6 +229,8 @@ pub struct AnalDrvConfig {
     pub resp: AnalDrvRespCfg,
     #[serde(flatten)]
     pub nucgrad: AnalDrvNucgradCfg,
+    #[serde(flatten)]
+    pub multipole: AnalDrvMultipoleCfg,
 }
 
 /* #endregion AnalDrvConfig */
@@ -178,7 +239,7 @@ pub struct AnalDrvConfig {
 mod tests {
     use super::*;
 
-    /// The three sub-configs flatten into the single flat `[analdrv]` key space of the control
+    /// The four sub-configs flatten into the single flat `[analdrv]` key space of the control
     /// input; the current `resp_*` key names must work, and the legacy `cpscf_*` / `*_cpscf` and
     /// `cphf_*` / `*_cphf` key names must keep working as aliases.
     #[test]
@@ -203,6 +264,21 @@ mod tests {
         assert!(config.nucgrad.gau_thermo);
         assert_eq!(config.nucgrad.atm_list, Some(vec![0, 1]));
         assert_eq!(config.general.verbose, Some(3));
+        // multipole sub-config defaults
+        assert_eq!(config.multipole.orders, vec![1, 2, 3, 4]);
+        assert_eq!(config.multipole.origin, None);
+        assert_eq!(config.multipole.rdm1_relax, MultipoleRdm1Relax::Relaxed);
+
+        // multipole sub-config keys
+        let v = serde_json::json!({
+            "multipole_orders": [1, 2],
+            "multipole_origin": [0.5, -0.5, 1.0],
+            "multipole_rdm1_relax": "unrelaxed",
+        });
+        let config: AnalDrvConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(config.multipole.orders, vec![1, 2]);
+        assert_eq!(config.multipole.origin, Some([0.5, -0.5, 1.0]));
+        assert_eq!(config.multipole.rdm1_relax, MultipoleRdm1Relax::Unrelaxed);
 
         // the legacy key names are accepted as aliases
         let v = serde_json::json!({
@@ -232,7 +308,9 @@ mod tests {
         // serialization stays flat, under the new key names
         let mut config = AnalDrvConfig::default();
         config.resp.tol = 1.0e-8;
+        config.multipole.rdm1_relax = MultipoleRdm1Relax::Unrelaxed;
         let v = serde_json::to_value(&config).unwrap();
         assert_eq!(v["resp_tol"], serde_json::json!(1.0e-8));
+        assert_eq!(v["multipole_rdm1_relax"], serde_json::json!("unrelaxed"));
     }
 }

@@ -1,5 +1,6 @@
 use pyrest::analdrv::config::AnalDrvConfig;
 use pyrest::analdrv::hessian::rscf_interface::rscf_hess_interface;
+use pyrest::analdrv::response::rresp_interface::rscf_resp_interface;
 
 use pyrest::ctrl_io;
 use pyrest::molecule_io::Molecule;
@@ -50,7 +51,8 @@ fn test_nh3() {
     scf_without_build(&mut scf_data, &None);
 
     let cfg = scf_data.mol.ctrl.analdrv.as_ref().unwrap().clone();
-    let (de, vib, th) = rscf_hess_interface(&mut scf_data, &cfg);
+    let mut resp_objs = rscf_resp_interface(&scf_data, &cfg);
+    let (de, vib, th) = rscf_hess_interface(&scf_data, &cfg.nucgrad, &mut resp_objs);
     let th = th.unwrap();
 
     let ref_freqs = [1263.343780, 1367.102321, 1424.072405, 2132.997526, 2443.140863, 3517.051480];
@@ -112,7 +114,8 @@ fn test_sbh3_hbr() {
     scf_without_build(&mut scf_data, &None);
 
     let config = AnalDrvConfig::default();
-    let (_, vib, _) = rscf_hess_interface(&mut scf_data, &config);
+    let mut resp_objs = rscf_resp_interface(&scf_data, &config);
+    let (_, vib, _) = rscf_hess_interface(&scf_data, &config.nucgrad, &mut resp_objs);
 
     // reference value from gaussian 16
     // we allow 1 cm^-1 difference due to RI-JK/conventional difference

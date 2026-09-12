@@ -4,41 +4,47 @@ use crate::analdrv::prelude::*;
 
 /// Working solver and maintainer of all hessian components for restricted SCF method.
 ///
-/// The two lifetime parameters decouple the response object's borrow from its data: `'a` is the
-/// region of the SCF data the objects borrow, `'b` the (typically shorter) borrow of `resp`
-/// itself. Bundling them into one (`&'a mut RRespSCF<'a>`) is rejected by dropck: the borrow
-/// would have to end before the referent's destructor, while that destructor pins the pointee's
-/// lifetime until the referent's drop.
-pub struct RHessSCF<'a, 'b> {
+/// The lifetime parameters decouple the response object's borrow from its data, and the response
+/// object's data region from the hessian component objects: `'a` is the region of the SCF data
+/// the response object borrows, `'b` the (typically shorter) borrow of `resp` itself, and `'c`
+/// the region of the hessian component objects (`ovlp_obj` and the lists). Bundling `'a` with
+/// `'b` (`&'a mut RRespSCF<'a>`) is rejected by dropck: the borrow would have to end before the
+/// referent's destructor, while that destructor pins the pointee's lifetime until the referent's
+/// drop. Keeping `'a` separate from `'c` allows the response object to be shared from outside
+/// (built once by the caller, e.g. the analdrv task loop) while the component objects remain
+/// function-local.
+pub struct RHessSCF<'a, 'b, 'c> {
     pub mo_coeff: Tsr,
     pub mo_occ: Tsr,
     pub mo_energy: Tsr,
-    pub ovlp_obj: &'a mut RHessOvlp,
-    pub nuc_list: Vec<&'a mut dyn HessNucAPI>,
-    pub core_list: Vec<&'a mut dyn RHessCoreAPI>,
-    pub el_list: Vec<&'a mut dyn RHessElecInteractAPI>,
+    pub ovlp_obj: &'c mut RHessOvlp,
+    pub nuc_list: Vec<&'c mut dyn HessNucAPI>,
+    pub core_list: Vec<&'c mut dyn RHessCoreAPI>,
+    pub el_list: Vec<&'c mut dyn RHessElecInteractAPI>,
     /// Response (fock/response) object for the electron-interaction contributions (the composite
     /// `RRespSCF` of the SCF); the CP-SCF machinery (`make_response_preparation`/`response_mo`)
     /// calls it, separate from the skeleton-hessian objects in `el_list`.
     pub resp: &'b mut RRespSCF<'a>,
-    pub config: AnalDrvConfig,
+    /// The `AnalDrvNucgradCfg` sub-config (`atm_list` etc.); the CP-SCF solver settings
+    /// (`level_shift` etc.) come from the captured `resp_cfg` on `self.resp`.
+    pub cfg: AnalDrvNucgradCfg,
     pub result: HashMap<String, Tsr>,
     /// Timing information. Represented by wall time in second.
     pub timing: Vec<(String, f64)>,
 }
 
-impl<'a, 'b> RHessSCF<'a, 'b> {
+impl<'a, 'b, 'c> RHessSCF<'a, 'b, 'c> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mo_coeff: Tsr,
         mo_occ: Tsr,
         mo_energy: Tsr,
-        ovlp_obj: &'a mut RHessOvlp,
-        nuc_list: Vec<&'a mut dyn HessNucAPI>,
-        core_list: Vec<&'a mut dyn RHessCoreAPI>,
-        el_list: Vec<&'a mut dyn RHessElecInteractAPI>,
+        ovlp_obj: &'c mut RHessOvlp,
+        nuc_list: Vec<&'c mut dyn HessNucAPI>,
+        core_list: Vec<&'c mut dyn RHessCoreAPI>,
+        el_list: Vec<&'c mut dyn RHessElecInteractAPI>,
         resp: &'b mut RRespSCF<'a>,
-        config: &AnalDrvConfig,
+        cfg: &AnalDrvNucgradCfg,
     ) -> Self {
         Self {
             mo_coeff,
@@ -49,7 +55,7 @@ impl<'a, 'b> RHessSCF<'a, 'b> {
             core_list,
             el_list,
             resp,
-            config: config.clone(),
+            cfg: cfg.clone(),
             result: HashMap::new(),
             timing: Vec::new(),
         }
@@ -58,7 +64,7 @@ impl<'a, 'b> RHessSCF<'a, 'b> {
     /// Number of atoms over which the Hessian is computed. This is `atm_list.len()` if
     /// `atm_list` is `Some`, otherwise the total number of atoms in the molecule.
     pub fn natm(&self) -> usize {
-        match &self.config.nucgrad.atm_list {
+        match &self.cfg.atm_list {
             Some(list) => list.len(),
             None => self.ovlp_obj.natm(),
         }
@@ -67,7 +73,7 @@ impl<'a, 'b> RHessSCF<'a, 'b> {
     /// Return the list of (global) atom indices the Hessian is computed for, ordered the same
     /// way as the local indexing used in the returned Hessian.
     pub fn atm_indices(&self) -> Vec<usize> {
-        match &self.config.nucgrad.atm_list {
+        match &self.cfg.atm_list {
             Some(list) => list.clone(),
             None => (0..self.ovlp_obj.natm()).collect(),
         }
@@ -101,7 +107,7 @@ impl<'a, 'b> RHessSCF<'a, 'b> {
         let mo_coeff = &self.mo_coeff;
         let mo_occ = &self.mo_occ;
         let mo_energy = &self.mo_energy;
-        let level_shift = self.config.resp.level_shift;
+        let level_shift = self.resp.resp_cfg.level_shift;
         let device = mo_coeff.device().clone();
 
         let [nao, nmo] = mo_coeff.shape().to_vec().try_into().unwrap();
@@ -113,7 +119,7 @@ impl<'a, 'b> RHessSCF<'a, 'b> {
         let nocc = occidx.iter().filter(|&&x| x).count();
         let natm = self.natm();
         let atm_indices = self.atm_indices();
-        let atm_list = self.config.nucgrad.atm_list.as_deref();
+        let atm_list = self.cfg.atm_list.as_deref();
 
         let e_ai = evir.i((.., None)) - eocc.i((None, ..));
         let e_ai_shift = &e_ai + level_shift;
@@ -344,7 +350,7 @@ impl<'a, 'b> RHessSCF<'a, 'b> {
         let natm = self.natm();
         let mo_coeff = self.mo_coeff.view();
         let mo_occ = self.mo_occ.view();
-        let atm_list = self.config.nucgrad.atm_list.as_deref();
+        let atm_list = self.cfg.atm_list.as_deref();
 
         let device = self.mo_coeff.device().clone();
         let mut de_skeleton = rt::zeros(([3, 3, natm, natm], &device));
@@ -393,7 +399,7 @@ impl<'a, 'b> RHessSCF<'a, 'b> {
         let mo_occ = self.mo_occ.view();
         let mo_energy = self.mo_energy.view();
         let dme0 = get_dme0_restricted(mo_coeff, mo_occ, mo_energy);
-        let atm_list = self.config.nucgrad.atm_list.clone();
+        let atm_list = self.cfg.atm_list.clone();
 
         let de_skeleton = self.make_skeleton_hess();
 

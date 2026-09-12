@@ -1,4 +1,5 @@
 use pyrest::analdrv::hessian::rscf_interface::rscf_hess_interface;
+use pyrest::analdrv::response::rresp_interface::rscf_resp_interface;
 // use pyrest::analdrv::config::AnalDrvConfig;
 
 use pyrest::ctrl_io;
@@ -46,6 +47,7 @@ fn test_h2o_qr_collapse() {
 
     // let config = AnalDrvConfig::default();
     let config = scf_data.mol.ctrl.analdrv.as_ref().unwrap().clone();
-    let (_de, vib, _) = rscf_hess_interface(&mut scf_data, &config);
+    let mut resp_objs = rscf_resp_interface(&scf_data, &config);
+    let (_de, vib, _) = rscf_hess_interface(&scf_data, &config.nucgrad, &mut resp_objs);
     println!("freqs: {:?}", vib.omega)
 }

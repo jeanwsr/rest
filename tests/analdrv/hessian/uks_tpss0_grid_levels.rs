@@ -48,7 +48,7 @@ fn run_with_config(config: AnalDrvConfig) -> Vec<f64> {
     let mol = Molecule::build_native(ctrl, geom, None).unwrap();
     let mut scf_data = scf_io::SCF::build(mol, &None);
     scf_without_build(&mut scf_data, &None);
-    let (de, _vib, _th) = uscf_hess_interface(&mut scf_data, &config);
+    let (de, _vib, _th) = uscf_hess_interface(&mut scf_data, &config.nucgrad, &config.resp);
     de
 }
 

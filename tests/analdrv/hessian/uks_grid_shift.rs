@@ -81,7 +81,7 @@ fn run_scf(input: &str) -> scf_io::SCF {
 }
 
 fn run_hessian(scf_data: &mut scf_io::SCF, config: &AnalDrvConfig) -> Tensor<f64, DeviceBLAS> {
-    let (de, _, _) = uscf_hess_interface(scf_data, config);
+    let (de, _, _) = uscf_hess_interface(scf_data, &config.nucgrad, &config.resp);
     let natm = 4;
     rt::asarray((de, [3, 3, natm, natm], &DeviceBLAS::default()))
 }

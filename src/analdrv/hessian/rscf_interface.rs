@@ -1,5 +1,5 @@
 use crate::analdrv::prelude::*;
-use crate::analdrv::response::rresp_interface::{rscf_resp_interface, scf_jk_factors, scf_xc_func_list};
+use crate::analdrv::response::rresp_interface::{scf_jk_factors, scf_xc_func_list};
 use crate::analdrv::vibration::vib::*;
 use crate::analdrv::vibration::vib_interface::*;
 use crate::dft::numint_matmul::nimatmul::{regroup_grids_by_atom, NIMatmul};
@@ -9,7 +9,19 @@ use crate::dftd::hess::HessDFTD;
 use crate::ri_jk::util::{get_cint_aux, get_cint_mol};
 use crate::SCF;
 
-pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>, VibInfo, Option<GauThermoInfo>) {
+/// Restricted SCF hessian: assembles the driver (overlap/nuclear/core/electronic parts plus
+/// the response object), evaluates the hessian and performs the vibrational analysis.
+///
+/// `resp_obj` is the SCF response object (composite [`RRespSCF`], RI-JK plus XC parts) that
+/// provides the CP-SCF solve for the relaxed density. It is not built here: initialize it
+/// beforehand with [`crate::analdrv::response::rresp_interface::rscf_resp_interface`] on the
+/// same `scf_data`. The driver mutates it (response preparation and cached intermediates), and
+/// a shared object can be reused by further tasks afterwards.
+pub fn rscf_hess_interface<'a>(
+    scf_data: &'a SCF,
+    cfg: &AnalDrvNucgradCfg,
+    resp_obj: &mut RRespSCF<'a>,
+) -> (Vec<f64>, VibInfo, Option<GauThermoInfo>) {
     let device = DeviceBLAS::default();
 
     // --- basic preparation --- //
@@ -41,7 +53,7 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
     // The dispersion energy is independent of the density matrix (nuclear-like term). Its
     // Hessian is evaluated numerically from the analytic dispersion gradient, and is only
     // added if empirical dispersion is specified in the input.
-    let mut hess_dftd_obj = HessDFTD::new(mol_obj, config.nucgrad.dftd_hess_step);
+    let mut hess_dftd_obj = HessDFTD::new(mol_obj, cfg.dftd_hess_step);
     if let Some(ref mut hess_dftd_obj) = hess_dftd_obj {
         hess_nuc_list.push(hess_dftd_obj);
     }
@@ -98,20 +110,16 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
     // The skeleton-level grid of the XC hessian object is built by `scf_skeleton_nimatmul`
     // (SCF grid reused or regenerated per the skeleton level policy); no grid data is shared
     // with the response objects.
-    let mut hess_nimatmul_obj = scf_skeleton_nimatmul(scf_data, config).map(|ni| {
+    let mut hess_nimatmul_obj = scf_skeleton_nimatmul(scf_data, cfg).map(|ni| {
         use crate::dft::numint_matmul::hess_rks::RHessKSNIMatmul;
 
         let verbose = scf_data.mol.ctrl.print_level > 2;
-        let grid_shift = config.nucgrad.grid_shift_deriv;
+        let grid_shift = cfg.grid_shift_deriv;
         RHessKSNIMatmul::new(&mol, scf_xc_func_list(scf_data), ni, grid_shift, verbose)
     });
     if let Some(ref mut hess_nimatmul_obj) = hess_nimatmul_obj {
         hess_el_list.push(hess_nimatmul_obj);
     }
-
-    // --- response objects (fock/response) --- //
-
-    let mut resp_objs = rscf_resp_interface(scf_data, config);
 
     // --- run hessian --- //
 
@@ -126,8 +134,8 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
             hess_nuc_list,
             hess_hcore_list,
             hess_el_list,
-            &mut resp_objs,
-            config,
+            resp_obj,
+            cfg,
         );
 
         let de_hess = hess_scf.make_hess();
@@ -166,7 +174,7 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
 
     // --- perform vibrational analysis --- //
 
-    vibration_analysis_interface(scf_data, config, de_hess.view())
+    vibration_analysis_interface(scf_data, cfg, de_hess.view())
 }
 
 /// The skeleton-level `NIMatmul` for the DFT XC hessian contribution, `None` for pure HF.
@@ -178,7 +186,7 @@ pub fn rscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
 /// `atm_idx`): the SCF grid is round-robin permuted for load balancing, while the Becke
 /// grid-shift attribution requires the ByAtom grouping. The regrouping only permutes, never
 /// changes values.
-fn scf_skeleton_nimatmul<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> Option<NIMatmul<'a>> {
+fn scf_skeleton_nimatmul<'a>(scf_data: &'a SCF, cfg: &AnalDrvNucgradCfg) -> Option<NIMatmul<'a>> {
     if scf_data.mol.xc_data.dfa_compnt_scf.is_empty() {
         return None;
     }
@@ -188,8 +196,8 @@ fn scf_skeleton_nimatmul<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> Optio
     let xc_type = determine_den_type_from_list(&xc_func_list.iter().map(|(_, f)| f).collect_vec());
     let is_mgga = matches!(xc_type, XCDenType::TAU);
     let grid_gen_level = scf_data.mol.ctrl.grid_gen_level;
-    let grid_shift = config.nucgrad.grid_shift_deriv;
-    let sk_level = config.nucgrad.grid_level_skeleton.unwrap_or(if is_mgga && !grid_shift {
+    let grid_shift = cfg.grid_shift_deriv;
+    let sk_level = cfg.grid_level_skeleton.unwrap_or(if is_mgga && !grid_shift {
         grid_gen_level + 2
     } else {
         grid_gen_level
