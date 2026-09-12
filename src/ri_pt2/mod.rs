@@ -19,6 +19,7 @@ use tensors::matrix_blas_lapack::{_dsymm, _dgemm};
 
 #[cfg(feature = "mpi")]
 use crate::ri_pt2::pt2_25d::{initialize_metadata, initialize_metadata_linear, check_memory_25d, swap_ownership, local_computation_close_shell_batch, local_computation_ss_batch, local_computation_os_batch};
+use crate::ri_pt2::pt2_ASlide::{initialize_metadata_ASlide, redistribute_batch_reverse_w_truncation, computation_close_shell_aslide, computation_ss_aslide, computation_os_aslide};
 
 use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon,open_shell_sbge2_rayon};
 use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon, evaluate_osrpa_correlation_rayon_mpi};
@@ -32,11 +33,13 @@ use crate::mpi_io::{self, mpi_reduce};
 use crate::post_scf_analysis::{split_indices_by_spin_occ, format_indices};
 
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
-
 use crate::utilities::memory_batch::{detect_available_memory_mb};
-
 #[cfg(feature = "mpi")]
 pub mod pt2_25d;
+#[cfg(feature = "mpi")]
+pub mod pt2_ASlide;
+#[cfg(feature = "mpi")]
+pub mod serviceportal;
 
 pub mod sbge2;
 pub mod sbge2_25d;
@@ -85,7 +88,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
 
     let mut pt2_c = [
         // total pt2 correlation energy;
-        0.0_f64, 
+        0.0_f64,
         // opposite-spin pt2 correlation energy;
         0.0_f64,
         // same-spin pt2 correlation energy;
@@ -142,7 +145,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         && mpi_operator.is_none()
         && dfa_family_pos == crate::dft::DFAFamily::PT2
         && matches!(scf_data.scftype, SCFType::RHF | SCFType::UHF);
-    
+
     // Streaming PT2 is enabled when all of:
     //   - ri_pt2.streaming = true
     //   - rimatr is materialized (use_ri_symm = true, not isdf)
@@ -182,7 +185,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
             occidx[i_spin] = Some(occ_filtered[i_spin].as_slice());
             viridx[i_spin] = Some(vir_filtered[i_spin].as_slice());
         }
-        
+
         let pt2_fp_mode = scf_data.mol.ctrl.ri_pt2.fp_mode;
         pt2_c = match scf_data.scftype {
             SCFType::RHF => match pt2_fp_mode {
@@ -271,7 +274,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
                 }
             };
         }
-
+        let pt2_tmp = restricted_open_shell_pt2_rayon_mpi_aslide(scf_data, mpi_operator).unwrap();
         timerecords.count("c_r5dft");
     } else {
         // Phase-0 guard (P0-1): the primitive path below implements ONLY the PT2 kernel.
@@ -306,7 +309,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         let pt2_c_old = pt2_c.clone();
         pt2_c[2] = pt2_c[0] - pt2_c[1];
     };
-    
+
     //println!("{:?}",&pt2_c);
     let hy_coeffi_scf = scf_data.mol.xc_data.dfa_hybrid_scf;
     let hy_coeffi_xdh = if let Some(coeff) = scf_data.mol.xc_data.dfa_hybrid_pos {coeff} else {0.0};
@@ -324,14 +327,14 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         println!("----------------------------------------------------------------------");
         println!("{:16}: {:>16}, {:>16}, {:>16}", "Methods", "Total Corr", "OS Corr", "SS Corr");
         println!("----------------------------------------------------------------------");
-        println!("{:16}: {:16.8}, {:16.8}, {:16.8}", 
+        println!("{:16}: {:16.8}, {:16.8}, {:16.8}",
             dfa_family_pos.to_name(), pt2_c[0], pt2_c[1], pt2_c[2]);
         println!("----------------------------------------------------------------------");
         println!("Fifth-rung correlation energy : {:20.12} Ha", xdh_pt2_energy);
-        println!("E[{:5}]=: {:16.8} Ha, Ex[HF]: {:16.8} Ha, Ec[{:5}]: {:16.8} Ha", 
-            scf_data.mol.ctrl.xc.to_uppercase(), 
-            total_energy, 
-            x_energy, 
+        println!("E[{:5}]=: {:16.8} Ha, Ex[HF]: {:16.8} Ha, Ec[{:5}]: {:16.8} Ha",
+            scf_data.mol.ctrl.xc.to_uppercase(),
+            total_energy,
+            x_energy,
             postscf_method,
             xdh_pt2_energy
         );
@@ -612,7 +615,7 @@ pub fn close_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
             let i_state_occ = occupation.get(i_state).unwrap()/2.0;
             let j_state_occ = occupation.get(j_state).unwrap()/2.0;
 
-            // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+            // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
             // the indices in rimo are shifted
 
             if i_state_occ.abs() > 1.0e-6 && j_state_occ.abs() > 1.0e-6 {
@@ -622,9 +625,9 @@ pub fn close_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
                 let ri_j = rimo.get_reducing_matrix(j_loc_state).unwrap();
                 let mut eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
                 _dgemm(
-                    &ri_i, (0..num_auxbas,0..vir_range.len()), 'T', 
-                    &ri_j,(0..num_auxbas,0..vir_range.len()) , 'N', 
-                    &mut eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                    &ri_i, (0..num_auxbas,0..vir_range.len()), 'T',
+                    &ri_j,(0..num_auxbas,0..vir_range.len()) , 'N',
+                    &mut eri_virt, (0..vir_range.len(),0..vir_range.len()),
                     1.0,0.0);
 
                 for i_virt in lumo..num_state {
@@ -643,7 +646,7 @@ pub fn close_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
                             };
                             double_gap /= (i_state_occ*j_state_occ*(1.0-i_virt_occ)*(1.0-j_virt_occ));
 
-                            // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                            // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                             // the indices in rimo are shifted
                             let i_loc_virt = i_virt-vir_range.start;
                             let j_loc_virt = j_virt-vir_range.start;
@@ -735,7 +738,7 @@ pub fn open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
                     let j_state_occ = occupation.get(j_state).unwrap();
 
                     if i_state_occ.abs() > 1.0e-6 && j_state_occ.abs() > 1.0e-6 {
-                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                         // the indices in rimo are shifted
                         let i_loc_state = i_state-occ_range.start;
                         let j_loc_state = j_state-occ_range.start;
@@ -743,9 +746,9 @@ pub fn open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
                         let ri_j = rimo.get_reducing_matrix(j_loc_state).unwrap();
                         let mut eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
                         _dgemm(
-                            &ri_i, (0..num_auxbas,0..vir_range.len()), 'T', 
-                            &ri_j,(0..num_auxbas,0..vir_range.len()) , 'N', 
-                            &mut eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                            &ri_i, (0..num_auxbas,0..vir_range.len()), 'T',
+                            &ri_j,(0..num_auxbas,0..vir_range.len()) , 'N',
+                            &mut eri_virt, (0..vir_range.len(),0..vir_range.len()),
                             1.0,0.0);
                         //// ==== DEBUG IGOR ====
                         //if i_state == 1 && j_state== 2 {
@@ -768,7 +771,7 @@ pub fn open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
                                     };
                                     double_gap /= (i_state_occ*j_state_occ*(1.0-i_virt_occ)*(1.0-j_virt_occ));
 
-                                    // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                                    // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                                     // the indices in rimo are shifted
                                     let i_loc_virt = i_virt-vir_range.start;
                                     let j_loc_virt = j_virt-vir_range.start;
@@ -826,7 +829,7 @@ pub fn open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
                     let j_state_occ = occupation_2.get(j_state).unwrap();
 
                     if i_state_occ.abs() > 1.0e-6 && j_state_occ.abs() > 1.0e-6 {
-                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                         // the indices in rimo are shifted
                         let i_loc_state = i_state-occ_range.start;
                         let j_loc_state = j_state-occ_range.start;
@@ -834,9 +837,9 @@ pub fn open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
                         let ri_j = rimo_2.get_reducing_matrix(j_loc_state).unwrap();
                         let mut eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
                         _dgemm(
-                            &ri_i, (0..num_auxbas,0..vir_range.len()), 'T', 
-                            &ri_j,(0..num_auxbas,0..vir_range.len()) , 'N', 
-                            &mut eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                            &ri_i, (0..num_auxbas,0..vir_range.len()), 'T',
+                            &ri_j,(0..num_auxbas,0..vir_range.len()) , 'N',
+                            &mut eri_virt, (0..vir_range.len(),0..vir_range.len()),
                             1.0,0.0);
                         //// ==== DEBUG IGOR ====
                         //if i_state == 0 && j_state== 0 {
@@ -859,7 +862,7 @@ pub fn open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
                                     };
                                     double_gap /= (i_state_occ*j_state_occ*(1.0-i_virt_occ)*(1.0-j_virt_occ));
 
-                                    // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                                    // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                                     // the indices in rimo are shifted
                                     let i_loc_virt = i_virt-vir_range.start;
                                     let j_loc_virt = j_virt-vir_range.start;
@@ -919,7 +922,7 @@ pub fn open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperato
             //let num_auxbas = scf_data.mol.num_auxbas;
             let spin_channel = scf_data.mol.spin_channel;
             let i_spin_pair: [(usize,usize);3] = [(0,0),(0,1),(1,1)];
-            
+
 
             for (i_spin_1,i_spin_2) in i_spin_pair {
                 if i_spin_1 == i_spin_2 {
@@ -949,7 +952,7 @@ pub fn open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperato
                             let j_state_occ = occupation.get(j_state).unwrap();
 
                             if i_state_occ.abs() > 1.0e-6 && j_state_occ.abs() > 1.0e-6 {
-                                // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                                // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                                 // the indices in rimo are shifted
                                 let i_loc_state = i_state-occ_range.start;
                                 let j_loc_state = j_state-occ_range.start;
@@ -961,9 +964,9 @@ pub fn open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperato
                                 //let mut eri_virt = {
                                     //let mut loc_eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
                                 _dgemm(
-                                    &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T', 
-                                    &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N', 
-                                    &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                                    &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T',
+                                    &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N',
+                                    &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()),
                                     1.0,0.0);
                                 mpi_allreduce(&mpi_op.world, loc_eri_virt.data_ref().unwrap(), eri_virt.data_ref_mut().unwrap(), &SystemOperation::sum());
                                 //let mut eri_virt = mpi_reduce(&mpi_op.world, &loc_eri_virt.data_ref().unwrap(), 0, &SystemOperation::sum());
@@ -998,7 +1001,7 @@ pub fn open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperato
                                         };
                                         double_gap /= (i_state_occ*j_state_occ*(1.0-i_virt_occ)*(1.0-j_virt_occ));
 
-                                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                                         // the indices in rimo are shifted
                                         let i_loc_virt = i_virt-vir_range.start;
                                         let j_loc_virt = j_virt-vir_range.start;
@@ -1063,7 +1066,7 @@ pub fn open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperato
                             let j_state_occ = occupation_2.get(j_state).unwrap();
 
                             if i_state_occ.abs() > 1.0e-6 && j_state_occ.abs() > 1.0e-6 {
-                                // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                                // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                                 // the indices in rimo are shifted
                                 let i_loc_state = i_state-occ_range.start;
                                 let j_loc_state = j_state-occ_range.start;
@@ -1071,9 +1074,9 @@ pub fn open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperato
                                 let ri_j = rimo_2.get_reducing_matrix(j_loc_state).unwrap();
                                 //let mut eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
                                 //_dgemm(
-                                //    &ri_i, (0..num_auxbas,0..vir_range.len()), 'T', 
-                                //    &ri_j,(0..num_auxbas,0..vir_range.len()) , 'N', 
-                                //    &mut eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                                //    &ri_i, (0..num_auxbas,0..vir_range.len()), 'T',
+                                //    &ri_j,(0..num_auxbas,0..vir_range.len()) , 'N',
+                                //    &mut eri_virt, (0..vir_range.len(),0..vir_range.len()),
                                 //    1.0,0.0);
                                 //if print_level >= 2 {
                                 //    println!("Debug: enter the preparation of eri_virt");
@@ -1081,9 +1084,9 @@ pub fn open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperato
                                 //let mut eri_virt = {
                                 //    let mut loc_eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
                                 //    _dgemm(
-                                //        &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T', 
-                                //        &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N', 
-                                //        &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                                //        &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T',
+                                //        &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N',
+                                //        &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()),
                                 //        1.0,0.0);
                                 //    let mut eri_virt = mpi_reduce(&mpi_op.world, &loc_eri_virt.data_ref().unwrap(), 0, &SystemOperation::sum());
                                 //    mpi_broadcast(&mpi_op.world, &mut eri_virt, 0);
@@ -1093,9 +1096,9 @@ pub fn open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperato
                                 //    println!("Debug: leave the preparation of eri_virt");
                                 //}
                                 _dgemm(
-                                    &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T', 
-                                    &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N', 
-                                    &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                                    &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T',
+                                    &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N',
+                                    &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()),
                                     1.0,0.0);
                                 mpi_allreduce(&mpi_op.world, loc_eri_virt.data_ref().unwrap(), eri_virt.data_ref_mut().unwrap(), &SystemOperation::sum());
                                 //// ==== DEBUG IGOR ====
@@ -1126,7 +1129,7 @@ pub fn open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperato
                                         };
                                         double_gap /= (i_state_occ*j_state_occ*(1.0-i_virt_occ)*(1.0-j_virt_occ));
 
-                                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                                         // the indices in rimo are shifted
                                         let i_loc_virt = i_virt-vir_range.start;
                                         let j_loc_virt = j_virt-vir_range.start;
@@ -1134,7 +1137,7 @@ pub fn open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperato
                                         e_mp2_term_os += e_mp2_a * e_mp2_a / double_gap;
                                     } //println!("debug e_mp2_term: {:16.8}, index: {:?}", e_mp2_term_os, i_pair);
                                     s.send(e_mp2_term_os).unwrap()
-                                    
+
                                 });
                                 e_mp2_os -= receiver.into_iter().sum::<f64>();
                                 if print_level >= 2 {
@@ -1221,7 +1224,7 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
                     let i_state_occ = occupation.get(i_state).unwrap()/2.0;
                     let j_state_occ = occupation.get(j_state).unwrap()/2.0;
 
-                    // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                    // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                     // the indices in rimo are shifted
 
                     if i_state_occ.abs() > 1.0e-6 && j_state_occ.abs() > 1.0e-6 {
@@ -1231,25 +1234,25 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
                         let ri_j = rimo.get_reducing_matrix(j_loc_state).unwrap();
                         //let mut eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
                         //_dgemm(
-                        //    &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T', 
-                        //    &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N', 
-                        //    &mut eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                        //    &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T',
+                        //    &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N',
+                        //    &mut eri_virt, (0..vir_range.len(),0..vir_range.len()),
                         //    1.0,0.0);
                         //let mut eri_virt = {
                         //    let mut loc_eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
                         //    _dgemm(
-                        //        &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T', 
-                        //        &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N', 
-                        //        &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                        //        &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T',
+                        //        &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N',
+                        //        &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()),
                         //        1.0,0.0);
                         //    let mut eri_virt = mpi_reduce(&mpi_op.world, &loc_eri_virt.data_ref().unwrap(), 0, &SystemOperation::sum());
                         //    mpi_broadcast_vector(&mpi_op.world, &mut eri_virt, 0);
                         //    MatrixFull::from_vec([vir_range.len(), vir_range.len()], eri_virt).unwrap()
                         //};
                         _dgemm(
-                            &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T', 
-                            &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N', 
-                            &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                            &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T',
+                            &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N',
+                            &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()),
                             1.0,0.0);
                         mpi_allreduce(&mpi_op.world, loc_eri_virt.data_ref().unwrap(), eri_virt.data_ref_mut().unwrap(), &SystemOperation::sum());
                         let (sender, receiver) = channel();
@@ -1272,7 +1275,7 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
                                 };
                                 double_gap /= (i_state_occ*j_state_occ*(1.0-i_virt_occ)*(1.0-j_virt_occ));
 
-                                // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                                // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                                 // the indices in rimo are shifted
                                 let i_loc_virt = i_virt-vir_range.start;
                                 let j_loc_virt = j_virt-vir_range.start;
@@ -1616,8 +1619,8 @@ pub fn close_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Option<MPIOp
             let n1_global = rimo.size[1];
             let n2_global = rimo.size[2];
 
-            //println!("rank:{}, cart_rank:{}, tensor_size=({},{},{}), local_n0_range:{:?})",
-                //my_rank, grid.rank, n0_local, n1_global, n2_global, local_n0_range);
+            //println!("rank:{}, tensor_size=({},{},{}), local_n0_range:{:?})",
+                //my_rank, n0_local, n1_global, n2_global, local_n0_range);
 
             let ctx = initialize_metadata(&grid, n2_global);
             let mut n0_global_tmp: u64 = 0;
@@ -1660,7 +1663,7 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
     let mut e_mp2_os = 0.0_f64;
 
     if let Some(ri3mo_vec) = &scf_data.ri3mo {
-        
+
         let start_mo: usize = scf_data.mol.start_mo;
         let num_basis = scf_data.mol.num_basis;
         let num_state = scf_data.mol.num_state;
@@ -1707,7 +1710,7 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
                     let j_state_occ = occupation.get(j_state).unwrap();
 
                     if i_state_occ.abs() > 1.0e-6 && j_state_occ.abs() > 1.0e-6 {
-                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                         // the indices in rimo are shifted
                         let i_loc_state = i_state-occ_range.start;
                         let j_loc_state = j_state-occ_range.start;
@@ -1715,9 +1718,9 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
                         let ri_j = rimo.get_reducing_matrix(j_loc_state).unwrap();
                         let mut eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
                         _dgemm(
-                            &ri_i, (0..num_auxbas,0..vir_range.len()), 'T', 
-                            &ri_j,(0..num_auxbas,0..vir_range.len()) , 'N', 
-                            &mut eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                            &ri_i, (0..num_auxbas,0..vir_range.len()), 'T',
+                            &ri_j,(0..num_auxbas,0..vir_range.len()) , 'N',
+                            &mut eri_virt, (0..vir_range.len(),0..vir_range.len()),
                             1.0,0.0);
                         //// ==== DEBUG IGOR ====
                         //if i_state == 1 && j_state== 2 {
@@ -1740,7 +1743,7 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
                                     };
                                     double_gap /= (i_state_occ*j_state_occ*(1.0-i_virt_occ)*(1.0-j_virt_occ));
 
-                                    // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                                    // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                                     // the indices in rimo are shifted
                                     let i_loc_virt = i_virt-vir_range.start;
                                     let j_loc_virt = j_virt-vir_range.start;
@@ -1797,7 +1800,7 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
                     let j_state_occ = occupation_2.get(j_state).unwrap();
 
                     if i_state_occ.abs() > 1.0e-6 && j_state_occ.abs() > 1.0e-6 {
-                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                         // the indices in rimo are shifted
                         let i_loc_state = i_state-occ_range.start;
                         let j_loc_state = j_state-occ_range.start;
@@ -1805,9 +1808,9 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
                         let ri_j = rimo_2.get_reducing_matrix(j_loc_state).unwrap();
                         let mut eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
                         _dgemm(
-                            &ri_i, (0..num_auxbas,0..vir_range.len()), 'T', 
-                            &ri_j,(0..num_auxbas,0..vir_range.len()) , 'N', 
-                            &mut eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                            &ri_i, (0..num_auxbas,0..vir_range.len()), 'T',
+                            &ri_j,(0..num_auxbas,0..vir_range.len()) , 'N',
+                            &mut eri_virt, (0..vir_range.len(),0..vir_range.len()),
                             1.0,0.0);
                         //// ==== DEBUG IGOR ====
                         //if i_state == 0 && j_state== 0 {
@@ -1830,7 +1833,7 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
                                     };
                                     double_gap /= (i_state_occ*j_state_occ*(1.0-i_virt_occ)*(1.0-j_virt_occ));
 
-                                    // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                                    // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                                     // the indices in rimo are shifted
                                     let i_loc_virt = i_virt-vir_range.start;
                                     let j_loc_virt = j_virt-vir_range.start;
@@ -1853,18 +1856,18 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
     };
     // reuse the default omp_num_threads setting
     omp_set_num_threads_wrapper(default_omp_num_threads);
-    
+
     // Temporarily output the contribution of singly excited states here, to avoid modifying the pt2_c structure.
     if let Some(coeff) = &scf_data.mol.xc_data.dfa_paramr_adv {
         let hy_coeffi_pt2 = coeff.clone();
-        println!("WARNING: The RO-PT2 method has been implemented.  
-        The contribution parameter of singly excited states has been set to match 'para_mp2_ss': {}.  
-        As a result, the contribution of singly excited states is {:16.8} * {} = {:16.8} Ha, with alpha: {:16.8} * {} = {:16.8} Ha, beta: {:16.8} * {} = {:16.8} Ha.  
-        However, this contribution is not yet included in the final total energy.",  
-    hy_coeffi_pt2[1],  
-    e_mp2_single_list[0] + e_mp2_single_list[1], hy_coeffi_pt2[1], (e_mp2_single_list[0] + e_mp2_single_list[1]) * hy_coeffi_pt2[1],  
-    e_mp2_single_list[0], hy_coeffi_pt2[1], e_mp2_single_list[0] * hy_coeffi_pt2[1],  
-    e_mp2_single_list[1], hy_coeffi_pt2[1], e_mp2_single_list[1] * hy_coeffi_pt2[1]);  
+        println!("WARNING: The RO-PT2 method has been implemented.
+        The contribution parameter of singly excited states has been set to match 'para_mp2_ss': {}.
+        As a result, the contribution of singly excited states is {:16.8} * {} = {:16.8} Ha, with alpha: {:16.8} * {} = {:16.8} Ha, beta: {:16.8} * {} = {:16.8} Ha.
+        However, this contribution is not yet included in the final total energy.",
+    hy_coeffi_pt2[1],
+    e_mp2_single_list[0] + e_mp2_single_list[1], hy_coeffi_pt2[1], (e_mp2_single_list[0] + e_mp2_single_list[1]) * hy_coeffi_pt2[1],
+    e_mp2_single_list[0], hy_coeffi_pt2[1], e_mp2_single_list[0] * hy_coeffi_pt2[1],
+    e_mp2_single_list[1], hy_coeffi_pt2[1], e_mp2_single_list[1] * hy_coeffi_pt2[1]);
     } else {
         println!("WARNING: The RO-PT2 method has been implemented.
         The contribution of singly excited states is {:16.8} Ha, with alpha: {:16.8} Ha, beta: {:16.8} Ha.
@@ -1873,7 +1876,7 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
         e_mp2_single_list[0],
         e_mp2_single_list[1]);
     }
-      
+
     Ok([e_mp2_ss+e_mp2_os+e_mp2_single_list[0]+e_mp2_single_list[1],e_mp2_os,e_mp2_ss])
 
 }
@@ -1882,7 +1885,7 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
     #[cfg(feature = "mpi")]
     {
     let print_level = scf_data.mol.ctrl.print_level;
-    
+
     if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data) {
         let num_threads = if let Some(nt) = scf_data.mol.ctrl.num_threads {nt} else {1};
         omp_set_num_threads_wrapper(num_threads);
@@ -1915,14 +1918,14 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
         let num_auxbas_loc = ran_auxbas_loc.len();
 
         if let Some(ri3mo_vec) = &scf_data.ri3mo {
-            
+
             let start_mo: usize = scf_data.mol.start_mo;
             let num_basis = scf_data.mol.num_basis;
             let num_state = scf_data.mol.num_state;
             //let num_auxbas = scf_data.mol.num_auxbas;
             let spin_channel = scf_data.mol.spin_channel;
             let i_spin_pair: [(usize,usize);3] = [(0,0),(0,1),(1,1)];
-            
+
 
             for (i_spin_1,i_spin_2) in i_spin_pair {
                 if i_spin_1 == i_spin_2 {
@@ -1952,7 +1955,7 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
                             let j_state_occ = occupation.get(j_state).unwrap();
 
                             if i_state_occ.abs() > 1.0e-6 && j_state_occ.abs() > 1.0e-6 {
-                                // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                                // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                                 // the indices in rimo are shifted
                                 let i_loc_state = i_state-occ_range.start;
                                 let j_loc_state = j_state-occ_range.start;
@@ -1964,9 +1967,9 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
                                 //let mut eri_virt = {
                                     //let mut loc_eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
                                 _dgemm(
-                                    &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T', 
-                                    &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N', 
-                                    &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                                    &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T',
+                                    &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N',
+                                    &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()),
                                     1.0,0.0);
                                 mpi_allreduce(&mpi_op.world, loc_eri_virt.data_ref().unwrap(), eri_virt.data_ref_mut().unwrap(), &SystemOperation::sum());
                                 //let mut eri_virt = mpi_reduce(&mpi_op.world, &loc_eri_virt.data_ref().unwrap(), 0, &SystemOperation::sum());
@@ -2001,7 +2004,7 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
                                         };
                                         double_gap /= (i_state_occ*j_state_occ*(1.0-i_virt_occ)*(1.0-j_virt_occ));
 
-                                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                                         // the indices in rimo are shifted
                                         let i_loc_virt = i_virt-vir_range.start;
                                         let j_loc_virt = j_virt-vir_range.start;
@@ -2066,7 +2069,7 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
                             let j_state_occ = occupation_2.get(j_state).unwrap();
 
                             if i_state_occ.abs() > 1.0e-6 && j_state_occ.abs() > 1.0e-6 {
-                                // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                                // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                                 // the indices in rimo are shifted
                                 let i_loc_state = i_state-occ_range.start;
                                 let j_loc_state = j_state-occ_range.start;
@@ -2074,9 +2077,9 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
                                 let ri_j = rimo_2.get_reducing_matrix(j_loc_state).unwrap();
                                 //let mut eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
                                 //_dgemm(
-                                //    &ri_i, (0..num_auxbas,0..vir_range.len()), 'T', 
-                                //    &ri_j,(0..num_auxbas,0..vir_range.len()) , 'N', 
-                                //    &mut eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                                //    &ri_i, (0..num_auxbas,0..vir_range.len()), 'T',
+                                //    &ri_j,(0..num_auxbas,0..vir_range.len()) , 'N',
+                                //    &mut eri_virt, (0..vir_range.len(),0..vir_range.len()),
                                 //    1.0,0.0);
                                 //if print_level >= 2 {
                                 //    println!("Debug: enter the preparation of eri_virt");
@@ -2084,9 +2087,9 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
                                 //let mut eri_virt = {
                                 //    let mut loc_eri_virt = MatrixFull::new([vir_range.len(),vir_range.len()],0.0_f64);
                                 //    _dgemm(
-                                //        &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T', 
-                                //        &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N', 
-                                //        &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                                //        &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T',
+                                //        &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N',
+                                //        &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()),
                                 //        1.0,0.0);
                                 //    let mut eri_virt = mpi_reduce(&mpi_op.world, &loc_eri_virt.data_ref().unwrap(), 0, &SystemOperation::sum());
                                 //    mpi_broadcast(&mpi_op.world, &mut eri_virt, 0);
@@ -2096,9 +2099,9 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
                                 //    println!("Debug: leave the preparation of eri_virt");
                                 //}
                                 _dgemm(
-                                    &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T', 
-                                    &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N', 
-                                    &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()), 
+                                    &ri_i, (0..num_auxbas_loc,0..vir_range.len()), 'T',
+                                    &ri_j,(0..num_auxbas_loc,0..vir_range.len()) , 'N',
+                                    &mut loc_eri_virt, (0..vir_range.len(),0..vir_range.len()),
                                     1.0,0.0);
                                 mpi_allreduce(&mpi_op.world, loc_eri_virt.data_ref().unwrap(), eri_virt.data_ref_mut().unwrap(), &SystemOperation::sum());
                                 //// ==== DEBUG IGOR ====
@@ -2129,7 +2132,7 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
                                         };
                                         double_gap /= (i_state_occ*j_state_occ*(1.0-i_virt_occ)*(1.0-j_virt_occ));
 
-                                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ], 
+                                        // because we generate ri3mo for [lumo..num_state, start_mo..num_occ],
                                         // the indices in rimo are shifted
                                         let i_loc_virt = i_virt-vir_range.start;
                                         let j_loc_virt = j_virt-vir_range.start;
@@ -2137,7 +2140,7 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
                                         e_mp2_term_os += e_mp2_a * e_mp2_a / double_gap;
                                     } //println!("debug e_mp2_term: {:16.8}, index: {:?}", e_mp2_term_os, i_pair);
                                     s.send(e_mp2_term_os).unwrap()
-                                    
+
                                 });
                                 e_mp2_os -= receiver.into_iter().sum::<f64>();
                                 if print_level >= 2 {
@@ -2976,4 +2979,245 @@ pub fn restricted_open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Opt
 
     omp_set_num_threads_wrapper(default_omp_num_threads);
     Ok([e_mp2_ss + e_mp2_os + e_single, e_mp2_os, e_mp2_ss])
+}
+
+#[cfg(feature = "mpi")]
+pub fn close_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
+    if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
+
+        let my_rank = mpi_ix.rank;
+        let size = mpi_ix.size;
+        let local_n0_range = if let Some(loc_auxbas) = &mpi_ix.auxbas {
+            loc_auxbas[my_rank].clone()
+        } else {
+            panic!("Memory distrubtion should be initalized for the auxiliary basis sets before post-SCF calculations")
+        };
+
+        let mut global_os:f64 = 0.0_f64;
+        let mut global_ss:f64 = 0.0_f64;
+        if let Some(ri3mo_vec) = &mut scf_data.ri3mo {
+            if ri3mo_vec[0].0.data.is_empty() {
+                    eprintln!("BUG: ri3mo already consumed by a previous sliding pass!");
+                    return Ok([0.0, 0.0, 0.0]);
+                }
+            let eigenvector = scf_data.eigenvectors.get(0).unwrap();
+            let eigenvalues = scf_data.eigenvalues.get(0).unwrap();
+            let occupation = scf_data.occupation.get(0).unwrap();
+
+            let homo = scf_data.homo.get(0).unwrap().clone();
+            let lumo = scf_data.lumo.get(0).unwrap().clone();
+            let num_basis = eigenvector.size.get(0).unwrap().clone();
+
+            let num_state = eigenvector.size.get(1).unwrap().clone();
+            let start_mo: usize = scf_data.mol.start_mo;
+
+            let num_occu = if scf_data.mol.num_elec[0] <= 1.0e-6 {0} else {homo + 1};
+            let (rimo, vir_range, occ_range) = &mut ri3mo_vec[0];
+            let n0_local = rimo.size[0];
+            let n1_global = rimo.size[1];
+            let n2_global = rimo.size[2];
+
+            //println!("rank:{}, tensor_size=({},{},{}), local_n0_range:{:?})",
+                //my_rank, n0_local, n1_global, n2_global, local_n0_range);
+
+            let mut n0_global_tmp: u64 = 0;
+            mpi_op.world.all_reduce_into(&(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
+            let n0_global = n0_global_tmp as usize;
+            let ctx = initialize_metadata_ASlide(mpi_op, n0_global, n1_global, n2_global, true);
+            // Mutable destructuring
+            let redistributed_rimo = redistribute_batch_reverse_w_truncation(mpi_op, &ctx, rimo, n0_global, &local_n0_range);
+            assert_eq!(rimo.data.len(), 0);
+            let (local_os, local_ss) = computation_close_shell_aslide(mpi_op, &redistributed_rimo, &ctx, n0_global, n1_global, n2_global,
+                                                                    eigenvalues, occupation, occ_range.start, vir_range.start);
+            mpi_op.world.all_reduce_into(&local_os, &mut global_os, SystemOperation::sum());
+            mpi_op.world.all_reduce_into(&local_ss, &mut global_ss, SystemOperation::sum());
+        }
+        if my_rank == 0 {
+            println!("os + ss = {}, os = {}, ss = {}", global_os + global_ss, global_os, global_ss);
+        }
+        Ok([global_os + global_ss, global_os, global_ss])
+    }
+    else {
+        panic!("MPI not initialized for aslide");
+    }
+}
+
+#[cfg(feature = "mpi")]
+pub fn open_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
+    if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
+
+        let my_rank = mpi_ix.rank;
+        let size = mpi_ix.size;
+        let local_n0_range = if let Some(loc_auxbas) = &mpi_ix.auxbas {
+            loc_auxbas[my_rank].clone()
+        } else {
+            panic!("Memory distrubtion should be initalized for the auxiliary basis sets before post-SCF calculations")
+        };
+
+        let mut global_os:f64 = 0.0_f64;
+        let mut global_ss:f64 = 0.0_f64;
+
+        let start_mo: usize = scf_data.mol.start_mo;
+        let num_basis = scf_data.mol.num_basis;
+        let num_state = scf_data.mol.num_state;
+
+        if let Some(ri3mo_vec) = &mut scf_data.ri3mo {
+            if ri3mo_vec[0].0.data.is_empty() || ri3mo_vec[1].0.data.is_empty() {
+                    eprintln!("BUG: ri3mo already consumed by a previous sliding pass!");
+                    return Ok([0.0, 0.0, 0.0]);
+            }
+
+            let alpha_eigenvalues = scf_data.eigenvalues.get(0).unwrap();
+            let alpha_occupation = scf_data.occupation.get(0).unwrap();
+
+            let alpha_homo = scf_data.homo.get(0).unwrap().clone();
+            let alpha_lumo = scf_data.lumo.get(0).unwrap().clone();
+            let alpha_num_occu = if scf_data.mol.num_elec[0 + 1] <= 1.0e-6 {0} else {alpha_homo + 1};
+
+            let beta_eigenvalues = scf_data.eigenvalues.get(1).unwrap();
+            let beta_occupation = scf_data.occupation.get(1).unwrap();
+
+            let beta_homo = scf_data.homo.get(1).unwrap().clone();
+            let beta_lumo = scf_data.lumo.get(1).unwrap().clone();
+            let beta_num_occu = if scf_data.mol.num_elec[1 + 1] <= 1.0e-6 {0} else {beta_homo + 1};
+
+            let (left, right) = ri3mo_vec.split_at_mut(1);
+            let (alpha_rimo, vir_range, occ_range) = &mut left[0];
+            let (beta_rimo, _, _)                  = &mut right[0];
+
+            let n0_local = alpha_rimo.size[0];
+            let n1_global = alpha_rimo.size[1];
+            let n2_global = alpha_rimo.size[2];
+
+            assert_eq!(
+                alpha_rimo.size, beta_rimo.size,
+                "ASlide requires α and β rimo to share [n0, n1, n2]"
+            );
+
+            let mut n0_global_tmp: u64 = 0;
+            mpi_op.world.all_reduce_into(&(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
+            let n0_global = n0_global_tmp as usize;
+
+            let ctx = initialize_metadata_ASlide(mpi_op, n0_global, n1_global, n2_global, false);
+
+            // Mutable destructuring
+            let redistributed_alpha_rimo = redistribute_batch_reverse_w_truncation(mpi_op, &ctx, alpha_rimo, n0_global, &local_n0_range);
+            assert_eq!(alpha_rimo.data.len(), 0);
+            let redistributed_beta_rimo = redistribute_batch_reverse_w_truncation(mpi_op, &ctx, beta_rimo, n0_global, &local_n0_range);
+            assert_eq!(beta_rimo.data.len(), 0);
+
+            let term_aa = computation_ss_aslide(mpi_op, &redistributed_alpha_rimo, &ctx,
+                                                n0_global, n1_global, n2_global,
+                                                alpha_eigenvalues, alpha_occupation, occ_range.start, vir_range.start, alpha_num_occu);
+            let term_bb = computation_ss_aslide(mpi_op, &redistributed_beta_rimo, &ctx,
+                                                n0_global, n1_global, n2_global,
+                                                beta_eigenvalues, beta_occupation, occ_range.start, vir_range.start, beta_num_occu);
+            let local_ss = term_aa + term_bb;
+            let local_os = computation_os_aslide(mpi_op, &redistributed_alpha_rimo, &redistributed_beta_rimo, &ctx,
+                                                n0_global, n1_global, n2_global,
+                                                alpha_eigenvalues, beta_eigenvalues, alpha_occupation, beta_occupation,
+                                                occ_range.start, vir_range.start, alpha_num_occu, beta_num_occu);
+
+            mpi_op.world.all_reduce_into(&local_os, &mut global_os, SystemOperation::sum());
+            mpi_op.world.all_reduce_into(&local_ss, &mut global_ss, SystemOperation::sum());
+            if my_rank == 0 {
+                println!("os + ss = {}, os = {}, ss = {}", global_os + global_ss, global_os, global_ss);
+            }
+
+        }
+        Ok([global_os + global_ss, global_os, global_ss])
+    }
+    else {
+        panic!("MPI not initialized for aslide");
+    }
+}
+
+#[cfg(feature = "mpi")]
+pub fn restricted_open_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
+    if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
+
+        let my_rank = mpi_ix.rank;
+        let size = mpi_ix.size;
+        let local_n0_range = if let Some(loc_auxbas) = &mpi_ix.auxbas {
+            loc_auxbas[my_rank].clone()
+        } else {
+            panic!("Memory distrubtion should be initalized for the auxiliary basis sets before post-SCF calculations")
+        };
+
+        let mut global_os:f64 = 0.0_f64;
+        let mut global_ss:f64 = 0.0_f64;
+
+        let start_mo: usize = scf_data.mol.start_mo;
+        let num_basis = scf_data.mol.num_basis;
+        let num_state = scf_data.mol.num_state;
+
+        if let Some(ri3mo_vec) = &mut scf_data.ri3mo {
+            if ri3mo_vec[0].0.data.is_empty() || ri3mo_vec[1].0.data.is_empty() {
+                    eprintln!("BUG: ri3mo already consumed by a previous sliding pass!");
+                    return Ok([0.0, 0.0, 0.0]);
+            }
+
+            let alpha_eigenvalues = &scf_data.semi_eigenvalues.as_ref().unwrap()[0];
+            let alpha_occupation = scf_data.occupation.get(0).unwrap();
+
+            let alpha_homo = scf_data.homo.get(0).unwrap().clone();
+            let alpha_lumo = scf_data.lumo.get(0).unwrap().clone();
+            let alpha_num_occu = if scf_data.mol.num_elec[0 + 1] <= 1.0e-6 {0} else {alpha_homo + 1};
+
+            let beta_eigenvalues = &scf_data.semi_eigenvalues.as_ref().unwrap()[0];
+            let beta_occupation = scf_data.occupation.get(1).unwrap();
+
+            let beta_homo = scf_data.homo.get(1).unwrap().clone();
+            let beta_lumo = scf_data.lumo.get(1).unwrap().clone();
+            let beta_num_occu = if scf_data.mol.num_elec[1 + 1] <= 1.0e-6 {0} else {beta_homo + 1};
+
+            let (left, right) = ri3mo_vec.split_at_mut(1);
+            let (alpha_rimo, vir_range, occ_range) = &mut left[0];
+            let (beta_rimo, _, _)                  = &mut right[0];
+
+            let n0_local = alpha_rimo.size[0];
+            let n1_global = alpha_rimo.size[1];
+            let n2_global = alpha_rimo.size[2];
+
+            assert_eq!(
+                alpha_rimo.size, beta_rimo.size,
+                "ASlide requires α and β rimo to share [n0, n1, n2]"
+            );
+
+            let mut n0_global_tmp: u64 = 0;
+            mpi_op.world.all_reduce_into(&(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
+            let n0_global = n0_global_tmp as usize;
+
+            let ctx = initialize_metadata_ASlide(mpi_op, n0_global, n1_global, n2_global, false);
+
+            // Mutable destructuring
+            let redistributed_alpha_rimo = redistribute_batch_reverse_w_truncation(mpi_op, &ctx, alpha_rimo, n0_global, &local_n0_range);
+            assert_eq!(alpha_rimo.data.len(), 0);
+            let redistributed_beta_rimo = redistribute_batch_reverse_w_truncation(mpi_op, &ctx, beta_rimo, n0_global, &local_n0_range);
+            assert_eq!(beta_rimo.data.len(), 0);
+
+            let term_aa = computation_ss_aslide(mpi_op, &redistributed_alpha_rimo, &ctx,
+                                                n0_global, n1_global, n2_global,
+                                                alpha_eigenvalues, alpha_occupation, occ_range.start, vir_range.start, alpha_num_occu);
+            let term_bb = computation_ss_aslide(mpi_op, &redistributed_beta_rimo, &ctx,
+                                                n0_global, n1_global, n2_global,
+                                                beta_eigenvalues, beta_occupation, occ_range.start, vir_range.start, beta_num_occu);
+            let local_ss = term_aa + term_bb;
+            let local_os = computation_os_aslide(mpi_op, &redistributed_alpha_rimo, &redistributed_beta_rimo, &ctx,
+                                                n0_global, n1_global, n2_global,
+                                                alpha_eigenvalues, beta_eigenvalues, alpha_occupation, beta_occupation,
+                                                occ_range.start, vir_range.start, alpha_num_occu, beta_num_occu);
+
+            mpi_op.world.all_reduce_into(&local_os, &mut global_os, SystemOperation::sum());
+            mpi_op.world.all_reduce_into(&local_ss, &mut global_ss, SystemOperation::sum());
+            if my_rank == 0 {
+                println!("os + ss = {}, os = {}, ss = {}", global_os + global_ss, global_os, global_ss);
+            }
+
+        }
+        Ok([global_os + global_ss, global_os, global_ss])
+    }
+    else {
+        panic!("MPI not initialized for aslide");
+    }
 }
