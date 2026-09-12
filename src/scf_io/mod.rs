@@ -2189,6 +2189,10 @@ impl SCF {
     /// Called both before the first Fock build (solvent-consistent initial guess /
     /// chkfile restart) and once per SCF iteration.
     pub fn refresh_solvent(&mut self) {
+        self.refresh_solvent_with_mpi(&None)
+    }
+
+    pub fn refresh_solvent_with_mpi(&mut self, mpi_operator: &Option<MPIOperator>) {
         if let Some(solvent_static) = self.solvent_static_obj.as_ref() {
             let s_static = PcmScf::get_pcm_refresh(
                 &solvent_static.surface,
@@ -2201,7 +2205,8 @@ impl SCF {
                 &self.mol.spin_channel,
                 &self.mol.ctrl.max_memory,
                 &self.mol.ctrl.solv_chunk,
-                self.mol.ctrl.solvent_ri
+                self.mol.ctrl.solvent_ri,
+                mpi_operator
             );
             // SMD: CDS energy from PcmStatic (computed once in solvent_prepare)
             let e_cds = solvent_static.pstatic.e_cds.unwrap_or(0.0);
@@ -5290,7 +5295,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     // build below is already solvent-consistent (chkfile restart converges in
     // few iterations; also fixes the noiter path where solvent_scf stayed None)
     if scf_data.mol.ctrl.solvent_enabled {
-        scf_data.refresh_solvent();
+        scf_data.refresh_solvent_with_mpi(mpi_operator);
     }
     scf_data.generate_hf_hamiltonian(mpi_operator);
     scf_data.grad_dm = scf_data.get_grad_dm();
@@ -5386,7 +5391,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
 
         let dt_solv0 = time::Local::now();
         if scf_data.mol.ctrl.solvent_enabled {
-            scf_data.refresh_solvent();
+            scf_data.refresh_solvent_with_mpi(mpi_operator);
         }
         let dt_solv1 = time::Local::now();
 

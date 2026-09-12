@@ -2993,28 +2993,48 @@ impl Molecule {
                 };
 
                 let (baspar, sbsh, ebsh) = &baspar_distribution[my_rank];
+                // IMPORTANT: scatter_to_blockcyclic / distributed_triangular_solve /
+                // gather_from_blockcyclic are COLLECTIVE over the BLACS grid — every
+                // rank must participate even when it has no basis-pair work. Ranks
+                // with baspar.len() == 0 pass a zero-column matrix (empty participation)
+                // rather than skipping the collective pipeline, which would deadlock
+                // the ranks that DO have data.
+                #[cfg(all(feature = "mpi", feature = "scalapack"))]
+                let loc_ri3fn = if dist_ctx.is_some() {
+                    // collective path: ALL ranks enter scatter/solve/gather
+                    let tmp = if baspar.len() > 0 {
+                        self.prepare_rimatr_for_ri_v_mpi_slot(*sbsh, *ebsh)
+                    } else {
+                        // empty [naux × 0] so scatter sends nothing but still participates
+                        MatrixFull::new([n_auxbas, 0], 0.0)
+                    };
+                    if let Some((u_dist, nb, col_ranges)) = &dist_ctx {
+                        let b_dist = crate::mpi_io::j2c_distributed::scatter_to_blockcyclic(
+                            &mpi_op.world, &mpi_op.cblacsgrid, *nb, col_ranges, &tmp,
+                        );
+                        let mut x_dist = b_dist;
+                        crate::mpi_io::j2c_distributed::distributed_triangular_solve(
+                            &mpi_op.cblacsgrid, u_dist, &mut x_dist,
+                        );
+                        let x_contig = crate::mpi_io::j2c_distributed::gather_from_blockcyclic(
+                            &mpi_op.world, &mpi_op.cblacsgrid, *nb, col_ranges, &x_dist,
+                        );
+                        x_contig.transpose()
+                    } else {
+                        unreachable!("dist_ctx is Some but inner None")
+                    }
+                } else if baspar.len() > 0 {
+                    // serial fallback (no distributed j2c): only ranks with work
+                    // participate (solve_tmp_to_ri3fn is local)
+                    let tmp = self.prepare_rimatr_for_ri_v_mpi_slot(*sbsh, *ebsh);
+                    self.solve_tmp_to_ri3fn(&aux_v, tmp)
+                } else {
+                    MatrixFull::empty()
+                };
+                #[cfg(not(all(feature = "mpi", feature = "scalapack")))]
                 let loc_ri3fn = if baspar.len() > 0 {
                     let tmp = self.prepare_rimatr_for_ri_v_mpi_slot(*sbsh, *ebsh);
-                    #[cfg(all(feature = "mpi", feature = "scalapack"))]
-                    {
-                        if let Some((u_dist, nb, col_ranges)) = &dist_ctx {
-                            let b_dist = crate::mpi_io::j2c_distributed::scatter_to_blockcyclic(
-                                &mpi_op.world, &mpi_op.cblacsgrid, *nb, col_ranges, &tmp,
-                            );
-                            let mut x_dist = b_dist;
-                            crate::mpi_io::j2c_distributed::distributed_triangular_solve(
-                                &mpi_op.cblacsgrid, u_dist, &mut x_dist,
-                            );
-                            let x_contig = crate::mpi_io::j2c_distributed::gather_from_blockcyclic(
-                                &mpi_op.world, &mpi_op.cblacsgrid, *nb, col_ranges, &x_dist,
-                            );
-                            x_contig.transpose()
-                        } else {
-                            self.solve_tmp_to_ri3fn(&aux_v, tmp)
-                        }
-                    }
-                    #[cfg(not(all(feature = "mpi", feature = "scalapack")))]
-                    { self.solve_tmp_to_ri3fn(&aux_v, tmp) }
+                    self.solve_tmp_to_ri3fn(&aux_v, tmp)
                 } else {
                     MatrixFull::empty()
                 };
