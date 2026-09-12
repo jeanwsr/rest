@@ -1,4 +1,4 @@
-//! UKS (TPSS0, MGGA) Hessian with explicit `grid_level_resp` / `grid_level_skeleton`.
+//! UKS (TPSS0, MGGA) Hessian with explicit `grid_level_cpscf` / `grid_level_skeleton`.
 //!
 //! Exercises the MGGA skeleton-grid regeneration (`grid_gen_level + 2` default) and the
 //! dedicated CP-SCF grid path on the UKS side.

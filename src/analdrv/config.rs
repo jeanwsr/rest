@@ -44,32 +44,39 @@ impl Default for AnalDrvGeneralCfg {
 /// These keywords control how the response (CP-SCF-type) equations are solved, but not what is
 /// passed into the solver (which is controlled by [`AnalDrvNucgradCfg`], e.g. `atm_list`).
 ///
-/// The legacy `cpscf_*` and `cphf_*` prefixed key names are still accepted as aliases.
+/// All these keywords are specific to the CP-SCF-type solve, hence the `cpscf_*` key names.
+/// `grid_level` is not a solver setting but the DFT grid of the CP-SCF response evaluation (the
+/// response path; the fock path and the DH generalized Fock stay on the SCF grid), so it is named
+/// in the `grid_level_*` family of [`AnalDrvNucgradCfg::grid_level_skeleton`] with `cpscf` as the
+/// scope.
+///
+/// The legacy `cphf_*` prefixed key names are still accepted as aliases.
 #[serde_inline_default]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnalDrvRespCfg {
-    #[serde(rename = "resp_level_shift", alias = "cpscf_level_shift", alias = "cphf_level_shift")]
+    #[serde(rename = "cpscf_level_shift", alias = "cphf_level_shift")]
     #[serde_inline_default(0.0)]
     pub level_shift: f64,
-    #[serde(rename = "resp_tol", alias = "cpscf_tol", alias = "cphf_tol")]
+    #[serde(rename = "cpscf_tol", alias = "cphf_tol")]
     #[serde_inline_default(1e-9)]
     pub tol: f64,
-    #[serde(rename = "resp_max_cycle", alias = "cpscf_max_cycle", alias = "cphf_max_cycle")]
+    #[serde(rename = "cpscf_max_cycle", alias = "cphf_max_cycle")]
     #[serde_inline_default(42)]
     pub max_cycle: usize,
-    #[serde(rename = "resp_max_space", alias = "cpscf_max_space", alias = "cphf_max_space")]
+    #[serde(rename = "cpscf_max_space", alias = "cphf_max_space")]
     #[serde_inline_default(14)]
     pub max_space: usize,
-    #[serde(rename = "resp_lindep", alias = "cpscf_lindep", alias = "cphf_lindep")]
+    #[serde(rename = "cpscf_lindep", alias = "cphf_lindep")]
     #[serde_inline_default(1e-15)]
     pub lindep: f64,
-    #[serde(rename = "resp_tol_inflation", alias = "cpscf_tol_inflation", alias = "cphf_tol_inflation")]
+    #[serde(rename = "cpscf_tol_inflation", alias = "cphf_tol_inflation")]
     #[serde_inline_default(1000.0)]
     pub tol_inflation: f64,
-    /// Grid level for the response calculation.
+    /// Grid level for the CP-SCF response path (the DFT evaluation of the response/A-tensor
+    /// contractions; the fock path stays on the SCF grid).
     ///
     /// By default, the response grid level is set to `grid_gen_level.max(3) - 2` (much coarser than the SCF grid).
-    #[serde(rename = "grid_level_resp", alias = "grid_level_cpscf", alias = "grid_level_cphf")]
+    #[serde(rename = "grid_level_cpscf", alias = "grid_level_cphf")]
     #[serde_inline_default(None)]
     pub grid_level: Option<usize>,
 }
@@ -258,14 +265,15 @@ mod tests {
     use super::*;
 
     /// The four sub-configs flatten into the single flat `[analdrv]` key space of the control
-    /// input; the current `resp_*` key names must work, and the legacy `cpscf_*` / `*_cpscf` and
-    /// `cphf_*` / `*_cphf` key names must keep working as aliases.
+    /// input; the current `cpscf_*` key names must work, and the legacy `cphf_*` key names must
+    /// keep working as aliases. The response DFT grid is named in the `grid_level_*` family
+    /// (cf. `grid_level_skeleton`), with `cpscf` as its scope.
     #[test]
     fn test_flatten_deserialize_and_serialize() {
         let v = serde_json::json!({
-            "resp_tol": 1.0e-8,
-            "resp_max_cycle": 99,
-            "grid_level_resp": 2,
+            "cpscf_tol": 1.0e-8,
+            "cpscf_max_cycle": 99,
+            "grid_level_cpscf": 2,
             "grid_level_skeleton": 4,
             "grid_shift_deriv": false,
             "gau_thermo": true,
@@ -301,37 +309,37 @@ mod tests {
         assert_eq!(config.multipole.rdm1_relax, MultipoleRdm1Relax::Unrelaxed);
         assert!(config.multipole.rdm1_dump);
 
-        // the legacy key names are accepted as aliases
+        // the legacy cphf_* key names are accepted as aliases
         let v = serde_json::json!({
-            "cpscf_tol": 1.0e-7,
-            "cpscf_max_cycle": 98,
-            "grid_level_cpscf": 1,
+            "cphf_tol": 1.0e-7,
+            "cphf_max_cycle": 98,
+            "cphf_level_shift": 0.1,
+            "cphf_lindep": 1.0e-14,
+            "cphf_tol_inflation": 999.0,
+            "grid_level_cphf": 1,
         });
         let config: AnalDrvConfig = serde_json::from_value(v).unwrap();
         assert_eq!(config.resp.tol, 1.0e-7);
         assert_eq!(config.resp.max_cycle, 98);
+        assert_eq!(config.resp.level_shift, 0.1);
+        assert_eq!(config.resp.lindep, 1.0e-14);
+        assert_eq!(config.resp.tol_inflation, 999.0);
         assert_eq!(config.resp.grid_level, Some(1));
-
-        let v = serde_json::json!({
-            "cphf_tol": 1.0e-6,
-            "cphf_max_cycle": 97,
-            "grid_level_cphf": 0,
-        });
-        let config: AnalDrvConfig = serde_json::from_value(v).unwrap();
-        assert_eq!(config.resp.tol, 1.0e-6);
-        assert_eq!(config.resp.max_cycle, 97);
-        assert_eq!(config.resp.grid_level, Some(0));
 
         // an empty section must give exactly the default configuration
         let config: AnalDrvConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(config, AnalDrvConfig::default());
 
-        // serialization stays flat, under the new key names
+        // serialization stays flat, under the cpscf_* / grid_level_* key names
         let mut config = AnalDrvConfig::default();
         config.resp.tol = 1.0e-8;
+        config.resp.max_space = 20;
+        config.resp.grid_level = Some(2);
         config.multipole.rdm1_relax = MultipoleRdm1Relax::Unrelaxed;
         let v = serde_json::to_value(&config).unwrap();
-        assert_eq!(v["resp_tol"], serde_json::json!(1.0e-8));
+        assert_eq!(v["cpscf_tol"], serde_json::json!(1.0e-8));
+        assert_eq!(v["cpscf_max_space"], serde_json::json!(20));
+        assert_eq!(v["grid_level_cpscf"], serde_json::json!(2));
         assert_eq!(v["multipole_rdm1_relax"], serde_json::json!("unrelaxed"));
     }
 }

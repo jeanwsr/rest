@@ -767,17 +767,17 @@ analdrv_tasks = ["multipole", "hessian"]
 
 #### 自洽场响应选项
 
-这类选项控制自洽场响应 (analdrv 中主要用于计算 CP-SCF、以及 post-SCF 方法的 generalized Fock) 如何计算，但不控制传入求解的量 (如参与计算的原子范围)。
+这类选项控制自洽场响应 (analdrv 中主要用于计算 CP-SCF、以及 post-SCF 方法的 generalized Fock) 如何计算，但不控制传入求解的量 (如参与计算的原子范围)。这些选项均只服务于 CP-SCF (响应) 求解：求解器选项以 `cpscf_` 为前缀；响应 DFT 格点并非求解器设置，命名为 `grid_level_cpscf` (与 `grid_level_skeleton` 同属 `grid_level_*` 命名)。
 
-- `resp_level_shift`：CP-SCF 求解时对 $\varepsilon_i - \varepsilon_a$ 的求解偏移。默认为 0，单位 Hartree。
-- `resp_tol`：CP-SCF 中的 Krylov 求解阈值。默认 1e-9，无量纲。实际求解阈值也受制于 `resp_lindep`。
-- `resp_max_cycle`：CP-SCF 最大迭代步数。默认为 42 步。CP-SCF 与 SCF 不同，一般 6-10 步能收敛。这里的最大步数一般不需要设得很大。
-- `resp_max_space`：CP-SCF 中 Krylov 空间的数量。默认为 14。该数值不宜设太小，因为超过该数值时，Krylov 求解器会代入最后一次迭代重新作为初猜，重置求解过程。但该数值设太大会对内存产生压力。
-- `resp_lindep`：CP-SCF 中一些数值过程的数值精度阈值。默认 1e-15，无量纲。
-- `resp_tol_inflation`：容忍系数。若 Krylov 真残差 `||r|| < factor * tol`，接受该解而不触发 per-root 求解。缺省为1000.0。
-- `grid_level_resp`：CP-SCF 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None，是 `[ctrl]` 中 grid_generation_level 关键词设定值减 2 (SCF 默认格点级别是 3，对应 Hessian 的级别是 1)；显式取值不设下限。
+- `cpscf_level_shift`：CP-SCF 求解时对 $\varepsilon_i - \varepsilon_a$ 的求解偏移。默认为 0，单位 Hartree。
+- `cpscf_tol`：CP-SCF 中的 Krylov 求解阈值。默认 1e-9，无量纲。实际求解阈值也受制于 `cpscf_lindep`。
+- `cpscf_max_cycle`：CP-SCF 最大迭代步数。默认为 42 步。CP-SCF 与 SCF 不同，一般 6-10 步能收敛。这里的最大步数一般不需要设得很大。
+- `cpscf_max_space`：CP-SCF 中 Krylov 空间的数量。默认为 14。该数值不宜设太小，因为超过该数值时，Krylov 求解器会代入最后一次迭代重新作为初猜，重置求解过程。但该数值设太大会对内存产生压力。
+- `cpscf_lindep`：CP-SCF 中一些数值过程的数值精度阈值。默认 1e-15，无量纲。
+- `cpscf_tol_inflation`：容忍系数。若 Krylov 真残差 `||r|| < factor * tol`，接受该解而不触发 per-root 求解。缺省为1000.0。
+- `grid_level_cpscf`：CP-SCF 中响应路径 (响应/A 张量收缩的 DFT 计算；fock 路径仍用 SCF 格点) 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None，是 `[ctrl]` 中 grid_generation_level 关键词设定值减 2 (SCF 默认格点级别是 3，对应 Hessian 的级别是 1)；显式取值不设下限。
 
-这些关键词的旧名称 `cpscf_*` 与更早的 `cphf_*` 前缀 (`cpscf_tol`、`cphf_tol`、`grid_level_cpscf`、`grid_level_cphf` 等) 目前仍然作为别名被接受。
+这些关键词的旧名称 `cphf_*` 前缀 (`cphf_tol`、`cphf_lindep`、`cphf_tol_inflation` 等) 目前仍然作为别名被接受；响应格点则同时接受其旧名称 `grid_level_cphf`。
 
 #### 核坐标导数性质选项
 
@@ -798,8 +798,8 @@ analdrv_tasks = ["multipole", "hessian"]
 analdrv_tasks = "freq"
 
 [analdrv]
-resp_max_space = 20
-grid_level_resp = 2
+cpscf_max_space = 20
+grid_level_cpscf = 2
 
 [thermo]
 ```

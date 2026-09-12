@@ -1,4 +1,4 @@
-//! RKS (B3LYP, GGA) Hessian with explicit `grid_level_resp` / `grid_level_skeleton`.
+//! RKS (B3LYP, GGA) Hessian with explicit `grid_level_cpscf` / `grid_level_skeleton`.
 //!
 //! Exercises the dedicated CP-SCF grid path (`ni_cpks = Some`) and the skeleton-grid
 //! regeneration path for a GGA functional.
