@@ -270,6 +270,43 @@ impl<'a, 'b> RMultipoleDH<'a, 'b> {
         self.make_multipole_core(4)
     }
 
+    /// Total density matrix in AO basis, shape `[nao, nao]`: the SCF density plus the
+    /// correlation rdm1, and, for `relaxed = true`, the symmetrized Z-vector increment
+    /// (`0.5 * (Z + Z^T)` on the vir-occ and occ-vir blocks). This is the density contracted
+    /// for the multipole moments — its trace against any symmetric one-electron property
+    /// integral reproduces the electronic moment — and the quantity dumped to the fchk file
+    /// by `multipole_rdm1_dump`.
+    ///
+    /// Requires the DH composite (a post-SCF method); for the relaxed increment the response
+    /// object must be present, and the moment evaluation must have run before (the Z-vector
+    /// and the correlation rdm1 are then already cached). The (possible) antisymmetric part
+    /// of the raw vir-occ increment does not contribute to traces against symmetric
+    /// integrals, so the symmetrized and the raw forms are equivalent for the moments; the
+    /// symmetric form is the canonical relaxed density and is used here.
+    ///
+    /// # Returns
+    ///
+    /// - `dm_total_ao` : shape `[nao, nao]`. The total density matrix in AO basis.
+    pub fn get_total_density_ao(&mut self, relaxed: bool) -> Tsr {
+        let dm0 = get_dm0_restricted(self.mo_coeff.view(), self.mo_occ.view());
+        let Some(gfock) = self.gfock.as_deref_mut() else {
+            panic!("The total density increment requires a post-SCF (PT2-family) method; for SCF-level methods the total density is the SCF density alone.")
+        };
+        let rdm1_corr = gfock.make_rdm1();
+        let mut rdm1_total = rdm1_corr.to_owned();
+        if relaxed {
+            let resp = self.resp.as_deref_mut().expect(
+                "Relaxed total density requires the response object (RRespSCF), which the relaxed multipole mode provides.",
+            );
+            let rdm1_resp = gfock.make_rdm1_resp(resp);
+            // `rdm1_resp - rdm1_corr` is the Z-vector on the vir-occ block (see
+            // `make_multipole_core`); symmetrize it to 0.5 * (Z + Z^T).
+            let dz = &rdm1_resp - &rdm1_corr;
+            rdm1_total = rdm1_total + 0.5 * (&dz + &dz.t());
+        }
+        dm0 + self.mo_coeff.view() % rdm1_total.view() % self.mo_coeff.view().t()
+    }
+
     /// Print the evaluated multipole moments in the analdrv output style.
     ///
     /// Only sections whose entries exist in `result` are printed (so a dipole-only evaluation

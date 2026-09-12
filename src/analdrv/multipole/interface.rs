@@ -1,6 +1,6 @@
 //! Interface of the multipole task to the analdrv driver.
 
-use crate::analdrv::config::AnalDrvConfig;
+use crate::analdrv::config::{AnalDrvConfig, MultipoleRdm1Relax};
 use crate::analdrv::multipole::rmultipole::RMultipoleDH;
 use crate::analdrv::response::rgfock_interface::rgfock_dh_interface;
 use crate::analdrv::response::rresp_interface::RRespSCF;
@@ -135,6 +135,38 @@ pub fn multipole_interface<'a>(
         for (label, t) in &rmultipole.timing {
             println!("Timing {label}: {t:.3} s");
         }
+    }
+
+    // optional: dump the total density (the one contracted for the moments above) into the
+    // Gaussian fchk file. Post-SCF (PT2-family: MP2 and double-hybrid) methods dump the total
+    // density; SCF-level methods silently ignore the keyword (their total density is the SCF
+    // density alone, already in the fchk output).
+    if mp_cfg.rdm1_dump && scf_data.mol.xc_data.is_fifth_dfa() {
+        let relaxed = matches!(mp_cfg.rdm1_relax, MultipoleRdm1Relax::Relaxed);
+        let dm_total_ao = rmultipole.get_total_density_ao(relaxed);
+
+        // the fchk (head + MO coefficients) is regenerated first: with `outputs = ["fchk"]`
+        // it was already written before the analdrv tasks in the main driver, so this only
+        // recreates the same content when the dump keyword alone requests the file
+        scf_data.save_fchk_of_gaussian();
+
+        // pack the density into the fchk layout: Gaussian AO order (consistent with the
+        // librest2fch-written MO coefficients), lower triangle by column
+        let nbf = dm_total_ao.shape()[0];
+        let perm = scf_data.gaussian_ao_permutation();
+        assert_eq!(perm.len(), nbf, "AO permutation size mismatch.");
+        let mut packed = Vec::with_capacity(nbf * (nbf + 1) / 2);
+        for pj in 0..nbf {
+            let j = perm[pj];
+            for pi in 0..=pj {
+                packed.push(dm_total_ao[[perm[pi], j]]);
+            }
+        }
+        scf_data.fchk_append_density_section("Total MP2 Density", &packed);
+        println!(
+            "    total density: {}",
+            if relaxed { "relaxed (SCF + corr. + Z-vector response)" } else { "unrelaxed (SCF + corr.)" }
+        );
     }
 
     MultipoleOutput {

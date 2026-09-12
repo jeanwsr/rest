@@ -201,11 +201,29 @@ pub struct AnalDrvMultipoleCfg {
     #[serde(rename = "multipole_rdm1_relax")]
     #[serde_inline_default(MultipoleRdm1Relax::Relaxed)]
     pub rdm1_relax: MultipoleRdm1Relax,
+    /// Dump the total density matrix (SCF density plus the correlation increments, following
+    /// `multipole_rdm1_relax`) into the Gaussian formatted-checkpoint file `{molecule}.fchk`,
+    /// appended as the `Total MP2 Density` section (lower-triangular, Gaussian AO order — the
+    /// same convention as the MO coefficients of the fchk output; the name follows Gaussian's
+    /// post-SCF density convention, and for double hybrids it is simply the storage name of
+    /// the DH total density, for which Gaussian has no analog). The dumped density is the one
+    /// contracted for the multipole moments, i.e. its contraction with any property integral
+    /// reproduces the electronic moment (`dip_tot = dip_nuc - Tr(D int1e_r)`).
+    /// Post-SCF (PT2-family) methods only; silently ignored for SCF-level methods.
+    /// Default to false.
+    #[serde(rename = "multipole_rdm1_dump")]
+    #[serde_inline_default(false)]
+    pub rdm1_dump: bool,
 }
 
 impl Default for AnalDrvMultipoleCfg {
     fn default() -> Self {
-        Self { orders: vec![1, 2, 3, 4], origin: None, rdm1_relax: MultipoleRdm1Relax::Relaxed }
+        Self {
+            orders: vec![1, 2, 3, 4],
+            origin: None,
+            rdm1_relax: MultipoleRdm1Relax::Relaxed,
+            rdm1_dump: false,
+        }
     }
 }
 
@@ -268,17 +286,20 @@ mod tests {
         assert_eq!(config.multipole.orders, vec![1, 2, 3, 4]);
         assert_eq!(config.multipole.origin, None);
         assert_eq!(config.multipole.rdm1_relax, MultipoleRdm1Relax::Relaxed);
+        assert!(!config.multipole.rdm1_dump);
 
         // multipole sub-config keys
         let v = serde_json::json!({
             "multipole_orders": [1, 2],
             "multipole_origin": [0.5, -0.5, 1.0],
             "multipole_rdm1_relax": "unrelaxed",
+            "multipole_rdm1_dump": true,
         });
         let config: AnalDrvConfig = serde_json::from_value(v).unwrap();
         assert_eq!(config.multipole.orders, vec![1, 2]);
         assert_eq!(config.multipole.origin, Some([0.5, -0.5, 1.0]));
         assert_eq!(config.multipole.rdm1_relax, MultipoleRdm1Relax::Unrelaxed);
+        assert!(config.multipole.rdm1_dump);
 
         // the legacy key names are accepted as aliases
         let v = serde_json::json!({
