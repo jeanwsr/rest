@@ -254,6 +254,10 @@ impl<'a> RRespAPI for RRespKSNIMatmul<'a> {
             let (_, fxc) = make_cpks_vxc_fxc(&self.xc_func_list, &mut self.ni, mo_coeff, mo_occ);
             self.intmd.insert("fxc_common_grid".to_string(), fxc);
         }
+        // NOTE: unlike `cpks_fxc`, the cached `fxc_common_grid` is NOT re-validated against the
+        // orbitals on later calls. This is safe under the analdrv driver contract (the orbitals
+        // are fixed for the lifetime of a driver object), but any future caller that
+        // re-prepares with different orbitals must invalidate this entry as well.
         let fxc = self.intmd["fxc_common_grid"].view();
 
         // flatten the trailing dimensions into one set dimension; assume each set of the rdm can

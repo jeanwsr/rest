@@ -341,6 +341,10 @@ impl SCF {
         // agrees with the MO coefficients written by librest2fch); a zero placeholder
         // elsewhere (librest2fch only requires the section header to exist). librest2fch
         // copies the section content verbatim when regenerating the MO coefficients.
+        //
+        // NOTE: the unrestricted (`spin_channel == 2`) case still writes the zero placeholder;
+        // dumping real alpha/beta ("Total SCF Density" plus spin-polarized sections in
+        // Gaussian's convention) is left as future work.
         let mut packed_dm = vec![0.0f64; n_dm];
         if self.mol.spin_channel == 1 {
             let dm = &self.density_matrix[0];

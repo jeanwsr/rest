@@ -3,6 +3,8 @@
 use crate::analdrv::config::{AnalDrvConfig, AnalDrvTask, MultipoleRdm1Relax};
 use crate::analdrv::hessian::hess_interface;
 use crate::analdrv::multipole::interface::{multipole_interface, MultipoleOutput};
+use crate::analdrv::response::rgfock_interface;
+use crate::analdrv::response::rresp_interface;
 use crate::analdrv::response::rresp_interface::rscf_resp_interface;
 use crate::scf_io::{SCFType, SCF};
 use crate::thermo::ThermoResult;
@@ -77,7 +79,15 @@ pub fn analdrv_interface(
     // response object; the unrelaxed increments still need the DFT grids (regenerated below)
     let multipole_relaxed_dh =
         has_multipole && is_fifth && config.multipole.rdm1_relax == MultipoleRdm1Relax::Relaxed;
-    if has_multipole && is_fifth && scf_data.grids.is_none() {
+    // the DFT grids are needed only when a numint (DFT) consumer exists: the final-energy
+    // functional's XC part, or, in the relaxed mode, the SCF functional's XC response. A pure
+    // MP2-family method (HF functional, no final-functional DFT part) consumes no grid at all.
+    let multipole_dft_grids = has_multipole
+        && is_fifth
+        && (rgfock_interface::dh_xc_func_list(scf_data).is_some()
+            || (config.multipole.rdm1_relax == MultipoleRdm1Relax::Relaxed
+                && !rresp_interface::scf_xc_func_list(scf_data).is_empty()));
+    if multipole_dft_grids && scf_data.grids.is_none() {
         scf_data.grids = Some(crate::dft::Grids::build(&mut scf_data.mol));
     }
 

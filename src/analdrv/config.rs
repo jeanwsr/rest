@@ -44,8 +44,7 @@ impl Default for AnalDrvGeneralCfg {
 /// These keywords control how the response (CP-SCF-type) equations are solved, but not what is
 /// passed into the solver (which is controlled by [`AnalDrvNucgradCfg`], e.g. `atm_list`).
 ///
-/// The legacy `cpscf_*` / `*_cpscf` and `cphf_*` / `*_cphf` key names are still accepted as
-/// aliases.
+/// The legacy `cpscf_*` and `cphf_*` prefixed key names are still accepted as aliases.
 #[serde_inline_default]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnalDrvRespCfg {
@@ -180,8 +179,8 @@ impl Default for MultipoleRdm1Relax {
 /// Settings of the electric multipole moment evaluation.
 ///
 /// These keywords control what is evaluated in the [`Multipole`](AnalDrvTask::Multipole) task.
-/// All moments are evaluated in atomic units; the origin convention follows Gaussian (center of
-/// nuclear mass by default).
+/// All moments are evaluated in atomic units; the default origin is the coordinate origin
+/// `[0, 0, 0]` (Bohr), the same print convention as Gaussian and pyscf.
 #[serde_inline_default]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnalDrvMultipoleCfg {
@@ -191,9 +190,10 @@ pub struct AnalDrvMultipoleCfg {
     #[serde_inline_default(vec![1, 2, 3, 4])]
     pub orders: Vec<usize>,
     /// Explicit origin (Bohr) of the multipole evaluation. By default `None`, meaning the
-    /// center of nuclear mass (computed from the IUPAC 2021 average atomic weights of REST's
-    /// element table; note Gaussian uses most-abundant-isotope masses, so tiny differences in
-    /// the default origin are expected when comparing higher moments).
+    /// coordinate origin `[0, 0, 0]` — the same print convention as Gaussian and pyscf. Note
+    /// that raw moments of order >= 2 depend on where the molecule sits in the input
+    /// coordinate frame; set this keyword explicitly (e.g. to the center of nuclear mass) for
+    /// origin-independent reporting or literature comparison.
     #[serde(rename = "multipole_origin")]
     #[serde_inline_default(None)]
     pub origin: Option<[f64; 3]>,

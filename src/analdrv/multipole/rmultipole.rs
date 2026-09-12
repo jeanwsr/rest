@@ -311,9 +311,10 @@ impl<'a, 'b> RMultipoleDH<'a, 'b> {
     ///
     /// Only sections whose entries exist in `result` are printed (so a dipole-only evaluation
     /// does not print an empty quadrupole section). All quantities are in atomic units. The
-    /// print is gated by `print_level >= 2`, following the hessian interface convention.
+    /// print is gated by `print_level >= 1` (the timing output stays at `>= 2`); the output
+    /// style of this section is expected to be refactored later.
     pub fn print_multipole(&self, print_level: usize) {
-        if print_level < 2 {
+        if print_level < 1 {
             return;
         }
         println!("=============== Multipole Moments (in analdrv) ===============");

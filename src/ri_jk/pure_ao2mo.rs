@@ -78,7 +78,9 @@ pub fn get_ao2mo_s2ij_to_s1_notrans_with_output<T, O>(
     // check if type T is the same to O; if so, create a scratch buffer
     let scratch_out_pool = BufferPool::new(|| unsafe { uninitialized_vec(n_scratch_out).unwrap() });
 
-    (0..np).into_iter().for_each(|p| {
+    // the scratch pools are mutex-protected and the per-`p` outputs are disjoint slices, so the
+    // parallel loop over the auxiliary index is safe
+    (0..np).into_par_iter().for_each(|p| {
         let j3c_p = j3c.i((.., p)).unpack_tri(uplo, FlagSymm::He);
         for iset in 0..nset {
             let ni = bra[iset].shape()[1];

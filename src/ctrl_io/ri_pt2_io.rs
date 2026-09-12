@@ -13,7 +13,10 @@ pub struct RiPt2Option {
     #[serde_inline_default(0)]
     pub mpi_mode: usize,
     /// Floating-point precision mode for PT2 calculations. Default is FP32.
-    /// Only effective when `new_driver = true`.
+    /// Effective for the PT2 energy only when `new_driver = true` (the legacy energy driver is
+    /// always f64); the analdrv generalized-Fock/property path
+    /// ([`rgfock_dh_interface`](crate::analdrv::response::rgfock_interface::rgfock_dh_interface))
+    /// follows this keyword regardless of `new_driver`.
     #[serde_inline_default(PT2FPMode::FP32)]
     pub fp_mode: PT2FPMode,
     /// Switch to select the PT2 implementation.

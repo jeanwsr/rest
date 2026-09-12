@@ -7,10 +7,12 @@
 //! future standalone response/property driver can call it directly, without any hessian
 //! machinery.
 //!
-//! The DFT XC response object evaluates the fock path on the SCF grid (regrouped to atom-grouped
-//! order), and the response path on a dedicated (usually coarser) cpscf grid. The hessian-side
-//! skeleton grid policy (including the MGGA level bump) lives in the hessian interface; no grid
-//! identity or grid data is shared between the hessian and response subsystems.
+//! The DFT XC response object evaluates the fock path directly on the SCF grid (in its native
+//! round-robin atom-interleaved order — the fock path is a plain quadrature sum, so no
+//! atom-regrouping is applied), and the response path on a dedicated (usually coarser) cpscf
+//! grid. The hessian-side skeleton grid policy (including the MGGA level bump) lives in the
+//! hessian interface; no grid identity or grid data is shared between the hessian and response
+//! subsystems.
 
 use crate::analdrv::config::AnalDrvRespCfg;
 use crate::analdrv::prelude::*;

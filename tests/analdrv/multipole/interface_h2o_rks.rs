@@ -3,8 +3,8 @@
 //! Drives the full task path — task dispatch, explicit `multipole_origin`, the SCF-only
 //! construction (no gfock/resp objects for usual DFT), stdout print, and the results-JSON
 //! export. The moment references are identical to `tests/analdrv/multipole/h2o_rks.rs`
-//! (pyscf 2.14.0, RI-JK with def2-universal-jkfit, origin at [0, 0, 0]); the default-origin
-//! (center of nuclear mass) check uses the IUPAC 2021 average atomic weights.
+//! (pyscf 2.14.0, RI-JK with def2-universal-jkfit, origin at [0, 0, 0]); the default
+//! (`multipole_origin = None`) resolves to the coordinate origin as well.
 
 use pyrest::analdrv::config::{AnalDrvConfig, AnalDrvTask};
 use pyrest::analdrv::interface::{analdrv_interface, analdrv_json_interface};
@@ -100,16 +100,14 @@ fn test_h2o_interface() {
     );
     assert!(json_extra.get("thermo").is_none());
 
-    // --- default origin: center of nuclear mass from IUPAC 2021 average weights --- //
+    // --- default origin: the coordinate origin [0, 0, 0] (the Gaussian/pyscf print
+    // convention) --- //
     let mut config = AnalDrvConfig::default();
     config.multipole.orders = vec![1];
     let output = analdrv_interface(&mut scf_data, &tasks, &config);
 
     let mp = output.multipole.as_ref().unwrap();
-    // expected CoM (Bohr): (1.008 * (0.75 - 0.70), 1.008 * (0.55 + 0.60), 1.008 * (0.10 - 0.05))
-    // Angstrom / (15.999 + 2 * 1.008) / 0.52917721092 (REST's BOHR)
-    let expected_com = [0.005286827459, 0.121597031562, 0.005286827459];
-    allclose(&mp.origin, &expected_com, 1e-9);
+    assert_eq!(mp.origin, [0.0; 3]);
     // neutral molecule: dipole is origin-independent, so the total is unchanged
     allclose(&mp.dipole.as_ref().unwrap().tot, &[0.031738377072, 0.814840804724, 0.035041217679], 1e-5);
 }

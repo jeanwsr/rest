@@ -39,7 +39,7 @@ pub struct MultipoleOrderParts {
 #[derive(Debug, Clone, Serialize)]
 pub struct MultipoleOutput {
     /// The origin (Bohr) actually used for the evaluation: the explicit `multipole_origin` if
-    /// given, else the center of nuclear mass.
+    /// given, else the coordinate origin `[0, 0, 0]`.
     pub origin: [f64; 3],
     /// Dipole moment (order 1), present if requested in `multipole_orders`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,7 +85,7 @@ pub fn multipole_interface<'a>(
         );
     }
 
-    let origin = mp_cfg.origin.unwrap_or_else(|| center_of_nuclear_mass(scf_data));
+    let origin = mp_cfg.origin.unwrap_or([0.0; 3]);
 
     let device = DeviceBLAS::default();
     let mo_coeff = (&scf_data.eigenvectors[0]).to_rstsr(&device);
@@ -102,7 +102,7 @@ pub fn multipole_interface<'a>(
                 "Multipole evaluation for post-SCF methods currently supports PT2-family (xDH/BDH/MP2) methods only, got {other:?}."
             ),
         }
-        Some(rgfock_dh_interface::<f64>(scf_data))
+        Some(rgfock_dh_interface(scf_data))
     } else {
         None
     };
@@ -142,31 +142,46 @@ pub fn multipole_interface<'a>(
     // density; SCF-level methods silently ignore the keyword (their total density is the SCF
     // density alone, already in the fchk output).
     if mp_cfg.rdm1_dump && scf_data.mol.xc_data.is_fifth_dfa() {
-        let relaxed = matches!(mp_cfg.rdm1_relax, MultipoleRdm1Relax::Relaxed);
-        let dm_total_ao = rmultipole.get_total_density_ao(relaxed);
+        let fchk_file = format!("{}.fchk", scf_data.mol.geom.name);
+        if !std::path::Path::new(&fchk_file).exists() {
+            // the density is appended to an existing fchk file; this keyword must not create one
+            // on its own (add "fchk" to `[ctrl] outputs` for that)
+            println!(
+                "Warning: multipole_rdm1_dump is set, but the fchk file \"{fchk_file}\" does not \
+                 exist. The density dump is skipped; request the fchk output (e.g. outputs = \
+                 [\"fchk\"]) to enable it."
+            );
+        } else {
+            let relaxed = matches!(mp_cfg.rdm1_relax, MultipoleRdm1Relax::Relaxed);
+            let dm_total_ao = rmultipole.get_total_density_ao(relaxed);
 
-        // the fchk (head + MO coefficients) is regenerated first: with `outputs = ["fchk"]`
-        // it was already written before the analdrv tasks in the main driver, so this only
-        // recreates the same content when the dump keyword alone requests the file
-        scf_data.save_fchk_of_gaussian();
+            // the fchk (head + MO coefficients) is regenerated first, so the appended section
+            // always sits after the librest2fch-written MO coefficients (the content is
+            // identical to the earlier `post_scf_output` write)
+            scf_data.save_fchk_of_gaussian();
 
-        // pack the density into the fchk layout: Gaussian AO order (consistent with the
-        // librest2fch-written MO coefficients), lower triangle by column
-        let nbf = dm_total_ao.shape()[0];
-        let perm = scf_data.gaussian_ao_permutation();
-        assert_eq!(perm.len(), nbf, "AO permutation size mismatch.");
-        let mut packed = Vec::with_capacity(nbf * (nbf + 1) / 2);
-        for pj in 0..nbf {
-            let j = perm[pj];
-            for pi in 0..=pj {
-                packed.push(dm_total_ao[[perm[pi], j]]);
+            // pack the density into the fchk layout: Gaussian AO order (consistent with the
+            // librest2fch-written MO coefficients), lower triangle by column
+            let nbf = dm_total_ao.shape()[0];
+            let perm = scf_data.gaussian_ao_permutation();
+            assert_eq!(perm.len(), nbf, "AO permutation size mismatch.");
+            let mut packed = Vec::with_capacity(nbf * (nbf + 1) / 2);
+            for pj in 0..nbf {
+                let j = perm[pj];
+                for pi in 0..=pj {
+                    packed.push(dm_total_ao[[perm[pi], j]]);
+                }
             }
+            scf_data.fchk_append_density_section("Total MP2 Density", &packed);
+            println!(
+                "    total density: {}",
+                if relaxed {
+                    "relaxed (SCF + corr. + Z-vector response)"
+                } else {
+                    "unrelaxed (SCF + corr.)"
+                }
+            );
         }
-        scf_data.fchk_append_density_section("Total MP2 Density", &packed);
-        println!(
-            "    total density: {}",
-            if relaxed { "relaxed (SCF + corr. + Z-vector response)" } else { "unrelaxed (SCF + corr.)" }
-        );
     }
 
     MultipoleOutput {
@@ -195,20 +210,4 @@ fn order_parts(driver: &RMultipoleDH, prefix: &str, traceless: bool) -> Option<M
             None
         },
     })
-}
-
-/// Center of nuclear mass (Bohr), from the IUPAC 2021 average atomic weights of REST's element
-/// table (Gaussian reports its moments at the center of mass as well, but uses
-/// most-abundant-isotope masses, so tiny origin differences are expected in comparisons).
-fn center_of_nuclear_mass(scf_data: &SCF) -> [f64; 3] {
-    let masses = crate::geom_io::get_mass_charge(&scf_data.mol.geom.elem);
-    let mut com = [0.0f64; 3];
-    let mut mass_tot = 0.0f64;
-    for (xyz, (mass, _)) in scf_data.mol.geom.position.iter_columns_full().zip(masses.iter()) {
-        for t in 0..3 {
-            com[t] += mass * xyz[t];
-        }
-        mass_tot += mass;
-    }
-    com.map(|v| v / mass_tot)
 }

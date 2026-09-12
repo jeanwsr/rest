@@ -78,7 +78,7 @@ fn test_nh3() {
     let mol_cint = get_cint_mol(&scf_data.mol);
     let config = AnalDrvConfig::default();
     let mut resp_objs = rscf_resp_interface(&scf_data, &config);
-    let mut rgfock = rgfock_dh_interface::<f64>(&scf_data);
+    let mut rgfock = rgfock_dh_interface(&scf_data);
 
     let mut rmultipole =
         RMultipoleDH::new(&mol_cint, mo_coeff, mo_occ, [0.0; 3], Some(&mut rgfock), Some(&mut resp_objs));

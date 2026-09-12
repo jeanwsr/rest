@@ -35,13 +35,11 @@ use crate::dft::DFAFamily;
 use crate::ri_jk::gfock_r::RGFockRIJK;
 use crate::ri_jk::util::get_cint_mol;
 use crate::ri_pt2::rgfock_pt2::RGFockPT2;
+use crate::ri_pt2::PT2FPMode;
 use crate::SCF;
 
 use enumflags2::BitFlags;
 use libxc::prelude::*;
-use num::traits::NumAssignOps;
-use num::{FromPrimitive, ToPrimitive};
-use rt::blas::BlasFloat;
 
 /// J/K factors of the RI-JK part of the (restricted) final-energy functional of a DH.
 ///
@@ -372,16 +370,16 @@ impl RGFockAPI for RGFockDH<'_> {
 /// The CP-SCF solver settings (including the Z-vector level shift) are those of the response
 /// object supplied by the caller, captured when it was built.
 ///
+/// The RI-PT2 working precision follows the `[ri_pt2] fp_mode` control keyword (FP32 by default);
+/// all outputs of the PT2 contribution are f64 regardless.
+///
 /// # Parameters
 ///
 /// - `scf_data` : converged SCF data. Must carry the cholesky decomposed ERI (`rimatr`); the DFT
 ///   part additionally requires the SCF grids (`scf_data.grids`) to be present — note that
 ///   [`xdh_calculations`](crate::ri_pt2::xdh_calculations) frees the grids, so this interface
 ///   must be called before it, or the grids must be regenerated in between.
-pub fn rgfock_dh_interface<'a, O>(scf_data: &'a SCF) -> RGFockDH<'a>
-where
-    O: BlasFloat + ToPrimitive + FromPrimitive + NumAssignOps + 'static,
-{
+pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
     let device = DeviceBLAS::default();
 
     // --- basic preparation and checks --- //
@@ -459,16 +457,31 @@ where
 
     // --- RI-PT2 (correlation contribution; an ordinary element of the list) --- //
 
-    gfock_list.push(Box::new(RGFockPT2::<O>::new(
-        mo_coeff.to_owned(),
-        mo_occ.to_owned(),
-        mo_energy.to_owned(),
-        rimatr.to_rstsr_view(&device).into_cow(),
-        None,
-        vec![0, nocc],
-        c_os,
-        c_ss,
-    )));
+    // the RI-PT2 working precision follows the `[ri_pt2] fp_mode` control keyword (default FP32;
+    // the pre-transformed f32 `cderi_vox` is not supplied here, so the kernel transforms in f64
+    // and casts on the fly); all outputs (`gfock_part`, `rdm1_corr`, `e_corr`) are f64 regardless
+    match scf_data.mol.ctrl.ri_pt2.fp_mode {
+        PT2FPMode::FP64 => gfock_list.push(Box::new(RGFockPT2::<f64>::new(
+            mo_coeff.to_owned(),
+            mo_occ.to_owned(),
+            mo_energy.to_owned(),
+            rimatr.to_rstsr_view(&device).into_cow(),
+            None,
+            vec![0, nocc],
+            c_os,
+            c_ss,
+        ))),
+        PT2FPMode::FP32 => gfock_list.push(Box::new(RGFockPT2::<f32>::new(
+            mo_coeff.to_owned(),
+            mo_occ.to_owned(),
+            mo_energy.to_owned(),
+            rimatr.to_rstsr_view(&device).into_cow(),
+            None,
+            vec![0, nocc],
+            c_os,
+            c_ss,
+        ))),
+    }
 
     RGFockDH::new(gfock_list, mo_coeff, mo_occ, mo_energy)
 }

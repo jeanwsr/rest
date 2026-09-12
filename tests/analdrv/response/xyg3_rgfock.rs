@@ -138,7 +138,7 @@ fn test_nh3() {
     println!("Lagrangian PT2 part (fro): {lag_pt2_fro} (ref 0.08654174685311)");
     assert!((lag_pt2_fro - 0.08654174685311).abs() < 1e-6, "PT2 Lagrangian fro mismatch");
 
-    let mut rgfock = rgfock_dh_interface::<f64>(&scf_data);
+    let mut rgfock = rgfock_dh_interface(&scf_data);
     rgfock.make_response_preparation(&mut resp_objs);
 
     // the composite's summed unrelaxed rdm1 (only the PT2 element contributes) agrees with the

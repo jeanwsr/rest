@@ -775,7 +775,7 @@ analdrv_tasks = ["multipole", "hessian"]
 - `resp_max_space`：CP-SCF 中 Krylov 空间的数量。默认为 14。该数值不宜设太小，因为超过该数值时，Krylov 求解器会代入最后一次迭代重新作为初猜，重置求解过程。但该数值设太大会对内存产生压力。
 - `resp_lindep`：CP-SCF 中一些数值过程的数值精度阈值。默认 1e-15，无量纲。
 - `resp_tol_inflation`：容忍系数。若 Krylov 真残差 `||r|| < factor * tol`，接受该解而不触发 per-root 求解。缺省为1000.0。
-- `grid_level_resp`：CP-SCF 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None，是 `[ctrl]` 中 grid_generation_level 关键词设定值减 2 (SCF 默认格点级别是 3，对应 Hessian 的级别是 1)；最低级别是 1。
+- `grid_level_resp`：CP-SCF 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None，是 `[ctrl]` 中 grid_generation_level 关键词设定值减 2 (SCF 默认格点级别是 3，对应 Hessian 的级别是 1)；显式取值不设下限。
 
 这些关键词的旧名称 `cpscf_*` 与更早的 `cphf_*` 前缀 (`cpscf_tol`、`cphf_tol`、`grid_level_cpscf`、`grid_level_cphf` 等) 目前仍然作为别名被接受。
 
@@ -806,10 +806,10 @@ grid_level_resp = 2
 
 #### 电多极矩选项
 
-这类关键词控制电多极矩 (`multipole` 任务) 的计算：求哪几阶矩、以何处为原点、以及后自洽 (PT2 族) 密度增量的处理方式，但不控制 CP-SCF 方程如何求解。所有矩以原子单位输出；原点约定与 Gaussian 相同，默认取核质量中心。
+这类关键词控制电多极矩 (`multipole` 任务) 的计算：求哪几阶矩、以何处为原点、以及后自洽 (PT2 族) 密度增量的处理方式，但不控制 CP-SCF 方程如何求解。所有矩以原子单位输出；默认原点为坐标原点 `[0, 0, 0]`，与 Gaussian、pyscf 的多极矩打印约定一致。对于含赝势 (ECP) 的体系，核电荷矩按有效核电荷 (核电荷数减去赝势冻结电子数) 计，该约定同样与 Gaussian 一致。
 
 - `multipole_orders`：取值为正整数列表：1 = 偶极、2 = 四极、3 = 八极、4 = 十六极。默认为 `[1, 2, 3, 4]`。
-- `multipole_origin`：显式指定多极矩计算原点，取值为长度 3 的浮点数列表，单位 Bohr。默认为 None，即约化质心。
+- `multipole_origin`：显式指定多极矩计算原点，取值为长度 3 的浮点数列表，单位 Bohr。默认为 None，即坐标原点 `[0, 0, 0]`。注意四极及以上矩 (2–4 阶) 的取值依赖分子在输入卡坐标系中的摆放位置；若需以核质量中心等其他原点取值 (如与文献值比较)，请显式设置本关键词。
 - `multipole_rdm1_relax`：双杂化密度增量的处理方式，取值 `"relaxed"` (求解 Z-vector 并计入响应增量) 或 `"unrelaxed"` (仅计入非弛豫关联 rdm1 增量，不求解 CP-SCF)。默认为 `"relaxed"`。对 HF/DFT 方法无效 (静默忽略)。
 - `multipole_rdm1_dump`：取值布尔类型。计算多极矩后，将总密度矩阵 (SCF 密度 + 关联 rdm1 增量；`"relaxed"` 模式下再对称地加入 0.5 * (Z + Zᵀ) 的 vir-occ/occ-vir 增量) 按 Gaussian fchk 格式追加写入 `{molecule}.fchk` 文件的 `Total MP2 Density` 段。该密度即多极矩计算中所收缩的密度：它与任意对称单电子性质积分的迹给出相应电子贡献。仅对 PT2 族后自洽方法 (纯 MP2 与双杂化) 生效；对 SCF 层级方法静默忽略。默认为 `false`。
 
