@@ -16,13 +16,13 @@ use std::time::{Instant, Duration};
 use rest_tensors::RIFull;
 use rest_tensors::{TensorOpt, MatrixFull, MatrixFullSlice, BasicMatrix};
 use rest_tensors::matrix_blas_lapack::{_dgemm};
-use libc::{sysconf, _SC_PHYS_PAGES};
 use crate::utilities::memory_batch::{detect_available_memory_mb};
+
+use crate::ri_pt2::serviceportal::ServicePortal;
+use crate::ri_pt2::pt2_25d::{compute_eri_virt_close_shell, compute_eri_virt_os, compute_eri_virt_ss};
 
 
 use std::ptr;
-use std::thread;
-use libc::c_void;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 
@@ -40,7 +40,8 @@ pub struct CtxASlideBlock {
     pub ownership: Vec<Vec<usize>>,
     pub row_block_idx: Vec<usize>,
     pub col_block_idx: Vec<usize>,
-    pub schedule: Vec<State>,
+    pub schedule: Vec<State>, // upper triangle (RHF / same-spin)
+    pub schedule_os: Option<Vec<State>>, // unified-ID OS schedule
     pub kernel_size: (usize, usize),
     pub cache_capacity: usize,
 }
@@ -54,8 +55,10 @@ pub fn generate_schedule(
     row_offset: usize,
     col_offset: usize,
     cache_capacity: usize,
-    upper_only: bool,
+    block_j_offset: usize,  // 0 for RHF / same-spin; num_blocks for OS
+    upper_only: bool, // false for RHF / same-spin; true for OS
 ) -> Vec<State> {
+    if (!upper_only) {assert!(block_j_offset > 0)};
     let R = row_blocks.len();
     let C = col_blocks.len();
 
@@ -93,10 +96,10 @@ pub fn generate_schedule(
                 let I = row_blocks[i];
                 for j in c_start..c_end {
                     let J = col_blocks[j];
-                    if (upper_only && I <= J) || (!upper_only) {
-                        cur_pairs.push((I, J));
+                    if (upper_only && I <= J) || (!upper_only)  {
+                        cur_pairs.push((I, block_j_offset + J));
                         cur_blocks.insert(I);
-                        cur_blocks.insert(J);
+                        cur_blocks.insert(block_j_offset + J);
                     }
                 }
             }
@@ -196,7 +199,7 @@ pub fn generate_schedule(
     schedule
 }
 
-pub fn validate_schedule(schedule: &Vec<State>, cache_capacity: usize, mpi_op: &MPIOperator) -> bool
+pub fn validate_schedule(schedule: &Vec<State>, cache_capacity: usize, block_j_offset: usize, mpi_op: &MPIOperator) -> bool
 {
     let num_sliding_steps = schedule.len();
     let mut cache: HashSet<usize> = HashSet::new();
@@ -293,23 +296,59 @@ pub fn initialize_metadata_ASlide(mpi_op: &MPIOperator, n0_global:usize, n1_glob
         ownership[owner].push(blk);
     }
     let max_block_size = if block_residue > 0 { block_size + 1 } else { block_size };
-    let cache_capacity: usize = determine_cache_capacity(mpi_op, n0_global * n1_global, max_block_size);
+    let mut cache_capacity: usize = determine_cache_capacity(mpi_op, n0_global * n1_global, max_block_size);
     assert!(cache_capacity > 1);
     let block_bandwidth = determine_bandwidth(mpi_op, n0_global * n1_global, max_block_size);
     let block_dgemm_speed = determine_dgemm_speed(mpi_op, n0_global, n1_global, max_block_size);
     let (kernel_row, kernel_col) = determine_kernel_size(cache_capacity, block_bandwidth, block_dgemm_speed);
+    let mut min_cap = 0usize;
+    let mut max_cap = 0usize;
 
-    let schedule = generate_schedule(&row_block_idx, &col_block_idx, kernel_row, kernel_col, my_row, my_col, cache_capacity, close_shell);
-    let schedule_flag = validate_schedule(&schedule, cache_capacity, mpi_op);
+    //cache_capacity = (kernel_row + kernel_col) * 2;
+    mpi_op.world.all_reduce_into(&cache_capacity, &mut min_cap, SystemOperation::min());
+    mpi_op.world.all_reduce_into(&cache_capacity, &mut max_cap, SystemOperation::max());
+    assert_eq!(
+        min_cap, max_cap,
+        "cache_capacity differs across ranks (min {}, max {}) — check determine_kernel_size inputs",
+        min_cap, max_cap
+    );
+    let schedule = generate_schedule(&row_block_idx, &col_block_idx, kernel_row, kernel_col, my_row, my_col, cache_capacity, 0, true);
+    let schedule_flag = validate_schedule(&schedule, cache_capacity, 0, mpi_op);
     assert!(schedule_flag, "schedule failed!");
+
+    // ---- Full-matrix schedule for opposite-spin in UHF/ROHF ----
+    // Only needed when the spin channels can differ (close_shell == false).
+    let schedule_os: Option<Vec<State>> = if close_shell {
+        None
+    } else {
+        let full = generate_schedule(
+            &row_block_idx,
+            &col_block_idx,
+            kernel_row,
+            kernel_col,
+            my_row,
+            my_col,
+            cache_capacity,
+            num_block,
+            false,
+        );
+        let full_flag = validate_schedule(&full, cache_capacity, num_block, mpi_op);
+        assert!(full_flag, "os schedule failed!");
+        Some(full)
+    };
 
     if (rank == 0) {
         println!("k:{}, num_blocks:{}, block_size:{}", k, num_block, max_block_size);
         println!("cache_capacity:{} blocks", cache_capacity);
-        println!("FLOPS/COMM = {}", (block_dgemm_speed as f64 / block_bandwidth as f64));
         println!("kernel size:({},{})", kernel_row, kernel_col);
+        let hardware_r = block_dgemm_speed as f64 / block_bandwidth as f64;
+        let block_r = (kernel_row * kernel_col) as f64 / (kernel_row + kernel_col) as f64 * hardware_r;
+        println!("HARDWARE COMP/COMM = {}, KERNEL({},{}) COMP/COMM = {}", hardware_r, kernel_row, kernel_col, block_r);
     }
-    eprintln!("rank:{} schedule steps:{}", rank, schedule.len());
+    eprintln!("rank:{} same-spin schedule steps:{}", rank, schedule.len());
+    if let Some(full) = &schedule_os {
+        eprintln!("rank:{} opposite-spin schedule steps:{}", rank, full.len());
+    }
 
     CtxASlideBlock {
         k,
@@ -318,6 +357,7 @@ pub fn initialize_metadata_ASlide(mpi_op: &MPIOperator, n0_global:usize, n1_glob
         row_block_idx,
         col_block_idx,
         schedule,
+        schedule_os,
         kernel_size: (kernel_row, kernel_col),
         cache_capacity: cache_capacity,
     }
@@ -358,7 +398,7 @@ pub fn determine_dgemm_speed(mpi_op: &MPIOperator, n0: usize, n1: usize, block_s
     let mut total_elapsed = 0.0_f64;
     mpi_op.world.all_reduce_into(&elapsed, &mut total_elapsed, SystemOperation::sum());
     let result = total_elapsed * (block_size as f64) / (mpi_op.size as f64);
-    elapsed
+    result
 }
 
 pub fn determine_bandwidth(mpi_op: &MPIOperator, slice_size: usize, block_size: usize) -> f64 {
@@ -407,14 +447,24 @@ pub fn determine_kernel_size(cache_capacity: usize, block_bandwidth: f64, block_
 {
     assert!(cache_capacity > 1);
 
-    let target_min = 5.0;
-    let target_max = 15.0;
+    // Measured hardware compute/communication ratio.
+    // On a laptop, block_bandwidth is loopback and inflates this by ~10×.
+    // On an HPC node the ratio is typically 5–30. Clamping makes the
+    // downstream tuner independent of where the code was written.
+
+    let hw_measured = block_dgemm_speed / block_bandwidth;
+    let hw = hw_measured.clamp(5.0, 30.0);
+    let target_min = (hw * 0.4).max(5.0);
+    let target_max = (hw * 1.1).max(10.0);
     let target_mid = (target_min + target_max) / 2.0;
 
     let f2c_ratio = block_dgemm_speed / block_bandwidth;
-    let ideal_kr = 2.0 * target_mid / f2c_ratio;
-    let mut kr = ideal_kr.round() as usize;
-    kr = kr.max(1);
+    let ideal_kr = if block_dgemm_speed > 0.0 && block_bandwidth > 0.0 {
+        2.0 * target_mid * block_bandwidth / block_dgemm_speed
+    } else {
+        1.0
+    };
+    let mut kr = (ideal_kr.round() as usize).clamp(1, cache_capacity.saturating_sub(1));
     let mut kc = kr;
 
     if kr + kc > cache_capacity {
@@ -471,6 +521,18 @@ pub fn redistribute_batch_reverse_w_truncation(mpi_op: &MPIOperator, ctx: &CtxAS
     let n1_global = dten.size[1];
     let n2_global = dten.size[2];
 
+    assert_eq!(
+        dten.data.len(),
+        dten.size[0] * dten.size[1] * n2_global,
+        "redistribute: dten.size = {:?}, data.len() = {}",
+        dten.size, dten.data.len()
+    );
+    assert!(
+        *ctx.block_start_idx.last().unwrap() < n2_global,
+        "ctx last_start = {} >= tensor n2 = {}: ctx built for a different n2",
+        ctx.block_start_idx.last().unwrap(), n2_global
+    );
+
     let start_n0 = n0_range.start;
     let local_n0 = n0_range.end - n0_range.start;
 
@@ -485,7 +547,7 @@ pub fn redistribute_batch_reverse_w_truncation(mpi_op: &MPIOperator, ctx: &CtxAS
     let mut result = HashMap::new();
 
     // Loop over global block IDs in batches (not just local owned blocks)
-    let batch_size = (ctx.cache_capacity / 2).min(1);
+    let batch_size = (ctx.cache_capacity / 2).max(1);
     let mut batch_end = num_blocks;
     while batch_end > 0 {
         let mut batch_start = batch_end.saturating_sub(batch_size).max(0);
@@ -596,316 +658,549 @@ pub fn redistribute_batch_reverse_w_truncation(mpi_op: &MPIOperator, ctx: &CtxAS
     result
 }
 
-pub fn computation_close_shell_slide(final_tensor: &HashMap<usize, RIFull<f64>>, ctx: &CtxASlideBlock, n2_global: usize,
- eigenvalues: &Vec<f64>, occupation: &Vec<f64>, occ_offset: usize, virt_offset: usize) -> (f64, f64) {
-    let schedule = ctx.schedule;
-    let block_start_idx = &ctx.block_start_idx;
-    let num_block = block_start_idx.len();
+fn pair_block_compute_close_shell(block_i: &RIFull<f64>, block_j: &RIFull<f64>, block_i_id: usize, block_j_id: usize,
+                                eigenvalues: &Vec<f64>, occupation: &Vec<f64>, occ_offset: usize, virt_offset: usize)
+-> (f64, f64)
+{
+    assert_eq!(block_i.dist_axis, 2);
+    assert_eq!(block_j.dist_axis, 2);
 
     let mut local_term_os: f64 = 0.0_f64;
     let mut local_term_ss: f64 = 0.0_f64;
-    let mut size_buf = [0usize; 2];
-/*
-    for &col_blk in col_block_idx {
-        let col_start = block_start_idx[col_blk];
-        let col_end = if col_blk == num_block - 1 {n2_global - 1} else {block_start_idx[col_blk + 1] - 1};
-        let ri_j_block = final_tensor.get_reducing_block_matrix_global_n2(col_start, col_end, &mut size_buf).unwrap();
-        let n1_block = ri_j_block.size[1];
-        assert_eq!(n1_block % n1_global, 0);
-        let bj = n1_block / n1_global;
-        assert_eq!(bj, col_end - col_start + 1);
 
-        let col_eigenvalues = &eigenvalues[col_start + occ_offset..col_end + occ_offset + 1];
-        let col_occupation = &occupation[col_start + occ_offset..col_end + occ_offset + 1];
+    let n0_global = block_i.size[0];
+    let n1_global = block_i.size[1];
+    let slice_elements = n0_global * n1_global;
 
-        let mut eri_virt: MatrixFull<f64> = MatrixFull::new([n1_global, n1_block], 0.0_f64);
+    let indices_i = block_i.local_n2_idx.as_ref().expect("missing local_n2_idx");
+    let indices_j = block_j.local_n2_idx.as_ref().expect("missing local_n2_idx");
+    let col_start = indices_j[0];
+    let col_end = *indices_j.last().unwrap();
+    let bi = indices_i.len();
+    let bj = indices_j.len();
 
-        for &row_blk in row_block_idx {
-            let row_start = block_start_idx[row_blk];
-            let row_end = if row_blk == num_block - 1 {n2_global - 1} else {block_start_idx[row_blk + 1] - 1};
-            if row_blk > col_blk {
+    let col_eigenvalues = &eigenvalues[col_start + occ_offset ..= col_end + occ_offset];
+    let col_occupation  = &occupation [col_start + occ_offset ..= col_end + occ_offset];
+
+    // Stack column block as a single matrix (n0_global × (bj*n1_global))
+    let n1_block = bj * n1_global;
+    let mut col_size = [n0_global, n1_block];
+    let ri_j_block = MatrixFullSlice {
+        size: &col_size[..],
+        indicing: &[1, n0_global],
+        data: &block_j.data[..],
+    };
+
+    let mut eri_virt: MatrixFull<f64> = MatrixFull::new([n1_global, n1_block], 0.0_f64);
+
+    let sub_size     = [n1_global, n1_global];
+    let sub_indicing = [1usize, n1_global];
+
+    for ii in 0..bi {
+        let gi = indices_i[ii];
+        let i_state_eigen = eigenvalues[gi + occ_offset];
+        let i_state_occ   = occupation [gi + occ_offset] / 2.0;
+        // Row slice as a (n0_global × n1_global) view
+        let slice_start = ii * slice_elements;
+        let mut row_size = [n0_global, n1_global];
+        let ri_i = MatrixFullSlice {
+            size: &row_size[..],
+            indicing: &[1usize, n0_global],
+            data: &block_i.data[slice_start .. slice_start + slice_elements],
+        };
+
+        // Batched dgemm: C = (slice_i)^T * (stacked column block)
+        _dgemm(
+            &ri_i,      (0..n0_global, 0..n1_global),        'T',
+            &ri_j_block,(0..n0_global, 0..n1_block),         'N',
+            &mut eri_virt,(0..n1_global, 0..n1_block),
+            1.0, 0.0,
+        );
+
+        // Decide j range:
+        //   - Same block (diagonal pair): upper triangle → j >= i
+        //   - Different blocks: all j (all pairs off-diagonal)
+        let (j_start, j_end) = if block_i_id == block_j_id {
+            (ii, bj)
+        } else {
+            (0, bj)
+        };
+
+        // Parallel extraction of sub-matrices and energy contributions
+        let terms: Vec<(f64, f64)> = (j_start..j_end)
+            .into_par_iter()
+            .map(|jj| {
+                let start = jj * n1_global * n1_global;
+                let end   = start + n1_global * n1_global;
+                let sub_view = MatrixFullSlice {
+                    size:    &sub_size[..],
+                    indicing:&sub_indicing[..],
+                    data:    &eri_virt.data[start..end],
+                };
+
+                let off_diag = if block_i_id == block_j_id {
+                    ii != jj
+                } else {
+                    true
+                };
+
+                let j_state_eigen = col_eigenvalues[jj];
+                let j_state_occ   = col_occupation [jj] / 2.0;
+
+                compute_eri_virt_close_shell(
+                                    &sub_view,
+                                    eigenvalues,
+                                    occupation,
+                                    i_state_eigen,
+                                    j_state_eigen,
+                                    i_state_occ,
+                                    j_state_occ,
+                                    virt_offset,
+                                    off_diag,)
+                            }).collect();
+
+        for (term_os, term_ss) in terms {
+                    local_term_os -= term_os;
+                    local_term_ss -= term_ss;
+        }
+
+    }
+
+    (local_term_os, local_term_ss)
+
+}
+
+
+/// Same-spin pair block computation (αα or ββ).
+///
+/// `block_i` and `block_j` are full slices of the SAME spin channel.
+/// When `block_i_id == block_j_id` (diagonal block), only the upper
+/// triangle (ii <= jj) is processed. The same-spin kernel `compute_eri_virt_ss`
+/// is used, which already applies the (e_ab - e_ba)^2 form.
+fn pair_block_compute_ss(
+    block_i: &RIFull<f64>,
+    block_j: &RIFull<f64>,
+    block_i_id: usize,
+    block_j_id: usize,
+    eigenvalues: &Vec<f64>,
+    occupation: &Vec<f64>,
+    occ_offset: usize,
+    virt_offset: usize,
+    num_occ: usize,
+) -> f64 {
+    assert_eq!(block_i.dist_axis, 2);
+    assert_eq!(block_j.dist_axis, 2);
+
+    let mut local_term_ss: f64 = 0.0_f64;
+
+    let n0_global = block_i.size[0];
+    let n1_global = block_i.size[1];
+    let slice_elements = n0_global * n1_global;
+
+    let indices_i = block_i.local_n2_idx.as_ref().expect("missing local_n2_idx");
+    let indices_j = block_j.local_n2_idx.as_ref().expect("missing local_n2_idx");
+
+    // local_n2_idx is sorted and contiguous; the slices within the occupied
+    // range form a PREFIX. Trim both blocks to that prefix.
+    let bi = indices_i.iter().take_while(|&&g| g + occ_offset < num_occ).count();
+    let bj = indices_j.iter().take_while(|&&g| g + occ_offset < num_occ).count();
+    // Entire block is beyond num_occ → nothing to compute.
+    if bi == 0 || bj == 0 { return 0.0; }
+
+    // Eigen/occupation slices over the trimmed column range.
+    let col_first = indices_j[0];
+    let col_eigenvalues = &eigenvalues[col_first + occ_offset .. col_first + occ_offset + bj];
+    let col_occupation  = &occupation [col_first + occ_offset .. col_first + occ_offset + bj];
+
+
+    // Stack column block as a single matrix (n0_global × (bj * n1_global))
+    let n1_block = bj * n1_global;
+    let mut col_size = [n0_global, n1_block];
+    let ri_j_block = MatrixFullSlice {
+        size: &col_size[..],
+        indicing: &[1usize, n0_global],
+        data: &block_j.data[.. bj * slice_elements],
+    };
+
+    let mut eri_virt: MatrixFull<f64> = MatrixFull::new([n1_global, n1_block], 0.0_f64);
+
+    let sub_size     = [n1_global, n1_global];
+    let sub_indicing = [1usize, n1_global];
+
+    for ii in 0..bi {
+        let gi = indices_i[ii];
+        let i_state_eigen = eigenvalues[gi + occ_offset];
+        let i_state_occ   = occupation [gi + occ_offset];
+
+        let slice_start = ii * slice_elements;
+        let mut row_size = [n0_global, n1_global];
+        let ri_i = MatrixFullSlice {
+            size: &row_size[..],
+            indicing: &[1usize, n0_global],
+            data: &block_i.data[slice_start .. slice_start + slice_elements],
+        };
+
+        _dgemm(
+            &ri_i,      (0..n0_global, 0..n1_global), 'T',
+            &ri_j_block,(0..n0_global, 0..n1_block),  'N',
+            &mut eri_virt,(0..n1_global, 0..n1_block),
+            1.0, 0.0,
+        );
+
+        // Diagonal block: upper triangle (j >= i). Off-diagonal block: all j.
+        let (j_start, j_end) = if block_i_id == block_j_id {
+            (ii, bj)
+        } else {
+            (0, bj)
+        };
+
+        let terms: Vec<f64> = (j_start..j_end)
+            .into_par_iter()
+            .map(|jj| {
+                let start = jj * n1_global * n1_global;
+                let end   = start + n1_global * n1_global;
+                let sub_view = MatrixFullSlice {
+                    size:     &sub_size[..],
+                    indicing: &sub_indicing[..],
+                    data:     &eri_virt.data[start..end],
+                };
+                let j_state_eigen = col_eigenvalues[jj];
+                let j_state_occ   = col_occupation [jj];
+
+                compute_eri_virt_ss(
+                    &sub_view,
+                    eigenvalues,
+                    occupation,
+                    i_state_eigen,
+                    j_state_eigen,
+                    i_state_occ,
+                    j_state_occ,
+                    virt_offset,
+                )
+            })
+            .collect();
+
+        for term in terms {
+            local_term_ss -= term;
+        }
+    }
+
+    local_term_ss
+}
+
+/// Opposite-spin pair block computation (αβ).
+///
+/// `block_i` is an α block and `block_j` is a β block. All (ii, jj) pairs
+/// are processed (no upper-triangle restriction). The OS kernel
+/// `compute_eri_virt_os` handles the mixed α/β eigenvalues and occupations.
+fn pair_block_compute_os(
+    alpha_block_i: &RIFull<f64>,
+    beta_block_j:  &RIFull<f64>,
+    alpha_eigenvalues: &Vec<f64>,
+    beta_eigenvalues:  &Vec<f64>,
+    alpha_occupation:  &Vec<f64>,
+    beta_occupation:   &Vec<f64>,
+    occ_offset:  usize,
+    virt_offset: usize,
+    alpha_num_occ: usize,
+    beta_num_occ: usize,
+) -> f64 {
+    assert_eq!(alpha_block_i.dist_axis, 2);
+    assert_eq!(beta_block_j.dist_axis, 2);
+
+    let mut local_term_os: f64 = 0.0_f64;
+
+    let n0_global = alpha_block_i.size[0];
+    let n1_global = alpha_block_i.size[1];
+    let slice_elements = n0_global * n1_global;
+
+    let indices_i = alpha_block_i.local_n2_idx.as_ref().expect("missing local_n2_idx");
+    let indices_j = beta_block_j .local_n2_idx.as_ref().expect("missing local_n2_idx");
+
+    // Trim each block against its OWN spin channel's occupied count.
+    let bi = indices_i.iter().take_while(|&&g| g + occ_offset < alpha_num_occ).count();
+    let bj = indices_j.iter().take_while(|&&g| g + occ_offset < beta_num_occ ).count();
+
+    if bi == 0 || bj == 0 { return 0.0; }
+
+    // Eigen/occupation slices over the trimmed column range.
+    let col_first = indices_j[0];
+    let col_eigenvalues = &beta_eigenvalues[col_first + occ_offset .. col_first + occ_offset + bj];
+    let col_occupation  = &beta_occupation [col_first + occ_offset .. col_first + occ_offset + bj];
+
+    // Stack β column block as a single matrix.
+    let n1_block = bj * n1_global;
+    let mut col_size = [n0_global, n1_block];
+    let ri_j_block = MatrixFullSlice {
+        size: &col_size[..],
+        indicing: &[1usize, n0_global],
+        data: &beta_block_j.data[.. bj * slice_elements],
+    };
+
+    let mut eri_virt: MatrixFull<f64> = MatrixFull::new([n1_global, n1_block], 0.0_f64);
+
+    let sub_size     = [n1_global, n1_global];
+    let sub_indicing = [1usize, n1_global];
+
+    for ii in 0..bi {
+        let gi = indices_i[ii];
+        let i_state_eigen = alpha_eigenvalues[gi + occ_offset];
+        let i_state_occ   = alpha_occupation [gi + occ_offset];
+
+        let slice_start = ii * slice_elements;
+        let mut row_size = [n0_global, n1_global];
+        let ri_i = MatrixFullSlice {
+            size: &row_size[..],
+            indicing: &[1usize, n0_global],
+            data: &alpha_block_i.data[slice_start .. slice_start + slice_elements],
+        };
+
+        _dgemm(
+            &ri_i,      (0..n0_global, 0..n1_global), 'T',
+            &ri_j_block,(0..n0_global, 0..n1_block),  'N',
+            &mut eri_virt,(0..n1_global, 0..n1_block),
+            1.0, 0.0,
+        );
+
+        // Opposite-spin: full rectangle, no upper-triangle restriction.
+        let terms: Vec<f64> = (0..bj)
+            .into_par_iter()
+            .map(|jj| {
+                let start = jj * n1_global * n1_global;
+                let end   = start + n1_global * n1_global;
+                let sub_view = MatrixFullSlice {
+                    size:     &sub_size[..],
+                    indicing: &sub_indicing[..],
+                    data:     &eri_virt.data[start..end],
+                };
+                let j_state_eigen = col_eigenvalues[jj];
+                let j_state_occ   = col_occupation [jj];
+
+                compute_eri_virt_os(
+                    &sub_view,
+                    alpha_eigenvalues,
+                    beta_eigenvalues,
+                    alpha_occupation,
+                    beta_occupation,
+                    i_state_eigen,
+                    j_state_eigen,
+                    i_state_occ,
+                    j_state_occ,
+                    virt_offset,
+                )
+            })
+            .collect();
+
+        for term in terms {
+            local_term_os -= term;
+        }
+    }
+
+    local_term_os
+}
+
+/// Shared sliding loop for closed-shell, same-spin, and opposite-spin phases.
+///
+/// `num_blocks` is the *raw* block count from `ctx.block_start_idx.len()`.
+/// Virtual IDs in the schedule are: α → v, β → v + num_blocks. Since
+/// `num_blocks` is a multiple of P (grid_mult is P or r, and k is chosen so
+/// num_blocks = k·grid_mult), we route ownership by `v % P`, which equals
+/// `(v % num_blocks) % P`. This is the key to sharing one portal across phases.
+fn run_sliding_phase<F>(
+    mpi_op: &MPIOperator,
+    portal: &mut ServicePortal,
+    schedule: &[State],
+    n0_global: usize,
+    n1_global: usize,
+    n2_global: usize,
+    block_start_idx: &[usize],
+    num_blocks: usize,
+    mut compute: F,
+) -> (f64, f64)
+where
+    F: FnMut(&HashMap<usize, RIFull<f64>>, &[(usize, usize)]) -> (f64, f64),
+{
+    let P = mpi_op.size;
+    let rank = mpi_op.rank as i32;
+
+    let mut cache: HashMap<usize, RIFull<f64>> = HashMap::new();
+    let mut local_os = 0.0_f64;
+    let mut local_ss = 0.0_f64;
+    let mut step: usize = 0;
+
+    for state in schedule {
+        // ── 1. Release ─────────────────────────────────────────────────
+        for &v in &state.to_release {
+            cache.remove(&v);
+        }
+
+        // ── 2. Fetch missing blocks ────────────────────────────────────
+        let mut temp: Vec<(usize, Vec<f64>)> = Vec::new();
+        for &v in &state.to_fetch {
+            if cache.contains_key(&v) {
                 continue;
             }
-            else if row_blk < col_blk {
-                assert!(row_end < col_start);
-                for i in row_start..=row_end {
-                    let ri_i = final_tensor.get_reducing_matrix_global_n2(i).unwrap();
-                    let i_state_eigen = eigenvalues.get(i + occ_offset).unwrap().clone();
-                    let i_state_occ = occupation.get(i + occ_offset).unwrap()/2.0.clone();
+            // Ownership is decided by the *raw* block ID.
+            let raw = v % num_blocks;
+            let owner = (raw % P) as i32;
 
-                    _dgemm(&ri_i, (0..n0_global, 0..n1_global), 'T',
-                           &ri_j_block, (0..n0_global, 0..n1_block), 'N',
-                           &mut eri_virt, (0..n1_global, 0..n1_block),
-                           1.0, 0.0);
-                    let sub_size = [n1_global, n1_global];
-                    let sub_indicing = [1usize, n1_global];
-                    let terms: Vec<(f64, f64)> = (0..bj).into_par_iter().map(|j_offset| {
-                        let start = j_offset * n1_global * n1_global;
-                        let end = start + n1_global * n1_global;
-                        let sub_view = MatrixFullSlice {
-                            size: &sub_size[..],
-                            indicing: &sub_indicing[..],
-                            data: &eri_virt.data[start..end],
-                        };
-                        let j_state_eigen = col_eigenvalues[j_offset].clone();
-                        let j_state_occ = col_occupation[j_offset] / 2.0.clone();
-                        compute_eri_virt_close_shell(&sub_view, eigenvalues, occupation, i_state_eigen, j_state_eigen, i_state_occ, j_state_occ, virt_offset, true)
-                    }).collect();
-                    for (term_os, term_ss) in terms {
-                        local_term_os -= term_os;
-                        local_term_ss -= term_ss;
-                    }
+            let start = block_start_idx[raw];
+            let end = if raw == num_blocks - 1 { n2_global } else { block_start_idx[raw + 1] };
+            let num_slices = end - start;
+            let block_doubles = num_slices * n0_global * n1_global;
 
+            if owner == rank {
+                // Local block: clone from the portal's storage.
+                if let Some(t) = portal.lookup(v) {
+                    cache.insert(v, t.clone());
                 }
-
-            }
-            else {
-                for i in row_start..=row_end {
-                    let ri_i = final_tensor.get_reducing_matrix_global_n2(i).unwrap();
-                    let i_state_eigen = eigenvalues.get(i + occ_offset).unwrap().clone();
-                    let i_state_occ = occupation.get(i + occ_offset).unwrap()/2.0.clone();
-                    _dgemm(&ri_i, (0..n0_global, 0..n1_global), 'T',
-                           &ri_j_block, (0..n0_global, 0..n1_block), 'N',
-                           &mut eri_virt, (0..n1_global, 0..n1_block),
-                           1.0, 0.0);
-
-                    let sub_size = [n1_global, n1_global];
-                    let sub_indicing = [1usize, n1_global];
-                    let i_offset = i - row_start;
-
-                    let terms: Vec<(f64, f64)> = (i_offset..bj).into_par_iter().map(|j_offset| {
-                        let start = j_offset * n1_global * n1_global;
-                        let end = start + n1_global * n1_global;
-                        let sub_view = MatrixFullSlice {
-                            size: &sub_size[..],
-                            indicing: &sub_indicing[..],
-                            data: &eri_virt.data[start..end],
-                        };
-                        let off_diag = i_offset != j_offset;
-                        let j_state_eigen = col_eigenvalues[j_offset].clone();
-                        let j_state_occ = col_occupation[j_offset] / 2.0.clone();
-                        compute_eri_virt_close_shell(&sub_view, eigenvalues, occupation, i_state_eigen, j_state_eigen, i_state_occ, j_state_occ, virt_offset, off_diag)
-                    }).collect();
-                    for (term_os, term_ss) in terms {
-                        local_term_os -= term_os;
-                        local_term_ss -= term_ss;
-                    }
-                }
-
+            } else {
+                // Remote: post the receive, send the request (portal handles tags).
+                let mut buf = vec![0.0_f64; block_doubles];
+                portal.request_block(v, owner, &mut buf);
+                temp.push((v, buf));
             }
         }
+
+        // ── 3. Wait for fetches, serving others meanwhile ──────────────
+        portal.wait_for_fetches_with_service();
+
+        // ── 4. Insert fetched blocks into cache ────────────────────────
+        for (v, buf) in temp {
+            let raw = v % num_blocks;
+            let start = block_start_idx[raw];
+            let end = if raw == num_blocks - 1 { n2_global } else { block_start_idx[raw + 1] };
+            let num_slices = end - start;
+            let local_n2_idx: Vec<usize> = (start..end).collect();
+            cache.insert(v, RIFull {
+                size:     [n0_global, n1_global, num_slices],
+                indicing: [1, n0_global, n0_global * n1_global],
+                data: buf,
+                dist_axis: 2,
+                local_n2_idx: Some(local_n2_idx),
+            });
+        }
+
+        // ── 5. Compute the tile ────────────────────────────────────────
+        let (t_os, t_ss) = compute(&cache, &state.to_compute);
+        local_os += t_os;
+        local_ss += t_ss;
+
+        // ── 6. Post-compute service ────────────────────────────────────
+        portal.service();
+
+        // ── 7. One-time prefetch barrier ───────────────────────────────
+        if step == 0 {
+            mpi_op.world.barrier();
+        }
+        step += 1;
     }
-    */
-    (local_term_os, local_term_ss)
+
+    // ── 8. Terminate ───────────────────────────────────────────────────
+    portal.signal_done();
+    while !portal.is_done() {
+        portal.service();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    portal.finalize();
+
+    (local_os, local_ss)
+}
+
+pub fn computation_close_shell_aslide(mpi_op: &MPIOperator, storage: &HashMap<usize, RIFull<f64>>, ctx: &CtxASlideBlock,
+                                    n0_global: usize, n1_global: usize, n2_global: usize,
+                                    eigenvalues: &Vec<f64>, occupation: &Vec<f64>, occ_offset: usize, virt_offset: usize)
+-> (f64, f64)
+{
+    let mut portal = ServicePortal::new(mpi_op, storage);
+    let num_blocks = ctx.block_start_idx.len();
+
+    run_sliding_phase(
+        mpi_op, &mut portal, &ctx.schedule,
+        n0_global, n1_global, n2_global,
+        &ctx.block_start_idx, num_blocks,
+        |cache, pairs| {
+            let mut os = 0.0; let mut ss = 0.0;
+            for &(I, J) in pairs {
+                let bi = cache.get(&I).expect("row block missing");
+                let bj = cache.get(&J).expect("col block missing");
+                let (t_os, t_ss) = pair_block_compute_close_shell(
+                    bi, bj, I, J, eigenvalues, occupation, occ_offset, virt_offset,
+                );
+                os += t_os; ss += t_ss;
+            }
+            (os, ss)
+        },
+    )
+}
+
+pub fn computation_ss_aslide(
+    mpi_op: &MPIOperator,
+    storage: &HashMap<usize, RIFull<f64>>,
+    ctx: &CtxASlideBlock,
+    n0_global: usize, n1_global: usize, n2_global: usize,
+    eigenvalues: &Vec<f64>, occupation: &Vec<f64>,
+    occ_offset: usize, virt_offset: usize, num_occ: usize,
+) -> f64 {
+    let mut portal = ServicePortal::new(mpi_op, storage);
+    let num_blocks = ctx.block_start_idx.len();
+
+    let (_dummy_os, ss) = run_sliding_phase(
+        mpi_op, &mut portal, &ctx.schedule,
+        n0_global, n1_global, n2_global,
+        &ctx.block_start_idx, num_blocks,
+        |cache, pairs| {
+            let mut ss = 0.0;
+            for &(I, J) in pairs {
+                let bi = cache.get(&I).expect("row block missing");
+                let bj = cache.get(&J).expect("col block missing");
+                ss += pair_block_compute_ss(
+                    bi, bj, I, J,
+                    eigenvalues, occupation, occ_offset, virt_offset, num_occ,
+                );
+            }
+            (0.0, ss)
+        },
+    );
+    ss
 }
 
 
+pub fn computation_os_aslide(
+    mpi_op: &MPIOperator,
+    alpha_storage: &HashMap<usize, RIFull<f64>>,
+    beta_storage:  &HashMap<usize, RIFull<f64>>,
+    ctx: &CtxASlideBlock,
+    n0_global: usize, n1_global: usize, n2_global: usize,
+    alpha_eigenvalues: &Vec<f64>, beta_eigenvalues: &Vec<f64>,
+    alpha_occupation:  &Vec<f64>, beta_occupation:  &Vec<f64>,
+    occ_offset: usize, virt_offset: usize,
+    alpha_num_occ: usize, beta_num_occ: usize,
+) -> f64 {
+    let num_blocks = ctx.block_start_idx.len();
+    let schedule_os = ctx.schedule_os.as_ref().expect("missing OS schedule");
 
-const TAG_REQUEST: i32 = 100;
-const TAG_BLOCK:   i32 = 101;
-pub struct ServicePortal<'a> {
-    pub mpi_op: &'a MPIOperator,
-    pub data: &'a HashMap<usize, RIFull<f64>>,
-    pending_fetch_requests: Vec<ffi::MPI_Request>,   // Irecv + Isend for own fetches
-    pending_data_sends: Vec<ffi::MPI_Request>,       // Isends we issued while serving
-    done_request_started: bool,
-    done_request: ffi::MPI_Request,
-    local_done: i32,
-    global_done: i32,
-}
+    let mut portal = ServicePortal::new_split(mpi_op, alpha_storage, beta_storage, num_blocks);
 
-impl<'a> ServicePortal<'a> {
-    pub fn new(mpi_op: &'a MPIOperator, data: &'a HashMap<usize, RIFull<f64>>) -> Self {
-        ServicePortal
-        {
-            mpi_op: mpi_op,
-            data: data,
-            pending_fetch_requests: Vec::new(),
-            pending_data_sends: Vec::new(),
-            done_request_started: false,
-            done_request: unsafe { mem::zeroed() },
-            local_done: 0,
-            global_done: 0,
-        }
-    }
-
-    pub fn request_block(&mut self, block_id: usize, owner: i32, buffer: &mut [f64]) {
-        let mut recv_req: ffi::MPI_Request = unsafe { mem::zeroed() };
-        let mut send_req: ffi::MPI_Request = unsafe { mem::zeroed() };
-        let blk = block_id as i32;
-        unsafe {
-            ffi::MPI_Irecv(
-                buffer.as_mut_ptr() as *mut c_void,
-                buffer.len() as i32,
-                ffi::RSMPI_DOUBLE,
-                owner,
-                TAG_BLOCK,
-                self.mpi_op.world.as_raw(),
-                &mut recv_req,
-            );
-
-            ffi::MPI_Isend(
-                &blk as *const i32 as *const c_void,
-                1,
-                ffi::RSMPI_INT32_T,
-                owner,
-                TAG_REQUEST,
-                self.mpi_op.world.as_raw(),
-                &mut send_req,
-            );
-        }
-        self.pending_fetch_requests.push(recv_req);
-        self.pending_fetch_requests.push(send_req);
-
-    }
-
-    pub fn wait_for_fetches_with_service(&mut self) {
-        while !self.pending_fetch_requests.is_empty() {
-            // Handle incoming block requests from other ranks
-            self.service();
-
-            let mut flag: i32 = 0;
-            unsafe {
-                ffi::MPI_Testall(
-                    self.pending_fetch_requests.len() as i32,
-                    self.pending_fetch_requests.as_mut_ptr(),
-                    &mut flag,
-                    ffi::RSMPI_STATUSES_IGNORE,
+    let (os, _dummy_ss) = run_sliding_phase(
+        mpi_op, &mut portal, schedule_os,
+        n0_global, n1_global, n2_global,
+        &ctx.block_start_idx, num_blocks,
+        |cache, pairs| {
+            let mut os = 0.0;
+            for &(I, J_v) in pairs {
+                // Pairs in the OS schedule carry virtual J (raw + num_blocks).
+                let bi = cache.get(&I).expect("alpha block missing");
+                let bj = cache.get(&J_v).expect("beta block missing");
+                os += pair_block_compute_os(
+                    bi, bj,
+                    alpha_eigenvalues, beta_eigenvalues,
+                    alpha_occupation, beta_occupation,
+                    occ_offset, virt_offset, alpha_num_occ, beta_num_occ,
                 );
             }
-
-            if flag != 0 {
-                // Fetches are complete. Drain any requests that arrived just
-                // before the test to ensure the queue is empty.
-                self.service();
-                self.pending_fetch_requests.clear();
-                break;
-            }
-
-            // Optional: yield to avoid busy-waiting
-            std::thread::yield_now();
-        }
-    }
-
-    pub fn service(&mut self) {
-        let mut flag: i32 = 0;
-        let mut status: ffi::MPI_Status = unsafe { std::mem::zeroed() };
-
-        loop {
-            unsafe {
-                ffi::MPI_Iprobe(
-                    ffi::RSMPI_ANY_SOURCE,
-                    TAG_REQUEST,
-                    self.mpi_op.world.as_raw(),
-                    &mut flag,
-                    &mut status,
-                );
-            }
-            if flag == 0 {
-                break;
-            }
-
-            let mut block_id: i32 = 0;
-            unsafe {
-                ffi::MPI_Recv(
-                    &mut block_id as *mut i32 as *mut c_void,
-                    1,
-                    ffi::RSMPI_INT32_T,
-                    status.MPI_SOURCE,
-                    TAG_REQUEST,
-                    self.mpi_op.world.as_raw(),
-                    ffi::RSMPI_STATUS_IGNORE,
-                );
-            }
-
-            let blk = block_id as usize;
-            let tensor = match self.data.get(&blk) {
-                Some(t) => t,
-                None => {
-                    eprintln!(
-                        "Rank {}: block {} requested but not owned locally.",
-                        self.mpi_op.rank, blk
-                    );
-                    unsafe { ffi::MPI_Abort(self.mpi_op.world.as_raw(), 1) };
-                    unreachable!();
-                }
-            };
-
-            let data_ptr = tensor.data.as_ptr() as *const f64;
-            let block_size = tensor.data.len() as i32;
-
-            let mut sreq: ffi::MPI_Request = unsafe { std::mem::zeroed() };
-            unsafe {
-                ffi::MPI_Isend(
-                    data_ptr as *const c_void,
-                    block_size,
-                    ffi::RSMPI_DOUBLE,
-                    status.MPI_SOURCE,
-                    TAG_BLOCK,
-                    self.mpi_op.world.as_raw(),
-                    &mut sreq,
-                );
-            }
-            self.pending_data_sends.push(sreq);
-        }
-
-        // Progress non‑blocking allreduce if started
-        if self.done_request_started {
-            let mut done_flag: i32 = 0;
-            unsafe {
-                ffi::MPI_Test(
-                    &mut self.done_request as *mut ffi::MPI_Request,
-                    &mut done_flag,
-                    ffi::RSMPI_STATUS_IGNORE,
-                );
-            }
-        }
-    }
-
-
-    pub fn signal_done(&mut self) {
-        if !self.done_request_started {
-            self.local_done = 1;
-            unsafe {
-                ffi::MPI_Iallreduce(
-                    &self.local_done as *const i32 as *const c_void,
-                    &mut self.global_done as *mut i32 as *mut c_void,
-                    1,
-                    ffi::RSMPI_INT32_T,
-                    ffi::RSMPI_SUM,
-                    self.mpi_op.world.as_raw(),
-                    &mut self.done_request,
-                );
-            }
-            self.done_request_started = true;
-        }
-    }
-
-    pub fn is_done(&mut self) -> bool {
-        if !self.done_request_started {
-            return false;
-        }
-        let mut flag: i32 = 0;
-        unsafe {
-            ffi::MPI_Test(
-                &mut self.done_request as *mut ffi::MPI_Request,
-                &mut flag,
-                ffi::RSMPI_STATUS_IGNORE,
-            );
-        }
-        flag != 0
-    }
-
-    pub fn finalize(&mut self) {
-        if !self.pending_data_sends.is_empty() {
-            unsafe {
-                ffi::MPI_Waitall(
-                    self.pending_data_sends.len() as i32,
-                    self.pending_data_sends.as_mut_ptr(),
-                    ffi::RSMPI_STATUSES_IGNORE,
-                );
-            }
-            self.pending_data_sends.clear();
-        }
-    }
+            (os, 0.0)
+        },
+    );
+    os
 }

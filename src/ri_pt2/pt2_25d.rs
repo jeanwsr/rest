@@ -63,7 +63,6 @@ use std::ops::Range;
 use rest_tensors::RIFull;
 use rest_tensors::{TensorOpt, MatrixFull, MatrixFullSlice, BasicMatrix};
 use rest_tensors::matrix_blas_lapack::{_dgemm};
-use libc::{sysconf, _SC_PHYS_PAGES};
 
 use crate::utilities::memory_batch::{detect_available_memory_mb};
 

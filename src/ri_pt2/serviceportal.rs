@@ -14,7 +14,9 @@ const TAG_REQUEST: i32 = 100;
 const TAG_BLOCK:   i32 = 101;
 pub struct ServicePortal<'a> {
     pub mpi_op: &'a MPIOperator,
-    pub data: &'a HashMap<usize, RIFull<f64>>,
+    pub data: &'a HashMap<usize, RIFull<f64>>,            // α (or single-tensor)
+    pub data_b: Option<&'a HashMap<usize, RIFull<f64>>>,  // β (None for single-tensor)
+    pub split_id: usize,                                   // virtual IDs >= split_id → data_b
     pending_fetch_requests: Vec<ffi::MPI_Request>,   // Irecv + Isend for own fetches
     pending_data_sends: Vec<ffi::MPI_Request>,       // Isends we issued while serving
     done_request_started: bool,
@@ -29,12 +31,39 @@ impl<'a> ServicePortal<'a> {
         {
             mpi_op: mpi_op,
             data: data,
+            data_b: None,
+            split_id: usize::MAX,
             pending_fetch_requests: Vec::new(),
             pending_data_sends: Vec::new(),
             done_request_started: false,
             done_request: unsafe { mem::zeroed() },
             local_done: 0,
             global_done: 0,
+        }
+    }
+
+    pub fn new_split(mpi_op: &'a MPIOperator, alpha_data: &'a HashMap<usize, RIFull<f64>>, beta_data:&'a HashMap<usize, RIFull<f64>>, split_id: usize) -> Self {
+        ServicePortal
+        {
+            mpi_op: mpi_op,
+            data: alpha_data,
+            data_b: Some(beta_data),
+            split_id: split_id,
+            pending_fetch_requests: Vec::new(),
+            pending_data_sends: Vec::new(),
+            done_request_started: false,
+            done_request: unsafe { mem::zeroed() },
+            local_done: 0,
+            global_done: 0,
+        }
+    }
+
+    /// Route a virtual ID to the correct storage and return the block.
+    pub fn lookup(&self, virtual_id: usize) -> Option<&RIFull<f64>> {
+        if virtual_id < self.split_id {
+            self.data.get(&virtual_id)
+        } else {
+            self.data_b?.get(&(virtual_id - self.split_id))
         }
     }
 
@@ -126,7 +155,7 @@ impl<'a> ServicePortal<'a> {
             }
 
             let blk = block_id as usize;
-            let tensor = match self.data.get(&blk) {
+            let tensor = match self.lookup(blk) {
                 Some(t) => t,
                 None => {
                     eprintln!(
