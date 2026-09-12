@@ -1619,8 +1619,8 @@ pub fn close_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Option<MPIOp
             let n1_global = rimo.size[1];
             let n2_global = rimo.size[2];
 
-            //println!("rank:{}, tensor_size=({},{},{}), local_n0_range:{:?})",
-                //my_rank, n0_local, n1_global, n2_global, local_n0_range);
+            //println!("rank:{}, cart_rank:{}, tensor_size=({},{},{}), local_n0_range:{:?})",
+                //my_rank, grid.rank, n0_local, n1_global, n2_global, local_n0_range);
 
             let ctx = initialize_metadata(&grid, n2_global);
             let mut n0_global_tmp: u64 = 0;
