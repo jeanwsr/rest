@@ -33,6 +33,8 @@ use crate::post_scf_analysis::{split_indices_by_spin_occ, format_indices};
 
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
 
+use crate::utilities::memory_batch::{detect_available_memory_mb};
+
 #[cfg(feature = "mpi")]
 pub mod pt2_25d;
 
@@ -1420,7 +1422,7 @@ fn check_conditions_25d(
                 _ => 8, // SCSRPA 保守估计（含 OS 分支临时矩阵）
             };
             let required_bytes = n_chi_sq * n0_global * n0_global * std::mem::size_of::<f64>();
-            let avail_bytes = crate::ri_pt2::pt2_25d::get_available_memory_bytes();
+            let avail_bytes = detect_available_memory_mb() * 1024.0 * 1024.0;
             let local_ok = 4.0 * (required_bytes as f64) < (avail_bytes as f64);
             let mut global_ok = true;
             grid.cart_comm.all_reduce_into(&local_ok, &mut global_ok, &SystemOperation::logical_and());

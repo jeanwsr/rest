@@ -65,6 +65,8 @@ use rest_tensors::{TensorOpt, MatrixFull, MatrixFullSlice, BasicMatrix};
 use rest_tensors::matrix_blas_lapack::{_dgemm};
 use libc::{sysconf, _SC_PHYS_PAGES};
 
+use crate::utilities::memory_batch::{detect_available_memory_mb};
+
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 
@@ -252,18 +254,17 @@ pub fn check_memory_25d(grid: &MPIGrid, ctx: &Ctx25dBlock, slice_size: usize, n2
     }
     let elem_size = std::mem::size_of::<f64>();
     let required_bytes = local_num_slice * slice_size * elem_size;
-    let avail_bytes = get_available_memory_bytes();
+    let avail_mib = detect_available_memory_mb(); // corrected call
     let required_mib = required_bytes as f64 / (1024.0 * 1024.0);
-    let avail_mib = avail_bytes as f64 / (1024.0 * 1024.0);
     let local_mem_flag = 4.0 * required_mib < avail_mib;
     let mut global_mem_flag: bool = true;
     grid.cart_comm.all_reduce_into(&local_mem_flag, &mut global_mem_flag, &SystemOperation::logical_and());
     return global_mem_flag;
 }
 
-/// Per-rank available physical memory (bytes); used by the memory gates.
-#[cfg(feature = "mpi")]
-pub(crate) fn get_available_memory_bytes() -> u64 {
+//deprecated. does not subtract memory used by other processes; does not reflect momentary availability;
+/*
+fn get_available_memory_bytes() -> u64 {
     // _SC_AVPHYS_PAGES: number of available physical pages
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
     let available_pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) as u64 };
@@ -272,7 +273,7 @@ pub(crate) fn get_available_memory_bytes() -> u64 {
     }
     page_size * available_pages
 }
-
+*/
 /// Redistribute an RI‑MO tensor from auxiliary‑index distribution
 /// (`dist_axis=0`) to diagonal ownership (`dist_axis=2`).
 ///
