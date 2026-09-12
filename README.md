@@ -737,12 +737,13 @@ hessian = { solver = "krylov", frequencies = true, verbose = 2 }
 
 ## 解析梯度性质模块 `analdrv` 计算相关设置
 
-解析梯度模块 `analdrv` 模块是实验性质模块。目前实现了 Hessian (原子核坐标二阶梯度) 功能。
+解析梯度模块 `analdrv` 模块是实验性质模块。目前实现了 Hessian (原子核坐标二阶梯度) 与电多极矩 (1-4 阶：偶极、四极、八极、十六极) 功能。
 它实现了不同于 `hessian` 模块的解析 Hessian 计算。目前该模块的 Hessian 功能支持 RHF/RKS/UHF/UKS 方法。对于 DFT，支持 LDA/GGA/mGGA 以及其对应的杂化泛函，包括范围分离杂化泛函 (RSH)。该模块的程序有性能优化，与目前顶级的量化程序 (ORCA 等) 有相当或更好的性能。
+多极矩功能支持 RHF/RKS；对于 PT2 族后自洽 (fifth-rung) 方法 (MP2、XYG3 等 xDH/BDH 类双杂化泛函)，在 SCF 密度之外额外计入关联密度增量，默认通过 Z-vector (CP-SCF) 求解弛豫增量。所有矩以原子单位输出，并给出核、SCF、关联 (corr)、响应 (resp) 与总 (tot) 的分项分解；四极矩额外输出无迹形式。
 
 ### 设置待计算性质的任务
 
-目前仅支持 Hessian 计算。需要在 `[ctrl]` 区块中设置 `analdrv_tasks` 关键词以启动对应性质的计算。若希望同时计算热力学矫正，请同时指定 `[thermo]` 区块。
+目前支持 Hessian (`"hessian"`，别名 `"hess"`/`"freq"` 等) 与电多极矩 (`"multipole"`，别名 `"pole"`/`"dipole"`) 两类任务。需要在 `[ctrl]` 区块中设置 `analdrv_tasks` 关键词 (单个字符串或字符串列表) 以启动对应性质的计算；两类任务可以同时指定。若希望同时计算热力学矫正，请同时指定 `[thermo]` 区块。
 ```toml
 [ctrl]
 analdrv_tasks = "freq"
@@ -750,27 +751,33 @@ analdrv_tasks = "freq"
 [thermo]
 ```
 
+多极矩任务 (或与 Hessian 的组合) 例如：
+```toml
+[ctrl]
+analdrv_tasks = ["multipole", "hessian"]
+```
+
 ### 解析梯度模块 `analdrv` 区块选项
 
-在设置任务后，用户可以在 `[analdrv]` 区块中设置对应的计算选项。该区块的关键词分为三个部分：通用选项、CP-SCF 求解器选项、以及核坐标导数性质选项。
+在设置任务后，用户可以在 `[analdrv]` 区块中设置对应的计算选项。该区块的关键词分为四个部分：通用选项、自洽场响应选项、核坐标导数性质选项、以及电多极矩选项。
 
 #### 通用选项
 
 - `verbose`：打印强度。默认为 None，使用输入卡 `[ctrl]` 区块的 verbose。
 
-#### CP-SCF 求解器选项
+#### 自洽场响应选项
 
-这类选项控制 CP-SCF 方程如何求解，但不控制传入求解的量 (如参与计算的原子范围)。
+这类选项控制自洽场响应 (analdrv 中主要用于计算 CP-SCF、以及 post-SCF 方法的 generalized Fock) 如何计算，但不控制传入求解的量 (如参与计算的原子范围)。
 
-- `cpscf_level_shift`：CP-SCF 求解时对 $\varepsilon_i - \varepsilon_a$ 的求解偏移。默认为 0，单位 Hartree。
-- `cpscf_tol`：CP-SCF 中的 Krylov 求解阈值。默认 1e-9，无量纲。实际求解阈值也受制于 `cpscf_lindep`。
-- `cpscf_max_cycle`：CP-SCF 最大迭代步数。默认为 42 步。CP-SCF 与 SCF 不同，一般 6-10 步能收敛。这里的最大步数一般不需要设得很大。
-- `cpscf_max_space`：CP-SCF 中 Krylov 空间的数量。默认为 14。该数值不宜设太小，因为超过该数值时，Krylov 求解器会代入最后一次迭代重新作为初猜，重置求解过程。但该数值设太大会对内存产生压力。
-- `cpscf_lindep`：CP-SCF 中一些数值过程的数值精度阈值。默认 1e-15，无量纲。
-- `cpscf_tol_inflation`：容忍系数。若 Krylov 真残差 `||r|| < factor * tol`，接受该解而不触发 per-root 求解。缺省为1000.0。
-- `grid_level_cpscf`：CP-SCF 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None，是 `[ctrl]` 中 grid_generation_level 关键词设定值减 2 (SCF 默认格点级别是 3，对应 Hessian 的级别是 1)；最低级别是 1。
+- `resp_level_shift`：CP-SCF 求解时对 $\varepsilon_i - \varepsilon_a$ 的求解偏移。默认为 0，单位 Hartree。
+- `resp_tol`：CP-SCF 中的 Krylov 求解阈值。默认 1e-9，无量纲。实际求解阈值也受制于 `resp_lindep`。
+- `resp_max_cycle`：CP-SCF 最大迭代步数。默认为 42 步。CP-SCF 与 SCF 不同，一般 6-10 步能收敛。这里的最大步数一般不需要设得很大。
+- `resp_max_space`：CP-SCF 中 Krylov 空间的数量。默认为 14。该数值不宜设太小，因为超过该数值时，Krylov 求解器会代入最后一次迭代重新作为初猜，重置求解过程。但该数值设太大会对内存产生压力。
+- `resp_lindep`：CP-SCF 中一些数值过程的数值精度阈值。默认 1e-15，无量纲。
+- `resp_tol_inflation`：容忍系数。若 Krylov 真残差 `||r|| < factor * tol`，接受该解而不触发 per-root 求解。缺省为1000.0。
+- `grid_level_resp`：CP-SCF 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None，是 `[ctrl]` 中 grid_generation_level 关键词设定值减 2 (SCF 默认格点级别是 3，对应 Hessian 的级别是 1)；最低级别是 1。
 
-这些关键词在旧版本中使用 `cphf_*` 前缀 (`cphf_tol`、`grid_level_cphf` 等)；旧关键词目前仍然作为别名被接受。
+这些关键词的旧名称 `cpscf_*` 与更早的 `cphf_*` 前缀 (`cpscf_tol`、`cphf_tol`、`grid_level_cpscf`、`grid_level_cphf` 等) 目前仍然作为别名被接受。
 
 #### 核坐标导数性质选项
 
@@ -791,10 +798,29 @@ analdrv_tasks = "freq"
 analdrv_tasks = "freq"
 
 [analdrv]
-cpscf_max_space = 20
-grid_level_cpscf = 2
+resp_max_space = 20
+grid_level_resp = 2
 
 [thermo]
+```
+
+#### 电多极矩选项
+
+这类关键词控制电多极矩 (`multipole` 任务) 的计算：求哪几阶矩、以何处为原点、以及后自洽 (PT2 族) 密度增量的处理方式，但不控制 CP-SCF 方程如何求解。所有矩以原子单位输出；原点约定与 Gaussian 相同，默认取核质量中心。
+
+- `multipole_orders`：取值为正整数列表：1 = 偶极、2 = 四极、3 = 八极、4 = 十六极。默认为 `[1, 2, 3, 4]`。
+- `multipole_origin`：显式指定多极矩计算原点，取值为长度 3 的浮点数列表，单位 Bohr。默认为 None，即约化质心。
+- `multipole_rdm1_relax`：双杂化密度增量的处理方式，取值 `"relaxed"` (求解 Z-vector 并计入响应增量) 或 `"unrelaxed"` (仅计入非弛豫关联 rdm1 增量，不求解 CP-SCF)。默认为 `"relaxed"`。对 HF/DFT 方法无效 (静默忽略)。
+
+作为例子，运行多极矩计算、仅求偶极与四极矩、将原点设为坐标原点、并对后自洽部分使用非弛豫密度，所需的设置如下：
+```toml
+[ctrl]
+analdrv_tasks = "multipole"
+
+[analdrv]
+multipole_orders = [1, 2]
+multipole_origin = [0.0, 0.0, 0.0]
+multipole_rdm1_relax = "unrelaxed"
 ```
 
 # Detailed description of [geom] block in the control file

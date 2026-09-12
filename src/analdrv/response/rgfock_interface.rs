@@ -62,6 +62,9 @@ pub fn dh_jk_factors(scf_data: &SCF) -> (f64, f64) {
 pub fn dh_xc_func_list(scf_data: &SCF) -> Option<Vec<(f64, LibXCFunctional)>> {
     let xc_data = &scf_data.mol.xc_data;
     let (xc_code, xc_params) = match (&xc_data.dfa_compnt_pos, &xc_data.dfa_paramr_pos) {
+        // a present-but-empty component list (pure-MP2-family post-SCF methods) carries no DFT
+        // part; treated the same as absent, so no empty KS contribution object is built
+        (Some(code), Some(_)) if code.is_empty() => return None,
         (Some(code), Some(param)) => (code, param),
         (None, None) => return None,
         _ => panic!("dfa_compnt_pos and dfa_paramr_pos must be present or absent together."),
