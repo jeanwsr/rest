@@ -498,8 +498,20 @@ impl CPHFSolverPySCF {
 
         // Low-rank exchange-response precomputation (ground-state, built once
         // per solve; None if no RI tensor or not applicable).
+        //
+        // Skipped for pure (LDA/GGA) DFAs: `k_scaling` is 0 there, so the
+        // matvec never consumes it, yet building it costs `naux` symmetric
+        // 3-index transforms and keeps `k/n/m/l_batch` resident (153 MB for
+        // naphthalene/def2-svp-rifit).  The matvec's K branch is already
+        // guarded by `k_scaling != 0.0`, so nothing else changes.
         let _t_kl = std::time::Instant::now();
-        let k_lowrank = KLowRankPrecompute::new(scf, &self.ws);
+        let is_hf_k = scf.mol.xc_data.dfa_compnt_scf.is_empty();
+        let hyb_k = if is_hf_k { 1.0 } else { scf.mol.xc_data.dfa_hybrid_scf };
+        let k_lowrank = if hyb_k != 0.0 {
+            KLowRankPrecompute::new(scf, &self.ws)
+        } else {
+            None
+        };
         if std::env::var("REST_MEM_TRACE").is_ok() {
             eprintln!("MEMTRACE cphf-lowrank-built RSS = {:.1} MiB", crate::hessian::memory_monitor::current_rss_mb());
         }

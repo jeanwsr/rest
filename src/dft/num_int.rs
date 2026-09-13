@@ -18,6 +18,7 @@ use crate::dft::xc_deriv::XCType;
 use crate::scf_io::util::occupied_orbital_count_with_threshold;
 use crate::dft::libxc_itrf::eval_xc_eff;
 use crate::ri_tddft::utils::tddft_occupation_parameters;
+use rest_libcint::prelude::CInt;
 
 
 pub fn eval_ao_batch(mol:&Molecule, coords:&[[f64; 3]], ao_deriv:usize, num_grids:usize) -> RIFull<f64> {
@@ -52,6 +53,94 @@ pub fn eval_ao_batch(mol:&Molecule, coords:&[[f64; 3]], ao_deriv:usize, num_grid
     );
 
     loc_ao
+}
+
+/// Raw libcint AO buffer, **without** the layout conversion of
+/// [`eval_ao_batch_libcint`].
+///
+/// The buffer holds component `c` as a `[num_grids, nao]` column-major block
+/// (element `(g, mu)` at `c*nao*num_grids + g + mu*num_grids`), i.e. the
+/// transpose of the `RIFull` layout.  Consumers that can express their
+/// contractions as BLAS calls on the transposed operand can use this to skip
+/// the (memory-bound) transpose entirely — the fxc response matvec does, see
+/// `compute_fxc_response_block`.
+pub fn eval_ao_batch_libcint_native(
+    cint: &CInt,
+    nao: usize,
+    coords: &[[f64; 3]],
+    ao_deriv: usize,
+) -> Vec<f64> {
+    let ncomp = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
+    let out = cint.eval_gto(&format!("deriv{}", ao_deriv), coords);
+    let data = out.out.expect("eval_ao_batch_libcint_native: libcint returned no output buffer");
+    assert_eq!(
+        data.len(),
+        nao * coords.len() * ncomp,
+        "eval_ao_batch_libcint_native: libcint returned {} values, expected {}",
+        data.len(),
+        nao * coords.len() * ncomp
+    );
+    data
+}
+
+/// AO values + Cartesian derivatives on a grid batch, evaluated with libcint.
+///
+/// The returned tensor is layout-identical to [`eval_ao_batch`]: component `c`
+/// is a `[nao, num_grids]` column-major block (`get_reducing_matrix(c)`), with
+/// the AO index fastest, so this is a drop-in replacement for the legacy
+/// serial spherical transform.
+///
+/// libcint's own output is the **transpose** of that (see
+/// [`eval_ao_batch_libcint_native`]), so a per-component transpose is needed;
+/// it is cache-blocked and costs ~50% of the evaluation itself.
+///
+/// Measured (naphthalene / def2-svp / 219212 grids, single thread) against the
+/// legacy path: `ao_deriv = 1` 1.15 s vs 2.79 s, `ao_deriv = 2` 2.88 s vs
+/// 7.43 s; values agree to 1.4e-14 (roundoff).
+pub fn eval_ao_batch_libcint(
+    cint: &CInt,
+    nao: usize,
+    coords: &[[f64; 3]],
+    ao_deriv: usize,
+    num_grids: usize,
+) -> RIFull<f64> {
+    let ncomp = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
+    let mut data = eval_ao_batch_libcint_native(cint, nao, coords, ao_deriv);
+    // [ng, nao] (grids fastest) -> [nao, ng] (AO fastest), per component.
+    // Tiled so that both the reads and the writes are contiguous: a BLK x BLK
+    // tile is loaded row- (AO-) wise and stored column-wise, which keeps every
+    // access either unit-stride or inside a 64-line (4 KB) window of L1.
+    if num_grids != nao {
+        const BLK: usize = 64;
+        let mut dst = vec![0.0f64; data.len()];
+        let mut tile = vec![0.0f64; BLK * BLK];
+        for c in 0..ncomp {
+            let src = &data[c * nao * num_grids..(c + 1) * nao * num_grids];
+            let d = &mut dst[c * nao * num_grids..(c + 1) * nao * num_grids];
+            for gb in (0..num_grids).step_by(BLK) {
+                let ge = (gb + BLK).min(num_grids);
+                for mub in (0..nao).step_by(BLK) {
+                    let mue = (mub + BLK).min(nao);
+                    let h = mue - mub;
+                    // load: tile[g_local * BLK + mu_local] = src[g + mu * ng]
+                    for (i, mu) in (mub..mue).enumerate() {
+                        let row = &src[gb + mu * num_grids..ge + mu * num_grids];
+                        for (j, v) in row.iter().enumerate() {
+                            tile[j * BLK + i] = *v;
+                        }
+                    }
+                    // store: dst[mu + g * nao] = tile[g_local * BLK + mu_local]
+                    for (j, g) in (gb..ge).enumerate() {
+                        let col = &tile[j * BLK..j * BLK + h];
+                        let drow = &mut d[g * nao + mub..g * nao + mue];
+                        drow.copy_from_slice(col);
+                    }
+                }
+            }
+        }
+        data = dst;
+    }
+    RIFull::from_vec([nao, num_grids, ncomp], data).unwrap()
 }
 
 

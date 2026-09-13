@@ -7,15 +7,15 @@
 /// For HF: vind(dm1) = J[dm1] - 0.5*K[dm1]
 /// For DFT: vind(dm1) = fxc[dm1] + J[dm1] - hyb*K[dm1]
 
-use rest_tensors::{MatrixFull, MatrixUpper, RIFull};
+use rest_tensors::{MatrixFull, MatrixFullSlice, MatrixUpper, RIFull};
 use rest_tensors::matrix::matrix_blas_lapack::{
     _dgemm_full, _dsymm, omp_get_num_threads_wrapper, omp_set_num_threads_wrapper,
 };
 use crate::scf_io::{SCF, SCFType};
-use crate::dft::num_int::{prepare_fxc_data, fxc_matvec_old,
-    eval_ao_batch, eval_rho5_batch};
+use crate::dft::num_int::{prepare_fxc_data, fxc_matvec_old, eval_rho5_batch};
 use crate::dft::libxc_itrf::eval_xc_eff;
 use crate::dft::xc_deriv::XCType;
+use rest_libcint::prelude::CInt;
 use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
 
 /// Global cumulative timing of compute_fxc_response_ao calls, in ns.
@@ -122,19 +122,35 @@ pub(crate) fn compute_k_upper(
 // ============================================================================
 // PySCF-style fxc kernel caching for Hessian CP-HF
 //
-// Mirrors `cache_xc_kernel` + `nr_rks_fxc(fxc=...)` in PySCF: all
-// ground-state-dependent quantities (AO values on grid, ρ₀, fxc kernel
-// evaluated at ρ₀) are computed ONCE and reused across every CP-HF matvec.
-// Only ρ₁ and the final contraction depend on dm1 and are computed per call.
+// Mirrors `cache_xc_kernel` + `nr_rks_fxc(fxc=...)` in PySCF: the
+// ground-state-dependent quantities (ρ₀ and the fxc kernel evaluated at ρ₀)
+// are computed ONCE and reused across every CP-HF matvec.  Only ρ₁ and the
+// final contraction depend on dm1 and are computed per call.
+//
+// Memory policy (2026 refactor): the *fxc kernel* (ngrids × nvar² doubles) is
+// always kept — it is small (28 MB for 220k grids) and expensive to re-evaluate
+// (a libxc `deriv=2` call).  The *AO tables* (nao × ngrids × nderiv doubles) are
+// the dominant term (1.27 GB for nao=180, ngrids=219212) and are **only kept
+// when the declared memory budget still has room for them**; otherwise each
+// matvec re-evaluates the AO for the block it is working on with libcint
+// (`eval_ao_batch_libcint`, 5-6x faster than the legacy path).  The old
+// behaviour — always keep the whole grid's AO — can be restored with
+// `REST_FXC_CACHE_MB=<mb>`.
 // ============================================================================
 
 /// Cached ground-state data for one grid block.
 pub struct FxcBlock {
     pub nb: usize,
+    /// Grid range of this block inside the global grid (for on-demand AO
+    /// re-evaluation and for progress diagnostics).
+    pub g0: usize,
+    pub g1: usize,
     pub weights: Vec<f64>,
-    /// AO values + derivatives on this block; one [nao, nb] matrix per
-    /// derivative component (0=ao, 1=ao_x, 2=ao_y, 3=ao_z for GGA).
-    pub ao_d: Vec<MatrixFull<f64>>,
+    /// AO values + derivatives on this block when the budget allowed caching
+    /// them: flat `[nao, nb, nderiv]`, component `c` at `c*nao*nb` (the
+    /// `eval_ao_batch` / `eval_ao_batch_libcint` layout).  `None` means the AO
+    /// is re-evaluated on demand for every matvec.
+    pub ao: Option<Vec<f64>>,
     /// fxc kernel for this block, layout `fxc_raw[g + x*nb + y*nvar*nb]`
     /// (= fxc[x,y,g] in column-major), already × weight baked out.
     /// Length: nb * nvar * nvar.
@@ -143,22 +159,122 @@ pub struct FxcBlock {
 
 /// PySCF `cache_xc_kernel` analog for the RKS Hessian fxc response.
 ///
-/// Built once per Hessian calculation by `prepare_fxc_hessian_cache`, then
-/// passed (by reference) to every `compute_fxc_response_ao_cached` call
-/// inside the CP-HF Krylov loop. This avoids re-evaluating AO basis, ρ₀,
-/// and the libxc fxc kernel on each matvec.
+/// Built once per Hessian/TDDFT-gradient calculation by
+/// `prepare_fxc_hessian_cache`, then passed (by reference) to every
+/// `compute_fxc_response_ao_cached` call inside the CP-HF Krylov loop.  This
+/// avoids re-evaluating ρ₀ and the libxc fxc kernel on each matvec; whether the
+/// AO tables are also cached is decided by the memory budget (see the module
+/// comment above).
 pub struct FxcHessianCache {
     pub nao: usize,
-    pub nvar: usize,       // 1 (LDA) or 4 (GGA)
+    pub nvar: usize,
+    /// number of AO derivative components (1 for LDA, 4 for GGA)
+    pub nderiv: usize,
+    /// AO derivative *order* handed to the AO evaluator (0 for LDA, 1 for GGA)
+    pub ao_deriv: usize,
     pub blocks: Vec<FxcBlock>,
+    /// AO bytes actually kept resident / AO bytes the whole grid would need.
+    pub ao_cached_bytes: usize,
+    pub ao_total_bytes: usize,
+    /// libcint handle + grid coordinates, used to re-evaluate the AO of blocks
+    /// that are not cached.
+    cint: CInt,
+    coords: Vec<[f64; 3]>,
 }
 
+/// One block's AO buffer plus its memory layout.
+///
+/// * `native = false`: `RIFull` layout, component `c` is `[nao, nb]` column-major
+///   (`eval_ao_batch_libcint`); this is what the resident cache stores.
+/// * `native = true`: raw libcint layout, component `c` is `[nb, nao]`
+///   column-major (`eval_ao_batch_libcint_native`); no transpose is paid.
+#[derive(Clone, Copy)]
+struct BlockAo<'a> {
+    data: &'a [f64],
+    native: bool,
+}
+
+impl FxcHessianCache {
+    /// AO buffer for one block: the cached copy when present, otherwise a
+    /// freshly evaluated one — in libcint's own layout, so that the on-demand
+    /// path pays neither the transpose nor its extra buffer.  The caller owns
+    /// `scratch` for the fallback case.
+    fn ao_of<'s>(&self, block: &'s FxcBlock, scratch: &'s mut Vec<f64>) -> BlockAo<'s> {
+        if let Some(ao) = block.ao.as_ref() {
+            return BlockAo { data: ao, native: false };
+        }
+        *scratch = crate::dft::num_int::eval_ao_batch_libcint_native(
+            &self.cint,
+            self.nao,
+            &self.coords[block.g0..block.g1],
+            self.ao_deriv,
+        );
+        BlockAo { data: scratch, native: true }
+    }
+}
+
+/// Grid points per fxc-cache block.
+///
+/// One block's working set during a matvec is the AO evaluator's buffer plus
+/// the `[nao, nb]` AO, `c0` and `aow` arrays — about `8*nao*(2*nderiv + 2)`
+/// bytes per grid point (the factor 2 on `nderiv` covers the evaluator's
+/// pre-transpose buffer).  The default budget is 128 MB, so no single block can
+/// dominate the peak; `REST_FXC_BLK_MB` overrides it (a larger block trades
+/// memory for a little less loop overhead, a smaller one the other way round).
+fn fxc_block_size(scf: &SCF, nao: usize, nderiv: usize, ngrids: usize) -> usize {
+    let mb = std::env::var("REST_FXC_BLK_MB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or_else(|| {
+            let max_memory = scf.mol.ctrl.max_memory.unwrap_or(2000.0);
+            (0.1 * max_memory).clamp(64.0, 512.0)
+        });
+    let per_grid = 8.0 * nao as f64 * (2 * nderiv + 2) as f64;
+    ((mb * 1.0e6 / per_grid) as usize).clamp(1024, ngrids.max(1))
+}
+
+/// Process high-water RSS (`VmHWM`) in MiB, 0 when unavailable.
+fn vmhwm_mb() -> f64 {
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                if let Some(kb) = rest.split_whitespace().next() {
+                    if let Ok(v) = kb.parse::<f64>() {
+                        return v / 1024.0;
+                    }
+                }
+            }
+        }
+    }
+    0.0
+}
+
+/// Bytes of AO tables the fxc cache may keep resident.
+///
+/// `max_memory` is REST's declared process budget; the AO cache is what is left
+/// of it after the resident set (SCF integrals, grids, the RI tensors), because
+/// keeping the AO is a *pure* time/memory trade: the same data can be
+/// re-evaluated per matvec with libcint for ~0.5 s per full-grid pass.
+/// `REST_FXC_CACHE_MB` (alias `REST_TDDFT_GRAD_FXCCACHE_MB`) overrides it.
+fn fxc_ao_cache_budget_bytes(scf: &SCF, needed: usize) -> usize {
+    let env_mb = std::env::var("REST_FXC_CACHE_MB")
+        .ok()
+        .or_else(|| std::env::var("REST_TDDFT_GRAD_FXCCACHE_MB").ok())
+        .and_then(|v| v.parse::<f64>().ok());
+    if let Some(mb) = env_mb {
+        return ((mb.max(0.0) * 1.0e6) as usize).min(needed);
+    }
+    let max_memory = scf.mol.ctrl.max_memory.unwrap_or(2000.0);
+    let used = crate::utilities::memory_batch::detect_used_memory_mb("proc");
+    let avail = ((max_memory - used).max(0.0) * 1.0e6) as usize;
+    avail.min(needed)
+}
 /// Build the Hessian fxc cache: iterates grid blocks once, evaluates AO +
 /// derivatives, ρ₀, and the fxc kernel via `eval_xc_eff(deriv=2)`.
 ///
-/// Matches the per-block work that the old `compute_fxc_response_ao` did on
-/// every call. After this function returns, no further AO/libxc evaluation
-/// is needed for the entire CP-HF phase.
+/// The fxc kernel is always kept; the AO tables are kept only as far as the
+/// memory budget allows (`fxc_ao_cache_budget_bytes`) — the remaining blocks
+/// re-evaluate their AO on demand inside `compute_fxc_response_ao_cached`.
 pub fn prepare_fxc_hessian_cache(scf: &SCF) -> FxcHessianCache {
     let _t = std::time::Instant::now();
     let mol = &scf.mol;
@@ -180,27 +296,37 @@ pub fn prepare_fxc_hessian_cache(scf: &SCF) -> FxcHessianCache {
     let ao_deriv = if nvar == 4 { 1 } else { 0 };
     let nderiv = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
 
+    let cint = crate::ri_jk::util::get_cint_mol(mol);
+    let coords = grids.coordinates.clone();
+    let ngrids = coords.len();
+    let ao_total_bytes = nao * ngrids * nderiv * 8;
+    let ao_budget_bytes = fxc_ao_cache_budget_bytes(scf, ao_total_bytes);
+
     // Ground-state density (ρ₀) is invariant across matvecs — evaluate once.
     let mo_vec = vec![scf.eigenvectors[0].clone()];
     let occ_vec = vec![scf.occupation[0].clone()];
 
+    // Grid blocking: the per-matvec workspace scales with the block size, and
+    // the block size used to be the SCF's `parallel_balancing` range — a single
+    // block covering the whole grid for a molecule of this size, i.e. ~3
+    // `[nao, nb]` arrays plus the AO evaluator's own buffer (several GB on
+    // naphthalene) alive for every matvec.  The block size is now chosen from a
+    // working-set budget instead; the number of blocks does not change the
+    // result (the per-block partial responses are summed).
+    let blksize = fxc_block_size(scf, nao, nderiv, ngrids);
     let mut blocks: Vec<FxcBlock> = Vec::new();
-    for block_range in &grids.parallel_balancing {
-        let start = block_range.start;
-        let end = block_range.end;
+    let mut ao_cached_bytes = 0usize;
+    let mut start = 0usize;
+    while start < ngrids {
+        let end = (start + blksize).min(ngrids);
         let nb = end - start;
-        if nb == 0 { continue; }
         let coords_block = &grids.coordinates[start..end];
         let weights_block = &grids.weights[start..end];
 
-        // AO + derivatives for this block
-        let ao = eval_ao_batch(mol, coords_block, ao_deriv, nb);
-        let ao_d: Vec<MatrixFull<f64>> = (0..nderiv)
-            .map(|d| {
-                let view = ao.get_reducing_matrix(d).unwrap();
-                MatrixFull::from_vec([nao, nb], view.iter().copied().collect()).unwrap()
-            })
-            .collect();
+        // AO + derivatives for this block (libcint; layout [nao, nb, nderiv],
+        // identical to `eval_ao_batch`, so it can be handed to the matvec
+        // without any repacking).
+        let ao = crate::dft::num_int::eval_ao_batch_libcint(&cint, nao, coords_block, ao_deriv, nb);
 
         // Ground-state ρ₀ → fxc kernel
         let rho_tensor = eval_rho5_batch(&ao, xc_type, &mo_vec, &occ_vec, 1, nb);
@@ -224,20 +350,51 @@ pub fn prepare_fxc_hessian_cache(scf: &SCF) -> FxcHessianCache {
             }
         }
 
+        // Keep the AO only while the budget lasts; blocks past it re-evaluate
+        // on demand (the data is identical, just recomputed per matvec).
+        let block_bytes = nao * nb * nderiv * 8;
+        let keep_ao = ao_cached_bytes + block_bytes <= ao_budget_bytes;
+        let ao_store = if keep_ao {
+            ao_cached_bytes += block_bytes;
+            Some(ao.data)
+        } else {
+            None
+        };
+
         blocks.push(FxcBlock {
             nb,
+            g0: start,
+            g1: end,
             weights: weights_block.to_vec(),
-            ao_d,
+            ao: ao_store,
             fxc_raw,
         });
+        start = end;
     }
 
-    println!("  FxcHessianCache prepared: nao={}, nvar={}, blocks={} ({} grids) in {:.3}s",
-             nao, nvar, blocks.len(),
-             blocks.iter().map(|b| b.nb).sum::<usize>(),
-             _t.elapsed().as_secs_f64());
+    println!(
+        "  FxcHessianCache prepared: nao={}, nvar={}, blocks={} ({} grids) in {:.3}s | AO resident {:.0}/{:.0} MB (budget {:.0} MB)",
+        nao,
+        nvar,
+        blocks.len(),
+        blocks.iter().map(|b| b.nb).sum::<usize>(),
+        _t.elapsed().as_secs_f64(),
+        ao_cached_bytes as f64 / 1.0e6,
+        ao_total_bytes as f64 / 1.0e6,
+        ao_budget_bytes as f64 / 1.0e6
+    );
 
-    FxcHessianCache { nao, nvar, blocks }
+    FxcHessianCache {
+        nao,
+        nvar,
+        nderiv,
+        ao_deriv,
+        blocks,
+        ao_cached_bytes,
+        ao_total_bytes,
+        cint,
+        coords,
+    }
 }
 
 /// AO-basis fxc response using a precomputed `FxcHessianCache`.
@@ -262,7 +419,9 @@ pub fn compute_fxc_response_ao_cached(
             // The per-block helper also sets OMP=1; doing it at the closure
             // boundary makes the Rayon+BLAS contract explicit and local.
             omp_set_num_threads_wrapper(1);
-            compute_fxc_response_block(block, dm1, nao, nvar)
+            let mut scratch = Vec::new();
+            let ao = cache.ao_of(block, &mut scratch);
+            compute_fxc_response_block(block, ao, dm1, nao, nvar)
         })
         .reduce(|| MatrixFull::new([nao, nao], 0.0), |mut a, b| {
             a += b.clone();
@@ -306,9 +465,18 @@ pub fn compute_fxc_response_ao_cached_batched(
             // The per-block helper also sets OMP=1; doing it at the closure
             // boundary makes the Rayon+BLAS contract explicit and local.
             omp_set_num_threads_wrapper(1);
+            let trace = std::env::var("REST_TDDFT_GRAD_MEM").is_ok();
+            let rss0 = if trace { crate::hessian::memory_monitor::current_rss_mb() } else { 0.0 };
+            let mut scratch = Vec::new();
+            let ao = cache.ao_of(block, &mut scratch);
+            if trace {
+                eprintln!("  [fxcmem] block nb={} ao={:.0} MB native={} rss {:.0} -> {:.0} MB (peak {:.0})",
+                    block.nb, ao.data.len() as f64 * 8.0 / 1e6, ao.native, rss0,
+                    crate::hessian::memory_monitor::current_rss_mb(), vmhwm_mb());
+            }
             let mut flat = vec![0.0; n_rhs * nao * nao];
             for i in 0..n_rhs {
-                let v_partial = compute_fxc_response_block(block, &dms[i], nao, nvar);
+                let v_partial = compute_fxc_response_block(block, ao, &dms[i], nao, nvar);
                 let off = i * nao * nao;
                 for k in 0..nao * nao { flat[off + k] = v_partial.data[k]; }
             }
@@ -336,15 +504,32 @@ pub fn compute_fxc_response_ao_cached_batched(
 
 /// Per-grid-block fxc response: returns the partial [nao, nao] contribution
 /// from this block. Pure (no shared mutable state) so safe to call in parallel.
+///
+/// `ao` is the block AO in the `[nao, nb, nderiv]` layout (component `c` at
+/// `c*nao*nb`), either the cached copy or one freshly evaluated by the caller.
 fn compute_fxc_response_block(
     block: &FxcBlock,
+    ao: BlockAo<'_>,
     dm1: &MatrixFull<f64>,
     nao: usize,
     nvar: usize,
 ) -> MatrixFull<f64> {
     let nb = block.nb;
-    let ao_d = &block.ao_d;
+    let native = ao.native;
+    let ao = ao.data;
     let fxc_raw = &block.fxc_raw;
+    // Component `c` of the block AO as a BLAS operand: `[nao, nb]` for the
+    // cached (RIFull) layout, `[nb, nao]` for libcint's own layout.  The
+    // contractions below pick the matching `trans` flags, so the native path
+    // needs no repacking at all.
+    let sz: [usize; 2] = if native { [nb, nao] } else { [nao, nb] };
+    let ind: [usize; 2] = if native { [1, nb] } else { [1, nao] };
+    let comp = |c: usize| MatrixFullSlice {
+        size: &sz,
+        indicing: &ind,
+        data: &ao[c * nao * nb..(c + 1) * nao * nb],
+    };
+    let a0 = comp(0);
     // Force single-threaded BLAS inside this (possibly parallel) grid task:
     // the process-wide OpenBLAS pool would otherwise oversubscribe the CPU
     // (n_blocks rayon tasks × OpenBLAS threads) and stall the contractions.
@@ -359,26 +544,40 @@ fn compute_fxc_response_block(
             counter.fetch_add(t.elapsed().as_nanos() as u64, AOrdering::Relaxed);
         }
     };
+    let aoc = |c: usize, mu: usize, g: usize| -> f64 {
+        if native {
+            ao[c * nao * nb + g + mu * nb]
+        } else {
+            ao[c * nao * nb + mu + g * nao]
+        }
+    };
 
     // ρ₁[μ,g] = Σ_ν dm1[μ,ν] · ao[0][ν,g]
     let mut c0 = MatrixFull::new([nao, nb], 0.0);
     let t = now();
-    _dgemm_full(dm1, 'N', &ao_d[0], 'N', &mut c0, 1.0, 0.0);
+    if native {
+        _dgemm_full(dm1, 'N', &a0, 'T', &mut c0, 1.0, 0.0);
+    } else {
+        _dgemm_full(dm1, 'N', &a0, 'N', &mut c0, 1.0, 0.0);
+    }
     acc(t, &FXC_DGEMM1_NS);
-
     if nvar == 1 {
         // LDA
         let mut aow = MatrixFull::new([nao, nb], 0.0);
         let t = now();
         for g in 0..nb {
             let mut rho1 = 0.0;
-            for mu in 0..nao { rho1 += ao_d[0][[mu, g]] * c0[[mu, g]]; }
+            for mu in 0..nao { rho1 += aoc(0, mu, g) * c0.data[mu + g * nao]; }
             let wf_rho = block.weights[g] * fxc_raw[g] * rho1;
-            for mu in 0..nao { aow[[mu, g]] = ao_d[0][[mu, g]] * wf_rho; }
+            for mu in 0..nao { aow.data[mu + g * nao] = aoc(0, mu, g) * wf_rho; }
         }
         acc(t, &FXC_RHO1_NS);
         let t = now();
-        _dgemm_full(&aow, 'N', &ao_d[0], 'T', &mut vmat, 1.0, 1.0);
+        if native {
+            _dgemm_full(&aow, 'N', &a0, 'N', &mut vmat, 1.0, 1.0);
+        } else {
+            _dgemm_full(&aow, 'N', &a0, 'T', &mut vmat, 1.0, 1.0);
+        }
         acc(t, &FXC_DGEMM2_NS);
     } else {
         // GGA — nvar == 4
@@ -386,13 +585,13 @@ fn compute_fxc_response_block(
         let mut rho1 = vec![0.0; 4 * nb];
         for g in 0..nb {
             let mut r0 = 0.0;
-            for mu in 0..nao { r0 += ao_d[0][[mu, g]] * c0[[mu, g]]; }
+            for mu in 0..nao { r0 += aoc(0, mu, g) * c0.data[mu + g * nao]; }
             rho1[0 + g * 4] = r0;
         }
         for x in 1..4 {
             for g in 0..nb {
                 let mut rx = 0.0;
-                for mu in 0..nao { rx += ao_d[x][[mu, g]] * c0[[mu, g]]; }
+                for mu in 0..nao { rx += aoc(x, mu, g) * c0.data[mu + g * nao]; }
                 rho1[x + g * 4] = 2.0 * rx;
             }
         }
@@ -420,15 +619,19 @@ fn compute_fxc_response_block(
         for g in 0..nb {
             for mu in 0..nao {
                 let mut v = 0.0;
-                for x in 0..4 { v += ao_d[x][[mu, g]] * wv[x + g * 4]; }
-                aow[[mu, g]] = v;
+                for x in 0..4 { v += aoc(x, mu, g) * wv[x + g * 4]; }
+                aow.data[mu + g * nao] = v;
             }
         }
         acc(t, &FXC_AOW_NS);
 
         let t = now();
         let mut m_block = MatrixFull::new([nao, nao], 0.0);
-        _dgemm_full(&ao_d[0], 'N', &aow, 'T', &mut m_block, 1.0, 0.0);
+        if native {
+            _dgemm_full(&a0, 'T', &aow, 'T', &mut m_block, 1.0, 0.0);
+        } else {
+            _dgemm_full(&a0, 'N', &aow, 'T', &mut m_block, 1.0, 0.0);
+        }
         acc(t, &FXC_DGEMM2_NS);
 
         let t = now();

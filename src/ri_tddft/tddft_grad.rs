@@ -29,6 +29,7 @@ use crate::ri_gw::gw_grad::{build_raw_ri_tensors, AtomDerivBlocks, RawRiTensors}
 use crate::ri_tddft::utils::tddft_occupation_parameters;
 use crate::scf_io::SCF;
 use libxc::prelude::*;
+use rest_libcint::prelude::CInt;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, _dinverse};
 use rest_tensors::matrix::matrixfullslice::MatrixFullSlice;
 use rest_tensors::{MatrixFull, RIFull};
@@ -144,6 +145,14 @@ pub struct TddftGradEngine<'a> {
     /// short-range HF-exchange correction (RSH only, 0 otherwise)
     hyb_sr: f64,
     fxc_cache: FxcHessianCache,
+    /// libcint handle for the grid AO tables.  `eval_ao_batch` (the legacy
+    /// serial spherical transform) is 5-6x slower than libcint on the same
+    /// grid, and the XC passes walk the grid twice, so the AO evaluation is
+    /// the second largest item of the response after the grid contractions.
+    cint: CInt,
+    /// `REST_TDDFT_GRAD_AO_LEGACY=1` restores the pre-refactor `eval_ao_batch`
+    /// path (regression cross-check only).
+    ao_legacy: bool,
 }
 
 impl<'a> TddftGradEngine<'a> {
@@ -177,10 +186,29 @@ impl<'a> TddftGradEngine<'a> {
             _dinverse(&j2).expect("TDDFT grad: singular RI metric")
         };
         let fxc_cache = crate::dft::response::prepare_fxc_hessian_cache(scf);
+        let cint = crate::ri_jk::util::get_cint_mol(&scf.mol);
+        let ao_legacy = std::env::var("REST_TDDFT_GRAD_AO_LEGACY").is_ok();
         TddftGradEngine {
             scf, state, singlet, tda,
             nao, nmo, nocc, nvir, natm, start_mo, lumo,
-            x, y, raw, jinv, hyb, hyb_sr, fxc_cache,
+            x, y, raw, jinv, hyb, hyb_sr, fxc_cache, cint, ao_legacy,
+        }
+    }
+
+    // ---- grid AO ----------------------------------------------------------
+
+    /// Grid AO values + derivatives, evaluated with libcint.
+    ///
+    /// Layout is identical to the legacy [`eval_ao_batch`] (`[nao, ng, ncomp]`
+    /// column-major), so it is a drop-in replacement; only the last bits differ
+    /// (verified max |Δ| = 1.4e-14 against the legacy path on the naphthalene
+    /// grid).  `REST_TDDFT_GRAD_AO_LEGACY=1` restores the legacy evaluator.
+    #[inline]
+    fn ao_batch(&self, coords: &[[f64; 3]], ao_deriv: usize, ng: usize) -> RIFull<f64> {
+        if self.ao_legacy {
+            eval_ao_batch(&self.scf.mol, coords, ao_deriv, ng)
+        } else {
+            crate::dft::num_int::eval_ao_batch_libcint(&self.cint, self.nao, coords, ao_deriv, ng)
         }
     }
 
@@ -552,31 +580,69 @@ impl<'a> TddftGradEngine<'a> {
 
     /// `(ao_deriv, ao_comp, blksize)` for the `contract_xc_kernel` grid loop.
     ///
-    /// `ao_deriv = 2` (10 components) is required by the GGA helpers even
-    /// though only components 0..3 are read directly (reducing it to 1 makes
-    /// the GGA path fail inside `gga_grad_sum`/`eval_rho5_batch`).  Sharing
-    /// this with `build_ao_cache` keeps the block boundaries identical.
+    /// `ao_deriv = 2` (10 components) is required by the GGA helpers: the
+    /// derivative tables of `gga_grad_sum` contract the second derivatives of
+    /// the AO with the gradient of the weighted kernel, so the 6 components
+    /// beyond the first derivative are genuinely needed (same as PySCF's
+    /// `ao_deriv=2` GGA gradient path).
+    ///
+    /// The block size is derived from the memory that is actually **left** in
+    /// the declared budget (`max_memory`), not from `max_memory` as if the
+    /// process were empty.  The old rule
+    /// (`max_memory / 8 / ((ao_comp+1) * nao)`) let a single grid block claim
+    /// ~11/12 of a 2000 MB budget inside a process whose resident set already
+    /// exceeded it, which is how the gradient acquired its 1.8 GB transient
+    /// workspace.  See [`Self::xc_work_budget_bytes`].
     fn xc_grid_setup(&self, xc_type: XCType) -> (usize, usize, usize) {
         let nao = self.nao;
         let ngrids = self.scf.grids.as_ref().map(|g| g.weights.len()).unwrap_or(0);
-        let max_memory = self.scf.mol.ctrl.max_memory.unwrap_or(2000.0);
         let ao_deriv = if xc_type == XCType::LDA { 1 } else { 2 };
         let ao_comp = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
-        let blksize = ((max_memory * 1_000_000.0 / 8.0 / ((ao_comp + 1) * nao) as f64) as usize)
+        // Working set of one grid block: the AO tensor (twice — the evaluator
+        // returns libcint's layout and the contraction kernels need the
+        // transposed one, so both are alive during the conversion) plus the
+        // `[nao, ng]`-sized helpers of the kernels (`eval_rho_response`'s A0
+        // copy and D·A0 product, `xc_eval_mat`'s `aow_all`, `gga_grad_sum`'s
+        // reusable `aow` scratch).
+        let per_grid_bytes = 8.0 * nao as f64 * (2 * ao_comp + 2) as f64;
+        let blksize = ((self.xc_work_budget_bytes() / per_grid_bytes) as usize)
             .min(ngrids)
             .max(4);
         (ao_deriv, ao_comp, blksize)
     }
 
+    /// Bytes one pass of the XC grid loop may spend on its per-block workspace.
+    ///
+    /// `max_memory` is REST's declared process budget.  `REST_TDDFT_GRAD_XCBLK_MB`
+    /// overrides the result; otherwise it is the head room left after the
+    /// resident set, capped at 10% of `max_memory` so that a grid is always
+    /// walked in several blocks (the block workspace then overlaps the resident
+    /// data instead of adding to it) and floored so that a process which already
+    /// exceeds its budget still runs.
+    fn xc_work_budget_bytes(&self) -> f64 {
+        const MIN_MB: f64 = 192.0;
+        if let Ok(v) = std::env::var("REST_TDDFT_GRAD_XCBLK_MB") {
+            if let Ok(mb) = v.parse::<f64>() {
+                return mb.max(1.0) * 1.0e6;
+            }
+        }
+        let max_memory = self.scf.mol.ctrl.max_memory.unwrap_or(2000.0);
+        let used = crate::utilities::memory_batch::detect_used_memory_mb("proc");
+        let avail = (max_memory - used).max(0.0);
+        avail.min(0.1 * max_memory).max(MIN_MB) * 1.0e6
+    }
+
     /// Pre-evaluate the AO for the whole grid **iff** it fits the cache budget.
     ///
-    /// `contract_xc_kernel` runs twice per gradient and `eval_ao_batch` is the
-    /// largest single item inside it, so the second pass is duplicated work.
-    /// Caching removes that duplication but costs `8*nao*ngrids*ao_comp` bytes
-    /// resident, which directly trades against requirement (3)'s memory goal.
-    /// The budget is therefore explicit: default 25% of `max_memory`, overridable
-    /// with `REST_TDDFT_GRAD_AOCACHE_MB` (or disabled with
-    /// `REST_TDDFT_GRAD_NO_AOCACHE`).  Large basis sets simply do not take it.
+    /// `contract_xc_kernel` runs twice per gradient with the same `ao_deriv`, so
+    /// the second AO evaluation is duplicated work.  Caching removes that
+    /// duplication but costs `8*nao*ngrids*ao_comp` bytes resident, which trades
+    /// directly against the memory goal; the budget is therefore the same
+    /// *available* head room the per-block workspace uses (override with
+    /// `REST_TDDFT_GRAD_AOCACHE_MB`, disable with `REST_TDDFT_GRAD_NO_AOCACHE`).
+    /// Since `eval_ao_batch_libcint` is 5-6x faster than the legacy evaluator,
+    /// re-evaluating instead of caching is cheap, and large grids simply do not
+    /// take the cache.
     fn build_ao_cache(&self, ao_deriv: usize, ao_comp: usize, blksize: usize) -> Option<AoBlocks> {
         if std::env::var("REST_TDDFT_GRAD_NO_AOCACHE").is_ok() {
             return None;
@@ -584,28 +650,33 @@ impl<'a> TddftGradEngine<'a> {
         let grids = self.scf.grids.as_ref()?;
         let ngrids = grids.weights.len();
         let nao = self.nao;
-        let max_memory = self.scf.mol.ctrl.max_memory.unwrap_or(2000.0);
         let bytes = (nao * ngrids * ao_comp * 8) as f64;
-        // Default budget: when the grid is processed as a **single block** the
-        // AO tensor is already resident for the whole of pass 1, so keeping it
-        // for pass 2 adds no peak memory at all (measured +54 MB on c4h6,
-        // i.e. allocator noise).  With multiple blocks the whole-grid cache
-        // would keep every block alive at once, so fall back to a conservative
-        // fraction of `max_memory`; a user who knows the real headroom can
-        // raise it with `REST_TDDFT_GRAD_AOCACHE_MB`.
+        // The cache trades memory for the second AO evaluation.  Since the
+        // 2026 refactor `eval_ao_batch_libcint` makes that evaluation cheap
+        // (~1.4 s for a 3156 MB deriv-2 grid tensor on naphthalene), so the
+        // cache is only taken when it fits in the same *available* budget the
+        // per-block workspace uses; large basis sets simply re-evaluate.
+        // `REST_TDDFT_GRAD_AOCACHE_MB` overrides the budget.
         let budget = std::env::var("REST_TDDFT_GRAD_AOCACHE_MB")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .map(|mb| mb * 1_000_000.0)
-            .unwrap_or(if blksize >= ngrids { f64::INFINITY } else { 0.25 * max_memory * 1_000_000.0 });
+            .unwrap_or_else(|| self.xc_work_budget_bytes());
         if bytes > budget {
+            if std::env::var("REST_TDDFT_GRAD_TIME").is_ok() {
+                eprintln!(
+                    "[aocache] skipped: {:.0} MB > {:.0} MB budget (REST_TDDFT_GRAD_AOCACHE_MB to override)",
+                    bytes / 1.0e6,
+                    budget / 1.0e6
+                );
+            }
             return None;
         }
         let mut blocks = Vec::new();
         let mut g0 = 0usize;
         while g0 < ngrids {
             let g1 = (g0 + blksize).min(ngrids);
-            let ao = eval_ao_batch(&self.scf.mol, &grids.coordinates[g0..g1], ao_deriv, g1 - g0);
+            let ao = self.ao_batch(&grids.coordinates[g0..g1], ao_deriv, g1 - g0);
             blocks.push((g0, g1, ao));
             g0 = g1;
         }
@@ -624,6 +695,7 @@ impl<'a> TddftGradEngine<'a> {
     /// is linear in the weighted kernel `wv`, folding `kxc` into the `fxc`
     /// contraction with weight 2 is exact and removes one full GGA grid kernel
     /// per call (5 -> 4 overall).
+    #[allow(clippy::too_many_arguments)]
     pub fn contract_xc_kernel(
         &self,
         dmvo: Option<&AOMat>,
@@ -632,6 +704,7 @@ impl<'a> TddftGradEngine<'a> {
         with_kxc: bool,
         singlet: bool,
         ao_blocks: Option<&AoBlocks>,
+        xc_setup: (usize, usize, usize),
     ) -> (Vec<f64>, Option<Vec<f64>>, Option<Vec<f64>>) {
         let nao = self.nao;
         let mut f1vo = vec![0.0; 4 * nao * nao];
@@ -672,7 +745,11 @@ impl<'a> TddftGradEngine<'a> {
 
         let grids = self.scf.grids.as_ref().expect("DFT grids required");
         let ngrids = grids.weights.len();
-        let (ao_deriv, ao_comp, blksize) = self.xc_grid_setup(xc_type);
+        // The blocking is decided once per `assemble` call and handed in, so
+        // that both XC passes and the pass-2 AO cache use identical block
+        // boundaries (the budget reads the current RSS, which grows as the
+        // gradient allocates).
+        let (ao_deriv, ao_comp, blksize) = xc_setup;
 
         let mo_coeffs = vec![self.scf.eigenvectors[0].clone()];
         let occ = vec![self.scf.occupation[0].clone()];
@@ -703,7 +780,7 @@ impl<'a> TddftGradEngine<'a> {
             let ao = match ao_blocks.and_then(|b| b.get(g0, g1)) {
                 Some(a) => a,
                 None => {
-                    local_ao = eval_ao_batch(&self.scf.mol, coords, ao_deriv, ng);
+                    local_ao = self.ao_batch(coords, ao_deriv, ng);
                     &local_ao
                 }
             };
@@ -905,12 +982,25 @@ impl<'a> TddftGradEngine<'a> {
     ///   zero amplitude, so their full value *is* the difference.
     fn assemble(&self, x: &[f64], y: &[f64], zero: bool, resp_only: bool) -> MatrixFull<f64> {
         let timing = std::env::var("REST_TDDFT_GRAD_TIME").is_ok();
+        let mem_trace = std::env::var("REST_TDDFT_GRAD_MEM").is_ok();
         let mut _t0 = std::time::Instant::now();
         macro_rules! tick {
             ($label:expr) => {
                 if timing {
                     eprintln!("[gradtime] {:<22} {:7.3}s", $label, _t0.elapsed().as_secs_f64());
                     _t0 = std::time::Instant::now();
+                }
+            };
+        }
+        macro_rules! memmark {
+            ($label:expr) => {
+                if mem_trace {
+                    eprintln!(
+                        "[gradmem] {:<22} rss={:8.1} MB  peak={:8.1} MB",
+                        $label,
+                        crate::hessian::memory_monitor::current_rss_mb(),
+                        process_peak_rss_mb()
+                    );
                 }
             };
         }
@@ -1052,6 +1142,7 @@ impl<'a> TddftGradEngine<'a> {
         };
 
         tick!("setup+densities");
+        memmark!("after setup");
         // ---- XC kernel contraction ----
         // `f1oo` is the combined `f1oo + 2*k1ao` target (see
         // `contract_xc_kernel`); the `kxc` part is folded in there and can be
@@ -1062,7 +1153,15 @@ impl<'a> TddftGradEngine<'a> {
         let (ao_deriv_c, ao_comp_c, blksize_c) = self.xc_grid_setup(xc_type);
         let ao_cache = self.build_ao_cache(ao_deriv_c, ao_comp_c, blksize_c);
         let (mut f1vo, mut f1oo, mut vxc1) =
-            self.contract_xc_kernel(Some(&dmxpy), Some(&dmzoo), true, true, self.singlet, ao_cache.as_ref());
+            self.contract_xc_kernel(
+                Some(&dmxpy),
+                Some(&dmzoo),
+                true,
+                true,
+                self.singlet,
+                ao_cache.as_ref(),
+                (ao_deriv_c, ao_comp_c, blksize_c),
+            );
         if let Ok(dir) = std::env::var("REST_TDDFT_GRAD_DUMP") {
             use std::io::Write;
             for (nm, v) in [
@@ -1086,6 +1185,7 @@ impl<'a> TddftGradEngine<'a> {
         let vxc1 = vxc1.unwrap();
 
         tick!("contract_xc_kernel");
+        memmark!("after xc kernel #1");
         // exchange coefficient: `veff0doo = 2J - hyb*K` (both spin cases);
         // `veff` for the 1st (dmxpy) block drops the J term for triplets.
         let jf_dmb = if self.singlet { 2.0 } else { 0.0 };
@@ -1218,6 +1318,7 @@ impl<'a> TddftGradEngine<'a> {
         }
 
         tick!("cphf solve");
+        memmark!("after cphf");
         // ---- im0 ----
         let zeta = self.zeta_matrix();
         let mut im0_mo = vec![0.0; nmo * nmo];
@@ -1507,7 +1608,15 @@ impl<'a> TddftGradEngine<'a> {
         let (fxcz1, _, _) = if zero || z1ao.data.iter().all(|&v| v == 0.0) {
             (vec![0.0; 4 * nao * nao], None, None)
         } else {
-            self.contract_xc_kernel(Some(&z1ao), None, false, false, true, ao_cache.as_ref())
+            self.contract_xc_kernel(
+                Some(&z1ao),
+                None,
+                false,
+                false,
+                true,
+                ao_cache.as_ref(),
+                (ao_deriv_c, ao_comp_c, blksize_c),
+            )
         };
         for k in 0..3 * nao * nao {
             veff1[1][k] += 2.0 * (f1oo[nao * nao + k] + fxcz1[nao * nao + k]);
@@ -1520,6 +1629,7 @@ impl<'a> TddftGradEngine<'a> {
         }
 
         tick!("second get_jk tables");
+        memmark!("after xc kernel #2");
         // ---- final per-atom assembly ----
         let ao_slice = self.scf.mol.aoslice_by_atom();
         let mut hcore_gen = generator_deriv_hcore(self.scf);
@@ -1665,6 +1775,7 @@ impl<'a> TddftGradEngine<'a> {
             }
         }
         tick!("atom assembly+dump");
+        memmark!("after assembly");
         if terms_dbg {
             let labels = ["h1", "pulay", "v1", "v2", "v3"];
             let mut tot = [0.0f64; 3];
@@ -1815,6 +1926,26 @@ fn tensor_slice(t: &Tsr<f64>, len: usize) -> Vec<f64> {
     let raw = t.raw();
     let off = t.offset();
     raw[off..off + len].to_vec()
+}
+
+/// Process-wide high-water RSS (`VmHWM`), in MiB; 0 when unavailable.
+///
+/// `VmHWM` is monotonic, so it only answers "did this stage push the peak
+/// further up", never "what does the stage cost on its own"; the per-stage
+/// `current_rss_mb()` marks printed next to it give the live footprint.
+fn process_peak_rss_mb() -> f64 {
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                if let Some(kb) = rest.split_whitespace().next() {
+                    if let Ok(v) = kb.parse::<f64>() {
+                        return v / 1024.0;
+                    }
+                }
+            }
+        }
+    }
+    0.0
 }
 
 /// AO tensor element `(mu,g,c)` of an `eval_ao_batch` buffer `[nao,ng,ncomp]`
