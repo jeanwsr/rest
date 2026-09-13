@@ -21,7 +21,7 @@ use rest_libcint::{CINTR2CDATA, CintType};
 use serde::{Deserialize, Serialize};
 use tensors::{map_full_to_upper, map_upper_to_full, MatrixFull, MatrixUpper, ri, BasicMatUp, BasicMatrix, MathMatrix, MatrixFullSlice, MatrixUpperSlice};
 //use rstsr as rt;
-use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemm_scaled};
+use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemm_scaled, omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
 use crate::molecule_io::Molecule;
 //use crate::geom_io::{GeomCell, get_mass_charge};
 //use crate::constants::solvent as data;
@@ -622,7 +622,9 @@ pub fn get_v_grids_e_old(
     
     let mut v_grids_e = vec![0.0; ngrids];
     //let (sender, receiver) = channel();
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     v_grids_e.par_chunks_mut(CHUNK).enumerate().for_each(|(v_chunk, idx)| {
+        omp_set_num_threads_wrapper(1);
         let t0 = Instant::now();
         let p0 = v_chunk * CHUNK;
         let p1 = (p0 + CHUNK).min(ngrids);
@@ -649,6 +651,7 @@ pub fn get_v_grids_e_old(
         idx.iter_mut().zip(v_e_chunk.iter()).for_each(|(i, &v)| *i = v);
 
     });
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     let dt1 = time::Local::now();
     let timecost = (dt1.timestamp_millis()-dt0.timestamp_millis()) as f64 /1000.0;
@@ -753,11 +756,13 @@ pub fn get_veff_pcm_by_q_old(
             }
         );
     */
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     let veff = grid_coords
     .par_chunks(CHUNK)
     .zip(charge_exp.par_chunks(CHUNK))
     .zip(q.par_chunks(CHUNK))
     .map(|((grid_coords_chunk, charge_exp_chunk), q_chunk)| {
+        omp_set_num_threads_wrapper(1);
         let t0 = Instant::now();
 
         let chunk_len = grid_coords_chunk.len();
@@ -798,6 +803,8 @@ pub fn get_veff_pcm_by_q_old(
             acc
         }
     );
+
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     let dt1 = time::Local::now();
     let timecost = (dt1.timestamp_millis() - dt0.timestamp_millis()) as f64 / 1000.0;
@@ -883,7 +890,9 @@ pub fn get_v_grids_e(
 
     // Step 3: Parallel grid chunks — v_grids_e[j] = Σ_P Y_P · (P|g_j)
     let mut v_grids_e = vec![0.0; ngrids];
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     v_grids_e.par_chunks_mut(CHUNK).enumerate().for_each(|(v_chunk, idx)| {
+        omp_set_num_threads_wrapper(1);
         let p0 = v_chunk * CHUNK;
         let p1 = (p0 + CHUNK).min(ngrids);
         let grid_coords_chunk = &grid_coords[p0..p1];
@@ -913,6 +922,7 @@ pub fn get_v_grids_e(
         let v_e_chunk = _dgemm_scaled(&pg_mat, 'N', &y_mat, 'N', 1.0);
         idx.iter_mut().zip(v_e_chunk.iter()).for_each(|(i, &v)| *i = v);
     });
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     // Debug: check v_grids_e results
     let ve_minmax = v_grids_e.iter().fold((f64::MAX, f64::MIN), |(mn, mx), &v| (mn.min(v), mx.max(v)));
@@ -1149,4 +1159,61 @@ pub fn debug_print_pcm(sta: &PcmStatic, scf: &PcmScf){
     print_vec_stats(&scf.veff.data);
     println!("eng:");
     println!("{}", scf.eng);
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 模糊 water 判定只比较 n, α, ε（容差 0.01 / 0.01 / 1.0）。
+    #[test]
+    fn test_is_water_descriptor() {
+        assert!(is_water_descriptor(&SMD_WATER_DESCRIPTORS));
+        // 容差内（严格 < 0.01 / < 0.01 / < 1.0）：Δn=+0.0072, Δα=+0.005, Δε=+0.645
+        let near = [1.34, 1.33, 0.825, 0.35, -1.0, 79.0, -1.0, -1.0];
+        assert!(is_water_descriptor(&near));
+        // 边界：|Δα| = 0.01 不满足严格小于 → false
+        let mut d = SMD_WATER_DESCRIPTORS;
+        d[2] = 0.83;
+        assert!(!is_water_descriptor(&d), "|Δα|=0.01 应为 false（严格小于）");
+        // 非水溶剂（octanol）
+        let octanol = [1.4295, 1.4279, 0.37, 0.48, 39.01, 9.8629, 0.0, 0.0];
+        assert!(!is_water_descriptor(&octanol));
+        // n 超容差
+        let mut d = SMD_WATER_DESCRIPTORS;
+        d[0] = 1.36;
+        assert!(!is_water_descriptor(&d));
+        // ε 超容差
+        let mut d = SMD_WATER_DESCRIPTORS;
+        d[5] = 76.0;
+        assert!(!is_water_descriptor(&d));
+        // 哨兵值
+        assert!(!is_water_descriptor(&SMD_ERROR_DESCRIPTORS));
+    }
+
+    #[test]
+    fn test_pcm_object_cfg_default() {
+        let cfg = PcmObjectCfg::default();
+        assert_eq!(cfg.method, PcmMethod::CPCM);
+        assert_eq!(cfg.epsilon, 78.3553);
+        assert_eq!(cfg.icds, 0);
+        assert_eq!(cfg.smd_cavity_radii, SmdCavityRadii::Bondi);
+        assert_eq!(cfg.solvent_descriptors, SMD_ERROR_DESCRIPTORS);
+    }
+
+    #[test]
+    fn test_pcm_method_deserialize() {
+        assert_eq!(serde_json::from_str::<PcmMethod>("\"cpcm\"").unwrap(), PcmMethod::CPCM);
+        assert_eq!(serde_json::from_str::<PcmMethod>("\"COSMO\"").unwrap(), PcmMethod::COSMO);
+        assert_eq!(serde_json::from_str::<PcmMethod>("\"iefpcm\"").unwrap(), PcmMethod::IEFPCM);
+        // Fortran/文献别名 SS(V)PE
+        assert_eq!(serde_json::from_str::<PcmMethod>("\"ss(v)pe\"").unwrap(), PcmMethod::SSVPE);
+        assert_eq!(serde_json::from_str::<PcmMethod>("\"ssvpe\"").unwrap(), PcmMethod::SSVPE);
+        assert_eq!(serde_json::from_str::<PcmMethod>("\"smd\"").unwrap(), PcmMethod::SMD);
+        assert!(serde_json::from_str::<PcmMethod>("\"unknown\"").is_err());
+    }
 }

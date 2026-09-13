@@ -15,6 +15,7 @@
 
 use std::f64::consts::PI;
 use std::time::Instant;
+use rayon::prelude::*;
 
 use rest_libcint::CINTR2CDATA;
 use tensors::MatrixFull;
@@ -421,6 +422,49 @@ pub fn grad_solvent_nuc(
 // ============================================================================
 
 /// Electronic potential contribution:  `– q_sym · ∂v_e / ∂R`.
+/// MPI ownership partition of the tessera (surface point) range: rank `r` owns the
+/// surface points in `[g0, g1)`. Uses the same deterministic `average_distribution`
+/// as the SCF rimatr build and the force path
+/// (`crate::grad::rhf::local_aux_function_range`); serial and single-rank runs
+/// (`mpi_operator` is `None`) own all points.
+///
+/// Each surface point is one shell in the fake molecule
+/// (`CINTR2CDATA::fakemol_for_charges`), so point = function = shell and the
+/// force path's "shell span ≠ function range" boundary issue does not arise here.
+fn local_grid_range(
+    ngrids: usize,                                     // total number of surface points
+    mpi_operator: &Option<crate::mpi_io::MPIOperator>, // MPI context; None = serial
+) -> (usize, usize) {
+    #[cfg(feature = "mpi")]
+    if let Some(mpi_op) = mpi_operator {
+        let dist = crate::mpi_io::average_distribution(ngrids, mpi_op.size);
+        return (dist[mpi_op.rank].start, dist[mpi_op.rank].end);
+    }
+    (0, ngrids)
+}
+
+/// Electronic-potential surface-charge gradient grad_qv: the response of the
+/// electronic potential, weighted by the surface charges, to nuclear displacements.
+///
+/// de[(t, a)] = Part A + Part B, each [3, natm], in Hartree/Bohr (t = x,y,z):
+/// - Part A (int3c2e_ip1, derivative w.r.t. AO centres):
+///   dvj_ao[(t,i)] = Σ_{μν} D_{μν} Σ_g q_g ∂(μν|g)/∂R_i[t], then AO→atom (×2 μν symmetry factor)
+/// - Part B (int3c2e_ip2, derivative w.r.t. grid centres):
+///   dq_grid[(g,t)] = Σ_{μν} D_{μν} ∂(μν|g)/∂R_g[t]·q_g, then grid→atom (via `gslice_by_atom`)
+///
+/// Parallel structure: surface points are MPI-sharded by `average_distribution`
+/// (this rank owns [g0,g1)); chunk-level thread parallelism (Rayon; batch width
+/// ÷ thread count keeps the in-flight tensor memory peak equal to serial);
+/// the per-rank [3, natm] partial sums are combined by one sum reduction +
+/// broadcast. `dm_total` / `q_sym` are replicated and read-only on all ranks.
+///
+/// # Arguments
+/// - `dm_total`: spin-summed density matrix D [nao, nao], dimensionless (occupation-weighted sum)
+/// - `mpi_operator`: MPI context; `None` = serial/single-rank, bitwise identical to the
+///   historical serial path at one thread
+///
+/// # Returns
+/// de [3, natm]: the grad_qv gradient component, in Hartree/Bohr
 pub fn grad_solvent_qv(
     surface: &SurfaceVdwGaussian,
     pscf: &PcmScf,
@@ -428,6 +472,7 @@ pub fn grad_solvent_qv(
     dm_total: &MatrixFull<f64>,
     natm: usize,
     nao: usize,
+    mpi_operator: &Option<crate::mpi_io::MPIOperator>,
 ) -> MatrixFull<f64> {
     let _t = Instant::now();
     let grid_coords = &surface.surface_calc.grid_coords;
@@ -443,48 +488,74 @@ pub fn grad_solvent_qv(
     // Chunk size: keep ~500 MB per batch
     let chunk = ((500_000_000.0 / (3.0 * nao as f64 * nao as f64 * 8.0)) as usize)
         .max(16).min(ngrids);
+    // Thread-parallel: T workers each hold one in-flight chunk tensor [nao,nao,nc,3];
+    // batch width ÷ T keeps the in-flight memory peak equal to serial
+    // (single-threaded: chunk unchanged, results bitwise identical)
+    let nthreads = rayon::current_num_threads();
+    let chunk = (chunk / nthreads.max(1)).max(16).min(ngrids);
+
+    // MPI: surface point range [g0, g1) owned by this rank; (0, ngrids) when serial
+    let (g0, g1) = local_grid_range(ngrids, mpi_operator);
+
+    // This rank's chunk table [p0, p1), covering [g0, g1); shared by Part A/B
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    let mut p0 = g0;
+    while p0 < g1 {
+        let p1 = (p0 + chunk).min(g1);
+        chunks.push((p0, p1));
+        p0 = p1;
+    }
 
     // ---- Part A : int3c2e_ip1  (derivative w.r.t. AO centres μ, ν) ----
     // dvj_ao[(t, i)] = ∫ Σ_{μ,ν} D_{μν} · ∂(μν|g)/∂R_i[t]
     let mut dvj_ao = MatrixFull::<f64>::new([3, nao], 0.0);
 
-    let mut p0 = 0;
-    while p0 < ngrids {
-        let p1 = (p0 + chunk).min(ngrids);
-        let nc = p1 - p0;
-        let grid_coords_chunk = &grid_coords[p0..p1];
-        let mut charge_exp_chunk = Vec::with_capacity(p1 - p0);
-        for &x in &charge_exp[p0..p1] {
-            charge_exp_chunk.push(x * x);
-        }
-        let fake = CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk.as_slice());
+    // Chunk-level thread parallelism: each chunk independently produces a partial sum dvj_c;
+    // collect preserves order (IndexedParallelIterator) → fold order = ascending chunk, deterministic
+    let partials: Vec<MatrixFull<f64>> = chunks
+        .par_iter()
+        .map(|&(p0, p1)| {
+            let nc = p1 - p0;
+            let grid_coords_chunk = &grid_coords[p0..p1];
+            let mut charge_exp_chunk = Vec::with_capacity(p1 - p0);
+            for &x in &charge_exp[p0..p1] {
+                charge_exp_chunk.push(x * x);
+            }
+            let fake = CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk.as_slice());
 
-        let (raw, sh) =
-            CINTR2CDATA::integrate_cross("int3c2e_ip1", [&cint, &cint, &fake], None, None).into();
-        // shape [nao, nao, nc, 3], column-major: index = i + nao*j + nao*nao*gi + nao*nao*nc*t
-        let np: usize = sh.iter().product();
-        if np == nao * nao * nc * 3 && sh.len() >= 3 {
-            let n3 = sh.last().copied().unwrap_or(3) as usize;
-            if n3 == 3 {
-                for t in 0..3 {
-                    for gi in 0..nc {
-                        let g_idx = p0 + gi;
-                        let qv = q_sym[(g_idx, 0)];
-                        if qv.abs() < 1e-15 { continue; }
-                        let base_tgi = nao * nao * (gi + nc * t);
-                        for j in 0..nao {
-                            let base_j = base_tgi + j * nao;
-                            for i in 0..nao {
-                                let dmv = dm_total[(i, j)];
-                                if dmv.abs() < 1e-15 { continue; }
-                                dvj_ao[(t, i)] += raw[base_j + i] * dmv * qv;
+            let (raw, sh) =
+                CINTR2CDATA::integrate_cross("int3c2e_ip1", [&cint, &cint, &fake], None, None).into();
+            // shape [nao, nao, nc, 3], column-major: index = i + nao*j + nao*nao*gi + nao*nao*nc*t
+            let mut dvj_c = MatrixFull::<f64>::new([3, nao], 0.0);   // partial sum of this chunk
+            let np: usize = sh.iter().product();
+            if np == nao * nao * nc * 3 && sh.len() >= 3 {
+                let n3 = sh.last().copied().unwrap_or(3) as usize;
+                if n3 == 3 {
+                    for t in 0..3 {
+                        for gi in 0..nc {
+                            let g_idx = p0 + gi;
+                            let qv = q_sym[(g_idx, 0)];
+                            if qv.abs() < 1e-15 { continue; }
+                            let base_tgi = nao * nao * (gi + nc * t);
+                            for j in 0..nao {
+                                let base_j = base_tgi + j * nao;
+                                for i in 0..nao {
+                                    let dmv = dm_total[(i, j)];
+                                    if dmv.abs() < 1e-15 { continue; }
+                                    dvj_c[(t, i)] += raw[base_j + i] * dmv * qv;
+                                }
                             }
                         }
                     }
                 }
             }
+            dvj_c
+        })
+        .collect();
+    for pdv in partials {                                   // serial fold, order = ascending chunk
+        for t in 0..3 {
+            for i in 0..nao { dvj_ao[(t, i)] += pdv[(t, i)]; }
         }
-        p0 = p1;
     }
 
     // Reduce AO → atoms ;  factor 2 for μ+ν symmetry
@@ -500,45 +571,56 @@ pub fn grad_solvent_qv(
 
     // ---- Part B : int3c2e_ip2  (derivative w.r.t. grid centres) ----
     // dq_grid[(g, t)] = Σ_{μ,ν} D_{μν} · ∂(μν|g)/∂R_g[t] · q_sym[g]
+    // dq_grid keeps its full size [ngrids, 3]: this rank fills only rows [g0,g1),
+    // the rest stay zero, so the grid→atom reduction below (summing over full
+    // gslice ranges) needs no ownership-intersection handling
     let mut dq_grid = MatrixFull::<f64>::new([ngrids, 3], 0.0);
 
-    p0 = 0;
-    while p0 < ngrids {
-        let p1 = (p0 + chunk).min(ngrids);
-        let nc = p1 - p0;
-        let grid_coords_chunk = &grid_coords[p0..p1];
-        let mut charge_exp_chunk = Vec::with_capacity(p1 - p0);
-        for &x in &charge_exp[p0..p1] {
-            charge_exp_chunk.push(x * x);
-        }
-        let fake = CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk.as_slice());
+    // Same chunk table as Part A; partial sums are (chunk start, point count, local rows [nc,3])
+    let partials_b: Vec<(usize, usize, MatrixFull<f64>)> = chunks
+        .par_iter()
+        .map(|&(p0, p1)| {
+            let nc = p1 - p0;
+            let grid_coords_chunk = &grid_coords[p0..p1];
+            let mut charge_exp_chunk = Vec::with_capacity(p1 - p0);
+            for &x in &charge_exp[p0..p1] {
+                charge_exp_chunk.push(x * x);
+            }
+            let fake = CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk.as_slice());
 
-        let (raw, sh) =
-            CINTR2CDATA::integrate_cross("int3c2e_ip2",
-                                          [&cint, &cint, &fake], None, None).into();
-        // shape [nao, nao, nc, 3], column-major: index = i + nao*j + nao*nao*gi + nao*nao*nc*t
-        let np: usize = sh.iter().product();
-        if np == nao * nao * nc * 3 && sh.len() >= 3 {
-            let n3 = sh.last().copied().unwrap_or(3) as usize;
-            if n3 == 3 {
-                for t in 0..3 {
-                    for gi in 0..nc {
-                        let g_idx = p0 + gi;
-                        let qv = q_sym[(g_idx, 0)];
-                        let base_tgi = nao * nao * (gi + nc * t);
-                        for j in 0..nao {
-                            let base_j = base_tgi + j * nao;
-                            for i in 0..nao {
-                                let dmv = dm_total[(i, j)];
-                                if dmv.abs() < 1e-15 { continue; }
-                                dq_grid[(g_idx, t)] += raw[base_j + i] * dmv * qv;
+            let (raw, sh) =
+                CINTR2CDATA::integrate_cross("int3c2e_ip2",
+                                              [&cint, &cint, &fake], None, None).into();
+            // shape [nao, nao, nc, 3], column-major: index = i + nao*j + nao*nao*gi + nao*nao*nc*t
+            let mut dq_c = MatrixFull::<f64>::new([nc, 3], 0.0);   // partial sum of this chunk (local rows)
+            let np: usize = sh.iter().product();
+            if np == nao * nao * nc * 3 && sh.len() >= 3 {
+                let n3 = sh.last().copied().unwrap_or(3) as usize;
+                if n3 == 3 {
+                    for t in 0..3 {
+                        for gi in 0..nc {
+                            let g_idx = p0 + gi;
+                            let qv = q_sym[(g_idx, 0)];
+                            let base_tgi = nao * nao * (gi + nc * t);
+                            for j in 0..nao {
+                                let base_j = base_tgi + j * nao;
+                                for i in 0..nao {
+                                    let dmv = dm_total[(i, j)];
+                                    if dmv.abs() < 1e-15 { continue; }
+                                    dq_c[(gi, t)] += raw[base_j + i] * dmv * qv;
+                                }
                             }
                         }
                     }
                 }
             }
+            (p0, nc, dq_c)
+        })
+        .collect();
+    for (p0, nc, pdq) in partials_b {                       // serial fold, order = ascending chunk
+        for t in 0..3 {
+            for gi in 0..nc { dq_grid[(p0 + gi, t)] += pdq[(gi, t)]; }
         }
-        p0 = p1;
     }
 
     // Reduce grid → atoms
@@ -554,6 +636,22 @@ pub fn grad_solvent_qv(
 
     let mut de = MatrixFull::<f64>::new([3, natm], 0.0);
     for a in 0..natm { for t in 0..3 { de[(t, a)] = de_ip1[(t, a)] + de_ip2[(t, a)]; } }
+
+    // MPI: each rank accumulated only its local surface points [g0,g1);
+    // sum-reduce [3, natm] + broadcast so all ranks hold the complete grad_qv
+    // (same pattern as the reductions in grad/rhf.rs calc_de_jk).
+    // `MatrixFull` is column-major contiguous, so `data` is the flat storage.
+    #[cfg(feature = "mpi")]
+    if let Some(mpi_op) = mpi_operator {
+        let mut tot = crate::mpi_io::mpi_reduce(
+            &mpi_op.world,
+            &de.data,
+            0,
+            &mpi::collective::SystemOperation::sum(),
+        );
+        crate::mpi_io::mpi_broadcast_vector(&mpi_op.world, &mut tot, 0);
+        de = MatrixFull::from_vec([3, natm], tot).unwrap();
+    }
     de
 }
 
@@ -587,7 +685,6 @@ struct SolverAux {
 /// - `q_sym`:   symmetrized apparent surface charges \[ngrids, 1\]
 /// - `method`:  PCM method (controls which vectors to compute)
 ///
-/// Ref: `grad_solver_derivation.md` §11 预计算向量汇总
 fn compute_solver_aux(
     pstatic: &PcmStatic,
     v_grids: &[f64],
@@ -662,7 +759,6 @@ fn compute_solver_aux(
 /// # Returns
 /// `de` shape [3, natm] — raw geometric contribution, **no prefactor**.
 ///
-/// Ref: `grad_solver_derivation.md` §5 链式法则
 fn antisym_chain_rule(
     u: &[f64],
     dm: &[MatrixFull<f64>],
@@ -713,7 +809,6 @@ fn antisym_chain_rule(
 /// # Returns
 /// `de` shape [3, natm] — raw geometric contribution, **no prefactor**.
 ///
-/// Ref: `grad_solver_derivation.md` §7 对角元修正
 fn diag_s_correction(
     u_mul_q: &[f64],
     dsii_df: &[f64],
@@ -749,7 +844,6 @@ fn diag_s_correction(
 /// # Returns
 /// `de` shape [3, natm] — raw geometric contribution, **no prefactor**.
 ///
-/// Ref: `grad_solver_derivation.md` §9.3 项 3
 fn da_contract(
     w: &[f64],
     da: &MatrixFull<f64>,
@@ -775,7 +869,6 @@ fn da_contract(
 // Each function returns the raw geometric contribution (no ½, no α/γ).
 // Prefactors are applied by the caller in grad_solvent_solver.
 //
-// Ref: design spec §5, derivation §9–§10
 // ============================================================================
 
 /// `de_dS0`: pure S‑matrix derivative contribution.
@@ -786,7 +879,6 @@ fn da_contract(
 ///
 /// Used by all PCM methods. Caller applies ½ prefactor.
 ///
-/// Ref: `grad_solver_derivation.md` §9.3 项 1
 pub fn compute_de_ds0(
     vk1: &[f64],
     q_sym: &MatrixFull<f64>,
@@ -823,7 +915,6 @@ pub fn compute_de_ds0(
 ///
 /// `w` = A⊙v (dR part) or A⊙Sq (dK part). Caller applies ½ prefactor.
 ///
-/// Ref: `grad_solver_derivation.md` §9.3 项 2
 pub fn compute_de_dd(
     vk1: &[f64],
     dd: &[MatrixFull<f64>],
@@ -842,7 +933,6 @@ pub fn compute_de_dd(
 ///
 /// `weight` = vk1_D⊙v (dR part) or vk1_D⊙Sq (dK part). Caller applies ½ prefactor.
 ///
-/// Ref: `grad_solver_derivation.md` §9.3 项 3
 pub fn compute_de_da(
     weight: &[f64],
     da: &MatrixFull<f64>,
@@ -859,7 +949,6 @@ pub fn compute_de_da(
 ///
 /// vk1_da = vk1^T·D·A  (pre‑computed in SolverAux). Caller applies ½ prefactor.
 ///
-/// Ref: `grad_solver_derivation.md` §9.3 项 4
 pub fn compute_de_ds1(
     vk1_da: &[f64],
     q_sym: &MatrixFull<f64>,
@@ -895,7 +984,6 @@ pub fn compute_de_ds1(
 ///
 /// ADT_q = A ⊙ (D^T·q). Caller applies ½ prefactor.
 ///
-/// Ref: `grad_solver_derivation.md` §10.3 de_dS1_T
 pub fn compute_de_ds1_t(
     vk1: &[f64],
     adt_q: &[f64],
@@ -929,7 +1017,6 @@ pub fn compute_de_ds1_t(
 ///
 /// vk1_sa = vk1^T·S·A. Caller applies ½ prefactor.
 ///
-/// Ref: `grad_solver_derivation.md` §10.3 de_dD_T
 pub fn compute_de_dd_t(
     vk1_sa: &[f64],
     q_sym: &MatrixFull<f64>,
@@ -975,7 +1062,6 @@ pub fn compute_de_dd_t(
 /// vk1_S = vk1^T·S,  DT_q = D^T·q  (pre‑computed in SolverAux).
 /// Caller applies ½ prefactor.
 ///
-/// Ref: `grad_solver_derivation.md` §10.3 de_dA_T
 pub fn compute_de_da_t(
     weight: &[f64],
     da: &MatrixFull<f64>,
@@ -1252,7 +1338,13 @@ fn format_grad_component(label: &str, g: &MatrixFull<f64>, elem: &[String]) -> S
 /// Compute the full PCM solvent gradient = grad_nuc + grad_qv + grad_solver.
 ///
 /// Returns `[3, natm]` force contribution from the implicit solvent model.
-pub fn compute_solvent_gradient(scf_data: &SCF) -> MatrixFull<f64> {
+/// PCM 溶剂梯度总装：de = de_nuc + de_qv + de_solver + de_cds（分量定义见模块 `//!` 文档）。
+/// `mpi_operator` 仅透传给 `grad_solvent_qv` 做表面点 MPI 分片；
+/// de_nuc / de_solver / de_cds 为便宜项，各 rank 冗余计算，不影响结果。
+pub fn compute_solvent_gradient(
+    scf_data: &SCF,
+    mpi_operator: &Option<crate::mpi_io::MPIOperator>,
+) -> MatrixFull<f64> {
     let t0 = Instant::now();
     let pcm_obj = scf_data.solvent_static_obj.as_ref()
         .expect("compute_solvent_gradient: solvent_static_obj missing");
@@ -1285,7 +1377,7 @@ pub fn compute_solvent_gradient(scf_data: &SCF) -> MatrixFull<f64> {
     println!("--- PCM gradient components ---");
 
     let de_nuc    = grad_solvent_nuc(surface, pscf, &scf_data.mol, natm);
-    let de_qv     = grad_solvent_qv(surface, pscf, &scf_data.mol, &dm_tot, natm, nao);
+    let de_qv     = grad_solvent_qv(surface, pscf, &scf_data.mol, &dm_tot, natm, nao, mpi_operator);
     let de_solver = grad_solvent_solver(surface, pstatic, pscf, method, natm);
 
     println!("  grad_nuc    done  (min={:12.6e}, max={:12.6e}, rms={:12.6e})",
@@ -1427,7 +1519,7 @@ mod tests {
         let w = vec![2.0, 3.0];
         let mut da = MatrixFull::<f64>::new([ngrids, natm * 3], 0.0);
         da[(0, 0)] = 0.5;  // dA0/dR0^x
-        da[(1, 3)] = 1.0;  // dA1/dR1^z
+        da[(1, 5)] = 1.0;  // dA1/dR1^z  (列 = a*3 + xyz = 1*3 + 2)
 
         let de = da_contract(&w, &da, natm);
 
