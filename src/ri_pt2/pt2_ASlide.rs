@@ -1091,7 +1091,7 @@ where
 
         // ── 7. One-time prefetch barrier ───────────────────────────────
         if step == 0 {
-            mpi_op.world.barrier();
+            portal.service_aware_barrier();
         }
         step += 1;
     }

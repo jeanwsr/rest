@@ -82,16 +82,18 @@ impl<'a> ServicePortal<'a> {
                 &mut recv_req,
             );
 
-            ffi::MPI_Send(
+            ffi::MPI_Isend(
                 &blk as *const i32 as *const c_void,
                 1,
                 ffi::RSMPI_INT32_T,
                 owner,
                 TAG_REQUEST,
                 self.mpi_op.world.as_raw(),
+                &mut send_req;
             );
         }
         self.pending_fetch_requests.push(recv_req);
+        self.pending_fetch_requests.push(send_req);
 
     }
 
@@ -195,6 +197,33 @@ impl<'a> ServicePortal<'a> {
                     ffi::RSMPI_STATUS_IGNORE,
                 );
             }
+        }
+    }
+
+    pub fn service_aware_barrier(&mut self) {
+        let mut req: ffi::MPI_Request = unsafe { mem::zeroed() };
+        unsafe {
+            ffi::MPI_Ibarrier(self.mpi_op.world.as_raw(), &mut req);
+        }
+        loop {
+            // Drain incoming block requests while waiting for the barrier.
+            self.service();
+    
+            let mut flag: i32 = 0;
+            unsafe {
+                ffi::MPI_Test(
+                    &mut req as *mut ffi::MPI_Request,
+                    &mut flag,
+                    ffi::RSMPI_STATUS_IGNORE,
+                );
+            }
+            if flag != 0 {
+                // Barrier complete; drain once more to catch requests that
+                // arrived just before the barrier fired.
+                self.service();
+                break;
+            }
+            std::thread::yield_now();
         }
     }
 
