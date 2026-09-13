@@ -901,20 +901,21 @@ pub fn vj_upper_rimatr_batched(
     out
 }
 
-pub fn gen_vind_opt(
+/// Core of [`gen_vind_opt`]: the full symmetric AO response matrix
+/// `v_ao = 2J(dm1) - hyb*K(dm1) + fxc(dm1)` (closed shell) without projecting
+/// it back to the occupied/virtual blocks.
+pub fn response_ao_core(
     scf: &SCF,
     ws: &VindWorkspace,
     z_vo: &[f64],  // active VO block, flat [i + a*nocc] (nvir * nocc)
     fxc_cache: Option<&FxcHessianCache>,
     z_oo: Option<&[f64]>,  // occ-occ block, flat [i + j*nocc]
     z_fo: Option<&[f64]>,  // frozen-occ block, flat [i + k*nocc] (nfrozen * nocc)
-) -> Vec<f64> {
-    // Returns: [frozen_response (nfrozen*nocc), VO_response (nvir*nocc)] as single flat vec
+) -> MatrixFull<f64> {
     let nao = ws.nao;
     let nocc = ws.nocc;
     let nvir = ws.nvir;
     let nfrozen = ws.nfrozen;
-    let dim = ws.dim;
 
     // ── Step 1: Build AO density matrix: VO contribution ──
     let mut z_scaled = MatrixFull::new([nvir, nocc], 0.0);
@@ -1018,6 +1019,25 @@ pub fn gen_vind_opt(
         }}
     }
 
+    v_ao
+}
+
+/// Full response vector `[frozen_response (nfrozen*nocc), VO_response (nvir*nocc)]`.
+pub fn gen_vind_opt(
+    scf: &SCF,
+    ws: &VindWorkspace,
+    z_vo: &[f64],
+    fxc_cache: Option<&FxcHessianCache>,
+    z_oo: Option<&[f64]>,
+    z_fo: Option<&[f64]>,
+) -> Vec<f64> {
+    let nao = ws.nao;
+    let nocc = ws.nocc;
+    let nvir = ws.nvir;
+    let nfrozen = ws.nfrozen;
+    let dim = ws.dim;
+    let v_ao = response_ao_core(scf, ws, z_vo, fxc_cache, z_oo, z_fo);
+
     // ── Step 5: Project v_ao to frozen and active virtual rows ──
     // Frozen row projection: C_occ^T @ v_ao @ C_frozen → [nocc, nfrozen]
     // VO row projection: C_occ^T @ v_ao @ C_vir → [nocc, nvir]
@@ -1071,7 +1091,8 @@ pub fn gen_vind_opt_batched(
     if n_rhs == 0 { return Vec::new(); }
     // Low-rank K applies only when dm1 is the pure VO low-rank form
     // (no OO/FO blocks) and there are no frozen orbitals to project onto.
-    let use_lowrank_k = k_lowrank.is_some()
+    let use_lowrank_k = std::env::var("REST_CPHF_NO_LOWRANK_K").is_err()
+        && k_lowrank.is_some()
         && z_oo_batch.is_none()
         && z_fo_batch.is_none()
         && nfrozen == 0;

@@ -55,6 +55,9 @@ pub struct TDDFTParameters {
     /// basis sets are supported (the PySOC export is always written in
     /// Cartesian format; REST transforms spheric MOs when necessary).
     pub pysoc: bool,
+    /// 1-based excited-state index for which the analytic nuclear gradient is
+    /// computed; 0 disables the TDDFT gradient.
+    pub tddft_grad_state: usize,
 }
 
 /// Default Davidson subspace size for the TDDFT eigen-solvers.
@@ -115,6 +118,7 @@ impl Default for TDDFTParameters {
             tddft_use_optimized_fxc: true,
             tddft_cutoff_energy: 1.0e6,
             pysoc: false,
+            tddft_grad_state: 0,
         }
     }
 }
@@ -313,6 +317,10 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
             p.pysoc = match tmp_ctrl.get("pysoc").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(b) => *b,
                 _ => false,
+            };
+            p.tddft_grad_state = match tmp_ctrl.get("tddft_grad_state").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+                _ => 0,
             };
             Ok(Some(p))
         },

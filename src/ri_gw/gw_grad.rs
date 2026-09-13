@@ -292,6 +292,58 @@ impl RawRiTensors {
     /// shared by its three Cartesian components.  The total integral work
     /// summed over atoms equals one full `dI1`/`dI2` build, but only one
     /// atom's blocks are resident at a time.
+    /// Atom-sliced `int3c2e_ip1` block only (AO-derivative tables).  The caller
+    /// usually needs either the `ip1` or the `ip2` block; evaluating both every
+    /// time doubles the integral cost for no reason.
+    pub fn d1_blocks(&self, atm: usize) -> AtomDerivBlocks {
+        let row = self.ao_range[atm];
+        let nrow = row[1] - row[0];
+        let aux_r = self.aux_range[atm];
+        let shls1 = [self.ao_shl_range[atm], [0, self.mol.nbas()], [0, self.auxmol.nbas()]];
+        let (d1, shape1) = CInt::integrate_cross(
+            "int3c2e_ip1",
+            [&self.mol, &self.mol, &self.auxmol],
+            "s1",
+            &shls1,
+        )
+        .into();
+        assert_eq!(shape1, vec![nrow, self.nao, self.naux, 3], "sliced int3c2e_ip1 shape");
+        AtomDerivBlocks {
+            d1,
+            d2: Vec::new(),
+            atm,
+            row0: row[0],
+            nrow,
+            naux_a: aux_r[1] - aux_r[0],
+            aux0: aux_r[0],
+        }
+    }
+
+    /// Atom-sliced `int3c2e_ip2` block only (auxiliary-basis derivative).
+    pub fn d2_blocks(&self, atm: usize) -> AtomDerivBlocks {
+        let row = self.ao_range[atm];
+        let aux_r = self.aux_range[atm];
+        let naux_a = aux_r[1] - aux_r[0];
+        let shls2 = [[0, self.mol.nbas()], [0, self.mol.nbas()], self.aux_shl_range[atm]];
+        let (d2, shape2) = CInt::integrate_cross(
+            "int3c2e_ip2",
+            [&self.mol, &self.mol, &self.auxmol],
+            "s1",
+            &shls2,
+        )
+        .into();
+        assert_eq!(shape2, vec![self.nao, self.nao, naux_a, 3], "sliced int3c2e_ip2 shape");
+        AtomDerivBlocks {
+            d1: Vec::new(),
+            d2,
+            atm,
+            row0: row[0],
+            nrow: row[1] - row[0],
+            naux_a,
+            aux0: aux_r[0],
+        }
+    }
+
     pub fn d_atom_blocks(&self, atm: usize) -> AtomDerivBlocks {
         let row = self.ao_range[atm];
         let nrow = row[1] - row[0];

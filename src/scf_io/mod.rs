@@ -113,6 +113,10 @@ pub struct SCF {
     pub algorithm_jk: AlgorithmJK,
     pub solvent_static_obj: Option<PcmObject>,
     pub solvent_scf: Option<PcmScf>,
+    /// Raw TDDFT eigenvectors from the last `tddft_main` call:
+    /// `(excitation energy, eigenvector)` in the solver's ordering.  Used by
+    /// the TDDFT analytic-gradient driver.
+    pub tddft_excitations: Option<Vec<(f64, Vec<f64>)>>,
 }
 
 #[derive(Clone,Copy)]
@@ -174,6 +178,7 @@ impl SCF {
             algorithm_jk: AlgorithmJK::Default,
             solvent_static_obj: None,
             solvent_scf: None,
+            tddft_excitations: None,
         };
 
         // at first check the scf type: RHF, ROHF or UHF

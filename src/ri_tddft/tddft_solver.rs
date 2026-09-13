@@ -35,6 +35,10 @@ use log::warn;
 pub struct TddftOutput {
     pub energies: Vec<f64>,
     pub osc: Vec<f64>,
+    /// `(excitation energy, eigenvector)` pairs, in the solver's own ordering.
+    /// The eigenvector is the raw Davidson/dense vector (length `dim` for TDA,
+    /// `2*dim` for full LR); callers normalise it with `dipoles::normalize`.
+    pub excitations: Vec<(f64, Vec<f64>)>,
 }
 
 /// Dense full-LR eigenpairs via the symmetrized Casida reduction (mirrors the
@@ -557,13 +561,13 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
 
         println!("TDDFT (both spins) calculation completed successfully.");
         println!("TDDFT calculation completed successfully.");
-        Ok(TddftOutput { energies, osc })
+        Ok(TddftOutput { energies, osc, excitations: eigenpairs_singlet })
     } else {
         // ── Single spin ──
-        let (_eigenpairs, energies, osc) = run_spin(xlet, &initial_guess);
+        let (eigenpairs, energies, osc) = run_spin(xlet, &initial_guess);
         println!("The first excitation obtained by TDDFT is {}", energies[0]);
         println!("TDDFT calculation completed successfully.");
-        Ok(TddftOutput { energies, osc })
+        Ok(TddftOutput { energies, osc, excitations: eigenpairs })
     }
 }
 
@@ -753,6 +757,7 @@ fn tddft_main_unrestricted(
     Ok(TddftOutput {
         energies: energies_all,
         osc: osc_all,
+        excitations: eigenpairs_all,
     })
 }
 
