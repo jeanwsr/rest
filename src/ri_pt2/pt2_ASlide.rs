@@ -52,9 +52,7 @@ use rayon::iter::ParallelIterator;
  Scope
  -----
  PT2 family only. SBGE2 / SCSRPA are not wired in and are marked
- unreachable! in the dispatch. The ROHF single-excitation (CIS-like) term is
- deliberately not folded into pt2_c[0] in this driver; it is a known debug
- stub, not a bug.
+ unreachable! in the dispatch. 
  
  MPI safety
  ----------
@@ -88,15 +86,6 @@ use rayon::iter::ParallelIterator;
                  MPI_Abort branch in ServicePortal::service.  Result: hard
                  job abort, not a numerical error.
  
-     Fix (must be applied before this driver is enabled for UHF/ROHF):
-     insert an MPI_Barrier between each pair of adjacent phases, OR
-     generalize the OS approach — use one ServicePortal::new_split(α, β,
-     num_block) across all three phases and generate the ββ schedule with
-     block_j_offset = num_block so all three ID spaces are disjoint.
- 
-     Until this is done, keep use_ASlide = false for open-shell systems, or
-     add an explicit `if scf_data.scftype == SCFType::ROHF/UHF { return
-     false }` gate to check_conditions_ASlide.
  
  Kernel-size tuning on HPC — UNRESOLVED
  --------------------------------------
