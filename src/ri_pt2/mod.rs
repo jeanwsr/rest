@@ -3093,6 +3093,13 @@ fn check_conditions_ASlide(
     global_use_ASlide
 }
 
+
+// Note on MPI safety: only a single sliding phase runs here (no αα/ββ/OS
+// split), there is exactly one block store, and the two Allreduce calls
+// below act as a hard synchronization point at function exit.  No barrier
+// between phases is needed.  This is NOT true for the open-shell driver,
+// which runs three phases and requires barriers (or disjoint virtual IDs)
+// between them.
 #[cfg(feature = "mpi")]
 pub fn close_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
     if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
@@ -3151,6 +3158,11 @@ pub fn close_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Optio
     }
 }
 
+// All three phases (αα, ββ, OS) generate schedules with their own virtual-ID
+// space.  αα and ββ both use IDs 0..num_block, and ββ's portal cannot resolve
+// OS's num_block..2*num_block range.  Barrier between phases so no rank
+// enters phase N+1 while a peer is still answering phase N.  See commit
+// message for the failure modes (silent wrong energy αα→ββ, MPI_Abort ββ→OS).
 #[cfg(feature = "mpi")]
 pub fn open_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
     if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
@@ -3218,15 +3230,17 @@ pub fn open_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Option
             let term_aa = computation_ss_aslide(mpi_op, &redistributed_alpha_rimo, &ctx,
                                                 n0_global, n1_global, n2_global,
                                                 alpha_eigenvalues, alpha_occupation, occ_range.start, vir_range.start, alpha_num_occu);
+            mpi_op.world.barrier();
             let term_bb = computation_ss_aslide(mpi_op, &redistributed_beta_rimo, &ctx,
                                                 n0_global, n1_global, n2_global,
                                                 beta_eigenvalues, beta_occupation, occ_range.start, vir_range.start, beta_num_occu);
+            mpi_op.world.barrier();
             let local_ss = term_aa + term_bb;
             let local_os = computation_os_aslide(mpi_op, &redistributed_alpha_rimo, &redistributed_beta_rimo, &ctx,
                                                 n0_global, n1_global, n2_global,
                                                 alpha_eigenvalues, beta_eigenvalues, alpha_occupation, beta_occupation,
                                                 occ_range.start, vir_range.start, alpha_num_occu, beta_num_occu);
-
+            mpi_op.world.barrier();
             mpi_op.world.all_reduce_into(&local_os, &mut global_os, SystemOperation::sum());
             mpi_op.world.all_reduce_into(&local_ss, &mut global_ss, SystemOperation::sum());
 
@@ -3305,15 +3319,17 @@ pub fn restricted_open_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operat
             let term_aa = computation_ss_aslide(mpi_op, &redistributed_alpha_rimo, &ctx,
                                                 n0_global, n1_global, n2_global,
                                                 alpha_eigenvalues, alpha_occupation, occ_range.start, vir_range.start, alpha_num_occu);
+            mpi_op.world.barrier();
             let term_bb = computation_ss_aslide(mpi_op, &redistributed_beta_rimo, &ctx,
                                                 n0_global, n1_global, n2_global,
                                                 beta_eigenvalues, beta_occupation, occ_range.start, vir_range.start, beta_num_occu);
+            mpi_op.world.barrier();
             let local_ss = term_aa + term_bb;
             let local_os = computation_os_aslide(mpi_op, &redistributed_alpha_rimo, &redistributed_beta_rimo, &ctx,
                                                 n0_global, n1_global, n2_global,
                                                 alpha_eigenvalues, beta_eigenvalues, alpha_occupation, beta_occupation,
                                                 occ_range.start, vir_range.start, alpha_num_occu, beta_num_occu);
-
+            mpi_op.world.barrier();
             mpi_op.world.all_reduce_into(&local_os, &mut global_os, SystemOperation::sum());
             mpi_op.world.all_reduce_into(&local_ss, &mut global_ss, SystemOperation::sum());
 
