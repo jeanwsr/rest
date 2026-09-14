@@ -1,6 +1,7 @@
 use super::prelude::*;
 use crate::analdrv::vib::*;
 use crate::analdrv::vib_interface::*;
+use crate::dftd::hess::HessDFTD;
 use crate::ri_jk::util::{get_cint_aux, get_cint_mol};
 use crate::SCF;
 
@@ -38,7 +39,17 @@ pub fn uscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
     let mut hess_nuc_repl_obj = HessNucRepl::new(&mol, &device);
     let mut hess_hcore_obj = UHessHcore::new(&mol, &device);
 
-    let hess_nuc_list: Vec<&mut dyn HessNucAPI> = vec![&mut hess_nuc_repl_obj];
+    let mut hess_nuc_list: Vec<&mut dyn HessNucAPI> = vec![&mut hess_nuc_repl_obj];
+
+    // --- empirical dispersion (DFTD3/DFTD4) --- //
+
+    // The dispersion energy is independent of the density matrix (nuclear-like term). Its
+    // Hessian is evaluated numerically from the analytic dispersion gradient, and is only
+    // added if empirical dispersion is specified in the input.
+    let mut hess_dftd_obj = HessDFTD::new(mol_obj, config.dftd_hess_step);
+    if let Some(ref mut hess_dftd_obj) = hess_dftd_obj {
+        hess_nuc_list.push(hess_dftd_obj);
+    }
     let hess_hcore_list: Vec<&mut dyn UHessCoreAPI> = vec![&mut hess_hcore_obj];
     let mut hess_el_list: Vec<&mut dyn UHessElecInteractAPI> = Vec::new();
 
@@ -48,9 +59,13 @@ pub fn uscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
 
     let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
     let scale_j = 1.0;
+    // For range-separated hybrids the exchange is decomposed as (same as the SCF Fock assembly)
+    //   K = alpha * K_full - (alpha - hyb) * K_erfc,
+    // so the full-range object carries the long-range coefficient `alpha`, and the short-range
+    // correction is a separate object evaluated below.
     let scale_k = match is_hf {
         true => 1.0,
-        false => scf_data.mol.xc_data.dfa_hybrid_scf,
+        false => scf_data.mol.xc_data.rsh_alpha().unwrap_or(scf_data.mol.xc_data.dfa_hybrid_scf),
     };
     let j2c_decomp_option = &scf_data.mol.ctrl.j2c_decomp;
     let j2c_decomp = crate::ri_jk::get_j2c_decomp(&aux, &device, *j2c_decomp_option);
@@ -65,6 +80,34 @@ pub fn uscf_hess_interface(scf_data: &SCF, config: &AnalDrvConfig) -> (Vec<f64>,
     };
 
     hess_el_list.push(&mut hess_rijk_obj);
+
+    // --- RI-JK short-range part (range-separated hybrids) --- //
+
+    // The short-range exchange correction -(alpha - hyb) * K_erfc is evaluated by a second
+    // RI-JK Hessian object reusing the same implementation as the full-range one: the object
+    // carries mol/aux clones holding the (negative) omega, so all its derivative integrals
+    // are short-range (erfc kernel), and the cderi is the incore `rimatr_sr` built in the SCF.
+    // There is no short-range Coulomb contribution (factor_j = 0).
+    let mut hess_rijk_sr_obj = scf_data.mol.xc_data.omega().map(|omega| {
+        let alpha = scf_data.mol.xc_data.rsh_alpha().unwrap();
+        let hyb = scf_data.mol.xc_data.dfa_hybrid_scf;
+        let (mut mol_sr, mut aux_sr) = (mol.clone(), aux.clone());
+        // negative omega in libcint's convention evaluates the short-range erfc kernel
+        mol_sr.set_omega(-omega);
+        aux_sr.set_omega(-omega);
+        if let Some((rimatr_sr, _, _)) = &scf_data.rimatr_sr {
+            let cderi_sr = rimatr_sr.to_rstsr_view(&device).into_cow();
+            let j2c_decomp_sr = crate::ri_jk::get_j2c_decomp(&aux_sr, &device, *j2c_decomp_option);
+            UHessRIJK::new_with_cderi(&mol_sr, &aux_sr, 0.0, hyb - alpha, cderi_sr, j2c_decomp_sr)
+        } else {
+            panic!(
+                "The range-separated Hessian requires the short-range ERI (rimatr_sr) to be built and stored in memory."
+            )
+        }
+    });
+    if let Some(ref mut hess_rijk_sr_obj) = hess_rijk_sr_obj {
+        hess_el_list.push(hess_rijk_sr_obj);
+    }
 
     // --- DFT --- //
 

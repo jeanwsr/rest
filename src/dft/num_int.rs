@@ -694,9 +694,7 @@ fn prepare_fxc_data_impl(
     }
 
     // ── Project MO values onto grids ──
-    // mo_occ[i,g] = Σ_p C_occ[p,i] × ao[p,g]
-    // mo_vir[a,g] = Σ_p C_vir[p,a] × ao[p,g]
-    // In BLAS: mo_occ = C_occ^T × ao
+    // mo_occ[i,g] = Σ_p C_occ[p,i] × ao[p,g]; mo_vir[a,g] = Σ_p C_vir[p,a] × ao[p,g]
     let mut mo_occ = MatrixFull::new([occ_size, ngrids], 0.0);
     _dgemm_full(&c_occ, 'T', ao, 'N', &mut mo_occ, 1.0, 0.0);
 

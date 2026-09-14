@@ -19,6 +19,7 @@ use crate::utilities;
 // use rayon::ThreadPoolBuilder;
 use crate::scf_io::occupation::OCCType;
 use tensors::matrix_blas_lapack::omp_set_num_threads_global_wrapper;
+use crate::solvent::surface_utils::SmdCavityRadii;
 use crate::solvent::{PcmMethod, RadiusScheme};
 use crate::x2c::RelativisticMethod;
 use serde_json;
@@ -292,6 +293,9 @@ pub struct InputKeywords {
     pub solvent_model: PcmMethod,
     pub solv_chunk: usize,
     pub pcm_cavity_radii: RadiusScheme,
+    /// SMD cavity/CDS radii scheme: "bondi" (default, aligned with PySCF/mnsol.F) | "uff_mixed"
+    /// (non-eq.16 elements use the BONDI_UFF_RADII mixed table).
+    pub smd_cavity_radii: SmdCavityRadii,
     /// SMD solvent name (e.g. "water", "acetone"). Looked up in solvent_db.
     /// When non-empty and method==SMD, auto-populates solvent_descriptors and solv_epsilon.
     pub solvent_name: String,
@@ -416,6 +420,11 @@ pub struct InputKeywords {
     /// in MPI runs. `Auto` (default) decides by problem size; `On` forces the
     /// distributed solver; `Off` forces the serial one.
     pub hamiltonian_distributed: HamiltonianDistributedMode,
+    /// Whether the dRPA/SCSRPA response matrices are built and factorized in
+    /// distributed (ScaLAPACK block-cyclic) form under MPI. `Auto` (default):
+    /// naux >= 8192 and nproc >= 32; `On` forces the distributed path (testing);
+    /// `Off` keeps the replicated path.
+    pub rpa_distributed: HamiltonianDistributedMode,
     pub ri_pt2: RiPt2Option,
     pub hessian: Option<HessianParameters>,
     pub thermo: Option<ThermoParameters>,
@@ -587,12 +596,14 @@ impl InputKeywords {
             solvent_model: PcmMethod::CPCM,
             solv_chunk: 8,
             pcm_cavity_radii: RadiusScheme::UFF,
+            smd_cavity_radii: SmdCavityRadii::Bondi,
             solvent_name: String::new(),
             solvent_descriptors: None, 
             stop_at: None,
             xc_parser: String::from("legacy"),
             j2c_decomp: J2CDecompOption::default(),
             hamiltonian_distributed: HamiltonianDistributedMode::default(),
+            rpa_distributed: HamiltonianDistributedMode::default(),
             ri_pt2: RiPt2Option::default(),
             tddft: None,
             hessian: None,
@@ -1382,6 +1393,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 },
                 None => RadiusScheme::UFF,
             };
+            tmp_input.smd_cavity_radii = match tmp_ctrl.get("smd_cavity_radii") {
+                Some(value) => {
+                    serde_json::from_value(value.clone())?
+                },
+                None => SmdCavityRadii::Bondi,
+            };
             let has_explicit_eps = matches!(
                 tmp_ctrl.get("solv_epsilon").unwrap_or(&serde_json::Value::Null),
                 serde_json::Value::String(_) | serde_json::Value::Number(_)
@@ -1602,6 +1619,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.algorithm_k = tmp_ctrl.get("algorithm_k").map(serde_from_value).unwrap_or_default();
             tmp_input.j2c_decomp = tmp_ctrl.get("j2c_decomp").map(serde_from_value).unwrap_or_default();
             tmp_input.hamiltonian_distributed = tmp_ctrl.get("hamiltonian_distributed").map(serde_from_value).unwrap_or_default();
+            tmp_input.rpa_distributed = tmp_ctrl.get("rpa_distributed").map(serde_from_value).unwrap_or_default();
             if (tmp_input.algorithm_j != AlgorithmJ::Default || tmp_input.algorithm_k != AlgorithmK::Default) {
                 if tmp_input.algorithm_jk != AlgorithmJK::Default {
                     warn!("algorithm_j or algorithm_k are specified, the setting in algorithm_jk will be ignored.");

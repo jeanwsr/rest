@@ -557,6 +557,129 @@ pub fn grad_solvent_qv(
     de
 }
 
+/// MPI 版 `grad_solvent_qv`：格点 chunk 按 rank 均分，allreduce [3,nao] 和 [3,natm]。
+/// 通信量微不足道（3·max(nao,natm) × 8B）。
+#[cfg(feature = "mpi")]
+pub fn grad_solvent_qv_mpi(
+    surface: &SurfaceVdwGaussian,
+    pscf: &PcmScf,
+    mol: &Molecule,
+    dm_total: &MatrixFull<f64>,
+    natm: usize,
+    nao: usize,
+    mpi_operator: &Option<crate::mpi_io::MPIOperator>,
+) -> MatrixFull<f64> {
+    use mpi::collective::SystemOperation;
+    use mpi::traits::*;
+
+    let (mpi_op, mpi_ix) = match (mpi_operator, &mol.mpi_data) {
+        (Some(op), Some(ix)) => (op, ix),
+        _ => return grad_solvent_qv(surface, pscf, mol, dm_total, natm, nao),
+    };
+    let my_rank = mpi_ix.rank;
+    let nproc = mpi_ix.size;
+
+    let grid_coords = &surface.surface_calc.grid_coords;
+    let charge_exp  = &surface.surface_calc.charge_exp;
+    let gslice = &surface.gslice_by_atom;
+    let q_sym  = &pscf.q_sym;
+    let ngrids = grid_coords.len();
+    let aoslice = mol.aoslice_by_atom();
+
+    let mut cint = mol.initialize_cint(false);
+    let chunk = ((500_000_000.0 / (3.0 * nao as f64 * nao as f64 * 8.0)) as usize)
+        .max(16).min(ngrids);
+    let n_chunks = (ngrids + chunk - 1) / chunk;
+
+    // ---- Part A: int3c2e_ip1 → dvj_ao [3, nao] ----
+    let mut dvj_ao_local = MatrixFull::<f64>::new([3, nao], 0.0);
+    let mut dq_grid_local = MatrixFull::<f64>::new([ngrids, 3], 0.0);
+
+    for chunk_id in (my_rank..n_chunks).step_by(nproc) {
+        let p0 = chunk_id * chunk;
+        let p1 = (p0 + chunk).min(ngrids);
+        let nc = p1 - p0;
+        let grid_coords_chunk = &grid_coords[p0..p1];
+        let charge_exp_chunk: Vec<f64> = charge_exp[p0..p1].iter().map(|x| x * x).collect();
+        let fake = CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk.as_slice());
+
+        // Part A: ip1 (AO derivative)
+        let (raw, sh) = CINTR2CDATA::integrate_cross("int3c2e_ip1", [&cint, &cint, &fake], None, None).into();
+        let np: usize = sh.iter().product();
+        if np == nao * nao * nc * 3 && sh.len() >= 3 {
+            for t in 0..3 {
+                for gi in 0..nc {
+                    let g_idx = p0 + gi;
+                    let qv = q_sym[(g_idx, 0)];
+                    if qv.abs() < 1e-15 { continue; }
+                    let base_tgi = nao * nao * (gi + nc * t);
+                    for j in 0..nao {
+                        let base_j = base_tgi + j * nao;
+                        for i in 0..nao {
+                            let dmv = dm_total[(i, j)];
+                            if dmv.abs() < 1e-15 { continue; }
+                            dvj_ao_local[(t, i)] += raw[base_j + i] * dmv * qv;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Part B: ip2 (grid derivative)
+        let (raw2, sh2) = CINTR2CDATA::integrate_cross("int3c2e_ip2", [&cint, &cint, &fake], None, None).into();
+        let np2: usize = sh2.iter().product();
+        if np2 == nao * nao * nc * 3 && sh2.len() >= 3 {
+            for t in 0..3 {
+                for gi in 0..nc {
+                    let g_idx = p0 + gi;
+                    let qv = q_sym[(g_idx, 0)];
+                    let base_tgi = nao * nao * (gi + nc * t);
+                    for j in 0..nao {
+                        let base_j = base_tgi + j * nao;
+                        for i in 0..nao {
+                            let dmv = dm_total[(i, j)];
+                            if dmv.abs() < 1e-15 { continue; }
+                            dq_grid_local[(g_idx, t)] += raw2[base_j + i] * dmv * qv;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Allreduce dvj_ao [3, nao]
+    let mut dvj_ao = vec![0.0_f64; 3 * nao];
+    mpi_op.world.any_process().all_reduce_into(&dvj_ao_local.data[..], &mut dvj_ao[..], &SystemOperation::sum());
+    // Reduce AO → atoms（列主序 [3,nao]: data[i*3 + t]）
+    let mut de_ip1 = MatrixFull::<f64>::new([3, natm], 0.0);
+    for a in 0..natm {
+        let [_, _, ao0, ao1] = aoslice[a];
+        for t in 0..3 {
+            let mut s = 0.0;
+            for i in ao0..ao1 { s += dvj_ao[i * 3 + t]; }
+            de_ip1[(t, a)] = 2.0 * s;
+        }
+    }
+
+    // Allreduce dq_grid [ngrids, 3]
+    let mut dq_grid = vec![0.0_f64; ngrids * 3];
+    mpi_op.world.any_process().all_reduce_into(&dq_grid_local.data[..], &mut dq_grid[..], &SystemOperation::sum());
+    // Reduce grid → atoms（列主序 [ngrids,3]: data[t*ngrids + g]）
+    let mut de_ip2 = MatrixFull::<f64>::new([3, natm], 0.0);
+    for a in 0..natm {
+        let (p0, p1) = gslice[a];
+        for t in 0..3 {
+            let mut s = 0.0;
+            for g in p0..p1 { s += dq_grid[t * ngrids + g]; }
+            de_ip2[(t, a)] = s;
+        }
+    }
+
+    let mut de = MatrixFull::<f64>::new([3, natm], 0.0);
+    for a in 0..natm { for t in 0..3 { de[(t, a)] = de_ip1[(t, a)] + de_ip2[(t, a)]; } }
+    de
+}
+
 // ============================================================================
 // SolverAux — pre‑computed intermediate vectors (shared by all de_* fns)
 // ============================================================================
@@ -1253,6 +1376,10 @@ fn format_grad_component(label: &str, g: &MatrixFull<f64>, elem: &[String]) -> S
 ///
 /// Returns `[3, natm]` force contribution from the implicit solvent model.
 pub fn compute_solvent_gradient(scf_data: &SCF) -> MatrixFull<f64> {
+    compute_solvent_gradient_with_mpi(scf_data, &None)
+}
+
+pub fn compute_solvent_gradient_with_mpi(scf_data: &SCF, mpi_operator: &Option<crate::mpi_io::MPIOperator>) -> MatrixFull<f64> {
     let t0 = Instant::now();
     let pcm_obj = scf_data.solvent_static_obj.as_ref()
         .expect("compute_solvent_gradient: solvent_static_obj missing");
@@ -1285,6 +1412,15 @@ pub fn compute_solvent_gradient(scf_data: &SCF) -> MatrixFull<f64> {
     println!("--- PCM gradient components ---");
 
     let de_nuc    = grad_solvent_nuc(surface, pscf, &scf_data.mol, natm);
+    #[cfg(feature = "mpi")]
+    let de_qv = {
+        if mpi_operator.is_some() {
+            grad_solvent_qv_mpi(surface, pscf, &scf_data.mol, &dm_tot, natm, nao, mpi_operator)
+        } else {
+            grad_solvent_qv(surface, pscf, &scf_data.mol, &dm_tot, natm, nao)
+        }
+    };
+    #[cfg(not(feature = "mpi"))]
     let de_qv     = grad_solvent_qv(surface, pscf, &scf_data.mol, &dm_tot, natm, nao);
     let de_solver = grad_solvent_solver(surface, pstatic, pscf, method, natm);
 

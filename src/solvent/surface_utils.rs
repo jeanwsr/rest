@@ -86,6 +86,32 @@ impl<'d> Deserialize<'d> for RadiusScheme {
 //  SMD-specific cavity radii (eq. 16, Marenich et al. JPCB 2009)
 // =============================================================================
 
+/// SMD cavity/CDS radii scheme, selected by the `smd_cavity_radii` keyword (default `Bondi`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum SmdCavityRadii {
+    /// Legacy behavior (default): electrostatic fallback uses `VDW_RADII` (PySCF mixed table),
+    /// CDS uses the full `BONDI` table — aligned with PySCF / NWChem mnsol.F.
+    #[default]
+    Bondi,
+    /// Non-eq.16 elements use `constants::solvent::BONDI_UFF_RADII`
+    /// (Bondi 1964 values ∪ unclassified values ∪ UFF fill-in, measured 2026-08);
+    /// the 11 eq.16 elements keep their original paths (eq.16 intrinsic / `BONDI`).
+    BondiUff,
+}
+
+impl<'d> Deserialize<'d> for SmdCavityRadii {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'d>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_uppercase().as_str() {
+            "BONDI" => Ok(SmdCavityRadii::Bondi),
+            "UFF_MIXED" => Ok(SmdCavityRadii::BondiUff),
+            _ => Err(serde::de::Error::custom(format!("Unknown SmdCavityRadii: {}", s))),
+        }
+    }
+}
 
 /// SMD intrinsic atomic Coulomb radii (Å), indexed by atomic number Z.
 /// Unlisted elements fall back to Bondi vdW radii.
@@ -112,10 +138,17 @@ const SMD_RADII_ANG: [f64; 104] = {
 ///       1.52 + 1.8×(0.43−α)   otherwise
 /// ```
 /// All other specialized elements (H, C, N, F, Si, P, S, Cl, Br, I) use
-/// fixed SMD values. Unparameterized elements fall back to Bondi radii.
+/// fixed SMD values. Unparameterized elements fall back per `scheme`:
+/// - `Bondi`: `VDW_RADII` (PySCF mixed table, legacy)
+/// - `BondiUff`: `BONDI_UFF_RADII` (reference snapshot table; zero entries are defensive only
+///   — the table covers Z=1..103 — and fall back to `VDW_RADII`)
 ///
 /// Returns radii in **Bohr**.
-pub fn smd_radii(alpha: f64, atomic_numbers: &[usize]) -> Vec<f64> {
+pub fn smd_radii(
+    alpha: f64,
+    atomic_numbers: &[usize],
+    scheme: SmdCavityRadii,
+) -> Vec<f64> {
     let r_o_ang = if alpha >= 0.43 {
         1.52
     } else {
@@ -127,7 +160,17 @@ pub fn smd_radii(alpha: f64, atomic_numbers: &[usize]) -> Vec<f64> {
         } else if z < SMD_RADII_ANG.len() && SMD_RADII_ANG[z] > 0.0 {
             SMD_RADII_ANG[z] / BOHR
         } else {
-            data::VDW_RADII[z]  // fallback to Bondi (Bohr)
+            match scheme {
+                SmdCavityRadii::Bondi => data::VDW_RADII[z], // fallback to PySCF mixed table (Bohr)
+                SmdCavityRadii::BondiUff => {
+                    // reference snapshot table in bohr; 0 entry is defensive only → fall back
+                    if z < data::BONDI_UFF_RADII.len() && data::BONDI_UFF_RADII[z] > 0.0 {
+                        data::BONDI_UFF_RADII[z]
+                    } else {
+                        data::VDW_RADII[z]
+                    }
+                }
+            }
         }
     }).collect()
 }
