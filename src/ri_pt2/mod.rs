@@ -3164,7 +3164,7 @@ pub fn restricted_open_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operat
             let alpha_lumo = scf_data.lumo.get(0).unwrap().clone();
             let alpha_num_occu = if scf_data.mol.num_elec[0 + 1] <= 1.0e-6 {0} else {alpha_homo + 1};
 
-            let beta_eigenvalues = &scf_data.semi_eigenvalues.as_ref().unwrap()[0];
+            let beta_eigenvalues = &scf_data.semi_eigenvalues.as_ref().unwrap()[1];
             let beta_occupation = scf_data.occupation.get(1).unwrap();
 
             let beta_homo = scf_data.homo.get(1).unwrap().clone();

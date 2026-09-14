@@ -89,7 +89,7 @@ impl<'a> ServicePortal<'a> {
                 owner,
                 TAG_REQUEST,
                 self.mpi_op.world.as_raw(),
-                &mut send_req;
+                &mut send_req,
             );
         }
         self.pending_fetch_requests.push(recv_req);
