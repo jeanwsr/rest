@@ -265,7 +265,7 @@ pub fn initialize_metadata_ASlide(mpi_op: &MPIOperator, n0_global:usize, n1_glob
     //println!("rank: {} -> ({},{})", rank, my_row, my_col);
 
     let grid_mult = if r == c {r} else {p};
-    let target_block_size: usize = 4;
+    let target_block_size: usize = 8;
     let min_blocks = (n2_global + target_block_size - 1) / target_block_size;
     let k = std::cmp::max(2, (min_blocks + grid_mult - 1) / grid_mult);
     let num_block = k * grid_mult;
@@ -369,7 +369,7 @@ pub fn determine_cache_capacity(mpi_op: &MPIOperator, slice_size: usize, block_s
     let block_mb: f64 = slice_size as f64 * block_size as f64 * elem_size as f64 / 1024.0 / 1024.0;
     let local_capacity : usize = (avail_mb / block_mb).floor() as usize;
     let mut global_capacity: usize = 0;
-    println!("rank:{}, avail_mb:{}, block_mb:{}, local_capacity:{}", mpi_op.rank, avail_mb, block_mb, local_capacity);
+    //println!("rank:{}, avail_mb:{}, block_mb:{}, local_capacity:{}", mpi_op.rank, avail_mb, block_mb, local_capacity);
     mpi_op.world.all_reduce_into(&local_capacity, &mut global_capacity, SystemOperation::min());
     global_capacity
 }
@@ -1203,4 +1203,36 @@ pub fn computation_os_aslide(
         },
     );
     os
+}
+
+pub fn check_memory_ASlide(mpi_op: &MPIOperator, n0_global: usize, n1_global: usize, n2_global: usize) -> bool {
+    let size = mpi_op.size;
+    let rank = mpi_op.rank;
+    let (r, c) = {
+        let mut r = (size as f64).sqrt() as i32;
+        let size_i32 = size as i32;
+        while size_i32 % r != 0 {
+            r -= 1;
+        }
+        (r, size_i32 / r)
+    };
+    let r = r as usize;
+    let c = c as usize;
+    let p = r * c;
+    
+    let grid_mult = if r == c {r} else {p};
+    let target_block_size: usize = 8;
+    let min_blocks = (n2_global + target_block_size - 1) / target_block_size;
+    let k = std::cmp::max(2, (min_blocks + grid_mult - 1) / grid_mult);
+    let num_block = k * grid_mult;
+    let block_size = n2_global / num_block;
+    let block_residue = n2_global % num_block;
+    assert!(block_size >= 1, "N2 too small for ASlide");
+
+    let max_block_size = if block_residue > 0 { block_size + 1 } else { block_size };
+    let cache_capacity: usize = determine_cache_capacity(mpi_op, n0_global * n1_global, max_block_size);
+    let local_mem_flag = (cache_capacity > 1);
+    let mut global_mem_flag: bool = true;
+    mpi_op.world.all_reduce_into(&local_mem_flag, &mut global_mem_flag, &SystemOperation::logical_and());
+    return global_mem_flag;
 }

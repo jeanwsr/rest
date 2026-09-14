@@ -19,7 +19,7 @@ use tensors::matrix_blas_lapack::{_dsymm, _dgemm};
 
 #[cfg(feature = "mpi")]
 use crate::ri_pt2::pt2_25d::{initialize_metadata, initialize_metadata_linear, check_memory_25d, swap_ownership, local_computation_close_shell_batch, local_computation_ss_batch, local_computation_os_batch};
-use crate::ri_pt2::pt2_ASlide::{initialize_metadata_ASlide, redistribute_batch_reverse_w_truncation, computation_close_shell_aslide, computation_ss_aslide, computation_os_aslide};
+use crate::ri_pt2::pt2_ASlide::{initialize_metadata_ASlide, check_memory_ASlide, redistribute_batch_reverse_w_truncation, computation_close_shell_aslide, computation_ss_aslide, computation_os_aslide};
 
 use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon,open_shell_sbge2_rayon};
 use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon, evaluate_osrpa_correlation_rayon_mpi};
@@ -225,9 +225,14 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         timerecords.count_start("c_r5dft");
 
         #[cfg(feature = "mpi")]
-        let use_25d = check_conditions_25d(&scf_data, mpi_operator, &dfa_family_pos);
+        //let use_25d = check_conditions_25d(&scf_data, mpi_operator, &dfa_family_pos);
+        let use_25d = false;
+        #[cfg(feature = "mpi")]
+        let use_ASlide = check_conditions_ASlide(&scf_data, mpi_operator, &dfa_family_pos);
         #[cfg(not(feature = "mpi"))]
         let use_25d = false;
+        #[cfg(not(feature = "mpi"))]
+        let use_ASlide = false;
 
         #[cfg(feature = "mpi")]
         if use_25d {
@@ -252,7 +257,29 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
                 }
             };
         }
-        if !use_25d {
+        else if (!use_25d) && use_ASlide {
+            pt2_c = match scf_data.scftype {
+                SCFType::RHF => match  dfa_family_pos {
+                    crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi_aslide(scf_data,mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SBGE2 => unreachable!("Asynchronous Sliding not implemented for SBGE2 now."),
+                    crate::dft::DFAFamily::SCSRPA => unreachable!("Asynchronous Sliding not implemented for SCSRPA now."),
+                    _ => [0.0,0.0,0.0]
+                },
+                SCFType::UHF => match  dfa_family_pos {
+                    crate::dft::DFAFamily::PT2 => open_shell_pt2_rayon_mpi_aslide(scf_data, mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SBGE2 => unreachable!("Asynchronous Sliding not implemented for SBGE2 now."),
+                    crate::dft::DFAFamily::SCSRPA => unreachable!("Asynchronous Sliding not implemented for SCSRPA now."),
+                    _ => [0.0,0.0,0.0]
+                },
+                SCFType::ROHF => match dfa_family_pos {
+                    crate::dft::DFAFamily::PT2 => restricted_open_shell_pt2_rayon_mpi_aslide(scf_data, mpi_operator).unwrap(),
+                    crate::dft::DFAFamily::SBGE2 => unreachable!("Asynchronous Sliding not implemented for SBGE2 now."),
+                    crate::dft::DFAFamily::SCSRPA => unreachable!("Asynchronous Sliding not implemented for SCSRPA now."),
+                    _ => [0.0,0.0,0.0]
+                }
+            };
+        }
+        else {
             pt2_c = match scf_data.scftype {
                 SCFType::RHF => match  dfa_family_pos {
                     crate::dft::DFAFamily::PT2 => close_shell_pt2_rayon_mpi(&scf_data,mpi_operator).unwrap(),
@@ -274,7 +301,6 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
                 }
             };
         }
-        let pt2_tmp = restricted_open_shell_pt2_rayon_mpi_aslide(scf_data, mpi_operator).unwrap();
         timerecords.count("c_r5dft");
     } else {
         // Phase-0 guard (P0-1): the primitive path below implements ONLY the PT2 kernel.
@@ -2982,6 +3008,92 @@ pub fn restricted_open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Opt
 }
 
 #[cfg(feature = "mpi")]
+fn check_conditions_ASlide(
+    scf_data: &SCF,
+    mpi_operator: &Option<MPIOperator>,
+    dfa_family_pos: &crate::dft::DFAFamily,
+) -> bool {
+    // ASlide only implements the PT2 kernels today.
+    if !matches!(dfa_family_pos, crate::dft::DFAFamily::PT2) {
+        return false;
+    }
+    let mut use_ASlide = true;
+    
+    let (mpi_op, mpi_ix) = match (&mpi_operator, &scf_data.mol.mpi_data) {
+        (Some(op), Some(ix)) => (op, ix),
+        _ => return false,
+    };
+
+    let my_rank = mpi_ix.rank;
+
+    let local_n0_range = match &mpi_ix.auxbas {
+        Some(loc_auxbas) => loc_auxbas[my_rank].clone(),
+        None => {
+            eprintln!("Auxiliary basis distribution not initialized");
+            return false;
+        }
+    };
+
+    let ri3mo_vec = match &scf_data.ri3mo {
+        Some(vec) => vec,
+        None => {
+            eprintln!("RI3MO not initialized, fallback to primitive PT2");
+            return false;
+        }
+    };
+
+    let (rimo, vir_range, occ_range) = &ri3mo_vec[0];
+    let n0_local = rimo.size[0];
+    let n1_global = rimo.size[1];
+    let n2_global = rimo.size[2];
+
+    if n0_local != local_n0_range.len()
+        || n1_global != vir_range.len()
+        || n2_global != occ_range.len()
+    {
+        eprintln!("Inconsistent RI3MO dimensions, fallback to primitive PT2");
+        return false;
+    }
+
+    if n2_global < 20 {
+        eprintln!("num_occ smaller than 20, fallback to primitive PT2");
+        use_ASlide = false;
+    }
+    
+    // Hard lower bound from initialize_metadata_ASlide (k >= 2, num_block = k*grid_mult).
+    let P = mpi_op.size as usize;
+    let mut r = (P as f64).sqrt() as usize;
+    while P % r != 0 { r -= 1; }
+    let c = P / r;
+    let grid_mult = if r == c { r } else { P };
+    let min_n2 = 2 * grid_mult;
+    if n2_global < min_n2 {
+        eprintln!(
+            "ASlide needs n2_global >= {} (2 * grid_mult for P={}), got {}; \
+                fallback to primitive PT2",
+            min_n2, P, n2_global
+        );
+        use_ASlide = false;
+    }
+
+    if use_ASlide {
+        let mut n0_global_tmp: u64 = 0;
+        mpi_op.world.all_reduce_into( &(n0_local as u64), &mut n0_global_tmp, &SystemOperation::sum());
+        let n0_global = n0_global_tmp as usize;
+        use_ASlide = check_memory_ASlide(mpi_op, n0_global, n1_global, n2_global);
+    }
+
+    let mut global_use_ASlide = false;
+    mpi_op.world.all_reduce_into(
+        &use_ASlide,
+        &mut global_use_ASlide,
+        &SystemOperation::logical_and(),
+    );
+    
+    global_use_ASlide
+}
+
+#[cfg(feature = "mpi")]
 pub fn close_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<[f64;3]> {
     if let (Some(mpi_op), Some(mpi_ix)) = (&mpi_operator, &scf_data.mol.mpi_data)  {
 
@@ -3031,9 +3143,6 @@ pub fn close_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Optio
                                                                     eigenvalues, occupation, occ_range.start, vir_range.start);
             mpi_op.world.all_reduce_into(&local_os, &mut global_os, SystemOperation::sum());
             mpi_op.world.all_reduce_into(&local_ss, &mut global_ss, SystemOperation::sum());
-        }
-        if my_rank == 0 {
-            println!("os + ss = {}, os = {}, ss = {}", global_os + global_ss, global_os, global_ss);
         }
         Ok([global_os + global_ss, global_os, global_ss])
     }
@@ -3120,9 +3229,6 @@ pub fn open_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operator: &Option
 
             mpi_op.world.all_reduce_into(&local_os, &mut global_os, SystemOperation::sum());
             mpi_op.world.all_reduce_into(&local_ss, &mut global_ss, SystemOperation::sum());
-            if my_rank == 0 {
-                println!("os + ss = {}, os = {}, ss = {}", global_os + global_ss, global_os, global_ss);
-            }
 
         }
         Ok([global_os + global_ss, global_os, global_ss])
@@ -3210,9 +3316,6 @@ pub fn restricted_open_shell_pt2_rayon_mpi_aslide(scf_data: &mut SCF, mpi_operat
 
             mpi_op.world.all_reduce_into(&local_os, &mut global_os, SystemOperation::sum());
             mpi_op.world.all_reduce_into(&local_ss, &mut global_ss, SystemOperation::sum());
-            if my_rank == 0 {
-                println!("os + ss = {}, os = {}, ss = {}", global_os + global_ss, global_os, global_ss);
-            }
 
         }
         Ok([global_os + global_ss, global_os, global_ss])
