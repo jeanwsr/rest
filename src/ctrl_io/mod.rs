@@ -578,7 +578,7 @@ impl InputKeywords {
             solvent_ri: true,
             solv_epsilon:1.0,
             solvent_model: PcmMethod::CPCM,
-            solv_chunk: 8,
+            solv_chunk: 16,
             pcm_cavity_radii: RadiusScheme::UFF,
             smd_cavity_radii: SmdCavityRadii::Bondi,
             solvent_name: String::new(),
