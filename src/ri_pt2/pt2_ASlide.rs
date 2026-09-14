@@ -27,8 +27,112 @@ use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 
 
+
 /*
- ASYNCHRONOUS SLIDING WORKFLOW
+ PT2_ASLIDE: ASYNCHRONOUS SLIDING KERNEL for PT2
+ 
+ Add a third MPI tier for RI-PT2 that sits between the 2.5D redistribution
+ path and the primitive aux-distributed path. Each rank holds only a bounded
+ cache of RI-MO blocks and fetches the rest on demand from the block owner
+ via non-blocking point-to-point MPI, so peak memory drops from
+ ~2*M/sqrt(p) (25D) to ~M/p + cache.
+ 
+ The kernel is unchanged from the 25D tier; the entire difference is data
+ placement plus a symmetric MPI service loop that overlaps fetch waits with
+ answering peer requests.
+ 
+ Components
+ ----------
+ - pt2_ASlide.rs: block partition, tile schedule generator (boustrophedon
+   tile order + Belady eviction), destructive one-shot redistribution,
+   per-pair kernels, sliding-window driver, closed/same/opposite-spin entry
+   points, cache/kernel-size tuners.
+ - serviceportal.rs: symmetric TAG_REQUEST/TAG_BLOCK service loop.
+ 
+ Scope
+ -----
+ PT2 family only. SBGE2 / SCSRPA are not wired in and are marked
+ unreachable! in the dispatch. The ROHF single-excitation (CIS-like) term is
+ deliberately not folded into pt2_c[0] in this driver; it is a known debug
+ stub, not a bug.
+ 
+ MPI safety
+ ----------
+ The driver is only correct when adjacent sliding phases cannot see each
+ other's requests.  The conditions are:
+ 
+   * Close-shell (close_shell_pt2_rayon_mpi_aslide): SAFE with no extra
+     synchronization.  There is exactly one sliding phase, one block store,
+     and the two Allreduce calls at function exit form a hard barrier:
+     every rank must arrive before any rank leaves ASlide.  No peer can
+     issue a new TAG_REQUEST while another rank is still in its exit loop,
+     because all peers are in their own exit loops draining their own
+     pending fetches.
+ 
+   * Open-shell (open_shell_pt2_rayon_mpi_aslide): UNSAFE as written.  It
+     runs three phases back-to-back (αα, ββ, OS) and every phase constructs
+     its own ServicePortal.  Two distinct failure modes exist between
+     phases:
+ 
+       αα → ββ:  both phases use virtual block IDs 0..num_block and both
+                 portals have split_id = usize::MAX (single-store).  A fast
+                 rank that has entered ββ sends TAG_REQUEST(5) meaning
+                 "β block 5"; a slow rank still in its αα exit loop answers
+                 from α storage.  Result: silently wrong correlation
+                 energy, no error, no assertion.
+ 
+       ββ → OS:  ββ uses IDs 0..num_block, OS uses num_block..2*num_block.
+                 The two ID sets are disjoint from the sender's point of
+                 view, but the ββ portal's lookup(v) for v >= num_block
+                 misses β_storage (keyed 0..num_block) and hits the
+                 MPI_Abort branch in ServicePortal::service.  Result: hard
+                 job abort, not a numerical error.
+ 
+     Fix (must be applied before this driver is enabled for UHF/ROHF):
+     insert an MPI_Barrier between each pair of adjacent phases, OR
+     generalize the OS approach — use one ServicePortal::new_split(α, β,
+     num_block) across all three phases and generate the ββ schedule with
+     block_j_offset = num_block so all three ID spaces are disjoint.
+ 
+     Until this is done, keep use_ASlide = false for open-shell systems, or
+     add an explicit `if scf_data.scftype == SCFType::ROHF/UHF { return
+     false }` gate to check_conditions_ASlide.
+ 
+ Kernel-size tuning on HPC — UNRESOLVED
+ --------------------------------------
+ determine_kernel_size feeds on two micro-benchmarks:
+ 
+     determine_dgemm_speed  ->  elapsed * block_size / size    (time × block_size)
+     determine_bandwidth    ->  one_way latency                (time)
+ 
+ Their ratio has units of block_size and no physical meaning; it is only
+ monotonic in the true hardware compute/comm ratio.  The code therefore
+ clamps it to [5, 30] and picks (kr, kc) from the band [0.4*hw, 1.1*hw].
+ The clamp and the band were calibrated against a single machine and have
+ NOT been validated on an HPC interconnect.  Two consequences:
+ 
+   * On a laptop / single-box MPI run the "bandwidth" is loopback and
+     inflates hw_measured by ~10x; the tuner may land on a plausible but
+     non-optimal kernel shape.
+ 
+   * On a real cluster the same measurement changes by 1–2 orders of
+     magnitude and there is no guarantee the resulting (kr, kc) is close to
+     optimal.  cache_capacity is also memory-derived and does not account
+     for other resident allocations, so the effective tile budget on a
+     loaded node can be smaller than the tuner believes.
+ 
+ Before enabling ASlide by default on a new machine, check the diagnostic
+ line printed by initialize_metadata_ASlide (rank 0):
+ 
+     HARDWARE COMP/COMM = <hw_measured>, KERNEL(<kr>,<kc>) COMP/COMM = <block_r>
+ 
+ If hw_measured is pinned at 5.0 or 30.0, the tuner is on a clamp boundary
+ and the chosen kernel size is not trustworthy.  Retuning the constants or
+ replacing the heuristic with true FLOP/s and bytes/s measurements is
+ required before this tier can be considered production-ready on HPC.
+ 
+     
+WORKFLOW
 initialize_metadata_ASlide
    │
    ├── partition occ range into blocks
