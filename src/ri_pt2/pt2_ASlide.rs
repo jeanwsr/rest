@@ -27,6 +27,60 @@ use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 
 
+/*
+ ASYNCHRONOUS SLIDING WORKFLOW
+initialize_metadata_ASlide
+   │
+   ├── partition occ range into blocks
+   ├── compute row_block_idx / col_block_idx (2D Cartesian decomposition)
+   ├── determine cache_capacity, bandwidth, dgemm_speed
+   ├── determine_kernel_size  → (kr, kc)
+   ├── generate_schedule (same-spin)      → ctx.schedule
+   └── generate_schedule (opposite-spin)  → ctx.schedule_os
+
+redistribute_batch_reverse_w_truncation
+   │
+   ├── for each batch of blocks (largest indices first):
+   │      pack local n0 pieces into a send buffer
+   │      MPI_Alltoallv
+   │      unpack into full n0_global × n1_global block tensors
+   │      store in HashMap<blk, RIFull>
+   └── destructively shrink dten.data (asserts it drops to 0)
+
+[per spin channel]
+   computation_close_shell_aslide  ─┐
+   computation_ss_aslide           ─┼─→  run_sliding_phase
+   computation_os_aslide           ─┘
+       │
+       └── for each State in schedule:
+              release evicted blocks
+              fetch missing blocks (Irecv+Isend, remote; clone, local)
+              wait_for_fetches_with_service  (drain incoming requests while waiting)
+              run the tile kernel on cached blocks
+              portal.service()               (answer any requests that arrived)
+              (once, after step 0) service_aware_barrier
+       │
+       └── signal_done / is_done / finalize
+ */
+
+/// One tile of the computation.
+///
+/// A schedule is a `Vec<State>` produced by `generate_schedule`. The sliding
+/// loop consumes states in order. Each state describes a small, self-contained
+/// unit of work and the cache edits required to execute it.
+///
+/// Fields
+/// ------
+/// * `to_compute` — occupied-index pairs `(I, J)` to run through the kernel.
+///   `I`, `J` are *virtual* block IDs: `I` is a row block (always < num_block),
+///   `J` is either a column block (same-spin, `J < num_block`) or a β column
+///   block encoded as `J = blk + num_block` (opposite-spin).
+///
+/// * `to_fetch`   — virtual block IDs that must be brought into the cache
+///   before the tile can run. Ordered as they should be requested.
+///
+/// * `to_release` — virtual block IDs to evict from the cache *before*
+///   the fetch, so that the cache never exceeds `cache_capacity`.
 #[derive(Debug, Clone)]
 pub struct State {
     pub to_compute: Vec<(usize, usize)>,  // block pairs (I,J) in this tile
@@ -34,6 +88,25 @@ pub struct State {
     pub to_release: Vec<usize>,           // blocks to evict after previous tile
 }
 
+/// Metadata describing the ASlide block partition, ownership, and schedule.
+///
+/// Produced once by `initialize_metadata_ASlide` and consumed by every
+/// `computation_*_aslide` entry point and by
+/// `redistribute_batch_reverse_w_truncation`.
+///
+/// Fields
+/// ------
+/// * `k`                 — blocks per Cartesian rank (`num_block = k · grid_mult`).
+/// * `block_start_idx`   — length `num_block + 1`; block `b` covers
+///                         `[block_start_idx[b], block_start_idx[b+1])`.
+/// * `ownership[i]`      — blocks owned by rank `i` (round-robin: `blk % P`).
+/// * `row_block_idx`     — blocks with `blk % r == my_row`.
+/// * `col_block_idx`     — blocks with `blk % c == my_col`.
+/// * `schedule`          — same-spin tile schedule (upper triangle only).
+/// * `schedule_os`       — opposite-spin tile schedule (full rectangle),
+///                         present only when `close_shell == false`.
+/// * `kernel_size`       — chosen tile shape `(kernel_row, kernel_col)`.
+/// * `cache_capacity`    — maximum resident blocks at any moment.
 pub struct CtxASlideBlock {
     pub k: usize,
     pub block_start_idx: Vec<usize>,
@@ -46,7 +119,34 @@ pub struct CtxASlideBlock {
     pub cache_capacity: usize,
 }
 
-
+/// Build the tile schedule for one spin configuration.
+///
+/// Walks the occupied×occupied block matrix as a grid of
+/// `kernel_row × kernel_col` tiles. Tiles are visited in a boustrophedon
+/// (snake) order so consecutive tiles share columns, maximizing reuse of
+/// the cache; row/column tile indices are rotated by `(row_offset,
+/// col_offset)` so different ranks start at different points and do not
+/// issue identical fetch patterns.
+///
+/// For each tile the function determines which blocks are missing from a
+/// simulated cache and which blocks can be evicted. Eviction uses Belady's
+/// optimal policy: drop the block whose next use is farthest in the future.
+///
+/// Arguments
+/// ---------
+/// * `row_blocks`, `col_blocks` — the current rank's row/column block IDs.
+/// * `kernel_row`, `kernel_col` — tile shape from `determine_kernel_size`.
+/// * `row_offset`, `col_offset` — per-rank rotation offsets.
+/// * `cache_capacity`           — max resident blocks.
+/// * `block_j_offset`           — `0` for same-spin, `num_block` for OS.
+/// * `upper_only`               — `true` for same-spin (I ≤ J only),
+///                                `false` for OS (full rectangle).
+///
+/// Returns
+/// -------
+/// A `Vec<State>` whose length is `1 + num_tiles`. Entry `0` is the initial
+/// prefetch; entries `1..` are one tile each. The order of states is the
+/// order in which `run_sliding_phase` consumes them.
 pub fn generate_schedule(
     row_blocks: &[usize],
     col_blocks: &[usize],
@@ -199,6 +299,18 @@ pub fn generate_schedule(
     schedule
 }
 
+/// Replay a schedule against a simulated cache to catch inconsistencies
+/// before the real MPI run.
+///
+/// Checks three invariants at every step:
+///   1. Each block in `to_release` is actually in the cache.
+///   2. The cache never exceeds `cache_capacity`.
+///   3. Every `(I, J)` in `to_compute` is in the cache after the fetch.
+///
+/// The local flag is combined across all ranks with `logical_and`; the
+/// function returns `true` only if *every* rank passed. This makes an
+/// asymmetric schedule fail loudly instead of deadlocking in the sliding
+/// loop.
 pub fn validate_schedule(schedule: &Vec<State>, cache_capacity: usize, block_j_offset: usize, mpi_op: &MPIOperator) -> bool
 {
     let num_sliding_steps = schedule.len();
@@ -247,6 +359,28 @@ pub fn validate_schedule(schedule: &Vec<State>, cache_capacity: usize, block_j_o
     global_flag
 }
 
+/// One-shot initializer for the whole ASlide context.
+///
+/// Steps
+/// -----
+/// 1. Factor the MPI size into a near-square 2D grid `(r, c)`, exactly as
+///    the 25D path does.
+/// 2. Partition the occupied range into `k · grid_mult` contiguous blocks
+///    (target block size: 8 occupied orbitals).
+/// 3. Assign round-robin ownership `blk % P`.
+/// 4. Populate `row_block_idx` / `col_block_idx` from the Cartesian coords.
+/// 5. Measure `cache_capacity`, `block_bandwidth`, `block_dgemm_speed`.
+/// 6. Choose `kernel_size` from the measured compute/comm ratio.
+/// 7. Build and validate the same-spin schedule and (if open-shell) the
+///    opposite-spin schedule.
+///
+/// Invariants enforced
+/// -------------------
+/// * All ranks must agree on `cache_capacity` (checked with min/max allreduce).
+/// * Both schedules must pass `validate_schedule`.
+///
+/// Debug output: block layout, chosen cache size, kernel shape, predicted
+/// hardware and kernel compute/comm ratios (rank 0 only).
 pub fn initialize_metadata_ASlide(mpi_op: &MPIOperator, n0_global:usize, n1_global: usize, n2_global: usize, close_shell: bool) -> CtxASlideBlock {
     let size = mpi_op.size;
     let rank = mpi_op.rank;
@@ -363,6 +497,16 @@ pub fn initialize_metadata_ASlide(mpi_op: &MPIOperator, n0_global:usize, n1_glob
     }
 }
 
+/// Decide how many blocks of the RI-MO tensor can be held in RAM at once.
+///
+/// Estimates the per-block size in MiB from the *global* slice shape and the
+/// *largest* block length, then divides the available memory (detected by
+/// `detect_available_memory_mb`) by that figure. The result is the minimum
+/// across ranks, so all ranks agree on the same cache budget.
+///
+/// This is a conservative upper bound: it ignores the memory already held
+/// by other allocations and does not reserve a safety margin beyond the
+/// simple "min over ranks" strategy.
 pub fn determine_cache_capacity(mpi_op: &MPIOperator, slice_size: usize, block_size: usize) -> usize {
     let avail_mb = detect_available_memory_mb();
     let elem_size = std::mem::size_of::<f64>();
@@ -374,6 +518,17 @@ pub fn determine_cache_capacity(mpi_op: &MPIOperator, slice_size: usize, block_s
     global_capacity
 }
 
+/// Micro-benchmark: how many doubles-per-second can one rank push through
+/// the contraction `A^T · B` at the given shape?
+///
+/// Runs `ITERATIONS` dgemm calls on the same `(n0, n1) × (n0, block_size·n1)`
+/// shapes used by the kernels, averages the wall time, and reduces (sums)
+/// across ranks. Returns doubles/s for a single rank, i.e. divide the total
+/// by `mpi_op.size`.
+///
+/// This number feeds `determine_kernel_size` and must be measured on the
+/// actual hardware — using a cached value across heterogeneous nodes would
+/// produce a mismatched kernel shape.
 pub fn determine_dgemm_speed(mpi_op: &MPIOperator, n0: usize, n1: usize, block_size: usize) -> f64 {
     let mut a = MatrixFull::new([n0, n1], 1.0_f64);
     let mut b = MatrixFull::new([n0, block_size * n1], 1.0_f64);
@@ -401,6 +556,16 @@ pub fn determine_dgemm_speed(mpi_op: &MPIOperator, n0: usize, n1: usize, block_s
     result
 }
 
+/// Micro-benchmark: one-way latency of sending a full block between two ranks.
+///
+/// Uses a simple ping-pong between rank 0 and rank 1: warm-up round, then
+/// `ITERATIONS` send/receive pairs. The elapsed time divided by `2 ·
+/// ITERATIONS` is the one-way latency. The result is broadcast to all ranks
+/// so every rank computes the same kernel size.
+///
+/// Requires `mpi_op.size > 1`; this is guaranteed by the caller because
+/// ASlide is only enabled under `feature = "mpi"` with an active
+/// `MPIOperator`.
 pub fn determine_bandwidth(mpi_op: &MPIOperator, slice_size: usize, block_size: usize) -> f64 {
     let rank = mpi_op.rank;
     let size = mpi_op.size;
@@ -443,6 +608,25 @@ pub fn determine_bandwidth(mpi_op: &MPIOperator, slice_size: usize, block_size: 
     result[0]
 }
 
+/// Choose the tile shape `(kernel_row, kernel_col)` from the measured
+/// hardware compute/comm ratio.
+///
+/// Rationale: a tile of `kr × kc` blocks incurs `(kr + kc)` block fetches
+/// and `kr · kc` block contractions. Its compute-to-comm ratio is therefore
+///     (kr · kc) / (kr + kc) · hardware_r
+/// where `hardware_r = dgemm_speed / bandwidth`. The tuner tries to land
+/// this in `[0.4·hw_clamped, 1.1·hw_clamped]` with `hw_clamped ∈ [5, 30]`,
+/// which prevents over-fitting to loopback measurements taken on a laptop.
+///
+/// Algorithm
+/// ---------
+/// 1. Compute the "ideal" square side `kr ≈ 2·target_mid·BW/dgemm_speed`.
+/// 2. Clamp it against `cache_capacity` (a tile needs `kr + kc ≤ capacity`).
+/// 3. Scan the ±2 neighborhood of the square and pick the shape whose
+///    ratio is closest to the target band.
+/// 4. Guarantee a valid fallback `(1, 1)` at the end.
+///
+/// Returns the chosen `(kr, kc)`.
 pub fn determine_kernel_size(cache_capacity: usize, block_bandwidth: f64, block_dgemm_speed: f64) -> (usize, usize)
 {
     assert!(cache_capacity > 1);
@@ -511,6 +695,28 @@ pub fn determine_kernel_size(cache_capacity: usize, block_bandwidth: f64, block_
 
 }
 
+/// Destructively redistribute the aux-distributed RI-MO tensor into
+/// per-block tensors, one for every block this rank owns.
+///
+/// The input `dten` is expected to have `dist_axis = 0` (aux index
+/// distributed). It is processed in batches of `cache_capacity / 2` blocks
+/// *from the highest block index down*, and each batch is completely
+/// transferred before the next batch is packed. This caps the peak memory
+/// to `(batch_size + in-flight receive buffer)` blocks even when the full
+/// tensor does not fit.
+///
+/// For every block in a batch:
+///   * Each source rank contributes its local `n0_local × n1_global` slab.
+///   * A single `MPI_Alltoallv` moves all slabs to the owner (`blk % P`).
+///   * On the owner, the slabs are unpacked into a dense
+///     `[n0_global, n1_global, block_len]` tensor.
+///
+/// After the function returns, `dten.data` has been truncated to length 0.
+/// The caller must not use `dten` again — this is why ASlide is a
+/// one-shot branch and must not be tried speculatively.
+///
+/// Returns a `HashMap<blk, RIFull>` keyed by raw block ID; virtual IDs for
+/// the opposite-spin phase are `blk + num_block`.
 pub fn redistribute_batch_reverse_w_truncation(mpi_op: &MPIOperator, ctx: &CtxASlideBlock, dten: &mut RIFull<f64>, n0_global: usize, n0_range: &Range<usize>)
 -> HashMap<usize, RIFull<f64>>
 {
@@ -999,13 +1205,30 @@ fn pair_block_compute_os(
     local_term_os
 }
 
-/// Shared sliding loop for closed-shell, same-spin, and opposite-spin phases.
+/// Generic sliding-window driver shared by all three spin configurations.
 ///
-/// `num_blocks` is the *raw* block count from `ctx.block_start_idx.len()`.
-/// Virtual IDs in the schedule are: α → v, β → v + num_blocks. Since
-/// `num_blocks` is a multiple of P (grid_mult is P or r, and k is chosen so
-/// num_blocks = k·grid_mult), we route ownership by `v % P`, which equals
-/// `(v % num_blocks) % P`. This is the key to sharing one portal across phases.
+/// For each `State` in `schedule` the loop:
+///   1. Evicts blocks listed in `state.to_release`.
+///   2. Fetches blocks listed in `state.to_fetch`:
+///        - Local owner → clone from the portal storage into the cache.
+///        - Remote owner → post Irecv for the block, Isend the request,
+///          remember the receive buffer.
+///   3. `wait_for_fetches_with_service`: waits for all pending Irecv,
+///      *while answering other ranks' TAG_REQUESTs* — this is where
+///      overlap happens.
+///   4. Inserts fetched blocks into the cache.
+///   5. Calls the caller-supplied closure `compute(&cache, &pairs)` to run
+///      the tile kernel, and adds the returned `(os, ss)` to the totals.
+///   6. Drains the service queue once more.
+///   7. After step 0 only: a `service_aware_barrier` so the very first
+///      requests from every rank meet a warm service loop.
+///
+/// Once the schedule is exhausted, the function calls `signal_done`,
+/// services until the non-blocking Iallreduce reports all ranks finished,
+/// and calls `finalize` to flush outstanding sends.
+///
+/// Returns the accumulated `(local_os, local_ss)` — these are this rank's
+/// share and must be summed across ranks by the caller with an Allreduce.
 fn run_sliding_phase<F>(
     mpi_op: &MPIOperator,
     portal: &mut ServicePortal,
@@ -1205,6 +1428,18 @@ pub fn computation_os_aslide(
     os
 }
 
+/// Cheap pre-flight check: is there enough RAM for the ASlide cache?
+///
+/// Recomputes the block partition exactly the way `initialize_metadata_ASlide`
+/// will, then calls `determine_cache_capacity` and requires the result to be
+/// strictly greater than 1 (i.e. at least one tile can be resident). The
+/// decision is combined across ranks with logical AND.
+///
+/// NOTE: the current implementation uses `target_block_size = 8` here,
+/// but `initialize_metadata_ASlide` uses `target_block_size = 4`. This makes
+/// the estimate conservative (slightly too few blocks per rank) but is a
+/// known inconsistency to be fixed. Also, the `assert!(block_size >= 1)`
+/// should be a `return false` because this function is a predicate.
 pub fn check_memory_ASlide(mpi_op: &MPIOperator, n0_global: usize, n1_global: usize, n2_global: usize) -> bool {
     let size = mpi_op.size;
     let rank = mpi_op.rank;
@@ -1227,11 +1462,10 @@ pub fn check_memory_ASlide(mpi_op: &MPIOperator, n0_global: usize, n1_global: us
     let num_block = k * grid_mult;
     let block_size = n2_global / num_block;
     let block_residue = n2_global % num_block;
-    assert!(block_size >= 1, "N2 too small for ASlide");
 
     let max_block_size = if block_residue > 0 { block_size + 1 } else { block_size };
     let cache_capacity: usize = determine_cache_capacity(mpi_op, n0_global * n1_global, max_block_size);
-    let local_mem_flag = (cache_capacity > 1);
+    let local_mem_flag = (cache_capacity > 1) && (block_size >= 1);
     let mut global_mem_flag: bool = true;
     mpi_op.world.all_reduce_into(&local_mem_flag, &mut global_mem_flag, &SystemOperation::logical_and());
     return global_mem_flag;

@@ -10,6 +10,32 @@ use rest_tensors::RIFull;
 
 use crate::mpi_io::MPIOperator;
 
+/// Asynchronous MPI service portal used by the ASlide driver.
+///
+/// The portal is the *only* place in the ASlide code that talks to MPI.
+/// It plays two symmetric roles:
+///
+///   * **Client** — the sliding loop calls `request_block` to fetch a block
+///     from a remote owner, then `wait_for_fetches_with_service` to
+///     wait for it.
+///
+///   * **Server** — while waiting, and between tiles, the portal drains its
+///     incoming message queue via `service`, answering every TAG_REQUEST
+///     with a TAG_BLOCK that carries the block's payload.
+///
+/// Protocol
+/// --------
+///     client → owner :  TAG_REQUEST  (i32 block ID, 1 element)
+///     owner → client :  TAG_BLOCK    (f64 [n_slices · n0 · n1])
+///
+/// `data`/`data_b` are the block stores on this rank (round-robin ownership
+/// by `blk % P`). `data_b` is `Some` only for the opposite-spin phase; the
+/// `split_id` boundary routes virtual IDs `< split_id` to `data` and the
+/// rest to `data_b` (see `lookup`).
+///
+/// The portal never blocks on MPI_Recv for its *own* fetches — those are
+/// always posted as `MPI_Irecv` and completed by `wait_for_fetches_with_service`.
+
 const TAG_REQUEST: i32 = 100;
 const TAG_BLOCK:   i32 = 101;
 pub struct ServicePortal<'a> {
@@ -26,6 +52,8 @@ pub struct ServicePortal<'a> {
 }
 
 impl<'a> ServicePortal<'a> {
+    /// Construct a single-store portal (same-spin or closed-shell).
+    /// `data_b` is left as `None`, so every `lookup` resolves against `data`.
     pub fn new(mpi_op: &'a MPIOperator, data: &'a HashMap<usize, RIFull<f64>>) -> Self {
         ServicePortal
         {
@@ -41,7 +69,13 @@ impl<'a> ServicePortal<'a> {
             global_done: 0,
         }
     }
-
+    
+    /// Construct a two-store portal for opposite-spin.
+    ///
+    /// Virtual IDs `< split_id` index into `alpha_data`; IDs `>= split_id`
+    /// index into `beta_data` after subtracting `split_id`. The caller sets
+    /// `split_id = num_block` so that β blocks carry virtual IDs
+    /// `num_block .. 2·num_block`.
     pub fn new_split(mpi_op: &'a MPIOperator, alpha_data: &'a HashMap<usize, RIFull<f64>>, beta_data:&'a HashMap<usize, RIFull<f64>>, split_id: usize) -> Self {
         ServicePortal
         {
@@ -66,7 +100,15 @@ impl<'a> ServicePortal<'a> {
             self.data_b?.get(&(virtual_id - self.split_id))
         }
     }
-
+    
+    /// Post a non-blocking fetch for `block_id` from `owner`.
+    ///
+    /// The receive buffer must be pre-sized by the caller to
+    /// `num_slices(block_id) · n0_global · n1_global` doubles.
+    ///
+    /// Both the Irecv (for the payload) and the Isend (of the request ID) are
+    /// pushed into `pending_fetch_requests`; a single
+    /// `MPI_Testall` in `wait_for_fetches_with_service` completes them together.
     pub fn request_block(&mut self, block_id: usize, owner: i32, buffer: &mut [f64]) {
         let mut recv_req: ffi::MPI_Request = unsafe { mem::zeroed() };
         let mut send_req: ffi::MPI_Request = unsafe { mem::zeroed() };
@@ -96,7 +138,15 @@ impl<'a> ServicePortal<'a> {
         self.pending_fetch_requests.push(send_req);
 
     }
-
+    
+    /// Wait until all outstanding Irecv/Isend pairs posted by `request_block`
+    /// have completed.
+    ///
+    /// Crucially, the wait is *not* a busy spin on MPI_Testall alone: the loop
+    /// calls `service()` each iteration, so this rank keeps answering other
+    /// ranks' TAG_REQUESTs while its own fetches are in flight. This is what
+    /// turns the algorithm from "block on Irecv" into "overlap communication
+    /// with service".
     pub fn wait_for_fetches_with_service(&mut self) {
         while !self.pending_fetch_requests.is_empty() {
             // Handle incoming block requests from other ranks
@@ -124,7 +174,23 @@ impl<'a> ServicePortal<'a> {
             std::thread::yield_now();
         }
     }
-
+    
+    /// Drain the incoming request queue and answer each one with the requested
+    /// block.
+    ///
+    /// Uses `MPI_Iprobe` in a loop so it never blocks: if no request is waiting,
+    /// it returns immediately. For each request it reads the block ID, looks up
+    /// the corresponding tensor in the local store, and posts an `MPI_Isend`
+    /// carrying the payload. The send request is pushed into `pending_data_sends`
+    /// so it can be completed in `finalize`.
+    ///
+    /// A missing block is treated as a fatal protocol error: the rank is
+    /// supposed to own the block (round-robin ownership) so the request can
+    /// only have come from a peer with a stale schedule. `MPI_Abort` is issued
+    /// rather than panicking, to tear down the whole job instead of hanging.
+    ///
+    /// Also advances the non-blocking Allreduce started by `signal_done`, if any,
+    /// by calling `MPI_Test` on its request handle.
     pub fn service(&mut self) {
         let mut flag: i32 = 0;
         let mut status: ffi::MPI_Status = unsafe { std::mem::zeroed() };
@@ -199,7 +265,15 @@ impl<'a> ServicePortal<'a> {
             }
         }
     }
-
+    
+    /// Barrier that keeps the service loop running while waiting.
+    ///
+    /// Used once after the very first tile so that every rank's initial burst
+    /// of fetch requests arrives at peers whose service loops are already warm.
+    /// `MPI_Ibarrier` is posted, then the loop repeatedly calls `service` (to
+    /// drain incoming requests) and `MPI_Test` on the barrier handle.
+    /// When the barrier completes, `service` is called one last time so any
+    /// request that arrived just before the barrier fired is handled.
     pub fn service_aware_barrier(&mut self) {
         let mut req: ffi::MPI_Request = unsafe { mem::zeroed() };
         unsafe {
@@ -227,7 +301,13 @@ impl<'a> ServicePortal<'a> {
         }
     }
 
-
+    /// Initiate the termination protocol.
+    ///
+    /// Sets `local_done = 1` and posts a non-blocking `MPI_Iallreduce(SUM)`
+    /// over all ranks. The counter of "done" flags reaching the number of
+    /// ranks is the signal used by `is_done`.
+    ///
+    /// Only the first call does anything; subsequent calls are no-ops.
     pub fn signal_done(&mut self) {
         if !self.done_request_started {
             self.local_done = 1;
@@ -245,7 +325,9 @@ impl<'a> ServicePortal<'a> {
             self.done_request_started = true;
         }
     }
-
+    
+    /// Poll the Allreduce started by `signal_done`. Returns `true` once it has
+    /// completed. Calling `is_done` before `signal_done` returns `false`.
     pub fn is_done(&mut self) -> bool {
         if !self.done_request_started {
             return false;
@@ -260,7 +342,12 @@ impl<'a> ServicePortal<'a> {
         }
         flag != 0
     }
-
+    
+    /// Complete all outstanding outgoing block payloads.
+    ///
+    /// `service` posts `MPI_Isend`s; `finalize` waits for all of them with
+    /// `MPI_Waitall`. Called at the very end of `run_sliding_phase` so that no
+    /// peer is left waiting on an in-flight payload after this rank exits.
     pub fn finalize(&mut self) {
         if !self.pending_data_sends.is_empty() {
             unsafe {
