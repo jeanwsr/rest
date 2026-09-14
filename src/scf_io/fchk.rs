@@ -7,6 +7,7 @@ use crate::constants::{SPECIES_INFO};
 use crate::external_libs::py2fch;
 use crate::scf_io::SCF;
 use crate::scf_io::SCFType;
+use crate::x2c::RelativisticMethod;
 
 
 macro_rules! dump_real_r2f {
@@ -72,6 +73,26 @@ impl SCF {
         };
         let natom = self.mol.geom.elem.len();
         write!(input, "Number of atoms                            I {:16}\n", self.mol.geom.elem.len());
+        let mut route_tokens: Vec<String> = vec![String::from("#p")];
+        route_tokens.push(format!("{}/{}",
+            self.mol.ctrl.xc.to_uppercase(),
+            basis_name.to_uppercase()
+        ));
+        if let Some(disp) = &self.mol.ctrl.empirical_dispersion {
+            let em = match disp.as_str() {
+                "d3" => "GD3",
+                "d3bj" => "GD3BJ",
+                "d4" => "GD4",
+                other => other,
+            };
+            route_tokens.push(format!("em={}", em));
+        }
+        match self.mol.ctrl.rel {
+            RelativisticMethod::SFX2C => route_tokens.push(String::from("int(nobasistransform,X2C)")),
+            _ => route_tokens.push(String::from("int=nobasistransform")),
+        };
+        write!(input, "Route                                      C   N={:12}\n", route_tokens.len());
+        write!(input, "{}\n", route_tokens.join(" "));
         write!(input, "Charge                                     I {:16}\n", self.mol.ctrl.charge as i32);
         write!(input, "Multiplicity                               I {:16}\n", self.mol.ctrl.spin as i32);
         write!(input, "Number of electrons                        I {:16}\n", self.mol.num_elec[0] as i32);

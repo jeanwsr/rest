@@ -296,6 +296,13 @@ pub fn update_basis_from_hdf5chk(scf_data: &mut SCF) {
             scf_data.mol.set_cint_data(atm, bas, env, ecp_raw, None, basis4elem, fdqc_bas, cint_fdqc);
             scf_data.mol.update_num_elec();
             scf_data.mol.start_mo = scf_data.mol.generate_start_mo(scf_data.mol.ecp_electrons);
+            // Fix (chkfile-basis + MPI/size>=2): 轨道基组在 initialize_scf 才经 set_cint_data 整体
+            // 替换 cint_env，而辅助基 cint/env 是按替换前的 env 布局建立的 → 2c2e 壳层指针错位
+            // → aux V 矩阵 NaN（full-RI 路径 n>=1 即触发；symm/MPI 路径 n>=2 触发，rank 集体处挂起）。
+            // 在 env 替换后重建辅助基，使壳层偏移与当前 env 一致。
+            if scf_data.mol.ctrl.use_auxbas {
+                scf_data.mol.initialize_auxbas();
+            }
         } else {
             panic!("Failed to load the basis set information from chkfile");
         }

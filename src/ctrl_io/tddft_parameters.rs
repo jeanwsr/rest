@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 pub struct TDDFTParameters {
     pub tddft_method: String,       // "tda" or "lr" (full linear response)
     pub tddft_spin: String,         // "singlet" or "triplet"
+    pub tddft_mode: String,         // "mo" (default; MO-basis RI tensors) or "ao" (AO transition-density kernel)
+    pub grid_batch: bool,           // AO mode only: batch the fxc AO evaluation over grid batches (memory-bounded)
+    pub tddft_ao_rik_driver: String, // AO mode only: exchange-K driver, "semitrans" (default; exact occ-side semi-transformation), "dm" (exact batched density-driven), or "lowrank" (per-vector SVD)
+    pub tddft_fxc_driver: String,   // AO mode only: fxc driver, "semitrans" (default; C_vir folded into the amplitudes, vir side stays in the raw AO basis) or "mo" (occ-cached + vir-streamed grid projections) or "dm" (assembled-density NIMatmul fallback)
+    pub tddft_svd_tol: f64,         // AO mode only: relative SVD threshold for low-rank K (σ_i ≥ tol·σ_max kept)
     pub nroots: usize,              // number of excitation energies to compute
     pub davidson_tol: f64,          // Davidson convergence: ||r|| < sqrt(tol), |de| < tol
     pub davidson_max_iter: usize,   // maximum Davidson iterations
@@ -52,6 +57,11 @@ impl Default for TDDFTParameters {
         TDDFTParameters {
             tddft_method: String::from("lr"),
             tddft_spin: String::from("singlet"),
+            tddft_mode: String::from("mo"),
+            grid_batch: true,
+            tddft_ao_rik_driver: String::from("semitrans"),
+            tddft_fxc_driver: String::from("semitrans"),
+            tddft_svd_tol: 1.0e-6,
             nroots: 6,
             davidson_tol: 1.0e-10,
             davidson_max_iter: 50,
@@ -101,6 +111,26 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
             p.tddft_spin = match tmp_ctrl.get("tddft_spin").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.to_lowercase(),
                 _ => String::from("singlet"),
+            };
+            p.tddft_mode = match tmp_ctrl.get("tddft_mode").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase(),
+                _ => String::from("mo"),
+            };
+            p.grid_batch = match tmp_ctrl.get("grid_batch").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => true,
+            };
+            p.tddft_ao_rik_driver = match tmp_ctrl.get("tddft_ao_rik_driver").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase(),
+                _ => String::from("semitrans"),
+            };
+            p.tddft_fxc_driver = match tmp_ctrl.get("tddft_fxc_driver").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase(),
+                _ => String::from("semitrans"),
+            };
+            p.tddft_svd_tol = match tmp_ctrl.get("tddft_svd_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-6),
+                _ => 1.0e-6,
             };
             p.nroots = match tmp_ctrl.get("nroots").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(6) as usize,
