@@ -17,9 +17,6 @@ static INPUT_H2O: &str = r##"
     charge =               0.0
     spin =                 1.0
     spin_polarization =    false
-    auxbasis_response =    true
-    mixer =                "diis"
-    max_scf_cycle =        100
 
 [analdrv]
     # legacy cphf_* key names, to verify they keep working as aliases of cpscf_*

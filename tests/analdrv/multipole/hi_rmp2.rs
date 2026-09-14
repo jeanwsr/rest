@@ -47,12 +47,6 @@ static INPUT_HI: &str = r##"
     charge =               0.0
     spin =                 1.0
     spin_polarization =    false
-    auxbasis_response =    true
-    mixer =                "diis"
-    num_max_diis =         8
-    start_diis_cycle =     1
-    mix_param =            0.6
-    max_scf_cycle =        100
 
 [ctrl.ri_pt2]
     # the multipole property path follows this keyword (FP32 is the global default); pinned to

@@ -20,7 +20,7 @@ use rstsr::prelude::*;
 static INPUT_NH3: &str = r##"
 [ctrl]
     print_level =          2
-    num_threads =          16
+    num_threads =          4
     xc =                   "b3lyp"
     basis_path =           "def2-tzvp"
     auxbas_path =          "def2-universal-jkfit"
@@ -28,12 +28,6 @@ static INPUT_NH3: &str = r##"
     charge =               0.0
     spin =                 1.0
     spin_polarization =    false
-    auxbasis_response =    true
-    mixer =                "diis"
-    num_max_diis =         8
-    start_diis_cycle =     3
-    mix_param =            0.8
-    max_scf_cycle =        100
 
 [geom]
     name = "NH3"

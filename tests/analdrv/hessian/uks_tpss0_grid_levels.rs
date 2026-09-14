@@ -15,7 +15,7 @@ use rstsr::prelude::*;
 static INPUT_NH3: &str = r##"
 [ctrl]
     print_level =          2
-    num_threads =          16
+    num_threads =          4
     xc =                   "TPSS0"
     basis_path =           "def2-tzvp"
     auxbas_path =          "def2-universal-jkfit"
@@ -23,12 +23,6 @@ static INPUT_NH3: &str = r##"
     charge =               2.0
     spin =                 3.0
     spin_polarization =    true
-    auxbasis_response =    true
-    mixer =                "diis"
-    num_max_diis =         8
-    start_diis_cycle =     3
-    mix_param =            0.8
-    max_scf_cycle =        100
     xc_parser =            "parse_xc"
 
 [geom]
