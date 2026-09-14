@@ -23,8 +23,9 @@ mod lib;
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper,_dgemm_full,_qrpinv};
 use itertools::Itertools;
 use num_traits::ToPrimitive;
-use std::ffi::{c_char,c_double,c_int};
-use std::process::Command;
+use std::ffi::{c_char,c_double};
+mod auto_k;
+pub use auto_k::estimate_isdf_k;
 
 /* Given grid points and center of each clusters, classify points to nearest cluster centers.
 Input:
@@ -1197,25 +1198,6 @@ pub fn prepare_m_isdf(k_mu: usize, mol: &Molecule, grids: &dft::Grids) -> (Matri
     (varphi, kernel_part)
 }
 
-pub fn find_current_python() -> Option<String> {
-    println!("=========================================================");
-    println!("Check Python interpreter");
-    let python_commands = ["python", "python3"];
-    for cmd in &python_commands {
-        match Command::new(cmd).arg("--version").output() {
-            Ok(output) => {
-                let version = String::from_utf8_lossy(&output.stdout);
-                println!("Find {}: {}", cmd, version.trim());
-                println!("=========================================================");
-                return Some(cmd.to_string());
-            },
-            Err(_) => {}
-        }
-    }
-    println!("Could not find python or python3!");
-    None
-}
-
 // \alpha = 1.0, 2.0, 3.0
 // \Omega = ZC^T(CC^T)^{-1}
 pub fn prepare_m_isdf_weight(k_mu: usize, mol: &Molecule, grids: &dft::Grids, occupation: &[Vec<f64>; 2], scftype: SCFType) -> (MatrixFull<f64>, MatrixFull<f64>) {
@@ -1401,49 +1383,6 @@ pub fn ip_from_dm_dense(tab_ao: &MatrixFull<f64>, coordinates: &Vec<[f64;3]>, la
     (ip, weight, n_mu)
 }
 
-pub fn ip_from_dm_compressed(grids: &dftgrids, mol: &Molecule, dm: &Vec<MatrixFull<f64>>, k_mu: usize) -> (Vec<[f64; 3]>, Vec<f64>, usize) {
-    /// for compressed tabulated_ao, which is saved as CompressedAO
-    let ao_c = match &grids.ao_compressed {
-        Some(c) => c,
-        None => panic!("This function should be used if AO is compressed. This must be a bug!"),
-    };
-    let spin_channel = dm.len();
-    let n_mu = k_mu * mol.num_auxbas;
-
-    let mut density_list: Vec<(usize, f64)> = Vec::new();
-    for ibatch in 0..ao_c.batches.len() {
-        let grid_range = ao_c.batch_grid_ranges[ibatch].clone();
-        let rho_batch = grids.prepare_tabulated_density_compressed(dm,spin_channel,grid_range.clone());
-        for g_local in 0..rho_batch.size[0] {
-            let total_rho = if spin_channel == 1 {
-                rho_batch[[g_local, 0]]
-            } else {
-                rho_batch[[g_local, 0]] + rho_batch[[g_local, 1]]
-            };
-            density_list.push((grid_range.start + g_local, total_rho));
-        }
-    }
-
-    density_list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-    let total = density_list.len();
-    let mut coords = Vec::with_capacity(n_mu);
-    let mut weights = Vec::with_capacity(n_mu);
-
-    for i in 0..n_mu {
-        let idx = if n_mu == 1 {
-            0
-        } else {
-            ((i as f64 * (total - 1) as f64) / (n_mu - 1) as f64).round() as usize
-        };
-        let global_idx = density_list[idx].0;
-        coords.push(grids.coordinates[global_idx]);
-        weights.push(grids.weights[global_idx]);
-    }
-
-    (coords, weights, n_mu)
-}
-
 pub fn tabulated_density(coordinates: &Vec<[f64;3]>, ao:&MatrixFull<f64>, dm: &Vec<MatrixFull<f64>>, spin_channel: usize) -> MatrixFull<f64> {
     let num_grids = coordinates.len();
     let mut cur_rho = MatrixFull::new([num_grids,spin_channel],0.0);
@@ -1609,24 +1548,7 @@ pub fn prepare_m_isdf_dm_v2(k_mu: usize, mol: &mut Molecule, grids: &mut Option<
     let mut time_mark = utilities::TimeRecords::new();
     time_mark.new_item("pinv", "pseudo inverse of S");
     time_mark.count_start("pinv");
-    /// DGESDD
-//    println!("Apply pinv_sdd");
-//    let mut inv_cctrans = pinv_sdd(&mut mat_s, 1.0e-12);
-//    println!("pinv_sdd done");
-    /// DGESDD
-//    println!("Apply pinv_sdd_i64");
-//    drop(work2);
-//    let mut inv_cctrans = pinv_sdd_i64(&mut work1, 1.0e-12);
-//    println!("pinv_sdd_i64 done");
-    /// DGESVD
-//    println!("Apply svd pinv");
-//    drop(work2);
-//    let mut inv_cctrans = work1.pinv(1.0e-12);
-//    println!("svd pinv done");
-    /// DGEQP3
-//    println!("Apply qr pinv");
     let mut inv_cctrans = _qrpinv(&mut work1, work2, Some(1e-10)).unwrap();
-//    println!("qr pinv done");
     time_mark.count("pinv");
     //=============================================================
 
@@ -1735,25 +1657,8 @@ pub fn prepare_m_isdf_dm_v2(k_mu: usize, mol: &mut Molecule, grids: &mut Option<
 }
 
 pub fn call_isdf_k_generator(mol: &Molecule) -> usize {
-    let project_root = std::env!("CARGO_MANIFEST_DIR");
-    let file_path = std::path::Path::new(project_root).parent().unwrap().join(file!());
-    let current_dir = file_path.parent().unwrap();
-    let wrapper_path = current_dir.join("set_k_auto.py");
-    let python_command = find_current_python().unwrap();
-    let output = Command::new(python_command.as_str())
-        .arg(wrapper_path.to_str().unwrap())
-        .arg(current_dir.to_str().unwrap())
-        .arg(&mol.ctrl.ctrl_file.as_str())
-        .output().unwrap();
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        panic!("Python script failed: {}", stderr);
-    };
-
-    let stdout_str = str::from_utf8(&output.stdout).unwrap();
-    let result: usize = stdout_str.trim().parse().unwrap();
-    result
+    estimate_isdf_k(std::path::Path::new(&mol.ctrl.ctrl_file))
+        .unwrap_or_else(|err| panic!("ISDF automatic k estimation failed: {err:#}"))
 }
 
 pub fn set_isdf_k(mol: &mut Molecule) {
@@ -1804,105 +1709,6 @@ pub fn dgemm_ffi(mat_a: &[f64], mat_b: &[f64], mat_c: &mut [f64], transa: &c_cha
             ldc as *const i32,
         );
     }
-}
-
-// use ffi to perform pinv_sdd
-pub fn pinv_sdd_i64(mat: &mut MatrixFull<f64>, threshold: f64) -> MatrixFull<f64> {
-    let jobz = b'A' as c_char;
-    let m = mat.size[0];
-    //m = n = lda = ldu = ldvt
-    let mut s = vec![0.0; m];
-    let mut u = vec![0.0; (m * m)];
-    //use jobz = 'O', the mat itself will be u
-    let mut vt = vec![0.0;(m * m)];
-    let lwork = 5 * m * m + 10 * m;
-    let mut work = vec![0.0; lwork];
-    let mut iwork = vec![0; (8 * m)];
-    let mut info = 0;
-    let m = m as i32;
-    let lwork = lwork as i64;
-    //u -> mat, vt -> vt, sigma -> s
-    unsafe {
-        dgesdd_(
-            &jobz as *const c_char,
-            &m as *const i32,
-            &m as *const i32,
-            mat.data.as_mut_ptr(),
-            &m as *const i32,
-            s.as_mut_ptr(),
-            u.as_mut_ptr(),
-            &m as *const i32,
-            vt.as_mut_ptr(),
-            &m as *const i32,
-            work.as_mut_ptr(),
-            &lwork as *const i64,
-            iwork.as_mut_ptr(),
-            &mut info as *mut i32,
-            );
-    };
-    if info != 0 {
-        panic!("Lapack dgesdd failed");
-    };
-    //filter s and get s_inv
-    let cutoff = threshold * s[0];
-    s.par_iter_mut().for_each(|x| {
-        if *x < cutoff {
-            *x = 0.0;
-        } else {
-            *x = x.recip();
-        }
-    });
-    //Note u_mat = mat.data
-    let mut u_mat = MatrixFull::from_vec([m as usize,m as usize], u).unwrap();
-    for j in 0..(m as usize) {
-        u_mat.iter_column_mut(j).for_each(|x| {
-            *x *= s[j];
-        });
-    };
-    let mut inv_s = vec![0.0;(m as usize) * (m as usize)];
-    let transa = b'T' as c_char;
-    let transb = b'T' as c_char;
-    let alpha = 1.0;
-    let beta = 0.0;
-    unsafe {
-        dgemm_(
-            &transa as *const c_char,
-            &transb as *const c_char,
-            &m as *const i32,
-            &m as *const i32,
-            &m as *const i32,
-            &alpha as *const f64,
-            vt.as_ptr(),
-            &m as *const i32,
-            u_mat.data.as_ptr(),
-            &m as *const i32,
-            &beta as *const f64,
-            inv_s.as_mut_ptr(),
-            &m as *const i32,
-            );
-    };
-    let inv_s = MatrixFull::from_vec([m as usize,m as usize],inv_s).unwrap();
-    inv_s
-}
-
-#[link(name="lapack")]
-extern "C" {
-    fn dgesdd_(
-        jobz: *const c_char,
-        m: *const i32,
-        n: *const i32,
-        a: *mut c_double,
-        lda: *const i32,
-        s: *mut c_double,
-        u: *mut c_double,
-        ldu: *const i32,
-        vt: *mut c_double,
-        ldvt: *const i32,
-        work: *mut c_double,
-        lwork: *const i64,
-        iwork: *mut c_int,
-        info: *mut i32,
-        );
 }
 
 #[link(name="lapack")]

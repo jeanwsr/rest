@@ -15,7 +15,6 @@ use crate::{dft::Grids, utilities::balancing};
 use crate::constants::BOHR;
 use super::{parameters::{SG1RADII, BRAGG0, LEBEDEV_NGRID}, atom::default_angular_num};
 use crate::{dft::RIFull, isdf::tabulated_density_batch};
-use crate::molecule_io::Molecule;
 
 /// Standard Grid 1 according to _P. M. W. Gill, B. G. Johnson, J. A. Pople. Chemical Physics Letters 209, 506-512 (1993)_.<br>
 /// Reference can be found [here](https://doi.org/10.1016/0009-2614(93)80125-9).
@@ -254,49 +253,6 @@ pub fn prune_by_rho(grids: &Grids, dm: &Vec<MatrixFull<f64>>, spin_channel: usiz
         quadrature_weights: quad_r,
     }
     
-}
-
-pub fn prune_by_rho_compressed(grids: &mut Grids, mol: &Molecule, dm: &Vec<MatrixFull<f64>>, spin_channel: usize) {
-    /// for the case that sparsity < 90%
-    /// the grids may keep sparse, or back to dense
-    let ao_c = grids.ao_compressed.as_ref().expect("Compressed AO must be built first. This must be a bug");
-    let ngrids_ori = grids.coordinates.len();
-    let threshold = 1.0e-3 / ngrids_ori.to_f64().unwrap();
-
-    let mut keep_indices = Vec::new();
-
-    for ibatch in 0..ao_c.batches.len() {
-        let grid_range = ao_c.batch_grid_ranges[ibatch].clone();
-
-        let rho_batch = grids.prepare_tabulated_density_compressed(dm, spin_channel, grid_range.clone());
-        for g_local in 0..rho_batch.size[0] {
-            let total_rho = if spin_channel == 1 {
-                rho_batch[[g_local, 0]]
-            } else {
-                rho_batch[[g_local, 0]] + rho_batch[[g_local, 1]]
-            };
-
-            if total_rho >= threshold {
-                keep_indices.push(grid_range.start + g_local);
-            }
-        }
-    }
-
-    if keep_indices.is_empty() {
-        panic!("No grids are kept, why?");
-    }
-
-    let old_coords = std::mem::take(&mut grids.coordinates);
-    let old_weights = std::mem::take(&mut grids.weights);
-
-    grids.coordinates = keep_indices.iter().map(|&g| old_coords[g]).collect();
-    grids.weights = keep_indices.iter().map(|&g| old_weights[g]).collect();
-
-    grids.non0tab = None;
-    grids.ao_compressed = None;
-    grids.aop_compressed = None;
-
-    grids.prepare_tabulated_ao_sparse(mol);
 }
 
 pub fn prune_by_rho_dense(grids: &mut Grids, dm: &Vec<MatrixFull<f64>>, spin_channel: usize, batch_size: Option<usize>) {

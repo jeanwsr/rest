@@ -1710,7 +1710,6 @@ impl SCF {
             1.0, 0.0);
             vk.push(vk_i.to_matrixupper());
         }
-	println!("vk end");
         vk
     }
 

@@ -188,7 +188,7 @@ pub struct InputKeywords {
     // Keywords for IDSF
     #[pyo3(get, set)]
     pub use_isdf: bool,
-    /// ISDF interpolation-points multiplier k, `None` to auto-estimate via set_k_auto.py.
+    /// ISDF interpolation-points multiplier k; `None` uses the Rust/PyO3 estimator.
     #[pyo3(get, set)]
     pub isdf_k: Option<usize>,
     #[pyo3(get, set)]
