@@ -15,7 +15,7 @@ use crate::scf_io::SCF;
 use crate::dft::num_int::{FXCMatvecData, prepare_fxc_data};
 use crate::dft::Grids;
 use crate::dft::numint_matmul::nimatmul::NIMatmul;
-use crate::dft::numint_matmul::hess_rks::eval_vxc_fxc_from_rho;
+use crate::dft::numint_matmul::resp_rks::eval_vxc_fxc_from_rho;
 use crate::dft::xceff::prelude::{determine_den_type, libxc_eval_eff, XCDenType, XCSpin};
 use crate::ri_jk::util::get_cint_mol;
 use crate::ri_tddft::utils::{tddft_occupation_parameters, tddft_get_submatrix};
@@ -142,7 +142,7 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
 /// Prepare the shared TDDFT data for **AO mode**.
 ///
 /// The fxc kernel is evaluated with the modern `numint_matmul` stack
-/// (`eval_vxc_fxc_from_rho`), the same libxc wrapper used by the RKS hessian,
+/// (`eval_vxc_fxc_from_rho`), the same libxc wrapper used by the RKS response,
 /// so the values match the MO path bit-identically. The **raw** kernel
 /// `[ngrids, nvar, nvar]` is stored as `fxc_eff` (×2 singlet factor) for the
 /// batched `NIMatmul` path, which applies the real grid weights internally.

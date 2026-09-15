@@ -43,6 +43,9 @@ pub mod sbge2_25d;
 pub mod pure_pt2_pair_eng;
 pub mod pt2_pair_eng;
 
+pub mod pure_pt2_r_elecderiv;
+pub mod rgfock_pt2;
+
 #[derive(Clone)]
 pub struct PT2 {
     pub pt2_type: usize,
