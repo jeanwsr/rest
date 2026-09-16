@@ -62,12 +62,18 @@ jobs:
           # simple-dftd3/dftd4/geometric are runtime Python deps required by the
           # regression suite (dispersion / TRIC-optimizer cases import them via
           # REST's Python bridge); the build itself does not link them
-          # openmpi 4.* and openblas <0.3.34 pinned to match the feedstock
+          # openmpi 4.* and openblas <0.3.34 pinned to match the feedstock.
+          # NOTE: space-separated specs ("openmpi 4.*") must stay QUOTED - unquoted,
+          # the shell would pass the version as a separate package spec.
+          CONDA_EXTRA="${{ matrix.conda_extra }}"
+          EXTRA_ARGS=()
+          if [ -n "$CONDA_EXTRA" ]; then EXTRA_ARGS=("$CONDA_EXTRA"); fi
           $CONDA create -y -p "$CONDA_DIR/envs/rest-dev" \
             python=3.11 numpy scipy h5py \
             "libopenblas <0.3.34 *openmp*" \
-            libxc libcint hdf5 openmpi 4.* gfortran libclang \
-            simple-dftd3 dftd4 geometric mokit ${{ matrix.conda_extra }} \
+            libxc libcint hdf5 "openmpi 4.*" gfortran libclang \
+            simple-dftd3 dftd4 geometric mokit \
+            "${EXTRA_ARGS[@]}" \
             -c conda-forge -c mokit
           echo "CONDA_PREFIX=$CONDA_DIR/envs/rest-dev" >> "$GITHUB_ENV"
           echo "$CONDA_DIR/envs/rest-dev/bin" >> "$GITHUB_PATH"
