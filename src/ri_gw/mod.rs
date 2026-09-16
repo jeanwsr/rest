@@ -56,7 +56,17 @@ pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperat
         println!("Starts renormalized singles calculations!");
         let w_rs=qp_ctrl.w_rs;
         let rs_full_space=qp_ctrl.rs_full_space;
-        if rs_full_space{
+        if qp_ctrl.rs_use_rs_orbitals{
+            // Diagonalise the HF Hamiltonian *and* feed the resulting RS orbital
+            // coefficients back into `scf_data.eigenvectors`, so that every
+            // subsequent RI AO-to-MO transformation is done in the RS MO basis.
+            let rs=renormalized_singles::renormalized_singles_with_orbitals(scf_data,rs_full_space,mpi_operator);
+            // Dump both orbital sets so that RS-basis quantities (BSE amplitudes,
+            // NTOs, ...) can be transformed back to the Kohn-Sham basis.
+            renormalized_singles::save_rs_orbitals(&rs.coefficients,&rs.ks_coefficients,&rs.rotation,&rs.energies,&scf_data.eigenvalues[0],"rs_orbitals.dat");
+            renormalized_singles::install_rs_orbitals(scf_data,&rs.coefficients);
+            rs_particles=rs.energies;
+        }else if rs_full_space{
             rs_particles=renormalized_singles::renormalized_singles_diagonalization_fullspace(scf_data,w_rs,mpi_operator);
         }else{
             rs_particles=renormalized_singles::renormalized_singles_diagonalization(scf_data,w_rs,mpi_operator);
@@ -711,6 +721,30 @@ pub fn calculate_sigma_c_imag_freq(
     }
     Complex64::new(real_sum, imag_sum)
 }
+/// One-particle energies that belong to the orbital set currently stored in
+/// `scf_data.eigenvectors`.
+///
+/// When the renormalized-singles orbitals have been installed
+/// (`rs_use_rs_orbitals = true`), the orbital coefficient matrix and the
+/// eigenvalues must stay in the same representation: the RS orbital `n` is not
+/// the Kohn-Sham orbital `n`, so energy-keyed quantities (orbital windows,
+/// screening denominators, output labels) have to use the RS eigenvalues
+/// `scf_data.renormalized_singles_particles`.
+///
+/// In every other case this is simply the Kohn-Sham eigenvalue array, i.e. the
+/// historical behaviour.
+pub fn current_orbital_energies(scf_data:&SCF)->Vec<f64>{
+    let rs_orbitals_installed=scf_data.mol.ctrl.quasiparticle_methods.clone()
+        .map(|qp|qp.rs_use_rs_orbitals&&qp.renormalized_singles)
+        .unwrap_or(false);
+    if rs_orbitals_installed
+        && scf_data.renormalized_singles_particles.len()==scf_data.eigenvalues[0].len()
+    {
+        scf_data.renormalized_singles_particles.clone()
+    }else{
+        scf_data.eigenvalues[0].clone()
+    }
+}
 pub fn get_occupation_parameters(scf_data:&SCF,response_or_not:char)->(usize,usize,usize,usize,usize,usize){
     let cutoff=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap().bse_cutoff_energy;
     let mut num_state = scf_data.mol.num_state;
@@ -730,7 +764,9 @@ pub fn get_occupation_parameters(scf_data:&SCF,response_or_not:char)->(usize,usi
     }
     
     else if response_or_not=='N'{
-        num_state=scf_data.eigenvalues[0].clone().iter().filter(|x|**x<cutoff).count();
+        // The cutoff defines which orbitals enter the calculation, so it must be
+        // applied to the energies of the orbitals that are actually in use.
+        num_state=current_orbital_energies(scf_data).iter().filter(|x|**x<cutoff).count();
         vir_size=num_state-occ_size;
     }
     (start_mo,num_state,occ_size,vir_size,homo,lumo)
@@ -1697,7 +1733,7 @@ pub fn get_homo_vx_or_vc(scf_data:&mut SCF,name:&str,choice:char)->f64{
 }
 pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperator>){
     let printlevel=scf_data.mol.ctrl.print_level.clone();
-    let v_matrix=v_matrix_from_scf(scf_data);
+    let mut v_matrix=v_matrix_from_scf(scf_data);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let mut rs_particles:Vec<f64>=Vec::new();
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
@@ -1706,7 +1742,14 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
         println!("Starts renormalized singles calculations!");
         let w_rs=qp_ctrl.w_rs;
         let rs_full_space=qp_ctrl.rs_full_space;
-        if rs_full_space{
+        if qp_ctrl.rs_use_rs_orbitals{
+            // See the corresponding branch of `gw_main`: the RS orbital
+            // coefficients replace the KS ones for all later RI AO2MO steps.
+            let rs=renormalized_singles::renormalized_singles_with_orbitals(scf_data,rs_full_space,mpi_operator);
+            renormalized_singles::save_rs_orbitals(&rs.coefficients,&rs.ks_coefficients,&rs.rotation,&rs.energies,&scf_data.eigenvalues[0],"rs_orbitals.dat");
+            renormalized_singles::install_rs_orbitals(scf_data,&rs.coefficients);
+            rs_particles=rs.energies;
+        }else if rs_full_space{
             rs_particles=renormalized_singles::renormalized_singles_diagonalization_fullspace(scf_data,w_rs,mpi_operator);
         }else{
             rs_particles=renormalized_singles::renormalized_singles_diagonalization(scf_data,w_rs,mpi_operator);
@@ -1715,6 +1758,11 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
             println!("rs_particles:{:?}",rs_particles);
         }
         scf_data.renormalized_singles_particles=rs_particles
+    }
+    if qp_ctrl.rs_use_rs_orbitals{
+        // The exchange matrix <n i|i n> is itself an RI AO2MO quantity: rebuild it
+        // in the RS orbital basis installed above.
+        v_matrix=v_matrix_from_scf(scf_data);
     }
     let eigenenergies:Vec<f64>=scf_data.eigenvalues[0].clone();
     let mut quasiparticle_energies_g:Vec<f64>=Vec::new();

@@ -253,7 +253,7 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
     // Triplet:   f_t = f↑↑ − f↑↓ cannot be obtained from an unpolarized
     //            evaluation; it requires a spin-polarized evaluation at
     //            (ρ/2, ∇ρ/2) per spin, combined along the antisymmetric direction.
-    let tddft_spin = scf.mol.ctrl.tddft.as_ref().map_or("singlet", |t| t.tddft_spin.as_str());
+    let tddft_spin = scf.mol.ctrl.tddft.as_ref().map_or("singlet", |t| t.restricted_spin());
     let rho0_g = rho0.i((.., .., 0)); // [ngrids, nvar] ground density + gradients
     let fxc_eff = match tddft_spin {
         "triplet" => {

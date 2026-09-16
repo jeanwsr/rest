@@ -427,6 +427,48 @@ Renormalized Singles方法通过投影DFT密度矩阵构造单激发HF哈密顿�
 
 - `renormalized_singles`: 取值bool，设置为 `true` 开启rsGW。得到的RS本征值用于初始化GW中Green函数G的粒子能量。缺省为false。
 - `w_rs`: 取值bool，仅在 `renormalized_singles = true` 时生效。设置为 `true` 时进一步使用RS粒子能量初始化GW中的屏蔽库仑相互作用W部分。缺省为false。
+- `rs_full_space`: 取值bool，仅在 `renormalized_singles = true` 时生效。缺省为 `false`：分别在占据子空间与未占据子空间内构建HF哈密顿量并各自对角化（块对角化，DFT占据数保持不变）。设置为 `true`：构建**完整轨道空间**的HF哈密顿量 `H^RS = Cᵀ (h + J[D_DFT] − ½K[D_DFT]) C` 并整体对角化，占据与未占据轨道之间允许混合，得到更严格的renormalized singles粒子；RS本征值按能量升序返回并用于GW初始化。
+- `rs_use_rs_orbitals`: 取值bool，仅在 `renormalized_singles = true` 时生效。缺省为 `false`：只使用RS本征值重新初始化GW，轨道系数仍为DFT（KS）轨道。设置为 `true`：把HF哈密顿量对角化得到的轨道系数（`C_rs = C_ks · U`，`U` 为变分一致的轨道旋转）写回轨道系数矩阵，于是**RI三中心积分张量会按新的轨道系数从AO基重新组合成MO基**——GW 中所有 `generate_ri3mo_*` / `v_matrix_from_scf` 的AO→MO变换都在RS轨道基下完成。推荐与 `w_rs = true` 搭配使用（此时G与W的能量、积分基组保持一致）。
+
+  打开该选项后，**rsGW 之后的整个后处理过程都统一在 RS 轨道表象中**：
+
+  - 后续 **BSE 计算**的 `v`、`W` 矩阵元、偶极矩阵、以及输出的跃迁振幅（`#i->#a`、NTO、PySOC 导出的 CI 系数）都在 RS 分子轨道基下（BSE 每次调用 `get_submatrix`/`compute_dipole_matrix` 时都重新用当前轨道系数做 AO→MO，不存在 KS 基缓存）；程序会打印 `BSE orbital representation: renormalized-singles (RS) orbitals.` 提示；
+  - BSE/响应的**屏蔽能量**（χ⁰ 分母）改用 RS 本征值 `renormalized_singles_particles`（否则会出现"RS 轨道 + KS 能量分母"的混合表象），程序会打印 `BSE screening: using the renormalized-singles eigenvalues`；
+  - `bse_cutoff_energy` 等**轨道窗口**判据按 RS 本征值而不是 KS 本征值筛选；
+  - 程序在当前目录写出 `rs_orbitals.dat`，内含 `e_rs`、`C_rs`、`e_ks`、`C_ks` 与旋转矩阵 `U`（`C_rs = C_ks·U`），可直接用于把 RS 表象下的跃迁振幅换回 KS 表象：`A_KS = U_o A_RS U_vᵀ`；
+  - `print_level > 2` 时程序会额外做一次自洽性校验，打印
+    `max|(ia|P)_RS - Σ U U (rs|P)_KS|` 与 `max|mu_RS - Uᵀ mu_KS U|`（应为机器零），用于确认 RI AO2MO 确实使用了新的轨道系数。
+
+  读取 `rs_orbitals.dat`（`#` 开头为注释行，其余按顺序为 `nao nmo`、`e_rs`、`C_rs`、`e_ks`、`C_ks`、`U`；矩阵按"每个轨道一行"存放）：
+
+  ```python
+  import numpy as np
+  lines = [l for l in open("rs_orbitals.dat") if not l.startswith("#")]
+  nao, nmo = map(int, lines[0].split()); i = 1
+  e_rs = np.array([float(x) for x in lines[i].split()]); i += 1
+  C_rs = np.array([[float(x) for x in lines[i+k].split()] for k in range(nmo)]); i += nmo
+  e_ks = np.array([float(x) for x in lines[i].split()]); i += 1
+  C_ks = np.array([[float(x) for x in lines[i+k].split()] for k in range(nmo)]); i += nmo
+  U    = np.array([[float(x) for x in lines[i+k].split()] for k in range(nmo)])
+  # 每行是一个轨道的AO系数: C_rs.T == U.T @ C_ks.T ; 把RS表象的(i,a)振幅换回KS表象:
+  # A_ks = U[:occ,:occ].T ... 见上式 A_KS = U_o A_RS U_v^T
+  ```
+
+> **注意**：`rs_full_space = false`（块对角化）且 `w_rs = true` 而 `rs_use_rs_orbitals = false` 时，写回轨道系数矩阵的是历史实现所用的转置旋转 `C_ks·Uᵀ`，它并不对角化HF哈密顿量。为兼容既有计算结果，该历史行为保持不变；需要变分一致的轨道基时请设置 `rs_use_rs_orbitals = true`（`rs_full_space = true` 的路径两者等价）。两种旋转给出的准粒子能量差别可达 ~0.1 Ha。
+
+rsGW 输入卡示例（完整轨道空间HF对角化 + RS轨道用于RI AO2MO）：
+
+```toml
+[quasiparticle_methods]
+gw_or_bse = “gw”
+gw_scheme = “extrapolated”
+scgw = “g0w0”
+renormalized_singles = true
+rs_full_space = true
+rs_use_rs_orbitals = true
+w_rs = true
+use_low_rank_contour = true
+```
 
 ### Low-Rank Contour Deformation（推荐加速方法）
 
@@ -467,10 +509,12 @@ Renormalized Singles方法通过投影DFT密度矩阵构造单激发HF哈密顿�
 BSE计算在 `gw_or_bse = “bse”` 时进行，在GW准粒子能量（或从文件读取的准粒子能量）基础上构建BSE kernel并对角化求解垂直激发能。
 
 - `bse_tda`: 取值bool，设置为 `true` 使用Tamm-Dancoff近似（仅保留BSE kernel的A子矩阵），设置为 `false`（缺省）使用完整BSE（包含A和B子矩阵的非TDA计算）。TDA近似计算量更小，通常对低能激发态精度足够。
-- `bse_spin`: 取值String，必须参数。指定计算的自旋激发类型：
+- `bse_spin`: 取值String，必须参数。指定计算的自旋激发类型（**限制性参考态**）：
     - `”singlet”`：单重态激发。
     - `”triplet”`：三重态激发。
     - `”both”`：同时计算单重态和三重态激发。
+    - 对**非限制参考态**（`spin_polarization = true`，UBSE）该关键词不选择自旋通道，
+      只作为 BSE 开关；`"triplet"` / `"both"` 已移除，详见"Unrestricted GW-BSE（UGW/UBSE）设置"一节。
 - `bse_cutoff_energy`: 取值f64，单位Hartree。KS能级高于此能量的虚轨道将被排除在BSE激发空间之外，缩减BSE kernel维度。建议根据体系设置为合理值（含几百条虚轨道即可），缺省为1e6（几乎不截断）。
 - `davidson_target_excitations`: 取值usize，需要计算的激发态数目。缺省为6。
 - `bse_davidson_solver`: 取值bool，设置为 `true` 使用Davidson迭代对角化（推荐用于仅需少数低能激发态的体系），设置为 `false`（缺省）使用完整矩阵对角化（适合小体系或需要全部激发态的情况）。
@@ -572,11 +616,20 @@ spin = 2.0          # 例如 NH2 双自由基/双基态，2S = 2
 spin_polarization = true
 ```
 
-UBSE 的 `bse_spin` 含义与 Restricted 略有不同：
+UBSE **没有**自旋通道选择：`bse_spin` 对非限制参考态不再表示"单重态/三重态"，
+它只保留"是否触发 BSE"的作用：
 
-- `bse_spin = "singlet"`：自旋守恒、含 Hartree 项的 BSE 通道。
-- `bse_spin = "triplet"`：自旋守恒、不含 Hartree 项的 BSE 通道（对应 MolGW 的 `triplet=yes`）。
-- `bse_spin = "both"`：同时计算上述两个通道。
+- `bse_spin = "none"`（缺省）：不触发 BSE 计算。
+- `bse_spin = "singlet"`（或 `"unrestricted"`）：触发非限制 BSE。此处只有一个合法的自旋守恒通道 ——
+  直接（屏蔽库仑）核与自旋无关，把 α、β 两个块耦合在一起，因此不存在"去掉直接项"的第二个通道。
+- `bse_spin = "triplet"` / `"both"`：**已移除**，程序会报错并给出说明。原因同上：
+  对自旋对称的参考态，去掉直接项的算符会把真正的三重态与对称扇区中无物理意义的根混在一起；
+  对开壳层参考态（如 NH₂ 双重态）它不对应任何物理通道，甚至会产生零能假根。
+  限制性参考态下的 `bse_spin = "singlet" / "triplet" / "both"` **保持不变**
+  （限制性参考态可以自旋适配，那里的三重态通道是严格的物理通道）。
+
+> 注：Restricted 与 Unrestricted 路径的 `bse_spin` 语义不同：限制性路径中它是真正的自旋通道选择器，
+> 非限制路径中它只是 BSE 的开关（"none" 之外的值都触发同一个自旋耦合通道）。
 
 UBSE 支持 dense、Davidson、FEAST 三种对角化方式。
 
@@ -628,7 +681,8 @@ davidson_max_iter = 100
 davidson_converge_threshold = 1e-8
 ```
 
-> 注意：UGW/UBSE 目前主要用于共线开壳层体系。Restricted 与 Unrestricted 路径的 `bse_spin` 语义不完全相同，使用时请根据实际自旋通道选择。
+> 注意：UGW/UBSE 目前主要用于共线开壳层体系。非限制路径下 `bse_spin` 只作为 BSE 开关
+> （`"none"` 之外的值都触发同一个自旋耦合通道），不再选择自旋通道；`"triplet"` / `"both"` 已移除。
 
 ## 溶剂化计算相关设置
 - `solvent_model`: 取值String, 用于指定用于计算的溶剂模型。目前支持CPCM, COSMO, IEFPCM, SS(V)PE,SMD。缺省为CPCM。SMD及其梯度为实验性功能。
@@ -653,9 +707,18 @@ TD-DFT方法相关的设置在 `[tddft]` 区块中进行。REST支持基于RI积
 - `tddft_method`: 取值String，选择TD-DFT求解方法：
     - `"tda"`：Tamm-Dancoff近似，仅求解A子矩阵的本征值问题。计算量较小，对低能激发态通常与完整线性响应精度相当。
     - `"lr"`（缺省）：完整线性响应，同时使用A和B子矩阵，对激发能的描述更完备。
-- `tddft_spin`: 取值String，指定计算的自旋激发类型：
+- `tddft_spin`: 取值String，指定**限制性**（自旋适配）参考态的自旋通道：
     - `"singlet"`（缺省）：单重态激发，库仑耦合因子为2。
-    - `"triplet"`：三重态激发，库仑耦合因子为0。
+    - `"triplet"`：三重态激发，库仑耦合因子为0；仅 AO 模式（需同时设 `tddft_mode = "ao"`）支持。
+    - `"both"`：先算单重态、再算三重态；同样仅 AO 模式支持，`pysoc = true` 的 PySOC 导出需要此项。
+    - 其它取值将报错。
+    - **该关键词不适用于非限制参考态**（`spin_polarization = true`，即非限制 TD-DFT，UTDDFT）。
+      非限制 TD-DFT 只有一个合法的响应通道：库仑（Hartree）核与自旋无关，它把 α、β 两个块耦合在一起；
+      而"库仑因子 2 / 0"这一对只对**可以旋转到单/三重态子空间**的限制性参考态成立。
+      因此 UTDDFT 不存在"去库仑"的第二个通道，`"triplet"` / `"both"` 会被直接拒绝；
+      若在非限制计算中写了缺省值 `"singlet"`，程序会忽略它并给出提示（建议直接从输入中删除该关键词）。
+      注意：对自旋对称的参考态，非限制通道的本征谱**本身就同时包含单重态型与三重态型根**
+      （三重态型根的振子强度≈0），这是该算符的固有性质，而不是需要额外选择的通道。
 - `nroots`: 取值usize，需要计算的激发态数目（根的数目）。缺省为6。
 - `tddft_cutoff_energy`: 取值f64，单位Hartree。KS轨道能量高于此值的虚轨道将被排除在TD-DFT激发空间之外。设置合理值（如20.0-100.0）可显著缩减激发空间维度，加速计算。缺省为1e6（几乎不截断）。
 - `tddft_mode`: 取值String，选择TD-DFT计算模式：`"mo"`（缺省，MO-basis RI）/ `"ao"`（AO-basis）。
@@ -712,12 +775,29 @@ davidson_tol = 1.0e-10
 tddft_cutoff_energy = 50.0
 ```
 
-TD-DFT三重态TDA计算（5个激发态）：
+TD-DFT三重态TDA计算（5个激发态，限制性参考态，需 AO 模式）：
 ```toml
 [tddft]
 tddft_method = "tda"
 tddft_spin = "triplet"
+tddft_mode = "ao"
 nroots = 5
+```
+
+非限制TD-DFT（UTDDFT）的激发能计算（如 NH₂ 双重态，PBE0/cc-pVDZ）：
+```toml
+[ctrl]
+charge = 0.0
+spin = 2.0
+spin_polarization = true
+xc = "pbe0"
+basis_path = "/path/to/cc-pvdz"
+auxbas_path = "/path/to/cc-pvdz-rifit"
+
+[tddft]
+tddft_method = "tda"
+nroots = 6
+# 不要设置 tddft_spin：非限制参考态只有一个自旋耦合通道
 ```
 
 ## 解析Hessian计算相关设置

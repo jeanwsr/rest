@@ -34,3 +34,4 @@ _tmp*
 # local cargo target used for this task
 /target_u/
 **/.DS_Store
+/.remote-assistant/

@@ -38,6 +38,18 @@ pub struct QuasiParticle {
     pub davidson_add_dimensions:usize,
     pub bse_tda:bool,
     pub print_nto:bool,
+    /// BSE switch / spin channel.
+    ///
+    /// * `"none"` (default): no BSE is run.
+    /// * Restricted reference: a genuine spin channel selector --
+    ///   `"singlet"` (direct term, factor 2), `"triplet"` (no direct term,
+    ///   factor 0) or `"both"`.  The restricted reference can be rotated into
+    ///   the singlet/triplet subspaces, so both channels are physical.
+    /// * Unrestricted reference (`spin_polarization = true`): **no channel
+    ///   selection**.  The direct (screened Coulomb) kernel is spin-independent
+    ///   and couples the alpha and beta blocks, so there is a single physical
+    ///   channel; any value other than `"none"` just switches the run on, and
+    ///   `"triplet"` / `"both"` are rejected (see `bse_main_unrestricted`).
     pub bse_spin:String,
     pub bse_cutoff_energy:f64,
     pub save_bse_terms:bool,
@@ -49,6 +61,7 @@ pub struct QuasiParticle {
     pub renormalized_singles:bool,
     pub w_rs:bool,
     pub rs_full_space:bool,
+    pub rs_use_rs_orbitals:bool,
     pub scgw:String,
     pub gw:bool,
     pub bse_exchange_rescaling:f64,
@@ -203,6 +216,7 @@ impl Default for QuasiParticle {
             renormalized_singles:false,
             w_rs:false,
             rs_full_space:false,
+            rs_use_rs_orbitals:false,
             scgw:String::from("g0w0"),
             gw:false,
             save_bse_excitations:false, 
@@ -335,6 +349,7 @@ impl QuasiParticle {
         table.insert("renormalized_singles".to_string(), toml::Value::Boolean(self.renormalized_singles));
         table.insert("w_rs".to_string(), toml::Value::Boolean(self.w_rs));
         table.insert("rs_full_space".to_string(), toml::Value::Boolean(self.rs_full_space));
+        table.insert("rs_use_rs_orbitals".to_string(), toml::Value::Boolean(self.rs_use_rs_orbitals));
         table.insert("scgw".to_string(), toml::Value::String(self.scgw.clone()));
         table.insert("gw_rootfinder".to_string(), toml::Value::String(self.gw_rootfinder.clone()));
         table.insert("gw".to_string(), toml::Value::Boolean(self.gw));
@@ -621,6 +636,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 other => {false},
             };
             tmp_input.rs_full_space = match tmp_ctrl.get("rs_full_space").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.rs_use_rs_orbitals = match tmp_ctrl.get("rs_use_rs_orbitals").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };

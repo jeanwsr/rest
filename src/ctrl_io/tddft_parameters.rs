@@ -3,7 +3,22 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TDDFTParameters {
     pub tddft_method: String,       // "tda" or "lr" (full linear response)
-    pub tddft_spin: String,         // "singlet" or "triplet"
+    /// Spin channel of a **restricted** (spin-adapted) reference:
+    /// `"singlet"` (default), `"triplet"`, or `"both"` (triplet/both require
+    /// `tddft_mode = "ao"`).
+    ///
+    /// This keyword is **not applicable** to an unrestricted reference
+    /// (`spin_polarization = true`).  Spin-unrestricted TDDFT has a single,
+    /// legitimate response channel: the Coulomb kernel is spin-independent, so
+    /// the alpha and beta blocks are coupled by it, and there is no second
+    /// (Coulomb-free) channel to select -- the "factor 2 / factor 0" pair of the
+    /// restricted formalism only exists because a closed-shell restricted
+    /// reference can be rotated into the singlet/triplet subspaces.  An explicit
+    /// value other than the default `"singlet"` is therefore rejected in an
+    /// unrestricted run.
+    ///
+    /// `None` means the keyword was not given (restricted default: `"singlet"`).
+    pub tddft_spin: Option<String>,
     pub tddft_mode: String,         // "mo" (default; MO-basis RI tensors) or "ao" (AO transition-density kernel)
     pub grid_batch: bool,           // AO mode only: batch the fxc AO evaluation over grid batches (memory-bounded)
     pub tddft_ao_rik_driver: String, // AO mode only: exchange-K driver, "semitrans" (default; exact occ-side semi-transformation), "dm" (exact batched density-driven), or "lowrank" (per-vector SVD)
@@ -51,8 +66,10 @@ pub struct TDDFTParameters {
     // (effectively no cutoff).
     pub tddft_cutoff_energy: f64,
     /// If true, export TDDFT results to rest_pysoc_export.json for PySOC.
-    /// Requires tddft_spin = "both". Both Cartesian and spheric orbital
-    /// basis sets are supported (the PySOC export is always written in
+    /// Requires a restricted reference with `tddft_spin = "both"` (spin-orbit
+    /// coupling needs both the singlet and the triplet amplitudes); it is
+    /// rejected for an unrestricted reference. Both Cartesian and spheric
+    /// orbital basis sets are supported (the PySOC export is always written in
     /// Cartesian format; REST transforms spheric MOs when necessary).
     pub pysoc: bool,
     /// 1-based excited-state index for which the analytic nuclear gradient is
@@ -73,7 +90,7 @@ impl Default for TDDFTParameters {
     fn default() -> Self {
         TDDFTParameters {
             tddft_method: String::from("lr"),
-            tddft_spin: String::from("singlet"),
+            tddft_spin: None,
             tddft_mode: String::from("mo"),
             grid_batch: true,
             tddft_ao_rik_driver: String::from("semitrans"),
@@ -123,6 +140,17 @@ impl Default for TDDFTParameters {
     }
 }
 
+impl TDDFTParameters {
+    /// Spin channel used by the **restricted** (spin-adapted) TDDFT path.
+    ///
+    /// `tddft_spin` is absent from most input files; the restricted default is
+    /// `"singlet"`.  The unrestricted path never calls this: it owns a single
+    /// spin-coupled channel (see [`TDDFTParameters::tddft_spin`]).
+    pub fn restricted_spin(&self) -> &str {
+        self.tddft_spin.as_deref().unwrap_or("singlet")
+    }
+}
+
 pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Option<TDDFTParameters>> {
     match tmp_keys.get("tddft").unwrap_or(&serde_json::Value::Null) {
         serde_json::Value::Object(tmp_ctrl) => {
@@ -132,8 +160,19 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
                 _ => String::from("lr"),
             };
             p.tddft_spin = match tmp_ctrl.get("tddft_spin").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(s) => s.to_lowercase(),
-                _ => String::from("singlet"),
+                serde_json::Value::String(s) => {
+                    let v = s.to_lowercase();
+                    if !matches!(v.as_str(), "singlet" | "triplet" | "both") {
+                        anyhow::bail!(
+                            "tddft_spin = \"{}\" is not a valid choice; \
+                             use \"singlet\", \"triplet\" or \"both\" \
+                             (the latter two apply to restricted references only)",
+                            s
+                        );
+                    }
+                    Some(v)
+                },
+                _ => None,
             };
             p.tddft_mode = match tmp_ctrl.get("tddft_mode").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.to_lowercase(),

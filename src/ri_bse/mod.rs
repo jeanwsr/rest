@@ -37,10 +37,85 @@ pub struct BseOutput {
     pub excitation_energies: Vec<f64>,
 }
 
+/// Report which one-particle orbital set the BSE stage is expanded in.
+///
+/// Everything that enters the BSE Hamiltonian is derived from
+/// `scf_data.eigenvectors` at call time (RI three-centre AO2MO, dipole matrix,
+/// `v`, `W`, ...), so when the renormalized-singles orbitals have been installed
+/// the whole BSE stage — kernel *and* the printed/saved transition amplitudes
+/// `#i -> #a`, NTOs and PySOC coefficients — lives in the RS MO basis.
+fn report_orbital_representation(scf_data:&SCF){
+    let rs_orbitals=scf_data.mol.ctrl.quasiparticle_methods.clone()
+        .map(|qp|qp.renormalized_singles&&qp.rs_use_rs_orbitals)
+        .unwrap_or(false);
+    if rs_orbitals{
+        println!("BSE orbital representation: renormalized-singles (RS) orbitals.");
+        println!("  v, W, the dipole matrix and the transition amplitudes are all expanded in the RS MO basis");
+        println!("  (C_rs = C_ks * U); the RS coefficients and eigenvalues are in rs_orbitals.dat.");
+    }else{
+        println!("BSE orbital representation: Kohn-Sham orbitals.");
+    }
+}
+/// Save the BSE transition amplitudes (the eigenvector `X`, plus `Y` for the
+/// non-TDA case) of every computed excitation to `bse_terms.dat`.
+///
+/// The header states the orbital representation the amplitudes are expressed in
+/// (`renormalized-singles(RS)` when `rs_use_rs_orbitals` installed the RS
+/// orbitals, `kohn-sham` otherwise).  In the RS case the accompanying
+/// `rs_orbitals.dat` (written by `renormalized_singles::save_rs_orbitals`) holds
+/// the rotation `U` needed to map the amplitudes back to the Kohn-Sham basis,
+/// `A_KS = U_o A_RS U_vᵀ`.
+///
+/// Layout (`#` starts a comment line):
+///
+/// ```text
+/// # REST BSE transition amplitudes
+/// # orbital_representation: renormalized-singles(RS)
+/// # spin tda occ_size vir_size nstates
+/// singlet 1 5 24 3
+/// # state <n> energy <E>  (X layout: index = a*occ_size + i)
+/// state 0 0.3140005370402806
+/// x ...
+/// y ...            (non-TDA only)
+/// ```
+pub fn save_bse_amplitudes(excitations:&Vec<(f64,Vec<f64>)>,occ_size:usize,vir_size:usize,
+                           tda:bool,spin:&str,rs_orbitals:bool,path:&str){
+    use std::io::Write;
+    let mut buffer=String::new();
+    buffer.push_str("# REST BSE transition amplitudes\n");
+    buffer.push_str(&format!("# orbital_representation: {}\n",
+        if rs_orbitals{"renormalized-singles(RS)"}else{"kohn-sham"}));
+    buffer.push_str(&format!("# spin tda occ_size vir_size nstates\n{} {} {} {} {}\n",
+                             spin,if tda{1}else{0},occ_size,vir_size,excitations.len()));
+    let join=|values:&[f64]|values.iter().map(|v|format!("{:.16e}",v)).collect::<Vec<_>>().join(" ");
+    for (n,(energy,vector)) in excitations.iter().enumerate(){
+        buffer.push_str(&format!("state {} {:.16e}\n",n,energy));
+        if tda{
+            buffer.push_str(&format!("x {}\n",join(vector)));
+        }else{
+            let n_pair=occ_size*vir_size;
+            buffer.push_str(&format!("x {}\n",join(&vector[0..n_pair.min(vector.len())])));
+            if vector.len()>n_pair{
+                buffer.push_str(&format!("y {}\n",join(&vector[n_pair..])));
+            }
+        }
+    }
+    match std::fs::File::create(path){
+        Ok(mut file)=>{
+            if let Err(err)=file.write_all(buffer.as_bytes()){
+                println!("Warning: could not write the BSE amplitudes to {}: {}",path,err);
+            }else{
+                println!("The BSE transition amplitudes have been written to {}",path);
+            }
+        },
+        Err(err)=>println!("Warning: could not create {}: {}",path,err),
+    }
+}
 pub fn bse_main(scf_data:&mut SCF) -> BseOutput {
     if scf_data.mol.spin_channel == 2 {
         return bse_main_unrestricted(scf_data);
     }
+    report_orbital_representation(scf_data);
     let start=Instant::now();
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let quasiparticle_energies=scf_data.gwqp.0.clone();
@@ -138,6 +213,10 @@ pub fn bse_main(scf_data:&mut SCF) -> BseOutput {
                 leading_components(&v, occ_size, vir_size,qp_ctrl.print_nto);
             }
             println!("The first excitation obtained by BSE is {}", excitations[0].0);
+            if qp_ctrl.save_bse_terms {
+                save_bse_amplitudes(&excitations,occ_size,vir_size,true,&bse_spin,
+                    qp_ctrl.renormalized_singles&&qp_ctrl.rs_use_rs_orbitals,"bse_terms.dat");
+            }
             if qp_ctrl.save_bse_excitations {
                 let line = excitations.iter().map(|(num,_)| num.to_string()).collect::<Vec<_>>().join(",");
                 let mut file = OpenOptions::new().append(true).create(true).open("bse_excitations.txt");
@@ -166,6 +245,10 @@ pub fn bse_main(scf_data:&mut SCF) -> BseOutput {
             println!("Transition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
             leading_components(&v,occ_size,vir_size,qp_ctrl.print_nto)});
             println!("\n\nThe first excitation obtained by BSE is {}",excitations[0].0);
+            if qp_ctrl.save_bse_terms{
+                save_bse_amplitudes(&excitations,occ_size,vir_size,false,&bse_spin,
+                    qp_ctrl.renormalized_singles&&qp_ctrl.rs_use_rs_orbitals,"bse_terms.dat");
+            }
             if qp_ctrl.save_bse_excitations==true{
                 let line = excitations.iter().map(|(num,vec)| num.to_string()).collect::<Vec<_>>().join(",");
                 let mut file = OpenOptions::new().append(true).create(true).open("bse_excitations.txt");
@@ -192,6 +275,10 @@ pub fn bse_main(scf_data:&mut SCF) -> BseOutput {
                 println!("\tTransition Dipole Square:{}; Oscillator Strength:{}",dipole_square,dipole_square*e*2.0/3.0);
                 leading_components(&v,occ_size,vir_size,qp_ctrl.print_nto)});
             println!("The first excitation obtained by BSE is {}",excitations[0].0);
+            if qp_ctrl.save_bse_terms{
+                save_bse_amplitudes(&excitations,occ_size,vir_size,true,&bse_spin,
+                    qp_ctrl.renormalized_singles&&qp_ctrl.rs_use_rs_orbitals,"bse_terms.dat");
+            }
             if qp_ctrl.save_bse_excitations==true{
                 let line = excitations.iter().map(|(num,vec)| num.to_string()).collect::<Vec<_>>().join(",");
                 let mut file = OpenOptions::new().append(true).create(true).open("bse_excitations.txt");
@@ -368,8 +455,40 @@ pub fn construct_energy_diag_for_a(quasiparticle_energies:&Vec<f64>,occ_size:usi
     }
     energy_diag
 }
+/// Energies used to dress the independent-particle response `chi0` (and hence the
+/// screened interaction `W`) in the BSE stage.
+///
+/// Historically the caller decides between the Kohn-Sham eigenvalues (default)
+/// and the GW quasiparticle energies (`bse_qp_polarization = true`).  When the
+/// renormalized-singles orbitals have been installed (`rs_use_rs_orbitals`),
+/// neither of those is the right choice on its own: the RI three-centre tensor —
+/// and therefore every `v`/`W` matrix element of the BSE kernel — is now
+/// expanded in the *RS* orbitals, so `chi0` must be dressed with the *RS*
+/// eigenvalues `scf_data.renormalized_singles_particles`.  Otherwise the
+/// screening would mix RS orbitals with KS energy denominators and `W` would be
+/// in neither representation.
+///
+/// The RS orbital coefficients are dumped by
+/// `renormalized_singles::save_rs_orbitals` when this mode is active, so the BSE
+/// transition amplitudes (which live in the RS `(i,a)` product basis) can always
+/// be transformed back to the Kohn-Sham basis.
+pub fn bse_screening_energies(scf_data:&SCF,epsilon:&Vec<f64>)->Vec<f64>{
+    let rs_orbitals_installed=scf_data.mol.ctrl.quasiparticle_methods.clone()
+        .map(|qp|qp.renormalized_singles&&qp.rs_use_rs_orbitals)
+        .unwrap_or(false);
+    if rs_orbitals_installed
+        && scf_data.renormalized_singles_particles.len()==scf_data.eigenvalues[0].len()
+    {
+        println!("BSE screening: using the renormalized-singles eigenvalues (RS representation).");
+        scf_data.renormalized_singles_particles.clone()
+    }else{
+        epsilon.clone()
+    }
+}
 pub fn construct_inverse_dielectric(scf_data:&SCF,epsilon:&Vec<f64>)->MatrixFull<f64>{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
+    // Keep the orbital basis and the energy denominators in the same representation.
+    let epsilon=bse_screening_energies(scf_data,epsilon);
 
     // Check if BSE-specific auxiliary basis is being used
     let use_bse_integrals = scf_data.ri3fn_bse.is_some() || scf_data.rimatr_bse.is_some();
@@ -386,7 +505,7 @@ pub fn construct_inverse_dielectric(scf_data:&SCF,epsilon:&Vec<f64>)->MatrixFull
     if scf_data.mol.ctrl.print_level>1{
         println!("occ_size={},vir_size(for response)={}",occ_size,vir_size);
     }
-    let response=ri_gw::response_matrix(epsilon,occ_size,vir_size,&ri_ov,0.0,'R',0.0);
+    let response=ri_gw::response_matrix(&epsilon,occ_size,vir_size,&ri_ov,0.0,'R',0.0);
     let inverse_dielectric=ri_gw::inverse_dielectric_matrix(response,'R');
     inverse_dielectric
 }
@@ -792,11 +911,16 @@ fn place_block(dst:&mut MatrixFull<f64>, src:&MatrixFull<f64>, row0:usize, col0:
     }
 }
 
+/// Unrestricted A block of the BSE Hamiltonian.
+///
+/// The direct (screened Coulomb) term always enters: it is spin-independent and
+/// is the only term coupling the alpha and beta blocks, so it is part of the
+/// single physical channel of an unrestricted reference.  There is no
+/// "triplet-like" (direct-term-free) variant -- see `bse_main_unrestricted`.
 fn construct_u_submat_a(
     scf_data:&SCF,
     inverse_dielectric:&MatrixFull<f64>,
     quasiparticle_energies:&[Vec<f64>;2],
-    with_hartree:bool,
 )->MatrixFull<f64>{
     let ops = get_occ_params_per_spin(scf_data,'N');
     let nspin = scf_data.mol.spin_channel;
@@ -817,13 +941,10 @@ fn construct_u_submat_a(
         let mut diag = construct_energy_diag_for_a(&quasiparticle_energies[s], ops[s].occ_size, ops[s].vir_size);
         let mut block = w_a;
         block.iter_diagonal_mut().unwrap().zip(diag.iter_mut()).for_each(|(x,e)|{*x += *e;});
-        if with_hartree {
-            block = MatrixFull::add(&v_ss, &block).unwrap();
-        }
+        block = MatrixFull::add(&v_ss, &block).unwrap();
         place_block(&mut a, &block, offsets[s], offsets[s]);
         for t in 0..nspin {
             if s == t { continue; }
-            if !with_hartree { continue; }
             let ri_ov_t = get_submatrix_spin(scf_data,'O','V','N',t);
             let v_st = construct_coulomb(&ri_ov_s, &ri_ov_t);
             place_block(&mut a, &v_st, offsets[s], offsets[t]);
@@ -832,10 +953,10 @@ fn construct_u_submat_a(
     a
 }
 
+/// Unrestricted B block of the BSE Hamiltonian (direct term always included).
 fn construct_u_submat_b(
     scf_data:&SCF,
     inverse_dielectric:&MatrixFull<f64>,
-    with_hartree:bool,
 )->MatrixFull<f64>{
     let ops = get_occ_params_per_spin(scf_data,'N');
     let nspin = scf_data.mol.spin_channel;
@@ -851,13 +972,11 @@ fn construct_u_submat_b(
         let mut w_b = reorganize_w(raw_w, 'B', ops[s].occ_size, ops[s].vir_size);
         w_b.self_multiple(-1.0);
         let mut block = w_b;
-        if with_hartree {
-            let v_ss = construct_coulomb(&ri_ov_s, &ri_ov_s);
-            block = MatrixFull::add(&v_ss, &block).unwrap();
-        }
+        let v_ss = construct_coulomb(&ri_ov_s, &ri_ov_s);
+        block = MatrixFull::add(&v_ss, &block).unwrap();
         place_block(&mut b, &block, offsets[s], offsets[s]);
         for t in 0..nspin {
-            if s == t || !with_hartree { continue; }
+            if s == t { continue; }
             let ri_ov_t = get_submatrix_spin(scf_data,'O','V','N',t);
             let v_st = construct_coulomb(&ri_ov_s, &ri_ov_t);
             place_block(&mut b, &v_st, offsets[s], offsets[t]);
@@ -870,10 +989,9 @@ fn construct_u_full_bse_hamiltonian(
     scf_data:&SCF,
     inverse_dielectric:&MatrixFull<f64>,
     quasiparticle_energies:&[Vec<f64>;2],
-    with_hartree:bool,
 )->MatrixFull<f64>{
-    let a = construct_u_submat_a(scf_data, inverse_dielectric, quasiparticle_energies, with_hartree);
-    let b = construct_u_submat_b(scf_data, inverse_dielectric, with_hartree);
+    let a = construct_u_submat_a(scf_data, inverse_dielectric, quasiparticle_energies);
+    let b = construct_u_submat_b(scf_data, inverse_dielectric);
     let n = a.size[0];
     let mut h = MatrixFull::new([2*n,2*n], 0.0);
     let mut minus_a = a.transpose();
@@ -989,24 +1107,22 @@ fn unrestricted_a_matvec(
     scf_data: &SCF,
     qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
     energies: &[Vec<f64>; 2],
-    with_hartree: bool,
     data: &UnrestrictedBseData,
     z: &Vec<f64>,
 ) -> Vec<f64> {
     matvec::a_block_matvec_unrestricted(
-        scf_data, qp_ctrl, energies, with_hartree,
+        scf_data, qp_ctrl, energies,
         &data.ri_vv, &data.ri_ov, &data.ri_oo_tilde, z)
 }
 
 fn unrestricted_b_matvec(
     scf_data: &SCF,
     qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
-    with_hartree: bool,
     data: &UnrestrictedBseData,
     z: &Vec<f64>,
 ) -> Vec<f64> {
     matvec::b_block_matvec_unrestricted(
-        scf_data, qp_ctrl, with_hartree,
+        scf_data, qp_ctrl,
         &data.ri_ov, &data.ri_ov_b, &data.ri_ov_tilde, z)
 }
 
@@ -1014,12 +1130,11 @@ fn unrestricted_amb_matvec(
     scf_data: &SCF,
     qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
     energies: &[Vec<f64>; 2],
-    with_hartree: bool,
     data: &UnrestrictedBseData,
     z: &Vec<f64>,
 ) -> Vec<f64> {
-    let a = unrestricted_a_matvec(scf_data, qp_ctrl, energies, with_hartree, data, z);
-    let b = unrestricted_b_matvec(scf_data, qp_ctrl, with_hartree, data, z);
+    let a = unrestricted_a_matvec(scf_data, qp_ctrl, energies, data, z);
+    let b = unrestricted_b_matvec(scf_data, qp_ctrl, data, z);
     a.into_iter().zip(b).map(|(ai, bi)| ai - bi).collect()
 }
 
@@ -1027,21 +1142,20 @@ fn unrestricted_apb_matvec(
     scf_data: &SCF,
     qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
     energies: &[Vec<f64>; 2],
-    with_hartree: bool,
     data: &UnrestrictedBseData,
     z: &Vec<f64>,
 ) -> Vec<f64> {
-    let a = unrestricted_a_matvec(scf_data, qp_ctrl, energies, with_hartree, data, z);
-    let b = unrestricted_b_matvec(scf_data, qp_ctrl, with_hartree, data, z);
+    let a = unrestricted_a_matvec(scf_data, qp_ctrl, energies, data, z);
+    let b = unrestricted_b_matvec(scf_data, qp_ctrl, data, z);
     a.into_iter().zip(b).map(|(ai, bi)| ai + bi).collect()
 }
 
-fn feast_solve_bse_unrestricted_mode(
+/// FEAST solve for the single unrestricted BSE channel (direct term included).
+fn feast_solve_bse_unrestricted(
     scf_data: &SCF,
     qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
     energies: &[Vec<f64>; 2],
     data: &UnrestrictedBseData,
-    with_hartree: bool,
 ) -> Vec<(f64, Vec<f64>)> {
     let n = data.energy_diag.len();
     let (emin, emax) = if qp_ctrl.bse_tda {
@@ -1053,7 +1167,7 @@ fn feast_solve_bse_unrestricted_mode(
 
     if qp_ctrl.bse_tda {
         let a_mul = |z: &Vec<f64>| {
-            unrestricted_a_matvec(scf_data, qp_ctrl, energies, with_hartree, data, z)
+            unrestricted_a_matvec(scf_data, qp_ctrl, energies, data, z)
         };
         let b_mul = |z: &Vec<f64>| z.clone();
         feast_solver::feast(
@@ -1086,11 +1200,11 @@ fn feast_solve_bse_unrestricted_mode(
         )
     } else {
         let a_mul = |z: &Vec<f64>| {
-            unrestricted_amb_matvec(scf_data, qp_ctrl, energies, with_hartree, data, z)
+            unrestricted_amb_matvec(scf_data, qp_ctrl, energies, data, z)
         };
         let b_mul = |z: &Vec<f64>| {
             let apb = |p: &Vec<f64>| {
-                unrestricted_apb_matvec(scf_data, qp_ctrl, energies, with_hartree, data, p)
+                unrestricted_apb_matvec(scf_data, qp_ctrl, energies, data, p)
             };
             feast_solver::cg(
                 &apb,
@@ -1102,8 +1216,8 @@ fn feast_solve_bse_unrestricted_mode(
         };
         let diag_sq: Vec<f64> = data.energy_diag.iter().map(|&d| d * d).collect();
         let gmres_a_mul = |z: &Vec<f64>| {
-            let amb_z = unrestricted_amb_matvec(scf_data, qp_ctrl, energies, with_hartree, data, z);
-            unrestricted_apb_matvec(scf_data, qp_ctrl, energies, with_hartree, data, &amb_z)
+            let amb_z = unrestricted_amb_matvec(scf_data, qp_ctrl, energies, data, z);
+            unrestricted_apb_matvec(scf_data, qp_ctrl, energies, data, &amb_z)
         };
         let gmres_b_mul = |z: &Vec<f64>| z.clone();
         let raw = feast_solver::feast(
@@ -1136,7 +1250,7 @@ fn feast_solve_bse_unrestricted_mode(
         );
         raw.into_iter()
             .map(|(omega2, xpy)| {
-                let xmy = unrestricted_amb_matvec(scf_data, qp_ctrl, energies, with_hartree, data, &xpy);
+                let xmy = unrestricted_amb_matvec(scf_data, qp_ctrl, energies, data, &xpy);
                 (omega2.sqrt(), xmy.iter().zip(xpy.iter()).map(|(xmy_k, xpy_k)| xmy_k / omega2.sqrt() + xpy_k).collect())
             })
             .collect()
@@ -1158,27 +1272,36 @@ pub fn bse_main_unrestricted(scf_data:&mut SCF) -> BseOutput {
     let epsilon = if qp_ctrl.bse_qp_polarization { qp_energies.clone() } else { ks_energies };
     let inverse_dielectric = construct_inverse_dielectric_spin(scf_data, &epsilon);
 
-    let modes: Vec<(&str,bool)> = if qp_ctrl.bse_spin == "both" {
-        vec![("singlet", true), ("triplet", false)]
-    } else if qp_ctrl.bse_spin == "singlet" {
-        vec![("singlet", true)]
-    } else if qp_ctrl.bse_spin == "triplet" {
-        vec![("triplet", false)]
-    } else {
-        vec![("unrestricted", true)]
-    };
+    // `bse_spin` does not select a spin channel for an unrestricted reference.
+    // The direct (screened Coulomb) kernel is spin-independent and is the only
+    // term coupling the alpha and beta blocks, so an unrestricted BSE
+    // Hamiltonian has exactly one physical channel; the former "triplet"
+    // (direct-term-free) and "both" options have been removed.  Leaving
+    // `bse_spin = "none"` still switches the BSE run off (handled above).
+    match qp_ctrl.bse_spin.as_str() {
+        "singlet" | "unrestricted" => {}
+        other => panic!(
+            "bse_spin = \"{}\" is not applicable to an unrestricted reference \
+             (spin_polarization = true): unrestricted BSE has a single, spin-coupled \
+             channel (the direct kernel couples the alpha and beta blocks), so there is \
+             no triplet-like channel to select. Set bse_spin to \"singlet\" (or any \
+             accepted value) to run unrestricted BSE, or to \"none\" to switch it off.",
+            other
+        ),
+    }
 
     let mut all_excitations: Vec<f64> = Vec::new();
 
     if qp_ctrl.bse_davidson_solver {
         let data = prepare_unrestricted_matvec_data(scf_data, &inverse_dielectric, &qp_energies);
-        for (mode, with_hartree) in modes {
+        // Single spin-coupled channel (previously a loop over spin modes).
+        {
             let cfg = davidson_config_from_qp(&qp_ctrl);
             let initial_guess = generate_initial_guess(&data.energy_diag, qp_ctrl.davidson_target_excitations);
             let eigenpairs = if qp_ctrl.bse_tda {
                 let a_matvec = |z: &Vec<f64>| {
                     matvec::a_block_matvec_unrestricted(
-                        scf_data, &qp_ctrl, &qp_energies, with_hartree,
+                        scf_data, &qp_ctrl, &qp_energies,
                         &data.ri_vv, &data.ri_ov, &data.ri_oo_tilde, z)
                 };
                 tda_davidson_solver(
@@ -1191,12 +1314,12 @@ pub fn bse_main_unrestricted(scf_data:&mut SCF) -> BseOutput {
             } else {
                 let a_matvec = |z: &Vec<f64>| {
                     matvec::a_block_matvec_unrestricted(
-                        scf_data, &qp_ctrl, &qp_energies, with_hartree,
+                        scf_data, &qp_ctrl, &qp_energies,
                         &data.ri_vv, &data.ri_ov, &data.ri_oo_tilde, z)
                 };
                 let b_matvec = |z: &Vec<f64>| {
                     matvec::b_block_matvec_unrestricted(
-                        scf_data, &qp_ctrl, with_hartree,
+                        scf_data, &qp_ctrl,
                         &data.ri_ov, &data.ri_ov_b, &data.ri_ov_tilde, z)
                 };
                 lr_davidson_solver(
@@ -1209,14 +1332,14 @@ pub fn bse_main_unrestricted(scf_data:&mut SCF) -> BseOutput {
                 )
             };
             let eigenpairs = filter_eigenpairs_range(eigenpairs, &qp_ctrl);
-            println!("\nUnrestricted BSE ({}, TDA={}) Davidson eigenvalues in [{:.6}, {:.6}] Ha: {}",
-                mode, qp_ctrl.bse_tda, qp_ctrl.bse_eigenrange_min, qp_ctrl.bse_eigenrange_max, eigenpairs.len());
+            println!("\nUnrestricted BSE (TDA={}) Davidson eigenvalues in [{:.6}, {:.6}] Ha: {}",
+                qp_ctrl.bse_tda, qp_ctrl.bse_eigenrange_min, qp_ctrl.bse_eigenrange_max, eigenpairs.len());
             for (n,(e,_v)) in eigenpairs.iter().enumerate() {
                 println!("#{} Excitation energy={} Ha = {:.6} eV", n, e, e*crate::constants::EV);
             }
             all_excitations.extend(eigenpairs.iter().map(|(e, _)| *e));
             if let Some((first,_)) = eigenpairs.first() {
-                println!("The first unrestricted BSE ({}) excitation is {} Ha ({:.6} eV)", mode, first, first*crate::constants::EV);
+                println!("The first unrestricted BSE excitation is {} Ha ({:.6} eV)", first, first*crate::constants::EV);
                 if qp_ctrl.save_first_excitation {
                     if let Ok(mut file) = OpenOptions::new().append(true).create(true).open(qp_ctrl.save_first_excitation_path.clone()) {
                         writeln!(file, "{}", first).unwrap();
@@ -1232,17 +1355,18 @@ pub fn bse_main_unrestricted(scf_data:&mut SCF) -> BseOutput {
         }
     } else if qp_ctrl.bse_feast_solver {
         let data = prepare_unrestricted_matvec_data(scf_data, &inverse_dielectric, &qp_energies);
-        for (mode, with_hartree) in modes {
-            let eigenpairs = feast_solve_bse_unrestricted_mode(scf_data, &qp_ctrl, &qp_energies, &data, with_hartree);
+        // Single spin-coupled channel (previously a loop over spin modes).
+        {
+            let eigenpairs = feast_solve_bse_unrestricted(scf_data, &qp_ctrl, &qp_energies, &data);
             let eigenpairs = filter_eigenpairs_range(eigenpairs, &qp_ctrl);
-            println!("\nUnrestricted BSE ({}, TDA={}) FEAST eigenvalues in [{:.6}, {:.6}] Ha: {}",
-                mode, qp_ctrl.bse_tda, qp_ctrl.bse_eigenrange_min, qp_ctrl.bse_eigenrange_max, eigenpairs.len());
+            println!("\nUnrestricted BSE (TDA={}) FEAST eigenvalues in [{:.6}, {:.6}] Ha: {}",
+                qp_ctrl.bse_tda, qp_ctrl.bse_eigenrange_min, qp_ctrl.bse_eigenrange_max, eigenpairs.len());
             for (n,(e,_v)) in eigenpairs.iter().enumerate() {
                 println!("#{} Excitation energy={} Ha = {:.6} eV", n, e, e*crate::constants::EV);
             }
             all_excitations.extend(eigenpairs.iter().map(|(e, _)| *e));
             if let Some((first,_)) = eigenpairs.first() {
-                println!("The first unrestricted BSE ({}) excitation is {} Ha ({:.6} eV)", mode, first, first*crate::constants::EV);
+                println!("The first unrestricted BSE excitation is {} Ha ({:.6} eV)", first, first*crate::constants::EV);
                 if qp_ctrl.save_first_excitation {
                     if let Ok(mut file) = OpenOptions::new().append(true).create(true).open(qp_ctrl.save_first_excitation_path.clone()) {
                         writeln!(file, "{}", first).unwrap();
@@ -1257,22 +1381,23 @@ pub fn bse_main_unrestricted(scf_data:&mut SCF) -> BseOutput {
             }
         }
     } else {
-        for (mode, with_hartree) in modes {
+        // Single spin-coupled channel (previously a loop over spin modes).
+        {
             let eigenpairs = if qp_ctrl.bse_tda {
-                let a = construct_u_submat_a(scf_data, &inverse_dielectric, &qp_energies, with_hartree);
+                let a = construct_u_submat_a(scf_data, &inverse_dielectric, &qp_energies);
                 solve_dense_eigenpairs(&a, &qp_ctrl)
             } else {
-                let h = construct_u_full_bse_hamiltonian(scf_data, &inverse_dielectric, &qp_energies, with_hartree);
+                let h = construct_u_full_bse_hamiltonian(scf_data, &inverse_dielectric, &qp_energies);
                 solve_dense_eigenpairs(&h, &qp_ctrl)
             };
-            println!("\nUnrestricted BSE ({}, TDA={}) eigenvalues in [{:.6}, {:.6}] Ha: {}",
-                mode, qp_ctrl.bse_tda, qp_ctrl.bse_eigenrange_min, qp_ctrl.bse_eigenrange_max, eigenpairs.len());
+            println!("\nUnrestricted BSE (TDA={}) eigenvalues in [{:.6}, {:.6}] Ha: {}",
+                qp_ctrl.bse_tda, qp_ctrl.bse_eigenrange_min, qp_ctrl.bse_eigenrange_max, eigenpairs.len());
             for (n,(e,_v)) in eigenpairs.iter().enumerate() {
                 println!("#{} Excitation energy={} Ha = {:.6} eV", n, e, e*crate::constants::EV);
             }
             all_excitations.extend(eigenpairs.iter().map(|(e, _)| *e));
             if let Some((first,_)) = eigenpairs.first() {
-                println!("The first unrestricted BSE ({}) excitation is {} Ha ({:.6} eV)", mode, first, first*crate::constants::EV);
+                println!("The first unrestricted BSE excitation is {} Ha ({:.6} eV)", first, first*crate::constants::EV);
                 if qp_ctrl.save_first_excitation {
                     if let Ok(mut file) = OpenOptions::new().append(true).create(true).open(qp_ctrl.save_first_excitation_path.clone()) {
                         writeln!(file, "{}", first).unwrap();

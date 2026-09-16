@@ -810,7 +810,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
                 );
                 let raw = &exc[state - 1].1;
                 let tda = tddft_ctrl.tddft_method.eq_ignore_ascii_case("tda");
-                let singlet = tddft_ctrl.tddft_spin != "triplet";
+                let singlet = tddft_ctrl.restricted_spin() != "triplet";
                 let norm = crate::ri_bse::dipoles::normalize(raw, tda);
                 let (x, y) = if tda {
                     (norm, vec![0.0; raw.len()])

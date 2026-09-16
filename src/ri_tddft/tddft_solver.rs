@@ -134,19 +134,26 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
         .ok_or_else(|| "TDDFT control parameters not set".to_string())?;
     let nroots = tddft_ctrl.nroots.max(1);
     let tddft_method = tddft_ctrl.tddft_method.clone();
-    let tddft_spin = tddft_ctrl.tddft_spin.clone();
-    let xlet = if tddft_spin == "singlet" { 'S' } else if tddft_spin == "triplet" { 'T' } else { 'R' };
     let is_tda = tddft_method == "tda" || tddft_method == "TDA";
 
     // Enable optimised (rayon-parallel) fxc kernel if requested
     set_fxc_use_optimized(tddft_ctrl.tddft_use_optimized_fxc);
 
     // Unrestricted (spin-polarised) reference: route to the spin-resolved
-    // solver.  The unrestricted TDDFT owns its own spin handling (including
-    // `tddft_spin = "both"`) and does not use the AO/MO machinery below.
+    // solver.  The unrestricted TDDFT has one single, spin-coupled response
+    // channel (see `tddft_main_unrestricted`) and does not use the AO/MO
+    // machinery below; in particular it does not read `tddft_spin`.
     if scf.mol.spin_channel == 2 {
         return tddft_main_unrestricted(scf, &tddft_ctrl, is_tda);
     }
+
+    // ── Restricted (spin-adapted) path ──
+    // Here `tddft_spin` is a genuine physical label: the closed-shell reference
+    // can be rotated into the singlet/triplet subspaces, which turns the
+    // spin-independent Coulomb kernel into the familiar factors 2 (singlet) and
+    // 0 (triplet).
+    let tddft_spin = tddft_ctrl.restricted_spin().to_string();
+    let xlet = if tddft_spin == "singlet" { 'S' } else if tddft_spin == "triplet" { 'T' } else { 'R' };
 
     let is_ao = tddft_ctrl.tddft_mode == "ao";
 
@@ -574,16 +581,55 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
 /// Unrestricted TDDFT main solver.
 ///
 /// Uses the spin-resolved α/β occupied-virtual spaces and the unrestricted
-/// A/B matrix-vector products.  When `tddft_spin == "both"`, it first solves
-/// the “singlet-like” (Coulomb included) mode, then the “triplet-like”
-/// (Coulomb omitted) mode, mirroring the existing unrestricted BSE path.
+/// A/B matrix-vector products.
+///
+/// There is exactly **one** physical response channel here: the spin-independent
+/// Coulomb kernel couples the α and β blocks, and no rotation into
+/// singlet/triplet subspaces is available for an unrestricted reference.  The
+/// former `tddft_spin = "triplet"` mode (the same α⊕β operator with the Coulomb
+/// coupling dropped) and the `"both"` mode (which ran it as a second pass) have
+/// therefore been removed: for a spin-symmetric reference the Coulomb-free
+/// operator mixes the true triplets with unphysical "Coulomb-free singlets" of
+/// the symmetric sector, and for an open-shell reference it corresponds to no
+/// physical channel at all.  `tddft_spin` is not read by this function.
 fn tddft_main_unrestricted(
     scf: &mut SCF,
     tddft_ctrl: &crate::ctrl_io::tddft_parameters::TDDFTParameters,
     is_tda: bool,
 ) -> Result<TddftOutput, String> {
     let nroots = tddft_ctrl.nroots.max(1);
-    let tddft_spin = tddft_ctrl.tddft_spin.clone();
+
+    // `tddft_spin` selects a spin-adapted channel, which only exists for a
+    // restricted reference.  Reject an explicit non-default value instead of
+    // silently reinterpreting it (previously "triplet" silently switched the
+    // Coulomb coupling off, and "both" ran the same operator twice).
+    if let Some(v) = tddft_ctrl.tddft_spin.as_deref() {
+        if v == "singlet" {
+            warn!(
+                "tddft_spin = \"singlet\" has no effect for an unrestricted reference \
+                 (spin_polarization = true); the single spin-coupled channel is always used. \
+                 The keyword can be removed from the input."
+            );
+        } else {
+            return Err(format!(
+                "tddft_spin = \"{}\" is not applicable to unrestricted TDDFT \
+                 (spin_polarization = true).  Unrestricted TDDFT has a single, spin-coupled \
+                 response channel (the Coulomb kernel couples the alpha and beta blocks); \
+                 there is no spin-adapted singlet/triplet channel to select. \
+                 Remove tddft_spin from the input.",
+                v
+            ));
+        }
+    }
+
+    // PySOC export needs both singlet and triplet transition amplitudes, which
+    // only the restricted path can supply.
+    if tddft_ctrl.pysoc {
+        return Err("pysoc = true requires the restricted path (tddft_spin = \"both\") \
+                    and is not available for an unrestricted reference \
+                    (spin_polarization = true)."
+            .to_string());
+    }
 
     // ── Per-spin orbital windows ──
     let p0 = tddft_occupation_parameters_spin(scf, 0);
@@ -707,49 +753,25 @@ fn tddft_main_unrestricted(
         ..Default::default()
     };
 
-    // ── Decide modes ──
-    let modes: Vec<(&str, bool)> = if tddft_spin == "both" {
-        vec![("singlet", true), ("triplet", false)]
-    } else if tddft_spin == "triplet" {
-        vec![("triplet", false)]
-    } else {
-        // "singlet", "unrestricted", or any non-triplet label uses the full
-        // Coulomb-coupled unrestricted TDDFT matrix, which is what PySCF's
-        // UKS TDDFT computes.
-        vec![("unrestricted", true)]
-    };
+    // ── Single spin-coupled channel ──
+    // The full Coulomb-coupled unrestricted TDDFT matrix; this is what PySCF's
+    // UKS TDDFT computes.  No second (Coulomb-free) channel exists.
+    println!("\n=== Unrestricted TDDFT Calculation (TDA={}) ===", is_tda);
+    let (eigenpairs_all, energies_all, osc_all) = solve_tddft_single_spin_unrestricted(
+        scf,
+        &fxc_data,
+        &ri_ov,
+        &exch,
+        &hdiag,
+        &initial_guess,
+        &davidson_cfg,
+        nroots,
+        total_dim,
+        is_tda,
+        tddft_ctrl,
+        params,
+    );
 
-    let mut energies_all: Vec<f64> = Vec::new();
-    let mut osc_all: Vec<f64> = Vec::new();
-    let mut eigenpairs_all: Vec<(f64, Vec<f64>)> = Vec::new();
-
-    for (mode, with_hartree) in modes {
-        println!(
-            "\n=== Unrestricted TDDFT Calculation ({}, TDA={}) ===",
-            mode, is_tda
-        );
-        let (eigenpairs, energies, osc) = solve_tddft_single_spin_unrestricted(
-            scf,
-            &fxc_data,
-            &ri_ov,
-            &exch,
-            &hdiag,
-            &initial_guess,
-            &davidson_cfg,
-            nroots,
-            total_dim,
-            is_tda,
-            with_hartree,
-            tddft_ctrl,
-            params,
-        );
-        eigenpairs_all.extend(eigenpairs);
-        energies_all.extend(energies);
-        osc_all.extend(osc);
-    }
-
-    // For a single mode return that mode's first energy; for "both", the first
-    // singlet-like root is the first element.
     if let Some(first) = energies_all.first() {
         println!("The first unrestricted TDDFT excitation is {}", first);
     }
@@ -761,7 +783,7 @@ fn tddft_main_unrestricted(
     })
 }
 
-/// Solve an unrestricted TDDFT spin mode (Coulomb included or omitted).
+/// Solve the unrestricted TDDFT eigenvalue problem (single spin-coupled channel).
 #[allow(clippy::too_many_arguments)]
 fn solve_tddft_single_spin_unrestricted(
     scf: &SCF,
@@ -774,7 +796,6 @@ fn solve_tddft_single_spin_unrestricted(
     nroots: usize,
     dim: usize,
     is_tda: bool,
-    with_hartree: bool,
     tddft_ctrl: &crate::ctrl_io::tddft_parameters::TDDFTParameters,
     params: [(usize, usize, usize, usize, usize, usize); 2],
 ) -> (Vec<(f64, Vec<f64>)>, Vec<f64>, Vec<f64>) {
@@ -786,7 +807,7 @@ fn solve_tddft_single_spin_unrestricted(
         eprintln!("Warning: FEAST solver for unrestricted TDDFT is not implemented; using Davidson.");
         if is_tda {
             davidson_solver::tda_davidson_solver(
-                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z, with_hartree),
+                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z),
                 nroots,
                 hdiag,
                 initial_guess.clone(),
@@ -794,8 +815,8 @@ fn solve_tddft_single_spin_unrestricted(
             )
         } else {
             davidson_solver::lr_davidson_solver(
-                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z, with_hartree),
-                |z: &Vec<f64>| b_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z, with_hartree),
+                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z),
+                |z: &Vec<f64>| b_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z),
                 nroots,
                 hdiag,
                 initial_guess.clone(),
@@ -808,9 +829,7 @@ fn solve_tddft_single_spin_unrestricted(
         for col in 0..dim {
             let mut e_col = vec![0.0; dim];
             e_col[col] = 1.0;
-            let a_col = a_matvec_unrestricted(
-                scf, fxc_data, ri_ov, exch, &e_col, with_hartree,
-            );
+            let a_col = a_matvec_unrestricted(scf, fxc_data, ri_ov, exch, &e_col);
             for row in 0..dim {
                 a_mat[row + col * dim] = a_col[row];
             }
@@ -835,12 +854,8 @@ fn solve_tddft_single_spin_unrestricted(
         for col in 0..dim {
             let mut e_col = vec![0.0; dim];
             e_col[col] = 1.0;
-            let a_col = a_matvec_unrestricted(
-                scf, fxc_data, ri_ov, exch, &e_col, with_hartree,
-            );
-            let b_col = b_matvec_unrestricted(
-                scf, fxc_data, ri_ov, exch, &e_col, with_hartree,
-            );
+            let a_col = a_matvec_unrestricted(scf, fxc_data, ri_ov, exch, &e_col);
+            let b_col = b_matvec_unrestricted(scf, fxc_data, ri_ov, exch, &e_col);
             for row in 0..dim {
                 a_mat[row + col * dim] = a_col[row];
                 b_mat[row + col * dim] = b_col[row];
@@ -872,7 +887,7 @@ fn solve_tddft_single_spin_unrestricted(
         if is_tda {
             println!("Solving unrestricted TDA eigenvalue problem...");
             davidson_solver::tda_davidson_solver(
-                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z, with_hartree),
+                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z),
                 nroots,
                 hdiag,
                 initial_guess.clone(),
@@ -881,8 +896,8 @@ fn solve_tddft_single_spin_unrestricted(
         } else {
             println!("Solving unrestricted full linear response eigenvalue problem...");
             davidson_solver::lr_davidson_solver(
-                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z, with_hartree),
-                |z: &Vec<f64>| b_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z, with_hartree),
+                |z: &Vec<f64>| a_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z),
+                |z: &Vec<f64>| b_matvec_unrestricted(scf, fxc_data, ri_ov, exch, z),
                 nroots,
                 hdiag,
                 initial_guess.clone(),
@@ -898,8 +913,7 @@ fn solve_tddft_single_spin_unrestricted(
     let vir_size = [params[0].3, params[1].3];
     let lumo = [params[0].5, params[1].5];
     let dipole_matrix = compute_tddft_dipole_matrix_unrestricted(scf, start_mo, occ_size, vir_size, lumo);
-    let spin_label = if with_hartree { "unrestricted/singlet-like" } else { "triplet-like" };
-    println!("\nFirst {} {} Excitations:", n_print.min(eigenpairs.len()), spin_label);
+    println!("\nFirst {} Unrestricted Excitations:", n_print.min(eigenpairs.len()));
 
     let mut td_energies: Vec<f64> = Vec::new();
     let mut td_osc: Vec<f64> = Vec::new();

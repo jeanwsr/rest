@@ -946,7 +946,11 @@ impl<'a> BseGradEngine<'a> {
         let nvir_act = if vir_cutoff.is_infinite() {
             nvir_full
         } else {
-            let eps_ref = &scf.eigenvalues[0][..gw.nmo];
+            // Orbital window: rank the virtuals by the energies of the orbital
+            // set actually in use (renormalized-singles energies when the RS
+            // orbitals have been installed).
+            let eps_ref = crate::ri_gw::current_orbital_energies(scf);
+            let eps_ref = &eps_ref[..gw.nmo];
             let nvir_act = (gw.nocc..gw.nmo).filter(|&a| eps_ref[a] < vir_cutoff).count();
             assert!(nvir_act >= 1, "bse_grad: virtual cutoff leaves no active virtual orbitals");
             nvir_act
@@ -971,7 +975,7 @@ impl<'a> BseGradEngine<'a> {
             .collect();
         let eps_screen: Vec<f64> = match screening_energy {
             ScreeningEnergy::Qp => qp_caches.iter().map(|c| c.omega).collect(),
-            ScreeningEnergy::Reference => scf.eigenvalues[0][..gw.nmo].to_vec(),
+            ScreeningEnergy::Reference => crate::ri_gw::current_orbital_energies(scf)[..gw.nmo].to_vec(),
         };
         let screen = BseScreening::build_from_parts_cutoff(
             &gw.q, &gw.j_mat, gw.nocc, gw.nmo, nvir_act, &eps_screen,

@@ -308,7 +308,6 @@ pub fn a_block_matvec_unrestricted(
     scf_data: &SCF,
     qp_ctrl: &QuasiParticle,
     energies: &[Vec<f64>; 2],
-    with_hartree: bool,
     ri_vv: &[MatrixFull<f64>; 2],
     ri_ov: &[MatrixFull<f64>; 2],
     ri_oo_tilde: &[MatrixFull<f64>; 2],
@@ -333,18 +332,19 @@ pub fn a_block_matvec_unrestricted(
             rs[k] -= w[k];
         }
 
-        if with_hartree {
-            let mut v = vec![0.0; ns];
-            for t in 0..2 {
-                let zt = &z_vec[if t == 0 { 0 } else { n0 }..if t == 0 { n0 } else { n0 + n1 }];
-                let vt = coulomb_cross_contribution(&ri_ov[s], &ri_ov[t], zt);
-                for k in 0..ns {
-                    v[k] += vt[k];
-                }
-            }
+        // Direct (screened Coulomb / Hartree) term: this is the only term that
+        // couples the alpha and beta blocks, and it belongs to the single
+        // physical channel of an unrestricted reference.
+        let mut v = vec![0.0; ns];
+        for t in 0..2 {
+            let zt = &z_vec[if t == 0 { 0 } else { n0 }..if t == 0 { n0 } else { n0 + n1 }];
+            let vt = coulomb_cross_contribution(&ri_ov[s], &ri_ov[t], zt);
             for k in 0..ns {
-                rs[k] += v[k];
+                v[k] += vt[k];
             }
+        }
+        for k in 0..ns {
+            rs[k] += v[k];
         }
 
         result[offset..offset + ns].copy_from_slice(&rs);
@@ -356,7 +356,6 @@ pub fn a_block_matvec_unrestricted(
 pub fn b_block_matvec_unrestricted(
     scf_data: &SCF,
     _qp_ctrl: &QuasiParticle,
-    with_hartree: bool,
     ri_ov: &[MatrixFull<f64>; 2],
     ri_ov_b: &[MatrixFull<f64>; 2],
     ri_ov_tilde: &[MatrixFull<f64>; 2],
@@ -380,18 +379,17 @@ pub fn b_block_matvec_unrestricted(
             rs[k] = -rs[k];
         }
 
-        if with_hartree {
-            let mut v = vec![0.0; ns];
-            for t in 0..2 {
-                let zt = &z_vec[if t == 0 { 0 } else { n0 }..if t == 0 { n0 } else { n0 + n1 }];
-                let vt = coulomb_cross_contribution(&ri_ov[s], &ri_ov[t], zt);
-                for k in 0..ns {
-                    v[k] += vt[k];
-                }
-            }
+        // Direct (screened Coulomb / Hartree) term: see the A-block above.
+        let mut v = vec![0.0; ns];
+        for t in 0..2 {
+            let zt = &z_vec[if t == 0 { 0 } else { n0 }..if t == 0 { n0 } else { n0 + n1 }];
+            let vt = coulomb_cross_contribution(&ri_ov[s], &ri_ov[t], zt);
             for k in 0..ns {
-                rs[k] += v[k];
+                v[k] += vt[k];
             }
+        }
+        for k in 0..ns {
+            rs[k] += v[k];
         }
 
         result[offset..offset + ns].copy_from_slice(&rs);

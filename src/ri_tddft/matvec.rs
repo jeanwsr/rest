@@ -448,17 +448,17 @@ fn unrestricted_coulomb_sum(
 
 /// Full unrestricted TDDFT A-block matrix-vector product.
 ///
-/// The vector is the concatenation `[alpha; beta]`.  `with_hartree` controls
-/// whether the Coulomb coupling is included (the “singlet-like” unrestricted
-/// mode).  The same-spin bare exchange and the spin-resolved fxc kernel are
-/// always included.
+/// The vector is the concatenation `[alpha; beta]`.  The Coulomb (Hartree)
+/// coupling is always included: it is spin-independent and is the only term
+/// that couples the alpha and beta blocks, so it belongs to the single physical
+/// response operator of an unrestricted reference.  Same-spin bare exchange and
+/// the spin-resolved fxc kernel are included as well.
 pub fn a_matvec_unrestricted(
     scf: &SCF,
     fxc_data: &FXCMatvecDataUnrestricted,
     ri_ov: &[MatrixFull<f64>; 2],
     exch: &[ExchangeTerms; 2],
     z: &[f64],
-    with_hartree: bool,
 ) -> Vec<f64> {
     let n0 = fxc_data.nocc[0] * fxc_data.nvir[0];
     let n1 = fxc_data.nocc[1] * fxc_data.nvir[1];
@@ -519,11 +519,10 @@ pub fn a_matvec_unrestricted(
         result[offset..offset + ns].copy_from_slice(&rs);
     }
 
-    if with_hartree {
-        let (va, vb) = unrestricted_coulomb_sum(ri_ov, n0, n1, fxc_data.nocc, fxc_data.nvir, z);
-        for idx in 0..n0 { result[idx] += va[idx]; }
-        for idx in 0..n1 { result[n0 + idx] += vb[idx]; }
-    }
+    // Coulomb (Hartree) coupling: the only alpha/beta coupling term.
+    let (va, vb) = unrestricted_coulomb_sum(ri_ov, n0, n1, fxc_data.nocc, fxc_data.nvir, z);
+    for idx in 0..n0 { result[idx] += va[idx]; }
+    for idx in 0..n1 { result[n0 + idx] += vb[idx]; }
 
     result
 }
@@ -535,7 +534,6 @@ pub fn b_matvec_unrestricted(
     ri_ov: &[MatrixFull<f64>; 2],
     exch: &[ExchangeTerms; 2],
     z: &[f64],
-    with_hartree: bool,
 ) -> Vec<f64> {
     let n0 = fxc_data.nocc[0] * fxc_data.nvir[0];
     let n1 = fxc_data.nocc[1] * fxc_data.nvir[1];
@@ -584,11 +582,10 @@ pub fn b_matvec_unrestricted(
         result[offset..offset + ns].copy_from_slice(&rs);
     }
 
-    if with_hartree {
-        let (va, vb) = unrestricted_coulomb_sum(ri_ov, n0, n1, fxc_data.nocc, fxc_data.nvir, z);
-        for idx in 0..n0 { result[idx] += va[idx]; }
-        for idx in 0..n1 { result[n0 + idx] += vb[idx]; }
-    }
+    // Coulomb (Hartree) coupling: the only alpha/beta coupling term.
+    let (va, vb) = unrestricted_coulomb_sum(ri_ov, n0, n1, fxc_data.nocc, fxc_data.nvir, z);
+    for idx in 0..n0 { result[idx] += va[idx]; }
+    for idx in 0..n1 { result[n0 + idx] += vb[idx]; }
 
     result
 }
