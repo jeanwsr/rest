@@ -1985,6 +1985,7 @@ impl GwGradEngine<'_> {
             AnalDrvConfig, HessNucAPI, RHessCoreAPI, RHessElecInteractAPI, RHessHcore,
             RHessOvlp, RHessSCF,
         };
+        use crate::analdrv::response::rresp_interface::rscf_resp_interface;
         use crate::ri_jk::hess_r::RHessRIJK;
         use crate::ri_jk::util::{get_cint_aux, get_cint_mol};
         use rstsr::prelude::*;
@@ -2038,24 +2039,32 @@ impl GwGradEngine<'_> {
         let mut rijk_obj = RHessRIJK::new_with_cderi(&mol, &aux, 1.0, 1.0, cderi, j2c_decomp);
 
         let config = AnalDrvConfig::default();
+        // upstream (analdrv refactor): the CP-SCF solve now lives in the shared
+        // response object, which `RHessSCF` only borrows.
+        let mut resp = rscf_resp_interface(self.scf, &config);
         let nuc_list: Vec<&mut dyn HessNucAPI> = Vec::new();
         let core_list: Vec<&mut dyn RHessCoreAPI> = vec![&mut hcore_obj];
         let el_list: Vec<&mut dyn RHessElecInteractAPI> = vec![&mut rijk_obj];
-        let mut hess = RHessSCF::new(
-            mo_coeff, mo_occ, mo_energy, &mut ovlp_obj, nuc_list, core_list, el_list,
-            &config,
-        );
-        let t_prep0 = Instant::now();
-        hess.make_response_preparation();
-        let t_prep = t_prep0.elapsed().as_secs_f64();
+        // `hess` holds a mutable borrow of `resp`, so it is confined to this
+        // scope; the block ends before `resp` is used directly for the solve.
+        let (rhs_map, t_prep, t_rhs) = {
+            let mut hess = RHessSCF::new(
+                mo_coeff, mo_occ, mo_energy, &mut ovlp_obj, nuc_list, core_list, el_list,
+                &mut resp, &config.nucgrad,
+            );
+            let t_prep0 = Instant::now();
+            hess.make_response_preparation();
+            let t_prep = t_prep0.elapsed().as_secs_f64();
 
-        // ---- dimensionless CP-HF right-hand side (analdrv skeleton route)
-        //      and one block-Krylov solve over all perturbations ----
-        let t_rhs0 = Instant::now();
-        let rhs_map = hess.compute_dimless_cphf_rhs();
-        let t_rhs = t_rhs0.elapsed().as_secs_f64();
+            // ---- dimensionless CP-HF right-hand side (analdrv skeleton route)
+            //      and one block-Krylov solve over all perturbations ----
+            let t_rhs0 = Instant::now();
+            let rhs_map = hess.compute_dimless_cpscf_rhs();
+            let t_rhs = t_rhs0.elapsed().as_secs_f64();
+            (rhs_map, t_prep, t_rhs)
+        };
         let t_solve0 = Instant::now();
-        let mo1_tsr = hess.solve_dimless_cphf(rhs_map["rhs"].view()); // [nmo, nocc, 3, natm]
+        let mo1_tsr = resp.solve_dimless_cpscf(rhs_map["rhs"].view()); // [nmo, nocc, 3, natm]
         let t_solve = t_solve0.elapsed().as_secs_f64();
 
         // ---- canonical-orbital assembly per perturbation ----
