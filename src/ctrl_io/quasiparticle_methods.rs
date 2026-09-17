@@ -67,6 +67,39 @@ pub struct QuasiParticle {
     pub bse_exchange_rescaling:f64,
     pub save_bse_excitations:bool,
     pub evgw_rounds:usize,
+    /// Linear mixing (damping) factor alpha in (0, 1] for the evGW outer loop.
+    ///
+    /// The Green's-function energy vector handed to the next GW pass is built as
+    ///   E_in^(k+1) = (1 - alpha) E_in^(k) + alpha E_out^(k)
+    /// where `E_out` is the result of one full GW pass.  `alpha = 1.0` is the
+    /// historical, undamped fixed-point iteration; smaller values damp the
+    /// eigenvalue self-consistency and are the scalar analogue of the
+    /// Z-scaled (linearized) quasiparticle update used by MolGW's GnWn loop.
+    pub evgw_damping:f64,
+    /// Enable Pulay/DIIS (Anderson) extrapolation of the evGW quasiparticle
+    /// energy vector, exactly as `pyscf.gw.evgw` does on `mo_energy`.
+    pub evgw_diis:bool,
+    /// Number of residual vectors kept in the DIIS history.
+    pub evgw_diis_space:usize,
+    /// Minimum number of stored residuals before DIIS extrapolation is used.
+    pub evgw_diis_start:usize,
+    /// Use the strict bracket-restricted fallback for the DIIS step.  Default
+    /// `false` = standard Pulay/DIIS behaviour (free extrapolation, rejected
+    /// only when non-finite or clearly runaway).
+    pub evgw_diis_safeguard:bool,
+    /// Optional hard cap (Ha) on the per-orbital quasiparticle-energy change of
+    /// one evGW round.  `0.0` (default) = unlimited.  This is the practical
+    /// analogue of MolGW's `Z <= 1` clamp: it bounds the step taken by the
+    /// eigenvalue self-consistency and prevents a quasiparticle-equation root
+    /// solve from jumping to a spurious distant root.
+    pub evgw_max_step:f64,
+    /// Convergence threshold (Ha) on max_n |E_n^out - E_n^in| for one evGW round.
+    pub evgw_conv_tol:f64,
+    /// Stop the evGW loop as soon as `evgw_conv_tol` is met (otherwise always
+    /// run the full `evgw_rounds` passes).
+    pub evgw_stop_on_convergence:bool,
+    /// Print a per-round convergence report (|dE|, |dG|, HOMO/LUMO).
+    pub evgw_report:bool,
     pub save_gw_homo_lumo_qp:bool,
     pub save_qp_path:String,
     pub save_first_excitation:bool,
@@ -221,6 +254,15 @@ impl Default for QuasiParticle {
             gw:false,
             save_bse_excitations:false, 
             evgw_rounds:0,
+            evgw_damping:1.0,
+            evgw_diis:true,
+            evgw_diis_space:8,
+            evgw_diis_start:2,
+            evgw_diis_safeguard:false,
+            evgw_max_step:0.0,
+            evgw_conv_tol:1e-5,
+            evgw_stop_on_convergence:true,
+            evgw_report:true,
             save_gw_homo_lumo_qp:false,
             save_qp_path:String::from("single_qp_path.txt"),
             save_first_excitation:false,
@@ -355,6 +397,15 @@ impl QuasiParticle {
         table.insert("gw".to_string(), toml::Value::Boolean(self.gw));
         table.insert("save_bse_excitations".to_string(), toml::Value::Boolean(self.save_bse_excitations));
         table.insert("evgw_rounds".to_string(), toml::Value::Integer(self.evgw_rounds as i64));
+        table.insert("evgw_damping".to_string(), toml::Value::Float(self.evgw_damping));
+        table.insert("evgw_diis".to_string(), toml::Value::Boolean(self.evgw_diis));
+        table.insert("evgw_diis_space".to_string(), toml::Value::Integer(self.evgw_diis_space as i64));
+        table.insert("evgw_diis_start".to_string(), toml::Value::Integer(self.evgw_diis_start as i64));
+        table.insert("evgw_diis_safeguard".to_string(), toml::Value::Boolean(self.evgw_diis_safeguard));
+        table.insert("evgw_max_step".to_string(), toml::Value::Float(self.evgw_max_step));
+        table.insert("evgw_conv_tol".to_string(), toml::Value::Float(self.evgw_conv_tol));
+        table.insert("evgw_stop_on_convergence".to_string(), toml::Value::Boolean(self.evgw_stop_on_convergence));
+        table.insert("evgw_report".to_string(), toml::Value::Boolean(self.evgw_report));
         table.insert("save_gw_homo_lumo_qp".to_string(), toml::Value::Boolean(self.save_gw_homo_lumo_qp));
         table.insert("save_qp_path".to_string(), toml::Value::String(self.save_qp_path.clone()));
         table.insert("save_first_excitation".to_string(), toml::Value::Boolean(self.save_first_excitation));
@@ -656,6 +707,47 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(4_usize)},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(4) as usize},
                 other => {0}
+            };
+            tmp_input.evgw_damping = match tmp_ctrl.get("evgw_damping").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(1.0_f64)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0)},
+                _ => {1.0}
+            };
+            tmp_input.evgw_diis = match tmp_ctrl.get("evgw_diis").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                _ => {true},
+            };
+            tmp_input.evgw_diis_space = match tmp_ctrl.get("evgw_diis_space").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(8_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
+                _ => {8}
+            };
+            tmp_input.evgw_diis_start = match tmp_ctrl.get("evgw_diis_start").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(2_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(2) as usize},
+                _ => {2}
+            };
+            tmp_input.evgw_diis_safeguard = match tmp_ctrl.get("evgw_diis_safeguard").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                _ => {false},
+            };
+            tmp_input.evgw_max_step = match tmp_ctrl.get("evgw_max_step").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(0.0_f64)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.0)},
+                _ => {0.0}
+            };
+            tmp_input.evgw_conv_tol = match tmp_ctrl.get("evgw_conv_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(1e-5_f64)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-5)},
+                _ => {1e-5}
+            };
+            tmp_input.evgw_stop_on_convergence = match tmp_ctrl.get("evgw_stop_on_convergence").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                _ => {true},
+            };
+            tmp_input.evgw_report = match tmp_ctrl.get("evgw_report").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                _ => {true},
             };
             tmp_input.bse_max_ang_momentum = match tmp_ctrl.get("bse_max_ang_momentum").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(10_usize)},

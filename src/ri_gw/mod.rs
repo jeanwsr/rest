@@ -1930,7 +1930,7 @@ fn get_homo_lumo_qp_only_lowrank(
         &quasiparticle_energies_g, &quasiparticle_energies_w,
         occ_size, vir_size, num_state,
         &wc_rows, &real_axis_vchiv,
-        eigenenergies[n], 0.00001, 50, side, printlevel, qp_ctrl.cdgw_eta,
+        eigenenergies[n], 0.00001, 50, side, printlevel, qp_ctrl.cdgw_res_tol,
     );
     println!("The QP energy of HOMO obtained by GWA (low-rank) is {}", homo_qp);
 
@@ -1952,7 +1952,7 @@ fn get_homo_lumo_qp_only_lowrank(
         &quasiparticle_energies_g, &quasiparticle_energies_w,
         occ_size, vir_size, num_state,
         &wc_rows, &real_axis_vchiv,
-        eigenenergies[n], 0.00001, 50, side, printlevel, qp_ctrl.cdgw_eta,
+        eigenenergies[n], 0.00001, 50, side, printlevel, qp_ctrl.cdgw_res_tol,
     );
 
     let save_path = qp_ctrl.save_qp_path.clone();
@@ -2772,11 +2772,11 @@ pub fn quasiparticle_equation_lowrank_v2(
     wc_rows: &Vec<(f64, f64, Vec<f64>)>,
     real_axis_vchiv: &RealAxisVChiV,
     print_level: usize,
-    eta: f64,
+    res_tol: f64,
 ) -> f64 {
     let contour = contour_rayon_lowrank(
         omega, n, quasiparticle_energies_g, quasiparticle_energies_w, occ_size, vir_size,
-        num_state, ri_row_n, real_axis_vchiv, print_level, eta,
+        num_state, ri_row_n, real_axis_vchiv, print_level, res_tol,
     );
     let imag = calculate_imag_from_rows(wc_rows, omega, quasiparticle_energies_g);
     if print_level > 2 {
@@ -2805,7 +2805,7 @@ pub fn newton_solver_lowrank_v2(
     max_iter: usize,
     side: f64,
     printlevel: usize,
-    eta: f64,
+    res_tol: f64,
 ) -> f64 {
     let h = 0.000001;
     let delta = 0.02;
@@ -2814,7 +2814,7 @@ pub fn newton_solver_lowrank_v2(
     let qp_eq = |omega: f64| {
         quasiparticle_equation_lowrank_v2(
             omega, n, consts, ri_row_n, quasiparticle_energies_g, quasiparticle_energies_w,
-            occ_size, vir_size, num_state, wc_rows, real_axis_vchiv, 0, eta,
+            occ_size, vir_size, num_state, wc_rows, real_axis_vchiv, 0, res_tol,
         )
     };
 
@@ -3093,11 +3093,11 @@ pub fn quasiparticle_equation_lowrank(
     w_c_at_freqs: &Vec<(f64, f64, MatrixFull<f64>)>,
     real_axis_vchiv: &RealAxisVChiV,
     print_level: usize,
-    eta: f64,
+    res_tol: f64,
 ) -> f64 {
     let contour = contour_rayon_lowrank(
         omega, n, quasiparticle_energies_g, quasiparticle_energies_w,
-        occ_size, vir_size, num_state, ri_row_n, real_axis_vchiv, print_level, eta,
+        occ_size, vir_size, num_state, ri_row_n, real_axis_vchiv, print_level, res_tol,
     );
     let imag = calculate_imag(
         w_c_at_freqs, num_state, n, omega,
@@ -3128,7 +3128,7 @@ pub fn newton_solver_lowrank(
     max_iter: usize,
     side: f64,
     printlevel: usize,
-    eta: f64,
+    res_tol: f64,
 ) -> f64 {
     let h = 0.000001;
     let delta = 0.02;
@@ -3138,7 +3138,7 @@ pub fn newton_solver_lowrank(
         quasiparticle_equation_lowrank(
             omega, n, consts, ri_row_n,
             quasiparticle_energies_g, quasiparticle_energies_w,
-            occ_size, vir_size, num_state, w_c_at_freqs, real_axis_vchiv, 0, eta,
+            occ_size, vir_size, num_state, w_c_at_freqs, real_axis_vchiv, 0, res_tol,
         )
     };
 
@@ -3276,7 +3276,7 @@ pub fn gw_calculations_lowrank(
     // Check whether self-energy correction is enabled
     let use_fourier = qp_ctrl.fourier_self_energy;
     let use_hermite = qp_ctrl.hermite_self_energy;
-    let cdgw_eta = qp_ctrl.cdgw_eta;
+    let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
 
     if use_fourier && use_hermite {
         panic!("Cannot enable both Fourier self-energy and Hermite self-energy simultaneously!");
@@ -3305,7 +3305,7 @@ pub fn gw_calculations_lowrank(
                     omega, n, consts, &ri_row_n,
                     &quasiparticle_energies_g, &quasiparticle_energies_w,
                     occ_size, vir_size, num_state,
-                    &wc_rows, &real_axis_vchiv, 0, cdgw_eta,
+                    &wc_rows, &real_axis_vchiv, 0, cdgw_res_tol,
                 )
             };
             let (_have_crossing, real_qp) =
@@ -3355,7 +3355,7 @@ pub fn gw_calculations_lowrank(
                         omega, n, consts, &ri_row_n,
                         &quasiparticle_energies_g, &quasiparticle_energies_w,
                         occ_size, vir_size, num_state,
-                        &wc_rows, &real_axis_vchiv, 0, cdgw_eta,
+                        &wc_rows, &real_axis_vchiv, 0, cdgw_res_tol,
                     ) + fourier_self_energy::fourier_series(
                         &sin_coeff, &cos_coeff, powers, t, omega - origin,
                     )
@@ -3402,7 +3402,7 @@ pub fn gw_calculations_lowrank(
                         omega, n, consts, &ri_row_n,
                         &quasiparticle_energies_g, &quasiparticle_energies_w,
                         occ_size, vir_size, num_state,
-                        &wc_rows, &real_axis_vchiv, 0, cdgw_eta,
+                        &wc_rows, &real_axis_vchiv, 0, cdgw_res_tol,
                     ) + fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff)
                 };
 
@@ -3499,7 +3499,7 @@ pub fn linearized_gw_lowrank(
     let h = qp_ctrl.gw_linearize_derivative_h;
     let use_fourier = qp_ctrl.fourier_self_energy;
     let use_hermite = qp_ctrl.hermite_self_energy;
-    let cdgw_eta = qp_ctrl.cdgw_eta;
+    let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
 
     if use_fourier && use_hermite {
         panic!("Cannot enable both Fourier self-energy and Hermite self-energy simultaneously!");
@@ -3518,7 +3518,7 @@ pub fn linearized_gw_lowrank(
                     omega, n, 0.0, &ri_row_n,
                     &quasiparticle_energies_g, &quasiparticle_energies_w,
                     occ_size, vir_size, num_state,
-                    &wc_rows, &real_axis_vchiv, 0, cdgw_eta,
+                    &wc_rows, &real_axis_vchiv, 0, cdgw_res_tol,
                 )
             };
 
@@ -3527,7 +3527,7 @@ pub fn linearized_gw_lowrank(
                 omega_shifted, n,
                 &quasiparticle_energies_g, &quasiparticle_energies_w,
                 occ_size, vir_size, num_state,
-                &ri_row_n, &real_axis_vchiv, 0, cdgw_eta,
+                &ri_row_n, &real_axis_vchiv, 0, cdgw_res_tol,
             );
 
             let imag_plus_h = calculate_imag_from_rows(
@@ -3540,13 +3540,13 @@ pub fn linearized_gw_lowrank(
                 omega_shifted + h, n,
                 &quasiparticle_energies_g, &quasiparticle_energies_w,
                 occ_size, vir_size, num_state,
-                &ri_row_n, &real_axis_vchiv, 0, cdgw_eta,
+                &ri_row_n, &real_axis_vchiv, 0, cdgw_res_tol,
             );
             let contour_minus_h = contour_rayon_lowrank(
                 omega_shifted - h, n,
                 &quasiparticle_energies_g, &quasiparticle_energies_w,
                 occ_size, vir_size, num_state,
-                &ri_row_n, &real_axis_vchiv, 0, cdgw_eta,
+                &ri_row_n, &real_axis_vchiv, 0, cdgw_res_tol,
             );
 
             let self_energy_plus_h = contour_plus_h - imag_plus_h;
@@ -3600,7 +3600,7 @@ pub fn linearized_gw_lowrank(
                         omega, n,
                         &quasiparticle_energies_g, &quasiparticle_energies_w,
                         occ_size, vir_size, num_state,
-                        &ri_row_n, &real_axis_vchiv, 0, cdgw_eta,
+                        &ri_row_n, &real_axis_vchiv, 0, cdgw_res_tol,
                     );
                     let imag = calculate_imag_from_rows(&wc_rows, omega, &quasiparticle_energies_g);
                     let fse = fourier_self_energy::fourier_series(
@@ -3658,7 +3658,7 @@ pub fn linearized_gw_lowrank(
                         omega, n,
                         &quasiparticle_energies_g, &quasiparticle_energies_w,
                         occ_size, vir_size, num_state,
-                        &ri_row_n, &real_axis_vchiv, 0, cdgw_eta,
+                        &ri_row_n, &real_axis_vchiv, 0, cdgw_res_tol,
                     );
                     let imag = calculate_imag_from_rows(&wc_rows, omega, &quasiparticle_energies_g);
                     let hse = fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff);

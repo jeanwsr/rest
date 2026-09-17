@@ -417,7 +417,42 @@ GW计算通过 `gw_or_bse = “gw”` 启动（也内置于 `”bse”` 模式�
 - `scgw`: 取值String，决定GW的自洽方案。可选项：
     - `”g0w0”`（缺省）：单次GW计算，不做自洽迭代。
     - `”evgw”`：本征值自洽GW（evGW），迭代更新准粒子能量中的G部分。需配合 `evgw_rounds` 设置迭代次数。
-- `evgw_rounds`: 取值usize，evGW自洽迭代的轮数。仅在 `scgw = “evgw”` 时需要设置。缺省为0。
+- `evgw_rounds`: 取值usize，evGW自洽迭代的轮数（上限）。仅在 `scgw = "evgw"` 时需要设置。缺省为0。
+
+#### evGW 外循环收敛控制
+
+evGW 的本质是对映射 `E^(k+1) = F(E^(k))`（`F` = 一轮完整 GW）做不动点迭代。与 PySCF、MolGW 的经验一致，**不做任何加速的朴素迭代对多数分子不会收敛**：`F` 的 Jacobian 在不动点附近有接近甚至超过单位模的特征值，迭代会落入极限环；若再叠加低秩等离面路径中"最近格点"选取带来的分段常值（不连续）误差，连迭代轨迹的逐次可复现性都会丧失。因此 REST 的 evGW 外循环默认启用 **Pulay/DIIS（Anderson）外推**，并提供阻尼与收敛判据：
+
+- `evgw_diis`: 取值bool，是否对整条准粒子能量矢量做 Pulay/DIIS 外推（与 `pyscf.gw.evgw` 中对 `mo_energy` 做 `pyscf.lib.diis.DIIS` 完全对应）。缺省 `true`（**强烈建议保持开启**，关闭后等价于历史的朴素迭代，通常不收敛）。
+- `evgw_diis_space`: DIIS 历史长度。缺省 8。
+- `evgw_diis_start`: 至少积累多少个残差矢量后才启用外推。缺省 2。
+- `evgw_diis_safeguard`: 取值bool。缺省 `false`，即标准 DIIS 行为（允许自由外推，仅在结果非有限或严重发散时回退到阻尼步）。设为 `true` 时改用更保守的区间约束回退。
+- `evgw_damping`: 取值f64，取值区间 `(0, 1]`。线性混合/阻尼因子 α，更新式为
+  `E_in^(k+1) = (1-α) E_in^(k) + α E_out^(k)`（DIIS 开启时先阻尼、再对阻尼后的矢量做外推）。
+  `α = 1.0`（缺省）为无阻尼。α 相当于 MolGW 的 `E + Z(F(E) - E)` 中状态相关步长 `Z` 的标量版本。**经验上 α = 1.0 + DIIS 收敛最快；调小 α 往往并不改善收敛性**（本仓库的测试中 α = 0.5 反而更慢或发散），仅在需要更保守的轨迹时使用。
+- `evgw_conv_tol`: 取值f64，单位Hartree。收敛判据：一轮内 `max_n |E_n^out - E_n^in|` 小于该值即认为收敛。缺省 `1e-5`。
+- `evgw_stop_on_convergence`: 取值bool。达到 `evgw_conv_tol` 后是否提前结束（否则始终跑满 `evgw_rounds` 轮）。缺省 `true`。
+- `evgw_report`: 取值bool。是否每轮打印收敛报告（`max|dE_qp|`、`|dG|`、最大步长、HOMO/LUMO 准粒子能量与 gap）。缺省 `true`。
+
+每轮日志形如：
+
+```text
+evGW round 5 summary: max|dE_qp|=1.2345e-04 Ha (orbital #7), |dG|=5.6789e-06, max|step|=9.8765e-05 Ha
+evGW round 5: HOMO(#4 QP)=-0.36912345 Ha, LUMO(#5 QP)=0.18345678 Ha, gap=0.55258023 Ha
+```
+
+收敛后打印 `evGW converged after N round(s): ...`；若跑满轮数仍未达到阈值，打印 `WARNING: evGW did not reach conv_tol=...`，并给出最后一次的残差，便于判断是"未收敛"还是"参数需要调整"。
+
+参考实测（NH3/cc-pVDZ、`xc = scan`、`gw_extrapolate_*_threshold = 0.5`、`use_low_rank_contour = true`、`nomega_chi_real = 64`）：
+
+| 外循环设置 | 结果 |
+| --- | --- |
+| 朴素迭代（`evgw_diis = false`, `evgw_damping = 1.0`） | 80 轮后 `max|dE_qp|` 仍在 ~1e-4 ~ 1e-2 Ha 量级振荡，不收敛 |
+| `evgw_diis = true`, `evgw_damping = 1.0`（缺省） | 11 轮收敛，`max|dE_qp| = 9.1e-6 Ha` |
+| `evgw_diis = true`, `evgw_damping = 0.5` | 25 轮收敛，`max|dE_qp| = 2.5e-6 Ha` |
+
+> **注意**：`use_low_rank_contour = true` 时，`evgw_diis = true` 是稳定收敛的必要条件。低秩路径的实轴 `v·χ·v` 采用"最近格点"取值（与 MolGW 的 `sf_interpolate_vsqrt_chi_vsqrt` 相同），该函数在格点中点上不连续；朴素迭代会把 1e-14 的舍入差异放大到 ~1e-3 Ha（同一二进制两次运行从第 5 轮起结果就不再一致），只有 DIIS 这类对小幅不连续扰动鲁棒的加速方法才能稳定收敛。
+
 - `gw_extrapolate_occ_threshold`: 取值f64，单位Hartree。在 `gw_scheme = “extrapolated”` 方案中，决定费米面以下精确求解准粒子方程的能量窗口。计算范围包括KS轨道能量落在 `[HOMO - gw_extrapolate_occ_threshold, HOMO]` 的占据轨道。缺省为0.1。
 - `gw_extrapolate_vir_threshold`: 取值f64，单位Hartree。在 `gw_scheme = “extrapolated”` 方案中，决定费米面以上精确求解准粒子方程的能量窗口。计算范围包括KS轨道能量落在 `[LUMO, LUMO + gw_extrapolate_vir_threshold]` 的虚轨道。缺省为0.1。
 
@@ -480,6 +515,15 @@ use_low_rank_contour = true
 - `step_sigma`: 取值f64，自能Sigma实轴扫描步长，单位Hartree。缺省为0.05。
 
 > **精度提示**：如果 GW 计算窗口包含深占据轨道或高虚轨道，低秩实轴插值需要更密的频率格点。此时应增大 `nomega_chi_real`（例如提高到 1000–5000 或更高），否则这些轨道的 QP 能量以及后续 BSE 激发能可能不够准确。对于仅关心 HOMO/LUMO 附近或低激发态的情况，可以使用较小的 `nomega_chi_real` 以节省计算时间。
+
+低秩路径涉及的另外两个参数：
+
+- `cdgw_eta`: 取值f64，单位Hartree。实轴响应函数 χ₀(ω) 的 Lorentzian 展宽 η。缺省 `1e-3`。它与 `nomega_chi_real` 共同决定低秩实轴表示的精度：实轴格点间距需与 η 相称，否则相邻格点上的 `v·χ·v` 差异过大（低秩路径按"最近格点"取值，见下），单轮 GW 的误差可达 1e-3 Ha 量级。需要提高精度时优先增大 `nomega_chi_real`。
+- `cdgw_res_tol`: 取值f64，单位Hartree。CD-GW 中极点/留数的**数值判据**（不是物理展宽）：`de >= -cdgw_res_tol` 时计入该极点，`|de| < cdgw_res_tol` 时按半权重 ×0.5 计入；`de_max` 扫描同样使用该阈值。缺省 `1e-3`。
+
+> **修正说明**：在本仓库此前的实现中，**低秩**围道变形路径把 `cdgw_eta` 当作留数判据使用，从而完全忽略了 `cdgw_res_tol`，与 `cdgw_res_tol` 的设计语义（"必须是小的数值容差，不能用物理展宽代替"）相矛盾；当两者取值不同（例如为了稳定而把 `cdgw_eta` 调大到 0.01）时，低秩路径的 Σ 会被半个极点权重污染，evGW 无法收敛。现已改为统一使用 `cdgw_res_tol`。两者取缺省值（均为 1e-3）时结果与修正前逐位一致；`cdgw_eta` 在低秩路径中只保留"实轴 χ₀ 展宽"的作用。
+
+> **可复现性提示**：低秩路径的实轴 `v·χ·v` 使用"最近格点"取值（等价于 MolGW 的 `sf_interpolate_vsqrt_chi_vsqrt`，不做插值），该映射在格点中点上不连续。因此在朴素 evGW 迭代（`evgw_diis = false`）下，同一二进制、同一输入的两次运行会从若干轮之后开始出现 ~1e-3 Ha 的差异（1e-14 的舍入差异被逐步放大）；采用 `evgw_diis = true` 后迭代轨迹重新变得逐位可复现。详见上文 evGW 外循环收敛控制一节。
 
 ### GW求解器通用参数
 
@@ -558,6 +602,12 @@ gw_or_bse = “gw”
 gw_scheme = “extrapolated”
 scgw = “evgw”
 evgw_rounds = 5
+# 外循环加速与收敛判据（缺省即为下列取值，DIIS 建议保持开启）
+evgw_diis = true
+evgw_diis_space = 8
+evgw_damping = 1.0
+evgw_conv_tol = 1e-5
+evgw_stop_on_convergence = true
 renormalized_singles = true
 w_rs = true
 threshold = 0.1
