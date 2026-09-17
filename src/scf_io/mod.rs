@@ -112,6 +112,7 @@ pub struct SCF {
     pub algorithm_jk: AlgorithmJK,
     pub solvent_static_obj: Option<PcmObject>,
     pub solvent_scf: Option<PcmScf>,
+    pub scf_converged: bool,
 }
 
 #[derive(Clone,Copy)]
@@ -172,6 +173,7 @@ impl SCF {
             algorithm_jk: AlgorithmJK::Default,
             solvent_static_obj: None,
             solvent_scf: None,
+            scf_converged: false,
         };
 
         // at first check the scf type: RHF, ROHF or UHF
@@ -5510,6 +5512,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             println!("solvent_model.refresh:   {:10.2}s", timecost);
         }
     }
+    scf_data.scf_converged = scf_converge[0];
     if scf_converge[0] {
         info!("SCF is converged after {:4} iterations.", scf_records.num_iter-1);
         // Level shift is disabled before the final diagonalization to ensure accurate eigenvalues.

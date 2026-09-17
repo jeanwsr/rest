@@ -90,6 +90,10 @@ pub fn main_driver() -> anyhow::Result<()> {
     if ! PathBuf::from(ctrl_file.clone()).is_file() {
         panic!("Input file ({:}) does not exist", ctrl_file);
     }
+    if crate::md::is_pure_mm_run(&ctrl_file) {
+        crate::md::run_pure_mm(&ctrl_file)?;
+        return Ok(());
+    }
     let mut mol = Molecule::build(ctrl_file.clone(), mpi_data)?;
     mol.ctrl.ctrl_file = ctrl_file;
     if mol.ctrl.print_level>0 {println!("Molecule_name: {}", &mol.geom.name)};
@@ -270,6 +274,10 @@ pub fn main_driver() -> anyhow::Result<()> {
         // UNVERIFIED NORMAL MODES CALCULATION
         JobType::NormalModes => {
             eval_normal_modes(&mut scf_data, &mut time_mark, &mpi_operator);
+        },
+        JobType::MD => {
+            let ctrl_file = utilities::parse_input().value_of("input_file").unwrap_or("ctrl.in").to_string();
+            crate::md::run_md(&mut scf_data, &mut time_mark, &mpi_operator, &ctrl_file);
         },
         // ------------
         _ => {}
@@ -799,7 +807,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
     (energy, gradient)
 }
 
-fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_operator: &Option<MPIOperator>, position: &MatrixFull<f64>) -> (f64, MatrixFull<f64>) {
+pub(crate) fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_operator: &Option<MPIOperator>, position: &MatrixFull<f64>) -> (f64, MatrixFull<f64>) {
     scf_data.mol.geom.geom_update(&position.data(), GeomUnit::Bohr);
     if scf_data.mol.ctrl.print_level>0 {
         println!("Input geometry in this round is:");
