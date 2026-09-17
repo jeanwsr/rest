@@ -100,10 +100,12 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
         scf_data.generate_density_matrix();
         //scf_data.generate_hf_hamiltonian();
     } else if scf_data.mol.ctrl.initial_guess.eq(&"sad") {
-        let cur_log_level = log::max_level();
-        log::set_max_level(LevelFilter::Info);
-        scf_data.density_matrix = initial_guess_from_sad(&scf_data.mol, mpi_operator);
-        log::set_max_level(cur_log_level);
+        if !scf_data.mol.ctrl.use_isdf {
+            let cur_log_level = log::max_level();
+            log::set_max_level(LevelFilter::Info);
+            scf_data.density_matrix = initial_guess_from_sad(&scf_data.mol, mpi_operator);
+            log::set_max_level(cur_log_level);
+        }
         //for DFT methods, it needs the eigenvectors to generate the hamiltoniam. In consequence, we use the hf method to prepare the eigenvectors from the guess dm
         //scf_data.generate_hf_hamiltonian_for_guess();
         //if scf_data.mol.ctrl.print_level>0 {println!("Initial guess HF energy: {:16.8}", scf_data.evaluate_hf_total_energy())};

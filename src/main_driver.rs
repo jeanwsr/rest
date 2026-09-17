@@ -72,6 +72,7 @@ pub fn main_driver() -> anyhow::Result<()> {
     // `log` macros, whose stdout target is not print_level-gated) are unconditional.
     // As a blanket fix, redirect the standard output of all non-root ranks to /dev/null;
     // stderr is intentionally kept so that warnings and MPI runtime errors remain visible.
+    #[cfg(feature = "mpi")]
     if let Some(mpi_op) = &mpi_operator {
         if mpi_op.rank != 0 {
             use std::os::unix::io::AsRawFd;
@@ -89,7 +90,8 @@ pub fn main_driver() -> anyhow::Result<()> {
     if ! PathBuf::from(ctrl_file.clone()).is_file() {
         panic!("Input file ({:}) does not exist", ctrl_file);
     }
-    let mut mol = Molecule::build(ctrl_file, mpi_data)?;
+    let mut mol = Molecule::build(ctrl_file.clone(), mpi_data)?;
+    mol.ctrl.ctrl_file = ctrl_file;
     if mol.ctrl.print_level>0 {println!("Molecule_name: {}", &mol.geom.name)};
     if mol.ctrl.print_level>=2 {
         println!("{}", mol.ctrl.formated_output_in_toml());
@@ -426,18 +428,13 @@ pub fn main_driver() -> anyhow::Result<()> {
     if !scf_data.mol.ctrl.analdrv_tasks.is_empty() {
         time_mark.new_item("AnalDrv", "analytical derivative module");
         time_mark.count_start("AnalDrv");
-        use crate::analdrv::interface::analdrv_interface;
-        let tasks = &scf_data.mol.ctrl.analdrv_tasks;
+        use crate::analdrv::interface::{analdrv_interface, analdrv_json_interface};
+        let tasks = scf_data.mol.ctrl.analdrv_tasks.clone();
         let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
-        if let Some(anal_output) = analdrv_interface(&scf_data, tasks, &config) {
-            json_extra.insert("analdrv".to_string(), json!({
-                "frequencies_cm": anal_output.frequencies_cm,
-                "modes_trv": anal_output.modes_trv,
-            }));
-            if let Some(th) = anal_output.thermo {
-                json_extra.insert("thermo".to_string(), json!(th));
-            }
-        }
+        // the results-JSON expansion (the "analdrv"/"thermo" entries) is returned by
+        // analdrv_json_interface, so this driver holds no task-specific knowledge
+        let analdrv_out = analdrv_interface(&mut scf_data, &tasks, &config);
+        json_extra.extend(analdrv_json_interface(&analdrv_out));
         time_mark.count("AnalDrv");
     }
 
@@ -557,6 +554,9 @@ pub fn performance_essential_calculations(scf_data: &mut SCF, time_mark: &mut ut
     scf_without_build(scf_data, mpi_operator);
     //println!("debug time mark SCF turn off");
     time_mark.count("SCF");
+    if scf_data.mol.ctrl.max_memory_backup.is_some() {
+        scf_data.mol.ctrl.max_memory = scf_data.mol.ctrl.max_memory_backup.clone();
+    }
 
     //==================================================================
     // Save the converged SCF results to the chkfile
@@ -1196,11 +1196,20 @@ mod geometric_pyo3_impl {
                     crate::hessian::compute_hessian(&*scf_data)
                         .expect("Analytical Hessian computation failed for geometry optimization")
                 } else {
-                    use crate::analdrv::interface::hess_interface;
+                    use crate::analdrv::hessian::hess_interface;
+                    use crate::analdrv::response::rresp_interface::rscf_resp_interface;
                     use rstsr::prelude::*;
-                    
+
                     let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
-                    let (hess_raw, _, _) = hess_interface(&scf_data, &config);
+                    // shared RHF response object for the hessian.
+                    // UHF builds its own internally, and will implement the UHF response interface in the future.
+                    let mut resp_objs = if matches!(scf_data.scftype, crate::scf_io::SCFType::RHF) {
+                        Some(rscf_resp_interface(&scf_data, &config))
+                    } else {
+                        None
+                    };
+                    let hess_out = hess_interface(&scf_data, &config, resp_objs.as_mut());
+                    let hess_raw = hess_out.hessian;
                     let natm = (hess_raw.len() / 9).isqrt();
                     assert!(natm * natm * 9 == hess_raw.len(), "Hessian raw data length does not match expected size for {} atoms", natm);
                     let device = DeviceBLAS::default();

@@ -7,6 +7,7 @@ use crate::constants::{SPECIES_INFO};
 use crate::external_libs::py2fch;
 use crate::scf_io::SCF;
 use crate::scf_io::SCFType;
+use crate::x2c::RelativisticMethod;
 
 
 macro_rules! dump_real_r2f {
@@ -72,6 +73,26 @@ impl SCF {
         };
         let natom = self.mol.geom.elem.len();
         write!(input, "Number of atoms                            I {:16}\n", self.mol.geom.elem.len());
+        let mut route_tokens: Vec<String> = vec![String::from("#p")];
+        route_tokens.push(format!("{}/{}",
+            self.mol.ctrl.xc.to_uppercase(),
+            basis_name.to_uppercase()
+        ));
+        if let Some(disp) = &self.mol.ctrl.empirical_dispersion {
+            let em = match disp.as_str() {
+                "d3" => "GD3",
+                "d3bj" => "GD3BJ",
+                "d4" => "GD4",
+                other => other,
+            };
+            route_tokens.push(format!("em={}", em));
+        }
+        match self.mol.ctrl.rel {
+            RelativisticMethod::SFX2C => route_tokens.push(String::from("int(nobasistransform,X2C)")),
+            _ => route_tokens.push(String::from("int=nobasistransform")),
+        };
+        write!(input, "Route                                      C   N={:12}\n", route_tokens.len());
+        write!(input, "{}\n", route_tokens.join(" "));
         write!(input, "Charge                                     I {:16}\n", self.mol.ctrl.charge as i32);
         write!(input, "Multiplicity                               I {:16}\n", self.mol.ctrl.spin as i32);
         write!(input, "Number of electrons                        I {:16}\n", self.mol.num_elec[0] as i32);
@@ -336,25 +357,36 @@ impl SCF {
         }
         // leave MOs blank, it will be written by librest2fch
         let n_dm = nbf*(nbf+1)/2;
-        // write all zeros as dm
-        // for compatibility with librest2fch.so
-        write!(input, "Total SCF Density                          R   N={:12}\n", n_dm);
-        for i_index in 0..n_dm {
-                let sdd = format!("{:16.8E}", 0.0f64); 
-                if (i_index + 1)%5 == 0 {
-                    write!(input, "{}\n",r2f(&sdd));
-                } else {
-                    write!(input, "{}",r2f(&sdd));
+        // Total SCF density: real data for restricted closed-shell calculations (the
+        // lower-triangular, column-packed AO density, permuted to Gaussian's AO order so it
+        // agrees with the MO coefficients written by librest2fch); a zero placeholder
+        // elsewhere (librest2fch only requires the section header to exist). librest2fch
+        // copies the section content verbatim when regenerating the MO coefficients.
+        //
+        // NOTE: the unrestricted (`spin_channel == 2`) case still writes the zero placeholder;
+        // dumping real alpha/beta ("Total SCF Density" plus spin-polarized sections in
+        // Gaussian's convention) is left as future work.
+        let mut packed_dm = vec![0.0f64; n_dm];
+        if self.mol.spin_channel == 1 {
+            let dm = &self.density_matrix[0];
+            let perm = self.gaussian_ao_permutation();
+            let mut i_index = 0;
+            for j in 0..nbf {
+                for i in 0..=j {
+                    packed_dm[i_index] = dm.data[perm[i] + perm[j] * nbf];
+                    i_index += 1;
                 }
+            }
         }
-        if n_dm % 5 != 0 {write!(input, "\n");}
+        write!(input, "Total SCF Density                          R   N={:12}\n", n_dm);
+        dump_real_r2f!(input, packed_dm);
         input.sync_all().unwrap();
     }
 
     pub fn fchk_write_mo(&self) {
         let nbf = self.mol.num_basis;
         let nif = self.mol.num_state;
-    
+
         for i_spin in 0..self.mol.spin_channel {
             if i_spin ==0  {
                 py2fch(format!("{}.fchk", self.mol.geom.name), nbf, nif, &self.eigenvectors[i_spin].data, 'a', &self.eigenvalues[i_spin], 0, 0);
@@ -365,4 +397,64 @@ impl SCF {
         }
     }
 
-} 
+    /// AO-position permutation from REST's (libcint) AO order to Gaussian's internal order,
+    /// as `perm[gaussian_position] = rest_position`, consistent with the permutation that
+    /// librest2fch (`py2fch`) applies to the MO coefficients: spherical shells with `l >= 2`
+    /// are reordered from libcint's m = -l ... +l to Gaussian's m = 0, +1, -1, +2, -2, ...
+    /// (the MOKIT `py2fch_permute_5d/7f/9g/11h` tables); s and p shells carry identical
+    /// orders in both conventions, so they are copied through.
+    ///
+    /// Any density matrix dumped to the fchk file (e.g. the `Total MP2 Density` section)
+    /// must be permuted with this table to agree with the MO coefficients of the same file.
+    pub fn gaussian_ao_permutation(&self) -> Vec<usize> {
+        if !matches!(self.mol.cint_type, CintType::Spheric) {
+            panic!("The Gaussian AO permutation is currently implemented for spherical shells only.")
+        }
+        let mut perm: Vec<usize> = Vec::new();
+        let mut base = 0usize;
+        self.mol.basis4elem.iter().for_each(|ibas| {
+            ibas.electron_shells.iter().for_each(|ibascell| {
+                let l = ibascell.angular_momentum[0];
+                let n_func = (2 * l + 1) as usize;
+                if l <= 1 {
+                    (0..n_func).for_each(|i| perm.push(base + i));
+                } else {
+                    // Gaussian m sequence 0, +1, -1, +2, -2, ...; libcint's m-ascending
+                    // position of m is (m + l) within the shell
+                    let mut ms: Vec<i32> = vec![0];
+                    let mut k = 1i32;
+                    while ms.len() < n_func {
+                        ms.push(k);
+                        if ms.len() < n_func {
+                            ms.push(-k);
+                        }
+                        k += 1;
+                    }
+                    ms.iter().for_each(|&m| perm.push(base + (m + l as i32) as usize));
+                }
+                base += n_func;
+            })
+        });
+        perm
+    }
+
+    /// Append a symmetric density section to the Gaussian fchk file: `label` followed by the
+    /// lower-triangular (column-packed) density in Gaussian's AO order — the same layout as
+    /// the `Total SCF Density` section. The file must already exist (i.e.
+    /// [`SCF::save_fchk_of_gaussian`] must have run, so the appended section comes after the
+    /// librest2fch-written MO coefficients, which are untouched). `label` should follow
+    /// Gaussian's section naming ("Total MP2 Density", the name Gaussian itself writes for
+    /// the relaxed MP2 density with `Density=MP2`), so that downstream readers (Gaussian
+    /// tooling, Multiwfn, MOKIT, ...) recognize the section.
+    pub fn fchk_append_density_section(&self, label: &str, packed_lower: &[f64]) {
+        println!("\nAppend density section \"{label}\" to fchk file");
+        let mut input = fs::OpenOptions::new()
+            .append(true)
+            .open(format!("{}.fchk", &self.mol.geom.name))
+            .unwrap();
+        write!(input, "{label:<43}R   N={:12}\n", packed_lower.len());
+        dump_real_r2f!(input, packed_lower);
+        input.sync_all().unwrap();
+    }
+
+}

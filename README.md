@@ -882,12 +882,13 @@ hessian = { frequencies = true, verbose = 2 }
 
 ## 解析梯度性质模块 `analdrv` 计算相关设置
 
-解析梯度模块 `analdrv` 模块是实验性质模块。目前实现了 Hessian (原子核坐标二阶梯度) 功能。
+解析梯度模块 `analdrv` 模块是实验性质模块。目前实现了 Hessian (原子核坐标二阶梯度) 与电多极矩 (1-4 阶：偶极、四极、八极、十六极) 功能。
 它实现了不同于 `hessian` 模块的解析 Hessian 计算。目前该模块的 Hessian 功能支持 RHF/RKS/UHF/UKS 方法。对于 DFT，支持 LDA/GGA/mGGA 以及其对应的杂化泛函，包括范围分离杂化泛函 (RSH)。该模块的程序有性能优化，与目前顶级的量化程序 (ORCA 等) 有相当或更好的性能。
+多极矩功能支持 RHF/RKS；对于 PT2 族后自洽 (fifth-rung) 方法 (MP2、XYG3 等 xDH/BDH 类双杂化泛函)，在 SCF 密度之外额外计入关联密度增量，默认通过 Z-vector (CP-SCF) 求解弛豫增量。所有矩以原子单位输出，并给出核、SCF、关联 (corr)、响应 (resp) 与总 (tot) 的分项分解；四极矩额外输出无迹形式。
 
 ### 设置待计算性质的任务
 
-目前仅支持 Hessian 计算。需要在 `[ctrl]` 区块中设置 `analdrv_tasks` 关键词以启动对应性质的计算。若希望同时计算热力学矫正，请同时指定 `[thermo]` 区块。
+目前支持 Hessian (`"hessian"`，别名 `"hess"`/`"freq"` 等) 与电多极矩 (`"multipole"`，别名 `"pole"`/`"dipole"`) 两类任务。需要在 `[ctrl]` 区块中设置 `analdrv_tasks` 关键词 (单个字符串或字符串列表) 以启动对应性质的计算；两类任务可以同时指定。若希望同时计算热力学矫正，请同时指定 `[thermo]` 区块。
 ```toml
 [ctrl]
 analdrv_tasks = "freq"
@@ -895,18 +896,39 @@ analdrv_tasks = "freq"
 [thermo]
 ```
 
+多极矩任务 (或与 Hessian 的组合) 例如：
+```toml
+[ctrl]
+analdrv_tasks = ["multipole", "hessian"]
+```
+
 ### 解析梯度模块 `analdrv` 区块选项
 
-在设置任务后，用户可以在 `[analdrv]` 区块中设置对应的计算选项。该区块的关键词包括：
-- `cphf_level_shift`：CPHF 求解时对 $\varepsilon_i - \varepsilon_a$ 的求解偏移。默认为 0，单位 Hartree。
-- `cphf_tol`：CPHF 中的 Krylov 求解阈值。默认 1e-9，无量纲。实际求解阈值也受制于 `cphf_lindep`。
-- `cphf_max_cycle`：CPHF 最大迭代步数。默认为 42 步。CPHF 与 SCF 不同，一般 6-10 步能收敛。这里的最大步数一般不需要设得很大。
-- `cphf_max_space`：CPHF 中 Krylov 空间的数量。默认为 14。该数值不宜设太小，因为超过该数值时，Krylov 求解器会代入最后一次迭代重新作为初猜，重置求解过程。但该数值设太大会对内存产生压力。
-- `cphf_lindep`：CPHF 中一些数值过程的数值精度阈值。默认 1e-15，无量纲。
-- `cphf_tol_inflation`：容忍系数。若 Krylov 真残差 `||r|| < factor * tol`，接受该解而不触发 per-root 求解。缺省为1000.0。
+在设置任务后，用户可以在 `[analdrv]` 区块中设置对应的计算选项。该区块的关键词分为四个部分：通用选项、自洽场响应选项、核坐标导数性质选项、以及电多极矩选项。
+
+#### 通用选项
+
 - `verbose`：打印强度。默认为 None，使用输入卡 `[ctrl]` 区块的 verbose。
+
+#### 自洽场响应选项
+
+这类选项控制自洽场响应 (analdrv 中主要用于计算 CP-SCF、以及 post-SCF 方法的 generalized Fock) 如何计算，但不控制传入求解的量 (如参与计算的原子范围)。这些选项均只服务于 CP-SCF (响应) 求解：求解器选项以 `cpscf_` 为前缀；响应 DFT 格点并非求解器设置，命名为 `grid_level_cpscf` (与 `grid_level_skeleton` 同属 `grid_level_*` 命名)。
+
+- `cpscf_level_shift`：CP-SCF 求解时对 $\varepsilon_i - \varepsilon_a$ 的求解偏移。默认为 0，单位 Hartree。
+- `cpscf_tol`：CP-SCF 中的 Krylov 求解阈值。默认 1e-9，无量纲。实际求解阈值也受制于 `cpscf_lindep`。
+- `cpscf_max_cycle`：CP-SCF 最大迭代步数。默认为 42 步。CP-SCF 与 SCF 不同，一般 6-10 步能收敛。这里的最大步数一般不需要设得很大。
+- `cpscf_max_space`：CP-SCF 中 Krylov 空间的数量。默认为 14。该数值不宜设太小，因为超过该数值时，Krylov 求解器会代入最后一次迭代重新作为初猜，重置求解过程。但该数值设太大会对内存产生压力。
+- `cpscf_lindep`：CP-SCF 中一些数值过程的数值精度阈值。默认 1e-15，无量纲。
+- `cpscf_tol_inflation`：容忍系数。若 Krylov 真残差 `||r|| < factor * tol`，接受该解而不触发 per-root 求解。缺省为1000.0。
+- `grid_level_cpscf`：CP-SCF 中响应路径 (响应/A 张量收缩的 DFT 计算；fock 路径仍用 SCF 格点) 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None，是 `[ctrl]` 中 grid_generation_level 关键词设定值减 2 (SCF 默认格点级别是 3，对应 Hessian 的级别是 1)；显式取值不设下限。
+
+这些关键词的旧名称 `cphf_*` 前缀 (`cphf_tol`、`cphf_lindep`、`cphf_tol_inflation` 等) 目前仍然作为别名被接受；响应格点则同时接受其旧名称 `grid_level_cphf`。
+
+#### 核坐标导数性质选项
+
+这类选项控制对哪些原子坐标求导、以及梯度/Hessian 等导数性质 (及其衍生的振动、热力学分析) 如何计算，但不控制 CP-SCF 方程如何求解。
+
 - `atm_list`：选择一部分原子进行 Hessian 计算。默认为 None，即所有原子参与 Hessian 计算。
-- `grid_level_cphf`：CPHF 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None，是 `[ctrl]` 中 grid_generation_level 关键词设定值减 2 (SCF 默认格点级别是 3，对应 Hessian 的级别是 1)；最低级别是 1。
 - `grid_level_skeleton`：Skeleton 导数 (包括 2 阶 Hessian 贡献、1 阶 Fock 贡献) 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None：
   - LDA/GGA 使用与 SCF 同样的格点；
   - mGGA 分为两种情况：若 `grid_shift_deriv` 为 true 则保持 SCF 格点；若为 false 则将比 `grid_generation_level` 增加 2 级别。
@@ -915,16 +937,36 @@ analdrv_tasks = "freq"
 - `dftd_hess_step`：经验色散校正 (DFT-D3/DFT-D4) 对 Hessian 贡献的数值差分步长。默认为 3e-4，单位 Bohr。
 - `gau_thermo`：是否使用 Gaussian 类型的热力学能矫正。默认 false。该选项仅作参考；目前 REST 的热力学矫正通常是定义 `[thermo]` 区块以进行计算。Gaussian 类型热力学能矫正接受输入卡中 `[thermo]` 区块的关键词 `temperature`, `pressure`, `symmetry_number` 与 `electronic_energy`。
 
-作为例子，运行 Hessian 计算、增大 CP-HF Krylov 求解器空间到 20、强制 CP-HF 中 DFT 格点积分级别为 2，所需要引入的、相比于能量计算的额外设置如下：
+作为例子，运行 Hessian 计算、增大 CP-SCF Krylov 求解器空间到 20、强制 CP-SCF 中 DFT 格点积分级别为 2，所需要引入的、相比于能量计算的额外设置如下：
 ```toml
 [ctrl]
 analdrv_tasks = "freq"
 
 [analdrv]
-cphf_max_space = 20
-grid_level_cphf = 2
+cpscf_max_space = 20
+grid_level_cpscf = 2
 
 [thermo]
+```
+
+#### 电多极矩选项
+
+这类关键词控制电多极矩 (`multipole` 任务) 的计算：求哪几阶矩、以何处为原点、以及后自洽 (PT2 族) 密度增量的处理方式，但不控制 CP-SCF 方程如何求解。所有矩以原子单位输出；默认原点为坐标原点 `[0, 0, 0]`，与 Gaussian、pyscf 的多极矩打印约定一致。对于含赝势 (ECP) 的体系，核电荷矩按有效核电荷 (核电荷数减去赝势冻结电子数) 计，该约定同样与 Gaussian 一致。
+
+- `multipole_orders`：取值为正整数列表：1 = 偶极、2 = 四极、3 = 八极、4 = 十六极。默认为 `[1, 2, 3, 4]`。
+- `multipole_origin`：显式指定多极矩计算原点，取值为长度 3 的浮点数列表，单位 Bohr。默认为 None，即坐标原点 `[0, 0, 0]`。注意四极及以上矩 (2–4 阶) 的取值依赖分子在输入卡坐标系中的摆放位置；若需以核质量中心等其他原点取值 (如与文献值比较)，请显式设置本关键词。
+- `multipole_rdm1_relax`：双杂化密度增量的处理方式，取值 `"relaxed"` (求解 Z-vector 并计入响应增量) 或 `"unrelaxed"` (仅计入非弛豫关联 rdm1 增量，不求解 CP-SCF)。默认为 `"relaxed"`。对 HF/DFT 方法无效 (静默忽略)。
+- `multipole_rdm1_dump`：取值布尔类型。计算多极矩后，将总密度矩阵 (SCF 密度 + 关联 rdm1 增量；`"relaxed"` 模式下再对称地加入 0.5 * (Z + Zᵀ) 的 vir-occ/occ-vir 增量) 按 Gaussian fchk 格式追加写入 `{molecule}.fchk` 文件的 `Total MP2 Density` 段。该密度即多极矩计算中所收缩的密度：它与任意对称单电子性质积分的迹给出相应电子贡献。仅对 PT2 族后自洽方法 (纯 MP2 与双杂化) 生效；对 SCF 层级方法静默忽略。默认为 `false`。
+
+作为例子，运行多极矩计算、仅求偶极与四极矩、将原点设为坐标原点、并对后自洽部分使用非弛豫密度，所需的设置如下：
+```toml
+[ctrl]
+analdrv_tasks = "multipole"
+
+[analdrv]
+multipole_orders = [1, 2]
+multipole_origin = [0.0, 0.0, 0.0]
+multipole_rdm1_relax = "unrelaxed"
 ```
 
 # Detailed description of [geom] block in the control file
