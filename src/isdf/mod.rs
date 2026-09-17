@@ -698,7 +698,7 @@ pub fn gen_atom_grids_for_isdf(mol:&Molecule) -> Vec<dftgrids>{
     let mut atom_grids: Vec<dftgrids> = vec![];
 
     alpha_min.iter().zip(alpha_max.iter()).enumerate().for_each(|(center_index,value)| {
-        let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid(
+        let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid_with_isdf(
             value.0.clone(),
             value.1.clone(),
             radial_precision,
@@ -711,6 +711,7 @@ pub fn gen_atom_grids_for_isdf(mol:&Molecule) -> Vec<dftgrids>{
             pruning.clone(),
             rad_grid_method.clone(),
             grid_gen_level,
+            true,
         );
 
         let threshold = 1.0e-15;

@@ -80,6 +80,35 @@ pub fn atom_grid(
     level: usize,
 ) -> (Vec<(f64, f64, f64)>, Vec<f64>, Vec<f64>) {
 
+    atom_grid_with_isdf(
+        alpha_min, alpha_max, radial_precision, min_num_angular_points,
+        max_num_angular_points, proton_charges, center_index,
+        center_coordinates_bohr, hardness, pruning, rad_grid_method, level, false,
+    )
+}
+
+/// Use the historical angular tables only for an explicitly requested ISDF grid.
+pub(crate) fn atom_grid_with_isdf(
+    alpha_min: HashMap<usize, f64>,
+    alpha_max: f64,
+    radial_precision: f64,
+    min_num_angular_points: usize,
+    max_num_angular_points: usize,
+    proton_charges: Vec<i32>,
+    center_index: usize,
+    center_coordinates_bohr: Vec<(f64, f64, f64)>,
+    hardness: usize,
+    pruning: String,
+    rad_grid_method: String,
+    level: usize,
+    use_isdf: bool,
+) -> (Vec<(f64, f64, f64)>, Vec<f64>, Vec<f64>) {
+
+    let angular_grid = if use_isdf {
+        super::lebedev_isdf::angular_grid
+    } else {
+        lebedev::angular_grid
+    };
 
 /*
     //Generate radial grid through lmg method
@@ -187,10 +216,10 @@ pub fn atom_grid(
                     num_angular = min_num_angular_points;
                 }
             }
-            lebedev::angular_grid(num_angular)
+            angular_grid(num_angular)
         }
         else {
-                lebedev::angular_grid(ang_array[radial_coord_index])
+                angular_grid(ang_array[radial_coord_index])
             };
 
         radial_coord_index += 1;
