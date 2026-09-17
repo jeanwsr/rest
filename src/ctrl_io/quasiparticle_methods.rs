@@ -1,8 +1,31 @@
 use serde::{Deserialize,Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GwVariant {
+    Cd,
+    Ac,
+}
+
+impl Default for GwVariant {
+    fn default() -> Self {
+        Self::Cd
+    }
+}
+
+impl GwVariant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cd => "cd",
+            Self::Ac => "ac",
+        }
+    }
+}
+
 #[derive(Debug,Clone,Serialize, Deserialize)]
 pub struct QuasiParticle {
     pub gw_scheme:String,
+    pub gw_variant: GwVariant,
     pub homo_lumo_gw_qp:bool,
     pub x_alpha:f64,
     pub save_qp:bool,
@@ -14,6 +37,19 @@ pub struct QuasiParticle {
     pub davidson_max_iter:usize,
     pub davidson_add_dimensions:usize,
     pub bse_tda:bool,
+    pub print_nto:bool,
+    /// BSE switch / spin channel.
+    ///
+    /// * `"none"` (default): no BSE is run.
+    /// * Restricted reference: a genuine spin channel selector --
+    ///   `"singlet"` (direct term, factor 2), `"triplet"` (no direct term,
+    ///   factor 0) or `"both"`.  The restricted reference can be rotated into
+    ///   the singlet/triplet subspaces, so both channels are physical.
+    /// * Unrestricted reference (`spin_polarization = true`): **no channel
+    ///   selection**.  The direct (screened Coulomb) kernel is spin-independent
+    ///   and couples the alpha and beta blocks, so there is a single physical
+    ///   channel; any value other than `"none"` just switches the run on, and
+    ///   `"triplet"` / `"both"` are rejected (see `bse_main_unrestricted`).
     pub bse_spin:String,
     pub bse_cutoff_energy:f64,
     pub save_bse_terms:bool,
@@ -24,6 +60,8 @@ pub struct QuasiParticle {
     pub gw_linearize_derivative_h:f64,
     pub renormalized_singles:bool,
     pub w_rs:bool,
+    pub rs_full_space:bool,
+    pub rs_use_rs_orbitals:bool,
     pub scgw:String,
     pub gw:bool,
     pub bse_exchange_rescaling:f64,
@@ -37,6 +75,7 @@ pub struct QuasiParticle {
     pub low_rank_grid_type:String,   // "linear" or "quadratic" (power-law, denser near zero)
     pub nomega_chi_real:usize,
     pub low_rank_tolerance:f64,
+    pub omega_chi_max:f64,          // real-axis freq grid max (Ha); 0=auto from de_max
     pub nomega_sigma:usize,         // number of sigma sampling points on each side (de_max scan)
     pub step_sigma:f64,             // spacing of sigma grid in Ha (de_max scan)
     pub fourier_self_energy:bool,
@@ -46,7 +85,8 @@ pub struct QuasiParticle {
     pub hermite_coeff_path:String,
     pub parse_qp_path:String,
     pub bse_qp_polarization:bool,
-    pub threshold:f64,
+    pub gw_extrapolate_occ_threshold:f64,
+    pub gw_extrapolate_vir_threshold:f64,
     pub external_field_freq:f64,
     pub lifetime_gamma:f64,
     pub gw_or_bse:String,
@@ -73,6 +113,31 @@ pub struct QuasiParticle {
     pub qsgw_energy_tol: f64,
     pub qsgw_mix_param: f64,
     pub qsgw_eta: f64,
+    /// Lorentzian broadening (Ha) for CD-GW real-axis contour deformation.
+    /// Default 0.0 (no broadening, backward compatible). 0.01 recommended for stability.
+    pub cdgw_eta: f64,
+    /// Numerical tolerance (Ha) for residue pole detection in CD-GW:
+    /// - de > -tol  → include the residue pole
+    /// - |de| < tol → pole lies on the contour, apply half-weight (×0.5)
+    /// - de_max scan: only collect de > tol
+    /// Must be a small numerical tolerance (∼1e-3), NOT a physics broadening.
+    /// Default 0.001 (matching MolGW). Separated from cdgw_eta to prevent
+    /// large broadening from incorrectly halving off-contour residues.
+    pub cdgw_res_tol: f64,
+    /// Number of imaginary-axis self-energy samples used for Padé continuation.
+    pub ac_num_samples: usize,
+    /// Maximum external imaginary frequency (Ha) used for Padé sampling.
+    pub ac_omega_max: f64,
+    /// Positive broadening (Ha) used to evaluate Sigma(omega + i*eta).
+    pub ac_eta: f64,
+    /// Number of states below/above HOMO-LUMO for the self-energy evaluation
+    /// and for the real-axis de_max scan. States far from the gap (e.g. core states)
+    /// contribute negligibly to the real-axis residues and inflate de_max, making
+    /// the low-rank grid excessively sparse. Restricting this range to ~20-50
+    /// around HOMO gives a much finer de_max grid that captures the pole structure
+    /// properly — exactly as MolGW does with selfenergy_state_range.
+    /// Default 100000 (essentially all states, backward compatible).
+    pub selfenergy_state_range: usize,
     // response BSE grid sampling parameters
     pub response_bse_x_start: f64,
     pub response_bse_x_end: f64,
@@ -127,17 +192,19 @@ impl Default for QuasiParticle {
     fn default() -> Self {
         QuasiParticle {
             gw_scheme:String::from("no gw"),
+            gw_variant: GwVariant::Cd,
             homo_lumo_gw_qp:false,
             x_alpha:0.5,
             save_qp:false,
             bse_davidson_solver:false,
             davidson_target_excitations:6,
             davidson_converge_threshold:1e-10,
-            davidson_maximum_subspace_size:2,
-            davidson_restart_dimensions:5,
-            davidson_add_dimensions:4,
-            davidson_max_iter:20,
+            davidson_maximum_subspace_size:60,
+            davidson_restart_dimensions:6,
+            davidson_add_dimensions:6,
+            davidson_max_iter:100,
             bse_tda:false,
+            print_nto:false,
             bse_spin:String::from("none"),
             bse_cutoff_energy:1000000.0,
             save_bse_terms:false,
@@ -148,6 +215,8 @@ impl Default for QuasiParticle {
             gw_linearize_derivative_h:1e-10,
             renormalized_singles:false,
             w_rs:false,
+            rs_full_space:false,
+            rs_use_rs_orbitals:false,
             scgw:String::from("g0w0"),
             gw:false,
             save_bse_excitations:false, 
@@ -160,6 +229,7 @@ impl Default for QuasiParticle {
             low_rank_grid_type:String::from("linear"),
             nomega_chi_real:6,
             low_rank_tolerance:1e-3,
+            omega_chi_max:0.0,
             nomega_sigma:10,
             step_sigma:0.05,
             parse_qp_path:String::from("./qp_energies"),
@@ -169,7 +239,8 @@ impl Default for QuasiParticle {
             hermite_self_energy:false,
             hermite_coeff_path:String::from("./hermite_coeff.txt"),
             bse_qp_polarization:false,
-            threshold:0.1,
+            gw_extrapolate_occ_threshold:0.1,
+            gw_extrapolate_vir_threshold:0.1,
             gw_or_bse:String::new(),
             gw_span_energy:0.2,
             bse_exchange_rescaling:1.0,
@@ -187,7 +258,7 @@ impl Default for QuasiParticle {
             gw_imag_rayon:true,
             bse_auxbas_path: None,
             bse_feast_renormalized_doubles: false,
-            bse_renormalized_doubles_extra_width: 0.1,
+            bse_renormalized_doubles_extra_width: 0.5,
             bse_feast_precondition_type: String::from("inner_gmres"),
             bse_feast_inner_gmres_tol: 0.0001,
             bse_feast_inner_gmres_restart: 50,
@@ -196,6 +267,12 @@ impl Default for QuasiParticle {
             qsgw_energy_tol: 1e-5,
             qsgw_mix_param: 0.5,
             qsgw_eta: 0.001,
+            cdgw_eta: 0.001,
+            cdgw_res_tol: 0.001,
+            ac_num_samples: 16,
+            ac_omega_max: 5.0,
+            ac_eta: 0.001,
+            selfenergy_state_range: 100000,
             // response BSE grid sampling parameters (default: 2 points per dimension)
             response_bse_x_start: 0.0,
             response_bse_x_end: 1.0,
@@ -245,9 +322,14 @@ impl QuasiParticle {
         let mut table = toml::map::Map::new();
         
         table.insert("gw_scheme".to_string(), toml::Value::String(self.gw_scheme.clone()));
+        table.insert(
+            "gw_variant".to_string(),
+            toml::Value::String(self.gw_variant.as_str().to_string()),
+        );
         table.insert("homo_lumo_gw_qp".to_string(), toml::Value::Boolean(self.homo_lumo_gw_qp));
         table.insert("x_alpha".to_string(), toml::Value::Float(self.x_alpha));
         table.insert("save_qp".to_string(), toml::Value::Boolean(self.save_qp));
+        table.insert("print_nto".to_string(), toml::Value::Boolean(self.print_nto));
         table.insert("bse_davidson_solver".to_string(), toml::Value::Boolean(self.bse_davidson_solver));
         table.insert("davidson_target_excitations".to_string(), toml::Value::Integer(self.davidson_target_excitations as i64));
         table.insert("davidson_converge_threshold".to_string(), toml::Value::Float(self.davidson_converge_threshold));
@@ -266,6 +348,8 @@ impl QuasiParticle {
         table.insert("gw_linearize_derivative_h".to_string(), toml::Value::Float(self.gw_linearize_derivative_h));
         table.insert("renormalized_singles".to_string(), toml::Value::Boolean(self.renormalized_singles));
         table.insert("w_rs".to_string(), toml::Value::Boolean(self.w_rs));
+        table.insert("rs_full_space".to_string(), toml::Value::Boolean(self.rs_full_space));
+        table.insert("rs_use_rs_orbitals".to_string(), toml::Value::Boolean(self.rs_use_rs_orbitals));
         table.insert("scgw".to_string(), toml::Value::String(self.scgw.clone()));
         table.insert("gw_rootfinder".to_string(), toml::Value::String(self.gw_rootfinder.clone()));
         table.insert("gw".to_string(), toml::Value::Boolean(self.gw));
@@ -279,6 +363,7 @@ impl QuasiParticle {
         table.insert("low_rank_grid_type".to_string(), toml::Value::String(self.low_rank_grid_type.clone()));
         table.insert("nomega_chi_real".to_string(), toml::Value::Integer(self.nomega_chi_real as i64));
         table.insert("low_rank_tolerance".to_string(), toml::Value::Float(self.low_rank_tolerance));
+        table.insert("omega_chi_max".to_string(), toml::Value::Float(self.omega_chi_max));
         table.insert("nomega_sigma".to_string(), toml::Value::Integer(self.nomega_sigma as i64));
         table.insert("step_sigma".to_string(), toml::Value::Float(self.step_sigma));
         table.insert("fse_sin_coeff_path".to_string(), toml::Value::String(self.fse_sin_coeff_path.clone()));
@@ -287,7 +372,8 @@ impl QuasiParticle {
         table.insert("hermite_coeff_path".to_string(), toml::Value::String(self.hermite_coeff_path.clone()));
         table.insert("parse_qp_path".to_string(), toml::Value::String(self.parse_qp_path.clone()));
         table.insert("bse_qp_polarization".to_string(), toml::Value::Boolean(self.bse_qp_polarization));
-        table.insert("threshold".to_string(), toml::Value::Float(self.threshold));
+        table.insert("gw_extrapolate_occ_threshold".to_string(), toml::Value::Float(self.gw_extrapolate_occ_threshold));
+        table.insert("gw_extrapolate_vir_threshold".to_string(), toml::Value::Float(self.gw_extrapolate_vir_threshold));
         table.insert("gw_span_energy".to_string(), toml::Value::Float(self.gw_span_energy));
         table.insert("external_field_freq".to_string(), toml::Value::Float(self.external_field_freq));
         table.insert("lifetime_gamma".to_string(), toml::Value::Float(self.lifetime_gamma));
@@ -316,6 +402,12 @@ impl QuasiParticle {
         table.insert("qsgw_energy_tol".to_string(), toml::Value::Float(self.qsgw_energy_tol));
         table.insert("qsgw_mix_param".to_string(), toml::Value::Float(self.qsgw_mix_param));
         table.insert("qsgw_eta".to_string(), toml::Value::Float(self.qsgw_eta));
+        table.insert("cdgw_eta".to_string(), toml::Value::Float(self.cdgw_eta));
+        table.insert("cdgw_res_tol".to_string(), toml::Value::Float(self.cdgw_res_tol));
+        table.insert("ac_num_samples".to_string(), toml::Value::Integer(self.ac_num_samples as i64));
+        table.insert("ac_omega_max".to_string(), toml::Value::Float(self.ac_omega_max));
+        table.insert("ac_eta".to_string(), toml::Value::Float(self.ac_eta));
+        table.insert("selfenergy_state_range".to_string(), toml::Value::Integer(self.selfenergy_state_range as i64));
         table.insert("response_bse_x_start".to_string(), toml::Value::Float(self.response_bse_x_start));
         table.insert("response_bse_x_end".to_string(), toml::Value::Float(self.response_bse_x_end));
         table.insert("response_bse_x_points".to_string(), toml::Value::Integer(self.response_bse_x_points as i64));
@@ -366,9 +458,40 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::from("no gw"),
             };
+            tmp_input.gw_variant = match tmp_ctrl
+                .get("gw_variant")
+                .unwrap_or(&serde_json::Value::Null)
+            {
+                serde_json::Value::String(value) => {
+                    match value.trim().to_ascii_lowercase().as_str() {
+                        "cd" => GwVariant::Cd,
+                        "ac" => GwVariant::Ac,
+                        other => {
+                            anyhow::bail!(
+                                "Invalid gw_variant '{}'. Supported values are 'cd' and 'ac'.",
+                                other
+                            );
+                        }
+                    }
+                }
+                serde_json::Value::Null => GwVariant::Cd,
+                other => {
+                    anyhow::bail!(
+                        "Invalid type for gw_variant: {:?}. Expected the string 'cd' or 'ac'.",
+                        other
+                    );
+                }
+            };
             tmp_input.homo_lumo_gw_qp=match tmp_ctrl.get("homo_lumo_gw_qp").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
+            };
+            tmp_input.print_nto = match tmp_ctrl
+                .get("print_nto")
+                .unwrap_or(&serde_json::Value::Null)
+            {
+                serde_json::Value::Bool(value) => *value,
+                _ => tmp_input.print_nto,
             };
             tmp_input.x_alpha=match tmp_ctrl.get("x_alpha").unwrap_or(&serde_json::Value::Null){
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(2.0_f64)},
@@ -431,18 +554,17 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 other => {6}
             };
             tmp_input.davidson_max_iter = match tmp_ctrl.get("davidson_max_iter").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(6_usize)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(6) as usize},
-                other => {20}
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(100_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(100) as usize},
+                other => {100}
             };
-            let maximum_subspace_size=(((tmp_input.davidson_target_excitations as f64)*3.0).ceil() as usize);
+            let maximum_subspace_size = 100usize.max((tmp_input.davidson_target_excitations as f64 * 20.0).ceil() as usize);
             tmp_input.davidson_maximum_subspace_size = match tmp_ctrl.get("davidson_maximum_subspace_size").unwrap_or(&serde_json::Value::Null) {
-        
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(maximum_subspace_size) as usize},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(maximum_subspace_size as i64) as usize},
                 other => {maximum_subspace_size}
             };
-            let restart_size=(((tmp_input.davidson_target_excitations as f64)*1.5).ceil() as usize);
+            let restart_size = 6usize.max((tmp_input.davidson_target_excitations as f64 * 1.5).ceil() as usize);
             tmp_input.davidson_restart_dimensions = match tmp_ctrl.get("davidson_restart_dimensions").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(restart_size) as usize},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(restart_size as i64) as usize},
@@ -493,7 +615,11 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-10_f64)},
                 other => {1e-10},
             };
-            tmp_input.threshold= match tmp_ctrl.get("threshold").unwrap_or(&serde_json::Value::Null) {
+            tmp_input.gw_extrapolate_occ_threshold= match tmp_ctrl.get("gw_extrapolate_occ_threshold").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.1)},
+                other => {0.1},
+            };
+            tmp_input.gw_extrapolate_vir_threshold= match tmp_ctrl.get("gw_extrapolate_vir_threshold").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.1)},
                 other => {0.1},
             };
@@ -506,6 +632,14 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 other => {false},
             };
             tmp_input.w_rs = match tmp_ctrl.get("w_rs").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.rs_full_space = match tmp_ctrl.get("rs_full_space").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.rs_use_rs_orbitals = match tmp_ctrl.get("rs_use_rs_orbitals").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };
@@ -596,6 +730,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-3)},
                 _ => {1e-3},
             };
+            tmp_input.omega_chi_max = match tmp_ctrl.get("omega_chi_max").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.0)},
+                _ => {0.0},
+            };
             tmp_input.nomega_sigma = match tmp_ctrl.get("nomega_sigma").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(10) as usize},
                 _ => {10},
@@ -603,6 +741,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.step_sigma = match tmp_ctrl.get("step_sigma").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.05)},
                 _ => {0.05},
+            };
+            tmp_input.selfenergy_state_range = match tmp_ctrl.get("selfenergy_state_range").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(100000) as usize},
+                _ => {100000},
             };
             tmp_input.parse_qp_path = match tmp_ctrl.get("parse_qp_path").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.clone(),
@@ -625,8 +767,8 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 _ => false,
             };
             tmp_input.bse_renormalized_doubles_extra_width = match tmp_ctrl.get("bse_renormalized_doubles_extra_width").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.1),
-                _ => 0.1,
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.5),
+                _ => 0.5,
             };
             tmp_input.bse_feast_precondition_type = match tmp_ctrl.get("bse_feast_precondition_type").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => {
@@ -666,6 +808,26 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 _ => 0.5,
             };
             tmp_input.qsgw_eta = match tmp_ctrl.get("qsgw_eta").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),
+                _ => 0.001,
+            };
+            tmp_input.cdgw_eta = match tmp_ctrl.get("cdgw_eta").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.cdgw_res_tol = match tmp_ctrl.get("cdgw_res_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),
+                _ => 0.001,
+            };
+            tmp_input.ac_num_samples = match tmp_ctrl.get("ac_num_samples").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(16) as usize,
+                _ => 16,
+            };
+            tmp_input.ac_omega_max = match tmp_ctrl.get("ac_omega_max").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(5.0),
+                _ => 5.0,
+            };
+            tmp_input.ac_eta = match tmp_ctrl.get("ac_eta").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.001),
                 _ => 0.001,
             };
@@ -865,4 +1027,45 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
         },
     }
     
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn gw_variant_defaults_to_cd() {
+        let input = json!({
+            "quasiparticle_methods": {}
+        });
+
+        let qp = parse_quasiparticle_keywords(&input).unwrap().unwrap();
+        assert_eq!(qp.gw_variant, GwVariant::Cd);
+    }
+
+    #[test]
+    fn gw_variant_accepts_ac_case_insensitively() {
+        for value in ["ac", "AC", "Ac"] {
+            let input = json!({
+                "quasiparticle_methods": {
+                    "gw_variant": value
+                }
+            });
+
+            let qp = parse_quasiparticle_keywords(&input).unwrap().unwrap();
+            assert_eq!(qp.gw_variant, GwVariant::Ac);
+        }
+    }
+
+    #[test]
+    fn gw_variant_rejects_unknown_value() {
+        let input = json!({
+            "quasiparticle_methods": {
+                "gw_variant": "unknown"
+            }
+        });
+
+        assert!(parse_quasiparticle_keywords(&input).is_err());
+    }
 }

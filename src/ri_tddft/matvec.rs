@@ -18,7 +18,7 @@ use rest_tensors::MatrixFull;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, _dgemv};
 use crate::scf_io::SCF;
 use crate::ri_bse;
-use crate::dft::num_int::{FXCMatvecData, fxc_matvec};
+use crate::dft::num_int::{FXCMatvecData, FXCMatvecDataUnrestricted, fxc_matvec, fxc_matvec_unrestricted};
 use crate::ri_tddft::utils::tddft_occupation_parameters;
 use crate::ri_tddft::TDDFTData;
 
@@ -51,6 +51,76 @@ pub fn mo_timing_report() {
         let v = s_of(t);
         let pct = if mv > 0.0 { 100.0 * v / mv } else { 0.0 };
         log::debug!("  {:<12} {:>10.3} s  ({:>5.1}% of matvec)", name, v, pct);
+    }
+}
+
+/// HF-exchange tensors and coefficients of the TDDFT response.
+///
+/// The exchange contribution of A and B reads
+/// `-coeff_full * K_full[z] - coeff_sr * K_SR[z]`, where `K_full` is built
+/// from the full-range 3-center integrals and `K_SR` from the short-range
+/// (erfc(omega*r12)/r12) integrals.
+///
+/// For ordinary hybrids (and pure functionals) `coeff_sr` is zero and the SR
+/// tensors are absent. For a range-separated hybrid the HF exchange is
+/// `c_SR*K_SR + c_LR*K_LR`, which is evaluated as
+/// `coeff_full*K_full + coeff_sr*K_SR` with `coeff_full = c_LR` and
+/// `coeff_sr = c_SR - c_LR` (since `K_full = K_SR + K_LR`), mirroring the
+/// ground-state Fock build in `scf_io`.
+pub struct ExchangeTerms<'a> {
+    pub coeff_full: f64,
+    pub ri_oo: &'a MatrixFull<f64>,   // [occ*naux, occ], for A exchange
+    pub ri_vv: &'a MatrixFull<f64>,   // [naux*vir, vir], for A exchange
+    pub ri_ov: &'a MatrixFull<f64>,   // [naux*occ, vir], for B exchange
+    pub coeff_sr: f64,
+    pub ri_oo_sr: Option<&'a MatrixFull<f64>>,
+    pub ri_vv_sr: Option<&'a MatrixFull<f64>>,
+    pub ri_ov_sr: Option<&'a MatrixFull<f64>>,
+}
+
+impl<'a> ExchangeTerms<'a> {
+    /// Exchange terms of a non-RSH DFA: only the full-range tensors, scaled
+    /// by the hybrid coefficient (possibly zero for pure functionals).
+    pub fn full_only(
+        coeff_full: f64,
+        ri_oo: &'a MatrixFull<f64>,
+        ri_vv: &'a MatrixFull<f64>,
+        ri_ov: &'a MatrixFull<f64>,
+    ) -> Self {
+        ExchangeTerms {
+            coeff_full,
+            ri_oo,
+            ri_vv,
+            ri_ov,
+            coeff_sr: 0.0,
+            ri_oo_sr: None,
+            ri_vv_sr: None,
+            ri_ov_sr: None,
+        }
+    }
+
+    /// Exchange terms of a range-separated hybrid:
+    /// `c_LR*K_full + (c_SR - c_LR)*K_SR` (see the struct documentation).
+    pub fn rsh(
+        coeff_full: f64,
+        coeff_sr: f64,
+        ri_oo: &'a MatrixFull<f64>,
+        ri_vv: &'a MatrixFull<f64>,
+        ri_ov: &'a MatrixFull<f64>,
+        ri_oo_sr: &'a MatrixFull<f64>,
+        ri_vv_sr: &'a MatrixFull<f64>,
+        ri_ov_sr: &'a MatrixFull<f64>,
+    ) -> Self {
+        ExchangeTerms {
+            coeff_full,
+            ri_oo,
+            ri_vv,
+            ri_ov,
+            coeff_sr,
+            ri_oo_sr: Some(ri_oo_sr),
+            ri_vv_sr: Some(ri_vv_sr),
+            ri_ov_sr: Some(ri_ov_sr),
+        }
     }
 }
 
@@ -146,16 +216,24 @@ pub fn exchange_b_matvec(
     let mut t_tensor = MatrixFull::new([num_auxbas * occ_size, occ_size], 0.0);
     _dgemm_full(ri_ov_reshaped, 'N', &z_mat, 'T', &mut t_tensor, 1.0, 0.0);
 
-    // Step 2: Transpose and reshape (converting RI index ordering)
-    // t_tensor: [naux*occ, occ] → we need to swap the occ and aux dimensions
-    // Result should be [occ, naux*occ] in a DGEMM-compatible form
-    t_tensor = t_tensor.transpose_and_drop();
-    // Now [occ, naux*occ]
-    t_tensor.reshape([num_auxbas * occ_size, occ_size]);
-    // Now [naux*occ, occ] with transposed data
+    // Step 2: Block-swap to convert RI index ordering
+    // t_tensor[P*occ + j, i] → t_tensor[P*occ + i, j]
+    // This swaps the two occupied indices in the block structure:
+    // original block at position (j,i) moves to position (i,j)
+    let mut swapped_data = vec![0.0; t_tensor.data.len()];
+    for new_idx in 0..occ_size * occ_size {
+        let n2 = new_idx / occ_size;
+        let n1 = new_idx % occ_size;
+        let orig_idx = n1 * occ_size + n2;
+        let source_start = orig_idx * num_auxbas;
+        let source_end = source_start + num_auxbas;
+        swapped_data[new_idx * num_auxbas..(new_idx + 1) * num_auxbas]
+            .copy_from_slice(&t_tensor.data[source_start..source_end]);
+    }
+    t_tensor = MatrixFull::from_vec([num_auxbas * occ_size, occ_size], swapped_data).unwrap();
 
     // Step 3: result[i, a] = -alpha * Σ_j Σ_P t_tensor^T[i, j*naux+P] * ri_ov[P*nocc + j, a]
-    // t_tensor after reshape-transpose: [naux*occ, occ]
+    // t_tensor after block-swap: [naux*occ, occ], with t_tensor[P*occ + i, j] = Σ_b (P|jb) * z_{ib}
     // t_tensor^T: [occ, naux*occ]
     // ri_ov_reshaped: [naux*occ, vir]
     // result: [occ, vir]
@@ -186,7 +264,6 @@ pub fn a_matvec(
     let ri_ov = data.ri_ov.as_ref().expect("MO mode requires ri_ov");
     let ri_oo_exch = data.ri_oo_exch.as_ref().expect("MO mode requires ri_oo_exch");
     let ri_vv_exch = data.ri_vv_exch.as_ref().expect("MO mode requires ri_vv_exch");
-    let alpha_hybrid = fxc_data.alpha_hybrid;
     let occ_size = fxc_data.nocc;
     let vir_size = fxc_data.nvir;
     let dim = occ_size * vir_size;
@@ -215,10 +292,25 @@ pub fn a_matvec(
         }
     }
 
-    // Step 3: Exchange contribution: -c_x * K_A[z] (hybrid only)
-    if alpha_hybrid.abs() > 1e-15 {
+    // Step 3: Exchange contribution: -coeff_full * K_A[z] (hybrid only);
+    // for a range-separated hybrid coeff_full = c_LR.
+    if data.coeff_full.abs() > 1e-15 {
         let t0 = Instant::now();
-        let kz = exchange_a_matvec(ri_oo_exch, ri_vv_exch, z, occ_size, vir_size, alpha_hybrid);
+        let kz = exchange_a_matvec(ri_oo_exch, ri_vv_exch, z, occ_size, vir_size, data.coeff_full);
+        add_ns(&T_MV_K, t0);
+        for idx in 0..dim {
+            result[idx] += kz[idx];
+        }
+    }
+
+    // Step 3b: RSH short-range exchange correction: -(c_SR - c_LR) * K_SR[z]
+    if data.coeff_sr.abs() > 1e-15 {
+        let t0 = Instant::now();
+        let (oo_sr, vv_sr) = match (data.ri_oo_sr.as_ref(), data.ri_vv_sr.as_ref()) {
+            (Some(oo), Some(vv)) => (oo, vv),
+            _ => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", data.coeff_sr),
+        };
+        let kz = exchange_a_matvec(oo_sr, vv_sr, z, occ_size, vir_size, data.coeff_sr);
         add_ns(&T_MV_K, t0);
         for idx in 0..dim {
             result[idx] += kz[idx];
@@ -256,7 +348,6 @@ pub fn b_matvec(
     let fxc_data = data.fxc.as_ref().expect("MO mode requires fxc data");
     let ri_ov = data.ri_ov.as_ref().expect("MO mode requires ri_ov");
     let ri_ov_exch = data.ri_ov_exch.as_ref().expect("MO mode requires ri_ov_exch");
-    let alpha_hybrid = fxc_data.alpha_hybrid;
     let occ_size = fxc_data.nocc;
     let vir_size = fxc_data.nvir;
     let dim = occ_size * vir_size;
@@ -274,10 +365,25 @@ pub fn b_matvec(
         }
     }
 
-    // Step 2: Exchange contribution: -c_x * K_B[z]
-    if alpha_hybrid.abs() > 1e-15 {
+    // Step 2: Exchange contribution: -coeff_full * K_B[z] (hybrid only);
+    // for a range-separated hybrid coeff_full = c_LR.
+    if data.coeff_full.abs() > 1e-15 {
         let t0 = Instant::now();
-        let kz = exchange_b_matvec(ri_ov_exch, z, occ_size, vir_size, alpha_hybrid);
+        let kz = exchange_b_matvec(ri_ov_exch, z, occ_size, vir_size, data.coeff_full);
+        add_ns(&T_MV_K, t0);
+        for idx in 0..dim {
+            result[idx] += kz[idx];
+        }
+    }
+
+    // Step 2b: RSH short-range exchange correction: -(c_SR - c_LR) * K_SR[z]
+    if data.coeff_sr.abs() > 1e-15 {
+        let t0 = Instant::now();
+        let ov_sr = match data.ri_ov_sr.as_ref() {
+            Some(ov) => ov,
+            None => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", data.coeff_sr),
+        };
+        let kz = exchange_b_matvec(ov_sr, z, occ_size, vir_size, data.coeff_sr);
         add_ns(&T_MV_K, t0);
         for idx in 0..dim {
             result[idx] += kz[idx];
@@ -293,6 +399,194 @@ pub fn b_matvec(
     }
 
     add_ns(&T_MV_ALL, t_mv);
+    result
+}
+
+
+// ============================================================================
+// Unrestricted TDDFT matrix-vector products
+// ============================================================================
+
+/// Coulomb contribution for unrestricted TDDFT from every spin channel.
+///
+/// For output spin `s`:
+///   V_s(z) = Σ_t ri_ov[s]^T (ri_ov[t] z_t)
+/// with no extra spin-degeneracy factor.
+fn unrestricted_coulomb_sum(
+    ri_ov: &[MatrixFull<f64>; 2],
+    n0: usize,
+    n1: usize,
+    occ_sizes: [usize; 2],
+    vir_sizes: [usize; 2],
+    z: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    let ns = [occ_sizes[0] * vir_sizes[0], occ_sizes[1] * vir_sizes[1]];
+    debug_assert_eq!(z.len(), n0 + n1);
+    let mut va = vec![0.0; ns[0]];
+    let mut vb = vec![0.0; ns[1]];
+
+    if ns[0] > 0 {
+        let z0 = z[..n0].to_vec();
+        let z1 = z[n0..].to_vec();
+        let v00 = ri_bse::matvec::coulomb_contribution(&ri_ov[0], &z0);
+        va.iter_mut().zip(v00).for_each(|(a, b)| *a += b);
+        if ns[1] > 0 {
+            let v01 = ri_bse::matvec::coulomb_cross_contribution(&ri_ov[0], &ri_ov[1], &z1);
+            va.iter_mut().zip(v01).for_each(|(a, b)| *a += b);
+        }
+    }
+    if ns[1] > 0 {
+        let z0 = z[..n0].to_vec();
+        let z1 = z[n0..].to_vec();
+        let v10 = ri_bse::matvec::coulomb_cross_contribution(&ri_ov[1], &ri_ov[0], &z0);
+        vb.iter_mut().zip(v10).for_each(|(a, b)| *a += b);
+        let v11 = ri_bse::matvec::coulomb_contribution(&ri_ov[1], &z1);
+        vb.iter_mut().zip(v11).for_each(|(a, b)| *a += b);
+    }
+    (va, vb)
+}
+
+/// Full unrestricted TDDFT A-block matrix-vector product.
+///
+/// The vector is the concatenation `[alpha; beta]`.  The Coulomb (Hartree)
+/// coupling is always included: it is spin-independent and is the only term
+/// that couples the alpha and beta blocks, so it belongs to the single physical
+/// response operator of an unrestricted reference.  Same-spin bare exchange and
+/// the spin-resolved fxc kernel are included as well.
+pub fn a_matvec_unrestricted(
+    scf: &SCF,
+    fxc_data: &FXCMatvecDataUnrestricted,
+    ri_ov: &[MatrixFull<f64>; 2],
+    exch: &[ExchangeTerms; 2],
+    z: &[f64],
+) -> Vec<f64> {
+    let n0 = fxc_data.nocc[0] * fxc_data.nvir[0];
+    let n1 = fxc_data.nocc[1] * fxc_data.nvir[1];
+    assert_eq!(z.len(), n0 + n1);
+    let mut result = vec![0.0; n0 + n1];
+
+    // Per-spin diagonal, exchange and fxc.
+    let (fa, fb) = fxc_matvec_unrestricted(fxc_data, z);
+    for s in 0..2 {
+        let occ_s = fxc_data.nocc[s];
+        let vir_s = fxc_data.nvir[s];
+        let ns = occ_s * vir_s;
+        if ns == 0 { continue; }
+        let offset = if s == 0 { 0 } else { n0 };
+        let zs = &z[offset..offset + ns];
+        let mut rs = vec![0.0; ns];
+
+        let (start_mo, _num_state, _occ, _vir, _homo, lumo) =
+            crate::ri_tddft::utils::tddft_occupation_parameters_spin(scf, s);
+        let ks = &scf.eigenvalues[s];
+        for a in 0..vir_s {
+            for i in 0..occ_s {
+                let idx = i + a * occ_s;
+                rs[idx] = (ks[lumo + a] - ks[start_mo + i]) * zs[idx];
+            }
+        }
+
+        let exch_s = &exch[s];
+        if exch_s.coeff_full.abs() > 1e-15 {
+            let kz = exchange_a_matvec(
+                exch_s.ri_oo,
+                exch_s.ri_vv,
+                zs,
+                occ_s,
+                vir_s,
+                exch_s.coeff_full,
+            );
+            for idx in 0..ns {
+                rs[idx] += kz[idx];
+            }
+        }
+        if exch_s.coeff_sr.abs() > 1e-15 {
+            let (oo_sr, vv_sr) = match (exch_s.ri_oo_sr, exch_s.ri_vv_sr) {
+                (Some(oo), Some(vv)) => (oo, vv),
+                _ => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", exch_s.coeff_sr),
+            };
+            let kz = exchange_a_matvec(oo_sr, vv_sr, zs, occ_s, vir_s, exch_s.coeff_sr);
+            for idx in 0..ns {
+                rs[idx] += kz[idx];
+            }
+        }
+
+        if s == 0 {
+            for idx in 0..ns { rs[idx] += fa[idx]; }
+        } else {
+            for idx in 0..ns { rs[idx] += fb[idx]; }
+        }
+        result[offset..offset + ns].copy_from_slice(&rs);
+    }
+
+    // Coulomb (Hartree) coupling: the only alpha/beta coupling term.
+    let (va, vb) = unrestricted_coulomb_sum(ri_ov, n0, n1, fxc_data.nocc, fxc_data.nvir, z);
+    for idx in 0..n0 { result[idx] += va[idx]; }
+    for idx in 0..n1 { result[n0 + idx] += vb[idx]; }
+
+    result
+}
+
+/// Full unrestricted TDDFT B-block matrix-vector product.
+pub fn b_matvec_unrestricted(
+    scf: &SCF,
+    fxc_data: &FXCMatvecDataUnrestricted,
+    ri_ov: &[MatrixFull<f64>; 2],
+    exch: &[ExchangeTerms; 2],
+    z: &[f64],
+) -> Vec<f64> {
+    let n0 = fxc_data.nocc[0] * fxc_data.nvir[0];
+    let n1 = fxc_data.nocc[1] * fxc_data.nvir[1];
+    assert_eq!(z.len(), n0 + n1);
+    let mut result = vec![0.0; n0 + n1];
+
+    let (fa, fb) = fxc_matvec_unrestricted(fxc_data, z);
+    for s in 0..2 {
+        let occ_s = fxc_data.nocc[s];
+        let vir_s = fxc_data.nvir[s];
+        let ns = occ_s * vir_s;
+        if ns == 0 { continue; }
+        let offset = if s == 0 { 0 } else { n0 };
+        let zs = &z[offset..offset + ns];
+        let mut rs = vec![0.0; ns];
+
+        let exch_s = &exch[s];
+        if exch_s.coeff_full.abs() > 1e-15 {
+            let kz = exchange_b_matvec(
+                exch_s.ri_ov,
+                zs,
+                occ_s,
+                vir_s,
+                exch_s.coeff_full,
+            );
+            for idx in 0..ns {
+                rs[idx] += kz[idx];
+            }
+        }
+        if exch_s.coeff_sr.abs() > 1e-15 {
+            let ov_sr = match exch_s.ri_ov_sr {
+                Some(ov) => ov,
+                _ => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", exch_s.coeff_sr),
+            };
+            let kz = exchange_b_matvec(ov_sr, zs, occ_s, vir_s, exch_s.coeff_sr);
+            for idx in 0..ns {
+                rs[idx] += kz[idx];
+            }
+        }
+
+        if s == 0 {
+            for idx in 0..ns { rs[idx] += fa[idx]; }
+        } else {
+            for idx in 0..ns { rs[idx] += fb[idx]; }
+        }
+        result[offset..offset + ns].copy_from_slice(&rs);
+    }
+
+    // Coulomb (Hartree) coupling: the only alpha/beta coupling term.
+    let (va, vb) = unrestricted_coulomb_sum(ri_ov, n0, n1, fxc_data.nocc, fxc_data.nvir, z);
+    for idx in 0..n0 { result[idx] += va[idx]; }
+    for idx in 0..n1 { result[n0 + idx] += vb[idx]; }
+
     result
 }
 

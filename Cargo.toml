@@ -109,3 +109,4 @@ path = "src/main.rs"
 name = "pyrest"
 path = "src/lib.rs"
 crate-type=["cdylib","lib"]
+
