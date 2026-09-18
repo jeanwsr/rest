@@ -370,8 +370,11 @@ pub fn main_driver() -> anyhow::Result<()> {
     if let Some(qp_ctrl)=scf_data.mol.ctrl.quasiparticle_methods.clone(){
         print!("Now starts quasiparticle method computation!\n");
         let qp_output = quasiparticle_methods(&mut scf_data,&mpi_operator);
-        if let Some(e1) = qp_output.first_excitation {
-            json_extra.insert("bse".to_string(), json!({ "first_excitation": e1 }));
+        if qp_output.first_excitation.is_some() || !qp_output.excitation_energies.is_empty() {
+            json_extra.insert("bse".to_string(), json!({
+                "first_excitation": qp_output.first_excitation,
+                "excitation_energies": qp_output.excitation_energies,
+            }));
         }
     }
 
@@ -388,6 +391,8 @@ pub fn main_driver() -> anyhow::Result<()> {
                         "energies": output.energies,
                         "osc": output.osc,
                     }));
+                    // Keep the raw eigenvectors for the TDDFT analytic gradient.
+                    scf_data.tddft_excitations = Some(output.excitations.clone());
                 }
                 Err(e) => eprintln!("Error in TDDFT calculation: {}", e),
             }
@@ -791,6 +796,50 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
             if scf_data.mol.ctrl.print_level > 1 {
                 println!("Gradient contribution from {:} [a.u.]:", grad_name);
                 println!("{}", formated_force(&grad_contrib, &scf_data.mol.geom.elem));
+            }
+        }
+
+        // TDDFT analytic-gradient response for the requested excited state.
+        if let Some(tddft_ctrl) = scf_data.mol.ctrl.tddft.clone() {
+            if tddft_ctrl.tddft_grad_state > 0 {
+                let state = tddft_ctrl.tddft_grad_state;
+                if scf_data.mol.spin_channel == 2 {
+                    panic!("TDDFT analytic gradient currently supports only spin-restricted references (spin_polarization = false)");
+                }
+                let exc = scf_data
+                    .tddft_excitations
+                    .as_ref()
+                    .expect("tddft_grad_state > 0 requires a TDDFT calculation to have run first");
+                assert!(
+                    state <= exc.len(),
+                    "tddft_grad_state = {} exceeds the {} computed TDDFT states",
+                    state,
+                    exc.len()
+                );
+                let raw = &exc[state - 1].1;
+                let tda = tddft_ctrl.tddft_method.eq_ignore_ascii_case("tda");
+                let singlet = tddft_ctrl.restricted_spin() != "triplet";
+                let norm = crate::ri_bse::dipoles::normalize(raw, tda);
+                let (x, y) = if tda {
+                    (norm, vec![0.0; raw.len()])
+                } else {
+                    let dim = raw.len() / 2;
+                    (norm[..dim].to_vec(), norm[dim..].to_vec())
+                };
+                let engine = crate::ri_tddft::TddftGradEngine::new(
+                    &scf_data, state, singlet, tda, x, y,
+                );
+                let response = engine.response_gradient();
+                gradient
+                    .data
+                    .iter_mut()
+                    .zip(response.data.iter())
+                    .for_each(|(to, from)| *to += from);
+                println!(
+                    "Gradient contribution from TDDFT state {} [a.u.]:",
+                    state
+                );
+                println!("{}", formated_force(&response, &scf_data.mol.geom.elem));
             }
         }
 

@@ -680,11 +680,11 @@ pub fn nlfeast_bse(
 
     // ── Build QP energy gaps for initial guess and preconditioner ──
     let energy_diag: Vec<f64> = {
-        let energies: Vec<f64> = if qp_ctrl.bse_qp_polarization {
+        let energies: Vec<f64> = super::bse_screening_energies(scf_data, &if qp_ctrl.bse_qp_polarization {
             quasiparticle_energies.clone()
         } else {
             scf_data.eigenvalues[0].clone()
-        };
+        });
         let mut d = Vec::with_capacity(n);
         for a in 0..vir_size {
             for i in 0..occ_size {
@@ -1150,6 +1150,7 @@ pub fn nlfeast_bse_main(scf_data: &SCF, qp_ctrl: &QuasiParticle) {
     if qp_ctrl.bse_qp_polarization {
         epsilon = quasiparticle_energies.clone();
     }
+    let epsilon = super::bse_screening_energies(scf_data, &epsilon);
 
     let num_auxbas = super::get_submatrix(scf_data, 'O', 'V', 'N').size[0];
     println!("========================================");
@@ -1229,7 +1230,7 @@ pub fn nlfeast_bse_main(scf_data: &SCF, qp_ctrl: &QuasiParticle) {
             let xv: Vec<f64> = (0..n).map(|i| result.eigenvectors[[i, k]]).collect();
             println!("\n  Excitation #{}: λ = {:.6} Ha = {:.6} eV",
                 k, result.eigenvalues[k], result.eigenvalues[k] * EV);
-            super::leading_components(&xv, occ_size, vir_size);
+            super::leading_components(&xv, occ_size, vir_size, qp_ctrl.print_nto);
         }
     }
 
@@ -1327,9 +1328,9 @@ pub fn nlfeast_dynamical_bse_v3(
 
     // ── QP energy gaps (preconditioner + initial guesses) ──
     let energy_diag: Vec<f64> = {
-        let energies: Vec<f64> = if qp_ctrl.bse_qp_polarization {
+        let energies: Vec<f64> = super::bse_screening_energies(scf_data, &if qp_ctrl.bse_qp_polarization {
             quasiparticle_energies.clone()
-        } else { scf_data.eigenvalues[0].clone() };
+        } else { scf_data.eigenvalues[0].clone() });
         let mut d = Vec::with_capacity(n);
         for a in 0..vir_size { for i in 0..occ_size { d.push(energies[occ_size + a] - energies[i]); } }
         d

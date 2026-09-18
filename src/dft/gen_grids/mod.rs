@@ -12,6 +12,8 @@ mod bragg;
 mod bse;
 mod comparison;
 mod lebedev;
+mod lebedev_isdf;
+mod tables;
 mod parameters;
 mod python;
 mod radial;
@@ -19,6 +21,7 @@ pub mod becke_partitioning_deriv;
 pub mod prune;
 
 pub use self::atom::atom_grid;
+pub(crate) use self::atom::atom_grid_with_isdf;
 pub use self::atom::atom_grid_bse;
 pub use self::lebedev::angular_grid;
 pub use self::radial::radial_grid_kk;

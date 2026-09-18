@@ -745,11 +745,11 @@ pub fn dynamic_bse_main(scf_data: &SCF, qp_ctrl: &QuasiParticle) {
 
     // IA-pair energy gaps Δ_p = ε_I − ε_A — controlled by bse_qp_polarization
     // (analogous to whether the polarization uses KS or QP energies)
-    let epsilon_ia = if qp_ctrl.bse_qp_polarization {
+    let epsilon_ia = crate::ri_bse::bse_screening_energies(scf_data, &if qp_ctrl.bse_qp_polarization {
         quasiparticle_energies.clone()
     } else {
         scf_data.eigenvalues[0].clone()
-    };
+    });
     let eps_occ_ia: Vec<f64> = epsilon_ia[0..occ_size].to_vec();
     let eps_vir_ia: Vec<f64> = epsilon_ia[occ_size..occ_size + vir_size].to_vec();
 
@@ -844,7 +844,7 @@ pub fn dynamic_bse_main(scf_data: &SCF, qp_ctrl: &QuasiParticle) {
             let xv: Vec<f64> = (0..n).map(|i| result.eigenvectors[[i, k]]).collect();
             println!("\n  Excitation #{}: λ = {:.6} Ha = {:.6} eV",
                 k, result.eigenvalues[k], result.eigenvalues[k] * EV);
-            super::leading_components(&xv, occ_size, vir_size);
+            super::leading_components(&xv, occ_size, vir_size, qp_ctrl.print_nto);
         }
     }
 

@@ -23,7 +23,8 @@ use crate::dft::num_int::{eval_rho5_batch, eval_rho5_dm_only_batch, eval_ao_batc
 use crate::dft::libxc_itrf::{eval_xc_eff};
 use crate::utilities::{self, balancing};
 
-use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
+use tensors::matrix_blas_lapack::{_dgemm_full, omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
+use tensors::matrix::matrixfullslice::MatrixFullSlice;
 
 
 impl<'a> NumInt<'a> for RIRHFGradient<'a> {
@@ -308,27 +309,88 @@ fn get_dm(scf_data: &SCF, device: &DeviceBLAS) -> Tsr<f64> {
 
 
 
-pub fn gga_grad_sum(vmat: &mut Tsr<f64>, ao:TsrView<f64>, wv:TsrView<f64>) {
-    let aow = &ao.i((.., .., 0..4)) * &wv.i((None, .., 0..4));
-    let aow = aow.t();
-    // ao_x (nbas, ngrid) vrho (ngrid) ao 
-    // ao_x (nbas, ngrid) (vsigma[P]) nabla_ao 
+/// Grid contribution of a GGA functional to the AO derivative matrix
+/// `vmat[nao,nao,3]`, from the AOs `ao[nao,ng,10]` and the weighted kernel
+/// `wv[ng,4]`.
+///
+/// This is the contraction PySCF performs in `grad.rks._gga_grad_sum_`
+/// (15 matmuls of shape `nao x ng x nao`), but expressed as explicit OpenBLAS
+/// `dgemm` calls on contiguous col-major operands.  Driving the same matmuls
+/// through `rstsr`'s `matmul_from` on the permuted views measured ~2.4x slower
+/// (`tests/bench_gga.rs`: 2.15 s vs 0.91 s per call at nao=86, ng=115752),
+/// which dominated the TDDFT response gradient.  The arithmetic is unchanged.
+pub fn gga_grad_sum(vmat: &mut Tsr<f64>, ao: TsrView<f64>, wv: TsrView<f64>) {
+    let nao = ao.shape()[0];
+    let ng = ao.shape()[1];
+    let ao_raw = ao.raw();
+    let ao_off = ao.offset();
+    // col-major [ng, 4]: channel c at g + c*ng
+    let wv_raw = wv.raw();
+    let wv_off = wv.offset();
+
+    // Zero-copy col-major [nao,ng] views of the 10 AO components (col-major
+    // [nao,ng,10]: component c starts at ao_off + c*nao*ng).
+    let sz = [nao, ng];
+    let ind = [1usize, nao];
+    let comp = |c: usize| MatrixFullSlice {
+        size: &sz,
+        indicing: &ind,
+        data: &ao_raw[ao_off + c * nao * ng..ao_off + (c + 1) * nao * ng],
+    };
+
+    let mut acc: Vec<MatrixFull<f64>> =
+        (0..3).map(|_| MatrixFull::new([nao, nao], 0.0)).collect();
+
+    // Single reusable [nao,ng] scratch buffer: aow_c[mu,g] = ao_c[mu,g]*wv_c[g].
+    let mut aow = MatrixFull::new([nao, ng], 0.0);
     for ic in 0..4 {
-        vmat.i_mut((.., .., 0)).matmul_from(
-            &ao.i((.., .., 1)), &aow.i(ic), 1.0, 1.0 
-        );
-        vmat.i_mut((.., .., 1)).matmul_from(
-            &ao.i((.., .., 2)), &aow.i(ic), 1.0, 1.0 
-        );
-        vmat.i_mut((.., .., 2)).matmul_from(
-            &ao.i((.., .., 3)), &aow.i(ic), 1.0, 1.0 
-        );
+        aow.data.copy_from_slice(&ao_raw[ao_off + ic * nao * ng..ao_off + (ic + 1) * nao * ng]);
+        for g in 0..ng {
+            let wc = wv_raw[wv_off + g + ic * ng];
+            for mu in 0..nao {
+                aow.data[mu + g * nao] *= wc;
+            }
+        }
+        for d in 0..3 {
+            _dgemm_full(&comp(1 + d), 'N', &aow, 'T', &mut acc[d], 1.0, 1.0);
+        }
     }
-    let aow = make_dR_dao_w(ao.view(), wv);
-    for ic in 0..3 {
-        vmat.i_mut((.., .., ic)).matmul_from(
-            &aow.i((.., .., ic)), &ao.i((.., .., 0)).t(), 1.0, 1.0
+
+    // `_make_dR_dao_w`: second-derivative AO combinations
+    //   aow[d] = ao[1+d]*wv[0] + ao[..]*wv[1] + ...   with the
+    // (XX,XY,XZ)=4,5,6 / (YX,YY,YZ)=5,7,8 / (ZX,ZY,ZZ)=6,8,9 map.
+    let idx = [[1usize, 4, 5, 6], [2, 5, 7, 8], [3, 6, 8, 9]];
+    for d in 0..3 {
+        aow.data.copy_from_slice(
+            &ao_raw[ao_off + idx[d][0] * nao * ng..ao_off + (idx[d][0] + 1) * nao * ng],
         );
+        for g in 0..ng {
+            let w0 = wv_raw[wv_off + g];
+            for mu in 0..nao {
+                aow.data[mu + g * nao] *= w0;
+            }
+        }
+        for c in 1..4 {
+            let src = ao_off + idx[d][c] * nao * ng;
+            for g in 0..ng {
+                let wg = wv_raw[wv_off + g + c * ng];
+                let base = g * nao;
+                for mu in 0..nao {
+                    let k = base + mu;
+                    aow.data[k] += ao_raw[src + k] * wg;
+                }
+            }
+        }
+        _dgemm_full(&aow, 'N', &comp(0), 'T', &mut acc[d], 1.0, 1.0);
+    }
+
+    let voff = vmat.offset();
+    let vraw = vmat.raw_mut();
+    for d in 0..3 {
+        let off = voff + d * nao * nao;
+        for (dst, src) in vraw[off..off + nao * nao].iter_mut().zip(acc[d].data.iter()) {
+            *dst += *src;
+        }
     }
 }
 
@@ -629,10 +691,13 @@ fn get_vxc_rayon_new(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &
 
             match xc_data.xc_type {
                 XCType::LDA => {
-                    let aow = &loc_ao.i((.., .., 0)) * &wv.i((None, .., 0)); 
+                    // `loc_vmat` has the Cartesian axis LAST ([nao,nao,3]), like
+                    // the GGA/MGGA branches and `gga_grad_sum`; indexing it with
+                    // a bare `ic` addresses the wrong axis.
+                    let aow = &loc_ao.i((.., .., 0)) * &wv.i((None, .., 0));
                     let aow = aow.t();
                     for ic in 0..3 {
-                        loc_vmat.i_mut(ic).matmul_from(
+                        loc_vmat.i_mut((.., .., ic)).matmul_from(
                             &loc_ao.i((.., .., ic + 1)), &aow, 1.0, 1.0);
                     }
                 }

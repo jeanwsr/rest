@@ -422,7 +422,8 @@ GW计算通过 `gw_or_bse = “gw”` 启动（也内置于 `”bse”` 模式�
     - `”g0w0”`（缺省）：单次GW计算，不做自洽迭代。
     - `”evgw”`：本征值自洽GW（evGW），迭代更新准粒子能量中的G部分。需配合 `evgw_rounds` 设置迭代次数。
 - `evgw_rounds`: 取值usize，evGW自洽迭代的轮数。仅在 `scgw = “evgw”` 时需要设置。缺省为0。
-- `threshold`: 取值f64，单位Hartree。在 `gw_scheme = “extrapolated”` 方案中，决定费米面附近精确求解准粒子方程的能量窗口。计算范围包括KS轨道能量落入 `[HOMO - threshold, LUMO + threshold]` 的所有轨道，超出范围者通过已计算的准粒子能量外推得到。缺省为0.1。
+- `gw_extrapolate_occ_threshold`: 取值f64，单位Hartree。在 `gw_scheme = “extrapolated”` 方案中，决定费米面以下精确求解准粒子方程的能量窗口。计算范围包括KS轨道能量落在 `[HOMO - gw_extrapolate_occ_threshold, HOMO]` 的占据轨道。缺省为0.1。
+- `gw_extrapolate_vir_threshold`: 取值f64，单位Hartree。在 `gw_scheme = “extrapolated”` 方案中，决定费米面以上精确求解准粒子方程的能量窗口。计算范围包括KS轨道能量落在 `[LUMO, LUMO + gw_extrapolate_vir_threshold]` 的虚轨道。缺省为0.1。
 
 ### Renormalized Singles（rsGW）
 
@@ -430,17 +431,59 @@ Renormalized Singles方法通过投影DFT密度矩阵构造单激发HF哈密顿�
 
 - `renormalized_singles`: 取值bool，设置为 `true` 开启rsGW。得到的RS本征值用于初始化GW中Green函数G的粒子能量。缺省为false。
 - `w_rs`: 取值bool，仅在 `renormalized_singles = true` 时生效。设置为 `true` 时进一步使用RS粒子能量初始化GW中的屏蔽库仑相互作用W部分。缺省为false。
+- `rs_full_space`: 取值bool，仅在 `renormalized_singles = true` 时生效。缺省为 `false`：分别在占据子空间与未占据子空间内构建HF哈密顿量并各自对角化（块对角化，DFT占据数保持不变）。设置为 `true`：构建**完整轨道空间**的HF哈密顿量 `H^RS = Cᵀ (h + J[D_DFT] − ½K[D_DFT]) C` 并整体对角化，占据与未占据轨道之间允许混合，得到更严格的renormalized singles粒子；RS本征值按能量升序返回并用于GW初始化。
+- `rs_use_rs_orbitals`: 取值bool，仅在 `renormalized_singles = true` 时生效。缺省为 `false`：只使用RS本征值重新初始化GW，轨道系数仍为DFT（KS）轨道。设置为 `true`：把HF哈密顿量对角化得到的轨道系数（`C_rs = C_ks · U`，`U` 为变分一致的轨道旋转）写回轨道系数矩阵，于是**RI三中心积分张量会按新的轨道系数从AO基重新组合成MO基**——GW 中所有 `generate_ri3mo_*` / `v_matrix_from_scf` 的AO→MO变换都在RS轨道基下完成。推荐与 `w_rs = true` 搭配使用（此时G与W的能量、积分基组保持一致）。
+
+  打开该选项后，**rsGW 之后的整个后处理过程都统一在 RS 轨道表象中**：
+
+  - 后续 **BSE 计算**的 `v`、`W` 矩阵元、偶极矩阵、以及输出的跃迁振幅（`#i->#a`、NTO、PySOC 导出的 CI 系数）都在 RS 分子轨道基下（BSE 每次调用 `get_submatrix`/`compute_dipole_matrix` 时都重新用当前轨道系数做 AO→MO，不存在 KS 基缓存）；程序会打印 `BSE orbital representation: renormalized-singles (RS) orbitals.` 提示；
+  - BSE/响应的**屏蔽能量**（χ⁰ 分母）改用 RS 本征值 `renormalized_singles_particles`（否则会出现"RS 轨道 + KS 能量分母"的混合表象），程序会打印 `BSE screening: using the renormalized-singles eigenvalues`；
+  - `bse_cutoff_energy` 等**轨道窗口**判据按 RS 本征值而不是 KS 本征值筛选；
+  - 程序在当前目录写出 `rs_orbitals.dat`，内含 `e_rs`、`C_rs`、`e_ks`、`C_ks` 与旋转矩阵 `U`（`C_rs = C_ks·U`），可直接用于把 RS 表象下的跃迁振幅换回 KS 表象：`A_KS = U_o A_RS U_vᵀ`；
+  - `print_level > 2` 时程序会额外做一次自洽性校验，打印
+    `max|(ia|P)_RS - Σ U U (rs|P)_KS|` 与 `max|mu_RS - Uᵀ mu_KS U|`（应为机器零），用于确认 RI AO2MO 确实使用了新的轨道系数。
+
+  读取 `rs_orbitals.dat`（`#` 开头为注释行，其余按顺序为 `nao nmo`、`e_rs`、`C_rs`、`e_ks`、`C_ks`、`U`；矩阵按"每个轨道一行"存放）：
+
+  ```python
+  import numpy as np
+  lines = [l for l in open("rs_orbitals.dat") if not l.startswith("#")]
+  nao, nmo = map(int, lines[0].split()); i = 1
+  e_rs = np.array([float(x) for x in lines[i].split()]); i += 1
+  C_rs = np.array([[float(x) for x in lines[i+k].split()] for k in range(nmo)]); i += nmo
+  e_ks = np.array([float(x) for x in lines[i].split()]); i += 1
+  C_ks = np.array([[float(x) for x in lines[i+k].split()] for k in range(nmo)]); i += nmo
+  U    = np.array([[float(x) for x in lines[i+k].split()] for k in range(nmo)])
+  # 每行是一个轨道的AO系数: C_rs.T == U.T @ C_ks.T ; 把RS表象的(i,a)振幅换回KS表象:
+  # A_ks = U[:occ,:occ].T ... 见上式 A_KS = U_o A_RS U_v^T
+  ```
+
+> **注意**：`rs_full_space = false`（块对角化）且 `w_rs = true` 而 `rs_use_rs_orbitals = false` 时，写回轨道系数矩阵的是历史实现所用的转置旋转 `C_ks·Uᵀ`，它并不对角化HF哈密顿量。为兼容既有计算结果，该历史行为保持不变；需要变分一致的轨道基时请设置 `rs_use_rs_orbitals = true`（`rs_full_space = true` 的路径两者等价）。两种旋转给出的准粒子能量差别可达 ~0.1 Ha。
+
+rsGW 输入卡示例（完整轨道空间HF对角化 + RS轨道用于RI AO2MO）：
+
+```toml
+[quasiparticle_methods]
+gw_or_bse = “gw”
+gw_scheme = “extrapolated”
+scgw = “g0w0”
+renormalized_singles = true
+rs_full_space = true
+rs_use_rs_orbitals = true
+w_rs = true
+use_low_rank_contour = true
+```
 
 ### Low-Rank Contour Deformation（推荐加速方法）
 
-低秩围道变形近似（Low-Rank Contour Deformation）通过自能解析延拓中频率相关极化的低秩分解，显著减少GW计算的频率采样点数和内存占用。**对于中大型体系，强烈推荐启用此近似方法。**
 
 - `use_low_rank_contour`: 取值bool，设置为 `true` 启用低秩等离面加速。缺省为false。
 - `low_rank_grid_type`: 取值String，实轴极化率Chi的采样格点分布方式。`”linear”`（缺省）为线性分布；`”quadratic”` 为二次幂律分布，在零能附近更密集。
 - `nomega_chi_real`: 取值usize，实轴极化率Chi的采样格点数。缺省为6。增大此值可提高精度但增加计算量。
-- `low_rank_tolerance`: 取值f64，低秩截断的本征值容差。数值越小精度越高。缺省为1e-3。
 - `nomega_sigma`: 取值usize，自能Sigma实轴扫描点数（每侧），在de_max扫描中使用。缺省为10。
 - `step_sigma`: 取值f64，自能Sigma实轴扫描步长，单位Hartree。缺省为0.05。
+
+> **精度提示**：如果 GW 计算窗口包含深占据轨道或高虚轨道，低秩实轴插值需要更密的频率格点。此时应增大 `nomega_chi_real`（例如提高到 1000–5000 或更高），否则这些轨道的 QP 能量以及后续 BSE 激发能可能不够准确。对于仅关心 HOMO/LUMO 附近或低激发态的情况，可以使用较小的 `nomega_chi_real` 以节省计算时间。
 
 ### GW求解器通用参数
 
@@ -448,7 +491,16 @@ Renormalized Singles方法通过投影DFT密度矩阵构造单激发HF哈密顿�
 - `gw_search_grid`: 取值usize，插值求根法的搜索格点数。仅当 `gw_rootfinder = “interpolation”` 时生效。缺省为51。
 - `gw_span_energy`: 取值f64，单位Hartree，插值求根法的能量扫描范围。缺省为0.2。
 - `gw_linearize_shift`: 取值f64，线性化GW中的有限差分位移量，单位Hartree。缺省为0.01。
-- `homo_lumo_gw_qp`: 取值bool，设置为 `true` 仅计算HOMO和LUMO的准粒子能量（不计算其他轨道）。缺省为false。
+
+### AC-GW（解析延拓 GW 变体）
+
+- `gw_variant`: 取值String，GW 变体类型：
+    - `"cd"`（缺省）：轮廓变形（Contour Deformation）路径。
+    - `"ac"`：解析延拓（Analytic Continuation）路径。配合 `gw_scheme = "extrapolated"` 使用。`ac` 路径暂不支持 `fourier_self_energy` 或 `hermite_self_energy`。
+- `ac_num_samples`: 取值usize，Padé 虚轴采样点数。从 quadrature 频点中按 PySCF 风格的指数递减步长选取。缺省为 16。
+- `ac_eta`: 取值f64，Padé 求值的展宽参数 η（小正数）。缺省为 0.001。
+- `ac_pade_step_ratio`: 取值f64，PySCF 风格 Padé 采样的步长衰减比（< 1.0 时低频更密）。缺省为 2/3。
+- `gw_switch_fallback_threshold`: 取值f64。当 |E_KS| 超过此值时退化为静态近似。缺省为 1e6。
 
 ### GW结果输出
 
@@ -461,10 +513,12 @@ Renormalized Singles方法通过投影DFT密度矩阵构造单激发HF哈密顿�
 BSE计算在 `gw_or_bse = “bse”` 时进行，在GW准粒子能量（或从文件读取的准粒子能量）基础上构建BSE kernel并对角化求解垂直激发能。
 
 - `bse_tda`: 取值bool，设置为 `true` 使用Tamm-Dancoff近似（仅保留BSE kernel的A子矩阵），设置为 `false`（缺省）使用完整BSE（包含A和B子矩阵的非TDA计算）。TDA近似计算量更小，通常对低能激发态精度足够。
-- `bse_spin`: 取值String，必须参数。指定计算的自旋激发类型：
+- `bse_spin`: 取值String，必须参数。指定计算的自旋激发类型（**限制性参考态**）：
     - `”singlet”`：单重态激发。
     - `”triplet”`：三重态激发。
     - `”both”`：同时计算单重态和三重态激发。
+    - 对**非限制参考态**（`spin_polarization = true`，UBSE）该关键词不选择自旋通道，
+      只作为 BSE 开关；`"triplet"` / `"both"` 已移除，详见"Unrestricted GW-BSE（UGW/UBSE）设置"一节。
 - `bse_cutoff_energy`: 取值f64，单位Hartree。KS能级高于此能量的虚轨道将被排除在BSE激发空间之外，缩减BSE kernel维度。建议根据体系设置为合理值（含几百条虚轨道即可），缺省为1e6（几乎不截断）。
 - `davidson_target_excitations`: 取值usize，需要计算的激发态数目。缺省为6。
 - `bse_davidson_solver`: 取值bool，设置为 `true` 使用Davidson迭代对角化（推荐用于仅需少数低能激发态的体系），设置为 `false`（缺省）使用完整矩阵对角化（适合小体系或需要全部激发态的情况）。
@@ -472,9 +526,6 @@ BSE计算在 `gw_or_bse = “bse”` 时进行，在GW准粒子能量（或从�
 - `davidson_max_iter`: 取值usize，Davidson最大迭代次数。缺省为20。
 - `davidson_maximum_subspace_size`: 取值usize，Davidson最大子空间维度倍数。实际最大子空间 = max(目标激发数 × 此值, 最小维度)。缺省为2。
 - `davidson_restart_dimensions`: 取值usize，Davidson重启动维度。当子空间达到上限后，收缩至此数量的近似特征向量后再继续扩张。缺省为5。
-- `simplified_bse`: 取值bool，设置为 `true` 使用裸库仑相互作用的简化BSE（不含W屏蔽）。缺省为false。
-- `bse_exchange_rescaling`: 取值f64，BSE交换项（屏蔽库仑项）的重标因子，可用于手动调整静态屏蔽强度。缺省为1.0。
-- `bse_qp_polarization`: 取值bool，设置为 `true` 时使用准粒子能量（而非KS轨道能量）构造BSE的极化函数。缺省为false。
 
 ### GW输入卡示例
 
@@ -559,6 +610,84 @@ bse_tda = true
 davidson_target_excitations = 10
 bse_davidson_solver = true
 ```
+### Unrestricted GW-BSE（UGW/UBSE）设置
+
+**触发方式**：在 `[ctrl]` 中设置：
+```toml
+[ctrl]
+charge = 0.0
+spin = 2.0          # 例如 NH2 双自由基/双基态，2S = 2
+spin_polarization = true
+```
+
+UBSE **没有**自旋通道选择：`bse_spin` 对非限制参考态不再表示"单重态/三重态"，
+它只保留"是否触发 BSE"的作用：
+
+- `bse_spin = "none"`（缺省）：不触发 BSE 计算。
+- `bse_spin = "singlet"`（或 `"unrestricted"`）：触发非限制 BSE。此处只有一个合法的自旋守恒通道 ——
+  直接（屏蔽库仑）核与自旋无关，把 α、β 两个块耦合在一起，因此不存在"去掉直接项"的第二个通道。
+- `bse_spin = "triplet"` / `"both"`：**已移除**，程序会报错并给出说明。原因同上：
+  对自旋对称的参考态，去掉直接项的算符会把真正的三重态与对称扇区中无物理意义的根混在一起；
+  对开壳层参考态（如 NH₂ 双重态）它不对应任何物理通道，甚至会产生零能假根。
+  限制性参考态下的 `bse_spin = "singlet" / "triplet" / "both"` **保持不变**
+  （限制性参考态可以自旋适配，那里的三重态通道是严格的物理通道）。
+
+> 注：Restricted 与 Unrestricted 路径的 `bse_spin` 语义不同：限制性路径中它是真正的自旋通道选择器，
+> 非限制路径中它只是 BSE 的开关（"none" 之外的值都触发同一个自旋耦合通道）。
+
+UBSE 支持 dense、Davidson、FEAST 三种对角化方式。
+
+一个完整的 UGW+UBSE 输入示例（NH₂ 双基态，PBE0/cc-pVDZ，Davidson full BSE）：
+
+```toml
+[ctrl]
+print_level = 1
+num_threads = 4
+xc = "pbe0"
+basis_path = "/path/to/cc-pvdz"
+auxbas_path = "/path/to/cc-pvdz-rifit"
+basis_type = "spheric"
+auxbas_type = "spheric"
+eri_type = "ri-v"
+charge = 0.0
+spin = 2.0
+spin_polarization = true
+initial_guess = "sad"
+mixer = "diis"
+max_scf_cycle = 100
+scf_acc_rho = 1.0e-8
+scf_acc_eev = 1.0e-7
+scf_acc_etot = 1.0e-10
+
+[geom]
+name = "NH2"
+unit = "angstrom"
+position = """
+N  0.0000000000   0.0000000000   0.0000000000
+H  0.0000000000   0.8030000000  -0.6350000000
+H  0.0000000000  -0.8030000000  -0.6350000000
+"""
+
+[quasiparticle_methods]
+gw_or_bse = "bse"
+gw_scheme = "extrapolated"
+scgw = "g0w0"
+gw_variant = "cd"
+save_qp = true
+save_qp_path = "qp_rest.txt"
+bse_spin = "singlet"
+bse_tda = false
+bse_davidson_solver = true
+davidson_target_excitations = 6
+davidson_maximum_subspace_size = 120
+davidson_restart_dimensions = 9
+davidson_max_iter = 100
+davidson_converge_threshold = 1e-8
+```
+
+> 注意：UGW/UBSE 目前主要用于共线开壳层体系。非限制路径下 `bse_spin` 只作为 BSE 开关
+> （`"none"` 之外的值都触发同一个自旋耦合通道），不再选择自旋通道；`"triplet"` / `"both"` 已移除。
+
 ## 溶剂化计算相关设置
 - `solvent_model`: 取值String, 用于指定用于计算的溶剂模型。目前支持CPCM, COSMO, IEFPCM, SS(V)PE,SMD。缺省为CPCM。SMD及其梯度为实验性功能。
 - `solvent`: 取值String。支持溶剂见[用户手册](https://gitee.com/restgroup/rest_doc/blob/master/source_zh/user/solvent.md)。
@@ -582,9 +711,18 @@ TD-DFT方法相关的设置在 `[tddft]` 区块中进行。REST支持基于RI积
 - `tddft_method`: 取值String，选择TD-DFT求解方法：
     - `"tda"`：Tamm-Dancoff近似，仅求解A子矩阵的本征值问题。计算量较小，对低能激发态通常与完整线性响应精度相当。
     - `"lr"`（缺省）：完整线性响应，同时使用A和B子矩阵，对激发能的描述更完备。
-- `tddft_spin`: 取值String，指定计算的自旋激发类型：
+- `tddft_spin`: 取值String，指定**限制性**（自旋适配）参考态的自旋通道：
     - `"singlet"`（缺省）：单重态激发，库仑耦合因子为2。
-    - `"triplet"`：三重态激发，库仑耦合因子为0。
+    - `"triplet"`：三重态激发，库仑耦合因子为0；仅 AO 模式（需同时设 `tddft_mode = "ao"`）支持。
+    - `"both"`：先算单重态、再算三重态；同样仅 AO 模式支持，`pysoc = true` 的 PySOC 导出需要此项。
+    - 其它取值将报错。
+    - **该关键词不适用于非限制参考态**（`spin_polarization = true`，即非限制 TD-DFT，UTDDFT）。
+      非限制 TD-DFT 只有一个合法的响应通道：库仑（Hartree）核与自旋无关，它把 α、β 两个块耦合在一起；
+      而"库仑因子 2 / 0"这一对只对**可以旋转到单/三重态子空间**的限制性参考态成立。
+      因此 UTDDFT 不存在"去库仑"的第二个通道，`"triplet"` / `"both"` 会被直接拒绝；
+      若在非限制计算中写了缺省值 `"singlet"`，程序会忽略它并给出提示（建议直接从输入中删除该关键词）。
+      注意：对自旋对称的参考态，非限制通道的本征谱**本身就同时包含单重态型与三重态型根**
+      （三重态型根的振子强度≈0），这是该算符的固有性质，而不是需要额外选择的通道。
 - `nroots`: 取值usize，需要计算的激发态数目（根的数目）。缺省为6。
 - `tddft_cutoff_energy`: 取值f64，单位Hartree。KS轨道能量高于此值的虚轨道将被排除在TD-DFT激发空间之外。设置合理值（如20.0-100.0）可显著缩减激发空间维度，加速计算。缺省为1e6（几乎不截断）。
 - `tddft_mode`: 取值String，选择TD-DFT计算模式：`"mo"`（缺省，MO-basis RI）/ `"ao"`（AO-basis）。
@@ -641,12 +779,29 @@ davidson_tol = 1.0e-10
 tddft_cutoff_energy = 50.0
 ```
 
-TD-DFT三重态TDA计算（5个激发态）：
+TD-DFT三重态TDA计算（5个激发态，限制性参考态，需 AO 模式）：
 ```toml
 [tddft]
 tddft_method = "tda"
 tddft_spin = "triplet"
+tddft_mode = "ao"
 nroots = 5
+```
+
+非限制TD-DFT（UTDDFT）的激发能计算（如 NH₂ 双重态，PBE0/cc-pVDZ）：
+```toml
+[ctrl]
+charge = 0.0
+spin = 2.0
+spin_polarization = true
+xc = "pbe0"
+basis_path = "/path/to/cc-pvdz"
+auxbas_path = "/path/to/cc-pvdz-rifit"
+
+[tddft]
+tddft_method = "tda"
+nroots = 6
+# 不要设置 tddft_spin：非限制参考态只有一个自旋耦合通道
 ```
 
 ## 解析Hessian计算相关设置
@@ -657,10 +812,8 @@ nroots = 5
 
 `hessian` 子表位于 `[ctrl]` 区块中，若存在则触发解析Hessian计算；若不存在（缺省），则不进行Hessian计算。子表内的关键词包括：
 
-- `solver`: 取值String，CP-HF（Coupled-Perturbed Hartree-Fock）方程求解器。可选项：
-    - `"krylov"`（**缺省，强烈推荐**）：分批次Pople-Krylov子空间迭代求解器。共享子空间使所有微扰方向复用同一Krylov空间，对于多原子体系比稠密求解器快约30-47倍。
-    - `"dense"`：直接矩阵求逆求解。仅适用于极小体系或开发验证。
 - `frequencies`: 取值bool，设置为 `true` 在Hessian矩阵计算完成后对角化质量加权Hessian，计算振动频率（cm⁻¹）和简正模式并保存到文件。缺省为false。
+- `solver`: 取值String，CP-HF求解器，可选 `"krylov"`（缺省）或 `"dense"`。
 - `krylov_max_cycle`: 取值usize，Krylov求解器的最大迭代次数。对于绝大多数体系，50轮已足以收敛到机器精度。缺省为50。
 - `krylov_tol`: 取值f64，Krylov求解器的残差范数收敛阈值。缺省为1e-9。实际收敛还受 `krylov_lindep` 约束。
 - `krylov_lindep`: 取值f64，Krylov求解器的线性相关阈值。缺省为1e-15。
@@ -676,7 +829,7 @@ nroots = 5
 
 以下 `[ctrl]` 区的全局关键词对Hessian计算有直接影响：
 
-- `auxbasis_response`: 取值bool，是否包含辅助基组响应修正（level 2）。缺省为true。**强烈建议保持开启**：关闭后Hessian矩阵会产生约7×10⁻³的系统误差。
+- 辅助基组响应修正在Hessian流程中始终启用；全局 `auxbasis_response` 开关不再改变Hessian计算。
 - `max_memory`: 取值f64，全局内存限制（单位MB）。Hessian流水线内嵌内存监控器（MemMonitor），在峰值RSS超过此限制时提前终止以防止系统OOM。
 
 ### 计算流水线
@@ -685,15 +838,7 @@ nroots = 5
 1. **Hess核贡献（calc_e1）**：动能+核吸引积分二阶导数，计算量小。
 2. **部分Hessian（calc_ej_ek）**：库仑+交换积分对Hessian的贡献，所有G项均采用BLAS GEMM优化。HF/杂化泛函的主要计算量集中于此。
 3. **一阶Fock响应（calc_h1ao）**：对所有原子方向的RI积分一阶响应生成h1ao矩阵。
-4. **CP-HF贡献+组装（calc_cphf_contrib + calc_hess_nuc）**：通过Krylov或稠密求解器计算轨道弛豫对Hessian的贡献，与核Hessian相加得到总Hessian。
-
-### 高级环境变量
-
-以下环境变量用于性能调优和开发验证，一般用户无需设置：
-
-- `REST_HESS_GRID_CONCURRENCY`: 取值usize，DFT Hessian中XC格点流式处理的并发块数。缺省为2（保守值）。对于大基组/大格点体系，增大此值可提升XC部分并行度但会增加峰值内存。Hessian对内存敏感，建议首选缺省值。
-- `REST_CPHF_METHOD`：覆盖 `solver` 设置。取值 `"krylov"` 或 `"dense"`。
-- `REST_CPHF_KRYLOV_MAXCYCLE` / `REST_CPHF_KRYLOV_TOL`：覆盖Krylov求解器的迭代次数和收敛阈值。
+4. **CP-HF贡献+组装（calc_cphf_contrib + calc_hess_nuc）**：通过固定的批量Krylov求解器（最大50轮、阈值1e-12）计算轨道弛豫对Hessian的贡献，与核Hessian相加得到总Hessian。
 
 ### 推荐配置
 
@@ -705,7 +850,7 @@ basis_path = "def2-SVP"
 auxbas_path = "def2-SVP-ri"
 charge = 0.0
 spin = 1
-hessian = { solver = "krylov" }
+hessian = {}
 
 [geom]
 name = "H2O"
@@ -725,7 +870,7 @@ basis_path = "def2-TZVP"
 auxbas_path = "def2-TZVP-ri"
 charge = 0.0
 spin = 1
-hessian = { solver = "krylov", frequencies = true }
+hessian = { frequencies = true }
 ```
 
 **完整调试输出（含中间量.npy保存，用于对比PySCF等参考程序）**：
@@ -736,7 +881,7 @@ basis_path = "def2-SVP"
 auxbas_path = "def2-SVP-ri"
 charge = 0.0
 spin = 1
-hessian = { solver = "krylov", frequencies = true, verbose = 2 }
+hessian = { frequencies = true, verbose = 2 }
 ```
 
 ## 解析梯度性质模块 `analdrv` 计算相关设置
@@ -939,7 +1084,17 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 
 ## `[hessian]` 区块关键词
 
-只要输入卡中存在 `[hessian]` 区块（可位于顶层或嵌套于 `[ctrl]` 下），SCF 收敛后即**无条件**触发解析 Hessian 计算（与 `job_type` 无关）。关键词见 hessian 部分。
+只要输入卡中存在 `[hessian]` 区块（可位于顶层或嵌套于 `[ctrl]` 下），SCF 收敛后即**无条件**触发解析 Hessian 计算（与 `job_type` 无关）。关键词包括：
+
+- `solver`: 取值 String。CP-HF 求解器，可选 `"krylov"`（缺省）或 `"dense"`。
+- `frequencies`: 取值 bool。是否在 Hessian 计算后顺带做振动频率与简正模分析并输出 `EigenModes.txt`。缺省 false。注意：若同时设置了 `[thermo]` 区块，频率会被自动计算，无需手动开启此项。
+- `krylov_max_cycle`: 取值 usize。Krylov 求解器最大迭代次数，缺省 50。
+- `krylov_tol`: 取值 f64。Krylov 收敛阈值，缺省 1e-9。
+- `krylov_lindep`: 取值 f64。Krylov 线性相关阈值，缺省 1e-15。
+- `krylov_tol_inflation`: 取值 f64。真残差容忍系数，缺省 1000.0。
+- `verbose`: 取值 usize。输出详细程度（0=静默，1=正常，2=调试；调试时额外输出各分量 .npy 文件）。缺省 1。
+- `hessian_matrix_path`: 取值 String。Hessian 矩阵输出路径。缺省 `"./HessianMatrix.txt"`。
+- `eigenmodes_path`: 取值 String。简正模输出路径。缺省 `"./EigenModes.txt"`。
 
 频率计算约定：对 Hessian 做质量加权后经 LAPACK `dsyev` 对角化，本征值转换为 cm⁻¹（虚频记为负值）。6（线性分子为 5）个平动/转动零模会自然产生（数值上接近 0；若几何未完全优化可能呈小幅虚频，不影响真实振动模式）。REST 内置质量为元素质量（如 H=1.008、C=12.011），与 Gaussian 默认同位素质量略有差异，对频率与热化学量的影响通常在 0.1% 量级。
 
@@ -1004,7 +1159,6 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
             H -0.629118  0.629118 -0.629118
          """
     [hessian]
-         solver = "krylov"
          frequencies = true
     [thermo]
          temperature = 298.15

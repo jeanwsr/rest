@@ -311,9 +311,15 @@ pub fn post_scf_correlation(scf_data: &mut SCF) {
 pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>) -> crate::ri_bse::BseOutput {
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let output_type=qp_ctrl.gw_or_bse.clone();
-    let mut bse_output = crate::ri_bse::BseOutput { first_excitation: None };
+    let mut bse_output = crate::ri_bse::BseOutput {
+        first_excitation: None,
+        excitation_energies: Vec::new(),
+    };
     if output_type.eq("gw"){
         let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
+        let vxc_nn_spin: Option<[Vec<f64>;2]> = if scf_data.mol.spin_channel==2 {
+            Some(ri_gw::vxc_ao2mo_spin(scf_data))
+        } else { None };
         let xc_data=scf_data.mol.xc_data.clone();
         println!("Current XC data:");
         println!("dfa_compnt_scf={:?}",xc_data.dfa_compnt_scf);
@@ -325,6 +331,8 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             ri_gw::spectrum_test(scf_data,20);
         }else if qp_ctrl.obtain_vx_vc_terms==true{
             ri_gw::obtain_vx_vc_terms(scf_data);
+        }else if scf_data.mol.spin_channel==2{
+            ri_gw::gw_main_spin(scf_data,&vxc_nn_spin.unwrap(),mpi_operator);
         }else{
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
             if scf_data.mol.ctrl.print_level>1{
@@ -332,16 +340,26 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             }
         }
     }else if output_type.eq("bse"){
-        // Prepare BSE-specific RI integrals before BSE calculation
-        scf_data.prepare_bse_integrals(mpi_operator);
-
+        // BSE-specific integrals must be prepared AFTER GW calculation,
+        // otherwise get_submatrix would pick them up during GW and return
+        // wrong-dimensional RI matrices (BSE aux basis instead of full).
         if qp_ctrl.gw_scheme=="parse from file"{
             let parse_qp_path=qp_ctrl.parse_qp_path.clone();
-            scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
+            let qp=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
+            scf_data.gwqp.0=qp.clone();
+            if scf_data.mol.spin_channel==2{
+                scf_data.gwqp_spin.0[0]=qp.clone();
+                scf_data.gwqp_spin.0[1]=qp;
+                scf_data.gwqp_spin.1=scf_data.gwqp_spin.0.clone();
+            }
+        }else if scf_data.mol.spin_channel==2{
+            let vxc_nn_spin=ri_gw::vxc_ao2mo_spin(scf_data);
+            ri_gw::gw_main_spin(scf_data,&vxc_nn_spin,mpi_operator);
         }else{
             let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
         }
+        scf_data.prepare_bse_integrals(mpi_operator);
         bse_output = ri_bse::bse_main(scf_data);
     }else if output_type.eq("response_bse"){
         if qp_ctrl.gw_scheme=="parse from file"{

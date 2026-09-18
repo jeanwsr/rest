@@ -145,6 +145,11 @@ fn build_ao_data(nvar: usize) -> TDDFTData {
         ri_oo_exch: None,
         ri_vv_exch: None,
         ri_ov_exch: None,
+        coeff_full: 0.0,
+        coeff_sr: 0.0,
+        ri_oo_sr: None,
+        ri_vv_sr: None,
+        ri_ov_sr: None,
     };
     data
 }
