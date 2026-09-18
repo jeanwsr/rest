@@ -645,7 +645,7 @@ impl RIUHFGradient<'_> {
             self.result.insert("de_solvent".into(), MatrixFull::new([3, natm], 0.0));
             return self;
         }
-        let de_solvent = crate::solvent::grad::compute_solvent_gradient(self.scf_data);
+        let de_solvent = crate::solvent::grad::compute_solvent_gradient_with_mpi(self.scf_data, self.mpi_operator);
         self.result.insert("de_solvent".into(), de_solvent);
         return self;
     }

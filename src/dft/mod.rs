@@ -424,6 +424,20 @@ impl DFA4REST {
 
     pub fn parse_postscf(name: &str, spin_channel: usize) -> Option<DFA4REST> {
         let tmp_name = name.to_lowercase();
+        if tmp_name.starts_with("dsd") {
+            panic!(
+                "DSD-type functional '{}' is no longer supported by the legacy xc parser: \
+                the DSD* definitions in legacy parser are confusing. Please set xc_parser = \"parse_xc\" \
+                in the ctrl input instead, e.g.\n \
+                xc_parser = \"parse_xc\"\n \
+                xc = \"dsdpbep86-d3bj\"\n \
+                or \n \
+                xc_parser = \"parse_xc\"\n \
+                xc = \"dsdpbep86\"\n \
+                (no dispersion version)",
+                name
+            );
+        }
         if tmp_name.eq("xyg3") {
             // XYG3 functional
             // Proc. Natl. Acad. Sci. U.S.A. 106, 13, 4963-4968 (2009); https://pnas.org/doi/full/10.1073/pnas.0901093106
@@ -892,118 +906,6 @@ impl DFA4REST {
             // PT2 part
             let dfa_family_pos = Some(DFAFamily::PT2);
             let dfa_paramr_adv = Some(vec![0.125, 0.125]);
-            let dfa_compnt_pos: Option<Vec<usize>> = Some(dfa_compnt_scf.clone());
-            let dfa_paramr_pos = Some(dfa_paramr_scf.clone());
-            let dfa_hybrid_pos = Some(dfa_hybrid_scf);
-            Some(DFA4REST{
-                spin_channel,
-                dfa_compnt_scf,
-                dfa_paramr_scf,
-                dfa_hybrid_scf,
-                dfa_paramr_adv,
-                dfa_family_pos,
-                dfa_compnt_pos,
-                dfa_paramr_pos,
-                dfa_hybrid_pos,
-                dfa_rsh_scf: None,
-            })
-        } else if tmp_name.eq("dsdpbep86-nodisp") {
-            // DSD-PBEP86
-            // Phys. Chem. Chem. Phys. 2011,13, 20104-20107.
-            let dfa_family_scf = DFAFamily::HybridGGA;
-            let scf_dfa = ["gga_x_pbe", "gga_c_p86"];
-            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
-                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
-                .flatten().collect();
-            let dfa_paramr_scf = vec![0.28, 0.44];
-            let dfa_hybrid_scf = 0.72;
-            // PT2 part
-            let dfa_family_pos = Some(DFAFamily::PT2);
-            let dfa_paramr_adv = Some(vec![0.51, 0.36]);
-            let dfa_compnt_pos: Option<Vec<usize>> = Some(dfa_compnt_scf.clone());
-            let dfa_paramr_pos = Some(dfa_paramr_scf.clone());
-            let dfa_hybrid_pos = Some(dfa_hybrid_scf);
-            Some(DFA4REST{
-                spin_channel,
-                dfa_compnt_scf,
-                dfa_paramr_scf,
-                dfa_hybrid_scf,
-                dfa_paramr_adv,
-                dfa_family_pos,
-                dfa_compnt_pos,
-                dfa_paramr_pos,
-                dfa_hybrid_pos,
-                dfa_rsh_scf: None,
-            })
-        } else if tmp_name.eq("dsdpbep86") {
-            // DSD-PBEP86-D3BJ
-            // J. Comput. Chem. 2013, 34, 2327-2344.
-            let dfa_family_scf = DFAFamily::HybridGGA;
-            let scf_dfa = ["gga_x_pbe", "gga_c_p86"];
-            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
-                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
-                .flatten().collect();
-            let dfa_paramr_scf = vec![0.31, 0.44];
-            let dfa_hybrid_scf = 0.69;
-            // PT2 part
-            let dfa_family_pos = Some(DFAFamily::PT2);
-            let dfa_paramr_adv = Some(vec![0.52, 0.22]);
-            let dfa_compnt_pos: Option<Vec<usize>> = Some(dfa_compnt_scf.clone());
-            let dfa_paramr_pos = Some(dfa_paramr_scf.clone());
-            let dfa_hybrid_pos = Some(dfa_hybrid_scf);
-            Some(DFA4REST{
-                spin_channel,
-                dfa_compnt_scf,
-                dfa_paramr_scf,
-                dfa_hybrid_scf,
-                dfa_paramr_adv,
-                dfa_family_pos,
-                dfa_compnt_pos,
-                dfa_paramr_pos,
-                dfa_hybrid_pos,
-                dfa_rsh_scf: None,
-            })
-        } else if tmp_name.eq("dsdblyp") {
-            // DSD-BLYP-D3BJ
-            // J. Comput. Chem. 2013, 34, 2327-2344.
-            let dfa_family_scf = DFAFamily::HybridGGA;
-            let scf_dfa = ["gga_x_b88", "gga_c_lyp"];
-            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
-                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
-                .flatten().collect();
-            let dfa_paramr_scf = vec![0.29, 0.54];
-            let dfa_hybrid_scf = 0.71;
-            // PT2 part
-            let dfa_family_pos = Some(DFAFamily::PT2);
-            let dfa_paramr_adv = Some(vec![0.47, 0.40]);
-            let dfa_compnt_pos: Option<Vec<usize>> = Some(dfa_compnt_scf.clone());
-            let dfa_paramr_pos = Some(dfa_paramr_scf.clone());
-            let dfa_hybrid_pos = Some(dfa_hybrid_scf);
-            Some(DFA4REST{
-                spin_channel,
-                dfa_compnt_scf,
-                dfa_paramr_scf,
-                dfa_hybrid_scf,
-                dfa_paramr_adv,
-                dfa_family_pos,
-                dfa_compnt_pos,
-                dfa_paramr_pos,
-                dfa_hybrid_pos,
-                dfa_rsh_scf: None,
-            })
-        } else if tmp_name.eq("dsdpbeb95") {
-            // DSD-PBEB95-D3BJ
-            // J. Comput. Chem. 2013, 34, 2327-2344.
-            let dfa_family_scf = DFAFamily::HybridMGGA;
-            let scf_dfa = ["gga_x_pbe", "mgga_c_bc95"];
-            let dfa_compnt_scf: Vec<usize> = scf_dfa.iter().map(|xc| {
-                DFA4REST::xc_func_init_fdqc(*xc, spin_channel).into_iter()})
-                .flatten().collect();
-            let dfa_paramr_scf = vec![0.34, 0.55];
-            let dfa_hybrid_scf = 0.66;
-            // PT2 part
-            let dfa_family_pos = Some(DFAFamily::PT2);
-            let dfa_paramr_adv = Some(vec![0.46, 0.09]);
             let dfa_compnt_pos: Option<Vec<usize>> = Some(dfa_compnt_scf.clone());
             let dfa_paramr_pos = Some(dfa_paramr_scf.clone());
             let dfa_hybrid_pos = Some(dfa_hybrid_scf);
@@ -3420,7 +3322,7 @@ impl Grids {
         let mut quadrature_weights: Vec<f64> = vec![];
 
         alpha_min.iter().zip(alpha_max.iter()).enumerate().for_each(|(center_index,value)| {
-            let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid(
+            let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid_with_isdf(
                 value.0.clone(),
                 value.1.clone(),
                 radial_precision,
@@ -3433,6 +3335,7 @@ impl Grids {
                 pruning.clone(),
                 rad_grid_method.clone(),
                 grid_gen_level,
+                mol.ctrl.use_isdf,
             );
             //println!("alpha_min: {:?}, alpha_max: {:6.3}",&value.0, &value.1);
             //println!("rs_atom: {:?}, ws_atom: {:?}",&rs_atom, &ws_atom);
@@ -3563,7 +3466,7 @@ impl Grids {
         let mut atm_idx: Vec<usize> = vec![];
         let mut quadrature_weights: Vec<f64> = vec![];
         alpha_min.iter().zip(alpha_max.iter()).enumerate().for_each(|(center_index, value)| {
-            let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid(
+            let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid_with_isdf(
                 value.0.clone(),
                 value.1.clone(),
                 radial_precision,
@@ -3576,6 +3479,7 @@ impl Grids {
                 pruning.clone(),
                 rad_grid_method.clone(),
                 level,
+                mol.ctrl.use_isdf,
             );
             coordinates.extend(rs_atom.iter().map(|value| [value.0, value.1, value.2]));
             weights.extend(ws_atom);

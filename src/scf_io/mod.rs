@@ -2,7 +2,7 @@
 use crate::basis_io::ecp::ghost_effective_potential_matrix;
 use self::force_state_occupation::adapt_occupation_with_force_projection;
 use self::occupation::{generate_occupation_frac_occ, generate_occupation_integer, generate_occupation_sad, OCCType};
-use crate::dft::gen_grids::prune::prune_by_rho;
+use crate::dft::gen_grids::prune::{prune_by_rho_dense};
 use crate::dft::{DFTType, Grids};
 use crate::geom_io::{calc_nuc_energy, calc_nuc_energy_with_ext_field, calc_nuc_energy_with_point_charges};
 #[cfg(feature = "mpi")]
@@ -12,6 +12,8 @@ use crate::utilities::{self, TimeRecords};
 use crate::utilities::memory_batch::*;
 use crate::ctrl_io::ri_jk_io::*;
 
+#[cfg(test)]
+mod ao2mo_kernel_tests;
 mod fchk;
 pub mod print;
 mod pyrest_scf_io;
@@ -26,15 +28,16 @@ use mpi::collective::SystemOperation;
 use pyo3::{pyclass};
 use tensors::matrix_blas_lapack::{_dgemm, _dgemm_full, _dgemv, _dspgvx, _dsymm, _dsyrk, _hamiltonian_fast_solver, _power_rayon_for_symmetric_matrix, _dsyevd};
 use tensors::{map_upper_to_full, BasicMatrix, ERIFold4, MathMatrix, MatrixFull, MatrixFullSlice, MatrixUpper, MatrixUpperSlice, RIFull, TensorSliceMut};
-use tensors::{TensorOpt, TensorSlice};
+use tensors::{TensorOpt,TensorSlice};
 use itertools::{Itertools};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use crossbeam::{channel::{unbounded},thread::{scope}};
 use std::sync::mpsc::{channel};
-use crate::isdf::{prepare_for_ri_isdf, prepare_m_isdf};
+use crate::isdf::{prepare_m_isdf, prepare_m_isdf_dm_v2, set_isdf_k};
 use crate::molecule_io::{Molecule};
 use crate::initial_guess::{initial_guess, update_basis_from_hdf5chk};
+use crate::initial_guess::sad::initial_guess_from_sad;
 use crate::dftd::energy::dftd;
 use crate::constants::{SQRT_THRESHOLD};
 use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
@@ -49,7 +52,7 @@ use smear::apply_smearing;
 use smear::annealed_sigma;
 
 #[cfg(feature = "scalapack")]
-use tensors::distributedmatrixfull::_hamiltonian_distributed_solver;
+use tensors::distributedmatrixfull::{_hamiltonian_distributed_solver, _hamiltonian_distributed_solver_inv};
 #[allow(unused_imports)]
 use tensors::BasicMatUp;
 
@@ -107,9 +110,15 @@ pub struct SCF {
     pub ref_eigenvectors: HashMap<String, ([MatrixFull<f64>;2], [usize;4])>,
     pub renormalized_singles_particles:Vec<f64>,
     pub gwqp:(Vec<f64>,Vec<f64>),
+    /// Spin-resolved quasiparticle energies: (G energies, W energies), indexed [spin].
+    pub gwqp_spin:([Vec<f64>;2],[Vec<f64>;2]),
     pub algorithm_jk: AlgorithmJK,
     pub solvent_static_obj: Option<PcmObject>,
     pub solvent_scf: Option<PcmScf>,
+    /// Raw TDDFT eigenvectors from the last `tddft_main` call:
+    /// `(excitation energy, eigenvector)` in the solver's ordering.  Used by
+    /// the TDDFT analytic-gradient driver.
+    pub tddft_excitations: Option<Vec<(f64, Vec<f64>)>>,
 }
 
 #[derive(Clone,Copy,PartialEq)]
@@ -167,9 +176,11 @@ impl SCF {
             energies: HashMap::new(),
             renormalized_singles_particles:Vec::new(),
             gwqp:(Vec::new(),Vec::new()),
+            gwqp_spin:([Vec::new(),Vec::new()],[Vec::new(),Vec::new()]),
             algorithm_jk: AlgorithmJK::Default,
             solvent_static_obj: None,
             solvent_scf: None,
+            tddft_excitations: None,
         };
 
         // at first check the scf type: RHF, ROHF or UHF
@@ -548,87 +559,101 @@ impl SCF {
     }
 
     pub fn prepare_density_grids(&mut self) {
-
-        self.grids = if self.mol.xc_data.is_dfa_scf() || self.mol.ctrl.use_isdf || self.mol.ctrl.initial_guess == "vsap" {
-            let grids = Grids::build(&mut self.mol);
-            info!("Grid size: {:}", grids.coordinates.len());
-            Some(grids)
-        } else {None};
-
-        if let Some(grids) = &mut self.grids {
-            grids.ao_cutoff = self.mol.ctrl.ao_cutoff;
-            if grids.ao_cutoff > 0.0 {
-                // sparse path: two-pass batch scan → compressed directly, no dense allocation
-                grids.prepare_tabulated_ao_sparse(&self.mol);
-            } else {
-                // dense path: allocate full AO/AOP, then optionally build non0tab + compressed
-                grids.prepare_tabulated_ao(&self.mol);
-                grids.build_non0tab(&self.mol);
-                grids.build_compressed_storage();
-            }
-            if self.mol.ctrl.drop_dense_ao && grids.ao_compressed.is_some() {
-                if self.mol.ctrl.print_level >= 1 {
-                    let (dense_bytes, comp_bytes, _) = grids.memory_footprint();
-                    let ratio = if dense_bytes > 0 { comp_bytes as f64 / dense_bytes as f64 * 100.0 } else { 0.0 };
-                    info!(" [non0tab] dropping dense ao/aop, dense={:.1}GB, compressed={:.1}GB ({:.1}%)",
-                        dense_bytes as f64 / 1e9, comp_bytes as f64 / 1e9, ratio);
+        if self.mol.ctrl.use_isdf {
+            // make a single branch
+            // always generate dense grids first
+            // generate ao only
+            self.grids = {
+                let grids = Grids::build(&mut self.mol);
+                if self.mol.ctrl.print_level > 0 {
+                    println!("Grid size: {:}",grids.coordinates.len());
                 }
-                grids.ao = None;
+                Some(grids)
+            };
+            if let Some(grids) = &mut self.grids {
+                grids.prepare_tabulated_ao(&self.mol);
                 grids.aop = None;
+            }
+        } else {
+            self.grids = if self.mol.xc_data.is_dfa_scf() || self.mol.ctrl.initial_guess == "vsap" {
+                let grids = Grids::build(&mut self.mol);
+                info!("Grid size: {:}", grids.coordinates.len());
+                Some(grids)
+            } else {None};
+
+            if let Some(grids) = &mut self.grids {
+                grids.ao_cutoff = self.mol.ctrl.ao_cutoff;
+                if grids.ao_cutoff > 0.0 {
+                    // sparse path: two-pass batch scan → compressed directly, no dense allocation
+                    grids.prepare_tabulated_ao_sparse(&self.mol);
+                } else {
+                    // dense path: allocate full AO/AOP, then optionally build non0tab + compressed
+                    grids.prepare_tabulated_ao(&self.mol);
+                    grids.build_non0tab(&self.mol);
+                    grids.build_compressed_storage();
+                }
+                if self.mol.ctrl.drop_dense_ao && grids.ao_compressed.is_some() {
+                    if self.mol.ctrl.print_level >= 1 {
+                        let (dense_bytes, comp_bytes, _) = grids.memory_footprint();
+                        let ratio = if dense_bytes > 0 { comp_bytes as f64 / dense_bytes as f64 * 100.0 } else { 0.0 };
+                        info!(" [non0tab] dropping dense ao/aop, dense={:.1}GB, compressed={:.1}GB ({:.1}%)",
+                            dense_bytes as f64 / 1e9, comp_bytes as f64 / 1e9, ratio);
+                    }
+                    grids.ao = None;
+                    grids.aop = None;
+                }
             }
         }
     }
 
     pub fn prepare_isdf(&mut self, mpi_operator: &Option<MPIOperator>) {
 
-        let use_eri = self.mol.use_eri;
+        let use_eri = true;
         let isdf = if use_eri {self.mol.ctrl.eri_type.eq("ri_v") && self.mol.ctrl.use_isdf} else {false};
         let ri3fn_full = if use_eri {self.mol.ctrl.use_auxbas && !self.mol.ctrl.use_ri_symm} else {false};
         let ri3fn_symm = if use_eri {self.mol.ctrl.use_auxbas && self.mol.ctrl.use_ri_symm} else{false};
 
         if ! isdf {return}
-        if let Some(grids) = &self.grids {
+        if self.grids.is_none() {
+            panic!("SCF grids should be initialized before the preparation of ISDF");
+        } else {
             if self.mol.ctrl.use_isdf {
-                let init_fock = self.h_core.clone();
-                if self.mol.spin_channel==1 {
-                    self.hamiltonian = [init_fock,MatrixUpper::new(1,0.0)];
-                } else {
-                    let init_fock_beta = init_fock.clone();
-                    self.hamiltonian = [init_fock,init_fock_beta];
-                };
-                (self.eigenvectors,self.eigenvalues, self.mol.num_state) = diagonalize_hamiltonian_outside(&self, mpi_operator);
-                (self.occupation, self.homo, self.lumo) = generate_occupation_outside(&self);
-                self.density_matrix = generate_density_matrix_outside(&self);
-
-                self.grids = Some(prune_by_rho(grids, &self.density_matrix, self.mol.spin_channel));
-                
+                set_isdf_k(&mut self.mol);
+                // generate initial guess(sad) here
+                self.density_matrix = initial_guess_from_sad(&self.mol, mpi_operator);
+                // apply a low memory version
+                // assume the extra memory is same as 0.5*N_IP^2
+                let nip = self.mol.num_auxbas * self.mol.ctrl.isdf_k.unwrap();
+                let batch_size: usize = (nip * nip).div_ceil(self.mol.num_basis * 2);
+                prune_by_rho_dense(&mut self.grids.as_mut().unwrap(), &self.density_matrix, self.mol.spin_channel, Some(batch_size));
             };
-
-
-            self.ri3fn_isdf = if ri3fn_full && isdf && !self.mol.ctrl.isdf_new{
-                if let Some(grids) = &self.grids {
-                    Some(prepare_for_ri_isdf(self.mol.ctrl.isdf_k_mu, &self.mol, &grids))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            (self.tab_ao, self.m) = if isdf && self.mol.ctrl.isdf_new{
-                if let Some(grids) = &self.grids {
-                    let isdf = prepare_m_isdf(self.mol.ctrl.isdf_k_mu, &self.mol, &grids);
+            (self.tab_ao, self.m) = if isdf && self.mol.ctrl.isdf_new {
+                if self.grids.is_some() {
+                    let nip: usize = self.mol.num_auxbas * self.mol.ctrl.isdf_k.unwrap();
+                    // here assume the extra memory is same as N_IP^2
+                    // as the number of grids is much smaller
+                    let batch_size: usize = self.mol.num_auxbas * self.mol.ctrl.isdf_k.unwrap();
+                    let isdf = match self.mol.ctrl.isdf_type.as_str() {
+                        "udd" => {
+                            prepare_m_isdf_dm_v2(self.mol.ctrl.isdf_k.unwrap(), &mut self.mol, &mut self.grids, &self.density_matrix, Some(batch_size))
+                        }
+                        "cvt" => {
+                            panic!("CVT is not supported in this version. If you really need, please contact us.");
+                            prepare_m_isdf(self.mol.ctrl.isdf_k.unwrap(), &self.mol, &self.grids.as_ref().unwrap())
+                        }
+                        _ => {
+                            panic!("Unknown isdf_type: {}",self.mol.ctrl.isdf_type);
+                            (MatrixFull::empty(), MatrixFull::empty())
+                        }
+                    };
                     (Some(isdf.0), Some(isdf.1))
                 } else {
-                    (None,None)
+                    (None, None)
                 }
             } else {
-                (None,None)
+                (None, None)
             };
-        } else {
-            panic!("SCF.grids should be initialized before the preparation of ISDF");
         }
-
     }
 
     pub fn prepare_solvent_calculation(&mut self) {
@@ -2015,10 +2040,14 @@ impl SCF {
 
         // Coulomb J
         let dt1 = time::Local::now();
-        let vj = match self.algorithm_jk {
+        let vj = if self.mol.ctrl.isdf_new {
+            self.generate_vj_ri_direct(None)
+        } else {
+            match self.algorithm_jk {
             AlgorithmJK::RiIncore | AlgorithmJK::Separated(AlgorithmJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
             AlgorithmJK::RiDirect | AlgorithmJK::Separated(AlgorithmJ::RiDirect, _) => self.generate_vj_ri_direct(None),
             _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
+            }
         };
 
         for i_spin in (0..spin_channel) {
@@ -2094,10 +2123,16 @@ impl SCF {
             let scaling_factor = base_scaling * self.mol.xc_data.dfa_hybrid_scf;
             if ! scaling_factor.eq(&0.0) {
                 let use_dm_only = self.mol.ctrl.use_dm_only;
-                let vk = match self.algorithm_jk {
+                let vk = if self.mol.ctrl.use_isdf && !self.mol.ctrl.isdf_new {
+                    self.generate_vk_with_isdf(scaling_factor, use_dm_only)
+                } else if self.mol.ctrl.isdf_new {
+                    self.generate_vk_with_isdf_new(scaling_factor)
+                } else {
+                    match self.algorithm_jk {
                     AlgorithmJK::RiIncore | AlgorithmJK::Separated(_, AlgorithmK::RiIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
                     AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None, None),
                     _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
+                    }
                 };
                 for i_spin in (0..spin_channel) {
                     self.hamiltonian[i_spin].data.par_iter_mut()
@@ -2188,6 +2223,10 @@ impl SCF {
     /// Called both before the first Fock build (solvent-consistent initial guess /
     /// chkfile restart) and once per SCF iteration.
     pub fn refresh_solvent(&mut self) {
+        self.refresh_solvent_with_mpi(&None)
+    }
+
+    pub fn refresh_solvent_with_mpi(&mut self, mpi_operator: &Option<MPIOperator>) {
         if let Some(solvent_static) = self.solvent_static_obj.as_ref() {
             let s_static = PcmScf::get_pcm_refresh(
                 &solvent_static.surface,
@@ -2200,7 +2239,8 @@ impl SCF {
                 &self.mol.spin_channel,
                 &self.mol.ctrl.max_memory,
                 &self.mol.ctrl.solv_chunk,
-                self.mol.ctrl.solvent_ri
+                self.mol.ctrl.solvent_ri,
+                mpi_operator
             );
             // SMD: CDS energy from PcmStatic (computed once in solvent_prepare)
             let e_cds = solvent_static.pstatic.e_cds.unwrap_or(0.0);
@@ -2663,7 +2703,7 @@ impl SCF {
         let use_dm_only = self.mol.ctrl.use_dm_only;
         //let mut vk = self.generate_vk_with_ri_v(1.0, use_dm_only);
         let mut vk = if self.mol.ctrl.use_isdf{
-            self.generate_vk_with_isdf(1.0, use_dm_only)
+            self.generate_vk_with_isdf_new(1.0)
         }else{
             match self.algorithm_jk {
                 AlgorithmJK::RiDirect | AlgorithmJK::Separated(_, AlgorithmK::RiDirect) => self.generate_vk_ri_direct(1.0, use_dm_only, None, None),
@@ -2834,11 +2874,11 @@ impl SCF {
             vj_upper_with_rimatr_sync_mpi(&self.rimatr, dm, spin_channel, scaling_factor, mpi_operator)
         } else {
             //vj_upper_with_ri_v_sync(&self.ri3fn, dm, spin_channel, scaling_factor)
-            if self.mol.ctrl.use_isdf && !self.mol.ctrl.isdf_k_only && !self.mol.ctrl.isdf_new{
-                vj_upper_with_ri_v_sync(&self.ri3fn_isdf, dm, spin_channel, scaling_factor)
-            }else{
+            //if self.mol.ctrl.use_isdf && !self.mol.ctrl.isdf_k_only && !self.mol.ctrl.isdf_new{
+            //    vj_upper_with_ri_v_sync(&self.ri3fn_isdf, dm, spin_channel, scaling_factor)
+            //}else{
                 vj_upper_with_ri_v_sync(&self.ri3fn, dm, spin_channel, scaling_factor)
-            }
+            //}
         }
     }
 
@@ -3363,6 +3403,25 @@ impl SCF {
         } else {
             panic!("rimatr should be initialized in the preparation of ri3mo");
         };
+        self.ao2mo_from_rimatr(ri3ao, row_range, col_range)
+    }
+
+    /// MO transformation of the short-range (RSH) 3-center RI integrals, i.e.
+    /// the same construction as `generate_ri3mo_rayon_for_multiple_times` but
+    /// built from `rimatr_sr` (erfc(omega*r12)/r12 operator). Used by the RSH
+    /// TDDFT response to assemble the short-range exchange contribution.
+    pub fn generate_ri3mo_sr_rayon_for_multiple_times(&self, row_range: std::ops::Range<usize>, col_range: std::ops::Range<usize>)->Vec<(RIFull<f64>,std::ops::Range<usize>,std::ops::Range<usize>)> {
+
+        let ri3ao = if let Some((riao, _basbas2baspair, _baspar2basbas))=&self.rimatr_sr {
+            riao
+        } else {
+            panic!("rimatr_sr should be initialized for RSH post-HF calculations; \
+                    it is built by prepare_necessary_integrals only for ri-symm in-core RI integrals");
+        };
+        self.ao2mo_from_rimatr(ri3ao, row_range, col_range)
+    }
+
+    fn ao2mo_from_rimatr(&self, ri3ao: &MatrixFull<f64>, row_range: std::ops::Range<usize>, col_range: std::ops::Range<usize>)->Vec<(RIFull<f64>,std::ops::Range<usize>,std::ops::Range<usize>)> {
         let mut ri3mo: Vec<(RIFull<f64>,std::ops::Range<usize>, std::ops::Range<usize>)> = vec![];
         for i_spin in 0..self.mol.spin_channel {
             let eigenvector = match self.scftype {
@@ -3371,8 +3430,8 @@ impl SCF {
             };
             ri3mo.push(
                 ao2mo_rayon(
-                    eigenvector, ri3ao, 
-                    row_range.clone(), 
+                    eigenvector, ri3ao,
+                    row_range.clone(),
                     col_range.clone()
                 ).unwrap()
             )
@@ -3450,9 +3509,15 @@ impl SCF {
         let naux = self.mol.num_auxbas;
         let nset = self.mol.spin_channel;
         let sys_info = sysinfo::System::new_all();
-        let mem_avail = self.mol.ctrl.max_memory.map(|max_memory| {
-            max_memory - detect_used_memory_mb("proc")
-        });
+        let mem_avail = if self.mol.ctrl.use_isdf {
+            self.mol.ctrl.max_memory.map(|max_memory| {
+                max_memory
+            })
+        } else {
+            self.mol.ctrl.max_memory.map(|max_memory| {
+                max_memory - detect_used_memory_mb("proc")
+            })
+        };
         let mem_est = ri_jk::mem_estimate_vj_ri_direct(nao, naux, nset);
         let mut batch_size_estimate = calc_batch_size_from_mem_estimate::<f64>(&mem_est, mem_avail, None, true);
 
@@ -4100,6 +4165,7 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v01(
     //let mut bm = RIFull::new([num_state,num_basis,num_auxbas], 0.0f64);
     let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
 
+
     if let Some((ri3fn,basbas2baspar,baspar2basbas)) = ri3fn {
         let num_basis = dm[0].size()[0];
         let num_baspair = (num_basis+1)*num_basis/2;
@@ -4108,33 +4174,51 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v01(
             let mut vk_s = &mut vk[i_spin];
             *vk_s = MatrixUpper::new(num_baspair,0.0_f64);
             let dm_s = &dm[i_spin];
-            let (sender, receiver) = channel();
-            ri3fn.par_iter_columns_full().for_each_with(sender,|s, m| {
-
-                // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
-                omp_set_num_threads_wrapper(1);
-
-                let mut tmp_mat = MatrixFull::new([num_basis,num_basis],0.0_f64);
-                let mut reduced_ri3fn = MatrixFull::new([num_basis,num_basis],0.0_f64);
-
-                reduced_ri3fn.iter_matrixupper_mut().unwrap().zip(m.iter()).for_each(|(to, from)| {*to = *from});
-
-                _dsymm(&reduced_ri3fn, dm_s, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
-                let mut vk_sm = MatrixFull::new([num_basis,num_basis],0.0_f64);
-                _dsymm(&reduced_ri3fn, &tmp_mat, &mut vk_sm, 'R', 'U', 1.0, 0.0);
-
-                s.send(vk_sm.to_matrixupper()).unwrap();
-            });
-
-            receiver.into_iter().for_each(|vk_mu_upper| {
-                vk_s.data.iter_mut()
-                    .zip(vk_mu_upper.data.iter()).for_each(|value| {
-                    *value.0 += *value.1
-                })
-            });
+            // ── Preallocated per-thread workspaces + fold/reduce: eliminates the
+            //    per-column 1MB MatrixFull allocations (~157 GB of zeroing per
+            //    batch), the channel sends, and the to_matrixupper copies that
+            //    dominated the old for_each_with(sender) structure. The second
+            //    dsymm accumulates in place (beta=1.0) into a per-thread full
+            //    [N,N] accumulator; the 24 accumulators are merged once. ──
+            let vk_full: MatrixFull<f64> = ri3fn.par_iter_columns_full()
+                .fold(
+                    || (MatrixFull::new([num_basis, num_basis], 0.0),
+                        MatrixFull::new([num_basis, num_basis], 0.0),
+                        MatrixFull::new([num_basis, num_basis], 0.0)),
+                    |(mut b_p, mut tmp_mat, mut vk_loc), m| {
+                        // 展开 ri3fn 列 → b_p 上三角 (dsymm 'U' 只读上三角).
+                        // OpenBLAS stays single-threaded inside the rayon
+                        // parallel region (no nested OpenMP thread explosion).
+                        omp_set_num_threads_wrapper(1);
+                        let mut iter = m.iter();
+                        for nu in 0..num_basis {
+                            for mu in 0..=nu {
+                                b_p[[mu, nu]] = *iter.next().unwrap();
+                            }
+                        }
+                        _dsymm(&b_p, dm_s, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
+                        _dsymm(&b_p, &tmp_mat, &mut vk_loc, 'R', 'U', 1.0, 1.0);
+                        (b_p, tmp_mat, vk_loc)
+                    },
+                )
+                .map(|(_, _, vk_loc)| vk_loc)
+                .reduce(
+                    || MatrixFull::new([num_basis, num_basis], 0.0),
+                    |mut acc, v| {
+                        for i in 0..v.data.len() { acc.data[i] += v.data[i]; }
+                        acc
+                    },
+                );
+            // 合并: 取上三角 (vk_full.data[mu + nu*num_basis], mu<=nu)
+            let mut idx = 0;
+            for nu in 0..num_basis {
+                for mu in 0..=nu {
+                    vk_s.data[idx] = vk_full.data[mu + nu * num_basis];
+                    idx += 1;
+                }
+            }
         }
     }
-
     if scaling_factor!=1.0f64 {
         for i_spin in (0..spin_channel) {
             vk[i_spin].data.par_iter_mut().for_each(|f| *f = *f*scaling_factor)
@@ -4603,14 +4687,41 @@ pub fn scf(mol:Molecule, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<S
     Ok(scf_data)
 }
 
+/// AO -> MO transformation of the symmetric-format RI 3-center tensor.
+///
+/// Dispatch rule, in order:
+///   1. if the eigenvector is not backed by a contiguous buffer, use `v02`, which
+///      works through the generic `BasicMatrix` interface;
+///   2. otherwise contract the *narrower* of the two requested blocks first.
+///      `m1` preslices the column (ket) block, `m2` preslices the row (bra) block.
+///      The two kernels are algebraically identical and differ only in which
+///      side carries the `dsymm`, so the cheap order costs
+///      `n^2 * min(|row|, |col|) + n * |row| * |col|` per auxiliary function
+///      instead of `n^2 * nmo + n * |row| * |col|`.
+///
+/// The per-orbital and per-block callers of RI-GW request (1, nmo) and
+/// (block, nmo) shapes, where the column block is the whole MO space. Those go
+/// through `m2` and no longer pay `n^2 * nmo` per auxiliary function.
 fn ao2mo_rayon<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops::Range<usize>, column_dim: std::ops::Range<usize>)
 -> anyhow::Result<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)>
     where T: BasicMatrix<'a, f64>+std::marker::Sync,
           P: BasicMatrix<'a, f64>
 {
-    ao2mo_rayon_v02(eigenvector, rimat_chunk, row_dim, column_dim)
-    //let mut 
-    //ri_ao2mo_f
+    // `m1` and `m2` walk the eigenvector through raw offsets, which assumes a
+    // contiguous, column-major `[nao, nmo]` buffer. Anything else goes to `v02`,
+    // which only uses the generic `BasicMatrix` interface.
+    let nao = eigenvector.size()[0];
+    let slicable = eigenvector.data_ref().is_some()
+        && eigenvector.is_contiguous()
+        && eigenvector.indicing() == [1, nao];
+    if !slicable {
+        return ao2mo_rayon_v02(eigenvector, rimat_chunk, row_dim, column_dim);
+    }
+    if row_dim.len() < column_dim.len() {
+        ao2mo_rayon_m2(eigenvector, rimat_chunk, row_dim, column_dim)
+    } else {
+        ao2mo_rayon_m1(eigenvector, rimat_chunk, row_dim, column_dim)
+    }
 }
 
 fn ao2mo_rayon_v01<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops::Range<usize>, column_dim: std::ops::Range<usize>)
@@ -4786,6 +4897,83 @@ where T: BasicMatrix<'a, f64> + std::marker::Sync,
     Ok((rimo, row_dim, column_dim))
 }
 
+/// M2-optimized AO->MO transformation: contracts the *row* (bra) block first.
+///
+/// Mirror image of `ao2mo_rayon_m1`. Where `m1` preslices the eigenvector to the
+/// requested *column* block and computes `tmp = A x C[:, col]`, this routine
+/// preslices the *row* block and computes `w = A x C[:, row]` followed by
+/// `out[a, i] = sum_u w[u, a] C[u, i]`. Both give the same `[naux, |row|, |col|]`
+/// tensor, and both cost `n^2 * (sliced block) + n * |row| * |col|` per auxiliary
+/// function, so together they cover the cheap contraction order for any block
+/// shape.
+///
+/// Use this whenever `|row_dim| < |column_dim|`. The case that motivates it is
+/// RI-GW, which asks for one MO row at a time against the full MO space
+/// (`|row| = 1`, `|col| = nmo`): contracting the column side first costs
+/// `n^2 * nmo` per auxiliary function for a single row, while contracting the
+/// row side costs `n^2 + n * nmo`.
+pub(crate) fn ao2mo_rayon_m2<'a, T, P>(
+    eigenvector: &T,
+    rimatr_chunk: &P,
+    row_dim: std::ops::Range<usize>,
+    column_dim: std::ops::Range<usize>,
+) -> anyhow::Result<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)>
+where T: BasicMatrix<'a, f64> + std::marker::Sync,
+      P: BasicMatrix<'a, f64>
+{
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
+
+    let num_basis = eigenvector.size()[0];
+    let num_bpair = rimatr_chunk.size()[0];
+    let num_auxbs = rimatr_chunk.size()[1];
+    let num_loc_row = row_dim.len();
+    let num_loc_col = column_dim.len();
+
+    // M2: pre-slice eigenvector to the bra (row) block.
+    // Cost: one-time copy of [nao, |row|] doubles.
+    let mut eigvec_row_data = vec![0.0_f64; num_basis * num_loc_row];
+    let eigvec_src = eigenvector.data_ref().expect("ao2mo_rayon_m2 requires a contiguous eigenvector");
+    for a in 0..num_loc_row {
+        let src_off = (row_dim.start + a) * num_basis;
+        let dst_off = a * num_basis;
+        eigvec_row_data[dst_off..dst_off + num_basis]
+            .copy_from_slice(&eigvec_src[src_off..src_off + num_basis]);
+    }
+    let eigvec_row = MatrixFull::from_vec([num_basis, num_loc_row], eigvec_row_data).unwrap();
+
+    let mut rimo = RIFull::new([num_auxbs, num_loc_row, num_loc_col], 0.0);
+    let (sender, receiver) = channel();
+
+    rimatr_chunk.data_ref().unwrap().par_chunks_exact(num_bpair).enumerate().for_each_with(sender, |s, (i_auxbs, m)| {
+
+        omp_set_num_threads_wrapper(1);
+
+        let mut reduced_ri = MatrixFull::new([num_basis, num_basis], 0.0_f64);
+        reduced_ri.iter_matrixupper_mut().unwrap().zip(m.iter()).for_each(|(to, from)| {*to = *from});
+
+        // M2: dsymm with the sliced bra block, [nao, |row|]
+        let mut tmp_mat = MatrixFull::new([num_basis, num_loc_row], 0.0_f64);
+        _dsymm(&reduced_ri, &eigvec_row, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
+
+        // out[a, i] = sum_u tmp_mat[u, a] * eigenvector[u, i]
+        let mut loc_ri3mo = MatrixFull::new([num_loc_row, num_loc_col], 0.0_f64);
+        _dgemm(
+            &tmp_mat, ((0..num_basis), (0..num_loc_row)), 'T',
+            eigenvector, ((0..num_basis), column_dim.clone()), 'N',
+            &mut loc_ri3mo, ((0..num_loc_row), (0..num_loc_col)),
+            1.0, 0.0
+        );
+        s.send((loc_ri3mo, i_auxbs)).unwrap()
+    });
+    receiver.into_iter().for_each(|(loc_ri3mo, i_auxbs)| {
+        rimo.copy_from_matr(0..num_loc_row, 0..num_loc_col, i_auxbs, 2, &loc_ri3mo, 0..num_loc_row, 0..num_loc_col)
+    });
+
+    omp_set_num_threads_wrapper(default_omp_num_threads);
+
+    Ok((rimo, row_dim, column_dim))
+}
+
 pub fn diagonalize_hamiltonian_outside(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> ([MatrixFull<f64>;2], [Vec<f64>;2], usize) {
     let mut eigenvectors = [MatrixFull::empty(),MatrixFull::empty()];
     let mut eigenvalues = [Vec::new(),Vec::new()];
@@ -4854,6 +5042,47 @@ pub fn diagonalize_hamiltonian_distributed_check(scf_data: &SCF, mpi_operator: &
 }
 
 #[cfg(feature = "scalapack")]
+
+/// 广义本征问题 A·X = B·X·Λ 的相对残差 ‖A·X − B·X·Λ‖_F / (‖A‖_F·‖X‖_F 尺度)。
+/// 仅用上三角输入（按对称填充下三角后运算）；X 为列本征矢、w 为对角本征值。
+/// 用于分布式求解器的静默质量门：pdsygvx 对小/病态体系（ECP）可能 info=0 却给出
+/// 漂移的解（同输入多次运行能量/轨道不同），此检查在 rank 间数据一致时给出全局一致的
+/// 回退判据。
+#[cfg(feature = "scalapack")]
+fn generalized_residual_upper(
+    matr_a: &rest_tensors::MatrixUpper<f64>,
+    matr_b: &rest_tensors::MatrixUpper<f64>,
+    z: &rest_tensors::MatrixFull<f64>,
+    w: &Vec<f64>,
+) -> f64 {
+    use tensors::{MathMatrix, ParMathMatrix};
+    let n = z.size()[0];
+    let ncol = z.size()[1].min(w.len());
+    let mut a = rest_tensors::MatrixFull::new([n, n], 0.0);
+    a.iter_matrixupper_mut().unwrap().zip(matr_a.data_ref().unwrap()).for_each(|(to, from)| { *to = *from; });
+    a.fill_lower_part_from_upper_unsafe();
+    let mut b = rest_tensors::MatrixFull::new([n, n], 0.0);
+    b.iter_matrixupper_mut().unwrap().zip(matr_b.data_ref().unwrap()).for_each(|(to, from)| { *to = *from; });
+    b.fill_lower_part_from_upper_unsafe();
+    // az = A·Z ; bz = B·Z ; then subtract column k scaled by w[k]
+    let mut az = rest_tensors::MatrixFull::new([n, ncol], 0.0);
+    let mut bz = rest_tensors::MatrixFull::new([n, ncol], 0.0);
+    tensors::matrix_blas_lapack::_dgemm(&a, (0..n, 0..n), 'N', z, (0..n, 0..ncol), 'N', &mut az, (0..n, 0..ncol), 1.0, 0.0);
+    tensors::matrix_blas_lapack::_dgemm(&b, (0..n, 0..n), 'N', z, (0..n, 0..ncol), 'N', &mut bz, (0..n, 0..ncol), 1.0, 0.0);
+    let mut denom = 0.0_f64;
+    let mut num = 0.0_f64;
+    for k in 0..ncol {
+        let wk = w[k];
+        for i in 0..n {
+            let res = az.data[k * n + i] - wk * bz.data[k * n + i];
+            num += res * res;
+            denom += az.data[k * n + i] * az.data[k * n + i];
+        }
+    }
+    (num / denom.max(1e-300)).sqrt()
+}
+
+#[cfg(feature = "scalapack")]
 pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) -> ([MatrixFull<f64>;2], [Vec<f64>;2], usize) {
 
     #[cfg(not(feature = "mpi"))]
@@ -4861,6 +5090,7 @@ pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option
 
     #[cfg(feature = "mpi")]
     if let Some(mpi_io) = mpi_operator {
+        use mpi::traits::*;
         let spin_channel = scf_data.mol.spin_channel;
         let mut num_state = scf_data.mol.num_state;
         let mut eigenvectors = [MatrixFull::empty(),MatrixFull::empty()];
@@ -4872,34 +5102,62 @@ pub fn diagonalize_hamiltonian_distributed(scf_data: &SCF, mpi_operator: &Option
         match scf_data.scftype {
             SCFType::RHF | SCFType::UHF => {
                 for i_spin in (0..spin_channel) {
-                    match _hamiltonian_distributed_solver(&scf_data.hamiltonian[i_spin], &scf_data.ovlp, &mut num_state, grid, world) {
-                        Some((eigenvector_spin, eigenvalue_spin)) => {
-                            eigenvectors[i_spin] = eigenvector_spin;
-                            eigenvalues[i_spin] = eigenvalue_spin;
-                        }
-                        None => {
-                            // distributed solve failed (e.g. non-convergence for small
-                            // / ill-conditioned systems); fall back to the serial solver.
-                            println!("WARNING: distributed (ScaLAPACK) Hamiltonian solver failed; falling back to the serial solver.");
-                            (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
-                            return (eigenvectors, eigenvalues, num_state);
-                        }
-                    }
-                }
-            },
-            SCFType::ROHF => {
-                // diagonalize Roothaan Fock matrix
-                match _hamiltonian_distributed_solver(scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp, &mut num_state, grid, world) {
-                    Some((eigenvector, eigenvalue)) => {
-                        eigenvectors[0] = eigenvector;
-                        eigenvalues[0] = eigenvalue;
-                    }
-                    None => {
-                        println!("WARNING: distributed (ScaLAPACK) Hamiltonian solver failed; falling back to the serial solver.");
+                    // ---- 首选：pdsyevd 反变换求解器 ----
+                    // 通过 S^{-1/2} A S^{-1/2} 变换后用 pdsyevd（分治法）求标准本征
+                    // 问题，数值质量（残差 ~1e-14~1e-15）远优于 pdsygvx（~5e-10）。
+                    // ScaLAPACK 的 info 失败时只在属主进程非零，故"求解器失败"判定
+                    // 必须做**全局逻辑 AND**——否则部分 rank 回退、其余继续 → 下一次
+                    // 集体操作死锁（opt 任务多次 force 求值下间歇挂起的根因）。
+                    let mut num_state_inv = scf_data.mol.num_state;
+                    let solver_result = _hamiltonian_distributed_solver_inv(
+                        &scf_data.hamiltonian[i_spin], &scf_data.ovlp, &mut num_state_inv, grid, world);
+                    let ok_local = solver_result.is_some();
+                    let mut ok_global = false;
+                    world.any_process().all_reduce_into(&ok_local, &mut ok_global, &SystemOperation::logical_and());
+                    if !ok_global {
+                        println!("WARNING: pdsyevd inverse solver failed on some rank (spin {}); all ranks fall back to serial.", i_spin);
                         (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
                         return (eigenvectors, eigenvalues, num_state);
                     }
+                    let (eigenvector_spin, eigenvalue_spin) = solver_result.unwrap();
+                    let n_dim = eigenvector_spin.size()[0];
+                    let res_inv = if n_dim <= 4096 { generalized_residual_upper(
+                            &scf_data.hamiltonian[i_spin], &scf_data.ovlp,
+                            &eigenvector_spin, &eigenvalue_spin) } else { 0.0 };
+                    if n_dim <= 4096 && res_inv > 1.0e-10 {
+                        println!("WARNING: pdsyevd inverse solver quality gate failed (spin {}, residual {:.3e}); falling back to serial.", i_spin, res_inv);
+                        (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
+                        return (eigenvectors, eigenvalues, num_state);
+                    }
+                    eigenvectors[i_spin] = eigenvector_spin;
+                    eigenvalues[i_spin] = eigenvalue_spin;
                 }
+            },
+            SCFType::ROHF => {
+                // ---- 首选：pdsyevd 反变换（同 RHF/UHF；失败判定全局 AND 防分歧死锁）----
+                let mut num_state_inv = scf_data.mol.num_state;
+                let solver_result = _hamiltonian_distributed_solver_inv(
+                    scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp, &mut num_state_inv, grid, world);
+                let ok_local = solver_result.is_some();
+                let mut ok_global = false;
+                world.any_process().all_reduce_into(&ok_local, &mut ok_global, &SystemOperation::logical_and());
+                if !ok_global {
+                    println!("WARNING: pdsyevd inverse solver failed on some rank (ROHF); all ranks fall back to serial.");
+                    (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
+                    return (eigenvectors, eigenvalues, num_state);
+                }
+                let (eigenvector, eigenvalue) = solver_result.unwrap();
+                let n_dim = eigenvector.size()[0];
+                let res_inv = if n_dim <= 4096 { generalized_residual_upper(
+                        scf_data.roothaan_hamiltonian.as_ref().unwrap(), &scf_data.ovlp,
+                        &eigenvector, &eigenvalue) } else { 0.0 };
+                if n_dim <= 4096 && res_inv > 1.0e-10 {
+                    println!("WARNING: pdsyevd inverse solver quality gate failed (ROHF, residual {:.3e}); falling back to serial.", res_inv);
+                    (eigenvectors, eigenvalues, num_state) = diagonalize_hamiltonian_outside(scf_data, mpi_operator);
+                    return (eigenvectors, eigenvalues, num_state);
+                }
+                eigenvectors[0] = eigenvector;
+                eigenvalues[0] = eigenvalue;
             }
         };
         (eigenvectors, eigenvalues, num_state)
@@ -5219,7 +5477,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     // build below is already solvent-consistent (chkfile restart converges in
     // few iterations; also fixes the noiter path where solvent_scf stayed None)
     if scf_data.mol.ctrl.solvent_enabled {
-        scf_data.refresh_solvent();
+        scf_data.refresh_solvent_with_mpi(mpi_operator);
     }
     scf_data.generate_hf_hamiltonian(mpi_operator);
     scf_data.grad_dm = scf_data.get_grad_dm();
@@ -5315,7 +5573,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
 
         let dt_solv0 = time::Local::now();
         if scf_data.mol.ctrl.solvent_enabled {
-            scf_data.refresh_solvent();
+            scf_data.refresh_solvent_with_mpi(mpi_operator);
         }
         let dt_solv1 = time::Local::now();
 

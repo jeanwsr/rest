@@ -7,6 +7,17 @@
 use crate::scf_io::SCF;
 use crate::hessian::memory_monitor;
 
+/// Guard for optional CPU-monitor instrumentation.
+macro_rules! cpu_section {
+    ($mon:expr, $label:expr) => {
+        let _guard = if let Some(ref m) = $mon {
+            Some(m.section($label))
+        } else {
+            None::<crate::hessian::cpu_monitor::CpuSection<'_>>
+        };
+    };
+}
+
 /// Add the RKS XC contribution (vxc_diag + vxc_deriv2) to the electronic
 /// Hessian partial `h_partial` (column-major, n3*n3, modified in place).
 ///
@@ -23,6 +34,36 @@ pub fn add_vxc_h_partial(
     timings: &mut Vec<(&'static str, std::time::Duration)>,
 ) {
     let _t_rks_xc = std::time::Instant::now();
+
+    // ── Optional CPU-monitor instrumentation ──
+    let _cpu_mon = if std::env::var("REST_EJ_EK_CPU_TRACE").as_deref() == Ok("1") {
+        let mon = crate::hessian::cpu_monitor::CpuMonitor::default_period();
+        let tr = crate::hessian::cpu_monitor::ThreadReport::collect();
+        tr.print("add_vxc_h_partial");
+
+        // Show grid parallelism plan
+        if let Some(ref grids) = scf.grids {
+            let block_ranges: &[std::ops::Range<usize>] = &grids.parallel_balancing;
+            let nao_diag = scf.mol.num_basis;
+            let (sub_blocks, concurrency, sub_nb) =
+                crate::hessian::xc_hessian::plan_grid_split(block_ranges, nao_diag, 20);
+            let n_sub = if sub_nb > 0 { sub_blocks.len() } else { block_ranges.len() };
+            let sub_info = if sub_nb > 0 {
+                format!("| {} sub-blocks (max {} pts each)", n_sub, sub_nb)
+            } else {
+                format!("| {} blocks", block_ranges.len())
+            };
+            println!(
+                "  [cpu] grid plan: adaptive {} | concurrency = {} | {} ngrid | rayon {} threads",
+                sub_info, concurrency, grids.coordinates.len(),
+                rayon::current_num_threads()
+            );
+        }
+        println!("  [cpu] RKS XC h_partial instrumentation active\n");
+        Some(mon)
+    } else {
+        None
+    };
     let mol_rks = &scf.mol;
     let nao_xc = mol_rks.num_basis;
     let natm_xc = mol_rks.geom.nfree;
@@ -35,6 +76,17 @@ pub fn add_vxc_h_partial(
     let aoslices_xc = crate::hessian::xc_hessian::build_aoslices(mol_rks);
     let dm0_xc = &scf.density_matrix[0];
 
+    // ── Optional grid block diagnostics ──
+    if _cpu_mon.is_some() {
+        if let Some(ref grids) = scf.grids {
+            let nblocks = grids.parallel_balancing.len();
+            let nactive = grids.parallel_balancing.iter()
+                .filter(|r| r.end > r.start).count();
+            println!("  [cpu] grid blocks: {} total, {} non-empty, {} ngrid",
+                nblocks, nactive, grids.coordinates.len());
+        }
+    }
+
     // Return freed Phase 1-4 memory to OS before the DFT grid sweep.
     memory_monitor::trim_to_os(scf.mol.ctrl.print_level);
 
@@ -42,51 +94,63 @@ pub fn add_vxc_h_partial(
     let _t_diag = std::time::Instant::now();
     // Phase 2: streaming mode — process grid blocks in small concurrent
     // batches instead of collecting all AO data in a cache. Peak AO
-    // memory ≈ grid_concurrency() × per_block_size instead of
-    // num_blocks × per_block_size.
-    let vxc_diag_mat = crate::hessian::xc_hessian::vxc_diag_streaming(scf, xc_type);
-    for ia in 0..natm_xc {
-        let (p0, p1) = aoslices_xc[ia];
-        for a in 0..3 { for b in 0..3 {
-            let row0 = (a * 3 + b) * nao_xc;
-            let mut s = 0.0;
-            for mu in p0..p1 { for nu in 0..nao_xc {
-                s += vxc_diag_mat[[row0 + mu, nu]] * dm0_xc[[mu, nu]];
+    // memory stays bounded by the adaptive grid split plan.
+    {
+        cpu_section!(_cpu_mon, "rks:vxc_diag:grid");
+        let vxc_diag_mat = crate::hessian::xc_hessian::vxc_diag_streaming(scf, xc_type);
+        cpu_section!(_cpu_mon, "rks:vxc_diag:scatter");
+        for ia in 0..natm_xc {
+            let (p0, p1) = aoslices_xc[ia];
+            for a in 0..3 { for b in 0..3 {
+                let row0 = (a * 3 + b) * nao_xc;
+                let mut s = 0.0;
+                for mu in p0..p1 { for nu in 0..nao_xc {
+                    s += vxc_diag_mat[[row0 + mu, nu]] * dm0_xc[[mu, nu]];
+                }}
+                h_partial[(ia * 3 + a) * n3_xc + (ia * 3 + b)] += s * 2.0;
             }}
-            h_partial[(ia * 3 + a) * n3_xc + (ia * 3 + b)] += s * 2.0;
-        }}
+        }
+        timings.push(("  rks: vxc_diag", _t_diag.elapsed()));
+        drop(vxc_diag_mat);
     }
-    timings.push(("  rks: vxc_diag", _t_diag.elapsed()));
-    // Free vxc_diag intermediates before the heavier vxc_deriv2 sweep.
-    drop(vxc_diag_mat);
     memory_monitor::trim_to_os(scf.mol.ctrl.print_level);
 
     // vxc_deriv2 (per-atom, symmetrized) — streaming with deriv=2.
     let _t_d2 = std::time::Instant::now();
-    let vxc_d2 = crate::hessian::xc_hessian::vxc_deriv2_streaming(scf, xc_type);
-    for ia in 0..natm_xc {
-        for ja in 0..=ia {
-            let (q0, q1) = aoslices_xc[ja];
-            for a in 0..3 { for b in 0..3 {
-                let row0 = (a * 3 + b) * nao_xc;
-                let mut s = 0.0;
-                for mu in q0..q1 { for nu in 0..nao_xc {
-                    s += vxc_d2[ia][[row0 + mu, nu]] * dm0_xc[[mu, nu]];
+    {
+        cpu_section!(_cpu_mon, "rks:vxc_d2:grid");
+        let vxc_d2 = crate::hessian::xc_hessian::vxc_deriv2_streaming(scf, xc_type);
+        cpu_section!(_cpu_mon, "rks:vxc_d2:scatter");
+        for ia in 0..natm_xc {
+            for ja in 0..=ia {
+                let (q0, q1) = aoslices_xc[ja];
+                for a in 0..3 { for b in 0..3 {
+                    let row0 = (a * 3 + b) * nao_xc;
+                    let mut s = 0.0;
+                    for mu in q0..q1 { for nu in 0..nao_xc {
+                        s += vxc_d2[ia][[row0 + mu, nu]] * dm0_xc[[mu, nu]];
+                    }}
+                    h_partial[(ia * 3 + a) * n3_xc + (ja * 3 + b)] += s * 2.0;
                 }}
-                h_partial[(ia * 3 + a) * n3_xc + (ja * 3 + b)] += s * 2.0;
-            }}
+            }
         }
-    }
-    for ia in 0..natm_xc {
-        for ja in 0..ia {
-            for a in 0..3 { for b in 0..3 {
-                h_partial[(ja * 3 + b) * n3_xc + (ia * 3 + a)] =
-                    h_partial[(ia * 3 + a) * n3_xc + (ja * 3 + b)];
-            }}
+        for ia in 0..natm_xc {
+            for ja in 0..ia {
+                for a in 0..3 { for b in 0..3 {
+                    h_partial[(ja * 3 + b) * n3_xc + (ia * 3 + a)] =
+                        h_partial[(ia * 3 + a) * n3_xc + (ja * 3 + b)];
+                }}
+            }
         }
+        timings.push(("  rks: vxc_deriv2", _t_d2.elapsed()));
+        drop(vxc_d2);
     }
 
-    timings.push(("  rks: vxc_deriv2", _t_d2.elapsed()));
+    // ── CPU monitor final report ──
+    if let Some(ref mon) = _cpu_mon {
+        mon.report();
+    }
+
     timings.push(("  rks: xc_add", _t_rks_xc.elapsed()));
 }
 
@@ -118,7 +182,7 @@ pub fn compute_vxc_h1ao(scf: &SCF) -> Vec<Vec<f64>> {
 //   3. twice after fxc-heavy phases   → `record_fxc_*_timings`
 //
 // The genuinely entangled bit — threading `fxc_cache_ref` (None for HF,
-// Some(cache) for RKS) into the shared Krylov/dense solve calls — stays
+// Some(cache) for RKS) into the shared batched Krylov solve — stays
 // in rhf.rs because extracting it would require restructuring the entire
 // solve phase, which violates the "leave RHF-shared solve logic untouched"
 // constraint. HF passing `None` is benign and does not branch on RKS-ness.
@@ -180,7 +244,7 @@ pub fn add_fxc_to_v_ao(
 /// Record the post-solve-phase fxc timings into the caller's timing profile.
 ///
 /// Mirrors the inline block that previously lived in `calc_cphf_contrib`
-/// after the Krylov/dense solve: the `cphf: fxc_solve` total plus the
+/// after the Krylov solve: the `cphf: fxc_solve` total plus the
 /// detailed per-subcomponent breakdown (matches PySCF `nr_rks_fxc` internals).
 /// `cache_elapsed` is the wall-clock time spent building the cache (returned
 /// by the caller from around its `prepare_fxc_cache` call).

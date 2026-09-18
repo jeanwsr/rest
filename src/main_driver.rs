@@ -72,6 +72,7 @@ pub fn main_driver() -> anyhow::Result<()> {
     // `log` macros, whose stdout target is not print_level-gated) are unconditional.
     // As a blanket fix, redirect the standard output of all non-root ranks to /dev/null;
     // stderr is intentionally kept so that warnings and MPI runtime errors remain visible.
+    #[cfg(feature = "mpi")]
     if let Some(mpi_op) = &mpi_operator {
         if mpi_op.rank != 0 {
             use std::os::unix::io::AsRawFd;
@@ -89,7 +90,8 @@ pub fn main_driver() -> anyhow::Result<()> {
     if ! PathBuf::from(ctrl_file.clone()).is_file() {
         panic!("Input file ({:}) does not exist", ctrl_file);
     }
-    let mut mol = Molecule::build(ctrl_file, mpi_data)?;
+    let mut mol = Molecule::build(ctrl_file.clone(), mpi_data)?;
+    mol.ctrl.ctrl_file = ctrl_file;
     if mol.ctrl.print_level>0 {println!("Molecule_name: {}", &mol.geom.name)};
     if mol.ctrl.print_level>=2 {
         println!("{}", mol.ctrl.formated_output_in_toml());
@@ -368,8 +370,11 @@ pub fn main_driver() -> anyhow::Result<()> {
     if let Some(qp_ctrl)=scf_data.mol.ctrl.quasiparticle_methods.clone(){
         print!("Now starts quasiparticle method computation!\n");
         let qp_output = quasiparticle_methods(&mut scf_data,&mpi_operator);
-        if let Some(e1) = qp_output.first_excitation {
-            json_extra.insert("bse".to_string(), json!({ "first_excitation": e1 }));
+        if qp_output.first_excitation.is_some() || !qp_output.excitation_energies.is_empty() {
+            json_extra.insert("bse".to_string(), json!({
+                "first_excitation": qp_output.first_excitation,
+                "excitation_energies": qp_output.excitation_energies,
+            }));
         }
     }
 
@@ -390,6 +395,8 @@ pub fn main_driver() -> anyhow::Result<()> {
                         "energies": output.energies,
                         "osc": output.osc,
                     }));
+                    // Keep the raw eigenvectors for the TDDFT analytic gradient.
+                    scf_data.tddft_excitations = Some(output.excitations.clone());
                 }
                 Err(e) => eprintln!("Error in TDDFT calculation: {}", e),
             }
@@ -433,18 +440,13 @@ pub fn main_driver() -> anyhow::Result<()> {
     if !scf_data.mol.ctrl.analdrv_tasks.is_empty() {
         time_mark.new_item("AnalDrv", "analytical derivative module");
         time_mark.count_start("AnalDrv");
-        use crate::analdrv::interface::analdrv_interface;
-        let tasks = &scf_data.mol.ctrl.analdrv_tasks;
+        use crate::analdrv::interface::{analdrv_interface, analdrv_json_interface};
+        let tasks = scf_data.mol.ctrl.analdrv_tasks.clone();
         let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
-        if let Some(anal_output) = analdrv_interface(&scf_data, tasks, &config) {
-            json_extra.insert("analdrv".to_string(), json!({
-                "frequencies_cm": anal_output.frequencies_cm,
-                "modes_trv": anal_output.modes_trv,
-            }));
-            if let Some(th) = anal_output.thermo {
-                json_extra.insert("thermo".to_string(), json!(th));
-            }
-        }
+        // the results-JSON expansion (the "analdrv"/"thermo" entries) is returned by
+        // analdrv_json_interface, so this driver holds no task-specific knowledge
+        let analdrv_out = analdrv_interface(&mut scf_data, &tasks, &config);
+        json_extra.extend(analdrv_json_interface(&analdrv_out));
         time_mark.count("AnalDrv");
     }
 
@@ -564,6 +566,9 @@ pub fn performance_essential_calculations(scf_data: &mut SCF, time_mark: &mut ut
     scf_without_build(scf_data, mpi_operator);
     //println!("debug time mark SCF turn off");
     time_mark.count("SCF");
+    if scf_data.mol.ctrl.max_memory_backup.is_some() {
+        scf_data.mol.ctrl.max_memory = scf_data.mol.ctrl.max_memory_backup.clone();
+    }
 
     //==================================================================
     // Save the converged SCF results to the chkfile
@@ -795,6 +800,50 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
             if scf_data.mol.ctrl.print_level > 1 {
                 println!("Gradient contribution from {:} [a.u.]:", grad_name);
                 println!("{}", formated_force(&grad_contrib, &scf_data.mol.geom.elem));
+            }
+        }
+
+        // TDDFT analytic-gradient response for the requested excited state.
+        if let Some(tddft_ctrl) = scf_data.mol.ctrl.tddft.clone() {
+            if tddft_ctrl.tddft_grad_state > 0 {
+                let state = tddft_ctrl.tddft_grad_state;
+                if scf_data.mol.spin_channel == 2 {
+                    panic!("TDDFT analytic gradient currently supports only spin-restricted references (spin_polarization = false)");
+                }
+                let exc = scf_data
+                    .tddft_excitations
+                    .as_ref()
+                    .expect("tddft_grad_state > 0 requires a TDDFT calculation to have run first");
+                assert!(
+                    state <= exc.len(),
+                    "tddft_grad_state = {} exceeds the {} computed TDDFT states",
+                    state,
+                    exc.len()
+                );
+                let raw = &exc[state - 1].1;
+                let tda = tddft_ctrl.tddft_method.eq_ignore_ascii_case("tda");
+                let singlet = tddft_ctrl.restricted_spin() != "triplet";
+                let norm = crate::ri_bse::dipoles::normalize(raw, tda);
+                let (x, y) = if tda {
+                    (norm, vec![0.0; raw.len()])
+                } else {
+                    let dim = raw.len() / 2;
+                    (norm[..dim].to_vec(), norm[dim..].to_vec())
+                };
+                let engine = crate::ri_tddft::TddftGradEngine::new(
+                    &scf_data, state, singlet, tda, x, y,
+                );
+                let response = engine.response_gradient();
+                gradient
+                    .data
+                    .iter_mut()
+                    .zip(response.data.iter())
+                    .for_each(|(to, from)| *to += from);
+                println!(
+                    "Gradient contribution from TDDFT state {} [a.u.]:",
+                    state
+                );
+                println!("{}", formated_force(&response, &scf_data.mol.geom.elem));
             }
         }
 
@@ -1159,11 +1208,20 @@ mod geometric_pyo3_impl {
                     crate::hessian::compute_hessian(&*scf_data)
                         .expect("Analytical Hessian computation failed for geometry optimization")
                 } else {
-                    use crate::analdrv::interface::hess_interface;
+                    use crate::analdrv::hessian::hess_interface;
+                    use crate::analdrv::response::rresp_interface::rscf_resp_interface;
                     use rstsr::prelude::*;
-                    
+
                     let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
-                    let (hess_raw, _, _) = hess_interface(&scf_data, &config);
+                    // shared RHF response object for the hessian.
+                    // UHF builds its own internally, and will implement the UHF response interface in the future.
+                    let mut resp_objs = if matches!(scf_data.scftype, crate::scf_io::SCFType::RHF) {
+                        Some(rscf_resp_interface(&scf_data, &config))
+                    } else {
+                        None
+                    };
+                    let hess_out = hess_interface(&scf_data, &config, resp_objs.as_mut());
+                    let hess_raw = hess_out.hessian;
                     let natm = (hess_raw.len() / 9).isqrt();
                     assert!(natm * natm * 9 == hess_raw.len(), "Hessian raw data length does not match expected size for {} atoms", natm);
                     let device = DeviceBLAS::default();

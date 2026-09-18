@@ -487,6 +487,7 @@ where
         let start = Instant::now();
         iter_num += 1;
         let m = ss.size[1];
+        let restart = ss.size[1] > config.max_subspace.saturating_sub(config.add_dim);
         // Batched application of A to the whole subspace block.
         let a_ss = a_matvec_block(&ss);
         debug!("m={}", m);
@@ -758,6 +759,14 @@ where
         }
         if iter_num > config.max_iter {
             break;
+        }
+        if restart {
+            debug!("Explicit LR restart: subspace {} -> restart_dim {}", ss.size[1], config.restart_dim);
+            ss = MatrixFull::new([xlen, 0], 0.0);
+            xpy_full
+                .iter_columns_full()
+                .take(config.restart_dim)
+                .for_each(|xi| ss.push_column(xi));
         }
         left_residues.iter_columns_full().enumerate().for_each(|(i, residue)| {
             let mut preconditioned: Vec<f64> = residue

@@ -7,13 +7,15 @@
 /// For HF: vind(dm1) = J[dm1] - 0.5*K[dm1]
 /// For DFT: vind(dm1) = fxc[dm1] + J[dm1] - hyb*K[dm1]
 
-use rest_tensors::{MatrixFull, MatrixUpper};
-use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
+use rest_tensors::{MatrixFull, MatrixFullSlice, MatrixUpper, RIFull};
+use rest_tensors::matrix::matrix_blas_lapack::{
+    _dgemm_full, _dsymm, omp_get_num_threads_wrapper, omp_set_num_threads_wrapper,
+};
 use crate::scf_io::{SCF, SCFType};
-use crate::dft::num_int::{prepare_fxc_data, fxc_matvec_old,
-    eval_ao_batch, eval_rho5_batch};
+use crate::dft::num_int::{prepare_fxc_data, fxc_matvec_old, eval_rho5_batch};
 use crate::dft::libxc_itrf::eval_xc_eff;
 use crate::dft::xc_deriv::XCType;
+use rest_libcint::prelude::CInt;
 use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
 
 /// Global cumulative timing of compute_fxc_response_ao calls, in ns.
@@ -120,19 +122,35 @@ pub(crate) fn compute_k_upper(
 // ============================================================================
 // PySCF-style fxc kernel caching for Hessian CP-HF
 //
-// Mirrors `cache_xc_kernel` + `nr_rks_fxc(fxc=...)` in PySCF: all
-// ground-state-dependent quantities (AO values on grid, ρ₀, fxc kernel
-// evaluated at ρ₀) are computed ONCE and reused across every CP-HF matvec.
-// Only ρ₁ and the final contraction depend on dm1 and are computed per call.
+// Mirrors `cache_xc_kernel` + `nr_rks_fxc(fxc=...)` in PySCF: the
+// ground-state-dependent quantities (ρ₀ and the fxc kernel evaluated at ρ₀)
+// are computed ONCE and reused across every CP-HF matvec.  Only ρ₁ and the
+// final contraction depend on dm1 and are computed per call.
+//
+// Memory policy (2026 refactor): the *fxc kernel* (ngrids × nvar² doubles) is
+// always kept — it is small (28 MB for 220k grids) and expensive to re-evaluate
+// (a libxc `deriv=2` call).  The *AO tables* (nao × ngrids × nderiv doubles) are
+// the dominant term (1.27 GB for nao=180, ngrids=219212) and are **only kept
+// when the declared memory budget still has room for them**; otherwise each
+// matvec re-evaluates the AO for the block it is working on with libcint
+// (`eval_ao_batch_libcint`, 5-6x faster than the legacy path).  The old
+// behaviour — always keep the whole grid's AO — can be restored with
+// `REST_FXC_CACHE_MB=<mb>`.
 // ============================================================================
 
 /// Cached ground-state data for one grid block.
 pub struct FxcBlock {
     pub nb: usize,
+    /// Grid range of this block inside the global grid (for on-demand AO
+    /// re-evaluation and for progress diagnostics).
+    pub g0: usize,
+    pub g1: usize,
     pub weights: Vec<f64>,
-    /// AO values + derivatives on this block; one [nao, nb] matrix per
-    /// derivative component (0=ao, 1=ao_x, 2=ao_y, 3=ao_z for GGA).
-    pub ao_d: Vec<MatrixFull<f64>>,
+    /// AO values + derivatives on this block when the budget allowed caching
+    /// them: flat `[nao, nb, nderiv]`, component `c` at `c*nao*nb` (the
+    /// `eval_ao_batch` / `eval_ao_batch_libcint` layout).  `None` means the AO
+    /// is re-evaluated on demand for every matvec.
+    pub ao: Option<Vec<f64>>,
     /// fxc kernel for this block, layout `fxc_raw[g + x*nb + y*nvar*nb]`
     /// (= fxc[x,y,g] in column-major), already × weight baked out.
     /// Length: nb * nvar * nvar.
@@ -141,22 +159,122 @@ pub struct FxcBlock {
 
 /// PySCF `cache_xc_kernel` analog for the RKS Hessian fxc response.
 ///
-/// Built once per Hessian calculation by `prepare_fxc_hessian_cache`, then
-/// passed (by reference) to every `compute_fxc_response_ao_cached` call
-/// inside the CP-HF Krylov loop. This avoids re-evaluating AO basis, ρ₀,
-/// and the libxc fxc kernel on each matvec.
+/// Built once per Hessian/TDDFT-gradient calculation by
+/// `prepare_fxc_hessian_cache`, then passed (by reference) to every
+/// `compute_fxc_response_ao_cached` call inside the CP-HF Krylov loop.  This
+/// avoids re-evaluating ρ₀ and the libxc fxc kernel on each matvec; whether the
+/// AO tables are also cached is decided by the memory budget (see the module
+/// comment above).
 pub struct FxcHessianCache {
     pub nao: usize,
-    pub nvar: usize,       // 1 (LDA) or 4 (GGA)
+    pub nvar: usize,
+    /// number of AO derivative components (1 for LDA, 4 for GGA)
+    pub nderiv: usize,
+    /// AO derivative *order* handed to the AO evaluator (0 for LDA, 1 for GGA)
+    pub ao_deriv: usize,
     pub blocks: Vec<FxcBlock>,
+    /// AO bytes actually kept resident / AO bytes the whole grid would need.
+    pub ao_cached_bytes: usize,
+    pub ao_total_bytes: usize,
+    /// libcint handle + grid coordinates, used to re-evaluate the AO of blocks
+    /// that are not cached.
+    cint: CInt,
+    coords: Vec<[f64; 3]>,
 }
 
+/// One block's AO buffer plus its memory layout.
+///
+/// * `native = false`: `RIFull` layout, component `c` is `[nao, nb]` column-major
+///   (`eval_ao_batch_libcint`); this is what the resident cache stores.
+/// * `native = true`: raw libcint layout, component `c` is `[nb, nao]`
+///   column-major (`eval_ao_batch_libcint_native`); no transpose is paid.
+#[derive(Clone, Copy)]
+struct BlockAo<'a> {
+    data: &'a [f64],
+    native: bool,
+}
+
+impl FxcHessianCache {
+    /// AO buffer for one block: the cached copy when present, otherwise a
+    /// freshly evaluated one — in libcint's own layout, so that the on-demand
+    /// path pays neither the transpose nor its extra buffer.  The caller owns
+    /// `scratch` for the fallback case.
+    fn ao_of<'s>(&self, block: &'s FxcBlock, scratch: &'s mut Vec<f64>) -> BlockAo<'s> {
+        if let Some(ao) = block.ao.as_ref() {
+            return BlockAo { data: ao, native: false };
+        }
+        *scratch = crate::dft::num_int::eval_ao_batch_libcint_native(
+            &self.cint,
+            self.nao,
+            &self.coords[block.g0..block.g1],
+            self.ao_deriv,
+        );
+        BlockAo { data: scratch, native: true }
+    }
+}
+
+/// Grid points per fxc-cache block.
+///
+/// One block's working set during a matvec is the AO evaluator's buffer plus
+/// the `[nao, nb]` AO, `c0` and `aow` arrays — about `8*nao*(2*nderiv + 2)`
+/// bytes per grid point (the factor 2 on `nderiv` covers the evaluator's
+/// pre-transpose buffer).  The default budget is 128 MB, so no single block can
+/// dominate the peak; `REST_FXC_BLK_MB` overrides it (a larger block trades
+/// memory for a little less loop overhead, a smaller one the other way round).
+fn fxc_block_size(scf: &SCF, nao: usize, nderiv: usize, ngrids: usize) -> usize {
+    let mb = std::env::var("REST_FXC_BLK_MB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or_else(|| {
+            let max_memory = scf.mol.ctrl.max_memory.unwrap_or(2000.0);
+            (0.1 * max_memory).clamp(64.0, 512.0)
+        });
+    let per_grid = 8.0 * nao as f64 * (2 * nderiv + 2) as f64;
+    ((mb * 1.0e6 / per_grid) as usize).clamp(1024, ngrids.max(1))
+}
+
+/// Process high-water RSS (`VmHWM`) in MiB, 0 when unavailable.
+fn vmhwm_mb() -> f64 {
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                if let Some(kb) = rest.split_whitespace().next() {
+                    if let Ok(v) = kb.parse::<f64>() {
+                        return v / 1024.0;
+                    }
+                }
+            }
+        }
+    }
+    0.0
+}
+
+/// Bytes of AO tables the fxc cache may keep resident.
+///
+/// `max_memory` is REST's declared process budget; the AO cache is what is left
+/// of it after the resident set (SCF integrals, grids, the RI tensors), because
+/// keeping the AO is a *pure* time/memory trade: the same data can be
+/// re-evaluated per matvec with libcint for ~0.5 s per full-grid pass.
+/// `REST_FXC_CACHE_MB` (alias `REST_TDDFT_GRAD_FXCCACHE_MB`) overrides it.
+fn fxc_ao_cache_budget_bytes(scf: &SCF, needed: usize) -> usize {
+    let env_mb = std::env::var("REST_FXC_CACHE_MB")
+        .ok()
+        .or_else(|| std::env::var("REST_TDDFT_GRAD_FXCCACHE_MB").ok())
+        .and_then(|v| v.parse::<f64>().ok());
+    if let Some(mb) = env_mb {
+        return ((mb.max(0.0) * 1.0e6) as usize).min(needed);
+    }
+    let max_memory = scf.mol.ctrl.max_memory.unwrap_or(2000.0);
+    let used = crate::utilities::memory_batch::detect_used_memory_mb("proc");
+    let avail = ((max_memory - used).max(0.0) * 1.0e6) as usize;
+    avail.min(needed)
+}
 /// Build the Hessian fxc cache: iterates grid blocks once, evaluates AO +
 /// derivatives, ρ₀, and the fxc kernel via `eval_xc_eff(deriv=2)`.
 ///
-/// Matches the per-block work that the old `compute_fxc_response_ao` did on
-/// every call. After this function returns, no further AO/libxc evaluation
-/// is needed for the entire CP-HF phase.
+/// The fxc kernel is always kept; the AO tables are kept only as far as the
+/// memory budget allows (`fxc_ao_cache_budget_bytes`) — the remaining blocks
+/// re-evaluate their AO on demand inside `compute_fxc_response_ao_cached`.
 pub fn prepare_fxc_hessian_cache(scf: &SCF) -> FxcHessianCache {
     let _t = std::time::Instant::now();
     let mol = &scf.mol;
@@ -178,27 +296,37 @@ pub fn prepare_fxc_hessian_cache(scf: &SCF) -> FxcHessianCache {
     let ao_deriv = if nvar == 4 { 1 } else { 0 };
     let nderiv = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
 
+    let cint = crate::ri_jk::util::get_cint_mol(mol);
+    let coords = grids.coordinates.clone();
+    let ngrids = coords.len();
+    let ao_total_bytes = nao * ngrids * nderiv * 8;
+    let ao_budget_bytes = fxc_ao_cache_budget_bytes(scf, ao_total_bytes);
+
     // Ground-state density (ρ₀) is invariant across matvecs — evaluate once.
     let mo_vec = vec![scf.eigenvectors[0].clone()];
     let occ_vec = vec![scf.occupation[0].clone()];
 
+    // Grid blocking: the per-matvec workspace scales with the block size, and
+    // the block size used to be the SCF's `parallel_balancing` range — a single
+    // block covering the whole grid for a molecule of this size, i.e. ~3
+    // `[nao, nb]` arrays plus the AO evaluator's own buffer (several GB on
+    // naphthalene) alive for every matvec.  The block size is now chosen from a
+    // working-set budget instead; the number of blocks does not change the
+    // result (the per-block partial responses are summed).
+    let blksize = fxc_block_size(scf, nao, nderiv, ngrids);
     let mut blocks: Vec<FxcBlock> = Vec::new();
-    for block_range in &grids.parallel_balancing {
-        let start = block_range.start;
-        let end = block_range.end;
+    let mut ao_cached_bytes = 0usize;
+    let mut start = 0usize;
+    while start < ngrids {
+        let end = (start + blksize).min(ngrids);
         let nb = end - start;
-        if nb == 0 { continue; }
         let coords_block = &grids.coordinates[start..end];
         let weights_block = &grids.weights[start..end];
 
-        // AO + derivatives for this block
-        let ao = eval_ao_batch(mol, coords_block, ao_deriv, nb);
-        let ao_d: Vec<MatrixFull<f64>> = (0..nderiv)
-            .map(|d| {
-                let view = ao.get_reducing_matrix(d).unwrap();
-                MatrixFull::from_vec([nao, nb], view.iter().copied().collect()).unwrap()
-            })
-            .collect();
+        // AO + derivatives for this block (libcint; layout [nao, nb, nderiv],
+        // identical to `eval_ao_batch`, so it can be handed to the matvec
+        // without any repacking).
+        let ao = crate::dft::num_int::eval_ao_batch_libcint(&cint, nao, coords_block, ao_deriv, nb);
 
         // Ground-state ρ₀ → fxc kernel
         let rho_tensor = eval_rho5_batch(&ao, xc_type, &mo_vec, &occ_vec, 1, nb);
@@ -222,20 +350,51 @@ pub fn prepare_fxc_hessian_cache(scf: &SCF) -> FxcHessianCache {
             }
         }
 
+        // Keep the AO only while the budget lasts; blocks past it re-evaluate
+        // on demand (the data is identical, just recomputed per matvec).
+        let block_bytes = nao * nb * nderiv * 8;
+        let keep_ao = ao_cached_bytes + block_bytes <= ao_budget_bytes;
+        let ao_store = if keep_ao {
+            ao_cached_bytes += block_bytes;
+            Some(ao.data)
+        } else {
+            None
+        };
+
         blocks.push(FxcBlock {
             nb,
+            g0: start,
+            g1: end,
             weights: weights_block.to_vec(),
-            ao_d,
+            ao: ao_store,
             fxc_raw,
         });
+        start = end;
     }
 
-    println!("  FxcHessianCache prepared: nao={}, nvar={}, blocks={} ({} grids) in {:.3}s",
-             nao, nvar, blocks.len(),
-             blocks.iter().map(|b| b.nb).sum::<usize>(),
-             _t.elapsed().as_secs_f64());
+    println!(
+        "  FxcHessianCache prepared: nao={}, nvar={}, blocks={} ({} grids) in {:.3}s | AO resident {:.0}/{:.0} MB (budget {:.0} MB)",
+        nao,
+        nvar,
+        blocks.len(),
+        blocks.iter().map(|b| b.nb).sum::<usize>(),
+        _t.elapsed().as_secs_f64(),
+        ao_cached_bytes as f64 / 1.0e6,
+        ao_total_bytes as f64 / 1.0e6,
+        ao_budget_bytes as f64 / 1.0e6
+    );
 
-    FxcHessianCache { nao, nvar, blocks }
+    FxcHessianCache {
+        nao,
+        nvar,
+        nderiv,
+        ao_deriv,
+        blocks,
+        ao_cached_bytes,
+        ao_total_bytes,
+        cint,
+        coords,
+    }
 }
 
 /// AO-basis fxc response using a precomputed `FxcHessianCache`.
@@ -253,14 +412,23 @@ pub fn compute_fxc_response_ao_cached(
     let _t_fxc = std::time::Instant::now();
     let nao = cache.nao;
     let nvar = cache.nvar;
+    let saved_omp = omp_get_num_threads_wrapper();
 
     let vmat = cache.blocks.par_iter()
-        .map(|block| compute_fxc_response_block(block, dm1, nao, nvar))
+        .map(|block| {
+            // The per-block helper also sets OMP=1; doing it at the closure
+            // boundary makes the Rayon+BLAS contract explicit and local.
+            omp_set_num_threads_wrapper(1);
+            let mut scratch = Vec::new();
+            let ao = cache.ao_of(block, &mut scratch);
+            compute_fxc_response_block(block, ao, dm1, nao, nvar)
+        })
         .reduce(|| MatrixFull::new([nao, nao], 0.0), |mut a, b| {
             a += b.clone();
             a
         });
 
+    omp_set_num_threads_wrapper(saved_omp);
     FXC_TIMING_NS.fetch_add(_t_fxc.elapsed().as_nanos() as u64, AOrdering::Relaxed);
     vmat
 }
@@ -290,12 +458,25 @@ pub fn compute_fxc_response_ao_cached_batched(
     // Each parallel task processes one block, returning a flat Vec<f64> of
     // length n_rhs*nao*nao (one partial response per RHS, concatenated).
     // Reduce sums across blocks element-wise.
+    let saved_omp = omp_get_num_threads_wrapper();
     let summed: Vec<f64> = cache.blocks
         .par_iter()
         .map(|block| {
+            // The per-block helper also sets OMP=1; doing it at the closure
+            // boundary makes the Rayon+BLAS contract explicit and local.
+            omp_set_num_threads_wrapper(1);
+            let trace = std::env::var("REST_TDDFT_GRAD_MEM").is_ok();
+            let rss0 = if trace { crate::hessian::memory_monitor::current_rss_mb() } else { 0.0 };
+            let mut scratch = Vec::new();
+            let ao = cache.ao_of(block, &mut scratch);
+            if trace {
+                eprintln!("  [fxcmem] block nb={} ao={:.0} MB native={} rss {:.0} -> {:.0} MB (peak {:.0})",
+                    block.nb, ao.data.len() as f64 * 8.0 / 1e6, ao.native, rss0,
+                    crate::hessian::memory_monitor::current_rss_mb(), vmhwm_mb());
+            }
             let mut flat = vec![0.0; n_rhs * nao * nao];
             for i in 0..n_rhs {
-                let v_partial = compute_fxc_response_block(block, &dms[i], nao, nvar);
+                let v_partial = compute_fxc_response_block(block, ao, &dms[i], nao, nvar);
                 let off = i * nao * nao;
                 for k in 0..nao * nao { flat[off + k] = v_partial.data[k]; }
             }
@@ -308,6 +489,7 @@ pub fn compute_fxc_response_ao_cached_batched(
                 acc
             },
         );
+    omp_set_num_threads_wrapper(saved_omp);
 
     // Unflatten into Vec<MatrixFull>.
     let mut results = Vec::with_capacity(n_rhs);
@@ -322,15 +504,36 @@ pub fn compute_fxc_response_ao_cached_batched(
 
 /// Per-grid-block fxc response: returns the partial [nao, nao] contribution
 /// from this block. Pure (no shared mutable state) so safe to call in parallel.
+///
+/// `ao` is the block AO in the `[nao, nb, nderiv]` layout (component `c` at
+/// `c*nao*nb`), either the cached copy or one freshly evaluated by the caller.
 fn compute_fxc_response_block(
     block: &FxcBlock,
+    ao: BlockAo<'_>,
     dm1: &MatrixFull<f64>,
     nao: usize,
     nvar: usize,
 ) -> MatrixFull<f64> {
     let nb = block.nb;
-    let ao_d = &block.ao_d;
+    let native = ao.native;
+    let ao = ao.data;
     let fxc_raw = &block.fxc_raw;
+    // Component `c` of the block AO as a BLAS operand: `[nao, nb]` for the
+    // cached (RIFull) layout, `[nb, nao]` for libcint's own layout.  The
+    // contractions below pick the matching `trans` flags, so the native path
+    // needs no repacking at all.
+    let sz: [usize; 2] = if native { [nb, nao] } else { [nao, nb] };
+    let ind: [usize; 2] = if native { [1, nb] } else { [1, nao] };
+    let comp = |c: usize| MatrixFullSlice {
+        size: &sz,
+        indicing: &ind,
+        data: &ao[c * nao * nb..(c + 1) * nao * nb],
+    };
+    let a0 = comp(0);
+    // Force single-threaded BLAS inside this (possibly parallel) grid task:
+    // the process-wide OpenBLAS pool would otherwise oversubscribe the CPU
+    // (n_blocks rayon tasks × OpenBLAS threads) and stall the contractions.
+    omp_set_num_threads_wrapper(1);
     let mut vmat = MatrixFull::new([nao, nao], 0.0);
     // Subtimings are opt-in (env var) to avoid atomic-cache-line contention
     // that otherwise costs ~3x wall time on small systems.
@@ -341,26 +544,40 @@ fn compute_fxc_response_block(
             counter.fetch_add(t.elapsed().as_nanos() as u64, AOrdering::Relaxed);
         }
     };
+    let aoc = |c: usize, mu: usize, g: usize| -> f64 {
+        if native {
+            ao[c * nao * nb + g + mu * nb]
+        } else {
+            ao[c * nao * nb + mu + g * nao]
+        }
+    };
 
     // ρ₁[μ,g] = Σ_ν dm1[μ,ν] · ao[0][ν,g]
     let mut c0 = MatrixFull::new([nao, nb], 0.0);
     let t = now();
-    _dgemm_full(dm1, 'N', &ao_d[0], 'N', &mut c0, 1.0, 0.0);
+    if native {
+        _dgemm_full(dm1, 'N', &a0, 'T', &mut c0, 1.0, 0.0);
+    } else {
+        _dgemm_full(dm1, 'N', &a0, 'N', &mut c0, 1.0, 0.0);
+    }
     acc(t, &FXC_DGEMM1_NS);
-
     if nvar == 1 {
         // LDA
         let mut aow = MatrixFull::new([nao, nb], 0.0);
         let t = now();
         for g in 0..nb {
             let mut rho1 = 0.0;
-            for mu in 0..nao { rho1 += ao_d[0][[mu, g]] * c0[[mu, g]]; }
+            for mu in 0..nao { rho1 += aoc(0, mu, g) * c0.data[mu + g * nao]; }
             let wf_rho = block.weights[g] * fxc_raw[g] * rho1;
-            for mu in 0..nao { aow[[mu, g]] = ao_d[0][[mu, g]] * wf_rho; }
+            for mu in 0..nao { aow.data[mu + g * nao] = aoc(0, mu, g) * wf_rho; }
         }
         acc(t, &FXC_RHO1_NS);
         let t = now();
-        _dgemm_full(&aow, 'N', &ao_d[0], 'T', &mut vmat, 1.0, 1.0);
+        if native {
+            _dgemm_full(&aow, 'N', &a0, 'N', &mut vmat, 1.0, 1.0);
+        } else {
+            _dgemm_full(&aow, 'N', &a0, 'T', &mut vmat, 1.0, 1.0);
+        }
         acc(t, &FXC_DGEMM2_NS);
     } else {
         // GGA — nvar == 4
@@ -368,13 +585,13 @@ fn compute_fxc_response_block(
         let mut rho1 = vec![0.0; 4 * nb];
         for g in 0..nb {
             let mut r0 = 0.0;
-            for mu in 0..nao { r0 += ao_d[0][[mu, g]] * c0[[mu, g]]; }
+            for mu in 0..nao { r0 += aoc(0, mu, g) * c0.data[mu + g * nao]; }
             rho1[0 + g * 4] = r0;
         }
         for x in 1..4 {
             for g in 0..nb {
                 let mut rx = 0.0;
-                for mu in 0..nao { rx += ao_d[x][[mu, g]] * c0[[mu, g]]; }
+                for mu in 0..nao { rx += aoc(x, mu, g) * c0.data[mu + g * nao]; }
                 rho1[x + g * 4] = 2.0 * rx;
             }
         }
@@ -402,15 +619,19 @@ fn compute_fxc_response_block(
         for g in 0..nb {
             for mu in 0..nao {
                 let mut v = 0.0;
-                for x in 0..4 { v += ao_d[x][[mu, g]] * wv[x + g * 4]; }
-                aow[[mu, g]] = v;
+                for x in 0..4 { v += aoc(x, mu, g) * wv[x + g * 4]; }
+                aow.data[mu + g * nao] = v;
             }
         }
         acc(t, &FXC_AOW_NS);
 
         let t = now();
         let mut m_block = MatrixFull::new([nao, nao], 0.0);
-        _dgemm_full(&ao_d[0], 'N', &aow, 'T', &mut m_block, 1.0, 0.0);
+        if native {
+            _dgemm_full(&a0, 'T', &aow, 'T', &mut m_block, 1.0, 0.0);
+        } else {
+            _dgemm_full(&a0, 'N', &aow, 'T', &mut m_block, 1.0, 0.0);
+        }
         acc(t, &FXC_DGEMM2_NS);
 
         let t = now();
@@ -433,20 +654,471 @@ fn compute_fxc_response_block(
 /// `fxc_cache`: when `Some`, adds the RKS fxc kernel response using the
 /// precomputed `FxcHessianCache` (PySCF `cache_xc_kernel` analog). Pass
 /// `None` for HF or when no XC contribution is desired.
-pub fn gen_vind_opt(
+// ============================================================================
+// Low-rank CPHF exchange-response (K) precomputation
+//
+// In the CPHF Krylov matvec, dm1 = dp1 + dp1ᵀ with dp1 = C_vir·Z'·C_occᵀ
+// (rank ≤ 2·nocc). The K term
+//     K = Σ_p B_p·dm1·B_pᵀ            (B_p = RI 3-center column, symmetric)
+// then needs only its VO projection:
+//     C_occᵀ·K·C_vir = Σ_p K_p·Z'·N_pᵀ  +  (Σ_p M_p·Z'·L_pᵀ)ᵀ
+// with the four ground-state (z-independent) factors
+//     K_p = C_occᵀ·B_p·C_vir   [nocc, nvir]
+//     N_p = C_virᵀ·B_p·C_occ   [nvir, nocc]
+//     M_p = C_virᵀ·B_p·C_vir   [nvir, nvir]   (symmetric)
+//     L_p = C_occᵀ·B_p·C_occ   [nocc, nocc]   (symmetric)
+// Precomputed once per Hessian; each matvec does 2 batched GEMMs
+// (K_batch·Z', M_batch·Z') + 2 small accumulations. FLOPs per matvec drop
+// from ~2·P·N³ (dsymm pair) to ~2·P·nvir²·nocc (~10× for N=358, nocc=34).
+// ============================================================================
+pub struct KLowRankPrecompute {
+    pub nocc: usize,
+    pub nvir: usize,
+    pub naux: usize,
+    /// K_p [P·nocc, nvir] col-major
+    pub k_batch: MatrixFull<f64>,
+    /// N_p [P·nvir, nocc] col-major
+    pub n_batch: MatrixFull<f64>,
+    /// M_p [P·nvir, nvir] col-major
+    pub m_batch: MatrixFull<f64>,
+    /// L_p [P·nocc, nocc] col-major
+    pub l_batch: MatrixFull<f64>,
+}
+
+impl KLowRankPrecompute {
+    /// Build from the RI 3-center tensor (rimatr preferred, ri3fn fallback)
+    /// and the MO coefficients. Returns None if no RI tensor is available.
+    pub fn new(scf: &SCF, ws: &VindWorkspace) -> Option<Self> {
+        use rayon::prelude::*;
+        let nao = ws.nao;
+        let nocc = ws.nocc;
+        let nvir = ws.nvir;
+        let c_occ = &ws.c_occ;
+        let c_vir = &ws.c_vir;
+        enum Src<'a> {
+            Rim(&'a MatrixFull<f64>, usize), // packed upper [N(N+1)/2, P]
+            Ri3(&'a RIFull<f64>),            // full symmetric [N, N, P]
+        }
+        let src: Src<'_>;
+        let naux;
+        if let Some((ri, _, _)) = &scf.rimatr {
+            naux = ri.size[1];
+            src = Src::Rim(ri, ri.size[0]);
+        } else if let Some(ri3) = &scf.ri3fn {
+            naux = ri3.size[2];
+            src = Src::Ri3(ri3);
+        } else {
+            return None;
+        }
+        if std::env::var("REST_VERIFY_LOWRANK").is_ok() {
+            match &src {
+                Src::Rim(ri, nbp) => eprintln!("DBG lowrank src: rimatr size={:?} naux={}", ri.size, naux),
+                Src::Ri3(ri3) => eprintln!("DBG lowrank src: ri3fn size={:?} naux={}", ri3.size, naux),
+            }
+        }
+        let size_kn = naux * nocc * nvir;
+        let size_nn = naux * nvir * nocc;
+        let size_mm = naux * nvir * nvir;
+        let size_ll = naux * nocc * nocc;
+        // Batched layout buffers (col-major: K_batch[(p,i) + a·(P·nocc)] etc.).
+        let mut k_p = vec![0.0; size_kn];
+        let mut n_p = vec![0.0; size_nn];
+        let mut m_p = vec![0.0; size_mm];
+        let mut l_p = vec![0.0; size_ll];
+        // Per-p blocks are built in chunks (128 p each) so the intermediate
+        // (kp/np/mp/lp tuples, ~0.9 GB for all p) never coexists with the
+        // final batched buffers — peak build RSS ≈ k_p+n_p+m_p+l_p (0.9 GB)
+        // + one chunk (0.13 GB) instead of 1.8 GB.
+        const CHUNK: usize = 128;
+        let saved_omp = omp_get_num_threads_wrapper();
+        for p_lo in (0..naux).step_by(CHUNK) {
+            let p_hi = (p_lo + CHUNK).min(naux);
+            let cols_chunk: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> = (p_lo..p_hi)
+                .into_par_iter()
+                .map(|p| {
+                    omp_set_num_threads_wrapper(1);
+                    let mut b = vec![0.0; nao * nao];
+                    match &src {
+                        Src::Rim(ri, num_baspair) => {
+                            let col = &ri.data[p * num_baspair..(p + 1) * num_baspair];
+                            let mut it = col.iter();
+                            for nu in 0..nao {
+                                for mu in 0..=nu {
+                                    let v = *it.next().unwrap();
+                                    b[mu + nu * nao] = v;
+                                    b[nu + mu * nao] = v;
+                                }
+                            }
+                        }
+                        Src::Ri3(ri3) => {
+                            let col = &ri3.data[p * nao * nao..(p + 1) * nao * nao];
+                            b.copy_from_slice(col);
+                        }
+                    }
+                    let b_mat = MatrixFull::from_vec([nao, nao], b).unwrap();
+                    let mut bcv = MatrixFull::new([nao, nvir], 0.0);
+                    _dsymm(&b_mat, c_vir, &mut bcv, 'L', 'U', 1.0, 0.0); // B_p·C_vir
+                    let mut bco = MatrixFull::new([nao, nocc], 0.0);
+                    _dsymm(&b_mat, c_occ, &mut bco, 'L', 'U', 1.0, 0.0); // B_p·C_occ
+                    let mut kp = MatrixFull::new([nocc, nvir], 0.0);
+                    _dgemm_full(c_occ, 'T', &bcv, 'N', &mut kp, 1.0, 0.0);
+                    let mut np = MatrixFull::new([nvir, nocc], 0.0);
+                    _dgemm_full(c_vir, 'T', &bco, 'N', &mut np, 1.0, 0.0);
+                    let mut mp = MatrixFull::new([nvir, nvir], 0.0);
+                    _dgemm_full(c_vir, 'T', &bcv, 'N', &mut mp, 1.0, 0.0);
+                    let mut lp = MatrixFull::new([nocc, nocc], 0.0);
+                    _dgemm_full(c_occ, 'T', &bco, 'N', &mut lp, 1.0, 0.0);
+                    (kp.data, np.data, mp.data, lp.data)
+                })
+                .collect();
+            for (p_local, (kp, np, mp, lp)) in cols_chunk.iter().enumerate() {
+                let p = p_lo + p_local;
+                for a in 0..nvir {
+                    for i in 0..nocc {
+                        k_p[p * nocc + i + a * nocc * naux] = kp[i + a * nocc];
+                    }
+                }
+                for c in 0..nocc {
+                    for a in 0..nvir {
+                        n_p[p * nvir + a + c * nvir * naux] = np[a + c * nvir];
+                    }
+                }
+                for v in 0..nvir {
+                    for u in 0..nvir {
+                        m_p[p * nvir + u + v * nvir * naux] = mp[u + v * nvir];
+                    }
+                }
+                for c in 0..nocc {
+                    for i in 0..nocc {
+                        l_p[p * nocc + i + c * nocc * naux] = lp[i + c * nocc];
+                    }
+                }
+            }
+            drop(cols_chunk);
+        }
+        omp_set_num_threads_wrapper(saved_omp);
+        Some(KLowRankPrecompute {
+            nocc, nvir, naux,
+            k_batch: MatrixFull::from_vec([nocc * naux, nvir], k_p).unwrap(),
+            n_batch: MatrixFull::from_vec([nvir * naux, nocc], n_p).unwrap(),
+            m_batch: MatrixFull::from_vec([nvir * naux, nvir], m_p).unwrap(),
+            l_batch: MatrixFull::from_vec([nocc * naux, nocc], l_p).unwrap(),
+        })
+    }
+}
+
+/// K contribution to the VO-projected CPHF response for one RHS z (flat
+/// [nocc·nvir], index i + a·nocc — same layout as the z input).
+///
+///   C_occᵀ·K·C_vir = Σ_p K_p·Z'·N_pᵀ  +  (Σ_p M_p·Z'·L_pᵀ)ᵀ
+///
+/// Two batched GEMMs (K_batch·Z', M_batch·Z') + two parallel accumulations.
+/// FLOPs: ~2·P·(nvir²·nocc + nocc²·nvir) vs ~2·P·N³ for the dsymm pair.
+pub fn k_vo_lowrank(pre: &KLowRankPrecompute, z: &[f64]) -> Vec<f64> {
+    use rayon::prelude::*;
+    let _tk = std::time::Instant::now();
+    let nocc = pre.nocc;
+    let nvir = pre.nvir;
+    let naux = pre.naux;
+    // Z' [nvir, nocc] col-major: Z'[u + c·nvir] = 2·z[c + u·nocc]
+    let mut zp = vec![0.0; nvir * nocc];
+    for u in 0..nvir {
+        for c in 0..nocc {
+            zp[u + c * nvir] = 2.0 * z[c + u * nocc];
+        }
+    }
+    let z_mat = MatrixFull::from_vec([nvir, nocc], zp).unwrap();
+    // Tk = K_batch [P·nocc, nvir] @ Z' → [P·nocc, nocc]
+    let mut tk = MatrixFull::new([nocc * naux, nocc], 0.0);
+    _dgemm_full(&pre.k_batch, 'N', &z_mat, 'N', &mut tk, 1.0, 0.0);
+    // T = M_batch [P·nvir, nvir] @ Z' → [P·nvir, nocc]
+    let mut t = MatrixFull::new([nvir * naux, nocc], 0.0);
+    _dgemm_full(&pre.m_batch, 'N', &z_mat, 'N', &mut t, 1.0, 0.0);
+    let tk_d = &tk.data;
+    let t_d = &t.data;
+    let n_p = &pre.n_batch.data;
+    let l_p = &pre.l_batch.data;
+    // vo_pos[i,a] += Σ_c Tk_p[i,c]·N_p[a,c] ; vo_neg[u,c] += Σ_d T_p[u,d]·L_p[c,d]
+    let (pos, neg) = (0..naux)
+        .into_par_iter()
+        .fold(
+            || (vec![0.0; nocc * nvir], vec![0.0; nvir * nocc]),
+            |(mut pos, mut neg), p| {
+                for i in 0..nocc {
+                    for a in 0..nvir {
+                        let mut s = 0.0;
+                        for c in 0..nocc {
+                            s += tk_d[p * nocc + i + c * nocc * naux]
+                                * n_p[p * nvir + a + c * nvir * naux];
+                        }
+                        pos[i + a * nocc] += s;
+                    }
+                }
+                for u in 0..nvir {
+                    for c in 0..nocc {
+                        let mut s = 0.0;
+                        for d in 0..nocc {
+                            s += t_d[p * nvir + u + d * nvir * naux]
+                                * l_p[p * nocc + c + d * nocc * naux];
+                        }
+                        neg[u + c * nvir] += s;
+                    }
+                }
+                (pos, neg)
+            },
+        )
+        .reduce(
+            || (vec![0.0; nocc * nvir], vec![0.0; nvir * nocc]),
+            |(mut a1, mut b1), (a2, b2)| {
+                for k in 0..a1.len() {
+                    a1[k] += a2[k];
+                }
+                for k in 0..b1.len() {
+                    b1[k] += b2[k];
+                }
+                (a1, b1)
+            },
+        );
+    // result[i + a·nocc] = vo_pos[i,a] + vo_neg[a,i]
+    let mut res = vec![0.0; nocc * nvir];
+    for i in 0..nocc {
+        for a in 0..nvir {
+            res[i + a * nocc] = pos[i + a * nocc] + neg[a + i * nvir];
+        }
+    }
+    if std::env::var("REST_CPHF_PROFILE").is_ok() {
+        eprintln!("CPHF-PROF kvo {:.4}s", _tk.elapsed().as_secs_f64());
+    }
+    res
+}
+
+/// Batched version of [`k_vo_lowrank`]: processes n_rhs z-vectors in one call
+/// so the big M_batch/K_batch GEMMs amortize the 740 MB read across all RHS
+/// (N = nocc·n_rhs instead of nocc per call). T/Tk are streamed in p-blocks
+/// (PB aux p each) and contracted immediately, keeping peak RSS ≈ PB-block
+/// outputs (133 MB at PB=32) instead of the full [P·nvir, nocc·n_rhs] T.
+pub fn k_vo_lowrank_batched(pre: &KLowRankPrecompute, z_batch: &[&[f64]]) -> Vec<Vec<f64>> {
+    use rayon::prelude::*;
+    let _tkb = std::time::Instant::now();
+    let mut _t_copy = 0.0f64;
+    let mut _t_gemm = 0.0f64;
+    let mut _t_contr = 0.0f64;
+    let nocc = pre.nocc;
+    let nvir = pre.nvir;
+    let naux = pre.naux;
+    let n_rhs = z_batch.len();
+    let dim = nocc * nvir;
+    // Z' [nvir, nocc·n_rhs] col-major: Z'[u + (c + z·nocc)·nvir] = 2·z[c + u·nocc]
+    let mut zp = vec![0.0; nvir * nocc * n_rhs];
+    for z in 0..n_rhs {
+        for u in 0..nvir {
+            for c in 0..nocc {
+                zp[u + (c + z * nocc) * nvir] = 2.0 * z_batch[z][c + u * nocc];
+            }
+        }
+    }
+    let z_mat = MatrixFull::from_vec([nvir, nocc * n_rhs], zp).unwrap();
+    let n_p = &pre.n_batch.data;
+    let l_p = &pre.l_batch.data;
+    const PB: usize = 32;
+    let mut res_all = vec![vec![0.0; dim]; n_rhs];
+    for p0 in (0..naux).step_by(PB) {
+        let pe = (p0 + PB).min(naux);
+        let npb = pe - p0;
+        // Tk_blk = K_batch[p-block]·Z' → [npb·nocc, nocc·n_rhs].
+        // K_batch/M_batch are col-major [P·rows, nvir]: the p-block rows are
+        // contiguous *within each column*, so the block matrix must be copied
+        // column by column (not sliced).
+        let _tc = std::time::Instant::now();
+        let mut tk_blk = MatrixFull::new([npb * nocc, nocc * n_rhs], 0.0);
+        {
+            // p-block rows are contiguous within each column of the col-major
+            // K_batch; copy columns in parallel, assemble col-major afterwards.
+            let k_cols: Vec<Vec<f64>> = (0..nvir)
+                .into_par_iter()
+                .map(|a| {
+                    let s = p0 * nocc + a * (nocc * naux);
+                    pre.k_batch.data[s..s + npb * nocc].to_vec()
+                })
+                .collect();
+            let mut k_blk_m = MatrixFull::new([npb * nocc, nvir], 0.0);
+            for (a, col) in k_cols.iter().enumerate() {
+                k_blk_m.data[a * (npb * nocc)..(a + 1) * (npb * nocc)].copy_from_slice(col);
+            }
+            let _tg1 = std::time::Instant::now();
+            _dgemm_full(&k_blk_m, 'N', &z_mat, 'N', &mut tk_blk, 1.0, 0.0);
+            _t_gemm += _tg1.elapsed().as_secs_f64();
+        }
+        // T_blk = M_batch[p-block]·Z' → [npb·nvir, nocc·n_rhs]
+        let mut t_blk = MatrixFull::new([npb * nvir, nocc * n_rhs], 0.0);
+        {
+            let m_cols: Vec<Vec<f64>> = (0..nvir)
+                .into_par_iter()
+                .map(|a| {
+                    let s = p0 * nvir + a * (nvir * naux);
+                    pre.m_batch.data[s..s + npb * nvir].to_vec()
+                })
+                .collect();
+            let mut m_blk_m = MatrixFull::new([npb * nvir, nvir], 0.0);
+            for (a, col) in m_cols.iter().enumerate() {
+                m_blk_m.data[a * (npb * nvir)..(a + 1) * (npb * nvir)].copy_from_slice(col);
+            }
+            let _tg2 = std::time::Instant::now();
+            _dgemm_full(&m_blk_m, 'N', &z_mat, 'N', &mut t_blk, 1.0, 0.0);
+            _t_gemm += _tg2.elapsed().as_secs_f64();
+            _t_copy += _tc.elapsed().as_secs_f64();
+        }
+        let tk_d = &tk_blk.data;
+        let t_d = &t_blk.data;
+        // Contract Tk/T into res_all via per-worker private accumulators
+        // (par_chunks, one merge per worker — no fold/reduce tree).
+        let _tc2 = std::time::Instant::now();
+        {
+            let nw = rayon::current_num_threads().max(1);
+            let chunk = npb.div_ceil(nw);
+            let partials: Vec<((Vec<f64>, Vec<f64>))> = (0..nw)
+                .into_par_iter()
+                .map(|w| {
+                    let lo = (w * chunk).min(npb);
+                    let hi = ((w + 1) * chunk).min(npb);
+                    let mut pos = vec![0.0; n_rhs * dim];
+                    let mut neg = vec![0.0; n_rhs * nvir * nocc];
+                    for pl in lo..hi {
+                        let p = p0 + pl;
+                        let tkb = &tk_d[pl * nocc..];
+                        let tb = &t_d[pl * nvir..];
+                        // Cache-friendly: c/d outer; contiguous inner writes
+                        // (pos[i·nvir+a], neg[u·nocc+c]).
+                        for z in 0..n_rhs {
+                            let pb = &mut pos[z * dim..];
+                            for c in 0..nocc {
+                                let ncol = &n_p[p * nvir + c * nvir * naux..p * nvir + c * nvir * naux + nvir];
+                                let tcol_base = (c + z * nocc) * (npb * nocc);
+                                for i in 0..nocc {
+                                    let tki = tkb[i + tcol_base];
+                                    for a in 0..nvir {
+                                        pb[i * nvir + a] += tki * ncol[a];
+                                    }
+                                }
+                            }
+                            let nb = &mut neg[z * nvir * nocc..];
+                            for d in 0..nocc {
+                                let tcol_base = (d + z * nocc) * (npb * nvir);
+                                for u in 0..nvir {
+                                    let tu = tb[u + tcol_base];
+                                    for c in 0..nocc {
+                                        nb[u * nocc + c] += tu
+                                            * l_p[p * nocc + c + d * nocc * naux];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (pos, neg)
+                })
+                .collect();
+            for (pos, neg) in partials {
+                for z in 0..n_rhs {
+                    let r = &mut res_all[z];
+                    let pz = &pos[z * dim..];
+                    for i in 0..nocc {
+                        for a in 0..nvir {
+                            r[i + a * nocc] += pz[i * nvir + a];
+                        }
+                    }
+                    let nz = &neg[z * nvir * nocc..];
+                    for u in 0..nvir {
+                        for c in 0..nocc {
+                            r[c + u * nocc] += nz[u * nocc + c];
+                        }
+                    }
+                }
+            }
+        }
+        _t_contr += _tc2.elapsed().as_secs_f64();
+        drop(tk_blk);
+        drop(t_blk);
+    }
+    if std::env::var("REST_CPHF_PROFILE").is_ok() {
+        eprintln!("CPHF-PROF kvob n={} total {:.3}s copy {:.3}s gemm {:.3}s contr {:.3}s",
+            n_rhs, _tkb.elapsed().as_secs_f64(), _t_copy, _t_gemm, _t_contr);
+    }
+    res_all
+}
+
+/// Batched RI-J: computes J = V⁻¹·(Cᵀ·dm) for all n_rhs densities in ONE
+/// pair of GEMMs (ri3fnᵀ·dm_upper_batch, ri3fn·tmp_mu), amortizing the
+/// 176 MB ri3fn read across the batch (was 1 dgemv pair per RHS).
+pub fn vj_upper_rimatr_batched(
+    scf: &SCF,
+    dms: &[MatrixFull<f64>],
+) -> Vec<MatrixFull<f64>> {
+    use itertools::Itertools;
+    let n_rhs = dms.len();
+    let nao = dms[0].size[0];
+    let (ri3fn, _, baspar2basbas) = scf.rimatr.as_ref().unwrap();
+    let npair = ri3fn.size[0];
+    let naux = ri3fn.size[1];
+    // Upper-triangle compressed density per RHS (diagonal halved), using
+    // MatrixUpper's compression order (identical to vj_upper_with_rimatr_sync
+    // so the ri3fn rows match).
+    let mut dm_upper = vec![0.0; npair * n_rhs];
+    for k in 0..n_rhs {
+        let mut upper =
+            MatrixUpper::from_vec(npair, dms[k].iter_matrixupper().unwrap().map(|x| *x).collect())
+                .unwrap();
+        upper.iter_diagonal_mut().for_each(|x| *x *= 0.5);
+        dm_upper[k * npair..(k + 1) * npair].copy_from_slice(&upper.data);
+    }
+    let dm_m = MatrixFull::from_vec([npair, n_rhs], dm_upper).unwrap();
+    // tmp_mu[aux, k] = Σ_pair ri3fn[pair,aux]·dm_upper[pair,k] (×2)
+    let mut tmp_mu = MatrixFull::new([naux, n_rhs], 0.0);
+    _dgemm_full(ri3fn, 'T', &dm_m, 'N', &mut tmp_mu, 2.0, 0.0);
+    // vj[pair', k] = Σ_aux ri3fn[pair',aux]·tmp_mu[aux,k]
+    let mut vj = MatrixFull::new([npair, n_rhs], 0.0);
+    _dgemm_full(ri3fn, 'N', &tmp_mu, 'N', &mut vj, 1.0, 0.0);
+    // Expand to symmetric [nao, nao].
+    let mut out: Vec<MatrixFull<f64>> = Vec::with_capacity(n_rhs);
+    for k in 0..n_rhs {
+        let mut m = vec![0.0; nao * nao];
+        for (ipair, &[mu, nu]) in baspar2basbas.iter().enumerate() {
+            let v = vj.data[ipair + k * npair];
+            m[mu + nu * nao] = v;
+            if mu != nu {
+                m[nu + mu * nao] = v;
+            }
+        }
+        out.push(MatrixFull::from_vec([nao, nao], m).unwrap());
+    }
+    if std::env::var("REST_VERIFY_LOWRANK").is_ok() {
+        let j_ref = compute_j_upper(scf, &vec![dms[0].clone()]).to_matrixfull().unwrap();
+        let mut mx = 0.0f64;
+        for r in 0..nao {
+            for c in 0..nao {
+                let d = (out[0][[r, c]] - j_ref[[r, c]]).abs();
+                if d > mx { mx = d; }
+            }
+        }
+        eprintln!("DBG vj_batched[0] max_diff={:.3e}", mx);
+    }
+    out
+}
+
+/// Core of [`gen_vind_opt`]: the full symmetric AO response matrix
+/// `v_ao = 2J(dm1) - hyb*K(dm1) + fxc(dm1)` (closed shell) without projecting
+/// it back to the occupied/virtual blocks.
+pub fn response_ao_core(
     scf: &SCF,
     ws: &VindWorkspace,
     z_vo: &[f64],  // active VO block, flat [i + a*nocc] (nvir * nocc)
     fxc_cache: Option<&FxcHessianCache>,
     z_oo: Option<&[f64]>,  // occ-occ block, flat [i + j*nocc]
     z_fo: Option<&[f64]>,  // frozen-occ block, flat [i + k*nocc] (nfrozen * nocc)
-) -> Vec<f64> {
-    // Returns: [frozen_response (nfrozen*nocc), VO_response (nvir*nocc)] as single flat vec
+) -> MatrixFull<f64> {
     let nao = ws.nao;
     let nocc = ws.nocc;
     let nvir = ws.nvir;
     let nfrozen = ws.nfrozen;
-    let dim = ws.dim;
 
     // ── Step 1: Build AO density matrix: VO contribution ──
     let mut z_scaled = MatrixFull::new([nvir, nocc], 0.0);
@@ -501,12 +1173,6 @@ pub fn gen_vind_opt(
     let dm_vec = vec![dm1.clone()];
 
     // ── Step 2: Compute J, K via REST JK ──
-    let j_full = compute_j_upper(scf, &dm_vec).to_matrixfull()
-        .unwrap_or_else(|| panic!("J to_matrixfull failed"));
-    let k_full = compute_k_upper(scf, &dm_vec).to_matrixfull()
-        .unwrap_or_else(|| panic!("K to_matrixfull failed"));
-
-    // ── Step 3: v_ao = J - 0.5*hyb*K (RHF) or J - hyb*K (UHF/ROHF) ──
     // hyb from DFA: for HF (dfa_compnt_scf empty), dfa_hybrid_scf=0, but
     // the SCF HF uses hardcoded scaling=-0.5 (generate_hf_hamiltonian_ri_v),
     // so we must set hyb=1.0 for HF to get the correct exchange response.
@@ -520,6 +1186,19 @@ pub fn gen_vind_opt(
         SCFType::RHF => 0.5 * hyb,
         _ => hyb,
     };
+    let j_full = compute_j_upper(scf, &dm_vec).to_matrixfull()
+        .unwrap_or_else(|| panic!("J to_matrixfull failed"));
+    // Skip the exchange response entirely for pure (LDA/GGA) DFAs: the K term
+    // is scaled by k_scaling = 0, so compute_k_upper would be pure waste. K is
+    // O(naux·nao³) per call and dominates the JK phase of every matvec.
+    let k_full = if k_scaling != 0.0 {
+        compute_k_upper(scf, &dm_vec).to_matrixfull()
+            .unwrap_or_else(|| panic!("K to_matrixfull failed"))
+    } else {
+        MatrixFull::new([nao, nao], 0.0)
+    };
+
+    // ── Step 3: v_ao = J - k_scaling*K ──
     let mut v_ao = MatrixFull::new([nao, nao], 0.0);
     for i in 0..nao { for j in 0..nao {
         v_ao[[i, j]] = j_full[[i, j]] - k_scaling * k_full[[i, j]];
@@ -542,6 +1221,25 @@ pub fn gen_vind_opt(
             v_ao[[i, j]] += fxc_ao[[i, j]];
         }}
     }
+
+    v_ao
+}
+
+/// Full response vector `[frozen_response (nfrozen*nocc), VO_response (nvir*nocc)]`.
+pub fn gen_vind_opt(
+    scf: &SCF,
+    ws: &VindWorkspace,
+    z_vo: &[f64],
+    fxc_cache: Option<&FxcHessianCache>,
+    z_oo: Option<&[f64]>,
+    z_fo: Option<&[f64]>,
+) -> Vec<f64> {
+    let nao = ws.nao;
+    let nocc = ws.nocc;
+    let nvir = ws.nvir;
+    let nfrozen = ws.nfrozen;
+    let dim = ws.dim;
+    let v_ao = response_ao_core(scf, ws, z_vo, fxc_cache, z_oo, z_fo);
 
     // ── Step 5: Project v_ao to frozen and active virtual rows ──
     // Frozen row projection: C_occ^T @ v_ao @ C_frozen → [nocc, nfrozen]
@@ -585,6 +1283,7 @@ pub fn gen_vind_opt_batched(
     fxc_cache: Option<&FxcHessianCache>,
     z_oo_batch: Option<&[&[f64]]>,    // n_rhs × nocc²  (None or all zeros for Krylov)
     z_fo_batch: Option<&[&[f64]]>,    // n_rhs × nfrozen*nocc
+    k_lowrank: Option<&KLowRankPrecompute>, // low-rank K path (Krylov matvec)
 ) -> Vec<Vec<f64>> {
     let nao = ws.nao;
     let nocc = ws.nocc;
@@ -593,6 +1292,13 @@ pub fn gen_vind_opt_batched(
     let dim = ws.dim;
     let n_rhs = z_vo_batch.len();
     if n_rhs == 0 { return Vec::new(); }
+    // Low-rank K applies only when dm1 is the pure VO low-rank form
+    // (no OO/FO blocks) and there are no frozen orbitals to project onto.
+    let use_lowrank_k = std::env::var("REST_CPHF_NO_LOWRANK_K").is_err()
+        && k_lowrank.is_some()
+        && z_oo_batch.is_none()
+        && z_fo_batch.is_none()
+        && nfrozen == 0;
 
     // ── Step 1: Build AO density matrix per RHS ──
     // dm1[i] = dp1[i] + dp1[i]^T (+ OO and FO contributions if provided)
@@ -660,18 +1366,65 @@ pub fn gen_vind_opt_batched(
     };
 
     let mut v_ao_batch: Vec<MatrixFull<f64>> = Vec::with_capacity(n_rhs);
+    // Low-rank K: precompute the VO projection once per RHS (bypasses the
+    // full [N,N] K assembly + Step-4 projection entirely).
+    let mut k_vo_batch: Option<Vec<Vec<f64>>> = if use_lowrank_k {
+        Some(k_vo_lowrank_batched(k_lowrank.unwrap(), z_vo_batch))
+    } else {
+        None
+    };
+    if std::env::var("REST_VERIFY_LOWRANK").is_ok() && use_lowrank_k {
+        for i in 0..n_rhs {
+            let dm_vec = vec![dms[i].clone()];
+            let k_full = compute_k_upper(scf, &dm_vec).to_matrixfull()
+                .unwrap_or_else(|| panic!("K to_matrixfull failed"));
+            let mut tmp_vo = MatrixFull::new([nao, nvir], 0.0);
+            _dgemm_full(&k_full, 'N', &ws.c_vir, 'N', &mut tmp_vo, 1.0, 0.0);
+            let mut vo_orig = MatrixFull::new([nocc, nvir], 0.0);
+            _dgemm_full(&ws.c_occ, 'T', &tmp_vo, 'N', &mut vo_orig, 1.0, 0.0);
+            let kv = &k_vo_batch.as_ref().unwrap()[i];
+            let mut mx = 0.0f64;
+            for a in 0..nvir { for r in 0..nocc {
+                let d = (vo_orig[[r, a]] - kv[r + a * nocc]).abs();
+                if d > mx { mx = d; }
+            }}
+            let norm = (0..nvir*nocc).map(|k| vo_orig.data[k]*vo_orig.data[k]).sum::<f64>().sqrt();
+            eprintln!("DBG lowrank[{}]: max_diff={:.3e} orig_norm={:.3e}", i, mx, norm);
+        }
+    }
+    let j_batch: Vec<MatrixFull<f64>> = if let Some(_rimatr) = &scf.rimatr {
+        vj_upper_rimatr_batched(scf, &dms)
+    } else {
+        (0..n_rhs)
+            .map(|i| {
+                let dm_vec = vec![dms[i].clone()];
+                compute_j_upper(scf, &dm_vec)
+                    .to_matrixfull()
+                    .unwrap_or_else(|| panic!("J to_matrixfull failed"))
+            })
+            .collect()
+    };
     for i in 0..n_rhs {
-        let dm_vec = vec![dms[i].clone()];
-        let j_full = compute_j_upper(scf, &dm_vec).to_matrixfull()
-            .unwrap_or_else(|| panic!("J to_matrixfull failed"));
-        let k_full = compute_k_upper(scf, &dm_vec).to_matrixfull()
-            .unwrap_or_else(|| panic!("K to_matrixfull failed"));
+        let j_full = &j_batch[i];
+        // Skip the exchange response for pure DFAs (k_scaling == 0); K is
+        // O(naux·nao³) and would dominate the per-RHS matvec cost as waste.
+        let k_full = if k_scaling != 0.0 && !use_lowrank_k {
+            let dm_vec = vec![dms[i].clone()];
+            compute_k_upper(scf, &dm_vec)
+                .to_matrixfull()
+                .unwrap_or_else(|| panic!("K to_matrixfull failed"))
+        } else {
+            MatrixFull::new([nao, nao], 0.0)
+        };
         let mut v_ao = MatrixFull::new([nao, nao], 0.0);
-        for r in 0..nao { for c in 0..nao {
-            v_ao[[r, c]] = j_full[[r, c]] - k_scaling * k_full[[r, c]];
-        }}
+        for r in 0..nao {
+            for c in 0..nao {
+                v_ao[[r, c]] = j_full[[r, c]] - k_scaling * k_full[[r, c]];
+            }
+        }
         v_ao_batch.push(v_ao);
     }
+
 
     // ── Step 3: Add batched fxc response (KEY Phase A win) ──
     if let Some(cache) = fxc_cache {
@@ -702,6 +1455,13 @@ pub fn gen_vind_opt_batched(
         let mut res = vec![0.0; total];
         for k in 0..nfrozen { for r in 0..nocc { res[r + k * nocc] = fro_result[[r, k]]; }}
         for a in 0..nvir { for r in 0..nocc { res[fo_size + r + a * nocc] = vo_result[[r, a]]; }}
+        // Low-rank K: the K contribution to the VO projection was computed
+        // directly in MO space — subtract k_scaling·K_vo.
+        if let Some(kvb) = &k_vo_batch {
+            for k in 0..dim {
+                res[fo_size + k] -= k_scaling * kvb[i][k];
+            }
+        }
         results.push(res);
     }
     results

@@ -3,7 +3,22 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TDDFTParameters {
     pub tddft_method: String,       // "tda" or "lr" (full linear response)
-    pub tddft_spin: String,         // "singlet" or "triplet"
+    /// Spin channel of a **restricted** (spin-adapted) reference:
+    /// `"singlet"` (default), `"triplet"`, or `"both"` (triplet/both require
+    /// `tddft_mode = "ao"`).
+    ///
+    /// This keyword is **not applicable** to an unrestricted reference
+    /// (`spin_polarization = true`).  Spin-unrestricted TDDFT has a single,
+    /// legitimate response channel: the Coulomb kernel is spin-independent, so
+    /// the alpha and beta blocks are coupled by it, and there is no second
+    /// (Coulomb-free) channel to select -- the "factor 2 / factor 0" pair of the
+    /// restricted formalism only exists because a closed-shell restricted
+    /// reference can be rotated into the singlet/triplet subspaces.  An explicit
+    /// value other than the default `"singlet"` is therefore rejected in an
+    /// unrestricted run.
+    ///
+    /// `None` means the keyword was not given (restricted default: `"singlet"`).
+    pub tddft_spin: Option<String>,
     pub tddft_mode: String,         // "mo" (default; MO-basis RI tensors) or "ao" (AO transition-density kernel)
     pub grid_batch: bool,           // AO mode only: batch the fxc AO evaluation over grid batches (memory-bounded)
     pub tddft_ao_rik_driver: String, // AO mode only: exchange-K driver, "semitrans" (default; exact occ-side semi-transformation), "dm" (exact batched density-driven), or "lowrank" (per-vector SVD)
@@ -57,13 +72,32 @@ pub struct TDDFTParameters {
     pub stability: String,
     pub stability_nroots: usize, // Davidson roots for the Hessian (lowest eigenvalues)
     pub stability_tol: f64,      // Davidson convergence tolerance for the Hessian
+    /// If true, export TDDFT results to rest_pysoc_export.json for PySOC.
+    /// Requires a restricted reference with `tddft_spin = "both"` (spin-orbit
+    /// coupling needs both the singlet and the triplet amplitudes); it is
+    /// rejected for an unrestricted reference. Both Cartesian and spheric
+    /// orbital basis sets are supported (the PySOC export is always written in
+    /// Cartesian format; REST transforms spheric MOs when necessary).
+    pub pysoc: bool,
+    /// 1-based excited-state index for which the analytic nuclear gradient is
+    /// computed; 0 disables the TDDFT gradient.
+    pub tddft_grad_state: usize,
 }
+
+/// Default Davidson subspace size for the TDDFT eigen-solvers.
+///
+/// The full-LR Davidson needs a subspace large enough to converge before the
+/// first restart (each iteration adds ~nroots residual vectors); with the
+/// previous default of 8 (effective ~4*nroots) the subspace collapsed to an
+/// empty set and the LR solver failed for all functionals. 60 converges the
+/// full-LR Davidson in ~8 iterations for typical valence-excitation problems.
+pub const DEFAULT_DAVIDSON_MAX_SUBSPACE: usize = 60;
 
 impl Default for TDDFTParameters {
     fn default() -> Self {
         TDDFTParameters {
             tddft_method: String::from("lr"),
-            tddft_spin: String::from("singlet"),
+            tddft_spin: None,
             tddft_mode: String::from("mo"),
             grid_batch: true,
             tddft_ao_rik_driver: String::from("semitrans"),
@@ -72,7 +106,11 @@ impl Default for TDDFTParameters {
             nroots: 6,
             davidson_tol: 1.0e-10,
             davidson_max_iter: 50,
-            davidson_max_subspace: 8,
+            // The full-LR Davidson needs a subspace large enough to converge
+            // before the first restart (each iteration adds ~nroots vectors);
+            // with the previous default of 8 (effective ~4*nroots) the solver
+            // collapsed to an empty subspace and failed for all functionals.
+            davidson_max_subspace: 60,
             response_tddft: false,
             response_tddft_solver: String::from("klopper"),
             response_tddft_tol: 1.0e-6,
@@ -106,7 +144,20 @@ impl Default for TDDFTParameters {
             stability: String::from("off"),
             stability_nroots: 3,
             stability_tol: 1.0e-4,
+            pysoc: false,
+            tddft_grad_state: 0,
         }
+    }
+}
+
+impl TDDFTParameters {
+    /// Spin channel used by the **restricted** (spin-adapted) TDDFT path.
+    ///
+    /// `tddft_spin` is absent from most input files; the restricted default is
+    /// `"singlet"`.  The unrestricted path never calls this: it owns a single
+    /// spin-coupled channel (see [`TDDFTParameters::tddft_spin`]).
+    pub fn restricted_spin(&self) -> &str {
+        self.tddft_spin.as_deref().unwrap_or("singlet")
     }
 }
 
@@ -119,8 +170,19 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
                 _ => String::from("lr"),
             };
             p.tddft_spin = match tmp_ctrl.get("tddft_spin").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(s) => s.to_lowercase(),
-                _ => String::from("singlet"),
+                serde_json::Value::String(s) => {
+                    let v = s.to_lowercase();
+                    if !matches!(v.as_str(), "singlet" | "triplet" | "both") {
+                        anyhow::bail!(
+                            "tddft_spin = \"{}\" is not a valid choice; \
+                             use \"singlet\", \"triplet\" or \"both\" \
+                             (the latter two apply to restricted references only)",
+                            s
+                        );
+                    }
+                    Some(v)
+                },
+                _ => None,
             };
             p.tddft_mode = match tmp_ctrl.get("tddft_mode").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.to_lowercase(),
@@ -155,8 +217,8 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
                 _ => 50,
             };
             p.davidson_max_subspace = match tmp_ctrl.get("davidson_max_subspace").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(n) => n.as_u64().unwrap_or(8) as usize,
-                _ => 8,
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(DEFAULT_DAVIDSON_MAX_SUBSPACE as u64) as usize,
+                _ => DEFAULT_DAVIDSON_MAX_SUBSPACE,
             };
             // Response TDDFT parameters
             p.response_tddft = match tmp_ctrl.get("response_tddft").unwrap_or(&serde_json::Value::Null) {
@@ -314,6 +376,14 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
             p.stability_tol = match tmp_ctrl.get("stability_tol").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-4),
                 _ => 1.0e-4,
+            };
+            p.pysoc = match tmp_ctrl.get("pysoc").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
+            };
+            p.tddft_grad_state = match tmp_ctrl.get("tddft_grad_state").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+                _ => 0,
             };
             Ok(Some(p))
         },

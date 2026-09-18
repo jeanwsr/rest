@@ -252,12 +252,9 @@ impl SymmMolecule {
     /// Reference: `has_inversion`.
     fn has_inversion(&self, g: &[[f64; 3]], origin: &Vec3, tol: f64) -> bool {
         for at in 0..self.natom() {
-            let inverted = vec3::sub(
-                &vec3::scale(origin, 2.0),
-                &g[at],
-            );
+            let inverted = vec3::sub(&vec3::scale(origin, 2.0), &g[at]);
             match atom_at_position(g, &inverted, tol) {
-                Some(idx) if self.equiv(idx, at) => {}
+                Some(idx) if self.equiv(idx, at) => {},
                 _ => return false,
             }
         }
@@ -272,7 +269,7 @@ impl SymmMolecule {
             let aperp = vec3::sub(&a, &apar);
             let reflected = vec3::add(&vec3::sub(&aperp, &apar), origin);
             match atom_at_position(g, &reflected, tol) {
-                Some(idx) if self.equiv(idx, i) => {}
+                Some(idx) if self.equiv(idx, i) => {},
                 _ => return false,
             }
         }
@@ -288,7 +285,7 @@ impl SymmMolecule {
                 let r = vec3::rotate(&a, j as f64 * two_pi / order as f64, axis);
                 let r = vec3::add(&r, origin);
                 match atom_at_position(g, &r, tol) {
-                    Some(idx) if self.equiv(idx, i) => {}
+                    Some(idx) if self.equiv(idx, i) => {},
                     _ => return false,
                 }
             }
@@ -308,7 +305,7 @@ impl SymmMolecule {
             let (x, y, z) = (g[i][0], g[i][1], g[i][2]);
             let refl = [x * c2 + y * s2, x * s2 - y * c2, z];
             match atom_at_position(g, &refl, tol) {
-                Some(j) if self.equiv(j, i) => {}
+                Some(j) if self.equiv(j, i) => {},
                 _ => return false,
             }
         }
@@ -460,11 +457,11 @@ impl SymmMolecule {
             for at in 0..self.natom() {
                 let pos = vec3::naivemult(&g[at], &diag);
                 match atom_at_position(g, &pos, tol) {
-                    Some(idx) if self.equiv(idx, at) => {}
+                    Some(idx) if self.equiv(idx, at) => {},
                     _ => {
                         found = false;
                         break;
-                    }
+                    },
                 }
             }
             if found {
@@ -788,7 +785,7 @@ impl SymmMolecule {
                 } else {
                     (Tmpl::CinfV, 0)
                 }
-            }
+            },
             Rotor::Spherical => {
                 if !op_i {
                     (Tmpl::Td, 3)
@@ -805,7 +802,7 @@ impl SymmMolecule {
                         (Tmpl::Ih, 5)
                     }
                 }
-            }
+            },
             Rotor::Asymmetric => {
                 let (tmpl, n) = match d2h_subgroup {
                     "c1" => (Tmpl::C1, 1u32),
@@ -819,14 +816,13 @@ impl SymmMolecule {
                     _ => (Tmpl::C1, 1),
                 };
                 (tmpl, n)
-            }
+            },
             Rotor::Prolate | Rotor::Oblate => {
                 // symmetric top
                 let (evals, evecs) = diagonalize3x3symmat(&self.inertia_tensor(g));
                 // zip eigenvalues with eigenvectors (columns of evecs -> rows), sort ascending
-                let mut ev_list: Vec<(f64, Vec3)> = (0..3)
-                    .map(|i| (evals[i], [evecs[0][i], evecs[1][i], evecs[2][i]]))
-                    .collect();
+                let mut ev_list: Vec<(f64, Vec3)> =
+                    (0..3).map(|i| (evals[i], [evecs[0][i], evecs[1][i], evecs[2][i]])).collect();
                 ev_list.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
                 let i_evals: [f64; 3] = [ev_list[0].0, ev_list[1].0, ev_list[2].0];
                 let i_evecs: [Vec3; 3] = [ev_list[0].1, ev_list[1].1, ev_list[2].1];
@@ -926,7 +922,7 @@ impl SymmMolecule {
                         return (Tmpl::Cn, cn);
                     }
                 }
-            }
+            },
         }
     }
 

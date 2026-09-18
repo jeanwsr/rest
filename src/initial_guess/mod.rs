@@ -100,10 +100,12 @@ pub fn initial_guess(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
         scf_data.generate_density_matrix();
         //scf_data.generate_hf_hamiltonian();
     } else if scf_data.mol.ctrl.initial_guess.eq(&"sad") {
-        let cur_log_level = log::max_level();
-        log::set_max_level(LevelFilter::Info);
-        scf_data.density_matrix = initial_guess_from_sad(&scf_data.mol, mpi_operator);
-        log::set_max_level(cur_log_level);
+        if !scf_data.mol.ctrl.use_isdf {
+            let cur_log_level = log::max_level();
+            log::set_max_level(LevelFilter::Info);
+            scf_data.density_matrix = initial_guess_from_sad(&scf_data.mol, mpi_operator);
+            log::set_max_level(cur_log_level);
+        }
         //for DFT methods, it needs the eigenvectors to generate the hamiltoniam. In consequence, we use the hf method to prepare the eigenvectors from the guess dm
         //scf_data.generate_hf_hamiltonian_for_guess();
         //if scf_data.mol.ctrl.print_level>0 {println!("Initial guess HF energy: {:16.8}", scf_data.evaluate_hf_total_energy())};
@@ -296,6 +298,13 @@ pub fn update_basis_from_hdf5chk(scf_data: &mut SCF) {
             scf_data.mol.set_cint_data(atm, bas, env, ecp_raw, None, basis4elem, fdqc_bas, cint_fdqc);
             scf_data.mol.update_num_elec();
             scf_data.mol.start_mo = scf_data.mol.generate_start_mo(scf_data.mol.ecp_electrons);
+            // Fix (chkfile-basis + MPI/size>=2): 轨道基组在 initialize_scf 才经 set_cint_data 整体
+            // 替换 cint_env，而辅助基 cint/env 是按替换前的 env 布局建立的 → 2c2e 壳层指针错位
+            // → aux V 矩阵 NaN（full-RI 路径 n>=1 即触发；symm/MPI 路径 n>=2 触发，rank 集体处挂起）。
+            // 在 env 替换后重建辅助基，使壳层偏移与当前 env 一致。
+            if scf_data.mol.ctrl.use_auxbas {
+                scf_data.mol.initialize_auxbas();
+            }
         } else {
             panic!("Failed to load the basis set information from chkfile");
         }

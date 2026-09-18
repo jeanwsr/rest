@@ -3,15 +3,18 @@ Cargo.lock
 /debug_logs/
 *.log
 /examples/
-/tmp/
+*tmp/
 *.npz
-*.py
 *.pyc
 .ipynb_checkpoints/
 *.so
 bse_pool
 /examples/WFA/fchk/*chk
 /examples/WFA/fchk/*log
+/.cargo/
+*.in
+*.in.toml
+.DS_Store
 
 # Ignore the map for names and values of libxc
 # This file is generated automatically during the build process
@@ -25,4 +28,13 @@ GeomeTRIC*
 # Hessian output files
 HessianMatrix.txt
 EigenModes.txt
+_tmp*
+
+# Local modified MOLGW build used only for cross-validation against REST.
+# Never commit it into rest.git.
+/molgw_mod/
+
+# local cargo target used for this task
+/target_u/
 **/.DS_Store
+/.remote-assistant/
