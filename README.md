@@ -572,6 +572,8 @@ use_low_rank_contour = true
 低秩路径涉及的另外两个参数：
 
 - `cdgw_eta`: 取值f64，单位Hartree。实轴响应函数 χ₀(ω) 的 Lorentzian 展宽 η。缺省 `1e-3`。它与 `nomega_chi_real` 共同决定低秩实轴表示的精度：实轴格点间距需与 η 相称，否则相邻格点上的 `v·χ·v` 差异过大（低秩路径按"最近格点"取值，见下），单轮 GW 的误差可达 1e-3 Ha 量级。需要提高精度时优先增大 `nomega_chi_real`。
+> **C6H6 专项（未解决）**：C6H6 的 evGW 即使采用上述 MolGW 缺省、即使把 `nomega_chi_real` 提到 1024、**即使关掉低秩**（`use_low_rank_contour = false`，rest 的精确围道变形同样发散）仍不收敛。已确认下列旋钮都无效：`low_rank_interp`（linear/nearest）、`low_rank_demax_window`、`evgw_z_step`、`cdgw_res_tol`、`low_rank_tolerance`。把 `cdgw_eta` 设为 `0.0`（即取消实轴 χ₀ 的 Lorentzian 展宽，这也是 MolGW 的做法）可把残差从 3.75e-3 降到 **1.48e-3 Ha**，是至今最有效的单项改进。MolGW 在同一体系、**同样的粗糙实轴网格**（`de_max` = 10.7 Ha、64 点、`MINLOC` 最近格点）下用围道变形 evGW 收敛到约 4e-6 Ha，说明差异在 REST 的 Σ_c 求值内部，而非网格/低秩/更新规则/外循环加速。下一步应逐点对比两程序在相同 (n, ω) 上的 Σ_c。
+
 - `cdgw_res_tol`: 取值f64，单位Hartree。CD-GW 中极点/留数的**数值判据**（不是物理展宽）：`de >= -cdgw_res_tol` 时计入该极点，`|de| < cdgw_res_tol` 时按半权重 ×0.5 计入；`de_max` 扫描同样使用该阈值。缺省 `1e-3`。
 
 > **修正说明**：在本仓库此前的实现中，**低秩**围道变形路径把 `cdgw_eta` 当作留数判据使用，从而完全忽略了 `cdgw_res_tol`，与 `cdgw_res_tol` 的设计语义（"必须是小的数值容差，不能用物理展宽代替"）相矛盾；当两者取值不同（例如为了稳定而把 `cdgw_eta` 调大到 0.01）时，低秩路径的 Σ 会被半个极点权重污染，evGW 无法收敛。现已改为统一使用 `cdgw_res_tol`。两者取缺省值（均为 1e-3）时结果与修正前逐位一致；`cdgw_eta` 在低秩路径中只保留"实轴 χ₀ 展宽"的作用。
