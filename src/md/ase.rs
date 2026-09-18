@@ -1,30 +1,7 @@
-use std::cell::Cell;
-
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 pub const ASE_TIME_PER_FS: f64 = 10.180512809629851;
-
-type HookFn = dyn FnMut(&[f64]) -> anyhow::Result<(f64, Vec<f64>)>;
-
-#[pyclass(unsendable)]
-struct PyForceHook {
-    slot: Cell<Option<*mut (dyn FnMut(&[f64]) -> anyhow::Result<(f64, Vec<f64>)> + 'static)>>,
-}
-
-#[pymethods]
-impl PyForceHook {
-    fn __call__(&self, positions: Vec<f64>) -> PyResult<(f64, Vec<f64>)> {
-        let ptr = self.slot.get().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "REST MD: force hook invoked outside a propagation step",
-            )
-        })?;
-
-        let f: &mut (dyn FnMut(&[f64]) -> anyhow::Result<(f64, Vec<f64>)> + 'static) = unsafe { &mut *ptr };
-        f(&positions).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-    }
-}
 
 const PY_ASE_MD: &str = r#"
 import numpy as np
@@ -32,33 +9,18 @@ from ase import Atoms, units
 from ase.md.langevin import Langevin
 from ase.md.verlet import VelocityVerlet
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
-from ase.calculators.calculator import Calculator, all_changes
 from ase.constraints import FixAtoms
-
-class _RestCalculator(Calculator):
-    implemented_properties = ['energy', 'forces']
-
-    def __init__(self, hook):
-        Calculator.__init__(self)
-        self._hook = hook
-
-    def calculate(self, atoms=None, properties=('energy',), system_changes=all_changes):
-        Calculator.calculate(self, atoms)
-        energy, forces = self._hook(list(atoms.get_positions().flatten()))
-        self.results = {'energy': energy,
-                        'forces': np.asarray(forces, dtype=float).reshape(-1, 3)}
 
 class _RestAseMD:
     def __init__(self, symbols, masses, positions_ang, velocities_ang_fs,
                  temperature_k, friction, friction_units, dt_fs, ensemble,
-                 seed, fixed, hook):
+                 seed, fixed):
         atoms = Atoms(symbols=symbols,
                       positions=np.asarray(positions_ang, dtype=float).reshape(-1, 3),
                       masses=masses)
-        if fixed:
-            atoms.set_constraint(FixAtoms(indices=list(fixed)))
-        atoms.calc = _RestCalculator(hook)
-        self._hook = hook
+        self.fixed = list(fixed)
+        if self.fixed:
+            atoms.set_constraint(FixAtoms(indices=self.fixed))
         rng = np.random.default_rng(seed)
         if velocities_ang_fs is None:
             if temperature_k > 0.0:
@@ -79,48 +41,37 @@ class _RestAseMD:
         v = self.atoms.get_velocities()
         return [c for row in (v * float(units.fs)) for c in row]
 
-    def step(self):
-        self.dyn.step()
+    def step(self, forces_ev_ang):
+        f = np.asarray(forces_ev_ang, dtype=float).reshape(-1, 3)
+        for i in self.fixed:
+            f[i] = 0.0
+        self.dyn.step(forces=f)
         p = self.atoms.get_positions()
         return [c for row in p for c in row], self.velocities_ang_fs()
 
 class _RestAseOpt:
-    def __init__(self, symbols, masses, positions_ang, algorithm, frozen, hook):
+    def __init__(self, symbols, masses, positions_ang, fixed):
         atoms = Atoms(symbols=symbols,
                       positions=np.asarray(positions_ang, dtype=float).reshape(-1, 3),
                       masses=masses)
-        if frozen:
-            atoms.set_constraint(FixAtoms(indices=list(frozen)))
-        atoms.calc = _RestCalculator(hook)
-        from ase.optimize import FIRE, LBFGS
-        self.dyn = LBFGS(atoms, logfile=None) if algorithm == 'lbfgs' \
-            else FIRE(atoms, logfile=None)
+        self.fixed = list(fixed)
+        if self.fixed:
+            atoms.set_constraint(FixAtoms(indices=self.fixed))
+        from ase.optimize import FIRE
+        self.dyn = FIRE(atoms, logfile=None)
         self.atoms = atoms
 
-    def run(self, fmax, steps):
-        self.dyn.run(fmax=fmax, steps=steps)
+    def step(self, forces_ev_ang):
+        f = np.asarray(forces_ev_ang, dtype=float).reshape(-1, 3)
+        for i in self.fixed:
+            f[i] = 0.0
+        self.dyn.step(f=f)
         p = self.atoms.get_positions()
-        import ase
-        e = float(self.atoms.get_potential_energy())
-        n = int(self.dyn.get_number_of_steps())
-        converged = bool(getattr(self.dyn, 'converged', lambda: True)())
-        return [c for row in p for c in row], e, n, converged
+        return [c for row in p for c in row]
 "#;
 
 pub struct AseMd {
     driver: Py<PyAny>,
-    hook: Py<PyForceHook>,
-}
-
-struct HookGuard<'py> {
-    hook: &'py Py<PyForceHook>,
-    py: Python<'py>,
-}
-
-impl Drop for HookGuard<'_> {
-    fn drop(&mut self) {
-        self.hook.bind(self.py).borrow_mut().slot.set(None);
-    }
 }
 
 impl AseMd {
@@ -145,7 +96,6 @@ impl AseMd {
             let locals = PyDict::new(py);
 
             py.run(&code, Some(&locals), Some(&locals))?;
-            let hook = Py::new(py, PyForceHook { slot: Cell::new(None) })?;
             let cls = locals
                 .get_item("_RestAseMD")?
                 .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("_RestAseMD missing"))?;
@@ -161,9 +111,8 @@ impl AseMd {
                 ensemble.to_string(),
                 seed,
                 fixed_rows.to_vec(),
-                hook.clone_ref(py),
             ))?;
-            Ok(AseMd { driver: driver.into(), hook })
+            Ok(AseMd { driver: driver.into() })
         })
         .map_err(|e| anyhow::anyhow!("ASE MD engine construction failed: {}", e))
     }
@@ -178,16 +127,9 @@ impl AseMd {
         })
     }
 
-    pub fn step(
-        &self,
-        eval: &mut (dyn FnMut(&[f64]) -> anyhow::Result<(f64, Vec<f64>)> + '_),
-    ) -> anyhow::Result<(Vec<f64>, Vec<f64>)> {
+    pub fn step(&self, forces_ev_ang: &[f64]) -> anyhow::Result<(Vec<f64>, Vec<f64>)> {
         Python::with_gil(|py| -> PyResult<(Vec<f64>, Vec<f64>)> {
-            let raw: *mut (dyn FnMut(&[f64]) -> anyhow::Result<(f64, Vec<f64>)> + '_) = eval;
-            let erased: *mut (dyn FnMut(&[f64]) -> anyhow::Result<(f64, Vec<f64>)> + 'static) = unsafe { std::mem::transmute(raw) };
-            self.hook.bind(py).borrow_mut().slot.set(Some(erased));
-            let _guard = HookGuard { hook: &self.hook, py };
-            let res = self.driver.bind(py).call_method0("step")?;
+            let res = self.driver.bind(py).call_method1("step", (forces_ev_ang.to_vec(),))?;
             let pos: Vec<f64> = res.get_item(0)?.extract()?;
             let vel: Vec<f64> = res.get_item(1)?.extract()?;
             Ok((pos, vel))
@@ -198,7 +140,6 @@ impl AseMd {
 
 pub struct AseOpt {
     driver: Py<PyAny>,
-    hook: Py<PyForceHook>,
 }
 
 impl AseOpt {
@@ -206,7 +147,6 @@ impl AseOpt {
         symbols: &[String],
         masses_amu: &[f64],
         pos_ang: &[f64],
-        algorithm: &str,
         frozen: &[usize],
     ) -> anyhow::Result<Self> {
         pyo3::prepare_freethreaded_python();
@@ -214,7 +154,6 @@ impl AseOpt {
             let code = std::ffi::CString::new(PY_ASE_MD).unwrap();
             let locals = PyDict::new(py);
             py.run(&code, Some(&locals), Some(&locals))?;
-            let hook = Py::new(py, PyForceHook { slot: Cell::new(None) })?;
             let cls = locals
                 .get_item("_RestAseOpt")?
                 .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("_RestAseOpt missing"))?;
@@ -222,34 +161,20 @@ impl AseOpt {
                 symbols.to_vec(),
                 masses_amu.to_vec(),
                 pos_ang.to_vec(),
-                algorithm.to_string(),
                 frozen.to_vec(),
-                hook.clone_ref(py),
             ))?;
-            Ok(AseOpt { driver: driver.into(), hook })
+            Ok(AseOpt { driver: driver.into() })
         })
         .map_err(|e| anyhow::anyhow!("ASE opt engine construction failed: {}", e))
     }
 
-    pub fn run(
-        &self,
-        eval: &mut (dyn FnMut(&[f64]) -> anyhow::Result<(f64, Vec<f64>)> + '_),
-        fmax: f64,
-        steps: usize,
-    ) -> anyhow::Result<(Vec<f64>, f64, usize, bool)> {
-        Python::with_gil(|py| -> PyResult<(Vec<f64>, f64, usize, bool)> {
-            let raw: *mut (dyn FnMut(&[f64]) -> anyhow::Result<(f64, Vec<f64>)> + '_) = eval;
-            let erased: *mut (dyn FnMut(&[f64]) -> anyhow::Result<(f64, Vec<f64>)> + 'static) =
-                unsafe { std::mem::transmute(raw) };
-            self.hook.bind(py).borrow_mut().slot.set(Some(erased));
-            let _guard = HookGuard { hook: &self.hook, py };
-            let res = self.driver.bind(py).call_method1("run", (fmax, steps))?;
-            let pos: Vec<f64> = res.get_item(0)?.extract()?;
-            let energy: f64 = res.get_item(1)?.extract()?;
-            let nsteps: usize = res.get_item(2)?.extract()?;
-            let converged: bool = res.get_item(3)?.extract()?;
-            Ok((pos, energy, nsteps, converged))
+    pub fn step(&self, forces_ev_ang: &[f64]) -> anyhow::Result<Vec<f64>> {
+        Python::with_gil(|py| -> PyResult<Vec<f64>> {
+            self.driver
+                .bind(py)
+                .call_method1("step", (forces_ev_ang.to_vec(),))
+                .and_then(|r| r.extract())
         })
-        .map_err(|e| anyhow::anyhow!("ASE optimization failed: {}", e))
+        .map_err(|e| anyhow::anyhow!("ASE optimization step failed: {}", e))
     }
 }

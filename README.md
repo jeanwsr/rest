@@ -49,7 +49,7 @@
     2. `opt`: 基于数值力的构型优化。等价设置有：`geometry optimization`, `relax`, `geom_opt`等
 	3. `force`: 计算当前结构下的受力。等价设置有：`gradient`
 	4. `numerical dipole`: 计算数值偶极。等价设置有：`numdipole`
-	5. `md`: 内置分子动力学（详见 MD.md）。纯 MM 使用 `pure_mm = true`
+	5. `md`: 内置分子动力学（详见 [REST 文档 · MD](https://rest-doc.readthedocs.io/zh_CN/user/md.html)）。纯 MM 使用 `pure_mm = true`
 - `auxbasis_response`：开启辅助基导数。缺省为true
 - `opt_engine`: 取值String类型。构型优化引擎。可选项有：`LBFGS`、`geometric-pyo3`（缺省）
     - **注意**：固定原子功能（在 `position` 中用 `0`/`1` 标记）当前仅支持 `geometric-pyo3` 引擎，`LBFGS` 引擎暂不支持约束优化。
@@ -1283,14 +1283,15 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 
 `job_type = "md"` 时 REST 将启动一套内置的分子动力学引擎（MD 循环、积分器、伞形采样都在 REST 内，每一步的 QM 能量/梯度走与几何优化相同的进程内接口）：
 
-- **AIMD（纯 QM）**：体系只有 `[geom]` 的 QM 分子，每步先收敛 SCF 再移动原子核并取解析梯度；上一步的收敛波函数作为下一步初猜（`initial_guess = "inherit"`，显著减少迭代），SCF 用多线程（`num_threads`）并行。
+- **AIMD（纯 QM）**：体系只有 `[geom]` 的 QM 分子，每步先收敛 SCF 再移动原子核并取解析梯度；上一步的收敛波函数自动作为下一步初猜（内部设为 `initial_guess = "inherit"`，用户无需配置，显著减少迭代），SCF 用多线程（`num_threads`）并行。
 - **QM/MM**：`[geom]` 为 QM 区，MM 体系可用内嵌 OpenMM 提供（TIP3P 自动类型，或直接给完整的 OpenMM System XML），也可由 REST 从经典力场参数**内部生成** System XML（支持共价切断的 link-H）；QM–MM 之间为点电荷嵌入 + QM–MM LJ。
 - **纯 MM**：`pure_mm = true` 时整个体系交给 OpenMM（`mm_file` / `mm_system_xml`）。
 - **任务类型**：`ensemble = "nvt"`(Langevin) / `"nve"`(VelocityVerlet) / `"opt"`(几何优化) / `"sp"`(单点能量/受力)。
 - **伞形采样（US）**：`umbrella_atoms` 存在即启用；CV 支持 `dihedral` / `distance` / `angle` / `distance_diff`（后者可叠加 `umbrella_sum_kappa` 的 ½ks(s−s0)² 约束），输出 `umbrella_timeseries.csv` 供 (2D) WHAM 后处理。
 - **续跑**：`restart_input` 从上次的 `md_restart` 同时读位置与速度，无需改写 `[geom]`。
 - **输出**：`md.log`、`dump_{nvt|nve}.xyz`、`dipole.dat`、`energy_force.log`、`umbrella_timeseries.csv`、`md_restart`。
+- **Python 依赖**：MD/AIMD 的积分与优化由内嵌 Python 的 [ASE](https://wiki.fysik.dtu.dk/ase/) 完成，QM/MM 与纯 MM 的 MM 侧由 [OpenMM](https://openmm.org/) 完成；运行时需要有可用的 Python 及 `numpy`、`ase`、`openmm`（含 `openmm.app`）。参考环境：Python 3.10、numpy 2.2、ASE 3.29、OpenMM 8.6。
 
-MD 驱动只支持单进程；进程内用 OpenMP/Rayon 多线程（`num_threads`）并行 SCF 与积分，多进程 MPI 会在启动时被拒绝。
+纯 QM 的 AIMD 支持多进程 MPI（SCF 与积分沿 MPI 并行，所有 rank 同步积分、仅 root 落盘）。QM/MM 与纯 MM 目前只支持单进程：进程内用 OpenMP/Rayon 多线程（`num_threads`），多进程 MPI 会在启动时被拒绝。
 
-详情请见 MD.md
+详情请见 [REST 文档 · 内置分子动力学](https://rest-doc.readthedocs.io/zh_CN/user/md.html)。

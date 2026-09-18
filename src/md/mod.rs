@@ -270,6 +270,15 @@ fn bcast_f64(vec: &mut Vec<f64>, root: usize, mpi_operator: &Option<MPIOperator>
 #[cfg(not(feature = "mpi"))]
 fn bcast_f64(_vec: &mut Vec<f64>, _root: usize, _mpi_operator: &Option<MPIOperator>) {}
 
+pub fn require_single_process(mpi_operator: &Option<MPIOperator>) {
+    if mpi_operator.as_ref().map_or(false, |op| op.size > 1) {
+        panic!(
+            "MD run: multi-process MPI is only supported for pure-QM AIMD; \
+             QM/MM and pure-MM runs must be single-process with OpenMP threads"
+        );
+    }
+}
+
 pub fn is_pure_mm_run(ctrl_file: &str) -> bool {
     let raw = std::fs::read_to_string(ctrl_file).unwrap_or_default();
     let keys: serde_json::Value = if let Ok(v) = serde_json::from_str(&raw) {
@@ -293,7 +302,8 @@ pub fn is_pure_mm_run(ctrl_file: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn run_pure_mm(ctrl_file: &str) -> anyhow::Result<()> {
+pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<()> {
+    require_single_process(mpi_operator);
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let raw = std::fs::read_to_string(ctrl_file)?;
@@ -423,22 +433,37 @@ pub fn run_pure_mm(ctrl_file: &str) -> anyhow::Result<()> {
             &symbols,
             &mass_amu,
             &pos.iter().map(|x| x * crate::constants::BOHR).collect::<Vec<f64>>(),
-            &params.opt_algorithm,
             &[],
         )
         .unwrap_or_else(|e| panic!("MD run: {}", e));
         println!(
-            "Pure-MM geometry optimization: {} (fmax = {} eV/A, max {} steps)",
-            params.opt_algorithm, params.opt_fmax, params.opt_steps
+            "Pure-MM geometry optimization: fire (fmax = {} eV/A, max {} steps)",
+            params.opt_fmax, params.opt_steps
         );
-        let (p_ang, _e_ev, nsteps, converged) = opt
-            .run(&mut hook, params.opt_fmax, params.opt_steps)
-            .unwrap_or_else(|e| panic!("MD run: {}", e));
-        for i in 0..3 * n {
-            pos[i] = p_ang[i] / crate::constants::BOHR;
+        let mut nsteps = 0usize;
+        let mut converged = false;
+        loop {
+            let pos_ang: Vec<f64> = pos.iter().map(|x| x * crate::constants::BOHR).collect();
+            let (_e_ev, f_ev) = hook(&pos_ang).unwrap_or_else(|e| panic!("MD run: {}", e));
+            let fmax = f_ev
+                .chunks(3)
+                .map(|c| (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt())
+                .fold(0.0f64, f64::max);
+            if fmax <= params.opt_fmax {
+                converged = true;
+                break;
+            }
+            if nsteps >= params.opt_steps {
+                break;
+            }
+            let p_ang = opt.step(&f_ev).unwrap_or_else(|e| panic!("MD run: {}", e));
+            for i in 0..3 * n {
+                pos[i] = p_ang[i] / crate::constants::BOHR;
+            }
+            nsteps += 1;
         }
-        let (_, f_au) = evaluate(&pos)?;
-        let fmax = f_au.iter().fold(0.0f64, |a, x| a.max(x.abs())) * AU_FORCE2_EV_PER_ANG;
+        let fmax = last_f.borrow().iter().fold(0.0f64, |a, x| a.max(x.abs()))
+            * AU_FORCE2_EV_PER_ANG;
         let mut f = std::fs::File::create("opt_mm.log").unwrap();
         writeln!(f, "# steps converged fmax_eV/A E_MM_eV").unwrap();
         writeln!(
@@ -482,6 +507,13 @@ pub fn run_pure_mm(ctrl_file: &str) -> anyhow::Result<()> {
         .truncate(true)
         .open("dump_mm.xyz")
         .unwrap();
+    let mut seed = params.seed;
+    if seed == 0 {
+        seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(12345);
+    }
     let md = ase::AseMd::new(
         &symbols,
         &mass_amu,
@@ -492,7 +524,7 @@ pub fn run_pure_mm(ctrl_file: &str) -> anyhow::Result<()> {
         &params.friction_units,
         params.dt,
         &params.ensemble,
-        42,
+        seed,
         &[],
     )
     .unwrap_or_else(|e| panic!("MD run: {}", e));
@@ -503,7 +535,9 @@ pub fn run_pure_mm(ctrl_file: &str) -> anyhow::Result<()> {
         .collect();
     let f_for_traj = last_f.clone();
     for step in 1..=params.steps {
-        let (p_ang, v_ang) = md.step(&mut hook).unwrap_or_else(|e| panic!("MD run: {}", e));
+        let pos_ang: Vec<f64> = pos.iter().map(|x| x * crate::constants::BOHR).collect();
+        let (_e_ev, f_ev) = hook(&pos_ang).unwrap_or_else(|e| panic!("MD run: {}", e));
+        let (p_ang, v_ang) = md.step(&f_ev).unwrap_or_else(|e| panic!("MD run: {}", e));
         for i in 0..3 * n {
             pos[i] = p_ang[i] / crate::constants::BOHR;
             vel[i] = v_ang[i] * integrator::AU_TIME_TO_FS / crate::constants::BOHR;
@@ -580,6 +614,9 @@ pub fn run_md(
     let mut params = parameters::parse_md_keywords(&keys)
         .unwrap_or_else(|e| panic!("MD run: invalid [md] section: {}", e))
         .unwrap_or_default();
+    if params.qmmm.is_some() {
+        require_single_process(mpi_operator);
+    }
     if let Some(qp) = params.qmmm.as_mut() {
         if !qp.top.is_empty() {
             let base =
@@ -861,15 +898,6 @@ pub fn run_md(
     });
     let bias = bias_owned.as_ref();
 
-    if let Some(op) = mpi_operator {
-        if op.size > 1 {
-            panic!(
-                "MD run: multi-process MPI is not supported for MD; run single-process \
-                 with OpenMP threads"
-            );
-        }
-    }
-
     let restart_mode = !params.restart_input.is_empty();
     let mut vel: Vec<f64> = if restart_mode {
         let base = std::path::Path::new(ctrl_file).parent().unwrap_or(std::path::Path::new("."));
@@ -1108,19 +1136,36 @@ pub fn run_md(
             &symbols,
             &mass_amu,
             &pos.iter().map(|x| x * crate::constants::BOHR).collect::<Vec<f64>>(),
-            &params.opt_algorithm,
             &frozen,
         )
         .unwrap_or_else(|e| panic!("MD run: {}", e));
         println!(
-            "Geometry optimization: {} (fmax = {} eV/A, max {} steps), {} atoms",
-            params.opt_algorithm, params.opt_fmax, params.opt_steps, n_total
+            "Geometry optimization: fire (fmax = {} eV/A, max {} steps), {} atoms",
+            params.opt_fmax, params.opt_steps, n_total
         );
-        let (p_ang, _e_ev, nsteps, converged) =
-            opt.run(&mut hook, params.opt_fmax, params.opt_steps)
-                .unwrap_or_else(|e| panic!("MD run: {}", e));
-        for i in 0..3 * n_total {
-            pos[i] = p_ang[i] / crate::constants::BOHR;
+        let mut nsteps = 0usize;
+        let mut converged = false;
+        loop {
+            let pos_ang: Vec<f64> = pos.iter().map(|x| x * crate::constants::BOHR).collect();
+            let (_e_ev, f_ev) = hook(&pos_ang).unwrap_or_else(|e| panic!("MD run: {}", e));
+            let fmax = f_ev
+                .chunks(3)
+                .enumerate()
+                .filter(|(i, _)| !frozen.contains(i))
+                .map(|(_, c)| (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt())
+                .fold(0.0f64, f64::max);
+            if fmax <= params.opt_fmax {
+                converged = true;
+                break;
+            }
+            if nsteps >= params.opt_steps {
+                break;
+            }
+            let p_ang = opt.step(&f_ev).unwrap_or_else(|e| panic!("MD run: {}", e));
+            for i in 0..3 * n_total {
+                pos[i] = p_ang[i] / crate::constants::BOHR;
+            }
+            nsteps += 1;
         }
         let vel_zero = vec![0.0f64; 3 * n_total];
         if write_restart_files {
@@ -1129,9 +1174,16 @@ pub fn run_md(
                 params.steps, dt_fs, &symbols, &pos, &vel_zero,
             );
         }
-        let n_ghost =
-            if rt.is_some() { 0 } else { scf_data.mol.geom.ghost_pc_chrg.len() };
-        let mut s = format!("{}\n", n_total + n_ghost);
+        let bs_elem: Vec<String> = scf_data.mol.geom.ghost_bs_elem.clone();
+        let gbs = scf_data.mol.geom.ghost_bs_pos.data();
+        let n_bs = bs_elem.len().min(gbs.len() / 3);
+        let gpc = scf_data.mol.geom.ghost_pc_pos.data();
+        let n_pc = if rt.is_some() {
+            0
+        } else {
+            scf_data.mol.geom.ghost_pc_chrg.len().min(gpc.len() / 3)
+        };
+        let mut s = format!("{}\n", n_total + n_bs + n_pc);
         for i in 0..n_total {
             s.push_str(&format!(
                 "{:<2}{:15.8}{:15.8}{:15.8}\n",
@@ -1141,22 +1193,23 @@ pub fn run_md(
                 pos[3 * i + 2] * crate::constants::BOHR
             ));
         }
-
-        let gpos = scf_data.mol.geom.ghost_pc_pos.data();
-        let gelem: Vec<String> = scf_data.mol.geom.ghost_bs_elem.clone();
-        for k in 0..n_ghost {
-            let (sym, gx, gy, gz) = if k < gpos.len() / 3 {
-
-                (
-                    gelem.get(k).cloned().unwrap_or_else(|| "X".to_string()),
-                    gpos[3 * k] * crate::constants::BOHR,
-                    gpos[3 * k + 1] * crate::constants::BOHR,
-                    gpos[3 * k + 2] * crate::constants::BOHR,
-                )
-            } else {
-                ("X".to_string(), 0.0, 0.0, 0.0)
-            };
-            s.push_str(&format!("{:<2}{:15.8}{:15.8}{:15.8}\n", sym, gx, gy, gz));
+        for k in 0..n_bs {
+            s.push_str(&format!(
+                "{:<2}{:15.8}{:15.8}{:15.8}\n",
+                bs_elem[k],
+                gbs[3 * k] * crate::constants::BOHR,
+                gbs[3 * k + 1] * crate::constants::BOHR,
+                gbs[3 * k + 2] * crate::constants::BOHR
+            ));
+        }
+        for k in 0..n_pc {
+            s.push_str(&format!(
+                "{:<2}{:15.8}{:15.8}{:15.8}\n",
+                "X",
+                gpc[3 * k] * crate::constants::BOHR,
+                gpc[3 * k + 1] * crate::constants::BOHR,
+                gpc[3 * k + 2] * crate::constants::BOHR
+            ));
         }
         let _ = std::fs::write(format!("{}opt_final.xyz", params.out_prefix), s);
         let fev = last_feval.borrow();
@@ -1200,8 +1253,10 @@ pub fn run_md(
             *last_feval.borrow_mut() = Some(fe);
             Ok(out)
         };
+        let pos_ang: Vec<f64> = pos.iter().map(|x| x * crate::constants::BOHR).collect();
+        let (_e_ev, f_ev) = hook(&pos_ang).unwrap_or_else(|e| panic!("MD run: {}", e));
         let (p_ang, v_ang) =
-            ase_engine.step(&mut hook).unwrap_or_else(|e| panic!("MD run: {}", e));
+            ase_engine.step(&f_ev).unwrap_or_else(|e| panic!("MD run: {}", e));
         for i in 0..3 * n_total {
             pos[i] = p_ang[i] / crate::constants::BOHR;
             vel[i] = v_ang[i] * integrator::AU_TIME_TO_FS / crate::constants::BOHR;

@@ -37,8 +37,6 @@ pub struct MdParameters {
     #[serde(default = "one")]
     pub traj_interval: usize,
     pub equil_steps: usize,
-    #[serde(default = "default_opt_algorithm")]
-    pub opt_algorithm: String,
     #[serde(default = "default_opt_fmax")]
     pub opt_fmax: f64,
     #[serde(default = "default_opt_steps")]
@@ -178,7 +176,6 @@ fn default_steps() -> usize { 100 }
 fn default_temperature() -> f64 { 300.0 }
 fn default_friction() -> f64 { 0.02 }
 fn default_friction_units() -> String { String::from("ase") }
-fn default_opt_algorithm() -> String { String::from("fire") }
 fn default_opt_fmax() -> f64 { 0.02 }
 fn default_opt_steps() -> usize { 200 }
 fn default_box_margin() -> f64 { 11.0 }
@@ -237,7 +234,6 @@ impl Default for MdParameters {
             ensemble: default_ensemble(),
             dt: default_dt(),
             steps: default_steps(),
-            opt_algorithm: default_opt_algorithm(),
             opt_fmax: default_opt_fmax(),
             opt_steps: default_opt_steps(),
             temperature: default_temperature(),
@@ -326,9 +322,14 @@ impl MdParameters {
             ));
         }
         if let Some(umb) = &self.umbrella {
+            let kappa_unit = match (umb.potential.as_str(), umb.cv.as_str()) {
+                ("harmonic", "distance") | ("harmonic", "distance_diff") => "kcal/mol/A^2",
+                ("harmonic", _) => "kcal/mol/rad^2",
+                _ => "kcal/mol",
+            };
             out.push_str(&format!(
-                "\nUmbrella bias: potential = {}, atoms = {:?}, center = {} deg, kappa = {} kcal/mol",
-                umb.potential, umb.atoms, umb.center, umb.kappa
+                "\nUmbrella bias: potential = {}, atoms = {:?}, center = {} deg, kappa = {} {}",
+                umb.potential, umb.atoms, umb.center, umb.kappa, kappa_unit
             ));
             if umb.sum_kappa > 0.0 {
                 out.push_str(&format!(
@@ -372,7 +373,7 @@ const MD_KEYS: &[&str] = &[
     "qmmm_build_system", "qmmm_ff", "qmmm_mm_pdb", "qmmm_frontier",
     "qmmm_top", "qmmm_ff_dir", "qmmm_qm_atoms", "qmmm_frontier_rescale",
     "qmmm_nb_cutoff",
-    "opt_algorithm", "opt_fmax", "opt_steps",
+    "opt_fmax", "opt_steps",
     "umbrella_atoms", "umbrella_center",
     "umbrella_kappa", "umbrella_potential", "umbrella_cv",
     "umbrella_sum_kappa", "umbrella_sum_center",
@@ -465,7 +466,14 @@ pub fn parse_md_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Option<
         let mut qmmm = QmmmParams::default();
         qmmm.mm_file = mm_file;
         qmmm.build_system = build_system;
-        if let Some(v) = get_str("qmmm_water_model") { qmmm.water_model = v.to_lowercase(); }
+        if let Some(v) = get_str("qmmm_water_model") {
+            let lv = v.to_lowercase();
+            if lv != "tip3p" {
+                return Err(anyhow::anyhow!(
+                    "qmmm_water_model: only \"tip3p\" is currently supported, got \"{}\"", v));
+            }
+            qmmm.water_model = lv;
+        }
         if let Some(v) = get_num("qmmm_mm_cutoff") { qmmm.mm_cutoff = v; }
         if let Some(v) = get_num("mm_cutoff") { qmmm.mm_cutoff = v; }
         if let Some(v) = get_bool("qmmm_pbc") { qmmm.pbc = v; }
@@ -574,6 +582,13 @@ pub fn parse_md_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Option<
             }
         }
         p.qmmm = Some(qmmm);
+    } else if get_str("qmmm_system_xml").map(|s| !s.is_empty()).unwrap_or(false)
+        || get_str("mm_system_xml").map(|s| !s.is_empty()).unwrap_or(false)
+        || get_str("qmmm_mm_pdb").map(|s| !s.is_empty()).unwrap_or(false)
+    {
+        return Err(anyhow::anyhow!(
+            "QM/MM: qmmm_system_xml/mm_system_xml/qmmm_mm_pdb requires qmmm_mm_file (MM positions); \
+             set qmmm_mm_file, or qmmm_build_system/qmmm_top/qmmm_build_box"));
     }
 
     p.outputs = outputs_explicit.unwrap_or_else(|| default_outputs_for(p.qmmm.is_some()));
@@ -598,10 +613,6 @@ pub fn parse_md_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Option<
     {
         return Err(anyhow::anyhow!(
             "md ensemble must be \"nvt\", \"nve\", \"opt\" or \"sp\", got \"{}\"", p.ensemble));
-    }
-    if !p.opt_algorithm.eq("fire") && !p.opt_algorithm.eq("lbfgs") {
-        return Err(anyhow::anyhow!(
-            "md opt_algorithm must be \"fire\" or \"lbfgs\", got \"{}\"", p.opt_algorithm));
     }
     if p.opt_fmax <= 0.0 {
         return Err(anyhow::anyhow!("md opt_fmax must be positive, got {}", p.opt_fmax));

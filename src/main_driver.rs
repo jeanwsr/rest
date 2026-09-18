@@ -91,7 +91,7 @@ pub fn main_driver() -> anyhow::Result<()> {
         panic!("Input file ({:}) does not exist", ctrl_file);
     }
     if crate::md::is_pure_mm_run(&ctrl_file) {
-        crate::md::run_pure_mm(&ctrl_file)?;
+        crate::md::run_pure_mm(&ctrl_file, &mpi_operator)?;
         return Ok(());
     }
     let mut mol = Molecule::build(ctrl_file.clone(), mpi_data)?;

@@ -183,16 +183,16 @@ pub fn parse_openmm_system_xml(path: &str) -> anyhow::Result<MmSystem> {
     Ok(sys)
 }
 
-const TIP3P_Q_O: f64 = -0.834;
-const TIP3P_Q_H: f64 = 0.417;
-const TIP3P_R_OH_NM: f64 = 0.09572;
-const TIP3P_K_OH_KJMOL_NM2: f64 = 502416.0;
-const TIP3P_THETA_HOH_DEG: f64 = 104.52;
-const TIP3P_K_HOH_KJMOL_RAD2: f64 = 627.6;
+pub(crate) const TIP3P_Q_O: f64 = -0.834;
+pub(crate) const TIP3P_Q_H: f64 = 0.417;
+pub(crate) const TIP3P_R_OH_NM: f64 = 0.09572;
+pub(crate) const TIP3P_K_OH_KJMOL_NM2: f64 = 376560.0;
+pub(crate) const TIP3P_THETA_HOH_DEG: f64 = 104.52;
+pub(crate) const TIP3P_K_HOH_KJMOL_RAD2: f64 = 460.24;
 const TIP3P_SIGMA_O_NM: f64 = 0.315061;
 const TIP3P_EPS_O_KJMOL: f64 = 0.635976;
-const MASS_O_AMU: f64 = 15.9994;
-const MASS_H_AMU: f64 = 1.008;
+pub(crate) const MASS_O_AMU: f64 = 15.9994;
+pub(crate) const MASS_H_AMU: f64 = 1.008;
 
 const WATER_RESNAMES: [&str; 5] = ["SOL", "HOH", "WAT", "TIP3", "TIP"];
 
@@ -971,12 +971,24 @@ def _rest_build_system(pdb_path, ff_files, qm_atoms, qm_skip, links, frontier,
         for i in range(n):
             q, s, e = nb.getParticleParameters(i)
             nb.setParticleParameters(i, final[i], s, e)
+        par = [nb.getParticleParameters(i) for i in range(n)]
         ex_idx = {}
         for k in range(nb.getNumExceptions()):
             a, b, q, s, e = nb.getExceptionParameters(k)
+            a, b = int(a), int(b)
             ex_idx[(min(a, b), max(a, b))] = k
-            if a in qm and b in qm:
+            aq = a in qm
+            bq = b in qm
+            if aq and bq:
                 nb.setExceptionParameters(k, a, b, 0.0, 1.0, 0.0)
+            elif aq or bq:
+                sig = 0.5 * (par[a][1]._value + par[b][1]._value)
+                eps = (par[a][2]._value * par[b][2]._value) ** 0.5
+                if abs(e._value) > 1.0e-12:
+                    use_s, use_e = s._value, e._value
+                else:
+                    use_s, use_e = sig, eps
+                nb.setExceptionParameters(k, a, b, 0.0, use_s, use_e)
         ql = sorted(qm)
         for i in range(len(ql)):
             for j in range(i + 1, len(ql)):

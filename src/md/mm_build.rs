@@ -38,6 +38,62 @@ struct ForceField {
     dihedraltypes: BTreeMap<DihedralKey, Vec<Vec<String>>>,
     cmaptypes: BTreeMap<CmapKey, Vec<f64>>,
     nbfix: BTreeMap<(String, String), (f64, f64)>,
+    fudge_lj: f64,
+    fudge_qq: f64,
+    gen_pairs: bool,
+}
+
+fn load_defaults(sections: &[(String, Vec<Vec<String>>)]) -> Option<(f64, f64, bool)> {
+    sec(sections, "defaults").and_then(|rows| rows.first()).map(|f| {
+        let gen = f.get(2).map(|s| s.eq_ignore_ascii_case("yes")).unwrap_or(false);
+        let flj = f.get(3).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let fqq = f.get(4).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        (flj, fqq, gen)
+    })
+}
+
+fn gen_pairs_for_mol(m: &Molecule) -> Vec<(usize, usize)> {
+    let n = m.types.len();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut bonded: std::collections::BTreeSet<(usize, usize)> = std::collections::BTreeSet::new();
+    for (a, b, _, _) in &m.bonds {
+        adj[*a].push(*b);
+        adj[*b].push(*a);
+        bonded.insert(((*a).min(*b), (*a).max(*b)));
+    }
+    let mut existing: std::collections::BTreeSet<(usize, usize)> =
+        std::collections::BTreeSet::new();
+    for (a, b) in &m.pairs {
+        existing.insert(((*a).min(*b), (*a).max(*b)));
+    }
+    let mut out: std::collections::BTreeSet<(usize, usize)> = std::collections::BTreeSet::new();
+    for (b, c, _, _) in &m.bonds {
+        for &a in &adj[*b] {
+            if a == *c {
+                continue;
+            }
+            for &d in &adj[*c] {
+                if d == *b || d == a {
+                    continue;
+                }
+                let key = (a.min(d), a.max(d));
+                if bonded.contains(&key) {
+                    continue;
+                }
+                if bonded.contains(&(a.min(*c), a.max(*c))) {
+                    continue;
+                }
+                if bonded.contains(&((*b).min(d), (*b).max(d))) {
+                    continue;
+                }
+                if existing.contains(&key) {
+                    continue;
+                }
+                out.insert(key);
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 fn read_text(path: &Path) -> String {
@@ -104,6 +160,8 @@ fn secs<'a>(sections: &'a [(String, Vec<Vec<String>>)], name: &str) -> Vec<&'a V
 impl ForceField {
     fn load(ffdir: &Path) -> Self {
         let mut ff = ForceField::default();
+        ff.fudge_lj = 1.0;
+        ff.fudge_qq = 1.0;
         if let Some(rows) = sec(&read_sections(&ffdir.join("ffnonbonded.itp"), false), "atomtypes") {
             for f in rows {
                 if f.len() >= 2 {
@@ -164,6 +222,13 @@ impl ForceField {
         }
         ff.cmaptypes = load_cmaptypes(ffdir);
         ff.nbfix = load_nbfix(ffdir);
+        if let Some((flj, fqq, gen)) =
+            load_defaults(&read_sections(&ffdir.join("forcefield.itp"), false))
+        {
+            ff.fudge_lj = flj;
+            ff.fudge_qq = fqq;
+            ff.gen_pairs = gen;
+        }
         ff
     }
 }
@@ -677,7 +742,12 @@ pub fn build_system_from_top(
     let keep_order = !gro_path.is_empty();
     let struct_ = if keep_order { parse_gro(Path::new(gro_path)) } else { parse_pdb(Path::new(pdb_path)) };
     let n = struct_.positions.len();
-    let ff = ForceField::load(Path::new(ff_dir));
+    let mut ff = ForceField::load(Path::new(ff_dir));
+    if let Some((flj, fqq, gen)) = load_defaults(&read_sections(Path::new(top_path), true)) {
+        ff.fudge_lj = flj;
+        ff.fudge_qq = fqq;
+        ff.gen_pairs = gen;
+    }
 
     let mut mols: BTreeMap<String, Molecule> = BTreeMap::new();
     for inc in included_files(Path::new(top_path)) {
@@ -701,6 +771,7 @@ pub fn build_system_from_top(
     let mut harmonic: Vec<(usize, usize, usize, usize, f64, f64)> = Vec::new();
     let mut rb: Vec<(usize, usize, usize, usize, [f64; 6])> = Vec::new();
     let mut pairs: Vec<(usize, usize)> = Vec::new();
+    let mut gen_pairs: Vec<(usize, usize)> = Vec::new();
     let mut cmaps: Vec<(usize, usize, usize, usize, usize, CmapKey)> = Vec::new();
     let mut exclusions: Vec<(usize, usize)> = Vec::new();
     let mut ub: Vec<(usize, usize, f64, f64)> = Vec::new();
@@ -721,6 +792,9 @@ pub fn build_system_from_top(
             harmonic.extend(m.harmonic.iter().map(|(a, b, c, d, p, k)| (a + off, b + off, c + off, d + off, *p, *k)));
             rb.extend(m.rb.iter().map(|(a, b, c, d, cs)| (a + off, b + off, c + off, d + off, *cs)));
             pairs.extend(m.pairs.iter().map(|(a, b)| (a + off, b + off)));
+            if m.pairs.is_empty() && ff.gen_pairs {
+                gen_pairs.extend(gen_pairs_for_mol(m).iter().map(|(a, b)| (a + off, b + off)));
+            }
             cmaps.extend(m.cmaps.iter().map(|(a, b, c, d, e, key)| (a + off, b + off, c + off, d + off, e + off, key.clone())));
             exclusions.extend(m.exclusions.iter().map(|(a, b)| (a + off, b + off)));
             ub.extend(m.ub.iter().map(|(a, b, r, k)| (a + off, b + off, *r, *k)));
@@ -781,17 +855,52 @@ pub fn build_system_from_top(
     for (a, b) in &exclusions {
         excl12.insert(((*a).min(*b), (*a).max(*b)));
     }
+    let pair_lj = |i: usize, j: usize| -> (f64, f64) {
+        ff.pairtypes
+            .get(&(types[i].clone(), types[j].clone()))
+            .cloned()
+            .unwrap_or_else(|| {
+                let (si, ei) = ff.atomtypes[&types[i]];
+                let (sj, ej) = ff.atomtypes[&types[j]];
+                (0.5 * (si + sj), (ei * ej).sqrt())
+            })
+    };
     for k in excl12.iter().chain(excl13.iter()) {
-        tables.set(k.0, k.1, 0.0, 1.0, 0.0);
+        let (i, j) = (k.0, k.1);
+        let qi = qm_set.contains(&i);
+        let qj = qm_set.contains(&j);
+        if qi && qj {
+            tables.set(i, j, 0.0, 1.0, 0.0);
+        } else if qi || qj {
+            let (sig, eps) = pair_lj(i, j);
+            tables.set(i, j, 0.0, sig, eps);
+        } else {
+            tables.set(i, j, 0.0, 1.0, 0.0);
+        }
     }
     for (i, j) in &pairs {
-        let pt = ff.pairtypes.get(&(types[*i].clone(), types[*j].clone())).cloned().unwrap_or_else(|| {
+        let (sig, eps) = pair_lj(*i, *j);
+        let q = if qm_set.contains(i) || qm_set.contains(j) { 0.0 } else { charges[*i] * charges[*j] };
+        tables.set(*i, *j, q, sig, eps);
+    }
+    for (i, j) in &gen_pairs {
+        let has_pt = ff.pairtypes.contains_key(&(types[*i].clone(), types[*j].clone()));
+        let (sig, eps) = if has_pt {
+            ff.pairtypes
+                .get(&(types[*i].clone(), types[*j].clone()))
+                .cloned()
+                .unwrap_or((0.0, 0.0))
+        } else {
             let (si, ei) = ff.atomtypes[&types[*i]];
             let (sj, ej) = ff.atomtypes[&types[*j]];
-            (0.5 * (si + sj), (ei * ej).sqrt())
-        });
-        let q = if qm_set.contains(i) || qm_set.contains(j) { 0.0 } else { charges[*i] * charges[*j] };
-        tables.set(*i, *j, q, pt.0, pt.1);
+            (0.5 * (si + sj), (ei * ej).sqrt() * ff.fudge_lj)
+        };
+        let q = if qm_set.contains(i) || qm_set.contains(j) {
+            0.0
+        } else {
+            charges[*i] * charges[*j] * ff.fudge_qq
+        };
+        tables.set(*i, *j, q, sig, eps);
     }
     let mut by_type: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, t) in types.iter().enumerate() {
@@ -896,13 +1005,24 @@ fn make_tip3p() -> Molecule {
     Molecule {
         name: "SOL".into(),
         types: vec!["OT".into(), "HT".into(), "HT".into()],
-        charges: vec![-0.834, 0.417, 0.417],
-        masses: vec![15.9994, 1.008, 1.008],
+        charges: vec![super::mm::TIP3P_Q_O, super::mm::TIP3P_Q_H, super::mm::TIP3P_Q_H],
+        masses: vec![super::mm::MASS_O_AMU, super::mm::MASS_H_AMU, super::mm::MASS_H_AMU],
         resnames: vec!["SOL".into(); 3],
         atomnames: vec!["OW".into(), "HW1".into(), "HW2".into()],
         resids: vec![1; 3],
-        bonds: vec![(0, 1, 0.09572, 376560.0), (0, 2, 0.09572, 376560.0)],
-        angles: vec![(1, 0, 2, 104.52, 460.24, 0.0, 0.0)],
+        bonds: vec![
+            (0, 1, super::mm::TIP3P_R_OH_NM, super::mm::TIP3P_K_OH_KJMOL_NM2),
+            (0, 2, super::mm::TIP3P_R_OH_NM, super::mm::TIP3P_K_OH_KJMOL_NM2),
+        ],
+        angles: vec![(
+            1,
+            0,
+            2,
+            super::mm::TIP3P_THETA_HOH_DEG,
+            super::mm::TIP3P_K_HOH_KJMOL_RAD2,
+            0.0,
+            0.0,
+        )],
         exclusions: vec![(0, 1), (0, 2), (1, 2)],
         ..Default::default()
     }
