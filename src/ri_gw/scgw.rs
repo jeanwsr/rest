@@ -664,6 +664,11 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
                  if max_step_cap>0.0{format!("{:.3e} Ha",max_step_cap)}else{String::from("unlimited")});
     }
 
+    let degeneracy_tol=qp_ctrl.evgw_degeneracy_tol;
+    if report && degeneracy_tol>0.0 {
+        println!("evGW degeneracy projection: QP energies of Kohn-Sham-degenerate partners (within {:.1e} Ha) are averaged every round.", degeneracy_tol);
+    }
+    let ks_reference=scf_data.eigenvalues[0].clone();
     let mut diis=EvgwDiis::new(diis_space,diis_start,diis_safeguard);
     let mut converged=false;
     let mut last_residual=f64::INFINITY;
@@ -675,11 +680,20 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
         let cancel_dfa_xc=true;
         // Energy vector fed into this round (G and W both built from it, as in
         // MolGW's GnWn / PySCF's EVGW with W0 = False).
-        let qp_in=scf_data.gwqp.0.clone();
+        let mut qp_in=scf_data.gwqp.0.clone();
+        symmetrize_degenerate_subspaces(&mut qp_in,&ks_reference,degeneracy_tol);
         scf_data.gwqp.0=qp_in.clone();
         scf_data.gwqp.1=qp_in.clone();
-        // One full GW pass: exact quasiparticle-equation solve per orbital.
-        let qp_out=g0w0(scf_data,num_freq,vxc_nn,cancel_dfa_xc);
+        // One full GW pass (root solve, single evaluation or Z-damped step,
+        // depending on `evgw_solver`).
+        let mut qp_out=g0w0(scf_data,num_freq,vxc_nn,cancel_dfa_xc);
+        // Apply the degeneracy projection to the raw output too, so that the
+        // convergence metric and the mixing both work with the projected
+        // vector.  Otherwise the frozen out-of-window orbitals -- which are
+        // returned at their (slightly different) Kohn-Sham energies -- keep a
+        // constant mismatch against the projected input and the loop can never
+        // report convergence even though the iterate has stopped moving.
+        symmetrize_degenerate_subspaces(&mut qp_out,&ks_reference,degeneracy_tol);
 
         // Convergence measures.
         let mut max_de=0.0_f64;
@@ -696,7 +710,8 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
         last_residual=max_de;
         last_dg=dg;
 
-        let qp_next=diis.update(&qp_in,&qp_out,damping,max_step_cap,use_diis);
+        let mut qp_next=diis.update(&qp_in,&qp_out,damping,max_step_cap,use_diis);
+        symmetrize_degenerate_subspaces(&mut qp_next,&ks_reference,degeneracy_tol);
         let mut max_step=0.0_f64;
         for n in 0..nstate.min(qp_next.len()){
             let d=(qp_next[n]-qp_in[n]).abs();
@@ -785,6 +800,46 @@ fn one_shot_step<F: Fn(f64) -> f64>(
 /// Central finite difference of the quasiparticle equation at `x`.
 fn central_difference<F: Fn(f64) -> f64>(f: &F, x: f64, h: f64) -> f64 {
     (f(x + h) - f(x - h)) / (2.0 * h)
+}
+
+/// Project the quasiparticle energies onto the (near-)degenerate subspaces of
+/// the reference (Kohn-Sham) spectrum.
+///
+/// evGW must respect the degeneracies of the reference: symmetry-degenerate
+/// partners have equal quasiparticle energies.  REST's integrals and DFT grid
+/// break that symmetry numerically (the KS partners differ by ~1e-5 Ha), and
+/// the evGW map *amplifies* the resulting antisymmetric mode -- for C6H6 the
+/// E1g HOMO pair goes from a 1.8e-5 Ha KS splitting to 8.2e-3 Ha, i.e. a factor
+/// 450, and it then oscillates.  MolGW does not show this because its integrals
+/// keep the pairs exactly degenerate (its CO2 1pi_g pair has a splitting of
+/// 0.000000 eV throughout the GnWn run).
+///
+/// Grouping is done on the *reference* spectrum, which is fixed, so the grouping
+/// cannot drift during the iteration.  `tol <= 0` disables the projection.
+fn symmetrize_degenerate_subspaces(values: &mut [f64], reference: &[f64], tol: f64) -> usize {
+    if tol <= 0.0 || values.len() < 2 {
+        return 0;
+    }
+    let n = values.len().min(reference.len());
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| reference[a].partial_cmp(&reference[b]).unwrap_or(std::cmp::Ordering::Equal));
+    let mut merged = 0_usize;
+    let mut start = 0_usize;
+    while start < n {
+        let mut end = start + 1;
+        while end < n && reference[idx[end]] - reference[idx[start]] <= tol {
+            end += 1;
+        }
+        if end - start > 1 {
+            let mean: f64 = idx[start..end].iter().map(|&i| values[i]).sum::<f64>() / (end - start) as f64;
+            for &i in &idx[start..end] {
+                values[i] = mean;
+            }
+            merged += end - start;
+        }
+        start = end;
+    }
+    merged
 }
 
 /// First/last orbital index whose KS energy lies inside the explicitly computed

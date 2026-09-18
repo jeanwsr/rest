@@ -441,6 +441,11 @@ REST 提供**两种可选的 evGW 求解技巧**，由 `evgw_solver` 选择：
 
   该步长必须同时满足两个尺度条件：**明显大于最小的虚轴求积频点**（`num_freq = 20` 时约为 `1.7e-3 Ha`，否则差分会被 `Σ_imag` 在极点处的 1/ω_p 尖峰污染，`Z` 会塌缩到 0），且**不大于留数判据 `cdgw_res_tol`**（否则 ±h 两点会落在留数半权重斜坡的两侧，差分被截断偏差污染）。实测：`h = 1e-5` 给出 `∂(Σ−ω)/∂ω = +68`（完全错误），`h = 1e-3` 给出 `−9.3`（`Z = 0.11`，过慢），`h = 1e-2` 与 `h = 5e-2` 分别给出 `−1.121` 与 `−1.109`（正确、`Z ≈ 0.89`）。
 
+- `evgw_degeneracy_tol`: 取值f64，单位Hartree，缺省 `1e-4`。evGW 的**简并投影**容差。
+  evGW 必须保持对称性简并伙伴的能量相等；REST 的积分与 DFT 网格在数值上破坏了这一对称性（KS 简并对劈裂约 1e-5 Ha），而 evGW 映射会**放大**由此产生的反对称模——C6H6 的 E1g HOMO 对从 KS 的 1.8e-5 Ha 放大到 **8.2e-3 Ha** 并持续振荡，这正是它不收敛的原因（NH3 的 E 简并对同理，只是幅度小些）。MolGW 不需要这一步，因为它的积分让简并对**严格简并**（其 CO2 的 1πg HOMO 对在整个 GnWn 过程中劈裂恒为 0.000000 eV）。
+  设为正数时，**Kohn-Sham 能量**相差不超过该容差的轨道被当作一个块、每轮把它们的准粒子能量替换为组内平均。分组依据固定的 KS 谱，因此不会在迭代中漂移。设为 `0.0` 关闭。
+  实测：H2O 这类无简并体系上，开/关该投影的结果差别为 **2.6e-14 Ha**（机器精度），即对无简并体系零影响。
+
 - `evgw_diis`: 取值bool，缺省 `true`。是否对整条准粒子能量矢量做 Pulay/DIIS 外推（与 `pyscf.gw.evgw` 中对 `mo_energy` 做 `pyscf.lib.diis.DIIS` 完全对应）。它**叠加在** `evgw_solver` 所选用的每轮映射之上——这个叠加正是"一套设置同时适配两类困难"的关键：`molgw` 的单次求值消除对低秩实轴网格的敏感性（CH4、CO2），DIIS 作为 Krylov 加速器压制标量步无法控制的近简并对反对称模（NH3、C6H6）。
 - `evgw_diis_space`: DIIS 历史长度。缺省 8。
 - `evgw_diis_start`: 至少积累多少个残差矢量后才启用外推。缺省 2。
@@ -572,7 +577,9 @@ use_low_rank_contour = true
 低秩路径涉及的另外两个参数：
 
 - `cdgw_eta`: 取值f64，单位Hartree。实轴响应函数 χ₀(ω) 的 Lorentzian 展宽 η。缺省 `1e-3`。它与 `nomega_chi_real` 共同决定低秩实轴表示的精度：实轴格点间距需与 η 相称，否则相邻格点上的 `v·χ·v` 差异过大（低秩路径按"最近格点"取值，见下），单轮 GW 的误差可达 1e-3 Ha 量级。需要提高精度时优先增大 `nomega_chi_real`。
-> **C6H6 专项（未解决）**：C6H6 的 evGW 即使采用上述 MolGW 缺省、即使把 `nomega_chi_real` 提到 1024、**即使关掉低秩**（`use_low_rank_contour = false`，rest 的精确围道变形同样发散）仍不收敛。已确认下列旋钮都无效：`low_rank_interp`（linear/nearest）、`low_rank_demax_window`、`evgw_z_step`、`cdgw_res_tol`、`low_rank_tolerance`。把 `cdgw_eta` 设为 `0.0`（即取消实轴 χ₀ 的 Lorentzian 展宽，这也是 MolGW 的做法）可把残差从 3.75e-3 降到 **1.48e-3 Ha**，是至今最有效的单项改进。MolGW 在同一体系、**同样的粗糙实轴网格**（`de_max` = 10.7 Ha、64 点、`MINLOC` 最近格点）下用围道变形 evGW 收敛到约 4e-6 Ha，说明差异在 REST 的 Σ_c 求值内部，而非网格/低秩/更新规则/外循环加速。下一步应逐点对比两程序在相同 (n, ω) 上的 Σ_c。
+> **C6H6 已解决**：C6H6（pbe/cc-pVDZ，低秩围道，`nomega_chi_real = 64`）在缺省设置下 **11 轮收敛到 1.9e-6 Ha**（此前 80 轮停在 3.75e-3 Ha、精确围道变形甚至发散）。关键是 `evgw_degeneracy_tol` 的简并投影：它把 E1g HOMO 对的劈裂从被放大的 8.2e-3 Ha 拉回到 −2.24e-5 Ha（与 KS 的 1.8e-5 Ha 同量级）。下表列出为定位该问题而排除的旋钮，供后续参考：
+>
+> `low_rank_interp`（linear/nearest）、`low_rank_demax_window`、`nomega_chi_real`（至 1024）、`cdgw_res_tol`、`cdgw_eta`（含 0.0）、`low_rank_tolerance`、`gw_variant = "ac"`（换成光滑的 Padé 自能同样不收敛）、以及**关掉低秩的精确围道变形**（同样发散）—— 全部不能解决；它们共同说明问题不在 Σ 的离散化，而在简并对的反对称模被放大。
 
 - `cdgw_res_tol`: 取值f64，单位Hartree。CD-GW 中极点/留数的**数值判据**（不是物理展宽）：`de >= -cdgw_res_tol` 时计入该极点，`|de| < cdgw_res_tol` 时按半权重 ×0.5 计入；`de_max` 扫描同样使用该阈值。缺省 `1e-3`。
 

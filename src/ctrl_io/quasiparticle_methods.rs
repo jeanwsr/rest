@@ -121,6 +121,22 @@ pub struct QuasiParticle {
     /// `false` = standard Pulay/DIIS behaviour (free extrapolation, rejected
     /// only when non-finite or clearly runaway).
     pub evgw_diis_safeguard:bool,
+    /// Tolerance (Ha) for the evGW degeneracy projection.
+    ///
+    /// evGW must keep symmetry-degenerate partners degenerate.  REST's integrals
+    /// and DFT grid break that symmetry numerically (its Kohn-Sham partners
+    /// differ by ~1e-5 Ha) and the evGW map amplifies the resulting
+    /// antisymmetric mode: for C6H6 the E1g HOMO pair goes from a 1.8e-5 Ha KS
+    /// splitting to 8.2e-3 Ha and then oscillates, which is what prevents
+    /// convergence.  With a positive tolerance, orbitals whose *Kohn-Sham*
+    /// energies lie within the tolerance are updated as a block (their
+    /// quasiparticle energies are replaced by the group average) every round.
+    /// MolGW does not need this because its integrals keep the pairs exactly
+    /// degenerate.
+    ///
+    /// Grouping uses the fixed KS spectrum, so it cannot drift during the
+    /// iteration.  Default `1e-4` Ha; set to `0.0` to disable.
+    pub evgw_degeneracy_tol:f64,
     /// MolGW-style handling of the orbitals outside the explicitly computed
     /// window during evGW.
     ///
@@ -339,6 +355,7 @@ impl Default for QuasiParticle {
             evgw_diis_start:2,
             evgw_diis_safeguard:false,
             evgw_freeze_outside:true,
+            evgw_degeneracy_tol:1e-4,
             evgw_z_step:0.01,
             evgw_max_step:0.0,
             evgw_conv_tol:1e-5,
@@ -487,6 +504,7 @@ impl QuasiParticle {
         table.insert("evgw_diis_start".to_string(), toml::Value::Integer(self.evgw_diis_start as i64));
         table.insert("evgw_diis_safeguard".to_string(), toml::Value::Boolean(self.evgw_diis_safeguard));
         table.insert("evgw_freeze_outside".to_string(), toml::Value::Boolean(self.evgw_freeze_outside));
+        table.insert("evgw_degeneracy_tol".to_string(), toml::Value::Float(self.evgw_degeneracy_tol));
         table.insert("evgw_z_step".to_string(), toml::Value::Float(self.evgw_z_step));
         table.insert("evgw_max_step".to_string(), toml::Value::Float(self.evgw_max_step));
         table.insert("evgw_conv_tol".to_string(), toml::Value::Float(self.evgw_conv_tol));
@@ -832,6 +850,11 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.evgw_freeze_outside = match tmp_ctrl.get("evgw_freeze_outside").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
                 _ => {true},
+            };
+            tmp_input.evgw_degeneracy_tol = match tmp_ctrl.get("evgw_degeneracy_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(1e-4_f64)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-4)},
+                _ => {1e-4}
             };
             tmp_input.evgw_z_step = match tmp_ctrl.get("evgw_z_step").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(0.01_f64)},
