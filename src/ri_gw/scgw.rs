@@ -341,7 +341,7 @@ fn gw_near_fermi_surface_spin_lowrank(
         nsemax[s] = op.homo.saturating_add(range).min(op.num_state.saturating_sub(1));
     }
     let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
-    let real_axis_vchiv = ri_gw::generate_real_axis_vchiv_spin(
+    let mut real_axis_vchiv = ri_gw::generate_real_axis_vchiv_spin(
         &gwqp_g_all,
         &gwqp_w_all,
         &ops,
@@ -358,6 +358,7 @@ fn gw_near_fermi_surface_spin_lowrank(
         qp_ctrl.cdgw_eta,
         qp_ctrl.cdgw_res_tol,
     );
+    real_axis_vchiv.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
 
     let mut out = [vec![], vec![]];
     for spin in 0..nspin {
@@ -634,7 +635,11 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
     let (_start_mo,_num_state,occ_size,_vir_size,_homo,_lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let damping=qp_ctrl.evgw_damping.clamp(1.0e-3,1.0);
-    let use_diis=qp_ctrl.evgw_diis;
+    let solver=if qp_ctrl.evgw_solver.eq_ignore_ascii_case("z_update"){String::from("z_update")}else{String::from("diis")};
+    // The two solvers are alternative accelerators for the same fixed-point
+    // problem and must not be stacked: with `z_update` each GW pass already
+    // takes a (damped) Newton step, so DIIS is switched off.
+    let use_diis=qp_ctrl.evgw_diis && solver=="diis";
     let diis_space=qp_ctrl.evgw_diis_space;
     let diis_start=qp_ctrl.evgw_diis_start;
     let conv_tol=qp_ctrl.evgw_conv_tol;
@@ -644,8 +649,8 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
     let max_step_cap=qp_ctrl.evgw_max_step;
 
     if qp_ctrl.scgw=="evgw" && report{
-        println!("evGW outer-loop settings: damping(alpha)={:.4}, DIIS={} (space={}, start={}, safeguard={}), conv_tol={:.3e} Ha, stop_on_convergence={}, max_step={}",
-                 damping,use_diis,diis_space.max(2),diis_start.max(2),diis_safeguard,conv_tol,stop_on_conv,
+        println!("evGW outer-loop settings: solver={}, damping(alpha)={:.4}, DIIS={} (space={}, start={}, safeguard={}), conv_tol={:.3e} Ha, stop_on_convergence={}, max_step={}",
+                 solver,damping,use_diis,diis_space.max(2),diis_start.max(2),diis_safeguard,conv_tol,stop_on_conv,
                  if max_step_cap>0.0{format!("{:.3e} Ha",max_step_cap)}else{String::from("unlimited")});
     }
 
@@ -714,7 +719,7 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
     if !converged && iter_rounds>0{
         println!("WARNING: evGW did not reach conv_tol={:.4e} Ha within {} round(s); last max|dE_qp|={:.4e} Ha, |dG|={:.4e}.",
                  conv_tol,iter_rounds,last_residual,last_dg);
-        println!("         Consider reducing evgw_damping, keeping evgw_diis = true, or increasing evgw_rounds.");
+        println!("         Consider reducing evgw_damping, keeping evgw_diis = true (solver=\"diis\"; for solver=\"z_update\" DIIS does not apply), or increasing evgw_rounds.");
     }
     let final_qp=scf_data.gwqp.0.clone();
     if report && iter_rounds>0{
@@ -722,6 +727,53 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
     }
     final_qp
 }
+/// Step size (Ha) of the central finite difference used to obtain the
+/// quasiparticle-equation derivative for the MolGW-style `z_update` solver.
+const Z_UPDATE_DERIVATIVE_H: f64 = 1.0e-5;
+
+/// One MolGW-style Z-damped quasiparticle step.
+///
+/// MolGW's eigenvalue-self-consistent `GnWn` loop does not iterate the
+/// quasiparticle equation to its root; it takes a single *linearized* Newton
+/// step per GW pass (`find_qp_energy_linearization` in
+/// `m_selfenergy_tools.f90`):
+///
+///     E_out = E_in + Z * (E_KS - V_xc + Sigma_c(E_in) - E_in),
+///     Z     = 1 / (1 - dSigma_c/domega),   clamped to [0, 1].
+///
+/// `qp_eq(omega)` here is `consts + Sigma_c(omega) - omega`, so
+/// `E_out = E_in + Z * qp_eq(E_in)` and `d(qp_eq)/domega = Sigma_c' - 1`,
+/// hence `Z = -1 / (d qp_eq / d omega)`.  Clamping Z to `[0, 1]` guarantees
+/// that a weak self-energy pole sitting close to `E_in` (which would give a
+/// tiny or sign-changing `dSigma/domega`) cannot produce an overshoot; this is
+/// exactly the `MIN(MAX(zz, 0), 1)` clamp in MolGW.
+///
+/// Returns `(E_out, Z, qp_eq(E_in))`.
+fn z_update_step<F: Fn(f64) -> f64>(qp_eq: &F, e_in: f64, h: f64) -> (f64, f64, f64, f64) {
+    let g0 = qp_eq(e_in);
+    if !g0.is_finite() {
+        return (e_in, 0.0, g0, f64::NAN);
+    }
+    let dq = central_difference(qp_eq, e_in, h);
+    let mut z = if dq.is_finite() && dq.abs() > 1.0e-12 { -1.0 / dq } else { 0.0 };
+    if !z.is_finite() {
+        z = 0.0;
+    }
+    z = z.clamp(0.0, 1.0);
+    (e_in + z * g0, z, g0, dq)
+}
+
+/// Central finite difference of the quasiparticle equation at `x`.
+fn central_difference<F: Fn(f64) -> f64>(f: &F, x: f64, h: f64) -> f64 {
+    (f(x + h) - f(x - h)) / (2.0 * h)
+}
+
+/// True when the evGW outer loop is configured to use the MolGW-style
+/// Z-damped single-step update instead of the PySCF-style DIIS extrapolation.
+fn use_z_update(qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle) -> bool {
+    qp_ctrl.scgw == "evgw" && qp_ctrl.evgw_solver.eq_ignore_ascii_case("z_update")
+}
+
 pub fn single_orbital_gw_ac(
     scf_data: &mut SCF,
     v_matrix: &MatrixFull<f64>,
@@ -810,7 +862,21 @@ pub fn single_orbital_gw_ac(
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
-    if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
+    if use_z_update(&qp_ctrl) {
+        // MolGW-style Z-damped update (see z_update_step).
+        let e_in = gwqp_g[n];
+        let (e_out, z, g0, dq) = z_update_step(&qp_eq_func, e_in, qp_ctrl.evgw_z_step);
+        if scf_data.mol.ctrl.print_level > 1 {
+            println!("  [z_update diag] d(Sigma-omega)/domega at h=1e-5: {:.4e}, h=1e-3: {:.4e}, h=1e-2: {:.4e}, h=5e-2: {:.4e}",
+                     central_difference(&qp_eq_func, e_in, 1.0e-5),
+                     central_difference(&qp_eq_func, e_in, 1.0e-3),
+                     central_difference(&qp_eq_func, e_in, 1.0e-2),
+                     central_difference(&qp_eq_func, e_in, 5.0e-2));
+        }
+        println!("Orbital #{} (AC, z_update): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
+                 n, e_in, z, g0, dq, e_out);
+        qp_energy_no_fse = e_out;
+    } else if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
         // Static approximation: Σ_c evaluated at the KS energy.
         let sigma_static = match pade.evaluate_retarded(e_ks_n, ac_eta) {
             Ok(s) => s.re,
@@ -962,7 +1028,21 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
-    if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
+    if use_z_update(&qp_ctrl) {
+        // MolGW-style Z-damped update (see z_update_step).
+        let e_in = gwqp_g[n];
+        let (e_out, z, g0, dq) = z_update_step(&qp_eq_func_no_fse, e_in, qp_ctrl.evgw_z_step);
+        if scf_data.mol.ctrl.print_level > 1 {
+            println!("  [z_update diag] d(Sigma-omega)/domega at h=1e-5: {:.4e}, h=1e-3: {:.4e}, h=1e-2: {:.4e}, h=5e-2: {:.4e}",
+                     central_difference(&qp_eq_func_no_fse, e_in, 1.0e-5),
+                     central_difference(&qp_eq_func_no_fse, e_in, 1.0e-3),
+                     central_difference(&qp_eq_func_no_fse, e_in, 1.0e-2),
+                     central_difference(&qp_eq_func_no_fse, e_in, 5.0e-2));
+        }
+        println!("Orbital #{} (z_update): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
+                 n, e_in, z, g0, dq, e_out);
+        qp_energy_no_fse = e_out;
+    } else if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
         qp_energy_no_fse = qp_eq_func_no_fse(e_ks_n) + e_ks_n;
         println!("Orbital #{}: |E_KS|={:.6} > gw_switch_fallback_threshold={:.6}, using static fallback QP energy={:.6}",
                  n, e_ks_n.abs(), qp_ctrl.gw_switch_fallback_threshold, qp_energy_no_fse);
@@ -1292,7 +1372,8 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
             .min(num_state_2.saturating_sub(1));
         let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
         let pl = scf_data.mol.ctrl.print_level;
-        Some(ri_gw::generate_real_axis_vchiv(
+        Some({
+            let mut ra = ri_gw::generate_real_axis_vchiv(
             &gwqp_g, &gwqp_w, occ_size_2, vir_size_2, num_state_2,
             &ri_ov,
             qp_ctrl.nomega_chi_real,
@@ -1305,7 +1386,10 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
             pl,
             qp_ctrl.cdgw_eta,
             qp_ctrl.cdgw_res_tol,
-        ))
+            );
+            ra.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
+            ra
+        })
     } else {
         None
     };
@@ -1422,7 +1506,28 @@ fn single_orbital_gw_lowrank(
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
-    if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
+    if use_z_update(&qp_ctrl) {
+        // MolGW-style Z-damped update (see z_update_step).
+        let qp_eq_func = |omega: f64| {
+            ri_gw::quasiparticle_equation_lowrank(
+                omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
+                occ_size, vir_size, num_state,
+                w_c_at_freqs, real_axis_vchiv, 0, cdgw_res_tol,
+            )
+        };
+        let e_in = gwqp_g[n];
+        let (e_out, z, g0, dq) = z_update_step(&qp_eq_func, e_in, qp_ctrl.evgw_z_step);
+        if scf_data.mol.ctrl.print_level > 1 {
+            println!("  [z_update diag] d(Sigma-omega)/domega at h=1e-5: {:.4e}, h=1e-3: {:.4e}, h=1e-2: {:.4e}, h=5e-2: {:.4e}",
+                     central_difference(&qp_eq_func, e_in, 1.0e-5),
+                     central_difference(&qp_eq_func, e_in, 1.0e-3),
+                     central_difference(&qp_eq_func, e_in, 1.0e-2),
+                     central_difference(&qp_eq_func, e_in, 5.0e-2));
+        }
+        println!("Orbital #{} (low-rank, z_update): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
+                 n, e_in, z, g0, dq, e_out);
+        qp_energy_no_fse = e_out;
+    } else if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
@@ -1575,7 +1680,28 @@ fn single_orbital_gw_lowrank_v2(
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
-    if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
+    if use_z_update(&qp_ctrl) {
+        // MolGW-style Z-damped update (see z_update_step).
+        let qp_eq_func = |omega: f64| {
+            ri_gw::quasiparticle_equation_lowrank_v2(
+                omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
+                occ_size, vir_size, num_state,
+                wc_rows, real_axis_vchiv, 0, cdgw_res_tol,
+            )
+        };
+        let e_in = gwqp_g[n];
+        let (e_out, z, g0, dq) = z_update_step(&qp_eq_func, e_in, qp_ctrl.evgw_z_step);
+        if scf_data.mol.ctrl.print_level > 1 {
+            println!("  [z_update diag] d(Sigma-omega)/domega at h=1e-5: {:.4e}, h=1e-3: {:.4e}, h=1e-2: {:.4e}, h=5e-2: {:.4e}",
+                     central_difference(&qp_eq_func, e_in, 1.0e-5),
+                     central_difference(&qp_eq_func, e_in, 1.0e-3),
+                     central_difference(&qp_eq_func, e_in, 1.0e-2),
+                     central_difference(&qp_eq_func, e_in, 5.0e-2));
+        }
+        println!("Orbital #{} (low-rank v2, z_update): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
+                 n, e_in, z, g0, dq, e_out);
+        qp_energy_no_fse = e_out;
+    } else if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank_v2(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
