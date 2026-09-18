@@ -866,17 +866,7 @@ pub fn build_system_from_top(
             })
     };
     for k in excl12.iter().chain(excl13.iter()) {
-        let (i, j) = (k.0, k.1);
-        let qi = qm_set.contains(&i);
-        let qj = qm_set.contains(&j);
-        if qi && qj {
-            tables.set(i, j, 0.0, 1.0, 0.0);
-        } else if qi || qj {
-            let (sig, eps) = pair_lj(i, j);
-            tables.set(i, j, 0.0, sig, eps);
-        } else {
-            tables.set(i, j, 0.0, 1.0, 0.0);
-        }
+        tables.set(k.0, k.1, 0.0, 1.0, 0.0);
     }
     for (i, j) in &pairs {
         let (sig, eps) = pair_lj(*i, *j);

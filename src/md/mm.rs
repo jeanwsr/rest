@@ -971,24 +971,14 @@ def _rest_build_system(pdb_path, ff_files, qm_atoms, qm_skip, links, frontier,
         for i in range(n):
             q, s, e = nb.getParticleParameters(i)
             nb.setParticleParameters(i, final[i], s, e)
-        par = [nb.getParticleParameters(i) for i in range(n)]
         ex_idx = {}
         for k in range(nb.getNumExceptions()):
             a, b, q, s, e = nb.getExceptionParameters(k)
-            a, b = int(a), int(b)
             ex_idx[(min(a, b), max(a, b))] = k
-            aq = a in qm
-            bq = b in qm
-            if aq and bq:
+            if a in qm and b in qm:
                 nb.setExceptionParameters(k, a, b, 0.0, 1.0, 0.0)
-            elif aq or bq:
-                sig = 0.5 * (par[a][1]._value + par[b][1]._value)
-                eps = (par[a][2]._value * par[b][2]._value) ** 0.5
-                if abs(e._value) > 1.0e-12:
-                    use_s, use_e = s._value, e._value
-                else:
-                    use_s, use_e = sig, eps
-                nb.setExceptionParameters(k, a, b, 0.0, use_s, use_e)
+            elif a in qm or b in qm:
+                nb.setExceptionParameters(k, a, b, 0.0, s, e)
         ql = sorted(qm)
         for i in range(len(ql)):
             for j in range(i + 1, len(ql)):

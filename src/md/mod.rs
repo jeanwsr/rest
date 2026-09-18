@@ -787,6 +787,23 @@ pub fn run_md(
                 top.n_mm, gro_skip, top.box_nm[0], top.box_nm[1], top.box_nm[2]
             );
         }
+        let n_cmp = gro_skip.min(n_qm).min(top.n_mm);
+        if n_cmp > 0 {
+            let mut maxdev = 0.0f64;
+            for i in 0..3 * n_cmp {
+                maxdev = maxdev.max((pos[i] - top.pos_bohr[i]).abs());
+            }
+            let dev_a = maxdev * crate::constants::BOHR;
+            if dev_a > 0.05 {
+                panic!(
+                    "MD run: the first {} atoms of '{}' do not match the [geom] QM block \
+                     (max deviation {:.3} A). '{}' must list the QM atoms first, in the same \
+                     order as [geom], for the first qmmm_gro_skip atoms \
+                     (stale [geom] or mismatched qmmm_gro_skip/qmmm_qm_atoms?).",
+                    gro_skip, qp.mm_file, dev_a, qp.mm_file
+                );
+            }
+        }
         if xml_mode {
             let xml_path = base.join(&qp.system_xml);
             let sys = mm::parse_openmm_system_xml(xml_path.to_str().unwrap())
