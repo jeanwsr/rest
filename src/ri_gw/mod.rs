@@ -1894,7 +1894,7 @@ fn get_homo_lumo_qp_only_lowrank(
     let step_sigma = qp_ctrl.step_sigma;
     let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
     let pl = scf_data.mol.ctrl.print_level;
-    let real_axis_vchiv = generate_real_axis_vchiv(
+    let mut real_axis_vchiv = generate_real_axis_vchiv(
         &quasiparticle_energies_g,
         &quasiparticle_energies_w,
         occ_size,
@@ -1913,6 +1913,7 @@ fn get_homo_lumo_qp_only_lowrank(
         qp_ctrl.cdgw_eta,
         qp_ctrl.cdgw_res_tol,
     );
+    real_axis_vchiv.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
     let n = homo;
     let mut exchange = 0.0;
     for i in 0..homo + 1 {
@@ -1930,7 +1931,7 @@ fn get_homo_lumo_qp_only_lowrank(
         &quasiparticle_energies_g, &quasiparticle_energies_w,
         occ_size, vir_size, num_state,
         &wc_rows, &real_axis_vchiv,
-        eigenenergies[n], 0.00001, 50, side, printlevel, qp_ctrl.cdgw_eta,
+        eigenenergies[n], 0.00001, 50, side, printlevel, qp_ctrl.cdgw_res_tol,
     );
     println!("The QP energy of HOMO obtained by GWA (low-rank) is {}", homo_qp);
 
@@ -1952,7 +1953,7 @@ fn get_homo_lumo_qp_only_lowrank(
         &quasiparticle_energies_g, &quasiparticle_energies_w,
         occ_size, vir_size, num_state,
         &wc_rows, &real_axis_vchiv,
-        eigenenergies[n], 0.00001, 50, side, printlevel, qp_ctrl.cdgw_eta,
+        eigenenergies[n], 0.00001, 50, side, printlevel, qp_ctrl.cdgw_res_tol,
     );
 
     let save_path = qp_ctrl.save_qp_path.clone();
@@ -1995,6 +1996,11 @@ pub struct RealAxisVChiV {
     pub omega_max: f64,
     pub n_points: usize,
     pub grid_type: usize,    // 0 = linear, 1 = power-law (quadratic, denser near zero)
+    /// How `v*chi*v` is obtained between grid points:
+    /// 0 = nearest grid point (piecewise constant; historical behaviour and
+    ///     the rule used by MolGW's `sf_interpolate_vsqrt_chi_vsqrt`),
+    /// 1 = linear interpolation between the two bracketing grid points.
+    pub interp: usize,
 }
 
 impl LowRankVChiV {
@@ -2346,6 +2352,7 @@ pub fn generate_real_axis_vchiv(
         omega_max: de_max,
         n_points: nomega_chi_real,
         grid_type: grid_type,
+        interp: 1,
     }
 }
 
@@ -2451,6 +2458,7 @@ pub fn generate_real_axis_vchiv_spin(
         omega_max: de_max,
         n_points: nomega_chi_real,
         grid_type,
+        interp: 1,
     }
 }
 
@@ -2491,6 +2499,75 @@ pub fn interpolate_vchiv_nearest<'a>(
     } else {
         &real_axis.grid[hi]
     }
+}
+
+/// Bracket of the real-axis grid around `de_abs`, together with the
+/// interpolation weight `t` of the upper bracket entry, so that the
+/// interpolated operator is `M(de) = (1-t) M(grid[lo]) + t M(grid[hi])`.
+/// Outside the grid the value is clamped to the boundary entry (`t = 0`).
+pub fn interpolate_vchiv_bracket<'a>(
+    real_axis: &'a RealAxisVChiV,
+    de_abs: f64,
+) -> (&'a LowRankVChiV, &'a LowRankVChiV, f64) {
+    let n = real_axis.grid.len();
+    if n <= 1 {
+        return (&real_axis.grid[0], &real_axis.grid[0], 0.0);
+    }
+    if de_abs <= real_axis.grid[0].omega {
+        return (&real_axis.grid[0], &real_axis.grid[0], 0.0);
+    }
+    if de_abs >= real_axis.grid[n - 1].omega {
+        return (&real_axis.grid[n - 1], &real_axis.grid[n - 1], 0.0);
+    }
+    let mut lo = 0_usize;
+    let mut hi = n - 1;
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if real_axis.grid[mid].omega < de_abs {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let w_lo = real_axis.grid[lo].omega;
+    let w_hi = real_axis.grid[hi].omega;
+    let t = if (w_hi - w_lo).abs() > 1.0e-300 {
+        (de_abs - w_lo) / (w_hi - w_lo)
+    } else {
+        0.0
+    };
+    (&real_axis.grid[lo], &real_axis.grid[hi], t.clamp(0.0, 1.0))
+}
+
+/// Residue contraction `ri^T M(de) ri` with the real-axis low-rank `v*chi*v`
+/// taken either from the nearest grid point (`interp == 0`; piecewise constant,
+/// the historical REST behaviour and the rule MolGW uses in
+/// `sf_interpolate_vsqrt_chi_vsqrt`) or by linear interpolation between the two
+/// bracketing grid points (`interp == 1`).
+///
+/// Linear interpolation needs no eigenvector matching between neighbouring grid
+/// points: the contraction `ri^T M ri = sum_v (ri . e_v)^2 lambda_v` is invariant
+/// under the sign and the ordering of the eigenvectors, so the two
+/// factorisations can simply be contracted separately and combined with the
+/// interpolation weights.
+pub fn compute_residue_lowrank_interp(
+    real_axis: &RealAxisVChiV,
+    de_abs: f64,
+    ri_vec: &[f64],
+) -> f64 {
+    if real_axis.interp == 0 {
+        let lr = interpolate_vchiv_nearest(real_axis, de_abs);
+        return compute_single_residue_lowrank(lr, ri_vec);
+    }
+    let (lo, hi, t) = interpolate_vchiv_bracket(real_axis, de_abs);
+    if std::ptr::eq(lo, hi) || t <= 0.0 {
+        return compute_single_residue_lowrank(lo, ri_vec);
+    }
+    if t >= 1.0 {
+        return compute_single_residue_lowrank(hi, ri_vec);
+    }
+    (1.0 - t) * compute_single_residue_lowrank(lo, ri_vec)
+        + t * compute_single_residue_lowrank(hi, ri_vec)
 }
 
 /// Compute a single residue contribution using the low-rank representation:
@@ -2772,11 +2849,11 @@ pub fn quasiparticle_equation_lowrank_v2(
     wc_rows: &Vec<(f64, f64, Vec<f64>)>,
     real_axis_vchiv: &RealAxisVChiV,
     print_level: usize,
-    eta: f64,
+    res_tol: f64,
 ) -> f64 {
     let contour = contour_rayon_lowrank(
         omega, n, quasiparticle_energies_g, quasiparticle_energies_w, occ_size, vir_size,
-        num_state, ri_row_n, real_axis_vchiv, print_level, eta,
+        num_state, ri_row_n, real_axis_vchiv, print_level, res_tol,
     );
     let imag = calculate_imag_from_rows(wc_rows, omega, quasiparticle_energies_g);
     if print_level > 2 {
@@ -2805,7 +2882,7 @@ pub fn newton_solver_lowrank_v2(
     max_iter: usize,
     side: f64,
     printlevel: usize,
-    eta: f64,
+    res_tol: f64,
 ) -> f64 {
     let h = 0.000001;
     let delta = 0.02;
@@ -2814,7 +2891,7 @@ pub fn newton_solver_lowrank_v2(
     let qp_eq = |omega: f64| {
         quasiparticle_equation_lowrank_v2(
             omega, n, consts, ri_row_n, quasiparticle_energies_g, quasiparticle_energies_w,
-            occ_size, vir_size, num_state, wc_rows, real_axis_vchiv, 0, eta,
+            occ_size, vir_size, num_state, wc_rows, real_axis_vchiv, 0, res_tol,
         )
     };
 
@@ -2896,10 +2973,9 @@ pub fn contour_rayon_lowrank(
             let mut residue = 0.0_f64;
             let de = omega - quasiparticle_energies_g[a_global];
             if de >= -res_tol {
-                let lr = interpolate_vchiv_nearest(real_axis_vchiv, de);
                 let ri_vec: Vec<f64> = ri_row_n.iter_column(a_global).copied().collect();
                 let pole_factor = if de.abs() < res_tol { 0.5 } else { 1.0 };
-                residue = compute_single_residue_lowrank(lr, &ri_vec) * pole_factor;
+                residue = compute_residue_lowrank_interp(real_axis_vchiv, de.abs(), &ri_vec) * pole_factor;
                 if print_level > 2 {
                     println!("[DEBUG individual residue] virtual a={} eps_a={:.6} de={:.6}  factor={:.2}  residue_contrib={:.10}",
                              a_global, quasiparticle_energies_g[a_global], de, pole_factor, residue * sign);
@@ -2979,10 +3055,9 @@ pub fn contour_rayon_lowrank(
             let mut residue = 0.0_f64;
             let de = quasiparticle_energies_g[i] - omega;
             if de >= -res_tol {
-                let lr = interpolate_vchiv_nearest(real_axis_vchiv, de);
                 let ri_vec: Vec<f64> = ri_row_n.iter_column(i).copied().collect();
                 let pole_factor = if de.abs() < res_tol { 0.5 } else { 1.0 };
-                residue = compute_single_residue_lowrank(lr, &ri_vec) * pole_factor;
+                residue = compute_residue_lowrank_interp(real_axis_vchiv, de.abs(), &ri_vec) * pole_factor;
                 if print_level > 2 {
                     println!("[DEBUG individual residue] occupied i={} eps_i={:.6} de={:.6}  factor={:.2}  residue_contrib={:.10}",
                              i, quasiparticle_energies_g[i], de, pole_factor, residue * sign);
@@ -3022,10 +3097,9 @@ pub fn contour_rayon_lowrank_spin(
             let mut residue = 0.0_f64;
             let de = omega - quasiparticle_energies_g[a_global];
             if de >= -res_tol {
-                let lr = interpolate_vchiv_nearest(real_axis_vchiv, de);
                 let ri_vec: Vec<f64> = ri_row_n.iter_column(a_col).copied().collect();
                 let pole_factor = if de.abs() < res_tol { 0.5 } else { 1.0 };
-                residue = compute_single_residue_lowrank(lr, &ri_vec) * pole_factor;
+                residue = compute_residue_lowrank_interp(real_axis_vchiv, de.abs(), &ri_vec) * pole_factor;
             }
             residue * sign
         }).sum()
@@ -3035,10 +3109,9 @@ pub fn contour_rayon_lowrank_spin(
             let mut residue = 0.0_f64;
             let de = quasiparticle_energies_g[i_global] - omega;
             if de >= -res_tol {
-                let lr = interpolate_vchiv_nearest(real_axis_vchiv, de);
                 let ri_vec: Vec<f64> = ri_row_n.iter_column(i_col).copied().collect();
                 let pole_factor = if de.abs() < res_tol { 0.5 } else { 1.0 };
-                residue = compute_single_residue_lowrank(lr, &ri_vec) * pole_factor;
+                residue = compute_residue_lowrank_interp(real_axis_vchiv, de.abs(), &ri_vec) * pole_factor;
             }
             residue * sign
         }).sum()
@@ -3093,11 +3166,11 @@ pub fn quasiparticle_equation_lowrank(
     w_c_at_freqs: &Vec<(f64, f64, MatrixFull<f64>)>,
     real_axis_vchiv: &RealAxisVChiV,
     print_level: usize,
-    eta: f64,
+    res_tol: f64,
 ) -> f64 {
     let contour = contour_rayon_lowrank(
         omega, n, quasiparticle_energies_g, quasiparticle_energies_w,
-        occ_size, vir_size, num_state, ri_row_n, real_axis_vchiv, print_level, eta,
+        occ_size, vir_size, num_state, ri_row_n, real_axis_vchiv, print_level, res_tol,
     );
     let imag = calculate_imag(
         w_c_at_freqs, num_state, n, omega,
@@ -3128,7 +3201,7 @@ pub fn newton_solver_lowrank(
     max_iter: usize,
     side: f64,
     printlevel: usize,
-    eta: f64,
+    res_tol: f64,
 ) -> f64 {
     let h = 0.000001;
     let delta = 0.02;
@@ -3138,7 +3211,7 @@ pub fn newton_solver_lowrank(
         quasiparticle_equation_lowrank(
             omega, n, consts, ri_row_n,
             quasiparticle_energies_g, quasiparticle_energies_w,
-            occ_size, vir_size, num_state, w_c_at_freqs, real_axis_vchiv, 0, eta,
+            occ_size, vir_size, num_state, w_c_at_freqs, real_axis_vchiv, 0, res_tol,
         )
     };
 
@@ -3253,7 +3326,7 @@ pub fn gw_calculations_lowrank(
     let step_sigma = qp_ctrl.step_sigma;
     let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
     let pl = scf_data.mol.ctrl.print_level;
-    let real_axis_vchiv = generate_real_axis_vchiv(
+    let mut real_axis_vchiv = generate_real_axis_vchiv(
         &quasiparticle_energies_g,
         &quasiparticle_energies_w,
         occ_size,
@@ -3272,11 +3345,12 @@ pub fn gw_calculations_lowrank(
         qp_ctrl.cdgw_eta,
         qp_ctrl.cdgw_res_tol,
     );
+    real_axis_vchiv.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
 
     // Check whether self-energy correction is enabled
     let use_fourier = qp_ctrl.fourier_self_energy;
     let use_hermite = qp_ctrl.hermite_self_energy;
-    let cdgw_eta = qp_ctrl.cdgw_eta;
+    let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
 
     if use_fourier && use_hermite {
         panic!("Cannot enable both Fourier self-energy and Hermite self-energy simultaneously!");
@@ -3305,7 +3379,7 @@ pub fn gw_calculations_lowrank(
                     omega, n, consts, &ri_row_n,
                     &quasiparticle_energies_g, &quasiparticle_energies_w,
                     occ_size, vir_size, num_state,
-                    &wc_rows, &real_axis_vchiv, 0, cdgw_eta,
+                    &wc_rows, &real_axis_vchiv, 0, cdgw_res_tol,
                 )
             };
             let (_have_crossing, real_qp) =
@@ -3355,7 +3429,7 @@ pub fn gw_calculations_lowrank(
                         omega, n, consts, &ri_row_n,
                         &quasiparticle_energies_g, &quasiparticle_energies_w,
                         occ_size, vir_size, num_state,
-                        &wc_rows, &real_axis_vchiv, 0, cdgw_eta,
+                        &wc_rows, &real_axis_vchiv, 0, cdgw_res_tol,
                     ) + fourier_self_energy::fourier_series(
                         &sin_coeff, &cos_coeff, powers, t, omega - origin,
                     )
@@ -3402,7 +3476,7 @@ pub fn gw_calculations_lowrank(
                         omega, n, consts, &ri_row_n,
                         &quasiparticle_energies_g, &quasiparticle_energies_w,
                         occ_size, vir_size, num_state,
-                        &wc_rows, &real_axis_vchiv, 0, cdgw_eta,
+                        &wc_rows, &real_axis_vchiv, 0, cdgw_res_tol,
                     ) + fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff)
                 };
 
@@ -3476,7 +3550,7 @@ pub fn linearized_gw_lowrank(
     let step_sigma = qp_ctrl.step_sigma;
     let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
     let pl = scf_data.mol.ctrl.print_level;
-    let real_axis_vchiv = generate_real_axis_vchiv(
+    let mut real_axis_vchiv = generate_real_axis_vchiv(
         &quasiparticle_energies_g,
         &quasiparticle_energies_w,
         occ_size,
@@ -3495,11 +3569,12 @@ pub fn linearized_gw_lowrank(
         qp_ctrl.cdgw_eta,
         qp_ctrl.cdgw_res_tol,
     );
+    real_axis_vchiv.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
 
     let h = qp_ctrl.gw_linearize_derivative_h;
     let use_fourier = qp_ctrl.fourier_self_energy;
     let use_hermite = qp_ctrl.hermite_self_energy;
-    let cdgw_eta = qp_ctrl.cdgw_eta;
+    let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
 
     if use_fourier && use_hermite {
         panic!("Cannot enable both Fourier self-energy and Hermite self-energy simultaneously!");
@@ -3518,7 +3593,7 @@ pub fn linearized_gw_lowrank(
                     omega, n, 0.0, &ri_row_n,
                     &quasiparticle_energies_g, &quasiparticle_energies_w,
                     occ_size, vir_size, num_state,
-                    &wc_rows, &real_axis_vchiv, 0, cdgw_eta,
+                    &wc_rows, &real_axis_vchiv, 0, cdgw_res_tol,
                 )
             };
 
@@ -3527,7 +3602,7 @@ pub fn linearized_gw_lowrank(
                 omega_shifted, n,
                 &quasiparticle_energies_g, &quasiparticle_energies_w,
                 occ_size, vir_size, num_state,
-                &ri_row_n, &real_axis_vchiv, 0, cdgw_eta,
+                &ri_row_n, &real_axis_vchiv, 0, cdgw_res_tol,
             );
 
             let imag_plus_h = calculate_imag_from_rows(
@@ -3540,13 +3615,13 @@ pub fn linearized_gw_lowrank(
                 omega_shifted + h, n,
                 &quasiparticle_energies_g, &quasiparticle_energies_w,
                 occ_size, vir_size, num_state,
-                &ri_row_n, &real_axis_vchiv, 0, cdgw_eta,
+                &ri_row_n, &real_axis_vchiv, 0, cdgw_res_tol,
             );
             let contour_minus_h = contour_rayon_lowrank(
                 omega_shifted - h, n,
                 &quasiparticle_energies_g, &quasiparticle_energies_w,
                 occ_size, vir_size, num_state,
-                &ri_row_n, &real_axis_vchiv, 0, cdgw_eta,
+                &ri_row_n, &real_axis_vchiv, 0, cdgw_res_tol,
             );
 
             let self_energy_plus_h = contour_plus_h - imag_plus_h;
@@ -3600,7 +3675,7 @@ pub fn linearized_gw_lowrank(
                         omega, n,
                         &quasiparticle_energies_g, &quasiparticle_energies_w,
                         occ_size, vir_size, num_state,
-                        &ri_row_n, &real_axis_vchiv, 0, cdgw_eta,
+                        &ri_row_n, &real_axis_vchiv, 0, cdgw_res_tol,
                     );
                     let imag = calculate_imag_from_rows(&wc_rows, omega, &quasiparticle_energies_g);
                     let fse = fourier_self_energy::fourier_series(
@@ -3658,7 +3733,7 @@ pub fn linearized_gw_lowrank(
                         omega, n,
                         &quasiparticle_energies_g, &quasiparticle_energies_w,
                         occ_size, vir_size, num_state,
-                        &ri_row_n, &real_axis_vchiv, 0, cdgw_eta,
+                        &ri_row_n, &real_axis_vchiv, 0, cdgw_res_tol,
                     );
                     let imag = calculate_imag_from_rows(&wc_rows, omega, &quasiparticle_energies_g);
                     let hse = fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff);

@@ -417,7 +417,77 @@ GW计算通过 `gw_or_bse = “gw”` 启动（也内置于 `”bse”` 模式�
 - `scgw`: 取值String，决定GW的自洽方案。可选项：
     - `”g0w0”`（缺省）：单次GW计算，不做自洽迭代。
     - `”evgw”`：本征值自洽GW（evGW），迭代更新准粒子能量中的G部分。需配合 `evgw_rounds` 设置迭代次数。
-- `evgw_rounds`: 取值usize，evGW自洽迭代的轮数。仅在 `scgw = “evgw”` 时需要设置。缺省为0。
+- `evgw_rounds`: 取值usize，evGW自洽迭代的轮数（上限）。仅在 `scgw = "evgw"` 时需要设置。缺省为0。
+
+#### evGW 外循环收敛控制
+
+evGW 的本质是对映射 `E^(k+1) = F(E^(k))`（`F` = 一轮完整 GW）做不动点迭代。与 PySCF、MolGW 的经验一致，**不做任何加速的朴素迭代对多数分子不会收敛**：`F` 的 Jacobian 在不动点附近有接近甚至超过单位模的特征值，迭代会落入极限环；若再叠加低秩等离面路径中"最近格点"选取带来的分段常值（不连续）误差，连迭代轨迹的逐次可复现性都会丧失。
+
+REST 提供**两种可选的 evGW 求解技巧**，由 `evgw_solver` 选择：
+
+- `evgw_solver`: 取值String，evGW 外循环求解技巧。
+    - `"molgw"`（缺省）：**MolGW 实际执行的更新规则**——每个轨道每轮只做**一次求值**
+      `E_out = consts + Σ_c(E_in)`（`Z ≡ 1`，不求根、不阻尼）。MolGW 的 `selfenergy_init` 对 `EVSC` 技术只设 `se%nomega = 0`，所以 `find_qp_energy_linearization` 里的 Z 分支是死代码；MolGW 的输出表逐位验证了 `E_qp = E0 + SigX−Vxc + SigC`（`E0` 恒为 KS 能量）。**每轮不在循环内求解准粒子方程**是消除 REST 对粗糙低秩实轴网格的敏感性、以及消除"卫星根跳变"的关键。实测（20 组独立运行）：NH3 5/5、CH4 5/5、CO2 5/5 收敛。
+    - `"diis"`：每轮做一次完整 GW 迭代（逐轨道精确求解准粒子方程），再对整条准粒子能量矢量做 **Pulay/DIIS（Anderson）外推**（PySCF 的做法）。实测对 CO2 只有 1/5 收敛，故不再是缺省。
+    - `"z_update"`：**Z 阻尼（线性化牛顿）单步更新**，每个轨道每轮只走一步
+      `E_out = E_in + Z · (consts + Σ_c(E_in) − E_in)`，其中 `Z = 1/(1 − ∂Σ_c/∂ω)` 并被**截断到 [0, 1]**（对应 MolGW `m_selfenergy_tools.f90` 中 `find_qp_energy_linearization` 的 `MIN(MAX(zz,0),1)` 分支）。使用该选项时**不再施加 DIIS**（各加速器互斥）。
+    - `"molgw"`：MolGW 的 evGW **实际**执行的更新规则——每个轨道每轮只做**一次求值**
+      `E_out = consts + Σ_c(E_in)`（即 `E_in + 1.0 · (consts + Σ_c(E_in) − E_in)`，`Z ≡ 1`，**不做求根、不做阻尼**）。
+      这一分支才是 MolGW 默认 `postscf='GnWn'`（EVSC 技术）真正走的路：`m_selfenergy_tools.f90: selfenergy_init` 对 `EVSC` 只设 `se%nomega = 0`，于是 `find_qp_energy_linearization` 中 `if( se%nomega > 0 .AND. PRESENT(zz) )` 恒为假，Z 分支是**死代码**；MolGW 输出的 `E_qp = E0 + SigX−Vxc + SigC`（`E0` 为恒定 KS 能量）也证实了这一点。（对 `contour_deformation` 技术 `se%nomega > 0`，Z 分支才会启用，差分步长为 `2·step_sigma`。）
+
+- `evgw_freeze_outside`: 取值bool，缺省 `true`。evGW 中如何处理**精确计算窗口之外**的轨道：
+    - `true`（缺省，MolGW 行为）：让它们保持初始（Kohn–Sham）能量，与 MolGW 一致——MolGW 的 `find_qp_energy_linearization` 先把 `energy_qp_z = energy0` 初始化，只覆盖 `nsemin..nsemax`，窗口外的态原样写回，从而**完全不参与自洽循环**。REST 的刚性外推会让这些态的能量每轮都被重新推导，构成一条额外的慢反馈通道（进入 G 的极点与 W 的分母）。
+- `evgw_z_step`: 取值f64，单位Hartree。`z_update` 中用于计算 `∂Σ_c/∂ω` 的中心差分步长。缺省 `0.01`（与 MolGW `step_sigma` 的缺省一致）。
+
+  该步长必须同时满足两个尺度条件：**明显大于最小的虚轴求积频点**（`num_freq = 20` 时约为 `1.7e-3 Ha`，否则差分会被 `Σ_imag` 在极点处的 1/ω_p 尖峰污染，`Z` 会塌缩到 0），且**不大于留数判据 `cdgw_res_tol`**（否则 ±h 两点会落在留数半权重斜坡的两侧，差分被截断偏差污染）。实测：`h = 1e-5` 给出 `∂(Σ−ω)/∂ω = +68`（完全错误），`h = 1e-3` 给出 `−9.3`（`Z = 0.11`，过慢），`h = 1e-2` 与 `h = 5e-2` 分别给出 `−1.121` 与 `−1.109`（正确、`Z ≈ 0.89`）。
+
+- `evgw_degeneracy_tol`: 取值f64，单位Hartree，缺省 `1e-4`。evGW 的**简并投影**容差。
+  evGW 必须保持对称性简并伙伴的能量相等；REST 的积分与 DFT 网格在数值上破坏了这一对称性（KS 简并对劈裂约 1e-5 Ha），而 evGW 映射会**放大**由此产生的反对称模——C6H6 的 E1g HOMO 对从 KS 的 1.8e-5 Ha 放大到 **8.2e-3 Ha** 并持续振荡，这正是它不收敛的原因（NH3 的 E 简并对同理，只是幅度小些）。MolGW 不需要这一步，因为它的积分让简并对**严格简并**（其 CO2 的 1πg HOMO 对在整个 GnWn 过程中劈裂恒为 0.000000 eV）。
+  设为正数时，**Kohn-Sham 能量**相差不超过该容差的轨道被当作一个块、每轮把它们的准粒子能量替换为组内平均。分组依据固定的 KS 谱，因此不会在迭代中漂移。设为 `0.0` 关闭。
+  实测：H2O 这类无简并体系上，开/关该投影的结果差别为 **2.6e-14 Ha**（机器精度），即对无简并体系零影响。
+
+- `evgw_diis`: 取值bool，缺省 `true`。是否对整条准粒子能量矢量做 Pulay/DIIS 外推（与 `pyscf.gw.evgw` 中对 `mo_energy` 做 `pyscf.lib.diis.DIIS` 完全对应）。它**叠加在** `evgw_solver` 所选用的每轮映射之上——这个叠加正是"一套设置同时适配两类困难"的关键：`molgw` 的单次求值消除对低秩实轴网格的敏感性（CH4、CO2），DIIS 作为 Krylov 加速器压制标量步无法控制的近简并对反对称模（NH3、C6H6）。
+- `evgw_diis_space`: DIIS 历史长度。缺省 8。
+- `evgw_diis_start`: 至少积累多少个残差矢量后才启用外推。缺省 2。
+- `evgw_diis_safeguard`: 取值bool。缺省 `false`，即标准 DIIS 行为（允许自由外推，仅在结果非有限或严重发散时回退到阻尼步）。设为 `true` 时改用更保守的区间约束回退。
+- `evgw_damping`: 取值f64，取值区间 `(0, 1]`。线性混合/阻尼因子 α，更新式为
+  `E_in^(k+1) = (1-α) E_in^(k) + α E_out^(k)`（DIIS 开启时先阻尼、再对阻尼后的矢量做外推）。
+  `α = 1.0`（缺省）为无阻尼。α 相当于 MolGW 的 `E + Z(F(E) - E)` 中状态相关步长 `Z` 的标量版本。**经验上 α = 1.0 + DIIS 收敛最快；调小 α 往往并不改善收敛性**（本仓库的测试中 α = 0.5 反而更慢或发散），仅在需要更保守的轨迹时使用。
+- `evgw_conv_tol`: 取值f64，单位Hartree。收敛判据：一轮内 `max_n |E_n^out - E_n^in|` 小于该值即认为收敛。缺省 `1e-5`。
+- `evgw_stop_on_convergence`: 取值bool。达到 `evgw_conv_tol` 后是否提前结束（否则始终跑满 `evgw_rounds` 轮）。缺省 `true`。
+- `evgw_report`: 取值bool。是否每轮打印收敛报告（`max|dE_qp|`、`|dG|`、最大步长、HOMO/LUMO 准粒子能量与 gap）。缺省 `true`。
+
+每轮日志形如：
+
+```text
+evGW round 5 summary: max|dE_qp|=1.2345e-04 Ha (orbital #7), |dG|=5.6789e-06, max|step|=9.8765e-05 Ha
+evGW round 5: HOMO(#4 QP)=-0.36912345 Ha, LUMO(#5 QP)=0.18345678 Ha, gap=0.55258023 Ha
+```
+
+收敛后打印 `evGW converged after N round(s): ...`；若跑满轮数仍未达到阈值，打印 `WARNING: evGW did not reach conv_tol=...`，并给出最后一次的残差，便于判断是"未收敛"还是"参数需要调整"。
+
+参考实测（NH3/cc-pVDZ、`xc = scan`、`gw_extrapolate_*_threshold = 0.5`、`use_low_rank_contour = true`、`nomega_chi_real = 64`）：
+
+| 外循环设置 | 结果 |
+| --- | --- |
+| 朴素迭代（`evgw_diis = false`, `evgw_damping = 1.0`） | 80 轮后 `max|dE_qp|` 仍在 ~1e-4 ~ 1e-2 Ha 量级振荡，不收敛 |
+| `evgw_diis = true`, `evgw_damping = 1.0`（缺省） | 11 轮收敛，`max|dE_qp| = 9.1e-6 Ha` |
+| `evgw_diis = true`, `evgw_damping = 0.5` | 25 轮收敛，`max|dE_qp| = 2.5e-6 Ha` |
+| `evgw_solver = "z_update"`（h = 0.01），H2O/cc-pVDZ | 6 轮收敛，`max|dE_qp| = 9.4e-7 Ha`（同体系 DIIS 需 11 轮） |
+| `evgw_solver = "z_update"`（h = 0.01），NH3/cc-pVDZ | **不收敛**，`max|dE_qp|` 停在 ~1e-3 Ha |
+| `evgw_solver = "molgw"`，NH3/cc-pVDZ | **不收敛**，`max|dE_qp|` 停在 ~1e-3 Ha |
+| 任意 `evgw_solver`，NH3 但把简并对排除出自洽窗口（窗口 = HOMO/LUMO） | `"molgw"` **4 轮**、`"z_update"` **6 轮**、`"diis"` **10 轮** |
+
+> **各求解技巧的适用范围（实测结论）**：`z_update` / `molgw` 对**没有近简并前线轨道**的体系明显更快（H2O/cc-pVDZ：6 轮 vs DIIS 11 轮，且末轮残差小一个数量级；NH3 但把自洽窗口限制为 HOMO/LUMO：`molgw` 4 轮、`z_update` 6 轮、DIIS 10 轮）；但对**存在近简并前线轨道**的体系（NH3 的 E 对称性简并对 #2/#3、π* 简并对 #6/#7 与 #8/#9）会停滞在 ~1e-3 Ha。
+>
+> 具体的失稳机制（本轮新定位）：REST 的单步映射（`z_update` / `molgw`）会**放大**简并对的**反对称模式**——从 KS 的 1.6e-6 Ha 劈裂出发，一轮就长到 1.5e-4 Ha（增益约 90），稳态振幅 ~1–2e-3 Ha，正好等于 CD 留数半权重窗口的宽度 `2·cdgw_res_tol = 2e-3 Ha`；而历史的"求根"映射只放大 ~2 倍。MolGW 的对应劈裂始终停在 1.3e-5 Ha，比它自己的 `2·eta = 2e-3 Ha` 窗口低两个数量级，因而永远进不了这个非线性区。DIIS/Anderson 是真正的 Krylov 加速器，可以处理模长 > 1 的模，故仍能收敛。
+>
+> 已排查但**不能**解决问题的参数：`cdgw_res_tol` 取 0 ~ 5e-3、`cdgw_eta` 取 1e-3 ~ 0.05、`evgw_z_step` 取 1e-3 ~ 0.05、`low_rank_interp` 取 linear/nearest、`low_rank_tolerance` 取 1e-5 ~ 0.3、`selfenergy_state_range`、`omega_chi_max`、`evgw_freeze_outside`。（`low_rank_tolerance = 1.0` 能在 3 轮内收敛，但那等于丢掉几乎全部响应，物理上无效；它说明放大作用来自实轴 RPA 响应中 λ₀→1 的近奇异本征值 `λ = λ₀/(1−λ₀)`。）
+>
+> 因此**缺省仍为 `evgw_solver = "diis"`**；`z_update` / `molgw` 适合作为无简并前线轨道体系上更快的替代方案。彻底修复需要从 Σ 一侧入手（正则化实轴近奇异 RPA 本征值，或消除"锚定在迭代中极点能量上的留数半权重斜坡"）。
+
+> **注意**：`use_low_rank_contour = true` 时，`evgw_diis = true` 是稳定收敛的必要条件。低秩路径的实轴 `v·χ·v` 采用"最近格点"取值（与 MolGW 的 `sf_interpolate_vsqrt_chi_vsqrt` 相同），该函数在格点中点上不连续；朴素迭代会把 1e-14 的舍入差异放大到 ~1e-3 Ha（同一二进制两次运行从第 5 轮起结果就不再一致），只有 DIIS 这类对小幅不连续扰动鲁棒的加速方法才能稳定收敛。
+
 - `gw_extrapolate_occ_threshold`: 取值f64，单位Hartree。在 `gw_scheme = “extrapolated”` 方案中，决定费米面以下精确求解准粒子方程的能量窗口。计算范围包括KS轨道能量落在 `[HOMO - gw_extrapolate_occ_threshold, HOMO]` 的占据轨道。缺省为0.1。
 - `gw_extrapolate_vir_threshold`: 取值f64，单位Hartree。在 `gw_scheme = “extrapolated”` 方案中，决定费米面以上精确求解准粒子方程的能量窗口。计算范围包括KS轨道能量落在 `[LUMO, LUMO + gw_extrapolate_vir_threshold]` 的虚轨道。缺省为0.1。
 
@@ -475,11 +545,47 @@ use_low_rank_contour = true
 
 - `use_low_rank_contour`: 取值bool，设置为 `true` 启用低秩等离面加速。缺省为false。
 - `low_rank_grid_type`: 取值String，实轴极化率Chi的采样格点分布方式。`”linear”`（缺省）为线性分布；`”quadratic”` 为二次幂律分布，在零能附近更密集。
+- `low_rank_interp`: 取值String，实轴低秩 `v·χ·v` 在格点之间的取值方式。
+    - `”linear”`（缺省）：在相邻两个格点之间做**线性插值**（`M(ω) = (1−t) M_i + t M_{i+1}`；由于留数收缩 `rᵀMr = Σ_v (r·e_v)² λ_v` 对特征向量的符号与次序均不变，两侧的低秩分解可以直接分别收缩再按权重相加，无需特征向量匹配）。
+    - `”nearest”`：取最近格点（分段常值）。这是 REST 的历史行为，也与 MolGW `sf_interpolate_vsqrt_chi_vsqrt` 中只做 `MINLOC` 的做法一致；保留用于复现旧结果或做 A/B 对比。
+
+> **实测（NH3/cc-pVDZ/scan，G0W0 单轮，以精确 CD 为参考，单位 Ha）**：线性插值系统性地降低低秩误差，并使误差随格点加密以二阶收敛；`nearest` 则收敛缓慢且非单调。
+>
+> | `nomega_chi_real` | `nearest` 的 HOMO 误差 | `linear` 的 HOMO 误差 |
+> | --- | --- | --- |
+> | 64 | 7.15e-3 | 2.97e-3 |
+> | 256 | 9.62e-4 | 1.74e-4 |
+> | 1024 | 2.06e-4 | 1.26e-5 |
+>
+> evGW 收敛后同样成立：NH3、`nomega_chi_real = 64` 时 HOMO 与精确 CD 的差从 4.4e-4 Ha（nearest）降到 7.7e-6 Ha（linear）。
+>
+> 对**非低秩路径（`use_low_rank_contour = false`）本选项无效**，结果与修改前逐位一致。低秩路径中，改动对 HOMO/LUMO 与前线路轨道的影响很小（`nomega_chi_real = 1024` 时 HOMO 变化 1.9e-4 Ha、LUMO 变化 5.8e-6 Ha），对深占据/高虚轨道可达 ~2e-3 Ha，且**改变方向一律是更接近精确 CD 参考值**。
 - `nomega_chi_real`: 取值usize，实轴极化率Chi的采样格点数。缺省为6。增大此值可提高精度但增加计算量。
+- `low_rank_demax_window`: 取值bool，缺省 `false`。低秩实轴网格的 `de_max` 扫描范围。
+    - `false`（缺省，历史行为）：扫描**全部**轨道。当体系有深芯轨道时，`de_max` 会被"深芯作为被扫态 + HOMO 作为极点"这类组合抬到 10–20 Ha，使 `[0, de_max]` 上的均匀实轴格点相对价层过粗。实测（对比 REST 自身的精确围道变形，`nomega_chi_real = 64`）单轮低秩误差：CO2 **1.4e-2 Ha**、C6H6 **1.4e-1 Ha**；`nomega_chi_real = 1024` 时分别降到 8.3e-5 / 1.0e-4 Ha。
+    - `true`：只扫描本次真正计算自能的轨道窗口——这正是 MolGW 的做法（`de_max` 只在 `nsemin..nsemax` 上求）。`de_max` 由 20.07 Ha 降到 1.15 Ha（CO2）、由 10.78 Ha 降到 1.12 Ha（C6H6），单轮低秩误差改善 **170–640 倍**；**CO2 的 evGW 由此从"完全不收敛"变为 13 轮收敛**。
+
+    > 注意：**这不是纯粹的改进**。对 CH4 该限制使 `de_max` 降到 0.97 Ha，大量留数被箝位到格点边界，CH4 由"确定性的 21 轮收敛（4/4 次运行完全一致）"变成不确定行为（4 次里 3 次不收敛）。因此它是可选开关，缺省保持历史行为。若体系含深芯轨道且低秩误差明显（例如 C6H6），建议显式设为 `true` 并配合 `nomega_chi_real ≥ 256`。
+
+    > 另一条结论：**C6H6 是本轮唯一没有被解决的体系**。MolGW 的 `GnWn` 对它收敛到 ~2e-5 Ha，而 REST 即使把 `nomega_chi_real` 提到 1024 也不收敛（残差 1.8e-2 Ha，且由刚性外推所"奴役"的深占据/高虚轨道主导）；打开 `evgw_freeze_outside` 可把残差从 4.1e-2 降到 4.6e-3（9 倍改善），再叠加 `nomega_chi_real = 256` 降到 ~1e-3，仍未达 1e-5。
+
 - `nomega_sigma`: 取值usize，自能Sigma实轴扫描点数（每侧），在de_max扫描中使用。缺省为10。
 - `step_sigma`: 取值f64，自能Sigma实轴扫描步长，单位Hartree。缺省为0.05。
 
 > **精度提示**：如果 GW 计算窗口包含深占据轨道或高虚轨道，低秩实轴插值需要更密的频率格点。此时应增大 `nomega_chi_real`（例如提高到 1000–5000 或更高），否则这些轨道的 QP 能量以及后续 BSE 激发能可能不够准确。对于仅关心 HOMO/LUMO 附近或低激发态的情况，可以使用较小的 `nomega_chi_real` 以节省计算时间。
+
+低秩路径涉及的另外两个参数：
+
+- `cdgw_eta`: 取值f64，单位Hartree。实轴响应函数 χ₀(ω) 的 Lorentzian 展宽 η。缺省 `1e-3`。它与 `nomega_chi_real` 共同决定低秩实轴表示的精度：实轴格点间距需与 η 相称，否则相邻格点上的 `v·χ·v` 差异过大（低秩路径按"最近格点"取值，见下），单轮 GW 的误差可达 1e-3 Ha 量级。需要提高精度时优先增大 `nomega_chi_real`。
+> **C6H6 已解决**：C6H6（pbe/cc-pVDZ，低秩围道，`nomega_chi_real = 64`）在缺省设置下 **11 轮收敛到 1.9e-6 Ha**（此前 80 轮停在 3.75e-3 Ha、精确围道变形甚至发散）。关键是 `evgw_degeneracy_tol` 的简并投影：它把 E1g HOMO 对的劈裂从被放大的 8.2e-3 Ha 拉回到 −2.24e-5 Ha（与 KS 的 1.8e-5 Ha 同量级）。下表列出为定位该问题而排除的旋钮，供后续参考：
+>
+> `low_rank_interp`（linear/nearest）、`low_rank_demax_window`、`nomega_chi_real`（至 1024）、`cdgw_res_tol`、`cdgw_eta`（含 0.0）、`low_rank_tolerance`、`gw_variant = "ac"`（换成光滑的 Padé 自能同样不收敛）、以及**关掉低秩的精确围道变形**（同样发散）—— 全部不能解决；它们共同说明问题不在 Σ 的离散化，而在简并对的反对称模被放大。
+
+- `cdgw_res_tol`: 取值f64，单位Hartree。CD-GW 中极点/留数的**数值判据**（不是物理展宽）：`de >= -cdgw_res_tol` 时计入该极点，`|de| < cdgw_res_tol` 时按半权重 ×0.5 计入；`de_max` 扫描同样使用该阈值。缺省 `1e-3`。
+
+> **修正说明**：在本仓库此前的实现中，**低秩**围道变形路径把 `cdgw_eta` 当作留数判据使用，从而完全忽略了 `cdgw_res_tol`，与 `cdgw_res_tol` 的设计语义（"必须是小的数值容差，不能用物理展宽代替"）相矛盾；当两者取值不同（例如为了稳定而把 `cdgw_eta` 调大到 0.01）时，低秩路径的 Σ 会被半个极点权重污染，evGW 无法收敛。现已改为统一使用 `cdgw_res_tol`。两者取缺省值（均为 1e-3）时结果与修正前逐位一致；`cdgw_eta` 在低秩路径中只保留"实轴 χ₀ 展宽"的作用。
+
+> **可复现性提示**：当 `low_rank_interp = "nearest"` 时，实轴 `v·χ·v` 在格点中点上不连续；在朴素 evGW 迭代（`evgw_diis = false`）下，同一二进制、同一输入的两次运行会从若干轮之后开始出现 ~1e-3 Ha 的差异（1e-14 的舍入差异被逐步放大）。缺省的 `low_rank_interp = "linear"` 消除了这一间断，但**并不能单独保证朴素迭代收敛**——evGW 的不动点映射本身仍不在稳定域内，仍需 `evgw_solver = "diis"`（或 `"z_update"`）加速。详见上文 evGW 外循环收敛控制一节。
 
 ### GW求解器通用参数
 
@@ -558,6 +664,16 @@ gw_or_bse = “gw”
 gw_scheme = “extrapolated”
 scgw = “evgw”
 evgw_rounds = 5
+# 外循环求解技巧与收敛判据（缺省即为下列取值；'diis' 鲁棒性最好，'z_update' 在
+# 无近简并前线轨道的体系上更快，但两者互斥）
+evgw_solver = "diis"        # 或 "z_update"（Z 阻尼牛顿单步）/ "molgw"（MolGW 的单次求值）
+evgw_freeze_outside = false # true = 窗口外轨道保持 KS 能量（MolGW 行为）
+evgw_diis = true
+evgw_diis_space = 8
+evgw_damping = 1.0
+evgw_z_step = 0.01          # 仅 evgw_solver = "z_update" 时使用
+evgw_conv_tol = 1e-5
+evgw_stop_on_convergence = true
 renormalized_singles = true
 w_rs = true
 threshold = 0.1
