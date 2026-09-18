@@ -70,9 +70,20 @@ pub struct QuasiParticle {
     /// Which solver is used for the evGW outer loop (eigenvalue
     /// self-consistency on the quasiparticle energies).
     ///
-    /// * `"diis"` (default): one full GW pass per round, accelerated by
-    ///   Pulay/DIIS extrapolation of the whole quasiparticle-energy vector --
-    ///   the mechanism used by `pyscf.gw.evgw`.
+    /// * `"molgw"` (default): MolGW's `GnWn` (EVSC) rule -- a *single*
+    ///   evaluation `E_out = consts + Sigma_c(E_in)` at the previous
+    ///   quasiparticle energy, with no root solve and no damping (`Z = 1`).
+    ///   This is the branch MolGW really executes: `selfenergy_init` sets
+    ///   `se%nomega = 0` for the `EVSC` technique, so
+    ///   `find_qp_energy_linearization` always takes its `else` branch and the
+    ///   Z factor is never applied (verified against MolGW's own tables, where
+    ///   `E_qp = E0 + SigX-Vxc + SigC` with `E0` the constant KS energy).  Not
+    ///   solving the quasiparticle equation inside the loop is what removes
+    ///   REST's sensitivity to the coarse low-rank real-axis grid and its
+    ///   satellite-root hopping.
+    /// * `"diis"`: one full GW pass per round (historical root-solving map),
+    ///   accelerated by Pulay/DIIS extrapolation of the whole
+    ///   quasiparticle-energy vector -- the mechanism used by `pyscf.gw.evgw`.
     /// * `"z_update"`: one *linearized* (Z-damped) Newton step per orbital per
     ///   round, `E_out = E_in + Z (consts + Sigma_c(E_in) - E_in)` with
     ///   `Z = 1/(1 - dSigma_c/domega)` clamped to `[0, 1]`; no DIIS is applied.
@@ -94,6 +105,13 @@ pub struct QuasiParticle {
     pub evgw_damping:f64,
     /// Enable Pulay/DIIS (Anderson) extrapolation of the evGW quasiparticle
     /// energy vector, exactly as `pyscf.gw.evgw` does on `mo_energy`.
+    ///
+    /// It is applied **on top of** whatever per-round map `evgw_solver`
+    /// selects.  That stacking is what makes a single parameter set work for
+    /// both classes of REST evGW difficulty: `molgw`'s single evaluation
+    /// removes the sensitivity to the coarse real-axis grid (CH4, CO2), while
+    /// DIIS damps the antisymmetric mode of near-degenerate pairs that a scalar
+    /// (diagonal) step cannot control (NH3, C6H6).
     pub evgw_diis:bool,
     /// Number of residual vectors kept in the DIIS history.
     pub evgw_diis_space:usize,
@@ -314,13 +332,13 @@ impl Default for QuasiParticle {
             gw:false,
             save_bse_excitations:false, 
             evgw_rounds:0,
-            evgw_solver:String::from("diis"),
+            evgw_solver:String::from("molgw"),
             evgw_damping:1.0,
             evgw_diis:true,
             evgw_diis_space:8,
             evgw_diis_start:2,
             evgw_diis_safeguard:false,
-            evgw_freeze_outside:false,
+            evgw_freeze_outside:true,
             evgw_z_step:0.01,
             evgw_max_step:0.0,
             evgw_conv_tol:1e-5,
@@ -783,10 +801,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                     match s.to_lowercase().as_str() {
                         "z_update" | "z-update" | "zupdate" => String::from("z_update"),
                         "molgw" | "molgw_update" | "plain_eval" | "eval" => String::from("molgw"),
-                        _ => String::from("diis"),
+                        _ => String::from("molgw"),
                     }
                 },
-                _ => String::from("diis"),
+                _ => String::from("molgw"),
             };
             tmp_input.evgw_damping = match tmp_ctrl.get("evgw_damping").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(1.0_f64)},
@@ -813,7 +831,7 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             };
             tmp_input.evgw_freeze_outside = match tmp_ctrl.get("evgw_freeze_outside").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
-                _ => {false},
+                _ => {true},
             };
             tmp_input.evgw_z_step = match tmp_ctrl.get("evgw_z_step").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(0.01_f64)},

@@ -426,21 +426,22 @@ evGW 的本质是对映射 `E^(k+1) = F(E^(k))`（`F` = 一轮完整 GW）做不
 REST 提供**两种可选的 evGW 求解技巧**，由 `evgw_solver` 选择：
 
 - `evgw_solver`: 取值String，evGW 外循环求解技巧。
-    - `"diis"`（缺省）：每轮做一次完整 GW 迭代（逐轨道精确求解准粒子方程），再对整条准粒子能量矢量做 **Pulay/DIIS（Anderson）外推**。对应 `pyscf.gw.evgw` 中对 `mo_energy` 做 `pyscf.lib.diis.DIIS` 的做法。**鲁棒性最好，是缺省与推荐选择。**
+    - `"molgw"`（缺省）：**MolGW 实际执行的更新规则**——每个轨道每轮只做**一次求值**
+      `E_out = consts + Σ_c(E_in)`（`Z ≡ 1`，不求根、不阻尼）。MolGW 的 `selfenergy_init` 对 `EVSC` 技术只设 `se%nomega = 0`，所以 `find_qp_energy_linearization` 里的 Z 分支是死代码；MolGW 的输出表逐位验证了 `E_qp = E0 + SigX−Vxc + SigC`（`E0` 恒为 KS 能量）。**每轮不在循环内求解准粒子方程**是消除 REST 对粗糙低秩实轴网格的敏感性、以及消除"卫星根跳变"的关键。实测（20 组独立运行）：NH3 5/5、CH4 5/5、CO2 5/5 收敛。
+    - `"diis"`：每轮做一次完整 GW 迭代（逐轨道精确求解准粒子方程），再对整条准粒子能量矢量做 **Pulay/DIIS（Anderson）外推**（PySCF 的做法）。实测对 CO2 只有 1/5 收敛，故不再是缺省。
     - `"z_update"`：**Z 阻尼（线性化牛顿）单步更新**，每个轨道每轮只走一步
       `E_out = E_in + Z · (consts + Σ_c(E_in) − E_in)`，其中 `Z = 1/(1 − ∂Σ_c/∂ω)` 并被**截断到 [0, 1]**（对应 MolGW `m_selfenergy_tools.f90` 中 `find_qp_energy_linearization` 的 `MIN(MAX(zz,0),1)` 分支）。使用该选项时**不再施加 DIIS**（各加速器互斥）。
     - `"molgw"`：MolGW 的 evGW **实际**执行的更新规则——每个轨道每轮只做**一次求值**
       `E_out = consts + Σ_c(E_in)`（即 `E_in + 1.0 · (consts + Σ_c(E_in) − E_in)`，`Z ≡ 1`，**不做求根、不做阻尼**）。
       这一分支才是 MolGW 默认 `postscf='GnWn'`（EVSC 技术）真正走的路：`m_selfenergy_tools.f90: selfenergy_init` 对 `EVSC` 只设 `se%nomega = 0`，于是 `find_qp_energy_linearization` 中 `if( se%nomega > 0 .AND. PRESENT(zz) )` 恒为假，Z 分支是**死代码**；MolGW 输出的 `E_qp = E0 + SigX−Vxc + SigC`（`E0` 为恒定 KS 能量）也证实了这一点。（对 `contour_deformation` 技术 `se%nomega > 0`，Z 分支才会启用，差分步长为 `2·step_sigma`。）
 
-- `evgw_freeze_outside`: 取值bool，缺省 `false`。evGW 中如何处理**精确计算窗口之外**的轨道：
-    - `false`（REST 历史行为）：用最低/最高被计算轨道的刚性平移外推到其余轨道；
-    - `true`：让它们保持初始（Kohn–Sham）能量，与 MolGW 一致——MolGW 的 `find_qp_energy_linearization` 先把 `energy_qp_z = energy0` 初始化，只覆盖 `nsemin..nsemax`，窗口外的态原样写回，从而**完全不参与自洽循环**。REST 的刚性外推会让这些态的能量每轮都被重新推导，构成一条额外的慢反馈通道（进入 G 的极点与 W 的分母）。
+- `evgw_freeze_outside`: 取值bool，缺省 `true`。evGW 中如何处理**精确计算窗口之外**的轨道：
+    - `true`（缺省，MolGW 行为）：让它们保持初始（Kohn–Sham）能量，与 MolGW 一致——MolGW 的 `find_qp_energy_linearization` 先把 `energy_qp_z = energy0` 初始化，只覆盖 `nsemin..nsemax`，窗口外的态原样写回，从而**完全不参与自洽循环**。REST 的刚性外推会让这些态的能量每轮都被重新推导，构成一条额外的慢反馈通道（进入 G 的极点与 W 的分母）。
 - `evgw_z_step`: 取值f64，单位Hartree。`z_update` 中用于计算 `∂Σ_c/∂ω` 的中心差分步长。缺省 `0.01`（与 MolGW `step_sigma` 的缺省一致）。
 
   该步长必须同时满足两个尺度条件：**明显大于最小的虚轴求积频点**（`num_freq = 20` 时约为 `1.7e-3 Ha`，否则差分会被 `Σ_imag` 在极点处的 1/ω_p 尖峰污染，`Z` 会塌缩到 0），且**不大于留数判据 `cdgw_res_tol`**（否则 ±h 两点会落在留数半权重斜坡的两侧，差分被截断偏差污染）。实测：`h = 1e-5` 给出 `∂(Σ−ω)/∂ω = +68`（完全错误），`h = 1e-3` 给出 `−9.3`（`Z = 0.11`，过慢），`h = 1e-2` 与 `h = 5e-2` 分别给出 `−1.121` 与 `−1.109`（正确、`Z ≈ 0.89`）。
 
-- `evgw_diis`: 取值bool，是否对整条准粒子能量矢量做 Pulay/DIIS 外推（与 `pyscf.gw.evgw` 中对 `mo_energy` 做 `pyscf.lib.diis.DIIS` 完全对应）。缺省 `true`（**强烈建议保持开启**，关闭后等价于历史的朴素迭代，通常不收敛）。仅在 `evgw_solver = "diis"` 时生效。
+- `evgw_diis`: 取值bool，缺省 `true`。是否对整条准粒子能量矢量做 Pulay/DIIS 外推（与 `pyscf.gw.evgw` 中对 `mo_energy` 做 `pyscf.lib.diis.DIIS` 完全对应）。它**叠加在** `evgw_solver` 所选用的每轮映射之上——这个叠加正是"一套设置同时适配两类困难"的关键：`molgw` 的单次求值消除对低秩实轴网格的敏感性（CH4、CO2），DIIS 作为 Krylov 加速器压制标量步无法控制的近简并对反对称模（NH3、C6H6）。
 - `evgw_diis_space`: DIIS 历史长度。缺省 8。
 - `evgw_diis_start`: 至少积累多少个残差矢量后才启用外推。缺省 2。
 - `evgw_diis_safeguard`: 取值bool。缺省 `false`，即标准 DIIS 行为（允许自由外推，仅在结果非有限或严重发散时回退到阻尼步）。设为 `true` 时改用更保守的区间约束回退。

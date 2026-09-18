@@ -641,10 +641,15 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
         EvgwUpdate::PlainEval=>String::from("molgw"),
         EvgwUpdate::Root=>String::from("diis"),
     };
-    // The accelerators are alternatives for the same fixed-point problem and
-    // must not be stacked: with `z_update` / `molgw` each GW pass already forms
-    // the next quasiparticle energy directly, so DIIS is switched off.
-    let use_diis=qp_ctrl.evgw_diis && update_kind==EvgwUpdate::Root;
+    // `evgw_diis` may be combined with any per-round map.  With the historical
+    // root-solving map (`EvgwUpdate::Root`) it is the PySCF-style accelerator;
+    // with `molgw`/`z_update` it acts as an outer Krylov accelerator on top of
+    // the (single-evaluation / Z-damped) step.  That combination is what makes
+    // one parameter set work for both classes of REST's evGW difficulties:
+    // MolGW's own per-round rule removes the sensitivity to the real-axis grid
+    // (CH4, CO2), while DIIS damps the antisymmetric mode of near-degenerate
+    // pairs that a scalar (diagonal) step cannot control (NH3, C6H6).
+    let use_diis=qp_ctrl.evgw_diis;
     let diis_space=qp_ctrl.evgw_diis_space;
     let diis_start=qp_ctrl.evgw_diis_start;
     let conv_tol=qp_ctrl.evgw_conv_tol;
