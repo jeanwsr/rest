@@ -635,11 +635,16 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
     let (_start_mo,_num_state,occ_size,_vir_size,_homo,_lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let damping=qp_ctrl.evgw_damping.clamp(1.0e-3,1.0);
-    let solver=if qp_ctrl.evgw_solver.eq_ignore_ascii_case("z_update"){String::from("z_update")}else{String::from("diis")};
-    // The two solvers are alternative accelerators for the same fixed-point
-    // problem and must not be stacked: with `z_update` each GW pass already
-    // takes a (damped) Newton step, so DIIS is switched off.
-    let use_diis=qp_ctrl.evgw_diis && solver=="diis";
+    let update_kind=evgw_update_kind(&qp_ctrl);
+    let solver=match update_kind{
+        EvgwUpdate::ZStep=>String::from("z_update"),
+        EvgwUpdate::PlainEval=>String::from("molgw"),
+        EvgwUpdate::Root=>String::from("diis"),
+    };
+    // The accelerators are alternatives for the same fixed-point problem and
+    // must not be stacked: with `z_update` / `molgw` each GW pass already forms
+    // the next quasiparticle energy directly, so DIIS is switched off.
+    let use_diis=qp_ctrl.evgw_diis && update_kind==EvgwUpdate::Root;
     let diis_space=qp_ctrl.evgw_diis_space;
     let diis_start=qp_ctrl.evgw_diis_start;
     let conv_tol=qp_ctrl.evgw_conv_tol;
@@ -749,10 +754,19 @@ const Z_UPDATE_DERIVATIVE_H: f64 = 1.0e-5;
 /// exactly the `MIN(MAX(zz, 0), 1)` clamp in MolGW.
 ///
 /// Returns `(E_out, Z, qp_eq(E_in))`.
-fn z_update_step<F: Fn(f64) -> f64>(qp_eq: &F, e_in: f64, h: f64) -> (f64, f64, f64, f64) {
+fn one_shot_step<F: Fn(f64) -> f64>(
+    qp_eq: &F,
+    e_in: f64,
+    h: f64,
+    force_z: Option<f64>,
+) -> (f64, f64, f64, f64) {
     let g0 = qp_eq(e_in);
     if !g0.is_finite() {
         return (e_in, 0.0, g0, f64::NAN);
+    }
+    if let Some(z0) = force_z {
+        let z = z0.clamp(0.0, 1.0);
+        return (e_in + z * g0, z, g0, f64::NAN);
     }
     let dq = central_difference(qp_eq, e_in, h);
     let mut z = if dq.is_finite() && dq.abs() > 1.0e-12 { -1.0 / dq } else { 0.0 };
@@ -768,10 +782,44 @@ fn central_difference<F: Fn(f64) -> f64>(f: &F, x: f64, h: f64) -> f64 {
     (f(x + h) - f(x - h)) / (2.0 * h)
 }
 
-/// True when the evGW outer loop is configured to use the MolGW-style
-/// Z-damped single-step update instead of the PySCF-style DIIS extrapolation.
-fn use_z_update(qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle) -> bool {
-    qp_ctrl.scgw == "evgw" && qp_ctrl.evgw_solver.eq_ignore_ascii_case("z_update")
+/// How one evGW round forms the next quasiparticle energy for each orbital.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EvgwUpdate {
+    /// Historical REST behaviour: solve the quasiparticle equation to its root
+    /// (Newton / interpolation rootfinder).
+    Root,
+    /// Z-damped linearized Newton step, `Z = 1/(1 - dSigma/domega)` clamped to
+    /// `[0, 1]`.
+    ZStep,
+    /// MolGW's `GnWn` (EVSC) rule: a *single* evaluation
+    /// `E_new = consts + Sigma_c(E_in)` at the previous quasiparticle energy,
+    /// with no root solve and no damping.
+    PlainEval,
+}
+
+fn evgw_update_kind(qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle) -> EvgwUpdate {
+    if qp_ctrl.scgw != "evgw" {
+        return EvgwUpdate::Root;
+    }
+    match qp_ctrl.evgw_solver.to_lowercase().as_str() {
+        "z_update" | "z-update" | "zupdate" => EvgwUpdate::ZStep,
+        "molgw" | "molgw_update" | "plain_eval" | "eval" => EvgwUpdate::PlainEval,
+        _ => EvgwUpdate::Root,
+    }
+}
+
+fn mode_label(update: EvgwUpdate) -> &'static str {
+    match update {
+        EvgwUpdate::PlainEval => "molgw_update",
+        _ => "z_update",
+    }
+}
+
+fn forced_z(update: EvgwUpdate) -> Option<f64> {
+    match update {
+        EvgwUpdate::PlainEval => Some(1.0),
+        _ => None,
+    }
 }
 
 pub fn single_orbital_gw_ac(
@@ -862,19 +910,20 @@ pub fn single_orbital_gw_ac(
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
-    if use_z_update(&qp_ctrl) {
+    if evgw_update_kind(&qp_ctrl) != EvgwUpdate::Root {
         // MolGW-style Z-damped update (see z_update_step).
         let e_in = gwqp_g[n];
-        let (e_out, z, g0, dq) = z_update_step(&qp_eq_func, e_in, qp_ctrl.evgw_z_step);
-        if scf_data.mol.ctrl.print_level > 1 {
+        let kind = evgw_update_kind(&qp_ctrl);
+        let (e_out, z, g0, dq) = one_shot_step(&qp_eq_func, e_in, qp_ctrl.evgw_z_step, forced_z(kind));
+        if scf_data.mol.ctrl.print_level > 1 && kind == EvgwUpdate::ZStep {
             println!("  [z_update diag] d(Sigma-omega)/domega at h=1e-5: {:.4e}, h=1e-3: {:.4e}, h=1e-2: {:.4e}, h=5e-2: {:.4e}",
                      central_difference(&qp_eq_func, e_in, 1.0e-5),
                      central_difference(&qp_eq_func, e_in, 1.0e-3),
                      central_difference(&qp_eq_func, e_in, 1.0e-2),
                      central_difference(&qp_eq_func, e_in, 5.0e-2));
         }
-        println!("Orbital #{} (AC, z_update): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
-                 n, e_in, z, g0, dq, e_out);
+        println!("Orbital #{} (AC, {}): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
+                 n, mode_label(kind), e_in, z, g0, dq, e_out);
         qp_energy_no_fse = e_out;
     } else if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
         // Static approximation: Σ_c evaluated at the KS energy.
@@ -1028,19 +1077,20 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
-    if use_z_update(&qp_ctrl) {
+    if evgw_update_kind(&qp_ctrl) != EvgwUpdate::Root {
         // MolGW-style Z-damped update (see z_update_step).
         let e_in = gwqp_g[n];
-        let (e_out, z, g0, dq) = z_update_step(&qp_eq_func_no_fse, e_in, qp_ctrl.evgw_z_step);
-        if scf_data.mol.ctrl.print_level > 1 {
+        let kind = evgw_update_kind(&qp_ctrl);
+        let (e_out, z, g0, dq) = one_shot_step(&qp_eq_func_no_fse, e_in, qp_ctrl.evgw_z_step, forced_z(kind));
+        if scf_data.mol.ctrl.print_level > 1 && kind == EvgwUpdate::ZStep {
             println!("  [z_update diag] d(Sigma-omega)/domega at h=1e-5: {:.4e}, h=1e-3: {:.4e}, h=1e-2: {:.4e}, h=5e-2: {:.4e}",
                      central_difference(&qp_eq_func_no_fse, e_in, 1.0e-5),
                      central_difference(&qp_eq_func_no_fse, e_in, 1.0e-3),
                      central_difference(&qp_eq_func_no_fse, e_in, 1.0e-2),
                      central_difference(&qp_eq_func_no_fse, e_in, 5.0e-2));
         }
-        println!("Orbital #{} (z_update): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
-                 n, e_in, z, g0, dq, e_out);
+        println!("Orbital #{} ({}): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
+                 n, mode_label(kind), e_in, z, g0, dq, e_out);
         qp_energy_no_fse = e_out;
     } else if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
         qp_energy_no_fse = qp_eq_func_no_fse(e_ks_n) + e_ks_n;
@@ -1438,14 +1488,28 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
         println!("high extrapolations:{}",num_state-1-calc_orbs[calc_orbs.len()-1].0);
         println!("Occ Shift={}, Vir Shift={}",occ_shift,vir_shift);
     }
+    // States outside the explicitly computed window.
+    //
+    // Default (REST historical behaviour): extrapolate them with the rigid
+    // shift of the lowest/highest computed orbital.
+    //
+    // `evgw_freeze_outside` selects MolGW's behaviour instead: those states
+    // keep their *initial* (Kohn-Sham) energies.  MolGW does this implicitly --
+    // `find_qp_energy_linearization` initialises `energy_qp_z = energy0` and
+    // only overwrites `nsemin..nsemax`, so the states outside the self-energy
+    // window are written back unchanged and never enter the self-consistent
+    // loop.  Extrapolating them instead (REST) makes their rigid shift a slow
+    // feedback channel into G and W.
+    let freeze_outside = qp_ctrl.evgw_freeze_outside && qp_ctrl.scgw == "evgw";
+    let baseline = &scf_data.eigenvalues[0];
     for i in 0 .. calc_orbs[0].0{
-        gwqp.push(scf_data.eigenvalues[0][i]+occ_shift)
+        gwqp.push(if freeze_outside {baseline[i]} else {baseline[i]+occ_shift})
     }
     for i in 0..calc_orbs.len(){
         gwqp.push(calc_orbs[i].1)
     }
     for i in calc_orbs[calc_orbs.len()-1].0+1 .. num_state{
-        gwqp.push(scf_data.eigenvalues[0][i]+vir_shift)
+        gwqp.push(if freeze_outside {baseline[i]} else {baseline[i]+vir_shift})
     }
     //println!("extrapolated GW Results:{:#?}",gwqp);
     ri_gw::display::extrapolation_quasiparticles(&gwqp,occ_size,&calc_orbs_indices,occ_threshold,vir_threshold);
@@ -1506,7 +1570,7 @@ fn single_orbital_gw_lowrank(
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
-    if use_z_update(&qp_ctrl) {
+    if evgw_update_kind(&qp_ctrl) != EvgwUpdate::Root {
         // MolGW-style Z-damped update (see z_update_step).
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank(
@@ -1516,16 +1580,17 @@ fn single_orbital_gw_lowrank(
             )
         };
         let e_in = gwqp_g[n];
-        let (e_out, z, g0, dq) = z_update_step(&qp_eq_func, e_in, qp_ctrl.evgw_z_step);
-        if scf_data.mol.ctrl.print_level > 1 {
+        let kind = evgw_update_kind(&qp_ctrl);
+        let (e_out, z, g0, dq) = one_shot_step(&qp_eq_func, e_in, qp_ctrl.evgw_z_step, forced_z(kind));
+        if scf_data.mol.ctrl.print_level > 1 && kind == EvgwUpdate::ZStep {
             println!("  [z_update diag] d(Sigma-omega)/domega at h=1e-5: {:.4e}, h=1e-3: {:.4e}, h=1e-2: {:.4e}, h=5e-2: {:.4e}",
                      central_difference(&qp_eq_func, e_in, 1.0e-5),
                      central_difference(&qp_eq_func, e_in, 1.0e-3),
                      central_difference(&qp_eq_func, e_in, 1.0e-2),
                      central_difference(&qp_eq_func, e_in, 5.0e-2));
         }
-        println!("Orbital #{} (low-rank, z_update): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
-                 n, e_in, z, g0, dq, e_out);
+        println!("Orbital #{} (low-rank, {}): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
+                 n, mode_label(kind), e_in, z, g0, dq, e_out);
         qp_energy_no_fse = e_out;
     } else if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
         let qp_eq_func = |omega: f64| {
@@ -1680,7 +1745,7 @@ fn single_orbital_gw_lowrank_v2(
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
-    if use_z_update(&qp_ctrl) {
+    if evgw_update_kind(&qp_ctrl) != EvgwUpdate::Root {
         // MolGW-style Z-damped update (see z_update_step).
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank_v2(
@@ -1690,16 +1755,17 @@ fn single_orbital_gw_lowrank_v2(
             )
         };
         let e_in = gwqp_g[n];
-        let (e_out, z, g0, dq) = z_update_step(&qp_eq_func, e_in, qp_ctrl.evgw_z_step);
-        if scf_data.mol.ctrl.print_level > 1 {
+        let kind = evgw_update_kind(&qp_ctrl);
+        let (e_out, z, g0, dq) = one_shot_step(&qp_eq_func, e_in, qp_ctrl.evgw_z_step, forced_z(kind));
+        if scf_data.mol.ctrl.print_level > 1 && kind == EvgwUpdate::ZStep {
             println!("  [z_update diag] d(Sigma-omega)/domega at h=1e-5: {:.4e}, h=1e-3: {:.4e}, h=1e-2: {:.4e}, h=5e-2: {:.4e}",
                      central_difference(&qp_eq_func, e_in, 1.0e-5),
                      central_difference(&qp_eq_func, e_in, 1.0e-3),
                      central_difference(&qp_eq_func, e_in, 1.0e-2),
                      central_difference(&qp_eq_func, e_in, 5.0e-2));
         }
-        println!("Orbital #{} (low-rank v2, z_update): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
-                 n, e_in, z, g0, dq, e_out);
+        println!("Orbital #{} (low-rank v2, {}): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
+                 n, mode_label(kind), e_in, z, g0, dq, e_out);
         qp_energy_no_fse = e_out;
     } else if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
         let qp_eq_func = |omega: f64| {

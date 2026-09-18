@@ -73,10 +73,15 @@ pub struct QuasiParticle {
     /// * `"diis"` (default): one full GW pass per round, accelerated by
     ///   Pulay/DIIS extrapolation of the whole quasiparticle-energy vector --
     ///   the mechanism used by `pyscf.gw.evgw`.
-    /// * `"z_update"`: MolGW's `GnWn` scheme -- one *linearized* (Z-damped)
-    ///   Newton step per orbital per round,
-    ///   `E_out = E_in + Z (consts + Sigma_c(E_in) - E_in)` with
+    /// * `"z_update"`: one *linearized* (Z-damped) Newton step per orbital per
+    ///   round, `E_out = E_in + Z (consts + Sigma_c(E_in) - E_in)` with
     ///   `Z = 1/(1 - dSigma_c/domega)` clamped to `[0, 1]`; no DIIS is applied.
+    /// * `"molgw"`: MolGW's actual `GnWn` (EVSC) rule -- a *single* evaluation
+    ///   `E_out = consts + Sigma_c(E_in)` at the previous quasiparticle energy,
+    ///   with no root solve and no damping (`Z = 1`).  This is the branch
+    ///   MolGW really executes: `selfenergy_init` sets `se%nomega = 0` for the
+    ///   `EVSC` technique, so `find_qp_energy_linearization` always takes its
+    ///   `else` branch and the Z factor is never applied.  No DIIS.
     pub evgw_solver:String,
     /// Linear mixing (damping) factor alpha in (0, 1] for the evGW outer loop.
     ///
@@ -98,6 +103,17 @@ pub struct QuasiParticle {
     /// `false` = standard Pulay/DIIS behaviour (free extrapolation, rejected
     /// only when non-finite or clearly runaway).
     pub evgw_diis_safeguard:bool,
+    /// MolGW-style handling of the orbitals outside the explicitly computed
+    /// window during evGW.
+    ///
+    /// * `false` (default): REST historical behaviour -- extrapolate their
+    ///   quasiparticle energies with the rigid shift of the lowest/highest
+    ///   computed orbital.
+    /// * `true`: keep them at their initial (Kohn-Sham) energies, exactly as
+    ///   MolGW's `find_qp_energy_linearization` does (it initialises
+    ///   `energy_qp_z = energy0` and only overwrites `nsemin..nsemax`, so
+    ///   out-of-window states are fed back unchanged).
+    pub evgw_freeze_outside:bool,
     /// Finite-difference step (Ha) used by the MolGW-style `z_update` solver to
     /// evaluate `dSigma_c/domega` for the Z factor.  It must be larger than the
     /// scale on which the self-energy varies sharply (the smallest
@@ -286,6 +302,7 @@ impl Default for QuasiParticle {
             evgw_diis_space:8,
             evgw_diis_start:2,
             evgw_diis_safeguard:false,
+            evgw_freeze_outside:false,
             evgw_z_step:0.01,
             evgw_max_step:0.0,
             evgw_conv_tol:1e-5,
@@ -432,6 +449,7 @@ impl QuasiParticle {
         table.insert("evgw_diis_space".to_string(), toml::Value::Integer(self.evgw_diis_space as i64));
         table.insert("evgw_diis_start".to_string(), toml::Value::Integer(self.evgw_diis_start as i64));
         table.insert("evgw_diis_safeguard".to_string(), toml::Value::Boolean(self.evgw_diis_safeguard));
+        table.insert("evgw_freeze_outside".to_string(), toml::Value::Boolean(self.evgw_freeze_outside));
         table.insert("evgw_z_step".to_string(), toml::Value::Float(self.evgw_z_step));
         table.insert("evgw_max_step".to_string(), toml::Value::Float(self.evgw_max_step));
         table.insert("evgw_conv_tol".to_string(), toml::Value::Float(self.evgw_conv_tol));
@@ -743,7 +761,8 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.evgw_solver = match tmp_ctrl.get("evgw_solver").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => {
                     match s.to_lowercase().as_str() {
-                        "z_update" | "z-update" | "zupdate" | "molgw" => String::from("z_update"),
+                        "z_update" | "z-update" | "zupdate" => String::from("z_update"),
+                        "molgw" | "molgw_update" | "plain_eval" | "eval" => String::from("molgw"),
                         _ => String::from("diis"),
                     }
                 },
@@ -769,6 +788,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 _ => {2}
             };
             tmp_input.evgw_diis_safeguard = match tmp_ctrl.get("evgw_diis_safeguard").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                _ => {false},
+            };
+            tmp_input.evgw_freeze_outside = match tmp_ctrl.get("evgw_freeze_outside").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
                 _ => {false},
             };
