@@ -782,6 +782,32 @@ fn central_difference<F: Fn(f64) -> f64>(f: &F, x: f64, h: f64) -> f64 {
     (f(x + h) - f(x - h)) / (2.0 * h)
 }
 
+/// First/last orbital index whose KS energy lies inside the explicitly computed
+/// window `(e_homo - occ_threshold, e_lumo + vir_threshold)`.
+fn demax_window_bounds(
+    ks_energies: &[f64],
+    occ_size: usize,
+    e_homo: f64,
+    e_lumo: f64,
+    occ_threshold: f64,
+    vir_threshold: f64,
+) -> (usize, usize) {
+    let mut lo = None;
+    let mut hi = None;
+    for (n, e) in ks_energies.iter().enumerate() {
+        if *e > e_homo - occ_threshold && *e < e_lumo + vir_threshold {
+            if lo.is_none() {
+                lo = Some(n);
+            }
+            hi = Some(n);
+        }
+    }
+    match (lo, hi) {
+        (Some(l), Some(h)) => (l, h),
+        _ => (occ_size.saturating_sub(1), occ_size),
+    }
+}
+
 /// How one evGW round forms the next quasiparticle energy for each orbital.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EvgwUpdate {
@@ -1399,6 +1425,9 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
         Vec::new() // placeholder; v2 path uses w_c_lr instead
     };
 
+    let e_homo=ks_energies[occ_size-1];
+    let e_lumo=ks_energies[occ_size];
+
     let w_c_lr: Option<Vec<(f64, f64, ri_gw::LowRankVChiV)>> = if qp_ctrl.use_low_rank_contour && imag_lr_enabled {
         println!("Low-rank contour (v2): Generating imaginary-axis low-rank sqrt(v)*chi*sqrt(v)...");
         Some(ri_gw::generate_w_c_lowrank(
@@ -1415,11 +1444,31 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
         let gwqp_g = scf_data.gwqp.0.clone();
         let gwqp_w = scf_data.gwqp.1.clone();
         let (start_mo_2,num_state_2,occ_size_2,vir_size_2,homo_2,lumo_2)=ri_gw::get_occupation_parameters(&scf_data,'Y');
-        let nsemin_demax = (occ_size_2.saturating_sub(1))
-            .saturating_sub(qp_ctrl.selfenergy_state_range)
-            .max(0);
-        let nsemax_demax = (occ_size_2 + qp_ctrl.selfenergy_state_range)
-            .min(num_state_2.saturating_sub(1));
+        // Range of states used by the `de_max` scan that sizes the real-axis grid.
+        //
+        // `de_max` is the largest |de| for which v*chi*v is needed and the
+        // real-axis grid is uniform on [0, de_max].  Scanning *all* states
+        // inflates it enormously -- pairing a deep core state as the scanned
+        // state with the HOMO as the pole gives de_max ~ 10-20 Ha, so a
+        // 64-point grid has a ~0.2-0.3 Ha spacing and the low-rank description
+        // of the valence region becomes worthless (measured single-pass error
+        // for C6H6: 1.4e-1 Ha, for CO2: 1.4e-2 Ha).  MolGW only scans
+        // `nsemin..nsemax`, i.e. the states whose self-energy it evaluates.
+        //
+        // Default (`low_rank_demax_window = true`): restrict the scan to the
+        // window of orbitals explicitly computed in this run.
+        let (win_lo, win_hi) = demax_window_bounds(
+            &ks_energies, occ_size, e_homo, e_lumo, occ_threshold, vir_threshold,
+        );
+        let (lo_cap, hi_cap) = if qp_ctrl.low_rank_demax_window {
+            (win_lo, win_hi)
+        } else {
+            (0, num_state_2.saturating_sub(1))
+        };
+        let nsemin_demax = lo_cap
+            .max((occ_size_2.saturating_sub(1)).saturating_sub(qp_ctrl.selfenergy_state_range));
+        let nsemax_demax = hi_cap
+            .min((occ_size_2 + qp_ctrl.selfenergy_state_range).min(num_state_2.saturating_sub(1)));
         let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
         let pl = scf_data.mol.ctrl.print_level;
         Some({
@@ -1444,8 +1493,6 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
         None
     };
 
-    let e_homo=ks_energies[occ_size-1];
-    let e_lumo=ks_energies[occ_size];
     // [DBG] KS-eigenvalue diagnostics (electron count / homo / window), only at print_level >= 2
     if scf_data.mol.ctrl.print_level >= 2 {
         println!("[DBG KS] occ_size={} start_mo={} num_state={} e_homo={:.12e} e_lumo={:.12e}", occ_size, start_mo, num_state, e_homo, e_lumo);

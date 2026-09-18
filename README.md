@@ -555,6 +555,14 @@ use_low_rank_contour = true
 >
 > 对**非低秩路径（`use_low_rank_contour = false`）本选项无效**，结果与修改前逐位一致。低秩路径中，改动对 HOMO/LUMO 与前线路轨道的影响很小（`nomega_chi_real = 1024` 时 HOMO 变化 1.9e-4 Ha、LUMO 变化 5.8e-6 Ha），对深占据/高虚轨道可达 ~2e-3 Ha，且**改变方向一律是更接近精确 CD 参考值**。
 - `nomega_chi_real`: 取值usize，实轴极化率Chi的采样格点数。缺省为6。增大此值可提高精度但增加计算量。
+- `low_rank_demax_window`: 取值bool，缺省 `false`。低秩实轴网格的 `de_max` 扫描范围。
+    - `false`（缺省，历史行为）：扫描**全部**轨道。当体系有深芯轨道时，`de_max` 会被"深芯作为被扫态 + HOMO 作为极点"这类组合抬到 10–20 Ha，使 `[0, de_max]` 上的均匀实轴格点相对价层过粗。实测（对比 REST 自身的精确围道变形，`nomega_chi_real = 64`）单轮低秩误差：CO2 **1.4e-2 Ha**、C6H6 **1.4e-1 Ha**；`nomega_chi_real = 1024` 时分别降到 8.3e-5 / 1.0e-4 Ha。
+    - `true`：只扫描本次真正计算自能的轨道窗口——这正是 MolGW 的做法（`de_max` 只在 `nsemin..nsemax` 上求）。`de_max` 由 20.07 Ha 降到 1.15 Ha（CO2）、由 10.78 Ha 降到 1.12 Ha（C6H6），单轮低秩误差改善 **170–640 倍**；**CO2 的 evGW 由此从"完全不收敛"变为 13 轮收敛**。
+
+    > 注意：**这不是纯粹的改进**。对 CH4 该限制使 `de_max` 降到 0.97 Ha，大量留数被箝位到格点边界，CH4 由"确定性的 21 轮收敛（4/4 次运行完全一致）"变成不确定行为（4 次里 3 次不收敛）。因此它是可选开关，缺省保持历史行为。若体系含深芯轨道且低秩误差明显（例如 C6H6），建议显式设为 `true` 并配合 `nomega_chi_real ≥ 256`。
+
+    > 另一条结论：**C6H6 是本轮唯一没有被解决的体系**。MolGW 的 `GnWn` 对它收敛到 ~2e-5 Ha，而 REST 即使把 `nomega_chi_real` 提到 1024 也不收敛（残差 1.8e-2 Ha，且由刚性外推所"奴役"的深占据/高虚轨道主导）；打开 `evgw_freeze_outside` 可把残差从 4.1e-2 降到 4.6e-3（9 倍改善），再叠加 `nomega_chi_real = 256` 降到 ~1e-3，仍未达 1e-5。
+
 - `nomega_sigma`: 取值usize，自能Sigma实轴扫描点数（每侧），在de_max扫描中使用。缺省为10。
 - `step_sigma`: 取值f64，自能Sigma实轴扫描步长，单位Hartree。缺省为0.05。
 

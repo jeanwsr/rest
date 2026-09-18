@@ -213,6 +213,24 @@ pub struct QuasiParticle {
     /// properly — exactly as MolGW does with selfenergy_state_range.
     /// Default 100000 (essentially all states, backward compatible).
     pub selfenergy_state_range: usize,
+    /// Restrict the `de_max` scan that sizes the low-rank real-axis grid to the
+    /// window of orbitals explicitly computed in the current run (only used by
+    /// the `extrapolated` GW scheme).
+    ///
+    /// * `false` (default): historical REST behaviour -- scan all states.
+    ///   `de_max` then reaches 10-20 Ha for molecules with a deep core orbital,
+    ///   which makes the uniform real-axis grid far too coarse for the valence
+    ///   region (measured single-pass low-rank error: 1.4e-2 Ha for CO2 and
+    ///   1.4e-1 Ha for C6H6 at `nomega_chi_real = 64`).
+    /// * `true`: scan only the states whose self-energy is actually evaluated,
+    ///   as MolGW does (`de_max` is computed over `nsemin..nsemax`).  This
+    ///   shrinks `de_max` to ~1 Ha and improves the single-pass low-rank error
+    ///   by 170-640x; it turned CO2's evGW from non-converging into 13-round
+    ///   convergence.  **But it is not a free win**: for CH4 the restriction
+    ///   makes `de_max` so small that many residues are clamped to the grid
+    ///   boundary, and CH4 goes from deterministic 21-round convergence to
+    ///   nondeterministic behaviour.  Hence it is opt-in, not the default.
+    pub low_rank_demax_window: bool,
     // response BSE grid sampling parameters
     pub response_bse_x_start: f64,
     pub response_bse_x_end: f64,
@@ -361,6 +379,7 @@ impl Default for QuasiParticle {
             ac_omega_max: 5.0,
             ac_eta: 0.001,
             selfenergy_state_range: 100000,
+            low_rank_demax_window: false,
             // response BSE grid sampling parameters (default: 2 points per dimension)
             response_bse_x_start: 0.0,
             response_bse_x_end: 1.0,
@@ -508,6 +527,7 @@ impl QuasiParticle {
         table.insert("ac_num_samples".to_string(), toml::Value::Integer(self.ac_num_samples as i64));
         table.insert("ac_omega_max".to_string(), toml::Value::Float(self.ac_omega_max));
         table.insert("ac_eta".to_string(), toml::Value::Float(self.ac_eta));
+        table.insert("low_rank_demax_window".to_string(), toml::Value::Boolean(self.low_rank_demax_window));
         table.insert("selfenergy_state_range".to_string(), toml::Value::Integer(self.selfenergy_state_range as i64));
         table.insert("response_bse_x_start".to_string(), toml::Value::Float(self.response_bse_x_start));
         table.insert("response_bse_x_end".to_string(), toml::Value::Float(self.response_bse_x_end));
@@ -908,6 +928,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.step_sigma = match tmp_ctrl.get("step_sigma").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.05)},
                 _ => {0.05},
+            };
+            tmp_input.low_rank_demax_window = match tmp_ctrl.get("low_rank_demax_window").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                _ => {false},
             };
             tmp_input.selfenergy_state_range = match tmp_ctrl.get("selfenergy_state_range").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(100000) as usize},
