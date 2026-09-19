@@ -36,7 +36,6 @@ use std::cell::RefCell;
 use rest_tensors::MatrixFull;
 
 use crate::ri_tddft::matvec::build_hdiag;
-use crate::ri_tddft::matvec::build_hdiag_u;
 use crate::ri_tddft::matvec_ao::{a_matvec_ao_batched, b_matvec_ao_batched};
 use crate::ri_tddft::tddft::{prepare_ao_data_with_spin, TDDFTData};
 use crate::scf_io::{SCF, SCFType};
@@ -101,7 +100,7 @@ pub fn stability(scf: &SCF) -> Result<StabilityReport, String> {
         let spin_override = if is_uhf { None } else { Some("singlet") };
         let (roots, stable) = {
             let data = RefCell::new(prepare_ao_data_with_spin(scf, spin_override));
-            let hdiag = if is_uhf { build_hdiag_u(scf) } else { build_hdiag(scf) };
+            let hdiag = build_hdiag(scf);
             hessian_roots(scf, &data, xlet, factor, &hdiag, nroots, tol)
         };
         report.roots_internal = roots;

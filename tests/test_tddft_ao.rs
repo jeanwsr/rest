@@ -142,16 +142,8 @@ fn build_ao_data(nvar: usize) -> TDDFTData {
         fxc_driver: Some(FxcDriver::MO),
         psi_occ: None,
         psi_occ_grad: None,
-        ri_ov: None,
-        ri_oo_exch: None,
-        ri_vv_exch: None,
-        ri_ov_exch: None,
-        ri_oo_sr: None,
-        ri_vv_sr: None,
-        ri_ov_sr: None,
+        ri_terms: vec![],
         fxc_u: None,
-        ri_ov_u: None,
-        exch_u: None,
         reftype: SCFType::RHF,
     };
     data

@@ -3,8 +3,9 @@
 //! `TDDFTData` holds everything the MO-based (`matvec.rs`) and AO-based
 //! (`matvec_ao.rs`) matvec paths need. Members are `Option` and populated only
 //! for the active mode:
-//! - **MO mode**: `fxc` (full, with MO-on-grid projections) + the four
-//!   MO-basis RI tensors (`ri_ov`, `ri_oo_exch`, `ri_vv_exch`, `ri_ov_exch`).
+//! - **MO mode**: `fxc` (full, with MO-on-grid projections) or `fxc_u`
+//!   (spin-resolved) + the per-sector MO-basis RI bundles (`ri_terms`;
+//!   one [`RITensorTerms`] for RHF, two for UHF).
 //! - **AO mode**: `fxc` (kernel-only, no MO projections) + `c_occ`/`c_vir`,
 //!   the NIMatmul integrator (`ni`), the raw kernel (`fxc_eff`), `den_type`,
 //!   `grid_batch`.
@@ -21,10 +22,9 @@ use crate::dft::numint_matmul::nimatmul::NIMatmul;
 use crate::dft::numint_matmul::resp_rks::eval_vxc_fxc_from_rho;
 use crate::dft::xceff::prelude::{determine_den_type, libxc_eval_eff, XCDenType, XCSpin};
 use crate::ri_jk::util::get_cint_mol;
-use crate::ri_tddft::matvec::ExchangeTerms;
+use crate::ri_tddft::matvec::RITensorTerms;
 use crate::ri_tddft::utils::{
     reshape_exchange_tensors, tddft_get_submatrix,
-    tddft_get_submatrix_sr, tddft_get_submatrix_spin, tddft_get_submatrix_sr_spin,
     tddft_occupation_parameters, tddft_occupation_parameters_u,
 };
 use crate::utilities::rstsr_util::{RestTensorToRstsrViewAPI, Tsr};
@@ -72,32 +72,15 @@ pub struct TDDFTData {
     pub psi_occ: Option<Vec<Tsr>>,
     /// Per-sector occ-MO gradient projections [3, ngrids, nocc_s] (GGA only).
     pub psi_occ_grad: Option<Vec<Tsr>>,
-    // ── MO mode only ──
-    /// [naux, occ*vir] RI tensor, Coulomb.
-    pub ri_ov: Option<MatrixFull<f64>>,
-    /// [occ*naux, occ] RI tensor, A-block exchange.
-    pub ri_oo_exch: Option<MatrixFull<f64>>,
-    /// [naux*vir, vir] RI tensor, A-block exchange.
-    pub ri_vv_exch: Option<MatrixFull<f64>>,
-    /// [naux*occ, vir] RI tensor, B-block exchange.
-    pub ri_ov_exch: Option<MatrixFull<f64>>,
-    // ── RSH short-range tensors (MO mode) ──
-    // The HF-exchange coefficients themselves (c_LR / c_SR − c_LR / omega) are
-    // NOT stored here: they are derived per use from `scf.mol.xc_data`
-    // (`rsh_params()` + `dfa_hybrid_scf`), which every matvec already holds.
-    /// [occ*naux, occ] short-range RI tensor, A-block exchange (RSH only).
-    pub ri_oo_sr: Option<MatrixFull<f64>>,
-    /// [naux*vir, vir] short-range RI tensor, A-block exchange (RSH only).
-    pub ri_vv_sr: Option<MatrixFull<f64>>,
-    /// [naux*occ, vir] short-range RI tensor, B-block exchange (RSH only).
-    pub ri_ov_sr: Option<MatrixFull<f64>>,
+    // ── MO mode only: per-sector RI bundles (1 entry for RHF, 2 for UHF;
+    //    empty for AO data) ──
+    /// Per-sector Coulomb + HF/RSH exchange tensors. The exchange
+    /// coefficients themselves are NOT stored (derived per matvec from
+    /// `scf.mol.xc_data`); only the expensive MO-basis tensors are kept.
+    pub ri_terms: Vec<RITensorTerms>,
     // ── MO mode, unrestricted ──
     /// Spin-resolved fxc kernel data (`prepare_fxc_data_unrestricted`).
     pub fxc_u: Option<FXCMatvecDataUnrestricted>,
-    /// Per-spin `[naux, occ_s*vir_s]` Coulomb RI tensors `[alpha, beta]`.
-    pub ri_ov_u: Option<[MatrixFull<f64>; 2]>,
-    /// Per-spin HF/RSH exchange operators `[alpha, beta]` (owned tensors).
-    pub exch_u: Option<[ExchangeTerms; 2]>,
     // ── Unrestricted (UKS) reference ──
     /// The SCF reference type this data was prepared for (RHF/ROHF/UHF).
     /// The concatenated `[z_alpha; z_beta]` amplitude space and the
@@ -118,8 +101,6 @@ impl TDDFTData {
     }
 }
 
-/// Prepare the shared TDDFT data for **MO mode**: the fxc kernel table
-/// (`prepare_fxc_data`) plus the four MO-basis RI tensors.
 /// Resolved `tddft_fxc_driver` for AO mode. Variants are spelled in the
 /// established all-caps abbreviation form (cf. `TDDFTMode::MO`).
 #[allow(non_camel_case_types)]
@@ -135,32 +116,29 @@ pub enum FxcDriver {
     DM,
 }
 
+/// Prepare the shared TDDFT data for **MO mode**: the fxc kernel table
+/// (restricted `prepare_fxc_data` / spin-resolved `prepare_fxc_data_unrestricted`)
+/// plus the per-sector MO-basis RI bundles (`RITensorTerms`; one sector for
+/// RHF, two for UHF, windows from `tddft_sector_params`).
 pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
-    println!("Obtaining RI integrals...");
-    let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
-        tddft_occupation_parameters(scf);
+    let is_uhf = scf.scftype == SCFType::UHF;
+    if is_uhf {
+        println!("Obtaining unrestricted RI integrals...");
+    } else {
+        println!("Obtaining RI integrals...");
+    }
+    let sectors = crate::ri_tddft::utils::tddft_sector_params(scf);
 
-    let fxc = prepare_fxc_data(scf);
-
-    let ri_ov = tddft_get_submatrix(scf, 'O', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
-    let ri_oo = tddft_get_submatrix(scf, 'O', 'O', start_mo, occ_size, vir_size, homo, lumo, num_state);
-    let ri_vv = tddft_get_submatrix(scf, 'V', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
-    let num_auxbas = ri_ov.size[0];
-    println!("num_auxbas = {}", num_auxbas);
-
-    // Reshape RI_OO for A-block exchange: [naux, occ*occ] → [occ*naux, occ]
-    let mut ri_oo_exch = ri_oo.clone();
-    ri_oo_exch.reshape([num_auxbas * occ_size, occ_size]);
-    ri_oo_exch = ri_oo_exch.transpose_and_drop();
-    ri_oo_exch.reshape([occ_size * num_auxbas, occ_size]);
-
-    // Reshape RI_VV for A-block exchange: [naux, vir*vir] → [naux*vir, vir]
-    let mut ri_vv_exch = ri_vv.clone();
-    ri_vv_exch.reshape([num_auxbas * vir_size, vir_size]);
-
-    // Reshape RI_OV for B-block exchange: [naux, occ*vir] → [naux*occ, vir]
-    let mut ri_ov_exch = ri_ov.clone();
-    ri_ov_exch.reshape([num_auxbas * occ_size, vir_size]);
+    // ── fxc kernel data: restricted table vs spin-resolved table ──
+    let (fxc, fxc_u, alpha_hybrid) = if is_uhf {
+        let fxc_u = prepare_fxc_data_unrestricted(scf);
+        let alpha_hybrid = fxc_u.alpha_hybrid;
+        (None, Some(fxc_u), alpha_hybrid)
+    } else {
+        let fxc = prepare_fxc_data(scf);
+        let alpha_hybrid = fxc.alpha_hybrid;
+        (Some(fxc), None, alpha_hybrid)
+    };
 
     // HF-exchange coefficients: for a range-separated hybrid the response
     // exchange reads coeff_full*K_full + coeff_sr*K_SR; otherwise the hybrid
@@ -175,127 +153,67 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
         None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
     };
 
-    // Short-range (erfc(omega*r12)/r12) exchange tensors for RSH.
-    let (ri_oo_sr, ri_vv_sr, ri_ov_sr) = if coeff_sr.abs() > 1e-12 {
-        let sr_ov = tddft_get_submatrix_sr(scf, 'O', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
-        let sr_oo = tddft_get_submatrix_sr(scf, 'O', 'O', start_mo, occ_size, vir_size, homo, lumo, num_state);
-        let sr_vv = tddft_get_submatrix_sr(scf, 'V', 'V', start_mo, occ_size, vir_size, homo, lumo, num_state);
-        let (oo_exch, vv_exch, ov_exch) =
-            reshape_exchange_tensors(&sr_oo, &sr_vv, &sr_ov, occ_size, vir_size);
-        (Some(oo_exch), Some(vv_exch), Some(ov_exch))
-    } else {
-        (None, None, None)
-    };
-
-    TDDFTData {
-        mode: TDDFTMode::MO,
-        alpha_hybrid: fxc.alpha_hybrid,
-        fxc: Some(fxc),
-        c_occ: vec![],
-        c_vir: vec![],
-        ni: None,
-        fxc_eff: None,
-        den_type: None,
-        grid_batch: false,
-        fxc_driver: None,
-        psi_occ: None,
-        psi_occ_grad: None,
-        ri_ov: Some(ri_ov),
-        ri_oo_exch: Some(ri_oo_exch),
-        ri_vv_exch: Some(ri_vv_exch),
-        ri_ov_exch: Some(ri_ov_exch),
-        ri_oo_sr,
-        ri_vv_sr,
-        ri_ov_sr,
-        fxc_u: None,
-        ri_ov_u: None,
-        exch_u: None,
-        reftype: scf.scftype,
-    }
-}
-
-/// Prepare the MO-mode unrestricted TDDFT data (kernel + per-spin RI tensors),
-/// stored in the `fxc_u`/`ri_ov_u`/`exch_u` fields of [`TDDFTData`]. The
-/// per-spin exchange operators ([`ExchangeTerms`]) own their tensors, so the
-/// whole unrestricted MO state flows through the shared data structure like
-/// every other (mode x reference) cell.
-///
-/// Orbital windows come from [`tddft_occupation_parameters_u`] (the same
-/// sector-Vec windows as the AO path - frozen-core and virtual cutoff resolved
-/// per spin), so both unrestricted modes share one excitation-space policy.
-pub fn prepare_mo_data_unrestricted(scf: &SCF) -> TDDFTData {
-    println!("Obtaining unrestricted RI integrals...");
-    let sectors = tddft_occupation_parameters_u(scf);
-
-    // ── fxc / RI data ──
-    let fxc = prepare_fxc_data_unrestricted(scf);
-    // HF-exchange coefficients derived from the DFA (see the restricted path
-    // for the RSH convention).
-    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
-        Some((omega, c_full, c_sr)) => {
-            println!("RSH functional: omega = {:.6}, c_LR (K_full coeff) = {:.6}, c_SR - c_LR (K_SR coeff) = {:.6}",
-                     omega, c_full, c_sr);
-            (c_full, c_sr)
-        }
-        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
-    };
-
-    let mut ri_ov: [MatrixFull<f64>; 2] = [
-        MatrixFull::new([0, 0], 0.0),
-        MatrixFull::new([0, 0], 0.0),
-    ];
-    let mut ri_oo_exch: [MatrixFull<f64>; 2] = [
-        MatrixFull::new([0, 0], 0.0),
-        MatrixFull::new([0, 0], 0.0),
-    ];
-    let mut ri_vv_exch: [MatrixFull<f64>; 2] = [
-        MatrixFull::new([0, 0], 0.0),
-        MatrixFull::new([0, 0], 0.0),
-    ];
-    let mut ri_ov_exch: [MatrixFull<f64>; 2] = [
-        MatrixFull::new([0, 0], 0.0),
-        MatrixFull::new([0, 0], 0.0),
-    ];
-    let mut exch_u: [ExchangeTerms; 2] = [
-        ExchangeTerms::full_only(MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0)),
-        ExchangeTerms::full_only(MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0)),
-    ];
-
-    for s in 0..2 {
-        let sec = sectors[s];
+    // ── Per-sector RI bundles: Coulomb [naux, occ*vir] + reshaped exchange
+    //    tensors (+ short-range triples for RSH). One loop serves the
+    //    restricted single-sector and unrestricted per-spin references.
+    let mut ri_terms: Vec<RITensorTerms> = Vec::with_capacity(sectors.len());
+    for (s, sec) in sectors.iter().enumerate() {
         if sec.occ_size == 0 || sec.vir_size == 0 {
+            // Keep the sector indexing consistent (e.g. an empty beta channel):
+            // the bundle records the window but carries no tensors.
+            ri_terms.push(RITensorTerms {
+                occ_size: sec.occ_size,
+                vir_size: sec.vir_size,
+                coulomb: MatrixFull::new([0, 0], 0.0),
+                oo_exch: MatrixFull::new([0, 0], 0.0),
+                vv_exch: MatrixFull::new([0, 0], 0.0),
+                ov_exch: MatrixFull::new([0, 0], 0.0),
+                oo_sr: None,
+                vv_sr: None,
+                ov_sr: None,
+            });
             continue;
         }
-        let ov = tddft_get_submatrix_spin(
-            scf, 'O', 'V', sec.start_mo, sec.occ_size, sec.vir_size, sec.homo, sec.lumo, sec.num_state, s,
-        );
-        let oo = tddft_get_submatrix_spin(
-            scf, 'O', 'O', sec.start_mo, sec.occ_size, sec.vir_size, sec.homo, sec.lumo, sec.num_state, s,
-        );
-        let vv = tddft_get_submatrix_spin(
-            scf, 'V', 'V', sec.start_mo, sec.occ_size, sec.vir_size, sec.homo, sec.lumo, sec.num_state, s,
-        );
+        let spin = if is_uhf { Some(s) } else { None };
+        let coulomb = tddft_get_submatrix(scf, 'O', 'V', sec.start_mo, sec.occ_size, sec.vir_size, sec.homo, sec.lumo, sec.num_state, false, spin);
+        let oo = tddft_get_submatrix(scf, 'O', 'O', sec.start_mo, sec.occ_size, sec.vir_size, sec.homo, sec.lumo, sec.num_state, false, spin);
+        let vv = tddft_get_submatrix(scf, 'V', 'V', sec.start_mo, sec.occ_size, sec.vir_size, sec.homo, sec.lumo, sec.num_state, false, spin);
         let (oo_exch, vv_exch, ov_exch) =
-            reshape_exchange_tensors(&oo, &vv, &ov, sec.occ_size, sec.vir_size);
+            reshape_exchange_tensors(&oo, &vv, &coulomb, sec.occ_size, sec.vir_size);
 
-        exch_u[s] = if coeff_sr.abs() > 1e-12 {
-            let ov_sr = tddft_get_submatrix_sr_spin(scf, 'O', 'V', sec.start_mo, sec.occ_size, sec.vir_size, sec.homo, sec.lumo, sec.num_state, s);
-            let oo_sr = tddft_get_submatrix_sr_spin(scf, 'O', 'O', sec.start_mo, sec.occ_size, sec.vir_size, sec.homo, sec.lumo, sec.num_state, s);
-            let vv_sr = tddft_get_submatrix_sr_spin(scf, 'V', 'V', sec.start_mo, sec.occ_size, sec.vir_size, sec.homo, sec.lumo, sec.num_state, s);
+        // Short-range (erfc(omega*r12)/r12) exchange tensors for RSH
+        // (all-or-nothing triple; see `RITensorTerms`).
+        let (oo_sr, vv_sr, ov_sr) = if coeff_sr.abs() > 1e-12 {
+            let ov_sr = tddft_get_submatrix(scf, 'O', 'V', sec.start_mo, sec.occ_size, sec.vir_size, sec.homo, sec.lumo, sec.num_state, true, spin);
+            let oo_sr = tddft_get_submatrix(scf, 'O', 'O', sec.start_mo, sec.occ_size, sec.vir_size, sec.homo, sec.lumo, sec.num_state, true, spin);
+            let vv_sr = tddft_get_submatrix(scf, 'V', 'V', sec.start_mo, sec.occ_size, sec.vir_size, sec.homo, sec.lumo, sec.num_state, true, spin);
             let (oo_sr_exch, vv_sr_exch, ov_sr_exch) =
                 reshape_exchange_tensors(&oo_sr, &vv_sr, &ov_sr, sec.occ_size, sec.vir_size);
-            ExchangeTerms::rsh(oo_exch, vv_exch, ov_exch, oo_sr_exch, vv_sr_exch, ov_sr_exch)
+            (Some(oo_sr_exch), Some(vv_sr_exch), Some(ov_sr_exch))
         } else {
-            ExchangeTerms::full_only(oo_exch, vv_exch, ov_exch)
+            (None, None, None)
         };
-
-        ri_ov[s] = ov;
+        if !is_uhf && s == 0 {
+            println!("num_auxbas = {}", coulomb.size[0]);
+        }
+        ri_terms.push(RITensorTerms {
+            occ_size: sec.occ_size,
+            vir_size: sec.vir_size,
+            coulomb,
+            oo_exch,
+            vv_exch,
+            ov_exch,
+            oo_sr,
+            vv_sr,
+            ov_sr,
+        });
     }
 
     TDDFTData {
         mode: TDDFTMode::MO,
-        alpha_hybrid: fxc.alpha_hybrid,
-        fxc: None,
+        alpha_hybrid,
+        fxc,
+        fxc_u,
         c_occ: vec![],
         c_vir: vec![],
         ni: None,
@@ -305,16 +223,7 @@ pub fn prepare_mo_data_unrestricted(scf: &SCF) -> TDDFTData {
         fxc_driver: None,
         psi_occ: None,
         psi_occ_grad: None,
-        ri_ov: None,
-        ri_oo_exch: None,
-        ri_vv_exch: None,
-        ri_ov_exch: None,
-        ri_oo_sr: None,
-        ri_vv_sr: None,
-        ri_ov_sr: None,
-        fxc_u: Some(fxc),
-        ri_ov_u: Some(ri_ov),
-        exch_u: Some(exch_u),
+        ri_terms,
         reftype: scf.scftype,
     }
 }
@@ -595,16 +504,8 @@ pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTDa
         fxc_driver: Some(fxc_driver),
         psi_occ,
         psi_occ_grad,
-        ri_ov: None,
-        ri_oo_exch: None,
-        ri_vv_exch: None,
-        ri_ov_exch: None,
-        ri_oo_sr: None,
-        ri_vv_sr: None,
-        ri_ov_sr: None,
+        ri_terms: vec![],
         fxc_u: None,
-        ri_ov_u: None,
-        exch_u: None,
         reftype: scf.scftype,
     }
 }

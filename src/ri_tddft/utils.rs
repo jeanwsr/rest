@@ -213,10 +213,18 @@ pub fn tddft_occupation_parameters_spin(
     let sec = tddft_occupation_parameters_u(scf)[spin];
     (sec.start_mo, sec.num_state, sec.occ_size, sec.vir_size, sec.homo, sec.lumo)
 }
-/// Get RI submatrix for TDDFT (no quasiparticle_methods dependency)
+/// Get an RI submatrix for TDDFT (no quasiparticle_methods dependency):
+/// the MO-basis three-center integral block `(choice_a choice_b | Q)` over
+/// the occ-occ / vir-vir / occ-vir MO ranges, for one spin channel.
 ///
-/// Directly calls generate_ri3mo_rayon_for_multiple_times with the appropriate
-/// MO ranges computed from the given orbital parameters.
+/// One merged implementation (formerly `tddft_get_submatrix`/`_sr`/`_spin`/
+/// `_sr_spin`), parameterized by:
+/// - `sr`: build from the short-range (RSH, erfc operator) 3-center integrals
+///   (`generate_ri3mo_sr_rayon_for_multiple_times`) instead of the full-range
+///   ones;
+/// - `spin`: `None` takes the first RI channel (restricted reference);
+///   `Some(s)` picks spin channel `s` of an unrestricted block (panics if
+///   out of range).
 pub fn tddft_get_submatrix(
     scf: &SCF,
     choice_a: char,
@@ -227,102 +235,32 @@ pub fn tddft_get_submatrix(
     homo: usize,
     lumo: usize,
     num_state: usize,
+    sr: bool,
+    spin: Option<usize>,
 ) -> MatrixFull<f64> {
     let ranges = tddft_submatrix_ranges(choice_a, choice_b, start_mo, homo, lumo, num_state);
-    let vector = scf.generate_ri3mo_rayon_for_multiple_times(ranges.0, ranges.1);
-    let matrix: MatrixFull<f64> = vector[0].0.rifull_to_matfull_i_jk();
-    println!(
-        "TDDFT RI Tensor: {}-{}, Size={:?}, naux={}",
-        choice_a, choice_b, matrix.size, matrix.size[0]
-    );
-    matrix
-}
-
-/// Get the short-range (RSH, erfc operator) RI submatrix for TDDFT.
-///
-/// Same construction as [`tddft_get_submatrix`] but built from the
-/// short-range 3-center integrals (`rimatr_sr`).
-pub fn tddft_get_submatrix_sr(
-    scf: &SCF,
-    choice_a: char,
-    choice_b: char,
-    start_mo: usize,
-    occ_size: usize,
-    vir_size: usize,
-    homo: usize,
-    lumo: usize,
-    num_state: usize,
-) -> MatrixFull<f64> {
-    let ranges = tddft_submatrix_ranges(choice_a, choice_b, start_mo, homo, lumo, num_state);
-    let vector = scf.generate_ri3mo_sr_rayon_for_multiple_times(ranges.0, ranges.1);
-    let matrix: MatrixFull<f64> = vector[0].0.rifull_to_matfull_i_jk();
-    println!(
-        "TDDFT RI Tensor (SR): {}-{}, Size={:?}, naux={}",
-        choice_a, choice_b, matrix.size, matrix.size[0]
-    );
-    matrix
-}
-
-/// Get a spin-resolved RI submatrix for unrestricted TDDFT.
-///
-/// The MO range arguments belong to one spin channel.  For an unrestricted
-/// SCF, `generate_ri3mo_rayon_for_multiple_times` returns one RI block per
-/// spin; this helper picks the requested one.
-pub fn tddft_get_submatrix_spin(
-    scf: &SCF,
-    choice_a: char,
-    choice_b: char,
-    start_mo: usize,
-    occ_size: usize,
-    vir_size: usize,
-    homo: usize,
-    lumo: usize,
-    num_state: usize,
-    spin: usize,
-) -> MatrixFull<f64> {
-    let ranges = tddft_submatrix_ranges(choice_a, choice_b, start_mo, homo, lumo, num_state);
-    let vector = scf.generate_ri3mo_rayon_for_multiple_times(ranges.0, ranges.1);
-    if spin >= vector.len() {
+    let vector = if sr {
+        scf.generate_ri3mo_sr_rayon_for_multiple_times(ranges.0, ranges.1)
+    } else {
+        scf.generate_ri3mo_rayon_for_multiple_times(ranges.0, ranges.1)
+    };
+    let i_spin = spin.unwrap_or(0);
+    if i_spin >= vector.len() {
         panic!(
-            "tddft_get_submatrix_spin: spin {} requested but only {} RI channels are available",
-            spin,
-            vector.len()
+            "tddft_get_submatrix: spin {} requested but only {} RI channels are available",
+            i_spin, vector.len()
         );
     }
-    let matrix: MatrixFull<f64> = vector[spin].0.rifull_to_matfull_i_jk();
+    let matrix: MatrixFull<f64> = vector[i_spin].0.rifull_to_matfull_i_jk();
+    let tag = match (sr, spin) {
+        (false, None) => String::new(),
+        (true, None) => " (SR)".to_string(),
+        (false, Some(s)) => format!(" (spin {})", s),
+        (true, Some(s)) => format!(" (SR, spin {})", s),
+    };
     println!(
-        "TDDFT RI Tensor (spin {}): {}-{}, Size={:?}, naux={}",
-        spin, choice_a, choice_b, matrix.size, matrix.size[0]
-    );
-    matrix
-}
-
-/// Get a spin-resolved short-range (RSH) RI submatrix for unrestricted TDDFT.
-pub fn tddft_get_submatrix_sr_spin(
-    scf: &SCF,
-    choice_a: char,
-    choice_b: char,
-    start_mo: usize,
-    occ_size: usize,
-    vir_size: usize,
-    homo: usize,
-    lumo: usize,
-    num_state: usize,
-    spin: usize,
-) -> MatrixFull<f64> {
-    let ranges = tddft_submatrix_ranges(choice_a, choice_b, start_mo, homo, lumo, num_state);
-    let vector = scf.generate_ri3mo_sr_rayon_for_multiple_times(ranges.0, ranges.1);
-    if spin >= vector.len() {
-        panic!(
-            "tddft_get_submatrix_sr_spin: spin {} requested but only {} RI channels are available",
-            spin,
-            vector.len()
-        );
-    }
-    let matrix: MatrixFull<f64> = vector[spin].0.rifull_to_matfull_i_jk();
-    println!(
-        "TDDFT RI Tensor (SR, spin {}): {}-{}, Size={:?}, naux={}",
-        spin, choice_a, choice_b, matrix.size, matrix.size[0]
+        "TDDFT RI Tensor{}: {}-{}, Size={:?}, naux={}",
+        tag, choice_a, choice_b, matrix.size, matrix.size[0]
     );
     matrix
 }
@@ -412,37 +350,3 @@ pub fn compute_tddft_dipole_matrix(
     dipole_matrix
 }
 
-/// Compute MO-basis transition dipoles for unrestricted TDDFT.
-///
-/// The returned matrix has shape [3, n0+n1], where n0/n1 are the alpha/beta
-/// occupied-virtual dimensions.  The column order is the same as the
-/// concatenated unrestricted TDDFT vector: all alpha pairs first, then all
-/// beta pairs.
-pub fn compute_tddft_dipole_matrix_unrestricted(
-    scf: &SCF,
-    start_mo: [usize; 2],
-    occ_size: [usize; 2],
-    vir_size: [usize; 2],
-    lumo: [usize; 2],
-) -> MatrixFull<f64> {
-    let ao_dip = crate::ri_bse::dipoles::obtain_ao_dips(scf, None);
-    let n0 = occ_size[0] * vir_size[0];
-    let n1 = occ_size[1] * vir_size[1];
-    let mut dipole_matrix = MatrixFull::new([3, n0 + n1], 0.0);
-
-    for spin in 0..2 {
-        let eigvec = &scf.eigenvectors[spin];
-        let offset = if spin == 0 { 0 } else { n0 };
-        for i in 0..occ_size[spin] {
-            for a in 0..vir_size[spin] {
-                let idx = offset + i + a * occ_size[spin];
-                let mu = crate::ri_bse::dipoles::obtain_mu_ia(
-                    eigvec, &ao_dip, start_mo[spin] + i, lumo[spin] + a);
-                for d in 0..3 {
-                    dipole_matrix[[d, idx]] = mu[d];
-                }
-            }
-        }
-    }
-    dipole_matrix
-}

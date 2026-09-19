@@ -15,16 +15,14 @@ use crate::ri_bse::{dipoles, pysoc_export};
 use crate::solvers::davidson as davidson_solver;
 use crate::solvers::davidson::DavidsonConfig;
 use crate::dft::num_int::set_fxc_use_optimized;
-use crate::ri_tddft::matvec::{self, a_matvec, a_matvec_unrestricted, b_matvec, b_matvec_unrestricted};
+use crate::ri_tddft::matvec::{self, a_matvec, b_matvec};
 use crate::ri_tddft::matvec_ao;
 use crate::ri_tddft::utils::{
     tddft_occupation_parameters, tddft_occupation_parameters_u,
-    tddft_get_submatrix,
     compute_tddft_dipole_matrix, compute_tddft_dipole_matrix_u, normalize_u, transition_dipole_square_u,
 };
 use crate::ri_tddft::feast_solver;
-use crate::ri_tddft::tddft::{build_a, build_b, prepare_ao_data, prepare_mo_data,
-    prepare_mo_data_unrestricted};
+use crate::ri_tddft::tddft::{build_a, build_b, prepare_ao_data, prepare_mo_data};
 use crate::ri_tddft::{TDDFTData, TDDFTMode};
 use log::warn;
 
@@ -151,8 +149,9 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     //
     // UHF references run through the SAME unified flow below for both modes;
     // `tddft_mode` only selects the kernel machinery: "mo" (the default)
-    // prepares the spin-resolved MO-basis tensors (`fxc_u`/`ri_ov_u`/`exch_u`) and
-    // uses the per-vector unrestricted matvecs; "ao" uses the sector-generic
+    // prepares the per-sector MO-basis RI bundles (`ri_terms`) + the
+    // spin-resolved fxc table (`fxc_u`) and the sector-generic per-vector
+    // matvecs serve both references; "ao" uses the sector-generic
     // AO machinery. The unrestricted response has one single, spin-coupled
     // channel (the Coulomb kernel couples the alpha and beta blocks) —
     // `tddft_spin` has no singlet/triplet meaning here and an explicit
@@ -316,9 +315,9 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
         }
     }
     // Data preparation covers all four (mode x reference) cells: AO is
-    // sector-generic (both references); MO splits into the restricted
-    // tensors and the spin-resolved unrestricted bundle (`fxc_u`/`ri_ov_u`/
-    // `exch_u` fields).
+    // sector-generic (both references); MO mode builds the per-sector RI
+    // bundles (`ri_terms`) and the restricted/spin-resolved fxc tables in one
+    // `prepare_mo_data`.
     let data: std::cell::RefCell<TDDFTData> = std::cell::RefCell::new(
         if is_ao {
             println!("Reftype: {}", if is_u { "UKS" } else { "RKS" });
@@ -332,8 +331,6 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
             // `prepare_ao_data` handles both reference types (RHF one-sector /
             // UHF two-sector kernels and coefficients).
             prepare_ao_data(scf)
-        } else if is_u {
-            prepare_mo_data_unrestricted(scf)
         } else {
             prepare_mo_data(scf)
         },
@@ -343,7 +340,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     let alpha_hybrid = data.borrow().alpha_hybrid;
 
     // ═══ Step 5: Build diagonal preconditioner ═══
-    let hdiag = if is_u { matvec::build_hdiag_u(scf) } else { matvec::build_hdiag(scf) };
+    let hdiag = matvec::build_hdiag(scf);
     println!("Diagonal preconditioner built, min gap = {:.6}",
         hdiag.iter().fold(f64::INFINITY, |a, &b| a.min(b)));
 
@@ -381,24 +378,13 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
         // ── Step 8: Diagnostic: check A matrix symmetry for first few columns ──
         // MO-mode matvec closures (used by diagnostic + MO solver dispatch; the
         // dense path and AO mode use the dedicated builders / batched matvecs).
-        // MO-U (data carries the `exch_u` bundle): route to the unrestricted
-        // per-vector matvecs over the concatenated α;β vector.
+        // Sector-generic: one call serves restricted and unrestricted data.
         let a_apply = |z: &Vec<f64>| -> Vec<f64> {
             let d = data.borrow();
-            if d.exch_u.is_some() {
-                return a_matvec_unrestricted(scf_ref,
-                    d.fxc_u.as_ref().unwrap(), d.ri_ov_u.as_ref().unwrap(),
-                    d.exch_u.as_ref().unwrap(), z);
-            }
             a_matvec(scf_ref, &d, z, xlet)
         };
         let b_apply = |z: &Vec<f64>| -> Vec<f64> {
             let d = data.borrow();
-            if d.exch_u.is_some() {
-                return b_matvec_unrestricted(scf_ref,
-                    d.fxc_u.as_ref().unwrap(), d.ri_ov_u.as_ref().unwrap(),
-                    d.exch_u.as_ref().unwrap(), z);
-            }
             b_matvec(scf_ref, &d, z, xlet)
         };
 
