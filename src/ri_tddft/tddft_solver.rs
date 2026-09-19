@@ -164,20 +164,19 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     let is_u = scf.scftype == SCFType::UHF;
     if is_u {
         // `tddft_spin` selects a spin-adapted channel, which only exists for a
-        // restricted reference. Reject an explicit non-default value instead
-        // of silently reinterpreting it (previously "triplet" silently switched
-        // the Coulomb coupling off, and "both" ran the same operator twice).
+        // restricted reference. The unrestricted default is None (no spin
+        // label at all): reject ANY explicit value instead of silently
+        // reinterpreting it (previously "triplet" silently switched the
+        // Coulomb coupling off, and "both" ran the same operator twice).
         if let Some(v) = tddft_ctrl.tddft_spin.as_deref() {
-            if v != "singlet" {
-                return Err(format!(
-                    "tddft_spin = \"{}\" is not applicable to unrestricted TDDFT \
-                     (spin_polarization = true).  Unrestricted TDDFT has a single, spin-coupled \
-                     response channel (the Coulomb kernel couples the alpha and beta blocks); \
-                     there is no spin-adapted singlet/triplet channel to select. \
-                     Remove tddft_spin from the input.",
-                    v
-                ));
-            }
+            return Err(format!(
+                "tddft_spin = \"{}\" is not applicable to unrestricted TDDFT \
+                 (spin_polarization = true).  Unrestricted TDDFT has a single, spin-coupled \
+                 response channel (the Coulomb kernel couples the alpha and beta blocks); \
+                 there is no spin-adapted singlet/triplet channel to select. \
+                 Remove tddft_spin from the input.",
+                v
+            ));
         }
         // PySOC export needs both singlet and triplet transition amplitudes,
         // which only the restricted path can supply.
@@ -209,12 +208,6 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
         if tddft_ctrl.tddft_fxc_driver == "mo" {
             return Err("tddft_fxc_driver=\"mo\" is not supported for unrestricted (UKS) TDDFT; \
                         use \"semitrans\" or \"dm\".".to_string());
-        }
-        if tddft_spin != "singlet" {
-            // The default is "singlet", so an explicit triplet/both setting
-            // cannot be distinguished — unrestricted response ignores the
-            // keyword either way (debug-level note only).
-            log::debug!("tddft_spin=\"{}\" is ignored for an unrestricted reference", tddft_spin);
         }
     }
 

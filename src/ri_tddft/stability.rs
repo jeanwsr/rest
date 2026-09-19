@@ -56,23 +56,40 @@ pub struct StabilityReport {
     pub roots_external: Vec<f64>,
 }
 
-/// Run the stability analysis requested by `[tddft] stability`
-/// ("internal" | "external" | "full"), on the converged SCF reference.
-pub fn stability(scf: &SCF) -> Result<StabilityReport, String> {
-    let (mode, nroots, tol) = {
-        let t = scf
-            .mol
-            .ctrl
-            .tddft
-            .as_ref()
-            .ok_or("stability analysis requires the [tddft] input section")?;
-        (t.stability.clone(), t.stability_nroots, t.stability_tol)
-    };
+/// Run the SCF stability analysis on the converged SCF reference. `mode` is
+/// resolved by the caller: from `[tddft] stability`, or the top-level
+/// `[ctrl] check_stab` keyword. Valid values: `"internal"` | `"external"` |
+/// `"full"` | `"auto"`.
+/// - `"auto"` (recommended): every check applicable to the reference type.
+///   RHF/RKS: internal + external. UHF/UKS: internal (the UHF→GHF external
+///   check is not yet implemented).
+/// - `"full"`: literally internal + external. For UHF/UKS the external check
+///   is a no-op today; if UHF→GHF is implemented later, "full" runs it while
+///   "auto" keeps selecting the applicable set.
+/// Currently "auto" resolves to "full" (identical behavior).
+/// `stability_nroots`/`stability_tol` come from the [tddft] section when
+/// present, with the struct defaults otherwise (a `check_stab` deck needs no
+/// [tddft] section).
+pub fn stability(scf: &SCF, mode: &str) -> Result<StabilityReport, String> {
+    let (nroots, tol) = scf
+        .mol
+        .ctrl
+        .tddft
+        .as_ref()
+        .map_or_else(
+            || {
+                let d = crate::ctrl_io::tddft_parameters::TDDFTParameters::default();
+                (d.stability_nroots, d.stability_tol)
+            },
+            |t| (t.stability_nroots, t.stability_tol),
+        );
+    // "auto" currently selects every implemented check (identical to "full").
+    let mode = if mode == "auto" { "full" } else { mode };
     let do_internal = mode == "internal" || mode == "full";
     let do_external = mode == "external" || mode == "full";
     if !do_internal && !do_external {
         return Err(format!(
-            "invalid [tddft] stability = \"{mode}\" (internal | external | full)"
+            "invalid stability mode = \"{mode}\" (internal | external | full | auto)"
         ));
     }
     if scf.scftype == SCFType::ROHF {
