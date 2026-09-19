@@ -151,6 +151,9 @@ fn build_ao_data(nvar: usize) -> TDDFTData {
         ri_oo_sr: None,
         ri_vv_sr: None,
         ri_ov_sr: None,
+        fxc_u: None,
+        ri_ov_u: None,
+        exch_u: None,
         reftype: SCFType::RHF,
     };
     data

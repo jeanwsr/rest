@@ -67,25 +67,25 @@ pub fn mo_timing_report() {
 /// `coeff_full*K_full + coeff_sr*K_SR` with `coeff_full = c_LR` and
 /// `coeff_sr = c_SR - c_LR` (since `K_full = K_SR + K_LR`), mirroring the
 /// ground-state Fock build in `scf_io`.
-pub struct ExchangeTerms<'a> {
+pub struct ExchangeTerms {
     pub coeff_full: f64,
-    pub ri_oo: &'a MatrixFull<f64>,   // [occ*naux, occ], for A exchange
-    pub ri_vv: &'a MatrixFull<f64>,   // [naux*vir, vir], for A exchange
-    pub ri_ov: &'a MatrixFull<f64>,   // [naux*occ, vir], for B exchange
+    pub ri_oo: MatrixFull<f64>,   // [occ*naux, occ], for A exchange
+    pub ri_vv: MatrixFull<f64>,   // [naux*vir, vir], for A exchange
+    pub ri_ov: MatrixFull<f64>,   // [naux*occ, vir], for B exchange
     pub coeff_sr: f64,
-    pub ri_oo_sr: Option<&'a MatrixFull<f64>>,
-    pub ri_vv_sr: Option<&'a MatrixFull<f64>>,
-    pub ri_ov_sr: Option<&'a MatrixFull<f64>>,
+    pub ri_oo_sr: Option<MatrixFull<f64>>,
+    pub ri_vv_sr: Option<MatrixFull<f64>>,
+    pub ri_ov_sr: Option<MatrixFull<f64>>,
 }
 
-impl<'a> ExchangeTerms<'a> {
+impl ExchangeTerms {
     /// Exchange terms of a non-RSH DFA: only the full-range tensors, scaled
     /// by the hybrid coefficient (possibly zero for pure functionals).
     pub fn full_only(
         coeff_full: f64,
-        ri_oo: &'a MatrixFull<f64>,
-        ri_vv: &'a MatrixFull<f64>,
-        ri_ov: &'a MatrixFull<f64>,
+        ri_oo: MatrixFull<f64>,
+        ri_vv: MatrixFull<f64>,
+        ri_ov: MatrixFull<f64>,
     ) -> Self {
         ExchangeTerms {
             coeff_full,
@@ -104,12 +104,12 @@ impl<'a> ExchangeTerms<'a> {
     pub fn rsh(
         coeff_full: f64,
         coeff_sr: f64,
-        ri_oo: &'a MatrixFull<f64>,
-        ri_vv: &'a MatrixFull<f64>,
-        ri_ov: &'a MatrixFull<f64>,
-        ri_oo_sr: &'a MatrixFull<f64>,
-        ri_vv_sr: &'a MatrixFull<f64>,
-        ri_ov_sr: &'a MatrixFull<f64>,
+        ri_oo: MatrixFull<f64>,
+        ri_vv: MatrixFull<f64>,
+        ri_ov: MatrixFull<f64>,
+        ri_oo_sr: MatrixFull<f64>,
+        ri_vv_sr: MatrixFull<f64>,
+        ri_ov_sr: MatrixFull<f64>,
     ) -> Self {
         ExchangeTerms {
             coeff_full,
@@ -507,8 +507,8 @@ pub fn a_matvec_unrestricted(
         let exch_s = &exch[s];
         if exch_s.coeff_full.abs() > 1e-15 {
             let kz = exchange_a_matvec(
-                exch_s.ri_oo,
-                exch_s.ri_vv,
+                &exch_s.ri_oo,
+                &exch_s.ri_vv,
                 zs,
                 occ_s,
                 vir_s,
@@ -519,7 +519,7 @@ pub fn a_matvec_unrestricted(
             }
         }
         if exch_s.coeff_sr.abs() > 1e-15 {
-            let (oo_sr, vv_sr) = match (exch_s.ri_oo_sr, exch_s.ri_vv_sr) {
+            let (oo_sr, vv_sr) = match (exch_s.ri_oo_sr.as_ref(), exch_s.ri_vv_sr.as_ref()) {
                 (Some(oo), Some(vv)) => (oo, vv),
                 _ => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", exch_s.coeff_sr),
             };
@@ -571,7 +571,7 @@ pub fn b_matvec_unrestricted(
         let exch_s = &exch[s];
         if exch_s.coeff_full.abs() > 1e-15 {
             let kz = exchange_b_matvec(
-                exch_s.ri_ov,
+                &exch_s.ri_ov,
                 zs,
                 occ_s,
                 vir_s,
@@ -582,7 +582,7 @@ pub fn b_matvec_unrestricted(
             }
         }
         if exch_s.coeff_sr.abs() > 1e-15 {
-            let ov_sr = match exch_s.ri_ov_sr {
+            let ov_sr = match exch_s.ri_ov_sr.as_ref() {
                 Some(ov) => ov,
                 _ => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", exch_s.coeff_sr),
             };

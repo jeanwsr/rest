@@ -202,37 +202,16 @@ pub fn transition_dipole_square_u(
 
 /// Get TDDFT orbital parameters for one spin channel (unrestricted).
 ///
-/// Same meaning as [`tddft_occupation_parameters`], but uses the spin-resolved
-/// eigenvalues, occupation windows and cutoff.
+/// Delegates to [`tddft_occupation_parameters_u`] so that every unrestricted
+/// consumer (driver, `prepare_fxc_data_unrestricted`, the unrestricted
+/// matvecs) shares ONE window definition — frozen-core and virtual cutoff
+/// resolved identically on both spin channels.
 pub fn tddft_occupation_parameters_spin(
     scf: &SCF,
     spin: usize,
 ) -> (usize, usize, usize, usize, usize, usize) {
-    let cutoff = scf.mol.ctrl.tddft.as_ref()
-        .map(|c| c.tddft_cutoff_energy)
-        .unwrap_or(1.0e6);
-    let mut num_state = scf.mol.num_state;
-    let homo = scf.homo[spin];
-    let lumo = scf.lumo[spin].min(num_state);
-    let ks = &scf.eigenvalues[spin];
-
-    // Do not freeze core orbitals automatically; keep all occupied orbitals to
-    // match PySCF's default no-frozen TDDFT.
-    let start_mo = scf.mol.start_mo;
-
-    // If there are no occupied orbitals in this spin channel, occ_size is zero.
-    let occ_size = (start_mo..=homo)
-        .filter(|&i| scf.occupation[spin].get(i).map(|&x| x > 1.0e-6).unwrap_or(false))
-        .count();
-
-    if cutoff < 1.0e5 {
-        num_state = ks.iter().filter(|x| **x < cutoff).count();
-        if num_state < homo + 1 {
-            num_state = homo + 1;
-        }
-    }
-    let vir_size = num_state.saturating_sub(lumo);
-    (start_mo, num_state, occ_size, vir_size, homo, lumo)
+    let sec = tddft_occupation_parameters_u(scf)[spin];
+    (sec.start_mo, sec.num_state, sec.occ_size, sec.vir_size, sec.homo, sec.lumo)
 }
 /// Get RI submatrix for TDDFT (no quasiparticle_methods dependency)
 ///
