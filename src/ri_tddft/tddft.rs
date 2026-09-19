@@ -23,7 +23,7 @@ use crate::dft::xceff::prelude::{determine_den_type, libxc_eval_eff, XCDenType, 
 use crate::ri_jk::util::get_cint_mol;
 use crate::ri_tddft::matvec::ExchangeTerms;
 use crate::ri_tddft::utils::{
-    rsh_exchange_coeffs, reshape_exchange_tensors, tddft_get_submatrix,
+    reshape_exchange_tensors, tddft_get_submatrix,
     tddft_get_submatrix_sr, tddft_get_submatrix_spin, tddft_get_submatrix_sr_spin,
     tddft_occupation_parameters, tddft_occupation_parameters_u,
 };
@@ -81,14 +81,10 @@ pub struct TDDFTData {
     pub ri_vv_exch: Option<MatrixFull<f64>>,
     /// [naux*occ, vir] RI tensor, B-block exchange.
     pub ri_ov_exch: Option<MatrixFull<f64>>,
-    // ── HF exchange coefficients & RSH short-range tensors (MO mode) ──
-    /// Full-range exchange coefficient of the response: `c_LR` for a
-    /// range-separated hybrid, `c_x` for an ordinary hybrid, `0` for a pure
-    /// functional. The exchange term reads `-coeff_full*K_full - coeff_sr*K_SR`.
-    pub coeff_full: f64,
-    /// Short-range `K_SR` coefficient: `c_SR - c_LR` for an RSH functional,
-    /// `0.0` otherwise (mirrors the ground-state Fock build in `scf_io`).
-    pub coeff_sr: f64,
+    // ── RSH short-range tensors (MO mode) ──
+    // The HF-exchange coefficients themselves (c_LR / c_SR − c_LR / omega) are
+    // NOT stored here: they are derived per use from `scf.mol.xc_data`
+    // (`rsh_params()` + `dfa_hybrid_scf`), which every matvec already holds.
     /// [occ*naux, occ] short-range RI tensor, A-block exchange (RSH only).
     pub ri_oo_sr: Option<MatrixFull<f64>>,
     /// [naux*vir, vir] short-range RI tensor, A-block exchange (RSH only).
@@ -168,14 +164,15 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
 
     // HF-exchange coefficients: for a range-separated hybrid the response
     // exchange reads coeff_full*K_full + coeff_sr*K_SR; otherwise the hybrid
-    // coefficient times K_full only.
-    let (coeff_full, coeff_sr) = match rsh_exchange_coeffs(scf) {
+    // coefficient times K_full only. Derived here from the DFA (also used by
+    // the kernels per matvec — no need to store it in TDDFTData).
+    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
         Some((omega, c_full, c_sr)) => {
             println!("RSH functional: omega = {:.6}, c_LR (K_full coeff) = {:.6}, c_SR - c_LR (K_SR coeff) = {:.6}",
                      omega, c_full, c_sr);
             (c_full, c_sr)
         }
-        None => (fxc.alpha_hybrid, 0.0),
+        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
     };
 
     // Short-range (erfc(omega*r12)/r12) exchange tensors for RSH.
@@ -207,8 +204,6 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
         ri_oo_exch: Some(ri_oo_exch),
         ri_vv_exch: Some(ri_vv_exch),
         ri_ov_exch: Some(ri_ov_exch),
-        coeff_full,
-        coeff_sr,
         ri_oo_sr,
         ri_vv_sr,
         ri_ov_sr,
@@ -234,14 +229,15 @@ pub fn prepare_mo_data_unrestricted(scf: &SCF) -> TDDFTData {
 
     // ── fxc / RI data ──
     let fxc = prepare_fxc_data_unrestricted(scf);
-    // HF-exchange coefficients (see the restricted path for the RSH convention)
-    let (coeff_full, coeff_sr) = match rsh_exchange_coeffs(scf) {
+    // HF-exchange coefficients derived from the DFA (see the restricted path
+    // for the RSH convention).
+    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
         Some((omega, c_full, c_sr)) => {
             println!("RSH functional: omega = {:.6}, c_LR (K_full coeff) = {:.6}, c_SR - c_LR (K_SR coeff) = {:.6}",
                      omega, c_full, c_sr);
             (c_full, c_sr)
         }
-        None => (fxc.alpha_hybrid, 0.0),
+        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
     };
 
     let mut ri_ov: [MatrixFull<f64>; 2] = [
@@ -261,8 +257,8 @@ pub fn prepare_mo_data_unrestricted(scf: &SCF) -> TDDFTData {
         MatrixFull::new([0, 0], 0.0),
     ];
     let mut exch_u: [ExchangeTerms; 2] = [
-        ExchangeTerms::full_only(0.0, MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0)),
-        ExchangeTerms::full_only(0.0, MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0)),
+        ExchangeTerms::full_only(MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0)),
+        ExchangeTerms::full_only(MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0), MatrixFull::new([0, 0], 0.0)),
     ];
 
     for s in 0..2 {
@@ -288,9 +284,9 @@ pub fn prepare_mo_data_unrestricted(scf: &SCF) -> TDDFTData {
             let vv_sr = tddft_get_submatrix_sr_spin(scf, 'V', 'V', sec.start_mo, sec.occ_size, sec.vir_size, sec.homo, sec.lumo, sec.num_state, s);
             let (oo_sr_exch, vv_sr_exch, ov_sr_exch) =
                 reshape_exchange_tensors(&oo_sr, &vv_sr, &ov_sr, sec.occ_size, sec.vir_size);
-            ExchangeTerms::rsh(coeff_full, coeff_sr, oo_exch, vv_exch, ov_exch, oo_sr_exch, vv_sr_exch, ov_sr_exch)
+            ExchangeTerms::rsh(oo_exch, vv_exch, ov_exch, oo_sr_exch, vv_sr_exch, ov_sr_exch)
         } else {
-            ExchangeTerms::full_only(coeff_full, oo_exch, vv_exch, ov_exch)
+            ExchangeTerms::full_only(oo_exch, vv_exch, ov_exch)
         };
 
         ri_ov[s] = ov;
@@ -313,8 +309,6 @@ pub fn prepare_mo_data_unrestricted(scf: &SCF) -> TDDFTData {
         ri_oo_exch: None,
         ri_vv_exch: None,
         ri_ov_exch: None,
-        coeff_full,
-        coeff_sr,
         ri_oo_sr: None,
         ri_vv_sr: None,
         ri_ov_sr: None,
@@ -355,6 +349,21 @@ pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTDa
     let nvar = if xc_data.use_density_gradient() { 4 } else { 1 };
     let alpha_hybrid = xc_data.dfa_hybrid_scf;
     let den_type = if nvar == 4 { XCDenType::SIGMA } else { XCDenType::RHO };
+    // Response exchange split (REST RSH convention, mirrors prepare_mo_data):
+    // `coeff_full*K_full + coeff_sr*K_SR` with coeff_full = c_LR and
+    // coeff_sr = c_SR - c_LR; for a non-RSH functional this reduces to the
+    // hybrid coefficient with no short-range pass.
+    let (coeff_full, coeff_sr) = match xc_data.rsh_params() {
+        Some((omega, c_full, c_sr)) => {
+            println!("RSH functional: omega = {:.6}, c_LR (K_full coeff) = {:.6}, c_SR - c_LR (K_SR coeff) = {:.6}",
+                     omega, c_full, c_sr);
+            (c_full, c_sr)
+        }
+        None => (alpha_hybrid, 0.0),
+    };
+    if coeff_sr.abs() > 1e-15 && scf.rimatr_sr.is_none() {
+        panic!("RSH AO-mode TDDFT requires the short-range three-center integrals                 (scf.rimatr_sr), which are built during the SCF of a range-separated                 hybrid; re-run the SCF with the same functional.");
+    }
 
     // ── Numerical integrator with the real grid weights (AO cached via libcint) ──
     let cint = get_cint_mol(&scf.mol);
@@ -590,10 +599,6 @@ pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTDa
         ri_oo_exch: None,
         ri_vv_exch: None,
         ri_ov_exch: None,
-        // AO mode scales the full-range exchange by c_x only; the RSH
-        // short-range/long-range split is not implemented on this path yet.
-        coeff_full: alpha_hybrid,
-        coeff_sr: 0.0,
         ri_oo_sr: None,
         ri_vv_sr: None,
         ri_ov_sr: None,

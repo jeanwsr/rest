@@ -164,6 +164,7 @@ fn get_j_ao_batched(scf: &SCF, p_block: &[MatrixFull<f64>]) -> MatrixFull<f64> {
 /// $K[D^{\mathrm{T}}] = K[D]^{\mathrm{T}}$ (each $M_Q$ is symmetric).
 fn get_k_ao_batched(
     scf: &SCF,
+    rimatr: &(MatrixFull<f64>, MatrixFull<usize>, Vec<[usize; 2]>),
     c_occ: &MatrixFull<f64>,
     c_vir: &MatrixFull<f64>,
     z_block: &MatrixFull<f64>,
@@ -181,8 +182,7 @@ fn get_k_ao_batched(
     let nao = scf.mol.num_basis;
     let m = p_block.len();
     let device = DeviceBLAS::default();
-    let (ri3fn, _, _) = scf.rimatr.as_ref()
-        .expect("rimatr must be initialized for AO-mode TDDFT");
+    let (ri3fn, _, _) = rimatr;
     let cderi = ri3fn.to_rstsr_view(&device);
     let naux = ri3fn.size[1];
     let occ_size = c_occ.size[1];
@@ -828,7 +828,22 @@ fn ao_kernel_block(
     xlet: char,
     is_b: bool,
 ) -> MatrixFull<f64> {
-    let alpha_hybrid = ao_data.alpha_hybrid;
+    // Response exchange: `coeff_full*K_full + coeff_sr*K_SR` (REST RSH
+    // convention: coeff_full = c_LR, coeff_sr = c_SR - c_LR; for a non-RSH
+    // functional coeff_full is the hybrid coefficient and coeff_sr is 0, so
+    // the single-operator path below is bit-identical to the plain-hybrid
+    // behaviour). K_SR reuses the same K drivers against `scf.rimatr_sr`.
+    // The coefficients derive from the DFA directly (not stored in the data).
+    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
+        Some((_, c_lr, c_sr)) => (c_lr, c_sr - c_lr),
+        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
+    };
+    let is_rsh = coeff_sr.abs() > 1e-15;
+    // Effective K multiplier at the assembly sites: for a non-RSH functional
+    // the raw K buffers stay unscaled and the sites multiply by coeff_full
+    // (== alpha_hybrid, bit-identical to the previous alpha_hybrid sites);
+    // for RSH the buffers are pre-scaled and the sites multiply by 1.
+    let alpha_hybrid = if is_rsh { 1.0 } else { coeff_full };
     let is_uhf = ao_data.is_uhf();
     let n_sec = ao_data.n_sectors();
     let sectors = crate::ri_tddft::utils::tddft_sector_params(scf);
@@ -908,17 +923,41 @@ fn ao_kernel_block(
 
     // ── K per spin sector (exchange is same-spin only) ──
     let t0 = Instant::now();
-    let k_sectors: Vec<Option<MatrixFull<f64>>> = if alpha_hybrid.abs() > 1e-15 {
+    let k_sectors: Vec<Option<MatrixFull<f64>>> = if coeff_full.abs() > 1e-15 {
         sectors.iter().enumerate()
             .map(|(i_sec, sec)| {
                 if sec.occ_size > 0 && sec.vir_size > 0 {
-                    Some(get_k_ao_batched(
+                    let mut k = get_k_ao_batched(
                         scf,
+                        scf.rimatr.as_ref()
+                            .expect("rimatr must be initialized for AO-mode TDDFT"),
                         &ao_data.c_occ[i_sec],
                         &ao_data.c_vir[i_sec],
                         &z_sectors[i_sec],
                         &p_sectors[i_sec],
-                    ))
+                    );
+                    if is_rsh {
+                        // RSH: scale the full-range pass and add the
+                        // short-range pass (erfc-attenuated integrals);
+                        // roughly doubles the K cost.
+                        for v in k.data.iter_mut() {
+                            *v *= coeff_full;
+                        }
+                        let rimatr_sr = scf.rimatr_sr.as_ref().expect(
+                            "RSH response requires rimatr_sr (built during SCF                              for range-separated hybrids)");
+                        let k_sr = get_k_ao_batched(
+                            scf,
+                            rimatr_sr,
+                            &ao_data.c_occ[i_sec],
+                            &ao_data.c_vir[i_sec],
+                            &z_sectors[i_sec],
+                            &p_sectors[i_sec],
+                        );
+                        for (v, s) in k.data.iter_mut().zip(k_sr.data.iter()) {
+                            *v += coeff_sr * *s;
+                        }
+                    }
+                    Some(k)
                 } else {
                     None
                 }

@@ -54,56 +54,51 @@ pub fn mo_timing_report() {
     }
 }
 
-/// HF-exchange tensors and coefficients of the TDDFT response.
+/// HF-exchange tensors of the TDDFT response (per spin sector, MO mode).
 ///
 /// The exchange contribution of A and B reads
 /// `-coeff_full * K_full[z] - coeff_sr * K_SR[z]`, where `K_full` is built
 /// from the full-range 3-center integrals and `K_SR` from the short-range
-/// (erfc(omega*r12)/r12) integrals.
+/// (erfc(omega*r12)/r12) integrals. The coefficients themselves are NOT
+/// stored here: they derive from `scf.mol.xc_data` (`rsh_params()` +
+/// `dfa_hybrid_scf`) at each use site.
 ///
-/// For ordinary hybrids (and pure functionals) `coeff_sr` is zero and the SR
-/// tensors are absent. For a range-separated hybrid the HF exchange is
-/// `c_SR*K_SR + c_LR*K_LR`, which is evaluated as
+/// For ordinary hybrids (and pure functionals) the SR tensors are absent and
+/// the exchange is the full-range term alone, scaled by the hybrid
+/// coefficient. For a range-separated hybrid the HF exchange is
+/// `c_SR*K_SR + c_LR*K_LR`, evaluated as
 /// `coeff_full*K_full + coeff_sr*K_SR` with `coeff_full = c_LR` and
 /// `coeff_sr = c_SR - c_LR` (since `K_full = K_SR + K_LR`), mirroring the
 /// ground-state Fock build in `scf_io`.
 pub struct ExchangeTerms {
-    pub coeff_full: f64,
     pub ri_oo: MatrixFull<f64>,   // [occ*naux, occ], for A exchange
     pub ri_vv: MatrixFull<f64>,   // [naux*vir, vir], for A exchange
     pub ri_ov: MatrixFull<f64>,   // [naux*occ, vir], for B exchange
-    pub coeff_sr: f64,
     pub ri_oo_sr: Option<MatrixFull<f64>>,
     pub ri_vv_sr: Option<MatrixFull<f64>>,
     pub ri_ov_sr: Option<MatrixFull<f64>>,
 }
 
 impl ExchangeTerms {
-    /// Exchange terms of a non-RSH DFA: only the full-range tensors, scaled
-    /// by the hybrid coefficient (possibly zero for pure functionals).
+    /// Exchange tensors of a non-RSH DFA: only the full-range terms.
     pub fn full_only(
-        coeff_full: f64,
         ri_oo: MatrixFull<f64>,
         ri_vv: MatrixFull<f64>,
         ri_ov: MatrixFull<f64>,
     ) -> Self {
         ExchangeTerms {
-            coeff_full,
             ri_oo,
             ri_vv,
             ri_ov,
-            coeff_sr: 0.0,
             ri_oo_sr: None,
             ri_vv_sr: None,
             ri_ov_sr: None,
         }
     }
 
-    /// Exchange terms of a range-separated hybrid:
-    /// `c_LR*K_full + (c_SR - c_LR)*K_SR` (see the struct documentation).
+    /// Exchange tensors of a range-separated hybrid (see the struct
+    /// documentation for the coefficient convention).
     pub fn rsh(
-        coeff_full: f64,
-        coeff_sr: f64,
         ri_oo: MatrixFull<f64>,
         ri_vv: MatrixFull<f64>,
         ri_ov: MatrixFull<f64>,
@@ -112,11 +107,9 @@ impl ExchangeTerms {
         ri_ov_sr: MatrixFull<f64>,
     ) -> Self {
         ExchangeTerms {
-            coeff_full,
             ri_oo,
             ri_vv,
             ri_ov,
-            coeff_sr,
             ri_oo_sr: Some(ri_oo_sr),
             ri_vv_sr: Some(ri_vv_sr),
             ri_ov_sr: Some(ri_ov_sr),
@@ -310,25 +303,28 @@ pub fn a_matvec(
         }
     }
 
-    // Step 3: Exchange contribution: -coeff_full * K_A[z] (hybrid only);
-    // for a range-separated hybrid coeff_full = c_LR.
-    if data.coeff_full.abs() > 1e-15 {
+    // Step 3: Exchange contribution: -coeff_full * K_A[z] - coeff_sr * K_SR[z]
+    // (hybrid only; the coefficients derive from the DFA, no need to store
+    // them in the data: RSH → (c_LR, c_SR - c_LR), hybrid → (c_x, 0)).
+    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
+        Some((_, c_lr, c_sr)) => (c_lr, c_sr - c_lr),
+        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
+    };
+    if coeff_full.abs() > 1e-15 {
         let t0 = Instant::now();
-        let kz = exchange_a_matvec(ri_oo_exch, ri_vv_exch, z, occ_size, vir_size, data.coeff_full);
+        let kz = exchange_a_matvec(ri_oo_exch, ri_vv_exch, z, occ_size, vir_size, coeff_full);
         add_ns(&T_MV_K, t0);
         for idx in 0..dim {
             result[idx] += kz[idx];
         }
     }
-
-    // Step 3b: RSH short-range exchange correction: -(c_SR - c_LR) * K_SR[z]
-    if data.coeff_sr.abs() > 1e-15 {
+    if coeff_sr.abs() > 1e-15 {
         let t0 = Instant::now();
         let (oo_sr, vv_sr) = match (data.ri_oo_sr.as_ref(), data.ri_vv_sr.as_ref()) {
             (Some(oo), Some(vv)) => (oo, vv),
-            _ => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", data.coeff_sr),
+            _ => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", coeff_sr),
         };
-        let kz = exchange_a_matvec(oo_sr, vv_sr, z, occ_size, vir_size, data.coeff_sr);
+        let kz = exchange_a_matvec(oo_sr, vv_sr, z, occ_size, vir_size, coeff_sr);
         add_ns(&T_MV_K, t0);
         for idx in 0..dim {
             result[idx] += kz[idx];
@@ -383,25 +379,27 @@ pub fn b_matvec(
         }
     }
 
-    // Step 2: Exchange contribution: -coeff_full * K_B[z] (hybrid only);
-    // for a range-separated hybrid coeff_full = c_LR.
-    if data.coeff_full.abs() > 1e-15 {
+    // Step 2: Exchange contribution: -coeff_full * K_B[z] - coeff_sr * K_SR[z]
+    // (hybrid only; coefficients derive from the DFA, see a_matvec).
+    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
+        Some((_, c_lr, c_sr)) => (c_lr, c_sr - c_lr),
+        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
+    };
+    if coeff_full.abs() > 1e-15 {
         let t0 = Instant::now();
-        let kz = exchange_b_matvec(ri_ov_exch, z, occ_size, vir_size, data.coeff_full);
+        let kz = exchange_b_matvec(ri_ov_exch, z, occ_size, vir_size, coeff_full);
         add_ns(&T_MV_K, t0);
         for idx in 0..dim {
             result[idx] += kz[idx];
         }
     }
-
-    // Step 2b: RSH short-range exchange correction: -(c_SR - c_LR) * K_SR[z]
-    if data.coeff_sr.abs() > 1e-15 {
+    if coeff_sr.abs() > 1e-15 {
         let t0 = Instant::now();
         let ov_sr = match data.ri_ov_sr.as_ref() {
             Some(ov) => ov,
-            None => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", data.coeff_sr),
+            None => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", coeff_sr),
         };
-        let kz = exchange_b_matvec(ov_sr, z, occ_size, vir_size, data.coeff_sr);
+        let kz = exchange_b_matvec(ov_sr, z, occ_size, vir_size, coeff_sr);
         add_ns(&T_MV_K, t0);
         for idx in 0..dim {
             result[idx] += kz[idx];
@@ -481,6 +479,13 @@ pub fn a_matvec_unrestricted(
     let n0 = fxc_data.nocc[0] * fxc_data.nvir[0];
     let n1 = fxc_data.nocc[1] * fxc_data.nvir[1];
     assert_eq!(z.len(), n0 + n1);
+    // Response HF-exchange coefficients from the DFA
+    // (RSH -> (c_LR, c_SR - c_LR); hybrid -> (c_x, 0)); the coefficients are
+    // spin-independent, derived once here and applied per spin sector.
+    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
+        Some((_, c_lr, c_sr)) => (c_lr, c_sr - c_lr),
+        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
+    };
     let mut result = vec![0.0; n0 + n1];
 
     // Per-spin diagonal, exchange and fxc.
@@ -505,25 +510,25 @@ pub fn a_matvec_unrestricted(
         }
 
         let exch_s = &exch[s];
-        if exch_s.coeff_full.abs() > 1e-15 {
+        if coeff_full.abs() > 1e-15 {
             let kz = exchange_a_matvec(
                 &exch_s.ri_oo,
                 &exch_s.ri_vv,
                 zs,
                 occ_s,
                 vir_s,
-                exch_s.coeff_full,
+                coeff_full,
             );
             for idx in 0..ns {
                 rs[idx] += kz[idx];
             }
         }
-        if exch_s.coeff_sr.abs() > 1e-15 {
+        if coeff_sr.abs() > 1e-15 {
             let (oo_sr, vv_sr) = match (exch_s.ri_oo_sr.as_ref(), exch_s.ri_vv_sr.as_ref()) {
                 (Some(oo), Some(vv)) => (oo, vv),
-                _ => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", exch_s.coeff_sr),
+                _ => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", coeff_sr),
             };
-            let kz = exchange_a_matvec(oo_sr, vv_sr, zs, occ_s, vir_s, exch_s.coeff_sr);
+            let kz = exchange_a_matvec(oo_sr, vv_sr, zs, occ_s, vir_s, coeff_sr);
             for idx in 0..ns {
                 rs[idx] += kz[idx];
             }
@@ -556,6 +561,13 @@ pub fn b_matvec_unrestricted(
     let n0 = fxc_data.nocc[0] * fxc_data.nvir[0];
     let n1 = fxc_data.nocc[1] * fxc_data.nvir[1];
     assert_eq!(z.len(), n0 + n1);
+    // Response HF-exchange coefficients from the DFA
+    // (RSH -> (c_LR, c_SR - c_LR); hybrid -> (c_x, 0)); the coefficients are
+    // spin-independent, derived once here and applied per spin sector.
+    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
+        Some((_, c_lr, c_sr)) => (c_lr, c_sr - c_lr),
+        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
+    };
     let mut result = vec![0.0; n0 + n1];
 
     let (fa, fb) = fxc_matvec_unrestricted(fxc_data, z);
@@ -569,24 +581,24 @@ pub fn b_matvec_unrestricted(
         let mut rs = vec![0.0; ns];
 
         let exch_s = &exch[s];
-        if exch_s.coeff_full.abs() > 1e-15 {
+        if coeff_full.abs() > 1e-15 {
             let kz = exchange_b_matvec(
                 &exch_s.ri_ov,
                 zs,
                 occ_s,
                 vir_s,
-                exch_s.coeff_full,
+                coeff_full,
             );
             for idx in 0..ns {
                 rs[idx] += kz[idx];
             }
         }
-        if exch_s.coeff_sr.abs() > 1e-15 {
+        if coeff_sr.abs() > 1e-15 {
             let ov_sr = match exch_s.ri_ov_sr.as_ref() {
                 Some(ov) => ov,
-                _ => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", exch_s.coeff_sr),
+                _ => panic!("RSH short-range exchange requested (coeff_sr = {}) but the SR exchange tensors are missing", coeff_sr),
             };
-            let kz = exchange_b_matvec(ov_sr, zs, occ_s, vir_s, exch_s.coeff_sr);
+            let kz = exchange_b_matvec(ov_sr, zs, occ_s, vir_s, coeff_sr);
             for idx in 0..ns {
                 rs[idx] += kz[idx];
             }

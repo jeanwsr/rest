@@ -73,7 +73,7 @@ pub fn stability(scf: &SCF) -> Result<StabilityReport, String> {
     let do_external = mode == "external" || mode == "full";
     if !do_internal && !do_external {
         return Err(format!(
-            "[tddft] stability = \"{mode}\" is not one of internal/external/full"
+            "invalid [tddft] stability = \"{mode}\" (internal | external | full)"
         ));
     }
     if scf.scftype == SCFType::ROHF {

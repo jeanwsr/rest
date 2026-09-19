@@ -171,8 +171,8 @@ impl<'a> TddftGradEngine<'a> {
         let raw = build_raw_ri_tensors(scf);
         let is_hf = scf.mol.xc_data.dfa_compnt_scf.is_empty();
         let hyb = if is_hf { 1.0 } else { scf.mol.xc_data.dfa_hybrid_scf };
-        let hyb_sr = match crate::ri_tddft::utils::rsh_exchange_coeffs(scf) {
-            Some((_omega, _c_full, c_sr)) => {
+        let hyb_sr = match scf.mol.xc_data.rsh_params() {
+            Some((_omega, _c_lr, c_sr)) => {
                 panic!(
                     "TDDFT gradient: range-separated hybrids are not yet supported \
                      (c_sr={:.6}); use an ordinary hybrid or pure functional",

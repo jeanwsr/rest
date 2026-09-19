@@ -378,20 +378,6 @@ pub fn reshape_exchange_tensors(
     (oo_exch, vv_exch, ov_exch)
 }
 
-/// HF-exchange coefficients of a range-separated hybrid for the TDDFT response.
-///
-/// Returns `None` unless the DFA is a range-separated hybrid. Otherwise
-/// returns `(omega, coeff_full, coeff_sr)` such that the HF exchange of the
-/// response reads `coeff_full*K_full + coeff_sr*K_SR` with
-/// `coeff_full = c_LR` and `coeff_sr = c_SR - c_LR`, mirroring the
-/// ground-state Fock build in `scf_io`.
-pub fn rsh_exchange_coeffs(scf: &SCF) -> Option<(f64, f64, f64)> {
-    let (omega, alpha_lr, _beta) = scf.mol.xc_data.rsh_params()?;
-    let c_sr = scf.mol.xc_data.dfa_hybrid_scf; // = c_SR = alpha + beta for RSH
-    Some((omega, alpha_lr, c_sr - alpha_lr))
-}
-
-
 /// Compute dipole moment integrals in MO basis for TDDFT
 ///
 /// Returns a matrix of shape [3, occ_size * vir_size] containing
