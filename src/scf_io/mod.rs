@@ -3586,6 +3586,8 @@ impl SCF {
             "Schwartz-screened RI-J engine is not built; the SCF object was not prepared with algorithm_j = ri-schwartz.",
         );
 
+        debug!("Entering Schwartz-screened RI-J algorithm ({} shell pairs).", engine.pairs.pairs.len());
+
         // compute vj only for specified spin channels
         let dms = &self.density_matrix[0..self.mol.spin_channel];
         let mut vjs = ri_jk::generate_vj_ri_schwartz(engine, dms);
