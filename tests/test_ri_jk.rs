@@ -38,6 +38,41 @@ fn test_nh3_j() {
 }
 
 #[test]
+fn test_nh3_j_schwartz() {
+    let scf_data = initialize_nh3();
+    let device = DeviceBLAS::default();
+
+    let dm = [&scf_data.density_matrix[0]].as_ref().to_rstsr(&device);
+    let mol_obj = &scf_data.mol;
+
+    let mol = util::get_cint_mol(mol_obj);
+    let aux = util::get_cint_aux(mol_obj);
+
+    // reference: incore
+    let rimatr = scf_data.rimatr.as_ref().unwrap().0.to_rstsr_view(&device);
+    let j_incore = get_vj_ri_incore(rimatr, dm.view());
+
+    // schwartz (default [ctrl.ri_jk] thresholds, same j2c policy as the incore rimatr)
+    let engine = RiJSchwartzEngine::build(
+        mol,
+        aux,
+        mol_obj.ctrl.ri_jk.schwartz_threshold,
+        mol_obj.ctrl.ri_jk.schwartz_overlap_tol2,
+        mol_obj.ctrl.j2c_decomp,
+    );
+    let j_schwartz = get_vj_ri_schwartz(&engine, dm.view());
+
+    assert!(rt::allclose(j_schwartz.view(), j_incore.view(), (1e-8, 1e-8)));
+
+    // the same fingerprint reference as test_nh3_j (same tolerance; the tight check is the
+    // elementwise comparison with incore above)
+    let fp = fingerprint_f64(j_schwartz.i((.., .., 0)));
+    let ref_fp = 37.83424292927407;
+    println!("schwartz J fingerprint: {fp}");
+    assert!((fp / ref_fp - 1.0).abs() < 1e-5);
+}
+
+#[test]
 fn test_nh3_k() {
     let scf_data = initialize_nh3();
     let device = DeviceBLAS::default();
@@ -147,11 +182,12 @@ fn test_solved_j3c() {
     // eigen way
     let j3c_ = j3c.clone();
     let ptr_j3c = j3c_.as_ptr();
-    let j2c_decomp = get_j2c_decomp(
-        &aux,
-        &device,
-        J2CDecompOption { policy: J2CDecompPolicy::Eig, threshold: Some(1e-13), uplo: Upper, ..Default::default() },
-    );
+    let j2c_decomp = get_j2c_decomp(&aux, &device, J2CDecompOption {
+        policy: J2CDecompPolicy::Eig,
+        threshold: Some(1e-13),
+        uplo: Upper,
+        ..Default::default()
+    });
     let j3c_solved = get_solved_j3c(j3c_, &j2c_decomp, false);
     let ptr_j3c_solved = j3c_solved.as_ptr();
     assert!(core::ptr::eq(ptr_j3c, ptr_j3c_solved));

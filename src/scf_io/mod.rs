@@ -112,6 +112,9 @@ pub struct SCF {
     /// Spin-resolved quasiparticle energies: (G energies, W energies), indexed [spin].
     pub gwqp_spin:([Vec<f64>;2],[Vec<f64>;2]),
     pub algorithm_jk: AlgorithmJK,
+    /// Per-geometry engine of the `ri-schwartz` RI-J algorithm, built in
+    /// `prepare_necessary_integrals` when `algorithm_j = ri-schwartz` is set.
+    pub schwartz_rij_engine: Option<std::sync::Arc<ri_jk::RiJSchwartzEngine>>,
     pub solvent_static_obj: Option<PcmObject>,
     pub solvent_scf: Option<PcmScf>,
     /// Raw TDDFT eigenvectors from the last `tddft_main` call:
@@ -177,6 +180,7 @@ impl SCF {
             gwqp:(Vec::new(),Vec::new()),
             gwqp_spin:([Vec::new(),Vec::new()],[Vec::new(),Vec::new()]),
             algorithm_jk: AlgorithmJK::Default,
+            schwartz_rij_engine: None,
             solvent_static_obj: None,
             solvent_scf: None,
             tddft_excitations: None,
@@ -491,6 +495,18 @@ impl SCF {
                 self.ri3fn_sr = Some(self.mol.prepare_ri3fn_sr_rayon(omega));
             }
             info!("  SR 3c integrals built.");
+        }
+
+        // build the per-geometry engine of the Schwartz-screened RI-J algorithm
+        // (all static data: shell-pair Schwarz bounds, aux-shell bounds, decomposed 2c-2e metric)
+        if let AlgorithmJK::Separated(AlgorithmJ::RiSchwartz, _) = self.algorithm_jk {
+            let mol = ri_jk::util::get_cint_mol(&self.mol);
+            let aux = ri_jk::util::get_cint_aux(&self.mol);
+            let ri_jk_opt = self.mol.ctrl.ri_jk;
+            let engine =
+                ri_jk::RiJSchwartzEngine::build(mol, aux, ri_jk_opt.schwartz_threshold, ri_jk_opt.schwartz_overlap_tol2, self.mol.ctrl.j2c_decomp);
+            info!("Schwartz-screened RI-J engine built ({} shell pairs).", engine.pairs.pairs.len());
+            self.schwartz_rij_engine = Some(std::sync::Arc::new(engine));
         }
 
         // initial eigenvectors and eigenvalues
@@ -1837,6 +1853,7 @@ impl SCF {
             match self.algorithm_jk {
                 AlgorithmJK::RiIncore | AlgorithmJK::Separated(AlgorithmJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
                 AlgorithmJK::RiDirect | AlgorithmJK::Separated(AlgorithmJ::RiDirect, _) => self.generate_vj_ri_direct(None),
+                AlgorithmJK::Separated(AlgorithmJ::RiSchwartz, _) => self.generate_vj_ri_schwartz(),
                 _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             }
         };
@@ -2045,6 +2062,7 @@ impl SCF {
             match self.algorithm_jk {
             AlgorithmJK::RiIncore | AlgorithmJK::Separated(AlgorithmJ::RiIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
             AlgorithmJK::RiDirect | AlgorithmJK::Separated(AlgorithmJ::RiDirect, _) => self.generate_vj_ri_direct(None),
+            AlgorithmJK::Separated(AlgorithmJ::RiSchwartz, _) => self.generate_vj_ri_schwartz(),
             _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             }
         };
@@ -3551,6 +3569,26 @@ impl SCF {
         let dms = &self.density_matrix[0..self.mol.spin_channel];
         let mol_obj = &self.mol;
         let mut vjs = ri_jk::generate_vj_ri_direct(dms, mol_obj, batch_size);
+
+        // complete `vjs` if the spin channel is 1 (restricted, spin-unpolarized)
+        if self.mol.spin_channel == 1 {
+            vjs.push(MatrixUpper::new(1, 0.0f64));
+        }
+
+        vjs
+    }
+
+    /// Generate Coulomb (J) matrices using the Schwartz-screened RI-J algorithm
+    /// (`algorithm_j = ri-schwartz`). The per-geometry engine is built in
+    /// `prepare_necessary_integrals`. This path is not MPI-parallel (single-node).
+    fn generate_vj_ri_schwartz(&self) -> Vec<MatrixUpper<f64>> {
+        let engine = self.schwartz_rij_engine.as_ref().expect(
+            "Schwartz-screened RI-J engine is not built; the SCF object was not prepared with algorithm_j = ri-schwartz.",
+        );
+
+        // compute vj only for specified spin channels
+        let dms = &self.density_matrix[0..self.mol.spin_channel];
+        let mut vjs = ri_jk::generate_vj_ri_schwartz(engine, dms);
 
         // complete `vjs` if the spin channel is 1 (restricted, spin-unpolarized)
         if self.mol.spin_channel == 1 {
