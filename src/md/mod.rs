@@ -63,6 +63,107 @@ impl QmmmRuntime {
     }
 }
 
+fn update_links(
+    pos: &mut [f64],
+    vel: &mut [f64],
+    zero_v: bool,
+    rt: Option<&QmmmRuntime>,
+    qp: Option<&parameters::QmmmParams>,
+) {
+    if let (Some(rt), Some(qp)) = (rt, qp) {
+        for (k, (qm_bdry, mm_host)) in qp.links.iter().enumerate() {
+            let lrow = rt.n_qm_geom - rt.n_link + k;
+            let qrow = 3 * qm_bdry;
+            let mrow = 3 * rt.gro_row(*mm_host);
+            let d = [
+                pos[mrow] - pos[qrow],
+                pos[mrow + 1] - pos[qrow + 1],
+                pos[mrow + 2] - pos[qrow + 2],
+            ];
+            let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            let r_eq = qp.link_r_eq / crate::constants::BOHR;
+            let unit = if n > 1.0e-12 { [d[0] / n, d[1] / n, d[2] / n] } else { [1.0, 0.0, 0.0] };
+            pos[3 * lrow] = pos[qrow] + r_eq * unit[0];
+            pos[3 * lrow + 1] = pos[qrow] + r_eq * unit[1];
+            pos[3 * lrow + 2] = pos[qrow] + r_eq * unit[2];
+            if zero_v {
+                for c in 0..3 {
+                    vel[3 * lrow + c] = 0.0;
+                }
+            }
+        }
+    }
+}
+
+struct EvalCtx {
+    scf: std::rc::Rc<std::cell::RefCell<SCF>>,
+    tm: std::rc::Rc<std::cell::RefCell<utilities::TimeRecords>>,
+    mpi: std::rc::Rc<Option<MPIOperator>>,
+    engine: std::rc::Rc<std::cell::RefCell<Option<mm::OpenMmEngine>>>,
+    rt: Option<std::rc::Rc<QmmmRuntime>>,
+    bias: Option<std::rc::Rc<UmbrellaBias>>,
+    params: std::rc::Rc<parameters::MdParameters>,
+    is_root: bool,
+    n_qm: usize,
+    last_feval: std::rc::Rc<std::cell::RefCell<Option<ForceEval>>>,
+    want_dipole: bool,
+}
+
+impl EvalCtx {
+    fn force(&self, pos_bohr: &[f64]) -> ForceEval {
+        let mut scf_b = self.scf.borrow_mut();
+        let mut tm_b = self.tm.borrow_mut();
+        let mut eng_b = self.engine.borrow_mut();
+        let fe = evaluate_forces(
+            &mut scf_b,
+            &mut tm_b,
+            &self.mpi,
+            pos_bohr,
+            self.is_root,
+            self.n_qm,
+            self.rt.as_deref(),
+            &mut eng_b,
+            self.params.qmmm.as_ref(),
+            self.bias.as_deref(),
+            self.want_dipole,
+        );
+        if !scf_b.scf_converged {
+            panic!(
+                "MD run: SCF did not converge at the current geometry — aborting to \
+                 protect the trajectory (delete a stale 'restart' chkfile if present)"
+            );
+        }
+        fe
+    }
+
+    fn eval_ang(&self, positions_ang: &[f64]) -> anyhow::Result<(f64, Vec<f64>)> {
+        let pos_bohr: Vec<f64> =
+            positions_ang.iter().map(|x| x / crate::constants::BOHR).collect();
+        self.eval_bohr(&pos_bohr)
+    }
+
+    fn eval_bohr(&self, pos_bohr: &[f64]) -> anyhow::Result<(f64, Vec<f64>)> {
+        let fe = self.force(pos_bohr);
+        let out = (
+            fe.epot * HARTREE2EV,
+            fe.force.iter().map(|x| x * AU_FORCE2_EV_PER_ANG).collect::<Vec<f64>>(),
+        );
+        *self.last_feval.borrow_mut() = Some(fe);
+        Ok(out)
+    }
+}
+
+fn eval_pure_mm(
+    engine: &mm::OpenMmEngine,
+    pos_bohr: &[f64],
+) -> anyhow::Result<(f64, Vec<f64>)> {
+    let (e_ha, f_au) = engine.evaluate(pos_bohr)?;
+    if f_au.iter().any(|x| !x.is_finite()) {
+        panic!("Pure-MM run: non-finite forces — check for overlapping particles");
+    }
+    Ok((e_ha, f_au))
+}
+
 fn evaluate_forces(
     scf_data: &mut SCF,
     time_mark: &mut utilities::TimeRecords,
@@ -376,7 +477,7 @@ pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyho
         )
         .unwrap_or_else(|e| panic!("MD run: {}", e))
     };
-    let engine_ref = &engine;
+    let engine = std::rc::Rc::new(engine);
 
     let n = top.n_mm;
     let mut pos: Vec<f64> = top.pos_bohr.clone();
@@ -389,28 +490,23 @@ pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyho
         n, mm_file
     );
 
-    let evaluate = |pos_bohr: &[f64]| -> anyhow::Result<(f64, Vec<f64>)> {
-        let (e_ha, f_au) = engine_ref.evaluate(pos_bohr)?;
-        if f_au.iter().any(|x| !x.is_finite()) {
-            panic!("Pure-MM run: non-finite forces — check for overlapping particles");
-        }
-        Ok((e_ha, f_au))
-    };
-    let last_e = std::cell::Cell::new(0.0f64);
+    let last_e = std::rc::Rc::new(std::cell::Cell::new(0.0f64));
     let last_f: std::rc::Rc<std::cell::RefCell<Vec<f64>>> =
         std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let f_slot = last_f.clone();
-    let mut hook = |positions_ang: &[f64]| -> anyhow::Result<(f64, Vec<f64>)> {
+    let hook_engine = engine.clone();
+    let hook_e = last_e.clone();
+    let mut hook = move |positions_ang: &[f64]| -> anyhow::Result<(f64, Vec<f64>)> {
         let pos_bohr: Vec<f64> =
             positions_ang.iter().map(|x| x / crate::constants::BOHR).collect();
-        let (e_ha, f_au) = evaluate(&pos_bohr)?;
-        last_e.set(e_ha);
+        let (e_ha, f_au) = eval_pure_mm(&hook_engine, &pos_bohr)?;
+        hook_e.set(e_ha);
         *f_slot.borrow_mut() = f_au.clone();
         Ok((e_ha * HARTREE2EV, f_au.iter().map(|x| x * AU_FORCE2_EV_PER_ANG).collect()))
     };
 
     if is_single_point {
-        let (e_ha, f_au) = evaluate(&pos)?;
+        let (e_ha, f_au) = eval_pure_mm(&engine, &pos)?;
         let fmax_au = f_au.iter().fold(0.0f64, |a, x| a.max(x.abs()));
         println!("Potential Energy = {:.9} a.u.", e_ha);
         println!("Max force = {:.9} a.u.", fmax_au);
@@ -514,6 +610,9 @@ pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyho
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(12345);
     }
+    let md_engine = engine.clone();
+    let md_e = last_e.clone();
+    let md_f = last_f.clone();
     let md = ase::AseMd::new(
         &symbols,
         &mass_amu,
@@ -526,6 +625,14 @@ pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyho
         &params.ensemble,
         seed,
         &[],
+        move |positions_ang: &[f64]| -> anyhow::Result<(f64, Vec<f64>)> {
+            let pos_bohr: Vec<f64> =
+                positions_ang.iter().map(|x| x / crate::constants::BOHR).collect();
+            let (e_ha, f_au) = eval_pure_mm(&md_engine, &pos_bohr)?;
+            md_e.set(e_ha);
+            *md_f.borrow_mut() = f_au.clone();
+            Ok((e_ha * HARTREE2EV, f_au.iter().map(|x| x * AU_FORCE2_EV_PER_ANG).collect()))
+        },
     )
     .unwrap_or_else(|e| panic!("MD run: {}", e));
     let mut vel: Vec<f64> = md
@@ -535,9 +642,7 @@ pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyho
         .collect();
     let f_for_traj = last_f.clone();
     for step in 1..=params.steps {
-        let pos_ang: Vec<f64> = pos.iter().map(|x| x * crate::constants::BOHR).collect();
-        let (_e_ev, f_ev) = hook(&pos_ang).unwrap_or_else(|e| panic!("MD run: {}", e));
-        let (p_ang, v_ang) = md.step(&f_ev).unwrap_or_else(|e| panic!("MD run: {}", e));
+        let (p_ang, v_ang) = md.step().unwrap_or_else(|e| panic!("MD run: {}", e));
         for i in 0..3 * n {
             pos[i] = p_ang[i] / crate::constants::BOHR;
             vel[i] = v_ang[i] * integrator::AU_TIME_TO_FS / crate::constants::BOHR;
@@ -595,11 +700,11 @@ pub fn run_pure_mm(ctrl_file: &str, mpi_operator: &Option<MPIOperator>) -> anyho
 }
 
 pub fn run_md(
-    scf_data: &mut SCF,
-    time_mark: &mut utilities::TimeRecords,
-    mpi_operator: &Option<MPIOperator>,
+    mut scf_data: SCF,
+    mut time_mark: utilities::TimeRecords,
+    mpi_operator: Option<MPIOperator>,
     ctrl_file: &str,
-) {
+) -> (SCF, utilities::TimeRecords, Option<MPIOperator>) {
     let is_root = mpi_operator.as_ref().map_or(true, |op| op.rank == 0);
 
     let raw = std::fs::read_to_string(ctrl_file).unwrap_or_else(|e| {
@@ -615,7 +720,7 @@ pub fn run_md(
         .unwrap_or_else(|e| panic!("MD run: invalid [md] section: {}", e))
         .unwrap_or_default();
     if params.qmmm.is_some() {
-        require_single_process(mpi_operator);
+        require_single_process(&mpi_operator);
     }
     if let Some(qp) = params.qmmm.as_mut() {
         if !qp.top.is_empty() {
@@ -726,7 +831,7 @@ pub fn run_md(
                 .unwrap_or(12345);
         }
         let mut buf = vec![f64::from_bits(seed)];
-        bcast_f64(&mut buf, 0, mpi_operator);
+        bcast_f64(&mut buf, 0, &mpi_operator);
         seed = buf[0].to_bits();
     }
 
@@ -838,7 +943,6 @@ pub fn run_md(
         mass_amu.extend_from_slice(&top.masses[gro_skip..]);
         pos.extend_from_slice(&top.pos_bohr[3 * gro_skip..]);
     }
-    let qmmm_params = params.qmmm.as_ref();
     let n_total = symbols.len();
     let mass_au = integrator::masses_amu_to_au(&mass_amu);
 
@@ -898,7 +1002,7 @@ pub fn run_md(
         }
     }
 
-    let bias_owned: Option<UmbrellaBias> = params.umbrella.as_ref().map(|u| {
+    let mut bias_owned: Option<UmbrellaBias> = params.umbrella.as_ref().map(|u| {
         if u.atoms.iter().any(|a| *a >= n_total) {
             panic!("MD run: umbrella_atoms {:?} out of range ({} atoms)", u.atoms, n_total);
         }
@@ -943,51 +1047,6 @@ pub fn run_md(
                 .unwrap_or_else(|e| panic!("MD run: {}", e)),
             _ => vec![0.0; 3 * n_total],
         }
-    };
-
-    let ase_engine = {
-        let fixed_rows: Vec<usize> = rt
-            .map(|r| (0..r.n_link).map(|k| r.n_qm_geom - r.n_link + k).collect())
-            .unwrap_or_default();
-        let v_init: Option<Vec<f64>> = if restart_mode || params.init_velocities.eq("file") {
-            let ang_fs = crate::constants::BOHR / integrator::AU_TIME_TO_FS;
-            Some(vel.iter().map(|v| v * ang_fs).collect())
-        } else if params.init_velocities.eq("zero") {
-            Some(vec![0.0; 3 * n_total])
-        } else {
-            None
-        };
-        let pos_ang: Vec<f64> = pos.iter().map(|x| x * crate::constants::BOHR).collect();
-        let engine = ase::AseMd::new(
-            &symbols,
-            &mass_amu,
-            &pos_ang,
-            v_init.as_deref(),
-            params.temperature,
-            params.friction,
-            &params.friction_units,
-            params.dt,
-            &params.ensemble,
-            seed,
-            &fixed_rows,
-        )
-        .unwrap_or_else(|e| panic!("MD run: {}", e));
-
-        vel = engine
-            .velocities_ang_fs()
-            .iter()
-            .map(|v| v * integrator::AU_TIME_TO_FS / crate::constants::BOHR)
-            .collect();
-        let g_fs = if params.ensemble.eq("nvt") { params.friction_fs_inv() } else { 0.0 };
-        println!(
-            "MD engine: ASE {} (friction = {} {} -> {:.4} 1/fs, tau = {:.1} fs)",
-            if params.ensemble.eq("nvt") { "Langevin" } else { "VelocityVerlet" },
-            params.friction,
-            params.friction_units,
-            g_fs,
-            if g_fs > 0.0 { 1.0 / g_fs } else { f64::INFINITY }
-        );
-        engine
     };
 
     let prefix = params.out_prefix.clone();
@@ -1042,41 +1101,12 @@ pub fn run_md(
 
     let wall_start = std::time::Instant::now();
 
-    let update_links = |pos: &mut Vec<f64>, vel: &mut Vec<f64>, zero_v: bool| {
-        if let (Some(rt), Some(qp)) = (rt, params.qmmm.as_ref()) {
-            for (k, (qm_bdry, mm_host)) in qp.links.iter().enumerate() {
-                let lrow = rt.n_qm_geom - rt.n_link + k;
-                let qrow = 3 * qm_bdry;
-                let mrow = 3 * rt.gro_row(*mm_host);
-                let d = [
-                    pos[mrow] - pos[qrow],
-                    pos[mrow + 1] - pos[qrow + 1],
-                    pos[mrow + 2] - pos[qrow + 2],
-                ];
-                let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                let r_eq = qp.link_r_eq / crate::constants::BOHR;
-                let unit = if n > 1.0e-12 {
-                    [d[0] / n, d[1] / n, d[2] / n]
-                } else {
-                    [r_eq, 0.0, 0.0]
-                };
-                pos[3 * lrow] = pos[qrow] + r_eq * unit[0];
-                pos[3 * lrow + 1] = pos[qrow] + r_eq * unit[1];
-                pos[3 * lrow + 2] = pos[qrow] + r_eq * unit[2];
-                if zero_v {
-                    for c in 0..3 {
-                        vel[3 * lrow + c] = 0.0;
-                    }
-                }
-            }
-        }
-    };
-    update_links(&mut pos, &mut vel, true);
+    update_links(&mut pos, &mut vel, true, rt, params.qmmm.as_ref());
 
     if params.ensemble.eq("sp") || params.ensemble.eq("singlepoint") {
         let fe = evaluate_forces(
-            scf_data, time_mark, mpi_operator, &pos, is_root, n_qm, rt, &mut engine,
-            qmmm_params, bias, f_dip.is_some(),
+            &mut scf_data, &mut time_mark, &mpi_operator, &pos, is_root, n_qm, rt, &mut engine,
+            params.qmmm.as_ref(), bias, params.output_enabled("dipole"),
         );
         if is_root {
             let fmax =
@@ -1100,7 +1130,7 @@ pub fn run_md(
                 );
             }
         }
-        return;
+        return (scf_data, time_mark, mpi_operator);
     }
 
     if params.ensemble.eq("opt") {
@@ -1132,8 +1162,8 @@ pub fn run_md(
                 }
             }
             let fe = evaluate_forces(
-                scf_data, time_mark, mpi_operator, &pos_bohr, is_root, n_qm, rt,
-                &mut engine, qmmm_params, bias, false,
+                &mut scf_data, &mut time_mark, &mpi_operator, &pos_bohr, is_root, n_qm, rt,
+                &mut engine, params.qmmm.as_ref(), bias, false,
             );
             if !fe.force.iter().all(|x| x.is_finite()) {
                 panic!("MD run: non-finite forces during optimization — aborting");
@@ -1242,38 +1272,80 @@ pub fn run_md(
              E = {:.6} eV, fmax = {:.6} eV/A; wrote {}opt_final.xyz / {}opt_restart",
             nsteps, converged, epot_ev, fmax_ev, params.out_prefix, params.out_prefix
         );
-        return;
+        return (scf_data, time_mark, mpi_operator);
     }
 
+    let scf = std::rc::Rc::new(std::cell::RefCell::new(scf_data));
+    let tm = std::rc::Rc::new(std::cell::RefCell::new(time_mark));
+    let mpi = std::rc::Rc::new(mpi_operator);
+    let engine_cell = std::rc::Rc::new(std::cell::RefCell::new(engine));
+    let rt_rc: Option<std::rc::Rc<QmmmRuntime>> = rt_owned.take().map(std::rc::Rc::new);
+    let bias_rc: Option<std::rc::Rc<UmbrellaBias>> = bias_owned.take().map(std::rc::Rc::new);
+    let params = std::rc::Rc::new(params);
     let last_feval = std::rc::Rc::new(std::cell::RefCell::new(None::<ForceEval>));
+    let ctx = std::rc::Rc::new(EvalCtx {
+        scf: scf.clone(),
+        tm: tm.clone(),
+        mpi: mpi.clone(),
+        engine: engine_cell.clone(),
+        rt: rt_rc.clone(),
+        bias: bias_rc.clone(),
+        params: params.clone(),
+        is_root,
+        n_qm,
+        last_feval: last_feval.clone(),
+        want_dipole: params.output_enabled("dipole"),
+    });
+    let rt = rt_rc.as_deref();
+    let bias = bias_rc.as_deref();
+
+    let fixed_rows: Vec<usize> = rt
+        .map(|r| (0..r.n_link).map(|k| r.n_qm_geom - r.n_link + k).collect())
+        .unwrap_or_default();
+    let v_init: Option<Vec<f64>> = if restart_mode || params.init_velocities.eq("file") {
+        let ang_fs = crate::constants::BOHR / integrator::AU_TIME_TO_FS;
+        Some(vel.iter().map(|v| v * ang_fs).collect())
+    } else if params.init_velocities.eq("zero") {
+        Some(vec![0.0; 3 * n_total])
+    } else {
+        None
+    };
+    let pos_ang: Vec<f64> = pos.iter().map(|x| x * crate::constants::BOHR).collect();
+    let ctx_hook = ctx.clone();
+    let ase_engine = ase::AseMd::new(
+        &symbols,
+        &mass_amu,
+        &pos_ang,
+        v_init.as_deref(),
+        params.temperature,
+        params.friction,
+        &params.friction_units,
+        params.dt,
+        &params.ensemble,
+        seed,
+        &fixed_rows,
+        move |p: &[f64]| ctx_hook.eval_ang(p),
+    )
+    .unwrap_or_else(|e| panic!("MD run: {}", e));
+    vel = ase_engine
+        .velocities_ang_fs()
+        .iter()
+        .map(|v| v * integrator::AU_TIME_TO_FS / crate::constants::BOHR)
+        .collect();
+    let g_fs = if params.ensemble.eq("nvt") { params.friction_fs_inv() } else { 0.0 };
+    println!(
+        "MD engine: ASE {} (friction = {} {} -> {:.4} 1/fs, tau = {:.1} fs)",
+        if params.ensemble.eq("nvt") { "Langevin" } else { "VelocityVerlet" },
+        params.friction,
+        params.friction_units,
+        g_fs,
+        if g_fs > 0.0 { 1.0 / g_fs } else { f64::INFINITY }
+    );
+    let last_feval = ctx.last_feval.clone();
     let mut prev_pos = pos.clone();
 
     for step in 1..=params.steps {
-        let mut hook = |positions_ang: &[f64]| -> anyhow::Result<(f64, Vec<f64>)> {
-            let pos_bohr: Vec<f64> =
-                positions_ang.iter().map(|x| x / crate::constants::BOHR).collect();
-            let fe = evaluate_forces(
-                scf_data, time_mark, mpi_operator, &pos_bohr, is_root, n_qm, rt,
-                &mut engine, qmmm_params, bias, f_dip.is_some(),
-            );
-            if !scf_data.scf_converged {
-
-                panic!(
-                    "MD run: SCF did not converge at the current geometry — aborting to \
-                     protect the trajectory (delete a stale 'restart' chkfile if present)"
-                );
-            }
-            let out = (
-                fe.epot * HARTREE2EV,
-                fe.force.iter().map(|x| x * AU_FORCE2_EV_PER_ANG).collect::<Vec<f64>>(),
-            );
-            *last_feval.borrow_mut() = Some(fe);
-            Ok(out)
-        };
-        let pos_ang: Vec<f64> = pos.iter().map(|x| x * crate::constants::BOHR).collect();
-        let (_e_ev, f_ev) = hook(&pos_ang).unwrap_or_else(|e| panic!("MD run: {}", e));
-        let (p_ang, v_ang) =
-            ase_engine.step(&f_ev).unwrap_or_else(|e| panic!("MD run: {}", e));
+        let (p_ang, v_ang) = ase_engine.step().unwrap_or_else(|e| panic!("MD run: {}", e));
         for i in 0..3 * n_total {
             pos[i] = p_ang[i] / crate::constants::BOHR;
             vel[i] = v_ang[i] * integrator::AU_TIME_TO_FS / crate::constants::BOHR;
@@ -1307,7 +1379,7 @@ pub fn run_md(
         }
         prev_pos.copy_from_slice(&pos);
 
-        update_links(&mut pos, &mut vel, false);
+        update_links(&mut pos, &mut vel, false, rt, params.qmmm.as_ref());
         let feval = last_feval.borrow_mut().take().unwrap();
 
         let in_equil = step <= params.equil_steps;
@@ -1384,4 +1456,13 @@ pub fn run_md(
         );
         let _ = std::io::stdout().flush();
     }
+    ase_engine.clear_hook();
+    drop(ase_engine);
+    drop(ctx);
+    drop(last_feval);
+    (
+        std::rc::Rc::try_unwrap(scf).ok().expect("run_md: scf still shared").into_inner(),
+        std::rc::Rc::try_unwrap(tm).ok().expect("run_md: tm still shared").into_inner(),
+        std::rc::Rc::try_unwrap(mpi).ok().expect("run_md: mpi still shared"),
+    )
 }

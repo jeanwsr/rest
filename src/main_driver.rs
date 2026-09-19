@@ -64,7 +64,7 @@ pub fn main_driver() -> anyhow::Result<()> {
 
 
     // VERY IMPORTANCE: introduce mpi_operator:
-    let (mpi_operator , mut mpi_data)= MPIData::initialization();
+    let (mut mpi_operator , mut mpi_data)= MPIData::initialization();
 
     // Under MPI, every rank executes the same code, so an ungated print would appear once
     // per process in the merged output. The `print_level` gating in `Molecule::build`
@@ -277,7 +277,10 @@ pub fn main_driver() -> anyhow::Result<()> {
         },
         JobType::MD => {
             let ctrl_file = utilities::parse_input().value_of("input_file").unwrap_or("ctrl.in").to_string();
-            crate::md::run_md(&mut scf_data, &mut time_mark, &mpi_operator, &ctrl_file);
+            let (sd, tm, mo) = crate::md::run_md(scf_data, time_mark, mpi_operator, &ctrl_file);
+            scf_data = sd;
+            time_mark = tm;
+            mpi_operator = mo;
         },
         // ------------
         _ => {}
