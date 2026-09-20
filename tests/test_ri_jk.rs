@@ -53,7 +53,7 @@ fn test_nh3_j_schwartz() {
     let j_incore = get_vj_ri_incore(rimatr, dm.view());
 
     // schwartz (default [ctrl.ri_jk] thresholds, same j2c policy as the incore rimatr)
-    let engine = RiJSchwartzEngine::build(
+    let engine = RIJSchwartzEngine::build(
         mol,
         aux,
         mol_obj.ctrl.ri_jk.schwartz_threshold,

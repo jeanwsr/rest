@@ -7,17 +7,17 @@ use super::pure_schwartz_rij::*;
 /// and output. Unlike [`generate_vj_ri_direct`](super::direct::generate_vj_ri_direct), all
 /// per-geometry data — the shell-pair Schwarz bounds, the aux-shell bounds, and the decomposed
 /// 2c-2e Coulomb metric — live in `engine` and are built once per geometry by
-/// [`RiJSchwartzEngine::build`].
+/// [`RIJSchwartzEngine::build`].
 ///
 /// # Parameters
 ///
-/// - `engine`: `&`[`RiJSchwartzEngine`]
+/// - `engine`: `&`[`RIJSchwartzEngine`]
 ///
 /// - `dms`: `&[MatrixFull<f64>]`
 ///
 ///   - Density matrices, each of shape (nao, nao), symmetric; one J matrix is generated per density
 ///     matrix.
-pub fn generate_vj_ri_schwartz(engine: &RiJSchwartzEngine, dms: &[MatrixFull<f64>]) -> Vec<MatrixUpper<f64>> {
+pub fn generate_vj_ri_schwartz(engine: &RIJSchwartzEngine, dms: &[MatrixFull<f64>]) -> Vec<MatrixUpper<f64>> {
     // dm shape: (nao, nao, nset) in f-contig
     let device = DeviceBLAS::default();
     let dms_rstsr = dms.to_rstsr(&device);

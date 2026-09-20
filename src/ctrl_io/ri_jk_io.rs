@@ -31,7 +31,7 @@ pub fn serde_from_value<T: serde::de::DeserializeOwned>(v: &serde_json::Value) -
 /// - `ri-schwartz`: use RI algorithm with on-the-fly computation of 3c-2e ERI and per-shell-pair
 ///   Schwarz screening; a screened variant of `ri-direct` that skips shell-pair/aux-shell blocks
 ///   whose Coulomb contribution is provably negligible. Settings of this algorithm are controlled
-///   by `[ctrl.ri_jk]` (see [`RiJKOption`]). This option is only available for the J part, i.e., it
+///   by `[ctrl.ri_jk]` (see [`RIJKOption`]). This option is only available for the J part, i.e., it
 ///   can only be specified through `algorithm_j`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -39,19 +39,23 @@ pub fn serde_from_value<T: serde::de::DeserializeOwned>(v: &serde_json::Value) -
 pub enum AlgorithmJ {
     #[default]
     Default,
-    Ri,
-    RiIncore,
-    RiDirect,
-    RiSchwartz,
+    #[serde(rename = "ri")]
+    RI,
+    #[serde(rename = "ri-incore")]
+    RIIncore,
+    #[serde(rename = "ri-direct")]
+    RIDirect,
+    #[serde(rename = "ri-schwartz")]
+    RISchwartz,
 }
 
 /// Options of the RI-J/RI-K algorithms, read from the `[ctrl.ri_jk]` table.
 ///
 /// The fields currently control the Schwartz screening of the `ri-schwartz` RI-J algorithm (see
-/// [`AlgorithmJ::RiSchwartz`]); they have no effect on other algorithms.
+/// [`AlgorithmJ::RISchwartz`]); they have no effect on other algorithms.
 #[serde_inline_default]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct RiJKOption {
+pub struct RIJKOption {
     /// Integral neglect threshold (Hartree) of the Schwartz screening. A (shell pair, aux shell)
     /// block enters the evaluation only when its bound Coulomb contribution reaches this
     /// threshold. Default is `1e-12`.
@@ -64,9 +68,9 @@ pub struct RiJKOption {
     pub schwartz_overlap_tol2: f64,
 }
 
-impl Default for RiJKOption {
+impl Default for RIJKOption {
     fn default() -> Self {
-        RiJKOption { schwartz_threshold: 1e-12, schwartz_overlap_tol2: 1e-24 }
+        RIJKOption { schwartz_threshold: 1e-12, schwartz_overlap_tol2: 1e-24 }
     }
 }
 
@@ -84,9 +88,12 @@ impl Default for RiJKOption {
 pub enum AlgorithmK {
     #[default]
     Default,
-    Ri,
-    RiIncore,
-    RiDirect,
+    #[serde(rename = "ri")]
+    RI,
+    #[serde(rename = "ri-incore")]
+    RIIncore,
+    #[serde(rename = "ri-direct")]
+    RIDirect,
 }
 
 /// Flag for combined algorithms of Coulomb and Exchange contributions (J and K) to Fock operator.
@@ -105,8 +112,11 @@ pub enum AlgorithmK {
 pub enum AlgorithmJK {
     #[default]
     Default,
-    Ri,
-    RiIncore,
-    RiDirect,
+    #[serde(rename = "ri")]
+    RI,
+    #[serde(rename = "ri-incore")]
+    RIIncore,
+    #[serde(rename = "ri-direct")]
+    RIDirect,
     Separated(AlgorithmJ, AlgorithmK),
 }

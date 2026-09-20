@@ -227,9 +227,9 @@ impl DmPack {
 
 /// Per-geometry data of the Schwartz-screened RI-J algorithm: static shell-pair list, aux-shell
 /// bounds, the 3c-2e machinery of the mol+aux concatenation, and the decomposed 2c-2e Coulomb
-/// metric. Built once per geometry by [`RiJSchwartzEngine::build`] and reused by every
+/// metric. Built once per geometry by [`RIJSchwartzEngine::build`] and reused by every
 /// [`get_vj_ri_schwartz`] call of the SCF iterations.
-pub struct RiJSchwartzEngine {
+pub struct RIJSchwartzEngine {
     /// mol+aux concatenation: 3c-2e shell triples index it as `[ish, jsh, nbas_mol + psh]` (the
     /// same construction `CInt::integrate_cross` performs internally).
     merged: CInt,
@@ -255,7 +255,7 @@ pub struct RiJSchwartzEngine {
     nbas_mol: usize,
 }
 
-impl RiJSchwartzEngine {
+impl RIJSchwartzEngine {
     /// Build the per-geometry data of the Schwartz-screened RI-J algorithm.
     ///
     /// - `mol`: [`CInt`]; `aux`: [`CInt`]: molecule and auxiliary basis objects.
@@ -287,7 +287,7 @@ impl RiJSchwartzEngine {
         let device = DeviceBLAS::default();
         let j2c_decomp = get_j2c_decomp(&aux, &device, j2c_decomp_option);
 
-        RiJSchwartzEngine {
+        RIJSchwartzEngine {
             merged,
             pairs,
             q_aux,
@@ -317,9 +317,9 @@ impl RiJSchwartzEngine {
 ///
 /// # Parameters
 ///
-/// - `engine`: `&`[`RiJSchwartzEngine`]
+/// - `engine`: `&`[`RIJSchwartzEngine`]
 ///
-///   - Per-geometry data built by [`RiJSchwartzEngine::build`]; can be shared across SCF iterations
+///   - Per-geometry data built by [`RIJSchwartzEngine::build`]; can be shared across SCF iterations
 ///     and threads.
 ///
 /// - `dms`: [`TsrView<f64>`]
@@ -336,7 +336,7 @@ impl RiJSchwartzEngine {
 ///
 ///   - Coulomb (J) matrices in shape (nao, nao, nset), stored in f-contiguous order.
 ///   - J matrices are symmetric by definition in real arithmetic.
-pub fn get_vj_ri_schwartz(engine: &RiJSchwartzEngine, dms: TsrView<f64>) -> Tsr<f64> {
+pub fn get_vj_ri_schwartz(engine: &RIJSchwartzEngine, dms: TsrView<f64>) -> Tsr<f64> {
     let nao = engine.nao;
     let naux = engine.naux;
     assert_eq!(dms.ndim(), 3, "DM must have 3 dimensions");
@@ -369,8 +369,8 @@ pub fn get_vj_ri_schwartz(engine: &RiJSchwartzEngine, dms: TsrView<f64>) -> Tsr<
 /// matrix of the batch. Each (pair, aux shell) block is evaluated once for the whole batch and
 /// contracted with every matrix; parallel over aux shells, each task owning a disjoint slice of
 /// every g.
-fn phase1(engine: &RiJSchwartzEngine, dms_raw: &[f64], nset: usize, nao: usize) -> Vec<f64> {
-    let RiJSchwartzEngine {
+fn phase1(engine: &RIJSchwartzEngine, dms_raw: &[f64], nset: usize, nao: usize) -> Vec<f64> {
+    let RIJSchwartzEngine {
         merged,
         pairs,
         q_aux,
@@ -445,8 +445,8 @@ fn phase1(engine: &RiJSchwartzEngine, dms_raw: &[f64], nset: usize, nao: usize) 
 /// Second half of a Coulomb build: fit coefficients `d` → Coulomb matrices, one (nao, nao)
 /// f-contiguous matrix per set of the batch. Parallel over shell pairs, each task owning the
 /// disjoint (both-triangle) block of every J its unique pair covers.
-fn phase2(engine: &RiJSchwartzEngine, d_raw: &[f64], nset: usize) -> Vec<f64> {
-    let RiJSchwartzEngine {
+fn phase2(engine: &RIJSchwartzEngine, d_raw: &[f64], nset: usize) -> Vec<f64> {
+    let RIJSchwartzEngine {
         merged,
         pairs,
         q_aux,
