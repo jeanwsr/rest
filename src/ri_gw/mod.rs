@@ -96,13 +96,6 @@ pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperat
     if gw_scheme !="no gw"{
         println!("One round of GW by {} scheme has finished.",gw_scheme);
     }
-    if qp_ctrl.save_qp {
-        let save_path=qp_ctrl.save_qp_path.clone();
-        let mut file = OpenOptions::new().append(true).create(true).open(save_path);
-        scf_data.gwqp.0.iter().for_each(|qp|{
-            writeln!(file.as_ref().expect("write failure"), "{}",qp);
-        });
-    }
 }
 pub fn initialize_qp_g_w(scf_data:&mut SCF){
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
@@ -379,16 +372,6 @@ pub fn gw_main_spin(scf_data:&mut SCF, vxc_nn:&[Vec<f64>;2], mpi_operator:&Optio
             println!("Spin channel {} QP energies:", spin);
             for (n,e) in scf_data.gwqp_spin.0[spin].iter().enumerate() {
                 println!("  MO {} : {:.12}", n, e);
-            }
-        }
-    }
-    if qp_ctrl.save_qp {
-        let save_path = qp_ctrl.save_qp_path.clone();
-        if let Ok(mut file) = OpenOptions::new().append(true).create(true).open(save_path) {
-            for spin in 0..scf_data.mol.spin_channel {
-                for e in scf_data.gwqp_spin.0[spin].iter() {
-                    writeln!(file, "{}", e).unwrap();
-                }
             }
         }
     }
@@ -2195,7 +2178,6 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     let ri_row_n=compute_ri3mo_row(scf_data,n);
     let homo_qp=newton_solver(|om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf| quasiparticle_equation(om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf,cdgw_res_tol,cdgw_eta),n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],0.00001,50,side,printlevel);
     //println!("for n={}, quasiparticle equation yields:qp energy={}",n,homo_qp);
-    let save_path=qp_ctrl.save_qp_path.clone();
     println!("The QP energy of HOMO obtained by GWA is {}",homo_qp);
     let n=lumo;
     let mut exchange=0.0;
@@ -2210,11 +2192,6 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     let printlevel=scf_data.mol.ctrl.print_level;
     let ri_row_n=compute_ri3mo_row(scf_data,n);
     let lumo_qp=newton_solver(|om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf| quasiparticle_equation(om,nn,cc,ov,rn,qpg,qpw,os,vs,ns,wcf,cdgw_res_tol,cdgw_eta),n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,eigenenergies[n],0.00001,50,side,printlevel);
-    let save_path=qp_ctrl.save_qp_path.clone();
-    if qp_ctrl.save_gw_homo_lumo_qp==true{
-        let mut file = OpenOptions::new().append(true).create(true).open(save_path);
-        writeln!(file.expect("write failure"), "{},{}",homo_qp,lumo_qp);
-    }
     println!("The QP energy of LUMO obtained by GWA is {}",lumo_qp);
 }
 pub fn obtain_vx_vc_terms(scf_data:&mut SCF){
@@ -2337,12 +2314,6 @@ fn get_homo_lumo_qp_only_lowrank(
         &wc_rows, &real_axis_vchiv,
         eigenenergies[n], 0.00001, 50, side, printlevel, qp_ctrl.cdgw_res_tol,
     );
-
-    let save_path = qp_ctrl.save_qp_path.clone();
-    if qp_ctrl.save_gw_homo_lumo_qp == true {
-        let mut file = OpenOptions::new().append(true).create(true).open(save_path);
-        writeln!(file.expect("write failure"), "{},{}", homo_qp, lumo_qp);
-    }
     println!("The QP energy of LUMO obtained by GWA (low-rank) is {}", lumo_qp);
 }
 

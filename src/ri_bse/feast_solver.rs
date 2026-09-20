@@ -31,27 +31,6 @@ use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Global log file for inner GMRES preconditioner statistics.
-static INNER_GMRES_LOG: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
-
-fn inner_gmres_log() -> &'static Mutex<std::fs::File> {
-    INNER_GMRES_LOG.get_or_init(|| {
-        Mutex::new(
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("inner-gmres.log")
-                .expect("Failed to open inner-gmres.log"),
-        )
-    })
-}
-
-/// Write a line to the inner GMRES log file (thread-safe).
-fn log_inner(msg: &str) {
-    if let Ok(mut f) = inner_gmres_log().lock() {
-        let _ = writeln!(f, "{}", msg);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Gauss-Legendre quadrature node/weight generation for arbitrary n
@@ -546,7 +525,6 @@ impl InnerGmresPrecond {
             Some(&inner_prec),
         );
 
-        log_inner(&format!("INNER {}", inner_matvecs));
         y
     }
 
@@ -633,7 +611,6 @@ where
     let r = (λ_max - λ_min) / 2.0; // radius
     let mut m0 = m_expected; // subspace size (shrinks after compression)
     let mut subspace_ever_compressed = false;
-    log_inner(&format!("=== FEAST start m0={} λ_min={} λ_max={} ===", m0, λ_min, λ_max));
 
     // Resolve GMRES matvec closures: use specified or fall back to a_mul/b_mul
     let default_a: &(dyn Fn(&Vec<f64>) -> Vec<f64> + Sync) = a_mul;
@@ -858,7 +835,6 @@ where
                 preconds[qp_idx].as_ref(),
             );
 
-            log_inner(&format!("OUTER qp={} col={} {}", qp_idx, col, matvec_cnt));
 
             // Contribution = w · (r·cosθ · x_re  −  r·sinθ · x_im)
             let fac_re = qp.w * r * qp.cosθ;
