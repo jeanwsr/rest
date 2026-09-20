@@ -416,6 +416,7 @@ pub struct InputKeywords {
     pub xc_parser: String,
     pub tddft: Option<TDDFTParameters>,
     pub j2c_decomp: J2CDecompOption,
+    pub ri_jk: RIJKOption,
     /// Whether to use the distributed (ScaLAPACK) Hamiltonian diagonalization
     /// in MPI runs. `Auto` (default) decides by problem size; `On` forces the
     /// distributed solver; `Off` forces the serial one.
@@ -602,6 +603,7 @@ impl InputKeywords {
             stop_at: None,
             xc_parser: String::from("legacy"),
             j2c_decomp: J2CDecompOption::default(),
+            ri_jk: RIJKOption::default(),
             hamiltonian_distributed: HamiltonianDistributedMode::default(),
             rpa_distributed: HamiltonianDistributedMode::default(),
             ri_pt2: RiPt2Option::default(),
@@ -1618,6 +1620,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.algorithm_j = tmp_ctrl.get("algorithm_j").map(serde_from_value).unwrap_or_default();
             tmp_input.algorithm_k = tmp_ctrl.get("algorithm_k").map(serde_from_value).unwrap_or_default();
             tmp_input.j2c_decomp = tmp_ctrl.get("j2c_decomp").map(serde_from_value).unwrap_or_default();
+            tmp_input.ri_jk = tmp_ctrl.get("ri_jk").map(serde_from_value).unwrap_or_default();
             tmp_input.hamiltonian_distributed = tmp_ctrl.get("hamiltonian_distributed").map(serde_from_value).unwrap_or_default();
             tmp_input.rpa_distributed = tmp_ctrl.get("rpa_distributed").map(serde_from_value).unwrap_or_default();
             if (tmp_input.algorithm_j != AlgorithmJ::Default || tmp_input.algorithm_k != AlgorithmK::Default) {
