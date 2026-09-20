@@ -1134,7 +1134,7 @@ pub fn single_orbital_gw_ac(
     }
     qp_energy_no_fse
 }
-pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&MatrixFull<f64>,ri_row_n:&MatrixFull<f64>,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,n:usize,num_freq:usize,vxc_nn:f64)->f64{
+pub fn single_orbital_gw(scf_data:&mut SCF,route:&ri_gw::GwTensorRoute,v_matrix:&MatrixFull<f64>,ri_ov:Option<&MatrixFull<f64>>,ri_row_n:&MatrixFull<f64>,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,n:usize,num_freq:usize,vxc_nn:f64)->f64{
     let start=Instant::now();
     let mut exchange=0.0;
     let gwqp_g=scf_data.gwqp.0.clone();
@@ -1154,10 +1154,15 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let cdgw_eta = qp_ctrl.cdgw_eta;
     let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
+    // The generic solvers below still take a `&MatrixFull<f64>` slot for the
+    // (unused on the AO route) `ri_ov`; give them an empty matrix rather than a
+    // materialised `O(N^3)` tensor.
+    let empty_ri_ov = MatrixFull::empty();
+    let ri_ov_slot: &MatrixFull<f64> = ri_ov.unwrap_or(&empty_ri_ov);
     //let self_energy_static=ri_gw::contour_rayon(scf_data.eigenvalues[0][n],n,&gwqp_g, &gwqp_w, occ_size, vir_size, num_state,ri_ov,ri_row_n)-ri_gw::calculate_imag(w_c_at_freqs,num_state,n,scf_data.eigenvalues[0][n],&gwqp_g, &gwqp_w);
     // 第一轮：正常GW计算（不添加Fourier自能）
     let qp_eq_func_no_fse = |omega: f64| {
-        ri_gw::quasiparticle_equation(omega, n, consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs, cdgw_res_tol, cdgw_eta)
+        route.quasiparticle_equation(scf_data, ri_ov, omega, n, consts, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, ri_row_n, w_c_at_freqs, cdgw_res_tol, cdgw_eta)
     };
     //println!("Static Approximation Yields:{},Sigma_c[E_KS]={},consts={},E_ks={}",qp_eq_func_no_fse(scf_data.eigenvalues[0][n])+scf_data.eigenvalues[0][n],self_energy_static,consts,scf_data.eigenvalues[0][n]);
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
@@ -1185,8 +1190,8 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
     } else if rootfinder == "newton".to_string() {
         println!("Orbital #{} (first round, no Fourier self-energy):", n);
         qp_energy_no_fse = ri_gw::newton_solver(
-            |om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf| ri_gw::quasiparticle_equation(om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf, cdgw_res_tol, cdgw_eta),
-            n, consts, ri_ov, ri_row_n,
+            |om, nn, cc, _ov, rn, qpg, qpw, os, vs, ns, wcf| route.quasiparticle_equation(scf_data, ri_ov, om, nn, cc, qpg, qpw, os, vs, ns, rn, wcf, cdgw_res_tol, cdgw_eta),
+            n, consts, ri_ov_slot, ri_row_n,
             &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
             e_ks_n, 0.00001, 50, side, scf_data.mol.ctrl.print_level
         );
@@ -1199,15 +1204,15 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
         if !have_crossing {
             println!("No graphical crossings found for n={}, using Newton solver instead.", n);
             qp_energy = ri_gw::newton_solver(
-                |om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf| ri_gw::quasiparticle_equation(om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf, cdgw_res_tol, cdgw_eta),
-                n, consts, ri_ov, ri_row_n,
+                |om, nn, cc, _ov, rn, qpg, qpw, os, vs, ns, wcf| route.quasiparticle_equation(scf_data, ri_ov, om, nn, cc, qpg, qpw, os, vs, ns, rn, wcf, cdgw_res_tol, cdgw_eta),
+                n, consts, ri_ov_slot, ri_row_n,
                 &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
                 e_ks_n, 0.00001, 50, side, scf_data.mol.ctrl.print_level
             );
         }
         qp_energy_no_fse = qp_energy;
         println!("First round QP energy (no FSE): {}", qp_energy_no_fse);
-        let self_energy_final=ri_gw::contour_rayon(qp_energy_no_fse,n,&gwqp_g, &gwqp_w, occ_size, vir_size, num_state,ri_ov,ri_row_n,cdgw_res_tol,cdgw_eta)-ri_gw::calculate_imag(w_c_at_freqs,num_state,n,qp_energy_no_fse,&gwqp_g, &gwqp_w);
+        let self_energy_final=route.contour(scf_data, ri_ov, qp_energy_no_fse,n,&gwqp_g, &gwqp_w, occ_size, vir_size, num_state,ri_row_n,cdgw_res_tol,cdgw_eta)-ri_gw::calculate_imag(w_c_at_freqs,num_state,n,qp_energy_no_fse,&gwqp_g, &gwqp_w);
         println!("Sigma_c[E_QP]={}",self_energy_final);
     } else {
         panic!("Invalid choice of GW rootfinder!");
@@ -1243,13 +1248,13 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
                  origin, powers, t, sin_coeff, cos_coeff);
 
         let qp_eq_func_with_se = |omega: f64| {
-            ri_gw::quasiparticle_equation(omega, n, consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs, cdgw_res_tol, cdgw_eta)
+            route.quasiparticle_equation(scf_data, ri_ov, omega, n, consts, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, ri_row_n, w_c_at_freqs, cdgw_res_tol, cdgw_eta)
                 + ri_gw::fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin)
         };
 
         final_qp_energy = solve_with_self_energy(
             n, qp_eq_func_with_se, qp_energy_no_fse, side, &qp_ctrl, rootfinder,
-            consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
+            consts, ri_ov_slot, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
             scf_data.mol.ctrl.print_level, "Fourier"
         );
     } else if use_hermite {
@@ -1259,13 +1264,13 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
                  origin, hermite_coeff.len(), hermite_coeff);
 
         let qp_eq_func_with_se = |omega: f64| {
-            ri_gw::quasiparticle_equation(omega, n, consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs, cdgw_res_tol, cdgw_eta)
+            route.quasiparticle_equation(scf_data, ri_ov, omega, n, consts, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, ri_row_n, w_c_at_freqs, cdgw_res_tol, cdgw_eta)
                 + ri_gw::fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff)
         };
 
         final_qp_energy = solve_with_self_energy(
             n, qp_eq_func_with_se, qp_energy_no_fse, side, &qp_ctrl, rootfinder,
-            consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
+            consts, ri_ov_slot, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
             scf_data.mol.ctrl.print_level, "Hermite"
         );
     } else {
@@ -1455,11 +1460,12 @@ pub fn gw_near_fermi_surface_ac(
     gwqp
 }
 pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,occ_threshold:f64,vir_threshold:f64)->Vec<f64>{
-    let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
-    println!("RI-OV Shape={:?}",ri_ov.size);
+    let route=ri_gw::GwTensorRoute::select(scf_data);
+    let ri_ov:Option<MatrixFull<f64>>=route.ri_ov(scf_data);
+    println!("RI-OV Shape={:?} (AO route: None = never materialised)",ri_ov.as_ref().map(|m| m.size));
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let start=Instant::now();
-    let v_matrix=ri_gw::v_matrix_from_scf(scf_data);
+    let v_matrix=route.v_matrix(scf_data);
     let time1=start.elapsed();
     println!("V Matrix Constructed. This step took {:?}",time1);
     let ks_energies=scf_data.eigenvalues[0].clone();
@@ -1476,11 +1482,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
     // imaginary-axis low-rank representation (w_c_lr) instead of the full W_c
     // matrix (w_c_at_freqs).
     let w_c_at_freqs: Vec<(f64, f64, MatrixFull<f64>)> = if need_full_wc {
-        if qp_ctrl.gw_imag_rayon {
-            ri_gw::generate_w_c(scf_data,&ri_ov,&scf_data.gwqp.0,&scf_data.gwqp.1,num_state,occ_size,vir_size,num_freq)
-        } else {
-            ri_gw::generate_w_c_serial(scf_data,&ri_ov,&scf_data.gwqp.0,&scf_data.gwqp.1,num_state,occ_size,vir_size,num_freq)
-        }
+        route.generate_w_c(scf_data,ri_ov.as_ref(),num_state,occ_size,vir_size,num_freq,!qp_ctrl.gw_imag_rayon)
     } else {
         Vec::new() // placeholder; v2 path uses w_c_lr instead
     };
@@ -1491,7 +1493,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
     let w_c_lr: Option<Vec<(f64, f64, ri_gw::LowRankVChiV)>> = if qp_ctrl.use_low_rank_contour && imag_lr_enabled {
         println!("Low-rank contour (v2): Generating imaginary-axis low-rank sqrt(v)*chi*sqrt(v)...");
         Some(ri_gw::generate_w_c_lowrank(
-            scf_data, &ri_ov, &scf_data.gwqp.1,
+            scf_data, ri_ov.as_ref().unwrap(), &scf_data.gwqp.1,
             occ_size, vir_size, num_freq, qp_ctrl.low_rank_tolerance,
         ))
     } else {
@@ -1534,7 +1536,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
         Some({
             let mut ra = ri_gw::generate_real_axis_vchiv(
             &gwqp_g, &gwqp_w, occ_size_2, vir_size_2, num_state_2,
-            &ri_ov,
+            ri_ov.as_ref().unwrap(),
             qp_ctrl.nomega_chi_real,
             nsemin_demax, nsemax_demax,
             qp_ctrl.nomega_sigma,
@@ -1570,7 +1572,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
     let calc_orbs:Vec<(usize,f64)>=if let Some(ref ra) = real_axis_vchiv {
         drop(ri_ov);
         calc_orbs_indices.iter().map(|&n|{
-            let ri_row_n=ri_gw::compute_ri3mo_row(scf_data,n);
+            let ri_row_n=route.ri_row(scf_data,n);
             if let Some(ref wlr) = w_c_lr {
                 // v2 path: imaginary-axis low-rank with pre-computed wc_rows.
                 let wc_rows = ri_gw::precompute_wc_rows_lowrank(wlr, &ri_row_n, num_state);
@@ -1582,8 +1584,8 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
         }).collect()
     } else {
         calc_orbs_indices.iter().map(|&n|{
-            let ri_row_n=ri_gw::compute_ri3mo_row(scf_data,n);
-            (n, single_orbital_gw(scf_data, &v_matrix, &ri_ov, &ri_row_n, &w_c_at_freqs, n, num_freq, vxc_nn[n]))
+            let ri_row_n=route.ri_row(scf_data,n);
+            (n, single_orbital_gw(scf_data, &route, &v_matrix, ri_ov.as_ref(), &ri_row_n, &w_c_at_freqs, n, num_freq, vxc_nn[n]))
         }).collect()
     };
     let occ_shift=calc_orbs[0].1-scf_data.eigenvalues[0][calc_orbs[0].0];

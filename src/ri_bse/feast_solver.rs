@@ -1262,33 +1262,13 @@ fn reconstruct_nontda_pairs_to_xy(
         ks_energies
     };
     let inverse_dielectric = construct_inverse_dielectric(scf_data, &epsilon);
-    let num_auxbas = inverse_dielectric.size[0];
-
-    let ri_oo = get_submatrix(scf_data, 'O', 'O', 'N');
-    let mut ri_oo_tilde = MatrixFull::new(ri_oo.size, 0.0);
-    _dgemm_full(&inverse_dielectric, 'N', &ri_oo, 'N', &mut ri_oo_tilde, 1.0, 0.0);
-    drop(ri_oo);
-    ri_oo_tilde.reshape([num_auxbas * occ_size, occ_size]);
-    ri_oo_tilde = ri_oo_tilde.transpose_and_drop();
-    ri_oo_tilde.reshape([occ_size * num_auxbas, occ_size]);
-
-    let ri_ov = get_submatrix(scf_data, 'O', 'V', 'N');
-    let mut ri_vv = get_submatrix(scf_data, 'V', 'V', 'N');
-    ri_vv.reshape([num_auxbas * vir_size, vir_size]);
-
-    let mut ri_ov_tilde = MatrixFull::new(ri_ov.size, 0.0);
-    _dgemm_full(&inverse_dielectric, 'N', &ri_ov, 'N', &mut ri_ov_tilde, 1.0, 0.0);
-    ri_ov_tilde.reshape([num_auxbas * occ_size, vir_size]);
-
-    let mut ri_ov_b = ri_ov.clone();
-    ri_ov_b.reshape([num_auxbas * occ_size, vir_size]);
+    // AO ("ao") or MO ("mo") backend.  In the renormalized-doubles workflow this
+    // runs after `rimatr_bse` has been cleared, so an AO context built here folds
+    // the *regular* `rimatr` (see `BseMatvec`).
+    let mv = super::BseMatvec::new(scf_data, &inverse_dielectric, true);
 
     // (A−B) matvec closure
-    let amb_matvec = |z: &Vec<f64>| -> Vec<f64> {
-        let a = matvec::a_block_matvec(scf_data, qp_ctrl, &ri_vv, &ri_ov, &ri_oo_tilde, z);
-        let b = matvec::b_block_matvec(scf_data, qp_ctrl, &ri_ov, &ri_ov_b, &ri_ov_tilde, z);
-        a.into_iter().zip(b.into_iter()).map(|(ai, bi)| ai - bi).collect()
-    };
+    let amb_matvec = |z: &Vec<f64>| -> Vec<f64> { mv.amb(scf_data, qp_ctrl, z) };
 
     eigenpairs
         .into_iter()
@@ -1335,6 +1315,18 @@ fn build_s_only_precond_data(
     let qp_ctrl_c = qp_ctrl.clone();
 
     if bse_tda {
+        // The s-only preconditioner is assembled from MO-basis RI tensors, which
+        // the AO matvec deliberately never materialises.  Rather than build them
+        // just for a preconditioner (and hold two fold sets at once), fall back to
+        // the diagonal preconditioner that the FEAST solver already supports.
+        if crate::ctrl_io::quasiparticle_methods::style_is_ao(&qp_ctrl.bse_matvec_style) {
+            println!(
+                "bse_matvec_style = \"ao\": skipping the s-only inner-GMRES preconditioner \
+                 (it is built from MO-basis tensors); using the diagonal preconditioner. \
+                 The FEAST matvec itself runs on the AO path."
+            );
+            return (None, None, Some(diag_a));
+        }
         // ── TDA: a_mul = A_matvec(s-only), b_mul = identity ──
         let num_auxbas = inverse_dielectric.size[0];
         let ri_ov = get_submatrix(scf_data, 'O', 'V', 'N');
@@ -1461,36 +1453,14 @@ fn rayleigh_ritz_refine(
     // X+Y vectors that are orthonormal in the (A+B)^{-1} metric (NOT in L2).
     // The old code used the A-block operator with an L2 metric, which made the
     // projected Gram matrix indefinite → Cholesky failed → empty result → panic.
-    let num_auxbas = inverse_dielectric.size[0];
-    let ri_ov = get_submatrix(scf_data, 'O', 'V', 'N');
-    let mut ri_vv = get_submatrix(scf_data, 'V', 'V', 'N');
-    let ri_oo = get_submatrix(scf_data, 'O', 'O', 'N');
+    // AO ("ao") or MO ("mo") backend.  This stage runs *after* the round-1
+    // caller has cleared `rimatr_bse`, so the AO context folds the regular
+    // `rimatr` -- which is what the refinement must use.
+    let mv = super::BseMatvec::new(scf_data, &inverse_dielectric, !qp_ctrl.bse_tda);
 
-    let mut ri_oo_tilde = MatrixFull::new(ri_oo.size, 0.0);
-    _dgemm_full(&inverse_dielectric, 'N', &ri_oo, 'N', &mut ri_oo_tilde, 1.0, 0.0);
-    ri_oo_tilde.reshape([num_auxbas * occ_size, occ_size]);
-    ri_oo_tilde = ri_oo_tilde.transpose_and_drop();
-    ri_oo_tilde.reshape([occ_size * num_auxbas, occ_size]);
-    ri_vv.reshape([num_auxbas * vir_size, vir_size]);
-
-    // For non-TDA also need the B-block integrals (mirrors feast_solve_bse_nontda).
-    // Built unconditionally so the same closures can be reused below; cheap.
-    let mut ri_ov_b = ri_ov.clone();
-    ri_ov_b.reshape([num_auxbas * occ_size, vir_size]);
-    let mut ri_ov_tilde = MatrixFull::new(ri_ov.size, 0.0);
-    _dgemm_full(&inverse_dielectric, 'N', &ri_ov, 'N', &mut ri_ov_tilde, 1.0, 0.0);
-    ri_ov_tilde.reshape([num_auxbas * occ_size, vir_size]);
-
-    // TDA operator = A; non-TDA operator = (A-B).  Both are borrowing closures so the
-    // integral matrices stay usable for the metric construction further below.
-    let a_matvec = |z: &Vec<f64>| -> Vec<f64> {
-        matvec::a_block_matvec(scf_data, qp_ctrl, &ri_vv, &ri_ov, &ri_oo_tilde, z)
-    };
-    let amb_matvec = |z: &Vec<f64>| -> Vec<f64> {
-        let a = matvec::a_block_matvec(scf_data, qp_ctrl, &ri_vv, &ri_ov, &ri_oo_tilde, z);
-        let b = matvec::b_block_matvec(scf_data, qp_ctrl, &ri_ov, &ri_ov_b, &ri_ov_tilde, z);
-        a.into_iter().zip(b.into_iter()).map(|(ai, bi)| ai - bi).collect()
-    };
+    // TDA operator = A; non-TDA operator = (A-B).
+    let a_matvec = |z: &Vec<f64>| -> Vec<f64> { mv.a(scf_data, qp_ctrl, z) };
+    let amb_matvec = |z: &Vec<f64>| -> Vec<f64> { mv.amb(scf_data, qp_ctrl, z) };
     let op_matvec: &dyn Fn(&Vec<f64>) -> Vec<f64> = if qp_ctrl.bse_tda { &a_matvec } else { &amb_matvec };
 
     // Normalize input eigenvectors to unit L2 norm
@@ -1617,11 +1587,7 @@ fn rayleigh_ritz_refine(
 
         // (2) T·Q where T = (A+B)(A-B): apply (A-B) then (A+B) to each column.
         //     op_matvec is (A-B); apb_matvec is (A+B).
-        let apb_matvec = |p: &Vec<f64>| -> Vec<f64> {
-            let a = matvec::a_block_matvec(scf_data, qp_ctrl, &ri_vv, &ri_ov, &ri_oo_tilde, p);
-            let b = matvec::b_block_matvec(scf_data, qp_ctrl, &ri_ov, &ri_ov_b, &ri_ov_tilde, p);
-            a.into_iter().zip(b.into_iter()).map(|(ai, bi)| ai + bi).collect()
-        };
+        let apb_matvec = |p: &Vec<f64>| -> Vec<f64> { mv.apb(scf_data, qp_ctrl, p) };
         let mut tq = MatrixFull::new([n, k_eff], 0.0);
         for j in 0..k_eff {
             let qj: Vec<f64> = (0..n).map(|i| q_mat[[i, j]]).collect();
@@ -1965,20 +1931,11 @@ fn feast_solve_bse_tda(
     inner_gmres_restart: usize,
     inner_gmres_max_iter: usize,
 )->Vec<(f64,Vec<f64>)>{
-    let num_auxbas=inverse_dielectric.size[0];
-    let ri_ov=get_submatrix(scf_data,'O','V','N');
-    let mut ri_vv=get_submatrix(scf_data,'V','V','N');
-    let ri_oo=get_submatrix(scf_data,'O','O','N');
-
-    let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
-    _dgemm_full(inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
-    ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
-    ri_oo_tilde=ri_oo_tilde.transpose_and_drop();
-    ri_oo_tilde.reshape([occ_size*num_auxbas,occ_size]);
-    ri_vv.reshape([num_auxbas*vir_size,vir_size]);
+    // AO ("ao") or MO ("mo") backend; in AO mode no MO-basis RI tensor is built.
+    let mv = super::BseMatvec::new(scf_data, inverse_dielectric, false);
 
     let feast_a_matvec=|z:&Vec<f64>|{
-        matvec::a_block_matvec(scf_data,qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,z)
+        mv.a(scf_data,qp_ctrl,z)
     };
     let feast_b_matvec=|z:&Vec<f64>|{
         z.clone()
@@ -2032,30 +1989,11 @@ fn feast_solve_bse_nontda(
     inner_gmres_restart: usize,
     inner_gmres_max_iter: usize,
 )->Vec<(f64,Vec<f64>)>{
-    let num_auxbas=inverse_dielectric.size[0];
-    let ri_oo=get_submatrix(scf_data,'O','O','N');
+    // AO ("ao") or MO ("mo") backend; in AO mode no MO-basis RI tensor is built.
+    let mv = super::BseMatvec::new(scf_data, inverse_dielectric, true);
 
-    let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
-    _dgemm_full(inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
-    drop(ri_oo);
-    ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
-    ri_oo_tilde=ri_oo_tilde.transpose_and_drop();
-    ri_oo_tilde.reshape([occ_size*num_auxbas,occ_size]);
-
-    let ri_ov=get_submatrix(scf_data,'O','V','N');
-    let mut ri_vv=get_submatrix(scf_data,'V','V','N');
-    ri_vv.reshape([num_auxbas*vir_size,vir_size]);
-
-    let mut ri_ov_tilde:MatrixFull<f64>=MatrixFull::new(ri_ov.size,0.0);
-    _dgemm_full(inverse_dielectric,'N',&ri_ov,'N',&mut ri_ov_tilde,1.0,0.0);
-    ri_ov_tilde.reshape([num_auxbas*occ_size,vir_size]);
-
-    let mut ri_ov_b=ri_ov.clone();
-    ri_ov_b.reshape([num_auxbas*occ_size,vir_size]);
     let feast_a_matvec=|z:&Vec<f64>|->Vec<f64>{
-        let a = matvec::a_block_matvec(scf_data,qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,z);
-        let b = matvec::b_block_matvec(scf_data,qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,z);
-        a.into_iter().zip(b.into_iter()).map(|(a,b)|a-b).collect()
+        mv.amb(scf_data,qp_ctrl,z)
     };
     // ── Diagonal preconditioner data for non-TDA ──
     // D_j = ε_a − ε_i are the diagonal QP energy gaps.  They are used:
@@ -2071,11 +2009,7 @@ fn feast_solve_bse_nontda(
     let diag_sq: Vec<f64> = diag.iter().map(|&d| d * d).collect();
 
     let feast_b_matvec=|z:&Vec<f64>|->Vec<f64>{
-        let apb_matvec=|p:&Vec<f64>|->Vec<f64>{
-            let a = matvec::a_block_matvec(scf_data,qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,p);
-            let b = matvec::b_block_matvec(scf_data,qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,p);
-            a.into_iter().zip(b.into_iter()).map(|(a,b)|a+b).collect()
-        };
+        let apb_matvec=|p:&Vec<f64>|->Vec<f64>{ mv.apb(scf_data,qp_ctrl,p) };
         cg(&apb_matvec,z,qp_ctrl.bse_feast_cg_max_iter,qp_ctrl.bse_feast_cg_tol,Some(&diag))
     };
 
@@ -2084,9 +2018,7 @@ fn feast_solve_bse_nontda(
     let gmres_tol = qp_ctrl.bse_feast_cg_tol;
     let gmres_a_mul=|z:&Vec<f64>|->Vec<f64>{
         let apb_q=feast_a_matvec(z);
-        let a = matvec::a_block_matvec(scf_data,qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&apb_q);
-        let b = matvec::b_block_matvec(scf_data,qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,&apb_q);
-        a.into_iter().zip(b.into_iter()).map(|(a,b)|a+b).collect()
+        mv.apb(scf_data,qp_ctrl,&apb_q)
     };
     let gmres_b_mul=|z:&Vec<f64>|{
         z.clone()

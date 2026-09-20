@@ -40,6 +40,7 @@ pub mod display;
 pub mod fourier_self_energy;
 pub mod qsgw;
 pub mod gw_grad;
+pub mod tensor_ao;
 use crate::mpi_io::MPIOperator;
 
 #[cfg(target_os = "linux")]
@@ -152,9 +153,10 @@ pub fn show_energy_levels(scf_data:&SCF){
 }
 
 pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
-    let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    let route=GwTensorRoute::select(scf_data);
+    let ri_ov:Option<MatrixFull<f64>>=route.ri_ov(scf_data);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let v_matrix=v_matrix_from_scf(scf_data);
+    let v_matrix=route.v_matrix(scf_data);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let (start_mo,num_state_cutoff,occ_size,vir_size_cutoff,homo,lumo)=get_occupation_parameters(scf_data,'N');
     let spin_channel=scf_data.mol.ctrl.spin_channel;
@@ -177,7 +179,7 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     }
 
     //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,0);
-    let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
+    let w_c_at_freqs=route.generate_w_c(scf_data,ri_ov.as_ref(),num_state,occ_size,vir_size,num_freq,false);
     let cdgw_eta = qp_ctrl.cdgw_eta;
     let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
 
@@ -203,9 +205,9 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
         let printlevel=scf_data.mol.ctrl.print_level.clone();
         let mut real_qp=0.0;
         let mut have_crossing=true;
-        let ri_row_n=compute_ri3mo_row(scf_data,n);
+        let ri_row_n=route.ri_row(scf_data,n);
         let qp_eq_func=|omega: f64|{
-            quasiparticle_equation(omega,n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,cdgw_res_tol,cdgw_eta)
+            route.quasiparticle_equation(scf_data,ri_ov.as_ref(),omega,n,consts,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_row_n,&w_c_at_freqs,cdgw_res_tol,cdgw_eta)
         };
         (have_crossing,real_qp)=linear_interpolation_solver(qp_eq_func,scf_data.eigenvalues[0][n],side,21,0.1);
         println!("for n={}, first round (no self-energy correction): qp energy={}",n,real_qp);
@@ -239,9 +241,9 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
             let side=if n>=occ_size{1.0}else{-1.0};
             let printlevel=scf_data.mol.ctrl.print_level.clone();
 
-            let ri_row_n=compute_ri3mo_row(scf_data,n);
+            let ri_row_n=route.ri_row(scf_data,n);
             let qp_eq_func_with_fse=|omega: f64|{
-                quasiparticle_equation(omega,n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,cdgw_res_tol,cdgw_eta)
+                route.quasiparticle_equation(scf_data,ri_ov.as_ref(),omega,n,consts,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_row_n,&w_c_at_freqs,cdgw_res_tol,cdgw_eta)
                     + fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin)
             };
 
@@ -265,9 +267,9 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
             let side=if n>=occ_size{1.0}else{-1.0};
             let printlevel=scf_data.mol.ctrl.print_level.clone();
 
-            let ri_row_n=compute_ri3mo_row(scf_data,n);
+            let ri_row_n=route.ri_row(scf_data,n);
             let qp_eq_func_with_hse=|omega: f64|{
-                quasiparticle_equation(omega,n,consts,&ri_ov,&ri_row_n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&w_c_at_freqs,cdgw_res_tol,cdgw_eta)
+                route.quasiparticle_equation(scf_data,ri_ov.as_ref(),omega,n,consts,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_row_n,&w_c_at_freqs,cdgw_res_tol,cdgw_eta)
                     + fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff)
             };
 
@@ -1090,6 +1092,385 @@ pub fn w_c_matrix_from_scf_spin(
     }
     w_c
 }
+/// Decides where a GW pass gets its RI three-centre tensors from.
+///
+/// * `"mo"` (default): the historical route — `ri_bse::get_submatrix`,
+///   `compute_ri3mo_row`, `v_matrix_from_scf`, `generate_w_c`.
+/// * `"ao"`: the zero-copy route of [`tensor_ao`].  Nothing is pre-transformed:
+///   `SCF::rimatr` is read in place, the response matrix is accumulated as a sum
+///   of rank-`V` updates and the `(Q|n m)` rows are folded on demand, so **no
+///   `ri_ov`, and no copy of the AO tensor, is ever created**.
+///
+/// Everything downstream (`inverse_dielectric_matrix`, the QP solvers,
+/// `calculate_imag`) is shared, so the two routes agree to round-off by
+/// construction.
+pub struct GwTensorRoute {
+    pub plan: Option<Arc<tensor_ao::GwAoPlan>>,
+}
+
+impl GwTensorRoute {
+    /// Decide the route for this `SCF` and build (or reuse) the AO plan.
+    pub fn select(scf_data: &mut SCF) -> Self {
+        let qp_ctrl = match scf_data.mol.ctrl.quasiparticle_methods.clone() {
+            Some(q) => q,
+            None => return Self { plan: None },
+        };
+        if !crate::ctrl_io::quasiparticle_methods::style_is_ao(&qp_ctrl.gw_tensor_style) {
+            return Self { plan: None };
+        }
+        // The low-rank contour stores `v*chi*v` grids that are built from a
+        // materialised `ri_ov`; that path is not part of the zero-copy route.
+        if qp_ctrl.use_low_rank_contour {
+            println!(
+                "gw_tensor_style = \"ao\": `use_low_rank_contour = true` still needs a \
+                 materialised ri_ov; keeping the MO-basis GW tensors for this run."
+            );
+            return Self { plan: None };
+        }
+        if let Some(cached) = &scf_data.gw_ao_ctx {
+            if cached.matches(scf_data) && cached.screening_tol == qp_ctrl.gw_ao_screening_tol {
+                return Self { plan: Some(cached.clone()) };
+            }
+        }
+        match tensor_ao::GwAoPlan::build_with_screening(scf_data, qp_ctrl.gw_ao_screening_tol) {
+            Some(p) => {
+                let p = Arc::new(p);
+                scf_data.gw_ao_ctx = Some(p.clone());
+                Self { plan: Some(p) }
+            }
+            None => {
+                println!("gw_tensor_style = \"ao\": falling back to the MO-basis GW tensors.");
+                Self { plan: None }
+            }
+        }
+    }
+
+    pub fn is_ao(&self) -> bool {
+        self.plan.is_some()
+    }
+
+    pub fn dims(&self) -> Option<&tensor_ao::GwAoDims> {
+        self.plan.as_ref().map(|p| &p.dims)
+    }
+
+    /// `ri_ov` in the historical layout `[n_aux, n_o * n_v]`.
+    ///
+    /// **On the AO route this deliberately returns `None`**: the whole point of
+    /// the route is that this `O(N^3)` tensor is never built.  Callers hand the
+    /// `Option` straight back to [`Self::generate_w_c`] / [`Self::contour`].
+    pub fn ri_ov(&self, scf_data: &SCF) -> Option<MatrixFull<f64>> {
+        match &self.plan {
+            Some(_) => None,
+            None => Some(ri_bse::get_submatrix(scf_data, 'O', 'V', 'Y')),
+        }
+    }
+
+    /// Row `n` of the RI three-centre tensor inside the MO window,
+    /// `[n_aux, n_mo]`.  This is the only RI-shaped array the AO route holds,
+    /// and it is `O(n_aux * n_mo)` — one order below `ri_ov`.
+    pub fn ri_row(&self, scf_data: &SCF, n: usize) -> MatrixFull<f64> {
+        match &self.plan {
+            Some(p) => {
+                tensor_ao::ri_row(scf_data, p, p.dims.start_mo + n, p.dims.start_mo, p.dims.n_mo)
+            }
+            None => compute_ri3mo_row(scf_data, n),
+        }
+    }
+
+    /// `V[n,m] = sum_Q (Q|n m)^2`.
+    pub fn v_matrix(&self, scf_data: &SCF) -> MatrixFull<f64> {
+        match &self.plan {
+            Some(p) => tensor_ao::v_matrix(scf_data, p),
+            None => v_matrix_from_scf(scf_data),
+        }
+    }
+
+    /// The imaginary-axis `W_c` grid.
+    pub fn generate_w_c(
+        &self,
+        scf_data: &SCF,
+        ri_ov: Option<&MatrixFull<f64>>,
+        num_state: usize,
+        occ_size: usize,
+        vir_size: usize,
+        num_freq: usize,
+        serial: bool,
+    ) -> Vec<(f64, f64, MatrixFull<f64>)> {
+        match &self.plan {
+            Some(p) => generate_w_c_ao(scf_data, p, num_freq, !serial),
+            None => {
+                let ri_ov = ri_ov.expect("the MO route needs ri_ov");
+                if serial {
+                    generate_w_c_serial(
+                        scf_data, ri_ov, &scf_data.gwqp.0, &scf_data.gwqp.1, num_state, occ_size,
+                        vir_size, num_freq,
+                    )
+                } else {
+                    generate_w_c(
+                        scf_data, ri_ov, &scf_data.gwqp.0, &scf_data.gwqp.1, num_state, occ_size,
+                        vir_size, num_freq,
+                    )
+                }
+            }
+        }
+    }
+
+    /// `sum_poles v_p^T (1 - chi(de_p))^-1 v_p` for one orbital.
+    #[allow(clippy::too_many_arguments)]
+    pub fn contour(
+        &self,
+        scf_data: &SCF,
+        ri_ov: Option<&MatrixFull<f64>>,
+        omega: f64,
+        n: usize,
+        qp_g: &Vec<f64>,
+        qp_w: &Vec<f64>,
+        occ_size: usize,
+        vir_size: usize,
+        num_state: usize,
+        ri_row_n: &MatrixFull<f64>,
+        res_tol: f64,
+        eta: f64,
+    ) -> f64 {
+        match &self.plan {
+            Some(p) => contour_rayon_ao(
+                scf_data, p, omega, n, qp_g, qp_w, occ_size, vir_size, num_state, ri_row_n,
+                res_tol, eta,
+            ),
+            None => contour_rayon(
+                omega,
+                n,
+                qp_g,
+                qp_w,
+                occ_size,
+                vir_size,
+                num_state,
+                ri_ov.expect("the MO route needs ri_ov"),
+                ri_row_n,
+                res_tol,
+                eta,
+            ),
+        }
+    }
+
+    /// `consts + contour - imag - omega`, route-dispatched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quasiparticle_equation(
+        &self,
+        scf_data: &SCF,
+        ri_ov: Option<&MatrixFull<f64>>,
+        omega: f64,
+        n: usize,
+        consts: f64,
+        qp_g: &Vec<f64>,
+        qp_w: &Vec<f64>,
+        occ_size: usize,
+        vir_size: usize,
+        num_state: usize,
+        ri_row_n: &MatrixFull<f64>,
+        w_c_at_freqs: &Vec<(f64, f64, MatrixFull<f64>)>,
+        res_tol: f64,
+        eta: f64,
+    ) -> f64 {
+        let contour = self.contour(
+            scf_data, ri_ov, omega, n, qp_g, qp_w, occ_size, vir_size, num_state, ri_row_n,
+            res_tol, eta,
+        );
+        let imag = calculate_imag(w_c_at_freqs, num_state, n, omega, qp_g, qp_w);
+        consts + contour - imag - omega
+    }
+}
+
+/// AO-basis counterpart of [`contour_rayon`].
+///
+/// The pole enumeration, the pole factor and the sign convention are identical;
+/// only the per-pole response matrix changes: it is accumulated as
+/// `sum_i u^(i) diag(f^(i)) u^(i)T` folded from `rimatr` (see
+/// [`tensor_ao::response_matrix`]) instead of being sliced out of a stored
+/// `ri_ov`.
+#[allow(clippy::too_many_arguments)]
+pub fn contour_rayon_ao(
+    scf_data: &SCF,
+    plan: &tensor_ao::GwAoPlan,
+    omega: f64,
+    n: usize,
+    quasiparticle_energies_g: &Vec<f64>,
+    quasiparticle_energies_w: &Vec<f64>,
+    occ_size: usize,
+    vir_size: usize,
+    num_state: usize,
+    ri_row_n: &MatrixFull<f64>,
+    res_tol: f64,
+    eta: f64,
+) -> f64 {
+    let num_auxbas = plan.dims.n_aux;
+    let fermi_energy =
+        (quasiparticle_energies_g[occ_size - 1] + quasiparticle_energies_g[occ_size]) / 2.0;
+    let sign = if omega > fermi_energy { 1.0_f64 } else { -1.0_f64 };
+
+    // Enumerate the poles first (cheap), then let Rayon work on the heavy part.
+    let poles: Vec<usize> = if sign > 0.0 {
+        (0..vir_size)
+            .filter(|a| omega - quasiparticle_energies_g[occ_size + a] > -res_tol)
+            .collect()
+    } else {
+        (0..occ_size)
+            .filter(|i| quasiparticle_energies_g[*i] - omega > -res_tol)
+            .collect()
+    };
+
+    let saved_omp = omp_get_num_threads_wrapper();
+    let result: f64 = poles
+        .into_par_iter()
+        .map(|m| {
+            omp_set_num_threads_wrapper(1);
+            // Virtual branch: pole `a` uses column `occ_size + a` of the row;
+            // occupied branch: pole `i` uses column `i` (as in `contour_rayon`).
+            let (de, col) = if sign > 0.0 {
+                (
+                    omega - quasiparticle_energies_g[occ_size + m],
+                    occ_size + m,
+                )
+            } else {
+                (quasiparticle_energies_g[m] - omega, m)
+            };
+            let pole_factor = if de.abs() < res_tol { 0.5 } else { 1.0 };
+            let response =
+                tensor_ao::response_matrix(scf_data, plan, quasiparticle_energies_w, de, 'C', eta);
+            let inverse_dielectric = inverse_dielectric_matrix(response, 'C');
+            let vec: Vec<f64> = ri_row_n.iter_column(col).copied().collect::<Vec<f64>>();
+            let mut first_product = vec![0.0; num_auxbas];
+            _dgemv(&inverse_dielectric, &vec, &mut first_product, 'N', 1.0, 0.0, 1, 1);
+            let residue = first_product
+                .iter()
+                .zip(vec.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f64>()
+                * pole_factor;
+            residue * sign
+        })
+        .sum();
+    omp_set_num_threads_wrapper(saved_omp);
+    result
+}
+
+/// AO-basis counterpart of [`generate_w_c`], with a frequency-chunked peak.
+///
+/// * the RPA response and its inverse are built per frequency from `rimatr`
+///   (`ri_ov` is not needed);
+/// * `(Q|n m)` does not depend on the frequency, so one fold pass is shared by a
+///   whole **chunk** of inverse-dielectric matrices, sized from
+///   `REST_GW_AO_FREQ_MEM_MB` (default 128 MB).  Holding all of them at once
+///   would cost `n_freq * n_aux^2`; the chunk keeps that bounded while still
+///   amortising the fold.
+pub fn generate_w_c_ao(
+    scf_data: &SCF,
+    plan: &tensor_ao::GwAoPlan,
+    num_freq: usize,
+    parallel: bool,
+) -> Vec<(f64, f64, MatrixFull<f64>)> {
+    let freq_grid_type = scf_data.mol.ctrl.freq_grid_type;
+    let max_freq = scf_data.mol.ctrl.freq_cut_off;
+    let (omega_1, weight) = if freq_grid_type == 0 {
+        ri_rpa::trans_gauss_legendre_grids(1.0, num_freq)
+    } else if freq_grid_type == 1 {
+        ri_rpa::gauss_legendre_grids([0.0, max_freq], num_freq)
+    } else if freq_grid_type == 2 {
+        ri_rpa::logarithmic_grid([0.0, max_freq], num_freq)
+    } else {
+        ri_rpa::trans_gauss_legendre_grids(1.0, num_freq)
+    };
+
+    let n_aux = plan.dims.n_aux;
+    let num_state = plan.dims.num_state;
+    let budget_mb: f64 = std::env::var("REST_GW_AO_FREQ_MEM_MB")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|b| *b > 0.0)
+        .unwrap_or(128.0);
+    let per_inv_mb = (n_aux * n_aux) as f64 * 8.0 / 1048576.0;
+    let chunk = ((budget_mb / per_inv_mb.max(1e-9)).floor() as usize).clamp(1, omega_1.len());
+    println!(
+        "GW tensors (ao): {} frequencies; {} inverse dielectric matrices per chunk ({:.1} MB \
+         each, budget {:.0} MB); fold pass(es) = {}",
+        omega_1.len(),
+        chunk,
+        per_inv_mb,
+        budget_mb,
+        omega_1.len().div_ceil(chunk)
+    );
+
+    let saved_omp = omp_get_num_threads_wrapper();
+    let mut outs: Vec<MatrixFull<f64>> = (0..omega_1.len())
+        .map(|_| MatrixFull::new([num_state, num_state], 0.0))
+        .collect();
+
+    let start = Instant::now();
+    let n_threads = if parallel {
+        std::env::var("REST_GW_MAX_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or_else(rayon::current_num_threads)
+            .min(omega_1.len())
+            .max(1)
+    } else {
+        1
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build()
+        .unwrap();
+    let mut f0 = 0usize;
+    while f0 < omega_1.len() {
+        let f1 = (f0 + chunk).min(omega_1.len());
+        let t_inv = Instant::now();
+        // Sequential over the frequencies: `response_matrix` already parallelises
+        // over the occupied orbitals with a *bounded* number of `[n_aux,n_aux]`
+        // accumulators, so running the frequencies concurrently would multiply
+        // that working set by the frequency count without adding parallelism.
+        let invs: Vec<MatrixFull<f64>> = (f0..f1)
+            .map(|f| {
+                let response = tensor_ao::response_matrix(
+                    scf_data,
+                    plan,
+                    &scf_data.gwqp.1,
+                    omega_1[f],
+                    'I',
+                    0.0,
+                );
+                inverse_dielectric_matrix(response, 'I')
+            })
+            .collect();
+        let t_fold = Instant::now();
+        tensor_ao::w_c_matrices(scf_data, plan, &invs, &mut outs[f0..f1]);
+        omp_set_num_threads_wrapper(saved_omp);
+        if scf_data.mol.ctrl.print_level > 0 {
+            println!(
+                "GW tensors (ao): frequencies {}..{} — inverse dielectric {:.3} s, W_c fold \
+                 {:.3} s",
+                f0,
+                f1,
+                t_fold.duration_since(t_inv).as_secs_f64(),
+                t_fold.elapsed().as_secs_f64()
+            );
+        }
+        f0 = f1;
+    }
+    omp_set_num_threads_wrapper(saved_omp);
+    println!(
+        "GW tensors (ao): W_c grid of {} frequencies finished in {:.3} s",
+        omega_1.len(),
+        start.elapsed().as_secs_f64()
+    );
+
+    omega_1
+        .into_iter()
+        .zip(weight.into_iter())
+        .zip(outs.into_iter())
+        .map(|((omega, weight), w_c)| (omega, weight, w_c))
+        .collect()
+}
+
 pub fn response_matrix_legacy(quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,ri_ov:&MatrixFull<f64>,omega:f64,part:char)->MatrixFull<f64>{
     let mut diag=vec![0.0;occ_size*vir_size];
     let num_auxbas=ri_ov.size[1];
@@ -1513,9 +1894,10 @@ pub fn x_alpha_gw(scf_data:&mut SCF)->Vec<f64>{
     }).collect()
 }
 pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
+    let route=GwTensorRoute::select(scf_data);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let delta=qp_ctrl.gw_linearize_shift;
-    let v_matrix=v_matrix_from_scf(scf_data);
+    let v_matrix=route.v_matrix(scf_data);
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
     let mut num_state_qp_range=num_state;
     if qp_ctrl.scgw=="g0w0"{
@@ -1525,7 +1907,7 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
     let eigenenergies:Vec<f64>=scf_data.eigenvalues[0].clone();
     let mut quasiparticle_energies_g:Vec<f64>=scf_data.gwqp.0.clone();
     let mut quasiparticle_energies_w:Vec<f64>=scf_data.gwqp.1.clone();
-    let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
+    let ri_ov:Option<MatrixFull<f64>>=route.ri_ov(scf_data);
 
     // Route to low-rank accelerated version if enabled
     if qp_ctrl.use_low_rank_contour {
@@ -1539,7 +1921,7 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
     }
 
     //display_and_save_quasiparticles(scf_data,&quasiparticle_energies_g,0);
-    let w_c_at_freqs=generate_w_c(scf_data,&ri_ov,&quasiparticle_energies_g,&quasiparticle_energies_w,num_state,occ_size,vir_size,num_freq);
+    let w_c_at_freqs=route.generate_w_c(scf_data,ri_ov.as_ref(),num_state,occ_size,vir_size,num_freq,false);
     let h=qp_ctrl.gw_linearize_derivative_h;
 
     // 检查是否启用自能校正
@@ -1557,12 +1939,12 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
     save_energies_no_se=(0..num_state_qp_range).map(|n|{
         let side=if n>=occ_size{1.0}else{-1.0};
         let omega_shifted=scf_data.eigenvalues[0][n]-delta*side;
-        let ri_row_n=compute_ri3mo_row(scf_data,n);
-        let contour=contour_rayon(omega_shifted,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,cdgw_res_tol,cdgw_eta);
+        let ri_row_n=route.ri_row(scf_data,n);
+        let contour=route.contour(scf_data,ri_ov.as_ref(),omega_shifted,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_row_n,cdgw_res_tol,cdgw_eta);
         let imag_n=calculate_imag(&w_c_at_freqs,num_state,n,omega_shifted,&quasiparticle_energies_g,&quasiparticle_energies_w);
 
-        let contour_plus_h=contour_rayon(omega_shifted+h,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,cdgw_res_tol,cdgw_eta);
-        let contour_minus_h=contour_rayon(omega_shifted-h,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,cdgw_res_tol,cdgw_eta);
+        let contour_plus_h=route.contour(scf_data,ri_ov.as_ref(),omega_shifted+h,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_row_n,cdgw_res_tol,cdgw_eta);
+        let contour_minus_h=route.contour(scf_data,ri_ov.as_ref(),omega_shifted-h,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_row_n,cdgw_res_tol,cdgw_eta);
         let imag_plus_h=calculate_imag(&w_c_at_freqs,num_state,n,omega_shifted+h,&quasiparticle_energies_g,&quasiparticle_energies_w);
         let imag_minus_h=calculate_imag(&w_c_at_freqs,num_state,n,omega_shifted-h,&quasiparticle_energies_g,&quasiparticle_energies_w);
         let self_energy_plus_h=contour_plus_h-imag_plus_h;
@@ -1602,11 +1984,11 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
             let origin = save_energies_no_se[n];
             let side=if n>=occ_size{1.0}else{-1.0};
             let omega_shifted=scf_data.eigenvalues[0][n]-delta*side;
-            let ri_row_n=compute_ri3mo_row(scf_data,n);
+            let ri_row_n=route.ri_row(scf_data,n);
 
             // 计算带FSE的自能及其导数
             let sigma_with_fse = |omega: f64| -> f64 {
-                let contour=contour_rayon(omega,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,cdgw_res_tol,cdgw_eta);
+                let contour=route.contour(scf_data,ri_ov.as_ref(),omega,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_row_n,cdgw_res_tol,cdgw_eta);
                 let imag=calculate_imag(&w_c_at_freqs,num_state,n,omega,&quasiparticle_energies_g,&quasiparticle_energies_w);
                 let fse=fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin);
                 contour - imag + fse
@@ -1641,11 +2023,11 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
             let origin = save_energies_no_se[n];
             let side=if n>=occ_size{1.0}else{-1.0};
             let omega_shifted=scf_data.eigenvalues[0][n]-delta*side;
-            let ri_row_n=compute_ri3mo_row(scf_data,n);
+            let ri_row_n=route.ri_row(scf_data,n);
 
             // 计算带HSE的自能及其导数
             let sigma_with_hse = |omega: f64| -> f64 {
-                let contour=contour_rayon(omega,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_ov,&ri_row_n,cdgw_res_tol,cdgw_eta);
+                let contour=route.contour(scf_data,ri_ov.as_ref(),omega,n,&quasiparticle_energies_g,&quasiparticle_energies_w,occ_size,vir_size,num_state,&ri_row_n,cdgw_res_tol,cdgw_eta);
                 let imag=calculate_imag(&w_c_at_freqs,num_state,n,omega,&quasiparticle_energies_g,&quasiparticle_energies_w);
                 let hse=fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff);
                 contour - imag + hse

@@ -18,6 +18,7 @@ use std::time::Instant;
 use std::{f64, fs::File, io::Write};
 pub mod dipoles;
 pub mod matvec;
+pub mod matvec_fast;
 pub mod response;
 pub mod feast_solver;
 pub mod nonlinbse_matvec;
@@ -195,6 +196,10 @@ pub fn bse_main(scf_data:&mut SCF) -> BseOutput {
         if !qp_ctrl.bse_davidson_solver && qp_ctrl.bse_feast_solver {
             eprintln!("Warning: Using FEAST solver for BSE (experimental). \
                        To use the Davidson solver instead, set bse_davidson_solver=true.");
+            if crate::ctrl_io::quasiparticle_methods::style_is_ao(&qp_ctrl.bse_matvec_style) {
+                eprintln!("Warning: bse_matvec_style = \"ao\" is not wired into the FEAST solver \
+                           yet; the FEAST path still uses the MO-basis matvec.");
+            }
             let excitations = match bse_spin.as_str() {
                 "singlet" => feast_solver::feast_solve_bse_singlet(scf_data),
                 "triplet" => feast_solver::feast_solve_bse_triplet(scf_data),
@@ -206,15 +211,18 @@ pub fn bse_main(scf_data:&mut SCF) -> BseOutput {
             for (n, (e, vec)) in excitations[..].iter().enumerate() {
                 let vec_norm: f64 = vec.iter().map(|x| x*x).sum::<f64>().sqrt();
                 println!("#{} Excitation energy={}, norm={:.6}", n, e, vec_norm);
-                let v = dipoles::normalize(vec, true);
-                let dipole_square = dipoles::transition_dipole_square(&dipole_matrix, &v, true);
+                // Non-TDA solvers return [X;Y] vectors (length 2*O*V); the dipole
+                // helpers must be told, exactly as the non-TDA Davidson branch does.
+                let v = dipoles::normalize(vec, qp_ctrl.bse_tda);
+                let dipole_square =
+                    dipoles::transition_dipole_square(&dipole_matrix, &v, qp_ctrl.bse_tda);
                 println!("\tTransition Dipole Square:{}; Oscillator Strength:{}",
                     dipole_square, dipole_square * e * 2.0 / 3.0);
                 leading_components(&v, occ_size, vir_size,qp_ctrl.print_nto);
             }
             println!("The first excitation obtained by BSE is {}", excitations[0].0);
             if qp_ctrl.save_bse_terms {
-                save_bse_amplitudes(&excitations,occ_size,vir_size,true,&bse_spin,
+                save_bse_amplitudes(&excitations,occ_size,vir_size,qp_ctrl.bse_tda,&bse_spin,
                     qp_ctrl.renormalized_singles&&qp_ctrl.rs_use_rs_orbitals,"bse_terms.dat");
             }
             if qp_ctrl.save_bse_excitations {
@@ -636,6 +644,172 @@ pub fn evaluate_all_excitations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,x
     let (matr_b_3, wr_3, wi_3,vl_3,vr_3,info_3)=_dgeev(&tda_bse_hamiltonian, 'N', 'V');
     (wr_1,wi_1,wr_2,wi_2,wr_3,wi_3)
 }
+/// The MO-basis RI tensors the historical matvec needs.
+struct MoBseTensors {
+    ri_vv: MatrixFull<f64>,
+    ri_oo_tilde: MatrixFull<f64>,
+    ri_ov: MatrixFull<f64>,
+    ri_ov_b: Option<MatrixFull<f64>>,
+    ri_ov_tilde: Option<MatrixFull<f64>>,
+}
+
+/// A-block / B-block BSE matvec behind one interface, dispatching between the
+/// historical MO-basis implementation and the AO-basis one (`bse_matvec_style`).
+///
+/// `BseMatvec::new(scf_data, inverse_dielectric, need_b)` builds **whichever**
+/// backend the control file selects; in AO mode it never materialises a MO-basis
+/// RI tensor.  `need_b = false` additionally skips `ri_ov_b`/`ri_ov_tilde`,
+/// which only the B block needs.
+///
+/// The packed AO tensor is looked up when the object is constructed
+/// (`rimatr_bse` first, then the regular `rimatr`), so constructing one of these
+/// **per stage** follows the renormalized-doubles workflow automatically:
+/// Round 1 runs while the BSE-specific integrals are still loaded, the caller
+/// then clears `rimatr_bse` (and `ri3fn_bse`), and the Rayleigh-Ritz refinement
+/// consequently builds its matvec from the regular `rimatr`.
+pub struct BseMatvec {
+    ao: Option<matvec_fast::FastBseContext>,
+    mo: Option<MoBseTensors>,
+}
+
+impl BseMatvec {
+    pub fn new(scf_data: &SCF, inverse_dielectric: &MatrixFull<f64>, need_b: bool) -> Self {
+        if let Some(ctx) = build_ao_matvec_context(scf_data, inverse_dielectric) {
+            return Self { ao: Some(ctx), mo: None };
+        }
+        let (_start_mo, _num_state, occ_size, vir_size, _homo, _lumo) =
+            get_occupation_parameters(scf_data, 'N');
+        let num_auxbas = inverse_dielectric.size[0];
+        let ri_ov = get_submatrix(scf_data, 'O', 'V', 'N');
+        let mut ri_vv = get_submatrix(scf_data, 'V', 'V', 'N');
+        ri_vv.reshape([num_auxbas * vir_size, vir_size]);
+        let ri_oo = get_submatrix(scf_data, 'O', 'O', 'N');
+        let mut ri_oo_tilde: MatrixFull<f64> = MatrixFull::new(ri_oo.size, 0.0);
+        _dgemm_full(inverse_dielectric, 'N', &ri_oo, 'N', &mut ri_oo_tilde, 1.0, 0.0);
+        drop(ri_oo);
+        ri_oo_tilde.reshape([num_auxbas * occ_size, occ_size]);
+        ri_oo_tilde = ri_oo_tilde.transpose_and_drop();
+        ri_oo_tilde.reshape([occ_size * num_auxbas, occ_size]);
+        let (ri_ov_b, ri_ov_tilde) = if need_b {
+            let mut ri_ov_b = ri_ov.clone();
+            ri_ov_b.reshape([num_auxbas * occ_size, vir_size]);
+            let mut ri_ov_tilde: MatrixFull<f64> = MatrixFull::new(ri_ov.size, 0.0);
+            _dgemm_full(inverse_dielectric, 'N', &ri_ov, 'N', &mut ri_ov_tilde, 1.0, 0.0);
+            ri_ov_tilde.reshape([num_auxbas * occ_size, vir_size]);
+            (Some(ri_ov_b), Some(ri_ov_tilde))
+        } else {
+            (None, None)
+        };
+        Self {
+            ao: None,
+            mo: Some(MoBseTensors { ri_vv, ri_oo_tilde, ri_ov, ri_ov_b, ri_ov_tilde }),
+        }
+    }
+
+    /// `true` when the AO backend is in use.
+    pub fn is_ao(&self) -> bool {
+        self.ao.is_some()
+    }
+
+    /// `A z`.
+    pub fn a(
+        &self,
+        scf_data: &SCF,
+        qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
+        z: &Vec<f64>,
+    ) -> Vec<f64> {
+        match (&self.ao, &self.mo) {
+            (Some(ctx), _) => ctx.a_block_matvec(scf_data, qp_ctrl, z),
+            (None, Some(mo)) => {
+                matvec::a_block_matvec(scf_data, qp_ctrl, &mo.ri_vv, &mo.ri_ov, &mo.ri_oo_tilde, z)
+            }
+            _ => unreachable!("BseMatvec has no backend"),
+        }
+    }
+
+    /// `B z`.  Requires `need_b = true` at construction.
+    pub fn b(
+        &self,
+        scf_data: &SCF,
+        qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
+        z: &Vec<f64>,
+    ) -> Vec<f64> {
+        match (&self.ao, &self.mo) {
+            (Some(ctx), _) => ctx.b_block_matvec(scf_data, qp_ctrl, z),
+            (None, Some(mo)) => matvec::b_block_matvec(
+                scf_data,
+                qp_ctrl,
+                &mo.ri_ov,
+                mo.ri_ov_b.as_ref().expect("BseMatvec::b requires need_b = true"),
+                mo.ri_ov_tilde.as_ref().expect("BseMatvec::b requires need_b = true"),
+                z,
+            ),
+            _ => unreachable!("BseMatvec has no backend"),
+        }
+    }
+
+    /// `(A - B) z`.
+    pub fn amb(
+        &self,
+        scf_data: &SCF,
+        qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
+        z: &Vec<f64>,
+    ) -> Vec<f64> {
+        let a = self.a(scf_data, qp_ctrl, z);
+        let b = self.b(scf_data, qp_ctrl, z);
+        a.into_iter().zip(b.into_iter()).map(|(ai, bi)| ai - bi).collect()
+    }
+
+    /// `(A + B) z`.
+    pub fn apb(
+        &self,
+        scf_data: &SCF,
+        qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
+        z: &Vec<f64>,
+    ) -> Vec<f64> {
+        let a = self.a(scf_data, qp_ctrl, z);
+        let b = self.b(scf_data, qp_ctrl, z);
+        a.into_iter().zip(b.into_iter()).map(|(ai, bi)| ai + bi).collect()
+    }
+}
+
+/// Build the AO-basis ("memory-efficient") matvec context when
+/// `[quasiparticle_methods] bse_matvec_style = "ao"`, else `None`.
+///
+/// When `Some` is returned the caller must **not** build the MO-basis RI
+/// tensors (`ri_vv`/`ri_oo_tilde`/`ri_ov`/`ri_ov_tilde`): the whole point of the
+/// AO path is that those `O(M*O*V)` objects never exist.
+pub fn build_ao_matvec_context(
+    scf_data: &SCF,
+    inverse_dielectric: &MatrixFull<f64>,
+) -> Option<matvec_fast::FastBseContext> {
+    let qp = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap_or_default();
+    if !crate::ctrl_io::quasiparticle_methods::style_is_ao(&qp.bse_matvec_style) {
+        return None;
+    }
+    if scf_data.mol.spin_channel > 1 {
+        println!(
+            "bse_matvec_style = \"ao\": the AO-basis matvec is implemented for the restricted \
+             (spin_channel = 1) reference only; keeping the MO-basis matvec."
+        );
+        return None;
+    }
+    println!(
+        "BSE matvec style: \"ao\" (memory-efficient AO-basis matvec, bse_matvec_style = {})",
+        qp.bse_matvec_style
+    );
+    match matvec_fast::FastBseContext::build(scf_data, inverse_dielectric) {
+        Some(ctx) => Some(ctx),
+        None => {
+            println!(
+                "bse_matvec_style = \"ao\": the AO context could not be built (see the message \
+                 above); falling back to the MO-basis matvec."
+            );
+            None
+        }
+    }
+}
+
 pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char)->Vec<(f64,Vec<f64>)>{
     let start=Instant::now();
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'N');
@@ -648,24 +822,33 @@ pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:
     let inverse_dielectric=construct_inverse_dielectric(scf_data,&epsilon);
     let mut eigenpairs:Vec<(f64,Vec<f64>)>=Vec::new();
     if qp_ctrl.bse_davidson_solver==true{
-        let ri_oo=get_submatrix(scf_data,'O','O','N');
-        println!("num_auxbas={}",ri_oo.size[0]);
-        let num_auxbas=ri_oo.size[0];
-        let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
-        _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
-        drop(ri_oo);
-        ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
-        ri_oo_tilde=ri_oo_tilde.transpose_and_drop();
-        ri_oo_tilde.reshape([occ_size*num_auxbas,occ_size]);
-        let ri_ov=get_submatrix(scf_data,'O','V','N');
-        let mut ri_ov_b=ri_ov.clone();
-        ri_ov_b.reshape([num_auxbas*occ_size,vir_size]);
-        let mut ri_vv=get_submatrix(scf_data,'V','V','N');
-        ri_vv.reshape([num_auxbas*vir_size,vir_size]);
-        let mut ri_ov_tilde:MatrixFull<f64>=MatrixFull::new(ri_ov.size,0.0);
-        _dgemm_full(&inverse_dielectric,'N',&ri_ov,'N',&mut ri_ov_tilde,1.0,0.0);
-        drop(inverse_dielectric);
-        ri_ov_tilde.reshape([num_auxbas*occ_size,vir_size]);
+        // ---- AO ("ao") or MO ("mo") matvec ----
+        let ao_ctx = build_ao_matvec_context(scf_data, &inverse_dielectric);
+        let mo_ri: Option<(MatrixFull<f64>,MatrixFull<f64>,MatrixFull<f64>,MatrixFull<f64>,MatrixFull<f64>)> =
+            if ao_ctx.is_some() {
+                drop(inverse_dielectric);
+                None
+            } else {
+                let ri_oo=get_submatrix(scf_data,'O','O','N');
+                println!("num_auxbas={}",ri_oo.size[0]);
+                let num_auxbas=ri_oo.size[0];
+                let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
+                _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
+                drop(ri_oo);
+                ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
+                ri_oo_tilde=ri_oo_tilde.transpose_and_drop();
+                ri_oo_tilde.reshape([occ_size*num_auxbas,occ_size]);
+                let ri_ov=get_submatrix(scf_data,'O','V','N');
+                let mut ri_ov_b=ri_ov.clone();
+                ri_ov_b.reshape([num_auxbas*occ_size,vir_size]);
+                let mut ri_vv=get_submatrix(scf_data,'V','V','N');
+                ri_vv.reshape([num_auxbas*vir_size,vir_size]);
+                let mut ri_ov_tilde:MatrixFull<f64>=MatrixFull::new(ri_ov.size,0.0);
+                _dgemm_full(&inverse_dielectric,'N',&ri_ov,'N',&mut ri_ov_tilde,1.0,0.0);
+                drop(inverse_dielectric);
+                ri_ov_tilde.reshape([num_auxbas*occ_size,vir_size]);
+                Some((ri_vv,ri_ov,ri_oo_tilde,ri_ov_b,ri_ov_tilde))
+            };
         let energy_diag=construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
         let initial_guess=generate_initial_guess(&energy_diag,qp_ctrl.davidson_target_excitations);
         let preptime=start.elapsed();
@@ -678,7 +861,23 @@ pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:
             tol: qp_ctrl.davidson_converge_threshold,
             ..Default::default()
         };
-        eigenpairs=lr_davidson_solver(|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),|z|matvec::b_block_matvec(scf_data,&qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&davidson_cfg);
+        let a_matvec = |z:&Vec<f64>| -> Vec<f64> {
+            match (&ao_ctx,&mo_ri) {
+                (Some(ctx),_) => ctx.a_block_matvec(scf_data,&qp_ctrl,z),
+                (None,Some((ri_vv,ri_ov,ri_oo_tilde,_,_))) =>
+                    matvec::a_block_matvec(scf_data,&qp_ctrl,ri_vv,ri_ov,ri_oo_tilde,z),
+                _ => unreachable!("no matvec backend selected"),
+            }
+        };
+        let b_matvec = |z:&Vec<f64>| -> Vec<f64> {
+            match (&ao_ctx,&mo_ri) {
+                (Some(ctx),_) => ctx.b_block_matvec(scf_data,&qp_ctrl,z),
+                (None,Some((_,ri_ov,_,ri_ov_b,ri_ov_tilde))) =>
+                    matvec::b_block_matvec(scf_data,&qp_ctrl,ri_ov,ri_ov_b,ri_ov_tilde,z),
+                _ => unreachable!("no matvec backend selected"),
+            }
+        };
+        eigenpairs=lr_davidson_solver(a_matvec,b_matvec,qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&davidson_cfg);
         println!("Davidson Solver took {:?}",start.elapsed()-preptime);
     }else{
         println!("starts contructing Full BSE hamiltonian!!!");
@@ -739,25 +938,32 @@ pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char
     let mut eigenpairs:Vec<(f64,Vec<f64>)>=Vec::new();
     if qp_ctrl.bse_davidson_solver==true{
         let start=Instant::now();
-        let ri_ov=get_submatrix(scf_data,'O','V','N');
-        let duration1=start.elapsed();
-        //println!("RI-OV耗时: {:?}", duration1);
-        let mut ri_vv=get_submatrix(scf_data,'V','V','N');
-        let num_auxbas=inverse_dielectric.size[0];
-        //ri_vv.reshape([num_auxbas*vir_size,vir_size]);
-        let duration2=start.elapsed();
-        //println!("RI-VV作耗时: {:?}", duration2-duration1);
-        let ri_oo=get_submatrix(scf_data,'O','O','N');
-        let duration3=start.elapsed();
-        //println!("RI-OO耗时: {:?}", duration3-duration2);
-        let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
-        _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
-        drop(inverse_dielectric);
-        ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
-        ri_oo_tilde=ri_oo_tilde.transpose_and_drop();
-        ri_oo_tilde.reshape([occ_size*num_auxbas,occ_size]);
-        ri_vv.reshape([num_auxbas*vir_size,vir_size]);
-        //ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
+        // ---- AO ("ao") or MO ("mo") matvec ----
+        let ao_ctx = build_ao_matvec_context(scf_data, &inverse_dielectric);
+        let mo_ri: Option<(MatrixFull<f64>,MatrixFull<f64>,MatrixFull<f64>)> = if ao_ctx.is_some() {
+            drop(inverse_dielectric);
+            None
+        } else {
+            let ri_ov=get_submatrix(scf_data,'O','V','N');
+            let duration1=start.elapsed();
+            let _ = duration1;
+            let mut ri_vv=get_submatrix(scf_data,'V','V','N');
+            let num_auxbas=inverse_dielectric.size[0];
+            let duration2=start.elapsed();
+            let _ = duration2;
+            let ri_oo=get_submatrix(scf_data,'O','O','N');
+            let duration3=start.elapsed();
+            let _ = duration3;
+            let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
+            _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
+            drop(ri_oo);
+            drop(inverse_dielectric);
+            ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
+            ri_oo_tilde=ri_oo_tilde.transpose_and_drop();
+            ri_oo_tilde.reshape([occ_size*num_auxbas,occ_size]);
+            ri_vv.reshape([num_auxbas*vir_size,vir_size]);
+            Some((ri_vv,ri_ov,ri_oo_tilde))
+        };
         let energy_diag=construct_energy_diag_for_a(&scf_data.gwqp.0,occ_size,vir_size);
         let initial_guess=generate_initial_guess(&energy_diag,qp_ctrl.davidson_target_excitations);
         let preptime=start.elapsed();
@@ -770,7 +976,15 @@ pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char
             tol: qp_ctrl.davidson_converge_threshold,
             ..Default::default()
         };
-        eigenpairs=tda_davidson_solver(|z|matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,&z),qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&davidson_cfg);
+        let a_matvec = |z:&Vec<f64>| -> Vec<f64> {
+            match (&ao_ctx,&mo_ri) {
+                (Some(ctx),_) => ctx.a_block_matvec(scf_data,&qp_ctrl,z),
+                (None,Some((ri_vv,ri_ov,ri_oo_tilde))) =>
+                    matvec::a_block_matvec(scf_data,&qp_ctrl,ri_vv,ri_ov,ri_oo_tilde,z),
+                _ => unreachable!("no matvec backend selected"),
+            }
+        };
+        eigenpairs=tda_davidson_solver(a_matvec,qp_ctrl.davidson_target_excitations,&energy_diag,initial_guess,&davidson_cfg);
         println!("Davidson Solver took {:?}",start.elapsed());
     }else{
         println!("starts contructing TDA BSE hamiltonian!!!");

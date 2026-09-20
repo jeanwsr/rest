@@ -76,6 +76,12 @@ pub struct SCF {
     pub ri3fn_bse: Option<RIFull<f64>>,
     pub rimatr_bse: Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
     pub num_auxbas_bse: Option<usize>,
+    /// Cached AO-basis GW plan (`gw_tensor_style = "ao"`).
+    ///
+    /// The plan holds only dimensions plus the (optional) pre-screening index —
+    /// **no RI tensor**.  `SCF::rimatr` itself is read in place by the AO folds,
+    /// so this cache never duplicates the `O(N^3)` array.
+    pub gw_ao_ctx: Option<std::sync::Arc<crate::ri_gw::tensor_ao::GwAoPlan>>,
     #[pyo3(get,set)]
     pub eigenvalues: [Vec<f64>;2],
     //pub eigenvectors: Vec<Tensors<f64>>,
@@ -147,6 +153,7 @@ impl SCF {
             ri3fn_bse: None,
             rimatr_bse: None,
             num_auxbas_bse: None,
+            gw_ao_ctx: None,
             eigenvalues: [vec![],vec![]],
             hamiltonian: [MatrixUpper::empty(),
                           MatrixUpper::empty()],

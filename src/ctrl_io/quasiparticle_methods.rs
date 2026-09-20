@@ -312,6 +312,51 @@ pub struct QuasiParticle {
     pub nlfeast_gmres_max_it: usize,
     pub nlfeast_gmres_tol: f64,
     pub export_matvec_count: bool,
+    /// Which implementation performs the implicit BSE matrix-vector products.
+    ///
+    /// * `"mo"` (default): the historical MO-basis matvec in
+    ///   `ri_bse::matvec`, which materialises the `[n_aux, n_o, n_v]`,
+    ///   `[n_aux, n_o, n_o]` and `[n_aux, n_v, n_v]` RI tensors together with
+    ///   the `[n_o*n_v, n_o*n_v]` W matrices.
+    /// * `"ao"`: the AO-basis matvec in `ri_bse::matvec_fast`, which folds the
+    ///   MO coefficients directly into the packed AO-basis RI tensor
+    ///   (`rimatr_bse`) and keeps the auxiliary index explicit, so neither the
+    ///   `[n_o*n_v, n_o*n_v]` matrices nor any fully transformed tensor is ever
+    ///   formed.
+    ///
+    /// The historical spellings `"fast"` / `"memory-efficient"` are still
+    /// accepted as aliases for `"mo"` / `"ao"`.
+    ///
+    /// `"ao"` requires `use_ri_symm = true` and a BSE auxiliary basis
+    /// (`bse_auxbas_path`); otherwise the run falls back to `"mo"` with a
+    /// printed warning.
+    pub bse_matvec_style: String,
+    /// Which tensor representation the GW module uses for the RI three-centre
+    /// integrals and the screened interaction.
+    ///
+    /// * `"mo"` (default): the historical route.  Every RI tensor is produced
+    ///   by the MO transformation `ao2mo_rayon` (`scf_data.rimatr` →
+    ///   `dsymm` against the *full* eigenvector, once per auxiliary function
+    ///   and, in `w_c_matrix_from_scf`, once per block of target orbitals).
+    /// * `"ao"`: the AO-basis route in `ri_gw::tensor_ao`.  The packed AO RI
+    ///   tensor is folded with MO coefficients directly,
+    ///   `(Q|nm) = sum_{mu,nu} J_Q[mu,nu] X[mu,n] X[nu,m]`, and the half
+    ///   transformation `Y_Q[mu,m] = sum_nu J_Q[mu,nu] X[nu,m]` is computed
+    ///   **once** and shared by every orbital row.  The cost of all `(Q|nm)`
+    ///   drops from `O(n_aux n_bas^2 n_mo^2 / block)` to
+    ///   `O(n_aux n_bas^2 n_mo + n_aux n_bas n_mo^2)`; no `[n_aux, n_mo, n_mo]`
+    ///   array is ever materialised.
+    ///
+    /// This is the GW analogue of the AO-basis BSE matvec: the auxiliary index
+    /// stays explicit and MO-coefficient folds replace pre-transformed
+    /// MO-basis tensors.
+    pub gw_tensor_style: String,
+    /// AO-pair pre-screening threshold (a.u.) used by `gw_tensor_style = "ao"`.
+    ///
+    /// An AO pair `(mu,nu)` is dropped from every fold when
+    /// `max_Q |J_Q[mu,nu]|` is below this threshold.  `0.0` disables screening
+    /// (bit-for-bit the unscreened result).
+    pub gw_ao_screening_tol: f64,
     pub gw_switch_fallback_threshold: f64,
 }
 
@@ -454,6 +499,9 @@ impl Default for QuasiParticle {
             nlfeast_gmres_max_it: 500,
             nlfeast_gmres_tol: 1e-6,
             export_matvec_count: false,
+            bse_matvec_style: String::from("mo"),
+            gw_tensor_style: String::from("mo"),
+            gw_ao_screening_tol: 0.0,
             gw_switch_fallback_threshold: 1e6,
         }
     }
@@ -602,9 +650,44 @@ impl QuasiParticle {
         table.insert("nlfeast_gmres_max_it".to_string(), toml::Value::Integer(self.nlfeast_gmres_max_it as i64));
         table.insert("nlfeast_gmres_tol".to_string(), toml::Value::Float(self.nlfeast_gmres_tol));
         table.insert("export_matvec_count".to_string(), toml::Value::Boolean(self.export_matvec_count));
+        table.insert("bse_matvec_style".to_string(), toml::Value::String(self.bse_matvec_style.clone()));
+        table.insert("gw_tensor_style".to_string(), toml::Value::String(self.gw_tensor_style.clone()));
+        table.insert("gw_ao_screening_tol".to_string(), toml::Value::Float(self.gw_ao_screening_tol));
         table.insert("gw_switch_fallback_threshold".to_string(), toml::Value::Float(self.gw_switch_fallback_threshold));
         toml::Value::Table(table)
     }
+}
+
+/// Normalise a `"mo"` / `"ao"` style keyword.
+///
+/// `aliases` lists the accepted spellings of the non-default style; anything
+/// unrecognised (including a missing key) falls back to `default`.  The
+/// canonical values stored in `QuasiParticle` are always the short forms
+/// `"mo"` and `"ao"`.
+pub fn normalise_style(
+    value: Option<&serde_json::Value>,
+    aliases: &[&str],
+    default: &str,
+) -> String {
+    match value {
+        Some(serde_json::Value::String(s)) => {
+            let lower = s.trim().to_lowercase();
+            if aliases.iter().any(|a| *a == lower) {
+                String::from("ao")
+            } else {
+                default.to_string()
+            }
+        }
+        _ => default.to_string(),
+    }
+}
+
+/// `true` when the stored style selects the AO-basis implementation.
+pub fn style_is_ao(style: &str) -> bool {
+    matches!(
+        style.trim().to_lowercase().as_str(),
+        "ao" | "memory-efficient" | "memory_efficient" | "mem-efficient"
+    )
 }
 
 pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Option<QuasiParticle>> { 
@@ -1247,6 +1330,20 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.nlfeast_gmres_tol = match tmp_ctrl.get("nlfeast_gmres_tol").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e-6),
                 _ => 1e-6,
+            };
+            tmp_input.bse_matvec_style = normalise_style(
+                tmp_ctrl.get("bse_matvec_style"),
+                &["ao", "memory-efficient", "memory_efficient", "mem-efficient"],
+                "mo",
+            );
+            tmp_input.gw_tensor_style = normalise_style(
+                tmp_ctrl.get("gw_tensor_style"),
+                &["ao", "memory-efficient", "memory_efficient", "mem-efficient"],
+                "mo",
+            );
+            tmp_input.gw_ao_screening_tol = match tmp_ctrl.get("gw_ao_screening_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
             };
             tmp_input.gw_switch_fallback_threshold = match tmp_ctrl.get("gw_switch_fallback_threshold").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e6),
