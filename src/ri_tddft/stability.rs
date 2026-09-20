@@ -95,9 +95,13 @@ pub fn stability(scf: &SCF, mode: &str) -> Result<StabilityReport, String> {
     if scf.scftype == SCFType::ROHF {
         return Err("stability analysis is not implemented for ROHF references".to_string());
     }
-    if scf.grids.is_none() {
+    // HF references (no libxc components) need no DFT grids: the Hessian
+    // runs the RI J/K parts only (`fxc_driver: None` in the prepared data).
+    let is_hf = scf.mol.xc_data.dfa_compnt_scf.is_empty();
+    if scf.grids.is_none() && !is_hf {
         return Err(
-            "stability analysis requires the DFT grids (only DFT references are supported)"
+            "stability analysis requires the DFT grids (DFT references carry the \
+             XC kernel on the grid); HF references are supported without grids"
                 .to_string(),
         );
     }

@@ -46,9 +46,11 @@ pub struct TDDFTData {
     pub mode: TDDFTMode,
     /// Hybrid exchange coefficient c_x from the functional (shared).
     pub alpha_hybrid: f64,
-    /// fxc kernel data, MO mode only (`None` in AO mode). Contains the
-    /// MO-on-grid projections + weighted `wfxc` table. AO mode carries the
-    /// raw kernel in `fxc_eff` and uses NIMatmul instead.
+    /// fxc kernel data, MO mode only (`None` in AO mode, and `None` for an
+    /// HF reference — no XC kernel; the MO matvecs treat absent tables as a
+    /// zero fxc contribution). Contains the MO-on-grid projections + weighted
+    /// `wfxc` table. AO mode carries the raw kernel in `fxc_eff` and uses
+    /// NIMatmul instead.
     pub fxc: Option<FXCMatvecData>,
     // ── AO mode only (per spin sector: 1 entry for RHF, 2 for UHF) ──
     /// Per-sector occupied MO coefficients [nao, occ_s] (AO mode).
@@ -65,7 +67,8 @@ pub struct TDDFTData {
     /// Batch the fxc AO evaluation over grid batches (AO mode, memory-bounded).
     pub grid_batch: bool,
     /// Resolved `tddft_fxc_driver` (AO mode); `None` for MO data — the fxc
-    /// driver only applies in AO mode.
+    /// driver only applies in AO mode. `None` additionally marks an HF
+    /// reference (no XC kernel): the AO kernel block then runs J/K only.
     pub fxc_driver: Option<FxcDriver>,
     /// Per-sector occ-MO projections on the grid [ngrids, nocc_s]
     /// (MO/SEMITRANS fxc driver); `None` when the active driver does not need them.
@@ -130,7 +133,12 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
     let sectors = crate::ri_tddft::utils::tddft_sector_params(scf);
 
     // ── fxc kernel data: restricted table vs spin-resolved table ──
-    let (fxc, fxc_u, alpha_hybrid) = if is_uhf {
+    // An HF reference has no XC kernel and no DFT grids: the tables stay
+    // `None` and the MO matvecs treat absent tables as a zero fxc
+    // contribution (the Hessian then runs the RI J/K parts only).
+    let (fxc, fxc_u, alpha_hybrid) = if scf.mol.xc_data.dfa_compnt_scf.is_empty() {
+        (None, None, scf.mol.xc_data.dfa_hybrid_scf)
+    } else if is_uhf {
         let fxc_u = prepare_fxc_data_unrestricted(scf);
         let alpha_hybrid = fxc_u.alpha_hybrid;
         (None, Some(fxc_u), alpha_hybrid)
@@ -245,16 +253,74 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
 /// restricted kernel (tddft.rs reads `tddft_spin` from the ctrl keyword
 /// otherwise). Used by the stability module: internal = "singlet",
 /// external RHF→UHF = "triplet" — independent of the deck's `tddft_spin`.
+/// Per-sector occupied/virtual MO coefficient blocks (C_occ [nao, occ_s],
+/// C_vir [nao, vir_s]) for the AO transition-density machinery.
+fn sector_mo_coeffs(
+    scf: &SCF,
+    sector_list: &[crate::ri_tddft::utils::TddftSector],
+) -> (Vec<MatrixFull<f64>>, Vec<MatrixFull<f64>>) {
+    let num_basis = scf.mol.num_basis;
+    let mut c_occ_all = Vec::with_capacity(sector_list.len());
+    let mut c_vir_all = Vec::with_capacity(sector_list.len());
+    for (i_spin, sec) in sector_list.iter().enumerate() {
+        let eigvec = &scf.eigenvectors[i_spin];
+        let mut c_occ = MatrixFull::new([num_basis, sec.occ_size], 0.0);
+        for j in 0..sec.occ_size {
+            for i in 0..num_basis {
+                c_occ[[i, j]] = eigvec[[i, sec.start_mo + j]];
+            }
+        }
+        let mut c_vir = MatrixFull::new([num_basis, sec.vir_size], 0.0);
+        for j in 0..sec.vir_size {
+            for i in 0..num_basis {
+                c_vir[[i, j]] = eigvec[[i, sec.lumo + j]];
+            }
+        }
+        c_occ_all.push(c_occ);
+        c_vir_all.push(c_vir);
+    }
+    (c_occ_all, c_vir_all)
+}
+
 pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTData {
     let is_uhf = scf.scftype == SCFType::UHF;
     let sector_list = crate::ri_tddft::utils::tddft_sector_params(scf);
     let n_sec = sector_list.len();
+    let xc_data = &scf.mol.xc_data;
+
+    // ── Hartree-Fock reference: no libxc components, no XC kernel, no DFT
+    // grids. The AO matvec machinery runs the RI J/K parts only:
+    // `fxc_driver: None` disables the fxc step (the same sentinel MO-mode
+    // data uses). This enables stability analysis (and AO-mode TDDFT) for
+    // HF references.
+    if xc_data.dfa_compnt_scf.is_empty() {
+        println!("HF reference: no XC kernel; the stability Hessian runs the RI J/K parts only");
+        let (c_occ_all, c_vir_all) = sector_mo_coeffs(scf, &sector_list);
+        return TDDFTData {
+            mode: TDDFTMode::AO,
+            // HF carries dfa_hybrid_scf = 1.0 from the dft module (full
+            // exact exchange).
+            alpha_hybrid: xc_data.dfa_hybrid_scf,
+            fxc: None,
+            c_occ: c_occ_all,
+            c_vir: c_vir_all,
+            ni: None,
+            fxc_eff: None,
+            den_type: None,
+            grid_batch: false,
+            fxc_driver: None,
+            psi_occ: None,
+            psi_occ_grad: None,
+            ri_terms: vec![],
+            fxc_u: None,
+            reftype: scf.scftype,
+        };
+    }
 
     let grids = scf.grids.as_ref().expect("DFT grids must be initialized for AO-mode fxc");
     let ngrids = grids.weights.len();
     let num_basis = scf.mol.num_basis;
     let weights = &grids.weights;
-    let xc_data = &scf.mol.xc_data;
     let nvar = if xc_data.use_density_gradient() { 4 } else { 1 };
     let alpha_hybrid = xc_data.dfa_hybrid_scf;
     let den_type = if nvar == 4 { XCDenType::SIGMA } else { XCDenType::RHO };
@@ -413,25 +479,7 @@ pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTDa
     let fxc: Option<FXCMatvecData> = None;
 
     // ── Per-sector occupied/virtual MO coefficients ──
-    let mut c_occ_all: Vec<MatrixFull<f64>> = Vec::with_capacity(n_sec);
-    let mut c_vir_all: Vec<MatrixFull<f64>> = Vec::with_capacity(n_sec);
-    for (i_spin, sec) in sector_list.iter().enumerate() {
-        let eigvec = &scf.eigenvectors[i_spin];
-        let mut c_occ = MatrixFull::new([num_basis, sec.occ_size], 0.0);
-        for j in 0..sec.occ_size {
-            for i in 0..num_basis {
-                c_occ[[i, j]] = eigvec[[i, sec.start_mo + j]];
-            }
-        }
-        let mut c_vir = MatrixFull::new([num_basis, sec.vir_size], 0.0);
-        for j in 0..sec.vir_size {
-            for i in 0..num_basis {
-                c_vir[[i, j]] = eigvec[[i, sec.lumo + j]];
-            }
-        }
-        c_occ_all.push(c_occ);
-        c_vir_all.push(c_vir);
-    }
+    let (c_occ_all, c_vir_all) = sector_mo_coeffs(scf, &sector_list);
 
     // ── MO-style fxc driver: cache occ/vir MO projections on the grid ──
     // Built grid-batch-wise (split_batch) so the full [ngrids, nao, ncomp] AO
