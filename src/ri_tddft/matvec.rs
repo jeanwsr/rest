@@ -53,18 +53,6 @@ pub fn mo_timing_report() {
     }
 }
 
-/// Response HF-exchange coefficients `(coeff_full, coeff_sr)` from the DFA
-/// (REST RSH convention: `coeff_full*K_full + coeff_sr*K_SR` with
-/// `coeff_full = c_LR`, `coeff_sr = c_SR - c_LR`; a non-RSH functional
-/// reduces to the hybrid coefficient with no short-range pass; an HF
-/// reference carries `dfa_hybrid_scf = 1.0` from the dft module).
-pub fn response_exchange_coeffs(xc_data: &crate::dft::DFA4REST) -> (f64, f64) {
-    match xc_data.rsh_params() {
-        Some((_, c_lr, c_sr)) => (c_lr, c_sr - c_lr),
-        None => (xc_data.dfa_hybrid_scf, 0.0),
-    }
-}
-
 /// Per-sector MO-basis RI tensors of the TDDFT response (MO mode): the
 /// Coulomb tensor plus the reshaped HF/RSH exchange tensors, bundled so that
 /// one sector loop serves restricted (one sector) and unrestricted
@@ -256,7 +244,10 @@ pub fn a_matvec(
     // Response HF-exchange coefficients from the DFA
     // (RSH -> (c_LR, c_SR - c_LR); hybrid -> (c_x, 0)); the coefficients are
     // spin-independent, derived once here and applied per sector.
-    let (coeff_full, coeff_sr) = response_exchange_coeffs(&scf.mol.xc_data);
+    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
+        Some((_, c_lr, c_sr)) => (c_lr, c_sr - c_lr),
+        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
+    };
     // Coulomb weight: spin-adapted restricted channels vs unit-weight unrestricted.
     let coulomb_factor = if data.is_uhf() {
         1.0
@@ -380,7 +371,10 @@ pub fn b_matvec(
     debug_assert_eq!(z.len(), dim_total);
 
     // Response HF-exchange coefficients from the DFA (see a_matvec).
-    let (coeff_full, coeff_sr) = response_exchange_coeffs(&scf.mol.xc_data);
+    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
+        Some((_, c_lr, c_sr)) => (c_lr, c_sr - c_lr),
+        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
+    };
     // Coulomb weight: spin-adapted restricted channels vs unit-weight unrestricted.
     let coulomb_factor = if data.is_uhf() {
         1.0
