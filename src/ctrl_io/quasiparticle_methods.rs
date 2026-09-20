@@ -499,7 +499,8 @@ impl Default for QuasiParticle {
             nlfeast_gmres_max_it: 500,
             nlfeast_gmres_tol: 1e-6,
             export_matvec_count: false,
-            bse_matvec_style: String::from("mo"),
+            // BSE defaults to the AO-basis ("memory-efficient") matvec; GW keeps MO.
+            bse_matvec_style: String::from("ao"),
             gw_tensor_style: String::from("mo"),
             gw_ao_screening_tol: 0.0,
             gw_switch_fallback_threshold: 1e6,
@@ -1334,7 +1335,7 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.bse_matvec_style = normalise_style(
                 tmp_ctrl.get("bse_matvec_style"),
                 &["ao", "memory-efficient", "memory_efficient", "mem-efficient"],
-                "mo",
+                "ao",
             );
             tmp_input.gw_tensor_style = normalise_style(
                 tmp_ctrl.get("gw_tensor_style"),
