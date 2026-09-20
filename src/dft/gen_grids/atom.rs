@@ -5,6 +5,7 @@ use std::convert::TryInto;
 use rayon::prelude::*;
 
 use super::becke_partitioning;
+use super::becke_partitioning::RadiiAdjust;
 use super::bragg;
 use super::bse;
 use super::lebedev;
@@ -27,6 +28,7 @@ pub fn atom_grid_bse(
     pruning: String,
     rad_grid_method: String,
     level: usize,
+    radii_adjust: RadiiAdjust,
 ) -> (Vec<(f64, f64, f64)>, Vec<f64>, Vec<f64>) {
     let (alpha_min, alpha_max) =
         bse::ang_min_and_max(basis_set, proton_charges[center_index] as usize);
@@ -44,6 +46,7 @@ pub fn atom_grid_bse(
         pruning,
         rad_grid_method,
         level,
+        radii_adjust,
     )
 }
 
@@ -78,12 +81,13 @@ pub fn atom_grid(
     pruning: String,
     rad_grid_method: String,
     level: usize,
+    radii_adjust: RadiiAdjust,
 ) -> (Vec<(f64, f64, f64)>, Vec<f64>, Vec<f64>) {
 
     atom_grid_with_isdf(
         alpha_min, alpha_max, radial_precision, min_num_angular_points,
         max_num_angular_points, proton_charges, center_index,
-        center_coordinates_bohr, hardness, pruning, rad_grid_method, level, false,
+        center_coordinates_bohr, hardness, pruning, rad_grid_method, level, radii_adjust, false,
     )
 }
 
@@ -101,6 +105,7 @@ pub(crate) fn atom_grid_with_isdf(
     pruning: String,
     rad_grid_method: String,
     level: usize,
+    radii_adjust: RadiiAdjust,
     use_isdf: bool,
 ) -> (Vec<(f64, f64, f64)>, Vec<f64>, Vec<f64>) {
 
@@ -249,6 +254,7 @@ pub(crate) fn atom_grid_with_isdf(
                     &proton_charges,
                     *c,
                     hardness,
+                    radii_adjust,
                 )
             })
             .collect();

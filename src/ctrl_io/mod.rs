@@ -259,6 +259,11 @@ pub struct InputKeywords {
     pub rad_grid_method: String,
     #[pyo3(get, set)]
     pub external_grids: String,
+    /// Becke radii adjustment used by the grid partitioning: `"becke"` keeps the raw Bragg radii
+    /// (Becke 1988, REST historical behaviour), `"treutler"` uses their square roots
+    /// (Treutler-Ahlrichs 1995, the PySCF/PyFock convention).
+    #[pyo3(get, set)]
+    pub radii_adjust: String,
     // Keywords for the scf procedures
     #[pyo3(get, set)]
     pub mixer: String,
@@ -508,6 +513,7 @@ impl InputKeywords {
             pruning: String::from("nwchem"),
             rad_grid_method: String::from("treutler"),
             external_grids: "none".to_string(),
+            radii_adjust: String::from("becke"),
             // ETB for autogen the auxbasis
             even_tempered_basis: false,
             etb_start_atom_number: 37,
@@ -812,6 +818,7 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
     };
     debug!("The pruning method is {}", ctrl.pruning);
     debug!("The radial grid generation method is {}", ctrl.rad_grid_method);
+    debug!("The Becke radii adjustment scheme is {}", ctrl.radii_adjust);
     debug!("min_num_angular_points: {}", ctrl.min_num_angular_points);
     debug!("max_num_angular_points: {}", ctrl.max_num_angular_points);
     debug!("hardness: {}", ctrl.hardness);
@@ -945,6 +952,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => {String::from("treutler")} //default prune method: sg1
             };
             //if tmp_input.print_level>0 {println!("The radial grid generation method will be {}", tmp_input.rad_grid_method)};
+
+            tmp_input.radii_adjust = match tmp_ctrl.get("radii_adjust").unwrap_or(&serde_json::Value::Null){
+                serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
+                other => {String::from("becke")} // default: raw Bragg radii (REST historical behaviour)
+            };
+            //if tmp_input.print_level>0 {println!("The Becke radii adjustment will be {}", tmp_input.radii_adjust)};
 
             tmp_input.eri_type = match tmp_ctrl.get("eri_type").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_eri) => {

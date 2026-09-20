@@ -1,6 +1,7 @@
 use crate::analdrv::prelude::*;
 use crate::analdrv::vibration::vib::*;
 use crate::analdrv::vibration::vib_interface::*;
+use crate::dft::gen_grids::RadiiAdjust;
 use crate::dftd::hess::HessDFTD;
 use crate::ri_jk::util::{get_cint_aux, get_cint_mol};
 use crate::SCF;
@@ -166,6 +167,7 @@ pub fn uscf_hess_interface(scf_data: &SCF, cfg: &AnalDrvNucgradCfg, resp_cfg: &A
             let (coordinates, weights, atm_idx, quadrature_weights) =
                 regroup_grids_by_atom(coordinates, weights, atm_idx, quadrature_weights, mol.natm());
             NIMatmul::new(&mol, &coordinates, &weights, &atm_idx, &quadrature_weights)
+                .with_radii_adjust(RadiiAdjust::from_str(&mol_obj.ctrl.radii_adjust))
         };
 
         // cpscf grid: when it coincides with the skeleton grid, leave `ni_cpks = None` so the
@@ -180,7 +182,8 @@ pub fn uscf_hess_interface(scf_data: &SCF, cfg: &AnalDrvNucgradCfg, resp_cfg: &A
                 &cpscf_grid.weights,
                 &cpscf_grid.atm_idx,
                 &cpscf_grid.quadrature_weights,
-            );
+            )
+            .with_radii_adjust(RadiiAdjust::from_str(&mol_obj.ctrl.radii_adjust));
             UHessKSNIMatmul::new(&mol, xc_func_list, ni, grid_shift, verbose).set_ni_cpks(ni_cpks)
         };
         hess_nimatmul_obj
