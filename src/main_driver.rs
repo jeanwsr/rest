@@ -293,8 +293,19 @@ pub fn main_driver() -> anyhow::Result<()> {
         time_mark.new_item("Stability", "the SCF stability analysis (TDDFT Hessian)");
         time_mark.count_start("Stability");
 
-        if let Err(e) = crate::ri_tddft::stability::stability(&scf_data, &stab_mode) {
-            return Err(anyhow::anyhow!("stability analysis failed: {e}"));
+        match crate::ri_tddft::stability::stability(&scf_data, &stab_mode) {
+            Ok(report) => {
+                // Expose the Hessian roots in rest_results.json (machine-readable
+                // regression input; the lowest internal root is the stability
+                // verdict quantity).
+                if !report.roots_internal.is_empty() {
+                    json_extra.insert("stability_roots_internal".to_string(), json!(report.roots_internal));
+                }
+                if !report.roots_external.is_empty() {
+                    json_extra.insert("stability_roots_external".to_string(), json!(report.roots_external));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!("stability analysis failed: {e}")),
         }
 
         time_mark.count("Stability");
