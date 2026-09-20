@@ -119,6 +119,7 @@ pub struct SCF {
     pub schwartz_rij_engine: Option<std::sync::Arc<ri_jk::RIJSchwartzEngine>>,
     pub solvent_static_obj: Option<PcmObject>,
     pub solvent_scf: Option<PcmScf>,
+    pub scf_converged: bool,
     /// Raw TDDFT eigenvectors from the last `tddft_main` call:
     /// `(excitation energy, eigenvector)` in the solver's ordering.  Used by
     /// the TDDFT analytic-gradient driver.
@@ -185,6 +186,7 @@ impl SCF {
             schwartz_rij_engine: None,
             solvent_static_obj: None,
             solvent_scf: None,
+            scf_converged: false,
             tddft_excitations: None,
         };
 
@@ -5702,6 +5704,7 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             println!("solvent_model.refresh:   {:10.2}s", timecost);
         }
     }
+    scf_data.scf_converged = scf_converge[0];
     if scf_converge[0] {
         info!("SCF is converged after {:4} iterations.", scf_records.num_iter-1);
         // Level shift is disabled before the final diagonalization to ensure accurate eigenvalues.

@@ -64,7 +64,7 @@ pub fn main_driver() -> anyhow::Result<()> {
 
 
     // VERY IMPORTANCE: introduce mpi_operator:
-    let (mpi_operator , mut mpi_data)= MPIData::initialization();
+    let (mut mpi_operator , mut mpi_data)= MPIData::initialization();
 
     // Under MPI, every rank executes the same code, so an ungated print would appear once
     // per process in the merged output. The `print_level` gating in `Molecule::build`
@@ -89,6 +89,10 @@ pub fn main_driver() -> anyhow::Result<()> {
     let ctrl_file = utilities::parse_input().value_of("input_file").unwrap_or("ctrl.in").to_string();
     if ! PathBuf::from(ctrl_file.clone()).is_file() {
         panic!("Input file ({:}) does not exist", ctrl_file);
+    }
+    if crate::md::is_pure_mm_run(&ctrl_file) {
+        crate::md::run_pure_mm(&ctrl_file, &mpi_operator)?;
+        return Ok(());
     }
     let mut mol = Molecule::build(ctrl_file.clone(), mpi_data)?;
     mol.ctrl.ctrl_file = ctrl_file;
@@ -270,6 +274,13 @@ pub fn main_driver() -> anyhow::Result<()> {
         // UNVERIFIED NORMAL MODES CALCULATION
         JobType::NormalModes => {
             eval_normal_modes(&mut scf_data, &mut time_mark, &mpi_operator);
+        },
+        JobType::MD => {
+            let ctrl_file = utilities::parse_input().value_of("input_file").unwrap_or("ctrl.in").to_string();
+            let (sd, tm, mo) = crate::md::run_md(scf_data, time_mark, mpi_operator, &ctrl_file);
+            scf_data = sd;
+            time_mark = tm;
+            mpi_operator = mo;
         },
         // ------------
         _ => {}
@@ -848,7 +859,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
     (energy, gradient)
 }
 
-fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_operator: &Option<MPIOperator>, position: &MatrixFull<f64>) -> (f64, MatrixFull<f64>) {
+pub(crate) fn eval_force_with_position(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_operator: &Option<MPIOperator>, position: &MatrixFull<f64>) -> (f64, MatrixFull<f64>) {
     scf_data.mol.geom.geom_update(&position.data(), GeomUnit::Bohr);
     if scf_data.mol.ctrl.print_level>0 {
         println!("Input geometry in this round is:");

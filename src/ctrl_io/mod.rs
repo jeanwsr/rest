@@ -122,6 +122,7 @@ pub enum JobType {
     NumDipole,
     GeomOpt,
     NormalModes,
+    MD,
 }
 
 /// Whether to use the distributed (ScaLAPACK) solver for diagonalizing the
@@ -657,6 +658,9 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         JobType::NormalModes => {
             println!("Calculation type: Vibrational normal modes (frequency) calculation");
         },
+        JobType::MD => {
+            println!("Calculation type: Molecular dynamics (MD) simulation");
+        },
     }
 
     // To make sure the geometric_pyo3 structure is initialized properly
@@ -1078,6 +1082,9 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     } else if tmp_xc_low.eq("normal_modes") || tmp_xc_low.eq("freq") ||
                       tmp_xc_low.eq("frequency") || tmp_xc_low.eq("vibration") {
                         JobType::NormalModes
+                    } else if tmp_xc_low.eq("md") || tmp_xc_low.eq("molecular dynamics") ||
+                      tmp_xc_low.eq("molecular_dynamics") {
+                        JobType::MD
                     } else {
                         JobType::SinglePoint
                     }
