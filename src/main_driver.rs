@@ -294,7 +294,7 @@ pub fn main_driver() -> anyhow::Result<()> {
         time_mark.count_start("Stability");
 
         if let Err(e) = crate::ri_tddft::stability::stability(&scf_data, &stab_mode) {
-            panic!("stability analysis failed: {e}");
+            return Err(anyhow::anyhow!("stability analysis failed: {e}"));
         }
 
         time_mark.count("Stability");

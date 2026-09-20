@@ -201,13 +201,11 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     let xlet = if tddft_spin == "singlet" { 'S' } else if tddft_spin == "triplet" { 'T' } else { 'R' };
 
     if is_u {
-        // (Reached only with tddft_mode = "ao".)
+        // Reached by both modes. FEAST is restricted-reference machinery, so
+        // it is rejected here for either mode; the tddft_fxc_driver = "mo"
+        // keyword check lives in the first is_u block (is_ao-gated).
         if tddft_ctrl.tddft_feast_solver {
             return Err("FEAST solver is not supported for unrestricted (UKS) TDDFT.".to_string());
-        }
-        if tddft_ctrl.tddft_fxc_driver == "mo" {
-            return Err("tddft_fxc_driver=\"mo\" is not supported for unrestricted (UKS) TDDFT; \
-                        use \"semitrans\" or \"dm\".".to_string());
         }
     }
 
@@ -489,12 +487,6 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
                 )
             }
         } else {
-            if tddft_ctrl.tddft_feast_solver {
-                // FEAST for unrestricted TDDFT is not implemented; fall back
-                // to Davidson with a warning instead of silently producing
-                // wrong results.
-                eprintln!("Warning: FEAST solver for unrestricted TDDFT is not implemented; using Davidson.");
-            }
             let is_mo_u = is_u && !is_ao;
             if is_mo_u && dim <= 15 && is_tda {
                 // MO-U small TDA: exact dense diagonalisation is robust.

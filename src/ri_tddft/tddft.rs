@@ -9,9 +9,12 @@
 //! - **AO mode**: `fxc` (kernel-only, no MO projections) + `c_occ`/`c_vir`,
 //!   the NIMatmul integrator (`ni`), the raw kernel (`fxc_eff`), `den_type`,
 //!   `grid_batch`.
-//! - **AO mode, unrestricted (`prepare_ao_data_u`)**: the same AO members with
-//!   per-spin `c_occ`/`c_vir` (+`_b` beta twins), the spin-polarized kernel
-//!   `fxc_eff: [ngrids, nvar, 2, nvar, 2]`, and `unrestricted = true`.
+//! - **AO mode, unrestricted**: the same AO members with per-sector
+//!   `c_occ`/`c_vir` (two sectors) and the spin-polarized kernel
+//!   `fxc_eff: [ngrids, nvar, 2, nvar, 2]`.
+//! - **HF reference**: no XC kernel and no DFT grids; the fxc tables are all
+//!   absent (`fxc`/`fxc_u`/`fxc_eff` = `None`, `fxc_driver: None`) and the
+//!   matvecs run the RI J/K parts only.
 
 use rest_tensors::MatrixFull;
 
@@ -337,7 +340,9 @@ pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTDa
         None => (alpha_hybrid, 0.0),
     };
     if coeff_sr.abs() > 1e-15 && scf.rimatr_sr.is_none() {
-        panic!("RSH AO-mode TDDFT requires the short-range three-center integrals                 (scf.rimatr_sr), which are built during the SCF of a range-separated                 hybrid; re-run the SCF with the same functional.");
+        panic!("RSH AO-mode TDDFT requires the short-range three-center integrals \
+                (scf.rimatr_sr), which are built during the SCF of a range-separated \
+                hybrid; re-run the SCF with the same functional.");
     }
 
     // ── Numerical integrator with the real grid weights (AO cached via libcint) ──

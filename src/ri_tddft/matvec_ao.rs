@@ -942,7 +942,8 @@ fn ao_kernel_block(
                             *v *= coeff_full;
                         }
                         let rimatr_sr = scf.rimatr_sr.as_ref().expect(
-                            "RSH response requires rimatr_sr (built during SCF                              for range-separated hybrids)");
+                            "RSH response requires rimatr_sr (built during SCF \
+                             for range-separated hybrids)");
                         let k_sr = get_k_ao_batched(
                             scf,
                             rimatr_sr,
@@ -1134,6 +1135,11 @@ pub fn b_matvec_ao_batched(
     result
 }
 
+/// Build the full B matrix `[dim, dim]` directly (dense small-system path).
+///
+/// Constructed by applying the B-kernel block to the identity — one batched
+/// J/K/fxc call across all `dim` columns instead of per-vector matvecs.
+/// Unrestricted: the concatenated `[dim_a + dim_b]` space.
 pub fn build_b_ao(scf: &SCF, ao_data: &mut TDDFTData, xlet: char) -> MatrixFull<f64> {
     let sectors = crate::ri_tddft::utils::tddft_sector_params(scf);
     let dim_total: usize = sectors.iter().map(|sec| sec.dim()).sum();
