@@ -305,7 +305,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
         println!("occ_size={}, vir_size={}, dim={}", occ_size, vir_size, dim);
     }
 
-    // ═══ Step 3+4: TDDFT data preparation (deferred into `run_spin`) ═══
+    // ═══ Step 3: TDDFT data preparation — deferred into `run_spin` (per spin channel; see there) ═══
     // The data is prepared per spin channel inside `run_spin`: the
     // spin-adapted fxc kernel differs between the singlet (f↑↑+f↑↓ = 2×
     // unpolarized) and triplet (f↑↑−f↑↓, CPL 256, 454) channels, so the
@@ -333,17 +333,17 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
         return Err("FEAST solver is not supported with tddft_mode=\"ao\"".to_string());
     }
 
-    // ═══ Step 5: Build diagonal preconditioner ═══
+    // ═══ Step 4: Build diagonal preconditioner ═══
     let hdiag = matvec::build_hdiag(scf);
     println!("Diagonal preconditioner built, min gap = {:.6}",
         hdiag.iter().fold(f64::INFINITY, |a, &b| a.min(b)));
 
-    // ═══ Step 6: Generate initial guess ═══
+    // ═══ Step 5: Generate initial guess ═══
     let init_nroots = nroots.min(dim);
     let initial_guess = davidson_solver::generate_initial_guess(&hdiag, init_nroots);
     println!("Initial guess generated: {} vectors", initial_guess.size[1]);
 
-    // ═══ Step 7: Prepare control parameters for Davidson solver ═══
+    // ═══ Step 6: Prepare control parameters for Davidson solver ═══
     let converged_tol = tddft_ctrl.davidson_tol.max(1e-12);
     let max_iter = tddft_ctrl.davidson_max_iter.max(10);
     let max_subspace = (nroots * 4).max(tddft_ctrl.davidson_max_subspace).min(dim);
@@ -362,9 +362,9 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
         ..Default::default()
     };
 
-    // ═══ Step 8+9: Solve and print one spin channel ═══
+    // ═══ Step 7: Solve and print one spin channel ═══
     // Per spin channel: the spin-adapted fxc kernel differs between the
-    // singlet and triplet passes (see Step 3+4 above), so each call prepares
+    // singlet and triplet passes (see Step 3 above), so each call prepares
     // its own TDDFTData; the spin enters the matvecs via `xlet`.
     let scf_ref: &SCF = scf;
     let run_spin = |xlet: char, spin: &str, initial_guess: &MatrixFull<f64>|
@@ -377,7 +377,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
                 prepare_mo_data(scf_ref)
             },
         );
-        // ── Step 8: Diagnostic: check A matrix symmetry for first few columns ──
+        // ── Diagnostics: check A matrix symmetry for first few columns ──
         // MO-mode matvec closures (used by diagnostic + MO solver dispatch; the
         // dense path and AO mode use the dedicated builders / batched matvecs).
         // Sector-generic: one call serves restricted and unrestricted data.
@@ -462,7 +462,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
             }
         }
 
-        // ── Step 8: Call solver (full diag, Davidson, or FEAST) ──
+        // ── Call solver (full diag, Davidson, or FEAST) ──
         // Selection first, then execution (see `SolverKind`). Layered: FEAST
         // (restricted only) → exact dense diagonalisation for small dim →
         // iterative Davidson (batched in AO, per-vector in MO). Dense
@@ -683,7 +683,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
             }
         };
 
-        // ═══ Step 9: Compute and print results (BSE-compatible format) ═══
+        // ═══ Step 8: Compute and print results (BSE-compatible format) ═══
         // Report the kernel-step timing attribution (debug level), per mode.
         match data.borrow().mode {
             TDDFTMode::AO => crate::ri_tddft::matvec_ao::ao_timing_report(),
@@ -776,7 +776,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
         (eigenpairs, td_energies, td_osc)
     };
 
-    // ═══ Step 10: Dispatch on the requested spin channel(s) ═══
+    // ═══ Step 9: Dispatch on the requested spin channel(s) ═══
     if tddft_spin == "both" {
         // ── Both singlet and triplet: singlet first, then triplet ──
         println!("\n--- Singlet ---");

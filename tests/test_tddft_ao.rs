@@ -131,7 +131,6 @@ fn build_ao_data(nvar: usize) -> TDDFTData {
     let den_type = if nvar == 4 { XCDenType::SIGMA } else { XCDenType::RHO };
     let data = TDDFTData {
         mode: TDDFTMode::AO,
-        alpha_hybrid: 0.0,
         fxc: None,
         c_occ: vec![c_occ],
         c_vir: vec![c_vir],

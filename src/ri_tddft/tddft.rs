@@ -47,8 +47,6 @@ pub enum TDDFTMode {
 pub struct TDDFTData {
     /// The mode this data was prepared for (MO or AO).
     pub mode: TDDFTMode,
-    /// Hybrid exchange coefficient c_x from the functional (shared).
-    pub alpha_hybrid: f64,
     /// fxc kernel data, MO mode only (`None` in AO mode, and `None` for an
     /// HF reference — no XC kernel; the MO matvecs treat absent tables as a
     /// zero fxc contribution). Contains the MO-on-grid projections + weighted
@@ -140,16 +138,14 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
     // An HF reference has no XC kernel and no DFT grids: the tables stay
     // `None` and the MO matvecs treat absent tables as a zero fxc
     // contribution (the Hessian then runs the RI J/K parts only).
-    let (fxc, fxc_u, alpha_hybrid) = if scf.mol.xc_data.dfa_compnt_scf.is_empty() {
-        (None, None, scf.mol.xc_data.dfa_hybrid_scf)
+    let (fxc, fxc_u) = if scf.mol.xc_data.dfa_compnt_scf.is_empty() {
+        (None, None)
     } else if is_uhf {
         let fxc_u = prepare_fxc_data_unrestricted(scf);
-        let alpha_hybrid = fxc_u.alpha_hybrid;
-        (None, Some(fxc_u), alpha_hybrid)
+        (None, Some(fxc_u))
     } else {
         let fxc = prepare_fxc_data(scf);
-        let alpha_hybrid = fxc.alpha_hybrid;
-        (Some(fxc), None, alpha_hybrid)
+        (Some(fxc), None)
     };
 
     // HF-exchange coefficients: for a range-separated hybrid the response
@@ -224,7 +220,6 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
 
     TDDFTData {
         mode: TDDFTMode::MO,
-        alpha_hybrid,
         fxc,
         fxc_u,
         c_occ: vec![],
@@ -241,23 +236,6 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
     }
 }
 
-/// Prepare the shared TDDFT data for **AO mode**.
-///
-/// The fxc kernel is evaluated with the modern `numint_matmul` stack
-/// (`eval_vxc_fxc_from_rho`), the same libxc wrapper used by the RKS response,
-/// so the values match the MO path bit-identically. The **raw** kernel
-/// `[ngrids, nvar, nvar]` is stored as `fxc_eff` (×2 singlet factor) for the
-/// batched `NIMatmul` path, which applies the real grid weights internally.
-/// AO mode carries no `FXCMatvecData` (`fxc: None`): the MO-on-grid
-/// projections and weighted `wfxc` table are MO-only.
-pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
-    prepare_ao_data_with_spin(scf, None)
-}
-
-/// [`prepare_ao_data`] with an explicit singlet/triplet override for the
-/// restricted kernel (tddft.rs reads `tddft_spin` from the ctrl keyword
-/// otherwise). Used by the stability module: internal = "singlet",
-/// external RHF→UHF = "triplet" — independent of the deck's `tddft_spin`.
 /// Per-sector occupied/virtual MO coefficient blocks (C_occ [nao, occ_s],
 /// C_vir [nao, vir_s]) for the AO transition-density machinery.
 fn sector_mo_coeffs(
@@ -287,6 +265,19 @@ fn sector_mo_coeffs(
     (c_occ_all, c_vir_all)
 }
 
+/// Prepare the shared TDDFT data for **AO mode**, with an explicit
+/// singlet/triplet override for the restricted kernel (tddft_solver passes
+/// the deck's resolved `tddft_spin`; the stability module passes
+/// internal = "singlet", external RHF→UHF = "triplet" — independent of the
+/// deck).
+///
+/// The fxc kernel is evaluated with the modern `numint_matmul` stack
+/// (`eval_vxc_fxc_from_rho`), the same libxc wrapper used by the RKS response,
+/// so the values match the MO path bit-identically. The **raw** kernel
+/// `[ngrids, nvar, nvar]` is stored as `fxc_eff` (×2 singlet factor) for the
+/// batched `NIMatmul` path, which applies the real grid weights internally.
+/// AO mode carries no `FXCMatvecData` (`fxc: None`): the MO-on-grid
+/// projections and weighted `wfxc` table are MO-only.
 pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTData {
     let is_uhf = scf.scftype == SCFType::UHF;
     let sector_list = crate::ri_tddft::utils::tddft_sector_params(scf);
@@ -303,9 +294,6 @@ pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTDa
         let (c_occ_all, c_vir_all) = sector_mo_coeffs(scf, &sector_list);
         return TDDFTData {
             mode: TDDFTMode::AO,
-            // HF carries dfa_hybrid_scf = 1.0 from the dft module (full
-            // exact exchange).
-            alpha_hybrid: xc_data.dfa_hybrid_scf,
             fxc: None,
             c_occ: c_occ_all,
             c_vir: c_vir_all,
@@ -327,7 +315,6 @@ pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTDa
     let num_basis = scf.mol.num_basis;
     let weights = &grids.weights;
     let nvar = if xc_data.use_density_gradient() { 4 } else { 1 };
-    let alpha_hybrid = xc_data.dfa_hybrid_scf;
     let den_type = if nvar == 4 { XCDenType::SIGMA } else { XCDenType::RHO };
     // Response exchange split (REST RSH convention, mirrors the ground-state
     // Fock build in scf_io): `coeff_full*K_full + coeff_sr*K_SR` with
@@ -548,7 +535,6 @@ pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTDa
 
     TDDFTData {
         mode: TDDFTMode::AO,
-        alpha_hybrid,
         fxc,
         c_occ: c_occ_all,
         c_vir: c_vir_all,
