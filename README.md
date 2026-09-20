@@ -49,6 +49,7 @@
     2. `opt`: 基于数值力的构型优化。等价设置有：`geometry optimization`, `relax`, `geom_opt`等
 	3. `force`: 计算当前结构下的受力。等价设置有：`gradient`
 	4. `numerical dipole`: 计算数值偶极。等价设置有：`numdipole`
+	5. `md`: 内置分子动力学（详见 [REST 文档 · MD](https://rest-doc.readthedocs.io/zh_CN/user/md.html)）。纯 MM 使用 `pure_mm = true`
 - `auxbasis_response`：开启辅助基导数。缺省为true
 - `opt_engine`: 取值String类型。构型优化引擎。可选项有：`LBFGS`、`geometric-pyo3`（缺省）
     - **注意**：固定原子功能（在 `position` 中用 `0`/`1` 标记）当前仅支持 `geometric-pyo3` 引擎，`LBFGS` 引擎暂不支持约束优化。
@@ -99,6 +100,9 @@
     - MP2、XYG3、XYGJOS、XYG7、xDH-PBE0、sBGE2、ZRPS、scsRPA、R-xDH7、RPA@PBE、RPA@B3LYP为后自洽场计算方法。若用户未申明具体基组，则使用def2-QZVPP基组 (`basis_path = {basis_set_pool}/def2-QZVPP`)
     - RPA@PBE、RPA@B3LYP表示后自洽场RPA计算使用PBE、B3LYP方法的轨道
     - 当 `xc_parser` 设置为`xc_parser=parse_xc`时，可通过 `xc` 关键词自定义密度泛函近似方法，具体书写规则请参见[REST程序用户手册](https://rest-doc.readthedocs.io/zh_CN/contributor/dft/parse_xc.html)
+- `pure_mm`：取值布尔类型。设为 `true` 时 REST 完全不做电子结构计算，整个体系交给内嵌 OpenMM 处理（纯 MM），
+  配合 `job_type = "md"/"sp"/"force"/"singlepoint"` 与 `[md]` 中的 `mm_file`/`mm_system_xml`/`mm_cutoff`。
+  此时无需 `xc`、`basis_path` 与 `[geom]`。
 - `empirical_dispersion`:　取值为String。针对低级别密度泛函方法（包括LDA、BLYP、PBE、B3LYP、PBE0等）的经验色散校正方法。目前支持D3, D3BJ和D4。对于XYG3型双杂化泛函比如XYG3、XYG7、XYGJOS、scsRPA、R-xDH7、RPA等不需要经验色散校正
 - `post_ai_correction`：取值String。AI辅助的校正方法。目前仅支持SCC15，并只能和R-xDH7重整化双杂化泛函方法相匹配。相关文章见：Wang, Y.; Lin, Z.; Ouyang, R.; Jiang, B.; Zhang, I. Y.; Xu, X. Toward Efficient and Unified Treatment of Static and Dynamic Correlations in Generalized Kohn–Sham Density Functional Theory. [JACS Au 2024, 4 (8), 3205–3216](https://doi.org/10.1021/jacsau.4c00488). 
 - `post_xc`：取值Vec\<String\>。采用自洽收敛的轨道和密度，进行不同的交换－关联泛函(xc)的计算。允许的方法包括REST支持的"xc"方法
@@ -214,8 +218,12 @@ guessfile = "my_checkpoint.rchk"
     - `default`: 目前同 `ri`。
 - `algorithm_j`: 设置 Fock 矩阵计算中 J (Coulomb) 部分的算法；该关键词是高级选项，一般用户建议使用`algorithm_jk`关键词进行整体设置。
     - 下述选项同 `algorithm_jk`：`ri-direct`, `ri-incore`, `ri`, `default`。
+    - `ri-schwartz`: 使用 Schwartz screening 的 direct RI-J 算法。3c-2e ERI 即算即用（同 `ri-direct`），但利用了稀疏性并降低内存开销与提升内存局域性。该选项仅对 J 部分有效，即只能通过 `algorithm_j` 指定；其行为由 `[ctrl.ri_jk]` 表控制（见下）。该路径暂不支持 MPI 并行。
 - `algorithm_k`: 设置 Fock 矩阵计算中 K (Exchange) 部分的算法；该关键词是高级选项，一般用户建议使用`algorithm_jk`关键词进行整体设置。
     - 下述选项同 `algorithm_jk`：`ri-direct`, `ri-incore`, `ri`, `default`。
+- `ri_jk`: RI-J/RI-K 算法的参数，以 `[ctrl.ri_jk]` 表形式给出。目前的字段控制 `ri-schwartz` RI-J 算法的筛选行为，对其它算法无影响。
+    - `schwartz_threshold`: 取值f64类型。Schwartz 筛选的积分忽略阈值（单位 Hartree）：仅当 (壳对, 辅助壳) 块的 Coulomb 贡献上界达到该阈值时才纳入计算。缺省为 1.0e-12。
+    - `schwartz_overlap_tol2`: 取值f64类型。Schwarz 上界构建前静态重叠预筛选的阈值：最弥散基元的重叠小于该值的壳对不参与上界构建。缺省为 1.0e-24。
 - `use_dm_only`: 取值布尔类型。控制 VK (Exchange) 和 VXC (XC Potential) 矩阵的构建方式。缺省为 false。
     - `false`（缺省）：使用分子轨道系数构造（occ-RI-K 算法），效率更高，推荐用于大多数体系。
     - `true`：直接使用密度矩阵构造。当轨道占据数非整数（如 dSCF 激发态）时可能需要设为 true。
@@ -1275,3 +1283,20 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 	```
     - `fac = 0.9` 全局收紧成键判据；`radii = {"Sr" = 1.0}` 进一步把 Sr 的共价半径从 1.95 降到 1.0，精确去除 Sr–O 离子接触（两者可单独或组合使用）
     - `check = 10` 每 10 步重建内坐标体系，防止 DLC 离域基随几何变化而陈旧化
+
+# 内置分子动力学（MD / AIMD）
+
+`job_type = "md"` 时 REST 将启动一套内置的分子动力学引擎（MD 循环、积分器、伞形采样都在 REST 内，每一步的 QM 能量/梯度走与几何优化相同的进程内接口）：
+
+- **AIMD（纯 QM）**：体系只有 `[geom]` 的 QM 分子，每步先收敛 SCF 再移动原子核并取解析梯度；上一步的收敛波函数自动作为下一步初猜（内部设为 `initial_guess = "inherit"`，用户无需配置，显著减少迭代），SCF 用多线程（`num_threads`）并行。
+- **QM/MM**：`[geom]` 为 QM 区，MM 体系可用内嵌 OpenMM 提供（TIP3P 自动类型，或直接给完整的 OpenMM System XML），也可由 REST 从经典力场参数**内部生成** System XML（支持共价切断的 link-H）；QM–MM 之间为点电荷嵌入 + QM–MM LJ。
+- **纯 MM**：`pure_mm = true` 时整个体系交给 OpenMM（`mm_file` / `mm_system_xml`）。
+- **任务类型**：`ensemble = "nvt"`(Langevin) / `"nve"`(VelocityVerlet) / `"opt"`(几何优化) / `"sp"`(单点能量/受力)。
+- **伞形采样（US）**：`umbrella_atoms` 存在即启用；CV 支持 `dihedral` / `distance` / `angle` / `distance_diff`（后者可叠加 `umbrella_sum_kappa` 的 ½ks(s−s0)² 约束），输出 `umbrella_timeseries.csv` 供 (2D) WHAM 后处理。
+- **续跑**：`restart_input` 从上次的 `md_restart` 同时读位置与速度，无需改写 `[geom]`。
+- **输出**：`md.log`、`dump_{nvt|nve}.xyz`、`dipole.dat`、`energy_force.log`、`umbrella_timeseries.csv`、`md_restart`。
+- **Python 依赖**：MD/AIMD 的积分与优化由内嵌 Python 的 [ASE](https://wiki.fysik.dtu.dk/ase/) 完成，QM/MM 与纯 MM 的 MM 侧由 [OpenMM](https://openmm.org/) 完成；运行时需要有可用的 Python 及 `numpy`、`ase`、`openmm`（含 `openmm.app`）。参考环境：Python 3.10、numpy 2.2、ASE 3.29、OpenMM 8.6。
+
+纯 QM 的 AIMD 支持多进程 MPI（SCF 与积分沿 MPI 并行，所有 rank 同步积分、仅 root 落盘）。QM/MM 与纯 MM 目前只支持单进程：进程内用 OpenMP/Rayon 多线程（`num_threads`），多进程 MPI 会在启动时被拒绝。
+
+详情请见 [REST 文档 · 内置分子动力学](https://rest-doc.readthedocs.io/zh_CN/user/md.html)。

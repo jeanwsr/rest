@@ -122,6 +122,7 @@ pub enum JobType {
     NumDipole,
     GeomOpt,
     NormalModes,
+    MD,
 }
 
 /// Whether to use the distributed (ScaLAPACK) solver for diagonalizing the
@@ -421,6 +422,7 @@ pub struct InputKeywords {
     pub xc_parser: String,
     pub tddft: Option<TDDFTParameters>,
     pub j2c_decomp: J2CDecompOption,
+    pub ri_jk: RIJKOption,
     /// Whether to use the distributed (ScaLAPACK) Hamiltonian diagonalization
     /// in MPI runs. `Auto` (default) decides by problem size; `On` forces the
     /// distributed solver; `Off` forces the serial one.
@@ -608,6 +610,7 @@ impl InputKeywords {
             stop_at: None,
             xc_parser: String::from("legacy"),
             j2c_decomp: J2CDecompOption::default(),
+            ri_jk: RIJKOption::default(),
             hamiltonian_distributed: HamiltonianDistributedMode::default(),
             rpa_distributed: HamiltonianDistributedMode::default(),
             ri_pt2: RiPt2Option::default(),
@@ -660,6 +663,9 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         },
         JobType::NormalModes => {
             println!("Calculation type: Vibrational normal modes (frequency) calculation");
+        },
+        JobType::MD => {
+            println!("Calculation type: Molecular dynamics (MD) simulation");
         },
     }
 
@@ -1089,6 +1095,9 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     } else if tmp_xc_low.eq("normal_modes") || tmp_xc_low.eq("freq") ||
                       tmp_xc_low.eq("frequency") || tmp_xc_low.eq("vibration") {
                         JobType::NormalModes
+                    } else if tmp_xc_low.eq("md") || tmp_xc_low.eq("molecular dynamics") ||
+                      tmp_xc_low.eq("molecular_dynamics") {
+                        JobType::MD
                     } else {
                         JobType::SinglePoint
                     }
@@ -1631,6 +1640,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.algorithm_j = tmp_ctrl.get("algorithm_j").map(serde_from_value).unwrap_or_default();
             tmp_input.algorithm_k = tmp_ctrl.get("algorithm_k").map(serde_from_value).unwrap_or_default();
             tmp_input.j2c_decomp = tmp_ctrl.get("j2c_decomp").map(serde_from_value).unwrap_or_default();
+            tmp_input.ri_jk = tmp_ctrl.get("ri_jk").map(serde_from_value).unwrap_or_default();
             tmp_input.hamiltonian_distributed = tmp_ctrl.get("hamiltonian_distributed").map(serde_from_value).unwrap_or_default();
             tmp_input.rpa_distributed = tmp_ctrl.get("rpa_distributed").map(serde_from_value).unwrap_or_default();
             if (tmp_input.algorithm_j != AlgorithmJ::Default || tmp_input.algorithm_k != AlgorithmK::Default) {
