@@ -22,7 +22,7 @@ use crate::ri_tddft::utils::{
     compute_tddft_dipole_matrix, compute_tddft_dipole_matrix_u, normalize_u, transition_dipole_square_u,
 };
 use crate::ri_tddft::feast_solver;
-use crate::ri_tddft::tddft::{build_a, build_b, prepare_ao_data, prepare_mo_data};
+use crate::ri_tddft::tddft::{build_a, build_b, prepare_ao_data_with_spin, prepare_mo_data};
 use crate::ri_tddft::{TDDFTData, TDDFTMode};
 use log::warn;
 
@@ -305,10 +305,15 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
         println!("occ_size={}, vir_size={}, dim={}", occ_size, vir_size, dim);
     }
 
-    // ═══ Step 3+4: Prepare the shared TDDFT data (fxc kernel + mode-specific tensors) ═══
-    // AO mode is prepared by `prepare_ao_data` (fxc kernel via numint_matmul,
-    // NIMatmul integrator, AO transition-density path); MO mode by
-    // `prepare_mo_data` (MO-basis RI tensors). Both return the same `TDDFTData`.
+    // ═══ Step 3+4: TDDFT data preparation (deferred into `run_spin`) ═══
+    // The data is prepared per spin channel inside `run_spin`: the
+    // spin-adapted fxc kernel differs between the singlet (f↑↑+f↑↓ = 2×
+    // unpolarized) and triplet (f↑↑−f↑↓, CPL 256, 454) channels, so the
+    // `tddft_spin = "both"` path must NOT share one kernel across its two
+    // passes. AO mode is prepared by `prepare_ao_data_with_spin` (fxc kernel
+    // via numint_matmul, NIMatmul integrator, AO transition-density path);
+    // MO mode by `prepare_mo_data` (MO-basis RI tensors; the deck's
+    // `tddft_spin` does not apply). Both return the same `TDDFTData`.
     // RefCell: shared mutable state needed by the batched Davidson closures,
     // each of which requires `&mut TDDFTData` (NIMatmul cache).
     //
@@ -322,30 +327,11 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
             g.aop = None;
         }
     }
-    // Data preparation covers all four (mode x reference) cells: AO is
-    // sector-generic (both references); MO mode builds the per-sector RI
-    // bundles (`ri_terms`) and the restricted/spin-resolved fxc tables in one
-    // `prepare_mo_data`.
-    let data: std::cell::RefCell<TDDFTData> = std::cell::RefCell::new(
-        if is_ao {
-            println!("Reftype: {}", if is_u { "UKS" } else { "RKS" });
-            // FEAST is not implemented for the AO path.
-            // Note: `response_tddft` bypasses this function entirely (dispatched
-            // separately in main_driver) and always uses MO-basis machinery
-            // regardless of `tddft_mode`.
-            if tddft_ctrl.tddft_feast_solver {
-                return Err("FEAST solver is not supported with tddft_mode=\"ao\"".to_string());
-            }
-            // `prepare_ao_data` handles both reference types (RHF one-sector /
-            // UHF two-sector kernels and coefficients).
-            prepare_ao_data(scf)
-        } else {
-            prepare_mo_data(scf)
-        },
-    );
-
-    // Hybrid coefficient: identical for both modes (from the kernel data).
-    let alpha_hybrid = data.borrow().alpha_hybrid;
+    // FEAST is restricted-MO machinery and cannot run in AO mode (checked
+    // here because the data preparation itself moved into `run_spin`).
+    if is_ao && tddft_ctrl.tddft_feast_solver {
+        return Err("FEAST solver is not supported with tddft_mode=\"ao\"".to_string());
+    }
 
     // ═══ Step 5: Build diagonal preconditioner ═══
     let hdiag = matvec::build_hdiag(scf);
@@ -377,12 +363,20 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     };
 
     // ═══ Step 8+9: Solve and print one spin channel ═══
-    // Extracted so that `tddft_spin = "both"` can solve singlet and triplet
-    // in a single pass over the same prepared TDDFTData (the fxc kernel and
-    // RI tensors are spin-independent; the spin enters per matvec via `xlet`).
+    // Per spin channel: the spin-adapted fxc kernel differs between the
+    // singlet and triplet passes (see Step 3+4 above), so each call prepares
+    // its own TDDFTData; the spin enters the matvecs via `xlet`.
     let scf_ref: &SCF = scf;
-    let run_spin = |xlet: char, initial_guess: &MatrixFull<f64>|
+    let run_spin = |xlet: char, spin: &str, initial_guess: &MatrixFull<f64>|
         -> (Vec<(f64, Vec<f64>)>, Vec<f64>, Vec<f64>) {
+        let data: std::cell::RefCell<TDDFTData> = std::cell::RefCell::new(
+            if is_ao {
+                println!("Reftype: {}", if is_u { "UKS" } else { "RKS" });
+                prepare_ao_data_with_spin(scf_ref, Some(spin))
+            } else {
+                prepare_mo_data(scf_ref)
+            },
+        );
         // ── Step 8: Diagnostic: check A matrix symmetry for first few columns ──
         // MO-mode matvec closures (used by diagnostic + MO solver dispatch; the
         // dense path and AO mode use the dedicated builders / batched matvecs).
@@ -786,10 +780,10 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     if tddft_spin == "both" {
         // ── Both singlet and triplet: singlet first, then triplet ──
         println!("\n--- Singlet ---");
-        let (eigenpairs_singlet, mut energies, mut osc) = run_spin('S', &initial_guess);
+        let (eigenpairs_singlet, mut energies, mut osc) = run_spin('S', "singlet", &initial_guess);
 
         println!("\n--- Triplet ---");
-        let (eigenpairs_triplet, energies_t, osc_t) = run_spin('T', &initial_guess);
+        let (eigenpairs_triplet, energies_t, osc_t) = run_spin('T', "triplet", &initial_guess);
 
         // JSON order: singlet roots first, then triplet roots.
         energies.extend(energies_t);
@@ -813,7 +807,7 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
         Ok(TddftOutput { energies, osc, excitations: eigenpairs_singlet })
     } else {
         // ── Single spin ──
-        let (eigenpairs, energies, osc) = run_spin(xlet, &initial_guess);
+        let (eigenpairs, energies, osc) = run_spin(xlet, tddft_spin.as_str(), &initial_guess);
         println!("The first excitation obtained by TDDFT is {}", energies[0]);
         println!("TDDFT calculation completed successfully.");
         Ok(TddftOutput { energies, osc, excitations: eigenpairs })
