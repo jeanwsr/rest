@@ -125,7 +125,8 @@ pub enum FxcDriver {
 /// Prepare the shared TDDFT data for **MO mode**: the fxc kernel table
 /// (restricted `prepare_fxc_data` / spin-resolved `prepare_fxc_data_unrestricted`)
 /// plus the per-sector MO-basis RI bundles (`RITensorTerms`; one sector for
-/// RHF, two for UHF, windows from `tddft_sector_params`).
+/// RHF, two for UHF, windows from `tddft_sector_params`). An HF reference
+/// skips both fxc tables (no XC kernel, no grids).
 pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
     let is_uhf = scf.scftype == SCFType::UHF;
     if is_uhf {

@@ -252,8 +252,8 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     // ═══ Step 2: Get orbital dimensions ═══
     let (start_mo, num_state, occ_size, vir_size, homo, lumo) =
         tddft_occupation_parameters(scf);
-    // Unrestricted: per-spin occupied/virtual windows (frozen core + virtual
-    // cutoff resolved independently on each spin channel).
+    // Unrestricted: per-spin occupied/virtual windows (virtual cutoff
+    // resolved independently on each spin channel).
     let sectors_u = if is_u { Some(tddft_occupation_parameters_u(scf)) } else { None };
         if scf.mol.ctrl.print_level > 1 {
         if let Some(sec) = &sectors_u {

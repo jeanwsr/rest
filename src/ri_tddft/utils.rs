@@ -197,8 +197,8 @@ pub fn transition_dipole_square_u(
 ///
 /// Delegates to [`tddft_occupation_parameters_u`] so that every unrestricted
 /// consumer (driver, `prepare_fxc_data_unrestricted`, the unrestricted
-/// matvecs) shares ONE window definition — frozen-core and virtual cutoff
-/// resolved identically on both spin channels.
+/// matvecs) shares ONE window definition — virtual cutoff resolved
+/// identically on both spin channels.
 pub fn tddft_occupation_parameters_spin(
     scf: &SCF,
     spin: usize,
