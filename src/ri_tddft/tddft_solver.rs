@@ -127,6 +127,23 @@ fn dense_lr_eigenpairs(
     }
 }
 
+/// Which solver the Step-8 dispatch selects for the eigenvalue problem.
+enum SolverKind {
+    /// FEAST contour solver (restricted references only).
+    Feast,
+    /// Exact dense diagonalisation, MO-U reference: TDA `dsyev` (dim ≤ 15) or
+    /// full-LR non-Hermitian `dgeev` (dim ≤ 80).
+    DenseU,
+    /// Per-vector Davidson over the concatenated MO-U amplitudes.
+    DavidsonMOU,
+    /// Exact dense diagonalisation, restricted reference (dim ≤ 15): Casida
+    /// reduction with a `dsyev` fallback.
+    DenseR,
+    /// Iterative Davidson: batched in AO mode, per-vector in MO mode
+    /// (restricted references and AO-mode unrestricted).
+    Davidson,
+}
+
 pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
     // ═══ Step 1: Extract control parameters ═══
     let tddft_ctrl = scf.mol.ctrl.tddft.clone()
@@ -452,103 +469,123 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
         }
 
         // ── Step 8: Call solver (full diag, Davidson, or FEAST) ──
-        let eigenpairs = if tddft_ctrl.tddft_feast_solver && !is_u {
-            // ── FEAST solver path (restricted MO mode only) ──
-            println!("Using FEAST eigensolver (experimental)");
-            let eigenrange_min = tddft_ctrl.tddft_feast_eigenrange_min;
-            let eigenrange_max = tddft_ctrl.tddft_feast_eigenrange_max;
-            let m_expected = tddft_ctrl.tddft_feast_m_expected;
-            let max_feast_iter = tddft_ctrl.tddft_feast_max_iter;
-            let tol_feast = tddft_ctrl.tddft_feast_tol;
-            let gmres_restart = tddft_ctrl.tddft_feast_gmres_restart;
-            let gmres_max_iter = tddft_ctrl.tddft_feast_gmres_max_iter;
-            let gmres_tol = tddft_ctrl.tddft_feast_cg_tol;
-            let cg_max_iter = tddft_ctrl.tddft_feast_cg_max_iter;
-            let cg_tol = tddft_ctrl.tddft_feast_cg_tol;
-            let init_guess_type = tddft_ctrl.tddft_feast_init_guess_type.as_str();
-            let gaussian_width_factor = tddft_ctrl.tddft_feast_gaussian_width_factor;
-
-            if is_tda {
-                feast_solver::feast_solve_tddft_tda(
-                    scf_ref, &*data.borrow(), &hdiag, xlet,
-                    eigenrange_min, eigenrange_max,
-                    m_expected, max_feast_iter, tol_feast,
-                    gmres_restart, gmres_max_iter, gmres_tol,
-                    init_guess_type, gaussian_width_factor,
-                )
-            } else {
-                feast_solver::feast_solve_tddft_lr(
-                    scf_ref, &*data.borrow(), &hdiag, xlet,
-                    eigenrange_min, eigenrange_max,
-                    m_expected, max_feast_iter, tol_feast,
-                    gmres_restart, gmres_max_iter, gmres_tol,
-                    cg_max_iter, cg_tol,
-                    init_guess_type, gaussian_width_factor,
-                )
-            }
+        // Selection first, then execution (see `SolverKind`). Layered: FEAST
+        // (restricted only) → exact dense diagonalisation for small dim →
+        // iterative Davidson (batched in AO, per-vector in MO). Dense
+        // thresholds are per-cell: MO-U TDA ≤ 15, MO-U LR ≤ 80 (non-Hermitian
+        // dgeev), restricted ≤ 15.
+        let is_mo_u = is_u && !is_ao;
+        let solver = if tddft_ctrl.tddft_feast_solver && !is_u {
+            SolverKind::Feast
+        } else if is_mo_u && dim <= if is_tda { 15 } else { 80 } {
+            SolverKind::DenseU
+        } else if is_mo_u {
+            SolverKind::DavidsonMOU
+        } else if dim <= 15 {
+            SolverKind::DenseR
         } else {
-            let is_mo_u = is_u && !is_ao;
-            if is_mo_u && dim <= 15 && is_tda {
-                // MO-U small TDA: exact dense diagonalisation is robust.
-                let mut a_mat = vec![0.0; dim * dim];
-                for col in 0..dim {
-                    let mut e_col = vec![0.0; dim];
-                    e_col[col] = 1.0;
-                    let a_col = a_apply(&e_col);
-                    for row in 0..dim {
-                        a_mat[row + col * dim] = a_col[row];
-                    }
+            SolverKind::Davidson
+        };
+        let eigenpairs = match solver {
+            SolverKind::Feast => {
+                // ── FEAST solver path (restricted MO mode only) ──
+                println!("Using FEAST eigensolver (experimental)");
+                let eigenrange_min = tddft_ctrl.tddft_feast_eigenrange_min;
+                let eigenrange_max = tddft_ctrl.tddft_feast_eigenrange_max;
+                let m_expected = tddft_ctrl.tddft_feast_m_expected;
+                let max_feast_iter = tddft_ctrl.tddft_feast_max_iter;
+                let tol_feast = tddft_ctrl.tddft_feast_tol;
+                let gmres_restart = tddft_ctrl.tddft_feast_gmres_restart;
+                let gmres_max_iter = tddft_ctrl.tddft_feast_gmres_max_iter;
+                let gmres_tol = tddft_ctrl.tddft_feast_cg_tol;
+                let cg_max_iter = tddft_ctrl.tddft_feast_cg_max_iter;
+                let cg_tol = tddft_ctrl.tddft_feast_cg_tol;
+                let init_guess_type = tddft_ctrl.tddft_feast_init_guess_type.as_str();
+                let gaussian_width_factor = tddft_ctrl.tddft_feast_gaussian_width_factor;
+
+                if is_tda {
+                    feast_solver::feast_solve_tddft_tda(
+                        scf_ref, &*data.borrow(), &hdiag, xlet,
+                        eigenrange_min, eigenrange_max,
+                        m_expected, max_feast_iter, tol_feast,
+                        gmres_restart, gmres_max_iter, gmres_tol,
+                        init_guess_type, gaussian_width_factor,
+                    )
+                } else {
+                    feast_solver::feast_solve_tddft_lr(
+                        scf_ref, &*data.borrow(), &hdiag, xlet,
+                        eigenrange_min, eigenrange_max,
+                        m_expected, max_feast_iter, tol_feast,
+                        gmres_restart, gmres_max_iter, gmres_tol,
+                        cg_max_iter, cg_tol,
+                        init_guess_type, gaussian_width_factor,
+                    )
                 }
-                let a = MatrixFull::from_vec([dim, dim], a_mat).unwrap();
-                let (eigvecs_opt, eigvals, _info) = rest_tensors::matrix::matrix_blas_lapack::_dsyev(&a, 'V');
-                let eigvecs = eigvecs_opt.expect("dsyev failed");
-                let mut pairs: Vec<(f64, Vec<f64>)> = eigvals.iter()
-                    .zip(eigvecs.iter_columns_full())
-                    .map(|(e, v)| (*e, v.to_vec()))
-                    .collect();
-                pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                pairs.truncate(nroots.min(dim));
-                pairs
-            } else if is_mo_u && !is_tda && dim <= 80 {
-                // MO-U small/medium full LR: build the explicit non-Hermitian
-                // matrix [A  B; -B -A] and diagonalise it. This avoids slow or
-                // oscillating Davidson iterations for small unrestricted systems.
-                println!("Building unrestricted full LR matrix ({} x {})...", 2 * dim, 2 * dim);
-                let mut a_mat = vec![0.0; dim * dim];
-                let mut b_mat = vec![0.0; dim * dim];
-                for col in 0..dim {
-                    let mut e_col = vec![0.0; dim];
-                    e_col[col] = 1.0;
-                    let a_col = a_apply(&e_col);
-                    let b_col = b_apply(&e_col);
-                    for row in 0..dim {
-                        a_mat[row + col * dim] = a_col[row];
-                        b_mat[row + col * dim] = b_col[row];
+            }
+            SolverKind::DenseU => {
+                if is_tda {
+                    // MO-U small TDA: exact dense diagonalisation is robust.
+                    let mut a_mat = vec![0.0; dim * dim];
+                    for col in 0..dim {
+                        let mut e_col = vec![0.0; dim];
+                        e_col[col] = 1.0;
+                        let a_col = a_apply(&e_col);
+                        for row in 0..dim {
+                            a_mat[row + col * dim] = a_col[row];
+                        }
                     }
-                }
-                let n2 = 2 * dim;
-                let mut h = MatrixFull::new([n2, n2], 0.0);
-                for j in 0..dim {
-                    for i in 0..dim {
-                        let av = a_mat[i + j * dim];
-                        let bv = b_mat[i + j * dim];
-                        h[[i, j]] = av;
-                        h[[dim + i, j]] = -bv;
-                        h[[i, dim + j]] = bv;
-                        h[[dim + i, dim + j]] = -av;
+                    let a = MatrixFull::from_vec([dim, dim], a_mat).unwrap();
+                    let (eigvecs_opt, eigvals, _info) = rest_tensors::matrix::matrix_blas_lapack::_dsyev(&a, 'V');
+                    let eigvecs = eigvecs_opt.expect("dsyev failed");
+                    let mut pairs: Vec<(f64, Vec<f64>)> = eigvals.iter()
+                        .zip(eigvecs.iter_columns_full())
+                        .map(|(e, v)| (*e, v.to_vec()))
+                        .collect();
+                    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    pairs.truncate(nroots.min(dim));
+                    pairs
+                } else {
+                    // MO-U small/medium full LR: build the explicit non-Hermitian
+                    // matrix [A  B; -B -A] and diagonalise it. This avoids slow or
+                    // oscillating Davidson iterations for small unrestricted systems.
+                    println!("Building unrestricted full LR matrix ({} x {})...", 2 * dim, 2 * dim);
+                    let mut a_mat = vec![0.0; dim * dim];
+                    let mut b_mat = vec![0.0; dim * dim];
+                    for col in 0..dim {
+                        let mut e_col = vec![0.0; dim];
+                        e_col[col] = 1.0;
+                        let a_col = a_apply(&e_col);
+                        let b_col = b_apply(&e_col);
+                        for row in 0..dim {
+                            a_mat[row + col * dim] = a_col[row];
+                            b_mat[row + col * dim] = b_col[row];
+                        }
                     }
+                    let n2 = 2 * dim;
+                    let mut h = MatrixFull::new([n2, n2], 0.0);
+                    for j in 0..dim {
+                        for i in 0..dim {
+                            let av = a_mat[i + j * dim];
+                            let bv = b_mat[i + j * dim];
+                            h[[i, j]] = av;
+                            h[[dim + i, j]] = -bv;
+                            h[[i, dim + j]] = bv;
+                            h[[dim + i, dim + j]] = -av;
+                        }
+                    }
+                    let (_, wr, wi, _vl, vr, _info) =
+                        rest_tensors::matrix::matrix_blas_lapack::_dgeev(&h, 'N', 'V');
+                    let mut pairs: Vec<(f64, Vec<f64>)> = wr.iter()
+                        .zip(wi.iter().zip(vr.iter_columns_full()))
+                        .filter(|(wr_i, (wi_i, _))| **wr_i > 1e-8 && wi_i.abs() < 1e-6)
+                        .map(|(wr_i, (_, v))| (*wr_i, v.to_vec()))
+                        .collect();
+                    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    pairs.truncate(nroots.min(dim));
+                    pairs
                 }
-                let (_, wr, wi, _vl, vr, _info) =
-                    rest_tensors::matrix::matrix_blas_lapack::_dgeev(&h, 'N', 'V');
-                let mut pairs: Vec<(f64, Vec<f64>)> = wr.iter()
-                    .zip(wi.iter().zip(vr.iter_columns_full()))
-                    .filter(|(wr_i, (wi_i, _))| **wr_i > 1e-8 && wi_i.abs() < 1e-6)
-                    .map(|(wr_i, (_, v))| (*wr_i, v.to_vec()))
-                    .collect();
-                pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                pairs.truncate(nroots.min(dim));
-                pairs
-            } else if is_mo_u {
+            }
+            SolverKind::DavidsonMOU => {
                 // MO-U iterative: per-vector Davidson over the concatenated α;β vector.
                 if is_tda {
                     println!("Solving unrestricted TDA eigenvalue problem...");
@@ -561,93 +598,96 @@ pub fn tddft_main(scf: &mut SCF) -> Result<TddftOutput, String> {
                         a_apply, b_apply, nroots, &hdiag, initial_guess.clone(), &davidson_cfg,
                     )
                 }
-            } else if dim <= 15 {
-            println!("Small system (dim={}), building full A matrix for diagnosis...", dim);
-            let a_full = build_a(scf_ref, &mut *data.borrow_mut(), xlet);
-            if log::log_enabled!(log::Level::Debug) {
-                println!("  A·e0 [0] = {:.10} (gap={:.10}, kernel={:.10})",
-                    a_full[[0, 0]], hdiag[0], a_full[[0, 0]] - hdiag[0]);
             }
-            // Full LR: build B too and solve the symmetrized Casida reduction
-            // (fall back to the TDA approximation if A−B is not positive-definite).
-            let lr_pairs = if is_tda {
-                None
-            } else {
-                let b_full = build_b(scf_ref, &mut *data.borrow_mut(), xlet);
-                dense_lr_eigenpairs(&a_full, &b_full, nroots)
-            };
-            if let Some(pairs) = lr_pairs {
-                pairs
-            } else {
-                // TDA (or LR with A−B not positive-definite): diagonalize A only.
-                let mut a = a_full;
-                let (eigvecs_opt, eigvals, _info) = rest_tensors::matrix::matrix_blas_lapack::_dsyev(&a, 'V');
-                let eigvecs = eigvecs_opt.expect("dsyev failed");
-                let mut pairs: Vec<(f64, Vec<f64>)> = eigvals.iter()
-                    .zip(eigvecs.iter_columns_full())
-                    .map(|(e, v)| (*e, v.to_vec()))
-                    .collect();
-                pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                pairs.truncate(nroots.min(dim));
-                pairs
-            }
-        } else {
-            // Layered by mode, then by method: AO/MO owns the matvec family,
-            // TDA/LR is the inner branch. (FEAST and dim<=15 are outer special cases.)
-            let mode = data.borrow().mode;
-            match mode {
-                TDDFTMode::AO => {
-                    if is_tda {
-                        println!("Solving TDA eigenvalue problem (AO-mode batched matvec)...");
-                        davidson_solver::tda_davidson_solver_batched(
-                            |z_block: &MatrixFull<f64>| {
-                                matvec_ao::a_matvec_ao_batched(scf_ref, &mut *data.borrow_mut(), z_block, xlet)
-                            },
-                            nroots,
-                            &hdiag,
-                            initial_guess.clone(),
-                            &davidson_cfg,
-                        )
-                    } else {
-                        println!("Solving full linear response eigenvalue problem (AO-mode batched matvec)...");
-                        davidson_solver::lr_davidson_solver_batched(
-                            |z_block: &MatrixFull<f64>| {
-                                matvec_ao::a_matvec_ao_batched(scf_ref, &mut *data.borrow_mut(), z_block, xlet)
-                            },
-                            |z_block: &MatrixFull<f64>| {
-                                matvec_ao::b_matvec_ao_batched(scf_ref, &mut *data.borrow_mut(), z_block, xlet)
-                            },
-                            nroots,
-                            &hdiag,
-                            initial_guess.clone(),
-                            &davidson_cfg,
-                        )
-                    }
+            SolverKind::DenseR => {
+                println!("Small system (dim={}), building full A matrix for diagnosis...", dim);
+                let a_full = build_a(scf_ref, &mut *data.borrow_mut(), xlet);
+                if log::log_enabled!(log::Level::Debug) {
+                    println!("  A·e0 [0] = {:.10} (gap={:.10}, kernel={:.10})",
+                        a_full[[0, 0]], hdiag[0], a_full[[0, 0]] - hdiag[0]);
                 }
-                TDDFTMode::MO => {
-                    if is_tda {
-                        println!("Solving TDA eigenvalue problem...");
-                        davidson_solver::tda_davidson_solver(
-                            |z: &Vec<f64>| a_apply(z),
-                            nroots,
-                            &hdiag,
-                            initial_guess.clone(),
-                            &davidson_cfg,
-                        )
-                    } else {
-                        println!("Solving full linear response eigenvalue problem...");
-                        davidson_solver::lr_davidson_solver(|z: &Vec<f64>| a_apply(z),
-                            |z: &Vec<f64>| b_apply(z),
-                            nroots,
-                            &hdiag,
-                            initial_guess.clone(),
-                            &davidson_cfg,
-                        )
-                    }
+                // Full LR: build B too and solve the symmetrized Casida reduction
+                // (fall back to the TDA approximation if A−B is not positive-definite).
+                let lr_pairs = if is_tda {
+                    None
+                } else {
+                    let b_full = build_b(scf_ref, &mut *data.borrow_mut(), xlet);
+                    dense_lr_eigenpairs(&a_full, &b_full, nroots)
+                };
+                if let Some(pairs) = lr_pairs {
+                    pairs
+                } else {
+                    // TDA (or LR with A−B not positive-definite): diagonalize A only.
+                    let mut a = a_full;
+                    let (eigvecs_opt, eigvals, _info) = rest_tensors::matrix::matrix_blas_lapack::_dsyev(&a, 'V');
+                    let eigvecs = eigvecs_opt.expect("dsyev failed");
+                    let mut pairs: Vec<(f64, Vec<f64>)> = eigvals.iter()
+                        .zip(eigvecs.iter_columns_full())
+                        .map(|(e, v)| (*e, v.to_vec()))
+                        .collect();
+                    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    pairs.truncate(nroots.min(dim));
+                    pairs
                 }
             }
-        }
-    };
+            SolverKind::Davidson => {
+                // Layered by mode, then by method: AO/MO owns the matvec family,
+                // TDA/LR is the inner branch. (FEAST and the dense paths are
+                // outer special cases.)
+                let mode = data.borrow().mode;
+                match mode {
+                    TDDFTMode::AO => {
+                        if is_tda {
+                            println!("Solving TDA eigenvalue problem (AO-mode batched matvec)...");
+                            davidson_solver::tda_davidson_solver_batched(
+                                |z_block: &MatrixFull<f64>| {
+                                    matvec_ao::a_matvec_ao_batched(scf_ref, &mut *data.borrow_mut(), z_block, xlet)
+                                },
+                                nroots,
+                                &hdiag,
+                                initial_guess.clone(),
+                                &davidson_cfg,
+                            )
+                        } else {
+                            println!("Solving full linear response eigenvalue problem (AO-mode batched matvec)...");
+                            davidson_solver::lr_davidson_solver_batched(
+                                |z_block: &MatrixFull<f64>| {
+                                    matvec_ao::a_matvec_ao_batched(scf_ref, &mut *data.borrow_mut(), z_block, xlet)
+                                },
+                                |z_block: &MatrixFull<f64>| {
+                                    matvec_ao::b_matvec_ao_batched(scf_ref, &mut *data.borrow_mut(), z_block, xlet)
+                                },
+                                nroots,
+                                &hdiag,
+                                initial_guess.clone(),
+                                &davidson_cfg,
+                            )
+                        }
+                    }
+                    TDDFTMode::MO => {
+                        if is_tda {
+                            println!("Solving TDA eigenvalue problem...");
+                            davidson_solver::tda_davidson_solver(
+                                |z: &Vec<f64>| a_apply(z),
+                                nroots,
+                                &hdiag,
+                                initial_guess.clone(),
+                                &davidson_cfg,
+                            )
+                        } else {
+                            println!("Solving full linear response eigenvalue problem...");
+                            davidson_solver::lr_davidson_solver(|z: &Vec<f64>| a_apply(z),
+                                |z: &Vec<f64>| b_apply(z),
+                                nroots,
+                                &hdiag,
+                                initial_guess.clone(),
+                                &davidson_cfg,
+                            )
+                        }
+                    }
+                }
+            }
+        };
 
         // ═══ Step 9: Compute and print results (BSE-compatible format) ═══
         // Report the kernel-step timing attribution (debug level), per mode.
