@@ -711,6 +711,7 @@ pub fn gen_atom_grids_for_isdf(mol:&Molecule) -> Vec<dftgrids>{
             pruning.clone(),
             rad_grid_method.clone(),
             grid_gen_level,
+            gen_grids::RadiiAdjust::from_str(&mol.ctrl.radii_adjust),
             true,
         );
 

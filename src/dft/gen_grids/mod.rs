@@ -22,6 +22,7 @@ pub mod prune;
 
 pub use self::atom::atom_grid;
 pub(crate) use self::atom::atom_grid_with_isdf;
+pub use self::becke_partitioning::RadiiAdjust;
 pub use self::atom::atom_grid_bse;
 pub use self::lebedev::angular_grid;
 pub use self::radial::radial_grid_kk;

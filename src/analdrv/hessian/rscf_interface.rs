@@ -2,6 +2,7 @@ use crate::analdrv::prelude::*;
 use crate::analdrv::response::rresp_interface::{scf_jk_factors, scf_xc_func_list};
 use crate::analdrv::vibration::vib::*;
 use crate::analdrv::vibration::vib_interface::*;
+use crate::dft::gen_grids::RadiiAdjust;
 use crate::dft::numint_matmul::nimatmul::{regroup_grids_by_atom, NIMatmul};
 use crate::dft::Grids;
 use crate::dft::xceff::prelude::{determine_den_type_from_list, XCDenType};
@@ -217,5 +218,8 @@ fn scf_skeleton_nimatmul<'a>(scf_data: &'a SCF, cfg: &AnalDrvNucgradCfg) -> Opti
     };
     let (coordinates, weights, atm_idx, quadrature_weights) =
         regroup_grids_by_atom(coordinates, weights, atm_idx, quadrature_weights, mol.natm());
-    Some(NIMatmul::new(&mol, &coordinates, &weights, &atm_idx, &quadrature_weights))
+    // the Becke grid-shift terms of the hessian rebuild the partition from the atomic radii, so
+    // the driver must know the radii adjustment scheme the grid was generated with
+    let radii_adjust = RadiiAdjust::from_str(&scf_data.mol.ctrl.radii_adjust);
+    Some(NIMatmul::new(&mol, &coordinates, &weights, &atm_idx, &quadrature_weights).with_radii_adjust(radii_adjust))
 }
