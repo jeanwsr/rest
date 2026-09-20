@@ -383,8 +383,8 @@ pub fn parse_tddft_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Opti
                 _ => 3,
             };
             p.stability_tol = match tmp_ctrl.get("stability_tol").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-4),
-                _ => 1.0e-4,
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e-8),
+                _ => 1.0e-8,
             };
             p.pysoc = match tmp_ctrl.get("pysoc").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(b) => *b,

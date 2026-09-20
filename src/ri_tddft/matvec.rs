@@ -386,14 +386,15 @@ pub fn b_matvec(
         1.0
     } else if xlet == 'S' { 2.0 } else if xlet == 'R' { 1.0 } else { 0.0 };
 
-    // fxc (see a_matvec).
+    // fxc (see a_matvec): absent tables (HF reference) contribute zero.
     let t_fxc = Instant::now();
     let fxc_parts: Vec<Vec<f64>> = if let Some(fxc_u) = data.fxc_u.as_ref() {
         let (fa, fb) = fxc_matvec_unrestricted(fxc_u, z);
         vec![fa, fb]
-    } else {
-        let fxc_data = data.fxc.as_ref().expect("MO mode requires fxc data");
+    } else if let Some(fxc_data) = data.fxc.as_ref() {
         vec![fxc_matvec(fxc_data, &z[..dims[0]])]
+    } else {
+        dims.iter().map(|&d| vec![0.0; d]).collect()
     };
     add_ns(&T_MV_FXC, t_fxc);
 

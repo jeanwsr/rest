@@ -10,11 +10,9 @@ use crate::scf_io::{SCF, SCFType};
 ///
 /// Returns (start_mo, num_state, occ_size, vir_size, homo, lumo)
 ///
-/// Automatically freezes core orbitals based on a simple energy heuristic:
-/// orbitals with eigenvalue < FROZEN_CORE_THRESHOLD (in Hartree) are frozen.
-/// This prevents unphysical core→virtual transitions from polluting the
-/// TDDFT excitation space, which would cause convergence issues in the
-/// Davidson solver.
+/// Core orbitals are NOT frozen automatically: the active space starts at
+/// `mol.start_mo` (default 0, i.e. all occupied orbitals), matching PySCF's
+/// TDDFT default. Core freezing can be requested explicitly via the input.
 pub fn tddft_occupation_parameters(scf: &SCF) -> (usize, usize, usize, usize, usize, usize) {
     let cutoff = scf.mol.ctrl.tddft.as_ref()
         .map(|c| c.tddft_cutoff_energy)
@@ -82,9 +80,10 @@ pub fn tddft_sector_params(scf: &SCF) -> Vec<TddftSector> {
 
 /// Per-spin TDDFT orbital parameters (unrestricted reference).
 ///
-/// Mirrors [`tddft_occupation_parameters`] but resolves frozen-core and
-/// virtual-cutoff windows independently on each spin channel's eigenvalues,
-/// instead of mixing `homo = max` / `lumo = min` across spins.
+/// Mirrors [`tddft_occupation_parameters`]: core orbitals are NOT frozen
+/// automatically (active space starts at `mol.start_mo`), and the
+/// virtual-cutoff window is resolved independently on each spin channel's
+/// eigenvalues instead of mixing `homo = max` / `lumo = min` across spins.
 /// Returns `[alpha_sector, beta_sector]`; a sector with no occupied orbitals
 /// (e.g. an empty beta channel) yields `occ_size == 0` (`dim() == 0`).
 pub fn tddft_occupation_parameters_u(scf: &SCF) -> [TddftSector; 2] {
@@ -99,13 +98,7 @@ pub fn tddft_occupation_parameters_u(scf: &SCF) -> [TddftSector; 2] {
         let homo = scf.homo[i_spin];
         let lumo = scf.lumo[i_spin];
         let mut num_state = scf.mol.num_state;
-        // Auto-detect frozen core (same heuristic/threshold as the restricted path).
-        const FROZEN_CORE_THRESHOLD: f64 = -2.0; // Ha
-        let start_mo = (scf.mol.start_mo..=homo)
-            .take_while(|&i| ks[i] < FROZEN_CORE_THRESHOLD)
-            .last()
-            .map(|i| i + 1)
-            .unwrap_or(scf.mol.start_mo);
+        let start_mo = scf.mol.start_mo;
         // Guard degenerate channels: an EMPTY spin channel carries the
         // homo=0 sentinel (scf_io/occupation.rs), indistinguishable from a
         // real 1-electron HOMO — disambiguate via the electron count.
