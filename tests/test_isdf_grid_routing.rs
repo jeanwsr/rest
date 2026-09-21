@@ -184,6 +184,7 @@ fn public_atom_grid_keeps_generated_source_for_every_pruning_mode() {
                     pruning.to_owned(),
                     "treutler".to_owned(),
                     0,
+                    gen_grids::RadiiAdjust::Becke,
                 );
                 let grid = Grids::build_with_level(&mol, 0);
                 assert_source(&grid, false);
