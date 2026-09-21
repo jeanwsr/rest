@@ -20,6 +20,7 @@ pub mod pure_ao2mo;
 pub mod pure_decompose;
 pub mod pure_direct;
 pub mod pure_incore;
+pub mod pure_schwartz_rij;
 
 // integrated functions
 //
@@ -28,10 +29,17 @@ pub mod ao2mo;
 pub mod decompose;
 pub mod direct;
 pub mod incore;
+pub mod schwartz_rij;
 
 // hessian implementations
 pub mod hess_r;
 pub mod hess_u;
+
+// response implementations
+pub mod resp_r;
+
+// generalized fock implementations
+pub mod gfock_r;
 
 // exports
 pub use ao2mo::*;
@@ -42,3 +50,5 @@ pub use pure_ao2mo::*;
 pub use pure_decompose::*;
 pub use pure_direct::*;
 pub use pure_incore::*;
+pub use pure_schwartz_rij::*;
+pub use schwartz_rij::*;

@@ -11,7 +11,7 @@ use rest_tensors::MatrixFull;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, _dsolve};
 use crate::scf_io::SCF;
 use crate::ri_tddft::utils::tddft_occupation_parameters;
-use crate::dft::response::{gen_vind_opt, gen_vind_opt_batched, VindWorkspace, FxcHessianCache};
+use crate::dft::response::{gen_vind_opt, gen_vind_opt_batched, VindWorkspace, FxcHessianCache, KLowRankPrecompute};
 use crate::solvers::krylov::{self, KrylovConfig};
 
 /// Solves (I + G̃)U = -(h1 - s1·e_i)·e_ai  in (nmo, nocc) space.
@@ -431,12 +431,15 @@ impl CPHFSolverPySCF {
         scf: &SCF,
         fxc_cache: Option<&FxcHessianCache>,
         z_vo_batch: &[&[f64]],
+        k_lowrank: Option<&KLowRankPrecompute>,
     ) -> Vec<Vec<f64>> {
+        let _tmv = std::time::Instant::now();
         let n_rhs = z_vo_batch.len();
         // Direct batched response: z_vo_batch is already in the (nvir*nocc)
-        // layout expected by gen_vind_opt_batched. OO/FO are zero (None).
+        // layout expected by gen_vind_opt_batched. OO/FO are zero (None); the
+        // low-rank K path is used when the precomputation is available.
         let resp_full_batch = gen_vind_opt_batched(
-            scf, &self.ws, z_vo_batch, fxc_cache, None, None,
+            scf, &self.ws, z_vo_batch, fxc_cache, None, None, k_lowrank,
         );
 
         // Each resp_full is laid out as [frozen_resp(fo_size), VO_resp(dim)].
@@ -452,6 +455,9 @@ impl CPHFSolverPySCF {
                 g_vo[k] = resp_full[fo_size + k] * self.e_ai[k];
             }
             g_vo_batch.push(g_vo);
+        }
+        if std::env::var("REST_CPHF_PROFILE").is_ok() {
+            eprintln!("CPHF-PROF matvec n={} {:.3}s", n_rhs, _tmv.elapsed().as_secs_f64());
         }
         g_vo_batch
     }
@@ -490,8 +496,31 @@ impl CPHFSolverPySCF {
             || std::env::var("REST_CPHF_KRYLOV_DEBUG").is_ok()
             || scf.mol.ctrl.print_level >= 1;
 
+        // Low-rank exchange-response precomputation (ground-state, built once
+        // per solve; None if no RI tensor or not applicable).
+        //
+        // Skipped for pure (LDA/GGA) DFAs: `k_scaling` is 0 there, so the
+        // matvec never consumes it, yet building it costs `naux` symmetric
+        // 3-index transforms and keeps `k/n/m/l_batch` resident (153 MB for
+        // naphthalene/def2-svp-rifit).  The matvec's K branch is already
+        // guarded by `k_scaling != 0.0`, so nothing else changes.
+        let _t_kl = std::time::Instant::now();
+        let is_hf_k = scf.mol.xc_data.dfa_compnt_scf.is_empty();
+        let hyb_k = if is_hf_k { 1.0 } else { scf.mol.xc_data.dfa_hybrid_scf };
+        let k_lowrank = if hyb_k != 0.0 {
+            KLowRankPrecompute::new(scf, &self.ws)
+        } else {
+            None
+        };
+        if std::env::var("REST_MEM_TRACE").is_ok() {
+            eprintln!("MEMTRACE cphf-lowrank-built RSS = {:.1} MiB", crate::hessian::memory_monitor::current_rss_mb());
+        }
+        if profile {
+            eprintln!("CPHF-PROF lowrank-build {:.3}s", _t_kl.elapsed().as_secs_f64());
+        }
+
         let mut matvec = |zs: &[&[f64]]| -> Vec<Vec<f64>> {
-            self.matvec_vo_batched(scf, fxc_cache, zs)
+            self.matvec_vo_batched(scf, fxc_cache, zs, k_lowrank.as_ref())
         };
 
         let config = KrylovConfig {
@@ -507,7 +536,6 @@ impl CPHFSolverPySCF {
         if profile {
             println!("    krylov_batched: n_rhs={}", rhs_all.len());
         }
-
         u_vo
     }
 }

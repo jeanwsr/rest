@@ -122,6 +122,7 @@ pub enum JobType {
     NumDipole,
     GeomOpt,
     NormalModes,
+    MD,
 }
 
 /// Whether to use the distributed (ScaLAPACK) solver for diagonalizing the
@@ -189,6 +190,9 @@ pub struct InputKeywords {
     // Keywords for IDSF
     #[pyo3(get, set)]
     pub use_isdf: bool,
+    /// ISDF interpolation-points multiplier k; `None` uses the Rust/PyO3 estimator.
+    #[pyo3(get, set)]
+    pub isdf_k: Option<usize>,
     #[pyo3(get, set)]
     pub isdf_k_only: bool,
     #[pyo3(get, set)]
@@ -196,6 +200,12 @@ pub struct InputKeywords {
     // Keywords for systems
     #[pyo3(get, set)]
     pub isdf_new: bool,
+    /// ISDF interpolation-point generation scheme: "udd" (density-driven) or "cvt".
+    #[pyo3(get, set)]
+    pub isdf_type: String,
+    /// Control input file name used by the ISDF k auto-estimation script.
+    #[pyo3(get, set)]
+    pub ctrl_file: String,
     #[pyo3(get, set)]
     pub eri_type: String,
     #[pyo3(get, set)]
@@ -249,6 +259,11 @@ pub struct InputKeywords {
     pub rad_grid_method: String,
     #[pyo3(get, set)]
     pub external_grids: String,
+    /// Becke radii adjustment used by the grid partitioning: `"becke"` keeps the raw Bragg radii
+    /// (Becke 1988, REST historical behaviour), `"treutler"` uses their square roots
+    /// (Treutler-Ahlrichs 1995, the PySCF/PyFock convention).
+    #[pyo3(get, set)]
+    pub radii_adjust: String,
     // Keywords for the scf procedures
     #[pyo3(get, set)]
     pub mixer: String,
@@ -373,6 +388,9 @@ pub struct InputKeywords {
     /// This option is only for single-node computation, and only works in some cases where algorithm awares memory usage and perform batched computation.
     /// For multi-node (MPI), this keyword is not fully discussed.
     pub max_memory: Option<f64>,
+    /// Back up of max_memory for the ISDF new driver (restored after ISDF preparation).
+    #[pyo3(get, set)]
+    pub max_memory_backup: Option<f64>,
     /// Abort the calculation when memory usage exceeds max_memory.
     pub abort_on_mem_exceed: bool,
     pub smear: Option<SmearingType>,
@@ -404,6 +422,7 @@ pub struct InputKeywords {
     pub xc_parser: String,
     pub tddft: Option<TDDFTParameters>,
     pub j2c_decomp: J2CDecompOption,
+    pub ri_jk: RIJKOption,
     /// Whether to use the distributed (ScaLAPACK) Hamiltonian diagonalization
     /// in MPI runs. `Auto` (default) decides by problem size; `On` forces the
     /// distributed solver; `Off` forces the serial one.
@@ -453,9 +472,12 @@ impl InputKeywords {
             numerical_force: false,
             use_isdf: false,
             ri_k_only: false,
+            isdf_k: None,
             isdf_k_only: false,
             isdf_k_mu: 17,
             isdf_new: false,
+            isdf_type: String::from("udd"),
+            ctrl_file: String::from("ctrl.in"),
             // Keywords associated with the method employed
             xc: String::from("x3lyp"),
             xc_type: DFTType::Standard,
@@ -491,6 +513,7 @@ impl InputKeywords {
             pruning: String::from("nwchem"),
             rad_grid_method: String::from("treutler"),
             external_grids: "none".to_string(),
+            radii_adjust: String::from("becke"),
             // ETB for autogen the auxbasis
             even_tempered_basis: false,
             etb_start_atom_number: 37,
@@ -557,6 +580,7 @@ impl InputKeywords {
             force_state_occupation: Vec::new(),
             rpa_de_excitation_parameters: None,
             max_memory: None,
+            max_memory_backup: None,
             abort_on_mem_exceed: true,
             smear: None,
             smear_sigma: None,
@@ -586,6 +610,7 @@ impl InputKeywords {
             stop_at: None,
             xc_parser: String::from("legacy"),
             j2c_decomp: J2CDecompOption::default(),
+            ri_jk: RIJKOption::default(),
             hamiltonian_distributed: HamiltonianDistributedMode::default(),
             rpa_distributed: HamiltonianDistributedMode::default(),
             ri_pt2: RiPt2Option::default(),
@@ -638,6 +663,9 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         },
         JobType::NormalModes => {
             println!("Calculation type: Vibrational normal modes (frequency) calculation");
+        },
+        JobType::MD => {
+            println!("Calculation type: Molecular dynamics (MD) simulation");
         },
     }
 
@@ -790,6 +818,7 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
     };
     debug!("The pruning method is {}", ctrl.pruning);
     debug!("The radial grid generation method is {}", ctrl.rad_grid_method);
+    debug!("The Becke radii adjustment scheme is {}", ctrl.radii_adjust);
     debug!("min_num_angular_points: {}", ctrl.min_num_angular_points);
     debug!("max_num_angular_points: {}", ctrl.max_num_angular_points);
     debug!("hardness: {}", ctrl.hardness);
@@ -924,6 +953,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
             //if tmp_input.print_level>0 {println!("The radial grid generation method will be {}", tmp_input.rad_grid_method)};
 
+            tmp_input.radii_adjust = match tmp_ctrl.get("radii_adjust").unwrap_or(&serde_json::Value::Null){
+                serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
+                other => {String::from("becke")} // default: raw Bragg radii (REST historical behaviour)
+            };
+            //if tmp_input.print_level>0 {println!("The Becke radii adjustment will be {}", tmp_input.radii_adjust)};
+
             tmp_input.eri_type = match tmp_ctrl.get("eri_type").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_eri) => {
                     if tmp_eri.to_lowercase().eq("ri_v") || tmp_eri.to_lowercase().eq("ri-v")
@@ -950,6 +985,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 //====================================================
                 tmp_input.use_auxbas = true;
                 tmp_input.use_isdf = true;
+            }else if eri_type.eq(&String::from("isdf")) {
+                // density-driven ISDF (like old version): isdf_new = true
+                tmp_input.use_auxbas = true;
+                tmp_input.use_isdf = true;
+                tmp_input.isdf_new = true;
+                tmp_input.eri_type = String::from("ri_v");
             }else if eri_type.eq(&String::from("isdf_k_new")){
                     tmp_input.use_auxbas = true;
                     tmp_input.use_isdf = true;
@@ -985,6 +1026,26 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
                 other => {8_usize},
             };            
+
+            tmp_input.isdf_type = match tmp_ctrl.get("isdf_type").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
+                other => {String::from("udd")},
+            };
+
+            tmp_input.isdf_k = match tmp_ctrl.get("isdf_k").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => {
+                    let lower = s.to_lowercase();
+                    if lower == "none" {
+                        None
+                    } else {
+                        lower.parse::<usize>().ok()
+                    }
+                }
+                serde_json::Value::Number(n) => {
+                    n.as_u64().and_then(|v: u64| v.try_into().ok())
+                }
+                _ => None,
+            };
 
             tmp_input.auxbas_type = match tmp_ctrl.get("auxbas_type").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
@@ -1034,6 +1095,9 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     } else if tmp_xc_low.eq("normal_modes") || tmp_xc_low.eq("freq") ||
                       tmp_xc_low.eq("frequency") || tmp_xc_low.eq("vibration") {
                         JobType::NormalModes
+                    } else if tmp_xc_low.eq("md") || tmp_xc_low.eq("molecular dynamics") ||
+                      tmp_xc_low.eq("molecular_dynamics") {
+                        JobType::MD
                     } else {
                         JobType::SinglePoint
                     }
@@ -1578,6 +1642,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.algorithm_j = tmp_ctrl.get("algorithm_j").map(serde_from_value).unwrap_or_default();
             tmp_input.algorithm_k = tmp_ctrl.get("algorithm_k").map(serde_from_value).unwrap_or_default();
             tmp_input.j2c_decomp = tmp_ctrl.get("j2c_decomp").map(serde_from_value).unwrap_or_default();
+            tmp_input.ri_jk = tmp_ctrl.get("ri_jk").map(serde_from_value).unwrap_or_default();
             tmp_input.hamiltonian_distributed = tmp_ctrl.get("hamiltonian_distributed").map(serde_from_value).unwrap_or_default();
             tmp_input.rpa_distributed = tmp_ctrl.get("rpa_distributed").map(serde_from_value).unwrap_or_default();
             if (tmp_input.algorithm_j != AlgorithmJ::Default || tmp_input.algorithm_k != AlgorithmK::Default) {

@@ -3,11 +3,13 @@
 //! Though saying "naive", it should be sufficiently good for dense GTO grids - basis pairs (small systems).
 //! For large molecules, we do not exploit sparsity here for code simplicity.
 
+pub mod gfock_rks;
 pub mod hess_rks;
 pub mod hess_uks;
 pub mod nimatmul;
 pub mod pure_eval_rho;
 pub mod pure_xcpot;
+pub mod resp_rks;
 
 #[allow(unused)]
 pub mod prelude {
@@ -25,6 +27,7 @@ pub mod prelude {
     pub(super) use super::nimatmul::*;
     pub(super) use super::pure_eval_rho::*;
     pub(super) use super::pure_xcpot::*;
+    pub(super) use crate::dft::gen_grids::RadiiAdjust;
     pub(super) use crate::dft::xceff::prelude::*;
     pub(super) use crate::ni_check_shape;
     pub(super) use crate::ri_jk::util::get_dm0_restricted;

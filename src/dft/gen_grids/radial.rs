@@ -413,7 +413,11 @@ pub fn radial_grid_becke(n: usize, charge: usize) -> (Vec<f64>, Vec<f64>) {
     let (mut t, mut w) = chebgauss_polynomial(n);
     
     let r = t.iter().map(|item| (1.0+item)/(1.0-item)*rm).collect();
-    w.iter_mut().zip(t.iter()).for_each(|(w,t)| *w *= 2.0/(1.0-t).powf(2.0)*rm);
+    // Gauss-Chebyshev quadrature of the first kind over x in (-1,1):
+    //   int_{-1}^1 g(x) dx ~= (pi/n) * sum_i g(x_i) * sqrt(1-x_i^2).
+    // r(x) = rm (1+x)/(1-x), dr/dx = rm * 2/(1-x)^2, hence the weight is
+    //   w_i = (pi/n) * dr/dx * sqrt(1-x_i^2).
+    w.iter_mut().zip(t.iter()).for_each(|(w,t)| *w *= 2.0/(1.0-t).powf(2.0)*rm*(1.0-t*t).sqrt());
     //println!("r = {:?}, w = {:?}", &r, &w);
     (r,w)
 

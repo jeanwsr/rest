@@ -1,6 +1,6 @@
-//! Utility trait for Hessian computation.
+//! Utility trait for analytical derivative module.
 
-pub trait HessUtilAPI {
+pub trait AnalDrvBaseAPI {
     /// Get the type name of the implementor.
     ///
     /// The full type name is too verbose. We will use the short type name for display usage.

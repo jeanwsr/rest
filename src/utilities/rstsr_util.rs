@@ -176,4 +176,13 @@ pub fn fingerprint_f64(tsr: TsrView<f64>) -> f64 {
         .reduce(|| 0.0_f64, |a, b| a + b)
 }
 
+/// Check if two tensors are exactly identical (shape and value).
+///
+/// This function is used for the cache-invalidation checks of `make_`-style cached evaluations:
+/// the cached result is reused only when the new inputs match the ones the cache was evaluated
+/// with.
+pub fn is_same_tensor(a: TsrView, b: TsrView) -> bool {
+    a.shape() == b.shape() && rt::allclose(&a, &b, (0.0, 0.0))
+}
+
 /* #endregion */

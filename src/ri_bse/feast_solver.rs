@@ -122,28 +122,51 @@ fn gauss_legendre_nodes(n: usize) -> Vec<(f64, f64)> {
 // Section 1: CG Solver — standard Conjugate Gradient
 // ============================================================================
 
-/// Solve A * x = b using CG, where A is an SPD matrix accessed
-/// through the closure `a_mul`.  Returns the solution vector x.
+/// Solve A * x = b using preconditioned CG, where A is an SPD matrix
+/// accessed through the closure `a_mul`.  Returns the solution vector x.
+///
+/// If `precond_diag` is provided, a diagonal (Jacobi) preconditioner
+/// `M = diag(precond_diag)` is applied to the residual.  The diagonal
+/// entries must be positive for the preconditioner to be SPD; non-positive
+/// entries fall back to 1.0 (no preconditioning for that component).
 pub fn cg(
     a_mul: impl Fn(&Vec<f64>) -> Vec<f64>,
     b: &Vec<f64>,
     max_iter: usize,
     tol: f64,
+    precond_diag: Option<&Vec<f64>>,
 ) -> Vec<f64> {
     let n = b.len();
+
+    // Precompute the inverse diagonal once per solve.
+    let inv_diag: Option<Vec<f64>> = precond_diag.map(|diag| {
+        diag.iter()
+            .map(|&d| if d > 1e-30 { 1.0 / d } else { 1.0 })
+            .collect()
+    });
+
+    // Apply M^{-1} to a residual vector.
+    let precond = |r: &Vec<f64>| -> Vec<f64> {
+        match &inv_diag {
+            Some(inv) => r.iter().zip(inv).map(|(&ri, &idi)| ri * idi).collect(),
+            None => r.clone(),
+        }
+    };
+
     let mut x = vec![0.0; n];
     let ax = a_mul(&x);
     let mut r: Vec<f64> = b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect();
-    let mut p = r.clone();
-    let mut r_dot_r: f64 = r.iter().map(|ri| ri * ri).sum();
+    let z = precond(&r);
+    let mut p = z;
+    let mut r_dot_z: f64 = r.iter().zip(&p).map(|(ri, zi)| ri * zi).sum();
 
-    for iter in 0..max_iter {
+    for _iter in 0..max_iter {
         let ap = a_mul(&p);
         let p_dot_ap: f64 = p.iter().zip(&ap).map(|(pi, api)| pi * api).sum();
-        if p_dot_ap.abs() < 1e-30 {
+        if p_dot_ap.abs() < 1e-30 || r_dot_z.abs() < 1e-30 {
             break;
         }
-        let alpha = r_dot_r / p_dot_ap;
+        let alpha = r_dot_z / p_dot_ap;
         for i in 0..n {
             x[i] += alpha * p[i];
         }
@@ -152,13 +175,14 @@ pub fn cg(
         if residual < tol {
             break;
         }
-        let r_new_dot_r_new: f64 = r_new.iter().map(|ri| ri * ri).sum();
-        let beta = r_new_dot_r_new / r_dot_r;
+        let z_new = precond(&r_new);
+        let r_new_dot_z_new: f64 = r_new.iter().zip(&z_new).map(|(ri, zi)| ri * zi).sum();
+        let beta = r_new_dot_z_new / r_dot_z;
         for i in 0..n {
-            p[i] = r_new[i] + beta * p[i];
+            p[i] = z_new[i] + beta * p[i];
         }
         r = r_new;
-        r_dot_r = r_new_dot_r_new;
+        r_dot_z = r_new_dot_z_new;
     }
     x
 }
@@ -1177,6 +1201,105 @@ fn extract_eigenpairs(
 // Section 4: BSE-specific FEAST solver entry points
 // ============================================================================
 
+/// Reconstruct a Davidson-style `[X; Y]` eigenvector (length 2n) from a FEAST
+/// non-TDA X-block eigenvector.
+///
+/// FEAST's non-TDA path solves the squared Hermitian problem
+///   (A−B)·(A+B)⁻¹·u = ω²·u        (GEP: operator = (A−B), metric = (A+B)⁻¹)
+/// whose eigenvector is `u = X+Y` (length n = occ·vir). From the BSE identity
+///   (A−B)(X+Y) = ω·(X−Y)
+/// we recover
+///   X = (u + (A−B)u / ω) / 2
+///   Y = (u − (A−B)u / ω) / 2
+/// and return them stacked as `[X ; Y]` (length 2n), matching the layout of
+/// `lr_davidson_solver` so that `export_pysoc_json`, `dipoles::normalize`, etc.
+/// work unchanged.
+///
+/// # Arguments
+/// * `xpy_block` - the FEAST eigenvector `u = X+Y` (length n)
+/// * `amb_xpy`   - `(A−B)·xpy_block`, i.e. `ω·(X−Y)` (length n); caller computes
+///                 this with whatever RI integrals are currently in scope
+/// * `omega`     - the excitation energy ω (> 0)
+fn reconstruct_xy_from_xpy(xpy_block: &[f64], amb_xpy: &[f64], omega: f64) -> Vec<f64> {
+    debug_assert_eq!(xpy_block.len(), amb_xpy.len());
+    let n = xpy_block.len();
+    let mut full = vec![0.0; 2 * n];
+    for i in 0..n {
+        let x = (xpy_block[i] + amb_xpy[i] / omega) * 0.5;
+        let y = (xpy_block[i] - amb_xpy[i] / omega) * 0.5;
+        full[i] = x;
+        full[n + i] = y;
+    }
+    full
+}
+
+/// Reconstruct FEAST non-TDA eigenpairs into Davidson-style `[X;Y]` layout.
+///
+/// FEAST non-TDA returns eigenvectors that are length `n = occ·vir` and live in
+/// the "X+Y space" (the squared-problem eigenvector `u = X+Y`, recovered as
+/// `(A−B)u/ω + u = 2X` by `feast_solve_bse_nontda`). Downstream consumers
+/// (`export_pysoc_json`, `dipoles::normalize(_, false)`, `leading_components`)
+/// expect the Davidson `[X;Y]` layout (length 2n). This helper applies the BSE
+/// identity `(A−B)(X+Y) = ω(X−Y)` to rebuild `[X;Y]` for every eigenpair.
+///
+/// Builds the (A−B) matvec from the regular RI integrals (mirrors
+/// `feast_solve_bse_nontda`'s construction). `qp_ctrl.bse_spin` selects the
+/// spin channel.
+fn reconstruct_nontda_pairs_to_xy(
+    scf_data: &SCF,
+    qp_ctrl: &QuasiParticle,
+    eigenpairs: Vec<(f64, Vec<f64>)>,
+    occ_size: usize,
+    vir_size: usize,
+) -> Vec<(f64, Vec<f64>)> {
+    if eigenpairs.is_empty() {
+        return eigenpairs;
+    }
+    let ks_energies: Vec<f64> = scf_data.eigenvalues[0].clone();
+    let epsilon: Vec<f64> = if qp_ctrl.bse_qp_polarization {
+        scf_data.gwqp.0.clone()
+    } else {
+        ks_energies
+    };
+    let inverse_dielectric = construct_inverse_dielectric(scf_data, &epsilon);
+    let num_auxbas = inverse_dielectric.size[0];
+
+    let ri_oo = get_submatrix(scf_data, 'O', 'O', 'N');
+    let mut ri_oo_tilde = MatrixFull::new(ri_oo.size, 0.0);
+    _dgemm_full(&inverse_dielectric, 'N', &ri_oo, 'N', &mut ri_oo_tilde, 1.0, 0.0);
+    drop(ri_oo);
+    ri_oo_tilde.reshape([num_auxbas * occ_size, occ_size]);
+    ri_oo_tilde = ri_oo_tilde.transpose_and_drop();
+    ri_oo_tilde.reshape([occ_size * num_auxbas, occ_size]);
+
+    let ri_ov = get_submatrix(scf_data, 'O', 'V', 'N');
+    let mut ri_vv = get_submatrix(scf_data, 'V', 'V', 'N');
+    ri_vv.reshape([num_auxbas * vir_size, vir_size]);
+
+    let mut ri_ov_tilde = MatrixFull::new(ri_ov.size, 0.0);
+    _dgemm_full(&inverse_dielectric, 'N', &ri_ov, 'N', &mut ri_ov_tilde, 1.0, 0.0);
+    ri_ov_tilde.reshape([num_auxbas * occ_size, vir_size]);
+
+    let mut ri_ov_b = ri_ov.clone();
+    ri_ov_b.reshape([num_auxbas * occ_size, vir_size]);
+
+    // (A−B) matvec closure
+    let amb_matvec = |z: &Vec<f64>| -> Vec<f64> {
+        let a = matvec::a_block_matvec(scf_data, qp_ctrl, &ri_vv, &ri_ov, &ri_oo_tilde, z);
+        let b = matvec::b_block_matvec(scf_data, qp_ctrl, &ri_ov, &ri_ov_b, &ri_ov_tilde, z);
+        a.into_iter().zip(b.into_iter()).map(|(ai, bi)| ai - bi).collect()
+    };
+
+    eigenpairs
+        .into_iter()
+        .map(|(omega, vec)| {
+            let amb = amb_matvec(&vec);                  // (A−B)(X+Y) = ω(X−Y)
+            let xy = reconstruct_xy_from_xpy(&vec, &amb, omega);  // [X;Y], length 2n
+            (omega, xy)
+        })
+        .collect()
+}
+
 /// Build s-only matvec closures and diag for use as inner GMRES preconditioner.
 /// Must be called while `ri3fn_bse`/`rimatr_bse` are still populated (before clearing).
 /// Returns (a_mul, b_mul, diag) where a_mul/b_mul are `Box<dyn Fn>` closures
@@ -1291,6 +1414,7 @@ fn print_ritz_eigenpairs(
     occ_size: usize,
     vir_size: usize,
 ) {
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let dipole_matrix = super::dipoles::compute_dipole_matrix(scf_data);
     let k = ritz_eigenvalues.len();
     println!("Rayleigh-Ritz {}: {} excitations within the window:", label, k);
@@ -1301,7 +1425,7 @@ fn print_ritz_eigenpairs(
                  vec.iter().map(|x| x*x).sum::<f64>().sqrt());
         println!("Transition Dipole Square:{}; Oscillator Strength:{}",
                  dipole_square, dipole_square * e * 2.0 / 3.0);
-        super::leading_components(&v, occ_size, vir_size);
+        super::leading_components(&v, occ_size, vir_size,qp_ctrl.print_nto);
     }
 }
 
@@ -1330,7 +1454,13 @@ fn rayleigh_ritz_refine(
     };
     let inverse_dielectric = construct_inverse_dielectric(scf_data, &epsilon);
 
-    // Build full A-matrix matvec closure (same pattern as feast_solve_bse_tda)
+    // Build full A-matrix matvec closure (same pattern as feast_solve_bse_tda).
+    //
+    // For non-TDA the squared-form operator is (A-B) with metric (A+B)^{-1},
+    // mirroring feast_solve_bse_nontda; the Round-1 FEAST eigenvectors are
+    // X+Y vectors that are orthonormal in the (A+B)^{-1} metric (NOT in L2).
+    // The old code used the A-block operator with an L2 metric, which made the
+    // projected Gram matrix indefinite → Cholesky failed → empty result → panic.
     let num_auxbas = inverse_dielectric.size[0];
     let ri_ov = get_submatrix(scf_data, 'O', 'V', 'N');
     let mut ri_vv = get_submatrix(scf_data, 'V', 'V', 'N');
@@ -1343,9 +1473,25 @@ fn rayleigh_ritz_refine(
     ri_oo_tilde.reshape([occ_size * num_auxbas, occ_size]);
     ri_vv.reshape([num_auxbas * vir_size, vir_size]);
 
+    // For non-TDA also need the B-block integrals (mirrors feast_solve_bse_nontda).
+    // Built unconditionally so the same closures can be reused below; cheap.
+    let mut ri_ov_b = ri_ov.clone();
+    ri_ov_b.reshape([num_auxbas * occ_size, vir_size]);
+    let mut ri_ov_tilde = MatrixFull::new(ri_ov.size, 0.0);
+    _dgemm_full(&inverse_dielectric, 'N', &ri_ov, 'N', &mut ri_ov_tilde, 1.0, 0.0);
+    ri_ov_tilde.reshape([num_auxbas * occ_size, vir_size]);
+
+    // TDA operator = A; non-TDA operator = (A-B).  Both are borrowing closures so the
+    // integral matrices stay usable for the metric construction further below.
     let a_matvec = |z: &Vec<f64>| -> Vec<f64> {
         matvec::a_block_matvec(scf_data, qp_ctrl, &ri_vv, &ri_ov, &ri_oo_tilde, z)
     };
+    let amb_matvec = |z: &Vec<f64>| -> Vec<f64> {
+        let a = matvec::a_block_matvec(scf_data, qp_ctrl, &ri_vv, &ri_ov, &ri_oo_tilde, z);
+        let b = matvec::b_block_matvec(scf_data, qp_ctrl, &ri_ov, &ri_ov_b, &ri_ov_tilde, z);
+        a.into_iter().zip(b.into_iter()).map(|(ai, bi)| ai - bi).collect()
+    };
+    let op_matvec: &dyn Fn(&Vec<f64>) -> Vec<f64> = if qp_ctrl.bse_tda { &a_matvec } else { &amb_matvec };
 
     // Normalize input eigenvectors to unit L2 norm
     let mut eigvecs_norm: Vec<Vec<f64>> = Vec::with_capacity(k);
@@ -1358,8 +1504,8 @@ fn rayleigh_ritz_refine(
         }
     }
 
-    // Compute A * v_i for each normalized eigenvector
-    let av: Vec<Vec<f64>> = eigvecs_norm.iter().map(|v| a_matvec(v)).collect();
+    // Compute op * v_i for each normalized eigenvector
+    let av: Vec<Vec<f64>> = eigvecs_norm.iter().map(|v| op_matvec(v)).collect();
 
     // Check for NaN/Inf in A*v results
     let mut av_bad = false;
@@ -1435,15 +1581,93 @@ fn rayleigh_ritz_refine(
         }
         (evals, Some(psi_mat))
     } else {
-        // Non-TDA: vectors are 2X components, not orthonormal → generalized EVP
-        let mut s_proj = _dgemm_scaled(&v_mat, 'T', &v_mat, 'N', 1.0);
-        let mut s_min = f64::INFINITY; let mut s_max = f64::NEG_INFINITY;
-        for i in 0..k { for j in 0..k {
-            let sv = s_proj[[i, j]];
-            if sv.is_finite() { s_min = s_min.min(sv); s_max = s_max.max(sv); }
+        // Non-TDA: Round-1 FEAST solved (A-B)u = ω²(A+B)^{-1}u, equivalently
+        //   (A+B)(A-B) u = ω² u ,            u = X+Y .
+        // The converged X+Y vectors are orthonormal in the (A+B)^{-1} metric,
+        // NOT in L2, so any metric-based Cholesky/GEP projection is fragile
+        // (indefinite Gram matrix / CG asymmetry).  Instead we project the
+        // (generally non-symmetric) operator T = (A+B)(A-B) onto an L2-
+        // orthonormal basis Q and solve the resulting standard (non-symmetric)
+        // eigenproblem with dgeev — no metric, no Cholesky, no CG.
+
+        // (1) Build an L2-orthonormal basis Q from the input vectors via
+        //     modified Gram-Schmidt.  (eigvecs_norm are unit L2-norm but not
+        //     mutually orthogonal.)
+        let mut q_orth: Vec<Vec<f64>> = Vec::with_capacity(k);
+        for v in eigvecs_norm.iter() {
+            let mut w = v.clone();
+            for q in q_orth.iter() {
+                let proj: f64 = w.iter().zip(q.iter()).map(|(wi, qi)| wi * qi).sum();
+                for i in 0..n { w[i] -= proj * q[i]; }
+            }
+            let nrm: f64 = w.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if nrm > 1e-12 {
+                for x in w.iter_mut() { *x /= nrm; }
+                q_orth.push(w);
+            }
+        }
+        let k_eff = q_orth.len();
+        if k_eff == 0 {
+            eprintln!("Warning: Rayleigh-Ritz non-TDA: subspace collapsed to rank 0, using original eigenvectors");
+            return (Vec::new(), eigvecs.clone());
+        }
+        // Pack Q (n × k_eff)
+        let mut q_mat = MatrixFull::new([n, k_eff], 0.0);
+        for j in 0..k_eff { for i in 0..n { q_mat[[i, j]] = q_orth[j][i]; } }
+
+        // (2) T·Q where T = (A+B)(A-B): apply (A-B) then (A+B) to each column.
+        //     op_matvec is (A-B); apb_matvec is (A+B).
+        let apb_matvec = |p: &Vec<f64>| -> Vec<f64> {
+            let a = matvec::a_block_matvec(scf_data, qp_ctrl, &ri_vv, &ri_ov, &ri_oo_tilde, p);
+            let b = matvec::b_block_matvec(scf_data, qp_ctrl, &ri_ov, &ri_ov_b, &ri_ov_tilde, p);
+            a.into_iter().zip(b.into_iter()).map(|(ai, bi)| ai + bi).collect()
+        };
+        let mut tq = MatrixFull::new([n, k_eff], 0.0);
+        for j in 0..k_eff {
+            let qj: Vec<f64> = (0..n).map(|i| q_mat[[i, j]]).collect();
+            let amb_qj = op_matvec(&qj);      // (A-B) q_j
+            let t_qj = apb_matvec(&amb_qj);   // (A+B)(A-B) q_j
+            for i in 0..n { tq[[i, j]] = t_qj[i]; }
+        }
+
+        // (3) T_proj = Q^T · (T·Q)  (k_eff × k_eff, generally non-symmetric)
+        let t_proj = _dgemm_scaled(&q_mat, 'T', &tq, 'N', 1.0);
+        let mut t_min = f64::INFINITY; let mut t_max = f64::NEG_INFINITY;
+        for i in 0..k_eff { for j in 0..k_eff {
+            let tv = t_proj[[i, j]];
+            if tv.is_finite() { t_min = t_min.min(tv); t_max = t_max.max(tv); }
         }}
-        println!("Rayleigh-Ritz: S_proj range=[{:.3e}, {:.3e}] (k={})", s_min, s_max, k);
-        solve_generalized_eigenproblem(&h_proj, &mut s_proj, k)
+        println!("Rayleigh-Ritz: T_proj range=[{:.3e}, {:.3e}] (k_eff={})", t_min, t_max, k_eff);
+
+        // (4) Standard (non-symmetric) EVP on T_proj → eigenvalues are ω².
+        let (_, wr, wi, _, vr, info) = _dgeev(&t_proj, 'N', 'V');
+        if info != 0 {
+            eprintln!("Warning: Rayleigh-Ritz non-TDA dgeev failed with info={}, using original eigenvectors", info);
+            return (Vec::new(), eigvecs.clone());
+        }
+        // Keep real, positive ω² eigenvalues, sort ascending by ω.
+        let mut eigen_pairs: Vec<(usize, f64)> = (0..k_eff)
+            .filter(|&j| wi[j].abs() < 1e-8 && wr[j] > 0.0)
+            .map(|j| (j, wr[j]))
+            .collect();
+        if eigen_pairs.is_empty() {
+            eprintln!("Warning: Rayleigh-Ritz non-TDA: no real positive ω² eigenvalues, using original eigenvectors");
+            return (Vec::new(), eigvecs.clone());
+        }
+        eigen_pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let m_sel = eigen_pairs.len();
+        let omega: Vec<f64> = eigen_pairs.iter().map(|&(_, w2)| w2.sqrt()).collect();
+        // Eigenvector coefficients in the Q basis: vr[:,orig_j]
+        let mut psi_mat = MatrixFull::new([k_eff, m_sel], 0.0);
+        for (col, &(orig_j, _)) in eigen_pairs.iter().enumerate() {
+            for row in 0..k_eff { psi_mat[[row, col]] = vr[[row, orig_j]]; }
+        }
+        // Stash Q so the Ritz-transform below uses the orthonormal basis:
+        // ritz_vec[i] = Σ_j psi[j,i] * q_orth[j].  We return evals=ω here; the
+        // caller filters by [emin, emax] (the ω window).  Replace eigvecs_norm
+        // with Q (length k_eff) — the transform loop below uses eigvecs_norm.len().
+        eigvecs_norm = q_orth.clone();
+        (omega, Some(psi_mat))
     };
     let psi = match psi_opt {
         Some(p) => p,
@@ -1455,10 +1679,14 @@ fn rayleigh_ritz_refine(
 
     // Transform: ritz_vec[i] = Σ_j psi[j,i] * eigvecs_norm[j], then L2-normalize.
     // _dgeev eigenvectors are not unit-norm, so explicit normalization is needed.
+    // Use eigvecs_norm.len() as the row dimension: it equals k for TDA, and
+    // k_eff (≤ k) for non-TDA where eigvecs_norm was replaced by the orthonormal
+    // basis q_orth above.
+    let k_rows = eigvecs_norm.len();
     let mut ritz_vecs: Vec<Vec<f64>> = Vec::with_capacity(ritz_eigenvalues.len());
     for i in 0..ritz_eigenvalues.len() {
         let mut new_v = vec![0.0; n];
-        for j in 0..k {
+        for j in 0..k_rows {
             let coeff = psi[[j, i]];
             for idx in 0..n {
                 new_v[idx] += coeff * eigvecs_norm[j][idx];
@@ -1591,11 +1819,19 @@ pub fn feast_solve_bse_singlet(scf_data:&mut SCF)->Vec<(f64,Vec<f64>)>{
         let emax = qp_ctrl.bse_eigenrange_max;
         let (fil_vals, fil_vecs) = filter_eigenpairs(ritz_vals, ritz_vecs, emin, emax);
         print_ritz_eigenpairs(scf_data, &fil_vals, &fil_vecs, "singlet", occ_size, vir_size);
-        fil_vals.into_iter().zip(fil_vecs.into_iter()).collect()
+        let raw: Vec<(f64, Vec<f64>)> = fil_vals.into_iter().zip(fil_vecs.into_iter()).collect();
+        // Rebuild [X;Y] for non-TDA so downstream export/print code is consistent.
+        if qp_ctrl.bse_tda { raw } else {
+            reconstruct_nontda_pairs_to_xy(scf_data, &qp_ctrl_singlet, raw, occ_size, vir_size)
+        }
     } else {
-        feast_solve_bse_spin(scf_data,&qp_ctrl_singlet,&quasiparticle_energies,
+        let raw = feast_solve_bse_spin(scf_data,&qp_ctrl_singlet,&quasiparticle_energies,
                              eigenrange_min,eigenrange_max,m_expected,max_feast_iter,tol_feast,None,
-                             None, None, "diagonal", None, 0.0001, 0, 0)
+                             None, None, "diagonal", None, 0.0001, 0, 0);
+        let (_, _, occ_size, vir_size, _, _) = get_occupation_parameters(scf_data, 'N');
+        if qp_ctrl.bse_tda { raw } else {
+            reconstruct_nontda_pairs_to_xy(scf_data, &qp_ctrl_singlet, raw, occ_size, vir_size)
+        }
     }
 }
 
@@ -1652,11 +1888,19 @@ pub fn feast_solve_bse_triplet(scf_data:&mut SCF)->Vec<(f64,Vec<f64>)>{
         let emax = qp_ctrl.bse_eigenrange_max;
         let (fil_vals, fil_vecs) = filter_eigenpairs(ritz_vals, ritz_vecs, emin, emax);
         print_ritz_eigenpairs(scf_data, &fil_vals, &fil_vecs, "triplet", occ_size, vir_size);
-        fil_vals.into_iter().zip(fil_vecs.into_iter()).collect()
+        let raw: Vec<(f64, Vec<f64>)> = fil_vals.into_iter().zip(fil_vecs.into_iter()).collect();
+        // Rebuild [X;Y] for non-TDA so downstream export/print code is consistent.
+        if qp_ctrl.bse_tda { raw } else {
+            reconstruct_nontda_pairs_to_xy(scf_data, &qp_ctrl_triplet, raw, occ_size, vir_size)
+        }
     } else {
-        feast_solve_bse_spin(scf_data,&qp_ctrl_triplet,&quasiparticle_energies,
+        let raw = feast_solve_bse_spin(scf_data,&qp_ctrl_triplet,&quasiparticle_energies,
                              eigenrange_min,eigenrange_max,m_expected,max_feast_iter,tol_feast,None,
-                             None, None, "diagonal", None, 0.0001, 0, 0)
+                             None, None, "diagonal", None, 0.0001, 0, 0);
+        let (_, _, occ_size, vir_size, _, _) = get_occupation_parameters(scf_data, 'N');
+        if qp_ctrl.bse_tda { raw } else {
+            reconstruct_nontda_pairs_to_xy(scf_data, &qp_ctrl_triplet, raw, occ_size, vir_size)
+        }
     }
 }
 
@@ -1813,13 +2057,26 @@ fn feast_solve_bse_nontda(
         let b = matvec::b_block_matvec(scf_data,qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,z);
         a.into_iter().zip(b.into_iter()).map(|(a,b)|a-b).collect()
     };
+    // ── Diagonal preconditioner data for non-TDA ──
+    // D_j = ε_a − ε_i are the diagonal QP energy gaps.  They are used:
+    //   1. as the diagonal preconditioner for CG solves of (A+B);
+    //   2. squared, as the diagonal preconditioner for the contour GMRES
+    //      system z·I − (A+B)(A−B).
+    let energies: Vec<f64> = if qp_ctrl.bse_qp_polarization {
+        scf_data.gwqp.0.clone()
+    } else {
+        scf_data.eigenvalues[0].clone()
+    };
+    let diag = construct_energy_diag_for_a(&energies, occ_size, vir_size);
+    let diag_sq: Vec<f64> = diag.iter().map(|&d| d * d).collect();
+
     let feast_b_matvec=|z:&Vec<f64>|->Vec<f64>{
         let apb_matvec=|p:&Vec<f64>|->Vec<f64>{
             let a = matvec::a_block_matvec(scf_data,qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,p);
             let b = matvec::b_block_matvec(scf_data,qp_ctrl,&ri_ov,&ri_ov_b,&ri_ov_tilde,p);
             a.into_iter().zip(b.into_iter()).map(|(a,b)|a+b).collect()
         };
-        cg(&apb_matvec,z,qp_ctrl.bse_feast_cg_max_iter,qp_ctrl.bse_feast_cg_tol)
+        cg(&apb_matvec,z,qp_ctrl.bse_feast_cg_max_iter,qp_ctrl.bse_feast_cg_tol,Some(&diag))
     };
 
     let gmres_restart = qp_ctrl.bse_feast_gmres_restart;
@@ -1834,18 +2091,6 @@ fn feast_solve_bse_nontda(
     let gmres_b_mul=|z:&Vec<f64>|{
         z.clone()
     };
-
-    // ── GMRES diagonal preconditioner for non-TDA ──
-    // The transformed GMRES matrix is (z·I − (A−B)(A+B)).
-    // Approximating A_diag ≈ D_j (QP energy gaps) and B_diag ≈ 0 gives
-    // (A−B)(A+B)_diag ≈ D_j².  So M₂_diag ≈ z − D_j².
-    let energies: Vec<f64> = if qp_ctrl.bse_qp_polarization {
-        scf_data.gwqp.0.clone()
-    } else {
-        scf_data.eigenvalues[0].clone()
-    };
-    let diag = construct_energy_diag_for_a(&energies, occ_size, vir_size);
-    let diag_sq: Vec<f64> = diag.iter().map(|&d| d * d).collect();
 
     let eigenpairs_xpy=feast(occ_size*vir_size,&feast_a_matvec,&feast_b_matvec,Some(&gmres_a_mul),Some(&gmres_b_mul),
                              eigenrange_min,eigenrange_max,m_expected,max_feast_iter,tol_feast,
@@ -1911,20 +2156,26 @@ pub fn feast_solve_bse(scf_data:&mut SCF)->(Vec<(f64,Vec<f64>)>,Vec<(f64,Vec<f64
         }else{
             let mut qp_ctrl_s=qp_ctrl.clone();
             qp_ctrl_s.bse_spin=String::from("singlet");
-            eigenpairs_singlet=feast_solve_bse_nontda(
+            let singlet_raw=feast_solve_bse_nontda(
                 scf_data,&qp_ctrl_s,&inverse_dielectric,occ_size,vir_size,
                 eigenrange_min,eigenrange_max,m_expected,max_feast_iter,tol_feast,None,
                 None, None, "diagonal", None, 0.0001, 0, 0);
             let one_feast_time=start.elapsed();
             println!("Singlets (FEAST) calculation took {:?}",one_feast_time);
+            // Rebuild [X;Y] (length 2n) from FEAST's X+Y-space vectors so that
+            // downstream export/dipole code (written for Davidson's [X;Y]) works.
+            eigenpairs_singlet=reconstruct_nontda_pairs_to_xy(
+                scf_data,&qp_ctrl_s,singlet_raw,occ_size,vir_size);
 
             let mut qp_ctrl_t=qp_ctrl.clone();
             qp_ctrl_t.bse_spin=String::from("triplet");
-            eigenpairs_triplet=feast_solve_bse_nontda(
+            let triplet_raw=feast_solve_bse_nontda(
                 scf_data,&qp_ctrl_t,&inverse_dielectric,occ_size,vir_size,
                 eigenrange_min,eigenrange_max,m_expected,max_feast_iter,tol_feast,None,
                 None, None, "diagonal", None, 0.0001, 0, 0);
             println!("Triplets (FEAST) calculation took {:?}",start.elapsed()-one_feast_time);
+            eigenpairs_triplet=reconstruct_nontda_pairs_to_xy(
+                scf_data,&qp_ctrl_t,triplet_raw,occ_size,vir_size);
         }
 
         return (eigenpairs_singlet,eigenpairs_triplet);
@@ -2005,7 +2256,23 @@ pub fn feast_solve_bse(scf_data:&mut SCF)->(Vec<(f64,Vec<f64>)>,Vec<(f64,Vec<f64
                                                       eigenrange_min_orig, eigenrange_max_orig);
     print_ritz_eigenpairs(scf_data, &fil_vals_t, &fil_vecs_t, "triplet", occ_size, vir_size);
 
-    let eigenpairs_singlet = fil_vals_s.into_iter().zip(fil_vecs_s.into_iter()).collect();
-    let eigenpairs_triplet = fil_vals_t.into_iter().zip(fil_vecs_t.into_iter()).collect();
+    let eigenpairs_singlet_raw: Vec<(f64, Vec<f64>)> =
+        fil_vals_s.into_iter().zip(fil_vecs_s.into_iter()).collect();
+    let eigenpairs_triplet_raw: Vec<(f64, Vec<f64>)> =
+        fil_vals_t.into_iter().zip(fil_vecs_t.into_iter()).collect();
+
+    // For non-TDA the Ritz vectors are length-n X+Y-space vectors; rebuild them
+    // into Davidson-style [X;Y] (length 2n) so export/dipole code works. TDA
+    // vectors are already in the correct layout (X block, Y=0) — pass through.
+    let eigenpairs_singlet = if qp_ctrl.bse_tda {
+        eigenpairs_singlet_raw
+    } else {
+        reconstruct_nontda_pairs_to_xy(scf_data, &qp_ctrl_rr_s, eigenpairs_singlet_raw, occ_size, vir_size)
+    };
+    let eigenpairs_triplet = if qp_ctrl.bse_tda {
+        eigenpairs_triplet_raw
+    } else {
+        reconstruct_nontda_pairs_to_xy(scf_data, &qp_ctrl_rr_t, eigenpairs_triplet_raw, occ_size, vir_size)
+    };
     (eigenpairs_singlet,eigenpairs_triplet)
 }

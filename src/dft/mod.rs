@@ -3296,6 +3296,7 @@ impl Grids {
         let pruning: String = mol.ctrl.pruning.clone();
         let grid_gen_level: usize = mol.ctrl.grid_gen_level;
         let rad_grid_method: String = mol.ctrl.rad_grid_method.clone();
+        let radii_adjust = gen_grids::RadiiAdjust::from_str(&mol.ctrl.radii_adjust);
 
         // obtain system-dependent parameters
         //let mass_charge = get_mass_charge(&mol.geom.elem);
@@ -3322,7 +3323,7 @@ impl Grids {
         let mut quadrature_weights: Vec<f64> = vec![];
 
         alpha_min.iter().zip(alpha_max.iter()).enumerate().for_each(|(center_index,value)| {
-            let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid(
+            let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid_with_isdf(
                 value.0.clone(),
                 value.1.clone(),
                 radial_precision,
@@ -3335,6 +3336,8 @@ impl Grids {
                 pruning.clone(),
                 rad_grid_method.clone(),
                 grid_gen_level,
+                radii_adjust,
+                mol.ctrl.use_isdf,
             );
             //println!("alpha_min: {:?}, alpha_max: {:6.3}",&value.0, &value.1);
             //println!("rs_atom: {:?}, ws_atom: {:?}",&rs_atom, &ws_atom);
@@ -3402,7 +3405,7 @@ impl Grids {
                 pruning.clone(),
                 rad_grid_method.clone(),
                 grid_gen_level,
-
+                gen_grids::RadiiAdjust::Becke,
             );
             //println!("alpha_min: {:?}, alpha_max: {:6.3}",&value.0, &value.1);
             //println!("rs_atom: {:?}, ws_atom: {:?}",&rs_atom, &ws_atom);
@@ -3448,6 +3451,7 @@ impl Grids {
         let hardness: usize = mol.ctrl.hardness;
         let pruning: String = mol.ctrl.pruning.clone();
         let rad_grid_method: String = mol.ctrl.rad_grid_method.clone();
+        let radii_adjust = gen_grids::RadiiAdjust::from_str(&mol.ctrl.radii_adjust);
 
         let mass_charge = get_mass_charge(&mol.geom.rg_elem);
         let proton_charges: Vec<i32> = mass_charge.iter().map(|value| value.1 as i32).collect();
@@ -3465,7 +3469,7 @@ impl Grids {
         let mut atm_idx: Vec<usize> = vec![];
         let mut quadrature_weights: Vec<f64> = vec![];
         alpha_min.iter().zip(alpha_max.iter()).enumerate().for_each(|(center_index, value)| {
-            let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid(
+            let (rs_atom, ws_atom, ws_quad_atom) = gen_grids::atom_grid_with_isdf(
                 value.0.clone(),
                 value.1.clone(),
                 radial_precision,
@@ -3478,6 +3482,8 @@ impl Grids {
                 pruning.clone(),
                 rad_grid_method.clone(),
                 level,
+                radii_adjust,
+                mol.ctrl.use_isdf,
             );
             coordinates.extend(rs_atom.iter().map(|value| [value.0, value.1, value.2]));
             weights.extend(ws_atom);
