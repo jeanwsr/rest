@@ -877,6 +877,7 @@ pub fn run_md(
                 qp.box_margin,
                 qp.box_spacing,
                 0,
+                params.seed,
             );
             let box_path = base.join("auto_box.gro");
             std::fs::write(&box_path, &gro_text)
