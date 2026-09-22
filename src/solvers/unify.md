@@ -119,7 +119,43 @@ All solvers use the same Galerkin projection: `H = xs^T·(I+A)·xs`, `g = xs^T·
 
 ---
 
-## 3. Test coverage
+## 3. FEAST: `ri_bse/feast_solver.rs` core → `solvers/feast.rs`
+
+The context-independent part of `ri_bse/feast_solver.rs` (Gauss–Legendre nodes,
+preconditioned CG, restarted GMRES, the block-diagonal / inner-GMRES
+preconditioners, and the `feast()` outer loop) moved to `solvers/feast.rs`.
+Only the FEAST eigenvalue solve is shared; every BSE-specific pre-/post-processing
+step stays in `ri_bse/feast_solver.rs`.
+
+```
+solvers/feast.rs
+├── gauss_legendre_nodes()        ← quadrature on [-1, 1]
+├── cg()                          ← SPD preconditioned CG (Vec<f64>)
+├── gmres()                       ← restarted GMRES(m) with Givens rotations
+├── BlockDiagPrecond              ← 2×2 block-diagonal real embedding
+├── InnerGmresPrecond             ← implicit inverse via inner GMRES
+├── GmresPrecond                  ← Diag | InnerGmres
+├── feast()                       ← linear FEAST outer loop (closures only)
+└── extract_eigenpairs()          ← interval selection + ascending sort
+
+ri_bse/feast_solver.rs            ← unchanged pre-/post-processing
+├── feast_solve_bse_{singlet,triplet,spin}
+├── feast_solve_bse_{tda,nontda}  ← build BSE matvecs, call solvers::feast
+├── rayleigh_ritz_refine()        ← renormalized-doubles full-basis projection
+├── reconstruct_nontda_pairs_to_xy()
+└── filter_eigenpairs() / print_ritz_eigenpairs()
+
+ri_tddft/feast_solver.rs          ← TDDFT wrappers call solvers::feast
+```
+
+The renormalized-doubles trick is preserved verbatim: Round 1 runs
+`feast_solve_bse_*` (s-only auxiliary basis) through `solvers::feast`, then
+`rayleigh_ritz_refine()` projects onto the full auxiliary basis.  No caller
+defaults change.
+
+---
+
+## 4. Test coverage
 
 | Test suite | Count | Validates |
 |-----------|-------|-----------|
@@ -127,3 +163,4 @@ All solvers use the same Galerkin projection: `H = xs^T·(I+A)·xs`, `g = xs^T·
 | `test_davidson` | 1 | Davidson vs dsyev |
 | `test_analdrv` | 12 | Krylov (Hessian frequencies) |
 | `test_analdrv` | 12 | Hessian frequencies via `krylov_block` → `krylov_tsr`. Includes QR collapse test (H2O B3LYP/6-31G). |
+| `bench_pool/gw_bse` FEAST | 2 | `NH3_BSE_FEAST` + `NH3_BSE_FEAST_Nontda` (renormalized doubles, TDA & non-TDA) match reference |

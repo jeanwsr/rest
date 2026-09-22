@@ -14,6 +14,7 @@ use crate::molecule_io::Molecule;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgeev,_dgemm_full,_newton_schulz_inverse_square_root_v02,_dsvd,_dsyevd};
 use std::fs::OpenOptions;
 use crate::solvers::davidson::{lr_davidson_solver, tda_davidson_solver, DavidsonConfig, generate_initial_guess};
+use crate::solvers::feast;
 use std::time::Instant;
 use std::{f64, fs::File, io::Write};
 pub mod dipoles;
@@ -1384,7 +1385,7 @@ fn feast_solve_bse_unrestricted(
             unrestricted_a_matvec(scf_data, qp_ctrl, energies, data, z)
         };
         let b_mul = |z: &Vec<f64>| z.clone();
-        feast_solver::feast(
+        feast::feast(
             n,
             &a_mul,
             &b_mul,
@@ -1420,7 +1421,7 @@ fn feast_solve_bse_unrestricted(
             let apb = |p: &Vec<f64>| {
                 unrestricted_apb_matvec(scf_data, qp_ctrl, energies, data, p)
             };
-            feast_solver::cg(
+            feast::cg(
                 &apb,
                 z,
                 qp_ctrl.bse_feast_cg_max_iter,
@@ -1434,7 +1435,7 @@ fn feast_solve_bse_unrestricted(
             unrestricted_apb_matvec(scf_data, qp_ctrl, energies, data, &amb_z)
         };
         let gmres_b_mul = |z: &Vec<f64>| z.clone();
-        let raw = feast_solver::feast(
+        let raw = feast::feast(
             n,
             &a_mul,
             &b_mul,

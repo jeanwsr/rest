@@ -15,7 +15,9 @@ bse_pool
 *.in
 *.in.toml
 .DS_Store
-
+/bench/
+/def2-*
+/cc-*
 # Ignore the map for names and values of libxc
 # This file is generated automatically during the build process
 src/dft/libxc/names_and_values.rs
