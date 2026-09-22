@@ -610,6 +610,72 @@ use_low_rank_contour = true
 - `save_qp_path`: 取值String，保存准粒子能量的文件路径。缺省为 `”single_qp_path.txt”`。
 - `parse_qp_path`: 取值String，从文件读取准粒子能量的路径。当 `gw_scheme = “parse from file”` 时从此路径读取预先计算的准粒子能量用于后续BSE计算。缺省为 `”./qp_energies”`。
 
+### GW/evGW 检查点（checkpoint）与断点续算
+
+GW 与 evGW 是 REST 中最昂贵的后自洽场步骤之一（一轮 evGW 就是一次完整 GW 遍历），而 BSE 求解通常更贵。在排队系统上这类作业经常被墙钟时间杀掉后重排，因此"把已经算完的东西写进磁盘、下次直接接着算"是必需的。
+
+- `save_gw_checkpoint`: 取值bool。设置为 `true` 后，REST 会在**GW 计算完成之后**、以及**每一轮 evGW 迭代结束时**，把后自洽场状态写入检查点文件。缺省为 `false`。
+- `gw_checkpoint_path`: 取值String，检查点文件（HDF5 格式）的路径。缺省为 `”./gw_checkpoint.h5”`。
+- `resume_from_checkpoint`: 取值bool。设置为 `true` 时，REST 读取 `gw_checkpoint_path` 并把其中的状态恢复到 `scf_data` 上，**同时跳过 SCF 迭代**（不再执行 `scf_without_build`），然后：
+    - 若检查点代表**已经完成的 GW**（`stage = gw_finished`）：**完全不重算 GW/evGW**，直接进入 BSE/响应计算（`response_bse` / `nonlinear_bse` / `dynamic_bse` 同理）。此时 `gw_or_bse = "gw"` 只把恢复出来的准粒子能谱打印出来。
+    - 若检查点代表**进行中的 evGW**（`stage = evgw_round`）：从保存的那一轮继续 evGW 外循环（上一轮的迭代向量与 DIIS 历史一并恢复）。此时输入卡的 `scgw` 必须仍为 `"evgw"`，否则报错退出。
+
+缺省为 `false`。
+
+> 恢复时**分子、基组和 RI 积分仍然会从输入卡重新构建**——这是有意为之，不是遗漏：`SCF::initialize_scf` → `prepare_necessary_integrals` 负责的 `nuc_energy`、`ovlp`、`h_core`、`ri3fn`、`rimatr` 是下游 GW/BSE 每一步都要用的，而它们完全由基组与几何决定、相对一次 GW 遍历而言很便宜，因此没有写进检查点。所以这里的"跳过 SCF"指的是**跳过 SCF 迭代本身**，而不是跳过整个初始化流程；程序启动 + 积分构建的时间照常支付。BSE 阶段的积分准备（`prepare_bse_integrals`）同样照常执行。
+
+#### 检查点文件里存了什么
+
+所有内容都放在 HDF5 的 `rest_gw_checkpoint` 组下，分为四块：
+
+- `meta`（兼容性元数据，用于校验）：格式版本号、`natm`、基函数数目、轨道数目、电子数（α/β/总计）、电荷、自旋、自旋通道数、SCF 类型（rhf/rohf/uhf）、基组路径 `basis_path`、辅助基组路径 `auxbas_path`、以及体系几何（JSON，含元素顺序与坐标）。此外还保存收敛的 `scf_energy` 与 `nuc_energy`。
+- `scf`（下游需要的 SCF 数组）：每个自旋通道的本征值 `eigenvalues`、本征矢 `eigenvectors`（MO 系数矩阵，显式记录 `[nbasis, nstate]` 维度）、密度矩阵 `density_matrix`、占据数 `occupation`、`homo`/`lumo` 下标，以及 Fock 矩阵 `hamiltonian`。
+- `gw`：`scf_data.gwqp` 的 G 分量与 W 分量（两者都存）、自旋分辨的 `gwqp_spin`（G/W × α/β），以及 `renormalized_singles_particles`（当 `renormalized_singles = true` 时；RS 的**轨道**已经体现在保存的 MO 系数里，所以恢复本征矢即恢复 RS 基）。
+- `diis` 以及根组下的若干标量：evGW 已完成轮数 `evgw_rounds_done`、该次运行的 `evgw_rounds`（`evgw_total_rounds`）、是否已满足 `evgw_conv_tol`、上一轮的 `max|dE_qp|` 与 `|dG|`、以及 DIIS 的历史向量与误差向量（逐条保存）。
+
+**恢复路径省下的**是 **SCF 迭代 + 已经完成的那部分 GW/evGW 工作**；如上一节所述，分子/基组/RI 积分的构建不在其列。
+
+#### 一致性与原子性
+
+- 读入时会逐项校验：格式版本、原子数、基函数数、轨道数、电子数、电荷、自旋、自旋通道、`basis_path`、`auxbas_path`、SCF 类型，以及**几何（元素顺序 + 坐标，容差 1e-8 Bohr）**。任何一项不符都会**立即报错并打印当前值与检查点值**，提示"修改输入使其一致，或设 `resume_from_checkpoint = false` 并删除该文件后重算"——绝不会在数据不匹配的情况下静默继续。重建出的 `nuc_energy` 与检查点中的值不一致时会给出显式警告（见上：它是几何+基组的纯函数）。
+- 写盘是准原子的：先写 `"<gw_checkpoint_path>.tmp"`，关闭 HDF5 文件后再 `rename` 到目标路径。因此作业在写盘过程中被杀掉，不会留下半截的坏文件，上一次的合法检查点仍然可用。
+- MPI 下只有 rank 0 会写检查点（与 `chkfile` 的约定一致）。
+
+#### 断点续算示例
+
+第一次运行（写完 GW 后落盘）：
+```toml
+[ctrl]
+job_type = “single_point”
+xc = “pbe”
+basis_path = “def2-TZVP”
+auxbas_path = “def2-TZVP-ri”
+
+[quasiparticle_methods]
+gw_or_bse = “bse”
+gw_scheme = “extrapolated”
+scgw = “evgw”
+evgw_rounds = 30
+save_gw_checkpoint = true
+gw_checkpoint_path = “./gw_checkpoint.h5”
+resume_from_checkpoint = false
+```
+
+作业被墙钟杀掉后重排，只需把开关翻转（其余输入**必须逐字保持不变**，否则校验会报错）：
+```toml
+[quasiparticle_methods]
+gw_or_bse = “bse”
+gw_scheme = “extrapolated”
+scgw = “evgw”
+evgw_rounds = 30
+save_gw_checkpoint = true
+gw_checkpoint_path = “./gw_checkpoint.h5”
+resume_from_checkpoint = true
+```
+程序会打印恢复的内容（恢复了哪些数组、检查点处在哪个阶段、跳过了什么、evGW 从第几轮继续）。
+
+> 注意：若检查点里已完成 `evgw_rounds` 轮但你认为还需要更多轮，可以调大 `evgw_rounds` 后带 `resume_from_checkpoint = true` 重启——evGW 会从保存的那一轮继续；反之，若 `evgw_rounds` 不大于已完成的轮数，evGW 循环会被跳过并直接使用已保存的准粒子能量。
+
 ### BSE计算设置
 
 BSE计算在 `gw_or_bse = “bse”` 时进行，在GW准粒子能量（或从文件读取的准粒子能量）基础上构建BSE kernel并对角化求解垂直激发能。

@@ -492,6 +492,29 @@ impl EvgwDiis {
         }
     }
 
+    /// Re-seed the DIIS history from a GW checkpoint (see
+    /// [`crate::fileop::gw_checkpoint`]).
+    ///
+    /// The *current* input-card values of `space` / `min_history` /
+    /// `safeguard` are kept -- only the stored vectors are injected -- so that
+    /// changing `evgw_diis_space` between the interrupted run and the resumed
+    /// one takes effect.  Vectors whose length disagrees with their error
+    /// vector are skipped rather than trusted.
+    fn restore(&mut self, history: &[Vec<f64>], errors: &[Vec<f64>]) {
+        self.history.clear();
+        self.errors.clear();
+        for (h, e) in history.iter().zip(errors.iter()) {
+            if h.len() == e.len() && !h.is_empty() {
+                self.history.push(h.clone());
+                self.errors.push(e.clone());
+            }
+        }
+        while self.history.len() > self.space {
+            self.history.remove(0);
+            self.errors.remove(0);
+        }
+    }
+
     fn update(
         &mut self,
         x_in: &[f64],
@@ -673,9 +696,41 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
     let mut converged=false;
     let mut last_residual=f64::INFINITY;
     let mut last_dg=f64::INFINITY;
+    let mut start_round=0_usize;
+
+    // ---- resume an interrupted evGW run -----------------------------------
+    // `scf_data.gwqp` already carries the iterate to feed into the next round
+    // (it was written next to the archive), so only the outer-loop bookkeeping
+    // has to come back from the checkpoint: the round counter, the convergence
+    // metrics and the DIIS history.  The DIIS history is restored as-is because
+    // it determines the *path* of the iteration; dropping it would still
+    // converge to the same fixed point, only along a different trajectory.
+    if let Some(state)=scf_data.gw_checkpoint_state.clone(){
+        if state.stage==crate::fileop::gw_checkpoint::GwCheckpointStage::EvgwRound{
+            start_round=state.rounds_done;
+            converged=state.converged;
+            last_residual=state.last_residual;
+            last_dg=state.last_dg;
+            diis.restore(&state.diis_history,&state.diis_errors);
+            println!("[gw_checkpoint] evGW resume: {} of {} round(s) are already contained in the checkpoint; \
+                      the loop restarts at round {}.",start_round,iter_rounds,start_round+1);
+            println!("[gw_checkpoint] evGW resume: restored {} DIIS vector(s), last max|dE_qp|={:.4e} Ha, |dG|={:.4e}, converged={}.",
+                      state.diis_history.len(),last_residual,last_dg,converged);
+            if start_round>=iter_rounds{
+                println!("[gw_checkpoint] evGW resume: the checkpoint already holds all {} requested round(s) \
+                          (evgw_rounds); the evGW loop is skipped and the stored quasiparticle energies are used.",
+                          iter_rounds);
+            } else if converged && stop_on_conv {
+                println!("[gw_checkpoint] evGW resume: the stored round already satisfied evgw_conv_tol={:.4e} Ha \
+                          and evgw_stop_on_convergence is true; the evGW loop is skipped.",conv_tol);
+                start_round=iter_rounds;
+            }
+        }
+    }
+
     let nstate=scf_data.gwqp.0.len();
 
-    for i in 0..iter_rounds{
+    for i in start_round..iter_rounds{
         println!("Now is round #{} of evGW calculation. There will be {} rounds in total.",i+1,iter_rounds);
         let cancel_dfa_xc=true;
         // Energy vector fed into this round (G and W both built from it, as in
@@ -730,7 +785,32 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
         scf_data.gwqp.0=qp_next.clone();
         scf_data.gwqp.1=qp_next.clone();
 
-        if max_de<conv_tol{
+        let round_converged=max_de<conv_tol;
+
+        // ---- end-of-round checkpoint hook ---------------------------------
+        // Written *after* the iterate and the DIIS history have been updated
+        // and *before* the convergence test, so that a job killed at any point
+        // during the round is picked up again from here (a `break` on
+        // convergence would otherwise skip the final round's archive).
+        if crate::fileop::gw_checkpoint::checkpoint_enabled(scf_data){
+            let mut ckpt=crate::fileop::gw_checkpoint::GwCheckpointState::from_scf(scf_data);
+            ckpt.stage=crate::fileop::gw_checkpoint::GwCheckpointStage::EvgwRound;
+            ckpt.rounds_done=i+1;
+            ckpt.total_rounds=iter_rounds;
+            ckpt.converged=round_converged;
+            ckpt.last_residual=last_residual;
+            ckpt.last_dg=last_dg;
+            ckpt.diis_space=diis.space;
+            ckpt.diis_min_history=diis.min_history;
+            ckpt.diis_safeguard=diis.safeguard;
+            ckpt.diis_history=diis.history.clone();
+            ckpt.diis_errors=diis.errors.clone();
+            if let Err(e)=crate::fileop::gw_checkpoint::save_gw_checkpoint(scf_data,&ckpt){
+                println!("[gw_checkpoint] WARNING: could not write the evGW checkpoint after round {}: {:#}",i+1,e);
+            }
+        }
+
+        if round_converged{
             converged=true;
             if report{
                 println!("evGW converged after {} round(s): max|dE_qp|={:.4e} Ha < conv_tol={:.4e} Ha",

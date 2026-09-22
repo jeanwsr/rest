@@ -155,10 +155,58 @@ pub fn main_driver() -> anyhow::Result<()> {
     // initialize the time record
     // initialize the SCF procedure
     time_mark.count_start("SCF");
+    // `mol` is consumed by `SCF::build`, so read the resume switch first.
+    let resume_from_checkpoint = mol
+        .ctrl
+        .quasiparticle_methods
+        .as_ref()
+        .map(|qp| qp.resume_from_checkpoint)
+        .unwrap_or(false);
     let mut scf_data = scf_io::SCF::build(mol,&mpi_operator);
     time_mark.count("SCF");
-    // perform the SCF and post SCF evaluation for the specified xc method
-    performance_essential_calculations(&mut scf_data, &mut time_mark, &mpi_operator);
+    if resume_from_checkpoint {
+        // Resume path (see `crate::fileop::gw_checkpoint`): the SCF *iterations*
+        // and the GW/evGW work already stored in the archive are skipped, and
+        // the converged electronic structure is installed directly onto
+        // `scf_data`.
+        //
+        // `SCF::build` above already ran `initialize_scf`, which builds the
+        // molecule/cint data, the DFT grids and -- crucially -- the RI
+        // integrals (`prepare_necessary_integrals`: nuc_energy, ovlp, h_core,
+        // ri3fn, rimatr) that every downstream GW/BSE step consumes.  Those are
+        // deliberately NOT archived, so the setup still runs; only
+        // `scf_without_build` (the iteration loop) and the correlation part of
+        // `performance_essential_calculations` are skipped.
+        crate::fileop::gw_checkpoint::announce_scf_skipped(&scf_data);
+        let gw_state = crate::fileop::gw_checkpoint::load_gw_checkpoint(&mut scf_data)?;
+        // Solvent runs refresh the PCM state from the current density inside
+        // `scf_without_build`; since we skip that, do it explicitly here so the
+        // restored density and the solvent stay consistent.
+        if scf_data.mol.ctrl.solvent_enabled {
+            scf_data.refresh_solvent_with_mpi(&mpi_operator);
+        }
+        scf_data.gw_checkpoint_state = Some(gw_state);
+        // `performance_essential_calculations` (which normally fills
+        // `energies["total_energy"]`) is skipped together with the SCF, so
+        // restore that bookkeeping from the archived SCF energy.
+        scf_data
+            .energies
+            .insert("total_energy".to_string(), vec![scf_data.scf_energy]);
+        println!(
+            "[gw_checkpoint] resume complete: SCF iterations skipped, GW state loaded; the run \
+             continues with '{}'.",
+            scf_data
+                .mol
+                .ctrl
+                .quasiparticle_methods
+                .as_ref()
+                .map(|qp| qp.gw_or_bse.clone())
+                .unwrap_or_default()
+        );
+    } else {
+        // perform the SCF and post SCF evaluation for the specified xc method
+        performance_essential_calculations(&mut scf_data, &mut time_mark, &mpi_operator);
+    }
 
     let mut json_extra: HashMap<String, serde_json::Value> = HashMap::new();
 

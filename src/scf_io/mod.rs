@@ -124,6 +124,17 @@ pub struct SCF {
     /// `(excitation energy, eigenvector)` in the solver's ordering.  Used by
     /// the TDDFT analytic-gradient driver.
     pub tddft_excitations: Option<Vec<(f64, Vec<f64>)>>,
+    /// State restored from a GW/evGW checkpoint when
+    /// `resume_from_checkpoint = true` (see `crate::fileop::gw_checkpoint`).
+    ///
+    /// `None` means "no checkpoint is being resumed".  When it is `Some`, the
+    /// post-SCF flow uses it to decide what may be skipped: a
+    /// [`crate::fileop::gw_checkpoint::GwCheckpointStage::GwFinished`] state
+    /// means the GW/evGW work is already done (go straight into BSE), while a
+    /// [`crate::fileop::gw_checkpoint::GwCheckpointStage::EvgwRound`] state
+    /// makes `scgw::evgw` continue from the saved round with the restored DIIS
+    /// history.
+    pub gw_checkpoint_state: Option<crate::fileop::gw_checkpoint::GwCheckpointState>,
 }
 
 #[derive(Clone,Copy)]
@@ -187,6 +198,7 @@ impl SCF {
             solvent_static_obj: None,
             solvent_scf: None,
             tddft_excitations: None,
+            gw_checkpoint_state: None,
         };
 
         // at first check the scf type: RHF, ROHF or UHF

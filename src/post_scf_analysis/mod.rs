@@ -308,6 +308,33 @@ pub fn post_scf_correlation(scf_data: &mut SCF) {
     }
 }
 
+/// Has a checkpoint been restored whose GW/evGW work is already complete?
+fn checkpoint_has_finished_gw(scf_data: &SCF) -> bool {
+    matches!(
+        scf_data.gw_checkpoint_state.as_ref().map(|state| state.stage),
+        Some(crate::fileop::gw_checkpoint::GwCheckpointStage::GwFinished)
+    )
+}
+
+/// Log the fact that a restored checkpoint lets us skip the GW/evGW work.
+fn announce_gw_skipped(scf_data: &SCF, output_type: &str) {
+    println!("--------------------------------------------------------------------------------");
+    println!(
+        "[gw_checkpoint] 'resume_from_checkpoint = true': the GW/evGW calculation is SKIPPED -- \
+         {} quasiparticle energies were restored from the checkpoint.",
+        scf_data.gwqp.0.len()
+    );
+    if output_type.eq("gw") {
+        println!("[gw_checkpoint] the restored spectrum is reported below; nothing is recomputed.");
+    } else {
+        println!(
+            "[gw_checkpoint] '{}' continues directly with the BSE/response step.",
+            output_type
+        );
+    }
+    println!("--------------------------------------------------------------------------------");
+}
+
 pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>) -> crate::ri_bse::BseOutput {
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let output_type=qp_ctrl.gw_or_bse.clone();
@@ -315,35 +342,70 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
         first_excitation: None,
         excitation_energies: Vec::new(),
     };
+    // A restored checkpoint may already contain the GW/evGW work.  In that case
+    // we must not redo it -- and must not overwrite the checkpoint either.
+    let gw_already_done = checkpoint_has_finished_gw(scf_data);
+    if let Some(state) = scf_data.gw_checkpoint_state.as_ref() {
+        if state.stage == crate::fileop::gw_checkpoint::GwCheckpointStage::EvgwRound
+            && !qp_ctrl.scgw.eq("evgw")
+        {
+            panic!(
+                "[gw_checkpoint] the checkpoint '{}' was written in the middle of an evGW run \
+                 (round {} of {}), but the current input asks for scgw = \"{}\".\n\
+                 Fix the input so that scgw = \"evgw\" (and evgw_rounds > {}), or set \
+                 'resume_from_checkpoint = false' to start over.",
+                crate::fileop::gw_checkpoint::checkpoint_path(scf_data),
+                state.rounds_done,
+                state.total_rounds,
+                qp_ctrl.scgw,
+                state.rounds_done,
+            );
+        }
+    }
+    if gw_already_done {
+        announce_gw_skipped(scf_data, &output_type);
+    }
     if output_type.eq("gw"){
-        let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
-        let vxc_nn_spin: Option<[Vec<f64>;2]> = if scf_data.mol.spin_channel==2 {
-            Some(ri_gw::vxc_ao2mo_spin(scf_data))
-        } else { None };
-        let xc_data=scf_data.mol.xc_data.clone();
-        println!("Current XC data:");
-        println!("dfa_compnt_scf={:?}",xc_data.dfa_compnt_scf);
-        println!("dfa_paramr_scf={:?}",xc_data.dfa_paramr_scf);
-        println!("dfa_hybrid_scf={}",xc_data.dfa_hybrid_scf);
-        if qp_ctrl.homo_lumo_gw_qp==true{
-            ri_gw::get_homo_lumo_qp_only(scf_data,20,&vxc_nn,mpi_operator);
-        }else if qp_ctrl.self_energy_spectrum_test==true{
-            ri_gw::spectrum_test(scf_data,20);
-        }else if qp_ctrl.obtain_vx_vc_terms==true{
-            ri_gw::obtain_vx_vc_terms(scf_data);
-        }else if scf_data.mol.spin_channel==2{
-            ri_gw::gw_main_spin(scf_data,&vxc_nn_spin.unwrap(),mpi_operator);
-        }else{
-            ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
-            if scf_data.mol.ctrl.print_level>1{
-                ri_bse::matvec::test_v_w_contribution(scf_data);
+        if gw_already_done {
+            // Nothing to recompute: just report the restored quasiparticle
+            // spectrum, exactly as the freshly computed one would have been.
+            let (_,_,occ_size,_,_,_)=ri_gw::get_occupation_parameters(scf_data,'Y');
+            ri_gw::display::full_quasiparticles(&scf_data.gwqp.0,occ_size);
+        } else {
+            let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
+            let vxc_nn_spin: Option<[Vec<f64>;2]> = if scf_data.mol.spin_channel==2 {
+                Some(ri_gw::vxc_ao2mo_spin(scf_data))
+            } else { None };
+            let xc_data=scf_data.mol.xc_data.clone();
+            println!("Current XC data:");
+            println!("dfa_compnt_scf={:?}",xc_data.dfa_compnt_scf);
+            println!("dfa_paramr_scf={:?}",xc_data.dfa_paramr_scf);
+            println!("dfa_hybrid_scf={}",xc_data.dfa_hybrid_scf);
+            if qp_ctrl.homo_lumo_gw_qp==true{
+                ri_gw::get_homo_lumo_qp_only(scf_data,20,&vxc_nn,mpi_operator);
+            }else if qp_ctrl.self_energy_spectrum_test==true{
+                ri_gw::spectrum_test(scf_data,20);
+            }else if qp_ctrl.obtain_vx_vc_terms==true{
+                ri_gw::obtain_vx_vc_terms(scf_data);
+            }else if scf_data.mol.spin_channel==2{
+                ri_gw::gw_main_spin(scf_data,&vxc_nn_spin.unwrap(),mpi_operator);
+            }else{
+                ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
+                if scf_data.mol.ctrl.print_level>1{
+                    ri_bse::matvec::test_v_w_contribution(scf_data);
+                }
             }
+            // The GW pass has finished: archive the state so that a later run
+            // can resume without redoing it.
+            crate::fileop::gw_checkpoint::save_gw_finished_checkpoint(scf_data);
         }
     }else if output_type.eq("bse"){
         // BSE-specific integrals must be prepared AFTER GW calculation,
         // otherwise get_submatrix would pick them up during GW and return
         // wrong-dimensional RI matrices (BSE aux basis instead of full).
-        if qp_ctrl.gw_scheme=="parse from file"{
+        if gw_already_done {
+            // restored from the checkpoint: GW is not recomputed
+        }else if qp_ctrl.gw_scheme=="parse from file"{
             let parse_qp_path=qp_ctrl.parse_qp_path.clone();
             let qp=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
             scf_data.gwqp.0=qp.clone();
@@ -359,15 +421,24 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
         }
+        // Hook: GW is complete, BSE/response has not started yet.
+        if !gw_already_done {
+            crate::fileop::gw_checkpoint::save_gw_finished_checkpoint(scf_data);
+        }
         scf_data.prepare_bse_integrals(mpi_operator);
         bse_output = ri_bse::bse_main(scf_data);
     }else if output_type.eq("response_bse"){
-        if qp_ctrl.gw_scheme=="parse from file"{
+        if gw_already_done {
+            // restored from the checkpoint: GW is not recomputed
+        }else if qp_ctrl.gw_scheme=="parse from file"{
             let parse_qp_path=qp_ctrl.parse_qp_path.clone();
             scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
         }else{
             let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
+        }
+        if !gw_already_done {
+            crate::fileop::gw_checkpoint::save_gw_finished_checkpoint(scf_data);
         }
         let p_induced=ri_bse::response::response_bse(scf_data);
         // println!("Induced Density Matrix:");
@@ -377,24 +448,34 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
         // println!("P Imaginary (Minus Half):\n{:#?}",p_induced.3);
     }else if output_type.eq("nonlinear_bse"){
         // NLFEAST requires GW quasiparticle energies for diagonal elements
-        if qp_ctrl.gw_scheme=="parse from file"{
+        if gw_already_done {
+            // restored from the checkpoint: GW is not recomputed
+        }else if qp_ctrl.gw_scheme=="parse from file"{
             let parse_qp_path=qp_ctrl.parse_qp_path.clone();
             scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
         }else{
             let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
         }
+        if !gw_already_done {
+            crate::fileop::gw_checkpoint::save_gw_finished_checkpoint(scf_data);
+        }
         ri_bse::nonlinbse::nlfeast_bse_main(scf_data, &qp_ctrl);
     }else if output_type.eq("dynamic_bse"){
         // Dynamical BSE: number-conserving RPA-pair kernel (Sangalli et al.,
         // J. Chem. Phys. 134, 034115 (2011)) solved as a nonlinear eigenvalue
         // problem with the NLFEAST kernel.  Requires GW quasiparticle energies.
-        if qp_ctrl.gw_scheme=="parse from file"{
+        if gw_already_done {
+            // restored from the checkpoint: GW is not recomputed
+        }else if qp_ctrl.gw_scheme=="parse from file"{
             let parse_qp_path=qp_ctrl.parse_qp_path.clone();
             scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
         }else{
             let vxc_nn=ri_gw::vxc_ao2mo(scf_data);
             ri_gw::gw_main(scf_data,&vxc_nn,mpi_operator);
+        }
+        if !gw_already_done {
+            crate::fileop::gw_checkpoint::save_gw_finished_checkpoint(scf_data);
         }
         ri_bse::dynamicbse::dynamic_bse_main(scf_data, &qp_ctrl);
     }else{
