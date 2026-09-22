@@ -371,7 +371,18 @@ impl DFA4REST {
     pub fn parse_scf(name: &str, spin_channel: usize) -> DFA4REST {
         let tmp_name = name.to_lowercase();
         let dfa_compnt_scf = DFA4REST::xc_func_init_fdqc(&tmp_name, spin_channel);
-        let dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf,spin_channel);
+        let mut dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf,spin_channel);
+        // The HF reference carries the full exact exchange:
+        // dfa_hybrid_scf = 1.0 so that every response consumer (TDDFT/
+        // stability matvecs, gradients, hessians, energy components) sees the
+        // correct exchange scaling. Keyed on the requested name ("hf"), not on
+        // the component list. The SCF's own Fock build dispatches on the empty
+        // component list into the dedicated `generate_hf_hamiltonian_*` paths,
+        // which apply the exchange at unit strength directly and do not read
+        // this field.
+        if tmp_name == "hf" {
+            dfa_hybrid_scf = 1.0;
+        }
         let dfa_paramr_scf =  vec![1.0;dfa_compnt_scf.len()];
         let dfa_rsh_scf = DFA4REST::get_rsh_libxc(&dfa_compnt_scf, spin_channel);
 

@@ -12,7 +12,6 @@ use crate::utilities::{self, TimeRecords};
 use crate::utilities::memory_batch::*;
 use crate::ctrl_io::ri_jk_io::*;
 
-mod addons;
 #[cfg(test)]
 mod ao2mo_kernel_tests;
 mod fchk;
@@ -126,7 +125,7 @@ pub struct SCF {
     pub tddft_excitations: Option<Vec<(f64, Vec<f64>)>>,
 }
 
-#[derive(Clone,Copy)]
+#[derive(Clone,Copy,PartialEq)]
 pub enum SCFType {
     RHF,
     ROHF,

@@ -329,7 +329,7 @@ pub struct InputKeywords {
     #[pyo3(get, set)]
     pub noiter: bool,
     #[pyo3(get, set)]
-    pub check_stab: bool,
+    pub check_stab: String,
     #[pyo3(get, set)]
     pub use_dm_only: bool,
     #[pyo3(get, set)]
@@ -540,7 +540,7 @@ impl InputKeywords {
             initial_guess: String::from("sad"),
             basis_projection: String::from("occupied"),
             noiter: false,
-            check_stab: false,
+            check_stab: String::from("off"),
             // Kyewords for the manner to evaluate the Vk (and also Vxc) potentials
             // True:  using only density matrix in the evaluation
             // False: use coefficients as well with higher efficiency
@@ -1606,9 +1606,10 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => false,
             };
             tmp_input.check_stab = match tmp_ctrl.get("check_stab").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
-                serde_json::Value:: Bool(tmp_bool) => tmp_bool.clone(),
-                other => false,
+                serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase(),
+                serde_json::Value:: Bool(true) => String::from("auto"),
+                serde_json::Value:: Bool(false) => String::from("off"),
+                other => String::from("off"),
             };
             tmp_input.use_dm_only = match tmp_ctrl.get("use_dm_only").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value:: String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),

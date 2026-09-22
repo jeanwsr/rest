@@ -56,6 +56,7 @@
 - `numerical_force`: 取值布尔类型。是否计算数值力。缺省为false
 - `nforce_displacement`:　取值f64类型。数值力计算中的结构位移值，缺省是0.0013 Bohr
 - `ndipole_displacement`:　取值f64类型。数值Dipole计算中的外电场位移值，缺省是3.0E-4 Bohr
+- `check_stab`: 取值String类型。SCF收敛后进行波函数稳定性分析，与 `[tddft] stability` 等价。详见 TD-DFT计算相关设置的稳定性分析一节。
 
 ## 计算体系相关关键词（Keyword）
 - `charge`：取值f64类型。体系的总电荷数
@@ -709,7 +710,7 @@ davidson_converge_threshold = 1e-8
 
 ## TD-DFT计算相关设置
 
-TD-DFT方法相关的设置在 `[tddft]` 区块中进行。REST支持基于RI积分的TD-DFT激发能计算，包括TDA近似和完整线性响应两种方案，可计算单重态和三重态的垂直激发能。
+TD-DFT方法相关的设置在 `[tddft]` 区块中进行。REST支持基于RI积分的TD-DFT激发能计算，包括TDA近似和完整线性响应两种方案，支持限制性（单重态/三重态）与非限制（UHF/UKS）参考态，并支持范围分离杂化（RSH）泛函。
 
 ### 基础设置
 
@@ -717,17 +718,11 @@ TD-DFT方法相关的设置在 `[tddft]` 区块中进行。REST支持基于RI积
     - `"tda"`：Tamm-Dancoff近似，仅求解A子矩阵的本征值问题。计算量较小，对低能激发态通常与完整线性响应精度相当。
     - `"lr"`（缺省）：完整线性响应，同时使用A和B子矩阵，对激发能的描述更完备。
 - `tddft_spin`: 取值String，指定**限制性**（自旋适配）参考态的自旋通道：
-    - `"singlet"`（缺省）：单重态激发，库仑耦合因子为2。
+    - `"singlet"`：单重态激发，库仑耦合因子为2。限制性参考态不设置该关键词时缺省取 `"singlet"`。
     - `"triplet"`：三重态激发，库仑耦合因子为0；仅 AO 模式（需同时设 `tddft_mode = "ao"`）支持。
     - `"both"`：先算单重态、再算三重态；同样仅 AO 模式支持，`pysoc = true` 的 PySOC 导出需要此项。
     - 其它取值将报错。
-    - **该关键词不适用于非限制参考态**（`spin_polarization = true`，即非限制 TD-DFT，UTDDFT）。
-      非限制 TD-DFT 只有一个合法的响应通道：库仑（Hartree）核与自旋无关，它把 α、β 两个块耦合在一起；
-      而"库仑因子 2 / 0"这一对只对**可以旋转到单/三重态子空间**的限制性参考态成立。
-      因此 UTDDFT 不存在"去库仑"的第二个通道，`"triplet"` / `"both"` 会被直接拒绝；
-      若在非限制计算中写了缺省值 `"singlet"`，程序会忽略它并给出提示（建议直接从输入中删除该关键词）。
-      注意：对自旋对称的参考态，非限制通道的本征谱**本身就同时包含单重态型与三重态型根**
-      （三重态型根的振子强度≈0），这是该算符的固有性质，而不是需要额外选择的通道。
+    - **该关键词不适用于UTDDFT**：显式设置任何取值（包括 `"singlet"`）都会报错。
 - `nroots`: 取值usize，需要计算的激发态数目（根的数目）。缺省为6。
 - `tddft_cutoff_energy`: 取值f64，单位Hartree。KS轨道能量高于此值的虚轨道将被排除在TD-DFT激发空间之外。设置合理值（如20.0-100.0）可显著缩减激发空间维度，加速计算。缺省为1e6（几乎不截断）。
 - `tddft_mode`: 取值String，选择TD-DFT计算模式：`"mo"`（缺省，MO-basis RI）/ `"ao"`（AO-basis）。
@@ -746,6 +741,23 @@ REST默认使用Davidson迭代对角化算法求解TD-DFT本征值问题。
 ### XC Kernel设置
 
 - `tddft_use_optimized_fxc`: 取值bool，设置为 `true`（缺省）使用rayon并行的优化fxc kernel加速矩阵-矢量积运算。一般用户无需修改。
+
+### SCF稳定性分析
+
+在SCF收敛后，可以对参考态波函数做稳定性分析。该分析基于TDDFT Hessian（轨道Hessian的最低本征值，由Davidson求解器计算），仅做检查（不改变波函数）：
+
+- `stability`: 取值String，选择要进行的稳定性检查：
+    - `"off"`（缺省）：不做稳定性分析
+    - `"internal"`：内部稳定性检查（RHF/RKS：轨道Hessian `4(A^S+B^S)`；UHF/UKS：轨道Hessian `2(A+B)`）
+    - `"external"`：外部稳定性检查（RHF/RKS参考态：RHF→UHF通道 `(A^T+B^T)`；UHF/UKS参考态暂不支持）
+    - `"full"`：同时进行内部与外部检查
+    - `"auto"`（**推荐**）：自动选择参考态适用的所有检查：RHF/RKS 为内部 + 外部检查；UHF/UKS 为内部检查（UHF→GHF 外部检查尚未实现）。目前与 `"full"` 行为一致；`"full"` 的含义保持固定（内部 + 外部），未来 `"auto"` 可能随方法/参考态扩展新的检查
+- `stability_nroots`: 取值usize，Hessian Davidson求解的最低本征值数目。缺省为3。
+- `stability_tol`: 取值f64，Hessian Davidson收敛阈值。缺省为1e-8。
+
+注意：
+- 仅支持RHF/RKS与UHF/UKS参考态（ROHF暂不支持）。
+- 设置 `stability ≠ "off"` 后，程序只做稳定性分析，不再进行TD-DFT激发能计算。
 
 ### 输入卡示例
 
@@ -806,7 +818,7 @@ auxbas_path = "/path/to/cc-pvdz-rifit"
 [tddft]
 tddft_method = "tda"
 nroots = 6
-# 不要设置 tddft_spin：非限制参考态只有一个自旋耦合通道
+# 不要设置 tddft_spin：非限制参考态不适用该关键词，任何显式取值（包括 "singlet"）都会报错
 ```
 
 ## 解析Hessian计算相关设置
