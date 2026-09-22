@@ -88,6 +88,16 @@ def _intra_pair_gpu(cderi_ovl, occ_energy, vir_energy, ss_only=False, device=Non
     naux = cderi_ovl.shape[2]
     assert tuple(cderi_ovl.shape) == (nocc, nvir, naux)
 
+    # empty occ (e.g. a spin channel without electrons) or empty vir: no
+    # excitations, all pair energies are zero by definition
+    if nocc == 0 or nvir == 0:
+        if ss_only:
+            return torch.zeros([nocc, nocc], dtype=acc_dtype, device=device)
+        return (
+            torch.zeros([nocc, nocc], dtype=acc_dtype, device=device),
+            torch.zeros([nocc, nocc], dtype=acc_dtype, device=device),
+        )
+
     d_vv = -vir_energy[:, None] - vir_energy[None, :]  # (nvir, nvir), f64
 
     # fold precision for the f32 matmul path (env MP2_FOLD, default "f32acc"):
@@ -735,6 +745,10 @@ def _uos_pair_gpu(
     naux = cderi_ovl_a.shape[2]
     assert tuple(cderi_ovl_a.shape) == (nocc_a, nvir_a, naux)
     assert tuple(cderi_ovl_b.shape) == (nocc_b, nvir_b, naux)
+
+    # empty occ on either spin or empty vir: no cross-spin excitations
+    if nocc_a == 0 or nocc_b == 0 or nvir_a == 0 or nvir_b == 0:
+        return torch.zeros([nocc_a, nocc_b], dtype=acc_dtype, device=device)
 
     # (nvir_b, nvir_a): row index b runs over beta virtuals, column a over alpha
     d_vv = -vir_energy_a[None, :] - vir_energy_b[:, None]

@@ -20,9 +20,11 @@
 //! `showcase-torch-mp2-pyo3@4f80e50` (`src/py/`; docstrings reworded locally,
 //! code unchanged except a local `del cderi_task` in
 //! `dfmp2_addons._inter_contraction_gpu`, freeing each task's GPU half-view
-//! before the next upload allocates); they keep both the single-device
-//! intra kernel and the multi-device intra+inter driver, so future multi-GPU
-//! wiring needs no python-side changes. The trailing *unrestricted* section of
+//! before the next upload allocates, and empty-occ/vir early returns in
+//! `_intra_pair_gpu` mirroring the totality of the CPU pair kernels); they
+//! keep both the single-device intra kernel and the multi-device intra+inter
+//! driver, so future multi-GPU wiring needs no python-side changes. The
+//! trailing *unrestricted* section of
 //! `dfmp2_addons.py` (`_uos_pair_gpu` / `get_dfump2_energy_pair_intra` /
 //! `dfump2_kernel_one_gpu`) is written locally for the UHF path of
 //! [`evaluate_riupt2_eng_torch`], following the file's leaf/wrapper/driver
@@ -284,13 +286,6 @@ where
             .map(|x| x.to_vec())
             .unwrap_or_else(|| (idx_lumo[spin]..num_mo).collect())
     });
-
-    // a fully-spin-polarized reference (e.g. triplet H2) has one empty occ list;
-    // its contractions contribute zero, but the other spin channel still runs
-    // (unlike the CPU new-driver, which returns 0 early for any empty list)
-    if occ_lists[A].is_empty() && occ_lists[B].is_empty() {
-        return [0.0, 0.0, 0.0];
-    }
 
     // slice each spin channel to 1D then index_select
     let occ_energy = [

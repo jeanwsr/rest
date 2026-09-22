@@ -39,6 +39,15 @@ where
     let naux = cderi_xvo.shape()[0];
     assert_eq!(cderi_xvo.shape(), &[naux, nvir, nocc], "cderi_xvo shape must be (naux, nvir, nocc)");
 
+    // empty occ (e.g. a spin channel without electrons) or empty vir: no
+    // excitations, all pair energies are zero by definition
+    if nocc == 0 || nvir == 0 {
+        return PairEng {
+            os: if ss_only { None } else { Some(rt::zeros(([nocc, nocc].f(), &device))) },
+            ss: Some(rt::zeros(([nocc, nocc].f(), &device))),
+        };
+    }
+
     // shape sanity check and unwrap for occupation numbers
     let occ_occupation = match occ_occupation {
         Some(occ_occ) => {
@@ -181,6 +190,11 @@ where
     assert_eq!(cderi_xvo[A].shape(), &[naux, nvir[A], nocc[A]], "cderi_xvo shape not match");
     assert_eq!(cderi_xvo[B].shape(), &[naux, nvir[B], nocc[B]], "cderi_xvo shape not match");
     let device = cderi_xvo[A].device().clone();
+
+    // empty occ on either spin or empty vir: no cross-spin excitations
+    if nocc[A] == 0 || nocc[B] == 0 || nvir[A] == 0 || nvir[B] == 0 {
+        return PairEng { os: Some(rt::zeros(([nocc[A], nocc[B]].f(), &device))), ss: None };
+    }
 
     // shape sanity check and unwrap for occupation numbers
     let occ_occupation = match occ_occupation {
