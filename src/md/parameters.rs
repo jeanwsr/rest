@@ -426,6 +426,8 @@ pub fn parse_md_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Option<
     if let Some(v) = get_str("restart_input") { p.restart_input = v; }
     if let Some(v) = get_u64("traj_interval") { p.traj_interval = v.max(1) as usize; }
     if let Some(v) = get_u64("equil_steps") { p.equil_steps = v as usize; }
+    if let Some(v) = get_num("opt_fmax") { p.opt_fmax = v; }
+    if let Some(v) = get_u64("opt_steps") { p.opt_steps = v as usize; }
     if let Some(v) = get_str("out_prefix") { p.out_prefix = v; }
     if let Some(v) = get_str("restart_output") { p.restart_output = v; }
     let mut outputs_explicit: Option<Vec<String>> = None;
