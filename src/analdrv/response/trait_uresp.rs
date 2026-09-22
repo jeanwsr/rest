@@ -103,10 +103,9 @@ pub trait URespAPI: AnalDrvBaseAPI {
     ///
     /// # Reserved for ugfock
     ///
-    /// No unrestricted implementation provides this rdm-form entry yet; the method is part of the
-    /// trait surface reserved for the future unrestricted generalized-Fock machinery, mirroring
-    /// [`RRespAPI::get_response_rdm`] (which stayed unimplemented until the RI-PT2 generalized
-    /// Fock needed it).
+    /// No unrestricted driver consumes this rdm-form entry yet; it is the form required by the
+    /// future unrestricted generalized-Fock machinery, mirroring how the restricted
+    /// [`RRespAPI::get_response_rdm`] serves the RI-PT2 generalized Fock.
     ///
     /// [`make_response_preparation`]: Self::make_response_preparation
     fn get_response_rdm(&mut self, rdm: &[TsrView; 2]) -> [Tsr; 2];

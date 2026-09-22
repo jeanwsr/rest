@@ -16,8 +16,8 @@
 //! This module should work in most cases, but still requires further testing and efficiency update.
 //!
 //! The nuclear-coordinate derivative properties (hessian) are currently SCF-level only; the
-//! electric multipole moments additionally support the PT2-family post-SCF (fifth-DFA) methods
-//! through the DH density increments.
+//! electric multipole moments support restricted and unrestricted SCF, and additionally the
+//! PT2-family post-SCF (fifth-DFA) methods (restricted only) through the DH density increments.
 //!
 //! This module does not contain extensive detailed implementation. Please refer to the [`hessian`]
 //! submodule for hessian traits, component implementations, total hessian drivers (including
@@ -78,6 +78,7 @@ pub mod prelude {
     pub use multipole::nuc_charge::MultipoleNucCharge;
     pub use multipole::rmultipole::RMultipoleDH;
     pub use multipole::trait_multipole::MultipoleNucAPI;
+    pub use multipole::umultipole::UMultipoleDH;
     pub use response::rresp_interface::RRespSCF;
     pub use response::trait_rresp::RRespAPI;
     pub use response::trait_uresp::URespAPI;

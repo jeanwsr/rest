@@ -1,7 +1,6 @@
 //! SCF-level (HF, RI-JK) multipole moments of an asymmetric H2O (def2-TZVP): dipole and
-//! quadrupole verified against pyscf (`local-runs/260911-multipole/gen_refs.py`, pyscf 2.14.0,
-//! RI-JK with def2-universal-jkfit), octupole and hexadecapole against Gaussian 16 RevB.01
-//! exact HF (`local-runs/260911-multipole/g16/`; default `#p` output contains the moments
+//! quadrupole verified against pyscf (2.14.0, RI-JK with def2-universal-jkfit), octupole and
+//! hexadecapole against Gaussian 16 RevB.01 exact HF (default `#p` output contains the moments
 //! through hexadecapole, so no extra keyword is needed), plus origin-invariance (dipole) and
 //! origin-shift-formula (quadrupole) checks.
 
@@ -117,12 +116,12 @@ fn test_h2o() {
         (1e-6, 1e-7)
     ));
 
-    // octupole and hexadecapole: totals referenced to Gaussian 16 RevB.01 exact HF
-    // (`local-runs/260911-multipole/g16/`, 4-decimal print; note G16's default output contains
-    // these sections without any extra keyword, and its "Traceless Quadrupole" uses Q - Tr/3 I
-    // without the 3/2 factor). Tolerances carry the exact-vs-RI-JK density difference (dipole/
-    // quadrupole calibration: 8e-5 / 2e-4 a.u.) plus the G16 print rounding. The nuclear parts
-    // are closed-form and asserted exactly against an independent computation.
+    // octupole and hexadecapole: totals referenced to Gaussian 16 RevB.01 exact HF (4-decimal
+    // print; note G16's default output contains these sections without any extra keyword, and
+    // its "Traceless Quadrupole" uses Q - Tr/3 I without the 3/2 factor). Tolerances carry the
+    // exact-vs-RI-JK density difference (dipole/quadrupole calibration: 8e-5 / 2e-4 a.u.) plus
+    // the G16 print rounding. The nuclear parts are closed-form and asserted exactly against an
+    // independent computation.
     let oct_tot = rmultipole.make_octupole();
     assert!(rt::allclose(
         &rmultipole.result["oct_nuc"],

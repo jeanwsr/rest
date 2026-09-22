@@ -1,8 +1,7 @@
 //! XYG3 (xDH double hybrid) generalized Fock / relaxed dipole of NH3 (def2-TZVP), verified
 //! contribution-by-contribution against pyscf-forge DFDH.
 //!
-//! Reference values were recorded by
-//! `local-runs/260910-xyg3/xyg3_dipole_contribs.py` (pyscf-forge master @ 0566d43, pyscf 2.14.0):
+//! Reference values were obtained with pyscf-forge DFDH (master @ 0566d43, pyscf 2.14.0):
 //! XYG3 on B3LYP orbitals, basis def2-TZVP, auxiliary basis def2-universal-jkfit for both the JK
 //! fitting and the RI-MP2 (3-center) part. The Lagrangian decomposition follows pyscf-forge's
 //! `prepare_lagrangian`: `L_pt2 = W3 + W4 + Ax0(D_rdm1)` and

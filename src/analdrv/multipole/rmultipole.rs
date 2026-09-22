@@ -51,7 +51,7 @@ pub fn quadrupole_to_traceless(quad: &Tsr) -> Tsr {
 }
 
 /// Intor name and `result`/`timing` key prefix of a multipole order.
-fn multipole_order_spec(order: usize) -> (&'static str, &'static str) {
+pub(crate) fn multipole_order_spec(order: usize) -> (&'static str, &'static str) {
     match order {
         1 => ("int1e_r", "dip"),
         2 => ("int1e_rr", "quad"),
@@ -64,7 +64,7 @@ fn multipole_order_spec(order: usize) -> (&'static str, &'static str) {
 /// Sorted (non-decreasing) Cartesian multi-indices enumerating the unique components of a
 /// permutation-symmetric order-`order` moment tensor (6 for order 2, 10 for order 3, 15 for
 /// order 4).
-fn sorted_multi_indices(order: usize) -> Vec<Vec<usize>> {
+pub(crate) fn sorted_multi_indices(order: usize) -> Vec<Vec<usize>> {
     let mut out = vec![vec![]];
     for _ in 0..order {
         let mut next = Vec::new();

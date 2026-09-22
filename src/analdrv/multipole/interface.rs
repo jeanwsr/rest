@@ -1,7 +1,9 @@
 //! Interface of the multipole task to the analdrv driver.
 
-use crate::analdrv::config::{AnalDrvConfig, MultipoleRdm1Relax};
+use crate::analdrv::config::{AnalDrvConfig, AnalDrvMultipoleCfg, MultipoleRdm1Relax};
 use crate::analdrv::multipole::rmultipole::RMultipoleDH;
+use crate::analdrv::multipole::umultipole::UMultipoleDH;
+use crate::analdrv::prelude::Tsr;
 use crate::analdrv::response::rgfock_interface::rgfock_dh_interface;
 use crate::analdrv::response::RespSCF;
 use crate::ri_jk::util::get_cint_mol;
@@ -10,6 +12,7 @@ use crate::utilities::rstsr_util::RestTensorToRstsrTsrAPI;
 
 use rstsr::prelude::*;
 use serde::Serialize;
+use std::collections::HashMap;
 
 /// Moments of one multipole order, split into contributions.
 ///
@@ -55,30 +58,28 @@ pub struct MultipoleOutput {
     pub hexadecapole: Option<MultipoleOrderParts>,
 }
 
-/// Run the electric multipole moment task of the analdrv driver.
+/// Run the electric multipole moment task of the analdrv driver, dispatching on the SCF type.
 ///
-/// For usual SCF methods (HF/DFT/hybrid-DFT, where the energy functional is the SCF functional),
-/// neither the DH composite nor the response object is given to the driver: the moments are the
-/// plain nuclear plus SCF-density contractions. For PT2-family post-SCF (fifth-DFA) methods, the
-/// unrelaxed correlation rdm1 increment is added, and, when `resp_objs` is passed, the relaxed
-/// (Z-vector) increment as well; whether `resp_objs` is passed is decided by the caller from
-/// `multipole_rdm1_relax`.
-///
-/// `resp_objs` is the [`RespSCF`] carrier (the multipole task itself is restricted-only for now;
-/// the unrestricted variant is rejected here until the U arm is wired). It is only used for the
-/// relaxed DH increments, and requires the DFT grids to be present; the caller
-/// ([`crate::analdrv::interface::analdrv_interface`]) regenerates them.
+/// The restricted arm ([`multipole_interface_r`]) covers RHF/RKS and the PT2-family post-SCF
+/// (fifth-DFA) methods: for usual SCF methods neither the DH composite nor the response object
+/// is given to the driver, while for post-SCF methods the unrelaxed correlation rdm1 increment
+/// is added, and, when `resp_objs` is passed, the relaxed (Z-vector) increment as well; whether
+/// `resp_objs` is passed is decided by the caller from `multipole_rdm1_relax`. The unrestricted
+/// arm ([`multipole_interface_u`]) covers SCF-level UHF/UKS only. ROHF is not supported.
 pub fn multipole_interface<'a>(
     scf_data: &'a SCF,
     config: &AnalDrvConfig,
     resp_objs: Option<&mut RespSCF<'a>>,
 ) -> MultipoleOutput {
     match scf_data.scftype {
-        SCFType::RHF => {},
-        _ => panic!("Multipole evaluation is currently only implemented for restricted (RHF/RKS) calculations."),
+        SCFType::RHF => multipole_interface_r(scf_data, config, resp_objs),
+        SCFType::UHF => multipole_interface_u(scf_data, config, resp_objs),
+        SCFType::ROHF => panic!("Multipole evaluation is not implemented for ROHF calculations."),
     }
+}
 
-    let mp_cfg = &config.multipole;
+/// Validate `multipole_orders` and return it.
+fn checked_orders(mp_cfg: &AnalDrvMultipoleCfg) -> &[usize] {
     assert!(!mp_cfg.orders.is_empty(), "multipole_orders cannot be empty");
     for &order in &mp_cfg.orders {
         assert!(
@@ -86,7 +87,23 @@ pub fn multipole_interface<'a>(
             "multipole_orders entries must be 1 (dipole) to 4 (hexadecapole), got {order}"
         );
     }
+    &mp_cfg.orders
+}
 
+/// Restricted arm of [`multipole_interface`]: RHF/RKS (SCF level) and PT2-family post-SCF
+/// (fifth-DFA) methods.
+///
+/// `resp_objs` is the [`RespSCF`] carrier, used only for the relaxed DH increments (the U
+/// variant of the carrier is rejected here; the unrestricted task has its own arm and consumes
+/// no response object). It requires the DFT grids to be present; the caller
+/// ([`crate::analdrv::interface::analdrv_interface`]) regenerates them.
+fn multipole_interface_r<'a>(
+    scf_data: &'a SCF,
+    config: &AnalDrvConfig,
+    resp_objs: Option<&mut RespSCF<'a>>,
+) -> MultipoleOutput {
+    let mp_cfg = &config.multipole;
+    let orders = checked_orders(mp_cfg);
     let origin = mp_cfg.origin.unwrap_or([0.0; 3]);
 
     let device = DeviceBLAS::default();
@@ -110,8 +127,7 @@ pub fn multipole_interface<'a>(
     };
 
     // The relaxed (Z-vector) increments consume the restricted response object; the U variant of
-    // the carrier is rejected here — the unrestricted multipole task is not wired yet (the task
-    // is also restricted-only at the SCF-type check above).
+    // the carrier cannot appear here (the unrestricted task never requests a response object).
     let resp = resp_objs.map(|resp| match resp {
         RespSCF::R(r) => r,
         RespSCF::U(_) => panic!(
@@ -123,22 +139,14 @@ pub fn multipole_interface<'a>(
 
     // evaluate the requested orders (each order caches itself; the DH density increments are
     // shared between the orders through the gfock result cache)
-    for &order in &mp_cfg.orders {
+    for &order in orders {
         match order {
-            1 => {
-                rmultipole.make_dipole();
-            },
-            2 => {
-                rmultipole.make_quadrupole();
-            },
-            3 => {
-                rmultipole.make_octupole();
-            },
-            4 => {
-                rmultipole.make_hexadecapole();
-            },
+            1 => rmultipole.make_dipole(),
+            2 => rmultipole.make_quadrupole(),
+            3 => rmultipole.make_octupole(),
+            4 => rmultipole.make_hexadecapole(),
             _ => unreachable!("multipole order range checked above"),
-        }
+        };
     }
 
     let print_level = scf_data.mol.ctrl.print_level;
@@ -187,29 +195,88 @@ pub fn multipole_interface<'a>(
             scf_data.fchk_append_density_section("Total MP2 Density", &packed);
             println!(
                 "    total density: {}",
-                if relaxed {
-                    "relaxed (SCF + corr. + Z-vector response)"
-                } else {
-                    "unrelaxed (SCF + corr.)"
-                }
+                if relaxed { "relaxed (SCF + corr. + Z-vector response)" } else { "unrelaxed (SCF + corr.)" }
             );
         }
     }
 
     MultipoleOutput {
         origin,
-        dipole: order_parts(&rmultipole, "dip", false),
-        quadrupole: order_parts(&rmultipole, "quad", true),
-        octupole: order_parts(&rmultipole, "oct", false),
-        hexadecapole: order_parts(&rmultipole, "hex", false),
+        dipole: order_parts(&rmultipole.result, "dip", false),
+        quadrupole: order_parts(&rmultipole.result, "quad", true),
+        octupole: order_parts(&rmultipole.result, "oct", false),
+        hexadecapole: order_parts(&rmultipole.result, "hex", false),
     }
 }
 
-/// Assemble the per-order output from the driver result map; `None` if the order was not
+/// Unrestricted arm of [`multipole_interface`]: SCF-level UHF/UKS only.
+///
+/// The post-SCF (fifth-DFA) density increments are not implemented for unrestricted methods —
+/// both the unrelaxed correlation rdm1 and the relaxed (Z-vector) increment would need the
+/// unrestricted PT2 generalized-Fock machinery — so fifth-DFA calculations are rejected
+/// outright. No response object is consumed: `multipole_rdm1_relax` is silently ignored
+/// (SCF-level moments carry no relaxation), and `multipole_rdm1_dump` is silently ignored
+/// (post-SCF restricted methods only).
+fn multipole_interface_u<'a>(
+    scf_data: &'a SCF,
+    config: &AnalDrvConfig,
+    resp_objs: Option<&mut RespSCF<'a>>,
+) -> MultipoleOutput {
+    if scf_data.mol.xc_data.is_fifth_dfa() {
+        panic!(
+            "Multipole evaluation is not implemented for unrestricted post-SCF (double-hybrid, \
+             fifth-DFA) methods yet; only SCF-level UHF/UKS is supported."
+        );
+    }
+    if resp_objs.is_some() {
+        panic!(
+            "The unrestricted multipole evaluation does not consume a response object; do not pass `resp_objs` for UHF/UKS calculations."
+        );
+    }
+
+    let mp_cfg = &config.multipole;
+    let orders = checked_orders(mp_cfg);
+    let origin = mp_cfg.origin.unwrap_or([0.0; 3]);
+
+    let device = DeviceBLAS::default();
+    let mo_coeff = [(&scf_data.eigenvectors[0]).to_rstsr(&device), (&scf_data.eigenvectors[1]).to_rstsr(&device)];
+    let mo_occ = [(&scf_data.occupation[0]).to_rstsr(&device), (&scf_data.occupation[1]).to_rstsr(&device)];
+    let mol_cint = get_cint_mol(&scf_data.mol);
+
+    let mut umultipole = UMultipoleDH::new(&mol_cint, mo_coeff, mo_occ, origin);
+
+    // evaluate the requested orders (each order caches itself)
+    for &order in orders {
+        match order {
+            1 => umultipole.make_dipole(),
+            2 => umultipole.make_quadrupole(),
+            3 => umultipole.make_octupole(),
+            4 => umultipole.make_hexadecapole(),
+            _ => unreachable!("multipole order range checked above"),
+        };
+    }
+
+    let print_level = scf_data.mol.ctrl.print_level;
+    umultipole.print_multipole(print_level);
+    if print_level >= 2 {
+        for (label, t) in &umultipole.timing {
+            println!("Timing {label}: {t:.3} s");
+        }
+    }
+
+    MultipoleOutput {
+        origin,
+        dipole: order_parts(&umultipole.result, "dip", false),
+        quadrupole: order_parts(&umultipole.result, "quad", true),
+        octupole: order_parts(&umultipole.result, "oct", false),
+        hexadecapole: order_parts(&umultipole.result, "hex", false),
+    }
+}
+
+/// Assemble the per-order output from a driver result map; `None` if the order was not
 /// evaluated. `traceless` includes the `quad_tot_traceless` entry (quadrupole only).
-fn order_parts(driver: &RMultipoleDH, prefix: &str, traceless: bool) -> Option<MultipoleOrderParts> {
-    let flat =
-        |suffix: &str| driver.result.get(&format!("{prefix}_{suffix}")).map(|v| v.view().into_shape(-1).into_vec());
+fn order_parts(result: &HashMap<String, Tsr>, prefix: &str, traceless: bool) -> Option<MultipoleOrderParts> {
+    let flat = |suffix: &str| result.get(&format!("{prefix}_{suffix}")).map(|v| v.view().into_shape(-1).into_vec());
     Some(MultipoleOrderParts {
         nuc: flat("nuc")?,
         scf: flat("scf")?,
@@ -217,7 +284,7 @@ fn order_parts(driver: &RMultipoleDH, prefix: &str, traceless: bool) -> Option<M
         resp: flat("resp"),
         tot: flat("tot")?,
         traceless: if traceless {
-            driver.result.get("quad_tot_traceless").map(|v| v.view().into_shape(-1).into_vec())
+            result.get("quad_tot_traceless").map(|v| v.view().into_shape(-1).into_vec())
         } else {
             None
         },

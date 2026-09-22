@@ -116,10 +116,48 @@ impl<'a> URespAPI for URespRIJK<'a> {
         fock
     }
 
-    fn get_response_rdm(&mut self, _rdm: &[TsrView; 2]) -> [Tsr; 2] {
-        // rdm-form entry of the unrestricted response kernel; reserved for the future ugfock
-        // machinery (no consumer yet), mirroring the restricted side before RI-PT2
-        unimplemented!("get_response_rdm is not implemented for URespRIJK; reserved for the future ugfock machinery.")
+    /// Response matrix per spin from (symmetrizable) spin density matrices: `2 * J(rdm_α +
+    /// rdm_β) - 2 * K(rdm_s)`.
+    ///
+    /// This is the rdm-form entry of the unrestricted response kernel, consistent with the
+    /// restricted `4 * J - 2 * K` convention of [`RRespRIJK`](super::resp_r::RRespRIJK) and with
+    /// this object's own bra form (whose `0.5` Coulomb prefactor carries the same convention):
+    /// per-spin occupation 1 against the restricted 2 halves the Coulomb scale, while the
+    /// two-term symmetrized exchange kernel keeps the restricted scale. In the closed-shell
+    /// limit (`rdm_α = rdm_β = X`), each spin's response equals the restricted kernel on `X`.
+    /// No preparation is required.
+    fn get_response_rdm(&mut self, rdm: &[TsrView; 2]) -> [Tsr; 2] {
+        for rdm_s in rdm {
+            assert_eq!(rdm_s.ndim(), 2, "rdm must have 2 dimensions");
+        }
+        let [α, β] = [0, 1];
+        let nao = rdm[α].shape()[0];
+        let device = self.cderi.device();
+
+        // symmetrize (the pure in-core functions require symmetric input); the Coulomb response
+        // sees the total (α+β) density
+        let rdm_sym = [
+            ((&rdm[α] + &rdm[α].t()) * 0.5).into_contig(ColMajor).into_shape((nao, nao, 1)),
+            ((&rdm[β] + &rdm[β].t()) * 0.5).into_contig(ColMajor).into_shape((nao, nao, 1)),
+        ];
+        let rdm_total = (&rdm_sym[α] + &rdm_sym[β]).into_contig(ColMajor);
+
+        let mut resp = [rt::zeros(([nao, nao], device)), rt::zeros(([nao, nao], device))];
+        if self.factor_j != 0.0 {
+            let vj = get_vj_ri_incore(self.cderi.view(), rdm_total.view()).i((.., .., 0)).into_contig(ColMajor);
+            // 2.0 against the restricted 4.0: occupation 1 vs 2 on the total-density Coulomb
+            resp[α] += 2.0 * self.factor_j * &vj;
+            resp[β] += 2.0 * self.factor_j * &vj;
+        }
+        if self.factor_k != 0.0 {
+            // K: same-spin exchange, same 2.0 scale as restricted (two-term symmetrized kernel)
+            for (s, resp_s) in resp.iter_mut().enumerate() {
+                // TODO: batch size `72` should be tunable by max-memory.
+                let vk = get_vk_ri_incore_dm(self.cderi.view(), rdm_sym[s].view(), 72).i((.., .., 0)).into_contig(ColMajor);
+                *resp_s -= 2.0 * self.factor_k * &vk;
+            }
+        }
+        resp
     }
 
     fn make_response_preparation(&mut self, mo_coeff: &[TsrView; 2], mo_occ: &[TsrView; 2]) {

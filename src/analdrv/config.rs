@@ -166,7 +166,9 @@ impl Default for AnalDrvNucgradCfg {
 
 /// Relaxation treatment of the double-hybrid (DH) density increments for the multipole moments.
 ///
-/// Only meaningful for PT2-family post-SCF (fifth-DFA) methods; silently ignored otherwise.
+/// Only meaningful for PT2-family post-SCF (fifth-DFA) restricted methods; silently ignored
+/// otherwise (the unrestricted multipole task is SCF-level only — post-SCF unrestricted methods
+/// are rejected there).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MultipoleRdm1Relax {
     /// Relaxed density: solve the Z-vector (CP-SCF) and include the response increment.
@@ -186,8 +188,10 @@ impl Default for MultipoleRdm1Relax {
 /// Settings of the electric multipole moment evaluation.
 ///
 /// These keywords control what is evaluated in the [`Multipole`](AnalDrvTask::Multipole) task.
-/// All moments are evaluated in atomic units; the default origin is the coordinate origin
-/// `[0, 0, 0]` (Bohr), the same print convention as Gaussian and pyscf.
+/// Supported for RHF/RKS and UHF/UKS calculations, with the PT2-family post-SCF (fifth-DFA)
+/// density increments restricted-only. All moments are evaluated in atomic units; the default
+/// origin is the coordinate origin `[0, 0, 0]` (Bohr), the same print convention as Gaussian
+/// and pyscf.
 #[serde_inline_default]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnalDrvMultipoleCfg {

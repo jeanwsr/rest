@@ -254,10 +254,70 @@ impl<'a> URespAPI for URespKSNIMatmul<'a> {
 
     // note: `get_fock_coeff` keeps the trait default (dm route via `get_dm0_restricted` per spin).
 
-    /// rdm-form entry of the unrestricted response kernel; reserved for the future ugfock
-    /// machinery (no consumer yet), mirroring the restricted side before RI-PT2.
-    fn get_response_rdm(&mut self, _rdm: &[TsrView; 2]) -> [Tsr; 2] {
-        unimplemented!("get_response_rdm is not implemented for URespKSNIMatmul; reserved for the future ugfock machinery.")
+    /// Response matrix per spin from (symmetrizable) full spin density matrices: `2 * fxc`
+    /// response on the common (large) grid `ni` — the UHF factor `2.0` (hermitian symmetry
+    /// only, no spin degeneracy) against the restricted `4.0` of
+    /// [`RRespKSNIMatmul`](super::resp_rks::RRespKSNIMatmul). The per-spin `rdm` carries a
+    /// leading `[nao, nao]` square followed by an arbitrary (possibly empty) set of trailing
+    /// dimensions, shared by both spins; the output has the same per-spin shape.
+    ///
+    /// This is the rdm-form entry of the unrestricted response kernel, the form required by the
+    /// future unrestricted generalized-Fock Lagrangian term `A_{ai, pq} D_{pq}`; accordingly,
+    /// the fxc kernel is built from the ground-state spin densities on the common (large) grid
+    /// `ni` — not on the dedicated response grid — mirroring
+    /// [`RRespKSNIMatmul::get_response_rdm`](super::resp_rks::RRespKSNIMatmul::get_response_rdm).
+    /// Call [`make_response_preparation`](URespAPI::make_response_preparation) before this
+    /// function to make sure the data is ready.
+    fn get_response_rdm(&mut self, rdm: &[TsrView; 2]) -> [Tsr; 2] {
+        for rdm_s in rdm {
+            assert!(rdm_s.ndim() >= 2, "rdm must have at least 2 dimensions");
+        }
+        let rdm_shape = [rdm[α].shape().to_vec(), rdm[β].shape().to_vec()];
+        let nao = rdm_shape[α][0];
+        for s in [α, β] {
+            assert_eq!(nao, rdm_shape[s][1], "the first two dimensions of rdm must be equal");
+        }
+        assert_eq!(rdm_shape[α], rdm_shape[β], "the rdm shape must agree across spins");
+        let nset: usize = rdm_shape[α][2..].iter().product();
+        let den_type = determine_den_type_from_list(&self.xc_func_list.iter().map(|(_, f)| f).collect_vec());
+
+        if !self.intmd.contains_key("fxc_common_grid") {
+            // panic with "no entry" if preparation is skipped
+            let mo_coeff = [self.intmd["mo_coeff_0"].view(), self.intmd["mo_coeff_1"].view()];
+            let mo_occ = [self.intmd["mo_occ_0"].view(), self.intmd["mo_occ_1"].view()];
+            let (_, fxc) = make_cpks_vxc_fxc_uks(&self.xc_func_list, &mut self.ni, &mo_coeff, &mo_occ);
+            self.intmd.insert("fxc_common_grid".to_string(), fxc);
+        }
+        // NOTE: unlike `cpks_fxc`, the cached `fxc_common_grid` is NOT re-validated against the
+        // orbitals on later calls. This is safe under the analdrv driver contract (the orbitals
+        // are fixed for the lifetime of a driver object), but any future caller that
+        // re-prepares with different orbitals must invalidate this entry as well.
+        let fxc = self.intmd["fxc_common_grid"].view();
+
+        // flatten the trailing dimensions into one set dimension; symmetrize each spin's
+        // leading [nao, nao] block — the fxc kernel only sees the symmetric part anyway
+        let rdm_sym = [
+            ((&rdm[α] + &rdm[α].swapaxes(0, 1)) * 0.5).into_shape((nao, nao, nset)),
+            ((&rdm[β] + &rdm[β].swapaxes(0, 1)) * 0.5).into_shape((nao, nao, nset)),
+        ];
+
+        // rho1 : [ngrids, nvar, 2, nset], assembled set by set from the per-spin dm lists
+        let ngrids = self.ni.weights.len();
+        let nvar = den_type.num_nvar();
+        let device = rdm[α].device().clone();
+        let mut rho1 = rt::zeros(([ngrids, nvar, 2, nset], &device));
+        for k in 0..nset {
+            let rho1_k =
+                self.ni.make_rho_from_dm(&[rdm_sym[α].i((.., .., k)), rdm_sym[β].i((.., .., k))], den_type);
+            rho1.i_mut((.., .., .., k)).assign(&rho1_k);
+        }
+
+        let pot = self.ni.make_fxc_pot_with_eff(fxc, rho1.view(), den_type, XCSpin::Polarized);
+        // restore the input's per-spin trailing shape
+        [
+            (pot.i((.., .., α, ..)) * 2.0_f64).into_shape(rdm_shape[α].to_vec()),
+            (pot.i((.., .., β, ..)) * 2.0_f64).into_shape(rdm_shape[β].to_vec()),
+        ]
     }
 
     /// Cached on first call for fixed inputs: the CP-KS `vxc`/`fxc` evaluation is skipped when

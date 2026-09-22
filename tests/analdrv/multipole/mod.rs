@@ -3,5 +3,8 @@ pub mod h2o_hf;
 pub mod h2o_rks;
 pub mod hi_rmp2;
 pub mod interface_h2o_rks;
+pub mod interface_nh2_uhf;
 pub mod interface_nh3_xyg3;
+pub mod nh2_uhf;
+pub mod nh2_uks;
 pub mod nh3_xyg3;
