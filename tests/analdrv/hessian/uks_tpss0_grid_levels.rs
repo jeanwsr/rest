@@ -5,6 +5,7 @@
 
 use pyrest::analdrv::config::{AnalDrvConfig, AnalDrvNucgradCfg, AnalDrvRespCfg};
 use pyrest::analdrv::hessian::uscf_interface::uscf_hess_interface;
+use pyrest::analdrv::response::uresp_interface::uscf_resp_interface;
 
 use pyrest::ctrl_io;
 use pyrest::molecule_io::Molecule;
@@ -42,13 +43,14 @@ fn run_with_config(config: AnalDrvConfig) -> Vec<f64> {
     let mol = Molecule::build_native(ctrl, geom, None).unwrap();
     let mut scf_data = scf_io::SCF::build(mol, &None);
     scf_without_build(&mut scf_data, &None);
-    let (de, _vib, _th) = uscf_hess_interface(&mut scf_data, &config.nucgrad, &config.resp);
+    let mut resp_obj = uscf_resp_interface(&scf_data, &config);
+    let (de, _vib, _th) = uscf_hess_interface(&scf_data, &config.nucgrad, &mut resp_obj);
     de
 }
 
 #[test]
 fn test_nh3_mgga_default_skeleton() {
-    // Default skeleton level for MGGA = grid_gen_level + 2 = 5; cpscf = 1 -> ni_cpks path.
+    // Default skeleton level for MGGA = grid_gen_level + 2 = 5; response grid = 1 -> ni_resp path.
     let config = AnalDrvConfig::default();
     let de = run_with_config(config);
 

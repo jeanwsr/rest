@@ -1,8 +1,9 @@
 //! Analytical derivative module for REST.
 //!
-//! This should serve as semi-independent module, handling property computations that requires (only)
-//! derivatives. The energy components are considered to be linearly added, so that components serve
-//! as independent operators (term of ORCA); trait design of this module will fully support this idea.
+//! This should serve as semi-independent module, handling property computations that requires
+//! (only) derivatives. The energy components are considered to be linearly added, so that
+//! components serve as independent operators (term of ORCA); trait design of this module will fully
+//! support this idea.
 //!
 //! This is a more modular and flexible design, and should be easier to maintain and extend.
 //! The API design document is not written at this time, but will be available in the future.
@@ -19,21 +20,23 @@
 //! through the DH density increments.
 //!
 //! This module does not contain extensive detailed implementation. Please refer to the [`hessian`]
-//! submodule for hessian traits, component implementations, total hessian drivers (including CP-SCF),
-//! and important utilities.
+//! submodule for hessian traits, component implementations, total hessian drivers (including
+//! CP-SCF), and important utilities.
 //! - For optimized RI-JK implementation, please refer to [`crate::ri_jk`] module.
 //! - For DFT matmul implementation, please refer to [`crate::dft::numint_matmul`] module.
 //!
 //! We will also handle interface to REST.
 //!
 //! Some important utilities comes from other programs, and we acknowledge them here.
-//! - `vibration/vib.rs`: Vibration analysis from Psi4, partially translated by AI, not fully reviewed by human.
-//!   - TR/V (translation-rotation and vibration classification) is different to Psi4. We will use rotor-type
-//!     to determine number of degrees of freedom (TR mode).
-//! - `point_group_detect`: Point group detection from Psi4, translated by AI, not reviewed by human but have been tested.
+//! - `vibration/vib.rs`: Vibration analysis from Psi4, partially translated by AI, not fully
+//!   reviewed by human.
+//!   - TR/V (translation-rotation and vibration classification) is different to Psi4. We will use
+//!     rotor-type to determine number of degrees of freedom (TR mode).
+//! - `point_group_detect`: Point group detection from Psi4, translated by AI, not reviewed by human
+//!   but have been tested.
 //!   - Note some point group detection is minorly different (such as C3v).
-//! - `krylov_block.rs`: Krylov solver (used in CP-SCF) from PySCF, translated with help by AI, reviewed
-//!   by extensive testing.
+//! - `krylov_block.rs`: Krylov solver (used in CP-SCF) from PySCF, translated with help by AI,
+//!   reviewed by extensive testing.
 
 #![warn(unused)]
 
@@ -77,6 +80,8 @@ pub mod prelude {
     pub use multipole::trait_multipole::MultipoleNucAPI;
     pub use response::rresp_interface::RRespSCF;
     pub use response::trait_rresp::RRespAPI;
+    pub use response::trait_uresp::URespAPI;
+    pub use response::uresp_interface::URespSCF;
     pub use trait_util::AnalDrvBaseAPI;
 
     pub(super) use crate::ri_jk::util::{get_dm0_restricted, get_dme0_restricted};

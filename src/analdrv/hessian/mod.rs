@@ -4,12 +4,12 @@
 //! - trait definitions for hessian components ([`trait_rhess`], [`trait_uhess`], [`trait_util`]);
 //! - component hessian implementations ([`hcore`], [`nuc_repl`], [`ovlp`], and integral handling
 //!   [`cint_handling`]);
-//! - total hessian drivers for restricted and unrestricted SCF ([`rscf`], [`uscf`]), which also
-//!   contain the CP-SCF response machinery;
+//! - total hessian drivers for restricted and unrestricted SCF ([`rscf`], [`uscf`]);
 //! - total hessian interface to REST ([`rscf_interface`], [`uscf_interface`]).
 //!
-//! Note that the CP-SCF parts (the response methods in [`rscf`] and [`uscf`]) are currently
-//! embedded in the total hessian drivers; they may be decoupled into a separate module in future.
+//! The CP-SCF response machinery lives in the separate
+//! [`response`](crate::analdrv::response) module; the hessian drivers consume its response
+//! objects through the `resp` field.
 
 // trait definitions
 pub mod trait_rhess;
@@ -34,7 +34,7 @@ pub mod rscf_interface;
 pub mod uscf_interface;
 
 use crate::analdrv::config::AnalDrvConfig;
-use crate::analdrv::response::rresp_interface::RRespSCF;
+use crate::analdrv::response::RespSCF;
 use crate::scf_io::{SCFType, SCF};
 use crate::thermo::ThermoResult;
 
@@ -57,7 +57,7 @@ pub struct HessOutput {
 pub fn hess_interface<'a>(
     scf_data: &'a SCF,
     config: &AnalDrvConfig,
-    resp_objs: Option<&mut RRespSCF<'a>>,
+    resp_objs: Option<&mut RespSCF<'a>>,
 ) -> HessOutput {
     use crate::analdrv::hessian::rscf_interface::rscf_hess_interface;
     use crate::analdrv::hessian::uscf_interface::uscf_hess_interface;
@@ -70,16 +70,25 @@ pub fn hess_interface<'a>(
         panic!("Normal modes calculation is currently not available for post-SCF methods.");
     }
 
-    // The RHF hessian consumes the shared response object built by the caller; the UHF hessian
-    // builds and owns its own (U-side) response machinery internally, so it takes the response
-    // settings explicitly.
+    // The hessian consumes the shared response object built by the caller (the `RespSCF`
+    // carrier, holding the restricted/unrestricted variant per the SCF type).
     let (hessian, vib, _) = match scf_data.scftype {
-        SCFType::RHF => rscf_hess_interface(
-            scf_data,
-            &config.nucgrad,
-            resp_objs.expect("internal error: the RHF hessian requires the shared response object"),
-        ),
-        SCFType::UHF => uscf_hess_interface(scf_data, &config.nucgrad, &config.resp),
+        SCFType::RHF => {
+            let RespSCF::R(resp) =
+                resp_objs.expect("internal error: the RHF hessian requires the shared response object")
+            else {
+                panic!("internal error: the RHF hessian requires the restricted (R) response object variant");
+            };
+            rscf_hess_interface(scf_data, &config.nucgrad, resp)
+        },
+        SCFType::UHF => {
+            let RespSCF::U(resp) =
+                resp_objs.expect("internal error: the UHF hessian requires the shared response object")
+            else {
+                panic!("internal error: the UHF hessian requires the unrestricted (U) response object variant");
+            };
+            uscf_hess_interface(scf_data, &config.nucgrad, resp)
+        },
         _ => unimplemented!("Normal modes calculation is only implemented for RHF and UHF SCF types."),
     };
 

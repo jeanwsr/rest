@@ -6,6 +6,8 @@ use crate::analdrv::multipole::interface::{multipole_interface, MultipoleOutput}
 use crate::analdrv::response::rgfock_interface;
 use crate::analdrv::response::rresp_interface;
 use crate::analdrv::response::rresp_interface::rscf_resp_interface;
+use crate::analdrv::response::uresp_interface::uscf_resp_interface;
+use crate::analdrv::response::RespSCF;
 use crate::scf_io::{SCFType, SCF};
 use crate::thermo::ThermoResult;
 
@@ -54,20 +56,19 @@ pub struct AnaldrvOutput {
 ///
 /// # Shared objects
 ///
-/// The RHF-level response object ([`crate::analdrv::response::rresp_interface::RRespSCF`]) is
-/// built once and shared (sequentially, by `&mut`) between the task arms: the RHF hessian always
-/// needs it, and the multipole task needs it for the relaxed DH increments. The UHF hessian
-/// builds and owns its own (U-side) response machinery internally.
+/// The SCF response object (the [`RespSCF`] carrier — [`RRespSCF`] for RHF,
+/// [`URespSCF`] for UHF, per the SCF type) is built once and shared (sequentially, by `&mut`)
+/// between the task arms: the hessian always needs it, and the multipole task needs it for the
+/// relaxed DH increments.
 ///
 /// The multipole task on post-SCF (fifth-DFA) methods needs the DFT grids (for both the unrelaxed
 /// and the relaxed DH increments), which `xdh_calculations` frees after the energy evaluation;
 /// they are regenerated here if absent. This is grid generation only: the AO tabulation is
 /// prepared by the respective consumers, not by the grid build.
-pub fn analdrv_interface(
-    scf_data: &mut SCF,
-    tasks: &[AnalDrvTask],
-    config: &AnalDrvConfig,
-) -> AnaldrvOutput {
+///
+/// [`RRespSCF`]: crate::analdrv::response::rresp_interface::RRespSCF
+/// [`URespSCF`]: crate::analdrv::response::uresp_interface::URespSCF
+pub fn analdrv_interface(scf_data: &mut SCF, tasks: &[AnalDrvTask], config: &AnalDrvConfig) -> AnaldrvOutput {
     let mut output = AnaldrvOutput::default();
 
     // --- preparation (the only phase taking scf_data mutably) --- //
@@ -77,8 +78,7 @@ pub fn analdrv_interface(
     let is_fifth = scf_data.mol.xc_data.is_fifth_dfa();
     // the relaxed (Z-vector) DH multipole increments are the only multipole requirement on the
     // response object; the unrelaxed increments still need the DFT grids (regenerated below)
-    let multipole_relaxed_dh =
-        has_multipole && is_fifth && config.multipole.rdm1_relax == MultipoleRdm1Relax::Relaxed;
+    let multipole_relaxed_dh = has_multipole && is_fifth && config.multipole.rdm1_relax == MultipoleRdm1Relax::Relaxed;
     // the DFT grids are needed only when a numint (DFT) consumer exists: the final-energy
     // functional's XC part, or, in the relaxed mode, the SCF functional's XC response. A pure
     // MP2-family method (HF functional, no final-functional DFT part) consumes no grid at all.
@@ -92,8 +92,12 @@ pub fn analdrv_interface(
     }
 
     let need_resp = has_hessian || multipole_relaxed_dh;
-    let mut resp_objs = if need_resp && matches!(scf_data.scftype, SCFType::RHF) {
-        Some(rscf_resp_interface(scf_data, config))
+    let mut resp_obj = if need_resp {
+        match scf_data.scftype {
+            SCFType::RHF => Some(RespSCF::R(rscf_resp_interface(scf_data, config))),
+            SCFType::UHF => Some(RespSCF::U(uscf_resp_interface(scf_data, config))),
+            _ => None,
+        }
     } else {
         None
     };
@@ -103,13 +107,13 @@ pub fn analdrv_interface(
     for task in tasks {
         match task {
             AnalDrvTask::Hessian => {
-                let hess = hess_interface(scf_data, config, resp_objs.as_mut());
+                let hess = hess_interface(scf_data, config, resp_obj.as_mut());
                 output.frequencies_cm = Some(hess.frequencies_cm);
                 output.modes_trv = Some(hess.modes_trv);
                 output.thermo = hess.thermo;
             },
             AnalDrvTask::Multipole => {
-                let resp = if multipole_relaxed_dh { resp_objs.as_mut() } else { None };
+                let resp = if multipole_relaxed_dh { resp_obj.as_mut() } else { None };
                 output.multipole = Some(multipole_interface(scf_data, config, resp));
             },
         }
@@ -126,15 +130,9 @@ pub fn analdrv_interface(
 /// under the legacy top-level `"thermo"` key when present.
 pub fn analdrv_json_interface(output: &AnaldrvOutput) -> HashMap<String, serde_json::Value> {
     let mut json = HashMap::new();
-    json.insert(
-        "analdrv".to_string(),
-        serde_json::to_value(output).unwrap_or(serde_json::Value::Null),
-    );
+    json.insert("analdrv".to_string(), serde_json::to_value(output).unwrap_or(serde_json::Value::Null));
     if let Some(thermo) = &output.thermo {
-        json.insert(
-            "thermo".to_string(),
-            serde_json::to_value(thermo).unwrap_or(serde_json::Value::Null),
-        );
+        json.insert("thermo".to_string(), serde_json::to_value(thermo).unwrap_or(serde_json::Value::Null));
     }
     json
 }

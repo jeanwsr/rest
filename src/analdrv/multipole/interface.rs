@@ -3,7 +3,7 @@
 use crate::analdrv::config::{AnalDrvConfig, MultipoleRdm1Relax};
 use crate::analdrv::multipole::rmultipole::RMultipoleDH;
 use crate::analdrv::response::rgfock_interface::rgfock_dh_interface;
-use crate::analdrv::response::rresp_interface::RRespSCF;
+use crate::analdrv::response::RespSCF;
 use crate::ri_jk::util::get_cint_mol;
 use crate::scf_io::{SCFType, SCF};
 use crate::utilities::rstsr_util::RestTensorToRstsrTsrAPI;
@@ -64,12 +64,14 @@ pub struct MultipoleOutput {
 /// (Z-vector) increment as well; whether `resp_objs` is passed is decided by the caller from
 /// `multipole_rdm1_relax`.
 ///
-/// `resp_objs` is only used for the relaxed DH increments, and requires the DFT grids to be
-/// present; the caller ([`crate::analdrv::interface::analdrv_interface`]) regenerates them.
+/// `resp_objs` is the [`RespSCF`] carrier (the multipole task itself is restricted-only for now;
+/// the unrestricted variant is rejected here until the U arm is wired). It is only used for the
+/// relaxed DH increments, and requires the DFT grids to be present; the caller
+/// ([`crate::analdrv::interface::analdrv_interface`]) regenerates them.
 pub fn multipole_interface<'a>(
     scf_data: &'a SCF,
     config: &AnalDrvConfig,
-    resp_objs: Option<&mut RRespSCF<'a>>,
+    resp_objs: Option<&mut RespSCF<'a>>,
 ) -> MultipoleOutput {
     match scf_data.scftype {
         SCFType::RHF => {},
@@ -107,7 +109,17 @@ pub fn multipole_interface<'a>(
         None
     };
 
-    let mut rmultipole = RMultipoleDH::new(&mol_cint, mo_coeff, mo_occ, origin, rgfock.as_mut(), resp_objs);
+    // The relaxed (Z-vector) increments consume the restricted response object; the U variant of
+    // the carrier is rejected here — the unrestricted multipole task is not wired yet (the task
+    // is also restricted-only at the SCF-type check above).
+    let resp = resp_objs.map(|resp| match resp {
+        RespSCF::R(r) => r,
+        RespSCF::U(_) => panic!(
+            "Multipole evaluation is currently only implemented for restricted (RHF/RKS) calculations; an unrestricted response object was given."
+        ),
+    });
+
+    let mut rmultipole = RMultipoleDH::new(&mol_cint, mo_coeff, mo_occ, origin, rgfock.as_mut(), resp);
 
     // evaluate the requested orders (each order caches itself; the DH density increments are
     // shared between the orders through the gfock result cache)

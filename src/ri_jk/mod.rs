@@ -37,6 +37,7 @@ pub mod hess_u;
 
 // response implementations
 pub mod resp_r;
+pub mod resp_u;
 
 // generalized fock implementations
 pub mod gfock_r;
