@@ -64,6 +64,7 @@ pub fn parse_ctl(filename: String) -> anyhow::Result<(InputKeywords,GeomCell)> {
 }
 
 pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(InputKeywords,GeomCell)> {
+    check_top_level_blocks(tmp_keys)?;
     let mut tmp_input = parse_ctrl_keywords(tmp_keys)?;
     let mut tmp_geomcell = parse_geom_keywords(tmp_keys)?;
     let mut tmp_geomtric = parse_geometric_keywords(tmp_keys)?;
@@ -88,6 +89,36 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     }
     tmp_input.analdrv = tmp_keys.get("analdrv").map(serde_from_value);
     Ok((tmp_input,tmp_geomcell))
+}
+
+const VALID_TOP_LEVEL_BLOCKS: &[&str] = &[
+    "ctrl",
+    "geom",
+    "md",
+    "tddft",
+    "hessian",
+    "thermo",
+    "analdrv",
+    "geometric_pyo3",
+    "quasiparticle_methods",
+];
+
+fn check_top_level_blocks(tmp_keys: &serde_json::Value) -> anyhow::Result<()> {
+    if let serde_json::Value::Object(top_level) = tmp_keys {
+        let unknown: Vec<&str> = top_level
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| !VALID_TOP_LEVEL_BLOCKS.contains(k))
+            .collect();
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "Unknown input block(s): [{}]. Valid top-level blocks are: {}.",
+                unknown.join("], ["),
+                VALID_TOP_LEVEL_BLOCKS.join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 fn parse_usize_list_keyword(value: &serde_json::Value) -> Vec<usize> {
@@ -1090,7 +1121,8 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                     } else if tmp_xc_low.eq("numdipole") || tmp_xc_low.eq("numerical dipole") {
                         JobType::NumDipole
                     } else if tmp_xc_low.eq("energy") || tmp_xc_low.eq("single point") ||
-                      tmp_xc_low.eq("single_point") {
+                      tmp_xc_low.eq("single_point") || tmp_xc_low.eq("sp") ||
+                      tmp_xc_low.eq("singlepoint") {
                         JobType::SinglePoint
                     } else if tmp_xc_low.eq("normal_modes") || tmp_xc_low.eq("freq") ||
                       tmp_xc_low.eq("frequency") || tmp_xc_low.eq("vibration") {
@@ -1099,7 +1131,14 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                       tmp_xc_low.eq("molecular_dynamics") {
                         JobType::MD
                     } else {
-                        JobType::SinglePoint
+                        anyhow::bail!(
+                            "Unknown job_type '{}' in the [ctrl] block. Valid values: \
+                             energy/single point/single_point/sp/singlepoint, force/gradient, \
+                             numdipole/numerical dipole, \
+                             opt/geometry optimization/geometry relaxation/geom_opt/geom_relax/relax, \
+                             normal_modes/freq/frequency/vibration, md/molecular dynamics/molecular_dynamics.",
+                            tmp_xc
+                        );
                     }
                 },
                 other => {JobType::SinglePoint},
