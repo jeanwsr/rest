@@ -179,8 +179,8 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
 
     // engine = "torch" delegates the pair-energy contraction to the embedded-CPython
     // torch kernel on a CUDA device (see torch_pt2_pair_eng). Guards are hard errors
-    // (never a silent CPU fallback): MPI, non-PT2 families and non-RHF references are
-    // all out of scope for the torch engine.
+    // (never a silent CPU fallback): MPI, non-PT2 families and non-RHF/UHF references
+    // are all out of scope for the torch engine.
     if scf_data.mol.ctrl.ri_pt2.engine == PT2Engine::Torch {
         if mpi_operator.is_some() {
             panic!("ri_pt2 engine = \"torch\" is not supported under MPI; run without MPI (mpirun -np 1 / serial build).");
@@ -188,10 +188,11 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         if dfa_family_pos != crate::dft::DFAFamily::PT2 {
             panic!("ri_pt2 engine = \"torch\" only applies to the PT2 family; got {dfa_family_pos:?} (xc = `{}`).", scf_data.mol.ctrl.xc);
         }
-        if !matches!(scf_data.scftype, SCFType::RHF) {
+        if !matches!(scf_data.scftype, SCFType::RHF | SCFType::UHF) {
             panic!(
-                "ri_pt2 engine = \"torch\" currently supports RHF (restricted closed-shell) only. \
-                 Use engine = \"cpu\" (default) for UHF/ROHF."
+                "ri_pt2 engine = \"torch\" currently supports RHF (restricted closed-shell) and \
+                 UHF (unrestricted, single device) references. Use engine = \"cpu\" (default) \
+                 for ROHF."
             );
         }
     }
@@ -258,17 +259,29 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
             viridx[i_spin] = Some(vir_filtered[i_spin].as_slice());
         }
 
-        // RHF-only (guarded above); fp_mode selects the torch matmul dtype:
+        // RHF | UHF (guarded above); fp_mode selects the torch matmul dtype:
         // FP64 -> f64, FP32 -> f32, TF32 -> f32 + TF32 tensor-core matmuls
-        // (the use_tf32 flag is read inside the torch engine).
+        // (the use_tf32 flag is read inside the torch engine). UHF routes
+        // through the single-device UMP2 driver (dfump2_kernel_one_gpu).
         let pt2_fp_mode = scf_data.mol.ctrl.ri_pt2.fp_mode;
-        pt2_c = match pt2_fp_mode {
-            PT2FPMode::FP64 => {
-                torch_pt2_pair_eng::evaluate_ript2_eng_torch::<f64>(scf_data, &mut timerecords, occidx, viridx)
+        pt2_c = match scf_data.scftype {
+            SCFType::RHF => match pt2_fp_mode {
+                PT2FPMode::FP64 => {
+                    torch_pt2_pair_eng::evaluate_ript2_eng_torch::<f64>(scf_data, &mut timerecords, occidx, viridx)
+                },
+                PT2FPMode::FP32 | PT2FPMode::TF32 => {
+                    torch_pt2_pair_eng::evaluate_ript2_eng_torch::<f32>(scf_data, &mut timerecords, occidx, viridx)
+                },
             },
-            PT2FPMode::FP32 | PT2FPMode::TF32 => {
-                torch_pt2_pair_eng::evaluate_ript2_eng_torch::<f32>(scf_data, &mut timerecords, occidx, viridx)
+            SCFType::UHF => match pt2_fp_mode {
+                PT2FPMode::FP64 => {
+                    torch_pt2_pair_eng::evaluate_riupt2_eng_torch::<f64>(scf_data, &mut timerecords, occidx, viridx)
+                },
+                PT2FPMode::FP32 | PT2FPMode::TF32 => {
+                    torch_pt2_pair_eng::evaluate_riupt2_eng_torch::<f32>(scf_data, &mut timerecords, occidx, viridx)
+                },
             },
+            SCFType::ROHF => unreachable!("ROHF is rejected by the torch-engine guard above"),
         };
     } else if use_new_driver {
         // we have already checked dfa_family_pos = PT2

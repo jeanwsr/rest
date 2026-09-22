@@ -2,7 +2,8 @@
 //! PyTorch-backed PT2 pair-energy engine (pyo3-embedded CPython).
 //!
 //! The pair-energy contraction is delegated to the torch kernel `get_dfmp2_energy_pair_intra`
-//! / `dfmp2_kernel_multi_gpu_cderi_cpu` in the vendored standalone python copy
+//! / `dfmp2_kernel_multi_gpu_cderi_cpu` (restricted) or `dfump2_kernel_one_gpu` (unrestricted,
+//! single device) in the vendored standalone python copy
 //! [`py/dfmp2_addons.py`], running on a CUDA device
 //! through an embedded CPython interpreter (pyo3). Everything before the contraction
 //! (integral generation, j2c decomposition, ao2mo) stays in rust on the CPU, exactly as in
@@ -21,7 +22,11 @@
 //! `dfmp2_addons._inter_contraction_gpu`, freeing each task's GPU half-view
 //! before the next upload allocates); they keep both the single-device
 //! intra kernel and the multi-device intra+inter driver, so future multi-GPU
-//! wiring needs no python-side changes.
+//! wiring needs no python-side changes. The trailing *unrestricted* section of
+//! `dfmp2_addons.py` (`_uos_pair_gpu` / `get_dfump2_energy_pair_intra` /
+//! `dfump2_kernel_one_gpu`) is written locally for the UHF path of
+//! [`evaluate_riupt2_eng_torch`], following the file's leaf/wrapper/driver
+//! conventions.
 
 use std::any::TypeId;
 
@@ -216,6 +221,210 @@ where
         }
     })
     .unwrap_or_else(|e| panic!("ri_pt2 engine = \"torch\" pair-energy contraction (pyo3) failed: {e}"));
+    timerecords.count("c_r5dft");
+
+    let eng_tot = eng_os + eng_ss;
+    [eng_tot, eng_os, eng_ss]
+}
+
+/// Same contract as [`super::pt2_pair_eng::evaluate_riupt2_eng`], but the three
+/// pair-energy contractions (αα / ββ same-spin through the ss-only intra kernel,
+/// αβ opposite-spin through the unrestricted kernel) run on a CUDA device via
+/// the embedded-CPython torch driver `dfump2_kernel_one_gpu`.
+///
+/// `occidx`/`viridx` are per-spin and follow the caller's frozen-core filtering
+/// (applied in [`xdh_calculations`](super::xdh_calculations), same as the
+/// new-driver path). The occupation weights are required to be canonical UHF
+/// (occ = 1, vir = 0 per spin channel, NO restricted `/2` rescale): the python
+/// kernel does not implement the fractional-occupation weights of the CPU
+/// kernel, so a violation is a hard error rather than a silently different
+/// energy.
+///
+/// Of the `[ctrl.ri_pt2]` torch options, the single-device path honors `fp_mode`
+/// (`FP64`/`FP32`/`TF32`), `torch_fold` and `torch_batch`. The batched intra+inter
+/// evaluation (`torch_devices` with 2+ entries or `torch_force_batch_inter`) is NOT
+/// available for UHF yet — its python driver implements the closed-shell
+/// bi-orthogonal fold only — so requesting it is a hard error rather than a
+/// silently different energy.
+///
+/// Returns `[eng_tot, eng_os, eng_ss]` with `eng_tot = eng_os + eng_ss`, where
+/// `eng_os = sum(pair_ab)` and `eng_ss = 0.25 * (sum(pair_aa) + sum(pair_bb))`
+/// (the full-matrix ss convention), matching the pure-rust driver.
+pub fn evaluate_riupt2_eng_torch<T>(
+    scf_data: &SCF,
+    timerecords: &mut TimeRecords,
+    occidx: [Option<&[usize]>; 2],
+    viridx: [Option<&[usize]>; 2],
+) -> [f64; 3]
+where
+    T: BlasFloat + FromPrimitive + 'static,
+    DeviceBLAS: LapackDriverAPI<T>,
+{
+    const A: usize = 0;
+    const B: usize = 1;
+
+    let device = DeviceBLAS::default();
+
+    let mo_energy = scf_data.eigenvalues.as_slice().to_rstsr(&device);
+    let mo_occupation = scf_data.occupation.as_slice().to_rstsr(&device);
+
+    // apply occ and vir orbital indices per spin (same convention as the CPU
+    // new-driver); when None, default to the conventional contiguous range
+    let idx_core = scf_data.mol.start_mo;
+    let idx_lumo = scf_data.lumo;
+    let num_mo = mo_energy.shape()[0];
+
+    let occ_lists: [Vec<usize>; 2] = [A, B].map(|spin| {
+        occidx[spin]
+            .map(|x| x.to_vec())
+            .unwrap_or_else(|| (idx_core..idx_lumo[spin]).collect())
+    });
+    let vir_lists: [Vec<usize>; 2] = [A, B].map(|spin| {
+        viridx[spin]
+            .map(|x| x.to_vec())
+            .unwrap_or_else(|| (idx_lumo[spin]..num_mo).collect())
+    });
+
+    // a fully-spin-polarized reference (e.g. triplet H2) has one empty occ list;
+    // its contractions contribute zero, but the other spin channel still runs
+    // (unlike the CPU new-driver, which returns 0 early for any empty list)
+    if occ_lists[A].is_empty() && occ_lists[B].is_empty() {
+        return [0.0, 0.0, 0.0];
+    }
+
+    // slice each spin channel to 1D then index_select
+    let occ_energy = [
+        mo_energy.i((.., A)).index_select(-1, &occ_lists[A]),
+        mo_energy.i((.., B)).index_select(-1, &occ_lists[B]),
+    ];
+    let vir_energy = [
+        mo_energy.i((.., A)).index_select(-1, &vir_lists[A]),
+        mo_energy.i((.., B)).index_select(-1, &vir_lists[B]),
+    ];
+
+    // The python kernel assumes canonical UHF occupations (its pair-energy fold
+    // has no n_ij * n_ab weight factor). Anything else (smearing, fractional
+    // occupations) would give a silently different energy than the CPU kernel.
+    for spin in [A, B] {
+        let occ_spin = mo_occupation.i((.., spin)).index_select(-1, &occ_lists[spin]);
+        let vir_spin = mo_occupation.i((.., spin)).index_select(-1, &vir_lists[spin]);
+        let occ_canonical = occ_spin.to_vec().iter().all(|&x| (x - 1.0).abs() < 1e-8);
+        let vir_canonical = vir_spin.to_vec().iter().all(|&x| x.abs() < 1e-8);
+        assert!(
+            occ_canonical && vir_canonical,
+            "ri_pt2 engine = \"torch\": the python DF-UMP2 kernel supports canonical UHF \
+             occupations only (occ = 1, vir = 0 per spin channel); fractional occupations \
+             (smearing/thermal) are not implemented yet. Use engine = \"cpu\" for this system."
+        );
+    }
+
+    // copy the engine options out of the card (scf_data stays free for the ao2mo call)
+    let ri_pt2_opt = &scf_data.mol.ctrl.ri_pt2;
+    let devices = ri_pt2_opt.torch_devices.clone();
+    let force_batch_inter = ri_pt2_opt.torch_force_batch_inter;
+    let use_tf32 = matches!(ri_pt2_opt.fp_mode, PT2FPMode::TF32);
+    let fold_str = match ri_pt2_opt.torch_fold {
+        PT2TorchFoldMode::F32Acc => "f32acc",
+        PT2TorchFoldMode::F64 => "f64",
+        PT2TorchFoldMode::F32 => "f32",
+    };
+    let batch = ri_pt2_opt.torch_batch;
+    let verbose = std::env::var("MP2_VERBOSE").map(|v| !v.is_empty() && v != "0").unwrap_or(false);
+
+    // batched intra+inter (multi-device or forced) implements the closed-shell
+    // bi-orthogonal fold only; it cannot serve the unrestricted ss/os blocks
+    assert!(
+        devices.len() == 1 && !force_batch_inter,
+        "ri_pt2 engine = \"torch\" with a UHF reference currently supports the single-device \
+         kernel only (dfump2_kernel_one_gpu); torch_devices with 2+ entries and \
+         torch_force_batch_inter are not yet available for UHF. Run with the default \
+         torch_devices = [0] and torch_force_batch_inter = false."
+    );
+
+    // lazy one-time initialization: embedded interpreter + torch import + CUDA context
+    // warmup. Fail fast (before spending minutes on ao2mo for large systems) if the
+    // torch runtime is unavailable.
+    timerecords.new_item("torch_setup", "lazy init of embedded python + torch (first torch-engine call)");
+    timerecords.count_start("torch_setup");
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| -> PyResult<()> {
+        ensure_py_modules(py).map(|_| ())?;
+        check_cuda_availability(py)
+    })
+    .unwrap_or_else(|e| panic!("ri_pt2 engine = \"torch\" initialization (pyo3) failed: {e}"));
+    timerecords.count("torch_setup");
+
+    // perform ao2mo (CPU; rimatr if present, else batched int3c2e + j2c solve);
+    // times "ao2mo"/"j2c"/"j3c"/"decomp" internally, same as the CPU new-driver
+    let cderi_xvo = ri_jk::obtain_cderi_xvo_unrestricted::<T>(
+        scf_data, timerecords, None,
+        [Some(vir_lists[A].as_slice()), Some(vir_lists[B].as_slice())],
+        [Some(occ_lists[A].as_slice()), Some(occ_lists[B].as_slice())],
+    );
+
+    timerecords.count_start("c_r5dft");
+    let (eng_os, eng_ss) = Python::with_gil(|py| -> PyResult<(f64, f64)> {
+        let (bridge, addons) = ensure_py_modules(py)?;
+        check_cuda_availability(py)?;
+        set_kernel_env(py, fold_str, batch)?;
+
+        // dtype string for the foreign buffer (f32 or f64 drives the torch matmul precision)
+        let dtype = if TypeId::of::<T>() == TypeId::of::<f64>() { "f64" } else { "f32" };
+
+        // rust col-major (naux, nvir_s, nocc_s) == python row-major (nocc_s, nvir_s, naux)
+        // per spin: same memory, reversed row-major view (see evaluate_ript2_eng_torch)
+        let naux = cderi_xvo[A].shape()[0];
+        let nocc = [occ_energy[A].size(), occ_energy[B].size()];
+        let nvir = [vir_energy[A].size(), vir_energy[B].size()];
+        assert_eq!(cderi_xvo[A].shape(), &[naux, nvir[A], nocc[A]], "cderi_xvo[A] shape must be (naux, nvir, nocc)");
+        assert_eq!(cderi_xvo[B].shape(), &[naux, nvir[B], nocc[B]], "cderi_xvo[B] shape must be (naux, nvir, nocc)");
+        assert!(cderi_xvo[A].f_contig() && cderi_xvo[B].f_contig(), "cderi_xvo must be column-major (f-contiguous)");
+
+        let torch_from_ptr = bridge.getattr("torch_from_ptr")?;
+        // index_select outputs are consumed here (moved into contiguous copies
+        // whose pointers are handed to python); cderi_xvo stays owned above
+        let [occ_energy_a, occ_energy_b] = occ_energy;
+        let [vir_energy_a, vir_energy_b] = vir_energy;
+        let occ_owned: [Tsr<f64>; 2] = [
+            occ_energy_a.into_contig(ColMajor),
+            occ_energy_b.into_contig(ColMajor),
+        ];
+        let vir_owned: [Tsr<f64>; 2] = [
+            vir_energy_a.into_contig(ColMajor),
+            vir_energy_b.into_contig(ColMajor),
+        ];
+        let cderi_addr = |spin: usize| {
+            cderi_xvo[spin].raw().as_ptr().wrapping_add(cderi_xvo[spin].offset()) as usize
+        };
+        let cderi_torch = [
+            torch_from_ptr.call1((cderi_addr(A), (nocc[A], nvir[A], naux), dtype))?,
+            torch_from_ptr.call1((cderi_addr(B), (nocc[B], nvir[B], naux), dtype))?,
+        ];
+        let occ_torch = [
+            torch_from_ptr.call1((occ_owned[A].raw().as_ptr() as usize, (nocc[A],), "f64"))?,
+            torch_from_ptr.call1((occ_owned[B].raw().as_ptr() as usize, (nocc[B],), "f64"))?,
+        ];
+        let vir_torch = [
+            torch_from_ptr.call1((vir_owned[A].raw().as_ptr() as usize, (nvir[A],), "f64"))?,
+            torch_from_ptr.call1((vir_owned[B].raw().as_ptr() as usize, (nvir[B],), "f64"))?,
+        ];
+        // occ_owned / vir_owned stay alive until the end of this scope, so their pointers
+        // remain valid for the python calls below.
+
+        // single-device UMP2 driver: uploads both spins' cderi once, runs the
+        // aa/bb ss-only intra + ab opposite-spin contractions
+        let driver = addons.getattr("dfump2_kernel_one_gpu")?;
+        let result = driver.call1((
+            cderi_torch[A].clone(), cderi_torch[B].clone(),
+            occ_torch[A].clone(), occ_torch[B].clone(),
+            vir_torch[A].clone(), vir_torch[B].clone(),
+            "cuda", use_tf32, verbose,
+        ))?;
+        let os: f64 = result.get_item("e_corr_os")?.extract()?;
+        let ss: f64 = result.get_item("e_corr_ss")?.extract()?;
+        Ok((os, ss))
+    })
+    .unwrap_or_else(|e| panic!("ri_pt2 engine = \"torch\" UMP2 pair-energy contraction (pyo3) failed: {e}"));
     timerecords.count("c_r5dft");
 
     let eng_tot = eng_os + eng_ss;
