@@ -422,7 +422,10 @@ def _inter_contraction_gpu(
     Each host half-view is uploaded with ``_as_torch`` (``torch.as_tensor``) and
     immediately consumed by the default-stream pair loop - one task at a time, peak
     device memory ~1 cluster (cderi_dev) + 1 half-view, so the ``nbatch``
-    auto-detection (1 cluster <= 0.4*avail) is valid.
+    auto-detection (1 cluster <= 0.4*avail) is valid. Each task's GPU half-view is
+    freed (``del cderi_task``) at the end of its iteration. Very close to the memory
+    wall, ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` can help if allocator
+    fragmentation from the varying-size half-view uploads becomes noticeable.
 
     Uploads are not overlapped with compute via a non-blocking side stream: under
     torch, ``torch.as_tensor`` from the non-pinned host arrays is synchronous / host-blocking
@@ -547,6 +550,10 @@ def _inter_contraction_gpu(
                         e_bi2 = (t_ab.mT * g_ab).sum(dim=(1, 2)).to(acc_dtype)
                 eng_pair_bi1[i, jcols] = e_bi1
                 eng_pair_bi2[i, jcols] = e_bi2
+
+        # free this half-view before the next upload allocates (the loop-top rebind
+        # would drop it only after the new tensor is already resident)
+        del cderi_task
 
     if _MP2_VERBOSE:
         torch.cuda.synchronize()
@@ -755,6 +762,11 @@ def dfmp2_kernel_multi_gpu_cderi_cpu(
     :func:`get_dfmp2_energy_pair_inter` (with the half-splitting scheme that assigns each
     quarter-block to exactly one cluster). Results are assembled into the full
     (nocc, nocc) bi1 / bi2 pair matrices.
+
+    Peak device memory is ~1 cluster upload + 1 inter half-view per batch. Near the
+    memory wall, ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` (or a larger
+    ``nbatch``) helps against caching-allocator fragmentation from the varying-size
+    half-view uploads.
 
     Multi-GPU dispatch: the per-device work
     (upload this cluster's cderi slice once, run intra then inter) is run concurrently

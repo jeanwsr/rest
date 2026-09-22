@@ -17,7 +17,9 @@
 //!
 //! `py/dfmp2_addons.py` and `py/_rstsr_bridge.py` are vendored from
 //! `showcase-torch-mp2-pyo3@4f80e50` (`src/py/`; docstrings reworded locally,
-//! code unchanged); they keep both the single-device
+//! code unchanged except a local `del cderi_task` in
+//! `dfmp2_addons._inter_contraction_gpu`, freeing each task's GPU half-view
+//! before the next upload allocates); they keep both the single-device
 //! intra kernel and the multi-device intra+inter driver, so future multi-GPU
 //! wiring needs no python-side changes.
 
