@@ -1476,10 +1476,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             };
             // Experimental function
             tmp_input.solv_chunk = match tmp_ctrl.get("solv_chunk").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(8)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
-                other => {8},
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(16)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(16) as usize},
+                _ => {16},
             };
+            // 0 would panic the RI veff path (`par_chunks(0)`); clamp to at least one point.
+            tmp_input.solv_chunk = tmp_input.solv_chunk.max(1);
             // ==============================================
             //  Keywords associated with relativistic methods 
             // ==============================================
