@@ -386,8 +386,9 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
         }
         ri_bse::nonlinbse::nlfeast_bse_main(scf_data, &qp_ctrl);
     }else if output_type.eq("dynamic_bse"){
-        // Dynamic BSE (new IA-pair projection scheme)
-        // Requires GW quasiparticle energies
+        // Dynamical BSE: number-conserving RPA-pair kernel (Sangalli et al.,
+        // J. Chem. Phys. 134, 034115 (2011)) solved as a nonlinear eigenvalue
+        // problem with the NLFEAST kernel.  Requires GW quasiparticle energies.
         if qp_ctrl.gw_scheme=="parse from file"{
             let parse_qp_path=qp_ctrl.parse_qp_path.clone();
             scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path).expect("Failure when reading from GW QP energies file!");
