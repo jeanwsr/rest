@@ -696,7 +696,7 @@ impl<'a> TddftGradEngine<'a> {
     /// contraction with weight 2 is exact and removes one full GGA grid kernel
     /// per call (5 -> 4 overall).
     #[allow(clippy::too_many_arguments)]
-    pub fn contract_xc_kernel(
+    fn contract_xc_kernel(
         &self,
         dmvo: Option<&AOMat>,
         dmoo: Option<&AOMat>,

@@ -67,13 +67,150 @@ pub struct QuasiParticle {
     pub bse_exchange_rescaling:f64,
     pub save_bse_excitations:bool,
     pub evgw_rounds:usize,
+    /// Which solver is used for the evGW outer loop (eigenvalue
+    /// self-consistency on the quasiparticle energies).
+    ///
+    /// * `"molgw"` (default): MolGW's `GnWn` (EVSC) rule -- a *single*
+    ///   evaluation `E_out = consts + Sigma_c(E_in)` at the previous
+    ///   quasiparticle energy, with no root solve and no damping (`Z = 1`).
+    ///   This is the branch MolGW really executes: `selfenergy_init` sets
+    ///   `se%nomega = 0` for the `EVSC` technique, so
+    ///   `find_qp_energy_linearization` always takes its `else` branch and the
+    ///   Z factor is never applied (verified against MolGW's own tables, where
+    ///   `E_qp = E0 + SigX-Vxc + SigC` with `E0` the constant KS energy).  Not
+    ///   solving the quasiparticle equation inside the loop is what removes
+    ///   REST's sensitivity to the coarse low-rank real-axis grid and its
+    ///   satellite-root hopping.
+    /// * `"diis"`: one full GW pass per round (historical root-solving map),
+    ///   accelerated by Pulay/DIIS extrapolation of the whole
+    ///   quasiparticle-energy vector -- the mechanism used by `pyscf.gw.evgw`.
+    /// * `"z_update"`: one *linearized* (Z-damped) Newton step per orbital per
+    ///   round, `E_out = E_in + Z (consts + Sigma_c(E_in) - E_in)` with
+    ///   `Z = 1/(1 - dSigma_c/domega)` clamped to `[0, 1]`; no DIIS is applied.
+    /// * `"molgw"`: MolGW's actual `GnWn` (EVSC) rule -- a *single* evaluation
+    ///   `E_out = consts + Sigma_c(E_in)` at the previous quasiparticle energy,
+    ///   with no root solve and no damping (`Z = 1`).  This is the branch
+    ///   MolGW really executes: `selfenergy_init` sets `se%nomega = 0` for the
+    ///   `EVSC` technique, so `find_qp_energy_linearization` always takes its
+    ///   `else` branch and the Z factor is never applied.  No DIIS.
+    pub evgw_solver:String,
+    /// Linear mixing (damping) factor alpha in (0, 1] for the evGW outer loop.
+    ///
+    /// The Green's-function energy vector handed to the next GW pass is built as
+    ///   E_in^(k+1) = (1 - alpha) E_in^(k) + alpha E_out^(k)
+    /// where `E_out` is the result of one full GW pass.  `alpha = 1.0` is the
+    /// historical, undamped fixed-point iteration; smaller values damp the
+    /// eigenvalue self-consistency and are the scalar analogue of the
+    /// Z-scaled (linearized) quasiparticle update used by MolGW's GnWn loop.
+    pub evgw_damping:f64,
+    /// Enable Pulay/DIIS (Anderson) extrapolation of the evGW quasiparticle
+    /// energy vector, exactly as `pyscf.gw.evgw` does on `mo_energy`.
+    ///
+    /// It is applied **on top of** whatever per-round map `evgw_solver`
+    /// selects.  That stacking is what makes a single parameter set work for
+    /// both classes of REST evGW difficulty: `molgw`'s single evaluation
+    /// removes the sensitivity to the coarse real-axis grid (CH4, CO2), while
+    /// DIIS damps the antisymmetric mode of near-degenerate pairs that a scalar
+    /// (diagonal) step cannot control (NH3, C6H6).
+    pub evgw_diis:bool,
+    /// Number of residual vectors kept in the DIIS history.
+    pub evgw_diis_space:usize,
+    /// Minimum number of stored residuals before DIIS extrapolation is used.
+    pub evgw_diis_start:usize,
+    /// Use the strict bracket-restricted fallback for the DIIS step.  Default
+    /// `false` = standard Pulay/DIIS behaviour (free extrapolation, rejected
+    /// only when non-finite or clearly runaway).
+    pub evgw_diis_safeguard:bool,
+    /// Tolerance (Ha) for the evGW degeneracy projection.
+    ///
+    /// evGW must keep symmetry-degenerate partners degenerate.  REST's integrals
+    /// and DFT grid break that symmetry numerically (its Kohn-Sham partners
+    /// differ by ~1e-5 Ha) and the evGW map amplifies the resulting
+    /// antisymmetric mode: for C6H6 the E1g HOMO pair goes from a 1.8e-5 Ha KS
+    /// splitting to 8.2e-3 Ha and then oscillates, which is what prevents
+    /// convergence.  With a positive tolerance, orbitals whose *Kohn-Sham*
+    /// energies lie within the tolerance are updated as a block (their
+    /// quasiparticle energies are replaced by the group average) every round.
+    /// MolGW does not need this because its integrals keep the pairs exactly
+    /// degenerate.
+    ///
+    /// Grouping uses the fixed KS spectrum, so it cannot drift during the
+    /// iteration.  Default `1e-4` Ha; set to `0.0` to disable.
+    pub evgw_degeneracy_tol:f64,
+    /// MolGW-style handling of the orbitals outside the explicitly computed
+    /// window during evGW.
+    ///
+    /// * `false` (default): REST historical behaviour -- extrapolate their
+    ///   quasiparticle energies with the rigid shift of the lowest/highest
+    ///   computed orbital.
+    /// * `true`: keep them at their initial (Kohn-Sham) energies, exactly as
+    ///   MolGW's `find_qp_energy_linearization` does (it initialises
+    ///   `energy_qp_z = energy0` and only overwrites `nsemin..nsemax`, so
+    ///   out-of-window states are fed back unchanged).
+    pub evgw_freeze_outside:bool,
+    /// Finite-difference step (Ha) used by the MolGW-style `z_update` solver to
+    /// evaluate `dSigma_c/domega` for the Z factor.  It must be larger than the
+    /// scale on which the self-energy varies sharply (the smallest
+    /// imaginary-axis quadrature frequency).
+    /// Default 0.01 (MolGW's `step_sigma` default).
+    pub evgw_z_step:f64,
+    /// Optional hard cap (Ha) on the per-orbital quasiparticle-energy change of
+    /// one evGW round.  `0.0` (default) = unlimited.  This is the practical
+    /// analogue of MolGW's `Z <= 1` clamp: it bounds the step taken by the
+    /// eigenvalue self-consistency and prevents a quasiparticle-equation root
+    /// solve from jumping to a spurious distant root.
+    pub evgw_max_step:f64,
+    /// Convergence threshold (Ha) on max_n |E_n^out - E_n^in| for one evGW round.
+    pub evgw_conv_tol:f64,
+    /// Stop the evGW loop as soon as `evgw_conv_tol` is met (otherwise always
+    /// run the full `evgw_rounds` passes).
+    pub evgw_stop_on_convergence:bool,
+    /// Print a per-round convergence report (|dE|, |dG|, HOMO/LUMO).
+    pub evgw_report:bool,
     pub save_gw_homo_lumo_qp:bool,
+    /// Write the GW/evGW checkpoint into the **chkfile** (`[ctrl] chkfile`).
+    ///
+    /// When `true`, REST stores the complete post-SCF state (compatibility
+    /// metadata, the converged SCF arrays, the GW quasiparticle energies and
+    /// the evGW outer-loop progress) inside the same HDF5 file as the SCF
+    /// checkpoint, under the group `rest_gw_checkpoint`, **after GW finishes**
+    /// and **at the end of every evGW round**.  A later run with
+    /// `resume_from_checkpoint = true` can then continue from that file
+    /// instead of redoing the SCF and the GW/evGW work.  Default `false`.
+    ///
+    /// Requires `chkfile` to be set (not `"none"`).  The update is written to
+    /// `<chkfile>.tmp` and renamed onto the chkfile once it is closed, so a job
+    /// killed in the middle of a write does not leave a corrupt checkpoint
+    /// behind.
+    pub save_gw_checkpoint:bool,
+    /// Read the **chkfile** and resume instead of redoing previous work.
+    ///
+    /// * If the stored checkpoint represents a finished GW, the SCF iterations
+    ///   and the whole GW/evGW calculation are skipped and the run continues
+    ///   directly into the BSE/response step.
+    /// * If it represents an interrupted evGW round, the SCF iterations are
+    ///   skipped and the evGW loop continues from the saved round (DIIS history
+    ///   included).
+    ///
+    /// The checkpoint is validated against the current input (basis, electron
+    /// count, charge, spin, geometry, array dimensions) and a clear error is
+    /// raised on any mismatch.  Requires `chkfile` to be set.  Default `false`.
+    pub resume_from_checkpoint:bool,
     pub save_qp_path:String,
     pub save_first_excitation:bool,
     pub save_first_excitation_path:String,
     pub use_low_rank_contour:bool,
     pub low_rank_grid_type:String,   // "linear" or "quadratic" (power-law, denser near zero)
     pub nomega_chi_real:usize,
+    /// How the real-axis low-rank `v*chi*v` is obtained between grid points.
+    ///
+    /// * `"linear"` (default): linear interpolation between the two bracketing
+    ///   grid points.  Removes the artificial discontinuity of the
+    ///   piecewise-constant rule and is the more accurate choice.
+    /// * `"nearest"`: piecewise constant (nearest grid point).  Historical REST
+    ///   behaviour and the rule MolGW uses in `sf_interpolate_vsqrt_chi_vsqrt`;
+    ///   kept for reproducing older numbers and for A/B comparison.
+    pub low_rank_interp:String,
     pub low_rank_tolerance:f64,
     pub omega_chi_max:f64,          // real-axis freq grid max (Ha); 0=auto from de_max
     pub nomega_sigma:usize,         // number of sigma sampling points on each side (de_max scan)
@@ -138,6 +275,24 @@ pub struct QuasiParticle {
     /// properly — exactly as MolGW does with selfenergy_state_range.
     /// Default 100000 (essentially all states, backward compatible).
     pub selfenergy_state_range: usize,
+    /// Restrict the `de_max` scan that sizes the low-rank real-axis grid to the
+    /// window of orbitals explicitly computed in the current run (only used by
+    /// the `extrapolated` GW scheme).
+    ///
+    /// * `false` (default): historical REST behaviour -- scan all states.
+    ///   `de_max` then reaches 10-20 Ha for molecules with a deep core orbital,
+    ///   which makes the uniform real-axis grid far too coarse for the valence
+    ///   region (measured single-pass low-rank error: 1.4e-2 Ha for CO2 and
+    ///   1.4e-1 Ha for C6H6 at `nomega_chi_real = 64`).
+    /// * `true`: scan only the states whose self-energy is actually evaluated,
+    ///   as MolGW does (`de_max` is computed over `nsemin..nsemax`).  This
+    ///   shrinks `de_max` to ~1 Ha and improves the single-pass low-rank error
+    ///   by 170-640x; it turned CO2's evGW from non-converging into 13-round
+    ///   convergence.  **But it is not a free win**: for CH4 the restriction
+    ///   makes `de_max` so small that many residues are clamped to the grid
+    ///   boundary, and CH4 goes from deterministic 21-round convergence to
+    ///   nondeterministic behaviour.  Hence it is opt-in, not the default.
+    pub low_rank_demax_window: bool,
     // response BSE grid sampling parameters
     pub response_bse_x_start: f64,
     pub response_bse_x_end: f64,
@@ -184,7 +339,58 @@ pub struct QuasiParticle {
     pub nlfeast_gmres_restart: usize,
     pub nlfeast_gmres_max_it: usize,
     pub nlfeast_gmres_tol: f64,
+    /// Dynamical kernel used by `gw_or_bse = "dynamic_bse"`:
+    ///   "bse"  — number-conserving RPA-pair kernel on top of the screened
+    ///            static GW-BSE singles block (default);
+    ///   "srpa" — bare-Coulomb sRPA: TDHF static singles block plus the bare
+    ///            two-particle–two-hole coupling (Eq. (7) of Sangalli 2011).
+    pub dynamic_bse_kernel: String,
     pub export_matvec_count: bool,
+    /// Which implementation performs the implicit BSE matrix-vector products.
+    ///
+    /// * `"mo"`: the historical MO-basis matvec in
+    ///   `ri_bse::matvec`, which materialises the `[n_aux, n_o, n_v]`,
+    ///   `[n_aux, n_o, n_o]` and `[n_aux, n_v, n_v]` RI tensors together with
+    ///   the `[n_o*n_v, n_o*n_v]` W matrices.
+    /// * `"ao"` (default): the AO-basis matvec in `ri_bse::matvec_fast`, which folds the
+    ///   MO coefficients directly into the packed AO-basis RI tensor
+    ///   (`rimatr_bse`) and keeps the auxiliary index explicit, so neither the
+    ///   `[n_o*n_v, n_o*n_v]` matrices nor any fully transformed tensor is ever
+    ///   formed.
+    ///
+    /// The historical spellings `"fast"` / `"memory-efficient"` are still
+    /// accepted as aliases for `"mo"` / `"ao"`.
+    ///
+    /// `"ao"` requires `use_ri_symm = true` and a BSE auxiliary basis
+    /// (`bse_auxbas_path`); otherwise the run falls back to `"mo"` with a
+    /// printed warning.
+    pub bse_matvec_style: String,
+    /// Which tensor representation the GW module uses for the RI three-centre
+    /// integrals and the screened interaction.
+    ///
+    /// * `"mo"` (default): the historical route.  Every RI tensor is produced
+    ///   by the MO transformation `ao2mo_rayon` (`scf_data.rimatr` →
+    ///   `dsymm` against the *full* eigenvector, once per auxiliary function
+    ///   and, in `w_c_matrix_from_scf`, once per block of target orbitals).
+    /// * `"ao"`: the AO-basis route in `ri_gw::tensor_ao`.  The packed AO RI
+    ///   tensor is folded with MO coefficients directly,
+    ///   `(Q|nm) = sum_{mu,nu} J_Q[mu,nu] X[mu,n] X[nu,m]`, and the half
+    ///   transformation `Y_Q[mu,m] = sum_nu J_Q[mu,nu] X[nu,m]` is computed
+    ///   **once** and shared by every orbital row.  The cost of all `(Q|nm)`
+    ///   drops from `O(n_aux n_bas^2 n_mo^2 / block)` to
+    ///   `O(n_aux n_bas^2 n_mo + n_aux n_bas n_mo^2)`; no `[n_aux, n_mo, n_mo]`
+    ///   array is ever materialised.
+    ///
+    /// This is the GW analogue of the AO-basis BSE matvec: the auxiliary index
+    /// stays explicit and MO-coefficient folds replace pre-transformed
+    /// MO-basis tensors.
+    pub gw_tensor_style: String,
+    /// AO-pair pre-screening threshold (a.u.) used by `gw_tensor_style = "ao"`.
+    ///
+    /// An AO pair `(mu,nu)` is dropped from every fold when
+    /// `max_Q |J_Q[mu,nu]|` is below this threshold.  `0.0` disables screening
+    /// (bit-for-bit the unscreened result).
+    pub gw_ao_screening_tol: f64,
     pub gw_switch_fallback_threshold: f64,
 }
 
@@ -221,13 +427,29 @@ impl Default for QuasiParticle {
             gw:false,
             save_bse_excitations:false, 
             evgw_rounds:0,
+            evgw_solver:String::from("molgw"),
+            evgw_damping:1.0,
+            evgw_diis:true,
+            evgw_diis_space:8,
+            evgw_diis_start:2,
+            evgw_diis_safeguard:false,
+            evgw_freeze_outside:true,
+            evgw_degeneracy_tol:1e-4,
+            evgw_z_step:0.01,
+            evgw_max_step:0.0,
+            evgw_conv_tol:1e-5,
+            evgw_stop_on_convergence:true,
+            evgw_report:true,
             save_gw_homo_lumo_qp:false,
+            save_gw_checkpoint:false,
+            resume_from_checkpoint:false,
             save_qp_path:String::from("single_qp_path.txt"),
             save_first_excitation:false,
             save_first_excitation_path:String::from("first_excitation_save.txt"),
             use_low_rank_contour:false,
             low_rank_grid_type:String::from("linear"),
             nomega_chi_real:6,
+            low_rank_interp:String::from("linear"),
             low_rank_tolerance:1e-3,
             omega_chi_max:0.0,
             nomega_sigma:10,
@@ -273,6 +495,7 @@ impl Default for QuasiParticle {
             ac_omega_max: 5.0,
             ac_eta: 0.001,
             selfenergy_state_range: 100000,
+            low_rank_demax_window: false,
             // response BSE grid sampling parameters (default: 2 points per dimension)
             response_bse_x_start: 0.0,
             response_bse_x_end: 1.0,
@@ -311,7 +534,12 @@ impl Default for QuasiParticle {
             nlfeast_gmres_restart: 200,
             nlfeast_gmres_max_it: 500,
             nlfeast_gmres_tol: 1e-6,
+            dynamic_bse_kernel: String::from("bse"),
             export_matvec_count: false,
+            // BSE defaults to the AO-basis ("memory-efficient") matvec; GW keeps MO.
+            bse_matvec_style: String::from("ao"),
+            gw_tensor_style: String::from("mo"),
+            gw_ao_screening_tol: 0.0,
             gw_switch_fallback_threshold: 1e6,
         }
     }
@@ -355,12 +583,28 @@ impl QuasiParticle {
         table.insert("gw".to_string(), toml::Value::Boolean(self.gw));
         table.insert("save_bse_excitations".to_string(), toml::Value::Boolean(self.save_bse_excitations));
         table.insert("evgw_rounds".to_string(), toml::Value::Integer(self.evgw_rounds as i64));
+        table.insert("evgw_solver".to_string(), toml::Value::String(self.evgw_solver.clone()));
+        table.insert("evgw_damping".to_string(), toml::Value::Float(self.evgw_damping));
+        table.insert("evgw_diis".to_string(), toml::Value::Boolean(self.evgw_diis));
+        table.insert("evgw_diis_space".to_string(), toml::Value::Integer(self.evgw_diis_space as i64));
+        table.insert("evgw_diis_start".to_string(), toml::Value::Integer(self.evgw_diis_start as i64));
+        table.insert("evgw_diis_safeguard".to_string(), toml::Value::Boolean(self.evgw_diis_safeguard));
+        table.insert("evgw_freeze_outside".to_string(), toml::Value::Boolean(self.evgw_freeze_outside));
+        table.insert("evgw_degeneracy_tol".to_string(), toml::Value::Float(self.evgw_degeneracy_tol));
+        table.insert("evgw_z_step".to_string(), toml::Value::Float(self.evgw_z_step));
+        table.insert("evgw_max_step".to_string(), toml::Value::Float(self.evgw_max_step));
+        table.insert("evgw_conv_tol".to_string(), toml::Value::Float(self.evgw_conv_tol));
+        table.insert("evgw_stop_on_convergence".to_string(), toml::Value::Boolean(self.evgw_stop_on_convergence));
+        table.insert("evgw_report".to_string(), toml::Value::Boolean(self.evgw_report));
         table.insert("save_gw_homo_lumo_qp".to_string(), toml::Value::Boolean(self.save_gw_homo_lumo_qp));
+        table.insert("save_gw_checkpoint".to_string(), toml::Value::Boolean(self.save_gw_checkpoint));
+        table.insert("resume_from_checkpoint".to_string(), toml::Value::Boolean(self.resume_from_checkpoint));
         table.insert("save_qp_path".to_string(), toml::Value::String(self.save_qp_path.clone()));
         table.insert("save_first_excitation".to_string(), toml::Value::Boolean(self.save_first_excitation));
         table.insert("save_first_excitation_path".to_string(), toml::Value::String(self.save_first_excitation_path.clone()));
         table.insert("use_low_rank_contour".to_string(), toml::Value::Boolean(self.use_low_rank_contour));
         table.insert("low_rank_grid_type".to_string(), toml::Value::String(self.low_rank_grid_type.clone()));
+        table.insert("low_rank_interp".to_string(), toml::Value::String(self.low_rank_interp.clone()));
         table.insert("nomega_chi_real".to_string(), toml::Value::Integer(self.nomega_chi_real as i64));
         table.insert("low_rank_tolerance".to_string(), toml::Value::Float(self.low_rank_tolerance));
         table.insert("omega_chi_max".to_string(), toml::Value::Float(self.omega_chi_max));
@@ -407,6 +651,7 @@ impl QuasiParticle {
         table.insert("ac_num_samples".to_string(), toml::Value::Integer(self.ac_num_samples as i64));
         table.insert("ac_omega_max".to_string(), toml::Value::Float(self.ac_omega_max));
         table.insert("ac_eta".to_string(), toml::Value::Float(self.ac_eta));
+        table.insert("low_rank_demax_window".to_string(), toml::Value::Boolean(self.low_rank_demax_window));
         table.insert("selfenergy_state_range".to_string(), toml::Value::Integer(self.selfenergy_state_range as i64));
         table.insert("response_bse_x_start".to_string(), toml::Value::Float(self.response_bse_x_start));
         table.insert("response_bse_x_end".to_string(), toml::Value::Float(self.response_bse_x_end));
@@ -444,10 +689,54 @@ impl QuasiParticle {
         table.insert("nlfeast_gmres_restart".to_string(), toml::Value::Integer(self.nlfeast_gmres_restart as i64));
         table.insert("nlfeast_gmres_max_it".to_string(), toml::Value::Integer(self.nlfeast_gmres_max_it as i64));
         table.insert("nlfeast_gmres_tol".to_string(), toml::Value::Float(self.nlfeast_gmres_tol));
+        table.insert("dynamic_bse_kernel".to_string(), toml::Value::String(self.dynamic_bse_kernel.clone()));
         table.insert("export_matvec_count".to_string(), toml::Value::Boolean(self.export_matvec_count));
+        table.insert("bse_matvec_style".to_string(), toml::Value::String(self.bse_matvec_style.clone()));
+        table.insert("gw_tensor_style".to_string(), toml::Value::String(self.gw_tensor_style.clone()));
+        table.insert("gw_ao_screening_tol".to_string(), toml::Value::Float(self.gw_ao_screening_tol));
         table.insert("gw_switch_fallback_threshold".to_string(), toml::Value::Float(self.gw_switch_fallback_threshold));
         toml::Value::Table(table)
     }
+}
+
+/// Normalise a `"mo"` / `"ao"` style keyword.
+///
+/// `aliases` lists the accepted spellings of the non-default style; anything
+/// unrecognised (including a missing key) falls back to `default`.  The
+/// canonical values stored in `QuasiParticle` are always the short forms
+/// `"mo"` and `"ao"`.
+/// Normalise a style keyword to its canonical `"ao"` / `"mo"` value.
+///
+/// `aliases` are the accepted spellings of the AO implementation.  The MO
+/// spellings `"mo"` / `"fast"` are recognised explicitly, so an *explicit*
+/// `bse_matvec_style = "mo"` really selects the MO matvec even though that
+/// field's default is `"ao"`.  Anything else falls back to `default`.
+pub fn normalise_style(
+    value: Option<&serde_json::Value>,
+    aliases: &[&str],
+    default: &str,
+) -> String {
+    match value {
+        Some(serde_json::Value::String(s)) => {
+            let lower = s.trim().to_lowercase();
+            if aliases.iter().any(|a| *a == lower) {
+                String::from("ao")
+            } else if matches!(lower.as_str(), "mo" | "fast") {
+                String::from("mo")
+            } else {
+                default.to_string()
+            }
+        }
+        _ => default.to_string(),
+    }
+}
+
+/// `true` when the stored style selects the AO-basis implementation.
+pub fn style_is_ao(style: &str) -> bool {
+    matches!(
+        style.trim().to_lowercase().as_str(),
+        "ao" | "memory-efficient" | "memory_efficient" | "mem-efficient"
+    )
 }
 
 pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Option<QuasiParticle>> { 
@@ -657,6 +946,71 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(4) as usize},
                 other => {0}
             };
+            tmp_input.evgw_solver = match tmp_ctrl.get("evgw_solver").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => {
+                    match s.to_lowercase().as_str() {
+                        "z_update" | "z-update" | "zupdate" => String::from("z_update"),
+                        "molgw" | "molgw_update" | "plain_eval" | "eval" => String::from("molgw"),
+                        _ => String::from("molgw"),
+                    }
+                },
+                _ => String::from("molgw"),
+            };
+            tmp_input.evgw_damping = match tmp_ctrl.get("evgw_damping").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(1.0_f64)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0)},
+                _ => {1.0}
+            };
+            tmp_input.evgw_diis = match tmp_ctrl.get("evgw_diis").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                _ => {true},
+            };
+            tmp_input.evgw_diis_space = match tmp_ctrl.get("evgw_diis_space").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(8_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
+                _ => {8}
+            };
+            tmp_input.evgw_diis_start = match tmp_ctrl.get("evgw_diis_start").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(2_usize)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(2) as usize},
+                _ => {2}
+            };
+            tmp_input.evgw_diis_safeguard = match tmp_ctrl.get("evgw_diis_safeguard").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                _ => {false},
+            };
+            tmp_input.evgw_freeze_outside = match tmp_ctrl.get("evgw_freeze_outside").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                _ => {true},
+            };
+            tmp_input.evgw_degeneracy_tol = match tmp_ctrl.get("evgw_degeneracy_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(1e-4_f64)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-4)},
+                _ => {1e-4}
+            };
+            tmp_input.evgw_z_step = match tmp_ctrl.get("evgw_z_step").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(0.01_f64)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.01)},
+                _ => {0.01}
+            };
+            tmp_input.evgw_max_step = match tmp_ctrl.get("evgw_max_step").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(0.0_f64)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.0)},
+                _ => {0.0}
+            };
+            tmp_input.evgw_conv_tol = match tmp_ctrl.get("evgw_conv_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(1e-5_f64)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-5)},
+                _ => {1e-5}
+            };
+            tmp_input.evgw_stop_on_convergence = match tmp_ctrl.get("evgw_stop_on_convergence").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                _ => {true},
+            };
+            tmp_input.evgw_report = match tmp_ctrl.get("evgw_report").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                _ => {true},
+            };
             tmp_input.bse_max_ang_momentum = match tmp_ctrl.get("bse_max_ang_momentum").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(10_usize)},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(10) as usize},
@@ -668,6 +1022,14 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 other => {21}
             };
             tmp_input.save_gw_homo_lumo_qp = match tmp_ctrl.get("save_gw_homo_lumo_qp").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.save_gw_checkpoint = match tmp_ctrl.get("save_gw_checkpoint").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_str) => {*tmp_str},
+                other => {false},
+            };
+            tmp_input.resume_from_checkpoint = match tmp_ctrl.get("resume_from_checkpoint").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };
@@ -726,6 +1088,12 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(6) as usize},
                 _ => {6}
             };
+            tmp_input.low_rank_interp = match tmp_ctrl.get("low_rank_interp").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => {
+                    if s.eq_ignore_ascii_case("nearest") { String::from("nearest") } else { String::from("linear") }
+                },
+                _ => String::from("linear"),
+            };
             tmp_input.low_rank_tolerance = match tmp_ctrl.get("low_rank_tolerance").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1e-3)},
                 _ => {1e-3},
@@ -741,6 +1109,10 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.step_sigma = match tmp_ctrl.get("step_sigma").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.05)},
                 _ => {0.05},
+            };
+            tmp_input.low_rank_demax_window = match tmp_ctrl.get("low_rank_demax_window").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                _ => {false},
             };
             tmp_input.selfenergy_state_range = match tmp_ctrl.get("selfenergy_state_range").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(100000) as usize},
@@ -1016,6 +1388,30 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e-6),
                 _ => 1e-6,
             };
+            tmp_input.dynamic_bse_kernel = match tmp_ctrl.get("dynamic_bse_kernel").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => {
+                    let lower = s.trim().to_lowercase();
+                    match lower.as_str() {
+                        "srpa" | "bare" | "bare_v" => String::from("srpa"),
+                        _ => String::from("bse"),
+                    }
+                }
+                _ => String::from("bse"),
+            };
+            tmp_input.bse_matvec_style = normalise_style(
+                tmp_ctrl.get("bse_matvec_style"),
+                &["ao", "memory-efficient", "memory_efficient", "mem-efficient"],
+                "ao",
+            );
+            tmp_input.gw_tensor_style = normalise_style(
+                tmp_ctrl.get("gw_tensor_style"),
+                &["ao", "memory-efficient", "memory_efficient", "mem-efficient"],
+                "mo",
+            );
+            tmp_input.gw_ao_screening_tol = match tmp_ctrl.get("gw_ao_screening_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            };
             tmp_input.gw_switch_fallback_threshold = match tmp_ctrl.get("gw_switch_fallback_threshold").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e6),
                 _ => 1e6,
@@ -1067,5 +1463,37 @@ mod tests {
         });
 
         assert!(parse_quasiparticle_keywords(&input).is_err());
+    }
+
+    #[test]
+    fn gw_checkpoint_keys_default_to_off() {
+        let input = json!({
+            "quasiparticle_methods": {}
+        });
+
+        let qp = parse_quasiparticle_keywords(&input).unwrap().unwrap();
+        assert!(!qp.save_gw_checkpoint);
+        assert!(!qp.resume_from_checkpoint);
+    }
+
+    #[test]
+    fn gw_checkpoint_keys_are_parsed() {
+        let input = json!({
+            "quasiparticle_methods": {
+                "save_gw_checkpoint": true,
+                "resume_from_checkpoint": true
+            }
+        });
+
+        let qp = parse_quasiparticle_keywords(&input).unwrap().unwrap();
+        assert!(qp.save_gw_checkpoint);
+        assert!(qp.resume_from_checkpoint);
+
+        // ... and round-trips through the TOML serialisation.
+        let table = qp.to_toml();
+        assert_eq!(table["save_gw_checkpoint"].as_bool(), Some(true));
+        assert_eq!(table["resume_from_checkpoint"].as_bool(), Some(true));
+        // The GW archive now lives in the chkfile; the separate path is gone.
+        assert!(table.get("gw_checkpoint_path").is_none());
     }
 }

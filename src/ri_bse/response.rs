@@ -292,31 +292,20 @@ pub fn response_bse_pople(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     println!("Now begins response BSE calculation (Pople). Parameters:\nOcc Size={},Vir Size={},External Field Freq={},Lifetime Gamma={}",occ_size,vir_size,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma);
     let mu_z_vec=compute_mu_z_vec(scf_data);
-    let ri_oo=ri_bse::get_submatrix(scf_data,'O','O','N');
-    println!("num_auxbas={}",ri_oo.size[0]);
-    let num_auxbas=ri_oo.size[0];
-    let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
-    _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
-    drop(ri_oo);
-    ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
-    ri_oo_tilde=ri_oo_tilde.transpose_and_drop();
-    ri_oo_tilde.reshape([occ_size*num_auxbas,occ_size]);
-    let ri_ov=ri_bse::get_submatrix(scf_data,'O','V','N');
-    let mut ri_ov_w=ri_ov.clone();
-    ri_ov_w.reshape([num_auxbas*occ_size,vir_size]);
-    let mut ri_vv=ri_bse::get_submatrix(scf_data,'V','V','N');
-    ri_vv.reshape([num_auxbas*vir_size,vir_size]);
-    let mut ri_ov_tilde:MatrixFull<f64>=MatrixFull::new(ri_ov.size,0.0);
-    _dgemm_full(&inverse_dielectric,'N',&ri_ov,'N',&mut ri_ov_tilde,1.0,0.0);
+    // Response BSE shares `bse_matvec_style` with the ordinary BSE solvers:
+    // "ao" runs the AO-basis matvec, and then no MO-basis RI tensor is built.
+    let mv = ri_bse::BseMatvec::new(scf_data, &inverse_dielectric, true);
     drop(inverse_dielectric);
-    ri_ov_tilde.reshape([num_auxbas*occ_size,vir_size]);
     let external_field_freq=qp_ctrl.external_field_freq;
     let lifetime_gamma=qp_ctrl.lifetime_gamma;
     let p0=prepare_p0_r_i(&mu_z_vec,&scf_data.gwqp.0,external_field_freq,lifetime_gamma,occ_size,vir_size);
     let wrapped_pair_matvec = |pairvec:&(Vec<f64>,Vec<f64>)| -> (Vec<f64>,Vec<f64>) {
-        pairvec_matvec(scf_data,&ri_vv,&ri_ov,&ri_oo_tilde,
-            &ri_ov_w,&ri_ov_tilde,&pairvec.0,&pairvec.1,
-            &qp_ctrl)
+        let ap = mv.a(scf_data,&qp_ctrl,&pairvec.0);
+        let am = mv.a(scf_data,&qp_ctrl,&pairvec.1);
+        let bp = mv.b(scf_data,&qp_ctrl,&pairvec.0);
+        let bm = mv.b(scf_data,&qp_ctrl,&pairvec.1);
+        (ap.iter().enumerate().map(|(k,apk)| apk + bm[k]).collect(),
+         bp.iter().enumerate().map(|(k,bpk)| bpk + am[k]).collect())
     };
     let wrapped_update_w=|u:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)|->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
         update_w_vecs(&u.0,&u.1,&u.2,&u.3,|x|wrapped_pair_matvec(&x),
@@ -477,31 +466,17 @@ pub fn response_bse_gmres(scf_data:&SCF)->(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>){
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     println!("Now begins response BSE calculation. Parameters:\nOcc Size={},Vir Size={},External Field Freq={},Lifetime Gamma={}",occ_size,vir_size,qp_ctrl.external_field_freq,qp_ctrl.lifetime_gamma);
     let mu_z_vec=compute_mu_z_vec(scf_data);
-    let ri_oo=ri_bse::get_submatrix(scf_data,'O','O','N');
-    println!("num_auxbas={}",ri_oo.size[0]);
-    let num_auxbas=ri_oo.size[0];
-    let mut ri_oo_tilde:MatrixFull<f64>=MatrixFull::new(ri_oo.size,0.0);
-    _dgemm_full(&inverse_dielectric,'N',&ri_oo,'N',&mut ri_oo_tilde,1.0,0.0);
-    drop(ri_oo);
-    ri_oo_tilde.reshape([num_auxbas*occ_size,occ_size]);
-    ri_oo_tilde=ri_oo_tilde.transpose_and_drop();
-    ri_oo_tilde.reshape([occ_size*num_auxbas,occ_size]);
-    let ri_ov=ri_bse::get_submatrix(scf_data,'O','V','N');
-    let mut ri_ov_w=ri_ov.clone();
-    ri_ov_w.reshape([num_auxbas*occ_size,vir_size]);
-    let mut ri_vv=ri_bse::get_submatrix(scf_data,'V','V','N');
-    ri_vv.reshape([num_auxbas*vir_size,vir_size]);
-    let mut ri_ov_tilde:MatrixFull<f64>=MatrixFull::new(ri_ov.size,0.0);
-    _dgemm_full(&inverse_dielectric,'N',&ri_ov,'N',&mut ri_ov_tilde,1.0,0.0);
+    // Response BSE shares `bse_matvec_style` with the ordinary BSE solvers:
+    // "ao" runs the AO-basis matvec, and then no MO-basis RI tensor is built.
+    let mv = ri_bse::BseMatvec::new(scf_data, &inverse_dielectric, true);
     drop(inverse_dielectric);
-    ri_ov_tilde.reshape([num_auxbas*occ_size,vir_size]);
     let external_field_freq=qp_ctrl.external_field_freq;
     let lifetime_gamma=qp_ctrl.lifetime_gamma;
     let casida_a_matvec=|z:&Vec<f64>|{
-        ri_bse::matvec::a_block_matvec(scf_data,&qp_ctrl,&ri_vv,&ri_ov,&ri_oo_tilde,z)
+        mv.a(scf_data, &qp_ctrl, z)
     };
     let casida_b_matvec=|z:&Vec<f64>|{
-        ri_bse::matvec::b_block_matvec(scf_data,&qp_ctrl,&ri_ov,&ri_ov_w,&ri_ov_tilde,z)
+        mv.b(scf_data, &qp_ctrl, z)
     };
     let gmres_matvec=|z:&(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)|{
         let mut vec1=casida_a_matvec(&z.0);
@@ -721,34 +696,20 @@ pub fn response_bse_klopper(scf_data: &SCF) -> (Vec<f64>, Vec<f64>, Vec<f64>, Ve
     println!("Now begins response BSE calculation (Klopper Subspace Solver). Parameters:\nOcc Size={}, Vir Size={}, External Field Freq={}, Lifetime Gamma={}",
              occ_size, vir_size, qp_ctrl.external_field_freq, qp_ctrl.lifetime_gamma);
     let mu_z_vec = compute_mu_z_vec(scf_data);
-    let ri_oo = ri_bse::get_submatrix(scf_data, 'O', 'O', 'N');
-    println!("num_auxbas={}", ri_oo.size[0]);
-    let num_auxbas = ri_oo.size[0];
-    let mut ri_oo_tilde: MatrixFull<f64> = MatrixFull::new(ri_oo.size, 0.0);
-    _dgemm_full(&inverse_dielectric, 'N', &ri_oo, 'N', &mut ri_oo_tilde, 1.0, 0.0);
-    drop(ri_oo);
-    ri_oo_tilde.reshape([num_auxbas * occ_size, occ_size]);
-    ri_oo_tilde = ri_oo_tilde.transpose_and_drop();
-    ri_oo_tilde.reshape([occ_size * num_auxbas, occ_size]);
-    let ri_ov = ri_bse::get_submatrix(scf_data, 'O', 'V', 'N');
-    let mut ri_ov_w = ri_ov.clone();
-    ri_ov_w.reshape([num_auxbas * occ_size, vir_size]);
-    let mut ri_vv = ri_bse::get_submatrix(scf_data, 'V', 'V', 'N');
-    ri_vv.reshape([num_auxbas * vir_size, vir_size]);
-    let mut ri_ov_tilde: MatrixFull<f64> = MatrixFull::new(ri_ov.size, 0.0);
-    _dgemm_full(&inverse_dielectric, 'N', &ri_ov, 'N', &mut ri_ov_tilde, 1.0, 0.0);
+    // Response BSE shares `bse_matvec_style` with the ordinary BSE solvers:
+    // "ao" runs the AO-basis matvec, and then no MO-basis RI tensor is built.
+    let mv = ri_bse::BseMatvec::new(scf_data, &inverse_dielectric, true);
     drop(inverse_dielectric);
-    ri_ov_tilde.reshape([num_auxbas * occ_size, vir_size]);
 
     let external_field_freq = qp_ctrl.external_field_freq;
     let lifetime_gamma = qp_ctrl.lifetime_gamma;
 
     // Matrix-vector product: same 4-component operator as GMRES
     let casida_a_matvec = |z: &Vec<f64>| {
-        ri_bse::matvec::a_block_matvec(scf_data, &qp_ctrl, &ri_vv, &ri_ov, &ri_oo_tilde, z)
+        mv.a(scf_data, &qp_ctrl, z)
     };
     let casida_b_matvec = |z: &Vec<f64>| {
-        ri_bse::matvec::b_block_matvec(scf_data, &qp_ctrl, &ri_ov, &ri_ov_w, &ri_ov_tilde, z)
+        mv.b(scf_data, &qp_ctrl, z)
     };
     let gmres_matvec = |z: &(Vec<f64>,Vec<f64>,Vec<f64>,Vec<f64>)| {
         let mut vec1 = casida_a_matvec(&z.0);
