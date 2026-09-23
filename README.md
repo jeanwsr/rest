@@ -930,6 +930,7 @@ analdrv_tasks = ["multipole", "hessian"]
 - `cpscf_lindep`：CP-SCF 中一些数值过程的数值精度阈值。默认 1e-15，无量纲。
 - `cpscf_tol_inflation`：容忍系数。若 Krylov 真残差 `||r|| < factor * tol`，接受该解而不触发 per-root 求解。缺省为1000.0。
 - `grid_level_cpscf`：CP-SCF 中响应路径 (响应/A 张量收缩的 DFT 计算；fock 路径仍用 SCF 格点) 的 DFT 格点级别。仅影响 numint_matmul 后端实现。默认为 None，是 `[ctrl]` 中 grid_generation_level 关键词设定值减 2 (SCF 默认格点级别是 3，对应 Hessian 的级别是 1)；显式取值不设下限。
+- `resp_auxbas_path`：响应计算辅助基路径。默认为 None，即使用 `[ctrl]` 中 auxbas_path 设定的辅助基组。若显式指定，则在 CP-SCF/Z-Vector/response 计算中使用对应辅助基。该选项通常用于指定更小的辅助基以加速 CP-SCF 计算，但作为代价会降低 CP-SCF 的精度且增加内存占用。
 
 这些关键词的旧名称 `cphf_*` 前缀 (`cphf_tol`、`cphf_lindep`、`cphf_tol_inflation` 等) 目前仍然作为别名被接受；响应格点则同时接受其旧名称 `grid_level_cphf`。
 
