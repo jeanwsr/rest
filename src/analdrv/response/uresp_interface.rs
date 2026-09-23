@@ -68,6 +68,13 @@ pub struct URespSCF<'a> {
     /// Orbital state stored by [`Self::make_cpscf_preparation`]; the CP-SCF machinery panics
     /// until it is set.
     cpscf_state: Option<UCpscfState>,
+    /// Timing information. Represented by wall time in second.
+    ///
+    /// Entries of the inherent CP-SCF machinery ([`Self::response_mo`],
+    /// [`Self::response_dimless_cpscf`], [`Self::solve_dimless_cpscf`]), pushed in call order.
+    /// The drivers splice them into their own timing report (e.g. the hessian driver, after the
+    /// CP-SCF solve and in `finalize_cpscf`).
+    pub timing: Vec<(String, f64)>,
 }
 
 /// Orbital state cached by [`URespSCF::make_cpscf_preparation`] for the inherent CP-SCF
@@ -209,15 +216,17 @@ impl<'a> URespSCF<'a> {
         let mo_coeff = [state.mo_coeff[α].view(), state.mo_coeff[β].view()];
         let ubra_α = &mo_coeff[α] % &mo1[α];
         let ubra_β = &mo_coeff[β] % &mo1[β];
-        let mut resp_α = rt::zeros_like(&ubra_α);
-        let mut resp_β = rt::zeros_like(&ubra_β);
+        let mut resp_α = rt::zeros_like(&mo1[α]);
+        let mut resp_β = rt::zeros_like(&mo1[β]);
 
         // the get_response_bra fan-out is inlined (not the composite trait method), keeping the
         // `cpscf_state` borrow disjoint from the `resp_list` iteration
         for resp_obj in self.resp_list.iter_mut() {
+            let t1 = std::time::Instant::now();
             let el_resp = resp_obj.get_response_bra(&[ubra_α.view(), ubra_β.view()]);
             resp_α += mo_coeff[α].t() % &el_resp[α];
             resp_β += mo_coeff[β].t() % &el_resp[β];
+            self.timing.push((format!("in response_mo, {}", resp_obj.get_type_name()), t1.elapsed().as_secs_f64()));
         }
         [resp_α, resp_β]
     }
@@ -239,6 +248,7 @@ impl<'a> URespSCF<'a> {
     ///
     /// - `resp` : shape `[nmo_s, nocc_s, ...]` per spin. The dimensionless response in MO space.
     pub fn response_dimless_cpscf(&mut self, mo1: &[TsrView; 2]) -> [Tsr; 2] {
+        let t0 = std::time::Instant::now();
         let [α, β] = [0, 1];
         let mut resp = self.response_mo(mo1);
 
@@ -257,6 +267,7 @@ impl<'a> URespSCF<'a> {
         *&mut resp[β].i_mut(sv[β]) /= &state.e_ai_shift[β];
         resp[α].i_mut(so[α]).fill(0.0);
         resp[β].i_mut(so[β]).fill(0.0);
+        self.timing.push(("response_dimless_cpscf".to_string(), t0.elapsed().as_secs_f64()));
         resp
     }
 
@@ -277,6 +288,7 @@ impl<'a> URespSCF<'a> {
     /// - `mo1` : shape `[nmo_s, nocc_s, ...]` per spin. Perturbation in MO space that solves the
     ///   dimensionless CP-SCF equation.
     pub fn solve_dimless_cpscf(&mut self, rhs: &[TsrView; 2]) -> [Tsr; 2] {
+        let t0 = std::time::Instant::now();
         let [α, β] = [0, 1];
         let rhs_shape = [rhs[α].shape().to_vec(), rhs[β].shape().to_vec()];
         let nmo = [rhs[α].shape()[0], rhs[β].shape()[0]];
@@ -344,6 +356,7 @@ impl<'a> URespSCF<'a> {
         let [mo1_α, mo1_β] = unpack_flattened(mo1_flattened.view());
         let mo1_α = mo1_α.into_shape(rhs_shape[α].to_vec());
         let mo1_β = mo1_β.into_shape(rhs_shape[β].to_vec());
+        self.timing.push(("solve_dimless_cpscf".to_string(), t0.elapsed().as_secs_f64()));
         [mo1_α, mo1_β]
     }
 }
@@ -405,5 +418,5 @@ pub fn uscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> URe
         resp_list.push(Box::new(resp_obj));
     }
 
-    URespSCF { resp_list, resp_cfg: config.resp.clone(), cpscf_state: None }
+    URespSCF { resp_list, resp_cfg: config.resp.clone(), cpscf_state: None, timing: Vec::new() }
 }

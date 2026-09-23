@@ -257,6 +257,8 @@ impl<'a, 'b, 'c> UHessSCF<'a, 'b, 'c> {
         let mo_e1_α = b1mo_α.i(so[α]) + &mo1_α.i(so[α]) * &e_ij[α];
         let mo_e1_β = b1mo_β.i(so[β]) + &mo1_β.i(so[β]) * &e_ij[β];
 
+        // splice the response-object timing of the last-iteration `response_mo` call
+        self.timing.append(&mut self.resp.timing);
         self.timing.push(("finalize_cpscf".to_string(), t0.elapsed().as_secs_f64()));
         HashMap::from([("mo1_0", mo1_α), ("mo1_1", mo1_β), ("mo_e1_0", mo_e1_α), ("mo_e1_1", mo_e1_β)])
     }
@@ -313,6 +315,8 @@ impl<'a, 'b, 'c> UHessSCF<'a, 'b, 'c> {
 
         self.make_response_preparation();
         let mo1 = self.resp.solve_dimless_cpscf(&rhs);
+        // splice the CP-SCF solve timing entries of the response object into the driver report
+        self.timing.append(&mut self.resp.timing);
         let mo1_view = [mo1[0].view(), mo1[1].view()];
         let finalize_dict = self.finalize_cpscf(&f1mo, &s1mo, &mo1_view);
         let mo1 = [finalize_dict.get("mo1_0").unwrap().view(), finalize_dict.get("mo1_1").unwrap().view()];

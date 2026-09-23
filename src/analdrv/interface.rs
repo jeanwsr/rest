@@ -77,6 +77,21 @@ pub fn analdrv_interface(scf_data: &mut SCF, tasks: &[AnalDrvTask], config: &Ana
     let has_multipole = tasks.iter().any(|task| matches!(task, AnalDrvTask::Multipole));
     let has_hessian = tasks.iter().any(|task| matches!(task, AnalDrvTask::Hessian));
     let is_fifth = scf_data.mol.xc_data.is_fifth_dfa();
+    // the hessian task on post-SCF methods is rejected outright (the same guard as inside
+    // `hess_interface`, for direct callers); reject here already, so that no grid/response
+    // preparation is wasted on a run that cannot succeed
+    if is_fifth && has_hessian {
+        panic!("Normal modes calculation is currently not available for post-SCF methods.");
+    }
+    // the unrestricted multipole task is rejected unconditionally for post-SCF methods (in
+    // `multipole_interface_u`); reject here already, so that no grid/response preparation is
+    // wasted on a run that cannot succeed
+    if is_fifth && has_multipole && matches!(scf_data.scftype, SCFType::UHF) {
+        panic!(
+            "Multipole evaluation is not implemented for unrestricted post-SCF (double-hybrid, \
+             fifth-DFA) methods yet; only SCF-level UHF/UKS is supported."
+        );
+    }
     // the relaxed (Z-vector) DH multipole increments are the only multipole requirement on the
     // response object; the unrelaxed increments still need the DFT grids (regenerated below)
     let multipole_relaxed_dh = has_multipole && is_fifth && config.multipole.rdm1_relax == MultipoleRdm1Relax::Relaxed;

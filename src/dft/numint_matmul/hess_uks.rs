@@ -510,7 +510,7 @@ pub fn get_vmat_becke_parts_uks(
 /// across chunks by a plain sum; grid-atom keys carry only the chunk atom's
 /// contribution and are scattered by [`make_hessian_setup_becke_uks`]:
 ///
-/// - Sum: `fxc [ngrids, nvar, 2, nvar, 2]` (disjoint grid ranges); `de_fxc`, `de_vxc_diag_a/b`,
+/// - Sum: `de_fxc`, `de_vxc_diag_a/b`,
 ///   `de_vxc_off_a/b`, `de_becke_full_1/2` `[3, 3, natm, natm]`; `vmat_ip_a/b [nao, nao, 3]`;
 ///   `vmat_fxc_a/b`, `vmat_vxc_a/b`, `vmat_deriv1_a/b`, `vmat_becke_dw_a/b` `[nao, nao, 3, natm]`.
 /// - Scatter into column `B = atm_idx` (direction axes interchanged): `de_becke_atom_1/2`,
@@ -690,7 +690,6 @@ pub fn make_hessian_setup_chunk_becke_uks(
     }
 
     let mut result = HashMap::from([
-        ("fxc", fxc),
         ("de_fxc", de_fxc),
         ("de_vxc_diag_a", de_vxc_diag_α),
         ("de_vxc_diag_b", de_vxc_diag_β),
@@ -777,8 +776,6 @@ pub fn make_hessian_setup_becke_uks(
     let nao = mol.nao();
     let ngrids = ni.weights.len();
     let nchunk = ni.nchunk;
-    let xc_type = determine_den_type_from_list(&xc_func_list.iter().map(|(_, f)| f).collect_vec());
-    let nvar = xc_type.num_nvar();
     let device = dm0α.device().clone();
 
     // per-atom grid boundaries, deduced from the (atom-grouped) attribution
@@ -805,7 +802,6 @@ pub fn make_hessian_setup_becke_uks(
     let chunks = quad_split_by_atom(&atm_quad_split, ngrids, nchunk);
     let nchunks = chunks.len();
 
-    let fxc_full: Tsr = rt::zeros(([ngrids, nvar, 2, nvar, 2], &device));
     let de_fxc: Tsr = rt::zeros(([3, 3, natm, natm], &device));
     let de_vxc_diag_α: Tsr = rt::zeros(([3, 3, natm, natm], &device));
     let de_vxc_diag_β: Tsr = rt::zeros(([3, 3, natm, natm], &device));
@@ -857,12 +853,6 @@ pub fn make_hessian_setup_becke_uks(
             hardness,
             grid_shift,
         );
-        // fxc: disjoint grid ranges
-        unsafe {
-            let fxc_slc = fxc_full.i(start..end);
-            let mut fxc_slc = fxc_slc.force_mut();
-            fxc_slc.assign(&result_chunk["fxc"]);
-        }
         // sum the full-grid keys, scatter the grid-atom keys into the chunk
         // atom's column of the last (B) axis
         unsafe {
@@ -951,7 +941,6 @@ pub fn make_hessian_setup_becke_uks(
     };
 
     let mut result = HashMap::from([
-        ("fxc", fxc_full),
         ("de_fxc", de_fxc),
         ("de_vxc_diag_a", de_vxc_diag_α),
         ("de_vxc_diag_b", de_vxc_diag_β),
