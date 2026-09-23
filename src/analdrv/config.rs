@@ -46,11 +46,11 @@ impl Default for AnalDrvGeneralCfg {
 ///
 /// All these keywords are specific to the CP-SCF-type solve, hence the `cpscf_*` key names.
 /// `grid_level` is not a solver setting but the DFT grid of the CP-SCF response evaluation (the
-/// response path; the fock path and the DH generalized Fock stay on the SCF grid), so it is named
-/// in the `grid_level_*` family of [`AnalDrvNucgradCfg::grid_level_skeleton`] with `cpscf` as the
-/// scope. Likewise, `auxbas_path` configures the response objects themselves (not only the
-/// CP-SCF solve — every consumer of the response object shares it), so it is named in the `resp_`
-/// scope.
+/// low-precision response path; the fock path and the DH generalized Fock stay on the SCF grid),
+/// so it is named in the `grid_level_*` family of
+/// [`AnalDrvNucgradCfg::grid_level_skeleton`] with `cpscf` as the scope. Likewise, `auxbas_path`
+/// configures the response objects themselves (the low-precision resource, not only the CP-SCF
+/// solve), so it is named in the `resp_` scope.
 ///
 /// The legacy `cphf_*` prefixed key names are still accepted as aliases.
 #[serde_inline_default]
@@ -81,16 +81,18 @@ pub struct AnalDrvRespCfg {
     #[serde(rename = "grid_level_cpscf", alias = "grid_level_cphf")]
     #[serde_inline_default(None)]
     pub grid_level: Option<usize>,
-    /// Auxiliary basis of the RI-JK response objects (the response/A-tensor side), as a
+    /// Auxiliary basis of the RI-JK response objects (the low-precision response side), as a
     /// basis-set pool name or an element-JSON directory — the same value format as
     /// `ctrl.auxbas_path`.
     ///
     /// By default `None`: the response objects reuse the SCF auxiliary basis, borrowing the SCF
     /// `rimatr` (and `rimatr_sr` for range-separated hybrids) with no copy. When set, a
-    /// decomposed ERI is freshly built on this basis for the response objects only — the
-    /// energy-derivative (B-side) objects of the hessian/multipole tasks keep the SCF auxiliary
-    /// basis, so the CP-SCF solve becomes a mixed-representation approximation (parallel to
-    /// `grid_level_cpscf`). Not supported together with `even_tempered_basis`.
+    /// decomposed ERI is freshly built on this basis and attached as the low-precision
+    /// (`prec = false`) resource: it feeds the CP-SCF response contractions only, while the fock
+    /// forms (`prec = true`) and the energy-derivative (B-side) objects of the hessian/multipole
+    /// tasks keep the SCF auxiliary basis, so the CP-SCF solve becomes a mixed-representation
+    /// approximation (parallel to `grid_level_cpscf`). Not supported together with
+    /// `even_tempered_basis`.
     #[serde(rename = "resp_auxbas_path")]
     #[serde_inline_default(None)]
     pub auxbas_path: Option<String>,

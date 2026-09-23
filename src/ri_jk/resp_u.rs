@@ -30,8 +30,12 @@ pub struct URespRIJK<'a> {
     pub factor_j: f64,
     /// Exchange factor, absorbed into the returned fock/response tensors.
     pub factor_k: f64,
-    /// Cholesky decomposed 3c-2e ERI, shape `[nao_tp, naux]`.
+    /// Cholesky decomposed 3c-2e ERI of the SCF auxiliary basis (the high-precision resource),
+    /// shape `[nao_tp, naux]`.
     pub cderi: TsrCow<'a>,
+    /// Optional decomposed ERI of the response auxiliary basis (`resp_auxbas_path`, the
+    /// low-precision resource); `None` reuses `cderi`.
+    pub cderi_resp: Option<TsrCow<'a>>,
     /// Response intermediates: `mo_coeff_s [nao, nmo_s]` (RowMajor) and `mo_occ_s [nmo_s]`, stored
     /// by [`URespAPI::make_response_preparation`].
     pub intmd: HashMap<String, Tsr>,
@@ -40,7 +44,27 @@ pub struct URespRIJK<'a> {
 impl<'a> URespRIJK<'a> {
     /// Create from a Cholesky-decomposed ERI (`cderi`).
     pub fn new_with_cderi(factor_j: f64, factor_k: f64, cderi: TsrCow<'a>) -> Self {
-        Self { factor_j, factor_k, cderi, intmd: HashMap::new() }
+        Self { factor_j, factor_k, cderi, cderi_resp: None, intmd: HashMap::new() }
+    }
+
+    /// Attach a dedicated decomposed ERI (`cderi_resp`) of the response auxiliary basis for the
+    /// low-precision (`prec = false`) path.
+    ///
+    /// When set, the response contractions called with `prec = false` (the CP-SCF machinery)
+    /// evaluate on this tensor instead of the SCF-basis `cderi`.
+    pub fn set_cderi_resp(mut self, cderi_resp: TsrCow<'a>) -> Self {
+        self.cderi_resp = Some(cderi_resp);
+        self
+    }
+
+    /// The decomposed ERI selected by the precision flag: the SCF-basis `cderi` for `prec = true`,
+    /// the response-basis [`Self::cderi_resp`] for `prec = false` (falling back to `cderi`).
+    fn cderi_in_use(&self, prec: bool) -> &TsrCow<'a> {
+        if prec {
+            &self.cderi
+        } else {
+            self.cderi_resp.as_ref().unwrap_or(&self.cderi)
+        }
     }
 }
 
@@ -55,20 +79,21 @@ impl<'a> URespAPI for URespRIJK<'a> {
     /// spin density carries occupation 1.
     ///
     /// The `rdm` is assumed to be symmetric, as required by the pure in-core functions.
-    fn get_fock_rdm(&mut self, rdm: &[TsrView; 2]) -> [Tsr; 2] {
+    fn get_fock_rdm(&mut self, rdm: &[TsrView; 2], prec: bool) -> [Tsr; 2] {
         let [α, β] = [0, 1];
         for rdm_s in rdm {
             assert_eq!(rdm_s.ndim(), 2, "rdm must have 2 dimensions");
         }
         let nao = rdm[α].shape()[0];
-        let device = self.cderi.device();
+        let cderi = self.cderi_in_use(prec);
+        let device = cderi.device();
 
         let mut fock = [rt::zeros(([nao, nao], device)), rt::zeros(([nao, nao], device))];
         if self.factor_j != 0.0 {
             // J: total (α+β) density, spin-independent
             let dm_total = &rdm[α] + &rdm[β];
             let dms = dm_total.into_contig(ColMajor).into_shape((nao, nao, 1));
-            let vj = get_vj_ri_incore(self.cderi.view(), dms.view()).i((.., .., 0)).into_contig(ColMajor);
+            let vj = get_vj_ri_incore(cderi.view(), dms.view()).i((.., .., 0)).into_contig(ColMajor);
             fock[α] += self.factor_j * &vj;
             fock[β] += self.factor_j * &vj;
         }
@@ -77,7 +102,7 @@ impl<'a> URespAPI for URespRIJK<'a> {
             for (s, fock_s) in fock.iter_mut().enumerate() {
                 let dms = rdm[s].view().into_contig(ColMajor).into_shape((nao, nao, 1));
                 // TODO: batch size `72` should be tunable by max-memory.
-                let vk = get_vk_ri_incore_dm(self.cderi.view(), dms.view(), 72).i((.., .., 0)).into_contig(ColMajor);
+                let vk = get_vk_ri_incore_dm(cderi.view(), dms.view(), 72).i((.., .., 0)).into_contig(ColMajor);
                 *fock_s -= self.factor_k * &vk;
             }
         }
@@ -86,10 +111,11 @@ impl<'a> URespAPI for URespRIJK<'a> {
 
     /// Fock per spin from molecular coefficients: J by the dm route (no coeff-native vj exists), K
     /// by the coeff-native pure function per spin.
-    fn get_fock_coeff(&mut self, mo_coeff: &[TsrView; 2], mo_occ: &[TsrView; 2]) -> [Tsr; 2] {
+    fn get_fock_coeff(&mut self, mo_coeff: &[TsrView; 2], mo_occ: &[TsrView; 2], prec: bool) -> [Tsr; 2] {
         let [α, β] = [0, 1];
         let nao = mo_coeff[α].shape()[0];
-        let device = self.cderi.device();
+        let cderi = self.cderi_in_use(prec);
+        let device = cderi.device();
 
         let mut fock = [rt::zeros(([nao, nao], device)), rt::zeros(([nao, nao], device))];
         if self.factor_j != 0.0 {
@@ -97,7 +123,7 @@ impl<'a> URespAPI for URespRIJK<'a> {
             let dm_total = get_dm0_restricted(mo_coeff[α].view(), mo_occ[α].view())
                 + get_dm0_restricted(mo_coeff[β].view(), mo_occ[β].view());
             let dms = dm_total.into_contig(ColMajor).into_shape((nao, nao, 1));
-            let vj = get_vj_ri_incore(self.cderi.view(), dms.view()).i((.., .., 0)).into_contig(ColMajor);
+            let vj = get_vj_ri_incore(cderi.view(), dms.view()).i((.., .., 0)).into_contig(ColMajor);
             fock[α] += self.factor_j * &vj;
             fock[β] += self.factor_j * &vj;
         }
@@ -109,7 +135,7 @@ impl<'a> URespAPI for URespRIJK<'a> {
                 let occ = mo_occ[s].view().into_contig(ColMajor).into_shape((nmo, 1));
                 // TODO: batch size `72` should be tunable by max-memory.
                 let vk =
-                    get_vk_ri_incore_coeff(self.cderi.view(), coeff.view(), occ.view(), 72).i((.., .., 0)).into_contig(ColMajor);
+                    get_vk_ri_incore_coeff(cderi.view(), coeff.view(), occ.view(), 72).i((.., .., 0)).into_contig(ColMajor);
                 *fock_s -= self.factor_k * &vk;
             }
         }
@@ -126,13 +152,14 @@ impl<'a> URespAPI for URespRIJK<'a> {
     /// two-term symmetrized exchange kernel keeps the restricted scale. In the closed-shell
     /// limit (`rdm_α = rdm_β = X`), each spin's response equals the restricted kernel on `X`.
     /// No preparation is required.
-    fn get_response_rdm(&mut self, rdm: &[TsrView; 2]) -> [Tsr; 2] {
+    fn get_response_rdm(&mut self, rdm: &[TsrView; 2], prec: bool) -> [Tsr; 2] {
         for rdm_s in rdm {
             assert_eq!(rdm_s.ndim(), 2, "rdm must have 2 dimensions");
         }
         let [α, β] = [0, 1];
         let nao = rdm[α].shape()[0];
-        let device = self.cderi.device();
+        let cderi = self.cderi_in_use(prec);
+        let device = cderi.device();
 
         // symmetrize (the pure in-core functions require symmetric input); the Coulomb response
         // sees the total (α+β) density
@@ -144,7 +171,7 @@ impl<'a> URespAPI for URespRIJK<'a> {
 
         let mut resp = [rt::zeros(([nao, nao], device)), rt::zeros(([nao, nao], device))];
         if self.factor_j != 0.0 {
-            let vj = get_vj_ri_incore(self.cderi.view(), rdm_total.view()).i((.., .., 0)).into_contig(ColMajor);
+            let vj = get_vj_ri_incore(cderi.view(), rdm_total.view()).i((.., .., 0)).into_contig(ColMajor);
             // 2.0 against the restricted 4.0: occupation 1 vs 2 on the total-density Coulomb
             resp[α] += 2.0 * self.factor_j * &vj;
             resp[β] += 2.0 * self.factor_j * &vj;
@@ -153,24 +180,25 @@ impl<'a> URespAPI for URespRIJK<'a> {
             // K: same-spin exchange, same 2.0 scale as restricted (two-term symmetrized kernel)
             for (s, resp_s) in resp.iter_mut().enumerate() {
                 // TODO: batch size `72` should be tunable by max-memory.
-                let vk = get_vk_ri_incore_dm(self.cderi.view(), rdm_sym[s].view(), 72).i((.., .., 0)).into_contig(ColMajor);
+                let vk = get_vk_ri_incore_dm(cderi.view(), rdm_sym[s].view(), 72).i((.., .., 0)).into_contig(ColMajor);
                 *resp_s -= 2.0 * self.factor_k * &vk;
             }
         }
         resp
     }
 
-    fn make_response_preparation(&mut self, mo_coeff: &[TsrView; 2], mo_occ: &[TsrView; 2]) {
+    fn make_response_preparation(&mut self, mo_coeff: &[TsrView; 2], mo_occ: &[TsrView; 2], _prec: bool) {
+        // the intermediates are precision-independent (the decomposed ERI is selected per call)
         self.intmd.insert("mo_coeff_0".to_string(), mo_coeff[0].view().into_contig(RowMajor));
         self.intmd.insert("mo_coeff_1".to_string(), mo_coeff[1].view().into_contig(RowMajor));
         self.intmd.insert("mo_occ_0".to_string(), mo_occ[0].to_owned());
         self.intmd.insert("mo_occ_1".to_string(), mo_occ[1].to_owned());
     }
 
-    fn get_response_bra(&mut self, bra: &[TsrView; 2]) -> [Tsr; 2] {
+    fn get_response_bra(&mut self, bra: &[TsrView; 2], prec: bool) -> [Tsr; 2] {
         let mo_coeff = [self.intmd["mo_coeff_0"].view(), self.intmd["mo_coeff_1"].view()];
         let mo_occ = [self.intmd["mo_occ_0"].view(), self.intmd["mo_occ_1"].view()];
-        let cderi = self.cderi.view();
+        let cderi = self.cderi_in_use(prec).view();
         let device = mo_coeff[0].device();
         // Shared separated J/K response core: J (AO form, from total density) + per-spin K (bra form).
         let (j_ao, k_bras) = get_rijk_response_bra_separated(

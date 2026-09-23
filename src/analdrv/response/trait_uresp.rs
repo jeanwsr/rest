@@ -37,6 +37,9 @@ pub trait URespAPI: AnalDrvBaseAPI {
     /// # Parameters
     ///
     /// - `rdm` : shape `[nao, nao]` per spin. Reduced one-particle (spin) density matrix.
+    /// - `prec` : precision of the underlying resource: `true` for the high-precision (SCF-grade)
+    ///   one, `false` for the low-precision response resource when attached (falling back to the
+    ///   high-precision one otherwise).
     ///
     /// # Returns
     ///
@@ -48,7 +51,7 @@ pub trait URespAPI: AnalDrvBaseAPI {
     /// No unrestricted driver consumes this method yet; it is part of the trait surface reserved
     /// for the future unrestricted generalized-Fock machinery, mirroring how the restricted
     /// [`RRespAPI::get_fock_rdm`] serves [`RGFockAPI`](crate::analdrv::response::trait_rgfock::RGFockAPI).
-    fn get_fock_rdm(&mut self, rdm: &[TsrView; 2]) -> [Tsr; 2];
+    fn get_fock_rdm(&mut self, rdm: &[TsrView; 2], prec: bool) -> [Tsr; 2];
 
     /// Generate Fock matrix from molecular coefficients and occupation numbers.
     ///
@@ -59,6 +62,8 @@ pub trait URespAPI: AnalDrvBaseAPI {
     ///
     /// - `mo_coeff` : shape `[nao, nmo_s]` per spin. Molecular orbital coefficients.
     /// - `mo_occ` : shape `[nmo_s]` per spin. Molecular orbital occupation numbers.
+    /// - `prec` : precision of the underlying resource, forwarded to
+    ///   [`get_fock_rdm`](Self::get_fock_rdm).
     ///
     /// Note `nmo_s` can be set to `nocc_s` if only occupied orbitals are considered. This can save
     /// memory and speed up the calculation.
@@ -67,9 +72,9 @@ pub trait URespAPI: AnalDrvBaseAPI {
     ///
     /// - `fock` : shape `[nao, nao]` per spin. Fock matrix (the operator in AO basis, not
     ///   contracted by `mo_coeff`).
-    fn get_fock_coeff(&mut self, mo_coeff: &[TsrView; 2], mo_occ: &[TsrView; 2]) -> [Tsr; 2] {
+    fn get_fock_coeff(&mut self, mo_coeff: &[TsrView; 2], mo_occ: &[TsrView; 2], prec: bool) -> [Tsr; 2] {
         let rdm = [get_dm0_restricted(mo_coeff[0].view(), mo_occ[0].view()), get_dm0_restricted(mo_coeff[1].view(), mo_occ[1].view())];
-        self.get_fock_rdm(&[rdm[0].view(), rdm[1].view()])
+        self.get_fock_rdm(&[rdm[0].view(), rdm[1].view()], prec)
     }
 
     /// Prepare the data for response calculation.
@@ -87,7 +92,9 @@ pub trait URespAPI: AnalDrvBaseAPI {
     ///
     /// - `mo_coeff` : shape `[nao, nmo_s]` per spin. Molecular orbital coefficients.
     /// - `mo_occ` : shape `[nmo_s]` per spin. Molecular orbital occupation numbers.
-    fn make_response_preparation(&mut self, mo_coeff: &[TsrView; 2], mo_occ: &[TsrView; 2]);
+    /// - `prec` : precision of the resource the preparation builds on; must match the `prec` of
+    ///   the subsequent response contraction calls (e.g. `false` throughout the CP-SCF solve).
+    fn make_response_preparation(&mut self, mo_coeff: &[TsrView; 2], mo_occ: &[TsrView; 2], prec: bool);
 
     /// Generate response matrix.
     ///
@@ -96,6 +103,9 @@ pub trait URespAPI: AnalDrvBaseAPI {
     /// # Parameters
     ///
     /// - `rdm` : shape `[nao, nao, ...]` per spin. Reduced one-particle (spin) density matrix list.
+    /// - `prec` : precision of the underlying resource: `true` for the high-precision (SCF-grade)
+    ///   one, `false` for the low-precision response resource when attached (falling back to the
+    ///   high-precision one otherwise).
     ///
     /// # Returns
     ///
@@ -108,7 +118,7 @@ pub trait URespAPI: AnalDrvBaseAPI {
     /// [`RRespAPI::get_response_rdm`] serves the RI-PT2 generalized Fock.
     ///
     /// [`make_response_preparation`]: Self::make_response_preparation
-    fn get_response_rdm(&mut self, rdm: &[TsrView; 2]) -> [Tsr; 2];
+    fn get_response_rdm(&mut self, rdm: &[TsrView; 2], prec: bool) -> [Tsr; 2];
 
     /// Generate response matrix in half-transformed MO basis.
     ///
@@ -122,6 +132,9 @@ pub trait URespAPI: AnalDrvBaseAPI {
     ///   occupied molecular coefficients (as input) or contracted fock/response matrix that is
     ///   half-transformed by occupied molecular coefficients (as output). This is usually the
     ///   derivative of MO coefficients (like $U_{\mu i}^\mathbb{A}$ given by CP-SCF).
+    /// - `prec` : precision of the underlying resource: `true` for the high-precision (SCF-grade)
+    ///   one, `false` for the low-precision response resource when attached (falling back to the
+    ///   high-precision one otherwise). The CP-SCF machinery contracts this method with `false`.
     ///
     /// # Returns
     ///
@@ -134,5 +147,5 @@ pub trait URespAPI: AnalDrvBaseAPI {
     /// We have not prepared to propose a good API for fractional occupation.
     ///
     /// [`make_response_preparation`]: Self::make_response_preparation
-    fn get_response_bra(&mut self, bra: &[TsrView; 2]) -> [Tsr; 2];
+    fn get_response_bra(&mut self, bra: &[TsrView; 2], prec: bool) -> [Tsr; 2];
 }

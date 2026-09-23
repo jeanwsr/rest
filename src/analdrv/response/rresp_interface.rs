@@ -7,11 +7,14 @@
 //! future standalone response/property driver can call it directly, without any hessian
 //! machinery.
 //!
-//! The DFT XC response object evaluates the fock path directly on the SCF grid (in its native
-//! round-robin atom-interleaved order — the fock path is a plain quadrature sum, so no
-//! atom-regrouping is applied), and the response path on a dedicated (usually coarser) cpscf
-//! grid. The hessian-side skeleton grid policy (including the MGGA level bump) lives in the
-//! hessian interface; no grid identity or grid data is shared between the hessian and response
+//! The precision of the response contractions is selected per call through the `prec` flag of
+//! [`RRespAPI`]: the high-precision (`prec = true`) resource is the SCF-grade one — the SCF
+//! `rimatr` for RI-JK, and the SCF grid for DFT (in its native round-robin atom-interleaved
+//! order, since the fock path is a plain quadrature sum, so no atom-regrouping is applied) —
+//! while the low-precision (`prec = false`) resource of the CP-SCF machinery is the dedicated
+//! (usually coarser) response grid / the `resp_auxbas_path` basis when attached. The
+//! hessian-side skeleton grid policy (including the MGGA level bump) lives in the hessian
+//! interface; no grid identity or grid data is shared between the hessian and response
 //! subsystems.
 
 use crate::analdrv::config::AnalDrvRespCfg;
@@ -108,20 +111,20 @@ pub struct RCpscfState {
 impl<'a> AnalDrvBaseAPI for RRespSCF<'a> {}
 
 impl<'a> RRespAPI for RRespSCF<'a> {
-    fn get_fock_rdm(&mut self, rdm: TsrView) -> Tsr {
+    fn get_fock_rdm(&mut self, rdm: TsrView, prec: bool) -> Tsr {
         let mut fock = rt::zeros_like(&rdm);
         for resp_obj in self.resp_list.iter_mut() {
-            fock += resp_obj.get_fock_rdm(rdm.view());
+            fock += resp_obj.get_fock_rdm(rdm.view(), prec);
         }
         fock
     }
 
-    fn get_fock_coeff(&mut self, mo_coeff: TsrView, mo_occ: TsrView) -> Tsr {
+    fn get_fock_coeff(&mut self, mo_coeff: TsrView, mo_occ: TsrView, prec: bool) -> Tsr {
         // delegated per element (not through the default rdm route), so that elements overriding
         // this function for efficiency keep their advantage
         let mut fock = None;
         for resp_obj in self.resp_list.iter_mut() {
-            let fock_obj = resp_obj.get_fock_coeff(mo_coeff.view(), mo_occ.view());
+            let fock_obj = resp_obj.get_fock_coeff(mo_coeff.view(), mo_occ.view(), prec);
             fock = Some(match fock {
                 Some(fock) => fock + fock_obj,
                 None => fock_obj,
@@ -130,24 +133,24 @@ impl<'a> RRespAPI for RRespSCF<'a> {
         fock.expect("RRespSCF must hold at least one response object")
     }
 
-    fn make_response_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView) {
+    fn make_response_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView, prec: bool) {
         for resp_obj in self.resp_list.iter_mut() {
-            resp_obj.make_response_preparation(mo_coeff.view(), mo_occ.view());
+            resp_obj.make_response_preparation(mo_coeff.view(), mo_occ.view(), prec);
         }
     }
 
-    fn get_response_rdm(&mut self, rdm: TsrView) -> Tsr {
+    fn get_response_rdm(&mut self, rdm: TsrView, prec: bool) -> Tsr {
         let mut resp = rt::zeros_like(&rdm);
         for resp_obj in self.resp_list.iter_mut() {
-            resp += resp_obj.get_response_rdm(rdm.view());
+            resp += resp_obj.get_response_rdm(rdm.view(), prec);
         }
         resp
     }
 
-    fn get_response_bra(&mut self, bra: TsrView) -> Tsr {
+    fn get_response_bra(&mut self, bra: TsrView, prec: bool) -> Tsr {
         let mut resp = rt::zeros_like(&bra);
         for resp_obj in self.resp_list.iter_mut() {
-            resp += resp_obj.get_response_bra(bra.view());
+            resp += resp_obj.get_response_bra(bra.view(), prec);
         }
         resp
     }
@@ -167,8 +170,10 @@ impl<'a> RRespSCF<'a> {
     /// - `mo_occ` : shape `[nmo]`. Molecular orbital occupation numbers.
     /// - `mo_energy` : shape `[nmo]`. Molecular orbital energies.
     pub fn make_cpscf_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView, mo_energy: TsrView) {
+        // the CP-SCF core runs the response machinery in low precision (`prec = false`): the
+        // dedicated response grid / `resp_auxbas_path` basis when attached
         for resp_obj in self.resp_list.iter_mut() {
-            resp_obj.make_response_preparation(mo_coeff.view(), mo_occ.view());
+            resp_obj.make_response_preparation(mo_coeff.view(), mo_occ.view(), false);
         }
 
         let occidx = mo_occ.view().greater(0).into_vec();
@@ -219,7 +224,10 @@ impl<'a> RRespSCF<'a> {
         let ubra = &mo_coeff % &mo1;
         let mut resp = rt::zeros_like(&mo1);
         for resp_obj in self.resp_list.iter_mut() {
-            resp += mo_coeff.t() % resp_obj.get_response_bra(ubra.view());
+            // low precision: the CP-SCF core contracts the response on the dedicated
+            // low-precision resource when attached (this includes the last-iteration W-operator
+            // assembly of the hessian driver)
+            resp += mo_coeff.t() % resp_obj.get_response_bra(ubra.view(), false);
         }
         resp
     }
@@ -347,19 +355,30 @@ pub fn rscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> RRe
 
     let (factor_j, factor_k, rsh) = scf_jk_factors(scf_data);
 
-    // decomposed ERI of the RI-JK response object: its own definition — the freshly built one of
-    // `resp_auxbas_path` when set (owned), otherwise the SCF rimatr (borrowed, zero copy)
+    // decomposed ERIs of the RI-JK response object, per precision: the fock path always borrows
+    // the SCF rimatr (zero copy); the low-precision response path attaches the freshly built one
+    // of `resp_auxbas_path` when set (owned), and reuses the SCF rimatr otherwise
     {
-        let cderi = resp_auxbas::cderi(scf_data, config);
-        resp_list.push(Box::new(RRespRIJK::new_with_cderi(factor_j, factor_k, cderi)));
+        let (cderi, cderi_resp) = resp_auxbas::cderi_pair(scf_data, config);
+        let resp_obj = match cderi_resp {
+            Some(cderi_resp) => RRespRIJK::new_with_cderi(factor_j, factor_k, cderi).set_cderi_resp(cderi_resp),
+            None => RRespRIJK::new_with_cderi(factor_j, factor_k, cderi),
+        };
+        resp_list.push(Box::new(resp_obj));
     }
 
     // The short-range exchange correction (range-separated hybrids) is a separate response
     // object reusing the full-range implementation; it evaluates on the short-range `rimatr_sr`
     // ERI, with no Coulomb part (factor_j = 0).
     if let Some((_omega, factor_k_sr)) = rsh {
-        let cderi_sr = resp_auxbas::cderi_sr(scf_data, config);
-        resp_list.push(Box::new(RRespRIJK::new_with_cderi(0.0, factor_k_sr, cderi_sr)));
+        let (cderi_sr, cderi_resp_sr) = resp_auxbas::cderi_pair_sr(scf_data, config);
+        let resp_obj = match cderi_resp_sr {
+            Some(cderi_resp_sr) => {
+                RRespRIJK::new_with_cderi(0.0, factor_k_sr, cderi_sr).set_cderi_resp(cderi_resp_sr)
+            },
+            None => RRespRIJK::new_with_cderi(0.0, factor_k_sr, cderi_sr),
+        };
+        resp_list.push(Box::new(resp_obj));
     }
 
     // --- DFT --- //
