@@ -81,6 +81,66 @@ pub(crate) fn sorted_multi_indices(order: usize) -> Vec<Vec<usize>> {
     out
 }
 
+/// Print the evaluated multipole moments from a driver `result` map, in the analdrv output style
+/// (shared by the restricted and unrestricted drivers).
+///
+/// Only sections whose entries exist in `result` are printed (so a dipole-only evaluation does
+/// not print an empty quadrupole section, and contribution entries a driver does not hold — e.g.
+/// the DH correlation/response increments of an SCF-level evaluation — are skipped). All
+/// quantities are in atomic units. The print is gated by `print_level >= 1` (the timing output
+/// stays at `>= 2`); the output style of this section is expected to be refactored later.
+pub(crate) fn print_multipole_result(result: &HashMap<String, Tsr>, origin: [f64; 3], print_level: usize) {
+    if print_level < 1 {
+        return;
+    }
+    println!("=============== Multipole Moments (in analdrv) ===============");
+    println!("Origin (a.u.): [{:14.8}, {:14.8}, {:14.8}]", origin[0], origin[1], origin[2]);
+
+    if result.contains_key("dip_tot") {
+        println!("Electric dipole moment (a.u.):");
+        for (key, label) in [
+            ("dip_nuc", "nuclear charges"),
+            ("dip_scf", "SCF density"),
+            ("dip_corr", "unrelaxed corr. density"),
+            ("dip_resp", "response (Z-vector)"),
+            ("dip_tot", "total"),
+        ] {
+            if let Some(v) = result.get(key) {
+                println!("    {:<24}: {:16.12}", label, v);
+            }
+        }
+        // total dipole additionally in Debye (1 a.u. = 2.54174623 Debye)
+        if let Some(v) = result.get("dip_tot") {
+            let au2debye = crate::constants::AU2DEBYE;
+            println!(
+                "    {:<24}: {:16.12} {:16.12} {:16.12}",
+                "total, Debye (X Y Z)",
+                v[[0]] * au2debye,
+                v[[1]] * au2debye,
+                v[[2]] * au2debye
+            );
+        }
+    }
+
+    print_moment_section(result, "Electric quadrupole moment, raw second moments (a.u.)", "quad_tot", 2);
+    print_moment_section(result, "Electric quadrupole moment, traceless (a.u.)", "quad_tot_traceless", 2);
+    print_moment_section(result, "Electric octupole moment (a.u.)", "oct_tot", 3);
+    print_moment_section(result, "Electric hexadecapole moment (a.u.)", "hex_tot", 4);
+}
+
+/// Print one moment section from the `result` entry `key`, listing the unique components of the
+/// permutation-symmetric order-`order` tensor. Does nothing if the key is absent.
+pub(crate) fn print_moment_section(result: &HashMap<String, Tsr>, title: &str, key: &str, order: usize) {
+    let Some(tot) = result.get(key) else { return };
+    let flat = tot.clone().into_shape(-1);
+    println!("{title}:");
+    for idx in sorted_multi_indices(order) {
+        let label: String = idx.iter().map(|&t| ['X', 'Y', 'Z'][t]).collect();
+        let c = idx.iter().enumerate().fold(0usize, |acc, (k, &t)| acc + t * 3usize.pow((order - 1 - k) as u32));
+        println!("    {label}: {:16.12}", flat[[c]]);
+    }
+}
+
 /// Working solver and maintainer of multipole moment evaluation for restricted SCF (and
 /// double-hybrid, DH) methods.
 ///
@@ -309,59 +369,9 @@ impl<'a, 'b> RMultipoleDH<'a, 'b> {
 
     /// Print the evaluated multipole moments in the analdrv output style.
     ///
-    /// Only sections whose entries exist in `result` are printed (so a dipole-only evaluation
-    /// does not print an empty quadrupole section). All quantities are in atomic units. The
-    /// print is gated by `print_level >= 1` (the timing output stays at `>= 2`); the output
-    /// style of this section is expected to be refactored later.
+    /// See [`print_multipole_result`](crate::analdrv::multipole::rmultipole::print_multipole_result)
+    /// for the format.
     pub fn print_multipole(&self, print_level: usize) {
-        if print_level < 1 {
-            return;
-        }
-        println!("=============== Multipole Moments (in analdrv) ===============");
-        println!("Origin (a.u.): [{:14.8}, {:14.8}, {:14.8}]", self.origin[0], self.origin[1], self.origin[2]);
-
-        if self.result.contains_key("dip_tot") {
-            println!("Electric dipole moment (a.u.):");
-            for (key, label) in [
-                ("dip_nuc", "nuclear charges"),
-                ("dip_scf", "SCF density"),
-                ("dip_corr", "unrelaxed corr. density"),
-                ("dip_resp", "response (Z-vector)"),
-                ("dip_tot", "total"),
-            ] {
-                if let Some(v) = self.result.get(key) {
-                    println!("    {:<24}: {:16.12}", label, v);
-                }
-            }
-            // total dipole additionally in Debye (1 a.u. = 2.54174623 Debye)
-            if let Some(v) = self.result.get("dip_tot") {
-                let au2debye = crate::constants::AU2DEBYE;
-                println!(
-                    "    {:<24}: {:16.12} {:16.12} {:16.12}",
-                    "total, Debye (X Y Z)",
-                    v[[0]] * au2debye,
-                    v[[1]] * au2debye,
-                    v[[2]] * au2debye
-                );
-            }
-        }
-
-        self.print_moment_section("Electric quadrupole moment, raw second moments (a.u.)", "quad_tot", 2);
-        self.print_moment_section("Electric quadrupole moment, traceless (a.u.)", "quad_tot_traceless", 2);
-        self.print_moment_section("Electric octupole moment (a.u.)", "oct_tot", 3);
-        self.print_moment_section("Electric hexadecapole moment (a.u.)", "hex_tot", 4);
-    }
-
-    /// Print one moment section from the `result` entry `key`, listing the unique components of
-    /// the permutation-symmetric order-`order` tensor. Does nothing if the key is absent.
-    fn print_moment_section(&self, title: &str, key: &str, order: usize) {
-        let Some(tot) = self.result.get(key) else { return };
-        let flat = tot.clone().into_shape(-1);
-        println!("{title}:");
-        for idx in sorted_multi_indices(order) {
-            let label: String = idx.iter().map(|&t| ['X', 'Y', 'Z'][t]).collect();
-            let c = idx.iter().enumerate().fold(0usize, |acc, (k, &t)| acc + t * 3usize.pow((order - 1 - k) as u32));
-            println!("    {label}: {:16.12}", flat[[c]]);
-        }
+        print_multipole_result(&self.result, self.origin, print_level);
     }
 }

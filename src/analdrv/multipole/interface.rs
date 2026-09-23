@@ -128,11 +128,8 @@ fn multipole_interface_r<'a>(
 
     // The relaxed (Z-vector) increments consume the restricted response object; the U variant of
     // the carrier cannot appear here (the unrestricted task never requests a response object).
-    let resp = resp_objs.map(|resp| match resp {
-        RespSCF::R(r) => r,
-        RespSCF::U(_) => panic!(
-            "Multipole evaluation is currently only implemented for restricted (RHF/RKS) calculations; an unrestricted response object was given."
-        ),
+    let resp = resp_objs.map(|resp| {
+        resp.expect_r_mut("Multipole evaluation is currently only implemented for restricted (RHF/RKS) calculations")
     });
 
     let mut rmultipole = RMultipoleDH::new(&mol_cint, mo_coeff, mo_occ, origin, rgfock.as_mut(), resp);

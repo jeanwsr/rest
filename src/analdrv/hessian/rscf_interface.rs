@@ -1,4 +1,5 @@
 use crate::analdrv::prelude::*;
+use super::print_hessian_and_timing;
 use crate::analdrv::response::rresp_interface::{scf_jk_factors, scf_xc_func_list};
 use crate::analdrv::vibration::vib::*;
 use crate::analdrv::vibration::vib_interface::*;
@@ -141,34 +142,7 @@ pub fn rscf_hess_interface<'a>(
 
         let de_hess = hess_scf.make_hess();
 
-        if scf_data.mol.ctrl.print_level >= 2 {
-            println!("=== HESSIAN ===");
-            println!("Print hessian in [tA, sB] format (component xyz first, atom then)");
-            println!("");
-            // print hessian matrix [t, s, A, B] -> [tA, sB]
-            let natm = de_hess.shape()[3];
-            let hess_mat = de_hess.transpose([0, 2, 1, 3]).into_shape((3 * natm, 3 * natm));
-            // print 6 columns at a time, with index header
-            for j in (0..3 * natm).step_by(6) {
-                let j_end = (j + 6).min(3 * natm);
-                let col_header = " ".repeat(6) + &(j..j_end).map(|i| format!("{:>12}", i)).collect::<String>();
-                println!("{}", col_header);
-                for i in 0..3 * natm {
-                    let row_str = format!("{i:>4}  ")
-                        + &(j..j_end).map(|j| format!("{:12.6}", hess_mat[[i, j]])).collect::<String>();
-                    println!("{}", row_str);
-                }
-                println!("");
-            }
-        }
-
-        // print timing information
-        if scf_data.mol.ctrl.print_level >= 2 {
-            println!("Timing in Hessian calculation:");
-            for (key, value) in hess_scf.timing.iter() {
-                println!("    {:60}: {:10.6} seconds", key, value);
-            }
-        }
+        print_hessian_and_timing(&de_hess, &hess_scf.timing, scf_data.mol.ctrl.print_level);
 
         de_hess
     };
@@ -180,6 +154,10 @@ pub fn rscf_hess_interface<'a>(
 
 /// The skeleton-level `NIMatmul` for the DFT XC hessian contribution, `None` for pure HF.
 ///
+/// Shared by the unrestricted hessian interface: the grid policy is spin-independent (the
+/// density-type determination depends only on the functional families, and the grid data itself
+/// carries no spin treatment).
+///
 /// The skeleton grid level is the SCF grid level, raised by 2 for MGGA (TAU) functionals when
 /// the grid-shift derivative terms are off (the grid-shift terms restore the grid-related
 /// accuracy the finer grid compensated). The grid reuses the SCF grid when the level matches,
@@ -187,7 +165,7 @@ pub fn rscf_hess_interface<'a>(
 /// `atm_idx`): the SCF grid is round-robin permuted for load balancing, while the Becke
 /// grid-shift attribution requires the ByAtom grouping. The regrouping only permutes, never
 /// changes values.
-fn scf_skeleton_nimatmul<'a>(scf_data: &'a SCF, cfg: &AnalDrvNucgradCfg) -> Option<NIMatmul<'a>> {
+pub(crate) fn scf_skeleton_nimatmul<'a>(scf_data: &'a SCF, cfg: &AnalDrvNucgradCfg) -> Option<NIMatmul<'a>> {
     if scf_data.mol.xc_data.dfa_compnt_scf.is_empty() {
         return None;
     }

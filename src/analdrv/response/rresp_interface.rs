@@ -47,15 +47,21 @@ pub fn scf_jk_factors(scf_data: &SCF) -> (f64, f64, Option<(f64, f64)>) {
     (factor_j, factor_k, rsh)
 }
 
-/// List of `(scale, functional)` pairs of the SCF XC functional (spin-unpolarized).
-pub fn scf_xc_func_list(scf_data: &SCF) -> Vec<(f64, LibXCFunctional)> {
+/// List of `(scale, functional)` pairs of the SCF XC functional, in the given libxc spin
+/// treatment.
+pub fn scf_xc_func_list_with_spin(scf_data: &SCF, spin: LibXCSpin) -> Vec<(f64, LibXCFunctional)> {
     let xc_code = &scf_data.mol.xc_data.dfa_compnt_scf;
     let xc_params = &scf_data.mol.xc_data.dfa_paramr_scf;
     xc_code
         .iter()
         .zip(xc_params.iter())
-        .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Unpolarized)))
+        .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, spin)))
         .collect_vec()
+}
+
+/// List of `(scale, functional)` pairs of the SCF XC functional (spin-unpolarized).
+pub fn scf_xc_func_list(scf_data: &SCF) -> Vec<(f64, LibXCFunctional)> {
+    scf_xc_func_list_with_spin(scf_data, LibXCSpin::Unpolarized)
 }
 
 /// The response (fock/response) objects of all electron-interaction contributions of a restricted
@@ -299,6 +305,40 @@ impl<'a> RRespSCF<'a> {
     }
 }
 
+/// The DFT response grids: the common (fock-path) grid and the optional dedicated response grid.
+///
+/// Shared by the restricted and unrestricted response interfaces (the grid policy is
+/// spin-independent). Returns `(ni, ni_resp)`:
+///
+/// - the common grid is the SCF grid as is; the fock path is a plain quadrature sum, so it does
+///   not require the atom-grouped (ByAtom) ordering;
+/// - the response grid is dedicated (built at `config.resp.grid_level`, by default the coarser
+///   `grid_gen_level.max(3) - 2`) when that level differs from the SCF grid generation level,
+///   and `None` when they coincide (the response then evaluates and caches on the common grid).
+pub fn resp_grids<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> (NIMatmul<'a>, Option<NIMatmul<'a>>) {
+    let mol = get_cint_mol(&scf_data.mol);
+
+    let grids = scf_data.grids.as_ref().unwrap();
+    let ni = NIMatmul::new(&mol, &grids.coordinates, &grids.weights, &grids.atm_idx, &grids.quadrature_weights);
+
+    let grid_gen_level = scf_data.mol.ctrl.grid_gen_level;
+    let grid_resp_level = config.resp.grid_level.unwrap_or(grid_gen_level.max(3) - 2);
+    let ni_resp = if grid_resp_level == grid_gen_level {
+        None
+    } else {
+        let cpscf_grid = Grids::build_with_level(&scf_data.mol, grid_resp_level);
+        let ni_resp = NIMatmul::new(
+            &mol,
+            &cpscf_grid.coordinates,
+            &cpscf_grid.weights,
+            &cpscf_grid.atm_idx,
+            &cpscf_grid.quadrature_weights,
+        );
+        Some(ni_resp)
+    };
+    (ni, ni_resp)
+}
+
 /// Build the response (fock/response) objects for a converged restricted SCF.
 pub fn rscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> RRespSCF<'a> {
     let mut resp_list: Vec<Box<dyn RRespAPI + 'a>> = Vec::new();
@@ -326,32 +366,13 @@ pub fn rscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> RRe
 
     let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
     if !is_hf {
-        let mol = get_cint_mol(&scf_data.mol);
         let xc_func_list = scf_xc_func_list(scf_data);
         let verbose = scf_data.mol.ctrl.print_level > 2;
 
-        // common grid (fock path): the SCF grid as is; the fock path is a plain quadrature sum,
-        // so it does not require the atom-grouped (ByAtom) ordering.
-        let grids = scf_data.grids.as_ref().unwrap();
-        let ni = NIMatmul::new(&mol, &grids.coordinates, &grids.weights, &grids.atm_idx, &grids.quadrature_weights);
-
-        // response grid: when it coincides with the SCF grid, leave `ni_resp = None`; the
-        // response then evaluates (and caches) on the common grid. Otherwise build a dedicated
-        // (usually coarser) grid.
-        let grid_gen_level = scf_data.mol.ctrl.grid_gen_level;
-        let grid_resp_level = config.resp.grid_level.unwrap_or(grid_gen_level.max(3) - 2);
-        let resp_obj = if grid_resp_level == grid_gen_level {
-            RRespKSNIMatmul::new(xc_func_list, ni, verbose)
-        } else {
-            let cpscf_grid = Grids::build_with_level(&scf_data.mol, grid_resp_level);
-            let ni_resp = NIMatmul::new(
-                &mol,
-                &cpscf_grid.coordinates,
-                &cpscf_grid.weights,
-                &cpscf_grid.atm_idx,
-                &cpscf_grid.quadrature_weights,
-            );
-            RRespKSNIMatmul::new(xc_func_list, ni, verbose).set_ni_resp(ni_resp)
+        let (ni, ni_resp) = resp_grids(scf_data, config);
+        let resp_obj = match ni_resp {
+            Some(ni_resp) => RRespKSNIMatmul::new(xc_func_list, ni, verbose).set_ni_resp(ni_resp),
+            None => RRespKSNIMatmul::new(xc_func_list, ni, verbose),
         };
         resp_list.push(Box::new(resp_obj));
     }

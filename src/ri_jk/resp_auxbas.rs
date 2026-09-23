@@ -21,20 +21,33 @@ use crate::SCF;
 
 use log::debug;
 
-/// Validate `resp_auxbas_path` before any response object is built.
+/// Hard-error on the unsupported `even_tempered_basis` combination.
 ///
-/// This hard-errors on the unsupported `even_tempered_basis` combination (the even-tempered
-/// machinery would silently override the response basis), and warns when the keyword is set but no
-/// response (CP-SCF) object will be built (`need_resp = false`). The per-component definitions
-/// below call it as well, so paths that build the response objects directly (e.g. the geomopt
-/// analytic hessian) are covered too.
-pub fn validate_resp_auxbas(scf_data: &SCF, config: &AnalDrvConfig, need_resp: bool) {
+/// The even-tempered machinery would silently override the response basis, so the keyword
+/// combination is rejected. Checked once up front by the task-level
+/// [`validate_resp_auxbas`], and again at every response-object build
+/// ([`cderi`]/[`cderi_sr`]), so paths that build the response objects directly (e.g. the
+/// geomopt analytic hessian) are covered too.
+pub fn assert_resp_auxbas_supported(scf_data: &SCF, config: &AnalDrvConfig) {
     if config.resp.auxbas_path.is_none() {
         return;
     }
     if scf_data.mol.ctrl.even_tempered_basis {
         panic!("`resp_auxbas_path` is not supported together with `even_tempered_basis`.");
     }
+}
+
+/// Validate `resp_auxbas_path` against this run's tasks, before any response object is built.
+///
+/// This is the task-level check: it warns when the keyword is set but no response (CP-SCF)
+/// object will be built (`need_resp = false`), and enforces the hard error of
+/// [`assert_resp_auxbas_supported`]. The per-component definitions call the latter themselves,
+/// but only this function carries the warn (only the caller knows `need_resp`).
+pub fn validate_resp_auxbas(scf_data: &SCF, config: &AnalDrvConfig, need_resp: bool) {
+    if config.resp.auxbas_path.is_none() {
+        return;
+    }
+    assert_resp_auxbas_supported(scf_data, config);
     if !need_resp {
         log::warn!(
             "`resp_auxbas_path` is set, but no task of this run uses the response (CP-SCF) object; the keyword will be ignored."
@@ -65,7 +78,7 @@ pub fn cderi<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> TsrCow<'a> {
     };
     match resp_auxbas_path {
         Some(resp_auxbas_path) => {
-            validate_resp_auxbas(scf_data, config, true);
+            assert_resp_auxbas_supported(scf_data, config);
             debug!("Building the response rimatr on `resp_auxbas_path` = \"{}\".", resp_auxbas_path);
             let mol = get_cint_mol(&scf_data.mol);
             let aux = get_cint_aux_on_path(&scf_data.mol, resp_auxbas_path);
@@ -106,7 +119,7 @@ pub fn cderi_sr<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> TsrCow<'a> {
     };
     match resp_auxbas_path {
         Some(resp_auxbas_path) => {
-            validate_resp_auxbas(scf_data, config, true);
+            assert_resp_auxbas_supported(scf_data, config);
             // SR RI omega is negative in libcint's convention (cf. the SCF integral preparation)
             let omega = scf_data.mol.xc_data.omega().unwrap();
             debug!(

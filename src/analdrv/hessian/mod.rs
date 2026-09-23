@@ -37,6 +37,7 @@ use crate::analdrv::config::AnalDrvConfig;
 use crate::analdrv::response::RespSCF;
 use crate::scf_io::{SCFType, SCF};
 use crate::thermo::ThermoResult;
+use crate::utilities::rstsr_util::Tsr;
 
 /// Output of the analytical Hessian task, with the derived vibrational/thermochemical analysis.
 #[derive(Debug, Clone, Default)]
@@ -52,6 +53,41 @@ pub struct HessOutput {
     pub modes_trv: Vec<&'static str>,
     /// Thermochemistry result, present if the `[thermo]` section is given in the control input.
     pub thermo: Option<ThermoResult>,
+}
+
+/// Print the hessian matrix and the driver timing report (shared by the restricted and
+/// unrestricted interfaces), at `print_level >= 2`.
+///
+/// The matrix is printed in `[tA, sB]` format (component xyz first, atom then), 6 columns at a
+/// time with an index header; the timing entries follow in call order.
+fn print_hessian_and_timing(de_hess: &Tsr, timing: &[(String, f64)], print_level: usize) {
+    if print_level < 2 {
+        return;
+    }
+    println!("=== HESSIAN ===");
+    println!("Print hessian in [tA, sB] format (component xyz first, atom then)");
+    println!("");
+    // print hessian matrix [t, s, A, B] -> [tA, sB]
+    let natm = de_hess.shape()[3];
+    let hess_mat = de_hess.transpose([0, 2, 1, 3]).into_shape((3 * natm, 3 * natm));
+    // print 6 columns at a time, with index header
+    for j in (0..3 * natm).step_by(6) {
+        let j_end = (j + 6).min(3 * natm);
+        let col_header = " ".repeat(6) + &(j..j_end).map(|i| format!("{:>12}", i)).collect::<String>();
+        println!("{}", col_header);
+        for i in 0..3 * natm {
+            let row_str = format!("{i:>4}  ")
+                + &(j..j_end).map(|j| format!("{:12.6}", hess_mat[[i, j]])).collect::<String>();
+            println!("{}", row_str);
+        }
+        println!("");
+    }
+
+    // print timing information
+    println!("Timing in Hessian calculation:");
+    for (key, value) in timing.iter() {
+        println!("    {:60}: {:10.6} seconds", key, value);
+    }
 }
 
 pub fn hess_interface<'a>(
@@ -74,20 +110,12 @@ pub fn hess_interface<'a>(
     // carrier, holding the restricted/unrestricted variant per the SCF type).
     let (hessian, vib, _) = match scf_data.scftype {
         SCFType::RHF => {
-            let RespSCF::R(resp) =
-                resp_objs.expect("internal error: the RHF hessian requires the shared response object")
-            else {
-                panic!("internal error: the RHF hessian requires the restricted (R) response object variant");
-            };
-            rscf_hess_interface(scf_data, &config.nucgrad, resp)
+            let ctx = "internal error: the RHF hessian requires the shared response object";
+            rscf_hess_interface(scf_data, &config.nucgrad, resp_objs.expect(ctx).expect_r_mut(ctx))
         },
         SCFType::UHF => {
-            let RespSCF::U(resp) =
-                resp_objs.expect("internal error: the UHF hessian requires the shared response object")
-            else {
-                panic!("internal error: the UHF hessian requires the unrestricted (U) response object variant");
-            };
-            uscf_hess_interface(scf_data, &config.nucgrad, resp)
+            let ctx = "internal error: the UHF hessian requires the shared response object";
+            uscf_hess_interface(scf_data, &config.nucgrad, resp_objs.expect(ctx).expect_u_mut(ctx))
         },
         _ => unimplemented!("Normal modes calculation is only implemented for RHF and UHF SCF types."),
     };

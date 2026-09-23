@@ -15,13 +15,10 @@
 
 use crate::analdrv::config::AnalDrvRespCfg;
 use crate::analdrv::prelude::*;
-use crate::analdrv::response::rresp_interface::scf_jk_factors;
+use crate::analdrv::response::rresp_interface::{resp_grids, scf_jk_factors};
 use crate::ri_jk::resp_auxbas;
-use crate::dft::numint_matmul::nimatmul::NIMatmul;
 use crate::dft::numint_matmul::resp_uks::URespKSNIMatmul;
-use crate::dft::Grids;
 use crate::ri_jk::resp_u::URespRIJK;
-use crate::ri_jk::util::get_cint_mol;
 use crate::SCF;
 
 use libxc::prelude::*;
@@ -32,13 +29,7 @@ use libxc::prelude::*;
 /// scf_xc_func_list): the functionals are created with [`LibXCSpin::Polarized`], as required by
 /// the UKS rho/vxc/fxc spin-block layout.
 pub fn scf_xc_func_list_uks(scf_data: &SCF) -> Vec<(f64, LibXCFunctional)> {
-    let xc_code = &scf_data.mol.xc_data.dfa_compnt_scf;
-    let xc_params = &scf_data.mol.xc_data.dfa_paramr_scf;
-    xc_code
-        .iter()
-        .zip(xc_params.iter())
-        .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Polarized)))
-        .collect_vec()
+    crate::analdrv::response::rresp_interface::scf_xc_func_list_with_spin(scf_data, LibXCSpin::Polarized)
 }
 
 /// The response (fock/response) objects of all electron-interaction contributions of an
@@ -388,32 +379,13 @@ pub fn uscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> URe
 
     let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
     if !is_hf {
-        let mol = get_cint_mol(&scf_data.mol);
         let xc_func_list = scf_xc_func_list_uks(scf_data);
         let verbose = scf_data.mol.ctrl.print_level > 2;
 
-        // common grid (fock path): the SCF grid as is; the fock path is a plain quadrature sum,
-        // so it does not require the atom-grouped (ByAtom) ordering.
-        let grids = scf_data.grids.as_ref().unwrap();
-        let ni = NIMatmul::new(&mol, &grids.coordinates, &grids.weights, &grids.atm_idx, &grids.quadrature_weights);
-
-        // response grid: when it coincides with the SCF grid, leave `ni_resp = None`; the
-        // response then evaluates (and caches) on the common grid. Otherwise build a dedicated
-        // (usually coarser) grid.
-        let grid_gen_level = scf_data.mol.ctrl.grid_gen_level;
-        let grid_resp_level = config.resp.grid_level.unwrap_or(grid_gen_level.max(3) - 2);
-        let resp_obj = if grid_resp_level == grid_gen_level {
-            URespKSNIMatmul::new(xc_func_list, ni, verbose)
-        } else {
-            let cpscf_grid = Grids::build_with_level(&scf_data.mol, grid_resp_level);
-            let ni_resp = NIMatmul::new(
-                &mol,
-                &cpscf_grid.coordinates,
-                &cpscf_grid.weights,
-                &cpscf_grid.atm_idx,
-                &cpscf_grid.quadrature_weights,
-            );
-            URespKSNIMatmul::new(xc_func_list, ni, verbose).set_ni_resp(ni_resp)
+        let (ni, ni_resp) = resp_grids(scf_data, config);
+        let resp_obj = match ni_resp {
+            Some(ni_resp) => URespKSNIMatmul::new(xc_func_list, ni, verbose).set_ni_resp(ni_resp),
+            None => URespKSNIMatmul::new(xc_func_list, ni, verbose),
         };
         resp_list.push(Box::new(resp_obj));
     }

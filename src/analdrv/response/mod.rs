@@ -21,9 +21,10 @@ pub mod rgfock_interface;
 /// type) and passed by `&mut` to the property drivers (hessian, multipole), so that the response
 /// preparation and cached intermediates are shared across tasks.
 ///
-/// This is a plain carrier with no façade methods: the restricted and unrestricted response
-/// types ([`RRespSCF`]/[`URespSCF`]) have different signatures (spin arrays) and no unified driver
-/// exists, so every consumer matches on the variant it supports.
+/// The restricted and unrestricted response types ([`RRespSCF`]/[`URespSCF`]) have different
+/// signatures (spin arrays) and no unified driver exists, so every consumer extracts the variant
+/// it supports through [`Self::expect_r_mut`]/[`Self::expect_u_mut`]; apart from these
+/// variant-accessors this is a plain carrier without façade methods.
 ///
 /// [`RRespSCF`]: rresp_interface::RRespSCF
 /// [`URespSCF`]: uresp_interface::URespSCF
@@ -33,4 +34,24 @@ pub enum RespSCF<'a> {
     /// Unrestricted response object
     /// ([`uscf_resp_interface`](uresp_interface::uscf_resp_interface)).
     U(uresp_interface::URespSCF<'a>),
+}
+
+impl<'a> RespSCF<'a> {
+    /// The restricted response object ([`RespSCF::R`]), for consumers supporting restricted
+    /// treatments only; panics with `ctx` on the unrestricted variant.
+    pub fn expect_r_mut(&mut self, ctx: &str) -> &mut rresp_interface::RRespSCF<'a> {
+        match self {
+            RespSCF::R(resp) => resp,
+            RespSCF::U(_) => panic!("{ctx}: expected the restricted (R) response object variant"),
+        }
+    }
+
+    /// The unrestricted response object ([`RespSCF::U`]), for consumers supporting unrestricted
+    /// treatments only; panics with `ctx` on the restricted variant.
+    pub fn expect_u_mut(&mut self, ctx: &str) -> &mut uresp_interface::URespSCF<'a> {
+        match self {
+            RespSCF::U(resp) => resp,
+            RespSCF::R(_) => panic!("{ctx}: expected the unrestricted (U) response object variant"),
+        }
+    }
 }

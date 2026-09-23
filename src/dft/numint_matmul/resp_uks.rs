@@ -301,16 +301,15 @@ impl<'a> URespAPI for URespKSNIMatmul<'a> {
             ((&rdm[β] + &rdm[β].swapaxes(0, 1)) * 0.5).into_shape((nao, nao, nset)),
         ];
 
-        // rho1 : [ngrids, nvar, 2, nset], assembled set by set from the per-spin dm lists
+        // rho1 : [ngrids, nvar, 2, nset], formed in one batched `make_rho_from_dm` call over the
+        // spin-interleaved dm list: the column-major output splits its last (set) axis as
+        // `k = spin + 2 * set`, so the list must alternate the spins within each set
+        let dm_list: Vec<TsrView> = (0..nset)
+            .flat_map(|k| [rdm_sym[α].i((.., .., k)), rdm_sym[β].i((.., .., k))])
+            .collect();
         let ngrids = self.ni.weights.len();
         let nvar = den_type.num_nvar();
-        let device = rdm[α].device().clone();
-        let mut rho1 = rt::zeros(([ngrids, nvar, 2, nset], &device));
-        for k in 0..nset {
-            let rho1_k =
-                self.ni.make_rho_from_dm(&[rdm_sym[α].i((.., .., k)), rdm_sym[β].i((.., .., k))], den_type);
-            rho1.i_mut((.., .., .., k)).assign(&rho1_k);
-        }
+        let rho1 = self.ni.make_rho_from_dm(&dm_list, den_type).into_shape((ngrids, nvar, 2, nset));
 
         let pot = self.ni.make_fxc_pot_with_eff(fxc, rho1.view(), den_type, XCSpin::Polarized);
         // restore the input's per-spin trailing shape
