@@ -18,14 +18,15 @@
 //!
 //! `py/dfmp2_addons.py` and `py/_rstsr_bridge.py` are vendored from
 //! `showcase-torch-mp2-pyo3@4f80e50` (`src/py/`; docstrings reworded locally,
-//! code unchanged except a local `del cderi_task` in
+//! code unchanged except a local `del cderi_task, b_2d` in
 //! `dfmp2_addons._inter_contraction_gpu`, freeing each task's GPU half-view
 //! before the next upload allocates, an `ss_only` mode of the same function
 //! (the antisymmetrized same-spin fold of the unrestricted driver), `MP2_FOLD`
 //! variants for the ss branch of `_intra_pair_gpu` (it used to upcast `g_ab`
 //! to f64 right after each GEMM; now the same f32acc-default accumulation
 //! scheme as the os fold), and empty-occ/vir early returns in
-//! `_intra_pair_gpu` mirroring the totality of the CPU pair kernels); they
+//! `_intra_pair_gpu` mirroring the totality of the CPU pair kernels, and a
+//! falsy `"0"`/empty `MP2_VERBOSE` (import-time `_MP2_VERBOSE` gate)); they
 //! keep both the single-device intra kernel and the multi-device intra+inter
 //! driver. The trailing *unrestricted* section of `dfmp2_addons.py`
 //! (`_uos_pair_gpu` / `get_dfump2_energy_pair_intra` /
@@ -127,6 +128,11 @@ where
     let devices = ri_pt2_opt.torch_devices.clone();
     let force_batch_inter = ri_pt2_opt.torch_force_batch_inter;
     let nbatch = ri_pt2_opt.torch_nbatch;
+    assert!(
+        nbatch.map_or(true, |n| n > 0),
+        "ri_pt2 engine = \"torch\": torch_nbatch must be positive (leave it unset for \
+         auto-detection); got {nbatch:?}."
+    );
     let use_tf32 = matches!(ri_pt2_opt.fp_mode, PT2FPMode::TF32);
     let fold_str = match ri_pt2_opt.torch_fold {
         PT2TorchFoldMode::F32Acc => "f32acc",
@@ -139,6 +145,10 @@ where
     // device ids must be pairwise distinct: the list assigns physical GPUs, not work
     // slots. To split the occ space over one GPU (GPU-OOM remedy), use
     // torch_force_batch_inter instead of a duplicated id.
+    assert!(
+        !devices.is_empty(),
+        "ri_pt2 engine = \"torch\": torch_devices must list at least one CUDA device."
+    );
     {
         let mut seen = std::collections::HashSet::new();
         assert!(
@@ -158,10 +168,23 @@ where
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| -> PyResult<()> {
         ensure_py_modules(py).map(|_| ())?;
-        check_cuda_availability(py)
+        check_torch_devices(py, &devices)
     })
     .unwrap_or_else(|e| panic!("ri_pt2 engine = \"torch\" initialization (pyo3) failed: {e}"));
     timerecords.count("torch_setup");
+
+    // fail fast before the ao2mo: the multi-device kernel requires >= 8 occupied
+    // orbitals per device (else it raises, after the ao2mo would have run)
+    if devices.len() > 1 || force_batch_inter {
+        let (nocc, nocc_min) = (occ_list.len(), 8 * devices.len().min(2));
+        assert!(
+            nocc >= nocc_min,
+            "ri_pt2 engine = \"torch\": nocc = {nocc} is too small for the multi-device \
+             evaluation (torch_devices = {devices:?}, >= 8 occupied orbitals per device, \
+             at least {nocc_min} in total); use a single torch_devices entry without \
+             torch_force_batch_inter instead."
+        );
+    }
 
     // perform ao2mo (CPU; rimatr if present, else batched int3c2e + j2c solve);
     // times "ao2mo"/"j2c"/"j3c"/"decomp" internally, same as the CPU new-driver
@@ -174,7 +197,6 @@ where
     timerecords.count_start("c_r5dft");
     let (eng_os, eng_ss) = Python::with_gil(|py| -> PyResult<(f64, f64)> {
         let (bridge, addons) = ensure_py_modules(py)?;
-        check_cuda_availability(py)?;
         set_kernel_env(py, fold_str, batch)?;
 
         // dtype string for the foreign buffer (f32 or f64 drives the torch matmul precision)
@@ -218,9 +240,9 @@ where
             let ss: f64 = result.get_item("e_corr_ss")?.extract()?;
             Ok((os, ss))
         } else {
-            // single-device intra-pair contraction (device = "cuda", verified available above)
+            // single-device intra-pair contraction on the user-listed device
             let kernel = addons.getattr("get_dfmp2_energy_pair_intra")?;
-            let result = kernel.call1((cderi_torch, occ_torch, vir_torch, false, "cuda", use_tf32))?;
+            let result = kernel.call1((cderi_torch, occ_torch, vir_torch, false, format!("cuda:{}", devices[0]), use_tf32))?;
             let bi1_sum = result.get_item(0)?.call_method0("sum")?.getattr("item")?.call0()?.extract::<f64>()?;
             let bi2_sum = result.get_item(1)?.call_method0("sum")?.getattr("item")?.call0()?.extract::<f64>()?;
             Ok((bi1_sum, bi1_sum - bi2_sum))
@@ -323,6 +345,11 @@ where
     let devices = ri_pt2_opt.torch_devices.clone();
     let force_batch_inter = ri_pt2_opt.torch_force_batch_inter;
     let nbatch = ri_pt2_opt.torch_nbatch;
+    assert!(
+        nbatch.map_or(true, |n| n > 0),
+        "ri_pt2 engine = \"torch\": torch_nbatch must be positive (leave it unset for \
+         auto-detection); got {nbatch:?}."
+    );
     let use_tf32 = matches!(ri_pt2_opt.fp_mode, PT2FPMode::TF32);
     let fold_str = match ri_pt2_opt.torch_fold {
         PT2TorchFoldMode::F32Acc => "f32acc",
@@ -335,6 +362,10 @@ where
     // device ids must be pairwise distinct: the list assigns physical GPUs, not work
     // slots. To split the occ space over one GPU (GPU-OOM remedy), use
     // torch_force_batch_inter instead of a duplicated id.
+    assert!(
+        !devices.is_empty(),
+        "ri_pt2 engine = \"torch\": torch_devices must list at least one CUDA device."
+    );
     {
         let mut seen = std::collections::HashSet::new();
         assert!(
@@ -354,7 +385,7 @@ where
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| -> PyResult<()> {
         ensure_py_modules(py).map(|_| ())?;
-        check_cuda_availability(py)
+        check_torch_devices(py, &devices)
     })
     .unwrap_or_else(|e| panic!("ri_pt2 engine = \"torch\" initialization (pyo3) failed: {e}"));
     timerecords.count("torch_setup");
@@ -370,7 +401,6 @@ where
     timerecords.count_start("c_r5dft");
     let (eng_os, eng_ss) = Python::with_gil(|py| -> PyResult<(f64, f64)> {
         let (bridge, addons) = ensure_py_modules(py)?;
-        check_cuda_availability(py)?;
         set_kernel_env(py, fold_str, batch)?;
 
         // dtype string for the foreign buffer (f32 or f64 drives the torch matmul precision)
@@ -437,7 +467,7 @@ where
                 cderi_torch[A].clone(), cderi_torch[B].clone(),
                 occ_torch[A].clone(), occ_torch[B].clone(),
                 vir_torch[A].clone(), vir_torch[B].clone(),
-                "cuda", use_tf32, verbose,
+                format!("cuda:{}", devices[0]), use_tf32, verbose,
             ))?;
             let os: f64 = result.get_item("e_corr_os")?.extract()?;
             let ss: f64 = result.get_item("e_corr_ss")?.extract()?;
@@ -487,12 +517,15 @@ fn ensure_py_modules(py: Python<'_>) -> PyResult<(Bound<'_, PyModule>, Bound<'_,
     Ok((bridge, addons))
 }
 
-/// Hard-require a CUDA device: `engine = "torch"` does not silently fall back to
+/// Hard-require usable CUDA devices: `engine = "torch"` does not silently fall back to
 /// torch-CPU (that would look like a success while being slower than the rust CPU
-/// engine); use `engine = "cpu"` instead.
-fn check_cuda_availability(py: Python<'_>) -> PyResult<()> {
+/// engine); use `engine = "cpu"` instead. Each `torch_devices` entry must be a valid
+/// logical CUDA device id (`< torch.cuda.device_count()`), checked here so a typo
+/// fails before the ao2mo instead of deep inside a torch call.
+fn check_torch_devices(py: Python<'_>, devices: &[usize]) -> PyResult<()> {
     let torch_mod = py.import("torch")?;
-    let available: bool = torch_mod.getattr("cuda")?.call_method0("is_available")?.extract()?;
+    let cuda = torch_mod.getattr("cuda")?;
+    let available: bool = cuda.call_method0("is_available")?.extract()?;
     if !available {
         return Err(PyRuntimeError::new_err(
             "torch reports no available CUDA device (torch.cuda.is_available() == false); \
@@ -500,6 +533,13 @@ fn check_cuda_availability(py: Python<'_>) -> PyResult<()> {
              torch-CPU. Use engine = \"cpu\" (default) for CPU contraction, or check the \
              CUDA_VISIBLE_DEVICES environment / torch installation.",
         ));
+    }
+    let device_count: usize = cuda.call_method0("device_count")?.extract()?;
+    if let Some(d) = devices.iter().find(|d| **d >= device_count) {
+        return Err(PyRuntimeError::new_err(format!(
+            "torch_devices entry {d} is out of range (torch.cuda.device_count() = {device_count}); \
+             entries are logical CUDA device ids after CUDA_VISIBLE_DEVICES filtering."
+        )));
     }
     Ok(())
 }

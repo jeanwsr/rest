@@ -202,7 +202,6 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     // sit at the edge of chemical accuracy).
     if scf_data.mol.ctrl.ri_pt2.engine == PT2Engine::Cpu
         && scf_data.mol.ctrl.ri_pt2.fp_mode == PT2FPMode::TF32
-        && scf_data.mol.ctrl.print_level > 0
     {
         println!("WARNING [ctrl.ri_pt2]: fp_mode = \"TF32\" is only effective with engine = \"torch\"; falling back to FP32 for the CPU drivers.");
     }

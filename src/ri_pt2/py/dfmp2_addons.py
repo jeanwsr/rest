@@ -17,7 +17,7 @@ _t_import = time.perf_counter()
 import torch
 import numpy as np
 
-_MP2_VERBOSE = bool(os.environ.get("MP2_VERBOSE"))
+_MP2_VERBOSE = os.environ.get("MP2_VERBOSE", "0") not in ("", "0")
 if _MP2_VERBOSE:
     print(
         f"[dfmp2] torch+numpy import: {time.perf_counter() - _t_import:.3f}s",
@@ -641,7 +641,7 @@ def _inter_contraction_gpu(
 
         # free this half-view before the next upload allocates (the loop-top rebind
         # would drop it only after the new tensor is already resident)
-        del cderi_task
+        del cderi_task, b_2d
 
     if _MP2_VERBOSE:
         torch.cuda.synchronize()

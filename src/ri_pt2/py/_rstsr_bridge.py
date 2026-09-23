@@ -3,7 +3,7 @@
 A rust column-major tensor of shape ``(naux, nvir, nocc)`` and a row-major numpy/torch array
 of shape ``(nocc, nvir, naux)`` share the *same* memory layout (the axis order is simply
 reversed). So a foreign C pointer + the ``(nocc, nvir, naux)`` shape can be wrapped into a
-read-only torch tensor with no copy: the only later copy is the unavoidable ``.to('cuda')``
+torch tensor with no copy: the only later copy is the unavoidable ``.to('cuda')``
 GPU upload performed by ``get_dfmp2_energy_pair_intra``.
 
 The caller (rust) must keep the backing memory alive for the lifetime of the returned tensor.
@@ -57,8 +57,9 @@ def torch_from_ptr(addr, shape, dtype):
     Returns
     -------
     torch.Tensor
-        CPU tensor sharing memory with the rust buffer (no copy). Non-writable; only
-        read by the pair-energy driver.
+        CPU tensor sharing memory with the rust buffer (no copy). The view aliases
+        the caller's memory: the pair-energy kernels only read it, and writing
+        through the view would corrupt the rust-owned buffer.
     """
     ct = _CTYPE[dtype]
     npdt = _NPDTYPE[dtype]
