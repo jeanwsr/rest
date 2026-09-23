@@ -78,6 +78,9 @@ pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperat
         scf_data.renormalized_singles_particles=rs_particles
     }
     initialize_qp_g_w(scf_data);
+    // GW-only state (e.g. the memoised AO-basis GW plan): created once per GW
+    // run and threaded through every evGW round below.
+    let mut gw_ctx=GwContext::default();
     let gw_scheme=qp_ctrl.gw_scheme.clone();
     let scgw=qp_ctrl.scgw.clone();
     let quasiparticle_energies:Vec<f64>=
@@ -86,12 +89,12 @@ pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperat
             qsgw::qsgw_loop(scf_data, vxc_nn, mpi_operator)
         } else if scgw=="g0w0"&&renormalized_singles==false{
             println!("You are doing G0W0 calculations of entire energy spectrum");
-            scgw::g0w0(scf_data,20,&vxc_nn,true)
+            scgw::g0w0(scf_data,20,&vxc_nn,true,&mut gw_ctx)
         }else if scgw=="evgw"{
             println!("You are doing evGW calculations of entire energy spectrum");
-            scgw::evgw(scf_data,20,&vxc_nn,qp_ctrl.evgw_rounds)
+            scgw::evgw(scf_data,20,&vxc_nn,qp_ctrl.evgw_rounds,&mut gw_ctx)
         }else if scgw=="g0w0"&&renormalized_singles==true{
-            scgw::g0w0(scf_data,20,&vxc_nn,true)
+            scgw::g0w0(scf_data,20,&vxc_nn,true,&mut gw_ctx)
         }else{panic!("invalid expression for scgw!")};
     if gw_scheme !="no gw"{
         println!("One round of GW by {} scheme has finished.",gw_scheme);
@@ -145,8 +148,8 @@ pub fn show_energy_levels(scf_data:&SCF){
     
 }
 
-pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
-    let route=GwTensorRoute::select(scf_data);
+pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool,gw_ctx:&mut GwContext)->Vec<f64>{
+    let route=gw_ctx.route(scf_data);
     let ri_ov:Option<MatrixFull<f64>>=route.ri_ov(scf_data);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let v_matrix=route.v_matrix(scf_data);
@@ -1091,15 +1094,37 @@ pub struct GwTensorRoute {
     pub plan: Option<Arc<tensor_ao::GwAoPlan>>,
 }
 
-impl GwTensorRoute {
-    /// Decide the route for this `SCF` and build (or reuse) the AO plan.
-    pub fn select(scf_data: &mut SCF) -> Self {
+/// GW-only run state, carried through a whole GW calculation.
+///
+/// The AO-basis GW plan (`gw_tensor_style = "ao"`) is memoised here rather than
+/// on [`SCF`]: it is *derived*, GW-specific data — only dimensions plus the
+/// optional pre-screening index, never an RI tensor — and therefore does not
+/// belong to the SCF state.  A `GwContext` is created once per GW run
+/// ([`gw_main`]) and threaded through the evGW rounds, so the plan is built at
+/// most once and is dropped together with the run that owns it.
+#[derive(Default)]
+pub struct GwContext {
+    ao_plan: Option<Arc<tensor_ao::GwAoPlan>>,
+}
+
+impl GwContext {
+    /// `true` when an AO plan is currently memoised (diagnostics / tests).
+    pub fn has_cached_plan(&self) -> bool {
+        self.ao_plan.is_some()
+    }
+
+    /// Decide the route for this `SCF`, building (or reusing) the AO plan.
+    pub fn route(&mut self, scf_data: &SCF) -> GwTensorRoute {
         let qp_ctrl = match scf_data.mol.ctrl.quasiparticle_methods.clone() {
             Some(q) => q,
-            None => return Self { plan: None },
+            None => {
+                self.ao_plan = None;
+                return GwTensorRoute { plan: None };
+            }
         };
         if !crate::ctrl_io::quasiparticle_methods::style_is_ao(&qp_ctrl.gw_tensor_style) {
-            return Self { plan: None };
+            self.ao_plan = None;
+            return GwTensorRoute { plan: None };
         }
         // The low-rank contour stores `v*chi*v` grids that are built from a
         // materialised `ri_ov`; that path is not part of the zero-copy route.
@@ -1108,26 +1133,30 @@ impl GwTensorRoute {
                 "gw_tensor_style = \"ao\": `use_low_rank_contour = true` still needs a \
                  materialised ri_ov; keeping the MO-basis GW tensors for this run."
             );
-            return Self { plan: None };
+            self.ao_plan = None;
+            return GwTensorRoute { plan: None };
         }
-        if let Some(cached) = &scf_data.gw_ao_ctx {
+        if let Some(cached) = &self.ao_plan {
             if cached.matches(scf_data) && cached.screening_tol == qp_ctrl.gw_ao_screening_tol {
-                return Self { plan: Some(cached.clone()) };
+                return GwTensorRoute { plan: Some(cached.clone()) };
             }
         }
         match tensor_ao::GwAoPlan::build_with_screening(scf_data, qp_ctrl.gw_ao_screening_tol) {
             Some(p) => {
                 let p = Arc::new(p);
-                scf_data.gw_ao_ctx = Some(p.clone());
-                Self { plan: Some(p) }
+                self.ao_plan = Some(p.clone());
+                GwTensorRoute { plan: Some(p) }
             }
             None => {
                 println!("gw_tensor_style = \"ao\": falling back to the MO-basis GW tensors.");
-                Self { plan: None }
+                self.ao_plan = None;
+                GwTensorRoute { plan: None }
             }
         }
     }
+}
 
+impl GwTensorRoute {
     pub fn is_ao(&self) -> bool {
         self.plan.is_some()
     }
@@ -1876,8 +1905,8 @@ pub fn x_alpha_gw(scf_data:&mut SCF)->Vec<f64>{
         e_n+x_alpha*(exchange-exchange_under_dfa[n])
     }).collect()
 }
-pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool)->Vec<f64>{
-    let route=GwTensorRoute::select(scf_data);
+pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_dfa_xc:bool,gw_ctx:&mut GwContext)->Vec<f64>{
+    let route=gw_ctx.route(scf_data);
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let delta=qp_ctrl.gw_linearize_shift;
     let v_matrix=route.v_matrix(scf_data);

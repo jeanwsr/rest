@@ -40,3 +40,8 @@ _tmp*
 /target_u/
 **/.DS_Store
 /.remote-assistant/
+
+# Local-only GW/BSE cargo tests. Cargo auto-discovers tests/gw_bse/main.rs as the
+# `gw_bse` test target, but the directory is kept out of git so the shared
+# tests/ tree stays clean and local tests can be added freely.
+/tests/gw_bse/

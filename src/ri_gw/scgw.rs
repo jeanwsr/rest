@@ -38,20 +38,21 @@ pub fn g0w0(
     num_freq: usize,
     vxc_nn: &Vec<f64>,
     cancel_dfa_xc: bool,
+    gw_ctx: &mut ri_gw::GwContext,
 ) -> Vec<f64> {
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let gw_scheme = qp_ctrl.gw_scheme.clone();
 
     if gw_scheme == "qp equation" {
-        ri_gw::gw_calculations(scf_data, 20, &vxc_nn, cancel_dfa_xc)
+        ri_gw::gw_calculations(scf_data, 20, &vxc_nn, cancel_dfa_xc, gw_ctx)
     } else if gw_scheme == "linearize" {
-        ri_gw::linearized_gw(scf_data, 20, &vxc_nn, cancel_dfa_xc)
+        ri_gw::linearized_gw(scf_data, 20, &vxc_nn, cancel_dfa_xc, gw_ctx)
     } else if gw_scheme == "x alpha" {
         ri_gw::x_alpha_gw(scf_data)
     } else if gw_scheme == "extrapolated" {
         match qp_ctrl.gw_variant {
             GwVariant::Cd => {
-                gw_near_fermi_surface(scf_data, 20, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold, qp_ctrl.gw_extrapolate_vir_threshold)
+                gw_near_fermi_surface(scf_data, 20, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold, qp_ctrl.gw_extrapolate_vir_threshold, gw_ctx)
             }
             GwVariant::Ac => {
                 gw_near_fermi_surface_ac(scf_data, num_freq, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold)
@@ -654,7 +655,7 @@ impl EvgwDiis {
 /// the same two mechanisms through `evgw_damping` (scalar analogue of MolGW's
 /// Z-scaling) and `evgw_diis` (PySCF's DIIS), plus a convergence test with
 /// early exit so that "did evGW converge?" is answerable from the log.
-pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)->Vec<f64>{
+pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,gw_ctx:&mut ri_gw::GwContext)->Vec<f64>{
     let (_start_mo,_num_state,occ_size,_vir_size,_homo,_lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let damping=qp_ctrl.evgw_damping.clamp(1.0e-3,1.0);
@@ -741,7 +742,7 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)
         scf_data.gwqp.1=qp_in.clone();
         // One full GW pass (root solve, single evaluation or Z-damped step,
         // depending on `evgw_solver`).
-        let mut qp_out=g0w0(scf_data,num_freq,vxc_nn,cancel_dfa_xc);
+        let mut qp_out=g0w0(scf_data,num_freq,vxc_nn,cancel_dfa_xc,gw_ctx);
         // Apply the degeneracy projection to the raw output too, so that the
         // convergence metric and the mixing both work with the projected
         // vector.  Otherwise the frozen out-of-window orbitals -- which are
@@ -1539,8 +1540,8 @@ pub fn gw_near_fermi_surface_ac(
     scf_data.gwqp = (gwqp.clone(), gwqp.clone());
     gwqp
 }
-pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,occ_threshold:f64,vir_threshold:f64)->Vec<f64>{
-    let route=ri_gw::GwTensorRoute::select(scf_data);
+pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,occ_threshold:f64,vir_threshold:f64,gw_ctx:&mut ri_gw::GwContext)->Vec<f64>{
+    let route=gw_ctx.route(scf_data);
     let ri_ov:Option<MatrixFull<f64>>=route.ri_ov(scf_data);
     println!("RI-OV Shape={:?} (AO route: None = never materialised)",ri_ov.as_ref().map(|m| m.size));
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();

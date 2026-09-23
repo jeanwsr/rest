@@ -89,46 +89,24 @@
 //! Per matvec: `O(M O V)` per term.  Persistent storage `O(M O V)`.
 
 use rayon::prelude::*;
-use rest_tensors::matrix::matrix_blas_lapack::omp_set_num_threads_wrapper;
+use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, omp_set_num_threads_wrapper};
+use rest_tensors::matrix::matrixfullslice::{MatrixFullSlice, MatrixFullSliceMut};
 use rest_tensors::matrix::MatrixFull;
-use std::os::raw::c_int;
 use std::time::Instant;
 
 // --------------------------------------------------------------- BLAS access --
 //
-// The workspace already links a BLAS (`rest_tensors` calls `dgemm_` itself), so
-// the CBLAS entry point is available without adding a dependency.  We call it
-// directly instead of going through `rest_tensors::_dgemm_full` / `_dgemm`
-// because both derive the leading dimension from something other than the
-// operand we pass:
+// Every multiplication below calls the workspace-standard
+// `rest_tensors::matrix_blas_lapack::_dgemm_full` — the same Fortran `dgemm`
+// the rest of REST uses.  The operands are contiguous column-major blocks whose
+// leading dimensions the caller knows exactly, so they are wrapped on the fly in
+// zero-copy `MatrixFullSlice` / `MatrixFullSliceMut` views.  The two adapters
+// keep the call sites terse and the explicit `lda`/`ldb`/`ldc` documented.
 //
-//   * `_dgemm_full` uses the *logical* row count (wrong for reshaped operands),
-//   * `_dgemm` routes through `general_dgemm_f`, which takes LDA from the C
-//     sub-block and LDB from the C sub-block's column count.
-//
-// Every operand below is a contiguous column-major block whose leading
-// dimension we know exactly, so we pass it explicitly.
-extern "C" {
-    fn cblas_dgemm(
-        layout: c_int,
-        transa: c_int,
-        transb: c_int,
-        m: c_int,
-        n: c_int,
-        k: c_int,
-        alpha: f64,
-        a: *const f64,
-        lda: c_int,
-        b: *const f64,
-        ldb: c_int,
-        beta: f64,
-        c: *mut f64,
-        ldc: c_int,
-    );
-}
-const CBLAS_COL_MAJOR: c_int = 102;
-const CBLAS_NO_TRANS: c_int = 111;
-const CBLAS_TRANS: c_int = 112;
+// `_dgemm_full` derives each leading dimension from the view's logical row count,
+// so the adapters require `lda == rows(A)`, `ldb == rows(B)` and `ldc == rows(C)`
+// (asserted in debug builds).  That holds for every call here: a per-`q` slab of
+// an `[n1, n2*M]` parent has the parent's leading dimension as its own row count.
 
 /// `C[m,n] = alpha * A[m,k] * B[n,k]^T + beta * C[m,n]`, all column-major.
 ///
@@ -152,32 +130,19 @@ fn dgemm_nt(
     if m == 0 || n == 0 || k == 0 {
         return;
     }
-    debug_assert!(
-        a.len() >= (k - 1) * lda + m,
-        "A slice too short: {} < {}",
-        a.len(),
-        (k - 1) * lda + m
-    );
-    debug_assert!(b.len() >= (k - 1) * ldb + n, "B slice too short");
-    debug_assert!(c.len() >= (n - 1) * ldc + m, "C slice too short");
-    unsafe {
-        cblas_dgemm(
-            CBLAS_COL_MAJOR,
-            CBLAS_NO_TRANS,
-            CBLAS_TRANS,
-            m as c_int,
-            n as c_int,
-            k as c_int,
-            alpha,
-            a.as_ptr(),
-            lda as c_int,
-            b.as_ptr(),
-            ldb as c_int,
-            beta,
-            c.as_mut_ptr(),
-            ldc as c_int,
-        );
-    }
+    debug_assert_eq!(lda, m.max(1), "dgemm_nt: lda must equal A's row count");
+    debug_assert_eq!(ldb, n.max(1), "dgemm_nt: ldb must equal B's row count");
+    debug_assert_eq!(ldc, m.max(1), "dgemm_nt: ldc must equal C's row count");
+    let size_a = [m, k];
+    let ind_a = [1, lda];
+    let size_b = [n, k];
+    let ind_b = [1, ldb];
+    let size_c = [m, n];
+    let ind_c = [1, ldc];
+    let a_view = MatrixFullSlice { size: &size_a, indicing: &ind_a, data: a };
+    let b_view = MatrixFullSlice { size: &size_b, indicing: &ind_b, data: b };
+    let mut c_view = MatrixFullSliceMut { size: &size_c, indicing: &ind_c, data: c };
+    _dgemm_full(&a_view, 'N', &b_view, 'T', &mut c_view, alpha, beta);
 }
 
 /// `C[m,n] = alpha * A[m,k] * B[k,n] + beta * C[m,n]`, all column-major.
@@ -200,24 +165,19 @@ fn dgemm_nn(
     if m == 0 || n == 0 || k == 0 {
         return;
     }
-    unsafe {
-        cblas_dgemm(
-            CBLAS_COL_MAJOR,
-            CBLAS_NO_TRANS,
-            CBLAS_NO_TRANS,
-            m as c_int,
-            n as c_int,
-            k as c_int,
-            alpha,
-            a.as_ptr(),
-            lda as c_int,
-            b.as_ptr(),
-            ldb as c_int,
-            beta,
-            c.as_mut_ptr(),
-            ldc as c_int,
-        );
-    }
+    debug_assert_eq!(lda, m.max(1), "dgemm_nn: lda must equal A's row count");
+    debug_assert_eq!(ldb, k.max(1), "dgemm_nn: ldb must equal B's row count");
+    debug_assert_eq!(ldc, m.max(1), "dgemm_nn: ldc must equal C's row count");
+    let size_a = [m, k];
+    let ind_a = [1, lda];
+    let size_b = [k, n];
+    let ind_b = [1, ldb];
+    let size_c = [m, n];
+    let ind_c = [1, ldc];
+    let a_view = MatrixFullSlice { size: &size_a, indicing: &ind_a, data: a };
+    let b_view = MatrixFullSlice { size: &size_b, indicing: &ind_b, data: b };
+    let mut c_view = MatrixFullSliceMut { size: &size_c, indicing: &ind_c, data: c };
+    _dgemm_full(&a_view, 'N', &b_view, 'N', &mut c_view, alpha, beta);
 }
 
 use crate::ctrl_io::quasiparticle_methods::QuasiParticle;

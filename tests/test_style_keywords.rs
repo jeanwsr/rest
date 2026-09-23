@@ -30,14 +30,14 @@ gw_tensor_style = "mo"
         let qp = parse_quasiparticle_keywords(&keys).unwrap().unwrap();
         assert_eq!(qp.bse_matvec_style, new, "{} -> {}", old, new);
     }
-    // default
+    // default: the BSE matvec defaults to AO, GW stays on MO (commit 4f32667)
     let keys = toml::from_str::<serde_json::Value>("[quasiparticle_methods]\n").unwrap();
     let qp = parse_quasiparticle_keywords(&keys).unwrap().unwrap();
-    assert_eq!(qp.bse_matvec_style, "mo");
+    assert_eq!(qp.bse_matvec_style, "ao");
     assert_eq!(qp.gw_tensor_style, "mo");
     // to_toml exports the new keys
     let t = qp.to_toml();
-    assert_eq!(t.get("bse_matvec_style").unwrap().as_str().unwrap(), "mo");
+    assert_eq!(t.get("bse_matvec_style").unwrap().as_str().unwrap(), "ao");
     assert_eq!(t.get("gw_tensor_style").unwrap().as_str().unwrap(), "mo");
     assert!(t.get("gw_ao_screening_tol").is_some());
     println!("style keyword round-trip OK");

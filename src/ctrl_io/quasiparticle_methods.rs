@@ -348,11 +348,11 @@ pub struct QuasiParticle {
     pub export_matvec_count: bool,
     /// Which implementation performs the implicit BSE matrix-vector products.
     ///
-    /// * `"mo"` (default): the historical MO-basis matvec in
+    /// * `"mo"`: the historical MO-basis matvec in
     ///   `ri_bse::matvec`, which materialises the `[n_aux, n_o, n_v]`,
     ///   `[n_aux, n_o, n_o]` and `[n_aux, n_v, n_v]` RI tensors together with
     ///   the `[n_o*n_v, n_o*n_v]` W matrices.
-    /// * `"ao"`: the AO-basis matvec in `ri_bse::matvec_fast`, which folds the
+    /// * `"ao"` (default): the AO-basis matvec in `ri_bse::matvec_fast`, which folds the
     ///   MO coefficients directly into the packed AO-basis RI tensor
     ///   (`rimatr_bse`) and keeps the auxiliary index explicit, so neither the
     ///   `[n_o*n_v, n_o*n_v]` matrices nor any fully transformed tensor is ever
@@ -707,6 +707,12 @@ impl QuasiParticle {
 /// unrecognised (including a missing key) falls back to `default`.  The
 /// canonical values stored in `QuasiParticle` are always the short forms
 /// `"mo"` and `"ao"`.
+/// Normalise a style keyword to its canonical `"ao"` / `"mo"` value.
+///
+/// `aliases` are the accepted spellings of the AO implementation.  The MO
+/// spellings `"mo"` / `"fast"` are recognised explicitly, so an *explicit*
+/// `bse_matvec_style = "mo"` really selects the MO matvec even though that
+/// field's default is `"ao"`.  Anything else falls back to `default`.
 pub fn normalise_style(
     value: Option<&serde_json::Value>,
     aliases: &[&str],
@@ -717,6 +723,8 @@ pub fn normalise_style(
             let lower = s.trim().to_lowercase();
             if aliases.iter().any(|a| *a == lower) {
                 String::from("ao")
+            } else if matches!(lower.as_str(), "mo" | "fast") {
+                String::from("mo")
             } else {
                 default.to_string()
             }
