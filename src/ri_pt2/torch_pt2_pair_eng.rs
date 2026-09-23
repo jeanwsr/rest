@@ -2,8 +2,8 @@
 //! PyTorch-backed PT2 pair-energy engine (pyo3-embedded CPython).
 //!
 //! The pair-energy contraction is delegated to the torch kernel `get_dfmp2_energy_pair_intra`
-//! / `dfmp2_kernel_multi_gpu_cderi_cpu` (restricted) or `dfump2_kernel_one_gpu` (unrestricted,
-//! single device) in the vendored standalone python copy
+//! / `dfmp2_kernel_multi_gpu_cderi_cpu` (restricted) or `dfump2_kernel_one_gpu` /
+//! `dfump2_kernel_multi_gpu_cderi_cpu` (unrestricted) in the vendored standalone python copy
 //! [`py/dfmp2_addons.py`], running on a CUDA device
 //! through an embedded CPython interpreter (pyo3). Everything before the contraction
 //! (integral generation, j2c decomposition, ao2mo) stays in rust on the CPU, exactly as in
@@ -20,14 +20,18 @@
 //! `showcase-torch-mp2-pyo3@4f80e50` (`src/py/`; docstrings reworded locally,
 //! code unchanged except a local `del cderi_task` in
 //! `dfmp2_addons._inter_contraction_gpu`, freeing each task's GPU half-view
-//! before the next upload allocates, and empty-occ/vir early returns in
+//! before the next upload allocates, an `ss_only` mode of the same function
+//! (the antisymmetrized same-spin fold of the unrestricted driver), `MP2_FOLD`
+//! variants for the ss branch of `_intra_pair_gpu` (it used to upcast `g_ab`
+//! to f64 right after each GEMM; now the same f32acc-default accumulation
+//! scheme as the os fold), and empty-occ/vir early returns in
 //! `_intra_pair_gpu` mirroring the totality of the CPU pair kernels); they
 //! keep both the single-device intra kernel and the multi-device intra+inter
-//! driver, so future multi-GPU wiring needs no python-side changes. The
-//! trailing *unrestricted* section of
-//! `dfmp2_addons.py` (`_uos_pair_gpu` / `get_dfump2_energy_pair_intra` /
-//! `dfump2_kernel_one_gpu`) is written locally for the UHF path of
-//! [`evaluate_riupt2_eng_torch`], following the file's leaf/wrapper/driver
+//! driver. The trailing *unrestricted* section of `dfmp2_addons.py`
+//! (`_uos_pair_gpu` / `get_dfump2_energy_pair_intra` /
+//! `dfump2_kernel_one_gpu` / `nbatch_from_avail_ump2` /
+//! `dfump2_kernel_multi_gpu_cderi_cpu`) is written locally for the UHF path
+//! of [`evaluate_riupt2_eng_torch`], following the file's leaf/wrapper/driver
 //! conventions.
 
 use std::any::TypeId;
@@ -242,12 +246,13 @@ where
 /// kernel, so a violation is a hard error rather than a silently different
 /// energy.
 ///
-/// Of the `[ctrl.ri_pt2]` torch options, the single-device path honors `fp_mode`
-/// (`FP64`/`FP32`/`TF32`), `torch_fold` and `torch_batch`. The batched intra+inter
-/// evaluation (`torch_devices` with 2+ entries or `torch_force_batch_inter`) is NOT
-/// available for UHF yet — its python driver implements the closed-shell
-/// bi-orthogonal fold only — so requesting it is a hard error rather than a
-/// silently different energy.
+/// Of the `[ctrl.ri_pt2]` torch options, `fp_mode` (`FP64`/`FP32`/`TF32`),
+/// `torch_fold` and `torch_batch` are honored on both paths; `torch_devices` with 2+
+/// entries or `torch_force_batch_inter` routes through the multi-device driver
+/// `dfump2_kernel_multi_gpu_cderi_cpu` (per-spin occ clusters; same-spin blocks reuse
+/// the RHF half-splitting scheme with the ss fold, opposite-spin blocks need no
+/// symmetry bookkeeping at all — each (alpha, beta) cluster pair is computed once),
+/// the default single-device path through `dfump2_kernel_one_gpu`.
 ///
 /// Returns `[eng_tot, eng_os, eng_ss]` with `eng_tot = eng_os + eng_ss`, where
 /// `eng_os = sum(pair_ab)` and `eng_ss = 0.25 * (sum(pair_aa) + sum(pair_bb))`
@@ -317,6 +322,7 @@ where
     let ri_pt2_opt = &scf_data.mol.ctrl.ri_pt2;
     let devices = ri_pt2_opt.torch_devices.clone();
     let force_batch_inter = ri_pt2_opt.torch_force_batch_inter;
+    let nbatch = ri_pt2_opt.torch_nbatch;
     let use_tf32 = matches!(ri_pt2_opt.fp_mode, PT2FPMode::TF32);
     let fold_str = match ri_pt2_opt.torch_fold {
         PT2TorchFoldMode::F32Acc => "f32acc",
@@ -326,15 +332,19 @@ where
     let batch = ri_pt2_opt.torch_batch;
     let verbose = std::env::var("MP2_VERBOSE").map(|v| !v.is_empty() && v != "0").unwrap_or(false);
 
-    // batched intra+inter (multi-device or forced) implements the closed-shell
-    // bi-orthogonal fold only; it cannot serve the unrestricted ss/os blocks
-    assert!(
-        devices.len() == 1 && !force_batch_inter,
-        "ri_pt2 engine = \"torch\" with a UHF reference currently supports the single-device \
-         kernel only (dfump2_kernel_one_gpu); torch_devices with 2+ entries and \
-         torch_force_batch_inter are not yet available for UHF. Run with the default \
-         torch_devices = [0] and torch_force_batch_inter = false."
-    );
+    // device ids must be pairwise distinct: the list assigns physical GPUs, not work
+    // slots. To split the occ space over one GPU (GPU-OOM remedy), use
+    // torch_force_batch_inter instead of a duplicated id.
+    {
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            devices.iter().all(|d| seen.insert(d)),
+            "ri_pt2 engine = \"torch\": torch_devices entries must be pairwise distinct \
+             (logical CUDA device ids); got {devices:?}. To run the batched intra+inter \
+             evaluation on a single GPU (e.g. for GPU-memory reasons), set \
+             torch_force_batch_inter = true instead of repeating the device id."
+        );
+    }
 
     // lazy one-time initialization: embedded interpreter + torch import + CUDA context
     // warmup. Fail fast (before spending minutes on ao2mo for large systems) if the
@@ -406,18 +416,33 @@ where
         // occ_owned / vir_owned stay alive until the end of this scope, so their pointers
         // remain valid for the python calls below.
 
-        // single-device UMP2 driver: uploads both spins' cderi once, runs the
-        // aa/bb ss-only intra + ab opposite-spin contractions
-        let driver = addons.getattr("dfump2_kernel_one_gpu")?;
-        let result = driver.call1((
-            cderi_torch[A].clone(), cderi_torch[B].clone(),
-            occ_torch[A].clone(), occ_torch[B].clone(),
-            vir_torch[A].clone(), vir_torch[B].clone(),
-            "cuda", use_tf32, verbose,
-        ))?;
-        let os: f64 = result.get_item("e_corr_os")?.extract()?;
-        let ss: f64 = result.get_item("e_corr_ss")?.extract()?;
-        Ok((os, ss))
+        // intra+inter (batched) evaluation runs when several devices are listed, or
+        // when forced on a single device (GPU-memory remedy); otherwise the plain
+        // single-device driver that uploads both spins' cderi once
+        if devices.len() > 1 || force_batch_inter {
+            let driver = addons.getattr("dfump2_kernel_multi_gpu_cderi_cpu")?;
+            let result = driver.call1((
+                cderi_torch[A].clone(), occ_torch[A].clone(), vir_torch[A].clone(),
+                cderi_torch[B].clone(), occ_torch[B].clone(), vir_torch[B].clone(),
+                Some(devices), nbatch, Option::<f64>::None,
+                use_tf32, verbose,
+            ))?;
+            let os: f64 = result.get_item("e_corr_os")?.extract()?;
+            let ss: f64 = result.get_item("e_corr_ss")?.extract()?;
+            Ok((os, ss))
+        } else {
+            // aa/bb ss-only intra + ab opposite-spin contractions, both cderi resident
+            let driver = addons.getattr("dfump2_kernel_one_gpu")?;
+            let result = driver.call1((
+                cderi_torch[A].clone(), cderi_torch[B].clone(),
+                occ_torch[A].clone(), occ_torch[B].clone(),
+                vir_torch[A].clone(), vir_torch[B].clone(),
+                "cuda", use_tf32, verbose,
+            ))?;
+            let os: f64 = result.get_item("e_corr_os")?.extract()?;
+            let ss: f64 = result.get_item("e_corr_ss")?.extract()?;
+            Ok((os, ss))
+        }
     })
     .unwrap_or_else(|e| panic!("ri_pt2 engine = \"torch\" UMP2 pair-energy contraction (pyo3) failed: {e}"));
     timerecords.count("c_r5dft");

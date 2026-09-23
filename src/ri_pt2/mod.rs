@@ -262,7 +262,9 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         // RHF | UHF (guarded above); fp_mode selects the torch matmul dtype:
         // FP64 -> f64, FP32 -> f32, TF32 -> f32 + TF32 tensor-core matmuls
         // (the use_tf32 flag is read inside the torch engine). UHF routes
-        // through the single-device UMP2 driver (dfump2_kernel_one_gpu).
+        // through dfump2_kernel_one_gpu, or the multi-device intra+inter
+        // driver dfump2_kernel_multi_gpu_cderi_cpu when several devices are
+        // listed / force-batch is set.
         let pt2_fp_mode = scf_data.mol.ctrl.ri_pt2.fp_mode;
         pt2_c = match scf_data.scftype {
             SCFType::RHF => match pt2_fp_mode {

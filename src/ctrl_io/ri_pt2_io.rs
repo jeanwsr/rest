@@ -96,18 +96,24 @@ pub struct RiPt2Option {
     /// one GPU: each cluster only uploads its own cderi slice and pair blocks, so
     /// the peak GPU memory scales down with the cluster size. This is the remedy
     /// for GPU OOM when the full intra evaluation (one whole-`cderi` upload plus
-    /// macro-batched pair GEMMs) exceeds a single device's memory. No effect when
-    /// `torch_devices` already lists 2+ devices (the intra+inter driver runs
-    /// anyway) or when `engine = Cpu`.
+    /// macro-batched pair GEMMs) exceeds a single device's memory. Under UHF the
+    /// split is per spin (an empty or tiny spin channel collapses to zero / one
+    /// cluster instead of being rejected). No effect when `torch_devices` already
+    /// lists 2+ devices (the intra+inter driver runs anyway) or when
+    /// `engine = Cpu`.
     #[serde_inline_default(false)]
     pub torch_force_batch_inter: bool,
 
     /// Occupied-cluster batch count for the intra+inter torch evaluation
     /// (`torch_devices` with 2+ entries, or `torch_force_batch_inter = true`).
     /// The occupied space is split into `len(torch_devices) * nbatch` balanced
-    /// clusters. `None` (default) auto-detects from per-device free GPU memory
-    /// (each cluster's cderi slice budgeted to 40% of it). Ignored by the
-    /// single-device path and when `engine = Cpu`.
+    /// clusters. Under UHF the split is per spin, clamped so each cluster keeps
+    /// >= 4 occupied orbitals (an empty or tiny spin channel collapses to zero /
+    /// one cluster). `None` (default) auto-detects from per-device free GPU memory
+    /// (each cluster's cderi slice budgeted to 40% of it; under UHF the per-device
+    /// peak — own cluster + inter half-view, or the alpha + beta cluster pair —
+    /// is budgeted to 60% of it). Ignored by the single-device path and when
+    /// `engine = Cpu`.
     #[serde_inline_default(None)]
     pub torch_nbatch: Option<usize>,
 

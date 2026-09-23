@@ -119,7 +119,8 @@ def _intra_pair_gpu(cderi_ovl, occ_energy, vir_energy, ss_only=False, device=Non
         torch.cuda.synchronize()
         _tgv0 = time.perf_counter()
         for _i in range(nocc):
-            _nb = _i + 1
+            # ss pairs are strictly j < i (no i == j diagonal)
+            _nb = _i if ss_only else _i + 1
             _at = (
                 cderi_ovl[_i : _i + 1]
                 .transpose(-1, -2)
@@ -132,13 +133,17 @@ def _intra_pair_gpu(cderi_ovl, occ_energy, vir_energy, ss_only=False, device=Non
                 _ = torch.matmul(_b2d, _at)
         torch.cuda.synchronize()
         _tgv = time.perf_counter() - _tgv0
-        _npairs = nocc * (nocc + 1) // 2
+        _npairs = nocc * (nocc - 1 if ss_only else nocc + 1) // 2
         _gflops = _npairs * 2 * nvir * nvir * naux / _tgv / 1e9
         print(
             f"[dfmp2] gemm-only: {_tgv:.3f}s  {_gflops:.0f} GF/s "
             f"({_npairs} pairs, macro-batch={_batch}, shape {nvir}x{naux}x{nvir})",
             flush=True,
         )
+
+    if _fold != "f64":
+        occ_m = occ_energy.to(mat_dtype)
+        d_vv_m = d_vv.to(mat_dtype)
 
     if not ss_only:
         eng_pair_bi1 = torch.zeros([nocc, nocc], dtype=acc_dtype, device=device)
@@ -150,9 +155,6 @@ def _intra_pair_gpu(cderi_ovl, occ_energy, vir_energy, ss_only=False, device=Non
         # g (jb,nvir,nvir) = cderi[i] @ cderi[j0:j0+jb].mT (broadcasts the (1,nvir,naux) lhs
         # over the jb rhs slices -> one batched GEMM per chunk). Bounding jb bounds the
         # (jb,nvir,nvir) output/intermediate tensors while keeping the GEMM batched.
-        if _fold != "f64":
-            occ_m = occ_energy.to(mat_dtype)
-            d_vv_m = d_vv.to(mat_dtype)
         for i in range(nocc):
             nb = i + 1
             a_t = (
@@ -201,16 +203,35 @@ def _intra_pair_gpu(cderi_ovl, occ_energy, vir_energy, ss_only=False, device=Non
         if _MP2_VERBOSE:
             torch.cuda.synchronize()
             _tc0 = time.perf_counter()
+        # macro-batched over j < i for fixed i, same chunked-GEMM scheme as the bi
+        # branch above (one (jb*nvir, naux) @ (naux, nvir) GEMM per j chunk)
         for i in range(nocc):
-            for j in range(i):
-                g_ab = cderi_ovl[i] @ cderi_ovl[j].t()  # matmul in mat_dtype
-                g_ab = g_ab.to(acc_dtype)
-                g_ab = g_ab - g_ab.t()  # antisymmetrize
-                d_ab = occ_energy[i] + occ_energy[j] + d_vv
-                t_ab = g_ab / d_ab
-                e_ab = torch.dot(t_ab.reshape(-1), g_ab.reshape(-1))
-                eng_pair_ss[i, j] = e_ab
-                eng_pair_ss[j, i] = e_ab
+            a_t = (
+                cderi_ovl[i : i + 1].transpose(-1, -2).contiguous().reshape(naux, nvir)
+            )
+            for j0 in range(0, i, _batch):
+                jb = min(_batch, i - j0)
+                b_2d = cderi_ovl[j0 : j0 + jb].reshape(jb * nvir, naux)
+                g_ab = torch.matmul(b_2d, a_t).reshape(jb, nvir, nvir)
+                g_as = g_ab - g_ab.mT  # antisymmetrize in mat_dtype (no f64 copy)
+                if _fold == "f64":
+                    g_as = g_as.to(acc_dtype)  # upcast for accumulation
+                    d_ab = (
+                        occ_energy[i]
+                        + occ_energy[j0 : j0 + jb, None, None]
+                        + d_vv[None]
+                    )
+                    t_as = g_as / d_ab
+                    e_ss = (t_as * g_as).sum(dim=(1, 2))
+                else:
+                    d_ab = occ_m[i] + occ_m[j0 : j0 + jb, None, None] + d_vv_m[None]
+                    t_as = g_as / d_ab
+                    if _fold == "f32acc":
+                        e_ss = (t_as * g_as).sum(dim=(1, 2), dtype=acc_dtype)
+                    else:  # "f32"
+                        e_ss = (t_as * g_as).sum(dim=(1, 2)).to(acc_dtype)
+                eng_pair_ss[i, j0 : j0 + jb] = e_ss
+                eng_pair_ss[j0 : j0 + jb, i] = e_ss
         if _MP2_VERBOSE:
             torch.cuda.synchronize()
             _tc = time.perf_counter() - _tc0
@@ -273,9 +294,11 @@ def get_dfmp2_energy_pair_intra(
     -----
     ``cderi_ovl`` must be a torch tensor; its dtype (float32 or float64) drives
     the matmul precision. The occupied/virtual energies are used in float64 and
-    the pair-energy accumulation is *always* done in float64. So when
-    ``cderi_ovl`` is float32, only the matmul itself runs in reduced precision;
-    ``g_ab`` is upcast to float64 before the denominator / amplitude / contraction.
+    the pair-energy *reduction* is always accumulated in float64. When
+    ``cderi_ovl`` is float32, the element-wise fold (denominator / amplitude /
+    contraction) runs in float32 with float64 accumulation by default
+    (``MP2_FOLD=f32acc``); ``MP2_FOLD=f64`` upcasts ``g_ab`` to float64 before
+    the fold instead (conservative option; slower, more memory).
     """
     with with_tf32(use_tf32):
         out = _intra_pair_gpu(
@@ -413,6 +436,7 @@ def _inter_contraction_gpu(
     occ_idx_device_list,
     occ_idx_host_list,
     nocc_full,
+    ss_only=False,
     device=None,
 ):
     r"""Off-diagonal (inter) pair contraction into on-device GPU tensors.
@@ -423,6 +447,13 @@ def _inter_contraction_gpu(
     the host half-views onto the device one task at a time and runs the pair loop:
 
     ``g_ab = cderi_dev[i] @ cderi_host_half[j].t()``
+
+    With ``ss_only=True`` (the same-spin mode of the unrestricted driver) the fold is
+    the antisymmetrized same-spin energy ``(g_ab - g_ab.mT)^2 / D`` per (i, j),
+    mirroring the ss branch of :func:`_intra_pair_gpu` (same ``MP2_FOLD``
+    accumulation scheme as the os fold: elementwise in mat_dtype, f64 upcast only
+    for ``MP2_FOLD=f64``), and a single ``eng_pair_ss`` tensor is returned instead
+    of the bi-orthogonal pair.
 
     Like :func:`_intra_pair_gpu` it does NOT toggle TF32 and performs NO host sync --
     it returns GPU tensors so the caller can defer ``.cpu()`` to a single sync point.
@@ -475,6 +506,7 @@ def _inter_contraction_gpu(
     eng_pair_bi1, eng_pair_bi2 : torch.Tensor
         Pair energies of shape (nocc_dev, nocc_full), float64 on `device`. Only the
         off-diagonal columns addressed by the tasks are filled; the rest stay zero.
+        When ``ss_only=True`` a single ``eng_pair_ss`` tensor is returned instead.
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -487,11 +519,16 @@ def _inter_contraction_gpu(
     vir_energy = _as_torch(vir_energy, acc_dtype, device)
     nocc_dev = occ_energy_dev.shape[0]
 
-    eng_pair_bi1 = torch.zeros([nocc_dev, nocc_full], dtype=acc_dtype, device=device)
-    eng_pair_bi2 = torch.zeros([nocc_dev, nocc_full], dtype=acc_dtype, device=device)
     ntask = len(cderi_host_half_list)
-    if ntask == 0:
-        return eng_pair_bi1, eng_pair_bi2
+    if ss_only:
+        eng_pair_ss = torch.zeros([nocc_dev, nocc_full], dtype=acc_dtype, device=device)
+        if ntask == 0:
+            return eng_pair_ss
+    else:
+        eng_pair_bi1 = torch.zeros([nocc_dev, nocc_full], dtype=acc_dtype, device=device)
+        eng_pair_bi2 = torch.zeros([nocc_dev, nocc_full], dtype=acc_dtype, device=device)
+        if ntask == 0:
+            return eng_pair_bi1, eng_pair_bi2
 
     d_vv = -vir_energy[:, None] - vir_energy[None, :]  # (nvir, nvir), f64
 
@@ -535,7 +572,35 @@ def _inter_contraction_gpu(
                 b_2d = cderi_task[j0 : j0 + jb].reshape(jb * nvir, naux)
                 g_ab = torch.matmul(b_2d, a_t).reshape(jb, nvir, nvir)
                 jcols = idx_t[j0 : j0 + jb]
-                if _fold == "f64":
+                if ss_only:
+                    # antisymmetrized same-spin fold, mirroring the ss branch of
+                    # _intra_pair_gpu (same MP2_FOLD accumulation scheme as the os
+                    # fold: elementwise in mat_dtype, no f64 copy of g_ab); the
+                    # double (a, b) sum is transpose-invariant, so the (host b,
+                    # device a) GEMM orientation is immaterial here
+                    g_as = g_ab - g_ab.mT
+                    if _fold == "f64":
+                        g_as = g_as.to(acc_dtype)  # upcast for accumulation
+                        d_ab = (
+                            occ_energy_dev[i]
+                            + occ_energy_task[j0 : j0 + jb, None, None]
+                            + d_vv[None]
+                        )
+                        t_as = g_as / d_ab
+                        e_ss = (t_as * g_as).sum(dim=(1, 2))
+                    else:
+                        d_ab = (
+                            occ_energy_dev_m[i]
+                            + occ_energy_task_m[j0 : j0 + jb, None, None]
+                            + d_vv_m[None]
+                        )
+                        t_as = g_as / d_ab
+                        if _fold == "f32acc":
+                            e_ss = (t_as * g_as).sum(dim=(1, 2), dtype=acc_dtype)
+                        else:  # "f32"
+                            e_ss = (t_as * g_as).sum(dim=(1, 2)).to(acc_dtype)
+                    eng_pair_ss[i, jcols] = e_ss
+                elif _fold == "f64":
                     g_ab = g_ab.to(acc_dtype)  # upcast for accumulation
                     d_ab = (
                         occ_energy_dev[i]
@@ -545,6 +610,8 @@ def _inter_contraction_gpu(
                     t_ab = g_ab / d_ab
                     e_bi1 = (t_ab * g_ab).sum(dim=(1, 2))
                     e_bi2 = (t_ab.mT * g_ab).sum(dim=(1, 2))
+                    eng_pair_bi1[i, jcols] = e_bi1
+                    eng_pair_bi2[i, jcols] = e_bi2
                 else:
                     d_ab = (
                         occ_energy_dev_m[i]
@@ -558,8 +625,8 @@ def _inter_contraction_gpu(
                     else:  # "f32"
                         e_bi1 = (t_ab * g_ab).sum(dim=(1, 2)).to(acc_dtype)
                         e_bi2 = (t_ab.mT * g_ab).sum(dim=(1, 2)).to(acc_dtype)
-                eng_pair_bi1[i, jcols] = e_bi1
-                eng_pair_bi2[i, jcols] = e_bi2
+                    eng_pair_bi1[i, jcols] = e_bi1
+                    eng_pair_bi2[i, jcols] = e_bi2
 
         # free this half-view before the next upload allocates (the loop-top rebind
         # would drop it only after the new tensor is already resident)
@@ -572,12 +639,15 @@ def _inter_contraction_gpu(
             len(d) * len(h) for d, h in zip(occ_idx_device_list, occ_idx_host_list)
         )
         _gflops = _ng * 2 * nvir * nvir * naux / _tc / 1e9
+        _tag = "ss " if ss_only else ""
         print(
-            f"[dfmp2] inter compute: {_tc:.3f}s  {_gflops:.0f} GF/s "
+            f"[dfmp2] inter {_tag}compute: {_tc:.3f}s  {_gflops:.0f} GF/s "
             f"(synced pair loop, {_ng} pairs)",
             flush=True,
         )
 
+    if ss_only:
+        return eng_pair_ss
     return eng_pair_bi1, eng_pair_bi2
 
 
@@ -595,6 +665,7 @@ def get_dfmp2_energy_pair_inter(
     cderi_ovl_host_list,
     occ_energy_host_list,
     eval_mode_list,
+    ss_only=False,
     device=None,
     use_tf32=False,
 ):
@@ -609,6 +680,9 @@ def get_dfmp2_energy_pair_inter(
     Index ``i`` runs over the *device's own* occ cluster (``cderi_ovl``, already on the
     device); index ``j`` runs over every *other* cluster, which lives in CPU memory
     (``cderi_ovl_host_list``) and is streamed onto the device one task at a time.
+
+    With ``ss_only=True`` a single same-spin pair matrix ``eng_pair_ss`` is returned
+    (see :func:`_inter_contraction_gpu`).
 
     Returns
     -------
@@ -628,7 +702,7 @@ def get_dfmp2_energy_pair_inter(
         nocc, cderi_ovl_host_list, occ_energy_host_list, eval_mode_list
     )
     with with_tf32(use_tf32):
-        bi1, bi2 = _inter_contraction_gpu(
+        out = _inter_contraction_gpu(
             cderi_ovl,
             occ_energy,
             vir_energy,
@@ -637,9 +711,12 @@ def get_dfmp2_energy_pair_inter(
             occ_idx_device_list,
             occ_idx_host_list,
             nocc_full,
+            ss_only=ss_only,
             device=device,
         )
-    return bi1.cpu().numpy(), bi2.cpu().numpy()
+    if ss_only:
+        return out.cpu().numpy()
+    return out[0].cpu().numpy(), out[1].cpu().numpy()
 
 
 def _inter_pair_gpu(
@@ -649,6 +726,7 @@ def _inter_pair_gpu(
     cderi_ovl_host_list,
     occ_energy_host_list,
     eval_mode_list,
+    ss_only=False,
     device=None,
 ):
     r"""Inter pair energies into on-device GPU tensors (no TF32 toggle, no host sync).
@@ -676,6 +754,7 @@ def _inter_pair_gpu(
         occ_idx_device_list,
         occ_idx_host_list,
         nocc_full,
+        ss_only=ss_only,
         device=device,
     )
 
@@ -904,6 +983,315 @@ def dfump2_kernel_one_gpu(
     e_corr_pair_aa = pair_aa.cpu().numpy()
     e_corr_pair_bb = pair_bb.cpu().numpy()
     e_corr_pair_ab = pair_ab.cpu().numpy()
+    e_corr_aa = 0.25 * float(e_corr_pair_aa.sum())
+    e_corr_bb = 0.25 * float(e_corr_pair_bb.sum())
+    e_corr_ab = float(e_corr_pair_ab.sum())
+    e_corr_os = e_corr_ab
+    e_corr_ss = e_corr_aa + e_corr_bb
+    return {
+        "e_corr_pair_aa": e_corr_pair_aa,
+        "e_corr_pair_bb": e_corr_pair_bb,
+        "e_corr_pair_ab": e_corr_pair_ab,
+        "e_corr_aa": e_corr_aa,
+        "e_corr_bb": e_corr_bb,
+        "e_corr_ab": e_corr_ab,
+        "e_corr_os": e_corr_os,
+        "e_corr_ss": e_corr_ss,
+        "e_corr": e_corr_os + e_corr_ss,
+    }
+
+
+# ---------------------------------------------------------------------------
+# multi-GPU UMP2 driver (no mol / aux; per-spin cderi supplied directly)
+# ---------------------------------------------------------------------------
+
+
+def nbatch_from_avail_ump2(
+    nocc_a, nvir_a, nocc_b, nvir_b, naux, ndevice, nbytes, avail_bytes
+):
+    """Deduce `nbatch` for the unrestricted multi-GPU driver from a memory budget.
+
+    The per-device peak is ~``max(1.5*bytes_a, 1.5*bytes_b, bytes_a + bytes_b) / nsplit``
+    (same-spin own cluster + inter half-view, or the opposite-spin alpha + beta cluster
+    pair), budgeted to 60% of the available memory -- the same effective share the RHF
+    heuristic of :func:`nbatch_from_avail` leaves (own cluster 40% + half-view ~20%).
+    ``nsplit = ndevice * nbatch`` then covers both spins' occupied orbitals.
+    """
+    for nocc, nvir in ((nocc_a, nvir_a), (nocc_b, nvir_b)):
+        if nocc == 0:
+            continue
+        nocc_batch_max = int(np.floor(avail_bytes * 0.6 / (nvir * naux * nbytes)))
+        if nocc_batch_max < 8:
+            raise RuntimeError(
+                f"GPU memory seems insufficient. Available (bytes): {avail_bytes}. "
+                f"Required (bytes): {8 * nvir * naux * nbytes}."
+            )
+    bytes_a = nocc_a * nvir_a * naux * nbytes
+    bytes_b = nocc_b * nvir_b * naux * nbytes
+    peak_per_split = max(1.5 * bytes_a, 1.5 * bytes_b, bytes_a + bytes_b)
+    nsplit_min = int(np.ceil(peak_per_split / (avail_bytes * 0.6)))
+    return max(int(np.ceil(nsplit_min / ndevice)), 1)
+
+
+def dfump2_kernel_multi_gpu_cderi_cpu(
+    cderi_ovl_a,
+    occ_energy_a,
+    vir_energy_a,
+    cderi_ovl_b,
+    occ_energy_b,
+    vir_energy_b,
+    ndevice=None,
+    nbatch=None,
+    max_memory=None,
+    use_tf32=False,
+    verbose=False,
+):
+    r"""Multi-GPU DF-UMP2 pair-energy kernel from CPU-resident per-spin `cderi_ovl`.
+
+    Unrestricted counterpart of :func:`dfmp2_kernel_multi_gpu_cderi_cpu`; returns the
+    same dict as :func:`dfump2_kernel_one_gpu`. Each spin's occupied space is split
+    into clusters (per-spin counts, see below) and the three contractions become:
+
+    - aa / bb (same spin): the ss pair matrix is symmetric under i <-> j, so the RHF
+      cluster machinery applies unchanged -- diagonal blocks through the ss-only intra
+      kernel (:func:`_intra_pair_gpu`), off-diagonal blocks through the ss inter kernel
+      (:func:`_inter_pair_gpu` with the half-splitting scheme that assigns each
+      quarter-block to exactly one cluster), assembled with ``+= block`` /
+      ``+= block.T``.
+    - ab (opposite spin): a rectangular (nocc_a, nocc_b) pair matrix with NO i/j
+      symmetry, so every (alpha cluster, beta cluster) block is computed exactly once
+      by the alpha cluster's owner through :func:`_uos_pair_gpu` -- no half-splitting,
+      no transpose assembly; simpler than the RHF inter scheme. The alpha cluster stays
+      resident while the beta clusters are streamed one at a time (each beta upload is
+      call-local to `_uos_pair_gpu`, so it self-frees at return).
+
+    Per-spin cluster counts: ``nsplit_s = max(1, min(ndevice * nbatch, nocc_s // 4))``
+    for a nonempty spin (clusters of >= 4 occupied orbitals, matching the RHF driver's
+    balanced-split assert); an empty spin channel (fully spin-polarized reference) is
+    skipped entirely. Unlike the RHF driver, small channels are CLAMPED to a single
+    cluster rather than rejected -- UHF beta channels are commonly tiny (high-spin
+    references), and a tiny channel's whole cderi is itself small. ``nbatch=None``
+    auto-detects through :func:`nbatch_from_avail_ump2` (min free VRAM across devices,
+    or `max_memory` MB, or host memory on CPU).
+
+    Peak device memory is ~``max(1.5*|A|, 1.5*|B|, |A| + |B|) / nsplit`` + O(nvir^2)
+    transients per device. Near the memory wall,
+    ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` (or a larger ``nbatch``) helps
+    against caching-allocator fragmentation from the varying-size uploads.
+
+    Multi-GPU dispatch mirrors the RHF driver: one worker thread per entry of
+    ``ndevice`` (:func:`_par_map`), each pinned to its own GPU and owning the clusters
+    whose position is ``pos mod ndevice``; per-cluster results stay on their device and
+    are only pulled to CPU at the single assembly sync point. TF32 is process-global,
+    so it is set once for the whole parallel region. On a single physical GPU the
+    dispatch is serial (no point in two threads on one device); set
+    ``DFMP2_FORCE_THREADS=1`` to force the threaded path for testing on one GPU (e.g.
+    with ``ndevice=[0, 0]``).
+
+    Returns
+    -------
+    dict with ``e_corr_pair_aa`` (nocc_a, nocc_a), ``e_corr_pair_bb`` (nocc_b, nocc_b),
+    ``e_corr_pair_ab`` (nocc_a, nocc_b) and the scalars ``e_corr_aa``/``e_corr_bb``/
+    ``e_corr_ab``/``e_corr_os``/``e_corr_ss``/``e_corr`` (full-matrix ss convention,
+    0.25 same-spin factor), same as :func:`dfump2_kernel_one_gpu`.
+    """
+    cderi_np = [np.asarray(cderi_ovl_a), np.asarray(cderi_ovl_b)]
+    occ = [np.asarray(occ_energy_a), np.asarray(occ_energy_b)]
+    vir = [np.asarray(vir_energy_a), np.asarray(vir_energy_b)]
+    nocc = [occ[0].shape[0], occ[1].shape[0]]
+    nvir = [vir[0].shape[0], vir[1].shape[0]]
+    naux = cderi_np[0].shape[2]
+    assert cderi_np[0].shape == (nocc[0], nvir[0], naux), cderi_np[0].shape
+    assert cderi_np[1].shape == (nocc[1], nvir[1], naux), cderi_np[1].shape
+    mat_dtype = (
+        torch.float64 if np.dtype(cderi_np[0].dtype) == np.float64 else torch.float32
+    )
+    assert (
+        np.dtype(cderi_np[1].dtype) == np.dtype(cderi_np[0].dtype)
+    ), "cderi_ovl_a/b must share dtype"
+
+    # ---- device list (same handling as the RHF driver) ----
+    if ndevice is None:
+        ndevice = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    if isinstance(ndevice, (list, tuple)):
+        device_list = list(ndevice)
+        ndevice = len(device_list)
+    else:
+        assert isinstance(ndevice, int) and ndevice >= 1
+        device_list = list(range(ndevice))
+
+    if nbatch is None:
+        nbytes = 4 if mat_dtype == torch.float32 else 8
+        if max_memory is not None:
+            avail_bytes = int(max_memory * 1024 * 1024)
+        elif torch.cuda.is_available():
+            avail_bytes = min(torch.cuda.mem_get_info(d)[0] for d in device_list)
+        else:
+            avail_bytes = _cpu_avail_bytes()
+        nbatch = nbatch_from_avail_ump2(
+            nocc[0], nvir[0], nocc[1], nvir[1], naux, ndevice, nbytes, avail_bytes
+        )
+
+    nsplit = ndevice * nbatch
+    # per-spin cluster counts (see docstring): >= 4 orbitals per cluster when possible;
+    # empty or tiny channels collapse to 0 / 1 clusters instead of being rejected
+    nsplit_s = [max(1, min(nsplit, nocc[s] // 4)) if nocc[s] > 0 else 0 for s in range(2)]
+    if verbose:
+        distinct_devs = len(set(device_list))
+        force_threads = bool(os.environ.get("DFMP2_FORCE_THREADS"))
+        print(
+            f"[info] ump2 ndevice={ndevice} nbatch={nbatch} nsplit={nsplit} "
+            f"nsplit_a={nsplit_s[0]} nsplit_b={nsplit_s[1]} nocc={nocc} dtype={mat_dtype} "
+            f"distinct_devs={distinct_devs} force_threads={force_threads}",
+            flush=True,
+        )
+
+    # ---- split each spin's cderi / occ energy into per-cluster CPU slices ----
+    cderi_cpu_list = [[], []]
+    occ_split = [[], []]
+    occ_balanced = [
+        balanced_split(nocc[s], nsplit_s[s]) if nocc[s] > 0 else [] for s in range(2)
+    ]
+    for s in range(2):
+        i0 = 0
+        for nb in occ_balanced[s]:
+            i1 = i0 + nb
+            cderi_cpu_list[s].append(np.ascontiguousarray(cderi_np[s][i0:i1]))
+            occ_split[s].append(np.ascontiguousarray(occ[s][i0:i1]))
+            i0 = i1
+
+    def _ss_blocks(spin, idx, cderi_dev, dev):
+        # same-spin diagonal + off-diagonal blocks of spin `spin`'s cluster `idx`
+        # (own cluster `cderi_dev` already on `dev`)
+        return (
+            _intra_pair_gpu(
+                cderi_dev, occ_split[spin][idx], vir[spin], ss_only=True, device=dev
+            ),
+            _inter_pair_gpu(
+                cderi_dev,
+                occ_split[spin][idx],
+                vir[spin],
+                cderi_cpu_list[spin],
+                occ_split[spin],
+                [None if i == idx else (i < idx) for i in range(nsplit_s[spin])],
+                ss_only=True,
+                device=dev,
+            ),
+        )
+
+    def _worker(pos_dev):
+        pos, dev_id = pos_dev
+        dev = _device_str(dev_id)
+        ctx = (
+            torch.cuda.device(dev_id)
+            if torch.cuda.is_available()
+            else contextlib.nullcontext()
+        )
+        out_aa, out_bb, out_ab = {}, {}, {}
+        with ctx:
+            # alpha clusters: own cderi uploaded once, shared by the aa blocks and the
+            # ab row block (beta clusters streamed inside the loop)
+            for p in range(pos, nsplit_s[0], ndevice):
+                if verbose:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize(dev_id)
+                    _w0 = time.perf_counter()
+                cderi_a_dev = _as_torch(cderi_cpu_list[0][p], mat_dtype, dev)
+                if verbose:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize(dev_id)
+                    print(
+                        f"[dev{dev_id}] alpha cluster {p} upload: "
+                        f"{time.perf_counter() - _w0:.2f}s "
+                        f"({cderi_cpu_list[0][p].nbytes / 1e9:.2f} GB)",
+                        flush=True,
+                    )
+                    _w1 = time.perf_counter()
+                out_aa[p] = _ss_blocks(0, p, cderi_a_dev, dev)
+                if nsplit_s[1] > 0:
+                    # rectangular ab row block: no i/j symmetry, each (p, q) block
+                    # computed exactly once by the alpha cluster's owner
+                    block = torch.zeros(
+                        [occ_balanced[0][p], nocc[1]], dtype=torch.float64, device=dev
+                    )
+                    j0 = 0
+                    for q in range(nsplit_s[1]):
+                        j1 = j0 + occ_balanced[1][q]
+                        block[:, j0:j1] = _uos_pair_gpu(
+                            cderi_a_dev,
+                            cderi_cpu_list[1][q],
+                            occ_split[0][p],
+                            occ_split[1][q],
+                            vir[0],
+                            vir[1],
+                            device=dev,
+                        )
+                        j0 = j1
+                    out_ab[p] = block
+                # free before the next cluster's upload allocates (the loop-top rebind
+                # would drop it only after the new tensor is already resident)
+                del cderi_a_dev
+                if verbose:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize(dev_id)
+                    print(
+                        f"[dev{dev_id}] alpha cluster {p} aa+ab: "
+                        f"{time.perf_counter() - _w1:.2f}s",
+                        flush=True,
+                    )
+            # beta clusters: bb blocks only (the ab work is done from the alpha side)
+            for q in range(pos, nsplit_s[1], ndevice):
+                cderi_b_dev = _as_torch(cderi_cpu_list[1][q], mat_dtype, dev)
+                out_bb[q] = _ss_blocks(1, q, cderi_b_dev, dev)
+                del cderi_b_dev
+        return out_aa, out_bb, out_ab
+
+    # TF32 is process-global: set it once for the whole parallel region (the `_gpu`
+    # leaves do not toggle it), so concurrent workers never race on the flag.
+    with with_tf32(use_tf32):
+        results = _par_map(_worker, enumerate(device_list))
+
+    res_aa = [None] * nsplit_s[0]
+    res_bb = [None] * nsplit_s[1]
+    res_ab = [None] * nsplit_s[0]
+    for out_aa, out_bb, out_ab in results:
+        for p, v in out_aa.items():
+            res_aa[p] = v
+        for q, v in out_bb.items():
+            res_bb[q] = v
+        for p, v in out_ab.items():
+            res_ab[p] = v
+
+    # ---- assemble: pull to CPU here (the single host sync point per cluster) ----
+    if verbose:
+        _asm0 = time.perf_counter()
+    e_corr_pair_aa = np.zeros([nocc[0], nocc[0]], dtype=np.float64)
+    e_corr_pair_bb = np.zeros([nocc[1], nocc[1]], dtype=np.float64)
+    e_corr_pair_ab = np.zeros([nocc[0], nocc[1]], dtype=np.float64)
+    for s, pair in ((0, e_corr_pair_aa), (1, e_corr_pair_bb)):
+        res = (res_aa, res_bb)[s]
+        i0 = 0
+        for idx, nocc_batch in enumerate(occ_balanced[s]):
+            i1 = i0 + nocc_batch
+            slc = slice(i0, i1)
+            intra, inter = res[idx]
+            pair[slc, slc] = intra.cpu().numpy()
+            inter_np = inter.cpu().numpy()
+            pair[slc, :] += inter_np
+            pair[:, slc] += inter_np.T
+            i0 = i1
+    i0 = 0
+    for p, nocc_batch in enumerate(occ_balanced[0]):
+        i1 = i0 + nocc_batch
+        if res_ab[p] is not None:
+            e_corr_pair_ab[i0:i1, :] = res_ab[p].cpu().numpy()
+        i0 = i1
+    if verbose:
+        print(
+            f"[asm] ump2 assembly (.cpu + numpy): {time.perf_counter() - _asm0:.2f}s",
+            flush=True,
+        )
+
     e_corr_aa = 0.25 * float(e_corr_pair_aa.sum())
     e_corr_bb = 0.25 * float(e_corr_pair_bb.sum())
     e_corr_ab = float(e_corr_pair_ab.sum())
