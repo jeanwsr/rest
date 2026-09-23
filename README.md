@@ -221,9 +221,13 @@ guessfile = "my_checkpoint.rchk"
     - `ri-schwartz`: 使用 Schwartz screening 的 direct RI-J 算法。3c-2e ERI 即算即用（同 `ri-direct`），但利用了稀疏性并降低内存开销与提升内存局域性。该选项仅对 J 部分有效，即只能通过 `algorithm_j` 指定；其行为由 `[ctrl.ri_jk]` 表控制（见下）。该路径暂不支持 MPI 并行。
 - `algorithm_k`: 设置 Fock 矩阵计算中 K (Exchange) 部分的算法；该关键词是高级选项，一般用户建议使用`algorithm_jk`关键词进行整体设置。
     - 下述选项同 `algorithm_jk`：`ri-direct`, `ri-incore`, `ri`, `default`。
-- `ri_jk`: RI-J/RI-K 算法的参数，以 `[ctrl.ri_jk]` 表形式给出。目前的字段控制 `ri-schwartz` RI-J 算法的筛选行为，对其它算法无影响。
+- `ri_jk`: RI-J/RI-K 算法的参数，以 `[ctrl.ri_jk]` 表形式给出。`schwartz_threshold` 与 `schwartz_overlap_tol2` 控制 `ri-schwartz` RI-J 算法的筛选行为，`pair_screen_threshold` 控制 incore RI-J/RI-K（`ri-incore`）的 AO 对筛选。
     - `schwartz_threshold`: 取值f64类型。Schwartz 筛选的积分忽略阈值（单位 Hartree）：仅当 (壳对, 辅助壳) 块的 Coulomb 贡献上界达到该阈值时才纳入计算。缺省为 1.0e-12。
     - `schwartz_overlap_tol2`: 取值f64类型。Schwarz 上界构建前静态重叠预筛选的阈值：最弥散基元的重叠小于该值的壳对不参与上界构建。缺省为 1.0e-24。
+    - `pair_screen_threshold`: 取值f64类型。incore RI-J/RI-K 的 AO 对（basis pair）筛选的相对阈值，同时作用于**构建期**与**缩并期**两级。
+    - 构建期（存储级）：三中心张量 `rimatr` 建成后，每个 AO 对的行上界 $q_p = \max_P |Y_{p,P}|$ 低于 $\text{threshold} \times \max_p q_p$ 的行被丢掉，张量原地压紧，行布局记入 `PairMap`（存储行到 $(\mu,\nu)$、行界、全量对号到存储行）。`basbas2baspar` 与 `baspar2basbas` 保持全量语义，J 的输出仍散射回全量 packed 上三角。MPI 下静态行界先做一次 `max` 归约再加广播，各 rank 保留同一批行。
+    - 缩并期：在保留行里按本轮密度/轨道权重再筛。J 的密度缩并用 $|w_p| q_p$（$w_p$ 为密度权重）与本次迭代最大的对界值比较，K 用 $q_p \max(W_\mu, W_\nu)$（$W_\mu = \max_i |C_{\mu i}|$）比较，低于阈值倍数者被丢弃。K 保留的行张成“活跃 AO 子集”，每个辅助基只在该子集上做缩并与 `dsyrk`。
+    - 缺省为 0.0，即不剪枝也不筛选，数值与未筛选内核一致。注意构建期剪枝改变了存储的 `rimatr` 的行空间，因此目前只支持单点能 SCF：后自洽场、解析导数、响应、Hessian 与数值力（`outputs = ["num_force"]`）等路径会在 `main_driver` 里显式报错退出（S2/S3 计划再铺开），不会静默算错。
 - `use_dm_only`: 取值布尔类型。控制 VK (Exchange) 和 VXC (XC Potential) 矩阵的构建方式。缺省为 false。
     - `false`（缺省）：使用分子轨道系数构造（occ-RI-K 算法），效率更高，推荐用于大多数体系。
     - `true`：直接使用密度矩阵构造。当轨道占据数非整数（如 dSCF 激发态）时可能需要设为 true。
@@ -1295,7 +1299,7 @@ REST 提供两条独立的频率/热化学计算路径，请勿混淆：
 - **伞形采样（US）**：`umbrella_atoms` 存在即启用；CV 支持 `dihedral` / `distance` / `angle` / `distance_diff`（后者可叠加 `umbrella_sum_kappa` 的 ½ks(s−s0)² 约束），输出 `umbrella_timeseries.csv` 供 (2D) WHAM 后处理。
 - **续跑**：`restart_input` 从上次的 `md_restart` 同时读位置与速度，无需改写 `[geom]`。
 - **输出**：`md.log`、`dump_{nvt|nve}.xyz`、`dipole.dat`、`energy_force.log`、`umbrella_timeseries.csv`、`md_restart`。
-- **Python 依赖**：MD/AIMD 的积分与优化由内嵌 Python 的 [ASE](https://wiki.fysik.dtu.dk/ase/) 完成，QM/MM 与纯 MM 的 MM 侧由 [OpenMM](https://openmm.org/) 完成；运行时需要有可用的 Python 及 `numpy`、`ase`、`openmm`（含 `openmm.app`）。参考环境：Python 3.10、numpy 2.2、ASE 3.29、OpenMM 8.6。
+- **Python 依赖**：MD/AIMD 的积分与优化由内嵌 Python 的 [ASE](https://wiki.fysik.dtu.dk/ase/) 完成，QM/MM 与纯 MM 的 MM 侧由 [OpenMM](https://openmm.org/) 完成；运行时需要有可用的 Python 及 `numpy`、`ase`、`openmm`（含 `openmm.app`）。参考环境：Python 3.10、numpy 2.2、ASE 3.29、OpenMM 8.6。MD 的参考轨迹需要 `ase >= 3.25`（3.25 起 Langevin 的 `fixcm` 投影才与参考日志一致，更旧的版本同一个 seed 走出不同轨迹），启动时日志会打印内嵌解释器与 ASE 的实际版本。
 
 纯 QM 的 AIMD 支持多进程 MPI（SCF 与积分沿 MPI 并行，所有 rank 同步积分、仅 root 落盘）。QM/MM 与纯 MM 目前只支持单进程：进程内用 OpenMP/Rayon 多线程（`num_threads`），多进程 MPI 会在启动时被拒绝。
 

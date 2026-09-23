@@ -51,8 +51,14 @@ pub enum AlgorithmJ {
 
 /// Options of the RI-J/RI-K algorithms, read from the `[ctrl.ri_jk]` table.
 ///
-/// The fields currently control the Schwartz screening of the `ri-schwartz` RI-J algorithm (see
-/// [`AlgorithmJ::RISchwartz`]); they have no effect on other algorithms.
+/// `schwartz_threshold` and `schwartz_overlap_tol2` control the Schwartz screening of the
+/// `ri-schwartz` RI-J algorithm (see [`AlgorithmJ::RISchwartz`]).
+///
+/// `pair_screen_threshold` controls the AO-pair screening of the **in-core** RI-J and RI-K
+/// kernels (`ri-incore`), i.e. of the algorithms that contract the stored `rimatr` tensor. It is
+/// independent of the algorithm flags: any `ri`/`ri-incore` calculation that stores `rimatr`
+/// uses it, and a value of `0.0` (default) disables the screening and reproduces the unscreened
+/// kernels exactly.
 #[serde_inline_default]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RIJKOption {
@@ -66,11 +72,22 @@ pub struct RIJKOption {
     /// from the setup. Default is `1e-24`.
     #[serde_inline_default(1e-24)]
     pub schwartz_overlap_tol2: f64,
+    /// AO-pair screening threshold of the in-core RI-J/RI-K kernels, in Hartree.
+    ///
+    /// An AO pair is dropped from the contraction when its bound contribution
+    /// `|density weight| × max_P |rimatr[pair, P]|` (J) or `max_i |C[μ,i]| × max_P |rimatr[pair, P]|`
+    /// (K, with `C` the occupied orbitals scaled by the square root of their occupation) falls
+    /// below this value. The bound uses the stored, metric-transformed tensor, so it is the
+    /// quantity the kernel actually contracts.
+    ///
+    /// `0.0` (default) keeps every pair and reproduces the unscreened kernels numerically.
+    #[serde_inline_default(0.0)]
+    pub pair_screen_threshold: f64,
 }
 
 impl Default for RIJKOption {
     fn default() -> Self {
-        RIJKOption { schwartz_threshold: 1e-12, schwartz_overlap_tol2: 1e-24 }
+        RIJKOption { schwartz_threshold: 1e-12, schwartz_overlap_tol2: 1e-24, pair_screen_threshold: 0.0 }
     }
 }
 

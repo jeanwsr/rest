@@ -24,9 +24,28 @@ use tensors::MatrixFull;
 //        });
 //    });
 //}
-pub fn numerical_force(scf_data: &SCF, displace: f64, mpi_operator: &Option<MPIOperator>) -> (f64,MatrixFull<f64>) {
+pub fn numerical_force(scf_data: &mut SCF, displace: f64, mpi_operator: &Option<MPIOperator>) -> (f64,MatrixFull<f64>) {
     let num_atoms =  scf_data.mol.geom.nfree;
     let mut num_force = MatrixFull::new([3,num_atoms],0.0);
+    // Every displaced job rebuilds the integrals and grids in `initialize_scf`, so the resident
+    // tensors would be copied 6N times only to be overwritten, and a second copy of them would be
+    // held for the whole loop: GBs per displacement on a large system. Park them for the duration
+    // of the loop (the caller gets them back before this function returns).
+    let parked = (
+        scf_data.ijkl.take(),
+        scf_data.ri3fn.take(),
+        scf_data.ri3fn_sr.take(),
+        scf_data.ri3fn_isdf.take(),
+        scf_data.ri3fn_bse.take(),
+        scf_data.rimatr.take(),
+        scf_data.rimatr_sr.take(),
+        scf_data.rimatr_bse.take(),
+        scf_data.ri3mo.take(),
+        scf_data.ri3mo_full.take(),
+        scf_data.tab_ao.take(),
+        scf_data.m.take(),
+        scf_data.grids.take(),
+    );
     if scf_data.mol.ctrl.print_level > 0 {
         if let Some(mp_op) = mpi_operator {
             if mp_op.rank == 0 {
@@ -57,7 +76,9 @@ pub fn numerical_force(scf_data: &SCF, displace: f64, mpi_operator: &Option<MPIO
             // move the atom along + direction
             let mut vec_xyz = vec![0.0;3];
             vec_xyz[xyz] = displace;
-            let mut new_scf = scf_data.clone();
+            // `(*scf_data).clone()`: `scf_data` is a `&mut SCF`, and `scf_data.clone()` would
+            // clone the reference instead of the structure
+            let mut new_scf = (*scf_data).clone();
             // update the geometry
             new_scf.mol.geom.geom_shift(atm_idx, vec_xyz);
             // update the control file
@@ -79,7 +100,7 @@ pub fn numerical_force(scf_data: &SCF, displace: f64, mpi_operator: &Option<MPIO
             // move the atom along - direction
             let mut vec_xyz = vec![0.0;3];
             vec_xyz[xyz] = -displace;
-            new_scf = scf_data.clone();
+            new_scf = (*scf_data).clone();
             // update the geometry
             new_scf.mol.geom.geom_shift(atm_idx, vec_xyz);
             // update the control file
@@ -102,6 +123,23 @@ pub fn numerical_force(scf_data: &SCF, displace: f64, mpi_operator: &Option<MPIO
 
         })
     });
+
+    // hand the parked tensors back, so the caller sees the SCF it passed in
+    (
+        scf_data.ijkl,
+        scf_data.ri3fn,
+        scf_data.ri3fn_sr,
+        scf_data.ri3fn_isdf,
+        scf_data.ri3fn_bse,
+        scf_data.rimatr,
+        scf_data.rimatr_sr,
+        scf_data.rimatr_bse,
+        scf_data.ri3mo,
+        scf_data.ri3mo_full,
+        scf_data.tab_ao,
+        scf_data.m,
+        scf_data.grids,
+    ) = parked;
 
     if scf_data.mol.ctrl.print_level > 0 {
         if let Some(mp_op) = mpi_operator {
