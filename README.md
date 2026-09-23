@@ -534,46 +534,12 @@ use_low_rank_contour = true
 - `save_qp_path`: 取值String，保存准粒子能量的文件路径。缺省为 `"single_qp_path.txt"`。
 - `parse_qp_path`: 取值String，从文件读取准粒子能量的路径。当 `gw_scheme = "parse from file"` 时从此路径读取预先计算的准粒子能量用于后续BSE计算。缺省为 `"./qp_energies"`。
 
-- `save_gw_checkpoint`: 取值bool。设置为 `true` 后，REST 会在**GW 计算完成之后**、以及**每一轮 evGW 迭代结束时**，把后自洽场状态写入检查点文件。缺省为 `false`。
-- `gw_checkpoint_path`: 取值String，检查点文件（HDF5 格式）的路径。缺省为 `"./gw_checkpoint.h5"`。
-- `resume_from_checkpoint`: 取值bool。设置为 `true` 时，REST 读取 `gw_checkpoint_path` 并把其中的状态恢复到 `scf_data` 上，**同时跳过 SCF 迭代**（不再执行 `scf_without_build`），然后：
-    - 若检查点代表**已经完成的 GW**（`stage = gw_finished`）：**完全不重算 GW/evGW**，直接进入 BSE/响应计算（`response_bse` / `nonlinear_bse` / `dynamic_bse` 同理）。此时 `gw_or_bse = "gw"` 只把恢复出来的准粒子能谱打印出来。
-    - 若检查点代表**进行中的 evGW**（`stage = evgw_round`）：从保存的那一轮继续 evGW 外循环（上一轮的迭代向量与 DIIS 历史一并恢复）。此时输入卡的 `scgw` 必须仍为 `"evgw"`，否则报错退出。
+#### GW/evGW 断点续算
 
-#### 断点续算示例
+- `save_gw_checkpoint`: 取值bool，缺省 `false`。GW 完成后及每轮 evGW 结束时，把后自洽场状态写入 `[ctrl] chkfile` 的 `rest_gw_checkpoint` 组（不另建文件，要求 `chkfile` 非 `"none"`）。更新方式为"复制到 `<chkfile>.tmp` → 替换该组 → 改名回去"，写入中途被打断不会损坏 chkfile。
+- `resume_from_checkpoint`: 取值bool，缺省 `false`。从 chkfile 恢复状态并**跳过 SCF 迭代**：若存入的是已完成的 GW，连 GW/evGW 一并跳过、直接进入 BSE/响应；若存入的是进行中的 evGW，从保存的那一轮继续（需 `scgw = "evgw"`）。
 
-第一次运行（写完 GW 后落盘）：
-```toml
-[ctrl]
-job_type = "single_point"
-xc = "pbe"
-basis_path = "def2-TZVP"
-auxbas_path = "def2-TZVP-ri"
-
-[quasiparticle_methods]
-gw_or_bse = "bse"
-gw_scheme = "extrapolated"
-scgw = "evgw"
-evgw_rounds = 30
-save_gw_checkpoint = true
-gw_checkpoint_path = "./gw_checkpoint.h5"
-resume_from_checkpoint = false
-```
-
-第二次运行（从上次进度恢复）：
-```toml
-[quasiparticle_methods]
-gw_or_bse = "bse"
-gw_scheme = "extrapolated"
-scgw = "evgw"
-evgw_rounds = 30
-save_gw_checkpoint = true
-gw_checkpoint_path = "./gw_checkpoint.h5"
-resume_from_checkpoint = true
-```
-程序会打印恢复的内容（恢复了哪些数组、检查点处在哪个阶段、跳过了什么、evGW 从第几轮继续）。
-
-> 注意：若检查点里已完成 `evgw_rounds` 轮但你认为还需要更多轮，可以调大 `evgw_rounds` 后带 `resume_from_checkpoint = true` 重启——evGW 会从保存的那一轮继续；反之，若 `evgw_rounds` 不大于已完成的轮数，evGW 循环会被跳过并直接使用已保存的准粒子能量。
+续算时在同一 `chkfile` 上把 `resume_from_checkpoint` 改为 `true` 即可；想多跑几轮，同时调大 `evgw_rounds`。
 
 ### BSE计算设置
 

@@ -783,6 +783,15 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         println!("Initial guess is prepared by ({}).", &ctrl.initial_guess);
 
     }
+    // The GW/evGW archive is stored inside the chkfile, so the feature needs one.
+    if let Some(qp) = ctrl.quasiparticle_methods.as_ref() {
+        if (qp.save_gw_checkpoint || qp.resume_from_checkpoint) && !ctrl.has_chkfile {
+            panic!(
+                "ERROR: `save_gw_checkpoint` / `resume_from_checkpoint` store and read the GW \
+                 state inside the chkfile; set `chkfile = \"job.chk\"` in [ctrl] (not \"none\")."
+            );
+        }
+    }
     if ctrl.force_state_occupation.len()>0 {
         if ! ctrl.external_init_guess.is_some() {
             panic!("ERROR: force_state_occupation can not be involved without an existing guessfile/chkfile");

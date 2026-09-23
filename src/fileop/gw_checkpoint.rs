@@ -5,9 +5,12 @@
 //! such jobs get killed by the wall-clock limit and requeued, so the state that
 //! crosses the kill boundary has to live on disk.
 //!
-//! This module writes a single HDF5 archive (`gw_checkpoint_path`, default
-//! `./gw_checkpoint.h5`) holding everything that the post-SCF flow needs to
-//! continue *without* redoing the work already done:
+//! This module stores the post-SCF state in the **chkfile** -- the same HDF5
+//! file the SCF checkpoint uses (`[ctrl] chkfile`) -- under the root group
+//! `rest_gw_checkpoint`.  There is no separate GW checkpoint file: `chkfile`
+//! is the single archive a killed-and-requeued job resumes from.  It holds
+//! everything the post-SCF flow needs to continue *without* redoing the work
+//! already done:
 //!
 //! * compatibility metadata (version, number of atoms / basis functions /
 //!   states / electrons, charge, spin, spin channel, basis and auxiliary-basis
@@ -41,12 +44,15 @@
 //! downstream GW/BSE step and is deliberately not archived.  So "skip the SCF"
 //! here means "skip the SCF *iterations*", not "skip the setup".
 //!
-//! Writing is "atomic-ish": the archive is written to `<path>.tmp` and only
-//! renamed onto `<path>` once it is closed, so a job killed mid-write leaves
-//! the previous (valid) checkpoint intact instead of a truncated file.
+//! Writing is "atomic-ish": the whole chkfile is first copied to
+//! `<chkfile>.tmp`, the `rest_gw_checkpoint` group is replaced there, and only
+//! then is the temporary file renamed onto the chkfile, so a job killed
+//! mid-write leaves the previous (valid) checkpoint intact instead of a
+//! truncated file.
 //!
 //! Everything lives under the single HDF5 group `rest_gw_checkpoint`; the
-//! sub-groups `meta`, `scf`, `gw` and `diis` mirror the four blocks above.
+//! sub-groups `meta`, `scf`, `gw` and `diis` mirror the four blocks above.  The
+//! chkfile's own `scf`, `molecule` and `geom` groups are left untouched.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -364,23 +370,39 @@ pub fn checkpoint_enabled(scf_data: &SCF) -> bool {
         .unwrap_or(false)
 }
 
-/// The configured checkpoint path (only meaningful when the feature is on).
+/// The chkfile that carries the GW archive (the feature requires `chkfile`).
 pub fn checkpoint_path(scf_data: &SCF) -> String {
-    qp_control(scf_data)
-        .map(|qp| qp.gw_checkpoint_path)
-        .unwrap_or_else(|| String::from("./gw_checkpoint.h5"))
+    scf_data.mol.ctrl.chkfile.clone()
+}
+
+/// GW checkpointing reads and writes the chkfile, so `chkfile` must be set.
+fn require_chkfile(scf_data: &SCF) -> Result<()> {
+    let path = &scf_data.mol.ctrl.chkfile;
+    if !scf_data.mol.ctrl.has_chkfile
+        || path.trim().is_empty()
+        || path.eq_ignore_ascii_case("none")
+    {
+        bail!(
+            "gw_checkpoint: `save_gw_checkpoint` / `resume_from_checkpoint` store and read the \
+             GW state inside the chkfile, but `chkfile` is '{}'.\n\
+             Set e.g. `chkfile = \"job.chk\"` in [ctrl].",
+            path
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // writing
 // ---------------------------------------------------------------------------
 
-/// Serialise the current post-SCF state to `gw_checkpoint_path`.
+/// Serialise the current post-SCF state into the chkfile.
 ///
-/// The archive is first written to `<path>.tmp` and renamed onto `<path>` after
-/// it is closed, so a process killed while writing leaves the previous
-/// checkpoint untouched.
+/// The chkfile is copied to `<chkfile>.tmp`, the `rest_gw_checkpoint` group is
+/// replaced there, and the temporary file is renamed back onto the chkfile, so
+/// a process killed while writing leaves the previous checkpoint untouched.
 pub fn save_gw_checkpoint(scf_data: &SCF, state: &GwCheckpointState) -> Result<()> {
+    require_chkfile(scf_data)?;
     let path = checkpoint_path(scf_data);
     let tmp_path = format!("{}.tmp", path);
     if Path::new(&tmp_path).exists() {
@@ -392,9 +414,30 @@ pub fn save_gw_checkpoint(scf_data: &SCF, state: &GwCheckpointState) -> Result<(
         })?;
     }
 
+    // Work on a copy of the chkfile so its `scf`/`molecule`/`geom` groups are
+    // preserved and the update stays atomic.
+    if Path::new(&path).exists() {
+        std::fs::copy(&path, &tmp_path).with_context(|| {
+            format!(
+                "gw_checkpoint: cannot copy the chkfile '{}' to '{}'",
+                path, tmp_path
+            )
+        })?;
+    }
+
     {
-        let file = hdf5::File::create(&tmp_path)
-            .with_context(|| format!("gw_checkpoint: cannot create '{}'", tmp_path))?;
+        let file = if Path::new(&tmp_path).exists() {
+            hdf5::File::open_rw(&tmp_path)
+                .with_context(|| format!("gw_checkpoint: cannot open '{}'", tmp_path))?
+        } else {
+            hdf5::File::create(&tmp_path)
+                .with_context(|| format!("gw_checkpoint: cannot create '{}'", tmp_path))?
+        };
+        // Drop any archive from an earlier evGW round before rewriting it.
+        if file.link_exists(ROOT_GROUP) {
+            file.unlink(ROOT_GROUP)
+                .with_context(|| format!("gw_checkpoint: cannot replace group '{}'", ROOT_GROUP))?;
+        }
         let root = file
             .create_group(ROOT_GROUP)
             .with_context(|| format!("gw_checkpoint: cannot create group '{}'", ROOT_GROUP))?;
@@ -546,17 +589,18 @@ pub fn save_gw_finished_checkpoint(scf_data: &SCF) {
 // reading
 // ---------------------------------------------------------------------------
 
-/// Read `gw_checkpoint_path`, validate it against the current input and write
-/// the stored state back onto `scf_data`.
+/// Read the chkfile, validate the GW archive against the current input and
+/// write the stored state back onto `scf_data`.
 ///
 /// Any incompatibility (version, basis, electron count, spin, geometry, array
 /// dimensions) is a hard error: silently continuing with mismatched data would
 /// produce a physically meaningless BSE spectrum.
 pub fn load_gw_checkpoint(scf_data: &mut SCF) -> Result<GwCheckpointState> {
+    require_chkfile(scf_data)?;
     let path = checkpoint_path(scf_data);
     if !Path::new(&path).exists() {
         bail!(
-            "gw_checkpoint: 'resume_from_checkpoint = true' but the checkpoint file '{}' does not exist.\n\
+            "gw_checkpoint: 'resume_from_checkpoint = true' but the chkfile '{}' does not exist.\n\
              Hint: run once with 'save_gw_checkpoint = true' to create it, or set \
              'resume_from_checkpoint = false' to recompute the SCF/GW/evGW work from scratch.",
             path
@@ -564,11 +608,11 @@ pub fn load_gw_checkpoint(scf_data: &mut SCF) -> Result<GwCheckpointState> {
     }
 
     let file = hdf5::File::open(&path)
-        .with_context(|| format!("gw_checkpoint: cannot open '{}'", path))?;
+        .with_context(|| format!("gw_checkpoint: cannot open the chkfile '{}'", path))?;
     let root = file.group(ROOT_GROUP).with_context(|| {
         format!(
-            "gw_checkpoint: '{}' is not a REST GW checkpoint (missing group '{}').\n\
-             Delete the file or set 'resume_from_checkpoint = false'.",
+            "gw_checkpoint: the chkfile '{}' carries no GW archive (missing group '{}').\n\
+             Run once with 'save_gw_checkpoint = true', or set 'resume_from_checkpoint = false'.",
             path, ROOT_GROUP
         )
     })?;
@@ -576,8 +620,10 @@ pub fn load_gw_checkpoint(scf_data: &mut SCF) -> Result<GwCheckpointState> {
     let version = read_usize(&root, "version")?;
     if version != GW_CHECKPOINT_VERSION {
         bail!(
-            "gw_checkpoint: '{}' was written in format version {} but this build expects version {}.\n\
-             Delete the checkpoint file (or set 'resume_from_checkpoint = false') and rerun.",
+            "gw_checkpoint: the GW archive in '{}' was written in format version {} but this build \
+             expects version {}.\n\
+             Rerun with 'save_gw_checkpoint = true' to rewrite it (or set \
+             'resume_from_checkpoint = false').",
             path,
             version,
             GW_CHECKPOINT_VERSION
@@ -957,8 +1003,10 @@ mod tests {
         mol.ctrl.spin = 0.0;
         let mut qp = QuasiParticle::default();
         qp.save_gw_checkpoint = true;
-        qp.gw_checkpoint_path = path.to_string();
         mol.ctrl.quasiparticle_methods = Some(qp);
+        // The GW archive lives in the chkfile now.
+        mol.ctrl.chkfile = path.to_string();
+        mol.ctrl.has_chkfile = true;
 
         let mut scf = SCF::init_scf(&mol);
         scf.eigenvalues[0] = (0..n).map(|i| -0.5 + 0.1 * i as f64).collect();
@@ -1057,5 +1105,70 @@ mod tests {
         assert!(load_gw_checkpoint(&mut target).is_err());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The GW archive must live *inside* an existing chkfile, preserve the
+    /// chkfile's own groups, and be replaced (not duplicated) on every round.
+    #[test]
+    fn checkpoint_reuses_and_preserves_the_chkfile() {
+        let path = tmp_path("reuse");
+        // Simulate the chkfile written by `save_chkfile` after the SCF.
+        {
+            let file = hdf5::File::create(&path).unwrap();
+            let scf = file.create_group("scf").unwrap();
+            scf.new_dataset::<f64>()
+                .shape(())
+                .create("e_tot")
+                .unwrap()
+                .write_scalar(&-42.0)
+                .unwrap();
+            file.close().unwrap();
+        }
+
+        let source = synthetic_scf(&path, 4, 0.0);
+        let mut state = GwCheckpointState::from_scf(&source);
+        state.stage = GwCheckpointStage::EvgwRound;
+        state.rounds_done = 1;
+        save_gw_checkpoint(&source, &state).expect("first evGW round checkpoint");
+
+        // A second round must replace the archive in place, not append a second one.
+        state.rounds_done = 2;
+        save_gw_checkpoint(&source, &state).expect("second evGW round checkpoint");
+        assert!(!Path::new(&format!("{}.tmp", path)).exists());
+
+        // The SCF group written before the GW stage must survive.
+        {
+            let file = hdf5::File::open(&path).unwrap();
+            let scf = file.group("scf").expect("the chkfile's scf group must survive");
+            let e_tot = scf.dataset("e_tot").unwrap().read_scalar::<f64>().unwrap();
+            assert!((e_tot + 42.0).abs() < 1e-15);
+            assert!(file.group(ROOT_GROUP).is_ok());
+        }
+
+        let mut target = synthetic_scf(&path, 4, 0.0);
+        let loaded = load_gw_checkpoint(&mut target).expect("the archive must load");
+        assert_eq!(loaded.rounds_done, 2);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Both switches require a real chkfile; `chkfile = "none"` must be refused.
+    #[test]
+    fn checkpoint_requires_a_chkfile() {
+        let path = tmp_path("nochk");
+        let mut scf = synthetic_scf(&path, 4, 0.0);
+        scf.mol.ctrl.chkfile = "none".to_string();
+        scf.mol.ctrl.has_chkfile = false;
+        let state = GwCheckpointState::from_scf(&scf);
+
+        let error = match save_gw_checkpoint(&scf, &state) {
+            Ok(_) => panic!("save_gw_checkpoint must refuse chkfile = \"none\""),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{:#}", error).contains("chkfile"),
+            "unexpected error message: {:#}",
+            error
+        );
     }
 }

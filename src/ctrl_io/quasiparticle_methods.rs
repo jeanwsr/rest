@@ -168,33 +168,33 @@ pub struct QuasiParticle {
     /// Print a per-round convergence report (|dE|, |dG|, HOMO/LUMO).
     pub evgw_report:bool,
     pub save_gw_homo_lumo_qp:bool,
-    /// Write a GW/evGW checkpoint (archive) to `gw_checkpoint_path`.
+    /// Write the GW/evGW checkpoint into the **chkfile** (`[ctrl] chkfile`).
     ///
-    /// When `true`, REST writes the complete post-SCF state (compatibility
+    /// When `true`, REST stores the complete post-SCF state (compatibility
     /// metadata, the converged SCF arrays, the GW quasiparticle energies and
-    /// the evGW outer-loop progress) to disk **after GW finishes** and **at the
-    /// end of every evGW round**.  A later run with
+    /// the evGW outer-loop progress) inside the same HDF5 file as the SCF
+    /// checkpoint, under the group `rest_gw_checkpoint`, **after GW finishes**
+    /// and **at the end of every evGW round**.  A later run with
     /// `resume_from_checkpoint = true` can then continue from that file
     /// instead of redoing the SCF and the GW/evGW work.  Default `false`.
+    ///
+    /// Requires `chkfile` to be set (not `"none"`).  The update is written to
+    /// `<chkfile>.tmp` and renamed onto the chkfile once it is closed, so a job
+    /// killed in the middle of a write does not leave a corrupt checkpoint
+    /// behind.
     pub save_gw_checkpoint:bool,
-    /// Path of the GW/evGW checkpoint file (HDF5).  Default `"./gw_checkpoint.h5"`.
+    /// Read the **chkfile** and resume instead of redoing previous work.
     ///
-    /// The file is written atomically: the archive goes to `<path>.tmp` first
-    /// and is renamed onto `<path>` once it is closed, so a job killed in the
-    /// middle of a write does not leave a corrupt checkpoint behind.
-    pub gw_checkpoint_path:String,
-    /// Read `gw_checkpoint_path` and resume instead of redoing previous work.
-    ///
-    /// * If the checkpoint represents a finished GW, the SCF iterations and the
-    ///   whole GW/evGW calculation are skipped and the run continues directly
-    ///   into the BSE/response step.
+    /// * If the stored checkpoint represents a finished GW, the SCF iterations
+    ///   and the whole GW/evGW calculation are skipped and the run continues
+    ///   directly into the BSE/response step.
     /// * If it represents an interrupted evGW round, the SCF iterations are
     ///   skipped and the evGW loop continues from the saved round (DIIS history
     ///   included).
     ///
     /// The checkpoint is validated against the current input (basis, electron
     /// count, charge, spin, geometry, array dimensions) and a clear error is
-    /// raised on any mismatch.  Default `false`.
+    /// raised on any mismatch.  Requires `chkfile` to be set.  Default `false`.
     pub resume_from_checkpoint:bool,
     pub save_qp_path:String,
     pub save_first_excitation:bool,
@@ -442,7 +442,6 @@ impl Default for QuasiParticle {
             evgw_report:true,
             save_gw_homo_lumo_qp:false,
             save_gw_checkpoint:false,
-            gw_checkpoint_path:String::from("./gw_checkpoint.h5"),
             resume_from_checkpoint:false,
             save_qp_path:String::from("single_qp_path.txt"),
             save_first_excitation:false,
@@ -599,7 +598,6 @@ impl QuasiParticle {
         table.insert("evgw_report".to_string(), toml::Value::Boolean(self.evgw_report));
         table.insert("save_gw_homo_lumo_qp".to_string(), toml::Value::Boolean(self.save_gw_homo_lumo_qp));
         table.insert("save_gw_checkpoint".to_string(), toml::Value::Boolean(self.save_gw_checkpoint));
-        table.insert("gw_checkpoint_path".to_string(), toml::Value::String(self.gw_checkpoint_path.clone()));
         table.insert("resume_from_checkpoint".to_string(), toml::Value::Boolean(self.resume_from_checkpoint));
         table.insert("save_qp_path".to_string(), toml::Value::String(self.save_qp_path.clone()));
         table.insert("save_first_excitation".to_string(), toml::Value::Boolean(self.save_first_excitation));
@@ -1034,10 +1032,6 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.resume_from_checkpoint = match tmp_ctrl.get("resume_from_checkpoint").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
-            };
-            tmp_input.gw_checkpoint_path = match tmp_ctrl.get("gw_checkpoint_path").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(s) => s.clone(),
-                _ => tmp_input.gw_checkpoint_path.clone(),
             };
             tmp_input.save_bse_excitations = match tmp_ctrl.get("save_bse_excitations").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
@@ -1480,7 +1474,6 @@ mod tests {
         let qp = parse_quasiparticle_keywords(&input).unwrap().unwrap();
         assert!(!qp.save_gw_checkpoint);
         assert!(!qp.resume_from_checkpoint);
-        assert_eq!(qp.gw_checkpoint_path, "./gw_checkpoint.h5");
     }
 
     #[test]
@@ -1488,23 +1481,19 @@ mod tests {
         let input = json!({
             "quasiparticle_methods": {
                 "save_gw_checkpoint": true,
-                "resume_from_checkpoint": true,
-                "gw_checkpoint_path": "/scratch/run42/gw.h5"
+                "resume_from_checkpoint": true
             }
         });
 
         let qp = parse_quasiparticle_keywords(&input).unwrap().unwrap();
         assert!(qp.save_gw_checkpoint);
         assert!(qp.resume_from_checkpoint);
-        assert_eq!(qp.gw_checkpoint_path, "/scratch/run42/gw.h5");
 
         // ... and round-trips through the TOML serialisation.
         let table = qp.to_toml();
         assert_eq!(table["save_gw_checkpoint"].as_bool(), Some(true));
         assert_eq!(table["resume_from_checkpoint"].as_bool(), Some(true));
-        assert_eq!(
-            table["gw_checkpoint_path"].as_str(),
-            Some("/scratch/run42/gw.h5")
-        );
+        // The GW archive now lives in the chkfile; the separate path is gone.
+        assert!(table.get("gw_checkpoint_path").is_none());
     }
 }
