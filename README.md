@@ -348,7 +348,7 @@ fp_mode = "FP64"
 输入卡关键词包括：
 - `ss_factor`: 取值f64。采用 Spin-Component-Scaled 方式计算 MP2 型相关能（SCS-MP2）时, 用于控制自旋平行（same spin）分量贡献的缩放系数，适用于 `xc` 关键词为 MP2、SCS-MP2或双杂化泛函，以及 `post_correlation` 设置为 PT2 的情况。缺省为 None，即依 `xc` 设置的泛函进行设定。
 - `os_factor`: 取值f64。适用场景与 `ss_factor` 一致，采用 SCS-MP2 方法计算相关能贡献时，用于缩放自旋反平行（opposite spin）分量贡献的系数。缺省为 None，即依 `xc` 设置的泛函进行设定。
-- `fp_mode`: 取值 String (`"FP32"`, `"FP64"`)。设置 RI-PT2 计算中使用的浮点精度。仅当 `new_driver = true` 时生效。缺省为 `"FP32"`。对于数值梯度计算，建议设置为 `"FP64"` 以获得更高的数值稳定性。
+- `fp_mode`: 取值 String (`"FP32"`, `"FP64"`, `"TF32"`)。设置 RI-PT2 计算中使用的浮点精度。缺省为 `"FP32"`。在 `new_driver = true` 的 CPU 驱动、`engine = "torch"` 以及 PT2 解析响应核（rgfock）中生效；`"TF32"` 仅在 `engine = "torch"` 时有效（f32 存储 + TF32 张量核 matmul），CPU 驱动下自动回退为 `"FP32"`。对于数值梯度计算，建议设置为 `"FP64"` 以获得更高的数值稳定性。
 - `mpi_mode`: 取值 usize。设置 RI-PT2 计算中使用的 MPI 模式。缺省为 0，即不使用 MPI。
 
 #### PT2 算法选择
@@ -382,6 +382,8 @@ REST 提供三种 PT2 实现算法，通过以下关键词选择：
 | 2 | `streaming = true`（缺省）且非 MPI 且 `use_ri_symm = true` 且 PT2 | **流式算法** |
 | 3 | 其它情况 | 原始 legacy 算法 |
 
+**注意**：若设置 `engine = "torch"` 且满足其适用条件（CUDA、非 MPI、PT2 家族、RHF/UHF），则优先使用 torch 引擎（见下节）。
+
 **输入卡示例**：
 
 ```toml
@@ -403,6 +405,33 @@ stream_block_size = 32
 [ctrl.ri_pt2]
 new_driver = true
 fp_mode = "FP32"
+```
+
+#### Torch 引擎（GPU 加速）
+
+设置 `engine = "torch"` 后，PT2 成对电子相关能张量乘法由 PyTorch 内核（`dfmp2_addons`）实现；AO→MO 变换等仍在 CPU 上完成。适用条件：单节点计算（不支持 MPI）、`xc` 属于 PT2 家族、参考态为 RHF 或 UHF（ROHF 请使用缺省的 `engine = "cpu"`）、整数占据（不支持 smearing/分数占据，此时请使用 `engine = "cpu"`）；不满足条件时程序直接报错，不会静默回退到 CPU 驱动。相关关键词包括：
+- `engine`: 取值 String（`"cpu"`、`"torch"`）。缺省为 `"cpu"`，即不采用 Torch 引擎的 GPU 加速。
+- `torch_devices`: 取值 `Vec<usize>`。torch 引擎使用的 CUDA 设备列表（逻辑设备号，受 `CUDA_VISIBLE_DEVICES` 过滤），缺省为 `[0]`。多设备驱动（设备列表含 2+ 设备，或 `torch_force_batch_inter = true`）要求至少 8 倍于 GPU 数的相关占据轨道，过小的体系请使用单 GPU。
+- `torch_force_batch_inter`: 取值 bool。缺省为 false。当 `torch_devices` 只含一个设备时，强制启用分批的 intra+inter 方案（占据空间切成若干簇，逐簇上传 cderi 切片和轨道块），从而降低单卡显存峰值。这是单卡 GPU 显存溢出（OOM）时的补救选项。
+- `torch_nbatch`: 取值 usize。分批 intra+inter 方案的占据簇数目，缺省根据各设备空闲显存自动选择。仅多设备驱动路径（`torch_devices` 含 2+ 设备或 `torch_force_batch_inter = true`）使用。
+- `torch_fold`: 取值 String（`"F32Acc"`、`"F64"`、`"F32"`）。f32 matmul 结果逐元素能量折叠的精度。缺省为 `"F32Acc"`（f32 折叠、对能以 f64 累加）；`"F64"` 最慢但最准；`"F32"` 最快但精度最低。仅对 `fp_mode = "FP32"/"TF32"` 生效。
+- `torch_batch`: 取值 usize。torch 引擎 j≤i 收缩循环中占据对的批大小，缺省 16；设为 0 表示一次完成全部对。值越大单次 GEMM 越大，FLOPS 利用率更高但显存开销稍高。
+
+输入卡示例：
+```toml
+# 单 GPU（缺省设备 0，等价于 torch_devices = [0]）
+[ctrl.ri_pt2]
+engine = "torch"
+
+# 双 GPU 分摊占据轨道
+[ctrl.ri_pt2]
+engine = "torch"
+torch_devices = [0, 1]
+
+# 单卡显存不足时分批计算
+[ctrl.ri_pt2]
+engine = "torch"
+torch_force_batch_inter = true
 ```
 
 ## RRS-PBC计算相关设置
