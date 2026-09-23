@@ -1053,7 +1053,6 @@ pub fn vj_upper_rimatr_batched(
     scf: &SCF,
     dms: &[MatrixFull<f64>],
 ) -> Vec<MatrixFull<f64>> {
-    use itertools::Itertools;
     let n_rhs = dms.len();
     let nao = dms[0].size[0];
     let (ri3fn, _, baspar2basbas) = scf.rimatr.as_ref().unwrap();

@@ -449,10 +449,8 @@ pub fn solve_bse_davidson(
     config: &DavidsonConfig,
 ) -> Vec<(f64, Vec<f64>, Vec<f64>)> {
     let nrun = (nroots + 2).min(dim);
-    let a_cl = a_mat.clone();
-    let b_cl = b_mat.clone();
-    let mut a_mv = |z: &Vec<f64>| -> Vec<f64> { gemm_nn(&a_cl, dim, dim, z, dim, 1) };
-    let mut b_mv = |z: &Vec<f64>| -> Vec<f64> { gemm_nn(&b_cl, dim, dim, z, dim, 1) };
+    let mut a_mv = |z: &Vec<f64>| -> Vec<f64> { gemm_nn(a_mat, dim, dim, z, dim, 1) };
+    let mut b_mv = |z: &Vec<f64>| -> Vec<f64> { gemm_nn(b_mat, dim, dim, z, dim, 1) };
     let diag: Vec<f64> = (0..dim).map(|k| a_mat[k + k * dim]).collect();
     let guess = generate_initial_guess(&diag, nrun);
     let mut pairs = lr_davidson_solver(&mut a_mv, &mut b_mv, nrun, &diag, guess, config);

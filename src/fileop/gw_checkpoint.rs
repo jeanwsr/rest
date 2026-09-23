@@ -8,16 +8,19 @@
 //! This module stores the post-SCF state in the **chkfile** -- the same HDF5
 //! file the SCF checkpoint uses (`[ctrl] chkfile`) -- under the root group
 //! `rest_gw_checkpoint`.  There is no separate GW checkpoint file: `chkfile`
-//! is the single archive a killed-and-requeued job resumes from.  It holds
-//! everything the post-SCF flow needs to continue *without* redoing the work
-//! already done:
+//! is the single archive a killed-and-requeued job resumes from.
 //!
-//! * compatibility metadata (version, number of atoms / basis functions /
-//!   states / electrons, charge, spin, spin channel, basis and auxiliary-basis
-//!   paths, SCF type, and the geometry as JSON);
-//! * the converged SCF arrays (MO energies, MO coefficients, density matrices,
-//!   occupations, HOMO/LUMO indices, the SCF and nuclear energies and the Fock
-//!   matrices);
+//! Because the chkfile already holds the converged SCF state (`scf/mo_energy`,
+//! `scf/mo_coeff`, `scf/mo_occ`, the dimensions / charge / spin / electrons and
+//! `molecule/geom`), the archive does **not** duplicate any of it.  It only
+//! adds what the chkfile's own groups do not carry:
+//!
+//! * the compatibility metadata the chkfile lacks (the basis / auxiliary-basis
+//!   paths, the SCF type and the nuclear energy); the dimensions, charge,
+//!   spin, electron count, geometry and SCF energy are read back from the
+//!   chkfile on load;
+//! * the HOMO/LUMO indices, the density matrices (read by the BSE dipole term)
+//!   and the Fock matrices (not rebuilt when the SCF loop is skipped);
 //! * the GW quasiparticle energies (`scf_data.gwqp`, both the G and W vectors,
 //!   plus the spin-resolved `gwqp_spin` arrays);
 //! * the renormalized-singles particle energies when `renormalized_singles`
@@ -61,12 +64,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use hdf5::types::VarLenUnicode;
 use tensors::{MatrixFull, MatrixUpper};
 
-use crate::fileop::chkfile::{geom_from_json, geom_to_json};
+use crate::fileop::chkfile::{load_basic, load_geom};
 use crate::scf_io::{SCF, SCFType};
 
 /// Format version of the archive.  Bump whenever the layout changes so that an
 /// old checkpoint is rejected with a clear message instead of being misread.
-pub const GW_CHECKPOINT_VERSION: usize = 1;
+pub const GW_CHECKPOINT_VERSION: usize = 2;
 
 /// Name of the root HDF5 group holding the archive.
 const ROOT_GROUP: &str = "rest_gw_checkpoint";
@@ -350,6 +353,47 @@ fn read_matrix(group: &hdf5::Group, name: &str) -> Result<MatrixFull<f64>> {
         .ok_or_else(|| anyhow!("gw_checkpoint: cannot rebuild matrix '{}'", name))
 }
 
+/// The converged SCF energy `save_chkfile` stored under `scf/e_tot`.
+///
+/// The GW archive does not duplicate it: the chkfile is the single place the
+/// SCF-side quantities live.
+fn read_chkfile_e_tot(path: &str) -> Result<f64> {
+    let file = hdf5::File::open(path)
+        .with_context(|| format!("gw_checkpoint: cannot open the chkfile '{}'", path))?;
+    let dataset = file
+        .dataset("scf/e_tot")
+        .context("gw_checkpoint: the chkfile stores no 'scf/e_tot'")?;
+    let values = dataset
+        .read_raw::<f64>()
+        .context("gw_checkpoint: 'scf/e_tot' is not an f64 array")?;
+    values
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow!("gw_checkpoint: 'scf/e_tot' is empty"))
+}
+
+/// The total electron count `save_chkfile` stored under `molecule/num_elec`.
+///
+/// Only the total is written there (the alpha/beta split is recomputed from the
+/// basis, charge and spin by `SCF::build`), which is enough to cross-check the
+/// current input.
+fn read_chkfile_total_electrons(path: &str) -> Result<f64> {
+    let file = hdf5::File::open(path)
+        .with_context(|| format!("gw_checkpoint: cannot open the chkfile '{}'", path))?;
+    let dataset = file
+        .dataset("molecule/num_elec")
+        .context("gw_checkpoint: the chkfile stores no 'molecule/num_elec'")?;
+    let text: VarLenUnicode = dataset
+        .read_scalar()
+        .context("gw_checkpoint: 'molecule/num_elec' is not a string")?;
+    serde_json::from_str(text.as_str()).with_context(|| {
+        format!(
+            "gw_checkpoint: cannot parse 'molecule/num_elec' = '{}'",
+            text.as_str()
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------
 // input-card accessors
 // ---------------------------------------------------------------------------
@@ -454,47 +498,34 @@ pub fn save_gw_checkpoint(scf_data: &SCF, state: &GwCheckpointState) -> Result<(
         write_usize(&root, "diis_safeguard", usize::from(state.diis_safeguard))?;
 
         // ---- metadata ----
+        // Only what the chkfile's own groups do NOT already hold.  The
+        // dimensions, charge, spin, electron count, geometry and SCF energy all
+        // live in `scf/*` / `molecule/*` (written by `save_chkfile`), so they
+        // are read back from there on load instead of being duplicated here.
         let meta = root.create_group("meta").context("gw_checkpoint: meta group")?;
-        write_usize(&meta, "natm", state.natm)?;
-        write_usize(&meta, "num_basis", state.num_basis)?;
-        write_usize(&meta, "num_state", state.num_state)?;
-        write_vec_f64(&meta, "num_elec", &state.num_elec)?;
-        write_f64(&meta, "charge", state.charge)?;
-        write_f64(&meta, "spin", state.spin)?;
-        write_usize(&meta, "spin_channel", state.spin_channel)?;
-        write_f64(&meta, "scf_energy", scf_data.scf_energy)?;
         write_f64(&meta, "nuc_energy", scf_data.nuc_energy)?;
         write_string(&meta, "scf_type", scf_type_as_str(state.scf_type))?;
         write_string(&meta, "basis_path", &state.basis_path)?;
         write_string(&meta, "auxbas_path", &state.auxbas_path)?;
-        write_string(&meta, "geom", &geom_to_json(&scf_data.mol.geom))?;
 
-        // ---- SCF arrays ----
+        // ---- arrays the chkfile does not store ----
+        // MO energies / coefficients / occupations are already in the chkfile
+        // (`scf/mo_energy`, `scf/mo_coeff`, `scf/mo_occ`) and are reinstalled by
+        // `SCF::build` on the resume path.  Only the HOMO/LUMO indices, the
+        // density matrices (read by the BSE dipole term) and the Fock matrices
+        // (not rebuilt when the SCF loop is skipped) are archived here.
         let spin_channel = scf_data.mol.spin_channel.min(2);
         let scf = root.create_group("scf").context("gw_checkpoint: scf group")?;
-        write_usize(&scf, "spin_channel", spin_channel)?;
         write_vec_usize(&scf, "homo", &scf_data.homo)?;
         write_vec_usize(&scf, "lumo", &scf_data.lumo)?;
         for i_spin in 0..spin_channel {
+            // Stored packed (`MatrixUpper` layout), which is exactly what the
+            // loader rebuilds.
             write_vec_f64(
                 &scf,
-                &format!("eigenvalues_{}", i_spin),
-                &scf_data.eigenvalues[i_spin],
+                &format!("hamiltonian_{}", i_spin),
+                &scf_data.hamiltonian[i_spin].data,
             )?;
-            write_vec_f64(
-                &scf,
-                &format!("occupation_{}", i_spin),
-                &scf_data.occupation[i_spin],
-            )?;
-            write_matrix(
-                &scf,
-                &format!("eigenvectors_{}", i_spin),
-                &scf_data.eigenvectors[i_spin],
-            )?;
-            let hamiltonian = scf_data.hamiltonian[i_spin]
-                .to_matrixfull()
-                .unwrap_or_else(MatrixFull::empty);
-            write_matrix(&scf, &format!("hamiltonian_{}", i_spin), &hamiltonian)?;
         }
         let n_dm = scf_data.density_matrix.len().min(2);
         write_usize(&scf, "num_density_matrices", n_dm)?;
@@ -633,16 +664,23 @@ pub fn load_gw_checkpoint(scf_data: &mut SCF) -> Result<GwCheckpointState> {
     let stage = GwCheckpointStage::from_str(&read_string(&root, "stage")?)?;
 
     // ---- metadata + validation ----
+    // The SCF-side quantities live in the chkfile's own groups (written by
+    // `save_chkfile`); the archive only adds what those do not hold.
+    let (num_basis_o, num_state_o, spin_channel_o, spin_o, charge_o) = load_basic(&path);
+    let num_basis = num_basis_o.context("gw_checkpoint: the chkfile stores no 'scf/num_basis'")?;
+    let num_state = num_state_o.context("gw_checkpoint: the chkfile stores no 'scf/num_states'")?;
+    let spin_channel =
+        spin_channel_o.context("gw_checkpoint: the chkfile stores no 'scf/spin_channel'")?;
+    let spin = spin_o.context("gw_checkpoint: the chkfile stores no 'scf/spin'")?;
+    let charge = charge_o.context("gw_checkpoint: the chkfile stores no 'scf/charge'")?;
+    let total_elec = read_chkfile_total_electrons(&path)?;
+    let scf_energy = read_chkfile_e_tot(&path)?;
+    let saved_geom = load_geom(&path)
+        .ok_or_else(|| anyhow!("gw_checkpoint: the chkfile stores no 'molecule/geom'"))?;
+
     let meta = root
         .group("meta")
         .context("gw_checkpoint: missing 'meta' group")?;
-    let natm = read_usize(&meta, "natm")?;
-    let num_basis = read_usize(&meta, "num_basis")?;
-    let num_state = read_usize(&meta, "num_state")?;
-    let num_elec = read_vec_f64(&meta, "num_elec")?;
-    let charge = read_f64(&meta, "charge")?;
-    let spin = read_f64(&meta, "spin")?;
-    let spin_channel = read_usize(&meta, "spin_channel")?;
     let scf_type = scf_type_from_str(&read_string(&meta, "scf_type")?)?;
     let basis_path = read_string(&meta, "basis_path")?;
     let auxbas_path = read_string(&meta, "auxbas_path")?;
@@ -662,13 +700,6 @@ pub fn load_gw_checkpoint(scf_data: &mut SCF) -> Result<GwCheckpointState> {
         )
     };
 
-    if natm != scf_data.mol.geom.elem.len() {
-        return Err(mismatch(
-            "the number of atoms",
-            natm.to_string(),
-            scf_data.mol.geom.elem.len().to_string(),
-        ));
-    }
     if num_basis != scf_data.mol.num_basis {
         return Err(mismatch(
             "the number of basis functions",
@@ -690,16 +721,11 @@ pub fn load_gw_checkpoint(scf_data: &mut SCF) -> Result<GwCheckpointState> {
             scf_data.mol.spin_channel.to_string(),
         ));
     }
-    if num_elec.len() != 3
-        || num_elec
-            .iter()
-            .zip(scf_data.mol.num_elec.iter())
-            .any(|(a, b)| (a - b).abs() > 1.0e-8)
-    {
+    if (total_elec - scf_data.mol.num_elec[0]).abs() > 1.0e-8 {
         return Err(mismatch(
             "the number of electrons",
-            format!("{:?}", num_elec),
-            format!("{:?}", scf_data.mol.num_elec),
+            total_elec.to_string(),
+            scf_data.mol.num_elec[0].to_string(),
         ));
     }
     if (charge - scf_data.mol.ctrl.charge).abs() > 1.0e-8 {
@@ -739,12 +765,6 @@ pub fn load_gw_checkpoint(scf_data: &mut SCF) -> Result<GwCheckpointState> {
     }
 
     // Geometry: same elements, same positions.
-    let saved_geom = geom_from_json(&read_string(&meta, "geom")?).ok_or_else(|| {
-        anyhow!(
-            "gw_checkpoint: the stored geometry in '{}' cannot be decoded",
-            path
-        )
-    })?;
     if saved_geom.elem != scf_data.mol.geom.elem {
         return Err(mismatch(
             "the chemical elements / their order",
@@ -777,34 +797,19 @@ pub fn load_gw_checkpoint(scf_data: &mut SCF) -> Result<GwCheckpointState> {
         }
     }
 
-    // ---- restore the SCF arrays ----
+    // ---- restore the archived extras ----
+    // `eigenvalues` / `eigenvectors` / `occupation` are deliberately NOT
+    // archived: the chkfile's `scf/mo_energy` / `mo_coeff` / `mo_occ` are the
+    // single copy of them, and `SCF::build` reinstalls those on the resume path.
     let scf = root.group("scf").context("gw_checkpoint: missing 'scf' group")?;
-    let saved_spin_channel = read_usize(&scf, "spin_channel")?;
     let saved_homo = read_vec_usize(&scf, "homo")?;
     let saved_lumo = read_vec_usize(&scf, "lumo")?;
-    let mut n_restored_spin = 0_usize;
-    for i_spin in 0..saved_spin_channel.min(2) {
-        let eigenvalues = read_vec_f64(&scf, &format!("eigenvalues_{}", i_spin))?;
-        if eigenvalues.len() != scf_data.mol.num_state {
-            bail!(
-                "gw_checkpoint: '{}' is corrupt: it stores {} MO energies for spin {} but the \
-                 current input has {} orbitals.",
-                path,
-                eigenvalues.len(),
-                i_spin,
-                scf_data.mol.num_state
-            );
+    for i_spin in 0..scf_data.mol.spin_channel.min(2) {
+        let data = read_vec_f64(&scf, &format!("hamiltonian_{}", i_spin))?;
+        if !data.is_empty() {
+            scf_data.hamiltonian[i_spin] = MatrixUpper::from_vec(data.len(), data)
+                .ok_or_else(|| anyhow!("gw_checkpoint: cannot rebuild the Fock matrix"))?;
         }
-        scf_data.eigenvalues[i_spin] = eigenvalues;
-        scf_data.occupation[i_spin] = read_vec_f64(&scf, &format!("occupation_{}", i_spin))?;
-        scf_data.eigenvectors[i_spin] = read_matrix(&scf, &format!("eigenvectors_{}", i_spin))?;
-        let hamiltonian = read_matrix(&scf, &format!("hamiltonian_{}", i_spin))?;
-        if !hamiltonian.data.is_empty() {
-            scf_data.hamiltonian[i_spin] =
-                MatrixUpper::from_vec(hamiltonian.data.len(), hamiltonian.data)
-                    .ok_or_else(|| anyhow!("gw_checkpoint: cannot rebuild the Fock matrix"))?;
-        }
-        n_restored_spin += 1;
     }
     let n_dm = read_usize(&scf, "num_density_matrices")?;
     for i_spin in 0..n_dm.min(2) {
@@ -816,7 +821,7 @@ pub fn load_gw_checkpoint(scf_data: &mut SCF) -> Result<GwCheckpointState> {
     if saved_lumo.len() == 2 {
         scf_data.lumo = [saved_lumo[0], saved_lumo[1]];
     }
-    scf_data.scf_energy = read_f64(&meta, "scf_energy")?;
+    scf_data.scf_energy = scf_energy;
     // `nuc_energy` is a pure function of geometry + basis and is rebuilt by
     // `prepare_necessary_integrals`, so a mismatch here also indicates a
     // basis/geometry inconsistency; report it rather than silently overwrite.
@@ -906,14 +911,10 @@ pub fn load_gw_checkpoint(scf_data: &mut SCF) -> Result<GwCheckpointState> {
         diis_space,
         diis_min_history,
         diis_safeguard,
-        natm,
+        natm: saved_geom.elem.len(),
         num_basis,
         num_state,
-        num_elec: [
-            num_elec.first().copied().unwrap_or(0.0),
-            num_elec.get(1).copied().unwrap_or(0.0),
-            num_elec.get(2).copied().unwrap_or(0.0),
-        ],
+        num_elec: scf_data.mol.num_elec,
         charge,
         spin,
         spin_channel,
@@ -925,12 +926,11 @@ pub fn load_gw_checkpoint(scf_data: &mut SCF) -> Result<GwCheckpointState> {
     println!("--------------------------------------------------------------------------------");
     println!("[gw_checkpoint] resuming from '{}'", path);
     println!(
-        "[gw_checkpoint] restored SCF state: {} spin channel(s) ({} MO energy set(s), {} MO coefficient set(s)), \
-         {} density matrix/matrices, E_SCF = {:18.10} Ha, E_nuc = {:18.10} Ha",
-        n_restored_spin,
-        n_restored_spin,
-        n_restored_spin,
+        "[gw_checkpoint] the chkfile supplies the MO energies/coefficients/occupations; \
+         the archive adds {} density matrix/matrices and {} Fock matrix/matrices. \
+         E_SCF = {:18.10} Ha, E_nuc = {:18.10} Ha",
         n_dm.min(2),
+        scf_data.mol.spin_channel.min(2),
         scf_data.scf_energy,
         scf_data.nuc_energy
     );
@@ -1017,6 +1017,9 @@ mod tests {
             MatrixFull::from_vec([n, n], vec![0.25; n * n]).unwrap();
         scf.homo = [n / 2 - 1, 0];
         scf.lumo = [n / 2, 0];
+        let npair = n * (n + 1) / 2;
+        scf.hamiltonian[0] =
+            MatrixUpper::from_vec(npair, (1..=npair).map(|v| v as f64).collect()).unwrap();
         scf.scf_energy = -1.25;
         // `nuc_energy` is rebuilt by `prepare_necessary_integrals` in a real
         // run; here it must match what the loader recomputes (0.0 for the empty
@@ -1030,10 +1033,18 @@ mod tests {
         scf
     }
 
+    /// Write the SCF half of the chkfile exactly as `save_chkfile` does in a
+    /// real run; the GW archive now relies on it for the MO arrays and the
+    /// compatibility metadata.
+    fn write_scf_chkfile(scf: &SCF) {
+        crate::fileop::chkfile::save_chkfile(scf);
+    }
+
     #[test]
     fn checkpoint_round_trips_scf_and_evgw_state() {
         let path = tmp_path("roundtrip");
         let source = synthetic_scf(&path, 4, 0.0);
+        write_scf_chkfile(&source);
 
         let mut state = GwCheckpointState::from_scf(&source);
         state.stage = GwCheckpointStage::EvgwRound;
@@ -1050,8 +1061,43 @@ mod tests {
         assert!(!Path::new(&format!("{}.tmp", path)).exists());
         assert!(Path::new(&path).exists());
 
+        // The archive must NOT duplicate what the chkfile already stores.
+        {
+            let file = hdf5::File::open(&path).unwrap();
+            let gw = file.group(ROOT_GROUP).unwrap();
+            let meta = gw.group("meta").unwrap();
+            for duplicate in [
+                "natm", "num_basis", "num_state", "num_elec", "charge", "spin",
+                "spin_channel", "scf_energy", "geom",
+            ] {
+                assert!(
+                    meta.dataset(duplicate).is_err(),
+                    "'meta/{}' duplicates a chkfile dataset",
+                    duplicate
+                );
+            }
+            let scf = gw.group("scf").unwrap();
+            for duplicate in ["spin_channel", "eigenvalues_0", "occupation_0", "eigenvectors_0"] {
+                assert!(
+                    scf.dataset(duplicate).is_err(),
+                    "'scf/{}' duplicates a chkfile dataset",
+                    duplicate
+                );
+            }
+            // The extras the chkfile does not hold stay in the archive.
+            assert!(scf.dataset("homo").is_ok());
+            assert!(scf.dataset("density_matrix_0_data").is_ok());
+            assert!(scf.dataset("hamiltonian_0").is_ok());
+        }
+
         let mut target = synthetic_scf(&path, 4, 0.0);
-        target.eigenvalues[0] = vec![0.0; 4];
+        // Wipe the values the archive is expected to restore, so the assertions
+        // below are not vacuous.
+        target.homo = [9, 9];
+        target.lumo = [9, 9];
+        target.scf_energy = 42.0;
+        target.density_matrix[0] = MatrixFull::from_vec([4, 4], vec![0.0; 16]).unwrap();
+        target.hamiltonian[0] = MatrixUpper::empty();
         let loaded = load_gw_checkpoint(&mut target).expect("the checkpoint must load");
 
         assert_eq!(loaded.stage, GwCheckpointStage::EvgwRound);
@@ -1062,13 +1108,12 @@ mod tests {
         assert_eq!(loaded.diis_history.len(), 2);
         assert_eq!(loaded.diis_errors[1], vec![0.011, 0.021, 0.031, 0.041]);
 
-        assert_eq!(target.eigenvalues[0], source.eigenvalues[0]);
-        assert_eq!(target.occupation[0], source.occupation[0]);
-        assert_eq!(target.eigenvectors[0].size, [4, 4]);
-        assert_eq!(target.eigenvectors[0].data, source.eigenvectors[0].data);
+        // The MO arrays come from the chkfile (reinstalled by `SCF::build` in a
+        // real run); the archive restores the density/HOMO/LUMO/energy extras.
         assert_eq!(target.density_matrix[0].data, source.density_matrix[0].data);
         assert_eq!(target.homo, source.homo);
         assert_eq!(target.lumo, source.lumo);
+        assert_eq!(target.hamiltonian[0].data, source.hamiltonian[0].data);
         assert!((target.scf_energy - source.scf_energy).abs() < 1e-15);
         assert_eq!(target.gwqp.0, source.gwqp.0);
         assert_eq!(target.gwqp.1, source.gwqp.1);
@@ -1084,6 +1129,7 @@ mod tests {
     fn checkpoint_rejects_mismatched_input() {
         let path = tmp_path("mismatch");
         let source = synthetic_scf(&path, 4, 0.0);
+        write_scf_chkfile(&source);
         let state = GwCheckpointState::from_scf(&source);
         save_gw_checkpoint(&source, &state).expect("the checkpoint must be written");
 
@@ -1112,20 +1158,21 @@ mod tests {
     #[test]
     fn checkpoint_reuses_and_preserves_the_chkfile() {
         let path = tmp_path("reuse");
-        // Simulate the chkfile written by `save_chkfile` after the SCF.
+        let source = synthetic_scf(&path, 4, 0.0);
+        // Write the SCF half of the chkfile, then drop a marker dataset into it.
+        write_scf_chkfile(&source);
         {
-            let file = hdf5::File::create(&path).unwrap();
-            let scf = file.create_group("scf").unwrap();
+            let file = hdf5::File::open_rw(&path).unwrap();
+            let scf = file.group("scf").unwrap();
             scf.new_dataset::<f64>()
                 .shape(())
-                .create("e_tot")
+                .create("marker")
                 .unwrap()
                 .write_scalar(&-42.0)
                 .unwrap();
             file.close().unwrap();
         }
 
-        let source = synthetic_scf(&path, 4, 0.0);
         let mut state = GwCheckpointState::from_scf(&source);
         state.stage = GwCheckpointStage::EvgwRound;
         state.rounds_done = 1;
@@ -1136,12 +1183,13 @@ mod tests {
         save_gw_checkpoint(&source, &state).expect("second evGW round checkpoint");
         assert!(!Path::new(&format!("{}.tmp", path)).exists());
 
-        // The SCF group written before the GW stage must survive.
+        // The chkfile's own groups/datasets written before the GW stage survive.
         {
             let file = hdf5::File::open(&path).unwrap();
             let scf = file.group("scf").expect("the chkfile's scf group must survive");
-            let e_tot = scf.dataset("e_tot").unwrap().read_scalar::<f64>().unwrap();
-            assert!((e_tot + 42.0).abs() < 1e-15);
+            let marker = scf.dataset("marker").unwrap().read_scalar::<f64>().unwrap();
+            assert!((marker + 42.0).abs() < 1e-15);
+            assert!(scf.dataset("e_tot").is_ok());
             assert!(file.group(ROOT_GROUP).is_ok());
         }
 

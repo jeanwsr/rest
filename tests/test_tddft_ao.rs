@@ -4,7 +4,7 @@
 //! public kernel primitives against naive four-index references built from a
 //! synthetic packed 3c2e integral table.
 
-use pyrest::ri_jk::pure_incore::{get_vj_ri_incore_nonsym, get_vk_ri_incore_coeff_pair, get_vk_ri_incore_dm};
+use pyrest::ri_jk::pure_incore::get_vk_ri_incore_dm;
 use pyrest::ri_tddft::matvec_ao::{contract_back, transition_density, RimatrTuple};
 use pyrest::ri_tddft::tddft::{FxcDriver, TDDFTData};
 use pyrest::ri_tddft::TDDFTMode;
@@ -123,7 +123,7 @@ fn test_ri_exchange_ao_vs_naive() {
 }
 
 fn build_ao_data(nvar: usize) -> TDDFTData {
-    let nao = 6; let occ = 3; let vir = 4; let ng = 17;
+    let nao = 6; let occ = 3; let vir = 4;
 
     let c_occ = MatrixFull::from_vec([nao, occ], pseudo(nao * occ, 11.2)).unwrap();
     let c_vir = MatrixFull::from_vec([nao, vir], pseudo(nao * vir, 12.3)).unwrap();
