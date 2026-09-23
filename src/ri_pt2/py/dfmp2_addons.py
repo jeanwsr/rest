@@ -1,3 +1,14 @@
+"""
+PyTorch implementation of the DF-MP2 pair-energy contraction.
+
+References
+----------
+- GPU4PySCF: https://github.com/pyscf/gpu4pyscf/pull/662
+  
+  This code initialized from GPU4PySCF PR, adapted and optimized for
+  pytorch usage with help of AI (glm-5.x).
+"""
+
 import contextlib
 import os
 import time
