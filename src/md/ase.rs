@@ -89,6 +89,12 @@ class _RestAseOpt:
         self.fixed = list(fixed)
         if self.fixed:
             atoms.set_constraint(FixAtoms(indices=self.fixed))
+        # Forces are supplied externally via step(f=...), but some ASE versions
+        # probe the calculator (get_forces/get_potential_energy) already at
+        # optimizer construction.  Attach a lazy calculator that replays the
+        # most recent external forces (zeros initially) so such versions work.
+        self._last_f = np.zeros((len(atoms), 3))
+        atoms.calc = _RestCalculator(lambda flat: (0.0, self._last_f.flatten()))
         from ase.optimize import FIRE
         self.dyn = FIRE(atoms, logfile=None)
         self.atoms = atoms
@@ -97,6 +103,7 @@ class _RestAseOpt:
         f = np.asarray(forces_ev_ang, dtype=float).reshape(-1, 3)
         for i in self.fixed:
             f[i] = 0.0
+        self._last_f = f.copy()
         self.dyn.step(f=f)
         p = self.atoms.get_positions()
         return [c for row in p for c in row]

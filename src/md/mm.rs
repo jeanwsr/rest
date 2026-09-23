@@ -227,25 +227,27 @@ pub fn build_solute_water_box(
 ) -> (String, usize) {
     const BOHR_ANG: f64 = crate::constants::BOHR;
     let n = symbols.len();
-    let mut lo = [f64::MAX; 3];
-    let mut hi = [f64::MIN; 3];
+    let mut cen = [0.0f64; 3];
     for a in pos_bohr.chunks(3) {
         for c in 0..3 {
-            let v = a[c] * BOHR_ANG;
-            lo[c] = lo[c].min(v);
-            hi[c] = hi[c].max(v);
+            cen[c] += a[c] * BOHR_ANG;
         }
     }
-    let side = [
-        (hi[0] - lo[0]) + 2.0 * margin_ang,
-        (hi[1] - lo[1]) + 2.0 * margin_ang,
-        (hi[2] - lo[2]) + 2.0 * margin_ang,
-    ];
-    let center = [
-        (lo[0] + hi[0]) * 0.5,
-        (lo[1] + hi[1]) * 0.5,
-        (lo[2] + hi[2]) * 0.5,
-    ];
+    for c in 0..3 {
+        cen[c] /= n as f64;
+    }
+    let mut r_max = 0.0f64;
+    for a in pos_bohr.chunks(3) {
+        let d = ((a[0] * BOHR_ANG - cen[0]).powi(2)
+            + (a[1] * BOHR_ANG - cen[1]).powi(2)
+            + (a[2] * BOHR_ANG - cen[2]).powi(2))
+        .sqrt();
+        if d > r_max {
+            r_max = d;
+        }
+    }
+    let side = [2.0 * (r_max + margin_ang); 3];
+    let center = cen;
     let origin = [center[0] - side[0] * 0.5, center[1] - side[1] * 0.5, center[2] - side[2] * 0.5];
 
     let th = 104.52f64.to_radians();
@@ -285,8 +287,10 @@ pub fn build_solute_water_box(
     }
     let mut rng = Rng(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed });
 
-    let clash = |x: f64, y: f64, z: f64, cutoff: f64| -> bool {
-        for a in pos_bohr.chunks(3) {
+    let is_h: Vec<bool> = symbols.iter().map(|s| s.eq_ignore_ascii_case("h")).collect();
+    let clash_elem = |x: f64, y: f64, z: f64, cutoff_heavy: f64, cutoff_h: f64| -> bool {
+        for (i, a) in pos_bohr.chunks(3).enumerate() {
+            let cutoff = if is_h[i] { cutoff_h } else { cutoff_heavy };
             let dx = a[0] * BOHR_ANG - x;
             let dy = a[1] * BOHR_ANG - y;
             let dz = a[2] * BOHR_ANG - z;
@@ -306,19 +310,23 @@ pub fn build_solute_water_box(
             let mut gx = origin[0] + spacing * 0.5;
             while gx < origin[0] + side[0] - spacing * 0.25 {
                 if max_waters == 0 || waters.len() < max_waters {
-                    let rot = random_rotation(&mut rng);
                     let o = [gx, gy, gz];
-                    let ah1 = [o[0] + rot[0][0]*h1[0] + rot[0][1]*h1[1] + rot[0][2]*h1[2],
-                               o[1] + rot[1][0]*h1[0] + rot[1][1]*h1[1] + rot[1][2]*h1[2],
-                               o[2] + rot[2][0]*h1[0] + rot[2][1]*h1[1] + rot[2][2]*h1[2]];
-                    let ah2 = [o[0] + rot[0][0]*h2[0] + rot[0][1]*h2[1] + rot[0][2]*h2[2],
-                               o[1] + rot[1][0]*h2[0] + rot[1][1]*h2[1] + rot[1][2]*h2[2],
-                               o[2] + rot[2][0]*h2[0] + rot[2][1]*h2[1] + rot[2][2]*h2[2]];
-                    if !clash(o[0], o[1], o[2], 3.2)
-                        && !clash(ah1[0], ah1[1], ah1[2], 3.0)
-                        && !clash(ah2[0], ah2[1], ah2[2], 3.0)
-                    {
-                        waters.push([o[0], o[1], o[2], ah1[0], ah1[1], ah1[2], ah2[0], ah2[1], ah2[2]]);
+                    if !clash_elem(o[0], o[1], o[2], 3.2, 2.4) {
+                        for _ in 0..64 {
+                            let rot = random_rotation(&mut rng);
+                            let ah1 = [o[0] + rot[0][0]*h1[0] + rot[0][1]*h1[1] + rot[0][2]*h1[2],
+                                       o[1] + rot[1][0]*h1[0] + rot[1][1]*h1[1] + rot[1][2]*h1[2],
+                                       o[2] + rot[2][0]*h1[0] + rot[2][1]*h1[1] + rot[2][2]*h1[2]];
+                            let ah2 = [o[0] + rot[0][0]*h2[0] + rot[0][1]*h2[1] + rot[0][2]*h2[2],
+                                       o[1] + rot[1][0]*h2[0] + rot[1][1]*h2[1] + rot[1][2]*h2[2],
+                                       o[2] + rot[2][0]*h2[0] + rot[2][1]*h2[1] + rot[2][2]*h2[2]];
+                            if !clash_elem(ah1[0], ah1[1], ah1[2], 3.0, 3.0)
+                                && !clash_elem(ah2[0], ah2[1], ah2[2], 3.0, 3.0)
+                            {
+                                waters.push([o[0], o[1], o[2], ah1[0], ah1[1], ah1[2], ah2[0], ah2[1], ah2[2]]);
+                                break;
+                            }
+                        }
                     }
                 }
                 gx += spacing;
