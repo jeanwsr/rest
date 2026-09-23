@@ -38,20 +38,21 @@ pub fn g0w0(
     num_freq: usize,
     vxc_nn: &Vec<f64>,
     cancel_dfa_xc: bool,
+    gw_ctx: &mut ri_gw::GwContext,
 ) -> Vec<f64> {
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let gw_scheme = qp_ctrl.gw_scheme.clone();
 
     if gw_scheme == "qp equation" {
-        ri_gw::gw_calculations(scf_data, 20, &vxc_nn, cancel_dfa_xc)
+        ri_gw::gw_calculations(scf_data, 20, &vxc_nn, cancel_dfa_xc, gw_ctx)
     } else if gw_scheme == "linearize" {
-        ri_gw::linearized_gw(scf_data, 20, &vxc_nn, cancel_dfa_xc)
+        ri_gw::linearized_gw(scf_data, 20, &vxc_nn, cancel_dfa_xc, gw_ctx)
     } else if gw_scheme == "x alpha" {
         ri_gw::x_alpha_gw(scf_data)
     } else if gw_scheme == "extrapolated" {
         match qp_ctrl.gw_variant {
             GwVariant::Cd => {
-                gw_near_fermi_surface(scf_data, 20, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold, qp_ctrl.gw_extrapolate_vir_threshold)
+                gw_near_fermi_surface(scf_data, 20, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold, qp_ctrl.gw_extrapolate_vir_threshold, gw_ctx)
             }
             GwVariant::Ac => {
                 gw_near_fermi_surface_ac(scf_data, num_freq, &vxc_nn, qp_ctrl.gw_extrapolate_occ_threshold)
@@ -341,7 +342,7 @@ fn gw_near_fermi_surface_spin_lowrank(
         nsemax[s] = op.homo.saturating_add(range).min(op.num_state.saturating_sub(1));
     }
     let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
-    let real_axis_vchiv = ri_gw::generate_real_axis_vchiv_spin(
+    let mut real_axis_vchiv = ri_gw::generate_real_axis_vchiv_spin(
         &gwqp_g_all,
         &gwqp_w_all,
         &ops,
@@ -358,6 +359,7 @@ fn gw_near_fermi_surface_spin_lowrank(
         qp_ctrl.cdgw_eta,
         qp_ctrl.cdgw_res_tol,
     );
+    real_axis_vchiv.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
 
     let mut out = [vec![], vec![]];
     for spin in 0..nspin {
@@ -416,19 +418,577 @@ fn gw_near_fermi_surface_spin_lowrank(
 }
 
 
-pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize)->Vec<f64>{
-    let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
-    for i in 0..iter_rounds{
-        println!("Now is round #{} of evGW calculation. There will be {} rounds in total.",i+1,iter_rounds);
-        //let cancel_dfa_xc=if i==0 && scf_data.mol.ctrl.renormalized_singles==false{true}else{false};
-        let cancel_dfa_xc=true;
-        let previous_qp=scf_data.gwqp.0.clone();
-        let qp=g0w0(scf_data,num_freq,vxc_nn,cancel_dfa_xc);
-        scf_data.gwqp.0=qp.clone();
-        scf_data.gwqp.1=qp.clone();
+/// Dense linear solve with partial pivoting for the (m+1)x(m+1) Pulay system.
+/// Returns `None` when the matrix is numerically singular.
+fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    let n = b.len();
+    for col in 0..n {
+        let mut piv = col;
+        for r in (col + 1)..n {
+            if a[r][col].abs() > a[piv][col].abs() {
+                piv = r;
+            }
+        }
+        if a[piv][col].abs() < 1.0e-300 {
+            return None;
+        }
+        a.swap(col, piv);
+        b.swap(col, piv);
+        for r in (col + 1)..n {
+            let f = a[r][col] / a[col][col];
+            if f != 0.0 {
+                for c in col..n {
+                    a[r][c] -= f * a[col][c];
+                }
+                b[r] -= f * b[col];
+            }
+        }
     }
-    scf_data.gwqp.0.clone()
+    let mut x = vec![0.0_f64; n];
+    for r in (0..n).rev() {
+        let mut s = b[r];
+        for c in (r + 1)..n {
+            s -= a[r][c] * x[c];
+        }
+        x[r] = s / a[r][r];
+    }
+    Some(x)
 }
+
+/// Pulay/DIIS (a.k.a. Anderson) extrapolation of the evGW quasiparticle energy
+/// vector.
+///
+/// This mirrors what `pyscf.gw.evgw` does: one full GW pass produces a new
+/// energy vector `x_out` from the vector `x_in` used to build G (and W); the
+/// plain fixed-point iteration `x_in <- x_out` is then replaced by
+///
+/// 1. an optional *damped* step `x_mix = (1-a) x_in + a x_out`, and
+/// 2. a Pulay extrapolation `x_next = sum_i c_i x_mix^(i)` that minimises
+///    `|sum_i c_i r^(i)|` subject to `sum_i c_i = 1`, with residuals
+///    `r^(i) = x_mix^(i) - x_in^(i)`.
+///
+/// A plain undamped and unextrapolated iteration is recovered with
+/// `damping = 1.0` and DIIS disabled.
+struct EvgwDiis {
+    space: usize,
+    min_history: usize,
+    history: Vec<Vec<f64>>,
+    errors: Vec<Vec<f64>>,
+    /// Reject a DIIS step only for *sanity* reasons (non-finite, or an
+    /// excursion larger than `max_excursion`).  A bracket-restricted variant
+    /// is available through `evgw_diis_safeguard = true`.
+    safeguard: bool,
+    max_excursion: f64,
+}
+
+impl EvgwDiis {
+    fn new(space: usize, min_history: usize, safeguard: bool) -> Self {
+        EvgwDiis {
+            space: space.max(2),
+            min_history: min_history.max(2),
+            history: Vec::new(),
+            errors: Vec::new(),
+            safeguard,
+            max_excursion: 1.0,
+        }
+    }
+
+    /// Re-seed the DIIS history from a GW checkpoint (see
+    /// [`crate::fileop::gw_checkpoint`]).
+    ///
+    /// The *current* input-card values of `space` / `min_history` /
+    /// `safeguard` are kept -- only the stored vectors are injected -- so that
+    /// changing `evgw_diis_space` between the interrupted run and the resumed
+    /// one takes effect.  Vectors whose length disagrees with their error
+    /// vector are skipped rather than trusted.
+    fn restore(&mut self, history: &[Vec<f64>], errors: &[Vec<f64>]) {
+        self.history.clear();
+        self.errors.clear();
+        for (h, e) in history.iter().zip(errors.iter()) {
+            if h.len() == e.len() && !h.is_empty() {
+                self.history.push(h.clone());
+                self.errors.push(e.clone());
+            }
+        }
+        while self.history.len() > self.space {
+            self.history.remove(0);
+            self.errors.remove(0);
+        }
+    }
+
+    fn update(
+        &mut self,
+        x_in: &[f64],
+        x_out: &[f64],
+        damping: f64,
+        max_step: f64,
+        use_diis: bool,
+    ) -> Vec<f64> {
+        let n = x_out.len();
+        let alpha = damping.clamp(1.0e-3, 1.0);
+        // Damped (linear-mixed) step, optionally with a per-orbital cap on the
+        // move.  MolGW's GnWn update is `E + Z (F(E) - E)` with Z clamped to
+        // [0, 1]; `max_step` is the same idea expressed as a hard bound on the
+        // per-round quasiparticle-energy change (it also protects against a
+        // Newton solve landing on a spurious distant root).
+        let x_mix: Vec<f64> = (0..n)
+            .map(|i| {
+                let mut d = alpha * (x_out[i] - x_in[i]);
+                if max_step > 0.0 && d.abs() > max_step {
+                    d = max_step * d.signum();
+                }
+                x_in[i] + d
+            })
+            .collect();
+        if !use_diis {
+            return x_mix;
+        }
+        let err: Vec<f64> = (0..n).map(|i| x_mix[i] - x_in[i]).collect();
+        self.history.push(x_mix.clone());
+        self.errors.push(err);
+        while self.history.len() > self.space {
+            self.history.remove(0);
+            self.errors.remove(0);
+        }
+        let m = self.history.len();
+        if m < self.min_history {
+            return x_mix;
+        }
+        // Assemble the Pulay matrix.
+        let dim = m + 1;
+        let mut a = vec![vec![0.0_f64; dim]; dim];
+        let mut max_diag = 0.0_f64;
+        for i in 0..m {
+            for j in 0..m {
+                let mut s = 0.0;
+                for k in 0..n {
+                    s += self.errors[i][k] * self.errors[j][k];
+                }
+                a[i][j] = s;
+            }
+            max_diag = max_diag.max(a[i][i].abs());
+        }
+        // Tikhonov regularisation: orbitals outside the explicitly computed
+        // window are extrapolated from a *common* energy shift, so their
+        // residual vectors are exactly collinear and the Pulay matrix is rank
+        // deficient (or badly conditioned) without a small diagonal shift.
+        let eps = 1.0e-8 * max_diag + 1.0e-300;
+        for i in 0..m {
+            a[i][i] += eps;
+        }
+        for i in 0..m {
+            a[i][m] = -1.0;
+            a[m][i] = -1.0;
+        }
+        a[m][m] = 0.0;
+        let mut rhs = vec![0.0_f64; dim];
+        rhs[m] = -1.0;
+        let coeffs = match solve_linear_system(a, rhs) {
+            Some(c) => c,
+            None => return x_mix,
+        };
+        let mut x_next = vec![0.0_f64; n];
+        for i in 0..m {
+            let ci = coeffs[i];
+            for k in 0..n {
+                x_next[k] += ci * self.history[i][k];
+            }
+        }
+        // Sanity guard.  The default accepts any finite extrapolation that does
+        // not run away from the damped step by more than `max_excursion`
+        // (Anderson extrapolation is *meant* to overshoot).  With
+        // `safeguard = true` a stricter bracket check is used instead: the
+        // extrapolation may not leave the interval spanned by `x_in` and
+        // `x_out` by more than half of its width plus 1e-3 Ha.
+        let mut reject = false;
+        for k in 0..n {
+            if !x_next[k].is_finite() {
+                reject = true;
+                break;
+            }
+            if self.safeguard {
+                let lo = x_in[k].min(x_out[k]);
+                let hi = x_in[k].max(x_out[k]);
+                let margin = 0.5 * (hi - lo).abs() + 1.0e-3;
+                if (x_next[k] - hi).max(lo - x_next[k]).max(0.0) > margin {
+                    reject = true;
+                    break;
+                }
+            } else if (x_next[k] - x_mix[k]).abs() > self.max_excursion {
+                reject = true;
+                break;
+            }
+        }
+        if reject {
+            return x_mix;
+        }
+        x_next
+    }
+}
+
+/// Eigenvalue-self-consistent GW (evGW).
+///
+/// Each round is one complete GW pass (`g0w0`) in which the Green's function
+/// (and, as in MolGW's `GnWn`, the screened interaction) is rebuilt from the
+/// current quasiparticle energies.  The plain fixed-point iteration
+///
+///     E^(k+1) = F(E^(k)),
+///
+/// where `F` is the map defined by one GW pass, is **not** a contraction for
+/// typical molecules: the Jacobian of `F` has eigenvalues that approach (and
+/// can exceed) unit modulus, so the raw iteration settles into a limit cycle
+/// instead of converging.  Both reference implementations therefore accelerate
+/// the outer loop:
+///
+/// * **MolGW** (`m_selfenergy_tools.f90`, `find_qp_energy_linearization`)
+///   updates with `E_new = E_in + Z (F(E_in) - E_in)` where
+///   `Z = 1 / (1 - dSigma/domega)` is clamped to `[0, 1]`.  In the diagonal
+///   approximation this is Newton's method for the quasiparticle equation and
+///   removes the fixed-point self-interaction entirely; it is a *damped*
+///   update with a state-dependent step.
+/// * **PySCF** (`pyscf/gw/evgw.py`) solves the quasiparticle equation exactly
+///   for every orbital and then applies Pulay/DIIS extrapolation
+///   (`pyscf.lib.diis.DIIS`) to the whole `mo_energy` vector.
+///
+/// REST already solves the quasiparticle equation exactly per orbital, so the
+/// missing ingredient is the outer accelerator.  This routine therefore offers
+/// the same two mechanisms through `evgw_damping` (scalar analogue of MolGW's
+/// Z-scaling) and `evgw_diis` (PySCF's DIIS), plus a convergence test with
+/// early exit so that "did evGW converge?" is answerable from the log.
+pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,gw_ctx:&mut ri_gw::GwContext)->Vec<f64>{
+    let (_start_mo,_num_state,occ_size,_vir_size,_homo,_lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
+    let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let damping=qp_ctrl.evgw_damping.clamp(1.0e-3,1.0);
+    let update_kind=evgw_update_kind(&qp_ctrl);
+    let solver=match update_kind{
+        EvgwUpdate::ZStep=>String::from("z_update"),
+        EvgwUpdate::PlainEval=>String::from("molgw"),
+        EvgwUpdate::Root=>String::from("diis"),
+    };
+    // `evgw_diis` may be combined with any per-round map.  With the historical
+    // root-solving map (`EvgwUpdate::Root`) it is the PySCF-style accelerator;
+    // with `molgw`/`z_update` it acts as an outer Krylov accelerator on top of
+    // the (single-evaluation / Z-damped) step.  That combination is what makes
+    // one parameter set work for both classes of REST's evGW difficulties:
+    // MolGW's own per-round rule removes the sensitivity to the real-axis grid
+    // (CH4, CO2), while DIIS damps the antisymmetric mode of near-degenerate
+    // pairs that a scalar (diagonal) step cannot control (NH3, C6H6).
+    let use_diis=qp_ctrl.evgw_diis;
+    let diis_space=qp_ctrl.evgw_diis_space;
+    let diis_start=qp_ctrl.evgw_diis_start;
+    let conv_tol=qp_ctrl.evgw_conv_tol;
+    let stop_on_conv=qp_ctrl.evgw_stop_on_convergence;
+    let report=qp_ctrl.evgw_report;
+    let diis_safeguard=qp_ctrl.evgw_diis_safeguard;
+    let max_step_cap=qp_ctrl.evgw_max_step;
+
+    if qp_ctrl.scgw=="evgw" && report{
+        println!("evGW outer-loop settings: solver={}, damping(alpha)={:.4}, DIIS={} (space={}, start={}, safeguard={}), conv_tol={:.3e} Ha, stop_on_convergence={}, max_step={}",
+                 solver,damping,use_diis,diis_space.max(2),diis_start.max(2),diis_safeguard,conv_tol,stop_on_conv,
+                 if max_step_cap>0.0{format!("{:.3e} Ha",max_step_cap)}else{String::from("unlimited")});
+    }
+
+    let degeneracy_tol=qp_ctrl.evgw_degeneracy_tol;
+    if report && degeneracy_tol>0.0 {
+        println!("evGW degeneracy projection: QP energies of Kohn-Sham-degenerate partners (within {:.1e} Ha) are averaged every round.", degeneracy_tol);
+    }
+    let ks_reference=scf_data.eigenvalues[0].clone();
+    let mut diis=EvgwDiis::new(diis_space,diis_start,diis_safeguard);
+    let mut converged=false;
+    let mut last_residual=f64::INFINITY;
+    let mut last_dg=f64::INFINITY;
+    let mut start_round=0_usize;
+
+    // ---- resume an interrupted evGW run -----------------------------------
+    // `scf_data.gwqp` already carries the iterate to feed into the next round
+    // (it was written next to the archive), so only the outer-loop bookkeeping
+    // has to come back from the checkpoint: the round counter, the convergence
+    // metrics and the DIIS history.  The DIIS history is restored as-is because
+    // it determines the *path* of the iteration; dropping it would still
+    // converge to the same fixed point, only along a different trajectory.
+    if let Some(state)=scf_data.gw_checkpoint_state.clone(){
+        if state.stage==crate::fileop::gw_checkpoint::GwCheckpointStage::EvgwRound{
+            start_round=state.rounds_done;
+            converged=state.converged;
+            last_residual=state.last_residual;
+            last_dg=state.last_dg;
+            diis.restore(&state.diis_history,&state.diis_errors);
+            println!("[gw_checkpoint] evGW resume: {} of {} round(s) are already contained in the checkpoint; \
+                      the loop restarts at round {}.",start_round,iter_rounds,start_round+1);
+            println!("[gw_checkpoint] evGW resume: restored {} DIIS vector(s), last max|dE_qp|={:.4e} Ha, |dG|={:.4e}, converged={}.",
+                      state.diis_history.len(),last_residual,last_dg,converged);
+            if start_round>=iter_rounds{
+                println!("[gw_checkpoint] evGW resume: the checkpoint already holds all {} requested round(s) \
+                          (evgw_rounds); the evGW loop is skipped and the stored quasiparticle energies are used.",
+                          iter_rounds);
+            } else if converged && stop_on_conv {
+                println!("[gw_checkpoint] evGW resume: the stored round already satisfied evgw_conv_tol={:.4e} Ha \
+                          and evgw_stop_on_convergence is true; the evGW loop is skipped.",conv_tol);
+                start_round=iter_rounds;
+            }
+        }
+    }
+
+    let nstate=scf_data.gwqp.0.len();
+
+    for i in start_round..iter_rounds{
+        println!("Now is round #{} of evGW calculation. There will be {} rounds in total.",i+1,iter_rounds);
+        let cancel_dfa_xc=true;
+        // Energy vector fed into this round (G and W both built from it, as in
+        // MolGW's GnWn / PySCF's EVGW with W0 = False).
+        let mut qp_in=scf_data.gwqp.0.clone();
+        symmetrize_degenerate_subspaces(&mut qp_in,&ks_reference,degeneracy_tol);
+        scf_data.gwqp.0=qp_in.clone();
+        scf_data.gwqp.1=qp_in.clone();
+        // One full GW pass (root solve, single evaluation or Z-damped step,
+        // depending on `evgw_solver`).
+        let mut qp_out=g0w0(scf_data,num_freq,vxc_nn,cancel_dfa_xc,gw_ctx);
+        // Apply the degeneracy projection to the raw output too, so that the
+        // convergence metric and the mixing both work with the projected
+        // vector.  Otherwise the frozen out-of-window orbitals -- which are
+        // returned at their (slightly different) Kohn-Sham energies -- keep a
+        // constant mismatch against the projected input and the loop can never
+        // report convergence even though the iterate has stopped moving.
+        symmetrize_degenerate_subspaces(&mut qp_out,&ks_reference,degeneracy_tol);
+
+        // Convergence measures.
+        let mut max_de=0.0_f64;
+        let mut max_at=0usize;
+        let mut dg=0.0_f64;
+        for n in 0..nstate.min(qp_out.len()){
+            let d=(qp_out[n]-qp_in[n]).abs();
+            if d>max_de{max_de=d;max_at=n;}
+            if qp_in[n].abs()>1.0e-12 && qp_out[n].abs()>1.0e-12{
+                dg+=(1.0/qp_out[n]-1.0/qp_in[n]).abs();
+            }
+        }
+        dg/=(nstate*nstate) as f64;
+        last_residual=max_de;
+        last_dg=dg;
+
+        let mut qp_next=diis.update(&qp_in,&qp_out,damping,max_step_cap,use_diis);
+        symmetrize_degenerate_subspaces(&mut qp_next,&ks_reference,degeneracy_tol);
+        let mut max_step=0.0_f64;
+        for n in 0..nstate.min(qp_next.len()){
+            let d=(qp_next[n]-qp_in[n]).abs();
+            if d>max_step{max_step=d;}
+        }
+
+        if report{
+            let homo_qp=qp_out.get(occ_size-1).copied().unwrap_or(f64::NAN);
+            let lumo_qp=qp_out.get(occ_size).copied().unwrap_or(f64::NAN);
+            println!("evGW round {} summary: max|dE_qp|={:.4e} Ha (orbital #{}), |dG|={:.4e}, max|step|={:.4e} Ha",
+                     i+1,max_de,max_at,dg,max_step);
+            println!("evGW round {}: HOMO(#{} QP)={:.8} Ha, LUMO(#{} QP)={:.8} Ha, gap={:.8} Ha",
+                     i+1,occ_size-1,homo_qp,occ_size,lumo_qp,lumo_qp-homo_qp);
+        }
+
+        scf_data.gwqp.0=qp_next.clone();
+        scf_data.gwqp.1=qp_next.clone();
+
+        let round_converged=max_de<conv_tol;
+
+        // ---- end-of-round checkpoint hook ---------------------------------
+        // Written *after* the iterate and the DIIS history have been updated
+        // and *before* the convergence test, so that a job killed at any point
+        // during the round is picked up again from here (a `break` on
+        // convergence would otherwise skip the final round's archive).
+        if crate::fileop::gw_checkpoint::checkpoint_enabled(scf_data){
+            let mut ckpt=crate::fileop::gw_checkpoint::GwCheckpointState::from_scf(scf_data);
+            ckpt.stage=crate::fileop::gw_checkpoint::GwCheckpointStage::EvgwRound;
+            ckpt.rounds_done=i+1;
+            ckpt.total_rounds=iter_rounds;
+            ckpt.converged=round_converged;
+            ckpt.last_residual=last_residual;
+            ckpt.last_dg=last_dg;
+            ckpt.diis_space=diis.space;
+            ckpt.diis_min_history=diis.min_history;
+            ckpt.diis_safeguard=diis.safeguard;
+            ckpt.diis_history=diis.history.clone();
+            ckpt.diis_errors=diis.errors.clone();
+            if let Err(e)=crate::fileop::gw_checkpoint::save_gw_checkpoint(scf_data,&ckpt){
+                println!("[gw_checkpoint] WARNING: could not write the evGW checkpoint after round {}: {:#}",i+1,e);
+            }
+        }
+
+        if round_converged{
+            converged=true;
+            if report{
+                println!("evGW converged after {} round(s): max|dE_qp|={:.4e} Ha < conv_tol={:.4e} Ha",
+                         i+1,max_de,conv_tol);
+            }
+            if stop_on_conv{
+                break;
+            }
+        }
+    }
+    if !converged && iter_rounds>0{
+        println!("WARNING: evGW did not reach conv_tol={:.4e} Ha within {} round(s); last max|dE_qp|={:.4e} Ha, |dG|={:.4e}.",
+                 conv_tol,iter_rounds,last_residual,last_dg);
+        println!("         Consider reducing evgw_damping, keeping evgw_diis = true (solver=\"diis\"; for solver=\"z_update\" DIIS does not apply), or increasing evgw_rounds.");
+    }
+    let final_qp=scf_data.gwqp.0.clone();
+    if report && iter_rounds>0{
+        ri_gw::display::full_quasiparticles(&final_qp,occ_size);
+    }
+    final_qp
+}
+/// Step size (Ha) of the central finite difference used to obtain the
+/// quasiparticle-equation derivative for the MolGW-style `z_update` solver.
+const Z_UPDATE_DERIVATIVE_H: f64 = 1.0e-5;
+
+/// One MolGW-style Z-damped quasiparticle step.
+///
+/// MolGW's eigenvalue-self-consistent `GnWn` loop does not iterate the
+/// quasiparticle equation to its root; it takes a single *linearized* Newton
+/// step per GW pass (`find_qp_energy_linearization` in
+/// `m_selfenergy_tools.f90`):
+///
+///     E_out = E_in + Z * (E_KS - V_xc + Sigma_c(E_in) - E_in),
+///     Z     = 1 / (1 - dSigma_c/domega),   clamped to [0, 1].
+///
+/// `qp_eq(omega)` here is `consts + Sigma_c(omega) - omega`, so
+/// `E_out = E_in + Z * qp_eq(E_in)` and `d(qp_eq)/domega = Sigma_c' - 1`,
+/// hence `Z = -1 / (d qp_eq / d omega)`.  Clamping Z to `[0, 1]` guarantees
+/// that a weak self-energy pole sitting close to `E_in` (which would give a
+/// tiny or sign-changing `dSigma/domega`) cannot produce an overshoot; this is
+/// exactly the `MIN(MAX(zz, 0), 1)` clamp in MolGW.
+///
+/// Returns `(E_out, Z, qp_eq(E_in))`.
+fn one_shot_step<F: Fn(f64) -> f64>(
+    qp_eq: &F,
+    e_in: f64,
+    h: f64,
+    force_z: Option<f64>,
+) -> (f64, f64, f64, f64) {
+    let g0 = qp_eq(e_in);
+    if !g0.is_finite() {
+        return (e_in, 0.0, g0, f64::NAN);
+    }
+    if let Some(z0) = force_z {
+        let z = z0.clamp(0.0, 1.0);
+        return (e_in + z * g0, z, g0, f64::NAN);
+    }
+    let dq = central_difference(qp_eq, e_in, h);
+    let mut z = if dq.is_finite() && dq.abs() > 1.0e-12 { -1.0 / dq } else { 0.0 };
+    if !z.is_finite() {
+        z = 0.0;
+    }
+    z = z.clamp(0.0, 1.0);
+    (e_in + z * g0, z, g0, dq)
+}
+
+/// Central finite difference of the quasiparticle equation at `x`.
+fn central_difference<F: Fn(f64) -> f64>(f: &F, x: f64, h: f64) -> f64 {
+    (f(x + h) - f(x - h)) / (2.0 * h)
+}
+
+/// Project the quasiparticle energies onto the (near-)degenerate subspaces of
+/// the reference (Kohn-Sham) spectrum.
+///
+/// evGW must respect the degeneracies of the reference: symmetry-degenerate
+/// partners have equal quasiparticle energies.  REST's integrals and DFT grid
+/// break that symmetry numerically (the KS partners differ by ~1e-5 Ha), and
+/// the evGW map *amplifies* the resulting antisymmetric mode -- for C6H6 the
+/// E1g HOMO pair goes from a 1.8e-5 Ha KS splitting to 8.2e-3 Ha, i.e. a factor
+/// 450, and it then oscillates.  MolGW does not show this because its integrals
+/// keep the pairs exactly degenerate (its CO2 1pi_g pair has a splitting of
+/// 0.000000 eV throughout the GnWn run).
+///
+/// Grouping is done on the *reference* spectrum, which is fixed, so the grouping
+/// cannot drift during the iteration.  `tol <= 0` disables the projection.
+fn symmetrize_degenerate_subspaces(values: &mut [f64], reference: &[f64], tol: f64) -> usize {
+    if tol <= 0.0 || values.len() < 2 {
+        return 0;
+    }
+    let n = values.len().min(reference.len());
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| reference[a].partial_cmp(&reference[b]).unwrap_or(std::cmp::Ordering::Equal));
+    let mut merged = 0_usize;
+    let mut start = 0_usize;
+    while start < n {
+        let mut end = start + 1;
+        while end < n && reference[idx[end]] - reference[idx[start]] <= tol {
+            end += 1;
+        }
+        if end - start > 1 {
+            let mean: f64 = idx[start..end].iter().map(|&i| values[i]).sum::<f64>() / (end - start) as f64;
+            for &i in &idx[start..end] {
+                values[i] = mean;
+            }
+            merged += end - start;
+        }
+        start = end;
+    }
+    merged
+}
+
+/// First/last orbital index whose KS energy lies inside the explicitly computed
+/// window `(e_homo - occ_threshold, e_lumo + vir_threshold)`.
+fn demax_window_bounds(
+    ks_energies: &[f64],
+    occ_size: usize,
+    e_homo: f64,
+    e_lumo: f64,
+    occ_threshold: f64,
+    vir_threshold: f64,
+) -> (usize, usize) {
+    let mut lo = None;
+    let mut hi = None;
+    for (n, e) in ks_energies.iter().enumerate() {
+        if *e > e_homo - occ_threshold && *e < e_lumo + vir_threshold {
+            if lo.is_none() {
+                lo = Some(n);
+            }
+            hi = Some(n);
+        }
+    }
+    match (lo, hi) {
+        (Some(l), Some(h)) => (l, h),
+        _ => (occ_size.saturating_sub(1), occ_size),
+    }
+}
+
+/// How one evGW round forms the next quasiparticle energy for each orbital.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EvgwUpdate {
+    /// Historical REST behaviour: solve the quasiparticle equation to its root
+    /// (Newton / interpolation rootfinder).
+    Root,
+    /// Z-damped linearized Newton step, `Z = 1/(1 - dSigma/domega)` clamped to
+    /// `[0, 1]`.
+    ZStep,
+    /// MolGW's `GnWn` (EVSC) rule: a *single* evaluation
+    /// `E_new = consts + Sigma_c(E_in)` at the previous quasiparticle energy,
+    /// with no root solve and no damping.
+    PlainEval,
+}
+
+fn evgw_update_kind(qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle) -> EvgwUpdate {
+    if qp_ctrl.scgw != "evgw" {
+        return EvgwUpdate::Root;
+    }
+    match qp_ctrl.evgw_solver.to_lowercase().as_str() {
+        "z_update" | "z-update" | "zupdate" => EvgwUpdate::ZStep,
+        "molgw" | "molgw_update" | "plain_eval" | "eval" => EvgwUpdate::PlainEval,
+        _ => EvgwUpdate::Root,
+    }
+}
+
+fn mode_label(update: EvgwUpdate) -> &'static str {
+    match update {
+        EvgwUpdate::PlainEval => "molgw_update",
+        _ => "z_update",
+    }
+}
+
+fn forced_z(update: EvgwUpdate) -> Option<f64> {
+    match update {
+        EvgwUpdate::PlainEval => Some(1.0),
+        _ => None,
+    }
+}
+
 pub fn single_orbital_gw_ac(
     scf_data: &mut SCF,
     v_matrix: &MatrixFull<f64>,
@@ -517,7 +1077,22 @@ pub fn single_orbital_gw_ac(
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
-    if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
+    if evgw_update_kind(&qp_ctrl) != EvgwUpdate::Root {
+        // MolGW-style Z-damped update (see z_update_step).
+        let e_in = gwqp_g[n];
+        let kind = evgw_update_kind(&qp_ctrl);
+        let (e_out, z, g0, dq) = one_shot_step(&qp_eq_func, e_in, qp_ctrl.evgw_z_step, forced_z(kind));
+        if scf_data.mol.ctrl.print_level > 1 && kind == EvgwUpdate::ZStep {
+            println!("  [z_update diag] d(Sigma-omega)/domega at h=1e-5: {:.4e}, h=1e-3: {:.4e}, h=1e-2: {:.4e}, h=5e-2: {:.4e}",
+                     central_difference(&qp_eq_func, e_in, 1.0e-5),
+                     central_difference(&qp_eq_func, e_in, 1.0e-3),
+                     central_difference(&qp_eq_func, e_in, 1.0e-2),
+                     central_difference(&qp_eq_func, e_in, 5.0e-2));
+        }
+        println!("Orbital #{} (AC, {}): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
+                 n, mode_label(kind), e_in, z, g0, dq, e_out);
+        qp_energy_no_fse = e_out;
+    } else if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
         // Static approximation: Σ_c evaluated at the KS energy.
         let sigma_static = match pade.evaluate_retarded(e_ks_n, ac_eta) {
             Ok(s) => s.re,
@@ -640,7 +1215,7 @@ pub fn single_orbital_gw_ac(
     }
     qp_energy_no_fse
 }
-pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&MatrixFull<f64>,ri_row_n:&MatrixFull<f64>,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,n:usize,num_freq:usize,vxc_nn:f64)->f64{
+pub fn single_orbital_gw(scf_data:&mut SCF,route:&ri_gw::GwTensorRoute,v_matrix:&MatrixFull<f64>,ri_ov:Option<&MatrixFull<f64>>,ri_row_n:&MatrixFull<f64>,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,n:usize,num_freq:usize,vxc_nn:f64)->f64{
     let start=Instant::now();
     let mut exchange=0.0;
     let gwqp_g=scf_data.gwqp.0.clone();
@@ -660,24 +1235,44 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let cdgw_eta = qp_ctrl.cdgw_eta;
     let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
+    // The generic solvers below still take a `&MatrixFull<f64>` slot for the
+    // (unused on the AO route) `ri_ov`; give them an empty matrix rather than a
+    // materialised `O(N^3)` tensor.
+    let empty_ri_ov = MatrixFull::empty();
+    let ri_ov_slot: &MatrixFull<f64> = ri_ov.unwrap_or(&empty_ri_ov);
     //let self_energy_static=ri_gw::contour_rayon(scf_data.eigenvalues[0][n],n,&gwqp_g, &gwqp_w, occ_size, vir_size, num_state,ri_ov,ri_row_n)-ri_gw::calculate_imag(w_c_at_freqs,num_state,n,scf_data.eigenvalues[0][n],&gwqp_g, &gwqp_w);
     // 第一轮：正常GW计算（不添加Fourier自能）
     let qp_eq_func_no_fse = |omega: f64| {
-        ri_gw::quasiparticle_equation(omega, n, consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs, cdgw_res_tol, cdgw_eta)
+        route.quasiparticle_equation(scf_data, ri_ov, omega, n, consts, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, ri_row_n, w_c_at_freqs, cdgw_res_tol, cdgw_eta)
     };
     //println!("Static Approximation Yields:{},Sigma_c[E_KS]={},consts={},E_ks={}",qp_eq_func_no_fse(scf_data.eigenvalues[0][n])+scf_data.eigenvalues[0][n],self_energy_static,consts,scf_data.eigenvalues[0][n]);
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
-    if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
+    if evgw_update_kind(&qp_ctrl) != EvgwUpdate::Root {
+        // MolGW-style Z-damped update (see z_update_step).
+        let e_in = gwqp_g[n];
+        let kind = evgw_update_kind(&qp_ctrl);
+        let (e_out, z, g0, dq) = one_shot_step(&qp_eq_func_no_fse, e_in, qp_ctrl.evgw_z_step, forced_z(kind));
+        if scf_data.mol.ctrl.print_level > 1 && kind == EvgwUpdate::ZStep {
+            println!("  [z_update diag] d(Sigma-omega)/domega at h=1e-5: {:.4e}, h=1e-3: {:.4e}, h=1e-2: {:.4e}, h=5e-2: {:.4e}",
+                     central_difference(&qp_eq_func_no_fse, e_in, 1.0e-5),
+                     central_difference(&qp_eq_func_no_fse, e_in, 1.0e-3),
+                     central_difference(&qp_eq_func_no_fse, e_in, 1.0e-2),
+                     central_difference(&qp_eq_func_no_fse, e_in, 5.0e-2));
+        }
+        println!("Orbital #{} ({}): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
+                 n, mode_label(kind), e_in, z, g0, dq, e_out);
+        qp_energy_no_fse = e_out;
+    } else if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
         qp_energy_no_fse = qp_eq_func_no_fse(e_ks_n) + e_ks_n;
         println!("Orbital #{}: |E_KS|={:.6} > gw_switch_fallback_threshold={:.6}, using static fallback QP energy={:.6}",
                  n, e_ks_n.abs(), qp_ctrl.gw_switch_fallback_threshold, qp_energy_no_fse);
     } else if rootfinder == "newton".to_string() {
         println!("Orbital #{} (first round, no Fourier self-energy):", n);
         qp_energy_no_fse = ri_gw::newton_solver(
-            |om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf| ri_gw::quasiparticle_equation(om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf, cdgw_res_tol, cdgw_eta),
-            n, consts, ri_ov, ri_row_n,
+            |om, nn, cc, _ov, rn, qpg, qpw, os, vs, ns, wcf| route.quasiparticle_equation(scf_data, ri_ov, om, nn, cc, qpg, qpw, os, vs, ns, rn, wcf, cdgw_res_tol, cdgw_eta),
+            n, consts, ri_ov_slot, ri_row_n,
             &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
             e_ks_n, 0.00001, 50, side, scf_data.mol.ctrl.print_level
         );
@@ -690,15 +1285,15 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
         if !have_crossing {
             println!("No graphical crossings found for n={}, using Newton solver instead.", n);
             qp_energy = ri_gw::newton_solver(
-                |om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf| ri_gw::quasiparticle_equation(om, nn, cc, ov, rn, qpg, qpw, os, vs, ns, wcf, cdgw_res_tol, cdgw_eta),
-                n, consts, ri_ov, ri_row_n,
+                |om, nn, cc, _ov, rn, qpg, qpw, os, vs, ns, wcf| route.quasiparticle_equation(scf_data, ri_ov, om, nn, cc, qpg, qpw, os, vs, ns, rn, wcf, cdgw_res_tol, cdgw_eta),
+                n, consts, ri_ov_slot, ri_row_n,
                 &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
                 e_ks_n, 0.00001, 50, side, scf_data.mol.ctrl.print_level
             );
         }
         qp_energy_no_fse = qp_energy;
         println!("First round QP energy (no FSE): {}", qp_energy_no_fse);
-        let self_energy_final=ri_gw::contour_rayon(qp_energy_no_fse,n,&gwqp_g, &gwqp_w, occ_size, vir_size, num_state,ri_ov,ri_row_n,cdgw_res_tol,cdgw_eta)-ri_gw::calculate_imag(w_c_at_freqs,num_state,n,qp_energy_no_fse,&gwqp_g, &gwqp_w);
+        let self_energy_final=route.contour(scf_data, ri_ov, qp_energy_no_fse,n,&gwqp_g, &gwqp_w, occ_size, vir_size, num_state,ri_row_n,cdgw_res_tol,cdgw_eta)-ri_gw::calculate_imag(w_c_at_freqs,num_state,n,qp_energy_no_fse,&gwqp_g, &gwqp_w);
         println!("Sigma_c[E_QP]={}",self_energy_final);
     } else {
         panic!("Invalid choice of GW rootfinder!");
@@ -734,13 +1329,13 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
                  origin, powers, t, sin_coeff, cos_coeff);
 
         let qp_eq_func_with_se = |omega: f64| {
-            ri_gw::quasiparticle_equation(omega, n, consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs, cdgw_res_tol, cdgw_eta)
+            route.quasiparticle_equation(scf_data, ri_ov, omega, n, consts, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, ri_row_n, w_c_at_freqs, cdgw_res_tol, cdgw_eta)
                 + ri_gw::fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin)
         };
 
         final_qp_energy = solve_with_self_energy(
             n, qp_eq_func_with_se, qp_energy_no_fse, side, &qp_ctrl, rootfinder,
-            consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
+            consts, ri_ov_slot, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
             scf_data.mol.ctrl.print_level, "Fourier"
         );
     } else if use_hermite {
@@ -750,13 +1345,13 @@ pub fn single_orbital_gw(scf_data:&mut SCF,v_matrix:&MatrixFull<f64>,ri_ov:&Matr
                  origin, hermite_coeff.len(), hermite_coeff);
 
         let qp_eq_func_with_se = |omega: f64| {
-            ri_gw::quasiparticle_equation(omega, n, consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs, cdgw_res_tol, cdgw_eta)
+            route.quasiparticle_equation(scf_data, ri_ov, omega, n, consts, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, ri_row_n, w_c_at_freqs, cdgw_res_tol, cdgw_eta)
                 + ri_gw::fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff)
         };
 
         final_qp_energy = solve_with_self_energy(
             n, qp_eq_func_with_se, qp_energy_no_fse, side, &qp_ctrl, rootfinder,
-            consts, ri_ov, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
+            consts, ri_ov_slot, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state, w_c_at_freqs,
             scf_data.mol.ctrl.print_level, "Hermite"
         );
     } else {
@@ -945,12 +1540,13 @@ pub fn gw_near_fermi_surface_ac(
     scf_data.gwqp = (gwqp.clone(), gwqp.clone());
     gwqp
 }
-pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,occ_threshold:f64,vir_threshold:f64)->Vec<f64>{
-    let mut ri_ov:MatrixFull<f64>=ri_bse::get_submatrix(scf_data,'O','V','Y');
-    println!("RI-OV Shape={:?}",ri_ov.size);
+pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,occ_threshold:f64,vir_threshold:f64,gw_ctx:&mut ri_gw::GwContext)->Vec<f64>{
+    let route=gw_ctx.route(scf_data);
+    let ri_ov:Option<MatrixFull<f64>>=route.ri_ov(scf_data);
+    println!("RI-OV Shape={:?} (AO route: None = never materialised)",ri_ov.as_ref().map(|m| m.size));
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let start=Instant::now();
-    let v_matrix=ri_gw::v_matrix_from_scf(scf_data);
+    let v_matrix=route.v_matrix(scf_data);
     let time1=start.elapsed();
     println!("V Matrix Constructed. This step took {:?}",time1);
     let ks_energies=scf_data.eigenvalues[0].clone();
@@ -967,19 +1563,18 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
     // imaginary-axis low-rank representation (w_c_lr) instead of the full W_c
     // matrix (w_c_at_freqs).
     let w_c_at_freqs: Vec<(f64, f64, MatrixFull<f64>)> = if need_full_wc {
-        if qp_ctrl.gw_imag_rayon {
-            ri_gw::generate_w_c(scf_data,&ri_ov,&scf_data.gwqp.0,&scf_data.gwqp.1,num_state,occ_size,vir_size,num_freq)
-        } else {
-            ri_gw::generate_w_c_serial(scf_data,&ri_ov,&scf_data.gwqp.0,&scf_data.gwqp.1,num_state,occ_size,vir_size,num_freq)
-        }
+        route.generate_w_c(scf_data,ri_ov.as_ref(),num_state,occ_size,vir_size,num_freq,!qp_ctrl.gw_imag_rayon)
     } else {
         Vec::new() // placeholder; v2 path uses w_c_lr instead
     };
 
+    let e_homo=ks_energies[occ_size-1];
+    let e_lumo=ks_energies[occ_size];
+
     let w_c_lr: Option<Vec<(f64, f64, ri_gw::LowRankVChiV)>> = if qp_ctrl.use_low_rank_contour && imag_lr_enabled {
         println!("Low-rank contour (v2): Generating imaginary-axis low-rank sqrt(v)*chi*sqrt(v)...");
         Some(ri_gw::generate_w_c_lowrank(
-            scf_data, &ri_ov, &scf_data.gwqp.1,
+            scf_data, ri_ov.as_ref().unwrap(), &scf_data.gwqp.1,
             occ_size, vir_size, num_freq, qp_ctrl.low_rank_tolerance,
         ))
     } else {
@@ -992,16 +1587,37 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
         let gwqp_g = scf_data.gwqp.0.clone();
         let gwqp_w = scf_data.gwqp.1.clone();
         let (start_mo_2,num_state_2,occ_size_2,vir_size_2,homo_2,lumo_2)=ri_gw::get_occupation_parameters(&scf_data,'Y');
-        let nsemin_demax = (occ_size_2.saturating_sub(1))
-            .saturating_sub(qp_ctrl.selfenergy_state_range)
-            .max(0);
-        let nsemax_demax = (occ_size_2 + qp_ctrl.selfenergy_state_range)
-            .min(num_state_2.saturating_sub(1));
+        // Range of states used by the `de_max` scan that sizes the real-axis grid.
+        //
+        // `de_max` is the largest |de| for which v*chi*v is needed and the
+        // real-axis grid is uniform on [0, de_max].  Scanning *all* states
+        // inflates it enormously -- pairing a deep core state as the scanned
+        // state with the HOMO as the pole gives de_max ~ 10-20 Ha, so a
+        // 64-point grid has a ~0.2-0.3 Ha spacing and the low-rank description
+        // of the valence region becomes worthless (measured single-pass error
+        // for C6H6: 1.4e-1 Ha, for CO2: 1.4e-2 Ha).  MolGW only scans
+        // `nsemin..nsemax`, i.e. the states whose self-energy it evaluates.
+        //
+        // Default (`low_rank_demax_window = true`): restrict the scan to the
+        // window of orbitals explicitly computed in this run.
+        let (win_lo, win_hi) = demax_window_bounds(
+            &ks_energies, occ_size, e_homo, e_lumo, occ_threshold, vir_threshold,
+        );
+        let (lo_cap, hi_cap) = if qp_ctrl.low_rank_demax_window {
+            (win_lo, win_hi)
+        } else {
+            (0, num_state_2.saturating_sub(1))
+        };
+        let nsemin_demax = lo_cap
+            .max((occ_size_2.saturating_sub(1)).saturating_sub(qp_ctrl.selfenergy_state_range));
+        let nsemax_demax = hi_cap
+            .min((occ_size_2 + qp_ctrl.selfenergy_state_range).min(num_state_2.saturating_sub(1)));
         let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
         let pl = scf_data.mol.ctrl.print_level;
-        Some(ri_gw::generate_real_axis_vchiv(
+        Some({
+            let mut ra = ri_gw::generate_real_axis_vchiv(
             &gwqp_g, &gwqp_w, occ_size_2, vir_size_2, num_state_2,
-            &ri_ov,
+            ri_ov.as_ref().unwrap(),
             qp_ctrl.nomega_chi_real,
             nsemin_demax, nsemax_demax,
             qp_ctrl.nomega_sigma,
@@ -1012,13 +1628,14 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
             pl,
             qp_ctrl.cdgw_eta,
             qp_ctrl.cdgw_res_tol,
-        ))
+            );
+            ra.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
+            ra
+        })
     } else {
         None
     };
 
-    let e_homo=ks_energies[occ_size-1];
-    let e_lumo=ks_energies[occ_size];
     // [DBG] KS-eigenvalue diagnostics (electron count / homo / window), only at print_level >= 2
     if scf_data.mol.ctrl.print_level >= 2 {
         println!("[DBG KS] occ_size={} start_mo={} num_state={} e_homo={:.12e} e_lumo={:.12e}", occ_size, start_mo, num_state, e_homo, e_lumo);
@@ -1036,7 +1653,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
     let calc_orbs:Vec<(usize,f64)>=if let Some(ref ra) = real_axis_vchiv {
         drop(ri_ov);
         calc_orbs_indices.iter().map(|&n|{
-            let ri_row_n=ri_gw::compute_ri3mo_row(scf_data,n);
+            let ri_row_n=route.ri_row(scf_data,n);
             if let Some(ref wlr) = w_c_lr {
                 // v2 path: imaginary-axis low-rank with pre-computed wc_rows.
                 let wc_rows = ri_gw::precompute_wc_rows_lowrank(wlr, &ri_row_n, num_state);
@@ -1048,8 +1665,8 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
         }).collect()
     } else {
         calc_orbs_indices.iter().map(|&n|{
-            let ri_row_n=ri_gw::compute_ri3mo_row(scf_data,n);
-            (n, single_orbital_gw(scf_data, &v_matrix, &ri_ov, &ri_row_n, &w_c_at_freqs, n, num_freq, vxc_nn[n]))
+            let ri_row_n=route.ri_row(scf_data,n);
+            (n, single_orbital_gw(scf_data, &route, &v_matrix, ri_ov.as_ref(), &ri_row_n, &w_c_at_freqs, n, num_freq, vxc_nn[n]))
         }).collect()
     };
     let occ_shift=calc_orbs[0].1-scf_data.eigenvalues[0][calc_orbs[0].0];
@@ -1061,14 +1678,28 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
         println!("high extrapolations:{}",num_state-1-calc_orbs[calc_orbs.len()-1].0);
         println!("Occ Shift={}, Vir Shift={}",occ_shift,vir_shift);
     }
+    // States outside the explicitly computed window.
+    //
+    // Default (REST historical behaviour): extrapolate them with the rigid
+    // shift of the lowest/highest computed orbital.
+    //
+    // `evgw_freeze_outside` selects MolGW's behaviour instead: those states
+    // keep their *initial* (Kohn-Sham) energies.  MolGW does this implicitly --
+    // `find_qp_energy_linearization` initialises `energy_qp_z = energy0` and
+    // only overwrites `nsemin..nsemax`, so the states outside the self-energy
+    // window are written back unchanged and never enter the self-consistent
+    // loop.  Extrapolating them instead (REST) makes their rigid shift a slow
+    // feedback channel into G and W.
+    let freeze_outside = qp_ctrl.evgw_freeze_outside && qp_ctrl.scgw == "evgw";
+    let baseline = &scf_data.eigenvalues[0];
     for i in 0 .. calc_orbs[0].0{
-        gwqp.push(scf_data.eigenvalues[0][i]+occ_shift)
+        gwqp.push(if freeze_outside {baseline[i]} else {baseline[i]+occ_shift})
     }
     for i in 0..calc_orbs.len(){
         gwqp.push(calc_orbs[i].1)
     }
     for i in calc_orbs[calc_orbs.len()-1].0+1 .. num_state{
-        gwqp.push(scf_data.eigenvalues[0][i]+vir_shift)
+        gwqp.push(if freeze_outside {baseline[i]} else {baseline[i]+vir_shift})
     }
     //println!("extrapolated GW Results:{:#?}",gwqp);
     ri_gw::display::extrapolation_quasiparticles(&gwqp,occ_size,&calc_orbs_indices,occ_threshold,vir_threshold);
@@ -1125,16 +1756,38 @@ fn single_orbital_gw_lowrank(
     let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
 
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let cdgw_eta = qp_ctrl.cdgw_eta;
+    let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
-    if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
+    if evgw_update_kind(&qp_ctrl) != EvgwUpdate::Root {
+        // MolGW-style Z-damped update (see z_update_step).
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
                 occ_size, vir_size, num_state,
-                w_c_at_freqs, real_axis_vchiv, 0, cdgw_eta,
+                w_c_at_freqs, real_axis_vchiv, 0, cdgw_res_tol,
+            )
+        };
+        let e_in = gwqp_g[n];
+        let kind = evgw_update_kind(&qp_ctrl);
+        let (e_out, z, g0, dq) = one_shot_step(&qp_eq_func, e_in, qp_ctrl.evgw_z_step, forced_z(kind));
+        if scf_data.mol.ctrl.print_level > 1 && kind == EvgwUpdate::ZStep {
+            println!("  [z_update diag] d(Sigma-omega)/domega at h=1e-5: {:.4e}, h=1e-3: {:.4e}, h=1e-2: {:.4e}, h=5e-2: {:.4e}",
+                     central_difference(&qp_eq_func, e_in, 1.0e-5),
+                     central_difference(&qp_eq_func, e_in, 1.0e-3),
+                     central_difference(&qp_eq_func, e_in, 1.0e-2),
+                     central_difference(&qp_eq_func, e_in, 5.0e-2));
+        }
+        println!("Orbital #{} (low-rank, {}): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
+                 n, mode_label(kind), e_in, z, g0, dq, e_out);
+        qp_energy_no_fse = e_out;
+    } else if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
+        let qp_eq_func = |omega: f64| {
+            ri_gw::quasiparticle_equation_lowrank(
+                omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
+                occ_size, vir_size, num_state,
+                w_c_at_freqs, real_axis_vchiv, 0, cdgw_res_tol,
             )
         };
         qp_energy_no_fse = qp_eq_func(e_ks_n) + e_ks_n;
@@ -1146,7 +1799,7 @@ fn single_orbital_gw_lowrank(
         qp_energy_no_fse = ri_gw::newton_solver_lowrank(
             n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
             w_c_at_freqs, real_axis_vchiv,
-            qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
+            qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
         );
         println!("QP energy (low-rank, no FSE): {}", qp_energy_no_fse);
     } else if rootfinder == "interpolation".to_string() {
@@ -1159,13 +1812,13 @@ fn single_orbital_gw_lowrank(
         ri_gw::quasiparticle_equation_lowrank(
             debug_omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
             occ_size, vir_size, num_state,
-            w_c_at_freqs, real_axis_vchiv, pl, cdgw_eta,
+            w_c_at_freqs, real_axis_vchiv, pl, cdgw_res_tol,
         );
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
                 occ_size, vir_size, num_state,
-                w_c_at_freqs, real_axis_vchiv, 0, cdgw_eta,
+                w_c_at_freqs, real_axis_vchiv, 0, cdgw_res_tol,
             )
         };
         // Use gwqp_g[n] as starting_point so the self-pole (de=0) at omega = qp_energy
@@ -1182,7 +1835,7 @@ fn single_orbital_gw_lowrank(
             qp_energy = ri_gw::newton_solver_lowrank(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 w_c_at_freqs, real_axis_vchiv,
-                qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
+                qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             );
         }
         qp_energy_no_fse = qp_energy;
@@ -1205,7 +1858,7 @@ fn single_orbital_gw_lowrank(
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
-                occ_size, vir_size, num_state,                 w_c_at_freqs, real_axis_vchiv, 0, cdgw_eta,
+                occ_size, vir_size, num_state,                 w_c_at_freqs, real_axis_vchiv, 0, cdgw_res_tol,
             ) + ri_gw::fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin)
         };
         let (have_crossing, qp) = ri_gw::linear_interpolation_solver(
@@ -1215,7 +1868,7 @@ fn single_orbital_gw_lowrank(
             ri_gw::newton_solver_lowrank(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 w_c_at_freqs, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
+                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             )
         } else {
             qp
@@ -1225,7 +1878,7 @@ fn single_orbital_gw_lowrank(
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
-                occ_size, vir_size, num_state,                 w_c_at_freqs, real_axis_vchiv, 0, cdgw_eta,
+                occ_size, vir_size, num_state,                 w_c_at_freqs, real_axis_vchiv, 0, cdgw_res_tol,
             ) + ri_gw::fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff)
         };
         let (have_crossing, qp) = ri_gw::linear_interpolation_solver(
@@ -1235,7 +1888,7 @@ fn single_orbital_gw_lowrank(
             ri_gw::newton_solver_lowrank(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 w_c_at_freqs, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
+                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             )
         } else {
             qp
@@ -1278,16 +1931,38 @@ fn single_orbital_gw_lowrank_v2(
     let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
 
     let qp_ctrl = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
-    let cdgw_eta = qp_ctrl.cdgw_eta;
+    let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
     let rootfinder = qp_ctrl.gw_rootfinder.clone();
     let qp_energy_no_fse;
 
-    if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
+    if evgw_update_kind(&qp_ctrl) != EvgwUpdate::Root {
+        // MolGW-style Z-damped update (see z_update_step).
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank_v2(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
                 occ_size, vir_size, num_state,
-                wc_rows, real_axis_vchiv, 0, cdgw_eta,
+                wc_rows, real_axis_vchiv, 0, cdgw_res_tol,
+            )
+        };
+        let e_in = gwqp_g[n];
+        let kind = evgw_update_kind(&qp_ctrl);
+        let (e_out, z, g0, dq) = one_shot_step(&qp_eq_func, e_in, qp_ctrl.evgw_z_step, forced_z(kind));
+        if scf_data.mol.ctrl.print_level > 1 && kind == EvgwUpdate::ZStep {
+            println!("  [z_update diag] d(Sigma-omega)/domega at h=1e-5: {:.4e}, h=1e-3: {:.4e}, h=1e-2: {:.4e}, h=5e-2: {:.4e}",
+                     central_difference(&qp_eq_func, e_in, 1.0e-5),
+                     central_difference(&qp_eq_func, e_in, 1.0e-3),
+                     central_difference(&qp_eq_func, e_in, 1.0e-2),
+                     central_difference(&qp_eq_func, e_in, 5.0e-2));
+        }
+        println!("Orbital #{} (low-rank v2, {}): E_in={:.8} Z={:.6} qp_eq(E_in)={:.8} dq={:.6e} -> E_out={:.8}",
+                 n, mode_label(kind), e_in, z, g0, dq, e_out);
+        qp_energy_no_fse = e_out;
+    } else if e_ks_n.abs() > qp_ctrl.gw_switch_fallback_threshold {
+        let qp_eq_func = |omega: f64| {
+            ri_gw::quasiparticle_equation_lowrank_v2(
+                omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
+                occ_size, vir_size, num_state,
+                wc_rows, real_axis_vchiv, 0, cdgw_res_tol,
             )
         };
         qp_energy_no_fse = qp_eq_func(e_ks_n) + e_ks_n;
@@ -1299,7 +1974,7 @@ fn single_orbital_gw_lowrank_v2(
         qp_energy_no_fse = ri_gw::newton_solver_lowrank_v2(
             n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
             wc_rows, real_axis_vchiv,
-            qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
+            qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
         );
         println!("QP energy (low-rank v2, no FSE): {}", qp_energy_no_fse);
     } else if rootfinder == "interpolation".to_string() {
@@ -1308,13 +1983,13 @@ fn single_orbital_gw_lowrank_v2(
         ri_gw::quasiparticle_equation_lowrank_v2(
             debug_omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
             occ_size, vir_size, num_state,
-            wc_rows, real_axis_vchiv, pl, cdgw_eta,
+            wc_rows, real_axis_vchiv, pl, cdgw_res_tol,
         );
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank_v2(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
                 occ_size, vir_size, num_state,
-                wc_rows, real_axis_vchiv, 0, cdgw_eta,
+                wc_rows, real_axis_vchiv, 0, cdgw_res_tol,
             )
         };
         let qp_start = gwqp_g[n];
@@ -1326,7 +2001,7 @@ fn single_orbital_gw_lowrank_v2(
             qp_energy = ri_gw::newton_solver_lowrank_v2(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 wc_rows, real_axis_vchiv,
-                qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
+                qp_start, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             );
         }
         qp_energy_no_fse = qp_energy;
@@ -1349,7 +2024,7 @@ fn single_orbital_gw_lowrank_v2(
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank_v2(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
-                occ_size, vir_size, num_state, wc_rows, real_axis_vchiv, 0, cdgw_eta,
+                occ_size, vir_size, num_state, wc_rows, real_axis_vchiv, 0, cdgw_res_tol,
             ) + ri_gw::fourier_self_energy::fourier_series(&sin_coeff, &cos_coeff, powers, t, omega - origin)
         };
         let (have_crossing, qp) = ri_gw::linear_interpolation_solver(
@@ -1359,7 +2034,7 @@ fn single_orbital_gw_lowrank_v2(
             ri_gw::newton_solver_lowrank_v2(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 wc_rows, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
+                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             )
         } else {
             qp
@@ -1369,7 +2044,7 @@ fn single_orbital_gw_lowrank_v2(
         let qp_eq_func = |omega: f64| {
             ri_gw::quasiparticle_equation_lowrank_v2(
                 omega, n, consts, ri_row_n, &gwqp_g, &gwqp_w,
-                occ_size, vir_size, num_state, wc_rows, real_axis_vchiv, 0, cdgw_eta,
+                occ_size, vir_size, num_state, wc_rows, real_axis_vchiv, 0, cdgw_res_tol,
             ) + ri_gw::fourier_self_energy::sigma_hermite(origin, omega, &hermite_coeff)
         };
         let (have_crossing, qp) = ri_gw::linear_interpolation_solver(
@@ -1379,7 +2054,7 @@ fn single_orbital_gw_lowrank_v2(
             ri_gw::newton_solver_lowrank_v2(
                 n, consts, ri_row_n, &gwqp_g, &gwqp_w, occ_size, vir_size, num_state,
                 wc_rows, real_axis_vchiv,
-                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_eta,
+                qp_energy_no_fse, 0.00001, 50, side, scf_data.mol.ctrl.print_level, cdgw_res_tol,
             )
         } else {
             qp

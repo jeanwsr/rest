@@ -3,11 +3,12 @@
 //
 // Provides TDA and full-LR entry points that build matvec closures using
 // TDDFT's a_matvec / b_matvec functions and pass them to the generic FEAST
-// algorithm in ri_bse::feast_solver.
+// algorithm in solvers::feast.
 // ============================================================================
 
-use crate::scf_io::SCF;
 use crate::ri_tddft::matvec;
+use crate::scf_io::SCF;
+use crate::solvers::feast;
 
 /// TDA branch: solve A*x = omega*x using FEAST.
 ///
@@ -51,7 +52,7 @@ pub fn feast_solve_tddft_tda(
     // B-matrix = I (standard eigenvalue problem)
     let feast_b_matvec = |z: &Vec<f64>| -> Vec<f64> { z.clone() };
 
-    let mut result: Vec<(f64, Vec<f64>)> = crate::ri_bse::feast_solver::feast(
+    let mut result: Vec<(f64, Vec<f64>)> = feast::feast(
         dim,
         &feast_a_matvec,
         &feast_b_matvec,
@@ -134,7 +135,7 @@ pub fn feast_solve_tddft_lr(
             let b = matvec::b_matvec(scf, data, p, xlet);
             a.into_iter().zip(b.into_iter()).map(|(a, b)| a + b).collect()
         };
-        crate::ri_bse::feast_solver::cg(
+        feast::cg(
             &apb_matvec,
             z,
             cg_max_iter,
@@ -162,7 +163,7 @@ pub fn feast_solve_tddft_lr(
     let gmres_b_mul = |z: &Vec<f64>| -> Vec<f64> { z.clone() };
 
     // Run FEAST — returns (omega^2, X+Y) pairs
-    let eigenpairs_xpy = crate::ri_bse::feast_solver::feast(
+    let eigenpairs_xpy = feast::feast(
         dim,
         &feast_a_matvec,
         &feast_b_matvec,

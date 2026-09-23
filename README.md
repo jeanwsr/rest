@@ -20,10 +20,10 @@
      2. 体系相关: `spin`, `charge`, `spin_polarization`等
   - 仅当使用了`opt_engine=geometric_pyo3`时，才要申明[geometric_pyo3]区
   - 当调用geometric_pyo3引擎做缺省的最稳结构优化时，不需要申请[geometric_pyo3]
-  - 调用的方法的关键词是否使用"xc"，不能无中生有地用其它的关键词，比如“method"等
+  - 调用的方法的关键词是否使用"xc"，不能无中生有地用其它的关键词，比如"method"等
   - D3BJ、D3以及D4是经验色散校正，需要用`empirical_dispersion`申明。比如"X3LYP-D3BJ"方法需要拆分成"xc=x3lyp"和"empirical_dispersion=d3bj"
   - 关键词`spin`和`charge`是在`[ctrl]`区，而不是在`[geom]`区
-  - 分子结构的关键词是`position`，不能无中生有地用其它的关键词——比如“coord"和"molecule"等
+  - 分子结构的关键词是`position`，不能无中生有地用其它的关键词——比如"coord"和"molecule"等
   - 分子结构`position`的申明使用String，比如
 `
 """
@@ -56,6 +56,7 @@
 - `numerical_force`: 取值布尔类型。是否计算数值力。缺省为false
 - `nforce_displacement`:　取值f64类型。数值力计算中的结构位移值，缺省是0.0013 Bohr
 - `ndipole_displacement`:　取值f64类型。数值Dipole计算中的外电场位移值，缺省是3.0E-4 Bohr
+- `check_stab`: 取值String类型。SCF收敛后进行波函数稳定性分析，与 `[tddft] stability` 等价。详见 TD-DFT计算相关设置的稳定性分析一节。
 
 ## 计算体系相关关键词（Keyword）
 - `charge`：取值f64类型。体系的总电荷数
@@ -351,7 +352,7 @@ fp_mode = "FP64"
 输入卡关键词包括：
 - `ss_factor`: 取值f64。采用 Spin-Component-Scaled 方式计算 MP2 型相关能（SCS-MP2）时, 用于控制自旋平行（same spin）分量贡献的缩放系数，适用于 `xc` 关键词为 MP2、SCS-MP2或双杂化泛函，以及 `post_correlation` 设置为 PT2 的情况。缺省为 None，即依 `xc` 设置的泛函进行设定。
 - `os_factor`: 取值f64。适用场景与 `ss_factor` 一致，采用 SCS-MP2 方法计算相关能贡献时，用于缩放自旋反平行（opposite spin）分量贡献的系数。缺省为 None，即依 `xc` 设置的泛函进行设定。
-- `fp_mode`: 取值 String (`"FP32"`, `"FP64"`)。设置 RI-PT2 计算中使用的浮点精度。仅当 `new_driver = true` 时生效。缺省为 `"FP32"`。对于数值梯度计算，建议设置为 `"FP64"` 以获得更高的数值稳定性。
+- `fp_mode`: 取值 String (`"FP32"`, `"FP64"`, `"TF32"`)。设置 RI-PT2 计算中使用的浮点精度。缺省为 `"FP32"`。在 `new_driver = true` 的 CPU 驱动、`engine = "torch"` 以及 PT2 解析响应核（rgfock）中生效；`"TF32"` 仅在 `engine = "torch"` 时有效（f32 存储 + TF32 张量核 matmul），CPU 驱动下自动回退为 `"FP32"`。对于数值梯度计算，建议设置为 `"FP64"` 以获得更高的数值稳定性。
 - `mpi_mode`: 取值 usize。设置 RI-PT2 计算中使用的 MPI 模式。缺省为 0，即不使用 MPI。
 
 #### PT2 算法选择
@@ -385,6 +386,8 @@ REST 提供三种 PT2 实现算法，通过以下关键词选择：
 | 2 | `streaming = true`（缺省）且非 MPI 且 `use_ri_symm = true` 且 PT2 | **流式算法** |
 | 3 | 其它情况 | 原始 legacy 算法 |
 
+**注意**：若设置 `engine = "torch"` 且满足其适用条件（CUDA、非 MPI、PT2 家族、RHF/UHF），则优先使用 torch 引擎（见下节）。
+
 **输入卡示例**：
 
 ```toml
@@ -408,6 +411,33 @@ new_driver = true
 fp_mode = "FP32"
 ```
 
+#### Torch 引擎（GPU 加速）
+
+设置 `engine = "torch"` 后，PT2 成对电子相关能张量乘法由 PyTorch 内核（`dfmp2_addons`）实现；AO→MO 变换等仍在 CPU 上完成。适用条件：单节点计算（不支持 MPI）、`xc` 属于 PT2 家族、参考态为 RHF 或 UHF（ROHF 请使用缺省的 `engine = "cpu"`）、整数占据（不支持 smearing/分数占据，此时请使用 `engine = "cpu"`）；不满足条件时程序直接报错，不会静默回退到 CPU 驱动。相关关键词包括：
+- `engine`: 取值 String（`"cpu"`、`"torch"`）。缺省为 `"cpu"`，即不采用 Torch 引擎的 GPU 加速。
+- `torch_devices`: 取值 `Vec<usize>`。torch 引擎使用的 CUDA 设备列表（逻辑设备号，受 `CUDA_VISIBLE_DEVICES` 过滤），缺省为 `[0]`。多设备驱动（设备列表含 2+ 设备，或 `torch_force_batch_inter = true`）要求至少 8 倍于 GPU 数的相关占据轨道，过小的体系请使用单 GPU。
+- `torch_force_batch_inter`: 取值 bool。缺省为 false。当 `torch_devices` 只含一个设备时，强制启用分批的 intra+inter 方案（占据空间切成若干簇，逐簇上传 cderi 切片和轨道块），从而降低单卡显存峰值。这是单卡 GPU 显存溢出（OOM）时的补救选项。
+- `torch_nbatch`: 取值 usize。分批 intra+inter 方案的占据簇数目，缺省根据各设备空闲显存自动选择。仅多设备驱动路径（`torch_devices` 含 2+ 设备或 `torch_force_batch_inter = true`）使用。
+- `torch_fold`: 取值 String（`"F32Acc"`、`"F64"`、`"F32"`）。f32 matmul 结果逐元素能量折叠的精度。缺省为 `"F32Acc"`（f32 折叠、对能以 f64 累加）；`"F64"` 最慢但最准；`"F32"` 最快但精度最低。仅对 `fp_mode = "FP32"/"TF32"` 生效。
+- `torch_batch`: 取值 usize。torch 引擎 j≤i 收缩循环中占据对的批大小，缺省 16；设为 0 表示一次完成全部对。值越大单次 GEMM 越大，FLOPS 利用率更高但显存开销稍高。
+
+输入卡示例：
+```toml
+# 单 GPU（缺省设备 0，等价于 torch_devices = [0]）
+[ctrl.ri_pt2]
+engine = "torch"
+
+# 双 GPU 分摊占据轨道
+[ctrl.ri_pt2]
+engine = "torch"
+torch_devices = [0, 1]
+
+# 单卡显存不足时分批计算
+[ctrl.ri_pt2]
+engine = "torch"
+torch_force_batch_inter = true
+```
+
 ## RRS-PBC计算相关设置
 RRS-PBC方法是由张颖教授等提出的一种基于分子团簇计算结果的周期性电子结构模拟方法，相关论文见 Zhang, I.Y., Jiang, J., Gao, B. *et al.* RRS-PBC: a molecular approach for periodic systems. [*Sci. China Chem.* **57**, 1399–1404 (2014)](https://doi.org/10.1007/s11426-014-5183-y)。在 REST 中，RRS-PBC 相关的设置主要在 `[geom]` 区块中进行，请参考后续的说明。`[ctrl]`区块中的相关关键词包括：
 - `pbc_eigenval`: 取值String，用于指定存储k点和能级信息的文件路径。如果设置为`"none"`或`"None"`则直接打印到标准输出。缺省为`"none"`。
@@ -418,21 +448,54 @@ GW-BSE方法相关的设置在 `[quasiparticle_methods]` 区块中进行。GW计
 
 ### GW计算设置
 
-GW计算通过 `gw_or_bse = “gw”` 启动（也内置于 `”bse”` 模式中）。
+GW计算通过 `gw_or_bse = "gw"` 启动（也内置于 `"bse"` 模式中）。
 
-- `gw_or_bse`: 取值String，必须参数。设置为 `”gw”` 开启GW准粒子能量计算，设置为 `”bse”` 在自动完成GW计算后进一步进行BSE激发能计算（当配合 `gw_scheme = “parse from file”` 时，BSE从文件读取预先计算的准粒子能量而不重新计算GW）。缺省为空，不触发任何计算。
+- `gw_or_bse`: 取值String，必须参数。设置为 `"gw"` 开启GW准粒子能量计算，设置为 `"bse"` 在自动完成GW计算后进一步进行BSE激发能计算（当配合 `gw_scheme = "parse from file"` 时，BSE从文件读取预先计算的准粒子能量而不重新计算GW）。缺省为空，不触发任何计算。
 - `gw_scheme`: 取值String，决定GW准粒子方程的求解方式。可选项：
-    - `”extrapolated”`（**推荐**）：在费米面附近一定能量窗口内精确求解准粒子方程，其余轨道通过外推获得。兼备高效率与准确性，适合大多数体系。
-    - `”linearize”`：线性化GW准粒子方程，对所有轨道逐一求解。
-    - `”qp equation”`：直接数值求解准粒子方程。
-    - `”parse from file”`：从文件读取预先计算的准粒子能量（配合 `parse_qp_path`），跳过GW计算直接进入BSE。
-    - 缺省为 `”no gw”`。
+    - `"extrapolated"`（**推荐**）：在费米面附近一定能量窗口内精确求解准粒子方程，其余轨道通过外推获得。兼备高效率与准确性，适合大多数体系。
+    - `"linearize"`：线性化GW准粒子方程，对所有轨道逐一求解。
+    - `"qp equation"`：直接数值求解准粒子方程。
+    - `"parse from file"`：从文件读取预先计算的准粒子能量（配合 `parse_qp_path`），跳过GW计算直接进入BSE。
+    - 缺省为 `"no gw"`。
 - `scgw`: 取值String，决定GW的自洽方案。可选项：
-    - `”g0w0”`（缺省）：单次GW计算，不做自洽迭代。
-    - `”evgw”`：本征值自洽GW（evGW），迭代更新准粒子能量中的G部分。需配合 `evgw_rounds` 设置迭代次数。
-- `evgw_rounds`: 取值usize，evGW自洽迭代的轮数。仅在 `scgw = “evgw”` 时需要设置。缺省为0。
-- `gw_extrapolate_occ_threshold`: 取值f64，单位Hartree。在 `gw_scheme = “extrapolated”` 方案中，决定费米面以下精确求解准粒子方程的能量窗口。计算范围包括KS轨道能量落在 `[HOMO - gw_extrapolate_occ_threshold, HOMO]` 的占据轨道。缺省为0.1。
-- `gw_extrapolate_vir_threshold`: 取值f64，单位Hartree。在 `gw_scheme = “extrapolated”` 方案中，决定费米面以上精确求解准粒子方程的能量窗口。计算范围包括KS轨道能量落在 `[LUMO, LUMO + gw_extrapolate_vir_threshold]` 的虚轨道。缺省为0.1。
+    - `"g0w0"`（缺省）：单次GW计算，不做自洽迭代。
+    - `"evgw"`：本征值自洽GW（evGW），迭代更新准粒子能量中的G部分。需配合 `evgw_rounds` 设置迭代次数。
+- `evgw_rounds`: 取值usize，evGW自洽迭代的轮数（上限）。仅在 `scgw = "evgw"` 时需要设置。缺省为0。
+
+#### evGW 外循环收敛控制
+
+evGW 的本质是对映射 `E^(k+1) = F(E^(k))`（`F` = 一轮完整 GW）做不动点迭代。与 PySCF、MolGW 的经验一致，**不做任何加速的朴素迭代对多数分子不会收敛**：`F` 的 Jacobian 在不动点附近有接近甚至超过单位模的特征值，迭代会落入极限环；若再叠加低秩等离面路径中"最近格点"选取带来的分段常值（不连续）误差，连迭代轨迹的逐次可复现性都会丧失。
+
+REST 提供**两种可选的 evGW 求解技巧**，由 `evgw_solver` 选择：
+
+- `evgw_solver`: 取值String，evGW 外循环求解技巧。
+    - `"molgw"`（缺省）：**MolGW 实际执行的更新规则**——每个轨道每轮只做**一次求值**
+      `E_out = consts + Σ_c(E_in)`（`Z ≡ 1`，不求根、不阻尼）。MolGW 的 `selfenergy_init` 对 `EVSC` 技术只设 `se%nomega = 0`，所以 `find_qp_energy_linearization` 里的 Z 分支是死代码；MolGW 的输出表逐位验证了 `E_qp = E0 + SigX−Vxc + SigC`（`E0` 恒为 KS 能量）。**每轮不在循环内求解准粒子方程**是消除 REST 对粗糙低秩实轴网格的敏感性、以及消除"卫星根跳变"的关键。实测（20 组独立运行）：NH3 5/5、CH4 5/5、CO2 5/5 收敛。
+    - `"diis"`：每轮做一次完整 GW 迭代（逐轨道精确求解准粒子方程），再对整条准粒子能量矢量做 **Pulay/DIIS（Anderson）外推**（PySCF 的做法）。实测对 CO2 只有 1/5 收敛，故不再是缺省。
+    - `"z_update"`：Z 阻尼（线性化牛顿）单步更新，每个轨道每轮只走一步
+      `E_out = E_in + Z · (consts + Σ_c(E_in) − E_in)`，其中 `Z = 1/(1 − ∂Σ_c/∂ω)` 并被截断到 [0, 1]（对应 MolGW `m_selfenergy_tools.f90` 中 `find_qp_energy_linearization` 的 `MIN(MAX(zz,0),1)` 分支）。使用该选项时不再施加 DIIS。
+    - `"molgw"`：MolGW 的 evGW 实际执行的更新规则——每个轨道每轮只做一次求值
+      `E_out = consts + Σ_c(E_in)`（即 `E_in + 1.0 · (consts + Σ_c(E_in) − E_in)`，`Z ≡ 1`）。
+
+- `evgw_freeze_outside`: 取值bool，缺省 `true`。evGW 中如何处理精确计算窗口之外的轨道：
+    - `true`（缺省，MolGW 行为）：让它们保持初始（Kohn–Sham）能量，与 MolGW 一致——MolGW 的 `find_qp_energy_linearization` 先把 `energy_qp_z = energy0` 初始化，只覆盖 `nsemin..nsemax`，窗口外的态原样写回，从而**完全不参与自洽循环**。REST 的刚性外推会让这些态的能量每轮都被重新推导，构成一条额外的慢反馈通道（进入 G 的极点与 W 的分母）。
+- `evgw_z_step`: 取值f64，单位Hartree。`z_update` 中用于计算 `∂Σ_c/∂ω` 的中心差分步长。缺省 `0.01`（与 MolGW `step_sigma` 的缺省一致）。
+
+  该步长必须同时满足两个尺度条件：明显大于最小的虚轴求积频点（`num_freq = 20` 时约为 `1.7e-3 Ha`），且不大于留数判据 `cdgw_res_tol`（否则差分被截断偏差污染）。
+
+- `evgw_degeneracy_tol`: 取值f64，单位Hartree，缺省 `1e-4`。evGW 的简并投影容差。
+
+- `evgw_diis`: 取值bool，缺省 `true`。是否对整条准粒子能量矢量做 Pulay/DIIS 外推。它叠加在 `evgw_solver` 所选用的每轮映射之上。
+- `evgw_diis_space`: DIIS 历史长度。缺省 8。
+- `evgw_diis_start`: 至少积累多少个残差矢量后才启用外推。缺省 2。
+- `evgw_diis_safeguard`: 取值bool。缺省 `false`，即标准 DIIS 行为（允许自由外推，仅在结果非有限或严重发散时回退到阻尼步）。设为 `true` 时改用更保守的区间约束回退。
+- `evgw_damping`: 取值f64，取值区间 `(0, 1]`。线性混合/阻尼因子 α。
+- `evgw_conv_tol`: 取值f64，单位Hartree。收敛判据：一轮内 `max_n |E_n^out - E_n^in|` 小于该值即认为收敛。缺省 `1e-5`。
+- `evgw_stop_on_convergence`: 取值bool。达到 `evgw_conv_tol` 后是否提前结束（否则始终跑满 `evgw_rounds` 轮）。缺省 `true`。
+- `evgw_report`: 取值bool。是否每轮打印收敛报告（`max|dE_qp|`、`|dG|`、最大步长、HOMO/LUMO 准粒子能量与 gap）。缺省 `true`。
+
+- `gw_extrapolate_occ_threshold`: 取值f64，单位Hartree。在 `gw_scheme = "extrapolated"` 方案中，决定费米面以下精确求解准粒子方程的能量窗口。计算范围包括KS轨道能量落在 `[HOMO - gw_extrapolate_occ_threshold, HOMO]` 的占据轨道。缺省为0.1。
+- `gw_extrapolate_vir_threshold`: 取值f64，单位Hartree。在 `gw_scheme = "extrapolated"` 方案中，决定费米面以上精确求解准粒子方程的能量窗口。计算范围包括KS轨道能量落在 `[LUMO, LUMO + gw_extrapolate_vir_threshold]` 的虚轨道。缺省为0.1。
 
 ### Renormalized Singles（rsGW）
 
@@ -452,30 +515,13 @@ Renormalized Singles方法通过投影DFT密度矩阵构造单激发HF哈密顿�
   - `print_level > 2` 时程序会额外做一次自洽性校验，打印
     `max|(ia|P)_RS - Σ U U (rs|P)_KS|` 与 `max|mu_RS - Uᵀ mu_KS U|`（应为机器零），用于确认 RI AO2MO 确实使用了新的轨道系数。
 
-  读取 `rs_orbitals.dat`（`#` 开头为注释行，其余按顺序为 `nao nmo`、`e_rs`、`C_rs`、`e_ks`、`C_ks`、`U`；矩阵按"每个轨道一行"存放）：
-
-  ```python
-  import numpy as np
-  lines = [l for l in open("rs_orbitals.dat") if not l.startswith("#")]
-  nao, nmo = map(int, lines[0].split()); i = 1
-  e_rs = np.array([float(x) for x in lines[i].split()]); i += 1
-  C_rs = np.array([[float(x) for x in lines[i+k].split()] for k in range(nmo)]); i += nmo
-  e_ks = np.array([float(x) for x in lines[i].split()]); i += 1
-  C_ks = np.array([[float(x) for x in lines[i+k].split()] for k in range(nmo)]); i += nmo
-  U    = np.array([[float(x) for x in lines[i+k].split()] for k in range(nmo)])
-  # 每行是一个轨道的AO系数: C_rs.T == U.T @ C_ks.T ; 把RS表象的(i,a)振幅换回KS表象:
-  # A_ks = U[:occ,:occ].T ... 见上式 A_KS = U_o A_RS U_v^T
-  ```
-
-> **注意**：`rs_full_space = false`（块对角化）且 `w_rs = true` 而 `rs_use_rs_orbitals = false` 时，写回轨道系数矩阵的是历史实现所用的转置旋转 `C_ks·Uᵀ`，它并不对角化HF哈密顿量。为兼容既有计算结果，该历史行为保持不变；需要变分一致的轨道基时请设置 `rs_use_rs_orbitals = true`（`rs_full_space = true` 的路径两者等价）。两种旋转给出的准粒子能量差别可达 ~0.1 Ha。
-
 rsGW 输入卡示例（完整轨道空间HF对角化 + RS轨道用于RI AO2MO）：
 
 ```toml
 [quasiparticle_methods]
-gw_or_bse = “gw”
-gw_scheme = “extrapolated”
-scgw = “g0w0”
+gw_or_bse = "gw"
+gw_scheme = "extrapolated"
+scgw = "g0w0"
 renormalized_singles = true
 rs_full_space = true
 rs_use_rs_orbitals = true
@@ -487,17 +533,31 @@ use_low_rank_contour = true
 
 
 - `use_low_rank_contour`: 取值bool，设置为 `true` 启用低秩等离面加速。缺省为false。
-- `low_rank_grid_type`: 取值String，实轴极化率Chi的采样格点分布方式。`”linear”`（缺省）为线性分布；`”quadratic”` 为二次幂律分布，在零能附近更密集。
+- `low_rank_grid_type`: 取值String，实轴极化率Chi的采样格点分布方式。`"linear"`（缺省）为线性分布；`"quadratic"` 为二次幂律分布，在零能附近更密集。
+- `low_rank_interp`: 取值String，实轴低秩 `v·χ·v` 在格点之间的取值方式。
+    - `"linear"`（缺省）：在相邻两个格点之间做**线性插值**（`M(ω) = (1−t) M_i + t M_{i+1}`；由于留数收缩 `rᵀMr = Σ_v (r·e_v)² λ_v` 对特征向量的符号与次序均不变，两侧的低秩分解可以直接分别收缩再按权重相加，无需特征向量匹配）。
+    - `"nearest"`：取最近格点（分段常值）。这是 REST 的历史行为，也与 MolGW `sf_interpolate_vsqrt_chi_vsqrt` 中只做 `MINLOC` 的做法一致；保留用于复现旧结果或做 A/B 对比。
+
+>
 - `nomega_chi_real`: 取值usize，实轴极化率Chi的采样格点数。缺省为6。增大此值可提高精度但增加计算量。
+- `low_rank_demax_window`: 取值bool，缺省 `false`(扫描全部轨道)。低秩实轴网格的 `de_max` 扫描范围。
+
 - `nomega_sigma`: 取值usize，自能Sigma实轴扫描点数（每侧），在de_max扫描中使用。缺省为10。
 - `step_sigma`: 取值f64，自能Sigma实轴扫描步长，单位Hartree。缺省为0.05。
 
 > **精度提示**：如果 GW 计算窗口包含深占据轨道或高虚轨道，低秩实轴插值需要更密的频率格点。此时应增大 `nomega_chi_real`（例如提高到 1000–5000 或更高），否则这些轨道的 QP 能量以及后续 BSE 激发能可能不够准确。对于仅关心 HOMO/LUMO 附近或低激发态的情况，可以使用较小的 `nomega_chi_real` 以节省计算时间。
 
+低秩路径涉及的另外两个参数：
+
+- `cdgw_eta`: 取值f64，单位Hartree。实轴响应函数 χ₀(ω) 的 Lorentzian 展宽 η。缺省 `1e-3`。它与 `nomega_chi_real` 共同决定低秩实轴表示的精度：实轴格点间距需与 η 相称，否则相邻格点上的 `v·χ·v` 差异过大（低秩路径按"最近格点"取值，见下），单轮 GW 的误差可达 1e-3 Ha 量级。需要提高精度时优先增大 `nomega_chi_real`。
+>
+- `cdgw_res_tol`: 取值f64，单位Hartree。CD-GW 中极点/留数的数值判据：`de >= -cdgw_res_tol` 时计入该极点，`|de| < cdgw_res_tol` 时按半权重 ×0.5 计入；`de_max` 扫描同样使用该阈值。缺省 `1e-3`。
+
+
 ### GW求解器通用参数
 
-- `gw_rootfinder`: 取值String，准粒子方程求根方法。`”newton”`（缺省）为Newton法求根；`”interpolation”` 为插值求根。
-- `gw_search_grid`: 取值usize，插值求根法的搜索格点数。仅当 `gw_rootfinder = “interpolation”` 时生效。缺省为51。
+- `gw_rootfinder`: 取值String，准粒子方程求根方法。`"newton"`（缺省）为Newton法求根；`"interpolation"` 为插值求根。
+- `gw_search_grid`: 取值usize，插值求根法的搜索格点数。仅当 `gw_rootfinder = "interpolation"` 时生效。缺省为51。
 - `gw_span_energy`: 取值f64，单位Hartree，插值求根法的能量扫描范围。缺省为0.2。
 - `gw_linearize_shift`: 取值f64，线性化GW中的有限差分位移量，单位Hartree。缺省为0.01。
 
@@ -511,21 +571,28 @@ use_low_rank_contour = true
 - `ac_pade_step_ratio`: 取值f64，PySCF 风格 Padé 采样的步长衰减比（< 1.0 时低频更密）。缺省为 2/3。
 - `gw_switch_fallback_threshold`: 取值f64。当 |E_KS| 超过此值时退化为静态近似。缺省为 1e6。
 
-### GW结果输出
+### GW结果导出
 
 - `save_qp`: 取值bool，设置为 `true` 将准粒子能量保存到文件。缺省为false。
-- `save_qp_path`: 取值String，保存准粒子能量的文件路径。缺省为 `”single_qp_path.txt”`。
-- `parse_qp_path`: 取值String，从文件读取准粒子能量的路径。当 `gw_scheme = “parse from file”` 时从此路径读取预先计算的准粒子能量用于后续BSE计算。缺省为 `”./qp_energies”`。
+- `save_qp_path`: 取值String，保存准粒子能量的文件路径。缺省为 `"single_qp_path.txt"`。
+- `parse_qp_path`: 取值String，从文件读取准粒子能量的路径。当 `gw_scheme = "parse from file"` 时从此路径读取预先计算的准粒子能量用于后续BSE计算。缺省为 `"./qp_energies"`。
+
+#### GW/evGW 断点续算
+
+- `save_gw_checkpoint`: 取值bool，缺省 `false`。GW 完成后及每轮 evGW 结束时，把后自洽场状态写入 `[ctrl] chkfile` 的 `rest_gw_checkpoint` 组（不另建文件，要求 `chkfile` 非 `"none"`）。更新方式为"复制到 `<chkfile>.tmp` → 替换该组 → 改名回去"，写入中途被打断不会损坏 chkfile。
+- `resume_from_checkpoint`: 取值bool，缺省 `false`。从 chkfile 恢复状态并**跳过 SCF 迭代**：若存入的是已完成的 GW，连 GW/evGW 一并跳过、直接进入 BSE/响应；若存入的是进行中的 evGW，从保存的那一轮继续（需 `scgw = "evgw"`）。
+
+续算时在同一 `chkfile` 上把 `resume_from_checkpoint` 改为 `true` 即可；想多跑几轮，同时调大 `evgw_rounds`。
 
 ### BSE计算设置
 
-BSE计算在 `gw_or_bse = “bse”` 时进行，在GW准粒子能量（或从文件读取的准粒子能量）基础上构建BSE kernel并对角化求解垂直激发能。
+BSE计算在 `gw_or_bse = "bse"` 时进行，在GW准粒子能量（或从文件读取的准粒子能量）基础上构建BSE kernel并对角化求解垂直激发能。
 
 - `bse_tda`: 取值bool，设置为 `true` 使用Tamm-Dancoff近似（仅保留BSE kernel的A子矩阵），设置为 `false`（缺省）使用完整BSE（包含A和B子矩阵的非TDA计算）。TDA近似计算量更小，通常对低能激发态精度足够。
 - `bse_spin`: 取值String，必须参数。指定计算的自旋激发类型（**限制性参考态**）：
-    - `”singlet”`：单重态激发。
-    - `”triplet”`：三重态激发。
-    - `”both”`：同时计算单重态和三重态激发。
+    - `"singlet"`：单重态激发。
+    - `"triplet"`：三重态激发。
+    - `"both"`：同时计算单重态和三重态激发。
     - 对**非限制参考态**（`spin_polarization = true`，UBSE）该关键词不选择自旋通道，
       只作为 BSE 开关；`"triplet"` / `"both"` 已移除，详见"Unrestricted GW-BSE（UGW/UBSE）设置"一节。
 - `bse_cutoff_energy`: 取值f64，单位Hartree。KS能级高于此能量的虚轨道将被排除在BSE激发空间之外，缩减BSE kernel维度。建议根据体系设置为合理值（含几百条虚轨道即可），缺省为1e6（几乎不截断）。
@@ -541,25 +608,25 @@ BSE计算在 `gw_or_bse = “bse”` 时进行，在GW准粒子能量（或从�
 G0W0计算（使用extrapolated方案和低秩等离面加速）：
 ```toml
 [ctrl]
-xc = “pbe”
-basis_path = “def2-TZVP”
-auxbas_path = “def2-TZVP-ri”
+xc = "pbe"
+basis_path = "def2-TZVP"
+auxbas_path = "def2-TZVP-ri"
 charge = 0.0
 spin = 1
 
 [geom]
-name = “H2O”
-unit = “angstrom”
-position = “””
+name = "H2O"
+unit = "angstrom"
+position = """
     O  0.0000000000      0.0000000000      0.0000000000
     H  0.0000000000      0.7569500000      0.5858820000
     H  0.0000000000     -0.7569500000      0.5858820000
-“””
+"""
 
 [quasiparticle_methods]
-gw_or_bse = “gw”
-gw_scheme = “extrapolated”
-scgw = “g0w0”
+gw_or_bse = "gw"
+gw_scheme = "extrapolated"
+scgw = "g0w0"
 threshold = 0.1
 use_low_rank_contour = true
 ```
@@ -567,10 +634,20 @@ use_low_rank_contour = true
 evGW计算（使用rsGW初始化和低秩围道变形加速）：
 ```toml
 [quasiparticle_methods]
-gw_or_bse = “gw”
-gw_scheme = “extrapolated”
-scgw = “evgw”
+gw_or_bse = "gw"
+gw_scheme = "extrapolated"
+scgw = "evgw"
 evgw_rounds = 5
+# 外循环求解技巧与收敛判据（缺省即为下列取值；'diis' 鲁棒性最好，'z_update' 在
+# 无近简并前线轨道的体系上更快，但两者互斥）
+evgw_solver = "diis"        # 或 "z_update"（Z 阻尼牛顿单步）/ "molgw"（MolGW 的单次求值）
+evgw_freeze_outside = false # true = 窗口外轨道保持 KS 能量（MolGW 行为）
+evgw_diis = true
+evgw_diis_space = 8
+evgw_damping = 1.0
+evgw_z_step = 0.01          # 仅 evgw_solver = "z_update" 时使用
+evgw_conv_tol = 1e-5
+evgw_stop_on_convergence = true
 renormalized_singles = true
 w_rs = true
 threshold = 0.1
@@ -582,12 +659,12 @@ use_low_rank_contour = true
 BSE单重态激发计算（TDA近似，Davidson迭代求解10个激发态）：
 ```toml
 [quasiparticle_methods]
-gw_or_bse = “bse”
-gw_scheme = “extrapolated”
-scgw = “g0w0”
+gw_or_bse = "bse"
+gw_scheme = "extrapolated"
+scgw = "g0w0"
 threshold = 0.15
 use_low_rank_contour = true
-bse_spin = “singlet”
+bse_spin = "singlet"
 bse_tda = true
 davidson_target_excitations = 10
 bse_davidson_solver = true
@@ -597,11 +674,11 @@ bse_cutoff_energy = 20.0
 BSE三重态完整（非TDA）计算：
 ```toml
 [quasiparticle_methods]
-gw_or_bse = “bse”
-gw_scheme = “extrapolated”
-scgw = “g0w0”
+gw_or_bse = "bse"
+gw_scheme = "extrapolated"
+scgw = "g0w0"
 use_low_rank_contour = true
-bse_spin = “triplet”
+bse_spin = "triplet"
 bse_tda = false
 davidson_target_excitations = 6
 bse_davidson_solver = true
@@ -611,10 +688,10 @@ bse_cutoff_energy = 15.0
 BSE同时计算单重态和三重态（从文件读取准粒子能量）：
 ```toml
 [quasiparticle_methods]
-gw_or_bse = “bse”
-gw_scheme = “parse from file”
-parse_qp_path = “./qp_energies.txt”
-bse_spin = “both”
+gw_or_bse = "bse"
+gw_scheme = "parse from file"
+parse_qp_path = "./qp_energies.txt"
+bse_spin = "both"
 bse_tda = true
 davidson_target_excitations = 10
 bse_davidson_solver = true
@@ -713,7 +790,7 @@ davidson_converge_threshold = 1e-8
 
 ## TD-DFT计算相关设置
 
-TD-DFT方法相关的设置在 `[tddft]` 区块中进行。REST支持基于RI积分的TD-DFT激发能计算，包括TDA近似和完整线性响应两种方案，可计算单重态和三重态的垂直激发能。
+TD-DFT方法相关的设置在 `[tddft]` 区块中进行。REST支持基于RI积分的TD-DFT激发能计算，包括TDA近似和完整线性响应两种方案，支持限制性（单重态/三重态）与非限制（UHF/UKS）参考态，并支持范围分离杂化（RSH）泛函。
 
 ### 基础设置
 
@@ -721,17 +798,11 @@ TD-DFT方法相关的设置在 `[tddft]` 区块中进行。REST支持基于RI积
     - `"tda"`：Tamm-Dancoff近似，仅求解A子矩阵的本征值问题。计算量较小，对低能激发态通常与完整线性响应精度相当。
     - `"lr"`（缺省）：完整线性响应，同时使用A和B子矩阵，对激发能的描述更完备。
 - `tddft_spin`: 取值String，指定**限制性**（自旋适配）参考态的自旋通道：
-    - `"singlet"`（缺省）：单重态激发，库仑耦合因子为2。
+    - `"singlet"`：单重态激发，库仑耦合因子为2。限制性参考态不设置该关键词时缺省取 `"singlet"`。
     - `"triplet"`：三重态激发，库仑耦合因子为0；仅 AO 模式（需同时设 `tddft_mode = "ao"`）支持。
     - `"both"`：先算单重态、再算三重态；同样仅 AO 模式支持，`pysoc = true` 的 PySOC 导出需要此项。
     - 其它取值将报错。
-    - **该关键词不适用于非限制参考态**（`spin_polarization = true`，即非限制 TD-DFT，UTDDFT）。
-      非限制 TD-DFT 只有一个合法的响应通道：库仑（Hartree）核与自旋无关，它把 α、β 两个块耦合在一起；
-      而"库仑因子 2 / 0"这一对只对**可以旋转到单/三重态子空间**的限制性参考态成立。
-      因此 UTDDFT 不存在"去库仑"的第二个通道，`"triplet"` / `"both"` 会被直接拒绝；
-      若在非限制计算中写了缺省值 `"singlet"`，程序会忽略它并给出提示（建议直接从输入中删除该关键词）。
-      注意：对自旋对称的参考态，非限制通道的本征谱**本身就同时包含单重态型与三重态型根**
-      （三重态型根的振子强度≈0），这是该算符的固有性质，而不是需要额外选择的通道。
+    - **该关键词不适用于UTDDFT**：显式设置任何取值（包括 `"singlet"`）都会报错。
 - `nroots`: 取值usize，需要计算的激发态数目（根的数目）。缺省为6。
 - `tddft_cutoff_energy`: 取值f64，单位Hartree。KS轨道能量高于此值的虚轨道将被排除在TD-DFT激发空间之外。设置合理值（如20.0-100.0）可显著缩减激发空间维度，加速计算。缺省为1e6（几乎不截断）。
 - `tddft_mode`: 取值String，选择TD-DFT计算模式：`"mo"`（缺省，MO-basis RI）/ `"ao"`（AO-basis）。
@@ -750,6 +821,23 @@ REST默认使用Davidson迭代对角化算法求解TD-DFT本征值问题。
 ### XC Kernel设置
 
 - `tddft_use_optimized_fxc`: 取值bool，设置为 `true`（缺省）使用rayon并行的优化fxc kernel加速矩阵-矢量积运算。一般用户无需修改。
+
+### SCF稳定性分析
+
+在SCF收敛后，可以对参考态波函数做稳定性分析。该分析基于TDDFT Hessian（轨道Hessian的最低本征值，由Davidson求解器计算），仅做检查（不改变波函数）：
+
+- `stability`: 取值String，选择要进行的稳定性检查：
+    - `"off"`（缺省）：不做稳定性分析
+    - `"internal"`：内部稳定性检查（RHF/RKS：轨道Hessian `4(A^S+B^S)`；UHF/UKS：轨道Hessian `2(A+B)`）
+    - `"external"`：外部稳定性检查（RHF/RKS参考态：RHF→UHF通道 `(A^T+B^T)`；UHF/UKS参考态暂不支持）
+    - `"full"`：同时进行内部与外部检查
+    - `"auto"`（**推荐**）：自动选择参考态适用的所有检查：RHF/RKS 为内部 + 外部检查；UHF/UKS 为内部检查（UHF→GHF 外部检查尚未实现）。目前与 `"full"` 行为一致；`"full"` 的含义保持固定（内部 + 外部），未来 `"auto"` 可能随方法/参考态扩展新的检查
+- `stability_nroots`: 取值usize，Hessian Davidson求解的最低本征值数目。缺省为3。
+- `stability_tol`: 取值f64，Hessian Davidson收敛阈值。缺省为1e-8。
+
+注意：
+- 仅支持RHF/RKS与UHF/UKS参考态（ROHF暂不支持）。
+- 设置 `stability ≠ "off"` 后，程序只做稳定性分析，不再进行TD-DFT激发能计算。
 
 ### 输入卡示例
 
@@ -810,7 +898,7 @@ auxbas_path = "/path/to/cc-pvdz-rifit"
 [tddft]
 tddft_method = "tda"
 nroots = 6
-# 不要设置 tddft_spin：非限制参考态只有一个自旋耦合通道
+# 不要设置 tddft_spin：非限制参考态不适用该关键词，任何显式取值（包括 "singlet"）都会报错
 ```
 
 ## 解析Hessian计算相关设置
