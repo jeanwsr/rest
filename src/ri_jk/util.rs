@@ -6,6 +6,18 @@ pub fn get_cint_mol(mol_obj: &Molecule) -> CInt {
 }
 
 pub fn get_cint_aux(mol_obj: &Molecule) -> CInt {
+    get_cint_aux_on_path(mol_obj, &mol_obj.ctrl.auxbas_path)
+}
+
+/// [`get_cint_aux`] on an auxiliary basis given by `auxbas_path` instead of the molecule's own
+/// `ctrl.auxbas_path` (same value format; pool names are resolved by the basis machinery).
+///
+/// The molecule is only read: the auxiliary-basis information is regenerated from a local copy of
+/// the keywords, and nothing on `mol_obj` is modified.
+pub fn get_cint_aux_on_path(mol_obj: &Molecule, auxbas_path: &str) -> CInt {
+    let mut ctrl = mol_obj.ctrl.clone();
+    ctrl.auxbas_path = auxbas_path.to_owned();
+
     let etb = if mol_obj.ctrl.even_tempered_basis == true {
         let etb_elem = get_etb_elem(&mol_obj.geom, &mol_obj.ctrl.etb_start_atom_number);
         let etb_basis = etb_gen_for_atom_list(&mol_obj, &mol_obj.ctrl.etb_beta, &etb_elem);
@@ -14,7 +26,7 @@ pub fn get_cint_aux(mol_obj: &Molecule) -> CInt {
         None
     };
 
-    let (_, atm, bas, env, _, _, _) = Molecule::collect_auxbas(&mol_obj.ctrl, &mol_obj.geom, etb);
+    let (_, atm, bas, env, _, _, _) = Molecule::collect_auxbas(&ctrl, &mol_obj.geom, etb);
     let mut cint = CInt::new();
     cint.initial_r2c(&atm, atm.len() as _, &bas, bas.len() as _, &env);
     cint.set_cint_type(mol_obj.cint_type);

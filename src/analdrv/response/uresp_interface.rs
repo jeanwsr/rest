@@ -16,6 +16,7 @@
 use crate::analdrv::config::AnalDrvRespCfg;
 use crate::analdrv::prelude::*;
 use crate::analdrv::response::rresp_interface::scf_jk_factors;
+use crate::ri_jk::resp_auxbas;
 use crate::dft::numint_matmul::nimatmul::NIMatmul;
 use crate::dft::numint_matmul::resp_uks::URespKSNIMatmul;
 use crate::dft::Grids;
@@ -349,18 +350,16 @@ impl<'a> URespSCF<'a> {
 
 /// Build the response (fock/response) objects for a converged unrestricted SCF.
 pub fn uscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> URespSCF<'a> {
-    let device = DeviceBLAS::default();
     let mut resp_list: Vec<Box<dyn URespAPI + 'a>> = Vec::new();
 
     // --- RI-JK --- //
 
     let (factor_j, factor_k, rsh) = scf_jk_factors(scf_data);
 
+    // decomposed ERI of the RI-JK response object: its own definition — the freshly built one of
+    // `resp_auxbas_path` when set (owned), otherwise the SCF rimatr (borrowed, zero copy)
     {
-        let (rimatr, _, _) = scf_data.rimatr.as_ref().expect(
-            "This implementation requires cholesky decomposed ERI (or rimatr) to be available and stored in memory.",
-        );
-        let cderi = rimatr.to_rstsr_view(&device).into_cow();
+        let cderi = resp_auxbas::cderi(scf_data, config);
         resp_list.push(Box::new(URespRIJK::new_with_cderi(factor_j, factor_k, cderi)));
     }
 
@@ -368,10 +367,7 @@ pub fn uscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> URe
     // object reusing the full-range implementation; it evaluates on the short-range `rimatr_sr`
     // ERI, with no Coulomb part (factor_j = 0).
     if let Some((_omega, factor_k_sr)) = rsh {
-        let (rimatr_sr, _, _) = scf_data.rimatr_sr.as_ref().expect(
-            "The range-separated response requires the short-range ERI (rimatr_sr) to be built and stored in memory.",
-        );
-        let cderi_sr = rimatr_sr.to_rstsr_view(&device).into_cow();
+        let cderi_sr = resp_auxbas::cderi_sr(scf_data, config);
         resp_list.push(Box::new(URespRIJK::new_with_cderi(0.0, factor_k_sr, cderi_sr)));
     }
 

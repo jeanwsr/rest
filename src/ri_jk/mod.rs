@@ -39,6 +39,9 @@ pub mod hess_u;
 pub mod resp_r;
 pub mod resp_u;
 
+// response-specific auxiliary basis (`resp_auxbas_path`)
+pub mod resp_auxbas;
+
 // generalized fock implementations
 pub mod gfock_r;
 

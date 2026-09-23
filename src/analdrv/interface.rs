@@ -3,6 +3,7 @@
 use crate::analdrv::config::{AnalDrvConfig, AnalDrvTask, MultipoleRdm1Relax};
 use crate::analdrv::hessian::hess_interface;
 use crate::analdrv::multipole::interface::{multipole_interface, MultipoleOutput};
+use crate::ri_jk::resp_auxbas::validate_resp_auxbas;
 use crate::analdrv::response::rgfock_interface;
 use crate::analdrv::response::rresp_interface;
 use crate::analdrv::response::rresp_interface::rscf_resp_interface;
@@ -92,6 +93,11 @@ pub fn analdrv_interface(scf_data: &mut SCF, tasks: &[AnalDrvTask], config: &Ana
     }
 
     let need_resp = has_hessian || multipole_relaxed_dh;
+
+    // response-specific auxiliary basis (`resp_auxbas_path`): validate it against this run's
+    // tasks here; the response objects pick it up per component when they are built
+    validate_resp_auxbas(scf_data, config, need_resp);
+
     let mut resp_obj = if need_resp {
         match scf_data.scftype {
             SCFType::RHF => Some(RespSCF::R(rscf_resp_interface(scf_data, config))),
