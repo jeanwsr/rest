@@ -377,7 +377,7 @@ pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTDa
             .zip(xc_data.dfa_paramr_scf.iter())
             .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Polarized)))
             .collect();
-        let (_vxc0, fxc_eff_u) = crate::dft::numint_matmul::hess_uks::eval_vxc_fxc_uks_from_rho(
+        let (_vxc0, fxc_eff_u) = crate::dft::numint_matmul::resp_uks::eval_vxc_fxc_uks_from_rho(
             &xc_func_list_pol, rho0_u.view());
         (rho0_u, fxc_eff_u)
     } else {
