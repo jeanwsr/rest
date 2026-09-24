@@ -29,6 +29,7 @@ pub mod ao2mo;
 pub mod decompose;
 pub mod direct;
 pub mod incore;
+pub mod pair_screened_rij;
 pub mod schwartz_rij;
 
 // hessian implementations
@@ -46,6 +47,7 @@ pub use ao2mo::*;
 pub use decompose::*;
 pub use direct::*;
 pub use incore::*;
+pub use pair_screened_rij::*;
 pub use pure_ao2mo::*;
 pub use pure_decompose::*;
 pub use pure_direct::*;

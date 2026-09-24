@@ -116,6 +116,21 @@ pub struct SCF {
     /// Per-geometry engine of the `ri-schwartz` RI-J algorithm, built in
     /// `prepare_necessary_integrals` when `algorithm_j = ri-schwartz` is set.
     pub schwartz_rij_engine: Option<std::sync::Arc<ri_jk::RIJSchwartzEngine>>,
+    /// Static per-pair bounds of the in-core RI-J/RI-K screening, built in
+    /// `prepare_necessary_integrals` when `[ctrl.ri_jk] pair_screen_threshold` is positive.
+    ///
+    /// These bounds belong to the **full** pair space and are the input of the storage-level
+    /// pruning; the screening kernels themselves work on `rimatr_pair_map`.
+    pub rimatr_pair_screen: Option<ri_jk::RIMatrPairScreen>,
+    /// Row description of the storage-level pruned `rimatr` (and of every other tensor that
+    /// shares its AO-pair space), built in `prepare_necessary_integrals` when
+    /// `[ctrl.ri_jk] pair_screen_threshold` is positive.
+    ///
+    /// `None` means the stored tensors keep the full pair space, and the J/K contractions then
+    /// take the unscreened kernels. The full-space tables `basbas2baspar` / `baspar2basbas`
+    /// keep their meaning in both cases, so only the consumers that read the compacted rows have
+    /// to go through this map.
+    pub rimatr_pair_map: Option<ri_jk::PairMap>,
     pub solvent_static_obj: Option<PcmObject>,
     pub solvent_scf: Option<PcmScf>,
     pub scf_converged: bool,
@@ -194,6 +209,8 @@ impl SCF {
             gwqp_spin:([Vec::new(),Vec::new()],[Vec::new(),Vec::new()]),
             algorithm_jk: AlgorithmJK::Default,
             schwartz_rij_engine: None,
+            rimatr_pair_screen: None,
+            rimatr_pair_map: None,
             solvent_static_obj: None,
             solvent_scf: None,
             scf_converged: false,
@@ -522,6 +539,64 @@ impl SCF {
                 ri_jk::RIJSchwartzEngine::build(mol, aux, ri_jk_opt.schwartz_threshold, ri_jk_opt.schwartz_overlap_tol2, self.mol.ctrl.j2c_decomp);
             info!("Schwartz-screened RI-J engine built ({} shell pairs).", engine.pairs.pairs.len());
             self.schwartz_rij_engine = Some(std::sync::Arc::new(engine));
+        }
+
+        // storage-level AO-pair pruning of the in-core RI tensor: the rows of the stored
+        // (metric-transformed) three-center tensor whose static row bound is negligible are
+        // dropped, and the compacted tensor is described by `rimatr_pair_map`.
+        //
+        // The J/K contractions then read the tensor through that map, so the full-space tables
+        // `basbas2baspar` / `baspar2basbas` of the tuple keep their meaning for every other
+        // consumer. The paths that still index the tensor with the full tables (post-SCF,
+        // derivatives, response, the density-based K variants) are pinned down by the guard in
+        // `main_driver`.
+        let pair_screen_threshold = self.mol.ctrl.ri_jk.pair_screen_threshold;
+        if pair_screen_threshold > 0.0 {
+            if let Some((rimatr, basbas2baspar, baspar2basbas)) = self.rimatr.take() {
+                let nao = basbas2baspar.size()[0];
+                let mut screen = ri_jk::RIMatrPairScreen::build(&rimatr, &basbas2baspar, nao);
+                // In MPI the auxiliary functions are distributed over the ranks, so the local row
+                // maxima are only partial: without the global maximum every rank would keep a
+                // different pair set and the reduced J/K would miss the dropped contributions.
+                #[cfg(feature = "mpi")]
+                if let Some(mpi_op) = mpi_operator {
+                    let mut global = mpi_reduce(&mpi_op.world, &screen.bounds, 0, &SystemOperation::max());
+                    mpi_broadcast_vector(&mpi_op.world, &mut global, 0);
+                    screen.bounds = global;
+                }
+                info!(
+                    "In-core RI pair screening enabled (threshold {:.1e}, {} AO pairs).",
+                    pair_screen_threshold,
+                    screen.bounds.len()
+                );
+
+                let num_baspar_full = screen.bounds.len();
+                let pruned = ri_jk::prune_rimatr(rimatr, &screen, &baspar2basbas, pair_screen_threshold);
+                let num_kept = pruned.map.len();
+                info!(
+                    "Storage-level AO-pair pruning: {} of {} AO-pair rows stored ({:.2}%), \
+                     the full-space pair tables are unchanged.",
+                    num_kept,
+                    num_baspar_full,
+                    100.0 * num_kept as f64 / num_baspar_full.max(1) as f64
+                );
+                // The short-range 3c tensor of a range-separated hybrid is indexed by the same AO
+                // pairs, so it is compacted onto the very same rows: one shared selection keeps
+                // the in-core tensors of the SCF on one layout.
+                if let Some((rimatr_sr, basbas2baspar_sr, baspar2basbas_sr)) = self.rimatr_sr.take() {
+                    let pruned_sr = ri_jk::prune_rimatr_to_map(
+                        rimatr_sr, &pruned.map, &basbas2baspar_sr);
+                    info!(
+                        "Storage-level AO-pair pruning of the short-range (RSH) 3c tensor: \
+                         {} rows stored.",
+                        pruned_sr.map.len()
+                    );
+                    self.rimatr_sr = Some((pruned_sr.ri3fn, basbas2baspar_sr, baspar2basbas_sr));
+                }
+                self.rimatr = Some((pruned.ri3fn, basbas2baspar, baspar2basbas));
+                self.rimatr_pair_screen = Some(screen);
+                self.rimatr_pair_map = Some(pruned.map);
+            }
         }
 
         // initial eigenvectors and eigenvalues
@@ -1714,22 +1789,25 @@ impl SCF {
         let spin_channel = self.mol.spin_channel;
         let mut vk: Vec<MatrixUpper<f64>> = vec![];
         let spin_channel = self.mol.spin_channel;
-        let m = self.m.clone().unwrap();
-        let tab_ao = self.tab_ao.clone().unwrap();
+        // Borrowed, not cloned. Both are read-only here, and the ISDF interpolation matrix is
+        // [n_ip, n_ip] with n_ip = isdf_k * naux: cloning it would copy hundreds of MB to GBs once
+        // per SCF iteration and raise the peak by the same amount.
+        let m = self.m.as_ref().expect("ISDF interpolation matrix is not built");
+        let tab_ao = self.tab_ao.as_ref().expect("tabulated AO is not built");
         let n_ip = m.size[0];
 
         for i_spin in 0..spin_channel{
             let mut dm_s = &self.density_matrix[i_spin];
             let nw = occupied_orbital_count(&self.occupation[i_spin]);
             let mut kernel_mid = MatrixFull::new([n_ip,num_basis], 0.0);
-            _dgemm(&tab_ao,(0..num_basis, 0..n_ip),'T',
+            _dgemm(tab_ao,(0..num_basis, 0..n_ip),'T',
                 dm_s,(0..num_basis,0..num_basis),'N',
                 &mut kernel_mid, (0..n_ip, 0..num_basis),
                 1.0,0.0);
 
             let mut kernel = MatrixFull::new([n_ip,n_ip], 0.0);
             _dgemm(&kernel_mid,(0..n_ip, 0..num_basis),'N',
-            &tab_ao, (0..num_basis, 0..n_ip),'N',
+            tab_ao, (0..num_basis, 0..n_ip),'N',
             &mut kernel, (0..n_ip,0..n_ip),
             1.0, 0.0);
 
@@ -1738,13 +1816,13 @@ impl SCF {
             });
 
             let mut tmp = MatrixFull::new([num_basis, n_ip], 0.0);
-            _dgemm(&tab_ao,(0..num_basis,0..n_ip),'N',
+            _dgemm(tab_ao,(0..num_basis,0..n_ip),'N',
             &kernel,(0..n_ip,0..n_ip),'N',
             &mut tmp, (0..num_basis,0..n_ip),
             1.0, 0.0);
             let mut vk_i = MatrixFull::new([num_basis, num_basis], 0.0);
             _dgemm(&tmp,(0..num_basis,0..n_ip),'N',
-            &tab_ao,(0..num_basis,0..n_ip),'T',
+            tab_ao,(0..num_basis,0..n_ip),'T',
             &mut vk_i, (0..num_basis,0..num_basis),
             1.0, 0.0);
             vk.push(vk_i.to_matrixupper());
@@ -1760,8 +1838,11 @@ impl SCF {
         let mut vk: Vec<MatrixUpper<f64>> = vec![];
         let eigv = &self.eigenvectors;
         let spin_channel = self.mol.spin_channel;
-        let m = self.m.clone().unwrap();
-        let tab_ao = self.tab_ao.clone().unwrap();
+        // Borrowed, not cloned. Both are read-only here, and the ISDF interpolation matrix is
+        // [n_ip, n_ip] with n_ip = isdf_k * naux: cloning it would copy hundreds of MB to GBs once
+        // per SCF iteration and raise the peak by the same amount.
+        let m = self.m.as_ref().expect("ISDF interpolation matrix is not built");
+        let tab_ao = self.tab_ao.as_ref().expect("tabulated AO is not built");
         let n_ip = m.size[0];
 
         for i_spin in 0..spin_channel{
@@ -1770,7 +1851,7 @@ impl SCF {
 
             let mut tab_mo = MatrixFull::new([nw,n_ip], 0.0);
             _dgemm(&eigv[i_spin],(0..num_basis, 0..nw),'T',
-                &tab_ao,(0..num_basis,0..n_ip),'N',
+                tab_ao,(0..num_basis,0..n_ip),'N',
                 &mut tab_mo, (0..nw, 0..n_ip),
                 1.0,0.0);
 
@@ -1785,14 +1866,14 @@ impl SCF {
             });
 
             let mut tmp = MatrixFull::new([num_basis, n_ip], 0.0);
-            _dgemm(&tab_ao,(0..num_basis,0..n_ip),'N',
+            _dgemm(tab_ao,(0..num_basis,0..n_ip),'N',
             &zip_m_mo,(0..n_ip,0..n_ip),'N',
             &mut tmp, (0..num_basis,0..n_ip),
             1.0, 0.0);
 
             let mut vk_i = MatrixFull::new([num_basis, num_basis], 0.0);
             _dgemm(&tmp,(0..num_basis,0..n_ip),'N',
-            &tab_ao,(0..num_basis,0..n_ip),'T',
+            tab_ao,(0..num_basis,0..n_ip),'T',
             &mut vk_i, (0..num_basis,0..num_basis),
             1.0, 0.0);
 
@@ -2128,14 +2209,26 @@ impl SCF {
                         if self.rimatr_sr.is_some() {
                             let dm = &self.density_matrix;
                             // rimatr_sr is aux-column-distributed under MPI: use the
-                            // MPI-aware kernel (per-rank partial contraction + reduce)
-                            vk_upper_with_rimatr_use_dm_only_sync_mpi(
-                                &self.rimatr_sr,
-                                dm,
-                                spin_channel,
-                                scaling_ksr,
-                                mpi_operator,
-                            )
+                            // MPI-aware kernel (per-rank partial contraction + reduce).
+                            // Under storage pruning the short-range tensor is compacted onto the
+                            // rows of rimatr_pair_map, so the same map addresses it.
+                            match &self.rimatr_pair_map {
+                                Some(map) => vk_upper_with_rimatr_use_dm_only_pruned_mpi(
+                                    &self.rimatr_sr,
+                                    map,
+                                    dm,
+                                    spin_channel,
+                                    scaling_ksr,
+                                    mpi_operator,
+                                ),
+                                None => vk_upper_with_rimatr_use_dm_only_sync_mpi(
+                                    &self.rimatr_sr,
+                                    dm,
+                                    spin_channel,
+                                    scaling_ksr,
+                                    mpi_operator,
+                                ),
+                            }
                         } else if self.ri3fn_sr.is_some() {
                             let dm = &self.density_matrix;
                             vk_upper_with_ri_v_use_dm_only_sync(&self.ri3fn_sr, dm, spin_channel, scaling_ksr)
@@ -2901,9 +2994,16 @@ impl SCF {
 
         let spin_channel = self.mol.spin_channel;
         let dm = &self.density_matrix;
+        let pair_screen_threshold = self.mol.ctrl.ri_jk.pair_screen_threshold;
 
         if self.mol.ctrl.use_ri_symm {
-            vj_upper_with_rimatr_sync_mpi(&self.rimatr, dm, spin_channel, scaling_factor, mpi_operator)
+            if pair_screen_threshold > 0.0 && self.rimatr_pair_map.is_some() {
+                vj_upper_with_rimatr_screened_mpi(
+                    &self.rimatr, &self.rimatr_pair_map, dm,
+                    spin_channel, scaling_factor, pair_screen_threshold, mpi_operator)
+            } else {
+                vj_upper_with_rimatr_sync_mpi(&self.rimatr, dm, spin_channel, scaling_factor, mpi_operator)
+            }
         } else {
             //vj_upper_with_ri_v_sync(&self.ri3fn, dm, spin_channel, scaling_factor)
             //if self.mol.ctrl.use_isdf && !self.mol.ctrl.isdf_k_only && !self.mol.ctrl.isdf_new{
@@ -2928,17 +3028,31 @@ impl SCF {
         //let num_auxbas = self.mol.num_auxbas;
         //let npair = num_basis*(num_basis+1)/2;
         let spin_channel = self.mol.spin_channel;
+        let pair_screen_threshold = self.mol.ctrl.ri_jk.pair_screen_threshold;
 
         if self.mol.ctrl.use_ri_symm {
             if use_dm_only {
                 let dm = &self.density_matrix;
-                vk_upper_with_rimatr_use_dm_only_sync_mpi(&self.rimatr, dm, spin_channel, scaling_factor, mpi_operator)
+                // the density-based K is a consumer of the compacted rows as well: with storage
+                // pruning it goes through the map, otherwise through the unpruned kernel
+                match &self.rimatr_pair_map {
+                    Some(map) => vk_upper_with_rimatr_use_dm_only_pruned_mpi(
+                        &self.rimatr, map, dm, spin_channel, scaling_factor, mpi_operator),
+                    None => vk_upper_with_rimatr_use_dm_only_sync_mpi(
+                        &self.rimatr, dm, spin_channel, scaling_factor, mpi_operator),
+                }
             } else {
                 let eigv = &self.eigenvectors;
                 let occupation = &self.occupation;
                 let num_elec = &self.mol.num_elec;
                 //vk_upper_with_rimatr_sync(&mut self.rimatr, eigv, num_elec, occupation, spin_channel, scaling_factor)
-                vk_upper_with_rimatr_sync_mpi(&self.rimatr, eigv, num_elec, occupation, spin_channel, scaling_factor,mpi_operator)
+                if pair_screen_threshold > 0.0 && self.rimatr_pair_map.is_some() {
+                    vk_upper_with_rimatr_screened_mpi(
+                        &self.rimatr, &self.rimatr_pair_map, eigv, num_elec, occupation,
+                        spin_channel, scaling_factor, pair_screen_threshold, mpi_operator)
+                } else {
+                    vk_upper_with_rimatr_sync_mpi(&self.rimatr, eigv, num_elec, occupation, spin_channel, scaling_factor,mpi_operator)
+                }
             }
         } else if self.mol.ctrl.isdf_new{
             self.generate_vk_with_isdf_new(scaling_factor)
@@ -2965,8 +3079,14 @@ impl SCF {
         let spin_channel = self.mol.spin_channel;
 
         if self.mol.ctrl.use_ri_symm {
+            // note: with ISDF the in-core tensor `rimatr` is not built at all, so this branch
+            // only ever sees `None` here; the map dispatch keeps the compacted rows readable if
+            // that ever changes
             let dm = &self.density_matrix;
-            vk_upper_with_rimatr_use_dm_only_sync(&self.rimatr, dm, spin_channel, scaling_factor)
+            match &self.rimatr_pair_map {
+                Some(map) => vk_upper_with_rimatr_use_dm_only_pruned(&self.rimatr, map, dm, spin_channel, scaling_factor),
+                None => vk_upper_with_rimatr_use_dm_only_sync(&self.rimatr, dm, spin_channel, scaling_factor),
+            }
         } else {
             if use_dm_only {
                 //println!("use isdf to generate k");
@@ -3941,6 +4061,151 @@ pub fn vj_upper_with_rimatr_sync_mpi(
     { vj_upper_with_rimatr_sync(ri3fn, dm, spin_channel, scaling_factor) }
 }
 
+/// Reduced occupied orbitals of one spin channel: `C_occ sqrt(occ)` on the full AO space, or
+/// `None` when the spin channel carries no electron. Shared by the screened K kernel and by its
+/// screening scale.
+fn reduced_occupied_orbitals(
+                eigv: &[MatrixFull<f64>;2],
+                num_elec: &[f64;3], occupation: &[Vec<f64>;2],
+                i_spin: usize) -> Option<MatrixFull<f64>> {
+    let num_basis = eigv[0].size()[0];
+    let eigv_s = if !eigv[i_spin].data.is_empty() {
+        &eigv[i_spin]
+    } else { // use the eigv[0] again for ROHF case.
+        &eigv[0]
+    };
+    let elec_spin = num_elec[i_spin+1].ceil() as usize;
+    let nw = if elec_spin == 0 {0} else {occupied_orbital_count(&occupation[i_spin])};
+    if nw == 0 {
+        return None;
+    }
+    let mut tmp_mat = MatrixFull::new([num_basis,nw],0.0_f64);
+    tmp_mat.data.iter_mut().zip(eigv_s.iter_submatrix(0..num_basis,0..nw))
+        .for_each(|value| {*value.0 = *value.1});
+    let occ_s = &occupation[i_spin][0..nw];
+    tmp_mat.data.par_chunks_exact_mut(tmp_mat.size[0]).zip(occ_s.par_iter()).for_each(|(to_value, from_value)| {
+            to_value.iter_mut().for_each(|to_value| {*to_value = *to_value*from_value.sqrt()});
+    });
+    Some(tmp_mat)
+}
+
+/// Screening scales of the J kernels: `[max_p |w_p| q_p, max_p q_p]` over the **stored** rows of
+/// the pruning map, maximized over the spin channels so that every spin (and every MPI rank,
+/// after the reduction of the caller) keeps the same row set.
+pub fn vj_screen_scales(
+                map: &ri_jk::PairMap,
+                dm: &Vec<MatrixFull<f64>>,
+                spin_channel: usize) -> [f64; 2] {
+    let mut scales = [0.0_f64, ri_jk::geometric_scale(map)];
+    for i_spin in 0..spin_channel {
+        scales[0] = scales[0].max(ri_jk::j_density_scale(map, &dm[i_spin]));
+    }
+    scales
+}
+
+/// Screening scale of the K kernels: `max_p q_p max(W_mu, W_nu)` over the stored rows, maximized
+/// over the spin channels.
+pub fn vk_screen_scale(
+                map: &ri_jk::PairMap,
+                eigv: &[MatrixFull<f64>;2],
+                num_elec: &[f64;3], occupation: &[Vec<f64>;2],
+                spin_channel: usize) -> f64 {
+    let mut scale = 0.0_f64;
+    for i_spin in 0..spin_channel {
+        if let Some(tmp_mat) = reduced_occupied_orbitals(eigv, num_elec, occupation, i_spin) {
+            let w_ao = ri_jk::orbital_weights(&tmp_mat);
+            scale = scale.max(ri_jk::orbital_scale(map, &w_ao));
+        }
+    }
+    scale
+}
+
+/// Coulomb matrix J with AO-pair screening of the storage-level pruned in-core RI tensor, at the
+/// given screening scales.
+///
+/// See [`ri_jk::get_vj_pair_screened`] for the screening criteria. `map` is the pruning map that
+/// describes the stored rows; the kernel already returns the **full** packed pair space, so the
+/// result keeps the shape of the unpruned tensor and the caller assembles the Fock matrix with the
+/// unmodified `basbas2baspar`. A `None` map (or tensor) leaves the output empty, which the
+/// callers avoid by dispatching on the map first.
+pub fn vj_upper_with_rimatr_screened_scales(
+                ri3fn: &Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
+                map: &Option<ri_jk::PairMap>,
+                dm: &Vec<MatrixFull<f64>>,
+                spin_channel: usize, scaling_factor: f64, threshold: f64,
+                scales: [f64;2])  -> Vec<MatrixUpper<f64>> {
+    let mut vj: Vec<MatrixUpper<f64>> = vec![MatrixUpper::new(1,0.0f64),MatrixUpper::new(1,0.0f64)];
+    if let (Some((ri3fn,basbas2baspar,_)), Some(map)) = (ri3fn, map) {
+        for i_spin in 0..spin_channel {
+            let j_data = ri_jk::get_vj_pair_screened(
+                ri3fn, map, basbas2baspar, &dm[i_spin], threshold, scales[0], scales[1]);
+            vj[i_spin] = MatrixUpper::from_vec(map.num_baspar_full(), j_data).unwrap();
+        }
+    }
+
+    if scaling_factor!=1.0f64 {
+        for i_spin in 0..spin_channel {
+            vj[i_spin].data.par_iter_mut().for_each(|f| *f = *f*scaling_factor)
+        }
+    };
+    vj
+}
+
+/// Coulomb matrix J with AO-pair screening of the storage-level pruned in-core RI tensor.
+///
+/// See [`ri_jk::get_vj_pair_screened`] for the screening criteria. `map` is the pruning map of
+/// the stored rows; a `None` map or tensor yields zeros, and a non-positive threshold keeps every
+/// stored row.
+pub fn vj_upper_with_rimatr_screened(
+                ri3fn: &Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
+                map: &Option<ri_jk::PairMap>,
+                dm: &Vec<MatrixFull<f64>>,
+                spin_channel: usize, scaling_factor: f64, threshold: f64)  -> Vec<MatrixUpper<f64>> {
+    let scales = match map {
+        Some(map) => vj_screen_scales(map, dm, spin_channel),
+        None => [0.0, 0.0],
+    };
+    vj_upper_with_rimatr_screened_scales(ri3fn, map, dm, spin_channel, scaling_factor, threshold, scales)
+}
+
+pub fn vj_upper_with_rimatr_screened_mpi(
+                ri3fn: &Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
+                map: &Option<ri_jk::PairMap>,
+                dm: &Vec<MatrixFull<f64>>,
+                spin_channel: usize, scaling_factor: f64, threshold: f64,
+                mpi_operator: &Option<MPIOperator>)  -> Vec<MatrixUpper<f64>> {
+    #[cfg(feature = "mpi")]
+    if let Some(mpi_op) = &mpi_operator {
+        // the auxiliary axis is distributed over the ranks, so the screening scales must be
+        // global: otherwise every rank would keep a different row set and the reduced J would
+        // miss the contributions the other ranks dropped
+        let scales = match map {
+            Some(map) => {
+                let local = vj_screen_scales(map, dm, spin_channel);
+                let mut global = mpi_reduce(&mpi_op.world, &local, 0, &SystemOperation::max());
+                mpi_broadcast_vector(&mpi_op.world, &mut global, 0);
+                [global[0], global[1]]
+            },
+            None => [0.0, 0.0],
+        };
+        let mut vj_vec = vj_upper_with_rimatr_screened_scales(
+            ri3fn, map, dm, spin_channel, scaling_factor, threshold, scales);
+        for i_spin in 0..spin_channel {
+            let vj = &mut vj_vec[i_spin];
+            let mut tot_vj = mpi_reduce(&mpi_op.world, vj.data_ref().unwrap(), 0, &SystemOperation::sum());
+            mpi_broadcast_vector(&mpi_op.world, &mut tot_vj, 0);
+            vj.data = tot_vj;
+        }
+        vj_vec
+    } else
+    {
+        vj_upper_with_rimatr_screened(ri3fn, map, dm, spin_channel, scaling_factor, threshold)
+    }
+    #[cfg(not(feature = "mpi"))]
+    { vj_upper_with_rimatr_screened(ri3fn, map, dm, spin_channel, scaling_factor, threshold) }
+}
+
+
 pub fn vj_upper_with_rimatr_sync(
                 ri3fn: &Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
                 dm: &Vec<MatrixFull<f64>>, 
@@ -4371,6 +4636,62 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_mpi(
     { vk_upper_with_rimatr_use_dm_only_sync_v02(ri3fn, dm, spin_channel, scaling_factor) }
 }
 
+/// Exchange matrix K built from the square root of the density, on the stored rows of a
+/// storage-level pruned in-core RI tensor.
+///
+/// This is the compacted counterpart of [`vk_upper_with_rimatr_use_dm_only_sync_v02`]: the same
+/// contraction `K = sum_P (R_P D^{1/2})(R_P D^{1/2})^t`, but the rows of `R_P` are addressed
+/// through the pruning map instead of being laid out as a full packed upper triangle. The rows
+/// that survive the storage pruning are the significant ones, so no further screening is applied:
+/// the kernel runs with a zero threshold, which keeps every stored row.
+pub fn vk_upper_with_rimatr_use_dm_only_pruned(
+                ri3fn: &Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
+                map: &ri_jk::PairMap,
+                dm: &Vec<MatrixFull<f64>>,
+                spin_channel: usize, scaling_factor: f64)  -> Vec<MatrixUpper<f64>> {
+    let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::empty(),MatrixUpper::empty()];
+
+    if let Some((ri3fn,_,_)) = ri3fn {
+        for i_spin in 0..spin_channel {
+            let dm_sqrt = _power_rayon_for_symmetric_matrix(&dm[i_spin], 0.5, SQRT_THRESHOLD).unwrap();
+            let w_ao = ri_jk::orbital_weights(&dm_sqrt);
+            vk[i_spin] = ri_jk::get_vk_pair_screened(ri3fn, map, &dm_sqrt, &w_ao, 0.0, 0.0);
+        }
+    }
+
+    if scaling_factor!=1.0f64 {
+        for i_spin in 0..spin_channel {
+            vk[i_spin].data.par_iter_mut().for_each(|f| *f = *f*scaling_factor)
+        }
+    };
+
+    vk
+}
+
+pub fn vk_upper_with_rimatr_use_dm_only_pruned_mpi(
+                ri3fn: &Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
+                map: &ri_jk::PairMap,
+                dm: &Vec<MatrixFull<f64>>,
+                spin_channel: usize, scaling_factor: f64,
+                mpi_operator: &Option<MPIOperator>)  -> Vec<MatrixUpper<f64>> {
+    #[cfg(feature = "mpi")]
+    if let Some(mpi_op) = &mpi_operator {
+        let mut vk_vec = vk_upper_with_rimatr_use_dm_only_pruned(ri3fn, map, dm, spin_channel, scaling_factor);
+        for i_spin in 0..spin_channel {
+            let vk = &mut vk_vec[i_spin];
+            let mut tot_vk = mpi_reduce(&mpi_op.world, vk.data_ref().unwrap(), 0, &SystemOperation::sum());
+            mpi_broadcast(&mpi_op.world, &mut tot_vk, 0);
+            vk.data = tot_vk;
+        };
+        vk_vec
+    } else
+    {
+        vk_upper_with_rimatr_use_dm_only_pruned(ri3fn, map, dm, spin_channel, scaling_factor)
+    }
+    #[cfg(not(feature = "mpi"))]
+    { vk_upper_with_rimatr_use_dm_only_pruned(ri3fn, map, dm, spin_channel, scaling_factor) }
+}
+
 pub fn vk_upper_with_rimatr_sync_mpi(
                 ri3fn: &Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
                 eigv: &[MatrixFull<f64>;2], 
@@ -4396,6 +4717,92 @@ pub fn vk_upper_with_rimatr_sync_mpi(
     #[cfg(not(feature = "mpi"))]
     { vk_upper_with_rimatr_sync_v03(ri3fn,eigv,num_elec,occupation,spin_channel,scaling_factor) }
 }
+
+/// Exchange matrix K with AO-pair screening of the storage-level pruned in-core RI tensor.
+///
+/// The occupied orbitals are reduced with the square root of their occupation exactly as in
+/// [`vk_upper_with_rimatr_sync_v03`], so the two kernels are numerically comparable. See
+/// [`ri_jk::get_vk_pair_screened`] for the screening criterion; `map` describes the stored rows
+/// and the kernel returns the packed upper triangle over the full AO space. A `None` map or
+/// tensor yields zeros, and callers keep using the unscreened kernel in that case.
+pub fn vk_upper_with_rimatr_screened_scales(
+                ri3fn: &Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
+                map: &Option<ri_jk::PairMap>,
+                eigv: &[MatrixFull<f64>;2],
+                num_elec: &[f64;3], occupation: &[Vec<f64>;2],
+                spin_channel: usize, scaling_factor: f64, threshold: f64,
+                scale: f64)  -> Vec<MatrixUpper<f64>> {
+    let mut vk: Vec<MatrixUpper<f64>> = vec![MatrixUpper::empty(),MatrixUpper::empty()];
+
+    if let (Some((ri3fn,_,_)), Some(map)) = (ri3fn, map) {
+        for i_spin in 0..spin_channel {
+            if let Some(tmp_mat) = reduced_occupied_orbitals(eigv, num_elec, occupation, i_spin) {
+                let w_ao = ri_jk::orbital_weights(&tmp_mat);
+                vk[i_spin] =
+                    ri_jk::get_vk_pair_screened(ri3fn, map, &tmp_mat, &w_ao, threshold, scale);
+            }
+        }
+    }
+
+    if scaling_factor!=1.0f64 {
+        for i_spin in 0..spin_channel {
+            vk[i_spin].data.par_iter_mut().for_each(|f| *f = *f*scaling_factor)
+        }
+    };
+    vk
+}
+
+pub fn vk_upper_with_rimatr_screened(
+                ri3fn: &Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
+                map: &Option<ri_jk::PairMap>,
+                eigv: &[MatrixFull<f64>;2],
+                num_elec: &[f64;3], occupation: &[Vec<f64>;2],
+                spin_channel: usize, scaling_factor: f64, threshold: f64)  -> Vec<MatrixUpper<f64>> {
+    let scale = match map {
+        Some(map) => vk_screen_scale(map, eigv, num_elec, occupation, spin_channel),
+        None => 0.0,
+    };
+    vk_upper_with_rimatr_screened_scales(
+        ri3fn, map, eigv, num_elec, occupation, spin_channel, scaling_factor, threshold, scale)
+}
+
+pub fn vk_upper_with_rimatr_screened_mpi(
+                ri3fn: &Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
+                map: &Option<ri_jk::PairMap>,
+                eigv: &[MatrixFull<f64>;2],
+                num_elec: &[f64;3], occupation: &[Vec<f64>;2],
+                spin_channel: usize, scaling_factor: f64, threshold: f64,
+                mpi_operator: &Option<MPIOperator>)  -> Vec<MatrixUpper<f64>> {
+    #[cfg(feature = "mpi")]
+    if let Some(mpi_op) = &mpi_operator {
+        // global scale, see vj_upper_with_rimatr_screened_mpi
+        let scale = match map {
+            Some(map) => {
+                let local = vk_screen_scale(map, eigv, num_elec, occupation, spin_channel);
+                let mut global = mpi_reduce(&mpi_op.world, &[local], 0, &SystemOperation::max());
+                mpi_broadcast_vector(&mpi_op.world, &mut global, 0);
+                global[0]
+            },
+            None => 0.0,
+        };
+        let mut vk_vec = vk_upper_with_rimatr_screened_scales(
+            ri3fn, map, eigv, num_elec, occupation, spin_channel, scaling_factor, threshold, scale);
+        for i_spin in 0..spin_channel {
+            let vk = &mut vk_vec[i_spin];
+            let mut tot_vk = mpi_reduce(&mpi_op.world, vk.data_ref().unwrap(), 0, &SystemOperation::sum());
+            mpi_broadcast(&mpi_op.world, &mut tot_vk, 0);
+            vk.data = tot_vk;
+        };
+        vk_vec
+    } else
+    {
+        vk_upper_with_rimatr_screened(
+            ri3fn, map, eigv, num_elec, occupation, spin_channel, scaling_factor, threshold)
+    }
+    #[cfg(not(feature = "mpi"))]
+    { vk_upper_with_rimatr_screened(ri3fn, map, eigv, num_elec, occupation, spin_channel, scaling_factor, threshold) }
+}
+
 pub fn vk_upper_with_rimatr_sync(
                 ri3fn: &Option<(MatrixFull<f64>,MatrixFull<usize>,Vec<[usize;2]>)>,
                 eigv: &[MatrixFull<f64>;2], 
@@ -5464,6 +5871,15 @@ pub fn generate_density_matrix_outside(scf_data: &SCF) -> Vec<MatrixFull<f64>>{
 
 pub fn initialize_scf(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
 
+    // Everything below is rebuilt from scratch, and the rebuild assigns the new tensors with
+    // `self.rimatr = ...` / `self.grids = ...`, which keeps the previous copy alive until the new
+    // one is in place. Dropping them up front removes that overlap, so a re-initialization (every
+    // displaced job of a numerical derivative, every optimization step) does not hold two
+    // generations of the integral tensors and grids at once.
+    // Nothing between here and the rebuild reads them: the initial guess only needs the density
+    // and the orbitals, and the post-SCF tensors (`ri3mo`) are rebuilt lazily on demand.
+    scf_data.free_large_tensors();
+
     // update the corresponding geometry information, which is crucial 
     // for preparing the following integrals accurately
     let position = &scf_data.mol.geom.position;
@@ -6164,6 +6580,8 @@ impl SCF {
         self.m = None;
         self.rimatr = None;
         self.rimatr_sr = None;
+        self.rimatr_pair_screen = None;
+        self.rimatr_pair_map = None;
         self.ri3mo = None;
         self.ri3mo_full = None;
         self.ri3fn_bse = None;

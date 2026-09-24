@@ -3187,8 +3187,14 @@ pub struct Non0Tab {
     pub sparsity_ratio: f64,
     /// Total non-zero ao entries (across all batches)
     pub total_nonzero_ao: usize,
-    /// Total non-zero aop entries
+    /// Total non-zero aop entries of the aop mask
     pub total_nonzero_aop: usize,
+    /// AOP entries actually written into `CompressedGridAOP`: the block is stored row-aligned
+    /// with the AO block, so it holds all three gradient components of every stored AO row, i.e.
+    /// `3 * total_nonzero_ao`. This is the number that matches the memory footprint, and it is
+    /// larger than `total_nonzero_aop` whenever the gradient mask is sparser in rows than the AO
+    /// mask, which is the usual case for diffuse basis functions.
+    pub total_stored_aop: usize,
     /// Total elements in dense ao (ngrids * nao)
     pub total_elements: usize,
 }
@@ -3663,6 +3669,8 @@ impl Grids {
             sparsity_ratio,
             total_nonzero_ao,
             total_nonzero_aop,
+            // row-aligned with the AO block: three components per stored AO row
+            total_stored_aop: 3 * total_nonzero_ao,
             total_elements,
         });
 
@@ -3902,6 +3910,16 @@ impl Grids {
         } else {
             0
         };
+        // The AOP block is stored row-aligned with the AO block (see `contract_response_compressed`),
+        // so it holds all three gradient components of every stored AO row. This is the number that
+        // matches the memory footprint, and it is what the log below has to report: counting the
+        // gradient mask instead understates the block, because the mask counts rows while the
+        // storage counts rows times three components.
+        let total_stored_aop: usize = if do_gradient { 3 * total_nonzero_ao } else { 0 };
+        let aop_rows_per_batch =
+            batch_aop_indices.iter().map(|v| v.len()).sum::<usize>() as f64 / nbatches.max(1) as f64;
+        let ao_rows_per_batch =
+            batch_ao_indices.iter().map(|v| v.len()).sum::<usize>() as f64 / nbatches.max(1) as f64;
         let total_elements = ngrids * nao;
         let sparsity_ratio = if total_nonzero_ao > 0 {
             total_nonzero_ao as f64 / total_elements as f64
@@ -3923,10 +3941,18 @@ impl Grids {
                     cutoff, blksize, auto_note, sparsity_ratio * 100.0
                 );
             } else {
+                let stored_aop_sparsity = if total_stored_aop > 0 {
+                    total_stored_aop as f64 / (total_elements * 3) as f64 * 100.0
+                } else {
+                    0.0
+                };
+                let gib = |entries: usize| entries as f64 * 8.0 / (1024.0 * 1024.0 * 1024.0);
                 println!(
-                    " [non0tab] cutoff={:.1e}, blksize={}{}, ao-sparsity={:.1}% ({}/{}), aop-sparsity={:.1}%",
+                    " [non0tab] cutoff={:.1e}, blksize={}{}, ao stored={:.1}% ({} entries, {:.2} GiB), aop stored={:.1}% ({} entries, {:.2} GiB), rows/batch: ao {:.0}/{}, aop mask {:.0}/{} [aop mask {:.1}%]",
                     cutoff, blksize, auto_note,
-                    sparsity_ratio * 100.0, total_nonzero_ao, total_elements,
+                    sparsity_ratio * 100.0, total_nonzero_ao, gib(total_nonzero_ao),
+                    stored_aop_sparsity, total_stored_aop, gib(total_stored_aop),
+                    ao_rows_per_batch, nao, aop_rows_per_batch, nao,
                     aop_sparsity,
                 );
             }
@@ -4031,18 +4057,27 @@ impl Grids {
             })
             .collect();
 
-        // unzip batch results
-        let ao_comp_batches: Vec<MatrixFull<f64>> =
-            batch_results.iter().map(|r| r.0.clone()).collect();
-        let mut aop_comp_batches: Vec<[MatrixFull<f64>; 3]> = if do_gradient {
-            batch_results.iter().map(|r| r.1.clone().unwrap_or([
-                MatrixFull::<f64>::empty(),
-                MatrixFull::<f64>::empty(),
-                MatrixFull::<f64>::empty(),
-            ])).collect()
-        } else {
-            vec![]
-        };
+        // unzip batch results. The batches are **moved** out of `batch_results`, not cloned: a
+        // clone here would keep two copies of the whole compressed grid alive at once, which was
+        // the single largest allocation of the run (7.9 GiB on (H2O)32).
+        let (ao_comp_batches, aop_comp_batches): (Vec<MatrixFull<f64>>, Vec<[MatrixFull<f64>; 3]>) =
+            if do_gradient {
+                batch_results
+                    .into_iter()
+                    .map(|(ao, aop)| {
+                        (
+                            ao,
+                            aop.unwrap_or([
+                                MatrixFull::<f64>::empty(),
+                                MatrixFull::<f64>::empty(),
+                                MatrixFull::<f64>::empty(),
+                            ]),
+                        )
+                    })
+                    .unzip()
+            } else {
+                (batch_results.into_iter().map(|(ao, _)| ao).collect(), vec![])
+            };
 
         // ── Store results ──
         self.non0tab = Some(Non0Tab {
@@ -4055,6 +4090,7 @@ impl Grids {
             sparsity_ratio,
             total_nonzero_ao,
             total_nonzero_aop,
+            total_stored_aop,
             total_elements,
         });
 
@@ -4071,6 +4107,7 @@ impl Grids {
         if do_gradient && !batch_ao_indices.is_empty() {
             self.aop_compressed = Some(CompressedGridAOP {
                 batches: aop_comp_batches,
+                // row-aligned with the AO block, see `contract_response_compressed`
                 batch_aop_map: batch_ao_indices.clone(),
                 batch_grid_ranges,
                 blksize,
@@ -6004,6 +6041,7 @@ fn test_non0tab_build() {
         sparsity_ratio: 0.25,
         total_nonzero_ao: 640,
         total_nonzero_aop: 640,
+        total_stored_aop: 640,
         total_elements: 2560,
     };
     assert_eq!(nt.batch_ao_indices.len(), 2);
@@ -6063,6 +6101,7 @@ fn test_non0tab_clone() {
         sparsity_ratio: 1.0,
         total_nonzero_ao: 512,
         total_nonzero_aop: 512,
+        total_stored_aop: 512,
         total_elements: 512,
     };
     let nt2 = nt.clone();
@@ -6099,6 +6138,7 @@ fn test_non0tab_compress_roundtrip() {
         sparsity_ratio: 0.5,
         total_nonzero_ao: nao * ngrids / 2,
         total_nonzero_aop: 0,
+        total_stored_aop: 0,
         total_elements: nao * ngrids,
     };
 

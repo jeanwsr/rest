@@ -103,6 +103,49 @@ pub fn main_driver() -> anyhow::Result<()> {
     let mut mol = Molecule::build(ctrl_file.clone(), mpi_data)?;
     mol.ctrl.ctrl_file = ctrl_file;
     if mol.ctrl.print_level>0 {println!("Molecule_name: {}", &mol.geom.name)};
+
+    // Storage-level AO-pair pruning ([ctrl.ri_jk] pair_screen_threshold > 0) rewrites the row
+    // space of the in-core RI tensor `rimatr`, and every consumer of that tensor has to address
+    // it through `SCF::rimatr_pair_map`. That is wired for the SCF J/K contractions only: the
+    // post-SCF, derivative, response and Hessian paths still index the tensor with the full-space
+    // pair tables, and would silently read the wrong rows instead of failing. Refuse to run them
+    // rather than return a wrong number. (S2/S3 of the pruning plan lift this restriction.)
+    if mol.ctrl.ri_jk.pair_screen_threshold > 0.0 {
+        let mut unsupported: Vec<&str> = Vec::new();
+        if !mol.ctrl.analdrv_tasks.is_empty() {
+            unsupported.push("analytical derivative tasks (analdrv_tasks)");
+        }
+        if !matches!(mol.ctrl.job_type, JobType::SinglePoint) {
+            unsupported.push("a job_type other than a single-point energy (gradient / optimization / MD / numerical dipole)");
+        }
+        if !mol.ctrl.post_correlation.is_empty() {
+            unsupported.push("post-correlation methods (post_correlation)");
+        }
+        if !mol.ctrl.post_xc.is_empty() {
+            unsupported.push("post-XC analysis (post_xc)");
+        }
+        if mol.ctrl.tddft.is_some() {
+            unsupported.push("TDDFT and response TDDFT (tddft)");
+        }
+        if mol.ctrl.hessian.is_some() {
+            unsupported.push("Hessian / frequency analysis (hessian)");
+        }
+        if mol.ctrl.quasiparticle_methods.is_some() {
+            unsupported.push("quasiparticle methods such as GW and BSE (quasiparticle_methods)");
+        }
+        if mol.ctrl.outputs.iter().any(|output| output.eq("num_force")) {
+            unsupported.push("numerical force output (outputs = \"num_force\")");
+        }
+        if !unsupported.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Storage-level AO-pair pruning is enabled ([ctrl.ri_jk] pair_screen_threshold = \
+                 {:e}), but it is only implemented for a single-point SCF energy. It does not \
+                 support: {}. Set pair_screen_threshold = 0.0 to run these paths.",
+                mol.ctrl.ri_jk.pair_screen_threshold,
+                unsupported.join(", ")
+            ));
+        }
+    }
     if mol.ctrl.print_level>=2 {
         println!("{}", mol.ctrl.formated_output_in_toml());
     }
@@ -435,7 +478,7 @@ pub fn main_driver() -> anyhow::Result<()> {
         }
     }
     
-    post_scf_analysis::post_scf_output(&scf_data, &mpi_operator);
+    post_scf_analysis::post_scf_output(&mut scf_data, &mpi_operator);
 
     //====================================
     // Now for post-correlation calculations
@@ -789,7 +832,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
             println!("Gradient evaluation using numerical differentiation");
         }
         let displace = scf_data.mol.ctrl.nforce_displacement / BOHR;
-        let (energy, nforce) = numerical_force(&scf_data, displace, &mpi_operator);
+        let (energy, nforce) = numerical_force(scf_data, displace, &mpi_operator);
         println!("------ Output gradient [a.u.] ------");
         println!("{}", formated_force(&nforce, &scf_data.mol.geom.elem));
         println!("------------------------------------");
@@ -991,6 +1034,28 @@ fn eval_normal_modes(
     // Build Hessian via central finite difference of analytical gradients
     let mut hessian = MatrixFull::new([dim, dim], 0.0);
 
+    // Every displaced job calls `initialize_scf`, which rebuilds the three-center tensors and the
+    // density grids from the displaced geometry. Cloning the SCF with those tensors resident would
+    // therefore copy them 6N times only to overwrite them immediately, and would hold a second
+    // copy of them for the whole loop: on a large system that is GBs per displacement. Park them
+    // for the duration of the loop and hand them back afterwards, so `scf_data.clone()` below
+    // copies only the cheap state (geometry, control, density, orbitals).
+    let parked = (
+        scf_data.ijkl.take(),
+        scf_data.ri3fn.take(),
+        scf_data.ri3fn_sr.take(),
+        scf_data.ri3fn_isdf.take(),
+        scf_data.ri3fn_bse.take(),
+        scf_data.rimatr.take(),
+        scf_data.rimatr_sr.take(),
+        scf_data.rimatr_bse.take(),
+        scf_data.ri3mo.take(),
+        scf_data.ri3mo_full.take(),
+        scf_data.tab_ao.take(),
+        scf_data.m.take(),
+        scf_data.grids.take(),
+    );
+
     if scf_data.mol.ctrl.print_level > 0 {
         print!("  Hessian finite difference progress: ");
         io::stdout().flush().unwrap();
@@ -1041,6 +1106,23 @@ fn eval_normal_modes(
     if scf_data.mol.ctrl.print_level > 0 {
         println!(" done");
     }
+
+    // hand the parked tensors back, so the caller sees the SCF it passed in
+    (
+        scf_data.ijkl,
+        scf_data.ri3fn,
+        scf_data.ri3fn_sr,
+        scf_data.ri3fn_isdf,
+        scf_data.ri3fn_bse,
+        scf_data.rimatr,
+        scf_data.rimatr_sr,
+        scf_data.rimatr_bse,
+        scf_data.ri3mo,
+        scf_data.ri3mo_full,
+        scf_data.tab_ao,
+        scf_data.m,
+        scf_data.grids,
+    ) = parked;
 
     // Symmetrize Hessian: H = (H + H^T) / 2
     for i in 0..dim {

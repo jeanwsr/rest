@@ -28,8 +28,11 @@ use self::molden_build::{gen_molden};
 use self::strong_correlation_correction::scc15_for_rxdh7;
 pub use crate::fileop::chkfile::{save_chkfile, save_hamiltonian, save_overlap, save_geometry};
 
-pub fn post_scf_output(scf_data: &SCF, mpi_operator: &Option<MPIOperator>) {
-    scf_data.mol.ctrl.outputs.iter().for_each(|output_type| {
+pub fn post_scf_output(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
+    // the list is cloned so that the closure below can hold `scf_data` mutably (the numerical
+    // force driver parks and rebuilds the integral tensors inside)
+    let outputs = scf_data.mol.ctrl.outputs.clone();
+    outputs.iter().for_each(|output_type| {
         if output_type.eq("fchk") {
             if let Some(mpi_op) = &mpi_operator {
                 if mpi_op.rank == 0 {scf_data.save_fchk_of_gaussian();}
