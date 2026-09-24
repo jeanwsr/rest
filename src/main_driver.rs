@@ -86,6 +86,12 @@ pub fn main_driver() -> anyhow::Result<()> {
         }
     }
 
+    // Stamp the very first lines of the output with the git revision of the source
+    // tree this binary was compiled from. Non-root MPI ranks have already had their
+    // stdout redirected to /dev/null above, so the lines are printed exactly once.
+    println!("REST git commit: {}", utilities::git_commit_string());
+    println!("REST git commit date: {}", utilities::git_commit_date_string());
+
     let ctrl_file = utilities::parse_input().value_of("input_file").unwrap_or("ctrl.in").to_string();
     if ! PathBuf::from(ctrl_file.clone()).is_file() {
         panic!("Input file ({:}) does not exist", ctrl_file);
