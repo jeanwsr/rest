@@ -10,7 +10,9 @@ pub fn get_cint_aux(mol_obj: &Molecule) -> CInt {
 }
 
 /// [`get_cint_aux`] on an auxiliary basis given by `auxbas_path` instead of the molecule's own
-/// `ctrl.auxbas_path` (same value format; pool names are resolved by the basis machinery).
+/// `ctrl.auxbas_path`. The path must already be resolved by the ctrl-input basis-path machinery
+/// (the form `ctrl.auxbas_path` itself holds after parsing): a directory of element JSONs, with
+/// missing elements left to the basis-set-exchange fallback of the basis machinery.
 ///
 /// The molecule is only read: the auxiliary-basis information is regenerated from a local copy of
 /// the keywords, and nothing on `mol_obj` is modified.

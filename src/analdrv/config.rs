@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
+use crate::ctrl_io::{path_util, serde_from_value};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AnalDrvTask {
@@ -83,7 +84,8 @@ pub struct AnalDrvRespCfg {
     pub grid_level: Option<usize>,
     /// Auxiliary basis of the RI-JK response objects (the low-precision response side), as a
     /// basis-set pool name or an element-JSON directory — the same value format as
-    /// `ctrl.auxbas_path`.
+    /// `ctrl.auxbas_path`, and resolved by [`parse_analdrv_keywords`] through the same
+    /// basis-path machinery (so pool names and aliases work, not only absolute directories).
     ///
     /// By default `None`: the response objects reuse the SCF auxiliary basis, borrowing the SCF
     /// `rimatr` (and `rimatr_sr` for range-separated hybrids) with no copy. When set, a
@@ -281,6 +283,25 @@ pub struct AnalDrvConfig {
 }
 
 /* #endregion AnalDrvConfig */
+
+/// Parse the `[analdrv]` section of the control input into an [`AnalDrvConfig`].
+///
+/// `None` when the section is absent; a malformed section panics (the `serde_from_value`
+/// convention of the other sections). The `resp_auxbas_path` keyword takes the same value format
+/// as `auxbas_path` (a basis-set pool name, an alias, or an element-JSON directory), so it is
+/// resolved through the same basis-path machinery here: pool names are looked up in the basis-set
+/// pool directories, and anything else is passed through for the basis-set-exchange fallback.
+pub fn parse_analdrv_keywords(tmp_keys: &serde_json::Value) -> Option<AnalDrvConfig> {
+    let mut config: AnalDrvConfig = tmp_keys.get("analdrv").map(serde_from_value)?;
+    if let Some(resp_auxbas_path) = &config.resp.auxbas_path {
+        config.resp.auxbas_path = Some(path_util::get_valid_basis_path(
+            resp_auxbas_path,
+            &path_util::get_rest_basis_dir(),
+            "auxiliary basis",
+        ));
+    }
+    Some(config)
+}
 
 #[cfg(test)]
 mod tests {
