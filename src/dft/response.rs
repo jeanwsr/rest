@@ -12,7 +12,7 @@ use rest_tensors::matrix::matrix_blas_lapack::{
     _dgemm_full, _dsymm, omp_get_num_threads_wrapper, omp_set_num_threads_wrapper,
 };
 use crate::scf_io::{SCF, SCFType};
-use crate::dft::num_int::{prepare_fxc_data, fxc_matvec_old, eval_rho5_batch};
+use crate::dft::num_int::eval_rho5_batch;
 use crate::dft::libxc_itrf::eval_xc_eff;
 use crate::dft::xc_deriv::XCType;
 use rest_libcint::prelude::CInt;
@@ -1053,7 +1053,6 @@ pub fn vj_upper_rimatr_batched(
     scf: &SCF,
     dms: &[MatrixFull<f64>],
 ) -> Vec<MatrixFull<f64>> {
-    use itertools::Itertools;
     let n_rhs = dms.len();
     let nao = dms[0].size[0];
     let (ri3fn, _, baspar2basbas) = scf.rimatr.as_ref().unwrap();
@@ -1465,63 +1464,5 @@ pub fn gen_vind_opt_batched(
         results.push(res);
     }
     results
-}
-
-/// Verify that gen_vind's fxc part matches existing fxc_matvec.
-pub fn verify_fxc_matvec(scf: &SCF) -> Result<(), String> {
-    println!("\n=== Verifying fxc_matvec consistency ===");
-    let (start_mo, _num_state, occ_size, vir_size, _homo, lumo) =
-        crate::ri_tddft::utils::tddft_occupation_parameters(scf);
-    let dim = occ_size * vir_size;
-    let is_dft = !scf.mol.xc_data.dfa_compnt_scf.is_empty();
-
-    let fxc_data = if is_dft {
-        println!("  DFT mode: preparing fxc data...");
-        Some(prepare_fxc_data(scf))
-    } else {
-        println!("  HF mode: no fxc kernel.");
-        None
-    };
-
-    // Random test vector
-    let mut z_test = vec![0.0; dim];
-    for i in 0..dim { z_test[i] = ((i * 7 + 13) as f64).sin() * 0.1; }
-
-    // fxc_matvec only (use old version for deterministic verification)
-    let fxc_only = fxc_data.as_ref().map(|f| fxc_matvec_old(f, &z_test))
-        .unwrap_or_else(|| vec![0.0; dim]);
-
-    let ws = VindWorkspace::new(scf, occ_size, vir_size, start_mo, lumo);
-
-    // gen_vind total (JK+fxc)
-    let cache = if is_dft { Some(prepare_fxc_hessian_cache(scf)) } else { None };
-    let gen_v = gen_vind_opt(scf, &ws, &z_test, cache.as_ref(), None, None);
-
-    // gen_vind JK only (no fxc)
-    let jk_only = gen_vind_opt(scf, &ws, &z_test, None, None, None);
-
-    // fxc part from gen_vind = total - JK (skip frozen rows in response)
-    let fo_size = ws.nfrozen * occ_size;
-    let mut fxc_from_gen = vec![0.0; dim];
-    for i in 0..dim { fxc_from_gen[i] = gen_v[fo_size + i] - jk_only[fo_size + i]; }
-
-    // Compare
-    let mut diff_norm = 0.0;
-    for i in 0..dim { let d = fxc_from_gen[i] - fxc_only[i]; diff_norm += d * d; }
-    diff_norm = diff_norm.sqrt();
-
-    println!("  dim = {}", dim);
-    println!("  |fxc_matvec|        = {:.10e}", fxc_only.iter().map(|x|x*x).sum::<f64>().sqrt());
-    println!("  |gen_vind fxc part| = {:.10e}", fxc_from_gen.iter().map(|x|x*x).sum::<f64>().sqrt());
-    println!("  |fxc diff|          = {:.2e}", diff_norm);
-    println!("  |gen_vind JK|       = {:.10e}", jk_only.iter().map(|x|x*x).sum::<f64>().sqrt());
-
-    if !is_dft || diff_norm < 1e-12 {
-        println!("  ✅ fxc_matvec in gen_vind matches existing fxc_matvec!");
-    } else {
-        println!("  ⚠️  fxc part differs by {:.2e}", diff_norm);
-    }
-    println!("  === fxc_matvec verification complete ===\n");
-    Ok(())
 }
 

@@ -118,6 +118,31 @@ pub struct GwGradConfig {
     /// the exact mode is the smooth continuous-CD limit (PySCF-like) and is
     /// better suited to finite-difference validation.
     pub exact_residue_z: bool,
+    /// Tolerance (Hartree) for recognising symmetry-protected **degenerate**
+    /// orbital shells of the reference (default `1e-8`).
+    ///
+    /// Inside a shell the canonical-orbital response
+    /// `u[p,q] = (F1[p,q] - e_q S1[p,q]) / (e_q - e_p)` is singular, so the
+    /// shell response is taken from degenerate perturbation theory and the
+    /// gradient requested for a shell member is returned as the
+    /// basis-independent **shell average** — which is exactly what a central
+    /// finite difference of that orbital's QP energy converges to (the finite
+    /// difference of the sorted level follows the other branch for `-h`).
+    /// `0.0` disables the treatment and restores the legacy behaviour (raw
+    /// `0/0` rotation, single-member gradient, orthogonality panic).
+    pub degenerate_tol: f64,
+    /// Validation bitmask for the full-CD pullback (`GwCdGradEngine`).
+    ///
+    /// With `S = Sigma_sub` written as
+    /// `sum_m [ sum_wi a_wi (W_wi - W0) + (1/2 - f_m) W0 + sum_r s_r (W_res - W0) ]`,
+    /// bit 0 keeps the imaginary-axis term, bit 1 the static `W(0)` term and
+    /// bit 2 the residue term; `0b111` (the default) is the complete
+    /// production gradient.  Because every `W` carries the same
+    /// `-q^T J^-1 q` piece, a masked pullback is the exact gradient of the
+    /// masked functional (the shared piece is scaled by `(1/2 - f_m)` only
+    /// when bit 1 is set), so each term can be validated against the finite
+    /// difference of its own contribution.
+    pub phase_mask: u32,
     /// Skip the low-rank machinery of the LR engine (`qt`, `qtia`, the
     /// real-axis grid and the low-rank factors).  Only the full-CD engine
     /// ([`GwCdGradEngine`]) sets this; the LR-only methods then find empty
@@ -143,6 +168,8 @@ impl Default for GwGradConfig {
             qpe_tol: 1.0e-11,
             qpe_max_iter: 100,
             exact_residue_z: false,
+            degenerate_tol: 1.0e-8,
+            phase_mask: 0b111,
             skip_lr_cache: false,
         }
     }
@@ -543,6 +570,31 @@ fn eigh_symmetric(a: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
     (vals, vecs.expect("gw_grad: dsyev vectors").data)
 }
 
+/// Symmetry-protected degenerate shells of the orbital energies `e`.
+///
+/// The SCF sorts its eigenvalues, so a shell is a maximal *contiguous* run of
+/// energies agreeing within `tol`; `tol <= 0` puts every orbital in a shell of
+/// its own (legacy behaviour).  Returns `(shells, shell_of)` where `shells` is
+/// the list of index groups (each of size >= 1) and `shell_of[p]` is the
+/// position of orbital `p` in `shells`.
+pub fn degenerate_shells(e: &[f64], tol: f64) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let mut shells: Vec<Vec<usize>> = Vec::new();
+    let mut shell_of = vec![0usize; e.len()];
+    for p in 0..e.len() {
+        let start_new = match shells.last() {
+            Some(s) => tol <= 0.0 || (e[p] - e[*s.last().unwrap()]).abs() > tol,
+            None => true,
+        };
+        if start_new {
+            shells.push(vec![p]);
+        } else {
+            shells.last_mut().unwrap().push(p);
+        }
+        shell_of[p] = shells.len() - 1;
+    }
+    (shells, shell_of)
+}
+
 // ---------------------------------------------------------------------------
 // low-rank screened response (REST real-symmetric convention)
 // ---------------------------------------------------------------------------
@@ -767,6 +819,11 @@ pub struct GwGradEngine<'a> {
     pub fock_hyb: f64,
     /// v_xc diagonal in the MO basis (cached once)
     vxc_nn: Vec<f64>,
+    /// symmetry-protected degenerate shells of `e` (see
+    /// [`degenerate_shells`]); shells of size 1 are non-degenerate orbitals
+    pub shells: Vec<Vec<usize>>,
+    /// index of the shell containing each orbital
+    pub shell_of: Vec<usize>,
 }
 
 impl<'a> GwGradEngine<'a> {
@@ -923,6 +980,14 @@ impl<'a> GwGradEngine<'a> {
         let hybrid = scf.mol.xc_data.dfa_hybrid_scf;
         let fock_hyb = if scf.mol.xc_data.dfa_compnt_scf.is_empty() { 1.0 } else { hybrid };
         let vxc_nn = crate::ri_gw::vxc_ao2mo(scf);
+        let (shells, shell_of) = degenerate_shells(&e, config.degenerate_tol);
+        if config.degenerate_tol > 0.0 && std::env::var("REST_GWGRAD_DBG").is_ok() {
+            let deg: Vec<&Vec<usize>> = shells.iter().filter(|s| s.len() > 1).collect();
+            println!(
+                "[new DBG] degenerate shells (tol {:.1e}): {:?}",
+                config.degenerate_tol, deg
+            );
+        }
         if config.skip_lr_cache {
             GwGradEngine {
                 scf,
@@ -951,6 +1016,8 @@ impl<'a> GwGradEngine<'a> {
                 hybrid,
                 fock_hyb,
                 vxc_nn,
+                shells,
+                shell_of,
             }
         } else {
             if std::env::var("REST_GWGRAD_DBG").is_ok() {
@@ -999,12 +1066,25 @@ impl<'a> GwGradEngine<'a> {
                 hybrid,
                 fock_hyb,
                 vxc_nn,
+                shells,
+                shell_of,
             }
         }
     }
 
     fn pair_col(&self, p: usize, q: usize) -> usize {
         p + q * self.nmo
+    }
+
+    /// True when `p` and `q` belong to the same (size > 1) degenerate shell.
+    pub fn same_degenerate_shell(&self, p: usize, q: usize) -> bool {
+        p != q && self.shell_of[p] == self.shell_of[q] && self.shells[self.shell_of[p]].len() > 1
+    }
+
+    /// The symmetry-protected degenerate shell containing `target`
+    /// (`vec![target]` when the orbital is non-degenerate).
+    pub fn degenerate_shell(&self, target: usize) -> Vec<usize> {
+        self.shells[self.shell_of[target]].clone()
     }
 
     /// Gather the block of one MO index against all MOs: `[naux, nmo]` with
@@ -2242,17 +2322,72 @@ impl GwGradEngine<'_> {
         let mut eps1 = vec![0.0f64; nmo];
         for p in 0..nmo {
             u[p + p * nmo] = -0.5 * s1_mo[p + p * nmo];
-            for q in 0..nmo {
-                if p != q {
-                    u[p + q * nmo] = (f1_mo[p + q * nmo] - self.e[q] * s1_mo[p + q * nmo])
-                        / (self.e[q] - self.e[p]);
-                }
-            }
             eps1[p] = f1_mo[p + p * nmo] - self.e[p] * s1_mo[p + p * nmo];
         }
+        // Non-degenerate pairs: the usual Roothaan restoration.  Pairs inside
+        // one degenerate shell are excluded (their `e_q - e_p` vanishes) and
+        // handled below.
+        for p in 0..nmo {
+            for q in 0..nmo {
+                if p == q || self.same_degenerate_shell(p, q) {
+                    continue;
+                }
+                u[p + q * nmo] = (f1_mo[p + q * nmo] - self.e[q] * s1_mo[p + q * nmo])
+                    / (self.e[q] - self.e[p]);
+            }
+        }
+        // Degenerate shells: the perturbation is not diagonal in the SCF
+        // basis, so its shell block
+        //     A[i,j] = F1[p_i, p_j] - e * S1[p_i, p_j]      (e = shell energy)
+        // is diagonalised; its eigenvalues are the level derivatives
+        // `eps1[p_i]` and its eigenvectors are the first-order rotation of the
+        // shell basis (degenerate perturbation theory).  `tr A` — and hence
+        // the shell-averaged gradient — is basis independent either way, but
+        // the rotation makes each member's `eps1` the derivative of its own
+        // split level instead of an arbitrary mixture of the two.
+        for shell in self.shells.iter() {
+            let d = shell.len();
+            if d < 2 {
+                continue;
+            }
+            let e0 = shell.iter().map(|&p| self.e[p]).sum::<f64>() / d as f64;
+            let mut a = vec![0.0f64; d * d];
+            for (ii, &p) in shell.iter().enumerate() {
+                for (jj, &q) in shell.iter().enumerate() {
+                    a[ii + jj * d] = f1_mo[p + q * nmo] - e0 * s1_mo[p + q * nmo];
+                }
+            }
+            for ii in 0..d {
+                for jj in (ii + 1)..d {
+                    let s = 0.5 * (a[ii + jj * d] + a[jj + ii * d]);
+                    a[ii + jj * d] = s;
+                    a[jj + ii * d] = s;
+                }
+            }
+            let (lam, v) = eigh_symmetric(&a, d);
+            for (ii, &p) in shell.iter().enumerate() {
+                eps1[p] = lam[ii];
+            }
+            // antisymmetric part of V (the pure first-order rotation)
+            for ii in 0..d {
+                for jj in 0..d {
+                    if ii != jj {
+                        let (p, q) = (shell[ii], shell[jj]);
+                        u[p + q * nmo] = 0.5 * (v[ii + jj * d] - v[jj + ii * d]);
+                    }
+                }
+            }
+        }
+        // The orthogonality identity `u + u^T + S1 = 0` is imposed by the
+        // non-degenerate formula; inside a shell a rotation of the basis is a
+        // free gauge (the shell functional is invariant under it), so those
+        // pairs are excluded from the diagnostic.
         let mut orth = 0.0f64;
         for p in 0..nmo {
             for q in 0..nmo {
+                if self.same_degenerate_shell(p, q) {
+                    continue;
+                }
                 orth = orth.max((u[p + q * nmo] + u[q + p * nmo] + s1_mo[p + q * nmo]).abs());
             }
         }
@@ -2275,12 +2410,24 @@ impl GwGradEngine<'_> {
     ///
     /// Returns `(grad, omega, z_factor)` with `grad[atm*3 + comp]` in
     /// Hartree/Bohr (row-major over atoms and Cartesian components).
+    ///
+    /// When `target` belongs to a symmetry-protected degenerate shell the
+    /// returned gradient is the **shell average** `(1/d) sum_m d Omega_m/dR`
+    /// and `omega` is the QP energy of `target` itself (all shell members are
+    /// degenerate).  This is the only basis-independent definition of "the"
+    /// gradient there, and it is what the central finite difference of the
+    /// QP energy of orbital `target` converges to: displacing the nuclei
+    /// splits the shell, the sorted index follows the *other* branch at `-h`,
+    /// so the two-sided difference averages the two level derivatives.
     pub fn analytic_gradient(&self, target: usize) -> (Vec<f64>, f64, f64) {
-        let cache = self.build_target_cache(target);
+        let shell = self.degenerate_shell(target);
+        let caches: Vec<QpCache> = shell.iter().map(|&m| self.build_target_cache(m)).collect();
         // responses before the pullback: see analytic_gradient_with_cache
         // for the memory-peak rationale of this order
         let responses = self.canonical_response_batch();
-        let (bq, bj, be, bb) = self.qp_pullback(&[&cache], &[vec![1.0]]);
+        let w = 1.0 / caches.len() as f64;
+        let refs: Vec<&QpCache> = caches.iter().collect();
+        let (bq, bj, be, bb) = self.qp_pullback(&refs, &[vec![w; caches.len()]]);
         let mut grad = vec![0.0f64; self.natm * 3];
         for atm in 0..self.natm {
             let blocks = self.raw.d_atom_blocks(atm);
@@ -2292,7 +2439,8 @@ impl GwGradEngine<'_> {
                 grad[atm * 3 + comp] = g[0];
             }
         }
-        (grad, cache.omega, cache.z_factor)
+        let own = &caches[shell.iter().position(|&m| m == target).unwrap()];
+        (grad, own.omega, own.z_factor)
     }
 
     /// QP energy of one orbital (the scalar whose gradient is returned by
@@ -2944,6 +3092,9 @@ impl<'a> GwCdGradEngine<'a> {
         for w in weights {
             assert_eq!(w.len(), caches.len(), "cd_qp_pullback: weight row length mismatch");
         }
+        let mask = base.config.phase_mask;
+        let (do_imag, do_static, do_res) = (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0);
+
         let mut bq = vec![vec![0.0f64; naux * nmo * nmo]; nk];
         let mut bj = vec![vec![0.0f64; naux * naux]; nk];
         let mut be = vec![vec![0.0f64; nmo]; nk];
@@ -2987,7 +3138,13 @@ impl<'a> GwCdGradEngine<'a> {
                         let dw = Complex::new(cache.w_imag[wi][m], 0.0) - cache.w0[m];
                         explicit[m] += wt * (kt * dw).re / std::f64::consts::PI;
                     }
-                    staticc[m] = half_minus_f - sum_a - active[m];
+                    // `W(0)` coefficient of the (masked) functional
+                    //   sum_m [ d_i sum_wi a (W_wi - W0) + d_s (1/2 - f_m) W0
+                    //           + d_r sum_r s (W_res - W0) ]
+                    let f_term = if do_static { half_minus_f } else { 0.0 };
+                    let s_a = if do_imag { sum_a } else { Complex::new(0.0, 0.0) };
+                    let act = if do_res { active[m] } else { 0.0 };
+                    staticc[m] = Complex::new(f_term, 0.0) - s_a - Complex::new(act, 0.0);
                 }
                 Coeffs { imag, staticc, explicit }
             })
@@ -3005,8 +3162,13 @@ impl<'a> GwCdGradEngine<'a> {
                 }
                 be[k][n] += c;
                 bb[k][n] += c;
-                for m in 0..nmo {
-                    be[k][m] += c * coeffs[j].explicit[m];
+                if do_imag {
+                    for m in 0..nmo {
+                        be[k][m] += c * coeffs[j].explicit[m];
+                    }
+                }
+                if !do_static {
+                    continue;
                 }
                 let mut scaled = vec![0.0f64; naux * nmo];
                 for m in 0..nmo {
@@ -3045,7 +3207,7 @@ impl<'a> GwCdGradEngine<'a> {
                 (d, dd)
             })
             .collect();
-        for wi in 0..base.quad.len() {
+        for wi in 0..if do_imag { base.quad.len() } else { 0 } {
             let (d, dd) = &imag_factors[wi];
             for k in 0..nk {
                 let mut v = MatrixFull::new([naux, naux], 0.0);
@@ -3141,7 +3303,7 @@ impl<'a> GwCdGradEngine<'a> {
 
         // ---- phase D: rank-one moving residues ----
         let t_d = Instant::now();
-        for (j, cache) in caches.iter().enumerate() {
+        for (j, cache) in caches.iter().enumerate().take(if do_res { usize::MAX } else { 0 }) {
             let n = cache.target;
             if cache.residues.is_empty() {
                 continue;
@@ -3155,7 +3317,9 @@ impl<'a> GwCdGradEngine<'a> {
                     yim[ri * naux + p] = r.y[p].im;
                 }
             }
-            // proj[res, col] = y_res^T qia[:, col]
+            // proj[res, col] = y_res^T qia[:, col]; `gemm_nt` returns the
+            // col-major [nres, nov] buffer of that product, so element
+            // (res, col) lives at `res + col*nres` (NOT `res*nov + col`).
             let proj_re = gemm_nt(&yre, naux, nres, &base.qia, naux, nov);
             let proj_im = gemm_nt(&yim, naux, nres, &base.qia, naux, nov);
             // per-residue diagonals (PySCF delta convention, delta = -de_ia)
@@ -3186,8 +3350,8 @@ impl<'a> GwCdGradEngine<'a> {
                 // w_zeta = Re sum_ia proj^2 dz (k-independent)
                 let mut wz = 0.0f64;
                 for col in 0..nov {
-                    let pr = proj_re[ri * nov + col];
-                    let pi = proj_im[ri * nov + col];
+                    let pr = proj_re[ri + col * nres];
+                    let pi = proj_im[ri + col * nres];
                     let p2re = pr * pr - pi * pi;
                     let p2im = 2.0 * pr * pi;
                     wz += p2re * zr[col] - p2im * zi[col];
@@ -3220,8 +3384,8 @@ impl<'a> GwCdGradEngine<'a> {
                     // polarizability pullback of y^T dQ y and the explicit
                     // zeta_m -> eps1[m] term
                     for col in 0..nov {
-                        let pr = proj_re[ri * nov + col];
-                        let pi = proj_im[ri * nov + col];
+                        let pr = proj_re[ri + col * nres];
+                        let pi = proj_im[ri + col * nres];
                         let p2re = pr * pr - pi * pi;
                         let p2im = 2.0 * pr * pi;
                         let pd_re = pr * dr[col] - pi * di[col];
@@ -3265,10 +3429,19 @@ impl<'a> GwCdGradEngine<'a> {
     ///
     /// Returns `(grad, omega, z_factor)` with `grad[atm*3 + comp]` in
     /// Hartree/Bohr (row-major over atoms and Cartesian components).
+    ///
+    /// For a `target` inside a symmetry-protected degenerate shell the
+    /// gradient is the basis-independent **shell average** — see
+    /// [`GwGradEngine::analytic_gradient`].
     pub fn analytic_gradient(&self, target: usize) -> (Vec<f64>, f64, f64) {
-        let cache = self.build_target_cache(target);
-        let grad = self.analytic_gradient_with_cache(&cache);
-        (grad, cache.omega, cache.z_factor)
+        let shell = self.base.degenerate_shell(target);
+        let caches: Vec<CdQpCache> =
+            shell.iter().map(|&m| self.build_target_cache(m)).collect();
+        let w = 1.0 / caches.len() as f64;
+        let refs: Vec<&CdQpCache> = caches.iter().collect();
+        let grad = self.cd_gradient_with_caches(&refs, &[vec![w; caches.len()]]);
+        let own = &caches[shell.iter().position(|&m| m == target).unwrap()];
+        (grad, own.omega, own.z_factor)
     }
 
     /// Analytic gradient from an already-converged [`CdQpCache`].
@@ -3277,9 +3450,29 @@ impl<'a> GwCdGradEngine<'a> {
     /// pullback so that the analdrv workspaces and the `bq` covector (plus
     /// the per-perturbation `di`/`qx` transients) never coexist — this keeps
     /// the peak memory of the gradient phase close to PySCF's.
+    ///
+    /// For a target inside a degenerate shell this rebuilds the partner
+    /// caches and returns the shell average (use
+    /// [`GwCdGradEngine::analytic_gradient`] to avoid the extra work).
     pub fn analytic_gradient_with_cache(&self, cache: &CdQpCache) -> Vec<f64> {
+        let shell = self.base.degenerate_shell(cache.target);
+        if shell.len() == 1 {
+            return self.cd_gradient_with_caches(&[cache], &[vec![1.0]]);
+        }
+        let caches: Vec<CdQpCache> =
+            shell.iter().map(|&m| self.build_target_cache(m)).collect();
+        let w = 1.0 / caches.len() as f64;
+        let refs: Vec<&CdQpCache> = caches.iter().collect();
+        self.cd_gradient_with_caches(&refs, &[vec![w; caches.len()]])
+    }
+
+    /// Shared gradient assembly: one covector pullback of the weighted cache
+    /// set followed by the per-perturbation contraction.  `weights[0][j]` is
+    /// the coefficient of cache `j`; a single covector set is returned and
+    /// `contract_perturbation` sums over the (here one) sets.
+    fn cd_gradient_with_caches(&self, caches: &[&CdQpCache], weights: &[Vec<f64>]) -> Vec<f64> {
         let responses = self.base.canonical_response_batch();
-        let (bq, bj, be, bb) = self.cd_qp_pullback(&[cache], &[vec![1.0]]);
+        let (bq, bj, be, bb) = self.cd_qp_pullback(caches, weights);
         let mut grad = vec![0.0f64; self.base.natm * 3];
         for atm in 0..self.base.natm {
             let blocks = self.base.raw.d_atom_blocks(atm);
@@ -3309,6 +3502,34 @@ impl<'a> GwCdGradEngine<'a> {
     /// [`GwCdGradEngine::analytic_gradient`]).
     pub fn qp_energy_of(&self, target: usize) -> f64 {
         self.build_target_cache(target).omega
+    }
+
+    /// Validation helper: the response cache (response vectors, `W(iu)`,
+    /// `W(0)` and the active residues) evaluated at a **fixed** external
+    /// frequency, without the QP root search.  Together with the public
+    /// cache fields this lets a test rebuild each phase of the self-energy
+    /// and finite-difference it independently.
+    pub fn cache_at(&self, omega: f64, n: usize) -> CdQpCache {
+        let (_sigma, dsigma, mut cache) = self.sigma_sub(omega, n);
+        cache.z_factor = 1.0 / (1.0 - dsigma);
+        cache
+    }
+
+    /// Validation helper: `Re Sigma_sub(omega)` and `d Re Sigma_sub/d omega`
+    /// at a **fixed** external frequency (no QP root search).
+    pub fn sigma_sub_at(&self, omega: f64, n: usize) -> (f64, f64) {
+        let (sigma, dsigma, _cache) = self.sigma_sub(omega, n);
+        (sigma, dsigma)
+    }
+
+    /// Validation helper: the pullback of one cache **without** the `Z`
+    /// renormalisation, i.e. `d consts_n/dR + d Re Sigma_sub/dR` at the cache
+    /// frequency.  This is the quantity a finite difference of
+    /// `e_n(R) + Re Sigma_sub(omega_ref, R)` (fixed `omega_ref`) must
+    /// reproduce, so it isolates the pullback from the `Z` factor / the
+    /// omega-dependence of the QP equation.
+    pub fn fixed_omega_gradient(&self, cache: &CdQpCache) -> Vec<f64> {
+        self.cd_gradient_with_caches(&[cache], &[vec![1.0 / cache.z_factor]])
     }
 }
 

@@ -471,7 +471,9 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
             c_os,
             c_ss,
         ))),
-        PT2FPMode::FP32 => gfock_list.push(Box::new(RGFockPT2::<f32>::new(
+        // TF32 is only executable by the torch energy engine; the CPU rgfock path
+        // falls back to the f32 kernel
+        PT2FPMode::FP32 | PT2FPMode::TF32 => gfock_list.push(Box::new(RGFockPT2::<f32>::new(
             mo_coeff.to_owned(),
             mo_occ.to_owned(),
             mo_energy.to_owned(),

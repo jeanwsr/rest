@@ -223,6 +223,7 @@ pub fn build_solute_water_box(
     margin_ang: f64,
     spacing_ang: f64,
     max_waters: usize,
+    seed: u64,
 ) -> (String, usize) {
     const BOHR_ANG: f64 = crate::constants::BOHR;
     let n = symbols.len();
@@ -252,28 +253,37 @@ pub fn build_solute_water_box(
     let h1 = [r * (th / 2.0).sin(), r * (th / 2.0).cos(), 0.0];
     let h2 = [-r * (th / 2.0).sin(), r * (th / 2.0).cos(), 0.0];
 
-    let rotations: Vec<[[f64; 3]; 3]> = (0..24)
-        .map(|k| {
-            let a = 0.7 * k as f64;
-            let b = 1.3 * (k as f64) * 0.618034;
-            let c = 2.1 * (k as f64) * 0.415827;
-            let (ca, sa, cb, sb, cc, sc) =
-                (a.cos(), a.sin(), b.cos(), b.sin(), c.cos(), c.sin());
-            let rx = [[1.0, 0.0, 0.0], [0.0, ca, -sa], [0.0, sa, ca]];
-            let ry = [[cb, 0.0, sb], [0.0, 1.0, 0.0], [-sb, 0.0, cb]];
-            let rz = [[cc, -sc, 0.0], [sc, cc, 0.0], [0.0, 0.0, 1.0]];
-            fn mul(p: [[f64; 3]; 3], q: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-                let mut r = [[0.0; 3]; 3];
-                for i in 0..3 {
-                    for jj in 0..3 {
-                        r[i][jj] = (0..3).map(|kk| p[i][kk] * q[kk][jj]).sum();
-                    }
-                }
-                r
+    fn mul(p: [[f64; 3]; 3], q: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+        let mut r = [[0.0; 3]; 3];
+        for i in 0..3 {
+            for jj in 0..3 {
+                r[i][jj] = (0..3).map(|kk| p[i][kk] * q[kk][jj]).sum();
             }
-            mul(rz, mul(ry, rx))
-        })
-        .collect();
+        }
+        r
+    }
+    struct Rng(u64);
+    impl Rng {
+        fn next_f64(&mut self) -> f64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            let z = z ^ (z >> 31);
+            ((z >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+    }
+    fn random_rotation(rng: &mut Rng) -> [[f64; 3]; 3] {
+        let a = rng.next_f64() * std::f64::consts::TAU;
+        let b = rng.next_f64() * std::f64::consts::TAU;
+        let c = rng.next_f64() * std::f64::consts::TAU;
+        let (ca, sa, cb, sb, cc, sc) = (a.cos(), a.sin(), b.cos(), b.sin(), c.cos(), c.sin());
+        let rx = [[1.0, 0.0, 0.0], [0.0, ca, -sa], [0.0, sa, ca]];
+        let ry = [[cb, 0.0, sb], [0.0, 1.0, 0.0], [-sb, 0.0, cb]];
+        let rz = [[cc, -sc, 0.0], [sc, cc, 0.0], [0.0, 0.0, 1.0]];
+        mul(rz, mul(ry, rx))
+    }
+    let mut rng = Rng(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed });
 
     let clash = |x: f64, y: f64, z: f64, cutoff: f64| -> bool {
         for a in pos_bohr.chunks(3) {
@@ -289,7 +299,6 @@ pub fn build_solute_water_box(
 
     let mut waters: Vec<[f64; 9]> = Vec::new();
     let spacing = spacing_ang.max(2.0);
-    let mut gi = 0usize;
     let mut gz = origin[2] + spacing * 0.5;
     while gz < origin[2] + side[2] - spacing * 0.25 {
         let mut gy = origin[1] + spacing * 0.5;
@@ -297,22 +306,21 @@ pub fn build_solute_water_box(
             let mut gx = origin[0] + spacing * 0.5;
             while gx < origin[0] + side[0] - spacing * 0.25 {
                 if max_waters == 0 || waters.len() < max_waters {
-                    let rot = &rotations[gi % rotations.len()];
+                    let rot = random_rotation(&mut rng);
                     let o = [gx, gy, gz];
-                    let h1 = [o[0] + rot[0][0]*h1[0] + rot[0][1]*h1[1] + rot[0][2]*h1[2],
-                              o[1] + rot[1][0]*h1[0] + rot[1][1]*h1[1] + rot[1][2]*h1[2],
-                              o[2] + rot[2][0]*h1[0] + rot[2][1]*h1[1] + rot[2][2]*h1[2]];
-                    let h2 = [o[0] + rot[0][0]*h2[0] + rot[0][1]*h2[1] + rot[0][2]*h2[2],
-                              o[1] + rot[1][0]*h2[0] + rot[1][1]*h2[1] + rot[1][2]*h2[2],
-                              o[2] + rot[2][0]*h2[0] + rot[2][1]*h2[1] + rot[2][2]*h2[2]];
-                    if !clash(o[0], o[1], o[2], 3.0)
-                        && !clash(h1[0], h1[1], h1[2], 2.0)
-                        && !clash(h2[0], h2[1], h2[2], 2.0)
+                    let ah1 = [o[0] + rot[0][0]*h1[0] + rot[0][1]*h1[1] + rot[0][2]*h1[2],
+                               o[1] + rot[1][0]*h1[0] + rot[1][1]*h1[1] + rot[1][2]*h1[2],
+                               o[2] + rot[2][0]*h1[0] + rot[2][1]*h1[1] + rot[2][2]*h1[2]];
+                    let ah2 = [o[0] + rot[0][0]*h2[0] + rot[0][1]*h2[1] + rot[0][2]*h2[2],
+                               o[1] + rot[1][0]*h2[0] + rot[1][1]*h2[1] + rot[1][2]*h2[2],
+                               o[2] + rot[2][0]*h2[0] + rot[2][1]*h2[1] + rot[2][2]*h2[2]];
+                    if !clash(o[0], o[1], o[2], 3.2)
+                        && !clash(ah1[0], ah1[1], ah1[2], 3.0)
+                        && !clash(ah2[0], ah2[1], ah2[2], 3.0)
                     {
-                        waters.push([o[0], o[1], o[2], h1[0], h1[1], h1[2], h2[0], h2[1], h2[2]]);
+                        waters.push([o[0], o[1], o[2], ah1[0], ah1[1], ah1[2], ah2[0], ah2[1], ah2[2]]);
                     }
                 }
-                gi += 1;
                 gx += spacing;
             }
             gy += spacing;
@@ -828,6 +836,20 @@ pub fn build_embedding(
             }
         }
         if best_dist2 <= cutoff_bohr * cutoff_bohr {
+            if best_dist2 < (1.5 / BOHR) * (1.5 / BOHR) {
+                static WARNED_CLOSE_QM_MM: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED_CLOSE_QM_MM.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "Warning: MM point charge #{} is only {:.2} A from the nearest QM atom. \
+                         The point-charge embedding has no LJ shielding for close MM atoms \
+                         (e.g. TIP3P H has eps=0), which can destabilise the SCF; check the QM/MM \
+                         setup and the solvent equilibration.",
+                        j + 1,
+                        best_dist2.sqrt() * BOHR
+                    );
+                }
+            }
             sites.push(EmbeddingSite {
                 mm_index: j,
                 charge: mm_charges[j],

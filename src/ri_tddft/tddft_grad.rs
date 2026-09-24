@@ -169,10 +169,10 @@ impl<'a> TddftGradEngine<'a> {
         let nmo = scf.eigenvalues[0].len();
         let natm = scf.mol.geom.nfree;
         let raw = build_raw_ri_tensors(scf);
-        let is_hf = scf.mol.xc_data.dfa_compnt_scf.is_empty();
-        let hyb = if is_hf { 1.0 } else { scf.mol.xc_data.dfa_hybrid_scf };
-        let hyb_sr = match crate::ri_tddft::utils::rsh_exchange_coeffs(scf) {
-            Some((_omega, _c_full, c_sr)) => {
+        // dfa_hybrid_scf is 1.0 for an HF reference (set by DFA4REST::parse_scf).
+        let hyb = scf.mol.xc_data.dfa_hybrid_scf;
+        let hyb_sr = match scf.mol.xc_data.rsh_params() {
+            Some((_omega, _c_lr, c_sr)) => {
                 panic!(
                     "TDDFT gradient: range-separated hybrids are not yet supported \
                      (c_sr={:.6}); use an ordinary hybrid or pure functional",
@@ -696,7 +696,7 @@ impl<'a> TddftGradEngine<'a> {
     /// contraction with weight 2 is exact and removes one full GGA grid kernel
     /// per call (5 -> 4 overall).
     #[allow(clippy::too_many_arguments)]
-    pub fn contract_xc_kernel(
+    fn contract_xc_kernel(
         &self,
         dmvo: Option<&AOMat>,
         dmoo: Option<&AOMat>,

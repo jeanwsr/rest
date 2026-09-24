@@ -102,6 +102,94 @@ class _RestAseOpt:
         return [c for row in p for c in row]
 "#;
 
+/// ASE release that first projected the Langevin random displacement and
+/// velocity with the sqrt(N/(N-1)) factor for `fixcm=True`.
+///
+/// ASE 3.22 used an older scheme, ASE 3.23 to 3.24 removed the centre of mass
+/// without that factor. Both follow a different trajectory from the same seed
+/// and therefore cannot reproduce the MD reference logs committed in
+/// `rest_regression`.
+pub const MIN_ASE_VERSION: (u32, u32) = (3, 25);
+
+/// Identity of the Python interpreter embedded in REST and of the ASE
+/// installation that this interpreter imports.
+#[derive(Clone, Debug)]
+pub struct AseEnv {
+    pub python_version: String,
+    pub python_prefix: String,
+    pub ase_version: String,
+    pub ase_path: String,
+}
+
+impl AseEnv {
+    pub fn describe(&self) -> String {
+        format!(
+            "python {} (prefix {}), ase {} ({})",
+            self.python_version, self.python_prefix, self.ase_version, self.ase_path
+        )
+    }
+
+    /// Major and minor version of ASE, when they can be parsed.
+    fn ase_major_minor(&self) -> Option<(u32, u32)> {
+        let mut parts = self.ase_version.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        Some((major, minor))
+    }
+}
+
+/// Read the interpreter and ASE identity from the embedded Python.
+///
+/// The interpreter is fixed when REST is built, so the reported prefix is also
+/// the environment whose pip has to provide ASE.
+fn probe_ase(py: Python<'_>) -> anyhow::Result<AseEnv> {
+    let sys = py.import("sys")?;
+    let version: String = sys.getattr("version")?.extract()?;
+    let python_version = version.split_whitespace().next().unwrap_or("?").to_string();
+    let python_prefix: String = sys.getattr("prefix")?.extract()?;
+    let ase = py.import("ase").map_err(|error| {
+        anyhow::anyhow!(
+            "the Python module 'ase' is not available ({error})\n  interpreter: python {python_version} (prefix {python_prefix})\n  REST MD needs ASE >= {}.{} in that environment, for example:\n    {}/bin/python -m pip install -U \"ase>={}.{}\"",
+            MIN_ASE_VERSION.0,
+            MIN_ASE_VERSION.1,
+            python_prefix,
+            MIN_ASE_VERSION.0,
+            MIN_ASE_VERSION.1,
+        )
+    })?;
+    Ok(AseEnv {
+        python_version,
+        python_prefix,
+        ase_version: ase.getattr("__version__")?.extract()?,
+        ase_path: ase.getattr("__file__")?.extract()?,
+    })
+}
+
+/// Announce the interpreter and ASE identity, and warn when ASE is old enough
+/// to change the Langevin trajectory.
+fn report_ase_env(env: &AseEnv) {
+    println!("MD engine ASE: {}", env.describe());
+    if let Some(version) = env.ase_major_minor() {
+        if version < MIN_ASE_VERSION {
+            println!(
+                "WARNING: ASE {}.{} is older than ASE {}.{}. REST MD uses Langevin(fixcm=True), \
+                 whose projection of the random displacement and velocity changed in ASE {}.{}. \
+                 Trajectories from the same seed therefore differ from the committed MD reference \
+                 logs. Upgrade with:\n    {}/bin/python -m pip install -U \"ase>={}.{}\"",
+                version.0,
+                version.1,
+                MIN_ASE_VERSION.0,
+                MIN_ASE_VERSION.1,
+                MIN_ASE_VERSION.0,
+                MIN_ASE_VERSION.1,
+                env.python_prefix,
+                MIN_ASE_VERSION.0,
+                MIN_ASE_VERSION.1,
+            );
+        }
+    }
+}
+
 pub struct AseMd {
     driver: Py<PyAny>,
     _hook: Py<PyForceHook>,
@@ -129,6 +217,9 @@ impl AseMd {
     {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| -> PyResult<Self> {
+            let env = probe_ase(py)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            report_ase_env(&env);
             let code = std::ffi::CString::new(PY_ASE_MD).unwrap();
             let locals = PyDict::new(py);
 
@@ -198,6 +289,9 @@ impl AseOpt {
     ) -> anyhow::Result<Self> {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| -> PyResult<Self> {
+            let env = probe_ase(py)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            println!("ASE optimizer: {}", env.describe());
             let code = std::ffi::CString::new(PY_ASE_MD).unwrap();
             let locals = PyDict::new(py);
             py.run(&code, Some(&locals), Some(&locals))?;
