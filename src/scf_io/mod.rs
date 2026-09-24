@@ -3842,12 +3842,15 @@ impl SCF {
 /// A new matrix that represents the result of \( a^T \cdot b \cdot c \).
 ///
 /// # Example
-/// ```
+///
+/// ```text
 /// let a = MatrixFull::new([size, size], ...);
 /// let b = MatrixFull::new([size, size], ...);
 /// let c = MatrixFull::new([size, size], ...);
-/// let result = apply_projection_operator(&a, &b, &c, size);
+/// let result = apply_projection_operator(&a, &b, &c);
 /// ```
+///
+/// (Illustrative; build the matrices with concrete values before running.)
 pub fn apply_projection_operator(a: &MatrixFull<f64>, b: &MatrixFull<f64>, c: &MatrixFull<f64>) -> MatrixFull<f64> {
     // Temporary matrix to store intermediate result of a^T * b
     let mut temp: MatrixFull<f64> = MatrixFull::new([a.size[1], b.size[1]], 0.0);
