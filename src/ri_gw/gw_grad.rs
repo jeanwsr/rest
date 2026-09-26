@@ -169,6 +169,26 @@ pub struct GwGradConfig {
     /// Requires a non-degenerate HF reference; otherwise the gradient falls
     /// back to the per-perturbation route.
     pub adjoint_cphf: bool,
+    /// Locality-aware evaluation of the `dI` contraction
+    /// ([`GwGradEngine::adjoint_perturbation_gradient_local`]).  `dI` is
+    /// nonzero only on the perturbed atom's own AO rows/columns
+    /// (`int3c2e_ip1`) and, for the atom's own auxiliary functions, on the
+    /// whole `[nao,nao]` slice (`int3c2e_ip2`); contracting the covectors
+    /// directly against those sliced blocks avoids materialising a dense
+    /// `[nao,nao]` slice for every auxiliary function, lowering the
+    /// per-perturbation cost from `O(naux nao^2)` to
+    /// `O(naux nao nrow_A + naux_A nao^2)` and the whole gradient from
+    /// `O(3 natm naux nao^2)` to `O(naux nao^2)`.
+    pub local_di: bool,
+    /// Evaluate the adjoint CP-HF channel without the per-perturbation skeleton
+    /// right-hand side tensor: `rhs_d` is linear in the derivative integrals,
+    /// so `sum_d <Z, rhs_d>` is folded into direction-independent AO-basis
+    /// covectors (`W = Zbra C_occ^T` and its `dh1`/`dS`/`dJ`/`dK` partners) that
+    /// contract with the *same* streamed `dI` slices the gradient already
+    /// touches.  This removes `compute_dimless_cpscf_rhs` (the RI-JK skeleton
+    /// derivative machinery, measured at ~2 s for C2H4/def2-TZVPP and ~7.5 s for
+    /// C6H6/def2-TZVPP) from the gradient path.
+    pub fold_cphf_rhs: bool,
 }
 
 impl Default for GwGradConfig {
@@ -194,6 +214,8 @@ impl Default for GwGradConfig {
             skip_lr_cache: false,
             folded_qx: true,
             adjoint_cphf: true,
+            local_di: true,
+            fold_cphf_rhs: true,
         }
     }
 }
@@ -535,6 +557,12 @@ impl RawRiTensors {
 // ---------------------------------------------------------------------------
 // small dense helpers (flat col-major buffers, first index fastest)
 // ---------------------------------------------------------------------------
+
+/// Plain inner product of two flat buffers.
+#[inline]
+pub fn flat_dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
 
 pub fn solve_linear(a: &MatrixFull<f64>, b: &[f64]) -> Vec<f64> {
     _dsolve(a, b).expect("gw_grad: singular linear system")
@@ -2306,6 +2334,11 @@ impl GwGradEngine<'_> {
             //      and one block-Krylov solve over all perturbations ----
             let t_rhs0 = Instant::now();
             let rhs_map = hess.compute_dimless_cpscf_rhs();
+            if std::env::var("REST_GWGRAD_RIJK_TIMING").is_ok() {
+                for (k, v) in rijk_obj.timing.iter() {
+                    eprintln!("[rijk timing] {k:44} {v:8.3}s");
+                }
+            }
             let t_rhs = t_rhs0.elapsed().as_secs_f64();
             (rhs_map, t_prep, t_rhs)
         };
@@ -2619,10 +2652,17 @@ impl GwGradEngine<'_> {
                     let blocks = self.raw.d_atom_blocks(atm);
                     for comp in 0..3 {
                         let dj = self.raw.d_j_atom(atm, comp);
-                        grad[atm * 3 + comp] = self.adjoint_perturbation_gradient(
-                            &adj, &blocks, comp, &h1r, &s1r[comp], &dj, &bj[0], &bb[0],
-                            &zero_bx, atm * 3 + comp,
-                        );
+                        grad[atm * 3 + comp] = if self.config.local_di {
+                            self.adjoint_perturbation_gradient_local(
+                                &adj, &blocks, comp, &h1r, &s1r[comp], &dj, &bj[0], &bb[0],
+                                &zero_bx, atm * 3 + comp,
+                            )
+                        } else {
+                            self.adjoint_perturbation_gradient(
+                                &adj, &blocks, comp, &h1r, &s1r[comp], &dj, &bj[0], &bb[0],
+                                &zero_bx, atm * 3 + comp,
+                            )
+                        };
                     }
                 }
                 return (grad, own0.omega, own0.z_factor);
@@ -3830,8 +3870,18 @@ impl<'a> GwCdGradEngine<'a> {
 
 /// Per-geometry adjoint data of the CP-HF channel; see the section header.
 pub struct CphfAdjoint {
-    /// `[naux, nao, nao]`: `B - 2 fock_hyb Theta` (coefficient of `dI`).
+    /// `[naux, nao, nao]`: **symmetrised** coefficient of `dI`,
+    /// `(B - 2 fock_hyb Theta + c_P Lam_ao) + transpose`.  The Coulomb
+    /// `sum_P a_P c_P` term (`a_P = <Lam_ao, dI_P>`) is folded in, and the
+    /// symmetrisation lets both `int3c2e_ip1` bra centres be contracted in a
+    /// single pass (see [`GwGradEngine::adjoint_perturbation_gradient_local`]).
     pub di_cov: Vec<f64>,
+    /// `[nao, nao]`: `dm + dm^T` (the SCF density is symmetric, so this is
+    /// `2 dm`); used together with the factor `1/2` of the symmetrised slicing.
+    pub dm_sym: Vec<f64>,
+    /// `[naux]`: `J^-1 lambda`; replaces the per-perturbation metric solve by
+    /// `sum_P lambda_P dc_P = sum_P lam_tilde_P (drho - dJ c)_P`.
+    pub lam_tilde: Vec<f64>,
     /// `[nao, nao]`: `Lam_ao` (coefficient of `dh1`).
     pub lam_ao: Vec<f64>,
     /// `[nao, nao]`: `Lam_s,ao` (coefficient of `dS`, col-major like `dS`).
@@ -3844,8 +3894,20 @@ pub struct CphfAdjoint {
     pub c_aux: Vec<f64>,
     /// `[nao, nao]` SCF density (col-major).
     pub dm: Vec<f64>,
-    /// `[3 natm]`: `<Z, rhs_d>`.
+    /// `[3 natm]`: `<Z, rhs_d>` (only filled when `fold_cphf_rhs` is off, for
+    /// cross-validation against the folded route).
     pub rhs_dot: Vec<f64>,
+    /// whether `<Z, rhs_d>` was folded into the covectors (`false` = the
+    /// reference route, which keeps `rhs_dot` and must not add the `W` terms).
+    pub fold_rhs: bool,
+    /// `[nao, nao]`: `W = Zbra C_occ^T`, the AO covector replacing `<Z, rhs_d>`
+    /// (coefficient of `dh1`).
+    pub w_dh1: Vec<f64>,
+    /// `[nao, nao]`: coefficient of `dS`.
+    pub w_ds: Vec<f64>,
+    /// flattened `[nmo, nocc, 3, natm]` analdrv skeleton Fock derivative (only
+    /// filled when `fold_cphf_rhs` is off; used by the verification tests).
+    pub f1mo_ref: Vec<f64>,
     /// exchange scale of the skeleton Fock derivative (always 0.5 here)
     pub half_k: f64,
     /// `[naux, nao, nao]`: exchange skeleton adjoint tensor `Theta`.
@@ -3987,8 +4049,9 @@ impl GwGradEngine<'_> {
         timings[1] = t_setup.elapsed().as_secs_f64();
 
         timings[0] = t_all.elapsed().as_secs_f64() - t_setup.elapsed().as_secs_f64();
+        let fold_rhs = self.config.fold_cphf_rhs;
         let t_rhs = Instant::now();
-        let rhs_full = {
+        let rhs_full_opt = {
             let nuc_list: Vec<&mut dyn HessNucAPI> = Vec::new();
             let core_list: Vec<&mut dyn RHessCoreAPI> = vec![&mut hcore_obj];
             let el_list: Vec<&mut dyn RHessElecInteractAPI> = vec![&mut rijk_obj];
@@ -3999,10 +4062,19 @@ impl GwGradEngine<'_> {
             hess.make_response_preparation();
             timings[2] = t_rhs.elapsed().as_secs_f64();
             let t2 = Instant::now();
-            let rhs_map = hess.compute_dimless_cpscf_rhs();
-            timings[3] = t2.elapsed().as_secs_f64();
-            rhs_map["rhs"].to_owned()
+            if fold_rhs {
+                // only `f1mo`/`s1mo` are unavailable here; the skeleton tensor
+                // itself is never needed (the `Z` contraction is folded below)
+                (None, None)
+            } else {
+                let rhs_map = hess.compute_dimless_cpscf_rhs();
+                timings[3] = t2.elapsed().as_secs_f64();
+                let f1 = rhs_map["f1mo"].to_owned();
+                let fr = f1.raw()[f1.offset()..f1.offset() + nmo * nocc * 3 * self.natm].to_vec();
+                (Some(rhs_map["rhs"].to_owned()), Some(fr))
+            }
         };
+        let (rhs_full, f1mo_ref) = rhs_full_opt;
 
         let t_solve = Instant::now();
         // dimensionless rhs for the adjoint: `rhs_vir = L / (e_a - e_i)`, occ = 0
@@ -4025,10 +4097,14 @@ impl GwGradEngine<'_> {
             let t = rt::asarray((&src, [nvir, nocc], &device)).into_contig(ColMajor);
             buf.assign(&t);
         }
+        let t_asm = t_solve.elapsed();
+        let t_sv = Instant::now();
         let z_raw = resp.solve_dimless_cpscf(rhs_z.view()); // [nmo, nocc]
+        let t_sv = t_sv.elapsed();
         let z_cont = z_raw.into_contig(ColMajor);
         let mut z_vec = vec![0.0f64; nmo * nocc];
         z_vec.copy_from_slice(&z_cont.raw()[z_cont.offset()..z_cont.offset() + nmo * nocc]);
+        let t_occ0 = Instant::now();
         let z_occ_corr = {
             let mut x = rt::zeros(([nmo, nocc].f(), &device));
             let mut zv = vec![0.0f64; nvir * nocc];
@@ -4061,18 +4137,69 @@ impl GwGradEngine<'_> {
             }
         }
 
-        // <Z, rhs_d> for every perturbation
-        let rhs_dot: Vec<f64> = {
-            let zt = rt::asarray((&z_vec, [nmo, nocc], &device)).into_contig(ColMajor);
-            let prod = &rhs_full * &zt.i((.., .., None, None));
-            let s = prod.sum_axes([0, 1]); // [3, natm]
-            let sr = s.raw();
-            let so = s.offset();
-            sr[so..so + 3 * self.natm].to_vec()
+        if std::env::var("REST_GWGRAD_ZDBG").is_ok() {
+            eprintln!(
+                "[zdbg] rhs-assembly {:.3}s solve {:.3}s occ-corr {:.3}s",
+                t_asm.as_secs_f64(),
+                t_sv.as_secs_f64(),
+                t_occ0.elapsed().as_secs_f64()
+            );
+        }
+        // <Z, rhs_d> for every perturbation (skipped on the folded route)
+        let rhs_dot: Vec<f64> = match &rhs_full {
+            Some(rhs_full) => {
+                let zt = rt::asarray((&z_vec, [nmo, nocc], &device)).into_contig(ColMajor);
+                let prod = rhs_full * &zt.i((.., .., None, None));
+                let s = prod.sum_axes([0, 1]); // [3, natm]
+                let sr = s.raw();
+                let so = s.offset();
+                sr[so..so + 3 * self.natm].to_vec()
+            }
+            None => vec![0.0f64; 3 * self.natm],
         };
 
         timings[4] = t_solve.elapsed().as_secs_f64();
         let t_skel = Instant::now();
+        // ---- (c2) fold `sum_d <Z, rhs_d>` into AO covectors -------------
+        //
+        // `rhs_d` is built from the skeleton Fock/overlap derivatives,
+        //   rhs[a,i] = -(f1mo[a,i] - s1mo[a,i] e_i)/D_ai ,  rhs[j,i] = -s1mo[j,i]/2,
+        // so with `Zf[p,i] = -Z[p,i]/D_pi` (virtual p) and
+        // `Zs[a,i] = Z[a,i] e_i/D_ai`, `Zs[j,i] = -Z[j,i]/2` (occupied j),
+        //   sum_d <Z, rhs_d> = sum_{mu i} Zbra[mu,i] f1bra[mu,i] + <Zsbra, s1mo>
+        // with `Zbra = C Zf`, `Zsbra = C Zs`.  Writing `f1bra = dh1·C_occ +
+        // (Jd - Kd/2)·C_occ` and `s1mo = C^T dS C_occ` gives
+        //   sum_d <Z, rhs_d> = <W, dh1_d + Jd_d - Kd_d/2> + <W_s, dS_d> ,
+        //   W = Zbra C_occ^T ,  W_s = Zsbra C_occ^T ,
+        // i.e. the same `dh1`/`dJ`/`dK`/`dS` contractions already built for
+        // `Lambda_ao`, so `W` is simply added into those folded covectors.
+        let (w_dh1, w_ds) = {
+            let mut zf = vec![0.0f64; nmo * nocc];
+            let mut zs = vec![0.0f64; nmo * nocc];
+            for i in 0..nocc {
+                for a in 0..nvir {
+                    let p = nocc + a;
+                    let d = e_ai_shift[a + i * nvir];
+                    let z = z_vec[p + i * nmo];
+                    zf[p + i * nmo] = -z / d;
+                    zs[p + i * nmo] = z * e[i] / d;
+                }
+                for j in 0..nocc {
+                    zs[j + i * nmo] = -0.5 * z_vec[j + i * nmo];
+                }
+            }
+            let cm = to_mat(&cocc, nao, nocc);
+            let to_ao = |m: &[f64]| -> Vec<f64> {
+                let mm = to_mat(m, nmo, nocc);
+                let mut tmp = MatrixFull::new([nao, nocc], 0.0);
+                let mut out = MatrixFull::new([nao, nao], 0.0);
+                _dgemm_full(&self.c_mo, 'N', &mm, 'N', &mut tmp, 1.0, 0.0);
+                _dgemm_full(&tmp, 'N', &cm, 'T', &mut out, 1.0, 0.0);
+                out.data
+            };
+            (to_ao(&zf), to_ao(&zs))
+        };
+
         // ---- (d) folded skeleton tensors --------------------------------
         // Lam_aux = I^T Lam_ao            [naux]
         let lam_aux = gemm_nt(&self.raw.i3, n2, naux, &lam_ao, n2, 1);
@@ -4098,13 +4225,19 @@ impl GwGradEngine<'_> {
         let mut gt = yt.clone();
         self.solve_metric_batch(&mut gt, nao * nocc);
 
-        // Theta_P = Lam_ao G_P Cocc^T   ([nao,nao] per P)
-        let lam_ao_m = to_mat(&lam_ao, nao, nao);
+        // Folded exchange adjoint of an arbitrary AO covector `x_ao`:
+        //   <x_ao, Kd> = 4 <Theta_x, dI> - 2 <Psi_x, dJ> ,
+        //   Theta_x[P] = x_ao G_P Cocc^T ,  Phi_x[P,P'] = sum_i Y_i^T x_ao G_i ,
+        //   Psi_x = J^-1 Phi_x .
         let cm = to_mat(&cocc, nao, nocc);
-        let mut theta = vec![0.0f64; naux * n2];
-        {
+        // `x_theta` and `x_phi` are separate because `<X,Kd> = 2<Theta_{X+X^T},dI>
+        // - 2<Psi_X,dJ>`: the `dY G^T` term symmetrises `X` (the partner is its
+        // transpose) while the `Y G2^T` term does not.
+        let mut fold_exchange = |x_theta: &[f64], x_phi: &[f64]| -> (Vec<f64>, Vec<f64>) {
+            let xm = to_mat(x_theta, nao, nao);
+            let mut theta = vec![0.0f64; naux * n2];
             let mut gp = MatrixFull::new([nao, nocc], 0.0);
-            let mut x = MatrixFull::new([nao, nocc], 0.0);
+            let mut xb = MatrixFull::new([nao, nocc], 0.0);
             let mut th = MatrixFull::new([nao, nao], 0.0);
             for p in 0..naux {
                 for i in 0..nocc {
@@ -4112,18 +4245,15 @@ impl GwGradEngine<'_> {
                         gp.data[nu + i * nao] = gt[p + (i * nao + nu) * naux];
                     }
                 }
-                _dgemm_full(&lam_ao_m, 'N', &gp, 'N', &mut x, 1.0, 0.0);
-                _dgemm_full(&x, 'N', &cm, 'T', &mut th, 1.0, 0.0);
+                _dgemm_full(&xm, 'N', &gp, 'N', &mut xb, 1.0, 0.0);
+                _dgemm_full(&xb, 'N', &cm, 'T', &mut th, 1.0, 0.0);
                 theta[p * n2..(p + 1) * n2].copy_from_slice(&th.data);
             }
-        }
-        // Phi[P,P'] = sum_i Y_i^T Lam_ao G_i,  Psi = J^-1 Phi
-        let mut phi = MatrixFull::new([naux, naux], 0.0);
-        {
+            let xm = to_mat(x_phi, nao, nao);
+            let mut acc = MatrixFull::new([naux, naux], 0.0);
             let mut yi = MatrixFull::new([nao, naux], 0.0);
             let mut gi = MatrixFull::new([nao, naux], 0.0);
-            let mut x = MatrixFull::new([nao, naux], 0.0);
-            let mut acc = MatrixFull::new([naux, naux], 0.0);
+            let mut xi = MatrixFull::new([nao, naux], 0.0);
             for i in 0..nocc {
                 for p in 0..naux {
                     for nu in 0..nao {
@@ -4131,24 +4261,80 @@ impl GwGradEngine<'_> {
                         gi.data[nu + p * nao] = gt[p + (i * nao + nu) * naux];
                     }
                 }
-                _dgemm_full(&lam_ao_m, 'N', &gi, 'N', &mut x, 1.0, 0.0);
+                _dgemm_full(&xm, 'N', &gi, 'N', &mut xi, 1.0, 0.0);
                 // accumulate over occupied orbitals (beta = 1)
-                _dgemm_full(&yi, 'T', &x, 'N', &mut acc, 1.0, 1.0);
+                _dgemm_full(&yi, 'T', &xi, 'N', &mut acc, 1.0, 1.0);
             }
             let mut phi_flat = acc.data;
             self.solve_metric_batch(&mut phi_flat, naux);
-            for (a, b) in phi.data.iter_mut().zip(phi_flat.iter()) {
-                *a = *b;
+            (theta, phi_flat)
+        };
+        // The `Z` covector `W` rides the same contractions, and both builders
+        // are linear in their covector, so a single call each suffices:
+        //   -2 Theta_{Lambda + (W+W^T)/2} = -2 Theta_Lambda - Theta_{W+W^T}
+        //     (the `dY G^T` term symmetrises its covector, hence `(W+W^T)/2`),
+        //   Psi_{Lambda + W} = Psi_Lambda + Psi_W .
+        let lam_aux_w = gemm_nt(&self.raw.i3, n2, naux, &w_dh1, n2, 1);
+        let mut x_theta = lam_ao.clone();
+        let mut x_phi = lam_ao.clone();
+        if fold_rhs {
+            for mu in 0..nao {
+                for nu in 0..nao {
+                    let k = mu + nu * nao;
+                    x_theta[k] += 0.5 * (w_dh1[k] + w_dh1[nu + mu * nao]);
+                    x_phi[k] += w_dh1[k];
+                }
             }
         }
+        let (theta, psi) = fold_exchange(&x_theta, &x_phi);
 
         timings[5] = t_skel.elapsed().as_secs_f64();
         // dI covector = B - 2*fock_hyb*Theta (the skeleton uses the plain 1/2)
+        // The Coulomb skeleton is <Lam_ao, Jd> = sum_P a_P c_P + sum_P lam_P dc_P
+        // with a_P = <Lam_ao, dI_P>, c = J^-1 rho and dc = J^-1 (drho - dJ c).
+        // J^-1 is symmetric, so sum_P lam_P dc_P = sum_P lam_tilde_P (drho - dJ c)_P
+        // with lam_tilde = J^-1 lam; this removes the per-perturbation metric
+        // solve and lets `c_P Lam_ao` be folded into the dI covector.
         let half_k = 0.5f64;
-        let mut di_cov = fold.b_ao.clone();
-        for k in 0..naux * n2 {
-            // -1/2 * <Lam,Kd> contributes -2 <Theta,dI>
-            di_cov[k] -= 2.0 * theta[k];
+        // `sum_d <Z,rhs_d> = <W, dh1 + Jd - Kd/2> + <W_s, dS>` rides the same
+        // folded contractions as `<Lambda_ao, ...>`, so the Coulomb covector
+        // `lambda_W = I^T W`, the exchange tensors `Theta_W`/`Psi_W` and the
+        // per-direction `dh1`/`dS` partners are simply added in.
+        let mut lam_aux_total = lam_aux.clone();
+        if fold_rhs {
+            for (a, b) in lam_aux_total.iter_mut().zip(lam_aux_w.iter()) {
+                *a += b;
+            }
+        }
+        let lam_tilde = self.solve_metric(&lam_aux_total);
+        // `dI^(a)` (first bra centre) and `dI^(b)` (second bra centre) are
+        // transposes of each other and `dI^(c)` (auxiliary centre) is symmetric,
+        // so the full `dI` slice is symmetric and contracting with the
+        // symmetrised covector counts both bra centres at once:
+        //   sum_munu X dI = sum X_sym dI^(a) + (1/2) sum X_sym dI^(c) .
+        let mut di_cov = vec![0.0f64; naux * n2];
+        for p in 0..naux {
+            let cp = c_aux[p];
+            let off = p * n2;
+            for mu in 0..nao {
+                for nu in 0..nao {
+                    let k = mu + nu * nao;
+                    let kt = nu + mu * nao;
+                    // A = B - 2*Theta + c_P Lam_ao - 2*Theta_W + c_P W   (un-symmetrised)
+                    let wfac = if fold_rhs { 1.0 } else { 0.0 };
+                    let a = fold.b_ao[off + k] - 2.0 * theta[off + k] + cp * lam_ao[k]
+                        + wfac * cp * w_dh1[k];
+                    let at = fold.b_ao[off + kt] - 2.0 * theta[off + kt] + cp * lam_ao[kt]
+                        + wfac * cp * w_dh1[kt];
+                    di_cov[off + k] = a + at;
+                }
+            }
+        }
+        let mut dm_sym = vec![0.0f64; n2];
+        for mu in 0..nao {
+            for nu in 0..nao {
+                dm_sym[mu + nu * nao] = dm[mu + nu * nao] + dm[nu + mu * nao];
+            }
         }
 
         Some(CphfAdjoint {
@@ -4156,12 +4342,18 @@ impl GwGradEngine<'_> {
             lam_ao,
             lams_ao,
             lam_aux,
-            psi: phi.data,
+            psi,
             c_aux,
             dm,
             rhs_dot,
+            fold_rhs,
+            w_dh1,
+            w_ds,
+            f1mo_ref: f1mo_ref.unwrap_or_default(),
             half_k,
             timings,
+            lam_tilde,
+            dm_sym,
             theta: theta.clone(),
             lam_mo: lam,
             lams_mo: lams,
@@ -4174,6 +4366,10 @@ impl GwGradEngine<'_> {
     /// One perturbation's gradient from the adjoint data; same value as
     /// `folded_perturbation_gradient` but with the CP-HF response contracted
     /// through `Z` (no per-perturbation response).
+    ///
+    /// This variant materialises a dense `[nao,nao]` `dI` slice for every
+    /// auxiliary function; see [`GwGradEngine::adjoint_perturbation_gradient_local`]
+    /// for the locality-aware (asymptotically cheaper) version.
     #[allow(clippy::too_many_arguments)]
     pub fn adjoint_perturbation_gradient(
         &self,
@@ -4188,63 +4384,174 @@ impl GwGradEngine<'_> {
         b_x: &[f64],
         dir: usize,
     ) -> f64 {
-        let an2 = self.nao * self.nao;
+        let n2 = self.nao * self.nao;
         let naux = self.naux;
-        let mut ip = vec![0.0f64; an2];
-        let mut a_vec = vec![0.0f64; naux];
-        let mut drho = vec![0.0f64; naux];
+        let mut ip = vec![0.0f64; n2];
         let mut g = 0.0f64;
+        let mut g_dm = 0.0f64;
         for p in 0..naux {
             self.raw.d_i_block(blocks, comp, p, &mut ip);
-            let off = p * an2;
-            g += adj.di_cov[off..off + an2]
-                .iter()
-                .zip(ip.iter())
-                .map(|(x, y)| x * y)
-                .sum::<f64>();
-            a_vec[p] = adj.lam_ao.iter().zip(ip.iter()).map(|(x, y)| x * y).sum::<f64>();
-            drho[p] = adj.dm.iter().zip(ip.iter()).map(|(x, y)| x * y).sum::<f64>();
+            let off = p * n2;
+            // the dense `dI` slice is symmetric, so the symmetrised covectors
+            // count it with a factor 1/2
+            g += 0.5 * flat_dot(&adj.di_cov[off..off + n2], &ip);
+            g_dm += 0.5 * adj.lam_tilde[p] * flat_dot(&adj.dm_sym, &ip);
         }
-        // Coulomb skeleton: <Lam_ao, Jd> = sum_P a_P c_P + sum_P lam_P dc_P
-        let mut djc = vec![0.0f64; naux];
+        self.finish_adjoint_gradient(adj, comp, h1r, s1_comp, dj, bj_k, bb_k, b_x, dir, g + g_dm)
+    }
+
+    /// Locality-aware variant of [`GwGradEngine::adjoint_perturbation_gradient`].
+    ///
+    /// `dI[mu,nu,P]` is nonzero only where a centre sits on the perturbed atom:
+    /// `int3c2e_ip1` gives the atom's AO rows (`mu` on the atom, all `nu`) and
+    /// columns (`nu` on the atom, all `mu`), while `int3c2e_ip2` is dense in
+    /// `[mu,nu]` but only for the atom's own auxiliary functions `P`.
+    /// Contracting the covectors directly against those sliced blocks costs
+    /// `O(naux nrow_A nao + naux_A nao^2)` per perturbation instead of the
+    /// `O(naux nao^2)` of the dense route; summed over the `3 natm`
+    /// perturbations the whole gradient drops from `O(3 natm naux nao^2)` to
+    /// `O(naux nao^2)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adjoint_perturbation_gradient_local(
+        &self,
+        adj: &CphfAdjoint,
+        blocks: &AtomDerivBlocks,
+        comp: usize,
+        h1r: &[f64],
+        s1_comp: &[f64],
+        dj: &[f64],
+        bj_k: &[f64],
+        bb_k: &[f64],
+        b_x: &[f64],
+        dir: usize,
+    ) -> f64 {
+        let nao = self.nao;
+        let naux = self.naux;
+        let n2 = nao * nao;
+        let row0 = blocks.row0;
+        let nrow = blocks.nrow;
+        let aux0 = blocks.aux0;
+        let naux_a = blocks.naux_a;
+        let stride1 = nrow * nao * naux;
+        let d1c = &blocks.d1[comp * stride1..(comp + 1) * stride1];
+        let stride2 = n2 * naux_a;
+        let d2c = &blocks.d2[comp * stride2..(comp + 1) * stride2];
+
+        let mut g_di = 0.0f64;
+        let mut g_dm = 0.0f64;
+        // The two inner loops are pure reductions, and Rust/LLVM will not
+        // reassociate `f64` additions on their own; four independent
+        // accumulators give both SIMD width and enough ILP to run at memory
+        // speed (measured ~3x over the single-accumulator form).
+        let dm = &adj.dm_sym;
         for p in 0..naux {
-            let mut acc = 0.0;
-            for q in 0..naux {
-                acc += dj[p + q * naux] * adj.c_aux[q];
+            let cov = &adj.di_cov[p * n2..(p + 1) * n2];
+            let lt = adj.lam_tilde[p];
+            let base1 = p * nrow * nao;
+            let mut adi = [0.0f64; 4];
+            let mut adm = [0.0f64; 4];
+            // int3c2e_ip1: rows `mu` on the atom, all `nu`.  `dI^(b)` is the
+            // transpose of `dI^(a)` and is already counted by the symmetrised
+            // covectors, so a single contiguous pass covers both bra centres.
+            // nu outside / mu_l inside keeps every access contiguous.
+            for nu in 0..nao {
+                let doff = base1 + nu * nrow;
+                let coff = row0 + nu * nao;
+                let mut i = 0usize;
+                while i + 4 <= nrow {
+                    let d = &d1c[doff + i..doff + i + 4];
+                    let c = &cov[coff + i..coff + i + 4];
+                    let m = &dm[coff + i..coff + i + 4];
+                    for j in 0..4 {
+                        let v = -d[j];
+                        adi[j] += c[j] * v;
+                        adm[j] += m[j] * v;
+                    }
+                    i += 4;
+                }
+                while i < nrow {
+                    let v = -d1c[doff + i];
+                    let k = coff + i;
+                    adi[0] += cov[k] * v;
+                    adm[0] += dm[k] * v;
+                    i += 1;
+                }
             }
-            djc[p] = acc;
+            g_di += adi.iter().sum::<f64>();
+            g_dm += lt * adm.iter().sum::<f64>();
+            // int3c2e_ip2: dense [nao,nao] symmetric slice, atom's own aux
+            // functions only, with the 1/2 of the symmetrised contraction.
+            if p >= aux0 && p < aux0 + naux_a {
+                let d2 = &d2c[(p - aux0) * n2..(p - aux0 + 1) * n2];
+                let mut cdi = [0.0f64; 4];
+                let mut cdm = [0.0f64; 4];
+                let mut k = 0usize;
+                while k + 4 <= n2 {
+                    let d = &d2[k..k + 4];
+                    let c = &cov[k..k + 4];
+                    let m = &dm[k..k + 4];
+                    for j in 0..4 {
+                        let v = -0.5 * d[j];
+                        cdi[j] += c[j] * v;
+                        cdm[j] += m[j] * v;
+                    }
+                    k += 4;
+                }
+                while k < n2 {
+                    let v = -0.5 * d2[k];
+                    cdi[0] += cov[k] * v;
+                    cdm[0] += dm[k] * v;
+                    k += 1;
+                }
+                g_di += cdi.iter().sum::<f64>();
+                g_dm += lt * cdm.iter().sum::<f64>();
+            }
         }
-        let mut rhs_c: Vec<f64> = (0..naux).map(|p| drho[p] - djc[p]).collect();
-        self.solve_metric_batch(&mut rhs_c, 1);
-        g += a_vec
-            .iter()
-            .zip(adj.c_aux.iter())
-            .map(|(x, y)| x * y)
-            .sum::<f64>();
-        g += adj
-            .lam_aux
-            .iter()
-            .zip(rhs_c.iter())
-            .map(|(x, y)| x * y)
-            .sum::<f64>();
-        // exchange skeleton: -half_k <Lam_ao, Kd> = -half_k(4<Theta,dI> - 2<Psi,dJ>)
-        //   the 4<Theta,dI> part is already inside di_cov (as -2*half_k*Theta)
-        g += 2.0 * adj.half_k * adj.psi.iter().zip(dj.iter()).map(|(x, y)| x * y).sum::<f64>();
-        // core Hamiltonian and overlap skeletons
-        g += adj.lam_ao
-            .iter()
-            .zip(h1r[comp * an2..(comp + 1) * an2].iter())
-            .map(|(x, y)| x * y)
-            .sum::<f64>();
-        g += adj
-            .lams_ao
-            .iter()
-            .zip(s1_comp.iter())
-            .map(|(x, y)| x * y)
-            .sum::<f64>();
-        // metric channel and the adjoint CP-HF channel
-        g += bj_k.iter().zip(dj.iter()).map(|(x, y)| x * y).sum::<f64>();
-        g += bb_k.iter().zip(b_x.iter()).map(|(x, y)| x * y).sum::<f64>();
+        self.finish_adjoint_gradient(adj, comp, h1r, s1_comp, dj, bj_k, bb_k, b_x, dir, g_di + g_dm)
+    }
+
+    /// Shared tail of the two adjoint perturbation routines: everything except
+    /// the `dI` contraction, whose value is passed in as `acc`.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_adjoint_gradient(
+        &self,
+        adj: &CphfAdjoint,
+        comp: usize,
+        h1r: &[f64],
+        s1_comp: &[f64],
+        dj: &[f64],
+        bj_k: &[f64],
+        bb_k: &[f64],
+        b_x: &[f64],
+        dir: usize,
+        acc: f64,
+    ) -> f64 {
+        let n2 = self.nao * self.nao;
+        let naux = self.naux;
+        let mut g = acc;
+        // - sum_P lam_tilde_P (dJ c)_P
+        let mut djc = 0.0f64;
+        for p in 0..naux {
+            let mut s = 0.0f64;
+            for q in 0..naux {
+                s += dj[p + q * naux] * adj.c_aux[q];
+            }
+            djc += adj.lam_tilde[p] * s;
+        }
+        g -= djc;
+        // exchange skeleton remainder, core Hamiltonian and overlap
+        g += 2.0 * adj.half_k * flat_dot(&adj.psi, dj);
+        g += flat_dot(&adj.lam_ao, &h1r[comp * n2..(comp + 1) * n2]);
+        g += flat_dot(&adj.lams_ao, s1_comp);
+        // the folded `<Z, rhs_d>` channel: <W, dh1> + <W_s, dS> (the rest of
+        // `<W, Jd - Kd/2>` rides the shared covectors)
+        if adj.fold_rhs {
+            g += flat_dot(&adj.w_dh1, &h1r[comp * n2..(comp + 1) * n2]);
+            g += flat_dot(&adj.w_ds, s1_comp);
+        }
+        // metric channel, static term and the adjoint CP-HF channel
+        g += flat_dot(bj_k, dj);
+        g += flat_dot(bb_k, b_x);
         g += adj.rhs_dot[dir];
         g
     }
