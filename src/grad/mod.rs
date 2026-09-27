@@ -4,6 +4,9 @@ pub mod uks;
 pub mod rhf;
 pub mod traits;
 
+#[cfg(test)]
+mod grad_pair_row_space_tests;
+
 use std::io::{self, Write};
 
 use crate::main_driver::{collect_total_energy, performance_essential_calculations};

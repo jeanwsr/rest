@@ -100,19 +100,29 @@ pub fn main_driver() -> anyhow::Result<()> {
 
     // Storage-level AO-pair pruning ([ctrl.ri_jk] pair_screen_threshold > 0) rewrites the row
     // space of the in-core RI tensor `rimatr`, and every consumer of that tensor has to address
-    // it through `SCF::rimatr_pair_map`. That is wired for the SCF J/K contractions (S1) and for
+    // it through `SCF::rimatr_pair_map`. That is wired for the SCF J/K contractions (S1), for
     // the AO-to-MO transform that feeds the post-SCF correlation energy: the `ri3mo` route and the
-    // streaming PT2 driver both go through the map-aware `scf_io::ao2mo_rayon*` kernels (S2).
-    // The derivative, response, Hessian, TDDFT and quasiparticle paths still index the tensor with
-    // the full-space pair tables, and would silently read the wrong rows instead of failing, so
-    // they stay refused here. (S3 of the pruning plan lifts the remaining ones.)
+    // streaming PT2 driver both go through the map-aware `scf_io::ao2mo_rayon*` kernels (S2), and
+    // for the analytic gradient of a hybrid functional (`grad/rhf.rs`, `grad/uhf.rs`, S3c). The
+    // response, Hessian, TDDFT and quasiparticle paths still index the tensor with the full-space
+    // pair tables, and would silently read the wrong rows instead of failing, so they stay
+    // refused here, and the entry points that were reachable from two of them now fail closed on
+    // their own (`ri_jk::require_unpruned_rimatr`).
     if mol.ctrl.ri_jk.pair_screen_threshold > 0.0 {
         let mut unsupported: Vec<&str> = Vec::new();
         if !mol.ctrl.analdrv_tasks.is_empty() {
             unsupported.push("analytical derivative tasks (analdrv_tasks)");
         }
-        if !matches!(mol.ctrl.job_type, JobType::SinglePoint) {
-            unsupported.push("a job_type other than a single-point energy (gradient / optimization / MD / numerical dipole)");
+        match mol.ctrl.job_type {
+            // The analytic gradient contracts `rimatr` through its pair map, and it shares the
+            // row set of the energy of the very same geometry, so a single point, a force
+            // calculation and a geometry optimization driven by that force are all consistent.
+            JobType::SinglePoint | JobType::Force | JobType::GeomOpt => {},
+            _ => unsupported.push(
+                "a job_type other than a single-point energy, a force calculation or a geometry \
+                 optimization (MD, normal modes and the numerical dipole change the geometry or \
+                 the field without freezing the pair mask)",
+            ),
         }
         if mol.ctrl.tddft.is_some() {
             unsupported.push("TDDFT and response TDDFT (tddft)");
@@ -122,6 +132,13 @@ pub fn main_driver() -> anyhow::Result<()> {
         }
         if mol.ctrl.quasiparticle_methods.is_some() {
             unsupported.push("quasiparticle methods such as GW and BSE (quasiparticle_methods)");
+        }
+        // A numerical force differentiates the pruned energy across geometries, and the pair
+        // mask is rebuilt at every displaced geometry: the finite difference then crosses a
+        // change of the row set, and its error does not converge with the displacement. Freezing
+        // the mask of the reference geometry for the whole stencil is still to be implemented.
+        if mol.ctrl.numerical_force {
+            unsupported.push("a numerical force ([ctrl] numerical_force = true)");
         }
         if mol.ctrl.outputs.iter().any(|output| output.eq("num_force")) {
             unsupported.push("numerical force output (outputs = \"num_force\")");

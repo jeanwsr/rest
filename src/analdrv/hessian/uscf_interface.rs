@@ -71,6 +71,7 @@ pub fn uscf_hess_interface(scf_data: &SCF, cfg: &AnalDrvNucgradCfg, resp_cfg: &A
     let j2c_decomp_option = &scf_data.mol.ctrl.j2c_decomp;
     let j2c_decomp = crate::ri_jk::get_j2c_decomp(&aux, &device, *j2c_decomp_option);
 
+    crate::ri_jk::require_unpruned_rimatr(&scf_data.rimatr_pair_map, "the RI-JK Hessian object (uscf_interface)");
     let mut hess_rijk_obj = if let Some((rimatr, _, _)) = &scf_data.rimatr {
         let cderi = rimatr.to_rstsr_view(&device).into_cow();
         UHessRIJK::new_with_cderi(&mol, &aux, scale_j, scale_k, cderi, j2c_decomp)

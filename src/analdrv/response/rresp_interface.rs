@@ -307,6 +307,7 @@ pub fn rscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> RRe
 
     let (factor_j, factor_k, rsh) = scf_jk_factors(scf_data);
 
+    crate::ri_jk::require_unpruned_rimatr(&scf_data.rimatr_pair_map, "the response RI-JK object (rscf_resp_interface)");
     {
         let (rimatr, _, _) = scf_data.rimatr.as_ref().expect(
             "This implementation requires cholesky decomposed ERI (or rimatr) to be available and stored in memory.",
