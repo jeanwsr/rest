@@ -79,6 +79,35 @@ pub struct AnalDrvRespCfg {
     #[serde(rename = "grid_level_cpscf", alias = "grid_level_cphf")]
     #[serde_inline_default(None)]
     pub grid_level: Option<usize>,
+    /// Cache the bra-independent intermediates of the RI-JK response kernel across CP-SCF
+    /// iterations.
+    ///
+    /// Every application of the response operator must unpack the packed 3c-ERI and half-transform
+    /// it with the occupied orbitals (`nao^2 * naux` doubles of work per pass) before it can touch
+    /// the right-hand side. That work does not depend on the right-hand side, and the Krylov solver
+    /// re-applies the operator for every iteration, so it can be done once instead.
+    ///
+    /// How much this buys depends on the number of right-hand sides, and so does whether it is worth
+    /// the memory. An analytic Hessian solves `3 * natm` columns: the up-front pass is amortized
+    /// (measured at ~3% of the CP-SCF stage), while the cache itself is held for the whole task,
+    /// which is a poor trade — so **the default is off**. A Z-vector solve (the CD-GW gradient, the
+    /// relaxed DH/PT2 multipoles) has a single column and recreates the intermediates on every
+    /// Krylov iteration; the CD-GW gradient enables the cache explicitly, and other single-column
+    /// callers can opt in with this keyword.
+    ///
+    /// The memory cost when enabled is `nao^2 * naux` doubles (plus `(nao + nocc) * naux * nocc` per
+    /// spin); the `cpscf_cache_budget` keyword caps it, and the budget is applied to the two tiers
+    /// separately, so an oversized `cderi` still leaves the (much smaller) half-transforms cached.
+    /// The numbers are unaffected either way.
+    #[serde(rename = "cpscf_cache_kernel", alias = "cphf_cache_kernel")]
+    #[serde_inline_default(false)]
+    pub cache_kernel: bool,
+    /// Memory budget of the response-kernel cache, in MiB (see `cpscf_cache_kernel`).
+    ///
+    /// A non-positive value disables the cache, which is equivalent to `cpscf_cache_kernel = false`.
+    #[serde(rename = "cpscf_cache_budget", alias = "cphf_cache_budget")]
+    #[serde_inline_default(1024.0)]
+    pub cache_budget: f64,
 }
 
 impl Default for AnalDrvRespCfg {
@@ -91,6 +120,8 @@ impl Default for AnalDrvRespCfg {
             lindep: 1e-15,
             tol_inflation: 1000.0,
             grid_level: None,
+            cache_kernel: false,
+            cache_budget: 1024.0,
         }
     }
 }

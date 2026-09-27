@@ -345,6 +345,13 @@ pub struct QuasiParticle {
     ///   "srpa" — bare-Coulomb sRPA: TDHF static singles block plus the bare
     ///            two-particle–two-hole coupling (Eq. (7) of Sangalli 2011).
     pub dynamic_bse_kernel: String,
+    /// One-particle energies used for the dynamical kernel's poles (the RPA
+    /// excitations and the bare doubles):
+    ///   "qp" — GW quasiparticle gaps (default);
+    ///   "ks" — Kohn–Sham gaps, matching the paper's "kernel built with
+    ///          KS–LDA eigenvalues" choice (brings the kernel poles into the
+    ///          optical range).  The static singles block is unchanged.
+    pub dynamic_bse_kernel_energies: String,
     pub export_matvec_count: bool,
     /// Which implementation performs the implicit BSE matrix-vector products.
     ///
@@ -535,6 +542,7 @@ impl Default for QuasiParticle {
             nlfeast_gmres_max_it: 500,
             nlfeast_gmres_tol: 1e-6,
             dynamic_bse_kernel: String::from("bse"),
+            dynamic_bse_kernel_energies: String::from("qp"),
             export_matvec_count: false,
             // BSE defaults to the AO-basis ("memory-efficient") matvec; GW keeps MO.
             bse_matvec_style: String::from("ao"),
@@ -690,6 +698,7 @@ impl QuasiParticle {
         table.insert("nlfeast_gmres_max_it".to_string(), toml::Value::Integer(self.nlfeast_gmres_max_it as i64));
         table.insert("nlfeast_gmres_tol".to_string(), toml::Value::Float(self.nlfeast_gmres_tol));
         table.insert("dynamic_bse_kernel".to_string(), toml::Value::String(self.dynamic_bse_kernel.clone()));
+        table.insert("dynamic_bse_kernel_energies".to_string(), toml::Value::String(self.dynamic_bse_kernel_energies.clone()));
         table.insert("export_matvec_count".to_string(), toml::Value::Boolean(self.export_matvec_count));
         table.insert("bse_matvec_style".to_string(), toml::Value::String(self.bse_matvec_style.clone()));
         table.insert("gw_tensor_style".to_string(), toml::Value::String(self.gw_tensor_style.clone()));
@@ -1397,6 +1406,16 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                     }
                 }
                 _ => String::from("bse"),
+            };
+            tmp_input.dynamic_bse_kernel_energies = match tmp_ctrl.get("dynamic_bse_kernel_energies").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => {
+                    let lower = s.trim().to_lowercase();
+                    match lower.as_str() {
+                        "ks" | "dft" | "hf" => String::from("ks"),
+                        _ => String::from("qp"),
+                    }
+                }
+                _ => String::from("qp"),
             };
             tmp_input.bse_matvec_style = normalise_style(
                 tmp_ctrl.get("bse_matvec_style"),

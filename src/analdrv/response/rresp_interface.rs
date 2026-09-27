@@ -307,12 +307,20 @@ pub fn rscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> RRe
 
     let (factor_j, factor_k, rsh) = scf_jk_factors(scf_data);
 
+    // Cache the bra-independent response-kernel intermediates (see `cpscf_cache_kernel`); the
+    // budget is spent per response object, so a range-separated short-range exchange object gets
+    // its own budget.
+    let cache_budget = config.resp.cache_budget * 1024.0 * 1024.0;
+
     {
         let (rimatr, _, _) = scf_data.rimatr.as_ref().expect(
             "This implementation requires cholesky decomposed ERI (or rimatr) to be available and stored in memory.",
         );
         let cderi = rimatr.to_rstsr_view(&device).into_cow();
-        resp_list.push(Box::new(RRespRIJK::new_with_cderi(factor_j, factor_k, cderi)));
+        resp_list.push(Box::new(
+            RRespRIJK::new_with_cderi(factor_j, factor_k, cderi)
+                .with_cache_kernel(config.resp.cache_kernel, cache_budget),
+        ));
     }
 
     // The short-range exchange correction (range-separated hybrids) is a separate response
@@ -323,7 +331,10 @@ pub fn rscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> RRe
             "The range-separated response requires the short-range ERI (rimatr_sr) to be built and stored in memory.",
         );
         let cderi_sr = rimatr_sr.to_rstsr_view(&device).into_cow();
-        resp_list.push(Box::new(RRespRIJK::new_with_cderi(0.0, factor_k_sr, cderi_sr)));
+        resp_list.push(Box::new(
+            RRespRIJK::new_with_cderi(0.0, factor_k_sr, cderi_sr)
+                .with_cache_kernel(config.resp.cache_kernel, cache_budget),
+        ));
     }
 
     // --- DFT --- //

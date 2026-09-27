@@ -30,7 +30,7 @@ use crate::ri_jk::hess_r::{
     generate_cderi_with_decomp, get_rijk_skeleton_decomposed_separated, KEYS_J02, KEYS_J11, KEYS_J1AO, KEYS_J20,
     KEYS_K02, KEYS_K11, KEYS_K1BRA, KEYS_K20,
 };
-use crate::ri_jk::resp_r::get_rijk_response_bra_separated;
+use crate::ri_jk::resp_r::{build_rijk_response_intmd, get_rijk_response_bra_separated, RijkRespIntmd};
 
 /* #region impl */
 
@@ -45,6 +45,17 @@ pub struct UHessRIJK<'a> {
     pub result: HashMap<&'static str, Tsr>,
     pub timing: Vec<(String, f64)>,
     pub is_skeleton_ready: bool,
+    /// Aux-batch size of the response kernel (shared by the cache and its application).
+    pub nbatch_aux: usize,
+    /// Whether `make_response_preparation` should build `resp_intmd`.
+    pub cache_kernel: bool,
+    /// Memory budget (bytes) of `resp_intmd`.
+    pub cache_budget: f64,
+    /// Precomputed bra-independent response-kernel intermediates (see
+    /// [`crate::ri_jk::resp_r::build_rijk_response_intmd`]).
+    pub resp_intmd: RijkRespIntmd,
+    /// Wall time (seconds) spent building `resp_intmd`.
+    pub cache_timing: f64,
 }
 
 impl<'a> UHessRIJK<'a> {
@@ -63,6 +74,11 @@ impl<'a> UHessRIJK<'a> {
             result: HashMap::new(),
             timing: Vec::new(),
             is_skeleton_ready: false,
+            nbatch_aux: 72,
+            cache_kernel: false,
+            cache_budget: 0.0,
+            resp_intmd: RijkRespIntmd::none(72),
+            cache_timing: 0.0,
         }
     }
 
@@ -85,7 +101,20 @@ impl<'a> UHessRIJK<'a> {
             result: HashMap::new(),
             timing: Vec::new(),
             is_skeleton_ready: false,
+            nbatch_aux: 72,
+            cache_kernel: false,
+            cache_budget: 0.0,
+            resp_intmd: RijkRespIntmd::none(72),
+            cache_timing: 0.0,
         }
+    }
+
+    /// Enable (or disable) caching of the bra-independent response-kernel intermediates, and set
+    /// its memory budget in bytes (see [`crate::ri_jk::resp_r::RijkRespIntmd`]).
+    pub fn with_cache_kernel(mut self, enabled: bool, budget_bytes: f64) -> Self {
+        self.cache_kernel = enabled;
+        self.cache_budget = budget_bytes;
+        self
     }
 
     /// Build the total density ``D^alpha + D^beta`` from the per-spin mo_coeff / mo_occ.
@@ -264,6 +293,33 @@ impl<'a> UHessElecInteractAPI for UHessRIJK<'a> {
         self.intmd.insert("mo_coeff_1".to_string(), mo_coeff[1].view().into_contig(RowMajor));
         self.intmd.insert("mo_occ_0".to_string(), mo_occ[0].to_owned());
         self.intmd.insert("mo_occ_1".to_string(), mo_occ[1].to_owned());
+
+        // Intermediates of the response kernel; the unpacked `cderi` batches are shared by the two
+        // spins (only the occupied half-transforms are spin-resolved).
+        if self.cache_kernel {
+            let t0 = std::time::Instant::now();
+            self.resp_intmd = build_rijk_response_intmd(
+                self.cderi.view(),
+                mo_coeff,
+                mo_occ,
+                self.factor_k != 0.0,
+                self.nbatch_aux,
+                self.cache_budget,
+            );
+            self.cache_timing = t0.elapsed().as_secs_f64();
+            if std::env::var("REST_RESP_KERNEL_TIMING").is_ok() {
+                let mb = self.resp_intmd.memory_bytes() as f64 / 1024.0 / 1024.0;
+                println!(
+                    "[resp-kernel] UHF cache built in {:.3} s (active: {}, memory: {:.1} MiB)",
+                    self.cache_timing,
+                    self.resp_intmd.is_active(),
+                    mb
+                );
+            }
+        } else {
+            self.resp_intmd = RijkRespIntmd::none(self.nbatch_aux);
+            self.cache_timing = 0.0;
+        }
     }
 
     fn get_response_bra(&mut self, bra: &[TsrView; 2]) -> [Tsr; 2] {
@@ -279,7 +335,8 @@ impl<'a> UHessElecInteractAPI for UHessRIJK<'a> {
             bra,
             self.factor_j != 0.0,
             self.factor_k != 0.0,
-            72, // TODO: batch size `72` should be tunable by max-memory.
+            self.nbatch_aux,
+            Some(&self.resp_intmd),
         );
 
         let nao = mo_coeff[0].shape()[0];

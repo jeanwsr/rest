@@ -73,6 +73,7 @@ pub fn uscf_hess_interface(scf_data: &SCF, cfg: &AnalDrvNucgradCfg, resp_cfg: &A
     let mut hess_rijk_obj = if let Some((rimatr, _, _)) = &scf_data.rimatr {
         let cderi = rimatr.to_rstsr_view(&device).into_cow();
         UHessRIJK::new_with_cderi(&mol, &aux, scale_j, scale_k, cderi, j2c_decomp)
+            .with_cache_kernel(resp_cfg.cache_kernel, resp_cfg.cache_budget * 1024.0 * 1024.0)
     } else {
         panic!(
             "This implementation requires cholesky decomposed ERI (or rimatr) to be available and stored in memory."
@@ -99,6 +100,7 @@ pub fn uscf_hess_interface(scf_data: &SCF, cfg: &AnalDrvNucgradCfg, resp_cfg: &A
             let cderi_sr = rimatr_sr.to_rstsr_view(&device).into_cow();
             let j2c_decomp_sr = crate::ri_jk::get_j2c_decomp(&aux_sr, &device, *j2c_decomp_option);
             UHessRIJK::new_with_cderi(&mol_sr, &aux_sr, 0.0, hyb - alpha, cderi_sr, j2c_decomp_sr)
+                .with_cache_kernel(resp_cfg.cache_kernel, resp_cfg.cache_budget * 1024.0 * 1024.0)
         } else {
             panic!(
                 "The range-separated Hessian requires the short-range ERI (rimatr_sr) to be built and stored in memory."

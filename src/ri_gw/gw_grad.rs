@@ -180,6 +180,13 @@ pub struct GwGradConfig {
     /// `O(naux nao nrow_A + naux_A nao^2)` and the whole gradient from
     /// `O(3 natm naux nao^2)` to `O(naux nao^2)`.
     pub local_di: bool,
+    /// Cache the bra-independent intermediates of the RI-JK response kernel
+    /// (`analdrv`'s `cpscf_cache_kernel`).  The CP-HF route applies that kernel
+    /// to a single right-hand side per Krylov iteration, so it rebuilds the
+    /// unpacked 3c-ERI and its occupied half-transforms (an `O(nao^2 naux)`
+    /// pass) on every iteration unless they are cached.  This only affects
+    /// speed and memory, not the numbers.
+    pub resp_cache_kernel: bool,
     /// Evaluate the adjoint CP-HF channel without the per-perturbation skeleton
     /// right-hand side tensor: `rhs_d` is linear in the derivative integrals,
     /// so `sum_d <Z, rhs_d>` is folded into direction-independent AO-basis
@@ -215,6 +222,7 @@ impl Default for GwGradConfig {
             folded_qx: true,
             adjoint_cphf: true,
             local_di: true,
+            resp_cache_kernel: true,
             fold_cphf_rhs: true,
         }
     }
@@ -245,6 +253,25 @@ impl GwGradConfig {
             ..Default::default()
         }
     }
+}
+
+/// Memory probe for the gradient phases: with `REST_GWGRAD_MEMDBG` set, print the
+/// resident set (`VmRSS`) and the high-water mark (`VmHWM`) of the process, so the
+/// peak of a gradient run can be attributed to a phase.  No effect otherwise.
+fn mem_probe(label: &str) {
+    if std::env::var("REST_GWGRAD_MEMDBG").is_err() {
+        return;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let kb = |key: &str| -> f64 {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|r| r.trim().trim_end_matches(" kB").trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+            / 1024.0
+    };
+    println!("[memdbg] {label:46} rss {:8.1} MB | peak {:8.1} MB", kb("VmRSS:"), kb("VmHWM:"));
 }
 
 // ---------------------------------------------------------------------------
@@ -900,35 +927,36 @@ impl<'a> GwGradEngine<'a> {
         let c_mo = scf.eigenvectors[0].clone();
 
         // ---- raw q[P, p, q] = sum_mu nu I[mu nu P] C[mu p] C[nu q] ----
+        // Two dgemms per auxiliary function (`dI_P C` then `C^T (dI_P C)`)
+        // instead of the naive O(nao^2 nmo) triple loop: this is the dominant
+        // setup cost for large basis sets (BLAS runs it at cache speed).
         let mut q = vec![0.0f64; naux * nmo * nmo];
-        for p_aux in 0..naux {
-            let i_block = &raw.i3[p_aux * nao * nao..(p_aux + 1) * nao * nao];
-            // tmp[mu, q_mo] = sum_nu I[mu, nu, P] C[nu, q_mo]
-            let mut tmp = vec![0.0f64; nao * nmo];
-            for mu in 0..nao {
-                for q_mo in 0..nmo {
-                    let mut acc = 0.0;
-                    for nu in 0..nao {
-                        acc += i_block[mu + nu * nao] * c_mo[[nu, q_mo]];
-                    }
-                    tmp[mu + q_mo * nao] = acc;
-                }
-            }
-            for q_mo in 0..nmo {
-                for p_mo in 0..nmo {
-                    let mut acc = 0.0;
-                    for mu in 0..nao {
-                        acc += c_mo[[mu, p_mo]] * tmp[mu + q_mo * nao];
-                    }
-                    q[(p_mo + q_mo * nmo) * naux + p_aux] = acc;
+        {
+            let n2 = nao * nao;
+            let mut ip = MatrixFull::new([nao, nao], 0.0);
+            let mut tmp = MatrixFull::new([nao, nmo], 0.0);
+            let mut sl = MatrixFull::new([nmo, nmo], 0.0);
+            for p_aux in 0..naux {
+                ip.data.copy_from_slice(&raw.i3[p_aux * n2..(p_aux + 1) * n2]);
+                // tmp[mu, q_mo] = sum_nu I[mu, nu, P] C[nu, q_mo]
+                _dgemm_full(&ip, 'N', &c_mo, 'N', &mut tmp, 1.0, 0.0);
+                // sl[p_mo, q_mo] = sum_mu C[mu, p_mo] tmp[mu, q_mo]
+                _dgemm_full(&c_mo, 'T', &tmp, 'N', &mut sl, 1.0, 0.0);
+                for col in 0..nmo * nmo {
+                    q[col * naux + p_aux] = sl.data[col];
                 }
             }
         }
         symmetrise_pairs(&mut q, naux, nmo);
         // pair-slowest repack (strided once, then contiguous for the gemms).
-        // The full-CD engine (skip_lr_cache) repacks on the fly inside
-        // qx_from_u instead, saving nao^2 naux doubles of resident memory.
-        let q_pairmajor: Vec<f64> = if config.skip_lr_cache {
+        // Only the legacy `qx_from_u_blocks` route reads it (`U^T q + q U` as one
+        // gemm); that route repacks per auxiliary block on the fly inside
+        // `qx_from_u` when this is empty. The folded route (`folded_qx`) never
+        // touches `q_pairmajor`, so it is not built there — that keeps
+        // `naux * nmo^2` doubles (874 MB at naphthalene/def2-TZVP) out of the
+        // resident set of every optimised gradient. Same for the full-CD
+        // engine (`skip_lr_cache`).
+        let q_pairmajor: Vec<f64> = if config.skip_lr_cache || config.folded_qx {
             Vec::new()
         } else {
             let npair = nmo * nmo;
@@ -2312,7 +2340,8 @@ impl GwGradEngine<'_> {
         assert!(is_hf, "gw_grad: analdrv CP-HF path supports HF references only");
         let mut rijk_obj = RHessRIJK::new_with_cderi(&mol, &aux, 1.0, 1.0, cderi, j2c_decomp);
 
-        let config = AnalDrvConfig::default();
+        let mut config = AnalDrvConfig::default();
+        config.resp.cache_kernel = self.config.resp_cache_kernel;
         // upstream (analdrv refactor): the CP-SCF solve now lives in the shared
         // response object, which `RHessSCF` only borrows.
         let mut resp = rscf_resp_interface(self.scf, &config);
@@ -2633,40 +2662,59 @@ impl GwGradEngine<'_> {
     /// splits the shell, the sorted index follows the *other* branch at `-h`,
     /// so the two-sided difference averages the two level derivatives.
     pub fn analytic_gradient(&self, target: usize) -> (Vec<f64>, f64, f64) {
+        mem_probe("gradient: enter");
         let shell = self.degenerate_shell(target);
         let caches: Vec<QpCache> = shell.iter().map(|&m| self.build_target_cache(m)).collect();
         let w = 1.0 / caches.len() as f64;
         let refs: Vec<&QpCache> = caches.iter().collect();
+        mem_probe("gradient: after QP caches");
         let (bq, bj, be, bb) = self.qp_pullback(&refs, &[vec![w; caches.len()]]);
         let own0 = &caches[shell.iter().position(|&m| m == target).unwrap()];
+        mem_probe("gradient: after qp_pullback (bq/bj/be/bb)");
         // ---- adjoint (Z-vector) route --------------------------------
-        if self.config.adjoint_cphf {
+        // The reference guard is checked *before* folding (both the builder and
+        // this branch use `supports_cphf_adjoint`): the folded covector is all
+        // the adjoint route needs from `bq`, so the `naux * nmo^2` covector
+        // buffer (874 MB at naphthalene/def2-TZVP) is released before the
+        // adjoint workspace is built. The adjoint foldings and the
+        // per-direction loop both then run without it resident. The
+        // per-perturbation fallback below still needs `bq`, which is why the
+        // release happens only on this branch.
+        if self.config.adjoint_cphf && self.supports_cphf_adjoint() {
             let fold = self.fold_covector(&bq[0]);
-            if let Some(adj) = self.build_cphf_adjoint(&fold, &be[0]) {
-                let mut grad = vec![0.0f64; self.natm * 3];
-                // HF reference only (guaranteed by `build_cphf_adjoint`)
-                let zero_bx = vec![0.0f64; self.nmo];
-                for atm in 0..self.natm {
-                    let h1r = crate::hessian::rhf::build_hcore_first_deriv(&self.scf.mol, atm);
-                    let s1r = crate::ri_cphf::cphf_solver_pyscf::build_s1ao_deriv(&self.scf.mol, atm);
-                    let blocks = self.raw.d_atom_blocks(atm);
-                    for comp in 0..3 {
-                        let dj = self.raw.d_j_atom(atm, comp);
-                        grad[atm * 3 + comp] = if self.config.local_di {
-                            self.adjoint_perturbation_gradient_local(
-                                &adj, &blocks, comp, &h1r, &s1r[comp], &dj, &bj[0], &bb[0],
-                                &zero_bx, atm * 3 + comp,
-                            )
-                        } else {
-                            self.adjoint_perturbation_gradient(
-                                &adj, &blocks, comp, &h1r, &s1r[comp], &dj, &bj[0], &bb[0],
-                                &zero_bx, atm * 3 + comp,
-                            )
-                        };
+            mem_probe("gradient: after fold_covector");
+            drop(bq);
+            let adj = self
+                .build_cphf_adjoint(&fold, &be[0])
+                .expect("`supports_cphf_adjoint` and `build_cphf_adjoint` share this guard");
+            mem_probe("gradient: after build_cphf_adjoint");
+            let mut grad = vec![0.0f64; self.natm * 3];
+            // HF reference only (guaranteed by `build_cphf_adjoint`)
+            let zero_bx = vec![0.0f64; self.nmo];
+            for atm in 0..self.natm {
+                let h1r = crate::hessian::rhf::build_hcore_first_deriv(&self.scf.mol, atm);
+                let s1r = crate::ri_cphf::cphf_solver_pyscf::build_s1ao_deriv(&self.scf.mol, atm);
+                let blocks = self.raw.d_atom_blocks(atm);
+                for comp in 0..3 {
+                    let dj = self.raw.d_j_atom(atm, comp);
+                    if atm == 0 && comp == 0 {
+                        mem_probe("gradient: inside per-direction loop (1st dir)");
                     }
+                    grad[atm * 3 + comp] = if self.config.local_di {
+                        self.adjoint_perturbation_gradient_local(
+                            &adj, &blocks, comp, &h1r, &s1r[comp], &dj, &bj[0], &bb[0],
+                            &zero_bx, atm * 3 + comp,
+                        )
+                    } else {
+                        self.adjoint_perturbation_gradient(
+                            &adj, &blocks, comp, &h1r, &s1r[comp], &dj, &bj[0], &bb[0],
+                            &zero_bx, atm * 3 + comp,
+                        )
+                    };
                 }
-                return (grad, own0.omega, own0.z_factor);
             }
+            mem_probe("gradient: after per-direction loop (adjoint)");
+            return (grad, own0.omega, own0.z_factor);
         }
         // responses before the pullback: see analytic_gradient_with_cache
         // for the memory-peak rationale of this order
@@ -3926,6 +3974,22 @@ pub struct CphfAdjoint {
 }
 
 impl GwGradEngine<'_> {
+    /// Whether the adjoint (Z-vector) CP-HF route applies to this reference.
+    ///
+    /// The route is the linear-response CP-HF solution of a **plain HF**
+    /// reference; for a DFT reference it declines and the gradient falls back to
+    /// the per-perturbation route. Callers check this *before* building the
+    /// folded covector, so that the `naux * nmo^2` covector buffer can be
+    /// released as soon as the fold has consumed it (see
+    /// [`Self::analytic_gradient`]).
+    ///
+    /// This is the one predicate behind [`Self::build_cphf_adjoint`]'s early
+    /// return: if that function ever declines for another reason, callers that
+    /// rely on it must be revisited too.
+    pub fn supports_cphf_adjoint(&self) -> bool {
+        self.scf.mol.xc_data.dfa_compnt_scf.is_empty()
+    }
+
     /// Build the adjoint data (see the section header).  Returns `None` when the
     /// reference has symmetry-degenerate shells (the route is not linear there)
     /// or when the reference is not a plain HF one.
@@ -3951,7 +4015,7 @@ impl GwGradEngine<'_> {
         //         = be * Tr[A] - w * sum_i s1[p_i,p_i] ,   A_ij = f1_ij - e0 s1_ij,
         // which is linear in the perturbation.  That is exactly what the
         // "skip the shell-internal off-diagonal pairs" rule below computes.
-        if !self.scf.mol.xc_data.dfa_compnt_scf.is_empty() {
+        if !self.supports_cphf_adjoint() {
             return None;
         }
 
@@ -4044,7 +4108,8 @@ impl GwGradEngine<'_> {
         let j2c_decomp =
             crate::ri_jk::get_j2c_decomp(&aux, &device, self.scf.mol.ctrl.j2c_decomp.clone());
         let mut rijk_obj = RHessRIJK::new_with_cderi(&mol, &aux, 1.0, 1.0, cderi, j2c_decomp);
-        let config = AnalDrvConfig::default();
+        let mut config = AnalDrvConfig::default();
+        config.resp.cache_kernel = self.config.resp_cache_kernel;
         let mut resp = rscf_resp_interface(self.scf, &config);
         timings[1] = t_setup.elapsed().as_secs_f64();
 
@@ -4137,6 +4202,7 @@ impl GwGradEngine<'_> {
             }
         }
 
+        mem_probe("  adjoint: after Z solve");
         if std::env::var("REST_GWGRAD_ZDBG").is_ok() {
             eprintln!(
                 "[zdbg] rhs-assembly {:.3}s solve {:.3}s occ-corr {:.3}s",
@@ -4337,6 +4403,7 @@ impl GwGradEngine<'_> {
             }
         }
 
+        mem_probe("  adjoint: after folding (di_cov/lam/psi)");
         Some(CphfAdjoint {
             di_cov,
             lam_ao,
