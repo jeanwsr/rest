@@ -147,11 +147,15 @@ fn build_s_only_precond_data(
         // the AO matvec deliberately never materialises.  Rather than build them
         // just for a preconditioner (and hold two fold sets at once), fall back to
         // the diagonal preconditioner that the FEAST solver already supports.
-        if crate::ctrl_io::quasiparticle_methods::style_is_ao(&qp_ctrl.bse_matvec_style) {
+        if crate::ctrl_io::quasiparticle_methods::style_is_ao(&qp_ctrl.bse_matvec_style)
+            || crate::ctrl_io::quasiparticle_methods::style_is_pair(&qp_ctrl.bse_matvec_style)
+        {
             println!(
-                "bse_matvec_style = \"ao\": skipping the s-only inner-GMRES preconditioner \
-                 (it is built from MO-basis tensors); using the diagonal preconditioner. \
-                 The FEAST matvec itself runs on the AO path."
+                "bse_matvec_style = \"{}\": skipping the s-only inner-GMRES preconditioner \
+                 (it is built from MO-basis tensors, which this backend deliberately never \
+                 materialises); using the diagonal preconditioner.  The FEAST matvec itself \
+                 runs on the selected AO-family path.",
+                qp_ctrl.bse_matvec_style
             );
             return (None, None, Some(diag_a));
         }

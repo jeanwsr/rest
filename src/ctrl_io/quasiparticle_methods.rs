@@ -398,6 +398,25 @@ pub struct QuasiParticle {
     /// `max_Q |J_Q[mu,nu]|` is below this threshold.  `0.0` disables screening
     /// (bit-for-bit the unscreened result).
     pub gw_ao_screening_tol: f64,
+    /// Per-auxiliary AO-support pre-screening threshold (a.u.) used by the
+    /// AO-basis BSE matvec (`bse_matvec_style = "ao"`).
+    ///
+    /// For every auxiliary function `q`, the AO indices whose largest weighted
+    /// coefficient `|J_q[mu,nu]| * w_mu * w_nu` stays below the threshold are
+    /// dropped from that `q`'s fold, so the fold runs on the compressed
+    /// `|S_q| x |S_q|` block instead of the full `[N, N]`.  `0.0` disables
+    /// screening (the original dense kernels, bit for bit).
+    pub bse_ao_screening_tol: f64,
+    /// AO-pair pre-screening threshold (a.u.) used by the pair-list BSE matvec
+    /// (`bse_matvec_style = "pair"`).
+    ///
+    /// An AO pair `(mu,nu)` is kept when its Schwarz factor
+    /// `sqrt(sum_q (mu nu|q)^2) ~ sqrt((mu nu|mu nu))` exceeds the threshold.
+    /// Kept pairs form the index set of the materialised kernel
+    /// `W[(mu,nu),(la,si)] = sum_q T^q[mu,nu] J^q[la,si]`; dropped pairs are
+    /// removed from *both* of its indices.  `0.0` keeps every pair whose RI row
+    /// is not exactly zero, which is numerically exact.
+    pub bse_pair_screening_tol: f64,
     pub gw_switch_fallback_threshold: f64,
 }
 
@@ -548,6 +567,8 @@ impl Default for QuasiParticle {
             bse_matvec_style: String::from("ao"),
             gw_tensor_style: String::from("mo"),
             gw_ao_screening_tol: 0.0,
+            bse_ao_screening_tol: 0.0,
+            bse_pair_screening_tol: 0.0,
             gw_switch_fallback_threshold: 1e6,
         }
     }
@@ -703,6 +724,8 @@ impl QuasiParticle {
         table.insert("bse_matvec_style".to_string(), toml::Value::String(self.bse_matvec_style.clone()));
         table.insert("gw_tensor_style".to_string(), toml::Value::String(self.gw_tensor_style.clone()));
         table.insert("gw_ao_screening_tol".to_string(), toml::Value::Float(self.gw_ao_screening_tol));
+        table.insert("bse_ao_screening_tol".to_string(), toml::Value::Float(self.bse_ao_screening_tol));
+        table.insert("bse_pair_screening_tol".to_string(), toml::Value::Float(self.bse_pair_screening_tol));
         table.insert("gw_switch_fallback_threshold".to_string(), toml::Value::Float(self.gw_switch_fallback_threshold));
         toml::Value::Table(table)
     }
@@ -738,6 +761,43 @@ pub fn normalise_style(
         }
         _ => default.to_string(),
     }
+}
+
+/// Normalise `bse_matvec_style` to its canonical `"mo"` / `"ao"` / `"pair"`.
+///
+/// `"pair"` selects the pair-list (materialised AO-pair kernel) matvec in
+/// `ri_bse::pair_kernel`; `"ao"` the memory-efficient AO fold matvec; `"mo"`
+/// the historical MO-basis tensors.
+pub fn normalise_bse_matvec_style(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(s)) => {
+            let lower = s.trim().to_lowercase();
+            if matches!(
+                lower.as_str(),
+                "pair" | "pairs" | "list" | "pair-list" | "pairlist" | "sparse"
+            ) {
+                String::from("pair")
+            } else if matches!(
+                lower.as_str(),
+                "ao" | "memory-efficient" | "memory_efficient" | "mem-efficient"
+            ) {
+                String::from("ao")
+            } else if matches!(lower.as_str(), "mo" | "fast") {
+                String::from("mo")
+            } else {
+                String::from("ao")
+            }
+        }
+        _ => String::from("ao"),
+    }
+}
+
+/// `true` when the stored style selects the pair-list implementation.
+pub fn style_is_pair(style: &str) -> bool {
+    matches!(
+        style.trim().to_lowercase().as_str(),
+        "pair" | "pairs" | "list" | "pair-list" | "pairlist" | "sparse"
+    )
 }
 
 /// `true` when the stored style selects the AO-basis implementation.
@@ -1417,10 +1477,8 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 }
                 _ => String::from("qp"),
             };
-            tmp_input.bse_matvec_style = normalise_style(
+            tmp_input.bse_matvec_style = normalise_bse_matvec_style(
                 tmp_ctrl.get("bse_matvec_style"),
-                &["ao", "memory-efficient", "memory_efficient", "mem-efficient"],
-                "ao",
             );
             tmp_input.gw_tensor_style = normalise_style(
                 tmp_ctrl.get("gw_tensor_style"),
@@ -1428,6 +1486,14 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 "mo",
             );
             tmp_input.gw_ao_screening_tol = match tmp_ctrl.get("gw_ao_screening_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.bse_ao_screening_tol = match tmp_ctrl.get("bse_ao_screening_tol").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.bse_pair_screening_tol = match tmp_ctrl.get("bse_pair_screening_tol").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
                 _ => 0.0,
             };

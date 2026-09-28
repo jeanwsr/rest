@@ -41,6 +41,7 @@ pub mod fourier_self_energy;
 pub mod qsgw;
 pub mod gw_grad;
 pub mod tensor_ao;
+pub mod ao_local;
 use crate::mpi_io::MPIOperator;
 
 #[cfg(target_os = "linux")]

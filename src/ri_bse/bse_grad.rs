@@ -264,7 +264,8 @@ impl BseScreening {
     /// Build the static screening from the GW engine's raw-RI data with the
     /// given screening orbital energies.
     pub fn build(gw: &GwGradEngine, eps_screen: &[f64]) -> BseScreening {
-        Self::build_from_parts(&gw.q, &gw.j_mat, gw.nocc, gw.nmo, eps_screen)
+        // `GwGradEngine::q` is evictable (`with_q` rebuilds it when a CD-GW gradient released it)
+        gw.with_q(|q| Self::build_from_parts(q, &gw.j_mat, gw.nocc, gw.nmo, eps_screen))
     }
 }
 
@@ -975,9 +976,9 @@ impl<'a> BseGradEngine<'a> {
             ScreeningEnergy::Qp => qp_caches.iter().map(|c| c.omega).collect(),
             ScreeningEnergy::Reference => crate::ri_gw::current_orbital_energies(scf)[..gw.nmo].to_vec(),
         };
-        let screen = BseScreening::build_from_parts_cutoff(
-            &gw.q, &gw.j_mat, gw.nocc, gw.nmo, nvir_act, &eps_screen,
-        );
+        let screen = gw.with_q(|q| {
+            BseScreening::build_from_parts_cutoff(q, &gw.j_mat, gw.nocc, gw.nmo, nvir_act, &eps_screen)
+        });
         let kappa = match multi {
             's' | 'S' => 2.0,
             't' | 'T' => 0.0,

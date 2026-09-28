@@ -1,5 +1,6 @@
 //use std::simd::num;
 use std::ops::Range;
+use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
 use crate::scf_io::SCF;
 use rayon::result;
 use rest_tensors::{RIFull};
@@ -20,6 +21,7 @@ use std::{f64, fs::File, io::Write};
 pub mod dipoles;
 pub mod matvec;
 pub mod matvec_fast;
+pub mod pair_kernel;
 pub mod response;
 pub mod feast_solver;
 pub mod nonlinbse_matvec;
@@ -196,9 +198,21 @@ pub fn bse_main(scf_data:&mut SCF) -> BseOutput {
         if !qp_ctrl.bse_davidson_solver && qp_ctrl.bse_feast_solver {
             eprintln!("Warning: Using FEAST solver for BSE (experimental). \
                        To use the Davidson solver instead, set bse_davidson_solver=true.");
-            if crate::ctrl_io::quasiparticle_methods::style_is_ao(&qp_ctrl.bse_matvec_style) {
-                eprintln!("Warning: bse_matvec_style = \"ao\" is not wired into the FEAST solver \
-                           yet; the FEAST path still uses the MO-basis matvec.");
+            // The FEAST matvec goes through `BseMatvec` (`feast_solve_bse_tda` /
+            // `_nontda`), so the AO-family backends *are* used there.  What does
+            // not carry over is the s-only inner-GMRES preconditioner, which is
+            // assembled from MO-basis RI tensors; `build_s_only_precond_data`
+            // falls back to the diagonal preconditioner for those styles and
+            // prints its own note.
+            if crate::ctrl_io::quasiparticle_methods::style_is_ao(&qp_ctrl.bse_matvec_style)
+                || crate::ctrl_io::quasiparticle_methods::style_is_pair(&qp_ctrl.bse_matvec_style)
+            {
+                eprintln!(
+                    "Note: bse_matvec_style = \"{}\" runs the FEAST matvec on the AO-family \
+                     path, but the s-only inner-GMRES preconditioner falls back to the diagonal \
+                     one (see the message printed when it is built).",
+                    qp_ctrl.bse_matvec_style
+                );
             }
             let excitations = match bse_spin.as_str() {
                 "singlet" => feast_solver::feast_solve_bse_singlet(scf_data),
@@ -668,14 +682,18 @@ struct MoBseTensors {
 /// then clears `rimatr_bse` (and `ri3fn_bse`), and the Rayleigh-Ritz refinement
 /// consequently builds its matvec from the regular `rimatr`.
 pub struct BseMatvec {
+    pair: Option<pair_kernel::PairBseContext>,
     ao: Option<matvec_fast::FastBseContext>,
     mo: Option<MoBseTensors>,
 }
 
 impl BseMatvec {
     pub fn new(scf_data: &SCF, inverse_dielectric: &MatrixFull<f64>, need_b: bool) -> Self {
+        if let Some(ctx) = build_pair_matvec_context(scf_data, inverse_dielectric) {
+            return Self { pair: Some(ctx), ao: None, mo: None };
+        }
         if let Some(ctx) = build_ao_matvec_context(scf_data, inverse_dielectric) {
-            return Self { ao: Some(ctx), mo: None };
+            return Self { pair: None, ao: Some(ctx), mo: None };
         }
         let (_start_mo, _num_state, occ_size, vir_size, _homo, _lumo) =
             get_occupation_parameters(scf_data, 'N');
@@ -701,6 +719,7 @@ impl BseMatvec {
             (None, None)
         };
         Self {
+            pair: None,
             ao: None,
             mo: Some(MoBseTensors { ri_vv, ri_oo_tilde, ri_ov, ri_ov_b, ri_ov_tilde }),
         }
@@ -708,7 +727,7 @@ impl BseMatvec {
 
     /// `true` when the AO backend is in use.
     pub fn is_ao(&self) -> bool {
-        self.ao.is_some()
+        self.ao.is_some() || self.pair.is_some()
     }
 
     /// `A z`.
@@ -718,9 +737,10 @@ impl BseMatvec {
         qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
         z: &Vec<f64>,
     ) -> Vec<f64> {
-        match (&self.ao, &self.mo) {
-            (Some(ctx), _) => ctx.a_block_matvec(scf_data, qp_ctrl, z),
-            (None, Some(mo)) => {
+        match (&self.pair, &self.ao, &self.mo) {
+            (Some(ctx), _, _) => ctx.a_block_matvec(scf_data, qp_ctrl, z),
+            (None, Some(ctx), _) => ctx.a_block_matvec(scf_data, qp_ctrl, z),
+            (None, None, Some(mo)) => {
                 matvec::a_block_matvec(scf_data, qp_ctrl, &mo.ri_vv, &mo.ri_ov, &mo.ri_oo_tilde, z)
             }
             _ => unreachable!("BseMatvec has no backend"),
@@ -734,9 +754,10 @@ impl BseMatvec {
         qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle,
         z: &Vec<f64>,
     ) -> Vec<f64> {
-        match (&self.ao, &self.mo) {
-            (Some(ctx), _) => ctx.b_block_matvec(scf_data, qp_ctrl, z),
-            (None, Some(mo)) => matvec::b_block_matvec(
+        match (&self.pair, &self.ao, &self.mo) {
+            (Some(ctx), _, _) => ctx.b_block_matvec(scf_data, qp_ctrl, z),
+            (None, Some(ctx), _) => ctx.b_block_matvec(scf_data, qp_ctrl, z),
+            (None, None, Some(mo)) => matvec::b_block_matvec(
                 scf_data,
                 qp_ctrl,
                 &mo.ri_ov,
@@ -773,6 +794,90 @@ impl BseMatvec {
     }
 }
 
+/// The `a`/`b` matvec backend the Davidson drivers build directly, when
+/// `bse_matvec_style` asks for one of the AO-family routes.
+///
+/// Both variants own their whole state (no MO-basis RI tensor exists), and both
+/// memoise the `z`-dependent terms, so the `a`-then-`b` pattern of a Davidson
+/// sweep is cheap on either.
+pub enum FastBseBackend {
+    Pair(pair_kernel::PairBseContext),
+    Ao(matvec_fast::FastBseContext),
+}
+
+impl FastBseBackend {
+    pub fn a(
+        &self,
+        scf_data: &SCF,
+        qp_ctrl: &QuasiParticle,
+        z: &[f64],
+    ) -> Vec<f64> {
+        match self {
+            Self::Pair(c) => c.a_block_matvec(scf_data, qp_ctrl, z),
+            Self::Ao(c) => c.a_block_matvec(scf_data, qp_ctrl, z),
+        }
+    }
+    pub fn b(
+        &self,
+        scf_data: &SCF,
+        qp_ctrl: &QuasiParticle,
+        z: &[f64],
+    ) -> Vec<f64> {
+        match self {
+            Self::Pair(c) => c.b_block_matvec(scf_data, qp_ctrl, z),
+            Self::Ao(c) => c.b_block_matvec(scf_data, qp_ctrl, z),
+        }
+    }
+}
+
+/// Build whichever AO-family backend `bse_matvec_style` selects (`"pair"` first,
+/// then `"ao"`), or `None` when the MO-basis tensors are wanted.
+pub fn build_fast_bse_backend(
+    scf_data: &SCF,
+    inverse_dielectric: &MatrixFull<f64>,
+) -> Option<FastBseBackend> {
+    if let Some(c) = build_pair_matvec_context(scf_data, inverse_dielectric) {
+        return Some(FastBseBackend::Pair(c));
+    }
+    build_ao_matvec_context(scf_data, inverse_dielectric).map(FastBseBackend::Ao)
+}
+
+/// Build the pair-list matvec context when
+/// `[quasiparticle_methods] bse_matvec_style = "pair"`, else `None`.
+///
+/// See [`pair_kernel`] for the operator identity, the screening criterion and
+/// the cost model.
+pub fn build_pair_matvec_context(
+    scf_data: &SCF,
+    inverse_dielectric: &MatrixFull<f64>,
+) -> Option<pair_kernel::PairBseContext> {
+    let qp = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap_or_default();
+    if !crate::ctrl_io::quasiparticle_methods::style_is_pair(&qp.bse_matvec_style) {
+        return None;
+    }
+    if scf_data.mol.spin_channel > 1 {
+        println!(
+            "bse_matvec_style = \"pair\": the pair-list matvec is implemented for the restricted \
+             (spin_channel = 1) reference only; keeping the other backend."
+        );
+        return None;
+    }
+    println!(
+        "BSE matvec style: \"pair\" (pair-list AO kernel, bse_matvec_style = {})",
+        qp.bse_matvec_style
+    );
+    match pair_kernel::PairBseContext::build_from_ctrl(scf_data, inverse_dielectric) {
+        Some(ctx) => Some(ctx),
+        None => {
+            println!(
+                "bse_matvec_style = \"pair\": the pair-list context could not be built (see the \
+                 message above); falling back."
+            );
+            None
+        }
+    }
+}
+
 /// Build the AO-basis ("memory-efficient") matvec context when
 /// `[quasiparticle_methods] bse_matvec_style = "ao"`, else `None`.
 ///
@@ -798,7 +903,11 @@ pub fn build_ao_matvec_context(
         "BSE matvec style: \"ao\" (memory-efficient AO-basis matvec, bse_matvec_style = {})",
         qp.bse_matvec_style
     );
-    match matvec_fast::FastBseContext::build(scf_data, inverse_dielectric) {
+    match matvec_fast::FastBseContext::build_with_screening(
+        scf_data,
+        inverse_dielectric,
+        qp.bse_ao_screening_tol,
+    ) {
         Some(ctx) => Some(ctx),
         None => {
             println!(
@@ -823,7 +932,7 @@ pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:
     let mut eigenpairs:Vec<(f64,Vec<f64>)>=Vec::new();
     if qp_ctrl.bse_davidson_solver==true{
         // ---- AO ("ao") or MO ("mo") matvec ----
-        let ao_ctx = build_ao_matvec_context(scf_data, &inverse_dielectric);
+        let ao_ctx = build_fast_bse_backend(scf_data, &inverse_dielectric);
         let mo_ri: Option<(MatrixFull<f64>,MatrixFull<f64>,MatrixFull<f64>,MatrixFull<f64>,MatrixFull<f64>)> =
             if ao_ctx.is_some() {
                 drop(inverse_dielectric);
@@ -863,7 +972,7 @@ pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:
         };
         let a_matvec = |z:&Vec<f64>| -> Vec<f64> {
             match (&ao_ctx,&mo_ri) {
-                (Some(ctx),_) => ctx.a_block_matvec(scf_data,&qp_ctrl,z),
+                (Some(ctx),_) => ctx.a(scf_data,&qp_ctrl,z),
                 (None,Some((ri_vv,ri_ov,ri_oo_tilde,_,_))) =>
                     matvec::a_block_matvec(scf_data,&qp_ctrl,ri_vv,ri_ov,ri_oo_tilde,z),
                 _ => unreachable!("no matvec backend selected"),
@@ -871,7 +980,7 @@ pub fn non_tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:
         };
         let b_matvec = |z:&Vec<f64>| -> Vec<f64> {
             match (&ao_ctx,&mo_ri) {
-                (Some(ctx),_) => ctx.b_block_matvec(scf_data,&qp_ctrl,z),
+                (Some(ctx),_) => ctx.b(scf_data,&qp_ctrl,z),
                 (None,Some((_,ri_ov,_,ri_ov_b,ri_ov_tilde))) =>
                     matvec::b_block_matvec(scf_data,&qp_ctrl,ri_ov,ri_ov_b,ri_ov_tilde,z),
                 _ => unreachable!("no matvec backend selected"),
@@ -939,7 +1048,7 @@ pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char
     if qp_ctrl.bse_davidson_solver==true{
         let start=Instant::now();
         // ---- AO ("ao") or MO ("mo") matvec ----
-        let ao_ctx = build_ao_matvec_context(scf_data, &inverse_dielectric);
+        let ao_ctx = build_fast_bse_backend(scf_data, &inverse_dielectric);
         let mo_ri: Option<(MatrixFull<f64>,MatrixFull<f64>,MatrixFull<f64>)> = if ao_ctx.is_some() {
             drop(inverse_dielectric);
             None
@@ -978,7 +1087,7 @@ pub fn tda_calculations(scf_data:&SCF,quasiparticle_energies:&Vec<f64>,xlet:char
         };
         let a_matvec = |z:&Vec<f64>| -> Vec<f64> {
             match (&ao_ctx,&mo_ri) {
-                (Some(ctx),_) => ctx.a_block_matvec(scf_data,&qp_ctrl,z),
+                (Some(ctx),_) => ctx.a(scf_data,&qp_ctrl,z),
                 (None,Some((ri_vv,ri_ov,ri_oo_tilde))) =>
                     matvec::a_block_matvec(scf_data,&qp_ctrl,ri_vv,ri_ov,ri_oo_tilde,z),
                 _ => unreachable!("no matvec backend selected"),

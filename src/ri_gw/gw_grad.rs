@@ -57,6 +57,7 @@ use rest_tensors::matrix::matrix_blas_lapack::{
 use tensors::{MathMatrix, MatrixFull};
 use num_complex::Complex;
 
+use std::cell::RefCell;
 use std::os::raw::c_char;
 use std::time::Instant;
 
@@ -180,6 +181,14 @@ pub struct GwGradConfig {
     /// `O(naux nao nrow_A + naux_A nao^2)` and the whole gradient from
     /// `O(3 natm naux nao^2)` to `O(naux nao^2)`.
     pub local_di: bool,
+    /// Keep the individual adjoint skeleton tensors of the CP-HF channel in
+    /// [`CphfAdjoint`] (`Theta` alongside its folded combination `di_cov`, and the
+    /// MO-basis covectors), so that the piecewise identities can be checked term by term.
+    ///
+    /// Off by default: `Theta` duplicates an `naux * nao^2` tensor (874 MB at
+    /// naphthalene/def2-TZVP) that the gradient itself never reads after the fold.
+    /// This only affects memory, not the numbers.
+    pub keep_adjoint_pieces: bool,
     /// Cache the bra-independent intermediates of the RI-JK response kernel
     /// (`analdrv`'s `cpscf_cache_kernel`).  The CP-HF route applies that kernel
     /// to a single right-hand side per Krylov iteration, so it rebuilds the
@@ -222,6 +231,7 @@ impl Default for GwGradConfig {
             folded_qx: true,
             adjoint_cphf: true,
             local_di: true,
+            keep_adjoint_pieces: false,
             resp_cache_kernel: true,
             fold_cphf_rhs: true,
         }
@@ -291,8 +301,13 @@ pub struct RawRiTensors {
     pub nao: usize,
     pub naux: usize,
     pub natm: usize,
-    /// I[mu + nu*nao + P*nao*nao], col-major [nao, nao, naux]
-    pub i3: Vec<f64>,
+    /// I[mu + nu*nao + P*nao*nao], col-major [nao, nao, naux].
+    ///
+    /// Held behind a [`RefCell`] so that a task which has finished with it can release
+    /// `nao^2 * naux` doubles (874 MB at naphthalene/def2-TZVP) with
+    /// [`RawRiTensors::evict_i3`]; every reader goes through [`RawRiTensors::with_i3`],
+    /// which re-evaluates the three-centre integrals on demand.
+    pub i3: RefCell<Vec<f64>>,
     /// J[P + Q*naux]
     pub j2: Vec<f64>,
     /// dJ1[P + Q*naux + t*naux*naux]
@@ -372,7 +387,7 @@ pub fn build_raw_ri_tensors(scf: &SCF) -> RawRiTensors {
         nao,
         naux,
         natm,
-        i3,
+        i3: RefCell::new(i3),
         j2,
         dj1,
         ao_atom: atom_map_from_slices(&ao_slices, nao),
@@ -387,6 +402,76 @@ pub fn build_raw_ri_tensors(scf: &SCF) -> RawRiTensors {
 }
 
 impl RawRiTensors {
+    /// Run `f` on the raw three-centre integrals, re-evaluating them if a previous
+    /// [`Self::evict_i3`] released them.
+    ///
+    /// The closure runs while the buffer is borrowed; nested readers are fine (they only take
+    /// shared borrows), but nothing inside may evict.
+    pub fn with_i3<R>(&self, f: impl FnOnce(&[f64]) -> R) -> R {
+        self.ensure_i3();
+        f(&self.i3.borrow())
+    }
+
+    /// Rebuild the three-centre integrals when they are not resident.
+    ///
+    /// Callers that keep a [`std::cell::Ref`] guard for a whole routine (the TDDFT gradient's
+    /// Coulomb/`Y` helpers) call this once on entry, then borrow `i3` directly.
+    pub fn ensure_i3(&self) {
+        if self.i3.borrow().is_empty() {
+            let t0 = Instant::now();
+            let (i3, shape3) =
+                CInt::integrate_cross("int3c2e", [&self.mol, &self.mol, &self.auxmol], "s1", None).into();
+            if std::env::var("REST_GWGRAD_MEMDBG").is_ok() {
+                println!(
+                    "[memdbg]   i3 re-evaluation (int3c2e, {:.1} MB): {:.3}s",
+                    (self.nao * self.nao * self.naux) as f64 * 8.0 / 1048576.0,
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+            assert_eq!(shape3, vec![self.nao, self.nao, self.naux], "int3c2e s1 shape");
+            *self.i3.borrow_mut() = i3;
+        }
+    }
+
+    /// Evaluate the raw three-centre integrals **auxiliary-atom block by auxiliary-atom block** and
+    /// hand each block to `f` as `(aux_offset, naux_block, block)`, with `block` col-major
+    /// `[nao, nao, naux_block]` (auxiliary functions ordered as in the full tensor, i.e. starting at
+    /// `aux_offset`).
+    ///
+    /// This is the streaming alternative to [`Self::with_i3`] for callers that only *contract* the
+    /// integrals: the full `nao^2 * naux` array (874 MB at naphthalene/def2-TZVP) is never
+    /// materialised, at the price of evaluating the same shell triplets in a few more libcint calls
+    /// (the per-call shell-pair setup is negligible against the integral work). The integral count
+    /// is identical to one full `int3c2e` call.
+    pub fn for_each_i3_atom_block<F>(&self, mut f: F)
+    where
+        F: FnMut(usize, usize, &[f64]),
+    {
+        let nao = self.nao;
+        for atm in 0..self.natm {
+            let fun = self.aux_range[atm];
+            let nb = fun[1] - fun[0];
+            if nb == 0 {
+                continue;
+            }
+            let shls = [[0, self.mol.nbas()], [0, self.mol.nbas()], self.aux_shl_range[atm]];
+            let (blk, shape) =
+                CInt::integrate_cross("int3c2e", [&self.mol, &self.mol, &self.auxmol], "s1", &shls).into();
+            assert_eq!(shape, vec![nao, nao, nb], "auxiliary-atom int3c2e block shape");
+            f(fun[0], nb, &blk);
+        }
+    }
+
+    /// Release the raw three-centre integrals (`nao^2 * naux` doubles).
+    ///
+    /// They are re-evaluated on demand by [`Self::with_i3`], so this only trades memory for the
+    /// integral work of whoever needs them next. Tasks that hold their own copies of what they
+    /// need (the CD-GW adjoint gradient after its Coulomb/`Y` contractions) can drop them for
+    /// the rest of the calculation.
+    pub fn evict_i3(&self) {
+        self.i3.replace(Vec::new());
+    }
+
     /// Shell-sliced derivative integral blocks of one perturbed atom,
     /// shared by its three Cartesian components.  The total integral work
     /// summed over atoms equals one full `dI1`/`dI2` build, but only one
@@ -601,14 +686,22 @@ fn to_mat(v: &[f64], r: usize, c: usize) -> MatrixFull<f64> {
 
 /// `A^T B` for flat col-major buffers `A [ar, ac]`, `B [br, bc]`, `ar == br`.
 /// The contraction runs over the FIRST dimension (REST `_dgemm_full` 'T'
-/// convention), the result is `[ac, bc]`.
+/// convention), the result is `[ac, bc]` col-major.
+///
+/// The operands are borrowed as **views** (`rt::asarray` on a slice) instead of being wrapped in
+/// `MatrixFull` through `to_mat`, which copies its whole buffer: in the GW gradient `A` is the raw
+/// three-centre integral tensor `[nao^2, naux]` (three calls per adjoint build) and `B` is the
+/// metric-transformed `qt` in the low-rank build, so a copy costs `nao^2 * naux` doubles
+/// (874 MB at naphthalene/def2-TZVP) of purely transient memory each time.
 fn gemm_nt(a: &[f64], ar: usize, ac: usize, b: &[f64], br: usize, bc: usize) -> Vec<f64> {
+    use rstsr::prelude::*;
+
     debug_assert_eq!(ar, br, "gemm_nt: contraction dimension mismatch");
-    let am = to_mat(a, ar, ac);
-    let bm = to_mat(b, br, bc);
-    let mut out = MatrixFull::new([ac, bc], 0.0);
-    _dgemm_full(&am, 'T', &bm, 'N', &mut out, 1.0, 0.0);
-    out.data
+    let device = DeviceBLAS::default();
+    let am = rt::asarray((a, [ar, ac].f(), &device));
+    let bm = rt::asarray((b, [br, bc].f(), &device));
+    let out = am.t() % bm;
+    out.into_contig(ColMajor).into_shape(-1).into_vec()
 }
 
 /// Explicit transpose of a flat col-major `[r, c]` buffer.
@@ -622,14 +715,43 @@ fn transpose_buf(a: &[f64], r: usize, c: usize) -> Vec<f64> {
     out
 }
 
-/// `A B` for flat col-major buffers.
+/// `A B` for flat col-major buffers `A [ar, ac]`, `B [br, bc]`, `ac == br`; result `[ar, bc]`.
+///
+/// Borrowed views for the same reason as [`gemm_nt`]: the operands include `q`/`qt`/`i3`
+/// (`nao^2 * naux` doubles) and the copies would dominate the engine-build and gradient peaks.
 fn gemm_nn(a: &[f64], ar: usize, ac: usize, b: &[f64], br: usize, bc: usize) -> Vec<f64> {
+    use rstsr::prelude::*;
+
     debug_assert_eq!(ac, br);
-    let am = to_mat(a, ar, ac);
-    let bm = to_mat(b, br, bc);
-    let mut out = MatrixFull::new([ar, bc], 0.0);
-    _dgemm_full(&am, 'N', &bm, 'N', &mut out, 1.0, 0.0);
-    out.data
+    let device = DeviceBLAS::default();
+    let am = rt::asarray((a, [ar, ac].f(), &device));
+    let bm = rt::asarray((b, [br, bc].f(), &device));
+    let out = am % bm;
+    out.into_contig(ColMajor).into_shape(-1).into_vec()
+}
+
+/// `s_metric · q` for a `[naux, ncol]` right-hand side, applied in auxiliary-column blocks.
+///
+/// `gemm_nn` (and the tensor matmul behind it) materialises the result as a *second* full-size
+/// buffer while the first is still alive, and converts its layout with a third: for the engine's
+/// `qt = s_metric · q` (`naux * nmo^2` = 874 MB at naphthalene/def2-TZVP) that transient was the
+/// highest point of the whole gradient. Working block-wise holds one `naux * block` temporary
+/// (3.7 MB) and writes straight into the output.
+fn metric_transform_blocked(s_metric: &[f64], q: &[f64], naux: usize, ncol: usize) -> Vec<f64> {
+    let mut out = vec![0.0f64; naux * ncol];
+    let sm = to_mat(s_metric, naux, naux);
+    let block = 512usize.min(ncol).max(1);
+    let mut c0 = 0;
+    while c0 < ncol {
+        let c1 = (c0 + block).min(ncol);
+        let nb = c1 - c0;
+        let bm = to_mat(&q[c0 * naux..c1 * naux], naux, nb);
+        let mut om = MatrixFull::new([naux, nb], 0.0);
+        _dgemm_full(&sm, 'N', &bm, 'N', &mut om, 1.0, 0.0);
+        out[c0 * naux..c1 * naux].copy_from_slice(&om.data);
+        c0 = c1;
+    }
+    out
 }
 
 /// Symmetric eigendecomposition, ascending eigenvalues, column eigenvectors.
@@ -859,8 +981,12 @@ pub struct GwGradEngine<'a> {
     pub e: Vec<f64>,
     /// MO coefficients [nao, nmo] col-major
     pub c_mo: MatrixFull<f64>,
-    /// raw three-center MO integrals (pair-symmetrised)
-    pub q: Vec<f64>,
+    /// raw three-center MO integrals (pair-symmetrised).
+    ///
+    /// Behind a [`RefCell`] so that a task which no longer needs them can release
+    /// `naux * nmo^2` doubles (874 MB at naphthalene/def2-TZVP) with [`Self::evict_q`];
+    /// readers go through [`Self::with_q`], which rebuilds them from `raw.i3` on demand.
+    pub q: RefCell<Vec<f64>>,
     /// the same integrals repacked pair-slowest (`[nmo, nmo*naux]` col-major
     /// view) so that the `U^T q + q U` contraction of `qx_from_u` is one
     /// large gemm
@@ -873,8 +999,9 @@ pub struct GwGradEngine<'a> {
     pub j_chol: MatrixFull<f64>,
     /// J^{-1/2}
     pub s_metric: Vec<f64>,
-    /// metric-transformed integrals (same layout as `q`)
-    pub qt: Vec<f64>,
+    /// metric-transformed integrals (same layout as `q`). Evictable like [`Self::q`]
+    /// (see [`Self::evict_qt`]); only the QP-cache construction reads it.
+    pub qt: RefCell<Vec<f64>>,
     /// raw occupied-virtual block [naux, nov], ia = i + a*nocc
     pub qia: Vec<f64>,
     /// screening transition energies de_ia = e_a - e_i
@@ -887,8 +1014,9 @@ pub struct GwGradEngine<'a> {
     pub lr_imag: Vec<LrFactor>,
     /// cached low-rank factors on the real-axis grid
     pub lr_grid: Vec<LrFactor>,
-    /// metric-transformed occupied-virtual block (kept for on-the-fly factors)
-    pub qtia: Vec<f64>,
+    /// metric-transformed occupied-virtual block (kept for on-the-fly factors).
+    /// Evictable together with `qt` ([`Self::evict_qt`]).
+    pub qtia: RefCell<Vec<f64>>,
     /// hybrid parameter alpha of the reference, as used by REST's GW
     /// `consts` (`dfa_hybrid_scf`)
     pub hybrid: f64,
@@ -933,11 +1061,12 @@ impl<'a> GwGradEngine<'a> {
         let mut q = vec![0.0f64; naux * nmo * nmo];
         {
             let n2 = nao * nao;
+            let i3_local = raw.i3.borrow();
             let mut ip = MatrixFull::new([nao, nao], 0.0);
             let mut tmp = MatrixFull::new([nao, nmo], 0.0);
             let mut sl = MatrixFull::new([nmo, nmo], 0.0);
             for p_aux in 0..naux {
-                ip.data.copy_from_slice(&raw.i3[p_aux * n2..(p_aux + 1) * n2]);
+                ip.data.copy_from_slice(&i3_local[p_aux * n2..(p_aux + 1) * n2]);
                 // tmp[mu, q_mo] = sum_nu I[mu, nu, P] C[nu, q_mo]
                 _dgemm_full(&ip, 'N', &c_mo, 'N', &mut tmp, 1.0, 0.0);
                 // sl[p_mo, q_mo] = sum_mu C[mu, p_mo] tmp[mu, q_mo]
@@ -956,6 +1085,13 @@ impl<'a> GwGradEngine<'a> {
         // `naux * nmo^2` doubles (874 MB at naphthalene/def2-TZVP) out of the
         // resident set of every optimised gradient. Same for the full-CD
         // engine (`skip_lr_cache`).
+        // `i3` has served its only purpose in the engine build (the `q` contraction above); the
+        // remaining construction (metric, `qt`, occupied-virtual blocks, low-rank factors) does not
+        // read it. Releasing `nao^2 * naux` doubles here (874 MB at naphthalene/def2-TZVP) removes
+        // them from the factor-construction phase, which is otherwise the highest point of the
+        // engine build. Whoever needs the raw integrals later (the adjoint skeleton contractions,
+        // the per-perturbation route, TDDFT) gets them back through `with_i3`.
+        raw.evict_i3();
         let q_pairmajor: Vec<f64> = if config.skip_lr_cache || config.folded_qx {
             Vec::new()
         } else {
@@ -969,6 +1105,7 @@ impl<'a> GwGradEngine<'a> {
             v
         };
 
+        mem_probe("  build: after q");
         // ---- metric and J^{-1/2} ----
         let j_mat = MatrixFull::from_vec([naux, naux], raw.j2.clone()).unwrap();
         let mut j_chol = j_mat.clone();
@@ -991,10 +1128,10 @@ impl<'a> GwGradEngine<'a> {
         let qt = if config.skip_lr_cache {
             Vec::new()
         } else {
-            let q_mat = to_mat(&q, naux, nmo * nmo);
-            gemm_nn(&s_metric, naux, naux, &q_mat.data, naux, nmo * nmo)
+            metric_transform_blocked(&s_metric, &q, naux, nmo * nmo)
         };
 
+        mem_probe("  build: after qt");
         // ---- occupied-virtual blocks ----
         let nov = nocc * (nmo - nocc);
         let mut qia = vec![0.0f64; naux * nov];
@@ -1017,6 +1154,7 @@ impl<'a> GwGradEngine<'a> {
         }
         assert_eq!(de_ia.len(), nov);
 
+        mem_probe("  build: after qia/qtia");
         // ---- imaginary-axis quadrature (REST grids) ----
         let quad: Vec<(f64, f64)> = match config.freq_grid_type {
             1 => {
@@ -1079,19 +1217,19 @@ impl<'a> GwGradEngine<'a> {
                 natm,
                 e,
                 c_mo,
-                q,
+                q: RefCell::new(q),
                 q_pairmajor,
                 j_mat,
                 j_chol,
                 s_metric,
-                qt,
+                qt: RefCell::new(qt),
                 qia,
                 de_ia,
                 quad,
                 z_grid,
                 lr_imag: Vec::new(),
                 lr_grid: Vec::new(),
-                qtia,
+                qtia: RefCell::new(qtia),
                 hybrid,
                 fock_hyb,
                 vxc_nn,
@@ -1108,12 +1246,14 @@ impl<'a> GwGradEngine<'a> {
                     build_lr_factor(&qtia, naux, nov, &de_ia, u, 'I', 0.0, config.low_rank_tolerance)
                 })
                 .collect();
+            mem_probe("  build: after imaginary factors");
             let lr_grid: Vec<LrFactor> = z_grid
                 .iter()
                 .map(|&z| {
                     build_lr_factor(&qtia, naux, nov, &de_ia, z, 'R', config.eta, config.low_rank_tolerance)
                 })
                 .collect();
+            mem_probe("  build: after all factors");
             if std::env::var("REST_GWGRAD_DBG").is_ok() {
                 println!("[new DBG] lr_imag nkeeps = {:?}", lr_imag.iter().map(|f| f.eigval.len()).collect::<Vec<_>>());
                 println!("[new DBG] lr_grid nkeeps = {:?}", lr_grid.iter().map(|f| f.eigval.len()).collect::<Vec<_>>());
@@ -1129,19 +1269,19 @@ impl<'a> GwGradEngine<'a> {
                 natm,
                 e,
                 c_mo,
-                q,
+                q: RefCell::new(q),
                 q_pairmajor,
                 j_mat,
                 j_chol,
                 s_metric,
-                qt,
+                qt: RefCell::new(qt),
                 qia,
                 de_ia,
                 quad,
                 z_grid,
                 lr_imag,
                 lr_grid,
-                qtia,
+                qtia: RefCell::new(qtia),
                 hybrid,
                 fock_hyb,
                 vxc_nn,
@@ -1240,14 +1380,109 @@ impl<'a> GwGradEngine<'a> {
         }
     }
 
+    /// Run `f` on the raw MO integrals `q[P, p, q]` (pair-symmetrised, aux-fastest).
+    ///
+    /// Rebuilds them from `raw.i3` when a previous task released them with [`Self::evict_q`].
+    pub fn with_q<R>(&self, f: impl FnOnce(&[f64]) -> R) -> R {
+        self.ensure_q();
+        f(&self.q.borrow())
+    }
+
+    /// Make sure `q` is resident (see [`Self::with_q`]).
+    pub fn ensure_q(&self) {
+        if self.q.borrow().is_empty() {
+            let built = self.build_q();
+            *self.q.borrow_mut() = built;
+        }
+    }
+
+    /// Rebuild `q[P, p, q] = sum_{mu,nu} (mu nu | P) C[mu,p] C[nu,q]` (pair-symmetrised) from the
+    /// raw three-centre integrals; mirrors the construction in the engine's `new_with_raw`.
+    fn build_q(&self) -> Vec<f64> {
+        let (nao, nmo, naux) = (self.nao, self.nmo, self.naux);
+        let n2 = nao * nao;
+        let mut q = vec![0.0f64; naux * nmo * nmo];
+        self.raw.with_i3(|i3| {
+            let mut ip = MatrixFull::new([nao, nao], 0.0);
+            let mut tmp = MatrixFull::new([nao, nmo], 0.0);
+            let mut sl = MatrixFull::new([nmo, nmo], 0.0);
+            for p_aux in 0..naux {
+                ip.data.copy_from_slice(&i3[p_aux * n2..(p_aux + 1) * n2]);
+                _dgemm_full(&ip, 'N', &self.c_mo, 'N', &mut tmp, 1.0, 0.0);
+                _dgemm_full(&self.c_mo, 'T', &tmp, 'N', &mut sl, 1.0, 0.0);
+                for col in 0..nmo * nmo {
+                    q[col * naux + p_aux] = sl.data[col];
+                }
+            }
+        });
+        symmetrise_pairs(&mut q, naux, nmo);
+        q
+    }
+
+    /// Make sure `qt` is resident (see [`Self::with_qt`]).
+    fn ensure_qt(&self) {
+        if self.qt.borrow().is_empty() && !self.config.skip_lr_cache {
+            self.ensure_q();
+            let built = metric_transform_blocked(
+                &self.s_metric,
+                &self.q.borrow(),
+                self.naux,
+                self.nmo * self.nmo,
+            );
+            *self.qt.borrow_mut() = built;
+        }
+    }
+
+    /// Run `f` on the metric-transformed integrals `qt` (see [`Self::evict_qt`]).
+    pub fn with_qt<R>(&self, f: impl FnOnce(&[f64]) -> R) -> R {
+        self.ensure_qt();
+        f(&self.qt.borrow())
+    }
+
+    /// Run `f` on the occupied-virtual block `qtia` (see [`Self::evict_qt`]).
+    pub fn with_qtia<R>(&self, f: impl FnOnce(&[f64]) -> R) -> R {
+        if self.qtia.borrow().is_empty() && !self.config.skip_lr_cache {
+            self.ensure_qt();
+            let (naux, nmo, nocc) = (self.naux, self.nmo, self.nocc);
+            let qt = self.qt.borrow();
+            let mut qtia = vec![0.0f64; naux * nocc * (nmo - nocc)];
+            for a in nocc..nmo {
+                for i in 0..nocc {
+                    let src = (i + a * nmo) * naux;
+                    let dst = (i + (a - nocc) * nocc) * naux;
+                    qtia[dst..dst + naux].copy_from_slice(&qt[src..src + naux]);
+                }
+            }
+            *self.qtia.borrow_mut() = qtia;
+        }
+        f(&self.qtia.borrow())
+    }
+
+    /// Release `qt` and `qtia` (`naux * nmo^2` + `naux * nov` doubles): they are only read while
+    /// building a QP cache (the static `consts` term and the exact-residue on-the-fly factors),
+    /// never by a gradient's own contractions. [`Self::with_qt`]/[`Self::with_qtia`] rebuild them.
+    pub fn evict_qt(&self) {
+        self.qt.replace(Vec::new());
+        self.qtia.replace(Vec::new());
+    }
+
+    /// Release `q` (`naux * nmo^2` doubles): the folded and adjoint gradient routes read it only
+    /// up to the covector fold. [`Self::with_q`] rebuilds it on demand.
+    pub fn evict_q(&self) {
+        self.q.replace(Vec::new());
+    }
+
     /// REST static term `consts_n = eps_n + (1-alpha) Sigma_x,nn - vxc_nn`
     /// with the RI exchange `Sigma_x,nn = -sum_i (n i | n i)`.
     pub fn consts(&self, n: usize) -> f64 {
-        let mut exchange = 0.0;
-        for i in 0..self.nocc {
-            let base = self.pair_col(n, i) * self.naux;
-            exchange -= self.qt[base..base + self.naux].iter().map(|x| x * x).sum::<f64>();
-        }
+        let exchange = self.with_qt(|qt| {
+            let mut acc = 0.0;
+            for i in 0..self.nocc {
+                let base = self.pair_col(n, i) * self.naux;
+                acc -= qt[base..base + self.naux].iter().map(|x| x * x).sum::<f64>();
+            }
+            acc
+        });
         // For HF references REST's ctrl sets dfa_hybrid_scf = 0 while the
         // HF eigenvalues already contain the exact exchange, so the static
         // term must use the true hybrid fraction (cf. dft/response.rs).
@@ -1280,15 +1515,17 @@ impl<'a> GwGradEngine<'a> {
         // diagonalisation); quantised mode: nearest grid factor
         let factor_on_the_fly;
         let factor = if self.config.exact_residue_z {
-            factor_on_the_fly = build_lr_factor(
-                &self.qtia, self.naux, self.de_ia.len(), &self.de_ia,
-                z_used, 'R', self.config.eta, self.config.low_rank_tolerance,
-            );
+            factor_on_the_fly = self.with_qtia(|qtia| {
+                build_lr_factor(
+                    qtia, self.naux, self.de_ia.len(), &self.de_ia,
+                    z_used, 'R', self.config.eta, self.config.low_rank_tolerance,
+                )
+            });
             &factor_on_the_fly
         } else {
             self.lr_factor_nearest(z_used)
         };
-        let qnm = self.gather_pair(&self.q, n, m);
+        let qnm = self.with_q(|q| self.gather_pair(q, n, m));
         let y = factor.response_vectors(&self.s_metric, &qnm, 1);
         let y0 = self.metric_solve(&qnm, 1);
         let w: f64 = qnm
@@ -1363,7 +1600,7 @@ impl<'a> GwGradEngine<'a> {
             Some(w) => &self.lr_imag[w],
             None => self.lr_factor_nearest(z),
         };
-        let qn = self.gather_row(&self.q, n);
+        let qn = self.with_q(|q| self.gather_row(q, n));
         let y = factor.response_vectors(&self.s_metric, &qn, self.nmo);
         let y0 = self.metric_solve(&qn, self.nmo);
         let mut w = vec![0.0f64; self.nmo];
@@ -1766,7 +2003,7 @@ impl<'a> GwGradEngine<'a> {
                 // in `canonical_response`).
                 if (1.0 - self.fock_hyb).abs() > 1.0e-14 && !no_exch {
                     for i in 0..nocc {
-                        let qni = self.gather_pair(&self.q, n, i);
+                        let qni = self.with_q(|q| self.gather_pair(q, n, i));
                         let g_ni = self.metric_solve(&qni, 1);
                         let col_i = self.pair_col(n, i) * naux;
                         for p in 0..naux {
@@ -1908,6 +2145,10 @@ impl<'a> GwGradEngine<'a> {
         let nmo = self.nmo;
         let n2 = nao * nao;
         let npair = nmo * nmo;
+        // one borrow of `q` for the whole routine (`with_q` would rebuild it if a previous
+        // gradient released it)
+        self.ensure_q();
+        let q_all = self.q.borrow();
         let mut qx = vec![0.0f64; naux * npair];
 
         // ---- dI part: qx[P, p + q*nmo] = (C^T dI_p C)[p, q], per P gemms ----
@@ -1949,7 +2190,7 @@ impl<'a> GwGradEngine<'a> {
                     let pi = pair % nmo;
                     let pj_m = pair / nmo;
                     let src = pair * naux + p0;
-                    for (p_l, &val) in self.q[src..src + n_chunk].iter().enumerate() {
+                    for (p_l, &val) in q_all[src..src + n_chunk].iter().enumerate() {
                         v[pi + (pj_m + p_l * nmo) * nmo] = val;
                     }
                 }
@@ -2038,6 +2279,8 @@ impl GwGradEngine<'_> {
         let npair = nmo * nmo;
         assert_eq!(bq_k.len(), naux * npair, "fold_covector: bq size mismatch");
 
+        self.ensure_q();
+        let q_all = self.q.borrow();
         let mut b_ao = vec![0.0f64; naux * n2];
         let mut x = MatrixFull::new([nao, nmo], 0.0);
         let mut bp = MatrixFull::new([nao, nao], 0.0);
@@ -2050,13 +2293,58 @@ impl GwGradEngine<'_> {
             // `[nmo, nmo]` block into the contiguous gemm buffers.
             for pair in 0..npair {
                 let src = pair * naux + p;
-                qm.data[pair] = self.q[src];
+                qm.data[pair] = q_all[src];
                 bqm.data[pair] = bq_k[src];
             }
             // W += q_P bq_P  (both pair-symmetric, so this is
             // W[r,p] = sum_q q[P,r,q] bq[P,p,q])
             _dgemm_full(&qm, 'N', &bqm, 'N', &mut wm, 1.0, 1.0);
             // B_P = C bq_P C^T
+            _dgemm_full(&self.c_mo, 'N', &bqm, 'N', &mut x, 1.0, 0.0);
+            _dgemm_full(&x, 'N', &self.c_mo, 'T', &mut bp, 1.0, 0.0);
+            b_ao[p * n2..(p + 1) * n2].copy_from_slice(&bp.data);
+        }
+        FoldedCovector { b_ao, w_rot: wm.data }
+    }
+
+    /// [`Self::fold_covector`] for a **pair-packed** `bq` (`[nmo*(nmo+1)/2, naux]`, lower triangle
+    /// of the pair-symmetric covector, aux-fastest), as produced by [`pack_pairs_in_place`].
+    ///
+    /// The symmetric plane is rebuilt from the packed values, so the fold is exact and identical to
+    /// the full-buffer version while half the covector memory is resident.
+    pub fn fold_covector_packed(&self, bq_tp: &[f64]) -> FoldedCovector {
+        let nao = self.nao;
+        let nmo = self.nmo;
+        let naux = self.naux;
+        let n2 = nao * nao;
+        let nmo_tp = nmo * (nmo + 1) / 2;
+        assert_eq!(bq_tp.len(), naux * nmo_tp, "fold_covector_packed: bq size mismatch");
+
+        self.ensure_q();
+        let q_all = self.q.borrow();
+        let mut b_ao = vec![0.0f64; naux * n2];
+        let mut x = MatrixFull::new([nao, nmo], 0.0);
+        let mut bp = MatrixFull::new([nao, nao], 0.0);
+        let mut qm = MatrixFull::new([nmo, nmo], 0.0);
+        let mut bqm = MatrixFull::new([nmo, nmo], 0.0);
+        let mut wm = MatrixFull::new([nmo, nmo], 0.0);
+        for p in 0..naux {
+            for pair in 0..nmo * nmo {
+                qm.data[pair] = q_all[pair * naux + p];
+            }
+            // rebuild the symmetric `bq` plane from its lower triangle (`bq` has been symmetrised,
+            // so the mirrored entries are the same floating-point number)
+            let mut tp = 0usize;
+            for col in 0..nmo {
+                for row in col..nmo {
+                    let val = bq_tp[tp * naux + p];
+                    bqm.data[row + col * nmo] = val;
+                    bqm.data[col + row * nmo] = val;
+                    tp += 1;
+                }
+            }
+            // W += q_P bq_P, B_P = C bq_P C^T (same order as `fold_covector`)
+            _dgemm_full(&qm, 'N', &bqm, 'N', &mut wm, 1.0, 1.0);
             _dgemm_full(&self.c_mo, 'N', &bqm, 'N', &mut x, 1.0, 0.0);
             _dgemm_full(&x, 'N', &self.c_mo, 'T', &mut bp, 1.0, 0.0);
             b_ao[p * n2..(p + 1) * n2].copy_from_slice(&bp.data);
@@ -2114,8 +2402,8 @@ impl GwGradEngine<'_> {
 /// Frozen-density RI Coulomb derivative `d J[dm] / dR` (PySCF
 /// `gw_cd_grad._j_deriv_from`).
 fn j_deriv_from(engine: &GwGradEngine, di: &[f64], dj: &[f64], dm: &[f64]) -> Vec<f64> {
-    j_deriv_from_impl(engine.nao, engine.naux, &engine.raw.i3, di, dj, dm, &|r| {
-        engine.solve_metric(r)
+    engine.raw.with_i3(|i3| {
+        j_deriv_from_impl(engine.nao, engine.naux, i3, di, dj, dm, &|r| engine.solve_metric(r))
     })
 }
 
@@ -2129,17 +2417,12 @@ fn j_deriv_from_impl(
     solve: &dyn Fn(&[f64]) -> Vec<f64>,
 ) -> Vec<f64> {
     let n2 = nao * nao;
-    // rho[P] = sum_k I[k, P] dm[k]: contract the natural [n2, naux] views
-    let i3v = to_mat(i3, n2, naux);
-    let div = to_mat(di, n2, naux);
-    let dmv = to_mat(dm, n2, 1);
-    let mut rho = MatrixFull::new([naux, 1], 0.0);
-    _dgemm_full(&i3v, 'T', &dmv, 'N', &mut rho, 1.0, 0.0);
-    let mut drho = MatrixFull::new([naux, 1], 0.0);
-    _dgemm_full(&div, 'T', &dmv, 'N', &mut drho, 1.0, 0.0);
-    let c = solve(&rho.data);
+    // rho[P] = sum_k I[k, P] dm[k]: contract the natural [n2, naux] views (no `to_mat` copies)
+    let rho = gemm_nt(i3, n2, naux, dm, n2, 1);
+    let drho = gemm_nt(di, n2, naux, dm, n2, 1);
+    let c = solve(&rho);
     let djc = gemm_nn(dj, naux, naux, &c, naux, 1);
-    let rhs: Vec<f64> = drho.data.iter().zip(djc.iter()).map(|(a, b)| a - b).collect();
+    let rhs: Vec<f64> = drho.iter().zip(djc.iter()).map(|(a, b)| a - b).collect();
     let dc = solve(&rhs);
     // out[k] = sum_P dI[k, P] c[P] + sum_P I[k, P] dc[P]
     let c_term = gemm_nn(di, n2, naux, &c, naux, 1);
@@ -2157,16 +2440,18 @@ fn j_deriv_from_impl(
 /// factoring the metric once per perturbation instead of twice per AO
 /// column is the main cost saving).
 fn k_deriv_from(engine: &GwGradEngine, di: &[f64], dj: &[f64], cocc: &[f64]) -> Vec<f64> {
-    k_deriv_from_impl(
-        engine.nao,
-        engine.naux,
-        engine.nocc,
-        &engine.raw.i3,
-        di,
-        dj,
-        cocc,
-        &|r| engine.solve_metric(r),
-    )
+    engine.raw.with_i3(|i3| {
+        k_deriv_from_impl(
+            engine.nao,
+            engine.naux,
+            engine.nocc,
+            i3,
+            di,
+            dj,
+            cocc,
+            &|r| engine.solve_metric(r),
+        )
+    })
 }
 
 fn k_deriv_from_impl(
@@ -2667,8 +2952,21 @@ impl GwGradEngine<'_> {
         let caches: Vec<QpCache> = shell.iter().map(|&m| self.build_target_cache(m)).collect();
         let w = 1.0 / caches.len() as f64;
         let refs: Vec<&QpCache> = caches.iter().collect();
+        let adjoint_route = self.config.adjoint_cphf && self.supports_cphf_adjoint();
+        // `qt`/`qtia` are read only while building a QP cache (`consts`, the exact-residue
+        // on-the-fly factors); the gradient's own contractions never touch them. Release
+        // `naux*nmo^2 + naux*nov` doubles (949 MB at naphthalene/def2-TZVP) for the rest of the
+        // gradient; `with_qt`/`with_qtia` rebuild them on demand.
+        self.evict_qt();
+        // The adjoint route rebuilds the raw integrals only inside `build_cphf_adjoint`, after the
+        // response objects (and their kernel cache) have been released; keeping them out of the
+        // covector/fold phase removes `nao^2 * naux` doubles from where this gradient peaks.
+        // (The pullback and the fold read `q`/`qtia`/factors, never `i3`.)
+        if adjoint_route {
+            self.raw.evict_i3();
+        }
         mem_probe("gradient: after QP caches");
-        let (bq, bj, be, bb) = self.qp_pullback(&refs, &[vec![w; caches.len()]]);
+        let (mut bq, bj, be, bb) = self.qp_pullback(&refs, &[vec![w; caches.len()]]);
         let own0 = &caches[shell.iter().position(|&m| m == target).unwrap()];
         mem_probe("gradient: after qp_pullback (bq/bj/be/bb)");
         // ---- adjoint (Z-vector) route --------------------------------
@@ -2680,13 +2978,27 @@ impl GwGradEngine<'_> {
         // per-direction loop both then run without it resident. The
         // per-perturbation fallback below still needs `bq`, which is why the
         // release happens only on this branch.
-        if self.config.adjoint_cphf && self.supports_cphf_adjoint() {
-            let fold = self.fold_covector(&bq[0]);
+        if adjoint_route {
+            // `bq` was symmetrised by the pullback, so compact it in place to its lower triangle
+            // before folding (the fold rebuilds the symmetric plane exactly): this releases
+            // `naux*nmo^2/2` doubles (437 MB at naphthalene/def2-TZVP) for the fold, which is where
+            // this gradient peaks. The route always returns below, so the (full-buffer) fallback
+            // never sees the compacted form.
+            let packed_pairs = pack_pairs_in_place(&mut bq[0], self.nmo, self.naux);
+            let mut fold = self.fold_covector_packed(&bq[0][..packed_pairs * self.naux]);
             mem_probe("gradient: after fold_covector");
             drop(bq);
+            // `q` is read only by the pullback and this fold, both done: release `naux*nmo^2`
+            // doubles (874 MB at naphthalene/def2-TZVP) before the adjoint workspace is built.
+            // `with_q` rebuilds it if a later task (another target, a BSE screening) needs it.
+            self.evict_q();
+            // `build_cphf_adjoint` takes `b_ao` out of `fold` and folds the exchange skeleton into
+            // it in place, so its `naux * nao * nao` tensor becomes `adj.di_cov` instead of being
+            // duplicated; only the small `w_rot` is left to release here.
             let adj = self
-                .build_cphf_adjoint(&fold, &be[0])
+                .build_cphf_adjoint(&mut fold, &be[0])
                 .expect("`supports_cphf_adjoint` and `build_cphf_adjoint` share this guard");
+            drop(fold);
             mem_probe("gradient: after build_cphf_adjoint");
             let mut grad = vec![0.0f64; self.natm * 3];
             // HF reference only (guaranteed by `build_cphf_adjoint`)
@@ -2839,6 +3151,31 @@ pub fn build_real_axis_grid(
             }
         })
         .collect()
+}
+
+/// Compact a **pair-symmetric** `[nmo*nmo, naux]` buffer (pair-slowest, `pair = row + col*nmo`)
+/// in place to its lower triangle `[nmo*(nmo+1)/2, naux]`, returning the packed length.
+///
+/// Written in increasing packed order, so the destination offset never overtakes an unread source
+/// (`tp <= pair`), and the tail is released with `truncate` + `shrink_to_fit`. Used by the adjoint
+/// gradient for `bq`, which the pullback has already symmetrised: the fold reads only the symmetric
+/// plane, so rebuilding it from the packed form is exact while `naux*nmo^2/2` doubles (437 MB at
+/// naphthalene/def2-TZVP) leave the resident set before the fold — the phase this gradient peaks in.
+fn pack_pairs_in_place(v: &mut Vec<f64>, nmo: usize, naux: usize) -> usize {
+    let mut tp = 0usize;
+    for col in 0..nmo {
+        for row in col..nmo {
+            let src = (row + col * nmo) * naux;
+            let dst = tp * naux;
+            if dst != src {
+                v.copy_within(src..src + naux, dst);
+            }
+            tp += 1;
+        }
+    }
+    v.truncate(tp * naux);
+    v.shrink_to_fit();
+    tp
 }
 
 fn symmetrise_pairs(v: &mut [f64], naux: usize, nmo: usize) {
@@ -3230,7 +3567,7 @@ impl<'a> GwCdGradEngine<'a> {
         let eta = base.config.eta;
         let res_tol = base.config.res_tol;
         let ef = 0.5 * (e[nocc - 1] + e[nocc]);
-        let qext = base.gather_row(&base.q, n);
+        let qext = base.with_q(|q| base.gather_row(q, n));
         let mut y0m = qext.clone();
         base.solve_metric_batch(&mut y0m, nmo);
 
@@ -3958,7 +4295,10 @@ pub struct CphfAdjoint {
     pub f1mo_ref: Vec<f64>,
     /// exchange scale of the skeleton Fock derivative (always 0.5 here)
     pub half_k: f64,
-    /// `[naux, nao, nao]`: exchange skeleton adjoint tensor `Theta`.
+    /// `[naux, nao, nao]`: exchange skeleton adjoint tensor `Theta`, kept **only** for
+    /// verification of the piecewise identities when
+    /// [`GwGradConfig::keep_adjoint_pieces`] is set; empty otherwise, because it is folded
+    /// into [`Self::di_cov`] in place and the per-direction contraction never reads it.
     pub theta: Vec<f64>,
     /// wall-clock of the sub-phases (seconds):
     /// [0] covectors Lambda + Vtil = vind(Lam_ao), [1] analdrv object setup,
@@ -3995,7 +4335,7 @@ impl GwGradEngine<'_> {
     /// or when the reference is not a plain HF one.
     pub fn build_cphf_adjoint(
         &self,
-        fold: &FoldedCovector,
+        fold: &mut FoldedCovector,
         be_k: &[f64],
     ) -> Option<CphfAdjoint> {
         use crate::analdrv::prelude::{
@@ -4110,11 +4450,21 @@ impl GwGradEngine<'_> {
         let mut rijk_obj = RHessRIJK::new_with_cderi(&mol, &aux, 1.0, 1.0, cderi, j2c_decomp);
         let mut config = AnalDrvConfig::default();
         config.resp.cache_kernel = self.config.resp_cache_kernel;
+        // Everything from here to the end of the Z-vector correction lives in its own scope: the
+        // response objects (and with them the RI-JK response-kernel cache, `nao^2 * naux` doubles —
+        // 1030 MB at naphthalene/def2-TZVP) are released before the skeleton contractions below,
+        // which never touch them. `z_vec`/`rhs_dot`/the timings are the only outputs needed later.
+        let mut z_vec: Vec<f64>;
+        let rhs_dot: Vec<f64>;
+        let nvir: usize;
+        let e_ai_shift: Vec<f64>;
+        let f1mo_ref: Option<Vec<f64>>;
+        let fold_rhs = self.config.fold_cphf_rhs;
+        {
         let mut resp = rscf_resp_interface(self.scf, &config);
         timings[1] = t_setup.elapsed().as_secs_f64();
 
         timings[0] = t_all.elapsed().as_secs_f64() - t_setup.elapsed().as_secs_f64();
-        let fold_rhs = self.config.fold_cphf_rhs;
         let t_rhs = Instant::now();
         let rhs_full_opt = {
             let nuc_list: Vec<&mut dyn HessNucAPI> = Vec::new();
@@ -4139,17 +4489,19 @@ impl GwGradEngine<'_> {
                 (Some(rhs_map["rhs"].to_owned()), Some(fr))
             }
         };
-        let (rhs_full, f1mo_ref) = rhs_full_opt;
+        let (rhs_full, f1mo_ref_inner) = rhs_full_opt;
+        f1mo_ref = f1mo_ref_inner;
 
         let t_solve = Instant::now();
         // dimensionless rhs for the adjoint: `rhs_vir = L / (e_a - e_i)`, occ = 0
-        let (nvir, e_ai_shift) = {
+        {
             let st = resp.cpscf_state();
             let nv = st.nmo - st.nocc;
             let cont = st.e_ai_shift.to_owned().into_contig(ColMajor);
             let s = cont.raw()[cont.offset()..cont.offset() + nv * st.nocc].to_vec();
-            (nv, s)
-        };
+            nvir = nv;
+            e_ai_shift = s;
+        }
         let mut rhs_z = rt::zeros(([nmo, nocc].f(), &device));
         {
             let mut buf = rhs_z.i_mut((rt::slice!(nocc, nmo), ..));
@@ -4167,7 +4519,7 @@ impl GwGradEngine<'_> {
         let z_raw = resp.solve_dimless_cpscf(rhs_z.view()); // [nmo, nocc]
         let t_sv = t_sv.elapsed();
         let z_cont = z_raw.into_contig(ColMajor);
-        let mut z_vec = vec![0.0f64; nmo * nocc];
+        z_vec = vec![0.0f64; nmo * nocc];
         z_vec.copy_from_slice(&z_cont.raw()[z_cont.offset()..z_cont.offset() + nmo * nocc]);
         let t_occ0 = Instant::now();
         let z_occ_corr = {
@@ -4212,7 +4564,7 @@ impl GwGradEngine<'_> {
             );
         }
         // <Z, rhs_d> for every perturbation (skipped on the folded route)
-        let rhs_dot: Vec<f64> = match &rhs_full {
+        rhs_dot = match &rhs_full {
             Some(rhs_full) => {
                 let zt = rt::asarray((&z_vec, [nmo, nocc], &device)).into_contig(ColMajor);
                 let prod = rhs_full * &zt.i((.., .., None, None));
@@ -4225,6 +4577,7 @@ impl GwGradEngine<'_> {
         };
 
         timings[4] = t_solve.elapsed().as_secs_f64();
+        }
         let t_skel = Instant::now();
         // ---- (c2) fold `sum_d <Z, rhs_d>` into AO covectors -------------
         //
@@ -4267,27 +4620,38 @@ impl GwGradEngine<'_> {
         };
 
         // ---- (d) folded skeleton tensors --------------------------------
-        // Lam_aux = I^T Lam_ao            [naux]
-        let lam_aux = gemm_nt(&self.raw.i3, n2, naux, &lam_ao, n2, 1);
-        // rho = I^T dm, c = J^-1 rho
+        // Each contraction over the raw three-centre integrals is accumulated **one auxiliary-atom
+        // block at a time**, so the full `nao^2 * naux` array (874 MB at naphthalene/def2-TZVP) is
+        // never resident — this phase used to be the gradient's peak. The integral work is the same
+        // shell-triplet sum as one `int3c2e` call, only split into `natm` calls.
+        //
+        //   Lam_aux = I^T Lam_ao   [naux]      rho = I^T dm   [naux]
+        //   Y^T [naux, nocc*nao]   (G^T = J^-1 Y^T)
         let dm = self.scf.density_matrix[0].data.clone();
-        let rho = gemm_nt(&self.raw.i3, n2, naux, &dm, n2, 1);
-        let c_aux = self.solve_metric(&rho);
-
-        // Y^T [naux, nocc*nao] and G^T = J^-1 Y^T
+        let mut lam_aux = vec![0.0f64; naux];
+        let mut rho = vec![0.0f64; naux];
+        // `Lam_aux,W = I^T W` (the `Z` covector's partner) rides the same pass: one sweep over the
+        // integral blocks serves all four contractions, so the shell triplets are evaluated once.
+        let mut lam_aux_w = vec![0.0f64; naux];
         let mut yt = vec![0.0f64; naux * nocc * nao];
         {
             let cm = to_mat(&cocc, nao, nocc);
             let mut ip = MatrixFull::new([nao, nao], 0.0);
             let mut block = MatrixFull::new([nao, nocc], 0.0);
-            for p in 0..naux {
-                ip.data.copy_from_slice(&self.raw.i3[p * n2..(p + 1) * n2]);
-                _dgemm_full(&ip, 'N', &cm, 'N', &mut block, 1.0, 0.0);
-                for col in 0..nao * nocc {
-                    yt[p + col * naux] = block.data[col];
+            self.raw.for_each_i3_atom_block(|p0, nb, blk| {
+                lam_aux[p0..p0 + nb].copy_from_slice(&gemm_nt(blk, n2, nb, &lam_ao, n2, 1));
+                rho[p0..p0 + nb].copy_from_slice(&gemm_nt(blk, n2, nb, &dm, n2, 1));
+                lam_aux_w[p0..p0 + nb].copy_from_slice(&gemm_nt(blk, n2, nb, &w_dh1, n2, 1));
+                for pl in 0..nb {
+                    ip.data.copy_from_slice(&blk[pl * n2..(pl + 1) * n2]);
+                    _dgemm_full(&ip, 'N', &cm, 'N', &mut block, 1.0, 0.0);
+                    for col in 0..nao * nocc {
+                        yt[(p0 + pl) + col * naux] = block.data[col];
+                    }
                 }
-            }
+            });
         }
+        let c_aux = self.solve_metric(&rho);
         let mut gt = yt.clone();
         self.solve_metric_batch(&mut gt, nao * nocc);
 
@@ -4299,9 +4663,18 @@ impl GwGradEngine<'_> {
         // `x_theta` and `x_phi` are separate because `<X,Kd> = 2<Theta_{X+X^T},dI>
         // - 2<Psi_X,dJ>`: the `dY G^T` term symmetrises `X` (the partner is its
         // transpose) while the `Y G2^T` term does not.
-        let mut fold_exchange = |x_theta: &[f64], x_phi: &[f64]| -> (Vec<f64>, Vec<f64>) {
+        // The `dI` covector is `B - 2*Theta + c_P Lam_ao - 2*Theta_W + c_P W`, i.e. a sum of
+        // two `[naux, nao, nao]` tensors plus rank-one-in-`P` terms. `Theta` and `B` are both
+        // `[naux, nao, nao]` and neither is read afterwards, so the exchange fold accumulates
+        // **into `B`'s buffer**: `b_ao` is taken out of `fold` and becomes `di_cov`. That keeps
+        // a second `naux * nao^2` tensor (874 MB at naphthalene/def2-TZVP) out of the resident
+        // set of the whole adjoint build and of the per-direction loop that follows.
+        let mut di_cov = std::mem::take(&mut fold.b_ao);
+        let keep_pieces = self.config.keep_adjoint_pieces;
+        let mut theta_pieces: Vec<f64> = if keep_pieces { vec![0.0f64; naux * n2] } else { Vec::new() };
+        let wfac = if fold_rhs { 1.0 } else { 0.0 };
+        let mut fold_exchange = |x_theta: &[f64], x_phi: &[f64]| -> Vec<f64> {
             let xm = to_mat(x_theta, nao, nao);
-            let mut theta = vec![0.0f64; naux * n2];
             let mut gp = MatrixFull::new([nao, nocc], 0.0);
             let mut xb = MatrixFull::new([nao, nocc], 0.0);
             let mut th = MatrixFull::new([nao, nao], 0.0);
@@ -4313,7 +4686,27 @@ impl GwGradEngine<'_> {
                 }
                 _dgemm_full(&xm, 'N', &gp, 'N', &mut xb, 1.0, 0.0);
                 _dgemm_full(&xb, 'N', &cm, 'T', &mut th, 1.0, 0.0);
-                theta[p * n2..(p + 1) * n2].copy_from_slice(&th.data);
+                if keep_pieces {
+                    theta_pieces[p * n2..(p + 1) * n2].copy_from_slice(&th.data);
+                }
+                // in-place: B_P -= 2 Theta_P, then add c_P Lam_ao (+ c_P W); the accumulated
+                // value is symmetric in (mu, nu) (`a + at` and `at + a` are the same
+                // floating-point number), so each unordered index pair is written once.
+                let cp = c_aux[p];
+                let off = p * n2;
+                for mu in 0..nao {
+                    for nu in 0..=mu {
+                        let k = mu + nu * nao;
+                        let kt = nu + mu * nao;
+                        let a = di_cov[off + k] - 2.0 * th.data[k] + cp * lam_ao[k]
+                            + wfac * cp * w_dh1[k];
+                        let at = di_cov[off + kt] - 2.0 * th.data[kt] + cp * lam_ao[kt]
+                            + wfac * cp * w_dh1[kt];
+                        let v = a + at;
+                        di_cov[off + k] = v;
+                        di_cov[off + kt] = v;
+                    }
+                }
             }
             let xm = to_mat(x_phi, nao, nao);
             let mut acc = MatrixFull::new([naux, naux], 0.0);
@@ -4333,14 +4726,13 @@ impl GwGradEngine<'_> {
             }
             let mut phi_flat = acc.data;
             self.solve_metric_batch(&mut phi_flat, naux);
-            (theta, phi_flat)
+            phi_flat
         };
         // The `Z` covector `W` rides the same contractions, and both builders
         // are linear in their covector, so a single call each suffices:
         //   -2 Theta_{Lambda + (W+W^T)/2} = -2 Theta_Lambda - Theta_{W+W^T}
         //     (the `dY G^T` term symmetrises its covector, hence `(W+W^T)/2`),
         //   Psi_{Lambda + W} = Psi_Lambda + Psi_W .
-        let lam_aux_w = gemm_nt(&self.raw.i3, n2, naux, &w_dh1, n2, 1);
         let mut x_theta = lam_ao.clone();
         let mut x_phi = lam_ao.clone();
         if fold_rhs {
@@ -4352,7 +4744,7 @@ impl GwGradEngine<'_> {
                 }
             }
         }
-        let (theta, psi) = fold_exchange(&x_theta, &x_phi);
+        let psi = fold_exchange(&x_theta, &x_phi);
 
         timings[5] = t_skel.elapsed().as_secs_f64();
         // dI covector = B - 2*fock_hyb*Theta (the skeleton uses the plain 1/2)
@@ -4378,24 +4770,6 @@ impl GwGradEngine<'_> {
         // so the full `dI` slice is symmetric and contracting with the
         // symmetrised covector counts both bra centres at once:
         //   sum_munu X dI = sum X_sym dI^(a) + (1/2) sum X_sym dI^(c) .
-        let mut di_cov = vec![0.0f64; naux * n2];
-        for p in 0..naux {
-            let cp = c_aux[p];
-            let off = p * n2;
-            for mu in 0..nao {
-                for nu in 0..nao {
-                    let k = mu + nu * nao;
-                    let kt = nu + mu * nao;
-                    // A = B - 2*Theta + c_P Lam_ao - 2*Theta_W + c_P W   (un-symmetrised)
-                    let wfac = if fold_rhs { 1.0 } else { 0.0 };
-                    let a = fold.b_ao[off + k] - 2.0 * theta[off + k] + cp * lam_ao[k]
-                        + wfac * cp * w_dh1[k];
-                    let at = fold.b_ao[off + kt] - 2.0 * theta[off + kt] + cp * lam_ao[kt]
-                        + wfac * cp * w_dh1[kt];
-                    di_cov[off + k] = a + at;
-                }
-            }
-        }
         let mut dm_sym = vec![0.0f64; n2];
         for mu in 0..nao {
             for nu in 0..nao {
@@ -4421,7 +4795,10 @@ impl GwGradEngine<'_> {
             timings,
             lam_tilde,
             dm_sym,
-            theta: theta.clone(),
+            // `Theta` was folded into `di_cov` in place; it exists only when a verification run
+            // asked for the individual pieces (`keep_adjoint_pieces`), because it duplicates an
+            // `naux * nao^2` tensor that the gradient itself never reads.
+            theta: theta_pieces,
             lam_mo: lam,
             lams_mo: lams,
             vtil,
