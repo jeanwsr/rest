@@ -189,6 +189,16 @@ pub struct GwGradConfig {
     /// naphthalene/def2-TZVP) that the gradient itself never reads after the fold.
     /// This only affects memory, not the numbers.
     pub keep_adjoint_pieces: bool,
+    /// Memory budget (MiB) of the RI-JK response-kernel cache used inside the adjoint CP-HF build.
+    ///
+    /// The cache trades memory for speed on the Z-vector solve. Its two tiers are the unpacked
+    /// three-centre ERI (`nao^2 * naux` doubles — 874 MB at naphthalene/def2-TZVP) and the much
+    /// smaller occupied half-transforms (`(nao+nocc) * naux * nocc`). The default here is
+    /// deliberately small: with a large budget the unpacked-`cderi` tier is resident *while the
+    /// folded covector `B_ao` (`naux*nao^2` doubles) is also alive*, which sets the gradient's peak.
+    /// 256 MiB keeps the half-transforms (the per-call win) and drops the big tier, costing about
+    /// 0.5 s on the Z solve; raise it on a memory-rich machine.
+    pub resp_cache_budget_mib: f64,
     /// Cache the bra-independent intermediates of the RI-JK response kernel
     /// (`analdrv`'s `cpscf_cache_kernel`).  The CP-HF route applies that kernel
     /// to a single right-hand side per Krylov iteration, so it rebuilds the
@@ -233,6 +243,7 @@ impl Default for GwGradConfig {
             local_di: true,
             keep_adjoint_pieces: false,
             resp_cache_kernel: true,
+            resp_cache_budget_mib: 256.0,
             fold_cphf_rhs: true,
         }
     }
@@ -369,8 +380,12 @@ pub fn build_raw_ri_tensors(scf: &SCF) -> RawRiTensors {
     let naux = aux.nao();
     let natm = scf.mol.geom.nfree;
 
-    let (i3, shape3) = CInt::integrate_cross("int3c2e", [&mol, &mol, &aux], "s1", None).into();
-    assert_eq!(shape3, vec![nao, nao, naux], "int3c2e s1 shape");
+    // The three-centre integrals are evaluated **on demand**: the engine build and the CD-GW
+    // gradient consume them in auxiliary-atom blocks (`for_each_i3_atom_block`, so the dense
+    // `nao^2 * naux` array — 874 MB at naphthalene/def2-TZVP — is never materialised), and only the
+    // per-perturbation route and the TDDFT gradient read them densely (`with_i3`, which evaluates
+    // them once and keeps them). Leaving this empty therefore costs those paths one integral
+    // evaluation and keeps the block out of every other task's peak.
 
     let (j2, shapej) = aux.integrate("int2c2e", "s1", None).into();
     assert_eq!(shapej, vec![naux, naux], "int2c2e shape");
@@ -387,7 +402,7 @@ pub fn build_raw_ri_tensors(scf: &SCF) -> RawRiTensors {
         nao,
         naux,
         natm,
-        i3: RefCell::new(i3),
+        i3: RefCell::new(Vec::new()),
         j2,
         dj1,
         ao_atom: atom_map_from_slices(&ao_slices, nao),
@@ -459,6 +474,66 @@ impl RawRiTensors {
                 CInt::integrate_cross("int3c2e", [&self.mol, &self.mol, &self.auxmol], "s1", &shls).into();
             assert_eq!(shape, vec![nao, nao, nb], "auxiliary-atom int3c2e block shape");
             f(fun[0], nb, &blk);
+        }
+    }
+
+    /// Stream the **AO-centre derivative** blocks (`int3c2e_ip1`) of one perturbed atom over
+    /// auxiliary-shell blocks, handing `f(aux_offset, naux_block, block)` with `block` col-major
+    /// `[nrow_A, nao, naux_block, 3]`.
+    ///
+    /// The per-direction contraction only *reads* these blocks, so streaming them keeps
+    /// `nrow_A * nao * naux * 3` doubles out of the gradient's peak (254 MB for a carbon atom at
+    /// naphthalene/def2-TZVP, against a few MB per block). The integral work is the same
+    /// shell-triplet sum as one `int3c2e_ip1` call, split into a few more libcint calls.
+    pub fn for_each_d1_block<F>(&self, atm: usize, mut f: F)
+    where
+        F: FnMut(usize, usize, &[f64]),
+    {
+        let row = self.ao_range[atm];
+        let nrow = row[1] - row[0];
+        let nshl_aux = self.auxmol.nbas();
+        // a few dozen auxiliary shells per block keeps the block (~60 MB) far below the full tensor
+        // (254 MB) while keeping the number of libcint calls small
+        let step = 64usize;
+        let mut a0 = 0usize;
+        let mut fun_off = 0usize;
+        while a0 < nshl_aux {
+            let a1 = (a0 + step).min(nshl_aux);
+            let shls = [self.ao_shl_range[atm], [0, self.mol.nbas()], [a0, a1]];
+            let (blk, shape) =
+                CInt::integrate_cross("int3c2e_ip1", [&self.mol, &self.mol, &self.auxmol], "s1", &shls).into();
+            let nb = shape[2];
+            assert_eq!(shape, vec![nrow, self.nao, nb, 3], "streamed int3c2e_ip1 block shape");
+            f(fun_off, nb, &blk);
+            fun_off += nb;
+            a0 = a1;
+        }
+        debug_assert_eq!(fun_off, self.naux);
+    }
+
+    /// Stream the **auxiliary-centre derivative** blocks (`int3c2e_ip2`) of one perturbed atom over
+    /// its own auxiliary shells; `block` is col-major `[nao, nao, naux_block, 3]`.
+    pub fn for_each_d2_block<F>(&self, atm: usize, mut f: F)
+    where
+        F: FnMut(usize, usize, &[f64]),
+    {
+        let (shl0, shl1) = (self.aux_shl_range[atm][0], self.aux_shl_range[atm][1]);
+        let fun0 = self.aux_range[atm][0];
+        // the atom's own auxiliary shells are only a handful, so small blocks are cheap here and
+        // cut the `nao^2 * naux_A * 3` tensor (135 MB for a carbon atom) to a few tens of MB
+        let step = 4usize;
+        let mut a0 = shl0;
+        let mut fun_off = 0usize;
+        while a0 < shl1 {
+            let a1 = (a0 + step).min(shl1);
+            let shls = [[0, self.mol.nbas()], [0, self.mol.nbas()], [a0, a1]];
+            let (blk, shape) =
+                CInt::integrate_cross("int3c2e_ip2", [&self.mol, &self.mol, &self.auxmol], "s1", &shls).into();
+            let nb = shape[2];
+            assert_eq!(shape, vec![self.nao, self.nao, nb, 3], "streamed int3c2e_ip2 block shape");
+            f(fun0 + fun_off, nb, &blk);
+            fun_off += nb;
+            a0 = a1;
         }
     }
 
@@ -866,6 +941,30 @@ pub fn dd_response_dz_single(de: f64, z: f64, eta: f64) -> f64 {
 ///
 /// `qt` are the metric-transformed (`S q`) occupied-virtual pairs
 /// [naux, n_trans] with `ia = i + a*nocc`.
+/// Build the imaginary-axis and real-axis low-rank factor sets from the occupied-virtual block
+/// `qtia` (shared by the engine constructor and the lazy rebuild after `evict_qt`).
+#[allow(clippy::too_many_arguments)]
+fn build_lr_factors(
+    qtia: &[f64],
+    naux: usize,
+    nov: usize,
+    de_ia: &[f64],
+    quad: &[(f64, f64)],
+    z_grid: &[f64],
+    eta: f64,
+    tol: f64,
+) -> (Vec<LrFactor>, Vec<LrFactor>) {
+    let lr_imag = quad
+        .iter()
+        .map(|&(u, _)| build_lr_factor(qtia, naux, nov, de_ia, u, 'I', 0.0, tol))
+        .collect();
+    let lr_grid = z_grid
+        .iter()
+        .map(|&z| build_lr_factor(qtia, naux, nov, de_ia, z, 'R', eta, tol))
+        .collect();
+    (lr_imag, lr_grid)
+}
+
 fn build_lr_factor(
     qt: &[f64],
     naux: usize,
@@ -999,8 +1098,10 @@ pub struct GwGradEngine<'a> {
     pub j_chol: MatrixFull<f64>,
     /// J^{-1/2}
     pub s_metric: Vec<f64>,
-    /// metric-transformed integrals (same layout as `q`). Evictable like [`Self::q`]
-    /// (see [`Self::evict_qt`]); only the QP-cache construction reads it.
+    /// Metric-transformed integrals, restricted to the **occupied MO columns**
+    /// (`naux * nmo * nocc`, same pair-slowest/aux-fastest layout as `q`): this is all the
+    /// QP-cache construction reads (`consts` needs `qt[P, n, i]` for `i < nocc`). Evictable like
+    /// [`Self::q`] (see [`Self::evict_qt`]).
     pub qt: RefCell<Vec<f64>>,
     /// raw occupied-virtual block [naux, nov], ia = i + a*nocc
     pub qia: Vec<f64>,
@@ -1010,10 +1111,11 @@ pub struct GwGradEngine<'a> {
     pub quad: Vec<(f64, f64)>,
     /// real-axis sampling grid (REST protocol)
     pub z_grid: Vec<f64>,
-    /// cached low-rank factors on the imaginary axis
-    pub lr_imag: Vec<LrFactor>,
-    /// cached low-rank factors on the real-axis grid
-    pub lr_grid: Vec<LrFactor>,
+    /// Cached low-rank factors on the imaginary axis. Evictable with `evict_qt`: only the QP-cache
+    /// construction reads them, and `with_lr` rebuilds them from `qtia` on demand.
+    pub lr_imag: RefCell<Vec<LrFactor>>,
+    /// Cached low-rank factors on the real-axis grid (evictable like [`Self::lr_imag`]).
+    pub lr_grid: RefCell<Vec<LrFactor>>,
     /// metric-transformed occupied-virtual block (kept for on-the-fly factors).
     /// Evictable together with `qt` ([`Self::evict_qt`]).
     pub qtia: RefCell<Vec<f64>>,
@@ -1060,21 +1162,27 @@ impl<'a> GwGradEngine<'a> {
         // setup cost for large basis sets (BLAS runs it at cache speed).
         let mut q = vec![0.0f64; naux * nmo * nmo];
         {
+            // The three-centre integrals are consumed **auxiliary-atom block by block**: the dense
+            // `nao^2 * naux` tensor (874 MB at naphthalene/def2-TZVP) is never materialised, which
+            // removes it from the engine-build peak. The integral work is the same shell-triplet
+            // sum as one `int3c2e` call.
             let n2 = nao * nao;
-            let i3_local = raw.i3.borrow();
             let mut ip = MatrixFull::new([nao, nao], 0.0);
             let mut tmp = MatrixFull::new([nao, nmo], 0.0);
             let mut sl = MatrixFull::new([nmo, nmo], 0.0);
-            for p_aux in 0..naux {
-                ip.data.copy_from_slice(&i3_local[p_aux * n2..(p_aux + 1) * n2]);
-                // tmp[mu, q_mo] = sum_nu I[mu, nu, P] C[nu, q_mo]
-                _dgemm_full(&ip, 'N', &c_mo, 'N', &mut tmp, 1.0, 0.0);
-                // sl[p_mo, q_mo] = sum_mu C[mu, p_mo] tmp[mu, q_mo]
-                _dgemm_full(&c_mo, 'T', &tmp, 'N', &mut sl, 1.0, 0.0);
-                for col in 0..nmo * nmo {
-                    q[col * naux + p_aux] = sl.data[col];
+            raw.for_each_i3_atom_block(|p0, nb, blk| {
+                for pl in 0..nb {
+                    let p_aux = p0 + pl;
+                    ip.data.copy_from_slice(&blk[pl * n2..(pl + 1) * n2]);
+                    // tmp[mu, q_mo] = sum_nu I[mu, nu, P] C[nu, q_mo]
+                    _dgemm_full(&ip, 'N', &c_mo, 'N', &mut tmp, 1.0, 0.0);
+                    // sl[p_mo, q_mo] = sum_mu C[mu, p_mo] tmp[mu, q_mo]
+                    _dgemm_full(&c_mo, 'T', &tmp, 'N', &mut sl, 1.0, 0.0);
+                    for col in 0..nmo * nmo {
+                        q[col * naux + p_aux] = sl.data[col];
+                    }
                 }
-            }
+            });
         }
         symmetrise_pairs(&mut q, naux, nmo);
         // pair-slowest repack (strided once, then contiguous for the gemms).
@@ -1085,13 +1193,6 @@ impl<'a> GwGradEngine<'a> {
         // `naux * nmo^2` doubles (874 MB at naphthalene/def2-TZVP) out of the
         // resident set of every optimised gradient. Same for the full-CD
         // engine (`skip_lr_cache`).
-        // `i3` has served its only purpose in the engine build (the `q` contraction above); the
-        // remaining construction (metric, `qt`, occupied-virtual blocks, low-rank factors) does not
-        // read it. Releasing `nao^2 * naux` doubles here (874 MB at naphthalene/def2-TZVP) removes
-        // them from the factor-construction phase, which is otherwise the highest point of the
-        // engine build. Whoever needs the raw integrals later (the adjoint skeleton contractions,
-        // the per-perturbation route, TDDFT) gets them back through `with_i3`.
-        raw.evict_i3();
         let q_pairmajor: Vec<f64> = if config.skip_lr_cache || config.folded_qx {
             Vec::new()
         } else {
@@ -1124,11 +1225,18 @@ impl<'a> GwGradEngine<'a> {
             }
         }
 
-        // ---- metric-transformed integrals (LR-only) ----
+        // ---- metric-transformed integrals (LR-only), occupied MO columns only ----
+        // `consts(n)` reads `qt[P, n, i]` for occupied `i` only, i.e. the pair columns
+        // `pair_col(n, i) = n + i*nmo < nocc*nmo` — the first `nocc*nmo` columns of `q`; and `qtia`
+        // is the (`n >= nocc`, `i < nocc`) block, which (because `q` is pair-symmetrised, so
+        // `q[(i,a)] == q[(a,i)]` exactly) is the (`n = a`, `i < nocc`) block of that same prefix.
+        // Keeping only the prefix stores `naux*nmo*nocc` doubles (87 MB at naphthalene/def2-TZVP)
+        // instead of `naux*nmo^2` (874 MB), which is what used to dominate the engine build.
+        let ncol_occ = nocc * nmo;
         let qt = if config.skip_lr_cache {
             Vec::new()
         } else {
-            metric_transform_blocked(&s_metric, &q, naux, nmo * nmo)
+            metric_transform_blocked(&s_metric, &q[..ncol_occ * naux], naux, ncol_occ)
         };
 
         mem_probe("  build: after qt");
@@ -1142,7 +1250,9 @@ impl<'a> GwGradEngine<'a> {
                 let dst = (i + (a - nocc) * nocc) * naux;
                 qia[dst..dst + naux].copy_from_slice(&q[src..src + naux]);
                 if !config.skip_lr_cache {
-                    qtia[dst..dst + naux].copy_from_slice(&qt[src..src + naux]);
+                    // occupied-column prefix index of the same number (`q` is pair-symmetric)
+                    let src_occ = (a + i * nmo) * naux;
+                    qtia[dst..dst + naux].copy_from_slice(&qt[src_occ..src_occ + naux]);
                 }
             }
         }
@@ -1227,8 +1337,8 @@ impl<'a> GwGradEngine<'a> {
                 de_ia,
                 quad,
                 z_grid,
-                lr_imag: Vec::new(),
-                lr_grid: Vec::new(),
+                lr_imag: RefCell::new(Vec::new()),
+                lr_grid: RefCell::new(Vec::new()),
                 qtia: RefCell::new(qtia),
                 hybrid,
                 fock_hyb,
@@ -1240,19 +1350,16 @@ impl<'a> GwGradEngine<'a> {
             if std::env::var("REST_GWGRAD_DBG").is_ok() {
                 println!("[new DBG] qtia max = {}", qtia.iter().fold(0.0f64, |a, &x| a.max(x.abs())));
             }
-            let lr_imag: Vec<LrFactor> = quad
-                .iter()
-                .map(|&(u, _)| {
-                    build_lr_factor(&qtia, naux, nov, &de_ia, u, 'I', 0.0, config.low_rank_tolerance)
-                })
-                .collect();
-            mem_probe("  build: after imaginary factors");
-            let lr_grid: Vec<LrFactor> = z_grid
-                .iter()
-                .map(|&z| {
-                    build_lr_factor(&qtia, naux, nov, &de_ia, z, 'R', config.eta, config.low_rank_tolerance)
-                })
-                .collect();
+            let (lr_imag, lr_grid) = build_lr_factors(
+                &qtia,
+                naux,
+                nov,
+                &de_ia,
+                &quad,
+                &z_grid,
+                config.eta,
+                config.low_rank_tolerance,
+            );
             mem_probe("  build: after all factors");
             if std::env::var("REST_GWGRAD_DBG").is_ok() {
                 println!("[new DBG] lr_imag nkeeps = {:?}", lr_imag.iter().map(|f| f.eigval.len()).collect::<Vec<_>>());
@@ -1279,8 +1386,8 @@ impl<'a> GwGradEngine<'a> {
                 de_ia,
                 quad,
                 z_grid,
-                lr_imag,
-                lr_grid,
+                lr_imag: RefCell::new(lr_imag),
+                lr_grid: RefCell::new(lr_grid),
                 qtia: RefCell::new(qtia),
                 hybrid,
                 fock_hyb,
@@ -1355,14 +1462,34 @@ impl<'a> GwGradEngine<'a> {
         b
     }
 
-    fn lr_factor_nearest(&self, z: f64) -> &LrFactor {
+    /// Ensure the low-rank factors are resident (rebuilds them from `qtia` after `evict_qt`).
+    fn ensure_lr(&self) {
+        if self.lr_grid.borrow().is_empty() && !self.config.skip_lr_cache {
+            self.with_qtia(|qtia| {
+                let (imag, grid) = build_lr_factors(
+                    qtia,
+                    self.naux,
+                    self.nocc * (self.nmo - self.nocc),
+                    &self.de_ia,
+                    &self.quad,
+                    &self.z_grid,
+                    self.config.eta,
+                    self.config.low_rank_tolerance,
+                );
+                *self.lr_imag.borrow_mut() = imag;
+                *self.lr_grid.borrow_mut() = grid;
+            });
+        }
+    }
+
+    fn lr_factor_nearest_idx(&self, z: f64) -> usize {
         let zs = &self.z_grid;
         let n = zs.len();
         if n <= 1 || z <= zs[0] {
-            return &self.lr_grid[0];
+            return 0;
         }
         if z >= zs[n - 1] {
-            return &self.lr_grid[n - 1];
+            return n - 1;
         }
         let (mut lo, mut hi) = (0usize, n - 1);
         while hi - lo > 1 {
@@ -1374,9 +1501,9 @@ impl<'a> GwGradEngine<'a> {
             }
         }
         if (z - zs[lo]) < (zs[hi] - z) {
-            &self.lr_grid[lo]
+            lo
         } else {
-            &self.lr_grid[hi]
+            hi
         }
     }
 
@@ -1423,11 +1550,13 @@ impl<'a> GwGradEngine<'a> {
     fn ensure_qt(&self) {
         if self.qt.borrow().is_empty() && !self.config.skip_lr_cache {
             self.ensure_q();
+            // same occupied-column prefix as the constructor (see `new_with_raw`)
+            let ncol_occ = self.nocc * self.nmo;
             let built = metric_transform_blocked(
                 &self.s_metric,
-                &self.q.borrow(),
+                &self.q.borrow()[..ncol_occ * self.naux],
                 self.naux,
-                self.nmo * self.nmo,
+                ncol_occ,
             );
             *self.qt.borrow_mut() = built;
         }
@@ -1448,7 +1577,8 @@ impl<'a> GwGradEngine<'a> {
             let mut qtia = vec![0.0f64; naux * nocc * (nmo - nocc)];
             for a in nocc..nmo {
                 for i in 0..nocc {
-                    let src = (i + a * nmo) * naux;
+                    // occupied-column prefix index of the same number (see `new_with_raw`)
+                    let src = (a + i * nmo) * naux;
                     let dst = (i + (a - nocc) * nocc) * naux;
                     qtia[dst..dst + naux].copy_from_slice(&qt[src..src + naux]);
                 }
@@ -1464,6 +1594,9 @@ impl<'a> GwGradEngine<'a> {
     pub fn evict_qt(&self) {
         self.qt.replace(Vec::new());
         self.qtia.replace(Vec::new());
+        // the low-rank factors are read only while building a QP cache as well
+        self.lr_imag.replace(Vec::new());
+        self.lr_grid.replace(Vec::new());
     }
 
     /// Release `q` (`naux * nmo^2` doubles): the folded and adjoint gradient routes read it only
@@ -1513,6 +1646,9 @@ impl<'a> GwGradEngine<'a> {
         };
         // exact mode: factor at the true residue frequency (fresh
         // diagonalisation); quantised mode: nearest grid factor
+        // the cached factors live behind a `RefCell` (evictable); hold one borrow for this pole
+        self.ensure_lr();
+        let lr_grid_guard = self.lr_grid.borrow();
         let factor_on_the_fly;
         let factor = if self.config.exact_residue_z {
             factor_on_the_fly = self.with_qtia(|qtia| {
@@ -1523,7 +1659,7 @@ impl<'a> GwGradEngine<'a> {
             });
             &factor_on_the_fly
         } else {
-            self.lr_factor_nearest(z_used)
+            &lr_grid_guard[self.lr_factor_nearest_idx(z_used)]
         };
         let qnm = self.with_q(|q| self.gather_pair(q, n, m));
         let y = factor.response_vectors(&self.s_metric, &qnm, 1);
@@ -1596,9 +1732,12 @@ impl<'a> GwGradEngine<'a> {
     /// `W_c[n, m](z)` for all m plus the exact response vectors, evaluated
     /// through a low-rank factor (imaginary axis or nearest real grid point).
     fn screened_row(&self, wi: Option<usize>, z: f64, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        self.ensure_lr();
+        let lr_imag = self.lr_imag.borrow();
+        let lr_grid = self.lr_grid.borrow();
         let factor = match wi {
-            Some(w) => &self.lr_imag[w],
-            None => self.lr_factor_nearest(z),
+            Some(w) => &lr_imag[w],
+            None => &lr_grid[self.lr_factor_nearest_idx(z)],
         };
         let qn = self.with_q(|q| self.gather_row(q, n));
         let y = factor.response_vectors(&self.s_metric, &qn, self.nmo);
@@ -2307,6 +2446,54 @@ impl GwGradEngine<'_> {
         FoldedCovector { b_ao, w_rot: wm.data }
     }
 
+    /// [`Self::fold_covector_packed`] without reading `q`.
+    ///
+    /// The orbital-rotation covector is `W = sum_P q_P bq_P = C^T X` with `X = sum_P I_P (C bq_P)`,
+    /// which only needs the **raw** three-centre integrals (streamed auxiliary-atom block by block)
+    /// instead of the transformed `q` (`naux*nmo^2` doubles, 874 MB at naphthalene/def2-TZVP).
+    /// The adjoint gradient uses this variant so that `q` can be released before the fold; `B` is
+    /// built with exactly the same operations as in [`Self::fold_covector`] (`Z_P = C bq_P`,
+    /// `B_P = Z_P C^T`), so `di_cov` is unchanged, while `W` differs only in the order of the
+    /// (mathematically identical) summations.
+    pub fn fold_covector_packed_streamed(&self, bq_tp: &[f64]) -> FoldedCovector {
+        let nao = self.nao;
+        let nmo = self.nmo;
+        let naux = self.naux;
+        let n2 = nao * nao;
+        let nmo_tp = nmo * (nmo + 1) / 2;
+        assert_eq!(bq_tp.len(), naux * nmo_tp, "fold_covector_packed_streamed: bq size mismatch");
+
+        let mut b_ao = vec![0.0f64; naux * n2];
+        let mut bqm = MatrixFull::new([nmo, nmo], 0.0);
+        let mut z = MatrixFull::new([nao, nmo], 0.0);
+        let mut bp = MatrixFull::new([nao, nao], 0.0);
+        let mut x_acc = MatrixFull::new([nao, nmo], 0.0);
+        // one streaming pass over the auxiliary-atom integral blocks serves every `P`
+        self.raw.for_each_i3_atom_block(|p0, nb, blk| {
+            for pl in 0..nb {
+                let p = p0 + pl;
+                // rebuild the symmetric `bq` plane from its lower triangle (`bq` was symmetrised)
+                let mut tp = 0usize;
+                for col in 0..nmo {
+                    for row in col..nmo {
+                        let val = bq_tp[tp * naux + p];
+                        bqm.data[row + col * nmo] = val;
+                        bqm.data[col + row * nmo] = val;
+                        tp += 1;
+                    }
+                }
+                _dgemm_full(&self.c_mo, 'N', &bqm, 'N', &mut z, 1.0, 0.0); // Z_P = C bq_P
+                let ip = to_mat(&blk[pl * n2..(pl + 1) * n2], nao, nao);
+                _dgemm_full(&ip, 'N', &z, 'N', &mut x_acc, 1.0, 1.0); // X += I_P Z_P
+                _dgemm_full(&z, 'N', &self.c_mo, 'T', &mut bp, 1.0, 0.0); // B_P = Z_P C^T
+                b_ao[p * n2..(p + 1) * n2].copy_from_slice(&bp.data);
+            }
+        });
+        let mut wm = MatrixFull::new([nmo, nmo], 0.0);
+        _dgemm_full(&self.c_mo, 'T', &x_acc, 'N', &mut wm, 1.0, 0.0); // W = C^T X
+        FoldedCovector { b_ao, w_rot: wm.data }
+    }
+
     /// [`Self::fold_covector`] for a **pair-packed** `bq` (`[nmo*(nmo+1)/2, naux]`, lower triangle
     /// of the pair-symmetric covector, aux-fastest), as produced by [`pack_pairs_in_place`].
     ///
@@ -2627,6 +2814,7 @@ impl GwGradEngine<'_> {
 
         let mut config = AnalDrvConfig::default();
         config.resp.cache_kernel = self.config.resp_cache_kernel;
+        config.resp.cache_budget = self.config.resp_cache_budget_mib;
         // upstream (analdrv refactor): the CP-SCF solve now lives in the shared
         // response object, which `RHessSCF` only borrows.
         let mut resp = rscf_resp_interface(self.scf, &config);
@@ -2958,6 +3146,14 @@ impl GwGradEngine<'_> {
         // `naux*nmo^2 + naux*nov` doubles (949 MB at naphthalene/def2-TZVP) for the rest of the
         // gradient; `with_qt`/`with_qtia` rebuild them on demand.
         self.evict_qt();
+        // On the HF-only adjoint route the pullback never reads `q` (its only `q`-dependent term,
+        // the static exchange derivative, is skipped for `fock_hyb == 1`) and the fold below uses
+        // the streamed-integrals variant, so `q` (`naux*nmo^2` doubles, 874 MB at
+        // naphthalene/def2-TZVP) can be released *before* the pullback instead of after the fold.
+        // Any later reader rebuilds it through `with_q`.
+        if adjoint_route {
+            self.evict_q();
+        }
         // The adjoint route rebuilds the raw integrals only inside `build_cphf_adjoint`, after the
         // response objects (and their kernel cache) have been released; keeping them out of the
         // covector/fold phase removes `nao^2 * naux` doubles from where this gradient peaks.
@@ -2985,9 +3181,13 @@ impl GwGradEngine<'_> {
             // this gradient peaks. The route always returns below, so the (full-buffer) fallback
             // never sees the compacted form.
             let packed_pairs = pack_pairs_in_place(&mut bq[0], self.nmo, self.naux);
-            let mut fold = self.fold_covector_packed(&bq[0][..packed_pairs * self.naux]);
-            mem_probe("gradient: after fold_covector");
+            // no `q` here: the orbital-rotation channel is contracted against the raw integrals,
+            // which are streamed auxiliary-atom block by block
+            let mut fold = self.fold_covector_packed_streamed(&bq[0][..packed_pairs * self.naux]);
+            // the folded covector replaces `bq` entirely, so release it here (the route returns
+            // below; the full-buffer fallback never sees the compacted form)
             drop(bq);
+            mem_probe("gradient: after fold_covector");
             // `q` is read only by the pullback and this fold, both done: release `naux*nmo^2`
             // doubles (874 MB at naphthalene/def2-TZVP) before the adjoint workspace is built.
             // `with_q` rebuilds it if a later task (another target, a BSE screening) needs it.
@@ -3006,23 +3206,26 @@ impl GwGradEngine<'_> {
             for atm in 0..self.natm {
                 let h1r = crate::hessian::rhf::build_hcore_first_deriv(&self.scf.mol, atm);
                 let s1r = crate::ri_cphf::cphf_solver_pyscf::build_s1ao_deriv(&self.scf.mol, atm);
-                let blocks = self.raw.d_atom_blocks(atm);
-                for comp in 0..3 {
-                    let dj = self.raw.d_j_atom(atm, comp);
-                    if atm == 0 && comp == 0 {
-                        mem_probe("gradient: inside per-direction loop (1st dir)");
+                // the locality-aware variant streams the derivative blocks internally, so it does
+                // not need (or allocate) the dense per-atom `AtomDerivBlocks`
+                if atm == 0 {
+                    mem_probe("gradient: inside per-direction loop (1st dir)");
+                }
+                if self.config.local_di {
+                    let djs: Vec<Vec<f64>> = (0..3).map(|c| self.raw.d_j_atom(atm, c)).collect();
+                    let g3 = self.adjoint_perturbation_gradient_local(
+                        &adj, atm, &h1r, &s1r, &djs, &bj[0], &bb[0], &zero_bx, atm * 3,
+                    );
+                    grad[atm * 3..atm * 3 + 3].copy_from_slice(&g3);
+                } else {
+                    let blocks = self.raw.d_atom_blocks(atm);
+                    for comp in 0..3 {
+                        let dj = self.raw.d_j_atom(atm, comp);
+                        grad[atm * 3 + comp] = self.adjoint_perturbation_gradient(
+                            &adj, &blocks, comp, &h1r, &s1r[comp], &dj, &bj[0], &bb[0],
+                            &zero_bx, atm * 3 + comp,
+                        );
                     }
-                    grad[atm * 3 + comp] = if self.config.local_di {
-                        self.adjoint_perturbation_gradient_local(
-                            &adj, &blocks, comp, &h1r, &s1r[comp], &dj, &bj[0], &bb[0],
-                            &zero_bx, atm * 3 + comp,
-                        )
-                    } else {
-                        self.adjoint_perturbation_gradient(
-                            &adj, &blocks, comp, &h1r, &s1r[comp], &dj, &bj[0], &bb[0],
-                            &zero_bx, atm * 3 + comp,
-                        )
-                    };
                 }
             }
             mem_probe("gradient: after per-direction loop (adjoint)");
@@ -4450,6 +4653,7 @@ impl GwGradEngine<'_> {
         let mut rijk_obj = RHessRIJK::new_with_cderi(&mol, &aux, 1.0, 1.0, cderi, j2c_decomp);
         let mut config = AnalDrvConfig::default();
         config.resp.cache_kernel = self.config.resp_cache_kernel;
+        config.resp.cache_budget = self.config.resp_cache_budget_mib;
         // Everything from here to the end of the Z-vector correction lives in its own scope: the
         // response objects (and with them the RI-JK response-kernel cache, `nao^2 * naux` doubles —
         // 1030 MB at naphthalene/def2-TZVP) are released before the skeleton contractions below,
@@ -4856,42 +5060,46 @@ impl GwGradEngine<'_> {
     /// perturbations the whole gradient drops from `O(3 natm naux nao^2)` to
     /// `O(naux nao^2)`.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn adjoint_perturbation_gradient_local(
         &self,
         adj: &CphfAdjoint,
-        blocks: &AtomDerivBlocks,
-        comp: usize,
+        atm: usize,
         h1r: &[f64],
-        s1_comp: &[f64],
-        dj: &[f64],
+        s1_all: &[Vec<f64>],
+        djs: &[Vec<f64>],
         bj_k: &[f64],
         bb_k: &[f64],
         b_x: &[f64],
-        dir: usize,
-    ) -> f64 {
+        dir0: usize,
+    ) -> [f64; 3] {
         let nao = self.nao;
-        let naux = self.naux;
         let n2 = nao * nao;
-        let row0 = blocks.row0;
-        let nrow = blocks.nrow;
-        let aux0 = blocks.aux0;
-        let naux_a = blocks.naux_a;
-        let stride1 = nrow * nao * naux;
-        let d1c = &blocks.d1[comp * stride1..(comp + 1) * stride1];
-        let stride2 = n2 * naux_a;
-        let d2c = &blocks.d2[comp * stride2..(comp + 1) * stride2];
+        let row0 = self.raw.ao_range[atm][0];
+        let nrow = self.raw.ao_range[atm][1] - row0;
 
-        let mut g_di = 0.0f64;
-        let mut g_dm = 0.0f64;
+        // all three Cartesian components are contracted from the *same* streamed integral blocks
+        let mut g_di = [0.0f64; 3];
+        let mut g_dm = [0.0f64; 3];
         // The two inner loops are pure reductions, and Rust/LLVM will not
         // reassociate `f64` additions on their own; four independent
         // accumulators give both SIMD width and enough ILP to run at memory
         // speed (measured ~3x over the single-accumulator form).
+        //
+        // The derivative blocks are *streamed* over auxiliary-shell blocks (see
+        // `RawRiTensors::for_each_d1_block`/`for_each_d2_block`), so the per-atom tensors
+        // (`nrow_A*nao*naux*3` + `nao^2*naux_A*3` doubles, ~390 MB for a carbon atom at
+        // naphthalene/def2-TZVP) are never resident; each block is consumed immediately.
         let dm = &adj.dm_sym;
-        for p in 0..naux {
+        self.raw.for_each_d1_block(atm, |p0, nb, d1b| {
+            let stride1 = nrow * nao * nb;
+            for comp in 0..3 {
+            let d1c = &d1b[comp * stride1..(comp + 1) * stride1];
+            for pl in 0..nb {
+            let p = p0 + pl;
             let cov = &adj.di_cov[p * n2..(p + 1) * n2];
             let lt = adj.lam_tilde[p];
-            let base1 = p * nrow * nao;
+            let base1 = pl * nrow * nao;
             let mut adi = [0.0f64; 4];
             let mut adm = [0.0f64; 4];
             // int3c2e_ip1: rows `mu` on the atom, all `nu`.  `dI^(b)` is the
@@ -4921,12 +5129,22 @@ impl GwGradEngine<'_> {
                     i += 1;
                 }
             }
-            g_di += adi.iter().sum::<f64>();
-            g_dm += lt * adm.iter().sum::<f64>();
-            // int3c2e_ip2: dense [nao,nao] symmetric slice, atom's own aux
-            // functions only, with the 1/2 of the symmetrised contraction.
-            if p >= aux0 && p < aux0 + naux_a {
-                let d2 = &d2c[(p - aux0) * n2..(p - aux0 + 1) * n2];
+            g_di[comp] += adi.iter().sum::<f64>();
+            g_dm[comp] += lt * adm.iter().sum::<f64>();
+            }
+            }
+        });
+        // int3c2e_ip2: dense [nao,nao] symmetric slices of the atom's own auxiliary functions, with
+        // the 1/2 of the symmetrised contraction; streamed as well.
+        self.raw.for_each_d2_block(atm, |p0, nb, d2b| {
+            let stride2 = n2 * nb;
+            for comp in 0..3 {
+            let d2c = &d2b[comp * stride2..(comp + 1) * stride2];
+            for pl in 0..nb {
+                let p = p0 + pl;
+                let cov = &adj.di_cov[p * n2..(p + 1) * n2];
+                let lt = adj.lam_tilde[p];
+                let d2 = &d2c[pl * n2..(pl + 1) * n2];
                 let mut cdi = [0.0f64; 4];
                 let mut cdm = [0.0f64; 4];
                 let mut k = 0usize;
@@ -4947,11 +5165,19 @@ impl GwGradEngine<'_> {
                     cdm[0] += dm[k] * v;
                     k += 1;
                 }
-                g_di += cdi.iter().sum::<f64>();
-                g_dm += lt * cdm.iter().sum::<f64>();
+                g_di[comp] += cdi.iter().sum::<f64>();
+                g_dm[comp] += lt * cdm.iter().sum::<f64>();
             }
+            }
+        });
+        let mut out = [0.0f64; 3];
+        for comp in 0..3 {
+            out[comp] = self.finish_adjoint_gradient(
+                adj, comp, h1r, &s1_all[comp], &djs[comp], bj_k, bb_k, b_x, dir0 + comp,
+                g_di[comp] + g_dm[comp],
+            );
         }
-        self.finish_adjoint_gradient(adj, comp, h1r, s1_comp, dj, bj_k, bb_k, b_x, dir, g_di + g_dm)
+        out
     }
 
     /// Shared tail of the two adjoint perturbation routines: everything except
