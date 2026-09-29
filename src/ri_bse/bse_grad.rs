@@ -56,7 +56,9 @@ use tensors::{MathMatrix, MatrixFull};
 use tensors::matrix::BasicMatrix;
 
 use crate::ri_cphf::CPHFSolverPySCF;
-use crate::solvers::davidson::{lr_davidson_solver, DavidsonConfig, generate_initial_guess};
+use crate::solvers::davidson::{
+    generate_initial_guess, lr_davidson_solver_batched, DavidsonConfig,
+};
 
 use std::time::Instant;
 
@@ -496,11 +498,26 @@ pub fn solve_bse_davidson(
     config: &DavidsonConfig,
 ) -> Vec<(f64, Vec<f64>, Vec<f64>)> {
     let nrun = (nroots + 2).min(dim);
-    let mut a_mv = |z: &Vec<f64>| -> Vec<f64> { gemm_nn(a_mat, dim, dim, z, dim, 1) };
-    let mut b_mv = |z: &Vec<f64>| -> Vec<f64> { gemm_nn(b_mat, dim, dim, z, dim, 1) };
+    // The solver applies `A`/`B` to the **whole subspace block** every
+    // iteration, so the matvec must be a gemm: the per-vector closure API
+    // (`lr_davidson_solver`) expands into one gemv per subspace column, i.e.
+    // `2 * m` reads of the full `dim^2` matrix per iteration (m up to
+    // `max_subspace`), which dominated the solve.
+    let a_m = to_mat(a_mat, dim, dim);
+    let b_m = to_mat(b_mat, dim, dim);
+    let mut a_mv = |z: &MatrixFull<f64>| -> MatrixFull<f64> {
+        let mut out = MatrixFull::new([dim, z.size()[1]], 0.0);
+        _dgemm_full(&a_m, 'N', z, 'N', &mut out, 1.0, 0.0);
+        out
+    };
+    let mut b_mv = |z: &MatrixFull<f64>| -> MatrixFull<f64> {
+        let mut out = MatrixFull::new([dim, z.size()[1]], 0.0);
+        _dgemm_full(&b_m, 'N', z, 'N', &mut out, 1.0, 0.0);
+        out
+    };
     let diag: Vec<f64> = (0..dim).map(|k| a_mat[k + k * dim]).collect();
     let guess = generate_initial_guess(&diag, nrun);
-    let mut pairs = lr_davidson_solver(&mut a_mv, &mut b_mv, nrun, &diag, guess, config);
+    let mut pairs = lr_davidson_solver_batched(&mut a_mv, &mut b_mv, nrun, &diag, guess, config);
     pairs.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
     assert!(
         pairs.len() >= nroots,

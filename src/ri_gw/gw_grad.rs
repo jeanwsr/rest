@@ -1439,16 +1439,30 @@ impl<'a> GwGradEngine<'a> {
         let mut j_chol = j_mat.clone();
         _dpotrf(&mut j_chol, 'L');
         let (vals, vecs) = eigh_symmetric(&j_mat.data, naux);
-        let mut s_metric = vec![0.0f64; naux * naux];
+        // `S = J^{-1/2} = V diag(1/sqrt(lam)) V^T` as two BLAS-3 products: the
+        // explicit `O(naux^3)` scalar triple loop this replaces (with its
+        // branch on the eigenvalue cutoff) cost ≈ 1.2 s at naphthalene/def2-SVP.
+        let mut vd = vec![0.0f64; naux * naux];
+        for v in 0..naux {
+            let scale = if vals[v] > 1.0e-10 { 1.0 / vals[v].sqrt() } else { 0.0 };
+            for a in 0..naux {
+                vd[a + v * naux] = vecs[a + v * naux] * scale;
+            }
+        }
+        let mut sm = MatrixFull::new([naux, naux], 0.0);
+        {
+            let vd_m = to_mat(&vd, naux, naux);
+            let v_m = to_mat(&vecs, naux, naux);
+            _dgemm_full(&vd_m, 'N', &v_m, 'T', &mut sm, 1.0, 0.0);
+        }
+        // keep `S` exactly symmetric: the self-energy value identities
+        // (`sum_P m corr`, with `m = S q_n`) rely on it
+        let mut s_metric = sm.data;
         for a in 0..naux {
-            for b in 0..naux {
-                let mut acc = 0.0;
-                for v in 0..naux {
-                    if vals[v] > 1.0e-10 {
-                        acc += vecs[a + v * naux] * vecs[b + v * naux] / vals[v].sqrt();
-                    }
-                }
-                s_metric[a + b * naux] = acc;
+            for b in (a + 1)..naux {
+                let avg = 0.5 * (s_metric[a + b * naux] + s_metric[b + a * naux]);
+                s_metric[a + b * naux] = avg;
+                s_metric[b + a * naux] = avg;
             }
         }
 
