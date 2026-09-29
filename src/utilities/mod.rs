@@ -29,6 +29,30 @@ pub fn parse_input() -> ArgMatches {
         .get_matches()
 }
 
+/// Source revision this binary was compiled from, as recorded by `build.rs`.
+///
+/// The value is the full git `HEAD` commit id. When the working tree differed
+/// from `HEAD` at build time, the returned string is suffixed with
+/// `" (Uncommitted Local Version)"`. If the project was not built inside a git
+/// checkout (for example from a source tarball) the commit is `"unknown"`.
+pub fn git_commit_string() -> String {
+    let commit = option_env!("REST_GIT_COMMIT").unwrap_or("unknown");
+    let dirty = matches!(option_env!("REST_GIT_DIRTY"), Some("1"));
+    if dirty {
+        format!("{} (Uncommitted Local Version)", commit)
+    } else {
+        commit.to_string()
+    }
+}
+
+/// Creation time of the git commit this binary was compiled from, as recorded by
+/// `build.rs`. The value is the committer date of `HEAD` in the commit's own
+/// timezone, formatted as `YYYY-MM-DD HH:MM:SS +ZZZZ`. It is `"unknown"` when the
+/// revision itself could not be determined.
+pub fn git_commit_date_string() -> String {
+    option_env!("REST_GIT_COMMIT_DATE").unwrap_or("unknown").to_string()
+}
+
 pub struct TimeRecords {
     items: HashMap<String, (Instant,f64,bool,String)>
 }

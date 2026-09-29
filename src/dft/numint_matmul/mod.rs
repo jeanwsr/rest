@@ -10,6 +10,7 @@ pub mod nimatmul;
 pub mod pure_eval_rho;
 pub mod pure_xcpot;
 pub mod resp_rks;
+pub mod resp_uks;
 
 #[allow(unused)]
 pub mod prelude {

@@ -5,14 +5,17 @@ use crate::analdrv::prelude::*;
 /// Working solver and maintainer of all hessian components for restricted SCF method.
 ///
 /// The lifetime parameters decouple the response object's borrow from its data, and the response
-/// object's data region from the hessian component objects: `'a` is the region of the SCF data
-/// the response object borrows, `'b` the (typically shorter) borrow of `resp` itself, and `'c`
-/// the region of the hessian component objects (`ovlp_obj` and the lists). Bundling `'a` with
-/// `'b` (`&'a mut RRespSCF<'a>`) is rejected by dropck: the borrow would have to end before the
-/// referent's destructor, while that destructor pins the pointee's lifetime until the referent's
-/// drop. Keeping `'a` separate from `'c` allows the response object to be shared from outside
-/// (built once by the caller, e.g. the analdrv task loop) while the component objects remain
-/// function-local.
+/// object's data region from the hessian component objects:
+///
+/// - `'a`: the region of the SCF data the response object borrows;
+/// - `'b`: the (typically shorter) borrow of `resp` itself;
+/// - `'c`: the region of the hessian component objects (`ovlp_obj` and the lists).
+///
+/// Bundling `'a` with `'b` (`&'a mut RRespSCF<'a>`) is rejected by dropck: the borrow would have
+/// to end before the referent's destructor, while that destructor pins the pointee's lifetime
+/// until the referent's drop. Keeping `'a` separate from `'c` allows the response object to be
+/// shared from outside (built once by the caller, e.g. the analdrv task loop) while the component
+/// objects remain function-local.
 pub struct RHessSCF<'a, 'b, 'c> {
     pub mo_coeff: Tsr,
     pub mo_occ: Tsr,
