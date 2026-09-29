@@ -3,11 +3,14 @@ use pyrest::analdrv::response::rgfock_interface::solve_z_vector;
 use pyrest::analdrv::response::rresp_interface::rscf_resp_interface;
 use pyrest::analdrv::response::trait_rgfock::{GFockFlags, RGFockAPI};
 use pyrest::molecule_io::Molecule;
+use pyrest::ri_jk::decompose::generate_rimatr_bare_on_cint;
 use pyrest::ri_jk::get_ao2mo_s2ij_to_s1_notrans;
-use pyrest::ri_jk::util::get_cint_mol;
+use pyrest::ri_jk::util::{get_cint_aux_on_path, get_cint_mol};
 use pyrest::ri_pt2::rgfock_pt2::RGFockPT2;
 use pyrest::scf_io::{self, scf_without_build};
-use pyrest::utilities::rstsr_util::{RestTensorToRstsrTsrAPI, RestTensorToRstsrViewAPI};
+use pyrest::utilities::rstsr_util::{
+    fingerprint_f64, RestTensorToRstsrTsrAPI, RestTensorToRstsrViewAPI,
+};
 use pyrest::{ctrl_io, ri_pt2};
 use rstsr::prelude::*;
 
@@ -102,7 +105,7 @@ fn test_nh3() {
         vir_energy: vir_energy.view(),
         index_occ_outer_vec: &[0, 2, 5],
     };
-    let arg = RPT2ElecDerivIncoreArg { c_os: 1.0, c_ss: 1.0 };
+    let arg = RPT2ElecDerivIncoreArg { c_os: 1.0, c_ss: 1.0, full_gfock: false };
     let output = get_rpt2_elec_deriv_incore(&input, &arg, |x| x);
     println!("MP2 correlation energy: {}", output.e_corr);
     let e_corr_ref = -0.245426806393;
@@ -226,7 +229,7 @@ fn test_nh3_fp32() {
         vir_energy: vir_energy.view(),
         index_occ_outer_vec: &[0, 2, 5],
     };
-    let arg = RPT2ElecDerivIncoreArg { c_os: 1.0, c_ss: 1.0 };
+    let arg = RPT2ElecDerivIncoreArg { c_os: 1.0, c_ss: 1.0, full_gfock: false };
     let output = get_rpt2_elec_deriv_incore(&input, &arg, |x| x as f32);
     let e_corr_ref = -0.245426806393;
     println!("MP2 correlation energy (f32): {}", output.e_corr);
@@ -291,6 +294,105 @@ fn test_nh3_fp32() {
     let dip_resp_ref = rt::asarray((vec![-0.009197291377, -0.004474412016, 0.008052718901], &device));
     println!("  deviation from f64 reference: {}", &dip_resp - &dip_resp_ref);
     assert!(rt::allclose(&dip_resp, &dip_resp_ref, (1e-4, 1e-6)));
+}
+
+static INPUT_NH3_SVP: &str = r##"
+[ctrl]
+    print_level =          2
+    num_threads =          4
+    xc =                   "mp2"
+    basis_path =           "def2-svp"
+    auxbas_path =          "def2-universal-jkfit"
+    eri_type =             "ri-v"
+    charge =               0.0
+    spin =                 1.0
+    spin_polarization =    false
+
+[geom]
+    name = "NH3"
+    unit = "Angstrom"
+    position = """
+    N  0.0          0.0          0.0
+    H  1.0          0.0          0.0
+    H -0.34202014   0.0          0.93969262
+    H -0.34202014   0.81379768  -0.46984631
+    """
+"##;
+
+/// Full four-block (OO+OV+VO+VV) generalized Fock of RI-PT2 against the pyscf reference
+/// pipeline `MP2-gfock-final.py` (NH3/def2-SVP): the PT2 part runs on the mp2fit auxiliary
+/// basis `def2-svp-rifit` (generated here on separate CInt integrators), while the SCF and
+/// the response A-terms use the SCF's `def2-universal-jkfit` (element-wise identical to
+/// pyscf's `def2-svp-jkfit` for N/H). The fingerprint is evaluated on the transposed view:
+/// the matrix is non-symmetric, and `fingerprint_f64` ravels column-major while pyscf's
+/// `lib.fingerprint` ravels row-major.
+#[test]
+fn test_nh3_gfock_full() {
+    let keys = toml::from_str::<serde_json::Value>(&INPUT_NH3_SVP[..]).unwrap();
+    let (ctrl, geom) = ctrl_io::parse_ctl_from_json(&keys).unwrap();
+    let mol = Molecule::build_native(ctrl, geom, None).unwrap();
+    let mut scf_data = scf_io::SCF::build(mol, &None);
+    scf_without_build(&mut scf_data, &None);
+
+    let device = rt::DeviceBLAS::default();
+    let mo_energy = (&scf_data.eigenvalues[0]).to_rstsr(&device);
+    let mut mo_coeff = (&scf_data.eigenvectors[0]).to_rstsr(&device);
+
+    // canonicalize MO signs (largest-|element| of each column positive): eigenvector signs are
+    // solver-arbitrary, and the pyscf reference orbitals of `MP2-gfock-final.py` follow this
+    // convention, which makes the elementwise MO-basis fingerprint comparison well-defined
+    for j in 0..mo_coeff.shape()[1] {
+        let col = mo_coeff.i((.., j));
+        let (imax, _) = col.iter().enumerate().max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap()).unwrap();
+        let scale = if col[[imax]] < 0.0 { -1.0 } else { 1.0 };
+        let scaled = col.to_owned() * scale;
+        mo_coeff.i_mut((.., j)).assign(&scaled);
+    }
+
+    // decomposed ERI of the mp2fit auxiliary basis for the PT2 part
+    let cderi_mp2_raw = generate_rimatr_bare_on_cint(
+        &get_cint_mol(&scf_data.mol),
+        &get_cint_aux_on_path(&scf_data.mol, "def2-svp-rifit"),
+        scf_data.mol.ctrl.j2c_decomp,
+        None,
+    );
+    let cderi_mp2 = cderi_mp2_raw.to_rstsr_view(&device);
+
+    let idx_core = scf_data.mol.start_mo;
+    let idx_lumo = scf_data.lumo[0];
+    let num_mo = mo_energy.size();
+    let mut mo_occ = rt::zeros(([num_mo].f(), &device));
+    mo_occ.i_mut(idx_core..idx_lumo).fill(2.0);
+
+    let config = AnalDrvConfig::default();
+    let mut resp_objs = rscf_resp_interface(&scf_data, &config);
+    let mut rgfock = RGFockPT2::<f64>::new(
+        mo_coeff.to_owned(),
+        mo_occ,
+        mo_energy.to_owned(),
+        cderi_mp2.into_cow(),
+        None,
+        vec![0, 2, 5],
+        1.0,
+        1.0,
+    );
+    resp_objs.make_cpscf_preparation(mo_coeff.view(), rgfock.mo_occ.view(), mo_energy.view());
+
+    let gfock = rgfock.make_gfock(
+        Some(&mut resp_objs),
+        GFockFlags::OO | GFockFlags::OV | GFockFlags::VO | GFockFlags::VV,
+    );
+    println!("PT2 correlation energy: {}", rgfock.e_corr.unwrap());
+    let gfock_t = gfock.view().t().into_contig(ColMajor);
+    let fingerprint = fingerprint_f64(gfock_t.view());
+    println!("full gfock fingerprint: {fingerprint:.17} (ref 0.24156063812028558)");
+    // tolerance floor: the reference carries the pyscf default-SCF convergence noise of its own
+    // recorded run (a tight-convergence rerun of the same script differs by ~1.6e-8, and the
+    // present result agrees with that rerun to ~5e-9)
+    assert!(
+        (fingerprint - 0.24156063812028558).abs() < 1e-7,
+        "full gfock fingerprint mismatch"
+    );
 }
 
 // --- following is utilities for developing dipole evaluation --- //
