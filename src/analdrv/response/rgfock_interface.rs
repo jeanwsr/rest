@@ -425,6 +425,7 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
 
     // --- RI-JK --- //
 
+    crate::ri_jk::require_unpruned_rimatr(&scf_data.rimatr_pair_map, "the generalized-Fock RI-JK object (rgfock_interface)");
     let (rimatr, _, _) = scf_data.rimatr.as_ref().expect(
         "This implementation requires cholesky decomposed ERI (or rimatr) to be available and stored in memory.",
     );
