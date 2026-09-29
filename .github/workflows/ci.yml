@@ -63,6 +63,9 @@ jobs:
           # regression suite (dispersion / TRIC-optimizer cases import them via
           # REST's Python bridge); the build itself does not link them
           # openmpi 4.* and openblas <0.3.34 pinned to match the feedstock.
+          # simple-dftd3 pinned to 1.*: dftd4 4.3.0 needs mctc-lib >=0.6.1 while
+          # simple-dftd3 1.x needs <0.6, so conda will resolve to 
+          # ancient 0.5.0 which lacks 'dsdpbep86' parameters (NH3_DSDDH_PARSEXC).
           # NOTE: space-separated specs ("openmpi 4.*") must stay QUOTED - unquoted,
           # the shell would pass the version as a separate package spec.
           CONDA_EXTRA="${{ matrix.conda_extra }}"
@@ -72,7 +75,7 @@ jobs:
             python=3.11 numpy scipy h5py \
             "libopenblas <0.3.34 *openmp*" \
             libxc libcint hdf5 "openmpi 4.*" gfortran libclang \
-            simple-dftd3 dftd4 geometric mokit \
+            "simple-dftd3 1.*" dftd4 geometric mokit \
             "${EXTRA_ARGS[@]}" \
             -c conda-forge -c mokit
           echo "CONDA_PREFIX=$CONDA_DIR/envs/rest-dev" >> "$GITHUB_ENV"
