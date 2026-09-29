@@ -67,6 +67,9 @@ use crate::ri_bse::bse_grad::grad_timing;
 // [0] j_deriv_from, [1] k_deriv_from, [2] compute_j_upper, [3] compute_k_upper
 thread_local! {
     static T_TIMER: std::cell::RefCell<[f64; 4]> = const { std::cell::RefCell::new([0.0; 4]) };
+    /// `[response, gram, accumulate, bq/be]` of the streaming QP pullback
+    /// (`REST_GRAD_TIMING=1`).
+    static T_PULL: std::cell::RefCell<[f64; 4]> = const { std::cell::RefCell::new([0.0; 4]) };
 }
 
 fn timer_add(idx: usize, t0: Instant) {
@@ -1320,6 +1323,21 @@ pub fn qp_cache_bytes_estimate(naux: usize, nmo: usize, nquad: usize) -> usize {
         }
     }
 
+/// Frequency-independent data of one orbital row's self-energy.
+///
+/// `m = s_metric * q_n` and the imaginary-axis table
+/// `w_imag[wi][m] = W_c[n, m](iu_wi)` do **not** depend on the trial QP energy,
+/// so the Newton iterations of one orbital share them.  Building the table is
+/// the dominant cost of a self-energy evaluation (`nquad` projections against
+/// the low-rank factors) and used to be repeated for every trial `omega` — a
+/// factor equal to the iteration count.
+pub struct QpRowTable {
+    /// `m = s_metric * q_n`, `[naux, nmo]` col-major
+    pub m: Vec<f64>,
+    /// `W_c[n, m](iu_wi)` per quadrature point
+    pub w_imag: Vec<Vec<f64>>,
+}
+
 impl<'a> GwGradEngine<'a> {
     pub fn new(scf: &'a SCF, config: GwGradConfig) -> Self {
         let raw = build_raw_ri_tensors(scf);
@@ -1785,6 +1803,19 @@ impl<'a> GwGradEngine<'a> {
         self.lr_grid.replace(Vec::new());
     }
 
+    /// Release only the metric-transformed integral blocks (`qt`, `qtia`) and
+    /// keep the cached low-rank factors.
+    ///
+    /// A driver that has finished building its QP caches but still needs the
+    /// factors for the gradient pullback (the BSE gradient) can drop
+    /// `naux*nmo^2 + naux*nov` doubles here — 76 MB at naphthalene/def2-SVP —
+    /// without giving up the factors.  `with_qt`/`with_qtia` rebuild the blocks
+    /// from `q` if a later cache build asks for them.
+    pub fn evict_qt_blocks(&self) {
+        self.qt.replace(Vec::new());
+        self.qtia.replace(Vec::new());
+    }
+
     /// Release `q` (`naux * nmo^2` doubles): the folded and adjoint gradient routes read it only
     /// up to the covector fold. [`Self::with_q`] rebuilds it on demand.
     pub fn evict_q(&self) {
@@ -1965,18 +1996,72 @@ impl<'a> GwGradEngine<'a> {
         }
     }
 
-    /// All pieces of the self-energy; optionally collects the response data
-    /// needed by the gradient.  Returns `(contour, imag, w_imag, y_imag,
-    /// residues, m)` where `m = s_metric * q_n` (`[naux, nmo]`) is the
-    /// frequency-independent intermediate every quadrature point shares.
+    /// Build the [`QpRowTable`] of orbital `n` (see there).
+    fn qp_row_table(&self, n: usize) -> QpRowTable {
+        let qn = self.with_q(|q| self.gather_row(q, n));
+        let m = gemm_nn(&self.s_metric, self.naux, self.naux, &qn, self.naux, self.nmo);
+        self.ensure_lr();
+        let lr_imag = self.lr_imag.borrow();
+        let w_imag = (0..self.quad.len())
+            .map(|wi| lr_imag[wi].response_value_from_qt(&m, self.nmo))
+            .collect();
+        QpRowTable { m, w_imag }
+    }
+
+    /// All pieces of the self-energy at a fixed `omega` from a precomputed
+    /// [`QpRowTable`]; optionally collects the response data needed by the
+    /// gradient.  Returns `(contour, imag, y_imag, residues)`.
     ///
-    /// `w_imag[wi][m]` is `W_c[n,m](iu_wi)`.  The value of the self-energy only
-    /// needs those numbers, which follow from the *element-wise* product of `m`
-    /// with the low-rank correction (`y - y0 = s_metric * corr`), so the
-    /// `y`/`y0` vectors (2 `[naux,nmo]` buffers and one `[naux,naux]` gemm each
-    /// per quadrature point) are only built when `collect` asks for them and the
-    /// cache does not store the compact intermediate instead
-    /// (`compact_qp_cache`, the BSE-gradient default).
+    /// The value of the self-energy only needs the table's `w_imag` numbers,
+    /// which follow from the *element-wise* product of `m` with the low-rank
+    /// correction (`y - y0 = s_metric * corr`), so the `y`/`y0` vectors (2
+    /// `[naux,nmo]` buffers and one `[naux,naux]` gemm each per quadrature point)
+    /// are only built when `want_y` asks for them.
+    #[allow(clippy::type_complexity)]
+    fn sigma_c_parts_with(
+        &self,
+        omega: f64,
+        n: usize,
+        collect: bool,
+        want_y: bool,
+        table: &QpRowTable,
+    ) -> (
+        f64,
+        f64,
+        Vec<(f64, Vec<f64>, Vec<f64>)>,
+        Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)>,
+    ) {
+        let want_y = want_y && collect;
+        let mut imag = 0.0f64;
+        let mut y_imag_all: Vec<(f64, Vec<f64>, Vec<f64>)> = Vec::new();
+        if want_y {
+            let y0 = gemm_nn(&self.s_metric, self.naux, self.naux, &table.m, self.naux, self.nmo);
+            self.ensure_lr();
+            let lr_imag = self.lr_imag.borrow();
+            for (wi, &(u, _wgt)) in self.quad.iter().enumerate() {
+                let corr = lr_imag[wi].correction_from_qt(&table.m, self.nmo);
+                let sc = gemm_nn(&self.s_metric, self.naux, self.naux, &corr, self.naux, self.nmo);
+                let y: Vec<f64> = y0.iter().zip(sc.iter()).map(|(a, b)| a + b).collect();
+                y_imag_all.push((u, y, y0.clone()));
+            }
+        }
+        for (wi, &(u, wgt)) in self.quad.iter().enumerate() {
+            let w = &table.w_imag[wi];
+            let mut sum_m = 0.0f64;
+            for mm in 0..self.nmo {
+                let t = omega - self.e[mm];
+                sum_m += 2.0 * t / (t * t + u * u) * w[mm];
+            }
+            imag += sum_m * wgt / TWO_PI;
+        }
+        // contour (residue) part with REST pole selection and nearest grid
+        let mut contour = 0.0f64;
+        let mut residues: Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)> = Vec::new();
+        self.add_poles(omega, n, collect, &mut contour, &mut residues);
+        (contour, imag, y_imag_all, residues)
+    }
+
+    /// [`Self::sigma_c_parts_with`] with the row table built on the fly.
     #[allow(clippy::type_complexity)]
     fn sigma_c_parts(
         &self,
@@ -1992,48 +2077,17 @@ impl<'a> GwGradEngine<'a> {
         Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)>,
         Vec<f64>,
     ) {
-        let ef = 0.5 * (self.e[self.nocc - 1] + self.e[self.nocc]);
-        // Frequency-independent intermediates of this row: `m = s_metric * q_n`
-        // (the `qt` intermediate of every factor) and, when the response
-        // vectors are wanted, `y0 = s_metric * m`.  Forming them once instead
-        // of once per quadrature point removes `nquad` identical
-        // `[naux,naux] x [naux,nmo]` products per self-energy evaluation.
-        let qn = self.with_q(|q| self.gather_row(q, n));
-        let m = gemm_nn(&self.s_metric, self.naux, self.naux, &qn, self.naux, self.nmo);
-        let want_y = want_y && collect;
-        let y0 = if want_y {
-            gemm_nn(&self.s_metric, self.naux, self.naux, &m, self.naux, self.nmo)
-        } else {
-            Vec::new()
-        };
-        // imaginary-axis part
-        let mut imag = 0.0f64;
-        let mut w_imag_all: Vec<Vec<f64>> = Vec::with_capacity(self.quad.len());
-        let mut y_imag_all: Vec<(f64, Vec<f64>, Vec<f64>)> = Vec::new();
-        self.ensure_lr();
-        let lr_imag = self.lr_imag.borrow();
-        for (wi, &(u, wgt)) in self.quad.iter().enumerate() {
-            // `w[mm] = sum_P qn[P,mm] (y[P,mm] - y0[P,mm]) = sum_P m corr`
-            let w = lr_imag[wi].response_value_from_qt(&m, self.nmo);
-            if want_y {
-                let corr = lr_imag[wi].correction_from_qt(&m, self.nmo);
-                let sc = gemm_nn(&self.s_metric, self.naux, self.naux, &corr, self.naux, self.nmo);
-                let y: Vec<f64> = y0.iter().zip(sc.iter()).map(|(a, b)| a + b).collect();
-                y_imag_all.push((u, y, y0.clone()));
-            }
-            let mut sum_m = 0.0f64;
-            for mm in 0..self.nmo {
-                let t = omega - self.e[mm];
-                sum_m += 2.0 * t / (t * t + u * u) * w[mm];
-            }
-            imag += sum_m * wgt / TWO_PI;
-            w_imag_all.push(w);
-        }
-        // contour (residue) part with REST pole selection and nearest grid
-        let mut contour = 0.0f64;
-        let mut residues: Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)> = Vec::new();
-        self.add_poles(omega, n, collect, &mut contour, &mut residues);
-        (contour, imag, w_imag_all, y_imag_all, residues, m)
+        let table = self.qp_row_table(n);
+        let (contour, imag, y_imag_all, residues) =
+            self.sigma_c_parts_with(omega, n, collect, want_y, &table);
+        (contour, imag, table.w_imag, y_imag_all, residues, table.m)
+    }
+
+    /// [`Self::sigma_c_and_d`] from a precomputed row table (the Newton loop).
+    fn sigma_c_and_d_with(&self, omega: f64, n: usize, table: &QpRowTable) -> (f64, f64) {
+        let (contour, imag, _y, residues) = self.sigma_c_parts_with(omega, n, true, false, table);
+        let ds = self.sigma_d_from_parts(omega, &table.w_imag, &residues);
+        (contour - imag, ds)
     }
 
     /// Compact interaction storage of a cache: the single metric intermediate
@@ -2245,6 +2299,10 @@ impl<'a> GwGradEngine<'a> {
         let consts = self.consts(n);
         let side = if n < self.nocc { -1.0 } else { 1.0 };
         let mut x = self.e[n] + side * 0.02;
+        // The imaginary-axis table of this row does not depend on the trial QP
+        // energy, so it is built once and reused by every Newton step (and by
+        // the final cache assembly) instead of once per evaluation.
+        let table = self.qp_row_table(n);
         // Smooth exact-residue mode: the residue frequencies follow the QP
         // energy, so the derivative carries the extra `d zeta/d omega` term of
         // `sigma_d_from_parts` / `d_sigma_d_omega` — both branches use the
@@ -2254,7 +2312,7 @@ impl<'a> GwGradEngine<'a> {
             let mut iter = 0;
             while converged == 0 && iter < self.config.qpe_max_iter {
                 // value and derivative share one response evaluation
-                let (sc, dsc) = self.sigma_c_and_d(x, n);
+                let (sc, dsc) = self.sigma_c_and_d_with(x, n, &table);
                 let fv = consts + sc - x;
                 let dfv = dsc - 1.0;
                 let shift = -fv / dfv;
@@ -2298,8 +2356,9 @@ impl<'a> GwGradEngine<'a> {
                 }
             }
             let omega = x;
-            let (_contour, _imag, w_imag, y_imag, residues, m) =
-                self.sigma_c_parts(omega, n, true, want_y);
+            let (_contour, _imag, y_imag, residues) =
+                self.sigma_c_parts_with(omega, n, true, want_y, &table);
+            let (w_imag, m) = (table.w_imag, table.m);
             let dsdw = self.sigma_d_from_parts(omega, &w_imag, &residues);
             let m_imag = self.compact_m_imag(&m, !want_y);
             let y_imag = if want_y { y_imag } else { Vec::new() };
@@ -2326,7 +2385,7 @@ impl<'a> GwGradEngine<'a> {
         let mut converged = 0;
         let mut iter = 0;
         while converged == 0 && iter < self.config.qpe_max_iter {
-            let (sc, dsc) = self.sigma_c_and_d(x, n);
+            let (sc, dsc) = self.sigma_c_and_d_with(x, n, &table);
             let fv = consts + sc - x;
             let dfv = dsc - 1.0;
             let shift = -fv / dfv;
@@ -2366,8 +2425,9 @@ impl<'a> GwGradEngine<'a> {
         }
         let omega = x;
 
-        let (_contour, _imag, w_imag, y_imag, residues, m) =
-            self.sigma_c_parts(omega, n, true, want_y);
+        let (_contour, _imag, y_imag, residues) =
+            self.sigma_c_parts_with(omega, n, true, want_y, &table);
+        let (w_imag, m) = (table.w_imag, table.m);
         let dsdw = self.sigma_d_from_parts(omega, &w_imag, &residues);
         let m_imag = self.compact_m_imag(&m, !want_y);
         let y_imag = if want_y { y_imag } else { Vec::new() };
@@ -2458,23 +2518,22 @@ impl<'a> GwGradEngine<'a> {
             }
             let compact = cache.y_imag.is_empty() && !cache.m_imag.is_empty();
             // `y0 = s_metric * m` is the same for every quadrature point, so it
-            // is rebuilt once per cache instead of once per (state, frequency);
-            // `y = y0 + s_metric * corr(u_wi)` follows from the low-rank
-            // correction of the frequency.
-            let y0_own: Vec<f64> = if compact {
-                gemm_nn(&self.s_metric, naux, naux, &cache.m_imag, naux, nmo)
-            } else {
-                Vec::new()
-            };
-            let mut y_own = vec![0.0f64; naux * nmo];
-            // sign-grouped scaling buffers of the outer-product accumulation
-            // (`bj += G+ G+^T - G- G-^T`), reused across frequencies
-            let mut g_pos = MatrixFull::new([naux, nmo], 0.0);
-            let mut g_neg = MatrixFull::new([naux, nmo], 0.0);
-            let mut v_pos = MatrixFull::new([naux, nmo], 0.0);
-            let mut v_neg = MatrixFull::new([naux, nmo], 0.0);
-            let mut bj_unit = MatrixFull::new([naux, naux], 0.0);
+            // is rebuilt once per cache instead of once per (state, frequency).
+            // The response buffers are `MatrixFull`s because the outer-product
+            // accumulation below reads them as gemm operands.
+            let mut y_m = MatrixFull::new([naux, nmo], 0.0);
+            let mut y0_m = MatrixFull::new([naux, nmo], 0.0);
+            if compact {
+                let y0_own = gemm_nn(&self.s_metric, naux, naux, &cache.m_imag, naux, nmo);
+                y0_m.data.copy_from_slice(&y0_own);
+            }
+            // `ya = diag(b) y`, `y0a = diag(b) y0` of the current frequency with
+            // the **unit** weights `b_m` (see the accumulation note below)
+            let mut ya = MatrixFull::new([naux, nmo], 0.0);
+            let mut y0a = MatrixFull::new([naux, nmo], 0.0);
+            let mut g0 = MatrixFull::new([naux, naux], 0.0);
             let mut v_unit = MatrixFull::new([naux, naux], 0.0);
+            let mut sc = vec![0.0f64; naux * nmo];
             // the compact path rebuilds each frequency's response from `m`, which
             // reads the (evictable) low-rank factors
             if compact {
@@ -2487,65 +2546,58 @@ impl<'a> GwGradEngine<'a> {
                 .take(if no_imag { 0 } else { usize::MAX })
             {
                 // `y` and `y0` of this frequency, shared by every state `k`
-                let (y, y0): (&[f64], &[f64]) = if compact {
+                let t_resp = Instant::now();
+                if compact {
                     let corr = {
                         let lr_imag = self.lr_imag.borrow();
                         lr_imag[wi].correction_from_qt(&cache.m_imag, nmo)
                     };
-                    let sc = gemm_nn(&self.s_metric, naux, naux, &corr, naux, nmo);
-                    for (d, (a, b)) in y_own.iter_mut().zip(y0_own.iter().zip(sc.iter())) {
+                    sc = gemm_nn(&self.s_metric, naux, naux, &corr, naux, nmo);
+                    for (d, (a, b)) in y_m.data.iter_mut().zip(y0_m.data.iter().zip(sc.iter()))
+                    {
                         *d = a + b;
                     }
-                    (&y_own, &y0_own)
                 } else if !cache.y_imag.is_empty() {
                     let (_u, y, y0) = &cache.y_imag[wi];
-                    (y, y0)
+                    y_m.data.copy_from_slice(y);
+                    y0_m.data.copy_from_slice(y0);
                 } else {
                     // empty placeholder: no contribution
                     continue;
-                };
+                }
+                if grad_timing() {
+                    T_PULL.with(|c| c.borrow_mut()[0] += t_resp.elapsed().as_secs_f64());
+                }
                 // ---- outer-product accumulation with **unit** weights ----
                 // `bj += sum_m a_m (y0_m y0_m^T - y_m y_m^T)` and
-                // `V += sum_m a_m y_m y_m^T` are linear in the per-state weight
-                // `c_k` (`a_m = c_k b_m`), so the two Gram matrices are formed
+                // `V += sum_m a_m y_m y_m^T` (`a_m = c_k b_m`) are linear in the
+                // per-state weight `c_k`, so the two Gram matrices are formed
                 // once per (cache, frequency) from the `c = 1` coefficients and
-                // scaled into every state below.  The sign-sorted scaling
-                // `sqrt(|b_m|)` keeps the accumulation BLAS-3: the outer
-                // products cannot carry a sign, so the positive and negative
-                // groups enter as separate `G+ G+^T - G- G-^T` terms.
+                // scaled into every state below.  Writing them as
+                // `Y0 diag(b) Y0^T` / `Y diag(b) Y^T` keeps the signed weights
+                // inside the second gemm operand, so each needs a single BLAS-3
+                // product (the sign-sorted `sqrt(|b|)` form needed four).
+                // `V` is exactly the `y y^T` half of `bj`, so `bj` only
+                // accumulates the `y0 y0^T` half here and the finish pass
+                // subtracts the accumulated `V` matrices.
+                let t_gram = Instant::now();
                 for m in 0..nmo {
                     let t = cache.omega - self.e[m];
                     let b = -wgt / TWO_PI * 2.0 * t / (t * t + u * u);
                     let base = m * naux;
-                    let s = b.abs().sqrt();
-                    // `b >= 0`: the pair (y0, y) is positive; `b < 0`: the two
-                    // vectors swap their roles.
-                    if b >= 0.0 {
-                        for r in 0..naux {
-                            let y0r = s * y0[base + r];
-                            let yr = s * y[base + r];
-                            g_pos.data[base + r] = y0r;
-                            g_neg.data[base + r] = yr;
-                            v_pos.data[base + r] = yr;
-                            v_neg.data[base + r] = 0.0;
-                        }
-                    } else {
-                        for r in 0..naux {
-                            let y0r = s * y0[base + r];
-                            let yr = s * y[base + r];
-                            g_pos.data[base + r] = yr;
-                            g_neg.data[base + r] = y0r;
-                            v_pos.data[base + r] = 0.0;
-                            v_neg.data[base + r] = yr;
-                        }
+                    for r in 0..naux {
+                        ya.data[base + r] = b * y_m.data[base + r];
+                        y0a.data[base + r] = b * y0_m.data[base + r];
                     }
                 }
-                bj_unit.data.fill(0.0);
-                _dgemm_full(&g_pos, 'N', &g_pos, 'T', &mut bj_unit, 1.0, 1.0);
-                _dgemm_full(&g_neg, 'N', &g_neg, 'T', &mut bj_unit, -1.0, 1.0);
+                g0.data.fill(0.0);
+                _dgemm_full(&y0_m, 'N', &y0a, 'T', &mut g0, 1.0, 0.0);
                 v_unit.data.fill(0.0);
-                _dgemm_full(&v_pos, 'N', &v_pos, 'T', &mut v_unit, 1.0, 1.0);
-                _dgemm_full(&v_neg, 'N', &v_neg, 'T', &mut v_unit, -1.0, 1.0);
+                _dgemm_full(&y_m, 'N', &ya, 'T', &mut v_unit, 1.0, 0.0);
+                if grad_timing() {
+                    T_PULL.with(|c| c.borrow_mut()[1] += t_gram.elapsed().as_secs_f64());
+                }
+                let t_acc = Instant::now();
                 for k in 0..nk {
                     let c = cs[k];
                     if c == 0.0 {
@@ -2567,14 +2619,20 @@ impl<'a> GwGradEngine<'a> {
                         let base = m * naux;
                         let col_m = self.pair_col(n, m) * naux;
                         for p in 0..naux {
-                            bq[k][col_m + p] += 2.0 * a * (y[base + p] - y0[base + p]);
+                            bq[k][col_m + p] +=
+                                2.0 * a * (y_m.data[base + p] - y0_m.data[base + p]);
                         }
                     }
-                    for (d, s) in bj[k].iter_mut().zip(bj_unit.data.iter()) {
+                    let t_bj = Instant::now();
+                    for (d, s) in bj[k].iter_mut().zip(g0.data.iter()) {
                         *d += c * s;
                     }
                     for (d, s) in v_imag[k][wi].iter_mut().zip(v_unit.data.iter()) {
                         *d += c * s;
+                    }
+                    if grad_timing() {
+                        T_PULL.with(|c| c.borrow_mut()[2] += t_bj.elapsed().as_secs_f64());
+                        T_PULL.with(|c| c.borrow_mut()[3] += t_acc.elapsed().as_secs_f64());
                     }
                 }
             }
@@ -2688,6 +2746,14 @@ impl<'a> GwGradEngine<'a> {
 
         // ---- deferred polarizability pullbacks ----
         let t_polar = Instant::now();
+        if grad_timing() {
+            let [t_r, t_g, t_b, t_a] = T_PULL.with(|c| *c.borrow());
+            eprintln!(
+                "[gw_grad timing]   qp_pullback: response {:.2}s  gram {:.2}s  bj/v accum {:.2}s  bq/be+rest {:.2}s",
+                t_r, t_g, t_b, (t_a - t_b).max(0.0)
+            );
+            T_PULL.with(|c| c.borrow_mut().fill(0.0));
+        }
         for k in 0..nk {
             for (wi, _) in self.quad.iter().enumerate().take(if no_imag { 0 } else { usize::MAX }) {
                 let (d, dd) = &imag_factors[wi];
@@ -2697,6 +2763,19 @@ impl<'a> GwGradEngine<'a> {
                 for (zi, &z) in z_order[k].iter().enumerate() {
                     let (d, dd) = real_response_and_deriv(&self.de_ia, z, self.config.eta);
                     self.polar_pullback(&mut bq, &mut be, k, &v_res[k][zi], &d, &dd);
+                }
+            }
+        }
+
+        // The imaginary-axis outer products accumulated `bj += sum a_m y0 y0^T`
+        // only; their `y y^T` half is exactly the dQ matrix, which the
+        // frequency buckets `v_imag[k][wi]` already hold, so the subtraction is
+        // one pass over the (small) `naux^2` covectors instead of a second Gram
+        // product per cache and frequency.
+        for k in 0..nk {
+            for v in v_imag[k].iter() {
+                for (d, s) in bj[k].iter_mut().zip(v.iter()) {
+                    *d -= s;
                 }
             }
         }
