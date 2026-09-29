@@ -144,6 +144,12 @@ pub struct GwGradConfig {
     /// when bit 1 is set), so each term can be validated against the finite
     /// difference of its own contribution.
     pub phase_mask: u32,
+    /// Store the QP-cache interaction data in its **compact** form: only the
+    /// metric intermediate `m = s_metric * q_n` per quadrature point, with `y`
+    /// and `y0` rebuilt on demand during the pullback.  Halves the resident
+    /// size of a cache at the cost of one gemm per `(cache, quadrature)` in the
+    /// pullback.  Used by the BSE gradient.
+    pub compact_qp_cache: bool,
     /// Skip the low-rank machinery of the LR engine (`qt`, `qtia`, the
     /// real-axis grid and the low-rank factors).  Only the full-CD engine
     /// ([`GwCdGradEngine`]) sets this; the LR-only methods then find empty
@@ -245,6 +251,7 @@ impl Default for GwGradConfig {
             resp_cache_kernel: true,
             resp_cache_budget_mib: 256.0,
             fold_cphf_rhs: true,
+            compact_qp_cache: false,
         }
     }
 }
@@ -279,10 +286,26 @@ impl GwGradConfig {
 /// Memory probe for the gradient phases: with `REST_GWGRAD_MEMDBG` set, print the
 /// resident set (`VmRSS`) and the high-water mark (`VmHWM`) of the process, so the
 /// peak of a gradient run can be attributed to a phase.  No effect otherwise.
+///
+/// The same line also carries the wall time elapsed since the previous probe
+/// (`dt`) and since the first probe of the process (`T`), so the per-stage cost
+/// breakdown comes from the very same instrumentation as the memory one.
 fn mem_probe(label: &str) {
     if std::env::var("REST_GWGRAD_MEMDBG").is_err() {
         return;
     }
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+    static CLOCK: OnceLock<Mutex<(Instant, Instant)>> = OnceLock::new();
+    let now = Instant::now();
+    let (dt, total) = {
+        let clock = CLOCK.get_or_init(|| Mutex::new((now, now)));
+        let mut g = clock.lock().unwrap();
+        let dt = now.duration_since(g.0).as_secs_f64();
+        let total = now.duration_since(g.1).as_secs_f64();
+        g.0 = now;
+        (dt, total)
+    };
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     let kb = |key: &str| -> f64 {
         status
@@ -292,7 +315,11 @@ fn mem_probe(label: &str) {
             .unwrap_or(0.0)
             / 1024.0
     };
-    println!("[memdbg] {label:46} rss {:8.1} MB | peak {:8.1} MB", kb("VmRSS:"), kb("VmHWM:"));
+    println!(
+        "[memdbg] {label:46} dt {dt:8.2}s | T {total:8.2}s | rss {:8.1} MB | peak {:8.1} MB",
+        kb("VmRSS:"),
+        kb("VmHWM:")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,10 +1049,27 @@ impl LrFactor {
     /// `y = S (qt_rhs + U diag(lam) U^T qt_rhs)` with `qt_rhs = S rhs`.
     /// `rhs` holds `n_col` right-hand sides of length naux (col-major).
     pub fn response_vectors(&self, s: &[f64], rhs: &[f64], n_col: usize) -> Vec<f64> {
+        self.response_vectors_parts(s, rhs, n_col).2
+    }
+
+    /// [`Self::response_vectors`] together with its two intermediates, so a
+    /// caller that wants to store the result can keep only `qt` (half the size)
+    /// and rebuild `y0`/`y` on demand.  For the empty-eigenvalue factor the
+    /// result is `qt` itself and both later entries are empty.
+    ///
+    /// With `y0 = s * s * rhs` (the metric solve) the identities are
+    /// `qt = s * rhs = s * y0 * s` (element-wise, `s` diagonal) and
+    /// `y = s * (qt + E diag(eig) E^T qt)`.
+    pub fn response_vectors_parts(
+        &self,
+        s: &[f64],
+        rhs: &[f64],
+        n_col: usize,
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let naux = self.n_aux;
         let qt = gemm_nn(s, naux, naux, rhs, naux, n_col);
         if self.eigval.is_empty() {
-            return qt;
+            return (qt.clone(), Vec::new(), qt);
         }
         let nk = self.eigval.len();
         let mut proj = gemm_nt(&self.eigvec, naux, nk, &qt, naux, n_col);
@@ -1035,7 +1079,30 @@ impl LrFactor {
             }
         }
         let corr = gemm_nn(&self.eigvec, naux, nk, &proj, nk, n_col);
-        let mut sum = qt;
+        let mut sum = qt.clone();
+        for (a, b) in sum.iter_mut().zip(corr.iter()) {
+            *a += b;
+        }
+        let y = gemm_nn(s, naux, naux, &sum, naux, n_col);
+        (qt, sum, y)
+    }
+
+    /// Rebuild the response vectors of a low-rank factor from the stored
+    /// intermediates `qt` (see [`Self::response_vectors_parts`]).
+    pub fn response_vectors_from_qt(&self, s: &[f64], qt: &[f64], n_col: usize) -> Vec<f64> {
+        let naux = self.n_aux;
+        if self.eigval.is_empty() {
+            return qt.to_vec();
+        }
+        let nk = self.eigval.len();
+        let mut proj = gemm_nt(&self.eigvec, naux, nk, qt, naux, n_col);
+        for c in 0..n_col {
+            for v in 0..nk {
+                proj[v + c * nk] *= self.eigval[v];
+            }
+        }
+        let corr = gemm_nn(&self.eigvec, naux, nk, &proj, nk, n_col);
+        let mut sum = qt.to_vec();
         for (a, b) in sum.iter_mut().zip(corr.iter()) {
             *a += b;
         }
@@ -1049,14 +1116,23 @@ impl LrFactor {
 
 /// One converged QP state: energy, renormalisation factor and the response
 /// data needed by the pullback.
+#[derive(Clone)]
 pub struct QpCache {
     pub target: usize,
     pub omega: f64,
     pub z_factor: f64,
     /// W_c[n, m](iu) at every quadrature point [n_freq][nmo]
     pub w_imag: Vec<Vec<f64>>,
-    /// (u, y[naux*nmo], y0[naux*nmo]) per quadrature point
+    /// (u, y[naux*nmo], y0[naux*nmo]) per quadrature point.  Empty when the
+    /// cache stores [`QpCache::m_imag`] instead.
     pub y_imag: Vec<(f64, Vec<f64>, Vec<f64>)>,
+    /// **Compact** interaction storage: `u` and the metric intermediate
+    /// `m = s_metric * q_n` per quadrature point.  Both `y` and `y0` are
+    /// element-wise/one-gemm functions of `m`
+    /// (`GwGradEngine::row_response_from_m`), so storing it instead of
+    /// `y`/`y0` halves the resident size of a cache.  Used by the BSE gradient,
+    /// whose caches are the dominant memory term.
+    pub m_imag: Vec<(f64, Vec<f64>)>,
     /// (m, sign*pole_factor, z_used, y_res[naux], y0_metric[naux]) per
     /// active residue
     pub residues: Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)>,
@@ -1133,6 +1209,80 @@ pub struct GwGradEngine<'a> {
     /// index of the shell containing each orbital
     pub shell_of: Vec<usize>,
 }
+
+    /// Bytes of one fully built [`QpCache`]: `nquad` pairs of `[naux, nmo]` vectors
+/// plus the residue vectors.  The residue count is not known before the cache
+/// is built, so the estimate is the imaginary-axis part, which dominates
+/// (`nres` is at most a few).
+pub fn qp_cache_bytes_estimate(naux: usize, nmo: usize, nquad: usize) -> usize {
+    nquad * 2 * naux * nmo * 8
+}
+
+/// One chunk of a **streaming** QP pullback: the running covectors
+    /// `(bq, bJ, be, bB)` plus the deferred polarizability workspace.
+    ///
+    /// The non-streaming [`Self::qp_pullback`] is the special case of a single
+    /// chunk; the BSE gradient uses several chunks so that the QP caches (the
+    /// largest geometry-fixed object of that path, `O(ncache·nquad·naux·nmo)`)
+    /// never have to be resident all at once.  See
+    /// [`Self::qp_pullback_streaming`].
+    pub struct QpPullbackScratch {
+        nk: usize,
+        naux: usize,
+        nmo: usize,
+        nocc: usize,
+        nov: usize,
+        bq: Vec<Vec<f64>>,
+        bj: Vec<Vec<f64>>,
+        be: Vec<Vec<f64>>,
+        bb: Vec<Vec<f64>>,
+        /// polarizability coefficient matrices `V[k][wi] = sum_m a_m y_m y_m^T`
+        /// of the imaginary axis; they must survive the whole cache loop
+        /// because every cache adds a rank-`nmo` contribution
+        v_imag: Vec<Vec<Vec<f64>>>,
+        /// residue frequency buckets `[k]`, parallel to `z_order[k]`
+        v_res: Vec<Vec<Vec<f64>>>,
+        z_order: Vec<Vec<f64>>,
+        /// `(-4 de/(de^2+u^2), -4(u^2-de^2)/(de^2+u^2)^2)` per quadrature point
+        imag_factors: Vec<(Vec<f64>, Vec<f64>)>,
+    }
+
+    impl QpPullbackScratch {
+        fn new(engine: &GwGradEngine, nk: usize) -> Self {
+            let (naux, nmo, nocc) = (engine.naux, engine.nmo, engine.nocc);
+            let nov = nocc * (nmo - nocc);
+            let imag_factors = engine
+                .quad
+                .iter()
+                .map(|&(u, _)| {
+                    let mut d = vec![0.0f64; nov];
+                    let mut dd = vec![0.0f64; nov];
+                    for (idx, &de) in engine.de_ia.iter().enumerate() {
+                        d[idx] = -4.0 * de / (de * de + u * u);
+                        dd[idx] =
+                            -4.0 * (u * u - de * de) / ((de * de + u * u) * (de * de + u * u));
+                    }
+                    (d, dd)
+                })
+                .collect();
+            let nquad = engine.quad.len();
+            QpPullbackScratch {
+                nk,
+                naux,
+                nmo,
+                nocc,
+                nov,
+                bq: vec![vec![0.0f64; naux * nmo * nmo]; nk],
+                bj: vec![vec![0.0f64; naux * naux]; nk],
+                be: vec![vec![0.0f64; nmo]; nk],
+                bb: vec![vec![0.0f64; nmo]; nk],
+                v_imag: vec![vec![vec![0.0f64; naux * naux]; nquad]; nk],
+                v_res: vec![Vec::new(); nk],
+                z_order: vec![Vec::new(); nk],
+                imag_factors,
+            }
+        }
+    }
 
 impl<'a> GwGradEngine<'a> {
     pub fn new(scf: &'a SCF, config: GwGradConfig) -> Self {
@@ -1732,6 +1882,22 @@ impl<'a> GwGradEngine<'a> {
     /// `W_c[n, m](z)` for all m plus the exact response vectors, evaluated
     /// through a low-rank factor (imaginary axis or nearest real grid point).
     fn screened_row(&self, wi: Option<usize>, z: f64, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let (w, _m, y, y0) = self.screened_row_compact(wi, z, n);
+        (w, y, y0)
+    }
+
+    /// [`Self::screened_row`] that also returns the metric intermediate
+    /// `m = s_metric * q_n` (`[naux, nmo]`, half the size of `y`/`y0`), from
+    /// which both `y0 = s_metric * m` and `y` can be rebuilt on demand with
+    /// [`Self::response_vectors_from_qt`]: the interaction matrix of a QP cache
+    /// then stores one `m` instead of the raw row plus two transformed copies.
+    #[allow(clippy::type_complexity)]
+    fn screened_row_compact(
+        &self,
+        wi: Option<usize>,
+        z: f64,
+        n: usize,
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
         self.ensure_lr();
         let lr_imag = self.lr_imag.borrow();
         let lr_grid = self.lr_grid.borrow();
@@ -1740,8 +1906,12 @@ impl<'a> GwGradEngine<'a> {
             None => &lr_grid[self.lr_factor_nearest_idx(z)],
         };
         let qn = self.with_q(|q| self.gather_row(q, n));
+        // exactly the original two calls: `y` comes from the factor, `y0` from
+        // the metric solve, and the metric intermediate `m = s_metric * qn`
+        // kept for the compact cache is the first half of the metric solve
+        let m = gemm_nn(&self.s_metric, self.naux, self.naux, &qn, self.naux, self.nmo);
         let y = factor.response_vectors(&self.s_metric, &qn, self.nmo);
-        let y0 = self.metric_solve(&qn, self.nmo);
+        let y0 = gemm_nn(&self.s_metric, self.naux, self.naux, &m, self.naux, self.nmo);
         let mut w = vec![0.0f64; self.nmo];
         for m in 0..self.nmo {
             let base = m * self.naux;
@@ -1752,7 +1922,73 @@ impl<'a> GwGradEngine<'a> {
                 .map(|((&a, &b), &c)| a * (b - c))
                 .sum();
         }
-        (w, y, y0)
+        (w, m, y, y0)
+    }
+
+    /// Compact interaction storage of a cache: one metric intermediate
+    /// `m = s_metric * q_n` per quadrature point, or empty when the full
+    /// `y`/`y0` pair is kept.
+    fn compact_m_imag(&self, n: usize, y_imag: &[(f64, Vec<f64>, Vec<f64>)]) -> Vec<(f64, Vec<f64>)> {
+        if !self.config.compact_qp_cache {
+            return Vec::new();
+        }
+        let m = self.row_metric_intermediate(n);
+        y_imag.iter().map(|(u, _y, _y0)| (*u, m.clone())).collect()
+    }
+
+    /// Sample the QP equation `f(omega) = consts + Sigma_c(omega) - omega` of
+    /// one orbital on a uniform grid.  Validation aid for the Newton solver:
+    /// the quantised residue protocol makes `f` piecewise continuous with
+    /// jumps, so it is worth seeing where the sign changes.
+    pub fn sample_qp_equation(&self, n: usize, lo: f64, hi: f64, npts: usize) -> Vec<(f64, f64)> {
+        let consts = self.consts(n);
+        (0..npts)
+            .map(|i| {
+                let x = lo + (hi - lo) * i as f64 / (npts - 1) as f64;
+                (x, consts + self.sigma_c(x, n) - x)
+            })
+            .collect()
+    }
+
+    /// Sample `(f(omega), f'(omega))` of the QP equation of one orbital, where
+    /// `f'` is the derivative the solver uses (`sigma_c_and_d`).  Validation
+    /// aid: in a self-consistent protocol the analytic `f'` must agree with a
+    /// central difference of `f`.
+    pub fn qp_equation_consistency(
+        &self,
+        n: usize,
+        omegas: &[f64],
+        h: f64,
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let consts = self.consts(n);
+        let f = |om: f64| consts + self.sigma_c(om, n) - om;
+        let mut vals = Vec::with_capacity(omegas.len());
+        let mut ana = Vec::with_capacity(omegas.len());
+        let mut num = Vec::with_capacity(omegas.len());
+        for &om in omegas {
+            vals.push(f(om));
+            let (_sc, ds) = self.sigma_c_and_d(om, n);
+            ana.push(ds - 1.0);
+            num.push((f(om + h) - f(om - h)) / (2.0 * h));
+        }
+        (vals, ana, num)
+    }
+
+    /// The metric intermediate `m = s_metric * q_n` of one orbital row.
+    pub fn row_metric_intermediate(&self, n: usize) -> Vec<f64> {
+        self.ensure_q();
+        let qn = self.with_q(|q| self.gather_row(q, n));
+        gemm_nn(&self.s_metric, self.naux, self.naux, &qn, self.naux, self.nmo)
+    }
+
+    /// Rebuild `(y, y0)` of one quadrature point from `m`
+    /// (see [`Self::screened_row_compact`]).
+    pub fn row_response_from_m(&self, wi: usize, m: &[f64]) -> (Vec<f64>, Vec<f64>) {
+        self.ensure_lr();
+        let lr_imag = self.lr_imag.borrow();
+        let y = lr_imag[wi].response_vectors_from_qt(&self.s_metric, m, self.nmo);
+        let y0 = gemm_nn(&self.s_metric, self.naux, self.naux, m, self.naux, self.nmo);
+        (y, y0)
     }
 
     /// Raw CD self-energy `Sigma_c(omega) = contour(omega) - imag(omega)`.
@@ -1889,17 +2125,46 @@ impl<'a> GwGradEngine<'a> {
                 iter += 1;
             }
             if converged == 0 {
-                println!("warning!!! gw_grad Newton (exact mode) did not converge for orbital {}!", n);
+                // The QP equation of the quantised residue protocol is only
+                // piecewise smooth: the residue term jumps whenever a pole
+                // frequency crosses a real-axis grid point, so the Newton
+                // iterate can keep crossing the same jump forever (observed for
+                // the symmetric O-H combination of H2O/STO-3G, where the plain
+                // Newton never settles and leaves the QP energy ~0.002 Ha off
+                // the root).  Grid scanning is immune to that: reuse the
+                // production graphical solver, which brackets the sign change
+                // on a grid and interpolates linearly inside it.
+                let mut fq = |om: f64| consts + self.sigma_c(om, n) - om;
+                let (have_crossing, xg) =
+                    crate::ri_gw::linear_interpolation_solver(&fq, self.e[n], side, 21, 0.1);
+                if have_crossing {
+                    if std::env::var("REST_GWGRAD_NEWTON").is_ok() {
+                        println!(
+                            "[newtonE] n={} Newton stalled at {:.10}; graphical solver -> {:.10}",
+                            n, x, xg
+                        );
+                    }
+                    x = xg;
+                    converged = 1;
+                } else {
+                    println!(
+                        "warning!!! gw_grad Newton (exact mode) did not converge for orbital {}!",
+                        n
+                    );
+                }
             }
             let omega = x;
             let (_contour, _imag, w_imag, y_imag, residues) = self.sigma_c_parts(omega, n, true);
             let dsdw = self.sigma_d_from_parts(omega, &w_imag, &residues);
+            let m_imag = self.compact_m_imag(n, &y_imag);
+            let y_imag = if self.config.compact_qp_cache { Vec::new() } else { y_imag };
             return QpCache {
                 target: n,
                 omega,
                 z_factor: 1.0 / (1.0 - dsdw),
                 w_imag,
                 y_imag,
+                m_imag,
                 residues,
             };
         }
@@ -1949,12 +2214,15 @@ impl<'a> GwGradEngine<'a> {
 
         let (_contour, _imag, w_imag, y_imag, residues) = self.sigma_c_parts(omega, n, true);
         let dsdw = self.sigma_d_from_parts(omega, &w_imag, &residues);
+        let m_imag = self.compact_m_imag(n, &y_imag);
+        let y_imag = if self.config.compact_qp_cache { Vec::new() } else { y_imag };
         QpCache {
             target: n,
             omega,
             z_factor: 1.0 / (1.0 - dsdw),
             w_imag,
             y_imag,
+            m_imag,
             residues,
         }
     }
@@ -1967,49 +2235,72 @@ impl<'a> GwGradEngine<'a> {
     /// `d Omega_k/dR = sum bq[k]:dq + sum bJ[k]:dJ + sum be[k][p] eps1[p]
     ///              + sum bB[k][p] b_x[p]`.
     ///
-    /// `weights[k][j]` is the derivative of `Omega_k` with respect to the QP
-    /// energy of cache `j`; the `Z` renormalisation of each cache is applied
-    /// here.
-    pub fn qp_pullback(
+
+    /// Covectors `(bq, bJ, be, bB)` such that for every state k
+    /// `d Omega_k/dR = sum bq[k]:dq + sum bJ[k]:dJ + sum be[k][p] eps1[p]
+    ///              + sum bB[k][p] b_x[p]`.
+    ///
+    /// Streaming form: `pages` yields successive disjoint runs of QP caches
+    /// (`(col0, page)`, `col0` = index of the first cache in the page) and `scr`
+    /// accumulates the covectors, so a driver that can rebuild a cache on demand
+    /// (the BSE gradient) never has to hold all of them at once.  `weights` is
+    /// row-major `[nk, nmo]`.
+    ///
+    /// Call [`Self::qp_pullback_streaming_finish`] once after the last page.
+    pub fn qp_pullback_streaming(
         &self,
-        caches: &[&QpCache],
-        weights: &[Vec<f64>],
-    ) -> (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>) {
-        let nk = weights.len();
-        for w in weights {
-            assert_eq!(w.len(), caches.len(), "qp_pullback: weight row length mismatch");
+        weights: &[f64],
+        scr: &mut QpPullbackScratch,
+        pages: impl Iterator<Item = (usize, Vec<QpCache>)>,
+    ) {
+        let nk = scr.nk;
+        assert_eq!(
+            weights.len(),
+            nk * self.nmo,
+            "qp_pullback_streaming: weight row length must be nk*nmo"
+        );
+        for (col0, page) in pages {
+            if page.is_empty() {
+                break;
+            }
+            self.qp_pullback_chunk(&page, weights, col0, scr);
         }
-        let naux = self.naux;
-        let nmo = self.nmo;
-        let nocc = self.nocc;
-        let nov = nocc * (nmo - nocc);
-        let pair = naux * nmo * nmo;
+    }
+
+    /// Process one page of caches (see [`Self::qp_pullback_streaming`]).
+    fn qp_pullback_chunk(
+        &self,
+        caches: &[QpCache],
+        weights: &[f64],
+        col0: usize,
+        scr: &mut QpPullbackScratch,
+    ) {
+        let (nk, naux, nmo, nocc, nov) = (scr.nk, scr.naux, scr.nmo, scr.nocc, scr.nov);
         let dbg = |name: &str| std::env::var(name).is_ok();
         let no_be_expl = dbg("REST_GWGRAD_NOBEEXPL");
         let no_exch = dbg("REST_GWGRAD_NOEXCH");
         let no_res = dbg("REST_GWGRAD_NORES");
         let no_imag = dbg("REST_GWGRAD_NOIMAG");
+        let QpPullbackScratch { bq, bj, be, bb, v_imag, v_res, z_order, .. } = scr;
 
-        let mut bq: Vec<Vec<f64>> = vec![vec![0.0; pair]; nk];
-        let mut bj: Vec<Vec<f64>> = vec![vec![0.0; naux * naux]; nk];
-        let mut be: Vec<Vec<f64>> = vec![vec![0.0; nmo]; nk];
-        let mut bb: Vec<Vec<f64>> = vec![vec![0.0; nmo]; nk];
-
-        // Polarizability-coefficient matrices V[k] = sum_m a_m y_m y_m^T are
-        // accumulated over ALL QP targets first; their contraction with q_ia
-        // (the expensive polarizability pullback) runs once per (k, frequency)
-        // at the end — the PySCF low_rank_weighted_screening structure.
-        let nquad = self.quad.len();
-        let mut v_imag: Vec<Vec<Vec<f64>>> =
-            vec![vec![vec![0.0; naux * naux]; nquad]; nk];
-        let mut z_order: Vec<Vec<f64>> = vec![Vec::new(); nk];
-        let mut v_res: Vec<Vec<Vec<f64>>> = vec![Vec::new(); nk];
-
-        let t_cache = Instant::now();
-        for (j, cache) in caches.iter().enumerate() {
+        for (jl, cache) in caches.iter().enumerate() {
+            let j = col0 + jl;
             let n = cache.target;
+            // The compact storage keeps one `m` per quadrature point; `y`/`y0`
+            // are rebuilt once here (they do not depend on the state `k`) instead
+            // of once per `k`.
+            let rebuilt: Vec<(Vec<f64>, Vec<f64>)> =
+                if cache.y_imag.is_empty() && !cache.m_imag.is_empty() {
+                    (0..self.quad.len())
+                        .map(|wi| self.row_response_from_m(wi, &cache.m_imag[wi].1))
+                        .collect()
+                } else {
+                    // `y_imag` present, or an empty placeholder for an orbital
+                    // whose weight is zero (its `c == 0.0` below skips it)
+                    Vec::new()
+                };
             for k in 0..nk {
-                let c = weights[k][j] * cache.z_factor;
+                let c = weights[k * nmo + j] * cache.z_factor;
                 // orbitals without QP weight (e.g. virtuals above the BSE
                 // cutoff, holding dummy caches) contribute nothing
                 if c == 0.0 {
@@ -2025,8 +2316,22 @@ impl<'a> GwGradEngine<'a> {
                 //   a_m = -c w/(2 pi) g(t_m, u),
                 // and the explicit eps1 dependence of t_m contributes
                 //   be[m] += c w/(2 pi) g'(t_m) Wc[n,m].
-                for (wi, &(u, wgt)) in self.quad.iter().enumerate().take(if no_imag { 0 } else { usize::MAX }) {
-                    let (_u, y, y0) = &cache.y_imag[wi];
+                for (wi, &(u, wgt)) in self
+                    .quad
+                    .iter()
+                    .enumerate()
+                    .take(if no_imag { 0 } else { usize::MAX })
+                {
+                    let (y, y0): (&Vec<f64>, &Vec<f64>) = if cache.y_imag.is_empty() {
+                        match rebuilt.get(wi) {
+                            Some(r) => (&r.0, &r.1),
+                            // empty placeholder: no contribution (see above)
+                            None => continue,
+                        }
+                    } else {
+                        let (_u, y, y0) = &cache.y_imag[wi];
+                        (y, y0)
+                    };
                     // J covector  bj += sum_m a_m (y0_m y0_m^T - y_m y_m^T)
                     // and dQ matrix V += sum_m a_m y_m y_m^T as BLAS-3
                     // products with the sign-sorted column scaling
@@ -2087,7 +2392,11 @@ impl<'a> GwGradEngine<'a> {
                 }
 
                 // ---- residues (quantised frequencies; no d_zeta term) ----
-                for &(m, sign, z_used, ref y_r, ref y0_r) in cache.residues.iter().take(if no_res { 0 } else { usize::MAX }) {
+                for &(m, sign, z_used, ref y_r, ref y0_r) in cache
+                    .residues
+                    .iter()
+                    .take(if no_res { 0 } else { usize::MAX })
+                {
                     let a = c * sign;
                     // exact mode: the moving residue frequency contributes
                     // dzeta/dR = zsign * eps1[m] through dW/dz
@@ -2115,7 +2424,8 @@ impl<'a> GwGradEngine<'a> {
                         }
                     }
                     // accumulate the V bucket of this residue frequency
-                    let idx = match z_order[k].iter().position(|&z| (z - z_used).abs() < 1.0e-14) {
+                    let idx = match z_order[k].iter().position(|&z| (z - z_used).abs() < 1.0e-14)
+                    {
                         Some(i) => i,
                         None => {
                             z_order[k].push(z_used);
@@ -2158,24 +2468,33 @@ impl<'a> GwGradEngine<'a> {
                 }
             }
         }
+    }
+
+    /// Close a streaming pullback: solve the deferred polarizability matrices,
+    /// symmetrise the covectors and hand them back.
+    pub fn qp_pullback_streaming_finish(
+        &self,
+        scr: QpPullbackScratch,
+    ) -> (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>) {
+        let nk = scr.nk;
+        let (naux, nmo) = (scr.naux, scr.nmo);
+        let dbg = |name: &str| std::env::var(name).is_ok();
+        let no_res = dbg("REST_GWGRAD_NORES");
+        let no_imag = dbg("REST_GWGRAD_NOIMAG");
+        let QpPullbackScratch {
+            mut bq,
+            mut bj,
+            mut be,
+            bb,
+            v_imag,
+            v_res,
+            z_order,
+            imag_factors,
+            ..
+        } = scr;
 
         // ---- deferred polarizability pullbacks ----
-        let t_cache = t_cache.elapsed().as_secs_f64();
         let t_polar = Instant::now();
-        let imag_factors: Vec<(Vec<f64>, Vec<f64>)> = self
-            .quad
-            .iter()
-            .map(|&(u, _)| {
-                let mut d = vec![0.0f64; nov];
-                let mut dd = vec![0.0f64; nov];
-                for (idx, &de) in self.de_ia.iter().enumerate() {
-                    d[idx] = -4.0 * de / (de * de + u * u);
-                    dd[idx] =
-                        -4.0 * (u * u - de * de) / ((de * de + u * u) * (de * de + u * u));
-                }
-                (d, dd)
-            })
-            .collect();
         for k in 0..nk {
             for (wi, _) in self.quad.iter().enumerate().take(if no_imag { 0 } else { usize::MAX }) {
                 let (d, dd) = &imag_factors[wi];
@@ -2196,12 +2515,71 @@ impl<'a> GwGradEngine<'a> {
         }
         if grad_timing() {
             eprintln!(
-                "[gw_grad timing]   qp_pullback: cache loop {:8.2}s  polar pullbacks {:8.2}s",
-                t_cache,
+                "[gw_grad timing]   qp_pullback: deferred polar pullbacks {:8.2}s",
                 t_polar.elapsed().as_secs_f64()
             );
         }
         (bq, bj, be, bb)
+    }
+
+    /// Fresh streaming scratch ([`Self::qp_pullback_streaming`]).
+    pub fn qp_pullback_scratch(&self, nk: usize) -> QpPullbackScratch {
+        QpPullbackScratch::new(self, nk)
+    }
+
+    /// Process one page of caches in an open streaming pullback.
+    pub fn qp_pullback_chunk_public(
+        &self,
+        caches: &[QpCache],
+        weights: &[f64],
+        col0: usize,
+        scr: &mut QpPullbackScratch,
+    ) {
+        self.qp_pullback_chunk(caches, weights, col0, scr);
+    }
+
+    /// Bytes of one fully built [`QpCache`] of this engine.
+    pub fn qp_cache_estimate_bytes(&self) -> usize {
+        qp_cache_bytes_estimate(self.naux, self.nmo, self.quad.len())
+    }
+
+    /// Non-streaming [`Self::qp_pullback_streaming`]: every cache resident.
+    ///
+    /// `weights[k][j]` is the derivative of `Omega_k` with respect to the QP
+    /// energy of cache `j`; the `Z` renormalisation of each cache is applied
+    /// here.
+    pub fn qp_pullback(
+        &self,
+        caches: &[&QpCache],
+        weights: &[Vec<f64>],
+    ) -> (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>) {
+        let nk = weights.len();
+        for w in weights {
+            assert_eq!(w.len(), caches.len(), "qp_pullback: weight row length mismatch");
+        }
+        let flat: Vec<f64> = weights.iter().flat_map(|w| w.iter().copied()).collect();
+        let t_cache = Instant::now();
+        let mut scr = QpPullbackScratch::new(self, nk);
+        let owned: Vec<QpCache> = caches
+            .iter()
+            .map(|c| QpCache {
+                target: c.target,
+                omega: c.omega,
+                z_factor: c.z_factor,
+                w_imag: c.w_imag.clone(),
+                y_imag: c.y_imag.clone(),
+                m_imag: c.m_imag.clone(),
+                residues: c.residues.clone(),
+            })
+            .collect();
+        self.qp_pullback_chunk(&owned, &flat, 0, &mut scr);
+        if grad_timing() {
+            eprintln!(
+                "[gw_grad timing]   qp_pullback: cache loop {:8.2}s",
+                t_cache.elapsed().as_secs_f64()
+            );
+        }
+        self.qp_pullback_streaming_finish(scr)
     }
 
     /// Add the pullback of `Tr[V dQ]` to `bq` and `be`, with

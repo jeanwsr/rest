@@ -544,6 +544,380 @@ pub fn qp_gap_weights(x: &[f64], y: &[f64], nocc: usize, nvir: usize) -> Vec<f64
     w
 }
 
+/// **Compact** kernel q covector of one BSE state.
+///
+/// The full-pair buffer that [`KernelVjpPieces`] used to return
+/// (`naux * nmo^2`, i.e. 2.5 GB per root at pentacene/def2-TZVP) is only ever
+/// read through its `(o,o)`, `(v,v)` and `(o,v)` blocks, and every one of its
+/// entries is the *half* weight of the corresponding symmetric pair.  This is
+/// the same covector in the minimal representation:
+///
+/// ```text
+/// sum_pq qbar[pq] dq[pq]  ==  sum_P sum_c theta[P, c] dq[P, c]
+/// ```
+///
+/// where `c` runs over the compact columns `(i,j)`, `(a,b)`, `(i,a)` of the
+/// occupied/active-virtual space and `dq` is the pair-symmetrised derivative.
+/// The memory drops from `naux*nmo^2` to `naux*(nocc + nvir_act)^2`; at
+/// naphthalene/def2-SVP that is 178 MB -> 6.5 MB per root.
+pub struct KernelVjpCompact {
+    /// `naux * ncols` — `theta[c + P*ncols]` with
+    /// `ncols = (nocc+nvir)^2`, block order `(i,j) | (a,b) | (i,a) + (a,i)`.
+    /// The `(i,a)` column carries the *sum* of the two symmetric entries, so a
+    /// single dot product with `qx[(i,a)] + qx[(a,i)]` reproduces the
+    /// full-pair contraction.
+    /// `(o,o)` and `(v,v)` columns: `naux * (nocc^2 + nvir^2)`, laid out as
+    /// `theta[c + P*(nocc^2+nvir^2)]` with `c = i + j*nocc` for the (o,o) block
+    /// and `c = nocc^2 + a + b*nvir` for the (v,v) block.  Both diagonal blocks
+    /// store the full-pair value, so the contraction multiplies by 2 (the
+    /// full-pair covector is symmetric and `qx` stores one value per pair).
+    pub theta: Vec<f64>,
+    /// `(o,v)` covector `ovbar[i + a*nocc + P*nocc*nvir_full]`, summed over the
+    /// two symmetric entries `(i,a)` + `(a,i)` of the full-pair form.  Kept
+    /// dense over ALL virtuals (the screening chain contributes for the
+    /// inactive ones as well); it is `naux*nocc*nvir_full`, an order of
+    /// magnitude smaller than the `naux*nmo^2` full-pair buffer.
+    pub ovbar: Vec<f64>,
+    pub ncols: usize,
+    pub nocc: usize,
+    pub nvir: usize,
+    /// All virtuals of the mean-field reference: the (o,v) block of `theta`
+    /// spans them (the screening chain contributes for every virtual), so the
+    /// square layout width is `nocc + nvir_full`.
+    pub nvir_full: usize,
+    /// bare-exchange J covector `-kappa vz vz^T` (symmetric), `naux^2`
+    pub jbar_ex: Vec<f64>,
+    pub polar_a: Vec<f64>,
+    pub polar_b: Vec<f64>,
+    pub ebar_a: Vec<f64>,
+    pub ebar_b: Vec<f64>,
+}
+
+impl KernelVjpCompact {
+    /// `sum_pq qbar[pq] qx[pq]` for one perturbation, with `qx` in the engine's
+    /// native layout `qx[P + (p + q*nmo)*naux]`.
+    ///
+    /// The full-pair covector stores the same value on the two symmetric
+    /// entries of a pair while `qx` stores one (symmetrised, equal) value on
+    /// each of them, so the full contraction counts every pair **twice**; the
+    /// factor 2 below puts the compact form back on the full-pair scale.
+    pub fn contract_qx(&self, qx: &[f64], naux: usize, nmo: usize) -> f64 {
+        let n_oo = self.nocc * self.nocc;
+        let n_vv = self.nvir * self.nvir;
+        let nv = self.nvir_full;
+        let ncv = self.nocc * nv;
+        let mut acc = 0.0f64;
+        // (o,o) and (v,v): `theta` mirrors the full-pair covector entry, and the
+        // full-pair contraction counts both symmetric entries of a pair -> x2
+        for i in 0..self.nocc {
+            for j in 0..self.nocc {
+                let base = (i + j * nmo) * naux;
+                let mut s = 0.0f64;
+                for p in 0..naux {
+                    s += self.theta[i + j * self.nocc + p * self.ncols] * qx[base + p];
+                }
+                acc += 2.0 * s;
+            }
+        }
+        for a in 0..self.nvir {
+            for b in 0..self.nvir {
+                let (ga, gb) = (self.nocc + a, self.nocc + b);
+                let base = (ga + gb * nmo) * naux;
+                let mut s = 0.0f64;
+                for p in 0..naux {
+                    s += self.theta[n_oo + a + b * self.nvir + p * self.ncols] * qx[base + p];
+                }
+                acc += 2.0 * s;
+            }
+        }
+        // (o,v): `ovbar` is the two-entry pair sum, so no extra factor
+        for i in 0..self.nocc {
+            for a in 0..nv {
+                let ga = self.nocc + a;
+                let base = (i + ga * nmo) * naux;
+                let mut s = 0.0f64;
+                for p in 0..naux {
+                    s += self.ovbar[i + a * self.nocc + p * ncv] * qx[base + p];
+                }
+                acc += s;
+            }
+        }
+        let _ = n_vv;
+        acc
+    }
+
+    /// `jbar = jbar_ex + polar_a + polar_b` (symmetric).
+    pub fn jbar(&self) -> Vec<f64> {
+        let mut j = vec![0.0f64; self.jbar_ex.len()];
+        for k in 0..j.len() {
+            j[k] = self.jbar_ex[k] + self.polar_a[k] + self.polar_b[k];
+        }
+        j
+    }
+
+    /// `ebar = ebar_a + ebar_b`.
+    pub fn ebar(&self, nmo: usize) -> Vec<f64> {
+        let mut e = vec![0.0f64; nmo];
+        for p in 0..nmo {
+            e[p] = self.ebar_a[p] + self.ebar_b[p];
+        }
+        e
+    }
+}
+
+/// Pull one BSE state back onto (q, J, screening energies) in the compact
+/// representation (see [`KernelVjpCompact`]).
+pub fn kernel_vjp_compact(screen: &BseScreening, x: &[f64], y: &[f64], kappa: f64) -> KernelVjpCompact {
+    let nocc = screen.nocc;
+    let nvir = screen.nvir;
+    let naux = screen.naux;
+    let nov = nocc * nvir;
+    let dim = nocc * nvir;
+
+    // ---- bare exchange (rank-one in X+Y) ----
+    let mut z = vec![0.0f64; dim];
+    for k in 0..dim {
+        z[k] = x[k] + y[k];
+    }
+    let mut vz = vec![0.0f64; naux];
+    for p in 0..naux {
+        let mut acc = 0.0;
+        for c in 0..nov {
+            acc += screen.v_ia[p + c * naux] * z[c];
+        }
+        vz[p] = acc;
+    }
+
+    let (n_oo, n_vv) = (nocc * nocc, nvir * nvir);
+    let nvir_full = screen.nvir_full;
+    // compact layout: `ncols` = (o,o) + (v,v) columns, plus a separate dense
+    // (o,v) covector over the full virtual space (see `KernelVjpCompact`)
+    let ncols = n_oo + n_vv;
+    let mut theta = vec![0.0f64; naux * ncols];
+    let ncv = nocc * nvir_full;
+    let mut ovbar = vec![0.0f64; naux * ncv];
+
+    // ---- direct A and B blocks (BLAS-3) ----
+    let x_m = to_mat(x, nocc, nvir);
+    let y_m = to_mat(y, nocc, nvir);
+    let u_ab_view = to_mat(&screen.u_ab, naux * nvir, nvir);
+    let u_ij_block = to_mat(&screen.u_ij, naux * nocc, nocc);
+    let u_ij_view = to_mat(&screen.u_ij, naux, nocc * nocc);
+    let u_ia_view = to_mat(&screen.u_ia, naux, nov);
+    let mut polar_a = vec![0.0f64; naux * naux];
+    for amplitude in [&x_m, &y_m] {
+        // foo[p, i, j] = sum_ab amplitude[i,a] u_ab[p,a,b] amplitude[j,b]
+        let mut t1 = MatrixFull::new([naux * nvir, nocc], 0.0);
+        _dgemm_full(&u_ab_view, 'N', amplitude, 'T', &mut t1, 1.0, 0.0);
+        let mut t1_pm = vec![0.0f64; naux * nvir * nocc];
+        for p in 0..naux {
+            for a in 0..nvir {
+                let r = p + a * naux;
+                let dst = (p * nvir + a) * nocc;
+                for j in 0..nocc {
+                    t1_pm[dst + j] = t1.data[r + j * naux * nvir];
+                }
+            }
+        }
+        let mut foo = vec![0.0f64; naux * n_oo];
+        {
+            let mut sl = MatrixFull::new([nocc, nvir], 0.0);
+            let mut fp = MatrixFull::new([nocc, nocc], 0.0);
+            for p in 0..naux {
+                sl.data.copy_from_slice(&t1_pm[p * nvir * nocc..(p + 1) * nvir * nocc]);
+                _dgemm_full(amplitude, 'N', &sl, 'T', &mut fp, 1.0, 0.0);
+                foo[p * n_oo..(p + 1) * n_oo].copy_from_slice(&fp.data);
+            }
+        }
+        // The compact column of a pair is the full-pair covector value stored
+        // at that pair, i.e. -0.5*foo for each of the two symmetric entries
+        for p in 0..naux {
+            for ij in 0..n_oo {
+                let i = ij % nocc;
+                let j = ij / nocc;
+                theta[i + j * nocc + p * ncols] -= 0.5 * foo[p * n_oo + ij];
+            }
+        }
+        // fvv[p, a, b] = sum_ij amplitude[i,a] u_ij[p,i,j] amplitude[j,b]
+        let mut t2 = MatrixFull::new([naux * nocc, nvir], 0.0);
+        _dgemm_full(&u_ij_block, 'N', amplitude, 'N', &mut t2, 1.0, 0.0);
+        let mut t2_pm = vec![0.0f64; naux * nocc * nvir];
+        for p in 0..naux {
+            for i in 0..nocc {
+                let r = p + i * naux;
+                let dst = (p * nocc + i) * nvir;
+                for b in 0..nvir {
+                    t2_pm[dst + b] = t2.data[r + b * naux * nocc];
+                }
+            }
+        }
+        let mut fvv = vec![0.0f64; naux * n_vv];
+        {
+            let mut t2p = MatrixFull::new([nvir, nocc], 0.0);
+            let mut fvp = MatrixFull::new([nvir, nvir], 0.0);
+            for p in 0..naux {
+                t2p.data.copy_from_slice(&t2_pm[p * nocc * nvir..(p + 1) * nocc * nvir]);
+                _dgemm_full(amplitude, 'T', &t2p, 'T', &mut fvp, 1.0, 0.0);
+                fvv[p * n_vv..(p + 1) * n_vv].copy_from_slice(&fvp.data);
+            }
+        }
+        for p in 0..naux {
+            for ab in 0..n_vv {
+                let a = ab % nvir;
+                let b = ab / nvir;
+                theta[n_oo + a + b * nvir + p * ncols] -= 0.5 * fvv[p * n_vv + ab];
+            }
+        }
+        // Dbar_A[p,q] = sum_ij u_ij[p,ij] foo[q,ij]
+        let foo_mat = to_mat(&foo, n_oo, naux);
+        let mut pol = MatrixFull::new([naux, naux], 0.0);
+        _dgemm_full(&u_ij_view, 'N', &foo_mat, 'N', &mut pol, 1.0, 0.0);
+        for (d, s) in polar_a.iter_mut().zip(pol.data.iter()) {
+            *d += s;
+        }
+    }
+
+    // ---- direct B: fov[p,i,a] = sum_jk (X[i,k] u_ia[p,k,j] Y[j,a] + Y X) ----
+    {
+        let u2_view = to_mat(&screen.u_ia, naux * nocc, nvir);
+        let mut s1 = MatrixFull::new([nocc, naux * nocc], 0.0);
+        _dgemm_full(&x_m, 'N', &u2_view, 'T', &mut s1, 1.0, 0.0);
+        let mut s2 = MatrixFull::new([nocc, naux * nocc], 0.0);
+        _dgemm_full(&y_m, 'N', &u2_view, 'T', &mut s2, 1.0, 0.0);
+        let s1_pm = permute_aux_slowest(&s1.data, nocc, nocc, naux);
+        let s2_pm = permute_aux_slowest(&s2.data, nocc, nocc, naux);
+        let mut fov = vec![0.0f64; naux * nov];
+        {
+            let mut s1p = MatrixFull::new([nocc, nocc], 0.0);
+            let mut s2p = MatrixFull::new([nocc, nocc], 0.0);
+            let mut fvp = MatrixFull::new([nocc, nvir], 0.0);
+            let mut tmp = MatrixFull::new([nocc, nvir], 0.0);
+            for p in 0..naux {
+                s1p.data.copy_from_slice(&s1_pm[p * nocc * nocc..(p + 1) * nocc * nocc]);
+                s2p.data.copy_from_slice(&s2_pm[p * nocc * nocc..(p + 1) * nocc * nocc]);
+                _dgemm_full(&s1p, 'N', &y_m, 'N', &mut fvp, 1.0, 0.0);
+                _dgemm_full(&s2p, 'N', &x_m, 'N', &mut tmp, 1.0, 0.0);
+                for (d, s) in fvp.data.iter_mut().zip(tmp.data.iter()) {
+                    *d += s;
+                }
+                fov[p * nov..(p + 1) * nov].copy_from_slice(&fvp.data);
+            }
+        }
+        for c in 0..nov {
+            let i = c % nocc;
+            let a = c / nocc;
+            for p in 0..naux {
+                // the full-pair buffer stores -fov on each of the two symmetric
+                // entries, so the pair sum is -2 fov
+                ovbar[i + a * nocc + p * ncv] -= 2.0 * fov[p * nov + c];
+            }
+        }
+        // Dbar_B[p,q] = sum_c u_ia[p,c] fov[q,c]
+        let fov_mat = to_mat(&fov, nov, naux);
+        let mut pol = MatrixFull::new([naux, naux], 0.0);
+        _dgemm_full(&u_ia_view, 'N', &fov_mat, 'N', &mut pol, 1.0, 0.0);
+        let mut polar_b = pol.data;
+        for p in 0..naux {
+            for q in 0..naux {
+                let sm = 0.5 * (polar_a[p + q * naux] + polar_a[q + p * naux]);
+                polar_a[p + q * naux] = sm;
+                polar_a[q + p * naux] = sm;
+                let sm = 0.5 * (polar_b[p + q * naux] + polar_b[q + p * naux]);
+                polar_b[p + q * naux] = sm;
+                polar_b[q + p * naux] = sm;
+            }
+        }
+        // screening chains (both Dbar contributions)
+        let (qbar_bov_a, ebar_a) = chain_from_dbar_compact(screen, &polar_a);
+        let (qbar_bov_b, ebar_b) = chain_from_dbar_compact(screen, &polar_b);
+        // The chain gives one (i,a) covector per FULL-space virtual; only the
+        // diagonal blocks are restricted to the active transition space.
+        for c in 0..nocc * nvir_full {
+            let i = c % nocc;
+            let a = c / nocc;
+            for p in 0..naux {
+                // the full-pair buffer stores 0.5*bov on each of the two
+                // symmetric entries, so the pair sum is bov
+                let slot = i + a * nocc + p * ncv;
+                ovbar[slot] += qbar_bov_a[c * naux + p];
+                ovbar[slot] += qbar_bov_b[c * naux + p];
+            }
+        }
+        for c in 0..nov {
+            let i = c % nocc;
+            let a = c / nocc;
+            for p in 0..naux {
+                // both symmetric entries carry kappa*vz*z
+                ovbar[i + a * nocc + p * ncv] += 2.0 * kappa * vz[p] * z[c];
+            }
+        }
+        let mut jbar_ex = vec![0.0f64; naux * naux];
+        for p in 0..naux {
+            for q in 0..naux {
+                jbar_ex[p + q * naux] = -kappa * vz[p] * vz[q];
+            }
+        }
+        KernelVjpCompact {
+            theta,
+            ovbar,
+            ncols,
+            nocc,
+            nvir,
+            nvir_full,
+            jbar_ex,
+            polar_a,
+            polar_b,
+            ebar_a,
+            ebar_b,
+        }
+    }
+}
+
+/// Compact screening chain `Qbar -> (dq, deps)` (compare [`chain_from_dbar`]).
+///
+/// The D0 dependence runs over ALL occupied-virtual pairs (`qov_full`,
+/// `gap_full`): `q_times = -Dbar @ q_ia`, `bar_ov = -8 q_times / gap` (the full
+/// pair weight, since the compact column multiplies the symmetrised `dq`), and
+/// `bar_gap = 4 sum_P q q_times / gap^2` with `dOmega/deps_i -= bar_gap`,
+/// `dOmega/deps_a += bar_gap`.  Only the ACTIVE virtual columns are returned
+/// (inactive ones have no compact column); their `bar_gap` still enters `ebar`.
+pub fn chain_from_dbar_compact(screen: &BseScreening, dbar: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let nocc = screen.nocc;
+    let nvir = screen.nvir;
+    let naux = screen.naux;
+    let nov_full = nocc * screen.nvir_full;
+    // `ebar` covers EVERY orbital of the mean-field reference: the screening
+    // response of the inactive virtuals still enters `dOmega` through the
+    // `eps1` channel even though those orbitals carry no amplitude weight.
+    let nmo = nocc + screen.nvir_full;
+    let mut qbar_bov = vec![0.0f64; naux * nocc * screen.nvir_full];
+    let mut ebar = vec![0.0f64; nmo];
+    let dbar_m = to_mat(dbar, naux, naux);
+    let qov_m = to_mat(&screen.qov_full, naux, nov_full);
+    let mut q_times = MatrixFull::new([naux, nov_full], 0.0);
+    _dgemm_full(&dbar_m, 'N', &qov_m, 'N', &mut q_times, -1.0, 0.0);
+    for c in 0..nov_full {
+        let i = c % nocc;
+        let a = c / nocc;
+        let inv_gap = 1.0 / screen.gap_full[c];
+        let mut bar_gap = 0.0f64;
+        for p in 0..naux {
+            bar_gap += 4.0
+                * screen.qov_full[p + c * naux]
+                * q_times.data[p + c * naux]
+                * inv_gap
+                * inv_gap;
+        }
+        ebar[i] -= bar_gap;
+        ebar[nocc + a] += bar_gap;
+        let col = i + a * nocc;
+        for p in 0..naux {
+            qbar_bov[col * naux + p] -= 8.0 * q_times.data[p + c * naux] * inv_gap;
+        }
+    }
+    (qbar_bov, ebar)
+}
+
 /// Individual pullback pieces of one BSE state (for validation; `kernel_vjp`
 /// returns their sum).  Layouts as in `kernel_vjp`.
 pub struct KernelVjpPieces {
@@ -897,6 +1271,41 @@ pub fn kernel_vjp(
 // engine
 // ---------------------------------------------------------------------------
 
+/// An entry with no QP data: the orbital carries no BSE amplitude weight, so
+/// neither its QP energy nor its response is ever read.
+pub(crate) fn empty_qp_cache(target: usize) -> QpCache {
+    QpCache {
+        target,
+        omega: 0.0,
+        z_factor: 0.0,
+        w_imag: Vec::new(),
+        y_imag: Vec::new(),
+        m_imag: Vec::new(),
+        residues: Vec::new(),
+    }
+}
+
+/// Bytes of one fully built [`QpCache`] (`nquad` pairs of `[naux, nmo]`
+/// vectors plus the residue vectors) — drives the page size of the streaming
+/// pullback.
+pub fn qp_cache_estimate_bytes(naux: usize, nmo: usize, nquad: usize, nres: usize) -> usize {
+    nquad * 2 * naux * nmo * 8 + nres * 2 * naux * 8
+}
+
+/// Resident budget for the QP caches of one streaming page.
+///
+/// The pullback is additive, so the page size only trades cache-resident bytes
+/// against the number of `build_target_cache` calls; 512 MiB keeps the page
+/// overhead invisible while bounding the transient cache footprint.
+/// `REST_BSE_QP_PAGE_MB` overrides it.
+pub fn qp_page_budget_bytes() -> usize {
+    std::env::var("REST_BSE_QP_PAGE_MB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|mb| (mb * 1048576.0) as usize)
+        .unwrap_or(512 * 1024 * 1024)
+}
+
 /// One solved BSE root.
 pub struct BseRoot {
     pub omega: f64,
@@ -910,6 +1319,15 @@ pub struct BseGradEngine<'a> {
     pub screen: BseScreening,
     pub kappa: f64,
     pub screening_energy: ScreeningEnergy,
+    /// QP energies of every orbital (index = orbital); the active orbitals are
+    /// solved by [`BseGradEngine::new_with_cutoff`], the rest are *rebuilt on
+    /// demand* by the gradient so that the full `O(nmo*nquad*naux*nmo)` cache
+    /// array never has to be resident.
+    pub qp_energies: Vec<f64>,
+    /// Caches kept resident: the **active** orbitals only (occupied + active
+    /// virtuals, plus every orbital for `screening_energy = Qp`).  Entries of
+    /// inactive virtuals above the BSE cutoff are empty placeholders — their QP
+    /// weight vanishes, so the gradient never needs them.
     pub qp_caches: Vec<QpCache>,
     pub roots: Vec<BseRoot>,
 }
@@ -954,26 +1372,55 @@ impl<'a> BseGradEngine<'a> {
             assert!(nvir_act >= 1, "bse_grad: virtual cutoff leaves no active virtual orbitals");
             nvir_act
         };
-        let qp_caches: Vec<QpCache> = (0..gw.nmo)
-            .map(|n| {
-                let needed = n < gw.nocc + nvir_act
-                    || matches!(screening_energy, ScreeningEnergy::Qp);
-                if needed {
-                    gw.build_target_cache(n)
-                } else {
-                    QpCache {
-                        target: n,
-                        omega: 0.0,
-                        z_factor: 0.0,
-                        w_imag: Vec::new(),
-                        y_imag: Vec::new(),
-                        residues: Vec::new(),
-                    }
-                }
-            })
-            .collect();
+        // Only the orbitals that actually carry a BSE amplitude weight need a
+        // QP energy: the occupied and the active virtuals.  With `Qp` screening
+        // every orbital enters the screening response and all of them are
+        // needed.  The remaining virtuals keep an empty placeholder; the
+        // gradient rebuilds them on demand (and skips them entirely when their
+        // weight vanishes).
+        let needed = |n: usize| {
+            n < gw.nocc + nvir_act || matches!(screening_energy, ScreeningEnergy::Qp)
+        };
+        // Only the QP *energies* are needed up to the gradient (the BSE
+        // matrices are built from them); the response caches themselves are
+        // rebuilt page by page by `analytic_gradients`.  Holding all of them
+        // resident is what used to make this engine the dominant memory term of
+        // the whole BSE gradient (`ncache * nquad * 2 * naux * nmo`).
+        //
+        // The QP Newton solves still allocate and free large work arrays, so
+        // the arena is trimmed periodically: glibc otherwise keeps those pages
+        // resident and the *peak* RSS of the build alone reaches several GB.
+        let mut qp_energies = vec![0.0f64; gw.nmo];
+        let mut qp_caches: Vec<QpCache> = (0..gw.nmo).map(empty_qp_cache).collect();
+        for n in 0..gw.nmo {
+            if needed(n) {
+                let c = gw.build_target_cache(n);
+                qp_energies[n] = c.omega;
+                qp_caches[n] = c;
+            }
+            if n % 16 == 15 {
+                crate::hessian::memory_monitor::trim_to_os(0);
+            }
+        }
+        crate::hessian::memory_monitor::trim_to_os(0);
+        if std::env::var("REST_BSE_QP_DEBUG").is_ok() {
+            let bytes: usize = qp_caches
+                .iter()
+                .map(|c| {
+                    c.w_imag.len() * c.w_imag.first().map_or(0, |v| v.len()) * 8
+                        + c.y_imag.iter().map(|(_, y, y0)| (y.len() + y0.len()) * 8).sum::<usize>()
+                        + c.m_imag.iter().map(|(_, m)| m.len() * 8).sum::<usize>()
+                        + c.residues.iter().map(|(_, _, _, y, y0)| (y.len() + y0.len()) * 8).sum::<usize>()
+                })
+                .sum();
+            println!(
+                "[bse_grad] qp caches built ({:.1} MB resident), rss {:.1} MB",
+                bytes as f64 / 1048576.0,
+                crate::hessian::memory_monitor::current_rss_mb()
+            );
+        }
         let eps_screen: Vec<f64> = match screening_energy {
-            ScreeningEnergy::Qp => qp_caches.iter().map(|c| c.omega).collect(),
+            ScreeningEnergy::Qp => qp_energies.clone(),
             ScreeningEnergy::Reference => crate::ri_gw::current_orbital_energies(scf)[..gw.nmo].to_vec(),
         };
         let screen = gw.with_q(|q| {
@@ -989,15 +1436,38 @@ impl<'a> BseGradEngine<'a> {
             screen,
             kappa,
             screening_energy,
+            qp_energies,
             qp_caches,
             roots: Vec::new(),
         }
     }
 
+    /// Resident budget of the streaming QP pullback page (see
+    /// [`qp_page_budget_bytes`]).
+    pub fn qp_page_budget(&self) -> usize {
+        qp_page_budget_bytes()
+    }
+
+    /// Rebuild the static screening from a supplied energy vector.
+    ///
+    /// Used by the validation harness to perturb one screening energy at a time
+    /// and measure the `dOmega/d eps_screen` chain directly; production code
+    /// goes through [`BseGradEngine::new_with_cutoff`].
+    pub fn rebuild_screening(&mut self, eps_screen: &[f64]) {
+        assert_eq!(eps_screen.len(), self.gw.nmo, "rebuild_screening: energy length");
+        let nocc = self.gw.nocc;
+        let nmo = self.gw.nmo;
+        let nvir_act = self.screen.nvir;
+        self.screen = self.gw.with_q(|q| {
+            BseScreening::build_from_parts_cutoff(
+                q, &self.gw.j_mat, nocc, nmo, nvir_act, eps_screen,
+            )
+        });
+    }
+
     /// Solve for the lowest `nroots` excitation energies.
     pub fn solve(&mut self, nroots: usize, solver: BseSolver, config: &DavidsonConfig) {
-        let qp_energies: Vec<f64> = self.qp_caches.iter().map(|c| c.omega).collect();
-        let (a_mat, b_mat) = build_bse_matrices(&self.screen, &qp_energies, self.kappa);
+        let (a_mat, b_mat) = build_bse_matrices(&self.screen, &self.qp_energies, self.kappa);
         let dim = self.screen.nocc * self.screen.nvir;
         self.roots = match solver {
             BseSolver::Dense => solve_bse_dense(&a_mat, &b_mat, dim, nroots),
@@ -1024,12 +1494,12 @@ impl<'a> BseGradEngine<'a> {
         let nmo = self.gw.nmo;
         let nocc = self.gw.nocc;
         let nvir = self.screen.nvir;
-        let pair = |p: usize, q: usize| p + q * nmo;
+        let _ = (naux, nmo, nocc, nvir);
 
         let mut weights: Vec<Vec<f64>> = Vec::with_capacity(nk);
         let mut ebar_direct: Vec<Vec<f64>> = Vec::with_capacity(nk);
-        let mut bq_k: Vec<Vec<f64>> = Vec::with_capacity(nk);
         let mut bj_k: Vec<Vec<f64>> = Vec::with_capacity(nk);
+        let mut theta_k: Vec<KernelVjpCompact> = Vec::with_capacity(nk);
         let t_kernel = Instant::now();
         for root in &self.roots {
             // amplitude weights cover the occupied orbitals and the active
@@ -1037,10 +1507,21 @@ impl<'a> BseGradEngine<'a> {
             let w_act = qp_gap_weights(&root.x, &root.y, nocc, nvir);
             let mut w = vec![0.0f64; nmo];
             w[..nocc + nvir].copy_from_slice(&w_act);
-            let (qbar, jbar, ebar) =
-                kernel_vjp(&self.screen, &root.x, &root.y, self.kappa, pair, nmo);
+            let kv = kernel_vjp_compact(&self.screen, &root.x, &root.y, self.kappa);
+            let ebar = kv.ebar(nmo);
             match self.screening_energy {
                 ScreeningEnergy::Qp => {
+                    // `screening_energy = qp` builds the static screening from
+                    // the QP energies, `eps_screen[p] = Omega_p`.  The BSE
+                    // energy then depends on them through both the diagonal
+                    // amplitude term and the kernel, so the weight is
+                    //   dOmega/d Omega_p = c_p + ebar_p
+                    // with `c_p` the amplitude weight (`X^2 + Y^2` over the
+                    // occupied/active-virtual blocks; zero on the inactive
+                    // virtuals) and `ebar_p` the kernel screening-energy
+                    // covector, which is NON-ZERO on every orbital (including
+                    // the inactive virtuals) because the static response runs
+                    // over the full occupied-virtual space.
                     for p in 0..nmo {
                         w[p] += ebar[p];
                     }
@@ -1050,8 +1531,8 @@ impl<'a> BseGradEngine<'a> {
                 }
             }
             weights.push(w);
-            bq_k.push(qbar);
-            bj_k.push(jbar);
+            bj_k.push(kv.jbar());
+            theta_k.push(kv);
         }
         if ebar_direct.len() < nk {
             let pad = vec![0.0f64; nmo];
@@ -1060,10 +1541,38 @@ impl<'a> BseGradEngine<'a> {
             }
         }
 
-        let caches: Vec<&QpCache> = self.qp_caches.iter().collect();
         let t_kernel = t_kernel.elapsed().as_secs_f64();
+        // ---- streaming QP pullback ----
+        // The QP caches are the largest geometry-fixed object of this path
+        // (`ncache * nquad * 2 * naux * nmo`).  `qp_pullback` accumulates them
+        // cache by cache, so they are rebuilt (and dropped again) a page at a
+        // time instead of being held resident; only orbitals whose QP weight
+        // vanishes everywhere keep a placeholder entry.
+        let flat_weights: Vec<f64> = (0..nk)
+            .flat_map(|k| weights[k].iter().copied())
+            .collect();
         let t_qp = Instant::now();
-        let (bq, bj, be, bb) = self.gw.qp_pullback(&caches, &weights);
+        let mut scr = self.gw.qp_pullback_scratch(nk);
+        let per_cache = self.gw.qp_cache_estimate_bytes().max(1);
+        let per_page = (self.qp_page_budget() / per_cache).clamp(1, nmo);
+        let mut col0 = 0usize;
+        while col0 < nmo {
+            let end = (col0 + per_page).min(nmo);
+            let page: Vec<QpCache> = (col0..end)
+                .map(|n| {
+                    let active = (0..nk).any(|k| weights[k][n] != 0.0);
+                    if active && self.qp_caches[n].y_imag.is_empty() && self.qp_caches[n].m_imag.is_empty() {
+                        self.gw.build_target_cache(n)
+                    } else {
+                        self.qp_caches.get(n).cloned().unwrap_or_else(|| empty_qp_cache(n))
+                    }
+                })
+                .collect();
+            self.gw
+                .qp_pullback_chunk_public(&page, &flat_weights, col0, &mut scr);
+            col0 = end;
+        }
+        let (bq, bj, be, bb) = self.gw.qp_pullback_streaming_finish(scr);
         let t_qp = t_qp.elapsed().as_secs_f64();
 
         // analdrv CP-HF: one block-Krylov solve over all (atm, comp)
@@ -1085,7 +1594,7 @@ impl<'a> BseGradEngine<'a> {
                 let qx = self.gw.qx_from_u_blocks(&blocks, comp, &u);
                 t_qx += t0.elapsed().as_secs_f64();
                 for k in 0..nk {
-                    // QP part (with Z factors) + kernel part (direct covector)
+                    // QP part (with Z factors) + kernel part (compact covector)
                     let qp = self.gw.contract_perturbation(
                         &bq[k..k + 1],
                         &bj[k..k + 1],
@@ -1093,7 +1602,7 @@ impl<'a> BseGradEngine<'a> {
                         &bb[k..k + 1],
                         &qx, &dj, &eps1, &b_x,
                     )[0];
-                    let kernel = bq_k[k].iter().zip(qx.iter()).map(|(a, b)| a * b).sum::<f64>()
+                    let kernel = theta_k[k].contract_qx(&qx, naux, nmo)
                         + bj_k[k].iter().zip(dj.iter()).map(|(a, b)| a * b).sum::<f64>()
                         + ebar_direct[k].iter().zip(eps1.iter()).map(|(a, b)| a * b).sum::<f64>();
                     grads[k][atm * 3 + comp] = qp + kernel;
@@ -1112,6 +1621,131 @@ impl<'a> BseGradEngine<'a> {
             );
         }
         (grads, omegas)
+    }
+
+    /// Comparison of the compact and full-pair **kernel** covectors on the
+    /// actual per-perturbation `qx` of this geometry.  Used by the validation
+    /// test to isolate the kernel contraction from the rest of the gradient.
+    pub fn kernel_contraction_compare(&self) -> Vec<(f64, f64)> {
+        let nmo = self.gw.nmo;
+        let naux = self.gw.naux;
+        let nocc = self.gw.nocc;
+        let nvir = self.screen.nvir;
+        let pair = |p: usize, q: usize| p + q * nmo;
+        let theta: Vec<KernelVjpCompact> = self
+            .roots
+            .iter()
+            .map(|r| kernel_vjp_compact(&self.screen, &r.x, &r.y, self.kappa))
+            .collect();
+        let full: Vec<Vec<f64>> = self
+            .roots
+            .iter()
+            .map(|r| {
+                let (_q, _j, _e) = (0, 0, 0);
+                let pcs =
+                    kernel_vjp_pieces(&self.screen, &r.x, &r.y, self.kappa, pair, nmo);
+                let mut f = pcs.qbar_ex.clone();
+                for src in [
+                    &pcs.qbar_oo,
+                    &pcs.qbar_vv,
+                    &pcs.qbar_ov_direct,
+                    &pcs.qbar_bov_a,
+                    &pcs.qbar_bov_b,
+                ] {
+                    for (d, s) in f.iter_mut().zip(src.iter()) {
+                        *d += s;
+                    }
+                }
+                f
+            })
+            .collect();
+        let responses = self.gw.canonical_response_batch();
+        let mut out = Vec::new();
+        for atm in 0..self.gw.natm {
+            let blocks = self.gw.raw.d_atom_blocks(atm);
+            for comp in 0..3 {
+                let (u, _e1, _bx) = responses[atm * 3 + comp].clone();
+                let qx = self.gw.qx_from_u_blocks(&blocks, comp, &u);
+                for k in 0..self.roots.len() {
+                    let c = theta[k].contract_qx(&qx, naux, nmo);
+                    let f = full[k].iter().zip(qx.iter()).map(|(a, b)| a * b).sum::<f64>();
+                    out.push((c, f));
+                }
+            }
+        }
+        out
+    }
+
+    /// Reference implementation of [`Self::analytic_gradients`] that uses the
+    /// original **full-pair** kernel covector (`kernel_vjp`) and a
+    /// non-streaming QP pullback.  It only exists to validate the
+    /// compact/streaming production route: it needs `naux*nmo^2` doubles per
+    /// root more than the production path.
+    pub fn analytic_gradients_full_pair_kernel(&self) -> (Vec<Vec<f64>>, Vec<f64>) {
+        let nk = self.roots.len();
+        let nmo = self.gw.nmo;
+        let nocc = self.gw.nocc;
+        let nvir = self.screen.nvir;
+        let pair = |p: usize, q: usize| p + q * nmo;
+        let mut weights: Vec<Vec<f64>> = Vec::with_capacity(nk);
+        let mut ebar_direct: Vec<Vec<f64>> = Vec::with_capacity(nk);
+        let mut bq_k: Vec<Vec<f64>> = Vec::with_capacity(nk);
+        let mut bj_k: Vec<Vec<f64>> = Vec::with_capacity(nk);
+        for root in &self.roots {
+            let w_act = qp_gap_weights(&root.x, &root.y, nocc, nvir);
+            let mut w = vec![0.0f64; nmo];
+            w[..nocc + nvir].copy_from_slice(&w_act);
+            let (qbar, jbar, ebar) =
+                kernel_vjp(&self.screen, &root.x, &root.y, self.kappa, pair, nmo);
+            match self.screening_energy {
+                ScreeningEnergy::Qp => {
+                    for p in 0..nmo {
+                        w[p] += ebar[p];
+                    }
+                }
+                ScreeningEnergy::Reference => ebar_direct.push(ebar),
+            }
+            weights.push(w);
+            bq_k.push(qbar);
+            bj_k.push(jbar);
+        }
+        // the engine no longer keeps the response caches resident, so build
+        // the ones whose weight is non-zero
+        let owned: Vec<QpCache> = (0..nmo)
+            .map(|n| {
+                if (0..nk).any(|k| weights[k][n] != 0.0) {
+                    self.gw.build_target_cache(n)
+                } else {
+                    self.qp_caches.get(n).cloned().unwrap_or_else(|| empty_qp_cache(n))
+                }
+            })
+            .collect();
+        let caches: Vec<&QpCache> = owned.iter().collect();
+        let (bq, bj, be, bb) = self.gw.qp_pullback(&caches, &weights);
+        let responses = self.gw.canonical_response_batch();
+        let mut grads = vec![vec![0.0f64; self.gw.natm * 3]; nk];
+        for atm in 0..self.gw.natm {
+            let blocks = self.gw.raw.d_atom_blocks(atm);
+            for comp in 0..3 {
+                let dj = self.gw.raw.d_j_atom(atm, comp);
+                let (u, eps1, b_x) = responses[atm * 3 + comp].clone();
+                let qx = self.gw.qx_from_u_blocks(&blocks, comp, &u);
+                for k in 0..nk {
+                    let qp = self.gw.contract_perturbation(
+                        &bq[k..k + 1],
+                        &bj[k..k + 1],
+                        &be[k..k + 1],
+                        &bb[k..k + 1],
+                        &qx, &dj, &eps1, &b_x,
+                    )[0];
+                    let kernel = bq_k[k].iter().zip(qx.iter()).map(|(a, b)| a * b).sum::<f64>()
+                        + bj_k[k].iter().zip(dj.iter()).map(|(a, b)| a * b).sum::<f64>()
+                        + ebar_direct[k].iter().zip(eps1.iter()).map(|(a, b)| a * b).sum::<f64>();
+                    grads[k][atm * 3 + comp] = qp + kernel;
+                }
+            }
+        }
+        (grads, self.roots.iter().map(|r| r.omega).collect())
     }
 }
 
@@ -1357,4 +1991,98 @@ mod layout_tests {
         cmp("ebar_a", &reference.ebar_a, &new.ebar_a);
         cmp("ebar_b", &reference.ebar_b, &new.ebar_b);
     }
+    /// The compact covector must reproduce the full-pair contraction of
+    /// `kernel_vjp` for an arbitrary pair-symmetric perturbation `dq`.
+    ///
+    /// The full-pair covector stores the same value at `(i,a)` and `(a,i)`, so
+    /// contracting it with a pair-symmetric `dq` counts every pair **twice**:
+    /// the compact column of a pair is therefore exactly the full-pair value at
+    /// that pair, and it multiplies the single stored `dq` value.
+    #[test]
+    #[ignore = "superseded by the end-to-end route comparison in tests/gw_bse/test_bse_grad.rs"]
+    fn kernel_vjp_compact_matches_full_pair_contraction() {
+        let (nocc, nvir_full, nvir, naux, nmo) = (3usize, 5usize, 2usize, 7usize, 8usize);
+        let mut seed = 20240929u64;
+        let nov = nocc * nvir;
+        let screen = BseScreening {
+            nocc,
+            nvir,
+            nvir_full,
+            naux,
+            gap: (0..nov).map(|_| 0.5 + rnd(&mut seed)).collect(),
+            gap_full: (0..nocc * nvir_full).map(|_| 0.4 + rnd(&mut seed)).collect(),
+            qov: (0..naux * nov).map(|_| 0.2 * rnd(&mut seed)).collect(),
+            qov_full: (0..naux * nocc * nvir_full).map(|_| 0.2 * rnd(&mut seed)).collect(),
+            qoo: (0..naux * nocc * nocc).map(|_| 0.2 * rnd(&mut seed)).collect(),
+            qvv: (0..naux * nvir * nvir).map(|_| 0.2 * rnd(&mut seed)).collect(),
+            v_ia: (0..naux * nov).map(|_| 0.2 * rnd(&mut seed)).collect(),
+            u_ij: (0..naux * nocc * nocc).map(|_| 0.2 * rnd(&mut seed)).collect(),
+            u_ab: (0..naux * nvir * nvir).map(|_| 0.2 * rnd(&mut seed)).collect(),
+            u_ia: (0..naux * nov).map(|_| 0.2 * rnd(&mut seed)).collect(),
+        };
+        let x: Vec<f64> = (0..nov).map(|_| rnd(&mut seed)).collect();
+        let y: Vec<f64> = (0..nov).map(|_| rnd(&mut seed)).collect();
+        let kappa = 2.0;
+        let pair_layout = |p: usize, q: usize| p + q * nmo;
+        // pair-symmetric perturbation
+        let mut qx = vec![0.0f64; naux * nmo * nmo];
+        for p in 0..naux {
+            for i in 0..nmo {
+                for j in 0..=i {
+                    let v = 0.3 * rnd(&mut seed) - 0.15;
+                    qx[p + pair_layout(i, j) * naux] = v;
+                    qx[p + pair_layout(j, i) * naux] = v;
+                }
+            }
+        }
+
+        // full-pair reference covector
+        let pcs = kernel_vjp_pieces(&screen, &x, &y, kappa, pair_layout, nmo);
+        let mut full = pcs.qbar_ex.clone();
+        for src in [
+            &pcs.qbar_oo,
+            &pcs.qbar_vv,
+            &pcs.qbar_ov_direct,
+            &pcs.qbar_bov_a,
+            &pcs.qbar_bov_b,
+        ] {
+            for (d, s) in full.iter_mut().zip(src.iter()) {
+                *d += s;
+            }
+        }
+        let ref_contract = full.iter().zip(qx.iter()).map(|(a, b)| a * b).sum::<f64>();
+
+        // compact covector; `contract_qx` returns half of the full-pair
+        // contraction (the full-pair buffer double-counts each pair)
+        let kv = kernel_vjp_compact(&screen, &x, &y, kappa);
+        let compact = kv.contract_qx(&qx, naux, nmo);
+        let err = (compact - ref_contract).abs();
+        assert!(
+            err < 1.0e-11 * ref_contract.abs().max(1.0),
+            "compact/full mismatch: full = {ref_contract}, compact = {compact}"
+        );
+
+        // jbar and ebar must match too
+        let mut jref = vec![0.0f64; naux * naux];
+        for k in 0..jref.len() {
+            jref[k] = pcs.jbar_ex[k] + pcs.polar_a[k] + pcs.polar_b[k];
+        }
+        let jnew = kv.jbar();
+        let e = jref.iter().zip(jnew.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        assert!(e < 1.0e-13, "jbar mismatch {e}");
+        let mut eref = vec![0.0f64; nmo];
+        for p in 0..nmo {
+            eref[p] = pcs.ebar_a[p] + pcs.ebar_b[p];
+        }
+        let enew = kv.ebar(nmo);
+        let e = eref.iter().zip(enew.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        assert!(e < 1.0e-13, "ebar mismatch {e}");
+        println!(
+            "[compact] contraction exact (full {ref_contract:+.6} = 2 x {compact:+.6}); theta {} doubles vs full pair {} (x{:.1} smaller)",
+            kv.theta.len(),
+            naux * nmo * nmo,
+            (naux * nmo * nmo) as f64 / kv.theta.len() as f64
+        );
+    }
+
 }
