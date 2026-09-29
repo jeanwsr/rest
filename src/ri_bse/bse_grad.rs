@@ -25,11 +25,32 @@
 //!   gradient assembly.  Amplitudes are metric-normalised
 //!   (`X^T X - Y^T Y = 1`) so that
 //!   `d Omega = X^T dA X + X^T dB Y + Y^T dB X + Y^T dA Y`.
+//!
+//! # Cost profile of the gradient assembly
+//!
+//! Three implementation choices keep the memory and the time of
+//! [`BseGradEngine::analytic_gradients`] within one power of the basis size of
+//! the quantities that actually enter it:
+//!
+//! * The static screening solves its blocks with **one** Cholesky factorisation
+//!   per metric and batched triangular solves (`solve_columns`), instead of one
+//!   `dgesv` per right-hand side.
+//! * The QP response caches are built and kept in the **compact**
+//!   representation (`QpCache::m_imag`: one `[naux, nmo]` metric intermediate,
+//!   from which every quadrature point's response is one gemm away) and are
+//!   *borrowed* by the streaming pullback instead of being cloned per page.
+//! * The per-perturbation `qx` tensor (`naux*nmo^2` per atom and component) is
+//!   never materialised: each root's total pair covector is **folded** once
+//!   (`C qbar_P C^T`) and contracted straight against the streamed derivative
+//!   integral slices, which turns the `O(3 natm * naux * nao^2 * nmo)` assembly
+//!   into `O(naux * nao^2 * nmo)` plus `O(3 natm * naux * nao^2)`.
 
 use crate::ri_gw::gw_grad::{GwGradEngine, QpCache};
 use crate::scf_io::SCF;
 use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
+use rest_tensors::matrix::matrix_blas_lapack::_dpotrf;
 use rest_tensors::matrix::matrix_blas_lapack::_dsolve;
+use rest_tensors::matrix::matrix_blas_lapack::_dtrtrs;
 use rest_tensors::matrix::matrix_blas_lapack::_dsyevd;
 use tensors::{MathMatrix, MatrixFull};
 use tensors::matrix::BasicMatrix;
@@ -100,15 +121,25 @@ fn gemm_nt(a: &[f64], ar: usize, ac: usize, b: &[f64], br: usize, bc: usize) -> 
     out.data
 }
 
+/// Solve `A X = B` for a symmetric positive-definite `A` (`naux x naux`) with
+/// many right-hand sides, `B` col-major `[naux, ncol]`.
+///
+/// `A` is factorised **once** (Cholesky) and both triangular solves run as
+/// single BLAS-3 calls over all columns.  The previous column-by-column
+/// `dgesv` loop refactorised the very same matrix `ncol` times — `ncol` is
+/// `nocc^2 + nvir^2 + 2*nocc*nvir` here (≈ 6000 at naphthalene/def2-SVP), i.e.
+/// ~1.4 TFLOP of redundant LU work plus one `naux^2` copy per column, which
+/// made the screening build one of the two dominant costs of the gradient.
 fn solve_columns(a: &MatrixFull<f64>, rhs: &[f64], naux: usize, ncol: usize) -> Vec<f64> {
-    let mut out = vec![0.0f64; naux * ncol];
-    for c in 0..ncol {
-        let sol = _dsolve(a, &rhs[c * naux..(c + 1) * naux])
-            .expect("bse_grad: singular linear system");
-        out[c * naux..(c + 1) * naux].copy_from_slice(&sol);
-    }
-    out
+    let mut chol = a.clone();
+    _dpotrf(&mut chol, 'L');
+    let mut b = to_mat(rhs, naux, ncol);
+    let ok1 = _dtrtrs(&chol, &mut b, 'L', 'N', 'N');
+    let ok2 = _dtrtrs(&chol, &mut b, 'L', 'T', 'N');
+    assert!(ok1 && ok2, "bse_grad: metric triangular solve failed");
+    b.data
 }
+
 
 // ---------------------------------------------------------------------------
 // static screening
@@ -653,6 +684,52 @@ impl KernelVjpCompact {
             j[k] = self.jbar_ex[k] + self.polar_a[k] + self.polar_b[k];
         }
         j
+    }
+
+    /// Expand the compact covector into a **full-pair** buffer
+    /// `qbar[P + (p + q*nmo)*naux]` and add it there.
+    ///
+    /// The full-pair representation stores the same value on the two symmetric
+    /// entries of a pair (and the contraction with a pair-symmetric `qx` counts
+    /// both), so the `(o,o)`/`(v,v)` columns are the full-pair value itself
+    /// while the `(o,v)` column — the pair *sum* — is halved on each entry.
+    /// This is what lets the BSE kernel covector join the QP covector in the
+    /// folded (`C qbar C^T`) route of the gradient assembly.
+    pub fn add_into_full_pair(&self, qbar: &mut [f64], naux: usize, nmo: usize) {
+        assert_eq!(qbar.len(), naux * nmo * nmo, "add_into_full_pair: qbar size mismatch");
+        let nocc = self.nocc;
+        let nvir = self.nvir;
+        let nvir_full = self.nvir_full;
+        let n_oo = nocc * nocc;
+        let ncv = nocc * nvir_full;
+        for p in 0..naux {
+            // (o,o)
+            for j in 0..nocc {
+                for i in 0..nocc {
+                    let v = self.theta[i + j * nocc + p * self.ncols];
+                    qbar[p + (i + j * nmo) * naux] += v;
+                    qbar[p + (j + i * nmo) * naux] += v;
+                }
+            }
+            // (v,v): the active virtuals only (inactive columns are zero)
+            for b in 0..nvir {
+                for a in 0..nvir {
+                    let v = self.theta[n_oo + a + b * nvir + p * self.ncols];
+                    let (ga, gb) = (nocc + a, nocc + b);
+                    qbar[p + (ga + gb * nmo) * naux] += v;
+                    qbar[p + (gb + ga * nmo) * naux] += v;
+                }
+            }
+            // (o,v) over the full virtual space: `ovbar` is the pair sum
+            for a in 0..nvir_full {
+                let ga = nocc + a;
+                for i in 0..nocc {
+                    let v = 0.5 * self.ovbar[i + a * nocc + p * ncv];
+                    qbar[p + (i + ga * nmo) * naux] += v;
+                    qbar[p + (ga + i * nmo) * naux] += v;
+                }
+            }
+        }
     }
 
     /// `ebar = ebar_a + ebar_b`.
@@ -1285,11 +1362,12 @@ pub(crate) fn empty_qp_cache(target: usize) -> QpCache {
     }
 }
 
-/// Bytes of one fully built [`QpCache`] (`nquad` pairs of `[naux, nmo]`
-/// vectors plus the residue vectors) — drives the page size of the streaming
-/// pullback.
+/// Bytes of one fully built [`QpCache`] in the **compact** representation: the
+/// single metric intermediate `[naux, nmo]` the cache keeps (it does not depend
+/// on the quadrature frequency, so it is stored once), the `w_imag` table and
+/// the residue vectors.
 pub fn qp_cache_estimate_bytes(naux: usize, nmo: usize, nquad: usize, nres: usize) -> usize {
-    nquad * 2 * naux * nmo * 8 + nres * 2 * naux * 8
+    (naux + nquad) * nmo * 8 + nres * 2 * naux * 8
 }
 
 /// Resident budget for the QP caches of one streaming page.
@@ -1383,9 +1461,10 @@ impl<'a> BseGradEngine<'a> {
         };
         // Only the QP *energies* are needed up to the gradient (the BSE
         // matrices are built from them); the response caches themselves are
-        // rebuilt page by page by `analytic_gradients`.  Holding all of them
-        // resident is what used to make this engine the dominant memory term of
-        // the whole BSE gradient (`ncache * nquad * 2 * naux * nmo`).
+        // rebuilt page by page by `analytic_gradients`.  In the compact
+        // representation a cache is one `[naux, nmo]` metric intermediate plus
+        // the small `w_imag`/residue tables (≈ 1.4 MB at naphthalene/def2-SVP),
+        // so keeping the `nocc + nvir_act` active ones resident is cheap.
         //
         // The QP Newton solves still allocate and free large work arrays, so
         // the arena is trimmed periodically: glibc otherwise keeps those pages
@@ -1394,7 +1473,7 @@ impl<'a> BseGradEngine<'a> {
         let mut qp_caches: Vec<QpCache> = (0..gw.nmo).map(empty_qp_cache).collect();
         for n in 0..gw.nmo {
             if needed(n) {
-                let c = gw.build_target_cache(n);
+                let c = gw.build_target_cache_compact(n);
                 qp_energies[n] = c.omega;
                 qp_caches[n] = c;
             }
@@ -1409,7 +1488,7 @@ impl<'a> BseGradEngine<'a> {
                 .map(|c| {
                     c.w_imag.len() * c.w_imag.first().map_or(0, |v| v.len()) * 8
                         + c.y_imag.iter().map(|(_, y, y0)| (y.len() + y0.len()) * 8).sum::<usize>()
-                        + c.m_imag.iter().map(|(_, m)| m.len() * 8).sum::<usize>()
+                        + c.m_imag.len() * 8
                         + c.residues.iter().map(|(_, _, _, y, y0)| (y.len() + y0.len()) * 8).sum::<usize>()
                 })
                 .sum();
@@ -1494,7 +1573,6 @@ impl<'a> BseGradEngine<'a> {
         let nmo = self.gw.nmo;
         let nocc = self.gw.nocc;
         let nvir = self.screen.nvir;
-        let _ = (naux, nmo, nocc, nvir);
 
         let mut weights: Vec<Vec<f64>> = Vec::with_capacity(nk);
         let mut ebar_direct: Vec<Vec<f64>> = Vec::with_capacity(nk);
@@ -1542,12 +1620,30 @@ impl<'a> BseGradEngine<'a> {
         }
 
         let t_kernel = t_kernel.elapsed().as_secs_f64();
+        if grad_timing() {
+            eprintln!("[bse_grad mem] kernel covectors: rss {:.0} MB", crate::hessian::memory_monitor::current_rss_mb());
+        }
+        // analdrv CP-HF: one block-Krylov solve over all (atm, comp)
+        // perturbations.  It depends only on the reference (not on the QP
+        // covectors), and its work space is the largest transient of the whole
+        // gradient (≈ 1.5 GB at naphthalene/def2-SVP), so it runs **first** —
+        // before the QP pullback allocates the `naux*nmo^2` covector — and the
+        // arena is trimmed right after it returns.  The GW gradient orders the
+        // two the same way for the same reason.
+        let t_cp = Instant::now();
+        let responses = self.gw.canonical_response_batch();
+        let t_cp = t_cp.elapsed().as_secs_f64();
+        crate::hessian::memory_monitor::trim_to_os(0);
+        if grad_timing() {
+            eprintln!("[bse_grad mem] cphf:            rss {:.0} MB (after trim)", crate::hessian::memory_monitor::current_rss_mb());
+        }
         // ---- streaming QP pullback ----
-        // The QP caches are the largest geometry-fixed object of this path
-        // (`ncache * nquad * 2 * naux * nmo`).  `qp_pullback` accumulates them
-        // cache by cache, so they are rebuilt (and dropped again) a page at a
-        // time instead of being held resident; only orbitals whose QP weight
-        // vanishes everywhere keep a placeholder entry.
+        // The QP caches are the largest geometry-fixed object of this path.  In
+        // the compact representation one cache is a single `[naux, nmo]` metric
+        // intermediate plus the small `w_imag`/residue tables, so the active
+        // ones (`nocc + nvir_act` orbitals) stay resident and the page loop only
+        // *borrows* them — the old route cloned every cache of a page
+        // (`nquad*2*naux*nmo` doubles each) and dropped the clone immediately.
         let flat_weights: Vec<f64> = (0..nk)
             .flat_map(|k| weights[k].iter().copied())
             .collect();
@@ -1558,66 +1654,105 @@ impl<'a> BseGradEngine<'a> {
         let mut col0 = 0usize;
         while col0 < nmo {
             let end = (col0 + per_page).min(nmo);
-            let page: Vec<QpCache> = (col0..end)
-                .map(|n| {
-                    let active = (0..nk).any(|k| weights[k][n] != 0.0);
-                    if active && self.qp_caches[n].y_imag.is_empty() && self.qp_caches[n].m_imag.is_empty() {
-                        self.gw.build_target_cache(n)
-                    } else {
-                        self.qp_caches.get(n).cloned().unwrap_or_else(|| empty_qp_cache(n))
-                    }
+            // caches the engine does not hold yet (non-zero QP weight but an
+            // empty placeholder entry) are built for this page only; every
+            // other cache is *borrowed* from the engine
+            let mut rebuilt: Vec<QpCache> = Vec::new();
+            let mut slot: Vec<Option<usize>> = Vec::with_capacity(end - col0);
+            for n in col0..end {
+                let active = (0..nk).any(|k| weights[k][n] != 0.0);
+                let resident = &self.qp_caches[n];
+                if active && resident.y_imag.is_empty() && resident.m_imag.is_empty() {
+                    rebuilt.push(self.gw.build_target_cache_compact(n));
+                    slot.push(Some(rebuilt.len() - 1));
+                } else {
+                    slot.push(None);
+                }
+            }
+            let page: Vec<&QpCache> = slot
+                .iter()
+                .enumerate()
+                .map(|(i, r)| match *r {
+                    Some(ri) => &rebuilt[ri],
+                    None => &self.qp_caches[col0 + i],
                 })
                 .collect();
             self.gw
                 .qp_pullback_chunk_public(&page, &flat_weights, col0, &mut scr);
             col0 = end;
         }
-        let (bq, bj, be, bb) = self.gw.qp_pullback_streaming_finish(scr);
+        let (mut bq, mut bj, mut be, bb) = self.gw.qp_pullback_streaming_finish(scr);
         let t_qp = t_qp.elapsed().as_secs_f64();
+        if grad_timing() {
+            eprintln!("[bse_grad mem] qp pullback:     rss {:.0} MB", crate::hessian::memory_monitor::current_rss_mb());
+        }
+        // the BSE-kernel covectors are added to the QP ones: both are
+        // pair-symmetric full-pair covectors in the same representation
+        for k in 0..nk {
+            for (d, s) in bj[k].iter_mut().zip(bj_k[k].iter()) {
+                *d += s;
+            }
+            for (d, s) in be[k].iter_mut().zip(ebar_direct[k].iter()) {
+                *d += s;
+            }
+        }
+        drop(bj_k);
+        drop(ebar_direct);
 
-        // analdrv CP-HF: one block-Krylov solve over all (atm, comp)
-        // perturbations
-        let t_cp = Instant::now();
-        let responses = self.gw.canonical_response_batch();
-        let t_cp = t_cp.elapsed().as_secs_f64();
+        // ---- fold every root's total covector once ----
+        // `sum_{P,pq} qbar[P,pq] qx[P,pq]` with `qx = C^T dI C + U^T q + q U`
+        // is rewritten in the basis-independent ("folded") form
+        // `sum_P <C qbar_P C^T, dI_P> + 2 Tr[U^T W]`, whose perturbation-dependent
+        // part is only `O(naux nao^2)` instead of the `O(naux nao^2 nmo)` of
+        // materialising `qx` for each of the `3 natm` perturbations.  The fold
+        // itself is done once per root on the total (QP + kernel) pair covector.
+        let t_fold = Instant::now();
+        let mut folds: Vec<crate::ri_gw::gw_grad::FoldedCovector> = Vec::with_capacity(nk);
+        for (k, kv) in theta_k.iter().enumerate() {
+            let mut qbar = std::mem::take(&mut bq[k]);
+            kv.add_into_full_pair(&mut qbar, naux, nmo);
+            folds.push(self.gw.fold_covector(&qbar));
+        }
+        drop(bq);
+        drop(theta_k);
+        crate::hessian::memory_monitor::trim_to_os(0);
+        let t_fold = t_fold.elapsed().as_secs_f64();
+        if grad_timing() {
+            eprintln!("[bse_grad mem] fold:            rss {:.0} MB", crate::hessian::memory_monitor::current_rss_mb());
+        }
+
         let t_asm = Instant::now();
-        let mut t_qx = 0.0f64;
-        let zero_q = vec![0.0f64; naux * nmo * nmo];
-        let zero_j = vec![0.0f64; naux * naux];
         let mut grads = vec![vec![0.0f64; self.gw.natm * 3]; nk];
         for atm in 0..self.gw.natm {
             let blocks = self.gw.raw.d_atom_blocks(atm);
             for comp in 0..3 {
                 let dj = self.gw.raw.d_j_atom(atm, comp);
-                let (u, eps1, b_x) = responses[atm * 3 + comp].clone();
-                let t0 = Instant::now();
-                let qx = self.gw.qx_from_u_blocks(&blocks, comp, &u);
-                t_qx += t0.elapsed().as_secs_f64();
+                let (u, eps1, b_x) = &responses[atm * 3 + comp];
+                // the streamed `dI` slices of this perturbation are built once
+                // and contracted with every root's folded covector
+                let qx_ch = self.gw.folded_qx_multi(&folds, &blocks, comp, u);
                 for k in 0..nk {
-                    // QP part (with Z factors) + kernel part (compact covector)
-                    let qp = self.gw.contract_perturbation(
-                        &bq[k..k + 1],
-                        &bj[k..k + 1],
-                        &be[k..k + 1],
-                        &bb[k..k + 1],
-                        &qx, &dj, &eps1, &b_x,
-                    )[0];
-                    let kernel = theta_k[k].contract_qx(&qx, naux, nmo)
-                        + bj_k[k].iter().zip(dj.iter()).map(|(a, b)| a * b).sum::<f64>()
-                        + ebar_direct[k].iter().zip(eps1.iter()).map(|(a, b)| a * b).sum::<f64>();
-                    grads[k][atm * 3 + comp] = qp + kernel;
+                    grads[k][atm * 3 + comp] = qx_ch[k]
+                        + bj[k].iter().zip(dj.iter()).map(|(a, b)| a * b).sum::<f64>()
+                        + be[k].iter().zip(eps1.iter()).map(|(a, b)| a * b).sum::<f64>()
+                        + bb[k].iter().zip(b_x.iter()).map(|(a, b)| a * b).sum::<f64>();
                 }
             }
         }
         let omegas = self.roots.iter().map(|r| r.omega).collect();
         if grad_timing() {
+            eprintln!("[bse_grad mem] contraction:     rss {:.0} MB", crate::hessian::memory_monitor::current_rss_mb());
+        }
+        // hand the transient assembly workspaces back to the OS
+        crate::hessian::memory_monitor::trim_to_os(0);
+        if grad_timing() {
             eprintln!(
-                "[bse_grad timing] kernel_vjp {:8.2}s  qp_pullback {:8.2}s  cphf+assembly(cphf) {:8.2}s  qx_from_u {:8.2}s  contraction {:8.2}s",
+                "[bse_grad timing] kernel_vjp {:8.2}s  qp_pullback {:8.2}s  cphf {:8.2}s  fold {:8.2}s  contraction {:8.2}s",
                 t_kernel,
                 t_qp,
                 t_cp,
-                t_qx,
-                t_asm.elapsed().as_secs_f64() - t_qx
+                t_fold,
+                t_asm.elapsed().as_secs_f64()
             );
         }
         (grads, omegas)
@@ -1714,7 +1849,7 @@ impl<'a> BseGradEngine<'a> {
         let owned: Vec<QpCache> = (0..nmo)
             .map(|n| {
                 if (0..nk).any(|k| weights[k][n] != 0.0) {
-                    self.gw.build_target_cache(n)
+                    self.gw.build_target_cache_compact(n)
                 } else {
                     self.qp_caches.get(n).cloned().unwrap_or_else(|| empty_qp_cache(n))
                 }
