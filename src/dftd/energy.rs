@@ -31,7 +31,14 @@ impl DispSpec {
         }
 
         if disp_from_parse_xc {
-            return Some(DispSpec::FromXc(mol.dfadef.as_ref().unwrap().get_dispersion().unwrap()));
+            let comp = mol.dfadef.as_ref().unwrap().get_dispersion().unwrap();
+            // VV10 is a density-based non-local correlation term evaluated on
+            // the quadrature grid during the SCF, not an empirical pairwise
+            // dispersion correction.
+            if comp.func.eq_ignore_ascii_case("VV10") {
+                return None;
+            }
+            return Some(DispSpec::FromXc(comp));
         }
         if disp_from_ctrl {
             return Some(DispSpec::FromCtrl(mol.ctrl.empirical_dispersion.clone().unwrap()));

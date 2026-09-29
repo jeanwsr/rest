@@ -540,6 +540,37 @@ impl DFAdef {
             }
         }
         xc_data.dfa_hybrid_scf = self.dfa_hybrid_scf;
+        // An explicit VV10 dispersion component (e.g. from the `-v` suffix of
+        // `wb97x-v`) activates non-local correlation. Its (b, C) parameters are
+        // read from the libxc VV10-flagged component, not from user keywords.
+        if let Some(disp) = self.get_dispersion() {
+            if disp.func.eq_ignore_ascii_case("VV10") {
+                // Combined VV10 functionals (e.g. wb97x-v / wb97m-v) carry the
+                // semilocal part and the VV10 parameters in a single libxc
+                // functional. Only this single-component, unit-factor form is
+                // supported here; composite forms such as `scan-vv10` require
+                // extra bookkeeping of the internal correlation and are not
+                // silently evaluated with the wrong energy.
+                if let Some(scf_components) = &self.xc_scf {
+                    // The semilocal part + VV10 parameters live in exactly one
+                    // libxc functional (e.g. 466 for wb97x-v); the VV10 Disp
+                    // component itself is not counted here.
+                    let nlc_comps: Vec<_> = scf_components
+                        .iter()
+                        .filter(|comp| comp.component_type == ComponentType::Libxc && comp.is_nlc())
+                        .collect();
+                    if nlc_comps.len() == 1 {
+                        let comp = nlc_comps[0];
+                        if (comp.factor - 1.0).abs() > 1.0e-12 {
+                            panic!("VV10 component with non-unit factor is not supported: {}", comp.func_full_name);
+                        }
+                        xc_data.nlc_vv10 = xc_func_init(comp.id, 1).vv10_coef();
+                    } else {
+                        panic!("VV10 requires exactly one libxc functional carrying the VV10 kernel.");
+                    }
+                }
+            }
+        }
         let alpha = self.dfa_rsh_scf.1;
         let beta = self.dfa_rsh_scf.2;
         if let Some(omega) = self.dfa_rsh_scf.0 {
@@ -730,9 +761,6 @@ impl DFAdef {
 
     pub fn check_sanity(&self) -> (bool, Vec<String>) {
         let mut err_strings = Vec::new();
-        if self.is_nlc() {
-            err_strings.push("Error: non-local correlation functionals are not supported in current implementation".to_string());
-        }
         if self.use_laplacian() {
             err_strings.push("Error: functionals that use Laplacian are not supported in current implementation".to_string());
         }
