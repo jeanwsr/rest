@@ -2654,6 +2654,9 @@ impl<'a> GwGradEngine<'a> {
                     let (_u, y, y0) = &cache.y_imag[wi];
                     y_m.data.copy_from_slice(y);
                     y0_m.data.copy_from_slice(y0);
+                    for (d, (a, b)) in sc.iter_mut().zip(y.iter().zip(y0.iter())) {
+                        *d = a - b;
+                    }
                 } else {
                     // empty placeholder: no contribution
                     continue;
@@ -2706,14 +2709,15 @@ impl<'a> GwGradEngine<'a> {
                             be[k][m] += f * gprime * cache.w_imag[wi][m];
                         }
                     }
+                    // `sc = y - y0` is already the covector's source vector, so
+                    // the update reads one stream instead of subtracting two
                     for m in 0..nmo {
                         let t = cache.omega - self.e[m];
                         let a = -c * wgt / TWO_PI * 2.0 * t / (t * t + u * u);
                         let base = m * naux;
                         let col_m = self.pair_col(n, m) * naux;
                         for p in 0..naux {
-                            bq[k][col_m + p] +=
-                                2.0 * a * (y_m.data[base + p] - y0_m.data[base + p]);
+                            bq[k][col_m + p] += 2.0 * a * sc[base + p];
                         }
                     }
                     let t_bj = Instant::now();
@@ -5816,6 +5820,12 @@ impl GwGradEngine<'_> {
         let psi = fold_exchange(&x_theta, &x_phi);
 
         timings[5] = t_skel.elapsed().as_secs_f64();
+        if grad_timing() {
+            eprintln!(
+                "[gw_grad timing]   adjoint: covectors {:.2}s  setup {:.2}s  prep {:.2}s  rhs {:.2}s  Z solve {:.2}s  foldings {:.2}s",
+                timings[0], timings[1], timings[2], timings[3], timings[4], timings[5]
+            );
+        }
         // dI covector = B - 2*fock_hyb*Theta (the skeleton uses the plain 1/2)
         // The Coulomb skeleton is <Lam_ao, Jd> = sum_P a_P c_P + sum_P lam_P dc_P
         // with a_P = <Lam_ao, dI_P>, c = J^-1 rho and dc = J^-1 (drho - dJ c).
