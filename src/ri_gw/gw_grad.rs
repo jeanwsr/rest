@@ -974,6 +974,21 @@ pub fn dd_response_dz_single(de: f64, z: f64, eta: f64) -> f64 {
 /// Build the imaginary-axis and real-axis low-rank factor sets from the occupied-virtual block
 /// `qtia` (shared by the engine constructor and the lazy rebuild after `evict_qt`).
 #[allow(clippy::too_many_arguments)]
+/// Low-rank factor of **one** real-axis grid point (see
+/// [`GwGradEngine::ensure_lr_grid_factor`]).
+fn build_lr_factor_at(
+    qtia: &[f64],
+    naux: usize,
+    nov: usize,
+    de_ia: &[f64],
+    z: f64,
+    eta: f64,
+    tol: f64,
+) -> LrFactor {
+    build_lr_factor(qtia, naux, nov, de_ia, z, 'R', eta, tol)
+}
+
+#[allow(dead_code)]
 fn build_lr_factors(
     qtia: &[f64],
     naux: usize,
@@ -1229,8 +1244,16 @@ pub struct GwGradEngine<'a> {
     /// Cached low-rank factors on the imaginary axis. Evictable with `evict_qt`: only the QP-cache
     /// construction reads them, and `with_lr` rebuilds them from `qtia` on demand.
     pub lr_imag: RefCell<Vec<LrFactor>>,
-    /// Cached low-rank factors on the real-axis grid (evictable like [`Self::lr_imag`]).
-    pub lr_grid: RefCell<Vec<LrFactor>>,
+    /// Cached low-rank factors on the real-axis grid (evictable like
+    /// [`Self::lr_imag`]).
+    ///
+    /// The real-axis factors are built **on demand**, one grid point at a time
+    /// ([`Self::ensure_lr_grid_factor`]): the contour part of a self-energy
+    /// reads at most a handful of them (`nearest_grid_value` maps every pole of
+    /// a row onto the grid), while building the whole grid costs one
+    /// `naux x naux` eigendecomposition per point — the dominant term of the
+    /// engine construction (7.0 s of 9.2 s at naphthalene/def2-SVP).
+    pub lr_grid: RefCell<Vec<Option<LrFactor>>>,
     /// metric-transformed occupied-virtual block (kept for on-the-fly factors).
     /// Evictable together with `qt` ([`Self::evict_qt`]).
     pub qtia: RefCell<Vec<f64>>,
@@ -1554,20 +1577,23 @@ impl<'a> GwGradEngine<'a> {
             if std::env::var("REST_GWGRAD_DBG").is_ok() {
                 println!("[new DBG] qtia max = {}", qtia.iter().fold(0.0f64, |a, &x| a.max(x.abs())));
             }
-            let (lr_imag, lr_grid) = build_lr_factors(
-                &qtia,
-                naux,
-                nov,
-                &de_ia,
-                &quad,
-                &z_grid,
-                config.eta,
-                config.low_rank_tolerance,
-            );
+            // The imaginary-axis factors are needed by every self-energy
+            // evaluation; the real-axis grid factors are built on demand
+            // (`ensure_lr_grid_factor`), because a self-energy row reads at
+            // most a handful of grid points while a full grid costs one
+            // `naux x naux` eigendecomposition per point.
+            let lr_imag: Vec<LrFactor> = quad
+                .iter()
+                .map(|&(u, _)| {
+                    build_lr_factor(
+                        &qtia, naux, nov, &de_ia, u, 'I', 0.0, config.low_rank_tolerance,
+                    )
+                })
+                .collect();
+            let lr_grid: Vec<Option<LrFactor>> = (0..z_grid.len()).map(|_| None).collect();
             mem_probe("  build: after all factors");
             if std::env::var("REST_GWGRAD_DBG").is_ok() {
                 println!("[new DBG] lr_imag nkeeps = {:?}", lr_imag.iter().map(|f| f.eigval.len()).collect::<Vec<_>>());
-                println!("[new DBG] lr_grid nkeeps = {:?}", lr_grid.iter().map(|f| f.eigval.len()).collect::<Vec<_>>());
             }
             GwGradEngine {
                 scf,
@@ -1670,20 +1696,50 @@ impl<'a> GwGradEngine<'a> {
     fn ensure_lr(&self) {
         if self.lr_grid.borrow().is_empty() && !self.config.skip_lr_cache {
             self.with_qtia(|qtia| {
-                let (imag, grid) = build_lr_factors(
-                    qtia,
-                    self.naux,
-                    self.nocc * (self.nmo - self.nocc),
-                    &self.de_ia,
-                    &self.quad,
-                    &self.z_grid,
-                    self.config.eta,
-                    self.config.low_rank_tolerance,
-                );
+                let imag: Vec<LrFactor> = self
+                    .quad
+                    .iter()
+                    .map(|&(u, _)| {
+                        build_lr_factor(
+                            qtia,
+                            self.naux,
+                            self.nocc * (self.nmo - self.nocc),
+                            &self.de_ia,
+                            u,
+                            'I',
+                            0.0,
+                            self.config.low_rank_tolerance,
+                        )
+                    })
+                    .collect();
                 *self.lr_imag.borrow_mut() = imag;
-                *self.lr_grid.borrow_mut() = grid;
+                // the real-axis factors are built on demand
+                *self.lr_grid.borrow_mut() =
+                    (0..self.z_grid.len()).map(|_| None).collect();
             });
         }
+    }
+
+    /// Make the real-axis factor of grid point `idx` resident, building it if
+    /// this is the first time it is read.
+    fn ensure_lr_grid_factor(&self, idx: usize) {
+        self.ensure_lr();
+        if self.lr_grid.borrow()[idx].is_some() {
+            return;
+        }
+        let z = self.z_grid[idx];
+        let factor = self.with_qtia(|qtia| {
+            build_lr_factor_at(
+                qtia,
+                self.naux,
+                self.nocc * (self.nmo - self.nocc),
+                &self.de_ia,
+                z,
+                self.config.eta,
+                self.config.low_rank_tolerance,
+            )
+        });
+        self.lr_grid.borrow_mut()[idx] = Some(factor);
     }
 
     fn lr_factor_nearest_idx(&self, z: f64) -> usize {
@@ -1841,6 +1897,39 @@ impl<'a> GwGradEngine<'a> {
 
     /// One pole contribution of the contour term with REST's protocol
     /// (`pole_factor` smoothing, nearest-grid frequency, sign convention).
+    /// Value — and, when `collect`, the response vectors — of one pole
+    /// contribution `w = sum_P qnm[P] (y[P] - y0[P])` through a given factor.
+    #[allow(clippy::type_complexity)]
+    fn pole_value(
+        &self,
+        factor: &LrFactor,
+        mm: &[f64],
+        m: usize,
+        sign_pf: f64,
+        z_used: f64,
+        collect: bool,
+        residues: &mut Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)>,
+    ) -> f64 {
+        if !collect {
+            // the value alone does not need the response vectors
+            return factor.response_value_from_qt(mm, 1)[0];
+        }
+        // `y = s_metric * (qt + corr)` and `y0 = s_metric * qt`
+        let corr = factor.correction_from_qt(mm, 1);
+        let y0 = gemm_nn(&self.s_metric, self.naux, self.naux, mm, self.naux, 1);
+        let sc = gemm_nn(&self.s_metric, self.naux, self.naux, &corr, self.naux, 1);
+        let y: Vec<f64> = y0.iter().zip(sc.iter()).map(|(a, b)| a + b).collect();
+        // the signed factor carries pole_factor so that every consumer
+        // (value, d/domega zeta term, pullback) stays consistent
+        residues.push((m, sign_pf, z_used, y, y0));
+        mm.iter().zip(corr.iter()).map(|(a, b)| a * b).sum()
+    }
+
+    /// One pole contribution of the contour term with REST's protocol
+    /// (`pole_factor` smoothing, nearest-grid frequency, sign convention).
+    ///
+    /// Only the exact-residue mode evaluates poles one by one; the production
+    /// quantised protocol goes through [`Self::add_poles`], which batches them.
     #[allow(clippy::type_complexity)]
     fn add_pole(
         &self,
@@ -1861,40 +1950,25 @@ impl<'a> GwGradEngine<'a> {
         } else {
             nearest_grid_value(&self.z_grid, de.abs())
         };
-        // exact mode: factor at the true residue frequency (fresh
-        // diagonalisation); quantised mode: nearest grid factor
-        // the cached factors live behind a `RefCell` (evictable); hold one borrow for this pole
-        self.ensure_lr();
-        let lr_grid_guard = self.lr_grid.borrow();
-        let factor_on_the_fly;
-        let factor = if self.config.exact_residue_z {
-            factor_on_the_fly = self.with_qtia(|qtia| {
+        let qnm = self.with_q(|q| self.gather_pair(q, n, m));
+        // `qt = s_metric * qnm` (the intermediate of the factor) and
+        // `w = sum_P qnm[P] (y[P] - y0[P]) = sum_P qt[P] corr[P]`
+        let mm = gemm_nn(&self.s_metric, self.naux, self.naux, &qnm, self.naux, 1);
+        let w = if self.config.exact_residue_z {
+            // fresh diagonalisation at the true residue frequency
+            let factor = self.with_qtia(|qtia| {
                 build_lr_factor(
                     qtia, self.naux, self.de_ia.len(), &self.de_ia,
                     z_used, 'R', self.config.eta, self.config.low_rank_tolerance,
                 )
             });
-            &factor_on_the_fly
+            self.pole_value(&factor, &mm, m, sign * pole_factor, z_used, collect, residues)
         } else {
-            &lr_grid_guard[self.lr_factor_nearest_idx(z_used)]
-        };
-        let qnm = self.with_q(|q| self.gather_pair(q, n, m));
-        // `qt = s_metric * qnm` (the intermediate of the factor) and
-        // `w = sum_P qnm[P] (y[P] - y0[P]) = sum_P qt[P] corr[P]`
-        let mm = gemm_nn(&self.s_metric, self.naux, self.naux, &qnm, self.naux, 1);
-        let w: f64 = if collect {
-            // `y = s_metric * (qt + corr)` and `y0 = s_metric * qt`
-            let corr = factor.correction_from_qt(&mm, 1);
-            let y0 = gemm_nn(&self.s_metric, self.naux, self.naux, &mm, self.naux, 1);
-            let sc = gemm_nn(&self.s_metric, self.naux, self.naux, &corr, self.naux, 1);
-            let y: Vec<f64> = y0.iter().zip(sc.iter()).map(|(a, b)| a + b).collect();
-            // the signed factor carries pole_factor so that every consumer
-            // (value, d/domega zeta term, pullback) stays consistent
-            residues.push((m, sign * pole_factor, z_used, y, y0));
-            mm.iter().zip(corr.iter()).map(|(a, b)| a * b).sum()
-        } else {
-            // the value alone does not need the response vectors
-            factor.response_value_from_qt(&mm, 1)[0]
+            let idx = self.lr_factor_nearest_idx(z_used);
+            self.ensure_lr_grid_factor(idx);
+            let guard = self.lr_grid.borrow();
+            let factor = guard[idx].as_ref().expect("bse_grad: grid factor missing");
+            self.pole_value(factor, &mm, m, sign * pole_factor, z_used, collect, residues)
         };
         *contour += sign * pole_factor * w;
     }
@@ -1961,10 +2035,15 @@ impl<'a> GwGradEngine<'a> {
         }
         self.ensure_lr();
         self.ensure_q();
+        for (idx, poles) in groups.iter() {
+            self.ensure_lr_grid_factor(*idx);
+        }
         let lr_grid = self.lr_grid.borrow();
         let q_all = self.q.borrow();
         for (idx, poles) in groups.iter() {
-            let factor = &lr_grid[*idx];
+            let factor = lr_grid[*idx]
+                .as_ref()
+                .expect("bse_grad: real-axis factor missing");
             let ncol = poles.len();
             // gather the `q[:, n, m]` columns of this group
             let mut qmat = vec![0.0f64; naux * ncol];
