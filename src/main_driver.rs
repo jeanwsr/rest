@@ -106,10 +106,12 @@ pub fn main_driver() -> anyhow::Result<()> {
 
     // Storage-level AO-pair pruning ([ctrl.ri_jk] pair_screen_threshold > 0) rewrites the row
     // space of the in-core RI tensor `rimatr`, and every consumer of that tensor has to address
-    // it through `SCF::rimatr_pair_map`. That is wired for the SCF J/K contractions only: the
-    // post-SCF, derivative, response and Hessian paths still index the tensor with the full-space
-    // pair tables, and would silently read the wrong rows instead of failing. Refuse to run them
-    // rather than return a wrong number. (S2/S3 of the pruning plan lift this restriction.)
+    // it through `SCF::rimatr_pair_map`. That is wired for the SCF J/K contractions (S1) and for
+    // the AO-to-MO transform that feeds the post-SCF correlation energy: the `ri3mo` route and the
+    // streaming PT2 driver both go through the map-aware `scf_io::ao2mo_rayon*` kernels (S2).
+    // The derivative, response, Hessian, TDDFT and quasiparticle paths still index the tensor with
+    // the full-space pair tables, and would silently read the wrong rows instead of failing, so
+    // they stay refused here. (S3 of the pruning plan lifts the remaining ones.)
     if mol.ctrl.ri_jk.pair_screen_threshold > 0.0 {
         let mut unsupported: Vec<&str> = Vec::new();
         if !mol.ctrl.analdrv_tasks.is_empty() {
@@ -117,12 +119,6 @@ pub fn main_driver() -> anyhow::Result<()> {
         }
         if !matches!(mol.ctrl.job_type, JobType::SinglePoint) {
             unsupported.push("a job_type other than a single-point energy (gradient / optimization / MD / numerical dipole)");
-        }
-        if !mol.ctrl.post_correlation.is_empty() {
-            unsupported.push("post-correlation methods (post_correlation)");
-        }
-        if !mol.ctrl.post_xc.is_empty() {
-            unsupported.push("post-XC analysis (post_xc)");
         }
         if mol.ctrl.tddft.is_some() {
             unsupported.push("TDDFT and response TDDFT (tddft)");
@@ -139,8 +135,9 @@ pub fn main_driver() -> anyhow::Result<()> {
         if !unsupported.is_empty() {
             return Err(anyhow::anyhow!(
                 "Storage-level AO-pair pruning is enabled ([ctrl.ri_jk] pair_screen_threshold = \
-                 {:e}), but it is only implemented for a single-point SCF energy. It does not \
-                 support: {}. Set pair_screen_threshold = 0.0 to run these paths.",
+                 {:e}). It is implemented for a single-point energy and for the post-SCF \
+                 correlation energy of that single point, but not for: {}. Set \
+                 pair_screen_threshold = 0.0 to run these paths.",
                 mol.ctrl.ri_jk.pair_screen_threshold,
                 unsupported.join(", ")
             ));

@@ -228,7 +228,9 @@ guessfile = "my_checkpoint.rchk"
     - `pair_screen_threshold`: 取值f64类型。incore RI-J/RI-K 的 AO 对（basis pair）筛选的相对阈值，同时作用于**构建期**与**缩并期**两级。
     - 构建期（存储级）：三中心张量 `rimatr` 建成后，每个 AO 对的行上界 $q_p = \max_P |Y_{p,P}|$ 低于 $\text{threshold} \times \max_p q_p$ 的行被丢掉，张量原地压紧，行布局记入 `PairMap`（存储行到 $(\mu,\nu)$、行界、全量对号到存储行）。`basbas2baspar` 与 `baspar2basbas` 保持全量语义，J 的输出仍散射回全量 packed 上三角。MPI 下静态行界先做一次 `max` 归约再加广播，各 rank 保留同一批行。
     - 缩并期：在保留行里按本轮密度/轨道权重再筛。J 的密度缩并用 $|w_p| q_p$（$w_p$ 为密度权重）与本次迭代最大的对界值比较，K 用 $q_p \max(W_\mu, W_\nu)$（$W_\mu = \max_i |C_{\mu i}|$）比较，低于阈值倍数者被丢弃。K 保留的行张成“活跃 AO 子集”，每个辅助基只在该子集上做缩并与 `dsyrk`。
-    - 缺省为 0.0，即不剪枝也不筛选，数值与未筛选内核一致。注意构建期剪枝改变了存储的 `rimatr` 的行空间，因此目前只支持单点能 SCF：后自洽场、解析导数、响应、Hessian 与数值力（`outputs = ["num_force"]`）等路径会在 `main_driver` 里显式报错退出（S2/S3 计划再铺开），不会静默算错。
+    - 缺省为 0.0，即不剪枝也不筛选，数值与未筛选内核一致。构建期剪枝改变了存储的 `rimatr` 的行空间，因此每个消费者都要按 `PairMap` 取行，未接线的路径一律显式报错退出，不会静默算错。
+    - 已接线：SCF 的 J/K 缩并（含 RSH 短程张量与 `use_dm_only` 的密度版 K），以及后自洽场相关能的 AO→MO 变换（`ri3mo` 与 streaming PT2 驱动，覆盖 PT2/SBGE2/SCS-RPA/RPA 以及 `xc = "mp2"` 这类 PT2 family 单点）。
+    - 仍被拒绝：解析导数与 Hessian、SCF/单点之外的 job_type、TDDFT 与响应、GW/BSE、数值力（`outputs = ["num_force"]`），以及 `ri_pt2` 的 `new_driver = true` 与 `engine = "torch"` 两个引擎。
 - `use_dm_only`: 取值布尔类型。控制 VK (Exchange) 和 VXC (XC Potential) 矩阵的构建方式。缺省为 false。
     - `false`（缺省）：使用分子轨道系数构造（occ-RI-K 算法），效率更高，推荐用于大多数体系。
     - `true`：直接使用密度矩阵构造。当轨道占据数非整数（如 dSCF 激发态）时可能需要设为 true。

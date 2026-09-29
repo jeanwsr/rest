@@ -276,6 +276,42 @@ impl PairMap {
     }
 }
 
+/// Fill the symmetric AO matrix of one auxiliary column from a stored tensor column.
+///
+/// The unpruned `rimatr` stores its rows in packed upper-triangular order, so a column can be
+/// zipped straight onto the packed upper triangle. A storage-level pruned tensor stores only the
+/// retained rows, and their `(mu, nu)` come from [`PairMap`]. The dropped rows stay at zero, which
+/// is exactly the truncation the storage level applied, so every AO-to-MO consumer that reads the
+/// column through this helper sees the same tensor the SCF kernels contract.
+///
+/// Callers allocate the output zeroed, so entries the map leaves out need no explicit clearing.
+pub fn fill_ao_matrix_from_column(column: &[f64], map: Option<&PairMap>, out: &mut MatrixFull<f64>) {
+    match map {
+        None => {
+            out.iter_matrixupper_mut()
+                .unwrap()
+                .zip(column.iter())
+                .for_each(|(to, from)| *to = *from);
+        }
+        Some(map) => {
+            debug_assert_eq!(
+                column.len(),
+                map.len(),
+                "a compacted column carries one value per stored row"
+            );
+            for (row, value) in column.iter().enumerate() {
+                let [mu, nu] = map.rows[row];
+                let (i, j) = if mu <= nu {
+                    (mu as usize, nu as usize)
+                } else {
+                    (nu as usize, mu as usize)
+                };
+                out[[i, j]] = *value;
+            }
+        }
+    }
+}
+
 /// Result of the build-time (storage level) AO-pair pruning of `rimatr`.
 ///
 /// `ri3fn` holds the retained rows only and [`PairMap`] carries the compact indexing and the
