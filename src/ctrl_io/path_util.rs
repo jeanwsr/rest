@@ -13,7 +13,7 @@ const DEFAULT_BASIS_PATH: &str = "/opt/rest_workspace/rest/basis-set-pool/";
 //     };
 // }
 
-pub fn get_rest_basis_dir(print_level:usize) -> Vec<String> {
+pub fn get_rest_basis_dir() -> Vec<String> {
     let mut rest_basis_dir:Vec<String> = vec![];
     if let Some(val) = env::var("REST_BASIS_DIR").ok() {
         if !val.is_empty() {

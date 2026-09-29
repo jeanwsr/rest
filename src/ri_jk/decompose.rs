@@ -136,15 +136,33 @@ pub enum J2CDecompose {
 /// - by Cholesky way, solve j3c to cderi does not require extra memory
 /// - by eigen way, the matmul will cost at most `2 * naux^2` or 4% of the final cderi matrix.
 pub fn generate_rimatr_bare(mol_obj: &Molecule, omega: Option<f64>) -> MatrixFull<f64> {
-    let mut mol = util::get_cint_mol(mol_obj);
-    let mut aux = util::get_cint_aux(mol_obj);
+    generate_rimatr_bare_on_cint(
+        &util::get_cint_mol(mol_obj),
+        &util::get_cint_aux(mol_obj),
+        mol_obj.ctrl.j2c_decomp,
+        omega,
+    )
+}
+
+/// Generate decomposed 3c-2e ERI (cderi/rimatr) on explicitly given `CInt` integrators.
+///
+/// The molecular-orbital side (`mol`) and the auxiliary side (`aux`) are supplied directly,
+/// together with the j2c decomposition setting `j2c_decomp_option` and the range-separation
+/// parameter `omega`, so the rimatr can be evaluated on basis combinations other than the
+/// molecule's own (e.g. the response-specific auxiliary basis of `resp_auxbas_path`).
+pub fn generate_rimatr_bare_on_cint(
+    mol: &CInt,
+    aux: &CInt,
+    j2c_decomp_option: J2CDecompOption,
+    omega: Option<f64>,
+) -> MatrixFull<f64> {
+    let mut mol = mol.clone();
+    let mut aux = aux.clone();
 
     if let Some(omega) = omega {
         mol.set_omega(omega);
         aux.set_omega(omega);
     }
-
-    let j2c_decomp_option = mol_obj.ctrl.j2c_decomp;
 
     let device = DeviceBLAS::default();
 

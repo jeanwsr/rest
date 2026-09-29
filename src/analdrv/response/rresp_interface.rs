@@ -7,15 +7,19 @@
 //! future standalone response/property driver can call it directly, without any hessian
 //! machinery.
 //!
-//! The DFT XC response object evaluates the fock path directly on the SCF grid (in its native
-//! round-robin atom-interleaved order — the fock path is a plain quadrature sum, so no
-//! atom-regrouping is applied), and the response path on a dedicated (usually coarser) cpscf
-//! grid. The hessian-side skeleton grid policy (including the MGGA level bump) lives in the
-//! hessian interface; no grid identity or grid data is shared between the hessian and response
+//! The precision of the response contractions is selected per call through the `prec` flag of
+//! [`RRespAPI`]: the high-precision (`prec = true`) resource is the SCF-grade one — the SCF
+//! `rimatr` for RI-JK, and the SCF grid for DFT (in its native round-robin atom-interleaved
+//! order, since the fock path is a plain quadrature sum, so no atom-regrouping is applied) —
+//! while the low-precision (`prec = false`) resource of the CP-SCF machinery is the dedicated
+//! (usually coarser) response grid / the `resp_auxbas_path` basis when attached. The
+//! hessian-side skeleton grid policy (including the MGGA level bump) lives in the hessian
+//! interface; no grid identity or grid data is shared between the hessian and response
 //! subsystems.
 
 use crate::analdrv::config::AnalDrvRespCfg;
 use crate::analdrv::prelude::*;
+use crate::ri_jk::resp_auxbas;
 use crate::dft::numint_matmul::nimatmul::NIMatmul;
 use crate::dft::numint_matmul::resp_rks::RRespKSNIMatmul;
 use crate::dft::Grids;
@@ -46,15 +50,21 @@ pub fn scf_jk_factors(scf_data: &SCF) -> (f64, f64, Option<(f64, f64)>) {
     (factor_j, factor_k, rsh)
 }
 
-/// List of `(scale, functional)` pairs of the SCF XC functional (spin-unpolarized).
-pub fn scf_xc_func_list(scf_data: &SCF) -> Vec<(f64, LibXCFunctional)> {
+/// List of `(scale, functional)` pairs of the SCF XC functional, in the given libxc spin
+/// treatment.
+pub fn scf_xc_func_list_with_spin(scf_data: &SCF, spin: LibXCSpin) -> Vec<(f64, LibXCFunctional)> {
     let xc_code = &scf_data.mol.xc_data.dfa_compnt_scf;
     let xc_params = &scf_data.mol.xc_data.dfa_paramr_scf;
     xc_code
         .iter()
         .zip(xc_params.iter())
-        .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Unpolarized)))
+        .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, spin)))
         .collect_vec()
+}
+
+/// List of `(scale, functional)` pairs of the SCF XC functional (spin-unpolarized).
+pub fn scf_xc_func_list(scf_data: &SCF) -> Vec<(f64, LibXCFunctional)> {
+    scf_xc_func_list_with_spin(scf_data, LibXCSpin::Unpolarized)
 }
 
 /// The response (fock/response) objects of all electron-interaction contributions of a restricted
@@ -101,20 +111,20 @@ pub struct RCpscfState {
 impl<'a> AnalDrvBaseAPI for RRespSCF<'a> {}
 
 impl<'a> RRespAPI for RRespSCF<'a> {
-    fn get_fock_rdm(&mut self, rdm: TsrView) -> Tsr {
+    fn get_fock_rdm(&mut self, rdm: TsrView, prec: bool) -> Tsr {
         let mut fock = rt::zeros_like(&rdm);
         for resp_obj in self.resp_list.iter_mut() {
-            fock += resp_obj.get_fock_rdm(rdm.view());
+            fock += resp_obj.get_fock_rdm(rdm.view(), prec);
         }
         fock
     }
 
-    fn get_fock_coeff(&mut self, mo_coeff: TsrView, mo_occ: TsrView) -> Tsr {
+    fn get_fock_coeff(&mut self, mo_coeff: TsrView, mo_occ: TsrView, prec: bool) -> Tsr {
         // delegated per element (not through the default rdm route), so that elements overriding
         // this function for efficiency keep their advantage
         let mut fock = None;
         for resp_obj in self.resp_list.iter_mut() {
-            let fock_obj = resp_obj.get_fock_coeff(mo_coeff.view(), mo_occ.view());
+            let fock_obj = resp_obj.get_fock_coeff(mo_coeff.view(), mo_occ.view(), prec);
             fock = Some(match fock {
                 Some(fock) => fock + fock_obj,
                 None => fock_obj,
@@ -123,24 +133,24 @@ impl<'a> RRespAPI for RRespSCF<'a> {
         fock.expect("RRespSCF must hold at least one response object")
     }
 
-    fn make_response_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView) {
+    fn make_response_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView, prec: bool) {
         for resp_obj in self.resp_list.iter_mut() {
-            resp_obj.make_response_preparation(mo_coeff.view(), mo_occ.view());
+            resp_obj.make_response_preparation(mo_coeff.view(), mo_occ.view(), prec);
         }
     }
 
-    fn get_response_rdm(&mut self, rdm: TsrView) -> Tsr {
+    fn get_response_rdm(&mut self, rdm: TsrView, prec: bool) -> Tsr {
         let mut resp = rt::zeros_like(&rdm);
         for resp_obj in self.resp_list.iter_mut() {
-            resp += resp_obj.get_response_rdm(rdm.view());
+            resp += resp_obj.get_response_rdm(rdm.view(), prec);
         }
         resp
     }
 
-    fn get_response_bra(&mut self, bra: TsrView) -> Tsr {
+    fn get_response_bra(&mut self, bra: TsrView, prec: bool) -> Tsr {
         let mut resp = rt::zeros_like(&bra);
         for resp_obj in self.resp_list.iter_mut() {
-            resp += resp_obj.get_response_bra(bra.view());
+            resp += resp_obj.get_response_bra(bra.view(), prec);
         }
         resp
     }
@@ -160,8 +170,10 @@ impl<'a> RRespSCF<'a> {
     /// - `mo_occ` : shape `[nmo]`. Molecular orbital occupation numbers.
     /// - `mo_energy` : shape `[nmo]`. Molecular orbital energies.
     pub fn make_cpscf_preparation(&mut self, mo_coeff: TsrView, mo_occ: TsrView, mo_energy: TsrView) {
+        // the CP-SCF core runs the response machinery in low precision (`prec = false`): the
+        // dedicated response grid / `resp_auxbas_path` basis when attached
         for resp_obj in self.resp_list.iter_mut() {
-            resp_obj.make_response_preparation(mo_coeff.view(), mo_occ.view());
+            resp_obj.make_response_preparation(mo_coeff.view(), mo_occ.view(), false);
         }
 
         let occidx = mo_occ.view().greater(0).into_vec();
@@ -212,7 +224,10 @@ impl<'a> RRespSCF<'a> {
         let ubra = &mo_coeff % &mo1;
         let mut resp = rt::zeros_like(&mo1);
         for resp_obj in self.resp_list.iter_mut() {
-            resp += mo_coeff.t() % resp_obj.get_response_bra(ubra.view());
+            // low precision: the CP-SCF core contracts the response on the dedicated
+            // low-precision resource when attached (this includes the last-iteration W-operator
+            // assembly of the hessian driver)
+            resp += mo_coeff.t() % resp_obj.get_response_bra(ubra.view(), false);
         }
         resp
     }
@@ -298,64 +313,85 @@ impl<'a> RRespSCF<'a> {
     }
 }
 
+/// The DFT response grids: the common (fock-path) grid and the optional dedicated response grid.
+///
+/// Shared by the restricted and unrestricted response interfaces (the grid policy is
+/// spin-independent). Returns `(ni, ni_resp)`:
+///
+/// - the common grid is the SCF grid as is; the fock path is a plain quadrature sum, so it does
+///   not require the atom-grouped (ByAtom) ordering;
+/// - the response grid is dedicated (built at `config.resp.grid_level`, by default the coarser
+///   `grid_gen_level.max(3) - 2`) when that level differs from the SCF grid generation level,
+///   and `None` when they coincide (the response then evaluates and caches on the common grid).
+pub fn resp_grids<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> (NIMatmul<'a>, Option<NIMatmul<'a>>) {
+    let mol = get_cint_mol(&scf_data.mol);
+
+    let grids = scf_data.grids.as_ref().unwrap();
+    let ni = NIMatmul::new(&mol, &grids.coordinates, &grids.weights, &grids.atm_idx, &grids.quadrature_weights);
+
+    let grid_gen_level = scf_data.mol.ctrl.grid_gen_level;
+    let grid_resp_level = config.resp.grid_level.unwrap_or(grid_gen_level.max(3) - 2);
+    let ni_resp = if grid_resp_level == grid_gen_level {
+        None
+    } else {
+        let cpscf_grid = Grids::build_with_level(&scf_data.mol, grid_resp_level);
+        let ni_resp = NIMatmul::new(
+            &mol,
+            &cpscf_grid.coordinates,
+            &cpscf_grid.weights,
+            &cpscf_grid.atm_idx,
+            &cpscf_grid.quadrature_weights,
+        );
+        Some(ni_resp)
+    };
+    (ni, ni_resp)
+}
+
 /// Build the response (fock/response) objects for a converged restricted SCF.
 pub fn rscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> RRespSCF<'a> {
-    let device = DeviceBLAS::default();
     let mut resp_list: Vec<Box<dyn RRespAPI + 'a>> = Vec::new();
 
     // --- RI-JK --- //
 
     let (factor_j, factor_k, rsh) = scf_jk_factors(scf_data);
 
+    // decomposed ERIs of the RI-JK response object, per precision: the fock path always borrows
+    // the SCF rimatr (zero copy); the low-precision response path attaches the freshly built one
+    // of `resp_auxbas_path` when set (owned), and reuses the SCF rimatr otherwise
     {
-        let (rimatr, _, _) = scf_data.rimatr.as_ref().expect(
-            "This implementation requires cholesky decomposed ERI (or rimatr) to be available and stored in memory.",
-        );
-        let cderi = rimatr.to_rstsr_view(&device).into_cow();
-        resp_list.push(Box::new(RRespRIJK::new_with_cderi(factor_j, factor_k, cderi)));
+        let (cderi, cderi_resp) = resp_auxbas::cderi_pair(scf_data, config);
+        let resp_obj = match cderi_resp {
+            Some(cderi_resp) => RRespRIJK::new_with_cderi(factor_j, factor_k, cderi).set_cderi_resp(cderi_resp),
+            None => RRespRIJK::new_with_cderi(factor_j, factor_k, cderi),
+        };
+        resp_list.push(Box::new(resp_obj));
     }
 
     // The short-range exchange correction (range-separated hybrids) is a separate response
     // object reusing the full-range implementation; it evaluates on the short-range `rimatr_sr`
     // ERI, with no Coulomb part (factor_j = 0).
     if let Some((_omega, factor_k_sr)) = rsh {
-        let (rimatr_sr, _, _) = scf_data.rimatr_sr.as_ref().expect(
-            "The range-separated response requires the short-range ERI (rimatr_sr) to be built and stored in memory.",
-        );
-        let cderi_sr = rimatr_sr.to_rstsr_view(&device).into_cow();
-        resp_list.push(Box::new(RRespRIJK::new_with_cderi(0.0, factor_k_sr, cderi_sr)));
+        let (cderi_sr, cderi_resp_sr) = resp_auxbas::cderi_pair_sr(scf_data, config);
+        let resp_obj = match cderi_resp_sr {
+            Some(cderi_resp_sr) => {
+                RRespRIJK::new_with_cderi(0.0, factor_k_sr, cderi_sr).set_cderi_resp(cderi_resp_sr)
+            },
+            None => RRespRIJK::new_with_cderi(0.0, factor_k_sr, cderi_sr),
+        };
+        resp_list.push(Box::new(resp_obj));
     }
 
     // --- DFT --- //
 
     let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
     if !is_hf {
-        let mol = get_cint_mol(&scf_data.mol);
         let xc_func_list = scf_xc_func_list(scf_data);
         let verbose = scf_data.mol.ctrl.print_level > 2;
 
-        // common grid (fock path): the SCF grid as is; the fock path is a plain quadrature sum,
-        // so it does not require the atom-grouped (ByAtom) ordering.
-        let grids = scf_data.grids.as_ref().unwrap();
-        let ni = NIMatmul::new(&mol, &grids.coordinates, &grids.weights, &grids.atm_idx, &grids.quadrature_weights);
-
-        // response grid: when it coincides with the SCF grid, leave `ni_resp = None`; the
-        // response then evaluates (and caches) on the common grid. Otherwise build a dedicated
-        // (usually coarser) grid.
-        let grid_gen_level = scf_data.mol.ctrl.grid_gen_level;
-        let grid_resp_level = config.resp.grid_level.unwrap_or(grid_gen_level.max(3) - 2);
-        let resp_obj = if grid_resp_level == grid_gen_level {
-            RRespKSNIMatmul::new(xc_func_list, ni, verbose)
-        } else {
-            let cpscf_grid = Grids::build_with_level(&scf_data.mol, grid_resp_level);
-            let ni_resp = NIMatmul::new(
-                &mol,
-                &cpscf_grid.coordinates,
-                &cpscf_grid.weights,
-                &cpscf_grid.atm_idx,
-                &cpscf_grid.quadrature_weights,
-            );
-            RRespKSNIMatmul::new(xc_func_list, ni, verbose).set_ni_resp(ni_resp)
+        let (ni, ni_resp) = resp_grids(scf_data, config);
+        let resp_obj = match ni_resp {
+            Some(ni_resp) => RRespKSNIMatmul::new(xc_func_list, ni, verbose).set_ni_resp(ni_resp),
+            None => RRespKSNIMatmul::new(xc_func_list, ni, verbose),
         };
         resp_list.push(Box::new(resp_obj));
     }

@@ -1376,15 +1376,21 @@ mod geometric_pyo3_impl {
                 } else {
                     use crate::analdrv::hessian::hess_interface;
                     use crate::analdrv::response::rresp_interface::rscf_resp_interface;
+                    use crate::analdrv::response::uresp_interface::uscf_resp_interface;
+                    use crate::analdrv::response::RespSCF;
                     use rstsr::prelude::*;
 
                     let config = scf_data.mol.ctrl.analdrv.clone().unwrap_or_default();
-                    // shared RHF response object for the hessian.
-                    // UHF builds its own internally, and will implement the UHF response interface in the future.
-                    let mut resp_objs = if matches!(scf_data.scftype, crate::scf_io::SCFType::RHF) {
-                        Some(rscf_resp_interface(&scf_data, &config))
-                    } else {
-                        None
+                    // post-SCF (fifth-DFA) methods have no analytic hessian; reject before any
+                    // response object is built (the DFT grids it would need are already freed)
+                    if scf_data.mol.xc_data.is_fifth_dfa() {
+                        panic!("Normal modes calculation is currently not available for post-SCF methods.");
+                    }
+                    // shared response object for the hessian, per the SCF type
+                    let mut resp_objs = match scf_data.scftype {
+                        crate::scf_io::SCFType::RHF => Some(RespSCF::R(rscf_resp_interface(&scf_data, &config))),
+                        crate::scf_io::SCFType::UHF => Some(RespSCF::U(uscf_resp_interface(&scf_data, &config))),
+                        _ => None,
                     };
                     let hess_out = hess_interface(&scf_data, &config, resp_objs.as_mut());
                     let hess_raw = hess_out.hessian;

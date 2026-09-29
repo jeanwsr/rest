@@ -169,7 +169,10 @@ where
             self.make_elec_deriv();
             let rdm1 = self.result["rdm1"].view();
             let dm_ao = self.mo_coeff.view() % rdm1 % self.mo_coeff.view().t();
-            let resp_ao = resp.get_response_rdm(dm_ao.view());
+            // high precision: this rdm-form A-contraction belongs to the generalized-Fock
+            // (energy-derivative) side and evaluates on the SCF-grade resource; a future input
+            // keyword may open the low-precision (`prec = false`) window here as well
+            let resp_ao = resp.get_response_rdm(dm_ao.view(), true);
             let axd_mo = self.mo_coeff.view().t() % resp_ao % self.mo_coeff.view();
             let nocc = self.nocc();
             let nmo = self.nmo();

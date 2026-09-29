@@ -78,6 +78,17 @@ where
     }
 }
 
+impl<T> RestTensorIntoRstsrTsrAPI<T> for MatrixFull<T>
+where
+    T: Clone,
+{
+    fn into_rstsr(self, device: &DeviceBLAS) -> Tsr<T> {
+        let layout = layout_from_rest_tensor_matrix(&self);
+        let data = self.data;
+        rt::asarray((data, layout, device))
+    }
+}
+
 impl<T> RestTensorToRstsrTsrAPI<T> for &[&MatrixFull<T>]
 where
     T: Clone,
