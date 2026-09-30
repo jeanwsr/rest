@@ -545,16 +545,19 @@ impl DFAdef {
         // read from the libxc VV10-flagged component, not from user keywords.
         if let Some(disp) = self.get_dispersion() {
             if disp.func.eq_ignore_ascii_case("VV10") {
-                // Combined VV10 functionals (e.g. wb97x-v / wb97m-v) carry the
-                // semilocal part and the VV10 parameters in a single libxc
-                // functional. Only this single-component, unit-factor form is
-                // supported here; composite forms such as `scan-vv10` require
-                // extra bookkeeping of the internal correlation and are not
-                // silently evaluated with the wrong energy.
+                // The VV10 (b, C) parameters come from the single libxc
+                // functional that carries the VV10 kernel. This covers both
+                // combined functionals (466/531 for wb97x-v/wb97m-v, where the
+                // semilocal part and VV10 live in one functional) and composite
+                // forms such as `scan-vv10` (263 MGGA_X_SCAN + 584
+                // MGGA_C_SCAN_VV10): in both cases exactly one component has the
+                // VV10 flag. The VV10 energy is evaluated separately on the NLC
+                // grid, so the internal correlation bundled in 584 is not
+                // double counted.
                 if let Some(scf_components) = &self.xc_scf {
-                    // The semilocal part + VV10 parameters live in exactly one
-                    // libxc functional (e.g. 466 for wb97x-v); the VV10 Disp
-                    // component itself is not counted here.
+                    // Exactly one libxc component must carry the VV10 kernel
+                    // (e.g. 466/531/584); the VV10 Disp component is not
+                    // counted here.
                     let nlc_comps: Vec<_> = scf_components
                         .iter()
                         .filter(|comp| comp.component_type == ComponentType::Libxc && comp.is_nlc())
