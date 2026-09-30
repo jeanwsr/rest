@@ -249,6 +249,15 @@ pub struct GwGradConfig {
     /// derivative machinery, measured at ~2 s for C2H4/def2-TZVPP and ~7.5 s for
     /// C6H6/def2-TZVPP) from the gradient path.
     pub fold_cphf_rhs: bool,
+    /// Solve the QP equation with REST's production **graphical
+    /// linear-interpolation solver** (`ri_gw::linear_interpolation_solver`:
+    /// one damped Newton step centres a uniform 21-point scan of +-0.1 Ha,
+    /// the root is the linear interpolation of the sign change, the crossing
+    /// of largest spectral weight wins) instead of the analytic-derivative
+    /// Newton iteration.  A scan without a sign change falls back to the
+    /// static-coupling estimate (`e_n + Sigma(e_n)`) and reports the root as
+    /// unconverged (`qp_equation_value` then has a large residual).
+    pub qpe_graphical: bool,
     /// Define the LR-CD self-energy through the **static-subtracted continuous**
     /// form of [`GwCdGradEngine`] (the default), evaluated with REST's low-rank
     /// response factors — see the module header.  Numerically identical to the
@@ -290,6 +299,7 @@ impl Default for GwGradConfig {
             fold_cphf_rhs: true,
             compact_qp_cache: false,
             subtracted: true,
+            qpe_graphical: false,
         }
     }
 }
@@ -2549,6 +2559,40 @@ impl<'a> GwGradEngine<'a> {
         // energy, so it is built once and reused by every Newton step (and by
         // the final cache assembly) instead of once per evaluation.
         let table = self.qp_row_table(n);
+        // REST production **graphical solver** (`GwGradConfig::qpe_graphical`):
+        // no Newton iteration at all — the linear-interpolation scan of
+        // `ri_gw::linear_interpolation_solver` defines the root.  A scan
+        // without a sign change returns the static-coupling fallback and the
+        // root is flagged unconverged by its large `qp_equation_value`.
+        if self.config.qpe_graphical {
+            let fq = |om: f64| consts + self.sigma_c_with_table(om, n, &table) - om;
+            let (have_crossing, xg) =
+                crate::ri_gw::linear_interpolation_solver(&fq, self.e[n], side, 21, 0.1);
+            if !have_crossing {
+                println!(
+                    "warning!!! gw_grad graphical solver found no crossing for orbital {n}!"
+                );
+            }
+            let omega = xg;
+            let (_contour, _imag, y_imag, residues) =
+                self.sigma_c_parts_with(omega, n, true, want_y, &table);
+            let (w_imag, m, w0) = (table.w_imag, table.m, table.w0);
+            let dsdw = self.sigma_d_from_parts(omega, &w_imag, &w0, &residues);
+            let m_imag = self.compact_m_imag(&m, !want_y);
+            let y0_static = self.compact_y0_static(&m, &w0, want_y);
+            let y_imag = if want_y { y_imag } else { Vec::new() };
+            return QpCache {
+                target: n,
+                omega,
+                z_factor: 1.0 / (1.0 - dsdw),
+                w_imag,
+                y_imag,
+                m_imag,
+                w0,
+                y0_static,
+                residues,
+            };
+        }
         // Smooth exact-residue mode: the residue frequencies follow the QP
         // energy, so the derivative carries the extra `d zeta/d omega` term of
         // `sigma_d_from_parts` / `d_sigma_d_omega` — both branches use the
@@ -4617,6 +4661,14 @@ impl GwGradEngine<'_> {
     pub fn qp_energy_of(&self, target: usize) -> f64 {
         self.build_target_cache(target).omega
     }
+
+    /// Validation helper: the QP equation residual `consts_n + Sigma_c(omega)
+    /// - omega` at a fixed external frequency.  A root returned by the
+    /// graphical solver has a residual of order the linear-interpolation
+    /// error (~1e-5); an unconverged fallback root stands out at ~1e-2.
+    pub fn qp_equation_value(&self, omega: f64, n: usize) -> f64 {
+        self.consts(n) + self.sigma_c(omega, n) - omega
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5283,18 +5335,67 @@ impl<'a> GwCdGradEngine<'a> {
         (sigma.re, dsigma, cache)
     }
 
+    /// Static term `consts_n = e_n + (1-hyb) Sigma^x_RI,nn - v_xc,nn` without
+    /// the LR-only `qt` cache (this engine sets `skip_lr_cache`): the RI
+    /// exchange of one row is formed from the raw `q` columns through the
+    /// metric transform, identical in value to `GwGradEngine::consts`.
+    pub fn consts(&self, n: usize) -> f64 {
+        let base = &self.base;
+        let naux = base.naux;
+        let exchange = base.with_q(|q| {
+            let mut acc = 0.0f64;
+            for i in 0..base.nocc {
+                let qni = base.gather_pair(q, n, i);
+                let sq = gemm_nn(&base.s_metric, naux, naux, &qni, naux, 1);
+                acc -= sq.iter().map(|x| x * x).sum::<f64>();
+            }
+            acc
+        });
+        base.e[n] + exchange * (1.0 - base.fock_hyb) - base.vxc_nn[n]
+    }
+
+    /// Validation helper: the QP equation residual `omega - consts_n -
+    /// Re Sigma_sub(omega)` at a fixed external frequency (see
+    /// [`GwGradEngine::qp_equation_value`]).
+    pub fn qp_equation_value(&self, omega: f64, n: usize) -> f64 {
+        omega - self.consts(n) - self.sigma_sub_at(omega, n).0
+    }
+
     /// Solve the QP equation of the static-subtracted continuous energy
-    /// with the analytic-derivative Newton iteration and assemble the full
-    /// response cache at the converged root (PySCF `qp_energy_subtracted`).
+    /// and assemble the full response cache at the root.  With
+    /// `GwGradConfig::qpe_graphical` the root comes from REST's production
+    /// graphical linear-interpolation solver instead of the
+    /// analytic-derivative Newton iteration (PySCF `qp_energy_subtracted`).
     pub fn build_target_cache(&self, n: usize) -> CdQpCache {
         let e_n = self.base.e[n];
         let side = if n < self.base.nocc { -1.0 } else { 1.0 };
-        let mut x = e_n + side * 1.0e-2;
+        let consts = self.consts(n);
         let t0 = Instant::now();
+        if self.base.config.qpe_graphical {
+            let fq = |om: f64| om - consts - self.sigma_sub_at(om, n).0;
+            let (have_crossing, xg) =
+                crate::ri_gw::linear_interpolation_solver(&fq, e_n, side, 21, 0.1);
+            if !have_crossing {
+                println!(
+                    "warning!!! cd_gw_grad graphical solver found no crossing for orbital {n}!"
+                );
+            }
+            let (_sigma, dsigma, mut cache) = self.sigma_sub(xg, n);
+            cache.omega = xg;
+            cache.z_factor = 1.0 / (1.0 - dsigma);
+            if grad_timing() {
+                eprintln!(
+                    "[cd_gw_grad timing]   target {n} graphical solve + cache {:8.2}s",
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+            return cache;
+        }
+        let mut x = e_n + side * 1.0e-2;
         let mut converged = false;
         for iter in 0..self.base.config.qpe_max_iter {
             let (sigma, dsigma, _) = self.sigma_sub(x, n);
-            let f = x - e_n - sigma;
+            let f = x - consts - sigma;
             let fp = 1.0 - dsigma;
             let shift = -f / fp;
             if std::env::var("REST_GWGRAD_NEWTON").is_ok() {
