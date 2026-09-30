@@ -2176,6 +2176,15 @@ impl<'a> GwGradEngine<'a> {
         (contour, imag, table.w_imag, y_imag_all, residues, table.m)
     }
 
+    /// Self-energy value from a precomputed row table: the imaginary-axis part
+    /// is a weighted sum over the table (`O(nquad*nmo)`, no gemms) and only the
+    /// residue part is re-evaluated, so scanning the QP equation costs
+    /// microseconds per point instead of a full self-energy evaluation.
+    fn sigma_c_with_table(&self, omega: f64, n: usize, table: &QpRowTable) -> f64 {
+        let (contour, imag, _y, _res) = self.sigma_c_parts_with(omega, n, false, false, table);
+        contour - imag
+    }
+
     /// [`Self::sigma_c_and_d`] from a precomputed row table (the Newton loop).
     fn sigma_c_and_d_with(&self, omega: f64, n: usize, table: &QpRowTable) -> (f64, f64) {
         let (contour, imag, _y, residues) = self.sigma_c_parts_with(omega, n, true, false, table);
@@ -2477,6 +2486,9 @@ impl<'a> GwGradEngine<'a> {
         // residue protocol.
         let mut converged = 0;
         let mut iter = 0;
+        // `(x, f)` of the iterate before the last step: a Newton that stalls on
+        // the residue jumps two-cycles, so these two bracket the discontinuity
+        let mut prev: Option<(f64, f64)> = None;
         while converged == 0 && iter < self.config.qpe_max_iter {
             let (sc, dsc) = self.sigma_c_and_d_with(x, n, &table);
             let fv = consts + sc - x;
@@ -2486,6 +2498,7 @@ impl<'a> GwGradEngine<'a> {
                 println!("[newton DBG] n={} it={} x={:.10} f={:+.3e} shift={:+.3e}",
                     n, iter, x, fv, shift);
             }
+            prev = Some((x, fv));
             x += shift;
             if shift.abs() < self.config.qpe_tol {
                 converged += 1;
@@ -2500,20 +2513,65 @@ impl<'a> GwGradEngine<'a> {
             // scanning is immune to that: reuse the production graphical
             // solver, which brackets the sign change on a grid and interpolates
             // linearly inside it.
-            let mut fq = |om: f64| consts + self.sigma_c(om, n) - om;
+            let fq = |om: f64| consts + self.sigma_c_with_table(om, n, &table) - om;
             let (have_crossing, xg) =
                 crate::ri_gw::linear_interpolation_solver(&fq, self.e[n], side, 21, 0.1);
             if have_crossing {
-                if std::env::var("REST_GWGRAD_NEWTON").is_ok() {
-                    println!(
-                        "[newton] n={} Newton stalled at {:.10}; graphical solver -> {:.10}",
-                        n, x, xg
-                    );
-                }
                 x = xg;
                 converged = 1;
+            } else if let Some((xp, fp)) = prev {
+                // The production scan steps 0.01 Ha, but a residue jump is only
+                // as wide as the distance between two real-axis grid points
+                // mapped back through the pole (1.6e-4 Ha for orbital 91 of
+                // naphthalene/def2-TZVP), so the scan can step over it.  The
+                // stalled two-cycle brackets the jump exactly, and the sign
+                // change inside that bracket is what the graphical solver
+                // reports — bisect it instead of giving up.
+                let fc = fq(x);
+                let (mut lo, mut hi, mut flo, fhi) = if xp <= x {
+                    (xp, x, fp, fc)
+                } else {
+                    (x, xp, fc, fp)
+                };
+                if flo * fhi < 0.0 {
+                    for _ in 0..200 {
+                        if hi - lo < 1.0e-12 {
+                            break;
+                        }
+                        let mid = 0.5 * (lo + hi);
+                        let fm = fq(mid);
+                        if fm == 0.0 {
+                            lo = mid;
+                            hi = mid;
+                            break;
+                        }
+                        if flo * fm < 0.0 {
+                            hi = mid;
+                        } else {
+                            lo = mid;
+                            flo = fm;
+                        }
+                    }
+                    x = 0.5 * (lo + hi);
+                    converged = 1;
+                    if grad_timing() {
+                        eprintln!(
+                            "[gw_grad] orbital {n}: Newton stalled across a residue jump; \
+                             bisected it to {x:.12} (bracket {:.2e} wide)",
+                            hi - lo
+                        );
+                    }
+                } else {
+                    println!(
+                        "warning!!! gw_grad Newton solver did not converge for orbital {}!",
+                        n
+                    );
+                }
             } else {
-                println!("warning!!! gw_grad Newton solver did not converge for orbital {}!", n);
+                println!(
+                    "warning!!! gw_grad Newton solver did not converge for orbital {}!",
+                    n
+                );
             }
         }
         let omega = x;
