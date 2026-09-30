@@ -78,9 +78,6 @@ pub struct DFA4REST {
     pub dfa_paramr_pos: Option<Vec<f64>>,
     pub dfa_hybrid_pos: Option<f64>,
     pub dfa_paramr_adv: Option<Vec<f64>>,
-    /// VV10 non-local correlation parameters `(b, C)`, present only when the
-    /// functional name explicitly requests VV10 (such as `wb97x-v`). The libxc
-    /// VV10 flag alone is not enough: `wb97x-d3bj` must keep using D3.
     pub nlc_vv10: Option<(f64, f64)>,
 }
 
@@ -378,8 +375,6 @@ impl DFA4REST {
 
     pub fn parse_scf(name: &str, spin_channel: usize) -> DFA4REST {
         let tmp_name = name.to_lowercase();
-        // VV10 functionals in the legacy name parser: the single libxc functional
-        // supplies both the semilocal part and the VV10 (b, C) parameters.
         let legacy_nlc_ids: Option<Vec<usize>> = match tmp_name.as_str() {
             "wb97x-v" => Some(vec![466]),
             "wb97m-v" => Some(vec![531]),
