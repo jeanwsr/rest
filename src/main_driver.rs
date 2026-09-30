@@ -888,6 +888,15 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         // list of (gradient name, gradient data)
         let mut grad_data_list: Vec<(String, Box<dyn GradAPI>)> = vec![];
 
+        // post-SCF (doubly-hybrid) gradients with a final-functional XC part need the DFT grids
+        // again, but `xdh_calculations` frees them for memory; regenerate before the SCF gradient
+        // borrows `scf_data` (the pure-MP2 family has no XC part and needs no grid)
+        let is_dh = matches!(scf_data.mol.xc_data.dfa_family_pos, Some(crate::dft::DFAFamily::PT2));
+        let has_dh_xc = scf_data.mol.xc_data.dfa_compnt_pos.as_ref().map_or(false, |v| !v.is_empty());
+        if is_dh && has_dh_xc && scf_data.grids.is_none() {
+            scf_data.grids = Some(crate::dft::Grids::build(&mut scf_data.mol));
+        }
+
         // 1. self-consistent gradient data
         let grad_data_scf: Box<dyn crate::grad::traits::GradAPI> = {
             if !scf_data.mol.ctrl.spin_polarization {

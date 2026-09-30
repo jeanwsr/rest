@@ -1,16 +1,35 @@
-//! Restricted doubly-hybrid (`xc = "mp2"`) analytic gradient: the PT2-correlation part.
+//! Restricted doubly-hybrid (XYG3-family and pure-MP2) analytic gradient.
 //!
-//! The SCF (HF) part of the gradient is provided by the existing `"SCF"` entry of
+//! The SCF-iteration functional's gradient is provided by the existing `"SCF"` entry of
 //! [`crate::main_driver::eval_force`]; this entry covers the D_r-carrying (correlation)
-//! remainder, following the D_r-dependent blocks of pyscf-forge `dh/grad/dfdh.py`:
+//! remainder plus the final-functional difference terms, following pyscf-forge
+//! `dh/grad/dfdh.py`:
 //!
 //! - `de_h`: hcore-derivative term `<H_1(A), D_r>` (forge `_get_gradient_pt2`, first term);
 //! - `de_s1`: overlap-Pulay term `<W, S_1(A)>` with `W = W_I + W_II + W_III` assembled from the
 //!   full four-block PT2 generalized Fock, the orbital-energy terms and the SCF response upon
 //!   the relaxed correlation density (forge `_get_gradient_pt2`, second term);
 //! - `de_jk`: `t1 + t2 + t4` of forge `get_gradient_jk`, restricted to the D_r-carrying weights
-//!   (`C1 = C D_r^S`; the `0.5 C D_mo` exchange part belongs to the `"SCF"` entry);
-//! - `de_rint`: `4 <G_ia, Y_1_ia(A)>` (forge `_get_gradient_pt2`, third term).
+//!   (`C1 = cx C D_r^S` with `cx = dfa_hybrid_scf`; the `0.5 cx_n C D_mo` exchange part belongs
+//!   to the `"SCF"` entry and the difference term below);
+//! - `de_rint`: `4 <G_ia, Y_1_ia(A)>` (forge `_get_gradient_pt2`, third term);
+//! - `de_k_dh`: exchange-derivative difference upon the SCF density with `factor_k =
+//!   dfa_hybrid_pos - dfa_hybrid_scf` (the D_scf part of forge `get_gradient_jk`'s `C D_mo`
+//!   exchange piece; the J part is unchanged);
+//! - `de_xc_n`: skeleton derivative of the final functional's XC part upon the SCF density
+//!   minus the SCF functional's one (forge `_get_gradient_gga` explicit part; the latter is
+//!   already carried by the `"SCF"` entry's `de_xc`);
+//! - `de_resp`: `<D_r_ao, F_1[xc]>`, the explicit AO-derivative of the SCF functional's XC
+//!   potential contracted with the relaxed density (forge `_get_gradient_gga` response part;
+//!   the fxc-upon-D_r half enters the CP-SCF kernel of the Z-vector instead);
+//! - `de_ovlp_dh`: occupied-Pulay difference, `Tr(S1, W_n - dme0)` with `W_n = C_oo F_n(D_scf)_oo
+//!   C_oo^T` the final-functional energy-weighted density (forge `_get_gradient_enfunc`).
+//!
+//! The relaxed density itself is the unrelaxed PT2 rdm1 with its vir-occupied block replaced by
+//! the DH-combined Z-vector: the Lagrangian carries the formal-SCF (Brillouin-violation) term
+//! `4 Cv^T F_n(D_scf) Co` of the final functional on top of the PT2 part. All the
+//! final-functional terms vanish for the pure-MP2 family (no `dfa_compnt_pos`, equal hybrid
+//! coefficients), which leaves the previous RI-MP2-only behaviour untouched.
 //!
 //! Every in-loop metric solve of the old per-atom scheme is replaced by an exact reordering:
 //! the persistent MO partners are pre-contracted once as `Ȳ = partner % S` (`S` = the solve
@@ -21,11 +40,20 @@
 //! rimatr itself), so a matching `policy` is asserted below.
 
 use crate::analdrv::config::AnalDrvConfig;
-use crate::analdrv::response::rresp_interface::{rscf_resp_interface, RRespSCF};
+use crate::analdrv::response::rresp_interface::{rscf_resp_interface, scf_xc_func_list, RRespSCF};
+use crate::analdrv::response::rgfock_interface::{dh_jk_factors, dh_xc_func_list, solve_z_vector};
 use crate::analdrv::response::trait_rgfock::{GFockFlags, RGFockAPI};
 use crate::analdrv::response::trait_rresp::RRespAPI;
+use crate::dft::num_int::{NumInt, XCData};
+use crate::dft::numint_matmul::nimatmul::{regroup_grids_by_atom, NIMatmul};
+use crate::dft::numint_matmul::resp_rks::RRespKSNIMatmul;
+use crate::dft::xc_deriv::XCType;
+use crate::dft::xceff::prelude::{determine_den_type_from_list, XCDenType};
+use crate::grad::rhf::{RIRHFGradient, RIHFGradientFlagsBuilder};
+use crate::grad::rks::get_vxc_rayon_new;
 use crate::grad::traits::GradAPI;
 use crate::mpi_io::MPIOperator;
+use crate::ri_jk::resp_r::RRespRIJK;
 use crate::ri_jk::util;
 use crate::ri_jk::{get_j2c_decomp, J2CDecompose, J2C_THRESH};
 use crate::ri_pt2::rgfock_pt2::RGFockPT2;
@@ -92,10 +120,63 @@ impl<'a> RDHGradient<'a> {
             .expect("Doubly-hybrid gradient requires the PT2 spin factors (dfa_paramr_adv).")
             .try_into()
             .expect("dfa_paramr_adv must have exactly two entries.");
+
+        // gates of the final-functional (doubly-hybrid) terms; the pure-MP2 family has none, and
+        // a bDH whose final functional equals the SCF one is covered by the "SCF" entry entirely
+        let xc_data = &mol_obj.xc_data;
+        let delta_hyb = xc_data.dfa_hybrid_pos.unwrap_or(xc_data.dfa_hybrid_scf) - xc_data.dfa_hybrid_scf;
+        let xc_func_pos = dh_xc_func_list(scf_data);
+        let xc_n_is_scf = match (&xc_data.dfa_compnt_pos, &xc_data.dfa_paramr_pos) {
+            (Some(code), Some(param)) => {
+                code.iter().eq(xc_data.dfa_compnt_scf.iter())
+                    && param.len() == xc_data.dfa_paramr_scf.len()
+                    && param.iter().zip(xc_data.dfa_paramr_scf.iter()).all(|(a, b)| (a - b).abs() < 1e-12)
+            },
+            _ => true,
+        };
+        let add_delta_k = delta_hyb.abs() > 1.0e-10;
+        let add_xc_n = xc_func_pos.is_some() && !xc_n_is_scf;
+        let has_final_functional = add_delta_k || add_xc_n;
+        let add_resp = has_scf_xc_gga(scf_data);
+
+        // atom-grouped copy of the SCF grid, shared by the final-Fock and response terms
+        let grids_regrouped = if has_final_functional || add_resp {
+            let grids = scf_data.grids.as_ref().expect(
+                "Doubly-hybrid gradient requires the DFT grids (`eval_force` regenerates them; `xdh_calculations` frees them).",
+            );
+            Some(regroup_grids_by_atom(
+                grids.coordinates.clone(),
+                grids.weights.clone(),
+                grids.atm_idx.clone(),
+                grids.quadrature_weights.clone(),
+                natm,
+            ))
+        } else {
+            None
+        };
+
+        // F_n(D_scf) = h + J - (hyb_pos / 2) K + v_xc[xc_n]; it enters the DH-combined Lagrangian
+        // (the formal-SCF/Brillouin term `4 Cv^T F_n Co`) and the occupied-Pulay difference
+        let fock_n = if has_final_functional {
+            let (coords, weights, atm_idx_grids, quadrature_weights) = grids_regrouped.as_ref().unwrap();
+            let (factor_j_dh, factor_k_dh) = dh_jk_factors(scf_data);
+            let cderi_dh = rimatr.0.to_rstsr_view(&device).into_cow();
+            let mut resp_rijk = RRespRIJK::new_with_cderi(factor_j_dh, factor_k_dh, cderi_dh);
+            let h_core = scf_data.h_core.to_matrixfull().unwrap().to_rstsr(&device);
+            let mut fock_n = &h_core + resp_rijk.get_fock_rdm(d_hf.view(), true);
+            if xc_func_pos.is_some() {
+                let ni_dh = NIMatmul::new(&mol, coords, weights, atm_idx_grids, quadrature_weights);
+                let mut resp_ks = RRespKSNIMatmul::new(dh_xc_func_list(scf_data).unwrap(), ni_dh, mol_obj.ctrl.print_level > 2);
+                *&mut fock_n += &resp_ks.get_fock_rdm(d_hf.view(), true);
+            }
+            Some(fock_n.into_contig(ColMajor))
+        } else {
+            None
+        };
         let j3c = rimatr.0.to_rstsr_view(&device);
         let mut pt2 = RGFockPT2::<f64>::new(
             mo_coeff.clone(),
-            mo_occ,
+            mo_occ.clone(),
             mo_energy.clone(),
             j3c.into_cow(),
             None,
@@ -108,17 +189,34 @@ impl<'a> RDHGradient<'a> {
         // full four-block request (also caches `g_vix` and the SCF response upon rdm1_corr),
         // then the relaxed density through the DH-level Z-vector
         let _ = pt2.make_gfock(Some(&mut resp_objs), GFockFlags::OO | GFockFlags::VV);
-        let _ = pt2.make_rdm1_resp(&mut resp_objs);
-        let rdm1_resp = pt2.result["rdm1_resp"].to_owned();
-        let gfock_part = pt2.result["gfock_part_full"].to_owned();
         let rdm1 = pt2.result["rdm1"].to_owned();
+        let rdm1_resp = match &fock_n {
+            Some(fock_n) => {
+                // DH-combined Lagrangian: the PT2 part plus the formal-SCF term `4 Cv^T F_n Co`
+                let lag_vo = pt2.make_lagrangian_vo(&mut resp_objs);
+                let lag_xc_n: Tsr<f64> = 4.0 * (cv.view().t() % fock_n.view() % c0.view());
+                let lag_dh = (&lag_vo + &lag_xc_n).into_contig(ColMajor);
+                let z = solve_z_vector(lag_dh.view(), &mut resp_objs);
+                let mut r = rdm1.clone();
+                r.i_mut((sv.clone(), so.clone())).assign(&z.i((sv.clone(), so.clone())));
+                r
+            },
+            None => {
+                let _ = pt2.make_rdm1_resp(&mut resp_objs);
+                pt2.result["rdm1_resp"].to_owned()
+            },
+        };
+        let gfock_part = pt2.result["gfock_part_full"].to_owned();
         let g_vix = pt2.result["g_vix"].to_owned(); // [nvir, nocc, naux]
         self.energy = pt2.e_corr.unwrap_or(0.0);
         drop(pt2);
 
         let d_r_sym = (&rdm1_resp + &rdm1_resp.t()).into_contig(ColMajor);
         let d_r_s: Tsr<f64> = d_r_sym.mapv(|x| 0.5 * x);
-        let c1_dr = (mo_coeff.view() % d_r_s.view()).into_contig(ColMajor);
+        // the exchange (K) part of the SCF functional linearized upon the relaxed density carries
+        // the SCF hybrid coefficient (forge `C1 = cx C D_r_symm`; unity for the MP2/HF reference)
+        let cx_scf = mol_obj.xc_data.dfa_hybrid_scf;
+        let c1_dr: Tsr<f64> = (mo_coeff.view() % d_r_s.view()).mapv(|x| cx_scf * x).into_contig(ColMajor);
         let d_r_ao = (mo_coeff.view() % d_r_s.view() % mo_coeff.view().t()).into_contig(ColMajor);
 
         // SCF response upon the *relaxed* correlation density (forge W_III); the cached `axd`
@@ -149,12 +247,12 @@ impl<'a> RDHGradient<'a> {
         // ── de_h and de_s1 ──
         let mut de_h: Tsr<f64> = rt::zeros(([3, natm], &device));
         let mut de_s1: Tsr<f64> = rt::zeros(([3, natm], &device));
+        let tsr_ipovlp = {
+            let (out, shape) = mol.integrate("int1e_ipovlp", "s1", None).into();
+            rt::asarray((out, shape, &device))
+        };
         {
             let mut hcore_gen = crate::grad::rhf::generator_deriv_hcore(scf_data);
-            let tsr_ipovlp = {
-                let (out, shape) = mol.integrate("int1e_ipovlp", "s1", None).into();
-                rt::asarray((out, shape, &device))
-            };
             // two half-row contractions of the skeleton overlap derivative (forge S_1_ao)
             let s1_mu = (&tsr_ipovlp * &w_ao.i((.., .., None))).sum_axes(1);
             let s1_nu = (&tsr_ipovlp * &w_ao.view().t().i((.., .., None))).sum_axes(1);
@@ -228,6 +326,7 @@ impl<'a> RDHGradient<'a> {
             let a_i = y2t.view().t() % d_r_s.view(); // [naux(P), nmo(q)]
             *&mut r_jk += &a_i.view() % y2t.view();
         }
+        *&mut r_jk *= cx_scf;
 
         // ── pre-contractions `Ȳ = partner % S` (replace all in-loop metric solves) ──
         let ybar_y2: Tsr<f64> = y_ip.view().into_shape([nocc * nmo, naux]) % s_op.view(); // [(i m), Q]
@@ -404,13 +503,167 @@ impl<'a> RDHGradient<'a> {
             de_rint.i_mut((.., atm)).assign(&rt::asarray((grad_ri.as_slice(), [3], &device)));
         }
 
+        // ── doubly-hybrid (final-functional) terms, all absent for the pure-MP2 family ──
+        // `de_k_dh`: exchange-derivative difference upon the SCF density (`factor_k =
+        //     dfa_hybrid_pos - dfa_hybrid_scf`; the J part is unchanged and covered by the "SCF"
+        //     entry), i.e. the D_scf part of forge `get_gradient_jk`'s `0.5 cx_n C D_mo` piece;
+        // `de_xc_n`: XC skeleton difference `xc_n - xc` upon D_scf (forge `_get_gradient_gga`
+        //     explicit part; the SCF-functional one is the "SCF" entry's `de_xc`);
+        // `de_resp`: `<D_r_ao, F_1[xc]>`, the explicit AO-derivative of the SCF functional's XC
+        //     potential (forge `_get_gradient_gga` response part; its fxc-on-D_r half enters the
+        //     CP-SCF kernel of the Z-vector instead);
+        // `de_ovlp_dh`: occupied-Pulay difference `-2 Tr(S1, W_n) - (-Tr(S1, dme0))` with
+        //     `W_n = C_oo F_n(D_scf)_oo C_oo^T` (forge `_get_gradient_enfunc`), against the
+        //     "SCF" entry's `dme0` term.
+        let mut de_k_dh: Tsr<f64> = rt::zeros(([3, natm], &device));
+        let mut de_xc_n: Tsr<f64> = rt::zeros(([3, natm], &device));
+        let mut de_resp: Tsr<f64> = rt::zeros(([3, natm], &device));
+        let mut de_ovlp_dh: Tsr<f64> = rt::zeros(([3, natm], &device));
+        if has_final_functional || add_resp {
+            if add_delta_k {
+                let mut grad_helper = dh_grad_helper(scf_data, self.mpi_operator);
+                grad_helper.flags.factor_k = Some(delta_hyb);
+                grad_helper.calc_de_jk();
+                let de_k = &grad_helper.result["de_k"];
+                de_k_dh.assign(&rt::asarray((&de_k.data, de_k.size, &device)));
+                // the auxiliary-basis-response part of the exchange gradient
+                if let Some(de_kaux) = grad_helper.result.get("de_kaux") {
+                    *&mut de_k_dh += &rt::asarray((&de_kaux.data, de_kaux.size, &device));
+                }
+            }
+            if add_xc_n {
+                // the DH total energy carries the *final* functional's XC skeleton explicitly
+                // (forge `grad_gga`), while the "SCF" entry contributes the SCF functional's one;
+                // add their difference
+                let dao_xc_n = xc_skeleton_dao(scf_data, self.mpi_operator, false, scf_data.grids.as_ref().unwrap());
+                let dao_xc_scf = xc_skeleton_dao(scf_data, self.mpi_operator, true, scf_data.grids.as_ref().unwrap());
+                let dao_xc: Tsr<f64> = 2.0 * (&(&dao_xc_n - &dao_xc_scf) * &d_hf.i((.., .., None))).sum_axes(1);
+                for atm in 0..natm {
+                    let [_, _, p0, p1] = mol_ao_slice[atm];
+                    *&mut de_xc_n.i_mut((.., atm)) += &dao_xc.i(p0..p1).sum_axes(0);
+                }
+            }
+            if add_resp {
+                let (coords, weights, atm_idx_grids, quadrature_weights) = grids_regrouped.as_ref().unwrap();
+                let dm0 = util::get_dm0_restricted(mo_coeff.view(), mo_occ.view());
+                let mut ni = NIMatmul::new(&mol, coords, weights, atm_idx_grids, quadrature_weights);
+                // the explicit AO-derivative of the SCF functional's XC potential (forge
+                // `hessian.rks._get_vxc_deriv1`), contracted with the relaxed density on the fly;
+                // the grid-shift terms are absent, following the forge reference
+                de_resp = de_xc_response_term(&mol, &scf_xc_func_list(scf_data), &mut ni, dm0.view(), d_r_ao.view());
+            }
+            if has_final_functional {
+                let fock_n = fock_n.as_ref().unwrap();
+                let f_n_oo = (c0.view().t() % fock_n.view() % c0.view()).into_contig(ColMajor);
+                let w_n = (c0.view() % &f_n_oo % c0.view().t()).into_contig(ColMajor);
+                // the "SCF" entry's `de_ovlp` carries the `dme0 = C (n eps) C^T` term, while the
+                // final-functional Pulay reads `-2 Tr(S1, W_n)` (no occupancy factor); add the
+                // difference `f(2 W_n - dme0)` only (`f` = the two-half contraction pattern)
+                let dme0 = crate::grad::rhf::get_dme0(mo_coeff.view(), mo_occ.view(), mo_energy.view());
+                let dao_ovlp: Tsr<f64> =
+                    2.0 * (&tsr_ipovlp * &(&(&w_n * 2.0) - &dme0).i((.., .., None))).sum_axes(1);
+                for atm in 0..natm {
+                    let [_, _, p0, p1] = mol_ao_slice[atm];
+                    *&mut de_ovlp_dh.i_mut((.., atm)) += &dao_ovlp.i(p0..p1).sum_axes(0);
+                }
+            }
+        }
+
         // ── assemble the parts ──
-        let de = de_h.view() + de_s1.view() + de_jk.view() + de_rint.view();
-        for (key, val) in [("de_h", de_h), ("de_s1", de_s1), ("de_jk", de_jk), ("de_rint", de_rint), ("de", de.into_owned())] {
+        let de = de_h.view() + de_s1.view() + de_jk.view() + de_rint.view() + de_k_dh.view() + de_xc_n.view()
+            + de_resp.view() + de_ovlp_dh.view();
+        for (key, val) in [
+            ("de_h", de_h),
+            ("de_s1", de_s1),
+            ("de_jk", de_jk),
+            ("de_rint", de_rint),
+            ("de_k_dh", de_k_dh),
+            ("de_xc_n", de_xc_n),
+            ("de_resp", de_resp),
+            ("de_ovlp_dh", de_ovlp_dh),
+            ("de", de.into_owned()),
+        ] {
             self.result.insert(key.to_string(), to_matrix_full(val));
         }
         self
     }
+}
+
+/// Response-density XC term `<D_r_ao, F_1[A, t]>` of the DH gradient (forge `_get_gradient_gga`
+/// response part), with `F_1[A, t, mu, nu]` the explicit AO-derivative of the SCF functional's XC
+/// potential (the gradient-level analogue of forge `hessian.rks._get_vxc_deriv1`, including its
+/// fxc-upon-skeleton-density part; the grid-shift terms are absent, following the forge
+/// reference).
+///
+/// Chunk-parallel over the (atom-grouped) grid on first-and-second-order AO channels, with the
+/// relaxed density contracted immediately, so only the Hessian-level kernels of
+/// [`crate::dft::numint_matmul::hess_rks`] are reused and no full-grid
+/// `[nao, nao, 3, natm]` accumulator is held.
+fn de_xc_response_term(
+    mol: &CInt,
+    xc_func_list: &[(f64, libxc::functional::LibXCFunctional)],
+    ni: &mut NIMatmul,
+    dm0: TsrView,
+    d_r_ao: TsrView,
+) -> Tsr<f64> {
+    use crate::dft::numint_matmul::hess_rks::{get_drho, get_rho_exc_vxc_fxc, get_vmat_fxc, get_vmat_ip, get_vmat_vxc};
+    use crate::dft::xceff::prelude::XCDenType::*;
+
+    let natm = mol.natm();
+    let nao = mol.nao();
+    let ngrids = ni.weights.len();
+    let device = dm0.device().clone();
+    let aoslices = mol.aoslice_by_atom();
+    let func_refs: Vec<&libxc::functional::LibXCFunctional> = xc_func_list.iter().map(|(_, f)| f).collect();
+    let xc_type = determine_den_type_from_list(&func_refs);
+    // gradient-level AO derivative order (pyscf `grad.rks` convention; the Hessian needs one more)
+    let ao_deriv = match xc_type {
+        RHO => 1,
+        _ => 2,
+    };
+    let ncomp_ao_dm0 = xc_type.num_ao_comp();
+
+    let de_resp: Tsr<f64> = rt::zeros(([3, natm].f(), &device));
+    let nchunk_target = (rayon::current_num_threads() * 8).max(1);
+    let nsplit = (ngrids + nchunk_target - 1) / nchunk_target;
+    let chunks = (0..ngrids).step_by(nsplit).map(|s| (s, (s + nsplit).min(ngrids))).collect::<Vec<_>>();
+    let guard = std::sync::Mutex::new(());
+    use rayon::prelude::*;
+    let weights_full = ni.weights.clone();
+    let d_r_ao_ref = &d_r_ao;
+    let dm0_owned: Tsr<f64> = dm0.into_contig(ColMajor).into_owned();
+    let ni_ref = &*ni;
+    let device_ref = &device;
+    let aoslices_ref = &aoslices;
+    chunks.into_par_iter().for_each(|(start, end)| {
+        let mut ni_chunk = ni_ref.split_batch(start, end);
+        let weights = rt::asarray((&weights_full[start..end], device_ref));
+        let ao = ni_chunk.get_cached_ao(ao_deriv);
+        let ao_dm0 = ao.i((Ellipsis, ..ncomp_ao_dm0)) % &dm0_owned;
+        let (_rho, _exc, vxc, fxc) = get_rho_exc_vxc_fxc(xc_func_list, ao.view(), ao_dm0.view());
+        let wv = &weights * &vxc;
+        let wf = &weights * &fxc;
+        let drho = get_drho(xc_type, ao.view(), ao_dm0.view(), aoslices_ref);
+        let vmat_ip = get_vmat_ip(xc_type, ao.view(), wv.view());
+        let vmat_fxc = get_vmat_fxc(xc_type, ao.view(), drho.view(), wf.view());
+        let vmat_vxc = get_vmat_vxc(vmat_ip.view(), aoslices_ref);
+        let vmat = &vmat_fxc + &vmat_vxc;
+        let mut de_chunk: Tsr<f64> = rt::zeros(([3, natm].f(), &device));
+        for atm in 0..natm {
+            for t in 0..3 {
+                let v: f64 = rt::vecdot(
+                    &d_r_ao_ref.view().into_shape([nao * nao]),
+                    &vmat.i((.., .., t, atm)).into_shape([nao * nao]),
+                    -1,
+                )
+                .sum_all();
+                de_chunk[[t, atm]] = v;
+            }
+        }
+        let _lock = guard.lock().unwrap();
+        unsafe { *&mut de_resp.force_mut() += &de_chunk };
+    });
+    de_resp
 }
 
 /// `[3, natm]` device tensor into a `MatrixFull` of the same shape.
@@ -461,4 +714,70 @@ impl GradAPI for RDHGradient<'_> {
     fn get_energy(&self) -> f64 {
         self.energy
     }
+}
+
+/// Whether the SCF-iteration functional carries a GGA-or-higher XC part (the gate of the
+/// response-density XC term; LDA-type functionals have no grid-gradient contribution here,
+/// following pyscf-forge's `_xc_type(xc) == "GGA"` gate).
+fn has_scf_xc_gga(scf_data: &SCF) -> bool {
+    let xc_data = &scf_data.mol.xc_data;
+    if xc_data.dfa_compnt_scf.is_empty() {
+        return false;
+    }
+    let func_list = scf_xc_func_list(scf_data);
+    let refs: Vec<&libxc::functional::LibXCFunctional> = func_list.iter().map(|(_, f)| f).collect();
+    let xc_type = determine_den_type_from_list(&refs);
+    matches!(xc_type, XCDenType::SIGMA | XCDenType::TAU)
+}
+
+/// A bare gradient helper carrying the SCF control flags, for reuse of the gradient kernels
+/// (`calc_de_jk` with custom J/K factors, `get_vxc_rayon_new`).
+fn dh_grad_helper<'a>(scf_data: &'a SCF, mpi_operator: &'a Option<MPIOperator>) -> RIRHFGradient<'a> {
+    let mol_obj = &scf_data.mol;
+    let flags = RIHFGradientFlagsBuilder::default()
+        .print_level(mol_obj.ctrl.print_level)
+        .max_memory(mol_obj.ctrl.max_memory)
+        .auxbasis_response(mol_obj.ctrl.auxbasis_response)
+        .factor_j(None)
+        .factor_k(None)
+        .build()
+        .unwrap();
+    RIRHFGradient { scf_data, flags, mpi_operator, result: HashMap::new() }
+}
+
+/// AO-derivative XC potential contraction `dao_vxc[nao, 3]` of one functional (the row-scatter,
+/// contracted with the SCF density and the two-half factor, is its skeleton-gradient
+/// contribution); `scf` selects the SCF-iteration functional, else the final (`pos`) one.
+fn xc_skeleton_dao(scf_data: &SCF, mpi_operator: &Option<MPIOperator>, scf: bool, grids: &crate::dft::Grids) -> Tsr<f64> {
+    let mol_obj = &scf_data.mol;
+    let xc_data = &mol_obj.xc_data;
+    let (code, param) = if scf {
+        (&xc_data.dfa_compnt_scf, &xc_data.dfa_paramr_scf)
+    } else {
+        (
+            xc_data.dfa_compnt_pos.as_ref().expect("the final functional has no XC component list."),
+            xc_data.dfa_paramr_pos.as_ref().expect("the final functional has no XC parameter list."),
+        )
+    };
+    let xc_type = if code.iter().any(|&c| xc_data.init_libxc(&c).needs_tau()) {
+        XCType::MGGA
+    } else if code
+        .iter()
+        .any(|&c| !matches!(xc_data.init_libxc(&c).family(), libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA))
+    {
+        XCType::GGA
+    } else {
+        XCType::LDA
+    };
+    let xc_data_sel = XCData {
+        xc_type,
+        xc_code: code,
+        xc_params: param,
+        device: DeviceOpenBLAS::default(),
+        dm: &scf_data.density_matrix,
+        mo_coeffs: None,
+        occ: None,
+    };
+    let mut grids_clone = grids.clone();
+    get_vxc_rayon_new(&dh_grad_helper(scf_data, mpi_operator), &xc_data_sel, &mut grids_clone, mol_obj, 16)
 }

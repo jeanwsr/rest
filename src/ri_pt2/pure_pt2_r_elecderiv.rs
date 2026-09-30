@@ -75,7 +75,8 @@ where
     let full_gfock = *full_gfock;
     let dump_g_vix = *dump_g_vix;
 
-    let bi1_scale = O::from_f64(2.0 * c_os).unwrap();
+    // biorthogonal amplitude `T = (c_os + c_ss) t - c_ss t^T` (forge `restricted_biorthogonalize`)
+    let bi1_scale = O::from_f64(c_os + c_ss).unwrap();
     let bi2_scale = O::from_f64(*c_ss).unwrap();
     let device = cderi.device().clone();
 
