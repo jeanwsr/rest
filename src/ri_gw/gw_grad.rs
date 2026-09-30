@@ -51,11 +51,15 @@
 //!   lookup) and the QP Newton iteration all follow REST's production
 //!   low-rank path (`ri_gw::contour_rayon_lowrank`, `generate_real_axis_vchiv`,
 //!   `newton_solver_lowrank`).
-//! * The reference must be a restricted closed-shell density-fitted HF
-//!   calculation without frozen orbitals (`consts_n = eps_n`, `B = 0`).  A
-//!   guard rejects references for which the static term
-//!   `B_n = (1-alpha) Sigma_x,nn - v_xc,nn` does not vanish; extending to DFT
-//!   references only requires filling the `bB` covector.
+//! * The reference is a restricted closed-shell density-fitted calculation
+//!   without frozen orbitals: HF, pure-DFA (GGA) and global-hybrid references
+//!   are supported.  The static term `B_n = (1-alpha) Sigma_x,nn - v_xc,nn`
+//!   of the QP equation is differentiated in full: the `(1-alpha)` RI
+//!   exchange through the (bq, bJ) pullback, the v_xc part (explicit grid
+//!   derivative, orbital rotation and XC-kernel density response) through
+//!   the `b_x` covector of `canonical_response_batch` (port of
+//!   `pyscf/gw/gw_cd_grad.py::_b_nuclear_deriv`).  Range-separated hybrids
+//!   are rejected.
 //! * The orbital response (U, eps1) is the full canonical CPHF response:
 //!   the CP-HF equation is solved by REST's `analdrv` driver (`RHessSCF`
 //!   block-Krylov over all perturbations, RI-JK response on `rimatr`), and
@@ -1311,6 +1315,12 @@ pub struct GwGradEngine<'a> {
     pub fock_hyb: f64,
     /// v_xc diagonal in the MO basis (cached once)
     vxc_nn: Vec<f64>,
+    /// Full v_xc matrix in the MO basis `[nmo*nmo]` col-major (empty for an
+    /// HF reference).  The static term `B = (1-alpha) Sigma_x - v_xc` of the
+    /// QP equation is differentiated through the `b_x` covector, whose
+    /// orbital-response piece `2 sum_p U[p,n] v_xc[p,n]` reads this matrix;
+    /// the exchange part flows through the (bq, bJ) pullback instead.
+    vxc_mo: Vec<f64>,
     /// symmetry-protected degenerate shells of `e` (see
     /// [`degenerate_shells`]); shells of size 1 are non-degenerate orbitals
     pub shells: Vec<Vec<usize>>,
@@ -1608,6 +1618,18 @@ impl<'a> GwGradEngine<'a> {
         let hybrid = scf.mol.xc_data.dfa_hybrid_scf;
         let fock_hyb = if scf.mol.xc_data.dfa_compnt_scf.is_empty() { 1.0 } else { hybrid };
         let vxc_nn = crate::ri_gw::vxc_ao2mo(scf);
+        let vxc_mo: Vec<f64> = if scf.mol.xc_data.dfa_compnt_scf.is_empty() {
+            Vec::new()
+        } else {
+            let vxc_ao = scf
+                .generate_vxc_rayon(1.0)
+                .2[0]
+                .to_matrixfull()
+                .expect("gw_grad: v_xc AO matrix")
+                .data;
+            let t = gemm_nt(&c_mo.data, nao, nmo, &vxc_ao, nao, nao);
+            gemm_nn(&t, nmo, nao, &c_mo.data, nao, nmo)
+        };
         let (shells, shell_of) = degenerate_shells(&e, config.degenerate_tol);
         if config.degenerate_tol > 0.0 && std::env::var("REST_GWGRAD_DBG").is_ok() {
             let deg: Vec<&Vec<usize>> = shells.iter().filter(|s| s.len() > 1).collect();
@@ -1645,6 +1667,7 @@ impl<'a> GwGradEngine<'a> {
                 hybrid,
                 fock_hyb,
                 vxc_nn,
+                vxc_mo,
                 shells,
                 shell_of,
             }
@@ -1698,6 +1721,7 @@ impl<'a> GwGradEngine<'a> {
                 hybrid,
                 fock_hyb,
                 vxc_nn,
+                vxc_mo,
                 shells,
                 shell_of,
             }
@@ -3911,9 +3935,9 @@ impl GwGradEngine<'_> {
     ///
     /// Returns one `(U [nmo*nmo col-major], eps1 [nmo], b_x [nmo])` per
     /// perturbation, ordered `atm*3 + comp`; `U` and `eps1` follow
-    /// `pyscf/gw/gw_cd_grad*.py::_cp_response_atom` and `b_x` is the
-    /// derivative of the static term `B_nn` (identically zero for an HF
-    /// reference, which is the only supported reference).
+    /// `pyscf/gw/gw_cd_grad*.py::_cp_response_atom` and `b_x` is the v_xc
+    /// derivative of the static term `B_nn` (zero for an HF reference; see
+    /// the module header).
     pub fn canonical_response_batch(
         &self,
     ) -> Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> {
@@ -3958,19 +3982,38 @@ impl GwGradEngine<'_> {
         let nocc = self.nocc;
         let natm = self.natm;
 
-        // reference guard: the v_xc relaxation of the static term is not
-        // implemented, so only exchange-only references are supported
-        let mut vxc_abs = 0.0f64;
-        for v in &self.vxc_nn[..self.nmo] {
-            vxc_abs = vxc_abs.max(v.abs());
-        }
-        assert!(
-            vxc_abs < 1.0e-12,
-            "gw_grad: reference has a nonzero v_xc (|v_xc| = {:.3e}); the \
-             derivative of B_n = (1-alpha) Sigma_x - v_xc is only implemented \
-             for exchange-only (HF) references",
-            vxc_abs
-        );
+        // ---- DFT reference pieces of the CP-KS solve and the B_n covector --
+        // The static term `B_n = (1-alpha) Sigma_x - v_xc` of the QP equation
+        // is differentiated in three channels: the (1-alpha) RI-exchange part
+        // through the (bq, bJ) pullback (see `qp_pullback_chunk`), and the
+        // v_xc part through the `b_x` covector:
+        //   b_x[n] = -[ <n|dv_xc^expl/dR|n> + 2 sum_p U[p,n] v_xc[p,n]
+        //               + <n| fxc(D^x) |n> ],
+        // the explicit grid derivative (frozen density and MOs), the orbital
+        // rotation and the XC-kernel density response of the reference
+        // (port of `pyscf/gw/gw_cd_grad.py::_b_nuclear_deriv`).  The same
+        // v_xc pieces must also enter the CP-KS right-hand side and the
+        // first-order Fock of the Roothaan restoration, so that `U`, `eps1`
+        // are the KS response of the actual reference.
+        let is_hf = self.scf.mol.xc_data.dfa_compnt_scf.is_empty();
+        let vxc_d1_atoms: Option<Vec<Vec<f64>>> = if is_hf {
+            None
+        } else {
+            assert!(
+                self.scf.mol.xc_data.omega().is_none(),
+                "gw_grad: range-separated hybrid references are not supported"
+            );
+            let t0 = Instant::now();
+            let v = crate::hessian::rks::compute_vxc_h1ao(self.scf);
+            if grad_timing() {
+                eprintln!(
+                    "[gw_grad timing]   cphf: vxc_deriv1 grid sweep {:8.2}s",
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+            Some(v)
+        };
+        let fxc_cache = crate::hessian::rks::prepare_fxc_cache(self.scf);
 
         // ---- analdrv CP-HF driver with the RI-JK response ----
         let device = DeviceBLAS::default();
@@ -3997,9 +4040,11 @@ impl GwGradEngine<'_> {
             &device,
             self.scf.mol.ctrl.j2c_decomp.clone(),
         );
-        let is_hf = self.scf.mol.xc_data.dfa_compnt_scf.is_empty();
-        assert!(is_hf, "gw_grad: analdrv CP-HF path supports HF references only");
-        let mut rijk_obj = RHessRIJK::new_with_cderi(&mol, &aux, 1.0, 1.0, cderi, j2c_decomp);
+        // the skeleton/response exchange weight follows the reference: the
+        // frozen Fock is `h1 + J1 - 0.5*hyb*K1 (+ v_xc^x)` for a hybrid,
+        // exactly `J - K` for HF (`fock_hyb` is 1.0 there)
+        let mut rijk_obj =
+            RHessRIJK::new_with_cderi(&mol, &aux, 1.0, self.fock_hyb, cderi, j2c_decomp);
 
         let mut config = AnalDrvConfig::default();
         config.resp.cache_kernel = self.config.resp_cache_kernel;
@@ -4012,7 +4057,7 @@ impl GwGradEngine<'_> {
         let el_list: Vec<&mut dyn RHessElecInteractAPI> = vec![&mut rijk_obj];
         // `hess` holds a mutable borrow of `resp`, so it is confined to this
         // scope; the block ends before `resp` is used directly for the solve.
-        let (rhs_map, t_prep, t_rhs) = {
+        let (mut rhs_map, t_prep, t_rhs) = {
             let mut hess = RHessSCF::new(
                 mo_coeff, mo_occ, mo_energy, &mut ovlp_obj, nuc_list, core_list, el_list,
                 &mut resp, &config.nucgrad,
@@ -4033,6 +4078,33 @@ impl GwGradEngine<'_> {
             let t_rhs = t_rhs0.elapsed().as_secs_f64();
             (rhs_map, t_prep, t_rhs)
         };
+        // ---- v_xc skeleton of the CP-KS right-hand side ----
+        // `compute_dimless_cpscf_rhs` only knows the core + RI-JK skeleton;
+        // a DFT reference adds the frozen-density XC derivative, which enters
+        // the dimensionless rhs exactly like `f1mo` does:
+        // `rhs[vir,occ] -= (C^T v_xc^x C)[vir,occ] / (e_a - e_i + shift)`.
+        if let Some(vxc_d1) = vxc_d1_atoms.as_ref() {
+            let level_shift = config.resp.level_shift;
+            let rhs_tsr_mut = rhs_map.get_mut("rhs").expect("gw_grad: rhs tensor");
+            let off = rhs_tsr_mut.offset();
+            let rhs_raw = &mut rhs_tsr_mut.raw_mut()[off..];
+            for atm in 0..natm {
+                for comp in 0..3 {
+                    let vxc_d1_ao = vxc_block_ao(&vxc_d1[atm], comp, nao);
+                    let t = gemm_nt(&self.c_mo.data, nao, nmo, &vxc_d1_ao, nao, nao);
+                    let vxc_d1_mo = gemm_nn(&t, nmo, nao, &self.c_mo.data, nao, nmo);
+                    let k = atm * 3 + comp;
+                    let base = k * nmo * nocc;
+                    for i in 0..nocc {
+                        for a in nocc..nmo {
+                            let denom = self.e[a] - self.e[i] + level_shift;
+                            rhs_raw[base + a + i * nmo] -=
+                                vxc_d1_mo[a + i * nmo] / denom;
+                        }
+                    }
+                }
+            }
+        }
         let t_solve0 = Instant::now();
         let mo1_tsr = resp.solve_dimless_cpscf(rhs_map["rhs"].view()); // [nmo, nocc, 3, natm]
         let t_solve = t_solve0.elapsed().as_secs_f64();
@@ -4068,12 +4140,30 @@ impl GwGradEngine<'_> {
                 let dj = self.raw.d_j_atom(atm, comp);
                 t_dij += t0.elapsed().as_secs_f64();
                 let t0 = Instant::now();
-                let (f1_skel_mo, s1_mo, jd, kd) =
+                // v_xc skeleton of this perturbation in the MO basis (DFT
+                // references): shared by the skeleton Fock and the b_x covector
+                let vxc_d1_mo: Option<Vec<f64>> = vxc_d1_atoms.as_ref().map(|v| {
+                    let vao = vxc_block_ao(&v[atm], comp, nao);
+                    let t = gemm_nt(&self.c_mo.data, nao, nmo, &vao, nao, nao);
+                    gemm_nn(&t, nmo, nao, &self.c_mo.data, nao, nmo)
+                });
+                let (mut f1_skel_mo, s1_mo, jd, kd) =
                     self.canonical_skeleton_mo(atm, comp, &h1r, &s1r, &di, &dj);
+                if let Some(vd1) = vxc_d1_mo.as_ref() {
+                    for (f, v) in f1_skel_mo.iter_mut().zip(vd1.iter()) {
+                        *f += v;
+                    }
+                }
                 t_skel += t0.elapsed().as_secs_f64();
                 let mo1_slab = &mo1_data[k_pert * nmo * nocc..(k_pert + 1) * nmo * nocc];
                 let t0 = Instant::now();
-                let resp1 = self.canonical_finish(&f1_skel_mo, &s1_mo, mo1_slab);
+                let resp1 = self.canonical_finish(
+                    &f1_skel_mo,
+                    &s1_mo,
+                    mo1_slab,
+                    vxc_d1_mo.as_deref(),
+                    fxc_cache.as_ref(),
+                );
                 responses.push(resp1);
                 if collect_debug {
                     debug.push((
@@ -4134,7 +4224,13 @@ impl GwGradEngine<'_> {
             timer_add(1, t0);
             (jd, kd)
         };
-        let vfrozen: Vec<f64> = jd.iter().zip(kd.iter()).map(|(a, b)| a - 0.5 * b).collect();
+        // frozen Fock skeleton `h1 + J1 - 0.5*hyb*K1` — the exchange weight
+        // follows the reference (`fock_hyb` is 1.0 for HF)
+        let vfrozen: Vec<f64> = jd
+            .iter()
+            .zip(kd.iter())
+            .map(|(a, b)| a - 0.5 * self.fock_hyb * b)
+            .collect();
         // Fock skeleton in AO, col-major
         let mut f1_ao = vec![0.0f64; n2];
         for k in 0..n2 {
@@ -4163,12 +4259,18 @@ impl GwGradEngine<'_> {
 
     /// Canonical-orbital response `(u, eps1, b_x)` of one perturbation from
     /// the analdrv CP-HF solution: relaxed first-order density, complete
-    /// first-order Fock and the Roothaan-style orbital rotations.
+    /// first-order Fock and the Roothaan-style orbital rotations.  With a DFT
+    /// reference (`vxc_d1_mo` given) the relaxed Fock carries the XC-kernel
+    /// response `fxc(D^x)` and `b_x` collects the v_xc derivative of the
+    /// static term `B_n = (1-alpha) Sigma_x - v_xc` (see
+    /// `canonical_response_batch_impl`); for HF `b_x` stays zero.
     fn canonical_finish(
         &self,
         f1_skel_mo: &[f64], // skeleton F1 in MO basis [nmo*nmo], col-major
         s1_mo: &[f64],      // overlap derivative in MO basis [nmo*nmo], col-major
         mo1: &[f64],        // analdrv CP-HF solution [nmo*nocc], col-major
+        vxc_d1_mo: Option<&[f64]>, // frozen-density v_xc skeleton, MO [nmo*nmo]
+        fxc_cache: Option<&crate::dft::response::FxcHessianCache>,
     ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let nao = self.nao;
         let nmo = self.nmo;
@@ -4206,15 +4308,23 @@ impl GwGradEngine<'_> {
         let j_up = crate::dft::response::compute_j_upper(self.scf, &vec![dm1_m.clone()]);
         timer_add(2, t0);
         let t0 = Instant::now();
-        let k_up = crate::dft::response::compute_k_upper(self.scf, &vec![dm1_m]);
+        let k_up = crate::dft::response::compute_k_upper(self.scf, &vec![dm1_m.clone()]);
         timer_add(3, t0);
         let j_full = j_up.to_matrixfull().expect("gw_grad: J upper").data;
         let k_full = k_up.to_matrixfull().expect("gw_grad: K upper").data;
+        // XC-kernel response of the density change (DFT references only)
+        let fxc_ao: Option<MatrixFull<f64>> = fxc_cache
+            .map(|c| crate::dft::response::compute_fxc_response_ao_cached(c, &dm1_m));
 
         // relaxed part of the first-order Fock in the AO basis ...
         let mut f1_relaxed = vec![0.0f64; n2];
         for k in 0..n2 {
             f1_relaxed[k] = j_full[k] - 0.5 * self.fock_hyb * k_full[k];
+        }
+        if let Some(fa) = fxc_ao.as_ref() {
+            for (f, v) in f1_relaxed.iter_mut().zip(fa.data.iter()) {
+                *f += v;
+            }
         }
         // ... transformed to MO and added to the skeleton derivative
         let f1_mo: Vec<f64> = {
@@ -4314,7 +4424,39 @@ impl GwGradEngine<'_> {
         if orth > 1.0e-6 {
             println!("warning!!! gw_grad canonical response orthogonality error {:.3e}", orth);
         }
-        (u, eps1, vec![0.0f64; nmo])
+        // ---- v_xc part of the static-term covector b_x (DFT references) ----
+        // `b_x[p] = -d v_xc,pp / dR`: explicit grid derivative (frozen density
+        // and MOs), orbital rotation `2 sum_q U[q,p] v_xc[q,p]` and the
+        // XC-kernel response `<p| fxc(D^x) |p>` of the first-order density.
+        // The `(1-alpha) Sigma_x` half of `B_n` needs nothing here — its
+        // complete derivative (explicit + orbital) flows through the
+        // (bq, bJ) exchange pullback of `qp_pullback_chunk`.
+        let mut b_x = vec![0.0f64; nmo];
+        if let Some(vd1) = vxc_d1_mo {
+            // MO diagonal of the fxc response: diag(C^T fxc_ao C)
+            let fxc_diag: Vec<f64> = if let Some(fa) = fxc_ao.as_ref() {
+                let t = gemm_nt(&self.c_mo.data, nao, nmo, &fa.data, nao, nao);
+                (0..nmo)
+                    .map(|p| {
+                        let base = p * nao;
+                        (0..nao)
+                            .map(|mu| t[p + mu * nmo] * self.c_mo.data[mu + base])
+                            .sum::<f64>()
+                    })
+                    .collect()
+            } else {
+                vec![0.0f64; nmo]
+            };
+            for p in 0..nmo {
+                let mut s = vd1[p + p * nmo] + fxc_diag[p];
+                let col = p * nmo;
+                for q in 0..nmo {
+                    s += 2.0 * u[q + col] * self.vxc_mo[q + col];
+                }
+                b_x[p] = -s;
+            }
+        }
+        (u, eps1, b_x)
     }
 
     /// Analytic gradient of one LR-CD G0W0 QP energy.
@@ -4480,6 +4622,22 @@ impl GwGradEngine<'_> {
 // ---------------------------------------------------------------------------
 // free helpers
 // ---------------------------------------------------------------------------
+
+/// One Cartesian component of the per-atom XC skeleton
+/// (`hessian::rks::compute_vxc_h1ao`): the flattened col-major `[3*nao, nao]`
+/// block reduced to a `[nao, nao]` col-major buffer of component `comp`
+/// (rows `[comp*nao, (comp+1)*nao)`).
+fn vxc_block_ao(flat: &[f64], comp: usize, nao: usize) -> Vec<f64> {
+    let n2 = nao * nao;
+    let mut out = vec![0.0f64; n2];
+    let row0 = comp * nao;
+    for j in 0..nao {
+        for i in 0..nao {
+            out[i + j * nao] = flat[row0 + i + j * 3 * nao];
+        }
+    }
+    out
+}
 
 fn nearest_grid_value(zs: &[f64], z: f64) -> f64 {
     let n = zs.len();
@@ -4682,8 +4840,9 @@ fn symmetrise_square(v: &mut [f64], n: usize) {
 // contributions of all three terms carry the total coefficient (1/2 - f_m)
 // and are pulled back once per cache; the imaginary-axis buckets are
 // accumulated frequency-major; the moving residues are rank-one pullbacks.
-// Only exchange-only (HF) references are supported (B_n = 0), as for the
-// low-rank engine.
+// HF, pure-DFA and global-hybrid references are supported (the v_xc part of
+// the static term flows through the shared `b_x` covector of
+// `canonical_response_batch`); range-separated hybrids are rejected.
 
 extern "C" {
     fn zgetrf_(
