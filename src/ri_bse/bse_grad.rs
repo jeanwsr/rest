@@ -1376,6 +1376,26 @@ pub fn kernel_vjp(
     (qbar, jbar, ebar)
 }
 
+/// Per-atom derivative data of the adjoint contraction, shared by every root.
+struct AdjointAtomData {
+    /// `dh1/dR` of this atom (`[nao, nao]`, col-major)
+    h1r: Vec<f64>,
+    /// `dS/dR` of this atom, one `[nao, nao]` per Cartesian component
+    s1r: Vec<Vec<f64>>,
+    /// `dJ/dR` of this atom, one `[naux, naux]` per Cartesian component
+    djs: Vec<Vec<f64>>,
+}
+
+impl AdjointAtomData {
+    fn build(gw: &GwGradEngine, atm: usize) -> Self {
+        AdjointAtomData {
+            h1r: crate::hessian::rhf::build_hcore_first_deriv(&gw.scf.mol, atm),
+            s1r: crate::ri_cphf::cphf_solver_pyscf::build_s1ao_deriv(&gw.scf.mol, atm),
+            djs: (0..3).map(|c| gw.raw.d_j_atom(atm, c)).collect(),
+        }
+    }
+}
+
 /// Are the folded rotation covector and the screening-energy covector
 /// **isotropic on every symmetry-degenerate shell**?
 ///
@@ -1662,7 +1682,7 @@ impl<'a> BseGradEngine<'a> {
         let mut weights: Vec<Vec<f64>> = Vec::with_capacity(nk);
         let mut ebar_direct: Vec<Vec<f64>> = Vec::with_capacity(nk);
         let mut bj_k: Vec<Vec<f64>> = Vec::with_capacity(nk);
-        let mut theta_k: Vec<KernelVjpCompact> = Vec::with_capacity(nk);
+        let mut theta_k: Vec<Option<KernelVjpCompact>> = Vec::with_capacity(nk);
         let t_kernel = Instant::now();
         for root in &self.roots {
             // amplitude weights cover the occupied orbitals and the active
@@ -1695,7 +1715,7 @@ impl<'a> BseGradEngine<'a> {
             }
             weights.push(w);
             bj_k.push(kv.jbar());
-            theta_k.push(kv);
+            theta_k.push(Some(kv));
         }
         if ebar_direct.len() < nk {
             let pad = vec![0.0f64; nmo];
@@ -1708,6 +1728,13 @@ impl<'a> BseGradEngine<'a> {
             eprintln!("[bse_grad mem] kernel covectors: rss {:.0} MB", crate::hessian::memory_monitor::current_rss_mb());
         }
 
+        // `q` (the metric-transformed three-centre MO integrals, `naux*nmo^2`) is
+        // read only while building the QP caches above and by the legacy
+        // `qx`-materialising fold; the pullback uses the cached row tables and
+        // the fold streams the raw integral blocks, so it is released here for
+        // the whole assembly.  `with_q` rebuilds it on demand if a later cache
+        // build needs it.
+        self.gw.evict_q();
         // ---- streaming QP pullback ----
         // The QP caches are the largest geometry-fixed object of this path.  In
         // the compact representation one cache is a single `[naux, nmo]` metric
@@ -1770,28 +1797,6 @@ impl<'a> BseGradEngine<'a> {
         drop(bj_k);
         drop(ebar_direct);
 
-        // ---- fold every root's total covector once ----
-        // `sum_{P,pq} qbar[P,pq] qx[P,pq]` with `qx = C^T dI C + U^T q + q U`
-        // is rewritten in the basis-independent ("folded") form
-        // `sum_P <C qbar_P C^T, dI_P> + 2 Tr[U^T W]`, whose perturbation-dependent
-        // part is only `O(naux nao^2)` instead of the `O(naux nao^2 nmo)` of
-        // materialising `qx` for each of the `3 natm` perturbations.  The fold
-        // itself is done once per root on the total (QP + kernel) pair covector.
-        let t_fold = Instant::now();
-        let mut folds: Vec<crate::ri_gw::gw_grad::FoldedCovector> = Vec::with_capacity(nk);
-        for (k, kv) in theta_k.iter().enumerate() {
-            let mut qbar = std::mem::take(&mut bq[k]);
-            kv.add_into_full_pair(&mut qbar, naux, nmo);
-            folds.push(self.gw.fold_covector(&qbar));
-        }
-        drop(bq);
-        drop(theta_k);
-        crate::hessian::memory_monitor::trim_to_os(0);
-        let t_fold = t_fold.elapsed().as_secs_f64();
-        if grad_timing() {
-            eprintln!("[bse_grad mem] fold:            rss {:.0} MB", crate::hessian::memory_monitor::current_rss_mb());
-        }
-
         // ---- CP-HF channel ----
         // Two routes produce the same contraction of the CP-HF response with the
         // root covectors:
@@ -1803,71 +1808,158 @@ impl<'a> BseGradEngine<'a> {
         //   into AO-basis covectors once per root and contract them against the
         //   streamed derivative integrals, so one adjoint solve replaces the
         //   `3 natm`-column Krylov solve.  Measured at naphthalene/def2-SVP:
-        //   5.1 s for the whole channel against 54.9 s of canonical CP-HF, and
-        //   a much smaller transient (no `naux*nao^2` RHS tensor, no
-        //   per-perturbation skeleton derivative).
-        let can_adjoint = self.gw.config.adjoint_cphf
+        //   5.5 s for the whole channel against 54.9 s of canonical CP-HF.
+        //
+        // Both routes need the *folded* form of the total (QP + kernel) pair
+        // covector,
+        //
+        //     sum_{P,pq} qbar[P,pq] qx[P,pq]
+        //         = sum_P <C qbar_P C^T, dI_P> + 2 Tr[U^T W],
+        //
+        // whose perturbation-dependent part is `O(naux nao^2)` instead of the
+        // `O(naux nao^2 nmo)` of materialising `qx`.
+        let adjoint_ok = self.gw.config.adjoint_cphf
             && self.gw.supports_cphf_adjoint()
-            && self.gw.scf.rimatr.is_some()
-            && folds
-                .iter()
-                .enumerate()
-                .all(|(k, f)| covectors_isotropic_on_shells(self.gw, f, &be[k]));
+            && self.gw.scf.rimatr.is_some();
+        // The adjoint route handles a symmetry-degenerate shell through its
+        // trace (`Schur's lemma`), which equals the per-perturbation Roothaan
+        // restoration only for covectors that are isotropic on the shell.  A
+        // reference without degenerate shells needs no such check, and only
+        // then can the assembly fold one root at a time.
+        let degenerate = self.gw.shells.iter().any(|s| s.len() > 1);
         let mut grads = vec![vec![0.0f64; self.gw.natm * 3]; nk];
         let t_asm = Instant::now();
-        if can_adjoint {
-            // per-atom derivative data, shared by every root
-            let zero_bx = vec![0.0f64; nmo];
-            let per_atom: Vec<(Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>)> = (0..self.gw.natm)
-                .map(|atm| {
-                    let h1r = crate::hessian::rhf::build_hcore_first_deriv(&self.gw.scf.mol, atm);
-                    let s1r = crate::ri_cphf::cphf_solver_pyscf::build_s1ao_deriv(&self.gw.scf.mol, atm);
-                    let djs: Vec<Vec<f64>> = (0..3).map(|c| self.gw.raw.d_j_atom(atm, c)).collect();
-                    (h1r, s1r, djs)
-                })
+        let mut used_adjoint = false;
+        if adjoint_ok && !degenerate {
+            // ---- memory-lean route: one root at a time ----
+            // `q` is read only by the fold (the QP caches already hold their row
+            // tables), and the fold runs on the raw integral blocks, so the
+            // `naux*nmo^2` transformed integrals are released for the rest of
+            // the gradient.  Packing the pair covector in place halves it, and
+            // the root's fold is consumed by the adjoint build in place, so the
+            // only `naux*nao^2` tensor alive is the current root's.
+            let per_atom: Vec<AdjointAtomData> = (0..self.gw.natm)
+                .map(|atm| AdjointAtomData::build(self.gw, atm))
                 .collect();
+            let zero_bx = vec![0.0f64; nmo];
+            // Expand the kernel covector into each root's QP covector and pack
+            // it in place before folding: the packed pair covector is half the
+            // full one, and after this loop only the packed forms are resident.
+            let mut packed: Vec<Vec<f64>> = Vec::with_capacity(nk);
             for k in 0..nk {
-                // `build_cphf_adjoint` consumes the folded `b_ao` into its `dI`
-                // covector in place, so the root's fold is released here
+                let kv = theta_k[k].take().expect("bse_grad: kernel covector reused");
+                let mut qbar = std::mem::take(&mut bq[k]);
+                kv.add_into_full_pair(&mut qbar, naux, nmo);
+                let npack = crate::ri_gw::gw_grad::pack_pairs_in_place(&mut qbar, nmo, naux);
+                qbar.truncate(npack * naux);
+                packed.push(qbar);
+                // `kv` (theta/ovbar/jbar/polar, ≈ 130 MB per root here) is
+                // dropped with the root's expanded covector
+            }
+            drop(bq);
+            drop(theta_k);
+            crate::hessian::memory_monitor::trim_to_os(0);
+            for k in 0..nk {
+                let mut fold = self
+                    .gw
+                    .fold_covector_packed_streamed(&packed[k]);
+                packed[k] = Vec::new();
                 let adj = self
                     .gw
-                    .build_cphf_adjoint(&mut folds[k], &be[k])
+                    .build_cphf_adjoint(&mut fold, &be[k])
                     .expect("bse_grad: adjoint route guard changed");
+                drop(fold);
                 for atm in 0..self.gw.natm {
-                    let (h1r, s1r, djs) = &per_atom[atm];
+                    let d = &per_atom[atm];
                     if self.gw.config.local_di {
                         let g3 = self.gw.adjoint_perturbation_gradient_local(
-                            &adj, atm, h1r, s1r, djs, &bj[k], &bb[k], &zero_bx, atm * 3,
+                            &adj, atm, &d.h1r, &d.s1r, &d.djs, &bj[k], &bb[k], &zero_bx,
+                            atm * 3,
                         );
                         grads[k][atm * 3..atm * 3 + 3].copy_from_slice(&g3);
                     } else {
                         let blocks = self.gw.raw.d_atom_blocks(atm);
                         for comp in 0..3 {
                             grads[k][atm * 3 + comp] = self.gw.adjoint_perturbation_gradient(
-                                &adj, &blocks, comp, h1r, &s1r[comp], &djs[comp], &bj[k],
-                                &bb[k], &zero_bx, atm * 3 + comp,
+                                &adj, &blocks, comp, &d.h1r, &d.s1r[comp], &d.djs[comp],
+                                &bj[k], &bb[k], &zero_bx, atm * 3 + comp,
                             );
                         }
                     }
                 }
             }
+            used_adjoint = true;
         } else {
-            // analdrv CP-HF: one block-Krylov solve over all (atm, comp)
-            // perturbations
-            let responses = self.gw.canonical_response_batch();
-            for atm in 0..self.gw.natm {
-                let blocks = self.gw.raw.d_atom_blocks(atm);
-                for comp in 0..3 {
-                    let dj = self.gw.raw.d_j_atom(atm, comp);
-                    let (u, eps1, b_x) = &responses[atm * 3 + comp];
-                    // the streamed `dI` slices of this perturbation are built
-                    // once and contracted with every root's folded covector
-                    let qx_ch = self.gw.folded_qx_multi(&folds, &blocks, comp, u);
-                    for k in 0..nk {
-                        grads[k][atm * 3 + comp] = qx_ch[k]
-                            + bj[k].iter().zip(dj.iter()).map(|(a, b)| a * b).sum::<f64>()
-                            + be[k].iter().zip(eps1.iter()).map(|(a, b)| a * b).sum::<f64>()
-                            + bb[k].iter().zip(b_x.iter()).map(|(a, b)| a * b).sum::<f64>();
+            // ---- general route: fold every root first ----
+            // The canonical route consumes the folds as a slice (one `dI` pass
+            // for all roots), and the degenerate case has to inspect each folded
+            // covector before choosing the route.
+            let mut folds: Vec<crate::ri_gw::gw_grad::FoldedCovector> = Vec::with_capacity(nk);
+            for k in 0..nk {
+                let kv = theta_k[k].take().expect("bse_grad: kernel covector reused");
+                let mut qbar = std::mem::take(&mut bq[k]);
+                kv.add_into_full_pair(&mut qbar, naux, nmo);
+                let npack = crate::ri_gw::gw_grad::pack_pairs_in_place(&mut qbar, nmo, naux);
+                folds.push(self.gw.fold_covector_packed(&qbar[..npack * naux]));
+            }
+            drop(bq);
+            drop(theta_k);
+            crate::hessian::memory_monitor::trim_to_os(0);
+            let can_adjoint = adjoint_ok
+                && folds
+                    .iter()
+                    .enumerate()
+                    .all(|(k, f)| covectors_isotropic_on_shells(self.gw, f, &be[k]));
+            if can_adjoint {
+                let per_atom: Vec<AdjointAtomData> = (0..self.gw.natm)
+                    .map(|atm| AdjointAtomData::build(self.gw, atm))
+                    .collect();
+                let zero_bx = vec![0.0f64; nmo];
+                for k in 0..nk {
+                    // `build_cphf_adjoint` consumes the folded `b_ao` into its
+                    // `dI` covector in place, so the root's fold is released here
+                    let adj = self
+                        .gw
+                        .build_cphf_adjoint(&mut folds[k], &be[k])
+                        .expect("bse_grad: adjoint route guard changed");
+                    for atm in 0..self.gw.natm {
+                        let d = &per_atom[atm];
+                        if self.gw.config.local_di {
+                            let g3 = self.gw.adjoint_perturbation_gradient_local(
+                                &adj, atm, &d.h1r, &d.s1r, &d.djs, &bj[k], &bb[k], &zero_bx,
+                                atm * 3,
+                            );
+                            grads[k][atm * 3..atm * 3 + 3].copy_from_slice(&g3);
+                        } else {
+                            let blocks = self.gw.raw.d_atom_blocks(atm);
+                            for comp in 0..3 {
+                                grads[k][atm * 3 + comp] = self.gw.adjoint_perturbation_gradient(
+                                    &adj, &blocks, comp, &d.h1r, &d.s1r[comp], &d.djs[comp],
+                                    &bj[k], &bb[k], &zero_bx, atm * 3 + comp,
+                                );
+                            }
+                        }
+                    }
+                }
+                used_adjoint = true;
+            } else {
+                // analdrv CP-HF: one block-Krylov solve over all (atm, comp)
+                // perturbations
+                let responses = self.gw.canonical_response_batch();
+                for atm in 0..self.gw.natm {
+                    let blocks = self.gw.raw.d_atom_blocks(atm);
+                    for comp in 0..3 {
+                        let dj = self.gw.raw.d_j_atom(atm, comp);
+                        let (u, eps1, b_x) = &responses[atm * 3 + comp];
+                        // the streamed `dI` slices of this perturbation are built
+                        // once and contracted with every root's folded covector
+                        let qx_ch = self.gw.folded_qx_multi(&folds, &blocks, comp, u);
+                        for k in 0..nk {
+                            grads[k][atm * 3 + comp] = qx_ch[k]
+                                + bj[k].iter().zip(dj.iter()).map(|(a, b)| a * b).sum::<f64>()
+                                + be[k].iter().zip(eps1.iter()).map(|(a, b)| a * b).sum::<f64>()
+                                + bb[k].iter().zip(b_x.iter()).map(|(a, b)| a * b).sum::<f64>();
+                        }
                     }
                 }
             }
@@ -1876,7 +1968,7 @@ impl<'a> BseGradEngine<'a> {
             eprintln!(
                 "[bse_grad mem] cphf+assembly:   rss {:.0} MB ({})",
                 crate::hessian::memory_monitor::current_rss_mb(),
-                if can_adjoint { "adjoint route" } else { "canonical route" }
+                if used_adjoint { "adjoint route" } else { "canonical route" }
             );
         }
         let omegas = self.roots.iter().map(|r| r.omega).collect();
@@ -1887,12 +1979,11 @@ impl<'a> BseGradEngine<'a> {
         crate::hessian::memory_monitor::trim_to_os(0);
         if grad_timing() {
             eprintln!(
-                "[bse_grad timing] kernel_vjp {:8.2}s  qp_pullback {:8.2}s  fold {:8.2}s  cphf+assembly {:8.2}s{}",
+                "[bse_grad timing] kernel_vjp {:8.2}s  qp_pullback {:8.2}s  cphf+assembly(fold+adjoint) {:8.2}s{}",
                 t_kernel,
                 t_qp,
-                t_fold,
                 t_asm.elapsed().as_secs_f64(),
-                if can_adjoint { " (adjoint)" } else { " (canonical)" }
+                if used_adjoint { " (adjoint)" } else { " (canonical)" }
             );
         }
         (grads, omegas)

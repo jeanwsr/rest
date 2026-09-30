@@ -4291,7 +4291,13 @@ pub fn build_real_axis_grid(
 /// gradient for `bq`, which the pullback has already symmetrised: the fold reads only the symmetric
 /// plane, so rebuilding it from the packed form is exact while `naux*nmo^2/2` doubles (437 MB at
 /// naphthalene/def2-TZVP) leave the resident set before the fold — the phase this gradient peaks in.
-fn pack_pairs_in_place(v: &mut Vec<f64>, nmo: usize, naux: usize) -> usize {
+/// Pack a pair-symmetric full covector `[nmo, nmo] x naux` (aux fastest) into
+/// its lower triangle `[nmo*(nmo+1)/2, naux]` **in place**, returning the packed
+/// pair count.  The packed buffer holds the same value the full buffer stored at
+/// each pair, so every consumer of the packed form
+/// ([`GwGradEngine::fold_covector_packed`] and its streamed variant) sees exactly
+/// the same covector while half the memory is resident.
+pub fn pack_pairs_in_place(v: &mut Vec<f64>, nmo: usize, naux: usize) -> usize {
     let mut tp = 0usize;
     for col in 0..nmo {
         for row in col..nmo {
