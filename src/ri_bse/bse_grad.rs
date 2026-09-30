@@ -294,6 +294,32 @@ impl BseScreening {
         }
     }
 
+    /// Release every block of the screening except the layout scalars.
+    ///
+    /// The kernel covector of each root is the only reader of `qov`/`qov_full`/
+    /// `qoo`/`qvv`/`v_ia`/`u_ij`/`u_ab`/`u_ia` and the gaps; once it is built
+    /// they are dead, and they are the sum of the engine's largest resident
+    /// blocks (`O(naux*(nocc+nvir)^2)` doubles).  [`Self::blocks_released`] tells
+    /// [`BseGradEngine::ensure_screening`] to rebuild them on demand.
+    fn release_blocks(&mut self) {
+        self.gap = Vec::new();
+        self.gap_full = Vec::new();
+        self.qov = Vec::new();
+        self.qov_full = Vec::new();
+        self.qoo = Vec::new();
+        self.qvv = Vec::new();
+        self.v_ia = Vec::new();
+        self.u_ij = Vec::new();
+        self.u_ab = Vec::new();
+        self.u_ia = Vec::new();
+    }
+
+    /// Whether [`Self::release_blocks`] has been called (the screening then has
+    /// to be rebuilt before it can be read again).
+    pub fn blocks_released(&self) -> bool {
+        self.qov_full.is_empty()
+    }
+
     /// Build the static screening from the GW engine's raw-RI data with the
     /// given screening orbital energies.
     pub fn build(gw: &GwGradEngine, eps_screen: &[f64]) -> BseScreening {
@@ -1560,6 +1586,10 @@ pub struct BseGradEngine<'a> {
     /// weight vanishes, so the gradient never needs them.
     pub qp_caches: Vec<QpCache>,
     pub roots: Vec<BseRoot>,
+    /// Screening energies the static screening was built from — kept so that
+    /// [`BseGradEngine::ensure_screening`] can rebuild the blocks after
+    /// [`BseScreening::release_blocks`] (`nmo` doubles).
+    eps_screen: Vec<f64>,
 }
 
 impl<'a> BseGradEngine<'a> {
@@ -1674,6 +1704,7 @@ impl<'a> BseGradEngine<'a> {
             qp_energies,
             qp_caches,
             roots: Vec::new(),
+            eps_screen,
         }
     }
 
@@ -1690,18 +1721,35 @@ impl<'a> BseGradEngine<'a> {
     /// goes through [`BseGradEngine::new_with_cutoff`].
     pub fn rebuild_screening(&mut self, eps_screen: &[f64]) {
         assert_eq!(eps_screen.len(), self.gw.nmo, "rebuild_screening: energy length");
+        self.eps_screen = eps_screen.to_vec();
         let nocc = self.gw.nocc;
         let nmo = self.gw.nmo;
         let nvir_act = self.screen.nvir;
         self.screen = self.gw.with_q(|q| {
             BseScreening::build_from_parts_cutoff(
-                q, &self.gw.j_mat, nocc, nmo, nvir_act, eps_screen,
+                q, &self.gw.j_mat, nocc, nmo, nvir_act, &self.eps_screen,
             )
+        });
+    }
+
+    /// Rebuild the screening blocks if a previous gradient released them
+    /// (`with_q` rebuilds the transformed integrals they need on demand).
+    fn ensure_screening(&mut self) {
+        if !self.screen.blocks_released() {
+            return;
+        }
+        let nocc = self.gw.nocc;
+        let nmo = self.gw.nmo;
+        let nvir_act = self.screen.nvir;
+        let eps = self.eps_screen.clone();
+        self.screen = self.gw.with_q(|q| {
+            BseScreening::build_from_parts_cutoff(q, &self.gw.j_mat, nocc, nmo, nvir_act, &eps)
         });
     }
 
     /// Solve for the lowest `nroots` excitation energies.
     pub fn solve(&mut self, nroots: usize, solver: BseSolver, config: &DavidsonConfig) {
+        self.ensure_screening();
         let (a_mat, b_mat) = build_bse_matrices(&self.screen, &self.qp_energies, self.kappa);
         let dim = self.screen.nocc * self.screen.nvir;
         self.roots = match solver {
@@ -1723,7 +1771,8 @@ impl<'a> BseGradEngine<'a> {
     /// Analytic gradients of all solved roots.
     ///
     /// Returns `(grads[k][atm*3 + comp], omegas)`.
-    pub fn analytic_gradients(&self) -> (Vec<Vec<f64>>, Vec<f64>) {
+    pub fn analytic_gradients(&mut self) -> (Vec<Vec<f64>>, Vec<f64>) {
+        self.ensure_screening();
         // The QP cache build left its Newton workspaces in the allocator's free
         // lists; returning them to the OS before the first large transient of
         // the assembly keeps that transient (and hence the peak) lower.
@@ -1779,6 +1828,12 @@ impl<'a> BseGradEngine<'a> {
             }
         }
         let t_kernel = t_kernel.elapsed().as_secs_f64();
+        // The kernel covectors are the only readers of the screening blocks;
+        // releasing them here (they are rebuilt by `ensure_screening` if the
+        // engine is used again) removes `O(naux*(nocc+nvir)^2)` doubles from
+        // the phase whose fold/adjoint tensors set the gradient's peak.
+        self.screen.release_blocks();
+        crate::hessian::memory_monitor::trim_to_os(0);
         if grad_timing() {
             eprintln!("[bse_grad mem] kernel covectors: rss {:.0} MB", crate::hessian::memory_monitor::current_rss_mb());
         }
@@ -1841,6 +1896,9 @@ impl<'a> BseGradEngine<'a> {
         // transformed blocks, released before it): return them before the fold
         // and the adjoint, whose `naux*nao^2` tensors set the peak.
         self.gw.evict_qt();
+        // the QP caches (one `[naux, nmo]` row table per active orbital) are
+        // consumed by the pullback; a later gradient rebuilds them on demand
+        self.qp_caches.clear();
         crate::hessian::memory_monitor::trim_to_os(0);
         if grad_timing() {
             eprintln!("[bse_grad mem] qp pullback:     rss {:.0} MB", crate::hessian::memory_monitor::current_rss_mb());
@@ -1854,6 +1912,13 @@ impl<'a> BseGradEngine<'a> {
             for (d, s) in be[k].iter_mut().zip(ebar_direct[k].iter()) {
                 *d += s;
             }
+        }
+        for kv in theta_k.iter_mut().flatten() {
+            // `jbar()`/`ebar()` have been merged into `bj`/`be`; only `theta`
+            // and `ovbar` are still read (by the fold)
+            kv.polar_a = Vec::new();
+            kv.polar_b = Vec::new();
+            kv.jbar_ex = Vec::new();
         }
         drop(bj_k);
         drop(ebar_direct);
@@ -2054,7 +2119,8 @@ impl<'a> BseGradEngine<'a> {
     /// Comparison of the compact and full-pair **kernel** covectors on the
     /// actual per-perturbation `qx` of this geometry.  Used by the validation
     /// test to isolate the kernel contraction from the rest of the gradient.
-    pub fn kernel_contraction_compare(&self) -> Vec<(f64, f64)> {
+    pub fn kernel_contraction_compare(&mut self) -> Vec<(f64, f64)> {
+        self.ensure_screening();
         let nmo = self.gw.nmo;
         let naux = self.gw.naux;
         let nocc = self.gw.nocc;
@@ -2109,7 +2175,8 @@ impl<'a> BseGradEngine<'a> {
     /// non-streaming QP pullback.  It only exists to validate the
     /// compact/streaming production route: it needs `naux*nmo^2` doubles per
     /// root more than the production path.
-    pub fn analytic_gradients_full_pair_kernel(&self) -> (Vec<Vec<f64>>, Vec<f64>) {
+    pub fn analytic_gradients_full_pair_kernel(&mut self) -> (Vec<Vec<f64>>, Vec<f64>) {
+        self.ensure_screening();
         let nk = self.roots.len();
         let nmo = self.gw.nmo;
         let nocc = self.gw.nocc;
