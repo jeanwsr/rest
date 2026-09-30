@@ -105,8 +105,8 @@ pub struct SCF {
     pub current_smear_sigma: f64,
     pub grad_dm: [MatrixFull<f64>; 2],
     pub grids: Option<Grids>,
-    /// Coarse quadrature grid used by non-local correlation (VV10); None unless
-    /// the functional carries an explicit VV10 component.
+    /// Coarse integration grid used for the VV10 term. Stays empty unless the
+    /// functional requests an explicit VV10 component.
     pub nlc_grids: Option<Grids>,
     pub empirical_dispersion_energy: f64,
     pub energies: HashMap<String,Vec<f64>>,
@@ -714,10 +714,11 @@ impl SCF {
             }
         }
 
-        // VV10 non-local correlation uses a dedicated coarser quadrature grid:
-        // the pair summation is O(N^2) and is far cheaper on the NLC grid
-        // (akin to PySCF's `nlcgrids`). Dense AO values and AO gradients are
-        // required there.
+        // VV10 uses a separate coarse integration grid. Its pairwise loop
+        // grows quadratically with the grid size, so it is much less expensive
+        // on this dedicated grid than on the main SCF grid (this follows the
+        // same separate-grid convention as the reference implementation).
+        // Dense AO values and AO gradients are needed.
         if self.mol.xc_data.nlc_vv10.is_some() && self.nlc_grids.is_none() {
             let mut nlc_grids = Grids::build_with_level(&self.mol, self.mol.ctrl.grid_gen_level);
             nlc_grids.prepare_tabulated_ao(&self.mol);
@@ -728,8 +729,8 @@ impl SCF {
         }
     }
 
-    /// Evaluate the VV10 energy and potential on the cached NLC grid. Returns
-    /// `None` when the functional does not carry an explicit VV10 component.
+    /// Evaluate the VV10 energy and potential on the cached VV10 grid.
+    /// Returns nothing when the functional does not request VV10.
     fn evaluate_nlc_vv10(&self) -> Option<(f64, Vec<MatrixUpper<f64>>)> {
         let (b, c) = self.mol.xc_data.nlc_vv10?;
         let grids = self.nlc_grids.as_ref()?;
@@ -742,7 +743,7 @@ impl SCF {
         ))
     }
 
-    /// Add the VV10 contribution, if any, to the XC energy and potential.
+    /// Accumulate the VV10 contribution into the XC energy and potential.
     fn add_nlc_vv10(&self, exc_total: &mut f64, vxc: &mut [MatrixUpper<f64>]) {
         if let Some((nlc_exc, nlc_vxc)) = self.evaluate_nlc_vv10() {
             *exc_total += nlc_exc;
