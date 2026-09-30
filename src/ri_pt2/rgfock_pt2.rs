@@ -80,6 +80,10 @@ where
     pub c_os: f64,
     /// Same-spin correlation factor $c_\mathrm{SS}$.
     pub c_ss: f64,
+    /// Whether to additionally cache the amplitude intermediate $G_{ai}^\mathtt{P}$ under the
+    /// result key `"g_vix"` (used by the analytic-gradient driver); costs an extra
+    /// `nvir * nocc * naux` tensor when enabled.
+    pub dump_g_vix: bool,
     /// Cached results, keyed by tensor name. Keys used by this struct: `"rdm1"`,
     /// `"gfock_part"`/`"gfock_part_full"` (electronic-derivative gfock contribution in the two
     /// modes of [`Self::make_elec_deriv`]), `"gfock_oo"`/`"gfock_ov"`/`"gfock_vo"`/`"gfock_vv"`
@@ -116,6 +120,7 @@ where
             index_occ_outer_vec,
             c_os,
             c_ss,
+            dump_g_vix: false,
             result: HashMap::new(),
             e_corr: None,
             timing: Vec::new(),
@@ -158,12 +163,15 @@ where
             vir_energy: evir.view(),
             index_occ_outer_vec: &self.index_occ_outer_vec,
         };
-        let arg = RPT2ElecDerivIncoreArg { c_os: self.c_os, c_ss: self.c_ss, full_gfock };
+        let arg = RPT2ElecDerivIncoreArg { c_os: self.c_os, c_ss: self.c_ss, full_gfock, dump_g_vix: self.dump_g_vix };
         let out = get_rpt2_elec_deriv_incore(&input, &arg, |x| O::from_f64(x).unwrap());
 
         self.e_corr = Some(out.e_corr);
         self.result.insert(key.to_string(), out.gfock_part);
         self.result.insert("rdm1".to_string(), out.rdm1_corr);
+        if let Some(g_vix) = out.g_vix {
+            self.result.insert("g_vix".to_string(), g_vix);
+        }
         self.timing.push(("in RGFockPT2, make_elec_deriv".to_string(), t0.elapsed().as_secs_f64()));
     }
 

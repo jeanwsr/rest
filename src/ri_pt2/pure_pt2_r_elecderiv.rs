@@ -31,6 +31,9 @@ pub struct RPT2ElecDerivIncoreArg {
     /// Evaluate the full four-block generalized-Fock contribution (OO+OV+VO+VV, including the
     /// orbital-energy terms) instead of the W3/W4 off-diagonal blocks only.
     pub full_gfock: bool,
+    /// Additionally dump the amplitude intermediate $G_{ai}^\mathtt{P}$ (contracted with the
+    /// cderi over the virtual axis) as an output; costs an extra `nvir * nocc * naux` tensor.
+    pub dump_g_vix: bool,
 }
 
 pub struct RPT2ElecDerivIncoreOut {
@@ -46,6 +49,10 @@ pub struct RPT2ElecDerivIncoreOut {
     pub gfock_part: Tsr<f64>,
     /// 1-RDM in MO basis (correlation contribution, unrelaxed). Shape `(nmo, nmo)`.
     pub rdm1_corr: Tsr<f64>,
+    /// Amplitude intermediate $G_{ai}^\mathtt{P} = T_{ij,ab} (i a | \mathtt{P})$ (summed over the
+    /// occupied index), only when requested by [`RPT2ElecDerivIncoreArg::dump_g_vix`].
+    /// Shape `(nvir, nocc, naux)`.
+    pub g_vix: Option<Tsr<f64>>,
 }
 
 pub fn get_rpt2_elec_deriv_incore<T, O>(
@@ -64,8 +71,9 @@ where
 
     let RPT2ElecDerivIncoreInp { cderi, cderi_vox, occ_coeff, vir_coeff, occ_energy, vir_energy, index_occ_outer_vec } =
         input;
-    let RPT2ElecDerivIncoreArg { c_os, c_ss, full_gfock } = arg;
+    let RPT2ElecDerivIncoreArg { c_os, c_ss, full_gfock, dump_g_vix } = arg;
     let full_gfock = *full_gfock;
+    let dump_g_vix = *dump_g_vix;
 
     let bi1_scale = O::from_f64(2.0 * c_os).unwrap();
     let bi2_scale = O::from_f64(*c_ss).unwrap();
@@ -95,6 +103,7 @@ where
     let eng_corr_double: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
     let mut gfock_part = rt::zeros(([nmo, nmo].f(), &device));
     let mut rdm1_corr = rt::zeros(([nmo, nmo].f(), &device));
+    let mut g_vix_dump: Option<Tsr<f64>> = if dump_g_vix { Some(rt::zeros(([nvir, nocc, naux].f(), &device))) } else { None };
     let w3: Arc<Mutex<Tsr<O>>> = Arc::new(Mutex::new(rt::zeros(([nocc, nvir].f(), &device))));
     let w4: Option<Arc<Mutex<Tsr<O>>>> = if full_gfock {
         None
@@ -211,6 +220,11 @@ where
             VAL_1,
             VAL_0,
         );
+        if let Some(g_vix_dump) = g_vix_dump.as_mut() {
+            g_vix_dump
+                .i_mut((.., io_slice[0]..io_slice[1], ..))
+                .assign(&G_vix.mapv(|x| x.to_f64().unwrap()));
+        }
 
         // --- block-4 --- //
 
@@ -285,5 +299,5 @@ where
         gfock_part.i_mut((sv, so)).assign(w4.mapv(|x| 4.0 * x.to_f64().unwrap()));
     }
 
-    RPT2ElecDerivIncoreOut { e_corr, gfock_part, rdm1_corr }
+    RPT2ElecDerivIncoreOut { e_corr, gfock_part, rdm1_corr, g_vix: g_vix_dump }
 }

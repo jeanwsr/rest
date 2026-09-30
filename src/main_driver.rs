@@ -841,10 +841,13 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         // current available analytical gradients methods:
         // 1) analytical RHF, UHF force
         // 2) dftd force
-        // 
-        // disallow post-scf calculations for force
-        if scf_data.mol.xc_data.is_fifth_dfa() {
+        // 3) doubly-hybrid (PT2-family) correlation gradient, as a separate entry
+        let is_dh = matches!(scf_data.mol.xc_data.dfa_family_pos, Some(crate::dft::DFAFamily::PT2));
+        if scf_data.mol.xc_data.is_fifth_dfa() && !is_dh {
             panic!("Analytic Gradient calculation is currently not available for post-SCF methods.");
+        }
+        if is_dh && mpi_operator.is_some() {
+            panic!("Analytic Gradient calculation of post-SCF methods is not MPI-parallelized yet.");
         }
 
         if scf_data.mol.ctrl.print_level > 1 {
@@ -910,6 +913,13 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
             }
         };
         grad_data_list.push(("SCF".into(), grad_data_scf));
+
+        // 1.5 doubly-hybrid (RI-PT2) correlation gradient; requires the CD-decomposed rimatr
+        if is_dh {
+            let mut grad_data_dh = crate::grad::rdh::RDHGradient::new(&scf_data, mpi_operator);
+            grad_data_dh.calc();
+            grad_data_list.push(("DH".into(), Box::new(grad_data_dh)));
+        }
 
         // 2. dftd gradient data
         //    we will force to evaluate dftd gradient, since dftd3 is not bottleneck for small to medium molecules

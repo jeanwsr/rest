@@ -1,3 +1,4 @@
+pub mod rdh;
 pub mod uhf;
 pub mod rks;
 pub mod uks;

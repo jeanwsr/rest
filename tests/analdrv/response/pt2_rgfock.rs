@@ -105,7 +105,7 @@ fn test_nh3() {
         vir_energy: vir_energy.view(),
         index_occ_outer_vec: &[0, 2, 5],
     };
-    let arg = RPT2ElecDerivIncoreArg { c_os: 1.0, c_ss: 1.0, full_gfock: false };
+    let arg = RPT2ElecDerivIncoreArg { c_os: 1.0, c_ss: 1.0, full_gfock: false, dump_g_vix: false };
     let output = get_rpt2_elec_deriv_incore(&input, &arg, |x| x);
     println!("MP2 correlation energy: {}", output.e_corr);
     let e_corr_ref = -0.245426806393;
@@ -229,7 +229,7 @@ fn test_nh3_fp32() {
         vir_energy: vir_energy.view(),
         index_occ_outer_vec: &[0, 2, 5],
     };
-    let arg = RPT2ElecDerivIncoreArg { c_os: 1.0, c_ss: 1.0, full_gfock: false };
+    let arg = RPT2ElecDerivIncoreArg { c_os: 1.0, c_ss: 1.0, full_gfock: false, dump_g_vix: false };
     let output = get_rpt2_elec_deriv_incore(&input, &arg, |x| x as f32);
     let e_corr_ref = -0.245426806393;
     println!("MP2 correlation energy (f32): {}", output.e_corr);
