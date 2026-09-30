@@ -1334,7 +1334,13 @@ pub fn qp_cache_bytes_estimate(naux: usize, nmo: usize, nquad: usize) -> usize {
                 nmo,
                 nocc,
                 nov,
-                bq: vec![vec![0.0f64; naux * nmo * nmo]; nk],
+                // the pair covector accumulates directly in its packed
+                // (lower-triangle) layout: the pullback writes the two
+                // directions of a pair into the same slot and the finish pass
+                // halves the off-diagonal pairs, which is exactly the
+                // minimum-norm symmetric representative the symmetrisation used
+                // to build — at half the memory
+                bq: vec![vec![0.0f64; naux * packed_pair_count(nmo)]; nk],
                 bj: vec![vec![0.0f64; naux * naux]; nk],
                 be: vec![vec![0.0f64; nmo]; nk],
                 bb: vec![vec![0.0f64; nmo]; nk],
@@ -2667,6 +2673,11 @@ impl<'a> GwGradEngine<'a> {
                     bb[k][n] += cs[k];
                 }
             }
+            // packed-pair offsets of this cache's rows: pair `(n, m)` for every
+            // `m`, i.e. the base column of each write below
+            let cols: Vec<usize> = (0..nmo)
+                .map(|m| packed_pair_index(nmo, n, m) * naux)
+                .collect();
             let compact = cache.y_imag.is_empty() && !cache.m_imag.is_empty();
             // `y0 = s_metric * m` is the same for every quadrature point, so it
             // is rebuilt once per cache instead of once per (state, frequency).
@@ -2773,7 +2784,7 @@ impl<'a> GwGradEngine<'a> {
                         let t = cache.omega - self.e[m];
                         let a = -c * wgt / TWO_PI * 2.0 * t / (t * t + u * u);
                         let base = m * naux;
-                        let col_m = self.pair_col(n, m) * naux;
+                        let col_m = cols[m];
                         for p in 0..naux {
                             bq[k][col_m + p] += 2.0 * a * sc[base + p];
                         }
@@ -2820,7 +2831,7 @@ impl<'a> GwGradEngine<'a> {
                         be[k][m] += c * sign * zsign * sum;
                     }
                     // dq covector of pair (n, m)
-                    let col_m = self.pair_col(n, m) * naux;
+                    let col_m = cols[m];
                     for p in 0..naux {
                         bq[k][col_m + p] += 2.0 * a * (y_r[p] - y0_r[p]);
                     }
@@ -2860,7 +2871,7 @@ impl<'a> GwGradEngine<'a> {
                     for i in 0..nocc {
                         let qni = self.with_q(|q| self.gather_pair(q, n, i));
                         let g_ni = self.metric_solve(&qni, 1);
-                        let col_i = self.pair_col(n, i) * naux;
+                        let col_i = packed_pair_index(nmo, n, i) * naux;
                         for p in 0..naux {
                             bq[k][col_i + p] -= 2.0 * c * (1.0 - self.fock_hyb) * g_ni[p];
                         }
@@ -2912,12 +2923,12 @@ impl<'a> GwGradEngine<'a> {
         for k in 0..nk {
             for (wi, _) in self.quad.iter().enumerate().take(if no_imag { 0 } else { usize::MAX }) {
                 let (d, dd) = &imag_factors[wi];
-                self.polar_pullback(&mut bq, &mut be, k, &v_imag[k][wi], d, dd);
+                self.polar_pullback(&mut bq, &mut be, k, &v_imag[k][wi], d, dd, true);
             }
             if !no_res {
                 for (zi, &z) in z_order[k].iter().enumerate() {
                     let (d, dd) = real_response_and_deriv(&self.de_ia, z, self.config.eta);
-                    self.polar_pullback(&mut bq, &mut be, k, &v_res[k][zi], &d, &dd);
+                    self.polar_pullback(&mut bq, &mut be, k, &v_res[k][zi], &d, &dd, true);
                 }
             }
         }
@@ -2935,9 +2946,25 @@ impl<'a> GwGradEngine<'a> {
             }
         }
 
-        // symmetrise the covectors (minimum-norm symmetric representation)
+        // The packed pair layout accumulated **both** directions of every pair
+        // into one slot (the pullback visits each row of each cache) while the
+        // diagonal carries a single contribution.  The minimum-norm symmetric
+        // representative the folded consumers expect stores the *average* of
+        // the two directions, so halve the off-diagonal pairs — exactly the
+        // values `symmetrise_pairs` used to write into the full buffer.
         for k in 0..nk {
-            symmetrise_pairs(&mut bq[k], naux, nmo);
+            let mut tp = 0usize;
+            for col in 0..nmo {
+                for row in col..nmo {
+                    if row != col {
+                        let s = &mut bq[k][tp * naux..(tp + 1) * naux];
+                        for v in s.iter_mut() {
+                            *v *= 0.5;
+                        }
+                    }
+                    tp += 1;
+                }
+            }
             symmetrise_square(&mut bj[k], naux);
         }
         if grad_timing() {
@@ -3024,6 +3051,10 @@ impl<'a> GwGradEngine<'a> {
 
     /// Add the pullback of `Tr[V dQ]` to `bq` and `be`, with
     /// `Q = sum_ia q_ia d_ia q_ia^T` and `deps_ia = deps_a - deps_i`.
+    /// Deferred polarizability pullback.  `packed` selects the pair layout of
+    /// `bq`: the LR streaming pullback accumulates the packed lower triangle,
+    /// the CD-GW pullback the full pair matrix.
+    #[allow(clippy::too_many_arguments)]
     fn polar_pullback(
         &self,
         bq: &mut [Vec<f64>],
@@ -3032,6 +3063,7 @@ impl<'a> GwGradEngine<'a> {
         v: &[f64],
         d: &[f64],
         dd: &[f64],
+        packed: bool,
     ) {
         let naux = self.naux;
         let nov = self.de_ia.len();
@@ -3042,7 +3074,11 @@ impl<'a> GwGradEngine<'a> {
         for col in 0..nov {
             let i = col % self.nocc;
             let a = self.nocc + col / self.nocc;
-            let col_pair = self.pair_col(i, a) * naux;
+            let col_pair = if packed {
+                packed_pair_index(self.nmo, i, a)
+            } else {
+                self.pair_col(i, a)
+            } * naux;
             let mut bg = 0.0f64;
             for p in 0..naux {
                 let vqv = vq.data[p + col * naux];
@@ -4107,7 +4143,9 @@ impl GwGradEngine<'_> {
             // `naux*nmo^2/2` doubles (437 MB at naphthalene/def2-TZVP) for the fold, which is where
             // this gradient peaks. The route always returns below, so the (full-buffer) fallback
             // never sees the compacted form.
-            let packed_pairs = pack_pairs_in_place(&mut bq[0], self.nmo, self.naux);
+            // the pullback accumulates the pair covector directly in its packed
+            // (lower-triangle) layout, so no repacking is needed here
+            let packed_pairs = packed_pair_count(self.nmo);
             // no `q` here: the orbital-rotation channel is contracted against the raw integrals,
             // which are streamed auxiliary-atom block by block
             let mut fold = self.fold_covector_packed_streamed(&bq[0][..packed_pairs * self.naux]);
@@ -4165,9 +4203,15 @@ impl GwGradEngine<'_> {
         // `B = C bq C^T` and the rotation factor `W = sum_P q_P bq_P` replace
         // the per-perturbation `qx` assembly (see `FoldedCovector`).
         let folded = if self.config.folded_qx {
-            Some(self.fold_covector(&bq[0]))
+            Some(self.fold_covector_packed(&bq[0]))
         } else {
             None
+        };
+        // the legacy per-perturbation route contracts the **full** pair layout
+        let bq_full: Vec<Vec<f64>> = if self.config.folded_qx {
+            Vec::new()
+        } else {
+            bq.iter().map(|v| unpack_pairs(v, self.nmo, self.naux)).collect()
         };
         let mut grad = vec![0.0f64; self.natm * 3];
         for atm in 0..self.natm {
@@ -4182,7 +4226,7 @@ impl GwGradEngine<'_> {
                     None => {
                         let qx = self.qx_from_u_blocks(&blocks, comp, &u);
                         self.contract_perturbation(
-                            &bq, &bj, &be, &bb, &qx, &dj, &eps1, &b_x,
+                            &bq_full, &bj, &be, &bb, &qx, &dj, &eps1, &b_x,
                         )[0]
                     }
                 };
@@ -4291,6 +4335,46 @@ pub fn build_real_axis_grid(
 /// gradient for `bq`, which the pullback has already symmetrised: the fold reads only the symmetric
 /// plane, so rebuilding it from the packed form is exact while `naux*nmo^2/2` doubles (437 MB at
 /// naphthalene/def2-TZVP) leave the resident set before the fold — the phase this gradient peaks in.
+/// Index of the unordered MO pair `{p, q}` in the **packed** (lower-triangle,
+/// column-major) pair layout produced by [`pack_pairs_in_place`] and read by
+/// [`GwGradEngine::fold_covector_packed`] and its streamed variant.
+///
+/// The layout is `for col { for row in col..nmo { … } }`, i.e. block `col`
+/// starts at `col*nmo - col*(col-1)/2`.
+#[inline]
+pub fn packed_pair_index(nmo: usize, p: usize, q: usize) -> usize {
+    let (col, row) = if p <= q { (p, q) } else { (q, p) };
+    col * nmo - (col * col.wrapping_sub(1)) / 2 + (row - col)
+}
+
+/// Number of pairs in the packed layout of an `nmo`-dimensional pair space.
+#[inline]
+pub fn packed_pair_count(nmo: usize) -> usize {
+    nmo * (nmo + 1) / 2
+}
+
+/// Expand a packed covector into the full symmetric `[nmo, nmo] x naux` layout
+/// (the same value on both entries of each pair), i.e. the inverse of
+/// [`pack_pairs_in_place`].  Provided for the legacy full-buffer contractions.
+pub fn unpack_pairs(packed: &[f64], nmo: usize, naux: usize) -> Vec<f64> {
+    assert_eq!(packed.len(), naux * packed_pair_count(nmo), "unpack_pairs: size mismatch");
+    let mut v = vec![0.0f64; naux * nmo * nmo];
+    let mut tp = 0usize;
+    for col in 0..nmo {
+        for row in col..nmo {
+            let src = tp * naux;
+            let dst = (row + col * nmo) * naux;
+            v[dst..dst + naux].copy_from_slice(&packed[src..src + naux]);
+            if row != col {
+                let dst_t = (col + row * nmo) * naux;
+                v[dst_t..dst_t + naux].copy_from_slice(&packed[src..src + naux]);
+            }
+            tp += 1;
+        }
+    }
+    v
+}
+
 /// Pack a pair-symmetric full covector `[nmo, nmo] x naux` (aux fastest) into
 /// its lower triangle `[nmo*(nmo+1)/2, naux]` **in place**, returning the packed
 /// pair count.  The packed buffer holds the same value the full buffer stored at
@@ -5018,7 +5102,7 @@ impl<'a> GwCdGradEngine<'a> {
                 for (bv, av) in bj[k].iter_mut().zip(v.data.iter()) {
                     *bv -= av;
                 }
-                base.polar_pullback(&mut bq, &mut be, k, &v.data, d, dd);
+                base.polar_pullback(&mut bq, &mut be, k, &v.data, d, dd, false);
             }
         }
         let t_b = t_b.elapsed().as_secs_f64();

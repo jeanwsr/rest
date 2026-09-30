@@ -764,6 +764,57 @@ impl KernelVjpCompact {
         }
     }
 
+    /// [`Self::add_into_full_pair`] into the **packed** (lower-triangle) pair
+    /// layout of [`crate::ri_gw::gw_grad::pack_pairs_in_place`], which is what
+    /// the QP pullback accumulates and what the folded consumers read.
+    ///
+    /// The packed slot of a pair holds the value the *entry* of the symmetric
+    /// full-pair covector carries, and the diagonal slot replaces the single
+    /// diagonal entry — so the `(o,o)`/`(v,v)` blocks contribute each unordered
+    /// pair once with the diagonal doubled (the full-pair form adds the value to
+    /// both symmetric entries, which coincide on the diagonal), and the `(o,v)`
+    /// column, being the pair sum, contributes its half.
+    pub fn add_into_packed(&self, qbar: &mut [f64], naux: usize, nmo: usize) {
+        let npack = crate::ri_gw::gw_grad::packed_pair_count(nmo);
+        assert_eq!(qbar.len(), naux * npack, "add_into_packed: qbar size mismatch");
+        let nocc = self.nocc;
+        let nvir = self.nvir;
+        let nvir_full = self.nvir_full;
+        let n_oo = nocc * nocc;
+        let ncv = nocc * nvir_full;
+        for p in 0..naux {
+            // (o,o): `add_into_full_pair` adds `theta_ij` to both the `(i,j)`
+            // and the `(j,i)` entry, and its loop visits both orderings, so the
+            // full-pair entry (which is what the packed slot represents) is
+            // `theta_ij + theta_ji` — `2 theta_ii` on the diagonal, where the
+            // two additions hit the same element.
+            for j in 0..nocc {
+                for i in j..nocc {
+                    let v = self.theta[i + j * nocc + p * self.ncols]
+                        + self.theta[j + i * nocc + p * self.ncols];
+                    qbar[crate::ri_gw::gw_grad::packed_pair_index(nmo, i, j) * naux + p] += v;
+                }
+            }
+            // (v,v): the active virtuals only (inactive columns are zero)
+            for b in 0..nvir {
+                for a in b..nvir {
+                    let v = self.theta[n_oo + a + b * nvir + p * self.ncols]
+                        + self.theta[n_oo + b + a * nvir + p * self.ncols];
+                    let (ga, gb) = (nocc + a, nocc + b);
+                    qbar[crate::ri_gw::gw_grad::packed_pair_index(nmo, ga, gb) * naux + p] += v;
+                }
+            }
+            // (o,v) over the full virtual space: `ovbar` is the pair sum
+            for a in 0..nvir_full {
+                let ga = nocc + a;
+                for i in 0..nocc {
+                    let v = 0.5 * self.ovbar[i + a * nocc + p * ncv];
+                    qbar[crate::ri_gw::gw_grad::packed_pair_index(nmo, i, ga) * naux + p] += v;
+                }
+            }
+        }
+    }
+
     /// `ebar = ebar_a + ebar_b`.
     pub fn ebar(&self, nmo: usize) -> Vec<f64> {
         let mut e = vec![0.0f64; nmo];
@@ -1845,13 +1896,13 @@ impl<'a> BseGradEngine<'a> {
             // Expand the kernel covector into each root's QP covector and pack
             // it in place before folding: the packed pair covector is half the
             // full one, and after this loop only the packed forms are resident.
+            let npack = crate::ri_gw::gw_grad::packed_pair_count(nmo);
             let mut packed: Vec<Vec<f64>> = Vec::with_capacity(nk);
             for k in 0..nk {
                 let kv = theta_k[k].take().expect("bse_grad: kernel covector reused");
                 let mut qbar = std::mem::take(&mut bq[k]);
-                kv.add_into_full_pair(&mut qbar, naux, nmo);
-                let npack = crate::ri_gw::gw_grad::pack_pairs_in_place(&mut qbar, nmo, naux);
-                qbar.truncate(npack * naux);
+                kv.add_into_packed(&mut qbar, naux, nmo);
+                assert_eq!(qbar.len(), npack * naux, "bse_grad: packed covector size mismatch");
                 packed.push(qbar);
                 // `kv` (theta/ovbar/jbar/polar, ≈ 130 MB per root here) is
                 // dropped with the root's expanded covector
@@ -1895,12 +1946,13 @@ impl<'a> BseGradEngine<'a> {
             // for all roots), and the degenerate case has to inspect each folded
             // covector before choosing the route.
             let mut folds: Vec<crate::ri_gw::gw_grad::FoldedCovector> = Vec::with_capacity(nk);
+            let npack = crate::ri_gw::gw_grad::packed_pair_count(nmo);
             for k in 0..nk {
                 let kv = theta_k[k].take().expect("bse_grad: kernel covector reused");
                 let mut qbar = std::mem::take(&mut bq[k]);
-                kv.add_into_full_pair(&mut qbar, naux, nmo);
-                let npack = crate::ri_gw::gw_grad::pack_pairs_in_place(&mut qbar, nmo, naux);
-                folds.push(self.gw.fold_covector_packed(&qbar[..npack * naux]));
+                kv.add_into_packed(&mut qbar, naux, nmo);
+                assert_eq!(qbar.len(), npack * naux, "bse_grad: packed covector size mismatch");
+                folds.push(self.gw.fold_covector_packed(&qbar));
             }
             drop(bq);
             drop(theta_k);
@@ -2088,6 +2140,13 @@ impl<'a> BseGradEngine<'a> {
             .collect();
         let caches: Vec<&QpCache> = owned.iter().collect();
         let (bq, bj, be, bb) = self.gw.qp_pullback(&caches, &weights);
+        // the pullback returns the packed (lower-triangle) pair covector; the
+        // legacy full-pair contraction below reads the expanded form
+        let naux = self.gw.naux;
+        let bq: Vec<Vec<f64>> = bq
+            .iter()
+            .map(|v| crate::ri_gw::gw_grad::unpack_pairs(v, nmo, naux))
+            .collect();
         let responses = self.gw.canonical_response_batch();
         let mut grads = vec![vec![0.0f64; self.gw.natm * 3]; nk];
         for atm in 0..self.gw.natm {
