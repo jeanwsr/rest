@@ -1724,6 +1724,10 @@ impl<'a> BseGradEngine<'a> {
     ///
     /// Returns `(grads[k][atm*3 + comp], omegas)`.
     pub fn analytic_gradients(&self) -> (Vec<Vec<f64>>, Vec<f64>) {
+        // The QP cache build left its Newton workspaces in the allocator's free
+        // lists; returning them to the OS before the first large transient of
+        // the assembly keeps that transient (and hence the peak) lower.
+        crate::hessian::memory_monitor::trim_to_os(0);
         let nk = self.roots.len();
         let naux = self.gw.naux;
         let nmo = self.gw.nmo;
@@ -1832,6 +1836,12 @@ impl<'a> BseGradEngine<'a> {
         }
         let (mut bq, mut bj, mut be, bb) = self.gw.qp_pullback_streaming_finish(scr);
         let t_qp = t_qp.elapsed().as_secs_f64();
+        // The low-rank screening factors are read only while a self-energy
+        // response is evaluated, i.e. by the pullback (they also hold the
+        // transformed blocks, released before it): return them before the fold
+        // and the adjoint, whose `naux*nao^2` tensors set the peak.
+        self.gw.evict_qt();
+        crate::hessian::memory_monitor::trim_to_os(0);
         if grad_timing() {
             eprintln!("[bse_grad mem] qp pullback:     rss {:.0} MB", crate::hessian::memory_monitor::current_rss_mb());
         }
