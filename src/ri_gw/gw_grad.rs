@@ -4,11 +4,32 @@
 //! This module ports the validated PySCF implementation
 //! `pyscf/gw/gw_lr_cd_grad.py` (+ `gw_cd_grad*.py`) to REST.  It reproduces
 //! REST's own LR-CD G0W0 energy functional (`ri_gw::gw_calculations_lowrank`
-//! / `newton_solver_lowrank_v2`) — the *raw* (non-static-subtracted)
-//! contour-deformation decomposition with REST's real-symmetric screened
-//! response, REST's imaginary-axis quadrature grids, REST's nearest-neighbour
-//! real-axis residue interpolation and REST's finite-difference Newton root
-//! finder — and differentiates it exactly.
+//! / `newton_solver_lowrank_v2`) — the contour-deformation decomposition with
+//! REST's real-symmetric screened response, REST's imaginary-axis quadrature
+//! grids, REST's nearest-neighbour real-axis residue interpolation and REST's
+//! finite-difference Newton root finder — and differentiates it exactly.
+//!
+//! By default the differentiated functional is the **static-subtracted**
+//! self-energy of the full-CD engine (see [`GwCdGradEngine`]),
+//! evaluated through the same low-rank response factors,
+//!
+//!     Sigma_sub = sum_m [ -1/pi sum_k w_k K(t_m, u_k) (W_m(iu_k) - W_m(0))
+//!                         + (1/2 - f_m) W_m(0)
+//!                         + s_m pf_m (W_m(zeta_m) - W_m(0)) ],
+//!
+//! with the *same* residue protocol (pole selection, `pole_factor` smoothing,
+//! nearest-grid quantisation) as REST's raw LR energy.  The static
+//! subtraction removes the artificial pole-selection jump of the raw
+//! decomposition at `omega = e_m`, making the QP energy — and therefore its
+//! gradient — well defined even when a quasiparticle energy coincides with a
+//! mean-field pole (degenerate shells, near-zero QP shifts).  Wherever no
+//! pole is crossed the two forms are numerically identical:
+//! `Sigma_sub - Sigma_raw = sum_m [A_m + 1/2 - f_m - s_m pf_m] W_m(0)` with
+//! `A_m = 1/pi sum_k w_k K(t_m,u_k) = 1/2 sign(t_m) + O(1e-9)` on REST's
+//! transformed Gauss-Legendre grids, so finite differences of the *raw*
+//! production energy match the subtracted analytic gradient (validated in
+//! `tests/gw_bse/test_gw_grad_subtracted.rs`).  `GwGradConfig::subtracted =
+//! false` restores the legacy raw functional.
 //!
 //! Key design points
 //! -----------------
@@ -224,6 +245,15 @@ pub struct GwGradConfig {
     /// derivative machinery, measured at ~2 s for C2H4/def2-TZVPP and ~7.5 s for
     /// C6H6/def2-TZVPP) from the gradient path.
     pub fold_cphf_rhs: bool,
+    /// Define the LR-CD self-energy through the **static-subtracted continuous**
+    /// form of [`GwCdGradEngine`] (the default), evaluated with REST's low-rank
+    /// response factors — see the module header.  Numerically identical to the
+    /// raw decomposition wherever no mean-field pole coincides with the QP
+    /// energy (to ~1e-9 `W(0)` on the production grids), but continuous and
+    /// differentiable there, so the analytic gradient is always defined.
+    /// `false` restores the legacy raw LR functional.  Ignored by the full-CD
+    /// engine ([`GwCdGradEngine`]), which is static-subtracted by construction.
+    pub subtracted: bool,
 }
 
 impl Default for GwGradConfig {
@@ -255,6 +285,7 @@ impl Default for GwGradConfig {
             resp_cache_budget_mib: 256.0,
             fold_cphf_rhs: true,
             compact_qp_cache: false,
+            subtracted: true,
         }
     }
 }
@@ -1182,11 +1213,19 @@ pub struct QpCache {
     /// `m = s_metric * q_n` (`[naux, nmo]`, col-major).  It does *not* depend
     /// on the quadrature frequency, and both `y0 = s_metric * m` and
     /// `y = y0 + s_metric * corr(m, u)` are functions of it
-    /// (`GwGradEngine::row_response_from_m`), so one `[naux, nmo]` buffer
-    /// replaces the `2 * nquad * naux * nmo` doubles of `y_imag` — a factor
+    /// (`GwGradEngine::row_response_from_m`), so one `[naux, nmo]` buffer replaces
+    /// the `2 * nquad * naux * nmo` doubles of `y_imag` — a factor
     /// `2*nquad` (40x at the production 20-point quadrature) per cache.  Used
     /// by the BSE gradient, whose caches are the dominant memory term.
     pub m_imag: Vec<f64>,
+    /// Static row `W_c[n, m](0)` of the static-subtracted functional
+    /// (`GwGradConfig::subtracted`); empty when the engine runs raw/full-CD.
+    pub w0: Vec<f64>,
+    /// Static response row `y0s = (J - Q(0))^-1 q_n` (`[naux, nmo]`), stored
+    /// only in the full (`y_imag`) representation — the compact caches rebuild
+    /// it from `m_imag` through the static low-rank factor.  Empty when the
+    /// engine runs raw/full-CD.
+    pub y0_static: Vec<f64>,
     /// (m, sign*pole_factor, z_used, y_res[naux], y0_metric[naux]) per
     /// active residue
     pub residues: Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)>,
@@ -1254,6 +1293,13 @@ pub struct GwGradEngine<'a> {
     /// `naux x naux` eigendecomposition per point — the dominant term of the
     /// engine construction (7.0 s of 9.2 s at naphthalene/def2-SVP).
     pub lr_grid: RefCell<Vec<Option<LrFactor>>>,
+    /// Low-rank factor of the **static** (`z = 0`) response, the third
+    /// ingredient of the static-subtracted self-energy
+    /// ([`GwGradConfig::subtracted`]).  Built on demand from `qtia` with the
+    /// same real-axis Lorentzian diagonal the production protocol evaluates at
+    /// grid point `z = 0` (`d_ia = -4 de_ia/(de_ia^2 + eta^2)`); evicted with
+    /// [`Self::evict_qt`] and rebuilt by [`Self::ensure_lr_static`].
+    pub lr_static: RefCell<Option<LrFactor>>,
     /// metric-transformed occupied-virtual block (kept for on-the-fly factors).
     /// Evictable together with `qt` ([`Self::evict_qt`]).
     pub qtia: RefCell<Vec<f64>>,
@@ -1302,6 +1348,9 @@ pub fn qp_cache_bytes_estimate(naux: usize, nmo: usize, nquad: usize) -> usize {
         /// of the imaginary axis; they must survive the whole cache loop
         /// because every cache adds a rank-`nmo` contribution
         v_imag: Vec<Vec<Vec<f64>>>,
+        /// static (`z = 0`) bucket of the subtracted functional,
+        /// `V_static[k] = sum_m staticc_m y0s_m y0s_m^T`
+        v_static: Vec<Vec<f64>>,
         /// residue frequency buckets `[k]`, parallel to `z_order[k]`
         v_res: Vec<Vec<Vec<f64>>>,
         z_order: Vec<Vec<f64>>,
@@ -1345,6 +1394,7 @@ pub fn qp_cache_bytes_estimate(naux: usize, nmo: usize, nquad: usize) -> usize {
                 be: vec![vec![0.0f64; nmo]; nk],
                 bb: vec![vec![0.0f64; nmo]; nk],
                 v_imag: vec![vec![vec![0.0f64; naux * naux]; nquad]; nk],
+                v_static: vec![vec![0.0f64; naux * naux]; nk],
                 v_res: vec![Vec::new(); nk],
                 z_order: vec![Vec::new(); nk],
                 imag_factors,
@@ -1365,6 +1415,10 @@ pub struct QpRowTable {
     pub m: Vec<f64>,
     /// `W_c[n, m](iu_wi)` per quadrature point
     pub w_imag: Vec<Vec<f64>>,
+    /// Static row `W_c[n, m](0)` (empty when the engine runs raw/full-CD).
+    /// Shared by every trial frequency of the Newton loop, so it is computed
+    /// once with the table instead of once per evaluation.
+    pub w0: Vec<f64>,
 }
 
 impl<'a> GwGradEngine<'a> {
@@ -1586,6 +1640,7 @@ impl<'a> GwGradEngine<'a> {
                 z_grid,
                 lr_imag: RefCell::new(Vec::new()),
                 lr_grid: RefCell::new(Vec::new()),
+                lr_static: RefCell::new(None),
                 qtia: RefCell::new(qtia),
                 hybrid,
                 fock_hyb,
@@ -1638,6 +1693,7 @@ impl<'a> GwGradEngine<'a> {
                 z_grid,
                 lr_imag: RefCell::new(lr_imag),
                 lr_grid: RefCell::new(lr_grid),
+                lr_static: RefCell::new(None),
                 qtia: RefCell::new(qtia),
                 hybrid,
                 fock_hyb,
@@ -1762,6 +1818,55 @@ impl<'a> GwGradEngine<'a> {
         self.lr_grid.borrow_mut()[idx] = Some(factor);
     }
 
+    /// Make the static (`z = 0`) low-rank factor resident, building it on
+    /// first use (see [`Self::lr_static`]).  The `z = 0` Lorentzian diagonal
+    /// `-4 de/(de^2 + eta^2)` is exactly what the production real-axis grid
+    /// evaluates at its first node, so the subtracted functional stays
+    /// consistent with REST's own response protocol.
+    fn ensure_lr_static(&self) {
+        if self.lr_static.borrow().is_some() || self.config.skip_lr_cache {
+            return;
+        }
+        let factor = self.with_qtia(|qtia| {
+            build_lr_factor(
+                qtia,
+                self.naux,
+                self.nocc * (self.nmo - self.nocc),
+                &self.de_ia,
+                0.0,
+                'R',
+                self.config.eta,
+                self.config.low_rank_tolerance,
+            )
+        });
+        *self.lr_static.borrow_mut() = Some(factor);
+    }
+
+    /// Static response row values `W_m(0)` of one orbital row from its metric
+    /// intermediate `m = S q_n` (empty when the engine runs raw/full-CD).
+    fn lr_static_row_values(&self, m: &[f64]) -> Vec<f64> {
+        if !self.config.subtracted || self.config.skip_lr_cache {
+            return Vec::new();
+        }
+        self.ensure_lr_static();
+        let guard = self.lr_static.borrow();
+        guard
+            .as_ref()
+            .expect("gw_grad: static low-rank factor missing")
+            .response_value_from_qt(m, self.nmo)
+    }
+
+    /// Static response vectors `y0s = (J - Q(0))^-1 q_n` of one orbital row
+    /// from its metric intermediate `m = S q_n`.
+    fn lr_static_row_response(&self, m: &[f64]) -> Vec<f64> {
+        self.ensure_lr_static();
+        let guard = self.lr_static.borrow();
+        guard
+            .as_ref()
+            .expect("gw_grad: static low-rank factor missing")
+            .response_vectors_from_qt(&self.s_metric, m, self.nmo)
+    }
+
     fn lr_factor_nearest_idx(&self, z: f64) -> usize {
         let zs = &self.z_grid;
         let n = zs.len();
@@ -1877,6 +1982,7 @@ impl<'a> GwGradEngine<'a> {
         // the low-rank factors are read only while building a QP cache as well
         self.lr_imag.replace(Vec::new());
         self.lr_grid.replace(Vec::new());
+        self.lr_static.replace(None);
     }
 
     /// Release only the metric-transformed integral blocks (`qt`, `qtia`) and
@@ -1931,7 +2037,10 @@ impl<'a> GwGradEngine<'a> {
         residues: &mut Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)>,
     ) -> f64 {
         if !collect {
-            // the value alone does not need the response vectors
+            // the value alone does not need the response vectors, but the
+            // static-subtracted rebalance reads the (m, sign*pole_factor)
+            // metadata, so the row is recorded with empty vectors
+            residues.push((m, sign_pf, z_used, Vec::new(), Vec::new()));
             return factor.response_value_from_qt(mm, 1)[0];
         }
         // `y = s_metric * (qt + corr)` and `y0 = s_metric * qt`
@@ -2076,21 +2185,27 @@ impl<'a> GwGradEngine<'a> {
             for (c, &(_, sign_pf, _, _)) in poles.iter().enumerate() {
                 *contour += sign_pf * w[c];
             }
-            if collect {
-                let y0 = gemm_nn(&self.s_metric, naux, naux, &qt, naux, ncol);
-                let corr = factor.correction_from_qt(&qt, ncol);
-                let sc = gemm_nn(&self.s_metric, naux, naux, &corr, naux, ncol);
-                for (c, &(m, sign_pf, z_used, _)) in poles.iter().enumerate() {
-                    let y: Vec<f64> = y0[c * naux..(c + 1) * naux]
-                        .iter()
-                        .zip(sc[c * naux..(c + 1) * naux].iter())
-                        .map(|(a, b)| a + b)
-                        .collect();
-                    // the signed factor carries pole_factor so that every
-                    // consumer (value, d/domega zeta term, pullback) stays
-                    // consistent
-                    residues.push((m, sign_pf, z_used, y, y0[c * naux..(c + 1) * naux].to_vec()));
+            if !collect {
+                // value-only callers still read the (m, sign*pole_factor)
+                // metadata of the active poles (static-subtracted rebalance)
+                for &(m, sign_pf, z_used, _) in poles.iter() {
+                    residues.push((m, sign_pf, z_used, Vec::new(), Vec::new()));
                 }
+                continue;
+            }
+            let y0 = gemm_nn(&self.s_metric, naux, naux, &qt, naux, ncol);
+            let corr = factor.correction_from_qt(&qt, ncol);
+            let sc = gemm_nn(&self.s_metric, naux, naux, &corr, naux, ncol);
+            for (c, &(m, sign_pf, z_used, _)) in poles.iter().enumerate() {
+                let y: Vec<f64> = y0[c * naux..(c + 1) * naux]
+                    .iter()
+                    .zip(sc[c * naux..(c + 1) * naux].iter())
+                    .map(|(a, b)| a + b)
+                    .collect();
+                // the signed factor carries pole_factor so that every
+                // consumer (value, d/domega zeta term, pullback) stays
+                // consistent
+                residues.push((m, sign_pf, z_used, y, y0[c * naux..(c + 1) * naux].to_vec()));
             }
         }
     }
@@ -2104,7 +2219,8 @@ impl<'a> GwGradEngine<'a> {
         let w_imag = (0..self.quad.len())
             .map(|wi| lr_imag[wi].response_value_from_qt(&m, self.nmo))
             .collect();
-        QpRowTable { m, w_imag }
+        let w0 = self.lr_static_row_values(&m);
+        QpRowTable { m, w_imag, w0 }
     }
 
     /// All pieces of the self-energy at a fixed `omega` from a precomputed
@@ -2157,6 +2273,27 @@ impl<'a> GwGradEngine<'a> {
         let mut contour = 0.0f64;
         let mut residues: Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)> = Vec::new();
         self.add_poles(omega, n, collect, &mut contour, &mut residues);
+        // ---- static-subtracted rebalance (see the module header) ----
+        // Sigma_sub = Sigma_raw + sum_m [A_m + 1/2 - f_m - a_m] W_m(0),
+        // A_m = 1/pi sum_k w_k K(t_m,u_k), a_m = s_m pole_factor of the
+        // active poles; the residues metadata carries a_m also in value-only
+        // calls.  Away from pole thresholds A_m = 1/2 sign(t_m) to ~1e-9 on
+        // REST's grids, so the two functionals coincide there.
+        if !table.w0.is_empty() {
+            for m in 0..self.nmo {
+                let f_m = if m < self.nocc { 1.0 } else { 0.0 };
+                let t = omega - self.e[m];
+                let mut a_m = 0.0f64;
+                for &(u, wgt) in self.quad.iter() {
+                    a_m += wgt / TWO_PI * 2.0 * t / (t * t + u * u);
+                }
+                imag -= a_m * table.w0[m];
+                contour += (0.5 - f_m) * table.w0[m];
+            }
+            for &(m, a_m, _z, ..) in residues.iter() {
+                contour -= a_m * table.w0[m];
+            }
+        }
         (contour, imag, y_imag_all, residues)
     }
 
@@ -2194,7 +2331,7 @@ impl<'a> GwGradEngine<'a> {
     /// [`Self::sigma_c_and_d`] from a precomputed row table (the Newton loop).
     fn sigma_c_and_d_with(&self, omega: f64, n: usize, table: &QpRowTable) -> (f64, f64) {
         let (contour, imag, _y, residues) = self.sigma_c_parts_with(omega, n, true, false, table);
-        let ds = self.sigma_d_from_parts(omega, &table.w_imag, &residues);
+        let ds = self.sigma_d_from_parts(omega, &table.w_imag, &table.w0, &residues);
         (contour - imag, ds)
     }
 
@@ -2209,6 +2346,16 @@ impl<'a> GwGradEngine<'a> {
             return Vec::new();
         }
         m.to_vec()
+    }
+
+    /// Static response row `y0s = (J - Q(0))^-1 q_n` of a cache: stored in the
+    /// full (`y_imag`) representation, rebuilt on demand from `m` in the
+    /// compact one.  Empty when the engine runs raw (`w0` empty).
+    fn compact_y0_static(&self, m: &[f64], w0: &[f64], want_y: bool) -> Vec<f64> {
+        if w0.is_empty() || !want_y {
+            return Vec::new();
+        }
+        self.lr_static_row_response(m)
     }
 
     /// Sample the QP equation `f(omega) = consts + Sigma_c(omega) - omega` of
@@ -2272,46 +2419,26 @@ impl<'a> GwGradEngine<'a> {
         contour - imag
     }
 
-    /// Decomposed self-energy at fixed omega (for validation).
+    /// Decomposed self-energy at fixed omega (for validation).  With the
+    /// static-subtracted functional the parts are already rebalanced: the
+    /// returned `imag` carries `W(iu) - W(0)` kernels and `contour` the static
+    /// and residue `W(0)` bookkeeping, so `contour - imag` is `Sigma_sub`.
     pub fn sigma_c_decomposed(&self, omega: f64, n: usize) -> (f64, f64) {
         let (contour, imag, _, _, _, _) = self.sigma_c_parts(omega, n, false, false);
         (contour, imag)
     }
 
-    /// `d imag(omega)/d omega` at fixed geometry.
-    fn imag_d_omega(&self, omega: f64, n: usize) -> f64 {
-        // the frequency-independent intermediates are formed once (see
-        // `sigma_c_parts`); the value only needs the element-wise product of
-        // `m` with the low-rank correction
-        let qn = self.with_q(|q| self.gather_row(q, n));
-        let m = gemm_nn(&self.s_metric, self.naux, self.naux, &qn, self.naux, self.nmo);
-        self.ensure_lr();
-        let lr_imag = self.lr_imag.borrow();
-        let mut d = 0.0f64;
-        for (wi, &(u, wgt)) in self.quad.iter().enumerate() {
-            let corr = lr_imag[wi].correction_from_qt(&m, self.nmo);
-            let mut sum_m = 0.0;
-            for mm in 0..self.nmo {
-                let base = mm * self.naux;
-                let wm: f64 = m[base..base + self.naux]
-                    .iter()
-                    .zip(corr[base..base + self.naux].iter())
-                    .map(|(a, b)| a * b)
-                    .sum();
-                let t = omega - self.e[mm];
-                sum_m += 2.0 * (u * u - t * t) / ((t * t + u * u) * (t * t + u * u)) * wm;
-            }
-            d += sum_m * wgt / TWO_PI;
-        }
-        d
-    }
-
     /// Omega-derivative pieces from already-collected response data:
     /// `w_imag[wi][m]` from the imaginary pass and the residue vectors.
+    ///
+    /// With the static-subtracted functional (`w0` non-empty) the axis kernel
+    /// multiplies `W_m(iu) - W_m(0)`, adding `sum_k w_k K'/pi * W_m(0)`; the
+    /// static and residue subtractions themselves are omega-independent.
     fn sigma_d_from_parts(
         &self,
         omega: f64,
         w_imag: &[Vec<f64>],
+        w0: &[f64],
         residues: &[(usize, f64, f64, Vec<f64>, Vec<f64>)],
     ) -> f64 {
         let mut d = 0.0f64;
@@ -2323,6 +2450,15 @@ impl<'a> GwGradEngine<'a> {
                 sum_m += 2.0 * (u * u - t * t) / ((t * t + u * u) * (t * t + u * u)) * w[m];
             }
             d -= sum_m * wgt / TWO_PI;
+            if !w0.is_empty() {
+                let mut sum_0 = 0.0;
+                for m in 0..self.nmo {
+                    let t = omega - self.e[m];
+                    sum_0 += 2.0 * (u * u - t * t) / ((t * t + u * u) * (t * t + u * u))
+                        * w0[m];
+                }
+                d += sum_0 * wgt / TWO_PI;
+            }
         }
         if self.config.exact_residue_z {
             let nov = self.de_ia.len();
@@ -2348,9 +2484,8 @@ impl<'a> GwGradEngine<'a> {
     /// screened rows and the pole factors are shared between the value and
     /// the derivative (the Newton solver evaluates both at every step).
     pub fn sigma_c_and_d(&self, omega: f64, n: usize) -> (f64, f64) {
-        let (contour, imag, w_imag, _y_imag, residues, _m) = self.sigma_c_parts(omega, n, true, false);
-        let ds = self.sigma_d_from_parts(omega, &w_imag, &residues);
-        (contour - imag, ds)
+        let table = self.qp_row_table(n);
+        self.sigma_c_and_d_with(omega, n, &table)
     }
 
     /// `d Sigma_c / d omega` at fixed geometry.  In the REST quantised
@@ -2358,28 +2493,7 @@ impl<'a> GwGradEngine<'a> {
     /// imaginary-axis part contributes away from orbital thresholds; in the
     /// exact mode the moving residue frequencies add the standard zeta term.
     pub fn d_sigma_d_omega(&self, omega: f64, n: usize) -> f64 {
-        let mut d = -self.imag_d_omega(omega, n);
-        if self.config.exact_residue_z {
-            let (_c, _i, _w, _yi, res, _m) = self.sigma_c_parts(omega, n, true, false);
-            let nov = self.de_ia.len();
-            for &(m, sign, z_used, ref y_r, ref _y0) in &res {
-                let zsign = if self.e[m] - omega >= 0.0 { 1.0 } else { -1.0 };
-                // dW/dz = 2 sum_ia proj_ia^2 dd_ia/dz with proj = y^T q_ia
-                let mut sum = 0.0f64;
-                for col in 0..nov {
-                    let mut proj = 0.0f64;
-                    for p in 0..self.naux {
-                        proj += y_r[p] * self.qia[p + col * self.naux];
-                    }
-                    sum += proj * proj
-                        * dd_response_dz_single(self.de_ia[col], z_used, self.config.eta);
-                }
-                // dzeta/domega = -zsign
-                d += sign * (-zsign) * sum;
-                let _ = m;
-            }
-        }
-        d
+        self.sigma_c_and_d(omega, n).1
     }
 
     /// Solve the QP equation with Newton's method (analytic derivative,
@@ -2466,9 +2580,10 @@ impl<'a> GwGradEngine<'a> {
             let omega = x;
             let (_contour, _imag, y_imag, residues) =
                 self.sigma_c_parts_with(omega, n, true, want_y, &table);
-            let (w_imag, m) = (table.w_imag, table.m);
-            let dsdw = self.sigma_d_from_parts(omega, &w_imag, &residues);
+            let (w_imag, m, w0) = (table.w_imag, table.m, table.w0);
+            let dsdw = self.sigma_d_from_parts(omega, &w_imag, &w0, &residues);
             let m_imag = self.compact_m_imag(&m, !want_y);
+            let y0_static = self.compact_y0_static(&m, &w0, want_y);
             let y_imag = if want_y { y_imag } else { Vec::new() };
             return QpCache {
                 target: n,
@@ -2477,6 +2592,8 @@ impl<'a> GwGradEngine<'a> {
                 w_imag,
                 y_imag,
                 m_imag,
+                w0,
+                y0_static,
                 residues,
             };
         }
@@ -2584,9 +2701,10 @@ impl<'a> GwGradEngine<'a> {
 
         let (_contour, _imag, y_imag, residues) =
             self.sigma_c_parts_with(omega, n, true, want_y, &table);
-        let (w_imag, m) = (table.w_imag, table.m);
-        let dsdw = self.sigma_d_from_parts(omega, &w_imag, &residues);
+        let (w_imag, m, w0) = (table.w_imag, table.m, table.w0);
+        let dsdw = self.sigma_d_from_parts(omega, &w_imag, &w0, &residues);
         let m_imag = self.compact_m_imag(&m, !want_y);
+        let y0_static = self.compact_y0_static(&m, &w0, want_y);
         let y_imag = if want_y { y_imag } else { Vec::new() };
         QpCache {
             target: n,
@@ -2595,6 +2713,8 @@ impl<'a> GwGradEngine<'a> {
             w_imag,
             y_imag,
             m_imag,
+            w0,
+            y0_static,
             residues,
         }
     }
@@ -2654,7 +2774,8 @@ impl<'a> GwGradEngine<'a> {
         let no_exch = dbg("REST_GWGRAD_NOEXCH");
         let no_res = dbg("REST_GWGRAD_NORES");
         let no_imag = dbg("REST_GWGRAD_NOIMAG");
-        let QpPullbackScratch { bq, bj, be, bb, v_imag, v_res, z_order, .. } = scr;
+        let no_static = dbg("REST_GWGRAD_NOSTATIC");
+        let QpPullbackScratch { bq, bj, be, bb, v_imag, v_static, v_res, z_order, .. } = scr;
 
         for (jl, cache) in caches.iter().enumerate() {
             let j = col0 + jl;
@@ -2679,6 +2800,9 @@ impl<'a> GwGradEngine<'a> {
                 .map(|m| packed_pair_index(nmo, n, m) * naux)
                 .collect();
             let compact = cache.y_imag.is_empty() && !cache.m_imag.is_empty();
+            // static-subtracted functional?  (`w0` is filled exactly when the
+            // cache was built by a subtracted engine with a non-empty row)
+            let sub = !cache.w0.is_empty() && (compact || !cache.y0_static.is_empty());
             // `y0 = s_metric * m` is the same for every quadrature point, so it
             // is rebuilt once per cache instead of once per (state, frequency).
             // The response buffers are `MatrixFull`s because the outer-product
@@ -2689,6 +2813,53 @@ impl<'a> GwGradEngine<'a> {
                 let y0_own = gemm_nn(&self.s_metric, naux, naux, &cache.m_imag, naux, nmo);
                 y0_m.data.copy_from_slice(&y0_own);
             }
+            // ---- subtracted rows (built once per cache) ----
+            // `y0s = (J - Q(0))^-1 q_n` is the response row of the static
+            // `W(0)` terms, `y0m = J^-1 q_n` their metric partner (the axis
+            // and residue terms keep the raw per-term pullback; the whole
+            // static-subtraction bookkeeping folds into their coefficient
+            // `staticc`).  Compact caches rebuild `y0s` from `m` through the
+            // static low-rank factor; full ones read the stored row.
+            let mut y0s_m = MatrixFull::new([naux, nmo], 0.0);
+            if sub {
+                if compact {
+                    let y0s = self.lr_static_row_response(&cache.m_imag);
+                    y0s_m.data.copy_from_slice(&y0s);
+                } else {
+                    y0s_m.data.copy_from_slice(&cache.y0_static);
+                    y0_m.data.copy_from_slice(&cache.y_imag[0].2);
+                }
+            }
+            // per-m static coefficient of the subtracted functional:
+            // `staticc_m = (1/2 - f_m) + A_m - active_m` with
+            // `A_m = 1/pi sum_k w_k K(t_m, u_k)` and `active_m` the signed
+            // pole factor, so that the pullback of
+            // `sum_wi a_wi W_wi + sum_m staticc_m W(0) + sum_res s pf W_res`
+            // is exactly the gradient of `Sigma_sub` (module header).  The
+            // `no_*` debug masks keep a masked pullback the exact gradient of
+            // the masked functional, as in the full-CD `phase_mask`.
+            let staticc: Vec<f64> = if sub {
+                let mut active = vec![0.0f64; nmo];
+                for &(m, a_m, ..) in cache.residues.iter() {
+                    active[m] += a_m;
+                }
+                (0..nmo)
+                    .map(|m| {
+                        let half_minus_f = if m < nocc { -0.5 } else { 0.5 };
+                        let t = cache.omega - self.e[m];
+                        let mut a_m = 0.0f64;
+                        for &(u, wgt) in self.quad.iter() {
+                            a_m += wgt / TWO_PI * 2.0 * t / (t * t + u * u);
+                        }
+                        let f_term = if no_static { 0.0 } else { half_minus_f };
+                        let s_a = if no_imag { 0.0 } else { a_m };
+                        let act = if no_res { 0.0 } else { active[m] };
+                        f_term + s_a - act
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             // `ya = diag(b) y`, `y0a = diag(b) y0` of the current frequency with
             // the **unit** weights `b_m` (see the accumulation note below)
             let mut ya = MatrixFull::new([naux, nmo], 0.0);
@@ -2808,6 +2979,55 @@ impl<'a> GwGradEngine<'a> {
                 if c == 0.0 {
                     continue;
                 }
+                // ---- static `W(0)` terms of the subtracted functional ----
+                // `sum_m c staticc_m W_m(0)` with `W(0) = q^T [(J-Q(0))^-1 -
+                // J^-1] q`: the `A(0)^-1` half pulls through the static
+                // response row `y0s` (deferred into the `v_static` bucket),
+                // the metric half through `y0m = J^-1 q_n`, and the row
+                // covector is their difference `2 (y0s - y0m)`.  The kernel
+                // sum `A_m(t_m)` inside `staticc` carries the explicit
+                // `-A'_m W(0)` eps1 term of the axis kernel.
+                if sub && staticc.iter().any(|&v| v != 0.0) {
+                    let mut pre = vec![0.0f64; naux * nmo];
+                    let mut prm = vec![0.0f64; naux * nmo];
+                    for m in 0..nmo {
+                        let csm = c * staticc[m];
+                        let base = m * naux;
+                        let col_m = cols[m];
+                        for p in 0..naux {
+                            pre[base + p] = csm * y0s_m.data[base + p];
+                            prm[base + p] = csm * y0_m.data[base + p];
+                            bq[k][col_m + p] += 2.0 * (pre[base + p] - prm[base + p]);
+                        }
+                    }
+                    let prem = to_mat(&pre, naux, nmo);
+                    let prmm = to_mat(&prm, naux, nmo);
+                    let ysm = to_mat(&y0s_m.data, naux, nmo);
+                    let ymm = to_mat(&y0_m.data, naux, nmo);
+                    let mut vr = MatrixFull::new([naux, naux], 0.0);
+                    _dgemm_full(&prem, 'N', &ysm, 'T', &mut vr, 1.0, 0.0);
+                    let mut vm = MatrixFull::new([naux, naux], 0.0);
+                    _dgemm_full(&prmm, 'N', &ymm, 'T', &mut vm, 1.0, 0.0);
+                    for (d, (a, b)) in bj[k].iter_mut().zip(vm.data.iter().zip(vr.data.iter()))
+                    {
+                        *d += a - b;
+                    }
+                    for (d, s) in v_static[k].iter_mut().zip(vr.data.iter()) {
+                        *d += s;
+                    }
+                    if !no_be_expl {
+                        for m in 0..nmo {
+                            let t = cache.omega - self.e[m];
+                            let mut ap = 0.0f64;
+                            for &(u, wgt) in self.quad.iter() {
+                                ap += wgt / TWO_PI
+                                    * 2.0 * (u * u - t * t)
+                                    / ((t * t + u * u) * (t * t + u * u));
+                            }
+                            be[k][m] -= c * ap * cache.w0[m];
+                        }
+                    }
+                }
                 // ---- residues (quantised frequencies; no d_zeta term) ----
                 for &(m, sign, z_used, ref y_r, ref y0_r) in cache
                     .residues
@@ -2904,6 +3124,7 @@ impl<'a> GwGradEngine<'a> {
             mut be,
             bb,
             v_imag,
+            v_static,
             v_res,
             z_order,
             imag_factors,
@@ -2930,6 +3151,16 @@ impl<'a> GwGradEngine<'a> {
                     let (d, dd) = real_response_and_deriv(&self.de_ia, z, self.config.eta);
                     self.polar_pullback(&mut bq, &mut be, k, &v_res[k][zi], &d, &dd, true);
                 }
+            }
+            // The static bucket is processed whenever it is nonzero: with the
+            // `REST_GWGRAD_NOSTATIC` mask the coefficient keeps the axis and
+            // residue `W(0)` compensations (`A_m` and `active_m`), so only the
+            // fully masked combination leaves it empty.  `Q(0)` carries the
+            // same real-axis Lorentzian diagonal at `z = 0` as the production
+            // grid's first node.
+            if v_static[k].iter().any(|&v| v != 0.0) {
+                let (d, dd) = real_response_and_deriv(&self.de_ia, 0.0, self.config.eta);
+                self.polar_pullback(&mut bq, &mut be, k, &v_static[k], &d, &dd, true);
             }
         }
 
@@ -3035,6 +3266,8 @@ impl<'a> GwGradEngine<'a> {
                 w_imag: c.w_imag.clone(),
                 y_imag: c.y_imag.clone(),
                 m_imag: c.m_imag.clone(),
+                w0: c.w0.clone(),
+                y0_static: c.y0_static.clone(),
                 residues: c.residues.clone(),
             })
             .collect();

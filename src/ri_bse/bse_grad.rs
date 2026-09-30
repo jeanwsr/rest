@@ -1536,6 +1536,8 @@ pub(crate) fn empty_qp_cache(target: usize) -> QpCache {
         w_imag: Vec::new(),
         y_imag: Vec::new(),
         m_imag: Vec::new(),
+        w0: Vec::new(),
+        y0_static: Vec::new(),
         residues: Vec::new(),
     }
 }
@@ -1675,6 +1677,8 @@ impl<'a> BseGradEngine<'a> {
                     c.w_imag.len() * c.w_imag.first().map_or(0, |v| v.len()) * 8
                         + c.y_imag.iter().map(|(_, y, y0)| (y.len() + y0.len()) * 8).sum::<usize>()
                         + c.m_imag.len() * 8
+                        + c.w0.len() * 8
+                        + c.y0_static.len() * 8
                         + c.residues.iter().map(|(_, _, _, y, y0)| (y.len() + y0.len()) * 8).sum::<usize>()
                 })
                 .sum();
