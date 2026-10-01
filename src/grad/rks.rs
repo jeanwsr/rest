@@ -646,12 +646,18 @@ fn get_vxc_rayon(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &mut 
 }
 
 
-/// One evaluation of the XC gradient contribution over the grid.
+/// Grid contribution of the XC skeleton gradient, `dao_vxc[nao, nao, 3]` (the AO-derivative
+/// potential contraction whose row-scatter, times `2`, is the XC skeleton gradient), for the
+/// XC functional carried by `xc_data`.
+///
+/// Public so that post-SCF (doubly-hybrid) gradients can evaluate the skeleton derivative of
+/// the *final* functional, whose component list is not the SCF one (`xc_data` is built by the
+/// caller, e.g. from `dfa_compnt_pos` / `dfa_paramr_pos`).
 ///
 /// `block_mem_mb` bounds the workspace of **one block of one worker**, so callers pass a
 /// per-thread share of the declared budget (`utilities::memory_batch::xc_grad_block_mb`),
 /// never `[ctrl] max_memory` itself.
-fn get_vxc_rayon_new(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &mut Grids, mol: &Molecule, block_mem_mb: usize) -> Tsr<f64> {
+pub fn get_vxc_rayon_new(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &mut Grids, mol: &Molecule, block_mem_mb: usize) -> Tsr<f64> {
     let default_omp_num_threads = omp_get_num_threads_wrapper();
 
     let num_grids = grids.weights.len();

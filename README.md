@@ -68,6 +68,7 @@
 - `outputs`: 取值Vec\<String\>。用于计算结束后输出结果。可输出的信息包括：
     - `dipole`    偶极
     - `fchk`　    Gaussian程序的fchk文件
+        - 双杂化 (PT2 族) 的解析力计算 (`job_type = "force"`) 额外在 fchk 中写入弛豫总密度 `Total MP2 Density` 段；开壳层 (UHF 参考) 另行写入 `Spin MP2 Density` 段 (alpha − beta)。
     - `cube_orb`  格点化的轨道文件信息 
     - `molden`　　结果输出为molden程序的格式
     - `geometry`  输出分子结构文件

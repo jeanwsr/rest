@@ -872,10 +872,13 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         // current available analytical gradients methods:
         // 1) analytical RHF, UHF force
         // 2) dftd force
-        // 
-        // disallow post-scf calculations for force
-        if scf_data.mol.xc_data.is_fifth_dfa() {
+        // 3) doubly-hybrid (PT2-family) correlation gradient, as a separate entry
+        let is_dh = matches!(scf_data.mol.xc_data.dfa_family_pos, Some(crate::dft::DFAFamily::PT2));
+        if scf_data.mol.xc_data.is_fifth_dfa() && !is_dh {
             panic!("Analytic Gradient calculation is currently not available for post-SCF methods.");
+        }
+        if is_dh && mpi_operator.is_some() {
+            panic!("Analytic Gradient calculation of post-SCF methods is not MPI-parallelized yet.");
         }
 
         if scf_data.mol.ctrl.print_level > 1 {
@@ -916,6 +919,25 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         // list of (gradient name, gradient data)
         let mut grad_data_list: Vec<(String, Box<dyn GradAPI>)> = vec![];
 
+        // the DH (PT2-family) entry hands the total relaxed density back for the fchk density
+        // dump (`SCF::dh_rdm1_resp`, written out by the `outputs` pass)
+        let mut dh_rdm1_resp: Option<Vec<MatrixFull<f64>>> = None;
+
+        // post-SCF (doubly-hybrid) gradients need the DFT grids again whenever the DH entry runs
+        // on a grid (final-functional XC part / hybrid difference, or the SCF functional's own XC
+        // response); `xdh_calculations` frees them, so regenerate (pure MP2 needs none)
+        let is_dh = matches!(scf_data.mol.xc_data.dfa_family_pos, Some(crate::dft::DFAFamily::PT2));
+        let dh_needs_grids = {
+            let xc_data = &scf_data.mol.xc_data;
+            let final_xc = xc_data.dfa_compnt_pos.as_ref().map_or(false, |v| !v.is_empty());
+            let delta_hyb =
+                xc_data.dfa_hybrid_pos.unwrap_or(xc_data.dfa_hybrid_scf) - xc_data.dfa_hybrid_scf;
+            final_xc || delta_hyb.abs() > 1.0e-10 || !xc_data.dfa_compnt_scf.is_empty()
+        };
+        if is_dh && dh_needs_grids && scf_data.grids.is_none() {
+            scf_data.grids = Some(crate::dft::Grids::build(&mut scf_data.mol));
+        }
+
         // 1. self-consistent gradient data
         let grad_data_scf: Box<dyn crate::grad::traits::GradAPI> = {
             if !scf_data.mol.ctrl.spin_polarization {
@@ -942,6 +964,21 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         };
         grad_data_list.push(("SCF".into(), grad_data_scf));
 
+        // 1.5 doubly-hybrid (RI-PT2) correlation gradient; requires the decomposed rimatr
+        if is_dh {
+            if !scf_data.mol.ctrl.spin_polarization {
+                let mut grad_data_dh = crate::grad::rdh::RDHGradient::new(&scf_data, mpi_operator);
+                grad_data_dh.calc();
+                dh_rdm1_resp = grad_data_dh.rdm1_dump.take();
+                grad_data_list.push(("DH".into(), Box::new(grad_data_dh)));
+            } else {
+                let mut grad_data_dh = crate::grad::udh::UDHGradient::new(&scf_data, mpi_operator);
+                grad_data_dh.calc();
+                dh_rdm1_resp = grad_data_dh.rdm1_dump.take();
+                grad_data_list.push(("DH".into(), Box::new(grad_data_dh)));
+            }
+        }
+
         // 2. dftd gradient data
         //    we will force to evaluate dftd gradient, since dftd3 is not bottleneck for small to medium molecules
         use crate::dftd::grad::DFTDGrad;
@@ -962,6 +999,13 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
                 println!("Gradient contribution from {:} [a.u.]:", grad_name);
                 println!("{}", formated_force(&grad_contrib, &scf_data.mol.geom.elem));
             }
+        }
+
+        // the gradient objects borrow `scf_data`; release them before handing the DH relaxed
+        // density to the fchk output pass — force jobs only
+        drop(grad_data_list);
+        if is_dh && matches!(scf_data.mol.ctrl.job_type, JobType::Force) {
+            scf_data.dh_rdm1_resp = dh_rdm1_resp;
         }
 
         // TDDFT analytic-gradient response for the requested excited state.
@@ -1012,7 +1056,8 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         println!("{}", formated_force(&gradient, &scf_data.mol.geom.elem));
         println!("------------------------------------");
 
-        (scf_data.scf_energy, gradient)
+        // the total energy (fifth-DFA/rpa/ai correction included), consistent with the gradient
+        (collect_total_energy(scf_data), gradient)
     };
 
     // 力阶段峰值（监控线程 20 ms 一次采样），随后关掉监控线程
