@@ -9,6 +9,17 @@
         "code": "0.8033*HF - 0.0140*LDA + 0.2107*B88, 0.6789*LYP + 0.3211*MP2",
         "ref": "10.1073/pnas.0901093106"
     },
+    "XYG3_D3BJ": {
+        "code_scf": "B3LYPg",
+        "code": "0.8033*HF - 0.0140*LDA + 0.2107*B88, 0.6789*LYP + 0.3211*MP2 + DFTD3(version=bj, xc=B3LYP)",
+        "ref": ["10.1073/pnas.0901093106", "10.1021/acs.jpclett.6b00780"]
+    },
+    "XYG3_TPSS0": {
+        "code_scf": "0.5*HF + 0.5*TPSS, 0.875*TPSS",
+        "code": "0.8033*HF - 0.0140*LDA + 0.2107*B88, 0.6789*LYP + 0.3211*MP2",
+        "ref": "",
+        "notes": "Validation construct, not a literature functional: the XYG3 final functional on top of a TPSS0 (meta-GGA) SCF reference."
+    },
     "XYGJ_OS": {
         "code_scf": "B3LYPg",
         "code": "0.7731*HF + 0.2269*LDA, 0.2309*VWN3 + 0.2754*LYP + 0.4364*MP2_OS",
