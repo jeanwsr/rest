@@ -48,6 +48,33 @@ pub mod pure_pt2_r_elecderiv;
 pub mod pure_pt2_u_elecderiv;
 pub mod rgfock_pt2;
 
+/// Batch size (number of outer occupied indices) of the amplitude-streaming electronic
+/// derivatives ([`pure_pt2_r_elecderiv`] / [`pure_pt2_u_elecderiv`]).
+///
+/// The amplitude tensors are never stored at their full `nocc^2 nvir^2` size; the outer occupied
+/// index is streamed in windows. Each streamed batch costs `elems_per_step` elements per outer
+/// index and must fit both the available memory (`mem_avail_mb`, when given) and `headroom` times
+/// the working class `class_elems` (the `nvir * nocc * naux` transform/`G` objects). The result is
+/// capped at `nocc` and floored at 1.
+pub fn occ_batch_step(nocc: usize, elems_per_step: usize, class_elems: usize, mem_avail_mb: Option<f64>, headroom: f64) -> usize {
+    let elems_per_step = elems_per_step.max(1);
+    let by_class = (headroom * class_elems as f64 / elems_per_step as f64).floor() as usize;
+    let by_mem = match mem_avail_mb {
+        Some(mb) => (mb.max(0.0) * 1048576.0 / (elems_per_step as f64 * 8.0)).floor() as usize,
+        None => usize::MAX,
+    };
+    by_class.min(by_mem).clamp(1, nocc.max(1))
+}
+
+/// Window boundaries `[0, step, 2*step, ..., nocc]` of the amplitude-streaming occupied batches
+/// (see [`occ_batch_step`]).
+pub fn occ_batch_index(nocc: usize, step: usize) -> Vec<usize> {
+    let step = step.max(1);
+    let mut index: Vec<usize> = (0..nocc).step_by(step).collect();
+    index.push(nocc);
+    index
+}
+
 #[derive(Clone)]
 pub struct PT2 {
     pub pt2_type: usize,

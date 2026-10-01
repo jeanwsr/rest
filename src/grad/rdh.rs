@@ -57,6 +57,7 @@ use crate::ri_jk::resp_r::RRespRIJK;
 use crate::ri_jk::util;
 use crate::ri_jk::{get_j2c_decomp, J2CDecompose, J2C_THRESH};
 use crate::ri_pt2::rgfock_pt2::RGFockPT2;
+use crate::ri_pt2::{occ_batch_index, occ_batch_step};
 use crate::scf_io::SCF;
 use crate::utilities::memory_batch::{blocksize_partition, calc_batch_size, detect_used_memory_mb, handle_memory_exceed};
 use crate::utilities::rstsr_util::{RestTensorToRstsrTsrAPI, RestTensorToRstsrViewAPI, Tsr, TsrView};
@@ -173,6 +174,18 @@ impl<'a> RDHGradient<'a> {
         } else {
             None
         };
+        // the PT2 kernel streams its amplitudes over occupied windows (never materializing
+        // `nocc^2 nvir^2` tensors): size the windows so the per-window transients stay within a
+        // few times the `nvir * nocc * naux` class and inside `max_memory`
+        let mem_avail = mol_obj.ctrl.max_memory.map(|m| m - detect_used_memory_mb("proc"));
+        let abort = mol_obj.ctrl.abort_on_mem_exceed;
+        let elems_per_step = 2 * nvir * nvir * nocc + nvir * naux;
+        handle_memory_exceed(elems_per_step as f64 * 8.0 / 1048576.0, mem_avail, abort);
+        let step_pt2 = occ_batch_step(nocc, elems_per_step, nvir * nocc * naux, mem_avail, 4.0);
+        if mol_obj.ctrl.print_level > 1 {
+            println!("DH gradient amplitude windows: PT2 occ step {step_pt2} (nocc {nocc}, nvir {nvir}, naux {naux}).");
+        }
+        let index_occ_outer = occ_batch_index(nocc, step_pt2);
         let j3c = rimatr.0.to_rstsr_view(&device);
         let mut pt2 = RGFockPT2::<f64>::new(
             mo_coeff.clone(),
@@ -180,7 +193,7 @@ impl<'a> RDHGradient<'a> {
             mo_energy.clone(),
             j3c.into_cow(),
             None,
-            vec![0, nocc],
+            index_occ_outer,
             c_os,
             c_ss,
         );

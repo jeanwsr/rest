@@ -457,6 +457,22 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
 
     // --- RI-PT2 (correlation contribution; an ordinary element of the list) --- //
 
+    // the PT2 kernel streams its amplitudes over occupied windows (never materializing
+    // `nocc^2 nvir^2` tensors): size the windows so the per-window transients stay within a few
+    // times the `nvir * nocc * naux` class and inside `max_memory`
+    let (nmo_, naux_) = (mo_coeff.shape()[1], rimatr.to_rstsr_view(&device).shape()[1]);
+    let nvir = nmo_ - nocc;
+    let mem_avail = scf_data.mol.ctrl.max_memory.map(|m| m - crate::utilities::memory_batch::detect_used_memory_mb("proc"));
+    let elems_per_step = 2 * nvir * nvir * nocc + nvir * naux_;
+    crate::utilities::memory_batch::handle_memory_exceed(
+        elems_per_step as f64 * 8.0 / 1048576.0,
+        mem_avail,
+        scf_data.mol.ctrl.abort_on_mem_exceed,
+    );
+    let index_occ_outer = crate::ri_pt2::occ_batch_index(
+        nocc,
+        crate::ri_pt2::occ_batch_step(nocc, elems_per_step, nvir * nocc * naux_, mem_avail, 4.0),
+    );
     // the RI-PT2 working precision follows the `[ri_pt2] fp_mode` control keyword (default FP32;
     // the pre-transformed f32 `cderi_vox` is not supplied here, so the kernel transforms in f64
     // and casts on the fly); all outputs (`gfock_part`, `rdm1_corr`, `e_corr`) are f64 regardless
@@ -467,7 +483,7 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
             mo_energy.to_owned(),
             rimatr.to_rstsr_view(&device).into_cow(),
             None,
-            vec![0, nocc],
+            index_occ_outer.clone(),
             c_os,
             c_ss,
         ))),
@@ -479,7 +495,7 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
             mo_energy.to_owned(),
             rimatr.to_rstsr_view(&device).into_cow(),
             None,
-            vec![0, nocc],
+            index_occ_outer.clone(),
             c_os,
             c_ss,
         ))),

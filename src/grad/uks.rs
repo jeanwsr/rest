@@ -433,7 +433,14 @@ fn get_vxc_rayon(gradient_method: &RIUHFGradient, xc_data: &XCData, grids: &mut 
 }
 
 
-fn get_vxc_rayon_new(gradient_method: &RIUHFGradient, xc_data: &XCData, grids: &mut Grids, mol: &Molecule, max_memory: usize) -> Vec<Tsr<f64>> {
+/// Grid contribution of the UKS XC skeleton derivative, `vmat_s[nao, nao, 3]` per spin (the
+/// row-scatter, times `2`, contracted with the per-spin density, is the XC skeleton gradient), for
+/// the XC functional carried by `xc_data`.
+///
+/// Public so that post-SCF (doubly-hybrid) gradients can evaluate the skeleton derivative of
+/// the *final* functional, whose component list is not the SCF one (`xc_data` is built by the
+/// caller, e.g. from `dfa_compnt_pos` / `dfa_paramr_pos`).
+pub fn get_vxc_rayon_new(gradient_method: &RIUHFGradient, xc_data: &XCData, grids: &mut Grids, mol: &Molecule, max_memory: usize) -> Vec<Tsr<f64>> {
     let default_omp_num_threads = omp_get_num_threads_wrapper();
 
     let num_grids = grids.weights.len();

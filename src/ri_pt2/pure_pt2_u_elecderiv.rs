@@ -22,11 +22,17 @@
 //! - the correlation energy $\Sigma T g$ over all three spin blocks, i.e.
 //!   $c_{os} E_{os} + c_{ss} E_{ss}$ already in the coefficient-weighted form.
 //!
-//! Same-spin blocks are evaluated with the pair-symmetry structure of the restricted kernel
-//! (single occupied batch, triangular pair loop with the transpose fill). The $\alpha\beta$
-//! block stores only the plain amplitudes ($T = c_{os} t$ enters every contraction as a factor)
-//! in a single batch; its four rdm1 contractions are per-index-partial-trace GEMM loops over
-//! the contracted pair, so no $[\cdot^2]$-sized intermediate is formed.
+//! Every block streams its amplitudes over windows ([`UPT2ElecDerivIncoreInp::index_occ_outer_vec`]
+//! / [`UPT2ElecDerivIncoreInp::index_vir_outer_vec`], cf.
+//! [`occ_batch_index`](crate::ri_pt2::occ_batch_index)): only window-sized buffers exist
+//! transiently and are discarded after their rdm1/$G$ accumulation, so no `nocc^2 nvir^2`
+//! amplitude tensor is ever materialized. The same-spin blocks use the pair-symmetry structure of
+//! the restricted kernel (triangular pair loop with the transpose fill) and window their outer
+//! occupied index. The $\alpha\beta$ block stores only the plain amplitudes ($T = c_{os} t$
+//! enters every contraction as a factor); each of its four rdm1 Grams must keep its own index
+//! pair complete in the working set, and the four pair up as α-side / β-side, so the amplitudes
+//! are streamed in two passes (α- then β-virtual windowed) — each a per-window partial-trace
+//! GEMM pair, with no `[.]^2`-sized intermediate.
 
 use crate::ri_jk::pure_ao2mo::get_ao2mo_s2ij_to_s1_notrans;
 use crate::utilities::rstsr_util::{Tsr, TsrView};
@@ -47,6 +53,16 @@ pub struct UPT2ElecDerivIncoreInp<'a> {
     pub occ_energy: [TsrView<'a>; 2],
     /// Virtual orbital energies, shape `[nvir_s]` per spin.
     pub vir_energy: [TsrView<'a>; 2],
+    /// Occupancy-window boundaries of the streamed same-spin blocks, per spin (cf.
+    /// [`occ_batch_index`](crate::ri_pt2::occ_batch_index)): the σσ block of spin `s` streams its
+    /// outer occupied index through `index_occ_outer_vec[s]`. Each vector starts at 0 and ends at
+    /// the spin's `nocc`.
+    pub index_occ_outer_vec: [Vec<usize>; 2],
+    /// Virtual-window boundaries of the streamed opposite-spin block, per spin: entry `0` windows
+    /// the α virtual index of the first (energy/$G$/β-side rdm1) pass, entry `1` the β virtual
+    /// index of the second (α-side rdm1) pass. Each vector starts at 0 and ends at the spin's
+    /// `nvir`.
+    pub index_vir_outer_vec: [Vec<usize>; 2],
 }
 
 pub struct UPT2ElecDerivIncoreArg {
@@ -72,7 +88,7 @@ pub fn get_rupt2_elec_deriv_incore(
     input: &UPT2ElecDerivIncoreInp,
     arg: &UPT2ElecDerivIncoreArg,
 ) -> UPT2ElecDerivIncoreOut {
-    let UPT2ElecDerivIncoreInp { cderi, cderi_vox, occ_coeff, vir_coeff, occ_energy, vir_energy } = input;
+    let UPT2ElecDerivIncoreInp { cderi, cderi_vox, occ_coeff, vir_coeff, occ_energy, vir_energy, index_occ_outer_vec, index_vir_outer_vec } = input;
     let UPT2ElecDerivIncoreArg { c_os, c_ss } = arg;
     let (c_os, c_ss) = (*c_os, *c_ss);
     let device = cderi.device().clone();
@@ -80,6 +96,16 @@ pub fn get_rupt2_elec_deriv_incore(
     let nocc = [occ_coeff[0].shape()[1], occ_coeff[1].shape()[1]];
     let nvir = [vir_coeff[0].shape()[1], vir_coeff[1].shape()[1]];
     let nmo = [nocc[0] + nvir[0], nocc[1] + nvir[1]];
+    for s in 0..2 {
+        assert_eq!(index_occ_outer_vec[s].first(), Some(&0), "index_occ_outer_vec[{s}] must start with 0");
+        assert_eq!(index_occ_outer_vec[s].last(), Some(&nocc[s]), "index_occ_outer_vec[{s}] must end with nocc");
+        assert!(index_occ_outer_vec[s].is_sorted(), "index_occ_outer_vec[{s}] must be sorted");
+    }
+    for s in 0..2 {
+        assert_eq!(index_vir_outer_vec[s].first(), Some(&0), "index_vir_outer_vec[{s}] must start with 0");
+        assert_eq!(index_vir_outer_vec[s].last(), Some(&nvir[s]), "index_vir_outer_vec[{s}] must end with nvir");
+        assert!(index_vir_outer_vec[s].is_sorted(), "index_vir_outer_vec[{s}] must be sorted");
+    }
 
     let cderi_vox: [Tsr; 2] =
         [0, 1].map(|s| match &cderi_vox[s] {
@@ -108,7 +134,7 @@ pub fn get_rupt2_elec_deriv_incore(
         (-vir_energy[1].i((.., None)) - vir_energy[1].i((None, ..))).into_dim::<Ix2>(),
     ];
 
-    // ── same-spin blocks: pair-symmetrized amplitudes, rdm1 by 4-d reshapes, G by one GEMM ── //
+    // ── same-spin blocks: pair-symmetrized amplitudes streamed over occupied windows ── //
     for s in 0..2 {
         if nocc[s] == 0 || nvir[s] == 0 {
             continue;
@@ -118,99 +144,133 @@ pub fn get_rupt2_elec_deriv_incore(
         let sv = no..nmo[s];
         // biorthogonal coefficients: T = bi1 t - bi2 t^T with T = 1/2 c_ss (t - t^T)
         let (bi1, bi2) = (0.5 * c_ss, 0.5 * c_ss);
-        let mut t_vivo: Tsr = rt::zeros(([nv, no, nv, no].f(), &device));
-        let mut T_vivo: Tsr = rt::zeros(([nv, no, nv, no].f(), &device));
-        let pair_ij: Vec<[usize; 2]> = (0..no).flat_map(|i| (0..=i).map(move |j| [i, j])).collect();
-        let e_corr_s = e_corr.clone();
-        pair_ij.into_par_iter().for_each(|[i, j]| {
-            let d_ij = occ_energy[s][[i]] + occ_energy[s][[j]];
-            let g_vv = cderi_vox[s].i((.., i, ..)) % cderi_vox[s].i((.., j, ..)).t();
-            let d_vv = &d_vv_outer[s] + d_ij;
-            let t_vv = &g_vv / &d_vv;
-            let t_vv_ = T_vv_full(&t_vv, bi1, bi2);
-            if j <= i {
-                let diag_scale = if i == j { 1.0 } else { 2.0 };
-                *e_corr_s.lock().unwrap() += diag_scale * (&t_vv_ * &g_vv).sum();
+        for io_slice in index_occ_outer_vec[s].windows(2) {
+            let nstep = io_slice[1] - io_slice[0];
+            let mut t_vivo: Tsr = rt::zeros(([nv, nstep, nv, no].f(), &device));
+            let mut T_vivo: Tsr = rt::zeros(([nv, nstep, nv, no].f(), &device));
+            let mut g_vix_b: Tsr = rt::zeros(([nv, nstep, naux].f(), &device));
+            // pairs (i, j): j <= i inside the window, all j outside it (each pair once)
+            let mut pair_ij: Vec<[usize; 2]> = Vec::new();
+            for i in io_slice[0]..io_slice[1] {
+                let range_1 = io_slice[0]..=i;
+                let range_2 = 0..io_slice[0];
+                let range_3 = io_slice[1]..no;
+                pair_ij.extend(range_1.chain(range_2).chain(range_3).map(|j| [i, j]));
             }
-            let mut t_vivo = unsafe { t_vivo.force_mut() };
-            let mut t_vivo_T = unsafe { T_vivo.force_mut() };
-            t_vivo.i_mut((.., i, .., j)).assign(&t_vv);
-            t_vivo_T.i_mut((.., i, .., j)).assign(&t_vv_);
-            if j < i {
-                t_vivo.i_mut((.., j, .., i)).assign(t_vv.t());
-                t_vivo_T.i_mut((.., j, .., i)).assign(t_vv_.t());
-            }
-        });
-        // D[oo] -= 2 sum T t; D[vv] += 2 sum T t (both sides of the pair matrix summed)
-        let scr = t_vivo.view().reshape((-1, no)).t() % T_vivo.view().reshape((-1, no));
-        *&mut rdm1[s].i_mut((so.clone(), so.clone())) -= &(scr * 2.0);
-        let scr = t_vivo.view().reshape((nv, -1)) % T_vivo.view().reshape((nv, -1)).t();
-        *&mut rdm1[s].i_mut((sv.clone(), sv.clone())) += &(scr * 2.0);
-        // G^s[same-spin part] = 4 T[viv, o] % cderi_vox[vo, x]
-        let g_part =
-            T_vivo.view().reshape([nv * no, nv * no]) % cderi_vox[s].view().reshape([nv * no, naux]);
-        g_vix[s] = (g_part * 4.0 + &g_vix[s].view().into_shape([nv * no, naux]))
-            .into_shape([nv, no, naux]);
+            let e_corr_s = e_corr.clone();
+            pair_ij.into_par_iter().for_each(|[i, j]| {
+                let d_ij = occ_energy[s][[i]] + occ_energy[s][[j]];
+                let g_vv = cderi_vox[s].i((.., i, ..)) % cderi_vox[s].i((.., j, ..)).t();
+                let d_vv = &d_vv_outer[s] + d_ij;
+                let t_vv = &g_vv / &d_vv;
+                let t_vv_ = T_vv_full(&t_vv, bi1, bi2);
+                if j <= i {
+                    let diag_scale = if i == j { 1.0 } else { 2.0 };
+                    *e_corr_s.lock().unwrap() += diag_scale * (&t_vv_ * &g_vv).sum();
+                }
+                let mut t_vivo = unsafe { t_vivo.force_mut() };
+                let mut t_vivo_T = unsafe { T_vivo.force_mut() };
+                t_vivo.i_mut((.., i - io_slice[0], .., j)).assign(&t_vv);
+                t_vivo_T.i_mut((.., i - io_slice[0], .., j)).assign(&t_vv_);
+                if (io_slice[0] <= j) && (j < i) {
+                    t_vivo.i_mut((.., j - io_slice[0], .., i)).assign(t_vv.t());
+                    t_vivo_T.i_mut((.., j - io_slice[0], .., i)).assign(t_vv_.t());
+                }
+            });
+            // D[oo] -= 2 sum T t; D[vv] += 2 sum T t (per-window partial sums over the i rows)
+            let scr = t_vivo.view().reshape((-1, no)).t() % T_vivo.view().reshape((-1, no));
+            *&mut rdm1[s].i_mut((so.clone(), so.clone())) -= &(scr * 2.0);
+            let scr = t_vivo.view().reshape((nv, -1)) % T_vivo.view().reshape((nv, -1)).t();
+            *&mut rdm1[s].i_mut((sv.clone(), sv.clone())) += &(scr * 2.0);
+            // G^s[same-spin part] = 4 T[viv, o] % cderi_vox[vo, x]
+            let mut g_vix_b_2d = rt::asarray((g_vix_b.raw_mut(), [nv * nstep, naux].f(), &device));
+            g_vix_b_2d.matmul_from(
+                &T_vivo.view().into_shape([nv * nstep, nv * no]),
+                &cderi_vox[s].view().into_shape([nv * no, naux]),
+                4.0,
+                0.0,
+            );
+            *&mut g_vix[s].i_mut((.., io_slice[0]..io_slice[1], ..)) += &g_vix_b;
+        }
     }
 
-    // ── opposite-spin block: all (i_a, k_b) pairs; T = c_os t, so only t is stored ── //
+    // ── opposite-spin block, two streaming passes ── //
+    // Each rdm1 piece is a Gram (outer product summed over the remaining three indices) whose
+    // own index pair must be complete in the working set; the four Grams pair up as α-side
+    // (α-occ / α-virt pairs) and β-side (β-occ / β-virt pairs), so one pass per side — each
+    // windowing its own α respectively β virtual index — covers all four without a `nocc^2
+    // nvir^2` tensor. The energy and both G intermediates ride the first pass.
     if nocc[0] > 0 && nocc[1] > 0 && nvir[0] > 0 && nvir[1] > 0 {
         let (nva, nvb, noa, nob) = (nvir[0], nvir[1], nocc[0], nocc[1]);
         let d_vv_ab =
             (-vir_energy[0].i((.., None)) - vir_energy[1].i((None, ..))).into_dim::<Ix2>();
-        let mut t_x: Tsr = rt::zeros(([nva, noa, nvb, nob].f(), &device));
-        let pair_ik: Vec<[usize; 2]> = (0..noa).flat_map(|i| (0..nob).map(move |k| [i, k])).collect();
-        let e_corr_x = e_corr.clone();
-        pair_ik.into_par_iter().for_each(|[i, k]| {
-            let d_ik = occ_energy[0][[i]] + occ_energy[1][[k]];
-            let g_ab = cderi_vox[0].i((.., i, ..)) % cderi_vox[1].i((.., k, ..)).t();
-            let d_ab = &d_vv_ab + d_ik;
-            let t_ab = &g_ab / &d_ab;
-            *e_corr_x.lock().unwrap() += c_os * (&t_ab * &g_ab).sum();
-            let mut t_x = unsafe { t_x.force_mut() };
-            t_x.i_mut((.., i, .., k)).assign(&t_ab);
-        });
-        let t2 = t_x.view().into_shape([nva * noa, nvb * nob]); // [(a i), (b k)]
-        // G contributions: rows of T2 = c_os t2 are (a i), columns (b k)
-        let g_a = (t2.view() % cderi_vox[1].view().into_shape([nvb * nob, naux])) * (2.0 * c_os);
-        *&mut g_vix[0] += &g_a.into_shape([nva, noa, naux]);
-        let g_b = (t2.view().t() % cderi_vox[0].view().into_shape([nva * noa, naux])) * (2.0 * c_os);
-        *&mut g_vix[1] += &g_b.into_shape([nvb, nob, naux]);
-        // correlation rdm1 pieces; each contracts one amplitude index pair completely (the `oo`
-        // parts) or takes the partial trace over the paired occupied index (the `vv` parts)
-        let t3 = t_x.view().into_shape([nva * noa * nvb, nob]); // [(a i b), k]
-        let t4 = t_x.view().into_shape([nva * noa, nvb, nob]); // [(a i), b, k]
-        let t4b = t_x.view().into_shape([nva, noa, nvb * nob]); // [a, (i), (k b)]-soluble per spin
-        let m_a_oo = {
-            let mut m: Tsr = rt::zeros(([noa, noa].f(), &device));
-            let mut ta: Tsr = rt::zeros(([noa, nvb * nob].f(), &device));
-            for a in 0..nva {
-                ta.assign(&t_x.i((a, .., .., ..)).into_shape([noa, nvb * nob]));
-                *&mut m += &(ta.view() % ta.view().t());
-            }
-            m
-        };
-        *&mut rdm1[0].i_mut((0..noa, 0..noa)) -= &(m_a_oo * c_os);
-        let m_b_oo = t3.view().t() % t3.view();
-        *&mut rdm1[1].i_mut((0..nob, 0..nob)) -= &(m_b_oo * c_os);
-        let m_a_vv = {
-            let mut m: Tsr = rt::zeros(([nva, nva].f(), &device));
-            for i in 0..noa {
-                let ti = t4b.i((.., i, ..));
-                *&mut m += &(ti.view() % ti.view().t());
-            }
-            m
-        };
-        *&mut rdm1[0].i_mut((noa..nmo[0], noa..nmo[0])) += &(m_a_vv * c_os);
-        let m_b_vv = {
-            let mut m: Tsr = rt::zeros(([nvb, nvb].f(), &device));
-            for k in 0..nob {
-                let tk = t4.i((.., .., k));
-                *&mut m += &(tk.view().t() % tk.view());
-            }
-            m
-        };
-        *&mut rdm1[1].i_mut((nob..nmo[1], nob..nmo[1])) += &(m_b_vv * c_os);
+
+        // --- pass 1: α-virtual-windowed, β transparent; energy, G^α/G^β, β-side Grams ---
+        // permuted copy [i, a, P] keeps the `(i a)` row order mergeable for the `G^β` contraction
+        let cderi_vox_0_iao =
+            cderi_vox[0].view().into_shape([nva, noa, naux]).transpose([1, 0, 2]).into_contig(ColMajor);
+        for io_slice in index_vir_outer_vec[0].windows(2) {
+            let [a0, a1] = [io_slice[0], io_slice[1]];
+            let nva_b = a1 - a0;
+            let mut t_x: Tsr = rt::zeros(([nva_b, noa, nvb, nob].f(), &device));
+            let pair_ik: Vec<[usize; 2]> =
+                (0..noa).flat_map(|i| (0..nob).map(move |k| [i, k])).collect();
+            let e_corr_x = e_corr.clone();
+            pair_ik.into_par_iter().for_each(|[i, k]| {
+                let d_ik = occ_energy[0][[i]] + occ_energy[1][[k]];
+                let g_ab = cderi_vox[0].i((a0..a1, i, ..)) % cderi_vox[1].i((.., k, ..)).t();
+                let d_ab = &d_vv_ab.i((a0..a1, ..)) + d_ik;
+                let t_ab = &g_ab / &d_ab;
+                *e_corr_x.lock().unwrap() += c_os * (&t_ab * &g_ab).sum();
+                let mut t_x = unsafe { t_x.force_mut() };
+                t_x.i_mut((.., i, .., k)).assign(&t_ab);
+            });
+            // G^α[(a i), P] += 2 c_os t[(a i), (b k)] (b k|P)
+            let t2_a = t_x.view().into_shape([nva_b * noa, nvb * nob]);
+            let g_a = (t2_a.view() % cderi_vox[1].view().into_shape([nvb * nob, naux])) * (2.0 * c_os);
+            *&mut g_vix[0].i_mut((a0..a1, .., ..)) += &g_a.into_shape([nva_b, noa, naux]);
+            // G^β[(b k), P] += 2 c_os Σ_{a, i} t[(i a), (b k)] (i a|P) over the window's α
+            let t_ia = t_x.view().transpose([1, 0, 2, 3]).into_contig(ColMajor);
+            let t2_ia = t_ia.view().into_shape([noa * nva_b, nvb * nob]);
+            let c_ia_2d = cderi_vox_0_iao.i((.., a0..a1, ..)).view().into_shape([noa * nva_b, naux]);
+            let g_b = (t2_ia.view().t() % c_ia_2d.view()) * (2.0 * c_os);
+            *&mut g_vix[1] += &g_b.into_shape([nvb, nob, naux]);
+            // β-side Grams: complete β-occupied / β-virtual pairs, partial sums over the α window
+            let t3 = t_x.view().into_shape([nva_b * noa * nvb, nob]); // [(a i b), k]
+            let m_b_oo = t3.view().t() % t3.view();
+            *&mut rdm1[1].i_mut((0..nob, 0..nob)) -= &(m_b_oo * c_os);
+            let w = t_x.view().transpose([2, 0, 1, 3]).into_contig(ColMajor);
+            let w = w.view().into_shape([nvb, nva_b * noa * nob]); // [b, (a i k)]
+            let m_b_vv = w.view() % w.view().t();
+            *&mut rdm1[1].i_mut((nob..nmo[1], nob..nmo[1])) += &(m_b_vv * c_os);
+        }
+
+        // --- pass 2: β-virtual-windowed, α transparent; α-side Grams (no energy/G) ---
+        let cderi_vox_0_2d = cderi_vox[0].view().into_shape([nva * noa, naux]); // [(a i), P]
+        let d_alpha_full = (-vir_energy[0].i((.., None)) + occ_energy[0].i((None, ..))).into_dim::<Ix2>();
+        for jo_slice in index_vir_outer_vec[1].windows(2) {
+            let [b0, b1] = [jo_slice[0], jo_slice[1]];
+            let nvb_b = b1 - b0;
+            let d_beta_b = (-vir_energy[1].i((b0..b1, None)) + occ_energy[1].i((None, ..))).into_dim::<Ix2>();
+            let yb = cderi_vox[1]
+                .i((b0..b1, .., ..))
+                .into_contig(ColMajor)
+                .view()
+                .into_shape([nvb_b * nob, naux]);
+            let g_all = cderi_vox_0_2d.view() % yb.view().t(); // [(a i), (b j)]
+            let d_all = &d_alpha_full.view().into_shape([nva * noa, 1]) + &d_beta_b.view().into_shape([1, nvb_b * nob]);
+            let t_x = (g_all / d_all).into_contig(ColMajor);
+            let t_x = t_x.view().into_shape([nva, noa, nvb_b, nob]);
+            // α-occupied Gram: [(a b j), i] partial over the β window
+            let a_oo = t_x.view().transpose([0, 2, 3, 1]).into_contig(ColMajor);
+            let a_oo = a_oo.view().into_shape([nva * nvb_b * nob, noa]);
+            let m_a_oo = a_oo.view().t() % a_oo.view();
+            *&mut rdm1[0].i_mut((0..noa, 0..noa)) -= &(m_a_oo * c_os);
+            // α-virtual Gram: [a, (i b j)] partial over the β window
+            let v = t_x.view().into_shape([nva, noa * nvb_b * nob]);
+            let m_a_vv = v.view() % v.view().t();
+            *&mut rdm1[0].i_mut((noa..nmo[0], noa..nmo[0])) += &(m_a_vv * c_os);
+        }
     }
 
     // ── generalized Fock blocks: per-aux-column contractions upon the complete G^s ── //
