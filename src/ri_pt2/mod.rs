@@ -45,6 +45,7 @@ pub mod pt2_pair_eng;
 pub mod torch_pt2_pair_eng;
 
 pub mod pure_pt2_r_elecderiv;
+pub mod pure_pt2_u_elecderiv;
 pub mod rgfock_pt2;
 
 #[derive(Clone)]

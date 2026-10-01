@@ -925,9 +925,15 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
 
         // 1.5 doubly-hybrid (RI-PT2) correlation gradient; requires the CD-decomposed rimatr
         if is_dh {
-            let mut grad_data_dh = crate::grad::rdh::RDHGradient::new(&scf_data, mpi_operator);
-            grad_data_dh.calc();
-            grad_data_list.push(("DH".into(), Box::new(grad_data_dh)));
+            if !scf_data.mol.ctrl.spin_polarization {
+                let mut grad_data_dh = crate::grad::rdh::RDHGradient::new(&scf_data, mpi_operator);
+                grad_data_dh.calc();
+                grad_data_list.push(("DH".into(), Box::new(grad_data_dh)));
+            } else {
+                let mut grad_data_dh = crate::grad::udh::UDHGradient::new(&scf_data, mpi_operator);
+                grad_data_dh.calc();
+                grad_data_list.push(("DH".into(), Box::new(grad_data_dh)));
+            }
         }
 
         // 2. dftd gradient data
