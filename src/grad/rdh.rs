@@ -37,9 +37,8 @@
 //! shell batch reduces directly (last-axis `rt::vecdot`) against `Ȳ`, never materializing
 //! `[naux, 3, x, y]` intermediates. The metric-derivative (`L_1`) term, however, follows forge's
 //! Cholesky-generator identity and therefore still requires the `Cd` convention (same as the
-//! rimatr itself), so a matching `policy` is asserted below.
+//! rimatr itself), so `calc` checks the control policy up front (`s_op` itself is trusted).
 
-use crate::analdrv::config::AnalDrvConfig;
 use crate::analdrv::response::rresp_interface::{rscf_resp_interface, scf_xc_func_list, RRespSCF};
 use crate::analdrv::response::rgfock_interface::{dh_jk_factors, dh_xc_func_list, solve_z_vector};
 use crate::analdrv::response::trait_rgfock::{GFockFlags, RGFockAPI};
@@ -49,13 +48,13 @@ use crate::dft::numint_matmul::nimatmul::{regroup_grids_by_atom, NIMatmul};
 use crate::dft::numint_matmul::resp_rks::RRespKSNIMatmul;
 use crate::dft::xc_deriv::XCType;
 use crate::dft::xceff::prelude::{determine_den_type_from_list, XCDenType};
-use crate::grad::rhf::{RIRHFGradient, RIHFGradientFlagsBuilder};
+use crate::grad::rhf::{get_grad_dao_ovlp, RIRHFGradient, RIHFGradientFlagsBuilder};
 use crate::grad::rks::get_vxc_rayon_new;
 use crate::grad::traits::GradAPI;
 use crate::mpi_io::MPIOperator;
 use crate::ri_jk::resp_r::RRespRIJK;
 use crate::ri_jk::util;
-use crate::ri_jk::{get_j2c_decomp, J2CDecompose, J2C_THRESH};
+use crate::ri_jk::{get_j2c_decomp, J2CDecompPolicy, J2CDecompose, J2C_THRESH};
 use crate::ri_pt2::rgfock_pt2::RGFockPT2;
 use crate::ri_pt2::{occ_batch_index, occ_batch_step};
 use crate::scf_io::SCF;
@@ -88,6 +87,24 @@ impl<'a> RDHGradient<'a> {
         assert!(!mol_obj.ctrl.spin_polarization, "RDHGradient supports only restricted (spin-polarization = false) references.");
         assert!(mol_obj.start_mo == 0, "RDHGradient does not support frozen core (start_mo).");
         assert!(self.mpi_operator.is_none(), "RDHGradient is not MPI-parallelized yet.");
+        assert!(
+            scf_data.mol.xc_data.omega().is_none(),
+            "RSH doubly-hybrid gradients are not supported."
+        );
+        assert!(
+            scf_data.mol.geom.ghost_pc_chrg.is_empty() && !scf_data.mol.ctrl.solvent_enabled,
+            "The DH analytic gradient does not support QMMM point charges or solvent models yet."
+        );
+        // the metric-derivative generator below follows forge's Cholesky-generator identity and
+        // is CD-only; refuse the other conventions before the PT2/Z-vector work (`s_op` trusted)
+        assert!(
+            matches!(scf_data.mol.ctrl.j2c_decomp.policy, J2CDecompPolicy::Cd),
+            "The DH analytic gradient's metric-derivative generator currently supports the CD convention only. Please set\n[ctrl.j2c_decomp]\npolicy = \"cd\"\nin the ctrl input (the derivative-integral solves themselves follow the rimatr convention)."
+        );
+        assert!(
+            !matches!(scf_data.mol.ctrl.j2c_decomp.uplo, Lower),
+            "RDHGradient does not support lower-triangular Cholesky factors (developer option)."
+        );
         let rimatr = scf_data.rimatr.as_ref().expect(
             "Decomposed ERI (rimatr) not found; the DH analytic gradient requires the streaming/new-driver RI-PT2 engine which keeps it alive.",
         );
@@ -112,7 +129,7 @@ impl<'a> RDHGradient<'a> {
         let d_hf = (&scf_data.density_matrix[0]).to_rstsr(&device);
 
         // ── response objects, relaxed correlation density, full four-block gfock ──
-        let config = AnalDrvConfig::default();
+        let config = mol_obj.ctrl.analdrv.clone().unwrap_or_default();
         let mut resp_objs: RRespSCF = rscf_resp_interface(scf_data, &config);
         let [c_os, c_ss]: [f64; 2] = mol_obj
             .xc_data
@@ -138,7 +155,7 @@ impl<'a> RDHGradient<'a> {
         let add_delta_k = delta_hyb.abs() > 1.0e-10;
         let add_xc_n = xc_func_pos.is_some() && !xc_n_is_scf;
         let has_final_functional = add_delta_k || add_xc_n;
-        let add_resp = has_scf_xc_gga(scf_data);
+        let add_resp = has_scf_xc(scf_data);
 
         // atom-grouped copy of the SCF grid, shared by the final-Fock and response terms
         let grids_regrouped = if has_final_functional || add_resp {
@@ -174,9 +191,9 @@ impl<'a> RDHGradient<'a> {
         } else {
             None
         };
-        // the PT2 kernel streams its amplitudes over occupied windows (never materializing
-        // `nocc^2 nvir^2` tensors): size the windows so the per-window transients stay within a
-        // few times the `nvir * nocc * naux` class and inside `max_memory`
+        // the PT2 kernel streams its amplitudes over occupied windows (storage bounded by the
+        // `nvir * nocc * naux` class): size the windows so the per-window transients stay within
+        // a few times that class and inside `max_memory`
         let mem_avail = mol_obj.ctrl.max_memory.map(|m| m - detect_used_memory_mb("proc"));
         let abort = mol_obj.ctrl.abort_on_mem_exceed;
         let elems_per_step = 2 * nvir * nvir * nocc + nvir * naux;
@@ -316,7 +333,13 @@ impl<'a> RDHGradient<'a> {
         // ── persistent MO intermediates; density dots of the rimatr by two GEMVs ──
         let mem_avail = mol_obj.ctrl.max_memory.map(|m| m - detect_used_memory_mb("proc"));
         let abort = mol_obj.ctrl.abort_on_mem_exceed;
-        handle_memory_exceed((nocc * nmo * naux + nvir * nocc * naux) as f64 * 8.0 / 1048576.0, mem_avail, abort);
+        // true peak of the persistent intermediates: `y_ip`/`g_vix` plus the three layout
+        // copies of their `Ȳ` partners, all co-resident until the two sources are dropped
+        handle_memory_exceed(
+            4.0 * (nocc * nmo * naux + nvir * nocc * naux) as f64 * 8.0 / 1048576.0,
+            mem_avail,
+            abort,
+        );
         let d_hf_tp = crate::grad::rhf::pack_triu_tilde(d_hf.view());
         let d_r_ao_tp = crate::grad::rhf::pack_triu_tilde(d_r_ao.view());
         let y_dot_d: Tsr<f64> = (ederi_utp.view().t() % d_hf_tp.view().reshape([nao_tp, 1])).into_shape([naux]);
@@ -550,7 +573,7 @@ impl<'a> RDHGradient<'a> {
                 // add their difference
                 let dao_xc_n = xc_skeleton_dao(scf_data, self.mpi_operator, false, scf_data.grids.as_ref().unwrap());
                 let dao_xc_scf = xc_skeleton_dao(scf_data, self.mpi_operator, true, scf_data.grids.as_ref().unwrap());
-                let dao_xc: Tsr<f64> = 2.0 * (&(&dao_xc_n - &dao_xc_scf) * &d_hf.i((.., .., None))).sum_axes(1);
+                let dao_xc: Tsr<f64> = get_grad_dao_ovlp((&dao_xc_n - &dao_xc_scf).view(), d_hf.view());
                 for atm in 0..natm {
                     let [_, _, p0, p1] = mol_ao_slice[atm];
                     *&mut de_xc_n.i_mut((.., atm)) += &dao_xc.i(p0..p1).sum_axes(0);
@@ -574,7 +597,7 @@ impl<'a> RDHGradient<'a> {
                 // difference `f(2 W_n - dme0)` only (`f` = the two-half contraction pattern)
                 let dme0 = crate::grad::rhf::get_dme0(mo_coeff.view(), mo_occ.view(), mo_energy.view());
                 let dao_ovlp: Tsr<f64> =
-                    2.0 * (&tsr_ipovlp * &(&(&w_n * 2.0) - &dme0).i((.., .., None))).sum_axes(1);
+                    get_grad_dao_ovlp(tsr_ipovlp.view(), (&(&w_n * 2.0) - &dme0).view());
                 for atm in 0..natm {
                     let [_, _, p0, p1] = mol_ao_slice[atm];
                     *&mut de_ovlp_dh.i_mut((.., atm)) += &dao_ovlp.i(p0..p1).sum_axes(0);
@@ -638,7 +661,7 @@ fn de_xc_response_term(
 
     let de_resp: Tsr<f64> = rt::zeros(([3, natm].f(), &device));
     let nchunk_target = (rayon::current_num_threads() * 8).max(1);
-    let nsplit = (ngrids + nchunk_target - 1) / nchunk_target;
+    let nsplit = ((ngrids + nchunk_target - 1) / nchunk_target).max(1);
     let chunks = (0..ngrids).step_by(nsplit).map(|s| (s, (s + nsplit).min(ngrids))).collect::<Vec<_>>();
     let guard = std::sync::Mutex::new(());
     use rayon::prelude::*;
@@ -729,18 +752,10 @@ impl GradAPI for RDHGradient<'_> {
     }
 }
 
-/// Whether the SCF-iteration functional carries a GGA-or-higher XC part (the gate of the
-/// response-density XC term; LDA-type functionals have no grid-gradient contribution here,
-/// following pyscf-forge's `_xc_type(xc) == "GGA"` gate).
-fn has_scf_xc_gga(scf_data: &SCF) -> bool {
-    let xc_data = &scf_data.mol.xc_data;
-    if xc_data.dfa_compnt_scf.is_empty() {
-        return false;
-    }
-    let func_list = scf_xc_func_list(scf_data);
-    let refs: Vec<&libxc::functional::LibXCFunctional> = func_list.iter().map(|(_, f)| f).collect();
-    let xc_type = determine_den_type_from_list(&refs);
-    matches!(xc_type, XCDenType::SIGMA | XCDenType::TAU)
+/// Whether the SCF-iteration functional carries a non-HF XC part (the gate of the
+/// response-density XC term; the kernels handle LDA/GGA/MGGA alike, unlike forge's GGA-only gate).
+fn has_scf_xc(scf_data: &SCF) -> bool {
+    !scf_data.mol.xc_data.dfa_compnt_scf.is_empty()
 }
 
 /// A bare gradient helper carrying the SCF control flags, for reuse of the gradient kernels

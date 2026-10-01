@@ -25,8 +25,10 @@
 //! Every block streams its amplitudes over windows ([`UPT2ElecDerivIncoreInp::index_occ_outer_vec`]
 //! / [`UPT2ElecDerivIncoreInp::index_vir_outer_vec`], cf.
 //! [`occ_batch_index`](crate::ri_pt2::occ_batch_index)): only window-sized buffers exist
-//! transiently and are discarded after their rdm1/$G$ accumulation, so no `nocc^2 nvir^2`
-//! amplitude tensor is ever materialized. The same-spin blocks use the pair-symmetry structure of
+//! transiently and are discarded after their rdm1/$G$ accumulation, so amplitude storage is
+//! bounded by the `nvir * nocc * naux` class (times the caller's headroom); a single window --
+//! the full `nocc^2 nvir^2` tensor -- only occurs when that tensor is within the bound. The
+//! same-spin blocks use the pair-symmetry structure of
 //! the restricted kernel (triangular pair loop with the transpose fill) and window their outer
 //! occupied index. The $\alpha\beta$ block stores only the plain amplitudes ($T = c_{os} t$
 //! enters every contraction as a factor); each of its four rdm1 Grams must keep its own index
@@ -136,7 +138,8 @@ pub fn get_rupt2_elec_deriv_incore(
 
     // ── same-spin blocks: pair-symmetrized amplitudes streamed over occupied windows ── //
     for s in 0..2 {
-        if nocc[s] == 0 || nvir[s] == 0 {
+        // same-spin blocks contribute nothing when the same-spin factor vanishes (xygj-os etc.)
+        if nocc[s] == 0 || nvir[s] == 0 || c_ss.abs() < 1.0e-12 {
             continue;
         }
         let (nv, no) = (nvir[s], nocc[s]);

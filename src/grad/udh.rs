@@ -31,7 +31,6 @@
 //! $W_n^\sigma = C_o^\sigma F_n^\sigma(D_{scf})_{oo} C_o^{\sigma\top}$ (no occupancy factor,
 //! against the restricted 2).
 
-use crate::analdrv::config::AnalDrvConfig;
 use crate::analdrv::response::rgfock_interface::dh_jk_factors;
 use crate::analdrv::response::trait_uresp::URespAPI;
 use crate::analdrv::response::uresp_interface::{
@@ -42,14 +41,16 @@ use crate::dft::numint_matmul::nimatmul::{regroup_grids_by_atom, NIMatmul};
 use crate::dft::numint_matmul::resp_uks::URespKSNIMatmul;
 use crate::dft::xc_deriv::XCType;
 use crate::dft::xceff::prelude::{determine_den_type_from_list, XCDenType};
-use crate::grad::rhf::{generator_deriv_hcore, get_dme0, pack_triu_tilde, RIHFGradientFlagsBuilder};
+use crate::grad::rhf::{
+    generator_deriv_hcore, get_dme0, get_grad_dao_ovlp, pack_triu_tilde, RIHFGradientFlagsBuilder,
+};
 use crate::grad::traits::GradAPI;
 use crate::grad::uhf::RIUHFGradient;
 use crate::mpi_io::MPIOperator;
 use crate::ri_jk::resp_u::URespRIJK;
 use crate::ri_jk::util;
 use crate::ri_jk::util::get_dm0_restricted;
-use crate::ri_jk::{get_j2c_decomp, J2CDecompose};
+use crate::ri_jk::{get_j2c_decomp, J2CDecompPolicy, J2CDecompose};
 use crate::ri_pt2::pure_pt2_u_elecderiv::{
     get_rupt2_elec_deriv_incore, UPT2ElecDerivIncoreArg, UPT2ElecDerivIncoreInp,
 };
@@ -88,6 +89,24 @@ impl<'a> UDHGradient<'a> {
         assert!(matches!(scf_data.scftype, SCFType::UHF), "UDHGradient supports only UHF references.");
         assert!(mol_obj.start_mo == 0, "UDHGradient does not support frozen core (start_mo).");
         assert!(self.mpi_operator.is_none(), "UDHGradient is not MPI-parallelized yet.");
+        assert!(
+            scf_data.mol.xc_data.omega().is_none(),
+            "RSH doubly-hybrid gradients are not supported."
+        );
+        assert!(
+            scf_data.mol.geom.ghost_pc_chrg.is_empty() && !scf_data.mol.ctrl.solvent_enabled,
+            "The DH analytic gradient does not support QMMM point charges or solvent models yet."
+        );
+        // the metric-derivative generator below follows forge's Cholesky-generator identity and
+        // is CD-only; refuse the other conventions before the PT2/Z-vector work (`s_op` trusted)
+        assert!(
+            matches!(scf_data.mol.ctrl.j2c_decomp.policy, J2CDecompPolicy::Cd),
+            "The DH analytic gradient's metric-derivative generator currently supports the CD convention only. Please set\n[ctrl.j2c_decomp]\npolicy = \"cd\"\nin the ctrl input (the derivative-integral solves themselves follow the rimatr convention)."
+        );
+        assert!(
+            !matches!(scf_data.mol.ctrl.j2c_decomp.uplo, Lower),
+            "UDHGradient does not support lower-triangular Cholesky factors (developer option)."
+        );
         let rimatr = scf_data.rimatr.as_ref().expect(
             "Decomposed ERI (rimatr) not found; the DH analytic gradient requires the streaming/new-driver RI-PT2 engine which keeps it alive.",
         );
@@ -121,7 +140,7 @@ impl<'a> UDHGradient<'a> {
         let add_delta_k = delta_hyb.abs() > 1.0e-10;
         let add_xc_n = xc_func_pos.is_some() && !xc_n_is_scf;
         let has_final_functional = add_delta_k || add_xc_n;
-        let add_resp = has_scf_xc_gga(scf_data);
+        let add_resp = has_scf_xc(scf_data);
 
         // atom-grouped copy of the SCF grid, shared by the final-Fock and response terms
         let grids_regrouped = if has_final_functional || add_resp {
@@ -202,10 +221,10 @@ impl<'a> UDHGradient<'a> {
         };
 
         // ── response objects, PT2 electronic derivative, relaxed correlation density ── //
-        let config = AnalDrvConfig::default();
+        let config = mol_obj.ctrl.analdrv.clone().unwrap_or_default();
         let mut resp_objs: URespSCF = uscf_resp_interface(scf_data, &config);
-        // the in-core electronic-derivative evaluation streams its amplitudes (never
-        // materializing `nocc^2 nvir^2` tensors): the same-spin blocks window their outer
+        // the in-core electronic-derivative evaluation streams its amplitudes (storage bounded
+        // by the `nvir * nocc * naux` class): the same-spin blocks window their outer
         // occupied index, the αβ block its α virtual index (full occupied range per window, cf.
         // the kernel docs). Size the windows so the per-window transients stay within a few
         // times the `nvir * nocc * naux` class and inside `max_memory`.
@@ -429,8 +448,10 @@ impl<'a> UDHGradient<'a> {
         };
 
         // ── persistent MO intermediates; density dots of the rimatr by two GEMVs per spin ── //
+        // true peak: the `y_ip`/`g_vix` partners plus the three layout copies of their `Ȳ`
+        // partners per spin, all co-resident until the two sources are dropped
         handle_memory_exceed(
-            ((nocc[0] + nocc[1]) * nmo * naux + (nvir[0] * nocc[0] + nvir[1] * nocc[1]) * naux) as f64
+            4.0 * ((nocc[0] + nocc[1]) * nmo * naux + (nvir[0] * nocc[0] + nvir[1] * nocc[1]) * naux) as f64
                 * 8.0
                 / 1048576.0,
             mem_avail,
@@ -815,7 +836,7 @@ impl<'a> UDHGradient<'a> {
                 let mut dao_xc: Tsr = rt::zeros(([nao, 3], &device));
                 for s in 0..2 {
                     *&mut dao_xc +=
-                        &(2.0 * &(&(&dao_xc_n[s] - &dao_xc_scf[s]) * &d_hf[s].i((.., .., None))).sum_axes(1));
+                        &get_grad_dao_ovlp((&dao_xc_n[s] - &dao_xc_scf[s]).view(), d_hf[s].view());
                 }
                 for atm in 0..natm {
                     let [_, _, p0, p1] = mol_ao_slice[atm];
@@ -846,7 +867,7 @@ impl<'a> UDHGradient<'a> {
                 // the difference only (`2` = the two-half contraction pattern)
                 let dme0 = get_dme0(mo_coeff[0].view(), mo_occ[0].view(), mo_energy[0].view())
                     + get_dme0(mo_coeff[1].view(), mo_occ[1].view(), mo_energy[1].view());
-                let dao_ovlp: Tsr = 2.0 * (&tsr_ipovlp * &(&w_n - &dme0).i((.., .., None))).sum_axes(1);
+                let dao_ovlp: Tsr = get_grad_dao_ovlp(tsr_ipovlp.view(), (&w_n - &dme0).view());
                 for atm in 0..natm {
                     let [_, _, p0, p1] = mol_ao_slice[atm];
                     *&mut de_ovlp_dh.i_mut((.., atm)) += &dao_ovlp.i(p0..p1).sum_axes(0);
@@ -880,19 +901,12 @@ fn to_matrix_full(tsr: Tsr) -> MatrixFull<f64> {
     MatrixFull::from_vec(shape, tsr.into_shape(-1).into_raw()).unwrap()
 }
 
-/// Whether the SCF-iteration functional carries a GGA-or-higher XC part (the gate of the
-/// response-density XC term; LDA-type functionals have no grid-gradient contribution here,
-/// following pyscf-forge's `_xc_type(xc) == "GGA"` gate). Unrestricted twin of the helper in
-/// [`crate::grad::rdh`], duplicated to keep the restricted module untouched.
-fn has_scf_xc_gga(scf_data: &SCF) -> bool {
-    let xc_data = &scf_data.mol.xc_data;
-    if xc_data.dfa_compnt_scf.is_empty() {
-        return false;
-    }
-    let func_list = scf_xc_func_list_uks(scf_data);
-    let refs: Vec<&libxc::functional::LibXCFunctional> = func_list.iter().map(|(_, f)| f).collect();
-    let xc_type = determine_den_type_from_list(&refs);
-    matches!(xc_type, XCDenType::SIGMA | XCDenType::TAU)
+/// Whether the SCF-iteration functional carries a non-HF XC part (the gate of the
+/// response-density XC term; the kernels handle LDA/GGA/MGGA alike, unlike forge's GGA-only
+/// gate). Unrestricted twin of the helper in [`crate::grad::rdh`], duplicated to keep the
+/// restricted module untouched.
+fn has_scf_xc(scf_data: &SCF) -> bool {
+    !scf_data.mol.xc_data.dfa_compnt_scf.is_empty()
 }
 
 /// A bare unrestricted gradient helper carrying the SCF control flags, for reuse of the UKS
@@ -991,7 +1005,7 @@ fn de_xc_response_term(
 
     let de_resp: Tsr = rt::zeros(([3, natm].f(), &device));
     let nchunk_target = (rayon::current_num_threads() * 8).max(1);
-    let nsplit = (ngrids + nchunk_target - 1) / nchunk_target;
+    let nsplit = ((ngrids + nchunk_target - 1) / nchunk_target).max(1);
     let chunks = (0..ngrids).step_by(nsplit).map(|s| (s, (s + nsplit).min(ngrids))).collect::<Vec<_>>();
     let guard = std::sync::Mutex::new(());
     use rayon::prelude::*;

@@ -457,9 +457,9 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
 
     // --- RI-PT2 (correlation contribution; an ordinary element of the list) --- //
 
-    // the PT2 kernel streams its amplitudes over occupied windows (never materializing
-    // `nocc^2 nvir^2` tensors): size the windows so the per-window transients stay within a few
-    // times the `nvir * nocc * naux` class and inside `max_memory`
+    // the PT2 kernel streams its amplitudes over occupied windows (storage bounded by the
+    // `nvir * nocc * naux` class): size the windows so the per-window transients stay within a
+    // few times that class and inside `max_memory`
     let (nmo_, naux_) = (mo_coeff.shape()[1], rimatr.to_rstsr_view(&device).shape()[1]);
     let nvir = nmo_ - nocc;
     let mem_avail = scf_data.mol.ctrl.max_memory.map(|m| m - crate::utilities::memory_batch::detect_used_memory_mb("proc"));

@@ -51,11 +51,12 @@ pub mod rgfock_pt2;
 /// Batch size (number of outer occupied indices) of the amplitude-streaming electronic
 /// derivatives ([`pure_pt2_r_elecderiv`] / [`pure_pt2_u_elecderiv`]).
 ///
-/// The amplitude tensors are never stored at their full `nocc^2 nvir^2` size; the outer occupied
-/// index is streamed in windows. Each streamed batch costs `elems_per_step` elements per outer
-/// index and must fit both the available memory (`mem_avail_mb`, when given) and `headroom` times
-/// the working class `class_elems` (the `nvir * nocc * naux` transform/`G` objects). The result is
-/// capped at `nocc` and floored at 1.
+/// Each streamed batch costs `elems_per_step` elements per outer occupied index and must fit both
+/// the available memory (`mem_avail_mb`, when given) and `headroom` times the working class
+/// `class_elems` (the `nvir * nocc * naux` transform/`G` objects); the result is capped at `nocc`
+/// and floored at 1. Amplitude storage is therefore bounded by the working class (times
+/// `headroom`), with a single window -- the full `nocc^2 nvir^2` tensor -- only when that tensor
+/// is itself within the bound (small systems).
 pub fn occ_batch_step(nocc: usize, elems_per_step: usize, class_elems: usize, mem_avail_mb: Option<f64>, headroom: f64) -> usize {
     let elems_per_step = elems_per_step.max(1);
     let by_class = (headroom * class_elems as f64 / elems_per_step as f64).floor() as usize;

@@ -74,7 +74,9 @@ where
     /// allocation of a cast copy.
     pub cderi_vox: Option<TsrCow<'a, O>>,
     /// Batching (outer slice) indices of occupied orbitals; must start with `0` and end with
-    /// `nocc`. Degenerate occupied orbitals must stay within one batch.
+    /// `nocc`. The kernels are window-agnostic: any monotonic partition works, and degenerate
+    /// occupied orbitals may be split across windows (each unordered pair is visited once and the
+    /// per-window partial sums accumulate).
     pub index_occ_outer_vec: Vec<usize>,
     /// Opposite-spin correlation factor $c_\mathrm{OS}$.
     pub c_os: f64,
@@ -82,7 +84,8 @@ where
     pub c_ss: f64,
     /// Whether to additionally cache the amplitude intermediate $G_{ai}^\mathtt{P}$ under the
     /// result key `"g_vix"` (used by the analytic-gradient driver); costs an extra
-    /// `nvir * nocc * naux` tensor when enabled.
+    /// `nvir * nocc * naux` tensor. Must be set before the first evaluation (a cached kernel is
+    /// not re-run; enabling it later panics rather than omitting `"g_vix"`).
     pub dump_g_vix: bool,
     /// Cached results, keyed by tensor name. Keys used by this struct: `"rdm1"`,
     /// `"gfock_part"`/`"gfock_part_full"` (electronic-derivative gfock contribution in the two
@@ -143,6 +146,10 @@ where
     fn make_elec_deriv_with(&mut self, full_gfock: bool) {
         let key = if full_gfock { "gfock_part_full" } else { "gfock_part" };
         if self.result.contains_key(key) || (!full_gfock && self.result.contains_key("gfock_part_full")) {
+            assert!(
+                !self.dump_g_vix || self.result.contains_key("g_vix"),
+                "dump_g_vix was enabled after the cached electronic-derivative evaluation; set it before the first make_elec_deriv call."
+            );
             return;
         }
         let t0 = std::time::Instant::now();

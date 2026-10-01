@@ -888,12 +888,18 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         // list of (gradient name, gradient data)
         let mut grad_data_list: Vec<(String, Box<dyn GradAPI>)> = vec![];
 
-        // post-SCF (doubly-hybrid) gradients with a final-functional XC part need the DFT grids
-        // again, but `xdh_calculations` frees them for memory; regenerate before the SCF gradient
-        // borrows `scf_data` (the pure-MP2 family has no XC part and needs no grid)
+        // post-SCF (doubly-hybrid) gradients need the DFT grids again whenever the DH entry runs
+        // on a grid (final-functional XC part / hybrid difference, or the SCF functional's own XC
+        // response); `xdh_calculations` frees them, so regenerate (pure MP2 needs none)
         let is_dh = matches!(scf_data.mol.xc_data.dfa_family_pos, Some(crate::dft::DFAFamily::PT2));
-        let has_dh_xc = scf_data.mol.xc_data.dfa_compnt_pos.as_ref().map_or(false, |v| !v.is_empty());
-        if is_dh && has_dh_xc && scf_data.grids.is_none() {
+        let dh_needs_grids = {
+            let xc_data = &scf_data.mol.xc_data;
+            let final_xc = xc_data.dfa_compnt_pos.as_ref().map_or(false, |v| !v.is_empty());
+            let delta_hyb =
+                xc_data.dfa_hybrid_pos.unwrap_or(xc_data.dfa_hybrid_scf) - xc_data.dfa_hybrid_scf;
+            final_xc || delta_hyb.abs() > 1.0e-10 || !xc_data.dfa_compnt_scf.is_empty()
+        };
+        if is_dh && dh_needs_grids && scf_data.grids.is_none() {
             scf_data.grids = Some(crate::dft::Grids::build(&mut scf_data.mol));
         }
 
@@ -1006,7 +1012,8 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         println!("{}", formated_force(&gradient, &scf_data.mol.geom.elem));
         println!("------------------------------------");
 
-        (scf_data.scf_energy, gradient)
+        // the total energy (fifth-DFA/rpa/ai correction included), consistent with the gradient
+        (collect_total_energy(scf_data), gradient)
     };
 
     time_mark.count("force");
