@@ -35,6 +35,28 @@ pub fn scf_xc_func_list_uks(scf_data: &SCF) -> Vec<(f64, LibXCFunctional)> {
     crate::analdrv::response::rresp_interface::scf_xc_func_list_with_spin(scf_data, LibXCSpin::Polarized)
 }
 
+/// List of `(scale, functional)` pairs of the final-energy functional's DFT (XC numint) part of a
+/// DH (spin-polarized); `None` when the final functional has no DFT part.
+///
+/// Spin-polarized sibling of [`dh_xc_func_list`](crate::analdrv::response::rgfock_interface::
+/// dh_xc_func_list).
+pub fn dh_xc_func_list_uks(scf_data: &SCF) -> Option<Vec<(f64, LibXCFunctional)>> {
+    let xc_data = &scf_data.mol.xc_data;
+    let (xc_code, xc_params) = match (&xc_data.dfa_compnt_pos, &xc_data.dfa_paramr_pos) {
+        (Some(code), Some(_)) if code.is_empty() => return None,
+        (Some(code), Some(param)) => (code, param),
+        (None, None) => return None,
+        _ => panic!("dfa_compnt_pos and dfa_paramr_pos must be present or absent together."),
+    };
+    Some(
+        xc_code
+            .iter()
+            .zip(xc_params.iter())
+            .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Polarized)))
+            .collect_vec(),
+    )
+}
+
 /// The response (fock/response) objects of all electron-interaction contributions of an
 /// unrestricted SCF, as an owned list of `URespAPI` trait objects.
 ///

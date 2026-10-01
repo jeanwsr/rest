@@ -138,6 +138,12 @@ pub struct SCF {
     /// `(excitation energy, eigenvector)` in the solver's ordering.  Used by
     /// the TDDFT analytic-gradient driver.
     pub tddft_excitations: Option<Vec<(f64, Vec<f64>)>>,
+    /// Total relaxed (response) density of the most recent analytic double-hybrid (PT2-family)
+    /// force evaluation, prepared for the fchk density dump: the section matrices in
+    /// `[Total MP2 Density]` (restricted) / `[Total, Spin MP2 Density]` (unrestricted) order.
+    /// Written out by the `outputs` pass when it writes the fchk (`post_scf_output`); `None`
+    /// otherwise.
+    pub dh_rdm1_resp: Option<Vec<MatrixFull<f64>>>,
     /// State restored from a GW/evGW checkpoint when
     /// `resume_from_checkpoint = true` (see `crate::fileop::gw_checkpoint`).
     ///
@@ -215,6 +221,7 @@ impl SCF {
             solvent_scf: None,
             scf_converged: false,
             tddft_excitations: None,
+            dh_rdm1_resp: None,
             gw_checkpoint_state: None,
         };
 
