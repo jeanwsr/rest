@@ -90,9 +90,13 @@ impl RIUHFGradient<'_> {
         let xc_data = self.gen_xc_data(scf_data, 1);
         let mut mol = scf_data.mol.clone();
         let grids = &mut Grids::build(&mut mol);
+        let mem_probe_on =
+            utilities::memory_batch::mem_probe_enabled(self.scf_data.mol.ctrl.print_level);
+        utilities::memory_batch::mem_probe("calc_de_xc (uks): before get_vxc_rayon_new", mem_probe_on);
         // let dao_vxc = get_vxc(&self, &xc_data, grids, &scf_data.mol, self.flags.max_memory.unwrap_or(2000.0) as usize);
         // let dao_vxc = get_vxc_rayon(&self, &xc_data, grids, &scf_data.mol);
         let dao_vxc = get_vxc_rayon_new(&self, &xc_data, grids, &mol, 16usize);
+        utilities::memory_batch::mem_probe("calc_de_xc (uks): after get_vxc_rayon_new", mem_probe_on);
         // println!("Finished calculating dx vxc");
         
         // contract dao_vxc and dm (tuv, uv -> tu) and sum over spin case
@@ -456,14 +460,12 @@ fn get_vxc_rayon_new(gradient_method: &RIUHFGradient, xc_data: &XCData, grids: &
     // UKS case 
     let spin = 1usize;
     let nspin = spin + 1;
-    let mut vmat_a = rt::zeros(([num_basis, num_basis, 3], device));
-    let mut vmat_b = rt::zeros(([num_basis, num_basis, 3], device));
-    let mut vmat = vec![vmat_a, vmat_b];
-
-    let (sender, receiver) = channel();
-
-    gradient_method.par_block_loop(mol, grids, block_settings)
-        .for_each_with(sender, |s, block| {
+    // Accumulate grid block by grid block with one accumulator per worker, see the closed-shell
+    // twin in `rks.rs`: an unbounded channel holding one [nao, nao, 3, nspin] entry per block
+    // grows like (ngrids / blksize) * nao^2 and dominates the memory of a large gradient.
+    let mut vmat = gradient_method
+        .par_block_loop(mol, grids, block_settings)
+        .map(|block| {
             omp_set_num_threads_wrapper(1);
 
             let ng = block.weights.len();
@@ -515,16 +517,22 @@ fn get_vxc_rayon_new(gradient_method: &RIUHFGradient, xc_data: &XCData, grids: &
                     unreachable!("HF gradient calculation does not support here in get_vxc");
                 },
             }
-            s.send((loc_vmat)).unwrap();
-        });
-
-    receiver.into_iter().for_each(
-        |(loc_vmat)| 
-        {
-            vmat[0] += loc_vmat[0].view();
-            vmat[1] += loc_vmat[1].view();
-        }
-    );
+            loc_vmat
+        })
+        .reduce(
+            || {
+                vec![
+                    rt::zeros(([num_basis, num_basis, 3], device)),
+                    rt::zeros(([num_basis, num_basis, 3], device)),
+                ]
+            },
+            |mut acc, part| {
+                for (a, p) in acc.iter_mut().zip(part.iter()) {
+                    *a += p.view();
+                }
+                acc
+            },
+        );
     omp_set_num_threads_wrapper(default_omp_num_threads);
     // nabla R = - nabla r
     for ispin in 0..nspin {

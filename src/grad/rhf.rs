@@ -303,6 +303,10 @@ impl RIRHFGradient<'_> {
         time_records.new_item("de-jk batch 7", "de-jk 7 batch (get_grad_dao_k_int3c2e_ip1, rsh)");
         time_records.new_item("de-jk batch 8", "de-jk 8 batch (get_grad_daux_k_int3c2e_ip2, rsh)");
 
+        // peak-attribution probe of the analytic gradient (REST_MEM_PROBE=1 or print_level >= 3)
+        let mem_probe_on = mem_probe_enabled(self.scf_data.mol.ctrl.print_level);
+        mem_probe("calc_de_jk: enter", mem_probe_on);
+
         time_records.count_start("de-jk prepr 1");
 
         let mol_obj = &self.scf_data.mol;
@@ -411,6 +415,7 @@ impl RIRHFGradient<'_> {
         let (aux_span0, aux_span1) = (aux_loc[aux_shl0], aux_loc[aux_shl1]);
 
         time_records.count("de-jk prepr 1");
+        mem_probe("de-jk prepr 1 done (rimatr, j2c, int2c2e_ip1)", mem_probe_on);
 
         // basic setup finished
         // begin hybrid computation
@@ -443,7 +448,9 @@ impl RIRHFGradient<'_> {
         }
 
         time_records.count("de-jk prepr 2");
+        mem_probe("de-jk prepr 2 done (itm_j, itm_k_occtp, daux seeds)", mem_probe_on);
 
+        let mut batch_probe_left = 2usize;
         for [shl0, shl1] in local_aux_partition.clone() {
             let shl_slices = [[0, mol.nbas()], [0, mol.nbas()], [shl0, shl1]];
             let (p0, p1) = (aux_loc[shl0], aux_loc[shl1]);
@@ -465,6 +472,13 @@ impl RIRHFGradient<'_> {
                 };
             }
             time_records.count("de-jk batch int");
+            if batch_probe_left > 0 {
+                mem_probe(
+                    &format!("int3c2e_ip1/ip2 built for aux shells {}..{}", shl0, shl1),
+                    mem_probe_on,
+                );
+                batch_probe_left -= 1;
+            }
 
             if self.flags.factor_j.is_some() {
                 time_records.count_start("de-jk batch 1");
@@ -747,6 +761,7 @@ impl RIRHFGradient<'_> {
             flag.then(|| self.result.insert(key.into(), de_part));
         }
 
+        mem_probe("calc_de_jk: done", mem_probe_on);
         return self;
     }
 

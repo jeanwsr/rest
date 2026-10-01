@@ -60,6 +60,23 @@ pub fn detect_used_memory_mb(use_case: &str) -> f64 {
 /// - `mem_factor`: factor for mem_avail, to avoid all memory consumed; should be smaller than 1,
 ///   recommended 0.7.
 /// - `pre_flop`: Number of data preserved in memory. Unit in number.
+/// Peak-attribution probe: print the resident set of this process together with a label.
+///
+/// Enabled by the environment variable `REST_MEM_PROBE=1` or by `print_level >= 3`, and a no-op
+/// otherwise, so the calls can stay in the hot paths of the force driver. Used to attribute the
+/// peak memory of an analytic gradient.
+pub fn mem_probe(label: &str, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    println!("[mem-probe] {:9.1} MB | {}", detect_used_memory_mb("proc"), label);
+}
+
+/// Whether the memory probe is switched on for this run.
+pub fn mem_probe_enabled(print_level: usize) -> bool {
+    print_level >= 3 || std::env::var("REST_MEM_PROBE").map(|v| v == "1").unwrap_or(false)
+}
+
 pub fn calc_batch_size<T>(
     unit_flop: usize,
     mem_avail: Option<f64>,
