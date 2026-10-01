@@ -174,8 +174,10 @@ fn multipole_interface_r<'a>(
 
             // the fchk (head + MO coefficients) is regenerated first, so the appended section
             // always sits after the librest2fch-written MO coefficients (the content is
-            // identical to the earlier `post_scf_output` write)
-            scf_data.save_fchk_of_gaussian();
+            // identical to the earlier `post_scf_output` write); the primitives are called
+            // directly, since `save_fchk_of_gaussian` would also write the DH density dump
+            scf_data.create_fchk_head();
+            scf_data.fchk_write_mo();
 
             // pack the density into the fchk layout: Gaussian AO order (consistent with the
             // librest2fch-written MO coefficients), lower triangle by column

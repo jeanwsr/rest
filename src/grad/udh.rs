@@ -74,11 +74,16 @@ pub struct UDHGradient<'a> {
     pub result: HashMap<String, MatrixFull<f64>>,
     /// PT2 correlation energy (side product of the electronic-derivative evaluation).
     pub energy: f64,
+    /// Total relaxed density (SCF density plus the relaxed correlation density) prepared for the
+    /// fchk density dump, in fchk section order: `[Total MP2 Density, Spin MP2 Density]`
+    /// (alpha + beta, alpha - beta). `Some` only when `[ctrl] outputs` requests `fchk`; the same
+    /// density the multipole task dumps.
+    pub rdm1_dump: Option<Vec<MatrixFull<f64>>>,
 }
 
 impl<'a> UDHGradient<'a> {
     pub fn new(scf_data: &'a SCF, mpi_operator: &'a Option<MPIOperator>) -> Self {
-        Self { scf_data, mpi_operator, result: HashMap::new(), energy: 0.0 }
+        Self { scf_data, mpi_operator, result: HashMap::new(), energy: 0.0, rdm1_dump: None }
     }
 
     pub fn calc(&mut self) -> &mut Self {
@@ -357,6 +362,17 @@ impl<'a> UDHGradient<'a> {
             (mo_coeff[0].view() % d_r_s[0].view() % mo_coeff[0].view().t()).into_contig(ColMajor),
             (mo_coeff[1].view() % d_r_s[1].view() % mo_coeff[1].view().t()).into_contig(ColMajor),
         ];
+        // per-spin total relaxed densities (SCF + relaxed correlation) and their fchk sections
+        // (total and spin) for the density dump of force jobs; only materialized when the fchk
+        // output is requested (`SCF::dh_rdm1_resp`)
+        if mol_obj.ctrl.outputs.iter().any(|output| output.eq("fchk")) {
+            let dm_alpha = &d_hf[0] + &d_r_ao[0];
+            let dm_beta = &d_hf[1] + &d_r_ao[1];
+            self.rdm1_dump = Some(vec![
+                to_matrix_full(&dm_alpha + &dm_beta),
+                to_matrix_full(&dm_alpha - &dm_beta),
+            ]);
+        }
         let axd_dr = {
             let resp_ao = resp_objs.get_response_rdm(&[d_r_ao[0].view(), d_r_ao[1].view()], true);
             [
@@ -896,7 +912,8 @@ impl<'a> UDHGradient<'a> {
     }
 }
 
-/// `[3, natm]` device tensor into a `MatrixFull` of the same shape.
+/// Device tensor (e.g. a `[3, natm]` gradient part or a `[nao, nao]` density) into a
+/// `MatrixFull` of the same shape.
 fn to_matrix_full(tsr: Tsr) -> MatrixFull<f64> {
     let shape: [usize; 2] = tsr.shape().to_vec().try_into().unwrap();
     MatrixFull::from_vec(shape, tsr.into_shape(-1).into_raw()).unwrap()

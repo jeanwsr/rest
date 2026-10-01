@@ -77,11 +77,15 @@ pub struct RDHGradient<'a> {
     pub result: HashMap<String, MatrixFull<f64>>,
     /// PT2 correlation energy (side product of the generalized-Fock evaluation).
     pub energy: f64,
+    /// Total relaxed density (SCF density plus the relaxed correlation density) prepared for the
+    /// fchk density dump, in fchk section order: `[Total MP2 Density]`. `Some` only when
+    /// `[ctrl] outputs` requests `fchk`; the same density the multipole task dumps.
+    pub rdm1_dump: Option<Vec<MatrixFull<f64>>>,
 }
 
 impl<'a> RDHGradient<'a> {
     pub fn new(scf_data: &'a SCF, mpi_operator: &'a Option<MPIOperator>) -> Self {
-        Self { scf_data, mpi_operator, result: HashMap::new(), energy: 0.0 }
+        Self { scf_data, mpi_operator, result: HashMap::new(), energy: 0.0, rdm1_dump: None }
     }
 
     pub fn calc(&mut self) -> &mut Self {
@@ -249,6 +253,11 @@ impl<'a> RDHGradient<'a> {
         let cx_scf = mol_obj.xc_data.dfa_hybrid_scf;
         let c1_dr: Tsr<f64> = (mo_coeff.view() % d_r_s.view()).mapv(|x| cx_scf * x).into_contig(ColMajor);
         let d_r_ao = (mo_coeff.view() % d_r_s.view() % mo_coeff.view().t()).into_contig(ColMajor);
+        // total relaxed density (SCF + relaxed correlation) for the fchk density dump of force
+        // jobs; only materialized when the fchk output is requested (`SCF::dh_rdm1_resp`)
+        if mol_obj.ctrl.outputs.iter().any(|output| output.eq("fchk")) {
+            self.rdm1_dump = Some(vec![to_matrix_full(&d_hf + &d_r_ao)]);
+        }
 
         // SCF response upon the *relaxed* correlation density (forge W_III); the cached `axd`
         // of the generalized-Fock evaluation acts on the unrelaxed rdm1 instead.
@@ -741,7 +750,8 @@ fn de_xc_response_term(
     de_resp
 }
 
-/// `[3, natm]` device tensor into a `MatrixFull` of the same shape.
+/// Device tensor (e.g. a `[3, natm]` gradient part or a `[nao, nao]` density) into a
+/// `MatrixFull` of the same shape.
 fn to_matrix_full(tsr: Tsr<f64>) -> MatrixFull<f64> {
     let shape: [usize; 2] = tsr.shape().to_vec().try_into().unwrap();
     MatrixFull::from_vec(shape, tsr.into_shape(-1).into_raw()).unwrap()

@@ -902,6 +902,10 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         // list of (gradient name, gradient data)
         let mut grad_data_list: Vec<(String, Box<dyn GradAPI>)> = vec![];
 
+        // the DH (PT2-family) entry hands the total relaxed density back for the fchk density
+        // dump (`SCF::dh_rdm1_resp`, written out by the `outputs` pass)
+        let mut dh_rdm1_resp: Option<Vec<MatrixFull<f64>>> = None;
+
         // post-SCF (doubly-hybrid) gradients need the DFT grids again whenever the DH entry runs
         // on a grid (final-functional XC part / hybrid difference, or the SCF functional's own XC
         // response); `xdh_calculations` frees them, so regenerate (pure MP2 needs none)
@@ -948,10 +952,12 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
             if !scf_data.mol.ctrl.spin_polarization {
                 let mut grad_data_dh = crate::grad::rdh::RDHGradient::new(&scf_data, mpi_operator);
                 grad_data_dh.calc();
+                dh_rdm1_resp = grad_data_dh.rdm1_dump.take();
                 grad_data_list.push(("DH".into(), Box::new(grad_data_dh)));
             } else {
                 let mut grad_data_dh = crate::grad::udh::UDHGradient::new(&scf_data, mpi_operator);
                 grad_data_dh.calc();
+                dh_rdm1_resp = grad_data_dh.rdm1_dump.take();
                 grad_data_list.push(("DH".into(), Box::new(grad_data_dh)));
             }
         }
@@ -976,6 +982,13 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
                 println!("Gradient contribution from {:} [a.u.]:", grad_name);
                 println!("{}", formated_force(&grad_contrib, &scf_data.mol.geom.elem));
             }
+        }
+
+        // the gradient objects borrow `scf_data`; release them before handing the DH relaxed
+        // density to the fchk output pass — force jobs only
+        drop(grad_data_list);
+        if is_dh && matches!(scf_data.mol.ctrl.job_type, JobType::Force) {
+            scf_data.dh_rdm1_resp = dh_rdm1_resp;
         }
 
         // TDDFT analytic-gradient response for the requested excited state.
