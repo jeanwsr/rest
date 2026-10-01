@@ -181,9 +181,15 @@ impl RIRHFGradient<'_> {
         let xc_data = self.gen_xc_data(scf_data, 0);
         let mut mol = scf_data.mol.clone();
         let grids = &mut Grids::build(&mut mol);
+        let mem_probe_on =
+            utilities::memory_batch::mem_probe_enabled(self.scf_data.mol.ctrl.print_level);
+        utilities::memory_batch::mem_probe("calc_de_xc: before get_vxc_rayon_new", mem_probe_on);
         // let dao_vxc = get_vxc(&self, &xc_data, grids, &scf_data.mol, self.flags.max_memory.unwrap_or(2000.0) as usize);
         // let dao_vxc = get_vxc_rayon(&self, &xc_data, grids, &scf_data.mol);
-        let dao_vxc = get_vxc_rayon_new(&self, &xc_data, grids, &mol, 16usize);
+        // 每线程每块的 XC 工作集预算，由 [ctrl] max_memory 推得，未设置时保持历史上的 16 MiB
+        let xc_block_mb = utilities::memory_batch::xc_grad_block_mb(self.flags.max_memory, 16.0);
+        let dao_vxc = get_vxc_rayon_new(&self, &xc_data, grids, &mol, xc_block_mb as usize);
+        utilities::memory_batch::mem_probe("calc_de_xc: after get_vxc_rayon_new", mem_probe_on);
         // println!("Print dao_vxc: {:?}", dao_vxc);
         
         // contract dao_vxc and dm (tuv, uv -> tu)
@@ -647,7 +653,11 @@ fn get_vxc_rayon(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &mut 
 /// Public so that post-SCF (doubly-hybrid) gradients can evaluate the skeleton derivative of
 /// the *final* functional, whose component list is not the SCF one (`xc_data` is built by the
 /// caller, e.g. from `dfa_compnt_pos` / `dfa_paramr_pos`).
-pub fn get_vxc_rayon_new(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &mut Grids, mol: &Molecule, max_memory: usize) -> Tsr<f64> {
+///
+/// `block_mem_mb` bounds the workspace of **one block of one worker**, so callers pass a
+/// per-thread share of the declared budget (`utilities::memory_batch::xc_grad_block_mb`),
+/// never `[ctrl] max_memory` itself.
+pub fn get_vxc_rayon_new(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &mut Grids, mol: &Molecule, block_mem_mb: usize) -> Tsr<f64> {
     let default_omp_num_threads = omp_get_num_threads_wrapper();
 
     let num_grids = grids.weights.len();
@@ -661,21 +671,37 @@ pub fn get_vxc_rayon_new(gradient_method: &RIRHFGradient, xc_data: &XCData, grid
     };
     let ao_comp = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
     let batch_size = 64;
-    let blksize = (max_memory * 1_000_000 / 8 / ((ao_comp + 1) * num_basis * batch_size))
-        .min(num_grids/batch_size+1).max(4) * batch_size;
+    let blksize = (block_mem_mb * 1_000_000 / 8 / ((ao_comp + 1) * num_basis * batch_size))
+        .min(num_grids / batch_size + 1)
+        .max(4) * batch_size;
+    let blksize = blksize.min(num_grids.max(1));
+    // 自检：一块的工作集是 (ao_comp + 1) 个分量 x nao x blksize 的 f64，应与预算同量级
+    let block_mb = ((ao_comp + 1) * num_basis * blksize * std::mem::size_of::<f64>()) as f64 / 1.0e6;
     if gradient_method.flags.print_level >= 2 {
-        println!("In get_vxc_rayon_new: BLKSIZE={:?}.", blksize);
-    };
-    
-    let block_settings = BlockSettings { ao_deriv, max_memory, blksize };
+        println!(
+            "In get_vxc_rayon_new: BLKSIZE={} grids, block budget={} MiB, per-block workspace={:.1} MiB, blocks={}.",
+            blksize, block_mem_mb, block_mb, (num_grids + blksize - 1) / blksize.max(1)
+        );
+    }
+    if block_mb > 1.5 * block_mem_mb as f64 && gradient_method.flags.print_level >= 1 {
+        println!(
+            "[WARN] XC gradient block workspace {:.1} MiB exceeds the {:.1} MiB budget; the block size formula and the budget disagree.",
+            block_mb, block_mem_mb as f64
+        );
+    }
+
+    let block_settings = BlockSettings { ao_deriv, max_memory: block_mem_mb, blksize };
     let device = &xc_data.device;
     let deriv = 1usize;
 
-    let mut vxc = rt::zeros(([num_basis, num_basis, 3], device));
-    let (sender, receiver) = channel();
-
-    gradient_method.par_block_loop(mol, grids, block_settings)
-        .for_each_with(sender, |s, block| {
+    // Accumulate grid block by grid block, one accumulator per worker, instead of buffering every
+    // block result in an unbounded channel. Each block produces a [nao, nao, 3] matrix, so a
+    // channel holding one entry per block grows like (ngrids / blksize) * nao^2, which reaches tens
+    // of GB for a few hundred basis functions. `reduce` keeps the live set at O(workers) and
+    // produces the identical sum.
+    let mut vxc = gradient_method
+        .par_block_loop(mol, grids, block_settings)
+        .map(|block| {
             omp_set_num_threads_wrapper(1);
 
             let ng = block.weights.len();
@@ -720,10 +746,15 @@ pub fn get_vxc_rayon_new(gradient_method: &RIRHFGradient, xc_data: &XCData, grid
                 }
                 XCType::HF => unreachable!("HF gradient not supported in get_vxc_rayon_new"),
             }
-            s.send(loc_vmat).unwrap();
-        });
-
-    receiver.into_iter().for_each(|m| vxc += m);
+            loc_vmat
+        })
+        .reduce(
+            || rt::zeros(([num_basis, num_basis, 3], device)),
+            |mut acc, part| {
+                acc += part.view();
+                acc
+            },
+        );
 
     omp_set_num_threads_wrapper(default_omp_num_threads);
     vxc *= -1.0;

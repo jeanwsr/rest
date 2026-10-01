@@ -1,5 +1,6 @@
 pub mod cpu_monitor;
-pub mod memory_monitor;
+// 监控模块已移到 utilities，供 force 路径共用
+pub use crate::utilities::memory_monitor;
 pub mod rhf;
 pub mod rks;
 pub mod xc_hessian;

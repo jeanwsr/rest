@@ -577,7 +577,7 @@ impl InputKeywords {
             // False: use coefficients as well with higher efficiency
             use_dm_only: false,
             vxc_screen_threshold: 1.0e-15,
-            ao_cutoff: 0.0,
+            ao_cutoff: 1.0e-9,
             non0tab_blksize: 0,     // 0 = auto-select based on nao
             drop_dense_ao: false,
             algorithm_jk: AlgorithmJK::Default,
@@ -1672,9 +1672,9 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 _ => 1.0e-15,
             };
             tmp_input.ao_cutoff = match tmp_ctrl.get("ao_cutoff").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-12),
-                serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-12),
-                _ => 1.0e-12,
+                serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-9),
+                serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-9),
+                _ => 1.0e-9,
             };
             tmp_input.non0tab_blksize = match tmp_ctrl.get("non0tab_blksize").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(num) => num.as_u64().map(|v| v as usize).unwrap_or(0),

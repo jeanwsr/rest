@@ -62,7 +62,10 @@ use crate::ri_jk::{get_j2c_decomp, J2CDecompose, J2C_THRESH};
 use crate::ri_pt2::rgfock_pt2::RGFockPT2;
 use crate::ri_pt2::{occ_batch_index, occ_batch_step};
 use crate::scf_io::SCF;
-use crate::utilities::memory_batch::{blocksize_partition, calc_batch_size, detect_used_memory_mb, handle_memory_exceed};
+use crate::utilities::memory_batch::{
+    blocksize_partition, calc_batch_size, detect_used_memory_mb, handle_memory_exceed,
+    xc_grad_block_mb,
+};
 use crate::utilities::rstsr_util::{RestTensorToRstsrTsrAPI, RestTensorToRstsrViewAPI, Tsr, TsrView};
 use rest_libcint::prelude::*;
 use rstsr::prelude::*;
@@ -912,5 +915,8 @@ fn xc_skeleton_dao(scf_data: &SCF, mpi_operator: &Option<MPIOperator>, scf: bool
         occ: None,
     };
     let mut grids_clone = grids.clone();
-    get_vxc_rayon_new(&dh_grad_helper(scf_data, mpi_operator), &xc_data_sel, &mut grids_clone, mol_obj, 16)
+    // 块预算同样走 [ctrl] max_memory 的口径（未设置时回到历史上的 16 MiB），
+    // 这样 DH 解析梯度的 XC 分块与 SCF 泛函那条路一致
+    let block_mb = xc_grad_block_mb(scf_data.mol.ctrl.max_memory, 16.0) as usize;
+    get_vxc_rayon_new(&dh_grad_helper(scf_data, mpi_operator), &xc_data_sel, &mut grids_clone, mol_obj, block_mb)
 }

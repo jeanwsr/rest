@@ -303,6 +303,10 @@ impl RIRHFGradient<'_> {
         time_records.new_item("de-jk batch 7", "de-jk 7 batch (get_grad_dao_k_int3c2e_ip1, rsh)");
         time_records.new_item("de-jk batch 8", "de-jk 8 batch (get_grad_daux_k_int3c2e_ip2, rsh)");
 
+        // peak-attribution probe of the analytic gradient (REST_MEM_PROBE=1 or print_level >= 3)
+        let mem_probe_on = mem_probe_enabled(self.scf_data.mol.ctrl.print_level);
+        mem_probe("calc_de_jk: enter", mem_probe_on);
+
         time_records.count_start("de-jk prepr 1");
 
         let mol_obj = &self.scf_data.mol;
@@ -377,8 +381,18 @@ impl RIRHFGradient<'_> {
 
         // available memory in MB, if not set, will be calculated from system
         let mem_avail = self.flags.max_memory.map(|max_memory| max_memory - detect_used_memory_mb("proc"));
-        let aux_batch_size = calc_batch_size::<f64>(8 * nao * nao, mem_avail, None, Some(naux * nocc * nocc));
-        let aux_batch_size = aux_batch_size.min(216);
+        let aux_batch_raw = calc_batch_size::<f64>(8 * nao * nao, mem_avail, None, Some(naux * nocc * nocc));
+        // `calc_batch_size` 在预算耗尽时下限是 1，会让下面的循环退化成「每个辅助壳一批」
+        // （上千次小积分）。这里保底 MIN_AUX_BATCH_FUNCS 个函数并给出告警：预算不足时
+        // 允许内存稍微超一点，而不是让墙钟爆掉。
+        const MIN_AUX_BATCH_FUNCS: usize = 16;
+        let aux_batch_size = aux_batch_raw.clamp(MIN_AUX_BATCH_FUNCS, 216);
+        if aux_batch_raw < MIN_AUX_BATCH_FUNCS && self.flags.print_level >= 1 {
+            println!(
+                "[WARN] the memory budget allows only {} auxiliary basis functions per derivative batch, raised to {} (nao = {}). Raise [ctrl] max_memory or expect a higher peak.",
+                aux_batch_raw, aux_batch_size, nao
+            );
+        }
 
         // ── MPI: restrict the 3c-2e integral batches to this rank's local
         // slice of the auxiliary basis (same deterministic distribution as
@@ -411,6 +425,7 @@ impl RIRHFGradient<'_> {
         let (aux_span0, aux_span1) = (aux_loc[aux_shl0], aux_loc[aux_shl1]);
 
         time_records.count("de-jk prepr 1");
+        mem_probe("de-jk prepr 1 done (rimatr, j2c, int2c2e_ip1)", mem_probe_on);
 
         // basic setup finished
         // begin hybrid computation
@@ -443,7 +458,9 @@ impl RIRHFGradient<'_> {
         }
 
         time_records.count("de-jk prepr 2");
+        mem_probe("de-jk prepr 2 done (itm_j, itm_k_occtp, daux seeds)", mem_probe_on);
 
+        let mut batch_probe_left = 2usize;
         for [shl0, shl1] in local_aux_partition.clone() {
             let shl_slices = [[0, mol.nbas()], [0, mol.nbas()], [shl0, shl1]];
             let (p0, p1) = (aux_loc[shl0], aux_loc[shl1]);
@@ -465,6 +482,13 @@ impl RIRHFGradient<'_> {
                 };
             }
             time_records.count("de-jk batch int");
+            if batch_probe_left > 0 {
+                mem_probe(
+                    &format!("int3c2e_ip1/ip2 built for aux shells {}..{}", shl0, shl1),
+                    mem_probe_on,
+                );
+                batch_probe_left -= 1;
+            }
 
             if self.flags.factor_j.is_some() {
                 time_records.count_start("de-jk batch 1");
@@ -747,6 +771,7 @@ impl RIRHFGradient<'_> {
             flag.then(|| self.result.insert(key.into(), de_part));
         }
 
+        mem_probe("calc_de_jk: done", mem_probe_on);
         return self;
     }
 

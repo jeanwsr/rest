@@ -58,6 +58,7 @@ use crate::ri_pt2::{occ_batch_index, occ_batch_step};
 use crate::scf_io::{SCF, SCFType};
 use crate::utilities::memory_batch::{
     blocksize_partition, calc_batch_size, detect_used_memory_mb, handle_memory_exceed,
+    xc_grad_block_mb,
 };
 use crate::utilities::rstsr_util::{RestTensorToRstsrTsrAPI, RestTensorToRstsrViewAPI, Tsr, TsrView};
 use rest_libcint::prelude::*;
@@ -1001,7 +1002,9 @@ fn xc_skeleton_dao(
         occ: None,
     };
     let mut grids_clone = grids.clone();
-    crate::grad::uks::get_vxc_rayon_new(&uhf_grad_helper(scf_data, mpi_operator), &xc_data_sel, &mut grids_clone, mol_obj, 16)
+    // 与闭壳层一侧一致：块预算由 [ctrl] max_memory 推得
+    let block_mb = xc_grad_block_mb(scf_data.mol.ctrl.max_memory, 16.0) as usize;
+    crate::grad::uks::get_vxc_rayon_new(&uhf_grad_helper(scf_data, mpi_operator), &xc_data_sel, &mut grids_clone, mol_obj, block_mb)
 }
 
 /// Response-density XC term `<D_r_ao^s, F_1[A, t]>` of the DH gradient (forge
