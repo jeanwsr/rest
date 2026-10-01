@@ -394,6 +394,13 @@ pub fn uscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> URe
 
     let (factor_j, factor_k, rsh) = scf_jk_factors(scf_data);
 
+    // the response object reads the SCF rimatr, which the storage-level AO-pair pruning shrinks,
+    // so that path refuses a pruned tensor (the response kernels are not row-space aware yet)
+    crate::ri_jk::require_unpruned_rimatr(
+        &scf_data.rimatr_pair_map,
+        "the response RI-JK object (uresp_interface)",
+    );
+
     // decomposed ERIs of the RI-JK response object, per precision: the fock path always borrows
     // the SCF rimatr (zero copy); the low-precision response path attaches the freshly built one
     // of `resp_auxbas_path` when set (owned), and reuses the SCF rimatr otherwise
@@ -408,7 +415,12 @@ pub fn uscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> URe
 
     // The short-range exchange correction (range-separated hybrids) is a separate response
     // object reusing the full-range implementation; it evaluates on the short-range `rimatr_sr`
-    // ERI, with no Coulomb part (factor_j = 0).
+    // ERI, with no Coulomb part (factor_j = 0). The short-range tensor is compacted onto the same
+    // rows as the full-range one, so the same guard applies.
+    crate::ri_jk::require_unpruned_rimatr(
+        &scf_data.rimatr_pair_map,
+        "the short-range response RI-JK object (uresp_interface)",
+    );
     if let Some((_omega, factor_k_sr)) = rsh {
         let (cderi_sr, cderi_resp_sr) = resp_auxbas::cderi_pair_sr(scf_data, config);
         let resp_obj = match cderi_resp_sr {

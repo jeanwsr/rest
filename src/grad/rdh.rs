@@ -103,6 +103,9 @@ impl<'a> RDHGradient<'a> {
             !matches!(scf_data.mol.ctrl.j2c_decomp.uplo, Lower),
             "RDHGradient does not support lower-triangular Cholesky factors (developer option)."
         );
+        // this driver reads `rimatr` through the full-space pair tables; a storage-level pruned
+        // tensor stores its retained rows only, so refuse it rather than contract wrong rows
+        crate::ri_jk::require_unpruned_rimatr(&scf_data.rimatr_pair_map, "the DH analytic gradient (RDHGradient)");
         let rimatr = scf_data.rimatr.as_ref().expect(
             "Decomposed ERI (rimatr) not found; the DH analytic gradient requires the streaming/new-driver RI-PT2 engine which keeps it alive.",
         );

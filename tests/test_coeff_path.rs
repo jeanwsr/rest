@@ -1,11 +1,32 @@
 use pyrest::molecule_io::Molecule;
 use pyrest::scf_io::scf;
 use std::env;
+use std::path::{Path, PathBuf};
 
-fn run_with_stats(system: &str, ao_cutoff: f64, blksize: usize, use_dm_only: bool) -> (f64, bool, String) {
-    let dir = format!("/home/igor/Documents/Package-Pool/rest_workspace/rest_regression/bench_pool/{}", system);
+/// Locate a regression case in the sibling `rest_regression` repository.
+///
+/// The path is resolved from the crate root (`CARGO_MANIFEST_DIR`), so the test never depends on a
+/// machine-specific location, and the case is searched one level down because the cases live in
+/// `bench_pool/<category>/<name>`. `None` means "case not present in this checkout" and the caller
+/// skips it, which also covers a standalone `rest` checkout without the sibling repository.
+fn case_dir(system: &str) -> Option<PathBuf> {
+    let pool = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rest_regression/bench_pool");
+    let direct = pool.join(system);
+    if direct.is_dir() {
+        return Some(direct);
+    }
+    for entry in std::fs::read_dir(&pool).ok()?.flatten() {
+        let candidate = entry.path().join(system);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn run_with_stats(dir: &Path, ao_cutoff: f64, blksize: usize, use_dm_only: bool) -> (f64, bool, String) {
     let saved = env::current_dir().unwrap();
-    env::set_current_dir(&dir).unwrap();
+    env::set_current_dir(dir).unwrap();
 
     let mut mol = Molecule::build("ctrl.in".to_string(), None).unwrap();
     mol.ctrl.ao_cutoff = ao_cutoff;
@@ -52,16 +73,20 @@ fn test_all_paths_with_sparsity() {
         ("NH3_SVWN",          1e-10, 128, false),   // 91.2% → skipped
         ("NH3_SVWN",          1e-12, 128, false),   // still >90% for this compact molecule
     ] {
+        let Some(dir) = case_dir(sys) else {
+            println!("skip {}: not found under rest_regression/bench_pool/<category>/", sys);
+            continue;
+        };
         println!("\n══════ {}  cutoff={:.0e}  blksize={} ══════", sys, cutoff, blk);
 
-        let (e_d, _act_d, s_d) = run_with_stats(sys, 0.0, 0, true);
+        let (e_d, _act_d, s_d) = run_with_stats(&dir, 0.0, 0, true);
         println!("  dense(dm_only) {:14.8}  | {}", e_d, s_d);
 
-        let (e_s_dm, act_s_dm, s_s_dm) = run_with_stats(sys, cutoff, blk, true);
+        let (e_s_dm, act_s_dm, s_s_dm) = run_with_stats(&dir, cutoff, blk, true);
         println!("  sparse(dm)    {:14.8}  Δ={:.2e}  | {}", e_s_dm, (e_s_dm-e_d).abs(), s_s_dm);
         assert_eq!(act_s_dm, expect_sparse, "sparse(dm) active mismatch: expected {} got {}", expect_sparse, act_s_dm);
 
-        let (e_s_co, act_s_co, s_s_co) = run_with_stats(sys, cutoff, blk, false);
+        let (e_s_co, act_s_co, s_s_co) = run_with_stats(&dir, cutoff, blk, false);
         println!("  sparse(coeff) {:14.8}  Δ={:.2e}  | {}", e_s_co, (e_s_co-e_d).abs(), s_s_co);
         assert_eq!(act_s_co, expect_sparse, "sparse(coeff) active mismatch");
 

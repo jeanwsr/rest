@@ -2990,14 +2990,34 @@ impl SCF {
         vj_upper_with_ri_v(&self.ri3fn, dm, spin_channel, scaling_factor)
     }
 
+    /// Screening threshold of the SCF J/K kernels.
+    ///
+    /// A gradient job reports the converged energy and its derivative together. The storage-level
+    /// row mask is part of the energy that the analytic gradient differentiates, while the
+    /// iteration-level screening of the kernels (a density- and orbital-weighted subset of the
+    /// stored rows) is not: its decisions move with the geometry, and a finite difference of the
+    /// reported energy then does not reproduce the reported gradient. A gradient job therefore
+    /// converges its SCF on the stored rows alone, and the energy it prints is the energy whose
+    /// derivative the gradient code computes.
+    fn kernel_pair_screen_threshold(&self) -> f64 {
+        if matches!(&self.mol.ctrl.job_type, crate::ctrl_io::JobType::Force | crate::ctrl_io::JobType::GeomOpt) {
+            0.0
+        } else {
+            self.mol.ctrl.ri_jk.pair_screen_threshold
+        }
+    }
+
     pub fn generate_vj_with_ri_v_sync(&mut self, scaling_factor: f64, mpi_operator: &Option<MPIOperator>) -> Vec<MatrixUpper<f64>> {
 
         let spin_channel = self.mol.spin_channel;
         let dm = &self.density_matrix;
-        let pair_screen_threshold = self.mol.ctrl.ri_jk.pair_screen_threshold;
+        let pair_screen_threshold = self.kernel_pair_screen_threshold();
 
         if self.mol.ctrl.use_ri_symm {
-            if pair_screen_threshold > 0.0 && self.rimatr_pair_map.is_some() {
+            // A compacted tensor is always read through its map, whatever the kernel threshold
+            // is: a gradient job sets that threshold to zero, which keeps every stored row but
+            // still has to address the stored rows through the map.
+            if self.rimatr_pair_map.is_some() {
                 vj_upper_with_rimatr_screened_mpi(
                     &self.rimatr, &self.rimatr_pair_map, dm,
                     spin_channel, scaling_factor, pair_screen_threshold, mpi_operator)
@@ -3028,7 +3048,7 @@ impl SCF {
         //let num_auxbas = self.mol.num_auxbas;
         //let npair = num_basis*(num_basis+1)/2;
         let spin_channel = self.mol.spin_channel;
-        let pair_screen_threshold = self.mol.ctrl.ri_jk.pair_screen_threshold;
+        let pair_screen_threshold = self.kernel_pair_screen_threshold();
 
         if self.mol.ctrl.use_ri_symm {
             if use_dm_only {
@@ -3046,7 +3066,7 @@ impl SCF {
                 let occupation = &self.occupation;
                 let num_elec = &self.mol.num_elec;
                 //vk_upper_with_rimatr_sync(&mut self.rimatr, eigv, num_elec, occupation, spin_channel, scaling_factor)
-                if pair_screen_threshold > 0.0 && self.rimatr_pair_map.is_some() {
+                if self.rimatr_pair_map.is_some() {
                     vk_upper_with_rimatr_screened_mpi(
                         &self.rimatr, &self.rimatr_pair_map, eigv, num_elec, occupation,
                         spin_channel, scaling_factor, pair_screen_threshold, mpi_operator)
@@ -3473,7 +3493,8 @@ impl SCF {
                     ao2mo_rayon(
                         eigenvector, ri3ao, 
                         row_range.clone(), 
-                        col_range.clone()
+                        col_range.clone(),
+                        self.rimatr_pair_map.as_ref(),
                     ).unwrap()
                 )
             }
@@ -3581,10 +3602,14 @@ impl SCF {
                 _ => &self.eigenvectors[i_spin],
             };
             ri3mo.push(
+                // `rimatr` and `rimatr_sr` share the row map of the storage-level pruning, so the
+                // same map addresses both. Without pruning the map is `None` and the kernel walks
+                // the full packed pair space.
                 ao2mo_rayon(
                     eigenvector, ri3ao,
                     row_range.clone(),
-                    col_range.clone()
+                    col_range.clone(),
+                    self.rimatr_pair_map.as_ref(),
                 ).unwrap()
             )
         }
@@ -3604,10 +3629,13 @@ impl SCF {
                     _ => &self.eigenvectors[i_spin],
                 };
 
+                // The BSE tensor is not part of the storage-level pruning (S2 keeps it full), so
+                // this path always walks the packed pair space.
                 let tmp_ri3mo = ao2mo_rayon(
                     eigenvector, ri3ao,
                     row_range.clone(),
-                    col_range.clone()
+                    col_range.clone(),
+                    None,
                 ).unwrap();
                 ri3mo.push(tmp_ri3mo);
             }
@@ -3632,7 +3660,8 @@ impl SCF {
                 ao2mo_rayon(
                     eigenvector, ri3ao, 
                     row_range.clone(), 
-                    col_range.clone()
+                    col_range.clone(),
+                    self.rimatr_pair_map.as_ref(),
                 ).unwrap()
             )
         }
@@ -3833,12 +3862,15 @@ impl SCF {
 /// A new matrix that represents the result of \( a^T \cdot b \cdot c \).
 ///
 /// # Example
-/// ```
+///
+/// ```text
 /// let a = MatrixFull::new([size, size], ...);
 /// let b = MatrixFull::new([size, size], ...);
 /// let c = MatrixFull::new([size, size], ...);
-/// let result = apply_projection_operator(&a, &b, &c, size);
+/// let result = apply_projection_operator(&a, &b, &c);
 /// ```
+///
+/// (Illustrative; build the matrices with concrete values before running.)
 pub fn apply_projection_operator(a: &MatrixFull<f64>, b: &MatrixFull<f64>, c: &MatrixFull<f64>) -> MatrixFull<f64> {
     // Temporary matrix to store intermediate result of a^T * b
     let mut temp: MatrixFull<f64> = MatrixFull::new([a.size[1], b.size[1]], 0.0);
@@ -5163,7 +5195,7 @@ pub fn scf(mol:Molecule, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<S
 /// The per-orbital and per-block callers of RI-GW request (1, nmo) and
 /// (block, nmo) shapes, where the column block is the whole MO space. Those go
 /// through `m2` and no longer pay `n^2 * nmo` per auxiliary function.
-fn ao2mo_rayon<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops::Range<usize>, column_dim: std::ops::Range<usize>)
+fn ao2mo_rayon<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops::Range<usize>, column_dim: std::ops::Range<usize>, map: Option<&ri_jk::PairMap>)
 -> anyhow::Result<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)>
     where T: BasicMatrix<'a, f64>+std::marker::Sync,
           P: BasicMatrix<'a, f64>
@@ -5176,16 +5208,16 @@ fn ao2mo_rayon<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops::Ra
         && eigenvector.is_contiguous()
         && eigenvector.indicing() == [1, nao];
     if !slicable {
-        return ao2mo_rayon_v02(eigenvector, rimat_chunk, row_dim, column_dim);
+        return ao2mo_rayon_v02(eigenvector, rimat_chunk, row_dim, column_dim, map);
     }
     if row_dim.len() < column_dim.len() {
-        ao2mo_rayon_m2(eigenvector, rimat_chunk, row_dim, column_dim)
+        ao2mo_rayon_m2(eigenvector, rimat_chunk, row_dim, column_dim, map)
     } else {
-        ao2mo_rayon_m1(eigenvector, rimat_chunk, row_dim, column_dim)
+        ao2mo_rayon_m1(eigenvector, rimat_chunk, row_dim, column_dim, map)
     }
 }
 
-fn ao2mo_rayon_v01<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops::Range<usize>, column_dim: std::ops::Range<usize>)
+fn ao2mo_rayon_v01<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops::Range<usize>, column_dim: std::ops::Range<usize>, map: Option<&ri_jk::PairMap>)
 -> anyhow::Result<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)>
     where T: BasicMatrix<'a, f64>+std::marker::Sync,
           P: BasicMatrix<'a, f64>
@@ -5211,7 +5243,9 @@ fn ao2mo_rayon_v01<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
 
         let mut loc_ri3mo = MatrixFull::new([row_dim.len(), column_dim.len()],0.0_f64);
         let mut reduced_ri = MatrixFull::new([num_basis, num_basis], 0.0_f64);
-        reduced_ri.iter_matrixupper_mut().unwrap().zip(m.iter()).for_each(|(to, from)| {*to = *from});
+        // Unpruned tensors have one row per packed pair, a storage-level pruned tensor only the
+        // retained rows (their (mu, nu) come from the map).
+        ri_jk::fill_ao_matrix_from_column(m, map, &mut reduced_ri);
 
         let mut tmp_mat = MatrixFull::new([num_basis,num_state], 0.0_f64);
         _dsymm(&reduced_ri, eigenvector, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
@@ -5233,7 +5267,7 @@ fn ao2mo_rayon_v01<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
     Ok((rimo, row_dim, column_dim))
 }
 
-fn ao2mo_rayon_v02<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops::Range<usize>, column_dim: std::ops::Range<usize>)
+fn ao2mo_rayon_v02<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops::Range<usize>, column_dim: std::ops::Range<usize>, map: Option<&ri_jk::PairMap>)
 -> anyhow::Result<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)>
     where T: BasicMatrix<'a, f64>+std::marker::Sync,
           P: BasicMatrix<'a, f64>
@@ -5259,7 +5293,9 @@ fn ao2mo_rayon_v02<'a, T, P>(eigenvector: &T, rimat_chunk: &P, row_dim: std::ops
 
         let mut loc_ri3mo = MatrixFull::new([row_dim.len(), column_dim.len()],0.0_f64);
         let mut reduced_ri = MatrixFull::new([num_basis, num_basis], 0.0_f64);
-        reduced_ri.iter_matrixupper_mut().unwrap().zip(m.iter()).for_each(|(to, from)| {*to = *from});
+        // Unpruned tensors have one row per packed pair, a storage-level pruned tensor only the
+        // retained rows (their (mu, nu) come from the map).
+        ri_jk::fill_ao_matrix_from_column(m, map, &mut reduced_ri);
 
         let mut tmp_mat = MatrixFull::new([num_basis,num_state], 0.0_f64);
         _dsymm(&reduced_ri, eigenvector, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
@@ -5298,6 +5334,7 @@ pub(crate) fn ao2mo_rayon_m1<'a, T, P>(
     rimatr_chunk: &P,
     row_dim: std::ops::Range<usize>,
     column_dim: std::ops::Range<usize>,
+    map: Option<&ri_jk::PairMap>,
 ) -> anyhow::Result<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)>
 where T: BasicMatrix<'a, f64> + std::marker::Sync,
       P: BasicMatrix<'a, f64>
@@ -5332,7 +5369,9 @@ where T: BasicMatrix<'a, f64> + std::marker::Sync,
         omp_set_num_threads_wrapper(1);
 
         let mut reduced_ri = MatrixFull::new([num_basis, num_basis], 0.0_f64);
-        reduced_ri.iter_matrixupper_mut().unwrap().zip(m.iter()).for_each(|(to, from)| {*to = *from});
+        // Unpruned tensors have one row per packed pair, a storage-level pruned tensor only the
+        // retained rows (their (mu, nu) come from the map).
+        ri_jk::fill_ao_matrix_from_column(m, map, &mut reduced_ri);
 
         // M1: dsymm with sliced eigenvector [nao, |column_dim|] (NOT full [nao, nmo])
         let mut tmp_mat = MatrixFull::new([num_basis, num_loc_col], 0.0_f64);
@@ -5378,6 +5417,7 @@ pub(crate) fn ao2mo_rayon_m2<'a, T, P>(
     rimatr_chunk: &P,
     row_dim: std::ops::Range<usize>,
     column_dim: std::ops::Range<usize>,
+    map: Option<&ri_jk::PairMap>,
 ) -> anyhow::Result<(RIFull<f64>, std::ops::Range<usize>, std::ops::Range<usize>)>
 where T: BasicMatrix<'a, f64> + std::marker::Sync,
       P: BasicMatrix<'a, f64>
@@ -5410,7 +5450,9 @@ where T: BasicMatrix<'a, f64> + std::marker::Sync,
         omp_set_num_threads_wrapper(1);
 
         let mut reduced_ri = MatrixFull::new([num_basis, num_basis], 0.0_f64);
-        reduced_ri.iter_matrixupper_mut().unwrap().zip(m.iter()).for_each(|(to, from)| {*to = *from});
+        // Unpruned tensors have one row per packed pair, a storage-level pruned tensor only the
+        // retained rows (their (mu, nu) come from the map).
+        ri_jk::fill_ao_matrix_from_column(m, map, &mut reduced_ri);
 
         // M2: dsymm with the sliced bra block, [nao, |row|]
         let mut tmp_mat = MatrixFull::new([num_basis, num_loc_row], 0.0_f64);

@@ -274,6 +274,72 @@ impl PairMap {
             .map(|row| basbas2baspar[[row[0] as usize, row[1] as usize]])
             .collect()
     }
+
+    /// Full packed pair indices of the stored rows, ascending.
+    ///
+    /// Same list as [`PairMap::kept_of`], read back from `full2row` instead of the pair table of a
+    /// molecule. A consumer that has to project a packed AO-pair quantity onto the stored rows (the
+    /// packed density of the derivative code, for instance) needs the packed index of every stored
+    /// row, and this avoids rebuilding the `[nao, nao]` pair table of the molecule for that.
+    pub fn kept_indices(&self) -> Vec<usize> {
+        (0..self.full2row.len())
+            .filter(|&p| self.full2row[p] != Self::NOT_STORED)
+            .collect()
+    }
+}
+
+/// Fail closed for a consumer that still indexes rimatr with the full-space pair tables.
+///
+/// A storage-level pruned tensor ([ctrl.ri_jk] pair_screen_threshold > 0) stores the retained
+/// rows only, so a reader that walks the packed pair space with basbas2baspar reads *the wrong
+/// rows* instead of failing, and returns a plausible number built from another pair. Every
+/// consumer that has not been wired to [PairMap] yet calls this first and stops with the name of
+/// the path that has to be wired.
+pub fn require_unpruned_rimatr(map: &Option<PairMap>, consumer: &str) {
+    if map.is_some() {
+        panic!(
+            "{} still reads the in-core RI tensor through the full-space pair tables, which is not \
+             valid for a storage-level pruned tensor ([ctrl.ri_jk] pair_screen_threshold > 0). \
+             Set pair_screen_threshold = 0.0 to run this path.",
+            consumer
+        );
+    }
+}
+
+/// Fill the symmetric AO matrix of one auxiliary column from a stored tensor column.
+///
+/// The unpruned `rimatr` stores its rows in packed upper-triangular order, so a column can be
+/// zipped straight onto the packed upper triangle. A storage-level pruned tensor stores only the
+/// retained rows, and their `(mu, nu)` come from [`PairMap`]. The dropped rows stay at zero, which
+/// is exactly the truncation the storage level applied, so every AO-to-MO consumer that reads the
+/// column through this helper sees the same tensor the SCF kernels contract.
+///
+/// Callers allocate the output zeroed, so entries the map leaves out need no explicit clearing.
+pub fn fill_ao_matrix_from_column(column: &[f64], map: Option<&PairMap>, out: &mut MatrixFull<f64>) {
+    match map {
+        None => {
+            out.iter_matrixupper_mut()
+                .unwrap()
+                .zip(column.iter())
+                .for_each(|(to, from)| *to = *from);
+        }
+        Some(map) => {
+            debug_assert_eq!(
+                column.len(),
+                map.len(),
+                "a compacted column carries one value per stored row"
+            );
+            for (row, value) in column.iter().enumerate() {
+                let [mu, nu] = map.rows[row];
+                let (i, j) = if mu <= nu {
+                    (mu as usize, nu as usize)
+                } else {
+                    (nu as usize, mu as usize)
+                };
+                out[[i, j]] = *value;
+            }
+        }
+    }
 }
 
 /// Result of the build-time (storage level) AO-pair pruning of `rimatr`.

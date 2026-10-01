@@ -220,6 +220,8 @@ where
     /// - `resp` : response objects of the SCF-iteration functional.
     pub fn make_axd_vo<'r>(&mut self, resp: &mut (dyn RRespAPI + 'r)) -> Tsr {
         if !self.result.contains_key("axd_vo") {
+            // `make_axd` performs the contraction on the SCF-grade resource (`prec = true`), as
+            // this generalized-Fock side term is energy-derivative, not CP-SCF
             let axd = self.make_axd(resp);
             let nocc = self.nocc();
             let nmo = self.nmo();
