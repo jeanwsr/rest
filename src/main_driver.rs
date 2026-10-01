@@ -841,6 +841,23 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         println!("Force calculation invoked");
     }
 
+    // 力阶段的内存监控：后台线程每 20 ms 采样 RSS 并跟踪峰值；只有用户要求时
+    // （`abort_on_mem_exceed`，缺省 true）才按 `[ctrl] max_memory` 中止。SCF 阶段不在覆盖范围内。
+    let mem_monitor = crate::utilities::memory_monitor::MemMonitor::start_from_ctrl(
+        scf_data.mol.ctrl.max_memory,
+        scf_data.mol.ctrl.abort_on_mem_exceed,
+        std::time::Duration::from_millis(20),
+    );
+    if scf_data.mol.ctrl.print_level > 1 {
+        println!(
+            "  Memory monitor (force phase): limit = {}",
+            mem_monitor
+                .limit_mb()
+                .map(|m| format!("{:.1} MiB ({:.3} GiB, abort on exceed)", m, m / 1024.0))
+                .unwrap_or_else(|| "NONE (peak tracking only)".to_string())
+        );
+    }
+
     let (energy, gradient) = if scf_data.mol.ctrl.numerical_force {
         if scf_data.mol.ctrl.print_level > 1 {
             println!("Gradient evaluation using numerical differentiation");
@@ -997,6 +1014,17 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
 
         (scf_data.scf_energy, gradient)
     };
+
+    // 力阶段峰值（监控线程 20 ms 一次采样），随后关掉监控线程
+    let force_peak_mb = mem_monitor.stage_peak_mb();
+    if scf_data.mol.ctrl.print_level > 0 {
+        println!(
+            "  [mem] force phase peak RSS = {:.1} MiB ({:.3} GiB)",
+            force_peak_mb,
+            force_peak_mb / 1024.0
+        );
+    }
+    mem_monitor.stop();
 
     time_mark.count("force");
     time_mark.report("force");

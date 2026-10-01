@@ -1,10 +1,12 @@
-//! Lightweight process-memory monitoring utilities for the analytical Hessian.
+//! Lightweight process-memory monitoring utilities.
 //!
-//! Provides:
+//! Shared by the analytical Hessian and by the analytic gradient (force and geometry
+//! optimization) phase of `main_driver`. Provides:
 //!   * [`current_rss_mb`] — read current resident set size (RSS) of this process.
 //!   * [`print_system_size`] — dump all system-size parameters relevant to memory analysis.
 //!   * [`MemMonitor`] — a background thread that polls RSS, tracks the peak, and
-//!     aborts the process if RSS exceeds a user-configured GiB limit.
+//!     aborts the process if RSS exceeds a user-configured MiB limit (the unit of
+//!     `[ctrl] max_memory`).
 //!
 //! Only Linux is supported (reads `/proc/self/status`). On other platforms the
 //! RSS reader returns 0.0 and the monitor degrades to a no-op peak tracker.
@@ -63,31 +65,32 @@ pub fn current_rss_mb() -> f64 {
 ///
 /// The thread polls the process RSS every `poll_interval` and:
 ///   * updates an atomic peak (in MiB × 1024, i.e. KiB, to keep integer math),
-///   * aborts the process via `std::process::abort()` if RSS exceeds `limit_gb`.
+///   * aborts the process via `std::process::abort()` if RSS exceeds `limit_mb`.
 ///
 /// Call [`MemMonitor::stage_peak_mb`] to read (and reset) the peak for the
-/// current stage, and [`MemMonitor::stop`] when the Hessian is done.
+/// current stage, and [`MemMonitor::stop`] when the phase is done.
 pub struct MemMonitor {
     /// Atomic peak RSS in KiB since last reset.
     peak_kib: Arc<AtomicU64>,
     /// Atomic running flag — set false by `stop()` to terminate the thread.
     running: Arc<AtomicBool>,
-    /// Limit in GiB; `None` disables the abort check.
-    limit_gb: Option<f64>,
+    /// Abort limit in MiB; `None` disables the abort check.
+    limit_mb: Option<f64>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl MemMonitor {
     /// Spawn a monitor thread.
     ///
-    /// `poll_interval` controls how often RSS is sampled. `limit_gb` of `None`
-    /// means "track peak only, never abort".
-    pub fn start(limit_gb: Option<f64>, poll_interval: Duration) -> Self {
+    /// `poll_interval` controls how often RSS is sampled. `limit_mb` is the abort
+    /// limit in MiB, the unit of `[ctrl] max_memory`; `None` means "track peak
+    /// only, never abort".
+    pub fn start(limit_mb: Option<f64>, poll_interval: Duration) -> Self {
         let peak_kib = Arc::new(AtomicU64::new(0));
         let running = Arc::new(AtomicBool::new(true));
         let peak_clone = Arc::clone(&peak_kib);
         let running_clone = Arc::clone(&running);
-        let limit_mib = limit_gb.map(|g| g * 1024.0);
+        let limit_mib = limit_mb;
 
         let handle = thread::Builder::new()
             .name("rest_mem_monitor".to_string())
@@ -113,9 +116,10 @@ impl MemMonitor {
                     if let Some(lim_mib) = limit_mib {
                         if rss > lim_mib {
                             eprintln!(
-                                "\n[FATAL] REST process RSS ({:.3} MiB = {:.3} GiB) exceeded \
-                                 max_memory_gb limit ({:.3} GiB). Aborting.",
-                                rss, rss / 1024.0, lim_mib / 1024.0
+                                "\n[FATAL] REST process RSS ({:.3} MiB = {:.3} GiB) exceeded the \
+                                 [ctrl] max_memory limit ({:.3} MiB = {:.3} GiB). Aborting. \
+                                 Set max_memory higher, or abort_on_mem_exceed = false to keep running.",
+                                rss, rss / 1024.0, lim_mib, lim_mib / 1024.0
                             );
                             std::process::abort();
                         }
@@ -128,18 +132,30 @@ impl MemMonitor {
         MemMonitor {
             peak_kib,
             running,
-            limit_gb,
+            limit_mb,
             handle,
         }
     }
 
-    /// Start a monitor with no GB limit (peak tracking only), 20 ms poll.
+    /// Start a monitor with no limit (peak tracking only), 20 ms poll.
     pub fn no_limit() -> Self {
         Self::start(None, Duration::from_millis(20))
     }
 
-    /// Return the current limit in GiB, if any.
-    pub fn limit_gb(&self) -> Option<f64> { self.limit_gb }
+    /// Start a monitor from the ctrl keywords: the abort limit is
+    /// `[ctrl] max_memory` (MiB) and it is armed only when
+    /// `[ctrl] abort_on_mem_exceed` is true. Tracking always happens.
+    pub fn start_from_ctrl(
+        max_memory_mb: Option<f64>,
+        abort_on_mem_exceed: bool,
+        poll_interval: Duration,
+    ) -> Self {
+        let limit = if abort_on_mem_exceed { max_memory_mb } else { None };
+        Self::start(limit, poll_interval)
+    }
+
+    /// Return the current abort limit in MiB, if any.
+    pub fn limit_mb(&self) -> Option<f64> { self.limit_mb }
 
     /// Read and reset the peak RSS (in MiB) accumulated since the last call.
     pub fn stage_peak_mb(&self) -> f64 {

@@ -1,4 +1,5 @@
 pub mod memory_batch;
+pub mod memory_monitor;
 pub mod rstsr_util;
 pub mod buffer_pool;
 pub mod log;
