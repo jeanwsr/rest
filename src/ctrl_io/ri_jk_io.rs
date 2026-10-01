@@ -57,8 +57,8 @@ pub enum AlgorithmJ {
 /// `pair_screen_threshold` controls the AO-pair screening of the **in-core** RI-J and RI-K
 /// kernels (`ri-incore`), i.e. of the algorithms that contract the stored `rimatr` tensor. It is
 /// independent of the algorithm flags: any `ri`/`ri-incore` calculation that stores `rimatr`
-/// uses it, and a value of `0.0` (default) disables the screening and reproduces the unscreened
-/// kernels exactly.
+/// uses it, and a value of `0.0` (default) disables the screening and reproduces the
+/// unscreened kernels exactly.
 #[serde_inline_default]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RIJKOption {
@@ -81,6 +81,9 @@ pub struct RIJKOption {
     /// quantity the kernel actually contracts.
     ///
     /// `0.0` (default) keeps every pair and reproduces the unscreened kernels numerically.
+    /// For hybrid functionals a value such as `1e-12` prunes most of the negligible rows at an
+    /// energy change of a few 1e-8 Ha and is the recommended setting for energies and geometry
+    /// optimizations of large systems.
     #[serde_inline_default(0.0)]
     pub pair_screen_threshold: f64,
 }
