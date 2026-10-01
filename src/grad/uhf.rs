@@ -305,13 +305,23 @@ impl RIUHFGradient<'_> {
 
         // available memory in MB, if not set, will be calculated from system
         let mem_avail = self.flags.max_memory.map(|max_memory| max_memory - detect_used_memory_mb("proc"));
-        let aux_batch_size = calc_batch_size::<f64>(
+        let aux_batch_raw = calc_batch_size::<f64>(
             8 * nao * nao,
             mem_avail,
             None,
             Some(naux * (nocc[0] * nocc[0] + nocc[1] * nocc[1])),
         );
-        let aux_batch_size = aux_batch_size.min(216);
+        // `calc_batch_size` 在预算耗尽时下限是 1，会让下面的循环退化成「每个辅助壳一批」
+        // （上千次小积分）。这里保底 MIN_AUX_BATCH_FUNCS 个函数并给出告警：预算不足时
+        // 允许内存稍微超一点，而不是让墙钟爆掉。
+        const MIN_AUX_BATCH_FUNCS: usize = 16;
+        let aux_batch_size = aux_batch_raw.clamp(MIN_AUX_BATCH_FUNCS, 216);
+        if aux_batch_raw < MIN_AUX_BATCH_FUNCS && self.flags.print_level >= 1 {
+            println!(
+                "[WARN] the memory budget allows only {} auxiliary basis functions per derivative batch, raised to {} (nao = {}). Raise [ctrl] max_memory or expect a higher peak.",
+                aux_batch_raw, aux_batch_size, nao
+            );
+        }
 
         // ── MPI: restrict the 3c-2e integral batches to this rank's local
         // slice of the auxiliary basis (same deterministic distribution as
