@@ -5,7 +5,9 @@
 //! CPKS tolerance 1e-8. The JSON reference was dumped per atom in Hartree/bohr (row-major
 //! `[natom, 3]`); REST stores the gradient as `[3, natm]`.
 //! The correlation part below is the `"DH"` entry of `eval_force` (the `"SCF"` entry covers
-//! the HF part). The rimatr must be CD-decomposed (see `src/grad/rdh.rs`).
+//! the HF part). Both `[ctrl.j2c_decomp]` policies (`cd`, `eig`) are exercised; the eig
+//! gradients agree with the cd ones to roundoff (~1e-13; the auxiliary basis is
+//! well-conditioned), so the same references are asserted with the same tolerances.
 
 use pyrest::grad::rdh::RDHGradient;
 use pyrest::grad::traits::GradAPI;
@@ -28,7 +30,7 @@ static INPUT_NH3: &str = r##"
     spin_polarization =    false
 
 [ctrl.j2c_decomp]
-policy = "cd"
+policy = "POLICY"
 
 [ctrl.ri_pt2]
 new_driver = true
@@ -57,7 +59,7 @@ static INPUT_XYG3: &str = r##"
     spin_polarization =    false
 
 [ctrl.j2c_decomp]
-policy = "cd"
+policy = "POLICY"
 
 [ctrl.ri_pt2]
 new_driver = true
@@ -73,9 +75,8 @@ new_driver = true
     """
 "##;
 
-#[test]
-fn test_nh3_rmp2_grad() {
-    let keys = toml::from_str::<serde_json::Value>(&INPUT_NH3[..]).unwrap();
+fn test_nh3_rmp2_grad_with(policy: &str, tol: f64) {
+    let keys = toml::from_str::<serde_json::Value>(&INPUT_NH3.replace("POLICY", policy)).unwrap();
     let (ctrl, geom) = ctrl_io::parse_ctl_from_json(&keys).unwrap();
     let mol = Molecule::build_native(ctrl, geom, None).unwrap();
     let mut scf_data = scf_io::SCF::build(mol, &None);
@@ -83,7 +84,7 @@ fn test_nh3_rmp2_grad() {
 
     // total energy (RI-MP2); also puts the SCF into the post-SCF state the gradient expects
     let eng = ri_pt2::xdh_calculations(&mut scf_data, &None).unwrap();
-    println!("RI-MP2 total energy: {eng}");
+    println!("RI-MP2 total energy ({policy}): {eng}");
     assert!((eng - (-56.32508171804932)).abs() < 2e-6, "RI-MP2 total energy mismatch");
 
     let mut grad = RDHGradient::new(&scf_data, &None);
@@ -100,7 +101,7 @@ fn test_nh3_rmp2_grad() {
          0.0042295109, -0.0090684480,  0.0019845245,
     ];
     let de_ref = rt::asarray((de_ref, [3, 4]));
-    println!("DH correlation gradient (REST): {:16.9}", de.t());
+    println!("DH correlation gradient ({policy}) (REST): {:16.9}", de.t());
     println!("DH correlation gradient (ref) : {:16.9}", de_ref.t());
     println!("Maximum Error {:?}", (&de_ref - &de).abs().max_all());
 
@@ -109,10 +110,20 @@ fn test_nh3_rmp2_grad() {
         let part = grad.result.get(key).unwrap().clone();
         println!("part {key}: {:16.9}", rt::asarray((part.data, part.size)).t());
     }
-    assert!((&de_ref - &de).abs().max_all() < 1.0e-5);
+    assert!((&de_ref - &de).abs().max_all() < tol);
 
     // PT2 correlation energy is carried along as the entry energy
     assert!((grad.get_energy() - (-0.19179525779814563)).abs() < 2e-6, "PT2 correlation energy mismatch");
+}
+
+#[test]
+fn test_nh3_rmp2_grad() {
+    test_nh3_rmp2_grad_with("cd", 1.0e-5);
+}
+
+#[test]
+fn test_nh3_rmp2_grad_eig() {
+    test_nh3_rmp2_grad_with("eig", 1.0e-5);
 }
 
 /// Doubly-hybrid (`xc = "xyg3"`) analytic gradient of distorted NH3 (restricted).
@@ -123,16 +134,15 @@ fn test_nh3_rmp2_grad() {
 /// tolerance 1e-8. The asserted total is the `"SCF"` (DF-B3LYP) entry plus the `"DH"` entry;
 /// the residual against pyscf is at the same quadrature/RI noise level as pyscf's own
 /// finite-difference check (6.8e-7).
-#[test]
-fn test_nh3_rxyg3_grad() {
-    let keys = toml::from_str::<serde_json::Value>(&INPUT_XYG3[..]).unwrap();
+fn test_nh3_rxyg3_grad_with(policy: &str, tol: f64) {
+    let keys = toml::from_str::<serde_json::Value>(&INPUT_XYG3.replace("POLICY", policy)).unwrap();
     let (ctrl, geom) = ctrl_io::parse_ctl_from_json(&keys).unwrap();
     let mol = Molecule::build_native(ctrl, geom, None).unwrap();
     let mut scf_data = scf_io::SCF::build(mol, &None);
     scf_without_build(&mut scf_data, &None);
 
     let eng = ri_pt2::xdh_calculations(&mut scf_data, &None).unwrap();
-    println!("XYG3 total energy: {eng}");
+    println!("XYG3 total energy ({policy}): {eng}");
     assert!((eng - (-56.445621659465374)).abs() < 2e-6, "XYG3 total energy mismatch");
 
     // regenerate the common SCF grids (xdh_calculations frees them for memory)
@@ -157,7 +167,7 @@ fn test_nh3_rxyg3_grad() {
         -0.0141324624,  0.0093628946, -0.0062191910,
     ];
     let de_ref = rt::asarray((de_ref, [3, 4]));
-    println!("XYG3 total gradient (REST): {:16.9}", de.t());
+    println!("XYG3 total gradient ({policy}) (REST): {:16.9}", de.t());
     println!("XYG3 total gradient (ref) : {:16.9}", de_ref.t());
     println!("Maximum Error {:?}", (&de_ref - &de).abs().max_all());
 
@@ -166,5 +176,15 @@ fn test_nh3_rxyg3_grad() {
         let part = grad.result.get(key).unwrap().clone();
         println!("part {key}: {:16.9}", rt::asarray((part.data, part.size)).t());
     }
-    assert!((&de_ref - &de).abs().max_all() < 1.0e-6, "XYG3 total gradient mismatch");
+    assert!((&de_ref - &de).abs().max_all() < tol, "XYG3 total gradient mismatch");
+}
+
+#[test]
+fn test_nh3_rxyg3_grad() {
+    test_nh3_rxyg3_grad_with("cd", 1.0e-6);
+}
+
+#[test]
+fn test_nh3_rxyg3_grad_eig() {
+    test_nh3_rxyg3_grad_with("eig", 1.0e-6);
 }

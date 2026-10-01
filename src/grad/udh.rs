@@ -50,7 +50,7 @@ use crate::mpi_io::MPIOperator;
 use crate::ri_jk::resp_u::URespRIJK;
 use crate::ri_jk::util;
 use crate::ri_jk::util::get_dm0_restricted;
-use crate::ri_jk::{get_j2c_decomp, J2CDecompPolicy, J2CDecompose};
+use crate::ri_jk::{get_j2c_decomp, J2CDecompose, J2C_THRESH};
 use crate::ri_pt2::pure_pt2_u_elecderiv::{
     get_rupt2_elec_deriv_incore, UPT2ElecDerivIncoreArg, UPT2ElecDerivIncoreInp,
 };
@@ -96,12 +96,6 @@ impl<'a> UDHGradient<'a> {
         assert!(
             scf_data.mol.geom.ghost_pc_chrg.is_empty() && !scf_data.mol.ctrl.solvent_enabled,
             "The DH analytic gradient does not support QMMM point charges or solvent models yet."
-        );
-        // the metric-derivative generator below follows forge's Cholesky-generator identity and
-        // is CD-only; refuse the other conventions before the PT2/Z-vector work (`s_op` trusted)
-        assert!(
-            matches!(scf_data.mol.ctrl.j2c_decomp.policy, J2CDecompPolicy::Cd),
-            "The DH analytic gradient's metric-derivative generator currently supports the CD convention only. Please set\n[ctrl.j2c_decomp]\npolicy = \"cd\"\nin the ctrl input (the derivative-integral solves themselves follow the rimatr convention)."
         );
         assert!(
             !matches!(scf_data.mol.ctrl.j2c_decomp.uplo, Lower),
@@ -430,7 +424,9 @@ impl<'a> UDHGradient<'a> {
             let (out, shape) = aux.integrate("int2c2e_ip1", "s1", None).into();
             rt::asarray((out, shape, &device))
         };
-        let (l_lower, l_mask) = match &j2c_decomp {
+        // strictly-lower mask with 1/2 diagonal of forge's `generator_L_1`; only the Cholesky
+        // convention uses it per atom (`Eig` folds the weight matrices once instead, below)
+        let l1_cd = match &j2c_decomp {
             J2CDecompose::Cd { j2c_l, .. } => {
                 let l_lower = j2c_l.t().into_contig(ColMajor);
                 let mut l_mask: Tsr = rt::zeros(([naux, naux], &device));
@@ -440,11 +436,9 @@ impl<'a> UDHGradient<'a> {
                     }
                     l_mask[[i, i]] = 0.5;
                 }
-                (l_lower, l_mask)
+                Some((l_lower, l_mask))
             },
-            _ => panic!(
-                "The DH analytic gradient's metric-derivative generator currently supports the CD convention only. Please set\n[ctrl.j2c_decomp]\npolicy = \"cd\"\nin the ctrl input (the derivative-integral solves themselves follow the rimatr convention)."
-            ),
+            J2CDecompose::Eig { .. } => None,
         };
 
         // ── persistent MO intermediates; density dots of the rimatr by two GEMVs per spin ── //
@@ -509,6 +503,27 @@ impl<'a> UDHGradient<'a> {
             }
         }
         *&mut r_jk *= cx_scf;
+        // `Eig` metric-derivative weights: the y-dot cross terms and the exchange weight form
+        // `M_jk`, the RI weight `M_ri`; each is folded once by the Fréchet derivative of
+        // `J^-1/2`, so the atom loop contracts the raw metric derivatives directly
+        let l1_eig = match &j2c_decomp {
+            J2CDecompose::Eig { j2c_e: Some(j2c_e), j2c_v: Some(j2c_v), .. } => {
+                let thresh = mol_obj.ctrl.j2c_decomp.threshold.unwrap_or(J2C_THRESH);
+                let y_dot_d_tot: Tsr = (&y_dot_d[0] + &y_dot_d[1]).into_owned();
+                let y_dot_dr_tot: Tsr = (&y_dot_dr[0] + &y_dot_dr[1]).into_owned();
+                let outer: Tsr = y_dot_dr_tot.view().i((.., None)) % y_dot_d_tot.view().i((None, ..));
+                let m_jk: Tsr = (&outer + &outer.t()).mapv(|x: f64| -x) + 2.0 * r_jk.view();
+                let m_ri: Tsr = -r_ri.view();
+                Some((
+                    l1_fold_eig(m_jk.view(), j2c_e.view(), j2c_v.view(), thresh),
+                    l1_fold_eig(m_ri.view(), j2c_e.view(), j2c_v.view(), thresh),
+                ))
+            },
+            J2CDecompose::Eig { .. } => panic!(
+                "The eigen-decomposed 2c-2e ERI carries no stored eigenpairs; cannot build the DH metric-derivative kernels."
+            ),
+            J2CDecompose::Cd { .. } => None,
+        };
 
         // ── pre-contractions `Ȳ = partner % S` in the single kept layout `[i, Q, x]`, per spin ──
         // one stored layout per partner: the solve result `[(i m), Q]` / `[(a i), Q]` is permuted
@@ -729,19 +744,32 @@ impl<'a> UDHGradient<'a> {
                 [rt::zeros(([naux, ncomp], &device)), rt::zeros(([naux, ncomp], &device))];
             let mut t4_l1 = [0.0f64; 3];
             let mut ri_l1 = [0.0f64; 3];
+            // `Cd`: forge's L_1 generator of this atom, contracted with the solve operator;
+            // `Eig`: the raw metric derivative contracts against the folded weights directly
             for t in 0..ncomp {
-                let m0 = &s_op_cols % tsr_int2c2e_ip1.i((auq0..auq1, .., t));
-                let mut m: Tsr = &m0 % s_op.view().t();
-                let m_t = m.view().t().into_owned();
-                *&mut m += &m_t;
-                let l1_t = (l_lower.view() % &(&l_mask * &m)).mapv(|x: f64| -x);
-                let l1di = s_op.view() % l1_t.view();
-                for s in 0..2 {
-                    ydd_l1[s].i_mut((.., t)).assign(&(l1di.view() % y_dot_d[s].view()));
-                    ydr_l1[s].i_mut((.., t)).assign(&(l1di.view() % y_dot_dr[s].view()));
+                match &l1_cd {
+                    Some((l_lower, l_mask)) => {
+                        let m0 = &s_op_cols % tsr_int2c2e_ip1.i((auq0..auq1, .., t));
+                        let mut m: Tsr = &m0 % s_op.view().t();
+                        let m_t = m.view().t().into_owned();
+                        *&mut m += &m_t;
+                        let l1_t = (l_lower.view() % &(l_mask * &m)).mapv(|x: f64| -x);
+                        let l1di = s_op.view() % l1_t.view();
+                        for s in 0..2 {
+                            ydd_l1[s].i_mut((.., t)).assign(&(l1di.view() % y_dot_d[s].view()));
+                            ydr_l1[s].i_mut((.., t)).assign(&(l1di.view() % y_dot_dr[s].view()));
+                        }
+                        t4_l1[t] = 2.0 * rt::vecdot(&l1di, r_jk.view(), -1).sum_all();
+                        ri_l1[t] = -rt::vecdot(&l1di, r_ri.view(), -1).sum_all();
+                    },
+                    None => {
+                        let (k_jk, k_ri) =
+                            l1_eig.as_ref().expect("the metric-derivative kernels must exist for a non-Cholesky policy.");
+                        let dj = tsr_int2c2e_ip1.i((auq0..auq1, .., t));
+                        t4_l1[t] = rt::vecdot(&dj, &k_jk.i((auq0..auq1, ..)), -1).sum_all();
+                        ri_l1[t] = rt::vecdot(&dj, &k_ri.i((auq0..auq1, ..)), -1).sum_all();
+                    },
                 }
-                t4_l1[t] = 2.0 * rt::vecdot(&l1di, r_jk.view(), -1).sum_all();
-                ri_l1[t] = -rt::vecdot(&l1di, r_ri.view(), -1).sum_all();
             }
 
             // forge t1 + t2 (all four spin pairs) + t4 (per spin), and the RI term
@@ -869,6 +897,24 @@ impl<'a> UDHGradient<'a> {
 fn to_matrix_full(tsr: Tsr) -> MatrixFull<f64> {
     let shape: [usize; 2] = tsr.shape().to_vec().try_into().unwrap();
     MatrixFull::from_vec(shape, tsr.into_shape(-1).into_raw()).unwrap()
+}
+
+/// Fold a metric-derivative weight matrix for the eigen convention: the `L_1` term
+/// `sum_weights . raw d(J^-1/2)` equals `<dJ, F(M S^-1)>` with `F` the (self-adjoint) Fréchet
+/// derivative of `J^-1/2`, i.e. `V (D ∘ (V^T M^T V)) V^T` with
+/// `D_ij = -1 / (sqrt(e_i) (sqrt(e_i) + sqrt(e_j)))`; the returned `G + G^T` pairs with one
+/// atom block of the raw `int2c2e_ip1` (its transposed half included). Eigenpairs below
+/// `threshold` are discarded, exactly as in the decomposition itself. Unrestricted twin of the
+/// helper in [`crate::grad::rdh`].
+fn l1_fold_eig(weight: TsrView, j2c_e: TsrView, j2c_v: TsrView, threshold: f64) -> Tsr {
+    let n = j2c_e.view().less(threshold).sum();
+    let sr = j2c_e.i(n..).pow(0.5);
+    let v = j2c_v.i((.., n..)).into_contig(ColMajor);
+    let ssum = &sr.i((.., None)) + &sr.i((None, ..));
+    let d: Tsr = (&sr.i((.., None)) * &ssum).mapv(|x: f64| -1.0 / x);
+    let p = v.view().t() % (weight.t() % v.view()); // V^T M^T V
+    let g: Tsr = v.view() % &(&d * &p) % v.view().t();
+    (&g + &g.t()).into_owned()
 }
 
 /// Whether the SCF-iteration functional carries a non-HF XC part (the gate of the

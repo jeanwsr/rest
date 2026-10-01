@@ -38,9 +38,10 @@
 //! `[naux, 3, x, y]` intermediates. Each partner is stored in a single layout `[i, Q, x]` (the
 //! metric-solve output permuted once); both the `u` and the `v` fold slots and the ip2-side
 //! reductions consume it in place, so the persistent cost stays at the two `Ȳ` tensors
-//! themselves. The metric-derivative (`L_1`) term, however, follows forge's Cholesky-generator
-//! identity and therefore still requires the `Cd` convention (same as the rimatr itself), so
-//! `calc` checks the control policy up front (`s_op` itself is trusted).
+//! themselves. The metric-derivative (`L_1`) term follows forge's Cholesky-generator identity
+//! under the `Cd` convention; under `Eig` the same term is evaluated through the (self-adjoint)
+//! Fréchet derivative of `J^{-1/2}`, which folds the weight matrices once so that the raw
+//! metric-derivative integrals contract against them directly.
 
 use crate::analdrv::response::rresp_interface::{rscf_resp_interface, scf_xc_func_list, RRespSCF};
 use crate::analdrv::response::rgfock_interface::{dh_jk_factors, dh_xc_func_list, solve_z_vector};
@@ -57,7 +58,7 @@ use crate::grad::traits::GradAPI;
 use crate::mpi_io::MPIOperator;
 use crate::ri_jk::resp_r::RRespRIJK;
 use crate::ri_jk::util;
-use crate::ri_jk::{get_j2c_decomp, J2CDecompPolicy, J2CDecompose, J2C_THRESH};
+use crate::ri_jk::{get_j2c_decomp, J2CDecompose, J2C_THRESH};
 use crate::ri_pt2::rgfock_pt2::RGFockPT2;
 use crate::ri_pt2::{occ_batch_index, occ_batch_step};
 use crate::scf_io::SCF;
@@ -97,12 +98,6 @@ impl<'a> RDHGradient<'a> {
         assert!(
             scf_data.mol.geom.ghost_pc_chrg.is_empty() && !scf_data.mol.ctrl.solvent_enabled,
             "The DH analytic gradient does not support QMMM point charges or solvent models yet."
-        );
-        // the metric-derivative generator below follows forge's Cholesky-generator identity and
-        // is CD-only; refuse the other conventions before the PT2/Z-vector work (`s_op` trusted)
-        assert!(
-            matches!(scf_data.mol.ctrl.j2c_decomp.policy, J2CDecompPolicy::Cd),
-            "The DH analytic gradient's metric-derivative generator currently supports the CD convention only. Please set\n[ctrl.j2c_decomp]\npolicy = \"cd\"\nin the ctrl input (the derivative-integral solves themselves follow the rimatr convention)."
         );
         assert!(
             !matches!(scf_data.mol.ctrl.j2c_decomp.uplo, Lower),
@@ -315,8 +310,9 @@ impl<'a> RDHGradient<'a> {
             let (out, shape) = aux.integrate("int2c2e_ip1", "s1", None).into();
             rt::asarray((out, shape, &device))
         };
-        // strictly-lower mask with 1/2 diagonal, of forge `generator_L_1` (Cd only)
-        let (l_lower, l_mask) = match &j2c_decomp {
+        // strictly-lower mask with 1/2 diagonal of forge's `generator_L_1`; only the Cholesky
+        // convention uses it per atom (`Eig` folds the weight matrices once instead, below)
+        let l1_cd = match &j2c_decomp {
             J2CDecompose::Cd { j2c_l, .. } => {
                 let l_lower = j2c_l.t().into_contig(ColMajor);
                 let mut l_mask: Tsr<f64> = rt::zeros(([naux, naux], &device));
@@ -326,11 +322,9 @@ impl<'a> RDHGradient<'a> {
                     }
                     l_mask[[i, i]] = 0.5;
                 }
-                (l_lower, l_mask)
+                Some((l_lower, l_mask))
             },
-            _ => panic!(
-                "The DH analytic gradient's metric-derivative generator currently supports the CD convention only. Please set\n[ctrl.j2c_decomp]\npolicy = \"cd\"\nin the ctrl input (the derivative-integral solves themselves follow the rimatr convention)."
-            ),
+            J2CDecompose::Eig { .. } => None,
         };
 
         // ── persistent MO intermediates; density dots of the rimatr by two GEMVs ──
@@ -364,6 +358,25 @@ impl<'a> RDHGradient<'a> {
             *&mut r_jk += &a_i.view() % y2t.view();
         }
         *&mut r_jk *= cx_scf;
+        // `Eig` metric-derivative weights: the y-dot cross terms and the exchange weight form
+        // `M_jk`, the RI weight `M_ri`; each is folded once by the Fréchet derivative of
+        // `J^-1/2`, so the atom loop contracts the raw metric derivatives directly
+        let l1_eig = match &j2c_decomp {
+            J2CDecompose::Eig { j2c_e: Some(j2c_e), j2c_v: Some(j2c_v), .. } => {
+                let thresh = mol_obj.ctrl.j2c_decomp.threshold.unwrap_or(J2C_THRESH);
+                let outer: Tsr<f64> = y_dot_dr.view().i((.., None)) % y_dot_d.view().i((None, ..));
+                let m_jk: Tsr<f64> = (&outer + &outer.t()).mapv(|x: f64| -x) + 2.0 * r_jk.view();
+                let m_ri: Tsr<f64> = -4.0 * r_ri.view();
+                Some((
+                    l1_fold_eig(m_jk.view(), j2c_e.view(), j2c_v.view(), thresh),
+                    l1_fold_eig(m_ri.view(), j2c_e.view(), j2c_v.view(), thresh),
+                ))
+            },
+            J2CDecompose::Eig { .. } => panic!(
+                "The eigen-decomposed 2c-2e ERI carries no stored eigenpairs; cannot build the DH metric-derivative kernels."
+            ),
+            J2CDecompose::Cd { .. } => None,
+        };
 
         // ── pre-contractions `Ȳ = partner % S` in the single kept layout `[i, Q, x]` ──
         // one stored layout per partner: the solve result `[(i m), Q]` / `[(a i), Q]` is permuted
@@ -517,18 +530,30 @@ impl<'a> RDHGradient<'a> {
             let mut ydr_l1: Tsr<f64> = rt::zeros(([naux, ncomp], &device));
             let mut t4_l1 = [0.0f64; 3];
             let mut ri_l1 = [0.0f64; 3];
-            // forge L_1 generator of this atom, contracted with the solve operator
+            // `Cd`: forge's L_1 generator of this atom, contracted with the solve operator;
+            // `Eig`: the raw metric derivative contracts against the folded weights directly
             for t in 0..ncomp {
-                let m0 = &s_op_cols % tsr_int2c2e_ip1.i((auq0..auq1, .., t));
-                let mut m: Tsr<f64> = &m0 % s_op.view().t();
-                let m_t = m.view().t().into_owned();
-                *&mut m += &m_t;
-                let l1_t = (l_lower.view() % &(&l_mask * &m)).mapv(|x: f64| -x);
-                let l1di = s_op.view() % l1_t.view();
-                ydd_l1.i_mut((.., t)).assign(&(l1di.view() % y_dot_d.view()));
-                ydr_l1.i_mut((.., t)).assign(&(l1di.view() % y_dot_dr.view()));
-                t4_l1[t] = 2.0 * rt::vecdot(&l1di, r_jk.view(), -1).sum_all();
-                ri_l1[t] = -4.0 * rt::vecdot(&l1di, r_ri.view(), -1).sum_all();
+                match &l1_cd {
+                    Some((l_lower, l_mask)) => {
+                        let m0 = &s_op_cols % tsr_int2c2e_ip1.i((auq0..auq1, .., t));
+                        let mut m: Tsr<f64> = &m0 % s_op.view().t();
+                        let m_t = m.view().t().into_owned();
+                        *&mut m += &m_t;
+                        let l1_t = (l_lower.view() % &(l_mask * &m)).mapv(|x: f64| -x);
+                        let l1di = s_op.view() % l1_t.view();
+                        ydd_l1.i_mut((.., t)).assign(&(l1di.view() % y_dot_d.view()));
+                        ydr_l1.i_mut((.., t)).assign(&(l1di.view() % y_dot_dr.view()));
+                        t4_l1[t] = 2.0 * rt::vecdot(&l1di, r_jk.view(), -1).sum_all();
+                        ri_l1[t] = -4.0 * rt::vecdot(&l1di, r_ri.view(), -1).sum_all();
+                    },
+                    None => {
+                        let (k_jk, k_ri) =
+                            l1_eig.as_ref().expect("the metric-derivative kernels must exist for a non-Cholesky policy.");
+                        let dj = tsr_int2c2e_ip1.i((auq0..auq1, .., t));
+                        t4_l1[t] = rt::vecdot(&dj, &k_jk.i((auq0..auq1, ..)), -1).sum_all();
+                        ri_l1[t] = rt::vecdot(&dj, &k_ri.i((auq0..auq1, ..)), -1).sum_all();
+                    },
+                }
             }
 
             // assemble forge t1 + t2 + t4 (D_r-carrying) and the RI term
@@ -717,6 +742,23 @@ fn de_xc_response_term(
 fn to_matrix_full(tsr: Tsr<f64>) -> MatrixFull<f64> {
     let shape: [usize; 2] = tsr.shape().to_vec().try_into().unwrap();
     MatrixFull::from_vec(shape, tsr.into_shape(-1).into_raw()).unwrap()
+}
+
+/// Fold a metric-derivative weight matrix for the eigen convention: the `L_1` term
+/// `sum_weights . raw d(J^-1/2)` equals `<dJ, F(M S^-1)>` with `F` the (self-adjoint) Fréchet
+/// derivative of `J^-1/2`, i.e. `V (D ∘ (V^T M^T V)) V^T` with
+/// `D_ij = -1 / (sqrt(e_i) (sqrt(e_i) + sqrt(e_j)))`; the returned `G + G^T` pairs with one
+/// atom block of the raw `int2c2e_ip1` (its transposed half included). Eigenpairs below
+/// `threshold` are discarded, exactly as in the decomposition itself.
+fn l1_fold_eig(weight: TsrView<f64>, j2c_e: TsrView<f64>, j2c_v: TsrView<f64>, threshold: f64) -> Tsr<f64> {
+    let n = j2c_e.view().less(threshold).sum();
+    let sr = j2c_e.i(n..).pow(0.5);
+    let v = j2c_v.i((.., n..)).into_contig(ColMajor);
+    let ssum = &sr.i((.., None)) + &sr.i((None, ..));
+    let d: Tsr<f64> = (&sr.i((.., None)) * &ssum).mapv(|x: f64| -1.0 / x);
+    let p = v.view().t() % (weight.t() % v.view()); // V^T M^T V
+    let g: Tsr<f64> = v.view() % &(&d * &p) % v.view().t();
+    (&g + &g.t()).into_owned()
 }
 
 /// One ip1 derivative-integral pass on an AO-shell batch, reduced against the pre-contracted

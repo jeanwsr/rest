@@ -929,7 +929,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
         };
         grad_data_list.push(("SCF".into(), grad_data_scf));
 
-        // 1.5 doubly-hybrid (RI-PT2) correlation gradient; requires the CD-decomposed rimatr
+        // 1.5 doubly-hybrid (RI-PT2) correlation gradient; requires the decomposed rimatr
         if is_dh {
             if !scf_data.mol.ctrl.spin_polarization {
                 let mut grad_data_dh = crate::grad::rdh::RDHGradient::new(&scf_data, mpi_operator);
