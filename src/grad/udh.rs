@@ -448,15 +448,21 @@ impl<'a> UDHGradient<'a> {
         };
 
         // ── persistent MO intermediates; density dots of the rimatr by two GEMVs per spin ── //
-        // true peak: the `y_ip`/`g_vix` partners plus the three layout copies of their `Ȳ`
-        // partners per spin, all co-resident until the two sources are dropped
-        handle_memory_exceed(
-            4.0 * ((nocc[0] + nocc[1]) * nmo * naux + (nvir[0] * nocc[0] + nvir[1] * nocc[1]) * naux) as f64
-                * 8.0
-                / 1048576.0,
-            mem_avail,
-            abort,
-        );
+        // true peak of the partner intermediates in construction order per spin: each source
+        // coexists with its solve transient, the transient with the permuted `[i, Q, x]` layout
+        // replacing it, and all of them with the partners already built
+        let mut resident = 0.0f64;
+        let mut partner_peak = 0.0f64;
+        for s in 0..2 {
+            if nocc[s] == 0 {
+                continue;
+            }
+            let (y_s, g_s) = ((nocc[s] * nmo * naux) as f64, (nvir[s] * nocc[s] * naux) as f64);
+            partner_peak = partner_peak.max(resident + 2.0 * y_s);
+            partner_peak = partner_peak.max(resident + y_s + 2.0 * g_s);
+            resident += y_s + g_s;
+        }
+        handle_memory_exceed(partner_peak * 8.0 / 1048576.0, mem_avail, abort);
         let d_hf_tp: [Tsr; 2] =
             [pack_triu_tilde(d_hf[0].view()), pack_triu_tilde(d_hf[1].view())];
         let d_r_ao_tp: [Tsr; 2] =
@@ -504,68 +510,26 @@ impl<'a> UDHGradient<'a> {
         }
         *&mut r_jk *= cx_scf;
 
-        // ── pre-contractions `Ȳ = partner % S` (replace all in-loop metric solves), per spin ── //
-        let mut ybar_y2: [Option<Tsr>; 2] = [None, None];
-        let mut ybar_g2i: [Option<Tsr>; 2] = [None, None];
-        let mut ybar_jk_u: [Option<Tsr>; 2] = [None, None];
-        let mut ybar_jk_v: [Option<Tsr>; 2] = [None, None];
-        let mut ybar_ri_u: [Option<Tsr>; 2] = [None, None];
-        let mut ybar_ri_v: [Option<Tsr>; 2] = [None, None];
+        // ── pre-contractions `Ȳ = partner % S` in the single kept layout `[i, Q, x]`, per spin ──
+        // one stored layout per partner: the solve result `[(i m), Q]` / `[(a i), Q]` is permuted
+        // once into `[i, Q, m]` / `[i, Q, a]`, and each spin source is dropped before its permute
+        let mut ybar_jk: [Option<Tsr>; 2] = [None, None];
+        let mut ybar_ri: [Option<Tsr>; 2] = [None, None];
+        let mut y_src = y_ip.map(Some);
+        let mut g_src = g_vix.map(Some);
         for s in 0..2 {
             if nocc[s] == 0 {
                 continue;
             }
-            let y2 = y_ip[s].view().into_shape([nocc[s] * nmo, naux]) % s_op.view();
-            let g2i = g_vix[s]
-                .view()
-                .transpose([1, 0, 2])
-                .into_contig(ColMajor)
-                .view()
-                .into_shape([nocc[s] * nvir[s], naux])
-                % s_op.view();
-            ybar_y2[s] = Some(y2);
-            ybar_g2i[s] = Some(g2i);
-            ybar_jk_u[s] = Some(
-                ybar_y2[s]
-                    .as_ref()
-                    .unwrap()
-                    .view()
-                    .into_shape([nocc[s], nmo, naux])
-                    .transpose([0, 2, 1])
-                    .into_contig(ColMajor),
-            );
-            let yv = y_ip[s]
-                .view()
-                .transpose([1, 0, 2])
-                .into_contig(ColMajor)
-                .view()
-                .into_shape([nmo * nocc[s], naux])
-                % s_op.view();
-            ybar_jk_v[s] = Some(
-                yv.view()
-                    .into_shape([nmo, nocc[s], naux])
-                    .transpose([0, 2, 1])
-                    .into_contig(ColMajor),
-            );
-            ybar_ri_u[s] = Some(
-                ybar_g2i[s]
-                    .as_ref()
-                    .unwrap()
-                    .view()
-                    .into_shape([nocc[s], nvir[s], naux])
-                    .transpose([0, 2, 1])
-                    .into_contig(ColMajor),
-            );
-            let gv = g_vix[s].view().into_shape([nvir[s] * nocc[s], naux]) % s_op.view();
-            ybar_ri_v[s] = Some(
-                gv.view()
-                    .into_shape([nvir[s], nocc[s], naux])
-                    .transpose([0, 2, 1])
-                    .into_contig(ColMajor),
-            );
+            let src = y_src[s].take().unwrap();
+            let solved: Tsr = src.view().into_shape([nocc[s] * nmo, naux]) % s_op.view(); // [(i m), Q]
+            drop(src);
+            ybar_jk[s] = Some(solved.view().into_shape([nocc[s], nmo, naux]).transpose([0, 2, 1]).into_contig(ColMajor)); // [i, Q, m]
+            let src = g_src[s].take().unwrap();
+            let solved: Tsr = src.view().into_shape([nvir[s] * nocc[s], naux]) % s_op.view(); // [(a i), Q]
+            drop(src);
+            ybar_ri[s] = Some(solved.view().into_shape([nvir[s], nocc[s], naux]).transpose([1, 2, 0]).into_contig(ColMajor)); // [i, Q, a]
         }
-        drop(y_ip);
-        drop(g_vix);
 
         // ── derivative-integral passes: shell batches over all atoms, atom scatter in-batch ── //
         let mol_loc = mol.ao_loc();
@@ -638,16 +602,16 @@ impl<'a> UDHGradient<'a> {
                         nub,
                         c0[s].i((r.clone(), ..)),
                         c1_dr[s].view(),
-                        ybar_jk_u[s].as_ref().unwrap().view(),
+                        ybar_jk[s].as_ref().unwrap().view(),
                         2.0,
                         t4_3c,
                     );
-                    t4_3c = add_fold_ip1_batched(
+                    t4_3c = add_fold_ip1_batched_v(
                         ip1_t2.view(),
                         nub,
                         c1_dr[s].i((r.clone(), ..)),
                         c0[s].view(),
-                        ybar_jk_v[s].as_ref().unwrap().view(),
+                        ybar_jk[s].as_ref().unwrap().view(),
                         2.0,
                         t4_3c,
                     );
@@ -656,16 +620,16 @@ impl<'a> UDHGradient<'a> {
                         nub,
                         c0[s].i((r.clone(), ..)),
                         cv[s].view(),
-                        ybar_ri_u[s].as_ref().unwrap().view(),
+                        ybar_ri[s].as_ref().unwrap().view(),
                         -1.0,
                         ri_3c,
                     );
-                    ri_3c = add_fold_ip1_batched(
+                    ri_3c = add_fold_ip1_batched_v(
                         ip1_t2.view(),
                         nub,
                         cv[s].i((r.clone(), ..)),
                         c0[s].view(),
-                        ybar_ri_v[s].as_ref().unwrap().view(),
+                        ybar_ri[s].as_ref().unwrap().view(),
                         -1.0,
                         ri_3c,
                     );
@@ -719,13 +683,19 @@ impl<'a> UDHGradient<'a> {
                 let w1 = c0[s].view().t() % &ip2_unp; // [i, nu, (q t)]
                 let f_jk = (w1.view() % c1_dr[s].view()).into_contig(ColMajor);
                 let f_ri = (w1.view() % cv[s].view()).into_contig(ColMajor);
-                let f_jk2 = f_jk.view().into_shape([nocc[s] * nmo, nb_q * ncomp]);
-                let f_ri2 = f_ri.view().into_shape([nocc[s] * nvir[s], nb_q * ncomp]);
                 for t in 0..ncomp {
-                    let r_jk_q =
-                        rt::vecdot(&f_jk2.i((.., t * nb_q..(t + 1) * nb_q)), ybar_y2[s].as_ref().unwrap().view().i((.., qa..qb)), 0);
-                    let r_ri_q =
-                        rt::vecdot(&f_ri2.i((.., t * nb_q..(t + 1) * nb_q)), ybar_g2i[s].as_ref().unwrap().view().i((.., qa..qb)), 0);
+                    // the partner is stored once, so the two contraction axes are paired
+                    // individually (`(i m)` is not merged) in both halves of the reduction
+                    let r_jk_q = rt::vecdot(
+                        &ybar_jk[s].as_ref().unwrap().view().i((.., qa..qb, ..)),
+                        &f_jk.i((.., .., t * nb_q..(t + 1) * nb_q)).transpose([0, 2, 1]),
+                        ([0, 2], [0, 2]),
+                    );
+                    let r_ri_q = rt::vecdot(
+                        &ybar_ri[s].as_ref().unwrap().view().i((.., qa..qb, ..)),
+                        &f_ri.i((.., .., t * nb_q..(t + 1) * nb_q)).transpose([0, 2, 1]),
+                        ([0, 2], [0, 2]),
+                    );
                     for atm in 0..natm {
                         let [_, _, auq0, auq1] = aux_slice[atm];
                         let (lo, hi) = (qa.max(auq0), qb.min(auq1));
@@ -1084,6 +1054,43 @@ fn add_fold_ip1_batched(
         let blk = ip1_t2.i((.., t * nub * naux..(t + 1) * nub * naux));
         g_buf.view_mut().matmul_from(&blk.t(), &c_col, 1.0, 0.0);
         let s: f64 = rt::vecdot(&g_buf, &k2, -1).sum_all();
+        acc[t] += factor * s;
+    }
+    acc
+}
+
+/// [`add_fold_ip1_batched`] counterpart for the `v` slot, where the partner `Ȳ[i, Q, m]` is
+/// contracted over its slow `m` axis instead: the same two GEMMs are kept, but the partner
+/// enters on the left of a single `[nocc naux, nmo] % [nmo, nub]` fold while the full-AO-side
+/// fold is assembled from one `[y, naov] % [naov, naux]` GEMM per batch row `u` (each landing
+/// contiguously in the paired buffer). Both stay within the `u` slot's GEMM structure and the
+/// reduction remains a `rt::vecdot` over matching layouts, so no second partner layout is
+/// stored; unrestricted twin of the kernel in [`crate::grad::rdh`].
+fn add_fold_ip1_batched_v(
+    ip1_t2: TsrView,  // [naov, nub naux ncomp]
+    nub: usize,
+    c_row: TsrView,   // [nub, x], the atom-side MO weight (contracted partner axis)
+    c_col: TsrView,   // [naov, y], the full-AO-side MO weight (partner's leading axis)
+    ybar: TsrView,    // [y, naux, x], pre-contracted partner in the single kept layout
+    factor: f64,
+    mut acc: [f64; 3],
+) -> [f64; 3] {
+    let device = ip1_t2.device().clone();
+    let naov = ip1_t2.shape()[0];
+    let naux = ip1_t2.shape()[1] / (nub * 3);
+    let x = c_row.shape()[1];
+    let y = c_col.shape()[1];
+    let mut k_buf: Tsr = rt::zeros(([y * naux, nub], &device));
+    k_buf.view_mut().matmul_from(&ybar.reshape([y * naux, x]), &c_row.t(), 1.0, 0.0);
+    let mut g_buf: Tsr = rt::zeros(([y, naux, nub], &device));
+    let c_col_t = c_col.t();
+    let ip1_t3 = ip1_t2.reshape([naov, nub, naux * 3]); // [naov, u, (Q t)]
+    for t in 0..3 {
+        for u in 0..nub {
+            let blk = ip1_t3.i((.., u, t * naux..(t + 1) * naux));
+            g_buf.i_mut((.., .., u)).matmul_from(&c_col_t, &blk, 1.0, 0.0);
+        }
+        let s: f64 = rt::vecdot(&k_buf, &g_buf.view().reshape([y * naux, nub]), 0).sum_all();
         acc[t] += factor * s;
     }
     acc

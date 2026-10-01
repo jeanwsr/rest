@@ -34,10 +34,13 @@
 //! Every in-loop metric solve of the old per-atom scheme is replaced by an exact reordering:
 //! the persistent MO partners are pre-contracted once as `Ȳ = partner % S` (`S` = the solve
 //! operator that generated `rimatr`, obtained from `get_j2c_decomp(ctrl.j2c_decomp)`), and each
-//! shell batch reduces directly (last-axis `rt::vecdot`) against `Ȳ`, never materializing
-//! `[naux, 3, x, y]` intermediates. The metric-derivative (`L_1`) term, however, follows forge's
-//! Cholesky-generator identity and therefore still requires the `Cd` convention (same as the
-//! rimatr itself), so `calc` checks the control policy up front (`s_op` itself is trusted).
+//! shell batch reduces directly (`rt::vecdot`) against `Ȳ`, never materializing
+//! `[naux, 3, x, y]` intermediates. Each partner is stored in a single layout `[i, Q, x]` (the
+//! metric-solve output permuted once); both the `u` and the `v` fold slots and the ip2-side
+//! reductions consume it in place, so the persistent cost stays at the two `Ȳ` tensors
+//! themselves. The metric-derivative (`L_1`) term, however, follows forge's Cholesky-generator
+//! identity and therefore still requires the `Cd` convention (same as the rimatr itself), so
+//! `calc` checks the control policy up front (`s_op` itself is trusted).
 
 use crate::analdrv::response::rresp_interface::{rscf_resp_interface, scf_xc_func_list, RRespSCF};
 use crate::analdrv::response::rgfock_interface::{dh_jk_factors, dh_xc_func_list, solve_z_vector};
@@ -333,13 +336,11 @@ impl<'a> RDHGradient<'a> {
         // ── persistent MO intermediates; density dots of the rimatr by two GEMVs ──
         let mem_avail = mol_obj.ctrl.max_memory.map(|m| m - detect_used_memory_mb("proc"));
         let abort = mol_obj.ctrl.abort_on_mem_exceed;
-        // true peak of the persistent intermediates: `y_ip`/`g_vix` plus the three layout
-        // copies of their `Ȳ` partners, all co-resident until the two sources are dropped
-        handle_memory_exceed(
-            4.0 * (nocc * nmo * naux + nvir * nocc * naux) as f64 * 8.0 / 1048576.0,
-            mem_avail,
-            abort,
-        );
+        // true peak of the partner intermediates: each source coexists with its metric-solve
+        // transient, which in turn coexists with the permuted `[i, Q, x]` layout replacing it
+        // (the partner built first stays resident throughout the second one's construction)
+        let (n_y, n_g) = ((nocc * nmo * naux) as f64, (nvir * nocc * naux) as f64);
+        handle_memory_exceed((2.0 * n_y).max(n_y + 2.0 * n_g) * 8.0 / 1048576.0, mem_avail, abort);
         let d_hf_tp = crate::grad::rhf::pack_triu_tilde(d_hf.view());
         let d_r_ao_tp = crate::grad::rhf::pack_triu_tilde(d_r_ao.view());
         let y_dot_d: Tsr<f64> = (ederi_utp.view().t() % d_hf_tp.view().reshape([nao_tp, 1])).into_shape([naux]);
@@ -364,18 +365,21 @@ impl<'a> RDHGradient<'a> {
         }
         *&mut r_jk *= cx_scf;
 
-        // ── pre-contractions `Ȳ = partner % S` (replace all in-loop metric solves) ──
-        let ybar_y2: Tsr<f64> = y_ip.view().into_shape([nocc * nmo, naux]) % s_op.view(); // [(i m), Q]
-        let ybar_g2i: Tsr<f64> = g_vix.view().transpose([1, 0, 2]).into_contig(ColMajor).view().into_shape([nocc * nvir, naux]) % s_op.view(); // [(i a), Q]
-        // layout copies `[x, Q, y]` for the ip1 shell-batch reductions
-        let ybar_jk_u = ybar_y2.view().into_shape([nocc, nmo, naux]).transpose([0, 2, 1]).into_contig(ColMajor); // [i, Q, m]
-        let ybar_jk_v = y_ip.view().transpose([1, 0, 2]).into_contig(ColMajor).view().into_shape([nmo * nocc, naux]) % s_op.view(); // [(m i), Q]
-        let ybar_jk_v = ybar_jk_v.view().into_shape([nmo, nocc, naux]).transpose([0, 2, 1]).into_contig(ColMajor); // [m, Q, i]
-        let ybar_ri_u = ybar_g2i.view().into_shape([nocc, nvir, naux]).transpose([0, 2, 1]).into_contig(ColMajor); // [i, Q, a]
-        let ybar_ri_v = g_vix.view().into_shape([nvir * nocc, naux]) % s_op.view(); // [(a i), Q]
-        let ybar_ri_v = ybar_ri_v.view().into_shape([nvir, nocc, naux]).transpose([0, 2, 1]).into_contig(ColMajor); // [a, Q, i]
-        drop(y_ip);
-        drop(g_vix);
+        // ── pre-contractions `Ȳ = partner % S` in the single kept layout `[i, Q, x]` ──
+        // one stored layout per partner: the solve result `[(i m), Q]` / `[(a i), Q]` is permuted
+        // once into `[i, Q, m]` / `[i, Q, a]`, and each source is dropped before the permutation
+        let ybar_jk: Tsr<f64> = {
+            let solved: Tsr<f64> = y_ip.view().into_shape([nocc * nmo, naux]) % s_op.view(); // [(i m), Q]
+            drop(y_ip);
+            let ybar = solved.view().into_shape([nocc, nmo, naux]).transpose([0, 2, 1]).into_contig(ColMajor); // [i, Q, m]
+            ybar
+        };
+        let ybar_ri: Tsr<f64> = {
+            let solved: Tsr<f64> = g_vix.view().into_shape([nvir * nocc, naux]) % s_op.view(); // [(a i), Q]
+            drop(g_vix);
+            let ybar = solved.view().into_shape([nvir, nocc, naux]).transpose([1, 2, 0]).into_contig(ColMajor); // [i, Q, a]
+            ybar
+        };
 
         // ── derivative-integral passes: shell batches over all atoms, atom scatter in-batch ──
         let mol_loc = mol.ao_loc();
@@ -436,10 +440,10 @@ impl<'a> RDHGradient<'a> {
                 let ip1_t2 = ip1_t.view().into_shape([naov, nub * naux * ncomp]);
                 let r = mol_loc[s0]..mol_loc[s1];
                 // u-slot (C0 on the atom rows) and v-slot (C1_dr / C0 swapped), t4 then RI term
-                t4_3c = add_fold_ip1_batched(ip1_t2.view(), nub, c0.i((r.clone(), ..)), c1_dr.view(), ybar_jk_u.view(), 2.0, t4_3c);
-                t4_3c = add_fold_ip1_batched(ip1_t2.view(), nub, c1_dr.i((r.clone(), ..)), c0.view(), ybar_jk_v.view(), 2.0, t4_3c);
-                ri_3c = add_fold_ip1_batched(ip1_t2.view(), nub, c0.i((r.clone(), ..)), cv.view(), ybar_ri_u.view(), -4.0, ri_3c);
-                ri_3c = add_fold_ip1_batched(ip1_t2.view(), nub, cv.i((r, ..)), c0.view(), ybar_ri_v.view(), -4.0, ri_3c);
+                t4_3c = add_fold_ip1_batched(ip1_t2.view(), nub, c0.i((r.clone(), ..)), c1_dr.view(), ybar_jk.view(), 2.0, t4_3c);
+                t4_3c = add_fold_ip1_batched_v(ip1_t2.view(), nub, c1_dr.i((r.clone(), ..)), c0.view(), ybar_jk.view(), 2.0, t4_3c);
+                ri_3c = add_fold_ip1_batched(ip1_t2.view(), nub, c0.i((r.clone(), ..)), cv.view(), ybar_ri.view(), -4.0, ri_3c);
+                ri_3c = add_fold_ip1_batched_v(ip1_t2.view(), nub, cv.i((r, ..)), c0.view(), ybar_ri.view(), -4.0, ri_3c);
             }
             ydd_sol_atoms.push(s_op.view() % ydd_raw.view());
             ydr_sol_atoms.push(s_op.view() % ydr_raw.view());
@@ -473,15 +477,22 @@ impl<'a> RDHGradient<'a> {
             let ip2_unp = ip2_2d.unpack_tri(Upper, FlagSymm::Sy); // [mu, nu, (q t)]
             let w1 = c0.view().t() % &ip2_unp; // [i, nu, (q t)]
             // the batched-matmul output stores the batch axis first; materialize standard
-            // col-major so the leading-(i m)/(i a) reshape pairs with the `Ȳ` rows
+            // col-major so the `(i, m)` / `(i, a)` axes pair with the partner's `[i, q, x]` slots
             let f_jk = (w1.view() % c1_dr.view()).into_contig(ColMajor); // [i, m, (q t)]
             let f_ri = (w1.view() % cv.view()).into_contig(ColMajor); // [i, a, (q t)]
-            let f_jk2 = f_jk.view().into_shape([nocc * nmo, nb_q * ncomp]);
-            let f_ri2 = f_ri.view().into_shape([nocc * nvir, nb_q * ncomp]);
             for t in 0..ncomp {
-                // `r_jk_q[q] = sum_{i m} F_jk[(i m), (q t)] Ȳ[(i m), q]` — contracted over (i m)
-                let r_jk_q = rt::vecdot(&f_jk2.i((.., t * nb_q..(t + 1) * nb_q)), ybar_y2.i((.., qa..qb)), 0);
-                let r_ri_q = rt::vecdot(&f_ri2.i((.., t * nb_q..(t + 1) * nb_q)), ybar_g2i.i((.., qa..qb)), 0);
+                // `r_jk_q[q] = sum_{i m} F_jk[i, m, (q t)] Ȳ[i, q, m]` — the partner is stored once,
+                // so the two contraction axes are paired individually (`(i m)` is not merged)
+                let r_jk_q = rt::vecdot(
+                    &ybar_jk.i((.., qa..qb, ..)),
+                    &f_jk.i((.., .., t * nb_q..(t + 1) * nb_q)).transpose([0, 2, 1]),
+                    ([0, 2], [0, 2]),
+                );
+                let r_ri_q = rt::vecdot(
+                    &ybar_ri.i((.., qa..qb, ..)),
+                    &f_ri.i((.., .., t * nb_q..(t + 1) * nb_q)).transpose([0, 2, 1]),
+                    ([0, 2], [0, 2]),
+                );
                 for atm in 0..natm {
                     let [_, _, auq0, auq1] = aux_slice[atm];
                     let (lo, hi) = (qa.max(auq0), qb.min(auq1));
@@ -709,7 +720,9 @@ fn to_matrix_full(tsr: Tsr<f64>) -> MatrixFull<f64> {
 }
 
 /// One ip1 derivative-integral pass on an AO-shell batch, reduced against the pre-contracted
-/// partner `Ȳ` (the metric solve is hoisted out of the atom loop).
+/// partner `Ȳ` (the metric solve is hoisted out of the atom loop). This is the `u` slot, where
+/// the atom-side weight contracts the partner's leading axis (`v` slot:
+/// [`add_fold_ip1_batched_v`]).
 ///
 /// Computes `acc[t] += factor sum_{u, Q, y} G[(u Q), y](t) K[(u Q), y]`, where the derivative
 /// fold `G[(u Q), y](t) = sum_v ip1_t2[v, (u Q t)] c_col[v, y]` and the partner fold
@@ -738,6 +751,43 @@ fn add_fold_ip1_batched(
         let blk = ip1_t2.i((.., t * nub * naux..(t + 1) * nub * naux));
         g_buf.view_mut().matmul_from(&blk.t(), &c_col, 1.0, 0.0);
         let s: f64 = rt::vecdot(&g_buf, &k2, -1).sum_all();
+        acc[t] += factor * s;
+    }
+    acc
+}
+
+/// [`add_fold_ip1_batched`] counterpart for the `v` slot, where the partner `Ȳ[i, Q, m]` is
+/// contracted over its slow `m` axis instead: the same two GEMMs are kept, but the partner
+/// enters on the left of a single `[nocc naux, nmo] % [nmo, nub]` fold while the full-AO-side
+/// fold is assembled from one `[y, naov] % [naov, naux]` GEMM per batch row `u` (each landing
+/// contiguously in the paired buffer). Both stay within the `u` slot's GEMM structure and the
+/// reduction remains a `rt::vecdot` over matching layouts, so no second partner layout is
+/// stored.
+fn add_fold_ip1_batched_v(
+    ip1_t2: TsrView<f64>, // [naov, nub naux ncomp]
+    nub: usize,
+    c_row: TsrView<f64>,  // [nub, x], the atom-side MO weight (contracted partner axis)
+    c_col: TsrView<f64>,  // [naov, y], the full-AO-side MO weight (partner's leading axis)
+    ybar: TsrView<f64>,   // [y, naux, x], pre-contracted partner in the single kept layout
+    factor: f64,
+    mut acc: [f64; 3],
+) -> [f64; 3] {
+    let device = ip1_t2.device().clone();
+    let naov = ip1_t2.shape()[0];
+    let naux = ip1_t2.shape()[1] / (nub * 3);
+    let x = c_row.shape()[1];
+    let y = c_col.shape()[1];
+    let mut k_buf: Tsr<f64> = rt::zeros(([y * naux, nub], &device));
+    k_buf.view_mut().matmul_from(&ybar.reshape([y * naux, x]), &c_row.t(), 1.0, 0.0);
+    let mut g_buf: Tsr<f64> = rt::zeros(([y, naux, nub], &device));
+    let c_col_t = c_col.t();
+    let ip1_t3 = ip1_t2.reshape([naov, nub, naux * 3]); // [naov, u, (Q t)]
+    for t in 0..3 {
+        for u in 0..nub {
+            let blk = ip1_t3.i((.., u, t * naux..(t + 1) * naux));
+            g_buf.i_mut((.., .., u)).matmul_from(&c_col_t, &blk, 1.0, 0.0);
+        }
+        let s: f64 = rt::vecdot(&k_buf, &g_buf.view().reshape([y * naux, nub]), 0).sum_all();
         acc[t] += factor * s;
     }
     acc
