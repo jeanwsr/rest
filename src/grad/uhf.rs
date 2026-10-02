@@ -256,7 +256,10 @@ impl RIUHFGradient<'_> {
             let tsr = self.scf_data.rimatr.as_ref().expect(msg);
             rt::asarray((&tsr.0.data, tsr.0.size, &device))
         };
-        let naux = ederi_utp.shape()[1];
+        // The auxiliary dimension of the *global* RI tensor. Under MPI the stored tensor holds
+        // only the column block of this rank (see `local_aux_function_range`), so the shape of
+        // `ederi_utp` is the local column count and must not be used as the auxiliary dimension.
+        let naux = mol_obj.num_auxbas;
 
         // Storage-level AO-pair pruning: the stored tensor holds the retained rows only, and every
         // contraction of the derivative runs over exactly those rows. The row set of the energy is
@@ -366,7 +369,15 @@ impl RIUHFGradient<'_> {
         let mut daux_j = rt::full(([], f64::NAN, &device));
         if self.flags.factor_j.is_some() {
             // the compacted tensor is contracted with the density on its own row space
-            itm_j = get_itm_j(&j2c_decomp, ederi_utp.view(), dm_tp_row.view());
+            itm_j = get_itm_j_columns(
+                    &j2c_decomp,
+                    ederi_utp.view(),
+                    dm_tp_row.view(),
+                    aux_fn0,
+                    aux_fn1,
+                    naux,
+                    &self.mpi_operator,
+            );
             dao_j = rt::zeros(([nao, 3], &device));
         }
         if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
@@ -378,8 +389,26 @@ impl RIUHFGradient<'_> {
         let mut daux_k = rt::full(([], f64::NAN, &device));
         if self.flags.factor_k.is_some() {
             itm_k_occtp = [
-                get_itm_k_occtp(&j2c_decomp, ederi_utp.view(), occ_coeff[0].view(), pair_map),
-                get_itm_k_occtp(&j2c_decomp, ederi_utp.view(), occ_coeff[1].view(), pair_map),
+                get_itm_k_occtp_columns(
+                    &j2c_decomp,
+                    ederi_utp.view(),
+                    occ_coeff[0].view(),
+                    pair_map,
+                    aux_fn0,
+                    aux_fn1,
+                    naux,
+                    &self.mpi_operator,
+                ),
+                get_itm_k_occtp_columns(
+                    &j2c_decomp,
+                    ederi_utp.view(),
+                    occ_coeff[1].view(),
+                    pair_map,
+                    aux_fn0,
+                    aux_fn1,
+                    naux,
+                    &self.mpi_operator,
+                ),
             ];
             dao_k = rt::zeros(([nao, 3], &device));
         }
@@ -513,8 +542,26 @@ impl RIUHFGradient<'_> {
 
             // temporaries for de_sraux
             let mut itm_k_occtp_sr = [
-                get_itm_k_occtp(&j2c_decomp_sr, ederi_utp_sr.view(), occ_coeff[0].view(), pair_map),
-                get_itm_k_occtp(&j2c_decomp_sr, ederi_utp_sr.view(), occ_coeff[1].view(), pair_map),
+                get_itm_k_occtp_columns(
+                    &j2c_decomp_sr,
+                    ederi_utp_sr.view(),
+                    occ_coeff[0].view(),
+                    pair_map,
+                    aux_fn0,
+                    aux_fn1,
+                    naux,
+                    &self.mpi_operator,
+                ),
+                get_itm_k_occtp_columns(
+                    &j2c_decomp_sr,
+                    ederi_utp_sr.view(),
+                    occ_coeff[1].view(),
+                    pair_map,
+                    aux_fn0,
+                    aux_fn1,
+                    naux,
+                    &self.mpi_operator,
+                ),
             ];
             dao_sr = rt::zeros(([nao, 3], &device));
             let itm_sr_aux = get_itm_k_aux(itm_k_occtp_sr[0].view_mut()) + get_itm_k_aux(itm_k_occtp_sr[1].view_mut());
