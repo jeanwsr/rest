@@ -120,14 +120,22 @@ fn test_parse_xc_fail() {
 
 #[test]
 fn test_parse_xc_vv10() {
-    let input1 = "wB97x-v";
-    let dfa = parse_and_derive(input1, 1, 0);
-    let (san,_) = dfa.check_sanity();
-    assert!(!san);
-    let input2 = "SCAN-VV10";
-    let dfa2 = parse_and_derive(input2, 1, 0);
-    let (san2,_) = dfa2.check_sanity();
-    assert!(!san2);
+    // wb97x-v parses into HYB_GGA_XC_WB97X_V (libxc 466) plus an explicit
+    // VV10 component; sanity must pass and the (b, C) parameters are taken
+    // from libxc and handed to the NLC evaluation.
+    let dfa = parse_and_derive("wB97x-v", 1, 0);
+    let (san, _) = dfa.check_sanity();
+    assert!(san);
+    let xc = dfa.to_dfa4rest();
+    assert_eq!(xc.dfa_compnt_scf, vec![466]);
+    assert_eq!(xc.nlc_vv10, Some((6.0, 0.01)));
+
+    // The VV10 flag on the libxc functional alone must not activate NLC:
+    // wb97x-d3bj keeps using D3 and must not carry a VV10 component.
+    let dfa_d3 = parse_and_derive("wb97x-d3bj", 1, 0);
+    let (san_d3, _) = dfa_d3.check_sanity();
+    assert!(san_d3);
+    assert_eq!(dfa_d3.to_dfa4rest().nlc_vv10, None);
 }
 
 #[test]
