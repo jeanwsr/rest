@@ -163,6 +163,15 @@ pub fn main_driver() -> anyhow::Result<()> {
     if mol.ctrl.print_level>=2 {
         println!("{}", mol.ctrl.formated_output_in_toml());
     }
+    // `[ctrl] num_threads` and `[ctrl] max_memory` are per-process values, so a hybrid
+    // MPI + threads job has to divide the cores and the memory of a node by the number of ranks
+    // placed on it. Warn once at startup when the requested thread count of all processes
+    // together exceeds what this node offers. Only the root rank reaches this point with a
+    // standard output (the other ranks are redirected to /dev/null above).
+    utilities::memory_batch::warn_thread_oversubscription(
+        mol.ctrl.num_threads,
+        mpi_operator.as_ref().map(|mpi_op| mpi_op.size),
+    );
     let mut time_mark = initialize_time_record(&mol);
     time_mark.count_start("Overall");
 

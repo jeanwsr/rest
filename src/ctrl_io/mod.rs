@@ -405,6 +405,13 @@ pub struct InputKeywords {
     #[pyo3(get, set)]
     pub bench_eps: bool,
     // Keywords for parallism
+    /// Number of threads of **this MPI process**, not of the node.
+    ///
+    /// Every rank is an independent process and builds its own global rayon pool (and sets the
+    /// OpenMP thread count of the BLAS behind it) to this value, so a node runs `num_threads`
+    /// times the number of ranks placed on it. For a hybrid MPI + threads run, set it to
+    /// `cores per node / ranks per node`. The default is 1, which serialises the parallel
+    /// regions of each process.
     #[pyo3(get, set)]
     pub num_threads: Option<usize>,
     // batch size for each thread
@@ -415,9 +422,17 @@ pub struct InputKeywords {
     pub force_state_occupation: Vec<ForceStateOccupation>,
     pub auxiliary_reference_states: Vec<(String,usize)>,
     pub rpa_de_excitation_parameters: Option<[f64;4]>,
-    /// Maximum memory available in MB, `None` if no limit.
-    /// This option is only for single-node computation, and only works in some cases where algorithm awares memory usage and perform batched computation.
-    /// For multi-node (MPI), this keyword is not fully discussed.
+    /// Maximum memory available to **this MPI process** in MB, `None` if no limit.
+    ///
+    /// The budget is consumed as `max_memory` minus the resident set of the current process
+    /// (`detect_used_memory_mb("proc")`), so under MPI every rank applies it to itself and a node
+    /// is allowed `max_memory` times the number of ranks placed on it. For a hybrid MPI + threads
+    /// run, set it to `memory per node / ranks per node` with some head room. When it is not set,
+    /// the batch decisions fall back to the available memory of the node, which every rank reads
+    /// as its own budget, so an explicit value is recommended whenever several ranks share a node.
+    ///
+    /// The keyword only works where the algorithm is aware of the memory usage and performs batched
+    /// computation, and it is not a hard cap: it feeds the batch sizes and the force-phase monitor.
     pub max_memory: Option<f64>,
     /// Back up of max_memory for the ISDF new driver (restored after ISDF preparation).
     #[pyo3(get, set)]
