@@ -1,5 +1,5 @@
 use crate::scf_io::SCF;
-use crate::constants::{AU2DEBYE, EV};
+use crate::constants::EV;
 use serde_json::json;
 use std::fs::File;
 use std::io::Write;
@@ -29,8 +29,8 @@ pub fn dump_json(scf_data: &SCF, extra: &std::collections::HashMap<String, serde
         }
     }
 
-    let dp_au = crate::post_scf_analysis::evaluate_dipole_moment(scf_data, None);
-    let dp_debye: Vec<f64> = dp_au.iter().map(|x| x * AU2DEBYE).collect();
+    // evaluate_dipole_moment already returns the dipole in debye
+    let dp_debye = crate::post_scf_analysis::evaluate_dipole_moment(scf_data, None);
     result["dipole_debye"] = json!(dp_debye);
 
     if !scf_data.gwqp.0.is_empty() {

@@ -140,6 +140,77 @@ pub fn build_ri_jk_grad_flags(scf_data: &SCF) -> RIHFGradientFlags {
     flags.build().unwrap()
 }
 
+/// Row space of a storage-level pruned in-core RI tensor, as seen by the derivative code.
+///
+/// When `[ctrl.ri_jk] pair_screen_threshold` is positive, `rimatr` stores the retained AO-pair
+/// rows only and `SCF::rimatr_pair_map` describes them. The pruned energy is the energy of a tensor
+/// whose dropped rows are zero at *every* geometry, because the row set is decided once per
+/// geometry and then frozen, so its derivative never contracts a dropped row. Three projections
+/// express that:
+///
+/// - [`RIMatrRowSpace::project_packed`] keeps the stored rows of a packed quantity, for the
+///   contractions against the compacted tensor itself (`get_itm_j`).
+/// - [`RIMatrRowSpace::mask_packed`] zeroes the dropped rows of a full-length packed quantity, for
+///   the contractions against a full-space derivative integral (`int3c2e_ip2`).
+/// - [`RIMatrRowSpace::mask_ao`] zeroes the dropped pairs of an AO matrix, for the contractions
+///   that run over the square AO-pair space (`int3c2e_ip1`) and for the exchange intermediate
+///   that weights them.
+///
+/// Without a map (the default, `pair_screen_threshold = 0`) none of this is built and the
+/// full-space code path is untouched.
+pub struct RIMatrRowSpace {
+    /// full packed pair indices of the stored rows, ascending
+    kept: Vec<usize>,
+    /// full packed pair space, 1.0 on a stored row and 0.0 on a dropped one
+    pub packed_mask: Tsr<f64>,
+    /// `[nao, nao]`, 1.0 on a stored pair (both triangles) and 0.0 on a dropped one
+    pub ao_mask: Tsr<f64>,
+}
+
+impl RIMatrRowSpace {
+    pub fn new(nao: usize, map: &ri_jk::PairMap, device: &DeviceBLAS) -> Self {
+        let kept = map.kept_indices();
+        let num_baspar = map.num_baspar_full();
+        let mut packed = vec![0.0_f64; num_baspar];
+        for &p in kept.iter() {
+            packed[p] = 1.0;
+        }
+        let mut ao = vec![0.0_f64; nao * nao];
+        for &[mu, nu] in map.rows.iter() {
+            let (i, j) = (mu as usize, nu as usize);
+            ao[i * nao + j] = 1.0;
+            ao[j * nao + i] = 1.0;
+        }
+        RIMatrRowSpace {
+            kept,
+            packed_mask: rt::asarray((packed, [num_baspar], device)),
+            ao_mask: rt::asarray((ao, [nao, nao], device)),
+        }
+    }
+
+    /// Number of stored rows.
+    pub fn len(&self) -> usize {
+        self.kept.len()
+    }
+
+    /// Packed quantity restricted to the stored rows, in stored-row order.
+    pub fn project_packed(&self, packed_full: &Tsr<f64>) -> Tsr<f64> {
+        let data = packed_full.clone().into_raw();
+        let projected = self.kept.iter().map(|&p| data[p]).collect::<Vec<f64>>();
+        rt::asarray((projected, [self.kept.len()], self.packed_mask.device()))
+    }
+
+    /// Full-length packed quantity with the dropped rows zeroed.
+    pub fn mask_packed(&self, packed_full: &Tsr<f64>) -> Tsr<f64> {
+        packed_full * &self.packed_mask
+    }
+
+    /// AO matrix with the dropped pairs zeroed.
+    pub fn mask_ao(&self, dm: TsrView<f64>) -> Tsr<f64> {
+        dm * &self.ao_mask
+    }
+}
+
 impl RIRHFGradient<'_> {
     pub fn new<'a>(scf_data: &'a SCF, mpi_operator: &'a Option<crate::mpi_io::MPIOperator>) -> RIRHFGradient<'a> {
         // check SCF type
@@ -232,6 +303,10 @@ impl RIRHFGradient<'_> {
         time_records.new_item("de-jk batch 7", "de-jk 7 batch (get_grad_dao_k_int3c2e_ip1, rsh)");
         time_records.new_item("de-jk batch 8", "de-jk 8 batch (get_grad_daux_k_int3c2e_ip2, rsh)");
 
+        // peak-attribution probe of the analytic gradient (REST_MEM_PROBE=1 or print_level >= 3)
+        let mem_probe_on = mem_probe_enabled(self.scf_data.mol.ctrl.print_level);
+        mem_probe("calc_de_jk: enter", mem_probe_on);
+
         time_records.count_start("de-jk prepr 1");
 
         let mol_obj = &self.scf_data.mol;
@@ -259,6 +334,38 @@ impl RIRHFGradient<'_> {
         };
         let naux = ederi_utp.shape()[1];
 
+        // Storage-level AO-pair pruning: the stored tensor holds the retained rows only, and every
+        // contraction of the derivative runs over exactly those rows. The row set of the energy is
+        // the row set of its derivative, because the dropped rows are zero at every geometry.
+        let pair_map = self.scf_data.rimatr_pair_map.as_ref();
+        if let Some(map) = pair_map {
+            assert_eq!(
+                map.len(),
+                ederi_utp.shape()[0],
+                "the stored RI tensor and its pair map disagree on the number of stored rows"
+            );
+        }
+        let row_space = pair_map.map(|map| RIMatrRowSpace::new(nao, map, &device));
+        // packed density on the stored rows, for the contractions against the compacted tensor
+        let dm_tp_row = match &row_space {
+            Some(rows) => rows.project_packed(&dm_tp),
+            None => dm_tp.clone(),
+        };
+        // packed density on the full pair space of the derivative integrals, dropped rows zeroed
+        let dm_tp_masked = match &row_space {
+            Some(rows) => rows.mask_packed(&dm_tp),
+            None => dm_tp.clone(),
+        };
+        // AO density on the square pair space of int3c2e_ip1, dropped pairs zeroed
+        let dm_ao = match &row_space {
+            Some(rows) => rows.mask_ao(dm.view()),
+            None => dm.clone(),
+        };
+        let (ao_pair_mask, packed_pair_mask) = match &row_space {
+            Some(rows) => (Some(&rows.ao_mask), Some(&rows.packed_mask)),
+            None => (None, None),
+        };
+
         // tsr_int2c2e_l: J^-1/2
         let j2c_decomp_option = self.scf_data.mol.ctrl.j2c_decomp;
         let j2c_decomp = ri_jk::get_j2c_decomp(&aux, &device, j2c_decomp_option);
@@ -274,8 +381,18 @@ impl RIRHFGradient<'_> {
 
         // available memory in MB, if not set, will be calculated from system
         let mem_avail = self.flags.max_memory.map(|max_memory| max_memory - detect_used_memory_mb("proc"));
-        let aux_batch_size = calc_batch_size::<f64>(8 * nao * nao, mem_avail, None, Some(naux * nocc * nocc));
-        let aux_batch_size = aux_batch_size.min(216);
+        let aux_batch_raw = calc_batch_size::<f64>(8 * nao * nao, mem_avail, None, Some(naux * nocc * nocc));
+        // `calc_batch_size` 在预算耗尽时下限是 1，会让下面的循环退化成「每个辅助壳一批」
+        // （上千次小积分）。这里保底 MIN_AUX_BATCH_FUNCS 个函数并给出告警：预算不足时
+        // 允许内存稍微超一点，而不是让墙钟爆掉。
+        const MIN_AUX_BATCH_FUNCS: usize = 16;
+        let aux_batch_size = aux_batch_raw.clamp(MIN_AUX_BATCH_FUNCS, 216);
+        if aux_batch_raw < MIN_AUX_BATCH_FUNCS && self.flags.print_level >= 1 {
+            println!(
+                "[WARN] the memory budget allows only {} auxiliary basis functions per derivative batch, raised to {} (nao = {}). Raise [ctrl] max_memory or expect a higher peak.",
+                aux_batch_raw, aux_batch_size, nao
+            );
+        }
 
         // ── MPI: restrict the 3c-2e integral batches to this rank's local
         // slice of the auxiliary basis (same deterministic distribution as
@@ -308,6 +425,7 @@ impl RIRHFGradient<'_> {
         let (aux_span0, aux_span1) = (aux_loc[aux_shl0], aux_loc[aux_shl1]);
 
         time_records.count("de-jk prepr 1");
+        mem_probe("de-jk prepr 1 done (rimatr, j2c, int2c2e_ip1)", mem_probe_on);
 
         // basic setup finished
         // begin hybrid computation
@@ -319,7 +437,8 @@ impl RIRHFGradient<'_> {
         let mut dao_j = rt::full(([], f64::NAN, &device));
         let mut daux_j = rt::full(([], f64::NAN, &device));
         if self.flags.factor_j.is_some() {
-            itm_j = get_itm_j(&j2c_decomp, ederi_utp.view(), dm_tp.view());
+            // the compacted tensor is contracted with the density on its own row space
+            itm_j = get_itm_j(&j2c_decomp, ederi_utp.view(), dm_tp_row.view());
             dao_j = rt::zeros(([nao, 3], &device));
         }
         if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
@@ -330,7 +449,7 @@ impl RIRHFGradient<'_> {
         let mut dao_k = rt::full(([], f64::NAN, &device));
         let mut daux_k = rt::full(([], f64::NAN, &device));
         if self.flags.factor_k.is_some() {
-            itm_k_occtp = get_itm_k_occtp(&j2c_decomp, ederi_utp.view(), weighted_occ_coeff.view());
+            itm_k_occtp = get_itm_k_occtp(&j2c_decomp, ederi_utp.view(), weighted_occ_coeff.view(), pair_map);
             dao_k = rt::zeros(([nao, 3], &device));
         }
         if self.flags.factor_k.is_some() && self.flags.auxbasis_response {
@@ -339,7 +458,9 @@ impl RIRHFGradient<'_> {
         }
 
         time_records.count("de-jk prepr 2");
+        mem_probe("de-jk prepr 2 done (itm_j, itm_k_occtp, daux seeds)", mem_probe_on);
 
+        let mut batch_probe_left = 2usize;
         for [shl0, shl1] in local_aux_partition.clone() {
             let shl_slices = [[0, mol.nbas()], [0, mol.nbas()], [shl0, shl1]];
             let (p0, p1) = (aux_loc[shl0], aux_loc[shl1]);
@@ -361,16 +482,23 @@ impl RIRHFGradient<'_> {
                 };
             }
             time_records.count("de-jk batch int");
+            if batch_probe_left > 0 {
+                mem_probe(
+                    &format!("int3c2e_ip1/ip2 built for aux shells {}..{}", shl0, shl1),
+                    mem_probe_on,
+                );
+                batch_probe_left -= 1;
+            }
 
             if self.flags.factor_j.is_some() {
                 time_records.count_start("de-jk batch 1");
-                *&mut dao_j += get_grad_dao_j_int3c2e_ip1(tsr_int3c2e_ip1.view(), dm.view(), itm_j.i(p0..p1));
+                *&mut dao_j += get_grad_dao_j_int3c2e_ip1(tsr_int3c2e_ip1.view(), dm_ao.view(), itm_j.i(p0..p1));
                 time_records.count("de-jk batch 1");
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 2");
                     *&mut daux_j.i_mut(p0..p1) +=
-                        get_grad_daux_j_int3c2e_ip2(tsr_int3c2e_ip2.view(), dm_tp.view(), itm_j.i(p0..p1));
+                        get_grad_daux_j_int3c2e_ip2(tsr_int3c2e_ip2.view(), dm_tp_masked.view(), itm_j.i(p0..p1));
                     time_records.count("de-jk batch 2");
                 }
             }
@@ -381,12 +509,17 @@ impl RIRHFGradient<'_> {
                 time_records.count("de-jk batch 3");
 
                 time_records.count_start("de-jk batch 4");
-                *&mut dao_k += get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1.view(), itm_k_ao.view());
+                *&mut dao_k +=
+                    get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1.view(), itm_k_ao.view(), ao_pair_mask);
                 time_records.count("de-jk batch 4");
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 5");
-                    *&mut daux_k.i_mut(p0..p1) += get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_k_ao.view());
+                    *&mut daux_k.i_mut(p0..p1) += get_grad_daux_k_int3c2e_ip2(
+                        tsr_int3c2e_ip2.view(),
+                        itm_k_ao.view(),
+                        packed_pair_mask,
+                    );
                     time_records.count("de-jk batch 5");
                 }
             }
@@ -434,6 +567,15 @@ impl RIRHFGradient<'_> {
                 let tsr = ederi_utp_rimatr_sr;
                 rt::asarray((&tsr.0.data, tsr.0.size, &device))
             };
+            // the short-range tensor of a range-separated hybrid shares the row space of the
+            // full-range one, which is the map the SCF compacted both onto
+            if let Some(map) = pair_map {
+                assert_eq!(
+                    map.len(),
+                    ederi_utp_sr.shape()[0],
+                    "the stored short-range RI tensor and the pair map of the full-range one disagree"
+                );
+            }
 
             // regenerate essential cheap integrals
             let j2c_decomp_option = self.scf_data.mol.ctrl.j2c_decomp;
@@ -447,7 +589,8 @@ impl RIRHFGradient<'_> {
             time_records.count_start("de-jk prepr 3");
 
             // temporaries for de_sraux
-            let mut itm_r_occtp = get_itm_k_occtp(&j2c_decomp_sr, ederi_utp_sr.view(), weighted_occ_coeff.view());
+            let mut itm_r_occtp =
+                get_itm_k_occtp(&j2c_decomp_sr, ederi_utp_sr.view(), weighted_occ_coeff.view(), pair_map);
             dao_sr = rt::zeros(([nao, 3], &device));
             let itm_sr_aux = get_itm_k_aux(itm_r_occtp.view_mut());
             daux_sr = get_grad_daux_k_int2c2e_ip1(tsr_int2c2e_ip1.view(), itm_sr_aux.view());
@@ -482,12 +625,17 @@ impl RIRHFGradient<'_> {
                 time_records.count("de-jk batch 6");
 
                 time_records.count_start("de-jk batch 7");
-                *&mut dao_sr += get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1.view(), itm_r_ao.view());
+                *&mut dao_sr +=
+                    get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1.view(), itm_r_ao.view(), ao_pair_mask);
                 time_records.count("de-jk batch 7");
 
                 if self.flags.auxbasis_response {
                     time_records.count_start("de-jk batch 8");
-                    *&mut daux_sr.i_mut(p0..p1) += get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2.view(), itm_r_ao.view());
+                    *&mut daux_sr.i_mut(p0..p1) += get_grad_daux_k_int3c2e_ip2(
+                        tsr_int3c2e_ip2.view(),
+                        itm_r_ao.view(),
+                        packed_pair_mask,
+                    );
                     time_records.count("de-jk batch 8");
                 }
 
@@ -623,6 +771,7 @@ impl RIRHFGradient<'_> {
             flag.then(|| self.result.insert(key.into(), de_part));
         }
 
+        mem_probe("calc_de_jk: done", mem_probe_on);
         return self;
     }
 
@@ -996,8 +1145,15 @@ pub fn get_grad_dao_ovlp(tsr_int1e_ipovlp: TsrView<f64>, dme0: TsrView<f64>) -> 
     return 2.0 * (tsr_int1e_ipovlp * dme0.i((.., .., None))).sum_axes(1);
 }
 
+/// `dm_tp` is the packed density on the row space of `ederi_utp`: the full pair space of an
+/// unpruned tensor, the stored rows of a storage-level pruned one (see [`RIMatrRowSpace`]).
 pub fn get_itm_j(j2c_decomp: &J2CDecompose, ederi_utp: TsrView<f64>, dm_tp: TsrView<f64>) -> Tsr<f64> {
     // see module level documentation for details
+    assert_eq!(
+        dm_tp.shape()[0],
+        ederi_utp.shape()[0],
+        "the density and the decomposed ERI must live on the same AO-pair row space"
+    );
     return get_solved_j3c(dm_tp % ederi_utp, j2c_decomp, true);
 }
 
@@ -1046,18 +1202,36 @@ pub fn get_itm_k_occtp(
     j2c_decomp: &J2CDecompose,
     ederi_utp: TsrView<f64>,
     weighted_occ_coeff: TsrView<f64>,
+    map: Option<&ri_jk::PairMap>,
 ) -> Tsr<f64> {
     // see module level documentation for details
     assert!(ederi_utp.f_prefer());
     assert!(weighted_occ_coeff.f_prefer());
 
+    let nao = weighted_occ_coeff.shape()[0];
     let nocc = weighted_occ_coeff.shape()[1];
     let naux = ederi_utp.shape()[1];
     let nocc_tp = nocc * (nocc + 1) / 2;
     let device = ederi_utp.device().clone();
     let tmp: Tsr<f64> = unsafe { rt::empty(([nocc_tp, naux], &device)) };
     (0..naux).into_par_iter().for_each(|p| {
-        let ederi_bb = ederi_utp.i((.., p)).unpack_triu(FlagSymm::Sy);
+        let ederi_bb = match map {
+            // the packed column of an unpruned tensor zips straight onto the upper triangle
+            None => ederi_utp.i((.., p)).unpack_triu(FlagSymm::Sy),
+            // a storage-level pruned tensor stores the retained rows only. The map carries their
+            // (mu, nu) and the dropped pairs stay zero, which is exactly the truncation that the
+            // energy contraction applies, so the derivative and the energy see one tensor.
+            Some(map) => {
+                let mut ederi_bb: Tsr<f64> = rt::zeros(([nao, nao], &device));
+                for (row, &[mu, nu]) in map.rows.iter().enumerate() {
+                    let (i, j) = (mu as usize, nu as usize);
+                    let value = ederi_utp[[row, p]];
+                    ederi_bb[[i, j]] = value;
+                    ederi_bb[[j, i]] = value;
+                }
+                ederi_bb
+            },
+        };
         let ederi_oo = weighted_occ_coeff.t() % ederi_bb % &weighted_occ_coeff;
 
         let mut tmp = unsafe { tmp.force_mut() };
@@ -1117,7 +1291,13 @@ pub fn get_grad_daux_k_int2c2e_ip1(tsr_int2c2e_ip1: TsrView<f64>, itm_k_aux: Tsr
     return (tsr_int2c2e_ip1 * itm_k_aux.i((.., .., None))).sum_axes(1);
 }
 
-pub fn get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1: TsrView<f64>, itm_k_ao: TsrView<f64>) -> Tsr<f64> {
+/// `pair_mask` is the symmetric AO-pair mask of a storage-level pruned RI tensor: the derivative
+/// of the pruned energy never contracts a dropped pair, so the mask zeroes it out of the sum.
+pub fn get_grad_dao_k_int3c2e_ip1(
+    tsr_int3c2e_ip1: TsrView<f64>,
+    itm_k_ao: TsrView<f64>,
+    pair_mask: Option<&Tsr<f64>>,
+) -> Tsr<f64> {
     // see module level documentation for details
     assert!(tsr_int3c2e_ip1.f_prefer());
     assert!(itm_k_ao.f_prefer());
@@ -1130,14 +1310,25 @@ pub fn get_grad_dao_k_int3c2e_ip1(tsr_int3c2e_ip1: TsrView<f64>, itm_k_ao: TsrVi
     (0..naux).into_par_iter().for_each(|p| {
         let mut tmp = unsafe { tmp.force_mut() };
         for t in 0..3 {
-            tmp.i_mut((.., t, p))
-                .assign(-2.0 * (tsr_int3c2e_ip1.i((.., .., p, t)) * itm_k_ao.i((.., .., p))).sum_axes(1));
+            let prod = tsr_int3c2e_ip1.i((.., .., p, t)) * itm_k_ao.i((.., .., p));
+            // the derivative of a storage-level pruned tensor never contracts a dropped pair
+            let prod = match pair_mask {
+                Some(mask) => prod * mask,
+                None => prod,
+            };
+            tmp.i_mut((.., t, p)).assign(-2.0 * prod.sum_axes(1));
         }
     });
     return tmp.sum_axes(-1);
 }
 
-pub fn get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2: TsrView<f64>, itm_k_ao: TsrView<f64>) -> Tsr<f64> {
+/// `packed_mask` is the packed AO-pair mask of a storage-level pruned RI tensor, in the same row
+/// order as the packed column of the derivative integral.
+pub fn get_grad_daux_k_int3c2e_ip2(
+    tsr_int3c2e_ip2: TsrView<f64>,
+    itm_k_ao: TsrView<f64>,
+    packed_mask: Option<&Tsr<f64>>,
+) -> Tsr<f64> {
     // see module level documentation for details
     assert!(tsr_int3c2e_ip2.f_prefer());
     assert!(itm_k_ao.f_prefer());
@@ -1154,6 +1345,11 @@ pub fn get_grad_daux_k_int3c2e_ip2(tsr_int3c2e_ip2: TsrView<f64>, itm_k_ao: TsrV
             let idx = (u + 2) * (u + 1) / 2 - 1;
             itm_k_ao_p[[idx]] *= 0.5;
         }
+        // the derivative of a storage-level pruned tensor never contracts a dropped pair
+        let itm_k_ao_p = match packed_mask {
+            Some(mask) => itm_k_ao_p * mask,
+            None => itm_k_ao_p,
+        };
         let tmp = -2.0 * (itm_k_ao_p % tsr_int3c2e_ip2.i((.., p)));
 
         let mut daux_k_int3c2e_ip2 = unsafe { daux_k_int3c2e_ip2.force_mut() };

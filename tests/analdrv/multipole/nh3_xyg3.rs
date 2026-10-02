@@ -1,11 +1,10 @@
 //! XYG3 (xDH double hybrid) multipole moments of NH3 (def2-TZVP), driving the `RMultipoleDH`
 //! evaluator with the `RGFockDH` composite and the `RRespSCF` response object.
 //!
-//! Dipole decomposition reference values are those recorded by
-//! `local-runs/260910-xyg3/xyg3_dipole_contribs.py` (pyscf-forge master @ 0566d43, pyscf 2.14.0)
-//! and already asserted contribution-by-contribution in `tests/analdrv/response/xyg3_rgfock.rs`;
-//! the quadrupole SCF-density reference is from `local-runs/260911-multipole/gen_refs.py`
-//! (pyscf 2.14.0, B3LYP RI-JK). The correlation/response quadrupole increments have no external
+//! Dipole decomposition reference values are those obtained with pyscf-forge DFDH (master
+//! @ 0566d43, pyscf 2.14.0), already asserted contribution-by-contribution in
+//! `tests/analdrv/response/xyg3_rgfock.rs`; the quadrupole SCF-density reference is from pyscf
+//! 2.14.0 (B3LYP RI-JK). The correlation/response quadrupole increments have no external
 //! reference yet and are printed only.
 
 use pyrest::analdrv::config::AnalDrvConfig;

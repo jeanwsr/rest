@@ -29,6 +29,7 @@ pub mod ao2mo;
 pub mod decompose;
 pub mod direct;
 pub mod incore;
+pub mod pair_screened_rij;
 pub mod schwartz_rij;
 
 // hessian implementations
@@ -37,6 +38,10 @@ pub mod hess_u;
 
 // response implementations
 pub mod resp_r;
+pub mod resp_u;
+
+// response-specific auxiliary basis (`resp_auxbas_path`)
+pub mod resp_auxbas;
 
 // generalized fock implementations
 pub mod gfock_r;
@@ -46,6 +51,7 @@ pub use ao2mo::*;
 pub use decompose::*;
 pub use direct::*;
 pub use incore::*;
+pub use pair_screened_rij::*;
 pub use pure_ao2mo::*;
 pub use pure_decompose::*;
 pub use pure_direct::*;

@@ -1,6 +1,6 @@
 //! SCF-level (B3LYP, RI-JK) multipole moments of an asymmetric H2O (def2-TZVP), verified against
-//! pyscf (`local-runs/260911-multipole/gen_refs.py`, pyscf 2.14.0, RI-JK with
-//! def2-universal-jkfit). Tolerances carry the REST/pyscf grid differences (~1e-5).
+//! pyscf (2.14.0, RI-JK with def2-universal-jkfit). Tolerances carry the REST/pyscf grid
+//! differences (~1e-5).
 
 use pyrest::analdrv::multipole::rmultipole::RMultipoleDH;
 use pyrest::ctrl_io;

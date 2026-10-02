@@ -470,8 +470,10 @@ impl BasCell {
 
 /// produce the value of cartesian gaussian-type orbital "gau(a,l,c)" in a given coordinate "r=(x,y,z)"
 ///
+/// ```text
 ///       gau(a,l,c) = Norm*x^{lx}*y^{ly}*z^{lz}*exp[-a*r^2],
 ///                  = Norm*Fang*exp[-a*r^2],
+/// ```
 ///
 /// The GTO is normalized with the normalization factor "Norm" as
 ///

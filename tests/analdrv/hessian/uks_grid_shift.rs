@@ -4,6 +4,7 @@
 
 use pyrest::analdrv::config::{AnalDrvConfig, AnalDrvNucgradCfg};
 use pyrest::analdrv::hessian::uscf_interface::uscf_hess_interface;
+use pyrest::analdrv::response::uresp_interface::uscf_resp_interface;
 use pyrest::ctrl_io;
 use pyrest::molecule_io::Molecule;
 use pyrest::scf_io::{self, scf_without_build};
@@ -69,7 +70,8 @@ fn run_scf(input: &str) -> scf_io::SCF {
 }
 
 fn run_hessian(scf_data: &mut scf_io::SCF, config: &AnalDrvConfig) -> Tensor<f64, DeviceBLAS> {
-    let (de, _, _) = uscf_hess_interface(scf_data, &config.nucgrad, &config.resp);
+    let mut resp_obj = uscf_resp_interface(scf_data, config);
+    let (de, _, _) = uscf_hess_interface(scf_data, &config.nucgrad, &mut resp_obj);
     let natm = 4;
     rt::asarray((de, [3, 3, natm, natm], &DeviceBLAS::default()))
 }

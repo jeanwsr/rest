@@ -730,8 +730,10 @@ fn compute_solver_aux(
     let K_ipiv = &pstatic.K_ipiv;
 
     // vk1 = K^{-T} · v_grids
-    let vk1 = solve_lu_transpose(K, K_ipiv, v_grids)
-        .expect("compute_solver_aux: solve_lu_transpose failed");
+    let vk1 = solve_lu_transpose(K, K_ipiv, v_grids).unwrap_or_else(|| panic!(
+        "compute_solver_aux: solve_lu_transpose failed — K is singular (method={}, ngrids={})",
+        method, ngrids
+    ));
 
     // Sq = S · q_sym   (BLAS: S[n,n] × q_sym[n,1] → [n,1])
     let sq = _dgemm_scaled(&pstatic.S, 'N', q_sym, 'N', 1.0);

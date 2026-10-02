@@ -506,7 +506,10 @@ pub fn solve_lu(a: &MatrixFull<f64>, a_ipiv: &Vec<i32>, b: &[f64]) -> Option<Vec
             sum += a[(i,j)] * x[j];
         }
         if a[(i,i)].abs() < 1e-15 {
-            println!("Singular matrix detected at diagonal element {}", i);
+            println!(
+                "Singular matrix detected in solve_lu: n={}, pivot index={}, |U_ii|={:10.3e} (< 1e-15)",
+                n, i, a[(i,i)].abs()
+            );
             return None;
         }
         x[i] = (x[i] - sum) / a[(i,i)];
@@ -531,7 +534,13 @@ pub fn solve_lu_transpose(
         for j in 0..i {
             sum += lu[(j, i)] * x[j];
         }
-        if lu[(i, i)].abs() < 1e-15 { return None; }
+        if lu[(i, i)].abs() < 1e-15 {
+            println!(
+                "Singular matrix detected in solve_lu_transpose: n={}, pivot index={}, |U_ii|={:10.3e} (< 1e-15)",
+                n, i, lu[(i, i)].abs()
+            );
+            return None;
+        }
         x[i] = (x[i] - sum) / lu[(i, i)];
     }
 

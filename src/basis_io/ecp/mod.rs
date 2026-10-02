@@ -217,7 +217,9 @@ fn evaluate_gp_matrix(gp_matr: &mut MatrixUpper<f64>,
 
 #[test]
 fn test_parse_gp() {
-    //"position": [[0.0, 0.0, 0.0]],
+    // The exponents and coefficients arrive as strings in the BasisSetExchange JSON, so the
+    // fixture must go through the `Raw` path (`parse_gp_from_string`), not be deserialized
+    // straight into `GhostPotential` whose fields are numeric.
     let cont = r#"{
         "potentials": [
           {
@@ -230,9 +232,12 @@ fn test_parse_gp() {
           }
         ]
         }"#.to_string();
-    let raw:Value = serde_json::from_str(&cont[..]).unwrap();
-    println!("debug raw: {:?}", raw);
-    let dd: GhostPotential = serde_json::from_value(raw).unwrap();
-    println!("{:?}", dd);
+    let gp = parse_gp_from_string(cont).unwrap();
+    assert_eq!(gp.potentials.len(), 1);
+    assert_eq!(gp.potentials[0].angular_momentum, vec![0]);
+    assert_eq!(gp.potentials[0].r_exponents, vec![0]);
+    assert_eq!(gp.potentials[0].gaussian_exponents, vec![0.0]);
+    assert_eq!(gp.potentials[0].coefficients, vec![vec![0.0]]);
+    assert!(gp.position.is_none());
 }
 

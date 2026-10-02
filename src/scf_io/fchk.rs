@@ -8,6 +8,7 @@ use crate::external_libs::py2fch;
 use crate::scf_io::SCF;
 use crate::scf_io::SCFType;
 use crate::x2c::RelativisticMethod;
+use tensors::MatrixFull;
 
 
 macro_rules! dump_real_r2f {
@@ -47,6 +48,13 @@ impl SCF {
         println!("\nSave fch file");
         self.create_fchk_head();
         self.fchk_write_mo();
+        // the DH density dump (see `SCF::dh_rdm1_resp`)
+        if let Some(sections) = self.dh_rdm1_resp.as_ref() {
+            let labels = ["Total MP2 Density", "Spin MP2 Density"];
+            for (label, dm) in labels.iter().zip(sections.iter()) {
+                self.fchk_append_density_ao(label, dm);
+            }
+        }
     }
 
     pub fn create_fchk_head(&self) {
@@ -357,29 +365,29 @@ impl SCF {
         }
         // leave MOs blank, it will be written by librest2fch
         let n_dm = nbf*(nbf+1)/2;
-        // Total SCF density: real data for restricted closed-shell calculations (the
-        // lower-triangular, column-packed AO density, permuted to Gaussian's AO order so it
-        // agrees with the MO coefficients written by librest2fch); a zero placeholder
-        // elsewhere (librest2fch only requires the section header to exist). librest2fch
-        // copies the section content verbatim when regenerating the MO coefficients.
-        //
-        // NOTE: the unrestricted (`spin_channel == 2`) case still writes the zero placeholder;
-        // dumping real alpha/beta ("Total SCF Density" plus spin-polarized sections in
-        // Gaussian's convention) is left as future work.
-        let mut packed_dm = vec![0.0f64; n_dm];
-        if self.mol.spin_channel == 1 {
-            let dm = &self.density_matrix[0];
-            let perm = self.gaussian_ao_permutation();
-            let mut i_index = 0;
-            for j in 0..nbf {
-                for i in 0..=j {
-                    packed_dm[i_index] = dm.data[perm[i] + perm[j] * nbf];
-                    i_index += 1;
-                }
-            }
-        }
+        // Total SCF density: the lower-triangular, column-packed AO density, permuted to
+        // Gaussian's AO order so it agrees with the MO coefficients written by librest2fch. For
+        // open-shell UHF runs the alpha/beta split is written in Gaussian's convention as
+        // `Total SCF Density` (alpha + beta) plus `Spin SCF Density` (alpha - beta); a zero
+        // placeholder is kept for ROHF (its fractional occupations have no alpha/beta split).
+        // librest2fch only requires the section header to exist and copies the section content
+        // verbatim when regenerating the MO coefficients.
+        let packed_dm = match self.scftype {
+            SCFType::UHF => {
+                let dm_total = self.density_matrix[0].clone() + self.density_matrix[1].clone();
+                self.fchk_pack_density_ao(&dm_total)
+            },
+            _ if self.mol.spin_channel == 1 => self.fchk_pack_density_ao(&self.density_matrix[0]),
+            _ => vec![0.0f64; n_dm],
+        };
         write!(input, "Total SCF Density                          R   N={:12}\n", n_dm);
         dump_real_r2f!(input, packed_dm);
+        if let SCFType::UHF = self.scftype {
+            let dm_spin = self.density_matrix[0].clone() - self.density_matrix[1].clone();
+            let packed_spin = self.fchk_pack_density_ao(&dm_spin);
+            write!(input, "Spin SCF Density                           R   N={:12}\n", n_dm);
+            dump_real_r2f!(input, packed_spin);
+        }
         input.sync_all().unwrap();
     }
 
@@ -455,6 +463,33 @@ impl SCF {
         write!(input, "{label:<43}R   N={:12}\n", packed_lower.len());
         dump_real_r2f!(input, packed_lower);
         input.sync_all().unwrap();
+    }
+
+    /// Permute an AO-basis density matrix into Gaussian's AO order (consistent with the MO
+    /// coefficients of the same fchk file) and pack its lower triangle by column — the layout
+    /// of the fchk density sections (same as `Total SCF Density`).
+    fn fchk_pack_density_ao(&self, dm_ao: &MatrixFull<f64>) -> Vec<f64> {
+        let nbf = dm_ao.size[0];
+        assert_eq!(dm_ao.size[1], nbf, "The packed AO density must be square.");
+        let perm = self.gaussian_ao_permutation();
+        assert_eq!(perm.len(), nbf, "AO permutation size mismatch.");
+        let mut packed = Vec::with_capacity(nbf * (nbf + 1) / 2);
+        for pj in 0..nbf {
+            let j = perm[pj];
+            for pi in 0..=pj {
+                packed.push(dm_ao.data[perm[pi] + j * nbf]);
+            }
+        }
+        packed
+    }
+
+    /// Append a symmetric AO-basis density as the Gaussian fchk density section `label`
+    /// (e.g. `Total MP2 Density`): the density is permuted into Gaussian's AO order, packed
+    /// lower-triangular by column and appended through [`SCF::fchk_append_density_section`]
+    /// (which documents the file/label requirements).
+    pub fn fchk_append_density_ao(&self, label: &str, dm_ao: &MatrixFull<f64>) {
+        let packed = self.fchk_pack_density_ao(dm_ao);
+        self.fchk_append_density_section(label, &packed);
     }
 
 }

@@ -302,7 +302,7 @@ pub fn get_K_R_f(surface: &SurfaceVdwGaussian, method: PcmMethod, epsilon: f64) 
     }
     //let A_matr = MatrixFull::from_vec([ngrids, 1], A.clone()).unwrap();
 
-    match method {
+    let (K, R, f_epsilon, K_ipiv, K_initial) = match method {
         PcmMethod::CPCM => {
             let f_epsilon = (epsilon - 1.0) / epsilon;
             let mut K_initial = S.clone();
@@ -354,6 +354,34 @@ pub fn get_K_R_f(surface: &SurfaceVdwGaussian, method: PcmMethod, epsilon: f64) 
             let (K, K_ipiv) = K_initial.clone().to_matrixfullslicemut().lapack_dgetrf_full().unwrap();
             (K, R, f_epsilon, K_ipiv, K_initial)
         },
+    };
+    warn_if_near_singular(&K, method);
+    (K, R, f_epsilon, K_ipiv, K_initial)
+}
+
+/// Warn when the LU-factored PCM matrix K is (nearly) singular.
+///
+/// `K` is the output of `lapack_dgetrf_full`, whose diagonal holds |U_ii|.
+/// A tiny min/max ratio means the surface discretization produced a degenerate
+/// matrix; subsequent `solve_lu` calls will lose accuracy or fail.
+fn warn_if_near_singular(K: &MatrixFull<f64>, method: PcmMethod) {
+    let n = K.size[0];
+    if n == 0 {
+        return;
+    }
+    let mut diag_min = f64::MAX;
+    let mut diag_max = 0.0f64;
+    for i in 0..n {
+        let d = K[(i, i)].abs();
+        diag_min = diag_min.min(d);
+        diag_max = diag_max.max(d);
+    }
+    let ratio = if diag_max > 0.0 { diag_min / diag_max } else { 0.0 };
+    if ratio < 1e-12 {
+        println!(
+            "WARNING: PCM matrix K is nearly singular ({}): min|U_ii|={:10.3e}, max|U_ii|={:10.3e}, min/max={:10.3e}",
+            method, diag_min, diag_max, ratio
+        );
     }
 }
 
@@ -433,6 +461,7 @@ impl PcmScf{
         mpi_operator: &Option<crate::mpi_io::MPIOperator>,
     ) -> PcmScf {
         let dt_solv0 = time::Local::now();
+        let print_root = mpi_operator.as_ref().map_or(true, |op| op.rank == 0);
         // RI-based PCM: use auxiliary basis for (μν|g_i) integrals
         let mut cint_data_ri = mol.initialize_cint(true);
         let mut aux_cint = mol.make_auxmol_fake().initialize_cint(false);
@@ -443,10 +472,17 @@ impl PcmScf{
 
         //let opt_3c_1 = cint_data.optimizer("int3c2e");
         //cint_data.c_opt = Some(Arc::new(opt_3c_1));
-        println!("nao= {}", cint_data_ri.nao());
+        if print_root {
+            println!("nao= {}", cint_data_ri.nao());
+        }
         // Compute V_{PQ} = (P|Q) for auxiliary basis (computed once per SCF iteration)
         let nbas = mol.cint_bas.len() as i32;
         let nbas_aux = mol.cint_aux_bas.len() as i32;
+
+        let singular_msg = |which: &str| format!(
+            "PCM solver failed: K is singular ({} returned None) — method={}, epsilon={}, ngrids={}, solv_ri={}",
+            which, mol.ctrl.solvent_model, mol.ctrl.solv_epsilon, K.size[0], solv_ri
+        );
 
         let (v_grids_e, v_grids_matrix, veff, q_sym, dt_4) = if solv_ri{
 
@@ -454,14 +490,18 @@ impl PcmScf{
             let (v_pq_out, v_pq_shape) = cint_data_ri.integral_s1::<int2c2e>(Some(&shls_slice_vpq));
             let mut v_pq = MatrixFull::from_vec([v_pq_shape[0], v_pq_shape[1]], v_pq_out).unwrap();
             let naux = v_pq_shape[0];
-            println!("naux= {}", naux);
+            if print_root {
+                println!("naux= {}", naux);
+            }
             // Regularize V_{PQ} to avoid numerical issues in Cholesky
             let v_diag_max = (0..naux).fold(0.0f64, |acc, i| acc.max(v_pq[(i, i)]));
             let lambda = 1e-12 * v_diag_max.max(1.0);
             for i in 0..naux {
                 v_pq[(i, i)] += lambda;
             }
-            println!("V_PQ regularization: lambda = {:10.6e}, diag_max = {:10.6e}", lambda, v_diag_max);
+            if print_root {
+                println!("V_PQ regularization: lambda = {:10.6e}, diag_max = {:10.6e}", lambda, v_diag_max);
+            }
             let v_grids_e = get_v_grids_e(surface, mol, dm, spin_channel, max_memory, chunk_size,
                 &cint_data_ri, &aux_cint, &v_pq);
 
@@ -479,11 +519,13 @@ impl PcmScf{
 
             assert!(v_grids_matrix.size[0] == R.size[1], "Dimension mismatch: v_grids has {} rows but R has {} columns", v_grids_matrix.size[0], R.size[1]);
             let b = _dgemm_scaled(R, 'N', &v_grids_matrix, 'N', 1.0);
-            let q = solve_lu(K, K_ipiv, &b.data).unwrap();
+            let q = solve_lu(K, K_ipiv, &b.data)
+                .unwrap_or_else(|| panic!("{}", singular_msg("solve_lu")));
             let q = MatrixFull::from_vec([q.len(), 1], q).unwrap();
 
             //solve K^T x = v_grids
-            let vK_1 = solve_lu_transpose(K, K_ipiv, &v_grids_matrix.data).unwrap();
+            let vK_1 = solve_lu_transpose(K, K_ipiv, &v_grids_matrix.data)
+                .unwrap_or_else(|| panic!("{}", singular_msg("solve_lu_transpose")));
 
             let vK_1 = MatrixFull::from_vec([vK_1.len(), 1], vK_1).unwrap();
 
@@ -530,11 +572,13 @@ impl PcmScf{
 
             assert!(v_grids_matrix.size[0] == R.size[1], "Dimension mismatch: v_grids has {} rows but R has {} columns", v_grids_matrix.size[0], R.size[1]);
             let b = _dgemm_scaled(R, 'N', &v_grids_matrix, 'N', 1.0);
-            let q = solve_lu(K, K_ipiv, &b.data).unwrap();
+            let q = solve_lu(K, K_ipiv, &b.data)
+                .unwrap_or_else(|| panic!("{}", singular_msg("solve_lu")));
             let q = MatrixFull::from_vec([q.len(), 1], q).unwrap();
 
             //solve K^T x = v_grids
-            let vK_1 = solve_lu_transpose(K, K_ipiv, &v_grids_matrix.data).unwrap();
+            let vK_1 = solve_lu_transpose(K, K_ipiv, &v_grids_matrix.data)
+                .unwrap_or_else(|| panic!("{}", singular_msg("solve_lu_transpose")));
 
             let vK_1 = MatrixFull::from_vec([vK_1.len(), 1], vK_1).unwrap();
 
@@ -586,24 +630,38 @@ impl PcmScf{
 /// Unified solvent chunk size (number of surface points per work batch).
 ///
 /// A single ctrl knob (`solv_chunk`) controls the thread-level batch size for
-/// both the PCM energy and gradient paths. The value is clamped by:
-/// - **user knob**: `solv_chunk` (upper bound; default 8, benchmark inputs 64);
+/// the PCM energy (RI and non-RI) and gradient paths. The value is clamped by:
+/// - **user knob**: `solv_chunk` (upper bound; default 16, benchmark inputs 64);
 /// - **memory**: the ~500 MB in-flight tensor budget per process divided by the
-///   thread count (`bytes_per_point · nao²` bytes per point; gradient tensors are
-///   3× the energy ones);
+///   thread count (`bytes_per_unit` bytes per surface point; gradient tensors
+///   are 3× the energy ones);
 /// - **load balance**: `range / (nthreads · K)` so every thread gets ≥K tasks;
-/// - **floor**: 16 points (per-batch overhead: fake molecule + integral call).
+/// - **floor**: 16 points, silently overridden by the memory cap when the two
+///   conflict (per-batch overhead: fake molecule + integral call).
 pub(crate) fn solvent_chunk(
     range: usize,          // surface points owned by this rank
     nao: usize,            // number of AO basis functions
-    bytes_per_point: f64,  // tensor bytes per point (8·nao² energy, 24·nao² gradient)
+    bytes_per_point: f64,  // tensor bytes per point as a multiple of nao² (8 energy, 24 gradient)
+    solv_chunk: usize,     // ctrl `solv_chunk`
+    nthreads: usize,       // rayon pool size
+) -> usize {
+    solvent_chunk_bytes(range, bytes_per_point * (nao * nao) as f64, solv_chunk, nthreads)
+}
+
+/// Bytes-based variant for tensor shapes whose per-point footprint is not
+/// nao²-shaped: the RI paths hold `[naux, chunk]` blocks (8·naux bytes per
+/// point), not `[nao², chunk]`. `bytes_per_unit` = in-flight tensor bytes
+/// contributed by ONE surface point.
+pub(crate) fn solvent_chunk_bytes(
+    range: usize,          // surface points owned by this rank
+    bytes_per_unit: f64,   // in-flight tensor bytes per surface point
     solv_chunk: usize,     // ctrl `solv_chunk`
     nthreads: usize,       // rayon pool size
 ) -> usize {
     const C_MIN: usize = 16;
     const K: usize = 2;
     let t = nthreads.max(1);
-    let mem_cap = ((500_000_000.0 / (bytes_per_point * (nao * nao) as f64)) as usize / t).max(1);
+    let mem_cap = ((500_000_000.0 / bytes_per_unit) as usize / t).max(1);
     let hi = solv_chunk.min(mem_cap).max(1);
     let by_load = (range / (t * K)).max(1);
     let lo = C_MIN.min(range).max(1);
@@ -622,12 +680,9 @@ pub fn get_v_grids_e_old(
     let grid_coords = &surface.surface_calc.grid_coords;
     
     let ngrids = charge_exp.len();
-
-
-    //const CHUNK: usize = 16;
-    let CHUNK =  *chunk_size;
-    
     let nao = cint_data.nao();
+
+    let CHUNK = solvent_chunk(ngrids, nao, 8.0, *chunk_size, rayon::current_num_threads());
     let mut dm_vec = vec![0.0; nao * nao];
     for i_spin in 0..*spin_channel {
         for j in 0..nao {
@@ -850,10 +905,13 @@ pub fn get_veff_pcm_by_q_old_mpi(
     let dt0 = time::Local::now();
 
     // Thread-parallel chunks; the BLAS call inside the closure is gated to one
-    // thread (Rayon × OpenBLAS double pool). Partials are collected in ascending
-    // chunk order → deterministic fold.
+    // thread (Rayon × OpenBLAS double pool). Each chunk's nao² contribution is
+    // negated and folded as soon as it is ready (Rayon tree reduction, same
+    // scheme as the serial `get_veff_pcm_by_q_old`) — an ordered collect + serial
+    // fold would materialize n_chunks·nao² partials and blow up at large nao.
+    // Fold order is fixed for a given chunk count and thread count.
     let default_omp_num_threads = omp_get_num_threads_wrapper();
-    let partials: Vec<Vec<f64>> = chunks
+    let veff_local = chunks
         .par_iter()
         .map(|&(p0, p1)| {
             omp_set_num_threads_wrapper(1);
@@ -866,18 +924,18 @@ pub fn get_veff_pcm_by_q_old_mpi(
             let tmpshape = [shape[0] * shape[1], shape[2]];
             let tmp_v_nj = MatrixFull::from_vec(tmpshape, tmpout).unwrap();
             let q_p = MatrixFull::from_vec([chunk_len, 1], q[p0..p1].to_vec()).unwrap();
-            let v_nj = _dgemm_scaled(&tmp_v_nj, 'N', &q_p, 'N', 1.0);
-            v_nj.data
+            let mut v_nj = _dgemm_scaled(&tmp_v_nj, 'N', &q_p, 'N', 1.0);
+            v_nj.iter_mut().for_each(|x| *x = -*x);
+            v_nj
         })
-        .collect();
+        .reduce(
+            || MatrixFull::<f64>::new([nao, nao], 0.0),
+            |mut acc, v| {
+                acc.data.iter_mut().zip(v.data.iter()).for_each(|(a, &b)| *a += b);
+                acc
+            },
+        );
     omp_set_num_threads_wrapper(default_omp_num_threads);
-
-    let mut veff_local = MatrixFull::<f64>::new([nao, nao], 0.0);
-    for vnj in &partials {
-        for (ve, &v) in veff_local.data.iter_mut().zip(vnj.iter()) {
-            *ve -= v;
-        }
-    }
 
     // Allreduce
     let mut veff_full = vec![0.0_f64; nao * nao];
@@ -907,8 +965,8 @@ pub fn get_veff_pcm_by_q_old(
     let ngrids = charge_exp.len();
 
     //let mut veff = MatrixFull::<f64>::new([nao, nao], 0.0);
-    
-    let CHUNK = *chunk_size;
+
+    let CHUNK = solvent_chunk(ngrids, nao, 8.0, *chunk_size, rayon::current_num_threads());
     /** 
     let mem_avail_mb = max_memory.map(|max_memory| {
         max_memory - detect_used_memory_mb("proc")
@@ -1066,9 +1124,11 @@ pub fn get_v_grids_e(
     let charge_exp = &surface.surface_calc.charge_exp;
     let grid_coords = &surface.surface_calc.grid_coords;
     let ngrids = charge_exp.len();
-    let CHUNK = 256;
     let nao = dm[0].size[0] as usize;
     let naux = aux_cint.ao_loc().last().unwrap().clone();
+    // Per grid point the RI chunk holds an [naux, chunk] block (8·naux bytes),
+    // not the [nao², chunk] of the non-RI paths.
+    let CHUNK = solvent_chunk_bytes(ngrids, 8.0 * naux as f64, *chunk_size, rayon::current_num_threads());
     let nbas = mol.cint_bas.len() as i32;
     let nbas_aux = mol.cint_aux_bas.len() as i32;
 
@@ -1096,12 +1156,7 @@ pub fn get_v_grids_e(
     for &[shl0, shl1] in &partition {
         let nbatch = aux_loc[shl1] - aux_loc[shl0];
         let shls_slice = [[0, nbas], [0, nbas], [nbas + shl0 as i32, nbas + shl1 as i32]];
-        let (out, shape) = cint_data_ri.integral_s1::<int3c2e>(Some(&shls_slice));
-        // Debug: check integrals for NaN on first batch
-        if idx_ao == 0 {
-            let int_nan = out.iter().any(|&x| x.is_nan() || x.is_infinite());
-            println!("RI-PCM: int3c shape={:?}, nbatch={}, int_nan={}, out[0..5]={:?}", shape, nbatch, int_nan, &out[..5.min(out.len())]);
-        }
+        let (out, _) = cint_data_ri.integral_s1::<int3c2e>(Some(&shls_slice));
         let tmpshape = [nao * nao, nbatch];
         let int3c = MatrixFull::from_vec(tmpshape, out).unwrap();
         let c_batch = _dgemm_scaled(&dm_mat, 'N', &int3c, 'N', 1.0);
@@ -1114,12 +1169,6 @@ pub fn get_v_grids_e(
     // Step 2: Solve V · Y = C via Cholesky decomposition (V is symmetric)
     let y_vec = solve_cholesky(&v_pq, &c_vec);
     let y_mat = MatrixFull::from_vec([naux, 1], y_vec).unwrap();
-
-    // Debug: check step 1+2 results
-    let c_minmax = c_vec.iter().fold((f64::MAX, f64::MIN), |(mn, mx), &v| (mn.min(v), mx.max(v)));
-    let y_minmax = y_mat.data.iter().fold((f64::MAX, f64::MIN), |(mn, mx), &v| (mn.min(v), mx.max(v)));
-    let c_nan = c_vec.iter().any(|&x| x.is_nan() || x.is_infinite());
-    let y_nan = y_mat.data.iter().any(|&x| x.is_nan() || x.is_infinite());
 
     // Step 3: Parallel grid chunks — v_grids_e[j] = Σ_P Y_P · (P|g_j)
     let mut v_grids_e = vec![0.0; ngrids];
@@ -1144,23 +1193,12 @@ pub fn get_v_grids_e(
         //let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&fake_chg_data, &fake_chg_data], None, None).into();
         let shls_slice_2c = [[0, (p1-p0) as i32], [nbas, nbas + nbas_aux]];
         let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&fake_chg_data, cint_data_ri], None, &shls_slice_2c).into();
-        let out_nan = tmpout.iter().any(|&x| x.is_nan() || x.is_infinite());
-        let out_minmax = tmpout.iter().fold((f64::MAX, f64::MIN), |(mn, mx), &v| (mn.min(v), mx.max(v)));
-        println!("CHUNK {}: RAW int2c2e shape={:?}, bad={}, min={:10.6e}, max={:10.6e}, first5={:?}",
-                 v_chunk, shape, out_nan, out_minmax.0, out_minmax.1, &tmpout[..5.min(tmpout.len())]);
         let pg_shape = [shape[0], shape[1]];
         let pg_mat = MatrixFull::from_vec(pg_shape, tmpout).unwrap();
-        let pg_nan = pg_mat.data.iter().any(|&x| x.is_nan() || x.is_infinite());
-        let pg_minmax = pg_mat.data.iter().fold((f64::MAX, f64::MIN), |(mn, mx), &v| (mn.min(v), mx.max(v)));
         let v_e_chunk = _dgemm_scaled(&pg_mat, 'N', &y_mat, 'N', 1.0);
         idx.iter_mut().zip(v_e_chunk.iter()).for_each(|(i, &v)| *i = v);
     });
     omp_set_num_threads_wrapper(default_omp_num_threads);
-
-    // Debug: check v_grids_e results
-    let ve_minmax = v_grids_e.iter().fold((f64::MAX, f64::MIN), |(mn, mx), &v| (mn.min(v), mx.max(v)));
-    let ve_nan = v_grids_e.iter().any(|&x| x.is_nan() || x.is_infinite());
-    println!("RI-PCM: v_grids_e: min={:10.6e}, max={:10.6e}, bad={}", ve_minmax.0, ve_minmax.1, ve_nan);
 
     let dt1 = time::Local::now();
     let timecost = (dt1.timestamp_millis() - dt0.timestamp_millis()) as f64 / 1000.0;
@@ -1191,7 +1229,9 @@ pub fn get_veff_pcm_by_q(
     let charge_exp = &surface.surface_calc.charge_exp;
     let grid_coords = &surface.surface_calc.grid_coords;
     let ngrids = charge_exp.len();
-    let CHUNK = *chunk_size;
+    // Per grid point the RI chunk holds an [naux, chunk] block (8·naux bytes),
+    // not the [nao², chunk] of the non-RI paths.
+    let CHUNK = solvent_chunk_bytes(ngrids, 8.0 * naux as f64, *chunk_size, rayon::current_num_threads());
 
     // Auxiliary basis info
     let aux_loc = &cint_data_ri.ao_loc()[(nbas as usize)..];
@@ -1199,11 +1239,13 @@ pub fn get_veff_pcm_by_q(
     let dt0 = time::Local::now();
 
     // Step 1: Compute Z'_P = Σ_j q_j · (P|g_j) over grid chunks (parallel)
+    let default_omp_num_threads = omp_get_num_threads_wrapper();
     let z_prime = grid_coords
         .par_chunks(CHUNK)
         .zip(charge_exp.par_chunks(CHUNK))
         .zip(q.par_chunks(CHUNK))
         .map(|((grid_coords_chunk, charge_exp_chunk), q_chunk)| {
+            omp_set_num_threads_wrapper(1);
             let chunk_len = grid_coords_chunk.len();
             let charge_exp_chunk_sq: Vec<f64> =
                 charge_exp_chunk.iter().map(|x| x * x).collect();
@@ -1227,6 +1269,7 @@ pub fn get_veff_pcm_by_q(
                 }
                 a
             });
+    omp_set_num_threads_wrapper(default_omp_num_threads);
 
     // Step 2: Solve V · Z = Z' via Cholesky decomposition (V is symmetric)
     let z_vec = solve_cholesky(&v_pq, &z_prime);
@@ -1256,12 +1299,8 @@ pub fn get_veff_pcm_by_q(
     println!("RI-PCM: veff costs {:10.2} seconds.", timecost);
 
     // Debug: check veff for NaN
-    let veff_nan = veff.data.iter().any(|&x| x.is_nan() || x.is_infinite());
-    if veff_nan {
-        println!("WARNING: veff contains NaN or Inf!");
-    } else {
-        let vf_minmax = veff.data.iter().fold((f64::MAX, f64::MIN), |(mn, mx), &v| (mn.min(v), mx.max(v)));
-        println!("RI-PCM: veff data min={:10.6e}, max={:10.6e}", vf_minmax.0, vf_minmax.1);
+    if veff.data.iter().any(|&x| x.is_nan() || x.is_infinite()) {
+        println!("WARNING: RI-PCM veff contains NaN or Inf!");
     }
 
     let veff_upper = veff.iter_matrixupper().unwrap().map(|&x| x).collect::<Vec<f64>>();
@@ -1448,5 +1487,26 @@ mod tests {
         assert_eq!(serde_json::from_str::<PcmMethod>("\"ssvpe\"").unwrap(), PcmMethod::SSVPE);
         assert_eq!(serde_json::from_str::<PcmMethod>("\"smd\"").unwrap(), PcmMethod::SMD);
         assert!(serde_json::from_str::<PcmMethod>("\"unknown\"").is_err());
+    }
+
+    /// `solvent_chunk_bytes` must never return 0 (`par_chunks(0)` panics) and
+    /// the nao²-based wrapper must reproduce the non-RI chunking.
+    #[test]
+    fn test_solvent_chunk_bytes_clamps_and_matches_wrapper() {
+        // user knob 0 -> clamped to 1 (the RI veff panic face)
+        assert_eq!(solvent_chunk_bytes(1000, 8.0 * 1000.0, 0, 4), 1);
+        // default knob 16 is the upper bound when memory is plentiful
+        assert_eq!(solvent_chunk_bytes(1000, 8.0 * 1000.0, 16, 4), 16);
+        // range below the floor: chunk collapses to the number of points
+        assert_eq!(solvent_chunk_bytes(10, 8.0 * 1000.0, 16, 4), 10);
+        // wrapper equivalence: solvent_chunk(nao=100, 8.0) == bytes(8·100²)
+        assert_eq!(
+            solvent_chunk(1000, 100, 8.0, 16, 4),
+            solvent_chunk_bytes(1000, 8.0 * 10_000.0, 16, 4)
+        );
+        // memory cap: 500 MB / (500 MB per point) -> 1 point per thread
+        assert_eq!(solvent_chunk_bytes(1000, 5.0e8, 16, 4), 1);
+        // load balance cannot exceed the user knob
+        assert_eq!(solvent_chunk_bytes(10_000, 8.0 * 100.0, 64, 4), 64);
     }
 }

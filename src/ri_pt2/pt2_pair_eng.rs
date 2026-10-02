@@ -107,12 +107,6 @@ where
             .unwrap_or_else(|| (idx_lumo[spin]..num_mo).collect())
     });
 
-    if occ_lists[A].is_empty() || occ_lists[B].is_empty()
-        || vir_lists[A].is_empty() || vir_lists[B].is_empty()
-    {
-        return [0.0, 0.0, 0.0];
-    }
-
     // slice each spin channel to 1D then index_select
     let occ_energy = [
         mo_energy.i((.., A)).index_select(-1, &occ_lists[A]),

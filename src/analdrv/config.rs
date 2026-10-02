@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
+use crate::ctrl_io::{path_util, serde_from_value};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AnalDrvTask {
@@ -46,9 +47,11 @@ impl Default for AnalDrvGeneralCfg {
 ///
 /// All these keywords are specific to the CP-SCF-type solve, hence the `cpscf_*` key names.
 /// `grid_level` is not a solver setting but the DFT grid of the CP-SCF response evaluation (the
-/// response path; the fock path and the DH generalized Fock stay on the SCF grid), so it is named
-/// in the `grid_level_*` family of [`AnalDrvNucgradCfg::grid_level_skeleton`] with `cpscf` as the
-/// scope.
+/// low-precision response path; the fock path and the DH generalized Fock stay on the SCF grid),
+/// so it is named in the `grid_level_*` family of
+/// [`AnalDrvNucgradCfg::grid_level_skeleton`] with `cpscf` as the scope. Likewise, `auxbas_path`
+/// configures the response objects themselves (the low-precision resource, not only the CP-SCF
+/// solve), so it is named in the `resp_` scope.
 ///
 /// The legacy `cphf_*` prefixed key names are still accepted as aliases.
 #[serde_inline_default]
@@ -79,6 +82,22 @@ pub struct AnalDrvRespCfg {
     #[serde(rename = "grid_level_cpscf", alias = "grid_level_cphf")]
     #[serde_inline_default(None)]
     pub grid_level: Option<usize>,
+    /// Auxiliary basis of the RI-JK response objects (the low-precision response side), as a
+    /// basis-set pool name or an element-JSON directory — the same value format as
+    /// `ctrl.auxbas_path`, and resolved by [`parse_analdrv_keywords`] through the same
+    /// basis-path machinery (so pool names and aliases work, not only absolute directories).
+    ///
+    /// By default `None`: the response objects reuse the SCF auxiliary basis, borrowing the SCF
+    /// `rimatr` (and `rimatr_sr` for range-separated hybrids) with no copy. When set, a
+    /// decomposed ERI is freshly built on this basis and attached as the low-precision
+    /// (`prec = false`) resource: it feeds the CP-SCF response contractions only, while the fock
+    /// forms (`prec = true`) and the energy-derivative (B-side) objects of the hessian/multipole
+    /// tasks keep the SCF auxiliary basis, so the CP-SCF solve becomes a mixed-representation
+    /// approximation (parallel to `grid_level_cpscf`). Not supported together with
+    /// `even_tempered_basis`.
+    #[serde(rename = "resp_auxbas_path")]
+    #[serde_inline_default(None)]
+    pub auxbas_path: Option<String>,
 }
 
 impl Default for AnalDrvRespCfg {
@@ -91,6 +110,7 @@ impl Default for AnalDrvRespCfg {
             lindep: 1e-15,
             tol_inflation: 1000.0,
             grid_level: None,
+            auxbas_path: None,
         }
     }
 }
@@ -166,7 +186,9 @@ impl Default for AnalDrvNucgradCfg {
 
 /// Relaxation treatment of the double-hybrid (DH) density increments for the multipole moments.
 ///
-/// Only meaningful for PT2-family post-SCF (fifth-DFA) methods; silently ignored otherwise.
+/// Only meaningful for PT2-family post-SCF (fifth-DFA) restricted methods; silently ignored
+/// otherwise (the unrestricted multipole task is SCF-level only — post-SCF unrestricted methods
+/// are rejected there).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MultipoleRdm1Relax {
     /// Relaxed density: solve the Z-vector (CP-SCF) and include the response increment.
@@ -186,8 +208,10 @@ impl Default for MultipoleRdm1Relax {
 /// Settings of the electric multipole moment evaluation.
 ///
 /// These keywords control what is evaluated in the [`Multipole`](AnalDrvTask::Multipole) task.
-/// All moments are evaluated in atomic units; the default origin is the coordinate origin
-/// `[0, 0, 0]` (Bohr), the same print convention as Gaussian and pyscf.
+/// Supported for RHF/RKS and UHF/UKS calculations, with the PT2-family post-SCF (fifth-DFA)
+/// density increments restricted-only. All moments are evaluated in atomic units; the default
+/// origin is the coordinate origin `[0, 0, 0]` (Bohr), the same print convention as Gaussian
+/// and pyscf.
 #[serde_inline_default]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnalDrvMultipoleCfg {
@@ -260,6 +284,25 @@ pub struct AnalDrvConfig {
 
 /* #endregion AnalDrvConfig */
 
+/// Parse the `[analdrv]` section of the control input into an [`AnalDrvConfig`].
+///
+/// `None` when the section is absent; a malformed section panics (the `serde_from_value`
+/// convention of the other sections). The `resp_auxbas_path` keyword takes the same value format
+/// as `auxbas_path` (a basis-set pool name, an alias, or an element-JSON directory), so it is
+/// resolved through the same basis-path machinery here: pool names are looked up in the basis-set
+/// pool directories, and anything else is passed through for the basis-set-exchange fallback.
+pub fn parse_analdrv_keywords(tmp_keys: &serde_json::Value) -> Option<AnalDrvConfig> {
+    let mut config: AnalDrvConfig = tmp_keys.get("analdrv").map(serde_from_value)?;
+    if let Some(resp_auxbas_path) = &config.resp.auxbas_path {
+        config.resp.auxbas_path = Some(path_util::get_valid_basis_path(
+            resp_auxbas_path,
+            &path_util::get_rest_basis_dir(),
+            "auxiliary basis",
+        ));
+    }
+    Some(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,12 +322,14 @@ mod tests {
             "gau_thermo": true,
             "atm_list": [0, 1],
             "verbose": 3,
+            "resp_auxbas_path": "def2-universal-jkfit",
         });
         let config: AnalDrvConfig = serde_json::from_value(v).unwrap();
         assert_eq!(config.resp.tol, 1.0e-8);
         assert_eq!(config.resp.max_cycle, 99);
         assert_eq!(config.resp.level_shift, 0.0);
         assert_eq!(config.resp.grid_level, Some(2));
+        assert_eq!(config.resp.auxbas_path, Some("def2-universal-jkfit".to_string()));
         assert_eq!(config.nucgrad.grid_level_skeleton, Some(4));
         assert!(!config.nucgrad.grid_shift_deriv);
         assert!(config.nucgrad.gau_thermo);
@@ -330,16 +375,18 @@ mod tests {
         let config: AnalDrvConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(config, AnalDrvConfig::default());
 
-        // serialization stays flat, under the cpscf_* / grid_level_* key names
+        // serialization stays flat, under the cpscf_* / grid_level_* / resp_* key names
         let mut config = AnalDrvConfig::default();
         config.resp.tol = 1.0e-8;
         config.resp.max_space = 20;
         config.resp.grid_level = Some(2);
+        config.resp.auxbas_path = Some("def2-universal-jkfit".to_string());
         config.multipole.rdm1_relax = MultipoleRdm1Relax::Unrelaxed;
         let v = serde_json::to_value(&config).unwrap();
         assert_eq!(v["cpscf_tol"], serde_json::json!(1.0e-8));
         assert_eq!(v["cpscf_max_space"], serde_json::json!(20));
         assert_eq!(v["grid_level_cpscf"], serde_json::json!(2));
+        assert_eq!(v["resp_auxbas_path"], serde_json::json!("def2-universal-jkfit"));
         assert_eq!(v["multipole_rdm1_relax"], serde_json::json!("unrelaxed"));
     }
 }

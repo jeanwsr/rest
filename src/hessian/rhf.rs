@@ -4732,13 +4732,19 @@ fn run_hessian_pipeline(
     if pl > 1 {
         memory_monitor::print_system_size("before Hessian pipeline", natm, nao, nocc, naux, ngrids);
     }
-    let limit_gb = scf.mol.ctrl.max_memory;
-    let monitor = MemMonitor::start(limit_gb, std::time::Duration::from_millis(20));
+    // `max_memory` 的单位是 MiB，而且只有用户要求时才武装中止（`abort_on_mem_exceed`，缺省 true）。
+    // 监控模块移到 utilities 之前，这里把 MiB 当作 GiB 传进去，限值大了 1024 倍。
+    let monitor = MemMonitor::start_from_ctrl(
+        scf.mol.ctrl.max_memory,
+        scf.mol.ctrl.abort_on_mem_exceed,
+        std::time::Duration::from_millis(20),
+    );
     if pl > 1 {
         println!(
             "  Memory monitor: limit = {}",
-            limit_gb
-                .map(|g| format!("{:.3} GiB (abort on exceed)", g))
+            monitor
+                .limit_mb()
+                .map(|m| format!("{:.1} MiB ({:.3} GiB, abort on exceed)", m, m / 1024.0))
                     .unwrap_or_else(|| "NONE (peak tracking only)".to_string())
         );
     }

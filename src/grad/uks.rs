@@ -90,9 +90,15 @@ impl RIUHFGradient<'_> {
         let xc_data = self.gen_xc_data(scf_data, 1);
         let mut mol = scf_data.mol.clone();
         let grids = &mut Grids::build(&mut mol);
+        let mem_probe_on =
+            utilities::memory_batch::mem_probe_enabled(self.scf_data.mol.ctrl.print_level);
+        utilities::memory_batch::mem_probe("calc_de_xc (uks): before get_vxc_rayon_new", mem_probe_on);
         // let dao_vxc = get_vxc(&self, &xc_data, grids, &scf_data.mol, self.flags.max_memory.unwrap_or(2000.0) as usize);
         // let dao_vxc = get_vxc_rayon(&self, &xc_data, grids, &scf_data.mol);
-        let dao_vxc = get_vxc_rayon_new(&self, &xc_data, grids, &mol, 16usize);
+        // 每线程每块的 XC 工作集预算，由 [ctrl] max_memory 推得，未设置时保持历史上的 16 MiB
+        let xc_block_mb = utilities::memory_batch::xc_grad_block_mb(self.flags.max_memory, 16.0);
+        let dao_vxc = get_vxc_rayon_new(&self, &xc_data, grids, &mol, xc_block_mb as usize);
+        utilities::memory_batch::mem_probe("calc_de_xc (uks): after get_vxc_rayon_new", mem_probe_on);
         // println!("Finished calculating dx vxc");
         
         // contract dao_vxc and dm (tuv, uv -> tu) and sum over spin case
@@ -433,7 +439,18 @@ fn get_vxc_rayon(gradient_method: &RIUHFGradient, xc_data: &XCData, grids: &mut 
 }
 
 
-fn get_vxc_rayon_new(gradient_method: &RIUHFGradient, xc_data: &XCData, grids: &mut Grids, mol: &Molecule, max_memory: usize) -> Vec<Tsr<f64>> {
+/// Grid contribution of the UKS XC skeleton derivative, `vmat_s[nao, nao, 3]` per spin (the
+/// row-scatter, times `2`, contracted with the per-spin density, is the XC skeleton gradient), for
+/// the XC functional carried by `xc_data`.
+///
+/// Public so that post-SCF (doubly-hybrid) gradients can evaluate the skeleton derivative of
+/// the *final* functional, whose component list is not the SCF one (`xc_data` is built by the
+/// caller, e.g. from `dfa_compnt_pos` / `dfa_paramr_pos`).
+///
+/// `block_mem_mb` bounds the workspace of **one block of one worker**, so callers pass a
+/// per-thread share of the declared budget (`utilities::memory_batch::xc_grad_block_mb`),
+/// never `[ctrl] max_memory` itself.
+pub fn get_vxc_rayon_new(gradient_method: &RIUHFGradient, xc_data: &XCData, grids: &mut Grids, mol: &Molecule, block_mem_mb: usize) -> Vec<Tsr<f64>> {
     let default_omp_num_threads = omp_get_num_threads_wrapper();
 
     let num_grids = grids.weights.len();
@@ -447,23 +464,37 @@ fn get_vxc_rayon_new(gradient_method: &RIUHFGradient, xc_data: &XCData, grids: &
     };
     let ao_comp = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
     let batch_size = 64;
-    let blksize = (max_memory * 1_000_000 / 8 / ((ao_comp + 1) * num_basis * batch_size))
-        .min(num_grids/batch_size+1).max(4) * batch_size;
+    let blksize = (block_mem_mb * 1_000_000 / 8 / ((ao_comp + 1) * num_basis * batch_size))
+        .min(num_grids / batch_size + 1)
+        .max(4) * batch_size;
+    let blksize = blksize.min(num_grids.max(1));
+    // 自检：一块的工作集是 (ao_comp + 1) 个分量 x nao x blksize 的 f64，应与预算同量级
+    let block_mb = ((ao_comp + 1) * num_basis * blksize * std::mem::size_of::<f64>()) as f64 / 1.0e6;
+    if gradient_method.flags.print_level >= 2 {
+        println!(
+            "In get_vxc_rayon_new: BLKSIZE={} grids, block budget={} MiB, per-block workspace={:.1} MiB, blocks={}.",
+            blksize, block_mem_mb, block_mb, (num_grids + blksize - 1) / blksize.max(1)
+        );
+    }
+    if block_mb > 1.5 * block_mem_mb as f64 && gradient_method.flags.print_level >= 1 {
+        println!(
+            "[WARN] XC gradient block workspace {:.1} MiB exceeds the {:.1} MiB budget; the block size formula and the budget disagree.",
+            block_mb, block_mem_mb as f64
+        );
+    }
 
-    let block_settings = BlockSettings { ao_deriv, max_memory, blksize };
+    let block_settings = BlockSettings { ao_deriv, max_memory: block_mem_mb, blksize };
     let device = &xc_data.device;
     let deriv = 1usize;
     // UKS case 
     let spin = 1usize;
     let nspin = spin + 1;
-    let mut vmat_a = rt::zeros(([num_basis, num_basis, 3], device));
-    let mut vmat_b = rt::zeros(([num_basis, num_basis, 3], device));
-    let mut vmat = vec![vmat_a, vmat_b];
-
-    let (sender, receiver) = channel();
-
-    gradient_method.par_block_loop(mol, grids, block_settings)
-        .for_each_with(sender, |s, block| {
+    // Accumulate grid block by grid block with one accumulator per worker, see the closed-shell
+    // twin in `rks.rs`: an unbounded channel holding one [nao, nao, 3, nspin] entry per block
+    // grows like (ngrids / blksize) * nao^2 and dominates the memory of a large gradient.
+    let mut vmat = gradient_method
+        .par_block_loop(mol, grids, block_settings)
+        .map(|block| {
             omp_set_num_threads_wrapper(1);
 
             let ng = block.weights.len();
@@ -515,16 +546,22 @@ fn get_vxc_rayon_new(gradient_method: &RIUHFGradient, xc_data: &XCData, grids: &
                     unreachable!("HF gradient calculation does not support here in get_vxc");
                 },
             }
-            s.send((loc_vmat)).unwrap();
-        });
-
-    receiver.into_iter().for_each(
-        |(loc_vmat)| 
-        {
-            vmat[0] += loc_vmat[0].view();
-            vmat[1] += loc_vmat[1].view();
-        }
-    );
+            loc_vmat
+        })
+        .reduce(
+            || {
+                vec![
+                    rt::zeros(([num_basis, num_basis, 3], device)),
+                    rt::zeros(([num_basis, num_basis, 3], device)),
+                ]
+            },
+            |mut acc, part| {
+                for (a, p) in acc.iter_mut().zip(part.iter()) {
+                    *a += p.view();
+                }
+                acc
+            },
+        );
     omp_set_num_threads_wrapper(default_omp_num_threads);
     // nabla R = - nabla r
     for ispin in 0..nspin {

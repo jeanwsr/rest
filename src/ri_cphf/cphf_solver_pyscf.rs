@@ -53,9 +53,9 @@ impl CPHFSolverPySCF {
             if cutoff < 1.0e5 {
                 println!("  TDDFT virtual cutoff: {:.4} Ha, {} states retained", cutoff, num_state);
             }
-            if start_mo > scf.mol.start_mo {
-                println!("  TDDFT frozen core: -2.00 Ha threshold, {} orbitals frozen (MO 0..{})",
-                    start_mo - scf.mol.start_mo, start_mo);
+            if start_mo > 0 {
+                println!("  TDDFT frozen core: {} orbitals frozen (MO 0..{})",
+                    start_mo, start_mo);
             }
         }
 

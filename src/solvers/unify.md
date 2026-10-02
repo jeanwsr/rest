@@ -119,7 +119,85 @@ All solvers use the same Galerkin projection: `H = xs^T·(I+A)·xs`, `g = xs^T·
 
 ---
 
-## 3. Test coverage
+## 3. FEAST: `ri_bse/feast_solver.rs` core → `solvers/feast.rs`
+
+The context-independent part of `ri_bse/feast_solver.rs` (Gauss–Legendre nodes,
+preconditioned CG, restarted GMRES, the block-diagonal / inner-GMRES
+preconditioners, and the `feast()` outer loop) moved to `solvers/feast.rs`.
+Only the FEAST eigenvalue solve is shared; every BSE-specific pre-/post-processing
+step stays in `ri_bse/feast_solver.rs`.
+
+```
+solvers/feast.rs
+├── gauss_legendre_nodes()        ← quadrature on [-1, 1]
+├── cg()                          ← SPD preconditioned CG (Vec<f64>)
+├── gmres()                       ← restarted GMRES(m) with Givens rotations
+├── BlockDiagPrecond              ← 2×2 block-diagonal real embedding
+├── InnerGmresPrecond             ← implicit inverse via inner GMRES
+├── GmresPrecond                  ← Diag | InnerGmres
+├── feast()                       ← linear FEAST outer loop (closures only)
+└── extract_eigenpairs()          ← interval selection + ascending sort
+
+ri_bse/feast_solver.rs            ← unchanged pre-/post-processing
+├── feast_solve_bse_{singlet,triplet,spin}
+├── feast_solve_bse_{tda,nontda}  ← build BSE matvecs, call solvers::feast
+├── rayleigh_ritz_refine()        ← renormalized-doubles full-basis projection
+├── reconstruct_nontda_pairs_to_xy()
+└── filter_eigenpairs() / print_ritz_eigenpairs()
+
+ri_tddft/feast_solver.rs          ← TDDFT wrappers call solvers::feast
+```
+
+The renormalized-doubles trick is preserved verbatim: Round 1 runs
+`feast_solve_bse_*` (s-only auxiliary basis) through `solvers::feast`, then
+`rayleigh_ritz_refine()` projects onto the full auxiliary basis.  No caller
+defaults change.
+
+---
+
+## 4. NLFEAST: `ri_bse/nonlinbse.rs` core → `solvers/nlfeast.rs`
+
+The context-independent part of `ri_bse/nonlinbse.rs` (the nonlinear FEAST
+subspace iteration of Gavin–Międlar–Polizzi 2018) moved to
+`solvers/nlfeast.rs`.  The kernel is generic over an `NlepOperator` trait and
+owns the selection, convergence test and contour-integral subspace update; the
+BSE-specific matvecs/projected solve/shifted solve are supplied by a
+`BseNlepOperator` adapter in `ri_bse/nonlinbse.rs`.
+
+```
+solvers/nlfeast.rs
+├── ContourNode / NLFeastResult
+├── trait NlepOperator
+│     projected_solve()  ← Qᴴ T(λ) Q y = 0
+│     t_real()           ← real-axis residual T(λ)x
+│     solve_shifted()    ← T(z)u = rhs
+├── qr_orthonormalise()  ← MGS QR, drops linearly dependent columns
+└── nlfeast()            ← Algorithm 1 subspace iteration
+
+ri_bse/nonlinbse.rs
+├── ContourNodeData / prepare_contour_nodes()
+├── compute_real_matvec() / compute_real_tda_matvec()
+├── solve_projected_bse() / solve_projected_tda()
+├── BlockDiagPrecond / gmres / make_shifted_*_matvec()
+├── BseNlepOperator      ← implements NlepOperator for BSE
+└── nlfeast_bse()        ← builds operator + initial subspace, calls kernel
+```
+
+### Bug found and fixed while testing
+
+`tests/test_nlfeast.rs` builds linear, Hermitian-quadratic, quartic and random
+quartic NLEVPs and compares against dense companion linearisations.  The kernel
+originally counted **spurious** Ritz values (Ritz pairs with no exact
+counterpart, residual ≫ tol) as eigenvalues inside the contour.  A single
+spurious value blocked the convergence test forever and then leaked into the
+final result.  The kernel now excludes interior Ritz pairs whose real-axis
+residual exceeds `SPURIOUS_RESIDUAL_TOL = 1e-2` from both the convergence test
+and the final result (the exclusion the original paper describes in §5).  All
+seven stress cases then find exactly the reference in-window spectrum.
+
+---
+
+## 5. Test coverage
 
 | Test suite | Count | Validates |
 |-----------|-------|-----------|
@@ -127,3 +205,5 @@ All solvers use the same Galerkin projection: `H = xs^T·(I+A)·xs`, `g = xs^T·
 | `test_davidson` | 1 | Davidson vs dsyev |
 | `test_analdrv` | 12 | Krylov (Hessian frequencies) |
 | `test_analdrv` | 12 | Hessian frequencies via `krylov_block` → `krylov_tsr`. Includes QR collapse test (H2O B3LYP/6-31G). |
+| `test_nlfeast` | 7 | NLFEAST vs dense companion linearisation: linear, Hermitian quadratic, quartic, random quartic, multiple windows, wide window (11 roots), clustered (1e-4 spacing) |
+| `bench_pool/gw_bse` FEAST | 2 | `NH3_BSE_FEAST` + `NH3_BSE_FEAST_Nontda` (renormalized doubles, TDA & non-TDA) match reference |

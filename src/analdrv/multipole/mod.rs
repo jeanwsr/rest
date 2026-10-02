@@ -2,8 +2,8 @@
 //!
 //! This module evaluates electric multipole moments (currently dipole, quadrupole, octupole and
 //! hexadecapole; higher orders can be added as further methods on the traits and drivers) of
-//! restricted SCF and double-hybrid (DH) type methods. The total moment is assembled from three
-//! kinds of contributions:
+//! restricted and unrestricted SCF methods, and (restricted only) double-hybrid (DH) type
+//! methods. The total moment is assembled from three kinds of contributions:
 //!
 //! - **Non-electronic (nuclear) part**: moments of the classical nuclear charges, described by
 //!   the [`MultipoleNucAPI`](trait_multipole::MultipoleNucAPI) trait. Currently the only
@@ -20,9 +20,11 @@
 //!   integral tensors.
 //!
 //! Unlike the hessian, the multipole evaluation is fully incremental (every contribution is a
-//! plain one-density contraction), so a single driver
-//! [`RMultipoleDH`](rmultipole::RMultipoleDH) handles both the SCF and the DH levels; the DH
-//! objects are simply optional fields of the driver.
+//! plain one-density contraction), so the restricted driver
+//! [`RMultipoleDH`](rmultipole::RMultipoleDH) handles both the SCF and the DH levels (the DH
+//! objects are simply optional fields of the driver), while the unrestricted driver
+//! [`UMultipoleDH`](umultipole::UMultipoleDH) covers the SCF level (the unrestricted DH
+//! increments are not implemented; the interface rejects post-SCF unrestricted methods).
 //!
 //! # Conventions
 //!
@@ -45,3 +47,4 @@ pub mod interface;
 pub mod nuc_charge;
 pub mod rmultipole;
 pub mod trait_multipole;
+pub mod umultipole;
