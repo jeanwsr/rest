@@ -332,7 +332,10 @@ impl RIRHFGradient<'_> {
             let tsr = self.scf_data.rimatr.as_ref().expect(msg);
             rt::asarray((&tsr.0.data, tsr.0.size, &device))
         };
-        let naux = ederi_utp.shape()[1];
+        // The auxiliary dimension of the *global* RI tensor. Under MPI the stored tensor holds
+        // only the column block of this rank (see `local_aux_function_range`), so the shape of
+        // `ederi_utp` is the local column count and must not be used as the auxiliary dimension.
+        let naux = mol_obj.num_auxbas;
 
         // Storage-level AO-pair pruning: the stored tensor holds the retained rows only, and every
         // contraction of the derivative runs over exactly those rows. The row set of the energy is
@@ -401,9 +404,10 @@ impl RIRHFGradient<'_> {
         // restriction every rank would redundantly redo the full auxiliary
         // loop, so the force calculation gets *slower* as the number of MPI
         // processes grows. The prepr quantities (j2c decomposition, `itm_j`,
-        // `itm_k_occtp`, the full 2c-2e `daux_*` seeds) still work on the
-        // complete matrix gathered by `eval_force`; the per-rank local
-        // contributions are combined afterwards with MPI reductions.
+        // `itm_k_occtp`, the full 2c-2e `daux_*` seeds) are built from this rank
+        // column block and all-gathered as small intermediate arrays, so the stored RI
+        // tensor itself stays distributed; the per-rank local contributions are combined
+        // afterwards with MPI reductions.
         let (aux_fn0, aux_fn1) = local_aux_function_range(naux, self.mpi_operator);
         let (aux_shl0, aux_shl1) = aux_function_range_to_shell_range(&aux_loc, aux_fn0, aux_fn1);
         let local_aux_partition = if aux_shl0 < aux_shl1 {
@@ -438,7 +442,15 @@ impl RIRHFGradient<'_> {
         let mut daux_j = rt::full(([], f64::NAN, &device));
         if self.flags.factor_j.is_some() {
             // the compacted tensor is contracted with the density on its own row space
-            itm_j = get_itm_j(&j2c_decomp, ederi_utp.view(), dm_tp_row.view());
+            itm_j = get_itm_j_columns(
+                &j2c_decomp,
+                ederi_utp.view(),
+                dm_tp_row.view(),
+                aux_fn0,
+                aux_fn1,
+                naux,
+                &self.mpi_operator,
+            );
             dao_j = rt::zeros(([nao, 3], &device));
         }
         if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
@@ -449,7 +461,16 @@ impl RIRHFGradient<'_> {
         let mut dao_k = rt::full(([], f64::NAN, &device));
         let mut daux_k = rt::full(([], f64::NAN, &device));
         if self.flags.factor_k.is_some() {
-            itm_k_occtp = get_itm_k_occtp(&j2c_decomp, ederi_utp.view(), weighted_occ_coeff.view(), pair_map);
+            itm_k_occtp = get_itm_k_occtp_columns(
+                &j2c_decomp,
+                ederi_utp.view(),
+                weighted_occ_coeff.view(),
+                pair_map,
+                aux_fn0,
+                aux_fn1,
+                naux,
+                &self.mpi_operator,
+            );
             dao_k = rt::zeros(([nao, 3], &device));
         }
         if self.flags.factor_k.is_some() && self.flags.auxbasis_response {
@@ -589,8 +610,16 @@ impl RIRHFGradient<'_> {
             time_records.count_start("de-jk prepr 3");
 
             // temporaries for de_sraux
-            let mut itm_r_occtp =
-                get_itm_k_occtp(&j2c_decomp_sr, ederi_utp_sr.view(), weighted_occ_coeff.view(), pair_map);
+            let mut itm_r_occtp = get_itm_k_occtp_columns(
+                &j2c_decomp_sr,
+                ederi_utp_sr.view(),
+                weighted_occ_coeff.view(),
+                pair_map,
+                aux_fn0,
+                aux_fn1,
+                naux,
+                &self.mpi_operator,
+            );
             dao_sr = rt::zeros(([nao, 3], &device));
             let itm_sr_aux = get_itm_k_aux(itm_r_occtp.view_mut());
             daux_sr = get_grad_daux_k_int2c2e_ip1(tsr_int2c2e_ip1.view(), itm_sr_aux.view());
@@ -1145,16 +1174,95 @@ pub fn get_grad_dao_ovlp(tsr_int1e_ipovlp: TsrView<f64>, dme0: TsrView<f64>) -> 
     return 2.0 * (tsr_int1e_ipovlp * dme0.i((.., .., None))).sum_axes(1);
 }
 
+/// Index, inside `ederi_utp`, of the first auxiliary column this rank owns.
+///
+/// The stored RI tensor comes in two forms. The distributed form left behind by the SCF carries
+/// only the column block of this rank, so its first column *is* the first column of the block. The
+/// gathered form, which the RI-TDDFT response path still requests, carries every auxiliary column
+/// and the block starts at `c0`. Both forms are accepted so that one code path serves both,
+/// and any other column count is a programming error rather than something to guess about.
+fn local_aux_offset(n_cols: usize, c0: usize, c1: usize, naux_total: usize) -> usize {
+    if n_cols == naux_total {
+        c0
+    } else if n_cols == c1 - c0 {
+        0
+    } else {
+        panic!(
+            "the stored RI tensor has {n_cols} auxiliary columns, which is neither the complete \
+             basis ({naux_total} columns) nor the local block of this rank ({} columns); cannot \
+             locate the local auxiliary slice",
+            c1 - c0
+        )
+    }
+}
+
+/// All-gather the auxiliary-column contribution of a matrix that is distributed over the MPI
+/// ranks by columns, following the same `average_distribution` split as the stored RI tensor.
+///
+/// `local` holds the columns `c0..c1` of the global `[n_row, naux_total]` matrix, in one
+/// column-major block. Without MPI, or on a single process, the block already is the whole matrix
+/// and is returned unchanged. Otherwise the block is all-gathered with the same variable-count
+/// all-gather that the SCF uses for the complete RI tensor, so the column order of the result is
+/// the global one and every entry keeps the value the full contraction produced.
+fn allgather_aux_columns(
+    local: Tsr<f64>,
+    naux_total: usize,
+    mpi_operator: &Option<crate::mpi_io::MPIOperator>,
+) -> Tsr<f64> {
+    #[cfg(feature = "mpi")]
+    if let Some(mpi_op) = mpi_operator {
+        if mpi_op.size > 1 {
+            let n_row = local.shape()[0];
+            let n_col = local.shape()[1];
+            let device = local.device().clone();
+            let data = local.into_shape(-1).into_raw();
+            let local_matrix = MatrixFull::from_vec([n_row, n_col], data)
+                .expect("the local column block holds n_row * n_col elements");
+            let full = crate::mpi_io::mpi_allgather_matrixfull_columns(
+                &mpi_op.world,
+                &local_matrix,
+                naux_total,
+            );
+            return rt::asarray((full.data, full.size, &device));
+        }
+    }
+    let _ = naux_total;
+    local
+}
+
 /// `dm_tp` is the packed density on the row space of `ederi_utp`: the full pair space of an
 /// unpruned tensor, the stored rows of a storage-level pruned one (see [`RIMatrRowSpace`]).
 pub fn get_itm_j(j2c_decomp: &J2CDecompose, ederi_utp: TsrView<f64>, dm_tp: TsrView<f64>) -> Tsr<f64> {
+    let naux = ederi_utp.shape()[1];
+    get_itm_j_columns(j2c_decomp, ederi_utp, dm_tp, 0, naux, naux, &None)
+}
+
+/// Column-restricted `get_itm_j` for an RI tensor that is distributed over the MPI ranks.
+///
+/// Only the columns `c0..c1` of `ederi_utp` (the auxiliary block this rank owns) enter the
+/// contraction with the density. The partial vector is all-gathered before the auxiliary-basis
+/// transformation, so the returned `[naux_total]` vector is the one the full contraction produces,
+/// while the auxiliary transformation stays a shared operation on `[naux_total]`.
+pub fn get_itm_j_columns(
+    j2c_decomp: &J2CDecompose,
+    ederi_utp: TsrView<f64>,
+    dm_tp: TsrView<f64>,
+    c0: usize,
+    c1: usize,
+    naux_total: usize,
+    mpi_operator: &Option<crate::mpi_io::MPIOperator>,
+) -> Tsr<f64> {
     // see module level documentation for details
     assert_eq!(
         dm_tp.shape()[0],
         ederi_utp.shape()[0],
         "the density and the decomposed ERI must live on the same AO-pair row space"
     );
-    return get_solved_j3c(dm_tp % ederi_utp, j2c_decomp, true);
+    let off = local_aux_offset(ederi_utp.shape()[1], c0, c1, naux_total);
+    let v_local =
+        (dm_tp % ederi_utp.i((.., off..off + (c1 - c0)))).into_shape([1, c1 - c0]);
+    let v = allgather_aux_columns(v_local, naux_total, mpi_operator).into_shape([naux_total]);
+    get_solved_j3c(v, j2c_decomp, true)
 }
 
 pub fn get_grad_daux_j_int2c2e_ip1(tsr_int2c2e_ip1: TsrView<f64>, itm_j: TsrView<f64>) -> Tsr<f64> {
@@ -1204,17 +1312,41 @@ pub fn get_itm_k_occtp(
     weighted_occ_coeff: TsrView<f64>,
     map: Option<&ri_jk::PairMap>,
 ) -> Tsr<f64> {
+    let naux = ederi_utp.shape()[1];
+    get_itm_k_occtp_columns(j2c_decomp, ederi_utp, weighted_occ_coeff, map, 0, naux, naux, &None)
+}
+
+/// Column-restricted `get_itm_k_occtp` for an RI tensor that is distributed over the MPI ranks.
+///
+/// Assembling the intermediate is a per-auxiliary-function operation, so each rank fills only its
+/// own columns `c0..c1` of the `[nocc_tp, naux_total]` array and the columns are all-gathered
+/// before the auxiliary-basis transformation. The transformation itself still acts on the complete
+/// `[nocc_tp, naux_total]` array, which is small next to the `[nbaspar, naux]` RI tensor (about
+/// 307 MB against 6.56 GiB for (H2O)30), so the result is the one the serial path produces while the
+/// large tensor never leaves its distributed form.
+pub fn get_itm_k_occtp_columns(
+    j2c_decomp: &J2CDecompose,
+    ederi_utp: TsrView<f64>,
+    weighted_occ_coeff: TsrView<f64>,
+    map: Option<&ri_jk::PairMap>,
+    c0: usize,
+    c1: usize,
+    naux_total: usize,
+    mpi_operator: &Option<crate::mpi_io::MPIOperator>,
+) -> Tsr<f64> {
     // see module level documentation for details
     assert!(ederi_utp.f_prefer());
     assert!(weighted_occ_coeff.f_prefer());
 
     let nao = weighted_occ_coeff.shape()[0];
     let nocc = weighted_occ_coeff.shape()[1];
-    let naux = ederi_utp.shape()[1];
     let nocc_tp = nocc * (nocc + 1) / 2;
     let device = ederi_utp.device().clone();
-    let tmp: Tsr<f64> = unsafe { rt::empty(([nocc_tp, naux], &device)) };
-    (0..naux).into_par_iter().for_each(|p| {
+    let tmp_local: Tsr<f64> = unsafe { rt::empty(([nocc_tp, c1 - c0], &device)) };
+    // the stored tensor may already hold only the local block, so index it in its own frame
+    let off = local_aux_offset(ederi_utp.shape()[1], c0, c1, naux_total);
+    (c0..c1).into_par_iter().enumerate().for_each(|(p_loc, _)| {
+        let p = off + p_loc;
         let ederi_bb = match map {
             // the packed column of an unpruned tensor zips straight onto the upper triangle
             None => ederi_utp.i((.., p)).unpack_triu(FlagSymm::Sy),
@@ -1234,9 +1366,10 @@ pub fn get_itm_k_occtp(
         };
         let ederi_oo = weighted_occ_coeff.t() % ederi_bb % &weighted_occ_coeff;
 
-        let mut tmp = unsafe { tmp.force_mut() };
-        tmp.i_mut((.., p)).assign(ederi_oo.pack_triu());
+        let mut tmp_local = unsafe { tmp_local.force_mut() };
+        tmp_local.i_mut((.., p_loc)).assign(ederi_oo.pack_triu());
     });
+    let tmp = allgather_aux_columns(tmp_local, naux_total, mpi_operator);
     get_solved_j3c(tmp, j2c_decomp, true)
 }
 
