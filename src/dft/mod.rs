@@ -5,6 +5,7 @@ pub mod deep_learning;
 pub mod libxc_itrf;
 pub mod xc_deriv;
 pub mod num_int;
+pub mod nlc;
 pub mod parse_xc;
 pub mod response;
 pub mod numint_matmul;
@@ -77,6 +78,7 @@ pub struct DFA4REST {
     pub dfa_paramr_pos: Option<Vec<f64>>,
     pub dfa_hybrid_pos: Option<f64>,
     pub dfa_paramr_adv: Option<Vec<f64>>,
+    pub nlc_vv10: Option<(f64, f64)>,
 }
 
 impl DFAFamily {
@@ -140,7 +142,9 @@ impl DFA4REST {
             dfa_compnt_pos: None, 
             dfa_paramr_pos: None, 
             dfa_hybrid_pos: None, 
-            dfa_paramr_adv: None }
+            dfa_paramr_adv: None,
+            nlc_vv10: None,
+        }
     }
     
     pub fn summary(&self, print_level: usize) {
@@ -273,6 +277,7 @@ impl DFA4REST {
             dfa_paramr_scf,
             dfa_hybrid_scf,
             dfa_rsh_scf,
+            nlc_vv10: None,
         }
     }
 
@@ -370,7 +375,15 @@ impl DFA4REST {
 
     pub fn parse_scf(name: &str, spin_channel: usize) -> DFA4REST {
         let tmp_name = name.to_lowercase();
-        let dfa_compnt_scf = DFA4REST::xc_func_init_fdqc(&tmp_name, spin_channel);
+        let legacy_nlc_ids: Option<Vec<usize>> = match tmp_name.as_str() {
+            "wb97x-v" => Some(vec![466]),
+            "wb97m-v" => Some(vec![531]),
+            _ => None,
+        };
+        let dfa_compnt_scf = match &legacy_nlc_ids {
+            Some(ids) => ids.clone(),
+            None => DFA4REST::xc_func_init_fdqc(&tmp_name, spin_channel),
+        };
         let mut dfa_hybrid_scf = DFA4REST::get_hybrid_libxc(&dfa_compnt_scf,spin_channel);
         // The HF reference carries the full exact exchange:
         // dfa_hybrid_scf = 1.0 so that every response consumer (TDDFT/
@@ -386,7 +399,7 @@ impl DFA4REST {
         let dfa_paramr_scf =  vec![1.0;dfa_compnt_scf.len()];
         let dfa_rsh_scf = DFA4REST::get_rsh_libxc(&dfa_compnt_scf, spin_channel);
 
-        DFA4REST {
+        let mut dfa = DFA4REST {
             spin_channel,
             dfa_family_pos: None,
             dfa_compnt_pos: None,
@@ -397,7 +410,16 @@ impl DFA4REST {
             dfa_paramr_scf,
             dfa_hybrid_scf,
             dfa_rsh_scf,
+            nlc_vv10: None,
+        };
+        if legacy_nlc_ids.is_some() {
+            dfa.nlc_vv10 = dfa
+                .dfa_compnt_scf
+                .iter()
+                .map(|id| dfa.init_libxc(id))
+                .find_map(|func| func.vv10_coef());
         }
+        dfa
     }
 
     pub fn parse_scf_nonstd(codelist: &Vec<String>, paramlist: &Vec<f64>, dfa_hybrid_scf: &f64, spin_channel: usize) -> DFA4REST {
@@ -430,6 +452,7 @@ impl DFA4REST {
             dfa_paramr_scf,
             dfa_hybrid_scf: *dfa_hybrid_scf,
             dfa_rsh_scf,
+            nlc_vv10: None,
         }
     }
 
@@ -479,7 +502,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("xygjos") {
             // XYGJ-OS functional
             // Proc. Natl. Acad. Sci. U.S.A. 108, 50, 19896-19900 (2011); https://pnas.org/doi/full/10.1073/pnas.1115123108
@@ -516,7 +540,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("xyg7") {
             // XYG7 functional 
             // J. Phys. Chem. Lett. 12, 10, 2638-2644 (2021); https://doi.org/10.1021/acs.jpclett.1c00360
@@ -553,8 +578,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("xyg2") {
             // XYG2 functional
             // Yan, W., PhD thesis, Fudan University, Shanghai, China (2022).
@@ -586,7 +611,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("xdh-pbe0") {
             // xDH-PBE0 functional
             // J. Chem. Phys. 136, 174103 (2012); https://doi.org/10.1063/1.3703893
@@ -620,7 +646,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("zrps") {
             // ZRPS
             // Phys. Rev. Lett. 117, 133002 (2016); https://doi.org/10.1103/PhysRevLett.117.133002
@@ -652,7 +679,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("rpa@b3lyp") {
             let dfa_family_pos = Some(DFAFamily::RPA);
             let dfa_compnt_pos: Option<Vec<usize>> = Some(vec![]);
@@ -678,7 +706,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("rpa@pbe") {
             let dfa_family_pos = Some(DFAFamily::RPA);
             let dfa_compnt_pos: Option<Vec<usize>> = Some(vec![]);
@@ -704,7 +733,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("scsrpa") {
             // scsRPA
             // J. Phys. Chem. Lett. 10, 10, 2617-2623 (2019); https://doi.org/10.1021/acs.jpclett.9b00946
@@ -732,7 +762,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("r-xdh7") {
             // R-xDH7
             // JACS Au 4, 8, 3205-3216 (2024); https://doi.org/10.1021/jacsau.4c00488
@@ -763,7 +794,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("mp2") {
             let dfa_family_pos = Some(DFAFamily::PT2);
             let dfa_compnt_pos: Option<Vec<usize>> = Some(vec![]);
@@ -788,7 +820,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("scs-mp2") {
             let dfa_family_pos = Some(DFAFamily::PT2);
             let dfa_compnt_pos: Option<Vec<usize>> = Some(vec![]);
@@ -816,7 +849,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("b2plyp") {
             // below are some popular B2PLYP-type DH functionals
             // B2PLYP
@@ -846,7 +880,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("b2gpplyp") {
             // B2GP-PLYP
             // J. Phys. Chem. A 2008, 112, 12868–12886.
@@ -875,7 +910,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("pbe-qidh") {
             // PBE-QIDH
             // J. Chem. Phys. 2014, 141, 031101.
@@ -903,7 +939,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("pbe0dh") {
             // PBE0-DH
             // J. Chem. Phys. 2011, 135, 024106.
@@ -931,7 +968,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("r-xyg3") {
             // Renormalized XYG3 functional (experimental)
             // Replaces PT2 correlation with sBGE2 in the post-SCF part
@@ -963,7 +1001,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("r-xygjos") {
             // Renormalized XYGJOS functional (experimental)
             // Replaces PT2 correlation with sBGE2 in the post-SCF part
@@ -1001,7 +1040,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("r-xyg7") {
             // Renormalized XYG7 functional (experimental)
             // Replaces PT2 correlation with sBGE2 in the post-SCF part
@@ -1039,7 +1079,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else if tmp_name.eq("r-xyg2") {
             // Renormalized XYG2 functional (experimental)
             let dfa_family_pos = Some(DFAFamily::SBGE2);
@@ -1069,7 +1110,8 @@ impl DFA4REST {
                 dfa_paramr_pos,
                 dfa_hybrid_pos,
                 dfa_rsh_scf: None,
-            })
+            nlc_vv10: None,
+        })
         } else {
             None
         }

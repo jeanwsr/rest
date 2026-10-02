@@ -105,6 +105,7 @@ pub struct SCF {
     pub current_smear_sigma: f64,
     pub grad_dm: [MatrixFull<f64>; 2],
     pub grids: Option<Grids>,
+    pub nlc_grids: Option<Grids>,
     pub empirical_dispersion_energy: f64,
     pub energies: HashMap<String,Vec<f64>>,
     pub ref_eigenvectors: HashMap<String, ([MatrixFull<f64>;2], [usize;4])>,
@@ -209,6 +210,7 @@ impl SCF {
             grad_dm: [MatrixFull::empty(), MatrixFull::empty()],
             empirical_dispersion_energy: 0.0,
             grids: None,
+            nlc_grids: None,
             energies: HashMap::new(),
             renormalized_singles_particles:Vec::new(),
             gwqp:(Vec::new(),Vec::new()),
@@ -714,6 +716,39 @@ impl SCF {
                     grids.ao = None;
                     grids.aop = None;
                 }
+            }
+        }
+
+        if self.mol.xc_data.nlc_vv10.is_some() && self.nlc_grids.is_none() {
+            let mut nlc_grids = Grids::build_with_level(&self.mol, self.mol.ctrl.grid_gen_level);
+            nlc_grids.prepare_tabulated_ao(&self.mol);
+            if self.mol.ctrl.print_level > 0 {
+                info!("NLC (VV10) grid size: {}", nlc_grids.coordinates.len());
+            }
+            self.nlc_grids = Some(nlc_grids);
+        }
+    }
+
+    fn evaluate_nlc_vv10(&self) -> Option<(f64, Vec<MatrixUpper<f64>>)> {
+        let (b, c) = self.mol.xc_data.nlc_vv10?;
+        let grids = self.nlc_grids.as_ref()?;
+        Some(crate::dft::nlc::vv10_exc_vxc(
+            &self.mol,
+            grids,
+            &self.density_matrix,
+            b,
+            c,
+        ))
+    }
+
+    fn add_nlc_vv10(&self, exc_total: &mut f64, vxc: &mut [MatrixUpper<f64>]) {
+        if let Some((nlc_exc, nlc_vxc)) = self.evaluate_nlc_vv10() {
+            *exc_total += nlc_exc;
+            for (vxc_s, nlc_s) in vxc.iter_mut().zip(nlc_vxc.iter()) {
+                vxc_s.data
+                    .iter_mut()
+                    .zip(nlc_s.data.iter())
+                    .for_each(|(v, n)| *v += n);
             }
         }
     }
@@ -3182,6 +3217,8 @@ impl SCF {
 
         exc_total = exc_spin.iter().sum();
 
+        self.add_nlc_vv10(&mut exc_total, &mut vxc);
+
 
         if scaling_factor!=1.0f64 {
             exc_total *= scaling_factor;
@@ -3325,6 +3362,10 @@ impl SCF {
         #[cfg(not(feature = "mpi"))]
         let (total_elec, tot_exc, tot_xc) = self.generate_vxc_rayon_dm_only(scaling_factor);
 
+        let mut tot_exc = tot_exc;
+        let mut tot_xc = tot_xc;
+        self.add_nlc_vv10(&mut tot_exc, &mut tot_xc);
+
         if self.mol.spin_channel==1 {
             debug!("total electron number: {:16.8}", total_elec[0]);
         } else {
@@ -3373,6 +3414,10 @@ impl SCF {
         };
         #[cfg(not(feature = "mpi"))]
         let (total_elec, tot_exc, tot_xc) = self.generate_vxc_rayon(scaling_factor);
+
+        let mut tot_exc = tot_exc;
+        let mut tot_xc = tot_xc;
+        self.add_nlc_vv10(&mut tot_exc, &mut tot_xc);
 
         if self.mol.spin_channel==1 {
             debug!("total electron number: {:16.8}", total_elec[0]);
