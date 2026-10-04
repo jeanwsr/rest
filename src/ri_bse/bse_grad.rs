@@ -1532,7 +1532,12 @@ pub(crate) fn empty_qp_cache(target: usize) -> QpCache {
     QpCache {
         target,
         omega: 0.0,
+        freq: 0.0,
         z_factor: 0.0,
+        dsigma_domega: 0.0,
+        static_fallback: false,
+        linearized: false,
+        lin_shift: 0.0,
         w_imag: Vec::new(),
         y_imag: Vec::new(),
         m_imag: Vec::new(),
@@ -1671,6 +1676,15 @@ impl<'a> BseGradEngine<'a> {
         gw.evict_qt_blocks();
         crate::hessian::memory_monitor::trim_to_os(0);
         if std::env::var("REST_BSE_QP_DEBUG").is_ok() {
+            let eps = crate::ri_gw::current_orbital_energies(scf);
+            for n in 0..gw.nmo {
+                eprintln!(
+                    "[bse_grad qp] n={n:3}  eps={:12.8}  qp={:12.8}  shift={:+.3e}  lin={}",
+                    eps[n], qp_energies[n], qp_energies[n] - eps[n], qp_caches[n].linearized
+                );
+            }
+        }
+        if std::env::var("REST_BSE_QP_DEBUG").is_ok() {
             let bytes: usize = qp_caches
                 .iter()
                 .map(|c| {
@@ -1679,7 +1693,11 @@ impl<'a> BseGradEngine<'a> {
                         + c.m_imag.len() * 8
                         + c.w0.len() * 8
                         + c.y0_static.len() * 8
-                        + c.residues.iter().map(|(_, _, _, y, y0)| (y.len() + y0.len()) * 8).sum::<usize>()
+                        + c.residues
+                            .iter()
+                            .flat_map(|r| r.entries.iter())
+                            .map(|e| (e.y.len() + e.y0.len()) * 8)
+                            .sum::<usize>()
                 })
                 .sum();
             println!(
@@ -1891,6 +1909,15 @@ impl<'a> BseGradEngine<'a> {
                 .collect();
             self.gw
                 .qp_pullback_chunk_public(&page, &flat_weights, col0, &mut scr);
+            // Orbitals whose QP energy came from the linearized (one-step
+            // Newton) branch carry an extra omega-derivative channel
+            // (`Z^2 * lin_shift * d_R d_omega Sigma_c`).  It is run on the same
+            // page immediately, while the caches are still resident, instead of
+            // keeping a second covector set or rebuilding the page.
+            if page.iter().any(|c| c.linearized) {
+                self.gw
+                    .qp_pullback_chunk_omega_public(&page, &flat_weights, col0, &mut scr);
+            }
             col0 = end;
         }
         let (mut bq, mut bj, mut be, bb) = self.gw.qp_pullback_streaming_finish(scr);

@@ -6,8 +6,9 @@
 //! REST's own LR-CD G0W0 energy functional (`ri_gw::gw_calculations_lowrank`
 //! / `newton_solver_lowrank_v2`) — the contour-deformation decomposition with
 //! REST's real-symmetric screened response, REST's imaginary-axis quadrature
-//! grids, REST's nearest-neighbour real-axis residue interpolation and REST's
-//! finite-difference Newton root finder — and differentiates it exactly.
+//! grids, REST's real-axis residue interpolation (`low_rank_interp`: nearest
+//! grid point or linear between bracketing nodes, the latter by default) and
+//! REST's finite-difference Newton root finder — and differentiates it exactly.
 //!
 //! By default the differentiated functional is the **static-subtracted**
 //! self-energy of the full-CD engine (see [`GwCdGradEngine`]),
@@ -18,7 +19,7 @@
 //!                         + s_m pf_m (W_m(zeta_m) - W_m(0)) ],
 //!
 //! with the *same* residue protocol (pole selection, `pole_factor` smoothing,
-//! nearest-grid quantisation) as REST's raw LR energy.  The static
+//! `low_rank_interp` interpolation) as REST's raw LR energy.  The static
 //! subtraction removes the artificial pole-selection jump of the raw
 //! decomposition at `omega = e_m`, making the QP energy — and therefore its
 //! gradient — well defined even when a quasiparticle energy coincides with a
@@ -47,10 +48,16 @@
 //!   gradient matches finite differences of REST's low-rank energy.  Use a
 //!   tight tolerance (1e-10) for validation runs.
 //! * The pole selection, `pole_factor` smoothing, frequency grids, real-axis
-//!   grid construction (de_max scan, linear/quadratic nodes, nearest-neighbour
-//!   lookup) and the QP Newton iteration all follow REST's production
-//!   low-rank path (`ri_gw::contour_rayon_lowrank`, `generate_real_axis_vchiv`,
+//!   grid construction (de_max scan, linear/quadratic nodes) and the QP Newton
+//!   iteration all follow REST's production low-rank path
+//!   (`ri_gw::contour_rayon_lowrank`, `generate_real_axis_vchiv`,
 //!   `newton_solver_lowrank`).
+//! * [`GwGradConfig::low_rank_interp`] mirrors the energy path's
+//!   `low_rank_interp` keyword.  The real-axis nodes are built from `de_max`,
+//!   which depends on the reference geometry, so the gradient also carries the
+//!   node-motion channel `d z_i / dR = (d z_i / d de_max)(d de_max / dR)`; the
+//!   interpolation weight adds `d t / dR`.  Both are exact, and the FD
+//!   validation in `tests/gw_bse/test_gw_bse_interp.rs` covers the two rules.
 //! * The reference is a restricted closed-shell density-fitted calculation
 //!   without frozen orbitals: HF, pure-DFA (GGA) and global-hybrid references
 //!   are supported.  The static term `B_n = (1-alpha) Sigma_x,nn - v_xc,nn`
@@ -147,6 +154,71 @@ pub struct GwGradConfig {
     /// the exact mode is the smooth continuous-CD limit (PySCF-like) and is
     /// better suited to finite-difference validation.
     pub exact_residue_z: bool,
+    /// How the low-rank real-axis response is interpolated **between** the grid
+    /// points, mirroring the energy path's `RealAxisVChiV::interp` and REST's
+    /// `low_rank_interp` control keyword:
+    ///
+    /// * `0` — nearest grid point (piecewise constant, the historical rule and
+    ///   MolGW's `sf_interpolate_vsqrt_chi_vsqrt`);
+    /// * `1` — linear interpolation between the two bracketing grid points.
+    ///
+    /// The gradient must differentiate the *same* functional whose root the QP
+    /// solver found, so this has to agree with the energy path.  REST's
+    /// `low_rank_interp` defaults to `"linear"`, and the two rules only
+    /// converge as the real-axis grid is refined (`nomega_chi_real`), so a
+    /// mismatch shows up as an analytic/FD discrepancy that cannot be removed
+    /// by tightening any other knob.  Ignored by the exact-residue protocol
+    /// (`exact_residue_z`), which never evaluates the grid.
+    pub low_rank_interp: usize,
+    /// Enable the **graphical scan** as a rescue when the Newton iteration on the
+    /// QP equation stalls (`GwGradConfig::qpe_graphical` selects it as the
+    /// primary solver instead).
+    ///
+    /// With `false` the cascade is strictly `Newton -> linearized (one-step
+    /// Newton) -> static on-shell`.  The graphical scan is derivative-free, so
+    /// it can bracket a sign change that lies *inside* a residue jump -- a point
+    /// where the self-energy is not differentiable and where the analytic
+    /// gradient (which needs `dSigma_c/domega` and the node sensitivities) has
+    /// no derivative to offer.  Turning it off keeps every branch of the cascade
+    /// a smooth function of the geometry, at the price of the accuracy the scan
+    /// would have recovered.
+    pub graphical_rescue: bool,
+    /// Replace the hard `0 / 0.5 / 1` residue `pole_factor` ladder by the C^1
+    /// cubic switch with the same endpoints and the same `0.5` at `z = 0`.
+    ///
+    /// The ladder is a pair of genuine **value jumps** in `Sigma_c` at
+    /// `|e_m - omega| = res_tol`, and a QP root of a high virtual sits right on
+    /// top of its own pole (`z = 0`), so the finite difference of such a root
+    /// does not converge (measured `|analytic - FD| ~ 15 * h` for orbital 23 of
+    /// water).  The analytic gradient cannot represent a jump; the switch
+    /// removes it, and `Residue::weight_slope` then also carries the missing
+    /// `d(pole_factor)/dz * W` term, so the analytic gradient is again the exact
+    /// derivative of the evaluated functional.
+    pub smooth_pole: bool,
+    /// `|E_KS|` above which the QP energy is taken from the **static on-shell**
+    /// fallback instead of a root of the QP equation (REST
+    /// `gw_switch_fallback_threshold`, default `1e6` = never):
+    ///
+    /// ```text
+    /// E_qp = E_KS + Sigma_x - V_xc + Re Sigma_c(E_KS)      (Z = 1)
+    /// ```
+    ///
+    /// MolGW's `EVSC` / `se%nomega = 0` rule.  The same evaluation is used when
+    /// a root finder cannot bracket a crossing, and it is what the energy path
+    /// (`ri_gw::scgw::single_orbital_gw` and its low-rank variants) returns in
+    /// both situations.  `0.0` selects it for every orbital.
+    ///
+    /// The gradient is then the derivative of that functional, which is **not**
+    /// the root gradient: the self-energy frequency is the mean-field `e_n`
+    /// (it does not follow the QP energy) and there is no `Z` factor, while the
+    /// explicit `e_n`-dependence adds `(d Sigma_c/d omega) d e_n/dR`.
+    ///
+    /// Only **occupied** levels are eligible: the rule fires when
+    /// `e_n < 0` **and** `-e_n > static_fallback_threshold`.  Virtual levels
+    /// are never forced onto it by this test.  Default **1.0 Ha**, so a deep
+    /// core level (e.g. the O `1s` of water at -20.5 Ha) is treated on-shell
+    /// while valence levels keep the root functional.
+    pub static_fallback_threshold: f64,
     /// Tolerance (Hartree) for recognising symmetry-protected **degenerate**
     /// orbital shells of the reference (default `1e-8`).
     ///
@@ -258,6 +330,40 @@ pub struct GwGradConfig {
     /// static-coupling estimate (`e_n + Sigma(e_n)`) and reports the root as
     /// unconverged (`qp_equation_value` then has a large residual).
     pub qpe_graphical: bool,
+    /// Orbital indices whose quasiparticle energy must be taken from the
+    /// **static on-shell fallback** instead of a root of the quasiparticle
+    /// equation (see [`QpCache::static_fallback`]).
+    ///
+    /// The branch that [`Self::build_target_cache`] selects depends on the
+    /// nuclear geometry (the graphical scan finds a sign change at some
+    /// displacements and not at others), so the QP energy — and therefore the
+    /// quantity being differentiated — is a *discontinuous* function of the
+    /// geometry.  A central finite difference then evaluates a different
+    /// functional on the two sides and cannot reproduce the analytic gradient.
+    /// Pinning this set to the one the reference geometry selected puts both
+    /// sides on the same branch, which is the only way to validate the
+    /// remaining (continuous) derivative machinery.  Empty by default.
+    pub force_static_fallback: Vec<usize>,
+    /// Validation pin of the **linearized** branch: orbitals listed here always
+    /// take [`Self::linearized_cache`], independent of the root search.  Like
+    /// [`Self::force_static_fallback`] it exists so that a central finite
+    /// difference evaluates one and the same functional at every geometry (a
+    /// root whose `Z` sits near `z_min` can otherwise flip branch between the
+    /// two displaced geometries).  Empty by default.
+    pub force_linearized: Vec<usize>,
+    /// Spectral-weight floor of the root branch.  When the converged root
+    /// carries `Z = 1/(1 - dSigma_c/domega) < z_min`, the quasiparticle energy
+    /// is instead taken from the **linearized (one-step Newton)** functional
+    ///
+    /// ```text
+    /// E_lin = e_n + Z(e_n) * [ consts_n + Re Sigma_c(e_n) - e_n ]
+    /// ```
+    ///
+    /// evaluated at the *mean-field* level `e_n` rather than at the root.  The
+    /// same branch is taken whenever the root search itself fails to converge.
+    /// `0.0` (or negative) disables the rule and restores the historical
+    /// behaviour (root, or the static on-shell fallback on failure).
+    pub z_min: f64,
     /// Define the LR-CD self-energy through the **static-subtracted continuous**
     /// form of [`GwCdGradEngine`] (the default), evaluated with REST's low-rank
     /// response factors — see the module header.  Numerically identical to the
@@ -287,6 +393,10 @@ impl Default for GwGradConfig {
             qpe_tol: 1.0e-11,
             qpe_max_iter: 100,
             exact_residue_z: false,
+            static_fallback_threshold: 1.0,
+            low_rank_interp: 1,
+            graphical_rescue: false,
+            smooth_pole: false,
             degenerate_tol: 1.0e-8,
             phase_mask: 0b111,
             skip_lr_cache: false,
@@ -300,6 +410,9 @@ impl Default for GwGradConfig {
             compact_qp_cache: false,
             subtracted: true,
             qpe_graphical: false,
+            force_static_fallback: Vec::new(),
+            force_linearized: Vec::new(),
+            z_min: 0.3,
         }
     }
 }
@@ -326,6 +439,10 @@ impl GwGradConfig {
             step_sigma: qp.step_sigma,
             selfenergy_state_range: qp.selfenergy_state_range,
             omega_chi_max: qp.omega_chi_max,
+            static_fallback_threshold: qp.gw_switch_fallback_threshold,
+            low_rank_interp: if qp.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 },
+            graphical_rescue: qp.gradient_graphical_rescue,
+            smooth_pole: qp.gradient_smooth_pole,
             ..Default::default()
         }
     }
@@ -1104,6 +1221,20 @@ fn build_lr_factor(
             cols.push(vecs[r + v * naux]);
         }
     }
+    if std::env::var("REST_GWGRAD_LRDBG").is_ok() {
+        // how close is this (node) frequency to an RPA pole of the low-rank
+        // Dyson equation `lam = lam0/(1-lam0)`?  `min|1-lam0|` is the distance
+        // of the closest retained `chi0` eigenvalue to the pole.
+        let max_lam = eigval.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        let min_gap = order
+            .iter()
+            .map(|&v| (1.0 - vals[v]).abs())
+            .fold(f64::INFINITY, f64::min);
+        println!(
+            "[lr] part={part} z={omega:.8} keep={} max|lam|={max_lam:.3e} min|1-lam0|={min_gap:.3e}",
+            eigval.len()
+        );
+    }
     LrFactor { omega, eigvec: cols, eigval, n_aux: naux }
 }
 
@@ -1211,13 +1342,90 @@ impl LrFactor {
 // per-geometry GW gradient engine
 // ---------------------------------------------------------------------------
 
+/// One low-rank response factor that contributes to a residue pole.
+///
+/// The exact-residue and nearest-grid protocols use a single entry per pole;
+/// the linear-interpolation protocol uses the two bracketing grid factors, so
+/// the pole's response is the convex combination
+/// `(1-t) W(z_lo) + t W(z_hi)` and the gradient of each factor is pulled back
+/// with its own weight.
+#[derive(Clone)]
+pub struct ResidueEntry {
+    /// signed weight `sign(e_m - omega) * pole_factor * split` (`split` is
+    /// `1` for a single-entry protocol and `1-t` / `t` for the linear one)
+    pub weight: f64,
+    /// the frequency this factor was built at
+    pub z: f64,
+    /// `d node(z) / d de_max` of this factor's grid node (`0` in the
+    /// exact-residue protocol and whenever the grid is pinned).
+    pub node_sens: f64,
+    /// response vector `y = (J - Q)^{-1} q_nm`
+    pub y: Vec<f64>,
+    /// metric partner `y0 = J^{-1} q_nm`
+    pub y0: Vec<f64>,
+}
+
+/// One active residue pole of the real-axis contour term, as consumed by the
+/// gradient pullback.
+#[derive(Clone)]
+pub struct Residue {
+    /// mean-field pole index `m`
+    pub m: usize,
+    /// `sign(e_m - omega) * pole_factor` of the pole (the sum of the entry
+    /// weights), used by the static-subtraction bookkeeping
+    pub pole_weight: f64,
+    /// `d W_m / d omega` of the **interpolation weight**, divided by the
+    /// `-zsign = -sign(e_m - omega)` that the pullback applies, i.e.
+    /// plus, with `smooth_pole`, the `d(pole_factor)/dz * W` half of the same
+    /// derivative (the historical hard ladder has a zero there).
+    ///
+    /// * `exact`   : `pole_weight * dW/dz` (the factor frequency follows `e_m`);
+    /// * `linear`  : `pole_weight * (W_hi - W_lo)/(z_hi - z_lo)`;
+    /// * `nearest` : `0` (a grid node does not move with `e_m`).
+    pub weight_slope: f64,
+    /// Interpolation weight `t` of the upper bracketing node (`0` when the
+    /// pole has a single entry).  Together with `secant` it lets the pullback
+    /// rebuild the grid-node channel `d W_m/d de_max` from the entries'
+    /// response vectors, so the (comparatively expensive) `d W/dz` contraction
+    /// is only paid once per cache instead of once per Newton step.
+    pub interp_t: f64,
+    /// Secant `(W_hi - W_lo)/(z_hi - z_lo)` of the linear rule (`0` otherwise)
+    pub secant: f64,
+    pub entries: Vec<ResidueEntry>,
+}
+
 /// One converged QP state: energy, renormalisation factor and the response
 /// data needed by the pullback.
 #[derive(Clone)]
 pub struct QpCache {
     pub target: usize,
+    /// the quasiparticle energy this cache describes
     pub omega: f64,
+    /// The frequency the self-energy was evaluated at: the QP root for a solved
+    /// state, and the **mean-field** `e_n` for the static on-shell fallback
+    /// ([`Self::static_fallback`]).  Everything in the pullback that reads
+    /// `omega - e_m` (the axis kernel, `pole_factor`, the residue sign) must use
+    /// this, not [`Self::omega`].
+    pub freq: f64,
+    /// `1/(1 - d Sigma_c/d omega)` at [`Self::freq`] for a solved root, and
+    /// exactly `1` for the static fallback.
     pub z_factor: f64,
+    /// `d Sigma_c/d omega` at [`Self::freq`] — the quantity behind
+    /// [`Self::z_factor`].  The static fallback's gradient needs it as the
+    /// weight of `d e_n/dR`.
+    pub dsigma_domega: f64,
+    /// The QP energy is the **static on-shell** value `consts_n + Re Sigma_c(e_n)`
+    /// (no root search, `Z = 1`) rather than a root of the QP equation.
+    pub static_fallback: bool,
+    /// The QP energy comes from the **linearized (one-step Newton)** functional
+    /// at the mean-field frequency `freq = e_n`, `Z = 1/(1 - dSigma_c/domega)`,
+    /// `omega = e_n + Z * lin_shift`.  Its gradient carries an extra
+    /// `Z^2 * lin_shift * d_R d_omega Sigma_c` term (the omega-derivative
+    /// pullback channel) on top of the usual `Z`-scaled one.
+    pub linearized: bool,
+    /// `consts_n + Re Sigma_c(e_n) - e_n`, the bracket the linearized branch
+    /// multiplies by `Z`.  Zero for every other branch.
+    pub lin_shift: f64,
     /// W_c[n, m](iu) at every quadrature point [n_freq][nmo]
     pub w_imag: Vec<Vec<f64>>,
     /// (u, y[naux*nmo], y0[naux*nmo]) per quadrature point.  Empty when the
@@ -1240,9 +1448,8 @@ pub struct QpCache {
     /// it from `m_imag` through the static low-rank factor.  Empty when the
     /// engine runs raw/full-CD.
     pub y0_static: Vec<f64>,
-    /// (m, sign*pole_factor, z_used, y_res[naux], y0_metric[naux]) per
-    /// active residue
-    pub residues: Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)>,
+    /// active residue poles (see [`Residue`])
+    pub residues: Vec<Residue>,
 }
 
 /// The LR-CD G0W0 analytic-gradient engine for one geometry.
@@ -1294,6 +1501,10 @@ pub struct GwGradEngine<'a> {
     pub quad: Vec<(f64, f64)>,
     /// real-axis sampling grid (REST protocol)
     pub z_grid: Vec<f64>,
+    /// `d z_grid[i] / d de_max` (see [`RealAxisGrid::node_sens`])
+    pub z_grid_sens: Vec<f64>,
+    /// the transition energy that sets `de_max` (see [`GridMover`])
+    pub z_grid_mover: Option<GridMover>,
     /// Cached low-rank factors on the imaginary axis. Evictable with `evict_qt`: only the QP-cache
     /// construction reads them, and `with_lr` rebuilds them from `qtia` on demand.
     pub lr_imag: RefCell<Vec<LrFactor>>,
@@ -1605,12 +1816,12 @@ impl<'a> GwGradEngine<'a> {
 
         // ---- REST real-axis grid (de_max scan + linear/quadratic nodes;
         //      LR-only) ----
-        let z_grid = if config.skip_lr_cache {
-            Vec::new()
+        let (z_grid, z_grid_sens, z_grid_mover) = if config.skip_lr_cache {
+            (Vec::new(), Vec::new(), None)
         } else {
             let nsemin = (nocc - 1).saturating_sub(config.selfenergy_state_range);
             let nsemax = (nocc + config.selfenergy_state_range).min(nmo - 1);
-            build_real_axis_grid(
+            let g = build_real_axis_grid(
                 &e,
                 nocc,
                 config.nomega_chi_real,
@@ -1621,12 +1832,29 @@ impl<'a> GwGradEngine<'a> {
                 config.res_tol,
                 config.grid_type,
                 config.omega_chi_max,
-            )
+                config.degenerate_tol,
+            );
+            // `REST_GWGRAD_ZGRID=1` dumps the real-axis layout: the node count,
+            // the range and the spacing decide how well the quantised residue
+            // protocol resolves a pole, and the auto rule rarely does what the
+            // `nomega_chi_real` value suggests.
+            if std::env::var("REST_GWGRAD_ZGRID").is_ok() {
+                eprintln!(
+                    "[zgrid] n={} range={:.6}..{:.6} d={:.6}",
+                    g.nodes.len(),
+                    g.nodes.first().copied().unwrap_or(0.0),
+                    g.nodes.last().copied().unwrap_or(0.0),
+                    g.nodes.windows(2).next().map(|w| w[1] - w[0]).unwrap_or(0.0)
+                );
+            }
+            (g.nodes, g.node_sens, g.mover)
         };
 
         // ---- reference static-term data and low-rank factors (LR-only) ----
         let hybrid = scf.mol.xc_data.dfa_hybrid_scf;
-        let fock_hyb = if scf.mol.xc_data.dfa_compnt_scf.is_empty() { 1.0 } else { hybrid };
+        // a plain HF reference counts as a hybrid with alpha = 1: its orbital
+        // energies already carry the exact exchange (see `ri_gw::exchange_fraction`)
+        let fock_hyb = crate::ri_gw::exchange_fraction(scf);
         let vxc_nn = crate::ri_gw::vxc_ao2mo(scf);
         let vxc_mo: Vec<f64> = if scf.mol.xc_data.dfa_compnt_scf.is_empty() {
             Vec::new()
@@ -1670,6 +1898,8 @@ impl<'a> GwGradEngine<'a> {
                 de_ia,
                 quad,
                 z_grid,
+                z_grid_sens,
+                z_grid_mover,
                 lr_imag: RefCell::new(Vec::new()),
                 lr_grid: RefCell::new(Vec::new()),
                 lr_static: RefCell::new(None),
@@ -1724,6 +1954,8 @@ impl<'a> GwGradEngine<'a> {
                 de_ia,
                 quad,
                 z_grid,
+                z_grid_sens,
+                z_grid_mover,
                 lr_imag: RefCell::new(lr_imag),
                 lr_grid: RefCell::new(lr_grid),
                 lr_static: RefCell::new(None),
@@ -2055,45 +2287,93 @@ impl<'a> GwGradEngine<'a> {
         self.e[n] + exchange * (1.0 - self.fock_hyb) - self.vxc_nn[n]
     }
 
-    /// One pole contribution of the contour term with REST's protocol
-    /// (`pole_factor` smoothing, nearest-grid frequency, sign convention).
-    /// Value — and, when `collect`, the response vectors — of one pole
-    /// contribution `w = sum_P qnm[P] (y[P] - y0[P])` through a given factor.
-    #[allow(clippy::type_complexity)]
-    fn pole_value(
-        &self,
-        factor: &LrFactor,
-        mm: &[f64],
-        m: usize,
-        sign_pf: f64,
-        z_used: f64,
-        collect: bool,
-        residues: &mut Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)>,
-    ) -> f64 {
-        if !collect {
-            // the value alone does not need the response vectors, but the
-            // static-subtracted rebalance reads the (m, sign*pole_factor)
-            // metadata, so the row is recorded with empty vectors
-            residues.push((m, sign_pf, z_used, Vec::new(), Vec::new()));
-            return factor.response_value_from_qt(mm, 1)[0];
+    /// Bracket `(lo, hi, t)` of the real-axis grid around `z`, mirroring the
+    /// energy path's `ri_gw::interpolate_vchiv_bracket`: the interpolated
+    /// operator is `(1-t) M(grid[lo]) + t M(grid[hi])`, and `t = 0` outside the
+    /// grid (`lo == hi`).
+    fn lr_bracket(&self, z: f64) -> (usize, usize, f64) {
+        let zs = &self.z_grid;
+        let n = zs.len();
+        if n <= 1 || z <= zs[0] {
+            return (0, 0, 0.0);
         }
-        // `y = s_metric * (qt + corr)` and `y0 = s_metric * qt`
-        let corr = factor.correction_from_qt(mm, 1);
-        let y0 = gemm_nn(&self.s_metric, self.naux, self.naux, mm, self.naux, 1);
-        let sc = gemm_nn(&self.s_metric, self.naux, self.naux, &corr, self.naux, 1);
-        let y: Vec<f64> = y0.iter().zip(sc.iter()).map(|(a, b)| a + b).collect();
-        // the signed factor carries pole_factor so that every consumer
-        // (value, d/domega zeta term, pullback) stays consistent
-        residues.push((m, sign_pf, z_used, y, y0));
-        mm.iter().zip(corr.iter()).map(|(a, b)| a * b).sum()
+        if z >= zs[n - 1] {
+            return (n - 1, n - 1, 0.0);
+        }
+        let (mut lo, mut hi) = (0usize, n - 1);
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if zs[mid] < z {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let t = ((z - zs[lo]) / (zs[hi] - zs[lo])).clamp(0.0, 1.0);
+        (lo, hi, t)
     }
 
-    /// One pole contribution of the contour term with REST's protocol
-    /// (`pole_factor` smoothing, nearest-grid frequency, sign convention).
-    ///
-    /// Only the exact-residue mode evaluates poles one by one; the production
-    /// quantised protocol goes through [`Self::add_poles`], which batches them.
-    #[allow(clippy::type_complexity)]
+    /// Grid sensitivity `dz/d(de_max)` of the node nearest to `z` (the
+    /// quantised protocol reads the node value, which moves with the geometry
+    /// whenever the grid is built from `de_max`).
+    fn lr_node_sens(&self, idx: usize) -> f64 {
+        self.z_grid_sens.get(idx).copied().unwrap_or(0.0)
+    }
+
+    /// `d W_m / d z` of a pole whose response vector is `y`: the response
+    /// diagonal is the only `z`-dependent ingredient, so
+    /// `sum_ia (y . q_ia)^2 d d_ia(z)/dz`.
+    fn residue_dwdz(&self, y: &[f64], z: f64) -> f64 {
+        let naux = self.naux;
+        let nov = self.de_ia.len();
+        let mut sum = 0.0f64;
+        for col in 0..nov {
+            let mut proj = 0.0f64;
+            for p in 0..naux {
+                proj += y[p] * self.qia[p + col * naux];
+            }
+            sum += proj * proj * dd_response_dz_single(self.de_ia[col], z, self.config.eta);
+        }
+        sum
+    }
+
+    /// `y = s_metric * (qt + corr)` and `y0 = s_metric * qt` of one pole from
+    /// the factor's metric intermediate `qt = S q_nm`.
+    fn residue_vectors(&self, factor: &LrFactor, qt: &[f64]) -> (Vec<f64>, Vec<f64>) {
+        let naux = self.naux;
+        let corr = factor.correction_from_qt(qt, 1);
+        let y0 = gemm_nn(&self.s_metric, naux, naux, qt, naux, 1);
+        let sc = gemm_nn(&self.s_metric, naux, naux, &corr, naux, 1);
+        let y: Vec<f64> = y0.iter().zip(sc.iter()).map(|(a, b)| a + b).collect();
+        (y, y0)
+    }
+
+    /// One value-only residue record (the static-subtracted rebalance reads
+    /// only the pole index and the weight; the pullback never runs on it).
+    fn push_value_residue(
+        m: usize,
+        pole_weight: f64,
+        z: f64,
+        residues: &mut Vec<Residue>,
+    ) {
+        residues.push(Residue {
+            m,
+            pole_weight,
+            weight_slope: 0.0,
+            interp_t: 0.0,
+            secant: 0.0,
+            entries: vec![ResidueEntry {
+                weight: pole_weight,
+                z,
+                node_sens: 0.0,
+                y: Vec::new(),
+                y0: Vec::new(),
+            }],
+        });
+    }
+
+    /// One pole contribution of the contour term in the **exact-residue**
+    /// protocol (`z = |e_m - omega|`, a fresh diagonalisation per pole).
     fn add_pole(
         &self,
         m: usize,
@@ -2101,104 +2381,184 @@ impl<'a> GwGradEngine<'a> {
         n: usize,
         collect: bool,
         contour: &mut f64,
-        residues: &mut Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)>,
+        residues: &mut Vec<Residue>,
     ) {
-        if de < -self.config.res_tol {
+        let (pole_factor, pole_factor_slope) = self.pole_factor_and_slope(de);
+        if pole_factor == 0.0 && pole_factor_slope == 0.0 {
             return;
         }
-        let pole_factor = if de.abs() < self.config.res_tol { 0.5 } else { 1.0 };
         let sign = if m < self.nocc { -1.0 } else { 1.0 };
-        let z_used = if self.config.exact_residue_z {
-            de.abs()
-        } else {
-            nearest_grid_value(&self.z_grid, de.abs())
-        };
+        let pole_weight = sign * pole_factor;
+        let pole_weight_slope = sign * pole_factor_slope;
+        let z_used = de.abs();
         let qnm = self.with_q(|q| self.gather_pair(q, n, m));
         // `qt = s_metric * qnm` (the intermediate of the factor) and
         // `w = sum_P qnm[P] (y[P] - y0[P]) = sum_P qt[P] corr[P]`
         let mm = gemm_nn(&self.s_metric, self.naux, self.naux, &qnm, self.naux, 1);
-        let w = if self.config.exact_residue_z {
-            // fresh diagonalisation at the true residue frequency
-            let factor = self.with_qtia(|qtia| {
-                build_lr_factor(
-                    qtia, self.naux, self.de_ia.len(), &self.de_ia,
-                    z_used, 'R', self.config.eta, self.config.low_rank_tolerance,
-                )
-            });
-            self.pole_value(&factor, &mm, m, sign * pole_factor, z_used, collect, residues)
-        } else {
-            let idx = self.lr_factor_nearest_idx(z_used);
-            self.ensure_lr_grid_factor(idx);
-            let guard = self.lr_grid.borrow();
-            let factor = guard[idx].as_ref().expect("bse_grad: grid factor missing");
-            self.pole_value(factor, &mm, m, sign * pole_factor, z_used, collect, residues)
-        };
-        *contour += sign * pole_factor * w;
+        // fresh diagonalisation at the true residue frequency
+        let factor = self.with_qtia(|qtia| {
+            build_lr_factor(
+                qtia, self.naux, self.de_ia.len(), &self.de_ia,
+                z_used, 'R', self.config.eta, self.config.low_rank_tolerance,
+            )
+        });
+        let w = factor.response_value_from_qt(&mm, 1)[0];
+        *contour += pole_weight * w;
+        if !collect {
+            Self::push_value_residue(m, pole_weight, z_used, residues);
+            return;
+        }
+        let (y, y0) = self.residue_vectors(&factor, &mm);
+        let dwdz = self.residue_dwdz(&y, z_used);
+        residues.push(Residue {
+            m,
+            pole_weight,
+            // the factor frequency follows `e_m`, so `dW/de_m = dwdz * zsign`;
+            // `pole_weight_slope * w` is the `d(pole_factor)/dz` half.
+            weight_slope: pole_weight * dwdz + pole_weight_slope * w,
+            interp_t: 0.0,
+            secant: 0.0,
+            // the exact protocol never reads the grid, so the entries carry no
+            // node sensitivity
+            entries: vec![ResidueEntry {
+                weight: pole_weight,
+                z: z_used,
+                node_sens: 0.0,
+                y,
+                y0,
+            }],
+        });
     }
 
     /// Residue (contour) part of the self-energy of orbital `n` at `omega`.
     ///
-    /// All poles of the active branch are evaluated **together, grouped by the
-    /// real-axis grid frequency they share** (`nearest_grid_value` maps many
-    /// transition energies onto the same cached low-rank factor): gathering the
-    /// pole columns into one `[naux, ncol]` block turns the per-pole
-    /// matrix-vector products against `s_metric` (one full `naux^2` read each,
-    /// 6.4 MB at naphthalene/def2-SVP, per pole and per Newton step) into a
-    /// handful of BLAS-3 products.  The exact-residue mode (fresh factor per
-    /// pole) keeps the per-pole route.
-    #[allow(clippy::type_complexity)]
+    /// The active poles are evaluated **together, grouped by the response
+    /// factors they share**: in the quantised protocols many transition
+    /// energies map onto the same pair of cached low-rank factors, and
+    /// gathering the pole columns into one `[naux, ncol]` block turns the
+    /// per-pole matrix-vector products against `s_metric` (one full `naux^2`
+    /// read each) into a handful of BLAS-3 products.  The exact-residue
+    /// protocol needs a fresh factor per pole and keeps the per-pole route.
+    ///
+    /// The interpolation rule is [`GwGradConfig::low_rank_interp`] and must
+    /// match the energy path, which defaults to `"linear"`.
     fn add_poles(
         &self,
         omega: f64,
         n: usize,
         collect: bool,
         contour: &mut f64,
-        residues: &mut Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)>,
+        residues: &mut Vec<Residue>,
     ) {
         let nocc = self.nocc;
-        let naux = self.naux;
         let ef = 0.5 * (self.e[nocc - 1] + self.e[nocc]);
         if self.config.exact_residue_z {
-            if omega > ef {
-                for a in nocc..self.nmo {
-                    let de = omega - self.e[a];
-                    self.add_pole(a, de, n, collect, contour, residues);
-                }
+            let branch: Box<dyn Iterator<Item = usize>> = if omega > ef {
+                Box::new(nocc..self.nmo)
             } else {
-                for i in 0..nocc {
-                    let de = self.e[i] - omega;
-                    self.add_pole(i, de, n, collect, contour, residues);
-                }
+                Box::new(0..nocc)
+            };
+            for m in branch {
+                let de = if omega > ef { omega - self.e[m] } else { self.e[m] - omega };
+                self.add_pole(m, de, n, collect, contour, residues);
             }
+            return;
+        }
+        if self.config.low_rank_interp == 1 {
+            self.add_poles_linear(omega, n, collect, contour, residues);
+        } else {
+            self.add_poles_nearest(omega, n, collect, contour, residues);
+        }
+    }
+
+    /// Active residue poles of orbital `n` at `omega`: `(m, signed pole
+    /// factor, |e_m - omega|)`, with REST's branch and `pole_factor` rules.
+    /// `pole_factor` of a residue pole and its derivative with respect to the
+    /// pole frequency `z = |e_m - omega|`.
+    ///
+    /// Historical **hard ladder** (`smooth_pole = false`): `0` for
+    /// `de < -res_tol`, `0.5` for `|de| < res_tol`, `1` above.  That is two
+    /// value jumps in `Sigma_c`, and they sit exactly where the QP root of a
+    /// high virtual lives, so the analytic gradient (a derivative *between* the
+    /// jumps) cannot match a central difference.
+    ///
+    /// **C^1 switch** (`smooth_pole = true`): the cubic smoothstep with the same
+    /// endpoints and the same `0.5` at `z = 0`, but continuous everywhere.  The
+    /// pullback then receives the matching `d(pole_factor)/dz * W` contribution
+    /// through `Residue::weight_slope`.
+    fn pole_factor_and_slope(&self, de: f64) -> (f64, f64) {
+        let w = self.config.res_tol;
+        if w <= 0.0 {
+            return (1.0, 0.0);
+        }
+        if !self.config.smooth_pole {
+            if de < -w {
+                return (0.0, 0.0);
+            }
+            return (if de.abs() < w { 0.5 } else { 1.0 }, 0.0);
+        }
+        let t = (de / w).clamp(-1.0, 1.0);
+        let f = 0.5 * (1.0 + 0.5 * (3.0 * t - t * t * t));
+        let df = if t.abs() >= 1.0 {
+            0.0
+        } else {
+            0.25 * (3.0 - 3.0 * t * t) / w
+        };
+        (f, df)
+    }
+
+    /// Active residue poles of orbital `n` at `omega`:
+    /// `(m, signed pole factor, |e_m - omega|, d(pole factor)/dz)`.
+    fn active_poles(&self, omega: f64) -> Vec<(usize, f64, f64, f64)> {
+        let nocc = self.nocc;
+        let ef = 0.5 * (self.e[nocc - 1] + self.e[nocc]);
+        let above = omega > ef;
+        let branch: Box<dyn Iterator<Item = usize>> =
+            if above { Box::new(nocc..self.nmo) } else { Box::new(0..nocc) };
+        let mut out = Vec::new();
+        for m in branch {
+            let de = if above { omega - self.e[m] } else { self.e[m] - omega };
+            let (f, df) = self.pole_factor_and_slope(de);
+            if !self.config.smooth_pole && de < -self.config.res_tol {
+                continue;
+            }
+            if f == 0.0 && df == 0.0 {
+                continue;
+            }
+            let sign = if m < nocc { -1.0 } else { 1.0 };
+            out.push((m, sign * f, de.abs(), sign * df));
+        }
+        out
+    }
+
+    /// Quantised protocol with the **nearest grid point** rule: the response
+    /// factor is the one at `nearest_grid_value(z_grid, |de|)`.
+    fn add_poles_nearest(
+        &self,
+        omega: f64,
+        n: usize,
+        collect: bool,
+        contour: &mut f64,
+        residues: &mut Vec<Residue>,
+    ) {
+        let naux = self.naux;
+        let poles = self.active_poles(omega);
+        if poles.is_empty() {
             return;
         }
         // group the poles by the index of their nearest grid frequency
         let mut groups: std::collections::BTreeMap<usize, Vec<(usize, f64, f64, f64)>> =
             std::collections::BTreeMap::new();
-        let branch: Box<dyn Iterator<Item = usize>> = if omega > ef {
-            Box::new(nocc..self.nmo)
-        } else {
-            Box::new(0..nocc)
-        };
-        for m in branch {
-            let de = if omega > ef { omega - self.e[m] } else { self.e[m] - omega };
-            if de < -self.config.res_tol {
-                continue;
-            }
-            let pole_factor = if de.abs() < self.config.res_tol { 0.5 } else { 1.0 };
-            let sign = if m < nocc { -1.0 } else { 1.0 };
-            let z_used = nearest_grid_value(&self.z_grid, de.abs());
+        for (m, pw, de, pws) in poles {
+            let z_used = nearest_grid_value(&self.z_grid, de);
             groups
                 .entry(self.lr_factor_nearest_idx(z_used))
                 .or_default()
-                .push((m, sign * pole_factor, z_used, de));
-        }
-        if groups.is_empty() {
-            return;
+                .push((m, pw, z_used, pws));
         }
         self.ensure_lr();
         self.ensure_q();
-        for (idx, poles) in groups.iter() {
+        for idx in groups.keys() {
             self.ensure_lr_grid_factor(*idx);
         }
         let lr_grid = self.lr_grid.borrow();
@@ -2206,7 +2566,8 @@ impl<'a> GwGradEngine<'a> {
         for (idx, poles) in groups.iter() {
             let factor = lr_grid[*idx]
                 .as_ref()
-                .expect("bse_grad: real-axis factor missing");
+                .expect("gw_grad: real-axis factor missing");
+            let sens = self.lr_node_sens(*idx);
             let ncol = poles.len();
             // gather the `q[:, n, m]` columns of this group
             let mut qmat = vec![0.0f64; naux * ncol];
@@ -2216,30 +2577,164 @@ impl<'a> GwGradEngine<'a> {
             }
             let qt = gemm_nn(&self.s_metric, naux, naux, &qmat, naux, ncol);
             let w = factor.response_value_from_qt(&qt, ncol);
-            for (c, &(_, sign_pf, _, _)) in poles.iter().enumerate() {
-                *contour += sign_pf * w[c];
+            for (c, &(_, pw, _, _)) in poles.iter().enumerate() {
+                *contour += pw * w[c];
             }
             if !collect {
-                // value-only callers still read the (m, sign*pole_factor)
-                // metadata of the active poles (static-subtracted rebalance)
-                for &(m, sign_pf, z_used, _) in poles.iter() {
-                    residues.push((m, sign_pf, z_used, Vec::new(), Vec::new()));
+                for &(m, pw, z_used, _) in poles.iter() {
+                    Self::push_value_residue(m, pw, z_used, residues);
                 }
                 continue;
             }
             let y0 = gemm_nn(&self.s_metric, naux, naux, &qt, naux, ncol);
             let corr = factor.correction_from_qt(&qt, ncol);
             let sc = gemm_nn(&self.s_metric, naux, naux, &corr, naux, ncol);
-            for (c, &(m, sign_pf, z_used, _)) in poles.iter().enumerate() {
-                let y: Vec<f64> = y0[c * naux..(c + 1) * naux]
-                    .iter()
-                    .zip(sc[c * naux..(c + 1) * naux].iter())
+            for (c, &(m, pw, z_used, pw_slope)) in poles.iter().enumerate() {
+                let y0c = y0[c * naux..(c + 1) * naux].to_vec();
+                let y: Vec<f64> = y0c.iter().zip(sc[c * naux..(c + 1) * naux].iter())
                     .map(|(a, b)| a + b)
                     .collect();
-                // the signed factor carries pole_factor so that every
-                // consumer (value, d/domega zeta term, pullback) stays
-                // consistent
-                residues.push((m, sign_pf, z_used, y, y0[c * naux..(c + 1) * naux].to_vec()));
+                residues.push(Residue {
+                    m,
+                    pole_weight: pw,
+                    // a grid node does not follow `e_m`; only the smooth
+                    // `pole_factor` moves with the pole
+                    weight_slope: pw_slope * w[c],
+                    interp_t: 0.0,
+                    secant: 0.0,
+                    entries: vec![ResidueEntry { weight: pw, z: z_used, node_sens: sens, y, y0: y0c }],
+                });
+            }
+        }
+    }
+
+    /// Quantised protocol with the **linear interpolation** rule (the energy
+    /// path's default): the pole response is
+    /// `(1-t) W(z_lo) + t W(z_hi)` with `t` from the bracketing grid nodes, and
+    /// the gradient carries both the weight derivative (`dt/dR`) and the
+    /// movement of the two nodes.
+    fn add_poles_linear(
+        &self,
+        omega: f64,
+        n: usize,
+        collect: bool,
+        contour: &mut f64,
+        residues: &mut Vec<Residue>,
+    ) {
+        let naux = self.naux;
+        let poles = self.active_poles(omega);
+        if poles.is_empty() {
+            return;
+        }
+        // group by the bracketing pair of grid nodes; `t` stays per column
+        let mut groups: std::collections::BTreeMap<(usize, usize), Vec<(usize, f64, f64, f64, f64)>> =
+            std::collections::BTreeMap::new();
+        for (m, pw, z, pws) in poles {
+            let (lo, hi, t) = self.lr_bracket(z);
+            groups.entry((lo, hi)).or_default().push((m, pw, t, z, pws));
+        }
+        self.ensure_lr();
+        self.ensure_q();
+        for (lo, hi) in groups.keys() {
+            self.ensure_lr_grid_factor(*lo);
+            self.ensure_lr_grid_factor(*hi);
+        }
+        let lr_grid = self.lr_grid.borrow();
+        let q_all = self.q.borrow();
+        for ((lo, hi), poles) in groups.iter() {
+            let single = lo == hi;
+            let (z_lo, sens_lo) = (self.z_grid[*lo], self.lr_node_sens(*lo));
+            let (z_hi, sens_hi) = (self.z_grid[*hi], self.lr_node_sens(*hi));
+            let f_lo = lr_grid[*lo].as_ref().expect("gw_grad: real-axis factor missing");
+            let f_hi = lr_grid[*hi].as_ref().expect("gw_grad: real-axis factor missing");
+            let ncol = poles.len();
+            let mut qmat = vec![0.0f64; naux * ncol];
+            for (c, &(m, ..)) in poles.iter().enumerate() {
+                let base = self.pair_col(n, m) * naux;
+                qmat[c * naux..(c + 1) * naux].copy_from_slice(&q_all[base..base + naux]);
+            }
+            let qt = gemm_nn(&self.s_metric, naux, naux, &qmat, naux, ncol);
+            let w_lo = f_lo.response_value_from_qt(&qt, ncol);
+            let w_hi = if single { None } else { Some(f_hi.response_value_from_qt(&qt, ncol)) };
+            for (c, &(_, pw, t, _, _)) in poles.iter().enumerate() {
+                let wv = match w_hi.as_ref() {
+                    None => w_lo[c],
+                    Some(wh) => (1.0 - t) * w_lo[c] + t * wh[c],
+                };
+                *contour += pw * wv;
+            }
+            if !collect {
+                for &(m, pw, _, z, _) in poles.iter() {
+                    Self::push_value_residue(m, pw, z, residues);
+                }
+                continue;
+            }
+            let y0 = gemm_nn(&self.s_metric, naux, naux, &qt, naux, ncol);
+            let corr_lo = f_lo.correction_from_qt(&qt, ncol);
+            let sc_lo = gemm_nn(&self.s_metric, naux, naux, &corr_lo, naux, ncol);
+            let hi_pair = if single {
+                None
+            } else {
+                let ch = f_hi.correction_from_qt(&qt, ncol);
+                let sh = gemm_nn(&self.s_metric, naux, naux, &ch, naux, ncol);
+                Some(sh)
+            };
+            for (c, &(m, pw, t, _, pw_slope)) in poles.iter().enumerate() {
+                let wv = match w_hi.as_ref() {
+                    None => w_lo[c],
+                    Some(wh) => (1.0 - t) * w_lo[c] + t * wh[c],
+                };
+                let col = c * naux..(c + 1) * naux;
+                let y0c = y0[col.clone()].to_vec();
+                let y_lo: Vec<f64> =
+                    y0c.iter().zip(sc_lo[col.clone()].iter()).map(|(a, b)| a + b).collect();
+                if single {
+                    // outside the grid (or a single-node grid) the clamped value
+                    // only follows its one node
+                    residues.push(Residue {
+                        m,
+                        pole_weight: pw,
+                        weight_slope: 0.0,
+                        interp_t: 0.0,
+                        secant: 0.0,
+                        entries: vec![ResidueEntry {
+                            weight: pw,
+                            z: z_lo,
+                            node_sens: sens_lo,
+                            y: y_lo,
+                            y0: y0c,
+                        }],
+                    });
+                    continue;
+                }
+                let sc_hi = hi_pair.as_ref().expect("gw_grad: hi factor missing");
+                let y_hi: Vec<f64> =
+                    y0c.iter().zip(sc_hi[col].iter()).map(|(a, b)| a + b).collect();
+                let wh = w_hi.as_ref().expect("gw_grad: hi value missing");
+                let secant = (wh[c] - w_lo[c]) / (z_hi - z_lo);
+                residues.push(Residue {
+                    m,
+                    pole_weight: pw,
+                    weight_slope: pw * secant + pw_slope * wv,
+                    interp_t: t,
+                    secant,
+                    entries: vec![
+                        ResidueEntry {
+                            weight: pw * (1.0 - t),
+                            z: z_lo,
+                            node_sens: sens_lo,
+                            y: y_lo,
+                            y0: y0c.clone(),
+                        },
+                        ResidueEntry {
+                            weight: pw * t,
+                            z: z_hi,
+                            node_sens: sens_hi,
+                            y: y_hi,
+                            y0: y0c,
+                        },
+                    ],
+                });
             }
         }
     }
@@ -2278,7 +2773,7 @@ impl<'a> GwGradEngine<'a> {
         f64,
         f64,
         Vec<(f64, Vec<f64>, Vec<f64>)>,
-        Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)>,
+        Vec<Residue>,
     ) {
         let want_y = want_y && collect;
         let mut imag = 0.0f64;
@@ -2305,7 +2800,7 @@ impl<'a> GwGradEngine<'a> {
         }
         // contour (residue) part with REST pole selection and nearest grid
         let mut contour = 0.0f64;
-        let mut residues: Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)> = Vec::new();
+        let mut residues: Vec<Residue> = Vec::new();
         self.add_poles(omega, n, collect, &mut contour, &mut residues);
         // ---- static-subtracted rebalance (see the module header) ----
         // Sigma_sub = Sigma_raw + sum_m [A_m + 1/2 - f_m - a_m] W_m(0),
@@ -2324,8 +2819,8 @@ impl<'a> GwGradEngine<'a> {
                 imag -= a_m * table.w0[m];
                 contour += (0.5 - f_m) * table.w0[m];
             }
-            for &(m, a_m, _z, ..) in residues.iter() {
-                contour -= a_m * table.w0[m];
+            for r in residues.iter() {
+                contour -= r.pole_weight * table.w0[r.m];
             }
         }
         (contour, imag, y_imag_all, residues)
@@ -2344,7 +2839,7 @@ impl<'a> GwGradEngine<'a> {
         f64,
         Vec<Vec<f64>>,
         Vec<(f64, Vec<f64>, Vec<f64>)>,
-        Vec<(usize, f64, f64, Vec<f64>, Vec<f64>)>,
+        Vec<Residue>,
         Vec<f64>,
     ) {
         let table = self.qp_row_table(n);
@@ -2473,7 +2968,7 @@ impl<'a> GwGradEngine<'a> {
         omega: f64,
         w_imag: &[Vec<f64>],
         w0: &[f64],
-        residues: &[(usize, f64, f64, Vec<f64>, Vec<f64>)],
+        residues: &[Residue],
     ) -> f64 {
         let mut d = 0.0f64;
         for (wi, &(u, wgt)) in self.quad.iter().enumerate() {
@@ -2494,24 +2989,52 @@ impl<'a> GwGradEngine<'a> {
                 d += sum_0 * wgt / TWO_PI;
             }
         }
-        if self.config.exact_residue_z {
-            let nov = self.de_ia.len();
-            for &(m, sign, z_used, ref y_r, ref _y0) in residues {
-                let zsign = if self.e[m] - omega >= 0.0 { 1.0 } else { -1.0 };
-                let mut sum = 0.0f64;
-                for col in 0..nov {
-                    let mut proj = 0.0f64;
-                    for p in 0..self.naux {
-                        proj += y_r[p] * self.qia[p + col * self.naux];
-                    }
-                    sum += proj * proj
-                        * dd_response_dz_single(self.de_ia[col], z_used, self.config.eta);
-                }
-                d += sign * (-zsign) * sum;
-                let _ = m;
+        // Residue contribution to `d Sigma / d omega`.  `weight_slope` is
+        // `dW_m/dz` of the interpolation rule (the factor is evaluated at the
+        // exact `|e_m - omega|` in the exact protocol, so its frequency follows
+        // `omega`; a grid node does not move with `omega`, so the nearest rule
+        // contributes nothing here), and `z = |e_m - omega|` adds `-zsign`.
+        if self.config.exact_residue_z || self.config.low_rank_interp == 1 {
+            for r in residues {
+                let zsign = if self.e[r.m] - omega >= 0.0 { 1.0 } else { -1.0 };
+                d += (-zsign) * r.weight_slope;
             }
         }
         d
+    }
+
+    /// `d^2 Sigma_c / d omega^2` at fixed geometry, from already-collected
+    /// response data (`w_imag[wi][m]` and the static row `w0`).
+    ///
+    /// Only the imaginary-axis integral contributes: the residue weights of the
+    /// linear interpolation rule have a **constant** slope on each bracketing
+    /// interval (the grid nodes do not move with `omega`), and the
+    /// exact-residue protocol is rejected by the omega channel of the pullback.
+    /// The static `W(0)` subtraction enters through `w0` exactly as in
+    /// [`Self::sigma_d_from_parts`].
+    fn sigma_d2_from_parts(&self, omega: f64, w_imag: &[Vec<f64>], w0: &[f64]) -> f64 {
+        let mut d2 = 0.0f64;
+        for (wi, &(u, wgt)) in self.quad.iter().enumerate() {
+            let w = &w_imag[wi];
+            let mut sum_m = 0.0;
+            for m in 0..self.nmo {
+                let t = omega - self.e[m];
+                let dd = t * t + u * u;
+                // d^2/d omega^2 [ 2t/(t^2+u^2) ] with `t = omega - e_m`
+                sum_m += -4.0 * t * (3.0 * u * u - t * t) / (dd * dd * dd) * w[m];
+            }
+            d2 -= sum_m * wgt / TWO_PI;
+            if !w0.is_empty() {
+                let mut sum_0 = 0.0;
+                for m in 0..self.nmo {
+                    let t = omega - self.e[m];
+                    let dd = t * t + u * u;
+                    sum_0 += -4.0 * t * (3.0 * u * u - t * t) / (dd * dd * dd) * w0[m];
+                }
+                d2 += sum_0 * wgt / TWO_PI;
+            }
+        }
+        d2
     }
 
     /// `Sigma_c` and `d Sigma_c / d omega` in one pass: the imaginary-axis
@@ -2548,6 +3071,120 @@ impl<'a> GwGradEngine<'a> {
         self.build_target_cache_with(n, false)
     }
 
+    /// Cache of the **static on-shell** quasiparticle energy
+    ///
+    /// ```text
+    /// E = consts_n + Re Sigma_c(e_n),      consts_n = e_n + (1-a)Sigma_x,nn - v_xc,nn
+    /// ```
+    ///
+    /// i.e. MolGW's `EVSC` / `se%nomega = 0` rule: the self-energy is evaluated
+    /// **once at the mean-field energy**, there is no root search and no `Z`
+    /// renormalisation.  Selected by [`GwGradConfig::static_fallback_threshold`]
+    /// for deep levels, and used whenever a root finder cannot bracket a
+    /// crossing (which is what the energy path does in both cases).
+    ///
+    /// The frequency does **not** follow the QP energy, so the pullback must use
+    /// [`QpCache::freq`] and the gradient carries the extra
+    /// `(d Sigma_c/d omega) * d e_n/dR` term (`dsigma_domega`); see
+    /// [`QpCache::static_fallback`].
+    /// One-step Newton ("linearized") quasiparticle energy
+    ///
+    /// ```text
+    /// f(w)   = w - consts_n - Sigma_c(w)
+    /// E_lin  = e_n - f(e_n)/f'(e_n) = e_n + Z(e_n) [ consts_n + Sigma_c(e_n) - e_n ]
+    /// Z(w)   = 1/(1 - dSigma_c/dw)
+    /// ```
+    ///
+    /// Used whenever the root search does not converge, or when the converged
+    /// root carries a spectral weight below `GwGradConfig::z_min`.  The
+    /// self-energy frequency is the **mean-field** `e_n`, so the analytic
+    /// gradient carries the extra `Z^2 * lin_shift * d_R d_omega Sigma_c` term
+    /// (the omega-derivative pullback channel) in addition to the usual
+    /// `Z`-scaled one.
+    /// One-step Newton ("linearized") branch guarded by the **physical
+    /// spectral weight**: the step is only meaningful while `Z > 0`.  A
+    /// non-positive `Z` means the slope of the QP equation at the
+    /// linearization point has the wrong sign (`d Sigma_c/d omega > 1`), so the
+    /// step runs away from `e_n` instead of interpolating towards the root
+    /// (observed: `Z = -62.9` moves orbital 18 of water/def2-SVP by -2.4 Ha).
+    /// Such an orbital uses the static on-shell energy instead, which depends
+    /// smoothly on the geometry.
+    fn linearized_guarded(
+        &self,
+        n: usize,
+        consts: f64,
+        table: &QpRowTable,
+        want_y: bool,
+    ) -> QpCache {
+        let (sigma_n, dsdw) = self.sigma_c_and_d_with(self.e[n], n, table);
+        let z = 1.0 / (1.0 - dsdw);
+        if !(z > 0.0) {
+            let shift = consts + sigma_n - self.e[n];
+            println!(
+                "warning!!! gw_grad orbital {n}: linearized (one-step Newton) Z = {z:.4} \
+                 is not positive (step would be {:+.3e} Ha); using the static on-shell energy",
+                z * shift
+            );
+            return self.static_fallback_cache(n, consts, table, want_y);
+        }
+        self.linearized_cache(n, consts, table, want_y)
+    }
+
+    fn linearized_cache(&self, n: usize, consts: f64, table: &QpRowTable, want_y: bool) -> QpCache {
+        let e_n = self.e[n];
+        let (sigma_n, dsdw_n) = self.sigma_c_and_d_with(e_n, n, table);
+        let z = 1.0 / (1.0 - dsdw_n);
+        let shift = consts + sigma_n - e_n;
+        let (_c, _i, y_imag, residues) = self.sigma_c_parts_with(e_n, n, true, want_y, table);
+        QpCache {
+            target: n,
+            omega: e_n + z * shift,
+            freq: e_n,
+            z_factor: z,
+            dsigma_domega: dsdw_n,
+            static_fallback: false,
+            linearized: true,
+            lin_shift: shift,
+            w_imag: table.w_imag.clone(),
+            y_imag: if want_y { y_imag } else { Vec::new() },
+            m_imag: self.compact_m_imag(&table.m, !want_y),
+            w0: table.w0.clone(),
+            y0_static: self.compact_y0_static(&table.m, &table.w0, want_y),
+            residues,
+        }
+    }
+
+    fn static_fallback_cache(
+        &self,
+        n: usize,
+        consts: f64,
+        table: &QpRowTable,
+        want_y: bool,
+    ) -> QpCache {
+        let freq = self.e[n];
+        let (contour, imag, y_imag, residues) =
+            self.sigma_c_parts_with(freq, n, true, want_y, table);
+        let dsdw = self.sigma_d_from_parts(freq, &table.w_imag, &table.w0, &residues);
+        let m_imag = self.compact_m_imag(&table.m, !want_y);
+        let y0_static = self.compact_y0_static(&table.m, &table.w0, want_y);
+        QpCache {
+            target: n,
+            omega: consts + contour - imag,
+            freq,
+            z_factor: 1.0,
+            dsigma_domega: dsdw,
+            static_fallback: true,
+            linearized: false,
+            lin_shift: 0.0,
+            w_imag: table.w_imag.clone(),
+            y_imag: if want_y { y_imag } else { Vec::new() },
+            m_imag,
+            w0: table.w0.clone(),
+            y0_static,
+            residues,
+        }
+    }
+
     /// Shared body of [`Self::build_target_cache`] and
     /// [`Self::build_target_cache_compact`]; `want_y` keeps the full
     /// `y`/`y0` response of every quadrature point in the cache.
@@ -2559,6 +3196,24 @@ impl<'a> GwGradEngine<'a> {
         // energy, so it is built once and reused by every Newton step (and by
         // the final cache assembly) instead of once per evaluation.
         let table = self.qp_row_table(n);
+        // REST `gw_switch_fallback_threshold`: deep levels (and any state whose
+        // QP equation cannot be solved) use the static on-shell energy instead
+        // of a root — see `GwGradConfig::static_fallback_threshold`.
+        // One-step on-shell (static) treatment: only **occupied** mean-field
+        // levels below `-static_fallback_threshold` are forced onto it.
+        let deeply_occupied = self.e[n] < 0.0
+            && -self.e[n] > self.config.static_fallback_threshold;
+        if deeply_occupied || self.config.force_static_fallback.contains(&n) {
+            return self.static_fallback_cache(n, consts, &table, want_y);
+        }
+        // Validation pin (`gradient_force_linearized`): take the linearized
+        // branch regardless of what the root search would do, so that a
+        // displaced geometry cannot switch the branch under a finite
+        // difference.  It is checked **before** the root solve so the branch is
+        // the same functional at every geometry.
+        if self.config.force_linearized.contains(&n) {
+            return self.linearized_guarded(n, consts, &table, want_y);
+        }
         // REST production **graphical solver** (`GwGradConfig::qpe_graphical`):
         // no Newton iteration at all — the linear-interpolation scan of
         // `ri_gw::linear_interpolation_solver` defines the root.  A scan
@@ -2584,7 +3239,12 @@ impl<'a> GwGradEngine<'a> {
             return QpCache {
                 target: n,
                 omega,
+                freq: omega,
                 z_factor: 1.0 / (1.0 - dsdw),
+                dsigma_domega: dsdw,
+                static_fallback: false,
+                linearized: false,
+                lin_shift: 0.0,
                 w_imag,
                 y_imag,
                 m_imag,
@@ -2626,6 +3286,22 @@ impl<'a> GwGradEngine<'a> {
                 // the root).  Grid scanning is immune to that: reuse the
                 // production graphical solver, which brackets the sign change
                 // on a grid and interpolates linearly inside it.
+                if self.config.exact_residue_z {
+                    println!(
+                        "warning!!! gw_grad Newton did not converge for orbital {n}; \
+                         using the static on-shell energy (the continuous-residue \
+                         protocol has no omega-derivative channel)"
+                    );
+                    return self.static_fallback_cache(n, consts, &table, want_y);
+                }
+                if !self.config.graphical_rescue {
+                    println!(
+                        "warning!!! gw_grad Newton did not converge for orbital {n}; \
+                         using the linearized (one-step Newton) functional \
+                         (graphical_rescue = false)"
+                    );
+                    return self.linearized_guarded(n, consts, &table, want_y);
+                }
                 let mut fq = |om: f64| consts + self.sigma_c(om, n) - om;
                 let (have_crossing, xg) =
                     crate::ri_gw::linear_interpolation_solver(&fq, self.e[n], side, 21, 0.1);
@@ -2640,9 +3316,10 @@ impl<'a> GwGradEngine<'a> {
                     converged = 1;
                 } else {
                     println!(
-                        "warning!!! gw_grad Newton (exact mode) did not converge for orbital {}!",
-                        n
+                        "warning!!! gw_grad Newton (exact mode) did not converge for orbital {n}; \
+                         using the linearized (one-step Newton) functional"
                     );
+                    return self.linearized_guarded(n, consts, &table, want_y);
                 }
             }
             let omega = x;
@@ -2656,7 +3333,12 @@ impl<'a> GwGradEngine<'a> {
             return QpCache {
                 target: n,
                 omega,
+                freq: omega,
                 z_factor: 1.0 / (1.0 - dsdw),
+                dsigma_domega: dsdw,
+                static_fallback: false,
+                linearized: false,
+                lin_shift: 0.0,
                 w_imag,
                 y_imag,
                 m_imag,
@@ -2705,6 +3387,22 @@ impl<'a> GwGradEngine<'a> {
             // solver, which brackets the sign change on a grid and interpolates
             // linearly inside it.
             let fq = |om: f64| consts + self.sigma_c_with_table(om, n, &table) - om;
+            if self.config.exact_residue_z {
+                println!(
+                    "warning!!! gw_grad Newton did not converge for orbital {n}; \
+                     using the static on-shell energy (the continuous-residue \
+                     protocol has no omega-derivative channel)"
+                );
+                return self.static_fallback_cache(n, consts, &table, want_y);
+            }
+            if !self.config.graphical_rescue {
+                println!(
+                    "warning!!! gw_grad Newton did not converge for orbital {n}; \
+                     using the linearized (one-step Newton) functional \
+                     (graphical_rescue = false)"
+                );
+                return self.linearized_guarded(n, consts, &table, want_y);
+            }
             let (have_crossing, xg) =
                 crate::ri_gw::linear_interpolation_solver(&fq, self.e[n], side, 21, 0.1);
             if have_crossing {
@@ -2754,30 +3452,52 @@ impl<'a> GwGradEngine<'a> {
                     }
                 } else {
                     println!(
-                        "warning!!! gw_grad Newton solver did not converge for orbital {}!",
-                        n
+                        "warning!!! gw_grad Newton solver did not converge for orbital {n}; \
+                         using the linearized (one-step Newton) functional"
                     );
+                    return self.linearized_guarded(n, consts, &table, want_y);
                 }
             } else {
                 println!(
-                    "warning!!! gw_grad Newton solver did not converge for orbital {}!",
-                    n
+                    "warning!!! gw_grad Newton solver did not converge for orbital {n}; \
+                     using the linearized (one-step Newton) functional"
                 );
+                return self.linearized_guarded(n, consts, &table, want_y);
             }
         }
         let omega = x;
 
         let (_contour, _imag, y_imag, residues) =
             self.sigma_c_parts_with(omega, n, true, want_y, &table);
+        // `dsdw` only needs the table by reference, and the `z_min` test may
+        // hand the table to `linearized_cache`; destructure by move only after
+        // that test.
+        let dsdw = self.sigma_d_from_parts(omega, &table.w_imag, &table.w0, &residues);
+        let z_root = 1.0 / (1.0 - dsdw);
+        if self.config.z_min > 0.0
+            && !self.config.exact_residue_z
+            && z_root < self.config.z_min
+        {
+            println!(
+                "warning!!! gw_grad orbital {n}: converged spectral weight Z = {z_root:.4} \
+                 is below z_min = {:.3}; using the linearized (one-step Newton) functional",
+                self.config.z_min
+            );
+            return self.linearized_guarded(n, consts, &table, want_y);
+        }
         let (w_imag, m, w0) = (table.w_imag, table.m, table.w0);
-        let dsdw = self.sigma_d_from_parts(omega, &w_imag, &w0, &residues);
         let m_imag = self.compact_m_imag(&m, !want_y);
         let y0_static = self.compact_y0_static(&m, &w0, want_y);
         let y_imag = if want_y { y_imag } else { Vec::new() };
         QpCache {
             target: n,
             omega,
-            z_factor: 1.0 / (1.0 - dsdw),
+            freq: omega,
+            z_factor: z_root,
+            dsigma_domega: dsdw,
+            static_fallback: false,
+            linearized: false,
+            lin_shift: 0.0,
             w_imag,
             y_imag,
             m_imag,
@@ -2824,17 +3544,23 @@ impl<'a> GwGradEngine<'a> {
                 break;
             }
             let refs: Vec<&QpCache> = page.iter().collect();
-            self.qp_pullback_chunk(&refs, weights, col0, scr);
+            self.qp_pullback_chunk(&refs, weights, col0, scr, false);
         }
     }
 
     /// Process one page of caches (see [`Self::qp_pullback_streaming`]).
+    /// `omega_mode` selects the **omega-derivative** channel: every kernel is
+    /// replaced by its `d/d omega` counterpart and the per-row coefficients
+    /// become `weights * Z^2 * lin_shift` (non-zero only for `linearized`
+    /// caches).  The caller runs the chunk twice for a linearized cache and
+    /// combines the two contractions; see the module plan.
     fn qp_pullback_chunk(
         &self,
         caches: &[&QpCache],
         weights: &[f64],
         col0: usize,
         scr: &mut QpPullbackScratch,
+        omega_mode: bool,
     ) {
         let (nk, naux, nmo, nocc, nov) = (scr.nk, scr.naux, scr.nmo, scr.nocc, scr.nov);
         let dbg = |name: &str| std::env::var(name).is_ok();
@@ -2851,15 +3577,54 @@ impl<'a> GwGradEngine<'a> {
             // `c` of this cache in every state (`0` for orbitals without QP
             // weight, e.g. virtuals above the BSE cutoff) — a cache that is
             // inactive in every state is skipped entirely.
-            let cs: Vec<f64> = (0..nk).map(|k| weights[k * nmo + j] * cache.z_factor).collect();
+            let cs: Vec<f64> = if omega_mode {
+                (0..nk)
+                    .map(|k| {
+                        if cache.linearized {
+                            let z = cache.z_factor;
+                            weights[k * nmo + j] * z * z * cache.lin_shift
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect()
+            } else {
+                (0..nk).map(|k| weights[k * nmo + j] * cache.z_factor).collect()
+            };
             if cs.iter().all(|&c| c == 0.0) {
                 continue;
             }
+            // Omega-mode `eps1[n]` coefficient of the linearized branch.
+            //
+            // `dE_lin/dR = Z (C' + d_R Sigma_c) + Z^2 S (d_R d_omega Sigma_c
+            //              + Sigma_c'' * d e_n/dR)`,
+            // so the omega channel must supply the **total** geometry derivative
+            // of `Sigma_c'` at `omega = e_n(R)`: the partial `d_R d_omega Sigma_c`
+            // (the omega-differentiated kernels below) plus this explicit chain
+            // term, which moves the tangent point `e_n`.  `B` has no
+            // omega-dependence, so its `b_x` and exchange channels contribute
+            // nothing in omega mode (the standard pass already carries `Z`).
+            let dsigma2 = if omega_mode && !no_imag {
+                self.sigma_d2_from_parts(cache.freq, &cache.w_imag, &cache.w0)
+            } else {
+                0.0
+            };
             for k in 0..nk {
                 if cs[k] != 0.0 {
-                    // d consts/dR = eps1[n] + b_x[n]
-                    be[k][n] += cs[k];
-                    bb[k][n] += cs[k];
+                    if omega_mode {
+                        be[k][n] += cs[k] * dsigma2;
+                    } else {
+                        // d consts/dR = eps1[n] + b_x[n]
+                        be[k][n] += cs[k];
+                        bb[k][n] += cs[k];
+                    }
+                    if cache.static_fallback && !omega_mode {
+                        // The static on-shell functional `consts_n + Sigma_c(e_n)`
+                        // is evaluated at the **mean-field** frequency, which
+                        // moves with the perturbation: its gradient adds
+                        // `(d Sigma_c/d omega) d e_n/dR` (and carries no `Z`).
+                        be[k][n] += weights[k * nmo + j] * cache.dsigma_domega;
+                    }
                 }
             }
             // packed-pair offsets of this cache's rows: pair `(n, m)` for every
@@ -2906,27 +3671,36 @@ impl<'a> GwGradEngine<'a> {
             // is exactly the gradient of `Sigma_sub` (module header).  The
             // `no_*` debug masks keep a masked pullback the exact gradient of
             // the masked functional, as in the full-CD `phase_mask`.
-            let staticc: Vec<f64> = if sub {
+            // `staticc_d` is the omega-derivative `d A_m/d omega` of the same
+            // coefficient (its `f_term` and `active` parts do not depend on
+            // omega); the omega channel reweights `W(0)` by it.
+            let (staticc, staticc_d): (Vec<f64>, Vec<f64>) = if sub {
                 let mut active = vec![0.0f64; nmo];
-                for &(m, a_m, ..) in cache.residues.iter() {
-                    active[m] += a_m;
+                for r in cache.residues.iter() {
+                    active[r.m] += r.pole_weight;
                 }
-                (0..nmo)
-                    .map(|m| {
-                        let half_minus_f = if m < nocc { -0.5 } else { 0.5 };
-                        let t = cache.omega - self.e[m];
-                        let mut a_m = 0.0f64;
-                        for &(u, wgt) in self.quad.iter() {
-                            a_m += wgt / TWO_PI * 2.0 * t / (t * t + u * u);
-                        }
-                        let f_term = if no_static { 0.0 } else { half_minus_f };
-                        let s_a = if no_imag { 0.0 } else { a_m };
-                        let act = if no_res { 0.0 } else { active[m] };
-                        f_term + s_a - act
-                    })
-                    .collect()
+                let mut sc = Vec::with_capacity(nmo);
+                let mut sc_d = Vec::with_capacity(nmo);
+                for m in 0..nmo {
+                    let half_minus_f = if m < nocc { -0.5 } else { 0.5 };
+                    let t = cache.freq - self.e[m];
+                    let mut a_m = 0.0f64;
+                    let mut a_d = 0.0f64;
+                    for &(u, wgt) in self.quad.iter() {
+                        let __d = t * t + u * u;
+                        a_m += wgt / TWO_PI * 2.0 * t / __d;
+                        // d/d omega [2t/(t^2+u^2)] = 2(u^2-t^2)/(t^2+u^2)^2
+                        a_d += wgt / TWO_PI * 2.0 * (u * u - t * t) / (__d * __d);
+                    }
+                    let f_term = if no_static { 0.0 } else { half_minus_f };
+                    let s_a = if no_imag { 0.0 } else { a_m };
+                    let act = if no_res { 0.0 } else { active[m] };
+                    sc.push(f_term + s_a - act);
+                    sc_d.push(if no_imag { 0.0 } else { a_d });
+                }
+                (sc, sc_d)
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
             // `ya = diag(b) y`, `y0a = diag(b) y0` of the current frequency with
             // the **unit** weights `b_m` (see the accumulation note below)
@@ -2986,8 +3760,17 @@ impl<'a> GwGradEngine<'a> {
                 // subtracts the accumulated `V` matrices.
                 let t_gram = Instant::now();
                 for m in 0..nmo {
-                    let t = cache.omega - self.e[m];
-                    let b = -wgt / TWO_PI * 2.0 * t / (t * t + u * u);
+                    let t = cache.freq - self.e[m];
+                    let b = {
+                    let __d = t * t + u * u;
+                    let (__k1, __k2) = if omega_mode {
+                        (2.0 * (u * u - t * t) / (__d * __d),
+                         -4.0 * t * (3.0 * u * u - t * t) / (__d * __d * __d))
+                    } else {
+                        (2.0 * t / __d, 2.0 * (u * u - t * t) / (__d * __d))
+                    };
+                    -wgt / TWO_PI * __k1
+                    };
                     let base = m * naux;
                     for r in 0..naux {
                         ya.data[base + r] = b * y_m.data[base + r];
@@ -3011,17 +3794,31 @@ impl<'a> GwGradEngine<'a> {
                     if !no_be_expl {
                         let f = c * wgt / TWO_PI;
                         for m in 0..nmo {
-                            let t = cache.omega - self.e[m];
-                            let gprime =
-                                2.0 * (u * u - t * t) / ((t * t + u * u) * (t * t + u * u));
-                            be[k][m] += f * gprime * cache.w_imag[wi][m];
+                            let t = cache.freq - self.e[m];
+                    let __d = t * t + u * u;
+                    let (__k1, __k2) = if omega_mode {
+                        (2.0 * (u * u - t * t) / (__d * __d),
+                         -4.0 * t * (3.0 * u * u - t * t) / (__d * __d * __d))
+                    } else {
+                        (2.0 * t / __d, 2.0 * (u * u - t * t) / (__d * __d))
+                    };
+                            be[k][m] += f * __k2 * cache.w_imag[wi][m];
                         }
                     }
                     // `sc = y - y0` is already the covector's source vector, so
                     // the update reads one stream instead of subtracting two
                     for m in 0..nmo {
-                        let t = cache.omega - self.e[m];
-                        let a = -c * wgt / TWO_PI * 2.0 * t / (t * t + u * u);
+                        let t = cache.freq - self.e[m];
+                        let a = {
+                    let __d = t * t + u * u;
+                    let (__k1, __k2) = if omega_mode {
+                        (2.0 * (u * u - t * t) / (__d * __d),
+                         -4.0 * t * (3.0 * u * u - t * t) / (__d * __d * __d))
+                    } else {
+                        (2.0 * t / __d, 2.0 * (u * u - t * t) / (__d * __d))
+                    };
+                        -c * wgt / TWO_PI * __k1
+                        };
                         let base = m * naux;
                         let col_m = cols[m];
                         for p in 0..naux {
@@ -3055,11 +3852,16 @@ impl<'a> GwGradEngine<'a> {
                 // covector is their difference `2 (y0s - y0m)`.  The kernel
                 // sum `A_m(t_m)` inside `staticc` carries the explicit
                 // `-A'_m W(0)` eps1 term of the axis kernel.
-                if sub && staticc.iter().any(|&v| v != 0.0) {
+                // The static `W(0)` bookkeeping carries its own omega-dependence
+                // (`d A_m/d omega`), so the omega channel reweights the block by
+                // `staticc_d[m]` instead of `staticc[m]` (and differentiates the
+                // explicit kernel below).
+                let static_w: &[f64] = if omega_mode { &staticc_d } else { &staticc };
+                if sub && static_w.iter().any(|&v| v != 0.0) {
                     let mut pre = vec![0.0f64; naux * nmo];
                     let mut prm = vec![0.0f64; naux * nmo];
                     for m in 0..nmo {
-                        let csm = c * staticc[m];
+                        let csm = c * static_w[m];
                         let base = m * naux;
                         let col_m = cols[m];
                         for p in 0..naux {
@@ -3085,64 +3887,176 @@ impl<'a> GwGradEngine<'a> {
                     }
                     if !no_be_expl {
                         for m in 0..nmo {
-                            let t = cache.omega - self.e[m];
+                            let t = cache.freq - self.e[m];
                             let mut ap = 0.0f64;
                             for &(u, wgt) in self.quad.iter() {
-                                ap += wgt / TWO_PI
-                                    * 2.0 * (u * u - t * t)
-                                    / ((t * t + u * u) * (t * t + u * u));
+                                let __d = t * t + u * u;
+                                // standard: `d/dt` of the `A_m` kernel
+                                // `2t/(t^2+u^2)`; omega: its second derivative
+                                let __k2 = if omega_mode {
+                                    -4.0 * t * (3.0 * u * u - t * t) / (__d * __d * __d)
+                                } else {
+                                    2.0 * (u * u - t * t) / (__d * __d)
+                                };
+                                ap += wgt / TWO_PI * __k2;
                             }
                             be[k][m] -= c * ap * cache.w0[m];
                         }
                     }
                 }
-                // ---- residues (quantised frequencies; no d_zeta term) ----
-                for &(m, sign, z_used, ref y_r, ref y0_r) in cache
+                // ---- residues (see `Residue`) ----
+                for r in cache
                     .residues
                     .iter()
                     .take(if no_res { 0 } else { usize::MAX })
                 {
-                    let a = c * sign;
-                    // exact mode: the moving residue frequency contributes
-                    // dzeta/dR = zsign * eps1[m] through dW/dz
-                    if self.config.exact_residue_z {
-                        let zsign = if self.e[m] - cache.omega >= 0.0 { 1.0 } else { -1.0 };
-                        let mut sum = 0.0f64;
-                        for col in 0..nov {
-                            let mut proj = 0.0f64;
-                            for p in 0..naux {
-                                proj += y_r[p] * self.qia[p + col * naux];
+                    // The factor frequency follows the pole (`z = |e_m - omega|`)
+                    // in the exact protocol and the interpolation weight follows
+                    // it in the linear one; `weight_slope` is the corresponding
+                    // `dW/de_m` divided by `zsign` and is zero for the nearest
+                    // (piecewise-constant) rule.
+                    let zsign = if self.e[r.m] - cache.freq >= 0.0 { 1.0 } else { -1.0 };
+                    if omega_mode {
+                        // `d W_m/d omega` of the entry weights of the **linear**
+                        // rule: the grid nodes do not move with omega, only the
+                        // bracketing weight `t`, so
+                        // `d split_lo/d omega = +zsign/(z_hi-z_lo)` and
+                        // `d split_hi/d omega = -zsign/(z_hi-z_lo)`, times the
+                        // pole weight.  `sum_i dh_i W_i` reproduces
+                        // `sigma_d_from_parts`'s `(-zsign) weight_slope`.
+                        // The exact protocol would need `d^2 W/dz^2` and is
+                        // rejected loudly below; the single-entry rules have
+                        // `dh = 0`.
+                        assert!(
+                            !self.config.exact_residue_z,
+                            "gw_grad: the omega-derivative pullback of a linearized \
+                             QP cache does not implement the exact-residue protocol \
+                             (`exact_residue_z = true`)"
+                        );
+                    } else if r.weight_slope != 0.0 {
+                        be[k][r.m] += c * r.weight_slope * zsign;
+                    }
+                    // Movement of the real-axis grid nodes with the reference:
+                    // `d de_max/dR = 1.05 * sign * (d e_p - d e_m*)/dR`, so the
+                    // node-frequency channel lands on the two scan indices.
+                    // `dW/dz` is rebuilt here (once per cache and entry) rather
+                    // than stored per Newton step.  The exact-residue protocol
+                    // never reads the grid.
+                    if !self.config.exact_residue_z {
+                        if let Some(mv) = self.z_grid_mover.as_ref() {
+                            let ent = &r.entries;
+                            let grid_slope = if ent.len() == 1 {
+                                if omega_mode {
+                                    // the clamped/nearest node does not move
+                                    // with omega
+                                    0.0
+                                } else {
+                                    r.pole_weight
+                                        * self.residue_dwdz(&ent[0].y, ent[0].z)
+                                        * ent[0].node_sens
+                                }
+                            } else {
+                                let (elo, ehi) = (&ent[0], &ent[1]);
+                                let t = r.interp_t;
+                                let (dlo, dhi) = (
+                                    self.residue_dwdz(&elo.y, elo.z),
+                                    self.residue_dwdz(&ehi.y, ehi.z),
+                                );
+                                if omega_mode {
+                                    // `d/dt` of the standard bracket times
+                                    // `dt/d omega = -zsign/(z_hi-z_lo)`
+                                    let dz = ehi.z - elo.z;
+                                    if dz.abs() < 1.0e-30 {
+                                        0.0
+                                    } else {
+                                        r.pole_weight
+                                            * (dhi * ehi.node_sens
+                                                - dlo * elo.node_sens
+                                                - r.secant * (ehi.node_sens - elo.node_sens))
+                                            * (-zsign / dz)
+                                    }
+                                } else {
+                                    r.pole_weight
+                                        * ((1.0 - t) * dlo * elo.node_sens
+                                            + t * dhi * ehi.node_sens
+                                            - r.secant
+                                                * ((1.0 - t) * elo.node_sens + t * ehi.node_sens))
+                                }
+                            };
+                            if grid_slope != 0.0 {
+                                // `de_max` is a **max** over the scan, so on a
+                                // symmetry-degenerate tie it is not
+                                // differentiable (its central difference is the
+                                // average of the tied branches).  The
+                                // basis-independent choice is the tie average,
+                                // which is exact for the 1- and 2-fold
+                                // degeneracies that dominate; a 3-fold tie
+                                // leaves a residual of order the shell's
+                                // `eps1` spread times the node sensitivity.
+                                let g = c * mv.scale * mv.sign * grid_slope;
+                                let wp = g / mv.p_set.len() as f64;
+                                let wm = g / mv.m_set.len() as f64;
+                                for &p in mv.p_set.iter() {
+                                    be[k][p] += wp;
+                                }
+                                for &m in mv.m_set.iter() {
+                                    be[k][m] -= wm;
+                                }
                             }
-                            sum += proj * proj
-                                * dd_response_dz_single(self.de_ia[col], z_used, self.config.eta);
-                        }
-                        be[k][m] += c * sign * zsign * sum;
-                    }
-                    // dq covector of pair (n, m)
-                    let col_m = cols[m];
-                    for p in 0..naux {
-                        bq[k][col_m + p] += 2.0 * a * (y_r[p] - y0_r[p]);
-                    }
-                    for p in 0..naux {
-                        for q in 0..naux {
-                            bj[k][p + q * naux] += a * (y0_r[p] * y0_r[q] - y_r[p] * y_r[q]);
                         }
                     }
-                    // accumulate the V bucket of this residue frequency
-                    let idx = match z_order[k].iter().position(|&z| (z - z_used).abs() < 1.0e-14)
-                    {
-                        Some(i) => i,
-                        None => {
-                            z_order[k].push(z_used);
-                            v_res[k].push(vec![0.0f64; naux * naux]);
-                            z_order[k].len() - 1
+                    // dq / dJ covectors and the V bucket of pair (n, m); a linear
+                    // pole contributes one entry per bracketing grid node.
+                    // In omega mode the entry weight is replaced by its
+                    // omega-derivative (see above); the single-entry rules are
+                    // omega-independent and contribute nothing.
+                    let col_m = cols[r.m];
+                    let entries_omega: [f64; 2] = if omega_mode && r.entries.len() == 2 {
+                        let dz = r.entries[1].z - r.entries[0].z;
+                        if dz.abs() < 1.0e-30 {
+                            [0.0, 0.0]
+                        } else {
+                            let inv = r.pole_weight * zsign / dz;
+                            [inv, -inv]
                         }
+                    } else {
+                        [0.0, 0.0]
                     };
-                    let v = &mut v_res[k][idx];
-                    for p in 0..naux {
-                        let yp = y_r[p];
-                        for q in 0..naux {
-                            v[p + q * naux] += a * yp * y_r[q];
+                    for (ei, e) in r.entries.iter().enumerate() {
+                        if e.y.is_empty() {
+                            continue;
+                        }
+                        let a = if omega_mode {
+                            c * if ei < 2 { entries_omega[ei] } else { 0.0 }
+                        } else {
+                            c * e.weight
+                        };
+                        if a == 0.0 {
+                            continue;
+                        }
+                        for p in 0..naux {
+                            bq[k][col_m + p] += 2.0 * a * (e.y[p] - e.y0[p]);
+                        }
+                        for p in 0..naux {
+                            for q in 0..naux {
+                                bj[k][p + q * naux] += a * (e.y0[p] * e.y0[q] - e.y[p] * e.y[q]);
+                            }
+                        }
+                        let idx =
+                            match z_order[k].iter().position(|&z| (z - e.z).abs() < 1.0e-14) {
+                                Some(i) => i,
+                                None => {
+                                    z_order[k].push(e.z);
+                                    v_res[k].push(vec![0.0f64; naux * naux]);
+                                    z_order[k].len() - 1
+                                }
+                            };
+                        let v = &mut v_res[k][idx];
+                        for p in 0..naux {
+                            let yp = e.y[p];
+                            for q in 0..naux {
+                                v[p + q * naux] += a * yp * e.y[q];
+                            }
                         }
                     }
                 }
@@ -3155,7 +4069,7 @@ impl<'a> GwGradEngine<'a> {
                 // g_ni = J^{-1} q_ni.  The v_xc relaxation term is not
                 // implemented (references with a nonzero v_xc are rejected
                 // in `canonical_response`).
-                if (1.0 - self.fock_hyb).abs() > 1.0e-14 && !no_exch {
+                if (1.0 - self.fock_hyb).abs() > 1.0e-14 && !no_exch && !omega_mode {
                     for i in 0..nocc {
                         let qni = self.with_q(|q| self.gather_pair(q, n, i));
                         let g_ni = self.metric_solve(&qni, 1);
@@ -3288,7 +4202,20 @@ impl<'a> GwGradEngine<'a> {
         col0: usize,
         scr: &mut QpPullbackScratch,
     ) {
-        self.qp_pullback_chunk(caches, weights, col0, scr);
+        self.qp_pullback_chunk(caches, weights, col0, scr, false);
+    }
+
+    /// Omega-derivative counterpart of [`Self::qp_pullback_chunk_public`].
+    /// Accumulates `d/d omega` of the same covectors, weighted by
+    /// `weights * Z^2 * lin_shift` and restricted to `linearized` caches.
+    pub fn qp_pullback_chunk_omega_public(
+        &self,
+        caches: &[&QpCache],
+        weights: &[f64],
+        col0: usize,
+        scr: &mut QpPullbackScratch,
+    ) {
+        self.qp_pullback_chunk(caches, weights, col0, scr, true);
     }
 
     /// Bytes of one fully built [`QpCache`] of this engine.
@@ -3330,7 +4257,12 @@ impl<'a> GwGradEngine<'a> {
             .map(|c| QpCache {
                 target: c.target,
                 omega: c.omega,
+                freq: c.freq,
                 z_factor: c.z_factor,
+                dsigma_domega: c.dsigma_domega,
+                static_fallback: c.static_fallback,
+                linearized: c.linearized,
+                lin_shift: c.lin_shift,
                 w_imag: c.w_imag.clone(),
                 y_imag: c.y_imag.clone(),
                 m_imag: c.m_imag.clone(),
@@ -3340,7 +4272,14 @@ impl<'a> GwGradEngine<'a> {
             })
             .collect();
         let refs: Vec<&QpCache> = owned.iter().collect();
-        self.qp_pullback_chunk(&refs, &flat, 0, &mut scr);
+        self.qp_pullback_chunk(&refs, &flat, 0, &mut scr, false);
+        // Omega-derivative channel of the linearized caches: run the same
+        // scratch a second time (its `cs` carries `weights * Z^2 * lin_shift`)
+        // instead of keeping a second covector set resident, so the peak
+        // memory of a linearized pullback equals the standard one.
+        if refs.iter().any(|c| c.linearized) {
+            self.qp_pullback_chunk(&refs, &flat, 0, &mut scr, true);
+        }
         if grad_timing() {
             eprintln!(
                 "[gw_grad timing]   qp_pullback: cache loop {:8.2}s",
@@ -4371,7 +5310,7 @@ impl GwGradEngine<'_> {
             }
         }
         // ... transformed to MO and added to the skeleton derivative
-        let f1_mo: Vec<f64> = {
+        let mut f1_mo: Vec<f64> = {
             let relaxed = {
                 let t = gemm_nt(&self.c_mo.data, nao, nmo, &f1_relaxed, nao, nao);
                 gemm_nn(&t, nmo, nao, &self.c_mo.data, nao, nmo)
@@ -4382,6 +5321,40 @@ impl GwGradEngine<'_> {
                 .map(|(a, b)| a + b)
                 .collect()
         };
+        // Both derivative matrices are derivatives of symmetric matrices, so
+        // the Roothaan restoration only ever reads their symmetric part.  Any
+        // asymmetry is numerical (the triangular `to_matrixfull` mirrors, the
+        // MO transformation preserves symmetry up to rounding); averaging it
+        // away makes the orthogonality identity `u + u^T + S1 = 0` exact for
+        // **every** pair, whatever its gap.  Without it the identity residual
+        // of a symmetry-degenerate (or merely nearly degenerate) reference is
+        // the rounding noise divided by `e_q - e_p`, which can abort a valid
+        // calculation through the diagnostic below.
+        // how asymmetric the raw derivatives are (the identity residual of a
+        // near-degenerate pair is this noise divided by the gap)
+        let (mut f1_asym, mut s1_asym) = (0.0f64, 0.0f64);
+        for p in 0..nmo {
+            for q in 0..nmo {
+                f1_asym = f1_asym.max((f1_mo[p + q * nmo] - f1_mo[q + p * nmo]).abs());
+                s1_asym = s1_asym.max((s1_mo[p + q * nmo] - s1_mo[q + p * nmo]).abs());
+            }
+        }
+        // `REST_GWGRAD_NO_SYMM` restores the historical behaviour (raw
+        // derivatives) and exists only so the degeneracy diagnostic can be
+        // reproduced in a test.
+        if std::env::var("REST_GWGRAD_NO_SYMM").is_err() {
+            symmetrise_square(&mut f1_mo, nmo);
+        }
+        let s1_mo: Vec<f64> = {
+            let mut v = s1_mo.to_vec();
+            if std::env::var("REST_GWGRAD_NO_SYMM").is_err() {
+                symmetrise_square(&mut v, nmo);
+            }
+            v
+        };
+        if std::env::var("REST_GWGRAD_DBG").is_ok() {
+            println!("[cphf DBG] raw f1/s1 asymmetry {f1_asym:.3e} / {s1_asym:.3e}");
+        }
 
         let mut u = vec![0.0f64; nmo * nmo];
         let mut eps1 = vec![0.0f64; nmo];
@@ -4446,27 +5419,40 @@ impl GwGradEngine<'_> {
         // The orthogonality identity `u + u^T + S1 = 0` is imposed by the
         // non-degenerate formula; inside a shell a rotation of the basis is a
         // free gauge (the shell functional is invariant under it), so those
-        // pairs are excluded from the diagnostic.
+        // pairs are excluded from the diagnostic.  With the symmetrised
+        // `f1_mo`/`s1_mo` above the identity is algebraically exact, so what is
+        // measured here is the solve residual only (diffuse bases amplify it by
+        // the smallest orbital gap).
         let mut orth = 0.0f64;
+        let mut worst = (0usize, 0usize, 0.0f64);
         for p in 0..nmo {
             for q in 0..nmo {
                 if self.same_degenerate_shell(p, q) {
                     continue;
                 }
-                orth = orth.max((u[p + q * nmo] + u[q + p * nmo] + s1_mo[p + q * nmo]).abs());
+                let e = (u[p + q * nmo] + u[q + p * nmo] + s1_mo[p + q * nmo]).abs();
+                if e > worst.2 {
+                    worst = (p, q, e);
+                }
+                orth = orth.max(e);
             }
         }
-        // diffuse bases amplify the CP-HF Krylov residual by the smallest
-        // orbital gap, so the canonical response can lose a little more than
-        // machine precision without any degeneracy problem
         if orth > 1.0e-2 {
             panic!(
-                "gw_grad: canonical response orthogonality error {:.3e} (degenerate orbitals?)",
-                orth
+                "gw_grad: canonical response orthogonality error {:.3e} at pair ({}, {}) \
+                 (gap {:.3e}, degenerate_tol {:.1e})",
+                orth,
+                worst.0,
+                worst.1,
+                (self.e[worst.1] - self.e[worst.0]).abs(),
+                self.config.degenerate_tol
             );
         }
         if orth > 1.0e-6 {
-            println!("warning!!! gw_grad canonical response orthogonality error {:.3e}", orth);
+            println!(
+                "warning!!! gw_grad canonical response orthogonality error {:.3e} at pair ({}, {})",
+                orth, worst.0, worst.1
+            );
         }
         // ---- v_xc part of the static-term covector b_x (DFT references) ----
         // `b_x[p] = -d v_xc,pp / dR`: explicit grid derivative (frozen density
@@ -4718,7 +5704,185 @@ fn nearest_grid_value(zs: &[f64], z: f64) -> f64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// automatic real-axis grid (best practice)
+// ---------------------------------------------------------------------------
+
+/// Range margin of the automatic rule over the largest residue frequency the
+/// requested state window actually reads.
+pub const AUTO_GRID_RANGE_MARGIN: f64 = 2.5;
+/// Smallest automatic grid range (Ha).
+pub const AUTO_GRID_RANGE_FLOOR: f64 = 0.5;
+/// Target node spacing (Ha) of the automatic rule.  Measured on
+/// H2O/def2-SVP/PBE with the range capped at `2.5 z_need`: the frontier grid
+/// error is 0.45 / 0.67 / 2.2 / 0.009 / 0.008 / 0.001 eV at 6 / 12 / 24 / 48 /
+/// 96 / 192 nodes, so ~0.025 Ha puts the uniform rule in its converged regime
+/// (`h = 0.025` -> 51 nodes for that case).  Note the non-monotonicity at
+/// n = 24: the residual is still sensitive to where a node falls relative to
+/// the RPA poles of `W`, which no spacing rule removes.
+pub const AUTO_GRID_DELTA: f64 = 0.025;
+/// Smallest automatic node count (the historical default).
+pub const AUTO_GRID_N_MIN: usize = 6;
+/// Largest automatic node count (cost cap).
+pub const AUTO_GRID_N_MAX: usize = 400;
+
+/// Symmetry-degenerate tie set of orbital `idx` within `lo..hi`.
+fn tie_set(e: &[f64], idx: usize, lo: usize, hi: usize, tol: f64) -> Vec<usize> {
+    (lo..hi).filter(|&j| (e[j] - e[idx]).abs() <= tol).collect()
+}
+
+/// Largest residue frequency the state window `nsemin..=nsemax` reads, and the
+/// transition that attains it.
+///
+/// A QP state `n` (with `omega ~ e_n`) has active poles `m` on its own branch
+/// with `de = |e_m - e_n| > 0`, and the residue evaluates the screened response
+/// at `z = |e_m - omega|`.  This is the frequency range the low-rank factors
+/// have to resolve — the **core-inflated `de_max` of the scan is usually far
+/// larger** (the scan pairs every pole with every scan centre), and spreading
+/// the nodes over that unused range makes the grid error stagnate at
+/// O(0.1-1 eV) instead of converging.
+///
+/// Returns `(z_need, (p, q, sign, p_on_occupied_branch))` with
+/// `d z_need/dR = sign * (eps1[p] - eps1[q])`.
+pub fn residue_z_need(
+    e: &[f64],
+    nocc: usize,
+    nsemin: usize,
+    nsemax: usize,
+) -> (f64, Option<(usize, usize, f64, bool)>) {
+    let nmo = e.len();
+    let mut z_need = 0.0f64;
+    let mut winner: Option<(usize, usize, f64, bool)> = None;
+    for n in nsemin..=nsemax {
+        let occ = n < nocc;
+        let (lo, hi) = if occ { (0, nocc) } else { (nocc, nmo) };
+        for m in lo..hi {
+            let de = if occ { e[m] - e[n] } else { e[n] - e[m] };
+            if de > 0.0 && de > z_need {
+                z_need = de;
+                // occupied: `de = e_m - e_n` grows with `e_m`
+                // virtual  : `de = e_n - e_m` grows with `e_n`
+                winner = if occ {
+                    Some((m, n, 1.0, true))
+                } else {
+                    Some((n, m, 1.0, false))
+                };
+            }
+        }
+    }
+    (z_need, winner)
+}
+
+/// Node count of the automatic rule for a grid range.
+fn auto_n(range: f64) -> usize {
+    (((range / AUTO_GRID_DELTA).ceil() as usize) + 1).clamp(AUTO_GRID_N_MIN, AUTO_GRID_N_MAX)
+}
+
+/// Best-practice automatic real-axis grid, used when
+/// `GwGradConfig::nomega_chi_real == 0` / `QuasiParticle::nomega_chi_real == 0`.
+///
+/// The rule is
+///
+/// ```text
+/// z_need = max_n max_{active m} |e_m - e_n|          (state window)
+/// range  = clamp(AUTO_GRID_RANGE_MARGIN * z_need, AUTO_GRID_RANGE_FLOOR, de_max)
+/// n      = clamp(1 + ceil(range / AUTO_GRID_DELTA), AUTO_GRID_N_MIN, AUTO_GRID_N_MAX)
+/// ```
+///
+/// i.e. the node count grows **linearly with the frequency range the residues
+/// read**, not with `de_max` and not linearly with the number of levels (which
+/// is what dilates `de_max` non-linearly through the deep core).  A user-pinned
+/// `omega_chi_max > 0` wins over the range part of the rule (`n` is still
+/// derived from it).
+///
+/// Returns `(n_points, grid_scale, mover)`; `None` when the rule does not apply
+/// (`omega_chi_max` pins a range *and* an explicit `n` was given).
+#[allow(clippy::too_many_arguments)]
+pub fn auto_real_axis_grid(
+    e: &[f64],
+    nocc: usize,
+    nsemin: usize,
+    nsemax: usize,
+    de_max: f64,
+    de_mover: Option<GridMover>,
+    omega_chi_max: f64,
+    nomega_chi_real: usize,
+    tie_tol: f64,
+) -> Option<(usize, f64, Option<GridMover>)> {
+    if nomega_chi_real != 0 {
+        return None;
+    }
+    if omega_chi_max > 0.0 {
+        return Some((auto_n(omega_chi_max), omega_chi_max, None));
+    }
+    let (z_need, winner) = residue_z_need(e, nocc, nsemin, nsemax);
+    let want = (AUTO_GRID_RANGE_MARGIN * z_need).max(AUTO_GRID_RANGE_FLOOR);
+    if !(want < de_max) || winner.is_none() {
+        // the scan range is already tighter than the rule: keep it (and its
+        // mover, whose `scale` is the `de_max` one)
+        return Some((auto_n(de_max), de_max, de_mover));
+    }
+    let (p, q, sign, p_occ) = winner.unwrap();
+    let p_set = if p_occ {
+        tie_set(e, p, 0, nocc, tie_tol)
+    } else {
+        tie_set(e, p, nocc, e.len(), tie_tol)
+    };
+    let m_set = tie_set(e, q, 0, e.len(), tie_tol);
+    Some((
+        auto_n(want),
+        want,
+        Some(GridMover {
+            p_set,
+            m_set,
+            sign,
+            scale: AUTO_GRID_RANGE_MARGIN,
+        }),
+    ))
+}
+
 /// REST real-axis grid construction: de_max scan + linear/quadratic nodes.
+///
+/// Besides the nodes themselves this returns their **geometry dependence**, so
+/// that the gradient can differentiate the grid-mediated part of the residue
+/// term exactly (see [`RealAxisGrid`]).
+pub struct RealAxisGrid {
+    /// the grid nodes, in increasing order
+    pub nodes: Vec<f64>,
+    /// `d node_i / d de_max` of every node (all zero when the grid is pinned by
+    /// `omega_chi_max > 0`)
+    pub node_sens: Vec<f64>,
+    /// The transition energy that attains the scan maximum (see
+    /// [`GridMover`]).  `None` when `de_max` does not move with the geometry
+    /// (`omega_chi_max > 0`) or when the scan found no transition above
+    /// `res_tol`.
+    pub mover: Option<GridMover>,
+}
+
+/// The scan maximum `de_max = 1.05 * |e_p - (e_m + i*step_sigma)| + 0.1` of
+/// [`build_real_axis_grid`], together with the symmetry-degenerate orbitals
+/// that tie for it.
+///
+/// `de_max` is a **max** over the scan, so at a degenerate geometry it is not
+/// differentiable: displacing by `+h` follows the tied branch with the largest
+/// derivative and `-h` the one with the smallest, and the central difference of
+/// a max is the average of those two branches.  Storing the tied sets lets the
+/// gradient reproduce exactly that.
+#[derive(Clone, Debug)]
+pub struct GridMover {
+    /// tied orbitals on the pole side (`de` grows with their energy)
+    pub p_set: Vec<usize>,
+    /// tied scan centres (`de` shrinks with their energy)
+    pub m_set: Vec<usize>,
+    /// `+1` when the maximum is an occupied pole (`de = e_p - omega`), `-1` when
+    /// it is a virtual pole (`de = omega - e_a`)
+    pub sign: f64,
+    /// `d(grid_scale)/d(Delta e)` where `Delta e = e_p - e_m` for the pole pair
+    /// above: `1.05` for the `de_max = 1.05*D + 0.1` scan, and the range margin
+    /// when the automatic rule caps the range at a multiple of `z_need`.
+    pub scale: f64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_real_axis_grid(
     e: &[f64],
@@ -4731,43 +5895,97 @@ pub fn build_real_axis_grid(
     res_tol: f64,
     grid_type: usize,
     omega_chi_max: f64,
-) -> Vec<f64> {
+    tie_tol: f64,
+) -> RealAxisGrid {
     let nmo = e.len();
     let mut de_max = 0.0f64;
+    let mut winner: Option<(usize, usize, f64)> = None;
     for mstate in nsemin..=nsemax {
         let e0 = e[mstate];
         for io in -(nomega_sigma as isize)..=(nomega_sigma as isize) {
             let omega = e0 + io as f64 * step_sigma;
             for p in 0..nocc {
                 let de = e[p] - omega;
-                if de > res_tol {
-                    de_max = de_max.max(de);
+                if de > res_tol && de > de_max {
+                    de_max = de;
+                    winner = Some((p, mstate, 1.0));
                 }
             }
             for a in nocc..nmo {
                 let de = omega - e[a];
-                if de > res_tol {
-                    de_max = de_max.max(de);
+                if de > res_tol && de > de_max {
+                    de_max = de;
+                    winner = Some((a, mstate, -1.0));
                 }
             }
         }
     }
-    de_max = de_max * 1.05 + 0.1;
-    let grid_scale = if omega_chi_max > 0.0 { omega_chi_max } else { de_max };
-    (0..nomega_chi_real)
-        .map(|i| {
-            if nomega_chi_real > 1 {
-                let t = i as f64 / (nomega_chi_real - 1) as f64;
-                if grid_type == 1 {
-                    grid_scale * t * t
-                } else {
-                    grid_scale * t
+    // Tie sets of the winner: the maximum is attained by a whole
+    // symmetry-degenerate shell whenever one is involved.
+    let mover = winner.map(|(p, m, sign)| {
+        let mut p_set = Vec::new();
+        let mut m_set = Vec::new();
+        if sign > 0.0 {
+            for i in 0..nocc {
+                if (e[i] - e[p]).abs() <= tie_tol {
+                    p_set.push(i);
                 }
-            } else {
-                grid_scale
             }
-        })
-        .collect()
+        } else {
+            for a in nocc..nmo {
+                if (e[a] - e[p]).abs() <= tie_tol {
+                    p_set.push(a);
+                }
+            }
+        }
+        for j in 0..nmo {
+            if (e[j] - e[m]).abs() <= tie_tol {
+                m_set.push(j);
+            }
+        }
+        GridMover { p_set, m_set, sign, scale: 1.05 }
+    });
+    de_max = de_max * 1.05 + 0.1;
+    // Automatic mode (`nomega_chi_real == 0`) or the historical layout.
+    // `omega_chi_max > 0` pins the node frequencies: the grid then does not
+    // move with the reference geometry at all.
+    let (n_points, grid_scale, pinned, mover) = match auto_real_axis_grid(
+        e,
+        nocc,
+        nsemin,
+        nsemax,
+        de_max,
+        mover.clone(),
+        omega_chi_max,
+        nomega_chi_real,
+        tie_tol,
+    ) {
+        Some((n, scale, mv)) => (n, scale, false, mv),
+        None if omega_chi_max > 0.0 => (nomega_chi_real, omega_chi_max, true, None),
+        None => (nomega_chi_real, de_max, false, mover),
+    };
+    let mut nodes = Vec::with_capacity(n_points);
+    let mut node_sens = Vec::with_capacity(n_points);
+    for i in 0..n_points {
+        if n_points > 1 {
+            let t = i as f64 / (n_points - 1) as f64;
+            if grid_type == 1 {
+                nodes.push(grid_scale * t * t);
+                node_sens.push(if pinned { 0.0 } else { t * t });
+            } else {
+                nodes.push(grid_scale * t);
+                node_sens.push(if pinned { 0.0 } else { t });
+            }
+        } else {
+            nodes.push(grid_scale);
+            node_sens.push(if pinned { 0.0 } else { 1.0 });
+        }
+    }
+    RealAxisGrid {
+        nodes,
+        node_sens,
+        mover,
+    }
 }
 
 /// Compact a **pair-symmetric** `[nmo*nmo, naux]` buffer (pair-slowest, `pair = row + col*nmo`)
@@ -5126,8 +6344,21 @@ pub struct CdResidue {
 /// `gw_cd_grad_optimized._CDCache`).
 pub struct CdQpCache {
     pub target: usize,
+    /// the quasiparticle energy this cache describes
     pub omega: f64,
+    /// the frequency the self-energy was evaluated at (the root, or `e_n` for
+    /// the static on-shell fallback) — see [`QpCache::freq`]
+    pub freq: f64,
     pub z_factor: f64,
+    /// `d Re Sigma_sub / d omega` at [`Self::freq`] — see [`QpCache::dsigma_domega`]
+    pub dsigma_domega: f64,
+    /// the energy is the **static on-shell** value `consts_n + Re Sigma_sub(e_n)`
+    /// (`Z = 1`, no root search) — see [`QpCache::static_fallback`]
+    pub static_fallback: bool,
+    /// linearized (one-step Newton) branch — see [`QpCache::linearized`]
+    pub linearized: bool,
+    /// `consts_n + Re Sigma_sub(e_n) - e_n` — see [`QpCache::lin_shift`]
+    pub lin_shift: f64,
     /// `W_c[n, m](iu)` at every quadrature point [n_freq][nmo]
     pub w_imag: Vec<Vec<f64>>,
     /// `A(iu)^-1 q_ext` per quadrature point, real [naux * nmo] (columns m)
@@ -5324,7 +6555,12 @@ impl<'a> GwCdGradEngine<'a> {
         let cache = CdQpCache {
             target: n,
             omega,
+            freq: omega,
             z_factor: 0.0,
+            dsigma_domega: dsigma,
+            static_fallback: false,
+            linearized: false,
+            lin_shift: 0.0,
             w_imag,
             y_imag,
             w0,
@@ -5366,13 +6602,88 @@ impl<'a> GwCdGradEngine<'a> {
     /// `GwGradConfig::qpe_graphical` the root comes from REST's production
     /// graphical linear-interpolation solver instead of the
     /// analytic-derivative Newton iteration (PySCF `qp_energy_subtracted`).
+    /// One-step Newton ("linearized") quasiparticle energy for the full-CD
+    /// engine — the counterpart of [`GwGradEngine::linearized_cache`].
+    ///
+    /// ```text
+    /// E_lin = e_n + Z(e_n) [ consts_n + Re Sigma_sub(e_n) - e_n ],
+    /// Z(e_n) = 1/(1 - d Re Sigma_sub/d omega)
+    /// ```
+    /// Full-CD static on-shell fallback: mean-field frequency and `Z = 1`
+    /// (`E = consts_n + Re Sigma_sub(e_n)`), the branch used for deep levels and
+    /// for a linearized step that is not a contraction.
+    fn static_fallback_cache(&self, n: usize) -> CdQpCache {
+        let e_n = self.base.e[n];
+        let consts = self.consts(n);
+        let (sigma, dsigma, mut cache) = self.sigma_sub(e_n, n);
+        cache.omega = consts + sigma;
+        cache.freq = e_n;
+        cache.z_factor = 1.0;
+        cache.dsigma_domega = dsigma;
+        cache.static_fallback = true;
+        cache.linearized = false;
+        cache.lin_shift = 0.0;
+        cache
+    }
+
+    #[allow(dead_code)]
+    /// Counterpart of [`GwGradEngine::linearized_guarded`] for the full-CD
+    /// engine: a non-positive linearized `Z` is rejected and the static
+    /// on-shell energy is used instead.
+    fn linearized_guarded(&self, n: usize) -> CdQpCache {
+        let e_n = self.base.e[n];
+        let consts = self.consts(n);
+        let (sigma, dsigma, _) = self.sigma_sub(e_n, n);
+        let z = 1.0 / (1.0 - dsigma);
+        if !(z > 0.0) {
+            println!(
+                "warning!!! cd_gw_grad orbital {n}: linearized (one-step Newton) Z = {z:.4} \
+                 is not positive (step would be {:+.3e} Ha); using the static on-shell energy",
+                z * (consts + sigma - e_n)
+            );
+            return self.static_fallback_cache(n);
+        }
+        self.linearized_cache(n)
+    }
+
+    #[allow(dead_code)]
+    fn linearized_cache(&self, n: usize) -> CdQpCache {
+        let e_n = self.base.e[n];
+        let consts = self.consts(n);
+        let (sigma, dsigma, mut cache) = self.sigma_sub(e_n, n);
+        let z = 1.0 / (1.0 - dsigma);
+        let shift = consts + sigma - e_n;
+        cache.omega = e_n + z * shift;
+        cache.freq = e_n;
+        cache.z_factor = z;
+        cache.dsigma_domega = dsigma;
+        cache.static_fallback = false;
+        cache.linearized = true;
+        cache.lin_shift = shift;
+        cache
+    }
+
     pub fn build_target_cache(&self, n: usize) -> CdQpCache {
         let e_n = self.base.e[n];
         let side = if n < self.base.nocc { -1.0 } else { 1.0 };
         let consts = self.consts(n);
         let t0 = Instant::now();
+        // REST `gw_switch_fallback_threshold`: deep levels use the static
+        // on-shell energy `consts_n + Re Sigma_sub(e_n)` (`Z = 1`).
+        let deeply_occupied =
+            e_n < 0.0 && -e_n > self.base.config.static_fallback_threshold;
+        if deeply_occupied {
+            return self.static_fallback_cache(n);
+        }
         if self.base.config.qpe_graphical {
             let fq = |om: f64| om - consts - self.sigma_sub_at(om, n).0;
+            if !self.base.config.graphical_rescue {
+                println!(
+                    "warning!!! cd_gw_grad Newton did not converge for orbital {n}; \
+                     using the static on-shell energy (graphical_rescue = false)"
+                );
+                return self.static_fallback_cache(n);
+            }
             let (have_crossing, xg) =
                 crate::ri_gw::linear_interpolation_solver(&fq, e_n, side, 21, 0.1);
             if !have_crossing {
@@ -5382,16 +6693,18 @@ impl<'a> GwCdGradEngine<'a> {
             }
             let (_sigma, dsigma, mut cache) = self.sigma_sub(xg, n);
             cache.omega = xg;
+            cache.freq = xg;
             cache.z_factor = 1.0 / (1.0 - dsigma);
+            cache.dsigma_domega = dsigma;
             if grad_timing() {
                 eprintln!(
                     "[cd_gw_grad timing]   target {n} graphical solve + cache {:8.2}s",
                     t0.elapsed().as_secs_f64()
                 );
             }
-            return cache;
         }
-        let mut x = e_n + side * 1.0e-2;
+        // Newton on the analytic derivative of the QP equation.
+        let mut x = e_n + side * 0.02;
         let mut converged = false;
         for iter in 0..self.base.config.qpe_max_iter {
             let (sigma, dsigma, _) = self.sigma_sub(x, n);
@@ -5411,14 +6724,39 @@ impl<'a> GwCdGradEngine<'a> {
             }
         }
         if !converged {
+            // The full-CD engine has no omega-derivative pullback channel, so it
+            // cannot differentiate the linearized branch; the root is also
+            // unusable (the Newton iterate did not settle).  The static
+            // on-shell energy is smooth and differentiable, so it is the only
+            // branch left.
             println!(
-                "warning!!! cd_gw_grad Newton solver did not converge for orbital {}!",
-                n
+                "warning!!! cd_gw_grad Newton solver did not converge for orbital {n}; \
+                 using the static on-shell energy (the full-CD gradient does not \
+                 implement the linearized branch)"
             );
+            return self.static_fallback_cache(n);
         }
         let (_sigma, dsigma, mut cache) = self.sigma_sub(x, n);
+        let z_root = 1.0 / (1.0 - dsigma);
+        if self.base.config.z_min > 0.0 && z_root < self.base.config.z_min {
+            // The `gradient_z_min` rule asks for the linearized (one-step
+            // Newton) functional, whose analytic derivative needs the
+            // omega-derivative pullback channel that only the low-rank engine
+            // implements.  Rather than differentiate a branch this engine does
+            // not support, keep the converged root (whose gradient **is**
+            // implemented) and say so.
+            println!(
+                "warning!!! cd_gw_grad orbital {n}: converged Z = {z_root:.4} is below \
+                 z_min = {:.3}, but the full-CD gradient does not implement the \
+                 linearized (one-step Newton) branch; keeping the root.  Use \
+                 gradient_engine = \"lr\" for the linearized branch.",
+                self.base.config.z_min
+            );
+        }
         cache.omega = x;
-        cache.z_factor = 1.0 / (1.0 - dsigma);
+        cache.freq = x;
+        cache.z_factor = z_root;
+        cache.dsigma_domega = dsigma;
         if grad_timing() {
             eprintln!(
                 "[cd_gw_grad timing]   target {} newton+cache {:8.2}s",
@@ -5449,6 +6787,19 @@ impl<'a> GwCdGradEngine<'a> {
         let nk = weights.len();
         for w in weights {
             assert_eq!(w.len(), caches.len(), "cd_qp_pullback: weight row length mismatch");
+        }
+        // The full-CD gradient has no omega-derivative channel yet: a linearized
+        // cache would silently produce a wrong gradient, so refuse loudly.
+        for c in caches.iter() {
+            assert!(
+                !c.linearized,
+                "gw_grad: the full-CD GW analytic gradient does not implement the \
+                 omega-derivative channel of the linearized (one-step Newton) QP \
+                 branch (orbital {} fell back to it).  Set \
+                 [quasiparticle_methods] gradient_z_min = 0 to disable that branch, \
+                 or use gradient_engine = \"lr\".",
+                c.target
+            );
         }
         let mask = base.config.phase_mask;
         let (do_imag, do_static, do_res) = (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0);
@@ -5481,7 +6832,7 @@ impl<'a> GwCdGradEngine<'a> {
                 for m in 0..nmo {
                     let half_minus_f = if m < nocc { -0.5 } else { 0.5 };
                     let t = Complex::new(
-                        cache.omega - base.e[m],
+                        cache.freq - base.e[m],
                         -eta * (ef - base.e[m]).signum(),
                     );
                     let t2 = t * t;
@@ -5520,9 +6871,41 @@ impl<'a> GwCdGradEngine<'a> {
                 }
                 be[k][n] += c;
                 bb[k][n] += c;
+                if cache.static_fallback {
+                    // see `QpCache::static_fallback`: the mean-field frequency
+                    // moves with the perturbation
+                    be[k][n] += weights[k][j] * cache.dsigma_domega;
+                }
                 if do_imag {
                     for m in 0..nmo {
                         be[k][m] += c * coeffs[j].explicit[m];
+                    }
+                }
+                // ---- (1-alpha) RI-exchange part of the static term --------
+                // `B_n = e_n + (1-alpha) Sigma_x,nn - v_xc,nn` with
+                // `Sigma_x,nn = -sum_i q_ni^T J^-1 q_ni`, so this half of
+                // `d B_n/dR` is `-(1-alpha)[2 sum_i g_ni^T dq_ni
+                // - sum_i g_ni^T dJ g_ni]` with `g_ni = J^-1 q_ni`.  The v_xc
+                // half leaves through the `b_x` covector (`bb`), and for an HF
+                // reference `fock_hyb == 1` drops the whole block (the exchange
+                // then already sits in `e_n`).  Mirrors the LR pullback
+                // (`qp_pullback_chunk`); Omitting it made every DFT reference's
+                // full-CD gradient wrong by the exchange-derivative term.
+                if (1.0 - base.fock_hyb).abs() > 1.0e-14 {
+                    let na = naux;
+                    let ex_scale = c * (1.0 - base.fock_hyb);
+                    for i in 0..nocc {
+                        let qni = base.with_q(|q| base.gather_pair(q, n, i));
+                        let g_ni = base.metric_solve(&qni, 1);
+                        let col_i = self.pair_col(n, i) * na;
+                        for p in 0..na {
+                            bq[k][col_i + p] -= 2.0 * ex_scale * g_ni[p];
+                        }
+                        for p in 0..na {
+                            for q in 0..na {
+                                bj[k][p + q * na] += ex_scale * g_ni[p] * g_ni[q];
+                            }
+                        }
                     }
                 }
                 if !do_static {
@@ -5714,7 +7097,7 @@ impl<'a> GwCdGradEngine<'a> {
                     let p2im = 2.0 * pr * pi;
                     wz += p2re * zr[col] - p2im * zi[col];
                 }
-                let zsign = (base.e[r.m] - cache.omega).signum();
+                let zsign = (base.e[r.m] - cache.freq).signum();
                 for k in 0..nk {
                     let c = weights[k][j] * cache.z_factor;
                     if c == 0.0 {

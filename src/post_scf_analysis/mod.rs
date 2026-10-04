@@ -478,10 +478,140 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             crate::fileop::gw_checkpoint::save_gw_finished_checkpoint(scf_data);
         }
         ri_bse::dynamicbse::dynamic_bse_main(scf_data, &qp_ctrl);
+    }else if output_type.eq("gw_gradient") || output_type.eq("bse_gradient"){
+        // Analytic nuclear gradients of the GW quasiparticle energy or of the
+        // lowest BSE excitation energies.  Both are evaluated through the
+        // library engines that the numerical tests use; this branch is the
+        // input-card entry point for them.
+        if scf_data.mol.spin_channel==2 {
+            panic!("GW-BSE analytic gradients currently support only spin-restricted (closed-shell) references.");
+        }
+        if qp_ctrl.gw_scheme=="parse from file"{
+            let parse_qp_path=qp_ctrl.parse_qp_path.clone();
+            scf_data.gwqp.0=ri_gw::read_floats(&parse_qp_path)
+                .expect("Failure when reading from GW QP energies file!");
+        }
+        if scf_data.mol.ctrl.print_level>0 {
+            println!("GW-BSE analytic nuclear gradient invoked (gw_or_bse = \"{output_type}\").");
+        }
+        let mut cfg = ri_gw::gw_grad::GwGradConfig::from_scf(scf_data);
+        cfg.z_min = qp_ctrl.gradient_z_min;
+        cfg.force_static_fallback = qp_ctrl.gradient_force_fallback
+            .split(',')
+            .filter_map(|t| t.trim().parse::<usize>().ok())
+            .collect();
+        if cfg.z_min > 0.0 && (cfg.z_min - 0.3).abs() > 0.0 {
+            println!("GW-BSE gradient: linearized (one-step Newton) branch used when Z < {:.3}", cfg.z_min);
+        }
+        if !cfg.force_static_fallback.is_empty() {
+            println!(
+                "GW-BSE gradient: {} orbital(s) pinned to the static on-shell fallback: {:?}",
+                cfg.force_static_fallback.len(), cfg.force_static_fallback
+            );
+        }
+        cfg.smooth_pole = qp_ctrl.gradient_smooth_pole;
+        if cfg.smooth_pole {
+            println!("GW-BSE gradient: C^1 residue pole-factor switch (no 0/0.5/1 jump)");
+        }
+        cfg.exact_residue_z = qp_ctrl.gradient_exact_residue;
+        if cfg.exact_residue_z {
+            println!("GW-BSE gradient: continuous (exact-frequency) residue evaluation, no real-axis grid");
+        }
+        cfg.graphical_rescue = qp_ctrl.gradient_graphical_rescue;
+        if cfg.graphical_rescue {
+            println!("GW-BSE gradient: graphical (linear-interpolation) rescue of a stalled Newton step enabled");
+        }
+        cfg.force_linearized = qp_ctrl.gradient_force_linearized
+            .split(',')
+            .filter_map(|t| t.trim().parse::<usize>().ok())
+            .collect();
+        if !cfg.force_linearized.is_empty() {
+            println!(
+                "GW-BSE gradient: {} orbital(s) pinned to the linearized (one-step Newton) branch: {:?}",
+                cfg.force_linearized.len(), cfg.force_linearized
+            );
+        }
+        if output_type.eq("gw_gradient"){
+            let target = if qp_ctrl.gradient_orbital < 0 {
+                scf_data.homo[0]
+            } else {
+                qp_ctrl.gradient_orbital as usize
+            };
+            assert!(target < scf_data.mol.num_state, "gradient_orbital {target} out of range");
+            let use_cd = qp_ctrl.gradient_engine.eq_ignore_ascii_case("cd");
+            let (grad, omega, z) = if use_cd {
+                let engine = ri_gw::gw_grad::GwCdGradEngine::new(scf_data, cfg);
+                engine.analytic_gradient(target)
+            } else {
+                let engine = ri_gw::gw_grad::GwGradEngine::new(scf_data, cfg);
+                engine.analytic_gradient(target)
+            };
+            println!(
+                "GW quasiparticle energy of orbital {target}: {omega:.12} Ha  (Z = {z:.6}, engine = \"{}\")",
+                if use_cd {"cd"} else {"lr"}
+            );
+            report_analytic_gradient(scf_data, "GW", &grad);
+        }else{
+            let multi = if qp_ctrl.bse_spin.eq_ignore_ascii_case("triplet") {'t'} else {'s'};
+            let screen = if qp_ctrl.gradient_screening.eq_ignore_ascii_case("qp") {
+                ri_bse::bse_grad::ScreeningEnergy::Qp
+            } else {
+                ri_bse::bse_grad::ScreeningEnergy::Reference
+            };
+            let nroots = if qp_ctrl.gradient_nroots == 0 {
+                (qp_ctrl.gradient_state + 1).max(2)
+            } else {
+                qp_ctrl.gradient_nroots
+            };
+            assert!(
+                nroots > qp_ctrl.gradient_state,
+                "gradient_nroots ({nroots}) must exceed gradient_state ({})",
+                qp_ctrl.gradient_state
+            );
+            let (grads, omegas) = {
+                let gw = ri_gw::gw_grad::GwGradEngine::new(scf_data, cfg);
+                let mut bse = ri_bse::bse_grad::BseGradEngine::new_with_cutoff(
+                    scf_data, &gw, multi, screen, f64::INFINITY);
+                println!(
+                    "BSE transition space: {} occupied x {} of {} virtuals, spin channel '{multi}'",
+                    bse.screen.nocc, bse.screen.nvir, bse.screen.nvir_full
+                );
+                bse.solve(nroots, ri_bse::bse_grad::BseSolver::Dense,
+                          &crate::solvers::davidson::DavidsonConfig::default());
+                for (k, om) in bse.excitation_energies().iter().enumerate() {
+                    println!("  BSE root {k}: {:.12} Ha = {:.6} eV", om, om * 27.211386245988);
+                }
+                bse.analytic_gradients()
+            };
+            let state = qp_ctrl.gradient_state;
+            println!(
+                "BSE analytic gradient requested for root {state} (omega = {:.12} Ha = {:.6} eV)",
+                omegas[state], omegas[state] * 27.211386245988
+            );
+            report_analytic_gradient(scf_data, &format!("BSE_ROOT{state}"), &grads[state]);
+        }
     }else{
         print!("Warning: You entered an invalid quasiparticle method. No quasiparticle methods Were triggered.")
     }
     bse_output
+}
+
+/// Print an analytic Cartesian gradient (flat index `3*atom + comp`, in
+/// Hartree/Bohr) with the standard force formatter and archive it in
+/// `scf_data.energies` under `<label>_gradient`.
+fn report_analytic_gradient(scf_data:&mut SCF, label:&str, grad:&[f64]) {
+    let natm = scf_data.mol.geom.elem.len();
+    assert_eq!(grad.len(), natm*3, "{label} gradient: unexpected length {} (expected {})", grad.len(), natm*3);
+    let mut m = tensors::MatrixFull::new([3, natm], 0.0);
+    for a in 0..natm {
+        for c in 0..3 {
+            m.data[c + a*3] = grad[a*3 + c];
+        }
+    }
+    println!("------ {label} analytic gradient [a.u.] ------");
+    println!("{}", formated_force(&m, &scf_data.mol.geom.elem));
+    println!("---------------------------------------------");
+    scf_data.energies.insert(format!("{}_gradient", label.to_lowercase()), grad.to_vec());
 }
 
 fn fciqmc_dump(scf_data: &SCF) {

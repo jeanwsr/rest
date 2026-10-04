@@ -192,10 +192,7 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     let mut save_energies_no_se:Vec<f64>=vec![0.0;num_state_cutoff];
     save_energies_no_se=(0..num_state_cutoff).map(|n|{
         let consts=if cancel_dfa_xc==true{
-            let mut exchange=0.0;
-            for i in 0..homo+1{
-                exchange-=v_matrix[[n,i]];
-            }
+            let exchange = static_exchange(scf_data, &v_matrix, n, homo);
             scf_data.eigenvalues[0][n]+exchange-vxc_nn[n]
         }else{quasiparticle_energies_g[n]};
         let side=if n>=occ_size{1.0}else{-1.0};
@@ -229,10 +226,7 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
         save_energies=(0..num_state_cutoff).map(|n|{
             let origin = save_energies_no_se[n];
             let consts=if cancel_dfa_xc==true{
-                let mut exchange=0.0;
-                for i in 0..homo+1{
-                    exchange-=v_matrix[[n,i]];
-                }
+                let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                 scf_data.eigenvalues[0][n]+exchange-vxc_nn[n]
             }else{quasiparticle_energies_g[n]};
             let side=if n>=occ_size{1.0}else{-1.0};
@@ -255,10 +249,7 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
         save_energies=(0..num_state_cutoff).map(|n|{
             let origin = save_energies_no_se[n];
             let consts=if cancel_dfa_xc==true{
-                let mut exchange=0.0;
-                for i in 0..homo+1{
-                    exchange-=v_matrix[[n,i]];
-                }
+                let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                 scf_data.eigenvalues[0][n]+exchange-vxc_nn[n]
             }else{quasiparticle_energies_g[n]};
             let side=if n>=occ_size{1.0}else{-1.0};
@@ -281,6 +272,42 @@ pub fn gw_calculations(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_
     display::full_quasiparticles(&quasiparticle_energies_g,occ_size);
     quasiparticle_energies_g
 }
+/// Fraction of the exact (RI) exchange `Sigma_x,nn` that the reference's own
+/// orbital energies already contain.
+///
+/// The static term of the quasiparticle equation is
+/// `B_n = e_n + (1 - alpha) Sigma_x,nn - v_xc,nn`: the `(1 - alpha) Sigma_x`
+/// piece *completes* the exchange up to the full exact one, and `v_xc` is
+/// cancelled, so that the G0W0 starting point is the HF-like `h + J + Sigma_x`.
+///
+/// REST leaves `dfa_hybrid_scf = 0` for a plain Hartree-Fock reference, but an
+/// HF calculation already carries the **exact** exchange in `e_n`, so the
+/// fraction to complement there is one, not zero.  Reading `dfa_hybrid_scf`
+/// directly therefore adds `Sigma_x,nn` a second time — 4.87 Ha for the O 1s of
+/// H2O/STO-3G, which is what used to make an HF reference's G0W0 energies
+/// disagree with `GwGradEngine` (whose `fock_hyb` has always made this
+/// distinction).  Mirrors `dft::response` (`is_hf = dfa_compnt_scf.is_empty()`).
+pub fn exchange_fraction(scf_data:&SCF)->f64{
+    if scf_data.mol.xc_data.dfa_compnt_scf.is_empty() {
+        1.0
+    } else {
+        scf_data.mol.xc_data.dfa_hybrid_scf
+    }
+}
+
+/// `(1 - alpha) * Sigma_x,nn` with `Sigma_x,nn = -sum_i (n i|n i)` and `alpha`
+/// from [`exchange_fraction`]: the exact-exchange part the static term adds on
+/// top of `e_n`.  Used by every energy path (`gw_calculations`, `linearized_gw`
+/// and their low-rank variants) so that an HF reference is handled like a
+/// hybrid with `alpha = 1`.
+pub fn static_exchange(scf_data:&SCF,v_matrix:&MatrixFull<f64>,n:usize,homo:usize)->f64{
+    let mut exchange = 0.0;
+    for i in 0..homo + 1 {
+        exchange -= v_matrix[[n, i]];
+    }
+    exchange * (1.0 - exchange_fraction(scf_data))
+}
+
 pub fn vxc_ao2mo(scf_data:&SCF)->Vec<f64>{
     let eigenvecs=scf_data.eigenvectors[0].clone();
     let vxc_ao=scf_data.generate_vxc_rayon(1.0).2[0].to_matrixfull().unwrap().clone();
@@ -1777,6 +1804,7 @@ pub fn linear_interpolation_solver<F>(mut f:F,starting_point:f64,side:f64,grid_f
     }
     (have_crossing,answer)
 }
+
 pub fn quasiparticle_equation(omega:f64,n:usize,consts:f64,ri_ov:&MatrixFull<f64>,ri_row_n:&MatrixFull<f64>,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>,occ_size:usize,vir_size:usize,num_state:usize,w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,res_tol:f64,eta:f64)->f64{
     let contour=contour_rayon(omega,n,quasiparticle_energies_g,quasiparticle_energies_w,occ_size,vir_size,num_state,ri_ov,ri_row_n,res_tol,eta);
     let imag=calculate_imag(&w_c_at_freqs,num_state,n,omega,quasiparticle_energies_g,quasiparticle_energies_w);
@@ -1969,10 +1997,7 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
         let spectral_weight=(1.0-derivative).powf(-1.0);
         println!("spectral weight at n={}: {}",n,spectral_weight);
         let real_qp=if cancel_dfa_xc==true{
-            let mut exchange=0.0;
-            for i in 0..homo+1{
-                exchange-=v_matrix[[n,i]];
-            }
+            let exchange = static_exchange(scf_data, &v_matrix, n, homo);
             omega_shifted+(spectral_weight*(contour-imag_n+exchange-vxc_nn[n]))
         }else{omega_shifted+(spectral_weight*(contour-imag_n))};
         println!("for n={}, first round (no self-energy correction): linearized gw yields qp energy={}",n,real_qp);
@@ -2019,10 +2044,7 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
             println!("spectral weight at n={} (with FSE): {}",n,spectral_weight);
 
             let real_qp=if cancel_dfa_xc==true{
-                let mut exchange=0.0;
-                for i in 0..homo+1{
-                    exchange-=v_matrix[[n,i]];
-                }
+                let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                 omega_shifted+(spectral_weight*(self_energy_at_omega+exchange-vxc_nn[n]))
             }else{omega_shifted+(spectral_weight*self_energy_at_omega)};
             println!("for n={}, second round (with FSE): linearized gw yields qp energy={}",n,real_qp);
@@ -2058,10 +2080,7 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
             println!("spectral weight at n={} (with HSE): {}",n,spectral_weight);
 
             let real_qp=if cancel_dfa_xc==true{
-                let mut exchange=0.0;
-                for i in 0..homo+1{
-                    exchange-=v_matrix[[n,i]];
-                }
+                let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                 omega_shifted+(spectral_weight*(self_energy_at_omega+exchange-vxc_nn[n]))
             }else{omega_shifted+(spectral_weight*self_energy_at_omega)};
             println!("for n={}, second round (with HSE): linearized gw yields qp energy={}",n,real_qp);
@@ -2195,10 +2214,7 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     let cdgw_eta = qp_ctrl.cdgw_eta;
     let cdgw_res_tol = qp_ctrl.cdgw_res_tol;
     let n=homo;
-    let mut exchange=0.0;
-    for i in 0..homo+1{
-        exchange-=v_matrix[[n,i]];
-    }
+    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
     let consts=eigenenergies[n]+exchange-vxc_nn[n];
     if scf_data.mol.ctrl.print_level>1{
         println!("for n={},exchange={}",n,exchange);
@@ -2210,10 +2226,7 @@ pub fn get_homo_lumo_qp_only(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,m
     //println!("for n={}, quasiparticle equation yields:qp energy={}",n,homo_qp);
     println!("The QP energy of HOMO obtained by GWA is {}",homo_qp);
     let n=lumo;
-    let mut exchange=0.0;
-    for i in 0..homo+1{
-        exchange-=v_matrix[[n,i]];
-    }
+    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
     let consts=eigenenergies[n]+exchange-vxc_nn[n];
     if scf_data.mol.ctrl.print_level>1{
         println!("for n={},exchange={}",n,exchange);
@@ -2304,10 +2317,7 @@ fn get_homo_lumo_qp_only_lowrank(
     );
     real_axis_vchiv.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
     let n = homo;
-    let mut exchange = 0.0;
-    for i in 0..homo + 1 {
-        exchange -= v_matrix[[n, i]];
-    }
+    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
     let consts = eigenenergies[n] + exchange - vxc_nn[n];
     if printlevel > 1 {
         println!("for n={},exchange={}", n, exchange);
@@ -2326,10 +2336,7 @@ fn get_homo_lumo_qp_only_lowrank(
 
     // LUMO
     let n = lumo;
-    let mut exchange = 0.0;
-    for i in 0..homo + 1 {
-        exchange -= v_matrix[[n, i]];
-    }
+    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
     let consts = eigenenergies[n] + exchange - vxc_nn[n];
     if printlevel > 1 {
         println!("for n={},exchange={}", n, exchange);
@@ -2685,25 +2692,43 @@ pub fn generate_real_axis_vchiv(
         println!("[DEBUG] de_max (after 1.05* + 0.1) = {:.10} Ha", de_max);
     }
 
-    // Step 2: Determine grid scaling factor
-    // omega_chi_max > 0.0  means user-specified max frequency for grid distribution;
-    // otherwise fall back to de_max (original behavior).
-    let grid_scale = if omega_chi_max > 0.0 {
-        if omega_chi_max < de_max && print_level > 0 {
-            println!("[omega_chi_max={:.6} Ha < de_max={:.6} Ha] Grid clamped at user-specified max;",
-                     omega_chi_max, de_max);
-            println!("  frequencies > omega_chi_max will use boundary v*chi*v value.");
-        }
-        omega_chi_max
-    } else {
-        de_max
+    // Step 2: Determine grid scaling factor and node count.
+    // `omega_chi_max > 0.0` means a user-specified max frequency for the grid
+    // distribution; otherwise the best-practice automatic rule applies when
+    // `nomega_chi_real == 0`, and `de_max` is the historical fallback.
+    if omega_chi_max > 0.0 && omega_chi_max < de_max && print_level > 0 {
+        println!("[omega_chi_max={:.6} Ha < de_max={:.6} Ha] Grid clamped at user-specified max;",
+                 omega_chi_max, de_max);
+        println!("  frequencies > omega_chi_max will use boundary v*chi*v value.");
+    }
+    let (n_points, grid_scale) = match crate::ri_gw::gw_grad::auto_real_axis_grid(
+        quasiparticle_energies_g,
+        occ_size,
+        nsemin,
+        nsemax,
+        de_max,
+        None,
+        omega_chi_max,
+        nomega_chi_real,
+        0.0,
+    ) {
+        Some((n, scale, _)) => (n, scale),
+        None if omega_chi_max > 0.0 => (nomega_chi_real, omega_chi_max),
+        None => (nomega_chi_real, de_max),
     };
+    if print_level > 0 && n_points != nomega_chi_real {
+        println!(
+            "Low-rank contour: automatic real-axis grid -> {} points on [0, {:.6} Ha] \
+             (z_need-driven; de_max = {:.6} Ha)",
+            n_points, grid_scale, de_max
+        );
+    }
 
     // Step 3: Build low-rank representation at each grid point
-    let mut grid: Vec<LowRankVChiV> = Vec::with_capacity(nomega_chi_real);
-    for i_omega in 0..nomega_chi_real {
-        let omega_real = if nomega_chi_real > 1 {
-            let t = (i_omega as f64) / ((nomega_chi_real - 1) as f64);
+    let mut grid: Vec<LowRankVChiV> = Vec::with_capacity(n_points);
+    for i_omega in 0..n_points {
+        let omega_real = if n_points > 1 {
+            let t = (i_omega as f64) / ((n_points - 1) as f64);
             if grid_type == 1 {
                 // Power-law grid: omega = grid_scale * t^2, denser near zero
                 grid_scale * t * t
@@ -2716,8 +2741,8 @@ pub fn generate_real_axis_vchiv(
         };
         if print_level > 2 {
             println!("[DEBUG] Real-axis freq {} / {} : omega = {:.10} Ha = {:.6} eV  (t={:.6})",
-                     i_omega + 1, nomega_chi_real, omega_real, omega_real * EV,
-                     (i_omega as f64) / ((nomega_chi_real - 1) as f64));
+                     i_omega + 1, n_points, omega_real, omega_real * EV,
+                     if n_points > 1 { (i_omega as f64) / ((n_points - 1) as f64) } else { 0.0 });
         }
         let lr = low_rank_vchi_vsqrt(
             quasiparticle_energies_w, occ_size, vir_size, ri_ov, omega_real, tolerance, 'R', eta,
@@ -2733,7 +2758,7 @@ pub fn generate_real_axis_vchiv(
         grid,
         omega_min: 0.0,
         omega_max: de_max,
-        n_points: nomega_chi_real,
+        n_points,
         grid_type: grid_type,
         interp: 1,
     }
@@ -2962,19 +2987,18 @@ pub fn compute_single_residue_lowrank(lr: &LowRankVChiV, ri_vec: &[f64]) -> f64 
     if lr.n_keep == 0 {
         return 0.0;
     }
-
-    let n_aux = lr.eigvec.size[0];
+    // `proj[v] = eigvec[:, v]^T ri_vec`, i.e. the matrix-vector product the old
+    // hand-written double loop over `n_aux * n_keep` computed element by
+    // element.  `eigvec` is stored column-major with exactly `n_keep` columns,
+    // so this is a plain transposed GEMV (BLAS-2, vectorised) instead of a
+    // scalar loop with `MatrixFull` indexing in the innermost body.
     let n_keep = lr.n_keep;
+    let mut proj = vec![0.0_f64; n_keep];
+    _dgemv(&lr.eigvec, ri_vec, &mut proj, 'T', 1.0, 0.0, 1, 1);
     let mut residue = 0.0_f64;
-
     for v in 0..n_keep {
-        let mut tmp = 0.0_f64;
-        for aux in 0..n_aux {
-            tmp += ri_vec[aux] * lr.eigvec[[aux, v]];
-        }
-        residue += tmp * tmp * lr.eigval[v];
+        residue += proj[v] * proj[v] * lr.eigval[v];
     }
-
     residue
 }
 
@@ -3745,10 +3769,7 @@ pub fn gw_calculations_lowrank(
     save_energies_no_se = (0..num_state_cutoff)
         .map(|n| {
             let consts = if cancel_dfa_xc == true {
-                let mut exchange = 0.0;
-                for i in 0..homo + 1 {
-                    exchange -= v_matrix[[n, i]];
-                }
+                let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                 scf_data.eigenvalues[0][n] + exchange - vxc_nn[n]
             } else {
                 quasiparticle_energies_g[n]
@@ -3795,10 +3816,7 @@ pub fn gw_calculations_lowrank(
             .map(|n| {
                 let origin = save_energies_no_se[n];
                 let consts = if cancel_dfa_xc == true {
-                    let mut exchange = 0.0;
-                    for i in 0..homo + 1 {
-                        exchange -= v_matrix[[n, i]];
-                    }
+                    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                     scf_data.eigenvalues[0][n] + exchange - vxc_nn[n]
                 } else {
                     quasiparticle_energies_g[n]
@@ -3842,10 +3860,7 @@ pub fn gw_calculations_lowrank(
             .map(|n| {
                 let origin = save_energies_no_se[n];
                 let consts = if cancel_dfa_xc == true {
-                    let mut exchange = 0.0;
-                    for i in 0..homo + 1 {
-                        exchange -= v_matrix[[n, i]];
-                    }
+                    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                     scf_data.eigenvalues[0][n] + exchange - vxc_nn[n]
                 } else {
                     quasiparticle_energies_g[n]
@@ -4016,10 +4031,7 @@ pub fn linearized_gw_lowrank(
             let spectral_weight = (1.0 - derivative).powf(-1.0);
             println!("spectral weight at n={}: {}", n, spectral_weight);
             let real_qp = if cancel_dfa_xc == true {
-                let mut exchange = 0.0;
-                for i in 0..homo + 1 {
-                    exchange -= v_matrix[[n, i]];
-                }
+                let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                 omega_shifted
                     + (spectral_weight * (contour - imag_n + exchange - vxc_nn[n]))
             } else {
@@ -4079,10 +4091,7 @@ pub fn linearized_gw_lowrank(
                 println!("spectral weight at n={} (with FSE): {}", n, spectral_weight);
 
                 let real_qp = if cancel_dfa_xc == true {
-                    let mut exchange = 0.0;
-                    for i in 0..homo + 1 {
-                        exchange -= v_matrix[[n, i]];
-                    }
+                    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                     omega_shifted
                         + (spectral_weight
                             * (self_energy_at_omega + exchange - vxc_nn[n]))
@@ -4135,10 +4144,7 @@ pub fn linearized_gw_lowrank(
                 println!("spectral weight at n={} (with HSE): {}", n, spectral_weight);
 
                 let real_qp = if cancel_dfa_xc == true {
-                    let mut exchange = 0.0;
-                    for i in 0..homo + 1 {
-                        exchange -= v_matrix[[n, i]];
-                    }
+                    let exchange = static_exchange(scf_data, &v_matrix, n, homo);
                     omega_shifted
                         + (spectral_weight
                             * (self_energy_at_omega + exchange - vxc_nn[n]))

@@ -200,7 +200,85 @@ pub struct QuasiParticle {
     pub save_first_excitation:bool,
     pub save_first_excitation_path:String,
     pub use_low_rank_contour:bool,
+    // ---- analytic nuclear gradients ------------------------------------
+    // Triggered by `gw_or_bse = "gw_gradient"` / `"bse_gradient"`.
+    /// Which engine differentiates the GW quasiparticle energy: `"lr"` (the
+    /// production low-rank CD engine) or `"cd"` (the full-CD engine).
+    /// Default `"lr"`.
+    pub gradient_engine:String,
+    /// Orbital whose quasiparticle energy `"gw_gradient"` differentiates.
+    /// Negative selects the HOMO.  Default `-1`.
+    pub gradient_orbital:i32,
+    /// BSE root (excitation) index differentiated by `"bse_gradient"`.
+    /// Default `0`.
+    pub gradient_state:usize,
+    /// Number of BSE roots solved before differentiating.  `0` selects
+    /// `max(gradient_state + 1, 2)`.  Default `0`.
+    pub gradient_nroots:usize,
+    /// Orbital energies that build the BSE screening inside the gradient:
+    /// `"reference"` (mean-field, REST's default) or `"qp"`.  Default
+    /// `"reference"`.
+    pub gradient_screening:String,
+    /// Orbital indices pinned to the **static on-shell fallback** while the
+    /// gradient is evaluated, as a comma-separated list (empty = off).
+    ///
+    /// The quasiparticle solver's branch depends on the geometry (the
+    /// graphical scan finds a sign change at some displacements and not at
+    /// others), so the differentiated functional is discontinuous there.  A
+    /// central-difference check must pin the same set on both sides; a
+    /// single-geometry production gradient does not need it.
+    pub gradient_force_fallback:String,
+    /// Same idea as [`Self::gradient_force_fallback`], but pins the
+    /// **linearized (one-step Newton)** branch: the listed orbitals always take
+    /// it, so a finite-difference check differentiates one functional at every
+    /// geometry even when `Z` sits near `gradient_z_min`.  Empty by default.
+    pub gradient_force_linearized:String,
+    /// Use the derivative-free **graphical scan** as a rescue when the Newton
+    /// iteration on the QP equation stalls.  Default `false`: the cascade is
+    /// strictly `Newton -> linearized (one-step Newton) -> static on-shell`, so
+    /// every branch is a smooth function of the geometry.
+    pub gradient_graphical_rescue:bool,
+    /// **Experimental.**  Evaluate the residue poles at their *exact* frequency
+    /// `|e_m - omega|` instead of reading the quantised real-axis grid, and skip
+    /// the grid-node sensitivity terms (one low-rank factorisation per pole and
+    /// frequency instead of a handful of BLAS-3 blocks).
+    ///
+    /// The energy path of this protocol is well tested (it is the continuous
+    /// reference of `test_gw_grid_scaling`), but its **gradient** is not: on
+    /// `bse_h2o_pbe` the BSE analytic gradient disagrees with the central
+    /// difference by `5.6e-2` (the default grid protocol agrees to `1.2e-6`).
+    /// Keep it off unless that is being worked on.
+    pub gradient_exact_residue:bool,
+    /// Replace the hard `0 / 0.5 / 1` residue `pole_factor` ladder by the C^1
+    /// cubic switch with the same endpoints (removes a genuine value jump in
+    /// `Sigma_c` that the analytic gradient cannot represent).
+    pub gradient_smooth_pole:bool,
+    /// Spectral-weight floor of the quasiparticle root branch used by the
+    /// analytic gradient.  When the converged root carries `Z < gradient_z_min`
+    /// (or the root search fails), the orbital is differentiated through the
+    /// **linearized (one-step Newton)** functional at the mean-field level
+    /// instead.  `0.0` disables the rule.  Default `0.3`.
+    pub gradient_z_min:f64,
     pub low_rank_grid_type:String,   // "linear" or "quadratic" (power-law, denser near zero)
+    /// Number of real-axis sampling points of the low-rank contour deformation.
+    ///
+    /// `0` selects the **automatic best-practice grid**
+    /// ([`crate::ri_gw::gw_grad::auto_real_axis_grid`]): the range is capped at
+    /// `2.5 * z_need` (`z_need` = the largest residue frequency the requested
+    /// state window reads, `max |e_m - e_n|` over the active branch) and the
+    /// node count follows `1 + ceil(range / 0.025 Ha)`, clamped to `[6, 400]`.
+    ///
+    /// Rationale (measured, see `tests/gw_bse/test_gw_grid_scaling.rs`): the
+    /// historical range `de_max` pairs *every* pole with *every* scan centre and
+    /// is therefore inflated by the deep core — for H2O/def2-SVP it is 20 Ha
+    /// while the frontier residues read only ~0.5 Ha.  Spreading the nodes over
+    /// that unused range makes the grid error stagnate at 0.1-1 eV and
+    /// non-monotonic in `n`, whereas capping the range makes it converge and
+    /// `n` scale linearly with it.  Because `z_need` grows with the deepest
+    /// state in the window, `0` also implies: compute only the states you need
+    /// (`selfenergy_state_range`) — asking for core QP states legitimately
+    /// requires a much denser grid.  Keep a positive value to reproduce the
+    /// historical layout.
     pub nomega_chi_real:usize,
     /// How the real-axis low-rank `v*chi*v` is obtained between grid points.
     ///
@@ -212,7 +290,11 @@ pub struct QuasiParticle {
     ///   kept for reproducing older numbers and for A/B comparison.
     pub low_rank_interp:String,
     pub low_rank_tolerance:f64,
-    pub omega_chi_max:f64,          // real-axis freq grid max (Ha); 0=auto from de_max
+    /// User override of the real-axis grid maximum (Ha); `0` lets
+    /// `nomega_chi_real` decide (the automatic rule when it is `0`, otherwise
+    /// `de_max`).  A positive value pins the grid, which also removes the
+    /// grid-deformation channel of the analytic gradient.
+    pub omega_chi_max:f64,
     pub nomega_sigma:usize,         // number of sigma sampling points on each side (de_max scan)
     pub step_sigma:f64,             // spacing of sigma grid in Ha (de_max scan)
     pub fourier_self_energy:bool,
@@ -417,6 +499,10 @@ pub struct QuasiParticle {
     /// removed from *both* of its indices.  `0.0` keeps every pair whose RI row
     /// is not exactly zero, which is numerically exact.
     pub bse_pair_screening_tol: f64,
+    /// Deep-level rule of the QP solver: an **occupied** level with
+    /// `e_n < 0` and `-e_n > gw_switch_fallback_threshold` is treated on-shell
+    /// (static `W`, no root search) — see
+    /// `GwGradConfig::static_fallback_threshold`.  Default **1.0 Ha**.
     pub gw_switch_fallback_threshold: f64,
 }
 
@@ -473,6 +559,17 @@ impl Default for QuasiParticle {
             save_first_excitation:false,
             save_first_excitation_path:String::from("first_excitation_save.txt"),
             use_low_rank_contour:false,
+            gradient_engine:String::from("lr"),
+            gradient_orbital:-1,
+            gradient_state:0,
+            gradient_nroots:0,
+            gradient_screening:String::from("reference"),
+            gradient_force_fallback:String::new(),
+            gradient_force_linearized:String::new(),
+            gradient_graphical_rescue:false,
+            gradient_exact_residue:false,
+            gradient_smooth_pole:false,
+            gradient_z_min:0.3,
             low_rank_grid_type:String::from("linear"),
             nomega_chi_real:6,
             low_rank_interp:String::from("linear"),
@@ -569,7 +666,7 @@ impl Default for QuasiParticle {
             gw_ao_screening_tol: 0.0,
             bse_ao_screening_tol: 0.0,
             bse_pair_screening_tol: 0.0,
-            gw_switch_fallback_threshold: 1e6,
+            gw_switch_fallback_threshold: 1.0,
         }
     }
 }
@@ -632,6 +729,17 @@ impl QuasiParticle {
         table.insert("save_first_excitation".to_string(), toml::Value::Boolean(self.save_first_excitation));
         table.insert("save_first_excitation_path".to_string(), toml::Value::String(self.save_first_excitation_path.clone()));
         table.insert("use_low_rank_contour".to_string(), toml::Value::Boolean(self.use_low_rank_contour));
+        table.insert("gradient_engine".to_string(), toml::Value::String(self.gradient_engine.clone()));
+        table.insert("gradient_orbital".to_string(), toml::Value::Integer(self.gradient_orbital as i64));
+        table.insert("gradient_state".to_string(), toml::Value::Integer(self.gradient_state as i64));
+        table.insert("gradient_nroots".to_string(), toml::Value::Integer(self.gradient_nroots as i64));
+        table.insert("gradient_screening".to_string(), toml::Value::String(self.gradient_screening.clone()));
+        table.insert("gradient_force_fallback".to_string(), toml::Value::String(self.gradient_force_fallback.clone()));
+        table.insert("gradient_force_linearized".to_string(), toml::Value::String(self.gradient_force_linearized.clone()));
+        table.insert("gradient_graphical_rescue".to_string(), toml::Value::Boolean(self.gradient_graphical_rescue));
+        table.insert("gradient_exact_residue".to_string(), toml::Value::Boolean(self.gradient_exact_residue));
+        table.insert("gradient_smooth_pole".to_string(), toml::Value::Boolean(self.gradient_smooth_pole));
+        table.insert("gradient_z_min".to_string(), toml::Value::Float(self.gradient_z_min));
         table.insert("low_rank_grid_type".to_string(), toml::Value::String(self.low_rank_grid_type.clone()));
         table.insert("low_rank_interp".to_string(), toml::Value::String(self.low_rank_interp.clone()));
         table.insert("nomega_chi_real".to_string(), toml::Value::Integer(self.nomega_chi_real as i64));
@@ -1142,6 +1250,57 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 _ => {false},
             };
+            tmp_input.gradient_engine = match tmp_ctrl.get("gradient_engine").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase(),
+                _ => String::from("lr"),
+            };
+            tmp_input.gradient_orbital = match tmp_ctrl.get("gradient_orbital").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_i64().unwrap_or(-1) as i32,
+                serde_json::Value::String(s) => s.trim().parse().unwrap_or(-1),
+                _ => -1,
+            };
+            tmp_input.gradient_state = match tmp_ctrl.get("gradient_state").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+                serde_json::Value::String(s) => s.trim().parse().unwrap_or(0),
+                _ => 0,
+            };
+            tmp_input.gradient_nroots = match tmp_ctrl.get("gradient_nroots").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+                serde_json::Value::String(s) => s.trim().parse().unwrap_or(0),
+                _ => 0,
+            };
+            tmp_input.gradient_screening = match tmp_ctrl.get("gradient_screening").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase(),
+                _ => String::from("reference"),
+            };
+            tmp_input.gradient_force_fallback = match tmp_ctrl.get("gradient_force_fallback").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.trim().to_string(),
+                _ => String::new(),
+            };
+            tmp_input.gradient_force_linearized = match tmp_ctrl.get("gradient_force_linearized").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.trim().to_string(),
+                _ => String::new(),
+            };
+            tmp_input.gradient_graphical_rescue = match tmp_ctrl.get("gradient_graphical_rescue").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::String(s) => s.trim().to_lowercase().parse().unwrap_or(false),
+                _ => false,
+            };
+            tmp_input.gradient_exact_residue = match tmp_ctrl.get("gradient_exact_residue").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::String(s) => s.trim().to_lowercase().parse().unwrap_or(false),
+                _ => false,
+            };
+            tmp_input.gradient_smooth_pole = match tmp_ctrl.get("gradient_smooth_pole").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::String(s) => s.trim().to_lowercase().parse().unwrap_or(false),
+                _ => false,
+            };
+            tmp_input.gradient_z_min = match tmp_ctrl.get("gradient_z_min").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.3),
+                serde_json::Value::String(s) => s.trim().parse().unwrap_or(0.3),
+                _ => 0.3,
+            };
             tmp_input.low_rank_grid_type = match tmp_ctrl.get("low_rank_grid_type").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => {
                     let lower = s.to_lowercase();
@@ -1498,8 +1657,8 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 _ => 0.0,
             };
             tmp_input.gw_switch_fallback_threshold = match tmp_ctrl.get("gw_switch_fallback_threshold").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e6),
-                _ => 1e6,
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0),
+                _ => 1.0,
             };
             return Ok(Some(tmp_input));
         },
