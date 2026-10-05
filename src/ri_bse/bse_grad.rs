@@ -45,7 +45,7 @@
 //!   integral slices, which turns the `O(3 natm * naux * nao^2 * nmo)` assembly
 //!   into `O(naux * nao^2 * nmo)` plus `O(3 natm * naux * nao^2)`.
 
-use crate::ri_gw::gw_grad::{GwGradEngine, QpCache, QpPullbackScratch, SyncGw};
+use crate::ri_gw::gw_grad::{GwGradEngine, QpCache};
 use crate::scf_io::SCF;
 use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
 use rest_tensors::matrix::matrix_blas_lapack::_dpotrf;
@@ -1896,40 +1896,20 @@ impl<'a> BseGradEngine<'a> {
         // `PULLBACK_BATCH_PAGES` and each batch is merged (and dropped) before
         // the next one starts.  The cost is a peak that grows from
         // ~5 GB to ~13 GB at vitamin C/def2-TZVP.
-        let nthreads = self
-            .gw
-            .scf
-            .mol
-            .ctrl
-            .num_threads
-            .unwrap_or(1)
-            .clamp(1, 64);
         let per_cache = self.gw.qp_cache_estimate_bytes().max(1);
         let per_page = (self.qp_page_budget() / per_cache).clamp(1, nmo);
-        let n_pages = (nmo + per_page - 1) / per_page;
-        let pages: Vec<(usize, usize)> = (0..n_pages)
-            .map(|i| (i * per_page, ((i + 1) * per_page).min(nmo)))
-            .collect();
-        // One scratch is `nk * (naux^2 * (nquad + 2) + naux * nmo^2/2)` doubles
-        // (1.3 GB at naphthalene/def2-TZVP: `bq` 460 + `v_imag` 640 + `bj` 230 +
-        // `be`/`bb`), so the memory bound is the number of *in-flight* pages, not
-        // the thread count.  Pages are therefore processed in fixed
-        // `PULLBACK_BATCH_PAGES`-sized batches with a worker pool capped to the
-        // configured thread count, and each batch's partials are merged before
-        // the next batch starts.
-        const PULLBACK_BATCH_PAGES: usize = 2;
-        let n_workers = nthreads.min(PULLBACK_BATCH_PAGES).min(pages.len().max(1));
-        let gw = SyncGw(&self.gw);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(n_workers)
-            .build()
-            .expect("bse_grad: pullback thread pool");
         //
-        // **Serial prologue.**  Every cache a page worker reads is materialised
-        // here, before the pool starts: rebuilding a cache runs the lazy
-        // low-rank builders, which mutate `GwGradEngine`'s `RefCell` caches and
-        // are therefore not safe to trigger from two threads at once (see
-        // `SyncGw`).  The prologue is also why the workers only ever *borrow*.
+        // **Single scratch, serial pages.**  `qp_pullback_chunk` is parallel
+        // *inside* (its frequency axis and its orbital reduction run on the
+        // pool), so the page loop does not need to be parallel as well — and
+        // making it parallel cost one whole scratch per in-flight page
+        // (`nk * (naux^2*(nquad+2) + naux*nmo^2/2)` doubles, 1.1 GB at vitamin
+        // C/def2-TZVP), which is exactly what pushed the 8-core peak above the
+        // 1-core one.  One scratch here keeps the peak at the serial level.
+        //
+        // The caches a page needs are materialised before the loop: rebuilding
+        // one triggers the lazy low-rank builders, which mutate the engine's
+        // `RefCell` caches, so it must not happen from inside a parallel region.
         let mut rebuilt_all: Vec<(usize, QpCache)> = Vec::new();
         for n in 0..nmo {
             let active = (0..nk).any(|k| weights[k][n] != 0.0);
@@ -1943,92 +1923,31 @@ impl<'a> BseGradEngine<'a> {
             .enumerate()
             .map(|(i, (n, _))| (*n, i))
             .collect();
-        let mut merged = self.gw.qp_pullback_scratch(nk);
-        // Merge each batch **before** the next one is computed, so only
-        // `n_workers` scratch-sized partials are ever resident at once.  The
-        // batch order is the page order, so the accumulation order (and hence
-        // the result) is the same as a single ordered pass over all partials.
-        for batch in pages.chunks(PULLBACK_BATCH_PAGES) {
-            let rebuilt_ref = &rebuilt_all;
-            let caches_ref = &self.qp_caches;
-            let batch_parts: Vec<(QpPullbackScratch, QpPullbackScratch)> = pool.install(|| {
-                use rayon::prelude::*;
-                // `map_init` gives every worker one scratch; the pages of the
-                // batch are handed out in index order and the merge below sums the
-                // collected partials in page order, so the accumulation order is
-                // the page index alone — never the thread count.
-                batch
-                    .par_iter()
-                    .map_init(
-                        || gw.qp_pullback_scratch(nk),
-                        |scr, &(col0, end)| {
-                            let page: Vec<&QpCache> = (col0..end)
-                                .map(|n| match rebuilt_of.get(&n) {
-                                    Some(&ri) => &rebuilt_ref[ri].1,
-                                    None => &caches_ref[n],
-                                })
-                                .collect();
-                            // standard channel
-                            // reset only the page-local accumulators: a worker's
-                            // scratch is reused across the pages of its batch, and
-                            // `v_imag`/`v_static` must keep accumulating over all
-                            // of them (`map_init` runs the initializer once per
-                            // worker, so the first page of a worker starts from the
-                            // freshly allocated scratch)
-                            gw.qp_pullback_scratch_reset_page(scr);
-                            gw.qp_pullback_chunk_public(&page, &flat_weights, col0, scr);
-                            // Orbitals whose QP energy came from the linearized
-                            // (one-step Newton) branch carry an extra
-                            // omega-derivative channel
-                            // (`Z^2 * lin_shift * d_R d_omega Sigma_c`).  Its
-                            // partial is merged right after every standard
-                            // partial, so the two channels keep the serial
-                            // accumulation order.  It needs its own buffer
-                            // because the standard pass has already written
-                            // `bq`/`bj`/`be` of this page; that buffer is
-                            // allocated and dropped per page (the phase peak is
-                            // already dominated by one scratch, so this is not
-                            // where the memory goes).
-                            let mut om_part = if page.iter().any(|c| c.linearized) {
-                                gw.qp_pullback_scratch(nk)
-                            } else {
-                                QpPullbackScratch::default_empty(nk)
-                            };
-                            if page.iter().any(|c| c.linearized) {
-                                gw.qp_pullback_chunk_omega_public(
-                                    &page,
-                                    &flat_weights,
-                                    col0,
-                                    &mut om_part,
-                                );
-                            }
-                            // hand the worker's scratch over as this page's
-                            // partial and start the next page from a **cleared**
-                            // buffer of the right shapes: re-allocating the
-                            // worker's scratch per page costs
-                            // `nk * naux^2 * (nquad + 2)` doubles of fresh zeroed
-                            // memory, which measured *more* than the page
-                            // contraction itself.  The omega partial is left
-                            // unshaped when the page has no linearized row.
-                            let mut next = gw.qp_pullback_scratch(nk);
-                            gw.qp_pullback_scratch_reset_page(&mut next);
-                            let std_part = std::mem::replace(scr, next);
-                            debug_assert!(std_part.is_shaped(nk));
-                            (std_part, om_part)
-                        },
-                    )
-                    .collect()
-            });
-            // Ordered merge: the accumulation order is the page index alone.  It
-            // is a serial pass over `naux^2`-sized buckets (a few hundred MB per
-            // page), small against the page contractions it collects.
-            for (std_part, om_part) in batch_parts.into_iter() {
-                self.gw.qp_pullback_scratch_merge(&mut merged, std_part);
-                self.gw.qp_pullback_scratch_merge(&mut merged, om_part);
+        let mut scr = self.gw.qp_pullback_scratch(nk);
+        let mut col0 = 0usize;
+        while col0 < nmo {
+            let end = (col0 + per_page).min(nmo);
+            let page: Vec<&QpCache> = (col0..end)
+                .map(|n| match rebuilt_of.get(&n) {
+                    Some(&ri) => &rebuilt_all[ri].1,
+                    None => &self.qp_caches[n],
+                })
+                .collect();
+            self.gw
+                .qp_pullback_chunk_public(&page, &flat_weights, col0, &mut scr);
+            // Orbitals whose QP energy came from the linearized (one-step
+            // Newton) branch carry an extra omega-derivative channel
+            // (`Z^2 * lin_shift * d_R d_omega Sigma_c`).  It is run on the same
+            // page immediately, while the caches are still resident, instead of
+            // keeping a second covector set or rebuilding the page.
+            if page.iter().any(|c| c.linearized) {
+                self.gw
+                    .qp_pullback_chunk_omega_public(&page, &flat_weights, col0, &mut scr);
             }
+            col0 = end;
         }
         drop(rebuilt_all);
-        let (mut bq, mut bj, mut be, bb) = self.gw.qp_pullback_streaming_finish(merged);
+        let (mut bq, mut bj, mut be, bb) = self.gw.qp_pullback_streaming_finish(scr);
         let t_qp = t_qp.elapsed().as_secs_f64();
         // The low-rank screening factors are read only while a self-energy
         // response is evaluated, i.e. by the pullback (they also hold the
