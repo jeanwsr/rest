@@ -2096,6 +2096,15 @@ impl<'a> BseGradEngine<'a> {
         let t_asm = Instant::now();
         let mut used_adjoint = false;
         let mut used_canonical = false;
+        if grad_timing() {
+            eprintln!(
+                "[bse_grad route] adjoint_ok {adjoint_ok} (config {} / engine {} / rimatr {})  \
+                 degenerate shells {degenerate}  roots {nk}",
+                self.gw.config.adjoint_cphf,
+                self.gw.supports_cphf_adjoint(),
+                self.gw.scf.rimatr.is_some()
+            );
+        }
         if adjoint_ok && !degenerate {
             // ---- memory-lean route: one root at a time ----
             // `q` is read only by the fold (the QP caches already hold their row

@@ -111,6 +111,95 @@ const PERT_BLK: usize = 128;
 /// Fixed work-block size (auxiliary functions) of the parallel `bq` fold.
 const FOLD_BLK: usize = 128;
 
+/// Fixed work-block size (**transition index** `ia`) of the parallel polar
+/// pullback.
+///
+/// The blocks are laid out from the index alone and the partials are merged in
+/// block order, so the result is independent of the thread count.
+const POLAR_BLK: usize = 256;
+
+/// Free-function core of [`GwGradEngine::polar_pullback_parallel`], so the
+/// parallel closure captures plain slices instead of the engine (`&GwGradEngine`
+/// is not `Sync` because of its `RefCell` caches).
+#[allow(clippy::too_many_arguments)]
+fn polar_pullback_blocks(
+    naux: usize,
+    nmo: usize,
+    nocc: usize,
+    qia: &[f64],
+    de_ia: &[f64],
+    bq: &mut [Vec<f64>],
+    be: &mut [Vec<f64>],
+    k: usize,
+    v: &[f64],
+    d: &[f64],
+    dd: &[f64],
+    packed: bool,
+) {
+    use rayon::prelude::*;
+    let nov = de_ia.len();
+    let vm = to_mat(v, naux, naux);
+    let qiam = to_mat(qia, naux, nov);
+    let spans = polar_blocks(nov);
+    let bqk = &mut bq[k];
+    let bek = &mut be[k];
+    let parts: Vec<(usize, Vec<f64>, Vec<f64>)> = spans
+        .par_iter()
+        .map(|&[c0, c1]| {
+            let nc = c1 - c0;
+            let qm = to_mat(&qiam.data[c0 * naux..c1 * naux], naux, nc);
+            let mut vq = MatrixFull::new([naux, nc], 0.0);
+            _dgemm_full(&vm, 'N', &qm, 'N', &mut vq, 1.0, 0.0);
+            let mut dbe = vec![0.0f64; nmo];
+            let mut dbq = vec![0.0f64; nc * naux];
+            for (lc, col) in (c0..c1).enumerate() {
+                let i = col % nocc;
+                let a = nocc + col / nocc;
+                let mut bg = 0.0f64;
+                for p in 0..naux {
+                    let vqv = vq.data[p + lc * naux];
+                    dbq[lc * naux + p] = 2.0 * d[col] * vqv;
+                    bg += qiam.data[p + col * naux] * vqv * dd[col];
+                }
+                dbe[i] -= bg;
+                dbe[a] += bg;
+            }
+            (c0, dbq, dbe)
+        })
+        .collect();
+    // ordered merge: the accumulation order is the block index alone
+    let mut be_local = vec![0.0f64; nmo];
+    for (c0, dbq, dbe) in parts {
+        let nc = dbq.len() / naux;
+        for (lc, col) in (c0..c0 + nc).enumerate() {
+            let i = col % nocc;
+            let a = nocc + col / nocc;
+            let col_pair = if packed {
+                packed_pair_index(nmo, i, a)
+            } else {
+                i + a * nmo
+            } * naux;
+            for p in 0..naux {
+                bqk[col_pair + p] += dbq[lc * naux + p];
+            }
+        }
+        for (row, val) in dbe.iter().enumerate() {
+            be_local[row] += *val;
+        }
+    }
+    for (row, val) in be_local.iter().enumerate() {
+        bek[row] += *val;
+    }
+}
+
+/// The fixed `[ia0, ia1)` blocks of the parallel polar pullback.
+#[inline]
+fn polar_blocks(n: usize) -> Vec<[usize; 2]> {
+    (0..(n + POLAR_BLK - 1) / POLAR_BLK)
+        .map(|b| [b * POLAR_BLK, ((b + 1) * POLAR_BLK).min(n)])
+        .collect()
+}
+
 // sub-step accumulators of the canonical-response assembly (seconds):
 // [0] j_deriv_from, [1] k_deriv_from, [2] compute_j_upper, [3] compute_k_upper
 thread_local! {
@@ -4502,15 +4591,19 @@ impl<'a> GwGradEngine<'a> {
             );
             T_PULL.with(|c| c.borrow_mut().fill(0.0));
         }
+        // The buckets of one state are independent, and within one bucket the
+        // contraction is a reduction over the transition index, so the deferred
+        // polar pullback runs on the pool as well — without a second scratch
+        // (see `polar_pullback_parallel`).
         for k in 0..nk {
             for (wi, _) in self.quad.iter().enumerate().take(if no_imag { 0 } else { usize::MAX }) {
                 let (d, dd) = &imag_factors[wi];
-                self.polar_pullback(&mut bq, &mut be, k, &v_imag[k][wi], d, dd, true);
+                self.polar_pullback_parallel(&mut bq, &mut be, k, &v_imag[k][wi], d, dd, true);
             }
             if !no_res {
                 for (zi, &z) in z_order[k].iter().enumerate() {
                     let (d, dd) = real_response_and_deriv(&self.de_ia, z, self.config.eta);
-                    self.polar_pullback(&mut bq, &mut be, k, &v_res[k][zi], &d, &dd, true);
+                    self.polar_pullback_parallel(&mut bq, &mut be, k, &v_res[k][zi], &d, &dd, true);
                 }
             }
             // The static bucket is processed whenever it is nonzero: with the
@@ -4521,7 +4614,7 @@ impl<'a> GwGradEngine<'a> {
             // grid's first node.
             if v_static[k].iter().any(|&v| v != 0.0) {
                 let (d, dd) = real_response_and_deriv(&self.de_ia, 0.0, self.config.eta);
-                self.polar_pullback(&mut bq, &mut be, k, &v_static[k], &d, &dd, true);
+                self.polar_pullback_parallel(&mut bq, &mut be, k, &v_static[k], &d, &dd, true);
             }
         }
 
@@ -4817,7 +4910,52 @@ impl<'a> GwGradEngine<'a> {
         }
     }
 
-    /// Contract the covectors with one nuclear perturbation: returns
+    /// Parallel [`Self::polar_pullback`] over a fixed partition of the
+    /// **transition index** `ia`.
+    ///
+    /// `polar_pullback` is the accumulated `v qia` contraction of the deferred
+    /// polarizability buckets.  It is a reduction over the transition index `ia`
+    /// whose outputs land on **distinct destinations per column**:
+    ///
+    /// * `vq[:, col]` is reduced within one block;
+    /// * `bq[k][pair(i,a), :] += 2 d[col] vq[:, col]` — each `col` maps to a
+    ///   unique pair `(i, a)`, so a block writes only its own pairs;
+    /// * `be[k][i] -= bg`, `be[k][a] += bg` — every row receives at most one
+    ///   `-` and one `+` per block, so block-local values merge in block order.
+    ///
+    /// The block layout comes from the index alone ([`POLAR_BLK`]) and the
+    /// partials are merged in block order, so the result is independent of the
+    /// thread count — and it needs **no extra scratch**: one `naux x POLAR_BLK`
+    /// matrix and one `nmo` vector per block (measured at vitamin C/def2-TZVP:
+    /// this is the 73 s of the 398 s 8-core gradient that ran on one core).
+    #[allow(clippy::too_many_arguments)]
+    fn polar_pullback_parallel(
+        &self,
+        bq: &mut [Vec<f64>],
+        be: &mut [Vec<f64>],
+        k: usize,
+        v: &[f64],
+        d: &[f64],
+        dd: &[f64],
+        packed: bool,
+    ) {
+        polar_pullback_blocks(
+            self.naux,
+            self.nmo,
+            self.nocc,
+            &self.qia,
+            &self.de_ia,
+            bq,
+            be,
+            k,
+            v,
+            d,
+            dd,
+            packed,
+        )
+    }
+
+    /// Contract the covectors with one nuclear perturbation: returns    /// Contract the covectors with one nuclear perturbation: returns
     /// `sum_k [ bq_k : qx + bJ_k : dJ + be_k . eps1 + bB_k . b_x ]`.
     pub fn contract_perturbation(
         &self,
