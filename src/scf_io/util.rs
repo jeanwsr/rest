@@ -1,4 +1,3 @@
-use rayon::prelude::*;
 use tensors::{BasicMatrix, MatrixFull};
 
 pub const ORB_OCCUPATION_THRESHOLD: f64 = 1.0e-6;
@@ -46,7 +45,9 @@ pub fn integer_homo_lumo(num_elec: &[f64; 3], spin_channel: usize) -> ([usize; 2
 }
 
 pub fn norm(m: &MatrixFull<f64>, kind: &str) -> f64 {
-    let sqsum = m.data.par_iter().map(|x| x * x).sum::<f64>();
+    // deterministic: this norm drives the SCF convergence test, so a
+    // thread-count dependent total would change the iteration count
+    let sqsum = crate::utilities::par_sum(&m.data.iter().map(|x| x * x).collect::<Vec<f64>>());
     match kind {
         "rms" => {
             let size = m.size();

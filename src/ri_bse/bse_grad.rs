@@ -45,7 +45,7 @@
 //!   integral slices, which turns the `O(3 natm * naux * nao^2 * nmo)` assembly
 //!   into `O(naux * nao^2 * nmo)` plus `O(3 natm * naux * nao^2)`.
 
-use crate::ri_gw::gw_grad::{GwGradEngine, QpCache};
+use crate::ri_gw::gw_grad::{GwGradEngine, QpCache, QpPullbackScratch, SyncGw};
 use crate::scf_io::SCF;
 use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
 use rest_tensors::matrix::matrix_blas_lapack::_dpotrf;
@@ -1878,49 +1878,157 @@ impl<'a> BseGradEngine<'a> {
             .flat_map(|k| weights[k].iter().copied())
             .collect();
         let t_qp = Instant::now();
-        let mut scr = self.gw.qp_pullback_scratch(nk);
+        //
+        // Parallel pages.  `qp_pullback_chunk` is one BLAS-2/BLAS-1 stream per
+        // orbital row (`consts`, the imaginary-axis response, the Gram updates)
+        // with no BLAS-3 work to hide behind, so a serial page loop leaves the
+        // cores idle: measured at naphthalene/def2-TZVP the phase took 75 s at 1
+        // thread and 75 s at 8.  Each page now accumulates into **its own**
+        // scratch and the partials are merged in page order by
+        // `qp_pullback_scratch_merge`, whose accumulation order is a function of
+        // the page layout alone (never of `rayon::current_num_threads()`), so
+        // the merged covectors — and the gradient built from them — stay
+        // reproducible under `num_threads`.
+        //
+        // **Memory** is what bounds this phase: one scratch is
+        // `nk * (naux^2 * (nquad + 2) + naux * nmo^2/2)` doubles (1.1 GB at
+        // vitamin C/def2-TZVP), so the in-flight pages are capped at
+        // `PULLBACK_BATCH_PAGES` and each batch is merged (and dropped) before
+        // the next one starts.  The cost is a peak that grows from
+        // ~5 GB to ~13 GB at vitamin C/def2-TZVP.
+        let nthreads = self
+            .gw
+            .scf
+            .mol
+            .ctrl
+            .num_threads
+            .unwrap_or(1)
+            .clamp(1, 64);
         let per_cache = self.gw.qp_cache_estimate_bytes().max(1);
         let per_page = (self.qp_page_budget() / per_cache).clamp(1, nmo);
-        let mut col0 = 0usize;
-        while col0 < nmo {
-            let end = (col0 + per_page).min(nmo);
-            // caches the engine does not hold yet (non-zero QP weight but an
-            // empty placeholder entry) are built for this page only; every
-            // other cache is *borrowed* from the engine
-            let mut rebuilt: Vec<QpCache> = Vec::new();
-            let mut slot: Vec<Option<usize>> = Vec::with_capacity(end - col0);
-            for n in col0..end {
-                let active = (0..nk).any(|k| weights[k][n] != 0.0);
-                let resident = &self.qp_caches[n];
-                if active && resident.y_imag.is_empty() && resident.m_imag.is_empty() {
-                    rebuilt.push(self.gw.build_target_cache_compact(n));
-                    slot.push(Some(rebuilt.len() - 1));
-                } else {
-                    slot.push(None);
-                }
+        let n_pages = (nmo + per_page - 1) / per_page;
+        let pages: Vec<(usize, usize)> = (0..n_pages)
+            .map(|i| (i * per_page, ((i + 1) * per_page).min(nmo)))
+            .collect();
+        // One scratch is `nk * (naux^2 * (nquad + 2) + naux * nmo^2/2)` doubles
+        // (1.3 GB at naphthalene/def2-TZVP: `bq` 460 + `v_imag` 640 + `bj` 230 +
+        // `be`/`bb`), so the memory bound is the number of *in-flight* pages, not
+        // the thread count.  Pages are therefore processed in fixed
+        // `PULLBACK_BATCH_PAGES`-sized batches with a worker pool capped to the
+        // configured thread count, and each batch's partials are merged before
+        // the next batch starts.
+        const PULLBACK_BATCH_PAGES: usize = 2;
+        let n_workers = nthreads.min(PULLBACK_BATCH_PAGES).min(pages.len().max(1));
+        let gw = SyncGw(&self.gw);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(n_workers)
+            .build()
+            .expect("bse_grad: pullback thread pool");
+        //
+        // **Serial prologue.**  Every cache a page worker reads is materialised
+        // here, before the pool starts: rebuilding a cache runs the lazy
+        // low-rank builders, which mutate `GwGradEngine`'s `RefCell` caches and
+        // are therefore not safe to trigger from two threads at once (see
+        // `SyncGw`).  The prologue is also why the workers only ever *borrow*.
+        let mut rebuilt_all: Vec<(usize, QpCache)> = Vec::new();
+        for n in 0..nmo {
+            let active = (0..nk).any(|k| weights[k][n] != 0.0);
+            let resident = &self.qp_caches[n];
+            if active && resident.y_imag.is_empty() && resident.m_imag.is_empty() {
+                rebuilt_all.push((n, self.gw.build_target_cache_compact(n)));
             }
-            let page: Vec<&QpCache> = slot
-                .iter()
-                .enumerate()
-                .map(|(i, r)| match *r {
-                    Some(ri) => &rebuilt[ri],
-                    None => &self.qp_caches[col0 + i],
-                })
-                .collect();
-            self.gw
-                .qp_pullback_chunk_public(&page, &flat_weights, col0, &mut scr);
-            // Orbitals whose QP energy came from the linearized (one-step
-            // Newton) branch carry an extra omega-derivative channel
-            // (`Z^2 * lin_shift * d_R d_omega Sigma_c`).  It is run on the same
-            // page immediately, while the caches are still resident, instead of
-            // keeping a second covector set or rebuilding the page.
-            if page.iter().any(|c| c.linearized) {
-                self.gw
-                    .qp_pullback_chunk_omega_public(&page, &flat_weights, col0, &mut scr);
-            }
-            col0 = end;
         }
-        let (mut bq, mut bj, mut be, bb) = self.gw.qp_pullback_streaming_finish(scr);
+        let rebuilt_of: std::collections::HashMap<usize, usize> = rebuilt_all
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| (*n, i))
+            .collect();
+        let mut merged = self.gw.qp_pullback_scratch(nk);
+        // Merge each batch **before** the next one is computed, so only
+        // `n_workers` scratch-sized partials are ever resident at once.  The
+        // batch order is the page order, so the accumulation order (and hence
+        // the result) is the same as a single ordered pass over all partials.
+        for batch in pages.chunks(PULLBACK_BATCH_PAGES) {
+            let rebuilt_ref = &rebuilt_all;
+            let caches_ref = &self.qp_caches;
+            let batch_parts: Vec<(QpPullbackScratch, QpPullbackScratch)> = pool.install(|| {
+                use rayon::prelude::*;
+                // `map_init` gives every worker one scratch; the pages of the
+                // batch are handed out in index order and the merge below sums the
+                // collected partials in page order, so the accumulation order is
+                // the page index alone — never the thread count.
+                batch
+                    .par_iter()
+                    .map_init(
+                        || gw.qp_pullback_scratch(nk),
+                        |scr, &(col0, end)| {
+                            let page: Vec<&QpCache> = (col0..end)
+                                .map(|n| match rebuilt_of.get(&n) {
+                                    Some(&ri) => &rebuilt_ref[ri].1,
+                                    None => &caches_ref[n],
+                                })
+                                .collect();
+                            // standard channel
+                            // reset only the page-local accumulators: a worker's
+                            // scratch is reused across the pages of its batch, and
+                            // `v_imag`/`v_static` must keep accumulating over all
+                            // of them (`map_init` runs the initializer once per
+                            // worker, so the first page of a worker starts from the
+                            // freshly allocated scratch)
+                            gw.qp_pullback_scratch_reset_page(scr);
+                            gw.qp_pullback_chunk_public(&page, &flat_weights, col0, scr);
+                            // Orbitals whose QP energy came from the linearized
+                            // (one-step Newton) branch carry an extra
+                            // omega-derivative channel
+                            // (`Z^2 * lin_shift * d_R d_omega Sigma_c`).  Its
+                            // partial is merged right after every standard
+                            // partial, so the two channels keep the serial
+                            // accumulation order.  It needs its own buffer
+                            // because the standard pass has already written
+                            // `bq`/`bj`/`be` of this page; that buffer is
+                            // allocated and dropped per page (the phase peak is
+                            // already dominated by one scratch, so this is not
+                            // where the memory goes).
+                            let mut om_part = if page.iter().any(|c| c.linearized) {
+                                gw.qp_pullback_scratch(nk)
+                            } else {
+                                QpPullbackScratch::default_empty(nk)
+                            };
+                            if page.iter().any(|c| c.linearized) {
+                                gw.qp_pullback_chunk_omega_public(
+                                    &page,
+                                    &flat_weights,
+                                    col0,
+                                    &mut om_part,
+                                );
+                            }
+                            // hand the worker's scratch over as this page's
+                            // partial and start the next page from a **cleared**
+                            // buffer of the right shapes: re-allocating the
+                            // worker's scratch per page costs
+                            // `nk * naux^2 * (nquad + 2)` doubles of fresh zeroed
+                            // memory, which measured *more* than the page
+                            // contraction itself.  The omega partial is left
+                            // unshaped when the page has no linearized row.
+                            let mut next = gw.qp_pullback_scratch(nk);
+                            gw.qp_pullback_scratch_reset_page(&mut next);
+                            let std_part = std::mem::replace(scr, next);
+                            debug_assert!(std_part.is_shaped(nk));
+                            (std_part, om_part)
+                        },
+                    )
+                    .collect()
+            });
+            // Ordered merge: the accumulation order is the page index alone.  It
+            // is a serial pass over `naux^2`-sized buckets (a few hundred MB per
+            // page), small against the page contractions it collects.
+            for (std_part, om_part) in batch_parts.into_iter() {
+                self.gw.qp_pullback_scratch_merge(&mut merged, std_part);
+                self.gw.qp_pullback_scratch_merge(&mut merged, om_part);
+            }
+        }
+        drop(rebuilt_all);
+        let (mut bq, mut bj, mut be, bb) = self.gw.qp_pullback_streaming_finish(merged);
         let t_qp = t_qp.elapsed().as_secs_f64();
         // The low-rank screening factors are read only while a self-energy
         // response is evaluated, i.e. by the pullback (they also hold the
@@ -1987,6 +2095,7 @@ impl<'a> BseGradEngine<'a> {
         let mut grads = vec![vec![0.0f64; self.gw.natm * 3]; nk];
         let t_asm = Instant::now();
         let mut used_adjoint = false;
+        let mut used_canonical = false;
         if adjoint_ok && !degenerate {
             // ---- memory-lean route: one root at a time ----
             // `q` is read only by the fold (the QP caches already hold their row
@@ -2017,15 +2126,20 @@ impl<'a> BseGradEngine<'a> {
             drop(theta_k);
             crate::hessian::memory_monitor::trim_to_os(0);
             for k in 0..nk {
+                let t_fold = Instant::now();
                 let mut fold = self
                     .gw
                     .fold_covector_packed_streamed(&packed[k]);
+                let t_fold = t_fold.elapsed().as_secs_f64();
                 packed[k] = Vec::new();
+                let t_adj = Instant::now();
                 let adj = self
                     .gw
                     .build_cphf_adjoint(&mut fold, &be[k])
                     .expect("bse_grad: adjoint route guard changed");
+                let t_adj = t_adj.elapsed().as_secs_f64();
                 drop(fold);
+                let t_pert = Instant::now();
                 for atm in 0..self.gw.natm {
                     let d = &per_atom[atm];
                     if self.gw.config.local_di {
@@ -2044,44 +2158,58 @@ impl<'a> BseGradEngine<'a> {
                         }
                     }
                 }
+                if grad_timing() {
+                    eprintln!(
+                        "[bse_grad timing] root {}: fold {:.2}s  adjoint {:.2}s  per-atom contraction {:.2}s",
+                        k,
+                        t_fold,
+                        t_adj,
+                        t_pert.elapsed().as_secs_f64()
+                    );
+                }
             }
             used_adjoint = true;
         } else {
-            // ---- general route: fold every root first ----
-            // The canonical route consumes the folds as a slice (one `dI` pass
-            // for all roots), and the degenerate case has to inspect each folded
-            // covector before choosing the route.
-            let mut folds: Vec<crate::ri_gw::gw_grad::FoldedCovector> = Vec::with_capacity(nk);
+            // ---- general route: fold **one root at a time** ----
+            // A reference with symmetry-degenerate shells cannot take the route
+            // above: the adjoint handles such a shell through its trace
+            // (Schur's lemma), which is only valid for an *isotropic* covector.
+            // That check reads `w_rot` (`nmo^2`) alone, so a root that passes it
+            // is folded, adjointed and contracted immediately and its
+            // `naux*nao^2` fold is released before the next root is touched.
+            // Only the roots that fail keep theirs for the canonical route,
+            // which does need all of them in one `dI` pass.
+            //
+            // The fold is the **streamed** one for the same reason as the lean
+            // route: it reads the raw integral blocks, so the `naux*nmo^2`
+            // transformed integrals stay released instead of being rebuilt for
+            // a non-streaming fold (874 MB at naphthalene/def2-TZVP).
+            let mut per_atom: Option<Vec<AdjointAtomData>> = None;
+            let zero_bx = vec![0.0f64; nmo];
             let npack = crate::ri_gw::gw_grad::packed_pair_count(nmo);
+            let mut folds: Vec<Option<crate::ri_gw::gw_grad::FoldedCovector>> =
+                (0..nk).map(|_| None).collect();
+            let mut canonical_at: Vec<usize> = Vec::new();
             for k in 0..nk {
                 let kv = theta_k[k].take().expect("bse_grad: kernel covector reused");
                 let mut qbar = std::mem::take(&mut bq[k]);
                 kv.add_into_packed(&mut qbar, naux, nmo);
                 assert_eq!(qbar.len(), npack * naux, "bse_grad: packed covector size mismatch");
-                folds.push(self.gw.fold_covector_packed(&qbar));
-            }
-            drop(bq);
-            drop(theta_k);
-            crate::hessian::memory_monitor::trim_to_os(0);
-            let can_adjoint = adjoint_ok
-                && folds
-                    .iter()
-                    .enumerate()
-                    .all(|(k, f)| covectors_isotropic_on_shells(self.gw, f, &be[k]));
-            if can_adjoint {
-                let per_atom: Vec<AdjointAtomData> = (0..self.gw.natm)
-                    .map(|atm| AdjointAtomData::build(self.gw, atm))
-                    .collect();
-                let zero_bx = vec![0.0f64; nmo];
-                for k in 0..nk {
-                    // `build_cphf_adjoint` consumes the folded `b_ao` into its
-                    // `dI` covector in place, so the root's fold is released here
+                let mut fold = self.gw.fold_covector_packed_streamed(&qbar);
+                drop(qbar);
+                if adjoint_ok && covectors_isotropic_on_shells(self.gw, &fold, &be[k]) {
+                    let pa = per_atom.get_or_insert_with(|| {
+                        (0..self.gw.natm)
+                            .map(|atm| AdjointAtomData::build(self.gw, atm))
+                            .collect()
+                    });
                     let adj = self
                         .gw
-                        .build_cphf_adjoint(&mut folds[k], &be[k])
+                        .build_cphf_adjoint(&mut fold, &be[k])
                         .expect("bse_grad: adjoint route guard changed");
+                    drop(fold);
                     for atm in 0..self.gw.natm {
-                        let d = &per_atom[atm];
+                        let d = &pa[atm];
                         if self.gw.config.local_di {
                             let g3 = self.gw.adjoint_perturbation_gradient_local(
                                 &adj, atm, &d.h1r, &d.s1r, &d.djs, &bj[k], &bb[k], &zero_bx,
@@ -2098,9 +2226,22 @@ impl<'a> BseGradEngine<'a> {
                             }
                         }
                     }
+                    used_adjoint = true;
+                } else {
+                    folds[k] = Some(fold);
+                    canonical_at.push(k);
                 }
-                used_adjoint = true;
-            } else {
+            }
+            drop(bq);
+            drop(theta_k);
+            drop(per_atom);
+            crate::hessian::memory_monitor::trim_to_os(0);
+            if !canonical_at.is_empty() {
+                let kept: Vec<crate::ri_gw::gw_grad::FoldedCovector> = canonical_at
+                    .iter()
+                    .map(|&k| folds[k].take().expect("bse_grad: fold missing"))
+                    .collect();
+                drop(folds);
                 // analdrv CP-HF: one block-Krylov solve over all (atm, comp)
                 // perturbations
                 let responses = self.gw.canonical_response_batch();
@@ -2110,23 +2251,28 @@ impl<'a> BseGradEngine<'a> {
                         let dj = self.gw.raw.d_j_atom(atm, comp);
                         let (u, eps1, b_x) = &responses[atm * 3 + comp];
                         // the streamed `dI` slices of this perturbation are built
-                        // once and contracted with every root's folded covector
-                        let qx_ch = self.gw.folded_qx_multi(&folds, &blocks, comp, u);
-                        for k in 0..nk {
-                            grads[k][atm * 3 + comp] = qx_ch[k]
+                        // once and contracted with every canonical root's fold
+                        let qx_ch = self.gw.folded_qx_multi(&kept, &blocks, comp, u);
+                        for (j, &k) in canonical_at.iter().enumerate() {
+                            grads[k][atm * 3 + comp] = qx_ch[j]
                                 + bj[k].iter().zip(dj.iter()).map(|(a, b)| a * b).sum::<f64>()
                                 + be[k].iter().zip(eps1.iter()).map(|(a, b)| a * b).sum::<f64>()
                                 + bb[k].iter().zip(b_x.iter()).map(|(a, b)| a * b).sum::<f64>();
                         }
                     }
                 }
+                used_canonical = true;
             }
         }
         if grad_timing() {
             eprintln!(
                 "[bse_grad mem] cphf+assembly:   rss {:.0} MB ({})",
                 crate::hessian::memory_monitor::current_rss_mb(),
-                if used_adjoint { "adjoint route" } else { "canonical route" }
+                match (used_adjoint, used_canonical) {
+                    (true, false) => "adjoint route",
+                    (false, true) => "canonical route",
+                    _ => "mixed route",
+                }
             );
         }
         let omegas = self.roots.iter().map(|r| r.omega).collect();
@@ -2141,7 +2287,11 @@ impl<'a> BseGradEngine<'a> {
                 t_kernel,
                 t_qp,
                 t_asm.elapsed().as_secs_f64(),
-                if used_adjoint { " (adjoint)" } else { " (canonical)" }
+                match (used_adjoint, used_canonical) {
+                    (true, false) => " (adjoint)",
+                    (false, true) => " (canonical)",
+                    _ => " (mixed)",
+                }
             );
         }
         (grads, omegas)

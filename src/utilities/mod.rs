@@ -4,6 +4,7 @@ pub mod buffer_pool;
 pub mod log;
 
 use clap::{Command, Arg, ArgMatches};
+use rayon::prelude::*;
 use rayon::ThreadPoolBuildError;
 use time::{DateTime,Local};
 use std::{time::Instant, collections::HashMap, ops::Range};
@@ -343,4 +344,57 @@ fn test_scientific_number() {
     println!("{}", &sdd);
     println!("{}", convert_scientific_notation_to_fortran_format(&sdd));
 
+}
+
+// ---------------------------------------------------------------------------
+// deterministic parallel reductions
+// ---------------------------------------------------------------------------
+
+/// Deterministic parallel sum of a slice.
+///
+/// `rayon`'s `sum()` / `fold(..).sum()` combine partial results in an order that
+/// depends on how the work happened to be split, and accumulating through a
+/// `channel` sums in **arrival** order; both make the floating-point total
+/// depend on the number of worker threads (and, with work stealing, on the run
+/// itself).  This partitions the slice into **fixed-size blocks** -- the
+/// partition does not depend on the thread count -- sums every block serially
+/// and adds the block sums in index order, so the result is bit-identical for
+/// every `num_threads`.
+pub fn par_sum(xs: &[f64]) -> f64 {
+    const BLK: usize = 8192;
+    if xs.len() <= BLK {
+        return xs.iter().sum();
+    }
+    xs.par_chunks(BLK)
+        .map(|c| c.iter().sum::<f64>())
+        .collect::<Vec<f64>>()
+        .iter()
+        .sum()
+}
+
+/// [`par_sum`] of the elementwise product `xs[i] * ys[i]`.
+pub fn par_dot(xs: &[f64], ys: &[f64]) -> f64 {
+    debug_assert_eq!(xs.len(), ys.len(), "par_dot: length mismatch");
+    const BLK: usize = 8192;
+    if xs.len() <= BLK {
+        return xs.iter().zip(ys.iter()).map(|(a, b)| a * b).sum();
+    }
+    xs.par_chunks(BLK)
+        .zip(ys.par_chunks(BLK))
+        .map(|(ca, cb)| ca.iter().zip(cb.iter()).map(|(a, b)| a * b).sum::<f64>())
+        .collect::<Vec<f64>>()
+        .iter()
+        .sum()
+}
+
+/// Deterministic sum of a parallel map: `sum_i f(item_i)`, evaluated in index
+/// order.  Replaces the `par_iter().for_each_with(sender, ..)` + channel +
+/// `receiver.into_iter().sum()` idiom, whose total follows arrival order.
+pub fn par_map_sum<T, F>(xs: &[T], f: F) -> f64
+where
+    T: Sync,
+    F: Fn(&T) -> f64 + Sync + Send,
+{
+    let partials: Vec<f64> = xs.par_iter().map(|x| f(x)).collect();
+    partials.iter().sum()
 }

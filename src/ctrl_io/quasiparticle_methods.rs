@@ -215,6 +215,13 @@ pub struct QuasiParticle {
     /// Number of BSE roots solved before differentiating.  `0` selects
     /// `max(gradient_state + 1, 2)`.  Default `0`.
     pub gradient_nroots:usize,
+    /// Energy window above the Fermi level (Hartree) for the BSE transition
+    /// space of the **analytic gradient**.  `0.0` keeps the full virtual space
+    /// (`f64::INFINITY`), which is what the card path used to do unconditionally
+    /// -- fine for small bases, but the transition space, the kernel covectors
+    /// and the folds then grow as `nocc*nvir_full` and `naux*nao^2`, so a
+    /// 20-atom molecule in def2-TZVP exhausts 30 GB before the gradient starts.
+    pub gradient_bse_window:f64,
     /// Orbital energies that build the BSE screening inside the gradient:
     /// `"reference"` (mean-field, REST's default) or `"qp"`.  Default
     /// `"reference"`.
@@ -563,6 +570,7 @@ impl Default for QuasiParticle {
             gradient_orbital:-1,
             gradient_state:0,
             gradient_nroots:0,
+            gradient_bse_window:0.0,
             gradient_screening:String::from("reference"),
             gradient_force_fallback:String::new(),
             gradient_force_linearized:String::new(),
@@ -733,6 +741,7 @@ impl QuasiParticle {
         table.insert("gradient_orbital".to_string(), toml::Value::Integer(self.gradient_orbital as i64));
         table.insert("gradient_state".to_string(), toml::Value::Integer(self.gradient_state as i64));
         table.insert("gradient_nroots".to_string(), toml::Value::Integer(self.gradient_nroots as i64));
+        table.insert("gradient_bse_window".to_string(), toml::Value::Float(self.gradient_bse_window));
         table.insert("gradient_screening".to_string(), toml::Value::String(self.gradient_screening.clone()));
         table.insert("gradient_force_fallback".to_string(), toml::Value::String(self.gradient_force_fallback.clone()));
         table.insert("gradient_force_linearized".to_string(), toml::Value::String(self.gradient_force_linearized.clone()));
@@ -1268,6 +1277,11 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
                 serde_json::Value::String(s) => s.trim().parse().unwrap_or(0),
                 _ => 0,
+            };
+            tmp_input.gradient_bse_window = match tmp_ctrl.get("gradient_bse_window").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                serde_json::Value::String(s) => s.trim().parse().unwrap_or(0.0),
+                _ => 0.0,
             };
             tmp_input.gradient_screening = match tmp_ctrl.get("gradient_screening").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.to_lowercase(),

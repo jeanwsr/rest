@@ -2693,18 +2693,16 @@ impl SCF {
     /// E0 = 1/2*\sum_{i}\sum_{j}a_{ij}*b_{ij}
     /// einsum('ij,ij')
     pub fn par_energy_contraction(a:&MatrixUpper<f64>, b:&MatrixUpper<f64>) -> f64 {
-        let (sender, receiver) = channel();
-        a.data.par_iter().zip(b.data.par_iter()).for_each_with(sender, |s,(dm,hc)| {
-            let mut tmp_scf_energy = 0.0_f64;
-            tmp_scf_energy += dm*(hc);
-            s.send(tmp_scf_energy).unwrap();
-        });
-        let mut tmp_energy = 2.0_f64 * receiver.into_iter().sum::<f64>();
-        let a_diag = a.get_diagonal_terms().unwrap();
-        let b_diag = b.get_diagonal_terms().unwrap();
-        let double_count = a_diag.par_iter().zip(b_diag.par_iter()).fold(|| 0.0_f64,|acc,(a,b)| {
-            acc + *a*(*b)
-        }).sum::<f64>();
+        // Deterministic reductions: the energy must not depend on the number of
+        // worker threads.  The old form accumulated through a `channel` (summing
+        // in arrival order) and with `par_iter().fold(..).sum()` (Rayon's
+        // combination order), so the total's last bits -- and hence the SCF
+        // density, the orbitals and every gradient built on them -- followed the
+        // scheduler.
+        let tmp_energy = 2.0_f64 * crate::utilities::par_dot(&a.data, &b.data);
+        let a_diag: Vec<f64> = a.get_diagonal_terms().unwrap().into_iter().copied().collect();
+        let b_diag: Vec<f64> = b.get_diagonal_terms().unwrap().into_iter().copied().collect();
+        let double_count = crate::utilities::par_dot(&a_diag, &b_diag);
 
         (tmp_energy - double_count) * 0.5
     }
@@ -2798,9 +2796,14 @@ impl SCF {
         let mut eev_err = 0.0;
         for i_spin in 0..spin_channel {
             if self.mol.num_elec[i_spin+1] > 1.0E-5 {
-                eev_err += cur_energy[i_spin].par_iter()
-                    .zip(pre_energy[i_spin].par_iter())
-                    .map(|(c,p)| (c-p).powf(2.0)).sum::<f64>();
+                // deterministic: this is the SCF convergence test, so a
+                // thread-count dependent total would change the iteration path
+                let d: Vec<f64> = cur_energy[i_spin]
+                    .iter()
+                    .zip(pre_energy[i_spin].iter())
+                    .map(|(c, p)| (c - p).powf(2.0))
+                    .collect();
+                eev_err += crate::utilities::par_sum(&d);
             } else {
                 eev_err += 0.0;
             }
@@ -2812,9 +2815,13 @@ impl SCF {
         let pre_dm = &scftracerecode.density_matrix[1];
 
         for i_spin in 0..spin_channel {
-            dm_err[i_spin] = cur_dm[i_spin].data.par_iter()
-                .zip(pre_dm[i_spin].data.par_iter())
-                .map(|(c,p)| (c-p).powf(2.0)).sum::<f64>().sqrt()/num_basis;
+            let d: Vec<f64> = cur_dm[i_spin]
+                .data
+                .iter()
+                .zip(pre_dm[i_spin].data.iter())
+                .map(|(c, p)| (c - p).powf(2.0))
+                .collect();
+            dm_err[i_spin] = crate::utilities::par_sum(&d).sqrt() / num_basis;
         }
 
         let mut g_err = [0.0;2];
@@ -4191,16 +4198,25 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v01(
             //    dominated the old for_each_with(sender) structure. The second
             //    dsymm accumulates in place (beta=1.0) into a per-thread full
             //    [N,N] accumulator; the 24 accumulators are merged once. ──
-            let vk_full: MatrixFull<f64> = ri3fn.par_iter_columns_full()
-                .fold(
-                    || (MatrixFull::new([num_basis, num_basis], 0.0),
-                        MatrixFull::new([num_basis, num_basis], 0.0),
-                        MatrixFull::new([num_basis, num_basis], 0.0)),
-                    |(mut b_p, mut tmp_mat, mut vk_loc), m| {
+            // Deterministic reduction: a **fixed** number of auxiliary columns
+            // per Rayon job (the partition depends on `num_auxbas` only, never
+            // on the worker count) and an index-ordered merge of the partials.
+            // `fold(..).reduce(..)` instead grouped the columns by whatever
+            // split Rayon chose, which made `K`, the SCF orbitals and every
+            // gradient built on them depend on `num_threads`.
+            const KCHUNK: usize = 16;
+            let vk_full: MatrixFull<f64> = ri3fn
+                .par_iter_columns_full()
+                .chunks(KCHUNK)
+                .map(|cols| {
+                    // OpenBLAS stays single-threaded inside the rayon parallel
+                    // region (no nested OpenMP thread explosion).
+                    omp_set_num_threads_wrapper(1);
+                    let mut b_p = MatrixFull::new([num_basis, num_basis], 0.0);
+                    let mut tmp_mat = MatrixFull::new([num_basis, num_basis], 0.0);
+                    let mut vk_loc = MatrixFull::new([num_basis, num_basis], 0.0);
+                    for m in cols.iter() {
                         // 展开 ri3fn 列 → b_p 上三角 (dsymm 'U' 只读上三角).
-                        // OpenBLAS stays single-threaded inside the rayon
-                        // parallel region (no nested OpenMP thread explosion).
-                        omp_set_num_threads_wrapper(1);
                         let mut iter = m.iter();
                         for nu in 0..num_basis {
                             for mu in 0..=nu {
@@ -4209,17 +4225,17 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v01(
                         }
                         _dsymm(&b_p, dm_s, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
                         _dsymm(&b_p, &tmp_mat, &mut vk_loc, 'R', 'U', 1.0, 1.0);
-                        (b_p, tmp_mat, vk_loc)
-                    },
-                )
-                .map(|(_, _, vk_loc)| vk_loc)
-                .reduce(
-                    || MatrixFull::new([num_basis, num_basis], 0.0),
-                    |mut acc, v| {
-                        for i in 0..v.data.len() { acc.data[i] += v.data[i]; }
-                        acc
-                    },
-                );
+                    }
+                    vk_loc
+                })
+                .collect::<Vec<MatrixFull<f64>>>()
+                .into_iter()
+                .fold(MatrixFull::new([num_basis, num_basis], 0.0), |mut acc, v| {
+                    for i in 0..v.data.len() {
+                        acc.data[i] += v.data[i];
+                    }
+                    acc
+                });
             // 合并: 取上三角 (vk_full.data[mu + nu*num_basis], mu<=nu)
             let mut idx = 0;
             for nu in 0..num_basis {
@@ -4263,32 +4279,45 @@ pub fn vk_upper_with_rimatr_use_dm_only_sync_v02(
             *vk_s = MatrixUpper::new(num_baspair,0.0_f64);
             //let dm_s = &dm[i_spin];
             let dm_s = _power_rayon_for_symmetric_matrix(&dm[i_spin], 0.5, SQRT_THRESHOLD).unwrap();
-            let batch_num_auxbas = utilities::balancing(num_auxbas, rayon::current_num_threads());
-            let (sender, receiver) = channel();
-            batch_num_auxbas.par_iter().for_each_with(sender, |s,loc_auxbas| {
+            // Deterministic reduction.  The batch partition used to follow
+            // `rayon::current_num_threads()` and the partials were added in
+            // channel *arrival* order, so both the grouping and the association
+            // order of this `K` build depended on the worker count -- and `K`
+            // feeds the Fock matrix, the SCF trajectory and every gradient.
+            // A **fixed** batch count and an index-ordered merge make the result
+            // identical for any `num_threads`.
+            const VK_BATCHES: usize = 64;
+            let batch_num_auxbas =
+                utilities::balancing(num_auxbas, VK_BATCHES.min(num_auxbas).max(1));
+            let partials: Vec<MatrixUpper<f64>> = batch_num_auxbas
+                .par_iter()
+                .map(|loc_auxbas| {
+                    // To ensure the efficiency, we disable the openmp ability of
+                    // openblas within the rayon parallel region
+                    omp_set_num_threads_wrapper(1);
 
-                // To ensure the efficiency, we disable the openmp ability of openblase within the rayon parallel region
-                omp_set_num_threads_wrapper(1);
-
-                let mut tmp_mat = MatrixFull::new([num_basis,num_basis],0.0_f64);
-                let mut reduced_ri3fn = MatrixFull::new([num_basis,num_basis],0.0_f64);
-                let mut vk_sm = MatrixFull::new([num_basis,num_basis],0.0_f64);
-                ri3fn.iter_columns(loc_auxbas.clone()).for_each(|m| {
-                    reduced_ri3fn.iter_matrixupper_mut().unwrap().zip(m.iter()).for_each(|(to, from)| {*to = *from});
-                    //_dsymm(&reduced_ri3fn, dm_s, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
-                    //_dsymm(&reduced_ri3fn, &tmp_mat, &mut vk_sm, 'R', 'U', 1.0, 1.0);
-                    _dsymm(&reduced_ri3fn, &dm_s, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
-                    _dsyrk(&tmp_mat, &mut vk_sm, 'U', 'N', 1.0, 1.0)
-                });
-                s.send(vk_sm.to_matrixupper()).unwrap();
-            });
-
-            receiver.into_iter().for_each(|vk_mu_upper| {
-                vk_s.data.par_iter_mut()
-                    .zip(vk_mu_upper.data.par_iter()).for_each(|value| {
+                    let mut tmp_mat = MatrixFull::new([num_basis, num_basis], 0.0_f64);
+                    let mut reduced_ri3fn = MatrixFull::new([num_basis, num_basis], 0.0_f64);
+                    let mut vk_sm = MatrixFull::new([num_basis, num_basis], 0.0_f64);
+                    ri3fn.iter_columns(loc_auxbas.clone()).for_each(|m| {
+                        reduced_ri3fn
+                            .iter_matrixupper_mut()
+                            .unwrap()
+                            .zip(m.iter())
+                            .for_each(|(to, from)| {
+                                *to = *from;
+                            });
+                        _dsymm(&reduced_ri3fn, &dm_s, &mut tmp_mat, 'L', 'U', 1.0, 0.0);
+                        _dsyrk(&tmp_mat, &mut vk_sm, 'U', 'N', 1.0, 1.0)
+                    });
+                    vk_sm.to_matrixupper()
+                })
+                .collect();
+            for vk_mu_upper in partials.iter() {
+                vk_s.data.iter_mut().zip(vk_mu_upper.data.iter()).for_each(|value| {
                     *value.0 += *value.1
                 })
-            });
+            }
         }
     }
 

@@ -187,6 +187,19 @@ use crate::ctrl_io::quasiparticle_methods::QuasiParticle;
 use crate::ri_gw::{get_occ_params_per_spin, get_occupation_parameters};
 use crate::scf_io::SCF;
 
+/// Number of auxiliary functions (`q`) handed to one Rayon job in the BSE
+/// matvec reductions.
+///
+/// The **partition must not depend on the worker count**: the matvec
+/// accumulates `O(naux)` partial results whose floating-point association order
+/// decides the last bits of the BSE eigenvalue, and the analytic gradient of a
+/// near-degenerate state amplifies that into a visible difference.  With a
+/// fixed chunk the reduction is bit-identical for every `num_threads` (a
+/// `fold(..).reduce(..)` instead combines in whatever order Rayon happens to
+/// split the range).
+const AUX_CHUNK: usize = 16;
+
+
 /// The AO-basis BSE matvec context.
 pub struct FastBseContext {
     n_bas: usize,
@@ -1072,29 +1085,27 @@ impl FastBseContext {
         // are allocated once per job instead of once per `q`.
         let w = (0..m)
             .into_par_iter()
-            .fold(
-                || {
-                    omp_set_num_threads_wrapper(1);
-                    (vec![0.0f64; nov], vec![0.0f64; v * o])
-                },
-                |(mut acc, mut tz), q| {
+            .chunks(AUX_CHUNK)
+            .map(|qs| {
+                omp_set_num_threads_wrapper(1);
+                let mut acc = vec![0.0f64; nov];
+                let mut tz = vec![0.0f64; v * o];
+                for q in qs.iter().copied() {
                     let bqq = &c.bq[q * v * v..(q + 1) * v * v];
                     let aqq = &c.aq[q * o * o..(q + 1) * o * o];
                     dgemm_nt(v, o, v, 1.0, bqq, v, z, o, 0.0, &mut tz, v);
                     dgemm_nt(o, v, o, 1.0, aqq, o, &tz, v, 1.0, &mut acc, o);
-                    (acc, tz)
-                },
-            )
-            .map(|(acc, _tz)| acc)
-            .reduce(
-                || vec![0.0f64; nov],
-                |mut a, b| {
-                    for (x, y) in a.iter_mut().zip(b.iter()) {
-                        *x += y;
-                    }
-                    a
-                },
-            );
+                }
+                acc
+            })
+            .collect::<Vec<Vec<f64>>>()
+            .into_iter()
+            .fold(vec![0.0f64; nov], |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += y;
+                }
+                a
+            });
         // Rayon may let the *calling* thread run part of the job, so restore the
         // configured BLAS thread count for it (`molecule_io` uses the same
         // set-1-then-restore convention around its parallel regions).
@@ -1137,29 +1148,27 @@ impl FastBseContext {
         // `w_contribution_b_block_dgemm` contracts against `Z_q`.
         let w = (0..m)
             .into_par_iter()
-            .fold(
-                || {
-                    omp_set_num_threads_wrapper(1);
-                    (vec![0.0f64; nov], vec![0.0f64; o * o])
-                },
-                |(mut acc, mut t2), q| {
+            .chunks(AUX_CHUNK)
+            .map(|qs| {
+                omp_set_num_threads_wrapper(1);
+                let mut acc = vec![0.0f64; nov];
+                let mut t2 = vec![0.0f64; o * o];
+                for q in qs.iter().copied() {
                     let rq = &c.r[q * v * o..(q + 1) * v * o];
                     let ztq = &c.zt[q * o * v..(q + 1) * o * v];
                     dgemm_nt(o, o, v, 1.0, rq, o, z, o, 0.0, &mut t2, o);
                     dgemm_nt(o, v, o, 1.0, &t2, o, ztq, v, 1.0, &mut acc, o);
-                    (acc, t2)
-                },
-            )
-            .map(|(acc, _t2)| acc)
-            .reduce(
-                || vec![0.0f64; nov],
-                |mut a, b| {
-                    for (x, y) in a.iter_mut().zip(b.iter()) {
-                        *x += y;
-                    }
-                    a
-                },
-            );
+                }
+                acc
+            })
+            .collect::<Vec<Vec<f64>>>()
+            .into_iter()
+            .fold(vec![0.0f64; nov], |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += y;
+                }
+                a
+            });
         omp_set_num_threads_wrapper(self.blas_threads);
         w
     }

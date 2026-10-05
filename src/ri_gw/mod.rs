@@ -652,18 +652,26 @@ pub fn calculate_imag_spin(
 
 pub fn calculate_imag(w_c_at_freqs:&Vec<(f64,f64,MatrixFull<f64>)>,num_state:usize,n:usize,omega:f64,quasiparticle_energies_g:&Vec<f64>,quasiparticle_energies_w:&Vec<f64>)->f64{
     omp_get_num_threads_wrapper();
-    let (sender,receiver)=channel();
-    //println!("0th freq:  calculating imag: w_c size:{},{}; quasiparticles_g size:{}",w_c_at_freqs[0].2.size[0],w_c_at_freqs[0].2.size[1],quasiparticle_energies_g.len());
-    //println!("10th freq: calculating imag: w_c size:{},{}; quasiparticles_g size:{}",w_c_at_freqs[10].2.size[0],w_c_at_freqs[10].2.size[1],quasiparticle_energies_g.len());
-    w_c_at_freqs.par_iter().for_each_with(sender, |s, (omega_1,weight,w_c)|{
-        let imag_n_omega=(quasiparticle_energies_g.iter().enumerate().map(|(m,qp_m)|{
-            let rpod=omega-qp_m;
-            let gfc=rpod/(rpod.powf(2.0)+omega_1.powf(2.0));
-            2.0*gfc*(w_c[[n,m]])/(2.0*PI)
-        }).sum::<f64>())*weight;
-        s.send(imag_n_omega).expect("unsuccessful collection of imag_n_omega")
+    // Deterministic reduction.  `par_iter().map(..)` over a slice is an *indexed*
+    // parallel iterator, so `collect` preserves the frequency order and the
+    // final serial sum is bit-identical for every `num_threads`.  The previous
+    // `for_each_with(sender, ..)` + `receiver.into_iter().sum()` accumulated in
+    // **arrival** order, which made the GW self-energy -- and every quantity
+    // built on it -- depend on the thread count and on the scheduler.
+    let imag_n = crate::utilities::par_map_sum(w_c_at_freqs, |t| {
+        let (omega_1, weight, w_c) = t;
+        let imag_n_omega = quasiparticle_energies_g
+            .iter()
+            .enumerate()
+            .map(|(m, qp_m)| {
+                let rpod = omega - qp_m;
+                let gfc = rpod / (rpod.powf(2.0) + omega_1.powf(2.0));
+                2.0 * gfc * (w_c[[n, m]]) / (2.0 * PI)
+            })
+            .sum::<f64>()
+            * weight;
+        imag_n_omega
     });
-    let imag_n=receiver.into_iter().sum();
     omp_get_num_threads_wrapper();
     imag_n
     //No need to worry about cutoff

@@ -570,14 +570,40 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             );
             let (grads, omegas) = {
                 let gw = ri_gw::gw_grad::GwGradEngine::new(scf_data, cfg);
+                // `gradient_bse_window = 0` keeps the full virtual space, the
+                // historical behaviour; a positive value restricts the
+                // transition space to `e_F + window` (the same convention as the
+                // timing driver's `PAPER_WINDOW`).
+                let cutoff = if qp_ctrl.gradient_bse_window > 0.0 {
+                    let e = &scf_data.eigenvalues[0];
+                    let nocc = scf_data.homo[0] + 1;
+                    0.5 * (e[nocc - 1] + e[nocc]) + qp_ctrl.gradient_bse_window
+                } else {
+                    f64::INFINITY
+                };
                 let mut bse = ri_bse::bse_grad::BseGradEngine::new_with_cutoff(
-                    scf_data, &gw, multi, screen, f64::INFINITY);
+                    scf_data, &gw, multi, screen, cutoff);
                 println!(
                     "BSE transition space: {} occupied x {} of {} virtuals, spin channel '{multi}'",
                     bse.screen.nocc, bse.screen.nvir, bse.screen.nvir_full
                 );
-                bse.solve(nroots, ri_bse::bse_grad::BseSolver::Dense,
-                          &crate::solvers::davidson::DavidsonConfig::default());
+                // Pick the solver by the size of the transition space, exactly
+                // as the timing driver does: the dense route materialises the
+                // full `dim x dim` matrix (plus its eigenvectors and LAPACK
+                // workspace), so `dim` in the thousands costs gigabytes before
+                // the gradient even starts.  The card path used to force
+                // `Dense`, which is what made an unrestricted transition space
+                // (see `gradient_bse_window`) run out of memory.
+                let dim = bse.screen.nocc * bse.screen.nvir;
+                let solver = if dim <= 128 {
+                    ri_bse::bse_grad::BseSolver::Dense
+                } else {
+                    ri_bse::bse_grad::BseSolver::Davidson
+                };
+                let mut dcfg = crate::solvers::davidson::DavidsonConfig::default();
+                dcfg.max_subspace = 200;
+                dcfg.max_iter = 400;
+                bse.solve(nroots, solver, &dcfg);
                 for (k, om) in bse.excitation_energies().iter().enumerate() {
                     println!("  BSE root {k}: {:.12} Ha = {:.6} eV", om, om * 27.211386245988);
                 }
