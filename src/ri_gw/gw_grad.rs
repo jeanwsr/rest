@@ -109,6 +109,23 @@ use crate::ri_bse::bse_grad::grad_timing;
 const PERT_BLK: usize = 128;
 
 /// Fixed work-block size (auxiliary functions) of the parallel `bq` fold.
+/// Clear a lazily-filled cache buffer, skipping (instead of panicking) when a
+/// reader still holds it.
+///
+/// Every `evict_*` on [`GwGradEngine`] is a **pure memory optimisation**: the
+/// matching `ensure_*` rebuilds the buffer on demand, so a skipped release
+/// cannot change any result — it only leaves the buffer resident a little
+/// longer.  Using `try_borrow_mut` here removes a `RefCell already borrowed`
+/// panic that a concurrent reader (a rayon worker still finishing a sweep)
+/// could otherwise trigger, while keeping the peak-memory win in the common
+/// case.
+fn release_vec<T>(cell: &std::cell::RefCell<Vec<T>>) {
+    if let Ok(mut g) = cell.try_borrow_mut() {
+        g.clear();
+        g.shrink_to_fit();
+    }
+}
+
 const FOLD_BLK: usize = 128;
 
 /// Fixed work-block size (**transition index** `ia`) of the parallel polar
@@ -2740,12 +2757,18 @@ impl<'a> GwGradEngine<'a> {
     /// building a QP cache (the static `consts` term and the exact-residue on-the-fly factors),
     /// never by a gradient's own contractions. [`Self::with_qt`]/[`Self::with_qtia`] rebuild them.
     pub fn evict_qt(&self) {
-        self.qt.replace(Vec::new());
-        self.qtia.replace(Vec::new());
+        // Every release here is a pure memory optimisation — the `ensure_*`
+        // builders rebuild on demand — so a release that is momentarily
+        // impossible (a reader still finishing) is skipped rather than turned
+        // into a `RefCell already borrowed` panic.  See `evict_qt_blocks`.
+        release_vec(&self.qt);
+        release_vec(&self.qtia);
         // the low-rank factors are read only while building a QP cache as well
-        self.lr_imag.replace(Vec::new());
-        self.lr_grid.replace(Vec::new());
-        self.lr_static.replace(None);
+        release_vec(&self.lr_imag);
+        release_vec(&self.lr_grid);
+        if let Ok(mut g) = self.lr_static.try_borrow_mut() {
+            *g = None;
+        }
     }
 
     /// Release only the metric-transformed integral blocks (`qt`, `qtia`) and
@@ -2757,14 +2780,14 @@ impl<'a> GwGradEngine<'a> {
     /// without giving up the factors.  `with_qt`/`with_qtia` rebuild the blocks
     /// from `q` if a later cache build asks for them.
     pub fn evict_qt_blocks(&self) {
-        self.qt.replace(Vec::new());
-        self.qtia.replace(Vec::new());
+        release_vec(&self.qt);
+        release_vec(&self.qtia);
     }
 
     /// Release `q` (`naux * nmo^2` doubles): the folded and adjoint gradient routes read it only
     /// up to the covector fold. [`Self::with_q`] rebuilds it on demand.
     pub fn evict_q(&self) {
-        self.q.replace(Vec::new());
+        release_vec(&self.q);
     }
 
     /// REST static term `consts_n = eps_n + (1-alpha) Sigma_x,nn - vxc_nn`
@@ -3240,12 +3263,27 @@ impl<'a> GwGradEngine<'a> {
     fn qp_row_table(&self, n: usize) -> QpRowTable {
         let qn = self.with_q(|q| self.gather_row(q, n));
         let m = gemm_nn(&self.s_metric, self.naux, self.naux, &qn, self.naux, self.nmo);
+        // Both low-rank slots must be resident **before** the `lr_imag` borrow is
+        // taken: `ensure_lr_static` shares the cold path with `ensure_lr` and can
+        // rebuild `lr_imag`, which would otherwise panic with
+        // `RefCell already borrowed` while `lr_imag` is held below.
         self.ensure_lr();
-        let lr_imag = self.lr_imag.borrow();
-        let w_imag = (0..self.quad.len())
-            .map(|wi| lr_imag[wi].response_value_from_qt(&m, self.nmo))
-            .collect();
-        let w0 = self.lr_static_row_values(&m);
+        self.ensure_lr_static();
+        let w_imag: Vec<Vec<f64>> = {
+            let lr_imag = self.lr_imag.borrow();
+            (0..self.quad.len())
+                .map(|wi| lr_imag[wi].response_value_from_qt(&m, self.nmo))
+                .collect()
+        };
+        let w0 = if !self.config.subtracted || self.config.skip_lr_cache {
+            Vec::new()
+        } else {
+            let guard = self.lr_static.borrow();
+            guard
+                .as_ref()
+                .expect("gw_grad: static low-rank factor missing")
+                .response_value_from_qt(&m, self.nmo)
+        };
         QpRowTable { m, w_imag, w0 }
     }
 
