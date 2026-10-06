@@ -1660,16 +1660,26 @@ impl<'a> BseGradEngine<'a> {
         // resident and the *peak* RSS of the build alone reaches several GB.
         let mut qp_energies = vec![0.0f64; gw.nmo];
         let mut qp_caches: Vec<QpCache> = (0..gw.nmo).map(empty_qp_cache).collect();
-        for n in 0..gw.nmo {
-            if needed(n) {
-                let c = gw.build_target_cache_compact(n);
-                qp_energies[n] = c.omega;
-                qp_caches[n] = c;
-            }
-            if n % 16 == 15 {
-                crate::hessian::memory_monitor::trim_to_os(0);
-            }
+        // `BSE build` is the one large serial block of this engine (vitamin
+        // C/def2-TZVP on an EPYC 9654: 125.9 s of the 431.1 s one-thread BSE
+        // gradient, only 1.68x at 8 threads), and its whole cost is this loop --
+        // the screening assembly and the BSE matrices together are 0.15 s.  A
+        // cache is a pure function of the geometry-fixed row table and the
+        // low-rank factors, so the sweep is a per-orbital map.
+        let targets: Vec<usize> = (0..gw.nmo).filter(|&n| needed(n)).collect();
+        let built: Vec<(usize, QpCache)> = if rayon::current_num_threads() > 1 && targets.len() > 1 {
+            gw.build_target_caches_parallel(&targets)
+        } else {
+            targets
+                .iter()
+                .map(|&n| (n, gw.build_target_cache_compact(n)))
+                .collect()
+        };
+        for (n, c) in built {
+            qp_energies[n] = c.omega;
+            qp_caches[n] = c;
         }
+        crate::hessian::memory_monitor::trim_to_os(0);
         // the metric-transformed blocks are only read while a QP cache is
         // built; the low-rank factors they helped build stay resident for the
         // pullback (`with_qt`/`with_qtia` would rebuild the blocks on demand)

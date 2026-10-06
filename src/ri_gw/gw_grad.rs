@@ -91,6 +91,7 @@ use num_complex::Complex;
 
 use rayon::prelude::*;
 use std::cell::RefCell;
+use std::sync::OnceLock;
 use std::os::raw::c_char;
 use std::time::Instant;
 
@@ -1967,7 +1968,19 @@ pub struct GwGradEngine<'a> {
     /// a row onto the grid), while building the whole grid costs one
     /// `naux x naux` eigendecomposition per point — the dominant term of the
     /// engine construction (7.0 s of 9.2 s at naphthalene/def2-SVP).
-    pub lr_grid: RefCell<Vec<Option<LrFactor>>>,
+    /// Real-axis low-rank factor per grid point, **each slot independently
+    /// lazily initialised**.
+    ///
+    /// `OnceLock` rather than `RefCell<Vec<Option<_>>>` because a self-energy row
+    /// only ever reads the one or two grid nodes bracketing its pole
+    /// (`lr_bracket`), while building the *whole* grid costs
+    /// `z_grid.len() * naux^2` doubles and dominates the engine construction.
+    /// Per-slot `get_or_init` keeps that lazy **and** makes the fill safe to
+    /// trigger from several threads at once — which is what a parallel QP-cache
+    /// sweep needs (a single `RefCell` forced the caller to pre-materialise every
+    /// node, measured at vitamin C/def2-TZVP as 428 s of build against 75 s
+    /// serial).
+    pub lr_grid: Vec<OnceLock<LrFactor>>,
     /// Low-rank factor of the **static** (`z = 0`) response, the third
     /// ingredient of the static-subtracted self-energy
     /// ([`GwGradConfig::subtracted`]).  Built on demand from `qtia` with the
@@ -2387,11 +2400,11 @@ impl<'a> GwGradEngine<'a> {
                 qia,
                 de_ia,
                 quad,
-                z_grid,
+                z_grid: z_grid.clone(),
                 z_grid_sens,
                 z_grid_mover,
                 lr_imag: RefCell::new(Vec::new()),
-                lr_grid: RefCell::new(Vec::new()),
+                lr_grid: (0..z_grid.len()).map(|_| OnceLock::new()).collect(),
                 lr_static: RefCell::new(None),
                 qtia: RefCell::new(qtia),
                 hybrid,
@@ -2447,7 +2460,16 @@ impl<'a> GwGradEngine<'a> {
                 z_grid_sens,
                 z_grid_mover,
                 lr_imag: RefCell::new(lr_imag),
-                lr_grid: RefCell::new(lr_grid),
+                lr_grid: lr_grid
+                    .into_iter()
+                    .map(|f| {
+                        let cell = OnceLock::new();
+                        if let Some(v) = f {
+                            let _ = cell.set(v);
+                        }
+                        cell
+                    })
+                    .collect(),
                 lr_static: RefCell::new(None),
                 qtia: RefCell::new(qtia),
                 hybrid,
@@ -2526,12 +2548,11 @@ impl<'a> GwGradEngine<'a> {
 
     /// Ensure the low-rank factors are resident (rebuilds them from `qtia` after `evict_qt`).
     fn ensure_lr(&self) {
-        // The guard must be evaluated in its **own scope**: `with_qtia` below can
-        // re-enter this function (`ensure_lr_grid_factor` -> `ensure_lr`), and a
-        // borrow still alive here would make the re-entry `borrow_mut()` panic
-        // with `RefCell already mutably borrowed`.
+        // Only the imaginary-axis table lives here; the real-axis grid is one
+        // `OnceLock` per node (see the field), so this function no longer owns it
+        // and cannot be re-entered from `ensure_lr_grid_factor`.
         let need = {
-            let g = self.lr_grid.borrow();
+            let g = self.lr_imag.borrow();
             g.is_empty()
         };
         if need && !self.config.skip_lr_cache {
@@ -2553,23 +2574,22 @@ impl<'a> GwGradEngine<'a> {
                     })
                     .collect();
                 *self.lr_imag.borrow_mut() = imag;
-                // the real-axis factors are built on demand
-                *self.lr_grid.borrow_mut() =
-                    (0..self.z_grid.len()).map(|_| None).collect();
             });
         }
     }
 
-    /// Make the real-axis factor of grid point `idx` resident, building it if
-    /// this is the first time it is read.
+    /// Make the real-axis factor of grid point `idx` resident.
+    ///
+    /// Each slot is its own [`OnceLock`], so several threads may race here: one
+    /// builds the factor, the others block until it is published.  That is what
+    /// lets a parallel QP-cache sweep fill grid nodes lazily instead of
+    /// pre-materialising the whole grid.
     fn ensure_lr_grid_factor(&self, idx: usize) {
-        let have = {
-            let g = self.lr_grid.borrow();
-            !g.is_empty() && g[idx].is_some()
-        };
-        if have {
+        if self.lr_grid[idx].get().is_some() {
             return;
         }
+        // A worker may reach this before `warm_lazy_caches` (or after an
+        // `evict_lr`); make the low-rank machinery itself resident first.
         self.ensure_lr();
         let z = self.z_grid[idx];
         let factor = self.with_qtia(|qtia| {
@@ -2583,7 +2603,12 @@ impl<'a> GwGradEngine<'a> {
                 self.config.low_rank_tolerance,
             )
         });
-        self.lr_grid.borrow_mut()[idx] = Some(factor);
+        let _ = self.lr_grid[idx].set(factor);
+    }
+
+    /// Are all the low-rank slots resident?  (debug/probe helper)
+    pub fn lr_grid_all_resident(&self) -> bool {
+        self.lr_grid.iter().all(|c| c.get().is_some())
     }
 
     /// Make the static (`z = 0`) low-rank factor resident, building it on
@@ -2765,7 +2790,6 @@ impl<'a> GwGradEngine<'a> {
         release_vec(&self.qtia);
         // the low-rank factors are read only while building a QP cache as well
         release_vec(&self.lr_imag);
-        release_vec(&self.lr_grid);
         if let Ok(mut g) = self.lr_static.try_borrow_mut() {
             *g = None;
         }
@@ -3081,11 +3105,10 @@ impl<'a> GwGradEngine<'a> {
         for idx in groups.keys() {
             self.ensure_lr_grid_factor(*idx);
         }
-        let lr_grid = self.lr_grid.borrow();
         let q_all = self.q.borrow();
         for (idx, poles) in groups.iter() {
-            let factor = lr_grid[*idx]
-                .as_ref()
+            let factor = self.lr_grid[*idx]
+                .get()
                 .expect("gw_grad: real-axis factor missing");
             let sens = self.lr_node_sens(*idx);
             let ncol = poles.len();
@@ -3159,14 +3182,17 @@ impl<'a> GwGradEngine<'a> {
             self.ensure_lr_grid_factor(*lo);
             self.ensure_lr_grid_factor(*hi);
         }
-        let lr_grid = self.lr_grid.borrow();
         let q_all = self.q.borrow();
         for ((lo, hi), poles) in groups.iter() {
             let single = lo == hi;
             let (z_lo, sens_lo) = (self.z_grid[*lo], self.lr_node_sens(*lo));
             let (z_hi, sens_hi) = (self.z_grid[*hi], self.lr_node_sens(*hi));
-            let f_lo = lr_grid[*lo].as_ref().expect("gw_grad: real-axis factor missing");
-            let f_hi = lr_grid[*hi].as_ref().expect("gw_grad: real-axis factor missing");
+            let f_lo = self.lr_grid[*lo]
+                .get()
+                .expect("gw_grad: real-axis factor missing");
+            let f_hi = self.lr_grid[*hi]
+                .get()
+                .expect("gw_grad: real-axis factor missing");
             let ncol = poles.len();
             let mut qmat = vec![0.0f64; naux * ncol];
             for (c, &(m, ..)) in poles.iter().enumerate() {
@@ -3674,10 +3700,12 @@ impl<'a> GwGradEngine<'a> {
         self.ensure_qt();
         self.ensure_lr_static();
         self.ensure_lr();
-        for idx in 0..self.z_grid.len() {
-            self.ensure_lr_grid_factor(idx);
-        }
-        self.ensure_lr_static();
+        // The real-axis grid is **deliberately not** pre-filled: each node is its
+        // own `OnceLock`, so the sweep may build the one or two nodes it needs
+        // concurrently.  Pre-filling the whole grid is what made an earlier
+        // attempt at this parallelisation 5.7x *slower* than the serial loop
+        // (`z_grid.len() * naux^2` doubles, measured 428 s vs 75 s at vitamin
+        // C/def2-TZVP).
     }
 
     /// Debug probes for the invariant of
