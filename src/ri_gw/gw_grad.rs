@@ -89,134 +89,11 @@ use rest_tensors::matrix::matrix_blas_lapack::{
 use tensors::{MathMatrix, MatrixFull};
 use num_complex::Complex;
 
-use rayon::prelude::*;
 use std::cell::RefCell;
-use std::sync::OnceLock;
 use std::os::raw::c_char;
 use std::time::Instant;
 
 use crate::ri_bse::bse_grad::grad_timing;
-
-/// Fixed work-block size (auxiliary functions) of the parallel perturbation
-/// contractions.
-///
-/// The batches are laid out from the **auxiliary-shell index** alone — never
-/// from `rayon::current_num_threads()` — so the per-batch partial sums and
-/// their merge order are the same for every thread count and a gradient stays
-/// bit-for-bit reproducible under `num_threads`, the same discipline as
-/// [`crate::utilities::par_sum`].  Each batch holds at least this many
-/// auxiliary functions (one whole shell more at most), which keeps the
-/// per-batch integral calls few.
-const PERT_BLK: usize = 128;
-
-/// Fixed work-block size (auxiliary functions) of the parallel `bq` fold.
-/// Clear a lazily-filled cache buffer, skipping (instead of panicking) when a
-/// reader still holds it.
-///
-/// Every `evict_*` on [`GwGradEngine`] is a **pure memory optimisation**: the
-/// matching `ensure_*` rebuilds the buffer on demand, so a skipped release
-/// cannot change any result — it only leaves the buffer resident a little
-/// longer.  Using `try_borrow_mut` here removes a `RefCell already borrowed`
-/// panic that a concurrent reader (a rayon worker still finishing a sweep)
-/// could otherwise trigger, while keeping the peak-memory win in the common
-/// case.
-fn release_vec<T>(cell: &std::cell::RefCell<Vec<T>>) {
-    if let Ok(mut g) = cell.try_borrow_mut() {
-        g.clear();
-        g.shrink_to_fit();
-    }
-}
-
-const FOLD_BLK: usize = 128;
-
-/// Fixed work-block size (**transition index** `ia`) of the parallel polar
-/// pullback.
-///
-/// The blocks are laid out from the index alone and the partials are merged in
-/// block order, so the result is independent of the thread count.
-const POLAR_BLK: usize = 256;
-
-/// Free-function core of [`GwGradEngine::polar_pullback_parallel`], so the
-/// parallel closure captures plain slices instead of the engine (`&GwGradEngine`
-/// is not `Sync` because of its `RefCell` caches).
-#[allow(clippy::too_many_arguments)]
-fn polar_pullback_blocks(
-    naux: usize,
-    nmo: usize,
-    nocc: usize,
-    qia: &[f64],
-    de_ia: &[f64],
-    bq: &mut [Vec<f64>],
-    be: &mut [Vec<f64>],
-    k: usize,
-    v: &[f64],
-    d: &[f64],
-    dd: &[f64],
-    packed: bool,
-) {
-    use rayon::prelude::*;
-    let nov = de_ia.len();
-    let vm = to_mat(v, naux, naux);
-    let qiam = to_mat(qia, naux, nov);
-    let spans = polar_blocks(nov);
-    let bqk = &mut bq[k];
-    let bek = &mut be[k];
-    let parts: Vec<(usize, Vec<f64>, Vec<f64>)> = spans
-        .par_iter()
-        .map(|&[c0, c1]| {
-            let nc = c1 - c0;
-            let qm = to_mat(&qiam.data[c0 * naux..c1 * naux], naux, nc);
-            let mut vq = MatrixFull::new([naux, nc], 0.0);
-            _dgemm_full(&vm, 'N', &qm, 'N', &mut vq, 1.0, 0.0);
-            let mut dbe = vec![0.0f64; nmo];
-            let mut dbq = vec![0.0f64; nc * naux];
-            for (lc, col) in (c0..c1).enumerate() {
-                let i = col % nocc;
-                let a = nocc + col / nocc;
-                let mut bg = 0.0f64;
-                for p in 0..naux {
-                    let vqv = vq.data[p + lc * naux];
-                    dbq[lc * naux + p] = 2.0 * d[col] * vqv;
-                    bg += qiam.data[p + col * naux] * vqv * dd[col];
-                }
-                dbe[i] -= bg;
-                dbe[a] += bg;
-            }
-            (c0, dbq, dbe)
-        })
-        .collect();
-    // ordered merge: the accumulation order is the block index alone
-    let mut be_local = vec![0.0f64; nmo];
-    for (c0, dbq, dbe) in parts {
-        let nc = dbq.len() / naux;
-        for (lc, col) in (c0..c0 + nc).enumerate() {
-            let i = col % nocc;
-            let a = nocc + col / nocc;
-            let col_pair = if packed {
-                packed_pair_index(nmo, i, a)
-            } else {
-                i + a * nmo
-            } * naux;
-            for p in 0..naux {
-                bqk[col_pair + p] += dbq[lc * naux + p];
-            }
-        }
-        for (row, val) in dbe.iter().enumerate() {
-            be_local[row] += *val;
-        }
-    }
-    for (row, val) in be_local.iter().enumerate() {
-        bek[row] += *val;
-    }
-}
-
-/// The fixed `[ia0, ia1)` blocks of the parallel polar pullback.
-#[inline]
-fn polar_blocks(n: usize) -> Vec<[usize; 2]> {
-    (0..(n + POLAR_BLK - 1) / POLAR_BLK)
-        .map(|b| [b * POLAR_BLK, ((b + 1) * POLAR_BLK).min(n)])
-        .collect()
-}
 
 // sub-step accumulators of the canonical-response assembly (seconds):
 // [0] j_deriv_from, [1] k_deriv_from, [2] compute_j_upper, [3] compute_k_upper
@@ -850,188 +727,6 @@ impl RawRiTensors {
             fun_off += nb;
             a0 = a1;
         }
-    }
-
-    /// The deterministic work batches (shell ranges) used by the parallel perturbation
-    /// contractions.
-    ///
-    /// The layout is a function of the core/auxiliary shell indices alone — never of the thread
-    /// count — so the callers can process the batches in parallel and merge their partial sums in
-    /// index order and stay bit-for-bit reproducible under `num_threads`, the same discipline as
-    /// [`crate::utilities::par_sum`].  Each batch holds at least [`PERT_BLK`] auxiliary functions
-    /// (one whole shell more at most), which keeps the per-batch integral calls few and their
-    /// result small: `nrow_A * nao * nb * 3`, i.e. a few MB at `PERT_BLK`, against the
-    /// `nrow_A * nao * naux * 3` of the full per-atom tensor (254 MB for a carbon atom at
-    /// naphthalene/def2-TZVP).
-    pub fn aux_perturbation_batches(&self, atm: usize) -> Vec<[usize; 2]> {
-        Self::perturbation_batches(
-            &self.aux_shl_range[atm],
-            &self.aux_range[atm],
-            &self.auxmol.ao_loc(),
-        )
-    }
-
-    /// Pure-function core of [`Self::aux_perturbation_batches`]: everything the batch layout
-    /// depends on, so that callers can compute it once and then run the batches in parallel
-    /// without holding a `&self` (`RawRiTensors` is not `Sync` because of its `RefCell`
-    /// caches).
-    fn perturbation_batches(
-        aux_shl_range: &[usize; 2],
-        aux_range: &[usize; 2],
-        loc: &[usize],
-    ) -> Vec<[usize; 2]> {
-        let (shl0, shl1) = (aux_shl_range[0], aux_shl_range[1]);
-        let mut out: Vec<[usize; 2]> = Vec::new();
-        let mut a0 = shl0;
-        while a0 < shl1 {
-            let mut a1 = a0;
-            let f0 = loc[a0];
-            let mut f1 = f0;
-            while a1 < shl1 && f1 - f0 < PERT_BLK {
-                f1 = loc[a1 + 1];
-                a1 += 1;
-            }
-            if f1 > f0 {
-                out.push([f0, f1]);
-            }
-            a0 = a1;
-        }
-        debug_assert_eq!(out.last().map(|r| r[1]), Some(aux_range[1]));
-        out
-    }
-
-    /// Materialise the streamed derivative blocks of one auxiliary-function range of one
-    /// perturbed atom: `(d1_blocks, d2_blocks)` in the layouts of
-    /// [`Self::for_each_d1_block`] / [`Self::for_each_d2_block`], but with the **whole range in
-    /// one block**.
-    ///
-    /// Called (in parallel) once per batch of [`Self::aux_perturbation_batches`]; the atom's own
-    /// auxiliary shells are limited to the range, so a range that is not aligned to the atom's
-    /// shells (the `ip1` stream is batched by auxiliary shells of every centre) simply
-    /// materialises fewer functions.
-    pub fn perturbation_batch_blocks(
-        &self,
-        atm: usize,
-        f0: usize,
-        f1: usize,
-    ) -> (Vec<f64>, Vec<f64>) {
-        let nshl = self.auxmol.nbas();
-        Self::perturbation_batch_blocks_pure(
-            &self.mol,
-            &self.auxmol,
-            &self.ao_shl_range[atm],
-            &self.aux_range[atm],
-            self.ao_range[atm][1] - self.ao_range[atm][0],
-            self.nao,
-            self.naux,
-            &[0, nshl],
-            f0,
-            f1,
-        )
-    }
-
-    /// Pure-function core of [`Self::perturbation_batch_blocks`], so that the perturbation
-    /// contraction can run its batches in parallel from `&CInt`s alone (`RawRiTensors` itself is
-    /// not `Sync` because of its `RefCell` caches).
-    ///
-    /// `nrow` is the number of AO functions of the perturbed atom
-    /// (`ao_range[atm][1] - ao_range[atm][0]`); `shl_range` is the **auxiliary** shell range to
-    /// evaluate (the full auxiliary basis for the exact streamed behaviour, a sub-range when the
-    /// caller only needs a slice, as in [`Self::fold_covector_packed_streamed_batch`]).
-    #[allow(clippy::too_many_arguments)]
-    pub fn perturbation_batch_blocks_pure(
-        mol: &CInt,
-        auxmol: &CInt,
-        ao_shl_range: &[usize; 2],
-        aux_range: &[usize; 2],
-        nrow: usize,
-        nao: usize,
-        naux: usize,
-        shl_range: &[usize; 2],
-        f0: usize,
-        f1: usize,
-    ) -> (Vec<f64>, Vec<f64>) {
-        // `ip1` is evaluated over the requested shell range and sliced to the batch (the atom's
-        // `mu` rows couple to every auxiliary centre); `ip2` is dense in `[mu,nu]` but only for
-        // the atom's own auxiliary functions, so its integral range is restricted to the batch.
-        let loc = auxmol.ao_loc();
-        let (c_lo, c_hi) = (loc[shl_range[0]], loc[shl_range[1]]);
-        let mut d1 = Vec::new();
-        if c_hi > c_lo {
-            let (d, shape1) = CInt::integrate_cross(
-                "int3c2e_ip1",
-                [mol, mol, auxmol],
-                "s1",
-                &[*ao_shl_range, [0, mol.nbas()], *shl_range],
-            )
-            .into();
-            assert_eq!(shape1, vec![nrow, nao, c_hi - c_lo, 3], "int3c2e_ip1 shape");
-            d1 = d;
-        }
-        let nb = f1 - f0;
-        let mut d1c = vec![0.0f64; nrow * nao * nb * 3];
-        let sl = nrow * nao;
-        for comp in 0..3 {
-            let src = &d1[comp * sl * (c_hi - c_lo)..(comp + 1) * sl * (c_hi - c_lo)];
-            let dst = &mut d1c[comp * sl * nb..(comp + 1) * sl * nb];
-            for k in 0..sl {
-                dst[k * nb..(k + 1) * nb]
-                    .copy_from_slice(&src[k * (c_hi - c_lo) + (f0 - c_lo)..k * (c_hi - c_lo) + (f1 - c_lo)]);
-            }
-        }
-        let n2 = nao * nao;
-        let (a_lo, a_hi) = (f0.max(aux_range[0]), f1.min(aux_range[1]));
-        let naux_a = a_hi.saturating_sub(a_lo);
-        let mut d2c = vec![0.0f64; n2 * naux_a * 3];
-        if naux_a > 0 {
-            let s_lo = loc.partition_point(|&f| f < a_lo);
-            let s_hi = loc.partition_point(|&f| f < a_hi);
-            let (d2, shape2) = CInt::integrate_cross(
-                "int3c2e_ip2",
-                [mol, mol, auxmol],
-                "s1",
-                &[[0, mol.nbas()], [0, mol.nbas()], [s_lo, s_hi]],
-            )
-            .into();
-            assert_eq!(shape2, vec![nao, nao, naux_a, 3], "int3c2e_ip2 shape");
-            d2c.copy_from_slice(&d2);
-        }
-        (d1c, d2c)
-    }
-
-    /// `int3c2e(mu,nu,P)` for one atom's `mu` rows over the auxiliary shell range `shl_range`,
-    /// as `(values, nfun_lo, nfun_hi)` with `values` col-major `[nrow, nao, nfun]`.
-    ///
-    /// The pure (batchable) core of [`Self::for_each_i3_atom_block`], so a fold that only needs
-    /// part of the auxiliary basis can run its parts in parallel without materialising the full
-    /// `nao^2 * naux` tensor.
-    pub fn i3_atom_block_pure(
-        mol: &CInt,
-        auxmol: &CInt,
-        ao_shl_range: &[usize; 2],
-        nrow: usize,
-        nao: usize,
-        shl_range: &[usize; 2],
-    ) -> (Vec<f64>, usize, usize) {
-        let loc = auxmol.ao_loc();
-        let (f0, f1) = (loc[shl_range[0]], loc[shl_range[1]]);
-        if f1 == f0 {
-            return (Vec::new(), f0, f1);
-        }
-        let (blk, shape) = CInt::integrate_cross(
-            "int3c2e",
-            [mol, mol, auxmol],
-            "s1",
-            &[*ao_shl_range, [0, mol.nbas()], *shl_range],
-        )
-        .into();
-        assert_eq!(shape, vec![nrow, nao, f1 - f0], "int3c2e block shape");
-        (blk, f0, f1)
-    }
-
-    /// Debug probe: is the raw-integral buffer currently mutably borrowed?
-    pub fn i3_dbg_try_borrow(&self) -> bool {
-        self.i3.try_borrow().is_err()
     }
 
     /// Release the raw three-centre integrals (`nao^2 * naux` doubles).
@@ -1762,152 +1457,6 @@ pub struct QpCache {
 /// Pair layout used throughout: `q[Q + (p + q_mo*nmo)*naux]` for the raw
 /// integrals and `qt` (metric-transformed), and
 /// `qia[Q + (i + a*nocc)*naux]` for the occupied-virtual block.
-/// A `Sync` view of a [`GwGradEngine`] for read-only parallel phases.
-///
-/// `GwGradEngine` holds its evictable caches in `RefCell`s, so it is not `Sync`:
-/// the type system cannot know that the lazy builders are no-ops once the caches
-/// exist.  The QP pullback is the one phase that needs to share the engine
-/// across threads, and it runs **after** the serial prologue that builds every
-/// cache it reads ([`BseGradEngine::analytic_gradients`] builds each active
-/// [`QpCache`] and the QP-cache construction already materialises the low-rank
-/// factors), so under the invariant below the shared access is pure reads.
-///
-/// # Safety
-///
-/// Code holding a `&SyncGw` must not call a `GwGradEngine` method that can
-/// mutate a `RefCell` (the `ensure_*` builders, `evict_*`, `rebuild_*`, the
-/// `*_cache` constructors) while another thread is using the same engine.  The
-/// only users are the page workers of the parallel QP pullback, which call
-/// `qp_pullback_chunk_public` / `qp_pullback_chunk_omega_public` — both of which
-/// only read the caches, `qia`, `de_ia` and the quadrature.
-#[derive(Clone, Copy)]
-pub struct SyncGw<'a, 'b>(pub &'a GwGradEngine<'b>);
-
-unsafe impl Send for SyncGw<'_, '_> {}
-unsafe impl Sync for SyncGw<'_, '_> {}
-
-impl<'a, 'b> std::ops::Deref for SyncGw<'a, 'b> {
-    type Target = GwGradEngine<'b>;
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.0
-    }
-}
-
-impl<'a, 'b> SyncGw<'a, 'b> {
-    /// Inherent (shadowing) forwarders.
-    ///
-    /// The `Deref` impl would send these calls through `GwGradEngine<'b>`, and
-    /// `&GwGradEngine<'b>` is not `Sync`, so every closure that captures the
-    /// wrapper must reach the engine through an inherent method — the receiver
-    /// then stays `SyncGw`, which *is* `Sync`.
-    #[inline]
-    pub fn qp_pullback_scratch(&self, nk: usize) -> QpPullbackScratch {
-        self.0.qp_pullback_scratch(nk)
-    }
-    #[inline]
-    pub fn qp_pullback_scratch_clear(&self, scr: &mut QpPullbackScratch) {
-        self.0.qp_pullback_scratch_clear(scr)
-    }
-    #[inline]
-    pub fn qp_pullback_scratch_reset_page(&self, scr: &mut QpPullbackScratch) {
-        self.0.qp_pullback_scratch_reset_page(scr)
-    }
-    #[inline]
-    pub fn qp_pullback_scratch_merge(&self, dst: &mut QpPullbackScratch, src: QpPullbackScratch) {
-        self.0.qp_pullback_scratch_merge(dst, src)
-    }
-    #[inline]
-    pub fn qp_pullback_chunk_public(
-        &self,
-        caches: &[&QpCache],
-        weights: &[f64],
-        col0: usize,
-        scr: &mut QpPullbackScratch,
-    ) {
-        self.0.qp_pullback_chunk_public(caches, weights, col0, scr)
-    }
-    #[inline]
-    pub fn qp_pullback_chunk_omega_public(
-        &self,
-        caches: &[&QpCache],
-        weights: &[f64],
-        col0: usize,
-        scr: &mut QpPullbackScratch,
-    ) {
-        self.0
-            .qp_pullback_chunk_omega_public(caches, weights, col0, scr)
-    }
-    #[inline]
-    pub fn qp_pullback_streaming_finish(
-        &self,
-        scr: QpPullbackScratch,
-    ) -> (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>) {
-        self.0.qp_pullback_streaming_finish(scr)
-    }
-    #[inline]
-    pub fn naux(&self) -> usize {
-        self.0.naux
-    }
-    #[inline]
-    pub fn nmo(&self) -> usize {
-        self.0.nmo
-    }
-    #[inline]
-    pub fn scf_num_threads(&self) -> Option<usize> {
-        self.0.scf.mol.ctrl.num_threads
-    }
-    #[inline]
-    pub fn ao_shl_range_of(&self, atm: usize) -> [usize; 2] {
-        self.0.raw.ao_shl_range[atm]
-    }
-    #[inline]
-    pub fn ao_range_of(&self, atm: usize) -> [usize; 2] {
-        self.0.raw.ao_range[atm]
-    }
-    #[inline]
-    pub fn aux_range_of(&self, atm: usize) -> [usize; 2] {
-        self.0.raw.aux_range[atm]
-    }
-    #[inline]
-    pub fn d_atom_blocks(&self, atm: usize) -> AtomDerivBlocks {
-        self.0.raw.d_atom_blocks(atm)
-    }
-    #[inline]
-    pub fn d_j_atom(&self, atm: usize, comp: usize) -> Vec<f64> {
-        self.0.raw.d_j_atom(atm, comp)
-    }
-    #[inline]
-    pub fn d_i_from_blocks(&self, blocks: &AtomDerivBlocks, comp: usize) -> Vec<f64> {
-        self.0.raw.d_i_from_blocks(blocks, comp)
-    }
-    #[inline]
-    pub fn canonical_skeleton_mo(
-        &self,
-        atm: usize,
-        comp: usize,
-        h1r: &[f64],
-        s1r: &[Vec<f64>],
-        di: &[f64],
-        dj: &[f64],
-    ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
-        self.0.canonical_skeleton_mo(atm, comp, h1r, s1r, di, dj)
-    }
-    #[allow(clippy::too_many_arguments)]
-    #[inline]
-    pub fn canonical_finish(
-        &self,
-        f1_skel_mo: &[f64],
-        s1_mo: &[f64],
-        mo1: &[f64],
-        vxc_d1_mo: Option<&[f64]>,
-        fxc_cache: Option<&crate::dft::response::FxcHessianCache>,
-    ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-        self.0
-            .canonical_finish(f1_skel_mo, s1_mo, mo1, vxc_d1_mo, fxc_cache)
-    }
-}
-
 pub struct GwGradEngine<'a> {
     pub scf: &'a SCF,
     pub config: GwGradConfig,
@@ -1968,19 +1517,7 @@ pub struct GwGradEngine<'a> {
     /// a row onto the grid), while building the whole grid costs one
     /// `naux x naux` eigendecomposition per point — the dominant term of the
     /// engine construction (7.0 s of 9.2 s at naphthalene/def2-SVP).
-    /// Real-axis low-rank factor per grid point, **each slot independently
-    /// lazily initialised**.
-    ///
-    /// `OnceLock` rather than `RefCell<Vec<Option<_>>>` because a self-energy row
-    /// only ever reads the one or two grid nodes bracketing its pole
-    /// (`lr_bracket`), while building the *whole* grid costs
-    /// `z_grid.len() * naux^2` doubles and dominates the engine construction.
-    /// Per-slot `get_or_init` keeps that lazy **and** makes the fill safe to
-    /// trigger from several threads at once — which is what a parallel QP-cache
-    /// sweep needs (a single `RefCell` forced the caller to pre-materialise every
-    /// node, measured at vitamin C/def2-TZVP as 428 s of build against 75 s
-    /// serial).
-    pub lr_grid: Vec<OnceLock<LrFactor>>,
+    pub lr_grid: RefCell<Vec<Option<LrFactor>>>,
     /// Low-rank factor of the **static** (`z = 0`) response, the third
     /// ingredient of the static-subtracted self-energy
     /// ([`GwGradConfig::subtracted`]).  Built on demand from `qtia` with the
@@ -2053,46 +1590,6 @@ pub fn qp_cache_bytes_estimate(naux: usize, nmo: usize, nquad: usize) -> usize {
     }
 
     impl QpPullbackScratch {
-        /// `true` when every per-state buffer has been allocated (a
-        /// [`Self::default_empty`] placeholder has not).
-        pub fn is_shaped(&self, nk: usize) -> bool {
-            self.bq.len() == nk
-                && self.bq.iter().all(|v| !v.is_empty())
-                && self.bj.len() == nk
-                && self.bj.iter().all(|v| !v.is_empty())
-                && self.be.len() == nk
-                && self.bb.len() == nk
-                && self.v_imag.len() == nk
-                && self.v_static.len() == nk
-                && self.v_res.len() == nk
-                && !self.imag_factors.is_empty()
-        }
-
-        /// A scratch with the right shapes but **no** quadrature tables.
-        ///
-        /// Only used as the placeholder that a parallel pullback worker swaps in
-        /// after handing its accumulated partial to the merge: the worker calls
-        /// [`GwGradEngine::qp_pullback_scratch_clear`] before its next page, so
-        /// the frequency tables are never read.
-        pub fn default_empty(nk: usize) -> Self {
-            QpPullbackScratch {
-                nk,
-                naux: 0,
-                nmo: 0,
-                nocc: 0,
-                nov: 0,
-                bq: Vec::new(),
-                bj: Vec::new(),
-                be: Vec::new(),
-                bb: Vec::new(),
-                v_imag: Vec::new(),
-                v_static: Vec::new(),
-                v_res: Vec::new(),
-                z_order: Vec::new(),
-                imag_factors: Vec::new(),
-            }
-        }
-
         fn new(engine: &GwGradEngine, nk: usize) -> Self {
             let (naux, nmo, nocc) = (engine.naux, engine.nmo, engine.nocc);
             let nov = nocc * (nmo - nocc);
@@ -2400,11 +1897,11 @@ impl<'a> GwGradEngine<'a> {
                 qia,
                 de_ia,
                 quad,
-                z_grid: z_grid.clone(),
+                z_grid,
                 z_grid_sens,
                 z_grid_mover,
                 lr_imag: RefCell::new(Vec::new()),
-                lr_grid: (0..z_grid.len()).map(|_| OnceLock::new()).collect(),
+                lr_grid: RefCell::new(Vec::new()),
                 lr_static: RefCell::new(None),
                 qtia: RefCell::new(qtia),
                 hybrid,
@@ -2460,16 +1957,7 @@ impl<'a> GwGradEngine<'a> {
                 z_grid_sens,
                 z_grid_mover,
                 lr_imag: RefCell::new(lr_imag),
-                lr_grid: lr_grid
-                    .into_iter()
-                    .map(|f| {
-                        let cell = OnceLock::new();
-                        if let Some(v) = f {
-                            let _ = cell.set(v);
-                        }
-                        cell
-                    })
-                    .collect(),
+                lr_grid: RefCell::new(lr_grid),
                 lr_static: RefCell::new(None),
                 qtia: RefCell::new(qtia),
                 hybrid,
@@ -2548,14 +2036,7 @@ impl<'a> GwGradEngine<'a> {
 
     /// Ensure the low-rank factors are resident (rebuilds them from `qtia` after `evict_qt`).
     fn ensure_lr(&self) {
-        // Only the imaginary-axis table lives here; the real-axis grid is one
-        // `OnceLock` per node (see the field), so this function no longer owns it
-        // and cannot be re-entered from `ensure_lr_grid_factor`.
-        let need = {
-            let g = self.lr_imag.borrow();
-            g.is_empty()
-        };
-        if need && !self.config.skip_lr_cache {
+        if self.lr_grid.borrow().is_empty() && !self.config.skip_lr_cache {
             self.with_qtia(|qtia| {
                 let imag: Vec<LrFactor> = self
                     .quad
@@ -2574,23 +2055,20 @@ impl<'a> GwGradEngine<'a> {
                     })
                     .collect();
                 *self.lr_imag.borrow_mut() = imag;
+                // the real-axis factors are built on demand
+                *self.lr_grid.borrow_mut() =
+                    (0..self.z_grid.len()).map(|_| None).collect();
             });
         }
     }
 
-    /// Make the real-axis factor of grid point `idx` resident.
-    ///
-    /// Each slot is its own [`OnceLock`], so several threads may race here: one
-    /// builds the factor, the others block until it is published.  That is what
-    /// lets a parallel QP-cache sweep fill grid nodes lazily instead of
-    /// pre-materialising the whole grid.
+    /// Make the real-axis factor of grid point `idx` resident, building it if
+    /// this is the first time it is read.
     fn ensure_lr_grid_factor(&self, idx: usize) {
-        if self.lr_grid[idx].get().is_some() {
+        self.ensure_lr();
+        if self.lr_grid.borrow()[idx].is_some() {
             return;
         }
-        // A worker may reach this before `warm_lazy_caches` (or after an
-        // `evict_lr`); make the low-rank machinery itself resident first.
-        self.ensure_lr();
         let z = self.z_grid[idx];
         let factor = self.with_qtia(|qtia| {
             build_lr_factor_at(
@@ -2603,12 +2081,7 @@ impl<'a> GwGradEngine<'a> {
                 self.config.low_rank_tolerance,
             )
         });
-        let _ = self.lr_grid[idx].set(factor);
-    }
-
-    /// Are all the low-rank slots resident?  (debug/probe helper)
-    pub fn lr_grid_all_resident(&self) -> bool {
-        self.lr_grid.iter().all(|c| c.get().is_some())
+        self.lr_grid.borrow_mut()[idx] = Some(factor);
     }
 
     /// Make the static (`z = 0`) low-rank factor resident, building it on
@@ -2617,11 +2090,7 @@ impl<'a> GwGradEngine<'a> {
     /// evaluates at its first node, so the subtracted functional stays
     /// consistent with REST's own response protocol.
     fn ensure_lr_static(&self) {
-        let have = {
-            let g = self.lr_static.borrow();
-            g.is_some()
-        };
-        if have || self.config.skip_lr_cache {
+        if self.lr_static.borrow().is_some() || self.config.skip_lr_cache {
             return;
         }
         let factor = self.with_qtia(|qtia| {
@@ -2730,11 +2199,7 @@ impl<'a> GwGradEngine<'a> {
 
     /// Make sure `qt` is resident (see [`Self::with_qt`]).
     fn ensure_qt(&self) {
-        let need = {
-            let g = self.qt.borrow();
-            g.is_empty()
-        };
-        if need && !self.config.skip_lr_cache {
+        if self.qt.borrow().is_empty() && !self.config.skip_lr_cache {
             self.ensure_q();
             // same occupied-column prefix as the constructor (see `new_with_raw`)
             let ncol_occ = self.nocc * self.nmo;
@@ -2756,11 +2221,7 @@ impl<'a> GwGradEngine<'a> {
 
     /// Run `f` on the occupied-virtual block `qtia` (see [`Self::evict_qt`]).
     pub fn with_qtia<R>(&self, f: impl FnOnce(&[f64]) -> R) -> R {
-        let need = {
-            let g = self.qtia.borrow();
-            g.is_empty()
-        };
-        if need && !self.config.skip_lr_cache {
+        if self.qtia.borrow().is_empty() && !self.config.skip_lr_cache {
             self.ensure_qt();
             let (naux, nmo, nocc) = (self.naux, self.nmo, self.nocc);
             let qt = self.qt.borrow();
@@ -2782,17 +2243,12 @@ impl<'a> GwGradEngine<'a> {
     /// building a QP cache (the static `consts` term and the exact-residue on-the-fly factors),
     /// never by a gradient's own contractions. [`Self::with_qt`]/[`Self::with_qtia`] rebuild them.
     pub fn evict_qt(&self) {
-        // Every release here is a pure memory optimisation — the `ensure_*`
-        // builders rebuild on demand — so a release that is momentarily
-        // impossible (a reader still finishing) is skipped rather than turned
-        // into a `RefCell already borrowed` panic.  See `evict_qt_blocks`.
-        release_vec(&self.qt);
-        release_vec(&self.qtia);
+        self.qt.replace(Vec::new());
+        self.qtia.replace(Vec::new());
         // the low-rank factors are read only while building a QP cache as well
-        release_vec(&self.lr_imag);
-        if let Ok(mut g) = self.lr_static.try_borrow_mut() {
-            *g = None;
-        }
+        self.lr_imag.replace(Vec::new());
+        self.lr_grid.replace(Vec::new());
+        self.lr_static.replace(None);
     }
 
     /// Release only the metric-transformed integral blocks (`qt`, `qtia`) and
@@ -2804,14 +2260,14 @@ impl<'a> GwGradEngine<'a> {
     /// without giving up the factors.  `with_qt`/`with_qtia` rebuild the blocks
     /// from `q` if a later cache build asks for them.
     pub fn evict_qt_blocks(&self) {
-        release_vec(&self.qt);
-        release_vec(&self.qtia);
+        self.qt.replace(Vec::new());
+        self.qtia.replace(Vec::new());
     }
 
     /// Release `q` (`naux * nmo^2` doubles): the folded and adjoint gradient routes read it only
     /// up to the covector fold. [`Self::with_q`] rebuilds it on demand.
     pub fn evict_q(&self) {
-        release_vec(&self.q);
+        self.q.replace(Vec::new());
     }
 
     /// REST static term `consts_n = eps_n + (1-alpha) Sigma_x,nn - vxc_nn`
@@ -3105,10 +2561,11 @@ impl<'a> GwGradEngine<'a> {
         for idx in groups.keys() {
             self.ensure_lr_grid_factor(*idx);
         }
+        let lr_grid = self.lr_grid.borrow();
         let q_all = self.q.borrow();
         for (idx, poles) in groups.iter() {
-            let factor = self.lr_grid[*idx]
-                .get()
+            let factor = lr_grid[*idx]
+                .as_ref()
                 .expect("gw_grad: real-axis factor missing");
             let sens = self.lr_node_sens(*idx);
             let ncol = poles.len();
@@ -3182,17 +2639,14 @@ impl<'a> GwGradEngine<'a> {
             self.ensure_lr_grid_factor(*lo);
             self.ensure_lr_grid_factor(*hi);
         }
+        let lr_grid = self.lr_grid.borrow();
         let q_all = self.q.borrow();
         for ((lo, hi), poles) in groups.iter() {
             let single = lo == hi;
             let (z_lo, sens_lo) = (self.z_grid[*lo], self.lr_node_sens(*lo));
             let (z_hi, sens_hi) = (self.z_grid[*hi], self.lr_node_sens(*hi));
-            let f_lo = self.lr_grid[*lo]
-                .get()
-                .expect("gw_grad: real-axis factor missing");
-            let f_hi = self.lr_grid[*hi]
-                .get()
-                .expect("gw_grad: real-axis factor missing");
+            let f_lo = lr_grid[*lo].as_ref().expect("gw_grad: real-axis factor missing");
+            let f_hi = lr_grid[*hi].as_ref().expect("gw_grad: real-axis factor missing");
             let ncol = poles.len();
             let mut qmat = vec![0.0f64; naux * ncol];
             for (c, &(m, ..)) in poles.iter().enumerate() {
@@ -3289,27 +2743,12 @@ impl<'a> GwGradEngine<'a> {
     fn qp_row_table(&self, n: usize) -> QpRowTable {
         let qn = self.with_q(|q| self.gather_row(q, n));
         let m = gemm_nn(&self.s_metric, self.naux, self.naux, &qn, self.naux, self.nmo);
-        // Both low-rank slots must be resident **before** the `lr_imag` borrow is
-        // taken: `ensure_lr_static` shares the cold path with `ensure_lr` and can
-        // rebuild `lr_imag`, which would otherwise panic with
-        // `RefCell already borrowed` while `lr_imag` is held below.
         self.ensure_lr();
-        self.ensure_lr_static();
-        let w_imag: Vec<Vec<f64>> = {
-            let lr_imag = self.lr_imag.borrow();
-            (0..self.quad.len())
-                .map(|wi| lr_imag[wi].response_value_from_qt(&m, self.nmo))
-                .collect()
-        };
-        let w0 = if !self.config.subtracted || self.config.skip_lr_cache {
-            Vec::new()
-        } else {
-            let guard = self.lr_static.borrow();
-            guard
-                .as_ref()
-                .expect("gw_grad: static low-rank factor missing")
-                .response_value_from_qt(&m, self.nmo)
-        };
+        let lr_imag = self.lr_imag.borrow();
+        let w_imag = (0..self.quad.len())
+            .map(|wi| lr_imag[wi].response_value_from_qt(&m, self.nmo))
+            .collect();
+        let w0 = self.lr_static_row_values(&m);
         QpRowTable { m, w_imag, w0 }
     }
 
@@ -3630,116 +3069,6 @@ impl<'a> GwGradEngine<'a> {
     /// representation is never needed there.
     pub fn build_target_cache_compact(&self, n: usize) -> QpCache {
         self.build_target_cache_with(n, false)
-    }
-
-    /// Build the QP caches of `targets` **in parallel**, sharing `self` through
-    /// the read-only [`SyncGw`] view.
-    ///
-    /// This is the one large serial block of the BSE gradient: at vitamin
-    /// C/def2-TZVP on an EPYC 9654 it is 128.9 s of the 434.7 s one-thread BSE
-    /// gradient (only 1.71x at 8 threads), while the screening assembly and the
-    /// BSE matrices together cost 0.15 s.  A cache is a pure function of the
-    /// geometry-fixed row table and the low-rank factors, so a per-orbital map
-    /// cannot change the numbers — but it does have to satisfy the invariant
-    /// below, which is why the warm-up lives here and not at the call site.
-    ///
-    /// # Invariant
-    ///
-    /// `build_target_cache_with` reaches five interior-mutable slots:
-    ///
-    /// | slot | reached through | filled by |
-    /// |---|---|---|
-    /// | `raw.i3` | `build_q` -> `raw.with_i3` | [`RawRiTensors::ensure_i3`] |
-    /// | `q` | `consts` -> `with_qt` -> `ensure_qt` -> `ensure_q` | `ensure_q` |
-    /// | `qt`, `qtia` | `ensure_qt`, `with_qtia` | `ensure_qt`, `with_qtia` |
-    /// | `lr_imag` | `ensure_lr` | `ensure_lr` |
-    /// | `lr_grid[*]`, `lr_static` | `ensure_lr_grid_factor`, `ensure_lr_static` | same |
-    ///
-    /// They are all materialised **serially and in that order** before the pool
-    /// starts: `q`/`qt` must precede the low-rank factors because `ensure_lr`'s
-    /// cold path goes back through `with_qtia` -> `ensure_qt` -> `ensure_q`, and
-    /// `raw.i3` must precede everything because `build_q` reads it.  Once they
-    /// are resident the guards short-circuit and the sweep only reads, which is
-    /// what makes `SyncGw` sound.
-    ///
-    /// **Not yet enabled in production.**  A residual cold path still trips
-    /// `ensure_q` under the parallel sweep (`RefCell already mutably borrowed`,
-    /// `gw_grad.rs`'s `ensure_q`); the `debug_assert`s below are there to make
-    /// that fail loudly instead of confusingly once the last path is found.  See
-    /// `docs/GW_BSE_并行效率优化方案.md` section 16 for the analysis and the
-    /// recommended fix (`OnceLock<Mutex<Option<..>>>`, which keeps `evict_*`'s
-    /// release-and-rebuild semantics that a plain `OnceLock` would lose).
-    pub fn build_target_caches_parallel(&self, targets: &[usize]) -> Vec<(usize, QpCache)> {
-        use rayon::prelude::*;
-        self.warm_lazy_caches();
-        debug_assert!(
-            !self.raw.i3_dbg_try_borrow(),
-            "build_target_caches_parallel: raw.i3 still borrowed after warm-up"
-        );
-        debug_assert!(
-            !self.q_dbg_try_borrow() && !self.qt_dbg_try_borrow() && !self.qtia_dbg_try_borrow(),
-            "build_target_caches_parallel: q/qt/qtia not resident after warm-up"
-        );
-        let gwv = SyncGw(self);
-        //
-        // **Bounded concurrency.**  Handing the whole target list to `par_iter`
-        // was measured to be a *net loss* on the whole gradient (vitamin
-        // C/def2-TZVP, EPYC 9654: `BSE build` 125.5 s -> 48.3 s, but the 1-vs-8
-        // gradient speedup fell from 2.75x to 2.16x and the peak rose from 6.9 GB
-        // to 7.6 GB) because every in-flight cache keeps its own QP-solve work
-        // arrays, so the workers contend for memory bandwidth.
-        //
-        // Building in batches of `batch` and trimming the arena between them
-        // keeps the peak near the serial level while still overlapping the
-        // integral-free part of the solves.
-        let batch = std::env::var("REST_QP_BUILD_BATCH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2)
-            .max(1);
-        let mut out: Vec<(usize, QpCache)> = Vec::with_capacity(targets.len());
-        for chunk in targets.chunks(batch) {
-            let part: Vec<(usize, QpCache)> = chunk
-                .par_iter()
-                .map(|&n| (n, gwv.build_target_cache_compact(n)))
-                .collect();
-            out.extend(part);
-            crate::hessian::memory_monitor::trim_to_os(0);
-        }
-        out
-    }
-
-    /// Serial warm-up of every interior-mutable slot
-    /// [`Self::build_target_caches_parallel`] depends on.
-    ///
-    /// The order is a correctness condition; see that method.  `raw.i3` is
-    /// included because `build_q` reaches it through `RawRiTensors::with_i3`,
-    /// whose cold path (`*self.i3.borrow_mut() = i3`) is itself a
-    /// `RefCell already mutably borrowed` hazard for a parallel sweep.
-    pub fn warm_lazy_caches(&self) {
-        self.raw.ensure_i3();
-        self.ensure_q();
-        self.ensure_qt();
-        self.ensure_lr_static();
-        self.ensure_lr();
-        // The real-axis grid is **deliberately not** pre-filled: each node is its
-        // own `OnceLock`, so the sweep may build the one or two nodes it needs
-        // concurrently.  Pre-filling the whole grid is what made an earlier
-        // attempt at this parallelisation 5.7x *slower* than the serial loop
-        // (`z_grid.len() * naux^2` doubles, measured 428 s vs 75 s at vitamin
-        // C/def2-TZVP).
-    }
-
-    /// Debug probes for the invariant of
-    /// [`Self::build_target_caches_parallel`].
-    pub fn q_dbg_try_borrow(&self) -> bool {
-        self.q.try_borrow().is_err()
-    }
-    pub fn qt_dbg_try_borrow(&self) -> bool {
-        self.qt.try_borrow().is_err()
-    }
-    pub fn qtia_dbg_try_borrow(&self) -> bool {
-        self.qtia.try_borrow().is_err()
     }
 
     /// Cache of the **static on-shell** quasiparticle energy
@@ -4794,19 +4123,15 @@ impl<'a> GwGradEngine<'a> {
             );
             T_PULL.with(|c| c.borrow_mut().fill(0.0));
         }
-        // The buckets of one state are independent, and within one bucket the
-        // contraction is a reduction over the transition index, so the deferred
-        // polar pullback runs on the pool as well — without a second scratch
-        // (see `polar_pullback_parallel`).
         for k in 0..nk {
             for (wi, _) in self.quad.iter().enumerate().take(if no_imag { 0 } else { usize::MAX }) {
                 let (d, dd) = &imag_factors[wi];
-                self.polar_pullback_parallel(&mut bq, &mut be, k, &v_imag[k][wi], d, dd, true);
+                self.polar_pullback(&mut bq, &mut be, k, &v_imag[k][wi], d, dd, true);
             }
             if !no_res {
                 for (zi, &z) in z_order[k].iter().enumerate() {
                     let (d, dd) = real_response_and_deriv(&self.de_ia, z, self.config.eta);
-                    self.polar_pullback_parallel(&mut bq, &mut be, k, &v_res[k][zi], &d, &dd, true);
+                    self.polar_pullback(&mut bq, &mut be, k, &v_res[k][zi], &d, &dd, true);
                 }
             }
             // The static bucket is processed whenever it is nonzero: with the
@@ -4817,7 +4142,7 @@ impl<'a> GwGradEngine<'a> {
             // grid's first node.
             if v_static[k].iter().any(|&v| v != 0.0) {
                 let (d, dd) = real_response_and_deriv(&self.de_ia, 0.0, self.config.eta);
-                self.polar_pullback_parallel(&mut bq, &mut be, k, &v_static[k], &d, &dd, true);
+                self.polar_pullback(&mut bq, &mut be, k, &v_static[k], &d, &dd, true);
             }
         }
 
@@ -4862,114 +4187,6 @@ impl<'a> GwGradEngine<'a> {
             );
         }
         (bq, bj, be, bb)
-    }
-
-    /// Reset an existing streaming scratch to zero so it can accumulate another
-    /// page (used by the parallel pullback, where each page owns a scratch).
-    pub fn qp_pullback_scratch_clear(&self, scr: &mut QpPullbackScratch) {
-        // A placeholder scratch ([`QpPullbackScratch::default_empty`], used as
-        // the `mem::replace` destination of a parallel worker) has no shapes
-        // yet; materialise them first so the cleared scratch is usable.
-        if scr.imag_factors.is_empty() || scr.bq.is_empty() || scr.bq[0].is_empty() {
-            *scr = self.qp_pullback_scratch(scr.nk);
-        }
-        let nk = scr.nk;
-        for k in 0..nk {
-            scr.bq[k].iter_mut().for_each(|v| *v = 0.0);
-            scr.bj[k].iter_mut().for_each(|v| *v = 0.0);
-            scr.be[k].iter_mut().for_each(|v| *v = 0.0);
-            scr.bb[k].iter_mut().for_each(|v| *v = 0.0);
-            scr.v_res[k].clear();
-            scr.z_order[k].clear();
-        }
-    }
-
-    /// Reset the **page-local** accumulators of an existing scratch, keeping the
-    /// per-state frequency bucketed ones.
-    ///
-    /// `v_imag`/`v_static` of a parallel pullback worker accumulate over *every*
-    /// page of its batch before the partial is merged (see
-    /// [`Self::qp_pullback_scratch_merge`]), so a page reset must leave them
-    /// alone; `bq`/`bj`/`be`/`bb` and the residue buckets are per-partial and are
-    /// zeroed (and their shapes materialised if the scratch is a placeholder).
-    pub fn qp_pullback_scratch_reset_page(&self, scr: &mut QpPullbackScratch) {
-        if scr.imag_factors.is_empty() || scr.bq.is_empty() || scr.bq[0].is_empty() {
-            let nk = scr.nk;
-            *scr = self.qp_pullback_scratch(nk);
-            return;
-        }
-        let nk = scr.nk;
-        for k in 0..nk {
-            scr.bq[k].iter_mut().for_each(|v| *v = 0.0);
-            scr.bj[k].iter_mut().for_each(|v| *v = 0.0);
-            scr.be[k].iter_mut().for_each(|v| *v = 0.0);
-            scr.bb[k].iter_mut().for_each(|v| *v = 0.0);
-            scr.v_res[k].clear();
-            scr.z_order[k].clear();
-        }
-    }
-
-    /// Merge the per-page partials of the parallel pullback into one scratch.
-    ///
-    /// The merge is an **ordered sum over pages** with a fixed page layout, so
-    /// the accumulation order is a function of the orbital index alone and the
-    /// result is bit-for-bit independent of the thread count.  The residue
-    /// buckets are re-keyed into the merged `z_order`; a bucket's position in
-    /// that list does not enter any floating-point expression (the finish pass
-    /// reads each bucket with its own frequency), so a different grouping
-    /// order cannot change the result.
-    pub fn qp_pullback_scratch_merge(&self, dst: &mut QpPullbackScratch, mut src: QpPullbackScratch) {
-        let nk = dst.nk;
-        debug_assert!(
-            dst.is_shaped(nk),
-            "merge: dst not shaped (nk {nk}, naux {})",
-            dst.naux
-        );
-        // An **empty** source (a page without a linearized row contributes
-        // nothing through the omega channel) is legal and must be a no-op: the
-        // caller merges one per page so that the accumulation order is the page
-        // index alone.
-        if !src.is_shaped(nk) {
-            return;
-        }
-        for k in 0..nk {
-            for (d, s) in dst.bq[k].iter_mut().zip(src.bq[k].iter()) {
-                *d += *s;
-            }
-            for (d, s) in dst.bj[k].iter_mut().zip(src.bj[k].iter()) {
-                *d += *s;
-            }
-            for (d, s) in dst.be[k].iter_mut().zip(src.be[k].iter()) {
-                *d += *s;
-            }
-            for (d, s) in dst.bb[k].iter_mut().zip(src.bb[k].iter()) {
-                *d += *s;
-            }
-            for (d, s) in dst.v_imag[k].iter_mut().zip(src.v_imag[k].iter()) {
-                for (x, y) in d.iter_mut().zip(s.iter()) {
-                    *x += *y;
-                }
-            }
-            for (d, s) in dst.v_static[k].iter_mut().zip(src.v_static[k].iter()) {
-                *d += *s;
-            }
-            for (zi, &z) in src.z_order[k].iter().enumerate() {
-                let idx = match dst.z_order[k]
-                    .iter()
-                    .position(|&w| (w - z).abs() < 1.0e-14)
-                {
-                    Some(i) => i,
-                    None => {
-                        dst.z_order[k].push(z);
-                        dst.v_res[k].push(vec![0.0f64; self.naux * self.naux]);
-                        dst.z_order[k].len() - 1
-                    }
-                };
-                for (d, s) in dst.v_res[k][idx].iter_mut().zip(src.v_res[k][zi].iter()) {
-                    *d += *s;
-                }
-            }
-        }
     }
 
     /// Fresh streaming scratch ([`Self::qp_pullback_streaming`]).
@@ -5113,52 +4330,7 @@ impl<'a> GwGradEngine<'a> {
         }
     }
 
-    /// Parallel [`Self::polar_pullback`] over a fixed partition of the
-    /// **transition index** `ia`.
-    ///
-    /// `polar_pullback` is the accumulated `v qia` contraction of the deferred
-    /// polarizability buckets.  It is a reduction over the transition index `ia`
-    /// whose outputs land on **distinct destinations per column**:
-    ///
-    /// * `vq[:, col]` is reduced within one block;
-    /// * `bq[k][pair(i,a), :] += 2 d[col] vq[:, col]` — each `col` maps to a
-    ///   unique pair `(i, a)`, so a block writes only its own pairs;
-    /// * `be[k][i] -= bg`, `be[k][a] += bg` — every row receives at most one
-    ///   `-` and one `+` per block, so block-local values merge in block order.
-    ///
-    /// The block layout comes from the index alone ([`POLAR_BLK`]) and the
-    /// partials are merged in block order, so the result is independent of the
-    /// thread count — and it needs **no extra scratch**: one `naux x POLAR_BLK`
-    /// matrix and one `nmo` vector per block (measured at vitamin C/def2-TZVP:
-    /// this is the 73 s of the 398 s 8-core gradient that ran on one core).
-    #[allow(clippy::too_many_arguments)]
-    fn polar_pullback_parallel(
-        &self,
-        bq: &mut [Vec<f64>],
-        be: &mut [Vec<f64>],
-        k: usize,
-        v: &[f64],
-        d: &[f64],
-        dd: &[f64],
-        packed: bool,
-    ) {
-        polar_pullback_blocks(
-            self.naux,
-            self.nmo,
-            self.nocc,
-            &self.qia,
-            &self.de_ia,
-            bq,
-            be,
-            k,
-            v,
-            d,
-            dd,
-            packed,
-        )
-    }
-
-    /// Contract the covectors with one nuclear perturbation: returns    /// Contract the covectors with one nuclear perturbation: returns
+    /// Contract the covectors with one nuclear perturbation: returns
     /// `sum_k [ bq_k : qx + bJ_k : dJ + be_k . eps1 + bB_k . b_x ]`.
     pub fn contract_perturbation(
         &self,
@@ -5413,128 +4585,6 @@ impl GwGradEngine<'_> {
         });
         let mut wm = MatrixFull::new([nmo, nmo], 0.0);
         _dgemm_full(&self.c_mo, 'T', &x_acc, 'N', &mut wm, 1.0, 0.0); // W = C^T X
-        FoldedCovector { b_ao, w_rot: wm.data }
-    }
-
-    /// Parallel, deterministic [`Self::fold_covector_packed_streamed`].
-    ///
-    /// The fold is a pure reduction over the auxiliary index: each `P` builds its own
-    /// plane of `b_ao` and contributes one term to `X = sum_P I_P Z_P`.  Splitting the
-    /// auxiliary **shells** into [`FOLD_BLK`]-sized batches (a layout fixed by the shell
-    /// index alone, never by `rayon::current_num_threads()`) and merging the batch-local
-    /// `X` accumulators in index order makes the result bit-for-bit independent of the
-    /// thread count — the same discipline as [`crate::utilities::par_sum`] — while
-    /// `b_ao` is written directly, since each `P` owns its slice.
-    ///
-    /// The integral work is identical to the streaming version (each batch evaluates its
-    /// own shell range once); only the peak changes: one `nrow_A*nao*nb` integral block
-    /// per in-flight batch instead of the serial stream's single block.
-    pub fn fold_covector_packed_streamed_parallel(&self, bq_tp: &[f64]) -> FoldedCovector {
-        let nao = self.nao;
-        let nmo = self.nmo;
-        let naux = self.naux;
-        let n2 = nao * nao;
-        let nmo_tp = nmo * (nmo + 1) / 2;
-        assert_eq!(bq_tp.len(), naux * nmo_tp, "fold_covector_packed_streamed: bq size mismatch");
-
-        // Batches of *all* auxiliary shells (the fold sums over every centred integral
-        // block, not only the perturbed atom's own functions).
-        let loc = self.raw.auxmol.ao_loc();
-        let nshl = loc.len() - 1;
-        let mut batches: Vec<[usize; 2]> = Vec::new();
-        {
-            let mut a0 = 0usize;
-            while a0 < nshl {
-                let mut a1 = a0;
-                let f0 = loc[a0];
-                let mut f1 = f0;
-                while a1 < nshl && f1 - f0 < FOLD_BLK {
-                    f1 = loc[a1 + 1];
-                    a1 += 1;
-                }
-                if f1 > f0 {
-                    batches.push([f0, f1]);
-                }
-                a0 = a1;
-            }
-        }
-        // Each batch returns its partial `X` (`[nao, nmo]`) and the `b_ao` planes it owns; the
-        // merge is an ordered sum, so the rounding order is a function of the batch layout alone.
-        let c_mo = &self.c_mo;
-        let rmol = &self.raw.mol;
-        let raux = &self.raw.auxmol;
-        let nbas_mol = rmol.nbas();
-        let nshl = loc.len() - 1;
-        let _ = nshl;
-        let parts: Vec<(Vec<f64>, Vec<usize>, Vec<f64>)> = batches
-            .par_iter()
-            .map(|&[f0, f1]| {
-                let nshl_lo = loc.partition_point(|&f| f < f0);
-                let nshl_hi = loc.partition_point(|&f| f < f1);
-                let mut x_part = vec![0.0f64; nao * nmo];
-                let mut z_part = vec![0.0f64; nao * nmo];
-                let mut bp_part = vec![0.0f64; n2];
-                let mut bqm_part = vec![0.0f64; nmo * nmo];
-                let mut planes: Vec<usize> = Vec::with_capacity(f1 - f0);
-                let mut plane_data: Vec<f64> = Vec::with_capacity((f1 - f0) * n2);
-                for shl in nshl_lo..nshl_hi {
-                    let (blk, p0, p1) = RawRiTensors::i3_atom_block_pure(
-                        rmol,
-                        raux,
-                        &[0, nbas_mol],
-                        nao,
-                        nao,
-                        &[shl, shl + 1],
-                    );
-                    if p1 == p0 {
-                        continue;
-                    }
-                    let nb = p1 - p0;
-                    for pl in 0..nb {
-                        let p = p0 + pl;
-                        // rebuild the symmetric `bq` plane from its lower triangle (`bq` was
-                        // symmetrised, so the mirrored entries are the same floating-point number)
-                        let mut tp = 0usize;
-                        for col in 0..nmo {
-                            for row in col..nmo {
-                                let val = bq_tp[tp * naux + p];
-                                bqm_part[row + col * nmo] = val;
-                                bqm_part[col + row * nmo] = val;
-                                tp += 1;
-                            }
-                        }
-                        let bqm = to_mat(&bqm_part, nmo, nmo);
-                        let mut z = to_mat(&z_part, nao, nmo);
-                        _dgemm_full(c_mo, 'N', &bqm, 'N', &mut z, 1.0, 0.0); // Z_P = C bq_P
-                        let ip = to_mat(&blk[pl * n2..(pl + 1) * n2], nao, nao);
-                        let mut x = to_mat(&x_part, nao, nmo);
-                        _dgemm_full(&ip, 'N', &z, 'N', &mut x, 1.0, 1.0); // X += I_P Z_P
-                        let mut bp = to_mat(&bp_part, nao, nao);
-                        _dgemm_full(&z, 'N', c_mo, 'T', &mut bp, 1.0, 0.0); // B_P = Z_P C^T
-                        planes.push(p);
-                        plane_data.extend_from_slice(&bp_part);
-                    }
-                }
-                (x_part, planes, plane_data)
-            })
-            .collect();
-        let mut b_ao = vec![0.0f64; naux * n2];
-        for (_, planes, data) in parts.iter() {
-            for (i, &p) in planes.iter().enumerate() {
-                b_ao[p * n2..(p + 1) * n2].copy_from_slice(&data[i * n2..(i + 1) * n2]);
-            }
-        }
-        let mut x_acc = vec![0.0f64; nao * nmo];
-        for (xp, _, _) in parts.iter() {
-            for (a, b) in x_acc.iter_mut().zip(xp.iter()) {
-                *a += *b;
-            }
-        }
-        let mut wm = MatrixFull::new([nmo, nmo], 0.0);
-        {
-            let x = to_mat(&x_acc, nao, nmo);
-            _dgemm_full(&self.c_mo, 'T', &x, 'N', &mut wm, 1.0, 0.0); // W = C^T X
-        }
         FoldedCovector { b_ao, w_rot: wm.data }
     }
 
@@ -6053,116 +5103,69 @@ impl GwGradEngine<'_> {
         let rhs_tsr = &rhs_map["rhs"];
         let rhs_data = &rhs_tsr.raw()[rhs_tsr.offset()..];
         let n2 = nao * nao;
-        // The per-perturbation assembly is embarrassingly parallel: each
-        // perturbation owns its `h1`/`s1`/`dI`/`dJ` slabs and its Roothaan
-        // restoration, and every shared object is read-only (`SyncGw`).  It is
-        // also the dominant cost of the canonical CP-HF route (61 s at
-        // naphthalene/def2-TZVP for the skeleton and 116 s for the finish,
-        // single-threaded at 1 core), so it runs on the pool.  The `J`/`K`
-        // builders inside are rayon-parallel themselves, which nests safely
-        // (rayon work-stealing), and they pin the OpenMP/BLAS threads to 1, so a
-        // worker's BLAS calls never oversubscribe the pool.
-        //
-        // `T_TIMER` is thread-local, so each worker reports its own sub-step sums
-        // and the caller folds them.
-        struct PertOut {
-            t_dij: f64,
-            t_skel: f64,
-            t_fin: f64,
-            sub: [f64; 4],
-            resp: (Vec<f64>, Vec<f64>, Vec<f64>),
-            dbg: Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)>,
-        }
-        let gw = SyncGw(self);
-        // bound outside the closure so that it captures plain references instead
-        // of the whole engine (`&GwGradEngine` is not `Sync`)
-        let scf_ref = &self.scf;
-        let c_mo_data = &self.c_mo.data;
-        let per_pert: Vec<PertOut> = {
-            use rayon::prelude::*;
-            (0..natm * 3)
-                .into_par_iter()
-                .map(|k_pert| {
-                    let atm = k_pert / 3;
-                    let comp = k_pert % 3;
-                    T_TIMER.with(|c| c.borrow_mut().fill(0.0));
-                    let t0 = Instant::now();
-                    let h1r = crate::hessian::rhf::build_hcore_first_deriv(&scf_ref.mol, atm);
-                    let s1r = crate::ri_cphf::cphf_solver_pyscf::build_s1ao_deriv(&scf_ref.mol, atm);
-                    let mut t_dij = t0.elapsed().as_secs_f64();
-                    // shell-sliced derivative integral blocks of this atom, shared
-                    // by the three Cartesian components
-                    let blocks = gw.d_atom_blocks(atm);
-                    let t0 = Instant::now();
-                    let di = gw.d_i_from_blocks(&blocks, comp);
-                    let dj = gw.d_j_atom(atm, comp);
-                    t_dij += t0.elapsed().as_secs_f64();
-                    let t0 = Instant::now();
-                    // v_xc skeleton of this perturbation in the MO basis (DFT
-                    // references): shared by the skeleton Fock and the b_x covector
-                    let vxc_d1_mo: Option<Vec<f64>> = vxc_d1_atoms.as_ref().map(|v| {
-                        let vao = vxc_block_ao(&v[atm], comp, nao);
-                        let t = gemm_nt(c_mo_data, nao, nmo, &vao, nao, nao);
-                        gemm_nn(&t, nmo, nao, c_mo_data, nao, nmo)
-                    });
-                    let (mut f1_skel_mo, s1_mo, jd, kd) =
-                        gw.canonical_skeleton_mo(atm, comp, &h1r, &s1r, &di, &dj);
-                    if let Some(vd1) = vxc_d1_mo.as_ref() {
-                        for (f, v) in f1_skel_mo.iter_mut().zip(vd1.iter()) {
-                            *f += v;
-                        }
-                    }
-                    let t_skel = t0.elapsed().as_secs_f64();
-                    let mo1_slab = &mo1_data[k_pert * nmo * nocc..(k_pert + 1) * nmo * nocc];
-                    let t0 = Instant::now();
-                    let resp = gw.canonical_finish(
-                        &f1_skel_mo,
-                        &s1_mo,
-                        mo1_slab,
-                        vxc_d1_mo.as_deref(),
-                        fxc_cache.as_ref(),
-                    );
-                    let t_fin = t0.elapsed().as_secs_f64();
-                    let sub = T_TIMER.with(|c| *c.borrow());
-                    let dbg = if collect_debug {
-                        Some((
-                            jd,
-                            kd,
-                            f1_skel_mo,
-                            s1_mo,
-                            mo1_slab.to_vec(),
-                            rhs_data[k_pert * nmo * nocc..(k_pert + 1) * nmo * nocc].to_vec(),
-                        ))
-                    } else {
-                        // the intermediates are only read by the validation
-                        // harnesses; dropping them here keeps the CP-HF work space
-                        // (and its transient copies) off the production path
-                        drop((jd, kd, f1_skel_mo, s1_mo));
-                        None
-                    };
-                    PertOut { t_dij, t_skel, t_fin, sub, resp, dbg }
-                })
-                .collect()
-        };
-        let mut responses: Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> = Vec::with_capacity(natm * 3);
+        let mut responses = Vec::with_capacity(natm * 3);
         let mut debug: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> =
             Vec::with_capacity(natm * 3);
         let (mut t_dij, mut t_skel, mut t_fin) = (0.0f64, 0.0f64, 0.0f64);
-        let mut sub_tot = [0.0f64; 4];
-        for p in per_pert {
-            t_dij += p.t_dij;
-            t_skel += p.t_skel;
-            t_fin += p.t_fin;
-            for (a, b) in sub_tot.iter_mut().zip(p.sub.iter()) {
-                *a += *b;
-            }
-            responses.push(p.resp);
-            if let Some(d) = p.dbg {
-                debug.push(d);
+        T_TIMER.with(|c| c.borrow_mut().fill(0.0));
+        for atm in 0..natm {
+            let t0 = Instant::now();
+            let h1r = crate::hessian::rhf::build_hcore_first_deriv(&self.scf.mol, atm);
+            let s1r = crate::ri_cphf::cphf_solver_pyscf::build_s1ao_deriv(&self.scf.mol, atm);
+            t_dij += t0.elapsed().as_secs_f64();
+            // shell-sliced derivative integral blocks of this atom, shared
+            // by the three Cartesian components
+            let blocks = self.raw.d_atom_blocks(atm);
+            for comp in 0..3 {
+                let k_pert = atm * 3 + comp;
+                let t0 = Instant::now();
+                let di = self.raw.d_i_from_blocks(&blocks, comp);
+                let dj = self.raw.d_j_atom(atm, comp);
+                t_dij += t0.elapsed().as_secs_f64();
+                let t0 = Instant::now();
+                // v_xc skeleton of this perturbation in the MO basis (DFT
+                // references): shared by the skeleton Fock and the b_x covector
+                let vxc_d1_mo: Option<Vec<f64>> = vxc_d1_atoms.as_ref().map(|v| {
+                    let vao = vxc_block_ao(&v[atm], comp, nao);
+                    let t = gemm_nt(&self.c_mo.data, nao, nmo, &vao, nao, nao);
+                    gemm_nn(&t, nmo, nao, &self.c_mo.data, nao, nmo)
+                });
+                let (mut f1_skel_mo, s1_mo, jd, kd) =
+                    self.canonical_skeleton_mo(atm, comp, &h1r, &s1r, &di, &dj);
+                if let Some(vd1) = vxc_d1_mo.as_ref() {
+                    for (f, v) in f1_skel_mo.iter_mut().zip(vd1.iter()) {
+                        *f += v;
+                    }
+                }
+                t_skel += t0.elapsed().as_secs_f64();
+                let mo1_slab = &mo1_data[k_pert * nmo * nocc..(k_pert + 1) * nmo * nocc];
+                let t0 = Instant::now();
+                let resp1 = self.canonical_finish(
+                    &f1_skel_mo,
+                    &s1_mo,
+                    mo1_slab,
+                    vxc_d1_mo.as_deref(),
+                    fxc_cache.as_ref(),
+                );
+                responses.push(resp1);
+                if collect_debug {
+                    debug.push((
+                        jd,
+                        kd,
+                        f1_skel_mo,
+                        s1_mo,
+                        mo1_slab.to_vec(),
+                        rhs_data[k_pert * nmo * nocc..(k_pert + 1) * nmo * nocc].to_vec(),
+                    ));
+                } else {
+                    // the intermediates are only read by the validation
+                    // harnesses; dropping them here keeps the CP-HF work space
+                    // (and its transient copies) off the production path
+                    drop((jd, kd, f1_skel_mo, s1_mo));
+                }
+                t_fin += t0.elapsed().as_secs_f64();
             }
         }
-        T_TIMER.with(|c| *c.borrow_mut() = sub_tot);
-
         if grad_timing() {
             let [t_jd, t_kd, t_jup, t_kup] = T_TIMER.with(|c| *c.borrow());
             eprintln!(
@@ -8977,126 +7980,95 @@ impl GwGradEngine<'_> {
         // all three Cartesian components are contracted from the *same* streamed integral blocks
         let mut g_di = [0.0f64; 3];
         let mut g_dm = [0.0f64; 3];
+        // The two inner loops are pure reductions, and Rust/LLVM will not
+        // reassociate `f64` additions on their own; four independent
+        // accumulators give both SIMD width and enough ILP to run at memory
+        // speed (measured ~3x over the single-accumulator form).
         //
-        // Parallelism.  This contraction is a pure reduction over the auxiliary index, and the
-        // per-atom derivative tensors are not kept resident, so it is embarrassingly parallel:
-        // every auxiliary-function batch of `aux_perturbation_batches` produces its own partial
-        // sums, which are merged in index order afterwards.  The batch layout is a function of
-        // the auxiliary-shell index alone — never of `rayon::current_num_threads()` — so a
-        // gradient stays bit-for-bit reproducible under `num_threads`, the same discipline as
-        // `utilities::par_sum`.  Before this change the whole `3 natm` loop ran on one core,
-        // re-evaluating the atom's full `ip1`/`ip2` tensors for every auxiliary-shell block;
-        // each batch now evaluates its own blocks in parallel and keeps them only for its own
-        // contraction.
+        // The derivative blocks are *streamed* over auxiliary-shell blocks (see
+        // `RawRiTensors::for_each_d1_block`/`for_each_d2_block`), so the per-atom tensors
+        // (`nrow_A*nao*naux*3` + `nao^2*naux_A*3` doubles, ~390 MB for a carbon atom at
+        // naphthalene/def2-TZVP) are never resident; each block is consumed immediately.
         let dm = &adj.dm_sym;
-        let raw = &self.raw;
-        let (a0, a1) = (raw.aux_range[atm][0], raw.aux_range[atm][1]);
-        let naux = raw.naux;
-        let mol = &raw.mol;
-        let auxmol = &raw.auxmol;
-        let ao_shl = raw.ao_shl_range[atm];
-        let aux_rng = raw.aux_range[atm];
-        // One parallel pass over the deterministic batches; each batch evaluates its own
-        // `int3c2e_ip1`/`ip2` blocks (both, once) and reduces them to `[g_di | g_dm]`.
-        let batches = raw.aux_perturbation_batches(atm);
-        let parts: Vec<[f64; 6]> = batches
-            .par_iter()
-            .map(|&[f0, f1]| {
-                let nshl = auxmol.nbas();
-                let (d1c, d2c) = crate::ri_gw::gw_grad::RawRiTensors::perturbation_batch_blocks_pure(
-                    mol, auxmol, &ao_shl, &aux_rng, nrow, nao, naux, &[0, nshl], f0, f1,
-                );
-                let nb = f1 - f0;
-                let stride1 = nrow * nao * nb;
-                let mut acc = [0.0f64; 6];
-                for comp in 0..3 {
-                    let d1cur = &d1c[comp * stride1..(comp + 1) * stride1];
-                    let mut adi = [0.0f64; 4];
-                    let mut adm = [0.0f64; 4];
-                    // int3c2e_ip1: rows `mu` on the atom, all `nu`.  `dI^(b)` is the transpose
-                    // of `dI^(a)` and is already counted by the symmetrised covectors, so a
-                    // single contiguous pass covers both bra centres.  nu outside / mu_l inside
-                    // keeps every access contiguous.
-                    for pl in 0..nb {
-                        let p = f0 + pl;
-                        let cov = &adj.di_cov[p * n2..(p + 1) * n2];
-                        let lt = adj.lam_tilde[p];
-                        let base1 = pl * nrow * nao;
-                        for nu in 0..nao {
-                            let doff = base1 + nu * nrow;
-                            let coff = row0 + nu * nao;
-                            let mut i = 0usize;
-                            while i + 4 <= nrow {
-                                let d = &d1cur[doff + i..doff + i + 4];
-                                let c = &cov[coff + i..coff + i + 4];
-                                let m = &dm[coff + i..coff + i + 4];
-                                for j in 0..4 {
-                                    let v = -d[j];
-                                    adi[j] += c[j] * v;
-                                    adm[j] += m[j] * v;
-                                }
-                                i += 4;
-                            }
-                            while i < nrow {
-                                let v = -d1cur[doff + i];
-                                let k = coff + i;
-                                adi[0] += cov[k] * v;
-                                adm[0] += dm[k] * v;
-                                i += 1;
-                            }
-                        }
-                    }
-                    acc[comp] += adi.iter().sum::<f64>();
-                    acc[3 + comp] += adm.iter().sum::<f64>();
-                    // int3c2e_ip2: dense `[nao,nao]` symmetric slices of the atom's own auxiliary
-                    // functions, with the 1/2 of the symmetrised contraction.  A batch outside
-                    // the atom's own auxiliary functions has no `ip2` part at all.
-                    let b_lo = f0.max(a0);
-                    let b_hi = f1.min(a1);
-                    let nb2 = b_hi.saturating_sub(b_lo);
-                    if nb2 == 0 {
-                        continue;
-                    }
-                    let stride2 = n2 * nb2;
-                    let d2cur = &d2c[comp * stride2..(comp + 1) * stride2];
-                    let mut cdi = [0.0f64; 4];
-                    let mut cdm = [0.0f64; 4];
-                    for pl in 0..nb2 {
-                        let p = b_lo + pl;
-                        let cov = &adj.di_cov[p * n2..(p + 1) * n2];
-                        let lt = adj.lam_tilde[p];
-                        let d2 = &d2cur[pl * n2..(pl + 1) * n2];
-                        let mut k = 0usize;
-                        while k + 4 <= n2 {
-                            let d = &d2[k..k + 4];
-                            let c = &cov[k..k + 4];
-                            let m = &dm[k..k + 4];
-                            for j in 0..4 {
-                                let v = -0.5 * d[j];
-                                cdi[j] += c[j] * v;
-                                cdm[j] += m[j] * v;
-                            }
-                            k += 4;
-                        }
-                        while k < n2 {
-                            let v = -0.5 * d2[k];
-                            cdi[0] += cov[k] * v;
-                            cdm[0] += dm[k] * v;
-                            k += 1;
-                        }
-                    }
-                    acc[comp] += cdi.iter().sum::<f64>();
-                    acc[3 + comp] += cdm.iter().sum::<f64>();
-                }
-                acc
-            })
-            .collect();
-        for acc in parts.iter() {
+        self.raw.for_each_d1_block(atm, |p0, nb, d1b| {
+            let stride1 = nrow * nao * nb;
             for comp in 0..3 {
-                g_di[comp] += acc[comp];
-                g_dm[comp] += acc[3 + comp];
+            let d1c = &d1b[comp * stride1..(comp + 1) * stride1];
+            for pl in 0..nb {
+            let p = p0 + pl;
+            let cov = &adj.di_cov[p * n2..(p + 1) * n2];
+            let lt = adj.lam_tilde[p];
+            let base1 = pl * nrow * nao;
+            let mut adi = [0.0f64; 4];
+            let mut adm = [0.0f64; 4];
+            // int3c2e_ip1: rows `mu` on the atom, all `nu`.  `dI^(b)` is the
+            // transpose of `dI^(a)` and is already counted by the symmetrised
+            // covectors, so a single contiguous pass covers both bra centres.
+            // nu outside / mu_l inside keeps every access contiguous.
+            for nu in 0..nao {
+                let doff = base1 + nu * nrow;
+                let coff = row0 + nu * nao;
+                let mut i = 0usize;
+                while i + 4 <= nrow {
+                    let d = &d1c[doff + i..doff + i + 4];
+                    let c = &cov[coff + i..coff + i + 4];
+                    let m = &dm[coff + i..coff + i + 4];
+                    for j in 0..4 {
+                        let v = -d[j];
+                        adi[j] += c[j] * v;
+                        adm[j] += m[j] * v;
+                    }
+                    i += 4;
+                }
+                while i < nrow {
+                    let v = -d1c[doff + i];
+                    let k = coff + i;
+                    adi[0] += cov[k] * v;
+                    adm[0] += dm[k] * v;
+                    i += 1;
+                }
             }
-        }
+            g_di[comp] += adi.iter().sum::<f64>();
+            g_dm[comp] += lt * adm.iter().sum::<f64>();
+            }
+            }
+        });
+        // int3c2e_ip2: dense [nao,nao] symmetric slices of the atom's own auxiliary functions, with
+        // the 1/2 of the symmetrised contraction; streamed as well.
+        self.raw.for_each_d2_block(atm, |p0, nb, d2b| {
+            let stride2 = n2 * nb;
+            for comp in 0..3 {
+            let d2c = &d2b[comp * stride2..(comp + 1) * stride2];
+            for pl in 0..nb {
+                let p = p0 + pl;
+                let cov = &adj.di_cov[p * n2..(p + 1) * n2];
+                let lt = adj.lam_tilde[p];
+                let d2 = &d2c[pl * n2..(pl + 1) * n2];
+                let mut cdi = [0.0f64; 4];
+                let mut cdm = [0.0f64; 4];
+                let mut k = 0usize;
+                while k + 4 <= n2 {
+                    let d = &d2[k..k + 4];
+                    let c = &cov[k..k + 4];
+                    let m = &dm[k..k + 4];
+                    for j in 0..4 {
+                        let v = -0.5 * d[j];
+                        cdi[j] += c[j] * v;
+                        cdm[j] += m[j] * v;
+                    }
+                    k += 4;
+                }
+                while k < n2 {
+                    let v = -0.5 * d2[k];
+                    cdi[0] += cov[k] * v;
+                    cdm[0] += dm[k] * v;
+                    k += 1;
+                }
+                g_di[comp] += cdi.iter().sum::<f64>();
+                g_dm[comp] += lt * cdm.iter().sum::<f64>();
+            }
+            }
+        });
         let mut out = [0.0f64; 3];
         for comp in 0..3 {
             out[comp] = self.finish_adjoint_gradient(
@@ -9126,32 +8098,14 @@ impl GwGradEngine<'_> {
         let n2 = self.nao * self.nao;
         let naux = self.naux;
         let mut g = acc;
-        // - sum_P lam_tilde_P (dJ c)_P, in fixed index blocks merged in order so
-        // that the perturbation loop parities stay bit-identical under
-        // `num_threads` (see `PERT_BLK`).
+        // - sum_P lam_tilde_P (dJ c)_P
         let mut djc = 0.0f64;
-        {
-            const DJC_BLK: usize = 64;
-            let blocks: Vec<usize> = (0..(naux + DJC_BLK - 1) / DJC_BLK).collect();
-            let parts: Vec<f64> = blocks
-                .par_iter()
-                .map(|&b| {
-                    let p0 = b * DJC_BLK;
-                    let p1 = (p0 + DJC_BLK).min(naux);
-                    let mut acc = 0.0f64;
-                    for p in p0..p1 {
-                        let mut s = 0.0f64;
-                        for q in 0..naux {
-                            s += dj[p + q * naux] * adj.c_aux[q];
-                        }
-                        acc += adj.lam_tilde[p] * s;
-                    }
-                    acc
-                })
-                .collect();
-            for v in parts.iter() {
-                djc += *v;
+        for p in 0..naux {
+            let mut s = 0.0f64;
+            for q in 0..naux {
+                s += dj[p + q * naux] * adj.c_aux[q];
             }
+            djc += adj.lam_tilde[p] * s;
         }
         g -= djc;
         // exchange skeleton remainder, core Hamiltonian and overlap
@@ -9394,17 +8348,17 @@ mod layout_tests {
         // Cholesky factor + multi-RHS solve closure, as in GwGradEngine
         let mut chol = spd.clone();
         _dpotrf(&mut chol, 'L');
-        // in-place multi-column solve, same signature as `j_deriv_from_impl` expects
-        let solve = |b: &mut [f64], ncol: usize| {
-            let mut bm = to_mat(b, naux, ncol);
+        let solve = |rhs: &[f64]| -> Vec<f64> {
+            let mut b = rhs.to_vec();
+            let mut bm = to_mat(&b, naux, 1);
             assert!(_dtrtrs(&chol, &mut bm, 'L', 'N', 'N'));
             assert!(_dtrtrs(&chol, &mut bm, 'L', 'T', 'N'));
             b.copy_from_slice(&bm.data);
+            b
         };
         // sanity: cholesky solve == dgesv solve
         let rhs: Vec<f64> = (0..naux).map(|_| rnd(&mut seed)).collect();
-        let mut x1 = rhs.clone();
-        solve(&mut x1, 1);
+        let x1 = solve(&rhs);
         let x2 = _dsolve(&spd, &rhs).unwrap();
         let err = x1.iter().zip(x2.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
         assert!(err < 1.0e-10, "chol solve err {err}");
