@@ -107,7 +107,7 @@ use crate::ri_bse::bse_grad::grad_timing;
 /// [`crate::utilities::par_sum`].  Each batch holds at least this many
 /// auxiliary functions (one whole shell more at most), which keeps the
 /// per-batch integral calls few.
-const PERT_BLK: usize = 128;
+const PERT_BLK: usize = 64;
 
 /// Fixed work-block size (auxiliary functions) of the parallel `bq` fold.
 /// Clear a lazily-filled cache buffer, skipping (instead of panicking) when a
@@ -134,7 +134,7 @@ const FOLD_BLK: usize = 128;
 ///
 /// The blocks are laid out from the index alone and the partials are merged in
 /// block order, so the result is independent of the thread count.
-const POLAR_BLK: usize = 256;
+const POLAR_BLK: usize = 128;
 
 /// Free-function core of [`GwGradEngine::polar_pullback_parallel`], so the
 /// parallel closure captures plain slices instead of the engine (`&GwGradEngine`
@@ -6792,6 +6792,14 @@ impl GwGradEngine<'_> {
         let (mut bq, bj, be, bb) = self.qp_pullback(&refs, &[vec![w; caches.len()]]);
         let own0 = &caches[shell.iter().position(|&m| m == target).unwrap()];
         mem_probe("gradient: after qp_pullback (bq/bj/be/bb)");
+        // The pullback's parallel regions each allocate and free their own block
+        // scratch; glibc keeps those blocks in the *per-thread* arenas, so the
+        // resident set after the pullback is ~175 MB higher with eight workers than
+        // with one even though the live data is identical.  The fold, which is where
+        // this gradient peaks, would then start from that inflated baseline.
+        // Returning the free arenas to the OS here keeps the eight-thread curve on
+        // top of the one-thread one.
+        crate::hessian::memory_monitor::trim_to_os(0);
         // ---- adjoint (Z-vector) route --------------------------------
         // The reference guard is checked *before* folding (both the builder and
         // this branch use `supports_cphf_adjoint`): the folded covector is all
