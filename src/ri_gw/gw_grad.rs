@@ -236,13 +236,17 @@ const RESP_BLK: usize = 64;
 /// Column block of the two Gram products (the `naux` output index is not contracted).
 const GRAM_BLK: usize = 64;
 
+/// Column block of the residue rank-1 updates (their `naux` output index is not
+/// contracted either, so the split needs no reduction and no partial buffer).
+const RES_BLK: usize = 128;
+
 // sub-step accumulators of the canonical-response assembly (seconds):
 // [0] j_deriv_from, [1] k_deriv_from, [2] compute_j_upper, [3] compute_k_upper
 thread_local! {
     static T_TIMER: std::cell::RefCell<[f64; 4]> = const { std::cell::RefCell::new([0.0; 4]) };
     /// `[response, gram, accumulate, bq/be]` of the streaming QP pullback
     /// (`REST_GRAD_TIMING=1`).
-    static T_PULL: std::cell::RefCell<[f64; 4]> = const { std::cell::RefCell::new([0.0; 4]) };
+    static T_PULL: std::cell::RefCell<[f64; 9]> = const { std::cell::RefCell::new([0.0; 9]) };
 }
 
 fn timer_add(idx: usize, t0: Instant) {
@@ -2871,6 +2875,32 @@ impl<'a> GwGradEngine<'a> {
         sum
     }
 
+    /// [`Self::residue_dwdz`] with the `qia` operator already in matrix form.
+    ///
+    /// `residue_dwdz` computes `nov` projections `y . qia[:,col]` with a scalar
+    /// double loop (`nov * naux` multiply-adds per call, and it is called once or
+    /// twice per residue entry).  At vitamin C/def2-TZVP that loop is ~40 s of the
+    /// BSE gradient — the single largest serial remainder of the pullback.  As a
+    /// BLAS-2 product against a prebuilt `qia` the same numbers come out of a
+    /// `T`-transposed gemm, so the per-call cost drops to a `naux`-element copy of
+    /// `y` plus one gemv.
+    fn residue_dwdz_m(&self, qia_m: &MatrixFull<f64>, y: &[f64], z: f64) -> f64 {
+        let naux = self.naux;
+        let nov = self.de_ia.len();
+        if nov == 0 || y.is_empty() {
+            return 0.0;
+        }
+        let ym = to_mat(y, naux, 1);
+        let mut proj = MatrixFull::new([nov, 1], 0.0);
+        _dgemm_full(qia_m, 'T', &ym, 'N', &mut proj, 1.0, 0.0);
+        let mut sum = 0.0f64;
+        for col in 0..nov {
+            let p = proj.data[col];
+            sum += p * p * dd_response_dz_single(self.de_ia[col], z, self.config.eta);
+        }
+        sum
+    }
+
     /// `y = s_metric * (qt + corr)` and `y0 = s_metric * qt` of one pole from
     /// the factor's metric intermediate `qt = S q_nm`.
     fn residue_vectors(&self, factor: &LrFactor, qt: &[f64]) -> (Vec<f64>, Vec<f64>) {
@@ -4231,6 +4261,9 @@ impl<'a> GwGradEngine<'a> {
         let no_imag = dbg("REST_GWGRAD_NOIMAG");
         let no_static = dbg("REST_GWGRAD_NOSTATIC");
         let QpPullbackScratch { bq, bj, be, bb, v_imag, v_static, v_res, z_order, .. } = scr;
+        // `qia` in matrix form, once per chunk: the residue `dW/dz` projections are
+        // then BLAS-2 products (see `residue_dwdz_m`).
+        let qia_m = to_mat(&self.qia, naux, self.de_ia.len());
 
         for (jl, cache) in caches.iter().enumerate() {
             let j = col0 + jl;
@@ -4565,6 +4598,7 @@ impl<'a> GwGradEngine<'a> {
                 }
             }
 
+            let t_post = Instant::now();
             for k in 0..nk {
                 let c = cs[k];
                 if c == 0.0 {
@@ -4601,9 +4635,39 @@ impl<'a> GwGradEngine<'a> {
                     let ysm = to_mat(&y0s_m.data, naux, nmo);
                     let ymm = to_mat(&y0_m.data, naux, nmo);
                     let mut vr = MatrixFull::new([naux, naux], 0.0);
-                    _dgemm_full(&prem, 'N', &ysm, 'T', &mut vr, 1.0, 0.0);
                     let mut vm = MatrixFull::new([naux, naux], 0.0);
-                    _dgemm_full(&prmm, 'N', &ymm, 'T', &mut vm, 1.0, 0.0);
+                    // Column-separable split, exactly as in the Gram products: output
+                    // column `q` of `vr`/`vm` depends only on **row** `q` of
+                    // `ysm`/`ymm`, so the blocks fill disjoint columns and each gathers
+                    // its operand rows into a small contiguous `[nc, nmo]` buffer (the
+                    // two blocks of a worker share the gather).  The products are the
+                    // same BLAS calls with the same `k` range, so the values are the
+                    // serial ones up to BLAS's own blocking.
+                    let parts: Vec<(usize, Vec<f64>, Vec<f64>)> = index_blocks(naux, GRAM_BLK)
+                        .par_iter()
+                        .map(|&[q0, q1]| {
+                            let nc = q1 - q0;
+                            let mut ysb = MatrixFull::new([nc, nmo], 0.0);
+                            let mut ymb = MatrixFull::new([nc, nmo], 0.0);
+                            for (lc, q) in (q0..q1).enumerate() {
+                                for m in 0..nmo {
+                                    ysb.data[lc + m * nc] = ysm.data[q + m * naux];
+                                    ymb.data[lc + m * nc] = ymm.data[q + m * naux];
+                                }
+                            }
+                            let mut a1 = MatrixFull::new([naux, nc], 0.0);
+                            _dgemm_full(&prem, 'N', &ysb, 'T', &mut a1, 1.0, 0.0);
+                            let mut a2 = MatrixFull::new([naux, nc], 0.0);
+                            _dgemm_full(&prmm, 'N', &ymb, 'T', &mut a2, 1.0, 0.0);
+                            (q0, a1.data, a2.data)
+                        })
+                        .collect();
+                    for (q0, a1, a2) in parts.iter() {
+                        let q0 = *q0;
+                        let nc = a1.len() / naux;
+                        vr.data[q0 * naux..(q0 + nc) * naux].copy_from_slice(a1);
+                        vm.data[q0 * naux..(q0 + nc) * naux].copy_from_slice(a2);
+                    }
                     for (d, (a, b)) in bj[k].iter_mut().zip(vm.data.iter().zip(vr.data.iter()))
                     {
                         *d += a - b;
@@ -4631,6 +4695,31 @@ impl<'a> GwGradEngine<'a> {
                     }
                 }
                 // ---- residues (see `Residue`) ----
+                if grad_timing() {
+                    static DIAG: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        let nent: usize = cache
+                            .residues
+                            .iter()
+                            .map(|r| r.entries.iter().filter(|e| !e.y.is_empty()).count())
+                            .sum();
+                        let nz: usize = z_order[k].len();
+                        eprintln!(
+                            "[gw_grad timing]   pullback diag: residues {}  live entries {}  distinct z {}  nquad {}  naux {} nmo {} nocc {} sub {}",
+                            cache.residues.len(),
+                            nent,
+                            nz,
+                            self.quad.len(),
+                            naux,
+                            nmo,
+                            nocc,
+                            sub
+                        );
+                    }
+                }
+                let t_res0 = Instant::now();
+                T_PULL.with(|c| c.borrow_mut()[4] += t_res0.duration_since(t_post).as_secs_f64());
                 for r in cache
                     .residues
                     .iter()
@@ -4668,6 +4757,7 @@ impl<'a> GwGradEngine<'a> {
                     // `dW/dz` is rebuilt here (once per cache and entry) rather
                     // than stored per Newton step.  The exact-residue protocol
                     // never reads the grid.
+                    let t_mv = Instant::now();
                     if !self.config.exact_residue_z {
                         if let Some(mv) = self.z_grid_mover.as_ref() {
                             let ent = &r.entries;
@@ -4678,15 +4768,15 @@ impl<'a> GwGradEngine<'a> {
                                     0.0
                                 } else {
                                     r.pole_weight
-                                        * self.residue_dwdz(&ent[0].y, ent[0].z)
+                                        * self.residue_dwdz_m(&qia_m, &ent[0].y, ent[0].z)
                                         * ent[0].node_sens
                                 }
                             } else {
                                 let (elo, ehi) = (&ent[0], &ent[1]);
                                 let t = r.interp_t;
                                 let (dlo, dhi) = (
-                                    self.residue_dwdz(&elo.y, elo.z),
-                                    self.residue_dwdz(&ehi.y, ehi.z),
+                                    self.residue_dwdz_m(&qia_m, &elo.y, elo.z),
+                                    self.residue_dwdz_m(&qia_m, &ehi.y, ehi.z),
                                 );
                                 if omega_mode {
                                     // `d/dt` of the standard bracket times
@@ -4736,6 +4826,7 @@ impl<'a> GwGradEngine<'a> {
                     // In omega mode the entry weight is replaced by its
                     // omega-derivative (see above); the single-entry rules are
                     // omega-independent and contribute nothing.
+                    T_PULL.with(|c| c.borrow_mut()[7] += t_mv.elapsed().as_secs_f64());
                     let col_m = cols[r.m];
                     let entries_omega: [f64; 2] = if omega_mode && r.entries.len() == 2 {
                         let dz = r.entries[1].z - r.entries[0].z;
@@ -4763,11 +4854,8 @@ impl<'a> GwGradEngine<'a> {
                         for p in 0..naux {
                             bq[k][col_m + p] += 2.0 * a * (e.y[p] - e.y0[p]);
                         }
-                        for p in 0..naux {
-                            for q in 0..naux {
-                                bj[k][p + q * naux] += a * (e.y0[p] * e.y0[q] - e.y[p] * e.y[q]);
-                            }
-                        }
+                        // The `V` bucket of this pair (one buffer per distinct pole
+                        // frequency `z`), created on first use.
                         let idx =
                             match z_order[k].iter().position(|&z| (z - e.z).abs() < 1.0e-14) {
                                 Some(i) => i,
@@ -4777,13 +4865,35 @@ impl<'a> GwGradEngine<'a> {
                                     z_order[k].len() - 1
                                 }
                             };
+                        // Both rank-1 updates write only their own `q`-th column of the
+                        // two `naux x naux` buffers, so the columns split across the pool
+                        // with **no reduction and no partial accumulator**: each element
+                        // is still produced by exactly the same expression, and the sum
+                        // over residues still runs in residue order, so the result is
+                        // bit-identical to the serial one.  `q` outer / `p` inner also
+                        // makes both inner loops unit-stride.
+                        let t_r1 = Instant::now();
                         let v = &mut v_res[k][idx];
-                        for p in 0..naux {
-                            let yp = e.y[p];
-                            for q in 0..naux {
-                                v[p + q * naux] += a * yp * e.y[q];
-                            }
-                        }
+                        let y0 = &e.y0;
+                        let y = &e.y;
+                        bj[k].par_chunks_mut(RES_BLK * naux)
+                            .zip(v.par_chunks_mut(RES_BLK * naux))
+                            .enumerate()
+                            .for_each(|(bi, (cb, cv))| {
+                                let q0 = bi * RES_BLK;
+                                for (lq, (cb, cv)) in
+                                    cb.chunks_mut(naux).zip(cv.chunks_mut(naux)).enumerate()
+                                {
+                                    let q = q0 + lq;
+                                    let c1 = y0[q];
+                                    let c2 = y[q];
+                                    for p in 0..naux {
+                                        cb[p] += a * (y0[p] * c1 - y[p] * c2);
+                                        cv[p] += a * y[p] * c2;
+                                    }
+                                }
+                            });
+                        T_PULL.with(|c| c.borrow_mut()[8] += t_r1.elapsed().as_secs_f64());
                     }
                 }
 
@@ -4791,6 +4901,7 @@ impl<'a> GwGradEngine<'a> {
                 //  *after* this loop: it is state-independent apart from the scalar
                 //  `c`, so the `nocc` metric solves and the Gram product are shared
                 //  by every state — see below)
+                T_PULL.with(|c| c.borrow_mut()[5] += t_res0.elapsed().as_secs_f64());
             }
 
             // ---- static term B_n = (1-alpha) Sigma_x,nn - v_xc,nn ----
@@ -4807,6 +4918,7 @@ impl<'a> GwGradEngine<'a> {
             // form wrote the whole `naux x naux` buffer once per occupied orbital
             // with stride-`naux` stores (4784 x 8.9 MB of cache-missing traffic at
             // vitamin C/def2-TZVP) and re-solved every `q_ni` once per state.
+            let t_ex0 = Instant::now();
             if (1.0 - self.fock_hyb).abs() > 1.0e-14 && !no_exch && !omega_mode {
                 let mut gmat = MatrixFull::new([naux, nocc], 0.0);
                 for i in 0..nocc {
@@ -4837,6 +4949,7 @@ impl<'a> GwGradEngine<'a> {
                     }
                 }
             }
+            T_PULL.with(|c| c.borrow_mut()[6] += t_ex0.elapsed().as_secs_f64());
         }
     }
 
@@ -4867,10 +4980,14 @@ impl<'a> GwGradEngine<'a> {
         // ---- deferred polarizability pullbacks ----
         let t_polar = Instant::now();
         if grad_timing() {
-            let [t_r, t_g, t_b, t_a] = T_PULL.with(|c| *c.borrow());
+            let [t_r, t_g, t_b, t_a, t_pre, t_res, t_ex, t_mv, t_r1] = T_PULL.with(|c| *c.borrow());
             eprintln!(
-                "[gw_grad timing]   qp_pullback: response {:.2}s  gram {:.2}s  bj/v accum {:.2}s  bq/be+rest {:.2}s",
-                t_r, t_g, t_b, (t_a - t_b).max(0.0)
+                "[gw_grad timing]   qp_pullback: response {:.2}s  gram {:.2}s  bj/v accum {:.2}s  bq/be+rest {:.2}s  | per-cache: prologue {:.2}s  residues {:.2}s  exchange {:.2}s",
+                t_r, t_g, t_b, (t_a - t_b).max(0.0), t_pre, t_res, t_ex
+            );
+            eprintln!(
+                "[gw_grad timing]   qp_pullback residues split: dwdz/mover {:.2}s  rank-1 updates {:.2}s",
+                t_mv, t_r1
             );
             T_PULL.with(|c| c.borrow_mut().fill(0.0));
         }
