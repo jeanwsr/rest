@@ -852,42 +852,44 @@ impl RawRiTensors {
         }
     }
 
-    /// The deterministic work batches (shell ranges) used by the parallel perturbation
-    /// contractions.
+    /// The deterministic work batches (auxiliary-function ranges) used by the parallel
+    /// perturbation contractions.
     ///
-    /// The layout is a function of the core/auxiliary shell indices alone — never of the thread
+    /// The batches tile the **whole** auxiliary basis, not only the perturbed atom's own
+    /// functions: `int3c2e_ip1` differentiates `(mu_A nu | P)` with respect to the position of
+    /// atom `A`, and the atom's `mu` rows couple to *every* auxiliary function `P`.  (The
+    /// `int3c2e_ip2` part is the mirror image — only the atom's own `P` carry the auxiliary-centre
+    /// derivative — and the batch contraction accounts for that by intersecting each batch with
+    /// `aux_range[atm]`, an intersection that is empty for most batches.)  Getting this range
+    /// wrong is not a small effect: it silently drops the `ip1` contribution of every auxiliary
+    /// function not centred on the perturbed atom.
+    ///
+    /// The layout is a function of the auxiliary shell indices alone — never of the thread
     /// count — so the callers can process the batches in parallel and merge their partial sums in
     /// index order and stay bit-for-bit reproducible under `num_threads`, the same discipline as
-    /// [`crate::utilities::par_sum`].  Each batch holds at least [`PERT_BLK`] auxiliary functions
+    /// [`crate::utilities::par_sum`].  Each batch spans at least [`PERT_BLK`] auxiliary functions
     /// (one whole shell more at most), which keeps the per-batch integral calls few and their
     /// result small: `nrow_A * nao * nb * 3`, i.e. a few MB at `PERT_BLK`, against the
     /// `nrow_A * nao * naux * 3` of the full per-atom tensor (254 MB for a carbon atom at
-    /// naphthalene/def2-TZVP).
-    pub fn aux_perturbation_batches(&self, atm: usize) -> Vec<[usize; 2]> {
-        Self::perturbation_batches(
-            &self.aux_shl_range[atm],
-            &self.aux_range[atm],
-            &self.auxmol.ao_loc(),
-        )
+    /// naphthalene/def2-TZVP).  Every batch is a whole number of auxiliary shells, so the `ip1`
+    /// block it evaluates is exactly the slice it contracts, and the batches together evaluate
+    /// each `ip1` shell triplet exactly once.
+    pub fn aux_perturbation_batches(&self) -> Vec<[usize; 2]> {
+        Self::perturbation_batches(self.auxmol.nbas(), &self.auxmol.ao_loc())
     }
 
     /// Pure-function core of [`Self::aux_perturbation_batches`]: everything the batch layout
     /// depends on, so that callers can compute it once and then run the batches in parallel
     /// without holding a `&self` (`RawRiTensors` is not `Sync` because of its `RefCell`
     /// caches).
-    fn perturbation_batches(
-        aux_shl_range: &[usize; 2],
-        aux_range: &[usize; 2],
-        loc: &[usize],
-    ) -> Vec<[usize; 2]> {
-        let (shl0, shl1) = (aux_shl_range[0], aux_shl_range[1]);
+    fn perturbation_batches(nshl: usize, loc: &[usize]) -> Vec<[usize; 2]> {
         let mut out: Vec<[usize; 2]> = Vec::new();
-        let mut a0 = shl0;
-        while a0 < shl1 {
-            let mut a1 = a0;
+        let mut a0 = 0usize;
+        while a0 < nshl {
             let f0 = loc[a0];
+            let mut a1 = a0;
             let mut f1 = f0;
-            while a1 < shl1 && f1 - f0 < PERT_BLK {
+            while a1 < nshl && f1 - f0 < PERT_BLK {
                 f1 = loc[a1 + 1];
                 a1 += 1;
             }
@@ -896,49 +898,25 @@ impl RawRiTensors {
             }
             a0 = a1;
         }
-        debug_assert_eq!(out.last().map(|r| r[1]), Some(aux_range[1]));
+        debug_assert!(out.is_empty() || out[0][0] == 0);
+        debug_assert_eq!(out.last().map(|r| r[1]), loc.get(nshl).copied());
         out
     }
 
-    /// Materialise the streamed derivative blocks of one auxiliary-function range of one
-    /// perturbed atom: `(d1_blocks, d2_blocks)` in the layouts of
-    /// [`Self::for_each_d1_block`] / [`Self::for_each_d2_block`], but with the **whole range in
-    /// one block**.
-    ///
-    /// Called (in parallel) once per batch of [`Self::aux_perturbation_batches`]; the atom's own
-    /// auxiliary shells are limited to the range, so a range that is not aligned to the atom's
-    /// shells (the `ip1` stream is batched by auxiliary shells of every centre) simply
-    /// materialises fewer functions.
-    pub fn perturbation_batch_blocks(
-        &self,
-        atm: usize,
-        f0: usize,
-        f1: usize,
-    ) -> (Vec<f64>, Vec<f64>) {
-        let nshl = self.auxmol.nbas();
-        Self::perturbation_batch_blocks_pure(
-            &self.mol,
-            &self.auxmol,
-            &self.ao_shl_range[atm],
-            &self.aux_range[atm],
-            self.ao_range[atm][1] - self.ao_range[atm][0],
-            self.nao,
-            self.naux,
-            &[0, nshl],
-            f0,
-            f1,
-        )
-    }
-
-    /// Pure-function core of [`Self::perturbation_batch_blocks`], so that the perturbation
+    /// Pure-function core of the per-batch block materialisation, so that the perturbation
     /// contraction can run its batches in parallel from `&CInt`s alone (`RawRiTensors` itself is
     /// not `Sync` because of its `RefCell` caches).
     ///
-    /// `nrow` is the number of AO functions of the perturbed atom
-    /// (`ao_range[atm][1] - ao_range[atm][0]`); `shl_range` is the **auxiliary** shell range to
-    /// evaluate (the full auxiliary basis for the exact streamed behaviour, a sub-range when the
-    /// caller only needs a slice, as in [`Self::fold_covector_packed_streamed_batch`]).
-    #[allow(clippy::too_many_arguments)]
+    /// `[f0, f1)` must be a whole number of auxiliary shells, which is what
+    /// [`Self::aux_perturbation_batches`] produces; `nrow` is the number of AO functions of the
+    /// perturbed atom (`ao_range[atm][1] - ao_range[atm][0]`).
+    ///
+    /// Returns `(d1, d2)`, both **in the layouts of [`Self::for_each_d1_block`] /
+    /// [`Self::for_each_d2_block`]**, i.e. col-major `[nrow, nao, f1 - f0, 3]` and col-major
+    /// `[nao, nao, naux_a, 3]` with `naux_a` the number of the atom's own auxiliary functions
+    /// inside the batch (zero for every batch that misses them).  Because the batch runs over its
+    /// own shells, the `ip1` integral *is* the block — no slicing or re-layout is needed, and the
+    /// batches together cost one full `int3c2e_ip1` pass, not one per batch.
     pub fn perturbation_batch_blocks_pure(
         mol: &CInt,
         auxmol: &CInt,
@@ -946,57 +924,51 @@ impl RawRiTensors {
         aux_range: &[usize; 2],
         nrow: usize,
         nao: usize,
-        naux: usize,
-        shl_range: &[usize; 2],
         f0: usize,
         f1: usize,
     ) -> (Vec<f64>, Vec<f64>) {
-        // `ip1` is evaluated over the requested shell range and sliced to the batch (the atom's
-        // `mu` rows couple to every auxiliary centre); `ip2` is dense in `[mu,nu]` but only for
-        // the atom's own auxiliary functions, so its integral range is restricted to the batch.
+        // `ip1` is evaluated over the batch's auxiliary shells and covers the atom's `mu` rows
+        // against every `nu`; `ip2` is dense in `[mu,nu]` but only for the atom's own auxiliary
+        // functions, so its integral range is the batch's intersection with them.
         let loc = auxmol.ao_loc();
-        let (c_lo, c_hi) = (loc[shl_range[0]], loc[shl_range[1]]);
+        let nb = f1 - f0;
         let mut d1 = Vec::new();
-        if c_hi > c_lo {
+        if nb > 0 {
+            let s_lo = loc.partition_point(|&f| f < f0);
+            let s_hi = loc.partition_point(|&f| f < f1);
+            assert_eq!(
+                (loc[s_lo], loc[s_hi]),
+                (f0, f1),
+                "perturbation batch must span whole auxiliary shells"
+            );
             let (d, shape1) = CInt::integrate_cross(
                 "int3c2e_ip1",
                 [mol, mol, auxmol],
                 "s1",
-                &[*ao_shl_range, [0, mol.nbas()], *shl_range],
+                &[*ao_shl_range, [0, mol.nbas()], [s_lo, s_hi]],
             )
             .into();
-            assert_eq!(shape1, vec![nrow, nao, c_hi - c_lo, 3], "int3c2e_ip1 shape");
+            assert_eq!(shape1, vec![nrow, nao, nb, 3], "int3c2e_ip1 shape");
             d1 = d;
-        }
-        let nb = f1 - f0;
-        let mut d1c = vec![0.0f64; nrow * nao * nb * 3];
-        let sl = nrow * nao;
-        for comp in 0..3 {
-            let src = &d1[comp * sl * (c_hi - c_lo)..(comp + 1) * sl * (c_hi - c_lo)];
-            let dst = &mut d1c[comp * sl * nb..(comp + 1) * sl * nb];
-            for k in 0..sl {
-                dst[k * nb..(k + 1) * nb]
-                    .copy_from_slice(&src[k * (c_hi - c_lo) + (f0 - c_lo)..k * (c_hi - c_lo) + (f1 - c_lo)]);
-            }
         }
         let n2 = nao * nao;
         let (a_lo, a_hi) = (f0.max(aux_range[0]), f1.min(aux_range[1]));
         let naux_a = a_hi.saturating_sub(a_lo);
         let mut d2c = vec![0.0f64; n2 * naux_a * 3];
         if naux_a > 0 {
-            let s_lo = loc.partition_point(|&f| f < a_lo);
-            let s_hi = loc.partition_point(|&f| f < a_hi);
+            let c_lo = loc.partition_point(|&f| f < a_lo);
+            let c_hi = loc.partition_point(|&f| f < a_hi);
             let (d2, shape2) = CInt::integrate_cross(
                 "int3c2e_ip2",
                 [mol, mol, auxmol],
                 "s1",
-                &[[0, mol.nbas()], [0, mol.nbas()], [s_lo, s_hi]],
+                &[[0, mol.nbas()], [0, mol.nbas()], [c_lo, c_hi]],
             )
             .into();
             assert_eq!(shape2, vec![nao, nao, naux_a, 3], "int3c2e_ip2 shape");
             d2c.copy_from_slice(&d2);
         }
-        (d1c, d2c)
+        (d1, d2c)
     }
 
     /// `int3c2e(mu,nu,P)` for one atom's `mu` rows over the auxiliary shell range `shl_range`,
@@ -8991,37 +8963,37 @@ impl GwGradEngine<'_> {
         let dm = &adj.dm_sym;
         let raw = &self.raw;
         let (a0, a1) = (raw.aux_range[atm][0], raw.aux_range[atm][1]);
-        let naux = raw.naux;
         let mol = &raw.mol;
         let auxmol = &raw.auxmol;
         let ao_shl = raw.ao_shl_range[atm];
         let aux_rng = raw.aux_range[atm];
         // One parallel pass over the deterministic batches; each batch evaluates its own
         // `int3c2e_ip1`/`ip2` blocks (both, once) and reduces them to `[g_di | g_dm]`.
-        let batches = raw.aux_perturbation_batches(atm);
+        let batches = raw.aux_perturbation_batches();
         let parts: Vec<[f64; 6]> = batches
             .par_iter()
             .map(|&[f0, f1]| {
-                let nshl = auxmol.nbas();
                 let (d1c, d2c) = crate::ri_gw::gw_grad::RawRiTensors::perturbation_batch_blocks_pure(
-                    mol, auxmol, &ao_shl, &aux_rng, nrow, nao, naux, &[0, nshl], f0, f1,
+                    mol, auxmol, &ao_shl, &aux_rng, nrow, nao, f0, f1,
                 );
                 let nb = f1 - f0;
                 let stride1 = nrow * nao * nb;
                 let mut acc = [0.0f64; 6];
                 for comp in 0..3 {
                     let d1cur = &d1c[comp * stride1..(comp + 1) * stride1];
-                    let mut adi = [0.0f64; 4];
-                    let mut adm = [0.0f64; 4];
                     // int3c2e_ip1: rows `mu` on the atom, all `nu`.  `dI^(b)` is the transpose
                     // of `dI^(a)` and is already counted by the symmetrised covectors, so a
-                    // single contiguous pass covers both bra centres.  nu outside / mu_l inside
-                    // keeps every access contiguous.
+                    // single contiguous pass covers both bra centres.
+                    // nu outside / mu_l inside keeps every access contiguous.
                     for pl in 0..nb {
                         let p = f0 + pl;
                         let cov = &adj.di_cov[p * n2..(p + 1) * n2];
                         let lt = adj.lam_tilde[p];
                         let base1 = pl * nrow * nao;
+                        // The two accumulators are per auxiliary function: `lam_tilde` weights
+                        // the `dm_sym` covector and is *not* constant over the batch.
+                        let mut adi = [0.0f64; 4];
+                        let mut adm = [0.0f64; 4];
                         for nu in 0..nao {
                             let doff = base1 + nu * nrow;
                             let coff = row0 + nu * nao;
@@ -9033,7 +9005,7 @@ impl GwGradEngine<'_> {
                                 for j in 0..4 {
                                     let v = -d[j];
                                     adi[j] += c[j] * v;
-                                    adm[j] += m[j] * v;
+                                    adm[j] += lt * m[j] * v;
                                 }
                                 i += 4;
                             }
@@ -9041,13 +9013,13 @@ impl GwGradEngine<'_> {
                                 let v = -d1cur[doff + i];
                                 let k = coff + i;
                                 adi[0] += cov[k] * v;
-                                adm[0] += dm[k] * v;
+                                adm[0] += lt * dm[k] * v;
                                 i += 1;
                             }
                         }
+                        acc[comp] += adi.iter().sum::<f64>();
+                        acc[3 + comp] += adm.iter().sum::<f64>();
                     }
-                    acc[comp] += adi.iter().sum::<f64>();
-                    acc[3 + comp] += adm.iter().sum::<f64>();
                     // int3c2e_ip2: dense `[nao,nao]` symmetric slices of the atom's own auxiliary
                     // functions, with the 1/2 of the symmetrised contraction.  A batch outside
                     // the atom's own auxiliary functions has no `ip2` part at all.
@@ -9059,13 +9031,13 @@ impl GwGradEngine<'_> {
                     }
                     let stride2 = n2 * nb2;
                     let d2cur = &d2c[comp * stride2..(comp + 1) * stride2];
-                    let mut cdi = [0.0f64; 4];
-                    let mut cdm = [0.0f64; 4];
                     for pl in 0..nb2 {
                         let p = b_lo + pl;
                         let cov = &adj.di_cov[p * n2..(p + 1) * n2];
                         let lt = adj.lam_tilde[p];
                         let d2 = &d2cur[pl * n2..(pl + 1) * n2];
+                        let mut cdi = [0.0f64; 4];
+                        let mut cdm = [0.0f64; 4];
                         let mut k = 0usize;
                         while k + 4 <= n2 {
                             let d = &d2[k..k + 4];
@@ -9074,19 +9046,19 @@ impl GwGradEngine<'_> {
                             for j in 0..4 {
                                 let v = -0.5 * d[j];
                                 cdi[j] += c[j] * v;
-                                cdm[j] += m[j] * v;
+                                cdm[j] += lt * m[j] * v;
                             }
                             k += 4;
                         }
                         while k < n2 {
                             let v = -0.5 * d2[k];
                             cdi[0] += cov[k] * v;
-                            cdm[0] += dm[k] * v;
+                            cdm[0] += lt * dm[k] * v;
                             k += 1;
                         }
+                        acc[comp] += cdi.iter().sum::<f64>();
+                        acc[3 + comp] += cdm.iter().sum::<f64>();
                     }
-                    acc[comp] += cdi.iter().sum::<f64>();
-                    acc[3 + comp] += cdm.iter().sum::<f64>();
                 }
                 acc
             })
