@@ -2901,6 +2901,52 @@ impl<'a> GwGradEngine<'a> {
         sum
     }
 
+    /// `dW/dz` of **every** residue entry of one cache, batched.
+    ///
+    /// The per-entry form projected the same `qia` operator onto each entry's `y`
+    /// separately, i.e. it re-read the `naux x nov` matrix (~2.3 MB at vitamin
+    /// C/def2-TZVP) once per entry — with a few hundred entries per cache that is
+    /// the dominant memory stream of the whole pullback.  Batching turns it into a
+    /// single `qia^T Y` product for the cache, after which an entry only needs the
+    /// `nov`-term sum over its own projected row.  Returns
+    /// `[dwdz(entry 0), dwdz(entry 1)]` per residue.
+    fn residue_dwdz_all(&self, qia_m: &MatrixFull<f64>, residues: &[Residue]) -> Vec<[f64; 2]> {
+        let naux = self.naux;
+        let nov = self.de_ia.len();
+        let mut out = vec![[0.0f64; 2]; residues.len()];
+        if nov == 0 || residues.is_empty() {
+            return out;
+        }
+        let nslot: usize = residues.iter().map(|r| r.entries.len().min(2)).sum();
+        if nslot == 0 {
+            return out;
+        }
+        let mut ymat = MatrixFull::new([naux, nslot], 0.0);
+        let mut slot_of: Vec<(usize, usize)> = Vec::with_capacity(nslot);
+        for (ri, r) in residues.iter().enumerate() {
+            for (ei, e) in r.entries.iter().enumerate().take(2) {
+                let s = slot_of.len();
+                if !e.y.is_empty() {
+                    ymat.data[s * naux..(s + 1) * naux].copy_from_slice(&e.y);
+                }
+                slot_of.push((ri, ei));
+            }
+        }
+        debug_assert_eq!(slot_of.len(), nslot);
+        let mut proj = MatrixFull::new([nov, nslot], 0.0);
+        _dgemm_full(qia_m, 'T', &ymat, 'N', &mut proj, 1.0, 0.0);
+        for (s, &(ri, ei)) in slot_of.iter().enumerate() {
+            let z = residues[ri].entries[ei].z;
+            let mut sum = 0.0f64;
+            for col in 0..nov {
+                let p = proj.data[col + s * nov];
+                sum += p * p * dd_response_dz_single(self.de_ia[col], z, self.config.eta);
+            }
+            out[ri][ei] = sum;
+        }
+        out
+    }
+
     /// `y = s_metric * (qt + corr)` and `y0 = s_metric * qt` of one pole from
     /// the factor's metric intermediate `qt = S q_nm`.
     fn residue_vectors(&self, factor: &LrFactor, qt: &[f64]) -> (Vec<f64>, Vec<f64>) {
@@ -4599,6 +4645,13 @@ impl<'a> GwGradEngine<'a> {
             }
 
             let t_post = Instant::now();
+            // `dW/dz` of every residue entry, batched (see `residue_dwdz_all`).
+            let dwdz_all: Vec<[f64; 2]> =
+                if !self.config.exact_residue_z && self.z_grid_mover.is_some() && !no_res {
+                    self.residue_dwdz_all(&qia_m, &cache.residues)
+                } else {
+                    Vec::new()
+                };
             for k in 0..nk {
                 let c = cs[k];
                 if c == 0.0 {
@@ -4720,9 +4773,10 @@ impl<'a> GwGradEngine<'a> {
                 }
                 let t_res0 = Instant::now();
                 T_PULL.with(|c| c.borrow_mut()[4] += t_res0.duration_since(t_post).as_secs_f64());
-                for r in cache
+                for (ri, r) in cache
                     .residues
                     .iter()
+                    .enumerate()
                     .take(if no_res { 0 } else { usize::MAX })
                 {
                     // The factor frequency follows the pole (`z = |e_m - omega|`)
@@ -4767,17 +4821,12 @@ impl<'a> GwGradEngine<'a> {
                                     // with omega
                                     0.0
                                 } else {
-                                    r.pole_weight
-                                        * self.residue_dwdz_m(&qia_m, &ent[0].y, ent[0].z)
-                                        * ent[0].node_sens
+                                    r.pole_weight * dwdz_all[ri][0] * ent[0].node_sens
                                 }
                             } else {
                                 let (elo, ehi) = (&ent[0], &ent[1]);
                                 let t = r.interp_t;
-                                let (dlo, dhi) = (
-                                    self.residue_dwdz_m(&qia_m, &elo.y, elo.z),
-                                    self.residue_dwdz_m(&qia_m, &ehi.y, ehi.z),
-                                );
+                                let (dlo, dhi) = (dwdz_all[ri][0], dwdz_all[ri][1]);
                                 if omega_mode {
                                     // `d/dt` of the standard bracket times
                                     // `dt/d omega = -zsign/(z_hi-z_lo)`
