@@ -1660,14 +1660,15 @@ impl<'a> BseGradEngine<'a> {
         // resident and the *peak* RSS of the build alone reaches several GB.
         let mut qp_energies = vec![0.0f64; gw.nmo];
         let mut qp_caches: Vec<QpCache> = (0..gw.nmo).map(empty_qp_cache).collect();
-        let built: Vec<(usize, QpCache)> = (0..gw.nmo)
-            .filter(|&n| needed(n))
-            .map(|n| (n, gw.build_target_cache_compact(n)))
-            .collect();
-        for (n, c) in built {
-            qp_energies[n] = c.omega;
-            qp_caches[n] = c;
-            crate::hessian::memory_monitor::trim_to_os(0);
+        for n in 0..gw.nmo {
+            if needed(n) {
+                let c = gw.build_target_cache_compact(n);
+                qp_energies[n] = c.omega;
+                qp_caches[n] = c;
+            }
+            if n % 16 == 15 {
+                crate::hessian::memory_monitor::trim_to_os(0);
+            }
         }
         // the metric-transformed blocks are only read while a QP cache is
         // built; the low-rank factors they helped build stay resident for the
