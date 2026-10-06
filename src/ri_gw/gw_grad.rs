@@ -4787,28 +4787,53 @@ impl<'a> GwGradEngine<'a> {
                     }
                 }
 
-                // ---- static term B_n = (1-alpha) Sigma_x,nn - v_xc,nn ----
-                // REST `consts = eps + (1-alpha) Sigma_x,nn - v_xc,nn` with
-                // `Sigma_x,nn = -sum_i (n i|n i) = -sum_i q_ni^T J^{-1} q_ni`,
-                // so the derivative contributes
-                //   -(1-alpha) [2 sum_i g_ni^T dq_ni - sum_i g_ni^T dJ g_ni],
-                // g_ni = J^{-1} q_ni.  The v_xc relaxation term is not
-                // implemented (references with a nonzero v_xc are rejected
-                // in `canonical_response`).
-                if (1.0 - self.fock_hyb).abs() > 1.0e-14 && !no_exch && !omega_mode {
-                    for i in 0..nocc {
-                        let qni = self.with_q(|q| self.gather_pair(q, n, i));
-                        let g_ni = self.metric_solve(&qni, 1);
-                        let col_i = packed_pair_index(nmo, n, i) * naux;
+                // (the static exchange term `(1-alpha) Sigma_x,nn` is accumulated
+                //  *after* this loop: it is state-independent apart from the scalar
+                //  `c`, so the `nocc` metric solves and the Gram product are shared
+                //  by every state — see below)
+            }
+
+            // ---- static term B_n = (1-alpha) Sigma_x,nn - v_xc,nn ----
+            // REST `consts = eps + (1-alpha) Sigma_x,nn - v_xc,nn` with
+            // `Sigma_x,nn = -sum_i (n i|n i) = -sum_i q_ni^T J^{-1} q_ni`,
+            // so the derivative contributes
+            //   -(1-alpha) [2 sum_i g_ni^T dq_ni - sum_i g_ni^T dJ g_ni],
+            // g_ni = J^{-1} q_ni.  The v_xc relaxation term is not
+            // implemented (references with a nonzero v_xc are rejected
+            // in `canonical_response`).
+            //
+            // The `nocc` rank-1 updates of the Gram half are **one** gemm,
+            // `sum_i g_i g_i^T = G G^T` with `G = [g_1 ... g_nocc]`:  the scalar
+            // form wrote the whole `naux x naux` buffer once per occupied orbital
+            // with stride-`naux` stores (4784 x 8.9 MB of cache-missing traffic at
+            // vitamin C/def2-TZVP) and re-solved every `q_ni` once per state.
+            if (1.0 - self.fock_hyb).abs() > 1.0e-14 && !no_exch && !omega_mode {
+                let mut gmat = MatrixFull::new([naux, nocc], 0.0);
+                for i in 0..nocc {
+                    let qni = self.with_q(|q| self.gather_pair(q, n, i));
+                    let g_ni = self.metric_solve(&qni, 1);
+                    gmat.data[i * naux..(i + 1) * naux].copy_from_slice(&g_ni);
+                    let col_i = packed_pair_index(nmo, n, i) * naux;
+                    for k in 0..nk {
+                        let c = cs[k];
+                        if c == 0.0 {
+                            continue;
+                        }
                         for p in 0..naux {
                             bq[k][col_i + p] -= 2.0 * c * (1.0 - self.fock_hyb) * g_ni[p];
                         }
-                        for p in 0..naux {
-                            for q in 0..naux {
-                                bj[k][p + q * naux] +=
-                                    c * (1.0 - self.fock_hyb) * g_ni[p] * g_ni[q];
-                            }
-                        }
+                    }
+                }
+                let mut gg = MatrixFull::new([naux, naux], 0.0);
+                _dgemm_full(&gmat, 'N', &gmat, 'T', &mut gg, 1.0, 0.0);
+                for k in 0..nk {
+                    let c = cs[k];
+                    if c == 0.0 {
+                        continue;
+                    }
+                    let f = c * (1.0 - self.fock_hyb);
+                    for (d, s) in bj[k].iter_mut().zip(gg.data.iter()) {
+                        *d += f * s;
                     }
                 }
             }
