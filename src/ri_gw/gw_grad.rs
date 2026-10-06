@@ -5394,13 +5394,18 @@ impl GwGradEngine<'_> {
     /// plane of `b_ao` and contributes one term to `X = sum_P I_P Z_P`.  Splitting the
     /// auxiliary **shells** into [`FOLD_BLK`]-sized batches (a layout fixed by the shell
     /// index alone, never by `rayon::current_num_threads()`) and merging the batch-local
-    /// `X` accumulators in index order makes the result bit-for-bit independent of the
-    /// thread count — the same discipline as [`crate::utilities::par_sum`] — while
-    /// `b_ao` is written directly, since each `P` owns its slice.
+    /// `X` accumulators in index order makes the result independent of the thread count —
+    /// the same discipline as [`crate::utilities::par_sum`] — while `b_ao` is written
+    /// directly, since each batch owns the contiguous slice of `P` it produces.
     ///
-    /// The integral work is identical to the streaming version (each batch evaluates its
-    /// own shell range once); only the peak changes: one `nrow_A*nao*nb` integral block
-    /// per in-flight batch instead of the serial stream's single block.
+    /// `b_ao` is handed to the batches as disjoint `&mut` slices (the batches tile
+    /// `0..naux` by whole shells, so the slices are exactly the batches' planes), which
+    /// keeps the peak at one `[nao, nmo]` partial per in-flight batch on top of the
+    /// `naux*nao^2` output the serial version also holds — no per-batch copy of the
+    /// result.
+    ///
+    /// The extra `[nao, nao]` block the serial stream already keeps is unchanged: each
+    /// batch materialises one auxiliary shell's `int3c2e` block at a time.
     pub fn fold_covector_packed_streamed_parallel(&self, bq_tp: &[f64]) -> FoldedCovector {
         let nao = self.nao;
         let nmo = self.nmo;
@@ -5430,25 +5435,35 @@ impl GwGradEngine<'_> {
                 a0 = a1;
             }
         }
-        // Each batch returns its partial `X` (`[nao, nmo]`) and the `b_ao` planes it owns; the
-        // merge is an ordered sum, so the rounding order is a function of the batch layout alone.
+        let mut b_ao = vec![0.0f64; naux * n2];
+        // Disjoint `&mut` views of `b_ao`, one per batch: the batches tile `0..naux` in
+        // order, so this is a plain `split_at_mut` walk and needs no unsafe code.
+        let mut targets: Vec<&mut [f64]> = Vec::with_capacity(batches.len());
+        {
+            let mut rest: &mut [f64] = &mut b_ao;
+            for &[f0, f1] in batches.iter() {
+                let (head, tail) = rest.split_at_mut((f1 - f0) * n2);
+                targets.push(head);
+                rest = tail;
+            }
+            debug_assert!(rest.is_empty(), "fold batches must tile the auxiliary basis");
+        }
+        // Each batch returns its partial `X` (`[nao, nmo]`); the merge is an ordered sum,
+        // so the rounding order is a function of the batch layout alone.
         let c_mo = &self.c_mo;
         let rmol = &self.raw.mol;
         let raux = &self.raw.auxmol;
         let nbas_mol = rmol.nbas();
-        let nshl = loc.len() - 1;
-        let _ = nshl;
-        let parts: Vec<(Vec<f64>, Vec<usize>, Vec<f64>)> = batches
+        let parts: Vec<Vec<f64>> = batches
             .par_iter()
-            .map(|&[f0, f1]| {
+            .zip(targets.into_par_iter())
+            .map(|(&[f0, f1], dst)| {
                 let nshl_lo = loc.partition_point(|&f| f < f0);
                 let nshl_hi = loc.partition_point(|&f| f < f1);
-                let mut x_part = vec![0.0f64; nao * nmo];
-                let mut z_part = vec![0.0f64; nao * nmo];
-                let mut bp_part = vec![0.0f64; n2];
-                let mut bqm_part = vec![0.0f64; nmo * nmo];
-                let mut planes: Vec<usize> = Vec::with_capacity(f1 - f0);
-                let mut plane_data: Vec<f64> = Vec::with_capacity((f1 - f0) * n2);
+                let mut x_part = MatrixFull::new([nao, nmo], 0.0);
+                let mut z = MatrixFull::new([nao, nmo], 0.0);
+                let mut bp = MatrixFull::new([nao, nao], 0.0);
+                let mut bqm = MatrixFull::new([nmo, nmo], 0.0);
                 for shl in nshl_lo..nshl_hi {
                     let (blk, p0, p1) = RawRiTensors::i3_atom_block_pure(
                         rmol,
@@ -5470,43 +5485,34 @@ impl GwGradEngine<'_> {
                         for col in 0..nmo {
                             for row in col..nmo {
                                 let val = bq_tp[tp * naux + p];
-                                bqm_part[row + col * nmo] = val;
-                                bqm_part[col + row * nmo] = val;
+                                bqm.data[row + col * nmo] = val;
+                                bqm.data[col + row * nmo] = val;
                                 tp += 1;
                             }
                         }
-                        let bqm = to_mat(&bqm_part, nmo, nmo);
-                        let mut z = to_mat(&z_part, nao, nmo);
                         _dgemm_full(c_mo, 'N', &bqm, 'N', &mut z, 1.0, 0.0); // Z_P = C bq_P
                         let ip = to_mat(&blk[pl * n2..(pl + 1) * n2], nao, nao);
-                        let mut x = to_mat(&x_part, nao, nmo);
-                        _dgemm_full(&ip, 'N', &z, 'N', &mut x, 1.0, 1.0); // X += I_P Z_P
-                        let mut bp = to_mat(&bp_part, nao, nao);
+                        _dgemm_full(&ip, 'N', &z, 'N', &mut x_part, 1.0, 1.0); // X += I_P Z_P
                         _dgemm_full(&z, 'N', c_mo, 'T', &mut bp, 1.0, 0.0); // B_P = Z_P C^T
-                        planes.push(p);
-                        plane_data.extend_from_slice(&bp_part);
+                        // `dst` is the batch's slice of `b_ao`, so the plane offset is
+                        // relative to the batch start (`p0` advances over the batch's
+                        // shells, while `pl` restarts at each shell).
+                        let off = (p - f0) * n2;
+                        dst[off..off + n2].copy_from_slice(&bp.data);
                     }
                 }
-                (x_part, planes, plane_data)
+                x_part.data
             })
             .collect();
-        let mut b_ao = vec![0.0f64; naux * n2];
-        for (_, planes, data) in parts.iter() {
-            for (i, &p) in planes.iter().enumerate() {
-                b_ao[p * n2..(p + 1) * n2].copy_from_slice(&data[i * n2..(i + 1) * n2]);
-            }
-        }
         let mut x_acc = vec![0.0f64; nao * nmo];
-        for (xp, _, _) in parts.iter() {
+        for xp in parts.iter() {
             for (a, b) in x_acc.iter_mut().zip(xp.iter()) {
                 *a += *b;
             }
         }
         let mut wm = MatrixFull::new([nmo, nmo], 0.0);
-        {
-            let x = to_mat(&x_acc, nao, nmo);
-            _dgemm_full(&self.c_mo, 'T', &x, 'N', &mut wm, 1.0, 0.0); // W = C^T X
-        }
+        let x = MatrixFull::from_vec([nao, nmo], x_acc).expect("fold: X shape");
+        _dgemm_full(&self.c_mo, 'T', &x, 'N', &mut wm, 1.0, 0.0); // W = C^T X
         FoldedCovector { b_ao, w_rot: wm.data }
     }
 
@@ -6045,6 +6051,16 @@ impl GwGradEngine<'_> {
             resp: (Vec<f64>, Vec<f64>, Vec<f64>),
             dbg: Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)>,
         }
+        // The workers below share the engine through `SyncGw`, which is only sound while the
+        // lazy caches are **read-only**.  `int3c2e` (`raw.i3`) is the one they reach through
+        // `with_i3`, and `ensure_i3` rebuilds it with `borrow_mut` when it is cold: on a cold
+        // cache every worker would try to rebuild it at once, which is both a data race on the
+        // borrow flag (observed as `RefCell already borrowed`, ammonia/def2-SVP) and `natm*3`
+        // redundant full `int3c2e` evaluations.  Build it once here, on this thread, before the
+        // pool starts; the workers then only ever take shared borrows.  This is exactly the
+        // resident set the serial loop kept (it built `i3` on the first perturbation and never
+        // released it), so the peak is unchanged.
+        self.raw.ensure_i3();
         let gw = SyncGw(self);
         // bound outside the closure so that it captures plain references instead
         // of the whole engine (`&GwGradEngine` is not `Sync`)
@@ -6522,7 +6538,8 @@ impl GwGradEngine<'_> {
             let packed_pairs = packed_pair_count(self.nmo);
             // no `q` here: the orbital-rotation channel is contracted against the raw integrals,
             // which are streamed auxiliary-atom block by block
-            let mut fold = self.fold_covector_packed_streamed(&bq[0][..packed_pairs * self.naux]);
+            let mut fold =
+                self.fold_covector_packed_streamed_parallel(&bq[0][..packed_pairs * self.naux]);
             // the folded covector replaces `bq` entirely, so release it here (the route returns
             // below; the full-buffer fallback never sees the compacted form)
             drop(bq);

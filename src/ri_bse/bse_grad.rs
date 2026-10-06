@@ -2075,7 +2075,7 @@ impl<'a> BseGradEngine<'a> {
                 let t_fold = Instant::now();
                 let mut fold = self
                     .gw
-                    .fold_covector_packed_streamed(&packed[k]);
+                    .fold_covector_packed_streamed_parallel(&packed[k]);
                 let t_fold = t_fold.elapsed().as_secs_f64();
                 packed[k] = Vec::new();
                 let t_adj = Instant::now();
@@ -2141,7 +2141,7 @@ impl<'a> BseGradEngine<'a> {
                 let mut qbar = std::mem::take(&mut bq[k]);
                 kv.add_into_packed(&mut qbar, naux, nmo);
                 assert_eq!(qbar.len(), npack * naux, "bse_grad: packed covector size mismatch");
-                let mut fold = self.gw.fold_covector_packed_streamed(&qbar);
+                let mut fold = self.gw.fold_covector_packed_streamed_parallel(&qbar);
                 drop(qbar);
                 if adjoint_ok && covectors_isotropic_on_shells(self.gw, &fold, &be[k]) {
                     let pa = per_atom.get_or_insert_with(|| {
