@@ -213,10 +213,28 @@ fn polar_pullback_blocks(
 /// The fixed `[ia0, ia1)` blocks of the parallel polar pullback.
 #[inline]
 fn polar_blocks(n: usize) -> Vec<[usize; 2]> {
-    (0..(n + POLAR_BLK - 1) / POLAR_BLK)
-        .map(|b| [b * POLAR_BLK, ((b + 1) * POLAR_BLK).min(n)])
+    index_blocks(n, POLAR_BLK)
+}
+
+/// Fixed `[c0, c1)` index blocks of width `blk`.
+///
+/// Used by the two column-separable pullback kernels (`response`, `gram`): their
+/// output can be cut along an index that appears in no contraction, so the blocks
+/// produce **disjoint** pieces of the result, need no reduction, and reproduce the
+/// serial product bit for bit.  The layout depends on the index and the width
+/// alone, never on the thread count.
+#[inline]
+fn index_blocks(n: usize, blk: usize) -> Vec<[usize; 2]> {
+    (0..(n + blk - 1) / blk)
+        .map(|b| [b * blk, ((b + 1) * blk).min(n)])
         .collect()
 }
+
+/// Column block of the metric response `S * corr` (the `nmo` index is not contracted).
+const RESP_BLK: usize = 64;
+
+/// Column block of the two Gram products (the `naux` output index is not contracted).
+const GRAM_BLK: usize = 64;
 
 // sub-step accumulators of the canonical-response assembly (seconds):
 // [0] j_deriv_from, [1] k_deriv_from, [2] compute_j_upper, [3] compute_k_upper
@@ -4357,6 +4375,14 @@ impl<'a> GwGradEngine<'a> {
             if compact {
                 self.ensure_lr();
             }
+            // `s_metric` is a flat `[naux, naux]` buffer; converting it once per chunk
+            // (rather than once per quadrature point, as the flat-slice `gemm_nn` did)
+            // removes one `naux^2` copy per frequency from the response phase.
+            let s_metric_m = if compact {
+                to_mat(&self.s_metric, naux, naux)
+            } else {
+                MatrixFull::new([0, 0], 0.0)
+            };
             for (wi, &(u, wgt)) in self
                 .quad
                 .iter()
@@ -4366,14 +4392,40 @@ impl<'a> GwGradEngine<'a> {
                 // `y` and `y0` of this frequency, shared by every state `k`
                 let t_resp = Instant::now();
                 if compact {
-                    let corr = {
-                        let lr_imag = self.lr_imag.borrow();
-                        lr_imag[wi].correction_from_qt(&cache.m_imag, nmo)
-                    };
-                    sc = gemm_nn(&self.s_metric, naux, naux, &corr, naux, nmo);
-                    for (d, (a, b)) in y_m.data.iter_mut().zip(y0_m.data.iter().zip(sc.iter()))
-                    {
-                        *d = a + b;
+                    // The response is **column separable**: `corr = E diag(v) E^T qt` and
+                    // `sc = S corr` both act on each column of the right-hand side
+                    // independently, so cutting the `nmo` columns into fixed blocks needs
+                    // *no* reduction — every output entry is produced by exactly one block,
+                    // with the same accumulation order as the serial product — and the
+                    // per-worker scratch is one `naux * RESP_BLK` block (~0.5 MB here).
+                    let m_imag = &cache.m_imag;
+                    let lr_guard = self.lr_imag.borrow();
+                    let factor = &lr_guard[wi];
+                    let spans = index_blocks(nmo, RESP_BLK);
+                    let parts: Vec<(usize, Vec<f64>)> = spans
+                        .par_iter()
+                        .map(|&[c0, c1]| {
+                            let nc = c1 - c0;
+                            let corr =
+                                factor.correction_from_qt(&m_imag[c0 * naux..c1 * naux], nc);
+                            let cm = to_mat(&corr, naux, nc);
+                            let mut out = MatrixFull::new([naux, nc], 0.0);
+                            _dgemm_full(&s_metric_m, 'N', &cm, 'N', &mut out, 1.0, 0.0);
+                            (c0, out.data)
+                        })
+                        .collect();
+                    for (c0, data) in parts.iter() {
+                        let c0 = *c0;
+                        let nc = data.len() / naux;
+                        for (lc, c) in (c0..c0 + nc).enumerate() {
+                            let add = &data[lc * naux..(lc + 1) * naux];
+                            sc[c * naux..(c + 1) * naux].copy_from_slice(add);
+                            let base = &y0_m.data[c * naux..(c + 1) * naux];
+                            let dst = &mut y_m.data[c * naux..(c + 1) * naux];
+                            for i in 0..naux {
+                                dst[i] = base[i] + add[i];
+                            }
+                        }
                     }
                 } else if !cache.y_imag.is_empty() {
                     let (_u, y, y0) = &cache.y_imag[wi];
@@ -4420,10 +4472,41 @@ impl<'a> GwGradEngine<'a> {
                         y0a.data[base + r] = b * y0_m.data[base + r];
                     }
                 }
-                g0.data.fill(0.0);
-                _dgemm_full(&y0_m, 'N', &y0a, 'T', &mut g0, 1.0, 0.0);
-                v_unit.data.fill(0.0);
-                _dgemm_full(&y_m, 'N', &ya, 'T', &mut v_unit, 1.0, 0.0);
+                // Column-separable split of the two Gram matrices.  `g0[:, q]` depends only
+                // on column `q` of `y0a` and on the whole of `y0_m`, so cutting the *output*
+                // columns needs no reduction and keeps the serial accumulation order over
+                // `m` (one BLAS product per block, same `k` range) — the result is
+                // bit-for-bit the single-gemm one.  The second operand of a block is
+                // gathered into a small contiguous `[nc, nmo]` buffer, so the extra memory
+                // is `GRAM_BLK * (nmo + naux)` doubles per worker (~0.7 MB here) and not a
+                // second `naux x naux` accumulator per thread.
+                let parts: Vec<(usize, Vec<f64>, Vec<f64>)> = index_blocks(naux, GRAM_BLK)
+                    .par_iter()
+                    .map(|&[q0, q1]| {
+                        let nc = q1 - q0;
+                        let mut y0b = MatrixFull::new([nc, nmo], 0.0);
+                        let mut yb = MatrixFull::new([nc, nmo], 0.0);
+                        for (lc, q) in (q0..q1).enumerate() {
+                            // `y0b`/`yb` are col-major `[nc, nmo]`, so entry (lc, m)
+                            // sits at `lc + m * nc` (NOT `lc * nmo + m`).
+                            for m in 0..nmo {
+                                y0b.data[lc + m * nc] = y0a.data[q + m * naux];
+                                yb.data[lc + m * nc] = ya.data[q + m * naux];
+                            }
+                        }
+                        let mut g = MatrixFull::new([naux, nc], 0.0);
+                        _dgemm_full(&y0_m, 'N', &y0b, 'T', &mut g, 1.0, 0.0);
+                        let mut v = MatrixFull::new([naux, nc], 0.0);
+                        _dgemm_full(&y_m, 'N', &yb, 'T', &mut v, 1.0, 0.0);
+                        (q0, g.data, v.data)
+                    })
+                    .collect();
+                for (q0, gd, vd) in parts.iter() {
+                    let q0 = *q0;
+                    let nc = gd.len() / naux;
+                    g0.data[q0 * naux..(q0 + nc) * naux].copy_from_slice(gd);
+                    v_unit.data[q0 * naux..(q0 + nc) * naux].copy_from_slice(vd);
+                }
                 if grad_timing() {
                     T_PULL.with(|c| c.borrow_mut()[1] += t_gram.elapsed().as_secs_f64());
                 }
