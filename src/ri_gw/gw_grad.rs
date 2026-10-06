@@ -240,6 +240,19 @@ const GRAM_BLK: usize = 64;
 /// contracted either, so the split needs no reduction and no partial buffer).
 const RES_BLK: usize = 128;
 
+/// Upper bound on the number of *concurrent* workers of the memory-heavy
+/// integral-driven phases (the streamed fold and the perturbation contraction).
+///
+/// Those phases evaluate one auxiliary shell (fold) or one auxiliary batch
+/// (contraction) of raw integrals per task, and each task's block stays alive for
+/// as long as the task runs, so the resident set grows by `workers * block`.  The
+/// blocks are tens of MB at def2-TZVP, so an unbounded fan-out makes an
+/// eight-thread run peak well above a one-thread run on the same job.  Working in
+/// fixed chunks of `PAR_CAP` tasks keeps the extra resident set bounded and
+/// independent of the machine's core count without changing any value: the partial
+/// sums are still merged in index order.
+const PAR_CAP: usize = 4;
+
 // sub-step accumulators of the canonical-response assembly (seconds):
 // [0] j_deriv_from, [1] k_deriv_from, [2] compute_j_upper, [3] compute_k_upper
 thread_local! {
@@ -5728,10 +5741,16 @@ impl GwGradEngine<'_> {
         let rmol = &self.raw.mol;
         let raux = &self.raw.auxmol;
         let nbas_mol = rmol.nbas();
-        let parts: Vec<Vec<f64>> = batches
-            .par_iter()
-            .zip(targets.into_par_iter())
-            .map(|(&[f0, f1], dst)| {
+        let mut x_acc = vec![0.0f64; nao * nmo];
+        let mut targets = targets.into_iter();
+        let mut bi = 0usize;
+        while bi < batches.len() {
+            let hi = (bi + PAR_CAP).min(batches.len());
+            let chunk_targets: Vec<&mut [f64]> = targets.by_ref().take(hi - bi).collect();
+            let parts: Vec<Vec<f64>> = batches[bi..hi]
+                .par_iter()
+                .zip(chunk_targets.into_par_iter())
+                .map(|(&[f0, f1], dst)| {
                 let nshl_lo = loc.partition_point(|&f| f < f0);
                 let nshl_hi = loc.partition_point(|&f| f < f1);
                 let mut x_part = MatrixFull::new([nao, nmo], 0.0);
@@ -5775,14 +5794,15 @@ impl GwGradEngine<'_> {
                         dst[off..off + n2].copy_from_slice(&bp.data);
                     }
                 }
-                x_part.data
-            })
-            .collect();
-        let mut x_acc = vec![0.0f64; nao * nmo];
-        for xp in parts.iter() {
-            for (a, b) in x_acc.iter_mut().zip(xp.iter()) {
-                *a += *b;
+                    x_part.data
+                })
+                .collect();
+            for xp in parts.iter() {
+                for (a, b) in x_acc.iter_mut().zip(xp.iter()) {
+                    *a += *b;
+                }
             }
+            bi = hi;
         }
         let mut wm = MatrixFull::new([nmo, nmo], 0.0);
         let x = MatrixFull::from_vec([nao, nmo], x_acc).expect("fold: X shape");
@@ -9269,7 +9289,14 @@ impl GwGradEngine<'_> {
         // One parallel pass over the deterministic batches; each batch evaluates its own
         // `int3c2e_ip1`/`ip2` blocks (both, once) and reduces them to `[g_di | g_dm]`.
         let batches = raw.aux_perturbation_batches();
-        let parts: Vec<[f64; 6]> = batches
+        // Bounded fan-out: each task materialises one auxiliary batch of the raw
+        // derivative integrals (`nrow*nrow_A*nao*nb*3` doubles), so an unbounded
+        // fan-out would add `workers * block` to the resident set of the whole
+        // gradient.  The partial sums are merged in index order either way.
+        let mut bi = 0usize;
+        while bi < batches.len() {
+            let hi = (bi + PAR_CAP).min(batches.len());
+            let parts: Vec<[f64; 6]> = batches[bi..hi]
             .par_iter()
             .map(|&[f0, f1]| {
                 let (d1c, d2c) = crate::ri_gw::gw_grad::RawRiTensors::perturbation_batch_blocks_pure(
@@ -9359,14 +9386,16 @@ impl GwGradEngine<'_> {
                         acc[3 + comp] += cdm.iter().sum::<f64>();
                     }
                 }
-                acc
-            })
-            .collect();
-        for acc in parts.iter() {
-            for comp in 0..3 {
-                g_di[comp] += acc[comp];
-                g_dm[comp] += acc[3 + comp];
+                    acc
+                })
+                .collect();
+            for acc in parts.iter() {
+                for comp in 0..3 {
+                    g_di[comp] += acc[comp];
+                    g_dm[comp] += acc[3 + comp];
+                }
             }
+            bi = hi;
         }
         let mut out = [0.0f64; 3];
         for comp in 0..3 {
