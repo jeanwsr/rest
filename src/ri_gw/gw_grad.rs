@@ -2504,7 +2504,15 @@ impl<'a> GwGradEngine<'a> {
 
     /// Ensure the low-rank factors are resident (rebuilds them from `qtia` after `evict_qt`).
     fn ensure_lr(&self) {
-        if self.lr_grid.borrow().is_empty() && !self.config.skip_lr_cache {
+        // The guard must be evaluated in its **own scope**: `with_qtia` below can
+        // re-enter this function (`ensure_lr_grid_factor` -> `ensure_lr`), and a
+        // borrow still alive here would make the re-entry `borrow_mut()` panic
+        // with `RefCell already mutably borrowed`.
+        let need = {
+            let g = self.lr_grid.borrow();
+            g.is_empty()
+        };
+        if need && !self.config.skip_lr_cache {
             self.with_qtia(|qtia| {
                 let imag: Vec<LrFactor> = self
                     .quad
@@ -2533,10 +2541,14 @@ impl<'a> GwGradEngine<'a> {
     /// Make the real-axis factor of grid point `idx` resident, building it if
     /// this is the first time it is read.
     fn ensure_lr_grid_factor(&self, idx: usize) {
-        self.ensure_lr();
-        if self.lr_grid.borrow()[idx].is_some() {
+        let have = {
+            let g = self.lr_grid.borrow();
+            !g.is_empty() && g[idx].is_some()
+        };
+        if have {
             return;
         }
+        self.ensure_lr();
         let z = self.z_grid[idx];
         let factor = self.with_qtia(|qtia| {
             build_lr_factor_at(
@@ -2558,7 +2570,11 @@ impl<'a> GwGradEngine<'a> {
     /// evaluates at its first node, so the subtracted functional stays
     /// consistent with REST's own response protocol.
     fn ensure_lr_static(&self) {
-        if self.lr_static.borrow().is_some() || self.config.skip_lr_cache {
+        let have = {
+            let g = self.lr_static.borrow();
+            g.is_some()
+        };
+        if have || self.config.skip_lr_cache {
             return;
         }
         let factor = self.with_qtia(|qtia| {
@@ -2667,7 +2683,11 @@ impl<'a> GwGradEngine<'a> {
 
     /// Make sure `qt` is resident (see [`Self::with_qt`]).
     fn ensure_qt(&self) {
-        if self.qt.borrow().is_empty() && !self.config.skip_lr_cache {
+        let need = {
+            let g = self.qt.borrow();
+            g.is_empty()
+        };
+        if need && !self.config.skip_lr_cache {
             self.ensure_q();
             // same occupied-column prefix as the constructor (see `new_with_raw`)
             let ncol_occ = self.nocc * self.nmo;
@@ -2689,7 +2709,11 @@ impl<'a> GwGradEngine<'a> {
 
     /// Run `f` on the occupied-virtual block `qtia` (see [`Self::evict_qt`]).
     pub fn with_qtia<R>(&self, f: impl FnOnce(&[f64]) -> R) -> R {
-        if self.qtia.borrow().is_empty() && !self.config.skip_lr_cache {
+        let need = {
+            let g = self.qtia.borrow();
+            g.is_empty()
+        };
+        if need && !self.config.skip_lr_cache {
             self.ensure_qt();
             let (naux, nmo, nocc) = (self.naux, self.nmo, self.nocc);
             let qt = self.qt.borrow();
