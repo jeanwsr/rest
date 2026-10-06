@@ -1011,6 +1011,11 @@ impl RawRiTensors {
         (blk, f0, f1)
     }
 
+    /// Debug probe: is the raw-integral buffer currently mutably borrowed?
+    pub fn i3_dbg_try_borrow(&self) -> bool {
+        self.i3.try_borrow().is_err()
+    }
+
     /// Release the raw three-centre integrals (`nao^2 * naux` doubles).
     ///
     /// They are re-evaluated on demand by [`Self::with_i3`], so this only trades memory for the
@@ -3561,6 +3566,92 @@ impl<'a> GwGradEngine<'a> {
     /// representation is never needed there.
     pub fn build_target_cache_compact(&self, n: usize) -> QpCache {
         self.build_target_cache_with(n, false)
+    }
+
+    /// Build the QP caches of `targets` **in parallel**, sharing `self` through
+    /// the read-only [`SyncGw`] view.
+    ///
+    /// This is the one large serial block of the BSE gradient: at vitamin
+    /// C/def2-TZVP on an EPYC 9654 it is 128.9 s of the 434.7 s one-thread BSE
+    /// gradient (only 1.71x at 8 threads), while the screening assembly and the
+    /// BSE matrices together cost 0.15 s.  A cache is a pure function of the
+    /// geometry-fixed row table and the low-rank factors, so a per-orbital map
+    /// cannot change the numbers — but it does have to satisfy the invariant
+    /// below, which is why the warm-up lives here and not at the call site.
+    ///
+    /// # Invariant
+    ///
+    /// `build_target_cache_with` reaches five interior-mutable slots:
+    ///
+    /// | slot | reached through | filled by |
+    /// |---|---|---|
+    /// | `raw.i3` | `build_q` -> `raw.with_i3` | [`RawRiTensors::ensure_i3`] |
+    /// | `q` | `consts` -> `with_qt` -> `ensure_qt` -> `ensure_q` | `ensure_q` |
+    /// | `qt`, `qtia` | `ensure_qt`, `with_qtia` | `ensure_qt`, `with_qtia` |
+    /// | `lr_imag` | `ensure_lr` | `ensure_lr` |
+    /// | `lr_grid[*]`, `lr_static` | `ensure_lr_grid_factor`, `ensure_lr_static` | same |
+    ///
+    /// They are all materialised **serially and in that order** before the pool
+    /// starts: `q`/`qt` must precede the low-rank factors because `ensure_lr`'s
+    /// cold path goes back through `with_qtia` -> `ensure_qt` -> `ensure_q`, and
+    /// `raw.i3` must precede everything because `build_q` reads it.  Once they
+    /// are resident the guards short-circuit and the sweep only reads, which is
+    /// what makes `SyncGw` sound.
+    ///
+    /// **Not yet enabled in production.**  A residual cold path still trips
+    /// `ensure_q` under the parallel sweep (`RefCell already mutably borrowed`,
+    /// `gw_grad.rs`'s `ensure_q`); the `debug_assert`s below are there to make
+    /// that fail loudly instead of confusingly once the last path is found.  See
+    /// `docs/GW_BSE_并行效率优化方案.md` section 16 for the analysis and the
+    /// recommended fix (`OnceLock<Mutex<Option<..>>>`, which keeps `evict_*`'s
+    /// release-and-rebuild semantics that a plain `OnceLock` would lose).
+    pub fn build_target_caches_parallel(&self, targets: &[usize]) -> Vec<(usize, QpCache)> {
+        use rayon::prelude::*;
+        self.warm_lazy_caches();
+        debug_assert!(
+            !self.raw.i3_dbg_try_borrow(),
+            "build_target_caches_parallel: raw.i3 still borrowed after warm-up"
+        );
+        debug_assert!(
+            !self.q_dbg_try_borrow() && !self.qt_dbg_try_borrow() && !self.qtia_dbg_try_borrow(),
+            "build_target_caches_parallel: q/qt/qtia not resident after warm-up"
+        );
+        let gwv = SyncGw(self);
+        targets
+            .par_iter()
+            .map(|&n| (n, gwv.build_target_cache_compact(n)))
+            .collect()
+    }
+
+    /// Serial warm-up of every interior-mutable slot
+    /// [`Self::build_target_caches_parallel`] depends on.
+    ///
+    /// The order is a correctness condition; see that method.  `raw.i3` is
+    /// included because `build_q` reaches it through `RawRiTensors::with_i3`,
+    /// whose cold path (`*self.i3.borrow_mut() = i3`) is itself a
+    /// `RefCell already mutably borrowed` hazard for a parallel sweep.
+    pub fn warm_lazy_caches(&self) {
+        self.raw.ensure_i3();
+        self.ensure_q();
+        self.ensure_qt();
+        self.ensure_lr_static();
+        self.ensure_lr();
+        for idx in 0..self.z_grid.len() {
+            self.ensure_lr_grid_factor(idx);
+        }
+        self.ensure_lr_static();
+    }
+
+    /// Debug probes for the invariant of
+    /// [`Self::build_target_caches_parallel`].
+    pub fn q_dbg_try_borrow(&self) -> bool {
+        self.q.try_borrow().is_err()
+    }
+    pub fn qt_dbg_try_borrow(&self) -> bool {
+        self.qt.try_borrow().is_err()
+    }
+    pub fn qtia_dbg_try_borrow(&self) -> bool {
+        self.qtia.try_borrow().is_err()
     }
 
     /// Cache of the **static on-shell** quasiparticle energy
