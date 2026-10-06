@@ -3681,10 +3681,32 @@ impl<'a> GwGradEngine<'a> {
             "build_target_caches_parallel: q/qt/qtia not resident after warm-up"
         );
         let gwv = SyncGw(self);
-        targets
-            .par_iter()
-            .map(|&n| (n, gwv.build_target_cache_compact(n)))
-            .collect()
+        //
+        // **Bounded concurrency.**  Handing the whole target list to `par_iter`
+        // was measured to be a *net loss* on the whole gradient (vitamin
+        // C/def2-TZVP, EPYC 9654: `BSE build` 125.5 s -> 48.3 s, but the 1-vs-8
+        // gradient speedup fell from 2.75x to 2.16x and the peak rose from 6.9 GB
+        // to 7.6 GB) because every in-flight cache keeps its own QP-solve work
+        // arrays, so the workers contend for memory bandwidth.
+        //
+        // Building in batches of `batch` and trimming the arena between them
+        // keeps the peak near the serial level while still overlapping the
+        // integral-free part of the solves.
+        let batch = std::env::var("REST_QP_BUILD_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2)
+            .max(1);
+        let mut out: Vec<(usize, QpCache)> = Vec::with_capacity(targets.len());
+        for chunk in targets.chunks(batch) {
+            let part: Vec<(usize, QpCache)> = chunk
+                .par_iter()
+                .map(|&n| (n, gwv.build_target_cache_compact(n)))
+                .collect();
+            out.extend(part);
+            crate::hessian::memory_monitor::trim_to_os(0);
+        }
+        out
     }
 
     /// Serial warm-up of every interior-mutable slot

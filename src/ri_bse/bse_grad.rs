@@ -1660,15 +1660,24 @@ impl<'a> BseGradEngine<'a> {
         // resident and the *peak* RSS of the build alone reaches several GB.
         let mut qp_energies = vec![0.0f64; gw.nmo];
         let mut qp_caches: Vec<QpCache> = (0..gw.nmo).map(empty_qp_cache).collect();
-        // Measured on an EPYC 9654 at vitamin C/def2-TZVP: running this loop on
-        // the pool (via `GwGradEngine::build_target_caches_parallel`) does cut
-        // `BSE build` from 125.5 s to 48.3 s, but the *whole* BSE gradient gets
-        // **slower** (433.1 s -> 200.1 s one-thread vs eight-thread is 2.16x,
-        // against 2.75x with the serial loop) and the peak rises from 6.9 GB to
-        // 7.6 GB, because the concurrent build keeps every QP cache and the
-        // caches' own large work arrays resident at once.  The serial loop below
-        // is therefore the better trade; see
-        // `docs/GW_BSE_并行效率优化方案.md` section 19.
+        // **This loop stays serial.**  It is the one large serial block of the
+        // engine (vitamin C/def2-TZVP, EPYC 9654: 125.5 s of the 433.1 s
+        // one-thread BSE gradient, 1.68x at 8 threads), and its whole cost is the
+        // QP cache construction, so parallelising it looks like the obvious win --
+        // it does cut this phase to 48.3 s.  But the **whole gradient** then gets
+        // slower, on two independent variants that were measured:
+        //
+        // | QP build                  | BSE build | 8-thread gradient | peak |
+        // |---------------------------|-----------|-------------------|------|
+        // | serial (this loop)        |  125.5 s  |      **157.0 s**  | 6.9 GB |
+        // | whole list on the pool    |   48.3 s  |        200.1 s    | 7.6 GB |
+        // | bounded batches of 2      |   77.4 s  |        226.1 s    | 7.2 GB |
+        //
+        // The reason is the pullback: it needs every cache resident anyway, so the
+        // concurrent build only adds contention for memory bandwidth and cache,
+        // which the gradient phase pays back with interest.  A bounded batch of 3
+        // also trips a `RefCell` panic.  See
+        // `docs/GW_BSE_并行效率优化方案.md` section 20.
         for n in 0..gw.nmo {
             if needed(n) {
                 let c = gw.build_target_cache_compact(n);
