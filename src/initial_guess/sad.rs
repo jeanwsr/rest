@@ -47,6 +47,11 @@ pub fn initial_guess_from_sad(mol: &Molecule, mpi_operator: &Option<MPIOperator>
             atom_ctrl.scf_acc_eev = 1.0e-8;
             atom_ctrl.scf_acc_rho = 1.0e-8;
             atom_ctrl.scf_acc_etot = 1.0e-8;
+            // The atomic densities are only a guess, so their stopping rule is pinned here
+            // instead of following the molecular defaults: the guess must not move when a
+            // user retunes the SCF convergence of the actual calculation.
+            atom_ctrl.scf_conv_criteria = String::from("dm,eev");
+            atom_ctrl.scf_acc_g = 1.0e-5;
             let (spin, spin_channel, spin_polarization) = ctrl_setting_atom_sad(ielem);
             atom_ctrl.spin = spin;
             atom_ctrl.use_int_nelec = false;
