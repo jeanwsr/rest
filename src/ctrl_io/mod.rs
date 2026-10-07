@@ -302,6 +302,15 @@ pub struct InputKeywords {
     pub mix_param: f64,
     #[pyo3(get, set)]
     pub num_max_diis: usize,
+    /// Truncation threshold of the pseudo-inverse used by the DIIS solver (Pulay
+    /// coefficients are obtained from the Gram matrix of the error vectors). Larger
+    /// values discard more of the near-singular directions of that matrix, which
+    /// bounds the extrapolation coefficients.
+    pub diis_pinv_threshold: f64,
+    /// Whether the DIIS error vector is transformed to the orthonormal basis,
+    /// i.e. S^(-1/2) (FDS - SDF) S^(-1/2). PySCF and PyFock use the plain AO-basis
+    /// commutator; set this to false to reproduce that behaviour.
+    pub diis_orthogonalize_error: bool,
     #[pyo3(get, set)]
     pub start_diis_cycle: usize,
     #[pyo3(get, set)]
@@ -559,7 +568,7 @@ impl InputKeywords {
             pruning: String::from("nwchem"),
             rad_grid_method: String::from("treutler"),
             external_grids: "none".to_string(),
-            radii_adjust: String::from("becke"),
+            radii_adjust: String::from("treutler"),
             // ETB for autogen the auxbasis
             even_tempered_basis: false,
             etb_start_atom_number: 37,
@@ -572,12 +581,14 @@ impl InputKeywords {
             mixer: String::from("diis"),
             mix_param: 0.6,
             num_max_diis: 8,
+            diis_pinv_threshold: 1.0e-12,
+            diis_orthogonalize_error: true,
             start_diis_cycle: 1,
             start_check_oscillation: 20,
             level_shift : None, 
             max_scf_cycle: 100,
-            scf_acc_rho: 1.0e-6,
-            scf_acc_eev: 1.0e-5,
+            scf_acc_rho: 1.0e-5,
+            scf_acc_eev: 1.0e-3,
             scf_acc_etot:1.0e-8,
             scf_conv_criteria: String::from("dm,eev"),
             scf_acc_g: 1.0e-5,
@@ -1010,7 +1021,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
 
             tmp_input.radii_adjust = match tmp_ctrl.get("radii_adjust").unwrap_or(&serde_json::Value::Null){
                 serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
-                other => {String::from("becke")} // default: raw Bragg radii (REST historical behaviour)
+                other => {String::from("treutler")} // default: Treutler-Ahlrichs sqrt radii (PySCF/PyFock default)
             };
             //if tmp_input.print_level>0 {println!("The Becke radii adjustment will be {}", tmp_input.radii_adjust)};
 
@@ -1581,15 +1592,21 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 },
                 other => {None}
             };
+            // The default stopping rule stays "dm,eev". Only the density and eigenvalue
+            // thresholds are loosened (1e-6 -> 1e-5 and 1e-5 -> 1e-3), matching the level
+            // PySCF reaches by default; switching the criterion itself to the gradient
+            // norm moved analytic derivatives and thermochemistry by more than their
+            // regression tolerances, so "g" is left as an explicit user choice.
+            // scf_acc_etot still binds in every mode, so it keeps its historical value.
             tmp_input.scf_acc_rho = match tmp_ctrl.get("scf_acc_rho").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-6)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-6)},
-                other => {1.0e-8}
-            };
-            tmp_input.scf_acc_eev = match tmp_ctrl.get("scf_acc_eev").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-5)},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-5)},
-                other => {1.0e-6}
+                other => {1.0e-5}
+            };
+            tmp_input.scf_acc_eev = match tmp_ctrl.get("scf_acc_eev").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-3)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-3)},
+                other => {1.0e-3}
             };
             tmp_input.scf_acc_etot = match tmp_ctrl.get("scf_acc_etot").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-8)},
@@ -1622,6 +1639,16 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(8_usize)},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
                 other => {8_usize}
+            };
+            tmp_input.diis_pinv_threshold = match tmp_ctrl.get("diis_pinv_threshold").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-12)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-12)},
+                other => {1.0e-12}
+            };
+            tmp_input.diis_orthogonalize_error = match tmp_ctrl.get("diis_orthogonalize_error").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                serde_json::Value::String(tmp_str) => {matches!(tmp_str.to_lowercase().as_str(), "true" | "yes" | "on" | "1")},
+                other => {true}
             };
             tmp_input.start_diis_cycle = match tmp_ctrl.get("start_diis_cycle").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
