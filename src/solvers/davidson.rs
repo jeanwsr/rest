@@ -559,8 +559,11 @@ where
             None
         };
 
-        let (mut xpy, mut xmy, mut omega) = match cholesky_result {
-            Some((xp, xm, ow)) => (xp, xm, ow),
+        // `Some` → the Casida/Cholesky construction below returns `G Z` / `G^-T Z`,
+        // which still need the `omega^±1/2` rescaling; `None` → the direct-subspace
+        // (`dgeev`) branch already returns `X+Y` and `X-Y` themselves.
+        let (mut xpy, mut xmy, mut omega, scale_omega) = match cholesky_result {
+            Some((xp, xm, ow)) => (xp, xm, ow, true),
             None => {
                 // Cholesky fallback: solve [A B; -B -A] on the projected subspace
                 // Build 2m x 2m matrix H = [A_proj,  B_proj; -B_proj, -A_proj]
@@ -589,6 +592,21 @@ where
 
                 let (_, wr, wi, _vl, vr, _info) = _dgeev(&h_full, 'N', 'V');
 
+                if std::env::var("REST_DAV_DBG").is_ok() {
+                    let npos = wr.iter().filter(|w| **w > 1e-4).count();
+                    let nreal = wr
+                        .iter()
+                        .zip(wi.iter())
+                        .filter(|(w, i)| **w > 1e-4 && i.abs() < 1e-6)
+                        .count();
+                    eprintln!(
+                        "[davdbg] m={m} eig(2m)={} wr>1e-4: {npos}  real: {nreal}  \
+                         wr[:6]={:?}  |wi|max={:.3e}",
+                        wr.len(),
+                        &wr[..wr.len().min(6)],
+                        wi.iter().fold(0.0f64, |a, b| a.max(b.abs()))
+                    );
+                }
                 let mut pairs: Vec<(f64, Vec<f64>)> = wr
                     .iter()
                     .zip(wi.iter().zip(vr.iter_columns_full()))
@@ -616,23 +634,35 @@ where
                         xp[[i, k]] = vx + vy;
                         xm[[i, k]] = vx - vy;
                     }
-                    let omega_sqrt = val.sqrt();
-                    for i in 0..m {
-                        xp[[i, k]] /= omega_sqrt;
-                        xm[[i, k]] *= omega_sqrt;
-                    }
+                    // NOTE: no `omega^±1/2` rescaling here.  The caller applies
+                    // `xpy /= sqrt(omega)`, `xmy *= sqrt(omega)` once, after this
+                    // branch, and the residual definition assumes exactly that
+                    // convention (`xpy = X+Y`, `xmy = X-Y`).  Scaling a second time
+                    // here left the Ritz vectors and the residual mutually
+                    // inconsistent, so `left:N/...` never converged and the solver
+                    // restarted until `max_iter` (acene BSE runs).
                 }
-                (xp, xm, ow)
+                (xp, xm, ow, false)
             }
         };
         // debug!("Subspace xmy:");
         // xmy.formated_output(1000,"full");
         let n_omega = omega.len();
-        for j in 0..n_omega {
-            let eig = omega[j];
-            for i in 0..m {
-                xmy[[i, j]] *= eig.sqrt();
-                xpy[[i, j]] /= eig.sqrt();
+        // Rescale only the Casida branch.  Applying `omega^±1/2` to the direct-subspace
+        // vectors as well made the two residuals mutually inconsistent: they are
+        // defined as `(A-B)(X-Y) - omega(X+Y)` and `(A+B)(X+Y) - omega(X-Y)`, which
+        // vanish together only for the *unscaled* `X±Y` — while the Casida branch's
+        // `G Z` / `G^-T Z` are the `omega^±1/2`-scaled combinations by construction.
+        // With the extra scaling the second residual could never fall below the
+        // tolerance, so a BSE Davidson run (indefinite `A-B`, i.e. always this branch)
+        // cycled through restarts until `max_iter` without converging.
+        if scale_omega {
+            for j in 0..n_omega {
+                let eig = omega[j];
+                for i in 0..m {
+                    xmy[[i, j]] *= eig.sqrt();
+                    xpy[[i, j]] /= eig.sqrt();
+                }
             }
         }
         let n_omega = omega.len();
@@ -719,11 +749,33 @@ where
             x_solutions = x_solutions_prev.clone();
             y_solutions = y_solutions_prev.clone();
             eigenvalues = eigenvalues_prev.clone();
+            // Restart from the best vectors that actually exist.  `x_solutions` only
+            // ever receives **converged** solutions, so on an early divergence it is
+            // still empty and `.take(restart_dim)` yields nothing; the subspace was
+            // then left with zero columns, and the next iteration fed `n = 0` to
+            // LAPACK (`DPOTRF`/`DGEEV` "illegal value" warnings, whose fallback then
+            // produced no roots) and finally hit `chunks_exact(0)` in
+            // `MatrixFull::iter_columns_full` — the "chunk size must be non-zero"
+            // panic seen on acene/def2-SVP BSE runs.  The current Ritz vectors
+            // (`xpy_full`, always at least one column here) are the natural source,
+            // exactly as in the explicit `restart` branch below.
+            let src: &MatrixFull<f64> = if x_solutions.size[1] > 0 {
+                &x_solutions
+            } else {
+                &xpy_full
+            };
             ss = MatrixFull::new([xlen, 0], 0.0);
-            x_solutions
-                .iter_columns_full()
-                .take(config.restart_dim)
+            // Keep at least one vector per tracked root: a subspace smaller than the
+            // root count cannot represent the Ritz vectors it is supposed to carry, so
+            // the solver would restart forever without ever passing the convergence
+            // test (`restart_dim = 6` against `nroots = 7` was exactly that).
+            src.iter_columns_full()
+                .take(cmp::max(config.restart_dim, nroots))
                 .for_each(|xi| ss.push_column(xi));
+            if ss.size[1] == 0 {
+                // last resort: never continue with an empty subspace
+                ss = generate_initial_guess(diag, nroots);
+            }
             max_dx_last = 1e9;
             continue;
         }
@@ -750,9 +802,10 @@ where
         if restart {
             debug!("Explicit LR restart: subspace {} -> restart_dim {}", ss.size[1], config.restart_dim);
             ss = MatrixFull::new([xlen, 0], 0.0);
+            // never restart below the tracked root count (see the divergence branch)
             xpy_full
                 .iter_columns_full()
-                .take(config.restart_dim)
+                .take(cmp::max(config.restart_dim, nroots))
                 .for_each(|xi| ss.push_column(xi));
         }
         left_residues.iter_columns_full().enumerate().for_each(|(i, residue)| {

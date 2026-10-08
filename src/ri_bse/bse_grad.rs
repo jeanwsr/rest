@@ -522,7 +522,8 @@ pub fn solve_bse_davidson(
     dim: usize,
     nroots: usize,
     config: &DavidsonConfig,
-) -> Vec<(f64, Vec<f64>, Vec<f64>)> {
+) -> Option<Vec<(f64, Vec<f64>, Vec<f64>)>> {
+    let mut failed = false;
     let nrun = (nroots + 2).min(dim);
     // The solver applies `A`/`B` to the **whole subspace block** every
     // iteration, so the matvec must be a gemm: the per-vector closure API
@@ -545,16 +546,18 @@ pub fn solve_bse_davidson(
     let guess = generate_initial_guess(&diag, nrun);
     let mut pairs = lr_davidson_solver_batched(&mut a_mv, &mut b_mv, nrun, &diag, guess, config);
     pairs.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
-    assert!(
-        pairs.len() >= nroots,
-        "bse_grad: Davidson returned only {} of {} requested roots (dim={}); \
-         increase max_subspace/max_iter or use the dense solver",
-        pairs.len(),
-        nroots,
-        dim
-    );
+    if pairs.len() < nroots {
+        eprintln!(
+            "[bse_grad] Davidson returned only {} of {} requested roots (dim={}); increase \
+             max_subspace/max_iter, or use the dense solver",
+            pairs.len(),
+            nroots,
+            dim
+        );
+        return None;
+    }
 
-    pairs
+    let out: Vec<(f64, Vec<f64>, Vec<f64>)> = pairs
         .into_iter()
         .take(nroots)
         .map(|(omega, vec)| {
@@ -571,15 +574,21 @@ pub fn solve_bse_davidson(
             let res = (r1.iter().map(|v| v * v).sum::<f64>().sqrt()
                 + r2.iter().map(|v| v * v).sum::<f64>().sqrt())
                 / scale;
-            assert!(
-                res < 1.0e-6,
-                "bse_grad: Davidson root omega={:.10} failed the BSE residual check ({:.3e}); \
-                 increase eigen_tol/max_subspace or use the dense solver",
-                omega, res
-            );
+            if res >= 1.0e-6 {
+                eprintln!(
+                    "[bse_grad] Davidson root omega={:.10} failed the BSE residual check ({:.3e}); \
+                     increase eigen_tol/max_subspace or use the dense solver",
+                    omega, res
+                );
+                failed = true;
+            }
             (omega, x, y)
         })
-        .collect()
+        .collect();
+    if failed {
+        return None;
+    }
+    Some(out)
 }
 
 /// Residuals of the original non-Hermitian BSE equations for one root.
@@ -1593,6 +1602,17 @@ pub struct BseGradEngine<'a> {
     /// weight vanishes, so the gradient never needs them.
     pub qp_caches: Vec<QpCache>,
     pub roots: Vec<BseRoot>,
+    /// Which of the solved roots the analytic gradient is assembled for.
+    ///
+    /// `None` (the default) differentiates **every** solved root.  Solving more
+    /// roots than are differentiated is a first-class configuration: an iterative
+    /// solver needs the extra roots to converge the lowest one, while the gradient
+    /// assembly (the per-root QP pullback covectors, the CP-HF response and its
+    /// `naux^2` intermediates) is by far the dominant cost, so restricting the
+    /// list keeps both its time and its peak at one root's worth.
+    pub grad_roots: Option<Vec<usize>>,
+    /// Solver that produced `roots` (see [`Self::solver_used`]).
+    solver_used: &'static str,
     /// Screening energies the static screening was built from — kept so that
     /// [`BseGradEngine::ensure_screening`] can rebuild the blocks after
     /// [`BseScreening::release_blocks`] (`nmo` doubles).
@@ -1744,6 +1764,8 @@ impl<'a> BseGradEngine<'a> {
             qp_energies,
             qp_caches,
             roots: Vec::new(),
+            grad_roots: None,
+            solver_used: "dense",
             eps_screen,
         }
     }
@@ -1792,15 +1814,63 @@ impl<'a> BseGradEngine<'a> {
         self.ensure_screening();
         let (a_mat, b_mat) = build_bse_matrices(&self.screen, &self.qp_energies, self.kappa);
         let dim = self.screen.nocc * self.screen.nvir;
-        self.roots = match solver {
-            BseSolver::Dense => solve_bse_dense(&a_mat, &b_mat, dim, nroots),
-            BseSolver::Davidson => {
-                solve_bse_davidson(&a_mat, &b_mat, dim, nroots, config)
+        let (pairs, used) = match solver {
+            BseSolver::Dense => (solve_bse_dense(&a_mat, &b_mat, dim, nroots), "dense"),
+            // The Davidson path is wrapped: on an indefinite `A-B` its internal
+            // Cholesky/`_dinverse`/`_dgeev` calls can still panic (LAPACK argument or
+            // definiteness errors that its own `catch_unwind` does not cover), and a
+            // failed attempt must degrade to the dense route rather than abort the
+            // job.
+            BseSolver::Davidson => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || solve_bse_davidson(&a_mat, &b_mat, dim, nroots, config),
+            ))
+            .unwrap_or(None)
+            {
+                Some(p) => (p, "davidson"),
+                None => {
+                    eprintln!(
+                        "[bse_grad] Davidson did not deliver {nroots} roots (dim={dim}); falling \
+                         back to the dense solver, which reduces to the dim-dimensional \
+                         P = (A-B)(A+B) problem instead of the 2-block form"
+                    );
+                    (solve_bse_dense(&a_mat, &b_mat, dim, nroots), "dense")
+                }
+            },
+        };
+        self.solver_used = used;
+        self.roots = pairs
+            .into_iter()
+            .map(|(omega, x, y)| BseRoot { omega, x, y })
+            .collect();
+    }
+
+    /// Restrict the analytic gradient to these solved roots (see
+    /// [`Self::grad_roots`]).  `None` restores "every solved root".
+    pub fn set_grad_roots(&mut self, roots: Option<Vec<usize>>) {
+        if let Some(idx) = &roots {
+            for &k in idx {
+                assert!(k < self.roots.len(), "set_grad_roots: root {k} was not solved");
             }
         }
-        .into_iter()
-        .map(|(omega, x, y)| BseRoot { omega, x, y })
-        .collect();
+        self.grad_roots = roots;
+    }
+
+    /// Indices of the roots [`Self::analytic_gradients`] will differentiate, in
+    /// the order it returns them.
+    pub fn grad_root_indices(&self) -> Vec<usize> {
+        match &self.grad_roots {
+            Some(v) => v.clone(),
+            None => (0..self.roots.len()).collect(),
+        }
+    }
+
+    /// Which solver actually produced [`Self::roots`]: `"dense"` or `"davidson"`.
+    ///
+    /// [`Self::solve`] falls back to the dense path when a Davidson request cannot
+    /// be satisfied (see [`solve_bse_davidson`]), so this is what the numbers were
+    /// really computed with.
+    pub fn solver_used(&self) -> &'static str {
+        self.solver_used
     }
 
     /// Excitation energies of the solved roots.
@@ -1817,7 +1887,9 @@ impl<'a> BseGradEngine<'a> {
         // lists; returning them to the OS before the first large transient of
         // the assembly keeps that transient (and hence the peak) lower.
         crate::hessian::memory_monitor::trim_to_os(0);
-        let nk = self.roots.len();
+        // Only the requested roots are assembled; see `Self::grad_roots`.
+        let sel = self.grad_root_indices();
+        let nk = sel.len();
         let naux = self.gw.naux;
         let nmo = self.gw.nmo;
         let nocc = self.gw.nocc;
@@ -1828,7 +1900,8 @@ impl<'a> BseGradEngine<'a> {
         let mut bj_k: Vec<Vec<f64>> = Vec::with_capacity(nk);
         let mut theta_k: Vec<Option<KernelVjpCompact>> = Vec::with_capacity(nk);
         let t_kernel = Instant::now();
-        for root in &self.roots {
+        for &k in sel.iter() {
+            let root = &self.roots[k];
             // amplitude weights cover the occupied orbitals and the active
             // virtuals; inactive virtuals carry zero QP weight
             let w_act = qp_gap_weights(&root.x, &root.y, nocc, nvir);
@@ -2221,7 +2294,7 @@ impl<'a> BseGradEngine<'a> {
                 }
             );
         }
-        let omegas = self.roots.iter().map(|r| r.omega).collect();
+        let omegas: Vec<f64> = sel.iter().map(|&k| self.roots[k].omega).collect();
         if grad_timing() {
             eprintln!("[bse_grad mem] contraction:     rss {:.0} MB", crate::hessian::memory_monitor::current_rss_mb());
         }

@@ -6360,9 +6360,24 @@ impl GwGradEngine<'_> {
         // of the whole engine (`&GwGradEngine` is not `Sync`)
         let scf_ref = &self.scf;
         let c_mo_data = &self.c_mo.data;
-        let per_pert: Vec<PertOut> = {
+        // Bounded fan-out.  Each perturbation materialises its own
+        // `int3c2e_ip1`/`ip2` blocks (`nrow_A*nao*naux*3` + `nao^2*naux_A*3` doubles,
+        // hundreds of MB on an acene) *and* drives the RI-JK builders, whose per-task
+        // buffers are also sized by the number of running workers.  An unbounded
+        // fan-out therefore makes the peak of this phase scale with the core count:
+        // on the 16-core AMD9654 queue the acene series needed 8 GB (benzene), 31 GB
+        // (naphthalene) and 77 GB (anthracene) and tetracene then hit the job's
+        // 134 GB memory limit.  Working in fixed chunks of `PAR_CAP` perturbations
+        // keeps the extra resident set bounded (the inner RI-JK parallelism still
+        // uses the whole pool), and the results are unchanged because every
+        // perturbation is independent.
+        let mut per_pert: Vec<PertOut> = Vec::with_capacity(natm * 3);
+        let mut k0 = 0usize;
+        while k0 < natm * 3 {
+            let k1 = (k0 + PAR_CAP).min(natm * 3);
+            let part: Vec<PertOut> = {
             use rayon::prelude::*;
-            (0..natm * 3)
+            (k0..k1)
                 .into_par_iter()
                 .map(|k_pert| {
                     let atm = k_pert / 3;
@@ -6425,7 +6440,10 @@ impl GwGradEngine<'_> {
                     PertOut { t_dij, t_skel, t_fin, sub, resp, dbg }
                 })
                 .collect()
-        };
+            };
+            per_pert.extend(part);
+            k0 = k1;
+        }
         let mut responses: Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> = Vec::with_capacity(natm * 3);
         let mut debug: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> =
             Vec::with_capacity(natm * 3);
