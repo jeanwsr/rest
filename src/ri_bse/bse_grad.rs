@@ -1601,6 +1601,61 @@ pub struct BseRoot {
     pub y: Vec<f64>,
 }
 
+/// Linear-response **stability** of the BSE reference state, i.e. the spectra of
+/// the two symmetric blocks of the BSE Hamiltonian `[[A, B], [B, A]]`.
+///
+/// Both solvers depend on their definiteness, silently:
+///
+/// * the Davidson route factorises `A - B` with a Cholesky (the Casida form is
+///   only defined for a positive-definite `A - B`), and
+/// * the dense route forms `P = (A - B)(A + B)` and inverse-iterates through
+///   `P - omega^2`.
+///
+/// With `A = diag(gap_qp) + kappa*v_bare - W_A` and `B = kappa*v_bare - W_B`
+/// the resonant difference is
+///
+/// ```text
+/// A - B = diag(gap_qp) - (W_A - W_B),
+/// ```
+///
+/// so when the screened direct kernel overwhelms the quasiparticle gap -- which
+/// is what the longer linear acenes do -- `A - B` acquires a negative
+/// eigenvalue, the reference state is triplet-unstable and *neither* route is
+/// valid.  The smallest eigenvalue of `A - B` is therefore the quantity to
+/// watch before committing hours to a gradient, and [`BseGradEngine::stability`]
+/// computes it from the same matrices `solve` would build.
+pub struct BseStability {
+    /// Dimension of the transition space (`nocc * nvir`).
+    pub dim: usize,
+    /// Smallest quasiparticle gap on the diagonal of `A` (Ha).
+    pub gap_min: f64,
+    /// Eigenvalues of `A - B`, ascending (Ha of the BSE Hamiltonian; `A - B` is
+    /// the block whose smallest eigenvalue must stay positive).
+    pub amb: Vec<f64>,
+    /// Eigenvalues of `A + B`, ascending.
+    pub apb: Vec<f64>,
+}
+
+impl BseStability {
+    /// Smallest eigenvalue of `A - B`.
+    pub fn amb_min(&self) -> f64 {
+        self.amb.first().copied().unwrap_or(f64::NAN)
+    }
+    /// Smallest eigenvalue of `A + B`.
+    pub fn apb_min(&self) -> f64 {
+        self.apb.first().copied().unwrap_or(f64::NAN)
+    }
+    /// Number of negative eigenvalues of `A - B`.
+    pub fn amb_negative(&self) -> usize {
+        self.amb.iter().filter(|w| **w < 0.0).count()
+    }
+    /// Whether both blocks are positive definite, i.e. whether the reference
+    /// state is stable and both BSE solvers are applicable.
+    pub fn stable(&self) -> bool {
+        self.amb_min() > 0.0 && self.apb_min() > 0.0
+    }
+}
+
 /// The static-BSE analytic-gradient engine for one geometry.
 pub struct BseGradEngine<'a> {
     pub gw: &'a GwGradEngine<'a>,
@@ -1858,6 +1913,36 @@ impl<'a> BseGradEngine<'a> {
             .into_iter()
             .map(|(omega, x, y)| BseRoot { omega, x, y })
             .collect();
+    }
+
+    /// Linear-response stability of the reference state (see [`BseStability`]).
+    ///
+    /// Builds the same two dense blocks [`Self::solve`] would build and
+    /// diagonalises them, and touches nothing else of the engine: it is the
+    /// cheap pre-flight that says whether a Davidson/dense solve of this system
+    /// is legitimate *before* the gradient spends hours on it.
+    pub fn stability(&mut self) -> BseStability {
+        self.ensure_screening();
+        let (a_mat, b_mat) = build_bse_matrices(&self.screen, &self.qp_energies, self.kappa);
+        let dim = self.screen.nocc * self.screen.nvir;
+        let block = |sign: f64| -> MatrixFull<f64> {
+            MatrixFull::from_vec(
+                [dim, dim],
+                (0..dim * dim).map(|k| a_mat[k] + sign * b_mat[k]).collect(),
+            )
+            .expect("bse_grad: A +- B block shape")
+        };
+        let (_, amb, _) = _dsyevd(&block(-1.0), 'N');
+        let (_, apb, _) = _dsyevd(&block(1.0), 'N');
+        let gap_min = (0..dim)
+            .map(|k| a_mat[k + k * dim])
+            .fold(f64::INFINITY, f64::min);
+        BseStability {
+            dim,
+            gap_min,
+            amb,
+            apb,
+        }
     }
 
     /// Restrict the analytic gradient to these solved roots (see

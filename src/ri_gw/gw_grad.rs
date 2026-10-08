@@ -253,6 +253,21 @@ const RES_BLK: usize = 128;
 /// sums are still merged in index order.
 const PAR_CAP: usize = 4;
 
+/// [`PAR_CAP`], overridable through `REST_PAR_CAP`.
+///
+/// On a machine with a hard per-job memory limit the fan-out is the knob that
+/// decides whether a large system fits at all (tetracene/def2-TZVP at 16
+/// threads is 49.8 GB at `PAR_CAP = 4` and above the 134 GB job limit with no
+/// cap at all), so the study that produced those numbers runs the largest
+/// systems through this override instead of a rebuild.
+fn par_cap() -> usize {
+    std::env::var("REST_PAR_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(PAR_CAP)
+}
+
 // sub-step accumulators of the canonical-response assembly (seconds):
 // [0] j_deriv_from, [1] k_deriv_from, [2] compute_j_upper, [3] compute_k_upper
 thread_local! {
@@ -5766,7 +5781,7 @@ impl GwGradEngine<'_> {
         let mut targets = targets.into_iter();
         let mut bi = 0usize;
         while bi < batches.len() {
-            let hi = (bi + PAR_CAP).min(batches.len());
+            let hi = (bi + par_cap()).min(batches.len());
             let chunk_targets: Vec<&mut [f64]> = targets.by_ref().take(hi - bi).collect();
             let parts: Vec<Vec<f64>> = batches[bi..hi]
                 .par_iter()
@@ -6395,7 +6410,7 @@ impl GwGradEngine<'_> {
         let mut per_pert: Vec<PertOut> = Vec::with_capacity(natm * 3);
         let mut k0 = 0usize;
         while k0 < natm * 3 {
-            let k1 = (k0 + PAR_CAP).min(natm * 3);
+            let k1 = (k0 + par_cap()).min(natm * 3);
             let part: Vec<PertOut> = {
             use rayon::prelude::*;
             (k0..k1)
@@ -9334,7 +9349,7 @@ impl GwGradEngine<'_> {
         // gradient.  The partial sums are merged in index order either way.
         let mut bi = 0usize;
         while bi < batches.len() {
-            let hi = (bi + PAR_CAP).min(batches.len());
+            let hi = (bi + par_cap()).min(batches.len());
             let parts: Vec<[f64; 6]> = batches[bi..hi]
             .par_iter()
             .map(|&[f0, f1]| {
