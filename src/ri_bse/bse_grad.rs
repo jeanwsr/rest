@@ -467,7 +467,23 @@ pub fn solve_bse_dense(
             let pmm = to_mat(&pm, dim, dim);
             let mut z = u.clone();
             for _ in 0..3 {
-                let sol = _dsolve(&pmm, &z).expect("bse_grad: inverse iteration failed");
+                // The shifted system can be numerically singular when two roots are
+                // nearly degenerate (the acene singlets are), and `_dpotrf` then panics
+                // inside `_dsolve`; keep the un-refined `dgeev` vector rather than
+                // aborting a run that has already spent an hour in the SCF/GW/BSE
+                // build.  The root is still verified below by the BSE residual.
+                let solved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    _dsolve(&pmm, &z)
+                }))
+                .unwrap_or(None);
+                let Some(sol) = solved else {
+                    eprintln!(
+                        "[bse_grad] dense BSE: inverse-iteration refinement failed for \
+                         omega={omega:.6} (shifted system not positive definite); keeping the \
+                         dgeev vector"
+                    );
+                    break;
+                };
                 let zn = sol.iter().map(|v| v * v).sum::<f64>().sqrt();
                 for r in 0..dim {
                     z[r] = sol[r] / zn;

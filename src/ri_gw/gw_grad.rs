@@ -773,8 +773,18 @@ impl RawRiTensors {
     /// The closure runs while the buffer is borrowed; nested readers are fine (they only take
     /// shared borrows), but nothing inside may evict.
     pub fn with_i3<R>(&self, f: impl FnOnce(&[f64]) -> R) -> R {
-        self.ensure_i3();
-        f(&self.i3.borrow())
+        // Never panic on a concurrent rebuild: `i3` is read by several rayon workers
+        // (the canonical CP-HF assembly, the QP cache build) and its cold path assigns
+        // through `borrow_mut`.  Retry until a shared borrow of a resident buffer is
+        // available; `ensure_i3` itself is written to be panic-free.
+        loop {
+            if let Ok(g) = self.i3.try_borrow() {
+                if !g.is_empty() {
+                    return f(&g);
+                }
+            }
+            self.ensure_i3();
+        }
     }
 
     /// Rebuild the three-centre integrals when they are not resident.
@@ -782,7 +792,14 @@ impl RawRiTensors {
     /// Callers that keep a [`std::cell::Ref`] guard for a whole routine (the TDDFT gradient's
     /// Coulomb/`Y` helpers) call this once on entry, then borrow `i3` directly.
     pub fn ensure_i3(&self) {
-        if self.i3.borrow().is_empty() {
+        // `try_borrow`/`try_borrow_mut` throughout: a worker may hold the borrow while
+        // another one rebuilds, and a panic there kills the whole gradient.  A losing
+        // racer simply drops its redundant integral evaluation.
+        let empty = match self.i3.try_borrow() {
+            Ok(g) => g.is_empty(),
+            Err(_) => return,
+        };
+        if empty {
             let t0 = Instant::now();
             let (i3, shape3) =
                 CInt::integrate_cross("int3c2e", [&self.mol, &self.mol, &self.auxmol], "s1", None).into();
@@ -794,7 +811,11 @@ impl RawRiTensors {
                 );
             }
             assert_eq!(shape3, vec![self.nao, self.nao, self.naux], "int3c2e s1 shape");
-            *self.i3.borrow_mut() = i3;
+            if let Ok(mut slot) = self.i3.try_borrow_mut() {
+                if slot.is_empty() {
+                    *slot = i3;
+                }
+            }
         }
     }
 
