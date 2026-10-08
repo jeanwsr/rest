@@ -91,6 +91,7 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     }
     tmp_input.analdrv = parse_analdrv_keywords(tmp_keys);
     tmp_input.output = parse_output_keywords(tmp_keys);
+    resolve_cube_keywords(&mut tmp_input, tmp_keys);
     Ok((tmp_input,tmp_geomcell))
 }
 
