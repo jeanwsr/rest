@@ -29,6 +29,8 @@ pub mod ri_jk_io;
 pub mod ri_pt2_io;
 pub use ri_jk_io::*;
 pub use ri_pt2_io::*;
+pub mod output;
+pub use output::*;
 
 mod pyrest_ctrl_io;
 mod geometric_pyo3_io;
@@ -90,41 +92,6 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
     tmp_input.analdrv = parse_analdrv_keywords(tmp_keys);
     tmp_input.output = parse_output_keywords(tmp_keys);
     Ok((tmp_input,tmp_geomcell))
-}
-
-/// Options of the `[output]` block of the control input.
-#[derive(Debug,Clone,Serialize, Deserialize)]
-#[serde(default)]
-pub struct OutputKeywords {
-    /// Dump the density matrices into the fchk file: "auto" (default) dumps
-    /// every density that has been calculated (`Total/Spin SCF Density`, and
-    /// for double-hybrid runs additionally `Total/Spin MP2 Density`), "scf"
-    /// dumps only the SCF density, "false" dumps none.
-    pub fchk_dm: String,
-    /// Which writer generates the Gaussian-ordered content of the fchk file
-    /// (MO coefficients, and the density layout they must agree with):
-    /// "default" (the MOKIT-derived librest2fch library when compiled in, the
-    /// native Rust writer otherwise), "librest2fch" or "rust". The density
-    /// itself is always computed by REST; the librest2fch path preserves it
-    /// (its own gen_density branch is not used, since it would rebuild the
-    /// density from aufbau occupations and drop the UHF spin density). Note
-    /// that omitting the density (`fchk_dm = "false"`) requires a librest2fch
-    /// library recent enough to honor `gen_density = 0` (MOKIT since 2026-10);
-    /// older libraries always dump the density.
-    pub fchk_writer: String,
-}
-
-impl Default for OutputKeywords {
-    fn default() -> Self {
-        OutputKeywords { fchk_dm: String::from("auto"), fchk_writer: String::from("default") }
-    }
-}
-
-pub fn parse_output_keywords(tmp_keys: &serde_json::Value) -> OutputKeywords {
-    match tmp_keys.get("output") {
-        Some(tmp_output) => serde_json::from_value(tmp_output.clone()).unwrap(),
-        None => OutputKeywords::default(),
-    }
 }
 
 const VALID_TOP_LEVEL_BLOCKS: &[&str] = &[
