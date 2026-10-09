@@ -15,6 +15,8 @@ pub struct ScfTraceRecord {
     pub num_max_records: usize,
     pub mix_param: f64,
     pub start_diis_cycle: usize,
+    /// Truncation threshold of the pseudo-inverse in `diis_solver`.
+    pub diis_pinv_threshold: f64,
     //pub scf_energy : Vec<f64>,
     //pub density_matrix: Vec<[MatrixFull<f64>;2]>,
     //pub eigenvectors: Vec<[MatrixFull<f64>;2]>,
@@ -49,7 +51,7 @@ pub struct ScfTraceRecord {
 }
 
 impl ScfTraceRecord {
-    pub fn new(num_max_records: usize, mix_param: f64, mixer: String,start_diis_cycle: usize) -> ScfTraceRecord {
+    pub fn new(num_max_records: usize, mix_param: f64, mixer: String, start_diis_cycle: usize, diis_pinv_threshold: f64) -> ScfTraceRecord {
         if num_max_records==0 {
             println!("Error: num_max_records cannot be 0");
         }
@@ -59,6 +61,7 @@ impl ScfTraceRecord {
             mix_param,
             num_max_records,
             start_diis_cycle,
+            diis_pinv_threshold,
             scf_energy : 0.0,
             smearing_entropy: 0.0,
             energy_records: vec![],
@@ -89,15 +92,35 @@ impl ScfTraceRecord {
             scf.mol.ctrl.num_max_diis, 
             scf.mol.ctrl.mix_param.clone(), 
             scf.mol.ctrl.mixer.clone(),
-            scf.mol.ctrl.start_diis_cycle.clone()
+            scf.mol.ctrl.start_diis_cycle.clone(),
+            scf.mol.ctrl.diis_pinv_threshold
         );
         tmp_records.scf_energy=scf.scf_energy;
         tmp_records.eigenvectors=scf.eigenvectors.clone();
         tmp_records.eigenvalues=scf.eigenvalues.clone();
         tmp_records.density_matrix=[scf.density_matrix.clone(),scf.density_matrix.clone()];
         let ovlp_full = scf.ovlp.to_matrixfull().unwrap();
-        if let Some((_sqrt_a, sqrt_inv_a, _rank)) = _get_sqrt_and_inv_sqrt(&ovlp_full, SQRT_THRESHOLD) {
-            tmp_records.sqrt_inv_ovlp = Some(sqrt_inv_a);
+        if scf.mol.ctrl.diis_orthogonalize_error {
+            if let Some((_sqrt_a, sqrt_inv_a, _rank)) = _get_sqrt_and_inv_sqrt(&ovlp_full, SQRT_THRESHOLD) {
+                tmp_records.sqrt_inv_ovlp = Some(sqrt_inv_a);
+            }
+        }
+        // Seed the DIIS history with the initial guess. The first
+        // prepare_next_input call then already holds two records and can
+        // extrapolate. Without this seed its Gram system is 1x1, the
+        // coefficients are [1], and the extrapolation effectively begins one
+        // update later. Restricted to the plain "diis" mixer and to the default
+        // start cycle so that the EDIIS/ADIIS paths and explicit
+        // start_diis_cycle settings keep their existing history semantics.
+        if tmp_records.mixer.eq(&"diis") && scf.mol.ctrl.start_diis_cycle <= 1 {
+            let mut dm_for_err = [tmp_records.density_matrix[0].clone(),
+                                  tmp_records.density_matrix[1].clone()];
+            let (guess_err, guess_target) = generate_diis_error_vector(
+                &scf.hamiltonian, &scf.ovlp, &mut dm_for_err,
+                scf.mol.spin_channel, &tmp_records.sqrt_inv_ovlp,
+                &scf.scftype, &scf.roothaan_hamiltonian);
+            tmp_records.error_vector.push(guess_err);
+            tmp_records.target_vector.push(guess_target);
         }
         if tmp_records.mixer.eq(&"ediis") || tmp_records.mixer.eq(&"ediis+diis") || tmp_records.mixer.eq(&"adiis+diis") {
             tmp_records.ediis_density.push([scf.density_matrix[0].clone(),
@@ -268,7 +291,8 @@ impl ScfTraceRecord {
 
 
             // solve the DIIS against the error vector
-            if let Some(coeff) = diis_solver(&self.error_vector, &self.error_vector.len()) {
+            if let Some(coeff) = diis_solver(&self.error_vector, &self.error_vector.len(), self.diis_pinv_threshold) {
+                debug!("DIIS extrapolation: num_iter={} history={} start_cycle={} coeff={:?}", self.num_iter, self.error_vector.len(), start_pulay, coeff);
                 if let SCFType::ROHF = scf.scftype {
                     let mut next_roothaan = MatrixFull::new(self.target_vector[0][0].size.clone(), 0.0);
                     coeff.iter().enumerate().for_each(|(i, value)| {
@@ -443,7 +467,7 @@ impl ScfTraceRecord {
                 }
             }
             if !ediis_used && num_diis >= 2 {
-                if let Some(coeff) = diis_solver(&self.error_vector, &num_diis) {
+                if let Some(coeff) = diis_solver(&self.error_vector, &num_diis, self.diis_pinv_threshold) {
                     if let SCFType::ROHF = scf.scftype {
                         let mut next_r = MatrixFull::new(self.target_vector[0][0].size.clone(), 0.0);
                         for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.target_vector[k][0], *ck); }
@@ -529,7 +553,7 @@ impl ScfTraceRecord {
                 }
             }
             if !adiis_used && num_diis >= 2 {
-                if let Some(coeff) = diis_solver(&self.error_vector, &num_diis) {
+                if let Some(coeff) = diis_solver(&self.error_vector, &num_diis, self.diis_pinv_threshold) {
                     if let SCFType::ROHF = scf.scftype {
                         let mut next_r = MatrixFull::new(self.target_vector[0][0].size.clone(), 0.0);
                         for (k, ck) in coeff.iter().enumerate() { next_r.self_scaled_add(&self.target_vector[k][0], *ck); }
@@ -771,7 +795,8 @@ fn generate_adiis_penalty(
 }
 
 pub fn diis_solver(em: &Vec<Vec<f64>>,
-                   num_vec:&usize) -> Option<Vec<f64>> {
+                   num_vec:&usize,
+                   pinv_threshold: f64) -> Option<Vec<f64>> {
 
     let dim_vec = em.len();
     let start_dim = if (em.len()>=*num_vec) {em.len()-*num_vec} else {0};
@@ -794,7 +819,7 @@ pub fn diis_solver(em: &Vec<Vec<f64>>,
             //sum_inv_norm_rdm += inv_norm_rdm;
         })
     });
-    let inv_opta = _pinv(&opta, Some(1.0e-12f64)).unwrap();
+    let inv_opta = _pinv(&opta, Some(pinv_threshold)).unwrap();
     let sum_inv = inv_opta.data.iter().sum::<f64>();
     if sum_inv.abs() < 1.0e-6 {
         return None;

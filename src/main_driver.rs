@@ -163,6 +163,15 @@ pub fn main_driver() -> anyhow::Result<()> {
     if mol.ctrl.print_level>=2 {
         println!("{}", mol.ctrl.formated_output_in_toml());
     }
+    // `[ctrl] num_threads` and `[ctrl] max_memory` are per-process values, so a hybrid
+    // MPI + threads job has to divide the cores and the memory of a node by the number of ranks
+    // placed on it. Warn once at startup when the requested thread count of all processes
+    // together exceeds what this node offers. Only the root rank reaches this point with a
+    // standard output (the other ranks are redirected to /dev/null above).
+    utilities::memory_batch::warn_thread_oversubscription(
+        mol.ctrl.num_threads,
+        mpi_operator.as_ref().map(|mpi_op| mpi_op.size),
+    );
     let mut time_mark = initialize_time_record(&mol);
     time_mark.count_start("Overall");
 
@@ -885,27 +894,43 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
             println!("Gradient evaluation using Analytical differentiation");
         }
 
-        // In MPI-parallel runs, `scf_data.rimatr` (decomposed ERI / cderi) is distributed
-        // along the auxiliary-basis dimension: each rank stores only its column block
-        // `[n_baspar, naux_local]` (the SCF J/K build reduces partial contractions over
-        // ranks). The analytical gradient routines require the complete `[n_baspar, naux]`
-        // matrix on every rank, so gather it in place before entering the gradient code.
-        // The same applies to `rimatr_sr` for range-separated hybrid (RSH) functionals.
-        // This is collective and must be executed by all ranks symmetrically.
-        let naux_total = scf_data.mol.num_auxbas;
-        if scf_data.rimatr.is_some() {
-            let (rimatr, basbas2baspar, baspar2basbas) = scf_data.rimatr.take().unwrap();
-            let full_rimatr =
-                crate::mpi_io::gather_full_rimatr(&rimatr, naux_total, mpi_operator)
-                    .unwrap_or(rimatr);
-            scf_data.rimatr = Some((full_rimatr, basbas2baspar, baspar2basbas));
-        }
-        if scf_data.rimatr_sr.is_some() {
-            let (rimatr_sr, basbas2baspar, baspar2basbas) = scf_data.rimatr_sr.take().unwrap();
-            let full_rimatr_sr =
-                crate::mpi_io::gather_full_rimatr(&rimatr_sr, naux_total, mpi_operator)
-                    .unwrap_or(rimatr_sr);
-            scf_data.rimatr_sr = Some((full_rimatr_sr, basbas2baspar, baspar2basbas));
+        // In MPI-parallel runs, `scf_data.rimatr` (decomposed ERI / cderi) is distributed along
+        // the auxiliary-basis dimension: each rank stores only its column block
+        // `[n_baspar, naux_local]` (the SCF J/K build reduces partial contractions over ranks).
+        // The analytic gradient reads exactly that local block: `grad::rhf::get_itm_j_columns` and
+        // `get_itm_k_occtp_columns` restrict the pair-row contraction to the columns this rank
+        // owns and all-gather only the small intermediates (a `[naux]` vector and a
+        // `[nocc_tp, naux]` array), so the complete `[n_baspar, naux]` matrix is *not* replicated
+        // on every rank any more. For (H2O)30 that replication cost 6.56 GiB per rank, which made
+        // the node footprint of a force job grow linearly with the number of ranks.
+        //
+        // The exception is the RI-TDDFT response gradient, which reads the complete tensor
+        // through the full-space pair tables and is not part of the validated MPI scope, so its
+        // path still gets the gathered form here. Any other consumer of the full matrix has to
+        // call `mpi_io::gather_full_rimatr` itself (it is idempotent, and returns the input when
+        // the tensor already carries every column).
+        let needs_full_rimatr = scf_data
+            .mol
+            .ctrl
+            .tddft
+            .as_ref()
+            .map_or(false, |tddft| tddft.tddft_grad_state > 0);
+        if needs_full_rimatr {
+            let naux_total = scf_data.mol.num_auxbas;
+            if scf_data.rimatr.is_some() {
+                let (rimatr, basbas2baspar, baspar2basbas) = scf_data.rimatr.take().unwrap();
+                let full_rimatr =
+                    crate::mpi_io::gather_full_rimatr(&rimatr, naux_total, mpi_operator)
+                        .unwrap_or(rimatr);
+                scf_data.rimatr = Some((full_rimatr, basbas2baspar, baspar2basbas));
+            }
+            if scf_data.rimatr_sr.is_some() {
+                let (rimatr_sr, basbas2baspar, baspar2basbas) = scf_data.rimatr_sr.take().unwrap();
+                let full_rimatr_sr =
+                    crate::mpi_io::gather_full_rimatr(&rimatr_sr, naux_total, mpi_operator)
+                        .unwrap_or(rimatr_sr);
+                scf_data.rimatr_sr = Some((full_rimatr_sr, basbas2baspar, baspar2basbas));
+            }
         }
 
         let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();

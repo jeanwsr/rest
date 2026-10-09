@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::convert::TryInto;
-use rayon::prelude::*;
 
 use super::becke_partitioning;
 use super::becke_partitioning::RadiiAdjust;
@@ -245,19 +244,22 @@ pub(crate) fn atom_grid_with_isdf(
 
     let quadrature_weights = weights.clone();
     if center_coordinates_bohr.len() > 1 {
-        let w_partitioning: Vec<f64> = coordinates
-            .par_iter()
-            .map(|c| {
-                becke_partitioning::partitioning_weight(
-                    center_index,
-                    &center_coordinates_bohr,
-                    &proton_charges,
-                    *c,
-                    hardness,
-                    radii_adjust,
-                )
-            })
-            .collect();
+        // Becke partitioning is the only part of this function whose cost grows with the
+        // square of the atom count. Hoist everything that depends on the molecule alone
+        // into one pair table, then evaluate the grid in blocks, reusing the scratch
+        // buffers of each worker. `partitioning_weights_par` is bit-identical to calling
+        // `partitioning_weight` once per grid point.
+        let table =
+            becke_partitioning::BeckePairTable::new(&center_coordinates_bohr, &proton_charges, radii_adjust);
+        let mut w_partitioning = vec![0.0f64; coordinates.len()];
+        becke_partitioning::partitioning_weights_par(
+            &table,
+            center_index,
+            &center_coordinates_bohr,
+            &coordinates,
+            hardness,
+            &mut w_partitioning,
+        );
 
         for (i, w) in weights.iter_mut().enumerate() {
             *w *= w_partitioning[i];

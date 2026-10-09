@@ -38,9 +38,15 @@
 # Detailed descrption of `[ctrl]` block in the control file
 
 ## 系统设置相关关键词（Keyword）
-- `num_threads`: 取值i32类型。任务最大可调用线程数目，缺省为1
+- `num_threads`: 取值i32类型。**每个 MPI 进程**可展开的线程数目（不是整个节点的线程数），缺省为1。
+  每个 rank 是独立进程，各自按此值建立 rayon 线程池并同步设置 OpenMP 线程数，所以节点实际使用的线程数是 `num_threads` 乘以落在该节点的 rank 数。
+  MPI 与线程混跑时建议设为「每节点核数除以每节点 rank 数」。缺省值 1 表示每个进程内的并行区串行执行。
+  程序启动时会检查 `num_threads` 乘 MPI 进程数是否超过节点的逻辑 CPU 数，超过时打印一条 `[WARN] Thread oversubscription` 告警并给出建议值。该检查按硬件列表统计节点 CPU，不受 MPI 进程绑定影响，可用环境变量 `REST_SKIP_THREAD_WARN=1` 关闭。
 - `print_level`: 取值i32类型。程序输出信息量，数字越大，输出信息量越多。缺省为1。0表示完全无输出
-- `max_memory`: 取值f64类型。程序可使用的最大内存，单位为MB。缺省不设置，使用当前节点所有可用内存。
+- `max_memory`: 取值f64类型。**每个 MPI 进程**可使用的最大内存，单位为MB。缺省不设置，此时批次决策按当前节点的可用内存估算。
+  预算的消费方式是「`max_memory` 减去本进程常驻内存」，所以 MPI 下每个 rank 各自套用，节点的实际额度是 `max_memory` 乘以落在该节点的 rank 数。
+  MPI 与线程混跑时建议设为「每节点内存除以每节点 rank 数」并留一到两成余量。未显式设置时各 rank 都会把节点可用内存当成自己的预算，多进程共享节点时应当显式设置。
+  该设置只在算法感知内存并按批计算的场合生效，也不是硬上限。它用于批次决策与力阶段的内存监控，峰值 RSS 超过限制时按 `abort_on_mem_exceed` 决定是否中止。
 - `abort_on_mem_exceed`: 取值布尔类型。是否在内存超出限制时终止计算。缺省为true。**设置false存在风险，不建议一般用户设置该选项**。
 
 ## 具体计算任务相关关键词（Keyword）
@@ -942,7 +948,7 @@ nroots = 6
 以下 `[ctrl]` 区的全局关键词对Hessian计算有直接影响：
 
 - 辅助基组响应修正在Hessian流程中始终启用；全局 `auxbasis_response` 开关不再改变Hessian计算。
-- `max_memory`: 取值f64，全局内存限制（单位MB）。Hessian流水线内嵌内存监控器（MemMonitor），在峰值RSS超过此限制时提前终止以防止系统OOM。
+- `max_memory`: 取值f64，每个 MPI 进程的内存限制（单位MB）。Hessian流水线内嵌内存监控器（MemMonitor），在峰值RSS超过此限制时提前终止以防止系统OOM。
 
 ### 计算流水线
 

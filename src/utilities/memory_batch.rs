@@ -76,6 +76,59 @@ pub fn xc_grad_block_mb(max_memory: Option<f64>, fallback_mb: f64) -> f64 {
     }
 }
 
+/// Message of the hybrid MPI + threads oversubscription check, `None` when the request fits.
+///
+/// `num_threads` is the per-process value of `[ctrl] num_threads`, `mpi_size` the number of MPI
+/// processes and `node_slots` the number of logical CPUs of the local node. The check asks
+/// whether every process of the job could run its threads on this node, which is the pessimistic
+/// reading when the ranks are spread over several nodes.
+///
+/// `node_slots` must come from a hardware listing and not from
+/// `std::thread::available_parallelism()`: an MPI launcher binds every rank to a subset of the CPUs
+/// (two logical CPUs here for `mpirun -n 2` on a 16 CPU node), and that affinity width is not what
+/// the other ranks of the job can use.
+pub fn check_thread_oversubscription(
+    num_threads: usize,
+    mpi_size: usize,
+    node_slots: usize,
+) -> Option<String> {
+    let num_threads = num_threads.max(1);
+    let mpi_size = mpi_size.max(1);
+    if node_slots == 0 || num_threads.saturating_mul(mpi_size) <= node_slots {
+        return None;
+    }
+    let demanded = num_threads.saturating_mul(mpi_size);
+    let suggested = (node_slots / mpi_size).max(1);
+    Some(format!(
+        "[WARN] Thread oversubscription: [ctrl] num_threads = {num_threads} is the thread count of one MPI process, and this job has {mpi_size} process(es), so {demanded} threads are requested while the local node offers {node_slots} parallel slots. The processes may be spread over several nodes, in which case this estimate is pessimistic. For a hybrid MPI + threads run set num_threads = {suggested} (cores per node / ranks per node). Set the environment variable REST_SKIP_THREAD_WARN=1 to silence this check."
+    ))
+}
+
+/// Print [`check_thread_oversubscription`] for the current job, unless `REST_SKIP_THREAD_WARN`
+/// is set. Called once at startup, where only the root rank still writes to the standard output.
+pub fn warn_thread_oversubscription(num_threads: Option<usize>, mpi_size: Option<usize>) {
+    if std::env::var("REST_SKIP_THREAD_WARN").is_ok() {
+        return;
+    }
+    // The node level has to come from a hardware listing: an MPI launcher binds every rank to a
+    // subset of the CPUs, so the affinity width of this process (`available_parallelism`) is not
+    // what the other ranks can use. `sysinfo` lists the CPUs of the node, binding aside.
+    let mut sys = sysinfo::System::new();
+    sys.refresh_cpu_all();
+    let node_slots = match sys.cpus().len() {
+        0 => match std::thread::available_parallelism() {
+            Ok(slots) => slots.get(),
+            Err(_) => return,
+        },
+        listed => listed,
+    };
+    if let Some(msg) =
+        check_thread_oversubscription(num_threads.unwrap_or(1), mpi_size.unwrap_or(1), node_slots)
+    {
+        println!("{msg}");
+    }
+}
+
 /// Peak-attribution probe: print the resident set of this process together with a label.
 ///
 /// Enabled by the environment variable `REST_MEM_PROBE=1` or by `print_level >= 3`, and a no-op
@@ -325,5 +378,20 @@ mod tests {
             pool.install(|| calc_batch_size_from_mem_estimate::<f64>(&mem_est, Some(500.0), Some(0.8), true));
         println!("Calculated batch size: {batch_size}");
         assert_eq!(batch_size, 256);
+    }
+
+    #[test]
+    fn test_check_thread_oversubscription() {
+        // fits, including the exact fit
+        assert!(check_thread_oversubscription(4, 2, 16).is_none());
+        assert!(check_thread_oversubscription(8, 2, 16).is_none());
+        assert!(check_thread_oversubscription(1, 16, 16).is_none());
+        // degenerate values never warn
+        assert!(check_thread_oversubscription(0, 1, 16).is_none());
+        assert!(check_thread_oversubscription(4, 1, 0).is_none());
+        // oversubscribed
+        let msg = check_thread_oversubscription(16, 4, 16).expect("oversubscription not detected");
+        assert!(msg.contains("64") && msg.contains("16") && msg.contains("REST_SKIP_THREAD_WARN"));
+        assert!(msg.contains("num_threads = 4"));
     }
 }

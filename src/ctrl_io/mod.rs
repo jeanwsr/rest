@@ -302,6 +302,15 @@ pub struct InputKeywords {
     pub mix_param: f64,
     #[pyo3(get, set)]
     pub num_max_diis: usize,
+    /// Truncation threshold of the pseudo-inverse used by the DIIS solver (Pulay
+    /// coefficients are obtained from the Gram matrix of the error vectors). Larger
+    /// values discard more of the near-singular directions of that matrix, which
+    /// bounds the extrapolation coefficients.
+    pub diis_pinv_threshold: f64,
+    /// Whether the DIIS error vector is transformed to the orthonormal basis,
+    /// i.e. S^(-1/2) (FDS - SDF) S^(-1/2). PySCF and PyFock use the plain AO-basis
+    /// commutator; set this to false to reproduce that behaviour.
+    pub diis_orthogonalize_error: bool,
     #[pyo3(get, set)]
     pub start_diis_cycle: usize,
     #[pyo3(get, set)]
@@ -405,6 +414,13 @@ pub struct InputKeywords {
     #[pyo3(get, set)]
     pub bench_eps: bool,
     // Keywords for parallism
+    /// Number of threads of **this MPI process**, not of the node.
+    ///
+    /// Every rank is an independent process and builds its own global rayon pool (and sets the
+    /// OpenMP thread count of the BLAS behind it) to this value, so a node runs `num_threads`
+    /// times the number of ranks placed on it. For a hybrid MPI + threads run, set it to
+    /// `cores per node / ranks per node`. The default is 1, which serialises the parallel
+    /// regions of each process.
     #[pyo3(get, set)]
     pub num_threads: Option<usize>,
     // batch size for each thread
@@ -415,9 +431,17 @@ pub struct InputKeywords {
     pub force_state_occupation: Vec<ForceStateOccupation>,
     pub auxiliary_reference_states: Vec<(String,usize)>,
     pub rpa_de_excitation_parameters: Option<[f64;4]>,
-    /// Maximum memory available in MB, `None` if no limit.
-    /// This option is only for single-node computation, and only works in some cases where algorithm awares memory usage and perform batched computation.
-    /// For multi-node (MPI), this keyword is not fully discussed.
+    /// Maximum memory available to **this MPI process** in MB, `None` if no limit.
+    ///
+    /// The budget is consumed as `max_memory` minus the resident set of the current process
+    /// (`detect_used_memory_mb("proc")`), so under MPI every rank applies it to itself and a node
+    /// is allowed `max_memory` times the number of ranks placed on it. For a hybrid MPI + threads
+    /// run, set it to `memory per node / ranks per node` with some head room. When it is not set,
+    /// the batch decisions fall back to the available memory of the node, which every rank reads
+    /// as its own budget, so an explicit value is recommended whenever several ranks share a node.
+    ///
+    /// The keyword only works where the algorithm is aware of the memory usage and performs batched
+    /// computation, and it is not a hard cap: it feeds the batch sizes and the force-phase monitor.
     pub max_memory: Option<f64>,
     /// Back up of max_memory for the ISDF new driver (restored after ISDF preparation).
     #[pyo3(get, set)]
@@ -544,7 +568,7 @@ impl InputKeywords {
             pruning: String::from("nwchem"),
             rad_grid_method: String::from("treutler"),
             external_grids: "none".to_string(),
-            radii_adjust: String::from("becke"),
+            radii_adjust: String::from("treutler"),
             // ETB for autogen the auxbasis
             even_tempered_basis: false,
             etb_start_atom_number: 37,
@@ -557,12 +581,14 @@ impl InputKeywords {
             mixer: String::from("diis"),
             mix_param: 0.6,
             num_max_diis: 8,
+            diis_pinv_threshold: 1.0e-12,
+            diis_orthogonalize_error: true,
             start_diis_cycle: 1,
             start_check_oscillation: 20,
             level_shift : None, 
             max_scf_cycle: 100,
-            scf_acc_rho: 1.0e-6,
-            scf_acc_eev: 1.0e-5,
+            scf_acc_rho: 1.0e-5,
+            scf_acc_eev: 1.0e-3,
             scf_acc_etot:1.0e-8,
             scf_conv_criteria: String::from("dm,eev"),
             scf_acc_g: 1.0e-5,
@@ -995,7 +1021,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
 
             tmp_input.radii_adjust = match tmp_ctrl.get("radii_adjust").unwrap_or(&serde_json::Value::Null){
                 serde_json::Value::String(tmp_type) => {tmp_type.to_lowercase()},
-                other => {String::from("becke")} // default: raw Bragg radii (REST historical behaviour)
+                other => {String::from("treutler")} // default: Treutler-Ahlrichs sqrt radii (PySCF/PyFock default)
             };
             //if tmp_input.print_level>0 {println!("The Becke radii adjustment will be {}", tmp_input.radii_adjust)};
 
@@ -1566,15 +1592,21 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 },
                 other => {None}
             };
+            // The default stopping rule stays "dm,eev". Only the density and eigenvalue
+            // thresholds are loosened (1e-6 -> 1e-5 and 1e-5 -> 1e-3), matching the level
+            // PySCF reaches by default; switching the criterion itself to the gradient
+            // norm moved analytic derivatives and thermochemistry by more than their
+            // regression tolerances, so "g" is left as an explicit user choice.
+            // scf_acc_etot still binds in every mode, so it keeps its historical value.
             tmp_input.scf_acc_rho = match tmp_ctrl.get("scf_acc_rho").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-6)},
-                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-6)},
-                other => {1.0e-8}
-            };
-            tmp_input.scf_acc_eev = match tmp_ctrl.get("scf_acc_eev").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-5)},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-5)},
-                other => {1.0e-6}
+                other => {1.0e-5}
+            };
+            tmp_input.scf_acc_eev = match tmp_ctrl.get("scf_acc_eev").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-3)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-3)},
+                other => {1.0e-3}
             };
             tmp_input.scf_acc_etot = match tmp_ctrl.get("scf_acc_etot").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-8)},
@@ -1607,6 +1639,16 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(8_usize)},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(8) as usize},
                 other => {8_usize}
+            };
+            tmp_input.diis_pinv_threshold = match tmp_ctrl.get("diis_pinv_threshold").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-12)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-12)},
+                other => {1.0e-12}
+            };
+            tmp_input.diis_orthogonalize_error = match tmp_ctrl.get("diis_orthogonalize_error").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                serde_json::Value::String(tmp_str) => {matches!(tmp_str.to_lowercase().as_str(), "true" | "yes" | "on" | "1")},
+                other => {true}
             };
             tmp_input.start_diis_cycle = match tmp_ctrl.get("start_diis_cycle").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1_usize)},
