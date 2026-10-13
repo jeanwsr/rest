@@ -13,6 +13,7 @@ use tensors::{MathMatrix, RIFull};
 
 use crate::constants::{BOHR, AU2DEBYE};
 use crate::grad::{formated_force, formated_force_ev, numerical_force};
+use crate::grad::traits::GradAPI;
 use crate::mpi_io::MPIOperator;
 use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon, open_shell_sbge2_rayon};
 use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon};
@@ -551,6 +552,7 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 if use_cd {"cd"} else {"lr"}
             );
             report_analytic_gradient(scf_data, "GW", &grad);
+            report_state_and_total_gradient(scf_data, "GW", &grad.clone());
         }else{
             let multi = if qp_ctrl.bse_spin.eq_ignore_ascii_case("triplet") {'t'} else {'s'};
             let screen = if qp_ctrl.gradient_screening.eq_ignore_ascii_case("qp") {
@@ -558,8 +560,20 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             } else {
                 ri_bse::bse_grad::ScreeningEnergy::Reference
             };
-            let nroots = if qp_ctrl.gradient_nroots == 0 {
-                (qp_ctrl.gradient_state + 1).max(2)
+            // How many BSE roots to solve.  The *default* is the lowest
+            // excited state alone (`gradient_state = 0`), i.e. exactly the roots
+            // needed up to the requested state: the analytic gradient cost is
+            // dominated by the transition-space construction, which grows with
+            // the number of solved roots, and the extra roots are never
+            // differentiated unless they are asked for.  Set
+            // `gradient_nroots` in the input card to solve (and report) more.
+            // Stage 1 of the two-stage workflow (`bse_roots_only`): solve
+            // `bse_roots_n` roots, dump their fingerprints and stop before the
+            // expensive per-root gradient assembly.
+            let nroots = if qp_ctrl.bse_roots_only {
+                qp_ctrl.bse_roots_n
+            } else if qp_ctrl.gradient_nroots == 0 {
+                qp_ctrl.gradient_state + 1
             } else {
                 qp_ctrl.gradient_nroots
             };
@@ -574,7 +588,22 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 // historical behaviour; a positive value restricts the
                 // transition space to `e_F + window` (the same convention as the
                 // timing driver's `PAPER_WINDOW`).
-                let cutoff = if qp_ctrl.gradient_bse_window > 0.0 {
+                let cutoff = if qp_ctrl.gradient_bse_nvir > 0 {
+                    // Fixed *count*: the cutoff sits halfway between the n-th and
+                    // the (n+1)-th virtual at this geometry, so the transition
+                    // space keeps the same dimension at every point of a
+                    // relaxation path.  An energy window lets orbitals drift in
+                    // and out (observed `dim 816 -> 864 -> 1008` on
+                    // azobenzene/def2-TZVPP), which makes `E_GS + Omega`
+                    // discontinuous at those crossings.
+                    let e = &scf_data.eigenvalues[0];
+                    let last = scf_data.homo[0] + qp_ctrl.gradient_bse_nvir;
+                    if last + 1 < e.len() {
+                        0.5 * (e[last] + e[last + 1])
+                    } else {
+                        f64::INFINITY
+                    }
+                } else if qp_ctrl.gradient_bse_window > 0.0 {
                     let e = &scf_data.eigenvalues[0];
                     let nocc = scf_data.homo[0] + 1;
                     0.5 * (e[nocc - 1] + e[nocc]) + qp_ctrl.gradient_bse_window
@@ -587,6 +616,15 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                     "BSE transition space: {} occupied x {} of {} virtuals, spin channel '{multi}'",
                     bse.screen.nocc, bse.screen.nvir, bse.screen.nvir_full
                 );
+                // Archive the quasiparticle spectrum this gradient is built on,
+                // so that a later card (e.g. stage 2 of the two-stage
+                // excited-state workflow) can restore the SCF *and* the GW pass
+                // from the chkfile instead of redoing them.  No-op unless
+                // `save_gw_checkpoint = true` and `chkfile` is set; the archive
+                // is validated against molecule/basis/geometry on reload, so a
+                // mismatched geometry is a hard error rather than silent wrong
+                // physics.
+                crate::fileop::gw_checkpoint::save_gw_finished_checkpoint(scf_data);
                 // Pick the solver by the size of the transition space, exactly
                 // as the timing driver does: the dense route materialises the
                 // full `dim x dim` matrix (plus its eigenvectors and LAPACK
@@ -607,6 +645,28 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 for (k, om) in bse.excitation_energies().iter().enumerate() {
                     println!("  BSE root {k}: {:.12} Ha = {:.6} eV", om, om * 27.211386245988);
                 }
+                // Composition of every solved root: the dominant `i -> a`
+                // transitions with their `x^2 - y^2` weights and the oscillator
+                // strength (dark vs bright).  This is what an external
+                // geometry-optimisation driver needs in order to follow a
+                // *state* (by composition) instead of a root *index* when two
+                // states approach each other, and it makes a run auditable after
+                // the fact -- the amplitudes are otherwise never printed.
+                report_root_composition(scf_data, &bse);
+                if !qp_ctrl.gradient_amplitude_path.is_empty() {
+                    save_bse_amplitudes(&bse, &qp_ctrl.gradient_amplitude_path);
+                }
+                if qp_ctrl.bse_roots_only {
+                    // Stage 1: write the fingerprints and return -- no gradient.
+                    save_bse_roots(scf_data, &bse, &qp_ctrl.bse_roots_path);
+                    println!(
+                        "bse_roots_only: {} root(s) dumped to {} -- no gradient assembled. \
+                         Use a second card with gradient_state = <index> to differentiate one.",
+                        bse.roots.len(),
+                        qp_ctrl.bse_roots_path
+                    );
+                    return bse_output;
+                }
                 bse.analytic_gradients()
             };
             let state = qp_ctrl.gradient_state;
@@ -615,11 +675,186 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 omegas[state], omegas[state] * 27.211386245988
             );
             report_analytic_gradient(scf_data, &format!("BSE_ROOT{state}"), &grads[state]);
+            report_state_and_total_gradient(
+                scf_data,
+                &format!("BSE_ROOT{state}"),
+                &grads[state].clone(),
+            );
         }
     }else{
         print!("Warning: You entered an invalid quasiparticle method. No quasiparticle methods Were triggered.")
     }
     bse_output
+}
+
+/// Print the transition composition of every solved BSE root.
+///
+/// One line per root: the excitation energy, the oscillator strength and the
+/// five largest `(i -> a)` contributions with their `x^2 - y^2` weights,
+/// labelled relative to the HOMO/LUMO (`H`, `H-1`, ..., `L`, `L+1`, ...).
+/// Amplitude flat index is `i + a*nocc` (occupied index fastest), so the
+/// orbital pair is `(i, nocc + a)`.
+fn report_root_composition(scf_data:&SCF, bse:&ri_bse::bse_grad::BseGradEngine) {
+    let (nocc, nvir) = (bse.screen.nocc, bse.screen.nvir);
+    if nocc == 0 || nvir == 0 { return; }
+    let dim = nocc * nvir;
+    // The active virtuals are the lowest `nvir`, so the active block of the
+    // `[3, nocc*nvir_full]` dipole matrix is its leading `dim` columns.
+    let mu_full = ri_bse::dipoles::compute_dipole_matrix(scf_data);
+    let mut mu_act = tensors::MatrixFull::new([3, dim], 0.0);
+    for d in 0..3 {
+        for k in 0..dim {
+            if k < mu_full.size[1] {
+                mu_act[[d, k]] = mu_full[[d, k]];
+            }
+        }
+    }
+    println!("BSE root composition (weights x^2 - y^2, |mu|^2 in a.u.):");
+    for (k, r) in bse.roots.iter().enumerate() {
+        if r.x.len() < dim || r.y.len() < dim { continue; }
+        // A failed solve (Cholesky of `A - B` can fail for a hybrid reference at
+        // a bad geometry) leaves NaN amplitudes; `partial_cmp` would then panic
+        // in the sort below and abort the whole REST run.  Report it instead.
+        if !r.x.iter().chain(r.y.iter()).all(|v| v.is_finite()) {
+            println!(
+                "  root {k}: NON-FINITE amplitudes (omega = {}) -- BSE solve unusable, no composition",
+                r.omega
+            );
+            continue;
+        }
+        let mut w: Vec<(f64, usize, usize)> = (0..dim)
+            .map(|idx| (r.x[idx].powi(2) - r.y[idx].powi(2), idx % nocc, idx / nocc))
+            .collect();
+        w.sort_by(|p, q| q.0.abs().total_cmp(&p.0.abs()));
+        let mut xy = r.x.clone();
+        xy.extend_from_slice(&r.y);
+        let f = ri_bse::dipoles::transition_dipole_square(&mu_act, &xy, false);
+        let top: Vec<String> = w.iter().take(5).map(|(wi, i, a)| {
+            let li = if *i == nocc - 1 { "H".to_string() } else { format!("H-{}", nocc - 1 - i) };
+            let la = if *a == 0 { "L".to_string() } else { format!("L+{a}") };
+            format!("{li}->{la}:{wi:+.4}")
+        }).collect();
+        println!(
+            "  root {k}: Omega = {:.9} Ha ({:.4} eV)  |mu|^2 = {:.5}  {}",
+            r.omega, r.omega * 27.211386245988, f, top.join("  ")
+        );
+    }
+}
+
+/// Write the BSE amplitudes of every solved root to `path`, one block per root:
+///
+/// ```text
+/// # root <k> omega <Ha> nocc <n> nvir <m>
+/// <2*nocc*nvir numbers: X then Y, flat index i + a*nocc>
+/// ```
+///
+/// An external optimisation driver uses these to follow a state by amplitude
+/// overlap from one geometry to the next; they also make the run auditable
+/// (nothing else records which state was actually differentiated).
+fn save_bse_amplitudes(bse:&ri_bse::bse_grad::BseGradEngine, path:&str) {
+    use std::io::Write;
+    let (nocc, nvir) = (bse.screen.nocc, bse.screen.nvir);
+    let mut out = String::new();
+    for (k, r) in bse.roots.iter().enumerate() {
+        out.push_str(&format!(
+            "# root {k} omega {:.12} nocc {nocc} nvir {nvir}\n",
+            r.omega
+        ));
+        for v in r.x.iter().chain(r.y.iter()) {
+            out.push_str(&format!("{v:.16e} "));
+        }
+        out.push('\n');
+    }
+    match std::fs::File::create(path) {
+        Ok(mut f) => {
+            if f.write_all(out.as_bytes()).is_ok() {
+                println!("BSE amplitudes of {} root(s) written to {path}", bse.roots.len());
+            }
+        }
+        Err(e) => println!("WARNING: cannot write BSE amplitudes to {path}: {e}"),
+    }
+}
+
+/// Transition dipole components `mu_d = 2 sum_ia (X_ia + Y_ia) mu^d_ia`.
+///
+/// The same contraction as [`ri_bse::dipoles::transition_dipole_square`], which
+/// returns only its square; the *direction* is what identifies a state by
+/// symmetry.
+fn dipole_components(dipole_matrix:&tensors::MatrixFull<f64>, xy:&[f64]) -> [f64;3] {
+    let dim = dipole_matrix.size[1];
+    let mut mu = [0.0f64;3];
+    for d in 0..3 {
+        let mut s = 0.0;
+        for ia in 0..dim {
+            s += (xy[ia] + xy[dim + ia]) * dipole_matrix[[d, ia]];
+        }
+        mu[d] = 2.0 * s;
+    }
+    mu
+}
+
+/// Stage-1 root dump (`bse_roots_only`), written as JSON.
+///
+/// Every root is described by quantities that are **invariant under a change of
+/// root order or of the orbital labelling inside the active space**: the
+/// excitation energy, the oscillator strength and the transition-dipole
+/// direction (symmetry-protected: a dark `n -> pi*` state has `|mu| ~ 0` while a
+/// bright `pi -> pi*` state has a large in-plane component), the count of roots
+/// below it, and the five largest `(i -> a)` weights.  An external driver picks
+/// the index from these and hands it to a second card via `gradient_state`.
+fn save_bse_roots(scf_data:&SCF, bse:&ri_bse::bse_grad::BseGradEngine, path:&str) {
+    use std::io::Write;
+    let (nocc, nvir) = (bse.screen.nocc, bse.screen.nvir);
+    let dim = nocc * nvir;
+    let mu_full = ri_bse::dipoles::compute_dipole_matrix(scf_data);
+    let mut mu_act = tensors::MatrixFull::new([3, dim], 0.0);
+    for d in 0..3 {
+        for k in 0..dim {
+            if k < mu_full.size[1] {
+                mu_act[[d, k]] = mu_full[[d, k]];
+            }
+        }
+    }
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str(&format!("  \"nocc\": {nocc},\n  \"nvir\": {nvir},\n  \"dim\": {dim},\n"));
+    out.push_str(&format!("  \"nroots\": {},\n  \"roots\": [\n", bse.roots.len()));
+    for (k, r) in bse.roots.iter().enumerate() {
+        let finite = r.x.len() >= dim && r.y.len() >= dim
+            && r.x.iter().chain(r.y.iter()).all(|v| v.is_finite());
+        if !finite {
+            out.push_str(&format!("    {{\"index\": {k}, \"omega_ha\": {:.12}, \"failed\": true}}", r.omega));
+        } else {
+            let mut xy = r.x.clone();
+            xy.extend_from_slice(&r.y);
+            let mu = dipole_components(&mu_act, &xy);
+            let mu2 = mu.iter().map(|x| x * x).sum::<f64>();
+            let mut w: Vec<(f64, usize, usize)> = (0..dim)
+                .map(|idx| (r.x[idx].powi(2) - r.y[idx].powi(2), idx % nocc, idx / nocc))
+                .collect();
+            w.sort_by(|p, q| q.0.abs().total_cmp(&p.0.abs()));
+            let top: Vec<String> = w.iter().take(5).map(|(wi, i, a)| {
+                format!(
+                    "{{\"i_from_homo\": {}, \"a_from_lumo\": {}, \"weight\": {:.6}}}",
+                    nocc - 1 - i, a, wi
+                )
+            }).collect();
+            out.push_str(&format!(
+                "    {{\"index\": {k}, \"omega_ha\": {:.12}, \"omega_ev\": {:.6}, \
+                 \"mu2\": {:.6}, \"mu\": [{:.6}, {:.6}, {:.6}], \"dim\": {dim}, \"top\": [{}]}}",
+                r.omega, r.omega * 27.211386245988, mu2, mu[0], mu[1], mu[2], top.join(", ")
+            ));
+        }
+        out.push_str(if k + 1 == bse.roots.len() { "\n" } else { ",\n" });
+    }
+    out.push_str("  ]\n}\n");
+    match std::fs::File::create(path) {
+        Ok(mut f) => match f.write_all(out.as_bytes()) {
+            Ok(_) => println!("BSE root fingerprints written to {path}"),
+            Err(e) => println!("WARNING: cannot write {path}: {e}"),
+        },
+        Err(e) => println!("WARNING: cannot create {path}: {e}"),
+    }
 }
 
 /// Print an analytic Cartesian gradient (flat index `3*atom + comp`, in
@@ -638,6 +873,54 @@ fn report_analytic_gradient(scf_data:&mut SCF, label:&str, grad:&[f64]) {
     println!("{}", formated_force(&m, &scf_data.mol.geom.elem));
     println!("---------------------------------------------");
     scf_data.energies.insert(format!("{}_gradient", label.to_lowercase()), grad.to_vec());
+}
+
+/// Analytic nuclear gradient of the *reference* state, flat `3*atom + comp`.
+///
+/// This is the ground-state (mean-field) gradient that has to be added to a
+/// GW quasiparticle or BSE excitation-energy gradient: those engines
+/// differentiate only their own energy (`E_QP` / `Omega_S`), while the total
+/// energy of the state is `E_GS(R) + E_QP(R)` or `E_GS(R) + Omega_S(R)`.
+///
+/// A Kohn-Sham reference needs the `calc_rks` path (it adds the xc
+/// contribution to the skeleton derivative) and a Hartree-Fock one `calc`;
+/// using the latter on a DFT reference leaves the xc term out entirely.
+fn reference_gradient(scf_data:&SCF) -> Vec<f64> {
+    let mut gs = crate::grad::rhf::RIRHFGradient::new(scf_data, &None);
+    if scf_data.mol.xc_data.dfa_compnt_scf.is_empty() {
+        gs.calc();
+    } else {
+        gs.calc_rks();
+    }
+    let m = gs.get_gradient();
+    let natm = scf_data.mol.geom.elem.len();
+    let mut g = vec![0.0f64; natm*3];
+    for a in 0..natm {
+        for c in 0..3 {
+            g[a*3 + c] = m.data[c + a*3];
+        }
+    }
+    g
+}
+
+/// Report the ground-state gradient and the *total* gradient of an electronic
+/// state whose own gradient is `state_grad` (`E_GS + E_state`), so that the
+/// caller can see both the engine's output and the quantity that defines the
+/// potential-energy surface the state actually lives on.
+fn report_state_and_total_gradient(
+    scf_data:&mut SCF,
+    state_label:&str,
+    state_grad:&[f64],
+) -> Vec<f64> {
+    let gs = reference_gradient(scf_data);
+    report_analytic_gradient(scf_data, "GS", &gs);
+    let total: Vec<f64> = gs.iter().zip(state_grad).map(|(a,b)| a + b).collect();
+    println!(
+        "Total gradient of {state_label} = d(E_GS)/dR + d({state_label})/dR \
+         (the state's own gradient alone is not the PES gradient)."
+    );
+    report_analytic_gradient(scf_data, &format!("{state_label}_TOTAL"), &total);
+    total
 }
 
 fn fciqmc_dump(scf_data: &SCF) {

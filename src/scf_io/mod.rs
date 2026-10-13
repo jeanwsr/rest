@@ -4937,7 +4937,16 @@ pub fn diagonalize_hamiltonian_outside(scf_data: &SCF, mpi_operator: &Option<MPI
     //println!("diagonalize_hamiltonian_outside: num_state {}", num_state);
 
 
-    (eigenvectors, eigenvalues, scf_data.mol.num_state)
+    // `num_state` is what `_hamiltonian_fast_solver` actually produced: when the
+    // basis has linear dependencies it *reduces* it (the near-singular
+    // directions are dropped, so `S^-1/2` has fewer independent columns and the
+    // eigenvector matrix has that many columns).  Returning
+    // `scf_data.mol.num_state` keeps the unreduced count, and the SCF then
+    // builds its density from a coefficient matrix with the wrong number of
+    // orbitals (azobenzene/def2-TZVPPD: 688 basis functions -> 686 orbitals,
+    // which diverges).  Without linear dependencies the two are equal, which is
+    // why this only shows up for diffuse basis sets.
+    (eigenvectors, eigenvalues, num_state)
 }
 
 #[cfg(feature = "scalapack")]

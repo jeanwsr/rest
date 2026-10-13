@@ -270,10 +270,10 @@ impl<'a> TddftGradEngine<'a> {
     fn coulomb_coeff(&self, d: &AOMat) -> Vec<f64> {
         let nao = self.nao;
         let naux = self.raw.naux;
-        // The raw integrals live behind a `RefCell` (the CD-GW gradient releases them once it is
-        // done with them): make sure they are resident, then hold one borrow for this routine.
-        self.raw.ensure_i3();
-        let i3 = self.raw.i3.borrow();
+        // The raw integrals are held by `RawRiTensors` (the CD-GW gradient releases them once
+        // it is done with them): take an `Arc` handle for this routine.  The handle keeps the
+        // buffer alive without holding a lock, so concurrent readers never block each other.
+        let i3 = self.raw.i3_shared();
         let mut rho = vec![0.0; naux];
         for p in 0..naux {
             let mut s = 0.0;
@@ -293,8 +293,7 @@ impl<'a> TddftGradEngine<'a> {
         let nao = self.nao;
         let naux = self.raw.naux;
         let c = self.coulomb_coeff(d);
-        self.raw.ensure_i3();
-        let i3 = self.raw.i3.borrow();
+        let i3 = self.raw.i3_shared();
         let mut out = AOMat::zeros(nao);
         for p in 0..naux {
             let base = p * nao * nao;
@@ -316,8 +315,7 @@ impl<'a> TddftGradEngine<'a> {
     fn exchange_y(&self, l: &[f64], nfac: usize) -> Vec<f64> {
         let nao = self.nao;
         let naux = self.raw.naux;
-        self.raw.ensure_i3();
-        let i3 = self.raw.i3.borrow();
+        let i3 = self.raw.i3_shared();
         let lm = MatrixFull::from_vec([nao, nfac], l.to_vec()).unwrap();
         let mut yt = vec![0.0; naux * nao * nfac];
         let mut ip = MatrixFull::new([nao, nao], 0.0);
@@ -469,8 +467,7 @@ impl<'a> TddftGradEngine<'a> {
         let naux = self.raw.naux;
         let di = self.raw.d_i_from_blocks(blocks, comp);
         let dj = self.raw.d_j_atom(blocks.atm, comp);
-        self.raw.ensure_i3();
-        let i3 = self.raw.i3.borrow();
+        let i3 = self.raw.i3_shared();
         let mut g = vec![0.0; naux];
         let mut dg = vec![0.0; naux];
         for p in 0..naux {
@@ -515,8 +512,7 @@ impl<'a> TddftGradEngine<'a> {
         let naux = self.raw.naux;
         let di = self.raw.d_i_from_blocks(blocks, comp);
         let dj = self.raw.d_j_atom(blocks.atm, comp);
-        self.raw.ensure_i3();
-        let i3 = MatrixFull::from_vec([nao * nao, naux], self.raw.i3.borrow().clone()).unwrap();
+        let i3 = MatrixFull::from_vec([nao * nao, naux], self.raw.i3_shared().as_ref().clone()).unwrap();
         let div = MatrixFull::from_vec([nao * nao, naux], di.clone()).unwrap();
         let djm = MatrixFull::from_vec([naux, naux], dj.clone()).unwrap();
         let mut out = vec![0.0; nao * nao];

@@ -213,7 +213,10 @@ pub struct QuasiParticle {
     /// Default `0`.
     pub gradient_state:usize,
     /// Number of BSE roots solved before differentiating.  `0` selects
-    /// `max(gradient_state + 1, 2)`.  Default `0`.
+    /// `gradient_state + 1`, i.e. **the lowest excited state alone** for the
+    /// default `gradient_state = 0`.  Set a larger value only when the
+    /// transition space must contain more roots (every solved root enlarges the
+    /// kernel covectors and the folds).  Default `0`.
     pub gradient_nroots:usize,
     /// Energy window above the Fermi level (Hartree) for the BSE transition
     /// space of the **analytic gradient**.  `0.0` keeps the full virtual space
@@ -222,6 +225,42 @@ pub struct QuasiParticle {
     /// and the folds then grow as `nocc*nvir_full` and `naux*nao^2`, so a
     /// 20-atom molecule in def2-TZVP exhausts 30 GB before the gradient starts.
     pub gradient_bse_window:f64,
+    /// **Fixed-size** alternative to `gradient_bse_window`: take the `n` lowest
+    /// virtual orbitals at *every* geometry, so the BSE transition space keeps a
+    /// constant dimension along a relaxation path.
+    ///
+    /// The energy window above moves with the orbital energies, so a virtual
+    /// orbital drifts in and out of the space from step to step (observed:
+    /// `dim 816 -> 864 -> 1008` on azobenzene/def2-TZVPP), which makes the
+    /// energy `E_GS + Omega` discontinuous at those crossings and can also
+    /// exchange the identity of the lowest root.  `0` keeps the energy-window
+    /// behaviour.  Default `0`.
+    pub gradient_bse_nvir:usize,
+    /// Write the BSE amplitudes `(X, Y)` of every solved root to this file
+    /// (one block per root).  Empty leaves them unsaved.
+    ///
+    /// A geometry-optimisation driver outside REST needs them to follow a
+    /// *state* by the overlap of its amplitudes from one geometry to the next
+    /// (the root index alone can swap character when two states cross), and it
+    /// makes the run auditable afterwards.  Size is `2*nocc*nvir` doubles per
+    /// root, i.e. a few kB.  Default empty.
+    pub gradient_amplitude_path:String,
+    /// **Stage 1 of the two-stage excited-state workflow**: when `true`, a
+    /// `bse_gradient` card solves `bse_roots_n` roots, writes their identifying
+    /// data (energy, oscillator strength, dipole components, dominant
+    /// transitions, amplitudes) to `bse_roots_path` and returns **without
+    /// assembling any gradient**.
+    ///
+    /// The per-root gradient assembly is the expensive part, so this makes the
+    /// "which state is which" decision cheap; a second card then picks the root
+    /// by those fingerprints (`gradient_state`) and differentiates it alone.
+    /// Combine with `save_gw_checkpoint` so the second card can reuse the GW
+    /// archive.  Default `false`.
+    pub bse_roots_only:bool,
+    /// Output file of the stage-1 root dump (JSON).  Default `bse_roots.json`.
+    pub bse_roots_path:String,
+    /// Number of roots solved by `bse_roots_only`.  Default `8`.
+    pub bse_roots_n:usize,
     /// Orbital energies that build the BSE screening inside the gradient:
     /// `"reference"` (mean-field, REST's default) or `"qp"`.  Default
     /// `"reference"`.
@@ -571,6 +610,11 @@ impl Default for QuasiParticle {
             gradient_state:0,
             gradient_nroots:0,
             gradient_bse_window:0.0,
+            gradient_bse_nvir:0,
+            gradient_amplitude_path:String::new(),
+            bse_roots_only:false,
+            bse_roots_path:String::from("bse_roots.json"),
+            bse_roots_n:8,
             gradient_screening:String::from("reference"),
             gradient_force_fallback:String::new(),
             gradient_force_linearized:String::new(),
@@ -742,6 +786,11 @@ impl QuasiParticle {
         table.insert("gradient_state".to_string(), toml::Value::Integer(self.gradient_state as i64));
         table.insert("gradient_nroots".to_string(), toml::Value::Integer(self.gradient_nroots as i64));
         table.insert("gradient_bse_window".to_string(), toml::Value::Float(self.gradient_bse_window));
+        table.insert("gradient_bse_nvir".to_string(), toml::Value::Integer(self.gradient_bse_nvir as i64));
+        table.insert("gradient_amplitude_path".to_string(), toml::Value::String(self.gradient_amplitude_path.clone()));
+        table.insert("bse_roots_only".to_string(), toml::Value::Boolean(self.bse_roots_only));
+        table.insert("bse_roots_path".to_string(), toml::Value::String(self.bse_roots_path.clone()));
+        table.insert("bse_roots_n".to_string(), toml::Value::Integer(self.bse_roots_n as i64));
         table.insert("gradient_screening".to_string(), toml::Value::String(self.gradient_screening.clone()));
         table.insert("gradient_force_fallback".to_string(), toml::Value::String(self.gradient_force_fallback.clone()));
         table.insert("gradient_force_linearized".to_string(), toml::Value::String(self.gradient_force_linearized.clone()));
@@ -1282,6 +1331,28 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
                 serde_json::Value::String(s) => s.trim().parse().unwrap_or(0.0),
                 _ => 0.0,
+            };
+            tmp_input.gradient_bse_nvir = match tmp_ctrl.get("gradient_bse_nvir").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+                serde_json::Value::String(s) => s.trim().parse().unwrap_or(0),
+                _ => 0,
+            };
+            tmp_input.bse_roots_only = match tmp_ctrl.get("bse_roots_only").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_b) => {*tmp_b},
+                other => {false},
+            };
+            tmp_input.bse_roots_path = match tmp_ctrl.get("bse_roots_path").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::from("bse_roots.json"),
+            };
+            tmp_input.bse_roots_n = match tmp_ctrl.get("bse_roots_n").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(8) as usize,
+                serde_json::Value::String(s) => s.trim().parse().unwrap_or(8),
+                _ => 8,
+            };
+            tmp_input.gradient_amplitude_path = match tmp_ctrl.get("gradient_amplitude_path").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::new(),
             };
             tmp_input.gradient_screening = match tmp_ctrl.get("gradient_screening").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => s.to_lowercase(),

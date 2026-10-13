@@ -84,14 +84,14 @@ use crate::ri_rpa::{gauss_legendre_grids, logarithmic_grid, trans_gauss_legendre
 use crate::scf_io::SCF;
 use rest_libcint::prelude::*;
 use rest_tensors::matrix::matrix_blas_lapack::{
-    _dgemm_full, _dpotrf, _dsolve, _dsyev_inplace, _dtrtrs,
+    _dgemm_full, _dpotrf, _dsolve, _dsyev_inplace, _dsyevd_inplace, _dtrtrs,
 };
 use tensors::{MathMatrix, MatrixFull};
 use num_complex::Complex;
 
 use rayon::prelude::*;
 use std::cell::RefCell;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::os::raw::c_char;
 use std::time::Instant;
 
@@ -449,6 +449,15 @@ pub struct GwGradConfig {
     /// Requires a non-degenerate HF reference; otherwise the gradient falls
     /// back to the per-perturbation route.
     pub adjoint_cphf: bool,
+    /// **Experimental**: extend the adjoint (Z-vector) CP-HF route to DFT and
+    /// hybrid (CP-KS) references, whose response operator carries the XC kernel
+    /// and whose static term `B_n` carries the `-v_xc` derivative.  Two kernel
+    /// sweeps are folded into the adjoint right-hand side (one for the adjoint
+    /// density `Lambda`, one for the `b_x`-weighted density) and the explicit
+    /// part of `b_x` is supplied per perturbation, replacing the `3 natm`-column
+    /// canonical CP-KS solve.  Off by default: with it off a DFT reference keeps
+    /// using the canonical route, exactly as before.
+    pub adjoint_cphf_dft: bool,
     /// Locality-aware evaluation of the `dI` contraction
     /// ([`GwGradEngine::adjoint_perturbation_gradient_local`]).  `dI` is
     /// nonzero only on the perturbed atom's own AO rows/columns
@@ -575,6 +584,8 @@ impl Default for GwGradConfig {
             skip_lr_cache: false,
             folded_qx: true,
             adjoint_cphf: true,
+            adjoint_cphf_dft: std::env::var("REST_ADJOINT_DFT")
+                .map_or(false, |v| v != "0"),
             local_di: true,
             keep_adjoint_pieces: false,
             resp_cache_kernel: true,
@@ -679,11 +690,23 @@ pub struct RawRiTensors {
     pub natm: usize,
     /// I[mu + nu*nao + P*nao*nao], col-major [nao, nao, naux].
     ///
-    /// Held behind a [`RefCell`] so that a task which has finished with it can release
-    /// `nao^2 * naux` doubles (874 MB at naphthalene/def2-TZVP) with
-    /// [`RawRiTensors::evict_i3`]; every reader goes through [`RawRiTensors::with_i3`],
-    /// which re-evaluates the three-centre integrals on demand.
-    pub i3: RefCell<Vec<f64>>,
+    /// Held as `Arc` inside a `Mutex<Option<..>>` rather than in a [`RefCell`], so
+    /// that the many rayon workers of the canonical CP-KS assembly can read it
+    /// concurrently while one of them is inside a long [`RawRiTensors::with_i3`]
+    /// closure (`j_deriv_from` / `k_deriv_from` / `build_q` all wrap their whole
+    /// body in one).  With a `RefCell` those readers could neither borrow nor make
+    /// progress: `ensure_i3` returned immediately while the cell was borrowed, so
+    /// `with_i3` **spun at 100% CPU** until the holder finished.  Measured on
+    /// acetylene/def2-TZVPP: three workers spinning for hours, ~44k wasted
+    /// CPU-seconds on a job whose real work is ~12.7k, i.e. a phase that runs
+    /// single-threaded while looking busy.
+    ///
+    /// Now a reader clones the `Arc` and drops the lock at once (readers never
+    /// block each other, nothing spins), and the build happens under the lock, so
+    /// a concurrent caller sleeps on the mutex instead of recomputing the
+    /// integrals.  `nao^2 * naux` doubles (874 MB at naphthalene/def2-TZVP) are
+    /// still released by [`RawRiTensors::evict_i3`], which drops the `Arc`.
+    pub i3: Mutex<Option<Arc<Vec<f64>>>>,
     /// J[P + Q*naux]
     pub j2: Vec<f64>,
     /// dJ1[P + Q*naux + t*naux*naux]
@@ -767,7 +790,7 @@ pub fn build_raw_ri_tensors(scf: &SCF) -> RawRiTensors {
         nao,
         naux,
         natm,
-        i3: RefCell::new(Vec::new()),
+        i3: Mutex::new(None),
         j2,
         dj1,
         ao_atom: atom_map_from_slices(&ao_slices, nao),
@@ -785,53 +808,50 @@ impl RawRiTensors {
     /// Run `f` on the raw three-centre integrals, re-evaluating them if a previous
     /// [`Self::evict_i3`] released them.
     ///
-    /// The closure runs while the buffer is borrowed; nested readers are fine (they only take
-    /// shared borrows), but nothing inside may evict.
+    /// The closure runs on an owned `Arc` handle, *not* while a lock is held: several rayon
+    /// workers may be inside `with_i3` at the same time, and one of them may run for a long
+    /// time (the canonical `j_deriv_from`/`k_deriv_from` wrap their whole body in it).  With
+    /// the previous `RefCell` implementation those concurrent readers could neither borrow
+    /// nor make progress -- `ensure_i3` returned immediately while the cell was borrowed and
+    /// the retry loop spun at 100% CPU.  Nothing inside may call [`Self::evict_i3`] and
+    /// expect the release to take effect immediately: the caller's `Arc` keeps the buffer
+    /// alive until it returns.
     pub fn with_i3<R>(&self, f: impl FnOnce(&[f64]) -> R) -> R {
-        // Never panic on a concurrent rebuild: `i3` is read by several rayon workers
-        // (the canonical CP-HF assembly, the QP cache build) and its cold path assigns
-        // through `borrow_mut`.  Retry until a shared borrow of a resident buffer is
-        // available; `ensure_i3` itself is written to be panic-free.
-        loop {
-            if let Ok(g) = self.i3.try_borrow() {
-                if !g.is_empty() {
-                    return f(&g);
-                }
-            }
-            self.ensure_i3();
+        let i3 = self.i3_shared();
+        f(i3.as_slice())
+    }
+
+    /// The resident three-centre integrals, built on first use.
+    ///
+    /// Building happens under the lock, so concurrent callers wait (sleeping on the mutex)
+    /// instead of each re-evaluating `int3c2e` and throwing all but one result away.
+    pub fn i3_shared(&self) -> Arc<Vec<f64>> {
+        let mut slot = self.i3.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(resident) = slot.as_ref() {
+            return Arc::clone(resident);
         }
+        let t0 = Instant::now();
+        let (i3, shape3) =
+            CInt::integrate_cross("int3c2e", [&self.mol, &self.mol, &self.auxmol], "s1", None).into();
+        if std::env::var("REST_GWGRAD_MEMDBG").is_ok() {
+            println!(
+                "[memdbg]   i3 re-evaluation (int3c2e, {:.1} MB): {:.3}s",
+                (self.nao * self.nao * self.naux) as f64 * 8.0 / 1048576.0,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        assert_eq!(shape3, vec![self.nao, self.nao, self.naux], "int3c2e s1 shape");
+        let arc = Arc::new(i3);
+        *slot = Some(Arc::clone(&arc));
+        arc
     }
 
     /// Rebuild the three-centre integrals when they are not resident.
     ///
-    /// Callers that keep a [`std::cell::Ref`] guard for a whole routine (the TDDFT gradient's
-    /// Coulomb/`Y` helpers) call this once on entry, then borrow `i3` directly.
+    /// Callers that need the buffer for a whole routine (the TDDFT gradient's Coulomb/`Y`
+    /// helpers) take it once with [`Self::i3_shared`] and keep the `Arc`.
     pub fn ensure_i3(&self) {
-        // `try_borrow`/`try_borrow_mut` throughout: a worker may hold the borrow while
-        // another one rebuilds, and a panic there kills the whole gradient.  A losing
-        // racer simply drops its redundant integral evaluation.
-        let empty = match self.i3.try_borrow() {
-            Ok(g) => g.is_empty(),
-            Err(_) => return,
-        };
-        if empty {
-            let t0 = Instant::now();
-            let (i3, shape3) =
-                CInt::integrate_cross("int3c2e", [&self.mol, &self.mol, &self.auxmol], "s1", None).into();
-            if std::env::var("REST_GWGRAD_MEMDBG").is_ok() {
-                println!(
-                    "[memdbg]   i3 re-evaluation (int3c2e, {:.1} MB): {:.3}s",
-                    (self.nao * self.nao * self.naux) as f64 * 8.0 / 1048576.0,
-                    t0.elapsed().as_secs_f64()
-                );
-            }
-            assert_eq!(shape3, vec![self.nao, self.nao, self.naux], "int3c2e s1 shape");
-            if let Ok(mut slot) = self.i3.try_borrow_mut() {
-                if slot.is_empty() {
-                    *slot = i3;
-                }
-            }
-        }
+        let _ = self.i3_shared();
     }
 
     /// Evaluate the raw three-centre integrals **auxiliary-atom block by auxiliary-atom block** and
@@ -1072,9 +1092,18 @@ impl RawRiTensors {
         (blk, f0, f1)
     }
 
-    /// Debug probe: is the raw-integral buffer currently mutably borrowed?
+    /// Debug probe: is another thread currently building or reading the raw-integral buffer?
     pub fn i3_dbg_try_borrow(&self) -> bool {
-        self.i3.try_borrow().is_err()
+        self.i3.try_lock().is_err()
+    }
+
+    /// Length of the resident raw-integral buffer (0 while evicted) -- profiling aid.
+    pub fn i3_len(&self) -> usize {
+        self.i3
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0, |v| v.len())
     }
 
     /// Release the raw three-centre integrals (`nao^2 * naux` doubles).
@@ -1082,9 +1111,10 @@ impl RawRiTensors {
     /// They are re-evaluated on demand by [`Self::with_i3`], so this only trades memory for the
     /// integral work of whoever needs them next. Tasks that hold their own copies of what they
     /// need (the CD-GW adjoint gradient after its Coulomb/`Y` contractions) can drop them for
-    /// the rest of the calculation.
+    /// the rest of the calculation.  Handles already taken with [`Self::i3_shared`] keep the
+    /// buffer alive until they are dropped.
     pub fn evict_i3(&self) {
-        self.i3.replace(Vec::new());
+        *self.i3.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Shell-sliced derivative integral blocks of one perturbed atom,
@@ -1374,9 +1404,17 @@ fn metric_transform_blocked(s_metric: &[f64], q: &[f64], naux: usize, ncol: usiz
 /// NOTE: the LAPACK bindings of this build leave `info = n` even on trivial
 /// input while returning correct results (REST's production code therefore
 /// ignores `info` as well); we validate the eigenvalues instead.
+///
+/// Driver choice: `dsyevd` (divide and conquer), not `dsyev`.  The chi0
+/// factorisation in [`build_lr_factor`] is called once per (orbital, frequency
+/// node) pair -- ~2000 times per excited-state gradient at azobenzene/
+/// def2-TZVPP, with `naux = 1234`.  `dsyev` is dominated by the *serial*
+/// tridiagonal QR iteration and hardly threads at all (benchmarked on this
+/// machine: 2.86 s single-thread, 2.37 s at 16 threads), whereas `dsyevd` is
+/// 0.50 s / 0.20 s -- an order of magnitude, and it uses the pool.
 fn eigh_symmetric(a: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
     let mat = to_mat(a, n, n);
-    let (vecs, vals, _info) = _dsyev_inplace(mat, 'V');
+    let (vecs, vals, _info) = _dsyevd_inplace(mat, 'V');
     let vals = vals;
     assert!(
         vals.iter().all(|v| v.is_finite()),
@@ -6908,13 +6946,14 @@ impl GwGradEngine<'_> {
             // it in place, so its `naux * nao * nao` tensor becomes `adj.di_cov` instead of being
             // duplicated; only the small `w_rot` is left to release here.
             let adj = self
-                .build_cphf_adjoint(&mut fold, &be[0])
+                .build_cphf_adjoint(&mut fold, &be[0], Some(&bb[0]))
                 .expect("`supports_cphf_adjoint` and `build_cphf_adjoint` share this guard");
             drop(fold);
             mem_probe("gradient: after build_cphf_adjoint");
             let mut grad = vec![0.0f64; self.natm * 3];
-            // HF reference only (guaranteed by `build_cphf_adjoint`)
-            let zero_bx = vec![0.0f64; self.nmo];
+            // Explicit v_xc grid derivative of a DFT reference (one sweep, shared
+            // by every perturbation); `None` for HF, where `b_x` is identically 0.
+            let vxc_atoms = self.vxc_grid_derivative_atoms();
             for atm in 0..self.natm {
                 let h1r = crate::hessian::rhf::build_hcore_first_deriv(&self.scf.mol, atm);
                 let s1r = crate::ri_cphf::cphf_solver_pyscf::build_s1ao_deriv(&self.scf.mol, atm);
@@ -6923,10 +6962,15 @@ impl GwGradEngine<'_> {
                 if atm == 0 {
                     mem_probe("gradient: inside per-direction loop (1st dir)");
                 }
+                let bx3: Vec<Vec<f64>> = match vxc_atoms.as_ref() {
+                    Some(a) => (0..3).map(|c| self.vxc_diag_bx(a, atm, c)).collect(),
+                    None => vec![vec![0.0f64; self.nmo]; 3],
+                };
                 if self.config.local_di {
                     let djs: Vec<Vec<f64>> = (0..3).map(|c| self.raw.d_j_atom(atm, c)).collect();
                     let g3 = self.adjoint_perturbation_gradient_local(
-                        &adj, atm, &h1r, &s1r, &djs, &bj[0], &bb[0], &zero_bx, atm * 3,
+                        &adj, atm, &h1r, &s1r, &djs, &bj[0], &bb[0], &bx3,
+                        vxc_atoms.as_ref().map(|a| &a[atm]), atm * 3,
                     );
                     grad[atm * 3..atm * 3 + 3].copy_from_slice(&g3);
                 } else {
@@ -6935,7 +6979,7 @@ impl GwGradEngine<'_> {
                         let dj = self.raw.d_j_atom(atm, comp);
                         grad[atm * 3 + comp] = self.adjoint_perturbation_gradient(
                             &adj, &blocks, comp, &h1r, &s1r[comp], &dj, &bj[0], &bb[0],
-                            &zero_bx, atm * 3 + comp,
+                            &bx3[comp], vxc_atoms.as_ref().map(|a| &a[atm]), atm * 3 + comp,
                         );
                     }
                 }
@@ -7017,6 +7061,16 @@ fn vxc_block_ao(flat: &[f64], comp: usize, nao: usize) -> Vec<f64> {
         }
     }
     out
+}
+
+/// Temporary bisection mask for the DFT adjoint terms (debug only):
+/// bit0 = XC kernel in `vtil`, bit1 = orbital-rotation part of `b_x`,
+/// bit2 = kernel-response part of `b_x`.  Default 7 (all terms on).
+fn dft_debug_mask() -> u32 {
+    std::env::var("REST_ADJOINT_DFT_MASK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7)
 }
 
 fn nearest_grid_value(zs: &[f64], z: f64) -> f64 {
@@ -8765,7 +8819,47 @@ impl GwGradEngine<'_> {
     /// return: if that function ever declines for another reason, callers that
     /// rely on it must be revisited too.
     pub fn supports_cphf_adjoint(&self) -> bool {
-        self.scf.mol.xc_data.dfa_compnt_scf.is_empty()
+        if self.scf.mol.xc_data.dfa_compnt_scf.is_empty() {
+            return true;                       // plain HF (the validated route)
+        }
+        // DFT / global-hybrid (CP-KS): requires the kernel terms of
+        // `build_cphf_adjoint`, which are opt-in; range-separated hybrids are
+        // rejected by the energy path already.
+        self.config.adjoint_cphf_dft && self.scf.mol.xc_data.omega().is_none()
+    }
+
+    /// Per-atom explicit grid derivative of `v_xc` (`d v_xc/dR` at frozen
+    /// density and orbitals), `[natm][3*nao*nao]`, or `None` for an HF
+    /// reference.  One grid sweep; shared by the canonical route's CP-KS
+    /// right-hand side and by the adjoint route's `b_x` covector.
+    pub fn vxc_grid_derivative_atoms(&self) -> Option<Vec<Vec<f64>>> {
+        if self.scf.mol.xc_data.dfa_compnt_scf.is_empty() {
+            return None;
+        }
+        let t0 = Instant::now();
+        let v = crate::hessian::rks::compute_vxc_h1ao(self.scf);
+        if grad_timing() {
+            eprintln!(
+                "[gw_grad timing]   cphf: vxc_deriv1 grid sweep {:8.2}s",
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        Some(v)
+    }
+
+    /// Explicit part of the `b_x` covector of perturbation `(atm, comp)` in the
+    /// MO basis, `b_x[p] = -<p| d v_xc^expl/dR |p>`.  The two U-dependent parts
+    /// (orbital rotation `-2 sum_q U[q,p] v_xc[q,p]` and the kernel response of
+    /// the first-order density) are folded into the adjoint right-hand side by
+    /// [`Self::build_cphf_adjoint`], because the adjoint route never forms `U`.
+    pub fn vxc_diag_bx(&self, atoms: &[Vec<f64>], atm: usize, comp: usize) -> Vec<f64> {
+        let nao = self.nao;
+        let nmo = self.nmo;
+        let vao = vxc_block_ao(&atoms[atm], comp, nao);
+        // MO transform and take the diagonal
+        let t = gemm_nt(&self.c_mo.data, nao, nmo, &vao, nao, nao);
+        let vmo = gemm_nn(&t, nmo, nao, &self.c_mo.data, nao, nmo);
+        (0..nmo).map(|p| -vmo[p + p * nmo]).collect()
     }
 
     /// Build the adjoint data (see the section header).  Returns `None` when the
@@ -8775,6 +8869,7 @@ impl GwGradEngine<'_> {
         &self,
         fold: &mut FoldedCovector,
         be_k: &[f64],
+        bb_k: Option<&[f64]>,
     ) -> Option<CphfAdjoint> {
         use crate::analdrv::prelude::{
             AnalDrvConfig, HessNucAPI, RHessCoreAPI, RHessElecInteractAPI, RHessHcore,
@@ -8848,10 +8943,37 @@ impl GwGradEngine<'_> {
         for k in 0..n2 {
             vtil[k] = j_full[k] - 0.5 * self.fock_hyb * k_full[k];
         }
+        // ---- DFT / hybrid references: the XC-kernel part ------------------
+        // `vtil` is the functional derivative of the energy with respect to the
+        // density, so a CP-KS reference adds the kernel's action on the adjoint
+        // density, `vtil += f_xc(Lambda_ao)` -- the exact analogue of the
+        // `f_xc(D^U)` term that the canonical route carries inside its relaxed
+        // first-order Fock (`canonical_finish`).  One grid kernel sweep.
+        let is_hf = self.scf.mol.xc_data.dfa_compnt_scf.is_empty();
+        // One kernel cache for both DFT terms below (the canonical route builds
+        // its own; here two sweeps share one cache).
+        let fxc_cache = if is_hf {
+            None
+        } else {
+            Some(crate::hessian::rks::prepare_fxc_cache(self.scf).expect(
+                "gw_grad: the adjoint CP-KS route needs the XC-kernel cache                  (an scf without grids cannot provide it)",
+            ))
+        };
+        let dft_mask = dft_debug_mask();
+        if !is_hf && dft_mask & 1 != 0 {
+            let cache = fxc_cache.as_ref().expect("cache built above");
+            let fxc = crate::dft::response::compute_fxc_response_ao_cached(
+                cache,
+                &to_mat(&lam_ao, nao, nao),
+            );
+            for (v, f) in vtil.iter_mut().zip(fxc.data.iter()) {
+                *v += *f;
+            }
+        }
         let cocc: Vec<f64> = (0..nocc)
             .flat_map(|i| (0..nao).map(move |mu| self.c_mo[[mu, i]]))
             .collect();
-        let l_mat = {
+        let mut l_mat = {
             let vm = to_mat(&vtil, nao, nao);
             let cm = to_mat(&cocc, nao, nocc);
             let mut tmp = MatrixFull::new([nao, nocc], 0.0);
@@ -8860,6 +8982,53 @@ impl GwGradEngine<'_> {
             _dgemm_full(&self.c_mo, 'T', &tmp, 'N', &mut out, 4.0, 0.0);
             out.data
         };
+        // ---- DFT / hybrid references: the U-dependent part of `b_x` -------
+        // The canonical route's v_xc covector is
+        //   b_x[p] = -[ vd1_pp + [C^T f_xc(D^U) C]_pp + 2 sum_q U[q,p] v_xc[q,p] ],
+        // whose last two terms are linear in the response `U` with known
+        // weights, so in the adjoint route they become a covector on `U`
+        // (added to `l_mat`) instead of a per-perturbation object.  With the
+        // kernel self-adjoint and `D_bb = C diag(bb) C^T`,
+        //   sum_p bb[p] [C^T f_xc(D^U) C]_pp = Tr[D^U f_xc(D_bb)]
+        //                                     = 4 sum_{p,i} (C^T X C)[p,i] U[p,i],
+        // so both terms cost one kernel sweep in total, independent of `3 natm`.
+        // The explicit `vd1` part stays per perturbation; the caller passes it
+        // as the `b_x` argument of the perturbation contractions.
+        if !is_hf && dft_mask & 6 != 0 {
+            if let Some(bb) = bb_k {
+                if dft_mask & 2 != 0 {
+                for i in 0..nocc {
+                    for p in 0..nmo {
+                        l_mat[p + i * nmo] -= 2.0 * self.vxc_mo[p + i * nmo] * bb[i];
+                    }
+                }
+                }
+                if dft_mask & 4 != 0 {
+                let mut dbb = vec![0.0f64; n2];
+                for mu in 0..nao {
+                    for nu in 0..nao {
+                        let mut acc = 0.0;
+                        for p in 0..nmo {
+                            acc += self.c_mo[[mu, p]] * bb[p] * self.c_mo[[nu, p]];
+                        }
+                        dbb[mu + nu * nao] = acc;
+                    }
+                }
+                let cache = fxc_cache.as_ref().expect("cache built above");
+                let x = crate::dft::response::compute_fxc_response_ao_cached(
+                    cache,
+                    &to_mat(&dbb, nao, nao),
+                );
+                let t = gemm_nt(&self.c_mo.data, nao, nmo, &x.data, nao, nao);
+                let xmo = gemm_nn(&t, nmo, nao, &self.c_mo.data, nao, nmo);
+                for i in 0..nocc {
+                    for p in 0..nmo {
+                        l_mat[p + i * nmo] -= 4.0 * xmo[p + i * nmo];
+                    }
+                }
+                }
+            }
+        }
 
         // ---- (c) one adjoint CP-HF solve -> Z, and <Z, rhs_d> -------------
         let t_all = Instant::now();
@@ -8898,6 +9067,10 @@ impl GwGradEngine<'_> {
         let nvir: usize;
         let e_ai_shift: Vec<f64>;
         let f1mo_ref: Option<Vec<f64>>;
+        assert!(
+            is_hf || self.config.fold_cphf_rhs,
+            "gw_grad: the adjoint CP-KS route needs fold_cphf_rhs = true"
+        );
         let fold_rhs = self.config.fold_cphf_rhs;
         {
         let mut resp = rscf_resp_interface(self.scf, &config);
@@ -9271,6 +9444,7 @@ impl GwGradEngine<'_> {
         bj_k: &[f64],
         bb_k: &[f64],
         b_x: &[f64],
+        vxc_atom: Option<&Vec<f64>>,
         dir: usize,
     ) -> f64 {
         let n2 = self.nao * self.nao;
@@ -9286,7 +9460,10 @@ impl GwGradEngine<'_> {
             g += 0.5 * flat_dot(&adj.di_cov[off..off + n2], &ip);
             g_dm += 0.5 * adj.lam_tilde[p] * flat_dot(&adj.dm_sym, &ip);
         }
-        self.finish_adjoint_gradient(adj, comp, h1r, s1_comp, dj, bj_k, bb_k, b_x, dir, g + g_dm)
+        let vd1 = vxc_atom.map(|v| vxc_block_ao(v, comp, self.nao));
+        self.finish_adjoint_gradient(
+            adj, comp, h1r, s1_comp, dj, bj_k, bb_k, b_x, vd1.as_deref(), dir, g + g_dm,
+        )
     }
 
     /// Locality-aware variant of [`GwGradEngine::adjoint_perturbation_gradient`].
@@ -9311,7 +9488,8 @@ impl GwGradEngine<'_> {
         djs: &[Vec<f64>],
         bj_k: &[f64],
         bb_k: &[f64],
-        b_x: &[f64],
+        b_x3: &[Vec<f64>],   // one v_xc covector per Cartesian component
+        vxc_atom: Option<&Vec<f64>>,
         dir0: usize,
     ) -> [f64; 3] {
         let nao = self.nao;
@@ -9453,9 +9631,10 @@ impl GwGradEngine<'_> {
         }
         let mut out = [0.0f64; 3];
         for comp in 0..3 {
+            let vd1 = vxc_atom.map(|v| vxc_block_ao(v, comp, self.nao));
             out[comp] = self.finish_adjoint_gradient(
-                adj, comp, h1r, &s1_all[comp], &djs[comp], bj_k, bb_k, b_x, dir0 + comp,
-                g_di[comp] + g_dm[comp],
+                adj, comp, h1r, &s1_all[comp], &djs[comp], bj_k, bb_k, &b_x3[comp],
+                vd1.as_deref(), dir0 + comp, g_di[comp] + g_dm[comp],
             );
         }
         out
@@ -9474,6 +9653,7 @@ impl GwGradEngine<'_> {
         bj_k: &[f64],
         bb_k: &[f64],
         b_x: &[f64],
+        vxc_d1_ao: Option<&[f64]>,
         dir: usize,
         acc: f64,
     ) -> f64 {
@@ -9517,6 +9697,15 @@ impl GwGradEngine<'_> {
         if adj.fold_rhs {
             g += flat_dot(&adj.w_dh1, &h1r[comp * n2..(comp + 1) * n2]);
             g += flat_dot(&adj.w_ds, s1_comp);
+        }
+        // DFT reference: the frozen-density v_xc skeleton enters the CP-KS
+        // right-hand side exactly like the core part of `f1mo`,
+        //   rhs_vxc[vir,occ] = -vxc_d1_mo[vir,occ] / D_ai ,
+        // so `sum_d <Z, rhs_d>` contributes the *same* folded covector, namely
+        // `<W, vxc_d1_ao>`.  (The canonical route adds this term to its `rhs`
+        // and to `f1_skel_mo`; this is its adjoint image.)
+        if let Some(vd1) = vxc_d1_ao {
+            g += flat_dot(&adj.w_dh1, vd1);
         }
         // metric channel, static term and the adjoint CP-HF channel
         g += flat_dot(bj_k, dj);

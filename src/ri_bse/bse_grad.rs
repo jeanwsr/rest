@@ -1769,6 +1769,31 @@ impl<'a> BseGradEngine<'a> {
         // which the gradient phase pays back with interest.  A bounded batch of 3
         // also trips a `RefCell` panic.  See
         // `docs/GW_BSE_并行效率优化方案.md` section 20.
+        // BLAS threads for the serial build below.  `build_target_cache_compact`
+        // is pure BLAS/LAPACK: per orbital it factorises one `naux x naux` chi0
+        // per frequency node (20 nodes, `naux = 1234` at azobenzene/def2-TZVPP),
+        // so the whole loop is thousands of dense `dsyevd` calls with no rayon
+        // parallelism to fall back on.  The *process-wide* OpenBLAS thread count
+        // is what decides how fast they run, and because this library is the
+        // pthread build (`libopenblasp`, verified via /proc/<pid>/maps) the
+        // `omp_set_num_threads(1)` guards elsewhere in REST do **not** reach it --
+        // only `openblas_set_num_threads` does, which
+        // `omp_set_num_threads_global_wrapper` sets together with the OpenMP
+        // one.  A launcher that exports `OPENBLAS_NUM_THREADS=1` (the historical
+        // advice, to keep BLAS from oversubscribing the rayon regions) would
+        // otherwise pin this loop to a single core: measured 120% CPU of 1600%
+        // available, and an excited-state gradient that takes hours instead of
+        // minutes.  Restore whatever the caller had on the way out so the
+        // phase-local policy of the surrounding code is preserved.
+        let blas_threads_saved =
+            rest_tensors::matrix_blas_lapack::blas_get_num_threads_wrapper();
+        let blas_threads_want = scf
+            .mol
+            .ctrl
+            .num_threads
+            .unwrap_or_else(|| rayon::current_num_threads())
+            .max(1);
+        rest_tensors::matrix_blas_lapack::omp_set_num_threads_global_wrapper(blas_threads_want);
         for n in 0..gw.nmo {
             if needed(n) {
                 let c = gw.build_target_cache_compact(n);
@@ -1779,6 +1804,7 @@ impl<'a> BseGradEngine<'a> {
                 crate::hessian::memory_monitor::trim_to_os(0);
             }
         }
+        rest_tensors::matrix_blas_lapack::omp_set_num_threads_global_wrapper(blas_threads_saved);
         // the metric-transformed blocks are only read while a QP cache is
         // built; the low-rank factors they helped build stay resident for the
         // pullback (`with_qt`/`with_qtia` would rebuild the blocks on demand)
@@ -2227,7 +2253,11 @@ impl<'a> BseGradEngine<'a> {
             let per_atom: Vec<AdjointAtomData> = (0..self.gw.natm)
                 .map(|atm| AdjointAtomData::build(self.gw, atm))
                 .collect();
-            let zero_bx = vec![0.0f64; nmo];
+            // Explicit v_xc grid derivative of a DFT reference: one sweep,
+            // shared by every root and perturbation (`None` for HF, whose
+            // `b_x` is identically zero).  `b_x`'s U-dependent parts live in
+            // the adjoint right-hand side (`build_cphf_adjoint`).
+            let vxc_atoms = self.gw.vxc_grid_derivative_atoms();
             // Expand the kernel covector into each root's QP covector and pack
             // it in place before folding: the packed pair covector is half the
             // full one, and after this loop only the packed forms are resident.
@@ -2255,17 +2285,21 @@ impl<'a> BseGradEngine<'a> {
                 let t_adj = Instant::now();
                 let adj = self
                     .gw
-                    .build_cphf_adjoint(&mut fold, &be[k])
+                    .build_cphf_adjoint(&mut fold, &be[k], Some(&bb[k]))
                     .expect("bse_grad: adjoint route guard changed");
                 let t_adj = t_adj.elapsed().as_secs_f64();
                 drop(fold);
                 let t_pert = Instant::now();
                 for atm in 0..self.gw.natm {
                     let d = &per_atom[atm];
+                    let bx3: Vec<Vec<f64>> = match vxc_atoms.as_ref() {
+                        Some(a) => (0..3).map(|c| self.gw.vxc_diag_bx(a, atm, c)).collect(),
+                        None => vec![vec![0.0f64; nmo]; 3],
+                    };
                     if self.gw.config.local_di {
                         let g3 = self.gw.adjoint_perturbation_gradient_local(
-                            &adj, atm, &d.h1r, &d.s1r, &d.djs, &bj[k], &bb[k], &zero_bx,
-                            atm * 3,
+                            &adj, atm, &d.h1r, &d.s1r, &d.djs, &bj[k], &bb[k], &bx3,
+                            vxc_atoms.as_ref().map(|a| &a[atm]), atm * 3,
                         );
                         grads[k][atm * 3..atm * 3 + 3].copy_from_slice(&g3);
                     } else {
@@ -2273,7 +2307,8 @@ impl<'a> BseGradEngine<'a> {
                         for comp in 0..3 {
                             grads[k][atm * 3 + comp] = self.gw.adjoint_perturbation_gradient(
                                 &adj, &blocks, comp, &d.h1r, &d.s1r[comp], &d.djs[comp],
-                                &bj[k], &bb[k], &zero_bx, atm * 3 + comp,
+                                &bj[k], &bb[k], &bx3[comp],
+                                vxc_atoms.as_ref().map(|a| &a[atm]), atm * 3 + comp,
                             );
                         }
                     }
@@ -2305,7 +2340,7 @@ impl<'a> BseGradEngine<'a> {
             // transformed integrals stay released instead of being rebuilt for
             // a non-streaming fold (874 MB at naphthalene/def2-TZVP).
             let mut per_atom: Option<Vec<AdjointAtomData>> = None;
-            let zero_bx = vec![0.0f64; nmo];
+            let vxc_atoms = self.gw.vxc_grid_derivative_atoms();
             let npack = crate::ri_gw::gw_grad::packed_pair_count(nmo);
             let mut folds: Vec<Option<crate::ri_gw::gw_grad::FoldedCovector>> =
                 (0..nk).map(|_| None).collect();
@@ -2325,15 +2360,19 @@ impl<'a> BseGradEngine<'a> {
                     });
                     let adj = self
                         .gw
-                        .build_cphf_adjoint(&mut fold, &be[k])
+                        .build_cphf_adjoint(&mut fold, &be[k], Some(&bb[k]))
                         .expect("bse_grad: adjoint route guard changed");
                     drop(fold);
                     for atm in 0..self.gw.natm {
                         let d = &pa[atm];
+                        let bx3: Vec<Vec<f64>> = match vxc_atoms.as_ref() {
+                            Some(a) => (0..3).map(|c| self.gw.vxc_diag_bx(a, atm, c)).collect(),
+                            None => vec![vec![0.0f64; nmo]; 3],
+                        };
                         if self.gw.config.local_di {
                             let g3 = self.gw.adjoint_perturbation_gradient_local(
-                                &adj, atm, &d.h1r, &d.s1r, &d.djs, &bj[k], &bb[k], &zero_bx,
-                                atm * 3,
+                                &adj, atm, &d.h1r, &d.s1r, &d.djs, &bj[k], &bb[k], &bx3,
+                                vxc_atoms.as_ref().map(|a| &a[atm]), atm * 3,
                             );
                             grads[k][atm * 3..atm * 3 + 3].copy_from_slice(&g3);
                         } else {
@@ -2341,7 +2380,8 @@ impl<'a> BseGradEngine<'a> {
                             for comp in 0..3 {
                                 grads[k][atm * 3 + comp] = self.gw.adjoint_perturbation_gradient(
                                     &adj, &blocks, comp, &d.h1r, &d.s1r[comp], &d.djs[comp],
-                                    &bj[k], &bb[k], &zero_bx, atm * 3 + comp,
+                                    &bj[k], &bb[k], &bx3[comp],
+                                    vxc_atoms.as_ref().map(|a| &a[atm]), atm * 3 + comp,
                                 );
                             }
                         }
