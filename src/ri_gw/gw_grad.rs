@@ -449,14 +449,27 @@ pub struct GwGradConfig {
     /// Requires a non-degenerate HF reference; otherwise the gradient falls
     /// back to the per-perturbation route.
     pub adjoint_cphf: bool,
-    /// **Experimental**: extend the adjoint (Z-vector) CP-HF route to DFT and
-    /// hybrid (CP-KS) references, whose response operator carries the XC kernel
-    /// and whose static term `B_n` carries the `-v_xc` derivative.  Two kernel
-    /// sweeps are folded into the adjoint right-hand side (one for the adjoint
-    /// density `Lambda`, one for the `b_x`-weighted density) and the explicit
-    /// part of `b_x` is supplied per perturbation, replacing the `3 natm`-column
-    /// canonical CP-KS solve.  Off by default: with it off a DFT reference keeps
-    /// using the canonical route, exactly as before.
+    /// Extend the adjoint (Z-vector) CP-HF route to DFT and hybrid (CP-KS)
+    /// references, whose response operator carries the XC kernel and whose
+    /// static term `B_n` carries the `-v_xc` derivative.
+    ///
+    /// Three DFT channels are folded once per geometry (see the section header
+    /// of `build_cphf_adjoint`): `f_xc(Lam_ao)` and `-f_xc(D_bb)` in `Vtil`, the
+    /// `b_x` orbital-rotation covector into `Lambda`/`Lambda_s`, and the
+    /// explicit v_xc skeleton into both the Roothaan covector and the `Z`
+    /// right-hand side.  What remains per perturbation is the same `dI`
+    /// contraction as for HF, replacing the `3 natm`-column canonical CP-KS
+    /// solve.
+    ///
+    /// **On by default** (with `REST_ADJOINT_DFT=0` or the card keyword
+    /// `gradient_adjoint_cphf = false` as the escape hatch): validated against
+    /// the canonical CP-KS route to `~1e-8` relative on water/formaldehyde and
+    /// to `1e-9` absolute on the production PBEh(45%) acene benchmarks
+    /// (`tests/gw_bse/test_adjoint_dft.rs`), which is the direct-vs-folded
+    /// contraction floor and far below the finite-difference accuracy of the
+    /// canonical route itself.  Measured speedup at the production settings:
+    /// 2.9x (benzene/def2-SVP, 36 directions), 5.5x (naphthalene/def2-SVP, 54)
+    /// at 4 threads.
     pub adjoint_cphf_dft: bool,
     /// Locality-aware evaluation of the `dI` contraction
     /// ([`GwGradEngine::adjoint_perturbation_gradient_local`]).  `dI` is
@@ -487,6 +500,20 @@ pub struct GwGradConfig {
     /// 256 MiB keeps the half-transforms (the per-call win) and drops the big tier, costing about
     /// 0.5 s on the Z solve; raise it on a memory-rich machine.
     pub resp_cache_budget_mib: f64,
+    /// Krylov tolerance of the CP-HF/CP-KS response solve (`cpscf_tol`, default
+    /// `1e-9`) and the inflation factor of its intermediate iterations
+    /// (`cpscf_tol_inflation`, default `1000`).
+    ///
+    /// The **adjoint** route's gradient accuracy is set by these directly: its
+    /// CP-HF channel is `<Z, rhs_d>` with `Z = S^T L`, so the Z-solve residual
+    /// enters the gradient linearly, while the canonical route re-derives `u`
+    /// from the relaxed Fock and is far less sensitive.  The default leaves the
+    /// two DFT routes agreeing to ~1e-7 relative; `1e-12`/`10` takes that to the
+    /// ~1e-8 folding floor (see `tests/gw_bse/test_adjoint_dft.rs`) for a few
+    /// extra Krylov iterations on a single right-hand side.
+    pub cpscf_tol: f64,
+    /// Inflation of [`Self::cpscf_tol`] for the intermediate Krylov iterations.
+    pub cpscf_tol_inflation: f64,
     /// Cache the bra-independent intermediates of the RI-JK response kernel
     /// (`analdrv`'s `cpscf_cache_kernel`).  The CP-HF route applies that kernel
     /// to a single right-hand side per Krylov iteration, so it rebuilds the
@@ -584,12 +611,17 @@ impl Default for GwGradConfig {
             skip_lr_cache: false,
             folded_qx: true,
             adjoint_cphf: true,
-            adjoint_cphf_dft: std::env::var("REST_ADJOINT_DFT")
-                .map_or(false, |v| v != "0"),
+            // Validated against the canonical CP-KS route to ~1e-8 relative
+            // (`tests/gw_bse/test_adjoint_dft.rs`), so it is the default for DFT
+            // references too; `REST_ADJOINT_DFT=0` (or the ctrl keyword
+            // `gradient_adjoint_cphf = false`) restores the canonical route.
+            adjoint_cphf_dft: std::env::var("REST_ADJOINT_DFT").map_or(true, |v| v != "0"),
             local_di: true,
             keep_adjoint_pieces: false,
             resp_cache_kernel: true,
             resp_cache_budget_mib: 256.0,
+            cpscf_tol: 1.0e-9,
+            cpscf_tol_inflation: 1000.0,
             fold_cphf_rhs: true,
             compact_qp_cache: false,
             subtracted: true,
@@ -627,6 +659,13 @@ impl GwGradConfig {
             low_rank_interp: if qp.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 },
             graphical_rescue: qp.gradient_graphical_rescue,
             smooth_pole: qp.gradient_smooth_pole,
+            // The input card is the authority for the route choice; the
+            // `REST_ADJOINT_DFT` environment variable can still force it off
+            // (it is read by `Default::default`, and the card value wins when
+            // the keyword is present -- `gradient_adjoint_cphf` defaults to
+            // true, so this is an explicit opt-out).
+            adjoint_cphf_dft: qp.gradient_adjoint_cphf
+                && std::env::var("REST_ADJOINT_DFT").map_or(true, |v| v != "0"),
             ..Default::default()
         }
     }
@@ -6328,6 +6367,11 @@ impl GwGradEngine<'_> {
         let mut config = AnalDrvConfig::default();
         config.resp.cache_kernel = self.config.resp_cache_kernel;
         config.resp.cache_budget = self.config.resp_cache_budget_mib;
+        // The adjoint route's accuracy is set by the Z solve, so the Krylov
+        // tolerances are part of the gradient configuration (and can be
+        // tightened; see `GwGradConfig::cpscf_tol`).
+        config.resp.tol = self.config.cpscf_tol;
+        config.resp.tol_inflation = self.config.cpscf_tol_inflation;
         // upstream (analdrv refactor): the CP-SCF solve now lives in the shared
         // response object, which `RHessSCF` only borrows.
         let mut resp = rscf_resp_interface(self.scf, &config);
@@ -7064,13 +7108,15 @@ fn vxc_block_ao(flat: &[f64], comp: usize, nao: usize) -> Vec<f64> {
 }
 
 /// Temporary bisection mask for the DFT adjoint terms (debug only):
-/// bit0 = XC kernel in `vtil`, bit1 = orbital-rotation part of `b_x`,
-/// bit2 = kernel-response part of `b_x`.  Default 7 (all terms on).
+/// bit0 = XC kernel in `vtil`, bit1 = orbital-rotation part of `b_x` folded into
+/// `Lambda`/`Lambda_s`, bit2 = kernel-response part of `b_x` (`-f_xc(D_bb)`) in
+/// `L`, bit3 = the explicit `v_xc` skeleton in the `Lambda_ao` contraction.
+/// Default 15 (all terms on).
 fn dft_debug_mask() -> u32 {
     std::env::var("REST_ADJOINT_DFT_MASK")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(7)
+        .unwrap_or(15)
 }
 
 fn nearest_grid_value(zs: &[f64], z: f64) -> f64 {
@@ -8741,9 +8787,61 @@ impl<'a> GwCdGradEngine<'a> {
 // `O(naux nao^3 + 3 natm naux nao^2)` instead of `O(3 natm (naux nao^2 nocc +
 // naux nao^3 + ...))`.
 //
-// Only non-degenerate references are supported: inside a symmetry-degenerate
-// shell the response is defined through the eigen-decomposition of the shell
-// block, which is *not* linear in the perturbation.
+// ---------------------------------------------------------------------------
+// CP-KS (DFT / hybrid) references
+// ---------------------------------------------------------------------------
+//
+// A DFT reference changes `f1_mo` and the static term, so (1) gains three
+// channels; all of them are still folded once per geometry:
+//
+//   f1_mo = C^T (dh1 + Jd - hyb Kd/2 + v_xc^expl            <- skeleton
+//                 + J(dm1) - hyb K(dm1)/2 + f_xc(dm1)) C    <- relaxed (via Z)
+//   b_x[p] = -v_xc^expl[p,p] - f_xc_diag(dm1)[p]
+//            - 2 sum_q u[q,p] v_xc_mo[q,p]                   <- `bb` covector
+//
+//  (i) the XC kernel in the adjoint density: `f_xc` is self-adjoint, so
+//      `<Lambda, f_xc(dm1_d)> = Tr[f_xc(Lam_ao) dm1_d]` and it is simply added
+//      to `Vtil` -- one grid sweep, no per-perturbation cost:
+//        Vtil = J[Lam_ao] - hyb K[Lam_ao]/2 + f_xc(Lam_ao) .
+// (ii) the explicit frozen-density v_xc skeleton `v_xc^expl` (= the grid
+//      derivative at fixed density and orbitals, `hessian::rks::compute_vxc_h1ao`)
+//      enters `f1_mo` exactly like `dh1`, so it needs *two* images: the Roothaan
+//      covector `<Lam_ao, v_xc^expl>` (per perturbation, like `<Lam_ao, dh1>`)
+//      and the `Z` right-hand side `-v_xc^expl[vir,occ]/D_ai`, whose fold is
+//      `<W, v_xc^expl>` with `W = Zbra C_occ^T`.
+// (iii) the static term `B_n = e_n + (1-alpha) Sigma_x,nn - v_xc,nn` is
+//      differentiated through the diagonal covector `bb` (`b_x`).  Its
+//      `-f_xc_diag(dm1)` part is `-Tr[f_xc(D_bb) dm1_d]` with
+//      `D_bb = C diag(bb) C^T`, i.e. `-f_xc(D_bb)` added to `Vtil` as well, and
+//      its orbital-rotation part is a covector on the **full** rotation `u`
+//      (every MO column, not only the occupied ones the `Z` solve sees), so it
+//      is folded into `Lambda`/`Lambda_s` before `Lam_ao` is formed:
+//        C[p,q] = -2 bb[q] v_xc_mo[p,q] ,
+//        Lambda[p,q]   += (C[p,q]-C[q,p]) / (2 (e_q-e_p)) ,
+//        Lambda_s[p,q] += (e_p C[q,p]-e_q C[p,q]) / (2 (e_q-e_p)) ,
+//        Lambda_s[p,p] += -C[p,p]/2           (from `u[p,p] = -s1[p,p]/2`).
+//      Dropping this fold (or truncating `C` to its occupied columns, as the
+//      first cut of this route did) leaves an O(1) error in the gradient.
+//
+// `Theta`/`Psi` are built for **unit** exchange, so the skeleton
+// `-hyb Kd/2` enters as `-2 hyb Theta` (`di_cov`) and `hyb <Psi, dJ>` -- an HF
+// reference has `hyb = 1` and cannot see the factor, a hybrid is wrong by
+// `1/hyb` without it (`CphfAdjoint::k_scale`).
+//
+// The XC-kernel terms need the CP-KS grid: `prepare_fxc_cache` (the SCF grid,
+// the same one the canonical route's relaxed Fock uses), one sweep for
+// `f_xc(Lam_ao)` and one for `f_xc(D_bb)`.
+//
+// Symmetry-degenerate shells are handled by the "skip the shell-internal
+// off-diagonal pairs" rule below: for an equal-weight shell average the
+// covectors are isotropic on the shell (Schur's lemma), which reduces the shell
+// block to `be Tr[A] - w sum_i s1[p_i,p_i]`, and the `b_x` rotation cocycle to
+// its diagonal (also isotropic: `v_xc` is totally symmetric, so it is
+// proportional to the identity inside a degenerate shell).
+//
+// Validation: `tests/gw_bse/test_adjoint_dft.rs` (water/formaldehyde/benzene,
+// PBEh(45%), canonical vs adjoint) and the production bench
+// `tests/gw_bse/gw_grad_bench_dft_adjoint.rs`.
 
 /// Per-geometry adjoint data of the CP-HF channel; see the section header.
 pub struct CphfAdjoint {
@@ -8787,6 +8885,10 @@ pub struct CphfAdjoint {
     pub f1mo_ref: Vec<f64>,
     /// exchange scale of the skeleton Fock derivative (always 0.5 here)
     pub half_k: f64,
+    /// hybrid (exact-exchange) fraction of the reference, `fock_hyb`; the
+    /// skeleton exchange is `-0.5 * k_scale * Kd`, so the `Theta`/`Psi` tensors
+    /// built for unit exchange enter the gradient with this weight (`1` for HF).
+    pub k_scale: f64,
     /// `[naux, nao, nao]`: exchange skeleton adjoint tensor `Theta`, kept **only** for
     /// verification of the piecewise identities when
     /// [`GwGradConfig::keep_adjoint_pieces`] is set; empty otherwise, because it is folded
@@ -8898,6 +9000,11 @@ impl GwGradEngine<'_> {
         let naux = self.naux;
         let n2 = nao * nao;
         let e = &self.e;
+        // DFT / hybrid references carry the XC-kernel terms (bits of
+        // `REST_ADJOINT_DFT_MASK`); an HF reference is the validated route and
+        // never enters them.
+        let is_hf = self.scf.mol.xc_data.dfa_compnt_scf.is_empty();
+        let dft_mask = dft_debug_mask();
 
         // ---- (a) MO covectors Lambda, Lambda_s ---------------------------
         let mut lam = vec![0.0f64; nmo * nmo];
@@ -8921,6 +9028,52 @@ impl GwGradEngine<'_> {
                 lams[p + q * nmo] = (e[p] * wqp - e[q] * wpq) / den;
             }
         }
+
+        // ---- (a2) DFT / hybrid references: the orbital-rotation part of b_x --
+        //
+        // The static term `B_n = e_n + (1-alpha) Sigma_x,nn - v_xc,nn` is
+        // differentiated through the diagonal covector `bb` (`b_x`, see
+        // `canonical_finish`):
+        //     b_x[p] = -vd1[p,p] - fxc_diag(dm1)[p] - 2 sum_q u[q,p] vxc_mo[q,p].
+        // The last term is linear in the **full** orbital rotation `u`, not only
+        // in its occupied columns `mo1`, so it cannot ride the `Z` solve (which
+        // is a covector on `mo1` alone).  With the u-covector
+        //     C[p,q] = -2 bb[q] vxc_mo[p,q] ,   sum_{p,q} u[p,q] C[p,q]
+        //            = -2 sum_{p,q} bb[p] u[q,p] vxc_mo[q,p] ,
+        // the Roothaan identity of the section header turns *any* u-covector
+        // into an equivalent `(Lambda, Lambda_s)` pair: the off-diagonal pairs
+        // through the orbital denominators and the diagonal through
+        // `u[p,p] = -s1[p,p]/2`,
+        //     Lambda_C[p,q] = (C[p,q]-C[q,p]) / (2 (e_q - e_p))
+        //                   = (bb[p]-bb[q]) vxc_mo[p,q] / (e_q - e_p) ,
+        //     Lam_s,C[p,q]  = (e_p C[q,p] - e_q C[p,q]) / (2 (e_q - e_p))
+        //                   = (e_q bb[q] - e_p bb[p]) vxc_mo[p,q] / (e_q - e_p) ,
+        //     Lam_s,C[p,p]  = -C[p,p]/2 = bb[p] vxc_mo[p,p] ,
+        // so folding it in here makes every downstream use of `Lambda_ao` (the
+        // folded `dI`/`dJ` covectors, `Vtil` and hence `L`/`Z`, and the explicit
+        // `dh1`/`dS` contractions) carry the `b_x` rotation channel exactly, at
+        // no per-perturbation cost.  (The earlier route put only the occupied
+        // columns of `C` into `l_mat`; the virtual columns -- which are the ones
+        // `bb` has support on whenever a virtual orbital is being
+        // differentiated -- were silently dropped.)
+        if !is_hf && (dft_debug_mask() & 2 != 0) {
+            if let Some(bb) = bb_k {
+                for p in 0..nmo {
+                    lams[p + p * nmo] += bb[p] * self.vxc_mo[p + p * nmo];
+                    for q in 0..nmo {
+                        if p == q || self.same_degenerate_shell(p, q) {
+                            continue;
+                        }
+                        let den = e[q] - e[p];
+                        let vpq = self.vxc_mo[p + q * nmo];
+                        lam[p + q * nmo] += (bb[p] - bb[q]) * vpq / den;
+                        lams[p + q * nmo] +=
+                            (e[q] * bb[q] - e[p] * bb[p]) * vpq / den;
+                    }
+                }
+            }
+        }
+
         // Lam_ao = C Lam C^T, Lam_s,ao = C Lam_s C^T
         let to_ao = |m: &[f64]| -> Vec<f64> {
             let mm = to_mat(m, nmo, nmo);
@@ -8949,7 +9102,6 @@ impl GwGradEngine<'_> {
         // density, `vtil += f_xc(Lambda_ao)` -- the exact analogue of the
         // `f_xc(D^U)` term that the canonical route carries inside its relaxed
         // first-order Fock (`canonical_finish`).  One grid kernel sweep.
-        let is_hf = self.scf.mol.xc_data.dfa_compnt_scf.is_empty();
         // One kernel cache for both DFT terms below (the canonical route builds
         // its own; here two sweeps share one cache).
         let fxc_cache = if is_hf {
@@ -8959,7 +9111,6 @@ impl GwGradEngine<'_> {
                 "gw_grad: the adjoint CP-KS route needs the XC-kernel cache                  (an scf without grids cannot provide it)",
             ))
         };
-        let dft_mask = dft_debug_mask();
         if !is_hf && dft_mask & 1 != 0 {
             let cache = fxc_cache.as_ref().expect("cache built above");
             let fxc = crate::dft::response::compute_fxc_response_ao_cached(
@@ -8982,28 +9133,19 @@ impl GwGradEngine<'_> {
             _dgemm_full(&self.c_mo, 'T', &tmp, 'N', &mut out, 4.0, 0.0);
             out.data
         };
-        // ---- DFT / hybrid references: the U-dependent part of `b_x` -------
-        // The canonical route's v_xc covector is
-        //   b_x[p] = -[ vd1_pp + [C^T f_xc(D^U) C]_pp + 2 sum_q U[q,p] v_xc[q,p] ],
-        // whose last two terms are linear in the response `U` with known
-        // weights, so in the adjoint route they become a covector on `U`
-        // (added to `l_mat`) instead of a per-perturbation object.  With the
-        // kernel self-adjoint and `D_bb = C diag(bb) C^T`,
-        //   sum_p bb[p] [C^T f_xc(D^U) C]_pp = Tr[D^U f_xc(D_bb)]
-        //                                     = 4 sum_{p,i} (C^T X C)[p,i] U[p,i],
-        // so both terms cost one kernel sweep in total, independent of `3 natm`.
+        // ---- DFT / hybrid references: the density-response part of `b_x` --
+        // After the `(a2)` fold above, `Lambda` carries the whole orbital-rotation
+        // channel of `b_x`; what is left of the `bb` covector is the kernel
+        // response of the first-order density,
+        //   -sum_p bb[p] [C^T f_xc(D^U) C]_pp = -Tr[D^U f_xc(D_bb)]
+        //                                      = -4 sum_{p,i} (C^T X C)[p,i] U[p,i],
+        // with `D_bb = C diag(bb) C^T` and `X = f_xc(D_bb)` (the kernel is
+        // self-adjoint, so this is the same sweep as `f_xc` of a density), i.e.
+        // an extra `Vtil`-like covector `-f_xc(D_bb)` on the `Z` right-hand side.
         // The explicit `vd1` part stays per perturbation; the caller passes it
         // as the `b_x` argument of the perturbation contractions.
-        if !is_hf && dft_mask & 6 != 0 {
+        if !is_hf && dft_mask & 4 != 0 {
             if let Some(bb) = bb_k {
-                if dft_mask & 2 != 0 {
-                for i in 0..nocc {
-                    for p in 0..nmo {
-                        l_mat[p + i * nmo] -= 2.0 * self.vxc_mo[p + i * nmo] * bb[i];
-                    }
-                }
-                }
-                if dft_mask & 4 != 0 {
                 let mut dbb = vec![0.0f64; n2];
                 for mu in 0..nao {
                     for nu in 0..nao {
@@ -9025,7 +9167,6 @@ impl GwGradEngine<'_> {
                     for p in 0..nmo {
                         l_mat[p + i * nmo] -= 4.0 * xmo[p + i * nmo];
                     }
-                }
                 }
             }
         }
@@ -9058,6 +9199,11 @@ impl GwGradEngine<'_> {
         let mut config = AnalDrvConfig::default();
         config.resp.cache_kernel = self.config.resp_cache_kernel;
         config.resp.cache_budget = self.config.resp_cache_budget_mib;
+        // The adjoint route's accuracy is set by the Z solve, so the Krylov
+        // tolerances are part of the gradient configuration (and can be
+        // tightened; see `GwGradConfig::cpscf_tol`).
+        config.resp.tol = self.config.cpscf_tol;
+        config.resp.tol_inflation = self.config.cpscf_tol_inflation;
         // Everything from here to the end of the Z-vector correction lives in its own scope: the
         // response objects (and with them the RI-JK response-kernel cache, `nao^2 * naux` doubles —
         // 1030 MB at naphthalene/def2-TZVP) are released before the skeleton contractions below,
@@ -9285,6 +9431,13 @@ impl GwGradEngine<'_> {
         let keep_pieces = self.config.keep_adjoint_pieces;
         let mut theta_pieces: Vec<f64> = if keep_pieces { vec![0.0f64; naux * n2] } else { Vec::new() };
         let wfac = if fold_rhs { 1.0 } else { 0.0 };
+        // The exchange skeleton of the reference is `-0.5 * fock_hyb * Kd`
+        // (`fock_hyb` = 1 for HF), so the adjoint tensors `Theta`/`Psi`, which
+        // are built for the *unit* exchange (`4<Theta,dI> - 2<Psi,dJ> =
+        // <x_ao,Kd>`, see the identity check in `test_gw_folded_qx`), enter the
+        // gradient with this factor.  `theta_pieces` keeps the unit tensors so
+        // that the piecewise identity stays checkable.
+        let kscale = self.fock_hyb;
         let mut fold_exchange = |x_theta: &[f64], x_phi: &[f64]| -> Vec<f64> {
             let xm = to_mat(x_theta, nao, nao);
             let mut gp = MatrixFull::new([nao, nocc], 0.0);
@@ -9310,9 +9463,9 @@ impl GwGradEngine<'_> {
                     for nu in 0..=mu {
                         let k = mu + nu * nao;
                         let kt = nu + mu * nao;
-                        let a = di_cov[off + k] - 2.0 * th.data[k] + cp * lam_ao[k]
+                        let a = di_cov[off + k] - 2.0 * kscale * th.data[k] + cp * lam_ao[k]
                             + wfac * cp * w_dh1[k];
-                        let at = di_cov[off + kt] - 2.0 * th.data[kt] + cp * lam_ao[kt]
+                        let at = di_cov[off + kt] - 2.0 * kscale * th.data[kt] + cp * lam_ao[kt]
                             + wfac * cp * w_dh1[kt];
                         let v = a + at;
                         di_cov[off + k] = v;
@@ -9410,6 +9563,7 @@ impl GwGradEngine<'_> {
             w_ds,
             f1mo_ref: f1mo_ref.unwrap_or_default(),
             half_k,
+            k_scale: kscale,
             timings,
             lam_tilde,
             dm_sym,
@@ -9689,7 +9843,9 @@ impl GwGradEngine<'_> {
         }
         g -= djc;
         // exchange skeleton remainder, core Hamiltonian and overlap
-        g += 2.0 * adj.half_k * flat_dot(&adj.psi, dj);
+        // `Theta`/`Psi` are the unit-exchange adjoint tensors, so the skeleton
+        // `-0.5 fock_hyb Kd` enters through `2 * half_k * k_scale`.
+        g += 2.0 * adj.half_k * adj.k_scale * flat_dot(&adj.psi, dj);
         g += flat_dot(&adj.lam_ao, &h1r[comp * n2..(comp + 1) * n2]);
         g += flat_dot(&adj.lams_ao, s1_comp);
         // the folded `<Z, rhs_d>` channel: <W, dh1> + <W_s, dS> (the rest of
@@ -9699,13 +9855,20 @@ impl GwGradEngine<'_> {
             g += flat_dot(&adj.w_ds, s1_comp);
         }
         // DFT reference: the frozen-density v_xc skeleton enters the CP-KS
-        // right-hand side exactly like the core part of `f1mo`,
-        //   rhs_vxc[vir,occ] = -vxc_d1_mo[vir,occ] / D_ai ,
-        // so `sum_d <Z, rhs_d>` contributes the *same* folded covector, namely
-        // `<W, vxc_d1_ao>`.  (The canonical route adds this term to its `rhs`
-        // and to `f1_skel_mo`; this is its adjoint image.)
+        // first-order Fock exactly like the core part of `f1mo`,
+        //   f1_mo  += C^T v_xc^expl C ,
+        // so it has *two* images in the adjoint route:
+        //   - the `Z` right-hand side, `rhs_vxc[vir,occ] = -vxc_d1_mo[vir,occ]/D_ai`,
+        //     whose fold is `<W, vxc_d1_ao>` with `W = Zbra C_occ^T`, and
+        //   - the Roothaan covector itself, `<Lambda, v_xc^expl> = <Lambda_ao, vxc_d1_ao>`
+        //     (the same channel as the `dh1` skeleton, which `lam_ao` carries).
+        // Both are needed: they are the explicit-density and the
+        // density-response halves of the derivative.
         if let Some(vd1) = vxc_d1_ao {
             g += flat_dot(&adj.w_dh1, vd1);
+            if dft_debug_mask() & 8 != 0 {
+                g += flat_dot(&adj.lam_ao, vd1);
+            }
         }
         // metric channel, static term and the adjoint CP-HF channel
         g += flat_dot(bj_k, dj);

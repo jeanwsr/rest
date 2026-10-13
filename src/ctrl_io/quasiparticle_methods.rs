@@ -299,6 +299,19 @@ pub struct QuasiParticle {
     /// cubic switch with the same endpoints (removes a genuine value jump in
     /// `Sigma_c` that the analytic gradient cannot represent).
     pub gradient_smooth_pole:bool,
+    /// Evaluate the CP-HF/CP-KS response channel of the analytic gradient with
+    /// the **adjoint (Z-vector)** route instead of solving the response for all
+    /// `3 * natm` perturbations.  Default `true`.
+    ///
+    /// For an HF reference this is the long-standing route; for a DFT/hybrid
+    /// (CP-KS) reference it adds the XC-kernel folding (validated against the
+    /// canonical route to ~1e-8 relative, `tests/gw_bse/test_adjoint_dft.rs`).
+    /// The saving grows with the number of perturbations: measured at 4 threads
+    /// on the production PBEh(45%) configuration, benzene/def2-SVP (36
+    /// directions) is 2.9x and naphthalene/def2-SVP (54) is 5.5x faster, with
+    /// bit-identical QP energies.  Set it to `false` to fall back to the
+    /// canonical per-perturbation route (either route gives the same gradient).
+    pub gradient_adjoint_cphf:bool,
     /// Spectral-weight floor of the quasiparticle root branch used by the
     /// analytic gradient.  When the converged root carries `Z < gradient_z_min`
     /// (or the root search fails), the orbital is differentiated through the
@@ -622,6 +635,7 @@ impl Default for QuasiParticle {
             gradient_exact_residue:false,
             gradient_smooth_pole:false,
             gradient_z_min:0.3,
+            gradient_adjoint_cphf:true,
             low_rank_grid_type:String::from("linear"),
             nomega_chi_real:6,
             low_rank_interp:String::from("linear"),
@@ -798,6 +812,7 @@ impl QuasiParticle {
         table.insert("gradient_exact_residue".to_string(), toml::Value::Boolean(self.gradient_exact_residue));
         table.insert("gradient_smooth_pole".to_string(), toml::Value::Boolean(self.gradient_smooth_pole));
         table.insert("gradient_z_min".to_string(), toml::Value::Float(self.gradient_z_min));
+        table.insert("gradient_adjoint_cphf".to_string(), toml::Value::Boolean(self.gradient_adjoint_cphf));
         table.insert("low_rank_grid_type".to_string(), toml::Value::String(self.low_rank_grid_type.clone()));
         table.insert("low_rank_interp".to_string(), toml::Value::String(self.low_rank_interp.clone()));
         table.insert("nomega_chi_real".to_string(), toml::Value::Integer(self.nomega_chi_real as i64));
@@ -1380,6 +1395,11 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Bool(b) => *b,
                 serde_json::Value::String(s) => s.trim().to_lowercase().parse().unwrap_or(false),
                 _ => false,
+            };
+            tmp_input.gradient_adjoint_cphf = match tmp_ctrl.get("gradient_adjoint_cphf").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::String(s) => s.trim().to_lowercase().parse().unwrap_or(true),
+                _ => true,
             };
             tmp_input.gradient_z_min = match tmp_ctrl.get("gradient_z_min").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.3),
