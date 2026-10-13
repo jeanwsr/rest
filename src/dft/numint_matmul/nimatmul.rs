@@ -31,6 +31,30 @@ pub struct NIMatmul<'a> {
     /// This cache is not designed to be modified by API caller in usual cases.
     pub cache_tensor: HashMap<String, TsrCow<'a, f64>>,
 
+    /// Budget, in bytes, of whole-grid AO tables kept in [`Self::cache_tensor`] across calls.
+    ///
+    /// Evaluating a whole-grid AO table is a pure time/memory trade: the same data can be
+    /// re-evaluated with libcint on demand.  Without a budget, one evaluation makes the table
+    /// resident for the rest of the object's life, which is exactly what turns a one-shot
+    /// preparation (the CP-KS `vxc`/`fxc`, a fock build) into a multi-GB resident allocation.
+    /// Tables larger than the remaining budget are therefore served from the single transient
+    /// slot [`Self::transient_ao`] instead of being retained.
+    ///
+    /// `usize::MAX` = no budget (retain everything, the historical behaviour), `0` = retain
+    /// nothing.  Set by `REST_NIM_AO_CACHE_MB` (negative = no budget); default 256 MiB.
+    pub ao_cache_budget_bytes: usize,
+
+    /// Bytes currently retained in [`Self::cache_tensor`] under the `ao_deriv*` keys.
+    pub ao_cached_bytes: usize,
+
+    /// Single-slot AO table for requests that do not fit [`Self::ao_cache_budget_bytes`].
+    ///
+    /// It is replaced by the next such request and released by [`Self::drop_ao_cache`], so at
+    /// most one over-budget whole-grid AO is alive per object, and none survives a phase
+    /// boundary.  The stored derivative order is the one the table was evaluated at, so
+    /// repeated requests for the same (or a lower) derivative still hit.
+    transient_ao: Option<(usize, Tsr)>,
+
     /// Number of grid points to process in one chunk.
     ///
     /// Relations of size: full-grid > batch > chunk > per-grid = 1.
@@ -99,6 +123,30 @@ pub fn regroup_grids_by_atom(
     (coordinates_new, weights_new, atm_idx_new, quadrature_weights_new)
 }
 
+/// Retained-AO budget of a new [`NIMatmul`], from `REST_NIM_AO_CACHE_MB`.
+///
+/// A negative value means "no budget" (the historical behaviour: every evaluated AO table is
+/// retained), `0` means "retain nothing", and the default is 256 MiB — large enough to keep the
+/// tables of small systems resident, small enough that a whole SCF-grid table (GBs at
+/// def2-TZVP/polyene scale) is never retained by side effect.
+fn ao_cache_budget_from_env() -> usize {
+    match std::env::var("REST_NIM_AO_CACHE_MB").ok().and_then(|v| v.trim().parse::<f64>().ok()) {
+        Some(mb) if mb < 0.0 => usize::MAX,
+        Some(mb) => (mb * 1.0e6).max(0.0) as usize,
+        None => 256 * 1024 * 1024,
+    }
+}
+
+/// `REST_NIM_MEMDBG` gates the AO-cache accounting lines.
+fn nim_memdbg() -> bool {
+    std::env::var("REST_NIM_MEMDBG").is_ok()
+}
+
+/// Dense byte count of an AO table.
+fn ao_table_bytes(t: &Tsr) -> usize {
+    t.shape().iter().product::<usize>() * std::mem::size_of::<f64>()
+}
+
 impl<'a> NIMatmul<'a> {
     /// Creates a new instance with the given integral engine, grid coordinates/weights and the
     /// per-grid atom attribution and pre-partition quadrature weights (see the struct fields).
@@ -117,16 +165,36 @@ impl<'a> NIMatmul<'a> {
         );
         let nchunk = 1536;
         let nbatch = nchunk * 1 * rayon::current_num_threads();
-        Self {
+        let out = Self {
             cint: cint.clone(),
             coords: coords.to_vec(),
             weights: weights.to_vec(),
             atm_idx: atm_idx.to_vec(),
             quadrature_weights: quadrature_weights.to_vec(),
             cache_tensor: HashMap::new(),
+            ao_cache_budget_bytes: ao_cache_budget_from_env(),
+            ao_cached_bytes: 0,
+            transient_ao: None,
             nchunk,
             nbatch,
+        };
+        if nim_memdbg() {
+            let ngrids = out.coords.len();
+            let nao = out.cint.nao();
+            let per_table = ngrids * nao * std::mem::size_of::<f64>();
+            println!(
+                "[nim] new object: ngrids {:8} | nao {:5} | whole-grid AO table {:7.1} MB per deriv component | budget {} MB",
+                ngrids,
+                nao,
+                per_table as f64 / 1024.0 / 1024.0,
+                if out.ao_cache_budget_bytes == usize::MAX {
+                    "unlimited".to_string()
+                } else {
+                    format!("{:.0}", out.ao_cache_budget_bytes as f64 / 1024.0 / 1024.0)
+                },
+            );
         }
+        out
     }
 
     /// Clone everything, except the cached tensors.
@@ -138,9 +206,86 @@ impl<'a> NIMatmul<'a> {
             atm_idx: self.atm_idx.clone(),
             quadrature_weights: self.quadrature_weights.clone(),
             cache_tensor: HashMap::new(),
+            ao_cache_budget_bytes: self.ao_cache_budget_bytes,
+            ao_cached_bytes: 0,
+            transient_ao: None,
             nchunk: self.nchunk,
             nbatch: self.nbatch,
         }
+    }
+
+    /// Release every whole-grid AO table this object retains (retained cache and the transient
+    /// slot), and report how many bytes that freed when `REST_NIM_MEMDBG` is set.
+    ///
+    /// The AO tables are a pure cache: they are recomputed by [`Self::get_cached_ao`] on demand,
+    /// so calling this never changes a result.  It is meant for phase boundaries — after a
+    /// one-shot preparation has consumed its AO, before a long solve starts — where keeping the
+    /// table would only inflate the peak.
+    ///
+    /// The integrator's own workspace (grids, coordinates, weights) is untouched.
+    pub fn drop_ao_cache(&mut self) -> usize {
+        let mut freed = 0usize;
+        let keys: Vec<String> = self.cache_tensor.keys().cloned().collect();
+        for key in keys {
+            let is_ao = key.strip_prefix("ao_deriv").and_then(|s| s.parse::<usize>().ok()).is_some();
+            if is_ao {
+                if let Some(t) = self.cache_tensor.remove(&key) {
+                    let v = t.view();
+                    freed += v.shape().iter().product::<usize>() * std::mem::size_of::<f64>();
+                }
+            }
+        }
+        if let Some((_, t)) = self.transient_ao.take() {
+            freed += ao_table_bytes(&t);
+        }
+        self.ao_cached_bytes = 0;
+        if nim_memdbg() {
+            println!("[nim] drop_ao_cache: freed {:.1} MB", freed as f64 / 1024.0 / 1024.0);
+        }
+        freed
+    }
+
+    /// Release only the transient slot (the over-budget table), keeping the retained cache.
+    ///
+    /// Used by one-shot consumers (a fock build) that are the last user of a table which was too
+    /// large to retain: the table cannot serve anyone else, so leaving it resident would only
+    /// inflate the peak until the next over-budget evaluation replaces it.
+    pub fn drop_transient_ao(&mut self) -> usize {
+        match self.transient_ao.take() {
+            Some((_, t)) => {
+                let bytes = ao_table_bytes(&t);
+                if nim_memdbg() {
+                    println!("[nim] drop_transient_ao: freed {:.1} MB", bytes as f64 / 1024.0 / 1024.0);
+                }
+                bytes
+            },
+            None => 0,
+        }
+    }
+
+    /// Whether a whole-grid AO table of derivative order `deriv` would be *retained* under the
+    /// current budget (rather than served from the transient slot).
+    ///
+    /// Consumers that would otherwise materialize the whole grid use this to decide between the
+    /// plain call (the table becomes a reusable cache — the historical behaviour) and a blocked
+    /// loop (the table never exists as a whole).
+    pub fn ao_table_would_retain(&self, deriv: usize) -> bool {
+        assert!(deriv < AO_DERIV_DIM.len(), "Derivative order {deriv} is too high");
+        let bytes = self.coords.len() * self.cint.nao() * AO_DERIV_DIM[deriv] * std::mem::size_of::<f64>();
+        self.ao_cache_budget_bytes == usize::MAX
+            || bytes <= self.ao_cache_budget_bytes.saturating_sub(self.ao_cached_bytes)
+    }
+
+    /// Grid blocks used by the memory-bounded consumers: `(start, end)` ranges in ascending
+    /// `start` order, of at most `nbatch` points each.
+    ///
+    /// `nbatch` is the same size the batched Krylov response path already uses
+    /// (`split_batch` + one `get_cached_ao` per batch), so blocking a preparation this way
+    /// reproduces the AO-evaluation pattern of the iterative path exactly, and the accumulation
+    /// order stays deterministic.
+    pub fn grid_blocks(&self, ngrids: usize) -> Vec<(usize, usize)> {
+        let nbatch = self.nbatch.max(1);
+        (0..ngrids).step_by(nbatch).map(|s| (s, (s + nbatch).min(ngrids))).collect()
     }
 
     /// Creates a new instance for a subset of the grid points, slicing from `start` to `end`
@@ -183,6 +328,11 @@ impl<'a> NIMatmul<'a> {
     ///
     /// When a higher derivative order has already been cached, the required subset is returned
     /// directly without recomputation.
+    ///
+    /// A table is only *retained* (kept for later calls) when it fits
+    /// [`Self::ao_cache_budget_bytes`]; otherwise it lives in the single transient slot for as
+    /// long as the next over-budget request, and the following call for the same derivative
+    /// still hits it.  `REST_NIM_AO_CACHE_MB` (negative = unlimited) selects the budget.
     pub fn get_cached_ao(&mut self, deriv: usize) -> TsrView<'_> {
         assert!(
             deriv < AO_DERIV_DIM.len(),
@@ -199,11 +349,41 @@ impl<'a> NIMatmul<'a> {
                 return self.cache_tensor.get(&cache_key).unwrap().i((.., .., ..AO_DERIV_DIM[deriv]));
             }
         }
+        // same, for the transient slot (a table that did not fit the budget)
+        if let Some((max_deriv, _)) = self.transient_ao.as_ref() {
+            if *max_deriv >= deriv {
+                return self.transient_ao.as_ref().unwrap().1.i((.., .., ..AO_DERIV_DIM[deriv]));
+            }
+        }
 
-        // otherwise, compute and cache all missing ao deriv up to the requested one
-        let key = format!("ao_deriv{}", deriv);
-        self.cache_tensor.insert(key.clone(), self.prepare_ao(deriv).into_cow());
-        self.cache_tensor.get(&key).unwrap().view()
+        // otherwise, compute the requested ao deriv
+        let ao = self.prepare_ao(deriv);
+        let bytes = ao_table_bytes(&ao);
+        let budget = self.ao_cache_budget_bytes;
+        let retain = budget == usize::MAX || bytes <= budget.saturating_sub(self.ao_cached_bytes);
+        if nim_memdbg() {
+            println!(
+                "[nim] get_cached_ao deriv{} : {:?} = {:.1} MB -> {} (budget {:.0} MB, retained {:.0} MB)",
+                deriv,
+                ao.shape(),
+                bytes as f64 / 1024.0 / 1024.0,
+                if retain { "retained" } else { "transient" },
+                if budget == usize::MAX {
+                    -1.0
+                } else {
+                    budget as f64 / 1024.0 / 1024.0
+                },
+                self.ao_cached_bytes as f64 / 1024.0 / 1024.0,
+            );
+        }
+        if retain {
+            let key = format!("ao_deriv{}", deriv);
+            self.cache_tensor.insert(key.clone(), ao.into_cow());
+            self.ao_cached_bytes += bytes;
+            return self.cache_tensor.get(&key).unwrap().view();
+        }
+        self.transient_ao = Some((deriv, ao));
+        self.transient_ao.as_ref().unwrap().1.view()
     }
 
     /// Evaluates density from density matrices.

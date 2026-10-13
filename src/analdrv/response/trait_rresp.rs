@@ -119,4 +119,16 @@ pub trait RRespAPI: AnalDrvBaseAPI {
     ///
     /// [`make_response_preparation`]: Self::make_response_preparation
     fn get_response_bra(&mut self, bra: TsrView) -> Tsr;
+
+    /// Release cached AO tables held by this response object, returning the freed byte count.
+    ///
+    /// The numerical-integration response objects cache the whole-grid AO tables they evaluate
+    /// (`NIMatmul`); those are pure caches, recomputed on demand, but they can reach GBs on an
+    /// SCF grid.  Drivers call this at phase boundaries (after the one-shot preparation, when a
+    /// long solve is about to start) so that the table does not stay resident for the rest of the
+    /// task.  The default implementation does nothing: contributions without an AO cache (RI-JK,
+    /// and the response objects of other methods) have nothing to release.
+    fn drop_ao_cache(&mut self) -> usize {
+        0
+    }
 }

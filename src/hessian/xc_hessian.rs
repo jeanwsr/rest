@@ -206,7 +206,20 @@ pub fn plan_grid_split(
     // system size, so large basis sets / high derivative orders do not blow
     // up the Hessian peak RSS. (2·max_orig_nb is kept as an upper limit so we
     // never sub-split more aggressively than the old behavior allowed.)
-    let ao_mem_cap = 1.5 * 1024.0 * 1024.0 * 1024.0; // 1.5 GiB
+    //
+    // `REST_VXC_AO_CAP_MB` (MiB, floor 16) overrides the cap.  The in-flight AO
+    // is a pure working set: a smaller cap splits the grid into more sub-blocks
+    // at the same total work and the same result (only the summation order of
+    // the per-block partials changes), so it is the cheapest knob with which a
+    // post-SCF calculation — whose resident set is already large — can trade a
+    // little BLAS efficiency for peak RSS.
+    let ao_mem_cap = match std::env::var("REST_VXC_AO_CAP_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+    {
+        Some(mb) => mb.max(16.0) * 1024.0 * 1024.0,
+        None => 1.5 * 1024.0 * 1024.0 * 1024.0, // 1.5 GiB
+    };
     let bytes_per_point = 2.0 * nderiv.max(1) as f64 * nao.max(1) as f64 * 8.0;
     let points_cap = (ao_mem_cap / bytes_per_point) as usize;
     let peak_budget = points_cap.max(min_nb).min(2 * max_orig_nb);

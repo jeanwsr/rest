@@ -6431,6 +6431,11 @@ impl GwGradEngine<'_> {
         let t_solve0 = Instant::now();
         let mo1_tsr = resp.solve_dimless_cpscf(rhs_map["rhs"].view()); // [nmo, nocc, 3, natm]
         let t_solve = t_solve0.elapsed().as_secs_f64();
+        // the batched Krylov solve was the last user of the CP-KS response object; release the
+        // whole-grid AO tables it retained (a pure cache) before the per-perturbation assembly
+        if !is_hf {
+            resp.release_ao_cache();
+        }
 
         // ---- canonical-orbital assembly per perturbation ----
         // The analdrv tensors order perturbations as col-major [.., .., 3, natm],
@@ -9312,6 +9317,12 @@ impl GwGradEngine<'_> {
             }
         }
 
+        // the CP-KS response object is done with both its Krylov solves; release the whole-grid
+        // AO tables it retained (a pure cache, recomputed on demand) so that they do not sit
+        // under the remaining gradient phases
+        if !is_hf {
+            resp.release_ao_cache();
+        }
         mem_probe("  adjoint: after Z solve");
         if std::env::var("REST_GWGRAD_ZDBG").is_ok() {
             eprintln!(

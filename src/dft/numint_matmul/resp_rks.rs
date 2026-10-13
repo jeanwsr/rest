@@ -65,8 +65,9 @@ pub fn eval_vxc_fxc_from_rho(xc_func_list: &[(f64, LibXCFunctional)], rho: TsrVi
 ///   `[nao, nao]` `dm0` matrix, exploiting the low rank of the occupied space (consistent with the
 ///   CP-KS response path in [`get_rks_response_bra`]).
 ///
-/// The CP-KS grid is assumed coarse enough that the full-grid AO tensor fits in memory; no batching
-/// is performed.
+/// The CP-KS grid is assumed coarse enough that the full-grid AO tensor fits in memory; when it
+/// does not (see [`NIMatmul::ao_table_would_retain`], budget `REST_NIM_AO_CACHE_MB`), the density
+/// is accumulated block by block instead, so the whole-grid AO tensor is never materialized.
 pub fn make_cpks_vxc_fxc(
     xc_func_list: &[(f64, LibXCFunctional)],
     ni: &mut NIMatmul,
@@ -82,7 +83,23 @@ pub fn make_cpks_vxc_fxc(
     let occ_sqrt = occ.mapv(f64::sqrt);
     let mocc_2 = &mocc * occ_sqrt.i((None, ..));
     // rho : [ngrids, nvar, 1] (single set) -> [ngrids, nvar]
-    let rho = ni.make_rho_from_homogeneous_braket(&[mocc_2.view()], xc_type);
+    let rho = if ni.ao_table_would_retain(xc_type.num_ao_deriv()) {
+        ni.make_rho_from_homogeneous_braket(&[mocc_2.view()], xc_type)
+    } else {
+        // blocked: the whole-grid AO table would not be retained, so building it once and
+        // throwing it away would still pay its peak.  Accumulate the density block by block
+        // (rho itself is `[ngrids, nvar]`, orders of magnitude smaller than the AO table).
+        let ngrids = ni.weights.len();
+        let nvar = xc_type.num_nvar();
+        let device = mocc_2.device().clone();
+        let mut rho = rt::zeros(([ngrids, nvar, 1], &device));
+        for (start, end) in ni.grid_blocks(ngrids) {
+            let mut ni_block = ni.split_batch(start, end);
+            let rho_block = ni_block.make_rho_from_homogeneous_braket(&[mocc_2.view()], xc_type);
+            rho.i_mut(start..end).assign(&rho_block);
+        }
+        rho
+    };
     eval_vxc_fxc_from_rho(xc_func_list, rho.i((.., .., 0)))
 }
 
@@ -223,7 +240,11 @@ impl<'a> RRespAPI for RRespKSNIMatmul<'a> {
         let den_type = determine_den_type_from_list(&self.xc_func_list.iter().map(|(_, f)| f).collect_vec());
         let rho = self.ni.make_rho_from_dm(&[rdm], den_type);
         let (vxc, _fxc) = eval_vxc_fxc_from_rho(&self.xc_func_list, rho.i((.., .., 0)));
-        self.ni.make_vxc_pot_with_eff(vxc.view(), den_type, XCSpin::Unpolarized)
+        let out = self.ni.make_vxc_pot_with_eff(vxc.view(), den_type, XCSpin::Unpolarized);
+        // a fock build is a one-shot consumer: an over-budget common-grid AO table (GBs at
+        // def2-TZVP scale) has no later user, so do not leave it resident
+        self.ni.drop_transient_ao();
+        out
     }
 
     // note: `get_fock_coeff` keeps the trait default (dm route via `get_dm0_restricted`).
@@ -264,8 +285,28 @@ impl<'a> RRespAPI for RRespKSNIMatmul<'a> {
         // be symmetrized — the fxc kernel only sees the symmetric part anyway
         let rdm_sym = ((&rdm + &rdm.swapaxes(0, 1)) * 0.5).into_shape((nao, nao, nset));
         let dm_views: Vec<TsrView> = (0..nset).map(|s| rdm_sym.i((.., .., s))).collect();
-        let rho1 = self.ni.make_rho_from_dm(&dm_views, den_type);
-        let resp = self.ni.make_fxc_pot_with_eff(fxc, rho1.view(), den_type, XCSpin::Unpolarized);
+        // When the common-grid AO table does not fit the retained budget, run the density and the
+        // fxc contraction block by block: `rho1` and the output are tiny (`[ngrids, nvar, nset]`
+        // and `[nao, nao, nset]`), the whole-grid AO table is not.
+        let resp = if self.ni.ao_table_would_retain(den_type.num_ao_deriv()) {
+            let rho1 = self.ni.make_rho_from_dm(&dm_views, den_type);
+            self.ni.make_fxc_pot_with_eff(fxc, rho1.view(), den_type, XCSpin::Unpolarized)
+        } else {
+            let ngrids = self.ni.weights.len();
+            let device = rdm.device().clone();
+            let mut resp = rt::zeros(([nao, nao, nset], &device));
+            for (start, end) in self.ni.grid_blocks(ngrids) {
+                let mut ni_block = self.ni.split_batch(start, end);
+                let rho_block = ni_block.make_rho_from_dm(&dm_views, den_type);
+                resp += ni_block.make_fxc_pot_with_eff(
+                    fxc.i(start..end),
+                    rho_block.view(),
+                    den_type,
+                    XCSpin::Unpolarized,
+                );
+            }
+            resp
+        };
         // 4.0 times is a trick of closed-shell coefficient; restore the input's trailing shape
         (resp * 4.0_f64).into_shape(rdm_shape)
     }
@@ -315,5 +356,15 @@ impl<'a> RRespAPI for RRespKSNIMatmul<'a> {
             self.verbose,
         );
         resp
+    }
+
+    /// Release the retained whole-grid AO tables of both grids (see
+    /// [`NIMatmul::drop_ao_cache`]); the CP-KS `vxc`/`fxc` kernels and the orbital state stay.
+    fn drop_ao_cache(&mut self) -> usize {
+        let mut freed = self.ni.drop_ao_cache();
+        if let Some(ni_resp) = self.ni_resp.as_mut() {
+            freed += ni_resp.drop_ao_cache();
+        }
+        freed
     }
 }

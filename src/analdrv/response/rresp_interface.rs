@@ -144,6 +144,10 @@ impl<'a> RRespAPI for RRespSCF<'a> {
         }
         resp
     }
+
+    fn drop_ao_cache(&mut self) -> usize {
+        self.resp_list.iter_mut().map(|resp_obj| resp_obj.drop_ao_cache()).sum()
+    }
 }
 
 impl<'a> RRespSCF<'a> {
@@ -188,6 +192,21 @@ impl<'a> RRespSCF<'a> {
         self.cpscf_state
             .as_ref()
             .expect("Call `RRespSCF::make_cpscf_preparation` before the CP-SCF machinery.")
+    }
+
+    /// Release the whole-grid AO tables cached by the response objects, and return the freed
+    /// memory to the OS.
+    ///
+    /// Call this at the end of a CP-SCF stage: between then and the next stage the tables have no
+    /// user, and on a large grid they can hold GBs (see [`RRespAPI::drop_ao_cache`]).  The
+    /// numerical results are unaffected — the tables are recomputed on demand.  Returns the
+    /// number of bytes freed.
+    pub fn release_ao_cache(&mut self) -> usize {
+        let freed = self.drop_ao_cache();
+        if freed > 0 {
+            crate::hessian::memory_monitor::trim_to_os(0);
+        }
+        freed
     }
 
     /// Compute the response in MO space to a perturbation in MO space.
