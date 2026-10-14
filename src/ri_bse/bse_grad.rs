@@ -2022,6 +2022,21 @@ impl<'a> BseGradEngine<'a> {
         let nocc = self.gw.nocc;
         let nvir = self.screen.nvir;
 
+        if std::env::var("REST_GWGRAD_MEMDBG").is_ok() {
+            let g = &self.gw;
+            let d = |n: usize| n as f64 * 8.0 / 1024.0 / 1024.0;
+            println!(
+                "[meminv] dims: nao {} naux {} nmo {} nocc {} nvir_act {} natm {} nk {} | \
+                 raw.i3 {:.0} MB | q {:.0}  qt {:.0}  qia {:.0}  qtia {:.0}  q_pairmajor {:.0} | \
+                 j_jchol_smetric {:.0} | imag quad nodes {} | one pair covector naux*nmo(nmo+1)/2 {:.0}",
+                g.nao, g.naux, g.nmo, g.nocc, self.screen.nvir, g.natm, nk,
+                d(g.raw.i3_len()), d(g.q.borrow().len()), d(g.qt.borrow().len()),
+                d(g.qia.len()), d(g.qtia.borrow().len()), d(g.q_pairmajor.len()),
+                d(g.j_mat.data.len() + g.j_chol.data.len() + g.s_metric.len()),
+                g.quad.len(),
+                d(g.naux * g.nmo * (g.nmo + 1) / 2),
+            );
+        }
         let mut weights: Vec<Vec<f64>> = Vec::with_capacity(nk);
         let mut ebar_direct: Vec<Vec<f64>> = Vec::with_capacity(nk);
         let mut bj_k: Vec<Vec<f64>> = Vec::with_capacity(nk);
@@ -2084,6 +2099,7 @@ impl<'a> BseGradEngine<'a> {
         // the fold streams the raw integral blocks, so it is released here for
         // the whole assembly.  `with_q` rebuilds it on demand if a later cache
         // build needs it.
+        crate::ri_gw::gw_grad::mem_probe("bse: after kernel_vjp + theta_k");
         self.gw.evict_q();
         // ---- streaming QP pullback ----
         // The QP caches are the largest geometry-fixed object of this path.  In
@@ -2095,6 +2111,7 @@ impl<'a> BseGradEngine<'a> {
         let flat_weights: Vec<f64> = (0..nk)
             .flat_map(|k| weights[k].iter().copied())
             .collect();
+        crate::ri_gw::gw_grad::mem_probe("bse: before qp pullback");
         let t_qp = Instant::now();
         //
         // Parallel pages.  `qp_pullback_chunk` is one BLAS-2/BLAS-1 stream per
@@ -2166,6 +2183,7 @@ impl<'a> BseGradEngine<'a> {
         }
         drop(rebuilt_all);
         let (mut bq, mut bj, mut be, bb) = self.gw.qp_pullback_streaming_finish(scr);
+        crate::ri_gw::gw_grad::mem_probe("bse: after qp pullback (bq/bj/be/bb live)");
         let t_qp = t_qp.elapsed().as_secs_f64();
         // The low-rank screening factors are read only while a self-energy
         // response is evaluated, i.e. by the pullback (they also hold the
@@ -2198,6 +2216,7 @@ impl<'a> BseGradEngine<'a> {
         }
         drop(bj_k);
         drop(ebar_direct);
+        crate::ri_gw::gw_grad::mem_probe("bse: after kernel covector merge");
 
         // ---- CP-HF channel ----
         // Two routes produce the same contraction of the CP-HF response with the
@@ -2250,14 +2269,17 @@ impl<'a> BseGradEngine<'a> {
             // the gradient.  Packing the pair covector in place halves it, and
             // the root's fold is consumed by the adjoint build in place, so the
             // only `naux*nao^2` tensor alive is the current root's.
+            crate::ri_gw::gw_grad::mem_probe("bse: enter memory-lean adjoint route");
             let per_atom: Vec<AdjointAtomData> = (0..self.gw.natm)
                 .map(|atm| AdjointAtomData::build(self.gw, atm))
                 .collect();
+            crate::ri_gw::gw_grad::mem_probe("bse: after per-atom derivative blocks");
             // Explicit v_xc grid derivative of a DFT reference: one sweep,
             // shared by every root and perturbation (`None` for HF, whose
             // `b_x` is identically zero).  `b_x`'s U-dependent parts live in
             // the adjoint right-hand side (`build_cphf_adjoint`).
             let vxc_atoms = self.gw.vxc_grid_derivative_atoms();
+            crate::ri_gw::gw_grad::mem_probe("bse: after v_xc grid-derivative sweep");
             // Expand the kernel covector into each root's QP covector and pack
             // it in place before folding: the packed pair covector is half the
             // full one, and after this loop only the packed forms are resident.
@@ -2275,12 +2297,14 @@ impl<'a> BseGradEngine<'a> {
             drop(bq);
             drop(theta_k);
             crate::hessian::memory_monitor::trim_to_os(0);
+            crate::ri_gw::gw_grad::mem_probe("bse: after packing + trim");
             for k in 0..nk {
                 let t_fold = Instant::now();
                 let mut fold = self
                     .gw
                     .fold_covector_packed_streamed_parallel(&packed[k]);
                 let t_fold = t_fold.elapsed().as_secs_f64();
+                crate::ri_gw::gw_grad::mem_probe("bse: after fold_covector (packed live)");
                 packed[k] = Vec::new();
                 let t_adj = Instant::now();
                 let adj = self
@@ -2288,6 +2312,7 @@ impl<'a> BseGradEngine<'a> {
                     .build_cphf_adjoint(&mut fold, &be[k], Some(&bb[k]))
                     .expect("bse_grad: adjoint route guard changed");
                 let t_adj = t_adj.elapsed().as_secs_f64();
+                crate::ri_gw::gw_grad::mem_probe("bse: after build_cphf_adjoint");
                 drop(fold);
                 let t_pert = Instant::now();
                 for atm in 0..self.gw.natm {
@@ -2424,6 +2449,7 @@ impl<'a> BseGradEngine<'a> {
                 used_canonical = true;
             }
         }
+        crate::ri_gw::gw_grad::mem_probe("bse: after per-direction assembly");
         if grad_timing() {
             eprintln!(
                 "[bse_grad mem] cphf+assembly:   rss {:.0} MB ({})",
