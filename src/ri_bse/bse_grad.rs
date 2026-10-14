@@ -826,10 +826,13 @@ impl KernelVjpCompact {
     /// both symmetric entries, which coincide on the diagonal), and the `(o,v)`
     /// column, being the pair sum, contributes its half.
     pub fn add_into_packed(&self, qbar: &mut [f64], naux: usize, nmo: usize) {
-        let npack = crate::ri_gw::gw_grad::packed_pair_count(nmo);
-        assert_eq!(qbar.len(), naux * npack, "add_into_packed: qbar size mismatch");
         let nocc = self.nocc;
         let nvir = self.nvir;
+        // `qbar` may be stored banded (`min(p, q) < nrow`): every block written below lives in
+        // the band `nrow = nocc + nvir`, and the packed index of a banded covector is the same
+        // as in the full layout.
+        let npack = crate::ri_gw::gw_grad::banded_pair_count(nmo, nocc + nvir);
+        assert!(qbar.len() >= naux * npack, "add_into_packed: qbar too small");
         let nvir_full = self.nvir_full;
         let n_oo = nocc * nocc;
         let ncv = nocc * nvir_full;
@@ -2158,7 +2161,17 @@ impl<'a> BseGradEngine<'a> {
             .enumerate()
             .map(|(i, (n, _))| (*n, i))
             .collect();
-        let mut scr = self.gw.qp_pullback_scratch(nk);
+        // Pair-covector band: the largest orbital that carries a QP weight, + 1.  Every writer
+        // of `bq` addresses pairs whose smaller index is one of those rows, so the rest of the
+        // packed pair space is identically zero and need not be stored.
+        let nrow_pair = weights
+            .iter()
+            .map(|w| w.iter().rposition(|&v| v != 0.0).map_or(0, |i| i + 1))
+            .max()
+            .unwrap_or(nmo)
+            .max(1)
+            .min(nmo);
+        let mut scr = self.gw.qp_pullback_scratch_banded(nk, nrow_pair);
         let mut col0 = 0usize;
         while col0 < nmo {
             let end = (col0 + per_page).min(nmo);
@@ -2283,7 +2296,7 @@ impl<'a> BseGradEngine<'a> {
             // Expand the kernel covector into each root's QP covector and pack
             // it in place before folding: the packed pair covector is half the
             // full one, and after this loop only the packed forms are resident.
-            let npack = crate::ri_gw::gw_grad::packed_pair_count(nmo);
+            let npack = crate::ri_gw::gw_grad::banded_pair_count(nmo, nrow_pair);
             let mut packed: Vec<Vec<f64>> = Vec::with_capacity(nk);
             for k in 0..nk {
                 let kv = theta_k[k].take().expect("bse_grad: kernel covector reused");
@@ -2302,7 +2315,7 @@ impl<'a> BseGradEngine<'a> {
                 let t_fold = Instant::now();
                 let mut fold = self
                     .gw
-                    .fold_covector_packed_streamed_parallel(&packed[k]);
+                    .fold_covector_packed_streamed_parallel_banded(&packed[k], nrow_pair);
                 let t_fold = t_fold.elapsed().as_secs_f64();
                 crate::ri_gw::gw_grad::mem_probe("bse: after fold_covector (packed live)");
                 packed[k] = Vec::new();
@@ -2366,7 +2379,7 @@ impl<'a> BseGradEngine<'a> {
             // a non-streaming fold (874 MB at naphthalene/def2-TZVP).
             let mut per_atom: Option<Vec<AdjointAtomData>> = None;
             let vxc_atoms = self.gw.vxc_grid_derivative_atoms();
-            let npack = crate::ri_gw::gw_grad::packed_pair_count(nmo);
+            let npack = crate::ri_gw::gw_grad::banded_pair_count(nmo, nrow_pair);
             let mut folds: Vec<Option<crate::ri_gw::gw_grad::FoldedCovector>> =
                 (0..nk).map(|_| None).collect();
             let mut canonical_at: Vec<usize> = Vec::new();
@@ -2375,7 +2388,9 @@ impl<'a> BseGradEngine<'a> {
                 let mut qbar = std::mem::take(&mut bq[k]);
                 kv.add_into_packed(&mut qbar, naux, nmo);
                 assert_eq!(qbar.len(), npack * naux, "bse_grad: packed covector size mismatch");
-                let mut fold = self.gw.fold_covector_packed_streamed_parallel(&qbar);
+                let mut fold = self
+                    .gw
+                    .fold_covector_packed_streamed_parallel_banded(&qbar, nrow_pair);
                 drop(qbar);
                 if adjoint_ok && covectors_isotropic_on_shells(self.gw, &fold, &be[k]) {
                     let pa = per_atom.get_or_insert_with(|| {

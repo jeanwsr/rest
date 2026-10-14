@@ -1926,6 +1926,10 @@ impl<'a, 'b> SyncGw<'a, 'b> {
         self.0.qp_pullback_scratch(nk)
     }
     #[inline]
+    pub fn qp_pullback_scratch_banded(&self, nk: usize, nrow_pair: usize) -> QpPullbackScratch {
+        self.0.qp_pullback_scratch_banded(nk, nrow_pair)
+    }
+    #[inline]
     pub fn qp_pullback_scratch_clear(&self, scr: &mut QpPullbackScratch) {
         self.0.qp_pullback_scratch_clear(scr)
     }
@@ -2168,6 +2172,9 @@ pub fn qp_cache_bytes_estimate(naux: usize, nmo: usize, nquad: usize) -> usize {
         nmo: usize,
         nocc: usize,
         nov: usize,
+        /// Width of the stored pair band: `bq` keeps only the packed pairs whose smaller index
+        /// is `< nrow_pair` (see [`banded_pair_count`]); `nmo` means the full packed layout.
+        nrow_pair: usize,
         bq: Vec<Vec<f64>>,
         bj: Vec<Vec<f64>>,
         be: Vec<Vec<f64>>,
@@ -2215,6 +2222,7 @@ pub fn qp_cache_bytes_estimate(naux: usize, nmo: usize, nquad: usize) -> usize {
                 nmo: 0,
                 nocc: 0,
                 nov: 0,
+                nrow_pair: 0,
                 bq: Vec::new(),
                 bj: Vec::new(),
                 be: Vec::new(),
@@ -2228,7 +2236,13 @@ pub fn qp_cache_bytes_estimate(naux: usize, nmo: usize, nquad: usize) -> usize {
         }
 
         fn new(engine: &GwGradEngine, nk: usize) -> Self {
+            Self::new_banded(engine, nk, engine.nmo)
+        }
+
+        /// As [`Self::new`], keeping only the pair band `min(p, q) < nrow_pair` of `bq`.
+        fn new_banded(engine: &GwGradEngine, nk: usize, nrow_pair: usize) -> Self {
             let (naux, nmo, nocc) = (engine.naux, engine.nmo, engine.nocc);
+            let nrow_pair = nrow_pair.min(nmo);
             let nov = nocc * (nmo - nocc);
             let imag_factors = engine
                 .quad
@@ -2251,13 +2265,17 @@ pub fn qp_cache_bytes_estimate(naux: usize, nmo: usize, nquad: usize) -> usize {
                 nmo,
                 nocc,
                 nov,
+                nrow_pair,
                 // the pair covector accumulates directly in its packed
                 // (lower-triangle) layout: the pullback writes the two
                 // directions of a pair into the same slot and the finish pass
                 // halves the off-diagonal pairs, which is exactly the
                 // minimum-norm symmetric representative the symmetrisation used
-                // to build — at half the memory
-                bq: vec![vec![0.0f64; naux * packed_pair_count(nmo)]; nk],
+                // to build — at half the memory.  Only the band
+                // `min(p, q) < nrow_pair` is allocated; that band is a prefix of
+                // the packed layout, and the covector is zero outside it (no QP
+                // weight reaches those rows), so the arithmetic is unchanged.
+                bq: vec![vec![0.0f64; naux * banded_pair_count(nmo, nrow_pair)]; nk],
                 bj: vec![vec![0.0f64; naux * naux]; nk],
                 be: vec![vec![0.0f64; nmo]; nk],
                 bb: vec![vec![0.0f64; nmo]; nk],
@@ -5213,8 +5231,10 @@ impl<'a> GwGradEngine<'a> {
             v_res,
             z_order,
             imag_factors,
+            nrow_pair,
             ..
         } = scr;
+        let nrow_pair = nrow_pair.max(1).min(nmo);
 
         // ---- deferred polarizability pullbacks ----
         let t_polar = Instant::now();
@@ -5278,7 +5298,7 @@ impl<'a> GwGradEngine<'a> {
         // values `symmetrise_pairs` used to write into the full buffer.
         for k in 0..nk {
             let mut tp = 0usize;
-            for col in 0..nmo {
+            for col in 0..nrow_pair {
                 for row in col..nmo {
                     if row != col {
                         let s = &mut bq[k][tp * naux..(tp + 1) * naux];
@@ -5289,7 +5309,17 @@ impl<'a> GwGradEngine<'a> {
                     tp += 1;
                 }
             }
+            debug_assert_eq!(tp, banded_pair_count(nmo, nrow_pair), "banded pair walk");
             symmetrise_square(&mut bj[k], naux);
+        }
+        if std::env::var("REST_GWGRAD_MEMDBG").is_ok() {
+            println!(
+                "[memdbg]   pair-covector band: {} of {} packed pairs stored ({nrow_pair}/{} rows, {:.1} MB)",
+                banded_pair_count(nmo, nrow_pair),
+                packed_pair_count(nmo),
+                nmo,
+                (nk * naux * banded_pair_count(nmo, nrow_pair)) as f64 * 8.0 / 1048576.0,
+            );
         }
         if grad_timing() {
             eprintln!(
@@ -5307,7 +5337,8 @@ impl<'a> GwGradEngine<'a> {
         // the `mem::replace` destination of a parallel worker) has no shapes
         // yet; materialise them first so the cleared scratch is usable.
         if scr.imag_factors.is_empty() || scr.bq.is_empty() || scr.bq[0].is_empty() {
-            *scr = self.qp_pullback_scratch(scr.nk);
+            let nk = scr.nk;
+            *scr = self.qp_pullback_scratch_banded(nk, scr.nrow_pair.max(1).min(self.nmo));
         }
         let nk = scr.nk;
         for k in 0..nk {
@@ -5331,7 +5362,8 @@ impl<'a> GwGradEngine<'a> {
     pub fn qp_pullback_scratch_reset_page(&self, scr: &mut QpPullbackScratch) {
         if scr.imag_factors.is_empty() || scr.bq.is_empty() || scr.bq[0].is_empty() {
             let nk = scr.nk;
-            *scr = self.qp_pullback_scratch(nk);
+            let nrow = scr.nrow_pair.max(1).min(self.nmo);
+            *scr = self.qp_pullback_scratch_banded(nk, nrow);
             return;
         }
         let nk = scr.nk;
@@ -5413,6 +5445,34 @@ impl<'a> GwGradEngine<'a> {
         QpPullbackScratch::new(self, nk)
     }
 
+    /// Width of the pair band the pullback of `caches`/`weights` writes.
+    ///
+    /// `qp_pullback_chunk` writes the pairs `(cache.target, m)` for every `m`, and
+    /// `polar_pullback_blocks` the occupied-virtual pairs `(i, a)`; the smaller index of any of
+    /// them is at most `cache.target` (or `i < nocc`).  So `1 + max target` over the caches with
+    /// a nonzero weight is the exact band that has to be stored — a *weight-row length* is **not**
+    /// the right bound: in the analytic-gradient entry point the caches are a compacted subset of
+    /// the orbitals, so a row index is not an orbital index.
+    pub fn pullback_pair_band(&self, caches: &[&QpCache], weights: &[Vec<f64>]) -> usize {
+        let nrow = (0..caches.len())
+            .filter(|&i| weights.iter().any(|w| w.get(i).copied().unwrap_or(0.0) != 0.0))
+            .map(|i| caches[i].target + 1)
+            .max()
+            .unwrap_or(self.nmo)
+            .max(self.nocc);
+        nrow.max(1).min(self.nmo)
+    }
+
+    /// As [`Self::qp_pullback_scratch`], storing only the pair band
+    /// `min(p, q) < nrow_pair` of the pair covector (see [`banded_pair_count`]).
+    ///
+    /// Callers that know the largest orbital carrying a QP weight — the GW/BSE gradient does,
+    /// from its weight rows — use this to keep `naux * (banded pairs)` doubles instead of
+    /// `naux * nmo(nmo+1)/2`.
+    pub fn qp_pullback_scratch_banded(&self, nk: usize, nrow_pair: usize) -> QpPullbackScratch {
+        QpPullbackScratch::new_banded(self, nk, nrow_pair)
+    }
+
     /// Process one page of caches in an open streaming pullback.
     pub fn qp_pullback_chunk_public(
         &self,
@@ -5470,6 +5530,10 @@ impl<'a> GwGradEngine<'a> {
         }
         let flat: Vec<f64> = weights.iter().flat_map(|w| w.iter().copied()).collect();
         let t_cache = Instant::now();
+        // The full packed width: this entry point returns the covector to callers outside the
+        // crate, which pair it with the full-width fold/unpack helpers.  The *banded* storage is
+        // opted into by the GW/BSE gradient driver, which owns its scratch and knows the band
+        // (`qp_pullback_scratch_banded`, see `pullback_pair_band`).
         let mut scr = QpPullbackScratch::new(self, nk);
         let owned: Vec<QpCache> = caches
             .iter()
@@ -5871,11 +5935,28 @@ impl GwGradEngine<'_> {
     /// The extra `[nao, nao]` block the serial stream already keeps is unchanged: each
     /// batch materialises one auxiliary shell's `int3c2e` block at a time.
     pub fn fold_covector_packed_streamed_parallel(&self, bq_tp: &[f64]) -> FoldedCovector {
+        self.fold_covector_packed_streamed_parallel_banded(bq_tp, self.nmo)
+    }
+
+    /// [`Self::fold_covector_packed_streamed_parallel`] for a **banded** pair covector, i.e. one
+    /// that stores only the packed pairs whose smaller index is `< nrow_pair`
+    /// (see [`banded_pair_count`]).
+    ///
+    /// The band is a prefix of the packed layout and the covector is zero outside it (the LR
+    /// engine writes it only at pairs reached by a QP-weighted row), so rebuilding the symmetric
+    /// `bqm` from the band alone leaves exactly the same zeros elsewhere and the fold result is
+    /// unchanged.
+    pub fn fold_covector_packed_streamed_parallel_banded(
+        &self,
+        bq_tp: &[f64],
+        nrow_pair: usize,
+    ) -> FoldedCovector {
         let nao = self.nao;
         let nmo = self.nmo;
         let naux = self.naux;
         let n2 = nao * nao;
-        let nmo_tp = nmo * (nmo + 1) / 2;
+        let nrow = nrow_pair.max(1).min(nmo);
+        let nmo_tp = banded_pair_count(nmo, nrow);
         assert_eq!(bq_tp.len(), naux * nmo_tp, "fold_covector_packed_streamed: bq size mismatch");
 
         // Batches of *all* auxiliary shells (the fold sums over every centred integral
@@ -5952,7 +6033,7 @@ impl GwGradEngine<'_> {
                         // rebuild the symmetric `bq` plane from its lower triangle (`bq` was
                         // symmetrised, so the mirrored entries are the same floating-point number)
                         let mut tp = 0usize;
-                        for col in 0..nmo {
+                        for col in 0..nrow {
                             for row in col..nmo {
                                 let val = bq_tp[tp * naux + p];
                                 bqm.data[row + col * nmo] = val;
@@ -5993,11 +6074,19 @@ impl GwGradEngine<'_> {
     /// The symmetric plane is rebuilt from the packed values, so the fold is exact and identical to
     /// the full-buffer version while half the covector memory is resident.
     pub fn fold_covector_packed(&self, bq_tp: &[f64]) -> FoldedCovector {
+        self.fold_covector_packed_banded(bq_tp, self.nmo)
+    }
+
+    /// [`Self::fold_covector_packed`] for a **banded** pair covector (see
+    /// [`banded_pair_count`]): the pairs outside the band are zero, so leaving their `bqm`
+    /// entries at zero rebuilds the identical symmetric plane.
+    pub fn fold_covector_packed_banded(&self, bq_tp: &[f64], nrow_pair: usize) -> FoldedCovector {
         let nao = self.nao;
         let nmo = self.nmo;
         let naux = self.naux;
         let n2 = nao * nao;
-        let nmo_tp = nmo * (nmo + 1) / 2;
+        let nrow = nrow_pair.max(1).min(nmo);
+        let nmo_tp = banded_pair_count(nmo, nrow);
         assert_eq!(bq_tp.len(), naux * nmo_tp, "fold_covector_packed: bq size mismatch");
 
         self.ensure_q();
@@ -6015,7 +6104,7 @@ impl GwGradEngine<'_> {
             // rebuild the symmetric `bq` plane from its lower triangle (`bq` has been symmetrised,
             // so the mirrored entries are the same floating-point number)
             let mut tp = 0usize;
-            for col in 0..nmo {
+            for col in 0..nrow {
                 for row in col..nmo {
                     let val = bq_tp[tp * naux + p];
                     bqm.data[row + col * nmo] = val;
@@ -7525,14 +7614,47 @@ pub fn packed_pair_count(nmo: usize) -> usize {
     nmo * (nmo + 1) / 2
 }
 
+/// Number of packed pairs whose **smaller** index is `< nrow` (the *band*).
+///
+/// [`packed_pair_index`] is left unchanged, so the banded layout is exactly the *prefix* of the
+/// packed one: index `i < banded_pair_count(nmo, nrow)` describes the same pair in both.  A
+/// writer therefore keeps its index formula, and a consumer that zips a banded covector against
+/// a full-pair one still reads the matching entries — the omitted ones are zero by construction.
+///
+/// The LR pair covector of the GW/BSE gradient is nonzero only inside the band
+/// `nrow = (largest orbital with a QP weight) + 1`: measured at polyene n=3/def2-TZVP,
+/// 7194 of 27495 pair planes carry a nonzero value and the largest smaller index is 32, i.e.
+/// `nocc + nvir - 1 = 22 + 11 - 1`.  At polyene n=6/def2-TZVPP the band is 32818 of 161596
+/// pairs, a 4.9x smaller covector.
+#[inline]
+pub fn banded_pair_count(nmo: usize, nrow: usize) -> usize {
+    let nrow = nrow.min(nmo);
+    if nrow == 0 {
+        return 0;
+    }
+    nrow * nmo - nrow * (nrow - 1) / 2
+}
+
 /// Expand a packed covector into the full symmetric `[nmo, nmo] x naux` layout
 /// (the same value on both entries of each pair), i.e. the inverse of
 /// [`pack_pairs_in_place`].  Provided for the legacy full-buffer contractions.
 pub fn unpack_pairs(packed: &[f64], nmo: usize, naux: usize) -> Vec<f64> {
-    assert_eq!(packed.len(), naux * packed_pair_count(nmo), "unpack_pairs: size mismatch");
+    unpack_pairs_banded(packed, nmo, naux, nmo)
+}
+
+/// [`unpack_pairs`] for a **banded** packed covector (see [`banded_pair_count`]); the pairs
+/// outside the band are zero in the unpacked buffer, exactly as they are in the stored one.
+pub fn unpack_pairs_banded(
+    packed: &[f64],
+    nmo: usize,
+    naux: usize,
+    nrow_pair: usize,
+) -> Vec<f64> {
+    let nrow = nrow_pair.max(1).min(nmo);
+    assert_eq!(packed.len(), naux * banded_pair_count(nmo, nrow), "unpack_pairs: size mismatch");
     let mut v = vec![0.0f64; naux * nmo * nmo];
     let mut tp = 0usize;
-    for col in 0..nmo {
+    for col in 0..nrow {
         for row in col..nmo {
             let src = tp * naux;
             let dst = (row + col * nmo) * naux;
