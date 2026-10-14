@@ -26,6 +26,27 @@ use crate::ri_gw;
 #[cfg(target_os = "linux")]
 use libc::seccomp_notif;
 
+/// Build the renormalized-singles (Hartree-Fock) Hamiltonian from the current
+/// density matrix, without permanently altering the reference's XC metadata.
+///
+/// The RS Hamiltonian is the *Hartree-Fock* Hamiltonian of the DFT density, so
+/// the XC component list is temporarily emptied while it is assembled.  The XC
+/// metadata, however, also encodes the identity of the reference:
+/// `ri_gw::exchange_fraction` (and the gradient/response code) treats an empty
+/// `dfa_compnt_scf` as a genuine Hartree-Fock reference and therefore sets the
+/// exact-exchange fraction to one.  Leaving the list empty after the RS step
+/// silently turns the DFT reference into an apparent HF one for every later GW
+/// stage, which shifts the RS quasiparticle energies by the full exact-exchange
+/// term.  Restore the saved fields so that the reference keeps its identity.
+fn generate_rs_hf_hamiltonian(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>){
+    let dfa_compnt_save=scf_data.mol.xc_data.dfa_compnt_scf.clone();
+    let dfa_paramr_save=scf_data.mol.xc_data.dfa_paramr_scf.clone();
+    scf_data.mol.xc_data.dfa_compnt_scf=vec![];
+    scf_io::SCF::generate_hf_hamiltonian_ri_v_dm_only(scf_data,mpi_operator);
+    scf_data.mol.xc_data.dfa_compnt_scf=dfa_compnt_save;
+    scf_data.mol.xc_data.dfa_paramr_scf=dfa_paramr_save;
+}
+
 pub fn generate_rs_hamiltonian(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>)->(MatrixFull<f64>,MatrixFull<f64>){
     println!("Starts generating rs hamiltonian!");
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
@@ -35,8 +56,7 @@ pub fn generate_rs_hamiltonian(scf_data:&mut SCF,mpi_operator:&Option<MPIOperato
     //dfa_oo_hamiltonian.formated_output(20,"full");
     //println!("DFA vv hamiltonian");
     //dfa_vv_hamiltonian.formated_output(20,"full");
-    scf_data.mol.xc_data.dfa_compnt_scf=vec![];
-    scf_io::SCF::generate_hf_hamiltonian_ri_v_dm_only(scf_data,mpi_operator);
+    generate_rs_hf_hamiltonian(scf_data,mpi_operator);
     let hf_oo_hamiltonian=hamiltonian_ao2mo(scf_data,'O');
     let hf_vv_hamiltonian=hamiltonian_ao2mo(scf_data,'V');
     (hf_oo_hamiltonian,hf_vv_hamiltonian)
@@ -82,10 +102,8 @@ pub fn renormalized_singles_diagonalization_fullspace(scf_data:&mut SCF,w_rs:boo
     println!("The full HF Hamiltonian in MO basis is diagonalized and renormalized.");
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
     
-    scf_data.mol.xc_data.dfa_compnt_scf=vec![];
-    scf_io::SCF::generate_hf_hamiltonian_ri_v_dm_only(scf_data,mpi_operator);
+    generate_rs_hf_hamiltonian(scf_data,mpi_operator);
     let hf_full_hamiltonian=hamiltonian_ao2mo_full(scf_data);
-    
     let (mut eigenvectors_opt, eigenvalues_opt, ndim) = _dsyev(&hf_full_hamiltonian, 'V');
     let ndim = ndim as usize;
     let mut eigenvectors = eigenvectors_opt.unwrap();
@@ -404,9 +422,9 @@ pub fn renormalized_singles_with_orbitals(scf_data:&mut SCF,full_space:bool,mpi_
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
     // The RS Hamiltonian is the HF Hamiltonian evaluated with the DFT density
     // matrix, and is expanded in the DFT orbitals: build it before touching the
-    // orbital coefficients.
-    scf_data.mol.xc_data.dfa_compnt_scf=vec![];
-    scf_io::SCF::generate_hf_hamiltonian_ri_v_dm_only(scf_data,mpi_operator);
+    // orbital coefficients.  `generate_rs_hf_hamiltonian` restores the reference
+    // XC metadata afterwards, so the DFT reference is not mistaken for HF later.
+    generate_rs_hf_hamiltonian(scf_data,mpi_operator);
     let previous_coeff=scf_data.eigenvectors[0].clone();
     let (energies,rotation)=rs_rotation_in_mo_basis(scf_data,full_space);
     // C_rs = C_ks * U
