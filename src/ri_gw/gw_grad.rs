@@ -678,7 +678,7 @@ impl GwGradConfig {
 /// The same line also carries the wall time elapsed since the previous probe
 /// (`dt`) and since the first probe of the process (`T`), so the per-stage cost
 /// breakdown comes from the very same instrumentation as the memory one.
-fn mem_probe(label: &str) {
+pub(crate) fn mem_probe(label: &str) {
     if std::env::var("REST_GWGRAD_MEMDBG").is_err() {
         return;
     }
@@ -2028,6 +2028,20 @@ impl<'a, 'b> SyncGw<'a, 'b> {
     }
 }
 
+/// The grid-derived `v_xc` data of a GW/BSE gradient reference.
+///
+/// Both fields come from the SCF's DFT grid tabulated AO (`generate_vxc_rayon`), which is
+/// why [`GwGradEngine::precompute_vxc`] exists: a driver that owns the `SCF` mutably can
+/// compute them, release the (multi-GB) grid tables and only then build the engine.  See
+/// [`Grids::release_tabulated_ao`](crate::dft::Grids::release_tabulated_ao).
+#[derive(Clone, Debug, Default)]
+pub struct GwVxc {
+    /// `v_xc` diagonal in the MO basis, `[nmo]` (`<n| v_xc |n>`); all-zero for HF.
+    pub nn: Vec<f64>,
+    /// Full `v_xc` matrix in the MO basis `[nmo*nmo]` col-major; empty for an HF reference.
+    pub mo: Vec<f64>,
+}
+
 pub struct GwGradEngine<'a> {
     pub scf: &'a SCF,
     pub config: GwGradConfig,
@@ -2281,9 +2295,58 @@ impl<'a> GwGradEngine<'a> {
         Self::new_with_raw(scf, config, raw)
     }
 
+    /// Engine with the grid-derived `v_xc` supplied by the caller.
+    ///
+    /// Use this together with [`Self::precompute_vxc`] when the caller owns the `SCF`
+    /// mutably and wants to release the SCF grid's tabulated AO tables in between: those
+    /// tables are read *only* by `precompute_vxc` in the whole GW/BSE analytic-gradient
+    /// path, so they are dead weight from the moment it returns.
+    pub fn new_with_vxc(scf: &'a SCF, config: GwGradConfig, vxc: GwVxc) -> Self {
+        let raw = build_raw_ri_tensors(scf);
+        Self::new_with_raw_and_vxc(scf, config, raw, vxc)
+    }
+
+    /// The two grid-derived `v_xc` objects this engine needs, computed up front.
+    ///
+    /// This is the **only** consumer of the SCF grid's tabulated AO tables
+    /// (`grids.ao`/`aop`/`ao_compressed`/`aop_compressed`/`non0tab`) in the GW/BSE analytic
+    /// gradient: `ri_gw`/`ri_bse` never touch `scf.grids`, and every other DFT piece of the
+    /// gradient — the CP-KS response (`NIMatmul`), the f_xc kernel (`FxcHessianCache`) and
+    /// the explicit `d v_xc/dR` (`vxc_deriv1_streaming`) — evaluates its own AO from
+    /// `grids.coordinates`/`weights`.  Hence a driver holding the `SCF` mutably can compute
+    /// these, call `Grids::release_tabulated_ao` and only then build the engine.
+    pub fn precompute_vxc(scf: &SCF) -> GwVxc {
+        // exactly the dimensions `new_with_raw_and_vxc` uses (`raw.nao` == `mol.num_basis`,
+        // `nmo` == `mol.num_state`); `c_mo` may carry more columns than `nmo`, and only the
+        // leading `nmo` of them are contracted.
+        let nao = scf.mol.num_basis;
+        let nmo = scf.mol.num_state;
+        let c_mo = &scf.eigenvectors[0];
+        let nn = crate::ri_gw::vxc_ao2mo(scf);
+        let mo: Vec<f64> = if scf.mol.xc_data.dfa_compnt_scf.is_empty() {
+            Vec::new()
+        } else {
+            let vxc_ao = scf
+                .generate_vxc_rayon(1.0)
+                .2[0]
+                .to_matrixfull()
+                .expect("gw_grad: v_xc AO matrix")
+                .data;
+            let t = gemm_nt(&c_mo.data, nao, nmo, &vxc_ao, nao, nao);
+            gemm_nn(&t, nmo, nao, &c_mo.data, nao, nmo)
+        };
+        GwVxc { nn, mo }
+    }
+
     /// Engine with externally supplied raw RI tensors (allows perturbing the
     /// integrals directly, e.g. for validation).
-    pub fn new_with_raw(scf: &'a SCF, mut config: GwGradConfig, raw: RawRiTensors) -> Self {
+    pub fn new_with_raw(scf: &'a SCF, config: GwGradConfig, raw: RawRiTensors) -> Self {
+        let vxc = Self::precompute_vxc(scf);
+        Self::new_with_raw_and_vxc(scf, config, raw, vxc)
+    }
+
+    /// As [`Self::new_with_raw`], with the grid-derived `v_xc` supplied by the caller.
+    pub fn new_with_raw_and_vxc(scf: &'a SCF, mut config: GwGradConfig, raw: RawRiTensors, vxc: GwVxc) -> Self {
         assert_eq!(scf.mol.spin_channel, 1, "gw_grad: restricted closed-shell only");
         assert_eq!(scf.mol.start_mo, 0, "gw_grad: no frozen orbitals supported");
         if config.num_freq == 0 {
@@ -2478,19 +2541,9 @@ impl<'a> GwGradEngine<'a> {
         // a plain HF reference counts as a hybrid with alpha = 1: its orbital
         // energies already carry the exact exchange (see `ri_gw::exchange_fraction`)
         let fock_hyb = crate::ri_gw::exchange_fraction(scf);
-        let vxc_nn = crate::ri_gw::vxc_ao2mo(scf);
-        let vxc_mo: Vec<f64> = if scf.mol.xc_data.dfa_compnt_scf.is_empty() {
-            Vec::new()
-        } else {
-            let vxc_ao = scf
-                .generate_vxc_rayon(1.0)
-                .2[0]
-                .to_matrixfull()
-                .expect("gw_grad: v_xc AO matrix")
-                .data;
-            let t = gemm_nt(&c_mo.data, nao, nmo, &vxc_ao, nao, nao);
-            gemm_nn(&t, nmo, nao, &c_mo.data, nao, nmo)
-        };
+        // supplied by `precompute_vxc`: the caller may have released the SCF grid's
+        // tabulated AO tables already (see `Self::precompute_vxc`)
+        let GwVxc { nn: vxc_nn, mo: vxc_mo } = vxc;
         let (shells, shell_of) = degenerate_shells(&e, config.degenerate_tol);
         if config.degenerate_tol > 0.0 && std::env::var("REST_GWGRAD_DBG").is_ok() {
             let deg: Vec<&Vec<usize>> = shells.iter().filter(|s| s.len() > 1).collect();
@@ -7884,10 +7937,31 @@ impl<'a> GwCdGradEngine<'a> {
 
     /// Engine with externally supplied raw RI tensors (for validation).
     pub fn new_with_raw(scf: &'a SCF, config: GwGradConfig, raw: RawRiTensors) -> Self {
+        let vxc = GwGradEngine::precompute_vxc(scf);
+        Self::new_with_raw_and_vxc(scf, config, raw, vxc)
+    }
+
+    /// Full-CD engine with the grid-derived `v_xc` supplied by the caller.
+    ///
+    /// Use this with [`GwGradEngine::precompute_vxc`] when the caller wants to release the
+    /// SCF grid's tabulated AO tables before the engine is built (see
+    /// [`Grids::release_tabulated_ao`](crate::dft::Grids::release_tabulated_ao)).
+    pub fn new_with_vxc(scf: &'a SCF, config: GwGradConfig, vxc: GwVxc) -> Self {
+        let raw = build_raw_ri_tensors(scf);
+        Self::new_with_raw_and_vxc(scf, config, raw, vxc)
+    }
+
+    /// As [`Self::new_with_raw`], with the grid-derived `v_xc` supplied by the caller.
+    pub fn new_with_raw_and_vxc(
+        scf: &'a SCF,
+        config: GwGradConfig,
+        raw: RawRiTensors,
+        vxc: GwVxc,
+    ) -> Self {
         // the full-CD path never touches the low-rank machinery
         let mut config = config;
         config.skip_lr_cache = true;
-        let base = GwGradEngine::new_with_raw(scf, config, raw);
+        let base = GwGradEngine::new_with_raw_and_vxc(scf, config, raw, vxc);
         let screening = CdScreening::new(&base);
         Self { base, screening }
     }

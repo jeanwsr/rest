@@ -336,6 +336,47 @@ fn announce_gw_skipped(scf_data: &SCF, output_type: &str) {
     println!("--------------------------------------------------------------------------------");
 }
 
+/// Compute the grid-derived `v_xc` of the GW/BSE gradient engine and then release the SCF
+/// grid's tabulated AO tables.
+///
+/// The tabulated tables (`grids.ao`/`aop`/`ao_compressed`/`aop_compressed`/`non0tab`) exist
+/// for the SCF's own XC evaluation.  In the whole GW/BSE analytic-gradient path they have a
+/// **single** reader — `GwGradEngine::precompute_vxc` (`ri_gw`/`ri_bse` never touch
+/// `scf.grids`, and the CP-KS response, the f_xc kernel and `d v_xc/dR` all evaluate their
+/// own AO from `grids.coordinates`/`weights`).  Once `precompute_vxc` has returned they are
+/// dead weight for the rest of the process, and at def2-TZVPP/polyene scale they are
+/// ~1-3.5 GB; releasing them here is therefore free, and the release lands *before* the
+/// gradient's peak phase (which is well after the engine build).
+///
+/// This is the *only* place the gradient driver gives them up; the escape hatch
+/// `REST_KEEP_GRID_AO=1` restores the historical behaviour for an A/B comparison.
+fn precompute_vxc_and_release_grid_ao(scf_data: &mut SCF) -> ri_gw::gw_grad::GwVxc {
+    let vxc = ri_gw::gw_grad::GwGradEngine::precompute_vxc(scf_data);
+    if std::env::var("REST_KEEP_GRID_AO").is_ok() {
+        return vxc;
+    }
+    // The only post-SCF consumer outside this gradient is the TDDFT-eigenvalue route
+    // (`num_int::prepare_fxc_data`), which runs *after* the QP section in `main_driver` and
+    // reads the compressed tables directly instead of re-evaluating.  A card that asks for
+    // both keeps the tables (the historical behaviour).
+    if scf_data.mol.ctrl.tddft.is_some() {
+        return vxc;
+    }
+    if let Some(grids) = scf_data.grids.as_mut() {
+        let freed = grids.release_tabulated_ao();
+        if freed > 0 {
+            crate::hessian::memory_monitor::trim_to_os(0);
+            if scf_data.mol.ctrl.print_level >= 1 {
+                println!(
+                    " [qp] released {:.0} MB of tabulated DFT-grid AO (the GW/BSE gradient evaluates its own AO)",
+                    freed as f64 / 1.0e6
+                );
+            }
+        }
+    }
+    vxc
+}
+
 pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>) -> crate::ri_bse::BseOutput {
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let output_type=qp_ctrl.gw_or_bse.clone();
@@ -540,11 +581,12 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             };
             assert!(target < scf_data.mol.num_state, "gradient_orbital {target} out of range");
             let use_cd = qp_ctrl.gradient_engine.eq_ignore_ascii_case("cd");
+            let vxc = precompute_vxc_and_release_grid_ao(scf_data);
             let (grad, omega, z) = if use_cd {
-                let engine = ri_gw::gw_grad::GwCdGradEngine::new(scf_data, cfg);
+                let engine = ri_gw::gw_grad::GwCdGradEngine::new_with_vxc(scf_data, cfg, vxc);
                 engine.analytic_gradient(target)
             } else {
-                let engine = ri_gw::gw_grad::GwGradEngine::new(scf_data, cfg);
+                let engine = ri_gw::gw_grad::GwGradEngine::new_with_vxc(scf_data, cfg, vxc);
                 engine.analytic_gradient(target)
             };
             println!(
@@ -582,8 +624,9 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
                 "gradient_nroots ({nroots}) must exceed gradient_state ({})",
                 qp_ctrl.gradient_state
             );
+            let vxc = precompute_vxc_and_release_grid_ao(scf_data);
             let (grads, omegas) = {
-                let gw = ri_gw::gw_grad::GwGradEngine::new(scf_data, cfg);
+                let gw = ri_gw::gw_grad::GwGradEngine::new_with_vxc(scf_data, cfg, vxc);
                 // `gradient_bse_window = 0` keeps the full virtual space, the
                 // historical behaviour; a positive value restricts the
                 // transition space to `e_F + window` (the same convention as the

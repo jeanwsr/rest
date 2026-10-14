@@ -4145,6 +4145,37 @@ impl Grids {
         aop_dense
     }
 
+    /// Release the tabulated AO tables of the DFT grid (dense and/or compressed) and the
+    /// `non0tab` mask, returning the number of bytes released.
+    ///
+    /// The tables are produced from `coordinates` + `weights` + the basis by
+    /// `prepare_tabulated_ao` / `prepare_tabulated_ao_sparse`, and the SCF's own XC evaluation
+    /// is their only consumer inside the SCF.  Their size is `~nao × ngrids × 8 B` for the AO
+    /// plus three times that (times the AOP occupancy) for the gradients — at
+    /// def2-TZVP/polyene scale the compressed pair reaches GBs.
+    ///
+    /// The post-SCF machinery does **not** read them: `NIMatmul` (CP-KS response), the
+    /// `FxcHessianCache` (f_xc kernel) and `vxc_deriv1_streaming` (explicit d v_xc/dR) all
+    /// evaluate their own AO from `coordinates`/`weights`.  So a caller that has already
+    /// taken everything it needs may drop the tables.  In the GW/BSE analytic gradient the
+    /// *only* reader is `GwGradEngine::precompute_vxc`, so the driver releases them
+    /// immediately after that call (see `post_scf_analysis::quasiparticle_methods`) and the
+    /// tables never sit under the gradient's peak phase.
+    ///
+    /// Caveats for other callers: the legacy TDDFT-eigenvalue / analytic-Hessian route
+    /// (`dft::num_int::prepare_fxc_data`) reads the compressed tables directly instead of
+    /// re-evaluating, so do not release while such a calculation is still to come in the
+    /// same input; and the drivers expose `REST_KEEP_GRID_AO=1` as an A/B switch.
+    pub fn release_tabulated_ao(&mut self) -> usize {
+        let (_, _, total) = self.memory_footprint();
+        self.ao = None;
+        self.aop = None;
+        self.ao_compressed = None;
+        self.aop_compressed = None;
+        self.non0tab = None;
+        total
+    }
+
     /// Memory footprint estimate for dense + compressed storage (bytes).
     pub fn memory_footprint(&self) -> (usize, usize, usize) {
         let dense_ao_bytes = self.ao.as_ref().map(|m| m.data.len() * 8).unwrap_or(0);
