@@ -2884,19 +2884,30 @@ impl<'a> GwGradEngine<'a> {
         let (nao, nmo, naux) = (self.nao, self.nmo, self.naux);
         let n2 = nao * nao;
         let mut q = vec![0.0f64; naux * nmo * nmo];
-        self.raw.with_i3(|i3| {
+        // Consume the three-centre integrals **auxiliary-atom block by block**, exactly as the
+        // engine build does (`for_each_i3_atom_block`), instead of materialising the dense
+        // `nao^2 * naux` tensor through `with_i3`.  This is the *rebuild* path (`ensure_q` after
+        // `evict_q`), so it used to be the one place that brought the dense tensor back — 2.8 GB
+        // at polyene n=6/def2-TZVPP, held on top of the `q` it is building and alongside the SCF's
+        // own `(mu nu|P)`.  Every `q[., P]` is assigned exactly once and in the same auxiliary
+        // order as the full-tensor version, so the result is bit-identical; the integral work is
+        // the same shell-triplet sum, split into a few more libcint calls.
+        {
             let mut ip = MatrixFull::new([nao, nao], 0.0);
             let mut tmp = MatrixFull::new([nao, nmo], 0.0);
             let mut sl = MatrixFull::new([nmo, nmo], 0.0);
-            for p_aux in 0..naux {
-                ip.data.copy_from_slice(&i3[p_aux * n2..(p_aux + 1) * n2]);
-                _dgemm_full(&ip, 'N', &self.c_mo, 'N', &mut tmp, 1.0, 0.0);
-                _dgemm_full(&self.c_mo, 'T', &tmp, 'N', &mut sl, 1.0, 0.0);
-                for col in 0..nmo * nmo {
-                    q[col * naux + p_aux] = sl.data[col];
+            self.raw.for_each_i3_atom_block(|p0, nb, blk| {
+                for pl in 0..nb {
+                    let p_aux = p0 + pl;
+                    ip.data.copy_from_slice(&blk[pl * n2..(pl + 1) * n2]);
+                    _dgemm_full(&ip, 'N', &self.c_mo, 'N', &mut tmp, 1.0, 0.0);
+                    _dgemm_full(&self.c_mo, 'T', &tmp, 'N', &mut sl, 1.0, 0.0);
+                    for col in 0..nmo * nmo {
+                        q[col * naux + p_aux] = sl.data[col];
+                    }
                 }
-            }
-        });
+            });
+        }
         symmetrise_pairs(&mut q, naux, nmo);
         q
     }
