@@ -234,6 +234,7 @@ fn fxc_block_size(scf: &SCF, nao: usize, nderiv: usize, ngrids: usize) -> usize 
 }
 
 /// Process high-water RSS (`VmHWM`) in MiB, 0 when unavailable.
+#[allow(dead_code)]
 fn vmhwm_mb() -> f64 {
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
         for line in s.lines() {
@@ -433,31 +434,52 @@ pub fn compute_fxc_response_ao_cached(
     vmat
 }
 
-/// Batched AO-basis fxc response for multiple density matrices.
+/// Batched fxc response for multiple density matrices, projected to the
+/// (frozen, VO) blocks that are all the CP-HF matvec ever consumes.
 ///
-/// Phase A optimization: processes all RHS in a single par_iter dispatch
-/// over grid blocks. Each block visits the cached AO data once and the
-/// cached fxc kernel once, then loops over RHS to compute ρ₁/wv/aow per
-/// RHS. This avoids N_RHS separate rayon fork/join overhead and improves
-/// cache locality on the AO arrays.
+/// One `par_iter` dispatch over grid blocks: each block visits its AO data once and the
+/// cached fxc kernel once, then loops over the RHS.  What is new is *when* the MO
+/// projection happens.
 ///
-/// Returns one [nao, nao] response matrix per input dm.
-pub fn compute_fxc_response_ao_cached_batched(
+/// The old `compute_fxc_response_ao_cached_batched` accumulated the full `[nao, nao]`
+/// partial of every block and returned `n_rhs` such matrices, i.e. `n_rhs*nao^2` doubles
+/// (311 MB at polyene n=7: nao = 658, n_rhs = 3*natm = 90) — and because it used
+/// `map(...).reduce(...)`, *every live reduce leaf* held a private partial **and** a
+/// private accumulator of that size.  The answer does not grow with the pool, but that
+/// scratch did.  Since the caller only ever needs `C^T V C`, and the projection is linear,
+/// projecting inside the per-block loop makes the reduced quantity `n_rhs*(nocc*nfrozen +
+/// nocc*nvir)` — 21.9 MB at the same geometry, 14x smaller — so the phase's extra resident
+/// set stops following the core count, and the reduction's DRAM traffic drops from
+/// `nblocks * n_rhs * nao^2` to `nblocks * n_rhs * nocc * nvir`.
+///
+/// The price is `2*nocc*nao^2 + 2*nocc*nao*(nfrozen+nvir)` flops per (RHS, block), about
+/// 19% on top of the block contraction itself.
+///
+/// Returns, per input density, a flat vector `[frozen block (r + k*nocc) | VO block
+/// (r + a*nocc)]` in the same layout `gen_vind_opt_batched` assembles.
+pub fn compute_fxc_response_vo_cached_batched(
     cache: &FxcHessianCache,
     dms: &[MatrixFull<f64>],
-) -> Vec<MatrixFull<f64>> {
+    ws: &VindWorkspace,
+) -> Vec<Vec<f64>> {
     use rayon::prelude::*;
     let _t_fxc = std::time::Instant::now();
     let nao = cache.nao;
     let nvar = cache.nvar;
     let n_rhs = dms.len();
+    let nocc = ws.nocc;
+    let nvir = ws.nvir;
+    let nfrozen = ws.nfrozen;
+    let fo = nocc * nfrozen;
+    let vo = nocc * nvir;
+    let total = fo + vo;
     if n_rhs == 0 {
         return Vec::new();
     }
+    if total == 0 {
+        return vec![Vec::new(); n_rhs];
+    }
 
-    // Each parallel task processes one block, returning a flat Vec<f64> of
-    // length n_rhs*nao*nao (one partial response per RHS, concatenated).
-    // Reduce sums across blocks element-wise.
     let saved_omp = omp_get_num_threads_wrapper();
     let summed: Vec<f64> = cache.blocks
         .par_iter()
@@ -465,25 +487,31 @@ pub fn compute_fxc_response_ao_cached_batched(
             // The per-block helper also sets OMP=1; doing it at the closure
             // boundary makes the Rayon+BLAS contract explicit and local.
             omp_set_num_threads_wrapper(1);
-            let trace = std::env::var("REST_TDDFT_GRAD_MEM").is_ok();
-            let rss0 = if trace { crate::hessian::memory_monitor::current_rss_mb() } else { 0.0 };
             let mut scratch = Vec::new();
             let ao = cache.ao_of(block, &mut scratch);
-            if trace {
-                eprintln!("  [fxcmem] block nb={} ao={:.0} MB native={} rss {:.0} -> {:.0} MB (peak {:.0})",
-                    block.nb, ao.data.len() as f64 * 8.0 / 1e6, ao.native, rss0,
-                    crate::hessian::memory_monitor::current_rss_mb(), vmhwm_mb());
+            let mut part = vec![0.0f64; n_rhs * total];
+            // `tmp = C_occ^T V_block` is shared by the frozen and the VO projection: going
+            // through it costs `2*nocc*nao^2` instead of `2*nao^2*nvir`.
+            let mut tmp = MatrixFull::new([nocc, nao], 0.0);
+            let mut vfr = MatrixFull::new([nocc, nfrozen.max(1)], 0.0);
+            let mut vvo = MatrixFull::new([nocc, nvir.max(1)], 0.0);
+            for (i, dm) in dms.iter().enumerate() {
+                let v_partial = compute_fxc_response_block(block, ao, dm, nao, nvar);
+                _dgemm_full(&ws.c_occ, 'T', &v_partial, 'N', &mut tmp, 1.0, 0.0);
+                let base = i * total;
+                if nfrozen > 0 {
+                    _dgemm_full(&tmp, 'N', &ws.c_frozen, 'N', &mut vfr, 1.0, 0.0);
+                    for k in 0..fo { part[base + k] += vfr.data[k]; }
+                }
+                if nvir > 0 {
+                    _dgemm_full(&tmp, 'N', &ws.c_vir, 'N', &mut vvo, 1.0, 0.0);
+                    for k in 0..vo { part[base + fo + k] += vvo.data[k]; }
+                }
             }
-            let mut flat = vec![0.0; n_rhs * nao * nao];
-            for i in 0..n_rhs {
-                let v_partial = compute_fxc_response_block(block, ao, &dms[i], nao, nvar);
-                let off = i * nao * nao;
-                for k in 0..nao * nao { flat[off + k] = v_partial.data[k]; }
-            }
-            flat
+            part
         })
         .reduce(
-            || vec![0.0; n_rhs * nao * nao],
+            || vec![0.0f64; n_rhs * total],
             |mut acc, block_flat| {
                 for k in 0..acc.len() { acc[k] += block_flat[k]; }
                 acc
@@ -491,15 +519,8 @@ pub fn compute_fxc_response_ao_cached_batched(
         );
     omp_set_num_threads_wrapper(saved_omp);
 
-    // Unflatten into Vec<MatrixFull>.
-    let mut results = Vec::with_capacity(n_rhs);
-    for i in 0..n_rhs {
-        let off = i * nao * nao;
-        results.push(MatrixFull::from_vec([nao, nao], summed[off..off + nao * nao].to_vec()).unwrap());
-    }
-
     FXC_TIMING_NS.fetch_add(_t_fxc.elapsed().as_nanos() as u64, AOrdering::Relaxed);
-    results
+    summed.chunks(total).map(|c| c.to_vec()).collect()
 }
 
 /// Per-grid-block fxc response: returns the partial [nao, nao] contribution
@@ -970,70 +991,63 @@ pub fn k_vo_lowrank_batched(pre: &KLowRankPrecompute, z_batch: &[&[f64]]) -> Vec
         }
         let tk_d = &tk_blk.data;
         let t_d = &t_blk.data;
-        // Contract Tk/T into res_all via per-worker private accumulators
-        // (par_chunks, one merge per worker — no fold/reduce tree).
+        // Contract Tk/T into res_all, one task per right-hand side.
+        //
+        // This used to be `nw = rayon::current_num_threads()` private `(pos, neg)` pairs of
+        // `n_rhs*dim` + `n_rhs*nvir*nocc` doubles, i.e. a *per-thread copy of the whole
+        // batched accumulator*, plus `chunk = npb.div_ceil(nw)` — so the decomposition, the
+        // summation order and the peak all followed the pool size.  On polyene n=7 the CPHF
+        // batch is `n_rhs = 3*natm = 90`, `dim = nocc*nvir = 30400`, so that was 43.8 MB per
+        // worker: 0.70 GB at 16 threads against 1.75 GB at 40 (and the freed copies are what
+        // kept RSS high for the rest of the adjoint).
+        //
+        // Nothing about a reduction over `p` needs per-thread copies: `res_all[z]` is only
+        // written by the task that owns `z`, and the sum over `p` is a plain running sum in
+        // `p` order.  Each task now allocates one `dim`-sized `pos` and one `nvir*nocc`-sized
+        // `neg` (its own RHS), so the total scratch is `n_rhs*(dim + nvir*nocc)`, which is the
+        // size of the answer and therefore independent of the pool — and the per-element
+        // summation order over `p` is unchanged.
         let _tc2 = std::time::Instant::now();
         {
-            let nw = rayon::current_num_threads().max(1);
-            let chunk = npb.div_ceil(nw);
-            let partials: Vec<((Vec<f64>, Vec<f64>))> = (0..nw)
-                .into_par_iter()
-                .map(|w| {
-                    let lo = (w * chunk).min(npb);
-                    let hi = ((w + 1) * chunk).min(npb);
-                    let mut pos = vec![0.0; n_rhs * dim];
-                    let mut neg = vec![0.0; n_rhs * nvir * nocc];
-                    for pl in lo..hi {
-                        let p = p0 + pl;
-                        let tkb = &tk_d[pl * nocc..];
-                        let tb = &t_d[pl * nvir..];
-                        // Cache-friendly: c/d outer; contiguous inner writes
-                        // (pos[i·nvir+a], neg[u·nocc+c]).
-                        for z in 0..n_rhs {
-                            let pb = &mut pos[z * dim..];
+            res_all.par_iter_mut().enumerate().for_each(|(z, r)| {
+                let mut pos = vec![0.0; dim];
+                let mut neg = vec![0.0; nvir * nocc];
+                for pl in 0..npb {
+                    let p = p0 + pl;
+                    let tkb = &tk_d[pl * nocc..];
+                    let tb = &t_d[pl * nvir..];
+                    for c in 0..nocc {
+                        let ncol = &n_p[p * nvir + c * nvir * naux..p * nvir + c * nvir * naux + nvir];
+                        let tcol_base = (c + z * nocc) * (npb * nocc);
+                        for i in 0..nocc {
+                            let tki = tkb[i + tcol_base];
+                            for a in 0..nvir {
+                                pos[i * nvir + a] += tki * ncol[a];
+                            }
+                        }
+                    }
+                    for d in 0..nocc {
+                        let tcol_base = (d + z * nocc) * (npb * nvir);
+                        for u in 0..nvir {
+                            let tu = tb[u + tcol_base];
                             for c in 0..nocc {
-                                let ncol = &n_p[p * nvir + c * nvir * naux..p * nvir + c * nvir * naux + nvir];
-                                let tcol_base = (c + z * nocc) * (npb * nocc);
-                                for i in 0..nocc {
-                                    let tki = tkb[i + tcol_base];
-                                    for a in 0..nvir {
-                                        pb[i * nvir + a] += tki * ncol[a];
-                                    }
-                                }
+                                neg[u * nocc + c] += tu
+                                    * l_p[p * nocc + c + d * nocc * naux];
                             }
-                            let nb = &mut neg[z * nvir * nocc..];
-                            for d in 0..nocc {
-                                let tcol_base = (d + z * nocc) * (npb * nvir);
-                                for u in 0..nvir {
-                                    let tu = tb[u + tcol_base];
-                                    for c in 0..nocc {
-                                        nb[u * nocc + c] += tu
-                                            * l_p[p * nocc + c + d * nocc * naux];
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    (pos, neg)
-                })
-                .collect();
-            for (pos, neg) in partials {
-                for z in 0..n_rhs {
-                    let r = &mut res_all[z];
-                    let pz = &pos[z * dim..];
-                    for i in 0..nocc {
-                        for a in 0..nvir {
-                            r[i + a * nocc] += pz[i * nvir + a];
-                        }
-                    }
-                    let nz = &neg[z * nvir * nocc..];
-                    for u in 0..nvir {
-                        for c in 0..nocc {
-                            r[c + u * nocc] += nz[u * nocc + c];
                         }
                     }
                 }
-            }
+                for i in 0..nocc {
+                    for a in 0..nvir {
+                        r[i + a * nocc] += pos[i * nvir + a];
+                    }
+                }
+                for u in 0..nvir {
+                    for c in 0..nocc {
+                        r[c + u * nocc] += neg[u * nocc + c];
+                    }
+                }
+            });
         }
         _t_contr += _tc2.elapsed().as_secs_f64();
         drop(tk_blk);
@@ -1425,15 +1439,13 @@ pub fn gen_vind_opt_batched(
     }
 
 
-    // ── Step 3: Add batched fxc response (KEY Phase A win) ──
-    if let Some(cache) = fxc_cache {
-        let fxc_batch = compute_fxc_response_ao_cached_batched(cache, &dms);
-        for i in 0..n_rhs {
-            for k in 0..nao * nao {
-                v_ao_batch[i].data[k] += fxc_batch[i].data[k];
-            }
-        }
-    }
+    // ── Step 3: batched fxc response, already in the (frozen, VO) projection ──
+    // The projection of the J/K part happens in Step 4 below; the fxc part is projected
+    // inside the block loop (`compute_fxc_response_vo_cached_batched`), because the AO-basis
+    // partial of every block is `[nao, nao]` and materialising all of them (once per reduce
+    // leaf) is what made this phase's peak scale with the pool.
+    let fxc_vo: Option<Vec<Vec<f64>>> = fxc_cache
+        .map(|cache| compute_fxc_response_vo_cached_batched(cache, &dms, ws));
 
     // ── Step 4: Project each v_ao to frozen and VO rows, flatten ──
     let fo_size = nfrozen * nocc;
@@ -1454,6 +1466,11 @@ pub fn gen_vind_opt_batched(
         let mut res = vec![0.0; total];
         for k in 0..nfrozen { for r in 0..nocc { res[r + k * nocc] = fro_result[[r, k]]; }}
         for a in 0..nvir { for r in 0..nocc { res[fo_size + r + a * nocc] = vo_result[[r, a]]; }}
+        // The fxc response arrives already projected, in this same layout.
+        if let Some(fv) = &fxc_vo {
+            let fvi = &fv[i];
+            for k in 0..total { res[k] += fvi[k]; }
+        }
         // Low-rank K: the K contribution to the VO projection was computed
         // directly in MO space — subtract k_scaling·K_vo.
         if let Some(kvb) = &k_vo_batch {
