@@ -198,10 +198,35 @@ pub fn balancing(num_tasks:usize, num_threads: usize) -> Vec<Range<usize>> {
     distribute_vec
 }
 
+/// Number of round-robin buckets used by [`apply_round_robin_permutation`].
+///
+/// Eight is the interleave the decomposition was tuned at.  The bucket count is deliberately
+/// **not** `rayon::current_num_threads()`: with one bucket per thread the permutation — and
+/// therefore the grid order, the AO prescreening mask (`non0tab`), the work per block and the
+/// accumulation order — became a function of the pool size.  Measured on one binary at polyene
+/// n=4: `non0tab` sparsity 64.3% at 16 threads against 69.4% at 40 threads, i.e. the 40-thread run
+/// did 7.8% more integral work for no reason, and the SCF energy differed in its last digits.
+/// A *fixed* bucket count keeps the mix — a contiguous range of `n/T` points still samples every
+/// bucket, hence every spatial region, for any `T` — while making the order a property of the
+/// problem alone.  `REST_ROUND_ROBIN_BUCKETS` overrides it.
+const ROUND_ROBIN_BUCKETS: usize = 8;
+
+/// Bucket count of the grid permutation, from `REST_ROUND_ROBIN_BUCKETS`.
+fn round_robin_buckets() -> usize {
+    std::env::var("REST_ROUND_ROBIN_BUCKETS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(ROUND_ROBIN_BUCKETS)
+        .max(1)
+}
+
 /// Apply round-robin permutation to grid data, so that contiguous ranges
 /// in `parallel_balancing` give each thread a uniform mix of grid points
 /// from all spatial regions. All per-grid arrays must be permuted together.
 /// Call before ao/aop tabulation.
+///
+/// The permutation is a property of the grid and of [`ROUND_ROBIN_BUCKETS`] alone, never of
+/// `rayon::current_num_threads()` — see [`ROUND_ROBIN_BUCKETS`] for what the pool dependence cost.
 pub fn apply_round_robin_permutation(
     coordinates: &mut Vec<[f64; 3]>,
     weights: &mut Vec<f64>,
@@ -209,7 +234,9 @@ pub fn apply_round_robin_permutation(
     quadrature_weights: &mut Vec<f64>,
 ) {
     let n = coordinates.len();
-    let num_threads = rayon::current_num_threads();
+    // `num_threads` is the bucket count here; the algorithm is unchanged, so a bucket count
+    // equal to the pool size reproduces the historical permutation exactly.
+    let num_threads = round_robin_buckets();
     if num_threads <= 1 {
         return;
     }

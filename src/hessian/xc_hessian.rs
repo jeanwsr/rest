@@ -170,6 +170,9 @@ const YYZ: usize = 17;
 const YZZ: usize = 18;
 const ZZZ: usize = 19;
 
+/// Minimum sub-block size, for reasonable BLAS efficiency.
+const MIN_SUB_NB: usize = 256;
+
 /// Adaptive grid parallelism plan.
 ///
 /// Splits grid blocks into sub-blocks of a calculated size so that peak AO
@@ -177,6 +180,10 @@ const ZZZ: usize = 19;
 /// rayon threads.
 ///
 /// Returns `(sub_blocks, concurrency, target_sub_block_size)`.
+///
+/// `concurrency` is an upper bound from the AO budget and the pool size; callers whose per-task
+/// accumulator is larger than the AO table should tighten it further (see
+/// `vxc_deriv1_streaming`) so that the byte cap really bounds the peak.
 pub fn plan_grid_split(
     block_ranges: &[std::ops::Range<usize>],
     nao: usize,
@@ -198,7 +205,7 @@ pub fn plan_grid_split(
     }
 
     // Minimum sub-block size for reasonable BLAS efficiency
-    let min_nb = 256usize;
+    let min_nb = MIN_SUB_NB;
 
     // Cap the in-flight AO memory: each grid point contributes
     // nderiv·nao·8 B (RIFull) plus an equal-sized owned ao_d copy (×2).
@@ -224,9 +231,23 @@ pub fn plan_grid_split(
     let points_cap = (ao_mem_cap / bytes_per_point) as usize;
     let peak_budget = points_cap.max(min_nb).min(2 * max_orig_nb);
 
-    // Target: use up to num_threads concurrent sub-blocks within the budget
-    let ideal_nb = (peak_budget as f64 / num_threads as f64).ceil() as usize;
-    let target_nb = ideal_nb.max(min_nb).min(max_orig_nb);
+    // Sub-block length: the finest the plan allows (down to `min_nb`), so the boundaries — and
+    // with them the summation order of the partials — are a property of the grid and the byte
+    // budget alone.  It used to be `peak_budget / rayon::current_num_threads()`, which moved every
+    // boundary with the core count and made one binary disagree with itself across thread counts.
+    //
+    // The pool then decides how many of the resulting sub-blocks run at once, capped so that the
+    // total in-flight AO stays inside `points_cap`.  That keeps full use of the pool: at the
+    // production `REST_VXC_AO_CAP_MB` the old formula already clamped `target_nb` to `min_nb`, so
+    // this is the *same* decomposition the tuned runs used — only now it is also the decomposition
+    // at every other thread count, instead of changing with the pool.
+    //
+    // (An intermediate version of this fix planned the sub-block length for a *fixed* design
+    // concurrency, `peak_budget / VXC_DESIGN_CONCURRENCY`.  That is thread-independent too, but it
+    // halves the number of sub-blocks whenever the pool is larger than that concurrency, and
+    // measured on polyene n=2 it took the `v_xc` sweep from 9.20 s to 16.85 s at 16 threads: fewer
+    // tasks than threads is not a neutral choice.)
+    let target_nb = min_nb.min(max_orig_nb);
     let concurrency = (peak_budget / target_nb).max(1).min(num_threads);
 
     // Split original blocks into sub-blocks
@@ -626,6 +647,15 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
 
     let block_ranges: &[std::ops::Range<usize>] = &grids.parallel_balancing;
     let (sub_blocks, concurrency, _sub_nb) = plan_grid_split(block_ranges, nao, nderiv_max);
+    // NOTE (measured, not yet fixed): one in-flight sub-block task owns a *dense* accumulator of
+    // `natm` blocks of `[3*nao, nao]` plus `3*[nao,nao]`, i.e. `(3*natm + 3)*nao^2` doubles —
+    // 1.59 GB per task at the polyene-n=6/def2-TZVPP geometry.  `plan_grid_split` sizes the
+    // concurrency from the *AO* bytes only, as if that accumulator were free, so the real peak of
+    // this phase is `concurrency * (AO + 1.59 GB)` and `REST_VXC_AO_CAP_MB` does not bound it.
+    // Clamping `concurrency` by those bytes is *not* the fix on its own: at that system size it
+    // forces `concurrency = 1` and serialises the phase.  The fix is to allocate the accumulator
+    // once per *worker* (reused across sub-blocks) instead of once per task, which lowers the peak
+    // and removes the per-chunk allocate+zero of a 1.6 GB buffer at the same time.
 
     // Accumulators
     let mut acc_vmat: Vec<MatrixFull<f64>> =

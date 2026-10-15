@@ -71,8 +71,19 @@ pub struct NIMatmul<'a> {
     /// for big systems. That's why we need to split the grid into batches.
     ///
     /// This value is better set to a proper size, not exceeding available memory, and be multiple
-    /// of `nchunk` for better performance.
-    /// Default to be 1536 * 1 * nthreads. nthreads is determined at runtime by rayon.
+    /// of `nchunk` for better performance.  It defaults to [`NIM_BATCH_CHUNKS`] chunks.
+    ///
+    /// **It is deliberately independent of `rayon::current_num_threads()`.**  It used to be
+    /// `nchunk * current_num_threads()`, which made the *decomposition itself* a function of the
+    /// pool size, with three measured consequences on a 40-core node: the batched consumers
+    /// materialise one block's AO table at a time (`nbatch * nao * ncomp` doubles), so the
+    /// transient slot — and with it the peak RSS — grew linearly with the core count; the block
+    /// boundaries moved with the pool, so the SCF energy of one binary differed in its last
+    /// digits between a 16- and a 40-thread run (the accumulation order is a function of the
+    /// blocks); and the number of blocks a serial `grid_blocks` loop walks shrank as threads were
+    /// added, i.e. the per-block overhead grew exactly when it was least affordable.  The
+    /// decomposition of a fixed problem must not depend on how many workers happen to be
+    /// available.
     pub nbatch: usize,
 }
 
@@ -123,6 +134,24 @@ pub fn regroup_grids_by_atom(
     (coordinates_new, weights_new, atm_idx_new, quadrature_weights_new)
 }
 
+/// Grid points per batch, in units of [`NIMatmul::nchunk`].
+///
+/// Eight chunks is the value the batched consumers were tuned and validated at; it keeps the
+/// batch at 12288 points, which is what an 8-thread pool used to get.  The pool size must not
+/// scale it — see [`NIMatmul::nbatch`].  `REST_NIM_BATCH_CHUNKS` overrides it, which is how the
+/// memory/overhead trade-off is tuned without a rebuild.
+const NIM_BATCH_CHUNKS: usize = 8;
+
+/// Number of `nchunk`s in one batch, from `REST_NIM_BATCH_CHUNKS` (default
+/// [`NIM_BATCH_CHUNKS`], clamped to at least 1).
+fn batch_chunks_from_env() -> usize {
+    std::env::var("REST_NIM_BATCH_CHUNKS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(NIM_BATCH_CHUNKS)
+        .max(1)
+}
+
 /// Retained-AO budget of a new [`NIMatmul`], from `REST_NIM_AO_CACHE_MB`.
 ///
 /// A negative value means "no budget" (the historical behaviour: every evaluated AO table is
@@ -164,7 +193,8 @@ impl<'a> NIMatmul<'a> {
             "Number of coordinates must match number of quadrature weights"
         );
         let nchunk = 1536;
-        let nbatch = nchunk * 1 * rayon::current_num_threads();
+        // Thread-independent: see `nbatch` and `NIM_BATCH_CHUNKS`.
+        let nbatch = nchunk * batch_chunks_from_env();
         let out = Self {
             cint: cint.clone(),
             coords: coords.to_vec(),
@@ -182,10 +212,21 @@ impl<'a> NIMatmul<'a> {
             let ngrids = out.coords.len();
             let nao = out.cint.nao();
             let per_table = ngrids * nao * std::mem::size_of::<f64>();
+            // One block's AO table is what a batched consumer holds at a time; report it so a
+            // run's log shows the decomposition is independent of the pool size.
+            let block_mb = |ncomp: usize| {
+                (out.nbatch * nao * ncomp * std::mem::size_of::<f64>()) as f64 / 1024.0 / 1024.0
+            };
             println!(
-                "[nim] new object: ngrids {:8} | nao {:5} | whole-grid AO table {:7.1} MB per deriv component | budget {} MB",
+                "[nim] new object: ngrids {:8} | nao {:5} | nchunk {} nbatch {} ({} blocks) | block AO table {:.1}/{:.1}/{:.1} MB (deriv 0/2/3) | whole-grid {:7.1} MB per deriv component | budget {} MB",
                 ngrids,
                 nao,
+                out.nchunk,
+                out.nbatch,
+                ngrids.div_ceil(out.nbatch.max(1)),
+                block_mb(1),
+                block_mb(AO_DERIV_DIM[2]),
+                block_mb(AO_DERIV_DIM[3]),
                 per_table as f64 / 1024.0 / 1024.0,
                 if out.ao_cache_budget_bytes == usize::MAX {
                     "unlimited".to_string()

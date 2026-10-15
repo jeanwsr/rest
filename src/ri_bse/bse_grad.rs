@@ -47,6 +47,7 @@
 
 use crate::ri_gw::gw_grad::{GwGradEngine, QpCache};
 use crate::scf_io::SCF;
+use rayon::prelude::*;
 use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
 use rest_tensors::matrix::matrix_blas_lapack::_dpotrf;
 use rest_tensors::matrix::matrix_blas_lapack::_dsolve;
@@ -90,6 +91,48 @@ pub enum BseSolver {
 
 fn to_mat(v: &[f64], r: usize, c: usize) -> MatrixFull<f64> {
     MatrixFull::from_vec([r, c], v.to_vec()).unwrap()
+}
+
+/// Columns per task of a column-split gemm.
+///
+/// A fixed constant, not a function of the pool: the split is a scheduling decision, and the
+/// result must not depend on it.
+const GEMM_COL_BLK: usize = 256;
+
+/// `out = alpha * a * b`, with `b` a flat col-major `[k, n]` buffer and the `n` **columns**
+/// split across the pool.  Returns the col-major `[m, n]` result.
+///
+/// The three dominant BLAS-3 products of the BSE kernel VJP — `Dbar · q_ov`
+/// ([`chain_from_dbar_compact`]), `u_ij · foo` and `u_ia · fov` ([`kernel_vjp_compact`]) — all
+/// share one shape: a fixed left operand times a tall right-hand side, with **disjoint columns**.
+/// Splitting the free index therefore needs no reduction and no partial accumulator, and the
+/// contracted dimension `k` is never split, so every output element is produced by the same
+/// expression as in the serial product.
+///
+/// This is not a micro-optimisation.  REST pins the process-wide BLAS to one thread (so that
+/// OpenBLAS never oversubscribes the rayon pool), so before this a single `dgemm` of the form
+/// `(naux x naux) · (naux x n_ov_full)` — `n_ov_full` is `nocc * nvir_full`, tens of thousands of
+/// columns — ran on **one core of a 40-core node**.  Measured on polyene n=2 / def2-TZVPP on
+/// XPK2, the `kernel_vjp + theta_k` phase took 8.59 s at one thread and **54.34 s at 40 threads**,
+/// the single largest contributor to the gradient becoming *slower* with more cores.
+fn gemm_nn_cols_par(a: &MatrixFull<f64>, b: &[f64], k: usize, n: usize, alpha: f64) -> Vec<f64> {
+    let m = a.size()[0];
+    debug_assert_eq!(a.size()[1], k, "gemm_nn_cols_par: inner dimensions disagree");
+    let mut out = vec![0.0f64; m * n];
+    if n == 0 || m == 0 {
+        return out;
+    }
+    out.par_chunks_mut(GEMM_COL_BLK * m)
+        .enumerate()
+        .for_each(|(bi, dst)| {
+            let c0 = bi * GEMM_COL_BLK;
+            let nc = (n - c0).min(GEMM_COL_BLK);
+            let bm = to_mat(&b[c0 * k..(c0 + nc) * k], k, nc);
+            let mut om = MatrixFull::new([m, nc], 0.0);
+            _dgemm_full(a, 'N', &bm, 'N', &mut om, alpha, 0.0);
+            dst.copy_from_slice(&om.data);
+        });
+    out
 }
 
 /// Permute the columns of a flat col-major `[n1, naux*n2]` matrix whose
@@ -1107,9 +1150,9 @@ pub fn chain_from_dbar_compact(screen: &BseScreening, dbar: &[f64]) -> (Vec<f64>
     let mut qbar_bov = vec![0.0f64; naux * nocc * screen.nvir_full];
     let mut ebar = vec![0.0f64; nmo];
     let dbar_m = to_mat(dbar, naux, naux);
-    let qov_m = to_mat(&screen.qov_full, naux, nov_full);
-    let mut q_times = MatrixFull::new([naux, nov_full], 0.0);
-    _dgemm_full(&dbar_m, 'N', &qov_m, 'N', &mut q_times, -1.0, 0.0);
+    // `q_times = -Dbar @ q_ov`, column-split across the pool (`q_ov_full` has
+    // `nocc * nvir_full` columns, so the serial product was one core's worth of BLAS-3).
+    let q_times = gemm_nn_cols_par(&dbar_m, &screen.qov_full, naux, nov_full, -1.0);
     for c in 0..nov_full {
         let i = c % nocc;
         let a = c / nocc;
@@ -1118,7 +1161,7 @@ pub fn chain_from_dbar_compact(screen: &BseScreening, dbar: &[f64]) -> (Vec<f64>
         for p in 0..naux {
             bar_gap += 4.0
                 * screen.qov_full[p + c * naux]
-                * q_times.data[p + c * naux]
+                * q_times[p + c * naux]
                 * inv_gap
                 * inv_gap;
         }
@@ -1126,7 +1169,7 @@ pub fn chain_from_dbar_compact(screen: &BseScreening, dbar: &[f64]) -> (Vec<f64>
         ebar[nocc + a] += bar_gap;
         let col = i + a * nocc;
         for p in 0..naux {
-            qbar_bov[col * naux + p] -= 8.0 * q_times.data[p + c * naux] * inv_gap;
+            qbar_bov[col * naux + p] -= 8.0 * q_times[p + c * naux] * inv_gap;
         }
     }
     (qbar_bov, ebar)
@@ -1178,9 +1221,8 @@ fn chain_from_dbar(
     let mut ebar = vec![0.0f64; nmo];
     // q_times[p + c*naux] = -sum_q dbar[p + q*naux] qov_full[q + c*naux]
     let dbar_m = to_mat(dbar, naux, naux);
-    let qov_m = to_mat(&screen.qov_full, naux, nov);
-    let mut q_times = MatrixFull::new([naux, nov], 0.0);
-    _dgemm_full(&dbar_m, 'N', &qov_m, 'N', &mut q_times, -1.0, 0.0);
+    // column-split across the pool, as in `chain_from_dbar_compact`
+    let q_times = gemm_nn_cols_par(&dbar_m, &screen.qov_full, naux, nov, -1.0);
     for c in 0..nov {
         let i = c % nocc;
         let a = nocc + c / nocc;
@@ -1189,10 +1231,10 @@ fn chain_from_dbar(
         let ctrans = q_pair_layout(a, i) * naux;
         let mut bar_gap = 0.0f64;
         for p in 0..naux {
-            let bov = -8.0 * q_times.data[p + c * naux] * inv_gap;
+            let bov = -8.0 * q_times[p + c * naux] * inv_gap;
             qbar_bov[col + p] += 0.5 * bov;
             qbar_bov[ctrans + p] += 0.5 * bov;
-            bar_gap += 4.0 * screen.qov_full[p + c * naux] * q_times.data[p + c * naux] * inv_gap * inv_gap;
+            bar_gap += 4.0 * screen.qov_full[p + c * naux] * q_times[p + c * naux] * inv_gap * inv_gap;
         }
         ebar[i] -= bar_gap;
         ebar[a] += bar_gap;
