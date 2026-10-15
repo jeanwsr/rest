@@ -86,7 +86,7 @@ use rest_libcint::prelude::*;
 use rest_tensors::matrix::matrix_blas_lapack::{
     _dgemm_full, _dpotrf, _dsolve, _dsyev_inplace, _dsyevd_inplace, _dtrtrs,
 };
-use tensors::{MathMatrix, MatrixFull};
+use tensors::{MathMatrix, MatrixFull, MatrixFullSlice};
 use num_complex::Complex;
 
 use rayon::prelude::*;
@@ -1372,20 +1372,30 @@ fn to_mat(v: &[f64], r: usize, c: usize) -> MatrixFull<f64> {
 /// The contraction runs over the FIRST dimension (REST `_dgemm_full` 'T'
 /// convention), the result is `[ac, bc]` col-major.
 ///
-/// The operands are borrowed as **views** (`rt::asarray` on a slice) instead of being wrapped in
-/// `MatrixFull` through `to_mat`, which copies its whole buffer: in the GW gradient `A` is the raw
-/// three-centre integral tensor `[nao^2, naux]` (three calls per adjoint build) and `B` is the
-/// metric-transformed `qt` in the low-rank build, so a copy costs `nao^2 * naux` doubles
-/// (874 MB at naphthalene/def2-TZVP) of purely transient memory each time.
+/// The operands are borrowed as **views** (`MatrixFullSlice` over the caller's slice) instead of
+/// being wrapped in `MatrixFull` through `to_mat`, which copies its whole buffer: in the GW
+/// gradient `A` is the raw three-centre integral tensor `[nao^2, naux]` (three calls per adjoint
+/// build) and `B` is the metric-transformed `qt` in the low-rank build, so a copy costs
+/// `nao^2 * naux` doubles (874 MB at naphthalene/def2-TZVP) of purely transient memory each time.
+///
+/// **This used to be a tensor-library matmul (`rt::asarray(..).t() % ..`), which is a parallel
+/// design defect on a shared-memory node.**  `rstsr`'s `%` routes every product through
+/// `with_num_threads(pool_size, ..)`, i.e. it writes the *process-global* OpenBLAS thread count
+/// twice, under a mutex, from whichever thread issues the product -- including threads inside a
+/// rayon parallel region, where the write is a cross-thread side effect on shared state.  On the
+/// polyene/def2-TZVPP gradient card at 40 threads, one run issued **43,686** such writes
+/// (30,784 of them from this function's call sites); neutralising them from outside the process
+/// (`LD_PRELOAD`) dropped the card from 141 s to 106 s and the CPU from 1934% to 614%, with
+/// bit-identical results.  `_dgemm_full` calls the same OpenBLAS `dgemm` directly and leaves the
+/// thread policy to whoever owns it (`ctrl_io`, or the phase-local raise in `bse_grad.rs`).
 fn gemm_nt(a: &[f64], ar: usize, ac: usize, b: &[f64], br: usize, bc: usize) -> Vec<f64> {
-    use rstsr::prelude::*;
-
     debug_assert_eq!(ar, br, "gemm_nt: contraction dimension mismatch");
-    let device = DeviceBLAS::default();
-    let am = rt::asarray((a, [ar, ac].f(), &device));
-    let bm = rt::asarray((b, [br, bc].f(), &device));
-    let out = am.t() % bm;
-    out.into_contig(ColMajor).into_shape(-1).into_vec()
+    let (sa, si_a, sb, si_b) = ([ar, ac], [1usize, ar.max(1)], [br, bc], [1usize, br.max(1)]);
+    let am = MatrixFullSlice { size: &sa, indicing: &si_a, data: a };
+    let bm = MatrixFullSlice { size: &sb, indicing: &si_b, data: b };
+    let mut out = MatrixFull::new([ac, bc], 0.0);
+    _dgemm_full(&am, 'T', &bm, 'N', &mut out, 1.0, 0.0);
+    out.data
 }
 
 /// Explicit transpose of a flat col-major `[r, c]` buffer.
@@ -1403,15 +1413,16 @@ fn transpose_buf(a: &[f64], r: usize, c: usize) -> Vec<f64> {
 ///
 /// Borrowed views for the same reason as [`gemm_nt`]: the operands include `q`/`qt`/`i3`
 /// (`nao^2 * naux` doubles) and the copies would dominate the engine-build and gradient peaks.
+/// Direct BLAS for the same reason as [`gemm_nt`] — see the note there on the global OpenBLAS
+/// thread count that the tensor library's `%` rewrites on every call.
 fn gemm_nn(a: &[f64], ar: usize, ac: usize, b: &[f64], br: usize, bc: usize) -> Vec<f64> {
-    use rstsr::prelude::*;
-
     debug_assert_eq!(ac, br);
-    let device = DeviceBLAS::default();
-    let am = rt::asarray((a, [ar, ac].f(), &device));
-    let bm = rt::asarray((b, [br, bc].f(), &device));
-    let out = am % bm;
-    out.into_contig(ColMajor).into_shape(-1).into_vec()
+    let (sa, si_a, sb, si_b) = ([ar, ac], [1usize, ar.max(1)], [br, bc], [1usize, br.max(1)]);
+    let am = MatrixFullSlice { size: &sa, indicing: &si_a, data: a };
+    let bm = MatrixFullSlice { size: &sb, indicing: &si_b, data: b };
+    let mut out = MatrixFull::new([ar, bc], 0.0);
+    _dgemm_full(&am, 'N', &bm, 'N', &mut out, 1.0, 0.0);
+    out.data
 }
 
 /// `s_metric · q` for a `[naux, ncol]` right-hand side, applied in auxiliary-column blocks.
