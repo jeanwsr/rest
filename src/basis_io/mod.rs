@@ -1909,6 +1909,42 @@ pub fn gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4Elem, basi
     } 
 }
 
+/// `out[out_row0 + i, g] = sum_j c2s[j, i] * cart[j, g]` — the cartesian -> spherical transform
+/// of one shell, written out instead of going through `lapack_dgemm`.
+///
+/// `c2s` is at most `10 x 9` and the transform is issued once per shell, contraction coefficient
+/// and grid batch: a single gradient card on polyene/def2-TZVPP made **747k** such calls
+/// (`spheric_gto_deriv_batch_serial` 383k, `spheric_gto_1st_value_serial` 273k,
+/// `spheric_gto_value_serial` 91k).  Every one of them is a BLAS call with `m,n,k <= 4`, and
+/// OpenBLAS's pthread build pays for its thread pool on each call, so at 40 threads those calls
+/// alone accounted for 10.8 s + 7.0 s + 4.1 s of BLAS time (by shape bucket) against well under a
+/// second at 16 threads -- the single largest reason the gradient got *slower* with more cores.
+/// The explicit loop has no call overhead, no pool and no temporary allocation.
+#[inline]
+fn cart_to_spheric_into(
+    c2s: &[f64],
+    c_len: usize,
+    cart: &[f64],
+    out: &mut [f64],
+    out_stride: usize,
+    out_row0: usize,
+    s_len: usize,
+    num_grids: usize,
+) {
+    for g in 0..num_grids {
+        let cb = g * c_len;
+        let ob = g * out_stride + out_row0;
+        for i in 0..s_len {
+            let mut acc = 0.0f64;
+            let ci = i * c_len;
+            for j in 0..c_len {
+                acc += c2s[ci + j] * cart[cb + j];
+            }
+            out[ob + i] = acc;
+        }
+    }
+}
+
 pub fn spheric_gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4Elem) -> MatrixFull<f64> {
 
     //let mut time_records = utilities::TimeRecords::new();
@@ -1940,14 +1976,9 @@ pub fn spheric_gto_value_serial(r: &[[f64;3]],gto_center:&[f64;3], bas:&Basis4El
             });
 
             //time_records.count_start("1-2");
-            let mut tmp_spheric= MatrixFull::new([s_len,num_grids],0.0);
-            tmp_spheric.to_matrixfullslicemut().lapack_dgemm(
-                &c2s_mat.to_matrixfullslice(),
-                &tmp_cart.to_matrixfullslice(), 
-                'T', 'N', 1.0, 0.0);
-
-            outmat_s.copy_from_matr(ibas_start..ibas_start+s_len, 0..num_grids, 
-                &tmp_spheric, 0..s_len, 0..num_grids);
+            let c2s_slc = c2s_mat.to_matrixfullslice();
+            cart_to_spheric_into(c2s_slc.data, c_len, &tmp_cart.data, &mut outmat_s.data,
+                                 num_bas_s, ibas_start, s_len, num_grids);
 
             ibas_start += s_len;
         }
@@ -2271,12 +2302,9 @@ pub fn spheric_gto_1st_value_serial(r:&[[f64;3]], gto_center:&[f64;3], bas:&Basi
             //Stop here
             paox.iter_mut().zip(tmp_cart.iter_mut()).for_each(|(paox_x,tmp_cart_x)| {
                 //tmp_spheric.lapack_dgemm(tmp_cart_x, &mut c2s_mat, 'N','N',1.0,0.0);
-                let mut tmp_spheric = MatrixFull::new([s_len,num_grids],0.0);
-                tmp_spheric.to_matrixfullslicemut().lapack_dgemm(
-                    &c2s_mat.to_matrixfullslice(),
-                    &tmp_cart_x.to_matrixfullslice(),
-                    'T','N',1.0,0.0);
-                paox_x.copy_from_matr(ibas_start..ibas_start+s_len,0..num_grids,  &tmp_spheric, 0..s_len,0..num_grids);
+                let c2s_slc = c2s_mat.to_matrixfullslice();
+                cart_to_spheric_into(c2s_slc.data, c_len, &tmp_cart_x.data, &mut paox_x.data,
+                                     num_bas_s, ibas_start, s_len, num_grids);
                 //let tmp_spheric = _dgemm_nn_serial(&tmp_cart_x.to_matrixfullslice(),&c2s_mat.to_matrixfullslice());
                 //paox_x.iter_columns_mut(ibas_start..ibas_start+s_len)
                 //.zip(tmp_spheric.iter_columns_full()).for_each(|(to,from)| {
@@ -2358,22 +2386,9 @@ pub fn spheric_gto_deriv_batch_serial(r:&[[f64;3]], gto_center:&[f64;3], bas:&Ba
             pao.iter_mut().zip(tmp_cart_res.iter_mut()).for_each(
                 |(pao_x, tmp_cart_x)| 
                 {
-                    let mut tmp_spheric = MatrixFull::new([s_len, num_grids],0.0);
-                    tmp_spheric.to_matrixfullslicemut().lapack_dgemm(
-                        &c2s_mat.to_matrixfullslice(),
-                        &tmp_cart_x.to_matrixfullslice(),
-                        'T','N',1.0,0.0
-                    );
-                    
-                    // pao_x.iter_columns_mut(ibas_start..ibas_start+s_len)
-                    // .zip(tmp_spheric.iter_columns_full()).for_each(
-                    //     |(to, from)| 
-                    //     {
-                    //         to.iter_mut().zip(from.iter()).for_each(|(to,from)| {*to = *from});
-                    //     }
-                    // );
-
-                    pao_x.copy_from_matr(ibas_start..ibas_start+s_len,0..num_grids,  &tmp_spheric, 0..s_len,0..num_grids);
+                    let c2s_slc = c2s_mat.to_matrixfullslice();
+                    cart_to_spheric_into(c2s_slc.data, c_len, &tmp_cart_x.data, &mut pao_x.data,
+                                         num_bas_s, ibas_start, s_len, num_grids);
                 }
             );
             ibas_start += s_len;
