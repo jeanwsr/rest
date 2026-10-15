@@ -18,6 +18,7 @@ use crate::scf_io::SCF;
 use rest_tensors::MatrixFull;
 use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, omp_set_num_threads_wrapper};
 use rayon::prelude::*;
+use std::time::Instant;
 
 // ── AO second-derivative index convention (matches PySCF) ──
 // ao_deriv=2 yields 10 components:
@@ -629,6 +630,21 @@ pub fn vxc_deriv2_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
 
 /// Streaming variant of `vxc_deriv1`: evaluates AO (deriv=2) + ρ₀ + XC kernel
 /// per block in small concurrent batches with bounded peak memory.
+/// Stage counters for `vxc_deriv1_streaming` (nanoseconds, summed over all sub-blocks).
+/// Printed when `REST_VXC_TIMING=1`: the sweep is the single largest phase of the gradient
+/// card at large `nao`, and this says which part of a sub-block actually costs the time.
+pub(crate) mod vxc_stage {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static AO: AtomicU64 = AtomicU64::new(0);
+    pub static RHO: AtomicU64 = AtomicU64::new(0);
+    pub static XC: AtomicU64 = AtomicU64::new(0);
+    pub static CONTRACT: AtomicU64 = AtomicU64::new(0);
+    pub static REDUCE: AtomicU64 = AtomicU64::new(0);
+    pub fn add(c: &AtomicU64, t: std::time::Instant) {
+        c.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
 pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> {
     let mol = &scf.mol;
     let nao = mol.num_basis;
@@ -664,6 +680,7 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
         (0..3).map(|_| MatrixFull::new([nao, nao], 0.0)).collect();
 
     for chunk in sub_blocks.chunks(concurrency) {
+        let t_stage_chunk = Instant::now();
         let partials: Vec<(Vec<MatrixFull<f64>>, Vec<MatrixFull<f64>>)> = chunk
             .par_iter()
             .filter_map(|range| {
@@ -673,6 +690,7 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                 let weights_block = &grids.weights[range.start..range.end];
                 let coords_block = &grids.coordinates[range.start..range.end];
 
+                let t_stage = Instant::now();
                 let ao = eval_ao_batch(mol, coords_block, ao_deriv, nb);
                 let ao_d: Vec<MatrixFull<f64>> = (0..nderiv_max)
                     .map(|d| {
@@ -682,6 +700,8 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                     .collect();
                 let ao_d_refs: Vec<&MatrixFull<f64>> = ao_d.iter().collect();
 
+                vxc_stage::add(&vxc_stage::AO, t_stage);
+                let t_stage = Instant::now();
                 let rho_tensor = eval_rho5_batch(&ao, xc_type, &mo_vec, &occ_vec, 1, nb);
                 let rho_array: Vec<f64> = {
                     let raw = rho_tensor.raw();
@@ -689,6 +709,8 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                     raw[off..off + nb * nvar].to_vec()
                 };
 
+                vxc_stage::add(&vxc_stage::RHO, t_stage);
+                let t_stage = Instant::now();
                 let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_array, nb, 2);
                 let vxc_t = xc_tensors[1].as_ref().expect("vxc required");
                 let fxc_t = xc_tensors[2].as_ref().expect("fxc required");
@@ -702,6 +724,8 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                 let mut v_ip: Vec<MatrixFull<f64>> =
                     (0..3).map(|_| MatrixFull::new([nao, nao], 0.0)).collect();
 
+                vxc_stage::add(&vxc_stage::XC, t_stage);
+                let t_stage = Instant::now();
                 match xc_type {
                     XCType::LDA => {
                         let mut aow = MatrixFull::new([nao, nb], 0.0);
@@ -834,6 +858,7 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                     }
                     _ => unreachable!(),
                 }
+                vxc_stage::add(&vxc_stage::CONTRACT, t_stage);
                 Some((vmat, v_ip))
             })
             .collect();
@@ -865,6 +890,18 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                     .for_each(|(a, b)| *a += b);
             }
         });
+        vxc_stage::add(&vxc_stage::REDUCE, t_stage_chunk);
+    }
+
+    if std::env::var("REST_VXC_TIMING").is_ok() {
+        use std::sync::atomic::Ordering;
+        let ms = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e6;
+        println!(
+            "[vxc timing] sub-blocks={} concurrency={} | AO {:.1} ms | rho {:.1} ms | xc {:.1} ms | contract {:.1} ms | reduce {:.1} ms (summed over tasks)",
+            sub_blocks.len(), concurrency,
+            ms(&vxc_stage::AO), ms(&vxc_stage::RHO), ms(&vxc_stage::XC),
+            ms(&vxc_stage::CONTRACT), ms(&vxc_stage::REDUCE)
+        );
     }
 
     // Final: vmat[ia, :, p0:p1, :] += v_ip[:, p0:p1, :]
