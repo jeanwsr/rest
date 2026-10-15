@@ -15,7 +15,7 @@ use crate::dft::libxc_itrf::eval_xc_eff;
 use crate::dft::xc_deriv::XCType;
 use crate::molecule_io::Molecule;
 use crate::scf_io::SCF;
-use rest_tensors::MatrixFull;
+use rest_tensors::{MatrixFull, MatrixFullSlice};
 use rest_tensors::matrix::matrix_blas_lapack::{_dgemm_full, omp_set_num_threads_wrapper};
 use rayon::prelude::*;
 use std::time::Instant;
@@ -628,21 +628,46 @@ pub fn vxc_deriv2_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
     acc_vmat
 }
 
-/// Streaming variant of `vxc_deriv1`: evaluates AO (deriv=2) + ρ₀ + XC kernel
-/// per block in small concurrent batches with bounded peak memory.
 /// Stage counters for `vxc_deriv1_streaming` (nanoseconds, summed over all sub-blocks).
 /// Printed when `REST_VXC_TIMING=1`: the sweep is the single largest phase of the gradient
 /// card at large `nao`, and this says which part of a sub-block actually costs the time.
+///
+/// `CONTRACT` counts the per-block preparation pass (AO, rho, XC kernel, the per-atom
+/// contraction weights and the direct `v_ip` term); `GEMM` counts the *per-(atom,
+/// direction)* contraction pass that consumes it.  The split matters because the two
+/// passes have completely different parallel shapes.
 pub(crate) mod vxc_stage {
     use std::sync::atomic::{AtomicU64, Ordering};
     pub static AO: AtomicU64 = AtomicU64::new(0);
     pub static RHO: AtomicU64 = AtomicU64::new(0);
     pub static XC: AtomicU64 = AtomicU64::new(0);
     pub static CONTRACT: AtomicU64 = AtomicU64::new(0);
+    pub static GEMM: AtomicU64 = AtomicU64::new(0);
     pub static REDUCE: AtomicU64 = AtomicU64::new(0);
     pub fn add(c: &AtomicU64, t: std::time::Instant) {
         c.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
+}
+
+/// Everything one grid sub-block has to hand to the per-atom contraction pass.
+///
+/// Sized by the *block*, not by the atom count: this is what lets the v_xc sweep run at
+/// full pool width without the peak RSS following the core count.  The old shape kept a
+/// dense `natm x [3*nao, nao]` accumulator per in-flight sub-block (322 MB at polyene
+/// n=7), so 40 concurrent sub-blocks needed 12.9 GB where 16 needed 5.2 GB.
+struct VxcBlockPrep {
+    /// grid points in this sub-block
+    nb: usize,
+    /// `ao_d[y]`, `y = 0..nvar`, flat column-major `[nao, nb]`.  `ao_d[0]` is the right
+    /// operand of the contraction product; the whole `0..nvar` range builds the AOW.
+    ao_d: Vec<Vec<f64>>,
+    /// Per-atom contraction weights, `3*nvar*nb` doubles each, indexed
+    /// `wv[s + y*3 + g*3*nvar]`.
+    wv: Vec<Vec<f64>>,
+    /// The direct (not per-atom) XC potential contribution, one `[nao, nao]` per
+    /// Cartesian direction.  `natm` orders of magnitude cheaper than the per-atom
+    /// part, so it stays a per-block partial and is reduced in block order.
+    v_ip: [MatrixFull<f64>; 3],
 }
 
 pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> {
@@ -662,26 +687,44 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
     let nderiv_max = (ao_deriv + 1) * (ao_deriv + 2) * (ao_deriv + 3) / 6;
 
     let block_ranges: &[std::ops::Range<usize>] = &grids.parallel_balancing;
-    let (sub_blocks, concurrency, _sub_nb) = plan_grid_split(block_ranges, nao, nderiv_max);
-    // NOTE (measured, not yet fixed): one in-flight sub-block task owns a *dense* accumulator of
-    // `natm` blocks of `[3*nao, nao]` plus `3*[nao,nao]`, i.e. `(3*natm + 3)*nao^2` doubles —
-    // 1.59 GB per task at the polyene-n=6/def2-TZVPP geometry.  `plan_grid_split` sizes the
-    // concurrency from the *AO* bytes only, as if that accumulator were free, so the real peak of
-    // this phase is `concurrency * (AO + 1.59 GB)` and `REST_VXC_AO_CAP_MB` does not bound it.
-    // Clamping `concurrency` by those bytes is *not* the fix on its own: at that system size it
-    // forces `concurrency = 1` and serialises the phase.  The fix is to allocate the accumulator
-    // once per *worker* (reused across sub-blocks) instead of once per task, which lowers the peak
-    // and removes the per-chunk allocate+zero of a 1.6 GB buffer at the same time.
+    let (sub_blocks, _concurrency, _sub_nb) = plan_grid_split(block_ranges, nao, nderiv_max);
+    let nb_max = sub_blocks.iter().map(|r| r.end - r.start).max().unwrap_or(0);
 
-    // Accumulators
+    // Blocks whose per-block data is kept alive together.  This is *deliberately* not a
+    // function of `rayon::current_num_threads()`: the retained set is what the phase adds
+    // to the peak, so a pool-dependent batch would make the 40-core peak follow the core
+    // count.  A fixed batch keeps the retained set identical at 16 and 40 threads; the
+    // pool only decides how many of the batch's blocks and atoms are worked on at once.
+    //
+    // Memory per block: `nvar*nao*nb` (the AO components the AOW build reads) +
+    // `natm*3*nvar*nb` (the per-atom weights) + `3*nao^2` (the direct term).  At polyene
+    // n=7 (nao 658, nb 256, natm 30, nvar 4) that is 5.4 + 0.74 + 10.4 = 16.5 MB.
+    //
+    // The batch is the *smaller* of a fixed maximum and a fixed byte budget, so the
+    // retained set is a constant of the geometry rather than of the core count — and it
+    // still shrinks on systems whose `nao`/`natm` would make 96 blocks several GB.
+    const VXC_BCHUNK_MAX: usize = 96;
+    const VXC_CACHE_BUDGET_BYTES: usize = 1600 * 1024 * 1024;
+    let per_block_bytes =
+        (nvar * nao * nb_max + natm * 3 * nvar * nb_max + 3 * nao * nao) * 8;
+    let vxc_bchunk = (VXC_CACHE_BUDGET_BYTES / per_block_bytes.max(1))
+        .clamp(1, VXC_BCHUNK_MAX);
+
+    // Accumulators.  `acc_vmat[ia]` is the same `[3*nao, nao]` layout the grid contraction
+    // used to produce directly; it is now assembled from the per-(atom, direction) tiles
+    // in a fixed order, so the summation order over sub-blocks is unchanged.
     let mut acc_vmat: Vec<MatrixFull<f64>> =
         (0..natm).map(|_| MatrixFull::new([3 * nao, nao], 0.0)).collect();
     let mut acc_vip: Vec<MatrixFull<f64>> =
         (0..3).map(|_| MatrixFull::new([nao, nao], 0.0)).collect();
 
-    for chunk in sub_blocks.chunks(concurrency) {
+    for chunk in sub_blocks.chunks(vxc_bchunk) {
         let t_stage_chunk = Instant::now();
-        let partials: Vec<(Vec<MatrixFull<f64>>, Vec<MatrixFull<f64>>)> = chunk
+
+        // ── Pass 1: one task per grid sub-block ──────────────────────────────────────
+        // AO + rho + libxc kernel + the per-atom contraction weights.  Output is sized
+        // by the block (16.5 MB), not by `natm * nao^2` (322 MB).
+        let preps: Vec<VxcBlockPrep> = chunk
             .par_iter()
             .filter_map(|range| {
                 omp_set_num_threads_wrapper(1);
@@ -719,14 +762,14 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                 let fxc_raw = fxc_t.raw();
                 let fxc_off = fxc_t.offset();
 
-                let mut vmat: Vec<MatrixFull<f64>> =
-                    (0..natm).map(|_| MatrixFull::new([3 * nao, nao], 0.0)).collect();
-                let mut v_ip: Vec<MatrixFull<f64>> =
-                    (0..3).map(|_| MatrixFull::new([nao, nao], 0.0)).collect();
-
+                let mut v_ip: [MatrixFull<f64>; 3] = [
+                    MatrixFull::new([nao, nao], 0.0),
+                    MatrixFull::new([nao, nao], 0.0),
+                    MatrixFull::new([nao, nao], 0.0),
+                ];
                 vxc_stage::add(&vxc_stage::XC, t_stage);
                 let t_stage = Instant::now();
-                match xc_type {
+                let wv_all: Vec<Vec<f64>> = match xc_type {
                     XCType::LDA => {
                         let mut aow = MatrixFull::new([nao, nb], 0.0);
                         for g in 0..nb {
@@ -740,11 +783,7 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                         let wf_factor: Vec<f64> = (0..nb)
                             .map(|g| weights_block[g] * fxc_raw[fxc_off + g])
                             .collect();
-                        // Buffers reused across atoms/sub-blocks (they are fully overwritten below);
-                        // allocating them per (atom, component) was 90 allocations of
-                        // `nao x nb` + `nao x nao` per sub-block.
-                        let mut aow_alpha = MatrixFull::new([nao, nb], 0.0);
-                        let mut vmat_alpha = MatrixFull::new([nao, nao], 0.0);
+                        let mut wv_all: Vec<Vec<f64>> = Vec::with_capacity(natm);
                         for ia in 0..natm {
                             let (p0, p1) = aoslices[ia];
                             let mut wv = vec![0.0; 3 * nb];
@@ -757,25 +796,9 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                                     wv[alpha + 3 * g] = wf_factor[g] * rho1;
                                 }
                             }
-                            for alpha in 0..3 {
-                                for g in 0..nb {
-                                    let w = wv[alpha + 3 * g];
-                                    for mu in 0..nao { aow_alpha[[mu, g]] = ao_d[0][[mu, g]] * w; }
-                                }
-                                let row0 = alpha * nao;
-                                for j in 0..nao {
-                                    let lo = j * 3 * nao + row0;
-                                    vmat_alpha.data[j * nao..(j + 1) * nao]
-                                        .copy_from_slice(&vmat[ia].data[lo..lo + nao]);
-                                }
-                                _dgemm_full(&aow_alpha, 'N', &ao_d[0], 'T', &mut vmat_alpha, 1.0, 1.0);
-                                for j in 0..nao {
-                                    let lo = j * 3 * nao + row0;
-                                    vmat[ia].data[lo..lo + nao]
-                                        .copy_from_slice(&vmat_alpha.data[j * nao..(j + 1) * nao]);
-                                }
-                            }
+                            wv_all.push(wv);
                         }
+                        wv_all
                     }
                     XCType::GGA => {
                         let mut wv0 = vec![0.0; nb];
@@ -811,6 +834,7 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                             _dgemm_full(&aow_1b, 'N', &ao_d[0], 'T', &mut v_ip[alpha], 1.0, 1.0);
                         }
                         let ao_dm0 = compute_ao_dm0(dm0, &ao_d_refs[..nvar], nvar, nao, nb);
+                        let mut wv_all: Vec<Vec<f64>> = Vec::with_capacity(natm);
                         for ia in 0..natm {
                             let (p0, p1) = aoslices[ia];
                             let dR_rho1 = make_dR_rho1(&ao_d_refs, &ao_dm0, p0, p1, xc_type, nb);
@@ -831,65 +855,91 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                                     }
                                 }
                             }
-                            let mut aow_s = MatrixFull::new([nao, nb], 0.0);
-                            let mut vmat_s = MatrixFull::new([nao, nao], 0.0);
-                            for s in 0..3 {
-                                for mu in 0..nao { for g in 0..nb {
-                                    let mut v = 0.0;
-                                    for y in 0..nvar {
-                                        v += ao_d[y][[mu, g]] * wv[s + y * 3 + g * 3 * nvar];
-                                    }
-                                    aow_s[[mu, g]] = v;
-                                }}
-                                let row0 = s * nao;
-                                for j in 0..nao {
-                                    let lo = j * 3 * nao + row0;
-                                    vmat_s.data[j * nao..(j + 1) * nao]
-                                        .copy_from_slice(&vmat[ia].data[lo..lo + nao]);
-                                }
-                                _dgemm_full(&aow_s, 'N', &ao_d[0], 'T', &mut vmat_s, 1.0, 1.0);
-                                for j in 0..nao {
-                                    let lo = j * 3 * nao + row0;
-                                    vmat[ia].data[lo..lo + nao]
-                                        .copy_from_slice(&vmat_s.data[j * nao..(j + 1) * nao]);
-                                }
-                            }
+                            wv_all.push(wv);
                         }
+                        wv_all
                     }
                     _ => unreachable!(),
-                }
+                };
                 vxc_stage::add(&vxc_stage::CONTRACT, t_stage);
-                Some((vmat, v_ip))
+
+                // Keep only the `nvar` AO derivative components the contraction pass needs
+                // (`ao_d[0]` is the right operand, `ao_d[0..nvar]` build the AOW); the rest
+                // of the nderiv block is dropped with the rest of `ao_d`.
+                let mut ao_d_keep: Vec<Vec<f64>> = Vec::with_capacity(nvar);
+                for m in ao_d.into_iter().take(nvar) {
+                    ao_d_keep.push(m.data);
+                }
+                Some(VxcBlockPrep { nb, ao_d: ao_d_keep, wv: wv_all, v_ip })
             })
             .collect();
 
-        // Reduce the partials into the accumulators.
-        //
-        // The original form was
-        //     `for k in 0..natm { acc_vmat[k] += vmat_p[k].clone(); }`
-        // which (a) *copied* a whole `[3*nao, nao]` block once per (atom, sub-block) -- 312 MB
-        // per sub-block at polyene n=7 (natm = 30, nao = 658), of order 400 GB over the sweep --
-        // for a value that is immediately consumed by the `+=`, and (b) ran the whole reduction
-        // on one thread while the pool idled, even though every atom's accumulator is written by
-        // exactly one task.  Both are gone here; the per-atom summation order over the partials
-        // is unchanged, so the result is bit-identical.
-        let partials_ref = &partials;
-        acc_vmat.par_iter_mut().enumerate().for_each(|(k, acc)| {
-            for (vmat_p, _) in partials_ref.iter() {
+        // The direct term: every block contributes to the same `acc_vip`, and the blocks
+        // arrive in grid order from `collect`, so reducing in that order keeps the
+        // summation order of the previous (per-block partial) implementation.
+        acc_vip.par_iter_mut().enumerate().for_each(|(alpha, acc)| {
+            for prep in preps.iter() {
                 acc.data
                     .iter_mut()
-                    .zip(vmat_p[k].data.iter())
+                    .zip(prep.v_ip[alpha].data.iter())
                     .for_each(|(a, b)| *a += b);
             }
         });
-        acc_vip.par_iter_mut().enumerate().for_each(|(k, acc)| {
-            for (_, vip_p) in partials_ref.iter() {
-                acc.data
-                    .iter_mut()
-                    .zip(vip_p[k].data.iter())
-                    .for_each(|(a, b)| *a += b);
+
+        // ── Pass 2: one task per (atom, Cartesian direction) ─────────────────────────
+        // The old shape gave every in-flight sub-block a private `natm x [3*nao, nao]`
+        // accumulator (concurrency -> peak RSS) and then shuffled each `[nao, nao]`
+        // direction block through a scratch buffer twice per atom (two thirds of the
+        // phase's DRAM traffic).  Here each tile owns a private `[nao, nao]` result whose
+        // total over the `3*natm` tiles is exactly the size of one old per-block
+        // accumulator (322 MB at polyene n=7), independent of how many tiles run at once.
+        let t_gemm = Instant::now();
+        let tiles: Vec<MatrixFull<f64>> = (0..3 * natm)
+            .into_par_iter()
+            .map(|t| {
+                omp_set_num_threads_wrapper(1);
+                let ia = t / 3;
+                let s = t % 3;
+                let mut acc = MatrixFull::new([nao, nao], 0.0);
+                let mut aow_buf: Vec<f64> = vec![0.0; nao * nb_max];
+                for prep in preps.iter() {
+                    let nb = prep.nb;
+                    if nb == 0 { continue; }
+                    let aow = &mut aow_buf[..nao * nb];
+                    let wv = &prep.wv[ia];
+                    for g in 0..nb {
+                        let gb = g * nao;
+                        let wo = g * 3 * nvar;
+                        for mu in 0..nao {
+                            let mut v = 0.0;
+                            for y in 0..nvar {
+                                v += prep.ao_d[y][gb + mu] * wv[s + y * 3 + wo];
+                            }
+                            aow[gb + mu] = v;
+                        }
+                    }
+                    let sz = [nao, nb];
+                    let ind = [1usize, nao];
+                    let rhs = MatrixFullSlice { size: &sz, indicing: &ind, data: &aow[..] };
+                    let lhs = MatrixFullSlice { size: &sz, indicing: &ind, data: &prep.ao_d[0][..] };
+                    _dgemm_full(&rhs, 'N', &lhs, 'T', &mut acc, 1.0, 1.0);
+                }
+                acc
+            })
+            .collect();
+        vxc_stage::add(&vxc_stage::GEMM, t_gemm);
+
+        // Reduce the tiles into `acc_vmat` (fixed order: atom, then direction).
+        for (t, tile) in tiles.into_iter().enumerate() {
+            let ia = t / 3;
+            let row0 = (t % 3) * nao;
+            for j in 0..nao {
+                let lo = j * 3 * nao + row0;
+                let dst = &mut acc_vmat[ia].data[lo..lo + nao];
+                let src = &tile.data[j * nao..(j + 1) * nao];
+                for (a, b) in dst.iter_mut().zip(src.iter()) { *a += b; }
             }
-        });
+        }
         vxc_stage::add(&vxc_stage::REDUCE, t_stage_chunk);
     }
 
@@ -897,10 +947,10 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
         use std::sync::atomic::Ordering;
         let ms = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e6;
         println!(
-            "[vxc timing] sub-blocks={} concurrency={} | AO {:.1} ms | rho {:.1} ms | xc {:.1} ms | contract {:.1} ms | reduce {:.1} ms (summed over tasks)",
-            sub_blocks.len(), concurrency,
+            "[vxc timing] sub-blocks={} chunk={} | AO {:.1} ms | rho {:.1} ms | xc {:.1} ms | weights {:.1} ms | gemm-p2 {:.1} ms | reduce {:.1} ms (summed over tasks)",
+            sub_blocks.len(), vxc_bchunk,
             ms(&vxc_stage::AO), ms(&vxc_stage::RHO), ms(&vxc_stage::XC),
-            ms(&vxc_stage::CONTRACT), ms(&vxc_stage::REDUCE)
+            ms(&vxc_stage::CONTRACT), ms(&vxc_stage::GEMM), ms(&vxc_stage::REDUCE)
         );
     }
 
