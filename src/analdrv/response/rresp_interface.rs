@@ -319,7 +319,7 @@ impl<'a> RRespSCF<'a> {
 
 /// Build the response (fock/response) objects for a converged restricted SCF.
 pub fn rscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> RRespSCF<'a> {
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
     let mut resp_list: Vec<Box<dyn RRespAPI + 'a>> = Vec::new();
 
     // --- RI-JK --- //

@@ -19,7 +19,7 @@ where
     T: BlasFloat + FromPrimitive + 'static,
     DeviceBLAS: LapackDriverAPI<T>,
 {
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
 
     let mo_coeff = match eigenvectors {
         None => (&scf_data.eigenvectors[0]).to_rstsr(&device),
@@ -146,7 +146,7 @@ where
     const A: usize = 0;
     const B: usize = 1;
 
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
 
     // apply occ and vir orbital indices
     let mo_coeff = match eigenvectors {

@@ -54,7 +54,7 @@ impl RIUHFGradient<'_> {
         // preparation
         let mol_obj = &self.scf_data.mol;
         let mol = ri_jk::util::get_cint_mol(mol_obj);
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
 
         // orbital informations
         let mo_coeff = get_mo_coeff(self.scf_data, &device);
@@ -91,7 +91,7 @@ impl RIUHFGradient<'_> {
     pub fn calc_de_hcore(&mut self) -> &mut Self {
         let mol = &self.scf_data.mol;
         let natm = mol.geom.elem.len();
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
 
         let dm = get_dm(self.scf_data, &device);
         let dm = &dm[0] + &dm[1];
@@ -201,7 +201,7 @@ impl RIUHFGradient<'_> {
             return self;
         }
 
-        let dm = get_dm(self.scf_data, &DeviceBLAS::default());
+        let dm = get_dm(self.scf_data, &crate::utilities::rstsr_util::device());
         let dm = &dm[0] + &dm[1];
         let shape = dm.shape().to_vec().try_into().unwrap();
         let dm = MatrixFull::from_vec(shape, dm.into_shape(-1).into_vec()).unwrap();
@@ -233,7 +233,7 @@ impl RIUHFGradient<'_> {
         let natm = mol_obj.geom.elem.len();
         let mol = ri_jk::util::get_cint_mol(mol_obj);
         let aux = ri_jk::util::get_cint_aux(mol_obj);
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
 
         // density matrix and triu-packed density matrix
         let dm = get_dm(self.scf_data, &device);

@@ -22,7 +22,7 @@ pub fn rscf_hess_interface<'a>(
     cfg: &AnalDrvNucgradCfg,
     resp_obj: &mut RRespSCF<'a>,
 ) -> (Vec<f64>, VibInfo, Option<GauThermoInfo>) {
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
 
     // --- basic preparation --- //
     let mo_coeff = {

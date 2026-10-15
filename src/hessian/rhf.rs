@@ -1887,7 +1887,7 @@ impl RIRHFHessian<'_> {
         let _tej = std::time::Instant::now();
 
         // ── rstsr device and tensor views (shared across all phases) ──
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
         // Column-major tensors (native F-order)
         let dm0_t: TsrView<f64> = rt::asarray((&dm0, [nao, nao].f(), &device));
         let mc2_t: TsrView<f64> = rt::asarray((&mc2, [nocc, nao].f(), &device));
@@ -2441,7 +2441,7 @@ impl RIRHFHessian<'_> {
                     wj001: &wj001,
                     ip1: $ip1,
                     tmpf: $tmpf,
-                device: DeviceBLAS::default(),
+                device: crate::utilities::rstsr_util::device(),
                     cint_all: &cint_all,
                     nreg,
                     aux_nbas: naux_nbas,
@@ -2470,7 +2470,7 @@ impl RIRHFHessian<'_> {
         let i_t = |i0, j0, x, y| i0 * natm * 9 + j0 * 9 + x * 3 + y;
 
         // ══ rstsr accelerated G1-G2 (standard path, replaces for loops) ══
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
         let dm0_t: TsrView<f64> = rt::asarray((&dm0, [nao, nao].f(), &device));
         let vjd_t: TsrView<f64> = rt::asarray((&vjd, [nao, nao, 9].f(), &device));
         let vkd_t: TsrView<f64> = rt::asarray((&vkd, [nao, nao, 9].f(), &device));
@@ -2770,10 +2770,10 @@ impl RIRHFHessian<'_> {
         }
 
         // A single DeviceBLAS instance is reused by all H1AO contractions.
-        // Creating DeviceBLAS::default() spawns a Rayon thread pool, so doing it
+        // Creating crate::utilities::rstsr_util::device() spawns a Rayon thread pool, so doing it
         // per-block (42× previously) was a major hidden cost.
         // All BLAS blocks share this instance.
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
 
         // rho0_Pij, rhoj0_P, rhok0_Pl_
         // H4: rho0_all[ia] = vinv · t3c_block  (GEMM [naux, naux] @ [naux, ni*nao])

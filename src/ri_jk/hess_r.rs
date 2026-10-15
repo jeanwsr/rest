@@ -1615,7 +1615,7 @@ impl<'a> RHessRIJK<'a> {
         // let j2c_decomp_option = J2CDecompOption { policy: J2CDecompPolicy::Cd, threshold: Some(1e-14), uplo: Upper };
         // let j2c_decomp_option = J2CDecompOption { policy: J2CDecompPolicy::Cd, threshold: Some(1e-14), uplo: Lower };
         // let j2c_decomp_option = J2CDecompOption { policy: J2CDecompPolicy::Eig, threshold: Some(1e-14), uplo: Upper };
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
         let (cderi, j2c_decomp) = generate_cderi_with_decomp(mol, aux, j2c_decomp_option, &device);
         Self {
             mol: mol.clone(),

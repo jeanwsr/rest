@@ -6498,7 +6498,7 @@ impl GwGradEngine<'_> {
         let fxc_cache = crate::hessian::rks::prepare_fxc_cache(self.scf);
 
         // ---- analdrv CP-HF driver with the RI-JK response ----
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
         let mol = get_cint_mol(&self.scf.mol);
         let aux = get_cint_aux(&self.scf.mol);
         let mo_coeff =
@@ -9400,7 +9400,7 @@ impl GwGradEngine<'_> {
         timings[0] = 0.0; // (a)+(b) are timed by the caller-visible total below
         let t_setup = Instant::now();
         let _ = t_all;
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
         let mol = get_cint_mol(&self.scf.mol);
         let aux = get_cint_aux(&self.scf.mol);
         let mo_coeff = rt::asarray((&self.c_mo.data, [nao, nmo], &device)).into_contig(ColMajor);

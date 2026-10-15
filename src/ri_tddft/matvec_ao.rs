@@ -135,7 +135,7 @@ pub fn transition_density(
 /// Returns `[nao*nao, m]` with column $\mathbb{A}$ = flattened J (column-major
 /// `[nao,nao]`), matching the `f_fxc_block` layout (`base = \mathbb{A}·nao·nao`).
 fn get_j_ao_batched(scf: &SCF, p_block: &[MatrixFull<f64>]) -> MatrixFull<f64> {
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
     let (ri3fn, _, _) = scf.rimatr.as_ref()
         .expect("rimatr must be initialized for AO-mode TDDFT");
     let cderi = ri3fn.to_rstsr_view(&device);
@@ -173,7 +173,7 @@ fn get_k_ao_batched(
     let svd_tol = tddft_ctrl.map_or(1.0e-6, |t| t.tddft_svd_tol);
     let nao = scf.mol.num_basis;
     let m = p_block.len();
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
     let (ri3fn, _, _) = scf.rimatr.as_ref()
         .expect("rimatr must be initialized for AO-mode TDDFT");
     let cderi = ri3fn.to_rstsr_view(&device);
@@ -697,7 +697,7 @@ fn ao_kernel_block(
     let mut result = MatrixFull::new([dim, m], 0.0);
 
     // Build P for each column, and batch the fxc over all columns.
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
     let t0 = Instant::now();
     let mut p_block: Vec<MatrixFull<f64>> = Vec::with_capacity(m);
     for s in 0..m {

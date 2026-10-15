@@ -6,7 +6,7 @@ use crate::ri_jk::util::{get_cint_aux, get_cint_mol};
 use crate::SCF;
 
 pub fn uscf_hess_interface(scf_data: &SCF, cfg: &AnalDrvNucgradCfg, resp_cfg: &AnalDrvRespCfg) -> (Vec<f64>, VibInfo, Option<GauThermoInfo>) {
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
 
     // --- basic preparation --- //
     let mo_coeff = {

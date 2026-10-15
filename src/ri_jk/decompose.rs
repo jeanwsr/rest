@@ -146,7 +146,7 @@ pub fn generate_rimatr_bare(mol_obj: &Molecule, omega: Option<f64>) -> MatrixFul
 
     let j2c_decomp_option = mol_obj.ctrl.j2c_decomp;
 
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
 
     let j2c_decomp = get_j2c_decomp(&aux, &device, j2c_decomp_option);
     let j3c = {

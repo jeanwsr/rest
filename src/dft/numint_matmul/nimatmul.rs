@@ -335,13 +335,15 @@ impl<'a> NIMatmul<'a> {
     /// Cached AO tensors for the full grid are sliced accordingly and cached for the batch.
     ///
     /// This is useful for processing the grid in batches to reduce memory usage.
+    ///
+    /// Note it does **not** go through [`Self::duplicate`]: that clones the whole-grid
+    /// `coords`/`weights`/`atm_idx`/`quadrature_weights` (tens of MB at production grid sizes,
+    /// ~17 MB for the 355012-point polyene-n=7 grid) only for the batch slices below to throw
+    /// them away.  This function is called once per batch of *every* numerical-integration
+    /// pass — 29 times per full-grid pass for the CP-KS response, i.e. once per Krylov matvec —
+    /// so the waste was a full-grid copy per batch.
     pub fn split_batch(&self, start: usize, end: usize) -> NIMatmul<'_> {
         assert!(start < end && end <= self.coords.len(), "Invalid batch range");
-        let mut new = self.duplicate();
-        new.coords = self.coords[start..end].to_vec();
-        new.weights = self.weights[start..end].to_vec();
-        new.atm_idx = self.atm_idx[start..end].to_vec();
-        new.quadrature_weights = self.quadrature_weights[start..end].to_vec();
         // if AO cached for the full grid exists, slice and cache the AO for the batch
         let mut cached_tensors = HashMap::new();
         for keys in self.cache_tensor.keys() {
@@ -351,8 +353,19 @@ impl<'a> NIMatmul<'a> {
                 cached_tensors.insert(keys.clone(), ao_batch.into_cow());
             }
         }
-        new.cache_tensor = cached_tensors;
-        new
+        NIMatmul {
+            cint: self.cint.clone(),
+            coords: self.coords[start..end].to_vec(),
+            weights: self.weights[start..end].to_vec(),
+            atm_idx: self.atm_idx[start..end].to_vec(),
+            quadrature_weights: self.quadrature_weights[start..end].to_vec(),
+            cache_tensor: cached_tensors,
+            ao_cache_budget_bytes: self.ao_cache_budget_bytes,
+            ao_cached_bytes: 0,
+            transient_ao: None,
+            nchunk: self.nchunk,
+            nbatch: self.nbatch,
+        }
     }
 
     /// Evaluates AO integrals for the given derivative order and returns as a tensor.
@@ -361,7 +374,7 @@ impl<'a> NIMatmul<'a> {
     pub fn prepare_ao(&self, deriv: usize) -> Tsr {
         let eval_name = format!("deriv{}", deriv);
         let (out, shape) = self.cint.eval_gto(&eval_name, &self.coords).into();
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
         rt::asarray((out, shape, &device))
     }
 

@@ -271,7 +271,7 @@ impl SurfaceVdwGaussian {
         }
 
         // basic quantities
-        //let device = DeviceBLAS::default();
+        //let device = crate::utilities::rstsr_util::device();
         let lebedev_degree = self.cfg.lebedev_degree;
         let unit_sphere = angular_grid(lebedev_degree);
         let unit_quads = unit_sphere.0;

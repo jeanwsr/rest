@@ -537,7 +537,7 @@ pub fn krylov_vec(
     if n_rhs == 0 {
         return vec![];
     }
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
     let b_tsr = b.to_rstsr(&device);
     let b_view = b_tsr.view();
 

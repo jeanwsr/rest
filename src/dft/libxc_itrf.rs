@@ -348,7 +348,7 @@ pub fn eval_xc_eff(func_ids:&Vec<usize>, func_factors:&Vec<f64>, xc_type:XCType,
     let libxc_out = eval_xc1(func_ids, func_factors, xc_type, spin, rho, sigma, lapl, tau, np, deriv);
 
     let (_, xc_n_components) = get_nvar(xc_type, spin, deriv);
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
     let rho_ten_shape: Vec<usize> = match spin {
         0 => vec![np, nvar], // unpolarized case
         1 => vec![np, nvar, 2], // polarized case

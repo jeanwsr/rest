@@ -18,7 +18,7 @@ where
     T: BlasFloat + FromPrimitive + 'static,
     DeviceBLAS: LapackDriverAPI<T>,
 {
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
 
     let mo_energy = (&scf_data.eigenvalues[0]).to_rstsr(&device);
     let mo_occupation = (&scf_data.occupation[0]).to_rstsr(&device);
@@ -84,7 +84,7 @@ where
     const A: usize = 0;
     const B: usize = 1;
 
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
 
     let mo_energy = scf_data.eigenvalues.as_slice().to_rstsr(&device);
     let mo_occupation = scf_data.occupation.as_slice().to_rstsr(&device);

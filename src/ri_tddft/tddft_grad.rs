@@ -817,7 +817,7 @@ impl<'a> TddftGradEngine<'a> {
             // reference is zero-copy — the old `ao.data.to_vec()` duplicated
             // the whole `[nao,ng,ao_comp]` block and pushed the real peak above
             // the `max_memory`-derived budget.
-            let device = DeviceBLAS::default();
+            let device = crate::utilities::rstsr_util::device();
             let ao_ref = if xc_type == XCType::GGA {
                 Some(rt::asarray((ao_data, [nao, ng, ao_comp].f(), &device)))
             } else {
@@ -2190,7 +2190,7 @@ fn xc_eval_mat(
             // built once per grid block by the caller: copying the whole
             // (nao, ng, ao_comp) block on every call was ~1 GB of memcpy per
             // call and dominated this routine.
-            let device = DeviceBLAS::default();
+            let device = crate::utilities::rstsr_util::device();
             let wv_ten: Tsr<f64> = rt::asarray((wvv.clone(), [ng, 4].f(), &device));
             let mut v: Tsr<f64> = rt::zeros(([nao, nao, 3].f(), &device));
             let ao_view = ao_ten.expect("xc_eval_mat: GGA requires a prebuilt AO tensor");

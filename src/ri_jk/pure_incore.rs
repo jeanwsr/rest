@@ -666,7 +666,7 @@ mod tests {
 
     /// Build a synthetic (nao_tp, naux) folded cderi + MO coeffs.
     fn synthetic_set(nao: usize, occ: usize, vir: usize, naux: usize) -> (Tsr<f64>, Tsr<f64>, Tsr<f64>, Tsr<f64>, usize) {
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
         let nao_tp = nao * (nao + 1) / 2;
         let cderi = rt::asarray((pseudo(nao_tp * naux, 1.7), [nao_tp, naux].f(), &device));
         let c_occ = rt::asarray((pseudo(nao * occ, 2.1), [nao, occ].f(), &device));
@@ -719,7 +719,7 @@ mod tests {
     #[test]
     fn test_vk_ri_incore_coeff_pair_matches_exact() {
         let nao = 6; let k_dim = 3; let naux = 5; let nset = 2;
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
         let nao_tp = nao * (nao + 1) / 2;
         let cderi = rt::asarray((pseudo(nao_tp * naux, 1.7), [nao_tp, naux].f(), &device));
         // c_left differs per set; c_right shared (the multi-root TDDFT pattern)

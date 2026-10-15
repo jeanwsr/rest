@@ -10,6 +10,36 @@ pub type TsrView<'a, T = f64> = TensorView<'a, T, DeviceBLAS, IxD>;
 pub type TsrMut<'a, T = f64> = TensorMut<'a, T, DeviceBLAS, IxD>;
 pub type TsrCow<'a, T = f64> = TensorCow<'a, T, DeviceBLAS, IxD>;
 
+/// The process-wide RSTSR device.  Use this instead of `DeviceBLAS::default()`.
+///
+/// `DeviceBLAS::default()` is **not** free.  rstsr's `DeviceCpuRayon::generate_pool` builds a
+/// brand-new rayon `ThreadPool` and spawns `rayon::current_num_threads()` workers on *every*
+/// call, so it costs `O(pool)` thread creations and keeps their stacks and TLS alive for as
+/// long as the device is.  REST called it per grid sub-block (`eval_xc_eff`, 1400 times per
+/// v_xc sweep on polyene n=7), per AO evaluation (`NIMatmul::prepare_ao`), per Krylov matvec
+/// conversion (`to_rstsr`) and about forty other places -- thousands of times per gradient
+/// card.  With 40 rayon workers each holding a 40-thread device pool alive at once that is
+/// ~1600 threads in the process.  Measured on the n=7 gradient card, the `[vxc timing] xc`
+/// figure -- which is exactly `eval_xc_eff` -- grew from **19.6 s of CPU at 16 threads to
+/// 371.1 s at 40**, and 10.2 s after this became a single shared instance.
+///
+/// The device is only an `Arc<ThreadPool>` plus a layout flag, and rstsr's `same_device`
+/// compares the pool's *current* thread count and the default order, not the identity, so one
+/// lazily created instance is equivalent and interoperates with anything built from
+/// `DeviceBLAS::default()`.
+///
+/// The pool size stays `rayon::current_num_threads()`: rstsr's *broadcasted* contractions run
+/// on this pool, and `with_num_threads` also asks OpenBLAS for that many threads around every
+/// `%` issued from a serial stretch.  Bounding the size here was tried and does **not** work
+/// -- a device whose thread count differs from the default one trips rstsr's `DeviceMismatch`
+/// check in `op_binary_arithmetic` wherever a tensor meets one built elsewhere.  The
+/// serial-BLAS oversubscription it would have fixed is handled at the BLAS symbol instead;
+/// see `rest_tensors::matrix::matrix_blas_lapack`.
+pub fn device() -> DeviceBLAS {
+    static DEV: std::sync::OnceLock<DeviceBLAS> = std::sync::OnceLock::new();
+    DEV.get_or_init(DeviceBLAS::default).clone()
+}
+
 /* #region interchange between rstsr and rest_tensor */
 
 // In REST, we always use DeviceBLAS as backend in most cases.
@@ -51,7 +81,7 @@ where
 
         let data_ref = self.data_ref().unwrap();
         let vec = data_ref[..upper_bound].to_vec();
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
         rt::asarray((vec, layout, &device))
     }
 }

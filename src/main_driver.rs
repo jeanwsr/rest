@@ -1266,7 +1266,7 @@ mod geometric_pyo3_impl {
                     let hess_raw = hess_out.hessian;
                     let natm = (hess_raw.len() / 9).isqrt();
                     assert!(natm * natm * 9 == hess_raw.len(), "Hessian raw data length does not match expected size for {} atoms", natm);
-                    let device = DeviceBLAS::default();
+                    let device = crate::utilities::rstsr_util::device();
                     let hess_rt = rt::asarray((&hess_raw, [3, 3, natm, natm].f(), &device));
                     let hess_rt = hess_rt.transpose([0, 2, 1, 3]).into_shape((3 * natm, 3 * natm));
                     let hess_vec = hess_rt.into_shape(-1).into_vec();

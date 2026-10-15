@@ -380,7 +380,7 @@ impl RGFockAPI for RGFockDH<'_> {
 ///   [`xdh_calculations`](crate::ri_pt2::xdh_calculations) frees the grids, so this interface
 ///   must be called before it, or the grids must be regenerated in between.
 pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
 
     // --- basic preparation and checks --- //
 

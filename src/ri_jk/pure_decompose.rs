@@ -390,7 +390,7 @@ where
 #[test]
 fn test_check_recoverable() {
     // this will just test if we can recover the original matrix by the decomposed factors.
-    let mut device = DeviceBLAS::default();
+    let mut device = crate::utilities::rstsr_util::device();
     device.set_default_order(ColMajor);
 
     let vec = vec![10.0, 1.0, 2.0, 1.0, 20.0, 3.0, 2.0, 3.0, 30.0];

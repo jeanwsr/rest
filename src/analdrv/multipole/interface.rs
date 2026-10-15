@@ -8,7 +8,6 @@ use crate::ri_jk::util::get_cint_mol;
 use crate::scf_io::{SCFType, SCF};
 use crate::utilities::rstsr_util::RestTensorToRstsrTsrAPI;
 
-use rstsr::prelude::*;
 use serde::Serialize;
 
 /// Moments of one multipole order, split into contributions.
@@ -87,7 +86,7 @@ pub fn multipole_interface<'a>(
 
     let origin = mp_cfg.origin.unwrap_or([0.0; 3]);
 
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
     let mo_coeff = (&scf_data.eigenvectors[0]).to_rstsr(&device);
     let mo_occ = (&scf_data.occupation[0]).to_rstsr(&device);
     let mol_cint = get_cint_mol(&scf_data.mol);

@@ -72,7 +72,7 @@ pub fn proj_mo(mol_target: &Molecule, mol_source: &Molecule, mo_source: [MatrixF
 
     let s21 = mol_target.int_cross(mol_source, "ovlp".to_string());
 
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
     let s21_tsr = s21.to_rstsr(&device);
 
     let tgt_nmo = mol_target.num_state;

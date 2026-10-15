@@ -224,7 +224,7 @@ pub fn prepare_ao_data(scf: &SCF) -> TDDFTData {
     // kernel `[ngrids, nvar, nvar]` — bit-identical to `prepare_fxc_data`.
     // When `grid_batch` is set, rho0 is assembled batch-by-batch via
     // `split_batch` so the full `[ngrids, nao, ncomp]` AO tensor is never cached.
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
     let dm0 = &scf.density_matrix[0];
     let rho0 = if grid_batch {
         let mut rho0 = rt::zeros(([ngrids, nvar, 1], &device));

@@ -165,7 +165,7 @@ impl RIRHFGradient<'_> {
         // preparation
         let mol_obj = &self.scf_data.mol;
         let mol = ri_jk::util::get_cint_mol(mol_obj);
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
 
         // orbital informations
         let mo_coeff = get_mo_coeff(self.scf_data, &device);
@@ -201,7 +201,7 @@ impl RIRHFGradient<'_> {
     pub fn calc_de_hcore(&mut self) -> &mut Self {
         let mol = &self.scf_data.mol;
         let natm = mol.geom.elem.len();
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
 
         let dm = get_dm(self.scf_data, &device);
         let mut de_hcore: Tsr<f64> = rt::zeros(([3, natm], &device));
@@ -238,7 +238,7 @@ impl RIRHFGradient<'_> {
         let natm = mol_obj.geom.elem.len();
         let mol = ri_jk::util::get_cint_mol(mol_obj);
         let aux = ri_jk::util::get_cint_aux(mol_obj);
-        let device = DeviceBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
 
         // density matrix and triu-packed density matrix
         let dm = get_dm(self.scf_data, &device);
@@ -811,7 +811,7 @@ impl RIRHFGradient<'_> {
 pub fn generator_deriv_hcore<'a>(scf_data: &'a SCF) -> impl FnMut(usize) -> Tsr<f64> + 'a {
     let mut mol_obj = scf_data.mol.clone();
     let mol = ri_jk::util::get_cint_mol(&mol_obj);
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
 
     let necp_by_atom = {
         let basis4elem = Molecule::collect_basis(&scf_data.mol.ctrl, &mut scf_data.mol.geom.clone()).0;
@@ -920,7 +920,7 @@ fn get_dm(scf_data: &SCF, device: &DeviceBLAS) -> Tsr<f64> {
 /* #region Matrix Algorithms in RI-RHF code */
 
 pub fn calc_de_nuc(mol: &Molecule) -> MatrixFull<f64> {
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
 
     let natm = mol.natm_real;
     let coords = (0..natm).map(|i| mol.geom.get_coord(i)).flatten().collect::<Vec<f64>>();

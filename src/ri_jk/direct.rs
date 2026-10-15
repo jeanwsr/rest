@@ -22,7 +22,7 @@ pub const fn mem_estimate_vj_ri_direct(nao: usize, naux: usize, nset: usize) -> 
 
 pub fn generate_vj_ri_direct(dms: &[MatrixFull<f64>], mol_obj: &Molecule, batch_size: usize) -> Vec<MatrixUpper<f64>> {
     // dm shape: (nao, nao, nset) in f-contig
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
     let dms_rstsr = dms.to_rstsr(&device);
 
     let nao = dms_rstsr.shape()[0];
@@ -52,7 +52,7 @@ pub fn generate_vk_ri_semi_direct_coeff(
     batch_size: usize,
 ) -> Vec<MatrixUpper<f64>> {
     // mo_coeff shape: (nao, nmo, nset) in f-contig
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
     let mo_coeff_rstsr = mo_coeff.to_rstsr(&device);
     let mo_occ_rstsr = mo_occ.to_rstsr(&device);
 
@@ -89,7 +89,7 @@ pub fn generate_vk_ri_direct_dm(
     omega: Option<f64>,
     batch_size: usize,
 ) -> Vec<MatrixUpper<f64>> {
-    let device = DeviceBLAS::default();
+    let device = crate::utilities::rstsr_util::device();
     let dms = dms.to_rstsr(&device);
 
     let nao = dms.shape()[0];

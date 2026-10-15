@@ -827,7 +827,7 @@ impl NormCo {
             NormCo::W => &vib.w,
             NormCo::X => &vib.x,
         };
-        rt::asarray((data, [vib.ndof, vib.ndof], &DeviceBLAS::default()))
+        rt::asarray((data, [vib.ndof, vib.ndof], &crate::utilities::rstsr_util::device()))
     }
 }
 
