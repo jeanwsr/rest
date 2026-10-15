@@ -6,6 +6,7 @@ use std::ops::Range;
 use crate::utilities;
 use crate::scf_io::SCF;
 //use std::slice::Iter::<'_, f64>;
+use rayon::prelude::*;
 use rayon::result;
 use reqwest::blocking::Response;
 use rest_tensors::{RIFull};
@@ -1542,8 +1543,10 @@ pub fn gw_near_fermi_surface_ac(
 }
 pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,occ_threshold:f64,vir_threshold:f64,gw_ctx:&mut ri_gw::GwContext)->Vec<f64>{
     let route=gw_ctx.route(scf_data);
+    let t_riov = Instant::now();
     let ri_ov:Option<MatrixFull<f64>>=route.ri_ov(scf_data);
-    println!("RI-OV Shape={:?} (AO route: None = never materialised)",ri_ov.as_ref().map(|m| m.size));
+    println!("RI-OV Shape={:?} (AO route: None = never materialised); took {:.2} s",
+             ri_ov.as_ref().map(|m| m.size), t_riov.elapsed().as_secs_f64());
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let start=Instant::now();
     let v_matrix=route.v_matrix(scf_data);
@@ -1571,6 +1574,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
     let e_homo=ks_energies[occ_size-1];
     let e_lumo=ks_energies[occ_size];
 
+    let t_wclr = Instant::now();
     let w_c_lr: Option<Vec<(f64, f64, ri_gw::LowRankVChiV)>> = if qp_ctrl.use_low_rank_contour && imag_lr_enabled {
         println!("Low-rank contour (v2): Generating imaginary-axis low-rank sqrt(v)*chi*sqrt(v)...");
         Some(ri_gw::generate_w_c_lowrank(
@@ -1580,6 +1584,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
     } else {
         None
     };
+    println!("Imaginary-axis W_c low-rank: {} nodes in {:.2} s", num_freq, t_wclr.elapsed().as_secs_f64());
 
     // Precompute low-rank real-axis v*chi*v if enabled
     let real_axis_vchiv: Option<ri_gw::RealAxisVChiV> = if qp_ctrl.use_low_rank_contour {
@@ -1614,7 +1619,8 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
             .min((occ_size_2 + qp_ctrl.selfenergy_state_range).min(num_state_2.saturating_sub(1)));
         let grid_type = if qp_ctrl.low_rank_grid_type == "quadratic" { 1 } else { 0 };
         let pl = scf_data.mol.ctrl.print_level;
-        Some({
+        let t_ra = Instant::now();
+        let ra_out = {
             let mut ra = ri_gw::generate_real_axis_vchiv(
             &gwqp_g, &gwqp_w, occ_size_2, vir_size_2, num_state_2,
             ri_ov.as_ref().unwrap(),
@@ -1631,7 +1637,9 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
             );
             ra.interp = if qp_ctrl.low_rank_interp.eq_ignore_ascii_case("nearest") { 0 } else { 1 };
             ra
-        })
+        };
+        println!("Real-axis v*chi*v precompute: {:.2} s", t_ra.elapsed().as_secs_f64());
+        Some(ra_out)
     } else {
         None
     };

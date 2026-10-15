@@ -716,6 +716,11 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                         let wf_factor: Vec<f64> = (0..nb)
                             .map(|g| weights_block[g] * fxc_raw[fxc_off + g])
                             .collect();
+                        // Buffers reused across atoms/sub-blocks (they are fully overwritten below);
+                        // allocating them per (atom, component) was 90 allocations of
+                        // `nao x nb` + `nao x nao` per sub-block.
+                        let mut aow_alpha = MatrixFull::new([nao, nb], 0.0);
+                        let mut vmat_alpha = MatrixFull::new([nao, nao], 0.0);
                         for ia in 0..natm {
                             let (p0, p1) = aoslices[ia];
                             let mut wv = vec![0.0; 3 * nb];
@@ -729,20 +734,22 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                                 }
                             }
                             for alpha in 0..3 {
-                                let mut aow_alpha = MatrixFull::new([nao, nb], 0.0);
                                 for g in 0..nb {
                                     let w = wv[alpha + 3 * g];
                                     for mu in 0..nao { aow_alpha[[mu, g]] = ao_d[0][[mu, g]] * w; }
                                 }
                                 let row0 = alpha * nao;
-                                let mut vmat_alpha = MatrixFull::new([nao, nao], 0.0);
-                                for j in 0..nao { for i in 0..nao {
-                                    vmat_alpha[[i, j]] = vmat[ia][[row0 + i, j]];
-                                }}
+                                for j in 0..nao {
+                                    let lo = j * 3 * nao + row0;
+                                    vmat_alpha.data[j * nao..(j + 1) * nao]
+                                        .copy_from_slice(&vmat[ia].data[lo..lo + nao]);
+                                }
                                 _dgemm_full(&aow_alpha, 'N', &ao_d[0], 'T', &mut vmat_alpha, 1.0, 1.0);
-                                for j in 0..nao { for i in 0..nao {
-                                    vmat[ia][[row0 + i, j]] = vmat_alpha[[i, j]];
-                                }}
+                                for j in 0..nao {
+                                    let lo = j * 3 * nao + row0;
+                                    vmat[ia].data[lo..lo + nao]
+                                        .copy_from_slice(&vmat_alpha.data[j * nao..(j + 1) * nao]);
+                                }
                             }
                         }
                     }
@@ -800,8 +807,9 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                                     }
                                 }
                             }
+                            let mut aow_s = MatrixFull::new([nao, nb], 0.0);
+                            let mut vmat_s = MatrixFull::new([nao, nao], 0.0);
                             for s in 0..3 {
-                                let mut aow_s = MatrixFull::new([nao, nb], 0.0);
                                 for mu in 0..nao { for g in 0..nb {
                                     let mut v = 0.0;
                                     for y in 0..nvar {
@@ -810,14 +818,17 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                                     aow_s[[mu, g]] = v;
                                 }}
                                 let row0 = s * nao;
-                                let mut vmat_s = MatrixFull::new([nao, nao], 0.0);
-                                for j in 0..nao { for i in 0..nao {
-                                    vmat_s[[i, j]] = vmat[ia][[row0 + i, j]];
-                                }}
+                                for j in 0..nao {
+                                    let lo = j * 3 * nao + row0;
+                                    vmat_s.data[j * nao..(j + 1) * nao]
+                                        .copy_from_slice(&vmat[ia].data[lo..lo + nao]);
+                                }
                                 _dgemm_full(&aow_s, 'N', &ao_d[0], 'T', &mut vmat_s, 1.0, 1.0);
-                                for j in 0..nao { for i in 0..nao {
-                                    vmat[ia][[row0 + i, j]] = vmat_s[[i, j]];
-                                }}
+                                for j in 0..nao {
+                                    let lo = j * 3 * nao + row0;
+                                    vmat[ia].data[lo..lo + nao]
+                                        .copy_from_slice(&vmat_s.data[j * nao..(j + 1) * nao]);
+                                }
                             }
                         }
                     }
@@ -827,10 +838,33 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
             })
             .collect();
 
-        for (vmat_p, vip_p) in partials {
-            for k in 0..natm { acc_vmat[k] += vmat_p[k].clone(); }
-            for k in 0..3 { acc_vip[k] += vip_p[k].clone(); }
-        }
+        // Reduce the partials into the accumulators.
+        //
+        // The original form was
+        //     `for k in 0..natm { acc_vmat[k] += vmat_p[k].clone(); }`
+        // which (a) *copied* a whole `[3*nao, nao]` block once per (atom, sub-block) -- 312 MB
+        // per sub-block at polyene n=7 (natm = 30, nao = 658), of order 400 GB over the sweep --
+        // for a value that is immediately consumed by the `+=`, and (b) ran the whole reduction
+        // on one thread while the pool idled, even though every atom's accumulator is written by
+        // exactly one task.  Both are gone here; the per-atom summation order over the partials
+        // is unchanged, so the result is bit-identical.
+        let partials_ref = &partials;
+        acc_vmat.par_iter_mut().enumerate().for_each(|(k, acc)| {
+            for (vmat_p, _) in partials_ref.iter() {
+                acc.data
+                    .iter_mut()
+                    .zip(vmat_p[k].data.iter())
+                    .for_each(|(a, b)| *a += b);
+            }
+        });
+        acc_vip.par_iter_mut().enumerate().for_each(|(k, acc)| {
+            for (_, vip_p) in partials_ref.iter() {
+                acc.data
+                    .iter_mut()
+                    .zip(vip_p[k].data.iter())
+                    .for_each(|(a, b)| *a += b);
+            }
+        });
     }
 
     // Final: vmat[ia, :, p0:p1, :] += v_ip[:, p0:p1, :]

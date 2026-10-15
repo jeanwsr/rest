@@ -18,7 +18,7 @@ use rest_tensors::{RIFull};
 use rayon::prelude::ParallelSliceMut;
 use tensors::{matrix_blas_lapack::{_dinverse,_dsyev}, ri, MathMatrix, MatrixFull};
 //use rest::molecule_io::Molecule;
-use rest_tensors::matrix::matrix_blas_lapack::{_dgees,_dgemm,_dgemm_full,_dgemv,_dinverse_inplace,_dsyev_inplace};
+use rest_tensors::matrix::matrix_blas_lapack::{_dgees,_dgemm,_dgemm_full,_dgemv,_dinverse_inplace,_dsyevd_inplace};
 use crate::tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper, omp_set_num_threads_wrapper};
 use rest_tensors::MatrixUpper;
 use crate::ri_bse;
@@ -2488,9 +2488,15 @@ pub fn low_rank_vchi_vsqrt(
         col_start = col_end;
     }
 
-    // Step 3: Diagonalize chi0 in place (LAPACK dsyev overwrites the input with
-    // the eigenvectors, so chi0's buffer is reused — no n² copy).
-    let (eigvecs_opt, eigvals_raw, _info) = _dsyev_inplace(chi0, 'V');
+    // Step 3: Diagonalize chi0 in place (the driver overwrites the input with the
+    // eigenvectors, so chi0's buffer is reused — no n² copy).
+    //
+    // `dsyevd`, not `dsyev`.  This call is the *entire* cost of the real-axis low-rank grid
+    // (400 points), and `dsyev` is dominated by its serial tridiagonal QR iteration: measured on
+    // xc03n02, `dsyev(408)` takes 131 ms at one thread and 100 ms at 40 -- it does not scale at
+    // all -- while `dsyevd(408)` takes 20 ms.  The same note already exists on
+    // `gw_grad::eigh_symmetric`, which is why that path uses `dsyevd`; this one did not.
+    let (eigvecs_opt, eigvals_raw, _info) = _dsyevd_inplace(chi0, 'V');
     let eigvecs = eigvecs_opt.expect("low_rank_vchi_vsqrt: dsyev failed");
 
     // _dsyev returns eigenvalues in ascending order, but we want descending by
@@ -2574,7 +2580,9 @@ pub fn low_rank_vchi_vsqrt_total(
     }
 
     // Diagonalize chi0 in place and form the RPA low-rank representation.
-    let (eigvecs_opt, eigvals_raw, _info) = _dsyev_inplace(chi0, 'V');
+    // `dsyevd` for the same reason as in `low_rank_vchi_vsqrt`: this loop runs once per
+    // real-axis grid point and `dsyev` is a serial-QR-bound 5x slower there.
+    let (eigvecs_opt, eigvals_raw, _info) = _dsyevd_inplace(chi0, 'V');
     let eigvecs = eigvecs_opt.expect("low_rank_vchi_vsqrt_total: dsyev failed");
 
     let mut idx_eig: Vec<(usize, f64)> = eigvals_raw.iter().enumerate()
@@ -2732,7 +2740,17 @@ pub fn generate_real_axis_vchiv(
         );
     }
 
-    // Step 3: Build low-rank representation at each grid point
+    // Step 3: Build low-rank representation at each grid point.
+    //
+    // Deliberately **serial**: each point is one `dsyevd`-class diagonalisation of an
+    // `naux x naux` matrix, which is inherently serial in LAPACK (measured on xc03n02:
+    // `dsyev(408)` = 100 ms at 1 thread and 100 ms at 40) and whose only large BLAS-3
+    // (`chi0 += ri_ov ri_block^T`) already uses the whole pool.  Splitting the loop over the
+    // pool instead would multiply the per-point scratch (`chi0` + `ri_block` + the eigenvector
+    // buffer, tens of MB each) by the number of points in flight and fragment the BLAS-3 into
+    // smaller problems.  The win has to come from making one point cheaper, not from running
+    // more of them at once.
+    let t_ra = Instant::now();
     let mut grid: Vec<LowRankVChiV> = Vec::with_capacity(n_points);
     for i_omega in 0..n_points {
         let omega_real = if n_points > 1 {
@@ -2760,6 +2778,11 @@ pub fn generate_real_axis_vchiv(
             println!("    Non-negligible eigenvalues: {} / {}", lr.n_keep, ri_ov.size[0]);
         }
         grid.push(lr);
+    }
+    if print_level > 0 {
+        println!("Real-axis low-rank grid: {} points in {:.2} s ({:.2} ms/point)",
+                 n_points, t_ra.elapsed().as_secs_f64(),
+                 t_ra.elapsed().as_secs_f64() * 1000.0 / (n_points.max(1) as f64));
     }
 
     RealAxisVChiV {
@@ -2843,18 +2866,20 @@ pub fn generate_real_axis_vchiv_spin(
     println!("Low-rank contour (unrestricted): Computing total sqrt(v)*chi*sqrt(v) at {} real-axis grid points",
              nomega_chi_real);
 
+    // Serial for the same reason as `generate_real_axis_vchiv`: the cost of a point is a
+    // serial LAPACK diagonalisation plus one pool-wide BLAS-3.
     let mut grid: Vec<LowRankVChiV> = Vec::with_capacity(nomega_chi_real);
     for i_omega in 0..nomega_chi_real {
-        let omega_real = if nomega_chi_real > 1 {
-            let t = (i_omega as f64) / ((nomega_chi_real - 1) as f64);
-            if grid_type == 1 {
-                grid_scale * t * t
+            let omega_real = if nomega_chi_real > 1 {
+                let t = (i_omega as f64) / ((nomega_chi_real - 1) as f64);
+                if grid_type == 1 {
+                    grid_scale * t * t
+                } else {
+                    grid_scale * t
+                }
             } else {
-                grid_scale * t
-            }
-        } else {
-            grid_scale
-        };
+                grid_scale
+            };
         let lr = low_rank_vchi_vsqrt_total(
             quasiparticle_energies_w,
             occ_params,
