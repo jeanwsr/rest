@@ -28,8 +28,9 @@ pub type TsrCow<'a, T = f64> = TensorCow<'a, T, DeviceBLAS, IxD>;
 /// lazily created instance is equivalent and interoperates with anything built from
 /// `DeviceBLAS::default()`.
 ///
-/// `REST_RSTSR_DEVICE_THREADS` sets the pool size (0, the default, means
-/// `rayon::current_num_threads()`).  The size matters twice:
+/// The pool size is `min(rayon::current_num_threads(), 16)`, and
+/// `REST_RSTSR_DEVICE_THREADS` overrides it (0 = the raw rayon pool size).  The size matters
+/// twice:
 ///
 /// * rstsr runs its *broadcasted* contractions on this pool, and `with_num_threads` also asks
 ///   OpenBLAS for that many threads around every `%` issued from a serial stretch;
@@ -47,14 +48,32 @@ pub type TsrCow<'a, T = f64> = TensorCow<'a, T, DeviceBLAS, IxD>;
 pub fn device() -> DeviceBLAS {
     static DEV: std::sync::OnceLock<DeviceBLAS> = std::sync::OnceLock::new();
     DEV.get_or_init(|| {
-        let n = std::env::var("REST_RSTSR_DEVICE_THREADS")
+        let n = match std::env::var("REST_RSTSR_DEVICE_THREADS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        if n == 0 { DeviceBLAS::default() } else { DeviceBLAS::new(n) }
+        {
+            Some(0) => rayon::current_num_threads().max(1),
+            Some(k) => k,
+            None => rayon::current_num_threads().min(DEVICE_THREADS_MAX).max(1),
+        };
+        DeviceBLAS::new(n)
     })
     .clone()
 }
+
+/// Largest pool this device will build, regardless of the rayon pool size.
+///
+/// `rstsr-openblas/src/matmul.rs` picks between two *different algorithms* with
+/// `if n_task >= 4 * nthreads`: below the threshold it parallelises the outer broadcast and
+/// does each small product with one BLAS thread; above it, it walks the broadcast serially and
+/// dispatches every small product to the whole pool.  The Z-vector solve's broadcast has
+/// `n_task = nprop = 3*natm = 90`, so the threshold is `nthreads = 22`: at 40 threads the
+/// default device (pool = 40) took the *expensive* branch, and bounding it to 16 put it back on
+/// the cheap one.  Measured on the polyene-n=7 gradient card at 40 threads, the Z-vector solve
+/// went from **137.9 s to 82.9 s** and the whole card from 1058 s to 1000 s, while 16 threads
+/// are unaffected (its pool is already <= 16).  16 also keeps the OpenBLAS request rstsr makes
+/// around each serial `%` in the range that helps rather than a 40-wide barrier per product.
+const DEVICE_THREADS_MAX: usize = 16;
 
 /* #region interchange between rstsr and rest_tensor */
 

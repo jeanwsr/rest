@@ -404,7 +404,20 @@ fn per_rhs_phase(
     // ── Per-RHS Krylov loop (independent subspaces) ───────────────────
     // Each cycle: collect active directions → batch aop → distribute
     // results per RHS → CGS orthogonalization → convergence check.
+    //
+    // Optional `malloc_trim` per cycle.  Every cycle allocates and frees the
+    // per-RHS direction/result tensors (hundreds of MB for a Z-vector solve with
+    // `n_rhs = 3*natm`), and glibc answers the next cycle from the free lists it kept.
+    // Measured on the n=7 gradient card it returns only ~0.15 GiB per thread count and does
+    // not change the 40/16 peak ratio (19.85 / 17.41 GiB against 19.82 / 17.59 without it), so
+    // it is **off** by default; `REST_KRYLOV_TRIM=1` turns it on.  The bigger allocator effect
+    // (`MALLOC_ARENA_MAX=1`: -1.0 GiB at 40 threads) cannot be had this way -- `malloc_trim`
+    // only returns the free tail of each arena, it cannot merge live allocations.
+    let trim_each_cycle = std::env::var("REST_KRYLOV_TRIM").is_ok();
     while active.iter().any(|&a| a) && *total_cycles < config.max_cycle {
+        if trim_each_cycle {
+            crate::hessian::memory_monitor::trim_to_os(0);
+        }
         let mut dir_vecs: Vec<Tsr> = Vec::new();
         let mut dir_to_rhs: Vec<usize> = Vec::new();
         for k in 0..n_rhs {
