@@ -28,16 +28,32 @@ pub type TsrCow<'a, T = f64> = TensorCow<'a, T, DeviceBLAS, IxD>;
 /// lazily created instance is equivalent and interoperates with anything built from
 /// `DeviceBLAS::default()`.
 ///
-/// The pool size stays `rayon::current_num_threads()`: rstsr's *broadcasted* contractions run
-/// on this pool, and `with_num_threads` also asks OpenBLAS for that many threads around every
-/// `%` issued from a serial stretch.  Bounding the size here was tried and does **not** work
-/// -- a device whose thread count differs from the default one trips rstsr's `DeviceMismatch`
-/// check in `op_binary_arithmetic` wherever a tensor meets one built elsewhere.  The
-/// serial-BLAS oversubscription it would have fixed is handled at the BLAS symbol instead;
-/// see `rest_tensors::matrix::matrix_blas_lapack`.
+/// `REST_RSTSR_DEVICE_THREADS` sets the pool size (0, the default, means
+/// `rayon::current_num_threads()`).  The size matters twice:
+///
+/// * rstsr runs its *broadcasted* contractions on this pool, and `with_num_threads` also asks
+///   OpenBLAS for that many threads around every `%` issued from a serial stretch;
+/// * `rstsr-openblas/src/matmul.rs` chooses between two **different algorithms** with
+///   `if n_task >= 4 * nthreads`: below the threshold it parallelises the outer broadcast and
+///   does each small product with one BLAS thread, above it it walks the broadcast serially
+///   and dispatches every small product to the whole pool.  With `n_task = nprop = 90` (the
+///   Z-vector solve) that threshold sits at `nthreads = 22`, so the 16-thread run takes the
+///   cheap branch and the 40-thread run takes the expensive one -- a pool-dependent *algorithm
+///   switch*, not just a pool-dependent amount of parallelism.
+///
+/// Every other device construction must go through this function: a second device whose
+/// thread count differs trips rstsr's `DeviceMismatch` check in `op_binary_arithmetic`
+/// wherever the two tensors meet.
 pub fn device() -> DeviceBLAS {
     static DEV: std::sync::OnceLock<DeviceBLAS> = std::sync::OnceLock::new();
-    DEV.get_or_init(DeviceBLAS::default).clone()
+    DEV.get_or_init(|| {
+        let n = std::env::var("REST_RSTSR_DEVICE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if n == 0 { DeviceBLAS::default() } else { DeviceBLAS::new(n) }
+    })
+    .clone()
 }
 
 /* #region interchange between rstsr and rest_tensor */

@@ -45,7 +45,7 @@ impl<'a> NumInt<'a> for RIRHFGradient<'a> {
         let mo_coeffs = scf_data.eigenvectors.clone().to_vec();
         let mo_occ = scf_data.occupation.clone().to_vec();
 
-        let device = DeviceOpenBLAS::default();
+        let device = crate::utilities::rstsr_util::device();
 
         XCData {
             xc_type,
