@@ -396,17 +396,20 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
     let gw_already_done = checkpoint_has_finished_gw(scf_data);
     if let Some(state) = scf_data.gw_checkpoint_state.as_ref() {
         if state.stage == crate::fileop::gw_checkpoint::GwCheckpointStage::EvgwRound
-            && !qp_ctrl.scgw.eq("evgw")
+            && !state.scgw_mode.eq_ignore_ascii_case(&qp_ctrl.scgw)
         {
             panic!(
-                "[gw_checkpoint] the checkpoint '{}' was written in the middle of an evGW run \
+                "[gw_checkpoint] the checkpoint '{}' was written in the middle of a {} run \
                  (round {} of {}), but the current input asks for scgw = \"{}\".\n\
-                 Fix the input so that scgw = \"evgw\" (and evgw_rounds > {}), or set \
-                 'resume_from_checkpoint = false' to start over.",
+                 evGW and evGW0 store different W vectors, so an interrupted archive must be \
+                 resumed with the mode that wrote it.  Fix the input so that scgw = \"{}\" \
+                 (and evgw_rounds > {}), or set 'resume_from_checkpoint = false' to start over.",
                 crate::fileop::gw_checkpoint::checkpoint_path(scf_data),
+                state.scgw_mode,
                 state.rounds_done,
                 state.total_rounds,
                 qp_ctrl.scgw,
+                state.scgw_mode,
                 state.rounds_done,
             );
         }

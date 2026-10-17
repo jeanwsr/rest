@@ -656,9 +656,34 @@ impl EvgwDiis {
 /// the same two mechanisms through `evgw_damping` (scalar analogue of MolGW's
 /// Z-scaling) and `evgw_diis` (PySCF's DIIS), plus a convergence test with
 /// early exit so that "did evGW converge?" is answerable from the log.
+/// Eigenvalue self-consistent GW (evGW): both G and W are rebuilt from the
+/// updated quasiparticle-energy vector in every outer round.
 pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,gw_ctx:&mut ri_gw::GwContext)->Vec<f64>{
+    evgw_impl(scf_data,num_freq,vxc_nn,iter_rounds,gw_ctx,false)
+}
+
+/// Eigenvalue self-consistent G0W0 (evGW0): the quasiparticle energies entering
+/// G are updated self-consistently, while the screening W is frozen at its
+/// initial (G0W0) value.
+///
+/// This is the `scgw = "evgw0"` entry point.  It shares the whole outer-loop
+/// machinery with [`evgw`] (per-round update rule, damping, DIIS, degeneracy
+/// projection, convergence test and checkpointing); the only difference is that
+/// the W energy vector (`scf_data.gwqp.1`) is never overwritten by the updated
+/// QP energies.
+pub fn evgw0(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,gw_ctx:&mut ri_gw::GwContext)->Vec<f64>{
+    evgw_impl(scf_data,num_freq,vxc_nn,iter_rounds,gw_ctx,true)
+}
+
+fn evgw_impl(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,gw_ctx:&mut ri_gw::GwContext,freeze_w:bool)->Vec<f64>{
     let (_start_mo,_num_state,occ_size,_vir_size,_homo,_lumo)=ri_gw::get_occupation_parameters(scf_data,'Y');
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+    let mode_name=if freeze_w{"evGW0"}else{"evGW"};
+    // In evGW0 the W energy vector is the one produced by the initialization
+    // in `gw_main` (`initialize_qp_g_w`): KS energies by default, or the
+    // renormalized-singles energies when `w_rs = true`.  Capture it before the
+    // first round and restore it before every GW pass.
+    let w_reference=scf_data.gwqp.1.clone();
     let damping=qp_ctrl.evgw_damping.clamp(1.0e-3,1.0);
     let update_kind=evgw_update_kind(&qp_ctrl);
     let solver=match update_kind{
@@ -683,15 +708,18 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,
     let diis_safeguard=qp_ctrl.evgw_diis_safeguard;
     let max_step_cap=qp_ctrl.evgw_max_step;
 
-    if qp_ctrl.scgw=="evgw" && report{
-        println!("evGW outer-loop settings: solver={}, damping(alpha)={:.4}, DIIS={} (space={}, start={}, safeguard={}), conv_tol={:.3e} Ha, stop_on_convergence={}, max_step={}",
-                 solver,damping,use_diis,diis_space.max(2),diis_start.max(2),diis_safeguard,conv_tol,stop_on_conv,
+    if (qp_ctrl.scgw=="evgw"||qp_ctrl.scgw=="evgw0") && report{
+        println!("{} outer-loop settings: solver={}, damping(alpha)={:.4}, DIIS={} (space={}, start={}, safeguard={}), conv_tol={:.3e} Ha, stop_on_convergence={}, max_step={}",
+                 mode_name,solver,damping,use_diis,diis_space.max(2),diis_start.max(2),diis_safeguard,conv_tol,stop_on_conv,
                  if max_step_cap>0.0{format!("{:.3e} Ha",max_step_cap)}else{String::from("unlimited")});
+        if freeze_w{
+            println!("{}: W is frozen at the initial (G0W0) energy vector; only the G quasiparticle energies are updated.",mode_name);
+        }
     }
 
     let degeneracy_tol=qp_ctrl.evgw_degeneracy_tol;
     if report && degeneracy_tol>0.0 {
-        println!("evGW degeneracy projection: QP energies of Kohn-Sham-degenerate partners (within {:.1e} Ha) are averaged every round.", degeneracy_tol);
+        println!("{} degeneracy projection: QP energies of Kohn-Sham-degenerate partners (within {:.1e} Ha) are averaged every round.", mode_name, degeneracy_tol);
     }
     let ks_reference=scf_data.eigenvalues[0].clone();
     let mut diis=EvgwDiis::new(diis_space,diis_start,diis_safeguard);
@@ -714,17 +742,17 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,
             last_residual=state.last_residual;
             last_dg=state.last_dg;
             diis.restore(&state.diis_history,&state.diis_errors);
-            println!("[gw_checkpoint] evGW resume: {} of {} round(s) are already contained in the checkpoint; \
-                      the loop restarts at round {}.",start_round,iter_rounds,start_round+1);
-            println!("[gw_checkpoint] evGW resume: restored {} DIIS vector(s), last max|dE_qp|={:.4e} Ha, |dG|={:.4e}, converged={}.",
-                      state.diis_history.len(),last_residual,last_dg,converged);
+            println!("[gw_checkpoint] {} resume: {} of {} round(s) are already contained in the checkpoint; \
+                      the loop restarts at round {}.",mode_name,start_round,iter_rounds,start_round+1);
+            println!("[gw_checkpoint] {} resume: restored {} DIIS vector(s), last max|dE_qp|={:.4e} Ha, |dG|={:.4e}, converged={}.",
+                      mode_name,state.diis_history.len(),last_residual,last_dg,converged);
             if start_round>=iter_rounds{
-                println!("[gw_checkpoint] evGW resume: the checkpoint already holds all {} requested round(s) \
-                          (evgw_rounds); the evGW loop is skipped and the stored quasiparticle energies are used.",
-                          iter_rounds);
+                println!("[gw_checkpoint] {} resume: the checkpoint already holds all {} requested round(s) \
+                          (evgw_rounds); the {} loop is skipped and the stored quasiparticle energies are used.",
+                          mode_name,iter_rounds,mode_name);
             } else if converged && stop_on_conv {
-                println!("[gw_checkpoint] evGW resume: the stored round already satisfied evgw_conv_tol={:.4e} Ha \
-                          and evgw_stop_on_convergence is true; the evGW loop is skipped.",conv_tol);
+                println!("[gw_checkpoint] {} resume: the stored round already satisfied evgw_conv_tol={:.4e} Ha \
+                          and evgw_stop_on_convergence is true; the {} loop is skipped.",mode_name,conv_tol,mode_name);
                 start_round=iter_rounds;
             }
         }
@@ -733,14 +761,18 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,
     let nstate=scf_data.gwqp.0.len();
 
     for i in start_round..iter_rounds{
-        println!("Now is round #{} of evGW calculation. There will be {} rounds in total.",i+1,iter_rounds);
+        println!("Now is round #{} of {} calculation. There will be {} rounds in total.",i+1,mode_name,iter_rounds);
         let cancel_dfa_xc=true;
-        // Energy vector fed into this round (G and W both built from it, as in
-        // MolGW's GnWn / PySCF's EVGW with W0 = False).
+        // Energy vector fed into this round.
+        //
+        // evGW  : G and W are both built from the current iterate
+        //         (MolGW GnWn / PySCF EVGW with W0 = False).
+        // evGW0 : only G is built from the iterate; W keeps the initial
+        //         G0W0 energy vector captured before the loop.
         let mut qp_in=scf_data.gwqp.0.clone();
         symmetrize_degenerate_subspaces(&mut qp_in,&ks_reference,degeneracy_tol);
         scf_data.gwqp.0=qp_in.clone();
-        scf_data.gwqp.1=qp_in.clone();
+        scf_data.gwqp.1=if freeze_w{w_reference.clone()}else{qp_in.clone()};
         // One full GW pass (root solve, single evaluation or Z-damped step,
         // depending on `evgw_solver`).
         let mut qp_out=g0w0(scf_data,num_freq,vxc_nn,cancel_dfa_xc,gw_ctx);
@@ -778,14 +810,14 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,
         if report{
             let homo_qp=qp_out.get(occ_size-1).copied().unwrap_or(f64::NAN);
             let lumo_qp=qp_out.get(occ_size).copied().unwrap_or(f64::NAN);
-            println!("evGW round {} summary: max|dE_qp|={:.4e} Ha (orbital #{}), |dG|={:.4e}, max|step|={:.4e} Ha",
-                     i+1,max_de,max_at,dg,max_step);
-            println!("evGW round {}: HOMO(#{} QP)={:.8} Ha, LUMO(#{} QP)={:.8} Ha, gap={:.8} Ha",
-                     i+1,occ_size-1,homo_qp,occ_size,lumo_qp,lumo_qp-homo_qp);
+            println!("{} round {} summary: max|dE_qp|={:.4e} Ha (orbital #{}), |dG|={:.4e}, max|step|={:.4e} Ha",
+                     mode_name,i+1,max_de,max_at,dg,max_step);
+            println!("{} round {}: HOMO(#{} QP)={:.8} Ha, LUMO(#{} QP)={:.8} Ha, gap={:.8} Ha",
+                     mode_name,i+1,occ_size-1,homo_qp,occ_size,lumo_qp,lumo_qp-homo_qp);
         }
 
         scf_data.gwqp.0=qp_next.clone();
-        scf_data.gwqp.1=qp_next.clone();
+        scf_data.gwqp.1=if freeze_w{w_reference.clone()}else{qp_next.clone()};
 
         let round_converged=max_de<conv_tol;
 
@@ -808,15 +840,15 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,
             ckpt.diis_history=diis.history.clone();
             ckpt.diis_errors=diis.errors.clone();
             if let Err(e)=crate::fileop::gw_checkpoint::save_gw_checkpoint(scf_data,&ckpt){
-                println!("[gw_checkpoint] WARNING: could not write the evGW checkpoint after round {}: {:#}",i+1,e);
+                println!("[gw_checkpoint] WARNING: could not write the {} checkpoint after round {}: {:#}",mode_name,i+1,e);
             }
         }
 
         if round_converged{
             converged=true;
             if report{
-                println!("evGW converged after {} round(s): max|dE_qp|={:.4e} Ha < conv_tol={:.4e} Ha",
-                         i+1,max_de,conv_tol);
+                println!("{} converged after {} round(s): max|dE_qp|={:.4e} Ha < conv_tol={:.4e} Ha",
+                         mode_name,i+1,max_de,conv_tol);
             }
             if stop_on_conv{
                 break;
@@ -824,8 +856,8 @@ pub fn evgw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,iter_rounds:usize,
         }
     }
     if !converged && iter_rounds>0{
-        println!("WARNING: evGW did not reach conv_tol={:.4e} Ha within {} round(s); last max|dE_qp|={:.4e} Ha, |dG|={:.4e}.",
-                 conv_tol,iter_rounds,last_residual,last_dg);
+        println!("WARNING: {} did not reach conv_tol={:.4e} Ha within {} round(s); last max|dE_qp|={:.4e} Ha, |dG|={:.4e}.",
+                 mode_name,conv_tol,iter_rounds,last_residual,last_dg);
         println!("         Consider reducing evgw_damping, keeping evgw_diis = true (solver=\"diis\"; for solver=\"z_update\" DIIS does not apply), or increasing evgw_rounds.");
     }
     let final_qp=scf_data.gwqp.0.clone();
@@ -966,10 +998,22 @@ enum EvgwUpdate {
 }
 
 fn evgw_update_kind(qp_ctrl: &crate::ctrl_io::quasiparticle_methods::QuasiParticle) -> EvgwUpdate {
-    if qp_ctrl.scgw != "evgw" {
+    if qp_ctrl.scgw != "evgw" && qp_ctrl.scgw != "evgw0" {
         return EvgwUpdate::Root;
     }
     match qp_ctrl.evgw_solver.to_lowercase().as_str() {
+        // `auto` keeps the historical evGW rule (MolGW's single evaluation)
+        // and selects the Z-damped step for evGW0.  The latter is markedly more
+        // stable when a deep core is inside the GW window: a single evaluation
+        // or a full root solve can jump between self-energy roots for the
+        // valence orbitals, whereas the Z-damped step converges monotonically.
+        "auto" => {
+            if qp_ctrl.scgw == "evgw0" {
+                EvgwUpdate::ZStep
+            } else {
+                EvgwUpdate::PlainEval
+            }
+        }
         "z_update" | "z-update" | "zupdate" => EvgwUpdate::ZStep,
         "molgw" | "molgw_update" | "plain_eval" | "eval" => EvgwUpdate::PlainEval,
         _ => EvgwUpdate::Root,
@@ -1698,7 +1742,8 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
     // window are written back unchanged and never enter the self-consistent
     // loop.  Extrapolating them instead (REST) makes their rigid shift a slow
     // feedback channel into G and W.
-    let freeze_outside = qp_ctrl.evgw_freeze_outside && qp_ctrl.scgw == "evgw";
+    let freeze_outside = qp_ctrl.evgw_freeze_outside
+        && (qp_ctrl.scgw == "evgw" || qp_ctrl.scgw == "evgw0");
     let baseline = &scf_data.eigenvalues[0];
     for i in 0 .. calc_orbs[0].0{
         gwqp.push(if freeze_outside {baseline[i]} else {baseline[i]+occ_shift})

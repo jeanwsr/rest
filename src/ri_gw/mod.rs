@@ -94,6 +94,9 @@ pub fn gw_main(scf_data:&mut SCF,vxc_nn:&Vec<f64>,mpi_operator:&Option<MPIOperat
         }else if scgw=="evgw"{
             println!("You are doing evGW calculations of entire energy spectrum");
             scgw::evgw(scf_data,20,&vxc_nn,qp_ctrl.evgw_rounds,&mut gw_ctx)
+        }else if scgw=="evgw0"{
+            println!("You are doing evGW0 calculations (W frozen at the G0W0 level)");
+            scgw::evgw0(scf_data,20,&vxc_nn,qp_ctrl.evgw_rounds,&mut gw_ctx)
         }else if scgw=="g0w0"&&renormalized_singles==true{
             scgw::g0w0(scf_data,20,&vxc_nn,true,&mut gw_ctx)
         }else{panic!("invalid expression for scgw!")};

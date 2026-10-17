@@ -99,10 +99,15 @@ pub struct QuasiParticle {
     pub bse_exchange_rescaling:f64,
     pub save_bse_excitations:bool,
     pub evgw_rounds:usize,
-    /// Which solver is used for the evGW outer loop (eigenvalue
+    /// Which solver is used for the evGW / evGW0 outer loop (eigenvalue
     /// self-consistency on the quasiparticle energies).
     ///
-    /// * `"molgw"` (default): MolGW's `GnWn` (EVSC) rule -- a *single*
+    /// * `"auto"` (default): keep the historical evGW rule (`"molgw"`) for
+    ///   `scgw = "evgw"`, and select the more robust `"z_update"` rule for
+    ///   `scgw = "evgw0"`.  The Z-damped step avoids the self-energy root jumps
+    ///   that a single evaluation or a full root solve can show when a deep
+    ///   core level is inside the GW window.
+    /// * `"molgw"`: MolGW's `GnWn` (EVSC) rule -- a *single*
     ///   evaluation `E_out = consts + Sigma_c(E_in)` at the previous
     ///   quasiparticle energy, with no root solve and no damping (`Z = 1`).
     ///   This is the branch MolGW really executes: `selfenergy_init` sets
@@ -636,7 +641,7 @@ impl Default for QuasiParticle {
             gw:false,
             save_bse_excitations:false, 
             evgw_rounds:0,
-            evgw_solver:String::from("molgw"),
+            evgw_solver:String::from("auto"),
             evgw_damping:1.0,
             evgw_diis:true,
             evgw_diis_space:8,
@@ -1272,12 +1277,14 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.evgw_solver = match tmp_ctrl.get("evgw_solver").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => {
                     match s.to_lowercase().as_str() {
+                        "auto" => String::from("auto"),
                         "z_update" | "z-update" | "zupdate" => String::from("z_update"),
                         "molgw" | "molgw_update" | "plain_eval" | "eval" => String::from("molgw"),
-                        _ => String::from("molgw"),
+                        "diis" | "root" | "newton" => String::from("diis"),
+                        _ => String::from("auto"),
                     }
                 },
-                _ => String::from("molgw"),
+                _ => String::from("auto"),
             };
             tmp_input.evgw_damping = match tmp_ctrl.get("evgw_damping").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(1.0_f64)},

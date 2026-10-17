@@ -416,8 +416,9 @@ GW计算通过 `gw_or_bse = "gw"` 启动（也内置于 `"bse"` 模式中）。
     - 缺省为 `"no gw"`。
 - `scgw`: 取值String，决定GW的自洽方案。可选项：
     - `"g0w0"`（缺省）：单次GW计算，不做自洽迭代。
-    - `"evgw"`：本征值自洽GW（evGW），迭代更新准粒子能量中的G部分。需配合 `evgw_rounds` 设置迭代次数。
-- `evgw_rounds`: 取值usize，evGW自洽迭代的轮数（上限）。仅在 `scgw = "evgw"` 时需要设置。缺省为0。
+    - `"evgw"`：本征值自洽GW（evGW），每轮用更新后的准粒子能量同时重建 G 和 W。需配合 `evgw_rounds` 设置迭代次数。
+    - `"evgw0"`：本征值自洽 G0W0（evGW0），每轮只把更新后的准粒子能量用于 G，**W 固定为初始 G0W0 水平**（初值为 KS 能量；若 `w_rs = true` 则为 RS 能量）。同样使用 `evgw_rounds`、`evgw_solver`、`evgw_damping`、`evgw_diis` 等外循环控制。
+- `evgw_rounds`: 取值usize，evGW/evGW0 自洽迭代的轮数（上限）。仅在 `scgw = "evgw"` 或 `"evgw0"` 时需要设置。缺省为0。
 
 #### evGW 外循环收敛控制
 
@@ -425,14 +426,17 @@ evGW 的本质是对映射 `E^(k+1) = F(E^(k))`（`F` = 一轮完整 GW）做不
 
 REST 提供**两种可选的 evGW 求解技巧**，由 `evgw_solver` 选择：
 
-- `evgw_solver`: 取值String，evGW 外循环求解技巧。
-    - `"molgw"`（缺省）：**MolGW 实际执行的更新规则**——每个轨道每轮只做**一次求值**
+- `evgw_solver`: 取值String，evGW/evGW0 外循环求解技巧。
+    - `"auto"`（缺省）：`scgw = "evgw"` 时使用 `"molgw"`；`scgw = "evgw0"` 时使用 `"z_update"`。evGW0 中芯层通常位于 GW 窗口内，单次求值或完整求根可能在价层轨道上跳到不同的自能根；Z 阻尼步更稳定。
+    - `"molgw"`：**MolGW 实际执行的更新规则**——每个轨道每轮只做**一次求值**
       `E_out = consts + Σ_c(E_in)`（`Z ≡ 1`，不求根、不阻尼）。MolGW 的 `selfenergy_init` 对 `EVSC` 技术只设 `se%nomega = 0`，所以 `find_qp_energy_linearization` 里的 Z 分支是死代码；MolGW 的输出表逐位验证了 `E_qp = E0 + SigX−Vxc + SigC`（`E0` 恒为 KS 能量）。**每轮不在循环内求解准粒子方程**是消除 REST 对粗糙低秩实轴网格的敏感性、以及消除"卫星根跳变"的关键。实测（20 组独立运行）：NH3 5/5、CH4 5/5、CO2 5/5 收敛。
     - `"diis"`：每轮做一次完整 GW 迭代（逐轨道精确求解准粒子方程），再对整条准粒子能量矢量做 **Pulay/DIIS（Anderson）外推**（PySCF 的做法）。实测对 CO2 只有 1/5 收敛，故不再是缺省。
     - `"z_update"`：Z 阻尼（线性化牛顿）单步更新，每个轨道每轮只走一步
-      `E_out = E_in + Z · (consts + Σ_c(E_in) − E_in)`，其中 `Z = 1/(1 − ∂Σ_c/∂ω)` 并被截断到 [0, 1]（对应 MolGW `m_selfenergy_tools.f90` 中 `find_qp_energy_linearization` 的 `MIN(MAX(zz,0),1)` 分支）。使用该选项时不再施加 DIIS。
+      `E_out = E_in + Z · (consts + Σ_c(E_in) − E_in)`，其中 `Z = 1/(1 − ∂Σ_c/∂ω)` 并被截断到 [0, 1]（对应 MolGW `m_selfenergy_tools.f90` 中 `find_qp_energy_linearization` 的 `MIN(MAX(zz,0),1)` 分支）。`evgw_diis = true` 时仍可在其上叠加 DIIS。
     - `"molgw"`：MolGW 的 evGW 实际执行的更新规则——每个轨道每轮只做一次求值
       `E_out = consts + Σ_c(E_in)`（即 `E_in + 1.0 · (consts + Σ_c(E_in) − E_in)`，`Z ≡ 1`）。
+
+evGW0 的默认 `evgw_solver = "auto"` 选择 `"z_update"`：在包含芯层的 GW 窗口中，单次求值或完整求根可能在价层轨道上跳到不同的自能根，而 Z 阻尼步能稳定收敛。实测（cc-pVDZ，scan，`evgw_conv_tol = 1e-5 Ha`，`evgw_diis = true`）：H2O 4 轮、CH4 4 轮、CO2 10 轮、NH3（芯层纳入窗口的 CVS 计算）12 轮。
 
 - `evgw_freeze_outside`: 取值bool，缺省 `true`。evGW 中如何处理精确计算窗口之外的轨道：
     - `true`（缺省，MolGW 行为）：让它们保持初始（Kohn–Sham）能量，与 MolGW 一致——MolGW 的 `find_qp_energy_linearization` 先把 `energy_qp_z = energy0` 初始化，只覆盖 `nsemin..nsemax`，窗口外的态原样写回，从而**完全不参与自洽循环**。REST 的刚性外推会让这些态的能量每轮都被重新推导，构成一条额外的慢反馈通道（进入 G 的极点与 W 的分母）。

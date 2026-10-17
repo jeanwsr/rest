@@ -113,6 +113,11 @@ impl GwCheckpointStage {
 #[derive(Clone)]
 pub struct GwCheckpointState {
     pub stage: GwCheckpointStage,
+    /// The `scgw` mode that produced this archive (`"g0w0"`, `"evgw"` or
+    /// `"evgw0"`).  Used to reject resuming an interrupted evGW archive with a
+    /// different self-consistency mode: evGW and evGW0 archive different W
+    /// vectors, so mixing them would silently use the wrong screening.
+    pub scgw_mode: String,
     /// Number of completed evGW rounds (0 for a plain G0W0 checkpoint).
     pub rounds_done: usize,
     /// `evgw_rounds` that was in effect when the archive was written.
@@ -147,6 +152,13 @@ impl GwCheckpointState {
     pub fn from_scf(scf_data: &SCF) -> Self {
         GwCheckpointState {
             stage: GwCheckpointStage::GwFinished,
+            scgw_mode: scf_data
+                .mol
+                .ctrl
+                .quasiparticle_methods
+                .as_ref()
+                .map(|qp| qp.scgw.clone())
+                .unwrap_or_else(|| String::from("g0w0")),
             rounds_done: 0,
             total_rounds: 0,
             converged: false,
@@ -507,6 +519,7 @@ pub fn save_gw_checkpoint(scf_data: &SCF, state: &GwCheckpointState) -> Result<(
         write_string(&meta, "scf_type", scf_type_as_str(state.scf_type))?;
         write_string(&meta, "basis_path", &state.basis_path)?;
         write_string(&meta, "auxbas_path", &state.auxbas_path)?;
+        write_string(&meta, "scgw_mode", &state.scgw_mode)?;
 
         // ---- arrays the chkfile does not store ----
         // MO energies / coefficients / occupations are already in the chkfile
@@ -684,6 +697,14 @@ pub fn load_gw_checkpoint(scf_data: &mut SCF) -> Result<GwCheckpointState> {
     let scf_type = scf_type_from_str(&read_string(&meta, "scf_type")?)?;
     let basis_path = read_string(&meta, "basis_path")?;
     let auxbas_path = read_string(&meta, "auxbas_path")?;
+    // Archives written before evGW0 existed have no `scgw_mode`; they can only
+    // have come from evGW (the only self-consistent mode then), so default to
+    // that rather than rejecting them.
+    let scgw_mode = if meta.dataset("scgw_mode").is_ok() {
+        read_string(&meta, "scgw_mode")?
+    } else {
+        String::from("evgw")
+    };
 
     let mismatch = |what: &str, saved: String, current: String| -> anyhow::Error {
         anyhow!(
@@ -901,6 +922,7 @@ pub fn load_gw_checkpoint(scf_data: &mut SCF) -> Result<GwCheckpointState> {
 
     let state = GwCheckpointState {
         stage,
+        scgw_mode,
         rounds_done,
         total_rounds,
         converged,
@@ -1101,6 +1123,7 @@ mod tests {
         let loaded = load_gw_checkpoint(&mut target).expect("the checkpoint must load");
 
         assert_eq!(loaded.stage, GwCheckpointStage::EvgwRound);
+        assert_eq!(loaded.scgw_mode, state.scgw_mode);
         assert_eq!(loaded.rounds_done, 3);
         assert_eq!(loaded.total_rounds, 10);
         assert!(!loaded.converged);
