@@ -1618,8 +1618,24 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
     let e_homo=ks_energies[occ_size-1];
     let e_lumo=ks_energies[occ_size];
 
+    // evGW0 freezes W, so its low-rank representation can be built once and
+    // reused in every outer round.  The same cache also guarantees that the
+    // frozen W is interpolated on exactly the same real-axis grid each round.
+    let lowrank_evgw0_cache_enabled =
+        qp_ctrl.scgw == "evgw0" && qp_ctrl.use_low_rank_contour && imag_lr_enabled;
+    let mut cached_w = if lowrank_evgw0_cache_enabled {
+        gw_ctx.evgw0_lowrank_cache.clone()
+    } else {
+        None
+    };
+    if cached_w.is_some() {
+        println!("evGW0: reusing the cached low-rank W representation (imaginary- and real-axis).");
+    }
+
     let t_wclr = Instant::now();
-    let w_c_lr: Option<Vec<(f64, f64, ri_gw::LowRankVChiV)>> = if qp_ctrl.use_low_rank_contour && imag_lr_enabled {
+    let mut w_c_lr: Option<Vec<(f64, f64, ri_gw::LowRankVChiV)>> = if cached_w.is_some() {
+        None
+    } else if qp_ctrl.use_low_rank_contour && imag_lr_enabled {
         println!("Low-rank contour (v2): Generating imaginary-axis low-rank sqrt(v)*chi*sqrt(v)...");
         Some(ri_gw::generate_w_c_lowrank(
             scf_data, ri_ov.as_ref().unwrap(), &scf_data.gwqp.1,
@@ -1628,13 +1644,24 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
     } else {
         None
     };
-    println!("Imaginary-axis W_c low-rank: {} nodes in {:.2} s", num_freq, t_wclr.elapsed().as_secs_f64());
+    if cached_w.is_none() {
+        println!("Imaginary-axis W_c low-rank: {} nodes in {:.2} s", num_freq, t_wclr.elapsed().as_secs_f64());
+    }
 
     // Precompute low-rank real-axis v*chi*v if enabled
-    let real_axis_vchiv: Option<ri_gw::RealAxisVChiV> = if qp_ctrl.use_low_rank_contour {
+    let mut real_axis_vchiv: Option<ri_gw::RealAxisVChiV> = if cached_w.is_some() {
+        None
+    } else if qp_ctrl.use_low_rank_contour {
         println!("Low-rank contour: Precomputing real-axis sqrt(v)*chi*sqrt(v)...");
         let gwqp_g = scf_data.gwqp.0.clone();
         let gwqp_w = scf_data.gwqp.1.clone();
+        // In evGW0 W is frozen, so the real-axis grid that represents W must
+        // not move with the iterated G energies.  Sizing it from the frozen
+        // W energy vector (the initial G0W0 energies) keeps the entire W
+        // representation fixed across rounds; otherwise the same W would be
+        // re-interpolated on a slightly different grid every iteration and
+        // the fixed point would depend on the G trajectory.
+        let gwqp_g_grid = if qp_ctrl.scgw == "evgw0" { &gwqp_w } else { &gwqp_g };
         let (start_mo_2,num_state_2,occ_size_2,vir_size_2,homo_2,lumo_2)=ri_gw::get_occupation_parameters(&scf_data,'Y');
         // Range of states used by the `de_max` scan that sizes the real-axis grid.
         //
@@ -1666,7 +1693,7 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
         let t_ra = Instant::now();
         let ra_out = {
             let mut ra = ri_gw::generate_real_axis_vchiv(
-            &gwqp_g, &gwqp_w, occ_size_2, vir_size_2, num_state_2,
+            gwqp_g_grid, &gwqp_w, occ_size_2, vir_size_2, num_state_2,
             ri_ov.as_ref().unwrap(),
             qp_ctrl.nomega_chi_real,
             nsemin_demax, nsemax_demax,
@@ -1688,6 +1715,35 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
         None
     };
 
+    // On the first evGW0 round move the freshly built W data into the cache;
+    // later rounds reuse it.  The references below also cover the non-evGW0
+    // low-rank path, where the owned options are used directly.
+    if lowrank_evgw0_cache_enabled && cached_w.is_none() {
+        let w_c = w_c_lr
+            .take()
+            .expect("evGW0 low-rank cache: missing imaginary-axis W_c");
+        let ra = real_axis_vchiv
+            .take()
+            .expect("evGW0 low-rank cache: missing real-axis v*chi*v");
+        let cache = std::sync::Arc::new(ri_gw::Evgw0LowRankW {
+            w_c_lr: w_c,
+            real_axis_vchiv: ra,
+        });
+        gw_ctx.evgw0_lowrank_cache = Some(cache.clone());
+        cached_w = Some(cache);
+        println!("evGW0: cached the low-rank W representation for all outer rounds.");
+    }
+    let w_c_lr_ref: Option<&Vec<(f64, f64, ri_gw::LowRankVChiV)>> = if let Some(cache) = &cached_w {
+        Some(&cache.w_c_lr)
+    } else {
+        w_c_lr.as_ref()
+    };
+    let real_axis_ref: Option<&ri_gw::RealAxisVChiV> = if let Some(cache) = &cached_w {
+        Some(&cache.real_axis_vchiv)
+    } else {
+        real_axis_vchiv.as_ref()
+    };
+
     // [DBG] KS-eigenvalue diagnostics (electron count / homo / window), only at print_level >= 2
     if scf_data.mol.ctrl.print_level >= 2 {
         println!("[DBG KS] occ_size={} start_mo={} num_state={} e_homo={:.12e} e_lumo={:.12e}", occ_size, start_mo, num_state, e_homo, e_lumo);
@@ -1702,11 +1758,11 @@ pub fn gw_near_fermi_surface(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,o
     // the full naux×nov ri_ov is not read in the orbital loop. Drop it (free the
     // N³ resident) before entering the loop. Only the v0 path (contour_rayon
     // builds response matrices from ri_ov) keeps it alive.
-    let calc_orbs:Vec<(usize,f64)>=if let Some(ref ra) = real_axis_vchiv {
+    let calc_orbs:Vec<(usize,f64)>=if let Some(ra) = real_axis_ref {
         drop(ri_ov);
         calc_orbs_indices.iter().map(|&n|{
             let ri_row_n=route.ri_row(scf_data,n);
-            if let Some(ref wlr) = w_c_lr {
+            if let Some(wlr) = w_c_lr_ref {
                 // v2 path: imaginary-axis low-rank with pre-computed wc_rows.
                 let wc_rows = ri_gw::precompute_wc_rows_lowrank(wlr, &ri_row_n, num_state);
                 (n, single_orbital_gw_lowrank_v2(scf_data, &v_matrix, &ri_row_n, &wc_rows, ra, n, num_freq, vxc_nn[n]))

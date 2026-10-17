@@ -1144,6 +1144,21 @@ pub struct GwTensorRoute {
 #[derive(Default)]
 pub struct GwContext {
     ao_plan: Option<Arc<tensor_ao::GwAoPlan>>,
+    /// Cached W representation for `scgw = "evgw0"` with
+    /// `use_low_rank_contour = true`.
+    ///
+    /// evGW0 keeps the W energy vector fixed, so the expensive low-rank W
+    /// construction (imaginary-axis W_c and the real-axis `v*chi*v` grid) is
+    /// identical in every outer round.  Building it once and reusing it both
+    /// saves the repeated grid diagonalisations and guarantees that the
+    /// frozen W is represented on exactly the same grid in all rounds.
+    pub evgw0_lowrank_cache: Option<Arc<Evgw0LowRankW>>,
+}
+
+/// Low-rank W data reused across all evGW0 outer rounds.
+pub struct Evgw0LowRankW {
+    pub w_c_lr: Vec<(f64, f64, LowRankVChiV)>,
+    pub real_axis_vchiv: RealAxisVChiV,
 }
 
 impl GwContext {

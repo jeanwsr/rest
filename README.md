@@ -438,6 +438,8 @@ REST 提供**两种可选的 evGW 求解技巧**，由 `evgw_solver` 选择：
 
 evGW0 的默认 `evgw_solver = "auto"` 选择 `"z_update"`：在包含芯层的 GW 窗口中，单次求值或完整求根可能在价层轨道上跳到不同的自能根，而 Z 阻尼步能稳定收敛。实测（cc-pVDZ，scan，`evgw_conv_tol = 1e-5 Ha`，`evgw_diis = true`）：H2O 4 轮、CH4 4 轮、CO2 10 轮、NH3（芯层纳入窗口的 CVS 计算）12 轮。
 
+evGW0 也支持 `use_low_rank_contour = true` 的低秩轮廓变形 GW 框架。由于 W 固定，低秩 W 表示（虚轴 W_c 与实轴 `v*chi*v`）只在第一轮构建一次，后续轮次复用；实轴网格也固定用冻结的 W 能量来定尺寸，不会随 G 迭代移动。**注意**：当芯层进入 GW 窗口时 `de_max` 可达 ~16 Ha（约 434 eV），实轴网格需要足够密才能分辨芯层/价层极点。NH3/N 1s 的实测：`nomega_chi_real = 1024` 时低秩 evGW0 与完整（非低秩）evGW0 的芯层 QP 差约 0.07 mHa、价层 HOMO 差约 1.6 mHa；`nomega_chi_real = 256` 时价层误差可达 ~24 mHa。低秩 evGW0 的 CVS 最低激发在 n=1024 下与完整 evGW0 相差约 0.07 mHa。
+
 - `evgw_freeze_outside`: 取值bool，缺省 `true`。evGW 中如何处理精确计算窗口之外的轨道：
     - `true`（缺省，MolGW 行为）：让它们保持初始（Kohn–Sham）能量，与 MolGW 一致——MolGW 的 `find_qp_energy_linearization` 先把 `energy_qp_z = energy0` 初始化，只覆盖 `nsemin..nsemax`，窗口外的态原样写回，从而**完全不参与自洽循环**。REST 的刚性外推会让这些态的能量每轮都被重新推导，构成一条额外的慢反馈通道（进入 G 的极点与 W 的分母）。
 - `evgw_z_step`: 取值f64，单位Hartree。`z_update` 中用于计算 `∂Σ_c/∂ω` 的中心差分步长。缺省 `0.01`（与 MolGW `step_sigma` 的缺省一致）。
