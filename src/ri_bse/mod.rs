@@ -30,6 +30,7 @@ pub mod matvec_trace;
 pub mod dynamicbse;
 pub mod pysoc_export;
 pub mod bse_grad;
+pub mod cvs;
 
 
 #[cfg(target_os = "linux")]

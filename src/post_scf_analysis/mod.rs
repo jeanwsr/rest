@@ -380,6 +380,13 @@ fn precompute_vxc_and_release_grid_ao(scf_data: &mut SCF) -> ri_gw::gw_grad::GwV
 pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>) -> crate::ri_bse::BseOutput {
     let qp_ctrl=scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
     let output_type=qp_ctrl.gw_or_bse.clone();
+    // `"cvs bse"` is the documented spelling; accept the underscore/dash
+    // variants as a convenience.  Matching is case-insensitive.
+    let normalized_output_type = output_type.trim().to_lowercase();
+    let is_cvs_bse = matches!(
+        normalized_output_type.as_str(),
+        "cvs bse" | "cvs_bse" | "cvs-bse"
+    );
     let mut bse_output = crate::ri_bse::BseOutput {
         first_excitation: None,
         excitation_energies: Vec::new(),
@@ -469,6 +476,31 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
         }
         scf_data.prepare_bse_integrals(mpi_operator);
         bse_output = ri_bse::bse_main(scf_data);
+    }else if is_cvs_bse {
+        // Core-valence separated BSE.  The GW stage is the ordinary one, except
+        // that the extrapolated-window thresholds are widened so the core
+        // quasiparticle energies are computed explicitly rather than rigidly
+        // shifted from the valence window.
+        if gw_already_done {
+            // restored from the checkpoint: GW is not recomputed
+        } else {
+            ri_bse::cvs::prepare_cvs_gw(scf_data);
+            // Re-read the (possibly widened) control block.
+            let qp_ctrl_cvs = scf_data.mol.ctrl.quasiparticle_methods.clone().unwrap();
+            if qp_ctrl_cvs.gw_scheme == "parse from file" {
+                let parse_qp_path = qp_ctrl_cvs.parse_qp_path.clone();
+                scf_data.gwqp.0 = ri_gw::read_floats(&parse_qp_path)
+                    .expect("Failure when reading from GW QP energies file!");
+            } else {
+                let vxc_nn = ri_gw::vxc_ao2mo(scf_data);
+                ri_gw::gw_main(scf_data, &vxc_nn, mpi_operator);
+            }
+        }
+        if !gw_already_done {
+            crate::fileop::gw_checkpoint::save_gw_finished_checkpoint(scf_data);
+        }
+        scf_data.prepare_bse_integrals(mpi_operator);
+        bse_output = ri_bse::cvs::cvs_bse_main(scf_data);
     }else if output_type.eq("response_bse"){
         if gw_already_done {
             // restored from the checkpoint: GW is not recomputed

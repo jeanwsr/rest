@@ -407,7 +407,7 @@ GW-BSE方法相关的设置在 `[quasiparticle_methods]` 区块中进行。GW计
 
 GW计算通过 `gw_or_bse = "gw"` 启动（也内置于 `"bse"` 模式中）。
 
-- `gw_or_bse`: 取值String，必须参数。设置为 `"gw"` 开启GW准粒子能量计算，设置为 `"bse"` 在自动完成GW计算后进一步进行BSE激发能计算（当配合 `gw_scheme = "parse from file"` 时，BSE从文件读取预先计算的准粒子能量而不重新计算GW）。缺省为空，不触发任何计算。
+- `gw_or_bse`: 取值String，必须参数。设置为 `"gw"` 开启GW准粒子能量计算，设置为 `"bse"` 在自动完成GW计算后进一步进行BSE激发能计算，设置为 `"cvs bse"` 进行**芯层激发**的core-valence separation（CVS）BSE计算（同样自动完成所需的GW计算）。当配合 `gw_scheme = "parse from file"` 时，BSE从文件读取预先计算的准粒子能量而不重新计算GW。缺省为空，不触发任何计算。
 - `gw_scheme`: 取值String，决定GW准粒子方程的求解方式。可选项：
     - `"extrapolated"`（**推荐**）：在费米面附近一定能量窗口内精确求解准粒子方程，其余轨道通过外推获得。兼备高效率与准确性，适合大多数体系。
     - `"linearize"`：线性化GW准粒子方程，对所有轨道逐一求解。
@@ -559,6 +559,48 @@ BSE计算在 `gw_or_bse = "bse"` 时进行，在GW准粒子能量（或从文件
 - `davidson_max_iter`: 取值usize，Davidson最大迭代次数。缺省为20。
 - `davidson_maximum_subspace_size`: 取值usize，Davidson最大子空间维度倍数。实际最大子空间 = max(目标激发数 × 此值, 最小维度)。缺省为2。
 - `davidson_restart_dimensions`: 取值usize，Davidson重启动维度。当子空间达到上限后，收缩至此数量的近似特征向量后再继续扩张。缺省为5。
+
+### Core-Valence Separation（CVS）BSE：芯层激发
+
+`gw_or_bse = "cvs bse"` 触发 CVS-BSE。它与普通 BSE 的区别是：跃迁空间只保留**芯层占据轨道 → 虚轨道**的激发，丢弃芯层与价层激发之间的耦合；屏蔽相互作用 `W` 默认仍由**全部占据轨道**的极化率构建（与普通 BSE 完全一致），因此 CVS 引入的误差仅来自被丢弃的芯-价耦合，通常对最低芯层激发只有几 meV 到几十 meV。
+
+CVS 计算会自动做两件事：
+
+1. 在 GW 阶段把 `gw_scheme = "extrapolated"` 的占据窗口自动加宽到包含所有芯层轨道（否则芯层 QP 能量只会从价层窗口刚性外推）。芯层轨道必须位于 `start_mo = 0` 的窗口内，因此 CVS 要求 `frozen_core_postscf = 0`。
+2. 用芯层 QP 能量与虚轨道 QP 能量构造 CVS 的 `A`/`B` 矩阵，并按 `bse_tda` 选择 TDA 或完整 BSE 求解。
+
+当使用 `gw_scheme = "parse from file"` 时，`parse_qp_path` 指向的文件必须同时包含芯层和虚轨道的准粒子能量（按 `scf_data.gwqp.0` 的完整轨道顺序）；否则 CVS 对角项会使用错误的芯层 QP 能量。
+
+CVS 专用关键词：
+
+- `cvs_ncore`: 取值usize，CVS 芯层占据轨道数（按能量从低到高，轨道 `0..cvs_ncore`）。缺省 `0` 表示自动检测。
+- `cvs_core_energy_max`: 取值f64，单位Hartree。`cvs_ncore = 0` 时，KS/RS 能量低于该值的占据轨道被判定为芯层。缺省 `-10.0`（可选中第一、二周期元素的 1s 芯层，排除 2s/2p 价层）。
+- `cvs_screening`: 取值String。`"full"`（缺省）用全部占据轨道构建屏蔽；`"core"` 只用芯层占据轨道构建屏蔽（诊断用，数值会与 `"full"` 有可见差别）。
+- `cvs_nroots`: 取值usize，报告的 CVS 根数。缺省 `0`：dense 求解报告全部根，Davidson 报告 `davidson_target_excitations` 个根。
+- `cvs_eigenvalue_min` / `cvs_eigenvalue_max`: 取值f64，单位Hartree。CVS 根的筛选窗口，缺省 `[0, 1e30]`。**注意**：芯层激发能量通常为几十到几百 eV（数 Hartree 到十几 Hartree），不要沿用普通 BSE 的 `[0, 0.5] Ha` 窗口。
+- `bse_spin`、`bse_tda`、`bse_davidson_solver`、`davidson_*`、`bse_cutoff_energy`、`save_bse_terms` 等关键词与普通 BSE 共用。`bse_spin = "none"` 在 CVS 中按单重态处理。
+
+CVS 输入卡示例（NH3 的 N 1s 芯层激发）：
+
+```toml
+[quasiparticle_methods]
+gw_or_bse = "cvs bse"
+gw_scheme = "extrapolated"
+scgw = "g0w0"
+cvs_ncore = 1
+cvs_screening = "full"
+bse_spin = "singlet"
+bse_tda = true
+bse_davidson_solver = true
+davidson_target_excitations = 5
+cvs_nroots = 5
+```
+
+输出中每条 CVS 根都会给出总激发能（Ha 与 eV）、振子强度，以及占主导的 `#i -> #a` 芯层跃迁（`#i` 为绝对轨道编号）。
+
+验证（NH3/cc-pVDZ，N 1s）：CVS dense 与 matrix-free Davidson 的根一致到 `~1e-13 Ha`；在相同的 QP 能量下，CVS 最低几个芯层根与包含全部占据轨道的普通 BSE 对应根相差 `~0.2–0.4 mHa`（约 5–11 meV），即 CVS 丢弃芯-价耦合所带来的误差。
+
+> **芯层 QP 与 static fallback**：芯层轨道的 `|E_KS|` 通常大于 `gw_switch_fallback_threshold`（缺省 1 Ha），因此 CVS 的芯层 QP 能量默认自动走 REST 已有的 on-shell static fallback（在 KS 能量处求值自能），而不是完整求解准粒子方程。对 NH3/N 1s 的观察：static fallback 给出 `E_core^QP = -14.981 Ha`，完整求根给出 `-14.649 Ha`，收敛的 evGW 给出 `-15.025 Ha`；对应的 CVS 最低激发能为 403.72 eV（static）、394.68 eV（完整求根）、404.93 eV（evGW）。static fallback 明显更接近 evGW。由于 CVS kernel 和激子束缚能不由芯层 QP 能量决定，这三种处理对 CVS 激发能的影响基本是芯层能级的整体平移（束缚能约 0.322 Ha，几乎不变）。把 `gw_switch_fallback_threshold` 调到大于芯层 `|E_KS|` 可关闭该 on-shell 处理，设为 0 则会强制所有轨道（含近 frontier 虚轨道）都走 static fallback。
 
 ### GW输入卡示例
 

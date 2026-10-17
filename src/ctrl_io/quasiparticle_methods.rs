@@ -52,6 +52,38 @@ pub struct QuasiParticle {
     ///   `"triplet"` / `"both"` are rejected (see `bse_main_unrestricted`).
     pub bse_spin:String,
     pub bse_cutoff_energy:f64,
+    // ---- core-valence separated (CVS) BSE --------------------------------
+    // Triggered by `gw_or_bse = "cvs bse"`.  See `ri_bse::cvs` for the method.
+    /// Number of lowest occupied orbitals treated as the CVS core.
+    ///
+    /// `0` (default) selects the core automatically: every occupied orbital
+    /// whose Kohn-Sham energy is below `cvs_core_energy_max` is included.
+    /// A positive value pins the count explicitly (orbitals `0..cvs_ncore`,
+    /// in the usual energy ordering of `scf_data.eigenvalues[0]`).
+    pub cvs_ncore:usize,
+    /// Energy threshold (Ha) used to detect core orbitals when
+    /// `cvs_ncore = 0`.  A level is core when `e_i < cvs_core_energy_max`.
+    /// The default `-10.0 Ha` selects 1s cores of first- and second-row
+    /// elements while excluding valence 2s/2p (and hydrogen 1s) levels.
+    pub cvs_core_energy_max:f64,
+    /// Screened interaction used inside the CVS kernel.
+    ///
+    /// * `"full"` (default): build the inverse dielectric from **all**
+    ///   occupied orbitals, exactly as the ordinary BSE does.  Core
+    ///   excitations then feel the same screening as the full calculation.
+    /// * `"core"`: build it from the CVS core orbitals only (a stricter
+    ///   core-valence-separated screening; mainly a diagnostic).
+    pub cvs_screening:String,
+    /// Number of CVS roots to report.  `0` (default) reports every root for
+    /// the dense solver, and `davidson_target_excitations` roots for the
+    /// Davidson solver.
+    pub cvs_nroots:usize,
+    /// Optional eigenvalue window (Ha) used to filter the dense CVS roots.
+    /// The default `[0, 1e30]` keeps every physical (positive) root, so core
+    /// excitations (tens to hundreds of eV) are never silently discarded by
+    /// the ordinary BSE default window `[0, 0.5] Ha`.
+    pub cvs_eigenvalue_min:f64,
+    pub cvs_eigenvalue_max:f64,
     pub save_bse_terms:bool,
     pub obtain_vx_vc_terms:bool,
     pub obtain_pure_exchange:bool,
@@ -584,6 +616,12 @@ impl Default for QuasiParticle {
             print_nto:false,
             bse_spin:String::from("none"),
             bse_cutoff_energy:1000000.0,
+            cvs_ncore:0,
+            cvs_core_energy_max:-10.0,
+            cvs_screening:String::from("full"),
+            cvs_nroots:0,
+            cvs_eigenvalue_min:0.0,
+            cvs_eigenvalue_max:1.0e30,
             save_bse_terms:false,
             obtain_vx_vc_terms:false,
             obtain_pure_exchange:false,
@@ -760,6 +798,12 @@ impl QuasiParticle {
         table.insert("bse_tda".to_string(), toml::Value::Boolean(self.bse_tda));
         table.insert("bse_spin".to_string(), toml::Value::String(self.bse_spin.clone()));
         table.insert("bse_cutoff_energy".to_string(), toml::Value::Float(self.bse_cutoff_energy));
+        table.insert("cvs_ncore".to_string(), toml::Value::Integer(self.cvs_ncore as i64));
+        table.insert("cvs_core_energy_max".to_string(), toml::Value::Float(self.cvs_core_energy_max));
+        table.insert("cvs_screening".to_string(), toml::Value::String(self.cvs_screening.clone()));
+        table.insert("cvs_nroots".to_string(), toml::Value::Integer(self.cvs_nroots as i64));
+        table.insert("cvs_eigenvalue_min".to_string(), toml::Value::Float(self.cvs_eigenvalue_min));
+        table.insert("cvs_eigenvalue_max".to_string(), toml::Value::Float(self.cvs_eigenvalue_max));
         table.insert("save_bse_terms".to_string(), toml::Value::Boolean(self.save_bse_terms));
         table.insert("obtain_vx_vc_terms".to_string(), toml::Value::Boolean(self.obtain_vx_vc_terms));
         table.insert("obtain_pure_exchange".to_string(), toml::Value::Boolean(self.obtain_pure_exchange));
@@ -1071,6 +1115,35 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.bse_cutoff_energy = match tmp_ctrl.get("bse_cutoff_energy").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1000000.0_f64)},
                 other => {1000000.0},
+            };
+            tmp_input.cvs_ncore = match tmp_ctrl.get("cvs_ncore").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(0) as usize},
+                serde_json::Value::String(tmp_str) => {tmp_str.trim().parse().unwrap_or(0)},
+                _ => 0,
+            };
+            tmp_input.cvs_core_energy_max = match tmp_ctrl.get("cvs_core_energy_max").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(-10.0)},
+                serde_json::Value::String(tmp_str) => {tmp_str.trim().parse().unwrap_or(-10.0)},
+                _ => -10.0,
+            };
+            tmp_input.cvs_screening = match tmp_ctrl.get("cvs_screening").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.trim().to_lowercase(),
+                _ => String::from("full"),
+            };
+            tmp_input.cvs_nroots = match tmp_ctrl.get("cvs_nroots").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(0) as usize},
+                serde_json::Value::String(tmp_str) => {tmp_str.trim().parse().unwrap_or(0)},
+                _ => 0,
+            };
+            tmp_input.cvs_eigenvalue_min = match tmp_ctrl.get("cvs_eigenvalue_min").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.0)},
+                serde_json::Value::String(tmp_str) => {tmp_str.trim().parse().unwrap_or(0.0)},
+                _ => 0.0,
+            };
+            tmp_input.cvs_eigenvalue_max = match tmp_ctrl.get("cvs_eigenvalue_max").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e30)},
+                serde_json::Value::String(tmp_str) => {tmp_str.trim().parse().unwrap_or(1.0e30)},
+                _ => 1.0e30,
             };
             tmp_input.bse_exchange_rescaling = match tmp_ctrl.get("bse_exchange_rescaling").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0_f64)},
