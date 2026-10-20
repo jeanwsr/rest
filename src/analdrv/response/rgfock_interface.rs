@@ -34,6 +34,7 @@ use crate::dft::numint_matmul::nimatmul::NIMatmul;
 use crate::dft::DFAFamily;
 use crate::ri_jk::gfock_r::RGFockRIJK;
 use crate::ri_jk::util::get_cint_mol;
+use crate::dft::parse_xc::DFAComponent;
 use crate::ri_pt2::rgfock_pt2::RGFockPT2;
 use crate::ri_pt2::PT2FPMode;
 use crate::SCF;
@@ -74,6 +75,30 @@ pub fn dh_xc_func_list(scf_data: &SCF) -> Option<Vec<(f64, LibXCFunctional)>> {
             .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Unpolarized)))
             .collect_vec(),
     )
+}
+
+/// Component-typed door of [`dh_xc_func_list`]/[`crate::analdrv::response::uresp_interface::
+/// dh_xc_func_list_uks`]: builds the `(scale, functional)` list directly from the DFAdef
+/// final-energy components (`xc_nscf`), for either spin. `None` when `xc_nscf` is absent or
+/// carries no libxc component (pure-MP2-family post-SCF methods).
+pub fn dh_xc_func_list_from_components(
+    xc_nscf: Option<&[DFAComponent]>,
+    spin: LibXCSpin,
+) -> Option<Vec<(f64, LibXCFunctional)>> {
+    let components = xc_nscf?;
+    let spin_channel = match spin {
+        LibXCSpin::Unpolarized => 1,
+        LibXCSpin::Polarized => 2,
+    };
+    let list: Vec<_> = components
+        .iter()
+        .filter_map(|comp| comp.to_libxc_functional(spin_channel).map(|func| (comp.factor, func)))
+        .collect_vec();
+    if list.is_empty() {
+        None
+    } else {
+        Some(list)
+    }
 }
 
 /// Solve the Z-vector (CP-SCF) equation for a Lagrangian of the (combined) post-SCF contributions.

@@ -12,6 +12,8 @@ use crate::dft::parse_xc::xc_helper::{ALIAS, AVAIL_FUNC, CODES,
 use crate::dft::parse_xc::dispersion::{check_disp_suffix};
 // use cached::proc_macro::cached;
 use crate::dft::DFA4REST;
+use crate::dft::DFAFamily;
+use libxc::prelude::LibXCFunctional;
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -500,6 +502,24 @@ impl std::ops::Add for DFAComponent {
     
 }
 
+impl DFAComponent {
+    /// `(libxc functional code, scale factor)` of a Libxc component; `None` for the
+    /// non-libxc component types (HF/RSHF/PT2/RPA/SCSRPA/SBGE2/Disp/Unknown).
+    pub fn libxc_code_param(&self) -> Option<(usize, f64)> {
+        match self.component_type {
+            ComponentType::Libxc => Some((self.id, self.factor)),
+            _ => None,
+        }
+    }
+
+    /// Initialized libxc functional of a Libxc component (spin per `spin_channel`:
+    /// 1 = unpolarized, 2 = polarized); `None` for other component types.
+    pub fn to_libxc_functional(&self, spin_channel: usize) -> Option<LibXCFunctional> {
+        self.libxc_code_param()
+            .map(|(code, _factor)| xc_func_init(code, spin_channel))
+    }
+}
+
 #[derive(Clone)]
 pub struct DFAdef {
     pub xc_scf: Option<Vec<DFAComponent>>,
@@ -526,7 +546,9 @@ impl DFAdef {
         }
     }
 
-    pub fn to_dfa4rest(&self) -> DFA4REST {
+    /// Backend shared by [`Self::to_dfa4rest`] and [`Self::to_xc_data`]: the SCF-side
+    /// DFA4REST (libxc components, hybrid, RSH, VV10) with no post-SCF state.
+    fn to_scf_xc_data(&self) -> DFA4REST {
         let mut xc_data = DFA4REST::new_xc(self.spin_channel, 0);
         if let Some(scf_components) = &self.xc_scf {
             for comp in scf_components {
@@ -581,6 +603,11 @@ impl DFAdef {
         } else {
             xc_data.dfa_rsh_scf = None;
         }
+        xc_data
+    }
+
+    pub fn to_dfa4rest(&self) -> DFA4REST {
+        let mut xc_data = self.to_scf_xc_data();
         if let Some(nscf_components) = &self.xc_nscf {
             let mut dfa_compnt_pos = Vec::new();
             let mut dfa_paramr_pos = Vec::new();
@@ -609,6 +636,76 @@ impl DFAdef {
             xc_data.dfa_hybrid_pos = self.dfa_hybrid_nscf;
         }
         xc_data
+    }
+
+    /// Narrowed SCF exc/vxc [`DFA4REST`]: same SCF-side content as [`Self::to_dfa4rest`]
+    /// but carrying no fifth-rung state (`dfa_family_pos`/`dfa_compnt_pos`/`dfa_paramr_pos`/
+    /// `dfa_hybrid_pos`/`dfa_paramr_adv` stay at defaults); the post-SCF definition remains
+    /// in `xc_nscf` and is read through the DFAdef accessors (`family_pos`, `pt2_component`, ...).
+    pub fn to_xc_data(&self) -> DFA4REST {
+        self.to_scf_xc_data()
+    }
+
+    /// The fifth-rung (post-SCF) family carried by the final-energy components
+    /// (`xc_nscf`); `None` for a purely variational SCF functional.
+    pub fn family_pos(&self) -> Option<DFAFamily> {
+        self.xc_nscf
+            .as_ref()?
+            .iter()
+            .find_map(|comp| comp.component_type.to_dfa_family())
+    }
+
+    /// Total exact-exchange coefficient of the final-energy functional (the HF/RSHF
+    /// factors of `xc_nscf`); `None` when the functional has no final-energy part.
+    pub fn hybrid_pos(&self) -> Option<f64> {
+        self.dfa_hybrid_nscf
+    }
+
+    /// `true` when the SCF functional evaluates DFT XC on a grid (has at least one
+    /// libxc component), mirroring `DFA4REST::is_dfa_scf`.
+    pub fn is_dfa_scf(&self) -> bool {
+        self.xc_scf
+            .as_ref()
+            .map_or(false, |comps| comps.iter().any(|comp| comp.component_type == ComponentType::Libxc))
+    }
+
+    /// `true` only for the RPA family (SCSRPA does not count), mirroring `DFA4REST::is_rpa`.
+    pub fn is_rpa(&self) -> bool {
+        matches!(self.family_pos(), Some(DFAFamily::RPA))
+    }
+
+    /// The PT2 component of the final-energy functional, whose `param_positional`
+    /// holds the opposite-spin / same-spin scaling factors `(c_os, c_ss)`.
+    pub fn pt2_component(&self) -> Option<&DFAComponent> {
+        self.xc_nscf
+            .as_ref()?
+            .iter()
+            .find(|comp| comp.component_type == ComponentType::PT2)
+    }
+
+    /// Override the PT2 `(c_os, c_ss)` factors (e.g. from the `ri_pt2` `os_factor`/`ss_factor`
+    /// control keywords). No-op when the definition carries no PT2 component; a component
+    /// without positional parameters defaults to `[1.0, 1.0]`.
+    pub fn update_pt2_params(&mut self, os_factor: Option<f64>, ss_factor: Option<f64>) {
+        let comps = match self.xc_nscf.as_mut() {
+            Some(comps) => comps,
+            None => return,
+        };
+        let idx = match comps.iter().position(|comp| comp.component_type == ComponentType::PT2) {
+            Some(idx) => idx,
+            None => return,
+        };
+        let mut params = std::mem::take(&mut comps[idx].param_positional);
+        if params.is_empty() {
+            params = vec![1.0, 1.0];
+        }
+        if let Some(osf) = os_factor {
+            params[0] = osf;
+        }
+        if let Some(ssf) = ss_factor {
+            params[1] = ssf;
+        }
+        comps[idx].param_positional = params;
     }
 
     pub fn formatted_output(&self) -> String {
@@ -898,6 +995,13 @@ pub fn parse_tokens(mut components: Vec<DFAComponent>, functype: &str) -> Vec<DF
 //     VecDFAComponent(Vec<DFAComponent>),
 //     DFA2step(DFA2step),
 // }
+
+/// `(libxc code, factor)` pairs of the Libxc components, in order — the bridge from the
+/// component-typed DFAdef world to the code-array currency of the exc/vxc/numint layer
+/// (e.g. `XCData` construction in the DH gradients).
+pub fn components_to_codes_params(components: &[DFAComponent]) -> (Vec<usize>, Vec<f64>) {
+    components.iter().filter_map(|comp| comp.libxc_code_param()).unzip()
+}
 
 pub fn parse_and_derive(xc: &str, spin_channel: usize, print_level: usize) -> DFAdef {
     let mut dfa = parse(xc.to_lowercase().as_str());
@@ -1194,4 +1298,143 @@ fn parse_arguments(input: &str) -> (HashMap<String, Value>, Vec<f64>) {
     }
 
     (keyword_args, positional_args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_and_derive, DFAFamily};
+    use libxc::prelude::LibXCSpin;
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1.0e-8
+    }
+
+    #[test]
+    fn parse_standard_functionals() {
+        let dfa = parse_and_derive("hf", 1, 0);
+        assert!(close(dfa.dfa_hybrid_scf, 1.0));
+        assert!(dfa.family_pos().is_none());
+        assert!(!dfa.is_dfa_scf());
+        assert!(!dfa.is_fifth_dfa());
+
+        let dfa = parse_and_derive("b3lyp", 1, 0);
+        assert!(close(dfa.dfa_hybrid_scf, 0.2));
+        assert!(dfa.is_dfa_scf());
+        assert!(dfa.family_pos().is_none());
+
+        let dfa = parse_and_derive("pbe0", 1, 0);
+        assert!(close(dfa.dfa_hybrid_scf, 0.25));
+        assert!(dfa.is_dfa_scf());
+
+        let dfa = parse_and_derive("wb97x_v", 1, 0);
+        assert!(dfa.is_dfa_scf());
+        assert!(dfa.is_rsh());
+    }
+
+    #[test]
+    fn parse_fifth_rung() {
+        let dfa = parse_and_derive("xyg3", 1, 0);
+        assert_eq!(dfa.family_pos(), Some(DFAFamily::PT2));
+        assert!(dfa.is_fifth_dfa());
+        assert!(!dfa.is_rpa());
+        assert!(dfa.is_dfa_scf());
+        assert!(close(dfa.dfa_hybrid_scf, 0.2));
+        assert!(close(dfa.hybrid_pos().unwrap(), 0.8033));
+        let pt2 = dfa.pt2_component().expect("xyg3 must carry a PT2 component");
+        assert_eq!(pt2.param_positional.len(), 2);
+        assert!(close(pt2.param_positional[0], 0.3211));
+        assert!(close(pt2.param_positional[1], 0.3211));
+
+        let dfa = parse_and_derive("dsd-blyp-d3bj", 1, 0);
+        assert_eq!(dfa.family_pos(), Some(DFAFamily::PT2));
+        let pt2 = dfa.pt2_component().expect("dsd-blyp-d3bj must carry a PT2 component");
+        assert!(close(pt2.param_positional[0], 0.47));
+        assert!(close(pt2.param_positional[1], 0.40));
+        assert!(dfa.has_dispersion());
+
+        let dfa = parse_and_derive("rpa@b3lyp", 1, 0);
+        assert_eq!(dfa.family_pos(), Some(DFAFamily::RPA));
+        assert!(dfa.is_rpa());
+
+        let dfa = parse_and_derive("scsrpa", 1, 0);
+        assert_eq!(dfa.family_pos(), Some(DFAFamily::SCSRPA));
+        assert!(dfa.is_fifth_dfa());
+        assert!(!dfa.is_rpa());
+    }
+
+    #[test]
+    fn parse_dispersion() {
+        let dfa = parse_and_derive("pbe0-d3bj", 1, 0);
+        let disp = dfa.get_dispersion().expect("pbe0-d3bj must carry a Disp component");
+        assert_eq!(disp.func.to_uppercase(), "DFTD3");
+        assert!(!dfa.is_nlc());
+
+        let dfa = parse_and_derive("wb97x-v", 1, 0);
+        assert!(dfa.is_nlc());
+        let (b, c) = dfa.vv10_params().expect("wb97x-v must carry VV10 parameters");
+        assert!(b > 0.0 && c > 0.0);
+    }
+
+    #[test]
+    fn update_pt2_params_overrides() {
+        let mut dfa = parse_and_derive("xyg3", 1, 0);
+        dfa.update_pt2_params(Some(0.5), None);
+        let pt2 = dfa.pt2_component().unwrap();
+        assert!(close(pt2.param_positional[0], 0.5));
+        assert!(close(pt2.param_positional[1], 0.3211));
+
+        let mut dfa = parse_and_derive("xyg3", 1, 0);
+        dfa.update_pt2_params(None, None);
+        let pt2 = dfa.pt2_component().unwrap();
+        assert!(close(pt2.param_positional[0], 0.3211));
+        assert!(close(pt2.param_positional[1], 0.3211));
+
+        let mut dfa = parse_and_derive("b3lyp", 1, 0);
+        dfa.update_pt2_params(Some(0.5), Some(0.5));
+        assert!(dfa.pt2_component().is_none());
+    }
+
+    #[test]
+    fn to_xc_data_matches_to_dfa4rest_scf_side() {
+        for name in ["hf", "b3lyp", "pbe0", "cam-b3lyp", "wb97x-v", "pbe0-d3bj", "xyg3"] {
+            let dfa = parse_and_derive(name, 1, 0);
+            let full = dfa.to_dfa4rest();
+            let narrow = dfa.to_xc_data();
+            assert_eq!(full.dfa_compnt_scf, narrow.dfa_compnt_scf, "compnt_scf mismatch for {name}");
+            assert_eq!(full.dfa_paramr_scf, narrow.dfa_paramr_scf, "paramr_scf mismatch for {name}");
+            assert!(close(full.dfa_hybrid_scf, narrow.dfa_hybrid_scf), "hybrid mismatch for {name}");
+            assert_eq!(full.dfa_rsh_scf, narrow.dfa_rsh_scf, "rsh mismatch for {name}");
+            assert_eq!(full.nlc_vv10, narrow.nlc_vv10, "nlc mismatch for {name}");
+        }
+    }
+
+    #[test]
+    fn func_list_door_matches_legacy_arrays() {
+        for name in ["xyg3", "dsd-blyp-d3bj", "rpa@b3lyp"] {
+            let dfa = parse_and_derive(name, 1, 0);
+            let full = dfa.to_dfa4rest();
+            let legacy: Option<Vec<(f64, usize)>> =
+                match (&full.dfa_compnt_pos, &full.dfa_paramr_pos) {
+                    (Some(code), Some(param)) if code.is_empty() => None,
+                    (Some(code), Some(param)) => Some(
+                        code.iter()
+                            .zip(param.iter())
+                            .map(|(&c, &p)| (p, c))
+                            .collect(),
+                    ),
+                    (None, None) => None,
+                    _ => panic!("pos arrays must be present or absent together"),
+                };
+            let door = crate::analdrv::response::rgfock_interface::dh_xc_func_list_from_components(
+                dfa.xc_nscf.as_deref(),
+                LibXCSpin::Unpolarized,
+            )
+            .map(|l| {
+                l.into_iter()
+                    .map(|(f, func)| (f, func.number() as usize))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(legacy, door, "func list mismatch for {name}");
+        }
+    }
 }
