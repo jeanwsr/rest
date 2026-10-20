@@ -687,7 +687,7 @@ impl InputKeywords {
             solvent_name: String::new(),
             solvent_descriptors: None, 
             stop_at: None,
-            xc_parser: String::from("legacy"),
+            xc_parser: String::from("parse_xc"),
             j2c_decomp: J2CDecompOption::default(),
             ri_jk: RIJKOption::default(),
             hamiltonian_distributed: HamiltonianDistributedMode::default(),
@@ -2187,7 +2187,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
 
             tmp_input.xc_parser = match tmp_ctrl.get("xc_parser").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => { tmp_str.to_lowercase() },
-                other => String::from("legacy"),
+                other => String::from("parse_xc"),
             };
             
             tmp_input.analdrv_tasks = match tmp_ctrl.get("analdrv_tasks").unwrap_or(&serde_json::Value::Null) {
