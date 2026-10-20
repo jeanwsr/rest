@@ -360,12 +360,7 @@ impl SCF {
         }
         //========================================
         // For emperial dispersion correction
-        let mut disp_from_parse_xc = false;
-        if let Some(dfadef) = &self.mol.dfadef {
-        if dfadef.has_dispersion() {
-            disp_from_parse_xc = true;
-        }
-        }
+        let disp_from_parse_xc = self.mol.dfadef.has_dispersion();
         let disp_from_ctrl = self.mol.ctrl.empirical_dispersion.is_some();
         if disp_from_ctrl || disp_from_parse_xc {
             // (energy, grad, sigma); fallback to this default value if dftd evaluation fails
@@ -373,7 +368,7 @@ impl SCF {
             let (engy_disp, grad_disp, sigma_disp) = dftd(&self.mol).unwrap_or(default_disp);
 
             let disp_name = if disp_from_parse_xc {
-                self.mol.dfadef.as_ref().unwrap().get_dispersion().unwrap().func.clone()
+                self.mol.dfadef.get_dispersion().unwrap().func.clone()
             } else {
                 self.mol.ctrl.empirical_dispersion.clone().unwrap()
             };

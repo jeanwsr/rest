@@ -64,7 +64,7 @@ pub struct Molecule {
     #[pyo3(get, set)]
     pub spin_channel: usize,
     // exchange-correlation functionals
-    pub dfadef: Option<parse_xc::DFAdef>,
+    pub dfadef: parse_xc::DFAdef,
     pub xc_data: DFA4REST,
     pub use_eri: bool,
     #[pyo3(get, set)]
@@ -116,7 +116,7 @@ impl Molecule {
         Molecule {
             ctrl:InputKeywords::init_ctrl(),
             mpi_data: None,
-            dfadef: None, 
+            dfadef: parse_xc::DFAdef::new(), 
             xc_data: DFA4REST::new("hf",1, 0),
             use_eri: false,
             geom: GeomCell::init_geom(),
@@ -241,7 +241,8 @@ impl Molecule {
                     "legacy" => {
                     let mut cur_xc_data = DFA4REST::new(&ctrl.xc, ctrl.spin_channel, ctrl.print_level);
                     cur_xc_data.update_pt2_params(ctrl.ri_pt2.os_factor, ctrl.ri_pt2.ss_factor);
-                    (None, cur_xc_data)
+                    let cur_dfadef = parse_xc::DFAdef::from_dfa4rest(&cur_xc_data);
+                    (cur_dfadef, cur_xc_data)
                     },
                     "parse_xc" => {
                         let mut dfadef = parse_xc::parse_and_derive(&ctrl.xc, ctrl.spin_channel, ctrl.print_level);
@@ -249,9 +250,9 @@ impl Molecule {
                         if !san {
                             panic!("{}", err_strings.join("\n"));
                         }
-                        let mut xc_data = dfadef.to_dfa4rest();
-                        xc_data.update_pt2_params(ctrl.ri_pt2.os_factor, ctrl.ri_pt2.ss_factor);
-                        (Some(dfadef.clone()), xc_data)
+                        dfadef.update_pt2_params(ctrl.ri_pt2.os_factor, ctrl.ri_pt2.ss_factor);
+                        let xc_data = dfadef.to_dfa4rest();
+                        (dfadef, xc_data)
                     },
                     _ => {
                         panic!("Error:: Unknown xc_parser '{}'. Please use either 'legacy' or 'parse_xc'", 
@@ -260,10 +261,17 @@ impl Molecule {
                 }
             },
             DFTType::NonStandard => {
-                println!("Warning: DFTType::NonStandard is about to be deprecated. Please use xc_parser = 'parse_xc' instead.");
-                (None, DFA4REST::new_nonstandard(ctrl.spin_channel, ctrl.print_level, &ctrl.xc_namelist, &ctrl.xc_paralist, &ctrl.dfa_hybrid_scf))
+                panic!(
+                    "Error:: DFTType::NonStandard is removed. Please use xc_parser = 'parse_xc' \
+                     with the xc expression syntax instead, e.g. xc_parser = 'parse_xc' and \
+                     xc = '0.5*gga_x_pbe + 0.5*gga_c_pbe + hf*0.2'."
+                )
             },
-            DFTType::DeepLearning => {(None, DFA4REST::new_deep_learning(ctrl.spin_channel, ctrl.print_level, &ctrl.xc_model))}
+            DFTType::DeepLearning => {
+                let cur_xc_data = DFA4REST::new_deep_learning(ctrl.spin_channel, ctrl.print_level, &ctrl.xc_model);
+                let cur_dfadef = parse_xc::DFAdef::from_dfa4rest(&cur_xc_data);
+                (cur_dfadef, cur_xc_data)
+            }
         };
 
         xc_data.summary(ctrl.print_level);
