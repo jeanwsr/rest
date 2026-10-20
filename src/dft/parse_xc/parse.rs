@@ -546,6 +546,75 @@ impl DFAdef {
         }
     }
 
+    /// Reconstruct a DFAdef record from a (full) DFA4REST, e.g. the output of the legacy
+    /// parser or the deep-learning constructor.
+    ///
+    /// This is the transitional bridge of the DFAdef-primary refactor: those constructors
+    /// keep producing a full DFA4REST that is used directly as `Molecule.xc_data`, while
+    /// `Molecule.dfadef` stores this reconstructed definition. The reconstruction is exact
+    /// over the DFA4REST fields except `nlc_vv10`, which has no DFAdef counterpart here
+    /// (legacy VV10 keeps flowing through `xc_data.nlc_vv10`).
+    pub fn from_dfa4rest(dfa: &DFA4REST) -> DFAdef {
+        let libxc_comp = |id: usize, factor: f64| DFAComponent {
+            factor,
+            func: get_name(id),
+            func_full_name: get_name(id),
+            id,
+            param_positional: Vec::new(),
+            param_keyword: HashMap::new(),
+            component_type: ComponentType::Libxc,
+            reference: Vec::new(),
+        };
+        let mut dfadef = DFAdef::new();
+        dfadef.spin_channel = dfa.spin_channel;
+        dfadef.dfa_hybrid_scf = dfa.dfa_hybrid_scf;
+        dfadef.dfa_rsh_scf = (
+            dfa.dfa_rsh_scf.map(|(omega, _, _)| omega),
+            dfa.dfa_rsh_scf.map_or(0.0, |(_, alpha, _)| alpha),
+            dfa.dfa_rsh_scf.map_or(0.0, |(_, _, beta)| beta),
+        );
+        dfadef.xc_scf = Some(
+            dfa.dfa_compnt_scf
+                .iter()
+                .zip(dfa.dfa_paramr_scf.iter())
+                .map(|(&id, &factor)| libxc_comp(id, factor))
+                .collect(),
+        );
+        if let Some(family) = &dfa.dfa_family_pos {
+            let (component_type, func) = match family {
+                DFAFamily::PT2 => (ComponentType::PT2, "MP2".to_string()),
+                DFAFamily::RPA => (ComponentType::RPA, "RPA".to_string()),
+                DFAFamily::SCSRPA => (ComponentType::SCSRPA, "SCSRPA".to_string()),
+                DFAFamily::SBGE2 => (ComponentType::SBGE2, "SBGE2".to_string()),
+                other => panic!(
+                    "DFAdef::from_dfa4rest: family {other:?} is not a fifth-rung family"
+                ),
+            };
+            let empty_vec: Vec<f64> = Vec::new();
+            let mut nscf_components: Vec<DFAComponent> = dfa
+                .dfa_compnt_pos
+                .as_ref()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .zip(dfa.dfa_paramr_pos.as_ref().unwrap_or(&empty_vec).iter())
+                .map(|(&id, &factor)| libxc_comp(id, factor))
+                .collect();
+            nscf_components.push(DFAComponent {
+                factor: 1.0,
+                func,
+                func_full_name: String::new(),
+                id: 0,
+                param_positional: dfa.dfa_paramr_adv.clone().unwrap_or_default(),
+                param_keyword: HashMap::new(),
+                component_type,
+                reference: Vec::new(),
+            });
+            dfadef.xc_nscf = Some(nscf_components);
+            dfadef.dfa_hybrid_nscf = dfa.dfa_hybrid_pos;
+        }
+        dfadef
+    }
+
     /// Backend shared by [`Self::to_dfa4rest`] and [`Self::to_xc_data`]: the SCF-side
     /// DFA4REST (libxc components, hybrid, RSH, VV10) with no post-SCF state.
     fn to_scf_xc_data(&self) -> DFA4REST {
@@ -1302,11 +1371,52 @@ fn parse_arguments(input: &str) -> (HashMap<String, Value>, Vec<f64>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_and_derive, DFAFamily};
+    use super::{parse_and_derive, DFA4REST, DFAdef, DFAFamily};
     use libxc::prelude::LibXCSpin;
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1.0e-8
+    }
+
+    fn assert_round_trip(original: &DFA4REST, name: &str) {
+        let rt = DFAdef::from_dfa4rest(original).to_dfa4rest();
+        assert_eq!(original.spin_channel, rt.spin_channel, "spin_channel for {name}");
+        assert_eq!(original.dfa_compnt_scf, rt.dfa_compnt_scf, "compnt_scf for {name}");
+        assert_eq!(original.dfa_paramr_scf, rt.dfa_paramr_scf, "paramr_scf for {name}");
+        assert!(close(original.dfa_hybrid_scf, rt.dfa_hybrid_scf), "hybrid_scf for {name}");
+        assert_eq!(original.dfa_rsh_scf, rt.dfa_rsh_scf, "rsh for {name}");
+        assert_eq!(original.dfa_family_pos, rt.dfa_family_pos, "family_pos for {name}");
+        assert_eq!(original.dfa_compnt_pos, rt.dfa_compnt_pos, "compnt_pos for {name}");
+        assert_eq!(original.dfa_paramr_pos, rt.dfa_paramr_pos, "paramr_pos for {name}");
+        match (original.dfa_hybrid_pos, rt.dfa_hybrid_pos) {
+            (None, None) => {},
+            (Some(a), Some(b)) => assert!(close(a, b), "hybrid_pos for {name}"),
+            _ => panic!("hybrid_pos presence mismatch for {name}"),
+        }
+        match (&original.dfa_paramr_adv, &rt.dfa_paramr_adv) {
+            (None, None) => {},
+            (Some(a), Some(b)) => {
+                assert_eq!(a.len(), b.len(), "paramr_adv len for {name}");
+                for (x, y) in a.iter().zip(b.iter()) {
+                    assert!(close(*x, *y), "paramr_adv for {name}");
+                }
+            },
+            _ => panic!("paramr_adv presence mismatch for {name}"),
+        }
+    }
+
+    #[test]
+    fn from_dfa4rest_round_trip_legacy() {
+        for name in ["hf", "b3lyp", "pbe0", "cam-b3lyp", "wb97x-v", "xyg3", "xygjos", "b2plyp", "scsrpa"] {
+            let original = DFA4REST::new(name, 1, 0);
+            assert_round_trip(&original, name);
+        }
+    }
+
+    #[test]
+    fn from_dfa4rest_round_trip_deep_learning() {
+        let original = DFA4REST::parse_scf_dldft(&"dl_dfa_scf".to_string(), 1);
+        assert_round_trip(&original, "dl_dfa_scf");
     }
 
     #[test]
