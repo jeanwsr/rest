@@ -244,6 +244,19 @@ impl DFAComponent {
         }
     }
 
+    /// `(omega, c_LR, c_SR)` of a component in the consumer convention of
+    /// `DFA4REST::get_rsh_libxc` / `DFA4REST::dfa_rsh_scf`: `c_LR` is the long-range
+    /// (full-range) HF fraction and `c_SR` the short-range fraction. Per libxc's
+    /// convention (xc.h) `cam_alpha` is the full HF fraction and `cam_beta` the
+    /// short-range-only extra (SR = cam_alpha + cam_beta, LR = cam_alpha), so the raw
+    /// `get_rsh` slots are `(c_LR, c_SR - c_LR)` for every component type and the
+    /// conversion below just restores the absolute `c_SR`. Non-RSH components carry
+    /// their (range-independent) hybrid in both slots.
+    pub fn get_rsh_lrsr(&self, spin_channel: usize) -> (Option<f64>, f64, f64) {
+        let (omega, c_lr, c_sr_minus_lr) = self.get_rsh(spin_channel);
+        (omega, c_lr, c_sr_minus_lr + c_lr)
+    }
+
     pub fn is_rsh(&self) -> bool {
         match self.component_type {
             ComponentType::RSHF => {
@@ -820,33 +833,29 @@ impl DFAdef {
     }
 
     pub fn get_rsh_scf(&self, spin_channel: usize) -> (Option<f64>, f64, f64) {
-        // check if any component in self.xc is RSH, if so, return (omega, alpha, beta)
+        // check if any component in self.xc is RSH, if so, return (omega, c_LR, c_SR)
+        // in the consumer convention of DFA4REST::dfa_rsh_scf / rsh_params (the same
+        // normalization as DFA4REST::get_rsh_libxc); see DFAComponent::get_rsh_lrsr.
         let mut result = (None, 0.0, 0.0);
         if let Some(components) = &self.xc_scf {
             for comp in components.iter() {
-                if comp.is_rsh() {
-                    let (omega, alpha, beta) = comp.get_rsh(spin_channel);
-                    // println!("Component {}: omega = {:?}, alpha = {}, beta = {}", comp.func, omega, alpha, beta);
-                    // only if alpha and beta are both close to zero, we consider it as not range-separated (pure zero).
-                    if alpha.abs() < 1e-10 && beta.abs() < 1e-10 {
-                        continue;
-                    }
+                let (omega, c_lr, c_sr) = comp.get_rsh_lrsr(spin_channel);
+                // println!("Component {}: omega = {:?}, c_LR = {}, c_SR = {}", comp.func, omega, c_lr, c_sr);
+                // only if c_LR and c_SR are both close to zero, we consider it as not range-separated (pure zero).
+                if c_lr.abs() < 1e-10 && c_sr.abs() < 1e-10 {
+                    continue;
+                }
+                if let Some(omega) = omega {
                     if result.0.is_some() {
-                        if result.0.unwrap() != omega.unwrap() {
+                        if result.0.unwrap() != omega {
                             panic!("Multiple omega detected in the DFA components for SCF. Currently this is not supported.");
                         }
                     } else {
-                        result.0 = omega;
+                        result.0 = Some(omega);
                     }
-                        // result = Some((omega, result.unwrap().1 + alpha, result.unwrap().2 + beta));
-                    result.1 += alpha;
-                    result.2 += beta;
-                    
-                } else {
-                    // if it's not RSH but has hybrid, we consider it as alpha with beta = 0.
-                    let hyb = comp.get_hybrid(spin_channel);
-                    result.1 += hyb;                    
                 }
+                result.1 += c_lr;
+                result.2 += c_sr;
             }
         }
         result
@@ -1371,11 +1380,34 @@ fn parse_arguments(input: &str) -> (HashMap<String, Value>, Vec<f64>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_and_derive, DFA4REST, DFAdef, DFAFamily};
+    use super::{parse_and_derive, DFA4REST, DFAComponent, DFAdef, DFAFamily, ComponentType};
     use libxc::prelude::LibXCSpin;
+    use std::collections::HashMap;
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1.0e-8
+    }
+
+    #[test]
+    fn rsh_lrsr_rshf_decomposition() {
+        let hf_comp = |factor: f64, func: &str| DFAComponent {
+            factor,
+            func: func.to_string(),
+            func_full_name: String::new(),
+            id: 0,
+            param_positional: vec![0.33],
+            param_keyword: HashMap::new(),
+            component_type: ComponentType::RSHF,
+            reference: Vec::new(),
+        };
+        let mut dfa = DFAdef::new();
+        dfa.spin_channel = 1;
+        dfa.xc_scf = Some(vec![hf_comp(0.65, "SR_HF"), hf_comp(0.19, "LR_HF")]);
+        let (omega, c_lr, c_sr) = dfa.get_rsh_scf(1);
+        assert_eq!(omega, Some(0.33));
+        assert!(close(c_lr, 0.19), "c_LR = {c_lr}");
+        assert!(close(c_sr, 0.65), "c_SR = {c_sr}");
+        assert!(dfa.is_rsh());
     }
 
     fn assert_round_trip(original: &DFA4REST, name: &str) {
@@ -1402,6 +1434,19 @@ mod tests {
                 }
             },
             _ => panic!("paramr_adv presence mismatch for {name}"),
+        }
+    }
+
+    #[test]
+    fn rsh_parity_parse_xc_vs_legacy() {
+        for name in ["cam-b3lyp", "lc-wpbe"] {
+            let legacy = DFA4REST::new(name, 1, 0);
+            let pxc = parse_and_derive(name, 1, 0).to_dfa4rest();
+            assert_eq!(legacy.dfa_rsh_scf, pxc.dfa_rsh_scf, "rsh triple mismatch for {name}");
+            assert!(
+                close(legacy.dfa_hybrid_scf, pxc.dfa_hybrid_scf),
+                "hybrid mismatch for {name}"
+            );
         }
     }
 
