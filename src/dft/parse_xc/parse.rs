@@ -894,6 +894,27 @@ impl DFAdef {
         self.is_hybrid() || self.is_fifth_dfa()
     }
 
+    /// SCF-functional list of `(factor, LibXCFunctional)` for the exc/vxc module
+    /// functions; the omega ext-parameter of RSH components is applied from
+    /// `dfa_rsh_scf`. DFAdef-side twin of `DFA4REST::libxc_func_list`.
+    pub fn scf_func_list(&self, spin_channel: usize) -> Vec<(f64, LibXCFunctional)> {
+        self.xc_scf
+            .as_ref()
+            .map(|comps| {
+                comps.iter().filter_map(|comp| {
+                    comp.to_libxc_functional(spin_channel).map(|mut func| {
+                        if let Some(omega) = self.dfa_rsh_scf.0 {
+                            if func.ext_param_names().contains(&"_omega".to_string()) {
+                                func.set_ext_param_by_name("_omega", omega);
+                            }
+                        }
+                        (comp.factor, func)
+                    })
+                }).collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn is_rsh(&self) -> bool {
         if let Some(scf_components) = &self.xc_scf {
             for comp in scf_components {
@@ -1673,7 +1694,7 @@ mod tests {
                     (None, None) => None,
                     _ => panic!("pos arrays must be present or absent together"),
                 };
-            let door = crate::analdrv::response::rgfock_interface::dh_xc_func_list_from_components(
+            let door = crate::dft::parse_xc::dh_xc_func_list_from_components(
                 dfa.xc_nscf.as_deref(),
                 LibXCSpin::Unpolarized,
             )

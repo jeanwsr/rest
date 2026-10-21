@@ -41,7 +41,7 @@ pub fn scf_xc_func_list_uks(scf_data: &SCF) -> Vec<(f64, LibXCFunctional)> {
 /// Spin-polarized sibling of [`dh_xc_func_list`](crate::analdrv::response::rgfock_interface::
 /// dh_xc_func_list).
 pub fn dh_xc_func_list_uks(scf_data: &SCF) -> Option<Vec<(f64, LibXCFunctional)>> {
-    crate::analdrv::response::rgfock_interface::dh_xc_func_list_from_components(
+    crate::dft::parse_xc::dh_xc_func_list_from_components(
         scf_data.mol.dfadef.xc_nscf.as_deref(),
         LibXCSpin::Polarized,
     )
