@@ -389,6 +389,20 @@ impl DFAComponent {
                 new_component.func = "MP2".to_string();
                 new_component.param_positional = vec![0.0, self.factor];
             },
+            "SBGE2_OS" => {
+                if !self.param_positional.is_empty() || !self.param_keyword.is_empty() {
+                    panic!("Error: SBGE2_OS component should not have parameters");
+                }
+                new_component.func = "SBGE2".to_string();
+                new_component.param_positional = vec![self.factor, 0.0];
+            },
+            "SBGE2_SS" => {
+                if !self.param_positional.is_empty() || !self.param_keyword.is_empty() {
+                    panic!("Error: SBGE2_SS component should not have parameters");
+                }
+                new_component.func = "SBGE2".to_string();
+                new_component.param_positional = vec![0.0, self.factor];
+            },
             _ => panic!("Error: unknown PT2 component type {}", self.func),
         }
 
@@ -433,7 +447,7 @@ impl Addable for DFAComponent {
         }
         if self.param_positional != other.param_positional {
             match self.component_type {
-                ComponentType::PT2 | ComponentType::SCSRPA => {
+            ComponentType::PT2 | ComponentType::SBGE2 | ComponentType::SCSRPA => {
                     if self.is_normalized() && other.is_normalized() {
                         return true;
                     } else {
@@ -464,7 +478,7 @@ impl std::ops::Add for DFAComponent {
         //     panic!("Error: cannot add two different DFAComponents");
         // }
         match self.component_type {
-            ComponentType::PT2 | ComponentType::SCSRPA => {
+            ComponentType::PT2 | ComponentType::SBGE2 | ComponentType::SCSRPA => {
                         DFAComponent {
             factor: 1.0, // should be normalized before add
             func: self.func.clone(),
@@ -1436,6 +1450,57 @@ mod tests {
                 }
             },
             _ => panic!("paramr_adv presence mismatch for {name}"),
+        }
+    }
+
+    #[test]
+    fn legacy_postscf_names_covered_by_parse_xc() {
+        // (name, expected fifth-rung family) for every entry of the legacy
+        // DFA4REST parse_postscf table (dft/mod.rs). parse_xc is the default
+        // xc_parser and must accept all of them.
+        let expected: Vec<(&str, DFAFamily)> = vec![
+            ("b2gpplyp", DFAFamily::PT2),
+            ("b2plyp", DFAFamily::PT2),
+            ("mp2", DFAFamily::PT2),
+            ("pbe0dh", DFAFamily::PT2),
+            ("pbe-qidh", DFAFamily::PT2),
+            ("scs-mp2", DFAFamily::PT2),
+            ("xdh-pbe0", DFAFamily::PT2),
+            ("xyg2", DFAFamily::PT2),
+            ("xyg3", DFAFamily::PT2),
+            ("xyg7", DFAFamily::PT2),
+            ("xygjos", DFAFamily::PT2),
+            ("zrps", DFAFamily::SBGE2),
+            ("r-xyg2", DFAFamily::SBGE2),
+            ("r-xyg3", DFAFamily::SBGE2),
+            ("r-xyg7", DFAFamily::SBGE2),
+            ("r-xygjos", DFAFamily::SBGE2),
+            ("r-xdh7", DFAFamily::SCSRPA),
+            ("scsrpa", DFAFamily::SCSRPA),
+            ("rpa@b3lyp", DFAFamily::RPA),
+            ("rpa@pbe", DFAFamily::RPA),
+        ];
+        for (name, family) in expected {
+            let dfa = parse_and_derive(name, 1, 0);
+            assert_eq!(dfa.family_pos(), Some(family), "family mismatch for {name}");
+        }
+        // the sBGE2-renormalized variants: (os, ss) factors transcribed from the
+        // legacy table, exercising the SBGE2_OS/SBGE2_SS tokens
+        let checks: Vec<(&str, [f64; 2], f64)> = vec![
+            ("r-xyg2", [0.3387, 0.3387], 0.8016),
+            ("r-xyg3", [0.3211, 0.3211], 0.8033),
+            ("r-xyg7", [0.4052, 0.2589], 0.8971),
+            ("r-xygjos", [0.4364, 0.0], 0.7731),
+        ];
+        for (name, os_ss, hybrid) in checks {
+            let dfa = parse_and_derive(name, 1, 0);
+            let comp = dfa
+                .fifth_rung_component()
+                .unwrap_or_else(|| panic!("{name} must carry a fifth-rung component"));
+            assert_eq!(comp.param_positional.len(), 2, "os/ss len for {name}");
+            assert!(close(comp.param_positional[0], os_ss[0]), "os for {name}");
+            assert!(close(comp.param_positional[1], os_ss[1]), "ss for {name}");
+            assert!(close(dfa.dfa_hybrid_nscf.unwrap(), hybrid), "hybrid for {name}");
         }
     }
 

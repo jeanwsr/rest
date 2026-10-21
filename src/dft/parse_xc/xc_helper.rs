@@ -207,6 +207,8 @@ lazy_static! {
         ("MP2", ComponentType::PT2),
         ("MP2_OS", ComponentType::PT2),
         ("MP2_SS", ComponentType::PT2),
+        ("SBGE2_OS", ComponentType::SBGE2),
+        ("SBGE2_SS", ComponentType::SBGE2),
         ("RPA", ComponentType::RPA),
         ("SCSRPA", ComponentType::SCSRPA),
         ("SBGE2", ComponentType::SBGE2),
@@ -223,6 +225,7 @@ lazy_static! {
     pub static ref MULTISTEP_ALIAS:HashMap<&'static str, &'static str> = HashMap::from([
         // lowercase
         ("xygjos", "xygj_os"),
+        ("r-xygjos", "r-xygj_os"),
         ("revxygjos", "revxygj_os"),
         ("xygjos5", "xygj_os5"),
         ("xdhpbe0", "xdh_pbe0"),
