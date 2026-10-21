@@ -3070,7 +3070,16 @@ impl SCF {
         let mo = &mut self.eigenvectors;
         let occ = &mut self.occupation;
         if let Some(grids) = &mut self.grids {
-            exc_spin = self.mol.xc_data.xc_exc(grids, spin_channel,dm, mo, occ,iop, mpi_operator);
+            let pos_components = if iop == 1 {
+                let (codes, params) = crate::dft::parse_xc::components_to_codes_params(
+                    self.mol.dfadef.xc_nscf.as_deref().unwrap_or(&[]),
+                );
+                Some((codes, params))
+            } else {
+                None
+            };
+            let pos_ref = pos_components.as_ref().map(|(c, p)| (c.as_slice(), p.as_slice()));
+            exc_spin = self.mol.xc_data.xc_exc(grids, spin_channel,dm, mo, occ,iop, pos_ref, mpi_operator);
         }
         let exc:f64 = exc_spin.iter().sum();
         exc

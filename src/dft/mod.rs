@@ -3001,7 +3001,7 @@ impl DFA4REST {
 
     }
 
-    pub fn xc_exc(&self, grids: &mut Grids, spin_channel: usize, dm: &mut Vec<MatrixFull<f64>>, mo: &mut [MatrixFull<f64>;2], occ: &mut [Vec<f64>;2],iop: usize, mpi_operator: &Option<MPIOperator>) -> Vec<f64> {
+    pub fn xc_exc(&self, grids: &mut Grids, spin_channel: usize, dm: &mut Vec<MatrixFull<f64>>, mo: &mut [MatrixFull<f64>;2], occ: &mut [Vec<f64>;2], iop: usize, pos_components: Option<(&[usize], &[f64])>, mpi_operator: &Option<MPIOperator>) -> Vec<f64> {
         let num_grids = grids.coordinates.len();
         let num_basis = dm[0].size[0];
         let mut exc = MatrixFull::new([num_grids,1],0.0);
@@ -3027,8 +3027,9 @@ impl DFA4REST {
                 let tmp_exc = self.compute_exc_by_family(&xc_func, spin_channel, &rho, &sigma, &lapl, &tau);
                 exc.par_self_scaled_add(&tmp_exc, *xc_para);
             });
-        } else if iop==1 { // for the post-SCF energy calculation
-            if let (Some(dfa_paramr),Some(dfa_compnt)) = (&self.dfa_paramr_pos, &self.dfa_compnt_pos) {
+        } else if iop==1 { // for the post-SCF energy calculation: the final-energy functional's
+            // libxc components, passed in from the DFAdef (the narrowed xc_data carries none)
+            if let Some((dfa_compnt, dfa_paramr)) = pos_components {
                 dfa_compnt.iter().zip(dfa_paramr.iter()).for_each(|(xc_func,xc_para)| {
                     let xc_func = self.init_libxc_and_set_param(xc_func);
                     let tmp_exc = self.compute_exc_by_family(&xc_func, spin_channel, &rho, &sigma, &lapl, &tau);
