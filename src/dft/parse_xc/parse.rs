@@ -723,7 +723,7 @@ impl DFAdef {
     /// Narrowed SCF exc/vxc [`DFA4REST`]: same SCF-side content as [`Self::to_dfa4rest`]
     /// but carrying no fifth-rung state (`dfa_family_pos`/`dfa_compnt_pos`/`dfa_paramr_pos`/
     /// `dfa_hybrid_pos`/`dfa_paramr_adv` stay at defaults); the post-SCF definition remains
-    /// in `xc_nscf` and is read through the DFAdef accessors (`family_pos`, `pt2_component`, ...).
+    /// in `xc_nscf` and is read through the DFAdef accessors (`family_pos`, `fifth_rung_component`, ...).
     pub fn to_xc_data(&self) -> DFA4REST {
         self.to_scf_xc_data()
     }
@@ -756,13 +756,15 @@ impl DFAdef {
         matches!(self.family_pos(), Some(DFAFamily::RPA))
     }
 
-    /// The PT2 component of the final-energy functional, whose `param_positional`
-    /// holds the opposite-spin / same-spin scaling factors `(c_os, c_ss)`.
-    pub fn pt2_component(&self) -> Option<&DFAComponent> {
+    /// The fifth-rung component of the final-energy functional - the single component
+    /// of type PT2/RPA/SCSRPA/SBGE2, matching what `to_dfa4rest` projects into
+    /// `dfa_paramr_adv`. Its `param_positional` holds the family's auxiliary factors
+    /// (for PT2/SCSRPA/SBGE2: the opposite-spin / same-spin scaling `(c_os, c_ss)`).
+    pub fn fifth_rung_component(&self) -> Option<&DFAComponent> {
         self.xc_nscf
             .as_ref()?
             .iter()
-            .find(|comp| comp.component_type == ComponentType::PT2)
+            .find(|comp| comp.component_type.to_dfa_family().is_some())
     }
 
     /// Override the PT2 `(c_os, c_ss)` factors (e.g. from the `ri_pt2` `os_factor`/`ss_factor`
@@ -1495,14 +1497,14 @@ mod tests {
         assert!(dfa.is_dfa_scf());
         assert!(close(dfa.dfa_hybrid_scf, 0.2));
         assert!(close(dfa.hybrid_pos().unwrap(), 0.8033));
-        let pt2 = dfa.pt2_component().expect("xyg3 must carry a PT2 component");
+        let pt2 = dfa.fifth_rung_component().expect("xyg3 must carry a PT2 component");
         assert_eq!(pt2.param_positional.len(), 2);
         assert!(close(pt2.param_positional[0], 0.3211));
         assert!(close(pt2.param_positional[1], 0.3211));
 
         let dfa = parse_and_derive("dsd-blyp-d3bj", 1, 0);
         assert_eq!(dfa.family_pos(), Some(DFAFamily::PT2));
-        let pt2 = dfa.pt2_component().expect("dsd-blyp-d3bj must carry a PT2 component");
+        let pt2 = dfa.fifth_rung_component().expect("dsd-blyp-d3bj must carry a PT2 component");
         assert!(close(pt2.param_positional[0], 0.47));
         assert!(close(pt2.param_positional[1], 0.40));
         assert!(dfa.has_dispersion());
@@ -1515,6 +1517,7 @@ mod tests {
         assert_eq!(dfa.family_pos(), Some(DFAFamily::SCSRPA));
         assert!(dfa.is_fifth_dfa());
         assert!(!dfa.is_rpa());
+        assert!(dfa.fifth_rung_component().is_some());
     }
 
     #[test]
@@ -1534,19 +1537,19 @@ mod tests {
     fn update_pt2_params_overrides() {
         let mut dfa = parse_and_derive("xyg3", 1, 0);
         dfa.update_pt2_params(Some(0.5), None);
-        let pt2 = dfa.pt2_component().unwrap();
+        let pt2 = dfa.fifth_rung_component().unwrap();
         assert!(close(pt2.param_positional[0], 0.5));
         assert!(close(pt2.param_positional[1], 0.3211));
 
         let mut dfa = parse_and_derive("xyg3", 1, 0);
         dfa.update_pt2_params(None, None);
-        let pt2 = dfa.pt2_component().unwrap();
+        let pt2 = dfa.fifth_rung_component().unwrap();
         assert!(close(pt2.param_positional[0], 0.3211));
         assert!(close(pt2.param_positional[1], 0.3211));
 
         let mut dfa = parse_and_derive("b3lyp", 1, 0);
         dfa.update_pt2_params(Some(0.5), Some(0.5));
-        assert!(dfa.pt2_component().is_none());
+        assert!(dfa.fifth_rung_component().is_none());
     }
 
     #[test]
