@@ -102,7 +102,7 @@ pub fn hess_interface<'a>(
     eprintln!("[WARN] Keywords of analdrv will be updated in future versions.");
 
     // simple guard, but currently many methods (solvent is not supported)
-    if scf_data.mol.xc_data.is_fifth_dfa() {
+    if scf_data.mol.dfadef.is_fifth_dfa() {
         panic!("Normal modes calculation is currently not available for post-SCF methods.");
     }
 

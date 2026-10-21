@@ -737,12 +737,6 @@ impl DFAdef {
             .find_map(|comp| comp.component_type.to_dfa_family())
     }
 
-    /// Total exact-exchange coefficient of the final-energy functional (the HF/RSHF
-    /// factors of `xc_nscf`); `None` when the functional has no final-energy part.
-    pub fn hybrid_pos(&self) -> Option<f64> {
-        self.dfa_hybrid_nscf
-    }
-
     /// `true` when the SCF functional evaluates DFT XC on a grid (has at least one
     /// libxc component), mirroring `DFA4REST::is_dfa_scf`.
     pub fn is_dfa_scf(&self) -> bool {
@@ -1496,7 +1490,7 @@ mod tests {
         assert!(!dfa.is_rpa());
         assert!(dfa.is_dfa_scf());
         assert!(close(dfa.dfa_hybrid_scf, 0.2));
-        assert!(close(dfa.hybrid_pos().unwrap(), 0.8033));
+        assert!(close(dfa.dfa_hybrid_nscf.unwrap(), 0.8033));
         let pt2 = dfa.fifth_rung_component().expect("xyg3 must carry a PT2 component");
         assert_eq!(pt2.param_positional.len(), 2);
         assert!(close(pt2.param_positional[0], 0.3211));

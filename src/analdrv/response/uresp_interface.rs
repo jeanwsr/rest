@@ -41,19 +41,9 @@ pub fn scf_xc_func_list_uks(scf_data: &SCF) -> Vec<(f64, LibXCFunctional)> {
 /// Spin-polarized sibling of [`dh_xc_func_list`](crate::analdrv::response::rgfock_interface::
 /// dh_xc_func_list).
 pub fn dh_xc_func_list_uks(scf_data: &SCF) -> Option<Vec<(f64, LibXCFunctional)>> {
-    let xc_data = &scf_data.mol.xc_data;
-    let (xc_code, xc_params) = match (&xc_data.dfa_compnt_pos, &xc_data.dfa_paramr_pos) {
-        (Some(code), Some(_)) if code.is_empty() => return None,
-        (Some(code), Some(param)) => (code, param),
-        (None, None) => return None,
-        _ => panic!("dfa_compnt_pos and dfa_paramr_pos must be present or absent together."),
-    };
-    Some(
-        xc_code
-            .iter()
-            .zip(xc_params.iter())
-            .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Polarized)))
-            .collect_vec(),
+    crate::analdrv::response::rgfock_interface::dh_xc_func_list_from_components(
+        scf_data.mol.dfadef.xc_nscf.as_deref(),
+        LibXCSpin::Polarized,
     )
 }
 

@@ -76,7 +76,7 @@ pub fn analdrv_interface(scf_data: &mut SCF, tasks: &[AnalDrvTask], config: &Ana
 
     let has_multipole = tasks.iter().any(|task| matches!(task, AnalDrvTask::Multipole));
     let has_hessian = tasks.iter().any(|task| matches!(task, AnalDrvTask::Hessian));
-    let is_fifth = scf_data.mol.xc_data.is_fifth_dfa();
+    let is_fifth = scf_data.mol.dfadef.is_fifth_dfa();
     // the hessian task on post-SCF methods is rejected outright (the same guard as inside
     // `hess_interface`, for direct callers); reject here already, so that no grid/response
     // preparation is wasted on a run that cannot succeed

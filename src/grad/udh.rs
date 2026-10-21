@@ -37,6 +37,7 @@ use crate::analdrv::response::uresp_interface::{
     dh_xc_func_list_uks, scf_xc_func_list_uks, uscf_resp_interface, URespSCF,
 };
 use crate::dft::num_int::XCData;
+use crate::dft::parse_xc::components_to_codes_params;
 use crate::dft::numint_matmul::nimatmul::{regroup_grids_by_atom, NIMatmul};
 use crate::dft::numint_matmul::resp_uks::URespKSNIMatmul;
 use crate::dft::xc_deriv::XCType;
@@ -120,25 +121,29 @@ impl<'a> UDHGradient<'a> {
         let naux = aux.nao();
 
         let [c_os, c_ss]: [f64; 2] = mol_obj
-            .xc_data
-            .dfa_paramr_adv
+            .dfadef
+            .fifth_rung_component()
+            .expect("Doubly-hybrid gradient requires the fifth-rung spin factors (os/ss parameters).")
+            .param_positional
             .clone()
-            .expect("Doubly-hybrid gradient requires the PT2 spin factors (dfa_paramr_adv).")
             .try_into()
-            .expect("dfa_paramr_adv must have exactly two entries.");
+            .expect("the fifth-rung factors must have exactly two entries.");
 
         // gates of the final-functional (doubly-hybrid) terms; the pure-MP2 family has none, and
         // a bDH whose final functional equals the SCF one is covered by the "SCF" entry entirely
-        let xc_data = &mol_obj.xc_data;
-        let delta_hyb = xc_data.dfa_hybrid_pos.unwrap_or(xc_data.dfa_hybrid_scf) - xc_data.dfa_hybrid_scf;
+        let dfadef = &mol_obj.dfadef;
+        let delta_hyb = dfadef.dfa_hybrid_nscf.unwrap_or(dfadef.dfa_hybrid_scf) - dfadef.dfa_hybrid_scf;
         let xc_func_pos = dh_xc_func_list_uks(scf_data);
-        let xc_n_is_scf = match (&xc_data.dfa_compnt_pos, &xc_data.dfa_paramr_pos) {
-            (Some(code), Some(param)) => {
-                code.iter().eq(xc_data.dfa_compnt_scf.iter())
-                    && param.len() == xc_data.dfa_paramr_scf.len()
-                    && param.iter().zip(xc_data.dfa_paramr_scf.iter()).all(|(a, b)| (a - b).abs() < 1e-12)
+        let xc_n_is_scf = match &dfadef.xc_nscf {
+            Some(nscf) => {
+                let (n_code, n_param) = components_to_codes_params(nscf);
+                let (s_code, s_param) =
+                    components_to_codes_params(dfadef.xc_scf.as_deref().unwrap_or(&[]));
+                n_code == s_code
+                    && n_param.len() == s_param.len()
+                    && n_param.iter().zip(s_param.iter()).all(|(a, b)| (a - b).abs() < 1e-12)
             },
-            _ => true,
+            None => true,
         };
         let add_delta_k = delta_hyb.abs() > 1.0e-10;
         let add_xc_n = xc_func_pos.is_some() && !xc_n_is_scf;
@@ -974,13 +979,21 @@ fn xc_skeleton_dao(
 ) -> Vec<Tsr> {
     let mol_obj = &scf_data.mol;
     let xc_data = &mol_obj.xc_data;
+    let (pos_codes, pos_params) = if scf {
+        (Vec::new(), Vec::new())
+    } else {
+        components_to_codes_params(
+            mol_obj
+                .dfadef
+                .xc_nscf
+                .as_deref()
+                .expect("the final functional has no XC component list."),
+        )
+    };
     let (code, param) = if scf {
         (&xc_data.dfa_compnt_scf, &xc_data.dfa_paramr_scf)
     } else {
-        (
-            xc_data.dfa_compnt_pos.as_ref().expect("the final functional has no XC component list."),
-            xc_data.dfa_paramr_pos.as_ref().expect("the final functional has no XC parameter list."),
-        )
+        (&pos_codes, &pos_params)
     };
     let xc_type = if code.iter().any(|&c| xc_data.init_libxc(&c).needs_tau()) {
         XCType::MGGA

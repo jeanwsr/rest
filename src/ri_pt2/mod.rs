@@ -138,7 +138,7 @@ pub enum PT2TorchFoldMode {
 }
 
 pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> anyhow::Result<f64> {
-    let postscf_method = match scf_data.mol.xc_data.dfa_family_pos.clone().unwrap() {
+    let postscf_method = match scf_data.mol.dfadef.family_pos().expect("ri_pt2 requires a fifth-rung family") {
         crate::dft::DFAFamily::PT2 => "PT2".to_string(),
         crate::dft::DFAFamily::SBGE2 => "SBGE2".to_string(),
         crate::dft::DFAFamily::RPA => "RPA".to_string(),
@@ -204,7 +204,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     // pre-computation above), grids are no longer needed.
     scf_data.grids = None;
 
-    let dfa_family_pos = scf_data.mol.xc_data.dfa_family_pos.clone().unwrap();
+    let dfa_family_pos = scf_data.mol.dfadef.family_pos().expect("ri_pt2 requires a fifth-rung family");
 
     // engine = "torch" delegates the pair-energy contraction to the embedded-CPython
     // torch kernel on a CUDA device (see torch_pt2_pair_eng). Guards are hard errors
@@ -472,8 +472,8 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     
     //println!("{:?}",&pt2_c);
     let hy_coeffi_scf = scf_data.mol.xc_data.dfa_hybrid_scf;
-    let hy_coeffi_xdh = if let Some(coeff) = scf_data.mol.xc_data.dfa_hybrid_pos {coeff} else {0.0};
-    let hy_coeffi_pt2 = if let Some(coeff) = &scf_data.mol.xc_data.dfa_paramr_adv {coeff.clone()} else {vec![0.0,0.0]};
+    let hy_coeffi_xdh = scf_data.mol.dfadef.dfa_hybrid_nscf.unwrap_or(0.0);
+    let hy_coeffi_pt2 = scf_data.mol.dfadef.fifth_rung_component().map(|c| c.param_positional.clone()).unwrap_or_else(|| vec![0.0, 0.0]);
     let xdh_pt2_energy: f64 = pt2_c[1..3].iter().zip(hy_coeffi_pt2.iter()).map(|(e,c)| e*c).sum();
     if scf_data.mol.ctrl.print_level>2 {
         println!("Exc_scf: ({:?},{:?}),Exc_pos: ({:?},{:?})",xc_energy_scf,hy_coeffi_scf,xc_energy_xdh,hy_coeffi_xdh);
@@ -2019,7 +2019,7 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
     omp_set_num_threads_wrapper(default_omp_num_threads);
     
     // Temporarily output the contribution of singly excited states here, to avoid modifying the pt2_c structure.
-    if let Some(coeff) = &scf_data.mol.xc_data.dfa_paramr_adv {
+    if let Some(coeff) = scf_data.mol.dfadef.fifth_rung_component().map(|c| &c.param_positional) {
         let hy_coeffi_pt2 = coeff.clone();
         println!("WARNING: The RO-PT2 method has been implemented.  
         The contribution parameter of singly excited states has been set to match 'para_mp2_ss': {}.  

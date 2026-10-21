@@ -220,9 +220,7 @@ pub fn post_scf_correlation(scf_data: &mut SCF) {
 
     let mut timerecords = TimeRecords::new();
     let spin_channel = scf_data.mol.spin_channel;
-    let dfa_family_pos = if let Some(tmp_dfa) = &scf_data.mol.xc_data.dfa_family_pos {
-        tmp_dfa.clone()
-    } else {crate::dft::DFAFamily::Unknown};
+    let dfa_family_pos = scf_data.mol.dfadef.family_pos().unwrap_or(crate::dft::DFAFamily::Unknown);
 
     if let None = scf_data.ri3mo {
         let (occ_range, vir_range) = crate::scf_io::determine_ri3mo_size_for_pt2_and_rpa(&scf_data);
