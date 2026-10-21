@@ -71,7 +71,8 @@ pub fn post_scf_output(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
                     let dm = &scf_data.density_matrix;
                     let mo = &scf_data.eigenvectors;
                     let occ = &scf_data.occupation;
-                    scf_data.mol.xc_data.post_tabulated_exc(grids, dm, mo, occ);
+                    let funcs = scf_data.mol.xc_data.libxc_func_list();
+                    crate::dft::post_tabulated_exc(&funcs, scf_data.mol.spin_channel, grids, dm, mo, occ);
                 } else {
                     panic!("The grids are not yet initialized");
                 }
@@ -164,9 +165,8 @@ pub fn post_scf_output(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
 
 
 pub fn print_out_dfa(scf_data: &SCF) {
-    let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);
     let post_xc_energy = if let Some(grids) = &scf_data.grids {
-        dfa.post_xc_exc(&scf_data.mol.ctrl.post_xc, grids, &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation)
+        crate::dft::post_xc_exc(&scf_data.mol.ctrl.post_xc, scf_data.mol.spin_channel, grids, &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation)
     } else {
         vec![[0.0,0.0]]
     };
@@ -176,9 +176,8 @@ pub fn print_out_dfa(scf_data: &SCF) {
 }
 
 pub fn print_out_xc_potentials(scf_data: &SCF) {
-    let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);
     let post_xc_energy = if let Some(grids) = &scf_data.grids {
-        dfa.post_xc_exc(&scf_data.mol.ctrl.post_xc, grids, &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation)
+        crate::dft::post_xc_exc(&scf_data.mol.ctrl.post_xc, scf_data.mol.spin_channel, grids, &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation)
     } else {
         vec![[0.0,0.0]]
     };

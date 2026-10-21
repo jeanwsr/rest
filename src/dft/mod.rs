@@ -1157,13 +1157,15 @@ impl DFA4REST {
             })
     }
 
-    fn prepare_dft_quantities(
-        &self,
+}
+
+fn prepare_dft_quantities(
         grids: &Grids,
         spin_channel: usize,
         mo: &[MatrixFull<f64>; 2],
         occ: &[Vec<f64>; 2],
-        use_density_gradient: bool,
+        use_kinetic: bool,
+        use_gradient: bool,
     ) -> (MatrixFull<f64>, RIFull<f64>, MatrixFull<f64>, MatrixFull<f64>, MatrixFull<f64>) {
         let num_grids = grids.coordinates.len();
         let all_grids = 0..num_grids;
@@ -1172,7 +1174,7 @@ impl DFA4REST {
         let mut lapl: MatrixFull<f64> = MatrixFull::empty();
         let mut tau: MatrixFull<f64> = MatrixFull::empty();
        
-        if self.use_kinetic_density() {
+        if use_kinetic {
             let rho_ensemble = if grids.ao_compressed.is_some() {
                 let mo_use: [MatrixFull<f64>; 2] = if !mo[1].data.is_empty() || spin_channel == 1 {
                     [mo[0].clone(), mo[1].clone()]
@@ -1180,21 +1182,22 @@ impl DFA4REST {
                     [mo[0].clone(), mo[0].clone()]
                 };
                 grids.prepare_tabulated_density_ensemble_slots_compressed(
-                    &self,
+                    use_kinetic,
+                    use_gradient,
                     &mo_use,
                     occ,
                     spin_channel,
                     all_grids.clone(),
                 )
             } else {
-                grids.prepare_tabulated_density_ensemble_slots(&self, mo, occ, spin_channel, all_grids.clone())
+                grids.prepare_tabulated_density_ensemble_slots(use_kinetic, use_gradient, mo, occ, spin_channel, all_grids.clone())
             };
             let rho_vec = rho_ensemble.get_reducing_matrix(0).unwrap().iter().copied().collect_vec();
             rho = MatrixFull::from_vec([num_grids, spin_channel], rho_vec).unwrap();
             let rhop_vec:Vec<f64> = rho_ensemble.get_slices(0..num_grids, 0..spin_channel, 1..4).copied().collect();
             rhop = RIFull::from_vec([num_grids, spin_channel, 3],rhop_vec).unwrap();
             rhop = rhop.transpose_ikj();
-            if self.use_kinetic_density() {
+            if use_kinetic {
                 // let lapl_vec = rho_ensemble.get_reducing_matrix(4).unwrap().iter().copied().collect_vec();
                 // lapl = MatrixFull::from_vec([num_grids, spin_channel], lapl_vec).unwrap();
                 lapl = MatrixFull::new([num_grids, spin_channel], 0.0);
@@ -1226,7 +1229,7 @@ impl DFA4REST {
             };
         }
 
-        let sigma = if use_density_gradient {
+        let sigma = if use_gradient {
             prepare_tabulated_sigma_rayon(&rhop, spin_channel)
         } else {
             MatrixFull::empty()
@@ -1235,7 +1238,7 @@ impl DFA4REST {
         (rho, rhop, sigma, lapl, tau)
     }
 
-    fn compute_exc_by_family(&self, xc_func: &LibXCFunctional, spin_channel: usize, rho: &MatrixFull<f64>, sigma: &MatrixFull<f64>, lapl: &MatrixFull<f64>, tau: &MatrixFull<f64>) -> MatrixFull<f64> {
+fn compute_exc_by_family(xc_func: &LibXCFunctional, spin_channel: usize, rho: &MatrixFull<f64>, sigma: &MatrixFull<f64>, lapl: &MatrixFull<f64>, tau: &MatrixFull<f64>) -> MatrixFull<f64> {
         let num_grids = rho.size()[0];
         match xc_func.family() {
             LibXCFamily::LDA => MatrixFull::from_vec([num_grids, 1], if spin_channel == 1 {
@@ -1257,7 +1260,7 @@ impl DFA4REST {
         }
     }
 
-    fn integrate_exc(&self, exc: &MatrixFull<f64>, rho: &MatrixFull<f64>, weights: &[f64], spin_channel: usize) -> (Vec<f64>, [f64; 2]) {
+fn integrate_exc(exc: &MatrixFull<f64>, rho: &MatrixFull<f64>, weights: &[f64], spin_channel: usize) -> (Vec<f64>, [f64; 2]) {
         let mut exc_total = vec![0.0; spin_channel];
         let mut total_elec = [0.0; 2];
         for i_spin in 0..spin_channel {
@@ -1271,6 +1274,7 @@ impl DFA4REST {
         (exc_total, total_elec)
     }
 
+impl DFA4REST {
     pub fn use_kinetic_density(&self) -> bool {
         self
             .dfa_compnt_pos
@@ -1280,7 +1284,19 @@ impl DFA4REST {
             .any(|xc_func_id| self.init_libxc(xc_func_id).needs_tau())
     }
 
-    pub fn xc_exc_vxc(&self, grids: &Grids, spin_channel: usize, dm: &Vec<MatrixFull<f64>>, mo: &[MatrixFull<f64>;2], occ: &[Vec<f64>;2], print_level:usize) -> (Vec<f64>, Vec<MatrixFull<f64>>) {
+    /// SCF-functional list of `(factor, LibXCFunctional)` for the exc/vxc module
+    /// functions; the omega ext-parameter of RSH components is applied here
+    /// (mirror of the former `init_libxc_and_set_param` behavior).
+    pub fn libxc_func_list(&self) -> Vec<(f64, LibXCFunctional)> {
+        self.dfa_compnt_scf
+            .iter()
+            .zip(self.dfa_paramr_scf.iter())
+            .map(|(code, param)| (*param, self.init_libxc_and_set_param(code)))
+            .collect()
+    }
+}
+
+pub fn xc_exc_vxc(funcs: &[(f64, LibXCFunctional)], grids: &Grids, spin_channel: usize, dm: &Vec<MatrixFull<f64>>, mo: &[MatrixFull<f64>;2], occ: &[Vec<f64>;2], print_level:usize) -> (Vec<f64>, Vec<MatrixFull<f64>>) {
         let num_grids = grids.coordinates.len();
         let num_basis = dm[0].size[0];
         let mut exc = MatrixFull::new([num_grids,1],0.0);
@@ -1288,27 +1304,29 @@ impl DFA4REST {
         let mut vxc_ao = vec![MatrixFull::new([num_basis,num_grids],0.0);spin_channel];
         let dt0 = utilities::init_timing();
 
-        let (rho, rhop, sigma, _lapl, _tau) = self.prepare_dft_quantities(
+        let use_gradient = funcs.iter().any(|(_factor, f)| !matches!(f.family(), LibXCFamily::LDA | LibXCFamily::HybLDA));
+        let use_kinetic = funcs.iter().any(|(_factor, f)| f.needs_tau());
+        let (rho, rhop, sigma, _lapl, _tau) = prepare_dft_quantities(
             grids,
             spin_channel,
             mo,
             occ,
-            self.use_density_gradient(),
+            use_kinetic,
+            use_gradient,
         );
         
         let dt2 = utilities::timing(&dt0, Some("evaluate rho/rhop/sigma"));
         let mut vrho = MatrixFull::new([num_grids,spin_channel],0.0);
-        let mut vsigma=if self.use_density_gradient() && spin_channel==1 {
+        let mut vsigma=if use_gradient && spin_channel==1 {
             MatrixFull::new([num_grids,1],0.0)
-        } else if self.use_density_gradient() && spin_channel==2 {
+        } else if use_gradient && spin_channel==2 {
             MatrixFull::new([num_grids,3],0.0)
         } else {
             MatrixFull::empty()
         };
         let dt3 = utilities::timing(&dt2, Some("init vrho/vsigma"));
 
-        self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
-            let xc_func = self.init_libxc_and_set_param(xc_func);
+        funcs.iter().for_each(|(xc_para, xc_func)| {
             match xc_func.family() {
                 LibXCFamily::LDA => {
                     if spin_channel==1 {
@@ -1363,7 +1381,7 @@ impl DFA4REST {
                 contract_vxc_0(vxc_ao_s, &ao_ref, vrho_s, None);
             }
             // for vsigma
-            if self.use_density_gradient() {
+            if use_gradient {
                 if let Some(aop) = &grids.aop {
                     if spin_channel==1 {
                         // vxc_ao_s: the shape of [num_basis, num_grids]
@@ -1465,7 +1483,7 @@ impl DFA4REST {
 
         let dt5 = utilities::timing(&dt4, Some("from vrho -> vxc_ao"));
 
-        let (exc_total, total_elec) = self.integrate_exc(&exc, &rho, &grids.weights, spin_channel);
+        let (exc_total, total_elec) = integrate_exc(&exc, &rho, &grids.weights, spin_channel);
         if print_level > 0 {
             if spin_channel==1 {
                 println!("total electron number: {:16.8}", total_elec[0])
@@ -1552,15 +1570,15 @@ impl DFA4REST {
     }
 
     fn compact_sigma(sigma: &MatrixFull<f64>, mask: &[bool], num_active: usize, ncol: usize) -> MatrixFull<f64> {
-        Self::compact_vsigma(sigma, mask, num_active, ncol)
+        compact_vsigma(sigma, mask, num_active, ncol)
     }
 
     fn compact_vtau(vtau: &MatrixFull<f64>, mask: &[bool], num_active: usize, spin_channel: usize) -> MatrixFull<f64> {
-        Self::compact_vrho(vtau, mask, num_active, spin_channel)
+        compact_vrho(vtau, mask, num_active, spin_channel)
     }
 
     fn compact_tau(tau: &MatrixFull<f64>, mask: &[bool], num_active: usize, spin_channel: usize) -> MatrixFull<f64> {
-        Self::compact_vrho(tau, mask, num_active, spin_channel)
+        compact_vrho(tau, mask, num_active, spin_channel)
     }
 
     fn compact_rhop(rhop: &RIFull<f64>, mask: &[bool], num_active: usize, spin_channel: usize) -> RIFull<f64> {
@@ -1640,7 +1658,7 @@ impl DFA4REST {
     }
 
     pub fn xc_exc_vxc_slots_dm_only(
-        &self, 
+        funcs: &[(f64, LibXCFunctional)],
         range_grids: Range<usize>, 
         grids: &Grids, 
         spin_channel: usize, 
@@ -1651,6 +1669,8 @@ impl DFA4REST {
         vxc_screen_threshold: f64,
     ) -> (Vec<f64>, Vec<MatrixFull<f64>>, [f64;2]) 
     {
+        let use_gradient = funcs.iter().any(|(_factor, f)| !matches!(f.family(), LibXCFamily::LDA | LibXCFamily::HybLDA));
+        let use_kinetic = funcs.iter().any(|(_factor, f)| f.needs_tau());
         let num_grids = range_grids.len();
         let num_basis = dm[0].size[0];
 
@@ -1658,7 +1678,7 @@ impl DFA4REST {
         let mut loc_rhop = RIFull::empty();
         let mut loc_lapl = MatrixFull::empty();
         let mut loc_tau = MatrixFull::empty();
-        if self.use_kinetic_density() {
+        if use_kinetic {
             let order = 2; 
             (loc_rho, loc_rhop, loc_tau) = if grids.ao_compressed.is_some() {
                 grids.prepare_tabulated_density_2_slots_dm_only_compressed(dm, spin_channel, order, range_grids.clone())
@@ -1711,7 +1731,7 @@ impl DFA4REST {
                 grids.prepare_tabulated_density_slots_dm_only(dm, spin_channel,range_grids.clone())
             };
         }
-        let loc_sigma = if self.use_density_gradient() {
+        let loc_sigma = if use_gradient {
             prepare_tabulated_sigma(&loc_rhop, spin_channel)
         } else {
             MatrixFull::empty()
@@ -1728,7 +1748,7 @@ impl DFA4REST {
         let mut num_active = num_grids;
         let mut use_screening = false;
         if vxc_screen_threshold > 0.0 {
-            active_mask = Self::build_active_grid_mask(&loc_rho, num_grids, spin_channel, vxc_screen_threshold);
+            active_mask = build_active_grid_mask(&loc_rho, num_grids, spin_channel, vxc_screen_threshold);
             num_active = active_mask.iter().filter(|&&x| x).count();
             use_screening = num_active > 0 && num_active < num_grids * 3 / 4;
         }
@@ -1742,33 +1762,32 @@ impl DFA4REST {
         if use_screening {
             // === Screened path: compact arrays, smaller vxc_ao ===
             let n_g = num_active;
-            let loc_rho_c = Self::compact_rho(&loc_rho, &active_mask, num_active, spin_channel);
-            let loc_rhop_c = Self::compact_rhop(&loc_rhop, &active_mask, num_active, spin_channel);
-            let loc_sigma_c = if self.use_density_gradient() {
-                Self::compact_sigma(&loc_sigma, &active_mask, num_active,
+            let loc_rho_c = compact_rho(&loc_rho, &active_mask, num_active, spin_channel);
+            let loc_rhop_c = compact_rhop(&loc_rhop, &active_mask, num_active, spin_channel);
+            let loc_sigma_c = if use_gradient {
+                compact_sigma(&loc_sigma, &active_mask, num_active,
                     if spin_channel==1 {1} else {3})
             } else { MatrixFull::empty() };
-            let loc_lapl_c = if self.use_kinetic_density() {
-                Self::compact_vrho(&loc_lapl, &active_mask, num_active, spin_channel)
+            let loc_lapl_c = if use_kinetic {
+                compact_vrho(&loc_lapl, &active_mask, num_active, spin_channel)
             } else { MatrixFull::empty() };
-            let loc_tau_c = if self.use_kinetic_density() {
-                Self::compact_tau(&loc_tau, &active_mask, num_active, spin_channel)
+            let loc_tau_c = if use_kinetic {
+                compact_tau(&loc_tau, &active_mask, num_active, spin_channel)
             } else { MatrixFull::empty() };
             let mut loc_exc_c = MatrixFull::new([num_active, 1], 0.0);
 
             let mut loc_vrho_c = MatrixFull::new([n_g, spin_channel], 0.0);
-            let mut loc_vsigma_c = if self.use_density_gradient() && spin_channel==1 {
+            let mut loc_vsigma_c = if use_gradient && spin_channel==1 {
                 MatrixFull::new([n_g, 1], 0.0)
-            } else if self.use_density_gradient() && spin_channel==2 {
+            } else if use_gradient && spin_channel==2 {
                 MatrixFull::new([n_g, 3], 0.0)
             } else { MatrixFull::empty() };
-            let mut loc_vtau_c = if self.use_kinetic_density() {
+            let mut loc_vtau_c = if use_kinetic {
                 MatrixFull::new([n_g, spin_channel], 0.0)
             } else { MatrixFull::empty() };
 
             // libxc on compact arrays
-            self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
-                let xc_func = self.init_libxc_and_set_param(xc_func);
+            funcs.iter().for_each(|(xc_para, xc_func)| {
                 match xc_func.family() {
                     LibXCFamily::LDA => {
                         if spin_channel==1 {
@@ -1845,7 +1864,7 @@ impl DFA4REST {
                     ao_dense_owned.as_ref().unwrap()
                 }
             };
-            let ao_active = Self::extract_active_ao_columns(
+            let ao_active = extract_active_ao_columns(
                 ao_ref, &range_grids, &active_mask, num_active, num_basis);
 
             let aop_dense_owned: Option<RIFull<f64>>;
@@ -1860,13 +1879,13 @@ impl DFA4REST {
                 }
             };
             let aop_active: Option<RIFull<f64>> = aop_ref.map(|aop| {
-                Self::extract_active_aop_columns(aop, &range_grids, &active_mask, num_active, num_basis)
+                extract_active_aop_columns(aop, &range_grids, &active_mask, num_active, num_basis)
             });
-            let weights_active = Self::compact_weights(&grids.weights[range_grids.clone()], &active_mask, num_active);
+            let weights_active = compact_weights(&grids.weights[range_grids.clone()], &active_mask, num_active);
 
             // vxc_ao arrays
             let mut loc_vxc_ao_0 = vec![MatrixFull::new([num_basis, n_g], 0.0); spin_channel];
-            let mut loc_vxc_ao_1 = if self.use_kinetic_density() {
+            let mut loc_vxc_ao_1 = if use_kinetic {
                 vec![MatrixFull::new([num_basis, n_g], 0.0); spin_channel]
             } else { vec![] };
             let mut loc_vxc_mat = vec![MatrixFull::new([num_basis, num_basis], 0.0); spin_channel];
@@ -1879,7 +1898,7 @@ impl DFA4REST {
                 contract_vxc_0_serial(loc_vxc_ao_s, &loc_ao_ref, loc_vrho_s, None);
             }
             // GGA sigma
-            if self.use_density_gradient() {
+            if use_gradient {
                 if let Some(ref aop_active) = aop_active {
                     if spin_channel == 1 {
                         let mut loc_vxc_ao_s = &mut loc_vxc_ao_0[0];
@@ -1954,7 +1973,7 @@ impl DFA4REST {
                 );
             }
             // MGGA tau
-            if self.use_kinetic_density() {
+            if use_kinetic {
                 if let Some(ref aop_active) = aop_active {
                     for i_spin in 0..spin_channel {
                         let loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
@@ -1977,7 +1996,7 @@ impl DFA4REST {
                 }
             }
 
-            let (loc_exc_total, loc_total_elec) = self.integrate_exc(&loc_exc_c, &loc_rho_c, &weights_active, spin_channel);
+            let (loc_exc_total, loc_total_elec) = integrate_exc(&loc_exc_c, &loc_rho_c, &weights_active, spin_channel);
             (loc_exc_total, loc_vxc_mat, loc_total_elec)
         } else {
             // === Original path: no screening, use full grids ===
@@ -1985,23 +2004,22 @@ impl DFA4REST {
             let mut loc_exc = MatrixFull::new([num_grids, 1], 0.0);
             let mut loc_exc_total = vec![0.0; spin_channel];
             let mut loc_vxc_ao_0 = vec![MatrixFull::new([num_basis, num_grids], 0.0); spin_channel];
-            let mut loc_vxc_ao_1 = if self.use_kinetic_density() {
+            let mut loc_vxc_ao_1 = if use_kinetic {
                 vec![MatrixFull::new([num_basis, num_grids], 0.0); spin_channel]
             } else { vec![] };
             let mut loc_vxc_mat = vec![MatrixFull::new([num_basis, num_basis], 0.0); spin_channel];
 
             let mut loc_vrho = MatrixFull::new([num_grids, spin_channel], 0.0);
-            let mut loc_vsigma = if self.use_density_gradient() && spin_channel==1 {
+            let mut loc_vsigma = if use_gradient && spin_channel==1 {
                 MatrixFull::new([num_grids, 1], 0.0)
-            } else if self.use_density_gradient() && spin_channel==2 {
+            } else if use_gradient && spin_channel==2 {
                 MatrixFull::new([num_grids, 3], 0.0)
             } else { MatrixFull::empty() };
-            let mut loc_vtau = if self.use_kinetic_density() {
+            let mut loc_vtau = if use_kinetic {
                 MatrixFull::new([num_grids, spin_channel], 0.0)
             } else { MatrixFull::empty() };
 
-            self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
-                let xc_func = self.init_libxc_and_set_param(xc_func);
+            funcs.iter().for_each(|(xc_para, xc_func)| {
                 match xc_func.family() {
                     LibXCFamily::LDA => {
                         if spin_channel==1 {
@@ -2074,7 +2092,7 @@ impl DFA4REST {
                 grids.contract_response_compressed(
                     &range_grids, &loc_vrho, &loc_vsigma, &loc_vtau,
                     loc_weights, &mut vxc_mat_comp, spin_channel,
-                    self.use_density_gradient(), self.use_kinetic_density(),
+                    use_gradient, use_kinetic,
                     &loc_rhop, num_basis,
                 );
 
@@ -2125,7 +2143,7 @@ impl DFA4REST {
                     contract_vxc_0_serial(loc_vxc_ao_s, &loc_ao_ref, loc_vrho_s, None);
                 }
                 // GGA vsigma * rho_p \dot AO_P
-                if self.use_density_gradient() {
+                if use_gradient {
                     if let Some(aop) = &grids.aop {
                         if spin_channel == 1 {
                             let mut loc_vxc_ao_s = &mut loc_vxc_ao_0[0];
@@ -2199,7 +2217,7 @@ impl DFA4REST {
                         );
                 }
                 // MGGA part 
-                if self.use_kinetic_density() {
+                if use_kinetic {
                     let Some(aop) = &grids.aop else {
                         panic!("aop is not available in xc_exc_vxc_slots_dm_only");
                     };
@@ -2223,13 +2241,13 @@ impl DFA4REST {
                     }
                 }
             }
-            let (loc_exc_total, loc_total_elec) = self.integrate_exc(&loc_exc, &loc_rho, loc_weights, spin_channel);
+            let (loc_exc_total, loc_total_elec) = integrate_exc(&loc_exc, &loc_rho, loc_weights, spin_channel);
             (loc_exc_total, loc_vxc_mat, loc_total_elec)
         }
     }
 
     pub fn xc_exc_vxc_slots(
-        &self, 
+        funcs: &[(f64, LibXCFunctional)],
         range_grids: Range<usize>, 
         grids: &Grids, 
         spin_channel: usize, 
@@ -2240,6 +2258,8 @@ impl DFA4REST {
         vxc_screen_threshold: f64,
     ) -> (Vec<f64>, Vec<MatrixFull<f64>>, [f64;2]) 
     {
+        let use_gradient = funcs.iter().any(|(_factor, f)| !matches!(f.family(), LibXCFamily::LDA | LibXCFamily::HybLDA));
+        let use_kinetic = funcs.iter().any(|(_factor, f)| f.needs_tau());
         let num_grids = range_grids.len();
         let num_basis = dm[0].size[0];
 
@@ -2247,7 +2267,7 @@ impl DFA4REST {
         let mut loc_rhop: RIFull<f64> = RIFull::empty();
         let mut loc_lapl: MatrixFull<f64> = MatrixFull::empty();
         let mut loc_tau: MatrixFull<f64> = MatrixFull::empty();
-        if self.use_kinetic_density() {
+        if use_kinetic {
             // for meta-GGA
             let mo_use: [MatrixFull<f64>; 2] = if !mo[1].data.is_empty() || spin_channel == 1 {
                 [mo[0].clone(), mo[1].clone()]
@@ -2257,14 +2277,15 @@ impl DFA4REST {
 
             let loc_rho_ensemble = if grids.ao_compressed.is_some() {
                 grids.prepare_tabulated_density_ensemble_slots_compressed(
-                    &self,
+                    use_kinetic,
+                    use_gradient,
                     &mo_use,
                     occ,
                     spin_channel,
                     range_grids.clone(),
                 )
             } else {
-                grids.prepare_tabulated_density_ensemble_slots(&self, &mo_use, occ, spin_channel, range_grids.clone())
+                grids.prepare_tabulated_density_ensemble_slots(use_kinetic, use_gradient, &mo_use, occ, spin_channel, range_grids.clone())
             };
             let loc_rho_vec = loc_rho_ensemble.get_reducing_matrix(0).unwrap().iter().copied().collect_vec();
             loc_rho = MatrixFull::from_vec([num_grids, spin_channel], loc_rho_vec).unwrap();
@@ -2291,7 +2312,7 @@ impl DFA4REST {
                 grids.prepare_tabulated_density_slots(&mo_temp, occ, spin_channel,range_grids.clone())
             }
         };
-        let loc_sigma = if self.use_density_gradient() {
+        let loc_sigma = if use_gradient {
             prepare_tabulated_sigma(&loc_rhop, spin_channel)
         } else {
             MatrixFull::empty()
@@ -2308,7 +2329,7 @@ impl DFA4REST {
         let mut num_active = num_grids;
         let mut use_screening = false;
         if vxc_screen_threshold > 0.0 {
-            active_mask = Self::build_active_grid_mask(&loc_rho, num_grids, spin_channel, vxc_screen_threshold);
+            active_mask = build_active_grid_mask(&loc_rho, num_grids, spin_channel, vxc_screen_threshold);
             num_active = active_mask.iter().filter(|&&x| x).count();
             use_screening = num_active > 0 && num_active < num_grids * 3 / 4;
         }
@@ -2322,33 +2343,32 @@ impl DFA4REST {
         if use_screening {
             // === Screened path ===
             let n_g = num_active;
-            let loc_rho_c = Self::compact_rho(&loc_rho, &active_mask, num_active, spin_channel);
-            let loc_rhop_c = Self::compact_rhop(&loc_rhop, &active_mask, num_active, spin_channel);
-            let loc_sigma_c = if self.use_density_gradient() {
-                Self::compact_sigma(&loc_sigma, &active_mask, num_active,
+            let loc_rho_c = compact_rho(&loc_rho, &active_mask, num_active, spin_channel);
+            let loc_rhop_c = compact_rhop(&loc_rhop, &active_mask, num_active, spin_channel);
+            let loc_sigma_c = if use_gradient {
+                compact_sigma(&loc_sigma, &active_mask, num_active,
                     if spin_channel==1 {1} else {3})
             } else { MatrixFull::empty() };
-            let loc_lapl_c = if self.use_kinetic_density() {
-                Self::compact_vrho(&loc_lapl, &active_mask, num_active, spin_channel)
+            let loc_lapl_c = if use_kinetic {
+                compact_vrho(&loc_lapl, &active_mask, num_active, spin_channel)
             } else { MatrixFull::empty() };
-            let loc_tau_c = if self.use_kinetic_density() {
-                Self::compact_tau(&loc_tau, &active_mask, num_active, spin_channel)
+            let loc_tau_c = if use_kinetic {
+                compact_tau(&loc_tau, &active_mask, num_active, spin_channel)
             } else { MatrixFull::empty() };
             let mut loc_exc_c = MatrixFull::new([num_active, 1], 0.0);
 
             let mut loc_vrho_c = MatrixFull::new([n_g, spin_channel], 0.0);
-            let mut loc_vsigma_c = if self.use_density_gradient() && spin_channel==1 {
+            let mut loc_vsigma_c = if use_gradient && spin_channel==1 {
                 MatrixFull::new([n_g, 1], 0.0)
-            } else if self.use_density_gradient() && spin_channel==2 {
+            } else if use_gradient && spin_channel==2 {
                 MatrixFull::new([n_g, 3], 0.0)
             } else { MatrixFull::empty() };
-            let mut loc_vtau_c = if self.use_kinetic_density() {
+            let mut loc_vtau_c = if use_kinetic {
                 MatrixFull::new([n_g, spin_channel], 0.0)
             } else { MatrixFull::empty() };
 
             // libxc on compact arrays
-            self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
-                let xc_func = self.init_libxc_and_set_param(xc_func);
+            funcs.iter().for_each(|(xc_para, xc_func)| {
                 match xc_func.family() {
                     LibXCFamily::LDA => {
                         if spin_channel==1 {
@@ -2424,7 +2444,7 @@ impl DFA4REST {
                     ao_dense_owned2.as_ref().unwrap()
                 }
             };
-            let ao_active = Self::extract_active_ao_columns(
+            let ao_active = extract_active_ao_columns(
                 ao_ref2, &range_grids, &active_mask, num_active, num_basis);
 
             let aop_dense_owned2: Option<RIFull<f64>>;
@@ -2439,12 +2459,12 @@ impl DFA4REST {
                 }
             };
             let aop_active: Option<RIFull<f64>> = aop_ref2.map(|aop| {
-                Self::extract_active_aop_columns(aop, &range_grids, &active_mask, num_active, num_basis)
+                extract_active_aop_columns(aop, &range_grids, &active_mask, num_active, num_basis)
             });
-            let weights_active = Self::compact_weights(&grids.weights[range_grids.clone()], &active_mask, num_active);
+            let weights_active = compact_weights(&grids.weights[range_grids.clone()], &active_mask, num_active);
 
             let mut loc_vxc_ao = vec![MatrixFull::new([num_basis, n_g], 0.0); spin_channel];
-            let mut loc_vxc_ao_1 = if self.use_kinetic_density() {
+            let mut loc_vxc_ao_1 = if use_kinetic {
                 vec![MatrixFull::new([num_basis, n_g], 0.0); spin_channel]
             } else { vec![] };
             let mut loc_vxc_mat = vec![MatrixFull::new([num_basis, num_basis], 0.0); spin_channel];
@@ -2455,7 +2475,7 @@ impl DFA4REST {
                 let loc_ao_ref = ao_active.to_matrixfullslice_columns(0..n_g);
                 contract_vxc_0_serial(loc_vxc_ao_s, &loc_ao_ref, loc_vrho_s, None);
             }
-            if self.use_density_gradient() {
+            if use_gradient {
                 if let Some(ref aop_active) = aop_active {
                     if spin_channel == 1 {
                         let mut loc_vxc_ao_s = &mut loc_vxc_ao[0];
@@ -2527,7 +2547,7 @@ impl DFA4REST {
                     1.0, 0.0
                 );
             }
-            if self.use_kinetic_density() {
+            if use_kinetic {
                 if let Some(ref aop_active) = aop_active {
                     for i_spin in 0..spin_channel {
                         let loc_vxc_mat_s = loc_vxc_mat.get_mut(i_spin).unwrap();
@@ -2549,7 +2569,7 @@ impl DFA4REST {
                     }
                 }
             }
-            let (loc_exc_total, loc_total_elec) = self.integrate_exc(&loc_exc_c, &loc_rho_c, &weights_active, spin_channel);
+            let (loc_exc_total, loc_total_elec) = integrate_exc(&loc_exc_c, &loc_rho_c, &weights_active, spin_channel);
             (loc_exc_total, loc_vxc_mat, loc_total_elec)
         } else {
             // === Original path (no screening) ===
@@ -2559,22 +2579,21 @@ impl DFA4REST {
             let mut loc_exc_total = vec![0.0; spin_channel];
             let mut loc_vxc_mat = vec![MatrixFull::new([num_basis, num_basis], 0.0); spin_channel];
             let mut loc_vxc_ao = vec![MatrixFull::new([num_basis, num_grids], 0.0); spin_channel];
-            let mut loc_vxc_ao_1 = if self.use_kinetic_density() {
+            let mut loc_vxc_ao_1 = if use_kinetic {
                 vec![MatrixFull::new([num_basis, num_grids], 0.0); spin_channel]
             } else { vec![] };
 
             let mut loc_vrho = MatrixFull::new([num_grids, spin_channel], 0.0);
-            let mut loc_vsigma = if self.use_density_gradient() && spin_channel==1 {
+            let mut loc_vsigma = if use_gradient && spin_channel==1 {
                 MatrixFull::new([num_grids, 1], 0.0)
-            } else if self.use_density_gradient() && spin_channel==2 {
+            } else if use_gradient && spin_channel==2 {
                 MatrixFull::new([num_grids, 3], 0.0)
             } else { MatrixFull::empty() };
-            let mut loc_vtau = if self.use_kinetic_density() {
+            let mut loc_vtau = if use_kinetic {
                 MatrixFull::new([num_grids, spin_channel], 0.0)
             } else { MatrixFull::empty() };
 
-            self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
-                let xc_func = self.init_libxc_and_set_param(xc_func);
+            funcs.iter().for_each(|(xc_para, xc_func)| {
                 match xc_func.family() {
                     LibXCFamily::LDA => {
                         if spin_channel==1 {
@@ -2645,7 +2664,7 @@ impl DFA4REST {
                 grids.contract_response_compressed(
                     &range_grids, &loc_vrho, &loc_vsigma, &loc_vtau,
                     loc_weights, &mut loc_vxc_mat, spin_channel,
-                    self.use_density_gradient(), self.use_kinetic_density(),
+                    use_gradient, use_kinetic,
                     &loc_rhop, num_basis,
                 );
             } else if let Some(ao) = &grids.ao {
@@ -2655,7 +2674,7 @@ impl DFA4REST {
                     let loc_ao_ref = ao.to_matrixfullslice_columns(range_grids.clone());
                     contract_vxc_0_serial(loc_vxc_ao_s, &loc_ao_ref, loc_vrho_s, None);
                 }
-                if self.use_density_gradient() {
+                if use_gradient {
                     if let Some(aop) = &grids.aop {
                         if spin_channel == 1 {
                             let mut loc_vxc_ao_s = &mut loc_vxc_ao[0];
@@ -2727,7 +2746,7 @@ impl DFA4REST {
                         1.0, 0.0
                     );
                 }
-                if self.use_kinetic_density() {
+                if use_kinetic {
                     let Some(aop) = &grids.aop else {
                         panic!("aop is not available");
                     };
@@ -2751,45 +2770,51 @@ impl DFA4REST {
                     }
                 }
             }
-            let (loc_exc_total, loc_total_elec) = self.integrate_exc(&loc_exc, &loc_rho, loc_weights, spin_channel);
+            let (loc_exc_total, loc_total_elec) = integrate_exc(&loc_exc, &loc_rho, loc_weights, spin_channel);
             (loc_exc_total, loc_vxc_mat, loc_total_elec)
         }
     }
 
-    pub fn post_xc_exc(&self, post_xc: &Vec<String>, grids: &crate::dft::Grids, dm: &Vec<MatrixFull<f64>>, mo: &[MatrixFull<f64>;2], occ: &[Vec<f64>;2]) 
+/// `(factor, LibXCFunctional)` list of the post-SCF xc names (unit factors); the
+/// name -> libxc-code resolution reuses `DFA4REST::xc_func_init_fdqc`.
+pub fn post_xc_funcs_from_names(post_xc: &Vec<String>, spin_channel: usize) -> Vec<(f64, LibXCFunctional)> {
+    post_xc.iter().flat_map(|x| {
+        DFA4REST::xc_func_init_fdqc(x, spin_channel).into_iter()
+            .map(|code| (1.0, crate::dft::libxc_helper::xc_func_init(code, spin_channel)))
+            .collect::<Vec<_>>()
+    }).collect()
+}
+
+pub fn post_xc_exc(post_xc: &Vec<String>, spin_channel: usize, grids: &crate::dft::Grids, dm: &Vec<MatrixFull<f64>>, mo: &[MatrixFull<f64>;2], occ: &[Vec<f64>;2]) 
     -> Vec<[f64;2]> {
         let mut post_xc_energy:Vec<[f64;2]>=vec![];
-        let spin_channel = self.spin_channel;
         let num_grids = grids.coordinates.len();
         let num_basis = dm[0].size[0];
         let dt0 = utilities::init_timing();
-        let use_density_gradient = post_xc.iter().fold(false,|flag, x| {
-            let code = DFA4REST::xc_func_init_fdqc(x,spin_channel);
-            let x_flag = code.iter().fold(false, |flag, xc_code| {
-                let xc_func = self.init_libxc(xc_code);
-                flag || !matches!(xc_func.family(), LibXCFamily::LDA | LibXCFamily::HybLDA)
-            });
-            flag || x_flag
+        let all_funcs = post_xc_funcs_from_names(post_xc, spin_channel);
+        let use_density_gradient = all_funcs.iter().any(|(_factor, f)| {
+            !matches!(f.family(), LibXCFamily::LDA | LibXCFamily::HybLDA)
         });
-        let (rho, rhop, sigma, _lapl, _tau) = self.prepare_dft_quantities(
+        let use_kinetic = all_funcs.iter().any(|(_factor, f)| f.needs_tau());
+        let (rho, rhop, sigma, _lapl, _tau) = prepare_dft_quantities(
             grids,
             spin_channel,
             mo,
             occ,
+            use_kinetic,
             use_density_gradient,
         );
         let _dt2 = utilities::timing(&dt0, Some("evaluate rho/rhop/sigma"));
         //let (rho,rhop) = grids.prepare_tabulated_density(dm, spin_channel);
-        post_xc.iter().for_each(|x| {
+        for name in post_xc.iter() {
+            let funcs = post_xc_funcs_from_names(&vec![name.clone()], spin_channel);
             let mut exc = MatrixFull::new([num_grids,1],0.0);
             let mut exc_total = [0.0, 0.0];
-            let code = DFA4REST::xc_func_init_fdqc(x,spin_channel);
-            //println!("debug xc_code: {:?}", &code);
-            code.iter().for_each(|xc_code| {
-                exc.par_self_scaled_add(&self.xc_exc_code(xc_code, &rho, &sigma, spin_channel),1.0);
+            funcs.iter().for_each(|(_factor, xc_func)| {
+                exc.par_self_scaled_add(&xc_exc_code(xc_func, &rho, &sigma, spin_channel),1.0);
             });
 
-            let (exc_total_vec, _) = self.integrate_exc(&exc, &rho, &grids.weights, spin_channel);
+            let (exc_total_vec, _) = integrate_exc(&exc, &rho, &grids.weights, spin_channel);
             exc_total[0] = exc_total_vec[0];
             if spin_channel == 2 {
                 exc_total[1] = exc_total_vec[1];
@@ -2797,13 +2822,13 @@ impl DFA4REST {
             //println!("exc_total: {:?}", &exc_total);
 
             post_xc_energy.push(exc_total);
-        });
+        }
 
         post_xc_energy
 
     }
 
-    pub fn post_tabulated_exc(&self, 
+    pub fn post_tabulated_exc(funcs: &[(f64, LibXCFunctional)], spin_channel: usize, 
         grids: &crate::dft::Grids, 
         dm: &Vec<MatrixFull<f64>>, 
         mo: &[MatrixFull<f64>;2], 
@@ -2811,10 +2836,11 @@ impl DFA4REST {
     {
         use std::io::Write;
         let dt0 = utilities::init_timing();
-        let spin_channel = self.spin_channel;
         let num_grids = grids.coordinates.len();
         let num_basis = dm[0].size[0];
-        let use_density_gradient = self.use_density_gradient();
+        let use_density_gradient = funcs.iter().any(|(_factor, f)| {
+            !matches!(f.family(), LibXCFamily::LDA | LibXCFamily::HybLDA)
+        });
 
         //// 获取rayon的当前线程的ID
         //let id = rayon::current_thread_index().unwrap_or_default();
@@ -2857,20 +2883,22 @@ impl DFA4REST {
             }
         }
 
-        self.dfa_compnt_scf.iter().enumerate().for_each(|(i_xc, xc)| { 
+        funcs.iter().enumerate().for_each(|(i_xc, (_factor, xc_func))| { 
             //if spin_channel == 1 {
-                str_lines[0].push_str(&format!("{:>20} ", libxc::util::libxc_functional_get_name(*xc as i32).unwrap_or_else(|| "Unknown_XC".to_string())));
+                str_lines[0].push_str(&format!("{:>20} ", libxc::util::libxc_functional_get_name(xc_func.number() as i32).unwrap_or_else(|| "Unknown_XC".to_string())));
             //} else {
             //    str_lines[0].push_str(&format!("{:>20}_alpha ", &code_to_name(*xc)));
             //    str_lines[0].push_str(&format!("{:>20}_beta ", &code_to_name(*xc)));
             //}
         });
 
-        let (rho, rhop, sigma, _lapl, _tau) = self.prepare_dft_quantities(
+        let use_kinetic = funcs.iter().any(|(_factor, f)| f.needs_tau());
+        let (rho, rhop, sigma, _lapl, _tau) = prepare_dft_quantities(
             grids,
             spin_channel,
             mo,
             occ,
+            use_kinetic,
             use_density_gradient,
         );
 
@@ -2920,9 +2948,9 @@ impl DFA4REST {
                 });
             }
         }
-        self.dfa_compnt_scf.iter().enumerate().for_each(|(i_xc, xc)| { 
+        funcs.iter().enumerate().for_each(|(i_xc, (_factor, xc_func))| { 
             //let mut exc = MatrixFull::new([num_grids,1],0.0);
-            let exc = self.xc_exc_code(xc, &rho, &sigma, spin_channel);
+            let exc = xc_exc_code(xc_func, &rho, &sigma, spin_channel);
             str_lines[1..].par_iter_mut().zip(exc.par_iter_column(0)).for_each(|(line,exc_i)| {
                 line.push_str(&format!("{:20.10} ", exc_i));
             });
@@ -2961,33 +2989,33 @@ impl DFA4REST {
         //});
     }
 
-    pub fn xc_exc_list(&self, xc_code_list: &Vec<usize>, grids: &crate::dft::Grids, dm: &Vec<MatrixFull<f64>>, mo: &[MatrixFull<f64>;2], occ: &[Vec<f64>;2]) 
+    pub fn xc_exc_list(funcs: &[(f64, LibXCFunctional)], spin_channel: usize, grids: &crate::dft::Grids, dm: &Vec<MatrixFull<f64>>, mo: &[MatrixFull<f64>;2], occ: &[Vec<f64>;2]) 
     -> Vec<[f64;2]> {
         let mut xc_energy:Vec<[f64;2]>=vec![];
-        let spin_channel = self.spin_channel;
         let num_grids = grids.coordinates.len();
         let num_basis = dm[0].size[0];
         let dt0 = utilities::init_timing();
-        let use_density_gradient = xc_code_list.iter().fold(false,|flag, xc_code| {
-            let xc_func = self.init_libxc(xc_code);
-            flag || !matches!(xc_func.family(), LibXCFamily::LDA | LibXCFamily::HybLDA)
+        let use_density_gradient = funcs.iter().any(|(_factor, f)| {
+            !matches!(f.family(), LibXCFamily::LDA | LibXCFamily::HybLDA)
         });
-        let (rho, rhop, sigma, _lapl, _tau) = self.prepare_dft_quantities(
+        let use_kinetic = funcs.iter().any(|(_factor, f)| f.needs_tau());
+        let (rho, rhop, sigma, _lapl, _tau) = prepare_dft_quantities(
             grids,
             spin_channel,
             mo,
             occ,
+            use_kinetic,
             use_density_gradient,
         );
         let _dt2 = utilities::timing(&dt0, Some("evaluate rho/rhop/sigma"));
         //let (rho,rhop) = grids.prepare_tabulated_density(dm, spin_channel);
-        xc_code_list.iter().for_each(|xc_code| {
+        funcs.iter().for_each(|(_factor, xc_func)| {
             //let mut exc = MatrixFull::new([num_grids,1],0.0);
             let mut exc_total = [0.0, 0.0];
-            let exc = self.xc_exc_code(xc_code, &rho, &sigma, spin_channel);
+            let exc = xc_exc_code(xc_func, &rho, &sigma, spin_channel);
             //});
 
-            let (exc_total_vec, _) = self.integrate_exc(&exc, &rho, &grids.weights, spin_channel);
+            let (exc_total_vec, _) = integrate_exc(&exc, &rho, &grids.weights, spin_channel);
             exc_total[0] = exc_total_vec[0];
             if spin_channel == 2 {
                 exc_total[1] = exc_total_vec[1];
@@ -3001,43 +3029,32 @@ impl DFA4REST {
 
     }
 
-    pub fn xc_exc(&self, grids: &mut Grids, spin_channel: usize, dm: &mut Vec<MatrixFull<f64>>, mo: &mut [MatrixFull<f64>;2], occ: &mut [Vec<f64>;2], iop: usize, pos_components: Option<(&[usize], &[f64])>, mpi_operator: &Option<MPIOperator>) -> Vec<f64> {
+    pub fn xc_exc(funcs: &[(f64, LibXCFunctional)], grids: &mut Grids, spin_channel: usize, dm: &mut Vec<MatrixFull<f64>>, mo: &mut [MatrixFull<f64>;2], occ: &mut [Vec<f64>;2], mpi_operator: &Option<MPIOperator>) -> Vec<f64> {
         let num_grids = grids.coordinates.len();
         let num_basis = dm[0].size[0];
         let mut exc = MatrixFull::new([num_grids,1],0.0);
         let mut exc_total = vec![0.0;spin_channel];
         let dt0 = utilities::init_timing();
-        let (rho, rhop, sigma, lapl, tau) = self.prepare_dft_quantities(
+        let use_gradient = funcs.iter().any(|(_factor, f)| !matches!(f.family(), LibXCFamily::LDA | LibXCFamily::HybLDA));
+        let use_kinetic = funcs.iter().any(|(_factor, f)| f.needs_tau());
+        let (rho, rhop, sigma, lapl, tau) = prepare_dft_quantities(
             grids,
             spin_channel,
             mo,
             occ,
-            self.use_density_gradient(),
+            use_kinetic,
+            use_gradient,
         );
         let dt2 = utilities::timing(&dt0, Some("evaluate rho/rhop/sigma"));
 
-        if iop==0 {  // for the SCF energy
-            //let rho_trans = if spin_channel== 1 {
-            //    None
-            //} else {
-            //    Some(rho.transpose())
-            //};
-            self.dfa_compnt_scf.iter().zip(self.dfa_paramr_scf.iter()).for_each(|(xc_func,xc_para)| {
-                let xc_func = self.init_libxc_and_set_param(xc_func);
-                let tmp_exc = self.compute_exc_by_family(&xc_func, spin_channel, &rho, &sigma, &lapl, &tau);
-                exc.par_self_scaled_add(&tmp_exc, *xc_para);
-            });
-        } else if iop==1 { // for the post-SCF energy calculation: the final-energy functional's
-            // libxc components, passed in from the DFAdef (the narrowed xc_data carries none)
-            if let Some((dfa_compnt, dfa_paramr)) = pos_components {
-                dfa_compnt.iter().zip(dfa_paramr.iter()).for_each(|(xc_func,xc_para)| {
-                    let xc_func = self.init_libxc_and_set_param(xc_func);
-                    let tmp_exc = self.compute_exc_by_family(&xc_func, spin_channel, &rho, &sigma, &lapl, &tau);
-                    exc.par_self_scaled_add(&tmp_exc, *xc_para);
-                });
-            }
-        }
-        let (exc_total, _total_elec) = self.integrate_exc(&exc, &rho, &grids.weights, spin_channel);
+        // the (factor, functional) list decides what is evaluated: the SCF functional's
+        // components for the SCF energy, the final-energy functional's components
+        // (from the DFAdef) for the post-SCF energy
+        funcs.iter().for_each(|(xc_para, xc_func)| {
+            let tmp_exc = compute_exc_by_family(xc_func, spin_channel, &rho, &sigma, &lapl, &tau);
+            exc.par_self_scaled_add(&tmp_exc, *xc_para);
+        });
+        let (exc_total, _total_elec) = integrate_exc(&exc, &rho, &grids.weights, spin_channel);
         #[cfg(feature = "mpi")]
         let global_exc_total = if let Some(mpi_op) = &mpi_operator {
             let my_rank = mpi_op.rank;
@@ -3055,11 +3072,9 @@ impl DFA4REST {
 
     }
 
-    pub fn xc_exc_code(&self, xc_code: &usize, rho: &MatrixFull<f64>, sigma:&MatrixFull<f64>, spin_channel: usize) -> MatrixFull<f64> {
-        let xc_func = self.init_libxc_and_set_param(xc_code);
-        let num_grids = rho.size()[0];
-        self.compute_exc_by_family(&xc_func, spin_channel, rho, sigma, &MatrixFull::empty(), &MatrixFull::empty())
-    }
+pub fn xc_exc_code(xc_func: &LibXCFunctional, rho: &MatrixFull<f64>, sigma:&MatrixFull<f64>, spin_channel: usize) -> MatrixFull<f64> {
+    let num_grids = rho.size()[0];
+    compute_exc_by_family(xc_func, spin_channel, rho, sigma, &MatrixFull::empty(), &MatrixFull::empty())
 }
 
 pub fn contract_vxc_0(mat_a: &mut MatrixFull<f64>, mat_b: &MatrixFullSlice<f64>, slice_c: &[f64], scaling_factor: Option<f64>) {
@@ -5827,7 +5842,8 @@ impl Grids {
 
     pub fn prepare_tabulated_density_ensemble_slots(
         &self, 
-        xc_method: &DFA4REST, 
+        use_kinetic: bool,
+        use_gradient: bool,
         mo: &[MatrixFull<f64>; 2], 
         occ: &[Vec<f64>; 2], 
         spin_channel: usize, 
@@ -5860,8 +5876,8 @@ impl Grids {
         //     _ => 1,
         // }
         let mut nvar = 1;
-        let do_mgga = xc_method.use_kinetic_density();
-        let do_gga = xc_method.use_density_gradient();
+        let do_mgga = use_kinetic;
+        let do_gga = use_gradient;
         if do_mgga {
             nvar = 6;
         } else if do_gga {
@@ -5871,7 +5887,7 @@ impl Grids {
         }
         let mut cur_rho = RIFull::new([num_grids, spin_channel, nvar], 0.0);
         let ao = self.ao.as_ref().unwrap();
-        let aop = if xc_method.use_density_gradient() {
+        let aop = if use_gradient {
             self.aop.as_ref().unwrap()
         } else {
             &RIFull::empty()
@@ -5945,7 +5961,8 @@ impl Grids {
     /// Compressed version of `prepare_tabulated_density_ensemble_slots`.
     pub fn prepare_tabulated_density_ensemble_slots_compressed(
         &self,
-        xc_method: &DFA4REST,
+        use_kinetic: bool,
+        use_gradient: bool,
         mo: &[MatrixFull<f64>; 2],
         occ: &[Vec<f64>; 2],
         spin_channel: usize,
@@ -5953,8 +5970,8 @@ impl Grids {
     ) -> RIFull<f64> {
         let num_grids = range_grids.len();
 
-        let do_mgga = xc_method.use_kinetic_density();
-        let do_gga = xc_method.use_density_gradient();
+        let do_mgga = use_kinetic;
+        let do_gga = use_gradient;
         let nvar = if do_mgga {
             6
         } else if do_gga {

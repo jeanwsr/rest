@@ -2,7 +2,7 @@ pub mod parse;
 mod xc_helper;
 mod dispersion;
 
-pub use parse::{components_to_codes_params, parse_and_derive, DFAdef, DFAComponent};
+pub use parse::{components_to_codes_params, dh_xc_func_list_from_components, parse_and_derive, DFAdef, DFAComponent};
 pub use xc_helper::{ComponentType};
 
 

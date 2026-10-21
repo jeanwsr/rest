@@ -1,4 +1,5 @@
 #![warn(unused_imports)]
+use libxc::prelude::LibXCSpin;
 use crate::basis_io::ecp::ghost_effective_potential_matrix;
 use self::force_state_occupation::adapt_occupation_with_force_projection;
 use self::occupation::{generate_occupation_frac_occ, generate_occupation_integer, generate_occupation_sad, OCCType};
@@ -2975,9 +2976,10 @@ impl SCF {
         //println!("Exc[HF] = {:16.8}", exc_hf);
         let current_dfa = &self.mol.xc_data;
         let xc_energy_list = if let Some(grids) = &self.grids {
-            let xc_code_list = &current_dfa.dfa_compnt_scf;
-            self.mol.xc_data.xc_exc_list(
-                xc_code_list, 
+            let funcs = current_dfa.libxc_func_list();
+            crate::dft::xc_exc_list(
+                &funcs, 
+                self.mol.spin_channel,
                 grids, 
                 &self.density_matrix, 
                 &self.eigenvectors, 
@@ -3070,16 +3072,18 @@ impl SCF {
         let mo = &mut self.eigenvectors;
         let occ = &mut self.occupation;
         if let Some(grids) = &mut self.grids {
-            let pos_components = if iop == 1 {
-                let (codes, params) = crate::dft::parse_xc::components_to_codes_params(
-                    self.mol.dfadef.xc_nscf.as_deref().unwrap_or(&[]),
-                );
-                Some((codes, params))
-            } else {
-                None
+            // iop = 0: the SCF functional's components; iop = 1: the final-energy
+            // functional's components, taken from the DFAdef (the narrowed xc_data
+            // carries no post-SCF state)
+            let funcs = match iop {
+                0 => self.mol.xc_data.libxc_func_list(),
+                1 => {
+                    let spin = if spin_channel == 1 { LibXCSpin::Unpolarized } else { LibXCSpin::Polarized };
+                    crate::dft::parse_xc::dh_xc_func_list_from_components(self.mol.dfadef.xc_nscf.as_deref(), spin).unwrap_or_default()
+                },
+                other => panic!("evaluate_xc_energy: unknown iop {other}"),
             };
-            let pos_ref = pos_components.as_ref().map(|(c, p)| (c.as_slice(), p.as_slice()));
-            exc_spin = self.mol.xc_data.xc_exc(grids, spin_channel,dm, mo, occ,iop, pos_ref, mpi_operator);
+            exc_spin = crate::dft::xc_exc(&funcs, grids, spin_channel, dm, mo, occ, mpi_operator);
         }
         let exc:f64 = exc_spin.iter().sum();
         exc
@@ -3357,7 +3361,8 @@ impl SCF {
         let print_level = self.mol.ctrl.print_level;
         if let Some(grids) = &self.grids {
             let dt0 = utilities::init_timing();
-            let (exc,mut vxc_ao) = self.mol.xc_data.xc_exc_vxc(grids, spin_channel,dm, mo, occ, print_level);
+            let funcs = self.mol.xc_data.libxc_func_list();
+            let (exc,mut vxc_ao) = crate::dft::xc_exc_vxc(&funcs, grids, spin_channel,dm, mo, occ, print_level);
             let dt1 = utilities::timing(&dt0, Some("Total vxc_ao time"));
             exc_spin = exc;
             if let Some(ao) = &grids.ao {
@@ -3432,7 +3437,8 @@ impl SCF {
                 // change the return of xc_exc_vxc, directly return vxc_mat [num_basis, num_basis]
                 // let (exc,vxc_ao,total_elec) = self.mol.xc_data.xc_exc_vxc_slots_dm_only(range_grids.clone(), grids, spin_channel,dm, mo, occ);
                 //exc_spin = exc;
-                let (exc, vxc_mf, total_elec) = self.mol.xc_data.xc_exc_vxc_slots_dm_only(range_grids.clone(), grids, spin_channel,dm, mo, occ, self.mol.ctrl.print_level, self.mol.ctrl.vxc_screen_threshold);
+                let funcs = self.mol.xc_data.libxc_func_list();
+                let (exc, vxc_mf, total_elec) = crate::dft::xc_exc_vxc_slots_dm_only(&funcs, range_grids.clone(), grids, spin_channel,dm, mo, occ, self.mol.ctrl.print_level, self.mol.ctrl.vxc_screen_threshold);
                 // let mut vxc_mf: Vec<MatrixFull<f64>> = vec![MatrixFull::new([num_basis,num_basis],0.0f64);spin_channel];;
                 // if let Some(ao) = &grids.ao {
                 //     for i_spin in 0..spin_channel {
@@ -3634,7 +3640,8 @@ impl SCF {
                 // change the return value of xc_exc_vxc by vxc_mat [num_basis, num_basis]
                 // let (exc,vxc_ao,total_elec) = self.mol.xc_data.xc_exc_vxc_slots(range_grids.clone(), grids, spin_channel,dm, mo, occ);
                 //exc_spin = exc;
-                let (exc, vxc_mf, total_elec) = self.mol.xc_data.xc_exc_vxc_slots(range_grids.clone(), grids, spin_channel, dm, mo, occ, self.mol.ctrl.print_level, self.mol.ctrl.vxc_screen_threshold);
+                let funcs = self.mol.xc_data.libxc_func_list();
+                let (exc, vxc_mf, total_elec) = crate::dft::xc_exc_vxc_slots(&funcs, range_grids.clone(), grids, spin_channel, dm, mo, occ, self.mol.ctrl.print_level, self.mol.ctrl.vxc_screen_threshold);
                 // let mut vxc_mf: Vec<MatrixFull<f64>> = vec![MatrixFull::new([num_basis,num_basis],0.0f64);spin_channel];;
                 // if let Some(ao) = &grids.ao {
                 //     for i_spin in 0..spin_channel {

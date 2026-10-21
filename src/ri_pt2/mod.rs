@@ -179,8 +179,8 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     if !scf_data.mol.ctrl.post_ai_correction.to_lowercase().eq("none") {
         if let Some(grids) = &scf_data.grids {
             let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);
-            let post_xc_energy = dfa.post_xc_exc(
-                &vec![String::from("gga_x_pbe")], grids,
+            let post_xc_energy = crate::dft::post_xc_exc(
+                &vec![String::from("gga_x_pbe")], scf_data.mol.spin_channel, grids,
                 &scf_data.density_matrix, &scf_data.eigenvectors, &scf_data.occupation,
             );
             let mut x_pbe = post_xc_energy[0][0] + post_xc_energy[0][1];

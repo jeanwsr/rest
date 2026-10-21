@@ -13,7 +13,8 @@ use crate::dft::parse_xc::dispersion::{check_disp_suffix};
 // use cached::proc_macro::cached;
 use crate::dft::DFA4REST;
 use crate::dft::DFAFamily;
-use libxc::prelude::LibXCFunctional;
+use itertools::Itertools;
+use libxc::prelude::{LibXCFunctional, LibXCSpin};
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -1095,6 +1096,30 @@ pub fn parse_tokens(mut components: Vec<DFAComponent>, functype: &str) -> Vec<DF
 /// (e.g. `XCData` construction in the DH gradients).
 pub fn components_to_codes_params(components: &[DFAComponent]) -> (Vec<usize>, Vec<f64>) {
     components.iter().filter_map(|comp| comp.libxc_code_param()).unzip()
+}
+
+/// `(scale, functional)` pairs of the final-energy functional's DFT (libxc) part; `None`
+/// when `xc_nscf` is absent or carries no libxc component (pure-MP2-family post-SCF
+/// methods). Shared door of the DH response/gradient interfaces (restricted and
+/// spin-polarized siblings via `spin`).
+pub fn dh_xc_func_list_from_components(
+    xc_nscf: Option<&[DFAComponent]>,
+    spin: LibXCSpin,
+) -> Option<Vec<(f64, LibXCFunctional)>> {
+    let components = xc_nscf?;
+    let spin_channel = match spin {
+        LibXCSpin::Unpolarized => 1,
+        LibXCSpin::Polarized => 2,
+    };
+    let list: Vec<_> = components
+        .iter()
+        .filter_map(|comp| comp.to_libxc_functional(spin_channel).map(|func| (comp.factor, func)))
+        .collect_vec();
+    if list.is_empty() {
+        None
+    } else {
+        Some(list)
+    }
 }
 
 pub fn parse_and_derive(xc: &str, spin_channel: usize, print_level: usize) -> DFAdef {

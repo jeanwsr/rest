@@ -70,20 +70,7 @@ pub fn dh_xc_func_list_from_components(
     xc_nscf: Option<&[DFAComponent]>,
     spin: LibXCSpin,
 ) -> Option<Vec<(f64, LibXCFunctional)>> {
-    let components = xc_nscf?;
-    let spin_channel = match spin {
-        LibXCSpin::Unpolarized => 1,
-        LibXCSpin::Polarized => 2,
-    };
-    let list: Vec<_> = components
-        .iter()
-        .filter_map(|comp| comp.to_libxc_functional(spin_channel).map(|func| (comp.factor, func)))
-        .collect_vec();
-    if list.is_empty() {
-        None
-    } else {
-        Some(list)
-    }
+    crate::dft::parse_xc::dh_xc_func_list_from_components(xc_nscf, spin)
 }
 
 /// Solve the Z-vector (CP-SCF) equation for a Lagrangian of the (combined) post-SCF contributions.
