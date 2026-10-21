@@ -251,7 +251,7 @@ impl Molecule {
                             panic!("{}", err_strings.join("\n"));
                         }
                         dfadef.update_pt2_params(ctrl.ri_pt2.os_factor, ctrl.ri_pt2.ss_factor);
-                        let xc_data = dfadef.to_dfa4rest();
+                        let xc_data = dfadef.to_xc_data();
                         (dfadef, xc_data)
                     },
                     _ => {
@@ -283,7 +283,7 @@ impl Molecule {
         mol.dfadef = dfadef;
         mol.xc_data = xc_data;
 
-        mol.use_eri = mol.xc_data.use_eri();
+        mol.use_eri = mol.dfadef.use_eri();
         
 
         mol.start_mo = mol.generate_start_mo(mol.ecp_electrons);

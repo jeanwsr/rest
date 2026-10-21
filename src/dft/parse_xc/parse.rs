@@ -870,7 +870,13 @@ impl DFAdef {
 
     pub fn is_hybrid(&self) -> bool {
         // todo: what if not initialized?
-        self.dfa_hybrid_scf.abs() >= 1e-6
+        self.dfa_hybrid_scf.abs() >= 1e-6 || self.is_rsh()
+    }
+
+    /// `true` when the definition needs the four-center ERI: a hybrid/rsh SCF functional
+    /// or a fifth-rung (post-SCF) family; mirrors `DFA4REST::use_eri`.
+    pub fn use_eri(&self) -> bool {
+        self.is_hybrid() || self.is_fifth_dfa()
     }
 
     pub fn is_rsh(&self) -> bool {
