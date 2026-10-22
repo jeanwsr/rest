@@ -544,6 +544,9 @@ pub struct DFAdef {
     pub dfa_hybrid_scf: f64,
     // (omega, alpha, beta) in libxc convention; note beta is usually not used in computation.
     pub dfa_rsh_scf: (Option<f64>, f64, f64),
+    // the same functional in the consumer convention of DFA4REST::rsh_params:
+    // (omega, c_LR, c_SR); None for a non-RSH functional.
+    pub dfa_rsh_scf_lrsr: Option<(f64, f64, f64)>,
     pub dfa_hybrid_nscf: Option<f64>,
 }
 
@@ -557,6 +560,7 @@ impl DFAdef {
             spin_channel: 1,
             dfa_hybrid_scf: 0.0,
             dfa_rsh_scf: (None, 0.0, 0.0),
+            dfa_rsh_scf_lrsr: None,
             dfa_hybrid_nscf: None,
         }
     }
@@ -583,11 +587,11 @@ impl DFAdef {
         let mut dfadef = DFAdef::new();
         dfadef.spin_channel = dfa.spin_channel;
         dfadef.dfa_hybrid_scf = dfa.dfa_hybrid_scf;
-        dfadef.dfa_rsh_scf = (
-            dfa.dfa_rsh_scf.map(|(omega, _, _)| omega),
-            dfa.dfa_rsh_scf.map_or(0.0, |(_, alpha, _)| alpha),
-            dfa.dfa_rsh_scf.map_or(0.0, |(_, _, beta)| beta),
-        );
+        dfadef.dfa_rsh_scf_lrsr = dfa.dfa_rsh_scf;
+        dfadef.dfa_rsh_scf = match dfa.dfa_rsh_scf {
+            Some((omega, c_lr, c_sr)) => (Some(omega), c_lr, c_sr - c_lr),
+            None => (None, 0.0, 0.0),
+        };
         dfadef.xc_scf = Some(
             dfa.dfa_compnt_scf
                 .iter()
@@ -680,13 +684,7 @@ impl DFAdef {
                 }
             }
         }
-        let alpha = self.dfa_rsh_scf.1;
-        let beta = self.dfa_rsh_scf.2;
-        if let Some(omega) = self.dfa_rsh_scf.0 {
-            xc_data.dfa_rsh_scf = Some((omega, alpha, beta));
-        } else {
-            xc_data.dfa_rsh_scf = None;
-        }
+        xc_data.dfa_rsh_scf = self.dfa_rsh_scf_lrsr;
         xc_data
     }
 
@@ -900,12 +898,6 @@ impl DFAdef {
     /// or a fifth-rung (post-SCF) family; mirrors `DFA4REST::use_eri`.
     pub fn use_eri(&self) -> bool {
         self.is_hybrid() || self.is_fifth_dfa()
-    }
-
-    /// `(omega, c_LR, c_SR)` of the stored definition (consumer convention, as
-    /// filled by `parse_and_derive`); `None` for a non-RSH functional.
-    pub fn rsh_params(&self) -> Option<(f64, f64, f64)> {
-        self.dfa_rsh_scf.0.map(|omega| (omega, self.dfa_rsh_scf.1, self.dfa_rsh_scf.2))
     }
 
     pub fn omega(&self) -> Option<f64> {
@@ -1192,7 +1184,9 @@ pub fn parse_and_derive(xc: &str, spin_channel: usize, print_level: usize) -> DF
     // restore intermediate variables
     // dfa.init_libxc();
     dfa.dfa_hybrid_scf = dfa.get_hybrid_scf(spin_channel);
-    dfa.dfa_rsh_scf = dfa.get_rsh_scf_lrsr(spin_channel);
+    dfa.dfa_rsh_scf = dfa.get_rsh_scf(spin_channel);
+    let (omega, c_lr, c_sr) = dfa.get_rsh_scf_lrsr(spin_channel);
+    dfa.dfa_rsh_scf_lrsr = omega.map(|omega| (omega, c_lr, c_sr));
     if dfa.has_nscf() {
         dfa.dfa_hybrid_nscf = Some(dfa.get_hybrid_nscf(spin_channel));
     }

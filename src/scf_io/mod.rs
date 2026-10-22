@@ -2322,7 +2322,7 @@ impl SCF {
         // F_ex = base_scaling * alpha * K_full + (-base_scaling) * (alpha-hyb) * K_erfc
         let base_scaling = match self.scftype { SCFType::RHF => -0.5, _ => -1.0 };
 
-        if let Some((omega, alpha, _)) = self.mol.dfadef.rsh_params() {
+        if let Some((omega, alpha, _)) = self.mol.dfadef.dfa_rsh_scf_lrsr {
             let hyb = self.mol.dfadef.dfa_hybrid_scf;
             let scaling_kfull = base_scaling * alpha;           // alpha * K_full
             let scaling_ksr = -base_scaling * (alpha - hyb);    // - (alpha-hyb) * K_erfc  (note: sign flipped)
