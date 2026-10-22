@@ -518,6 +518,21 @@ impl std::ops::Add for DFAComponent {
 }
 
 impl DFAComponent {
+    /// A Libxc component from a functional code and scale factor (e.g. for the
+    /// temporary xc swaps in ri_gw); the names come from `xc_helper::get_name`.
+    pub fn from_libxc(id: usize, factor: f64) -> Self {
+        DFAComponent {
+            factor,
+            func: get_name(id),
+            func_full_name: get_name(id),
+            id,
+            param_positional: Vec::new(),
+            param_keyword: HashMap::new(),
+            component_type: ComponentType::Libxc,
+            reference: Vec::new(),
+        }
+    }
+
     /// `(libxc functional code, scale factor)` of a Libxc component; `None` for the
     /// non-libxc component types (HF/RSHF/PT2/RPA/SCSRPA/SBGE2/Disp/Unknown).
     pub fn libxc_code_param(&self) -> Option<(usize, f64)> {

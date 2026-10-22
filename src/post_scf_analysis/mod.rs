@@ -376,11 +376,7 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             let vxc_nn_spin: Option<[Vec<f64>;2]> = if scf_data.mol.spin_channel==2 {
                 Some(ri_gw::vxc_ao2mo_spin(scf_data))
             } else { None };
-            let xc_data=scf_data.mol.xc_data.clone();
-            println!("Current XC data:");
-            println!("dfa_compnt_scf={:?}",xc_data.dfa_compnt_scf);
-            println!("dfa_paramr_scf={:?}",xc_data.dfa_paramr_scf);
-            println!("dfa_hybrid_scf={}",xc_data.dfa_hybrid_scf);
+            scf_data.mol.dfadef.summary();
             if qp_ctrl.homo_lumo_gw_qp==true{
                 ri_gw::get_homo_lumo_qp_only(scf_data,20,&vxc_nn,mpi_operator);
             }else if qp_ctrl.self_energy_spectrum_test==true{

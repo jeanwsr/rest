@@ -167,7 +167,7 @@ pub fn rscf_hess_interface<'a>(
 /// grid-shift attribution requires the ByAtom grouping. The regrouping only permutes, never
 /// changes values.
 pub(crate) fn scf_skeleton_nimatmul<'a>(scf_data: &'a SCF, cfg: &AnalDrvNucgradCfg) -> Option<NIMatmul<'a>> {
-    if scf_data.mol.xc_data.dfa_compnt_scf.is_empty() {
+    if !scf_data.mol.dfadef.is_dfa_scf() {
         return None;
     }
     let mol = get_cint_mol(&scf_data.mol);

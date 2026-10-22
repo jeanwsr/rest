@@ -36,7 +36,7 @@ use libxc::prelude::*;
 /// the correction object, following the same decomposition as the SCF Fock assembly:
 /// `K = alpha * K_full + factor_k_sr * K_erfc` with `factor_k_sr = hyb - alpha`.
 pub fn scf_jk_factors(scf_data: &SCF) -> (f64, f64, Option<(f64, f64)>) {
-    let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+    let is_hf = !scf_data.mol.dfadef.is_dfa_scf();
     let factor_j = 1.0;
     let factor_k = match is_hf {
         true => 1.0,
@@ -53,13 +53,8 @@ pub fn scf_jk_factors(scf_data: &SCF) -> (f64, f64, Option<(f64, f64)>) {
 /// List of `(scale, functional)` pairs of the SCF XC functional, in the given libxc spin
 /// treatment.
 pub fn scf_xc_func_list_with_spin(scf_data: &SCF, spin: LibXCSpin) -> Vec<(f64, LibXCFunctional)> {
-    let xc_code = &scf_data.mol.xc_data.dfa_compnt_scf;
-    let xc_params = &scf_data.mol.xc_data.dfa_paramr_scf;
-    xc_code
-        .iter()
-        .zip(xc_params.iter())
-        .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, spin)))
-        .collect_vec()
+    let spin_channel = match spin { LibXCSpin::Unpolarized => 1, _ => 2 };
+    scf_data.mol.dfadef.scf_func_list(spin_channel)
 }
 
 /// List of `(scale, functional)` pairs of the SCF XC functional (spin-unpolarized).
@@ -392,7 +387,7 @@ pub fn rscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> RRe
 
     // --- DFT --- //
 
-    let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+    let is_hf = !scf_data.mol.dfadef.is_dfa_scf();
     if !is_hf {
         let xc_func_list = scf_xc_func_list(scf_data);
         let verbose = scf_data.mol.ctrl.print_level > 2;

@@ -2075,12 +2075,11 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
 pub fn get_pure_x_or_c_of_xc(scf_data:&mut SCF,name:&str,choice:char)->Vec<f64>{
     let eigenvecs=scf_data.eigenvectors.clone();
     let x_or_c=if choice=='X'{1}else if choice=='C'{2}else{panic!("invalid choice for pure x/c!")};
-    let dfa_compnt_save=scf_data.mol.xc_data.dfa_compnt_scf.clone();
-    let dfa_paramr_save=scf_data.mol.xc_data.dfa_paramr_scf.clone();
+    let xc_scf_save=scf_data.mol.dfadef.xc_scf.clone();
     let mut new_paramr=vec![0.0,0.0,0.0];
     new_paramr[x_or_c]=1.0;
-    scf_data.mol.xc_data.dfa_compnt_scf=DFA4REST::libxc_code_fdqc(name).to_vec();
-    scf_data.mol.xc_data.dfa_paramr_scf=new_paramr;
+    scf_data.mol.dfadef.xc_scf=Some(DFA4REST::libxc_code_fdqc(name).iter().zip(new_paramr.iter())
+        .map(|(&id, &factor)| crate::dft::parse_xc::DFAComponent::from_libxc(id, factor)).collect());
     let v_x_or_c_ao=scf_data.generate_vxc_rayon(1.0).2[0].to_matrixfull().unwrap().clone();
     let dimensions=v_x_or_c_ao.size[0];
     let mut v_x_or_c_nn=vec![0.0;dimensions];
@@ -2094,8 +2093,7 @@ pub fn get_pure_x_or_c_of_xc(scf_data:&mut SCF,name:&str,choice:char)->Vec<f64>{
         }
         v_x_or_c_nn[i]=element;
     }
-    scf_data.mol.xc_data.dfa_compnt_scf=dfa_compnt_save;
-    scf_data.mol.xc_data.dfa_paramr_scf=dfa_paramr_save;
+    scf_data.mol.dfadef.xc_scf=xc_scf_save;
     v_x_or_c_nn
 }
 pub fn get_homo_vx_or_vc(scf_data:&mut SCF,name:&str,choice:char)->f64{
@@ -2103,12 +2101,9 @@ pub fn get_homo_vx_or_vc(scf_data:&mut SCF,name:&str,choice:char)->f64{
     let eigenvecs=scf_data.eigenvectors.clone();
     let x_or_c=if choice=='X'{1}else if choice=='C'{2}else{panic!("invalid choice for pure x/c!")};
     //println!("About to save DFA4REST");
-    let dfa_compnt_save=scf_data.mol.xc_data.dfa_compnt_scf.clone();
-    let dfa_paramr_save=scf_data.mol.xc_data.dfa_paramr_scf.clone();
+    let xc_scf_save=scf_data.mol.dfadef.xc_scf.clone();
     //println!("About to obtain xc_code and change DFA4REST");
-    scf_data.mol.xc_data.dfa_compnt_scf=vec![DFA4REST::libxc_code_fdqc(name)[x_or_c]];
-    //println!("xc_code has been obtained");
-    scf_data.mol.xc_data.dfa_paramr_scf=vec![1.0];
+    scf_data.mol.dfadef.xc_scf=Some(vec![crate::dft::parse_xc::DFAComponent::from_libxc(DFA4REST::libxc_code_fdqc(name)[x_or_c], 1.0)]);
     //println!("About to generate vxc");
     let v_x_or_c_ao=scf_data.generate_vxc_rayon(1.0).2[0].to_matrixfull().unwrap().clone();
     //println!("vxc has been generated");
@@ -2120,8 +2115,7 @@ pub fn get_homo_vx_or_vc(scf_data:&mut SCF,name:&str,choice:char)->f64{
         }
     }
     //println!("About to recover DFA4REST");
-    scf_data.mol.xc_data.dfa_compnt_scf=dfa_compnt_save;
-    scf_data.mol.xc_data.dfa_paramr_scf=dfa_paramr_save;
+    scf_data.mol.dfadef.xc_scf=xc_scf_save;
     //println!("DFA4REST has been recovered");
     element
 }

@@ -30,7 +30,7 @@ use tensors::matrix::matrixfullslice::MatrixFullSlice;
 
 impl<'a> NumInt<'a> for RIRHFGradient<'a> {
     fn gen_xc_data(&'a self, scf_data: &'a SCF, spin: usize) -> XCData<'a> {
-        let xc_method = &self.scf_data.mol.xc_data;
+        let xc_method = &self.scf_data.mol.dfadef;
         let xc_type = if xc_method.use_kinetic_density() {
             XCType::MGGA
         } else if xc_method.use_density_gradient() {
@@ -39,8 +39,9 @@ impl<'a> NumInt<'a> for RIRHFGradient<'a> {
             XCType::LDA
         };
 
-        let xc_code = &xc_method.dfa_compnt_scf;
-        let xc_params = &xc_method.dfa_paramr_scf;
+        let (xc_code, xc_params) = crate::dft::parse_xc::components_to_codes_params(
+            xc_method.xc_scf.as_deref().expect("the SCF functional has no libxc components"),
+        );
 
         let density_matrix = &scf_data.density_matrix;
         let mo_coeffs = scf_data.eigenvectors.clone().to_vec();
@@ -109,7 +110,7 @@ impl<'a> NumInt<'a> for RIRHFGradient<'a> {
                     eval_rho5_dm_only_batch(&block.ao, xc_data.xc_type, xc_data.dm, spin + 1, num_grids)
                 };
 
-                let loc_xc_tensor = eval_xc_eff(xc_data.xc_code, xc_data.xc_params, xc_data.xc_type, spin, loc_rho.raw(), num_grids, deriv);
+                let loc_xc_tensor = eval_xc_eff(&xc_data.xc_code, &xc_data.xc_params, xc_data.xc_type, spin, loc_rho.raw(), num_grids, deriv);
                 
                 // let loc_rho = rt::asarray((rho_array, shape, device));
                 let loc_vxc = if let Some(vxc) = loc_xc_tensor[1].as_ref() {
@@ -622,7 +623,7 @@ fn get_vxc(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &mut Grids,
                 eval_rho5_dm_only_batch(&block.ao, xc_data.xc_type, xc_data.dm, 1, num_grids)
             };
 
-            let loc_xc_tensor = eval_xc_eff(xc_data.xc_code, xc_data.xc_params, xc_data.xc_type, 0, &loc_rho.raw(), num_grids, deriv);
+            let loc_xc_tensor = eval_xc_eff(&xc_data.xc_code, &xc_data.xc_params, xc_data.xc_type, 0, &loc_rho.raw(), num_grids, deriv);
             
             // let loc_rho = rt::asarray((rho_array, shape, device));
             let loc_vxc = if let Some(vxc) = loc_xc_tensor[1].as_ref() {
@@ -708,7 +709,7 @@ fn get_vxc_rayon(gradient_method: &RIRHFGradient, xc_data: &XCData, grids: &mut 
                 eval_rho5_dm_only_batch(&loc_ao, xc_data.xc_type, xc_data.dm, 1, num_grids)
             };
             // eval vxc on grids 
-            let loc_xc_tensor = eval_xc_eff(xc_data.xc_code, xc_data.xc_params, xc_data.xc_type, 0, &loc_rho.raw(), num_grids, deriv);
+            let loc_xc_tensor = eval_xc_eff(&xc_data.xc_code, &xc_data.xc_params, xc_data.xc_type, 0, &loc_rho.raw(), num_grids, deriv);
             // let loc_rho = rt::asarray((rho_array, shape, device));
             let loc_vxc = if let Some(vxc) = loc_xc_tensor[1].as_ref() {
                 rt::asarray(vxc)
@@ -860,7 +861,7 @@ pub fn get_vxc_rayon_new(gradient_method: &RIRHFGradient, xc_data: &XCData, grid
                 eval_rho5_dm_only_batch(&block.ao, xc_data.xc_type, dm_use, 1, ng)
             };
 
-            let xc_ten = eval_xc_eff(xc_data.xc_code, xc_data.xc_params, xc_data.xc_type, 0, &loc_rho.raw(), ng, deriv);
+            let xc_ten = eval_xc_eff(&xc_data.xc_code, &xc_data.xc_params, xc_data.xc_type, 0, &loc_rho.raw(), ng, deriv);
             GRID_BLOCK_RHOXC_NS.fetch_add(t_rhoxc.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             let loc_vxc = rt::asarray(xc_ten[1].as_ref().expect("vxc not provided for this xc_type"));
 

@@ -65,7 +65,7 @@ pub struct Molecule {
     pub spin_channel: usize,
     // exchange-correlation functionals
     pub dfadef: parse_xc::DFAdef,
-    pub xc_data: DFA4REST,
+    pub xc_data: Option<DFA4REST>,
     pub use_eri: bool,
     #[pyo3(get, set)]
     pub num_state: usize,
@@ -117,7 +117,7 @@ impl Molecule {
             ctrl:InputKeywords::init_ctrl(),
             mpi_data: None,
             dfadef: parse_xc::DFAdef::new(), 
-            xc_data: DFA4REST::new("hf",1, 0),
+            xc_data: None,
             use_eri: false,
             geom: GeomCell::init_geom(),
             num_elec: [0.0;3],
@@ -242,7 +242,7 @@ impl Molecule {
                     let mut cur_xc_data = DFA4REST::new(&ctrl.xc, ctrl.spin_channel, ctrl.print_level);
                     cur_xc_data.update_pt2_params(ctrl.ri_pt2.os_factor, ctrl.ri_pt2.ss_factor);
                     let cur_dfadef = parse_xc::DFAdef::from_dfa4rest(&cur_xc_data);
-                    (cur_dfadef, cur_xc_data)
+                    (cur_dfadef, Some(cur_xc_data))
                     },
                     "parse_xc" => {
                         let mut dfadef = parse_xc::parse_and_derive(&ctrl.xc, ctrl.spin_channel, ctrl.print_level);
@@ -251,8 +251,7 @@ impl Molecule {
                             panic!("{}", err_strings.join("\n"));
                         }
                         dfadef.update_pt2_params(ctrl.ri_pt2.os_factor, ctrl.ri_pt2.ss_factor);
-                        let xc_data = dfadef.to_xc_data();
-                        (dfadef, xc_data)
+                        (dfadef, None)
                     },
                     _ => {
                         panic!("Error:: Unknown xc_parser '{}'. Please use either 'legacy' or 'parse_xc'", 
@@ -270,11 +269,13 @@ impl Molecule {
             DFTType::DeepLearning => {
                 let cur_xc_data = DFA4REST::new_deep_learning(ctrl.spin_channel, ctrl.print_level, &ctrl.xc_model);
                 let cur_dfadef = parse_xc::DFAdef::from_dfa4rest(&cur_xc_data);
-                (cur_dfadef, cur_xc_data)
+                (cur_dfadef, Some(cur_xc_data))
             }
         };
 
-        xc_data.summary(ctrl.print_level);
+        if let Some(xc_data) = &xc_data {
+            xc_data.summary(ctrl.print_level);
+        }
         if let Some(stop_at) = &ctrl.stop_at {
             if stop_at == "parse_xc" {
                 std::process::exit(0);
@@ -289,7 +290,9 @@ impl Molecule {
         mol.start_mo = mol.generate_start_mo(mol.ecp_electrons);
 
         if ctrl.print_level>0 {
-            mol.xc_data.xc_version();
+            if mol.xc_data.is_some() {
+                mol.xc_data.as_ref().unwrap().xc_version();
+            }
             println!("nbas: {}, natm: {} for standard basis sets", mol.cint_bas.len(), mol.cint_atm.len());
             println!("First valence state for the frozen-core algorithm: {:5}", mol.start_mo);
         };

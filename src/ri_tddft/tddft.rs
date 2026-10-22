@@ -138,7 +138,7 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
     // An HF reference has no XC kernel and no DFT grids: the tables stay
     // `None` and the MO matvecs treat absent tables as a zero fxc
     // contribution (the Hessian then runs the RI J/K parts only).
-    let (fxc, fxc_u) = if scf.mol.xc_data.dfa_compnt_scf.is_empty() {
+    let (fxc, fxc_u) = if !scf.mol.dfadef.is_dfa_scf() {
         (None, None)
     } else if is_uhf {
         let fxc_u = prepare_fxc_data_unrestricted(scf);
@@ -282,14 +282,14 @@ pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTDa
     let is_uhf = scf.scftype == SCFType::UHF;
     let sector_list = crate::ri_tddft::utils::tddft_sector_params(scf);
     let n_sec = sector_list.len();
-    let xc_data = &scf.mol.xc_data;
+    let dfadef = &scf.mol.dfadef;
 
     // ── Hartree-Fock reference: no libxc components, no XC kernel, no DFT
     // grids. The AO matvec machinery runs the RI J/K parts only:
     // `fxc_driver: None` disables the fxc step (the same sentinel MO-mode
     // data uses). This enables stability analysis (and AO-mode TDDFT) for
     // HF references.
-    if xc_data.dfa_compnt_scf.is_empty() {
+    if !dfadef.is_dfa_scf() {
         println!("HF reference: no XC kernel; the stability Hessian runs the RI J/K parts only");
         let (c_occ_all, c_vir_all) = sector_mo_coeffs(scf, &sector_list);
         return TDDFTData {
@@ -314,7 +314,7 @@ pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTDa
     let ngrids = grids.weights.len();
     let num_basis = scf.mol.num_basis;
     let weights = &grids.weights;
-    let nvar = if xc_data.use_density_gradient() { 4 } else { 1 };
+    let nvar = if dfadef.use_density_gradient() { 4 } else { 1 };
     let den_type = if nvar == 4 { XCDenType::SIGMA } else { XCDenType::RHO };
     // Response exchange split (REST RSH convention, mirrors the ground-state
     // Fock build in scf_io): `coeff_full*K_full + coeff_sr*K_SR` with
@@ -372,11 +372,7 @@ pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTDa
             let dm_views = [dm_a.to_rstsr_view(&device), dm_b.to_rstsr_view(&device)];
             ni.make_rho_from_dm(&dm_views, den_type) // [ngrids, nvar, 2]
         };
-        let xc_func_list_pol: Vec<(f64, LibXCFunctional)> = xc_data.dfa_compnt_scf
-            .iter()
-            .zip(xc_data.dfa_paramr_scf.iter())
-            .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Polarized)))
-            .collect();
+        let xc_func_list_pol: Vec<(f64, LibXCFunctional)> = dfadef.scf_func_list(2);
         let (_vxc0, fxc_eff_u) = crate::dft::numint_matmul::resp_uks::eval_vxc_fxc_uks_from_rho(
             &xc_func_list_pol, rho0_u.view());
         (rho0_u, fxc_eff_u)
@@ -397,11 +393,7 @@ pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTDa
             ni.make_rho_from_dm(&[dm0_view], den_type) // [ngrids, nvar, 1]
         };
 
-        let xc_func_list: Vec<(f64, LibXCFunctional)> = xc_data.dfa_compnt_scf
-            .iter()
-            .zip(xc_data.dfa_paramr_scf.iter())
-            .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Unpolarized)))
-            .collect();
+        let xc_func_list: Vec<(f64, LibXCFunctional)> = dfadef.scf_func_list(1);
 
         // ── Spin-channel-aware fxc kernel (CPL, 256, 454; PySCF `nr_rks_fxc_st`) ──
         // Singlet:   f_s = f↑↑ + f↑↓ = 2 × (unpolarized kernel at the total density).
@@ -415,11 +407,7 @@ pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTDa
         let rho0_g = rho0_r.i((.., .., 0)); // [ngrids, nvar] ground density + gradients
         let fxc_eff_r = match tddft_spin {
             "triplet" => {
-                let xc_func_list_pol: Vec<(f64, LibXCFunctional)> = xc_data.dfa_compnt_scf
-                    .iter()
-                    .zip(xc_data.dfa_paramr_scf.iter())
-                    .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Polarized)))
-                    .collect();
+                let xc_func_list_pol: Vec<(f64, LibXCFunctional)> = dfadef.scf_func_list(2);
                 // Polarized closed-shell ground density (ρ/2, ∇ρ/2) per spin,
                 // layout [ngrids, ncomp_in, 2] (GGA input: ncomp_in = 5, LDA: 1).
                 let ncomp_in = if nvar == 4 { 5 } else { 1 };

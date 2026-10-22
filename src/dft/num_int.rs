@@ -607,8 +607,8 @@ pub fn prepare_fxc_data(scf: &SCF) -> FXCMatvecData {
     let (start_mo, _num_state, occ_size, vir_size, _homo, _lumo) =
         tddft_occupation_parameters(scf);
 
-    let xc_data = &scf.mol.xc_data;
-    let xc_type = if xc_data.use_density_gradient() {
+    let dfadef = &scf.mol.dfadef;
+    let xc_type = if dfadef.use_density_gradient() {
         XCType::GGA
     } else {
         XCType::LDA
@@ -618,7 +618,7 @@ pub fn prepare_fxc_data(scf: &SCF) -> FXCMatvecData {
         XCType::GGA => 4,
         _ => panic!("fxc only supports LDA and GGA"),
     };
-    let alpha_hybrid = xc_data.dfa_hybrid_scf;
+    let alpha_hybrid = dfadef.dfa_hybrid_scf;
 
     let grids = scf.grids.as_ref().expect("DFT grids must be initialized for fxc");
     let ngrids = grids.weights.len();
@@ -717,9 +717,10 @@ pub fn prepare_fxc_data(scf: &SCF) -> FXCMatvecData {
     };
 
     // ── Compute fxc kernel analytically via libxc ──
-    let func_ids = &xc_data.dfa_compnt_scf;
-    let func_factors = &xc_data.dfa_paramr_scf;
-    let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_array, ngrids, 2);
+    let (xc_codes, xc_params) = crate::dft::parse_xc::components_to_codes_params(
+        dfadef.xc_scf.as_deref().expect("the SCF functional has no libxc components"),
+    );
+    let xc_tensors = eval_xc_eff(&xc_codes, &xc_params, xc_type, 0, &rho_array, ngrids, 2);
 
     // xc_tensors[2] = fxc kernel (deriv=2)
     let fxc_tensor = xc_tensors[2].as_ref()
@@ -799,8 +800,8 @@ fn prepare_fxc_data_impl(
     vir_size: usize,
     lumo: usize,
 ) -> FXCMatvecData {
-    let xc_data = &scf.mol.xc_data;
-    let xc_type = if xc_data.use_density_gradient() {
+    let dfadef = &scf.mol.dfadef;
+    let xc_type = if dfadef.use_density_gradient() {
         XCType::GGA
     } else {
         XCType::LDA
@@ -810,7 +811,7 @@ fn prepare_fxc_data_impl(
         XCType::GGA => 4,
         _ => panic!("fxc only supports LDA and GGA"),
     };
-    let alpha_hybrid = xc_data.dfa_hybrid_scf;
+    let alpha_hybrid = dfadef.dfa_hybrid_scf;
 
     let grids = scf.grids.as_ref().expect("DFT grids must be initialized for fxc");
     let ngrids = grids.weights.len();
@@ -907,9 +908,10 @@ fn prepare_fxc_data_impl(
     };
 
     // ── Compute fxc kernel analytically via libxc ──
-    let func_ids = &xc_data.dfa_compnt_scf;
-    let func_factors = &xc_data.dfa_paramr_scf;
-    let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_array, ngrids, 2);
+    let (xc_codes, xc_params) = crate::dft::parse_xc::components_to_codes_params(
+        dfadef.xc_scf.as_deref().expect("the SCF functional has no libxc components"),
+    );
+    let xc_tensors = eval_xc_eff(&xc_codes, &xc_params, xc_type, 0, &rho_array, ngrids, 2);
 
     // xc_tensors[2] = fxc kernel (deriv=2)
     let fxc_tensor = xc_tensors[2].as_ref()
@@ -1036,8 +1038,8 @@ pub fn prepare_fxc_data_unrestricted(scf: &SCF) -> FXCMatvecDataUnrestricted {
     let nvir = [p0.3, p1.3];
     let lumo = [p0.5, p1.5];
 
-    let xc_data = &scf.mol.xc_data;
-    let xc_type = if xc_data.use_density_gradient() {
+    let dfadef = &scf.mol.dfadef;
+    let xc_type = if dfadef.use_density_gradient() {
         XCType::GGA
     } else {
         XCType::LDA
@@ -1047,7 +1049,7 @@ pub fn prepare_fxc_data_unrestricted(scf: &SCF) -> FXCMatvecDataUnrestricted {
         XCType::GGA => 4,
         _ => panic!("fxc only supports LDA and GGA"),
     };
-    let alpha_hybrid = xc_data.dfa_hybrid_scf;
+    let alpha_hybrid = dfadef.dfa_hybrid_scf;
 
     let grids = scf.grids.as_ref().expect("DFT grids must be initialized for fxc");
     let ngrids = grids.weights.len();
@@ -1169,9 +1171,10 @@ pub fn prepare_fxc_data_unrestricted(scf: &SCF) -> FXCMatvecDataUnrestricted {
         raw[offset..offset + ngrids * nvar * 2].to_vec()
     };
 
-    let func_ids = &xc_data.dfa_compnt_scf;
-    let func_factors = &xc_data.dfa_paramr_scf;
-    let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 1, &rho_array, ngrids, 2);
+    let (xc_codes, xc_params) = crate::dft::parse_xc::components_to_codes_params(
+        dfadef.xc_scf.as_deref().expect("the SCF functional has no libxc components"),
+    );
+    let xc_tensors = eval_xc_eff(&xc_codes, &xc_params, xc_type, 1, &rho_array, ngrids, 2);
     let fxc_tensor = xc_tensors[2].as_ref()
         .expect("fxc (deriv=2) should be available for unrestricted TDDFT");
 
@@ -2191,8 +2194,8 @@ pub fn prepare_fxc_data_nwchem_opt(scf: &SCF) -> FXCMatvecDataNwchemOpt {
     let (start_mo, _num_state, occ_size, vir_size, _homo, _lumo) =
         tddft_occupation_parameters(scf);
 
-    let xc_data = &scf.mol.xc_data;
-    let xc_type = if xc_data.use_density_gradient() {
+    let dfadef = &scf.mol.dfadef;
+    let xc_type = if dfadef.use_density_gradient() {
         XCType::GGA
     } else {
         XCType::LDA
@@ -2269,9 +2272,10 @@ pub fn prepare_fxc_data_nwchem_opt(scf: &SCF) -> FXCMatvecDataNwchemOpt {
         raw[offset..offset + ngrids * nvar].to_vec()
     };
 
-    let func_ids = &xc_data.dfa_compnt_scf;
-    let func_factors = &xc_data.dfa_paramr_scf;
-    let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_array, ngrids, 2);
+    let (xc_codes, xc_params) = crate::dft::parse_xc::components_to_codes_params(
+        dfadef.xc_scf.as_deref().expect("the SCF functional has no libxc components"),
+    );
+    let xc_tensors = eval_xc_eff(&xc_codes, &xc_params, xc_type, 0, &rho_array, ngrids, 2);
     let fxc_tensor = xc_tensors[2].as_ref()
         .expect("fxc (deriv=2) should be available");
     let fxc_raw: Vec<f64> = {
@@ -2599,8 +2603,10 @@ pub struct BlockData<'a> {
 
 pub struct XCData<'a> {
     pub xc_type: XCType,
-    pub xc_code: &'a Vec<usize>,
-    pub xc_params: &'a Vec<f64>,
+    /// Owned libxc codes/parameters; converted from the DFA components at
+    /// construction (XCData no longer borrows the legacy xc_data arrays).
+    pub xc_code: Vec<usize>,
+    pub xc_params: Vec<f64>,
     pub device: DeviceOpenBLAS,
     pub dm: &'a Vec<MatrixFull<f64>>, 
     pub mo_coeffs: Option<Vec<MatrixFull<f64>>>,
@@ -2986,8 +2992,8 @@ impl<'a> NumInt<'a> for DFA4REST {
             XCType::LDA
         };
 
-        let xc_code = &self.dfa_compnt_scf;
-        let xc_params = &self.dfa_paramr_scf;
+        let xc_code = self.dfa_compnt_scf.clone();
+        let xc_params = self.dfa_paramr_scf.clone();
 
         let density_matrix = &scf_data.density_matrix;
         let mo_coeffs = scf_data.eigenvectors.clone().to_vec();
@@ -3072,7 +3078,7 @@ impl<'a> NumInt<'a> for DFA4REST {
                 let shape = loc_rho.shape().clone();
 
                 let rho_array = loc_rho.into_vec();
-                let loc_xc_tensor = eval_xc_eff(xc_data.xc_code, xc_data.xc_params, xc_data.xc_type, spin, &rho_array, num_grids, deriv);
+                let loc_xc_tensor = eval_xc_eff(&xc_data.xc_code, &xc_data.xc_params, xc_data.xc_type, spin, &rho_array, num_grids, deriv);
 
                 let loc_rho = rt::asarray((rho_array, shape, device));
                 // let loc_exc = rt::asarray((&loc_xc_tensor[0].unwrap()));

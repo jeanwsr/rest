@@ -948,7 +948,7 @@ fn l1_fold_eig(weight: TsrView, j2c_e: TsrView, j2c_v: TsrView, threshold: f64) 
 /// gate). Unrestricted twin of the helper in [`crate::grad::rdh`], duplicated to keep the
 /// restricted module untouched.
 fn has_scf_xc(scf_data: &SCF) -> bool {
-    !scf_data.mol.xc_data.dfa_compnt_scf.is_empty()
+    scf_data.mol.dfadef.is_dfa_scf()
 }
 
 /// A bare unrestricted gradient helper carrying the SCF control flags, for reuse of the UKS
@@ -978,7 +978,7 @@ fn xc_skeleton_dao(
     grids: &crate::dft::Grids,
 ) -> Vec<Tsr> {
     let mol_obj = &scf_data.mol;
-    let xc_data = &mol_obj.xc_data;
+    let xc_data = &mol_obj.dfadef;
     let (pos_codes, pos_params) = if scf {
         (Vec::new(), Vec::new())
     } else {
@@ -991,15 +991,18 @@ fn xc_skeleton_dao(
         )
     };
     let (code, param) = if scf {
-        (&xc_data.dfa_compnt_scf, &xc_data.dfa_paramr_scf)
+        crate::dft::parse_xc::components_to_codes_params(
+            mol_obj.dfadef.xc_scf.as_deref()
+                .expect("the SCF functional has no XC component list."),
+        )
     } else {
-        (&pos_codes, &pos_params)
+        (pos_codes, pos_params)
     };
-    let xc_type = if code.iter().any(|&c| xc_data.init_libxc(&c).needs_tau()) {
+    let xc_type = if code.iter().any(|&c| crate::dft::libxc_helper::xc_func_init(c, 1).needs_tau()) {
         XCType::MGGA
     } else if code
         .iter()
-        .any(|&c| !matches!(xc_data.init_libxc(&c).family(), libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA))
+        .any(|&c| !matches!(crate::dft::libxc_helper::xc_func_init(c, 1).family(), libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA))
     {
         XCType::GGA
     } else {

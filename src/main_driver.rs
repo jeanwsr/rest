@@ -933,7 +933,7 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
             }
         }
 
-        let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+        let is_hf = !scf_data.mol.dfadef.is_dfa_scf();
 
         // Please note that this is only a temporary workaround implemented gradients.
         // Totally refactor the following code if necessary if other types of gradients to be implemented.

@@ -868,7 +868,7 @@ impl GradAPI for RDHGradient<'_> {
 /// Whether the SCF-iteration functional carries a non-HF XC part (the gate of the
 /// response-density XC term; the kernels handle LDA/GGA/MGGA alike, unlike forge's GGA-only gate).
 fn has_scf_xc(scf_data: &SCF) -> bool {
-    !scf_data.mol.xc_data.dfa_compnt_scf.is_empty()
+    scf_data.mol.dfadef.is_dfa_scf()
 }
 
 /// A bare gradient helper carrying the SCF control flags, for reuse of the gradient kernels
@@ -891,7 +891,7 @@ fn dh_grad_helper<'a>(scf_data: &'a SCF, mpi_operator: &'a Option<MPIOperator>) 
 /// contribution); `scf` selects the SCF-iteration functional, else the final (`pos`) one.
 fn xc_skeleton_dao(scf_data: &SCF, mpi_operator: &Option<MPIOperator>, scf: bool, grids: &crate::dft::Grids) -> Tsr<f64> {
     let mol_obj = &scf_data.mol;
-    let xc_data = &mol_obj.xc_data;
+    let xc_data = &mol_obj.dfadef;
     let (pos_codes, pos_params) = if scf {
         (Vec::new(), Vec::new())
     } else {
@@ -904,15 +904,18 @@ fn xc_skeleton_dao(scf_data: &SCF, mpi_operator: &Option<MPIOperator>, scf: bool
         )
     };
     let (code, param) = if scf {
-        (&xc_data.dfa_compnt_scf, &xc_data.dfa_paramr_scf)
+        crate::dft::parse_xc::components_to_codes_params(
+            mol_obj.dfadef.xc_scf.as_deref()
+                .expect("the SCF functional has no XC component list."),
+        )
     } else {
-        (&pos_codes, &pos_params)
+        (pos_codes, pos_params)
     };
-    let xc_type = if code.iter().any(|&c| xc_data.init_libxc(&c).needs_tau()) {
+    let xc_type = if code.iter().any(|&c| crate::dft::libxc_helper::xc_func_init(c, 1).needs_tau()) {
         XCType::MGGA
     } else if code
         .iter()
-        .any(|&c| !matches!(xc_data.init_libxc(&c).family(), libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA))
+        .any(|&c| !matches!(crate::dft::libxc_helper::xc_func_init(c, 1).family(), libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA))
     {
         XCType::GGA
     } else {

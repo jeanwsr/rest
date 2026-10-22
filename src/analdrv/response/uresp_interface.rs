@@ -412,7 +412,7 @@ pub fn uscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> URe
 
     // --- DFT --- //
 
-    let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+    let is_hf = !scf_data.mol.dfadef.is_dfa_scf();
     if !is_hf {
         let xc_func_list = scf_xc_func_list_uks(scf_data);
         let verbose = scf_data.mol.ctrl.print_level > 2;

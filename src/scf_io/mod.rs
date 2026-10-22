@@ -821,7 +821,7 @@ impl SCF {
             }
         }
 
-        if self.mol.xc_data.nlc_vv10.is_some() && self.nlc_grids.is_none() {
+        if self.mol.dfadef.is_nlc() && self.nlc_grids.is_none() {
             let mut nlc_grids = Grids::build_with_level(&self.mol, self.mol.ctrl.grid_gen_level);
             nlc_grids.prepare_tabulated_ao(&self.mol);
             if self.mol.ctrl.print_level > 0 {
@@ -832,7 +832,7 @@ impl SCF {
     }
 
     fn evaluate_nlc_vv10(&self) -> Option<(f64, Vec<MatrixUpper<f64>>)> {
-        let (b, c) = self.mol.xc_data.nlc_vv10?;
+        let (b, c) = self.mol.dfadef.vv10_params()?;
         let grids = self.nlc_grids.as_ref()?;
         Some(crate::dft::nlc::vv10_exc_vxc(
             &self.mol,
@@ -2247,7 +2247,7 @@ impl SCF {
             };
         }
         let dt3 = time::Local::now();
-        if self.mol.xc_data.dfa_compnt_scf.len()!=0 {
+        if self.mol.dfadef.is_dfa_scf() {
             let (exc,vxc) = self.generate_vxc(1.0);
             //println!("{:?}",vxc[0].data);
             for i_spin in (0..spin_channel) {
@@ -2410,7 +2410,7 @@ impl SCF {
             }
         }
         let dt3 = time::Local::now();
-        if self.mol.xc_data.dfa_compnt_scf.len()!=0 {
+        if self.mol.dfadef.is_dfa_scf() {
             //let (exc,vxc) = self.generate_vxc_rayon_dm_only(1.0);
             let (_, exc,vxc) = if self.mol.ctrl.use_dm_only {
                 self.generate_vxc_mpi_rayon_dm_only(1.0, mpi_operator)
@@ -2717,7 +2717,7 @@ impl SCF {
 //            };
 //        }
 //        let dt3 = time::Local::now();
-//        if self.mol.xc_data.dfa_compnt_scf.len()!=0 {
+//        if self.mol.dfadef.is_dfa_scf() {
 //            let (_, exc,vxc) = self.generate_vxc_mpi_rayon_dm_only(1.0, mpi_operator);
 //            //let (exc,vxc) = self.generate_vxc(1.0);
 //            let _ = utilities::timing(&dt3, Some("evaluate vxc total"));
@@ -2751,7 +2751,7 @@ impl SCF {
 //    }
 
     pub fn generate_hf_hamiltonian_for_guess(&mut self) {
-        if self.mol.xc_data.dfa_compnt_scf.len() == 0 {
+        if !self.mol.dfadef.is_dfa_scf() {
             if self.mol.ctrl.eri_type.eq("analytic") {
                 self.generate_hf_hamiltonian_erifold4();
             } else if  self.mol.ctrl.eri_type.eq("ri_v") {
@@ -2814,7 +2814,7 @@ impl SCF {
         let spin_channel = self.mol.spin_channel;
         let mut exc_total = 0.0;
         let mut vxc_total = 0.0;
-        if self.mol.xc_data.dfa_compnt_scf.len() == 0 {
+        if !self.mol.dfadef.is_dfa_scf() {
             if self.mol.ctrl.eri_type.eq("analytic") {
                 self.generate_hf_hamiltonian_erifold4();
             } else if  self.mol.ctrl.eri_type.eq("ri_v") {
@@ -2909,7 +2909,9 @@ impl SCF {
                 // 3) update the DL-DFA xc potential 
                 let next_dfa_paramr_scf = crate::dft::deep_learning::dl_hybrid_xc_param(&energy_components);
                 self.mol.dfadef.dfa_hybrid_scf = next_dfa_paramr_scf[1];
-                self.mol.xc_data.dfa_paramr_scf = next_dfa_paramr_scf[2..].to_vec();
+                for (i, comp) in self.mol.dfadef.xc_scf.as_mut().expect("DL-DFA must carry SCF components").iter_mut().enumerate() {
+                    comp.factor = next_dfa_paramr_scf[2 + i];
+                }
             },
             _ => {}
         }
@@ -2973,9 +2975,8 @@ impl SCF {
             panic!("Only RI_V version has been implemented for SCF::evaluate_energy_components")
         };
         //println!("Exc[HF] = {:16.8}", exc_hf);
-        let current_dfa = &self.mol.xc_data;
+        let funcs = self.mol.dfadef.scf_func_list(self.mol.spin_channel);
         let xc_energy_list = if let Some(grids) = &self.grids {
-            let funcs = self.mol.dfadef.scf_func_list(self.mol.spin_channel);
             crate::dft::xc_exc_list(
                 &funcs, 
                 self.mol.spin_channel,
@@ -2985,8 +2986,7 @@ impl SCF {
                 &self.occupation
             )
         } else {
-            let code_list = &self.mol.xc_data.dfa_compnt_scf;
-            vec![[0.0,0.0];code_list.len()]
+            vec![[0.0,0.0];funcs.len()]
         };
 
         let mut xc_energy_list: Vec<f64> = xc_energy_list.iter().map(|energy| energy[0]+energy[1]).collect();
@@ -2998,8 +2998,8 @@ impl SCF {
             xc_energy_list = tot_xc_list;
         }
 
-        let mut exc_total = exc_hf * current_dfa.dfa_hybrid_scf;
-        xc_energy_list.iter().zip(current_dfa.dfa_paramr_scf.iter()).for_each(|(xc_energy, &param)| {
+        let mut exc_total = exc_hf * self.mol.dfadef.dfa_hybrid_scf;
+        xc_energy_list.iter().zip(funcs.iter().map(|(factor, _)| factor)).for_each(|(xc_energy, &param)| {
             exc_total += xc_energy * param
         });
 

@@ -1670,7 +1670,7 @@ impl RIRHFHessian<'_> {
         // hybrid DFA (e.g. B3LYP, hyb=0.2) scales the K term by hyb so that
         //   h_partial = e1 + ej - hyb*ek        (PySCF df/hessian/rks.py:60)
         //   h1ao      = h1 + vj1 - 0.5*hyb*vk1  (PySCF df/hessian/rks.py:109)
-        let is_dft = !scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+        let is_dft = scf_data.mol.dfadef.is_dfa_scf();
         let factor_k = if is_dft {
             scf_data.mol.dfadef.dfa_hybrid_scf
         } else {
@@ -1688,7 +1688,7 @@ impl RIRHFHessian<'_> {
 
     /// Check if this is an RKS (DFT) calculation: non-empty XC functional list.
     fn is_rks(&self) -> bool {
-        !self.scf_data.mol.xc_data.dfa_compnt_scf.is_empty()
+        !self.scf_data.mol.dfadef.is_dfa_scf()
     }
     /// Check if the XC functional contains a hybrid (exact-exchange) component.
     fn _is_hybrid(&self) -> bool {
@@ -3987,7 +3987,7 @@ impl RIRHFHessian<'_> {
             // RKS: hybrid exchange scaling (0.5*hyb for closed-shell). For HF
             // (no DFA components), hyb=1.0 so k_scaling=0.5, recovering the
             // historical J - 0.5*K response.
-            let is_hf = scf.mol.xc_data.dfa_compnt_scf.is_empty();
+            let is_hf = !scf.mol.dfadef.is_dfa_scf();
             let hyb_e1 = if is_hf {
                 1.0
             } else {
