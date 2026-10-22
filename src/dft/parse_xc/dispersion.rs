@@ -85,6 +85,7 @@ impl DFAdef {
             .filter(|comp| comp.component_type == ComponentType::Libxc && comp.is_nlc());
         let comp = match (nlc_comps.next(), nlc_comps.next()) {
             (Some(comp), None) => comp,
+            (None, None) => return None,
             _ => panic!("VV10 requires exactly one libxc functional carrying the VV10 kernel."),
         };
         if (comp.factor - 1.0).abs() > 1.0e-12 {

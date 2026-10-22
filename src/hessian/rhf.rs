@@ -1686,10 +1686,6 @@ impl RIRHFHessian<'_> {
         }
     }
 
-    /// Check if this is an RKS (DFT) calculation: non-empty XC functional list.
-    fn is_rks(&self) -> bool {
-        !self.scf_data.mol.dfadef.is_dfa_scf()
-    }
     /// Check if the XC functional contains a hybrid (exact-exchange) component.
     fn _is_hybrid(&self) -> bool {
         self.scf_data.mol.dfadef.is_hybrid()
@@ -2709,7 +2705,7 @@ impl RIRHFHessian<'_> {
         // Scatters directly into the live h_partial buffer (zero new allocation).
         // The implementation lives in rks.rs; split-borrow of self.result.data
         // and self.timings from a shared &SCF ref compiles cleanly here.
-        if self.is_rks() {
+        if self.scf_data.mol.dfadef.is_dfa_scf() {
             let scf = self.scf_data;
             let hp_data = &mut self
                 .result
@@ -3307,7 +3303,7 @@ impl RIRHFHessian<'_> {
 
         // Per-atom: h1ao = hcore_deriv + vj1 - 0.5*vk1 + vxc_deriv1
         let _t_vxc_d1 = std::time::Instant::now();
-        let vxc_d1: Option<Vec<Vec<f64>>> = if self.is_rks() {
+        let vxc_d1: Option<Vec<Vec<f64>>> = if self.scf_data.mol.dfadef.is_dfa_scf() {
             Some(crate::hessian::rks::compute_vxc_h1ao(scf))
         } else {
             None
@@ -3723,7 +3719,7 @@ impl RIRHFHessian<'_> {
                 );
             }
         }
-        if self.is_rks() {
+        if self.scf_data.mol.dfadef.is_dfa_scf() {
             self.timings
                 .push(("  rks: vxc_deriv1", _t_vxc_d1.elapsed()));
         }
