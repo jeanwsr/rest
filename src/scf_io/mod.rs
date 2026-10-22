@@ -1,5 +1,4 @@
 #![warn(unused_imports)]
-use libxc::prelude::LibXCSpin;
 use crate::basis_io::ecp::ghost_effective_potential_matrix;
 use self::force_state_occupation::adapt_occupation_with_force_projection;
 use self::occupation::{generate_occupation_frac_occ, generate_occupation_integer, generate_occupation_sad, OCCType};
@@ -3077,10 +3076,7 @@ impl SCF {
             // carries no post-SCF state)
             let funcs = match iop {
                 0 => self.mol.xc_data.libxc_func_list(),
-                1 => {
-                    let spin = if spin_channel == 1 { LibXCSpin::Unpolarized } else { LibXCSpin::Polarized };
-                    crate::dft::parse_xc::dh_xc_func_list_from_components(self.mol.dfadef.xc_nscf.as_deref(), spin).unwrap_or_default()
-                },
+                1 => self.mol.dfadef.nscf_func_list(spin_channel).unwrap_or_default(),
                 other => panic!("evaluate_xc_energy: unknown iop {other}"),
             };
             exc_spin = crate::dft::xc_exc(&funcs, grids, spin_channel, dm, mo, occ, mpi_operator);

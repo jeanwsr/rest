@@ -44,7 +44,7 @@
 //! metric-derivative integrals contract against them directly.
 
 use crate::analdrv::response::rresp_interface::{rscf_resp_interface, scf_xc_func_list, RRespSCF};
-use crate::analdrv::response::rgfock_interface::{dh_jk_factors, dh_xc_func_list, solve_z_vector};
+use crate::analdrv::response::rgfock_interface::{dh_jk_factors, solve_z_vector};
 use crate::analdrv::response::trait_rgfock::{GFockFlags, RGFockAPI};
 use crate::analdrv::response::trait_rresp::RRespAPI;
 use crate::dft::num_int::{NumInt, XCData};
@@ -153,7 +153,7 @@ impl<'a> RDHGradient<'a> {
         // a bDH whose final functional equals the SCF one is covered by the "SCF" entry entirely
         let dfadef = &mol_obj.dfadef;
         let delta_hyb = dfadef.dfa_hybrid_nscf.unwrap_or(dfadef.dfa_hybrid_scf) - dfadef.dfa_hybrid_scf;
-        let xc_func_pos = dh_xc_func_list(scf_data);
+        let xc_func_pos = mol_obj.dfadef.nscf_func_list(1);
         let xc_n_is_scf = match &dfadef.xc_nscf {
             Some(nscf) => {
                 let (n_code, n_param) = components_to_codes_params(nscf);
@@ -197,7 +197,7 @@ impl<'a> RDHGradient<'a> {
             let mut fock_n = &h_core + resp_rijk.get_fock_rdm(d_hf.view(), true);
             if xc_func_pos.is_some() {
                 let ni_dh = NIMatmul::new(&mol, coords, weights, atm_idx_grids, quadrature_weights);
-                let mut resp_ks = RRespKSNIMatmul::new(dh_xc_func_list(scf_data).unwrap(), ni_dh, mol_obj.ctrl.print_level > 2);
+                let mut resp_ks = RRespKSNIMatmul::new(mol_obj.dfadef.nscf_func_list(1).unwrap(), ni_dh, mol_obj.ctrl.print_level > 2);
                 *&mut fock_n += &resp_ks.get_fock_rdm(d_hf.view(), true);
             }
             Some(fock_n.into_contig(ColMajor))

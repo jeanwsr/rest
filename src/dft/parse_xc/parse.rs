@@ -14,7 +14,7 @@ use crate::dft::parse_xc::dispersion::{check_disp_suffix};
 use crate::dft::DFA4REST;
 use crate::dft::DFAFamily;
 use itertools::Itertools;
-use libxc::prelude::{LibXCFunctional, LibXCSpin};
+use libxc::prelude::LibXCFunctional;
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -898,21 +898,23 @@ impl DFAdef {
     /// functions; the omega ext-parameter of RSH components is applied from
     /// `dfa_rsh_scf`. DFAdef-side twin of `DFA4REST::libxc_func_list`.
     pub fn scf_func_list(&self, spin_channel: usize) -> Vec<(f64, LibXCFunctional)> {
-        self.xc_scf
-            .as_ref()
-            .map(|comps| {
-                comps.iter().filter_map(|comp| {
-                    comp.to_libxc_functional(spin_channel).map(|mut func| {
-                        if let Some(omega) = self.dfa_rsh_scf.0 {
-                            if func.ext_param_names().contains(&"_omega".to_string()) {
-                                func.set_ext_param_by_name("_omega", omega);
-                            }
-                        }
-                        (comp.factor, func)
-                    })
-                }).collect()
-            })
-            .unwrap_or_default()
+        let mut funcs = func_list_from_components(self.xc_scf.as_deref(), spin_channel)
+            .unwrap_or_default();
+        if let Some(omega) = self.dfa_rsh_scf.0 {
+            for (_factor, func) in funcs.iter_mut() {
+                if func.ext_param_names().contains(&"_omega".to_string()) {
+                    func.set_ext_param_by_name("_omega", omega);
+                }
+            }
+        }
+        funcs
+    }
+
+    /// Final-energy functional list of `(factor, LibXCFunctional)`; `None` when the
+    /// definition has no final-energy part or carries no libxc component
+    /// (pure-MP2-family post-SCF methods).
+    pub fn nscf_func_list(&self, spin_channel: usize) -> Option<Vec<(f64, LibXCFunctional)>> {
+        func_list_from_components(self.xc_nscf.as_deref(), spin_channel)
     }
 
     pub fn is_rsh(&self) -> bool {
@@ -1123,15 +1125,11 @@ pub fn components_to_codes_params(components: &[DFAComponent]) -> (Vec<usize>, V
 /// when `xc_nscf` is absent or carries no libxc component (pure-MP2-family post-SCF
 /// methods). Shared door of the DH response/gradient interfaces (restricted and
 /// spin-polarized siblings via `spin`).
-pub fn dh_xc_func_list_from_components(
-    xc_nscf: Option<&[DFAComponent]>,
-    spin: LibXCSpin,
+pub fn func_list_from_components(
+    components: Option<&[DFAComponent]>,
+    spin_channel: usize,
 ) -> Option<Vec<(f64, LibXCFunctional)>> {
-    let components = xc_nscf?;
-    let spin_channel = match spin {
-        LibXCSpin::Unpolarized => 1,
-        LibXCSpin::Polarized => 2,
-    };
+    let components = components?;
     let list: Vec<_> = components
         .iter()
         .filter_map(|comp| comp.to_libxc_functional(spin_channel).map(|func| (comp.factor, func)))
@@ -1694,9 +1692,9 @@ mod tests {
                     (None, None) => None,
                     _ => panic!("pos arrays must be present or absent together"),
                 };
-            let door = crate::dft::parse_xc::dh_xc_func_list_from_components(
+            let door = crate::dft::parse_xc::func_list_from_components(
                 dfa.xc_nscf.as_deref(),
-                LibXCSpin::Unpolarized,
+                1,
             )
             .map(|l| {
                 l.into_iter()

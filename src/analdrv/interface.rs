@@ -4,7 +4,6 @@ use crate::analdrv::config::{AnalDrvConfig, AnalDrvTask, MultipoleRdm1Relax};
 use crate::analdrv::hessian::hess_interface;
 use crate::analdrv::multipole::interface::{multipole_interface, MultipoleOutput};
 use crate::ri_jk::resp_auxbas::validate_resp_auxbas;
-use crate::analdrv::response::rgfock_interface;
 use crate::analdrv::response::rresp_interface;
 use crate::analdrv::response::rresp_interface::rscf_resp_interface;
 use crate::analdrv::response::uresp_interface::uscf_resp_interface;
@@ -100,7 +99,7 @@ pub fn analdrv_interface(scf_data: &mut SCF, tasks: &[AnalDrvTask], config: &Ana
     // MP2-family method (HF functional, no final-functional DFT part) consumes no grid at all.
     let multipole_dft_grids = has_multipole
         && is_fifth
-        && (rgfock_interface::dh_xc_func_list(scf_data).is_some()
+        && (scf_data.mol.dfadef.nscf_func_list(1).is_some()
             || (config.multipole.rdm1_relax == MultipoleRdm1Relax::Relaxed
                 && !rresp_interface::scf_xc_func_list(scf_data).is_empty()));
     if multipole_dft_grids && scf_data.grids.is_none() {

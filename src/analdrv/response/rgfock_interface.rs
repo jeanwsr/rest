@@ -39,7 +39,6 @@ use crate::ri_pt2::PT2FPMode;
 use crate::SCF;
 
 use enumflags2::BitFlags;
-use libxc::prelude::*;
 
 /// J/K factors of the RI-JK part of the (restricted) final-energy functional of a DH.
 ///
@@ -53,12 +52,6 @@ pub fn dh_jk_factors(scf_data: &SCF) -> (f64, f64) {
     // functional (e.g. MP2 correlation on HF), this correctly yields the full exchange 1.0.
     let factor_k = dfadef.dfa_hybrid_nscf.unwrap_or(dfadef.dfa_hybrid_scf);
     (1.0, factor_k)
-}
-
-/// List of `(scale, functional)` pairs of the final-energy functional's DFT (XC numint) part
-/// (spin-unpolarized); `None` when the final functional has no DFT part.
-pub fn dh_xc_func_list(scf_data: &SCF) -> Option<Vec<(f64, LibXCFunctional)>> {
-    crate::dft::parse_xc::dh_xc_func_list_from_components(scf_data.mol.dfadef.xc_nscf.as_deref(), LibXCSpin::Unpolarized)
 }
 
 /// Solve the Z-vector (CP-SCF) equation for a Lagrangian of the (combined) post-SCF contributions.
@@ -428,7 +421,7 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
 
     // --- DFT (final-energy functional, common SCF grid) --- //
 
-    if let Some(xc_func_list) = dh_xc_func_list(scf_data) {
+    if let Some(xc_func_list) = scf_data.mol.dfadef.nscf_func_list(1) {
         let mol = get_cint_mol(&scf_data.mol);
         let grids = scf_data.grids.as_ref().expect(
             "The DH generalized Fock requires the SCF grids; note xdh_calculations frees them, so build this interface before it or regenerate the grids in between.",

@@ -35,18 +35,6 @@ pub fn scf_xc_func_list_uks(scf_data: &SCF) -> Vec<(f64, LibXCFunctional)> {
     crate::analdrv::response::rresp_interface::scf_xc_func_list_with_spin(scf_data, LibXCSpin::Polarized)
 }
 
-/// List of `(scale, functional)` pairs of the final-energy functional's DFT (XC numint) part of a
-/// DH (spin-polarized); `None` when the final functional has no DFT part.
-///
-/// Spin-polarized sibling of [`dh_xc_func_list`](crate::analdrv::response::rgfock_interface::
-/// dh_xc_func_list).
-pub fn dh_xc_func_list_uks(scf_data: &SCF) -> Option<Vec<(f64, LibXCFunctional)>> {
-    crate::dft::parse_xc::dh_xc_func_list_from_components(
-        scf_data.mol.dfadef.xc_nscf.as_deref(),
-        LibXCSpin::Polarized,
-    )
-}
-
 /// The response (fock/response) objects of all electron-interaction contributions of an
 /// unrestricted SCF, as an owned list of `URespAPI` trait objects.
 ///

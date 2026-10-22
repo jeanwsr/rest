@@ -34,7 +34,7 @@
 use crate::analdrv::response::rgfock_interface::dh_jk_factors;
 use crate::analdrv::response::trait_uresp::URespAPI;
 use crate::analdrv::response::uresp_interface::{
-    dh_xc_func_list_uks, scf_xc_func_list_uks, uscf_resp_interface, URespSCF,
+    scf_xc_func_list_uks, uscf_resp_interface, URespSCF,
 };
 use crate::dft::num_int::XCData;
 use crate::dft::parse_xc::components_to_codes_params;
@@ -133,7 +133,7 @@ impl<'a> UDHGradient<'a> {
         // a bDH whose final functional equals the SCF one is covered by the "SCF" entry entirely
         let dfadef = &mol_obj.dfadef;
         let delta_hyb = dfadef.dfa_hybrid_nscf.unwrap_or(dfadef.dfa_hybrid_scf) - dfadef.dfa_hybrid_scf;
-        let xc_func_pos = dh_xc_func_list_uks(scf_data);
+        let xc_func_pos = mol_obj.dfadef.nscf_func_list(2);
         let xc_n_is_scf = match &dfadef.xc_nscf {
             Some(nscf) => {
                 let (n_code, n_param) = components_to_codes_params(nscf);
@@ -216,7 +216,7 @@ impl<'a> UDHGradient<'a> {
             let mut resp_rijk = URespRIJK::new_with_cderi(factor_j_dh, factor_k_dh, cderi_dh);
             let f_jk = resp_rijk.get_fock_rdm(&[d_hf[0].view(), d_hf[1].view()], true);
             let mut fock_n = [(&h_core + &f_jk[0]).into_contig(ColMajor), (&h_core + &f_jk[1]).into_contig(ColMajor)];
-            if let Some(xc_func_list) = dh_xc_func_list_uks(scf_data) {
+            if let Some(xc_func_list) = mol_obj.dfadef.nscf_func_list(2) {
                 let ni_dh = NIMatmul::new(&mol, coords, weights, atm_idx_grids, quadrature_weights);
                 let mut resp_ks = URespKSNIMatmul::new(xc_func_list, ni_dh, mol_obj.ctrl.print_level > 2);
                 let f_ks = resp_ks.get_fock_rdm(&[d_hf[0].view(), d_hf[1].view()], true);
