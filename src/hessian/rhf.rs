@@ -1672,7 +1672,7 @@ impl RIRHFHessian<'_> {
         //   h1ao      = h1 + vj1 - 0.5*hyb*vk1  (PySCF df/hessian/rks.py:109)
         let is_dft = !scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
         let factor_k = if is_dft {
-            scf_data.mol.xc_data.dfa_hybrid_scf
+            scf_data.mol.dfadef.dfa_hybrid_scf
         } else {
             1.0
         };
@@ -1692,7 +1692,7 @@ impl RIRHFHessian<'_> {
     }
     /// Check if the XC functional contains a hybrid (exact-exchange) component.
     fn _is_hybrid(&self) -> bool {
-        self.scf_data.mol.xc_data.is_hybrid()
+        self.scf_data.mol.dfadef.is_hybrid()
     }
 
     pub fn print_timings(&self) {
@@ -3991,7 +3991,7 @@ impl RIRHFHessian<'_> {
             let hyb_e1 = if is_hf {
                 1.0
             } else {
-                scf.mol.xc_data.dfa_hybrid_scf
+                scf.mol.dfadef.dfa_hybrid_scf
             };
             let k_scaling_e1 = 0.5 * hyb_e1;
             for ia in 0..natm {

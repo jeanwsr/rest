@@ -3859,7 +3859,7 @@ impl Grids {
         let nao = mol.num_basis;
         let ngrids = self.coordinates.len();
         let cutoff = self.ao_cutoff;
-        let do_gradient = mol.xc_data.use_density_gradient();
+        let do_gradient = mol.dfadef.use_density_gradient();
 
         let default_omp_num_threads = mol.ctrl.num_threads.unwrap();
 
@@ -4953,13 +4953,13 @@ impl Grids {
 
         // handle memory exceed
         // AJZ: here tabulated grids will cost (num_basis * num_grids * 1 or 4) memory, depending on whether gradients are needed.
-        let ncomp = if mol.xc_data.use_density_gradient() { 4 } else { 1 };
+        let ncomp = if mol.dfadef.use_density_gradient() { 4 } else { 1 };
         let estimated_mem = (num_basis * num_grids * ncomp) as f64 * 8.0 / 1024.0 / 1024.0; // in MB
         let mem_avail = mol.ctrl.max_memory.map(|m| m - crate::utilities::memory_batch::detect_used_memory_mb("proc"));
         crate::utilities::memory_batch::handle_memory_exceed(estimated_mem, mem_avail, mol.ctrl.abort_on_mem_exceed);
 
         let mut ao = MatrixFull::new([num_basis,num_grids],0.0);
-        let mut aop =  if mol.xc_data.use_density_gradient() {
+        let mut aop =  if mol.dfadef.use_density_gradient() {
             Some(RIFull::new([num_basis,num_grids,3],0.0))
         } else {
             None
@@ -4973,7 +4973,7 @@ impl Grids {
             let loc_num_grids = range_grids.len();
 
             let mut loc_ao = MatrixFull::new([num_basis, loc_num_grids],0.0);
-            let mut loc_aop =  if mol.xc_data.use_density_gradient() {
+            let mut loc_aop =  if mol.dfadef.use_density_gradient() {
                 RIFull::new([num_basis,loc_num_grids,3],0.0)
             } else {
                 RIFull::empty()
@@ -4992,7 +4992,7 @@ impl Grids {
 
                 loc_ao.copy_from_matr(start..end, 0..loc_num_grids, &tab_den, 0..loc_num_bas, 0..loc_num_grids);
 
-                if mol.xc_data.use_density_gradient() {
+                if mol.dfadef.use_density_gradient() {
                     //println!("debug 01");
                     let tab_dev = gto_1st_value_serial(&self.coordinates[range_grids.clone()], &tmp_geom, elem, &mol.ctrl.basis_type);
                     //println!("debug 02");
@@ -5030,7 +5030,7 @@ impl Grids {
         let num_grids = self.coordinates.len();
 
         let mut ao = MatrixFull::new([num_grids,mol.num_basis],0.0);
-        let mut aop =  if mol.xc_data.use_density_gradient() {
+        let mut aop =  if mol.dfadef.use_density_gradient() {
             Some(RIFull::new([mol.num_basis,num_grids,3],0.0))
         } else {
             None
@@ -5047,7 +5047,7 @@ impl Grids {
             tmp_geom.iter_mut().zip(geom.iter()).for_each(|value| {*value.0 = *value.1});
             let tab_den = gto_value_matrixfull_serial(&self.coordinates, &tmp_geom, elem, &mol.ctrl.basis_type);
 
-            let tab_dev = if mol.xc_data.use_density_gradient() {
+            let tab_dev = if mol.dfadef.use_density_gradient() {
                 Some(gto_1st_value_batch_serial(&self.coordinates, &tmp_geom, elem, &mol.ctrl.basis_type))
                 //Some(RIFull::new([num_loc_bas,num_grids,3],0.0))
             } else {
@@ -5120,7 +5120,7 @@ impl Grids {
         self.ao = Some(tab_den.transpose_and_drop());
 
         // then for density gradient
-        if mol.xc_data.use_density_gradient() {
+        if mol.dfadef.use_density_gradient() {
 
             time_records.new_item("2", "spheric_gto_1st_value_batch");
             time_records.new_item("3", "copy");

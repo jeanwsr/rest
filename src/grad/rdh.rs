@@ -100,7 +100,7 @@ impl<'a> RDHGradient<'a> {
         assert!(mol_obj.start_mo == 0, "RDHGradient does not support frozen core (start_mo).");
         assert!(self.mpi_operator.is_none(), "RDHGradient is not MPI-parallelized yet.");
         assert!(
-            scf_data.mol.xc_data.omega().is_none(),
+            scf_data.mol.dfadef.omega().is_none(),
             "RSH doubly-hybrid gradients are not supported."
         );
         assert!(
@@ -258,7 +258,7 @@ impl<'a> RDHGradient<'a> {
         let d_r_s: Tsr<f64> = d_r_sym.mapv(|x| 0.5 * x);
         // the exchange (K) part of the SCF functional linearized upon the relaxed density carries
         // the SCF hybrid coefficient (forge `C1 = cx C D_r_symm`; unity for the MP2/HF reference)
-        let cx_scf = mol_obj.xc_data.dfa_hybrid_scf;
+        let cx_scf = mol_obj.dfadef.dfa_hybrid_scf;
         let c1_dr: Tsr<f64> = (mo_coeff.view() % d_r_s.view()).mapv(|x| cx_scf * x).into_contig(ColMajor);
         let d_r_ao = (mo_coeff.view() % d_r_s.view() % mo_coeff.view().t()).into_contig(ColMajor);
         // total relaxed density (SCF + relaxed correlation) for the fchk density dump of force

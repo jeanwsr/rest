@@ -977,7 +977,7 @@ impl<'a> GwGradEngine<'a> {
         };
 
         // ---- reference static-term data and low-rank factors (LR-only) ----
-        let hybrid = scf.mol.xc_data.dfa_hybrid_scf;
+        let hybrid = scf.mol.dfadef.dfa_hybrid_scf;
         let fock_hyb = if scf.mol.xc_data.dfa_compnt_scf.is_empty() { 1.0 } else { hybrid };
         let vxc_nn = crate::ri_gw::vxc_ao2mo(scf);
         let (shells, shell_of) = degenerate_shells(&e, config.degenerate_tol);

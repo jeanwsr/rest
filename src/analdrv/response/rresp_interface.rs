@@ -40,11 +40,11 @@ pub fn scf_jk_factors(scf_data: &SCF) -> (f64, f64, Option<(f64, f64)>) {
     let factor_j = 1.0;
     let factor_k = match is_hf {
         true => 1.0,
-        false => scf_data.mol.xc_data.rsh_alpha().unwrap_or(scf_data.mol.xc_data.dfa_hybrid_scf),
+        false => scf_data.mol.dfadef.rsh_alpha().unwrap_or(scf_data.mol.dfadef.dfa_hybrid_scf),
     };
-    let rsh = scf_data.mol.xc_data.omega().map(|omega| {
-        let alpha = scf_data.mol.xc_data.rsh_alpha().unwrap();
-        let hyb = scf_data.mol.xc_data.dfa_hybrid_scf;
+    let rsh = scf_data.mol.dfadef.omega().map(|omega| {
+        let alpha = scf_data.mol.dfadef.rsh_alpha().unwrap();
+        let hyb = scf_data.mol.dfadef.dfa_hybrid_scf;
         (omega, hyb - alpha)
     });
     (factor_j, factor_k, rsh)

@@ -471,7 +471,7 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     };
     
     //println!("{:?}",&pt2_c);
-    let hy_coeffi_scf = scf_data.mol.xc_data.dfa_hybrid_scf;
+    let hy_coeffi_scf = scf_data.mol.dfadef.dfa_hybrid_scf;
     let hy_coeffi_xdh = scf_data.mol.dfadef.dfa_hybrid_nscf.unwrap_or(0.0);
     let hy_coeffi_pt2 = scf_data.mol.dfadef.fifth_rung_component().map(|c| c.param_positional.clone()).unwrap_or_else(|| vec![0.0, 0.0]);
     let xdh_pt2_energy: f64 = pt2_c[1..3].iter().zip(hy_coeffi_pt2.iter()).map(|(e,c)| e*c).sum();

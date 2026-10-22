@@ -122,7 +122,7 @@ pub fn build_ri_jk_grad_flags(scf_data: &SCF) -> RIHFGradientFlags {
     let factor_k = if is_hf {
         Some(1.0)
     } else {
-        let fac = scf_data.mol.xc_data.dfa_hybrid_scf;
+        let fac = scf_data.mol.dfadef.dfa_hybrid_scf;
         if fac == 0.0 {
             None
         } else {

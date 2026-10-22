@@ -162,7 +162,7 @@ pub fn add_vxc_h_partial(
 /// involved.
 pub fn compute_vxc_h1ao(scf: &SCF) -> Vec<Vec<f64>> {
     let mol = &scf.mol;
-    let xct = if mol.xc_data.use_density_gradient() {
+    let xct = if mol.dfadef.use_density_gradient() {
         crate::dft::xc_deriv::XCType::GGA
     } else {
         crate::dft::xc_deriv::XCType::LDA

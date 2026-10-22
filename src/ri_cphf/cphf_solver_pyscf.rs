@@ -506,7 +506,7 @@ impl CPHFSolverPySCF {
         // guarded by `k_scaling != 0.0`, so nothing else changes.
         let _t_kl = std::time::Instant::now();
         let is_hf_k = scf.mol.xc_data.dfa_compnt_scf.is_empty();
-        let hyb_k = if is_hf_k { 1.0 } else { scf.mol.xc_data.dfa_hybrid_scf };
+        let hyb_k = if is_hf_k { 1.0 } else { scf.mol.dfadef.dfa_hybrid_scf };
         let k_lowrank = if hyb_k != 0.0 {
             KLowRankPrecompute::new(scf, &self.ws)
         } else {

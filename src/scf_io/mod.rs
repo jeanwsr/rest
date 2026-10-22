@@ -249,7 +249,7 @@ impl SCF {
                 // Therefore, even though "spin_polarization=False" is specified as input, we handle it as "spin_channel=2".
                 scf_data.mol.ctrl.spin_channel=2;
                 scf_data.mol.spin_channel=2;
-                scf_data.mol.xc_data.spin_channel=2;
+                scf_data.mol.spin_channel=2;
             },
             SCFType::UHF => {
                 info!("Unrestricted Hartree-Fock (or Kohn-Sham) algorithm is invoked.")
@@ -295,7 +295,7 @@ impl SCF {
             let nao = mol.num_basis;
             let naux = mol.num_auxbas;
             // range-separate hybrid functionals requires double memory for RI integrals due to the need of both standard RI and short-range RI integrals.
-            let scale_rsh = if mol.xc_data.is_rsh() { 2.0 } else { 1.0 };
+            let scale_rsh = if mol.dfadef.is_rsh() { 2.0 } else { 1.0 };
             // TODO: for safety, we add factor 1.5 to the memory requirement
             let mem_cderi_mb = 1.5 * scale_rsh * 8.0 * (0.5 * (nao * nao * naux) as f64) / 1024.0 / 1024.0;
             let mem_avail_mb = mol.ctrl.max_memory.map(|max_memory| {
@@ -485,7 +485,7 @@ impl SCF {
         let ri3fn_full = if use_eri_jk {self.mol.ctrl.use_auxbas && !self.mol.ctrl.use_ri_symm} else {false};
         let ri3fn_symm = if use_eri_jk {self.mol.ctrl.use_auxbas && self.mol.ctrl.use_ri_symm} else{false};
 
-        let is_rsh = self.mol.xc_data.is_rsh();
+        let is_rsh = self.mol.dfadef.is_rsh();
 
         // For RSH: J uses on-the-fly shell-based ERI (generate_vj_on_the_fly_par).
         // K_full still needs standard rimatr (generate_vk_ri_direct has unresolved RSTSR bug).
@@ -593,7 +593,7 @@ impl SCF {
 
         // build short-range 3c RI integrals for range-separated hybrid (RSH) functionals
         if is_rsh && use_eri_jk {
-            let omega = self.mol.xc_data.omega().unwrap();
+            let omega = self.mol.dfadef.omega().unwrap();
             info!("Building short-range 3c RI integrals for RSH (omega = {:.4})", omega);
             if ri3fn_symm {
                 // Note: SR RI omega is negative in libcint's convention.
@@ -791,7 +791,7 @@ impl SCF {
                 grids.aop = None;
             }
         } else {
-            self.grids = if self.mol.xc_data.is_dfa_scf() || self.mol.ctrl.initial_guess == "vsap" {
+            self.grids = if self.mol.dfadef.is_dfa_scf() || self.mol.ctrl.initial_guess == "vsap" {
                 let grids = Grids::build(&mut self.mol);
                 info!("Grid size: {:}", grids.coordinates.len());
                 Some(grids)
@@ -2233,7 +2233,7 @@ impl SCF {
         let scaling_factor = match self.scftype {
             SCFType::RHF => -0.5,
             _ => -1.0,
-        }*self.mol.xc_data.dfa_hybrid_scf ;
+        }*self.mol.dfadef.dfa_hybrid_scf ;
         if ! scaling_factor.eq(&0.0) {
             //let vk = self.generate_vk_with_ri_v(scaling_factor);
             let vk = self.generate_vk_with_erifold4_sync(scaling_factor);
@@ -2322,8 +2322,8 @@ impl SCF {
         // F_ex = base_scaling * alpha * K_full + (-base_scaling) * (alpha-hyb) * K_erfc
         let base_scaling = match self.scftype { SCFType::RHF => -0.5, _ => -1.0 };
 
-        if let Some((omega, alpha, _)) = self.mol.xc_data.rsh_params() {
-            let hyb = self.mol.xc_data.dfa_hybrid_scf;
+        if let Some((omega, alpha, _)) = self.mol.dfadef.rsh_params() {
+            let hyb = self.mol.dfadef.dfa_hybrid_scf;
             let scaling_kfull = base_scaling * alpha;           // alpha * K_full
             let scaling_ksr = -base_scaling * (alpha - hyb);    // - (alpha-hyb) * K_erfc  (note: sign flipped)
 
@@ -2389,7 +2389,7 @@ impl SCF {
                 }
             }
         } else {
-            let scaling_factor = base_scaling * self.mol.xc_data.dfa_hybrid_scf;
+            let scaling_factor = base_scaling * self.mol.dfadef.dfa_hybrid_scf;
             if ! scaling_factor.eq(&0.0) {
                 let use_dm_only = self.mol.ctrl.use_dm_only;
                 let vk = if self.mol.ctrl.use_isdf && !self.mol.ctrl.isdf_new {
@@ -2699,7 +2699,7 @@ impl SCF {
 //        let scaling_factor = match self.scftype {
 //            SCFType::RHF => -0.5,
 //            _ => -1.0,
-//        }*self.mol.xc_data.dfa_hybrid_scf ;
+//        }*self.mol.dfadef.dfa_hybrid_scf ;
 //        if ! scaling_factor.eq(&0.0) {
 //            let use_dm_only = self.mol.ctrl.use_dm_only;
 //            let vk = if self.mol.ctrl.use_isdf{
@@ -2908,7 +2908,7 @@ impl SCF {
                 let exc_dldfa = crate::dft::deep_learning::dl_hybrid_xc_energy(&energy_components);
                 // 3) update the DL-DFA xc potential 
                 let next_dfa_paramr_scf = crate::dft::deep_learning::dl_hybrid_xc_param(&energy_components);
-                self.mol.xc_data.dfa_hybrid_scf = next_dfa_paramr_scf[1];
+                self.mol.dfadef.dfa_hybrid_scf = next_dfa_paramr_scf[1];
                 self.mol.xc_data.dfa_paramr_scf = next_dfa_paramr_scf[2..].to_vec();
             },
             _ => {}
@@ -2975,7 +2975,7 @@ impl SCF {
         //println!("Exc[HF] = {:16.8}", exc_hf);
         let current_dfa = &self.mol.xc_data;
         let xc_energy_list = if let Some(grids) = &self.grids {
-            let funcs = current_dfa.libxc_func_list();
+            let funcs = self.mol.dfadef.scf_func_list(self.mol.spin_channel);
             crate::dft::xc_exc_list(
                 &funcs, 
                 self.mol.spin_channel,
@@ -3075,7 +3075,7 @@ impl SCF {
             // functional's components, taken from the DFAdef (the narrowed xc_data
             // carries no post-SCF state)
             let funcs = match iop {
-                0 => self.mol.xc_data.libxc_func_list(),
+                0 => self.mol.dfadef.scf_func_list(spin_channel),
                 1 => self.mol.dfadef.nscf_func_list(spin_channel).unwrap_or_default(),
                 other => panic!("evaluate_xc_energy: unknown iop {other}"),
             };
@@ -3357,7 +3357,7 @@ impl SCF {
         let print_level = self.mol.ctrl.print_level;
         if let Some(grids) = &self.grids {
             let dt0 = utilities::init_timing();
-            let funcs = self.mol.xc_data.libxc_func_list();
+            let funcs = self.mol.dfadef.scf_func_list(spin_channel);
             let (exc,mut vxc_ao) = crate::dft::xc_exc_vxc(&funcs, grids, spin_channel,dm, mo, occ, print_level);
             let dt1 = utilities::timing(&dt0, Some("Total vxc_ao time"));
             exc_spin = exc;
@@ -3433,7 +3433,7 @@ impl SCF {
                 // change the return of xc_exc_vxc, directly return vxc_mat [num_basis, num_basis]
                 // let (exc,vxc_ao,total_elec) = self.mol.xc_data.xc_exc_vxc_slots_dm_only(range_grids.clone(), grids, spin_channel,dm, mo, occ);
                 //exc_spin = exc;
-                let funcs = self.mol.xc_data.libxc_func_list();
+                let funcs = self.mol.dfadef.scf_func_list(spin_channel);
                 let (exc, vxc_mf, total_elec) = crate::dft::xc_exc_vxc_slots_dm_only(&funcs, range_grids.clone(), grids, spin_channel,dm, mo, occ, self.mol.ctrl.print_level, self.mol.ctrl.vxc_screen_threshold);
                 // let mut vxc_mf: Vec<MatrixFull<f64>> = vec![MatrixFull::new([num_basis,num_basis],0.0f64);spin_channel];;
                 // if let Some(ao) = &grids.ao {
@@ -3636,7 +3636,7 @@ impl SCF {
                 // change the return value of xc_exc_vxc by vxc_mat [num_basis, num_basis]
                 // let (exc,vxc_ao,total_elec) = self.mol.xc_data.xc_exc_vxc_slots(range_grids.clone(), grids, spin_channel,dm, mo, occ);
                 //exc_spin = exc;
-                let funcs = self.mol.xc_data.libxc_func_list();
+                let funcs = self.mol.dfadef.scf_func_list(spin_channel);
                 let (exc, vxc_mf, total_elec) = crate::dft::xc_exc_vxc_slots(&funcs, range_grids.clone(), grids, spin_channel, dm, mo, occ, self.mol.ctrl.print_level, self.mol.ctrl.vxc_screen_threshold);
                 // let mut vxc_mf: Vec<MatrixFull<f64>> = vec![MatrixFull::new([num_basis,num_basis],0.0f64);spin_channel];;
                 // if let Some(ao) = &grids.ao {

@@ -110,7 +110,7 @@ pub fn single_orbital_gw_spin(
     for i_local in 0..op.occ_size {
         exchange -= v_matrix[[n, op.start_mo + i_local]];
     }
-    let hybrid_param = scf_data.mol.xc_data.dfa_hybrid_scf;
+    let hybrid_param = scf_data.mol.dfadef.dfa_hybrid_scf;
     let side = if n > op.homo { 1.0 } else { -1.0 };
     let consts = scf_data.eigenvalues[spin][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
     let cdgw_eta = qp_ctrl.cdgw_eta;
@@ -167,7 +167,7 @@ fn single_orbital_gw_lowrank_spin(
     for i_local in 0..op.occ_size {
         exchange -= v_matrix[[n, op.start_mo + i_local]];
     }
-    let hybrid_param = scf_data.mol.xc_data.dfa_hybrid_scf;
+    let hybrid_param = scf_data.mol.dfadef.dfa_hybrid_scf;
     let side = if n > op.homo { 1.0 } else { -1.0 };
     let consts = scf_data.eigenvalues[spin][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
     let res_tol = qp_ctrl.cdgw_res_tol;
@@ -1014,7 +1014,7 @@ pub fn single_orbital_gw_ac(
     for i in 0..homo + 1 {
         exchange -= v_matrix[[n, i]];
     }
-    let hybrid_param = scf_data.mol.xc_data.dfa_hybrid_scf;
+    let hybrid_param = scf_data.mol.dfadef.dfa_hybrid_scf;
     let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
     let side = if n >= occ_size { 1.0 } else { -1.0 };
 
@@ -1229,7 +1229,7 @@ pub fn single_orbital_gw(scf_data:&mut SCF,route:&ri_gw::GwTensorRoute,v_matrix:
     for i in 0..homo+1{
         exchange-=v_matrix[[n,i]];
     }
-    let hybrid_param=scf_data.mol.xc_data.dfa_hybrid_scf;
+    let hybrid_param=scf_data.mol.dfadef.dfa_hybrid_scf;
     println!("Exchange={},V_xc={}",exchange,vxc_nn+hybrid_param*exchange);
     let side=if n>=occ_size{1.0}else{-1.0};
     let consts=scf_data.eigenvalues[0][n]+exchange*(1.0-hybrid_param)-vxc_nn;
@@ -1755,7 +1755,7 @@ fn single_orbital_gw_lowrank(
     for i in 0..homo + 1 {
         exchange -= v_matrix[[n, i]];
     }
-    let hybrid_param = scf_data.mol.xc_data.dfa_hybrid_scf;
+    let hybrid_param = scf_data.mol.dfadef.dfa_hybrid_scf;
     let side = if n >= occ_size { 1.0 } else { -1.0 };
     let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
 
@@ -1930,7 +1930,7 @@ fn single_orbital_gw_lowrank_v2(
     for i in 0..homo + 1 {
         exchange -= v_matrix[[n, i]];
     }
-    let hybrid_param = scf_data.mol.xc_data.dfa_hybrid_scf;
+    let hybrid_param = scf_data.mol.dfadef.dfa_hybrid_scf;
     let side = if n >= occ_size { 1.0 } else { -1.0 };
     let consts = scf_data.eigenvalues[0][n] + exchange * (1.0 - hybrid_param) - vxc_nn;
 

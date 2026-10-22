@@ -153,13 +153,13 @@ pub fn prepare_mo_data(scf: &SCF) -> TDDFTData {
     // coefficient times K_full only. Derived here from the DFA, mirroring the
     // ground-state Fock build in scf_io (coeff_full = c_LR, the raw third
     // element of rsh_params() is c_SR, so the K_SR coeff is c_SR - c_LR).
-    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
+    let (coeff_full, coeff_sr) = match scf.mol.dfadef.rsh_params() {
         Some((omega, c_lr, c_sr)) => {
             println!("RSH functional: omega = {:.6}, c_LR (K_full coeff) = {:.6}, c_SR - c_LR (K_SR coeff) = {:.6}",
                      omega, c_lr, c_sr - c_lr);
             (c_lr, c_sr - c_lr)
         }
-        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
+        None => (scf.mol.dfadef.dfa_hybrid_scf, 0.0),
     };
 
     // ── Per-sector RI bundles: Coulomb [naux, occ*vir] + reshaped exchange
@@ -320,13 +320,13 @@ pub fn prepare_ao_data_with_spin(scf: &SCF, tddft_spin: Option<&str>) -> TDDFTDa
     // Fock build in scf_io): `coeff_full*K_full + coeff_sr*K_SR` with
     // coeff_full = c_LR and coeff_sr = c_SR - c_LR; for a non-RSH functional
     // this reduces to the hybrid coefficient with no short-range pass.
-    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
+    let (coeff_full, coeff_sr) = match scf.mol.dfadef.rsh_params() {
         Some((omega, c_lr, c_sr)) => {
             println!("RSH functional: omega = {:.6}, c_LR (K_full coeff) = {:.6}, c_SR - c_LR (K_SR coeff) = {:.6}",
                      omega, c_lr, c_sr - c_lr);
             (c_lr, c_sr - c_lr)
         }
-        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
+        None => (scf.mol.dfadef.dfa_hybrid_scf, 0.0),
     };
     if coeff_sr.abs() > 1e-15 && scf.rimatr_sr.is_none() {
         panic!("RSH AO-mode TDDFT requires the short-range three-center integrals \

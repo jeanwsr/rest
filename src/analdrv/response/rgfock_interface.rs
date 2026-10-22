@@ -374,7 +374,7 @@ pub fn rgfock_dh_interface<'a>(scf_data: &'a SCF) -> RGFockDH<'a> {
         Some(DFAFamily::PT2) => {}
         _ => panic!("RGFockDH currently requires the PT2 post-SCF family (ri_pt2 correlation)."),
     }
-    if scf_data.mol.xc_data.omega().is_some() {
+    if scf_data.mol.dfadef.omega().is_some() {
         panic!(
             "RGFockDH does not support range-separated double hybrids yet: the final-energy \
              functional's range separation is not stored in xc_data (only the SCF functional's \

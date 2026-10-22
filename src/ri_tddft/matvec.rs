@@ -244,9 +244,9 @@ pub fn a_matvec(
     // Response HF-exchange coefficients from the DFA
     // (RSH -> (c_LR, c_SR - c_LR); hybrid -> (c_x, 0)); the coefficients are
     // spin-independent, derived once here and applied per sector.
-    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
+    let (coeff_full, coeff_sr) = match scf.mol.dfadef.rsh_params() {
         Some((_, c_lr, c_sr)) => (c_lr, c_sr - c_lr),
-        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
+        None => (scf.mol.dfadef.dfa_hybrid_scf, 0.0),
     };
     // Coulomb weight: spin-adapted restricted channels vs unit-weight unrestricted.
     let coulomb_factor = if data.is_uhf() {
@@ -371,9 +371,9 @@ pub fn b_matvec(
     debug_assert_eq!(z.len(), dim_total);
 
     // Response HF-exchange coefficients from the DFA (see a_matvec).
-    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
+    let (coeff_full, coeff_sr) = match scf.mol.dfadef.rsh_params() {
         Some((_, c_lr, c_sr)) => (c_lr, c_sr - c_lr),
-        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
+        None => (scf.mol.dfadef.dfa_hybrid_scf, 0.0),
     };
     // Coulomb weight: spin-adapted restricted channels vs unit-weight unrestricted.
     let coulomb_factor = if data.is_uhf() {

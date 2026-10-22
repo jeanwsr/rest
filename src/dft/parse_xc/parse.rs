@@ -245,19 +245,6 @@ impl DFAComponent {
         }
     }
 
-    /// `(omega, c_LR, c_SR)` of a component in the consumer convention of
-    /// `DFA4REST::get_rsh_libxc` / `DFA4REST::dfa_rsh_scf`: `c_LR` is the long-range
-    /// (full-range) HF fraction and `c_SR` the short-range fraction. Per libxc's
-    /// convention (xc.h) `cam_alpha` is the full HF fraction and `cam_beta` the
-    /// short-range-only extra (SR = cam_alpha + cam_beta, LR = cam_alpha), so the raw
-    /// `get_rsh` slots are `(c_LR, c_SR - c_LR)` for every component type and the
-    /// conversion below just restores the absolute `c_SR`. Non-RSH components carry
-    /// their (range-independent) hybrid in both slots.
-    pub fn get_rsh_lrsr(&self, spin_channel: usize) -> (Option<f64>, f64, f64) {
-        let (omega, c_lr, c_sr_minus_lr) = self.get_rsh(spin_channel);
-        (omega, c_lr, c_sr_minus_lr + c_lr)
-    }
-
     pub fn is_rsh(&self) -> bool {
         match self.component_type {
             ComponentType::RSHF => {
@@ -886,28 +873,11 @@ impl DFAdef {
     /// every component type and `get_rsh_lrsr` restores the absolute `c_SR`.
     /// Non-RSH components carry their (range-independent) hybrid in both slots.
     pub fn get_rsh_scf_lrsr(&self, spin_channel: usize) -> (Option<f64>, f64, f64) {
-        let mut result = (None, 0.0, 0.0);
-        if let Some(components) = &self.xc_scf {
-            for comp in components.iter() {
-                let (omega, c_lr, c_sr) = comp.get_rsh_lrsr(spin_channel);
-                // only if c_LR and c_SR are both close to zero, we consider it as not range-separated (pure zero).
-                if c_lr.abs() < 1e-10 && c_sr.abs() < 1e-10 {
-                    continue;
-                }
-                if let Some(omega) = omega {
-                    if result.0.is_some() {
-                        if result.0.unwrap() != omega {
-                            panic!("Multiple omega detected in the DFA components for SCF. Currently this is not supported.");
-                        }
-                    } else {
-                        result.0 = Some(omega);
-                    }
-                }
-                result.1 += c_lr;
-                result.2 += c_sr;
-            }
-        }
-        result
+        // get_rsh_scf sums the raw libxc-style slots (c_LR, c_SR - c_LR) over the
+        // components; restoring the absolute short-range fraction is then just
+        // c_SR = (c_SR - c_LR) + c_LR (SR = alpha + beta in libxc's convention)
+        let (omega, c_lr, c_sr_minus_lr) = self.get_rsh_scf(spin_channel);
+        (omega, c_lr, c_sr_minus_lr + c_lr)
     }
 
     pub fn get_hybrid_nscf(&self, spin_channel: usize) -> f64 {
@@ -930,6 +900,43 @@ impl DFAdef {
     /// or a fifth-rung (post-SCF) family; mirrors `DFA4REST::use_eri`.
     pub fn use_eri(&self) -> bool {
         self.is_hybrid() || self.is_fifth_dfa()
+    }
+
+    /// `(omega, c_LR, c_SR)` of the stored definition (consumer convention, as
+    /// filled by `parse_and_derive`); `None` for a non-RSH functional.
+    pub fn rsh_params(&self) -> Option<(f64, f64, f64)> {
+        self.dfa_rsh_scf.0.map(|omega| (omega, self.dfa_rsh_scf.1, self.dfa_rsh_scf.2))
+    }
+
+    pub fn omega(&self) -> Option<f64> {
+        self.dfa_rsh_scf.0
+    }
+
+    pub fn rsh_alpha(&self) -> Option<f64> {
+        self.dfa_rsh_scf.0.map(|_| self.dfa_rsh_scf.1)
+    }
+
+    /// `true` when any SCF libxc component needs the density gradient
+    /// (non-LDA family); mirrors `DFA4REST::use_density_gradient` over the
+    /// SCF components.
+    pub fn use_density_gradient(&self) -> bool {
+        self.xc_scf.as_ref().map_or(false, |comps| {
+            comps.iter().any(|comp| {
+                comp.to_libxc_functional(1).map_or(false, |f| {
+                    !matches!(f.family(), libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA)
+                })
+            })
+        })
+    }
+
+    /// `true` when any SCF libxc component needs tau (meta-GGA); mirrors
+    /// `DFA4REST::use_kinetic_density` over the SCF components.
+    pub fn use_kinetic_density(&self) -> bool {
+        self.xc_scf.as_ref().map_or(false, |comps| {
+            comps.iter().any(|comp| {
+                comp.to_libxc_functional(1).map_or(false, |f| f.needs_tau())
+            })
+        })
     }
 
     /// SCF-functional list of `(factor, LibXCFunctional)` for the exc/vxc module

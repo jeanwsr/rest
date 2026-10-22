@@ -97,7 +97,7 @@ impl<'a> UDHGradient<'a> {
         assert!(mol_obj.start_mo == 0, "UDHGradient does not support frozen core (start_mo).");
         assert!(self.mpi_operator.is_none(), "UDHGradient is not MPI-parallelized yet.");
         assert!(
-            scf_data.mol.xc_data.omega().is_none(),
+            scf_data.mol.dfadef.omega().is_none(),
             "RSH doubly-hybrid gradients are not supported."
         );
         assert!(
@@ -359,7 +359,7 @@ impl<'a> UDHGradient<'a> {
         ];
         // the exchange (K) part of the SCF functional linearized upon the relaxed density carries
         // the SCF hybrid coefficient (forge `C1^s = cx C D_r^{S,s}`; unity for the MP2/HF reference)
-        let cx_scf = mol_obj.xc_data.dfa_hybrid_scf;
+        let cx_scf = mol_obj.dfadef.dfa_hybrid_scf;
         let c1_dr: [Tsr; 2] = [
             (mo_coeff[0].view() % d_r_s[0].view()).mapv(|x| cx_scf * x).into_contig(ColMajor),
             (mo_coeff[1].view() % d_r_s[1].view()).mapv(|x| cx_scf * x).into_contig(ColMajor),

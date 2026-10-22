@@ -834,9 +834,9 @@ fn ao_kernel_block(
     // the single-operator path below is bit-identical to the plain-hybrid
     // behaviour). K_SR reuses the same K drivers against `scf.rimatr_sr`.
     // The coefficients derive from the DFA directly (not stored in the data).
-    let (coeff_full, coeff_sr) = match scf.mol.xc_data.rsh_params() {
+    let (coeff_full, coeff_sr) = match scf.mol.dfadef.rsh_params() {
         Some((_, c_lr, c_sr)) => (c_lr, c_sr - c_lr),
-        None => (scf.mol.xc_data.dfa_hybrid_scf, 0.0),
+        None => (scf.mol.dfadef.dfa_hybrid_scf, 0.0),
     };
     let is_rsh = coeff_sr.abs() > 1e-15;
     // Effective K multiplier at the assembly sites: for a non-RSH functional

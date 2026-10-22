@@ -71,7 +71,7 @@ pub fn post_scf_output(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
                     let dm = &scf_data.density_matrix;
                     let mo = &scf_data.eigenvectors;
                     let occ = &scf_data.occupation;
-                    let funcs = scf_data.mol.xc_data.libxc_func_list();
+                    let funcs = scf_data.mol.dfadef.scf_func_list(scf_data.mol.spin_channel);
                     crate::dft::post_tabulated_exc(&funcs, scf_data.mol.spin_channel, grids, dm, mo, occ);
                 } else {
                     panic!("The grids are not yet initialized");

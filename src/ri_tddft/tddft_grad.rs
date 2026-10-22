@@ -170,8 +170,8 @@ impl<'a> TddftGradEngine<'a> {
         let natm = scf.mol.geom.nfree;
         let raw = build_raw_ri_tensors(scf);
         // dfa_hybrid_scf is 1.0 for an HF reference (set by DFA4REST::parse_scf).
-        let hyb = scf.mol.xc_data.dfa_hybrid_scf;
-        let hyb_sr = match scf.mol.xc_data.rsh_params() {
+        let hyb = scf.mol.dfadef.dfa_hybrid_scf;
+        let hyb_sr = match scf.mol.dfadef.rsh_params() {
             Some((_omega, _c_lr, c_sr)) => {
                 panic!(
                     "TDDFT gradient: range-separated hybrids are not yet supported \
@@ -1149,7 +1149,7 @@ impl<'a> TddftGradEngine<'a> {
         // suppressed with `REST_TDDFT_GRAD_NO_KXC`.
         // Pre-evaluate the grid AO once so the second (`fxcz1`) pass can reuse
         // it, when the memory budget allows (see `build_ao_cache`).
-        let xc_type = if self.scf.mol.xc_data.use_density_gradient() { XCType::GGA } else { XCType::LDA };
+        let xc_type = if self.scf.mol.dfadef.use_density_gradient() { XCType::GGA } else { XCType::LDA };
         let (ao_deriv_c, ao_comp_c, blksize_c) = self.xc_grid_setup(xc_type);
         let ao_cache = self.build_ao_cache(ao_deriv_c, ao_comp_c, blksize_c);
         let (mut f1vo, mut f1oo, mut vxc1) =
