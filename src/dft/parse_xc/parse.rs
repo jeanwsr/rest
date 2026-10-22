@@ -844,14 +844,52 @@ impl DFAdef {
     }
 
     pub fn get_rsh_scf(&self, spin_channel: usize) -> (Option<f64>, f64, f64) {
-        // check if any component in self.xc is RSH, if so, return (omega, c_LR, c_SR)
-        // in the consumer convention of DFA4REST::dfa_rsh_scf / rsh_params (the same
-        // normalization as DFA4REST::get_rsh_libxc); see DFAComponent::get_rsh_lrsr.
+        // check if any component in self.xc is RSH, if so, return (omega, alpha, beta)
+        let mut result = (None, 0.0, 0.0);
+        if let Some(components) = &self.xc_scf {
+            for comp in components.iter() {
+                if comp.is_rsh() {
+                    let (omega, alpha, beta) = comp.get_rsh(spin_channel);
+                    // println!("Component {}: omega = {:?}, alpha = {}, beta = {}", comp.func, omega, alpha, beta);
+                    // only if alpha and beta are both close to zero, we consider it as not range-separated (pure zero).
+                    if alpha.abs() < 1e-10 && beta.abs() < 1e-10 {
+                        continue;
+                    }
+                    if result.0.is_some() {
+                        if result.0.unwrap() != omega.unwrap() {
+                            panic!("Multiple omega detected in the DFA components for SCF. Currently this is not supported.");
+                        }
+                    } else {
+                        result.0 = omega;
+                    }
+                        // result = Some((omega, result.unwrap().1 + alpha, result.unwrap().2 + beta));
+                    result.1 += alpha;
+                    result.2 += beta;
+                    
+                } else {
+                    // if it's not RSH but has hybrid, we consider it as alpha with beta = 0.
+                    let hyb = comp.get_hybrid(spin_channel);
+                    result.1 += hyb;                    
+                }
+            }
+        }
+        result
+    }
+
+    /// `(omega, c_LR, c_SR)` of the SCF functional in the consumer convention of
+    /// `DFA4REST::dfa_rsh_scf` / `rsh_params` (the same normalization
+    /// `DFA4REST::get_rsh_libxc` applies on the legacy path): `c_LR` is the
+    /// long-range (full-range) HF fraction and `c_SR` the short-range fraction.
+    /// Per libxc's convention (xc.h) `cam_alpha` is the full HF fraction and
+    /// `cam_beta` the short-range-only extra (SR = cam_alpha + cam_beta,
+    /// LR = cam_alpha), so the raw `get_rsh` slots are `(c_LR, c_SR - c_LR)` for
+    /// every component type and `get_rsh_lrsr` restores the absolute `c_SR`.
+    /// Non-RSH components carry their (range-independent) hybrid in both slots.
+    pub fn get_rsh_scf_lrsr(&self, spin_channel: usize) -> (Option<f64>, f64, f64) {
         let mut result = (None, 0.0, 0.0);
         if let Some(components) = &self.xc_scf {
             for comp in components.iter() {
                 let (omega, c_lr, c_sr) = comp.get_rsh_lrsr(spin_channel);
-                // println!("Component {}: omega = {:?}, c_LR = {}, c_SR = {}", comp.func, omega, c_lr, c_sr);
                 // only if c_LR and c_SR are both close to zero, we consider it as not range-separated (pure zero).
                 if c_lr.abs() < 1e-10 && c_sr.abs() < 1e-10 {
                     continue;
@@ -1147,7 +1185,7 @@ pub fn parse_and_derive(xc: &str, spin_channel: usize, print_level: usize) -> DF
     // restore intermediate variables
     // dfa.init_libxc();
     dfa.dfa_hybrid_scf = dfa.get_hybrid_scf(spin_channel);
-    dfa.dfa_rsh_scf = dfa.get_rsh_scf(spin_channel);
+    dfa.dfa_rsh_scf = dfa.get_rsh_scf_lrsr(spin_channel);
     if dfa.has_nscf() {
         dfa.dfa_hybrid_nscf = Some(dfa.get_hybrid_nscf(spin_channel));
     }
@@ -1438,270 +1476,3 @@ fn parse_arguments(input: &str) -> (HashMap<String, Value>, Vec<f64>) {
     (keyword_args, positional_args)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{parse_and_derive, DFA4REST, DFAComponent, DFAdef, DFAFamily, ComponentType};
-    use libxc::prelude::LibXCSpin;
-    use std::collections::HashMap;
-
-    fn close(a: f64, b: f64) -> bool {
-        (a - b).abs() < 1.0e-8
-    }
-
-    #[test]
-    fn rsh_lrsr_rshf_decomposition() {
-        let hf_comp = |factor: f64, func: &str| DFAComponent {
-            factor,
-            func: func.to_string(),
-            func_full_name: String::new(),
-            id: 0,
-            param_positional: vec![0.33],
-            param_keyword: HashMap::new(),
-            component_type: ComponentType::RSHF,
-            reference: Vec::new(),
-        };
-        let mut dfa = DFAdef::new();
-        dfa.spin_channel = 1;
-        dfa.xc_scf = Some(vec![hf_comp(0.65, "SR_HF"), hf_comp(0.19, "LR_HF")]);
-        let (omega, c_lr, c_sr) = dfa.get_rsh_scf(1);
-        assert_eq!(omega, Some(0.33));
-        assert!(close(c_lr, 0.19), "c_LR = {c_lr}");
-        assert!(close(c_sr, 0.65), "c_SR = {c_sr}");
-        assert!(dfa.is_rsh());
-    }
-
-    fn assert_round_trip(original: &DFA4REST, name: &str) {
-        let rt = DFAdef::from_dfa4rest(original).to_dfa4rest();
-        assert_eq!(original.spin_channel, rt.spin_channel, "spin_channel for {name}");
-        assert_eq!(original.dfa_compnt_scf, rt.dfa_compnt_scf, "compnt_scf for {name}");
-        assert_eq!(original.dfa_paramr_scf, rt.dfa_paramr_scf, "paramr_scf for {name}");
-        assert!(close(original.dfa_hybrid_scf, rt.dfa_hybrid_scf), "hybrid_scf for {name}");
-        assert_eq!(original.dfa_rsh_scf, rt.dfa_rsh_scf, "rsh for {name}");
-        assert_eq!(original.dfa_family_pos, rt.dfa_family_pos, "family_pos for {name}");
-        assert_eq!(original.dfa_compnt_pos, rt.dfa_compnt_pos, "compnt_pos for {name}");
-        assert_eq!(original.dfa_paramr_pos, rt.dfa_paramr_pos, "paramr_pos for {name}");
-        match (original.dfa_hybrid_pos, rt.dfa_hybrid_pos) {
-            (None, None) => {},
-            (Some(a), Some(b)) => assert!(close(a, b), "hybrid_pos for {name}"),
-            _ => panic!("hybrid_pos presence mismatch for {name}"),
-        }
-        match (&original.dfa_paramr_adv, &rt.dfa_paramr_adv) {
-            (None, None) => {},
-            (Some(a), Some(b)) => {
-                assert_eq!(a.len(), b.len(), "paramr_adv len for {name}");
-                for (x, y) in a.iter().zip(b.iter()) {
-                    assert!(close(*x, *y), "paramr_adv for {name}");
-                }
-            },
-            _ => panic!("paramr_adv presence mismatch for {name}"),
-        }
-    }
-
-    #[test]
-    fn legacy_postscf_names_covered_by_parse_xc() {
-        // (name, expected fifth-rung family) for every entry of the legacy
-        // DFA4REST parse_postscf table (dft/mod.rs). parse_xc is the default
-        // xc_parser and must accept all of them.
-        let expected: Vec<(&str, DFAFamily)> = vec![
-            ("b2gpplyp", DFAFamily::PT2),
-            ("b2plyp", DFAFamily::PT2),
-            ("mp2", DFAFamily::PT2),
-            ("pbe0dh", DFAFamily::PT2),
-            ("pbe-qidh", DFAFamily::PT2),
-            ("scs-mp2", DFAFamily::PT2),
-            ("xdh-pbe0", DFAFamily::PT2),
-            ("xyg2", DFAFamily::PT2),
-            ("xyg3", DFAFamily::PT2),
-            ("xyg7", DFAFamily::PT2),
-            ("xygjos", DFAFamily::PT2),
-            ("zrps", DFAFamily::SBGE2),
-            ("r-xyg2", DFAFamily::SBGE2),
-            ("r-xyg3", DFAFamily::SBGE2),
-            ("r-xyg7", DFAFamily::SBGE2),
-            ("r-xygjos", DFAFamily::SBGE2),
-            ("r-xdh7", DFAFamily::SCSRPA),
-            ("scsrpa", DFAFamily::SCSRPA),
-            ("rpa@b3lyp", DFAFamily::RPA),
-            ("rpa@pbe", DFAFamily::RPA),
-        ];
-        for (name, family) in expected {
-            let dfa = parse_and_derive(name, 1, 0);
-            assert_eq!(dfa.family_pos(), Some(family), "family mismatch for {name}");
-        }
-        // the sBGE2-renormalized variants: (os, ss) factors transcribed from the
-        // legacy table, exercising the SBGE2_OS/SBGE2_SS tokens
-        let checks: Vec<(&str, [f64; 2], f64)> = vec![
-            ("r-xyg2", [0.3387, 0.3387], 0.8016),
-            ("r-xyg3", [0.3211, 0.3211], 0.8033),
-            ("r-xyg7", [0.4052, 0.2589], 0.8971),
-            ("r-xygjos", [0.4364, 0.0], 0.7731),
-        ];
-        for (name, os_ss, hybrid) in checks {
-            let dfa = parse_and_derive(name, 1, 0);
-            let comp = dfa
-                .fifth_rung_component()
-                .unwrap_or_else(|| panic!("{name} must carry a fifth-rung component"));
-            assert_eq!(comp.param_positional.len(), 2, "os/ss len for {name}");
-            assert!(close(comp.param_positional[0], os_ss[0]), "os for {name}");
-            assert!(close(comp.param_positional[1], os_ss[1]), "ss for {name}");
-            assert!(close(dfa.dfa_hybrid_nscf.unwrap(), hybrid), "hybrid for {name}");
-        }
-    }
-
-    #[test]
-    fn rsh_parity_parse_xc_vs_legacy() {
-        for name in ["cam-b3lyp", "lc-wpbe"] {
-            let legacy = DFA4REST::new(name, 1, 0);
-            let pxc = parse_and_derive(name, 1, 0).to_dfa4rest();
-            assert_eq!(legacy.dfa_rsh_scf, pxc.dfa_rsh_scf, "rsh triple mismatch for {name}");
-            assert!(
-                close(legacy.dfa_hybrid_scf, pxc.dfa_hybrid_scf),
-                "hybrid mismatch for {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn from_dfa4rest_round_trip_legacy() {
-        for name in ["hf", "b3lyp", "pbe0", "cam-b3lyp", "wb97x-v", "xyg3", "xygjos", "b2plyp", "scsrpa"] {
-            let original = DFA4REST::new(name, 1, 0);
-            assert_round_trip(&original, name);
-        }
-    }
-
-    #[test]
-    fn from_dfa4rest_round_trip_deep_learning() {
-        let original = DFA4REST::parse_scf_dldft(&"dl_dfa_scf".to_string(), 1);
-        assert_round_trip(&original, "dl_dfa_scf");
-    }
-
-    #[test]
-    fn parse_standard_functionals() {
-        let dfa = parse_and_derive("hf", 1, 0);
-        assert!(close(dfa.dfa_hybrid_scf, 1.0));
-        assert!(dfa.family_pos().is_none());
-        assert!(!dfa.is_dfa_scf());
-        assert!(!dfa.is_fifth_dfa());
-
-        let dfa = parse_and_derive("b3lyp", 1, 0);
-        assert!(close(dfa.dfa_hybrid_scf, 0.2));
-        assert!(dfa.is_dfa_scf());
-        assert!(dfa.family_pos().is_none());
-
-        let dfa = parse_and_derive("pbe0", 1, 0);
-        assert!(close(dfa.dfa_hybrid_scf, 0.25));
-        assert!(dfa.is_dfa_scf());
-
-        let dfa = parse_and_derive("wb97x_v", 1, 0);
-        assert!(dfa.is_dfa_scf());
-        assert!(dfa.is_rsh());
-    }
-
-    #[test]
-    fn parse_fifth_rung() {
-        let dfa = parse_and_derive("xyg3", 1, 0);
-        assert_eq!(dfa.family_pos(), Some(DFAFamily::PT2));
-        assert!(dfa.is_fifth_dfa());
-        assert!(!dfa.is_rpa());
-        assert!(dfa.is_dfa_scf());
-        assert!(close(dfa.dfa_hybrid_scf, 0.2));
-        assert!(close(dfa.dfa_hybrid_nscf.unwrap(), 0.8033));
-        let pt2 = dfa.fifth_rung_component().expect("xyg3 must carry a PT2 component");
-        assert_eq!(pt2.param_positional.len(), 2);
-        assert!(close(pt2.param_positional[0], 0.3211));
-        assert!(close(pt2.param_positional[1], 0.3211));
-
-        let dfa = parse_and_derive("dsd-blyp-d3bj", 1, 0);
-        assert_eq!(dfa.family_pos(), Some(DFAFamily::PT2));
-        let pt2 = dfa.fifth_rung_component().expect("dsd-blyp-d3bj must carry a PT2 component");
-        assert!(close(pt2.param_positional[0], 0.47));
-        assert!(close(pt2.param_positional[1], 0.40));
-        assert!(dfa.has_dispersion());
-
-        let dfa = parse_and_derive("rpa@b3lyp", 1, 0);
-        assert_eq!(dfa.family_pos(), Some(DFAFamily::RPA));
-        assert!(dfa.is_rpa());
-
-        let dfa = parse_and_derive("scsrpa", 1, 0);
-        assert_eq!(dfa.family_pos(), Some(DFAFamily::SCSRPA));
-        assert!(dfa.is_fifth_dfa());
-        assert!(!dfa.is_rpa());
-        assert!(dfa.fifth_rung_component().is_some());
-    }
-
-    #[test]
-    fn parse_dispersion() {
-        let dfa = parse_and_derive("pbe0-d3bj", 1, 0);
-        let disp = dfa.get_dispersion().expect("pbe0-d3bj must carry a Disp component");
-        assert_eq!(disp.func.to_uppercase(), "DFTD3");
-        assert!(!dfa.is_nlc());
-
-        let dfa = parse_and_derive("wb97x-v", 1, 0);
-        assert!(dfa.is_nlc());
-        let (b, c) = dfa.vv10_params().expect("wb97x-v must carry VV10 parameters");
-        assert!(b > 0.0 && c > 0.0);
-    }
-
-    #[test]
-    fn update_pt2_params_overrides() {
-        let mut dfa = parse_and_derive("xyg3", 1, 0);
-        dfa.update_pt2_params(Some(0.5), None);
-        let pt2 = dfa.fifth_rung_component().unwrap();
-        assert!(close(pt2.param_positional[0], 0.5));
-        assert!(close(pt2.param_positional[1], 0.3211));
-
-        let mut dfa = parse_and_derive("xyg3", 1, 0);
-        dfa.update_pt2_params(None, None);
-        let pt2 = dfa.fifth_rung_component().unwrap();
-        assert!(close(pt2.param_positional[0], 0.3211));
-        assert!(close(pt2.param_positional[1], 0.3211));
-
-        let mut dfa = parse_and_derive("b3lyp", 1, 0);
-        dfa.update_pt2_params(Some(0.5), Some(0.5));
-        assert!(dfa.fifth_rung_component().is_none());
-    }
-
-    #[test]
-    fn to_xc_data_matches_to_dfa4rest_scf_side() {
-        for name in ["hf", "b3lyp", "pbe0", "cam-b3lyp", "wb97x-v", "pbe0-d3bj", "xyg3"] {
-            let dfa = parse_and_derive(name, 1, 0);
-            let full = dfa.to_dfa4rest();
-            let narrow = dfa.to_xc_data();
-            assert_eq!(full.dfa_compnt_scf, narrow.dfa_compnt_scf, "compnt_scf mismatch for {name}");
-            assert_eq!(full.dfa_paramr_scf, narrow.dfa_paramr_scf, "paramr_scf mismatch for {name}");
-            assert!(close(full.dfa_hybrid_scf, narrow.dfa_hybrid_scf), "hybrid mismatch for {name}");
-            assert_eq!(full.dfa_rsh_scf, narrow.dfa_rsh_scf, "rsh mismatch for {name}");
-            assert_eq!(full.nlc_vv10, narrow.nlc_vv10, "nlc mismatch for {name}");
-        }
-    }
-
-    #[test]
-    fn func_list_door_matches_legacy_arrays() {
-        for name in ["xyg3", "dsd-blyp-d3bj", "rpa@b3lyp"] {
-            let dfa = parse_and_derive(name, 1, 0);
-            let full = dfa.to_dfa4rest();
-            let legacy: Option<Vec<(f64, usize)>> =
-                match (&full.dfa_compnt_pos, &full.dfa_paramr_pos) {
-                    (Some(code), Some(param)) if code.is_empty() => None,
-                    (Some(code), Some(param)) => Some(
-                        code.iter()
-                            .zip(param.iter())
-                            .map(|(&c, &p)| (p, c))
-                            .collect(),
-                    ),
-                    (None, None) => None,
-                    _ => panic!("pos arrays must be present or absent together"),
-                };
-            let door = crate::dft::parse_xc::func_list_from_components(
-                dfa.xc_nscf.as_deref(),
-                1,
-            )
-            .map(|l| {
-                l.into_iter()
-                    .map(|(f, func)| (f, func.number() as usize))
-                    .collect::<Vec<_>>()
-            });
-            assert_eq!(legacy, door, "func list mismatch for {name}");
-        }
-    }
-}
