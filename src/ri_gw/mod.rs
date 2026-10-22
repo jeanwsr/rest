@@ -42,6 +42,8 @@ pub mod qsgw;
 pub mod gw_grad;
 pub mod tensor_ao;
 pub mod ao_local;
+pub mod nonlingw;
+pub mod fully_analytic;
 use crate::mpi_io::MPIOperator;
 
 #[cfg(target_os = "linux")]

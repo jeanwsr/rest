@@ -387,6 +387,14 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
         normalized_output_type.as_str(),
         "cvs bse" | "cvs_bse" | "cvs-bse"
     );
+    let is_feast_gw = matches!(
+        normalized_output_type.as_str(),
+        "feast_gw" | "feast-gw" | "nlfeast_gw" | "nonlinear_gw"
+    );
+    let is_fully_analytic_gw = matches!(
+        normalized_output_type.as_str(),
+        "fully_analytic_gw" | "fully-analytic-gw" | "analytic_gw"
+    );
     let mut bse_output = crate::ri_bse::BseOutput {
         first_excitation: None,
         excitation_energies: Vec::new(),
@@ -417,7 +425,26 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
     if gw_already_done {
         announce_gw_skipped(scf_data, &output_type);
     }
-    if output_type.eq("gw"){
+    if is_fully_analytic_gw {
+        if gw_already_done {
+            let (_,_,occ_size,_,_,_)=ri_gw::get_occupation_parameters(scf_data,'Y');
+            ri_gw::display::full_quasiparticles(&scf_data.gwqp.0,occ_size);
+        } else {
+            ri_gw::fully_analytic::fully_analytic_gw_main(scf_data, &qp_ctrl, mpi_operator);
+            crate::fileop::gw_checkpoint::save_gw_finished_checkpoint(scf_data);
+        }
+    }else if is_feast_gw {
+        // Nonlinear FEAST solution of the full off-diagonal G0W0 Dyson
+        // equation.  The GW checkpoint machinery is reused verbatim: a
+        // finished run is archived exactly like the conventional GW branch.
+        if gw_already_done {
+            let (_,_,occ_size,_,_,_)=ri_gw::get_occupation_parameters(scf_data,'Y');
+            ri_gw::display::full_quasiparticles(&scf_data.gwqp.0,occ_size);
+        } else {
+            ri_gw::nonlingw::feast_gw_main(scf_data, &qp_ctrl, mpi_operator);
+            crate::fileop::gw_checkpoint::save_gw_finished_checkpoint(scf_data);
+        }
+    }else if output_type.eq("gw"){
         if gw_already_done {
             // Nothing to recompute: just report the restored quasiparticle
             // spectrum, exactly as the freshly computed one would have been.

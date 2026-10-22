@@ -54,12 +54,22 @@ pub struct QuasiParticle {
     pub bse_cutoff_energy:f64,
     // ---- core-valence separated (CVS) BSE --------------------------------
     // Triggered by `gw_or_bse = "cvs bse"`.  See `ri_bse::cvs` for the method.
-    /// Number of lowest occupied orbitals treated as the CVS core.
+    /// First occupied orbital (0-based) of the CVS core window.
+    ///
+    /// The default `0` selects the deepest core levels (1s, ...).  For EUV
+    /// semi-core excitations (e.g. I 4d or Br 3d) set this to the index of the
+    /// first semi-core orbital and `cvs_ncore` to the number of orbitals in
+    /// that shell, so that deeper true-core levels are not pulled into the CVS
+    /// transition space.
+    pub cvs_core_start:usize,
+    /// Number of occupied orbitals treated as the CVS core, starting at
+    /// `cvs_core_start`.
     ///
     /// `0` (default) selects the core automatically: every occupied orbital
-    /// whose Kohn-Sham energy is below `cvs_core_energy_max` is included.
-    /// A positive value pins the count explicitly (orbitals `0..cvs_ncore`,
-    /// in the usual energy ordering of `scf_data.eigenvalues[0]`).
+    /// from `cvs_core_start` upward whose Kohn-Sham energy is below
+    /// `cvs_core_energy_max` is included.  A positive value pins the count
+    /// explicitly (orbitals `cvs_core_start..cvs_core_start+cvs_ncore`, in the
+    /// usual energy ordering of `scf_data.eigenvalues[0]`).
     pub cvs_ncore:usize,
     /// Energy threshold (Ha) used to detect core orbitals when
     /// `cvs_ncore = 0`.  A level is core when `e_i < cvs_core_energy_max`.
@@ -517,6 +527,86 @@ pub struct QuasiParticle {
     pub nlfeast_gmres_restart: usize,
     pub nlfeast_gmres_max_it: usize,
     pub nlfeast_gmres_tol: f64,
+    // ---- Nonlinear FEAST GW (`gw_or_bse = "feast_gw"`) -----------------
+    /// Extra energy padding (Ha) around the FEAST contour used to select the
+    /// active MO window whose full (off-diagonal) self-energy matrix is built.
+    ///
+    /// The window is `[centre - radius - margin, centre + radius + margin]`
+    /// using the diagonal of the static GW Hamiltonian as the energy estimate.
+    /// A negative value (the default `-1`) puts **all** MOs in the active
+    /// space, which is the faithful full-space formulation of the paper.
+    /// Positive values truncate the active space for large systems; a
+    /// non-zero margin is then needed because the correlation self-energy can
+    /// shift a level by a few tenths of an eV (more for empty states).
+    pub feast_gw_window_margin: f64,
+    /// Largest RPA transition energy `e_a - e_i` (Ha) retained when building
+    /// the spectral representation of `W_c`.
+    ///
+    /// The fully analytic GW self-energy needs the RPA poles of `W_c`.  High
+    /// transitions contribute little to the valence self-energy but make the
+    /// dense RPA eigenproblem expensive, so this is the main knob for large
+    /// basis sets.  `1e6` keeps every transition (default).
+    pub feast_gw_rpa_energy_max: f64,
+    /// Maximum number of occupied orbitals entering the RPA transition space.
+    /// When smaller than the full occupied space, the *highest* occupied
+    /// orbitals (valence) are kept.  `0` keeps all occupied orbitals (default).
+    pub feast_gw_rpa_occ_max: usize,
+    /// Maximum number of virtual orbitals entering the RPA transition space.
+    /// `0` keeps all virtual orbitals (default).
+    pub feast_gw_rpa_vir_max: usize,
+    /// Number of states below/above the active window kept in the Green's
+    /// function sum of the self-energy.  `0` keeps all states (default).
+    pub feast_gw_selfenergy_state_range: usize,
+    /// Real-axis broadening (Ha) used when evaluating the analytic
+    /// self-energy at a real eigenvalue estimate.  `0.0` (default) evaluates
+    /// the principal value; a small positive value (e.g. `1e-4`) regularises
+    /// nearly degenerate denominators.
+    pub feast_gw_eta: f64,
+    /// Shifted linear solver used inside FEAST:
+    /// `"auto"` (default; direct LU for small windows, GMRES otherwise),
+    /// `"direct"`, or `"gmres"`.
+    ///
+    /// The paper observes that the correlation term may be omitted from the
+    /// shifted systems without changing the converged eigenpairs; see
+    /// `feast_gw_shift_correlation` for that choice.
+    pub feast_gw_shift_solver: String,
+    /// Self-energy construction: currently only `"analytic"` (dRPA spectral
+    /// representation of `W_c`, full off-diagonal matrix).
+    pub feast_gw_selfenergy_mode: String,
+    /// Projected nonlinear solver: `"selfconsistent"` (default, robust
+    /// Rayleigh–Ritz iteration per Ritz pair) or `"linearized"` (the cheaper
+    /// per-column linearisation used by the nonlinear BSE driver).
+    pub feast_gw_projected_solver: String,
+    /// Maximum number of inner self-consistent projected iterations.
+    pub feast_gw_projected_max_inner: usize,
+    /// Whether the correlation self-energy is included in the shifted FEAST
+    /// systems: `"auto"` (default; included for small/medium windows where
+    /// the extra cost is negligible), `"on"`, or `"off"`.
+    ///
+    /// The paper shows that omitting `Σ_c` still converges (the systems then
+    /// act as preconditioners), but including it makes the contour update
+    /// exact and is more robust for systems with near-degeneracies or strong
+    /// off-diagonal self-energy.
+    pub feast_gw_shift_correlation: String,
+    /// Print a diagonal-only comparison with the conventional contour-
+    /// deformation GW solver (diagnostic; default `false`).
+    pub feast_gw_validate_diagonal: bool,
+    /// Diagnostic: zero every off-diagonal element of the self-energy,
+    /// including the static `(Σ_x - V_xc)` block.
+    ///
+    /// With this flag the nonlinear FEAST problem becomes a set of independent
+    /// scalar equations, so it must reduce to the conventional/MolGW-style
+    /// fully analytic (diagonal) G0W0 result.  Useful for validating the
+    /// off-diagonal machinery.
+    pub feast_gw_zero_offdiag: bool,
+    /// If non-empty, dump the full `Σ_c(ω)` matrix (and the MO energies /
+    /// coefficients) at `feast_gw_dump_omega` to this path, then return
+    /// without running FEAST.  Intended for element-by-element comparison
+    /// against MolGW.
+    pub feast_gw_dump_sigma: String,
+    /// Frequency (Ha) at which `feast_gw_dump_sigma` is evaluated.  The
+    /// imaginary part is taken from `feast_gw_eta`.
+    pub feast_gw_dump_omega: f64,
     /// Dynamical kernel used by `gw_or_bse = "dynamic_bse"`:
     ///   "bse"  — number-conserving RPA-pair kernel on top of the screened
     ///            static GW-BSE singles block (default);
@@ -621,6 +711,7 @@ impl Default for QuasiParticle {
             print_nto:false,
             bse_spin:String::from("none"),
             bse_cutoff_energy:1000000.0,
+            cvs_core_start:0,
             cvs_ncore:0,
             cvs_core_energy_max:-10.0,
             cvs_screening:String::from("full"),
@@ -766,6 +857,21 @@ impl Default for QuasiParticle {
             nlfeast_gmres_restart: 200,
             nlfeast_gmres_max_it: 500,
             nlfeast_gmres_tol: 1e-6,
+            feast_gw_window_margin: -1.0,
+            feast_gw_rpa_energy_max: 1.0e6,
+            feast_gw_rpa_occ_max: 0,
+            feast_gw_rpa_vir_max: 0,
+            feast_gw_selfenergy_state_range: 0,
+            feast_gw_eta: 0.0,
+            feast_gw_shift_solver: String::from("auto"),
+            feast_gw_selfenergy_mode: String::from("analytic"),
+            feast_gw_projected_solver: String::from("selfconsistent"),
+            feast_gw_projected_max_inner: 12,
+            feast_gw_shift_correlation: String::from("auto"),
+            feast_gw_validate_diagonal: false,
+            feast_gw_zero_offdiag: false,
+            feast_gw_dump_sigma: String::new(),
+            feast_gw_dump_omega: 0.0,
             dynamic_bse_kernel: String::from("bse"),
             dynamic_bse_kernel_energies: String::from("qp"),
             export_matvec_count: false,
@@ -803,6 +909,7 @@ impl QuasiParticle {
         table.insert("bse_tda".to_string(), toml::Value::Boolean(self.bse_tda));
         table.insert("bse_spin".to_string(), toml::Value::String(self.bse_spin.clone()));
         table.insert("bse_cutoff_energy".to_string(), toml::Value::Float(self.bse_cutoff_energy));
+        table.insert("cvs_core_start".to_string(), toml::Value::Integer(self.cvs_core_start as i64));
         table.insert("cvs_ncore".to_string(), toml::Value::Integer(self.cvs_ncore as i64));
         table.insert("cvs_core_energy_max".to_string(), toml::Value::Float(self.cvs_core_energy_max));
         table.insert("cvs_screening".to_string(), toml::Value::String(self.cvs_screening.clone()));
@@ -948,6 +1055,21 @@ impl QuasiParticle {
         table.insert("nlfeast_gmres_restart".to_string(), toml::Value::Integer(self.nlfeast_gmres_restart as i64));
         table.insert("nlfeast_gmres_max_it".to_string(), toml::Value::Integer(self.nlfeast_gmres_max_it as i64));
         table.insert("nlfeast_gmres_tol".to_string(), toml::Value::Float(self.nlfeast_gmres_tol));
+        table.insert("feast_gw_window_margin".to_string(), toml::Value::Float(self.feast_gw_window_margin));
+        table.insert("feast_gw_rpa_energy_max".to_string(), toml::Value::Float(self.feast_gw_rpa_energy_max));
+        table.insert("feast_gw_rpa_occ_max".to_string(), toml::Value::Integer(self.feast_gw_rpa_occ_max as i64));
+        table.insert("feast_gw_rpa_vir_max".to_string(), toml::Value::Integer(self.feast_gw_rpa_vir_max as i64));
+        table.insert("feast_gw_selfenergy_state_range".to_string(), toml::Value::Integer(self.feast_gw_selfenergy_state_range as i64));
+        table.insert("feast_gw_eta".to_string(), toml::Value::Float(self.feast_gw_eta));
+        table.insert("feast_gw_shift_solver".to_string(), toml::Value::String(self.feast_gw_shift_solver.clone()));
+        table.insert("feast_gw_selfenergy_mode".to_string(), toml::Value::String(self.feast_gw_selfenergy_mode.clone()));
+        table.insert("feast_gw_projected_solver".to_string(), toml::Value::String(self.feast_gw_projected_solver.clone()));
+        table.insert("feast_gw_projected_max_inner".to_string(), toml::Value::Integer(self.feast_gw_projected_max_inner as i64));
+        table.insert("feast_gw_shift_correlation".to_string(), toml::Value::String(self.feast_gw_shift_correlation.clone()));
+        table.insert("feast_gw_validate_diagonal".to_string(), toml::Value::Boolean(self.feast_gw_validate_diagonal));
+        table.insert("feast_gw_zero_offdiag".to_string(), toml::Value::Boolean(self.feast_gw_zero_offdiag));
+        table.insert("feast_gw_dump_sigma".to_string(), toml::Value::String(self.feast_gw_dump_sigma.clone()));
+        table.insert("feast_gw_dump_omega".to_string(), toml::Value::Float(self.feast_gw_dump_omega));
         table.insert("dynamic_bse_kernel".to_string(), toml::Value::String(self.dynamic_bse_kernel.clone()));
         table.insert("dynamic_bse_kernel_energies".to_string(), toml::Value::String(self.dynamic_bse_kernel_energies.clone()));
         table.insert("export_matvec_count".to_string(), toml::Value::Boolean(self.export_matvec_count));
@@ -1120,6 +1242,11 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.bse_cutoff_energy = match tmp_ctrl.get("bse_cutoff_energy").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1000000.0_f64)},
                 other => {1000000.0},
+            };
+            tmp_input.cvs_core_start = match tmp_ctrl.get("cvs_core_start").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(0) as usize},
+                serde_json::Value::String(tmp_str) => {tmp_str.trim().parse().unwrap_or(0)},
+                _ => 0,
             };
             tmp_input.cvs_ncore = match tmp_ctrl.get("cvs_ncore").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_u64().unwrap_or(0) as usize},
@@ -1800,6 +1927,66 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
             tmp_input.nlfeast_gmres_tol = match tmp_ctrl.get("nlfeast_gmres_tol").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(1e-6),
                 _ => 1e-6,
+            };
+            tmp_input.feast_gw_window_margin = match tmp_ctrl.get("feast_gw_window_margin").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(-1.0),
+                _ => -1.0,
+            };
+            tmp_input.feast_gw_rpa_energy_max = match tmp_ctrl.get("feast_gw_rpa_energy_max").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0e6),
+                _ => 1.0e6,
+            };
+            tmp_input.feast_gw_rpa_occ_max = match tmp_ctrl.get("feast_gw_rpa_occ_max").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+                _ => 0,
+            };
+            tmp_input.feast_gw_rpa_vir_max = match tmp_ctrl.get("feast_gw_rpa_vir_max").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+                _ => 0,
+            };
+            tmp_input.feast_gw_selfenergy_state_range = match tmp_ctrl.get("feast_gw_selfenergy_state_range").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+                _ => 0,
+            };
+            tmp_input.feast_gw_eta = match tmp_ctrl.get("feast_gw_eta").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.feast_gw_shift_solver = match tmp_ctrl.get("feast_gw_shift_solver").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.trim().to_lowercase(),
+                _ => String::from("auto"),
+            };
+            tmp_input.feast_gw_selfenergy_mode = match tmp_ctrl.get("feast_gw_selfenergy_mode").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.trim().to_lowercase(),
+                _ => String::from("analytic"),
+            };
+            tmp_input.feast_gw_projected_solver = match tmp_ctrl.get("feast_gw_projected_solver").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.trim().to_lowercase(),
+                _ => String::from("selfconsistent"),
+            };
+            tmp_input.feast_gw_projected_max_inner = match tmp_ctrl.get("feast_gw_projected_max_inner").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(12) as usize,
+                _ => 12,
+            };
+            tmp_input.feast_gw_shift_correlation = match tmp_ctrl.get("feast_gw_shift_correlation").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.trim().to_lowercase(),
+                _ => String::from("auto"),
+            };
+            tmp_input.feast_gw_validate_diagonal = match tmp_ctrl.get("feast_gw_validate_diagonal").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
+            };
+            tmp_input.feast_gw_zero_offdiag = match tmp_ctrl.get("feast_gw_zero_offdiag").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                _ => false,
+            };
+            tmp_input.feast_gw_dump_sigma = match tmp_ctrl.get("feast_gw_dump_sigma").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            tmp_input.feast_gw_dump_omega = match tmp_ctrl.get("feast_gw_dump_omega").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
             };
             tmp_input.dynamic_bse_kernel = match tmp_ctrl.get("dynamic_bse_kernel").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(s) => {
