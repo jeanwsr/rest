@@ -22,6 +22,11 @@ pub mod smear;
 pub mod util;
 pub mod occupation;
 pub mod force_state_occupation;
+/// PEXSI-based SCF solve layer: preconditioning, frozen pattern, driver loop
+/// and state restore. See the module documentation for the contract and the
+/// scope (LDA/GGA only).
+#[cfg(feature = "pexsi")]
+pub mod pexsi_solver;
 
 #[cfg(feature = "mpi")]
 use mpi::collective::SystemOperation;
@@ -6276,6 +6281,54 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     scf_data.generate_density_matrix();
     scf_records.update(&scf_data);
 
+    // ------------------------------------------------------------------
+    // Solver selection. Once per run: there is no second pass, so nothing has
+    // to be saved or restored.
+    //
+    // A failure here is safe to fall back from: `PexsiSolver::new` only reads
+    // the SCF and builds its own pattern and plan.
+    // ------------------------------------------------------------------
+    #[cfg(feature = "pexsi")]
+    let mut pexsi_driver: Option<pexsi_solver::PexsiSolver> =
+        if pexsi_solver::PexsiSolver::is_enabled(scf_data) {
+            match pexsi_solver::PexsiSolver::new(scf_data, mpi_operator) {
+                Ok(driver) => Some(driver),
+                Err(e) => {
+                    warn!("PEXSI not used for this run, falling back to diagonalisation: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+     };
+
+    // The pole expansion IS the SCF, so the energy has to take the
+    // density-matrix route: under PEXSI there are no current eigenvectors to
+    // contract against, and the orbital route would silently use stale ones.
+    // The user's value is put back before anything downstream sees it.
+    let user_dm_only = scf_data.mol.ctrl.use_dm_only;
+    let user_acc_etot = scf_data.mol.ctrl.scf_acc_etot;
+    #[cfg(feature = "pexsi")]
+    if pexsi_driver.is_some() {
+        scf_data.mol.ctrl.use_dm_only = true;
+        // An energy window tighter than the pole-expansion noise floor cannot
+        // close; the density criterion stays the real gate.
+        scf_data.mol.ctrl.scf_acc_etot =
+            user_acc_etot.max(pexsi_solver::ENERGY_TOLERANCE_FLOOR);
+        warn!(
+            "PEXSI: energy tolerance relaxed to {:.0e} Ha for this run (user value {:.0e}); \
+                the density criterion is the real gate.",
+            scf_data.mol.ctrl.scf_acc_etot, user_acc_etot
+        );
+    }
+    // Bookkeeping for the per-iteration line and for the final report. Plain
+    // scalars so the loop body compiles with or without the feature.
+    #[allow(unused_mut, unused_assignments)]
+    let mut step_mu = 0.0_f64;
+    #[allow(unused_mut, unused_assignments)]
+    let mut step_n_raw = 0.0_f64;
+    let mut used_pexsi = false;
+
     //println!("======== IGOR debug for xc components =======");
     //let dfa = crate::dft::DFA4REST::new_xc(scf_data.mol.spin_channel, scf_data.mol.ctrl.print_level);
     //let post_xc_energy = if let Some(grids) = &scf_data.grids {
@@ -6290,6 +6343,11 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
 
     let mut scf_converge = [false;2];
     let mut guess_mix_applied = (scf_data.mol.ctrl.start_mix_cycle == 0_usize); 
+    // ------------------------------------------------------------------
+    // The one SCF loop. `solved_by_pexsi` is decided inside, once per
+    // iteration, so both solver steps live in the same iteration body:
+    // mixing, convergence, records and printing are shared.
+    // ------------------------------------------------------------------
     while ! (scf_converge[0] || scf_converge[1]) {
         let dt1 = time::Local::now();
 
@@ -6297,34 +6355,66 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         // scf_data.grad_dm = scf_data.get_grad_dm();
 
         let dt1_1 = time::Local::now();
-
-        scf_data.diagonalize_hamiltonian(mpi_operator);
-        let dt1_2 = time::Local::now();
-        scf_data.generate_occupation();
-        if let Some(st) = &scf_data.mol.ctrl.smear {
-            let mut sigma = scf_data.mol.ctrl.smear_sigma.unwrap();
-            if scf_data.mol.ctrl.smear_anneal {
-                let anneal_start = scf_data.mol.ctrl.start_diis_cycle;
-                let anneal_length = (scf_data.mol.ctrl.max_scf_cycle as f64 * 0.5) as usize;
-                let sigma_min = scf_data.mol.ctrl.smear_sigma_min
-                    .unwrap_or_else(|| f64::max(sigma * 0.01, 0.001));
-                sigma = annealed_sigma(sigma, sigma_min, scf_records.num_iter, anneal_start, anneal_length);
+        // ---- solve step: PEXSI or diagonalisation --------------------
+        #[cfg(feature = "pexsi")]
+        let solved_by_pexsi = match pexsi_driver.as_mut() {
+            Some(driver) => {
+                let report = driver
+                    .solve_step(scf_data, mpi_operator)
+                    .unwrap_or_else(|e| panic!("PEXSI solve failed mid-SCF: {e}"));
+                step_mu = report.mu;
+                step_n_raw = report.num_electrons_raw;
+                true
             }
-            apply_smearing(scf_data, *st, sigma);
-            scf_data.current_smear_sigma = sigma;
-        }
+            None => false,
+        };
+        #[cfg(not(feature = "pexsi"))]
+        let solved_by_pexsi = false;
 
-        // --- Apply guess_mix during SCF iterations ---
-        // When start_mix_cycle > 0, perform HOMO–LUMO mixing exactly at the
-        // specified SCF cycle number (num_iter == start_mix_cycle).
-        if scf_data.mol.ctrl.guess_mix && !guess_mix_applied && (scf_records.num_iter as usize) == scf_data.mol.ctrl.start_mix_cycle {
-            println!(">>> guess_mix activated at SCF iteration {}.", scf_records.num_iter);
-            apply_guess_mix(scf_data);
-            scf_records.refresh();
-            guess_mix_applied = true;
-        }
+        if !solved_by_pexsi {
+            scf_data.diagonalize_hamiltonian(mpi_operator);
+            scf_data.generate_occupation();
+            if let Some(st) = &scf_data.mol.ctrl.smear {
+                let mut sigma = scf_data.mol.ctrl.smear_sigma.unwrap();
+                if scf_data.mol.ctrl.smear_anneal {
+                    let anneal_start = scf_data.mol.ctrl.start_diis_cycle;
+                    let anneal_length = (scf_data.mol.ctrl.max_scf_cycle as f64 * 0.5) as usize;
+                    let sigma_min = scf_data
+                        .mol
+                        .ctrl
+                        .smear_sigma_min
+                        .unwrap_or_else(|| f64::max(sigma * 0.01, 0.001));
+                    sigma = annealed_sigma(
+                        sigma,
+                        sigma_min,
+                        scf_records.num_iter,
+                        anneal_start,
+                        anneal_length,
+                    );
+                }
+                apply_smearing(scf_data, *st, sigma);
+                scf_data.current_smear_sigma = sigma;
+            }
 
-        scf_data.generate_density_matrix();
+            // HOMO–LUMO mixing needs the current orbitals, so it can only run
+            // on this branch.
+            if scf_data.mol.ctrl.guess_mix
+                && !guess_mix_applied
+                && (scf_records.num_iter as usize) == scf_data.mol.ctrl.start_mix_cycle
+            {
+                println!(
+                    ">>> guess_mix activated at SCF iteration {}.",
+                    scf_records.num_iter
+                );
+                apply_guess_mix(scf_data);
+                scf_records.refresh();
+                guess_mix_applied = true;
+            }
+
+            scf_data.generate_density_matrix();
+        }
+        
+        let dt1_2 = time::Local::now();
 
         let dt_solv0 = time::Local::now();
         if scf_data.mol.ctrl.solvent_enabled {
@@ -6345,23 +6435,36 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         // apply mixing now and continue SCF (do NOT exit loop).
         // -------------------------
         if (scf_converge[0] || scf_converge[1]) && scf_data.mol.ctrl.guess_mix && !guess_mix_applied {
-            println!(">>> guess_mix requested at start_mix_cycle = {}, but SCF converged after {} iterations. \
-            Applying HOMO-LUMO mixing now and continuing SCF.", scf_data.mol.ctrl.start_mix_cycle, scf_records.num_iter - 1);
-
-            // apply mixing and mark as applied
-            apply_guess_mix(scf_data);
-            scf_records.refresh();
-            guess_mix_applied = true;
-
-            // rebuild dependent quantities so subsequent SCF iterations are consistent
-            scf_data.generate_density_matrix();
-            scf_data.generate_hf_hamiltonian(mpi_operator);
-            scf_data.grad_dm = scf_data.get_grad_dm();
-            scf_data.diagonalize_hamiltonian(mpi_operator);
-            scf_data.generate_occupation();
-
-            // IMPORTANT: clear convergence so the while-loop continues
-            scf_converge = [false, false];
+            if solved_by_pexsi {
+                warn!(
+                    "guess_mix was requested at start_mix_cycle = {} but the SCF converged at \
+                    {}. Skipping it: HOMO–LUMO mixing needs the current orbitals, which the \
+                    PEXSI path does not produce. Use start_mix_cycle = 0 (the mixing then \
+                    happens on the initial guess) or the diagonalisation solver.",
+                scf_data.mol.ctrl.start_mix_cycle,
+                scf_records.num_iter - 1
+                );
+                guess_mix_applied = true;
+            }
+            else {
+                println!(">>> guess_mix requested at start_mix_cycle = {}, but SCF converged after {} iterations. \
+                Applying HOMO-LUMO mixing now and continuing SCF.", scf_data.mol.ctrl.start_mix_cycle, scf_records.num_iter - 1);
+    
+                // apply mixing and mark as applied
+                apply_guess_mix(scf_data);
+                scf_records.refresh();
+                guess_mix_applied = true;
+    
+                // rebuild dependent quantities so subsequent SCF iterations are consistent
+                scf_data.generate_density_matrix();
+                scf_data.generate_hf_hamiltonian(mpi_operator);
+                scf_data.grad_dm = scf_data.get_grad_dm();
+                scf_data.diagonalize_hamiltonian(mpi_operator);
+                scf_data.generate_occupation();
+    
+                // IMPORTANT: clear convergence so the while-loop continues
+                scf_converge = [false, false];
+            }
         }
 
         scf_records.update(&scf_data);
@@ -6370,34 +6473,69 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
 
         let dt2 = time::Local::now();
         let timecost = (dt2.timestamp_millis()-dt1.timestamp_millis()) as f64 /1000.0;
-        if scf_data.mol.ctrl.print_level>0 {
-            let have_smear = scf_data.mol.ctrl.smear.is_some();
+        if scf_data.mol.ctrl.print_level > 0 {
             let e_tot = scf_records.scf_energy;
-            if scf_data.mol.spin_channel == 2 {
-                let [square_spin, spin_z] = evaluate_spin_angular_momentum(&scf_data.density_matrix, &scf_data.ovlp, scf_data.mol.spin_channel, &scf_data.mol.num_elec);
-                if have_smear {
+            if solved_by_pexsi {
+                // No free-energy decomposition here: the entropy term comes
+                // from the orbital occupations, which this solver does not form.
+                println!(
+                    "PEXSI E {:18.10}  mu {:+.6}  N_raw {:9.6}  iter {:4}  {:8.2}s",
+                    e_tot,
+                    step_mu,
+                    step_n_raw,
+                    scf_records.num_iter - 1,
+                    timecost
+                );
+            } else if scf_data.mol.spin_channel == 2 {
+                let [square_spin, spin_z] = evaluate_spin_angular_momentum(
+                    &scf_data.density_matrix,
+                    &scf_data.ovlp,
+                    scf_data.mol.spin_channel,
+                    &scf_data.mol.num_elec,
+                );
+                if scf_data.mol.ctrl.smear.is_some() {
                     let sigma = scf_data.current_smear_sigma;
                     let s = scf_data.smearing_entropy;
-                    println!("E(T) {:18.10}  E_free {:18.10}  E0 {:18.10}  S^2 {:5.3}  2S+1 {:5.3}  iter {:4}  {:8.2}s",
-                         e_tot, e_tot - sigma * s, e_tot - 0.5 * sigma * s,
-                         square_spin, spin_z,
-                         scf_records.num_iter-1, timecost)
+                    println!(
+                        "E(T) {:18.10}  E_free {:18.10}  E0 {:18.10}  S^2 {:5.3}  2S+1 {:5.3}  \
+                            iter {:4}  {:8.2}s",
+                        e_tot,
+                        e_tot - sigma * s,
+                        e_tot - 0.5 * sigma * s,
+                        square_spin,
+                        spin_z,
+                        scf_records.num_iter - 1,
+                        timecost
+                    )
                 } else {
-                    println!("Energy: {:18.10} Ha with <S^2> = {:6.3} and <2S+1> = {:6.3} after {:4} iterations (in {:10.2} seconds).",
-                         e_tot, square_spin, spin_z,
-                         scf_records.num_iter-1, timecost)
+                    println!(
+                        "Energy: {:18.10} Ha with <S^2> = {:6.3} and <2S+1> = {:6.3} after {:4} \
+                            iterations (in {:10.2} seconds).",
+                        e_tot,
+                        square_spin,
+                        spin_z,
+                        scf_records.num_iter - 1,
+                        timecost
+                    )
                 }
+            } else if scf_data.mol.ctrl.smear.is_some() {
+                let sigma = scf_data.current_smear_sigma;
+                let s = scf_data.smearing_entropy;
+                println!(
+                    "E(T) {:18.10}  E_free {:18.10}  E0 {:18.10}  iter {:4}  {:8.2}s",
+                    e_tot,
+                    e_tot - sigma * s,
+                    e_tot - 0.5 * sigma * s,
+                    scf_records.num_iter - 1,
+                    timecost
+                )
             } else {
-                if have_smear {
-                    let sigma = scf_data.current_smear_sigma;
-                    let s = scf_data.smearing_entropy;
-                    println!("E(T) {:18.10}  E_free {:18.10}  E0 {:18.10}  iter {:4}  {:8.2}s",
-                         e_tot, e_tot - sigma * s, e_tot - 0.5 * sigma * s,
-                         scf_records.num_iter-1, timecost)
-                } else {
-                    println!("Energy: {:18.10} Ha after {:4} iterations (in {:10.2} seconds).",
-                         e_tot, scf_records.num_iter-1, timecost)
-                }
+                println!(
+                    "Energy: {:18.10} Ha after {:4} iterations (in {:10.2} seconds).",
+                    e_tot,
+                    scf_records.num_iter - 1,
+                    timecost
+                )
             }
         };
         if scf_data.mol.ctrl.print_level>1 {
@@ -6425,9 +6563,14 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
         //if scf_data.mol.ctrl.restart {save_chkfile(&scf_data)};
         println!("SCF does not converge within {:03} iterations",scf_records.num_iter);
     }
+    
     match scf_data.mol.ctrl.occupation_type {
-        OCCType::FRAC => {
-            let (occupation, homo, lumo) = occupation::generate_occupation_integer(&scf_data.mol, &scf_data.scftype);
+        OCCType::FRAC if !used_pexsi => {
+            // Fractional occupations are an orbital-level construct: rebuild the
+            // density from integer occupations, then let the final
+            // diagonalisation below repopulate the spectrum.
+            let (occupation, homo, lumo) =
+                occupation::generate_occupation_integer(&scf_data.mol, &scf_data.scftype);
             scf_data.occupation = occupation;
             scf_data.homo = homo;
             scf_data.lumo = lumo;
@@ -6436,22 +6579,38 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
             scf_data.grad_dm = scf_data.get_grad_dm();
             scf_data.diagonalize_hamiltonian(mpi_operator);
             scf_data.generate_occupation();
-
         }
         _ => {
-            scf_data.generate_hf_hamiltonian(mpi_operator); 
-            scf_data.grad_dm = scf_data.get_grad_dm();
-            info!("Energy: {:20.10} Ha", scf_data.scf_energy);
-            info!("grad_dm l2: {:10.5e} Ha", norm(&scf_data.grad_dm[0], "l2"));
-            scf_data.diagonalize_hamiltonian(mpi_operator);
-            scf_data.generate_occupation();
-            // scf_data.generate_density_matrix();
-            // scf_data.generate_hf_hamiltonian(mpi_operator);
-            // scf_data.grad_dm = scf_data.get_grad_dm();
-            // info!("Energy: {:20.10} Ha", scf_data.scf_energy);
-            // info!("grad_dm l2: {:10.5e} Ha", norm(&scf_data.grad_dm[0], "l2"));
+            if matches!(scf_data.mol.ctrl.occupation_type, OCCType::FRAC) && used_pexsi {
+                warn!(
+                    "PEXSI: occupation_type = FRAC is an orbital-level construct and is not                      applied. The occupation is the pole-expanded Fermi-Dirac function at                      kT = the solver temperature; use `smear_sigma` to control it."
+                );
+            }
+            // Energy at the converged density, taken with the route the solver
+            // used, then hand the user's flags back before anything else reads
+            // them.
+            scf_data.generate_hf_hamiltonian(mpi_operator);
+            let final_energy = scf_data.scf_energy;
+            let final_grad = scf_data.get_grad_dm();
+            let grad_norm = norm(&final_grad[0], "l2");
+
+            scf_data.mol.ctrl.use_dm_only = user_dm_only;
+            scf_data.mol.ctrl.scf_acc_etot = user_acc_etot;
+
+            scf_data.grad_dm = final_grad;
+            info!("Energy: {:20.10} Ha", final_energy);
+            info!("grad_dm l2: {:10.5e} Ha", grad_norm);
         }
     }
+    // ------------------------------------------------------------------
+    // Final diagonalisation. Under PEXSI this is the first time the solver has
+    // produced eigenvectors at the converged density; under diagonalisation it
+    // is a repeat of the last iteration. Either way, everything downstream
+    // (HOMO/LUMO, charges, gradients, post-SCF analysis) now reads a spectrum
+    // that belongs to the converged density rather than to the initial guess.
+    // ------------------------------------------------------------------
+    scf_data.diagonalize_hamiltonian(mpi_operator);
+    scf_data.generate_occupation();
 
     //solvent debug
     if scf_data.mol.ctrl.solvent_enabled{

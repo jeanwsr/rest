@@ -420,6 +420,16 @@ pub struct InputKeywords {
     // Keywords for sad initial guess
     #[pyo3(get, set)]
     pub atom_sad: bool,
+    /// Use the PEXSI pole-expanded selected-inversion solver for the SCF step
+    /// instead of the O(N^3) diagonalisation (`ctrl.pexsi = true`).
+    ///
+    /// Run-time switch: no rebuild is needed to go back to diagonalisation.
+    /// Needs a build with the `pexsi` feature — without it the keyword is
+    /// reported and ignored. Refused for the nested SAD SCF (`atom_sad = true`),
+    /// which is a doublet. Validated for LDA/GGA; with exact exchange the frozen
+    /// `H_core` pattern truncates the 1/R tail of `K`, which only warns.
+    #[pyo3(get, set)]
+    pub pexsi: bool,
     pub empirical_dispersion: Option<String>,
     pub occupation_type: OCCType,
     pub frac_tolerant: f64,
@@ -647,6 +657,8 @@ impl InputKeywords {
             //output_fchk: false,
             // Keyword to turn on atom calculations for the SAD initial guess
             atom_sad: false,
+            // Keyword to use the PEXSI solver instead of diagonalisation
+            pexsi: false,
             // Derived keywords of identifying the method used
             //use_dft: false,
             //dft_type: None,
@@ -843,6 +855,17 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         println!("                            {:e} Ha. for grad_dm", ctrl.scf_acc_g);
         println!("SCF convergence criteria:       {}", ctrl.scf_conv_criteria);
         println!("Max. SCF cycle number:      {}", ctrl.max_scf_cycle);
+        // Which solver will drive the SCF. Three states worth distinguishing:
+        // requested and compiled in, requested but not compiled in, not
+        // requested.
+        let solver_line = if ctrl.pexsi && cfg!(feature = "pexsi") {
+            "PEXSI (pole-expanded selected inversion)"
+        } else if ctrl.pexsi {
+            "diagonalisation (pexsi requested, but this build has no pexsi feature)"
+        } else {
+            "diagonalisation"
+        };
+        println!("SCF solver:                 {}", solver_line);
         match geom.pbc {
             MOrC::Molecule => println!("It is a finite cluster calculation"),
             MOrC::Crystal => println!("It is a periodic calculation")
@@ -2036,6 +2059,24 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::Bool(tmp_str) => {*tmp_str},
                 other => {false},
             };
+
+            // for the SCF solver: pexsi = true switches the solve step from
+            // diagonalisation to the PEXSI selected inversion. Accepted as a
+            // bool, a string ("true"/"false") or a number (1/0), because the
+            // input file may be written with any of the three.
+            tmp_input.pexsi = match tmp_ctrl.get("pexsi").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                serde_json::Value::Number(tmp_num) => tmp_num.as_i64().unwrap_or(0) != 0,
+                _ => false,
+            };
+            if tmp_input.pexsi && !cfg!(feature = "pexsi") {
+                warn!(
+                    "`pexsi = true` is set in [ctrl], but this build has no `pexsi` feature; \
+                        the SCF will use diagonalisation. Rebuild with \
+                        `cargo build --features pexsi` to use it."
+                );
+            }
 
             tmp_input.max_memory = match tmp_ctrl.get("max_memory").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(tmp_num) => Some(tmp_num.as_f64().unwrap()),
