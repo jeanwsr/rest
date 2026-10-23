@@ -315,6 +315,32 @@ impl RIRHFGradient<'_> {
         let aux = ri_jk::util::get_cint_aux(mol_obj);
         let device = DeviceBLAS::default();
 
+        // Integral-level Schwartz screening of the derivative batches: the
+        // engine evaluates only the (shell pair, aux shell) triples whose
+        // exact Schwarz bound can contribute above
+        // `ri_jk.c3_screen_threshold / DERIV_AMP`, filling the rest of the
+        // batch tensors with zeros (same shape and layout as the unscreened
+        // driver). `c3_screen_threshold <= 0` (default) keeps the exact unscreened path.
+        let deriv_screen = if mol_obj.ctrl.ri_jk.c3_screen_threshold > 0.0 {
+            let engine = ri_jk::schwartz_c3::ScreenedC3Engine::build(
+                &mol,
+                &aux,
+                mol_obj.ctrl.ri_jk.schwartz_overlap_tol2,
+            );
+            let log_thresh =
+                (mol_obj.ctrl.ri_jk.c3_screen_threshold / ri_jk::schwartz_c3::DERIV_AMP).ln();
+            if mol_obj.ctrl.print_level >= 2 {
+                println!(
+                    "de-jk Schwartz screen: keeping {:.1}% of (pair, aux shell) triples at threshold {:.1e}.",
+                    engine.kept_fraction([0, aux.nbas()], log_thresh) * 100.0,
+                    mol_obj.ctrl.ri_jk.c3_screen_threshold
+                );
+            }
+            Some((engine, log_thresh))
+        } else {
+            None
+        };
+
         // density matrix and triu-packed density matrix
         let dm = get_dm(self.scf_data, &device);
         let dm_tp = pack_triu_tilde(dm.view());
@@ -482,14 +508,28 @@ impl RIRHFGradient<'_> {
         mem_probe("de-jk prepr 2 done (itm_j, itm_k_occtp, daux seeds)", mem_probe_on);
 
         let mut batch_probe_left = 2usize;
+        // mol+aux concatenation shared by every batch of this gradient: with
+        // the instance-level optimizer cache of rest_libcint, the per-batch
+        // `integrate` calls stop rebuilding the O(nbas^2) libcint optimizer
+        // that `CInt::integrate_cross` would rebuild on every call (it
+        // concatenates a fresh molecule each time).
+        let merged_ijk = &mol + &aux;
+        let nbas_mol = mol.nbas();
+
         for [shl0, shl1] in local_aux_partition.clone() {
-            let shl_slices = [[0, mol.nbas()], [0, mol.nbas()], [shl0, shl1]];
+            let shl_slices_merged =
+                [[0, nbas_mol], [0, nbas_mol], [nbas_mol + shl0, nbas_mol + shl1]];
             let (p0, p1) = (aux_loc[shl0], aux_loc[shl1]);
 
             time_records.count_start("de-jk batch int");
             // int3c2e_ip1
             let tsr_int3c2e_ip1 = {
-                let (out, shape) = CInt::integrate_cross("int3c2e_ip1", [&mol, &mol, &aux], "s1", shl_slices).into();
+                let (out, shape): (Vec<f64>, Vec<usize>) = match &deriv_screen {
+                    Some((engine, thr)) => engine.evaluate_s1_ip1([shl0, shl1], *thr),
+                    None => merged_ijk
+                        .integrate("int3c2e_ip1", "s1", &shl_slices_merged)
+                        .into(),
+                };
                 rt::asarray((out, shape, &device))
             };
 
@@ -497,8 +537,14 @@ impl RIRHFGradient<'_> {
             let mut tsr_int3c2e_ip2 = rt::full(([], f64::NAN, &device));
             if self.flags.auxbasis_response {
                 tsr_int3c2e_ip2 = {
-                    let (out, shape) =
-                        CInt::integrate_cross("int3c2e_ip2", [&mol, &mol, &aux], "s2ij", shl_slices).into();
+                    let (out, shape): (Vec<f64>, Vec<usize>) = match &deriv_screen {
+                        Some((engine, thr)) => {
+                            engine.evaluate_s2ij("int3c2e_ip2", [shl0, shl1], *thr)
+                        }
+                        None => merged_ijk
+                            .integrate("int3c2e_ip2", "s2ij", &shl_slices_merged)
+                            .into(),
+                    };
                     rt::asarray((out, shape, &device))
                 };
             }
@@ -626,15 +672,21 @@ impl RIRHFGradient<'_> {
 
             time_records.count("de-jk prepr 3");
 
+            // SR 分支同样共享合并分子（见上方 LR 注释；mol/aux 此处已带 omega）
+            let merged_ijk_sr = &mol + &aux;
+            let nbas_mol_sr = mol.nbas();
+
             for [shl0, shl1] in local_aux_partition.clone() {
-                let shl_slices = [[0, mol.nbas()], [0, mol.nbas()], [shl0, shl1]];
+                let shl_slices_merged =
+                    [[0, nbas_mol_sr], [0, nbas_mol_sr], [nbas_mol_sr + shl0, nbas_mol_sr + shl1]];
                 let (p0, p1) = (aux_loc[shl0], aux_loc[shl1]);
 
                 time_records.count_start("de-jk batch int 2");
                 // int3c2e_ip1
                 let tsr_int3c2e_ip1 = {
-                    let (out, shape) =
-                        CInt::integrate_cross("int3c2e_ip1", [&mol, &mol, &aux], "s1", shl_slices).into();
+                    let (out, shape) = merged_ijk_sr
+                        .integrate("int3c2e_ip1", "s1", &shl_slices_merged)
+                        .into();
                     rt::asarray((out, shape, &device))
                 };
 
@@ -642,8 +694,9 @@ impl RIRHFGradient<'_> {
                 let mut tsr_int3c2e_ip2 = rt::full(([], f64::NAN, &device));
                 if self.flags.auxbasis_response {
                     tsr_int3c2e_ip2 = {
-                        let (out, shape) =
-                            CInt::integrate_cross("int3c2e_ip2", [&mol, &mol, &aux], "s2ij", shl_slices).into();
+                        let (out, shape) = merged_ijk_sr
+                            .integrate("int3c2e_ip2", "s2ij", &shl_slices_merged)
+                            .into();
                         rt::asarray((out, shape, &device))
                     };
                 }
@@ -701,7 +754,7 @@ impl RIRHFGradient<'_> {
         let aux_slice = mol_obj.make_auxmol_fake().aoslice_by_atom();
 
         for atm in 0..natm {
-            let [_, _, p0, p1] = ao_slice[atm].clone().try_into().unwrap();
+            let [_, _, p0, p1] = ao_slice[atm];
             if self.flags.factor_j.is_some() {
                 *&mut de_j.i_mut((.., atm)).assign(dao_j.i(p0..p1).sum_axes(0));
             }
@@ -716,7 +769,7 @@ impl RIRHFGradient<'_> {
             // the rank that owns the corresponding auxiliary rows, so every
             // rank must restrict its aux-atom summation to its local rows; the
             // partial [3, natm] results are summed over ranks below.
-            let [_, _, p0, p1] = aux_slice[atm].clone().try_into().unwrap();
+            let [_, _, p0, p1] = aux_slice[atm];
             let (q0, q1) = (p0.max(aux_span0), p1.min(aux_span1));
             if self.flags.factor_j.is_some() && self.flags.auxbasis_response {
                 if q0 < q1 {
@@ -992,7 +1045,10 @@ pub fn generator_deriv_hcore<'a>(scf_data: &'a SCF) -> impl FnMut(usize) -> Tsr<
     let device = DeviceBLAS::default();
 
     let necp_by_atom = {
-        let basis4elem = Molecule::collect_basis(&scf_data.mol.ctrl, &mut scf_data.mol.geom.clone()).0;
+        // take the basis already loaded into the molecule (from `basis_path`
+        // files, or reconstructed from the chkfile when `basis_path = "chkfile"`):
+        // re-collecting from disk here would break force jobs with chkbasis
+        let basis4elem = &scf_data.mol.basis4elem;
         basis4elem.iter().map(|i| if let Some(num_ecp) = i.ecp_electrons { num_ecp } else { 0 }).collect::<Vec<usize>>()
     };
     let has_ecp = necp_by_atom.iter().any(|&x| x > 0);

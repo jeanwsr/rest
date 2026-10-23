@@ -29,6 +29,8 @@ pub mod ri_jk_io;
 pub mod ri_pt2_io;
 pub use ri_jk_io::*;
 pub use ri_pt2_io::*;
+pub mod output;
+pub use output::*;
 
 mod pyrest_ctrl_io;
 mod geometric_pyo3_io;
@@ -88,12 +90,15 @@ pub fn parse_ctl_from_json(tmp_keys: &serde_json::Value) -> anyhow::Result<(Inpu
         tmp_input.thermo = Some(std::mem::take(tmp_thermo));
     }
     tmp_input.analdrv = parse_analdrv_keywords(tmp_keys);
+    tmp_input.output = parse_output_keywords(tmp_keys);
+    resolve_cube_keywords(&mut tmp_input, tmp_keys);
     Ok((tmp_input,tmp_geomcell))
 }
 
 const VALID_TOP_LEVEL_BLOCKS: &[&str] = &[
     "ctrl",
     "geom",
+    "output",
     "md",
     "tddft",
     "hessian",
@@ -366,6 +371,8 @@ pub struct InputKeywords {
     pub initial_guess: String,
     #[pyo3(get, set)]
     pub basis_projection: String,
+    /// Options of the `[output]` block (see `OutputKeywords`).
+    pub output: OutputKeywords,
     #[pyo3(get, set)]
     pub noiter: bool,
     #[pyo3(get, set)]
@@ -374,6 +381,18 @@ pub struct InputKeywords {
     pub use_dm_only: bool,
     #[pyo3(get, set)]
     pub vxc_screen_threshold: f64,
+    /// Drop the grid points whose initial-guess density contribution
+    /// `|rho_p * w_p|` is below this value, once, before the SCF iterations.
+    /// 0.0 (default) keeps every grid point.
+    #[pyo3(get, set)]
+    pub grid_prune_threshold: f64,
+    /// How the one-shot grid pruning materializes the smaller grid. `true` (default)
+    /// copies the surviving columns of the already tabulated AO/AOP tables, which costs
+    /// about a fifth of a re-tabulation but needs the old and the new table at once.
+    /// `false` re-tabulates the surviving points, keeping the peak at one table at the
+    /// price of about 0.8x of the first tabulation.
+    #[pyo3(get, set)]
+    pub grid_prune_compact: bool,
     #[pyo3(get, set)]
     pub ao_cutoff: f64,
     #[pyo3(get, set)]
@@ -594,15 +613,18 @@ impl InputKeywords {
             scf_acc_g: 1.0e-5,
             has_chkfile: false, // not directly set by input
             external_init_guess: None, // not directly set by input
-            initial_guess: String::from("sad"),
+            initial_guess: String::from("pao"),
             basis_projection: String::from("occupied"),
+            output: OutputKeywords::default(),
             noiter: false,
             check_stab: String::from("off"),
             // Kyewords for the manner to evaluate the Vk (and also Vxc) potentials
             // True:  using only density matrix in the evaluation
             // False: use coefficients as well with higher efficiency
             use_dm_only: false,
-            vxc_screen_threshold: 1.0e-15,
+            vxc_screen_threshold: 0.0, // 0.0 = 关闭格点密度筛选（见 README）
+            grid_prune_threshold: 0.0,  // 0.0 = 不剪枝（见 README）
+            grid_prune_compact: true,   // true = 就地压缩（省时间、多一份表的峰值内存）
             ao_cutoff: 1.0e-9,
             non0tab_blksize: 0,     // 0 = auto-select based on nao
             drop_dense_ao: false,
@@ -1682,9 +1704,12 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
 
             tmp_input.has_chkfile = ! tmp_input.chkfile.to_lowercase().eq(&"none");
 
+            // Keep this fallback in sync with `InputKeywords::init_ctrl`: the parser, not the
+            // struct initializer, decides the effective default when the ctrl file has no
+            // `initial_guess` line.
             tmp_input.initial_guess = match tmp_ctrl.get("initial_guess").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase()},
-                other => {String::from("sad")},
+                other => {String::from("pao")},
             };
 
             tmp_input.basis_projection = match tmp_ctrl.get("basis_projection").unwrap_or(&serde_json::Value::Null) {
@@ -1709,9 +1734,19 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => false,
             };
             tmp_input.vxc_screen_threshold = match tmp_ctrl.get("vxc_screen_threshold").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-15),
-                serde_json::Value::String(s) => s.parse().unwrap_or(1.0e-15),
-                _ => 1.0e-15,
+                serde_json::Value::Number(num) => num.as_f64().unwrap_or(0.0),
+                serde_json::Value::String(s) => s.parse().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.grid_prune_threshold = match tmp_ctrl.get("grid_prune_threshold").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Number(num) => num.as_f64().unwrap_or(0.0),
+                serde_json::Value::String(s) => s.parse().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            tmp_input.grid_prune_compact = match tmp_ctrl.get("grid_prune_compact").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(s) => s.to_lowercase().parse().unwrap_or(true),
+                serde_json::Value::Bool(b) => *b,
+                _ => true,
             };
             tmp_input.ao_cutoff = match tmp_ctrl.get("ao_cutoff").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(num) => num.as_f64().unwrap_or(1.0e-9),

@@ -496,12 +496,68 @@ impl SCF {
         // K_full still needs standard rimatr (generate_vk_ri_direct has unresolved RSTSR bug).
         // K_erfc uses rimatr_sr.
         // TODO: when generate_vk_ri_direct is fixed, add `if !is_rsh` to skip standard rimatr for RSH.
+
+        // A-priori AO-pair pre-screen of the in-core RI tensor: assigned in the block below,
+        // before the build, and consumed again by the storage-level pruning after it.
+        let mut prescreen_keep: Option<Vec<usize>> = None;
+        // The row space the finished tensor actually lives on: `Some(outer)` when the builder
+        // compacted it onto the pre-screen, `None` when the tensor still covers every AO pair
+        // (no pre-screen at all, or the distributed builder, which keeps the shape and only
+        // skips the metric solve). The storage-level pruning needs to know which one it holds.
+        let mut prescreen_compacted: Option<&[usize]> = None;
+        // Number of packed AO pairs: a tensor with fewer rows than this lived on a compacted
+        // row space (see the `prescreen_compacted` assignment below).
+        let nbaspar_full = self.mol.num_basis * (self.mol.num_basis + 1) / 2;
+
         {
             // preparing the three-center integrals in the full format
             self.ri3fn = if ri3fn_full && !isdf {
                 Some(self.mol.prepare_ri3fn_for_ri_v_full_rayon())
             } else if self.mol.ctrl.isdf_k_only {
                 Some(self.mol.prepare_ri3fn_for_ri_v_full_rayon())
+            } else {
+                None
+            };
+
+            // A-priori AO-pair pre-screen of the in-core RI tensor.
+            //
+            // The storage-level pruning below runs on the finished tensor, so the three-centre
+            // integration and the metric transformation would otherwise pay for every AO pair.
+            // The rows it will keep are a subset of the ones whose *Schwarz* bound clears the same
+            // relative threshold, and that bound is available before any three-centre integral, so
+            // the tensor can be built on the smaller row space directly. The pruning still runs
+            // afterwards on the compacted tensor, so the resulting `PairMap` and the row layout
+            // that the SCF, the gradient and the post-SCF consumers see are exactly the ones of the
+            // unprescreened path.
+            //
+            // MPI runs the same pre-screen. The auxiliary columns are distributed over the
+            // ranks, but the selection is geometry-only and rank-local, and the distributed
+            // builder carries it into the metric solve while keeping the local block shape,
+            // so no collective is added (see `Molecule::prepare_rimatr_for_ri_v_mpi_rayon`).
+            // The cut is deliberately loose (PRESCREEN_SAFETY below the pruning threshold) because
+            // the Schwarz bound bounds the untransformed block while the pruning acts on the
+            // metric-transformed row maximum.
+            const PRESCREEN_SAFETY: f64 = 10.0;
+            prescreen_keep = if self.mol.ctrl.ri_jk.pair_screen_threshold > 0.0 && ri3fn_symm {
+                let cint_mol = ri_jk::util::get_cint_mol(&self.mol);
+                let (basbas2baspar, _) = ri_jk::generate_baspar(self.mol.num_basis);
+                let nao = self.mol.num_basis;
+                let keep = ri_jk::prescreen_pair_keep(
+                    &cint_mol,
+                    nao,
+                    &basbas2baspar,
+                    self.mol.ctrl.ri_jk.schwartz_overlap_tol2,
+                    self.mol.ctrl.ri_jk.pair_screen_threshold / PRESCREEN_SAFETY,
+                );
+                info!(
+                    "In-core RI pair pre-screen: {} of {} AO pairs kept for the build \
+                     (threshold {:.1e}, safety factor {:.0}).",
+                    keep.len(),
+                    nao * (nao + 1) / 2,
+                    self.mol.ctrl.ri_jk.pair_screen_threshold,
+                    PRESCREEN_SAFETY
+                );
+                Some(keep)
             } else {
                 None
             };
@@ -515,14 +571,29 @@ impl SCF {
                     let cint_bas = self.mol.cint_fdqc.clone();
                     local_mpi.distribute_rimatr_tasks(num_auxbas, num_basis, cint_bas);
                 }
-                let (rimatr, basbas2baspar, baspar2basbas) =
-                    self.mol.prepare_rimatr_for_ri_v_mpi_rayon(None, mpi_operator);
+                let (rimatr, basbas2baspar, baspar2basbas) = self
+                    .mol
+                    .prepare_rimatr_for_ri_v_mpi_rayon(None, prescreen_keep.as_deref(), mpi_operator);
                 Some((rimatr, basbas2baspar, baspar2basbas))
             } else if ri3fn_symm && isdf {
                 None
             } else {
                 None
             };
+
+            // Did the builder COMPACT the tensor onto the pre-screen? The local prescreened
+            // builder returns the selected rows alone; the distributed one cannot (the
+            // redistribution places rows by contiguous packed range) and keeps the full row
+            // space with the pre-screened rows zeroed. Instead of re-deriving which builder
+            // ran, read it off the tensor: only a compacted tensor has fewer rows than the
+            // full packed pair count. Every full-row-space tensor, pre-screened or not, goes
+            // through the plain pruning, which is also the only variant that takes the global
+            // maximum of the row bounds across the ranks.
+            if let Some((rimatr, _, _)) = self.rimatr.as_ref() {
+                if rimatr.size[0] != nbaspar_full {
+                    prescreen_compacted = prescreen_keep.as_deref();
+                }
+            }
         }
 
         // build short-range 3c RI integrals for range-separated hybrid (RSH) functionals
@@ -531,7 +602,7 @@ impl SCF {
             info!("Building short-range 3c RI integrals for RSH (omega = {:.4})", omega);
             if ri3fn_symm {
                 // Note: SR RI omega is negative in libcint's convention.
-                self.rimatr_sr = Some(self.mol.prepare_rimatr_for_ri_v_mpi_rayon(Some(-omega), mpi_operator));
+                self.rimatr_sr = Some(self.mol.prepare_rimatr_for_ri_v_mpi_rayon(Some(-omega), None, mpi_operator));
             } else {
                 self.ri3fn_sr = Some(self.mol.prepare_ri3fn_sr_rayon(omega));
             }
@@ -563,24 +634,60 @@ impl SCF {
         if pair_screen_threshold > 0.0 {
             if let Some((rimatr, basbas2baspar, baspar2basbas)) = self.rimatr.take() {
                 let nao = basbas2baspar.size()[0];
-                let mut screen = ri_jk::RIMatrPairScreen::build(&rimatr, &basbas2baspar, nao);
-                // In MPI the auxiliary functions are distributed over the ranks, so the local row
-                // maxima are only partial: without the global maximum every rank would keep a
-                // different pair set and the reduced J/K would miss the dropped contributions.
-                #[cfg(feature = "mpi")]
-                if let Some(mpi_op) = mpi_operator {
-                    let mut global = mpi_reduce(&mpi_op.world, &screen.bounds, 0, &SystemOperation::max());
-                    mpi_broadcast_vector(&mpi_op.world, &mut global, 0);
-                    screen.bounds = global;
-                }
-                info!(
-                    "In-core RI pair screening enabled (threshold {:.1e}, {} AO pairs).",
-                    pair_screen_threshold,
-                    screen.bounds.len()
-                );
+                let num_baspar_full = nao * (nao + 1) / 2;
+                let (pruned, screen) = match prescreen_compacted {
+                    // The tensor was built on the row space of the a-priori pre-screen, so its own
+                    // row bounds are the ones the storage level selects on. The map is built back
+                    // in the full packed pair space of `baspar2basbas`, and the diagonal-pair flags
+                    // of the full-space diagnostic screen are recovered from the pair table.
+                    Some(outer) => {
+                        let bounds = ri_jk::row_bounds(&rimatr);
+                        info!(
+                            "In-core RI pair screening enabled (threshold {:.1e}, {} AO pairs, \
+                             pre-screened build of {} rows).",
+                            pair_screen_threshold,
+                            num_baspar_full,
+                            bounds.len()
+                        );
+                        let num_auxbas = rimatr.size()[1];
+                        let pruned = ri_jk::prune_rimatr_prescreened(
+                            rimatr, &bounds, outer, num_baspar_full, &baspar2basbas, pair_screen_threshold);
+                        let mut bounds_full = vec![0.0_f64; num_baspar_full];
+                        for (r, &p) in outer.iter().enumerate() {
+                            bounds_full[p] = bounds[r];
+                        }
+                        let mut is_diagonal = vec![false; num_baspar_full];
+                        for i in 0..nao {
+                            let p = basbas2baspar[[i, i]];
+                            if p < num_baspar_full {
+                                is_diagonal[p] = true;
+                            }
+                        }
+                        let screen = ri_jk::RIMatrPairScreen { bounds: bounds_full, is_diagonal, num_auxbas };
+                        (pruned, screen)
+                    }
+                    None => {
+                        let mut screen = ri_jk::RIMatrPairScreen::build(&rimatr, &basbas2baspar, nao);
+                        // In MPI the auxiliary functions are distributed over the ranks, so the
+                        // local row maxima are only partial: without the global maximum every rank
+                        // would keep a different pair set and the reduced J/K would miss the
+                        // dropped contributions.
+                        #[cfg(feature = "mpi")]
+                        if let Some(mpi_op) = mpi_operator {
+                            let mut global = mpi_reduce(&mpi_op.world, &screen.bounds, 0, &SystemOperation::max());
+                            mpi_broadcast_vector(&mpi_op.world, &mut global, 0);
+                            screen.bounds = global;
+                        }
+                        info!(
+                            "In-core RI pair screening enabled (threshold {:.1e}, {} AO pairs).",
+                            pair_screen_threshold,
+                            screen.bounds.len()
+                        );
 
-                let num_baspar_full = screen.bounds.len();
-                let pruned = ri_jk::prune_rimatr(rimatr, &screen, &baspar2basbas, pair_screen_threshold);
+                        let pruned = ri_jk::prune_rimatr(rimatr, &screen, &baspar2basbas, pair_screen_threshold);
+                        (pruned, screen)
+                    }
+                };
                 let num_kept = pruned.map.len();
                 info!(
                     "Storage-level AO-pair pruning: {} of {} AO-pair rows stored ({:.2}%), \
@@ -658,7 +765,7 @@ impl SCF {
             }
 
             let (rimatr, basbas2baspar, baspar2basbas) =
-                self.mol.prepare_rimatr_for_ri_v_mpi_rayon(None, mpi_operator);
+                self.mol.prepare_rimatr_for_ri_v_mpi_rayon(None, None, mpi_operator);
             self.rimatr_bse = Some((rimatr, basbas2baspar, baspar2basbas));
         } else {
             self.ri3fn_bse = Some(self.mol.prepare_ri3fn_for_ri_v_full_rayon());
@@ -2317,6 +2424,10 @@ impl SCF {
             };
             //let (exc,vxc) = self.generate_vxc(1.0);
             let _ = utilities::timing(&dt3, Some("evaluate vxc total"));
+            if let Some((t_den, t_elem, t_gemm, t_scat, t_call)) = crate::dft::xc_timing::report_and_reset() {
+                println!("[xc-time] density {:.3}s | elem {:.3}s | gemm {:.3}s | scatter {:.3}s | contract_total {:.3}s (thread-seconds, divide by chunk count for wall)",
+                    t_den, t_elem, t_gemm, t_scat, t_call);
+            }
             for i_spin in (0..spin_channel) {
                 self.hamiltonian[i_spin].data
                                 .par_iter_mut()
@@ -2394,6 +2505,69 @@ impl SCF {
     }
 
     pub fn refresh_solvent_with_mpi(&mut self, mpi_operator: &Option<MPIOperator>) {
+        // Prototype (2.1): reuse the resident, metric-solved RI tensor for the two
+        // nao²·naux PCM contractions instead of re-evaluating the 3c integrals.
+        // Opt-in via `REST_PCM_RI_REUSE=1`; requires the tensor to be readable through
+        // `pairs`/`PairMap`, the matching metric factor and a known auxiliary layout.
+        //
+        // Under MPI the distributed builder splits the auxiliary dimension over the ranks
+        // and keeps every packed AO pair on every rank, so both contractions are completed
+        // by one sum per rank (`solvent::reduce_aux_contribution`). The metric factor is
+        // replicated, so the reduced result is identical on the ranks.
+        let ri_reuse = if std::env::var("REST_PCM_RI_REUSE").map(|v| v == "1").unwrap_or(false) {
+            let nao = self.mol.num_basis;
+            let nbaspar = nao * (nao + 1) / 2;
+            match (&self.rimatr, &self.solvent_static_obj) {
+                (Some((cderi, _, pairs)), Some(st)) => {
+                    // `rimatr` holds either all packed pairs or, for a storage-level pruned
+                    // tensor, the retained rows only — in which case the compact indexing
+                    // comes from `PairMap` (`scf_io` stores the pruned tensor in `rimatr`,
+                    // see the `pair_screen_threshold` block in `prepare_necessary_integrals`).
+                    let map = self.rimatr_pair_map.as_ref();
+                    let rows_ok = match map {
+                        None => cderi.size[0] == nbaspar,
+                        Some(m) => cderi.size[0] == m.len(),
+                    };
+                    // Auxiliary columns: the whole space in serial, the rank's slice of
+                    // `mpi_data.auxbas` under MPI. Either way the column count of the
+                    // tensor has to match, otherwise the contractions would silently read
+                    // the wrong auxiliary block.
+                    let naux_full = self.mol.num_auxbas;
+                    let aux_cols = match (&mpi_operator, &self.mol.mpi_data) {
+                        (Some(op), Some(mpi_data)) => mpi_data
+                            .auxbas
+                            .as_ref()
+                            .and_then(|d| d.get(op.rank).cloned()),
+                        _ => Some(0..naux_full),
+                    };
+                    let cols_ok = aux_cols.as_ref().map_or(false, |c| c.len() == cderi.size[1]);
+                    if rows_ok && cols_ok {
+                        let aux_cols = aux_cols.unwrap();
+                        st.pstatic.j2c_factor.as_ref().map(|m| {
+                            crate::solvent::PcmRiReuse { cderi, pairs, map, m, aux_cols, naux_full }
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(ri) = ri_reuse.as_ref() {
+            if mpi_operator.as_ref().map_or(true, |op| op.rank == 0) {
+                println!(
+                    "RI-PCM: reusing the resident 3c tensor for the solvent contractions \
+                     ({} stored AO-pair rows, auxiliary columns {}..{} of {}, {} rank(s)).",
+                    ri.cderi.size[0],
+                    ri.aux_cols.start,
+                    ri.aux_cols.end,
+                    ri.naux_full,
+                    mpi_operator.as_ref().map_or(1, |op| op.size)
+                );
+            }
+        }
         if let Some(solvent_static) = self.solvent_static_obj.as_ref() {
             let s_static = PcmScf::get_pcm_refresh(
                 &solvent_static.surface,
@@ -2403,6 +2577,8 @@ impl SCF {
                 &solvent_static.pstatic.K_ipiv,
                 &solvent_static.pstatic.R,
                 &solvent_static.pstatic.v_grids_n,
+                &solvent_static.pstatic.v_pq_chol,
+                ri_reuse.as_ref(),
                 &self.mol.spin_channel,
                 &self.mol.ctrl.max_memory,
                 &self.mol.ctrl.solv_chunk,
@@ -2480,7 +2656,6 @@ impl SCF {
                 }
                 electron_force[t] = 2.0 * sum_val;
             }
-
             let mut nuclear_force = [0.0; 3];
             for a in 0..nuclear_charges.len() {
                 let pos_a = [qm_position[[0, a]], qm_position[[1, a]], qm_position[[2, a]]];
@@ -6027,6 +6202,22 @@ pub fn initialize_scf(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) {
     //    println!("{:<16}: {:16.8} Ha", name, energy[0]+energy[1]);
     //});
     //println!("======= IGOR debug ========");
+    // Optional one-shot pruning of the molecular grid on the initial-guess density
+    // (opt-in, `grid_prune_threshold > 0`). The ISDF tables are built from the
+    // unpruned grid, so the combination is refused instead of silently mixing two
+    // grid sets.
+    if scf_data.mol.ctrl.grid_prune_threshold > 0.0 {
+        if scf_data.mol.ctrl.use_isdf {
+            println!("WARNING: grid_prune_threshold is ignored when use_isdf is enabled (the ISDF tables are built from the unpruned grid)");
+        } else if let Some(grids) = scf_data.grids.as_mut() {
+            grids.prune_by_density(
+                &scf_data.mol,
+                &scf_data.density_matrix,
+                scf_data.mol.spin_channel,
+                scf_data.mol.ctrl.grid_prune_threshold,
+            );
+        }
+    }
     time_mark.count("InitGuess");
 
     time_mark.count("Overall");

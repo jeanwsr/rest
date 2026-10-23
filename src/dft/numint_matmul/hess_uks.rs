@@ -742,6 +742,10 @@ fn symmetrize_ts_ab(x: Tsr) -> Tsr {
 /// - `dm0α`, `dm0β` : shape `[nao, nao]`.  Per-spin reference density matrices in AO basis.
 /// - `grid_shift` : evaluate the Becke grid-shift terms; requires full atom attribution of the
 ///   grids.
+/// - `proton_charges` : true nuclear (element) charge of each atom, used to build the Bragg
+///   radii of the Becke partition.  Must be the element charge, not `CInt::atom_charges()`:
+///   the latter is ECP-reduced for ECP atoms and would make the grid-shift inconsistent with
+///   grid generation.
 /// - `atm_list` : must be `None` or the full atom list.
 /// - `verbose` : print per-chunk progress.
 ///
@@ -764,6 +768,7 @@ pub fn make_hessian_setup_becke_uks(
     dm0α: TsrView,
     dm0β: TsrView,
     grid_shift: bool,
+    proton_charges: &[i32],
     atm_list: Option<&[usize]>,
     verbose: bool,
 ) -> (HashMap<&'static str, Tsr>, IndexMap<&'static str, f64>) {
@@ -790,12 +795,12 @@ pub fn make_hessian_setup_becke_uks(
     }
 
     // molecular tables of the Becke partition, built once and shared by all
-    // chunks; the radii table derives from the Bragg radii of the nuclear
-    // charges (see make_hessian_setup_becke)
+    // chunks; the radii table derives from the true proton charges passed in by
+    // the caller (see make_hessian_setup_becke; `mol.atom_charges()` would use
+    // ECP-reduced charges and break consistency with grid generation)
     let hardness = BECKE_HARDNESS;
     let tables = grid_shift.then(|| {
-        let proton_charges: Vec<i32> = mol.atom_charges().iter().map(|&c| c as i32).collect_vec();
-        let adjustment_factor = gen_adjustment_factor(&proton_charges, ni.radii_adjust);
+        let adjustment_factor = gen_adjustment_factor(proton_charges, ni.radii_adjust);
         BeckeMolTables::new(&mol.atom_coords(), &adjustment_factor, 2)
     });
 
@@ -991,6 +996,14 @@ pub struct UHessKSNIMatmul<'a> {
     /// Evaluate the Becke grid-shift terms; requires full atom attribution of
     /// the grids.
     pub grid_shift: bool,
+    /// True nuclear (element) charge of each atom, used for the Bragg radii of
+    /// the Becke partition in the grid-shift terms.
+    ///
+    /// This must not be taken from `CInt::atom_charges()`: that stores the
+    /// ECP-reduced charge for ECP atoms, while grid generation uses the element
+    /// charge, and a mismatch makes the analytic Hessian inconsistent with the
+    /// energy grid.
+    pub proton_charges: Vec<i32>,
     /// Print per-chunk progress of the Hessian setup.
     pub verbose: bool,
     /// Skeleton-Hessian intermediates: all keys of [`make_hessian_setup_becke_uks`].
@@ -1006,15 +1019,17 @@ impl<'a> UHessKSNIMatmul<'a> {
     /// - `xc_func_list` : list of `(scale, functional)` pairs.
     /// - `ni` : numerical-integration driver over the atom-grouped grid.
     /// - `grid_shift` : evaluate the Becke grid-shift terms.
+    /// - `proton_charges` : true nuclear (element) charge of each atom (see the field docs).
     /// - `verbose` : print progress.
     pub fn new(
         mol: &CInt,
         xc_func_list: Vec<(f64, LibXCFunctional)>,
         ni: NIMatmul<'a>,
         grid_shift: bool,
+        proton_charges: Vec<i32>,
         verbose: bool,
     ) -> Self {
-        Self { mol: mol.clone(), xc_func_list, ni, grid_shift, verbose, intmd: HashMap::new() }
+        Self { mol: mol.clone(), xc_func_list, ni, grid_shift, proton_charges, verbose, intmd: HashMap::new() }
     }
 
     /// Perform the Hessian setup for UKS calculations.
@@ -1035,6 +1050,7 @@ impl<'a> UHessKSNIMatmul<'a> {
             dm0α.view(),
             dm0β.view(),
             self.grid_shift,
+            &self.proton_charges,
             atm_list,
             self.verbose,
         );

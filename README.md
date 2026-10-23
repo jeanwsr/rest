@@ -14,7 +14,7 @@
   - 输出格式是TOML
   - 输入卡必须包含[ctrl]和[geom]两个区块
   - [ctrl]中的大部分关键词有缺省设置。若用户无具体要求，不必出现在输入卡中
-  - 如果用户没有明确要求，设置num_threads为10
+  - 如果用户没有明确要求，设置num_threads为4
   - [ctr]区块中必须声明的关键词：
      1. 计算方法和配置相关：`xc`，`basis_path`，`print_level`，以及`num_threads`等
      2. 体系相关: `spin`, `charge`, `spin_polarization`等
@@ -75,23 +75,13 @@
     - `dipole`    偶极
     - `fchk`　    Gaussian程序的fchk文件
         - 双杂化 (PT2 族) 的解析力计算 (`job_type = "force"`) 额外在 fchk 中写入弛豫总密度 `Total MP2 Density` 段；开壳层 (UHF 参考) 另行写入 `Spin MP2 Density` 段 (alpha − beta)。
+        - fchk 文件中 MO 系数与各密度段的写出行为由 `[output]` 区块控制（如 `fchk_dm`、`fchk_writer`），详见 `[output]` 区块说明。缺省设置下无需关心。
     - `cube_orb`  格点化的轨道文件信息 
     - `molden`　　结果输出为molden程序的格式
     - `geometry`  输出分子结构文件
     - `force`     输出分子受力信息
     - `force_for_ghost_point_charges`  在[geom]部分输入ghost point charges时输出原子区域对这些ghost点电荷的作用力
-- `cube_orb_setting`: 取值[f64;2]。`cube_orb`格点参数设置。前一个值(margin)是边界信息，第二个值(num_grids)是生成格点的数目。缺省值为[3.0, 80.0]
-- `cube_orb_indices`: 取值Vec\<[usize;3]\>。
-	- 指定需要生成cube文件的一组轨道。缺省为空，即`[]`
-    - 每一个矢量元素`[usize;3]`代表一组轨道信息：
-    - 第一个值(start_orb)为起始轨道的index
-    - 第二个值(end_orb)为截止轨道的index，与start_orb组成闭区间(closed interval)
-    - 第三个值(i_spin)是这组轨道所在的自旋通道。0为alpha自旋;1为beta自旋
-    - **注意**：REST的轨道排序从0开始，因此第一个轨道是0。如果HOMO是第X个轨道，在REST的排序是X-1
-	- 举例来说：闭壳层基态苯分子体系的HOMO-1、HOMO和LUMO是第20、21和22个轨道，在REST中的排序是19、20和21。打印alpha自旋通道上这三个轨道的设置是[[19,21,0]]
-- `cube_orb_type`: 取值String类型。指定生成的cube文件类型：
-  - `wavefunction`: 生成轨道波函数的cube文件（缺省）
-  - `density`: 生成轨道概率密度的cube文件（|ψ|²）
+- cube文件相关关键词 `cube_orb_setting`、`cube_orb_indices`、`cube_orb_type` 已移至 `[output]` 区块。`[ctrl]` 中的旧位置仍然可用（向后兼容，但已弃用），详见 `[output]` 区块说明。
 
 ## 计算方法相关关键词（Keyword）
 - `xc_parser`：指定用于解析`xc`关键词的方式，选项包括
@@ -112,7 +102,7 @@
   配合 `job_type = "md"/"sp"/"force"/"singlepoint"` 与 `[md]` 中的 `mm_file`/`mm_system_xml`/`mm_cutoff`。
   此时无需 `xc`、`basis_path` 与 `[geom]`。
 - `empirical_dispersion`:　取值为String。针对低级别密度泛函方法（包括LDA、BLYP、PBE、B3LYP、PBE0等）的经验色散校正方法。目前支持D3, D3BJ和D4。对于XYG3型双杂化泛函比如XYG3、XYG7、XYGJOS、scsRPA、R-xDH7、RPA等不需要经验色散校正
-- `post_ai_correction`：取值String。AI辅助的校正方法。目前仅支持SCC15，并只能和R-xDH7重整化双杂化泛函方法相匹配。相关文章见：Wang, Y.; Lin, Z.; Ouyang, R.; Jiang, B.; Zhang, I. Y.; Xu, X. Toward Efficient and Unified Treatment of Static and Dynamic Correlations in Generalized Kohn–Sham Density Functional Theory. [JACS Au 2024, 4 (8), 3205–3216](https://doi.org/10.1021/jacsau.4c00488). 
+- `post_ai_correction`：取值String。AI辅助的校正方法。目前仅支持SCC15，并只能和R-xDH7重整化双杂化泛函方法相匹配。 
 - `post_xc`：取值Vec\<String\>。采用自洽收敛的轨道和密度，进行不同的交换－关联泛函(xc)的计算。允许的方法包括REST支持的"xc"方法
 - `post_correlation`：取值Vec\<String\>。采用自洽收敛的轨道和密度，进行后自洽场高等级相关能方法计算。允许的方法包括PT2、sBGE2、RPA、scsRPA等
 
@@ -120,13 +110,13 @@
 - `grid_generation_level`: 取值usize。格点精度等级，数值越大越精确。缺省为3
 - `pruning`: 取值String。DFT方法或sap初猜所选用格点筛选。目前，REST支持nwchem，sg1以及none。其中none为不筛选。缺省为nwchem
 - `radial_grid_method`: 取值String。径向格点的生成方法。目前REST支持treutler，gc2nd， delley, becke, mura_knowles及lmg。缺省为treutler
-- `radii_adjust`: 取值String。Becke划分中原子的半径调整方案。`becke` 用Bragg半径本身（Becke 1988原文形式），`treutler` 用Bragg半径的平方根（Treutler-Ahlrichs 1995形式）。两者都满足权重和为1，差别随格点加密衰减。缺省为becke
-
-### VXC 格点积分优化相关关键词（Keyword）
-- `vxc_screen_threshold`: 取值f64。密度筛选阈值，在 VXC 计算中跳过密度低于此值的格点。对于大分子（真空区域多），可节省 30-70% 的 XC 计算量。设为 0.0 可关闭筛选。缺省为 1.0e-15。
+- `radii_adjust`: 取值String。Becke划分中原子的半径调整方案。`becke` 用Bragg半径本身（Becke 1988原文形式），`treutler` 用Bragg半径的平方根（Treutler-Ahlrichs 1995形式）。两者都满足权重和为1，差别随格点加密衰减。缺省为treutler（历史缺省 becke 可用输入卡显式指定）
+- `grid_prune_threshold`: 取值f64。**初猜密度的一次性格点裁剪**阈值。缺省为 0.0（不裁剪）
+- `grid_prune_compact`: 取值bool。`grid_prune_threshold` 生效时如何生成裁剪后的 AO/AOP 表。
+  - `true`（缺省）**就地把存活格点的列搬进更小的批次表**：不重新求值基函数，一次性开销约为重新制表的 1/5，但要同时持有旧表与新表，峰值内存因此多出约一个新表的大小
+  - `false` **对存活点重新制表**。内存吃紧时，设 false。
 - `ao_cutoff`: 取值f64。AO 格点值截断阈值，启用 non0tab 稀疏存储。AO 值低于此阈值的基函数-格点对被当作零处理。缺省为 1.0e-9：格点制表按批次只存超过阈值的 AO/AOP 元素，稠密 AO/AOP 不分配。若某体系在该阈值下 AO 存留率高于 90%，程序自动放弃压缩、回退稠密存储。设为 0.0 可强制关闭压缩。(H2O)30 / B3LYP / def2-SVP 实测：1.0e-9 相对 1.0e-12 峰值内存少约 10%、墙钟少约 12%，能量差约 1 nHa。
 - `non0tab_blksize`: 取值usize。non0tab 压缩存储中每个格点批次的大小。设为 0（缺省）时程序根据基组大小自动选择 [32, 256]。设为具体值则固定该批次大小。
-- `drop_dense_ao`: 取值布尔类型。non0tab 压缩存储生成后是否释放稠密 AO/AOP 矩阵以节省内存。缺省为 false。当 `ao_cutoff > 0` 且该体系 AO 稀疏率 < 90% 时，设为 true 可显著降低内存。
 
 ## 基组相关关键词（Keyword）
 - `eri_type`: 取值String类型。设置四中心积分计算方法。选项：
@@ -213,11 +203,33 @@ auxbas_path = "def2-universal-jkfit"
 guessfile = "my_checkpoint.rchk"
 ```
 
+## RI 密度拟合的分解策略（Keyword）
+
+密度拟合（`eri_type = "ri-v"`）先把 2c-2e 辅助基库仑度量化成 $J = L L^{\mathsf T}$（或 $J^{-1/2}$），再把三中心张量变换为 $Y_{\mu\nu,P}$。`[ctrl.j2c_decomp]` 表控制这一步的分解方式：
+
+````toml
+[ctrl.j2c_decomp]
+     policy = "cd"            # "cd"（Cholesky）或 "eig"（特征值）；缺省 "eig"
+     threshold = 1.0e-13      # 缺省 1.0e-13
+     uplo = "upper"           # 仅 Cholesky 使用；开发者选项，缺省 "upper"
+     distributed = "auto"     # 仅 Cholesky + MPI 使用，缺省 "auto"
+````
+
+- `policy`：取值String。
+    - `"cd"`（别名 `cholesky`）：Cholesky 分解，得到三角因子 $L$，$J^{-1/2}$ 通过三角求解（TRSM）作用于 $L$ 隐式获得，不显式构造逆。
+    - `"eig"`（别名 `eigen`/`eig`/`eigenvalue`）：对称特征分解，显式构造 $J^{-1/2} = V \Lambda^{-1/2} V^{\mathsf T}$。形式上更正交，但代价明显更高。
+	- **注意**: 缺省为"eig"，实际生产环境建议使用"cd"，可显著提升RI准备效率。
+- `threshold`：取值f64。缺省 1.0e-13。`policy = "cd"` 时，若 Cholesky 因子对角元小于该阈值，先将矩阵补正到满足该阈值的正定程度再重新分解；`policy = "eig"` 时，只保留大于该阈值的特征值来构造 $J^{-1/2}$。
+- `uplo`：取值String。`"upper"`（缺省）或 `"lower"`，仅对 Cholesky 有效。列主序下通常使用 upper；lower 仅供调试与测试。
+- `distributed`：取值String。`"auto"`（缺省）/`"on"`/`"off"`。仅在（1）编译了 `scalapack` 与 `mpi` 特性、（2）MPI 进程数 ≥ 2、（3）`policy = "cd"` 三条同时满足时生效，其余组合一律回退到 rank-0 串行路径（特征分解没有分布式实现）。`auto` 仅在辅助基函数数 $n_{aux} \ge 8192$ 且进程数 ≥ 32 时才启用分布式 Cholesky 与三角求解；小体系测试可用 `on` 强制打开。
+
+**与其他关键词的关系**：`algorithm_jk`/`algorithm_j`/`algorithm_k` 决定 $Y_{\mu\nu,P}$ 是常驻内存（`ri-incore`）还是即算即用（`ri-direct`），`j2c_decomp` 决定 $Y$ 的构造方式，两者正交、可自由组合。`ri-incore` 需要约 $0.5\,n_{ao}^2 n_{aux}$ 个双精度数的存储，通常是内存峰值的主要来源。
+
 ## 自洽场计算相关关键词（Keyword）
 - `max_scf_cycle`: 取值i32。自洽场运算的最大迭代循环数。缺省为100
 - `noiter`: 取值布尔类型。是否跳过自洽场运算。缺省为false
-- `scf_acc_rho`: 取值f64。自洽场运算密度矩阵的收敛标准。缺省为1.0e-7
-- `scf_acc_eev`: 取值f64。自洽场运算能量差平方和的收敛标准。缺省为1.0e-5
+- `scf_acc_rho`: 取值f64。自洽场运算密度矩阵的收敛标准。缺省为1.0e-5
+- `scf_acc_eev`: 取值f64。自洽场运算能量差平方和的收敛标准。缺省为1.0e-3
 - `scf_acc_etot`: 取值f64。自洽场运算总能量的收敛标准。缺省为1.0e-8
 - `algorithm_jk`: 设置 Fock 矩阵计算中 J (Coulomb) 和 K (Exchange) 两部分的算法：
     - `ri-direct`: 强制使用 direct RI 算法。对于 RI-K 部分，取决于内存大小，可能会使用 semi-direct 算法 (储存相对较小的 $O(N^3)$ 的 $g_{\mu i, P}$)。
@@ -230,26 +242,18 @@ guessfile = "my_checkpoint.rchk"
 - `algorithm_k`: 设置 Fock 矩阵计算中 K (Exchange) 部分的算法；该关键词是高级选项，一般用户建议使用`algorithm_jk`关键词进行整体设置。
     - 下述选项同 `algorithm_jk`：`ri-direct`, `ri-incore`, `ri`, `default`。
 - `ri_jk`: RI-J/RI-K 算法的参数，以 `[ctrl.ri_jk]` 表形式给出。`schwartz_threshold` 与 `schwartz_overlap_tol2` 控制 `ri-schwartz` RI-J 算法的筛选行为，`pair_screen_threshold` 控制 incore RI-J/RI-K（`ri-incore`）的 AO 对筛选。
-    - `schwartz_threshold`: 取值f64类型。Schwartz 筛选的积分忽略阈值（单位 Hartree）：仅当 (壳对, 辅助壳) 块的 Coulomb 贡献上界达到该阈值时才纳入计算。缺省为 1.0e-12。
-    - `schwartz_overlap_tol2`: 取值f64类型。Schwarz 上界构建前静态重叠预筛选的阈值：最弥散基元的重叠小于该值的壳对不参与上界构建。缺省为 1.0e-24。
-    - `pair_screen_threshold`: 取值f64类型。incore RI-J/RI-K 的 AO 对（basis pair）筛选的相对阈值，同时作用于**构建期**与**缩并期**两级。
-    - 构建期（存储级）：三中心张量 `rimatr` 建成后，每个 AO 对的行上界 $q_p = \max_P |Y_{p,P}|$ 低于 $\text{threshold} \times \max_p q_p$ 的行被丢掉，张量原地压紧，行布局记入 `PairMap`（存储行到 $(\mu,\nu)$、行界、全量对号到存储行）。`basbas2baspar` 与 `baspar2basbas` 保持全量语义，J 的输出仍散射回全量 packed 上三角。MPI 下静态行界先做一次 `max` 归约再加广播，各 rank 保留同一批行。
-    - 缩并期：在保留行里按本轮密度/轨道权重再筛。J 的密度缩并用 $|w_p| q_p$（$w_p$ 为密度权重）与本次迭代最大的对界值比较，K 用 $q_p \max(W_\mu, W_\nu)$（$W_\mu = \max_i |C_{\mu i}|$）比较，低于阈值倍数者被丢弃。K 保留的行张成“活跃 AO 子集”，每个辅助基只在该子集上做缩并与 `dsyrk`。
-    - 缺省为 0.0，即不剪枝也不筛选，数值与未筛选内核一致。构建期剪枝改变了存储的 `rimatr` 的行空间，因此每个消费者都要按 `PairMap` 取行，未接线的路径一律显式报错退出，不会静默算错。
-    - 已接线：SCF 的 J/K 缩并（含 RSH 短程张量与 `use_dm_only` 的密度版 K），以及后自洽场相关能的 AO→MO 变换（`ri3mo` 与 streaming PT2 驱动，覆盖 PT2/SBGE2/SCS-RPA/RPA 以及 `xc = "mp2"` 这类 PT2 family 单点）。
-    - 仍被拒绝：解析导数与 Hessian、SCF/单点之外的 job_type、TDDFT 与响应、GW/BSE、数值力（`outputs = ["num_force"]`），以及 `ri_pt2` 的 `new_driver = true` 与 `engine = "torch"` 两个引擎。
-
-    - **推荐用法（杂化泛函的能量与几何优化）**：显式设 `pair_screen_threshold = 1.0e-12`。构建期会丢掉大多数可忽略的 AO 对行，K 的缩并随之变短，内存与时间都明显下降，而能量变化只有 1e-8 Ha 量级。
-
-      ````toml`
-      [ctrl]
-           ao_cutoff =                 1.0e-9      # 缺省值，可省略
-           ...
-      [ctrl.ri_jk]
-           pair_screen_threshold =     1.0e-12     # 杂化泛函能量与几何优化推荐
-      `````
-
-      (H2O)30 / B3LYP / def2-SVP 实测（ao_cutoff = 1.0e-9，4 线程）：不筛选 12.75 GB / 897 s，1.0e-12 为 **8.78 GB / 624 s**（能量差 0.017 μHa），1.0e-10 为 8.38 GB / 606 s（差 2.1 μHa），1.0e-9 为 8.16 GB / 593 s（差 12.8 μHa）。收益在 1.0e-12 已基本拿满，故推荐 1.0e-12。
+    - `schwartz_threshold`: 取值f64类型。Schwartz 筛选的积分忽略阈值（单位 Hartree）：仅当 (壳对, 辅助壳) 块的 Coulomb 贡献上界达到该阈值时才纳入计算。缺省为 1.0e-12
+    - `schwartz_overlap_tol2`: 取值f64类型。Schwarz 上界构建前静态重叠预筛选的阈值：最弥散基元的重叠小于该值的壳对不参与上界构建。缺省为 1.0e-24
+    - `pair_screen_threshold`: 取值f64类型。incore RI-J/RI-K 的 AO 对（basis pair）筛选的相对阈值，同时作用于**构建期**与**缩并期**两级。缺省为 0.0
+        - 未打通的计算功能：解析导数与 Hessian、SCF/单点之外的 job_type、TDDFT 与响应、GW/BSE、数值力（`outputs = ["num_force"]`），以及 `ri_pt2` 的 `new_driver = true` 与 `engine = "torch"` 两个引擎。
+        - **推荐用法（杂化泛函的能量与几何优化）**：显式设 `pair_screen_threshold = 1.0e-12`。构建期会丢掉大多数可忽略的 AO 对行，K 的缩并随之变短，内存与时间都明显下降，而能量变化只有 1e-8 Ha 量级。
+````toml
+[ctrl]
+     ao_cutoff =                 1.0e-9      # 缺省值，可省略
+     ...
+[ctrl.ri_jk]
+     pair_screen_threshold =     1.0e-12     # 杂化泛函能量与几何优化推荐
+`````
 - `use_dm_only`: 取值布尔类型。控制 VK (Exchange) 和 VXC (XC Potential) 矩阵的构建方式。缺省为 false。
     - `false`（缺省）：使用分子轨道系数构造（occ-RI-K 算法），效率更高，推荐用于大多数体系。
     - `true`：直接使用密度矩阵构造。当轨道占据数非整数（如 dSCF 激发态）时可能需要设为 true。
@@ -257,9 +261,15 @@ guessfile = "my_checkpoint.rchk"
 ### 自洽场初猜相关关键词
 - `initial_guess`: 取值String。分子体系进行自洽场运算所用的初始猜测方法。目前REST支持:
     1. 从 checkpoint 文件读取初猜。不需要设定 `initial_guess`，存在 `guessfile` 或 `chkfile` 时会自动读取初猜。
-	2. `sad` : 对体系各原子进行自洽场计算得到自洽的密度矩阵后，将多个密度矩阵按顺序置于对角位置后得到初始的密度矩阵进行自洽场运算。缺省为sad
-    3. `vsap`: Superposition of Atomic Potentials的初始猜测方法。采用半经验方法对体系势能项进行估计，与libcint生成的动能项进行加和后得到初始的Fock矩阵
-	4. `hcore`: Hcore则对应单电子近似初猜，直接将由libcint生成的hcore矩阵作为初始猜测的fock矩阵进行计算
+    2. `pao`: 对体系各原子做自洽场计算得到各原子的原子轨道，按原子块放入分子轨道空间后作一次 Roothaan 迭代，得到自洽场运算的初始密度矩阵。缺省为pao
+        - 限制性（闭壳层）与非限制（开壳层）自洽场均支持。
+        - 不需要设定任何额外的关键词或文件。不写 `initial_guess` 行时即为 `pao`。
+        - 体系含 ghost 基组原子、启用了 ISDF、或原子初猜构造失败时，程序会给出警告并自动退回 `sad`。
+    3. `sad` : 对体系各原子进行自洽场计算得到自洽的密度矩阵后，将多个密度矩阵按顺序置于对角位置后得到初始的密度矩阵进行自洽场运算
+    4. `vsap`: Superposition of Atomic Potentials的初始猜测方法。采用半经验方法对体系势能项进行估计，与libcint生成的动能项进行加和后得到初始的Fock矩阵
+    5. `hcore`: Hcore则对应单电子近似初猜，直接将由libcint生成的hcore矩阵作为初始猜测的fock矩阵进行计算
+
+需要换用其它初猜时显式写明取值即可，例如 `initial_guess = "sad"`、`initial_guess = "vsap"` 或 `initial_guess = "hcore"`。
 - `guess_mix`: 取值布尔类型，是否采用混合HOMO和LUMO的方法获得对称性破缺初猜。由此可以破坏体系的空间对称性和自旋对称性，有助于得到对称破缺单重态UHF波函数。缺省为false。
 - `guess_mix_theta_deg`: 取值`[f64;2]`或f64，分别设置两个自旋通道的混合角度（单位：度）。
     - 设为0.0，则表示完全不混合
@@ -282,13 +292,12 @@ chkfile = "mychk.rchk"
     - `"direct"` 不使用额外辅助收敛方法（naive SCF）
     - `"linear"` 线性辅助收敛方法，
     - `"diis"` direct inversion in the iterative subspace，是最常用的 SCF 加速收敛方法。当前DIIS实现已内置**正交基误差矢量**（通过 S⁻¹ᐟ² 变换改善条件数）和 **SVD 伪逆求解器**（替代直接矩阵求逆），对过渡金属等近简并体系有更好的数值稳定性。
-    - `"ediis"`: Energy-DIIS（Kudin-Scuseria-Cancès, JCP 2002, 116, 8255）。通过最小化历史密度的能量二次规划模型 `f^EDIIS(c) = ΣcᵢEᵢ − ½ΣcᵢcⱼBᵢⱼ`（`Bᵢⱼ = Tr[(Dᵢ−Dⱼ)(Fᵢ−Fⱼ)]`），求得最优凸组合系数后对 Fock 矩阵做线性组合 `F̃ = ΣcᵢFᵢ`，再对角化得到下一步密度。对 HF 精确成立（Fock 对密度仿射），对 DFT 为近似（论文指出 V_xc 非线性"可忽略"）。
+    - `"ediis"`: Energy-DIIS（Kudin-Scuseria-Cancès, JCP 2002, 116, 8255）。
     - `"ediis+diis"`：混合模式。早期使用 EDIIS，当 DIIS 误差范数降至 1e-3 时自动切换至 DIIS：
       ```
       DIIS误差范数 > 1e-3  →  EDIIS  # 保守的稳速下降
       DIIS误差范数 ≤ 1e-3  →  DIIS   # 快速的末段冲刺
       ```
-      在常规体系（C₂/HF、H₂O/PBE、Fe²⁺/UHF、N₂/PBE 等）中，`ediis+diis` 的迭代数与纯 `diis` 一致，同时具有 EDIIS 的早期能量稳定性。
     - `"adiis+diis"`：ADIIS-DIIS 混合（Hu-Yang, JCP 2010, 132, 054109）。与 `ediis+diis` 类似，但使用以最新历史点为参考的惩罚矩阵。
     - 各 mixer 策略对比：
       | 策略 | 场景 | 收敛速度 | 备注 |
@@ -298,10 +307,11 @@ chkfile = "mychk.rchk"
       | ediis | HF 近简并体系 | 较慢 | 理论上有能量单调性（仅 HF），但 DFT 下为近似 |
       | **ediis+diis** | 常规体系 | **快** | 与 diis 等速，兼具 EDIIS 早期稳定性 |
       | adiis+diis | 与 ediis+diis 类似 | 快 | B 矩阵保证 PSD，数值更鲁棒 |
-    - 已知局限：纯 `ediis` 在极端拉伸的 DFT 体系（如 N₂ r=3Å PBE）中可能不收敛——此时 Fock 混合近似 `ΣcᵢFᵢ ≈ F(D̃)` 因 V_xc 强非线性而失效，建议使用 `ediis+diis`（自动切换到 DIIS）。
 - `mix_param`: 取值f64。DIIS方法或linear方法的混合系数。缺省为0.6
-- `start_diis_cycle`: 取值i32。开始使用diis（或ediis）加速收敛方法的循环数。缺省为2
+- `start_diis_cycle`: 取值i32。开始使用diis（或ediis）加速收敛方法的循环数。缺省为1（第 1 轮即启用 DIIS；DIIS 历史不足时按线性混合回退）
 - `num_max_diis`: 取值i32。DIIS/EDIIS子空间大小（存储的历史Fock/密度矩阵数量）。缺省为8
+- `diis_pinv_threshold`: 取值f64。DIIS 误差矩阵求伪逆时的奇异值截断阈值。缺省为1.0e-12
+- `diis_orthogonalize_error`: 取值bool。是否对 DIIS 误差矢量做正交化（经 S^-1/2 变换改善条件数）。缺省为true；设为 false 可复现历史行为
 - `level_shift`: 取值f64。对于发生近简并振荡不收敛的情况，可以采用level_shift的方式人为破坏简并，加速收敛。单位为hartree，缺省值为None（不开启）。
     - 注意：当体系本身可以用纯 DIIS 正常收敛时，开启 level_shift 反而会减速收敛（DIIS 子空间已充分条件良好）。仅当 DIIS 失效（近简并振荡）时才需要开启此选项。
 - `ediis_penalty`：取值f64。EDIIS 惩罚参数 η（Kudin-Scuseria, JCP 2002, 116, 8255）。η 越大，外推越保守（偏离历史数据点的惩罚越大）。缺省为 0.5。仅当 `mixer = "ediis"`、`"ediis+diis"` 或 `"adiis+diis"` 时生效。
@@ -325,6 +335,7 @@ chkfile = "mychk.rchk"
 - `smear_sigma_min`：取值f64。退火过程中 σ 的下限值，单位为 Hartree。缺省为 `max(smear_sigma × 0.01, 0.001)`。
     - **σ 不应退火至零**：对于高对称性过渡金属等具有严格简并轨道的体系，σ→0 会导致占据数在简并轨道间 ping-pong 振荡而无法收敛。保留非零下限（~0.001 Ha ≈ 300 K）可确保简并流形的平滑平均占据。
     - 若体系简并程度高、退火后仍不收敛，可手动加大该值，如 `smear_sigma_min = 0.005`。
+
 ### $\Delta$-SCF 计算相关关键词
 - `force_state_occupation`: 取值是Vector。 $\Delta$-SCF 方法中用于约束轨道占据数的条件。具体声明方式如下：
      - `[
@@ -1091,6 +1102,40 @@ multipole_orders = [1, 2]
 multipole_origin = [0.0, 0.0, 0.0]
 multipole_rdm1_relax = "unrelaxed"
 ```
+
+# Detailed description of [output] block in the control file
+
+`[output]` 区块控制 `[ctrl]` 中 `outputs` 列表所请求输出文件的生成方式。区块内所有关键词均有缺省设置，一般计算无需显式声明该区块。目前其关键词影响 fchk 文件 (`outputs = ["fchk"]`) 与 cube 文件 (`outputs = ["cube_orb"]`) 的写出。
+
+- `fchk_dm`：取值String类型。控制写入 fchk 文件的密度矩阵段。可选项：
+    - `auto`（缺省）：写入所有已计算的密度。即总是写入 `Total SCF Density`（开壳层 UHF 参考另行写入 `Spin SCF Density`）；双杂化 (PT2 族) 计算若已求得弛豫 MP2 密度（如 `job_type = "force"` 的解析力计算），则额外写入 `Total MP2 Density` 段，开壳层另写 `Spin MP2 Density` 段
+    - `scf`：仅写入 SCF 密度段，省略全部 MP2 密度段
+    - `false`：不写入任何密度段
+- `fchk_writer`：取值String类型。选择写出 fchk 文件中 MO 系数等的写入器。可选项：
+    - `default`（缺省）：编译时启用了 cargo feature `librest2fch`（当前为缺省 feature）则使用 MOKIT 的 librest2fch 写出 MO 系数；否则使用 REST 原生的 Rust 写入器
+    - `librest2fch`：使用 librest2fch 库。若编译时未启用该 feature，程序报错
+    - `rust`：使用 REST 原生 Rust 写入器
+
+一个显式设置的例子：
+```toml
+[output]
+fchk_dm = "scf"
+fchk_writer = "rust"
+```
+
+- `cube_orb_setting`: 取值[f64;2]。`outputs = ["cube_orb"]` 的格点参数设置。前一个值(margin)是边界信息，第二个值(num_grids)是生成格点的数目。缺省值为[3.0, 80.0]
+- `cube_orb_indices`: 取值Vec\<[usize;3]\>。
+	- 指定需要生成cube文件的一组轨道。缺省为空，即`[]`
+    - 每一个矢量元素`[usize;3]`代表一组轨道信息：
+    - 第一个值(start_orb)为起始轨道的index
+    - 第二个值(end_orb)为截止轨道的index，与start_orb组成闭区间(closed interval)
+    - 第三个值(i_spin)是这组轨道所在的自旋通道。0为alpha自旋;1为beta自旋
+    - **注意**：REST的轨道排序从0开始，因此第一个轨道是0。如果HOMO是第X个轨道，在REST的排序是X-1
+	- 举例来说：闭壳层基态苯分子体系的HOMO-1、HOMO和LUMO是第20、21和22个轨道，在REST中的排序是19、20和21。打印alpha自旋通道上这三个轨道的设置是[[19,21,0]]
+- `cube_orb_type`: 取值String类型。指定生成的cube文件类型：
+  - `wavefunction`: 生成轨道波函数的cube文件（缺省）
+  - `density`: 生成轨道概率密度的cube文件（|ψ|²）
+- **注意**：以上三个cube关键词原先位于 `[ctrl]` 区块。为向后兼容，`[ctrl]` 中的旧位置仍然可用（程序会打印弃用提示），但同一关键词在 `[output]` 中给出时以 `[output]` 为准。
 
 # Detailed description of [geom] block in the control file
 - `name`：取值String类型。分子体系的名称
