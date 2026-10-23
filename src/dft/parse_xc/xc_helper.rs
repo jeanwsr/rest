@@ -25,6 +25,16 @@ pub const NSCF_COMPONENTS: [ComponentType; 5] = [
     ComponentType::Disp,
 ];
 
+/// The component types that constitute a fifth-rung (post-SCF) correlation term, i.e.
+/// the families that enter only the final-energy functional. Note `Disp` is an
+/// NSCF-allowed component but not a fifth-rung one; `HF`/`RSHF` are exchange terms.
+pub const FIFTH_RUNG_COMPONENT_TYPES: &[ComponentType] = &[
+    ComponentType::PT2,
+    ComponentType::RPA,
+    ComponentType::SCSRPA,
+    ComponentType::SBGE2,
+];
+
 impl ComponentType {
     pub fn as_str(&self) -> &'static str {
         match self {

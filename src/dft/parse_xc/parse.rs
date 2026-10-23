@@ -8,6 +8,7 @@ use crate::dft::parse_xc::xc_helper::{ALIAS, AVAIL_FUNC, CODES,
     ComponentType, 
     MULTISTEP, MULTISTEP_ALIAS, MULTISTEP_NAME_WITH_DASH, 
     NAME_WITH_DASH, NAME_WITHOUT_UNDERSCORE, NSCF_COMPONENTS, WHITELIST_NONLIBXC, 
+    FIFTH_RUNG_COMPONENT_TYPES,
     get_name, load_user_json_functionals};
 use crate::dft::parse_xc::dispersion::{check_disp_suffix};
 // use cached::proc_macro::cached;
@@ -746,10 +747,8 @@ impl DFAdef {
     /// The fifth-rung (post-SCF) family carried by the final-energy components
     /// (`xc_nscf`); `None` for a purely variational SCF functional.
     pub fn family_pos(&self) -> Option<DFAFamily> {
-        self.xc_nscf
-            .as_ref()?
-            .iter()
-            .find_map(|comp| comp.component_type.to_dfa_family())
+        self.fifth_rung_component()
+            .and_then(|comp| comp.component_type.to_dfa_family())
     }
 
     /// `true` when the SCF functional evaluates DFT XC on a grid (has at least one
@@ -770,10 +769,9 @@ impl DFAdef {
     /// `dfa_paramr_adv`. Its `param_positional` holds the family's auxiliary factors
     /// (for PT2/SCSRPA/SBGE2: the opposite-spin / same-spin scaling `(c_os, c_ss)`).
     pub fn fifth_rung_component(&self) -> Option<&DFAComponent> {
-        self.xc_nscf
-            .as_ref()?
-            .iter()
-            .find(|comp| comp.component_type.to_dfa_family().is_some())
+        self.xc_nscf.as_ref()?.iter().find(|comp| {
+            FIFTH_RUNG_COMPONENT_TYPES.contains(&comp.component_type)
+        })
     }
 
     /// Override the PT2 `(c_os, c_ss)` factors (e.g. from the `ri_pt2` `os_factor`/`ss_factor`
@@ -1008,17 +1006,7 @@ impl DFAdef {
 
     pub fn is_fifth_dfa(&self) -> bool {
         // check if any component in self.xc is a fifth rung functional
-        if let Some(components) = &self.xc_nscf {
-            for comp in components.iter() {
-                match comp.component_type {
-                    ComponentType::PT2 | ComponentType::RPA | ComponentType::SCSRPA | ComponentType::SBGE2 => {
-                        return true;
-                    },
-                    _ => {},
-                }
-            }
-        }
-        false
+        self.fifth_rung_component().is_some()
     }
 
     pub fn has_nscf(&self) -> bool {
