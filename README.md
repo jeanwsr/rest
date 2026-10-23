@@ -261,9 +261,15 @@ guessfile = "my_checkpoint.rchk"
 ### 自洽场初猜相关关键词
 - `initial_guess`: 取值String。分子体系进行自洽场运算所用的初始猜测方法。目前REST支持:
     1. 从 checkpoint 文件读取初猜。不需要设定 `initial_guess`，存在 `guessfile` 或 `chkfile` 时会自动读取初猜。
-	2. `sad` : 对体系各原子进行自洽场计算得到自洽的密度矩阵后，将多个密度矩阵按顺序置于对角位置后得到初始的密度矩阵进行自洽场运算。缺省为sad
-    3. `vsap`: Superposition of Atomic Potentials的初始猜测方法。采用半经验方法对体系势能项进行估计，与libcint生成的动能项进行加和后得到初始的Fock矩阵
-	4. `hcore`: Hcore则对应单电子近似初猜，直接将由libcint生成的hcore矩阵作为初始猜测的fock矩阵进行计算
+    2. `pao`: 对体系各原子做自洽场计算得到各原子的原子轨道，按原子块放入分子轨道空间后作一次 Roothaan 迭代，得到自洽场运算的初始密度矩阵。缺省为pao
+        - 限制性（闭壳层）与非限制（开壳层）自洽场均支持。
+        - 不需要设定任何额外的关键词或文件。不写 `initial_guess` 行时即为 `pao`。
+        - 体系含 ghost 基组原子、启用了 ISDF、或原子初猜构造失败时，程序会给出警告并自动退回 `sad`。
+    3. `sad` : 对体系各原子进行自洽场计算得到自洽的密度矩阵后，将多个密度矩阵按顺序置于对角位置后得到初始的密度矩阵进行自洽场运算
+    4. `vsap`: Superposition of Atomic Potentials的初始猜测方法。采用半经验方法对体系势能项进行估计，与libcint生成的动能项进行加和后得到初始的Fock矩阵
+    5. `hcore`: Hcore则对应单电子近似初猜，直接将由libcint生成的hcore矩阵作为初始猜测的fock矩阵进行计算
+
+需要换用其它初猜时显式写明取值即可，例如 `initial_guess = "sad"`、`initial_guess = "vsap"` 或 `initial_guess = "hcore"`。
 - `guess_mix`: 取值布尔类型，是否采用混合HOMO和LUMO的方法获得对称性破缺初猜。由此可以破坏体系的空间对称性和自旋对称性，有助于得到对称破缺单重态UHF波函数。缺省为false。
 - `guess_mix_theta_deg`: 取值`[f64;2]`或f64，分别设置两个自旋通道的混合角度（单位：度）。
     - 设为0.0，则表示完全不混合
