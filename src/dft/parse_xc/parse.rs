@@ -14,7 +14,7 @@ use crate::dft::parse_xc::dispersion::{check_disp_suffix};
 use crate::dft::DFA4REST;
 use crate::dft::DFAFamily;
 use itertools::Itertools;
-use libxc::prelude::LibXCFunctional;
+use libxc::prelude::{LibXCFunctional, LibXCFunctionalKind, LibXCSpin};
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -518,8 +518,8 @@ impl std::ops::Add for DFAComponent {
 }
 
 impl DFAComponent {
-    /// A Libxc component from a functional code and scale factor (e.g. for the
-    /// temporary xc swaps in ri_gw); the names come from `xc_helper::get_name`.
+    /// A Libxc component from a functional code and scale factor; the names come from
+    /// `xc_helper::get_name`.
     pub fn from_libxc(id: usize, factor: f64) -> Self {
         DFAComponent {
             factor,
@@ -1185,6 +1185,91 @@ pub fn func_list_from_components(
         None
     } else {
         Some(list)
+    }
+}
+
+impl DFAdef {
+    /// Pure-exchange part of this definition: HF/RSHF components plus Libxc components
+    /// whose libxc kind is `Exchange`, with their factors preserved. Combined
+    /// `ExchangeCorrelation` functionals cannot be split natively and are omitted, as are
+    /// PT2/Disp terms. `None` when nothing survives (e.g. a pure-hybrid definition, or
+    /// HF-free pure correlation). The result is a definition whose `xc_scf` evaluates to
+    /// the pure exchange contribution; its other fields are empty.
+    pub fn x_part(&self, spin_channel: usize) -> Option<DFAdef> {
+        let comps: Vec<DFAComponent> = self.xc_scf.as_ref()?.iter().filter_map(|comp| {
+            match comp.component_type {
+                ComponentType::HF | ComponentType::RSHF => Some(comp.clone()),
+                ComponentType::Libxc => {
+                    let func = comp.to_libxc_functional(spin_channel)?;
+                    if matches!(func.kind(), LibXCFunctionalKind::Exchange) {
+                        Some(comp.clone())
+                    } else {
+                        None
+                    }
+                },
+                _ => None,
+            }
+        }).collect();
+        if comps.is_empty() {
+            return None;
+        }
+        let mut part = DFAdef::new();
+        part.spin_channel = spin_channel;
+        part.xc_scf = Some(comps);
+        Some(part)
+    }
+
+    /// Pure-correlation part of this definition: Libxc components whose libxc kind is
+    /// `Correlation`, factors preserved. HF/RSHF are exchange-only and omitted; combined
+    /// `ExchangeCorrelation` functionals cannot be split natively; PT2/Disp omitted.
+    /// `None` when nothing survives.
+    pub fn c_part(&self, spin_channel: usize) -> Option<DFAdef> {
+        let comps: Vec<DFAComponent> = self.xc_scf.as_ref()?.iter().filter_map(|comp| {
+            match comp.component_type {
+                ComponentType::Libxc => {
+                    let func = comp.to_libxc_functional(spin_channel)?;
+                    if matches!(func.kind(), LibXCFunctionalKind::Correlation) {
+                        Some(comp.clone())
+                    } else {
+                        None
+                    }
+                },
+                _ => None,
+            }
+        }).collect();
+        if comps.is_empty() {
+            return None;
+        }
+        let mut part = DFAdef::new();
+        part.spin_channel = spin_channel;
+        part.xc_scf = Some(comps);
+        Some(part)
+    }
+}
+
+/// The pure exchange (`kind = Exchange`) or correlation (`kind = Correlation`) part of a
+/// functional NAME as a definition, decomposed natively without curated x/c tables:
+/// a raw libxc identifier (e.g. `lda_x_slater`) is resolved by libxc itself and kept when
+/// its functional kind matches; otherwise the REST-level parse (aliases, multistep,
+/// dispersion suffixes) runs and the definition is filtered through
+/// `DFAdef::x_part`/`c_part`. Combined `ExchangeCorrelation` functionals (e.g. `b3lyp`)
+/// have no separate parts and yield `None`, as does an unmatched request.
+pub fn xc_part_of_name(name: &str, spin_channel: usize, kind: LibXCFunctionalKind) -> Option<DFAdef> {
+    let spin = if spin_channel == 2 { LibXCSpin::Polarized } else { LibXCSpin::Unpolarized };
+    if let Ok(func) = LibXCFunctional::from_identifier_f(name, spin) {
+        if matches!(func.kind(), k if k == kind) {
+            let mut part = DFAdef::new();
+            part.spin_channel = spin_channel;
+            part.xc_scf = Some(vec![DFAComponent::from_libxc(func.number() as usize, 1.0)]);
+            return Some(part);
+        }
+        return None;
+    }
+    let def = parse_and_derive(name, spin_channel, 0);
+    match kind {
+        LibXCFunctionalKind::Exchange => def.x_part(spin_channel),
+        LibXCFunctionalKind::Correlation => def.c_part(spin_channel),
+        _ => None,
     }
 }
 

@@ -445,3 +445,60 @@ fn func_list_door_matches_legacy_arrays() {
         assert_eq!(legacy, door, "func list mismatch for {name}");
     }
 }
+
+#[test]
+fn test_parse_xc_part_decomposition() {
+    // pbe parses into separate exchange and correlation components
+    let pbe = parse_and_derive("pbe", 1, 0);
+    let x = pbe.x_part(1).expect("pbe has an exchange part");
+    let x_funcs = x.scf_func_list(1);
+    assert_eq!(x_funcs.len(), 1);
+    assert_eq!(x_funcs[0].1.number(), 101); // gga_x_pbe
+    let c = pbe.c_part(1).expect("pbe has a correlation part");
+    let c_funcs = c.scf_func_list(1);
+    assert_eq!(c_funcs.len(), 1);
+    assert_eq!(c_funcs[0].1.number(), 130); // gga_c_pbe
+
+    // blyp: b88 (106) is exchange, lyp (131) is correlation
+    let blyp = parse_and_derive("blyp", 1, 0);
+    assert_eq!(blyp.x_part(1).expect("blyp x").scf_func_list(1)[0].1.number(), 106);
+    assert_eq!(blyp.c_part(1).expect("blyp c").scf_func_list(1)[0].1.number(), 131);
+
+    // combined exchange-correlation functionals cannot be split natively
+    let b3lyp = parse_and_derive("b3lyp", 1, 0);
+    assert!(b3lyp.x_part(1).is_none(), "b3lypg is a combined functional");
+    assert!(b3lyp.c_part(1).is_none());
+}
+
+#[test]
+fn test_parse_xc_part_hf_kept_in_x() {
+    // an HF reference: the exact-exchange term belongs to the x part
+    let hf = parse_and_derive("hf", 1, 0);
+    let x = hf.x_part(1).expect("hf has an exchange part");
+    let comps = x.xc_scf.expect("hf x part carries components");
+    assert!(comps.iter().all(|comp| !matches!(comp.component_type, ComponentType::Libxc)));
+}
+#[test]
+fn test_parse_xc_part_of_name() {
+    use pyrest::dft::parse_xc::xc_part_of_name;
+    use libxc::prelude::LibXCFunctionalKind;
+
+    // libxc-style pure names resolve via libxc itself (no REST-level alias needed)
+    let x = xc_part_of_name("lda_x", 1, LibXCFunctionalKind::Exchange)
+        .expect("lda_x is a pure exchange functional");
+    assert_eq!(x.scf_func_list(1)[0].1.number(), 1);
+    let c = xc_part_of_name("gga_c_pbe", 1, LibXCFunctionalKind::Correlation)
+        .expect("gga_c_pbe is a pure correlation functional");
+    assert_eq!(c.scf_func_list(1)[0].1.number(), 130);
+
+    // REST-level names resolve through the parse
+    let pbe_x = xc_part_of_name("pbe", 1, LibXCFunctionalKind::Exchange)
+        .expect("pbe has an exchange part");
+    assert_eq!(pbe_x.scf_func_list(1)[0].1.number(), 101);
+
+    // combined exchange-correlation functionals have no separate parts
+    assert!(xc_part_of_name("b3lyp", 1, LibXCFunctionalKind::Exchange).is_none());
+    assert!(xc_part_of_name("b3lyp", 1, LibXCFunctionalKind::Correlation).is_none());
+    // a wrong-kind request on a pure functional yields None
+    assert!(xc_part_of_name("lda_x", 1, LibXCFunctionalKind::Correlation).is_none());
+}

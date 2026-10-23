@@ -2073,13 +2073,15 @@ pub fn linearized_gw(scf_data:&mut SCF,num_freq:usize,vxc_nn:&Vec<f64>,cancel_df
     quasiparticle_energies_g
 }
 pub fn get_pure_x_or_c_of_xc(scf_data:&mut SCF,name:&str,choice:char)->Vec<f64>{
+    // The pure exchange/correlation part of `name`, decomposed natively from the parsed
+    // definition via the libxc functional kind (no curated x/c tables). `None` (e.g. a
+    // combined exchange-correlation functional) evaluates to a zero potential.
+    let spin_channel=scf_data.mol.spin_channel;
+    let kind=if choice=='X'{libxc::prelude::LibXCFunctionalKind::Exchange}else if choice=='C'{libxc::prelude::LibXCFunctionalKind::Correlation}else{panic!("invalid choice for pure x/c!")};
+    let part=crate::dft::parse_xc::xc_part_of_name(name,spin_channel,kind);
     let eigenvecs=scf_data.eigenvectors.clone();
-    let x_or_c=if choice=='X'{1}else if choice=='C'{2}else{panic!("invalid choice for pure x/c!")};
     let xc_scf_save=scf_data.mol.dfadef.xc_scf.clone();
-    let mut new_paramr=vec![0.0,0.0,0.0];
-    new_paramr[x_or_c]=1.0;
-    scf_data.mol.dfadef.xc_scf=Some(DFA4REST::libxc_code_fdqc(name).iter().zip(new_paramr.iter())
-        .map(|(&id, &factor)| crate::dft::parse_xc::DFAComponent::from_libxc(id, factor)).collect());
+    scf_data.mol.dfadef.xc_scf=part.map(|def| def.xc_scf).unwrap_or(None);
     let v_x_or_c_ao=scf_data.generate_vxc_rayon(1.0).2[0].to_matrixfull().unwrap().clone();
     let dimensions=v_x_or_c_ao.size[0];
     let mut v_x_or_c_nn=vec![0.0;dimensions];
@@ -2098,13 +2100,12 @@ pub fn get_pure_x_or_c_of_xc(scf_data:&mut SCF,name:&str,choice:char)->Vec<f64>{
 }
 pub fn get_homo_vx_or_vc(scf_data:&mut SCF,name:&str,choice:char)->f64{
     let (start_mo,num_state,occ_size,vir_size,homo,lumo)=get_occupation_parameters(scf_data,'Y');
+    let spin_channel=scf_data.mol.spin_channel;
+    let kind=if choice=='X'{libxc::prelude::LibXCFunctionalKind::Exchange}else if choice=='C'{libxc::prelude::LibXCFunctionalKind::Correlation}else{panic!("invalid choice for pure x/c!")};
+    let part=crate::dft::parse_xc::xc_part_of_name(name,spin_channel,kind);
     let eigenvecs=scf_data.eigenvectors.clone();
-    let x_or_c=if choice=='X'{1}else if choice=='C'{2}else{panic!("invalid choice for pure x/c!")};
-    //println!("About to save DFA4REST");
     let xc_scf_save=scf_data.mol.dfadef.xc_scf.clone();
-    //println!("About to obtain xc_code and change DFA4REST");
-    scf_data.mol.dfadef.xc_scf=Some(vec![crate::dft::parse_xc::DFAComponent::from_libxc(DFA4REST::libxc_code_fdqc(name)[x_or_c], 1.0)]);
-    //println!("About to generate vxc");
+    scf_data.mol.dfadef.xc_scf=part.map(|def| def.xc_scf).unwrap_or(None);
     let v_x_or_c_ao=scf_data.generate_vxc_rayon(1.0).2[0].to_matrixfull().unwrap().clone();
     //println!("vxc has been generated");
     let dimensions=v_x_or_c_ao.size[0];
