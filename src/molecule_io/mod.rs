@@ -290,9 +290,7 @@ impl Molecule {
         mol.start_mo = mol.generate_start_mo(mol.ecp_electrons);
 
         if ctrl.print_level>0 {
-            if mol.xc_data.is_some() {
-                mol.xc_data.as_ref().unwrap().xc_version();
-            }
+            crate::dft::xc_version();
             println!("nbas: {}, natm: {} for standard basis sets", mol.cint_bas.len(), mol.cint_atm.len());
             println!("First valence state for the frozen-core algorithm: {:5}", mol.start_mo);
         };

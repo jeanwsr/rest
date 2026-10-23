@@ -3431,7 +3431,6 @@ impl SCF {
             grids.parallel_balancing.par_iter().for_each_with(sender,|s,range_grids| {
                 omp_set_num_threads_wrapper(1);
                 // change the return of xc_exc_vxc, directly return vxc_mat [num_basis, num_basis]
-                // let (exc,vxc_ao,total_elec) = self.mol.xc_data.xc_exc_vxc_slots_dm_only(range_grids.clone(), grids, spin_channel,dm, mo, occ);
                 //exc_spin = exc;
                 let funcs = self.mol.dfadef.scf_func_list(spin_channel);
                 let (exc, vxc_mf, total_elec) = crate::dft::xc_exc_vxc_slots_dm_only(&funcs, range_grids.clone(), grids, spin_channel,dm, mo, occ, self.mol.ctrl.print_level, self.mol.ctrl.vxc_screen_threshold);
@@ -3634,7 +3633,6 @@ impl SCF {
                 omp_set_num_threads_wrapper(1);
 
                 // change the return value of xc_exc_vxc by vxc_mat [num_basis, num_basis]
-                // let (exc,vxc_ao,total_elec) = self.mol.xc_data.xc_exc_vxc_slots(range_grids.clone(), grids, spin_channel,dm, mo, occ);
                 //exc_spin = exc;
                 let funcs = self.mol.dfadef.scf_func_list(spin_channel);
                 let (exc, vxc_mf, total_elec) = crate::dft::xc_exc_vxc_slots(&funcs, range_grids.clone(), grids, spin_channel, dm, mo, occ, self.mol.ctrl.print_level, self.mol.ctrl.vxc_screen_threshold);

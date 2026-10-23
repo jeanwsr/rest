@@ -124,14 +124,13 @@ impl DFAFamily {
     }
 }
 
+/// Print the libxc version REST is linked against (self-independent).
+pub fn xc_version() {
+    let (major, minor, micro) = libxc::util::libxc_version();
+    println!("Libxc version used in REST: {}.{}.{}", major, minor, micro);
+}
+
 impl DFA4REST {
-
-    pub fn xc_version(&self) {
-        let (major, minor, micro) = libxc::util::libxc_version();
-        println!("Libxc version used in REST: {}.{}.{}", major, minor, micro);
-    }
-
-
     pub fn new_xc(spin_channel: usize, print_level: usize) -> DFA4REST {
         DFA4REST { 
             spin_channel, 
@@ -1284,16 +1283,6 @@ impl DFA4REST {
             .any(|xc_func_id| self.init_libxc(xc_func_id).needs_tau())
     }
 
-    /// SCF-functional list of `(factor, LibXCFunctional)` for the exc/vxc module
-    /// functions; the omega ext-parameter of RSH components is applied here
-    /// (mirror of the former `init_libxc_and_set_param` behavior).
-    pub fn libxc_func_list(&self) -> Vec<(f64, LibXCFunctional)> {
-        self.dfa_compnt_scf
-            .iter()
-            .zip(self.dfa_paramr_scf.iter())
-            .map(|(code, param)| (*param, self.init_libxc_and_set_param(code)))
-            .collect()
-    }
 }
 
 pub fn xc_exc_vxc(funcs: &[(f64, LibXCFunctional)], grids: &Grids, spin_channel: usize, dm: &Vec<MatrixFull<f64>>, mo: &[MatrixFull<f64>;2], occ: &[Vec<f64>;2], print_level:usize) -> (Vec<f64>, Vec<MatrixFull<f64>>) {
