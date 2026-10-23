@@ -37,7 +37,6 @@ use crate::analdrv::response::uresp_interface::{
     scf_xc_func_list_uks, uscf_resp_interface, URespSCF,
 };
 use crate::dft::num_int::XCData;
-use crate::dft::parse_xc::components_to_codes_params;
 use crate::dft::numint_matmul::nimatmul::{regroup_grids_by_atom, NIMatmul};
 use crate::dft::numint_matmul::resp_uks::URespKSNIMatmul;
 use crate::dft::xc_deriv::XCType;
@@ -67,6 +66,7 @@ use rstsr::prelude::*;
 use std::collections::HashMap;
 use std::ops::Range;
 use tensors::MatrixFull;
+use libxc::prelude::LibXCFunctional;
 
 /// Analytic gradient of the PT2-correlation (RI-MP2) energy, unrestricted case.
 pub struct UDHGradient<'a> {
@@ -134,14 +134,13 @@ impl<'a> UDHGradient<'a> {
         let dfadef = &mol_obj.dfadef;
         let delta_hyb = dfadef.dfa_hybrid_nscf.unwrap_or(dfadef.dfa_hybrid_scf) - dfadef.dfa_hybrid_scf;
         let xc_func_pos = mol_obj.dfadef.nscf_func_list(2);
+        let func_codes = |funcs: &[(f64, LibXCFunctional)]| -> Vec<(usize, f64)> {
+            funcs.iter().map(|(factor, func)| (func.number() as usize, *factor)).collect()
+        };
         let xc_n_is_scf = match &dfadef.xc_nscf {
-            Some(nscf) => {
-                let (n_code, n_param) = components_to_codes_params(nscf);
-                let (s_code, s_param) =
-                    components_to_codes_params(dfadef.xc_scf.as_deref().unwrap_or(&[]));
-                n_code == s_code
-                    && n_param.len() == s_param.len()
-                    && n_param.iter().zip(s_param.iter()).all(|(a, b)| (a - b).abs() < 1e-12)
+            Some(_) => {
+                let n = func_codes(dfadef.nscf_func_list(2).as_deref().unwrap_or(&[]));
+                n == func_codes(&dfadef.scf_func_list(2))
             },
             None => true,
         };
@@ -979,30 +978,20 @@ fn xc_skeleton_dao(
 ) -> Vec<Tsr> {
     let mol_obj = &scf_data.mol;
     let xc_data = &mol_obj.dfadef;
-    let (pos_codes, pos_params) = if scf {
-        (Vec::new(), Vec::new())
+    let funcs = if scf {
+        xc_data.scf_func_list(2)
     } else {
-        components_to_codes_params(
-            mol_obj
-                .dfadef
-                .xc_nscf
-                .as_deref()
-                .expect("the final functional has no XC component list."),
+        crate::dft::parse_xc::func_list_from_components(
+            mol_obj.dfadef.xc_nscf.as_deref(),
+            2,
         )
+        .expect("the final functional has no XC component list or libxc components")
     };
-    let (code, param) = if scf {
-        crate::dft::parse_xc::components_to_codes_params(
-            mol_obj.dfadef.xc_scf.as_deref()
-                .expect("the SCF functional has no XC component list."),
-        )
-    } else {
-        (pos_codes, pos_params)
-    };
-    let xc_type = if code.iter().any(|&c| crate::dft::libxc_helper::xc_func_init(c, 1).needs_tau()) {
+    let xc_type = if funcs.iter().any(|(_f, func)| func.needs_tau()) {
         XCType::MGGA
-    } else if code
+    } else if funcs
         .iter()
-        .any(|&c| !matches!(crate::dft::libxc_helper::xc_func_init(c, 1).family(), libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA))
+        .any(|(_f, func)| !matches!(func.family(), libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA))
     {
         XCType::GGA
     } else {
@@ -1010,8 +999,7 @@ fn xc_skeleton_dao(
     };
     let xc_data_sel = XCData {
         xc_type,
-        xc_code: code,
-        xc_params: param,
+        funcs,
         device: DeviceOpenBLAS::default(),
         dm: &scf_data.density_matrix,
         mo_coeffs: None,

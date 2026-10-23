@@ -1168,11 +1168,6 @@ pub fn parse_tokens(mut components: Vec<DFAComponent>, functype: &str) -> Vec<DF
 
 /// `(libxc code, factor)` pairs of the Libxc components, in order — the bridge from the
 /// component-typed DFAdef world to the code-array currency of the exc/vxc/numint layer
-/// (e.g. `XCData` construction in the DH gradients).
-pub fn components_to_codes_params(components: &[DFAComponent]) -> (Vec<usize>, Vec<f64>) {
-    components.iter().filter_map(|comp| comp.libxc_code_param()).unzip()
-}
-
 /// `(scale, functional)` pairs of the final-energy functional's DFT (libxc) part; `None`
 /// when `xc_nscf` is absent or carries no libxc component (pure-MP2-family post-SCF
 /// methods). Shared door of the DH response/gradient interfaces (restricted and

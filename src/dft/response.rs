@@ -282,9 +282,7 @@ pub fn prepare_fxc_hessian_cache(scf: &SCF) -> FxcHessianCache {
     let mol = &scf.mol;
     let grids = scf.grids.as_ref().expect("prepare_fxc_hessian_cache requires scf.grids");
     let nao = mol.num_basis;
-    let (func_ids, func_factors) = crate::dft::parse_xc::components_to_codes_params(
-        mol.dfadef.xc_scf.as_deref().expect("the SCF functional has no libxc components"),
-    );
+    let funcs = mol.dfadef.scf_func_list(1);
 
     let xc_type = if mol.dfadef.use_density_gradient() {
         XCType::GGA
@@ -338,7 +336,7 @@ pub fn prepare_fxc_hessian_cache(scf: &SCF) -> FxcHessianCache {
             let off = rho_tensor.offset();
             raw[off..off + nb * nvar].to_vec()
         };
-        let xc_tensors = eval_xc_eff(&func_ids, &func_factors, xc_type, 0, &rho_array, nb, 2);
+        let xc_tensors = eval_xc_eff(&funcs, xc_type, 0, &rho_array, nb, 2);
         let fxc_t = xc_tensors[2].as_ref().expect("prepare_fxc_hessian_cache: fxc required");
         let fxc_raw_src = fxc_t.raw();
         let fxc_off = fxc_t.offset();

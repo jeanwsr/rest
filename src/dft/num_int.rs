@@ -6,6 +6,7 @@ use rest_tensors::{MatrixFull, MatrixFullSlice, RIFull};
 use rest_tensors::matrix_blas_lapack::{ _einsum_01_serial, _einsum_02_serial};
 use rest_tensors::matrix::matrix_blas_lapack::_dgemm_full;
 use tensors::matrix_blas_lapack::{_dgemm};
+use libxc::prelude::LibXCFunctional;
 use rayon::iter::{
     ParallelIterator, IndexedParallelIterator,
     plumbing::{Consumer, Folder, Producer, ProducerCallback, bridge},
@@ -717,10 +718,8 @@ pub fn prepare_fxc_data(scf: &SCF) -> FXCMatvecData {
     };
 
     // ── Compute fxc kernel analytically via libxc ──
-    let (xc_codes, xc_params) = crate::dft::parse_xc::components_to_codes_params(
-        dfadef.xc_scf.as_deref().expect("the SCF functional has no libxc components"),
-    );
-    let xc_tensors = eval_xc_eff(&xc_codes, &xc_params, xc_type, 0, &rho_array, ngrids, 2);
+    let funcs = dfadef.scf_func_list(1);
+    let xc_tensors = eval_xc_eff(&funcs, xc_type, 0, &rho_array, ngrids, 2);
 
     // xc_tensors[2] = fxc kernel (deriv=2)
     let fxc_tensor = xc_tensors[2].as_ref()
@@ -908,10 +907,8 @@ fn prepare_fxc_data_impl(
     };
 
     // ── Compute fxc kernel analytically via libxc ──
-    let (xc_codes, xc_params) = crate::dft::parse_xc::components_to_codes_params(
-        dfadef.xc_scf.as_deref().expect("the SCF functional has no libxc components"),
-    );
-    let xc_tensors = eval_xc_eff(&xc_codes, &xc_params, xc_type, 0, &rho_array, ngrids, 2);
+    let funcs = dfadef.scf_func_list(1);
+    let xc_tensors = eval_xc_eff(&funcs, xc_type, 0, &rho_array, ngrids, 2);
 
     // xc_tensors[2] = fxc kernel (deriv=2)
     let fxc_tensor = xc_tensors[2].as_ref()
@@ -1171,10 +1168,8 @@ pub fn prepare_fxc_data_unrestricted(scf: &SCF) -> FXCMatvecDataUnrestricted {
         raw[offset..offset + ngrids * nvar * 2].to_vec()
     };
 
-    let (xc_codes, xc_params) = crate::dft::parse_xc::components_to_codes_params(
-        dfadef.xc_scf.as_deref().expect("the SCF functional has no libxc components"),
-    );
-    let xc_tensors = eval_xc_eff(&xc_codes, &xc_params, xc_type, 1, &rho_array, ngrids, 2);
+    let funcs = dfadef.scf_func_list(2);
+    let xc_tensors = eval_xc_eff(&funcs, xc_type, 1, &rho_array, ngrids, 2);
     let fxc_tensor = xc_tensors[2].as_ref()
         .expect("fxc (deriv=2) should be available for unrestricted TDDFT");
 
@@ -2272,10 +2267,8 @@ pub fn prepare_fxc_data_nwchem_opt(scf: &SCF) -> FXCMatvecDataNwchemOpt {
         raw[offset..offset + ngrids * nvar].to_vec()
     };
 
-    let (xc_codes, xc_params) = crate::dft::parse_xc::components_to_codes_params(
-        dfadef.xc_scf.as_deref().expect("the SCF functional has no libxc components"),
-    );
-    let xc_tensors = eval_xc_eff(&xc_codes, &xc_params, xc_type, 0, &rho_array, ngrids, 2);
+    let funcs = dfadef.scf_func_list(1);
+    let xc_tensors = eval_xc_eff(&funcs, xc_type, 0, &rho_array, ngrids, 2);
     let fxc_tensor = xc_tensors[2].as_ref()
         .expect("fxc (deriv=2) should be available");
     let fxc_raw: Vec<f64> = {
@@ -2603,10 +2596,9 @@ pub struct BlockData<'a> {
 
 pub struct XCData<'a> {
     pub xc_type: XCType,
-    /// Owned libxc codes/parameters; converted from the DFA components at
-    /// construction (XCData no longer borrows the legacy xc_data arrays).
-    pub xc_code: Vec<usize>,
-    pub xc_params: Vec<f64>,
+    /// The initialized `(factor, functional)` list to evaluate, converted from the DFA
+    /// components at construction (the evaluation currency since P5-d; no code arrays).
+    pub funcs: Vec<(f64, LibXCFunctional)>,
     pub device: DeviceOpenBLAS,
     pub dm: &'a Vec<MatrixFull<f64>>, 
     pub mo_coeffs: Option<Vec<MatrixFull<f64>>>,

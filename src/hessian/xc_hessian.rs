@@ -242,9 +242,7 @@ pub fn vxc_diag_streaming(scf: &SCF, xc_type: XCType) -> MatrixFull<f64> {
     let mol = &scf.mol;
     let nao = mol.num_basis;
     let grids = scf.grids.as_ref().expect("vxc_diag_streaming requires scf.grids");
-    let (func_ids, func_factors) = crate::dft::parse_xc::components_to_codes_params(
-        mol.dfadef.xc_scf.as_deref().expect("the SCF functional has no libxc components"),
-    );
+    let funcs = mol.dfadef.scf_func_list(1);
     let mo_vec = vec![scf.eigenvectors[0].clone()];
     let occ_vec = vec![scf.occupation[0].clone()];
 
@@ -283,7 +281,7 @@ pub fn vxc_diag_streaming(scf: &SCF, xc_type: XCType) -> MatrixFull<f64> {
                     raw[off..off + nb * nvar].to_vec()
                 };
 
-                let xc_tensors = eval_xc_eff(&func_ids, &func_factors, xc_type, 0, &rho_array, nb, 1);
+                let xc_tensors = eval_xc_eff(&funcs, xc_type, 0, &rho_array, nb, 1);
                 let vxc_t = xc_tensors[1].as_ref().expect("vxc_diag: vxc required");
                 let vxc_raw = vxc_t.raw();
                 let vxc_off = vxc_t.offset();
@@ -380,9 +378,7 @@ pub fn vxc_deriv2_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
     let grids = scf.grids.as_ref().expect("vxc_deriv2_streaming requires scf.grids");
     let aoslices = build_aoslices(mol);
     let dm0 = &scf.density_matrix[0];
-    let (func_ids, func_factors) = crate::dft::parse_xc::components_to_codes_params(
-        mol.dfadef.xc_scf.as_deref().expect("the SCF functional has no libxc components"),
-    );
+    let funcs = mol.dfadef.scf_func_list(1);
     let mo_vec = vec![scf.eigenvectors[0].clone()];
     let occ_vec = vec![scf.occupation[0].clone()];
 
@@ -426,7 +422,7 @@ pub fn vxc_deriv2_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                     raw[off..off + nb * nvar].to_vec()
                 };
 
-                let xc_tensors = eval_xc_eff(&func_ids, &func_factors, xc_type, 0, &rho_array, nb, 2);
+                let xc_tensors = eval_xc_eff(&funcs, xc_type, 0, &rho_array, nb, 2);
                 let vxc_t = xc_tensors[1].as_ref().expect("vxc_deriv2: vxc required");
                 let fxc_t = xc_tensors[2].as_ref().expect("vxc_deriv2: fxc required");
                 let vxc_raw = vxc_t.raw();
@@ -604,9 +600,7 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
     let grids = scf.grids.as_ref().expect("vxc_deriv1_streaming requires scf.grids");
     let aoslices = build_aoslices(mol);
     let dm0 = &scf.density_matrix[0];
-    let (func_ids, func_factors) = crate::dft::parse_xc::components_to_codes_params(
-        mol.dfadef.xc_scf.as_deref().expect("the SCF functional has no libxc components"),
-    );
+    let funcs = mol.dfadef.scf_func_list(1);
     let mo_vec = vec![scf.eigenvectors[0].clone()];
     let occ_vec = vec![scf.occupation[0].clone()];
 
@@ -649,7 +643,7 @@ pub fn vxc_deriv1_streaming(scf: &SCF, xc_type: XCType) -> Vec<MatrixFull<f64>> 
                     raw[off..off + nb * nvar].to_vec()
                 };
 
-                let xc_tensors = eval_xc_eff(&func_ids, &func_factors, xc_type, 0, &rho_array, nb, 2);
+                let xc_tensors = eval_xc_eff(&funcs, xc_type, 0, &rho_array, nb, 2);
                 let vxc_t = xc_tensors[1].as_ref().expect("vxc required");
                 let fxc_t = xc_tensors[2].as_ref().expect("fxc required");
                 let vxc_raw = vxc_t.raw();
