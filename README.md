@@ -231,6 +231,12 @@ guessfile = "my_checkpoint.rchk"
 - `scf_acc_rho`: 取值f64。自洽场运算密度矩阵的收敛标准。缺省为1.0e-5
 - `scf_acc_eev`: 取值f64。自洽场运算能量差平方和的收敛标准。缺省为1.0e-3
 - `scf_acc_etot`: 取值f64。自洽场运算总能量的收敛标准。缺省为1.0e-8
+- `pexsi`: 取值布尔类型。是否用 PEXSI（极点展开 + 选择性求逆）替代 $O(N^3)$ 对角化求解自洽场。缺省为 `false`，即走对角化。该关键词是**运行期开关**，同一个可执行文件即可切换两种求解器，不需要重新编译；但可执行文件本身必须带 `pexsi` 特性（`cargo build --features pexsi`），否则该关键词会被接受、打印提示并忽略，仍走对角化。
+  - 稀疏结构在进入 SCF 之前由 `h_core` 在 1e-10 阈值下冻结一次（`H_core` 的支持包含 $S$，故 $F = H_{core} + J + V_{xc} \subseteq H_{core}$ 对局域泛函成立）。之后每一轮只更新 $F$ 与 $D$ 的数值，符号分解（`isSymbolicFactorize = 0`）跨轮复用。
+  - **适用范围**：LDA/GGA 已验证。H2O20/cc-pVDZ 实测与对角化路径相差 **+1.58 µHa**（0.71 µeV/atom）。精确交换（`xc = "hf"` 或杂化泛函）**不被拒绝但结果有偏**：$K_{ij} = -\sum_{kl} D_{kl}(ik|jl)$ 只需 $(i,k)$、$(j,l)$ 分别重叠，尾部按 $1/R$ 衰减，落在 `h_core` 模式之外，实测 H2O20 收敛能偏差 **−13.7 mHa**。程序只打印警告（含被丢弃的 $|F_{off}|$ 与其隐含的密度误差），由使用者权衡速度与精度。
+  - 只支持闭壳层（RHF）：RHF 之外会打印警告并退回对角化。`atom_sad = true` 的嵌套 SAD 自洽场是二重态，同样退回对角化。
+  - 渐近占据由极点展开的 Fermi–Dirac 函数给出，因此 `smear` 只能是 `fermi`（`gaussian` 会退回对角化），`smear_sigma` 即 $k_BT$（单位 Ha）；未指定时取 $0.05\times$gap 并夹在 $[5\times10^{-3}, 10^{-2}]$ Ha。`scf_conv_criteria` 建议用 `"dm"`：极点展开的密度噪声约 $10^{-6}$，`etot` 判据在这一量级以下无法闭合（该轮 `scf_acc_etot` 会自动放宽到不小于 `1e-4`），`g` 判据（$\|FDS - SDF\|_F$）也到不了 $10^{-5}$。
+  - 收敛后仍会做一次对角化，以给出属于收敛密度的本征值/本征向量（HOMO/LUMO、电荷、梯度与后自洽场分析都读这一套）。`OCCType::FRAC` 是轨道层面的构造，在 PEXSI 轮次中不适用并会给出警告。
 - `algorithm_jk`: 设置 Fock 矩阵计算中 J (Coulomb) 和 K (Exchange) 两部分的算法：
     - `ri-direct`: 强制使用 direct RI 算法。对于 RI-K 部分，取决于内存大小，可能会使用 semi-direct 算法 (储存相对较小的 $O(N^3)$ 的 $g_{\mu i, P}$)。
     - `ri-incore`: 强制使用 incore RI 算法 (储存完整的 Cholesky decomposed 3c-2e ERI $Y_{\mu \nu, P}$)。该算法对内存需求较大，但计算速度更快。
