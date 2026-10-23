@@ -1139,10 +1139,6 @@ impl DFA4REST {
         }
     }
 
-    pub fn use_eri(&self) -> bool {
-        self.is_hybrid() || self.is_fifth_dfa()
-    }
-
 
     pub fn use_density_gradient(&self) -> bool {
         self

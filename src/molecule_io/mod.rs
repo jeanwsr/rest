@@ -66,7 +66,6 @@ pub struct Molecule {
     // exchange-correlation functionals
     pub dfadef: parse_xc::DFAdef,
     pub xc_data: Option<DFA4REST>,
-    pub use_eri: bool,
     #[pyo3(get, set)]
     pub num_state: usize,
     #[pyo3(get, set)]
@@ -118,7 +117,6 @@ impl Molecule {
             mpi_data: None,
             dfadef: parse_xc::DFAdef::new(), 
             xc_data: None,
-            use_eri: false,
             geom: GeomCell::init_geom(),
             num_elec: [0.0;3],
             num_state: 0,
@@ -284,7 +282,6 @@ impl Molecule {
         mol.dfadef = dfadef;
         mol.xc_data = xc_data;
 
-        mol.use_eri = mol.dfadef.use_eri();
         
 
         mol.start_mo = mol.generate_start_mo(mol.ecp_electrons);
