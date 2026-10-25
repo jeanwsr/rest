@@ -557,6 +557,23 @@ pub fn sorted_runs(indices: &[usize]) -> Vec<Range<usize>> {
 /// vector is the packed upper triangle of J over the **full** pair space of `map` (length
 /// `map.num_baspar_full()`): dropped rows contribute zeros, so the caller keeps the unmodified
 /// `basbas2baspar` to assemble the Fock matrix. A threshold of `0.0` keeps every stored row.
+#[cfg(target_os = "linux")]
+fn advise_huge_pages_scratch(buf: &mut [f64]) {
+    // MADV_HUGEPAGE on the 2 MiB-aligned interior of the buffer; the kernel ignores
+    // unaligned head/tail. Best-effort: the call only helps when THP is in madvise mode.
+    extern "C" { fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32; }
+    const MADV_HUGEPAGE: i32 = 14;
+    unsafe {
+        let a = buf.as_mut_ptr() as usize;
+        let len = buf.len() * std::mem::size_of::<f64>();
+        let start = (a + (1 << 21) - 1) & !((1 << 21) - 1);
+        let end = (a + len) & !((1 << 21) - 1);
+        if end > start {
+            madvise(start as *mut u8, end - start, MADV_HUGEPAGE);
+        }
+    }
+}
+
 pub mod k_stat {
     use std::sync::atomic::{AtomicU64, Ordering};
     pub static DENSIFY_NS: AtomicU64 = AtomicU64::new(0);
@@ -773,8 +790,8 @@ pub fn get_vk_pair_screened(
             // these scratch buffers are fully rewritten every auxiliary column; on a
             // madvise-THP system without this hint each column re-faults on 4 KB pages.
             // Measured without it: the per-column fill slowed 4.3x between adjacent builds.
-            crate::dft::advise_huge_pages(&mut sub.data);
-            crate::dft::advise_huge_pages(&mut accum.data);
+            advise_huge_pages_scratch(&mut sub.data);
+            advise_huge_pages_scratch(&mut accum.data);
             for p_aux in columns.clone() {
                 let column = &data[p_aux * num_stored..(p_aux + 1) * num_stored];
                 // one ascending pass: zeros at the dropped pairs, values at the retained ones
