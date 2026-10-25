@@ -244,7 +244,7 @@ pub fn a_matvec(
     // Response HF-exchange coefficients from the DFA
     // (RSH -> (c_LR, c_SR - c_LR); hybrid -> (c_x, 0)); the coefficients are
     // spin-independent, derived once here and applied per sector.
-    let (coeff_full, coeff_sr) = match scf.mol.dfadef.dfa_rsh_scf_lrsr {
+    let (coeff_full, coeff_sr) = match scf.mol.dfadef.rsh_params_scf() {
         Some((_, c_lr, c_sr)) => (c_lr, c_sr - c_lr),
         None => (scf.mol.dfadef.dfa_hybrid_scf, 0.0),
     };
@@ -371,7 +371,7 @@ pub fn b_matvec(
     debug_assert_eq!(z.len(), dim_total);
 
     // Response HF-exchange coefficients from the DFA (see a_matvec).
-    let (coeff_full, coeff_sr) = match scf.mol.dfadef.dfa_rsh_scf_lrsr {
+    let (coeff_full, coeff_sr) = match scf.mol.dfadef.rsh_params_scf() {
         Some((_, c_lr, c_sr)) => (c_lr, c_sr - c_lr),
         None => (scf.mol.dfadef.dfa_hybrid_scf, 0.0),
     };

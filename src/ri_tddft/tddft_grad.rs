@@ -171,7 +171,7 @@ impl<'a> TddftGradEngine<'a> {
         let raw = build_raw_ri_tensors(scf);
         // dfa_hybrid_scf is 1.0 for an HF reference (set by DFA4REST::parse_scf).
         let hyb = scf.mol.dfadef.dfa_hybrid_scf;
-        let hyb_sr = match scf.mol.dfadef.dfa_rsh_scf_lrsr {
+        let hyb_sr = match scf.mol.dfadef.rsh_params_scf() {
             Some((_omega, _c_lr, c_sr)) => {
                 panic!(
                     "TDDFT gradient: range-separated hybrids are not yet supported \

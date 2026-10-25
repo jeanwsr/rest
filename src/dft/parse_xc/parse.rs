@@ -915,6 +915,13 @@ impl DFAdef {
         self.dfa_rsh_scf.0.map(|_| self.dfa_rsh_scf.1)
     }
 
+    /// The RSH parameters `(omega, c_LR, c_SR)` of the SCF functional, in the consumer
+    /// convention (computed once at parse time and stored in `dfa_rsh_scf_lrsr`);
+    /// `None` when the SCF functional is not range-separated.
+    pub fn rsh_params_scf(&self) -> Option<(f64, f64, f64)> {
+        self.dfa_rsh_scf_lrsr
+    }
+
     /// `true` when any SCF libxc component needs the density gradient
     /// (non-LDA family); mirrors `DFA4REST::use_density_gradient` over the
     /// SCF components.
