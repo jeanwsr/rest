@@ -557,6 +557,17 @@ pub fn sorted_runs(indices: &[usize]) -> Vec<Range<usize>> {
 /// vector is the packed upper triangle of J over the **full** pair space of `map` (length
 /// `map.num_baspar_full()`): dropped rows contribute zeros, so the caller keeps the unmodified
 /// `basbas2baspar` to assemble the Fock matrix. A threshold of `0.0` keeps every stored row.
+pub mod k_stat {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static DENSIFY_NS: AtomicU64 = AtomicU64::new(0);
+    pub static BLAS_NS: AtomicU64 = AtomicU64::new(0);
+    pub fn take() -> (f64, f64) {
+        let d = DENSIFY_NS.swap(0, Ordering::Relaxed) as f64 / 1e9;
+        let b = BLAS_NS.swap(0, Ordering::Relaxed) as f64 / 1e9;
+        (d, b)
+    }
+}
+
 pub fn get_vj_pair_screened(
     ri3fn: &MatrixFull<f64>,
     map: &PairMap,
@@ -763,6 +774,7 @@ pub fn get_vk_pair_screened(
                 let column = &data[p_aux * num_stored..(p_aux + 1) * num_stored];
                 // one ascending pass: zeros at the dropped pairs, values at the retained ones
                 {
+                    let t_f = std::time::Instant::now();
                     let sub_data = &mut sub.data[..];
                     let mut prev = 0usize;
                     for k in 0..write_offsets.len() {
@@ -776,15 +788,21 @@ pub fn get_vk_pair_screened(
                     if prev < sub_len {
                         sub_data[prev..sub_len].fill(0.0);
                     }
+                    k_stat::DENSIFY_NS.fetch_add(t_f.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 // T = R_P C on the active subset, then K += T T^t
+                let t_b = std::time::Instant::now();
                 _dsymm(&sub, &coeff_active, &mut tmp, 'L', 'U', 1.0, 0.0);
                 _dsyrk(&tmp, &mut accum, 'U', 'N', 1.0, 1.0);
+                k_stat::BLAS_NS.fetch_add(t_b.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             accum
         })
         .collect();
 
+    let (d_s, b_s) = k_stat::take();
+    println!("[k-stat] screened K: nw={} n_active={} retained={} of {} wall_total(next line) densify={:.2}s blas={:.2}s (thread-s)",
+        nw, num_active, retained.len(), num_stored, d_s, b_s);
     // scatter the active block into the full symmetric matrix and pack it
     let mut k_full = MatrixFull::new([nao, nao], 0.0_f64);
     for accum in &partial {
