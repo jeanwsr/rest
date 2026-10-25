@@ -911,10 +911,6 @@ impl DFAdef {
         self.dfa_rsh_scf.0
     }
 
-    pub fn rsh_alpha(&self) -> Option<f64> {
-        self.dfa_rsh_scf.0.map(|_| self.dfa_rsh_scf.1)
-    }
-
     /// The RSH parameters `(omega, c_LR, c_SR)` of the SCF functional, in the consumer
     /// convention (computed once at parse time and stored in `dfa_rsh_scf_lrsr`);
     /// `None` when the SCF functional is not range-separated.

@@ -35,18 +35,19 @@ use crate::SCF;
 /// the correction object, following the same decomposition as the SCF Fock assembly:
 /// `K = alpha * K_full + factor_k_sr * K_erfc` with `factor_k_sr = hyb - alpha`.
 pub fn scf_jk_factors(scf_data: &SCF) -> (f64, f64, Option<(f64, f64)>) {
-    let is_hf = !scf_data.mol.dfadef.is_dfa_scf();
-    let factor_j = 1.0;
-    let factor_k = match is_hf {
-        true => 1.0,
-        false => scf_data.mol.dfadef.rsh_alpha().unwrap_or(scf_data.mol.dfadef.dfa_hybrid_scf),
-    };
-    let rsh = scf_data.mol.dfadef.omega().map(|omega| {
-        let alpha = scf_data.mol.dfadef.rsh_alpha().unwrap();
-        let hyb = scf_data.mol.dfadef.dfa_hybrid_scf;
-        (omega, hyb - alpha)
-    });
-    (factor_j, factor_k, rsh)
+    match scf_data.mol.dfadef.rsh_params_scf() {
+        // rsh case: full-range K scaled by c_LR, the erfc part by c_SR - c_LR (the raw beta)
+        Some((omega, alpha, c_sr)) => (1.0, alpha, Some((omega, c_sr - alpha))),
+        None => (
+            1.0,
+            if !scf_data.mol.dfadef.is_dfa_scf() {
+                1.0
+            } else {
+                scf_data.mol.dfadef.dfa_hybrid_scf
+            },
+            None,
+        ),
+    }
 }
 
 /// List of `(scale, functional)` pairs of the SCF XC functional, in the given libxc spin
