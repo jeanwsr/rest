@@ -733,6 +733,26 @@ pub fn get_vk_pair_screened(
         retained.iter().map(|&(p, mu, nu)| (p, active_of[mu], active_of[nu])).collect();
 
     let chunks = crate::utilities::balancing(num_auxbas, rayon::current_num_threads());
+
+    // ---- sequential densification plan -------------------------------------------
+    // `retained_active` ascends in the packed upper-triangle index, which is also the
+    // ascending order of the column-major dense offsets `lo + hi * num_active`. Instead of
+    // scattering only the retained entries and zeroing them again after each dsymm (two
+    // un-prefetchable store streams into a matrix that exceeds LLC from nao ~ 2000 on;
+    // measured 8x slower than the unpruned streaming kernel on a 2392-bfs system), every
+    // auxiliary column is now written in ONE ascending pass: `fill(0.0)` over the gaps
+    // between retained offsets plus a direct store at each retained offset. The resulting
+    // matrix is bit-identical to the old one (same values, same positions, zeros elsewhere).
+    let write_offsets: Vec<usize> = retained_active
+        .iter()
+        .map(|&(_, ia, ja)| {
+            let (lo, hi) = if ia <= ja { (ia, ja) } else { (ja, ia) };
+            lo + hi * num_active
+        })
+        .collect();
+    let read_rows: Vec<usize> = retained_active.iter().map(|&(p, _, _)| p).collect();
+    let sub_len = num_active * num_active;
+
     let partial: Vec<MatrixFull<f64>> = chunks
         .par_iter()
         .map(|columns| {
@@ -741,18 +761,25 @@ pub fn get_vk_pair_screened(
             let mut accum = MatrixFull::new([num_active, num_active], 0.0_f64);
             for p_aux in columns.clone() {
                 let column = &data[p_aux * num_stored..(p_aux + 1) * num_stored];
-                // upper triangle of the retained rows only, dsymm reads the upper triangle
-                for &(p, ia, ja) in &retained_active {
-                    let (lo, hi) = if ia <= ja { (ia, ja) } else { (ja, ia) };
-                    sub[[lo, hi]] = column[p];
+                // one ascending pass: zeros at the dropped pairs, values at the retained ones
+                {
+                    let sub_data = &mut sub.data[..];
+                    let mut prev = 0usize;
+                    for k in 0..write_offsets.len() {
+                        let off = write_offsets[k];
+                        if off > prev {
+                            sub_data[prev..off].fill(0.0);
+                        }
+                        sub_data[off] = column[read_rows[k]];
+                        prev = off + 1;
+                    }
+                    if prev < sub_len {
+                        sub_data[prev..sub_len].fill(0.0);
+                    }
                 }
                 // T = R_P C on the active subset, then K += T T^t
                 _dsymm(&sub, &coeff_active, &mut tmp, 'L', 'U', 1.0, 0.0);
                 _dsyrk(&tmp, &mut accum, 'U', 'N', 1.0, 1.0);
-                for &(_, ia, ja) in &retained_active {
-                    let (lo, hi) = if ia <= ja { (ia, ja) } else { (ja, ia) };
-                    sub[[lo, hi]] = 0.0;
-                }
             }
             accum
         })
