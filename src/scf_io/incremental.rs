@@ -11,7 +11,7 @@ use super::SCF;
 struct Cache {
     dm: Vec<MatrixFull<f64>>,
     vj: Vec<MatrixFull<f64>>,
-    vk: Vec<MatrixUpper>,
+    vk: Vec<MatrixUpper<f64>>,
 }
 
 fn cache() -> &'static Mutex<Option<Cache>> {
@@ -52,7 +52,7 @@ pub fn cached_vj(scf: &SCF, mpi_operator: &Option<MPIOperator>) -> Vec<MatrixFul
     vj
 }
 
-pub fn cached_vk(scf: &SCF, scaling_factor: f64, mpi_operator: &Option<MPIOperator>) -> Vec<MatrixUpper> {
+pub fn cached_vk(scf: &SCF, scaling_factor: f64, mpi_operator: &Option<MPIOperator>) -> Vec<MatrixUpper<f64>> {
     let mut g = cache().lock().unwrap();
     if let Some(c) = g.as_ref() {
         if !c.vk.is_empty() && dm_matches(scf, c) {
