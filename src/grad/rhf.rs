@@ -131,9 +131,8 @@ pub fn build_ri_jk_grad_flags(scf_data: &SCF) -> RIHFGradientFlags {
     };
     flags.factor_k(factor_k);
 
-    // set rsh factor
-    let (omega, alpha, _beta) = scf_data.mol.dfadef.get_rsh_scf_lrsr(scf_data.mol.spin_channel);
-    if let Some(omega) = omega {
+    // set rsh factor: read the stored RSH field of the definition
+    if let Some((omega, alpha, _c_sr)) = scf_data.mol.dfadef.dfa_rsh_scf_lrsr {
         flags.omega(Some(omega));
         flags.factor_alpha(Some(alpha));
     }
