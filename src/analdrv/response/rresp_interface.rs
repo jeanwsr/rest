@@ -27,7 +27,6 @@ use crate::ri_jk::resp_r::RRespRIJK;
 use crate::ri_jk::util::get_cint_mol;
 use crate::SCF;
 
-use libxc::prelude::*;
 
 /// J/K factors of the RI-JK electronic-interaction contributions of the (restricted) SCF.
 ///
@@ -52,16 +51,6 @@ pub fn scf_jk_factors(scf_data: &SCF) -> (f64, f64, Option<(f64, f64)>) {
 
 /// List of `(scale, functional)` pairs of the SCF XC functional, in the given libxc spin
 /// treatment.
-pub fn scf_xc_func_list_with_spin(scf_data: &SCF, spin: LibXCSpin) -> Vec<(f64, LibXCFunctional)> {
-    let spin_channel = match spin { LibXCSpin::Unpolarized => 1, _ => 2 };
-    scf_data.mol.dfadef.scf_func_list(spin_channel)
-}
-
-/// List of `(scale, functional)` pairs of the SCF XC functional (spin-unpolarized).
-pub fn scf_xc_func_list(scf_data: &SCF) -> Vec<(f64, LibXCFunctional)> {
-    scf_xc_func_list_with_spin(scf_data, LibXCSpin::Unpolarized)
-}
-
 /// The response (fock/response) objects of all electron-interaction contributions of a restricted
 /// SCF, as an owned list of `RRespAPI` trait objects.
 ///
@@ -389,7 +378,7 @@ pub fn rscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> RRe
 
     let is_hf = !scf_data.mol.dfadef.is_dfa_scf();
     if !is_hf {
-        let xc_func_list = scf_xc_func_list(scf_data);
+        let xc_func_list = scf_data.mol.dfadef.scf_func_list(1);
         let verbose = scf_data.mol.ctrl.print_level > 2;
 
         let (ni, ni_resp) = resp_grids(scf_data, config);

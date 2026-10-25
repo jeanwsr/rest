@@ -43,7 +43,7 @@
 //! Fréchet derivative of `J^{-1/2}`, which folds the weight matrices once so that the raw
 //! metric-derivative integrals contract against them directly.
 
-use crate::analdrv::response::rresp_interface::{rscf_resp_interface, scf_xc_func_list, RRespSCF};
+use crate::analdrv::response::rresp_interface::{rscf_resp_interface, RRespSCF};
 use crate::analdrv::response::rgfock_interface::{dh_jk_factors, solve_z_vector};
 use crate::analdrv::response::trait_rgfock::{GFockFlags, RGFockAPI};
 use crate::analdrv::response::trait_rresp::RRespAPI;
@@ -641,7 +641,7 @@ impl<'a> RDHGradient<'a> {
                 // the explicit AO-derivative of the SCF functional's XC potential (forge
                 // `hessian.rks._get_vxc_deriv1`), contracted with the relaxed density on the fly;
                 // the grid-shift terms are absent, following the forge reference
-                de_resp = de_xc_response_term(&mol, &scf_xc_func_list(scf_data), &mut ni, dm0.view(), d_r_ao.view());
+                de_resp = de_xc_response_term(&mol, &scf_data.mol.dfadef.scf_func_list(1), &mut ni, dm0.view(), d_r_ao.view());
             }
             if has_final_functional {
                 let fock_n = fock_n.as_ref().unwrap();

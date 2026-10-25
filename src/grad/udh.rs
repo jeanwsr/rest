@@ -34,7 +34,7 @@
 use crate::analdrv::response::rgfock_interface::dh_jk_factors;
 use crate::analdrv::response::trait_uresp::URespAPI;
 use crate::analdrv::response::uresp_interface::{
-    scf_xc_func_list_uks, uscf_resp_interface, URespSCF,
+    uscf_resp_interface, URespSCF,
 };
 use crate::dft::num_int::XCData;
 use crate::dft::numint_matmul::nimatmul::{regroup_grids_by_atom, NIMatmul};
@@ -875,7 +875,7 @@ impl<'a> UDHGradient<'a> {
                 // the explicit AO-derivative of the SCF functional's XC potential (forge
                 // `hessian.uks._get_vxc_deriv1`), contracted with the relaxed density on the fly;
                 // the grid-shift terms are absent, following the forge reference
-                de_resp = de_xc_response_term(&mol, &scf_xc_func_list_uks(scf_data), &mut ni, &dm0, &d_r_ao);
+                de_resp = de_xc_response_term(&mol, &scf_data.mol.dfadef.scf_func_list(2), &mut ni, &dm0, &d_r_ao);
             }
             if has_final_functional {
                 let fock_n = fock_n.as_ref().unwrap();

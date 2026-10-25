@@ -1,6 +1,6 @@
 use crate::analdrv::prelude::*;
 use super::print_hessian_and_timing;
-use crate::analdrv::response::rresp_interface::{scf_jk_factors, scf_xc_func_list};
+use crate::analdrv::response::rresp_interface::scf_jk_factors;
 use crate::analdrv::vibration::vib::*;
 use crate::analdrv::vibration::vib_interface::*;
 use crate::dft::gen_grids::RadiiAdjust;
@@ -118,7 +118,7 @@ pub fn rscf_hess_interface<'a>(
 
         let verbose = scf_data.mol.ctrl.print_level > 2;
         let grid_shift = cfg.grid_shift_deriv;
-        RHessKSNIMatmul::new(&mol, scf_xc_func_list(scf_data), ni, grid_shift, verbose)
+        RHessKSNIMatmul::new(&mol, scf_data.mol.dfadef.scf_func_list(1), ni, grid_shift, verbose)
     });
     if let Some(ref mut hess_nimatmul_obj) = hess_nimatmul_obj {
         hess_el_list.push(hess_nimatmul_obj);
@@ -172,7 +172,7 @@ pub(crate) fn scf_skeleton_nimatmul<'a>(scf_data: &'a SCF, cfg: &AnalDrvNucgradC
     }
     let mol = get_cint_mol(&scf_data.mol);
 
-    let xc_func_list = scf_xc_func_list(scf_data);
+    let xc_func_list = scf_data.mol.dfadef.scf_func_list(1);
     let xc_type = determine_den_type_from_list(&xc_func_list.iter().map(|(_, f)| f).collect_vec());
     let is_mgga = matches!(xc_type, XCDenType::TAU);
     let grid_gen_level = scf_data.mol.ctrl.grid_gen_level;
