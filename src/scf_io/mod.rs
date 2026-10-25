@@ -41,6 +41,7 @@ use crate::initial_guess::sad::initial_guess_from_sad;
 use crate::dftd::energy::dftd;
 use crate::constants::{SQRT_THRESHOLD};
 use crate::solvent::{PcmObject, PcmScf, solvent_prepare, debug_print_pcm};
+pub mod incremental;
 use crate::x2c::RelativisticMethod;
 use crate::ri_jk;
 use tensors::matrix_blas_lapack::{omp_get_num_threads_wrapper,omp_set_num_threads_wrapper};
@@ -2096,7 +2097,7 @@ impl SCF {
             self.generate_vj_ri_direct(None)
         } else {
             match self.algorithm_jk {
-                AlgorithmJK::RIIncore | AlgorithmJK::Separated(AlgorithmJ::RIIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
+                AlgorithmJK::RIIncore | AlgorithmJK::Separated(AlgorithmJ::RIIncore, _) => if self.mol.ctrl.incremental_fock { incremental::cached_vj(self, mpi_operator) } else { self.generate_vj_with_ri_v_sync(1.0, mpi_operator) },
                 AlgorithmJK::RIDirect | AlgorithmJK::Separated(AlgorithmJ::RIDirect, _) => self.generate_vj_ri_direct(None),
                 AlgorithmJK::Separated(AlgorithmJ::RISchwartz, _) => self.generate_vj_ri_schwartz(),
                 _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
@@ -2116,7 +2117,7 @@ impl SCF {
             self.generate_vk_with_isdf_new(scaling_factor)
         } else {
             match self.algorithm_jk {
-                AlgorithmJK::RIIncore | AlgorithmJK::Separated(_, AlgorithmK::RIIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
+                AlgorithmJK::RIIncore | AlgorithmJK::Separated(_, AlgorithmK::RIIncore) => if self.mol.ctrl.incremental_fock { incremental::cached_vk(self, scaling_factor, mpi_operator) } else { self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator) },
                 AlgorithmJK::RIDirect | AlgorithmJK::Separated(_, AlgorithmK::RIDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None, None),
                 _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
             }
@@ -2305,7 +2306,7 @@ impl SCF {
             self.generate_vj_ri_direct(None)
         } else {
             match self.algorithm_jk {
-            AlgorithmJK::RIIncore | AlgorithmJK::Separated(AlgorithmJ::RIIncore, _) => self.generate_vj_with_ri_v_sync(1.0, mpi_operator),
+            AlgorithmJK::RIIncore | AlgorithmJK::Separated(AlgorithmJ::RIIncore, _) => if self.mol.ctrl.incremental_fock { incremental::cached_vj(self, mpi_operator) } else { self.generate_vj_with_ri_v_sync(1.0, mpi_operator) },
             AlgorithmJK::RIDirect | AlgorithmJK::Separated(AlgorithmJ::RIDirect, _) => self.generate_vj_ri_direct(None),
             AlgorithmJK::Separated(AlgorithmJ::RISchwartz, _) => self.generate_vj_ri_schwartz(),
             _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
@@ -2403,7 +2404,7 @@ impl SCF {
                     self.generate_vk_with_isdf_new(scaling_factor)
                 } else {
                     match self.algorithm_jk {
-                    AlgorithmJK::RIIncore | AlgorithmJK::Separated(_, AlgorithmK::RIIncore) => self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator),
+                    AlgorithmJK::RIIncore | AlgorithmJK::Separated(_, AlgorithmK::RIIncore) => if self.mol.ctrl.incremental_fock { incremental::cached_vk(self, scaling_factor, mpi_operator) } else { self.generate_vk_with_ri_v(scaling_factor, use_dm_only, mpi_operator) },
                     AlgorithmJK::RIDirect | AlgorithmJK::Separated(_, AlgorithmK::RIDirect) => self.generate_vk_ri_direct(scaling_factor, use_dm_only, None, None),
                     _ => unreachable!("Other cases of algorithm_jk ({:?}) should have been ruled out. If this happens, it is a bug.", self.algorithm_jk),
                     }
