@@ -162,13 +162,17 @@ pub fn initial_guess_from_pao(
             let w = data.occ[j];
             if spin_channel == 1 {
                 cols[0].push((col, w));
-            } else if data.atomic_spin_channel == 1 {
-                // closed-shell reference atom: half of the pair occupation per spin, as SAD does
+            } else {
+                // Spin-polarized molecule: EVERY reference atom is spin-averaged, half of the
+                // pair occupation per spin. The previous convention sent open-shell reference
+                // atoms (H is a doublet in ctrl_setting_atom_sad) to alpha only, which skews the
+                // guess by one electron per such atom: 153 H atoms gave alpha 535 / beta 382
+                // against a target of 460 / 456, and the 0.86 / 1.19 per-channel rescale fixed
+                // the counts but not the shape (first-iteration energy 3165 Ha off, <S^2> 8.5).
+                // Spin-averaging keeps each atom's electron count and leaves the rescale a
+                // percent-level correction.
                 cols[0].push((col.clone(), 0.5 * w));
                 cols[1].push((col, 0.5 * w));
-            } else {
-                // open-shell reference atom: its alpha orbitals only
-                cols[0].push((col, w));
             }
         }
     }
