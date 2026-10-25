@@ -5323,6 +5323,7 @@ pub fn vk_upper_with_ri_v_sync(
             let eigv_s = &eigv[i_spin];
             let nw = occupied_orbital_count(&occupation[i_spin]);
             if nw>0 {
+                println!("[k-stat] unscreened K: spin={} nw={} num_basis={} num_auxbas={}", i_spin, nw, num_basis, num_auxbas);
                 let mut tmp_mat = MatrixFull::new([num_basis,nw],0.0_f64);
                 tmp_mat.data.iter_mut().zip(eigv_s.iter_submatrix(0..num_basis,0..nw))
                     .for_each(|value| {*value.0 = *value.1});
