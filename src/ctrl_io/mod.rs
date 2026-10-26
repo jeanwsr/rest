@@ -442,6 +442,10 @@ pub struct InputKeywords {
     /// regions of each process.
     #[pyo3(get, set)]
     pub num_threads: Option<usize>,
+    /// δD 增量 Fock（v1：J/K 缓存跳过）。`true` 时 J 与 K 在密度变化小于
+    /// `scf_acc_rho` 的迭代里重用上一次结果（二者对密度线性，误差与收敛精度同级）。
+    #[pyo3(get, set)]
+    pub incremental_fock: bool,
     // batch size for each thread
     pub batch_size: usize,
     pub nforce_displacement: f64,
@@ -531,6 +535,7 @@ impl InputKeywords {
             // keywords for machine and debug info
             print_level: 0,
             num_threads: Some(1),
+            incremental_fock: false,
             batch_size: 64,
             job_type: JobType::SinglePoint,
             nforce_displacement: 0.0013,
@@ -987,6 +992,11 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::String(tmp_str) => {Some(tmp_str.to_lowercase().parse().unwrap_or(1))},
                 serde_json::Value::Number(tmp_num) => {Some(tmp_num.as_i64().unwrap_or(1) as usize)},
                 other => {Some(1)},
+            };
+            tmp_input.incremental_fock = match tmp_ctrl.get("incremental_fock").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(bl) => *bl,
+                serde_json::Value::String(s0) => s0.to_lowercase().parse().unwrap_or(false),
+                _ => false,
             };
             tmp_input.batch_size = match tmp_ctrl.get("batch_size").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(64)},
