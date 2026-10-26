@@ -67,11 +67,10 @@ pub fn cached_vj(scf: &mut SCF, mpi_operator: &Option<MPIOperator>) -> Vec<Matri
     let vj = scf.generate_vj_with_ri_v_sync(1.0, mpi_operator);
     match g.as_mut() {
         Some(c) => {
+            // this build used the current density, so the cache's reference density must be it
             c.reuse_now = false;
             c.stale = 0;
-            if c.vk.is_empty() || !dm_delta(scf, c).map_or(false, |d| d < 1.0) {
-                c.dm = scf.density_matrix.clone();
-            }
+            c.dm = scf.density_matrix.clone();
             c.vj = vj.clone();
         }
         None => *g = Some(Cache { dm: scf.density_matrix.clone(), vj: vj.clone(), vk: Vec::new(), stale: 0, reuse_now: false }),
@@ -91,7 +90,7 @@ pub fn cached_vk(scf: &mut SCF, scaling_factor: f64, mpi_operator: &Option<MPIOp
     }
     let vk = scf.generate_vk_with_ri_v(scaling_factor, scf.mol.ctrl.use_dm_only, mpi_operator);
     match g.as_mut() {
-        Some(c) => { c.reuse_now = false; c.vk = vk.clone(); }
+        Some(c) => { c.reuse_now = false; c.dm = scf.density_matrix.clone(); c.vk = vk.clone(); }
         None => *g = Some(Cache { dm: scf.density_matrix.clone(), vj: Vec::new(), vk: vk.clone(), stale: 0, reuse_now: false }),
     }
     vk
