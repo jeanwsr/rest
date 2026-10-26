@@ -21,7 +21,7 @@ struct Cache {
 /// reuse threshold as a multiple of `scf_acc_rho`: the Fock may lag the density by a
 /// controlled amount mid-SCF (the direct-SCF "fock drift" trade), and the periodic
 /// rebuild keeps the convergence criteria clean at the end
-const REUSE_TOL_FACTOR: f64 = 100.0;
+const REUSE_TOL_FACTOR: f64 = 10.0;
 const MAX_STALE: u32 = 4;
 
 fn cache() -> &'static Mutex<Option<Cache>> {
