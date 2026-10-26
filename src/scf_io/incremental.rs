@@ -10,7 +10,7 @@ use super::SCF;
 
 struct Cache {
     dm: Vec<MatrixFull<f64>>,
-    vj: Vec<MatrixFull<f64>>,
+    vj: Vec<MatrixUpper<f64>>,
     vk: Vec<MatrixUpper<f64>>,
 }
 
@@ -36,7 +36,7 @@ fn dm_matches(scf: &SCF, c: &Cache) -> bool {
     delta_max(&scf.density_matrix, &c.dm).map_or(false, |d| d < scf.mol.ctrl.scf_acc_rho)
 }
 
-pub fn cached_vj(scf: &SCF, mpi_operator: &Option<MPIOperator>) -> Vec<MatrixFull<f64>> {
+pub fn cached_vj(scf: &SCF, mpi_operator: &Option<MPIOperator>) -> Vec<MatrixUpper<f64>> {
     let mut g = cache().lock().unwrap();
     if let Some(c) = g.as_ref() {
         if !c.vj.is_empty() && dm_matches(scf, c) {
