@@ -36,7 +36,7 @@ fn dm_matches(scf: &SCF, c: &Cache) -> bool {
     delta_max(&scf.density_matrix, &c.dm).map_or(false, |d| d < scf.mol.ctrl.scf_acc_rho)
 }
 
-pub fn cached_vj(scf: &SCF, mpi_operator: &Option<MPIOperator>) -> Vec<MatrixUpper<f64>> {
+pub fn cached_vj(scf: &mut SCF, mpi_operator: &Option<MPIOperator>) -> Vec<MatrixUpper<f64>> {
     let mut g = cache().lock().unwrap();
     if let Some(c) = g.as_ref() {
         if !c.vj.is_empty() && dm_matches(scf, c) {
@@ -52,7 +52,7 @@ pub fn cached_vj(scf: &SCF, mpi_operator: &Option<MPIOperator>) -> Vec<MatrixUpp
     vj
 }
 
-pub fn cached_vk(scf: &SCF, scaling_factor: f64, mpi_operator: &Option<MPIOperator>) -> Vec<MatrixUpper<f64>> {
+pub fn cached_vk(scf: &mut SCF, scaling_factor: f64, mpi_operator: &Option<MPIOperator>) -> Vec<MatrixUpper<f64>> {
     let mut g = cache().lock().unwrap();
     if let Some(c) = g.as_ref() {
         if !c.vk.is_empty() && dm_matches(scf, c) {
