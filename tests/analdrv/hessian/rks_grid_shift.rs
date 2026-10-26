@@ -7,6 +7,7 @@
 //!   derivatives) over the atom indices must vanish — the grid-shift terms are constructed to
 //!   restore exactly this invariance.
 
+use pyrest::analdrv::hessian::rscf_interface::scf_proton_charges;
 use pyrest::analdrv::config::{AnalDrvConfig, AnalDrvNucgradCfg};
 use pyrest::analdrv::hessian::rscf_interface::rscf_hess_interface;
 use pyrest::analdrv::response::rresp_interface::rscf_resp_interface;
@@ -82,14 +83,7 @@ fn run_hessian(scf_data: &scf_io::SCF, config: &AnalDrvConfig) -> Tensor<f64, De
 }
 
 fn xc_func_list(scf_data: &scf_io::SCF) -> Vec<(f64, LibXCFunctional)> {
-    scf_data
-        .mol
-        .xc_data
-        .dfa_compnt_scf
-        .iter()
-        .zip(scf_data.mol.xc_data.dfa_paramr_scf.iter())
-        .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Unpolarized)))
-        .collect()
+    scf_data.mol.dfadef.scf_func_list(1)
 }
 
 #[test]
@@ -156,9 +150,10 @@ fn test_skeleton_invariance() {
         );
         let ni = NIMatmul::new(&cint_mol, &coordinates, &weights, &atm_idx, &quadrature_weights);
 
-        let xc_func_list = xc_func_list(&scf_data);
+        let proton_charges = scf_proton_charges(&scf_data);
+        let xc_func_list = scf_data.mol.dfadef.scf_func_list(1);
 
-        let mut hess_obj = RHessKSNIMatmul::new(&cint_mol, xc_func_list, ni, true, false);
+        let mut hess_obj = RHessKSNIMatmul::new(&cint_mol, xc_func_list, ni, true, proton_charges, false);
         hess_obj.make_hessian_setup(mo_coeff.view(), mo_occ.view(), None);
 
         let de_sk = hess_obj.intmd["de_xc_skeleton"].view();

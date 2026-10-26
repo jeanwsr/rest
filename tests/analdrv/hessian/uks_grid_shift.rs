@@ -2,6 +2,7 @@
 //! sibling of `rks_grid_shift`: magnitude of the correction (B3LYP) and translational
 //! invariance of the assembled Hessian (B3LYP/TPSSh) and of the per-spin skeleton terms.
 
+use pyrest::analdrv::hessian::rscf_interface::scf_proton_charges;
 use pyrest::analdrv::config::{AnalDrvConfig, AnalDrvNucgradCfg};
 use pyrest::analdrv::hessian::uscf_interface::uscf_hess_interface;
 use pyrest::analdrv::response::uresp_interface::uscf_resp_interface;
@@ -77,14 +78,7 @@ fn run_hessian(scf_data: &mut scf_io::SCF, config: &AnalDrvConfig) -> Tensor<f64
 }
 
 fn xc_func_list(scf_data: &scf_io::SCF) -> Vec<(f64, LibXCFunctional)> {
-    scf_data
-        .mol
-        .xc_data
-        .dfa_compnt_scf
-        .iter()
-        .zip(scf_data.mol.xc_data.dfa_paramr_scf.iter())
-        .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Polarized)))
-        .collect()
+    scf_data.mol.dfadef.scf_func_list(2)
 }
 
 #[test]
@@ -153,9 +147,10 @@ fn test_skeleton_invariance() {
         );
         let ni = NIMatmul::new(&cint_mol, &coordinates, &weights, &atm_idx, &quadrature_weights);
 
-        let xc_func_list = xc_func_list(&scf_data);
+        let proton_charges = scf_proton_charges(&scf_data);
+        let xc_func_list = scf_data.mol.dfadef.scf_func_list(2);
 
-        let mut hess_obj = UHessKSNIMatmul::new(&cint_mol, xc_func_list, ni, true, false);
+        let mut hess_obj = UHessKSNIMatmul::new(&cint_mol, xc_func_list, ni, true, proton_charges, false);
         hess_obj.make_hessian_setup(
             &[mo_coeff[0].view(), mo_coeff[1].view()],
             &[mo_occ[0].view(), mo_occ[1].view()],

@@ -123,14 +123,7 @@ fn test_cpks_vxc_fxc_matches_dm0_path() {
     let mut ni =
         NIMatmul::new(&cint_mol, &grids.coordinates, &grids.weights, &grids.atm_idx, &grids.quadrature_weights);
 
-    let xc_func_list: Vec<(f64, LibXCFunctional)> = scf_data
-        .mol
-        .xc_data
-        .dfa_compnt_scf
-        .iter()
-        .zip(scf_data.mol.xc_data.dfa_paramr_scf.iter())
-        .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Unpolarized)))
-        .collect();
+    let xc_func_list: Vec<(f64, LibXCFunctional)> = scf_data.mol.dfadef.scf_func_list(1);
 
     // reference: dm0 -> ao_dm0 -> get_rho_exc_vxc_fxc
     let xc_type = determine_den_type_from_list(&xc_func_list.iter().map(|(_, f)| f).collect_vec());

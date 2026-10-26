@@ -8,10 +8,9 @@
 //!   duplicate of the high-precision one, every form agrees between `prec = true` and
 //!   `prec = false`.
 
-use pyrest::analdrv::response::rresp_interface::{scf_jk_factors, scf_xc_func_list};
+use pyrest::analdrv::response::rresp_interface::scf_jk_factors;
 use pyrest::analdrv::response::trait_rresp::RRespAPI;
 use pyrest::analdrv::response::trait_uresp::URespAPI;
-use pyrest::analdrv::response::uresp_interface::scf_xc_func_list_uks;
 use pyrest::ctrl_io;
 use pyrest::dft::numint_matmul::nimatmul::NIMatmul;
 use pyrest::dft::numint_matmul::resp_rks::RRespKSNIMatmul;
@@ -113,7 +112,7 @@ fn test_oh_uks_response_rdm_consistency() {
     let grids = scf_data.grids.as_ref().unwrap();
     let mol_cint = get_cint_mol(&scf_data.mol);
     let ni = NIMatmul::new(&mol_cint, &grids.coordinates, &grids.weights, &grids.atm_idx, &grids.quadrature_weights);
-    let mut uks = URespKSNIMatmul::new(scf_xc_func_list_uks(&scf_data), ni, false);
+    let mut uks = URespKSNIMatmul::new(scf_data.mol.dfadef.scf_func_list(2), ni, false);
     uks.make_response_preparation(&[mo_coeff[0].view(), mo_coeff[1].view()], &[mo_occ[0].view(), mo_occ[1].view()], true);
 
     let resp_bra = uks.get_response_bra(&[bra[0].view(), bra[1].view()], true);
@@ -152,8 +151,8 @@ fn test_closed_shell_limit() {
     let mol_cint = get_cint_mol(&scf_data.mol);
     let ni_r = NIMatmul::new(&mol_cint, &grids.coordinates, &grids.weights, &grids.atm_idx, &grids.quadrature_weights);
     let ni_u = NIMatmul::new(&mol_cint, &grids.coordinates, &grids.weights, &grids.atm_idx, &grids.quadrature_weights);
-    let mut rks = RRespKSNIMatmul::new(scf_xc_func_list(&scf_data), ni_r, false);
-    let mut uks = URespKSNIMatmul::new(scf_xc_func_list_uks(&scf_data), ni_u, false);
+    let mut rks = RRespKSNIMatmul::new(scf_data.mol.dfadef.scf_func_list(1), ni_r, false);
+    let mut uks = URespKSNIMatmul::new(scf_data.mol.dfadef.scf_func_list(2), ni_u, false);
     rks.make_response_preparation(mo_coeff.view(), mo_occ.view(), true);
     let occ_half = &mo_occ * 0.5_f64;
     uks.make_response_preparation(&[mo_coeff.view(), mo_coeff.view()], &[occ_half.view(), occ_half.view()], true);
@@ -213,7 +212,7 @@ fn test_precision_selection_plumbing() {
     let mol_cint = get_cint_mol(&scf_data.mol);
     let ni = NIMatmul::new(&mol_cint, &grids.coordinates, &grids.weights, &grids.atm_idx, &grids.quadrature_weights);
     let ni_resp = NIMatmul::new(&mol_cint, &grids.coordinates, &grids.weights, &grids.atm_idx, &grids.quadrature_weights);
-    let mut uks = URespKSNIMatmul::new(scf_xc_func_list_uks(&scf_data), ni, false).set_ni_resp(ni_resp);
+    let mut uks = URespKSNIMatmul::new(scf_data.mol.dfadef.scf_func_list(2), ni, false).set_ni_resp(ni_resp);
 
     uks.make_response_preparation(&[mo_coeff[0].view(), mo_coeff[1].view()], &[mo_occ[0].view(), mo_occ[1].view()], true);
     let bra_high = uks.get_response_bra(&[bra[0].view(), bra[1].view()], true);
