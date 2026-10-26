@@ -12,7 +12,17 @@ struct Cache {
     dm: Vec<MatrixFull<f64>>,
     vj: Vec<MatrixUpper<f64>>,
     vk: Vec<MatrixUpper<f64>>,
+    /// consecutive reuses since the last full rebuild
+    stale: u32,
+    /// the decision taken by this iteration's J call; K follows it so the two stay consistent
+    reuse_now: bool,
 }
+
+/// reuse threshold as a multiple of `scf_acc_rho`: the Fock may lag the density by a
+/// controlled amount mid-SCF (the direct-SCF "fock drift" trade), and the periodic
+/// rebuild keeps the convergence criteria clean at the end
+const REUSE_TOL_FACTOR: f64 = 100.0;
+const MAX_STALE: u32 = 4;
 
 fn cache() -> &'static Mutex<Option<Cache>> {
     static C: OnceLock<Mutex<Option<Cache>>> = OnceLock::new();
@@ -32,38 +42,57 @@ fn delta_max(cur: &[MatrixFull<f64>], prev: &[MatrixFull<f64>]) -> Option<f64> {
     Some(m)
 }
 
-fn dm_matches(scf: &SCF, c: &Cache) -> bool {
-    delta_max(&scf.density_matrix, &c.dm).map_or(false, |d| d < scf.mol.ctrl.scf_acc_rho)
+fn dm_delta(scf: &SCF, c: &Cache) -> Option<f64> {
+    delta_max(&scf.density_matrix, &c.dm)
 }
 
 pub fn cached_vj(scf: &mut SCF, mpi_operator: &Option<MPIOperator>) -> Vec<MatrixUpper<f64>> {
     let mut g = cache().lock().unwrap();
-    if let Some(c) = g.as_ref() {
-        if !c.vj.is_empty() && dm_matches(scf, c) {
-            println!("[incremental] J reused (max|ΔD| < {:.1e})", scf.mol.ctrl.scf_acc_rho);
+    let tol = REUSE_TOL_FACTOR * scf.mol.ctrl.scf_acc_rho;
+    if let Some(c) = g.as_mut() {
+        let hit = !c.vj.is_empty()
+            && c.stale < MAX_STALE
+            && dm_delta(scf, c).map_or(false, |d| d < tol);
+        if hit {
+            c.reuse_now = true;
+            c.stale += 1;
+            println!("[incremental] J reused (max|ΔD| = {:.2e} < {:.1e}, streak {})",
+                dm_delta(scf, c).unwrap_or(0.0), tol, c.stale);
             return c.vj.clone();
+        }
+        if c.stale >= MAX_STALE && !c.vj.is_empty() {
+            println!("[incremental] periodic full rebuild after {} reuses", c.stale);
         }
     }
     let vj = scf.generate_vj_with_ri_v_sync(1.0, mpi_operator);
     match g.as_mut() {
-        Some(c) if dm_matches(scf, c) => c.vj = vj.clone(),
-        _ => *g = Some(Cache { dm: scf.density_matrix.clone(), vj: vj.clone(), vk: Vec::new() }),
+        Some(c) => {
+            c.reuse_now = false;
+            c.stale = 0;
+            if c.vk.is_empty() || !dm_delta(scf, c).map_or(false, |d| d < 1.0) {
+                c.dm = scf.density_matrix.clone();
+            }
+            c.vj = vj.clone();
+        }
+        None => *g = Some(Cache { dm: scf.density_matrix.clone(), vj: vj.clone(), vk: Vec::new(), stale: 0, reuse_now: false }),
     }
     vj
 }
 
 pub fn cached_vk(scf: &mut SCF, scaling_factor: f64, mpi_operator: &Option<MPIOperator>) -> Vec<MatrixUpper<f64>> {
     let mut g = cache().lock().unwrap();
+    // follow the decision the J call of this iteration already took, so J and K never mix
+    // a stale and a fresh half within one Fock build
     if let Some(c) = g.as_ref() {
-        if !c.vk.is_empty() && dm_matches(scf, c) {
-            println!("[incremental] K reused (max|ΔD| < {:.1e})", scf.mol.ctrl.scf_acc_rho);
+        if c.reuse_now && !c.vk.is_empty() {
+            println!("[incremental] K reused");
             return c.vk.clone();
         }
     }
     let vk = scf.generate_vk_with_ri_v(scaling_factor, scf.mol.ctrl.use_dm_only, mpi_operator);
     match g.as_mut() {
-        Some(c) if dm_matches(scf, c) => c.vk = vk.clone(),
-        _ => *g = Some(Cache { dm: scf.density_matrix.clone(), vj: Vec::new(), vk: vk.clone() }),
+        Some(c) => { c.reuse_now = false; c.vk = vk.clone(); }
+        None => *g = Some(Cache { dm: scf.density_matrix.clone(), vj: Vec::new(), vk: vk.clone(), stale: 0, reuse_now: false }),
     }
     vk
 }
