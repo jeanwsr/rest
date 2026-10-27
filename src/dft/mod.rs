@@ -4876,6 +4876,34 @@ impl Grids {
                                 }
                                 contract_vxc_0_serial(&mut old_ao[0], &wao_old.to_matrixfullslice(),
                                     &loc_vsigma_s[pot_offset..pot_offset + n_batch], Some(4.0));
+                            } else {
+                                // open shell: vxc_ao[s] += 4*vsigma_uu[s] * (sum_x rhop_s,x * aop_x)
+                                //              + 2*vsigma_ud    * (sum_x rhop_other,x * aop_x)
+                                // (matches the reuse path above; the 2*vsigma_ud cross term was
+                                //  missing here before, which made the dbg diff on w30 read
+                                //  ~1.5e-4 relative while the energies agreed bitwise)
+                                for i_spin in 0..spin_channel {
+                                    let loc_vsigma_uu = vsigma.slice_column(2 * i_spin);
+                                    let loc_vsigma_ud = vsigma.slice_column(1);
+                                    let loc_rhop_a = loc_rhop.get_reducing_matrix(i_spin).unwrap();
+                                    let loc_rhop_b = loc_rhop.get_reducing_matrix(1 - i_spin).unwrap();
+                                    let mut wao_old = MatrixFull::new([n_active, n_batch], 0.0);
+                                    for x in 0usize..3usize {
+                                        let loc_aop_x = aop_batch[x].to_matrixfullslice_columns(g_local_start..g_local_end);
+                                        contract_vxc_0_serial(&mut wao_old, &loc_aop_x,
+                                            &loc_rhop_a.get_slice_x(x)[pot_offset..pot_offset + n_batch], None);
+                                    }
+                                    contract_vxc_0_serial(&mut old_ao[i_spin], &wao_old.to_matrixfullslice(),
+                                        &loc_vsigma_uu[pot_offset..pot_offset + n_batch], Some(4.0));
+                                    let mut wbo_old = MatrixFull::new([n_active, n_batch], 0.0);
+                                    for x in 0usize..3usize {
+                                        let loc_aop_x = aop_batch[x].to_matrixfullslice_columns(g_local_start..g_local_end);
+                                        contract_vxc_0_serial(&mut wbo_old, &loc_aop_x,
+                                            &loc_rhop_b.get_slice_x(x)[pot_offset..pot_offset + n_batch], None);
+                                    }
+                                    contract_vxc_0_serial(&mut old_ao[i_spin], &wbo_old.to_matrixfullslice(),
+                                        &loc_vsigma_ud[pot_offset..pot_offset + n_batch], Some(2.0));
+                                }
                             }
                         }
                     }
