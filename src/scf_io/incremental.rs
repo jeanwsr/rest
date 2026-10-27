@@ -20,8 +20,9 @@ struct Cache {
 
 /// reuse threshold as a multiple of `scf_acc_rho`: the Fock may lag the density by a
 /// controlled amount mid-SCF (the direct-SCF "fock drift" trade), and the periodic
-/// rebuild keeps the convergence criteria clean at the end
-const REUSE_TOL_FACTOR: f64 = 10.0;
+/// rebuild keeps the convergence criteria clean at the end. Tightened 10x -> 3x after
+/// w30 measured a 8.4e-5 Ha energy lag at 10x (target 1e-5).
+const REUSE_TOL_FACTOR: f64 = 3.0;
 const MAX_STALE: u32 = 4;
 
 fn cache() -> &'static Mutex<Option<Cache>> {
@@ -50,7 +51,12 @@ pub fn cached_vj(scf: &mut SCF, mpi_operator: &Option<MPIOperator>) -> Vec<Matri
     let mut g = cache().lock().unwrap();
     let tol = REUSE_TOL_FACTOR * scf.mol.ctrl.scf_acc_rho;
     if let Some(c) = g.as_mut() {
+        // Once the density itself has reached the convergence criterion
+        // (max|ΔD| < scf_acc_rho) the SCF is about to declare convergence: force a full
+        // rebuild so the final energy is computed from a fresh Fock, not a reused one.
+        let near_conv = dm_delta(scf, c).map_or(true, |d| d < scf.mol.ctrl.scf_acc_rho);
         let hit = !c.vj.is_empty()
+            && !near_conv
             && c.stale < MAX_STALE
             && dm_delta(scf, c).map_or(false, |d| d < tol);
         if hit {
@@ -60,7 +66,10 @@ pub fn cached_vj(scf: &mut SCF, mpi_operator: &Option<MPIOperator>) -> Vec<Matri
                 dm_delta(scf, c).unwrap_or(0.0), tol, c.stale);
             return c.vj.clone();
         }
-        if c.stale >= MAX_STALE && !c.vj.is_empty() {
+        if near_conv && !c.vj.is_empty() {
+            println!("[incremental] density at convergence level (max|ΔD| < {:.1e}): full rebuild for the final Fock",
+                scf.mol.ctrl.scf_acc_rho);
+        } else if c.stale >= MAX_STALE && !c.vj.is_empty() {
             println!("[incremental] periodic full rebuild after {} reuses", c.stale);
         }
     }
