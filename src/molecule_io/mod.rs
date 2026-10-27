@@ -257,13 +257,7 @@ impl Molecule {
                     }
                 }
             },
-            DFTType::NonStandard => {
-                panic!(
-                    "Error:: DFTType::NonStandard is removed. Please use xc_parser = 'parse_xc' \
-                     with the xc expression syntax instead, e.g. xc_parser = 'parse_xc' and \
-                     xc = '0.5*gga_x_pbe + 0.5*gga_c_pbe + hf*0.2'."
-                )
-            },
+            DFTType::NonStandard => unreachable!("NonStandard input is rejected at ctrl parsing"),
             DFTType::DeepLearning => {
                 let cur_xc_data = DFA4REST::new_deep_learning(ctrl.spin_channel, ctrl.print_level, &ctrl.xc_model);
                 let cur_dfadef = parse_xc::DFAdef::from_dfa4rest(&cur_xc_data);
