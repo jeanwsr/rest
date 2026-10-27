@@ -534,20 +534,13 @@ impl DFAComponent {
         }
     }
 
-    /// `(libxc functional code, scale factor)` of a Libxc component; `None` for the
-    /// non-libxc component types (HF/RSHF/PT2/RPA/SCSRPA/SBGE2/Disp/Unknown).
-    pub fn libxc_code_param(&self) -> Option<(usize, f64)> {
-        match self.component_type {
-            ComponentType::Libxc => Some((self.id, self.factor)),
-            _ => None,
-        }
-    }
-
     /// Initialized libxc functional of a Libxc component (spin per `spin_channel`:
     /// 1 = unpolarized, 2 = polarized); `None` for other component types.
     pub fn to_libxc_functional(&self, spin_channel: usize) -> Option<LibXCFunctional> {
-        self.libxc_code_param()
-            .map(|(code, _factor)| xc_func_init(code, spin_channel))
+        match self.component_type {
+            ComponentType::Libxc => Some(xc_func_init(self.id, spin_channel)),
+            _ => None,
+        }
     }
 }
 
