@@ -3601,6 +3601,7 @@ mod tests {
     /// GGA performance benchmark: compare original (serial) vs optimised with
     /// 8 rayon threads.  Reports wall-clock times and speedup.
     #[test]
+    #[ignore = "slow"]
     fn test_opt_gga_performance() {
         let nocc = 50;
         let nvir = 200;
@@ -4078,6 +4079,7 @@ mod tests {
 
     /// NWChem-opt GGA performance benchmark.
     #[test]
+    #[ignore = "slow"]
     fn test_nwchem_opt_gga_performance() {
         let nocc = 50;
         let nvir = 200;
@@ -4138,6 +4140,7 @@ mod tests {
     /// Reports timing for original (serial) and NWChem-opt (8-thread rayon),
     /// scaling over a range of grid sizes.
     #[test]
+    #[ignore = "slow"]
     fn test_bench_vs_nwchem_h2o() {
         let nocc = 5;
         let nvir = 14;

@@ -12,7 +12,6 @@ use pyrest::scf_io::{self, scf_without_build};
 
 use rstsr::prelude::*;
 
-use libxc::prelude::*;
 
 static INPUT_NH3_B3LYP: &str = r##"
 [ctrl]
@@ -75,10 +74,6 @@ fn run_hessian(scf_data: &mut scf_io::SCF, config: &AnalDrvConfig) -> Tensor<f64
     let (de, _, _) = uscf_hess_interface(scf_data, &config.nucgrad, &mut resp_obj);
     let natm = 4;
     rt::asarray((de, [3, 3, natm, natm], &DeviceBLAS::default()))
-}
-
-fn xc_func_list(scf_data: &scf_io::SCF) -> Vec<(f64, LibXCFunctional)> {
-    scf_data.mol.dfadef.scf_func_list(2)
 }
 
 #[test]

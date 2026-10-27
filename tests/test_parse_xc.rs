@@ -182,7 +182,7 @@ fn test_parse_xc_rsh_fail() {
 
 use pyrest::dft::DFA4REST;
 use pyrest::dft::DFAFamily;
-use pyrest::dft::parse_xc::{DFAComponent, DFAdef, func_list_from_components};
+use pyrest::dft::parse_xc::DFAComponent;
 use std::collections::HashMap;
 
 fn close(a: f64, b: f64) -> bool {
