@@ -222,6 +222,8 @@ impl RIRHFGradient<'_> {
             aop_compressed: None,
             atm_idx: perm.iter().map(|&i| grids.atm_idx[i]).collect(),
             quadrature_weights: perm.iter().map(|&i| grids.quadrature_weights[i]).collect(),
+            ao_atm: Vec::new(),
+            atm_coords: Vec::new(),
         };
         let t_reorder = t_reorder.elapsed();
         let mem_probe_on =
