@@ -234,7 +234,7 @@ impl U2RStyle {
         match keyword.to_lowercase().as_str() {
             "keepalpha" | "keep_alpha" | "alpha" => Some(U2RStyle::KeepAlpha),
             "keepbeta" | "keep_beta" | "beta" => Some(U2RStyle::KeepBeta),
-            "natural" | "uno" | "density" | "symmetrize" | "averaged" => Some(U2RStyle::Natural),
+            "natural" | "uno" => Some(U2RStyle::Natural),
             _ => None,
         }
     }
@@ -2218,9 +2218,6 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.u2r_style = match tmp_ctrl.get("u2r_style").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => match U2RStyle::from_keyword(tmp_str) {
                     Some(style) => style,
-                    None if tmp_str.to_lowercase().eq("average") => panic!(
-                        "ERROR: u2r_style = \"average\" is not available: averaging the two spin channels is exactly the natural orbitals of D_alpha + D_beta; use u2r_style = \"natural\""
-                    ),
                     None => panic!(
                         "ERROR: not recognized option for u2r_style: \"{}\" (available: {})",
                         tmp_str, U2RStyle::KEYWORDS.join("\", \"")
