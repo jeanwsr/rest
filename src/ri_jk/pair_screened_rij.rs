@@ -781,6 +781,17 @@ pub fn get_vk_pair_screened(
     let read_rows: Vec<usize> = retained_active.iter().map(|&(p, _, _)| p).collect();
     let sub_len = num_active * num_active;
 
+    // ---- BLAS thread pairing around the rayon region --------------------------------
+    // The SIF ships a pthread-built OpenBLAS: `omp_set_num_threads` inside a rayon worker is a
+    // no-op there, so each worker's `_dsymm/_dsyrk` fans out to the auto-detected (= all cores)
+    // thread count and multiplies with the worker pool (measured 224 OS threads on 2x56 cores).
+    // Pin BLAS to 1 thread on the MAIN thread before entering the region — the global wrapper
+    // also emits `openblas_set_num_threads`, which the pthread build honours — and restore the
+    // saved count after `collect()` returns to the main thread. Never call the global wrapper
+    // from inside a worker: on an OpenMP build it is process-global and would serialize every
+    // later BLAS call (see the 15s -> 321s regression note on the per-thread wrapper).
+    let blas_threads_saved = tensors::matrix_blas_lapack::omp_get_num_threads_wrapper();
+    tensors::matrix_blas_lapack::omp_set_num_threads_global_wrapper(1);
     let partial: Vec<MatrixFull<f64>> = chunks
         .par_iter()
         .map(|columns| {
@@ -821,6 +832,7 @@ pub fn get_vk_pair_screened(
             accum
         })
         .collect();
+    tensors::matrix_blas_lapack::omp_set_num_threads_global_wrapper(blas_threads_saved);
 
     let (d_s, b_s) = k_stat::take();
     println!("[k-stat] screened K: nw={} n_active={} retained={} of {} wall_total(next line) densify={:.2}s blas={:.2}s (thread-s)",
