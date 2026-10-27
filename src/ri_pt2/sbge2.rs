@@ -1282,8 +1282,10 @@ pub fn open_shell_sbge2_rayon_mpi(scf_data: &crate::scf_io::SCF, mpi_operator:&O
 
                     let homo = scf_data.homo[i_spin].clone();
                     let lumo = scf_data.lumo[i_spin].clone();
-                    //let num_occu = homo + 1;
-                    let num_occu = lumo;
+                    // `max(lumo, homo + 1)` covers the occupied orbitals for an
+                    // Aufbau occupation (where the two are equal) as well as for a
+                    // non-Aufbau one, where `lumo` lies below occupied orbitals.
+                    let num_occu = lumo.max(homo + 1);
 
                     let (rimo, vir_range, occ_range) = &ri3mo_vec[i_spin];
                     let lumo_min = vir_range.start;
