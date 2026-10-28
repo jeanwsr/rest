@@ -297,69 +297,53 @@ pub fn get_A_D_S(surface: &SurfaceVdwGaussian) -> (Vec<f64>, MatrixFull<f64>, Ma
     let charge_exp = &surface.surface_calc.charge_exp;
     let grid_coords = &surface.surface_calc.grid_coords;
     let n_grids = grid_coords.len();
-    let grid_capacity = n_grids * (n_grids + 1) /2;
     let norm_vec = &surface.surface_calc.norm_vec;
-    
-    if n_grids == 0 {
-        panic!("ERROR: No surface grid points generated!");
-    }
-
-    let mut zeta_ij = Vec::with_capacity(grid_capacity);
-    for j in 0..n_grids{
-        for i in 0..j+1{
-            zeta_ij.push(charge_exp[i]*charge_exp[j]/(charge_exp[i].powi(2)+charge_exp[j].powi(2)).sqrt() );
-        }
-    }
-
-    let mut r_ij = Vec::with_capacity(grid_capacity);
-    for j in 0..n_grids{
-        for i in 0..j+1{
-            if i == j {
-                r_ij.push(1.0);
-            } else {
-                r_ij.push(dist_3d(&grid_coords[i], &grid_coords[j]));
+    // ---- streaming construction -----------------------------------------------------------
+    // The old implementation materialised zeta_ij / r_ij / zeta_r_ij (three n(n+1)/2
+    // upper-triangle Vecs) plus r_ij_matrix / zeta_r_ij_matrix / n_r_ij / r_scale /
+    // f_zeta_r_ij / tmp_D_ij (six n^2 temporaries) before writing S and D. For a 56k-point
+    // surface (system1) that is ~150 GB of transient memory, and one of the first 3 GB
+    // Vec::with_capacity calls failed reproducibly on some builds. Every element here uses
+    // the exact same formula as before, evaluated on the fly into the two output matrices:
+    // peak memory drops from ~150 GB to 2 * n^2 * 8 bytes.
+    let mut S_ij: MatrixFull<f64> = MatrixFull::new([n_grids, n_grids], 0.0_f64);
+    let mut D_ij: MatrixFull<f64> = MatrixFull::new([n_grids, n_grids], 0.0_f64);
+    {
+        let s_data = S_ij.data_ref_mut().unwrap();
+        let d_data = D_ij.data_ref_mut().unwrap();
+        let sqrt_2_over_pi = (2.0_f64 / PI).sqrt();
+        let two_over_sqrt_pi = 2.0_f64 / PI.sqrt();
+        for j in 0..n_grids {
+            let cj = &grid_coords[j];
+            let ce_j = charge_exp[j];
+            let nj = &norm_vec[j];
+            for i in 0..n_grids {
+                if i == j {
+                    continue;
+                }
+                let dx = grid_coords[i][0] - cj[0];
+                let dy = grid_coords[i][1] - cj[1];
+                let dz = grid_coords[i][2] - cj[2];
+                let r = (dx * dx + dy * dy + dz * dz).sqrt();
+                let zeta_ij_val = ce_j * charge_exp[i]
+                    / (ce_j.powi(2) + charge_exp[i].powi(2)).sqrt();
+                let zeta_r = zeta_ij_val * r;
+                let erf_zeta_r = libm::erf(zeta_r);
+                // S_ij = erf(zeta_ij * r_ij) / r_ij (symmetric)
+                let s = erf_zeta_r / r;
+                // D_ij[i,j] = [erf(zr) - 2/sqrt(pi) * zr * exp(-zr^2)] * (n_j . r_ij) / r^3
+                let f = erf_zeta_r - two_over_sqrt_pi * zeta_r * f64::exp(-zeta_r.powi(2));
+                let n_dot_r = dx * nj.0 + dy * nj.1 + dz * nj.2;
+                let d = f * (n_dot_r / r.powi(3));
+                // MatrixFull is column-major: element (i, j) sits at data[i + j * n_grids]
+                s_data[i + j * n_grids] = s;
+                s_data[j + i * n_grids] = s;
+                d_data[i + j * n_grids] = d;
             }
+            // diagonals (same formulas as the old post-hoc overwrite)
+            s_data[j + j * n_grids] = ce_j * sqrt_2_over_pi / switch_fun[j];
+            d_data[j + j * n_grids] = -ce_j * sqrt_2_over_pi / (2.0 * R_vdw[j]);
         }
-    }
-    //let r_ij = MatrixUpper::from_vec(grid_capacity, tmp_r_ij).unwrap();
-    //let r_ij = r_ij.to_matrixfull();
-    let zeta_r_ij: Vec<f64> = r_ij.iter()
-        .zip(zeta_ij.iter()).map(|(&r, &z)| z*r).collect();
-    
-    // S_ij = erf(zeta_ij * r_ij) / r_ij, with S_ii = charge_exp[i] * (2/pi)^0.5 / switch_fun[i]
-    let mut tmp_S_ij = zeta_r_ij.iter().zip(r_ij.iter())
-        .map(|(&z, &r)| libm::erf(z) / r).collect();
-    let mut S_ij: MatrixFull<f64> = MatrixUpper::from_vec(grid_capacity, tmp_S_ij).unwrap().to_matrixfull().unwrap();
-    for i in 0..n_grids{
-        let s_ii = charge_exp[i] * (2.0 / PI).sqrt() / switch_fun[i];
-        S_ij[(i,i)] = s_ii;
-    }
-
-    let r_ij_matrix: MatrixFull<f64> = MatrixUpper::from_vec(grid_capacity, r_ij).unwrap().to_matrixfull().unwrap();
-    let zeta_r_ij_matrix: MatrixFull<f64> = MatrixUpper::from_vec(grid_capacity, zeta_r_ij).unwrap().to_matrixfull().unwrap();
-    // n_r_ij = \vec{n_j} * \vec{r_ij}, where \vec{n_j} is the normal vector at grid point j, and \vec{r_ij} is the vector from grid point j to grid point i.
-    let mut n_r_ij: Vec<f64> = Vec::with_capacity(n_grids * n_grids);
-    for j in 0..n_grids{
-        for i in 0..n_grids{
-            let dx = grid_coords[i][0] - grid_coords[j][0];
-            let dy = grid_coords[i][1] - grid_coords[j][1];
-            let dz = grid_coords[i][2] - grid_coords[j][2];
-            n_r_ij.push(dx * norm_vec[j].0 + dy * norm_vec[j].1 + dz * norm_vec[j].2);
-        }
-    }
-
-    //r_scale = \vec{n_j} * \vec{r_ij}/ r_ij^3, 
-    let r_scale: Vec<f64> = n_r_ij.iter().zip(r_ij_matrix.iter())
-        .map(|(&n, &r)| n / r.powi(3)).collect();
-    let f_zeta_r_ij: Vec<f64> = zeta_r_ij_matrix.iter()
-        .map(|&x| libm::erf(x) - 2.0 / PI.sqrt() * x * f64::exp(-x.powi(2)))
-        .collect();
-    let tmp_D_ij: Vec<f64> = f_zeta_r_ij.iter().zip(r_scale.iter())
-        .map(|(&f, &scale)| f * scale).collect();
-    let mut D_ij = MatrixFull::from_vec([n_grids, n_grids], tmp_D_ij).unwrap();
-    for i in 0..n_grids{
-        let d_ii = -charge_exp[i]* (2.0 / PI).sqrt() / (2.0 * R_vdw[i]);
-        D_ij[(i,i)] = d_ii;
     }
 
     (A, D_ij, S_ij)
