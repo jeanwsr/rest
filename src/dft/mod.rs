@@ -3444,11 +3444,17 @@ pub fn contract_vxc_0(mat_a: &mut MatrixFull<f64>, mat_b: &MatrixFullSlice<f64>,
 ///
 /// With 4 KiB pages a 9 MB block spans ~2400 TLB entries, more than the L2 TLB holds, so a
 /// column-wise walk misses the TLB continuously. A 2 MiB page collapses the same block to a
-/// handful of entries. The hint is silently ignored when THP is disabled or the range is not
-/// page aligned, and `REST_XC_THP=0` turns it off for A/B measurements.
+/// handful of entries.
+///
+/// **Default OFF since 2026-10-29**: advising THP on the ~70 GB of AO/AOP compressed tables
+/// reproducibly broke every later large (>3 GB) allocation in the process on the xc09 nodes
+/// (system1: `get_A_D_S` / SAD-thread setup died with ENOMEM while the node had 700+ GB
+/// free; with the advice off the same runs pass, 1262 s end-to-end). The mechanism is
+/// THP-fault/compaction interference with subsequent big mmaps. Set `REST_XC_THP=1` to
+/// re-enable for A/B measurements on machines where it is safe.
 #[cfg(target_os = "linux")]
 pub(crate) fn advise_huge_pages(buf: &mut [f64]) {
-    if std::env::var("REST_XC_THP").ok().as_deref() == Some("0") { return; }
+    if std::env::var("REST_XC_THP").ok().as_deref() != Some("1") { return; }
     if buf.is_empty() { return; }
     unsafe {
         extern "C" {
