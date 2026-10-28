@@ -25,6 +25,16 @@ pub const NSCF_COMPONENTS: [ComponentType; 5] = [
     ComponentType::Disp,
 ];
 
+/// The component types that constitute a fifth-rung (post-SCF) correlation term, i.e.
+/// the families that enter only the final-energy functional. Note `Disp` is an
+/// NSCF-allowed component but not a fifth-rung one; `HF`/`RSHF` are exchange terms.
+pub const FIFTH_RUNG_COMPONENT_TYPES: &[ComponentType] = &[
+    ComponentType::PT2,
+    ComponentType::RPA,
+    ComponentType::SCSRPA,
+    ComponentType::SBGE2,
+];
+
 impl ComponentType {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -207,6 +217,8 @@ lazy_static! {
         ("MP2", ComponentType::PT2),
         ("MP2_OS", ComponentType::PT2),
         ("MP2_SS", ComponentType::PT2),
+        ("SBGE2_OS", ComponentType::SBGE2),
+        ("SBGE2_SS", ComponentType::SBGE2),
         ("RPA", ComponentType::RPA),
         ("SCSRPA", ComponentType::SCSRPA),
         ("SBGE2", ComponentType::SBGE2),
@@ -223,6 +235,7 @@ lazy_static! {
     pub static ref MULTISTEP_ALIAS:HashMap<&'static str, &'static str> = HashMap::from([
         // lowercase
         ("xygjos", "xygj_os"),
+        ("r-xygjos", "r-xygj_os"),
         ("revxygjos", "revxygj_os"),
         ("xygjos5", "xygj_os5"),
         ("xdhpbe0", "xdh_pbe0"),

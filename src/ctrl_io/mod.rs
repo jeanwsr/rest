@@ -299,9 +299,6 @@ pub struct InputKeywords {
     pub xc: String,
     pub xc_type: DFTType,
     // == for the non_standard setting of DFA ==
-    pub xc_namelist: Option<Vec<String>>,
-    pub xc_paralist: Option<Vec<f64>>,
-    pub dfa_hybrid_scf: Option<f64>,
     // =========================================
     // == for the non_standard setting of DFA ==
     pub xc_model: Option<String>,
@@ -608,9 +605,6 @@ impl InputKeywords {
             // Keywords associated with the method employed
             xc: String::from("x3lyp"),
             xc_type: DFTType::Standard,
-            xc_namelist: None,
-            xc_paralist: None,
-            dfa_hybrid_scf: None,
             xc_model: None,
             empirical_dispersion: None,
             post_xc: vec![],
@@ -741,7 +735,7 @@ impl InputKeywords {
             solvent_name: String::new(),
             solvent_descriptors: None, 
             stop_at: None,
-            xc_parser: String::from("legacy"),
+            xc_parser: String::from("parse_xc"),
             j2c_decomp: J2CDecompOption::default(),
             ri_jk: RIJKOption::default(),
             hamiltonian_distributed: HamiltonianDistributedMode::default(),
@@ -844,14 +838,11 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
             println!("The exchange-correlation method: {}", ctrl.xc);
         },
         DFTType::NonStandard => {
-            if let (Some(xc_namelist), Some(xc_paralist), Some(dfa_hybrid_scf)) = (&ctrl.xc_namelist, &ctrl.xc_paralist, &ctrl.dfa_hybrid_scf) {
-                println!("Nonstandard exchange-correlation method with {:16.8} exact exchange is employed:", dfa_hybrid_scf);
-                xc_namelist.iter().zip(xc_paralist.iter()).for_each(|(xc_name, xc_para)| {
-                    println!("    Component: {:>20}, parameter: {:16.8}", xc_name, xc_para);
-                });
-            } else {
-                panic!("Error:: xc_namelist, xc_paralist and xc_hybrid_para should be specified for nonstandard xc method")
-            }
+            panic!(
+                "Error:: DFTType::NonStandard is removed. Please use xc_parser = 'parse_xc' \
+                 with the xc expression syntax instead, e.g. xc_parser = 'parse_xc' and \
+                 xc = '0.5*gga_x_pbe + 0.5*gga_c_pbe + hf*0.2'."
+            )
         },
         DFTType::DeepLearning => {
             if let Some(xc_model) = &ctrl.xc_model {
@@ -1299,39 +1290,6 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 other => {
                     DFTType::Standard
                 },
-            };
-            // to be deprecated
-            tmp_input.xc_namelist = match tmp_ctrl.get("xc_namelist").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_op) => {Some(vec![tmp_op.to_lowercase()])},
-                serde_json::Value::Array(tmp_op) => {
-                    let mut tmp_vec:Vec<String> = vec![];
-                    tmp_op.iter().for_each(|x| {
-                        let op_type = x.to_string();
-                        let string_len = op_type.len();
-                        tmp_vec.push(op_type[1..string_len-1].to_lowercase().to_string())
-                    });
-                    Some(tmp_vec)
-                },
-                other => {None},
-            };
-            tmp_input.xc_paralist = match tmp_ctrl.get("xc_paralist").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::Array(tmp_op) => {
-                    let tmp_vec:Vec<f64> = tmp_op.iter().map(|x| {
-                        match x {
-                            serde_json::Value::String(tmp_str) => {tmp_str.parse().unwrap_or(0.0)},
-                            serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(0.0)},
-                            other => {0.0},
-                        }
-                    }).collect::<Vec<f64>>();
-                    Some(tmp_vec)
-                },
-                other => {None},
-            };
-            //
-            tmp_input.dfa_hybrid_scf = match tmp_ctrl.get("xc_hybrid_para").unwrap_or(&serde_json::Value::Null) {
-                serde_json::Value::String(tmp_str) => {Some(tmp_str.parse().unwrap_or(0.0))},
-                serde_json::Value::Number(tmp_num) => {Some(tmp_num.as_f64().unwrap_or(0.0))},
-                other => {None}
             };
             tmp_input.xc_model = match tmp_ctrl.get("xc_model").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_xc) => {
@@ -2260,7 +2218,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
 
             tmp_input.xc_parser = match tmp_ctrl.get("xc_parser").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => { tmp_str.to_lowercase() },
-                other => String::from("legacy"),
+                other => String::from("parse_xc"),
             };
             
             tmp_input.analdrv_tasks = match tmp_ctrl.get("analdrv_tasks").unwrap_or(&serde_json::Value::Null) {

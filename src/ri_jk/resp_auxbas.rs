@@ -135,7 +135,7 @@ pub fn cderi_pair_sr<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> (TsrCow<'
         Some(resp_auxbas_path) => {
             assert_resp_auxbas_supported(scf_data, config);
             // SR RI omega is negative in libcint's convention (cf. the SCF integral preparation)
-            let omega = scf_data.mol.xc_data.omega().unwrap();
+            let omega = scf_data.mol.dfadef.omega().unwrap();
             debug!(
                 "Building the short-range response rimatr for RSH (omega = {:.4}) on `resp_auxbas_path` = \"{}\".",
                 omega, resp_auxbas_path

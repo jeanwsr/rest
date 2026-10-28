@@ -27,7 +27,6 @@ use crate::ri_jk::resp_r::RRespRIJK;
 use crate::ri_jk::util::get_cint_mol;
 use crate::SCF;
 
-use libxc::prelude::*;
 
 /// J/K factors of the RI-JK electronic-interaction contributions of the (restricted) SCF.
 ///
@@ -36,37 +35,23 @@ use libxc::prelude::*;
 /// the correction object, following the same decomposition as the SCF Fock assembly:
 /// `K = alpha * K_full + factor_k_sr * K_erfc` with `factor_k_sr = hyb - alpha`.
 pub fn scf_jk_factors(scf_data: &SCF) -> (f64, f64, Option<(f64, f64)>) {
-    let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
-    let factor_j = 1.0;
-    let factor_k = match is_hf {
-        true => 1.0,
-        false => scf_data.mol.xc_data.rsh_alpha().unwrap_or(scf_data.mol.xc_data.dfa_hybrid_scf),
-    };
-    let rsh = scf_data.mol.xc_data.omega().map(|omega| {
-        let alpha = scf_data.mol.xc_data.rsh_alpha().unwrap();
-        let hyb = scf_data.mol.xc_data.dfa_hybrid_scf;
-        (omega, hyb - alpha)
-    });
-    (factor_j, factor_k, rsh)
+    match scf_data.mol.dfadef.rsh_params_scf() {
+        // rsh case: full-range K scaled by c_LR, the erfc part by c_SR - c_LR (the raw beta)
+        Some((omega, alpha, c_sr)) => (1.0, alpha, Some((omega, c_sr - alpha))),
+        None => (
+            1.0,
+            if !scf_data.mol.dfadef.is_dfa_scf() {
+                1.0
+            } else {
+                scf_data.mol.dfadef.dfa_hybrid_scf
+            },
+            None,
+        ),
+    }
 }
 
 /// List of `(scale, functional)` pairs of the SCF XC functional, in the given libxc spin
 /// treatment.
-pub fn scf_xc_func_list_with_spin(scf_data: &SCF, spin: LibXCSpin) -> Vec<(f64, LibXCFunctional)> {
-    let xc_code = &scf_data.mol.xc_data.dfa_compnt_scf;
-    let xc_params = &scf_data.mol.xc_data.dfa_paramr_scf;
-    xc_code
-        .iter()
-        .zip(xc_params.iter())
-        .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, spin)))
-        .collect_vec()
-}
-
-/// List of `(scale, functional)` pairs of the SCF XC functional (spin-unpolarized).
-pub fn scf_xc_func_list(scf_data: &SCF) -> Vec<(f64, LibXCFunctional)> {
-    scf_xc_func_list_with_spin(scf_data, LibXCSpin::Unpolarized)
-}
-
 /// The response (fock/response) objects of all electron-interaction contributions of a restricted
 /// SCF, as an owned list of `RRespAPI` trait objects.
 ///
@@ -392,9 +377,9 @@ pub fn rscf_resp_interface<'a>(scf_data: &'a SCF, config: &AnalDrvConfig) -> RRe
 
     // --- DFT --- //
 
-    let is_hf = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+    let is_hf = !scf_data.mol.dfadef.is_dfa_scf();
     if !is_hf {
-        let xc_func_list = scf_xc_func_list(scf_data);
+        let xc_func_list = scf_data.mol.dfadef.scf_func_list(1);
         let verbose = scf_data.mol.ctrl.print_level > 2;
 
         let (ni, ni_resp) = resp_grids(scf_data, config);

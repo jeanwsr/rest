@@ -6,7 +6,7 @@ use core::panic;
 use rayon::prelude::*;
 use rstsr::prelude::*;
 use libxc::prelude::*;
-use crate::dft::libxc_helper::{xc_func_init, eval_libxc_func_new};
+use crate::dft::libxc_helper::eval_libxc_func_new;
 use crate::dft::xc_deriv::{XCType, xc_indices_transform, transform_xc_inner, count_combinations};
 
 
@@ -162,8 +162,7 @@ fn merge_xc(output: &mut Vec<f64>, outbuf: &Vec<f64>, factor: f64, xc_type:XCTyp
 
 
 fn eval_xc1(
-    func_ids:&Vec<usize>, 
-    func_factors:&Vec<f64>,
+    funcs: &[(f64, LibXCFunctional)],
     xc_type: XCType, 
     spin: usize,
     rho: &[f64],
@@ -183,12 +182,10 @@ fn eval_xc1(
     };
     let mut output = vec![0.0; np * n_components];
 
-    func_ids.iter()
-    .zip(func_factors.iter())
+    funcs.iter()
     .for_each(
-        |(func_id, xc_param)|
+        |(xc_param, xc_func)|
         {
-            let xc_func = xc_func_init(*func_id, spin+1);
             let cur_xc_type = match xc_func.family() {
                 LibXCFamily::LDA => XCType::LDA,
                 LibXCFamily::GGA => XCType::GGA,
@@ -308,7 +305,7 @@ fn generate_rho_vec(rho_u:&[f64], spin:usize, nvar: usize, np: usize) -> Vec<f64
 }
 
 
-pub fn eval_xc_eff(func_ids:&Vec<usize>, func_factors:&Vec<f64>, xc_type:XCType, spin:usize, rho_array:&[f64], np:usize, deriv:usize) -> Vec<Option<Tensor<f64, DeviceBLAS>>> {
+pub fn eval_xc_eff(funcs:&[(f64, LibXCFunctional)], xc_type:XCType, spin:usize, rho_array:&[f64], np:usize, deriv:usize) -> Vec<Option<Tensor<f64, DeviceBLAS>>> {
 
     // let (xc_type, nvar) = match xc_family {
     //     "LDA" => (XCType::LDA, 1 as usize),
@@ -345,7 +342,7 @@ pub fn eval_xc_eff(func_ids:&Vec<usize>, func_factors:&Vec<f64>, xc_type:XCType,
         _ => None,
     };
 
-    let libxc_out = eval_xc1(func_ids, func_factors, xc_type, spin, rho, sigma, lapl, tau, np, deriv);
+    let libxc_out = eval_xc1(funcs, xc_type, spin, rho, sigma, lapl, tau, np, deriv);
 
     let (_, xc_n_components) = get_nvar(xc_type, spin, deriv);
     let device = DeviceBLAS::default();

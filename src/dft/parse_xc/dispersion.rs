@@ -74,6 +74,27 @@ impl DFAComponent {
 }
 
 impl DFAdef {
+    /// The `(b, C)` parameters of the NLC (VV10) kernel carried by this definition's libxc
+    /// components: the single VV10-flagged functional in `xc_scf` (e.g. 466/531/584), which
+    /// must appear with unit factor. `None` when no VV10-flagged component is present.
+    /// Mirrors the `nlc_vv10` population in `DFAdef::to_scf_xc_data`.
+    pub fn vv10_params(&self) -> Option<(f64, f64)> {
+        let comps = self.xc_scf.as_ref()?;
+        let mut nlc_comps = comps
+            .iter()
+            .filter(|comp| comp.component_type == ComponentType::Libxc && comp.is_nlc());
+        let comp = match (nlc_comps.next(), nlc_comps.next()) {
+            (Some(comp), None) => comp,
+            (None, None) => return None,
+            _ => panic!("VV10 requires exactly one libxc functional carrying the VV10 kernel."),
+        };
+        if (comp.factor - 1.0).abs() > 1.0e-12 {
+            panic!("VV10 component with non-unit factor is not supported: {}", comp.func_full_name);
+        }
+        use crate::dft::libxc_helper::xc_func_init;
+        xc_func_init(comp.id, 1).vv10_coef()
+    }
+
     pub fn has_dispersion(&self) -> bool {
         if let Some(components) = &self.xc_scf {
             for comp in components.iter() {

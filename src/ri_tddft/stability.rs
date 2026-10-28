@@ -91,7 +91,7 @@ pub fn stability(scf: &SCF, mode: &str) -> Result<StabilityReport, String> {
     }
     // HF references (no libxc components) need no DFT grids: the Hessian
     // runs the RI J/K parts only (`fxc_driver: None` in the prepared data).
-    let is_hf = scf.mol.xc_data.dfa_compnt_scf.is_empty();
+    let is_hf = !scf.mol.dfadef.is_dfa_scf();
     if scf.grids.is_none() && !is_hf {
         return Err(
             "stability analysis requires the DFT grids (DFT references carry the \

@@ -98,10 +98,11 @@ fn test_nh3() {
     // PT2 (correlation) contribution: unrelaxed rdm1 and Lagrangian
     let [c_os, c_ss]: [f64; 2] = scf_data
         .mol
-        .xc_data
-        .dfa_paramr_adv
-        .clone()
+        .dfadef
+        .fifth_rung_component()
         .expect("xyg3 carries the PT2 spin factors.")
+        .param_positional
+        .clone()
         .try_into()
         .expect("dfa_paramr_adv must have exactly two entries.");
     let mo_occ = (&scf_data.occupation[0]).to_rstsr(&device);

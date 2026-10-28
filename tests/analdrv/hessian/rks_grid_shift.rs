@@ -7,17 +7,16 @@
 //!   derivatives) over the atom indices must vanish — the grid-shift terms are constructed to
 //!   restore exactly this invariance.
 
+use pyrest::analdrv::hessian::rscf_interface::scf_proton_charges;
 use pyrest::analdrv::config::{AnalDrvConfig, AnalDrvNucgradCfg};
 use pyrest::analdrv::hessian::rscf_interface::rscf_hess_interface;
 use pyrest::analdrv::response::rresp_interface::rscf_resp_interface;
 use pyrest::ctrl_io;
-use pyrest::geom_io::get_mass_charge;
 use pyrest::molecule_io::Molecule;
 use pyrest::scf_io::{self, scf_without_build};
 
 use rstsr::prelude::*;
 
-use libxc::prelude::*;
 
 static INPUT_NH3_B3LYP: &str = r##"
 [ctrl]
@@ -80,17 +79,6 @@ fn run_hessian(scf_data: &scf_io::SCF, config: &AnalDrvConfig) -> Tensor<f64, De
     let (de, _, _) = rscf_hess_interface(scf_data, &config.nucgrad, &mut resp_objs);
     let natm = 4;
     rt::asarray((de, [3, 3, natm, natm], &DeviceBLAS::default()))
-}
-
-fn xc_func_list(scf_data: &scf_io::SCF) -> Vec<(f64, LibXCFunctional)> {
-    scf_data
-        .mol
-        .xc_data
-        .dfa_compnt_scf
-        .iter()
-        .zip(scf_data.mol.xc_data.dfa_paramr_scf.iter())
-        .map(|(&code, &param)| (param, LibXCFunctional::from_number(code as _, LibXCSpin::Unpolarized)))
-        .collect()
 }
 
 #[test]
@@ -157,10 +145,9 @@ fn test_skeleton_invariance() {
         );
         let ni = NIMatmul::new(&cint_mol, &coordinates, &weights, &atm_idx, &quadrature_weights);
 
-        let xc_func_list = xc_func_list(&scf_data);
+        let proton_charges = scf_proton_charges(&scf_data);
+        let xc_func_list = scf_data.mol.dfadef.scf_func_list(1);
 
-        let proton_charges =
-            get_mass_charge(&scf_data.mol.geom.rg_elem).iter().map(|&(_, charge)| charge as i32).collect();
         let mut hess_obj = RHessKSNIMatmul::new(&cint_mol, xc_func_list, ni, true, proton_charges, false);
         hess_obj.make_hessian_setup(mo_coeff.view(), mo_occ.view(), None);
 

@@ -282,10 +282,9 @@ pub fn prepare_fxc_hessian_cache(scf: &SCF) -> FxcHessianCache {
     let mol = &scf.mol;
     let grids = scf.grids.as_ref().expect("prepare_fxc_hessian_cache requires scf.grids");
     let nao = mol.num_basis;
-    let func_ids = &mol.xc_data.dfa_compnt_scf;
-    let func_factors = &mol.xc_data.dfa_paramr_scf;
+    let funcs = mol.dfadef.scf_func_list(1);
 
-    let xc_type = if mol.xc_data.use_density_gradient() {
+    let xc_type = if mol.dfadef.use_density_gradient() {
         XCType::GGA
     } else {
         XCType::LDA
@@ -337,7 +336,7 @@ pub fn prepare_fxc_hessian_cache(scf: &SCF) -> FxcHessianCache {
             let off = rho_tensor.offset();
             raw[off..off + nb * nvar].to_vec()
         };
-        let xc_tensors = eval_xc_eff(func_ids, func_factors, xc_type, 0, &rho_array, nb, 2);
+        let xc_tensors = eval_xc_eff(&funcs, xc_type, 0, &rho_array, nb, 2);
         let fxc_t = xc_tensors[2].as_ref().expect("prepare_fxc_hessian_cache: fxc required");
         let fxc_raw_src = fxc_t.raw();
         let fxc_off = fxc_t.offset();
@@ -1187,8 +1186,8 @@ pub fn response_ao_core(
     // hyb from DFA: for HF (dfa_compnt_scf empty), dfa_hybrid_scf=0, but
     // the SCF HF uses hardcoded scaling=-0.5 (generate_hf_hamiltonian_ri_v),
     // so we must set hyb=1.0 for HF to get the correct exchange response.
-    let is_hf = scf.mol.xc_data.dfa_compnt_scf.is_empty();
-    let hyb = if is_hf { 1.0 } else { scf.mol.xc_data.dfa_hybrid_scf };
+    let is_hf = !scf.mol.dfadef.is_dfa_scf();
+    let hyb = if is_hf { 1.0 } else { scf.mol.dfadef.dfa_hybrid_scf };
     // dm1 = 2*dmbare in gen_vind_opt → J and K are linear, so J[2*dm] = 2*J[dmbare]
     // and K[2*dm] = 2*K[dmbare]. The SCF response needs 2*J - K, so:
     //   v_ao = 2*J[dmbare] - hyb*K[dmbare] = J[2*dmbare] - 0.5*hyb*K[2*dmbare]
@@ -1369,8 +1368,8 @@ pub fn gen_vind_opt_batched(
     }
 
     // ── Step 2: Compute J, K per RHS (sequential — Phase C can batch) ──
-    let is_hf = scf.mol.xc_data.dfa_compnt_scf.is_empty();
-    let hyb = if is_hf { 1.0 } else { scf.mol.xc_data.dfa_hybrid_scf };
+    let is_hf = !scf.mol.dfadef.is_dfa_scf();
+    let hyb = if is_hf { 1.0 } else { scf.mol.dfadef.dfa_hybrid_scf };
     let k_scaling = match scf.scftype {
         SCFType::RHF => 0.5 * hyb,
         _ => hyb,

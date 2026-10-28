@@ -8,10 +8,14 @@ use crate::dft::parse_xc::xc_helper::{ALIAS, AVAIL_FUNC, CODES,
     ComponentType, 
     MULTISTEP, MULTISTEP_ALIAS, MULTISTEP_NAME_WITH_DASH, 
     NAME_WITH_DASH, NAME_WITHOUT_UNDERSCORE, NSCF_COMPONENTS, WHITELIST_NONLIBXC, 
+    FIFTH_RUNG_COMPONENT_TYPES,
     get_name, load_user_json_functionals};
 use crate::dft::parse_xc::dispersion::{check_disp_suffix};
 // use cached::proc_macro::cached;
 use crate::dft::DFA4REST;
+use crate::dft::DFAFamily;
+use itertools::Itertools;
+use libxc::prelude::{LibXCFunctional, LibXCFunctionalKind, LibXCSpin};
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -374,6 +378,20 @@ impl DFAComponent {
                 new_component.func = "MP2".to_string();
                 new_component.param_positional = vec![0.0, self.factor];
             },
+            "SBGE2_OS" => {
+                if !self.param_positional.is_empty() || !self.param_keyword.is_empty() {
+                    panic!("Error: SBGE2_OS component should not have parameters");
+                }
+                new_component.func = "SBGE2".to_string();
+                new_component.param_positional = vec![self.factor, 0.0];
+            },
+            "SBGE2_SS" => {
+                if !self.param_positional.is_empty() || !self.param_keyword.is_empty() {
+                    panic!("Error: SBGE2_SS component should not have parameters");
+                }
+                new_component.func = "SBGE2".to_string();
+                new_component.param_positional = vec![0.0, self.factor];
+            },
             _ => panic!("Error: unknown PT2 component type {}", self.func),
         }
 
@@ -418,7 +436,7 @@ impl Addable for DFAComponent {
         }
         if self.param_positional != other.param_positional {
             match self.component_type {
-                ComponentType::PT2 | ComponentType::SCSRPA => {
+            ComponentType::PT2 | ComponentType::SBGE2 | ComponentType::SCSRPA => {
                     if self.is_normalized() && other.is_normalized() {
                         return true;
                     } else {
@@ -449,7 +467,7 @@ impl std::ops::Add for DFAComponent {
         //     panic!("Error: cannot add two different DFAComponents");
         // }
         match self.component_type {
-            ComponentType::PT2 | ComponentType::SCSRPA => {
+            ComponentType::PT2 | ComponentType::SBGE2 | ComponentType::SCSRPA => {
                         DFAComponent {
             factor: 1.0, // should be normalized before add
             func: self.func.clone(),
@@ -500,6 +518,32 @@ impl std::ops::Add for DFAComponent {
     
 }
 
+impl DFAComponent {
+    /// A Libxc component from a functional code and scale factor; the names come from
+    /// `xc_helper::get_name`.
+    pub fn from_libxc(id: usize, factor: f64) -> Self {
+        DFAComponent {
+            factor,
+            func: get_name(id),
+            func_full_name: get_name(id),
+            id,
+            param_positional: Vec::new(),
+            param_keyword: HashMap::new(),
+            component_type: ComponentType::Libxc,
+            reference: Vec::new(),
+        }
+    }
+
+    /// Initialized libxc functional of a Libxc component (spin per `spin_channel`:
+    /// 1 = unpolarized, 2 = polarized); `None` for other component types.
+    pub fn to_libxc_functional(&self, spin_channel: usize) -> Option<LibXCFunctional> {
+        match self.component_type {
+            ComponentType::Libxc => Some(xc_func_init(self.id, spin_channel)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DFAdef {
     pub xc_scf: Option<Vec<DFAComponent>>,
@@ -509,6 +553,9 @@ pub struct DFAdef {
     pub dfa_hybrid_scf: f64,
     // (omega, alpha, beta) in libxc convention; note beta is usually not used in computation.
     pub dfa_rsh_scf: (Option<f64>, f64, f64),
+    // the same functional in the consumer convention of DFA4REST::rsh_params:
+    // (omega, c_LR, c_SR); None for a non-RSH functional.
+    pub dfa_rsh_scf_lrsr: Option<(f64, f64, f64)>,
     pub dfa_hybrid_nscf: Option<f64>,
 }
 
@@ -522,11 +569,83 @@ impl DFAdef {
             spin_channel: 1,
             dfa_hybrid_scf: 0.0,
             dfa_rsh_scf: (None, 0.0, 0.0),
+            dfa_rsh_scf_lrsr: None,
             dfa_hybrid_nscf: None,
         }
     }
 
-    pub fn to_dfa4rest(&self) -> DFA4REST {
+    /// Reconstruct a DFAdef record from a (full) DFA4REST, e.g. the output of the legacy
+    /// parser or the deep-learning constructor.
+    ///
+    /// This is the transitional bridge of the DFAdef-primary refactor: those constructors
+    /// keep producing a full DFA4REST that is used directly as `Molecule.xc_data`, while
+    /// `Molecule.dfadef` stores this reconstructed definition. The reconstruction is exact
+    /// over the DFA4REST fields except `nlc_vv10`, which has no DFAdef counterpart here
+    /// (legacy VV10 keeps flowing through `xc_data.nlc_vv10`).
+    pub fn from_dfa4rest(dfa: &DFA4REST) -> DFAdef {
+        let libxc_comp = |id: usize, factor: f64| DFAComponent {
+            factor,
+            func: get_name(id),
+            func_full_name: get_name(id),
+            id,
+            param_positional: Vec::new(),
+            param_keyword: HashMap::new(),
+            component_type: ComponentType::Libxc,
+            reference: Vec::new(),
+        };
+        let mut dfadef = DFAdef::new();
+        dfadef.spin_channel = dfa.spin_channel;
+        dfadef.dfa_hybrid_scf = dfa.dfa_hybrid_scf;
+        dfadef.dfa_rsh_scf_lrsr = dfa.dfa_rsh_scf;
+        dfadef.dfa_rsh_scf = match dfa.dfa_rsh_scf {
+            Some((omega, c_lr, c_sr)) => (Some(omega), c_lr, c_sr - c_lr),
+            None => (None, 0.0, 0.0),
+        };
+        dfadef.xc_scf = Some(
+            dfa.dfa_compnt_scf
+                .iter()
+                .zip(dfa.dfa_paramr_scf.iter())
+                .map(|(&id, &factor)| libxc_comp(id, factor))
+                .collect(),
+        );
+        if let Some(family) = &dfa.dfa_family_pos {
+            let (component_type, func) = match family {
+                DFAFamily::PT2 => (ComponentType::PT2, "MP2".to_string()),
+                DFAFamily::RPA => (ComponentType::RPA, "RPA".to_string()),
+                DFAFamily::SCSRPA => (ComponentType::SCSRPA, "SCSRPA".to_string()),
+                DFAFamily::SBGE2 => (ComponentType::SBGE2, "SBGE2".to_string()),
+                other => panic!(
+                    "DFAdef::from_dfa4rest: family {other:?} is not a fifth-rung family"
+                ),
+            };
+            let empty_vec: Vec<f64> = Vec::new();
+            let mut nscf_components: Vec<DFAComponent> = dfa
+                .dfa_compnt_pos
+                .as_ref()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .zip(dfa.dfa_paramr_pos.as_ref().unwrap_or(&empty_vec).iter())
+                .map(|(&id, &factor)| libxc_comp(id, factor))
+                .collect();
+            nscf_components.push(DFAComponent {
+                factor: 1.0,
+                func,
+                func_full_name: String::new(),
+                id: 0,
+                param_positional: dfa.dfa_paramr_adv.clone().unwrap_or_default(),
+                param_keyword: HashMap::new(),
+                component_type,
+                reference: Vec::new(),
+            });
+            dfadef.xc_nscf = Some(nscf_components);
+            dfadef.dfa_hybrid_nscf = dfa.dfa_hybrid_pos;
+        }
+        dfadef
+    }
+
+    /// Backend shared by [`Self::to_dfa4rest`] and [`Self::to_xc_data`]: the SCF-side
+    /// DFA4REST (libxc components, hybrid, RSH, VV10) with no post-SCF state.
+    fn to_scf_xc_data(&self) -> DFA4REST {
         let mut xc_data = DFA4REST::new_xc(self.spin_channel, 0);
         if let Some(scf_components) = &self.xc_scf {
             for comp in scf_components {
@@ -574,13 +693,12 @@ impl DFAdef {
                 }
             }
         }
-        let alpha = self.dfa_rsh_scf.1;
-        let beta = self.dfa_rsh_scf.2;
-        if let Some(omega) = self.dfa_rsh_scf.0 {
-            xc_data.dfa_rsh_scf = Some((omega, alpha, beta));
-        } else {
-            xc_data.dfa_rsh_scf = None;
-        }
+        xc_data.dfa_rsh_scf = self.dfa_rsh_scf_lrsr;
+        xc_data
+    }
+
+    pub fn to_dfa4rest(&self) -> DFA4REST {
+        let mut xc_data = self.to_scf_xc_data();
         if let Some(nscf_components) = &self.xc_nscf {
             let mut dfa_compnt_pos = Vec::new();
             let mut dfa_paramr_pos = Vec::new();
@@ -609,6 +727,69 @@ impl DFAdef {
             xc_data.dfa_hybrid_pos = self.dfa_hybrid_nscf;
         }
         xc_data
+    }
+
+    /// Narrowed SCF exc/vxc [`DFA4REST`]: same SCF-side content as [`Self::to_dfa4rest`]
+    /// but carrying no fifth-rung state (`dfa_family_pos`/`dfa_compnt_pos`/`dfa_paramr_pos`/
+    /// `dfa_hybrid_pos`/`dfa_paramr_adv` stay at defaults); the post-SCF definition remains
+    /// in `xc_nscf` and is read through the DFAdef accessors (`family_pos`, `fifth_rung_component`, ...).
+    pub fn to_xc_data(&self) -> DFA4REST {
+        self.to_scf_xc_data()
+    }
+
+    /// The fifth-rung (post-SCF) family carried by the final-energy components
+    /// (`xc_nscf`); `None` for a purely variational SCF functional.
+    pub fn family_pos(&self) -> Option<DFAFamily> {
+        self.fifth_rung_component()
+            .and_then(|comp| comp.component_type.to_dfa_family())
+    }
+
+    /// `true` when the SCF functional evaluates DFT XC on a grid (has at least one
+    /// libxc component), mirroring `DFA4REST::is_dfa_scf`.
+    pub fn is_dfa_scf(&self) -> bool {
+        self.xc_scf
+            .as_ref()
+            .map_or(false, |comps| comps.iter().any(|comp| comp.component_type == ComponentType::Libxc))
+    }
+
+    /// `true` only for the RPA family (SCSRPA does not count), mirroring `DFA4REST::is_rpa`.
+    pub fn is_rpa(&self) -> bool {
+        matches!(self.family_pos(), Some(DFAFamily::RPA))
+    }
+
+    /// The fifth-rung component of the final-energy functional - the single component
+    /// of type PT2/RPA/SCSRPA/SBGE2, matching what `to_dfa4rest` projects into
+    /// `dfa_paramr_adv`. Its `param_positional` holds the family's auxiliary factors
+    /// (for PT2/SCSRPA/SBGE2: the opposite-spin / same-spin scaling `(c_os, c_ss)`).
+    pub fn fifth_rung_component(&self) -> Option<&DFAComponent> {
+        self.xc_nscf.as_ref()?.iter().find(|comp| {
+            FIFTH_RUNG_COMPONENT_TYPES.contains(&comp.component_type)
+        })
+    }
+
+    /// Override the PT2 `(c_os, c_ss)` factors (e.g. from the `ri_pt2` `os_factor`/`ss_factor`
+    /// control keywords). No-op when the definition carries no PT2 component; a component
+    /// without positional parameters defaults to `[1.0, 1.0]`.
+    pub fn update_pt2_params(&mut self, os_factor: Option<f64>, ss_factor: Option<f64>) {
+        let comps = match self.xc_nscf.as_mut() {
+            Some(comps) => comps,
+            None => return,
+        };
+        let idx = match comps.iter().position(|comp| comp.component_type == ComponentType::PT2) {
+            Some(idx) => idx,
+            None => return,
+        };
+        let mut params = std::mem::take(&mut comps[idx].param_positional);
+        if params.is_empty() {
+            params = vec![1.0, 1.0];
+        }
+        if let Some(osf) = os_factor {
+            params[0] = osf;
+        }
+        if let Some(ssf) = ss_factor {
+            params[1] = ssf;
+        }
+        comps[idx].param_positional = params;
     }
 
     pub fn formatted_output(&self) -> String {
@@ -686,6 +867,23 @@ impl DFAdef {
         result
     }
 
+    /// `(omega, c_LR, c_SR)` of the SCF functional in the consumer convention of
+    /// `DFA4REST::dfa_rsh_scf` / `rsh_params` (the same normalization
+    /// `DFA4REST::get_rsh_libxc` applies on the legacy path): `c_LR` is the
+    /// long-range (full-range) HF fraction and `c_SR` the short-range fraction.
+    /// Per libxc's convention (xc.h) `cam_alpha` is the full HF fraction and
+    /// `cam_beta` the short-range-only extra (SR = cam_alpha + cam_beta,
+    /// LR = cam_alpha), so the raw `get_rsh` slots are `(c_LR, c_SR - c_LR)` for
+    /// every component type and `get_rsh_lrsr` restores the absolute `c_SR`.
+    /// Non-RSH components carry their (range-independent) hybrid in both slots.
+    pub fn get_rsh_scf_lrsr(&self, spin_channel: usize) -> (Option<f64>, f64, f64) {
+        // get_rsh_scf sums the raw libxc-style slots (c_LR, c_SR - c_LR) over the
+        // components; restoring the absolute short-range fraction is then just
+        // c_SR = (c_SR - c_LR) + c_LR (SR = alpha + beta in libxc's convention)
+        let (omega, c_lr, c_sr_minus_lr) = self.get_rsh_scf(spin_channel);
+        (omega, c_lr, c_sr_minus_lr + c_lr)
+    }
+
     pub fn get_hybrid_nscf(&self, spin_channel: usize) -> f64 {
         // sum up all hybrid components in self.xc
         if let Some(components) = &self.xc_nscf {
@@ -699,7 +897,64 @@ impl DFAdef {
 
     pub fn is_hybrid(&self) -> bool {
         // todo: what if not initialized?
-        self.dfa_hybrid_scf.abs() >= 1e-6
+        self.dfa_hybrid_scf.abs() >= 1e-6 || self.is_rsh()
+    }
+
+    pub fn omega(&self) -> Option<f64> {
+        self.dfa_rsh_scf.0
+    }
+
+    /// The RSH parameters `(omega, c_LR, c_SR)` of the SCF functional, in the consumer
+    /// convention (computed once at parse time and stored in `dfa_rsh_scf_lrsr`);
+    /// `None` when the SCF functional is not range-separated.
+    pub fn rsh_params_scf(&self) -> Option<(f64, f64, f64)> {
+        self.dfa_rsh_scf_lrsr
+    }
+
+    /// `true` when any SCF libxc component needs the density gradient
+    /// (non-LDA family); mirrors `DFA4REST::use_density_gradient` over the
+    /// SCF components.
+    pub fn use_density_gradient(&self) -> bool {
+        self.xc_scf.as_ref().map_or(false, |comps| {
+            comps.iter().any(|comp| {
+                comp.to_libxc_functional(1).map_or(false, |f| {
+                    !matches!(f.family(), libxc::enums::LibXCFamily::LDA | libxc::enums::LibXCFamily::HybLDA)
+                })
+            })
+        })
+    }
+
+    /// `true` when any SCF libxc component needs tau (meta-GGA); mirrors
+    /// `DFA4REST::use_kinetic_density` over the SCF components.
+    pub fn use_kinetic_density(&self) -> bool {
+        self.xc_scf.as_ref().map_or(false, |comps| {
+            comps.iter().any(|comp| {
+                comp.to_libxc_functional(1).map_or(false, |f| f.needs_tau())
+            })
+        })
+    }
+
+    /// SCF-functional list of `(factor, LibXCFunctional)` for the exc/vxc module
+    /// functions; the omega ext-parameter of RSH components is applied from
+    /// `dfa_rsh_scf`. DFAdef-side twin of `DFA4REST::libxc_func_list`.
+    pub fn scf_func_list(&self, spin_channel: usize) -> Vec<(f64, LibXCFunctional)> {
+        let mut funcs = func_list_from_components(self.xc_scf.as_deref(), spin_channel)
+            .unwrap_or_default();
+        if let Some(omega) = self.dfa_rsh_scf.0 {
+            for (_factor, func) in funcs.iter_mut() {
+                if func.ext_param_names().contains(&"_omega".to_string()) {
+                    func.set_ext_param_by_name("_omega", omega);
+                }
+            }
+        }
+        funcs
+    }
+
+    /// Final-energy functional list of `(factor, LibXCFunctional)`; `None` when the
+    /// definition has no final-energy part or carries no libxc component
+    /// (pure-MP2-family post-SCF methods).
+    pub fn nscf_func_list(&self, spin_channel: usize) -> Option<Vec<(f64, LibXCFunctional)>> {
+        func_list_from_components(self.xc_nscf.as_deref(), spin_channel)
     }
 
     pub fn is_rsh(&self) -> bool {
@@ -741,17 +996,7 @@ impl DFAdef {
 
     pub fn is_fifth_dfa(&self) -> bool {
         // check if any component in self.xc is a fifth rung functional
-        if let Some(components) = &self.xc_nscf {
-            for comp in components.iter() {
-                match comp.component_type {
-                    ComponentType::PT2 | ComponentType::RPA | ComponentType::SCSRPA | ComponentType::SBGE2 => {
-                        return true;
-                    },
-                    _ => {},
-                }
-            }
-        }
-        false
+        self.fifth_rung_component().is_some()
     }
 
     pub fn has_nscf(&self) -> bool {
@@ -899,6 +1144,113 @@ pub fn parse_tokens(mut components: Vec<DFAComponent>, functype: &str) -> Vec<DF
 //     DFA2step(DFA2step),
 // }
 
+/// `(libxc code, factor)` pairs of the Libxc components, in order — the bridge from the
+/// component-typed DFAdef world to the code-array currency of the exc/vxc/numint layer
+/// `(scale, functional)` pairs of the final-energy functional's DFT (libxc) part; `None`
+/// when `xc_nscf` is absent or carries no libxc component (pure-MP2-family post-SCF
+/// methods). Shared door of the DH response/gradient interfaces (restricted and
+/// spin-polarized siblings via `spin`).
+pub fn func_list_from_components(
+    components: Option<&[DFAComponent]>,
+    spin_channel: usize,
+) -> Option<Vec<(f64, LibXCFunctional)>> {
+    let components = components?;
+    let list: Vec<_> = components
+        .iter()
+        .filter_map(|comp| comp.to_libxc_functional(spin_channel).map(|func| (comp.factor, func)))
+        .collect_vec();
+    if list.is_empty() {
+        None
+    } else {
+        Some(list)
+    }
+}
+
+impl DFAdef {
+    /// Pure-exchange part of this definition: HF/RSHF components plus Libxc components
+    /// whose libxc kind is `Exchange`, with their factors preserved. Combined
+    /// `ExchangeCorrelation` functionals cannot be split natively and are omitted, as are
+    /// PT2/Disp terms. `None` when nothing survives (e.g. a pure-hybrid definition, or
+    /// HF-free pure correlation). The result is a definition whose `xc_scf` evaluates to
+    /// the pure exchange contribution; its other fields are empty.
+    pub fn x_part(&self, spin_channel: usize) -> Option<DFAdef> {
+        let comps: Vec<DFAComponent> = self.xc_scf.as_ref()?.iter().filter_map(|comp| {
+            match comp.component_type {
+                ComponentType::HF | ComponentType::RSHF => Some(comp.clone()),
+                ComponentType::Libxc => {
+                    let func = comp.to_libxc_functional(spin_channel)?;
+                    if matches!(func.kind(), LibXCFunctionalKind::Exchange) {
+                        Some(comp.clone())
+                    } else {
+                        None
+                    }
+                },
+                _ => None,
+            }
+        }).collect();
+        if comps.is_empty() {
+            return None;
+        }
+        let mut part = DFAdef::new();
+        part.spin_channel = spin_channel;
+        part.xc_scf = Some(comps);
+        Some(part)
+    }
+
+    /// Pure-correlation part of this definition: Libxc components whose libxc kind is
+    /// `Correlation`, factors preserved. HF/RSHF are exchange-only and omitted; combined
+    /// `ExchangeCorrelation` functionals cannot be split natively; PT2/Disp omitted.
+    /// `None` when nothing survives.
+    pub fn c_part(&self, spin_channel: usize) -> Option<DFAdef> {
+        let comps: Vec<DFAComponent> = self.xc_scf.as_ref()?.iter().filter_map(|comp| {
+            match comp.component_type {
+                ComponentType::Libxc => {
+                    let func = comp.to_libxc_functional(spin_channel)?;
+                    if matches!(func.kind(), LibXCFunctionalKind::Correlation) {
+                        Some(comp.clone())
+                    } else {
+                        None
+                    }
+                },
+                _ => None,
+            }
+        }).collect();
+        if comps.is_empty() {
+            return None;
+        }
+        let mut part = DFAdef::new();
+        part.spin_channel = spin_channel;
+        part.xc_scf = Some(comps);
+        Some(part)
+    }
+}
+
+/// The pure exchange (`kind = Exchange`) or correlation (`kind = Correlation`) part of a
+/// functional NAME as a definition, decomposed natively without curated x/c tables:
+/// a raw libxc identifier (e.g. `lda_x_slater`) is resolved by libxc itself and kept when
+/// its functional kind matches; otherwise the REST-level parse (aliases, multistep,
+/// dispersion suffixes) runs and the definition is filtered through
+/// `DFAdef::x_part`/`c_part`. Combined `ExchangeCorrelation` functionals (e.g. `b3lyp`)
+/// have no separate parts and yield `None`, as does an unmatched request.
+pub fn xc_part_of_name(name: &str, spin_channel: usize, kind: LibXCFunctionalKind) -> Option<DFAdef> {
+    let spin = if spin_channel == 2 { LibXCSpin::Polarized } else { LibXCSpin::Unpolarized };
+    if let Ok(func) = LibXCFunctional::from_identifier_f(name, spin) {
+        if matches!(func.kind(), k if k == kind) {
+            let mut part = DFAdef::new();
+            part.spin_channel = spin_channel;
+            part.xc_scf = Some(vec![DFAComponent::from_libxc(func.number() as usize, 1.0)]);
+            return Some(part);
+        }
+        return None;
+    }
+    let def = parse_and_derive(name, spin_channel, 0);
+    match kind {
+        LibXCFunctionalKind::Exchange => def.x_part(spin_channel),
+        LibXCFunctionalKind::Correlation => def.c_part(spin_channel),
+        _ => None,
+    }
+}
+
 pub fn parse_and_derive(xc: &str, spin_channel: usize, print_level: usize) -> DFAdef {
     let mut dfa = parse(xc.to_lowercase().as_str());
     dfa.spin_channel = spin_channel;
@@ -906,6 +1258,8 @@ pub fn parse_and_derive(xc: &str, spin_channel: usize, print_level: usize) -> DF
     // dfa.init_libxc();
     dfa.dfa_hybrid_scf = dfa.get_hybrid_scf(spin_channel);
     dfa.dfa_rsh_scf = dfa.get_rsh_scf(spin_channel);
+    let (omega, c_lr, c_sr) = dfa.get_rsh_scf_lrsr(spin_channel);
+    dfa.dfa_rsh_scf_lrsr = omega.map(|omega| (omega, c_lr, c_sr));
     if dfa.has_nscf() {
         dfa.dfa_hybrid_nscf = Some(dfa.get_hybrid_nscf(spin_channel));
     }
@@ -1195,3 +1549,4 @@ fn parse_arguments(input: &str) -> (HashMap<String, Value>, Vec<f64>) {
 
     (keyword_args, positional_args)
 }
+
