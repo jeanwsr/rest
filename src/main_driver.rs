@@ -622,6 +622,9 @@ pub fn main_driver() -> anyhow::Result<()> {
         println!("              REST: Mission accomplished");
         println!("====================================================");
         output_result(&scf_data);
+        if scf_data.mol.ctrl.oss_roks {
+            scf_data.evaluate_oss_quantities();
+        }
         time_mark.report_all();
     }
 
@@ -642,7 +645,35 @@ pub fn main_driver() -> anyhow::Result<()> {
 }
 
 pub fn output_result(scf_data: &scf_io::SCF) {
-    
+
+    //===========================================================
+    // 0a. ROKS (oss_roks): the Mission-accomplished block
+    //     prints the spin-purified singlet energies only. The first
+    //     line is the final ROKS total E_S of the requested method
+    //     ("oss_e_singlet": method-level for the PT2 family, SCF-level
+    //     otherwise); the second line, printed only when it differs
+    //     from the first, is the SCF-level E_S(KS) = 2 E_mix - E_T(KS),
+    //     the analogue of Q-Chem's ROKS "SCF energy in the final basis
+    //     set". E_mix is an intermediate construction (not a physical
+    //     state) and appears only in the rohf-oss report table; the
+    //     legacy "(R)-xDH energy" line would print E_mix(DH) and is
+    //     skipped for OSS jobs.
+    //===========================================================
+    if scf_data.mol.ctrl.oss_roks {
+        if scf_data.mol.ctrl.solvent_enabled {
+            println!("The solvent energy    : {:18.10} Ha", scf_data.energies.get("solvent_energy").unwrap()[0]);
+        }
+        if let Some(v) = scf_data.energies.get("oss_e_singlet") {
+            println!("The ROKS energy (E_S) : {:18.10} Ha", v[0]);
+        }
+        if let (Some(e_scf), Some(e)) = (scf_data.energies.get("oss_e_singlet_scf"), scf_data.energies.get("oss_e_singlet")) {
+            if (e_scf[0] - e[0]).abs() > 1.0e-10 {
+                println!("The ROKS SCF energy   : {:18.10} Ha", e_scf[0]);
+            }
+        }
+        return;
+    }
+
     //--------------------------
     // 0. Solvent energy
     //--------------------------
@@ -735,6 +766,15 @@ pub fn performance_essential_calculations(scf_data: &mut SCF, time_mark: &mut ut
     }
 
     //==================================================================
+    // Store the open-shell singlet energies (E_mix / K_ab / E_T / E_S)
+    // so that the chkfile and the total-energy collection see the
+    // spin-purified ROKS total energy E_S = 2 E_mix - E_T
+    //==================================================================
+    if scf_data.mol.ctrl.oss_roks {
+        scf_data.store_oss_energies(mpi_operator);
+    }
+
+    //==================================================================
     // Save the converged SCF results to the chkfile
     //==================================================================
     if scf_data.mol.ctrl.has_chkfile {
@@ -783,6 +823,16 @@ pub fn performance_essential_calculations(scf_data: &mut SCF, time_mark: &mut ut
         scf_data.energies.insert("ai_correction".to_string(), scc);
     }
 
+    //==================================================================
+    // Finalize the ROKS open-shell singlet energies at the method level:
+    // for the PT2 family the triplet components were cached by
+    // store_oss_energies while the DFT grids were alive; they are now
+    // combined with E_mix(DH) = xdh_energy into E_T(DH) / E_S(DH)
+    //==================================================================
+    if scf_data.mol.ctrl.oss_roks {
+        scf_data.store_oss_energies_finalize();
+    }
+
     let total_energy = collect_total_energy(scf_data);
     scf_data.energies.insert("total_energy".to_string(), vec![total_energy]);
     total_energy
@@ -794,8 +844,16 @@ pub fn collect_total_energy(scf_data: &SCF) -> f64 {
     // Determine the total energy
     //====================================
     let mut total_energy = scf_data.scf_energy;
-    
-    if scf_data.mol.xc_data.is_rpa() {
+
+    if scf_data.mol.ctrl.oss_roks {
+        // ROKS: the total energy is the spin-purified open-shell singlet
+        // E_S = 2 E_mix - E_T, stored by store_oss_energies at the SCF
+        // level and overwritten by store_oss_energies_finalize with the
+        // method-level values for the PT2 family. This branch must come
+        // FIRST: for an OSS + double-hybrid job the xdh branch below would
+        // otherwise return E_mix(DH) instead of E_S(DH).
+        total_energy = scf_data.energies.get("oss_e_singlet").unwrap()[0];
+    } else if scf_data.mol.xc_data.is_rpa() {
         total_energy = scf_data.energies.get("rpa_energy").unwrap()[0];
     } else if scf_data.mol.xc_data.is_fifth_dfa() {
         total_energy = scf_data.energies.get("xdh_energy").unwrap()[0];
@@ -855,6 +913,13 @@ fn eval_force(scf_data: &mut SCF, time_mark: &mut utilities::TimeRecords, mpi_op
     // this is a temporary workaround for the force evaluation
     // currently, this framework could not work for post-scf,
     // especially that currently there's no class that represents post-scf computation
+
+    // ROKS forces are not implemented yet (Phase 2, Step 5): both the
+    // analytical RHF branch (wrong occupation handling) and the numerical
+    // branch (would differentiate E_mix, not E_S) would give wrong results.
+    if scf_data.mol.ctrl.oss_roks {
+        panic!("ERROR: rohf-oss: forces / geometry optimization are not yet supported for oss_roks (planned for Phase 2, Step 5)");
+    }
 
     time_mark.count_start("force");
     if scf_data.mol.ctrl.print_level>0 {

@@ -22,7 +22,7 @@ use crate::ri_pt2::pt2_25d::{initialize_metadata, initialize_metadata_linear, ch
 
 use crate::ri_pt2::sbge2::{close_shell_sbge2_rayon,open_shell_sbge2_rayon};
 use crate::ri_rpa::scsrpa::{evaluate_osrpa_correlation_rayon, evaluate_osrpa_correlation_rayon_mpi};
-use crate::scf_io::{determine_ri3mo_size_for_pt2_and_rpa, scf};
+use crate::scf_io::{determine_ri3mo_size_for_pt2_and_rpa, generate_ri3mo_rayon_for_pt2_and_rpa, oss_homo_lumo_scan, scf};
 use crate::molecule_io::Molecule;
 use crate::scf_io::{SCF, SCFType};
 use crate::utilities::{TimeRecords, self};
@@ -171,6 +171,8 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     let xc_energy_scf = scf_data.evaluate_xc_energy(0, mpi_operator);
     let xc_energy_xdh = scf_data.evaluate_xc_energy(1, mpi_operator);
     scf_data.energies.insert(String::from("x_hf"), vec![x_energy]);
+    scf_data.energies.insert(String::from("xc_energy_scf"), vec![xc_energy_scf]);
+    scf_data.energies.insert(String::from("xc_energy_xdh"), vec![xc_energy_xdh]);
     timerecords.count("xc_energy");
 
     // If post_ai_correction (e.g. SCC15) will run after xdh_calculations,
@@ -250,12 +252,17 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     //   - new_driver is not also requested (precedence: new_driver > streaming)
     //   - engine = "torch" is not requested (precedence: torch > new_driver > streaming)
     //   - MPI not active (single-node only for now)
+    // OSS is excluded: the streaming driver builds occ_range = start_mo..lumo,
+    // which is only valid for an Aufbau occupation, while the OSS beta
+    // channel has a hole below its HOMO. The ri_symm / legacy drivers build
+    // occ_range = start_mo..homo+1 and handle the hole correctly.
     let use_streaming = !use_new_driver
         && !use_torch_engine
         && scf_data.mol.ctrl.ri_pt2.streaming
         && mpi_operator.is_none()
         && scf_data.mol.ctrl.use_ri_symm
         && scf_data.rimatr.is_some()
+        && !scf_data.mol.ctrl.oss_roks
         && dfa_family_pos == crate::dft::DFAFamily::PT2;
 
     if use_torch_engine {
@@ -379,6 +386,23 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
         };
         timerecords.count("c_r5dft");
     } else if scf_data.mol.ctrl.use_ri_symm {
+        // OSS (ROKS) PT2 uses the actual open-shell occupation as its
+        // reference (alpha in a,
+        // beta in b -- a hole in the beta channel at `a`), evaluated in
+        // the OSS semi-canonical basis that
+        // `semi_diagonalize_hamiltonian_outside_oss` builds from the
+        // occupation mask (closed 0..nc, alpha open at a, beta open at b).
+        // `restricted_open_shell_pt2_rayon` skips every orbital whose
+        // occupation is neither 0 nor 1, so the beta hole enters only as a
+        // virtual (`lumo[1] = a`) and `orb_b` is excluded from the beta
+        // virtuals -- that is the internal-flip sector of the OS doubles.
+        //
+        // 2026-10-28: this replaces the earlier "fill the beta hole"
+        // (symmetric Aufbau) reference. That variant built a closed-shell
+        // MP2 on orbitals that are stationary for E_S but not for the
+        // closed shell, leaving a large non-Brillouin singles row and
+        // overestimating the correlation by ~1.74x against Q-Chem
+        // (H2/6-31G B2PLYP: -0.0586 vs -0.0337 Ha raw, -6.7 mHa in E_S(DH)).
         timerecords.count_start("ao2mo");
         crate::scf_io::generate_ri3mo_rayon_for_pt2_and_rpa(scf_data);
         timerecords.count("ao2mo");
@@ -474,7 +498,34 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     let hy_coeffi_scf = scf_data.mol.xc_data.dfa_hybrid_scf;
     let hy_coeffi_xdh = if let Some(coeff) = scf_data.mol.xc_data.dfa_hybrid_pos {coeff} else {0.0};
     let hy_coeffi_pt2 = if let Some(coeff) = &scf_data.mol.xc_data.dfa_paramr_adv {coeff.clone()} else {vec![0.0,0.0]};
-    let xdh_pt2_energy: f64 = pt2_c[1..3].iter().zip(hy_coeffi_pt2.iter()).map(|(e,c)| e*c).sum();
+    // The ROHF single-excitation contribution does not vanish in the
+    // semi-canonical basis: the restricted open-shell reference violates
+    // Brillouin's theorem, so the occ-vir block of its Fock stays non-zero.
+    //
+    // It belongs to the second-order energy only when the reference is a
+    // pure Hartree-Fock one (plain MP2).  There it is the orbital-relaxation
+    // term that makes E2 independent of how the orbitals are
+    // semi-canonicalized, and its weight is 1.
+    //
+    // For xDH / bDH the Fock used by the semi-canonicalization is the SCF
+    // functional's (e.g. B3LYP for XYG3, 0.53 HF + 0.47 B88 for B2PLYP).
+    // Its occupied-virtual block carries the XC potential and is NOT the MP2
+    // singles of orbital relaxation; those functionals define their PT2 part
+    // as the doubles-only correction on such orbitals and were fitted on
+    // closed-shell systems, where this term vanishes identically.  Adding it
+    // here would scale an unfitted, functional-dependent quantity by c_ss,
+    // so it is deliberately dropped.  (The PT2 drivers still print the raw
+    // contribution, see `print_ro_pt2_singles_warning`.)
+    let singles = pt2_c[0] - pt2_c[1] - pt2_c[2];
+    let pure_hf_reference = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+    let rohf_singles = if matches!(scf_data.scftype, SCFType::ROHF) && pure_hf_reference {
+        singles
+    } else {
+        0.0
+    };
+    let xdh_pt2_energy: f64 =
+        pt2_c[1..3].iter().zip(hy_coeffi_pt2.iter()).map(|(e,c)| e*c).sum::<f64>()
+        + rohf_singles;
     if scf_data.mol.ctrl.print_level>2 {
         println!("Exc_scf: ({:?},{:?}),Exc_pos: ({:?},{:?})",xc_energy_scf,hy_coeffi_scf,xc_energy_xdh,hy_coeffi_xdh);
     }
@@ -502,10 +553,122 @@ pub fn xdh_calculations(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) 
     }
 
     scf_data.energies.insert(String::from("xdh_energy"), vec![total_energy]);
+    // The PT2 correlation of the post-SCF family (OS/SS pair sums weighted
+    // by the dfa_paramr_adv coefficients) under its own key: the
+    // single-pass ROKS assembly of `store_oss_energies_finalize`
+    // (oss_pt2_single_pass) adds it onto E_S(SCF) after the exchange/XC
+    // level-raising corr_S of that function, so it must be retrievable
+    // independently of the E_mix(DH) bookkeeping of xdh_energy.
+    scf_data.energies.insert(String::from("xdh_pt2_energy"), vec![xdh_pt2_energy]);
 
     if scf_data.mol.ctrl.print_level>1 {timerecords.report_all()};
 
     Ok(total_energy)
+}
+
+/// Triplet PT2 correlation for the open-shell singlet (PT2 family only;
+/// Step 5' of `docs/oss_rohf_phase2_framework.md`).
+///
+/// F1 decision: the OSS semi-canonical orbitals and eigenvalues are reused
+/// -- the basis on which the OSS SCF converged. (The triplet occupation
+/// leaves the total occupation of the (a, b) pair unchanged, so the
+/// closed / virtual subspaces of the OSS semi-canonicalization are
+/// identical; re-running the semi diagonalization under the triplet
+/// occupation therefore reproduces the same basis and is a numerical
+/// no-op.) Only the occupation / homo / lumo are swapped to the triplet
+/// pattern (alpha += b, beta -= b) and the ri3mo integrals regenerated
+/// with the triplet pair sectors; the standard restricted open-shell
+/// driver then runs unchanged. (The E_mix pass of `xdh_calculations` also
+/// follows the Q-Chem ROKS convention: the PT2 reference is the OSS
+/// occupation itself -- alpha in `a`, beta in `b`, the beta hole kept
+/// open -- in the OSS semi-canonical basis.)
+///
+/// The driver dispatch mirrors `xdh_calculations` for the ri_symm branch;
+/// the legacy branch diverges (see the inline comment there). The
+/// streaming driver is deliberately NOT used here: it builds
+/// occ_range = start_mo..lumo, which is only valid for an Aufbau
+/// occupation, while both the OSS mixed determinant and the triplet have
+/// a hole below the HOMO of one spin channel (see the use_streaming
+/// condition of `xdh_calculations`, which excludes OSS for the same
+/// reason). The restricted open-shell drivers build occ_range =
+/// start_mo..homo+1 and handle the hole correctly.
+pub fn oss_triplet_pt2_correlation(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>) -> [f64; 3] {
+    let dfa_family_pos = scf_data.mol.xc_data.dfa_family_pos.clone().unwrap();
+    let [_, orb_b] = match scf_data.mol.ctrl.oss_pair {
+        Some(occ) => occ,
+        None => panic!("ERROR: rohf-oss: the open-shell orbital indices (a, b) are not fixed yet"),
+    };
+
+    // the OSS semi-canonical basis (F1): computed from the OSS hamiltonian
+    // under the OSS occupation, shared by both PT2 evaluations
+    if scf_data.semi_eigenvectors.is_none() {
+        scf_data.semi_diagonalize_hamiltonian();
+    }
+
+    // --- swap to the triplet occupation -------------------------------------
+    let occ_mix = scf_data.occupation.clone();
+    let (homo_mix, lumo_mix) = (scf_data.homo, scf_data.lumo);
+
+
+    scf_data.occupation[0][orb_b] = 1.0;
+    scf_data.occupation[1][orb_b] = 0.0;
+    (scf_data.homo, scf_data.lumo) = oss_homo_lumo_scan(&scf_data.occupation);
+
+
+    // Only the ri3mo-generating branches mutate the integral fields: the
+    // generator overwrites ri3mo and (in the ri_symm branch) consumes
+    // rimatr, so both handles are moved out first and restored afterwards
+    // (the triplet pass then pays the AO-based ri3mo generation while the
+    // subsequent E_mix pass inside `xdh_calculations` keeps the fast
+    // rimatr path).
+    let mut pt2_c = if scf_data.mol.ctrl.use_ri_symm {
+        let ri3mo_mix = scf_data.ri3mo.take();
+        let rimatr_mix = scf_data.rimatr.take();
+        // ri3mo with the triplet pair sectors (occ up to max(homo), virt
+        // from min(lumo)); the internal ROHF semi re-diagonalization
+        // reproduces the OSS basis bitwise under the triplet occupation
+        generate_ri3mo_rayon_for_pt2_and_rpa(scf_data);
+        let pt2_c_t = match dfa_family_pos {
+            crate::dft::DFAFamily::PT2 => restricted_open_shell_pt2_rayon_mpi(scf_data, mpi_operator).unwrap(),
+            crate::dft::DFAFamily::SBGE2 => open_shell_sbge2_rayon_mpi(scf_data, mpi_operator).unwrap(),
+            crate::dft::DFAFamily::SCSRPA => evaluate_osrpa_correlation_rayon_mpi(scf_data, mpi_operator).unwrap(),
+            _ => unreachable!("rohf-oss: the triplet PT2 pass is only defined for the PT2 family"),
+        };
+        scf_data.ri3mo = ri3mo_mix;
+        scf_data.rimatr = rimatr_mix;
+        pt2_c_t
+    } else {
+        // use_ri_symm = false: the E_mix pass dispatches to the legacy
+        // open_shell_pt2, a UHF driver that reads eigenvectors[1] -- which
+        // is empty for ROHF (only eigenvectors[0] is filled by the
+        // diagonalization), so it cannot be mirrored for the triplet.
+        // Build ri3mo through the AO-based path and run the non-MPI
+        // restricted open-shell driver instead. (The E_mix legacy path for
+        // ROHF has the same eigenvector issue and is unaffected by this
+        // function; use use_ri_symm = true for OSS + PT2-family jobs.)
+        let ri3mo_mix = scf_data.ri3mo.take();
+        generate_ri3mo_rayon_for_pt2_and_rpa(scf_data);
+        let pt2_c_t = match dfa_family_pos {
+            crate::dft::DFAFamily::PT2 => restricted_open_shell_pt2_rayon(scf_data).unwrap(),
+            crate::dft::DFAFamily::SBGE2 => open_shell_sbge2_rayon(scf_data).unwrap(),
+            crate::dft::DFAFamily::SCSRPA => evaluate_osrpa_correlation_rayon(scf_data).unwrap(),
+            _ => unreachable!("rohf-oss: the triplet PT2 pass is only defined for the PT2 family"),
+        };
+        scf_data.ri3mo = ri3mo_mix;
+        pt2_c_t
+    };
+    // mirror the SCSRPA repacking of xdh_calculations (pt2_c[2] = same-spin)
+    if scf_data.mol.ctrl.xc.eq(&"scsrpa") {
+        pt2_c[2] = pt2_c[0] - pt2_c[1];
+    }
+
+
+    // --- restore the OSS occupation ------------------------------------------
+    scf_data.occupation = occ_mix;
+    scf_data.homo = homo_mix;
+    scf_data.lumo = lumo_mix;
+
+    pt2_c
 }
 
 
@@ -1475,10 +1638,16 @@ pub fn close_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPIOperat
 
         Ok([e_mp2_ss+e_mp2_os,e_mp2_os,e_mp2_ss])
     } else {
-        close_shell_pt2_rayon(scf_data)
+        // No MPI operator available: run the non-MPI restricted open-shell
+        // driver. (This used to fall back to close_shell_pt2_rayon, which
+        // only reads the alpha channel and silently produced the wrong
+        // correlation for any open-shell reference; the restricted driver
+        // handles the alpha/beta pair sectors -- including the OSS hole
+        // below the beta HOMO -- correctly on a single node.)
+        restricted_open_shell_pt2_rayon(scf_data)
     }
     #[cfg(not(feature = "mpi"))]
-    { close_shell_pt2_rayon(scf_data) }
+    { restricted_open_shell_pt2_rayon(scf_data) }
 
 }
 
@@ -1799,6 +1968,56 @@ pub fn close_shell_pt2_rayon_mpi_25d(scf_data: &SCF, mpi_operator: &Option<MPIOp
     }
 }
 
+/// Report the RO-PT2 single-excitation contribution of one PT2 pass.
+///
+/// Kept as a **WARNING** on purpose: the term, its weight and its spin
+/// treatment are still being adjusted, so every run states what was
+/// computed and whether it entered the total energy.
+///
+/// `e_singles` is the per-spin list `[alpha, beta]` produced by the
+/// single-excitation loop of the calling driver:
+///
+/// ```text
+/// E_singles[sigma] = sum_{i in occ_sigma} sum_{a in vir_sigma}
+///                    -F^sigma_{ia}^2 / (eps^sigma_a - eps^sigma_i)
+/// ```
+///
+/// with `F^sigma` / `eps^sigma` the per-spin semi-canonical Fock and
+/// orbital energies of `semi_diagonalize_hamiltonian_outside` (i.e. of the
+/// **SCF-stage functional**, e.g. B3LYP for XYG3).
+///
+/// Whether the term is added to the total energy depends on the reference,
+/// not on the name of the method (see the singles comment in
+/// [`xdh_calculations`]):
+///
+/// * pure Hartree-Fock reference (plain MP2): the Fock is the HF one, the
+///   occ-vir block is non-zero only because ROHF violates Brillouin, and
+///   the term enters with weight 1;
+/// * DFT-based reference (xDH / bDH): the occ-vir block carries the XC
+///   potential and is not the MP2 singles; the PT2 part of those
+///   functionals is doubles-only by definition, so the term is computed and
+///   reported here but **not** added.
+fn print_ro_pt2_singles_warning(scf_data: &SCF, e_singles: &[f64; 2]) {
+    let pure_hf_reference = scf_data.mol.xc_data.dfa_compnt_scf.is_empty();
+    let verdict = if pure_hf_reference {
+        "The reference is pure Hartree-Fock (plain MP2): this contribution is ADDED to the \
+         second-order energy with weight 1."
+    } else {
+        "The reference is DFT-based (xDH/bDH): the occ-vir Fock elements are not the MP2 \
+         singles and the PT2 part of these functionals is doubles-only by definition, so this \
+         contribution is NOT added to the total energy."
+    };
+    println!(
+        "WARNING: The RO-PT2 method has been implemented.\n\
+         The contribution of singly excited states is {:16.8} Ha, with alpha: {:16.8} Ha, beta: {:16.8} Ha.\n\
+         {}",
+        e_singles[0] + e_singles[1],
+        e_singles[0],
+        e_singles[1],
+        verdict,
+    );
+}
+
 pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]> {
     let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
 
@@ -1806,13 +2025,21 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
     let mut e_mp2_single_list = [0.0_f64, 0.0_f64];
 
 
+    let spin_orb_indices = split_indices_by_spin_occ(&scf_data.occupation, 0.5);
     for i_spin in (0..2) {
+        let (occ_idx, vir_idx) = &spin_orb_indices[i_spin];
         let eigenvalues_spin = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin];
         let fock_spin = &scf_data.semi_fock.as_ref().unwrap()[i_spin];
-        for i_occ in (0..scf_data.lumo[i_spin]) {
-            for i_virt in (scf_data.lumo[i_spin]..scf_data.mol.num_state) {
+        for &i_occ in occ_idx {
+            if i_occ < scf_data.mol.start_mo {
+                continue;
+            }
+            for &i_virt in vir_idx {
                 let single_gap = eigenvalues_spin[i_virt] - eigenvalues_spin[i_occ];
-                e_mp2_single_list[i_spin] += - fock_spin[(i_virt,i_occ)].powf(2.0) / single_gap;
+                if single_gap.abs() <= 1.0e-10 {
+                    continue;
+                }
+                e_mp2_single_list[i_spin] += - fock_spin[(i_virt, i_occ)].powf(2.0) / single_gap;
             }
         }
     }
@@ -2018,26 +2245,10 @@ pub fn restricted_open_shell_pt2_rayon(scf_data: &SCF) -> anyhow::Result<[f64;3]
     // reuse the default omp_num_threads setting
     omp_set_num_threads_wrapper(default_omp_num_threads);
     
-    // Temporarily output the contribution of singly excited states here, to avoid modifying the pt2_c structure.
-    if let Some(coeff) = &scf_data.mol.xc_data.dfa_paramr_adv {
-        let hy_coeffi_pt2 = coeff.clone();
-        println!("WARNING: The RO-PT2 method has been implemented.  
-        The contribution parameter of singly excited states has been set to match 'para_mp2_ss': {}.  
-        As a result, the contribution of singly excited states is {:16.8} * {} = {:16.8} Ha, with alpha: {:16.8} * {} = {:16.8} Ha, beta: {:16.8} * {} = {:16.8} Ha.  
-        However, this contribution is not yet included in the final total energy.",  
-    hy_coeffi_pt2[1],  
-    e_mp2_single_list[0] + e_mp2_single_list[1], hy_coeffi_pt2[1], (e_mp2_single_list[0] + e_mp2_single_list[1]) * hy_coeffi_pt2[1],  
-    e_mp2_single_list[0], hy_coeffi_pt2[1], e_mp2_single_list[0] * hy_coeffi_pt2[1],  
-    e_mp2_single_list[1], hy_coeffi_pt2[1], e_mp2_single_list[1] * hy_coeffi_pt2[1]);  
-    } else {
-        println!("WARNING: The RO-PT2 method has been implemented.
-        The contribution of singly excited states is {:16.8} Ha, with alpha: {:16.8} Ha, beta: {:16.8} Ha.
-        However, this contribution is not yet included in the final total energy.",
-        e_mp2_single_list[0]+e_mp2_single_list[1],
-        e_mp2_single_list[0],
-        e_mp2_single_list[1]);
-    }
-      
+    // Report the singly excited contribution (kept as a warning on purpose:
+    // the term, its weight and its spin treatment are still being adjusted).
+    print_ro_pt2_singles_warning(scf_data, &e_mp2_single_list);
+
     Ok([e_mp2_ss+e_mp2_os+e_mp2_single_list[0]+e_mp2_single_list[1],e_mp2_os,e_mp2_ss])
 
 }
@@ -2323,6 +2534,7 @@ fn restricted_open_shell_pt2_rayon_mpi(scf_data: &SCF, mpi_operator: &Option<MPI
         mpi_broadcast(&mpi_op.world, &mut e_mp2_ss, 0);
         let mut e_mp2_os = mpi_reduce(&mpi_op.world, &mut [e_mp2_os], 0, &SystemOperation::sum())[0];
         mpi_broadcast(&mpi_op.world, &mut e_mp2_os, 0);
+        print_ro_pt2_singles_warning(scf_data, &e_mp2_single_list);
         Ok([e_mp2_ss+e_mp2_os+e_mp2_single_list[0]+e_mp2_single_list[1], e_mp2_os, e_mp2_ss])
     } else {
         restricted_open_shell_pt2_rayon(scf_data)
@@ -2834,6 +3046,10 @@ pub fn open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>)
     let default_omp_num_threads = scf_data.mol.ctrl.num_threads.unwrap();
     let print_level = scf_data.mol.ctrl.print_level;
 
+    if print_level > 3 {
+        report_pt2_denominator_diagnostic(scf_data, &scf_data.eigenvalues, "UHF canonical");
+    }
+
     let mut e_mp2_ss = 0.0_f64;
     let mut e_mp2_os = 0.0_f64;
 
@@ -2931,6 +3147,98 @@ pub fn open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>)
     Ok([e_mp2_ss + e_mp2_os, e_mp2_os, e_mp2_ss])
 }
 
+/// Diagnostic scan of the PT2 denominators of the reference used by the driver.
+///
+/// A non-Aufbau reference (e.g. a MOM hole below the HOMO) can leave an empty
+/// orbital at (almost) the same energy as an occupied one. The
+/// `1/(eps_a + eps_b - eps_i - eps_j)` terms of such pairs then dominate the
+/// correlation energy -- and make it unstable -- which is easy to mistake for a
+/// bug in the driver. This scan reports, for each spin-pair block, the smallest
+/// |denominator| (with the orbitals involved) and how many occupied pairs have
+/// a near-degenerate virtual pair; the single-excitation gaps are reported per
+/// channel as well.
+fn report_pt2_denominator_diagnostic(scf_data: &SCF, eigenvalues: &[Vec<f64>; 2], label: &str) {
+    let start_mo = scf_data.mol.start_mo;
+    let num_state = scf_data.mol.num_state;
+    let spin_channel = scf_data.mol.spin_channel.min(2);
+
+    // Occupied / virtual index lists per spin channel (core excluded).
+    let mut occ: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+    let mut vir: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+    for s in 0..spin_channel {
+        if eigenvalues[s].len() < num_state || scf_data.occupation[s].len() < num_state {
+            return;
+        }
+        for p in start_mo..num_state {
+            if scf_data.occupation[s][p] > 0.5 { occ[s].push(p); } else { vir[s].push(p); }
+        }
+    }
+
+    println!("PT2 denominator diagnostic ({}):", label);
+    // Cap the temporary pair-sum table (~24 bytes per entry).
+    const MAX_SUM_PAIRS: usize = 1_000_000;
+
+    // Single-excitation gaps, per channel.
+    for s in 0..spin_channel {
+        let mut best = f64::INFINITY;
+        let mut at = (0usize, 0usize);
+        for &i in &occ[s] {
+            for &a in &vir[s] {
+                let d = (eigenvalues[s][a] - eigenvalues[s][i]).abs();
+                if d < best { best = d; at = (i, a); }
+            }
+        }
+        if best.is_finite() {
+            println!("  ({},{}): min |eps_a - eps_i| = {:.3e} Ha  (i={}, a={})", s, s, best, at.0, at.1);
+        }
+    }
+
+    for (s1, s2) in [(0usize, 0usize), (0usize, 1usize), (1usize, 1usize)] {
+        if s1 >= spin_channel || s2 >= spin_channel { continue; }
+        let (no, nv) = (occ[s1].len() * occ[s2].len(), vir[s1].len() * vir[s2].len());
+        if no == 0 || nv == 0 { continue; }
+        if nv > MAX_SUM_PAIRS || no > MAX_SUM_PAIRS {
+            println!("  ({},{}): skipped ({} occupied x {} virtual pairs is too large for this scan)", s1, s2, no, nv);
+            continue;
+        }
+
+        // All virtual pair sums, sorted, for a binary search per occupied pair.
+        let mut vsum: Vec<(f64, usize, usize)> = Vec::with_capacity(nv);
+        for &a in &vir[s1] {
+            for &b in &vir[s2] {
+                vsum.push((eigenvalues[s1][a] + eigenvalues[s2][b], a, b));
+            }
+        }
+        vsum.sort_by(|x, y| x.0.total_cmp(&y.0));
+
+        let mut best = f64::INFINITY;
+        let mut best_at = (0usize, 0usize, 0usize, 0usize);
+        let (mut n05, mut n01, mut n001) = (0usize, 0usize, 0usize);
+        for &i in &occ[s1] {
+            for &j in &occ[s2] {
+                let target = eigenvalues[s1][i] + eigenvalues[s2][j];
+                let k = vsum.partition_point(|p| p.0 < target);
+                let mut d_min = f64::INFINITY;
+                let mut at = (0usize, 0usize);
+                if k < vsum.len() {
+                    let d = (vsum[k].0 - target).abs();
+                    if d < d_min { d_min = d; at = (vsum[k].1, vsum[k].2); }
+                }
+                if k > 0 {
+                    let d = (target - vsum[k - 1].0).abs();
+                    if d < d_min { d_min = d; at = (vsum[k - 1].1, vsum[k - 1].2); }
+                }
+                if d_min < best { best = d_min; best_at = (i, j, at.0, at.1); }
+                if d_min < 0.05 { n05 += 1; }
+                if d_min < 0.01 { n01 += 1; }
+                if d_min < 1.0e-3 { n001 += 1; }
+            }
+        }
+        println!("  ({},{}): min |D| = {:.3e} Ha  (i={}, j={}, a={}, b={});  occupied pairs with min|D| < 0.05/0.01/1e-3 Ha: {}/{}/{}",
+            s1, s2, best, best_at.0, best_at.1, best_at.2, best_at.3, n05, n01, n001);
+    }
+}
+
 /// Streaming ROHF PT2 driver.
 ///
 /// ROHF uses semi-canonical orbitals; the PT2 calculation treats α and β
@@ -2941,14 +3249,28 @@ pub fn open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>)
 pub fn restricted_open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Option<usize>) -> anyhow::Result<[f64;3]> {
     let print_level = scf_data.mol.ctrl.print_level;
 
+    if print_level > 3 {
+        if let Some(semi_evals) = scf_data.semi_eigenvalues.as_ref() {
+            report_pt2_denominator_diagnostic(scf_data, semi_evals, "ROHF semi-canonical");
+        }
+    }
+
     // Single-excitation contribution (no ao2mo or rimatr needed; uses semi Fock).
     let mut e_mp2_single_list = [0.0_f64, 0.0_f64];
+    let spin_orb_indices = split_indices_by_spin_occ(&scf_data.occupation, 0.5);
     for i_spin in 0..2 {
+        let (occ_idx, vir_idx) = &spin_orb_indices[i_spin];
         let eigenvalues_spin = &scf_data.semi_eigenvalues.as_ref().unwrap()[i_spin];
         let fock_spin = &scf_data.semi_fock.as_ref().unwrap()[i_spin];
-        for i_occ in 0..scf_data.lumo[i_spin] {
-            for i_virt in scf_data.lumo[i_spin]..scf_data.mol.num_state {
+        for &i_occ in occ_idx {
+            if i_occ < scf_data.mol.start_mo {
+                continue;
+            }
+            for &i_virt in vir_idx {
                 let single_gap = eigenvalues_spin[i_virt] - eigenvalues_spin[i_occ];
+                if single_gap.abs() <= 1.0e-10 {
+                    continue;
+                }
                 e_mp2_single_list[i_spin] += -fock_spin[(i_virt, i_occ)].powf(2.0) / single_gap;
             }
         }
@@ -3151,6 +3473,10 @@ pub fn restricted_open_shell_pt2_rayon_streaming(scf_data: &SCF, block_size: Opt
     // Mirrors `restricted_open_shell_pt2_rayon` at mod.rs:1464:
     //   Ok([ss + os + single, os, ss])
     let e_single = e_mp2_single_list[0] + e_mp2_single_list[1];
+
+    // Same report as `restricted_open_shell_pt2_rayon`: both drivers compute
+    // the term with identical code and weight it identically.
+    print_ro_pt2_singles_warning(scf_data, &e_mp2_single_list);
 
     omp_set_num_threads_wrapper(default_omp_num_threads);
     Ok([e_mp2_ss + e_mp2_os + e_single, e_mp2_os, e_mp2_ss])

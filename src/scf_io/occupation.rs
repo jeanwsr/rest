@@ -123,6 +123,53 @@ pub fn generate_occupation_integer(mol: &Molecule, scftype: &SCFType) -> ([Vec<f
         },
         SCFType::ROHF => {
             let occ_num = 1.0;
+            if mol.ctrl.oss_roks {
+                // restricted open-shell singlet: alpha occupies the closed shell
+                // plus orbital a, beta the closed shell plus orbital b (a != b).
+                // The occupation pattern is fixed by the orbital indices (a, b)
+                // in every SCF iteration (the fixed-index scheme).
+                let num_elec_alpha = num_elec[1];
+                let num_elec_beta = num_elec[2];
+                if num_elec_alpha != num_elec_beta {
+                    panic!("Error:: rohf-oss requires a singlet state (n_alpha = n_beta), but n_alpha = {}, n_beta = {}", num_elec_alpha, num_elec_beta);
+                }
+                let nc = num_elec_beta as usize - 1;   // number of closed-shell orbitals
+                let (orb_a, orb_b) = match mol.ctrl.oss_pair {
+                    Some([a, b]) => (a, b),
+                    None => (nc, nc + 1),   // automatic: alpha = HOMO, beta = LUMO
+                };
+                if orb_a == orb_b {
+                    panic!("Error:: rohf-oss requires two different open-shell orbitals (a != b), but (a, b) = ({}, {})", orb_a, orb_b);
+                }
+                if orb_a < nc || orb_b < nc {
+                    panic!("Error:: the rohf-oss open-shell orbitals must lie above the closed shell (nc = {}), but (a, b) = ({}, {})", nc, orb_a, orb_b);
+                }
+                if orb_a >= num_state || orb_b >= num_state {
+                    panic!("Error:: the rohf-oss open-shell orbital index exceeds the number of MOs (num_state = {}), but (a, b) = ({}, {})", num_state, orb_a, orb_b);
+                }
+                (0..2).for_each(|i_spin| {
+                    occupation[i_spin] = vec![0.0;num_state];
+                    (0..nc).for_each(|i| { occupation[i_spin][i] = occ_num; });
+                });
+                occupation[0][orb_a] = occ_num;
+                occupation[1][orb_b] = occ_num;
+                (0..2).for_each(|i_spin| {
+                    homo[i_spin] = occupation[i_spin].iter().enumerate()
+                        .filter(|(i,occ)| **occ >= 1.0e-6)
+                        .map(|(i,occ)| i).max().unwrap_or(0);
+                    // lumo = first strictly empty orbital of this spin channel.
+                    // (An older scan for the first |occ - 1| >= 1e-6 orbital
+                    // mistook the closed shell (occ = 2) for an unoccupied
+                    // orbital, returning lumo = 0 whenever a closed shell is
+                    // present. The post-SCF PT2 drivers treat lumo..num_state
+                    // as the particle set and only exclude singly-occupied
+                    // orbitals themselves, so with the old convention the
+                    // closed orbitals leaked into the particle sums.)
+                    lumo[i_spin] = occupation[i_spin].iter().enumerate()
+                        .filter(|(i,occ)| **occ < 1.0e-6)
+                        .map(|(i,occ)| i).min().unwrap_or(0);
+                });
+            } else {
             (0..2).for_each(|i_spin| {
                 occupation[i_spin] = vec![0.0;num_state];
                 let mut left_elec_spin = num_elec[i_spin+1];
@@ -134,13 +181,17 @@ pub fn generate_occupation_integer(mol: &Molecule, scftype: &SCFType) -> ([Vec<f
                 }
                 // make sure there is at least one LUMO
                 if index_i > num_state-1 && left_elec_spin>0.0 {
-                    panic!("Error:: the number of molecular orbitals is smaller than the number of electrons in the {}-spin channel\n num_state: {}; num_elec_alpha: {}", 
+                    panic!("Error:: the number of molecular orbitals is smaller than the number of electrons in the {}-spin channel\n num_state: {}; num_elec_alpha: {}",
                            i_spin,num_state, num_elec[i_spin]);
                 } else {
                     lumo[i_spin] = index_i;
-                    homo[i_spin] = index_i-1;
-                }; 
+                    // an empty spin channel (e.g. the beta channel of a
+                    // high-spin triplet with no closed shell, like H2 with
+                    // n_alpha = 2, n_beta = 0) has no HOMO: keep index 0
+                    homo[i_spin] = if index_i == 0 { 0 } else { index_i - 1 };
+                };
             });
+            }
         },
         SCFType::UHF => {
             let occ_num = 1.0;

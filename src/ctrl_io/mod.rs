@@ -538,6 +538,27 @@ pub struct InputKeywords {
     /// common orbital set of a restricted (RHF/ROHF/ROKS) calculation
     /// (keyword `u2r_style`, default "keepalpha").  See [`U2RStyle`].
     pub u2r_style: U2RStyle,
+    // Keywords for the restricted open-shell singlet (rohf-oss) calculations
+    // Force the ROHF path even when n_alpha == n_beta (singlet), with alpha
+    // occupying orbital a and beta occupying orbital b (a != b).
+    #[pyo3(get, set)]
+    pub oss_roks: bool,
+    /// (a, b): 0-based orbital indices of the singly-occupied alpha (a) and
+    /// beta (b) orbitals. None => automatic choice a = nc, b = nc + 1
+    /// (nc = number of closed-shell orbitals), i.e. Q-Chem RHF-OSS style.
+    pub oss_pair: Option<[usize; 2]>,
+    /// OSS + fifth-rung PT2-family energy assembly (default true): the
+    /// Q-Chem ROKS *structure* -- one SCF plus one PT2 pass. The PT2
+    /// reference is the **OSS occupation** (alpha in a, beta in b, the beta
+    /// hole kept open) in the OSS semi-canonical basis:
+    ///   E_S(DH) = E_S(SCF) + PT2(OSS occupation)
+    /// This is the REST OSS reference; the Q-Chem ROKS-MP2 reference is
+    /// undocumented and is not matched (see PR4_oss_roks.md). The triplet
+    /// PT2 pass is skipped (`store_oss_energies` caches pt2_c = [0;3]).
+    /// When false, the legacy double-pass assembly is used instead:
+    /// PT2_t on the triplet occupation is evaluated and
+    ///   E_S(DH) = 2 E_mix(DH) - E_T(DH).
+    pub oss_pt2_single_pass: bool,
     pub spin_correction_scheme: Option<String>,
     pub yamaguchi_triplet_type: Option<String>,
     /// External dipole field (x, y, z) intensity in atomic units
@@ -725,6 +746,9 @@ impl InputKeywords {
             guess_mix_theta_deg: [15.0, 15.0].to_vec(),
             start_mix_cycle: 0,
             u2r_style: U2RStyle::KeepAlpha,
+            oss_roks: false,
+            oss_pair: None,
+            oss_pt2_single_pass: true,
             spin_correction_scheme: None,
             yamaguchi_triplet_type: None,
             ext_field_dipole: None,
@@ -950,6 +974,22 @@ pub fn overall_parse_and_report_on_ctrl_geom(ctrl: &mut InputKeywords, geom: &mu
         };
         for fso in ctrl.force_state_occupation.iter_mut() {
             fso.normalize_ref_index(actual_file);
+        }
+    }
+
+    // sanity checks for the restricted open-shell singlet (rohf-oss) mode
+    if ctrl.oss_roks {
+        if ctrl.spin_polarization {
+            panic!("ERROR: oss_roks is incompatible with spin_polarization=true (the restricted open-shell singlet requires a common orbital set)");
+        }
+        if ctrl.force_state_occupation.len() > 0 {
+            warn!("oss_roks: the occupation pattern is overridden by force_state_occupation (MOM)");
+        }
+        info!("Restricted open-shell singlet (rohf-oss) calculation is requested.");
+        if let Some([orb_a, orb_b]) = ctrl.oss_pair {
+            info!("Open-shell orbitals: alpha = {}, beta = {}", orb_a, orb_b);
+        } else {
+            info!("Open-shell orbitals: automatic choice (alpha = HOMO, beta = LUMO)");
         }
     }
 
@@ -2191,6 +2231,39 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 _ => false,
             };
             
+            // for oss_roks: force the restricted open-shell singlet (rohf-oss) mode
+            tmp_input.oss_roks = match tmp_ctrl.get("oss_roks").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => tmp_bool.clone(),
+                serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(false),
+                other => false,
+            };
+            // for oss_pair: [a, b] with 0-based orbital indices of the singly-occupied
+            // alpha (a) and beta (b) orbitals; None (default) => automatic a=nc, b=nc+1
+            tmp_input.oss_pair = match tmp_ctrl.get("oss_pair").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Array(tmp_value) => {
+                    if tmp_value.len() == 2 {
+                        let orb_a = tmp_value[0].as_i64().unwrap_or(-1);
+                        let orb_b = tmp_value[1].as_i64().unwrap_or(-1);
+                        if orb_a >= 0 && orb_b >= 0 {
+                            Some([orb_a as usize, orb_b as usize])
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                },
+                other => None,
+            };
+            // for oss_pt2_single_pass: assemble E_S(DH) with a single PT2 on
+            // the OSS occupation (default true)
+            // or with the legacy double-pass 2 E_mix(DH) - E_T(DH)
+            // assembly (separate triplet PT2 pass).
+            tmp_input.oss_pt2_single_pass = match tmp_ctrl.get("oss_pt2_single_pass").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => tmp_bool.clone(),
+                serde_json::Value::String(tmp_str) => tmp_str.to_lowercase().parse().unwrap_or(true),
+                other => true,
+            };
             // for guess_mix_theta_deg: support number, string, or array; default to [15.0, 15.0]
             tmp_input.guess_mix_theta_deg = match tmp_ctrl.get("guess_mix_theta_deg").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Number(n) => vec![n.as_f64().unwrap_or(15.0); 2],
@@ -2218,6 +2291,7 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
             tmp_input.u2r_style = match tmp_ctrl.get("u2r_style").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::String(tmp_str) => match U2RStyle::from_keyword(tmp_str) {
                     Some(style) => style,
+
                     None => panic!(
                         "ERROR: not recognized option for u2r_style: \"{}\" (available: {})",
                         tmp_str, U2RStyle::KEYWORDS.join("\", \"")
