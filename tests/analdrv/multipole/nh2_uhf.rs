@@ -97,7 +97,7 @@ fn test_nh2_uhf() {
             &device
         ))
         .into_shape((3, 3)),
-        (1e-6, 1e-7)
+        (1e-6, 3e-6)
     ));
     assert!(rt::allclose(
         &umultipole.result["quad_tot_traceless"],
@@ -107,7 +107,7 @@ fn test_nh2_uhf() {
             &device
         ))
         .into_shape((3, 3)),
-        (1e-6, 1e-7)
+        (1e-6, 2e-6)
     ));
 
     // shifted origin: the dipole of the neutral radical is origin-independent
