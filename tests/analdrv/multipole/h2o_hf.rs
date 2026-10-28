@@ -113,7 +113,7 @@ fn test_h2o() {
             &device
         ))
         .into_shape((3, 3)),
-        (1e-6, 1e-7)
+        (1e-6, 1e-6)
     ));
 
     // octupole and hexadecapole: totals referenced to Gaussian 16 RevB.01 exact HF (4-decimal

@@ -6,6 +6,7 @@ use pyrest::analdrv::config::{AnalDrvConfig, AnalDrvNucgradCfg};
 use pyrest::analdrv::hessian::uscf_interface::uscf_hess_interface;
 use pyrest::analdrv::response::uresp_interface::uscf_resp_interface;
 use pyrest::ctrl_io;
+use pyrest::geom_io::get_mass_charge;
 use pyrest::molecule_io::Molecule;
 use pyrest::scf_io::{self, scf_without_build};
 
@@ -155,7 +156,9 @@ fn test_skeleton_invariance() {
 
         let xc_func_list = xc_func_list(&scf_data);
 
-        let mut hess_obj = UHessKSNIMatmul::new(&cint_mol, xc_func_list, ni, true, false);
+        let proton_charges =
+            get_mass_charge(&scf_data.mol.geom.rg_elem).iter().map(|&(_, charge)| charge as i32).collect();
+        let mut hess_obj = UHessKSNIMatmul::new(&cint_mol, xc_func_list, ni, true, proton_charges, false);
         hess_obj.make_hessian_setup(
             &[mo_coeff[0].view(), mo_coeff[1].view()],
             &[mo_occ[0].view(), mo_occ[1].view()],

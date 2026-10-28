@@ -355,6 +355,8 @@ fn test_nh3_gfock_full() {
         &get_cint_aux_on_path(&scf_data.mol, "def2-svp-rifit"),
         scf_data.mol.ctrl.j2c_decomp,
         None,
+        scf_data.mol.ctrl.ri_jk.c3_screen_threshold,
+        scf_data.mol.ctrl.ri_jk.schwartz_overlap_tol2,
     );
     let cderi_mp2 = cderi_mp2_raw.to_rstsr_view(&device);
 
