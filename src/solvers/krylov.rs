@@ -10,42 +10,43 @@
 //! ## Algorithm
 //!
 //! Shared-subspace block Krylov method (PySCF `lib.krylov` style) with
-//! optional hard restart at `max_space` cap.  All right-hand sides share a
-//! single subspace; each cycle calls the operator once on all active
-//! directions.  The matvec closure implements `A` (**not** `I+A`) — the
-//! identity contribution is added via subspace norms during the projected
-//! solve.
+//! optional hard restart at `max_space`.  All right-hand sides share one
+//! subspace; each cycle applies the operator once to the active directions.
+//! The matvec closure implements `A`; the identity block of the projected
+//! system is the exact overlap `S = X^T X`, truncated at `lindep`.
 //!
 //! ## Convergence
 //!
-//! Convergence is declared when all new trial directions have squared norm
-//! below `max(tol^2, lindep)`.  Panics on non-convergence.
+//! The true residual `r = b - (I+A)x` is formed from the stored trial
+//! subspace and coefficients after each cycle.  The iteration stops when
+//! `max||r|| <= tol`, or when the next trial block has squared norm below
+//! `max(lindep, tol^2)`.
 //!
 //! ## Source
 //!
-//! The shared-subspace Krylov algorithm follows PySCF's
-//! `lib.linalg_helper.krylov` — `(I+A)` projected onto a non-normalized
-//! Krylov basis with CGS + QR re-orthogonalization.  The per-RHS fallback
-//! and hard restart mechanism are REST-specific extensions.
+//! Shared-subspace algorithm: PySCF `lib.linalg_helper.krylov`.  Exact
+//! overlap: PySCF PR #3549.  Per-RHS fallback and hard restart: REST
+//! extensions.
 
 use crate::utilities::rstsr_util::{RestTensorToRstsrTsrAPI, Tsr, TsrView};
-use rstsr::prelude::*;
 use log::{debug, trace, warn};
+use rstsr::prelude::*;
 
 // ── Configuration ──────────────────────────────────────────────────────────
 
 /// Configuration for the Krylov subspace solver.
 #[derive(Debug, Clone)]
 pub struct KrylovConfig {
-    /// Convergence tolerance: stop when `max(||trial||^2) < max(lindep, tol^2)`.
+    /// Convergence tolerance.  The solve stops when the true residual
+    /// `||b - (I+A)x|| <= tol`, or when the next trial block is exhausted.
     pub tol: f64,
     /// Maximum total number of inner Krylov cycles (summed across restarts).
     pub max_cycle: usize,
     /// Optional hard-restart subspace cap (GMRES(m)-style).
     /// `None` means no hard restart.
     pub max_space: Option<usize>,
-    /// Linear dependence threshold: vectors with `||v||^2 < lindep` are
-    /// dropped during QR filtering.
+    /// Linear dependence threshold for QR filtering and for truncating the
+    /// overlap eigenvalues in the projected solve.
     pub lindep: f64,
     /// Factor on tol for accepting residual without warning or recursive solve.
     /// RHS with `||r|| < factor * tol` are considered converged.
@@ -114,6 +115,24 @@ pub fn krylov_tsr(
         None => rt::zeros(([n, n_rhs], &device)),
     };
 
+    let mut total_cycles: usize = 0;
+    let mut aop_calls: usize = 0;
+    let mut restart_idx: usize = 0;
+    let mut converged = false;
+    let mut n_recursive = 0usize;
+    let mut last_max_ip: f64 = 0.0;
+    let mut final_residual: Option<(f64, f64)> = None;
+
+    // Cached aop(x_accum); r = b - x_accum - ax_accum.
+    let mut ax_accum: Tsr = match x0.as_ref() {
+        Some(_) => {
+            aop_calls += 1;
+            aop(x_accum.view())
+        },
+        None => rt::zeros(([n, n_rhs], &device)),
+    };
+    let mut residual: Tsr = &b_orig - &x_accum - &ax_accum;
+
     // Pre-allocate subspace storage once and reuse across restarts.
     // Upper bound: n_rhs directions per cycle × (max_space + 1) for safety.
     let max_basis = n_rhs * (max_space + 2);
@@ -121,29 +140,15 @@ pub fn krylov_tsr(
     let mut axs: Tsr = rt::zeros(([n, max_basis], &device));
     let mut innerprod: Vec<f64> = Vec::with_capacity(max_basis);
 
-    let mut total_cycles: usize = 0;
-    let mut aop_calls: usize = 0;
-    let mut restart_idx: usize = 0;
-    let mut converged = false;
-    let mut n_recursive = 0usize;
-    let mut last_max_ip: f64 = 0.0;
-
     while total_cycles < config.max_cycle {
-        // ── Form residual for this restart ─────────────────────────────────
-        let b_work: Tsr = if restart_idx == 0 && x0.is_none() {
-            b_orig.clone()
-        } else {
-            aop_calls += 1;
-            &b_orig - (&x_accum + aop(x_accum.view()))
-        };
-
+        // ── Residual for this restart ──────────────────────────────────────
         if restart_idx > 0 {
-            let max_bw2: f64 = b_work.iter().fold(0.0_f64, |a, &v| a.max(v * v));
+            let max_bw2 = max_col_sq(&residual);
             trace!("    ---- restart {}: residual max(||v||) = {:.3e} ----", restart_idx, max_bw2.sqrt());
         }
 
         // ── Initial QR of residual columns ─────────────────────────────────
-        let (x1_init, ip_init) = orth_block(b_work.view(), config.lindep);
+        let (x1_init, ip_init) = orth_block(residual.view(), config.lindep);
         let max_init = ip_init.iter().fold(0.0_f64, |a, &v| a.max(v));
         last_max_ip = max_init;
         if max_init < conv_thresh || x1_init.shape()[1] == 0 {
@@ -157,6 +162,8 @@ pub fn krylov_tsr(
         let mut x1: Tsr = x1_init;
         let mut nd: usize = 0;
         let mut inner_converged = false;
+        // Last projected solution of this restart.
+        let mut cached_solution: Option<(Tsr, Tsr, Tsr, f64)> = None;
 
         // ── Inner Krylov loop (shared subspace) ────────────────────────────
         for _inner in 0..max_space {
@@ -189,10 +196,26 @@ pub fn krylov_tsr(
             let max_ip = ip_new.iter().fold(0.0_f64, |a, &v| a.max(v));
             last_max_ip = max_ip;
 
+            // Projected solution and its true residual; no extra matvec.
+            let (x_cur, ax_cur) =
+                projected_solve(xs.i((.., ..nd)), axs.i((.., ..nd)), config.lindep, residual.view());
+            let r_cur = &b_orig - (&x_accum + &x_cur) - (&ax_accum + &ax_cur);
+            let max_r_cur = max_col_sq(&r_cur).sqrt();
+            cached_solution = Some((x_cur, ax_cur, r_cur, max_r_cur));
+
             trace!(
-                "    r{} c{} (total {}): max(||v||) = {:.3e}, n_active = {}",
-                restart_idx, _inner + 1, total_cycles, max_ip.sqrt(), n_active,
+                "    r{} c{} (total {}): max(||v||) = {:.3e}, max||r|| = {:.3e}, n_active = {}",
+                restart_idx, _inner + 1, total_cycles, max_ip.sqrt(), max_r_cur, n_active,
             );
+
+            if max_r_cur <= config.tol {
+                trace!(
+                    "    true residual {:.3e} <= tol({:.3e}) at cycle {}; stopping",
+                    max_r_cur, config.tol, total_cycles,
+                );
+                inner_converged = true;
+                break;
+            }
 
             if max_ip < conv_thresh {
                 inner_converged = true;
@@ -206,8 +229,6 @@ pub fn krylov_tsr(
             let keep_mask: Vec<bool> = ip_new.iter().map(|&ip| ip > conv_thresh).collect();
             let has_drop = keep_mask.iter().any(|&b| !b);
             if has_drop {
-                let mut kept: Vec<&[bool]> = Vec::new(); // 临时 dummy，我们直接用 bool_select
-                // Actually, use bool_select to filter columns
                 x1 = x_new_orth.bool_select(1, &keep_mask);
                 let kept_ip: Vec<f64> = ip_new
                     .iter()
@@ -223,29 +244,24 @@ pub fn krylov_tsr(
 
         // ── Reconstruct partial solution from current subspace ─────────────
         if nd > 0 {
-            let x_partial = projected_solve(xs.i((.., ..nd)), axs.i((.., ..nd)), &innerprod, b_work.view());
-
-            // Check true residual before accepting convergence.
-            // If the subspace convergence signal fired but the true residual
-            // is still large, the subspace has collapsed — switch to per-RHS
-            // independent subspaces to recover accuracy.
+            // Reuse the cached projected solution.
+            let (x_partial, ax_partial, r_temp, max_rnorm) = match cached_solution {
+                Some(v) => v,
+                None => {
+                    let (x, ax) =
+                        projected_solve(xs.i((.., ..nd)), axs.i((.., ..nd)), config.lindep, residual.view());
+                    let r = &b_orig - (&x_accum + &x) - (&ax_accum + &ax);
+                    let max_r = max_col_sq(&r).sqrt();
+                    (x, ax, r, max_r)
+                }
+            };
             let x_temp = &x_accum + &x_partial;
-            aop_calls += 1;
-            let residual = &b_orig - (&x_temp + aop(x_temp.view()));
-            let mut max_r2: f64 = 0.0;
-
-        // ── Convergence check per RHS ────────────────────────────────
-        // solve_one_rhs: Galerkin projection of (I+A) onto xs_k,
-        // direct solve, true residual via linearity (r = x_k + ax_k·c - b).
-        for k in 0..n_rhs {
-                let r_col = residual.i((.., k));
-                let r2: f64 = (&r_col % &r_col).to_scalar();
-                max_r2 = max_r2.max(r2);
-            }
-            let max_rnorm = max_r2.sqrt();
+            let ax_temp = &ax_accum + &ax_partial;
             let relaxed_tol = config.max_residual_factor * config.tol;
 
-            if inner_converged && max_rnorm > relaxed_tol && n_rhs > 1 && nd > 0 {
+            // Shared subspace exhausted with a large residual: switch to
+            // per-RHS independent subspaces.
+            if inner_converged && max_rnorm > relaxed_tol && n_rhs > 1 {
                 debug!(
                     "    QR collapse detected (max ||r|| = {:.3e} > {:.0} * tol({:.3e})), switching to per-RHS",
                     max_rnorm, config.max_residual_factor, config.tol,
@@ -253,19 +269,22 @@ pub fn krylov_tsr(
                 let shared_xs = xs.i((.., ..nd));
                 let shared_axs = axs.i((.., ..nd));
                 let shared_ip: Vec<f64> = innerprod[..nd].to_vec();
-                let (per_root_sol, n_rec, rec_aop_calls) = per_rhs_phase(
-                    aop, &b_orig, shared_xs, shared_axs, &shared_ip,
-                    residual.view(), &x_temp,
+                let (per_root_sol, n_rec, rec_aop_calls, res2, res_abs) = per_rhs_phase(
+                    aop, &residual, &x_accum, shared_xs, shared_axs, &shared_ip,
+                    r_temp.view(), &x_temp,
                     &mut total_cycles, &mut aop_calls, config, conv_thresh, max_space, &device,
                 );
                 x_accum = per_root_sol;
                 n_recursive = n_rec;
                 aop_calls += rec_aop_calls;
+                final_residual = Some((res2, res_abs));
                 converged = true;
                 break;
             }
 
-            x_accum += &x_partial;
+            x_accum = x_temp;
+            ax_accum = ax_temp;
+            residual = r_temp;
         }
 
         if inner_converged || !has_max_space || total_cycles >= config.max_cycle {
@@ -285,31 +304,25 @@ pub fn krylov_tsr(
         );
     }
 
-    // Post-solve accuracy check: compute true residual, warn if above tol.
+    // Post-solve residual check.
     let max_r2: f64;
     {
-        aop_calls += 1;
-        let residual = &b_orig - (&x_accum + aop(x_accum.view()));
-        let mut inner_r2 = 0.0_f64;
-        let mut max_abs: f64 = 0.0;
-        for k in 0..n_rhs {
-            let r_col = residual.i((.., k));
-            let r2: f64 = (&r_col % &r_col).to_scalar();
-            inner_r2 = inner_r2.max(r2);
-            max_abs = max_abs.max(r_col.iter().fold(0.0_f64, |a, &v| a.max(v.abs())));
-        }
+        let (inner_r2, max_abs_v) = match final_residual {
+            Some(v) => v,
+            None => (max_col_sq(&residual), max_abs(&residual)),
+        };
         max_r2 = inner_r2;
         let max_rnorm = max_r2.sqrt();
         let relaxed_tol = config.max_residual_factor * config.tol;
         if max_rnorm > relaxed_tol {
             warn!("    max ||r|| = {:.3e} > {:.0} * tol({:.3e}), max |r| = {:.3e} (subspace exhausted)",
-                max_rnorm, config.max_residual_factor, config.tol, max_abs);
+                max_rnorm, config.max_residual_factor, config.tol, max_abs_v);
         } else if max_rnorm > config.tol {
             debug!("    tol({:.3e}) < max ||r|| = {:.3e} < {:.0} * tol({:.3e}), max |r| = {:.3e}",
-                config.tol, max_rnorm, config.max_residual_factor, config.tol, max_abs);
+                config.tol, max_rnorm, config.max_residual_factor, config.tol, max_abs_v);
         } else {
             debug!("    max ||r|| = {:.3e} < tol({:.3e}), max |r| = {:.3e}",
-                max_rnorm, config.tol, max_abs);
+                max_rnorm, config.tol, max_abs_v);
         }
         if n_rhs > 1 {
             if n_recursive > 0 {
@@ -333,9 +346,12 @@ pub fn krylov_tsr(
 
 /// Per-RHS independent Krylov subspaces: activated when shared subspace
 /// collapses (trial norms → 0 but true residual still large).
+///
+/// Solves `(I+A) dx = b_work` per RHS and returns `x_base + dx`.
 fn per_rhs_phase(
     aop: &mut impl FnMut(TsrView) -> Tsr,
-    b_orig: &Tsr,
+    b_work: &Tsr,
+    x_base: &Tsr,
     shared_xs: TsrView,        // [n, nd]
     shared_axs: TsrView,       // [n, nd]
     shared_ip: &[f64],         // [nd]
@@ -347,7 +363,7 @@ fn per_rhs_phase(
     conv_thresh: f64,
     max_space: usize,
     device: &DeviceBLAS,
-) -> (Tsr, usize, usize) {
+) -> (Tsr, usize, usize, f64, f64) {
     let n = shared_xs.shape()[0];
     let n_rhs = residual.shape()[1];
     let nd = shared_xs.shape()[1];
@@ -373,7 +389,13 @@ fn per_rhs_phase(
     }
 
     let mut rhs_x1: Vec<Vec<Tsr>> = vec![Vec::new(); n_rhs];
-    let mut rhs_x_accum: Vec<Tsr> = (0..n_rhs).map(|k| x_temp.i((.., k)).to_owned()).collect();
+    // Per-RHS corrections dx; x_base is added when reconstructing x.
+    let mut rhs_x_accum: Vec<Tsr> = (0..n_rhs)
+        .map(|k| (&x_temp.i((.., k)) - &x_base.i((.., k))))
+        .collect();
+    // Last residual per RHS.
+    let mut last_rnorm: Vec<f64> = vec![0.0; n_rhs];
+    let mut last_abs: Vec<f64> = vec![0.0; n_rhs];
 
     // ── Build initial trial directions from residual ───────────────────
     // Orthogonalize each RHS's residual against the shared subspace.
@@ -381,6 +403,8 @@ fn per_rhs_phase(
     for k in 0..n_rhs {
         let r_k: Tsr = residual.i((.., k)).to_owned();
         let rnorm = r_k.l2_norm();
+        last_rnorm[k] = rnorm;
+        last_abs[k] = r_k.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
         if rnorm > relaxed_tol {
             let mut x = r_k;
             for i in 0..nd {
@@ -424,19 +448,18 @@ fn per_rhs_phase(
             let stalled: Vec<usize> = (0..n_rhs).filter(|&k| active[k]).collect();
             if stalled.is_empty() { break; }
 
-            // Single-RHS config: same tolerances, no shared subspace coupling
-            let single_config = KrylovConfig {
-                tol: config.tol,
-                max_cycle: config.max_cycle - *total_cycles,
-                max_space: None,
-                lindep: config.lindep,
-                max_residual_factor: config.max_residual_factor,
-            };
-
             n_recursive = 0;
             per_root_aop_calls = 0;
             for &k in &stalled {
-                let b_col = b_orig.i((.., k));
+                // Per-RHS solve with the remaining cycle budget.
+                let single_config = KrylovConfig {
+                    tol: config.tol,
+                    max_cycle: config.max_cycle.saturating_sub(*total_cycles).max(1),
+                    max_space: None,
+                    lindep: config.lindep,
+                    max_residual_factor: config.max_residual_factor,
+                };
+                let b_col = b_work.i((.., k));
                 let b_mat = b_col.to_owned().into_shape((n, 1));
                 let x0_view = rhs_x_accum[k].view();
                 let x0_mat = x0_view.reshape([n, 1]);
@@ -445,6 +468,9 @@ fn per_rhs_phase(
                 active[k] = false;
                 n_recursive += 1;
                 per_root_aop_calls += kr.aop_calls;
+                *total_cycles += kr.cycles;
+                last_rnorm[k] = kr.residual;
+                last_abs[k] = kr.residual;
                 debug!("    per-root solve: RHS {} converged after {} cycles ({} aop calls), max ||r|| = {:.3e}",
                     k, kr.cycles, kr.aop_calls, kr.residual);
             }
@@ -486,13 +512,15 @@ fn per_rhs_phase(
 
         for k in 0..n_rhs {
             if !active[k] || rhs_nd[k] == 0 { continue; }
-            let (x_k, rnorm) = solve_one_rhs(
+            let (x_k, r_k) = solve_one_rhs(
                 rhs_xs[k].i((.., ..rhs_nd[k])),
                 rhs_axs[k].i((.., ..rhs_nd[k])),
-                &rhs_ip[k],
-                b_orig.i((.., k)),
-                device,
+                b_work.i((.., k)),
+                config.lindep,
             );
+            let rnorm = r_k.l2_norm();
+            last_rnorm[k] = rnorm;
+            last_abs[k] = r_k.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
             let relaxed_tol = config.max_residual_factor * config.tol;
             if rnorm < relaxed_tol {
                 rhs_x_accum[k] = x_k;
@@ -508,11 +536,15 @@ fn per_rhs_phase(
         rhs_x1.iter_mut().zip(rhs_new_x1.iter_mut()).for_each(|(x1, new)| *x1 = std::mem::take(new));
     }
 
-    // ── Reconstruct x_accum from per-RHS solutions ─────────────────
-    let mut x_accum = rt::zeros((vec![n, n_rhs].f(), device));
-    rhs_x_accum.iter().enumerate().for_each(|(k, x)| x_accum.i_mut((.., k)).assign(x));
+    // ── Reconstruct x = x_base + dx ───────────────────────────────────────
+    let mut x_accum = x_base.clone();
+    for (k, dx) in rhs_x_accum.iter().enumerate() {
+        x_accum.i_mut((.., k)).assign(&(&x_base.i((.., k)) + dx));
+    }
+    let max_res2 = last_rnorm.iter().map(|r| r * r).fold(0.0_f64, f64::max);
+    let max_res_abs = last_abs.iter().copied().fold(0.0_f64, f64::max);
     debug!("    per-RHS: all {} RHS converged", n_rhs);
-    (x_accum, n_recursive, per_root_aop_calls)
+    (x_accum, n_recursive, per_root_aop_calls, max_res2, max_res_abs)
 }
 
 // ── Vec<f64> convenience wrapper ───────────────────────────────────────────
@@ -564,25 +596,18 @@ pub use krylov_vec as krylov;
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 /// Projected solve + true residual for one RHS.
-/// Returns `(x_k, rnorm)` where `x_k` is the solution and `rnorm = ||(I+A)x_k - b||`.
+/// Returns `(x_k, r_k)` where `x_k = X c` and `r_k = (I+A)x_k - b`.
 fn solve_one_rhs(
     xs: TsrView,       // [n, nd]
     ax: TsrView,       // [n, nd]
-    ip: &[f64],        // [nd]
     b_col: TsrView,    // [n]
-    device: &DeviceBLAS,
-) -> (Tsr, f64) {
-    let nd = xs.shape()[1];
-    let mut h = xs.t() % &ax;
-    for i in 0..nd { h[[i, i]] += ip[i]; }
-    let mut g = rt::zeros(([nd, 1], device));
-    for i in 0..nd { g[[i, 0]] = (&xs.i((.., i)) % &b_col).to_scalar(); }
-    let c = rt::linalg::solve_general((h, g));
-    let c_1d = c.reshape(-1);
-    let x_k = &xs % &c_1d;
-    let r_k = &x_k + &ax % &c_1d - &b_col;
-    let rnorm = r_k.l2_norm();
-    (x_k, rnorm)
+    lindep: f64,
+) -> (Tsr, Tsr) {
+    let n = xs.shape()[0];
+    let b_mat: Tsr = b_col.to_owned().into_shape((n, 1));
+    let (x_mat, ax_mat) = projected_solve(xs, ax, lindep, b_mat.view());
+    let r_k = &x_mat + &ax_mat - &b_mat;
+    (x_mat.reshape(-1).to_owned(), r_k)
 }
 
 /// Modified Gram-Schmidt over columns, returning non-normalized orthogonal
@@ -624,20 +649,108 @@ fn orth_block(vec: TsrView, lindep: f64) -> (Tsr, Vec<f64>) {
     }
 }
 
-fn projected_solve(xs: TsrView, ax: TsrView, innerprod: &[f64], b: TsrView) -> Tsr {
+/// Solve the projected system `(I+A)x = b` on the trial subspace.
+///
+/// Uses the exact overlap `S = X^T X`, truncated at `lindep`, and returns
+/// `(x, ax)` with `x = Xc` and `ax = (AX)c`.
+fn projected_solve(xs: TsrView, ax: TsrView, lindep: f64, b: TsrView) -> (Tsr, Tsr) {
     let nd = xs.shape()[1];
+    let n = xs.shape()[0];
+    let n_rhs = b.shape()[1];
     let device = xs.device().clone();
 
-    // H[i,j] = xs[:,i]·ax[:,j] + δ[i,j]·||xs[:,i]||^2
-    let mut h: Tsr = xs.t() % &ax;
-    for i in 0..nd {
-        h[[i, i]] += innerprod[i];
+    if nd == 0 {
+        return (rt::zeros(([n, n_rhs], &device)), rt::zeros(([n, n_rhs], &device)));
     }
 
-    // g[i,k] = xs[:,i]·b[:,k]
+    // H = X^T A X, S = X^T X, g = X^T b.
+    let h_ax: Tsr = xs.t() % &ax;
+    let s: Tsr = xs.t() % &xs;
+    let h: Tsr = &h_ax + &s;
     let g: Tsr = xs.t() % &b;
 
-    let c = rt::linalg::solve_general((h, g));
+    // T = U_keep / sqrt(e_keep), then c = T (T^T H T)^{-1} T^T g.
+    let (e, u) = rt::linalg::eigh(s.view()).into();
+    let n_keep: usize = e.greater(lindep).sum();
+    if n_keep == 0 {
+        return (rt::zeros(([n, n_rhs], &device)), rt::zeros(([n, n_rhs], &device)));
+    }
+    let n_drop = nd - n_keep;
+    let e_keep = e.i(n_drop..).pow(-0.5);
+    let v = u.i((.., n_drop..));
+    let t: Tsr = &v * e_keep.i((None, ..));
 
-    &xs % &c
+    let ht: Tsr = (t.t() % &h) % &t;
+    let gt: Tsr = t.t() % &g;
+    let ct = rt::linalg::solve_general((ht, gt));
+    let c: Tsr = &t % &ct;
+
+    let x: Tsr = &xs % &c;
+    let axc: Tsr = &ax % &c;
+    (x, axc)
+}
+
+/// Squared norm of the largest residual column.
+fn max_col_sq(a: &Tsr) -> f64 {
+    let n_rhs = a.shape()[1];
+    let mut max_r2 = 0.0_f64;
+    for k in 0..n_rhs {
+        let r_col = a.i((.., k));
+        let r2: f64 = (&r_col % &r_col).to_scalar();
+        max_r2 = max_r2.max(r2);
+    }
+    max_r2
+}
+
+/// Largest absolute element.
+fn max_abs(a: &Tsr) -> f64 {
+    a.iter().fold(0.0_f64, |m, &v| m.max(v.abs()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Full 3x3 Krylov solve with a near-dependent right-hand side block.
+    #[test]
+    fn krylov_3x3_near_dependent_rhs() {
+        let device = DeviceBLAS::default();
+        let adiag = [1.0_f64, 2.0, 3.0];
+        let b: Vec<Vec<f64>> = vec![
+            vec![1.0, 2.0, 3.0],
+            vec![4.0, 5.0, 6.0],
+            vec![5.0, 7.0, 9.0 + 1e-7],
+        ];
+        let b_tsr: Tsr = b.as_slice().to_rstsr(&device);
+
+        let mut aop = |v: TsrView| -> Tsr {
+            let ncol = v.shape()[1];
+            let out: Vec<Vec<f64>> = (0..ncol)
+                .map(|k| {
+                    let col: Vec<f64> = v.i((.., k)).to_vec();
+                    col.iter().enumerate().map(|(i, v)| adiag[i] * v).collect()
+                })
+                .collect();
+            out.as_slice().to_rstsr(&device)
+        };
+
+        let config = KrylovConfig {
+            tol: 1e-8,
+            max_cycle: 30,
+            max_space: None,
+            lindep: f64::EPSILON,
+            max_residual_factor: 1000.0,
+        };
+        let (x, result) = krylov_tsr(&mut aop, b_tsr.view(), None, &config);
+
+        let mut max_err = 0.0_f64;
+        for k in 0..3 {
+            for i in 0..3 {
+                let x_ref = b[k][i] / (1.0 + adiag[i]);
+                max_err = max_err.max((x.i((.., k))[[i]] - x_ref).abs());
+            }
+        }
+        assert!(max_err < 1e-10, "3x3 Krylov solve error {:.3e}", max_err);
+        assert_eq!(result.aop_calls, result.cycles);
+    }
 }
