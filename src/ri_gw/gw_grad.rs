@@ -410,6 +410,21 @@ pub struct GwGradConfig {
     /// `n >= nocc` **and** `e_n > linear_fallback_threshold`; `f64::INFINITY`
     /// (the default) disables the rule.
     pub linear_fallback_threshold: f64,
+    /// Use the quasiparticle energies that the **energy path** already solved
+    /// (`scf_data.gwqp.0`, the vector the BSE Hamiltonian is built from) instead
+    /// of re-solving the QP equation inside the gradient engine.
+    ///
+    /// The gradient needs, per orbital, the response cache (residues, `y/w`
+    /// quadrature data, `Z`, `dSigma/domega`) -- not just the energy -- which is
+    /// why [`BseGradEngine`] used to call `build_target_cache` and take
+    /// `omega` from it.  That made the gradient re-run a *second*, independent
+    /// root search: at the S1 minimum of azobenzene/def2-TZVPP the same orbital
+    /// came out at +0.724 Ha in the energy path and at -0.247 Ha in the
+    /// gradient.  When this flag is set the cache is built **at** the stored
+    /// quasiparticle energy (no root search, one self-energy evaluation per
+    /// orbital instead of one per Newton step), so the BSE diagonal, the printed
+    /// spectrum and the gradient share one quasiparticle solution.
+    pub pin_qp_from_checkpoint: bool,
     /// Upper bound on the linearized step `|Z * shift|` (Ha).  `Z` of a
     /// high-lying virtual can be negative and large (`Z = -24.8` was observed),
     /// in which case the linear extrapolation would move the level by ~1 Ha.
@@ -630,6 +645,7 @@ impl Default for GwGradConfig {
             static_fallback_threshold: 1.0,
             linear_fallback_threshold: f64::INFINITY,
             linear_step_cap: 0.5,
+            pin_qp_from_checkpoint: true,
             low_rank_interp: 1,
             graphical_rescue: false,
             smooth_pole: false,
@@ -685,6 +701,7 @@ impl GwGradConfig {
             static_fallback_threshold: qp.gw_switch_fallback_threshold,
             linear_fallback_threshold: qp.gradient_linear_threshold,
             linear_step_cap: qp.gradient_linear_step_cap,
+            pin_qp_from_checkpoint: qp.gradient_qp_from_checkpoint,
             low_rank_interp: crate::ri_gw::low_rank_interp_code(&qp.low_rank_interp),
             graphical_rescue: qp.gradient_graphical_rescue,
             // `gradient_qp_graphical` (card) or `REST_QP_GRAPHICAL=1` (env): pick the
@@ -2101,6 +2118,13 @@ pub struct GwGradEngine<'a> {
     pub natm: usize,
     /// mean-field orbital energies (poles and screening energies of G0W0)
     pub e: Vec<f64>,
+    /// Quasiparticle energies handed in by the caller (`scf_data.gwqp.0`, the
+    /// vector the BSE Hamiltonian is built from).  With
+    /// [`GwGradConfig::pin_qp_from_checkpoint`] set and an entry for orbital
+    /// `n`, the cache of `n` is built **at** that energy -- no root search -- so
+    /// the gradient differentiates the same quasiparticle solution the energy
+    /// path used.  Empty = solve the QP equation here (historical behaviour).
+    pub pinned_qp: Vec<f64>,
     /// MO coefficients [nao, nmo] col-major
     pub c_mo: MatrixFull<f64>,
     /// raw three-center MO integrals (pair-symmetrised).
@@ -2625,6 +2649,7 @@ impl<'a> GwGradEngine<'a> {
                 nocc,
                 natm,
                 e,
+                pinned_qp: Vec::new(),
                 c_mo,
                 q: RefCell::new(q),
                 q_pairmajor,
@@ -2681,6 +2706,7 @@ impl<'a> GwGradEngine<'a> {
                 nocc,
                 natm,
                 e,
+                pinned_qp: Vec::new(),
                 c_mo,
                 q: RefCell::new(q),
                 q_pairmajor,
@@ -4224,7 +4250,64 @@ impl<'a> GwGradEngine<'a> {
     /// Shared body of [`Self::build_target_cache`] and
     /// [`Self::build_target_cache_compact`]; `want_y` keeps the full
     /// `y`/`y0` response of every quadrature point in the cache.
+    /// Hand in the quasiparticle energies the energy path already solved
+    /// (`scf_data.gwqp.0`).  With [`GwGradConfig::pin_qp_from_checkpoint`] set,
+    /// every orbital with an entry here is cached **at** that energy instead of
+    /// running a second, independent root search.
+    pub fn pin_qp_energies(&mut self, qp: Vec<f64>) {
+        self.pinned_qp = qp;
+    }
+
+    /// Pinned quasiparticle energy of orbital `n`, if any.
+    #[inline]
+    fn pinned_omega(&self, n: usize) -> Option<f64> {
+        if !self.config.pin_qp_from_checkpoint {
+            return None;
+        }
+        match self.pinned_qp.get(n) {
+            Some(&w) if w.is_finite() && w != 0.0 => Some(w),
+            _ => None,
+        }
+    }
+
+    /// Response cache of orbital `n` at a **fixed** frequency: no root search, so
+    /// the cache, the BSE diagonal and the printed spectrum all refer to the same
+    /// quasiparticle solution.  One self-energy evaluation instead of one per
+    /// Newton step.
+    fn cache_at_omega(&self, n: usize, omega: f64, want_y: bool) -> QpCache {
+        let table = self.qp_row_table(n);
+        let (_contour, _imag, y_imag, residues) =
+            self.sigma_c_parts_with(omega, n, true, want_y, &table);
+        let (w_imag, m, w0) = (table.w_imag, table.m, table.w0);
+        let dsdw = self.sigma_d_from_parts(omega, &w_imag, &w0, &residues);
+        let m_imag = self.compact_m_imag(&m, !want_y);
+        let y0_static = self.compact_y0_static(&m, &w0, want_y);
+        let y_imag = if want_y { y_imag } else { Vec::new() };
+        QpCache {
+            target: n,
+            omega,
+            freq: omega,
+            z_factor: 1.0 / (1.0 - dsdw),
+            dsigma_domega: dsdw,
+            static_fallback: false,
+            linearized: false,
+            lin_shift: 0.0,
+            w_imag,
+            y_imag,
+            m_imag,
+            w0,
+            y0_static,
+            residues,
+        }
+    }
+
     fn build_target_cache_with(&self, n: usize, want_y: bool) -> QpCache {
+        // One quasiparticle solution per orbital, the one the energy path used:
+        // take it and evaluate the response there.  This is checked first so the
+        // branch cascade below never runs for a pinned orbital.
+        if let Some(omega) = self.pinned_omega(n) {
+            return self.cache_at_omega(n, omega, want_y);
+        }
         let consts = self.consts(n);
         let side = if n < self.nocc { -1.0 } else { 1.0 };
         let mut x = self.e[n] + side * 0.02;

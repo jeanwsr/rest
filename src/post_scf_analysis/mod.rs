@@ -688,7 +688,16 @@ pub fn quasiparticle_methods(scf_data:&mut SCF,mpi_operator:&Option<MPIOperator>
             );
             let vxc = precompute_vxc_and_release_grid_ao(scf_data);
             let (grads, omegas) = {
-                let gw = ri_gw::gw_grad::GwGradEngine::new_with_vxc(scf_data, cfg, vxc);
+                let pin_qp = cfg.pin_qp_from_checkpoint && !scf_data.gwqp.0.is_empty();
+                let mut gw = ri_gw::gw_grad::GwGradEngine::new_with_vxc(scf_data, cfg, vxc);
+                // Hand the energy path's quasiparticle energies to the gradient
+                // engine: `gradient_qp_from_checkpoint` (default true) then builds
+                // every cache at the stored energy instead of re-solving the QP
+                // equation, so the BSE diagonal, the printed spectrum and the
+                // gradient share one solution per orbital.
+                if pin_qp {
+                    gw.pin_qp_energies(scf_data.gwqp.0.clone());
+                }
                 // `gradient_bse_window = 0` keeps the full virtual space, the
                 // historical behaviour; a positive value restricts the
                 // transition space to `e_F + window` (the same convention as the

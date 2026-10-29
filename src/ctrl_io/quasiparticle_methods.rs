@@ -760,6 +760,14 @@ pub struct QuasiParticle {
     /// cache so the analytic gradient differentiates the same functional.
     /// `0` disables the clamp.
     pub gradient_linear_step_cap: f64,
+    /// Build the gradient's quasiparticle caches at the energies the energy path
+    /// already solved (`scf_data.gwqp.0`) instead of re-solving the QP equation
+    /// inside the gradient engine.  `true` (default) keeps one quasiparticle
+    /// solution per orbital -- the one the BSE Hamiltonian uses -- and needs a
+    /// single self-energy evaluation per orbital instead of one per Newton step.
+    /// `false` restores the historical independent root search (kept for A/B
+    /// comparisons and for reproducing pre-2026-10 gradients).
+    pub gradient_qp_from_checkpoint: bool,
 }
 
 impl Default for QuasiParticle {
@@ -963,6 +971,7 @@ impl Default for QuasiParticle {
             gw_switch_fallback_threshold: 1.0,
             gradient_linear_threshold: f64::INFINITY,
             gradient_linear_step_cap: 0.5,
+            gradient_qp_from_checkpoint: true,
         }
     }
 }
@@ -1171,6 +1180,7 @@ impl QuasiParticle {
         table.insert("gw_switch_fallback_threshold".to_string(), toml::Value::Float(self.gw_switch_fallback_threshold));
         table.insert("gradient_linear_threshold".to_string(), toml::Value::Float(self.gradient_linear_threshold));
         table.insert("gradient_linear_step_cap".to_string(), toml::Value::Float(self.gradient_linear_step_cap));
+        table.insert("gradient_qp_from_checkpoint".to_string(), toml::Value::Boolean(self.gradient_qp_from_checkpoint));
         toml::Value::Table(table)
     }
 }
@@ -1710,6 +1720,11 @@ pub fn parse_quasiparticle_keywords(tmp_keys: &serde_json::Value) -> anyhow::Res
                 serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.5),
                 serde_json::Value::String(s) => s.trim().parse().unwrap_or(0.5),
                 _ => 0.5,
+            };
+            tmp_input.gradient_qp_from_checkpoint = match tmp_ctrl.get("gradient_qp_from_checkpoint").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::String(s) => s.trim().to_lowercase().parse().unwrap_or(true),
+                _ => true,
             };
             tmp_input.gradient_exact_residue = match tmp_ctrl.get("gradient_exact_residue").unwrap_or(&serde_json::Value::Null) {
                 serde_json::Value::Bool(b) => *b,
