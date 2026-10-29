@@ -780,6 +780,67 @@ pub(crate) fn solvent_chunk_bytes(
     by_load.max(lo).min(hi).max(1)
 }
 
+
+//=============================================================================
+//  rayon contractions for the resident RI tensor (cderi)
+//=============================================================================
+
+/// `y[c] = \u{03a3}_r A[r,c] \u{00b7} x[r]` for a column-major `[r, c]` matrix.
+/// A plain dgemv runs this memory-bound reduction on one BLAS thread (measured
+/// 3.4 GB/s over a 51 GB `cderi`, ~15 s on system1); rayon over columns reads the
+/// same bytes at full node bandwidth.
+fn par_mat_t_vec(a: &MatrixFull<f64>, x: &[f64]) -> Vec<f64> {
+    let (nrow, ncols) = (a.size[0], a.size[1]);
+    let data = &a.data[..];
+    assert_eq!(x.len(), nrow, "par_mat_t_vec: x length {} != rows {}", x.len(), nrow);
+    (0..ncols)
+        .into_par_iter()
+        .map(|c| {
+            let col = &data[c * nrow..(c + 1) * nrow];
+            let mut s = 0.0_f64;
+            for (av, xv) in col.iter().zip(x.iter()) {
+                s += av * xv;
+            }
+            s
+        })
+        .collect()
+}
+
+/// `y[r] = \u{03a3}_c A[r,c] \u{00b7} w[c]` for a column-major `[r, c]` matrix.
+/// Parallel over contiguous column blocks with per-block row partials, so every
+/// thread streams a contiguous slice of `A` (a row-major walk would stride).
+fn par_mat_vec(a: &MatrixFull<f64>, w: &[f64]) -> Vec<f64> {
+    let (nrow, ncols) = (a.size[0], a.size[1]);
+    let data = &a.data[..];
+    assert_eq!(w.len(), ncols, "par_mat_vec: w length {} != cols {}", w.len(), ncols);
+    let nthread = rayon::current_num_threads().max(1);
+    let block = ((ncols + nthread * 4 - 1) / (nthread * 4)).max(1);
+    let starts: Vec<usize> = (0..ncols).step_by(block).collect();
+    let partials: Vec<Vec<f64>> = starts
+        .into_par_iter()
+        .map(|c0| {
+            let c1 = (c0 + block).min(ncols);
+            let mut acc = vec![0.0_f64; nrow];
+            for c in c0..c1 {
+                let wc = w[c];
+                if wc == 0.0 { continue; }
+                let col = &data[c * nrow..(c + 1) * nrow];
+                for r in 0..nrow {
+                    acc[r] += col[r] * wc;
+                }
+            }
+            acc
+        })
+        .collect();
+    let mut y = vec![0.0_f64; nrow];
+    for part in partials {
+        for (yv, pv) in y.iter_mut().zip(part.iter()) {
+            *yv += pv;
+        }
+    }
+    y
+}
+
 pub fn get_v_grids_e_old(
     surface: &SurfaceVdwGaussian,
     cint_data: &CINTR2CDATA,
@@ -1409,7 +1470,8 @@ pub fn get_v_grids_e(
             }
         }
         let d_mat = MatrixFull::from_vec([nrow, 1], d_packed).unwrap();
-        let c_hat_local = _dgemm_scaled(ri.cderi, 'T', &d_mat, 'N', 1.0); // [ncols, 1]
+        let c_hat_local_data = par_mat_t_vec(ri.cderi, &d_mat.data); // [ncols, 1]
+        let c_hat_local = MatrixFull::from_vec([c_hat_local_data.len(), 1], c_hat_local_data).unwrap();
         // Under MPI the tensor carries only this rank's auxiliary columns, so the
         // contraction is completed over the ranks before the metric factor is applied.
         // The factor itself is replicated, so every rank gets the same `Y`.
@@ -1563,7 +1625,8 @@ pub fn get_veff_pcm_by_q(
             [ri.aux_cols.len(), 1],
             w.data[ri.aux_cols.clone()].to_vec(),
         ).unwrap();
-        let vp_local = _dgemm_scaled(ri.cderi, 'N', &w_local, 'N', 1.0); // [nrow, 1]
+        let vp_local_data = par_mat_vec(ri.cderi, &w_local.data); // [nrow, 1]
+        let vp_local = MatrixFull::from_vec([vp_local_data.len(), 1], vp_local_data).unwrap();
         let vp_data = reduce_aux_contribution(ri, mpi_operator, &vp_local.data, vp_local.size[0], 0);
         let vp = MatrixFull::from_vec([vp_data.len(), 1], vp_data).unwrap();
         match ri.map {
