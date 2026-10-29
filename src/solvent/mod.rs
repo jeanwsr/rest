@@ -456,41 +456,50 @@ pub fn get_A_D_S(surface: &SurfaceVdwGaussian) -> (Vec<f64>, MatrixFull<f64>, Ma
     let mut S_ij: MatrixFull<f64> = MatrixFull::new([n_grids, n_grids], 0.0_f64);
     let mut D_ij: MatrixFull<f64> = MatrixFull::new([n_grids, n_grids], 0.0_f64);
     {
-        let s_data = S_ij.data_ref_mut().unwrap();
-        let d_data = D_ij.data_ref_mut().unwrap();
+        // Two column-parallel passes (S, then D). Each column j is written by exactly
+        // one thread; the serial mirror write of the old loop is dropped because the
+        // S formula is symmetric — column i's owner computes the same value for (j, i).
+        // The transcendental work is done twice (once per pass), which is irrelevant
+        // next to the parallelism gain: serial this was ~n² sqrt+erf+exp evaluations
+        // on ONE core (tens of seconds at 28k surface points) — the first long
+        // single-core window of every PCM job.
+        let n = n_grids;
         let sqrt_2_over_pi = (2.0_f64 / PI).sqrt();
-        let two_over_sqrt_pi = 2.0_f64 / PI.sqrt();
-        for j in 0..n_grids {
+        S_ij.data_ref_mut().unwrap().par_chunks_mut(n).enumerate().for_each(|(j, s_col)| {
             let cj = &grid_coords[j];
             let ce_j = charge_exp[j];
-            let nj = &norm_vec[j];
-            for i in 0..n_grids {
-                if i == j {
-                    continue;
-                }
+            for i in 0..n {
+                if i == j { continue; }
                 let dx = grid_coords[i][0] - cj[0];
                 let dy = grid_coords[i][1] - cj[1];
                 let dz = grid_coords[i][2] - cj[2];
                 let r = (dx * dx + dy * dy + dz * dz).sqrt();
-                let zeta_ij_val = ce_j * charge_exp[i]
-                    / (ce_j.powi(2) + charge_exp[i].powi(2)).sqrt();
-                let zeta_r = zeta_ij_val * r;
-                let erf_zeta_r = libm::erf(zeta_r);
-                // S_ij = erf(zeta_ij * r_ij) / r_ij (symmetric)
-                let s = erf_zeta_r / r;
-                // D_ij[i,j] = [erf(zr) - 2/sqrt(pi) * zr * exp(-zr^2)] * (n_j . r_ij) / r^3
-                let f = erf_zeta_r - two_over_sqrt_pi * zeta_r * f64::exp(-zeta_r.powi(2));
-                let n_dot_r = dx * nj.0 + dy * nj.1 + dz * nj.2;
-                let d = f * (n_dot_r / r.powi(3));
-                // MatrixFull is column-major: element (i, j) sits at data[i + j * n_grids]
-                s_data[i + j * n_grids] = s;
-                s_data[j + i * n_grids] = s;
-                d_data[i + j * n_grids] = d;
+                let zeta = ce_j * charge_exp[i] / (ce_j.powi(2) + charge_exp[i].powi(2)).sqrt();
+                let zr = zeta * r;
+                s_col[i] = libm::erf(zr) / r;
             }
-            // diagonals (same formulas as the old post-hoc overwrite)
-            s_data[j + j * n_grids] = ce_j * sqrt_2_over_pi / switch_fun[j];
-            d_data[j + j * n_grids] = -ce_j * sqrt_2_over_pi / (2.0 * R_vdw[j]);
-        }
+            s_col[j] = ce_j * sqrt_2_over_pi / switch_fun[j];
+        });
+        let two_over_sqrt_pi = 2.0_f64 / PI.sqrt();
+        D_ij.data_ref_mut().unwrap().par_chunks_mut(n).enumerate().for_each(|(j, d_col)| {
+            let cj = &grid_coords[j];
+            let ce_j = charge_exp[j];
+            let nj = &norm_vec[j];
+            for i in 0..n {
+                if i == j { continue; }
+                let dx = grid_coords[i][0] - cj[0];
+                let dy = grid_coords[i][1] - cj[1];
+                let dz = grid_coords[i][2] - cj[2];
+                let r = (dx * dx + dy * dy + dz * dz).sqrt();
+                let zeta = ce_j * charge_exp[i] / (ce_j.powi(2) + charge_exp[i].powi(2)).sqrt();
+                let zr = zeta * r;
+                let erf_zr = libm::erf(zr);
+                let f = erf_zr - two_over_sqrt_pi * zr * f64::exp(-zr.powi(2));
+                let n_dot_r = dx * nj.0 + dy * nj.1 + dz * nj.2;
+                d_col[i] = f * (n_dot_r / r.powi(3));
+            }
+            d_col[j] = -ce_j * sqrt_2_over_pi / (2.0 * R_vdw[j]);
+        });
     }
 
     (A, D_ij, S_ij)
@@ -527,10 +536,15 @@ pub fn get_K_R_f(surface: &SurfaceVdwGaussian, method: PcmMethod, epsilon: f64) 
         PcmMethod::IEFPCM | PcmMethod::SMD => {
             let f_epsilon = (epsilon - 1.0) / (epsilon + 1.0);
             let mut DA = D.clone();
-            for j in 0..ngrids{
-                for i in 0..ngrids{
-                    DA[(i,j)] = DA[(i,j)] * A[j];
-                }
+            // column scaling, one thread per column block (the serial Index-trait loop
+            // was another ~10 s single-core window at 28k surface points)
+            {
+                let n = ngrids;
+                let a = &A[..];
+                DA.data.par_chunks_mut(n).enumerate().for_each(|(j, col)| {
+                    let aj = a[j];
+                    for v in col.iter_mut() { *v *= aj; }
+                });
             }
             //let DA = _dgemm_scaled(&D, 'N', &A_matr, 'N', 1.0);
             let DAS = _dgemm_scaled(&DA, 'N', &S, 'N', 1.0);
@@ -545,10 +559,15 @@ pub fn get_K_R_f(surface: &SurfaceVdwGaussian, method: PcmMethod, epsilon: f64) 
         PcmMethod::SSVPE => {
             let f_epsilon = (epsilon - 1.0) / (epsilon + 1.0);
             let mut DA = D.clone();
-            for j in 0..ngrids{
-                for i in 0..ngrids{
-                    DA[(i,j)] = DA[(i,j)] * A[j];
-                }
+            // column scaling, one thread per column block (the serial Index-trait loop
+            // was another ~10 s single-core window at 28k surface points)
+            {
+                let n = ngrids;
+                let a = &A[..];
+                DA.data.par_chunks_mut(n).enumerate().for_each(|(j, col)| {
+                    let aj = a[j];
+                    for v in col.iter_mut() { *v *= aj; }
+                });
             }
             //let DA =  _dgemm_scaled(&D, 'N', &A_matr, 'N', 1.0);;
             let mut DAS = _dgemm_scaled(&DA, 'N', &S, 'N', 1.0);
