@@ -208,8 +208,15 @@ impl ScfTraceRecord {
                     .reduce(|| 0.0_f64, |m, v| m.max(v));
                 err = err.max(e);
             }
-            if err > thr {
-                let alpha_d = if err > 1.0e-1 { 0.25 } else { 0.5 };
+            if err > 2.0 * thr {
+                // logarithmic taper: alpha = 1 (off) just above the threshold, 0.5 at
+                // 100x, flooring at 0.2. A constant alpha (0.5 up to the threshold)
+                // turned the tail into geometric halving — measured on the atomic
+                // reference SCFs: 300 iterations where ~30 suffice, because near the
+                // threshold the 50% mixing dominates and DIIS never engages. With the
+                // taper the damping fades out exactly where DIIS becomes superlinear.
+                let ratio = (err / thr).log10();
+                let alpha_d = (1.0 - 0.25 * ratio).clamp(0.2, 1.0);
                 for i_spin in 0..spin_channel {
                     let residual = self.density_matrix[1][i_spin]
                         .sub(&self.density_matrix[0][i_spin]).unwrap();
