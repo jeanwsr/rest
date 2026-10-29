@@ -185,6 +185,46 @@ impl ScfTraceRecord {
         let alpha = self.mix_param;
         let beta = 1.0-self.mix_param;
         let mut level_shift_applied = false;
+        // ---- dynamic density damping ---------------------------------------------------
+        // While max|D_out - D_prev| (the same metric as the scf_acc_rho criterion)
+        // exceeds the threshold, the density fed to the next Fock build is a damped
+        // mixture D_prev + alpha_damp*(D_out - D_prev). The damped density replaces the
+        // cycle's output in the record as well, so the DIIS error vector stays a
+        // consistent [F(D), D] pair and the convergence trajectory bookkeeping is exact.
+        // alpha_damp = 0.5 in the moderate regime, 0.25 above |ΔD| > 0.1 (strong
+        // oscillation, e.g. the 0.5-Ha jumps observed on system1 iterations 24-28);
+        // damping switches itself off below the threshold.
+        let mut damping_applied = false;
+        if scf.mol.ctrl.dynamic_damping
+            && (self.mixer.eq(&"linear") || self.mixer.eq(&"diis"))
+        {
+            let thr = scf.mol.ctrl.damping_error_threshold;
+            let mut err = 0.0_f64;
+            for i_spin in 0..spin_channel {
+                let a = &self.density_matrix[0][i_spin].data;
+                let b = &self.density_matrix[1][i_spin].data;
+                let e = a.par_iter().zip(b.par_iter())
+                    .map(|(x, y)| (x - y).abs())
+                    .reduce(|| 0.0_f64, |m, v| m.max(v));
+                err = err.max(e);
+            }
+            if err > thr {
+                let alpha_d = if err > 1.0e-1 { 0.25 } else { 0.5 };
+                for i_spin in 0..spin_channel {
+                    let residual = self.density_matrix[1][i_spin]
+                        .sub(&self.density_matrix[0][i_spin]).unwrap();
+                    let damped = self.density_matrix[0][i_spin]
+                        .scaled_add(&residual, alpha_d).unwrap();
+                    scf.density_matrix[i_spin] = damped.clone();
+                    self.density_matrix[1][i_spin] = damped;
+                }
+                damping_applied = true;
+                if scf.mol.ctrl.print_level > 0 {
+                    println!("[damping] iter {:3}: max|ΔD| = {:9.3e} > {:9.3e} -> {}% new density",
+                        self.num_iter, err, thr, (alpha_d * 100.0) as usize);
+                }
+            }
+        }
         if self.mixer.eq(&"direct") {
             scf.generate_hf_hamiltonian(mpi_operator);
             scf.grad_dm = scf.get_grad_dm();
@@ -193,6 +233,12 @@ impl ScfTraceRecord {
             || (self.mixer.eq(&"diis") && self.num_iter<start_pulay) 
         {
             debug!("using linear mixer");
+            if damping_applied {
+                // dynamic damping already set the input density above; only the Fock
+                // rebuild remains (its fixed mix_param mixing would double-damp)
+                scf.generate_hf_hamiltonian(mpi_operator);
+                scf.grad_dm = scf.get_grad_dm();
+            } else {
             let mut alpha = self.mix_param;
             let mut beta = 1.0-alpha;
             // n1[in] = a*n0[out] + (1-a)*n0[in] = n0[out]-(1-a)*Rn0 = n0[in] + a*Rn0
@@ -206,6 +252,7 @@ impl ScfTraceRecord {
             }
             scf.generate_hf_hamiltonian(mpi_operator);
             scf.grad_dm = scf.get_grad_dm();
+            }
         } else if self.mixer.eq(&"diis") && self.num_iter>=start_pulay {
             debug!("using diis mixer");
             // 

@@ -320,6 +320,17 @@ pub struct InputKeywords {
     pub start_diis_cycle: usize,
     #[pyo3(get, set)]
     pub start_check_oscillation: usize,
+    /// Dynamic density damping: while the
+    /// max element of the output-density change exceeds `damping_error_threshold`, the
+    /// density that feeds the next Fock build is a damped mixture
+    /// `D_in + alpha*(D_out - D_in)` instead of the raw output. alpha = 0.5 for
+    /// moderate error, 0.25 above 0.1 (strong oscillation); damping switches itself off
+    /// once the error drops below the threshold.
+    #[pyo3(get, set)]
+    pub dynamic_damping: bool,
+    /// DIIS/density error above which dynamic damping activates (default 1e-3).
+    #[pyo3(get, set)]
+    pub damping_error_threshold: f64,
     #[pyo3(get, set)]
     pub level_shift: Option<f64>,
     #[pyo3(get, set)]
@@ -609,6 +620,8 @@ impl InputKeywords {
             diis_orthogonalize_error: true,
             start_diis_cycle: 1,
             start_check_oscillation: 20,
+            dynamic_damping: true,
+            damping_error_threshold: 1.0e-3,
             level_shift : None, 
             max_scf_cycle: 100,
             scf_acc_rho: 1.0e-5,
@@ -1691,6 +1704,16 @@ pub fn parse_ctrl_keywords(tmp_keys: &serde_json::Value) -> anyhow::Result<Input
                 serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(20_usize)},
                 serde_json::Value::Number(tmp_num) => {tmp_num.as_i64().unwrap_or(20) as usize},
                 other => {20_usize}
+            };
+            tmp_input.dynamic_damping = match tmp_ctrl.get("dynamic_damping").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::Bool(tmp_bool) => {*tmp_bool},
+                serde_json::Value::String(tmp_str) => {matches!(tmp_str.to_lowercase().as_str(), "true" | "yes" | "on" | "1")},
+                other => {true}
+            };
+            tmp_input.damping_error_threshold = match tmp_ctrl.get("damping_error_threshold").unwrap_or(&serde_json::Value::Null) {
+                serde_json::Value::String(tmp_str) => {tmp_str.to_lowercase().parse().unwrap_or(1.0e-3)},
+                serde_json::Value::Number(tmp_num) => {tmp_num.as_f64().unwrap_or(1.0e-3)},
+                other => {1.0e-3}
             };
 
             // Initial guess relevant keywords

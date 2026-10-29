@@ -6237,6 +6237,15 @@ pub fn scf_without_build(scf_data: &mut SCF, mpi_operator: &Option<MPIOperator>)
     if scf_data.mol.ctrl.solvent_enabled {
         scf_data.refresh_solvent_with_mpi(mpi_operator);
     }
+    // ---- PCM-in-DIIS consistency (Gaussian l502 DISPCM=2 default) ------------------
+    // The DIIS seed record and the FIRST loop iteration's Fock must carry the solvent
+    // potential of the guess density. Without this, `solvent_scf` only appears after
+    // the first diagonalization, so the first two DIIS error vectors mix a PCM-less
+    // and a PCM-full Fock — an inconsistent history that pollutes the extrapolation
+    // for exactly the iterations where the guess is farthest from convergence.
+    if scf_data.mol.ctrl.solvent_enabled && scf_data.solvent_scf.is_none() {
+        scf_data.refresh_solvent_with_mpi(mpi_operator);
+    }
     scf_data.generate_hf_hamiltonian(mpi_operator);
     scf_data.grad_dm = scf_data.get_grad_dm();
 
