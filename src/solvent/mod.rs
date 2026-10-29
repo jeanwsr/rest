@@ -217,12 +217,18 @@ impl PcmStatic{
         // Only built when the prototype path is requested: the eigendecomposition of
         // the `naux × naux` metric is not free, and every other path ignores it.
         let j2c_factor = if std::env::var("REST_PCM_RI_REUSE").map(|v| v == "1").unwrap_or(false) {
-            match mol.ctrl.j2c_decomp.policy {
-                crate::ri_jk::J2CDecompPolicy::Eig => {
-                    let j2c = mol.int_ij_aux_columb();
-                    Some(crate::mpi_io::prepare_j2c_solve_factor(&j2c, &mol.ctrl.j2c_decomp))
+            let j2c = mol.int_ij_aux_columb();
+            // `M = J^{-1/2}`. The spectral route (`_dsyevd` on the naux x naux metric) runs
+            // close to single-threaded in this OpenBLAS and cost ~800 s at naux = 11.6k;
+            // Newton-Schulz needs only ~10-20 dense GEMMs (~2 s each) and works for ANY
+            // j2c policy, falling back to the spectral power when it does not converge.
+            let threshold = mol.ctrl.j2c_decomp.threshold.unwrap_or(crate::ri_jk::J2C_THRESH);
+            match newton_schulz_inv_sqrt(&j2c, threshold) {
+                Some(m) => {
+                    println!("PCM static: j2c factor via Newton-Schulz ({} x {})", m.size[0], m.size[1]);
+                    Some(m)
                 }
-                _ => None,
+                None => crate::mpi_io::prepare_j2c_solve_factor(&j2c, &mol.ctrl.j2c_decomp).into(),
             }
         } else {
             None
@@ -303,6 +309,72 @@ impl PcmStatic{
 /// so this runs once per calculation (from [`PcmStatic::build_pcm_static`]) instead
 /// of on every SCF iteration. The diagonal regularization is the one the
 /// per-iteration code applied: `1e-12 · max(1, max diag)`.
+
+/// `J^{-1/2}` by the Newton-Schulz iteration `X <- X·(3I - J·X²)/2`, started from
+/// `X0 = J/||J||_F`. Converges quadratically while `||I - J·X_k|| < 1`; returns `None`
+/// when the residual stalls above `1e-10` after 100 sweeps (callers fall back to the
+/// spectral `_power_rayon_for_symmetric_matrix`). Matrix polynomials only, so every
+/// sweep is one dense GEMM — no eigendecomposition.
+fn newton_schulz_inv_sqrt(j2c: &MatrixFull<f64>, threshold: f64) -> Option<MatrixFull<f64>> {
+    let n = j2c.size[0];
+    if j2c.size[1] != n || n == 0 {
+        return None;
+    }
+    // scaled start X0 = alpha * J with alpha = 1/sqrt(||J||_1 * ||J||_inf), the classic
+    // choice guaranteeing the spectral radius of I - J·X0 stays below 1
+    let mut norm1 = 0.0_f64;
+    let mut norminf = 0.0_f64;
+    let mut rowsum = vec![0.0_f64; n];
+    for j in 0..n {
+        let mut cs = 0.0_f64;
+        for i in 0..n {
+            let v = j2c.data[i + j * n].abs();
+            cs += v;
+            rowsum[i] += v;
+        }
+        norm1 = norm1.max(cs);
+    }
+    norminf = rowsum.into_iter().fold(0.0_f64, f64::max);
+    let denom = (norm1 * norminf).sqrt();
+    if !(denom > 0.0 && denom.is_finite()) {
+        return None;
+    }
+    let alpha = 1.0 / denom;
+    // X0 = alpha * J  (so that ||J X0|| = alpha^2 ||J||^2... standard scaled start)
+    let mut x = MatrixFull::<f64>::new([n, n], 0.0);
+    for (xv, jv) in x.data.iter_mut().zip(j2c.data.iter()) {
+        *xv = alpha * jv;
+    }
+    let mut jx: MatrixFull<f64> = MatrixFull::new([n, n], 0.0);
+    for _sweep in 0..100 {
+        // JX
+        jx = _dgemm_scaled(j2c, 'N', &x, 'N', 1.0);
+        // residual R = I - JX  (Frobenius)
+        let mut r2 = 0.0_f64;
+        for i in 0..n {
+            for j in 0..n {
+                let d = if i == j { 1.0 - jx.data[i + j * n] } else { -jx.data[i + j * n] };
+                r2 += d * d;
+            }
+        }
+        if r2 < 1e-20 {
+            return Some(x);
+        }
+        // X <- X·(3I - JX)/2  computed as X <- 1.5·X - 0.5·X·(JX)
+        let mut xjx: MatrixFull<f64> = MatrixFull::new([n, n], 0.0);
+        let xjx2 = _dgemm_scaled(&x, 'N', &jx, 'N', 1.0); xjx = xjx2;
+        for (xv, t) in x.data.iter_mut().zip(xjx.data.iter()) {
+            *xv = 1.5 * *xv - 0.5 * *t;
+        }
+        // non-convergence guard: divergence shows up as non-finite entries
+        if !x.data.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let _ = threshold;
+    }
+    None
+}
+
 pub fn build_v_pq_chol(mol: &Molecule) -> MatrixFull<f64> {
     let cint_data_ri = mol.initialize_cint(true);
     let nbas = mol.cint_bas.len() as i32;
