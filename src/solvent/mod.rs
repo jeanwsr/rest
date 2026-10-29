@@ -195,6 +195,13 @@ pub struct PcmStatic {
     pub e_cds: Option<f64>,
     pub tarea: Option<f64>,
     pub d_cds: Option<Vec<MatrixFull<f64>>>,
+    /// Cached `(P|g_j)` int2c2e block, `[naux, ngrids]` (column-major, one column per
+    /// grid point). Geometry-only, yet the per-iteration code used to re-evaluate it TWICE
+    /// per SCF iteration (once in `get_v_grids_e` step 3, once in `get_veff_pcm_by_q`
+    /// step 1) — on system1 that was ~30 s of integral work each iteration. Built once
+    /// here; the per-iteration paths then reduce to one dgemv/dgemm each.
+    /// `None` when `REST_PCM_PG_CACHE=0` or when the cache would exceed the budget.
+    pub pg: Option<MatrixFull<f64>>,
 }
 
 impl PcmStatic{
@@ -220,6 +227,58 @@ impl PcmStatic{
         } else {
             None
         };
+        // ---- cached (P|g_j) block ---------------------------------------------------------
+        // Geometry-only int2c2e between the auxiliary basis and the Gaussian surface
+        // charges. The per-iteration paths re-evaluated this twice per SCF iteration;
+        // here it is built once (parallel over grid chunks) and the iterations reduce
+        // to dgemv/dgemm. `REST_PCM_PG_CACHE=0` disables.
+        let pg = if mol.ctrl.solvent_ri
+            && std::env::var("REST_PCM_PG_CACHE").map(|v| v != "0").unwrap_or(true)
+        {
+            let t0 = std::time::Instant::now();
+            let cint_data_ri = mol.initialize_cint(true);
+            let nbas = mol.cint_bas.len() as i32;
+            let nbas_aux = mol.cint_aux_bas.len() as i32;
+            let naux = cint_data_ri.ao_loc()[(nbas + nbas_aux) as usize] - cint_data_ri.ao_loc()[nbas as usize];
+            let grid_coords = &surface.surface_calc.grid_coords;
+            let charge_exp = &surface.surface_calc.charge_exp;
+            let ngrids = grid_coords.len();
+            let chunk = solvent_chunk_bytes(ngrids, 8.0 * naux as f64, mol.ctrl.solv_chunk, rayon::current_num_threads());
+            let default_omp = omp_get_num_threads_wrapper();
+            let mut pg = MatrixFull::<f64>::new([naux as usize, ngrids], 0.0);
+            {
+                // parallel per-chunk evaluation (immutable closure), sequential scatter
+                let parts: Vec<(usize, usize, Vec<f64>)> = grid_coords
+                    .par_chunks(chunk)
+                    .enumerate()
+                    .map(|(ci, gchunk)| {
+                        omp_set_num_threads_wrapper(1);
+                        let p0 = ci * chunk;
+                        let clen = gchunk.len();
+                        let charge_sq: Vec<f64> = charge_exp[p0..p0 + clen].iter().map(|x| x * x).collect();
+                        let fake = CINTR2CDATA::fakemol_for_charges(gchunk, charge_sq.as_slice());
+                        let shls = [[nbas, nbas + nbas_aux], [0, clen as i32]];
+                        let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&cint_data_ri, &fake], None, &shls).into();
+                        (p0, shape[0], tmpout)
+                    })
+                    .collect();
+                let pg_cols = pg.data_ref_mut().unwrap();
+                for (p0, r, tmpout) in parts {
+                    let c = tmpout.len() / r;
+                    for j in 0..c {
+                        for i in 0..r {
+                            pg_cols[i + (p0 + j) * naux as usize] = tmpout[i + j * r];
+                        }
+                    }
+                }
+            }
+            omp_set_num_threads_wrapper(default_omp);
+            println!("PCM static: cached (P|g) [{} x {}] in {:.1} s",
+                naux, ngrids, t0.elapsed().as_secs_f64());
+            Some(pg)
+        } else {
+            None
+        };
         let (e_cds, tarea, d_cds) = if cfg.method == PcmMethod::SMD {
             let (e, a, d) = compute_cds_from_surface(surface, cfg);
             let natm = surface.atomic_num.len();
@@ -232,7 +291,7 @@ impl PcmStatic{
         } else {
             (None, None, None)
         };
-        PcmStatic { A, D, S, K, R, f_epsilon, v_grids_n, K_ipiv, K_initial, v_pq_chol, j2c_factor, e_cds, tarea, d_cds }
+        PcmStatic { A, D, S, K, R, f_epsilon, v_grids_n, K_ipiv, K_initial, v_pq_chol, j2c_factor, e_cds, tarea, d_cds, pg }
     }
 }
 
@@ -516,6 +575,7 @@ impl PcmScf{
         v_grids_n: &Vec<f64>,
         v_pq_chol: &MatrixFull<f64>,
         ri_reuse: Option<&PcmRiReuse>,
+        pg_cache: Option<&MatrixFull<f64>>,
         spin_channel: &usize,
         max_memory: &Option<f64>,
         chunk_size: &usize,
@@ -549,7 +609,7 @@ impl PcmScf{
         let (v_grids_e, v_grids_matrix, veff, q_sym, dt_4) = if solv_ri{
 
             let v_grids_e = get_v_grids_e(surface, mol, dm, spin_channel, max_memory, chunk_size,
-                &cint_data_ri, &aux_cint, v_pq_chol, ri_reuse, mpi_operator);
+                &cint_data_ri, &aux_cint, v_pq_chol, ri_reuse, mpi_operator, pg_cache);
 
             let dt_1 = time::Local::now();
             let timecost_vgrid_e = (dt_1.timestamp_millis()-dt_solv0.timestamp_millis()) as f64 /1000.0;
@@ -592,7 +652,7 @@ impl PcmScf{
             let timecost_qsym = (dt_4.timestamp_millis()-dt_3.timestamp_millis()) as f64 /1000.0;
             println!("Symmetrization of q costs {:10.2} seconds.", timecost_qsym);
 
-            let veff = get_veff_pcm_by_q(surface, mol, &q_sym.data, max_memory, chunk_size, &cint_data_ri, &aux_cint, v_pq_chol, ri_reuse, mpi_operator);
+            let veff = get_veff_pcm_by_q(surface, mol, &q_sym.data, max_memory, chunk_size, &cint_data_ri, &aux_cint, v_pq_chol, ri_reuse, mpi_operator, pg_cache);
     
             (v_grids_e, v_grids_matrix, veff, q_sym, dt_4)
         } else {
@@ -1279,6 +1339,7 @@ pub fn get_v_grids_e(
     v_pq_chol: &MatrixFull<f64>,
     ri_reuse: Option<&PcmRiReuse>,
     mpi_operator: &Option<crate::mpi_io::MPIOperator>,
+    pg_cache: Option<&MatrixFull<f64>>,
 ) -> Vec<f64> {
     let charge_exp = &surface.surface_calc.charge_exp;
     let grid_coords = &surface.surface_calc.grid_coords;
@@ -1377,35 +1438,34 @@ pub fn get_v_grids_e(
     };
     let y_mat = MatrixFull::from_vec([naux, 1], y_vec).unwrap();
 
-    // Step 3: Parallel grid chunks — v_grids_e[j] = Σ_P Y_P · (P|g_j)
-    let mut v_grids_e = vec![0.0; ngrids];
-    let default_omp_num_threads = omp_get_num_threads_wrapper();
-    v_grids_e.par_chunks_mut(CHUNK).enumerate().for_each(|(v_chunk, idx)| {
-        omp_set_num_threads_wrapper(1);
-        let p0 = v_chunk * CHUNK;
-        let p1 = (p0 + CHUNK).min(ngrids);
-        let grid_coords_chunk = &grid_coords[p0..p1];
-        let mut charge_exp_chunk = Vec::with_capacity(p1 - p0);
-        for &x in &charge_exp[p0..p1] {
-            charge_exp_chunk.push(x * x);
-        }
-        let fake_chg_data = CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk.as_slice());
-        
-        //println!("CHUNK {}: exponents[0..5]={:?}, coef check: 2*α^1.5/π = {:?}",
-        //v_chunk, &charge_exp_chunk[..5.min(charge_exp_chunk.len())],
-        //charge_exp_chunk.iter().map(|&a| 2.0 * a.powf(1.5) / std::f64::consts::PI).take(5).collect::<Vec<_>>());
-
-        //actual code let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&fake_chg_data, aux_cint], None, None).into();
-        //let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&fake_chg_data, cint_data_ri], None, None).into();
-        //let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&fake_chg_data, &fake_chg_data], None, None).into();
-        let shls_slice_2c = [[0, (p1-p0) as i32], [nbas, nbas + nbas_aux]];
-        let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&fake_chg_data, cint_data_ri], None, &shls_slice_2c).into();
-        let pg_shape = [shape[0], shape[1]];
-        let pg_mat = MatrixFull::from_vec(pg_shape, tmpout).unwrap();
-        let v_e_chunk = _dgemm_scaled(&pg_mat, 'N', &y_mat, 'N', 1.0);
-        idx.iter_mut().zip(v_e_chunk.iter()).for_each(|(i, &v)| *i = v);
-    });
-    omp_set_num_threads_wrapper(default_omp_num_threads);
+    // Step 3: v_grids_e[j] = \u{03a3}_P Y_P \u{00b7} (P|g_j) \u{2014} from the cached (P|g) block when
+    // available (one dgemv), else the original per-chunk integral evaluation.
+    let v_grids_e: Vec<f64> = if let Some(pg) = pg_cache {
+        let v = _dgemm_scaled(pg, 'T', &y_mat, 'N', 1.0);
+        v.data
+    } else {
+        let mut v_grids_e = vec![0.0; ngrids];
+        let default_omp_num_threads = omp_get_num_threads_wrapper();
+        v_grids_e.par_chunks_mut(CHUNK).enumerate().for_each(|(v_chunk, idx)| {
+            omp_set_num_threads_wrapper(1);
+            let p0 = v_chunk * CHUNK;
+            let p1 = (p0 + CHUNK).min(ngrids);
+            let grid_coords_chunk = &grid_coords[p0..p1];
+            let mut charge_exp_chunk = Vec::with_capacity(p1 - p0);
+            for &x in &charge_exp[p0..p1] {
+                charge_exp_chunk.push(x * x);
+            }
+            let fake_chg_data = CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk.as_slice());
+            let shls_slice_2c = [[0, (p1-p0) as i32], [nbas, nbas + nbas_aux]];
+            let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [&fake_chg_data, cint_data_ri], None, &shls_slice_2c).into();
+            let pg_shape = [shape[0], shape[1]];
+            let pg_mat = MatrixFull::from_vec(pg_shape, tmpout).unwrap();
+            let v_e_chunk = _dgemm_scaled(&pg_mat, 'N', &y_mat, 'N', 1.0);
+            idx.iter_mut().zip(v_e_chunk.iter()).for_each(|(i, &v)| *i = v);
+        });
+        omp_set_num_threads_wrapper(default_omp_num_threads);
+        v_grids_e
+    };
 
     let dt1 = time::Local::now();
     let timecost = (dt1.timestamp_millis() - dt0.timestamp_millis()) as f64 / 1000.0;
@@ -1429,6 +1489,7 @@ pub fn get_veff_pcm_by_q(
     v_pq_chol: &MatrixFull<f64>,
     ri_reuse: Option<&PcmRiReuse>,
     mpi_operator: &Option<crate::mpi_io::MPIOperator>,
+    pg_cache: Option<&MatrixFull<f64>>,
 ) -> MatrixUpper<f64> {
 
     let nbas = mol.cint_bas.len() as i32;
@@ -1447,38 +1508,43 @@ pub fn get_veff_pcm_by_q(
 
     let dt0 = time::Local::now();
 
-    // Step 1: Compute Z'_P = Σ_j q_j · (P|g_j) over grid chunks (parallel)
-    let default_omp_num_threads = omp_get_num_threads_wrapper();
-    let z_prime = grid_coords
-        .par_chunks(CHUNK)
-        .zip(charge_exp.par_chunks(CHUNK))
-        .zip(q.par_chunks(CHUNK))
-        .map(|((grid_coords_chunk, charge_exp_chunk), q_chunk)| {
-            omp_set_num_threads_wrapper(1);
-            let chunk_len = grid_coords_chunk.len();
-            let charge_exp_chunk_sq: Vec<f64> =
-                charge_exp_chunk.iter().map(|x| x * x).collect();
-            let fake_chg_data =
-                CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk_sq.as_slice());
-
-            //let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [aux_cint, &fake_chg_data], None, None).into();
-            let shls_slice_2c = [[nbas, nbas + nbas_aux], [0, chunk_len as i32]];
-            let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [cint_data_ri, &fake_chg_data], None, &shls_slice_2c).into();
-            let pg_shape = [shape[0], shape[1]];
-            let pg_mat = MatrixFull::from_vec(pg_shape, tmpout).unwrap();
-            let q_mat = MatrixFull::from_vec([chunk_len, 1], q_chunk.to_vec()).unwrap();
-            let z_contrib = _dgemm_scaled(&pg_mat, 'N', &q_mat, 'N', 1.0);
-            z_contrib.data
-        })
-        .reduce(
-            || vec![0.0; naux],
-            |mut a, b| {
-                for (i, &v) in b.iter().enumerate() {
-                    a[i] += v;
-                }
-                a
-            });
-    omp_set_num_threads_wrapper(default_omp_num_threads);
+    // Step 1: Z'_P = \u{03a3}_j q_j \u{00b7} (P|g_j) \u{2014} cached (P|g) dgemm when available,
+    // else the original parallel per-chunk integral evaluation.
+    let z_prime: Vec<f64> = if let Some(pg) = pg_cache {
+        let q_mat = MatrixFull::from_vec([q.len(), 1], q.clone()).unwrap();
+        _dgemm_scaled(pg, 'N', &q_mat, 'N', 1.0).data
+    } else {
+        let default_omp_num_threads = omp_get_num_threads_wrapper();
+        let z = grid_coords
+            .par_chunks(CHUNK)
+            .zip(charge_exp.par_chunks(CHUNK))
+            .zip(q.par_chunks(CHUNK))
+            .map(|((grid_coords_chunk, charge_exp_chunk), q_chunk)| {
+                omp_set_num_threads_wrapper(1);
+                let chunk_len = grid_coords_chunk.len();
+                let charge_exp_chunk_sq: Vec<f64> =
+                    charge_exp_chunk.iter().map(|x| x * x).collect();
+                let fake_chg_data =
+                    CINTR2CDATA::fakemol_for_charges(grid_coords_chunk, charge_exp_chunk_sq.as_slice());
+                let shls_slice_2c = [[nbas, nbas + nbas_aux], [0, chunk_len as i32]];
+                let (tmpout, shape) = CINTR2CDATA::integrate_cross("int2c2e", [cint_data_ri, &fake_chg_data], None, &shls_slice_2c).into();
+                let pg_shape = [shape[0], shape[1]];
+                let pg_mat = MatrixFull::from_vec(pg_shape, tmpout).unwrap();
+                let q_mat = MatrixFull::from_vec([chunk_len, 1], q_chunk.to_vec()).unwrap();
+                let z_contrib = _dgemm_scaled(&pg_mat, 'N', &q_mat, 'N', 1.0);
+                z_contrib.data
+            })
+            .reduce(
+                || vec![0.0; naux],
+                |mut a, b| {
+                    for (i, &v) in b.iter().enumerate() {
+                        a[i] += v;
+                    }
+                    a
+                });
+        omp_set_num_threads_wrapper(default_omp_num_threads);
+        z
+    };
 
     // Step 2: Solve V · Z = Z' via the precomputed Cholesky factor of V (V is symmetric)
     let z_vec = solve_cholesky_factorized(v_pq_chol, &z_prime);

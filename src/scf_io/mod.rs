@@ -2580,6 +2580,7 @@ impl SCF {
                 &solvent_static.pstatic.v_grids_n,
                 &solvent_static.pstatic.v_pq_chol,
                 ri_reuse.as_ref(),
+                solvent_static.pstatic.pg.as_ref(),
                 &self.mol.spin_channel,
                 &self.mol.ctrl.max_memory,
                 &self.mol.ctrl.solv_chunk,
