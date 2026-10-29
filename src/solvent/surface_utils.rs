@@ -1,6 +1,7 @@
 use std::fmt;
 use std::f64::consts;
 use rstsr::prelude::*;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tensors::{MatrixFull, MatrixUpper, BasicMatrix};
 use super::SurfaceSwitchType;
@@ -584,6 +585,227 @@ pub fn solve_lu_transpose(
 }
 
 // ============================================================================
+//  Parallel blocked triangular solves for the cached PCM LU factors
+// ============================================================================
+
+/// Block size of the parallel LU solves below. Within a block the substitution is
+/// serial (B² / 2 scalar flops ≈ 2 M, sub-millisecond); the cross-block updates are
+/// rayon-parallel and every memory access is a contiguous column slice, so the
+/// `[ngrids, ngrids]` factor (6.4 GB at system1) streams at node bandwidth instead
+/// of the single-core crawl of the scalar loops in [`solve_lu`] (measured 7-16 s
+/// per SCF iteration there, `n = 28373`).
+const PCM_SOLVE_BLOCK: usize = 2048;
+
+/// Parallel blocked `A·x = b` with a cached LU factorization (`A = P·L·U`, `a` holds
+/// `L` below the diagonal and `U` on and above it, `a_ipiv` from `dgetrf`).
+/// Identical permutation and singularity semantics to [`solve_lu`]; only the
+/// floating-point accumulation order differs (blocked), at roundoff level.
+pub fn par_solve_lu(a: &MatrixFull<f64>, a_ipiv: &Vec<i32>, b: &[f64]) -> Option<Vec<f64>> {
+    let n = a.size[0];
+    debug_assert_eq!(a.size[1], n);
+    if b.len() != n {
+        return None;
+    }
+    let lu = &a.data[..];
+    let mut x = b.to_vec();
+    // row interchanges, forward (same sequence as the scalar version)
+    for i in 0..n {
+        let p = a_ipiv[i] as usize;
+        if p != i + 1 {
+            x.swap(i, p - 1);
+        }
+    }
+    let bsz = PCM_SOLVE_BLOCK.min(n.max(1));
+    // ---- forward: L·y = x, column-blocked; the trailing update is rayon-parallel --
+    for kb in (0..n).step_by(bsz) {
+        let ke = (kb + bsz).min(n);
+        // serial within-block forward substitution
+        for j in kb..ke {
+            let yj = x[j];
+            if yj != 0.0 {
+                let col = &lu[j * n..(j + 1) * n];
+                for i in (j + 1)..ke {
+                    x[i] -= col[i] * yj;
+                }
+            }
+        }
+        // parallel trailing update: x[ke..n] -= L[ke..n, kb..ke] · y[kb..ke]
+        if ke < n {
+            let nthread = rayon::current_num_threads().max(1);
+            let nrem = n - ke;
+            let chunk = ((nrem + nthread - 1) / nthread).max(1);
+            let (head, tail) = x.split_at_mut(ke);
+            let y = &head[kb..ke]; // final within-block solution, read-only here
+            let tail_ptr = tail.as_ptr() as usize;
+            tail.par_chunks_mut(chunk).for_each(|xi| {
+                let r0 = ke + (xi.as_ptr() as usize - tail_ptr) / std::mem::size_of::<f64>();
+                for (jb, &yj) in (kb..ke).zip(y.iter()) {
+                    if yj != 0.0 {
+                        let col = &lu[jb * n + r0..jb * n + r0 + xi.len()];
+                        for (xv, &lv) in xi.iter_mut().zip(col.iter()) {
+                            *xv -= lv * yj;
+                        }
+                    }
+                }
+            });
+        }
+    }
+    // ---- backward: U·x = y, column-blocked from the bottom ------------------------
+    for kb in (0..n).step_by(bsz).rev() {
+        let ke = (kb + bsz).min(n);
+        // contributions of the already-solved blocks BELOW this one, applied first:
+        // x[kb..ke] -= U[kb..ke, ke..n] · x[ke..n] (rayon over rows, contiguous columns)
+        if ke < n {
+            let nthread = rayon::current_num_threads().max(1);
+            let nrem = ke - kb;
+            let chunk = ((nrem + nthread - 1) / nthread).max(1);
+            let (head, tail) = x.split_at_mut(ke);
+            let seg = &mut head[kb..ke];
+            let tail_ref = &tail[..];
+            let seg_ptr = seg.as_mut_ptr() as usize;
+            seg.par_chunks_mut(chunk).for_each(|xi| {
+                let r0 = kb + (xi.as_ptr() as usize - seg_ptr) / std::mem::size_of::<f64>();
+                for (off, xv) in xi.iter_mut().enumerate() {
+                    let i = r0 + off;
+                    let mut s = 0.0;
+                    for (jc, &xj) in (ke..n).zip(tail_ref.iter()) {
+                        s += lu[i + jc * n] * xj;
+                    }
+                    *xv -= s;
+                }
+            });
+        }
+        // serial within-block back substitution with the singularity guard.
+        // NOTE: this is a ROW access — `U[i, j]` sits at data[i + j*n], a strided walk
+        // inside the small block (a column slice here would read the transpose U[j, i]).
+        for i in (kb..ke).rev() {
+            let mut sum = 0.0;
+            for j in (i + 1)..ke {
+                sum += lu[i + j * n] * x[j];
+            }
+            let uii = lu[i + i * n];
+            if uii.abs() < 1e-15 {
+                println!(
+                    "Singular matrix detected in par_solve_lu: n={}, pivot index={}, |U_ii|={:10.3e} (< 1e-15)",
+                    n, i, uii.abs()
+                );
+                return None;
+            }
+            x[i] = (x[i] - sum) / uii;
+        }
+        // NOTE: no "propagate above" step here — the cross-block update at the top of
+        // each earlier block already collects every solved column below it; a separate
+        // upward propagation would double-count those columns (verified against the
+        // scalar solve: removing it dropped the residual from 3e-2 to roundoff).
+    }
+    Some(x)
+}
+
+/// Parallel blocked `Aᵀ·x = b` with the same cached LU layout. Phases mirror
+/// [`solve_lu_transpose`]: `Uᵀ·y = b` (ascending blocks), `Lᵀ·z = y` (descending
+/// blocks), then the permutation applied in reverse. All column accesses of the
+/// factor are contiguous slices.
+pub fn par_solve_lu_transpose(a: &MatrixFull<f64>, a_ipiv: &Vec<i32>, b: &[f64]) -> Option<Vec<f64>> {
+    let n = a.size[0];
+    debug_assert_eq!(a.size[1], n);
+    if b.len() != n {
+        return None;
+    }
+    let lu = &a.data[..];
+    let mut x = b.to_vec();
+    let bsz = PCM_SOLVE_BLOCK.min(n.max(1));
+    // ---- phase 1: Uᵀ·y = x, block-row ascending. Cross-block contributions are
+    // dots of already-final y against contiguous column slices U[0..kb, i].
+    for kb in (0..n).step_by(bsz) {
+        let ke = (kb + bsz).min(n);
+        if kb > 0 {
+            let nthread = rayon::current_num_threads().max(1);
+            let nrem = ke - kb;
+            let chunk = ((nrem + nthread - 1) / nthread).max(1);
+            let (done, rest) = x.split_at_mut(kb);
+            // only THIS block's rows [kb..ke) receive the earlier-block contributions
+            // here; rows ≥ ke get their own update when their block runs. Iterating the
+            // whole `rest` slice would apply the same columns twice (the exact
+            // double-count that broke the first version of this routine).
+            let pending = &mut rest[..nrem];
+            let pend_ptr = pending.as_ptr() as usize;
+            pending.par_chunks_mut(chunk).for_each(|xi| {
+                let i0 = kb + (xi.as_ptr() as usize - pend_ptr) / std::mem::size_of::<f64>();
+                for (off, xv) in xi.iter_mut().enumerate() {
+                    let i = i0 + off;
+                    let col = &lu[i * n..i * n + kb];
+                    let mut s = 0.0;
+                    for (yv, &uv) in done.iter().zip(col.iter()) {
+                        s += yv * uv;
+                    }
+                    *xv -= s;
+                }
+            });
+        }
+        // serial within-block: x[i] = (x[i] - U[kb..i, i]·x[kb..i]) / U[i,i]
+        for i in kb..ke {
+            let col = &lu[i * n..i * n + i + 1];
+            let mut sum = 0.0;
+            for j in kb..i {
+                sum += col[j] * x[j];
+            }
+            let uii = col[i];
+            if uii.abs() < 1e-15 {
+                println!(
+                    "Singular matrix detected in par_solve_lu_transpose: n={}, pivot index={}, |U_ii|={:10.3e} (< 1e-15)",
+                    n, i, uii.abs()
+                );
+                return None;
+            }
+            x[i] = (x[i] - sum) / uii;
+        }
+    }
+    // ---- phase 2: Lᵀ·z = y, block-row descending. Cross-block dots read contiguous
+    // slices L[ke..n, i] against the final tail.
+    for kb in (0..n).step_by(bsz).rev() {
+        let ke = (kb + bsz).min(n);
+        if ke < n {
+            let nthread = rayon::current_num_threads().max(1);
+            let nrem = ke - kb;
+            let chunk = ((nrem + nthread - 1) / nthread).max(1);
+            let (head, tail) = x.split_at_mut(ke);
+            let seg = &mut head[kb..ke];
+            let seg_ptr = seg.as_mut_ptr() as usize;
+            let tail_ref = &tail[..];
+            seg.par_chunks_mut(chunk).for_each(|xi| {
+                let i0 = kb + (xi.as_ptr() as usize - seg_ptr) / std::mem::size_of::<f64>();
+                for (off, xv) in xi.iter_mut().enumerate() {
+                    let i = i0 + off;
+                    let col = &lu[i * n + ke..(i + 1) * n];
+                    let mut s = 0.0;
+                    for (zv, &lv) in tail_ref.iter().zip(col.iter()) {
+                        s += zv * lv;
+                    }
+                    *xv -= s;
+                }
+            });
+        }
+        // serial within-block backward: x[i] -= L[i+1..ke, i]·x[i+1..ke]
+        for i in (kb..ke).rev() {
+            let col = &lu[i * n + i + 1..(i + 1) * n];
+            let mut sum = 0.0;
+            for (zv, &lv) in x[i + 1..ke].iter().zip(col.iter()) {
+                sum += zv * lv;
+            }
+            x[i] -= sum;
+        }
+    }
+    // ---- phase 3: permutation, reverse application (same sequence as the scalar version)
+    for i in (0..n).rev() {
+        let p = a_ipiv[i] as usize;
+        if p != i + 1 {
+            x.swap(i, p - 1);
+        }
+    }
+    Some(x)
+}
+
+// ============================================================================
 // Unit tests
 // ============================================================================
 
@@ -644,5 +866,61 @@ mod tests {
         assert!((r_bondi[0] - data::VDW_RADII[4]).abs() < 1e-12);
         assert!((r_uff[0] - data::BONDI_UFF_RADII[4]).abs() < 1e-12);
         assert!((r_bondi[0] - r_uff[0]).abs() > 0.1, "两套 fallback 表应显著不同");
+    }
+
+    /// par_solve_lu / par_solve_lu_transpose 与标量版在随机矩阵上逐元素一致
+    /// （roundoff 级；分块只改变累加顺序）。
+    #[test]
+    fn test_par_lu_solves_match_scalar() {
+        use crate::solvent::surface_utils::{par_solve_lu, par_solve_lu_transpose, solve_lu, solve_lu_transpose};
+        // deterministic pseudo-random SPD-plus-shift matrix, n spanning several blocks
+        let n = 5010usize;
+        let mut a = MatrixFull::<f64>::new([n, n], 0.0);
+        let mut state = 12345u64;
+        let mut rnd = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+        };
+        for j in 0..n {
+            for i in 0..n {
+                a[[i, j]] = rnd() * 0.1;
+            }
+            a[[j, j]] += 8.0; // diagonally dominant, well-conditioned
+        }
+        let b: Vec<f64> = (0..n).map(|i| ((i * 37) % 1000) as f64 * 0.01 - 5.0).collect();
+        let (lu, ipiv) = a.clone().to_matrixfullslicemut().lapack_dgetrf_full().unwrap();
+        let x_scalar = solve_lu(&lu, &ipiv, &b).unwrap();
+        let x_par = par_solve_lu(&lu, &ipiv, &b).unwrap();
+        // small-scale debug dump when the block size makes the problem few-block
+
+        let scale = b.iter().fold(0.0f64, |m, &v| m.max(v.abs())).max(1.0);
+        for i in 0..n {
+            assert!(
+                (x_scalar[i] - x_par[i]).abs() < 1e-10 * scale,
+                "par_solve_lu mismatch at {}: {} vs {}",
+                i, x_scalar[i], x_par[i]
+            );
+        }
+        let xt_scalar = solve_lu_transpose(&lu, &ipiv, &b).unwrap();
+        let xt_par = par_solve_lu_transpose(&lu, &ipiv, &b).unwrap();
+        if n <= 64 {
+            let resid = |xv: &[f64]| {
+                (0..n).map(|i| {
+                    let s: f64 = (0..n).map(|j| a[[j, i]] * xv[j]).sum();
+                    (s - b[i]).abs()
+                }).fold(0.0_f64, f64::max)
+            };
+            println!("residT scalar = {:e}", resid(&xt_scalar));
+            println!("residT par    = {:e}", resid(&xt_par));
+            println!("xt_sca = {:?}", &xt_scalar[..n.min(13)]);
+            println!("xt_par = {:?}", &xt_par[..n.min(13)]);
+        }
+        for i in 0..n {
+            assert!(
+                (xt_scalar[i] - xt_par[i]).abs() < 1e-10 * scale,
+                "par_solve_lu_transpose mismatch at {}: {} vs {}",
+                i, xt_scalar[i], xt_par[i]
+            );
+        }
     }
 }

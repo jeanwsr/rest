@@ -7550,6 +7550,8 @@ fn test_non0tab_build() {
         aop_compressed: None,
         atm_idx: vec![0; 100],
         quadrature_weights: vec![1.0; 100],
+        ao_atm: Vec::new(),
+        atm_coords: Vec::new(),
     };
     assert!(grids.non0tab.is_some());
     assert_eq!(grids.ao_cutoff, 1e-10);
@@ -7567,6 +7569,8 @@ fn test_non0tab_build() {
         aop_compressed: None,
         atm_idx: vec![0; 100],
         quadrature_weights: vec![1.0; 100],
+        ao_atm: Vec::new(),
+        atm_coords: Vec::new(),
     };
     assert!(grids2.non0tab.is_none());
     assert_eq!(grids2.ao_cutoff, 0.0);
@@ -7791,6 +7795,8 @@ fn test_non0tab_contract_response_offset() {
         aop_compressed: Some(aop_compressed),
         atm_idx: vec![0; ngrids],
         quadrature_weights: vec![1.0; ngrids],
+        ao_atm: Vec::new(),
+        atm_coords: Vec::new(),
     };
 
     // Build global vrho: 1.0 for grids 0..8, 2.0 for grids 8..16

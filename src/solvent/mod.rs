@@ -712,13 +712,17 @@ impl PcmScf{
             println!("v_grids costs {:10.2} seconds.", timecost_vgrid);
 
             assert!(v_grids_matrix.size[0] == R.size[1], "Dimension mismatch: v_grids has {} rows but R has {} columns", v_grids_matrix.size[0], R.size[1]);
-            let b = _dgemm_scaled(R, 'N', &v_grids_matrix, 'N', 1.0);
-            let q = solve_lu(K, K_ipiv, &b.data)
+            // R·V and both triangular solves stream the [ngrids, ngrids] factors once;
+            // the plain-BLAS / scalar-loop versions run single-core (measured 7-16 s per
+            // SCF iteration at n = 28373), the rayon matvec and blocked solves read the
+            // same bytes at node bandwidth.
+            let b_data = par_mat_vec(R, &v_grids_matrix.data);
+            let q = crate::solvent::surface_utils::par_solve_lu(K, K_ipiv, &b_data)
                 .unwrap_or_else(|| panic!("{}", singular_msg("solve_lu")));
             let q = MatrixFull::from_vec([q.len(), 1], q).unwrap();
 
             //solve K^T x = v_grids
-            let vK_1 = solve_lu_transpose(K, K_ipiv, &v_grids_matrix.data)
+            let vK_1 = crate::solvent::surface_utils::par_solve_lu_transpose(K, K_ipiv, &v_grids_matrix.data)
                 .unwrap_or_else(|| panic!("{}", singular_msg("solve_lu_transpose")));
 
             let vK_1 = MatrixFull::from_vec([vK_1.len(), 1], vK_1).unwrap();
@@ -730,7 +734,8 @@ impl PcmScf{
             // `Rᵀ · vK_1`. The transpose goes to BLAS as a flag: `R.transpose()`
             // would clone and re-permute the whole `[ngrids, ngrids]` matrix (several
             // GB) on every SCF iteration.
-            let qt = _dgemm_scaled(R, 'T', &vK_1, 'N', 1.0);
+            let qt_data = par_mat_t_vec(R, &vK_1.data);
+            let qt = MatrixFull::from_vec([qt_data.len(), 1], qt_data).unwrap();
             if qt.size[0] != q.size[0] {
             panic!("Dimension mismatch: qt has {} rows but q has {} rows", qt.size[0], q.size[0]);
             }
@@ -768,13 +773,17 @@ impl PcmScf{
             println!("v_grids costs {:10.2} seconds.", timecost_vgrid);
 
             assert!(v_grids_matrix.size[0] == R.size[1], "Dimension mismatch: v_grids has {} rows but R has {} columns", v_grids_matrix.size[0], R.size[1]);
-            let b = _dgemm_scaled(R, 'N', &v_grids_matrix, 'N', 1.0);
-            let q = solve_lu(K, K_ipiv, &b.data)
+            // R·V and both triangular solves stream the [ngrids, ngrids] factors once;
+            // the plain-BLAS / scalar-loop versions run single-core (measured 7-16 s per
+            // SCF iteration at n = 28373), the rayon matvec and blocked solves read the
+            // same bytes at node bandwidth.
+            let b_data = par_mat_vec(R, &v_grids_matrix.data);
+            let q = crate::solvent::surface_utils::par_solve_lu(K, K_ipiv, &b_data)
                 .unwrap_or_else(|| panic!("{}", singular_msg("solve_lu")));
             let q = MatrixFull::from_vec([q.len(), 1], q).unwrap();
 
             //solve K^T x = v_grids
-            let vK_1 = solve_lu_transpose(K, K_ipiv, &v_grids_matrix.data)
+            let vK_1 = crate::solvent::surface_utils::par_solve_lu_transpose(K, K_ipiv, &v_grids_matrix.data)
                 .unwrap_or_else(|| panic!("{}", singular_msg("solve_lu_transpose")));
 
             let vK_1 = MatrixFull::from_vec([vK_1.len(), 1], vK_1).unwrap();
@@ -786,7 +795,8 @@ impl PcmScf{
             // `Rᵀ · vK_1`. The transpose goes to BLAS as a flag: `R.transpose()`
             // would clone and re-permute the whole `[ngrids, ngrids]` matrix (several
             // GB) on every SCF iteration.
-            let qt = _dgemm_scaled(R, 'T', &vK_1, 'N', 1.0);
+            let qt_data = par_mat_t_vec(R, &vK_1.data);
+            let qt = MatrixFull::from_vec([qt_data.len(), 1], qt_data).unwrap();
             if qt.size[0] != q.size[0] {
             panic!("Dimension mismatch: qt has {} rows but q has {} rows", qt.size[0], q.size[0]);
             }
